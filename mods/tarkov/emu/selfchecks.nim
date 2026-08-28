@@ -44,6 +44,7 @@ import customise
 import tuning
 import globalsgaps
 import itemsgaps
+import itemsadd
 import mailcheck
 import spawn
 import decorate
@@ -113,6 +114,11 @@ proc selfCheckFailures*(): seq[string] =
   # pre-1.0 database lacks are spliced in at the right depth, without
   # overwriting the database and without inventing an item id.
   discard itemsgaps.selfCheckItemsGaps(result)
+  # `itemsadd` proves the WHOLE item templates BSG serves and our pre-1.0
+  # database lacks are spliced in as new ids, without overwriting an id the
+  # database already has and without dropping a sibling -- the referential
+  # hole that made the client throw "Cannot find template ... for item".
+  discard itemsadd.selfCheckItemsAdd(result)
   discard spawn.selfCheckSpawn(result)
   # `mailcheck` proves the served-mail payload check can FAIL. It is run on
   # the exact bad body measured in a live mailbox on 2026-08-28 -- a message

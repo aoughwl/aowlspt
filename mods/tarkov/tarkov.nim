@@ -81,6 +81,7 @@ import emu/metadata
 import emu/post1
 import emu/globalsgaps # the config members REAL BSG sends and db.json lacks
 import emu/itemsgaps # the `_props` members REAL BSG sends and db.json lacks
+import emu/itemsadd  # the WHOLE item templates BSG serves and db.json lacks
 import emu/tuning   # the globals overrides -- the settings that reach the CLIENT
 import emu/spawn    # spawning items into a stash from the settings page
 
@@ -1362,8 +1363,11 @@ proc onTraderUserAssort(url, body, session: string): string =
 proc onItems(url, body, session: string): string =
   ## The item-template document, with the `_props` members REAL BSG sends
   ## and this pre-1.0 database lacks spliced in. `applyItemsGaps` caches
-  ## against its input text, so the 12.7 MB reparse happens once.
-  envelope(raw(applyItemsGaps(items())))
+  ## against its input text, so the 12.7 MB reparse happens once. `applyItemsAdd`
+  ## then splices in the WHOLE templates BSG serves that db.json lacks entirely,
+  ## so a payload that references one (a battle-pass reward, a season item, a
+  ## quest note) resolves instead of throwing "Cannot find template ... for item".
+  envelope(raw(applyItemsAdd(applyItemsGaps(items()))))
 proc onGlobals(url, body, session: string): string =
   ## The globals document, with every singleplayer override applied.
   ##
