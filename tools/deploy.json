@@ -27,6 +27,7 @@
    "exports": [
     "aowl_host_gameworld",
     "aowl_host_gameworld_armed",
+    "aowl_host_gate_call",
     "aowl_region_abi_x",
     "aowl_region_box_x",
     "aowl_region_commands_x",

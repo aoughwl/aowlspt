@@ -243,6 +243,38 @@ static int32_t sain_is_readable(void* p, int32_t size) {
         return need <= end ? 1 : 0;
     }
 }
+
+/* THE ONLY WAY THIS MOD MAY REACH A TOKEN-GATED IL2CPP EXPORT.
+ *
+ * `aowl_host_gate_call` is a single `__declspec(dllexport)` symbol on
+ * aowlspt-host-il2cpp.dll. The host arms and CONSUMES the nonce in the same
+ * breath, so nothing here ever sees a TLS slot -- which matters, because an
+ * armed-but-unconsumed slot removes the early-out that is the only reason this
+ * mod's ~20 stock-signature by-name calls returned garbage instead of faulting
+ * inside the gate's own memcmp.
+ *
+ * The host owns the fault guard. Nothing here wraps one: `aowl_p_p_seh` is not
+ * re-entrant and an outer guard would be DISARMED by an inner one. */
+typedef int (*sain_gate_fn_t)(const char*, void**, int, void**, int*,
+                              const char**, int*);
+static const char* sain_gate_last_why_s = "the host gate export was never called";
+static int sain_gate_call(void* f, const char* name, int argc,
+                          void* a0, void* a1, void* a2,
+                          void** out_ret, int* out_why, int* out_outstanding) {
+    void* argv[3];
+    const char* wt = 0;
+    int r;
+    if (out_ret) *out_ret = 0;
+    if (out_why) *out_why = -1;
+    if (out_outstanding) *out_outstanding = -1;
+    if (!f || !name || argc < 0 || argc > 3) return 0;
+    argv[0] = a0; argv[1] = a1; argv[2] = a2;
+    r = ((sain_gate_fn_t)f)(name, argv, argc, out_ret, out_why, &wt,
+                            out_outstanding);
+    if (wt) sain_gate_last_why_s = wt;
+    return r;
+}
+static const char* sain_gate_last_why(void) { return sain_gate_last_why_s; }
 """.}
 
 proc sainGwPV(f: Il2CppPtr): Il2CppPtr {.importc: "sain_gw_p_v", nodecl.}
@@ -269,6 +301,125 @@ proc gwResolve() =
   var n2 = "aowl_host_gameworld_armed"
   gGwFn = gwGetProcAddress(h, toCString(n1))
   gGwArmedFn = gwGetProcAddress(h, toCString(n2))
+
+proc sainGateCall(f: Il2CppPtr; name: cstring; argc: int32;
+                  a0, a1, a2: Il2CppPtr; outRet: ptr Il2CppPtr;
+                  outWhy: ptr int32; outOutstanding: ptr int32): int32 {.
+  importc: "sain_gate_call", nodecl.}
+proc sainGateLastWhy(): cstring {.importc: "sain_gate_last_why", nodecl.}
+
+var gGateFn: Il2CppPtr = cast[Il2CppPtr](0)
+var gGateTried = false
+var gGateNoted = false
+
+proc gateResolve() =
+  ## Resolve the host's ONE gate export, exactly as `gwResolve` resolves the
+  ## GameWorld one. Absence is a real, expected state -- an older host, or this
+  ## code running outside the client -- and it must produce a REFUSAL, never a
+  ## fallback to the un-tokened call, which is the fatal path.
+  if gGateTried:
+    return
+  gGateTried = true
+  var hostName = "aowlspt-host-il2cpp.dll"
+  let h = gwGetModuleHandleA(toCString(hostName))
+  if h == nil:
+    return
+  var n = "aowl_host_gate_call"
+  gGateFn = gwGetProcAddress(h, toCString(n))
+
+proc gateAvailable*(): bool =
+  ## Only that the SYMBOL is present. It says nothing about the `il2cppGates`
+  ## flag, which is default OFF -- with the flag off every call still refuses,
+  ## with `why` = "the il2cppGates flag is off". Structural is not behavioural.
+  gateResolve()
+  result = gGateFn != nil
+
+proc gateWhyText*(): string =
+  ## The host's own explanation of the last refusal, not one this mod invented.
+  readCString(cast[Il2CppPtr](sainGateLastWhy()))
+
+proc gateClassFromName*(rt: Il2Cpp; image: Il2CppImage;
+                        ns, name: string): Il2CppClass =
+  ## `il2cpp_class_from_name` THROUGH the token gate. Three outcomes, and the
+  ## caller can tell them apart: a class, or nil with `gateWhyText()` saying
+  ## either "no host export" or the host's own refusal code.
+  ##
+  ## What a working gate does NOT buy: resolution by name becomes POSSIBLE, not
+  ## SAFE. 28.3% of by-name METHOD lookups land on a SHARED RVA, and this build
+  ## has a universal empty-body stub at 0x628110 shared by 6,438 methods, so a
+  ## resolved and signature-checked address can still be a no-op. Calling a
+  ## shared address is fine; DETOURING one fires for every other owner.
+  result = nullPtr()
+  if not gateAvailable():
+    if not gGateNoted:
+      gGateNoted = true
+      warn "sain: no host export aowl_host_gate_call -- this host predates " &
+           "the token-gate export layer. By-name resolution stays REFUSED; " &
+           "there is deliberately no un-tokened fallback, because that call " &
+           "returns a plausible random handle and kills the client."
+    return
+  if image == nil:
+    return
+  var n1 = ns
+  var n2 = name
+  var ret: Il2CppPtr = cast[Il2CppPtr](0)
+  var why: int32 = -1'i32
+  var outstanding: int32 = -1'i32
+  # `toCString` takes its string by `var`, so the export name needs a local.
+  var exportName = "il2cpp_class_from_name"
+  let ok = sainGateCall(gGateFn, toCString(exportName), 3'i32,
+                        image, cast[Il2CppPtr](toCString(n1)),
+                        cast[Il2CppPtr](toCString(n2)),
+                        addr ret, addr why, addr outstanding)
+  if ok == 0'i32:
+    debug "sain: gated il2cpp_class_from_name(" & ns & "." & name &
+          ") refused: " & gateWhyText()
+    return
+  # ASSERT THE NEGATIVE, per CLAUDE.md 9b: nothing may be left ARMED on this
+  # thread. A leaked arm is not a slow leak -- it removes the zero-slot
+  # early-out for the NEXT stock-signature caller anywhere in the process, and
+  # that faults inside GameAssembly+0x6206E0.
+  if outstanding != 0'i32:
+    warn "sain: gated call left " & $outstanding & " nonce arm(s) OUTSTANDING " &
+         "-- treating the result as INCONCLUSIVE and refusing it."
+    return
+  # `ret != nil` proves NOTHING on its own: the trap never returns NULL. The
+  # gate's own verdict (`ok`) is the check; this is only a readability hop.
+  if not sainReadable(ret, 8):
+    return
+  result = ret
+
+proc gateFindClass*(rt: Il2Cpp; qualified: string): Il2CppClass =
+  ## `findClass`, but every `classFromName` hop goes through the gate. Same
+  ## all-images search as `aowl/src/aowlspt/il2cpp.nim`, because a type moves
+  ## between assemblies across Tarkov releases.
+  result = nullPtr()
+  if not rt.loaded:
+    return
+  if not gateAvailable():
+    discard gateClassFromName(rt, cast[Il2CppImage](0), "", "")  # logs once
+    return
+  var ns = ""
+  var name = ""
+  splitTypeName(qualified, ns, name)
+  let domain = rt.domainGet()
+  if domain == nil:
+    return
+  var count = 0
+  let assemblies = rt.domainGetAssemblies(domain, count)
+  if assemblies == nil:
+    return
+  # rule 4: capped. 512 assemblies is far past any real domain.
+  var lim = count
+  if lim > 512:
+    lim = 512
+  for i in 0 ..< lim:
+    let image = rt.assemblyGetImage(assemblyAt(assemblies, i))
+    if image == nil:
+      continue
+    let c = gateClassFromName(rt, image, ns, name)
+    if c != nil:
+      return c
 
 proc gwState*(): int =
   ## 0 no host export (host too old, or this is not the client)
@@ -379,7 +530,7 @@ proc signatureOf*(owner, member: string; argc: int;
     return false
   if reflectionRefused(owner & "::" & member):
     return false
-  let cls = findClass(gRt, owner)
+  let cls = gateFindClass(gRt, owner)
   if cls == nil:
     return false
   let m = findMethod(gRt, cls, member, argc)
@@ -644,8 +795,8 @@ proc headerBytes(): int =
   # and the range check in `byPointerSize` is what makes holding it safe.
   if reflectionRefused("System.Int32 / System.Double"):
     return gHeaderBytes
-  let i32 = findClass(gRt, "System.Int32")
-  let f64 = findClass(gRt, "System.Double")
+  let i32 = gateFindClass(gRt, "System.Int32")
+  let f64 = gateFindClass(gRt, "System.Double")
   if i32 != nil and f64 != nil:
     let a = classInstanceSize(gRt, i32)
     let b = classInstanceSize(gRt, f64)
@@ -668,7 +819,7 @@ proc byPointerSize(tn: string): int =
   # answer every caller already handles as "not a size this understands".
   if reflectionRefused(tn):
     return
-  let c = findClass(gRt, tn)
+  let c = gateFindClass(gRt, tn)
   if c == nil:
     return
   if not classIsValueType(gRt, c):
@@ -1758,7 +1909,7 @@ proc payloadSizeOf*(tn: string): int =
     return
   if reflectionRefused(tn):
     return
-  let c = findClass(gRt, tn)
+  let c = gateFindClass(gRt, tn)
   if c == nil:
     return
   if not classIsValueType(gRt, c):
@@ -1782,7 +1933,7 @@ proc staticMethodOf*(owner, member: string; argc: int): Il2CppMethod =
     return
   if reflectionRefused(owner & "::" & member):
     return
-  let cls = findClass(gRt, owner)
+  let cls = gateFindClass(gRt, owner)
   if cls == nil:
     return
   let m = findMethod(gRt, cls, member, argc)
