@@ -317,6 +317,40 @@ proc idxBind(e: Env): bool =
              "its caller names",
              "python " & quoted(tool), e.repo)
 
+var gSettingsBackedRan = false
+
+proc settingsBacked(e: Env): bool =
+  ## Build gate for the "renders but resolves to nothing" class.
+  ##
+  ## A mod declares a row with `intSetting("progressionPlayerLevel", ...)`. If
+  ## that key has no entry in the mod's own `config.json`, the control still
+  ## draws -- `Setting.toJson` falls back to `defaultJson` when the read fails
+  ## -- and the mod's `asInt(setting(k), default)` still returns its default.
+  ## Nothing anywhere says so. That is how three progression settings shipped
+  ## declared, wired to real code, and unreachable.
+  ##
+  ## `tools/settingscheck.py` asserts the FINISHED STATE (the union of what the
+  ## schema declares against what the file holds), not a property of anything
+  ## it wrote, so deleting one key from any config.json turns it red naming the
+  ## key and the mod. Exit 2 -- a schema it could not parse -- is INCONCLUSIVE
+  ## and fails the build too: "I could not look" is not a pass.
+  ##
+  ## Runs once per invocation rather than once per mod: it already walks every
+  ## mod, and `aowl build mods` would otherwise run it fifteen times.
+  if gSettingsBackedRan:
+    return true
+  let tool = joinPath(e.repo, "tools\\settingscheck.py")
+  if not fileExists(tool):
+    note "tools\\settingscheck.py is not present on this branch, so no " &
+         "declared setting was checked for a config.json key. That is " &
+         "inconclusive, not a pass."
+    gSettingsBackedRan = true
+    return true
+  gSettingsBackedRan = true
+  return run(e, "every declared setting resolves to a key in its mod's " &
+             "config.json",
+             "python " & quoted(tool), e.repo)
+
 proc buildMod(e: Env; modPathIn: string): bool =
   let modPath = absolutePathOf(modPathIn)
   let source = sourceOf(modPath)
@@ -328,6 +362,8 @@ proc buildMod(e: Env; modPathIn: string): bool =
   if not symTab(e):
     return false
   if not idxBind(e):
+    return false
+  if not settingsBacked(e):
     return false
 
   let dir = parentOf(source)
@@ -1351,6 +1387,16 @@ proc cmdBuildOne(e: Env; target: string): int =
     # is that they need no client and no deploy -- were the most expensive to
     # run, and the temptation was to skip them. They take seconds this way.
     result = if buildOverlayTests(e): 0 else: 1
+  of "realtest":
+    # `buildRealTest` was reachable only from the bare `aowl build`, which is
+    # 18 minutes cold -- so the harness that asserts against a real imported
+    # database was the most expensive thing in the repo to compile, and an
+    # edit to it went unchecked until somebody paid that.
+    result = if buildRealTest(e): 0 else: 1
+  of "settings", "settingscheck":
+    # The cheapest gate in the repo, given its own name so it can be run
+    # without compiling a mod -- the same reasoning as `overlaytests`.
+    result = if settingsBacked(e): 0 else: 1
   of "mods":
     for m in modDirs(e):
       discard buildMod(e, m)
@@ -1366,7 +1412,7 @@ proc cmdBuildOne(e: Env; target: string): int =
   else:
     err "unknown build target: " & target
     note "targets: host backend sim launch installer emutest verify probe " &
-         "mods examples deploy"
+         "settings realtest mods examples deploy"
     note "or a mod path, with `aowl build-mod mods\\tarkov`"
     result = 1
 
