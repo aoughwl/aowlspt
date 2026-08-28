@@ -160,22 +160,7 @@ hierarchy of wrong children without faulting at all.
 whole search) and says which happened: `searched EXHAUSTIVELY` vs `STOPPED EARLY`
 — and STOPPED EARLY is **not** proof a name is absent.
 
-**`rect EXPR` now prints real numbers.** It used to call
-`RectTransform::get_anchoredPosition`/`get_sizeDelta` and admit it could not
-decode a Vector2 returned BY VALUE, pointing at `fields` as a workaround —
-which measurement then showed is impossible: `UnityEngine.RectTransform`
-declares exactly ONE il2cpp field (`reapplyDrivenProperties`, static);
-`m_AnchorMin`/`m_AnchoredPosition`/`m_SizeDelta`/`m_Pivot` are native-side, not
-il2cpp fields. The fix was a struct-return decoder, not a field offset: MEASURED
-from `GameAssembly.dll` prologues (not assumed) that on this build's Win64 ABI a
-Vector2 (8 bytes) comes back **packed in RAX**, while a Rect (16 bytes, `x,y,w,h`)
-is bigger than 8 bytes and comes back through a **hidden-buffer (sret)** —
-`(retbuf in RCX, this in RDX, MethodInfo* in R8)`. `rect` now prints
-`anchoredPosition`, `sizeDelta`, `anchorMin`, `anchorMax`, `pivot` (all via the
-RAX shape) and `rect (x,y,w,h)` (via sret), each resolved by name through the
-same byte-verified target table `call` uses, and each checked NOT `[shared]`
-before being trusted. A getter that fails prologue verify or a struct call that
-comes back NaN/absurd prints a refusal, never a plausible-looking number.
+**`rect EXPR` prints real numbers**: `anchoredPosition`, `sizeDelta`, `anchorMin`, `anchorMax`, `pivot` and `rect (x,y,w,h)`. Do NOT reach for `fields` instead -- `UnityEngine.RectTransform` declares exactly ONE il2cpp field (`reapplyDrivenProperties`, static); the rest are native-side. MEASURED Win64 ABI on this build: a Vector2 (8 bytes) comes back packed in RAX; a Rect (16 bytes) comes back via hidden-buffer sret `(retbuf in RCX, this in RDX, MethodInfo* in R8)`. Every getter is byte-verified and checked NOT `[shared]`; a failed verify or a NaN/absurd struct prints a refusal, never a plausible number.
 
 `find NAME X` with exactly ONE trailing token is genuinely ambiguous against the
 `[ROOT] [BUDGET]` grammar — `X` disambiguates by **readability**: if it reads
@@ -189,22 +174,7 @@ as a valid Transform — `find` never again reports a "genuinely NOT PRESENT" or
 "searched EXHAUSTIVELY" verdict when zero valid nodes were actually visited; it
 says plainly that nothing was examined.
 
-**`findtext` shares `find`'s root/budget parser and reporter** (`iFindResolveRoot`,
-`iFindValidateRoot`, `iFindParseBudget(Noted)`, `iFindReportGeneric`) — it was
-added on a different branch and had drifted to reproduce the same bugs `find`
-had just been fixed for; that is now structurally harder, since only the
-per-node predicate differs. It also fixes two defects `find` never had:
-`findtext` used to echo its own `> findtext ...` header **every resumed
-frame** (57 lines around a 4-line answer) because the echo-suppression check
-only ever tested `find`'s resume flag, not `findtext`'s; and every hit is now
-checked against `GameObject::get_activeInHierarchy` and tagged in the output,
-because a hit on an inactive node **is not pressable** — pressing one returns
-success and does nothing (fact #72). `findtext` therefore searches **ACTIVE
-nodes only by default**, matching the Nimony `aowl ui` driver; pass a
-trailing `all` to include inactive hits, and the summary line always states
-which scope was actually searched. `find` has the identical active/inactive
-blind spot and was deliberately **left unchanged** — flip its default only as
-a considered decision, not silently.
+**`findtext` shares `find`'s root/budget parser and reporter**, so the two cannot drift apart; only the per-node predicate differs. Every hit is checked against `GameObject::get_activeInHierarchy` and tagged, because a hit on an INACTIVE node is **not pressable** -- pressing one returns success and does nothing (fact #72). `findtext` therefore searches ACTIVE nodes only by default; pass a trailing `all` to include inactive hits, and the summary always states which scope was searched. `find` has the identical blind spot and was deliberately LEFT UNCHANGED -- flip its default only as a considered decision, not silently.
 
 Write the command file **without a BOM**. PowerShell 5.1's `Set-Content -Encoding
 utf8` emits one; it is stripped now, but `printf` from Bash is the safe habit.
@@ -254,46 +224,12 @@ line. Marker list is data in `tools/deploy.json`; **never edit it to make a chec
 
 ## 5. IL2CPP facts
 
-Reflection is **NOT dead** -- it is **token-gated**, and the old wording in this file
-was wrong about the mechanism for months. Measured 2026-08-26 by offline disassembly
-(`docs/IL2CPP_EXPORTS.md`): this is **stock IL2CPP with a gated export ABI**. 38 of the
-241 `il2cpp_*` exports take an **extra trailing argument we never passed** -- a pointer
-to 32 bytes -- and `memcmp` it before doing any work. On mismatch they do not return
-NULL and do not abort: they tail-call a trap that lazily seeds a per-thread
-**MT19937-64** and returns a **uniform random non-zero uint64**. THAT is why a nil check
-passes and the first dereference kills the client. It was never poisoned metadata; it
-was a random number. 20 gates are STATIC (expected bytes are a constant in `.rdata`, all
-extracted) and 18 are NONCE-derived via the exported, non-stock `il2cpp_nonce(apiId)`.
+Reflection is **NOT dead** -- it is **TOKEN-GATED**. This is stock IL2CPP with a gated export ABI (`docs/IL2CPP_EXPORTS.md` -- NOTE: that file currently lives ONLY on the
+unmerged branch `feat-il2cpp-export-map`, not here; measured 2026-08-26). **40** of the 241 `il2cpp_*` exports (22 static + 18 nonce; an earlier count of 38 was wrong) take an **extra trailing argument we never pass** -- a pointer to 32 bytes -- and `memcmp` it first. On mismatch they do NOT return NULL: they return a **uniform random non-zero uint64** from a per-thread MT19937-64. THAT is why a nil check passes and the first dereference kills the client. 20 gates are STATIC (expected bytes extracted from `.rdata`); 18 are NONCE-derived via the exported `il2cpp_nonce(apiId)`.
 
-Two corrections that follow, because both were stated here as fact and are false:
-`il2cpp_object_get_class` does **not** fault -- it is literally `mov rax,[rcx]; ret`, one
-of 33 three-instruction accessors that validate nothing, so a bad pointer yields a
-*plausible number* silently, which is worse. `il2cpp_value_box` is likewise intact and
-ungated. **Nothing a mod needs is stubbed**: 386 exports, all in `.text`, no forwarders,
-none at the universal stub; the 9 `ret0` exports are ordinary release no-ops
-(debugger/profiler/android/thread-affinity).
+Two corrections, because both were once stated here as fact and are FALSE: `il2cpp_object_get_class` does **not** fault -- it is `mov rax,[rcx]; ret`, so a bad pointer yields a *plausible number* silently, which is worse; and `il2cpp_value_box` is intact and ungated. **Nothing a mod needs is stubbed** (386 exports, none at the universal stub; the 9 `ret0` ones are ordinary release no-ops).
 
-**None of this changes what you should DO today.** Keep using raw static-offset field
-read/write, direct calls at byte-verified static RVA, and `il2cpp_string_new` -- a direct
-RVA call bypasses the export ABI entirely and is unaffected by any gate. What changes is
-the *reason*: never write "reflection is dead" into a comment, a doc or a refusal
-message again. Say the export is token-gated and its failure mode is a plausible random
-value. Runtime managed **type injection is PLAUSIBLE, not blocked** -- every
-injector-relevant export (`object_new`, `gc_alloc_fixed`, `gchandle_*`,
-`runtime_class_init`, `runtime_invoke`, `add_internal_call`, `type_get_object`) is
-ungated -- but nothing about constructing a valid `Il2CppClass` has been checked, so
-"plausible" means the export surface does not block it, not that it works. Convention: instance
-`RCX=this, RDX/R8/R9=args`, then a **hidden trailing `const MethodInfo*`**; NULL is fine
-except for shared generics. Imagebase `0x180000000`; generated code lives in the
-**`il2cpp` PE section, not `.text`**. Offsets come from `Il2CppMetadataRegistration.fieldOffsets`
-via `tools/il2cpp_resolve.py` (`find` / `type` / `bytes <RVA>` / `fields <Type>`) or
-`tools/fldoff.py` (`fields <Type>` / `field <Type> <fieldName>`) — a thin CLI over the
-same `Resolver`, with a mandatory self-check (`System.String._stringLength@0x10`,
-`_firstChar@0x14`) that must pass, printing nothing else, before any offset is
-trusted — **never guess**. Full signatures are reachable offline
-(`returnType@8`, `parameterStart@16`, `parameterCount@34`), so a patch frame shape
-should be **derived, never inferred from a method name**. Metadata strings are
-encrypted (`tools/metablob.py`; decrypted cache at `.cache/global-metadata.dec.dat`).
+**What to DO today:** raw static-offset field read/write, direct calls at byte-verified static RVA, and `il2cpp_string_new` -- a direct RVA call bypasses the export ABI entirely and no gate affects it. Never write "reflection is dead" into a comment, a doc or a refusal message again; say the export is token-gated and its failure mode is a plausible random value. Runtime managed **type injection is PLAUSIBLE, not blocked** -- every injector-relevant export (`object_new`, `gc_alloc_fixed`, `gchandle_*`, `runtime_class_init`, `runtime_invoke`, `add_internal_call`, `type_get_object`) is ungated -- but constructing a valid `Il2CppClass` has NOT been checked, so "plausible" means the export surface does not block it, not that it works. Convention: instance `RCX=this, RDX/R8/R9=args`, then a **hidden trailing `const MethodInfo*`**; NULL is fine except for shared generics. Imagebase `0x180000000`; generated code lives in the **`il2cpp` PE section, not `.text`**. Offsets come from `Il2CppMetadataRegistration.fieldOffsets` via `tools/il2cpp_resolve.py` (`find`/`type`/`bytes <RVA>`/`fields <Type>`) or `tools/fldoff.py`, each with a mandatory self-check (`System.String._stringLength@0x10`, `_firstChar@0x14`) that must pass before any offset is trusted -- **never guess**. Full signatures are reachable offline (`returnType@8`, `parameterStart@16`, `parameterCount@34`), so a patch frame shape should be **derived, never inferred from a method name**. Metadata strings are encrypted (`tools/metablob.py`; cache at `.cache/global-metadata.dec.dat`).
 
 - **Walk from a verified live object; never trust an offset that can read null.**
   (`SettingsTab._rectTransform`@0x78 reads null; the row container was only ever reached
