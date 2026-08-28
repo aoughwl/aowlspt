@@ -110,6 +110,22 @@ import invoke
 ## prologue check now compares against the snapshot instead of live memory; the
 ## check itself is unchanged and just as strict. See `aowlspt_prologue.h`.
 {.emit: """#include "aowlspt_prologue.h" """.}
+
+## THE TOKEN-GATED IL2CPP EXPORT LAYER (`aowlspt_il2cpp_gates.h`) and its
+## live self-test (`aowlspt_il2cpp_gatetest.h`).
+##
+## 40 of the 241 `il2cpp_*` exports take an extra trailing 32-byte token
+## that stock IL2CPP does not have, and `memcmp` it before doing any work.
+## On a mismatch they do NOT return NULL: they tail-call a trap that
+## returns MT19937-64 output. That is why a nil check passed and the first
+## dereference killed the client. Included AFTER `aowlspt_prologue.h`
+## because the layer follows the same startup-snapshot discipline, and it
+## needs `aowlspt_shim.h` (guard + VirtualQuery), which is already above.
+##
+## Nothing here runs unless `il2cppGates` is set. It ships DEFAULT OFF and
+## no mod resolves by name through it yet.
+{.emit: """#include "aowlspt_il2cpp_gates.h" """.}
+{.emit: """#include "aowlspt_il2cpp_gatetest.h" """.}
 ## PATCH BY VERIFIED STATIC RVA -- the address side of it, in C because it is
 ## three Win32 calls and no Nim.
 ##
@@ -806,6 +822,30 @@ proc cProPrimeAll() {.importc: "aowl_pro_prime_all", nodecl.}
 proc cProRowsUsed(): int32 {.importc: "aowl_pro_rows_used", nodecl.}
 proc cProPrimedCount(): int32 {.importc: "aowl_pro_primed_count", nodecl.}
 proc cProLazyCount(): int32 {.importc: "aowl_pro_lazy_count", nodecl.}
+# The token-gate layer. `cGateSetEnabled` is the ONLY thing that arms it;
+# with the flag off every `aowl_gate_call` returns AOWL_GATE_DISABLED and
+# no gated export is called at all.
+proc cGateBind(): int32 {.importc: "aowl_gate_bind_module", nodecl.}
+proc cGateSnapshot() {.importc: "aowl_gate_snapshot", nodecl.}
+proc cGateSetEnabled(on: int32) {.importc: "aowl_gate_set_enabled", nodecl.}
+proc cGateIsGated(name: cstring): int32 {.importc: "aowl_gate_is_gated", nodecl.}
+proc cGateWhy(w: int32): cstring {.importc: "aowl_gate_why", nodecl.}
+# The live self-test. Its verdict is PASS / FAIL / INCONCLUSIVE -- never a
+# boolean, because "the gate never armed" is not a pass.
+proc cGtRun() {.importc: "aowl_gt_run", nodecl.}
+proc cGtCaseCount(): int32 {.importc: "aowl_gt_case_count", nodecl.}
+proc cGtVerdict(i: int32): int32 {.importc: "aowl_gt_verdict", nodecl.}
+proc cGtPassCount(): int32 {.importc: "aowl_gt_pass_count", nodecl.}
+proc cGtFailCount(): int32 {.importc: "aowl_gt_fail_count", nodecl.}
+proc cGtInconcCount(): int32 {.importc: "aowl_gt_inconc_count", nodecl.}
+proc cGtStaticArmed(): int32 {.importc: "aowl_gt_static_armed", nodecl.}
+proc cGtNonceArmed(): int32 {.importc: "aowl_gt_nonce_armed", nodecl.}
+proc cGtRefused(): int32 {.importc: "aowl_gt_refused_count", nodecl.}
+proc cGtPrologueBad(): int32 {.importc: "aowl_gt_prologue_bad_count", nodecl.}
+proc cGtFaults(): int32 {.importc: "aowl_gt_fault_count", nodecl.}
+proc cGtFirstRefusal(): cstring {.importc: "aowl_gt_first_refusal", nodecl.}
+proc cGtLine(i: int32): cstring {.importc: "aowl_gt_line", nodecl.}
+var gGatesOn = false
 proc cProBadCount(): int32 {.importc: "aowl_pro_bad_count", nodecl.}
 proc cProHave(rva: uint32): int32 {.importc: "aowl_pro_have", nodecl.}
 ## THE prologue verify, bound here because patch-by-RVA is its first caller on
@@ -6686,6 +6726,17 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
     info "bridgeUiProbe is set: the drain self-test will also instantiate and " &
          "parent Unity UI GameObjects on the Unity thread once, to prove the " &
          "native settings-injection path"
+  # The token-gated il2cpp export layer. DEFAULT OFF, and read here only;
+  # it cannot BIND yet, because GameAssembly.dll is not mapped at
+  # DLL-attach -- the same phase the nameIndex stamp cannot verify in.
+  # Binding, the startup snapshot and the self-test all happen in
+  # `hostReady`, after the runtime is up.
+  gGatesOn = readBoolKey("il2cppGates")
+  if gGatesOn:
+    info "il2cppGates is set. The token-gated il2cpp export layer will " &
+         "bind once GameAssembly.dll is mapped, and will run its live " &
+         "self-test then. It is NOT bound yet and nothing resolves by " &
+         "name through it: no mod has been switched over."
   gCodeGenAudit = readBoolKey("codeGenAudit")
   gRegionOn = readBoolKey("sharedRegion")
   betaNoticeReadFlags()
@@ -7212,6 +7263,65 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
              else: "") & "). Every later prologue check compares against " &
             "this, not against live memory, so two features may share one " &
             "target and both still verify it."
+
+      # THE TOKEN-GATE LAYER, and it belongs exactly here: GameAssembly.dll
+      # is now mapped (the runtime came up through it), and no `bind*`
+      # below has installed a detour yet, so every gated export still
+      # holds its ORIGINAL bytes. The layer prologue-verifies each of its
+      # 40 exports against what it captures now, never against live
+      # memory -- snapshotting later would record trampolines.
+      if gGatesOn:
+        if cGateBind() == 0:
+          warn "il2cppGates is set but the layer could NOT bind: " &
+               "GetModuleHandleA(GameAssembly.dll) returned NULL or its " &
+               "PE headers were unreadable at this point in boot. No " &
+               "gated export will be called; nothing is degraded, " &
+               "because nothing resolves by name through it yet."
+        else:
+          cGateSnapshot()
+          cGateSetEnabled(1'i32)
+          cGtRun()
+          # Per-case detail FIRST, so the summary below can be checked
+          # against the raw numbers instead of being taken on trust.
+          var i = 0'i32
+          let n = cGtCaseCount()
+          while i < n and i < 8'i32:      # capped
+            let line = $cGtLine(i)
+            if cGtVerdict(i) == 1'i32: okLog "il2cpp gates: " & line
+            elif cGtVerdict(i) == 2'i32: fail "il2cpp gates: " & line
+            else: warn "il2cpp gates: " & line
+            inc i
+          # THE ONE-LINE VERDICT. It states what was proven and what was
+          # not, and it never says "safe" off the back of a call that
+          # merely returned something -- the trap returns something too.
+          let verdict =
+            if cGtFailCount() > 0: "UNSAFE -- a gated export did not " &
+              "honour its token; do NOT resolve by name"
+            elif cGtPassCount() >= 2: "the gate mechanism is PROVEN IN " &
+              "THIS CLIENT for both flavours. By-name resolution is now " &
+              "POSSIBLE; it is NOT automatically safe to HOOK, because " &
+              "6,261 RVAs have more than one owner"
+            elif cGtPassCount() > 0: "PARTIAL -- one flavour proved, the " &
+              "other did not; treat by-name as UNPROVEN"
+            else: "INCONCLUSIVE -- nothing was proven either way"
+          info "il2cpp gates: " & $int(cGtStaticArmed()) & " of " &
+               "22 static ARMED, " & $int(cGtNonceArmed()) & " of 18 " &
+               "nonce ARMED, " & $int(cGtRefused()) & " refused (" &
+               $int(cGtPrologueBad()) & " on prologue), " &
+               $int(cGtFaults()) & " faulted; self-test " &
+               $int(cGtPassCount()) & " PASS / " & $int(cGtFailCount()) &
+               " FAIL / " & $int(cGtInconcCount()) & " INCONCLUSIVE -- " &
+               verdict
+          if cGtRefused() > 0:
+            info "il2cpp gates: first refusal was " & $cGtFirstRefusal()
+          if cGtFailCount() > 0:
+            # A FAIL means the map is stale or this is a different build.
+            # Disarming is the only honest response: leaving it armed
+            # would let a later caller take a random pointer.
+            cGateSetEnabled(0'i32)
+            warn "il2cpp gates: DISARMED after a FAIL. Regenerate " &
+                 "abi/aowlspt_il2cpp_gates_data.h with " &
+                 "tools/il2cpp_gatescan.py against this GameAssembly.dll."
 
       # Before any mod loads, and for one reason that is not about timing: the
       # detour engine hands out slots in ascending order and the firing path
