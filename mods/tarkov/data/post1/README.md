@@ -20,6 +20,7 @@ Read by `emu/post1.nim`. Regenerate from a capture with `tools/bsgwire.py`.
 | `serversettings.json` | the `serverSettings` of `POST /client/match/local/start` | 158 | 3,927 |
 | `locationpaths.json` | the `paths` of `GET /client/locations` | 134 | 1,670 |
 | `customizationstorage.json` | `POST /client/customization/storage` | 086 | 3,397 |
+| `defaultequipmentpresets.json` | the `equipmentBuilds` of `POST /client/builds/list` | 123 | 57,428 |
 
 Source capture: `mods/tarkov/data/capture/raid1`, a full session against the
 live backend on 2026-08-20, client build 1.1.0.1.46777.
@@ -30,6 +31,20 @@ entries, which depend on the game edition and are **not** stored here. Nothing
 in this server grows this list as a player unlocks things, so it is the
 starting wardrobe permanently -- a smaller lie than the object-shaped answer it
 replaces, and still one.
+
+`defaultequipmentpresets.json` is the twelve `BuildType: "Standard"` loadouts
+(Papasha, Hunter, Shotgunner, Scout, Fighter, Guard, Gunslinger, Sharpshooter,
+Operator, Marksman, Raider, Robber; 352 items between them) that the real
+backend returns to every profile. They are a constant of the install, never
+stored under a profile's builds key, and merged in after the player's own by
+`emu/builds.withDefaultEquipment`.
+
+They are load-bearing, not decoration. `EquipmentBuildsScreen.Show` calls
+`Enumerable.First` on `equipmentBuilds`; with the list empty it throws
+`InvalidOperationException: Sequence contains no elements` inside `Show`, and
+the kits screen opens and closes in the same frame. Our answer was valid JSON,
+correctly typed and complete on every key -- and empty, which no shape check
+can see.
 
 `locationpaths.json` is the transit graph -- 18 edges over 10 maps. It is used
 only when the database has none, which today is always: SPT keeps the graph in

@@ -4604,6 +4604,67 @@ proc main(): int =
   line "  " & $restarts & " restarts over one store, " & $markers.len &
        " distinct id runs, " & $everySeen.len & " ids seen"
 
+  # -- the kits screen: a valid, correctly typed, EMPTY answer is a crash ---
+  #
+  # `EFT.UI.EquipmentBuildsScreen.Show` calls `System.Linq.Enumerable.First`
+  # on `equipmentBuilds`. An empty list throws `InvalidOperationException:
+  # Sequence contains no elements` inside `Show`, so the screen opens and
+  # closes in the same frame -- measured live in the client's own
+  # `errors_000.log` at 2026-08-28 14:06:45, one line after the client logged
+  # `_buildList empty` from `UpdateBuildList()`.
+  #
+  # Every check we already had passed on that response. It had all three
+  # keys, both lists were arrays, nothing was mistyped, the envelope matched.
+  # It was EMPTY, and emptiness is invisible to a shape check. So these
+  # checks are about CONTENT, and each is stated as a negative that a real
+  # regression can falsify.
+  heading "Saved builds"
+  let blist = call("/client/builds/list", "")
+  let blAt = dataAt(blist)
+  let eqBuilds = elements(blist.body,
+                          memberValue(blist.body, blAt, "equipmentBuilds"))
+  check("the kits screen is never handed an empty equipment list",
+        eqBuilds.len > 0,
+        "equipmentBuilds is [] -- EquipmentBuildsScreen.Show() will throw")
+  var stock = 0
+  var husks = 0
+  var danglingRoot = 0
+  var unnamed = 0
+  for b in eqBuilds:
+    if textField(blist.body, b, "BuildType") == "Standard":
+      inc stock
+    if textField(blist.body, b, "Name").len == 0:
+      inc unnamed
+    let items = elements(blist.body, memberValue(blist.body, b, "Items"))
+    if items.len == 0:
+      inc husks
+      continue
+    let root = textField(blist.body, b, "Root")
+    var rooted = false
+    for it in items:
+      if textField(blist.body, it, "_id") == root:
+        rooted = true
+    if not rooted:
+      inc danglingRoot
+  check("all twelve stock loadouts the real backend ships are among them",
+        stock == 12, $stock & " of 12 carry BuildType=Standard")
+  check("and not one of them is a named husk with no Items",
+        husks == 0, $husks & " builds have an empty Items list")
+  check("and every build's Root is the _id of one of its own Items",
+        danglingRoot == 0, $danglingRoot & " builds point Root at nothing")
+  check("and every build has a name to draw on the row",
+        unnamed == 0, $unnamed & " builds have no Name")
+  # The other two lists are legitimately empty on a fresh profile -- the
+  # capture shows the real backend sending `[]` for both (seq 123) -- so
+  # emptiness there is asserted as CORRECT rather than merely tolerated.
+  let wpBuilds = elements(blist.body,
+                          memberValue(blist.body, blAt, "weaponBuilds"))
+  let mgBuilds = elements(blist.body,
+                          memberValue(blist.body, blAt, "magazineBuilds"))
+  check("a profile that saved nothing has no weapon or magazine builds",
+        wpBuilds.len == 0 and mgBuilds.len == 0,
+        $wpBuilds.len & " weapon, " & $mgBuilds.len & " magazine")
+
   if not keep:
     cSpawnKill(server)
 
