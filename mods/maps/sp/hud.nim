@@ -73,11 +73,51 @@ import world  # the Snapshot this file mirrors; no game memory is read here
  * bytes out of it. If that packing ever changes, the colours here go wrong --
  * visibly and harmlessly, never fatally. */
 
-typedef struct { float x, y, z; int32_t bot; } MHudEnt;
+typedef struct { float x, y, z; int32_t bot; uint64_t key; } MHudEnt;
+
+/* ---- indicator LIFETIME ------------------------------------------------ *
+ *
+ * Defect 2 as the user reported it: "the audio indicators always stay on the
+ * screen instead of fading out." The honest half of that report is the
+ * lifetime; the other half is named in sp/world.nim and in maps.nim's
+ * diagnostic, and is repeated here because a reader of this file must not
+ * conclude the fade made these into audio cues:
+ *
+ *   THERE IS NO SOUND FEED. Nothing in this mod subscribes to a shot, a
+ *   footstep or any other audio event. Every indicator is one LIVE PLAYER out
+ *   of `GameWorld.AllAlivePlayersList`, refreshed every collection. An
+ *   indicator "always staying on the screen" for a bot that is still standing
+ *   there is that feed working as built, not a decay that failed to run.
+ *
+ * What the decay below genuinely fixes, and what it is honestly for:
+ *
+ *   * a contact that DROPS OUT of the feed -- dies, despawns, exceeds the
+ *     list cap, or fails its position read -- used to vanish between one frame
+ *     and the next. It now holds at its last known place and fades out, which
+ *     is both what a transient should do and what makes the mark readable.
+ *   * it is the mechanism an event feed needs. When a sound-event source is
+ *     wired up, it stamps a track and this is already the decay.
+ *
+ * A track is keyed by the entity's identity (the Player pointer, passed in as
+ * an opaque u64), NOT by its index in the frame's array: indices shuffle every
+ * frame as players enter and leave the list, so an index-keyed table would
+ * hand one contact's age to another and produce a mark that flickers between
+ * two ages. The table is FIXED SIZE and never allocates -- rule 7.
+ */
+typedef struct {
+    uint64_t key;
+    float    x, y, z;
+    int32_t  bot;
+    int64_t  lastMs;    /* when this contact was last REFRESHED by the feed */
+    int32_t  live;      /* 1 = occupied slot */
+} MHudTrack;
 
 static struct {
     int32_t  n;
     MHudEnt  e[MHUD_MAX];
+    MHudTrack tr[MHUD_MAX];
+    int64_t  nowMs;
+    int64_t  holdMs, fadeMs;
     float    px, py, pz;
     int32_t  hasLocal;
     float    heading;        /* radians; 0 = +Z. Only used if hasHeading. */
@@ -105,9 +145,37 @@ static struct {
      * the projector never arrived read exactly like one in which it did --
      * which is the failure this project keeps paying for. */
     int64_t  indProjected, indBearing, indRefused;
+    /* lifetime accounting, separate from the two draw paths above:
+     *   indFaded   marks drawn at LESS than full alpha (the decay is running)
+     *   indExpired tracks evicted because their window elapsed (it completes)
+     *   indStale   marks drawn for a contact NOT in this frame's feed
+     * All three are zero when nothing ever drops out of the feed -- which is
+     * itself the answer to "is the feed event-driven or persistent?". */
+    int64_t  indFaded, indExpired, indStale;
     int32_t  screenFromRegion; /* 1 = measured back buffer, 0 = config guess */
     int32_t  handle;
 } g_mhud;
+
+/* THE CLOCK. `GetTickCount64` is declared here rather than by including
+ * windows.h, which this translation unit does not otherwise need; the
+ * declaration is byte-compatible with the one in winbase.h (on x64 __stdcall
+ * is the same calling convention as the default, so a mismatch is not
+ * possible). It is monotonic, needs no QueryPerformanceFrequency, cannot fail,
+ * and its ~15ms resolution is two orders of magnitude finer than the shortest
+ * fade window this feature allows.
+ *
+ * BOTH the refresh and the draw read the clock DIRECTLY rather than sharing a
+ * timestamp captured at publish time. If the feed stops publishing -- the raid
+ * ends, the collector self-disables, the host loses the GameWorld -- a shared
+ * timestamp would freeze, every age would stay at zero, and every indicator on
+ * screen would persist forever. That is the exact defect being fixed, so it
+ * must not be reachable by the fix's own plumbing. */
+#if defined(_WIN32)
+__declspec(dllimport) unsigned long long __stdcall GetTickCount64(void);
+static int64_t mhud_now_ms(void) { return (int64_t)GetTickCount64(); }
+#else
+static int64_t mhud_now_ms(void) { return 0; }
+#endif
 
 static void mhud_reset(void) {
     memset(&g_mhud, 0, sizeof(g_mhud));
@@ -115,6 +183,8 @@ static void mhud_reset(void) {
     g_mhud.radiusM        = 120.0f;
     g_mhud.mapSpanM       = 500.0f;
     g_mhud.indicatorInset = 48.0f;
+    g_mhud.holdMs         = 400;
+    g_mhud.fadeMs         = 1600;
 }
 
 /* ---- the mirror, filled on Unity's thread before the draw ------------- */
@@ -126,15 +196,50 @@ static void mhud_begin(float px, float py, float pz, int32_t hasLocal,
     g_mhud.hasLocal = hasLocal ? 1 : 0;
     g_mhud.heading = heading;
     g_mhud.hasHeading = hasHeading ? 1 : 0;
+    g_mhud.nowMs = mhud_now_ms();   /* diagnostic only; the draw re-reads it */
 }
 
-static void mhud_add(float x, float y, float z, int32_t bot) {
+static void mhud_lifetime(int64_t holdMs, int64_t fadeMs) {
+    g_mhud.holdMs = holdMs < 0 ? 0 : holdMs;
+    g_mhud.fadeMs = fadeMs < 0 ? 0 : fadeMs;
+}
+
+/* Refresh this contact's track, or claim a free slot for it. Linear and
+ * CAPPED at MHUD_MAX both ways, so the worst case is 128*128 comparisons in a
+ * frame and there is no unbounded loop and no allocation. A full table simply
+ * declines the newcomer rather than evicting a live track: dropping a mark we
+ * never had is a smaller lie than dropping one already on screen. */
+static void mhud_touch(uint64_t key, float x, float y, float z, int32_t bot) {
+    int32_t i, free_ = -1;
+    if (key == 0) return;              /* no identity => cannot be aged */
+    for (i = 0; i < MHUD_MAX; i++) {
+        if (g_mhud.tr[i].live && g_mhud.tr[i].key == key) {
+            g_mhud.tr[i].x = x; g_mhud.tr[i].y = y; g_mhud.tr[i].z = z;
+            g_mhud.tr[i].bot = bot;
+            g_mhud.tr[i].lastMs = mhud_now_ms();
+            return;
+        }
+        if (!g_mhud.tr[i].live && free_ < 0) free_ = i;
+    }
+    if (free_ < 0) return;
+    g_mhud.tr[free_].key    = key;
+    g_mhud.tr[free_].x      = x;
+    g_mhud.tr[free_].y      = y;
+    g_mhud.tr[free_].z      = z;
+    g_mhud.tr[free_].bot    = bot;
+    g_mhud.tr[free_].lastMs = mhud_now_ms();
+    g_mhud.tr[free_].live   = 1;
+}
+
+static void mhud_add(float x, float y, float z, int32_t bot, uint64_t key) {
     if (g_mhud.n >= MHUD_MAX) return;   /* capped by construction */
     g_mhud.e[g_mhud.n].x = x;
     g_mhud.e[g_mhud.n].y = y;
     g_mhud.e[g_mhud.n].z = z;
     g_mhud.e[g_mhud.n].bot = bot ? 1 : 0;
+    g_mhud.e[g_mhud.n].key = key;
     g_mhud.n++;
+    mhud_touch(key, x, y, z, bot ? 1 : 0);
 }
 
 static void mhud_configure(float radiusM, float screenW, float screenH,
@@ -280,9 +385,12 @@ static void mhud_draw(void* user, int64_t frame) {
 
     /* ---- every contact, on all three surfaces ---------------------------- *
      * Command budget: the map frame is at most 2 + 2*31 + 2 = 66, the radar
-     * frame 3, and each entity contributes at most 1 (map) + 2 (radar) + 2
-     * (indicator) = 5. With MHUD_MAX 128 that is 66 + 3 + 640 = 709 against
-     * AOWL_REGION_MAX_CMDS (2048). It cannot overrun.
+     * frame 3, and each entity contributes at most 1 (map) + 2 (radar) = 3.
+     * The indicator loop that follows is over a SEPARATE table, also capped at
+     * MHUD_MAX, contributing at most 2 each. With MHUD_MAX 128 that is
+     * 66 + 3 + 384 + 256 = 709 against AOWL_REGION_MAX_CMDS (2048) -- the same
+     * bound as before the indicators moved out of this loop. It cannot
+     * overrun.
      */
     for (i = 0; i < g_mhud.n; i++) {
         float ex = g_mhud.e[i].x, ez = g_mhud.e[i].z;
@@ -323,46 +431,87 @@ static void mhud_draw(void* user, int64_t frame) {
                 aowl_region_fill(b.x + -1.0f, b.y + 4.0f, 2.0f, 2.0f, col);
         }
 
-        /* ---- the DIRECTIONAL indicator ---------------------------------- *
-         * Preferred path: ask the region's projector where this world point
-         * is on screen and clamp that to the screen edge. That answer is
-         * camera-relative -- it points where the player is actually LOOKING,
-         * which is the whole point of the feature.
-         *
-         * `aowl_region_project` returns 0 when no projector has been installed
-         * (nothing in the host calls `aowl_region_set_projector` yet). That
-         * zero is a REFUSAL and is treated as one: we fall back to the
-         * north-up bearing ring and count the fallback separately, so the
-         * status line can never present a north-up guess as a look-relative
-         * answer. */
-        if (g_mhud.indicatorsOn && d > 0.001f) {
-            float sx = 0.0f, sy = 0.0f;
-            MmPt m;
-            int offscreen = 0;
-            if (aowl_region_project(ex, g_mhud.e[i].y, ez, &sx, &sy)) {
-                /* The projector reports nothing about the camera plane through
-                 * this ABI, so `behind` cannot be known here and is passed as
-                 * 0. mm_indicator handles a behind-camera point correctly when
-                 * told; it is simply never told, which is a capability gap in
-                 * the projector contract and is named as one rather than
-                 * papered over with a sign heuristic. */
-                if (mm_indicator(sx, sy, 0, scrW, scrH,
-                                 g_mhud.indicatorInset, &m, &offscreen)) {
-                    aowl_region_fill(m.x - 3.0f, m.y - 3.0f, 6.0f, 6.0f, col);
-                    if (offscreen)
-                        aowl_region_box(m.x - 5.0f, m.y - 5.0f, 10.0f, 10.0f,
-                                        1.0f, col);
-                    g_mhud.indProjected++;
-                } else {
-                    g_mhud.indRefused++;
-                }
-            } else if (mm_bearing_ring(ex, ez, g_mhud.px, g_mhud.pz, rot,
-                                       scrW, scrH, 0.35f, &m)) {
+    }
+
+    /* ---- the DIRECTIONAL indicators, which are TRANSIENTS ---------------- *
+     *
+     * Driven off the TRACK table, not off this frame's entity array, because
+     * an indicator has to outlive the contact that raised it -- that is what
+     * makes it a transient rather than a second radar. A track that is still
+     * being refreshed draws at full alpha; one that has stopped being
+     * refreshed holds its last known place, ramps down over the configured
+     * window, and is EVICTED. Eviction is unconditional and happens whether or
+     * not the mark was drawn, so a table full of dead contacts cannot
+     * accumulate and starve a live one of a slot.
+     *
+     * Preferred path: ask the region's projector where this world point is on
+     * screen and clamp that to the screen edge -- camera-relative, pointing
+     * where the player is actually LOOKING.
+     *
+     * `aowl_region_project` returns 0 when no projector has been installed.
+     * That zero is a REFUSAL and is treated as one: we fall back to the
+     * bearing ring and count the fallback separately, so the status line can
+     * never present a fallback as a look-relative answer. The fallback is no
+     * longer north-up WHENEVER A HEADING WAS MEASURED -- it is passed the same
+     * `rot` the radar uses, so a turning player now turns the ring too. With
+     * no heading measured it is north-up exactly as before, and the diagnostic
+     * still says which of the two happened.
+     */
+    for (i = 0; i < MHUD_MAX; i++) {
+        float ex, ez, ey, d, alpha;
+        int64_t age;
+        uint32_t col;
+        MmPt m;
+        int offscreen = 0;
+        float sx = 0.0f, sy = 0.0f;
+
+        if (!g_mhud.tr[i].live) continue;
+
+        age = mhud_now_ms() - g_mhud.tr[i].lastMs;
+        if (mm_fade_expired(age, g_mhud.holdMs, g_mhud.fadeMs)) {
+            g_mhud.tr[i].live = 0;
+            g_mhud.indExpired++;
+            continue;
+        }
+        if (!g_mhud.indicatorsOn) continue;
+        if (g_mhud.tr[i].bot && !g_mhud.showBots) continue;
+        if (!g_mhud.tr[i].bot && !g_mhud.showPlayers) continue;
+
+        alpha = mm_fade_alpha(age, g_mhud.holdMs, g_mhud.fadeMs);
+        if (alpha < 1.0f) g_mhud.indFaded++;
+        if (age > 0) g_mhud.indStale++;
+
+        ex = g_mhud.tr[i].x; ey = g_mhud.tr[i].y; ez = g_mhud.tr[i].z;
+        d = mm_dist2d(ex, ez, g_mhud.px, g_mhud.pz);
+        if (!(d > 0.001f)) continue;
+
+        col = g_mhud.tr[i].bot ? MHUD_RGBA(230, 70, 60, 235)
+                               : MHUD_RGBA(70, 190, 255, 235);
+        col = mm_fade_rgba(col, alpha);
+
+        if (aowl_region_project(ex, ey, ez, &sx, &sy)) {
+            /* The projector reports nothing about the camera plane through
+             * this ABI, so `behind` cannot be known here and is passed as 0.
+             * mm_indicator handles a behind-camera point correctly when told;
+             * it is simply never told, which is a capability gap in the
+             * projector contract and is named as one rather than papered over
+             * with a sign heuristic. */
+            if (mm_indicator(sx, sy, 0, scrW, scrH,
+                             g_mhud.indicatorInset, &m, &offscreen)) {
                 aowl_region_fill(m.x - 3.0f, m.y - 3.0f, 6.0f, 6.0f, col);
-                g_mhud.indBearing++;
+                if (offscreen)
+                    aowl_region_box(m.x - 5.0f, m.y - 5.0f, 10.0f, 10.0f,
+                                    1.0f, col);
+                g_mhud.indProjected++;
             } else {
                 g_mhud.indRefused++;
             }
+        } else if (mm_bearing_ring(ex, ez, g_mhud.px, g_mhud.pz, rot,
+                                   scrW, scrH, 0.35f, &m)) {
+            aowl_region_fill(m.x - 3.0f, m.y - 3.0f, 6.0f, 6.0f, col);
+            g_mhud.indBearing++;
+        } else {
+            g_mhud.indRefused++;
         }
     }
     g_mhud.blips += (int64_t)g_mhud.n;
@@ -414,6 +563,19 @@ static int32_t mhud_handle(void)  { return g_mhud.handle; }
 static int64_t mhud_ind_projected(void) { return g_mhud.indProjected; }
 static int64_t mhud_ind_bearing(void)   { return g_mhud.indBearing; }
 static int64_t mhud_ind_refused(void)   { return g_mhud.indRefused; }
+static int64_t mhud_ind_faded(void)     { return g_mhud.indFaded; }
+static int64_t mhud_ind_expired(void)   { return g_mhud.indExpired; }
+static int64_t mhud_ind_stale(void)     { return g_mhud.indStale; }
+static int32_t mhud_tracks(void) {
+    int32_t i, n = 0;
+    for (i = 0; i < MHUD_MAX; i++) if (g_mhud.tr[i].live) n++;
+    return n;
+}
+static int64_t mhud_hold_ms(void) { return g_mhud.holdMs; }
+static int64_t mhud_fade_ms(void) { return g_mhud.fadeMs; }
+static int32_t mhud_has_heading(void) { return g_mhud.hasHeading; }
+static float   mhud_heading(void) { return g_mhud.hasHeading ? g_mhud.heading
+                                                             : 0.0f; }
 static int32_t mhud_screen_measured(void) { return g_mhud.screenFromRegion; }
 static int32_t mhud_screen_w(void) { float w, h; mhud_screen(&w, &h);
                                      return (int32_t)w; }
@@ -425,7 +587,9 @@ proc cHudReset() {.importc: "mhud_reset", nodecl.}
 proc cHudBegin(px, py, pz: cfloat; hasLocal: int32;
                heading: cfloat; hasHeading: int32) {.
   importc: "mhud_begin", nodecl.}
-proc cHudAdd(x, y, z: cfloat; bot: int32) {.importc: "mhud_add", nodecl.}
+proc cHudAdd(x, y, z: cfloat; bot: int32; key: uint64) {.
+  importc: "mhud_add", nodecl.}
+proc cHudLifetime(holdMs, fadeMs: int64) {.importc: "mhud_lifetime", nodecl.}
 proc cHudConfigure(radiusM, screenW, screenH: cfloat;
                    radarOn, indicatorsOn: int32;
                    radarSize, radarX, radarY: cfloat;
@@ -447,6 +611,14 @@ proc cHudConfigureMap(mapOn: int32; mapX, mapY, mapSize, mapSpanM: cfloat;
 proc cHudIndProjected(): int64 {.importc: "mhud_ind_projected", nodecl.}
 proc cHudIndBearing(): int64 {.importc: "mhud_ind_bearing", nodecl.}
 proc cHudIndRefused(): int64 {.importc: "mhud_ind_refused", nodecl.}
+proc cHudIndFaded(): int64 {.importc: "mhud_ind_faded", nodecl.}
+proc cHudIndExpired(): int64 {.importc: "mhud_ind_expired", nodecl.}
+proc cHudIndStale(): int64 {.importc: "mhud_ind_stale", nodecl.}
+proc cHudTracks(): int32 {.importc: "mhud_tracks", nodecl.}
+proc cHudHoldMs(): int64 {.importc: "mhud_hold_ms", nodecl.}
+proc cHudFadeMs(): int64 {.importc: "mhud_fade_ms", nodecl.}
+proc cHudHasHeading(): int32 {.importc: "mhud_has_heading", nodecl.}
+proc cHudHeading(): cfloat {.importc: "mhud_heading", nodecl.}
 proc cHudScreenMeasured(): int32 {.importc: "mhud_screen_measured", nodecl.}
 proc cHudScreenW(): int32 {.importc: "mhud_screen_w", nodecl.}
 proc cHudScreenH(): int32 {.importc: "mhud_screen_h", nodecl.}
@@ -488,6 +660,11 @@ type
     mapX*, mapY*, mapSize*, mapSpanM*: float
     mapGrid*: int
     indicatorInset*: float
+    ## indicator LIFETIME. Full alpha for `indicatorHoldMs` after the contact
+    ## was last refreshed, then a linear ramp to zero over `indicatorFadeMs`,
+    ## then gone.
+    indicatorHoldMs*: int
+    indicatorFadeMs*: int
 
 proc hudInit*(o: HudOpts) =
   ## Resets the mirror and installs the layout. Safe to call before the region
@@ -503,6 +680,7 @@ proc hudInit*(o: HudOpts) =
                    cfloat(o.mapX), cfloat(o.mapY), cfloat(o.mapSize),
                    cfloat(o.mapSpanM), int32(o.mapGrid),
                    cfloat(o.indicatorInset))
+  cHudLifetime(int64(o.indicatorHoldMs), int64(o.indicatorFadeMs))
 
 proc hudArmed*(): bool =
   ## Whether the HOST has armed the shared region at all. This is the host flag
@@ -546,8 +724,14 @@ proc hudPublish*(snap: Snapshot) =
   while i < snap.n:
     if i != snap.localIdx:
       let e = snap.ents[i]
+      # `key` is the Player pointer as an opaque u64. It is an IDENTITY, never
+      # dereferenced here -- hud.nim reads no game memory at all -- and it is
+      # what lets a contact's age follow it across frames as the feed's array
+      # order changes. A zero key (an entity whose pointer was not recorded)
+      # simply gets no track and therefore no indicator, rather than sharing
+      # slot 0 with every other keyless contact.
       cHudAdd(cfloat(e.x), cfloat(e.y), cfloat(e.z),
-              (if e.bot: 1'i32 else: 0'i32))
+              (if e.bot: 1'i32 else: 0'i32), e.key)
     inc i
 
 proc hudStatusText*(): string =
@@ -563,8 +747,28 @@ proc hudStatusText*(): string =
   " indicators: projected=" & $cHudIndProjected() &
   " bearing=" & $cHudIndBearing() &
   " refused=" & $cHudIndRefused() &
+  " faded=" & $cHudIndFaded() &
+  " expired=" & $cHudIndExpired() &
+  " tracks=" & $cHudTracks() &
+  " window=" & $cHudHoldMs() & "+" & $cHudFadeMs() & "ms" &
   (if cHudIndProjected() == 0'i64 and cHudIndBearing() > 0'i64:
      " -- NO projector is installed, so every indicator drawn so far is a " &
-     "NORTH-UP bearing, not a look-relative direction. The host does not call " &
-     "aowl_region_set_projector yet"
+     "BEARING RING, not a projected screen position. The host does not call " &
+     "aowl_region_set_projector yet. The ring is now rotated by the measured " &
+     "heading when there is one, so it is look-relative rather than north-up, " &
+     "but it is still a bearing and not a projection"
    else: "")
+
+# The lifetime counters, for the diagnostic. Kept as separate readings rather
+# than one "indicators are fine" boolean, because they answer different
+# questions and the interesting failures are the ones where they disagree:
+# `expired` climbing with `faded` at zero would mean tracks are being evicted
+# without ever being drawn mid-ramp.
+proc hudIndFaded*(): int64 = cHudIndFaded()
+proc hudIndExpired*(): int64 = cHudIndExpired()
+proc hudIndStale*(): int64 = cHudIndStale()
+proc hudTracks*(): int = int(cHudTracks())
+proc hudHoldMs*(): int = int(cHudHoldMs())
+proc hudFadeMs*(): int = int(cHudFadeMs())
+proc hudHasHeading*(): bool = cHudHasHeading() != 0'i32
+proc hudHeading*(): float = float(cHudHeading())

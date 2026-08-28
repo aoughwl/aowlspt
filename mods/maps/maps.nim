@@ -136,6 +136,12 @@ var gLastErr = ""
 
 var gOpts: HudOpts
 var gHudOn = false
+var gHeadingOn = false
+  ## The `heading` setting. Flag-gated and default OFF, like everything else
+  ## here. When off, the measured heading is DISCARDED at publish time rather
+  ## than merely ignored downstream, so "heading-up" and "north-up" remain one
+  ## decision made in one place; hud.nim reads `rot` from a single variable and
+  ## both the radar and the map pane follow it together.
 
 proc loadHudOpts() =
   gOpts.radar       = asBool(setting("hudRadar"), true)
@@ -160,6 +166,13 @@ proc loadHudOpts() =
   gOpts.mapSpanM    = asFloat(setting("mapSpanM"), 500.0)
   gOpts.mapGrid     = asInt(setting("mapGrid"), 8)
   gOpts.indicatorInset = asFloat(setting("indicatorInset"), 48.0)
+  # Indicator LIFETIME. Defaults chosen so the ramp is visible rather than a
+  # blink: 0.4 s at full alpha, then 1.6 s of fade -- two seconds from the last
+  # refresh to gone. Both are clamped by the schema, and a 0 fade is legal and
+  # means "vanish the instant the hold elapses".
+  gOpts.indicatorHoldMs = asInt(setting("indicatorHoldMs"), 400)
+  gOpts.indicatorFadeMs = asInt(setting("indicatorFadeMs"), 1600)
+  gHeadingOn            = asBool(setting("heading"), false)
 
 proc spatialSchema(): seq[Setting] =
   ## `implemented` is the honest column, not a decoration. Everything declared
@@ -231,13 +244,32 @@ proc spatialSchema(): seq[Setting] =
                description = "Specified from the pre-1.0 BepInEx map/radar mods (no upstream code carried; map art and calibration provenance in mods/maps/data/maps/README.md). Only needed because the shared region does not " &
                              "yet expose the back-buffer size to a mod"),
 
+    intSetting("indicatorHoldMs", "Indicator hold (ms)", 400, lo = 0,
+               hi = 10000, category = "HUD",
+               description = "Specified from the pre-1.0 BepInEx map/radar mods (no upstream code carried; map art and calibration provenance in mods/maps/data/maps/README.md). How long an indicator stays at FULL opacity " &
+                             "after the contact was last refreshed by the feed"),
+    intSetting("indicatorFadeMs", "Indicator fade (ms)", 1600, lo = 0,
+               hi = 20000, category = "HUD",
+               description = "Specified from the pre-1.0 BepInEx map/radar mods (no upstream code carried; map art and calibration provenance in mods/maps/data/maps/README.md). How long the indicator then takes to ramp to " &
+                             "zero, after which it is REMOVED. Note what this " &
+                             "does and does not fix: there is no sound feed in " &
+                             "this mod, so an indicator for a contact that is " &
+                             "STILL THERE never ages and never fades. This " &
+                             "window governs a contact that has DROPPED OUT of " &
+                             "the feed. 0 means gone the instant the hold ends"),
+
     boolSetting("heading", "Rotate radar to facing", false, category = "HUD",
-                implemented = false,
-                description = "Specified from the pre-1.0 BepInEx map/radar mods (no upstream code carried; map art and calibration provenance in mods/maps/data/maps/README.md). Read; sp/world.nim measures no heading yet, so " &
-                              "the radar AND the map pane are north-up and say " &
-                              "so rather than rotating by a guessed zero. Both " &
-                              "take their rotation from one place, so a " &
-                              "measured heading turns both heading-up at once"),
+                description = "Specified from the pre-1.0 BepInEx map/radar mods (no upstream code carried; map art and calibration provenance in mods/maps/data/maps/README.md). Rotate BOTH the radar and the map pane to " &
+                              "the player's VIEW direction, from " &
+                              "MovementContext._lookDirection @0x3D0 -- the " &
+                              "field EFT.Player::get_LookDirection @0x6F8060 " &
+                              "reads, per its own instruction bytes. View and " &
+                              "not body yaw, so the radar agrees with the " &
+                              "middle of the monitor and with the direction " &
+                              "indicators. OFF means north-up. If the field " &
+                              "ever reads all-zero the surfaces stay north-up " &
+                              "and the diagnostic says so, rather than " &
+                              "rotating by a fake zero"),
     boolSetting("markers", "Loot / extract / corpse / quest markers", false,
                 category = "HUD", implemented = false,
                 description = "Specified from the pre-1.0 BepInEx map/radar mods (no upstream code carried; map art and calibration provenance in mods/maps/data/maps/README.md). Not collected: no field offset for any of those " &
@@ -259,6 +291,13 @@ proc onMainTick(payload: string): string =
   lockMod()
   collect(gSnap)
   gPending = true
+  # The `heading` setting gates the ROTATION, not the measurement: the
+  # heading is still read and still counted every collection, so
+  # `mapsDiagText` can report whether it is live and MOVING even while the
+  # surfaces are deliberately north-up. Gating the read instead would make
+  # "the setting is off" and "the field is dead" produce the same diagnostic,
+  # which is the ambiguity this mod keeps paying for.
+  if not gHeadingOn: gSnap.hasHeading = false
   if gHudOn: hudPublish(gSnap)   # same thread as the region's draw; see sp/hud.nim
   unlockMod()
   result = ""
@@ -391,10 +430,56 @@ proc mapsDiagText(): string =
     lProj = "PASS  " & $hudIndProjected() & " indicator(s) projected"
   elif hudIndBearing() > 0'i64:
     lProj = "INCONCLUSIVE  " & $hudIndBearing() & " indicator(s) drawn as " &
-            "NORTH-UP bearings; no projector is installed (nothing calls " &
-            "aowl_region_set_projector), so they are not look-relative"
+            "BEARING RINGS; no projector is installed (nothing calls " &
+            "aowl_region_set_projector), so they are a bearing and not a " &
+            "projected screen position. They are no longer NORTH-UP whenever " &
+            "a heading was measured -- the ring takes the same rotation the " &
+            "radar does -- so a turning player now turns them; see `heading` " &
+            "below for whether that is actually happening"
   else:
     lProj = "INCONCLUSIVE  no indicator has been drawn yet"
+
+  # 7. the HEADING. Defect 1: "the player rotation does not rotate either map."
+  # The trap this line exists to avoid is reporting PASS for a heading that
+  # reads perfectly and never changes -- which draws a map that never rotates
+  # and is indistinguishable from a working one on any single sample. So the
+  # verdict is driven by the number of TURNS observed, not by the number of
+  # successful reads. `hdgVerdict` owns that; this line adds only whether the
+  # setting is even on, because "off" and "dead" must never look alike.
+  var lHdg = ""
+  if not gHeadingOn:
+    lHdg = "INCONCLUSIVE  the `heading` setting is OFF, so both surfaces are " &
+           "deliberately north-up. The measurement still ran: " & hdgVerdict()
+  else:
+    lHdg = hdgVerdict()
+
+  # 8. indicator LIFETIME. Defect 2: "the audio indicators always stay on the
+  # screen." The honest finding is stated first and unconditionally, because
+  # the fade cannot make these into audio cues and a diagnostic that implied
+  # otherwise would be the confidently-wrong-answer failure all over again.
+  var lLife = ""
+  if hudTracks() == 0 and hudIndExpired() == 0'i64:
+    lLife = "INCONCLUSIVE  no contact has ever been tracked, so the decay has " &
+            "not been exercised"
+  elif hudIndExpired() == 0'i64:
+    lLife = "INCONCLUSIVE  " & $hudTracks() & " contact(s) tracked and none " &
+            "has expired yet. That is EXPECTED while every contact is still " &
+            "in the feed: an indicator only ages once the feed STOPS " &
+            "refreshing it"
+  elif hudIndFaded() == 0'i64:
+    lLife = "FAIL  " & $hudIndExpired() & " track(s) were evicted but NOT ONE " &
+            "was ever drawn at reduced alpha -- they are disappearing " &
+            "abruptly instead of fading. The decay is not reaching the draw"
+  else:
+    lLife = "PASS  " & $hudIndFaded() & " indicator(s) drawn mid-fade and " &
+            $hudIndExpired() & " removed after their window (" &
+            $hudHoldMs() & "+" & $hudFadeMs() & "ms); " & $hudTracks() &
+            " track(s) live"
+  lLife = lLife & ". NOTE: these are NOT audio indicators. This mod " &
+          "subscribes to no sound event of any kind; every indicator is one " &
+          "live entry of GameWorld.AllAlivePlayersList, refreshed every " &
+          "collection. An indicator that persists for a contact that is still " &
+          "present is the FEED working as built, not a failed decay"
 
   result = "maps diag:\n" &
            "  region       : " & lRegion & "\n" &
@@ -403,6 +488,8 @@ proc mapsDiagText(): string =
            "  draw         : " & lDraw   & "\n" &
            "  screen       : " & lScreen & "\n" &
            "  projector    : " & lProj   & "\n" &
+           "  heading      : " & lHdg    & "\n" &
+           "  indLifetime  : " & lLife   & "\n" &
            "  feed         : ticks=" & $gTicks & " published=" & $gPublished &
              " faults=" & $feedFaults() & " defect=" & feedDefect()
 

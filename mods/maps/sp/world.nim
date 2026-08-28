@@ -88,13 +88,20 @@
 ## WHAT IS NOT HERE, STATED PLAINLY
 ## ---------------------------------------------------------------------------
 ##
-## **Player HEADING is not read.** The radar and the indicators both want which
-## way the player faces. `MovementContext` carries rotation, but no field on it
-## resolved to a name this file could measure with confidence, and a heading
-## read from a guessed offset would be a plausible wrong number pointing every
-## marker in the wrong direction -- the worst failure this project produces.
-## So `heading` is published as `hasHeading:false` and every consumer draws
-## NORTH-UP and says so. See README for what would unblock it.
+## **Player HEADING is now read** -- this paragraph used to say it was not.
+## The field was found the same way the position was: by reading the client's
+## own accessor. `EFT.Player::get_LookDirection` @0x6F8060 is, in its entirety,
+## `mov rax,[rdx+0x60]` then a 12-byte load from `[rax+0x3D0]`, and metadata
+## independently names `EFT.MovementContext._lookDirection` a Vector3 at
+## exactly 0x3D0. So the offset is not guessed and it is not inferred from the
+## method's name; it is read off the instruction bytes and corroborated.
+##
+## Unlike the POSITION, which bottoms out in a Unity native icall and therefore
+## needs a direct RVA call, the heading IS a managed field -- so no call is
+## made at all, only a guarded two-hop walk. `hasHeading` is published FALSE
+## for anything the classifier does not call OK, so a dead field (the
+## PreviousPosition@0x370 failure) still leaves both surfaces north-up and
+## says why, rather than rotating by a fake zero.
 ##
 ## **There is no world->screen projection here.** That belongs to the in-game
 ## ESP path and is deliberately out of scope; this feed is top-down only, which
@@ -321,6 +328,57 @@ static int32_t sp_pos_live(void* player, float* out3) {
   return (int32_t)mm_pos_classify(1, tmp[0], tmp[1], tmp[2]);
 }
 
+/* ===================================================================
+ * THE LIVE HEADING *IS* A MANAGED FIELD -- unlike the position.
+ * ===================================================================
+ *
+ * `EFT.Player::get_LookDirection` RVA 0x6F8060, in its own bytes:
+ *
+ *     48 83 EC 28                sub rsp,0x28
+ *     48 8B 42 60                mov rax,[rdx+0x60]      Player.MovementContext
+ *     48 85 C0 74 1D             null -> throw
+ *     F2 0F 10 80 D0 03 00 00    movsd xmm0,[rax+0x3D0]  _lookDirection .x,.y
+ *     8B 80 D8 03 00 00          mov  eax,[rax+0x3D8]    _lookDirection .z
+ *     F2 0F 11 01                movsd [rcx],xmm0        (sret buffer)
+ *     89 41 08                   mov  [rcx+8],eax
+ *     48 8B C1 48 83 C4 28 C3    mov rax,rcx; ret
+ *
+ *   metadata: EFT.Player.<MovementContext>k__BackingField @0x60
+ *   metadata: EFT.MovementContext._lookDirection @0x3D0  (Vector3)
+ *
+ * Both corroborate the accessor field-for-field. THE WHOLE BODY IS A FIELD
+ * READ -- there is no icall, no delegate, no property chain. That is the
+ * difference from the position, which bottoms out in
+ * `Transform::get_position_Injected` and therefore HAS no managed home.
+ *
+ * So the heading needs NO CALL AT ALL. A guarded two-hop walk and a 12-byte
+ * read is strictly less machinery than a direct RVA call, and less machinery
+ * is less blast radius: nothing to byte-verify at runtime, no throw branch to
+ * prove unreachable, no ABI shape to get wrong. The RVA above is quoted as
+ * PROVENANCE for the two offsets, not as something this code jumps to.
+ *
+ * WHAT THIS MUST NOT DO is assume the field is live. `PreviousPosition` @0x370
+ * is also correctly named by metadata and is permanently (0,0,0). So the read
+ * is classified by `mm_heading_from_look`, which answers ALLZERO separately
+ * from UNREADABLE and from OK, and world.nim publishes hasHeading:false for
+ * anything that is not OK. A dead field must name itself here, not silently
+ * become a yaw of zero that looks exactly like "facing north".
+ * =================================================================== */
+#define SP_MC_LOOKDIR 0x3D0
+
+static int32_t sp_look_dir(void* player, int32_t mcOff, float* yaw) {
+  void* mc;
+  float v[3];
+  int32_t readable;
+  *yaw = 0.0f;
+  if (!player) return MM_HDG_UNREADABLE;
+  mc = sp_rd_ptr(player, mcOff);
+  if (!mc) return MM_HDG_UNREADABLE;
+  v[0] = 0.0f; v[1] = 0.0f; v[2] = 0.0f;
+  readable = sp_rd_vec3(mc, SP_MC_LOOKDIR, v);
+  return (int32_t)mm_heading_from_look(readable, v[0], v[1], v[2], yaw);
+}
+
 static int32_t sp_rd_idtail(void* s, int32_t lenOff, int32_t chOff, char* out) {
   int32_t n, take, i;
   out[0] = 0;
@@ -370,6 +428,16 @@ proc cGetPosArm(base: pointer): int32 {.importc: "sp_getpos_arm", nodecl.}
 proc cGetPosArmed(): int32 {.importc: "sp_getpos_armed", nodecl.}
 proc cPosLive(player: pointer; out3: ptr cfloat): int32 {.
   importc: "sp_pos_live", nodecl.}
+proc cLookDir(player: pointer; mcOff: int32; yaw: ptr cfloat): int32 {.
+  importc: "sp_look_dir", nodecl.}
+
+const
+  # Mirrors MM_HDG_* in sp/mapmath.h.
+  MmHdgOk*         = 0
+  MmHdgUnreadable* = 1
+  MmHdgNan*        = 2
+  MmHdgAllZero*    = 3
+  MmHdgFlat*       = 4
 
 proc rdPtr(o: pointer; off: int): pointer =
   if o == nil: return nil
@@ -420,6 +488,14 @@ type
     me*: bool
     id*: string        ## last 8 chars of the profile id, or "" -- a label,
                        ## never used as an identity key
+    key*: uint64       ## the Player pointer, as an opaque identity. NEVER
+                       ## dereferenced by any consumer: it exists so a contact
+                       ## can be followed across collections while the list's
+                       ## ORDER changes. The profile-id tail above is the wrong
+                       ## thing for that -- it is truncated to 8 chars and can
+                       ## collide, and it is empty whenever the string read
+                       ## declines, which would silently merge every contact
+                       ## whose id could not be read into one track.
 
 var gFn: Il2CppPtr = cast[Il2CppPtr](0)
 var gArmedFn: Il2CppPtr = cast[Il2CppPtr](0)
@@ -478,8 +554,8 @@ type
     n*: int
     ents*: array[MaxEntities, Ent]
     localIdx*: int       ## index into ents of the local player, or -1
-    hasHeading*: bool    ## always false today -- see the header block
-    heading*: float
+    hasHeading*: bool    ## the yaw below was classified OK this collection
+    heading*: float      ## radians, 0 = +Z (north), increasing toward +X
     state*: int          ## gwState() at collection time
     seq*: int64
 
@@ -613,6 +689,160 @@ proc posVerdict*(): string =
            $gPosEver.nilCtx & " players"
   "EVERY position read failed and no reason was recorded -- this is a BUG in " &
   "posOf's own accounting, not a measurement"
+
+# ---------------------------------------------------------------------------
+# WHY A HEADING READ FAILED -- and, harder, whether it is actually MOVING.
+# ---------------------------------------------------------------------------
+#
+# Defect 1 as the user reported it: "the player rotation does not rotate
+# either map." The position bug immediately before it was found by counters
+# that could say `allZero`, so the heading gets the same treatment.
+#
+# But a heading has a failure mode a position does not: it can be READ
+# SUCCESSFULLY, pass every plausibility gate, and be a CONSTANT. That draws a
+# smooth heading-up map that never turns -- exactly the symptom -- while every
+# counter here reads healthy. `good > 0` therefore CANNOT be the pass
+# condition. `changed` is: the number of collections on which the yaw differed
+# from the previous one by more than a mouse-jitter threshold. A player who has
+# turned at all makes it non-zero; a dead constant leaves it at zero forever,
+# and the diagnostic reports that as FAIL rather than as PASS.
+type
+  HdgReason* = object
+    good*, unreadable*, nan*, allZero*, flat*, nilPlayer*: int
+    changed*: int          ## collections on which the yaw actually MOVED
+    spread*: float         ## the largest |delta| ever seen between collections
+
+var gHdg: HdgReason
+var gHdgLast = 0.0
+var gHdgHave = false
+
+const HdgMoved = 1.0e-3
+  ## radians. Below this is float noise on a stationary player, not a turn.
+  ## 1e-3 rad is about 0.057 degrees -- far below any real mouse movement and
+  ## far above the jitter of a value that is genuinely not changing.
+
+proc yawDelta(a, b: float): float =
+  ## The signed shortest difference, wrapped into (-pi, pi]. Mirrors
+  ## `mm_yaw_delta` in sp/mapmath.h, which the offline test pins; a player who
+  ## turns THROUGH north must not register as a 6.28 rad jump, and one who
+  ## stands still must not register as anything.
+  const Tau = 6.283185307179586
+  const Pi2 = 3.141592653589793
+  result = a - b
+  while result > Pi2: result = result - Tau
+  while result <= -Pi2: result = result + Tau
+
+proc hdgEverTried*(): int =
+  gHdg.good + gHdg.unreadable + gHdg.nan + gHdg.allZero + gHdg.flat +
+  gHdg.nilPlayer
+
+proc hdgEverText*(): string =
+  "good=" & $gHdg.good & " changed=" & $gHdg.changed &
+  " unreadable=" & $gHdg.unreadable & " NaN=" & $gHdg.nan &
+  " allZero=" & $gHdg.allZero & " lookingStraightUpDown=" & $gHdg.flat &
+  " nilPlayer=" & $gHdg.nilPlayer
+
+proc hdgVerdict*(): string =
+  ## Three outcomes, never two (CLAUDE.md 9b). "I read a heading" is NOT
+  ## "the map rotates" -- that was the whole shape of this defect.
+  let tried = hdgEverTried()
+  if tried == 0:
+    return "INCONCLUSIVE  no heading has been read yet (no raid, or the feed " &
+           "has not run). This is not 'the heading is broken'"
+  if gHdg.good == 0:
+    if gHdg.allZero > 0:
+      return "FAIL  every one of " & $gHdg.allZero & " reads of " &
+             "MovementContext+0x3D0 _lookDirection came back EXACTLY (0,0,0) " &
+             "from a READABLE page. That is the PreviousPosition@0x370 failure " &
+             "again: the offset is right and the field is dead on this build. " &
+             "Both surfaces stay north-up rather than rotate by a fake zero"
+    if gHdg.unreadable > 0:
+      return "FAIL  every read failed readability -- Player+0x60 " &
+             "<MovementContext>k__BackingField was null, or " &
+             "MovementContext+0x3D0 is not a mapped page. A POINTER problem, " &
+             "not a zero heading"
+    if gHdg.nan > 0:
+      return "FAIL  _lookDirection read NaN on all " & $gHdg.nan & " attempts"
+    if gHdg.flat > 0:
+      return "INCONCLUSIVE  every read found the look vector within " &
+             "1e-4 of vertical (straight up or straight down), which carries " &
+             "no bearing. Refused rather than rotated by atan2(0,0)"
+    return "FAIL  " & hdgEverText()
+  if gHdg.changed == 0:
+    return "FAIL  the heading READS fine (" & $gHdg.good & " of " & $tried &
+           ") but has NEVER CHANGED -- the largest yaw delta between any two " &
+           "collections is " & $gHdg.spread & " rad, below the " &
+           "1e-3 turn threshold. A constant heading draws a map that never " &
+           "rotates, which is exactly the reported defect, and it is NOT a " &
+           "pass just because the value is non-zero"
+  return "PASS  the heading is live AND MOVING (" & $gHdg.good & " of " &
+         $tried & " read, " & $gHdg.changed & " turns seen, largest delta " &
+         $gHdg.spread & " rad)"
+
+proc headingOf(p: pointer; ok: var bool; yaw: var float) =
+  ## The live VIEW heading, from `MovementContext._lookDirection` @0x3D0.
+  ##
+  ## BODY YAW vs CAMERA YAW -- a decision, not an accident. This reads the LOOK
+  ## direction, so both surfaces are view-relative. Two reasons, both about
+  ## what the player experiences rather than about what is easiest to read:
+  ##
+  ##  * a minimap the player reads WHILE AIMING has to agree with the screen.
+  ##    Up on the radar must be the middle of the monitor. Body yaw and view
+  ##    yaw differ by the whole lean/turn-in-place range in Tarkov, so a
+  ##    body-yaw radar is visibly wrong exactly when it is being used.
+  ##  * the directional indicators are, by definition, camera-relative -- they
+  ##    clamp a projected screen point to the screen edge. Driving the radar
+  ##    off a different rotation than the indicators would put a contact on the
+  ##    left of the radar and the right of the screen, simultaneously, and both
+  ##    would look right in isolation.
+  ##
+  ## The map PANE takes the same rotation, because it is the same
+  ## player-centred top-down view at a different scale; hud.nim reads `rot`
+  ## from one place precisely so the two can never disagree.
+  ##
+  ## No call is made. See the C block for the accessor bytes that establish
+  ## both offsets, and for why a field read is the smaller instrument here.
+  ok = false
+  yaw = 0.0
+  if p == nil:
+    gHdg.nilPlayer = gHdg.nilPlayer + 1
+    return
+  var v: cfloat = 0.0'f32
+  let code = cLookDir(p, int32(PlMoveCtx), addr v)
+  case int(code)
+  of MmHdgUnreadable:
+    gHdg.unreadable = gHdg.unreadable + 1
+    note("Player+0x60 <MovementContext>k__BackingField or " &
+         "MovementContext+0x3D0 _lookDirection was NOT READABLE -- a " &
+         "VirtualQuery refusal, not a heading of zero")
+    return
+  of MmHdgNan:
+    gHdg.nan = gHdg.nan + 1
+    note("MovementContext+0x3D0 _lookDirection read NaN")
+    return
+  of MmHdgAllZero:
+    gHdg.allZero = gHdg.allZero + 1
+    note("MovementContext+0x3D0 _lookDirection read EXACTLY (0,0,0) from a " &
+         "readable page -- the field is declared and dead on this build, " &
+         "exactly like PreviousPosition@0x370. Reported rather than drawn")
+    return
+  of MmHdgFlat:
+    gHdg.flat = gHdg.flat + 1
+    # NOT a fault and NOT a defect: looking straight down is a thing players
+    # do. It simply carries no bearing, so this frame keeps the last heading
+    # by publishing none, and the surfaces hold their previous rotation.
+    return
+  else:
+    yaw = float(v)
+    gHdg.good = gHdg.good + 1
+    if gHdgHave:
+      let d = yawDelta(yaw, gHdgLast)
+      let m = if d < 0.0: -d else: d
+      if m > gHdg.spread: gHdg.spread = m
+      if m > HdgMoved: gHdg.changed = gHdg.changed + 1
+    gHdgLast = yaw
+    gHdgHave = true
+    ok = true
 
 proc posOf(p: pointer; ok: var bool; x, y, z: var float) =
   ## The live world pose, via `EFT.Player::get_Position` @0x6F32C0.
@@ -767,8 +997,19 @@ proc collectInner(snap: var Snapshot) =
   else:
     note("GameWorld+0x230 MainPlayer read null")
 
+  # The heading, from the SAME already-validated local player pointer. It is
+  # read whether or not the position read succeeded, because the two failures
+  # are independent and folding them together would hide one behind the other.
+  if me != nil:
+    var hok = false
+    var hyaw = 0.0
+    headingOf(me, hok, hyaw)
+    snap.hasHeading = hok
+    snap.heading = hyaw
+
   if lok:
-    snap.ents[0] = Ent(x: lx, y: ly, z: lz, bot: false, me: true, id: idTailOf(me))
+    snap.ents[0] = Ent(x: lx, y: ly, z: lz, bot: false, me: true,
+                       id: idTailOf(me), key: localPtr)
     snap.localIdx = 0
     snap.n = 1
     snap.ok = true
@@ -806,7 +1047,7 @@ proc collectInner(snap: var Snapshot) =
     # on a radar than the reverse.
     let bot = rdPtr(p, PlAIData) != nil
     snap.ents[snap.n] = Ent(x: px, y: py, z: pz, bot: bot, me: false,
-                            id: idTailOf(p))
+                            id: idTailOf(p), key: cast[uint64](p))
     inc snap.n
     snap.ok = true
 

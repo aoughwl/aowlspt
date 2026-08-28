@@ -21,6 +21,7 @@
 #define AOWL_MAPMATH_H
 
 #include <math.h>
+#include <stdint.h>
 
 typedef struct { float x, y; } MmPt;
 
@@ -229,6 +230,129 @@ static int mm_pos_classify(int readable, float x, float y, float z)
      * must be answered ABOVE and not inferred from this. */
     if (x == 0.0f && y == 0.0f && z == 0.0f) return MM_POS_ALLZERO;
     return MM_POS_OK;
+}
+
+/* ------------------------------------------------------------------- heading
+ *
+ * WHY A HEADING WAS REJECTED, as a value -- the same discipline as position,
+ * for the same reason. `MovementContext.PreviousPosition` @0x370 is declared,
+ * correctly named by metadata, and permanently (0,0,0) on this build. Any new
+ * field this mod reads must therefore be able to come back as "readable page,
+ * all zeros", distinctly from "not mapped" and from "a real value", or the
+ * next dead field is invisible exactly as that one was.
+ *
+ * WHERE THE HEADING COMES FROM. `EFT.Player::get_LookDirection` @0x6F8060 is,
+ * in its own instruction bytes, a PURE FIELD READ:
+ *
+ *     48 8B 42 60                mov rax,[rdx+0x60]        Player.MovementContext
+ *     48 85 C0 74 1D             null -> throw
+ *     F2 0F 10 80 D0 03 00 00    movsd xmm0,[rax+0x3D0]    _lookDirection.x,.y
+ *     8B 80 D8 03 00 00          mov  eax,[rax+0x3D8]      _lookDirection.z
+ *     F2 0F 11 01 / 89 41 08     store 12 bytes to the sret buffer
+ *
+ * and metadata independently names `EFT.MovementContext._lookDirection` a
+ * `Vector3` at exactly 0x3D0. Unlike the POSITION -- which bottoms out in the
+ * Unity native icall `Transform::get_position_Injected` and so has no managed
+ * home at all -- the look direction IS a managed field, so the heading needs
+ * no call: a guarded walk and a 12-byte read is strictly less machinery, and
+ * less machinery is less blast radius. Nothing here is inferred from the
+ * method's NAME; the offsets are read off the accessor and corroborated.
+ *
+ * The yaw convention is mm_topdown's, stated there: 0 = +Z (north), increasing
+ * toward +X (east). Facing east means look=(1,0,z~0) -> atan2(1,0) = +pi/2,
+ * and mm_topdown then puts a contact due north on the LEFT. Both conventions
+ * are pinned by the offline test, because both readings produce a smooth,
+ * plausible, MIRRORED map.
+ */
+#define MM_HDG_OK         0
+#define MM_HDG_UNREADABLE 1
+#define MM_HDG_NAN        2
+#define MM_HDG_ALLZERO    3
+#define MM_HDG_FLAT       4
+
+/* Below this the horizontal projection of the look vector carries no bearing:
+ * the player is looking very nearly straight up or down. Rotating the map by
+ * the atan2 of two near-zero numbers is not a heading, it is noise amplified,
+ * so it is refused and counted rather than drawn. */
+#define MM_HDG_MINXZ 1.0e-4f
+
+static int mm_heading_from_look(int readable, float x, float y, float z,
+                                float* yaw)
+{
+    float h2;
+    if (yaw) *yaw = 0.0f;
+    if (!readable) return MM_HDG_UNREADABLE;
+    if (x != x || y != y || z != z) return MM_HDG_NAN;
+    /* Exactly (0,0,0): a mapped page that nobody ever wrote. This is the
+     * PreviousPosition failure mode and it gets its own answer. */
+    if (x == 0.0f && y == 0.0f && z == 0.0f) return MM_HDG_ALLZERO;
+    h2 = x * x + z * z;
+    if (h2 < MM_HDG_MINXZ * MM_HDG_MINXZ) return MM_HDG_FLAT;
+    if (yaw) *yaw = (float)atan2((double)x, (double)z);
+    return MM_HDG_OK;
+}
+
+/* The smallest signed difference between two yaws, in radians, wrapped into
+ * (-pi, pi]. Used by the diagnostic to answer the ONLY question that settles
+ * defect 1: has the drawn rotation actually CHANGED? A static non-zero heading
+ * is a FAIL, and it is indistinguishable from a working one unless something
+ * measures the spread. */
+static float mm_yaw_delta(float a, float b)
+{
+    float d = a - b;
+    const float TAU = 6.28318530717958647692f;
+    const float PI  = 3.14159265358979323846f;
+    while (d >  PI) d -= TAU;
+    while (d <= -PI) d += TAU;
+    return d;
+}
+
+/* --------------------------------------------------------------- indicator
+ * lifetime: HOLD, then FADE, then GONE.
+ *
+ * A directional indicator is a TRANSIENT. It is drawn at full alpha for
+ * `holdMs` after the contact was last refreshed, ramps linearly to zero over
+ * the following `fadeMs`, and past that it must not be drawn at all.
+ *
+ * Three separate functions rather than one, on purpose: "how opaque" and "is
+ * it gone" are different questions, and a caller that folded them together
+ * would draw a fully transparent mark forever and count it as an indicator.
+ * `mm_fade_expired` is the one the eviction path uses and it is defined as the
+ * strict complement of a positive alpha, so the two can never disagree.
+ *
+ * A fadeMs of 0 is a legal setting and means "no ramp": full alpha until the
+ * hold elapses, then gone. A negative age (a clock that went backwards, or a
+ * contact stamped in the future) is treated as fresh rather than as expired --
+ * failing OPEN here loses a frame of fade, failing closed loses the feature.
+ */
+static float mm_fade_alpha(int64_t ageMs, int64_t holdMs, int64_t fadeMs)
+{
+    if (holdMs < 0) holdMs = 0;
+    if (fadeMs < 0) fadeMs = 0;
+    if (ageMs <= holdMs) return 1.0f;
+    if (fadeMs == 0) return 0.0f;
+    if (ageMs >= holdMs + fadeMs) return 0.0f;
+    return 1.0f - (float)(ageMs - holdMs) / (float)fadeMs;
+}
+
+static int mm_fade_expired(int64_t ageMs, int64_t holdMs, int64_t fadeMs)
+{
+    return mm_fade_alpha(ageMs, holdMs, fadeMs) <= 0.0f ? 1 : 0;
+}
+
+/* Scale the ALPHA byte of a packed r|g<<8|b<<16|a<<24 colour, leaving the
+ * three colour bytes untouched. Rounded, not truncated, so a 0.999 factor does
+ * not silently drop a level. */
+static uint32_t mm_fade_rgba(uint32_t rgba, float a)
+{
+    uint32_t al = (rgba >> 24) & 0xFFu;
+    float scaled;
+    if (a <= 0.0f) return rgba & 0x00FFFFFFu;
+    if (a >= 1.0f) return rgba;
+    scaled = (float)al * a + 0.5f;
+    if (scaled < 0.0f) scaled = 0.0f;
+    if (scaled > 255.0f) scaled = 255.0f;
+    return (rgba & 0x00FFFFFFu) | ((uint32_t)scaled << 24);
 }
 
 #endif /* AOWL_MAPMATH_H */
