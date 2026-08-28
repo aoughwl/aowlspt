@@ -429,6 +429,16 @@ proc onCamTick(payload: string): string =
   if not toggleOn(gRegion, admEsp): return
   gSamplerFirings = gSamplerFirings + 1
   if camSample(): gSamplerGood = gSamplerGood + 1
+  # UNITY THREAD, and it has to be. `EFT.Player::get_Position` @0x6F32C0 ends in
+  # `Transform::get_position_Injected`, a Unity native ICall -- it is not legal
+  # from `onUpdate` (host thread), which is where the ESP data pass runs. So the
+  # positions are SAMPLED here into a snapshot and READ back there. This
+  # replaces `MovementContext.PreviousPosition` @0x370, which is a real field
+  # that is permanently zero on this build and made `positions` report FAIL in
+  # a live raid. `posSample` arms itself once behind a 16-byte prologue verify,
+  # validates every hop, caps its sweep, allocates nothing, and declines with a
+  # named reason rather than silently.
+  posSample()
 
 proc armCamSampler() =
   ## Idempotent, retried from onUpdate until it arms or refuses for a reason

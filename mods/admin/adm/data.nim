@@ -104,8 +104,17 @@ const
   PlPhysical        = 0x9D8   ## PhysicalBase
   PlAIData          = 0xA00   ## IAIData; non-null => this player is a bot
 
-  # EFT.MovementContext
-  McPreviousPosition = 0x370  ## Vector3 -- the real world position
+  # ---- EFT.MovementContext -------------------------------------------------
+  # THERE IS NO POSITION FIELD HERE. `PreviousPosition` @0x370 used to be read
+  # as "the real world position" and it is not: the offset is CORRECT (metadata
+  # names the field at exactly 0x370) and the field is PERMANENTLY ZERO on this
+  # build -- 66331 readable reads in a live raid, every one exactly (0,0,0),
+  # measured 2026-08-28. That is why `positions` reported
+  # "FAIL no player position passed the finite/bounded check" in a raid; it was
+  # never the sampler's timing. The constant is deliberately GONE rather than
+  # left unused, so nothing reaches for it again. The live pose comes from
+  # `posSample()` below, a byte-verified direct call at
+  # `EFT.Player::get_Position` @0x6F32C0 -- see abi/aowlspt_admin.h.
 
   # PhysicalBase
   PhStamina         = 0x68    ## Stamina
@@ -173,9 +182,9 @@ const
   SeNewShotRecoil    = 0x20
   NrRecoilEffectOn   = 0x11    ## bool -- ONE byte
 
-## Box height. The position read at MovementContext+0x370 is the player ROOT
-## (feet), so the head is one standing height above it. 1.8 m is a drawing
-## constant, NOT a measured field -- it is deliberately not dressed up as one.
+## Box height. `EFT.Player::get_Position` returns the BodyTransform origin, i.e.
+## the player ROOT (feet), so the head is one standing height above it. 1.8 m is
+## a drawing constant, NOT a measured field -- not dressed up as one.
 const PlayerHeightM = 1.8
 
 # God mode. `EFT.Player::ApplyDamageInfo`, MEASURED:
@@ -294,27 +303,100 @@ proc worldPtr(): pointer =
 # ---------------------------------------------------------------------------
 
 proc playerPos(p: pointer; ok: var bool; x, y, z: var float) =
-  ## Player +0x60 -> MovementContext +0x370 (Vector3). The same chain the host's
-  ## own working ESP walks, and the pose the client itself reads.
-  ok = false
-  x = 0.0; y = 0.0; z = 0.0
-  if p == nil: return
-  let mc = rdPtr(p, PlMovementContext)
-  if mc == nil:
-    note("Player+0x60 MovementContext read null")
+  ## HOST THREAD. Reads back the snapshot `posSample()` published on Unity's
+  ## thread. No game code runs here and no offset is walked: the finite/bounded/
+  ## non-origin gates already ran inside `aowl_admin_pos_classify`, and an entry
+  ## only exists at all if it passed them. False is "not in the last good
+  ## sweep", never "the origin".
+  ok = posGet(p, x, y, z)
+
+proc playersList(world: pointer): pointer =
+  ## AllAlivePlayersList (List<Player>, concrete) first; RegisteredPlayers
+  ## (List<IPlayer>) as a fallback.
+  result = rdPtr(world, GwAllAlivePlayers)
+  if result == nil:
+    result = rdPtr(world, GwRegisteredPlrs)
+
+# ---------------------------------------------------------------------------
+# The Unity-thread position sweep
+# ---------------------------------------------------------------------------
+#
+# `EFT.Player::get_Position` @0x6F32C0 ends in `Transform::get_position_Injected`,
+# a Unity native ICall, so it is legal ONLY on Unity's thread. `collectAndPublish`
+# runs on the host's thread. That is the whole reason this is split: the sweep
+# rides the same `everyMain` tick the camera sampler already rides (gated on the
+# host confirming its main-thread drain has fired -- fact #136), and publishes a
+# snapshot the host-thread pass reads with pure memory reads.
+
+var gPosCode = posNoCall      ## the LAST exit reason the local-player sample took
+var gPosSweeps = 0
+var gPosGood = 0
+
+# THE FALSIFIABLE ASSERTION (CLAUDE.md 9b). A finite, bounded, non-origin
+# position that NEVER CHANGES is exactly what a wrong-but-plausible offset
+# produces, and it would pass every gate above. So the local player's position
+# is compared against the previous sweep's and the largest displacement ever
+# seen is kept. `gPosMoved` is the only thing that can turn `positions` into a
+# PASS, and standing still makes it INCONCLUSIVE -- not a pass.
+var gPosHavePrev = false
+var gPosPx = 0.0
+var gPosPy = 0.0
+var gPosPz = 0.0
+var gPosMaxStep = 0.0
+var gPosMoved = false
+
+proc posSample*() =
+  ## UNITY THREAD ONLY. One sweep per frame: arm (once), walk the player list,
+  ## sample each, publish. Capped, allocation-free, and a no-op until the world
+  ## and the prologue are both good.
+  if not gLive or not dataReady() or dataDisabled(): return
+  let armed = posArm()
+  if armed != 1:
+    gPosCode = posNoCall
+    if armed < 0:
+      note("EFT.Player::get_Position @0x6F32C0 prologue did NOT byte-verify " &
+           "against this build -- position sampling REFUSED, permanently")
     return
-  x = rdF32(mc, McPreviousPosition + 0)
-  y = rdF32(mc, McPreviousPosition + 4)
-  z = rdF32(mc, McPreviousPosition + 8)
-  # A position is finite and inside any Tarkov map by a wide margin. This is a
-  # property of the FINISHED read, not a restatement of it: garbage from a moved
-  # object or a stale offset fails it.
-  if x != x or y != y or z != z: return
-  if x > 1.0e6 or x < -1.0e6: return
-  if y > 1.0e6 or y < -1.0e6: return
-  if z > 1.0e6 or z < -1.0e6: return
-  if x == 0.0 and y == 0.0 and z == 0.0: return
-  ok = true
+  let world = worldPtr()
+  if world == nil: return
+
+  let list = playersList(world)
+  if list == nil: return
+  let items = rdPtr(list, ListItemsOff)
+  var n = int(rdI32(list, ListSizeOff))
+  if items == nil or n < 0 or n > 1024: return
+
+  gPosSweeps = gPosSweeps + 1
+  posBegin()
+  let me = rdPtr(world, GwMainPlayer)
+  var good = 0
+  if me != nil:
+    let c = posAdd(me)
+    gPosCode = c
+    if c == posOk: good = good + 1
+  var i = 0
+  while i < n:
+    let p = rdPtr(items, ArrDataOff + i*8)
+    inc i
+    if p == nil or p == me: continue
+    if posAdd(p) == posOk: good = good + 1
+  posCommit()
+  if good > 0: gPosGood = gPosGood + 1
+
+  # The movement check, taken on the FINISHED published snapshot.
+  if me != nil:
+    var x = 0.0; var y = 0.0; var z = 0.0
+    if posGet(me, x, y, z):
+      gPosOk = true
+      if gPosHavePrev:
+        let dx = x - gPosPx; let dy = y - gPosPy; let dz = z - gPosPz
+        let step = dx*dx + dy*dy + dz*dz
+        if step > gPosMaxStep: gPosMaxStep = step
+        if step > 1.0e-6: gPosMoved = true
+      gPosPx = x; gPosPy = y; gPosPz = z
+      gPosHavePrev = true
+    elif gPosCode != posOk:
+      note("player position: " & posCodeText(gPosCode))
 
 proc distance(ax, ay, az, bx, by, bz: float): float =
   let dx = ax - bx; let dy = ay - by; let dz = az - bz
@@ -325,13 +407,6 @@ proc distance(ax, ay, az, bx, by, bz: float): float =
   while k < 24:
     d = 0.5 * (d + d2 / d); inc k
   result = d
-
-proc playersList(world: pointer): pointer =
-  ## AllAlivePlayersList (List<Player>, concrete) first; RegisteredPlayers
-  ## (List<IPlayer>) as a fallback.
-  result = rdPtr(world, GwAllAlivePlayers)
-  if result == nil:
-    result = rdPtr(world, GwRegisteredPlrs)
 
 proc dataResolved*(): bool =
   ## ESP is live only when there is a world, a validated position read, AND a
@@ -365,8 +440,10 @@ proc collectAndPublish*(s: AdminRegion; maxDistance: float; bbW, bbH: int) =
   let me = rdPtr(world, GwMainPlayer)
   if me != nil:
     localPtr = cast[uint64](me)
+    # gPosOk is NOT set here: it is owned by posSample() on Unity's thread,
+    # which is the only place a position is actually produced. Setting it from
+    # a snapshot read would make it a restatement of our own cache.
     playerPos(me, haveLocal, lx, ly, lz)
-    if haveLocal: gPosOk = true
   else:
     note("GameWorld+0x230 MainPlayer read null")
 
@@ -401,7 +478,6 @@ proc collectAndPublish*(s: AdminRegion; maxDistance: float; bbW, bbH: int) =
     playerPos(p, pok, hx, hy, hz)
     if not pok: continue
     inc seen
-    gPosOk = true
 
     var dist = 0.0
     if haveLocal:
@@ -679,11 +755,38 @@ proc dataDiag*(): string =
   r.add "  gameworld    : " & (if worldPtr() != nil: "PASS  " else:
                                (if gwState() <= 1: "FAIL  " else: "INCONCLUSIVE  ")) &
         gwStateText() & "\n"
+  # POSITIONS. PASS requires the FINISHED STATE, not our own read: finite,
+  # bounded, non-origin AND OBSERVED TO CHANGE. A static non-zero value is what
+  # a wrong-but-plausible offset produces and it is NOT a pass -- standing still
+  # is INCONCLUSIVE. Every failure names WHICH of the exit reasons it took.
   r.add "  positions    : " &
-        (if not gInRaid: "INCONCLUSIVE  no raid, nothing to read"
-         elif gPosOk: "PASS  Player+0x60->MovementContext+0x370 validated (" &
-                      $gLastSeen & " players)"
-         else: "FAIL  no player position passed the finite/bounded check") & "\n"
+        (if posArmed() < 0:
+           "FAIL  EFT.Player::get_Position @0x6F32C0 prologue did not " &
+           "byte-verify against this build"
+         elif not gInRaid: "INCONCLUSIVE  no raid, nothing to read"
+         elif gPosSweeps == 0:
+           "INCONCLUSIVE  the Unity-thread sweep has never fired (see esp " &
+           "sampler) -- get_position_Injected cannot be called from the host " &
+           "thread, so nothing has been sampled"
+         elif not gPosOk:
+           "FAIL  " & $gPosSweeps & " sweeps, no local position: " &
+           posCodeText(gPosCode)
+         elif gPosMoved:
+           "PASS  EFT.Player::get_Position @0x6F32C0 via Player+0xB40->" &
+           "PlayerBones+0x178->BifacialTransform; " & $posCount() &
+           " in snapshot gen " & $posGen() & ", and the local position HAS " &
+           "CHANGED between sweeps"
+         else:
+           "INCONCLUSIVE  " & $posCount() & " positions validated but the " &
+           "local one has NOT changed across " & $gPosSweeps & " sweeps -- " &
+           "either the player is standing still, or this is a plausible " &
+           "constant rather than a live pose. Move and re-run") & "\n"
+  r.add "  pos reasons  : " &
+        ("ok=" & $posStat(posOk) & " nilBones=" & $posStat(posNilBones) &
+         " nilXform=" & $posStat(posNilXform) & " imitated=" &
+         $posStat(posImitated) & " allZero=" & $posStat(posAllZero) &
+         " nan=" & $posStat(posNan) & " range=" & $posStat(posRange) &
+         " noCall=" & $posStat(posNoCall)) & "\n"
   # The projection is a SEPARATE axis from the raid: it binds and samples in the
   # menu too. So a bind failure is FAIL wherever it happens, "bound but never
   # sampled / stale" is INCONCLUSIVE, and only a live snapshot is PASS. None of

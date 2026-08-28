@@ -108,6 +108,21 @@ proc cWf(o: pointer; off: int32; v: cfloat) {.importc: "aowl_admin_wf", nodecl.}
 proc cRb(o: pointer; off: int32): int32 {.importc: "aowl_admin_rb", nodecl.}
 proc cWb(o: pointer; off: int32; v: int32): int32 {.importc: "aowl_admin_wb", nodecl.}
 
+# The live world position: a byte-verified direct call at EFT.Player::get_Position
+# @0x6F32C0, sampled on Unity's thread into a double-buffered snapshot the host
+# thread reads back. See the long block in abi/aowlspt_admin.h for the
+# disassembly and the metadata that establish every offset and the sret shape.
+proc cPosArm(): int32 {.importc: "aowl_admin_pos_arm", nodecl.}
+proc cPosArmed(): int32 {.importc: "aowl_admin_pos_armed", nodecl.}
+proc cPosBegin() {.importc: "aowl_admin_pos_begin", nodecl.}
+proc cPosAdd(p: pointer): int32 {.importc: "aowl_admin_pos_add", nodecl.}
+proc cPosCommit() {.importc: "aowl_admin_pos_commit", nodecl.}
+proc cPosCount(): int32 {.importc: "aowl_admin_pos_count", nodecl.}
+proc cPosGen(): int32 {.importc: "aowl_admin_pos_gen_get", nodecl.}
+proc cPosStatAt(code: int32): int32 {.importc: "aowl_admin_pos_stat_at", nodecl.}
+proc cPosGet(p: pointer; x, y, z: ptr cfloat): int32 {.
+  importc: "aowl_admin_pos_get", nodecl.}
+
 # --------------------------------------------------------------- public
 
 proc adminMap*(): AdminRegion =
@@ -419,6 +434,84 @@ proc worldToScreen*(x, y, z: float; w, h: int; sx, sy: var float): bool =
   sx = float(fx)
   sy = float(fy)
   result = ok != 0'i32
+
+# --------------------------------------------------------- live positions
+#
+# `EFT.MovementContext.PreviousPosition` @0x370 is permanently ZERO on this
+# build -- the offset is right and the field is dead. The pose exists only on
+# Unity's native side, reachable through `EFT.Player::get_Position` @0x6F32C0,
+# which bottoms out in `Transform::get_position_Injected`. That makes it a
+# UNITY-THREAD-ONLY call, so `posArm` / `posBegin` / `posAdd` / `posCommit` are
+# legal ONLY from the everyMain tick; `posGet` is the any-thread reader.
+
+const
+  posOk*         = 0'i32
+  posUnreadable* = 1'i32
+  posNan*        = 2'i32
+  posRange*      = 3'i32
+  posAllZero*    = 4'i32
+  posNilBones*   = 10'i32
+  posNilXform*   = 11'i32
+  posImitated*   = 12'i32
+  posNoCall*     = 13'i32
+  posCodes*      = 14'i32
+
+proc posArm*(): int32 =
+  ## UNITY THREAD. Byte-verifies the 16-byte prologue at 0x6F32C0 once.
+  ## 1 = armed, 0 = GameAssembly.dll not up yet (retry), -1 = refused for good.
+  cPosArm()
+proc posArmed*(): int32 = cPosArmed()
+
+proc posBegin*() = cPosBegin()
+proc posAdd*(p: pointer): int32 =
+  ## UNITY THREAD. Samples one player; returns the exit code it took, so a
+  ## caller reports WHICH reason rather than "nothing worked".
+  if p == nil: return posNilBones
+  cPosAdd(p)
+proc posCommit*() = cPosCommit()
+proc posCount*(): int = int(cPosCount())
+proc posGen*(): int = int(cPosGen())
+proc posStat*(code: int32): int = int(cPosStatAt(code))
+
+proc posGet*(p: pointer; x, y, z: var float): bool =
+  ## ANY thread. False means "this player was not in the last good sweep" --
+  ## never "its position is the origin".
+  var fx = 0.0'f32
+  var fy = 0.0'f32
+  var fz = 0.0'f32
+  x = 0.0; y = 0.0; z = 0.0
+  if p == nil: return false
+  let ok = cPosGet(p, addr fx, addr fy, addr fz)
+  x = float(fx); y = float(fy); z = float(fz)
+  result = ok != 0'i32
+
+proc posCodeText*(code: int32): string =
+  ## The NAMED exit reason, mirroring the classification in aowlspt_admin.h.
+  if code == posOk: "OK"
+  elif code == posNoCall:
+    "EFT.Player::get_Position @0x6F32C0 is NOT ARMED -- GameAssembly.dll was " &
+    "absent, or its 16 prologue bytes did not match this build"
+  elif code == posNilBones:
+    "Player+0xB40 <PlayerBones>k__BackingField read null"
+  elif code == posNilXform:
+    "PlayerBones+0x178 BodyTransform (or BifacialTransform+0x10 Original) " &
+    "read null -- get_Position would have THROWN here, so it was correctly " &
+    "NOT called"
+  elif code == posImitated:
+    "BifacialTransform+0xA8 _useImitation / +0xA9 " &
+    "_accumulatePositionAndRotation was SET -- get_position takes a delegate " &
+    "path we have not proven throw-free, so the call was declined"
+  elif code == posUnreadable:
+    "a hop on Player+0xB40 -> PlayerBones+0x178 was NOT READABLE -- a POINTER " &
+    "problem, not a zero-field one"
+  elif code == posNan: "get_Position @0x6F32C0 returned NaN"
+  elif code == posRange:
+    "get_Position @0x6F32C0 returned out of range (|component| > 1e6)"
+  elif code == posAllZero:
+    "get_Position @0x6F32C0 returned exactly (0,0,0) from a READABLE buffer " &
+    "-- THE EXACT SHAPE THE OLD MovementContext+0x370 BUG PRODUCED, so the " &
+    "walk is reaching a BifacialTransform that is not the body"
+  else: "unclassified code " & $code
 
 proc godmodePatch*(on: bool; rva: uint32): bool =
   ## Apply (or revert) the God mode byte-patch on the damage function at `rva`.

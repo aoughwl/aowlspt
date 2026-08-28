@@ -789,6 +789,259 @@ static int32_t aowl_admin_gameasm_present(void) {
     return GetModuleHandleA("GameAssembly.dll") ? 1 : 0;
 }
 
+/* ================================================================== *
+ * THE LIVE WORLD POSITION IS NOT A MANAGED FIELD ON THIS BUILD.
+ * ==================================================================
+ *
+ * This mod read `EFT.MovementContext.PreviousPosition` @0x370 and reported
+ * `positions : FAIL no player position passed the finite/bounded check` in a
+ * live raid, which was misattributed to sampler timing. It was not timing.
+ * The offset is CORRECT -- metadata names the field at exactly 0x370 -- and the
+ * field is also permanently ZERO on this build: measured live in a raid on
+ * 2026-08-28 by `mods/maps`, 66331 readable reads, every one exactly (0,0,0)
+ * from a page VirtualQuery accepted. It is declared and never written. So this
+ * was never a one-wrong-offset problem; it was the wrong KIND of answer.
+ *
+ * Where the pose really lives, read out of the client's OWN accessor bytes and
+ * corroborated field-by-field against il2cpp metadata:
+ *
+ *   EFT.Player::get_Position  RVA 0x6F32C0
+ *     40 53 48 83 EC 30              push rbx; sub rsp,0x30
+ *     48 8B 82 40 0B 00 00           mov rax,[rdx+0xB40]   Player.PlayerBones
+ *     48 8B D9                       mov rbx,rcx           (sret buffer)
+ *     48 85 C0 74 30                 null -> managed throw path
+ *     48 8B 90 78 01 00 00           mov rdx,[rax+0x178]   PlayerBones.BodyTransform
+ *     48 85 D2 74 24                 null -> managed throw path
+ *     45 33 C0                       xor r8d,r8d           MethodInfo* = NULL
+ *     48 8D 4C 24 20                 lea rcx,[rsp+0x20]
+ *     E8 B2 0C 1E 00                 call 0x8D3FA0  BifacialTransform::get_position
+ *     ... F2 0F 11 03 / 89 43 08     store 12 bytes to [rbx]; return rbx
+ *
+ *   EFT.BifacialTransform::get_position  RVA 0x8D3FA0
+ *     80 BA A9 00 00 00 00  cmp byte [rdx+0xA9],0   _accumulatePositionAndRotation
+ *     80 BA A8 00 00 00 00  cmp byte [rdx+0xA8],0   _useImitation
+ *     48 8B 7A 10           mov rdi,[rdx+0x10]      Original (UnityEngine.Transform)
+ *     ... FF D0             Transform::get_position_Injected(this, out Vector3)
+ *
+ *   metadata: EFT.Player.<PlayerBones>k__BackingField @0xB40  (PlayerBones)
+ *             PlayerBones.BodyTransform              @0x178  (BifacialTransform)
+ *             BifacialTransform.Original @0x10, _useImitation @0xA8,
+ *             _accumulatePositionAndRotation @0xA9  -- all three match.
+ *
+ * The fast path bottoms out in a UNITY NATIVE ICALL. There is therefore no
+ * managed offset that holds the live pose, and no amount of hunting for one
+ * will produce it. A direct call at a byte-verified static RVA is the only
+ * route, and it is the route CLAUDE.md 5 sanctions.
+ *
+ * WHY WE WALK THE CHAIN OURSELVES BEFORE CALLING. Both `get_Position` and
+ * `get_position` THROW a managed NullReferenceException on their null branches.
+ * A managed throw unwinding out of a raw native call, 128 times a frame, is not
+ * something we survive. Every pointer the callee will dereference is validated
+ * HERE first (rule 2: `a->b->c` is three checks, not one) and the call happens
+ * only once the throw branches are proven unreachable. The pre-walk is not
+ * redundant with the callee's checks; it is what makes them never fire.
+ *
+ * MIRRORED, NOT SHARED, from `mods/maps/sp/world.nim` + `mods/maps/sp/mapmath.h`.
+ * Those are a sibling MOD's private translation-unit-local statics; including
+ * them here would make admin's build depend on maps' internals, and two agents
+ * are editing maps concurrently. The disassembly and the metadata above are the
+ * shared artifact -- they are reproducible from GameAssembly.dll, and neither
+ * copy is authoritative over the other.
+ *
+ * THREADING. `Transform::get_position_Injected` is a Unity native call and is
+ * legal only on Unity's thread. The ESP data pass runs on the HOST's thread, so
+ * this cannot be called from it. `aowl_admin_pos_add` is therefore driven from
+ * the same `everyMain` tick the camera sampler already rides (fact #136 gate),
+ * and the host-thread pass reads back the snapshot below with pure memory
+ * reads. That is why a cache exists at all.
+ * ================================================================== */
+
+#define AOWL_ADM_GETPOS_RVA  0x6F32C0
+#define AOWL_ADM_PL_BONES    0xB40
+#define AOWL_ADM_PB_BODYXF   0x178
+#define AOWL_ADM_BT_ORIGINAL 0x10
+#define AOWL_ADM_BT_USEIMIT  0xA8
+#define AOWL_ADM_BT_ACCUM    0xA9
+
+/* Classification, mirrored from mm_pos_classify. UNREADABLE and ALLZERO are
+ * DISTINCT answers on purpose: "a bad pointer" and "a readable page that is
+ * genuinely full of zeroes" are different bugs, and collapsing them is exactly
+ * what hid the PreviousPosition failure for as long as it hid. */
+#define AOWL_ADM_POS_OK         0
+#define AOWL_ADM_POS_UNREADABLE 1
+#define AOWL_ADM_POS_NAN        2
+#define AOWL_ADM_POS_RANGE      3
+#define AOWL_ADM_POS_ALLZERO    4
+/* Above the range above, so the five-way classification stays intact and these
+ * are additive. A future wrong offset landing on a mapped, zeroed page STILL
+ * comes back ALLZERO -- the report that made this bug findable at all. */
+#define AOWL_ADM_POS_NILBONES   10
+#define AOWL_ADM_POS_NILXFORM   11
+#define AOWL_ADM_POS_IMITATED   12
+#define AOWL_ADM_POS_NOCALL     13
+#define AOWL_ADM_POS_CODES      14
+
+#define AOWL_ADM_POS_LIMIT 1.0e6f
+
+static int32_t aowl_admin_pos_classify(int32_t readable, float x, float y, float z) {
+    if (!readable) return AOWL_ADM_POS_UNREADABLE;
+    /* NaN is the only value that compares unequal to itself. Written this way
+     * rather than with isnan() so it survives -ffast-math builds unchanged. */
+    if (x != x || y != y || z != z) return AOWL_ADM_POS_NAN;
+    if (x > AOWL_ADM_POS_LIMIT || x < -AOWL_ADM_POS_LIMIT) return AOWL_ADM_POS_RANGE;
+    if (y > AOWL_ADM_POS_LIMIT || y < -AOWL_ADM_POS_LIMIT) return AOWL_ADM_POS_RANGE;
+    if (z > AOWL_ADM_POS_LIMIT || z < -AOWL_ADM_POS_LIMIT) return AOWL_ADM_POS_RANGE;
+    if (x == 0.0f && y == 0.0f && z == 0.0f) return AOWL_ADM_POS_ALLZERO;
+    return AOWL_ADM_POS_OK;
+}
+
+static const unsigned char aowl_adm_getpos_sig[16] = {
+    0x40,0x53,0x48,0x83,0xEC,0x30,0x48,0x8B,
+    0x82,0x40,0x0B,0x00,0x00,0x48,0x8B,0xD9
+};
+static void*   aowl_adm_getpos_fn    = 0;
+static int32_t aowl_adm_getpos_state = 0;   /* 0 untried, 1 armed, -1 refused */
+
+/* Arm ONCE, and refuse STICKILY: a build whose prologue does not match never
+ * gets a second chance and never calls. `GetModuleHandleA` is the OS loader,
+ * not an il2cpp by-name lookup -- there is no token-gated export on this path
+ * and nothing here can return a plausible random value. */
+static int32_t aowl_admin_pos_arm(void) {
+    unsigned char* fn;
+    HMODULE ga;
+    if (aowl_adm_getpos_state != 0) return aowl_adm_getpos_state;
+    ga = GetModuleHandleA("GameAssembly.dll");
+    if (!ga) return 0;                       /* not up YET -- retry later */
+    fn = (unsigned char*)ga + AOWL_ADM_GETPOS_RVA;
+    if (!aowl_admin_readable(fn, 16))                       { aowl_adm_getpos_state = -1; return -1; }
+    if (memcmp(fn, aowl_adm_getpos_sig, 16) != 0)           { aowl_adm_getpos_state = -1; return -1; }
+    aowl_adm_getpos_fn = (void*)fn;
+    aowl_adm_getpos_state = 1;
+    return 1;
+}
+static int32_t aowl_admin_pos_armed(void) { return aowl_adm_getpos_state; }
+
+static int32_t aowl_adm_rd_u8(const void* o, int32_t off, unsigned char* out) {
+    const unsigned char* a = (const unsigned char*)o + off;
+    *out = 0;
+    if (!aowl_admin_readable(a, 1)) return 0;
+    *out = *a;
+    return 1;
+}
+
+/* Vector3 (12 bytes) is bigger than 8, so Win64 returns it through a HIDDEN
+ * BUFFER: (retbuf in RCX, this in RDX, MethodInfo* in R8). That shape is not
+ * inferred from the name -- it is read off `48 8B D9` (mov rbx,rcx) at entry
+ * and `F2 0F 11 03 / 89 43 08 / 48 8B C3` (store 12 bytes to [rbx], return rbx)
+ * at exit. MethodInfo* NULL is safe: get_Position is not a shared generic. */
+static int32_t aowl_admin_pos_live(void* player, float* out3) {
+    void* bones; void* bt; void* orig;
+    unsigned char flag = 0;
+    float tmp[3];
+    out3[0] = 0.0f; out3[1] = 0.0f; out3[2] = 0.0f;
+    if (aowl_adm_getpos_state != 1) return AOWL_ADM_POS_NOCALL;
+    if (!player)                    return AOWL_ADM_POS_NILBONES;
+    bones = aowl_admin_rp(player, AOWL_ADM_PL_BONES);
+    if (!bones)                     return AOWL_ADM_POS_NILBONES;
+    bt = aowl_admin_rp(bones, AOWL_ADM_PB_BODYXF);
+    if (!bt)                        return AOWL_ADM_POS_NILXFORM;
+    /* Both imitation flags must be clear, or get_position takes a delegate path
+     * we have NOT proven throw-free. Declining is an ANSWER, not a silence. */
+    if (!aowl_adm_rd_u8(bt, AOWL_ADM_BT_ACCUM, &flag)   || flag) return AOWL_ADM_POS_IMITATED;
+    if (!aowl_adm_rd_u8(bt, AOWL_ADM_BT_USEIMIT, &flag) || flag) return AOWL_ADM_POS_IMITATED;
+    orig = aowl_admin_rp(bt, AOWL_ADM_BT_ORIGINAL);
+    if (!orig)                      return AOWL_ADM_POS_NILXFORM;
+    tmp[0] = 0.0f; tmp[1] = 0.0f; tmp[2] = 0.0f;
+    ((void* (*)(void*, void*, void*))aowl_adm_getpos_fn)((void*)tmp, player, (void*)0);
+    out3[0] = tmp[0]; out3[1] = tmp[1]; out3[2] = tmp[2];
+    /* readable=1: the buffer is OUR stack, so readability is not in question --
+     * it was answered by the guarded walk above. The plausibility gates
+     * (NaN / out-of-range / exactly-zero) still apply unchanged. */
+    return aowl_admin_pos_classify(1, tmp[0], tmp[1], tmp[2]);
+}
+
+/* ------------------------------------------------------------------ *
+ * The snapshot. Written on Unity's thread by the everyMain tick, read on the
+ * host's thread by the ESP data pass. Fixed storage, no allocation of any kind
+ * per frame (rule 7); capped at a population far above any real raid (rule 4).
+ *
+ * DOUBLE-BUFFERED with a seqlock-style generation, for the same reason the
+ * camera snapshot is: the reader must never see half of one frame's sweep
+ * spliced onto half of the next. `begin` fills the BACK buffer, `commit`
+ * publishes it by flipping the index; the reader only ever looks at the
+ * published side.
+ * ------------------------------------------------------------------ */
+#define AOWL_ADM_POS_MAX 128
+
+typedef struct {
+    void* player;
+    float x, y, z;
+} AowlAdmPosEnt;
+
+static AowlAdmPosEnt aowl_adm_pos_buf[2][AOWL_ADM_POS_MAX];
+static int32_t aowl_adm_pos_n[2]  = { 0, 0 };
+static int32_t aowl_adm_pos_pub   = 0;   /* index of the PUBLISHED buffer */
+static int32_t aowl_adm_pos_back  = 1;
+static int32_t aowl_adm_pos_fill  = 0;   /* entries written into the back one */
+static int32_t aowl_adm_pos_gen   = 0;
+static int32_t aowl_adm_pos_stat[AOWL_ADM_POS_CODES];
+
+static void aowl_admin_pos_begin(void) { aowl_adm_pos_fill = 0; }
+
+/* Sample ONE player and record it. Returns the classification so the caller can
+ * report WHICH exit reason it took rather than "it did not work". Entries that
+ * did not classify OK are deliberately NOT stored: a rejected read must not
+ * reach the draw loop as a plausible coordinate. */
+static int32_t aowl_admin_pos_add(void* player) {
+    float p[3];
+    int32_t code = aowl_admin_pos_live(player, p);
+    if (code >= 0 && code < AOWL_ADM_POS_CODES) {
+        if (aowl_adm_pos_stat[code] < 0x40000000) aowl_adm_pos_stat[code]++;
+    }
+    if (code != AOWL_ADM_POS_OK) return code;
+    if (aowl_adm_pos_fill >= AOWL_ADM_POS_MAX) return code;   /* capped */
+    aowl_adm_pos_buf[aowl_adm_pos_back][aowl_adm_pos_fill].player = player;
+    aowl_adm_pos_buf[aowl_adm_pos_back][aowl_adm_pos_fill].x = p[0];
+    aowl_adm_pos_buf[aowl_adm_pos_back][aowl_adm_pos_fill].y = p[1];
+    aowl_adm_pos_buf[aowl_adm_pos_back][aowl_adm_pos_fill].z = p[2];
+    aowl_adm_pos_fill++;
+    return code;
+}
+
+static void aowl_admin_pos_commit(void) {
+    int32_t t;
+    aowl_adm_pos_n[aowl_adm_pos_back] = aowl_adm_pos_fill;
+    t = aowl_adm_pos_pub; aowl_adm_pos_pub = aowl_adm_pos_back; aowl_adm_pos_back = t;
+    aowl_adm_pos_gen++;
+}
+
+static int32_t aowl_admin_pos_count(void) { return aowl_adm_pos_n[aowl_adm_pos_pub]; }
+static int32_t aowl_admin_pos_gen_get(void) { return aowl_adm_pos_gen; }
+static int32_t aowl_admin_pos_stat_at(int32_t code) {
+    if (code < 0 || code >= AOWL_ADM_POS_CODES) return 0;
+    return aowl_adm_pos_stat[code];
+}
+
+/* Look a player up in the PUBLISHED snapshot. Linear over at most 128 entries,
+ * which is the same bound the sweep already carries. Returns 1 and fills
+ * x/y/z, or 0 -- and 0 means "this player was not in the last good sweep",
+ * never "its position is the origin". */
+static int32_t aowl_admin_pos_get(void* player, float* x, float* y, float* z) {
+    int32_t i;
+    const AowlAdmPosEnt* b = aowl_adm_pos_buf[aowl_adm_pos_pub];
+    int32_t n = aowl_adm_pos_n[aowl_adm_pos_pub];
+    *x = 0.0f; *y = 0.0f; *z = 0.0f;
+    if (!player) return 0;
+    if (n < 0 || n > AOWL_ADM_POS_MAX) return 0;
+    for (i = 0; i < n; i++) {
+        if (b[i].player == player) {
+            *x = b[i].x; *y = b[i].y; *z = b[i].z;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* ------------------------------------------------------------------ *
  * Projection helpers, runnable either side. `m` is a Unity Matrix4x4 product
  * (projection * worldToCamera) in column-major order: element (row r, col c) is
