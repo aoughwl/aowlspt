@@ -578,6 +578,155 @@ proc leakProof(w, h: int) =
         rowIndexOf(good.rows, "SUMMARYLINE") == 1,
         "leak proof: while the REAL frame passes all three")
 
+proc oldVerdict(w: EnterWait; reason: var string): int =
+  ## THE BEHAVIOUR THAT SHIPPED, reproduced exactly, so the new checks can be
+  ## shown to go red against it.
+  ##
+  ## The old wait loop looked at one thing: is there a screen named
+  ## `CharacterSelectionScreen` with `active == triYes`? It never consulted
+  ## `ScreenSet.rootPresent`. Everything else was the 270s wall-clock bound.
+  reason = ""
+  if w.selectorActive:
+    reason = "character select is up"
+    return EwSelectorUp
+  if w.elapsedMs >= EnterWaitLimitMs:
+    reason = "timed out"
+    return EwTimedOut
+  result = EwWaiting
+
+proc inRaid(elapsedMs: int64): EnterWait =
+  ## THE STATE THE PLAYER WAS ACTUALLY IN.
+  ##
+  ## Client alive, host running, they clicked through character select
+  ## themselves and are in a raid -- so the `Menu UI` scene root is gone. The
+  ## selector WAS seen earlier in the run, which is what makes this different
+  ## from a cold client that has not reached the menu yet.
+  result = EnterWait(sawMenuRoot: true, menuRootPresent: false,
+                     sawSelector: true, selectorActive: false,
+                     otherScreenActive: false, clientAlive: true,
+                     elapsedMs: elapsedMs)
+
+proc transition(w, h: int) =
+  ## THE REGRESSION THE 274 GRID CHECKS COULD NOT SEE.
+  ##
+  ## Every check up to here asks "does this screen render correctly". None of
+  ## them can ask "is this the right screen to be on", and that is exactly what
+  ## broke in front of a player: the launcher rendered screen 1 perfectly, for
+  ## four and a half minutes, while they were in a raid.
+  ##
+  ## The falsifiable assertion, per the brief: given a live client with all its
+  ## steps satisfied, the produced screen must be the LOG VIEW. It is asserted
+  ## on the produced GRID, not just on the verdict integer -- the frame we end
+  ## up with must carry the panes and must NOT carry the profile panel.
+  echo ""
+  echo "--- transition  (w=" & $w & " h=" & $h & ") ---"
+
+  # 1. The reported state, decided the OLD way: still waiting => screen 1.
+  var oldWhy = ""
+  let oldV = oldVerdict(inRaid(2000'i64), oldWhy)
+  check(oldV == EwWaiting,
+        "transition: the SHIPPED logic says 'keep waiting' while the player " &
+        "is in a raid (this is the bug)")
+  check(screenFor(true, true, oldV) == ScreenLauncher,
+        "transition: ...and therefore stays on the LAUNCHER -- the red case")
+
+  # 2. The same state, decided the new way: past it => log view.
+  var why = ""
+  let v = enterWaitVerdict(inRaid(2000'i64), why)
+  check(v == EwPassed,
+        "transition: the missing Menu UI root is read as 'already past " &
+        "character select' (got " & $v & ")")
+  check(why.len > 0, "transition: and it SAYS why: " & why)
+  echo "      reason: " & why
+  check(enterWaitDone(v), "transition: which is a terminal verdict")
+  check(screenFor(true, true, v) == ScreenLogView,
+        "transition: so the screen is the LOG VIEW")
+
+  # 3. THE GRID. Not the integer -- the frame the player would be looking at.
+  var srv = fakeTail("SRVLINE", 40)
+  var cli = fakeTail("CLILINE", 40)
+  if screenFor(true, true, v) == ScreenLogView:
+    let lay = logViewRows(w, h, buildHeader(w),
+                          stepRow(MarkDone, "launch", "SUMMARYLINE ready", w),
+                          srv, cli, "SRVPANE 40", "CLIPANE 40",
+                          0, 0, 0, false, buildHelp(w))
+    check(lay.renderable, "transition: the log view renders")
+    check(has(lay.rows, "SRVLINE") and has(lay.rows, "CLILINE"),
+          "transition: and the frame in front of the player has BOTH logs")
+    check(not has(lay.rows, "PROFROW") and not has(lay.rows, "PANELTITLE"),
+          "transition: and NOT the profile panel they were stuck on")
+
+  # 4. The bound is still there, and still announces itself. A wait that gives
+  #    up silently is the same defect wearing a timer.
+  var toWhy = ""
+  var late = inRaid(0'i64)
+  late.sawMenuRoot = false     # never reached the menu at all
+  late.sawSelector = false
+  late.menuRootPresent = false
+  late.elapsedMs = EnterWaitLimitMs
+  let toV = enterWaitVerdict(late, toWhy)
+  check(toV == EwTimedOut, "transition: a client that never gets there times out")
+  check(toWhy.len > 0, "transition: and the timeout states a reason: " & toWhy)
+  check(screenFor(true, true, toV) == ScreenLogView,
+        "transition: a timeout hands off to the logs rather than sitting there")
+
+  # 5. THE COLD-BOOT CASE MUST STILL WAIT. This is what makes the fix a fix
+  #    rather than a shortcut: "no Menu UI root" before the menu has EVER been
+  #    seen is a client that has not got there yet, not one in a raid. Without
+  #    the `sawMenuRoot` latch this would abandon auto-enter one poll after
+  #    launch, on every single launch.
+  var cold = EnterWait(sawMenuRoot: false, menuRootPresent: false,
+                       sawSelector: false, selectorActive: false,
+                       otherScreenActive: false, clientAlive: true,
+                       elapsedMs: 4000'i64)
+  var coldWhy = ""
+  check(enterWaitVerdict(cold, coldWhy) == EwWaiting,
+        "transition: a cold client that has not loaded the menu KEEPS waiting")
+  check(screenFor(true, true, enterWaitVerdict(cold, coldWhy)) ==
+        ScreenLauncher,
+        "transition: ...and stays on the launcher, which is correct there")
+
+  # 6. A dead client is not a raid. Checked before any screen reasoning,
+  #    because a client that has exited has no Menu UI root either and would
+  #    otherwise be reported as "in a raid".
+  var dead = inRaid(2000'i64)
+  dead.clientAlive = false
+  var deadWhy = ""
+  let deadV = enterWaitVerdict(dead, deadWhy)
+  check(deadV == EwClientGone,
+        "transition: an exited client is EwClientGone, not EwPassed")
+  check(screenFor(true, false, deadV) == ScreenLogView,
+        "transition: and it still hands off, so the logs can say what died")
+
+  # 7. And the ordinary happy path is untouched.
+  var up = EnterWait(sawMenuRoot: true, menuRootPresent: true,
+                     sawSelector: true, selectorActive: true,
+                     otherScreenActive: false, clientAlive: true,
+                     elapsedMs: 30000'i64)
+  var upWhy = ""
+  check(enterWaitVerdict(up, upWhy) == EwSelectorUp,
+        "transition: character select actually being up still means PRESS IT")
+
+  # 8. NO STATE SITS ON THE LAUNCHER FOREVER. Swept rather than argued: over
+  #    every combination of the observable flags, any state at the wall-clock
+  #    bound must be terminal. This is the property the whole bug violated.
+  var stuck = 0
+  for a in 0 ..< 64:
+    var e = EnterWait(sawMenuRoot: (a and 1) != 0,
+                      menuRootPresent: (a and 2) != 0,
+                      sawSelector: (a and 4) != 0,
+                      selectorActive: (a and 8) != 0,
+                      otherScreenActive: (a and 16) != 0,
+                      clientAlive: (a and 32) != 0,
+                      elapsedMs: EnterWaitLimitMs)
+    var r = ""
+    if not enterWaitDone(enterWaitVerdict(e, r)): inc stuck
+    if r.len == 0 and enterWaitDone(enterWaitVerdict(e, r)): inc stuck
+  check(stuck == 0,
+        "transition: of 64 observable states, " & $stuck & " could still be " &
+        "on the launcher at the time bound (must be 0), and every terminal " &
+        "one carries a reason")
+
 proc main(): int =
   # Pin the rendering so the grid is plain ASCII and a match means what it says.
   discard termStart()
@@ -616,6 +765,7 @@ proc main(): int =
   notFused(80, 24)
   leakProof(120, 30)
   leakProof(80, 24)
+  transition(120, 30)
   handoff(119)
   handoff(39)
 

@@ -534,6 +534,11 @@ type
       ## panel that offered to create a profile at that moment would be
       ## offering it because it had not looked, which is the create affordance
       ## appearing for an install that already has six characters.
+    enterState: int
+      ## The auto-enter wait's verdict (`EwWaiting` .. `EwTimedOut`). Screen 1
+      ## grows a fifth step from it, because that wait used to be a completely
+      ## invisible 270 seconds sitting behind a settled, frozen panel.
+    enterWaitedMs: int64
     profiles: seq[Profile]
     chosenId: string
       ## The profile the launcher bound, so the panel can mark WHICH row is the
@@ -557,7 +562,8 @@ proc newScreen(): Screen =
                   answered: false, alive: true, tlsMode: false, port: 0,
                   pid: 0, who: "", srvText: "", srvCol: ColDim,
                   cliText: "", cliCol: ColDim, summaryKind: MarkPending,
-                  summaryText: "", profilesKnown: false, profiles: @[],
+                  summaryText: "", profilesKnown: false,
+                  enterState: EwWaiting, enterWaitedMs: 0'i64, profiles: @[],
                   chosenId: "", canCreate: false, profileNote: "")
 
 proc bootSteps(s: Screen; width: int): seq[Row] =
@@ -637,6 +643,26 @@ proc clientSteps(s: Screen; width: int): seq[Row] =
                      "host",
                      (if h.running: $h.modsLoaded & " client mod(s) loaded"
                       else: ""), width)
+  # THE FIFTH STEP. Only once the host is running, because that is when the
+  # auto-enter wait starts -- and before this row existed that wait was up to
+  # 270 seconds behind a frozen panel with nothing to look at. A step that says
+  # what is being waited for, with a clock that moves, is the difference
+  # between a bounded wait and an apparent hang.
+  if h.running:
+    result.add stepRow(
+      (case s.enterState
+       of EwSelectorUp: MarkActive
+       of EwPassed: MarkDone
+       of EwClientGone: MarkFailed
+       of EwTimedOut: MarkFailed
+       else: MarkActive),
+      "character select",
+      (case s.enterState
+       of EwSelectorUp: "up -- pressing it"
+       of EwPassed: "already past it"
+       of EwClientGone: "the client exited"
+       of EwTimedOut: "did not appear in time -- going to the logs"
+       else: "waiting for it (" & secsText(s.enterWaitedMs) & ")"), width)
   if h.errors > 0:
     result.add stepRow(MarkFailed, $h.errors & " error(s)", h.lastError, width)
 
@@ -725,10 +751,26 @@ proc screenHeader(s: Screen; w: int; elapsed: int64): Row =
   # Fields are dropped right to left, least important first: the clock, then
   # the client state, then the server state, then the profile. `aowlspt` is
   # always there, so the row is never empty.
+  # ONE SOURCE. This label used to be `case s.phase` alone, so screen 1 in the
+  # client phase always read "starting the client" -- including next to its own
+  # "client up" in the very next column, and above four ticked steps. The
+  # player saw a header contradicting itself. The phase says which set of
+  # things is being reported; the STATE says how far along they are, and both
+  # the label and the step marks now read the same state.
   let label =
     case s.phase
-    of phBoot: "starting the server"
-    of phClient: "starting the client"
+    of phBoot: (if s.answered: "server ready" else: "starting the server")
+    of phClient:
+      if not s.alive: "the client exited"
+      elif s.host.running:
+        # Past "starting": the host is up and the only thing left is the
+        # character-select wait, so say which of those two it is.
+        (case s.enterState
+         of EwWaiting: "waiting for character select"
+         of EwSelectorUp: "entering the game"
+         else: (if s.who.len > 0: s.who else: "in game"))
+      elif s.host.runtimeUp: "binding the host"
+      else: "starting the client"
     of phRun: (if s.who.len > 0: s.who else: "no profile")
   var labelW = 26
   var srvW = 30
@@ -2498,29 +2540,104 @@ proc main(): int =
     let waitStart = cNowMs()
     discard writeTextFile(verdictPath,
       entryLine & "\nauto-enter: before screen-wait loop\n")
-    # The bound is WALL-CLOCK, not "N attempts", so a call that runs long
-    # despite the pin still cannot keep this looping past 270s.
-    while cNowMs() - waitStart < 270000'i64 and not screenUp:
+    # FOURTH, and the one a player actually hit: this loop used to look at
+    # exactly one thing -- a `CharacterSelectionScreen` with `active == triYes`
+    # -- and so it could not tell "not there yet" from "gone, because the human
+    # clicked through it and is in a raid". In a raid the `Menu UI` scene root
+    # does not exist at all, so the screen it was waiting for could never come
+    # back and the loop burned the whole 270s. Meanwhile `watchClient` had
+    # already called `panel.settle()`, so screen 1 was frozen in the scrollback
+    # with its clock stopped at 1.3s and nothing on screen said what was going
+    # on. The player was playing; the launcher looked hung.
+    #
+    # `ScreenSet.rootPresent` is exactly this signal and the library returns it
+    # deliberately -- see its comment in `tools/aowlui.nim`: the absence of the
+    # root "is not an error -- it is the single most reliable IN-RAID signal we
+    # have". It was being ignored. The whole decision now lives in
+    # `enterWaitVerdict`, which is pure and therefore actually testable
+    # (`tests/tuilayout.nim`); this loop only gathers what it observes.
+    #
+    # The wait also PAINTS now. A bounded wait that shows nothing is
+    # indistinguishable from a hang for as long as it lasts, and 270s of that
+    # is what the player saw.
+    var ew = EnterWait(sawMenuRoot: false, menuRootPresent: false,
+                       sawSelector: false, selectorActive: false,
+                       otherScreenActive: false, clientAlive: true,
+                       elapsedMs: 0'i64)
+    var verdict = EwWaiting
+    var verdictWhy = ""
+    var waitPanel = newPanel()
+    var waitPainting = termMode() == tmFull
+    var ws = newScreen()
+    ws.phase = phClient
+    ws.who = who
+    ws.profilesKnown = true
+    ws.profiles = knownProfiles
+    ws.chosenId = chosen.id
+    ws.pid = int(cLaunchPid(launch))
+    ws.srvText = "server up"
+    ws.srvCol = ColGreen
+    pumpBoth(logs)
+    var hostRunning = scanHost(logs.client).running
+    while screenFor(hostRunning, ew.clientAlive, verdict) == ScreenLauncher:
       var ss = default(ScreenSet)
       var active = triUnknown
+      ew.selectorActive = false
+      ew.otherScreenActive = false
       if screens(u, "Menu UI", ss):
+        ew.menuRootPresent = ss.rootPresent
+        if ss.rootPresent: ew.sawMenuRoot = true
         for sc in ss.screens:
           if sc.name == "CharacterSelectionScreen":
             active = sc.active
-            if sc.active == triYes: screenUp = true
+            ew.sawSelector = true
+            if sc.active == triYes: ew.selectorActive = true
+          elif sc.active == triYes:
+            ew.otherScreenActive = true
       else:
+        # A poll that got no answer says nothing either way, so it must not
+        # move `menuRootPresent`: reading a dropped batch as "the root is gone"
+        # would call a raid on a channel hiccup.
         waitErr = u.lastErr
+      ew.clientAlive = cLaunchAlive(launch) != 0'i32
+      ew.elapsedMs = cNowMs() - waitStart
+      verdict = enterWaitVerdict(ew, verdictWhy)
       discard writeTextFile(verdictPath,
         entryLine & "\nauto-enter: wait iter " & $waitTries & " elapsed=" &
-        $(cNowMs() - waitStart) & "ms active=" & $active &
+        $ew.elapsedMs & "ms active=" & $active &
+        " sawMenuRoot=" & $ew.sawMenuRoot &
+        " menuRootPresent=" & $ew.menuRootPresent &
+        " verdict=" & $verdict & " why=" & verdictWhy &
         " err=" & waitErr & "\n")
-      if not screenUp:
+      # Keep screen 1 alive while we wait, so the clock moves and the step
+      # says what is being waited for.
+      pumpBoth(logs)
+      ws.host = scanHost(logs.client)
+      hostRunning = ws.host.running
+      if waitPainting:
+        ws.alive = ew.clientAlive
+        ws.cliText = (if ew.clientAlive: "client up" else: "client exited")
+        ws.cliCol = (if ew.clientAlive: ColGreen else: ColRed)
+        ws.enterState = verdict
+        ws.enterWaitedMs = ew.elapsedMs
+        if not paintPhase(waitPanel, logs, ws, ew.elapsedMs):
+          waitPainting = false
+      if not enterWaitDone(verdict):
         cSleepMs 3000
         inc waitTries
+    screenUp = (verdict == EwSelectorUp)
+    if waitPainting: waitPanel.settle()
     discard writeTextFile(verdictPath,
-      entryLine & "\nauto-enter: after screen-wait loop, screenUp=" &
-      $screenUp & " waitTries=" & $waitTries & " waitErr=" & waitErr & "\n")
-    if not screenUp:
+      entryLine & "\nauto-enter: after screen-wait loop, verdict=" & $verdict &
+      " why=" & verdictWhy & " screenUp=" & $screenUp &
+      " waitTries=" & $waitTries & " waitErr=" & waitErr & "\n")
+    if verdict == EwPassed or verdict == EwClientGone:
+      # NOT a failure, and it must not be reported as one: the player got
+      # themselves past character select, which is the thing auto-enter exists
+      # to do. Say so and hand straight over to the logs.
+      note "auto-enter skipped -- " & verdictWhy
+      flushOut()
+    elif not screenUp:
       let msg = "auto-enter verdict: INCONCLUSIVE -- " &
         "CharacterSelectionScreen under Menu UI never became active " &
         "within 270s. " & waitErr
