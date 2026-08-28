@@ -248,6 +248,69 @@ class SlotScan(object):
             k += 1
         return best
 
+    # ---- offline slot -> T attestation ----------------------------------
+
+    def slot_static_token(self, rva):
+        """The STATIC qword the DLL ships in `.data` at `rva` -- for an
+        unresolved metadata-usage slot this is the encoded token, the SAME value
+        the live host reads before il2cpp_codegen_initialize_runtime_metadata
+        resolves it. Read from the file image, not a live process."""
+        R = self.R
+        for nm, vaddr, vsize, rawptr, rawsize in R.SEC:
+            if vaddr <= rva < vaddr + vsize:
+                return struct.unpack_from("<Q", R.b, rawptr + (rva - vaddr))[0]
+        return None
+
+    def slot_type_arg(self, rva):
+        """Resolve `.data` slot `rva` to the generic type argument T of the
+        AddComponent<T> its token encodes -- WITHOUT running the game.
+
+        The runtime resolver 0x5251C0 decodes an unresolved slot value as
+        kind = token>>29, index = (token>>1)&0x0FFFFFFF; for a MethodRef
+        (kind 6) the index selects Il2CppMetadataRegistration.methodSpecs[index],
+        whose methodInst generic-inst names T. Returns
+        (token, kind, index, methodName, [type-arg names]) or None fields where
+        it cannot resolve. This is what pins each kind's slot to a PROVEN T, so
+        the runtime klass check is corroboration rather than the sole authority."""
+        R = self.R
+        if getattr(R, "MREG", None) is None:
+            R._find_metadata_registration()
+        mr = R.MREG
+        val = self.slot_static_token(rva)
+        if val is None:
+            return None
+        tok = val & 0xFFFFFFFF
+        kind = (tok >> 29) & 0x7
+        index = (tok >> 1) & 0x0FFFFFFF
+        ms_cnt = struct.unpack_from("<i", R.b, R.v2f(mr + 0x40))[0]
+        ms_ptr = R.rq(mr + 0x48)
+        gi_ptr = R.rq(mr + 0x18)
+        name = None
+        args = []
+        if kind == 6 and 0 <= index < ms_cnt:
+            mdef, class_inst, method_inst = struct.unpack_from(
+                "<iii", R.b, R.v2f(ms_ptr + index * 12))
+            try:
+                name = R.mname(mdef)
+            except Exception:
+                name = None
+            if method_inst >= 0:
+                gi = R.rq(gi_ptr + method_inst * 8)
+                argc = struct.unpack_from("<Q", R.b, R.v2f(gi))[0]
+                argv = R.rq(gi + 8)
+                for k in range(min(int(argc), 8)):
+                    tp = R.rq(argv + k * 8)
+                    o = R.v2f(tp)
+                    data = struct.unpack_from("<Q", R.b, o)[0]
+                    bits = struct.unpack_from("<I", R.b, o + 8)[0]
+                    tenum = (bits >> 16) & 0xFF
+                    if tenum in (0x11, 0x12):   # VALUETYPE / CLASS
+                        ns, nm = R.tname(data)
+                        args.append((ns + "." + nm) if ns else nm)
+                    else:
+                        args.append("tenum=0x%x" % tenum)
+        return (val, kind, index, name, args)
+
 
 def main(argv):
     if len(argv) < 3:
@@ -257,6 +320,7 @@ def main(argv):
     target = ADDCOMPONENT_GENERIC_RVA
     window = 64
     limit = 0
+    slottypes = []
     rest = argv[3:]
     i = 0
     while i < len(rest):
@@ -269,11 +333,33 @@ def main(argv):
         elif rest[i] == "--max":
             limit = int(rest[i + 1], 0)
             i += 2
+        elif rest[i] == "--slottype":
+            slottypes.append(int(rest[i + 1], 0))
+            i += 2
         else:
             sys.stderr.write("unknown argument %r\n" % rest[i])
             return 2
 
     R = Resolver(gameasm, metadec)
+
+    # --slottype: resolve one or more .data slot RVAs to the generic argument T
+    # of AddComponent<T> their token encodes, OFFLINE. This is the reproducible
+    # attestation the host's `attested` flag stands on -- decode the same static
+    # token the live host warms, and name T from methodSpecs. Falsifiable: a
+    # different slot decodes to a different T, so a swapped RVA is caught here,
+    # not by a runtime klass check against a possibly-mistyped donor.
+    if slottypes:
+        S = SlotScan(R)
+        for rva in slottypes:
+            res = S.slot_type_arg(rva)
+            if res is None:
+                print("slot 0x%X: NOT in .data / unreadable" % rva)
+                continue
+            val, kind, index, name, args = res
+            T = ("%s<%s>" % (name, ",".join(args))) if name else "UNRESOLVED"
+            print("slot 0x%X  static-token=0x%08X  kind=%d  index=0x%X  -> %s"
+                  % (rva, val & 0xFFFFFFFF, kind, index, T))
+        return 0
 
     # Self-check, before any answer is printed, exactly as `fldoff.py` does:
     # if the field decoder cannot reproduce System.String's known layout then

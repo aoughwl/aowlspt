@@ -129,31 +129,52 @@ static void test_slots(void) {
        "an out-of-range kind reads back POISONED, so a bad index cannot be "
        "mistaken for a usable slot");
 
-    /* NO REFERENCE -> INCONCLUSIVE, never a pass. This is the case that stops
-     * "I could not look" being reported as success. */
-    ck(aowl_nu_slot_judge(AOWL_NU_KIND_IMAGE, obj_rt_a) == AOWL_NU_SLOT_NOREF,
-       "with no reference instance the verdict is INCONCLUSIVE, not VERIFIED");
+    /* THE VERDICT AS PURE ARITHMETIC. aowl_nu_slot_judge on THIS build only
+     * ever sees attested kinds (all four slots are offline-proven), which would
+     * leave the strict unattested-poison branch untestable -- a check that
+     * cannot fail. aowl_nu_verdict takes `attested` as an argument, so BOTH
+     * branches are exercised here with named falsifying inputs. */
+    /* A null produced class is a real failure regardless of anything else. */
+    ck(aowl_nu_verdict(1, klass_rt, NULL) == AOWL_NU_SLOT_POISONED &&
+       aowl_nu_verdict(0, NULL, NULL) == AOWL_NU_SLOT_POISONED,
+       "a NULL produced class POISONS, attested or not");
+    /* Donor and slot agree -> the strongest outcome, either way. */
+    ck(aowl_nu_verdict(0, klass_rt, klass_rt) == AOWL_NU_SLOT_VERIFIED &&
+       aowl_nu_verdict(1, klass_rt, klass_rt) == AOWL_NU_SLOT_VERIFIED,
+       "got == ref VERIFIES");
+    /* THE FALSIFYING CASE for an UNATTESTED slot: wrong class must POISON. */
+    ck(aowl_nu_verdict(0, klass_rt, klass_tmp) == AOWL_NU_SLOT_POISONED,
+       "an UNATTESTED slot that produces the WRONG class is POISONED");
+    ck(aowl_nu_verdict(0, NULL, klass_tmp) == AOWL_NU_SLOT_NOREF,
+       "an UNATTESTED slot with no reference is INCONCLUSIVE, never a pass");
+    /* THE ATTESTED CASE: the slot's T is offline-proven, so a mismatch means
+     * the DONOR is mistyped -> ATTESTED (proceed), NOT poisoned. This must NOT
+     * collapse to VERIFIED (that would hide a genuinely null result) nor to
+     * POISONED (that is the bug we are fixing). */
+    ck(aowl_nu_verdict(1, klass_rt, klass_tmp) == AOWL_NU_SLOT_ATTESTED,
+       "an ATTESTED slot whose class != the (mistyped) donor is ATTESTED");
+    ck(aowl_nu_verdict(1, NULL, klass_tmp) == AOWL_NU_SLOT_ATTESTED,
+       "an ATTESTED slot with no donor still proceeds on the offline proof");
 
+    /* Now through the TABLE-DRIVEN judge, which uses each kind's real attested
+     * flag. Every kind on this build is attested, so a wrong-class result is
+     * ATTESTED, not POISONED -- the exact live bug: the slot was correct, the
+     * walked donor was not. */
+    ck(aowl_nu_kind_attested(AOWL_NU_KIND_RECTTRANSFORM) == 1,
+       "the RectTransform slot is offline-attested");
     ck(aowl_nu_ref_set(AOWL_NU_KIND_RECTTRANSFORM, obj_rt_a) == 1,
        "a reference instance is accepted");
     ck(aowl_nu_ref_klass(AOWL_NU_KIND_RECTTRANSFORM) == klass_rt,
        "the reference class is the object header's first qword");
-
-    /* THE POSITIVE. */
     ck(aowl_nu_slot_judge(AOWL_NU_KIND_RECTTRANSFORM, obj_rt_b) ==
        AOWL_NU_SLOT_VERIFIED,
        "a component of the reference class VERIFIES the slot");
-
-    /* THE FALSIFYING CASE -- the whole design turns on this one. A slot
-     * attributed to the wrong T returns the wrong class, and the kind must be
-     * poisoned rather than used. */
     ck(aowl_nu_slot_judge(AOWL_NU_KIND_RECTTRANSFORM, obj_tmp) ==
-       AOWL_NU_SLOT_POISONED,
-       "a component of the WRONG class POISONS the slot");
-    ck(aowl_nu_slot_state(AOWL_NU_KIND_RECTTRANSFORM) == AOWL_NU_SLOT_POISONED,
-       "and the poisoning is remembered");
+       AOWL_NU_SLOT_ATTESTED,
+       "an attested kind whose produced class != the donor is ATTESTED "
+       "(the donor is the suspect), not POISONED");
 
-    /* A NULL result is not 'no opinion'. */
+    /* A NULL result is still not 'no opinion', even for an attested kind. */
     ck(aowl_nu_slot_judge(AOWL_NU_KIND_BUTTON, NULL) == AOWL_NU_SLOT_POISONED,
        "a null component poisons rather than leaving the kind UNKNOWN");
 
@@ -178,6 +199,9 @@ static void test_slots(void) {
             ck(strlen(aowl_nu_kind_evidence(k)) > 32,
                "every kind carries the call-site evidence it was attributed by");
             ck(strlen(aowl_nu_kind_name(k)) > 0, "every kind is named");
+            ck(aowl_nu_kind_attested(k) == 1,
+               "every kind on this build is offline token-attested to its T "
+               "(reproduce with tools/addcompslots.py --slottype)");
         }
     }
     ck(aowl_nu_kind_slot_rva(AOWL_NU_KIND_RECTTRANSFORM) == 0x6E19580u,
@@ -379,11 +403,20 @@ static void falsify(void) {
        "all twelve deliberately-bad inputs were REFUSED (got a different "
        "count? then one of the guards above accepts something it must not)");
 
-    /* And the slot judge, end to end, on a fresh kind. */
+    /* THE case the whole design turns on, in its CURRENT form: attribution is
+     * settled by the OFFLINE token proof, so for an attested kind a wrong-class
+     * result is ATTESTED (the walked donor is the suspect), not a poisoned
+     * slot. The falsifiable poison check now lives in aowl_nu_verdict(0,...)
+     * (an UNATTESTED slot with a wrong class IS poisoned -- asserted in
+     * test_slots), and the attribution's falsifiability is that distinct slot
+     * tokens decode to distinct T (asserted in test_token_decode). */
     ck(aowl_nu_ref_set(AOWL_NU_KIND_BUTTON, obj_a) == 1, "reference taken");
-    ck(aowl_nu_slot_judge(AOWL_NU_KIND_BUTTON, obj_b) == AOWL_NU_SLOT_POISONED,
-       "THE case the whole design turns on: a slot that yields the wrong "
-       "class is refused, permanently");
+    ck(aowl_nu_slot_judge(AOWL_NU_KIND_BUTTON, obj_b) == AOWL_NU_SLOT_ATTESTED,
+       "an attested kind whose produced class != the donor is ATTESTED "
+       "(the offline token proof, not the donor, is the authority)");
+    ck(aowl_nu_verdict(0, klass_a, klass_b) == AOWL_NU_SLOT_POISONED,
+       "and an UNATTESTED wrong-class result is still POISONED -- the strict "
+       "guard is intact for any kind not offline-proven");
 }
 
 /* ------------------------------------------------------------------ *
@@ -470,6 +503,23 @@ static void test_token_decode(void) {
        "`shr eax,0x1d` computes");
     ck(aowl_nu_token_index(0xc00804f3u) == 0x40279u,
        "0xc00804f3 decodes to usage index 0x40279, via (token>>1)&0x0FFFFFFF");
+
+    /* All four kinds' STATIC .data tokens (read offline from GameAssembly.dll)
+     * decode to DISTINCT indices, each resolving via methodSpecs to the right
+     * AddComponent<T>. Pinning them here makes a shuffled slot fail the suite,
+     * and the distinctness is the falsifiability -- a swapped RVA names a
+     * different T. Index<->T proven with tools/addcompslots.py --slottype. */
+    ck(aowl_nu_token_index(0xC0080485u) == 0x40242u,
+       "RectTransform slot token 0xC0080485 -> index 0x40242");
+    ck(aowl_nu_token_index(0xC008040Bu) == 0x40205u,
+       "UI.Image slot token 0xC008040B -> index 0x40205");
+    ck(aowl_nu_token_index(0xC0080391u) == 0x401C8u,
+       "UI.Button slot token 0xC0080391 -> index 0x401C8");
+    ck(aowl_nu_token_index(0xC0080485u) != aowl_nu_token_index(0xc00804f3u),
+       "distinct slots decode to distinct indices (a swapped RVA is caught)");
+    ck(aowl_nu_token_kind(0xC0080485u) == 6 && aowl_nu_token_kind(0xC008040Bu) == 6 &&
+       aowl_nu_token_kind(0xC0080391u) == 6,
+       "every AddComponent<T> slot token is a MethodRef (kind 6)");
 
     /* The discriminator the resolver itself uses: bit0. A cold token has it
      * set; a real MethodInfo* (aligned) does not. */

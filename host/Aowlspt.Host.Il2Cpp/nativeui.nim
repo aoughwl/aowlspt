@@ -107,6 +107,8 @@ proc cNuKindEvidence(k: int32): Il2CppPtr {.
   importc: "aowl_nu_kind_evidence", nodecl.}
 proc cNuKindSlotRva(k: int32): uint32 {.
   importc: "aowl_nu_kind_slot_rva", nodecl.}
+proc cNuKindAttested(k: int32): int32 {.
+  importc: "aowl_nu_kind_attested", nodecl.}
 proc cNuKindCount(): int32 {.importc: "aowl_nu_kind_count", nodecl.}
 proc cNuKindMi(k: int32): Il2CppPtr {.importc: "aowl_nu_kind_mi", nodecl.}
 proc cNuWarmSlot(k: int32; metaInitFn: Il2CppPtr): Il2CppPtr {.
@@ -203,6 +205,7 @@ const
   NuSlotVerified = 1'i32
   NuSlotPoisoned = 2'i32
   NuSlotNoRef    = 3'i32
+  NuSlotAttested = 4'i32
 
 proc nuSlotStateName(s: int32): string =
   case int(s)
@@ -210,6 +213,8 @@ proc nuSlotStateName(s: int32): string =
   of 1: "VERIFIED (produced the reference class)"
   of 2: "POISONED (produced the WRONG class -- refused for the session)"
   of 3: "INCONCLUSIVE (no live reference instance to check against)"
+  of 4: "ATTESTED (offline token proof says the slot is right; the live donor " &
+        "was mistyped -- proceeded)"
   else: "?"
 
 # ---------------------------------------------------------------------------
@@ -516,6 +521,22 @@ proc nuAdd(go: Il2CppPtr; kind: int32): Il2CppPtr =
             " VERIFIED -- the component's klass 0x" &
             hexOf(cast[uint64](cNuGotKlass(kind))) &
             " equals the live reference instance's"
+    return comp
+  if verdict == NuSlotAttested:
+    # The produced class does NOT equal the live donor's, but the slot's T is
+    # OFFLINE-PROVEN (its static .data token decodes to AddComponent<this-T>;
+    # reproduce with `tools/addcompslots.py --slottype 0x...`). AddComponent<T>
+    # with that MethodInfo cannot return a non-T, so the DONOR is the mistyped
+    # object, not the slot. Proceed -- loudly, and the finished-state proof (the
+    # label on screen) remains the real gate.
+    warn "nativeui: add(" & kname & "): ATTESTED, not poisoned. The component's " &
+         "klass 0x" & hexOf(cast[uint64](cNuGotKlass(kind))) &
+         " differs from the live reference 0x" &
+         hexOf(cast[uint64](cNuRefKlass(kind))) & ", but slot 0x" &
+         hexOf(uint64(cNuKindSlotRva(kind))) & " is offline-proven to be " &
+         "AddComponent<" & kname & ">, so the WALKED DONOR is the mistyped " &
+         "object (it is not really a " & kname & "), not the slot. Proceeding " &
+         "with the produced component; the rendered label is the final gate."
     return comp
   if verdict == NuSlotNoRef:
     warn "nativeui: add(" & kname & "): INCONCLUSIVE. A component came back " &
@@ -1140,14 +1161,17 @@ proc nuProofStageB(tabPtr: Il2CppPtr) =
               "is deferred, so this no longer runs TMP's font-loading path")
   let tmp = nuAdd(go, NuKindTmpText)
   if tmp == nil:
-    gNuVerdictB = (if cNuSlotState(NuKindTmpText) == NuSlotPoisoned:
-                     "FAIL" else: "INCONCLUSIVE")
-    warn "nativeui PROOF B: " & gNuVerdictB & " -- AddComponent<TMP> was " &
-         "REFUSED (reason logged above). The likely cause, measured live, is " &
-         "a COLD .data slot: the TMP AddComponent MethodInfo is an unresolved " &
-         "metadata-usage token until TMP_DefaultControls::CreateText (or a " &
-         "sibling) runs this session. Everything else on path B is proven; " &
-         "this one call needs the slot warmed. Tearing down."
+    let st = cNuSlotState(NuKindTmpText)
+    gNuVerdictB = (if st == NuSlotPoisoned: "FAIL" else: "INCONCLUSIVE")
+    # State the ACTUAL post-warm reason, not the old COLD-slot guess: the slot
+    # is warmed and offline-attested this run, so a refusal now is either the
+    # add producing an unreadable component (POISONED) or an earlier guard
+    # declining (INCONCLUSIVE). The exact reason is the last nuAdd line above.
+    warn "nativeui PROOF B: " & gNuVerdictB & " -- AddComponent<TMP> did not " &
+         "yield a usable component (slot state " & nuSlotStateName(st) &
+         "). The slot WAS warmed and is offline-proven AddComponent<" &
+         "TextMeshProUGUI>, so this is NOT a cold slot; the exact reason is the " &
+         "last `add(TMPro.TextMeshProUGUI)` line above. Tearing down."
     discard nuDestroy(go)
     return
   okLog "nativeui PROOF B: AddComponent<TextMeshProUGUI> on the inactive " &

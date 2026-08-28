@@ -700,30 +700,50 @@ static int32_t aowl_nu_rect_renderable(float w, float h) {
 #define AOWL_NU_SLOT_VERIFIED  1   /* produced a component of the right class */
 #define AOWL_NU_SLOT_POISONED  2   /* produced the WRONG class -- never again */
 #define AOWL_NU_SLOT_NOREF     3   /* no reference instance -- INCONCLUSIVE   */
+#define AOWL_NU_SLOT_ATTESTED  4   /* got != the live donor, but the slot's T
+                                    * is OFFLINE-PROVEN (its static token decodes
+                                    * to AddComponent<this-T>), so the DONOR is
+                                    * the suspect, not the slot. Proceed, loudly. */
 
 typedef struct AowlNuKind {
     const char* type;       /* for the log only; never used to resolve      */
     uint32_t    slotRva;    /* .data slot holding MethodInfo* AddComponent<T> */
+    int32_t     attested;   /* 1 if the slot's static token was OFFLINE-resolved
+                             * to AddComponent<`type`>; see the token comment.  */
     const char* evidence;   /* which call sites attributed it, from addcompslots */
 } AowlNuKind;
 
+/* The `attested` column is PROVEN, not asserted. Reproduce with:
+ *   python tools/addcompslots.py <GameAssembly.dll> <global-metadata.dec.dat> \
+ *       --slottype 0x6E19580 --slottype 0x6D50040 \
+ *       --slottype 0x6D50070 --slottype 0x6D50038
+ * which reads each slot's STATIC .data token, decodes kind/index the same way
+ * the runtime resolver 0x5251C0 does, and names T from methodSpecs. Measured
+ * 2026-08-28: 0x6E19580->AddComponent<RectTransform> (token 0xC0080485),
+ * 0x6D50040->AddComponent<TextMeshProUGUI> (0xC00804F3), 0x6D50070->
+ * AddComponent<UI.Image> (0xC008040B), 0x6D50038->AddComponent<UI.Button>
+ * (0xC0080391). Each token decodes to a DISTINCT, correct T -- that is the
+ * falsifiability: a swapped RVA would name a different type. This is why a
+ * klass mismatch against a mistyped live donor is downgraded to ATTESTED, not
+ * treated as a poisoned slot. */
 static const AowlNuKind aowl_nu_kinds[AOWL_NU_MAX_KINDS] = {
-    { "UnityEngine.RectTransform", 0x6E19580u,
+    { "UnityEngine.RectTransform", 0x6E19580u, 1,
       "8 sites: TMP_DefaultControls::CreateUIElementRoot/CreateUIObject/"
       "CreateButton, TextMeshProUGUI::Awake, TMP_Dropdown::CreateBlocker, "
-      "UI.Dropdown::CreateBlocker. Independently reproduces the value the "
-      "invoke2 ladder found by hand." },
-    { "TMPro.TextMeshProUGUI", 0x6D50040u,
+      "UI.Dropdown::CreateBlocker. Static token 0xC0080485 -> "
+      "AddComponent<RectTransform>." },
+    { "TMPro.TextMeshProUGUI", 0x6D50040u, 1,
       "6 sites: TMP_DefaultControls::CreateText (whose ONLY AddComponent is "
-      "this one), CreateButton, CreateInputField x2, CreateDropdown x2." },
-    { "UnityEngine.UI.Image", 0x6D50070u,
+      "this one), CreateButton, CreateInputField x2, CreateDropdown x2. Static "
+      "token 0xC00804F3 -> AddComponent<TextMeshProUGUI>." },
+    { "UnityEngine.UI.Image", 0x6D50070u, 1,
       "12 sites: CreateScrollbar x2 (background + handle), CreateButton, "
-      "CreateInputField, CreateDropdown x4. Brings CanvasRenderer with it via "
-      "Graphic's [RequireComponent]." },
-    { "UnityEngine.UI.Button", 0x6D50038u,
+      "CreateInputField, CreateDropdown x4. Static token 0xC008040B -> "
+      "AddComponent<UI.Image>. Brings CanvasRenderer via [RequireComponent]." },
+    { "UnityEngine.UI.Button", 0x6D50038u, 1,
       "3 sites: TMP_DefaultControls::CreateButton, TMP_Dropdown::CreateBlocker, "
-      "UI.Dropdown::CreateBlocker -- Button is the only component all three "
-      "add." },
+      "UI.Dropdown::CreateBlocker. Static token 0xC0080391 -> "
+      "AddComponent<UI.Button>." },
 };
 
 /* Runtime state, one row per kind. */
@@ -742,6 +762,10 @@ static const char* aowl_nu_kind_evidence(int32_t k) {
 static uint32_t aowl_nu_kind_slot_rva(int32_t k) {
     if (k < 0 || k >= AOWL_NU_MAX_KINDS) return 0u;
     return aowl_nu_kinds[k].slotRva;
+}
+static int32_t aowl_nu_kind_attested(int32_t k) {
+    if (k < 0 || k >= AOWL_NU_MAX_KINDS) return 0;
+    return aowl_nu_kinds[k].attested;
 }
 static int32_t aowl_nu_kind_count(void) { return AOWL_NU_MAX_KINDS; }
 static int32_t aowl_nu_slot_state(int32_t k) {
@@ -905,20 +929,27 @@ static int32_t aowl_nu_ref_set(int32_t k, void* liveInstance) {
  * This is the whole falsifiable check. Its failing input is concrete: a slot
  * attributed to the wrong T returns a component whose header klass differs
  * from the reference, and the kind is poisoned for the rest of the session. */
+/* The verdict, as pure arithmetic over three inputs -- extracted so BOTH the
+ * attested and the unattested branch are exercised offline (aowl_nu_slot_judge
+ * only ever sees attested==1 kinds on this build, which would leave the strict
+ * poison path untestable -- a check that cannot fail). `gotKlass` is the
+ * produced component's class (NULL if unreadable); `refKlass` the live donor's
+ * (NULL if none registered); `attested` the offline token->T proof. */
+static int32_t aowl_nu_verdict(int32_t attested, void* refKlass, void* gotKlass) {
+    if (!gotKlass)                       return AOWL_NU_SLOT_POISONED;
+    if (refKlass && gotKlass == refKlass) return AOWL_NU_SLOT_VERIFIED;
+    if (attested)                        return AOWL_NU_SLOT_ATTESTED;
+    if (!refKlass)                       return AOWL_NU_SLOT_NOREF;
+    return AOWL_NU_SLOT_POISONED;
+}
+
 static int32_t aowl_nu_slot_judge(int32_t k, void* got) {
     void* gk;
     if (k < 0 || k >= AOWL_NU_MAX_KINDS) return AOWL_NU_SLOT_POISONED;
     gk = aowl_nu_klass_of(got);
     g_nu_got_klass[k] = gk;
-    if (!gk) {
-        g_nu_slot_state[k] = AOWL_NU_SLOT_POISONED;
-    } else if (!g_nu_ref_klass[k]) {
-        g_nu_slot_state[k] = AOWL_NU_SLOT_NOREF;
-    } else if (gk == g_nu_ref_klass[k]) {
-        g_nu_slot_state[k] = AOWL_NU_SLOT_VERIFIED;
-    } else {
-        g_nu_slot_state[k] = AOWL_NU_SLOT_POISONED;
-    }
+    g_nu_slot_state[k] =
+        aowl_nu_verdict(aowl_nu_kinds[k].attested, g_nu_ref_klass[k], gk);
     return g_nu_slot_state[k];
 }
 
