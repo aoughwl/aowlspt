@@ -154,7 +154,7 @@ Usage:
   il2cpp_resolve.py <GameAssembly.dll> <global-metadata.dec.dat> settings-table
         # the SettingsScreen/SettingControl offset table Phase 1 will probe
 """
-import struct, sys
+import os, struct, sys
 
 
 def load_pe(path):
@@ -428,6 +428,35 @@ class Resolver:
                     counts[r] = counts.get(r, 0) + 1
         self._SHARED = counts
         return counts
+
+    # The ONE place sharedness is decided. Both the library and every CLI verb
+    # go through this, so the two cannot drift apart -- the previous shape was
+    # `shared.get(rva, 1)` open-coded at two call sites, and that default of 1
+    # is a check that cannot fail (CLAUDE.md 9b): a VA, an ASLR-rebased
+    # address or a typo'd RVA is not in the table, so it silently reads back as
+    # "1 owner == safe to detour". Three outcomes, never two.
+    #   ("shared", n>1) ("unique", 1) ("unknown", 0)
+    def sharedness(self, addr):
+        """(state, owner_count) for a code address. Accepts an RVA or a VA."""
+        rva = addr - self.IB if addr > self.IB else addr
+        n = self.shared_rva_counts().get(rva)
+        if n is None:
+            return ("unknown", 0)
+        return ("shared" if n > 1 else "unique", n)
+
+    def sharedness_note(self, addr):
+        """The human-readable annotation. Empty string ONLY for a known-unique
+        address -- an address we cannot find is stated, never silently passed."""
+        state, n = self.sharedness(addr)
+        if state == "shared":
+            return ("[SHARED: %d methods resolve here -- hooking this fires "
+                    "for all of them]" % n)
+        if state == "unknown":
+            return ("[SHARENESS UNKNOWN: %s is not in the methodPointers "
+                    "histogram at all -- this is NOT 'not shared'. Check you "
+                    "passed a static RVA/VA from this same GameAssembly.dll, "
+                    "not a live ASLR address.]" % hex(addr))
+        return ""
 
     def find(self, needle):
         needle = needle.lower()
@@ -873,11 +902,38 @@ def const_check(R):
     return ok, rows
 
 
+VERBS = ("find", "methods", "type", "bytes", "shared", "verify-be", "fields",
+         "verify-fields", "enum", "verify-consts", "settings-table")
+
+
 def main():
     if len(sys.argv) < 4:
         sys.exit(__doc__)
+    # EVERY verb takes GAMEASM and METADEC FIRST. Agents read CLAUDE.md 5's
+    # shorthand ("`bytes <RVA>`") as the whole command line, ran
+    # `il2cpp_resolve.py bytes 0x52a8a80 8`, and got a raw FileNotFoundError
+    # traceback out of Resolver -- one hand-rolled a PE section walker rather
+    # than work out that argv[1] was being opened as GameAssembly.dll. Say it.
+    if sys.argv[1] in VERBS:
+        sys.exit(
+            "usage error: %r is a VERB, but argv[1] must be the path to "
+            "GameAssembly.dll.\n"
+            "  every verb is:  il2cpp_resolve.py GAMEASM METADEC %s ...\n"
+            "  e.g.  python tools/il2cpp_resolve.py D:/Games/Tarkov/"
+            "GameAssembly.dll .cache/global-metadata.dec.dat %s\n"
+            % (sys.argv[1], sys.argv[1],
+               " ".join(sys.argv[1:]) or sys.argv[1]))
+    for p in (sys.argv[1], sys.argv[2]):
+        if not os.path.exists(p):
+            sys.exit("usage error: %r does not exist. argv[1] must be "
+                     "GameAssembly.dll and argv[2] the DECRYPTED "
+                     "global-metadata (see tools/metablob.py; the encrypted "
+                     "file on disk will NOT parse)." % p)
     R = Resolver(sys.argv[1], sys.argv[2])
     cmd = sys.argv[3]
+    if cmd not in VERBS:
+        sys.exit("usage error: unknown verb %r. Known verbs: %s"
+                 % (cmd, ", ".join(VERBS)))
     if cmd == "find":
         needle = sys.argv[4]
         n = 0
@@ -912,7 +968,6 @@ def main():
         # sharedness so the answer is directly actionable.
         needle = sys.argv[4].lower()
         want_shared = "--shared" in sys.argv[5:]
-        shared = R.shared_rva_counts() if want_shared else {}
         lim = 200
         for a in sys.argv[5:]:
             if a.startswith("--limit="):
@@ -943,10 +998,10 @@ def main():
                 if rva is None:
                     continue
                 note = R.annotate_rva(rva)
-                n = shared.get(rva, 1)
-                if n > 1:
-                    note += ("  [SHARED: %d methods resolve here -- hooking "
-                             "this fires for all of them]" % n)
+                if want_shared:
+                    sn = R.sharedness_note(rva)
+                    if sn:
+                        note += "  " + sn
                 if note.strip():
                     print("      " + note.strip())
         if hits == 0:
@@ -955,7 +1010,6 @@ def main():
     elif cmd == "type":
         args = [a for a in sys.argv[4:] if not a.startswith("--")]
         want_shared = "--shared" in sys.argv[4:]
-        shared = R.shared_rva_counts() if want_shared else {}
         # `type` used to take a numeric index ONLY -- an index that only
         # `find` produces -- while fldoff.py's `fields` took a name. The two
         # CLIs disagreeing is a papercut that pushed agents into hand-rolling.
@@ -982,15 +1036,16 @@ def main():
                 if rva is None:
                     continue
                 note = R.annotate_rva(rva)
-                n = shared.get(rva, 1)
-                if n > 1:
-                    note += ("  [SHARED: %d methods resolve here -- hooking "
-                             "this fires for all of them]" % n)
+                if want_shared:
                     # NOTE: this counts METHOD DEFINITIONS. il2cpp_nameindex.py
                     # counts index KEYS, which is slightly lower because it has
                     # already dropped the name-ambiguous ones. Neither is wrong;
                     # they answer marginally different questions.
-                print("      " + note.strip())
+                    sn = R.sharedness_note(rva)
+                    if sn:
+                        note += "  " + sn
+                if note.strip():
+                    print("      " + note.strip())
     elif cmd == "bytes":
         rva = int(sys.argv[4], 0)
         if rva > R.IB:
@@ -1013,6 +1068,22 @@ def main():
         print("shape    %s -- %s" % th if th else
               "shape    no known thunk shape matched (this is NOT proof of a "
               "real body)")
+    elif cmd == "shared":
+        # The verb an agent actually wants before detouring: one address in,
+        # a tri-state verdict out. Same Resolver.sharedness the library and
+        # `type --shared` / `methods --shared` use -- there is no second path.
+        addr = int(sys.argv[4], 0)
+        state, n = R.sharedness(addr)
+        rva = addr - R.IB if addr > R.IB else addr
+        print("RVA 0x%X   sharedness=%s   owners=%d" % (rva, state.upper(), n))
+        note = R.sharedness_note(addr)
+        if note:
+            print("  " + note)
+        if state == "shared":
+            print("  DO NOT DETOUR by name: the write fires for all %d." % n)
+        elif state == "unique":
+            print("  exactly one method definition resolves here.")
+        sys.exit(0 if state == "unique" else 1)
     elif cmd == "verify-be":
         known = {"IsInstanceSuccessfully": 0x6699C0, "Update": 0x669390,
                  "Stop": 0x668E80, "Run": 0x667700}
