@@ -435,8 +435,31 @@ proc nuAdd(go: Il2CppPtr; kind: int32): Il2CppPtr =
          "time the owning method runs. Refusing rather than passing a NULL " &
          "MethodInfo, which the shared generic body dereferences at +0x38."
     return nil
+  # THE §9b CHECK THAT DID NOT FIRE. A non-NULL slot value is not yet a usable
+  # MethodInfo*. Before its owning method has run this session, IL2CPP leaves an
+  # UNRESOLVED metadata-usage TOKEN in the slot -- a small, tagged, NON-POINTER
+  # value (measured live: TMP's slot 0x6D50040 held 0xc00804f3, high dword zero,
+  # top bits set, while RectTransform's warm slot held a real 0x17b_ heap
+  # pointer). Passing that token as `const MethodInfo*` makes the shared generic
+  # body dereference it at +0x38 and faults. A MethodInfo* is always a readable
+  # heap/metadata pointer, so VirtualQuery over its header is the discriminator:
+  # a real one is readable, a cold token is not. REFUSE the token; never call.
+  if not nuOk(mi, 0x48'i32):
+    warn "nativeui: add(" & kname & "): the .data slot 0x" &
+         hexOf(uint64(cNuKindSlotRva(kind))) & " holds mi=0x" &
+         hexOf(cast[uint64](mi)) & ", which is NOT a readable MethodInfo " &
+         "pointer -- on this build that is the shape of an UNRESOLVED IL2CPP " &
+         "metadata-usage token, i.e. the slot is COLD: its owning method (for " &
+         kname & ", TMP_DefaultControls::CreateText and 5 siblings) has NOT " &
+         "run this session, so IL2CPP has not filled it. The RectTransform " &
+         "slot works only because the game keeps it warm. REFUSING to call " &
+         "AddComponent<T> with a non-pointer MethodInfo (that is the crash " &
+         "the breadcrumbs just localised). This kind cannot be built from " &
+         "scratch until its slot is warmed."
+    return nil
   okLog "nativeui: add(" & kname & "): mi=0x" & hexOf(cast[uint64](mi)) &
-        " fn=0x" & hexOf(cast[uint64](fn)) & " -- about to call AddComponent<T>"
+        " fn=0x" & hexOf(cast[uint64](fn)) & " -- readable MethodInfo, " &
+        "about to call AddComponent<T>"
   let comp = cNuCallGeneric0(fn, go, mi)
   okLog "nativeui: add(" & kname & "): AddComponent<T> returned comp=0x" &
         hexOf(cast[uint64](comp)) & " -- survived the call; about to validate"
@@ -1079,12 +1102,16 @@ proc nuProofStageB(tabPtr: Il2CppPtr) =
   if tmp == nil:
     gNuVerdictB = (if cNuSlotState(NuKindTmpText) == NuSlotPoisoned:
                      "FAIL" else: "INCONCLUSIVE")
-    warn "nativeui PROOF B: " & gNuVerdictB & " -- the TextMeshProUGUI slot " &
-         "could not be settled; tearing down"
+    warn "nativeui PROOF B: " & gNuVerdictB & " -- AddComponent<TMP> was " &
+         "REFUSED (reason logged above). The likely cause, measured live, is " &
+         "a COLD .data slot: the TMP AddComponent MethodInfo is an unresolved " &
+         "metadata-usage token until TMP_DefaultControls::CreateText (or a " &
+         "sibling) runs this session. Everything else on path B is proven; " &
+         "this one call needs the slot warmed. Tearing down."
     discard nuDestroy(go)
     return
   okLog "nativeui PROOF B: AddComponent<TextMeshProUGUI> on the inactive " &
-        "object SURVIVED"
+        "object SURVIVED -- the slot was WARM this run"
 
   # THE FIX. Copy font asset + materials from the live donor TMP (gMi2Tmp,
   # the anchor Stage A walked to and registered as the reference instance)
