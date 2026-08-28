@@ -28,8 +28,17 @@ can be silently wrong is worse than no tool at all.
            static/instance kind.
 
   fldoff.py [GAMEASM] [METADEC] field <Namespace.Type> <fieldName>
-        -> just that field's offset, machine-readable ("0x120", "MISSING",
-           or "NO-STORAGE" for a C# const, which has no address to read).
+        -> just that field's offset, machine-readable. Never a number the
+           tool cannot stand behind:
+             0x120              a real offset
+             MISSING            (exit 1) no such field on the type
+             NO-STORAGE         (exit 2) a C# const -- no address to read
+             GENERIC-NO-LAYOUT  (exit 3) an UNINSTANTIATED generic definition
+                                (``List`1``). IL2CPP stores an all-zero
+                                fieldOffsets array for these because the
+                                layout depends on the type arguments and is
+                                built at runtime; it used to print 0x0.
+             NO-OFFSET-TABLE    (exit 4) fieldOffsets[type] is null
 
   fldoff.py [GAMEASM] [METADEC] enum <Namespace.Type>
         -> every member of an enum with its ORDINAL, decoded from the
@@ -159,19 +168,26 @@ def main():
         if len(args) < 3:
             sys.exit(__doc__)
         t = R.find_one(args[1])
-        rows = [(name, off, st) for _, name, off, st, _ in R.all_fields(t)
-                if name == args[2]]
+        rows = [r for r in R.all_fields_ex(t) if r["name"] == args[2]]
         if not rows:
             print("MISSING")
             sys.exit(1)
-        name, off, st = rows[0]
+        r = rows[0]
         # A literal has no storage; printing 0x0 here would be a lie that a
         # caller would happily read or write through.
-        lit = [r for r in R.all_fields_ex(t) if r["name"] == args[2]][0]
-        if not lit["has_storage"]:
+        if not r["has_storage"]:
             print("NO-STORAGE")
             sys.exit(2)
-        print(hex(off) if off is not None else "MISSING")
+        # Same class of lie, one level up: an uninstantiated generic
+        # definition's fieldOffsets array is all zeros, and 0x0 is a real
+        # offset shape. Three outcomes, never two.
+        if r["layout"] == "generic":
+            print("GENERIC-NO-LAYOUT")
+            sys.exit(3)
+        if r["layout"] == "absent" or r["off"] is None:
+            print("NO-OFFSET-TABLE")
+            sys.exit(4)
+        print(hex(r["off"]))
     elif cmd == "enum":
         enum_self_check(R)
         t = R.find_one(args[1])
