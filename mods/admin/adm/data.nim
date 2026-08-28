@@ -103,6 +103,12 @@ const
   PlMovementContext = 0x60    ## MovementContext -- the pose the client reads
   PlPhysical        = 0x9D8   ## PhysicalBase
   PlAIData          = 0xA00   ## IAIData; non-null => this player is a bot
+  PlIsYou           = 0xB89   ## <IsYourPlayer>k__BackingField : bool. MEASURED
+                              ## `python tools/fldoff.py fields EFT.Player`
+                              ## (self-check passed). The ROBUST local-player
+                              ## identity: true only on the local instance,
+                              ## independent of GameWorld+0x230, which can read
+                              ## null on a frame and let self leak into the draw.
 
   # ---- EFT.MovementContext -------------------------------------------------
   # THERE IS NO POSITION FIELD HERE. `PreviousPosition` @0x370 used to be read
@@ -447,6 +453,19 @@ proc collectAndPublish*(s: AdminRegion; maxDistance: float; bbW, bbH: int) =
   else:
     note("GameWorld+0x230 MainPlayer read null")
 
+  # STABILISE THE DISTANCE CULL against a transient this frame. If GwMainPlayer
+  # read null (or its snapshot was not published yet) we have no local position,
+  # `haveLocal` is false, the `maxDistance` cull below is skipped, and every
+  # distant bot suddenly draws -- then vanishes next frame when the pointer
+  # returns. That inconsistency is remote boxes BLINKING WITH THE LOCAL PLAYER'S
+  # OWN STATE (task 2b). posSample() publishes the last good local world position
+  # (gPosPx/Py/Pz, set only from a validated sample of `me`); fall back to it so
+  # the cull stays steady. A frame-stale, already-validated position -- never
+  # fabricated, and the box positions themselves are unaffected (they use each
+  # target's own sample). Only the local anchor for the distance test is filled.
+  if not haveLocal and gPosHavePrev:
+    lx = gPosPx; ly = gPosPy; lz = gPosPz; haveLocal = true
+
   let list = playersList(world)
   if list == nil:
     note("GameWorld player list (+0x1C8 / +0x1D0) read null")
@@ -473,6 +492,16 @@ proc collectAndPublish*(s: AdminRegion; maxDistance: float; bbW, bbH: int) =
     let p = rdPtr(items, ArrDataOff + i*8)
     inc i
     if p == nil or cast[uint64](p) == localPtr: continue
+    # ROBUST self-exclusion. The pointer test above misses self on any frame
+    # where GameWorld+0x230 (GwMainPlayer) read null -- localPtr is then 0, no
+    # list entry equals it, and the LOCAL player gets a box. Intermittent null
+    # reads are exactly the "glitching in and out from me being visible" the
+    # user saw: the box on SELF, blinking as the pointer came and went.
+    # `IsYourPlayer` is true only on the local instance and never depends on
+    # that pointer, so it excludes self on every frame. rdBool is guarded
+    # (VirtualQuery first): a stale offset reads -1, never a fault, and only a
+    # definite 1 excludes -- an unreadable value is NOT treated as self.
+    if rdBool(p, PlIsYou) == 1'i32: continue
     var pok = false
     var hx = 0.0; var hy = 0.0; var hz = 0.0
     playerPos(p, pok, hx, hy, hz)

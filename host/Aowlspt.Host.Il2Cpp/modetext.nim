@@ -215,9 +215,23 @@ const MtxSliceMs = 40'u64
   ## a pass that overran for some reason the inner bound could not see. Setting
   ## it below the inner bound would make the back-off fire on every healthy
   ## pass, which is a check that cannot fail in the other direction.
-const MtxHuntMs = 300_000'u64
-  ## Five minutes of wall clock to find the button, then a loud give-up. The
-  ## menu can legitimately be many seconds away on a cold load.
+const MtxHuntMs = 90_000'u64
+  ## Wall clock to find the button, then a loud give-up. Was 300_000 (five
+  ## minutes) -- MEASURED to grind the whole scene tree every steady pass for
+  ## the full five minutes in a RAID, where `ChangeGameModeButton` does not
+  ## exist at all (277 bounded walks over 300 s, host log this raid). The menu
+  ## can legitimately be ~26 s away on a cold load, so 90 s is still ample slack
+  ## for the ONE case this walk is for; it is no longer a per-frame raid tax.
+  ## The RAID GATE below declines in ZERO walks when a live GameWorld is known,
+  ## and `MtxMaxSteadyWalks` hard-bounds the total-attempts even when it is not.
+const MtxMaxSteadyWalks = 30
+  ## HARD BOUND on resolve walks counted AFTER warm-up. A pure walk cap during
+  ## warm-up would be the "gave up before its target existed" trap: warm-up runs
+  ## the FAST cadence (every `MtxHuntFrames` frames) and the menu is not up until
+  ## ~26 s, so a warm-up count would exhaust before the button could appear.
+  ## Post-warm-up each walk is ~`MtxSteadyFrames` frames apart (~2 s), so 30 is
+  ## ~60 s of steady hunting -- inside `MtxHuntMs`, and it can NEVER become 300 s
+  ## regardless of the wall clock.
 const MtxNodeBudget = 6000
   ## Nodes one resolve pass may visit across ALL roots combined.
   ##
@@ -260,6 +274,8 @@ var gMtxSaidSlow = false          ## the back-off has been announced once
 var gMtxT0: uint64 = 0            ## first tick from the rider chain
 var gMtxTResolved: uint64 = 0
 var gMtxNotReady = 0              ## passes where the button was legitimately absent
+var gMtxSteadyWalks = 0          ## resolve walks counted AFTER warm-up; the hard bound
+var gMtxRaidDeclined = false     ## the raid gate has declined this rider, permanently
 
 # ---------------------------------------------------------------------------
 # REMOVE THE BUTTON ENTIRELY (`uxHideModeButton`, default OFF).
@@ -717,6 +733,9 @@ proc modeTextTickBody(a: Il2CppPtr): Il2CppPtr {.
       let spent = cNowMs() - t0
       mtxNoteSlice(spent, "menu mode text")
       inc gMtxResolvePasses
+      # The hard total-attempts bound counts only POST-warm-up walks, so an
+      # early fast-cadence burst before the menu exists cannot exhaust it.
+      if cNowMs() - gMtxT0 >= MtxWarmupMs: inc gMtxSteadyWalks
       if got:
         gMtxResolved = true
         gMtxTResolved = cNowMs()
@@ -836,6 +855,30 @@ proc modeTextUpdateFired(regs: Il2CppPtr) =
     gMtxT0 = cNowMs()
   let warming = cNowMs() - gMtxT0 < MtxWarmupMs
   let hunting = (if gModeHideOn: gMtxHideGo == nil else: not gMtxResolved)
+
+  # THE RAID GATE. `ChangeGameModeButton` is a MENU-ONLY control; it does not
+  # exist in a raid. MEASURED (host log this raid): with `uxHideModeButton` on,
+  # this rider walked the whole scene tree (6000 nodes / 30 ms) every steady
+  # pass for 300 s looking for a button that was never there. So: if a live
+  # GameWorld is KNOWN, we are in a raid -- decline in ZERO walks, permanently.
+  # `aowlHostGameWorld` reads the pointer the existing kind=11/botdiag
+  # RegisterPlayer detour caches (no second detour). `..._armed` distinguishes
+  # "no GameWorld -> menu" from "nobody is watching -> INCONCLUSIVE"; only a
+  # KNOWN world (armed AND non-null) is treated as a raid, so an unarmed run
+  # falls through to the hard walk bound below rather than being mislabelled.
+  if hunting and not gMtxRaidDeclined and
+     aowlHostGameWorldArmed() == 1'i32 and aowlHostGameWorld() != nil:
+    gMtxRaidDeclined = true
+    gMtxResolveGaveUp = true
+    warn (if gModeHideOn: "hide mode button" else: "menu mode text") &
+         ": DECLINED with ZERO walks -- a live GameWorld is present, so this " &
+         "is a RAID, and 'ChangeGameModeButton' is a MENU-ONLY control that " &
+         "does not exist here. Searching would walk the whole scene tree every " &
+         "frame for nothing (that is the 300 s / 277-walk drain this replaces). " &
+         "Nothing was changed. This is a REFUSAL, not a success."
+    gModeTextOff = true
+    return
+
   let every = (if hunting and (warming or not gMtxSlow): MtxHuntFrames
                else: MtxSteadyFrames)
   inc gMtxFrames
@@ -843,13 +886,21 @@ proc modeTextUpdateFired(regs: Il2CppPtr) =
     return
   gMtxFrames = 0
 
-  # THE GIVE-UP, in wall clock rather than in attempts, and LOUD. "The button is
-  # still there" must never be a silent outcome.
-  if hunting and cNowMs() - gMtxT0 > MtxHuntMs:
+  # THE GIVE-UP, and LOUD. "The button is still there" must never be a silent
+  # outcome. Two bounds, whichever fires first: a WALL-CLOCK ceiling and a HARD
+  # cap on post-warm-up walks -- so even an unarmed run (raid gate inconclusive)
+  # can never grind for 300 s, and neither can a menu the button never joins.
+  if hunting and (cNowMs() - gMtxT0 > MtxHuntMs or
+                  gMtxSteadyWalks >= MtxMaxSteadyWalks):
     if not gMtxResolveGaveUp:
       gMtxResolveGaveUp = true
+      let why = (if gMtxSteadyWalks >= MtxMaxSteadyWalks:
+                   "after " & $gMtxSteadyWalks & " post-warm-up walks (hard cap " &
+                   $MtxMaxSteadyWalks & ")"
+                 else:
+                   "after " & $int(MtxHuntMs div 1000) & " s")
       warn (if gModeHideOn: "hide mode button" else: "menu mode text") &
-           ": GIVING UP after " & $int(MtxHuntMs div 1000) & " s and " &
+           ": GIVING UP " & why & " and " &
            $gMtxNotReady & " bounded walks -- " & gMtxResolveWhy &
            ". Nothing was changed; the stock control is exactly as the game " &
            "made it. This is a REFUSAL, not a success."
