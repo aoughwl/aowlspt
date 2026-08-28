@@ -1531,15 +1531,20 @@ proc onOkStatus(url, body, session: string): string =
 
 proc onBattlePassActive(url, body, session: string): string =
   ## `/client/battle-pass/active` -- an OBJECT `{battlePasses:[...]}`, not null.
-  ## No active battle pass -> empty list. Null data risks a deref on the client.
+  ## BSG ships one active battle pass (44 KB, capture seq 081) to every account;
+  ## `battlePasses:[]` is an install-constant HOLE, not a fresh-profile empty.
+  ## The real catalogue is `data/post1/battlepassactive.json`; absent it, the
+  ## empty list is the non-throwing fallback.
   inc gRequests
-  result = envelope(objOf("battlePasses", arr()))
+  result = post1Object("battlepassactive", objOf("battlePasses", arr()))
 
 proc onEndingList(url, body, session: string): string =
   ## `/client/ending/list` -- an OBJECT `{elements:[...]}` of raid-ending
-  ## descriptors, not a 404. Empty elements is a valid "no custom endings".
+  ## descriptors. BSG ships four prestige-ending elements (capture seq 132) the
+  ## same for every account; `elements:[]` is an install-constant HOLE. Real
+  ## data in `data/post1/endinglist.json`, empty list as the fallback.
   inc gRequests
-  result = envelope(objOf("elements", arr()))
+  result = post1Object("endinglist", objOf("elements", arr()))
 
 proc onDialogue(url, body, session: string): string =
   ## `/client/dialogue` -- deserialised into `EFT.Dialogs.TraderDialogsDTO`, an
@@ -1566,13 +1571,22 @@ proc onSeasonalPerks(url, body, session: string): string =
   var o = obj()
   put(o, "common", arr())
   put(o, "personal", arr())
-  result = envelope(o)
+  result = post1Object("seasonalperks", o)
 
 proc onSeasonActive(url, body, session: string): string =
-  ## `/client/season/active` -- whether a seasonal event (Halloween, New Year)
-  ## is running. None, so an empty object.
+  ## `/client/season/active` -- the active seasonal event. BSG sends
+  ## `{"season":{...}}` (capture seq 080); we sent `{}`, so `data.season` read
+  ## back null and any consumer that derefs it throws -- the same null-perks
+  ## shape that keeps the pvp-season slot disabled (see onCharacterList). The
+  ## captured season is real BSG content in `data/post1/seasonactive.json`.
+  ##
+  ## Unlike the other three this route is TIME-scoped: the season carries
+  ## start/end timestamps, so the captured event is a real-shape season that is
+  ## not necessarily current. It is still strictly better than `{}` -- a
+  ## non-null `season` object rather than a null the client indexes -- and the
+  ## fallback stays `{}` if the file is absent.
   inc gRequests
-  result = envelope(emptyObject())
+  result = post1Object("seasonactive", obj())
 
 proc onTokenIssue(url, body, session: string): string =
   ## `/client/game/token/issue` -- issues a session token the client keeps for
@@ -1757,6 +1771,25 @@ proc post1Route(name, what: string): string =
   let text = post1Table(name)
   if text.len == 0:
     return envelope(emptyArray())
+  result = envelope(raw(text))
+
+proc post1Object(name: string; fallback: JsonObject): string =
+  ## An install-constant OBJECT route backed by an installed table -- the object
+  ## counterpart of `post1Route`, which serves arrays. These routes
+  ## (battle-pass/active, seasonal-perks/list, ending/list, season/active) send
+  ## the SAME content to every account regardless of profile: a battle-pass
+  ## catalogue, the seasonal perk definitions, the prestige-ending descriptors,
+  ## the active seasonal event. Empty is always wrong for them -- a hole
+  ## `emptygap.py` ranks -- yet type/shape audits pass an empty one, because the
+  ## SHAPE is right and only the CONTENT is missing.
+  ##
+  ## When the table is absent the answer is the caller's `fallback` (the empty-
+  ## but-correctly-shaped object each route already served), NOT the raw table:
+  ## the fallback is a valid, non-throwing "nothing here", and losing the data
+  ## file must degrade to that rather than to a 404 that stalls the menu.
+  let text = post1Table(name)
+  if text.len == 0:
+    return envelope(fallback)
   result = envelope(raw(text))
 
 proc onMainQuestsList(url, body, session: string): string =

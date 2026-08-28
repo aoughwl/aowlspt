@@ -4951,6 +4951,56 @@ proc main(): int =
         $wpBuilds.len & " weapon, " & $mgBuilds.len & " magazine")
 
   # -------------------------------------------------------------------------
+  # Install-constant content routes (emptygap.py's ranked HOLEs)
+  # -------------------------------------------------------------------------
+  #
+  # Same failure class as builds/list: a structurally valid, correctly typed,
+  # EMPTY object passes every shape/type audit and is still a hole, because BSG
+  # ships the SAME content here to every account regardless of profile. Each
+  # check below is a NEGATIVE about the finished served body -- "the member BSG
+  # populates is not empty in ours" -- so it is falsified by reverting the fill
+  # (move the data/post1 file aside and the count drops to 0). Weights match the
+  # capture (raid1: seq 081/044/132/080).
+  heading "Install-constant content routes"
+
+  let bpass = call("/client/battle-pass/active", "")
+  let bpAt = dataAt(bpass)
+  let passes = elements(bpass.body, memberValue(bpass.body, bpAt, "battlePasses"))
+  check("battle-pass/active carries at least one battle pass, not []",
+        passes.len >= 1,
+        $passes.len & " passes -- BSG ships one (seq 081); [] is a HOLE")
+
+  let perks = call("/client/seasonal-perks/list", "")
+  let spAt = dataAt(perks)
+  let common = elements(perks.body, memberValue(perks.body, spAt, "common"))
+  let personal = elements(perks.body, memberValue(perks.body, spAt, "personal"))
+  check("seasonal-perks/list carries the common perk catalogue, not []",
+        common.len >= 1,
+        $common.len & " common perks -- BSG ships 6 (seq 044); [] is a HOLE")
+  check("seasonal-perks/list carries the personal perk catalogue, not []",
+        personal.len >= 1,
+        $personal.len & " personal perks -- BSG ships 33 (seq 044); [] is a HOLE")
+
+  let ending = call("/client/ending/list", "")
+  let enAt = dataAt(ending)
+  let elems = elements(ending.body, memberValue(ending.body, enAt, "elements"))
+  check("ending/list carries the prestige-ending descriptors, not []",
+        elems.len >= 1,
+        $elems.len & " elements -- BSG ships 4 (seq 132); [] is a HOLE")
+
+  let season = call("/client/season/active", "")
+  let seAt = dataAt(season)
+  let seasonObj = memberValue(season.body, seAt, "season")
+  var seasonKeys: seq[string] = @[]
+  var seasonVals: seq[int] = @[]
+  if seasonObj >= 0 and seasonObj < season.body.len and
+     season.body[seasonObj] == '{':
+    members(season.body, seasonObj, seasonKeys, seasonVals)
+  check("season/active carries a non-null season object, not {}",
+        seasonKeys.len >= 1,
+        "season is absent/null/empty -- {} makes data.season a null the client derefs")
+
+  # -------------------------------------------------------------------------
   # The item spawner
   # -------------------------------------------------------------------------
   #
@@ -5059,9 +5109,9 @@ proc main(): int =
 
     # -- SPAWN -------------------------------------------------------------
     let unitsBefore = unitsOf(listR.body, spProfAt, spTpl)
-    var armed = setMapSetting("spawnQuery", "\"" & spTpl & "\"")
-    armed = armed and setMapSetting("spawnCount", "2")
-    armed = armed and setMapSetting("spawnCondition", "100")
+    var armed = setTarkovSetting("spawnQuery", "\"" & spTpl & "\"")
+    armed = armed and setTarkovSetting("spawnCount", "2")
+    armed = armed and setTarkovSetting("spawnCondition", "100")
     check("the four spawn rows accept an edit through the real settings route",
           armed, "one of spawnQuery/spawnCount/spawnCondition did not persist")
 
@@ -5069,7 +5119,7 @@ proc main(): int =
       skip("the stash spawn", "the spawn rows would not arm, so a spawn " &
            "would be testing the settings route rather than the spawner")
     else:
-      let fired = setMapSetting("spawnNow", "true")
+      let fired = setTarkovSetting("spawnNow", "true")
       check("and flipping `spawnNow` is accepted as an action", fired,
             "the momentary spawn row refused the POST")
 
@@ -5146,15 +5196,15 @@ proc main(): int =
     # Each distinct way to decline says which one it was. A spawner that
     # accepts input and produces nothing is the defect being fixed, so the
     # messages are asserted, not just the absence of a crash.
-    discard setMapSetting("spawnQuery", "\"\"")
-    discard setMapSetting("spawnNow", "true")
+    discard setTarkovSetting("spawnQuery", "\"\"")
+    discard setTarkovSetting("spawnNow", "true")
     let emptyRows = call(TarkovSettings, "")
     check("an empty query is refused in writing, not silently ignored",
           findAt(emptyRows.body, "type part of an item name", 0) >= 0,
           "spawnResult does not explain what an empty query did")
 
-    discard setMapSetting("spawnQuery", "\"zzqqxxnosuchitemzzqq\"")
-    discard setMapSetting("spawnNow", "true")
+    discard setTarkovSetting("spawnQuery", "\"zzqqxxnosuchitemzzqq\"")
+    discard setTarkovSetting("spawnNow", "true")
     let noneRows = call(TarkovSettings, "")
     check("and a query that matches nothing says so by name",
           findAt(noneRows.body, "no item matches", 0) >= 0,
@@ -5177,8 +5227,8 @@ proc main(): int =
     if raidMap.len == 0:
       skip("the in-raid spawn guard", "no map was raidable in this database")
     else:
-      discard setMapSetting("spawnQuery", "\"" & spTpl & "\"")
-      discard setMapSetting("spawnCount", "1")
+      discard setTarkovSetting("spawnQuery", "\"" & spTpl & "\"")
+      discard setTarkovSetting("spawnCount", "1")
       listR = call("/client/game/profile/list", "")
       let heldBeforeRaid = unitsOf(listR.body, profileOf(listR.body, uid), spTpl)
 
@@ -5187,7 +5237,7 @@ proc main(): int =
       check("a raid can be started to test the spawner's raid guard",
             rStart.contains("serverId"), rStart.body)
 
-      discard setMapSetting("spawnNow", "true")
+      discard setTarkovSetting("spawnNow", "true")
       let raidRows = call(TarkovSettings, "")
       check("the spawner refuses mid-raid and names the raid as the reason",
             findAt(raidRows.body, "a raid is in progress", 0) >= 0,
@@ -5209,7 +5259,7 @@ proc main(): int =
 
       # The guard LIFTS. Without this the whole feature could be "permanently
       # broken" and every check above would still be green.
-      discard setMapSetting("spawnNow", "true")
+      discard setTarkovSetting("spawnNow", "true")
       listR = call("/client/game/profile/list", "")
       check("and once the raid ends the spawner works again",
             unitsOf(listR.body, profileOf(listR.body, uid), spTpl) ==

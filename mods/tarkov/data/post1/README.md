@@ -21,6 +21,10 @@ Read by `emu/post1.nim`. Regenerate from a capture with `tools/bsgwire.py`.
 | `locationpaths.json` | the `paths` of `GET /client/locations` | 134 | 1,670 |
 | `customizationstorage.json` | `POST /client/customization/storage` | 086 | 3,397 |
 | `defaultequipmentpresets.json` | the `equipmentBuilds` of `POST /client/builds/list` | 123 | 57,428 |
+| `battlepassactive.json` | the `data` of `POST /client/battle-pass/active` | 081 | 43,681 |
+| `seasonalperks.json` | the `data` of `POST /client/seasonal-perks/list` | 044 | 19,486 |
+| `endinglist.json` | the `data` of `POST /client/ending/list` | 132 | 17,866 |
+| `seasonactive.json` | the `data` of `POST /client/season/active` | 080 | 8,801 |
 
 Source capture: `mods/tarkov/data/capture/raid1`, a full session against the
 live backend on 2026-08-20, client build 1.1.0.1.46777.
@@ -60,12 +64,27 @@ armoured transport). Both are static game config. Taken from a **tutorial**
 raid, the only `match/local/start` in the capture -- almost certainly identical
 for other modes, but that is reasoning rather than evidence.
 
+The four object-shaped routes above (`battlepassactive`, `seasonalperks`,
+`endinglist`, `seasonactive`) are the install-constant HOLEs `tools/emptygap.py`
+ranked: BSG ships the same catalogue to every account, we answered a
+correctly-shaped **empty** object, and a shape/type audit passed it. Served
+through `post1Object` in `tarkov.nim`, which falls back to the old empty object
+if the file is absent (a valid non-throwing "nothing here", never a 404).
+`seasonactive.json` is time-scoped -- the captured season carries start/end
+timestamps, so it is a real-shape season that is not necessarily current; still
+strictly better than `{}`, which left `data.season` a null the client derefs.
+
 ## Not here, and why
 
 * `/client/dialogue` — the same kind of static table, and 13 MB decoded. Too
   large to check in beside these; it needs its own decision.
 * `/client/tutor-game/profile` — looks static, but the body is a profile. It
-  belongs to the profile store, not to a table.
+  belongs to the profile store, not to a table. It is also **never requested in
+  this emulator's flow**: `/client/tutor-game/check` answers
+  `launchTutorGame:false`, so the client does not enter the tutorial and does
+  not fetch its profile. Registering a canned foreign profile (the capture's is
+  48 KB and carries a specific player identity) would be a fabrication with no
+  caller — left unregistered on purpose.
 
 ## What these are and are not
 
