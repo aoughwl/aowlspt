@@ -41,6 +41,98 @@ static void eq_int(const char* what, int got, int want) {
     failures++;
 }
 
+/* ================================================================== *
+ * WHAT THE FRAME ACTUALLY RENDERS, decoded from the vertex buffer.
+ *
+ * `aowl_ov_build` fills `g_ov.vtx` with no device and no back buffer, and a
+ * glyph quad carries its own identity: the atlas is 16 cells of AOWL_OV_CW x
+ * AOWL_OV_CH, so the cell index -- and therefore the character -- is
+ * recoverable from u0/v0. That makes the nav header and the empty-state
+ * caption assertable OFFLINE against what was DRAWN, rather than against the
+ * string literal in the source, which is the check that cannot fail
+ * (CLAUDE.md 9b).
+ *
+ * A quad is text when its two top corners differ in u; a solid rect samples
+ * the white texel and has u0 == u1.
+ * ================================================================== */
+
+/* Reconstruct every text run in the frame into `out`, one run per line. Runs
+ * break on a colour change, a y change, or a gap in x -- i.e. exactly where
+ * the eye sees a separate piece of text. */
+static void ov_render_text(char* out, int cap) {
+    int n = 0, i;
+    float lastX = -1e9f, lastY = -1e9f;
+    uint32_t lastCol = 0;
+    out[0] = 0;
+    for (i = 0; i + 5 < g_ov.vtxCount; i += 6) {
+        const AowlOvVert* v = &g_ov.vtx[i];
+        int idx, cell;
+        char c;
+        if (v[0].u == v[1].u) continue;             /* a solid rect, not text */
+        cell = (int)(v[0].u * (float)AOWL_OV_ATW / (float)AOWL_OV_CW + 0.5f);
+        idx  = cell + 16 * (int)(v[0].v * (float)AOWL_OV_ATH / (float)AOWL_OV_CH + 0.5f);
+        if (idx < 0 || idx > 94) continue;
+        c = (char)(idx + 32);
+        if (v[0].col != lastCol || v[0].y != lastY ||
+            v[0].x < lastX - 0.5f || v[0].x > lastX + 0.5f) {
+            if (n > 0 && n < cap - 1) out[n++] = '\n';
+        }
+        if (n < cap - 1) out[n++] = c;
+        lastCol = v[0].col; lastY = v[0].y;
+        lastX = v[0].x + (float)AOWL_OV_CW * (float)(g_ov.scale > 0 ? g_ov.scale : 1);
+    }
+    out[n] = 0;
+}
+
+/* Is `want` a WHOLE rendered run? Whole, not a substring of the frame, so
+ * `mods` cannot be satisfied by the word inside some sentence elsewhere. */
+static int ov_has_run(const char* txt, const char* want) {
+    const char* p = txt;
+    size_t w = strlen(want);
+    while (*p) {
+        const char* e = strchr(p, '\n');
+        size_t len = e ? (size_t)(e - p) : strlen(p);
+        if (len == w && memcmp(p, want, w) == 0) return 1;
+        if (!e) break;
+        p = e + 1;
+    }
+    return 0;
+}
+
+/* Does the word `want` appear ANYWHERE in what was drawn? Used only for the
+ * negative. */
+static int ov_has_word(const char* txt, const char* want) {
+    return strstr(txt, want) != NULL;
+}
+
+/* A wide 1px-tall rule inside the nav column -- the ROOT BORDER that used to
+ * be drawn above every top-level row. The negative for it. The nav`s vertical
+ * divider is the same colour but is 1 unit WIDE and hundreds tall, so it
+ * cannot be confused for one. */
+static int ov_count_nav_hairlines(void) {
+    int i, found = 0;
+    float k = (float)(g_ov.scale > 0 ? g_ov.scale : 1);
+    float navW = (float)((g_ov.navW >= 140 && g_ov.navW <= 640) ? g_ov.navW : 256);
+    for (i = 0; i + 5 < g_ov.vtxCount; i += 6) {
+        const AowlOvVert* v = &g_ov.vtx[i];
+        float w, h;
+        if (v[0].u != v[1].u) continue;             /* text, not a rect */
+        if (v[0].col != AOWL_OV_EDGE) continue;
+        w = v[4].x - v[0].x;
+        h = v[4].y - v[0].y;
+        /* SCOPED TO THE NAV COLUMN, or this counts the panel's own header and
+         * footer rules (940 wide) and the right pane's row separators (652
+         * wide, and 276 units to the right) and reports a border that is not
+         * there. Measured from the dump: those are the only wide EDGE rules in
+         * a settings frame. The root hairline was drawn at panX + 1 and was
+         * `leftW + PAD` wide, so both bounds are needed. */
+        if (v[0].x > (g_ov.panX + 2.0f) * k) continue;
+        if (w > 100.0f * k && w <= ((float)navW + (float)AOWL_OV_PAD + 8.0f) * k
+            && h <= 1.5f * k) found++;
+    }
+    return found;
+}
+
 /* A page nav with more rows than fit, and a control list with more rows than
  * fit -- both lists have to be scrollable for the routing question to mean
  * anything. */
@@ -174,6 +266,62 @@ int main(void) {
         key(VK_RETURN);
         eq_int("RETURN steps out of the nav and back onto the controls",
                g_ov.navFocus, 0);
+    }
+
+    printf("-- the nav column names what it lists, and does not fence it --\n");
+    {
+        static char txt[65536];
+        int hair;
+
+        stage();
+        g_ov.drawSig = 0;
+        aowl_ov_build();
+        ov_render_text(txt, (int)sizeof(txt));
+
+        /* POSITIVE: the caption over the nav column, read back off the quads
+         * that were emitted for it. */
+        eq_int("the nav column header renders as `mods`",
+               ov_has_run(txt, "mods"), 1);
+        /* NEGATIVE, and this is the one that can fail: the old caption must
+         * not be anywhere in the frame. Restoring the word in any of the
+         * three places it used to live fails here. */
+        eq_int("the word `pages` renders NOWHERE in a settings frame",
+               ov_has_word(txt, "pages"), 0);
+
+        /* ROOT BORDER GONE, asserted on geometry rather than on the absence
+         * of a line of source: no wide 1px rule is drawn. The hairline this
+         * replaces was `leftW + PAD` wide and 1 tall. */
+        hair = ov_count_nav_hairlines();
+        eq_int("no root row is fenced by a hairline", hair, 0);
+        /* AND THE DETECTOR CAN SAY YES. A counter scoped until it matches
+         * nothing would pass this file forever; so draw the exact rule that
+         * was removed -- panX + 1, `leftW + PAD` wide, 1 tall, EDGE -- and
+         * require it to be seen. This is the input that makes the check
+         * above fail (CLAUDE.md 9b). */
+        aowl_ov_rect(g_ov.panX + 1.0f,
+                     g_ov.panY + (float)AOWL_OV_HEAD_H + (float)AOWL_OV_LINE_H,
+                     (float)((g_ov.navW >= 140 && g_ov.navW <= 640)
+                               ? g_ov.navW : 256) + (float)AOWL_OV_PAD,
+                     1.0f, AOWL_OV_EDGE);
+        eq_int("...and the hairline detector DOES see one when it is drawn",
+               ov_count_nav_hairlines(), 1);
+
+        /* THE EMPTY STATE says it too. It only draws with no pages at all, so
+         * it is staged on purpose -- otherwise the rename is untested exactly
+         * where the old word survived longest. */
+        stage();
+        g_ov.sPageCount = 0;
+        g_ov.sCatCount = 0;
+        g_ov.backendPort = 0;
+        g_ov.sIdxWhy[0] = 0;
+        g_ov.drawSig = 0;
+        aowl_ov_build();
+        ov_render_text(txt, (int)sizeof(txt));
+        eq_int("the empty nav says `no mods`, not `no pages`",
+               ov_has_word(txt, "no mods") && !ov_has_word(txt, "no pages"), 1);
+
+        stage();
+        aowl_ov_build();
     }
 
     printf("-- what a settings frame costs --\n");
