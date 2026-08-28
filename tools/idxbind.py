@@ -81,6 +81,24 @@ TABLES = [
         "users": ["host/Aowlspt.Host.Il2Cpp/modeskip.nim"],
         "accessors": ["cMskFn", "cMskName", "cMskRva", "mskFn"],
     },
+    # The four `UnityEngine.Cursor` accessors the overlay cursor-free feature
+    # CALLS (never detours). The C side indexes this table by its own adjacent
+    # `AOWL_CUR_T_*` defines; the Nim side names the same four rows through
+    # `CurT*`, annotated, which is what gives this table a binding to check at
+    # all. Getter and setter of the SAME property sit next to each other here,
+    # which is precisely the shift that would be invisible without the check:
+    # `set_lockState` called with `get_lockState`'s shape takes its argument as
+    # a MethodInfo* and writes nothing.
+    {
+        "mode": "positional",
+        "header": "abi/aowlspt_cursor.h",
+        "array": "aowl_cur_targets",
+        "const_prefix": "CurT",
+        "const_file": "host/Aowlspt.Host.Il2Cpp/cursorfree.nim",
+        "expect_file": None,
+        "users": ["host/Aowlspt.Host.Il2Cpp/cursorfree.nim"],
+        "accessors": ["cCurFn", "cCurName", "cCurRva"],
+    },
     {
         "mode": "positional",
         "header": "abi/aowlspt_modetext.h",
