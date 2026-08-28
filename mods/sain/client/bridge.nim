@@ -216,10 +216,36 @@ proc probe*(): Capability =
   # STEP 7 REFUSES, AND capFull IS NOT REACHED. This is the deliberate part.
   #
   # Everything past here -- the bot walk, every sensor, every driving call --
-  # goes through `LazyCall`/`ensure`, which needs `il2cpp_object_get_class` on
-  # a receiver. That is on CLAUDE.md 5's list of reflection entry points that
-  # FAULT on this build. So `capFull` would not be a capability, it would be a
-  # licence to walk straight back into the fault this whole pass removed.
+  # goes through `LazyCall`/`ensure`, which resolves members BY NAME.
+  #
+  # THE REASON WRITTEN HERE USED TO BE WRONG, and it was copied verbatim into
+  # 24 setting descriptions, so it is corrected at the source rather than
+  # patched at the leaves. It said `capFull` was refused because
+  # `il2cpp_object_get_class` faults. It does not fault: it is literally
+  # `mov rax,[rcx]; ret`, ungated and intact, which is WORSE -- a bad receiver
+  # yields a plausible number in silence.
+  #
+  # The real reason, and it still fully justifies the refusal: `LazyCall`'s
+  # binding goes through `il2cpp_class_from_name` /
+  # `il2cpp_class_get_method_from_name`, which are among the 40 TOKEN-GATED
+  # exports on this build. Called in the stock shape -- without the extra
+  # 32-byte token argument -- they do not return NULL and do not abort. They
+  # return a uniform random non-zero uint64 from a per-thread MT19937-64. So
+  # the nil check passes, the handle is garbage, and the first dereference
+  # kills the client with a log byte-identical to a healthy run. That is what
+  # killed arming at `UnityEngine.Physics::Raycast`.
+  #
+  # WHY THAT MATTERS FOR ANYONE TRYING TO FIX THIS: the blocker is the BINDING
+  # MECHANISM, not the operation. A bot walk built out of byte-verified static
+  # RVAs and metadata field offsets bypasses the export ABI entirely and no
+  # gate touches it -- which is exactly what `server/drive.nim` and the host's
+  # `botnav` detour already are, and why per-role difficulty reaches bots
+  # through THAT path while nothing in `core/decide.nim` does. Reviving this
+  # driver means replacing `LazyCall` with an RVA table, not re-enabling
+  # `capFull`.
+  #
+  # So `capFull` would not be a capability, it would be a licence to walk
+  # straight back into the fault this whole pass removed.
   #
   # The mod therefore stays at `capReadOnly`: it boots, it says what it found
   # and what it cannot do, and it drives nothing. That is a mod declining
@@ -231,10 +257,15 @@ proc probe*(): Capability =
   gProbeNote = "the world and the alive-players list were both reached " &
                "without calling into game code, and that is as far as this " &
                "build allows. " & listLenWhy() &
-               ". Everything past a count needs LazyCall/ensure, which needs " &
-               "il2cpp_object_get_class -- one of the reflection entry " &
-               "points that faults here -- so this mod stays in observer " &
-               "mode and drives nothing rather than walking back into that"
+               ". Everything past a count needs LazyCall/ensure, which binds " &
+               "BY NAME through il2cpp_class_from_name -- a TOKEN-GATED " &
+               "export on this build that returns a plausible RANDOM handle " &
+               "instead of failing, so the nil check passes and the first " &
+               "dereference kills the client. This half therefore stays in " &
+               "observer mode and drives nothing. The blocker is the BINDING " &
+               "MECHANISM, not the operation: difficulty and per-role " &
+               "difficulty do reach bots, over server/drive.nim's botnav " &
+               "path, which uses byte-verified RVAs and no name lookup"
   crumb("step 7/7 refused; the arming path is complete and this trace stops")
   gCrumbsDone = true
   result = gCapability

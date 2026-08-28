@@ -29,6 +29,7 @@
 
   "roles": {
     "pmc": {
+      "difficulty": "inherit",
       "engageDistance": 90.0,
       "timeBeforeSearch": 25.0,
       "willSearchForEnemy": true,
@@ -36,6 +37,7 @@
       "canShiftCoverPosition": true
     },
     "scav": {
+      "difficulty": "inherit",
       "engageDistance": 50.0,
       "timeBeforeSearch": 60.0,
       "willSearchForEnemy": false,
@@ -43,6 +45,7 @@
       "canShiftCoverPosition": true
     },
     "boss": {
+      "difficulty": "inherit",
       "engageDistance": 110.0,
       "timeBeforeSearch": 5.0,
       "willSearchForEnemy": true,
@@ -50,6 +53,7 @@
       "canShiftCoverPosition": true
     },
     "zombie": {
+      "difficulty": "inherit",
       "engageDistance": 200.0,
       "timeBeforeSearch": 1.0,
       "willSearchForEnemy": true,

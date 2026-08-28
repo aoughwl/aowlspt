@@ -41,6 +41,16 @@ type
     ## `resolvedFor` reaches the same behaviour, and the per-setting overrides
     ## are the escape hatch for anything it does not cover.
     difficulty*: float
+    ## Per-role difficulty band, one entry per `BotRole` in `ord(BotRole)`
+    ## order, same 0..1 scale as `difficulty` and defaulted to it.
+    ##
+    ## This exists because it is the ONE part of the roles cascade that reaches
+    ## a bot on this build. `server/drive.nim` turns a difficulty scalar into
+    ## `BotMover.MoveSpeed` over `aowlspt/botnav`, and the bot census carries
+    ## each bot's `WildSpawnType`, so a PER-ROLE scalar can be delivered per bot
+    ## with no new RVA and no by-name lookup. Every other `roles.*` knob feeds
+    ## `core/decide.nim`, which never runs -- see the note in `client/bridge.nim`.
+    roleDifficulty*: seq[float]
     enabled*: bool
     ## Server-side switches, read on the server side only.
     patchBrains*: bool
@@ -169,6 +179,13 @@ proc applyOverrides(s: var Settings; node: JsonRef) =
     of "maxBotsPerTick": s.maxBotsPerTick = int(f)
     of "willSearchForEnemy": s.willSearchForEnemy = b
     of "canShiftCoverPosition": s.canShiftCoverPosition = b
+    of "difficulty":
+      # Handled by `loadPreset`, not here: a role's difficulty is a BAND NAME
+      # ("easy".."deathwish"), not a member of `Settings`, and it is folded in
+      # as `aggressionMultiplier` after the overrides pass. Named explicitly so
+      # it does not fall through to the unknown-key warning below and read as a
+      # typo to the next person looking at a log.
+      discard
     else:
       warn "sain: config key '" & key & "' is not a setting this build knows"
 
@@ -210,20 +227,40 @@ proc loadPreset*(): Preset =
     roles.add base
     inc i
 
+  # Per-role difficulty starts as the global band for every role, so a config
+  # that names none of them behaves EXACTLY as it did before this existed --
+  # every role resolves to `scale` and `server/drive.nim` emits the single
+  # BotNavAll row it always emitted. That is deliberate: a new knob must not
+  # change a raid until somebody sets it.
+  var roleDiff: seq[float] = @[]
+  var rd = 0
+  while rd < RoleCount:
+    roleDiff.add scale
+    inc rd
+
   let perRole = doc.field("roles")
   if perRole.exists and perRole.isObject:
     let names = perRole.keys()
     for name in names:
       let idx = roleFromText(name)
       var s = roles[idx]
-      applyOverrides(s, perRole.child(name))
+      let node = perRole.child(name)
+      applyOverrides(s, node)
       roles[idx] = s
+      let band = node.child("difficulty")
+      if band.exists:
+        # "" is not "default": an empty string is what a cleared text control
+        # writes, and resolving it to 0.5 would silently OVERRIDE a global of
+        # deathwish with normal. An absent or empty band inherits, full stop.
+        let txt = band.asText("")
+        if txt.len > 0 and txt != "inherit":
+          roleDiff[idx] = difficultyScale(txt)
 
   let forced = personalityFromText(doc.field("forcePersonality").asText(""))
 
   result = Preset(
     base: base, byRole: roles, forcePersonality: forced,
-    difficulty: scale, enabled: enabled,
+    difficulty: scale, roleDifficulty: roleDiff, enabled: enabled,
     patchBrains: doc.field("server.patchBrains").asBool(true),
     neutraliseLocationModifiers:
       doc.field("server.neutraliseLocationModifiers").asBool(true),
@@ -239,7 +276,7 @@ proc loadPreset*(): Preset =
   var j = 0
   while j < RoleCount:
     var s = roles[j]
-    s.aggressionMultiplier = scale
+    s.aggressionMultiplier = roleDiff[j]
     result.byRole[j] = s
     inc j
 

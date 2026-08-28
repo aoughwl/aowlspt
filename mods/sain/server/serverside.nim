@@ -370,7 +370,7 @@ proc startServer*(p: Preset) =
   if not startDispatch(p.forcePersonality, p.logDecisions):
     warn "sain: could not subscribe to `tarkov.orbit.plan`; no bot will be " &
          "sent to an objective this session, and /sain/status says so"
-  startDrive(p.difficulty, p.logDecisions)
+  startDrive(p.difficulty, p.roleDifficulty, p.logDecisions)
   discard serve("/sain/status", onStatus)
   discard serve("/sain/preset", onPreset)
   success "sain: server half ready"
