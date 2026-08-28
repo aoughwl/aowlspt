@@ -204,6 +204,16 @@ static int aowl_rva_is_code(unsigned int rva) {
 ## allocation exports. Table and thunks only; the proof ladder that drives them
 ## is in `invoke2.nim` (included below). See `aowlspt_invoke2.h`.
 {.emit: """#include "aowlspt_invoke2.h" """.}
+## THE NATIVE UNITY UI CONSTRUCTION LAYER: the reusable API mods build real UI
+## on. Byte-verified layout setters (the `_Injected` variants, so no by-value
+## struct ABI is involved in either direction), the generalised
+## `AddComponent<T>` MethodInfo cache-slot registry with its runtime klass
+## check, interned managed strings (no per-frame allocation), and owned-object
+## teardown. Table, thunks and pure arithmetic only; the guarded operations and
+## the visual self-proof are in `nativeui.nim` (included below).
+## MUST follow `aowlspt_prologue.h` -- every verify goes through the STARTUP
+## SNAPSHOT, never live memory. See `aowlspt_nativeui.h`.
+{.emit: """#include "aowlspt_nativeui.h" """.}
 ## The main menu's bottom-right GAME MODE label: the verified `PreloaderUI`
 ## targets (`Update`, `SetGameModeText`, `RefreshCornerLabel`) and the one call
 ## thunk that drives it. The implementation is in `modetext.nim` (included
@@ -280,6 +290,11 @@ static void aowl_pro_prime_all(void) {
     /* The inspector's UI-navigation targets. ShowScreen among them IS
      * contended -- see the note on the forward declaration above. */
     aowl_pro_prime_navui();
+    /* The native-UI layer's 25 call targets. Two of them -- TMP_Text::set_text
+     * and LocalizedText::SetLabelText -- are exactly the functions other UI
+     * features reach for, so this is not a precaution, it is the case the
+     * snapshot exists for. */
+    aowl_nu_prime_all();
 }
 """.}
 {.emit: """#include "aowlspt_detour.h" """.}
@@ -5578,7 +5593,26 @@ include "settingsui.nim"
 ## comes AFTER `settingsui.nim`, that file's `suiReadString` and settings-tree
 ## offsets. Defines `mi2LadderFired` (dispatched by slot identity in
 ## `patchReturned`) and `bindManagedInvoke`.
+## FORWARD DECLARATIONS for the native-UI layer.
+##
+## `invoke2.nim` owns the only proven Unity-thread detour where a live
+## SettingsScreen and built controls both exist, and a SECOND detour on that
+## function would overwrite the first's trampoline and silently kill it. So the
+## native-UI proof RIDES invoke2's postfix as a drain. That means invoke2.nim
+## calls forward into `nativeui.nim`, which is `include`d after it -- these two
+## declarations are what make that legal.
+proc nuProofWanted(): bool
+proc nuProofRun(tab: Il2CppPtr)
+
 include "invoke2.nim"
+
+## THE NATIVE UNITY UI CONSTRUCTION LAYER -- the API mods build real UI on.
+## `include`d immediately after `invoke2.nim` because it stands on that file's
+## byte-verified `Component::get_gameObject` thunk and its `mi2FindTmp` anchor
+## walk, and on `settingsui.nim`'s `suiReadString` above both. Defines
+## `nuCreate`/`nuAdd`/`nuLayout`/`nuSetText`/`nuClone`/`nuDestroyAll`,
+## `bindNativeUi`, and the visual self-proof `nuProofRun`.
+include "nativeui.nim"
 
 ## The in-game, Unity-native debug overlay (the F3 panel + in-world AI markers).
 ## `include`d rather than imported, and LAST, because it stands on everything
@@ -7018,7 +7052,23 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
          "TarkovApplication::Update drain will call the game's own " &
          "Submit for it a couple of ticks later. Neither detour suppresses " &
          "its original, so the screen is dismissed rather than prevented."
+  # The native-UI layer. Both default OFF. `nativeUi` makes the API answer at
+  # all; `nativeUiProof` additionally runs the one-shot visual self-proof.
+  gNuOn = readBoolKey("nativeUi")
+  gNuProof = gNuOn and readBoolKey("nativeUiProof")
+  if gNuOn:
+    bindNativeUi(true)
   gMi2Probe = readBoolKey("managedInvokeProbe")
+  # The proof RIDES invoke2's postfix detour rather than binding a second one,
+  # so asking for the proof implies arming that detour. Saying so here, rather
+  # than leaving the human to discover that `nativeUiProof` alone does nothing,
+  # is the difference between a feature and a silent decline.
+  if gNuProof and not gMi2Probe:
+    gMi2Probe = true
+    info "nativeUiProof is set, so managedInvokeProbe is being armed with it: " &
+         "the proof rides that detour on SettingsScreen.EnsureTabInitialized " &
+         "as a drain, because a second detour on one function overwrites the " &
+         "first's trampoline"
   if gMi2Probe:
     info "managedInvokeProbe is set: a POSTFIX detour on " &
          "SettingsScreen.EnsureTabInitialized will run a five-step ladder that " &

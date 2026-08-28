@@ -655,6 +655,22 @@ proc buildOverlayTests(e: Env): bool =
                quoted(joinPath(dir, "mapstest.exe")), dir):
     okAll = false
 
+  # The NATIVE UI layer's pure logic: the renderability predicate, the polled
+  # hit test, the component-slot verdict machine, the ownership table and the
+  # string-intern refusals. It belongs offline for exactly the reason the F3
+  # widgets do -- the failure it guards against is an element that is created
+  # successfully, reports success at every step, and renders nothing. A 0x0
+  # rect is that failure, and here it is one assertion instead of a build,
+  # deploy, launch and a human looking at the screen.
+  if not run(e, "the native UI layer's logic",
+    "gcc -O2 -Wall -Wno-unused-function -I" & inc & " " &
+    quoted(joinPath(dir, "nativeuitest.c")) & " -o " &
+    quoted(joinPath(dir, "nativeuitest.exe")), dir):
+    okAll = false
+  elif not run(e, "native UI checks",
+               quoted(joinPath(dir, "nativeuitest.exe")), dir):
+    okAll = false
+
   if not run(e, "overlay header needs no extra link library",
     "gcc -O1 -Wno-unused-function -I" & inc & " " &
     quoted(joinPath(dir, "linkprobe.c")) & " -o " &
