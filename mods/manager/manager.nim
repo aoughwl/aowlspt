@@ -218,6 +218,25 @@ var gRegistry: Registry = Registry(ok: false, path: "", error: "not loaded",
 var gRes: Resolution = Resolution(order: @[], decisions: @[], problems: @[],
                                   pipelineChecked: false, hostVersion: "",
                                   side: "")
+## The SAME selection resolved with `client` as the side, kept beside `gRes`.
+##
+## `routeClient` already had to resolve twice and says why in its header: on the
+## server resolution every client-only mod is `wrong-side`, "which reads as
+## `enabled:false`". That sentence was written about the client host and is just
+## as true of the panel -- and the panel is what the player presses. A row for
+## `aowl.fovfix` was drawn from `gRes` alone, so it read `enabled:false` while
+## the selection store said `enabled:true` and the game had the mod loaded and
+## running. Pressing that row did not "enable" it: `toggleLocked` flips the
+## stored override, so the gesture that looks like switching FOV on is the one
+## that switches it off.
+##
+## So the second resolution is computed once per `recompute` rather than once
+## per request, and `effectiveWant` below reads it. Same registry, same
+## selection, same rules, one argument different -- the property that made
+## asking twice honest in `routeClient` is the reason it is honest here.
+var gResClient: Resolution = Resolution(order: @[], decisions: @[],
+                                        problems: @[], pipelineChecked: false,
+                                        hostVersion: "", side: "")
 var gDefaultLists: seq[string] = @[]
 var gProbeMs = 750
 var gWriteSelectionFile = true
@@ -444,6 +463,13 @@ proc recompute() =
     ids.add ov.id
     flags.add ov.enabled
   gRes = resolve(gRegistry, activeLists(), ids, flags, sideName(), hostVersion())
+  # Both sides, from the one selection, in the one place the selection changes.
+  # If this manager IS the client host there is nothing to ask twice.
+  if sideName() == "client":
+    gResClient = gRes
+  else:
+    gResClient = resolve(gRegistry, activeLists(), ids, flags, "client",
+                         hostVersion())
 
 proc isProtected(id: string): bool =
   ## Mods that may not be switched off from inside the game.
@@ -772,6 +798,43 @@ proc modSides(id: string; onServer, onClient: var bool) =
   onServer = hasSide(m, "server") or hasSide(m, "sim")
   onClient = hasSide(m, "client")
 
+proc effectiveWant(d: Decision): bool =
+  ## What the switch on this row is actually set to, on the side that can run
+  ## this mod. NOT `d.verdict == vLoaded`, which is the server's answer and is
+  ## `false` for every client-only mod whether or not you asked for it.
+  ##
+  ## `rowRestart` already had to make exactly this distinction and says so in
+  ## step 3 -- "`want`, which is this row's server-side answer and is `false`
+  ## for every client-only mod". That reasoning stopped one field short: the
+  ## `restart` marker was corrected and `enabled` was left reading the server.
+  ## For `aowl.fovfix`, `aowl.graphics` and `aowl.debug` -- the three mods in
+  ## this registry that declare a client side and no server side -- the panel
+  ## therefore drew an OFF switch over a mod the game had loaded and reported
+  ## `running` on the very same row (`clientLive:true` beside `enabled:false`).
+  ##
+  ## `managerContradiction` calls that shape out by name for `aowl.manager`:
+  ## "a row that reads `enabled:false` about a mod that is running is exactly
+  ## the kind of quiet disagreement that sends somebody looking in the wrong
+  ## place". It was true of three more rows, every session, and nothing said it.
+  ##
+  ## Only `wrong-side` defers. Every other verdict is a real decision about this
+  ## mod that the server was entitled to make -- `not-selected`, `conflict`,
+  ## `unknown`, a failed `pipeline` range -- and substituting the client's
+  ## answer for one of those would hide a genuine exclusion behind a switch that
+  ## looks live. This can move a row from `false` to `true` only where the
+  ## server had no opinion to give.
+  if d.verdict != vWrongSide:
+    return d.verdict == vLoaded
+  var onServer = false
+  var onClient = false
+  modSides(d.id, onServer, onClient)
+  if not onClient:
+    return false
+  var ci = -1
+  if not decisionFor(gResClient, d.id, ci):
+    return false
+  result = gResClient.decisions[ci].verdict == vLoaded
+
 proc clientRowShown(id: string): bool =
   ## Whether a row on `/panel` or `/list` carries the client host's answer at
   ## all.
@@ -807,11 +870,20 @@ proc decisionJson(d: Decision): JsonObject =
   # is the route that must never hide anything, so it names the rows the
   # player-facing panel omits rather than omitting them too.
   put(o, "internal", isInternal(d.id))
+
   # The nesting the settings page renders, stated as data on the route that
   # must never hide anything. Present only when non-empty -- see above.
   let par = registryParent(d.id)
   if par.len > 0:
     put(o, "parent", par)
+
+  # The switch position, same rule as the panel's -- see `effectiveWant`. The
+  # `verdict`/`reason` beside it stay the SERVER's, unaltered: this route is the
+  # diagnostic one and must keep saying that the server is not loading this mod
+  # and why. `enabled` is the other question -- what you asked for -- and the
+  # two genuinely differ for a client-only mod.
+  put(o, "enabled", effectiveWant(d))
+
   # Same rule as the panel row: present only when the client host has actually
   # answered about this guid, so that absence stays the one way of saying "no
   # answer yet" on every route that carries it.
@@ -912,7 +984,11 @@ proc panelRow(d: Decision): JsonObject =
     version = m.version
     if name.len == 0:
       name = m.name
-  let want = d.verdict == vLoaded
+  # The switch position, on the side that can run this mod -- see
+  # `effectiveWant`. Feeding it to `rowRestart` too, because comparing what is
+  # running against the *server's* answer is what put a spurious `*` on a
+  # client-only row before the client host learned to report for itself.
+  let want = effectiveWant(d)
   var o = obj()
   # Both spellings. `id` is what the registry and every other route call it;
   # `guid` is what the host, the ABI and the overlay call the same string, and
@@ -927,6 +1003,19 @@ proc panelRow(d: Decision): JsonObject =
   put(o, "name", name)
   put(o, "version", version)
   put(o, "enabled", want)
+  # WHICH HOST this switch is an instruction to, straight from the registry's
+  # `sides`. The panel had no way to say "this one is applied by the game, not
+  # by the backend", so a client-only row was indistinguishable from a
+  # server-side row that had failed to apply -- and `control`/`live` on the
+  # status object describe the *server's* host only. Present on every row so a
+  # reader never has to infer it from which optional client keys turned up.
+  var rowServer = false
+  var rowClient = false
+  modSides(d.id, rowServer, rowClient)
+  put(o, "appliesOn", (if rowServer and rowClient: "both"
+                       elif rowClient: "client"
+                       elif rowServer: "server"
+                       else: "none"))
   var live = false
   if rowLive(d.id, live):
     put(o, "live", live)

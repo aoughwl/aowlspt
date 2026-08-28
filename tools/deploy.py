@@ -613,6 +613,14 @@ def cmd_deploy(args, cfg, C):
         src = os.path.join(REPO, art["src"].replace("/", os.sep))
         dst = os.path.join(install, art["dst"].replace("/", os.sep))
         if args.dry_run:
+            off = dst + ".off"
+            if not os.path.isfile(dst) and os.path.isfile(off):
+                print("%s(dry-run)%s %-8s is switched OFF -> would refresh %s "
+                      "and LEAVE it off%s"
+                      % (dim, reset, art["name"], os.path.basename(off),
+                         "" if not getattr(args, "re_enable", False)
+                         else "  [--re-enable: would switch it ON]"))
+                continue
             print("%s(dry-run)%s %-8s -> %s" % (dim, reset, art["name"], dst))
             for rule in art.get("data", []):
                 files, note = derive_data(rule)
@@ -625,6 +633,43 @@ def cmd_deploy(args, cfg, C):
                       % (dim, reset, rel))
             continue
         os.makedirs(os.path.dirname(dst), exist_ok=True)
+
+        # A mod switched OFF in the live install is renamed to `<name>.dll.off`,
+        # so the path we are about to write does not exist. Every guard below
+        # keys off `os.path.isfile(dst)`, which is therefore False -- no backup
+        # is taken, nothing is printed, and `copy2` CREATES the enabled DLL.
+        # The result is a mod that was switched off on purpose coming back at
+        # the next launch, and the marker check cannot notice because the bytes
+        # it verifies are correct. That is exactly how sain and textures were
+        # resurrected (fact #156).
+        #
+        # The switch is the player's, not the deploy's. So the bytes still go
+        # out -- an artifact that is off should not also be stale, or switching
+        # it back on later silently gets you an old build -- but they go to the
+        # `.off` path, and the state is left as it was found. `--re-enable`
+        # opts in to the old behaviour, loudly, one artifact at a time.
+        off = dst + ".off"
+        if not os.path.isfile(dst) and os.path.isfile(off):
+            if not getattr(args, "re_enable", False):
+                try:
+                    shutil.copy2(off, backup_name(off))
+                    shutil.copy2(src, off)
+                except PermissionError:
+                    print("%sFAIL%s %s is locked -- the game or "
+                          "aowlspt-backend.exe is still running."
+                          % (red, reset, off))
+                    return 1
+                print("%sOFF %s %-8s -> %s"
+                      % (yellow, reset, art["name"], off))
+                print("     this mod is switched OFF in the install and was "
+                      "LEFT off. The new bytes were written to the .off file, "
+                      "so it is current if you switch it on. Pass --re-enable "
+                      "to switch it on now.")
+                continue
+            print("%sRE-ENABLING%s %s -- it was switched off (%s) and "
+                  "--re-enable was passed."
+                  % (yellow, reset, art["name"], os.path.basename(off)))
+
         if os.path.isfile(dst):
             bak = backup_name(dst)
             shutil.copy2(dst, bak)
@@ -788,6 +833,10 @@ def main():
                         "Skips the install-side data check, which does not "
                         "apply to a file that has not been deployed.")
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--re-enable", action="store_true",
+                   help="switch a mod back ON that the install had switched "
+                        "off as <name>.dll.off. Without this, deploy refreshes "
+                        "the .off file and LEAVES it off (fact #156).")
     p.add_argument("--no-color", action="store_true")
     args = p.parse_args()
     if args.target and not args.only:
