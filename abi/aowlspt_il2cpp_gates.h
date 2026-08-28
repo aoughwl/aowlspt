@@ -283,13 +283,19 @@ typedef struct {
     int32_t argc;
     void*   ret;       /* raw return value                                    */
     int32_t why;       /* AOWL_GATE_*; ONLY AOWL_GATE_OK means the gate passed*/
+    int32_t done;      /* 0 => the call FAULTED and the guard caught it       */
 } aowl_gate_call_t;
 
 static void* aowl_gate_invoke_thunk(void* p) {
     aowl_gate_call_t* c = (aowl_gate_call_t*)p;
     typedef void* (*f4)(void*, void*, void*, void*);
     f4 f = (f4)c->args[0];   /* slot 0 carries the target on entry */
-    return f(c->args[1], c->args[2], c->args[3], c->ret);
+    void* r = f(c->args[1], c->args[2], c->args[3], c->ret);
+    /* `aowl_p_p_seh` returns 0 both for a caught fault and for a legitimate 0
+     * return, so its value alone CANNOT distinguish them -- a check that cannot
+     * fail. This flag can: it is only ever reached if the call returned. */
+    c->done = 1;
+    return r;
 }
 
 /* Returns 1 only when the GATE was satisfied and the call completed. The
@@ -349,24 +355,35 @@ static int32_t aowl_gate_call(const char* name, void** argv, int32_t argc,
     {
         aowl_gate_call_t c;
         void* rv;
+        memset(&c, 0, sizeof(c));
         c.args[0] = (void*)fp;
         c.args[1] = slots[0];
         c.args[2] = slots[1];
         c.args[3] = slots[2];
         c.ret     = slots[3];
         rv = aowl_p_p_seh((void*)aowl_gate_invoke_thunk, &c);
-        /* aowl_p_p_seh returns 0 on a caught fault; we cannot distinguish that
-         * from a legitimate 0 return, so a 0 is reported as OK but the caller
-         * is told to treat 0 as ambiguous for pointer-returning exports. */
-        out->ret = rv;
+        if (!c.done) {
+            /* An access violation inside the call, caught by the guard. This
+             * used to be reported as AOWL_GATE_OK with a 0 return, which is a
+             * verification that cannot fail (CLAUDE.md 9b). */
+            /* rule 6: self-disable after AOWL_GATE_MAX_FAULTS. */
+            if (aowl_gate_faults < AOWL_GATE_MAX_FAULTS) aowl_gate_faults++;
+            out->ret  = 0;
+            out->done = 0;
+            out->why  = AOWL_GATE_FAULTED;
+            return 0;
+        }
+        out->ret  = rv;
+        out->done = 1;
     }
     out->why = AOWL_GATE_OK;
     return 1;
 }
 
-/* The honest success predicate, replacing `ret != nil`. */
+/* The honest success predicate, replacing `ret != nil`. A caller must ALSO not
+ * infer anything from `ret` alone: the trap never returns NULL. */
 static int32_t aowl_gate_call_ok(const aowl_gate_call_t* c) {
-    return c && c->why == AOWL_GATE_OK;
+    return c && c->why == AOWL_GATE_OK && c->done;
 }
 
 static void aowl_gate_note_fault(void) {
