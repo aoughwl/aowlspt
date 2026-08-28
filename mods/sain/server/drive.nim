@@ -50,6 +50,8 @@
 
 import aowlspt
 import aowlspt/botnav
+import ".." / core / types
+import ".." / preset / preset      # roleName only; no cycle (preset imports core/*)
 import "." / dispatch
 
 const
@@ -69,6 +71,10 @@ const
     ## Consecutive refused sends before this path switches itself off for the
     ## session. Matches the host side's own budget.
 
+  RoleCount* = 8
+    ## Must match the number of `BotRole` members. `preset.roleDifficulty` is
+    ## indexed by `ord(BotRole)` and so is `gRoleScale`.
+
 type
   Tracked = object
     id: int
@@ -76,6 +82,37 @@ type
     x, y, z: float
     lastCensus: int
     moved: bool     ## has this bot EVER changed position between two sightings
+    role: int       ## `ord(BotRole)`, classified from the census WildSpawnType
+    roleKnown: bool ## false until a census actually named this bot's type
+    roleSent: bool  ## has a per-bot role row ever gone out for this bot
+
+func roleOfSpawnType*(w: int): int =
+  ## `WildSpawnType` (a raw int32 off the census) -> `ord(BotRole)`.
+  ##
+  ## The numbers are the vanilla table documented in
+  ## `mods/morebots/bots/spawntypes.nim`, which read them out of
+  ## `EFT.WildSpawnType` in the shipped assemblies rather than from memory. They
+  ## are DATA, not truth: BSG renumbers this enum between wipes, and a wrong
+  ## number here shows up as a boss moving at scav speed -- visible, and not
+  ## dangerous, which is why this is a pure `case` over an integer we were
+  ## handed and not a lookup that touches the client.
+  ##
+  ## Anything unrecognised falls to scav, matching `preset.roleFromText`: a
+  ## build with a type this table does not have must still drive that bot at
+  ## SOME honest speed rather than be excluded from the feature silently.
+  ##
+  ## The gaps at 31, 54, 55 and 56 are real -- those values were removed
+  ## upstream -- and they are absent here rather than folded into a neighbour.
+  case w
+  of 9, 24, 51, 52: ord(brPmc)                # pmcBot exUsec pmcBEAR pmcUSEC
+  of 34, 35: ord(brRaider)                    # arenaFighter(+Event)
+  of 26, 27, 28: ord(brGoon)                  # bossKnight BigPipe BirdEye
+  of 2, 3, 6, 7, 11, 17, 22, 29, 32, 36, 43, 47, 65, 66:
+    ord(brBoss)                               # boss*, incl. the Agro variants
+  of 4, 5, 8, 12, 13, 14, 15, 16, 23, 30, 33, 41, 42, 44, 45, 67:
+    ord(brFollower)                           # follower*, tagillaHelperAgro
+  of 60, 61, 62, 63, 64: ord(brZombie)        # infected*
+  else: ord(brScav)                           # marksman assault cursed sectant
 
 var
   gArmed = false
@@ -91,6 +128,15 @@ var
   gPairs = 0        ## how many times a bot was seen twice (the "could we look" number)
   gMovers = 0       ## how many DISTINCT bots were ever observed to move
   gReported = false
+  gRoleScale: array[RoleCount, float]
+  gRolesDiffer = false
+    ## Whether any role's band differs from the global one. When false this
+    ## file emits exactly the one BotNavAll row it always did -- no per-bot
+    ## rows, no rotation, no extra wire traffic. A knob nobody set costs
+    ## nothing.
+  gRoleCursor = 0   ## where the per-bot override rotation resumes
+  gRoleRows = 0     ## per-bot role rows emitted this session (coverage, not a check)
+  gRoleCovered = 0  ## DISTINCT bots that have had a role row sent at least once
 
 proc speedForScale*(scale: float): float =
   ## SAIN's 0..1 difficulty band -> `BotMover.MoveSpeed`, also 0..1.
@@ -118,7 +164,7 @@ proc indexOf(id: int): int =
       return i
     inc i
 
-proc note(id: int; x, y, z: float) =
+proc note(id: int; x, y, z: float; spawnType: int) =
   ## Record a sighting, and remember whether the bot has ever actually moved.
   ## This is the evidence the check below is built from; it is deliberately a
   ## property of the bot's position in the census, not of anything this file
@@ -137,12 +183,14 @@ proc note(id: int; x, y, z: float) =
         inc j
       idx = oldest
       gTrack[idx] = Tracked(id: id, seen: false, x: 0.0, y: 0.0, z: 0.0,
-                            lastCensus: 0, moved: false)
+                            lastCensus: 0, moved: false, role: ord(brScav),
+                            roleKnown: false, roleSent: false)
     else:
       idx = gTrackLen
       inc gTrackLen
       gTrack[idx] = Tracked(id: id, seen: false, x: 0.0, y: 0.0, z: 0.0,
-                            lastCensus: 0, moved: false)
+                            lastCensus: 0, moved: false, role: ord(brScav),
+                            roleKnown: false, roleSent: false)
   if gTrack[idx].seen:
     inc gPairs
     let dx = x - gTrack[idx].x
@@ -152,6 +200,14 @@ proc note(id: int; x, y, z: float) =
       if not gTrack[idx].moved:
         gTrack[idx].moved = true
         inc gMovers
+  # The role is recorded from the census, not assumed. `roleKnown` stays false
+  # for a bot no census has typed yet, and an untyped bot gets NO per-bot row --
+  # it keeps the BotNavAll baseline. Defaulting an unknown to scav here would be
+  # a check that cannot fail: it would look like full role coverage while
+  # actually reporting our own default back to us.
+  if spawnType >= 0:
+    gTrack[idx].role = roleOfSpawnType(spawnType)
+    gTrack[idx].roleKnown = true
   gTrack[idx].id = id
   gTrack[idx].seen = true
   gTrack[idx].x = x
@@ -159,7 +215,40 @@ proc note(id: int; x, y, z: float) =
   gTrack[idx].z = z
   gTrack[idx].lastCensus = gCensuses
 
-proc send(speed: float; orders: seq[BotCommand]): bool =
+proc roleSpeedRows(baseline: float): seq[BotCommand] =
+  ## One `speed` row per TRACKED bot whose role band differs from the global
+  ## one, resuming from `gRoleCursor` so successive censuses cover every bot
+  ## rather than re-sending the same first few forever.
+  ##
+  ## Capped twice: by `MaxTracked` (the walk) and by `BotNavMaxCommands` (the
+  ## set). Neither cap can be exceeded by a corrupt census, because the census
+  ## contributes ids to `gTrack` and nothing else here.
+  result = @[]
+  if not gRolesDiffer:
+    return
+  var k = 0
+  while k < MaxTracked and k < gTrackLen and result.len < BotNavMaxCommands:
+    let i = (gRoleCursor + k) mod (if gTrackLen > 0: gTrackLen else: 1)
+    inc k
+    if not gTrack[i].roleKnown:
+      continue
+    var ri = gTrack[i].role
+    if ri < 0 or ri >= RoleCount:
+      continue
+    let want = speedForScale(gRoleScale[ri])
+    if want == baseline:
+      # Already covered by the BotNavAll row. Spending one of sixteen command
+      # slots to repeat the baseline would starve a bot that actually differs.
+      continue
+    result.add moveSpeed(gTrack[i].id, want)
+    if not gTrack[i].roleSent:
+      gTrack[i].roleSent = true
+      inc gRoleCovered
+  if gTrackLen > 0:
+    gRoleCursor = (gRoleCursor + k) mod gTrackLen
+
+proc send(speed: float; orders: seq[BotCommand];
+          roleRows: seq[BotCommand]): bool =
   ## ONE command set, carrying both halves of what this mod has to say.
   ##
   ## The MoveSpeed row is addressed to `BotNavAll` rather than per bot on
@@ -174,11 +263,24 @@ proc send(speed: float; orders: seq[BotCommand]): bool =
   ## MoveSpeed row and the difficulty band would stop reaching anything with no
   ## error anywhere. One set, assembled once, is the only shape that cannot do
   ## that silently.
+  ## PER-ROLE ROWS ride the same single set, for exactly the same reason
+  ## `orders` do: a second `sendBotCommands` would REPLACE this one and the
+  ## global row would stop reaching anything, silently. The BotNavAll row goes
+  ## FIRST and the per-bot rows after it, because the host applies a set in
+  ## order -- so a bot named by a role row takes the role speed and every bot
+  ## that is not named keeps the global one. That ordering is what makes the
+  ## partial, rotating census survivable: a bot the rotation has not reached
+  ## yet is at the global speed, not at no speed.
   var set: seq[BotCommand] = @[moveSpeed(BotNavAll, speed)]
   var i = 0
   while i < orders.len and set.len < BotNavMaxCommands:
     set.add orders[i]
     inc i
+  var r = 0
+  while r < roleRows.len and set.len < BotNavMaxCommands:
+    set.add roleRows[r]
+    inc r
+  gRoleRows = gRoleRows + r
   let st = sendBotCommands(set)
   if st == Ok:
     gFaults = 0
@@ -253,7 +355,7 @@ proc onCensus(payload: string): string =
   while i < bots.len and i < MaxRowsPerCensus:
     let b = bots[i]
     if b.alive:
-      note(b.id, b.x, b.y, b.z)
+      note(b.id, b.x, b.y, b.z, b.role)
     inc i
 
   let want = speedForScale(gScale)
@@ -266,14 +368,20 @@ proc onCensus(payload: string): string =
   var orders: seq[BotCommand] = @[]
   if dispatchArmed():
     orders = dispatchFor(bots)
+  # The role rows are rebuilt every census the set goes out, because the
+  # rotation is the whole point: a set that was not rebuilt would re-send the
+  # same bots' rows and never reach the rest.
+  var roleRows = roleSpeedRows(want)
   if gSpeed < 0.0 or want != gSpeed or gSinceSend >= RefreshEvery or
-     orders.len > 0:
+     orders.len > 0 or roleRows.len > 0:
     var why = " [refresh]"
     if gSpeed < 0.0 or want != gSpeed:
       why = " [value changed]"
     if orders.len > 0:
       why = " [" & $orders.len & " ORBIT order(s)]"
-    if send(want, orders):
+    if roleRows.len > 0:
+      why = why & " [" & $roleRows.len & " per-role row(s)]"
+    if send(want, orders, roleRows):
       gSpeed = want
       if gLog:
         info "sain: drive -> every bot at MoveSpeed " & $round3(want) &
@@ -286,20 +394,70 @@ proc onCensus(payload: string): string =
   if not gReported and gPairs >= 3:
     gReported = true
     info "sain: drive check " & driveCheck()
+    info "sain: " & roleCoverage()
     if dispatchArmed():
       info "sain: dispatch check " & dispatchCheck()
 
-proc startDrive*(difficultyScale: float; logDecisions: bool) =
+proc roleCoverage*(): string =
+  ## COVERAGE, and deliberately not called a check.
+  ##
+  ## It counts how many distinct tracked bots have had a per-role row sent.
+  ## That is a property of OUR OWN WRITE, so under CLAUDE.md 9b it cannot be a
+  ## verification and is not presented as one -- a row that went out and was
+  ## dropped by the host, or applied to the wrong offset, counts here exactly
+  ## the same. The falsifiable statement about the finished state is still
+  ## `driveCheck`'s ("no commanded bot is frozen"), plus the two-band raid
+  ## comparison a human runs; this line exists only so that comparison can be
+  ## set up without guessing whether the rotation ever reached the bots.
+  if not gRolesDiffer:
+    return "per-role difficulty: every role is on the global band, so no " &
+           "per-bot rows are sent and this session is byte-for-byte the " &
+           "single-speed behaviour"
+  result = "per-role difficulty: " & $gRoleCovered & " of " & $gTrackLen &
+           " tracked bots have had a role row sent (" & $gRoleRows &
+           " rows total). This says what was SENT, not what took effect"
+
+proc startDrive*(difficultyScale: float; roleScales: seq[float];
+                 logDecisions: bool) =
   ## Wire the drive. Called from the server half's `startServer`, which already
   ## refuses to run at all when `enabled` is false -- so `enabled` gates this
   ## too, without a second read of it.
   gScale = difficultyScale
   gLog = logDecisions
+  # Per-role bands. A short or absent `roleScales` is not an error: it means the
+  # caller has no per-role opinion, and every role inherits the global band --
+  # which reproduces the exact single-speed behaviour this file had before.
+  var ri = 0
+  while ri < RoleCount:
+    if ri < roleScales.len:
+      gRoleScale[ri] = roleScales[ri]
+    else:
+      gRoleScale[ri] = difficultyScale
+    if speedForScale(gRoleScale[ri]) != speedForScale(difficultyScale):
+      gRolesDiffer = true
+    inc ri
   if onBotCensus(onCensus) != Ok:
     gOff = true
     warn "sain: could not subscribe to the bot census; difficulty will not " &
          "reach any bot this session"
     return
+  # Say which roles differ, and say it as NUMBERS. "per-role difficulty is on"
+  # would be a line that cannot be wrong; the resolved MoveSpeed per role can
+  # be, and a wrong band shows up here before any raid is spent on it.
+  if gRolesDiffer:
+    var line = "sain: per-role difficulty is ACTIVE ->"
+    var q = 0
+    while q < RoleCount:
+      if speedForScale(gRoleScale[q]) != speedForScale(gScale):
+        line = line & " " & roleName(BotRole(q)) & "=" &
+               $round3(speedForScale(gRoleScale[q]))
+      inc q
+    line = line & " (every other role stays at the global " &
+           $round3(speedForScale(gScale)) & ")"
+    info line
+  else:
+    info "sain: per-role difficulty: every role inherits the global band, so " &
+         "only the one BotNavAll row is sent"
   info "sain: difficulty resolves to scale " & $round3(gScale) &
        " -> MoveSpeed " & $round3(speedForScale(gScale)) &
        ", and will be sent to every bot on the first census. NOTE: the " &
@@ -320,4 +478,4 @@ proc driveState*(): string =
   elif gArmed:
     what = "armed"
   result = "drive: " & what & ", " & $gCensuses & " censuses, " & $gTrackLen &
-           " bots, speed " & $round3(gSpeed)
+           " bots, speed " & $round3(gSpeed) & "; " & roleCoverage()
