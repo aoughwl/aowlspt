@@ -578,6 +578,69 @@ proc leakProof(w, h: int) =
         rowIndexOf(good.rows, "SUMMARYLINE") == 1,
         "leak proof: while the REAL frame passes all three")
 
+proc stepColumns(w: int) =
+  ## THE COLLISION. `character selectwaiting for it (1m 08s)` -- the step name
+  ## ran straight into its own detail with no space between them.
+  ##
+  ## Asserted the way the brief asks: every row's detail must begin at the SAME
+  ## column, and no name may run into it, with a name long enough to overflow
+  ## the column. The overlong names are the point -- the four names the launcher
+  ## happened to use at wide widths all fit, which is why this shipped, and why
+  ## a test using only those names would pass against the broken version.
+  echo ""
+  echo "--- step columns  (w=" & $w & ") ---"
+  let names = @["process", "host log", "IL2CPP runtime", "host",
+                "character select",
+                "a preposterously long step name that cannot possibly fit"]
+  var detailCols: seq[int] = @[]
+  var collided = false
+  for n in names:
+    let r = stepRow(MarkActive, n, "DETAILMARK", w)
+    echo "|" & r.text & "|"
+    let c = find(r.text, "DETAILMARK")
+    detailCols.add c
+    # The character immediately before the detail must be a space. That is the
+    # collision, stated as a property rather than as a column number.
+    if c > 0 and r.text[c - 1] != ' ': collided = true
+  check(not collided,
+        "steps: no name runs into its own detail (w=" & $w & ")")
+  var sameCol = true
+  var colsText = ""
+  for c in detailCols:
+    if c != detailCols[0]: sameCol = false
+    if colsText.len > 0: colsText.add ","
+    colsText.add $c
+  check(sameCol,
+        "steps: every detail begins at the same column (w=" & $w & ", got " &
+        colsText & ")")
+  # ALL-OR-NOTHING, stated separately, because "every detail is at the same
+  # column" is satisfied vacuously when there is no detail on any row -- which
+  # is exactly what happens at w=24, where `stepRow` correctly drops it for
+  # want of room. A check that passes on `-1,-1,-1,-1,-1,-1` is not evidence
+  # about column alignment, so the two cases are now distinguished and the
+  # column identity is asserted only where a detail was actually drawn.
+  if detailCols[0] < 0:
+    var allDropped = true
+    for c in detailCols:
+      if c >= 0: allDropped = false
+    check(allDropped,
+          "steps: at w=" & $w & " there is no room for a detail, and it is " &
+          "dropped on EVERY row rather than some")
+    echo "      (no detail column at this width -- correctly dropped)"
+  else:
+    check(detailCols[0] == stepDetailCol(w),
+          "steps: ...which is the DERIVED column " & $stepDetailCol(w))
+  check(stepDetailCol(w) > StepNameCol + stepNameW(w),
+        "steps: the detail column is strictly past the widest possible name " &
+        "(" & $StepNameCol & "+" & $stepNameW(w) & " < " & $stepDetailCol(w) &
+        ") -- the arithmetic that failed")
+  # A pending step's marker is blank, and it must not shift the columns.
+  let p = stepRow(MarkPending, "character select", "DETAILMARK", w)
+  check(find(p.text, "DETAILMARK") == detailCols[0],
+        "steps: a PENDING row's detail is in the same column too")
+  check(colsOf(p.text) <= w,
+        "steps: and an overlong name never widens the row past " & $w)
+
 proc oldVerdict(w: EnterWait; reason: var string): int =
   ## THE BEHAVIOUR THAT SHIPPED, reproduced exactly, so the new checks can be
   ## shown to go red against it.
@@ -727,6 +790,82 @@ proc transition(w, h: int) =
         "on the launcher at the time bound (must be 0), and every terminal " &
         "one carries a reason")
 
+  # 9. A CHANNEL THAT NEVER ANSWERS. The player was sitting AT character select
+  #    for 66 seconds while the wait reported nothing but a clock. Whatever the
+  #    cause -- liveInspector off, or another tool overwriting the command file,
+  #    which nothing arbitrates -- a wait learning nothing must say so and hand
+  #    off, not keep counting.
+  var silent = EnterWait(sawMenuRoot: false, menuRootPresent: false,
+                         sawSelector: false, selectorActive: false,
+                         otherScreenActive: false, clientAlive: true,
+                         elapsedMs: 9000'i64, polls: EwNoChannelPolls,
+                         answered: 0, interactive: true)
+  var silentWhy = ""
+  let silentV = enterWaitVerdict(silent, silentWhy)
+  check(silentV == EwNoChannel,
+        "transition: polls that all go unanswered are EwNoChannel, not " &
+        "'still waiting' (got " & $silentV & ")")
+  check(screenFor(true, true, silentV) == ScreenLogView,
+        "transition: ...and hand off rather than sitting there")
+  echo "      reason: " & silentWhy
+  # One dropped poll is routine and must NOT trip it.
+  var blip = silent
+  blip.polls = 1
+  var blipWhy = ""
+  check(enterWaitVerdict(blip, blipWhy) == EwWaiting,
+        "transition: a single dropped poll is routine and keeps waiting")
+  # A channel that IS answering never trips it, however long it takes.
+  var slow = silent
+  slow.polls = 20
+  slow.answered = 20
+  slow.sawMenuRoot = true
+  slow.menuRootPresent = true
+  var slowWhy = ""
+  check(enterWaitVerdict(slow, slowWhy) == EwWaiting,
+        "transition: an answering channel keeps waiting, however many polls")
+
+  # 10. THE DETAIL NAMES WHAT IT SAW. A clock alone made "menu up, watching"
+  #     and "nothing has answered" render identically -- the same blind spot
+  #     one level down. Two distinct states must produce two distinct strings.
+  let dSilent = enterWaitDetail(silent, silentV)
+  let dSlow = enterWaitDetail(slow, EwWaiting)
+  echo "      detail(silent): " & dSilent
+  echo "      detail(slow):   " & dSlow
+  check(dSilent != dSlow,
+        "transition: a silent channel and a live one do NOT render the same")
+  check(dSlow.contains("menu root: yes") and dSlow.contains("poll"),
+        "transition: the live detail names the menu root and the poll count")
+  check(dSilent.contains("no answer"),
+        "transition: the silent detail says the inspector is not answering")
+
+  # 11. THE HUMAN-PRESENT BOUND. 60s+ of an apparently frozen screen is what
+  #     the player called weird. When someone is watching, the wait gives up
+  #     quickly and hands them the logs -- they can press the button in a
+  #     second. Headless, where auto-enter is the only way in and nobody is
+  #     looking at a screen, the long bound stays.
+  check(enterWaitLimitMs(true) < enterWaitLimitMs(false),
+        "transition: an interactive launcher gives up sooner than a headless one")
+  check(enterWaitLimitMs(true) <= 30000'i64,
+        "transition: ...and gives up within 30s (got " &
+        $(enterWaitLimitMs(true) div 1000'i64) & "s)")
+  var human = EnterWait(sawMenuRoot: true, menuRootPresent: true,
+                        sawSelector: false, selectorActive: false,
+                        otherScreenActive: false, clientAlive: true,
+                        elapsedMs: 25000'i64, polls: 8, answered: 8,
+                        interactive: true)
+  var humanWhy = ""
+  check(enterWaitVerdict(human, humanWhy) == EwTimedOut,
+        "transition: 25s with a human watching is over the bound")
+  check(screenFor(true, true, enterWaitVerdict(human, humanWhy)) ==
+        ScreenLogView,
+        "transition: so they get the logs")
+  var headless = human
+  headless.interactive = false
+  var headWhy = ""
+  check(enterWaitVerdict(headless, headWhy) == EwWaiting,
+        "transition: the SAME 25s headless keeps waiting -- a cold boot " &
+        "legitimately takes 90s+ and nobody is looking at a screen")
+
 proc main(): int =
   # Pin the rendering so the grid is plain ASCII and a match means what it says.
   discard termStart()
@@ -766,6 +905,12 @@ proc main(): int =
   leakProof(120, 30)
   leakProof(80, 24)
   transition(120, 30)
+  # Both sides of the `width > 24` split: the narrow column is where
+  # `IL2CPP runtime` -- a name the launcher really uses -- was already
+  # colliding before `character select` ever existed.
+  stepColumns(120)
+  stepColumns(80)
+  stepColumns(24)
   handoff(119)
   handoff(39)
 

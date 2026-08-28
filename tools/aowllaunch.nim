@@ -539,6 +539,10 @@ type
       ## grows a fifth step from it, because that wait used to be a completely
       ## invisible 270 seconds sitting behind a settled, frozen panel.
     enterWaitedMs: int64
+    enterDetail: string
+      ## What the wait is actually OBSERVING, from `enterWaitDetail`. A clock
+      ## alone made "the menu is up, watching for the selector" and "every poll
+      ## has gone unanswered" render identically.
     profiles: seq[Profile]
     chosenId: string
       ## The profile the launcher bound, so the panel can mark WHICH row is the
@@ -563,7 +567,8 @@ proc newScreen(): Screen =
                   pid: 0, who: "", srvText: "", srvCol: ColDim,
                   cliText: "", cliCol: ColDim, summaryKind: MarkPending,
                   summaryText: "", profilesKnown: false,
-                  enterState: EwWaiting, enterWaitedMs: 0'i64, profiles: @[],
+                  enterState: EwWaiting, enterWaitedMs: 0'i64,
+                  enterDetail: "", profiles: @[],
                   chosenId: "", canCreate: false, profileNote: "")
 
 proc bootSteps(s: Screen; width: int): seq[Row] =
@@ -655,13 +660,12 @@ proc clientSteps(s: Screen; width: int): seq[Row] =
        of EwPassed: MarkDone
        of EwClientGone: MarkFailed
        of EwTimedOut: MarkFailed
+       of EwNoChannel: MarkFailed
        else: MarkActive),
       "character select",
-      (case s.enterState
-       of EwSelectorUp: "up -- pressing it"
-       of EwPassed: "already past it"
-       of EwClientGone: "the client exited"
-       of EwTimedOut: "did not appear in time -- going to the logs"
+      # Built by `enterWaitDetail` from what the wait observed, not from a
+      # clock. One source, so the row and the verdict cannot disagree.
+      (if s.enterDetail.len > 0: s.enterDetail
        else: "waiting for it (" & secsText(s.enterWaitedMs) & ")"), width)
   if h.errors > 0:
     result.add stepRow(MarkFailed, $h.errors & " error(s)", h.lastError, width)
@@ -768,6 +772,8 @@ proc screenHeader(s: Screen; w: int; elapsed: int64): Row =
         (case s.enterState
          of EwWaiting: "waiting for character select"
          of EwSelectorUp: "entering the game"
+         of EwNoChannel: "the inspector is not answering"
+         of EwTimedOut: "character select not seen"
          else: (if s.who.len > 0: s.who else: "in game"))
       elif s.host.runtimeUp: "binding the host"
       else: "starting the client"
@@ -2560,10 +2566,38 @@ proc main(): int =
     # The wait also PAINTS now. A bounded wait that shows nothing is
     # indistinguishable from a hang for as long as it lasts, and 270s of that
     # is what the player saw.
+    # FIFTH, and this is why the screen still looked frozen after the last fix:
+    # one iteration of this loop could BLOCK for over a minute.
+    #
+    # `screens()` is `roots` + `children` + `actives`, and each of those goes
+    # through `runBatch`, which retries a dropped batch THREE times at the
+    # pinned `Ui.timeoutMs`. At the 20s pin that is up to 60s for the `roots`
+    # call alone, during which this loop is inside a single call: it does not
+    # tick, does not re-evaluate and does not repaint. That is exactly the
+    # reported symptom -- the step read `waiting for it (0.0s)` and then, with
+    # no frame in between, `waiting for it (1m 08s)`. Painting once per
+    # iteration is worth nothing when an iteration lasts 66 seconds.
+    #
+    # So the POLL gets a short pin of its own. A poll that gets no answer is
+    # supposed to be cheap; the outer loop is what provides the patience, and
+    # it can only do that if it actually gets to run. The press below still
+    # uses the long pinned timeout, because by then the screen is confirmed up
+    # and the click is worth waiting for.
+    #
+    # Also relevant, and worth saying plainly: `runBatchOnce` writes the WHOLE
+    # command file with no locking or ownership of any kind, so any other tool
+    # driving the inspector at the same time silently overwrites this batch and
+    # vice versa. That cannot corrupt an answer -- each batch waits on its own
+    # unique sentinel, so a clobbered batch times out rather than returning
+    # someone else's result -- but it does make polls fail, and under a short
+    # pin that now shows up on screen as "N unanswered" instead of as a stall.
+    u.timeoutMs = 4000
+    u.timeoutPinned = true
     var ew = EnterWait(sawMenuRoot: false, menuRootPresent: false,
                        sawSelector: false, selectorActive: false,
                        otherScreenActive: false, clientAlive: true,
-                       elapsedMs: 0'i64)
+                       elapsedMs: 0'i64, polls: 0, answered: 0,
+                       interactive: termMode() == tmFull and stdinIsConsole())
     var verdict = EwWaiting
     var verdictWhy = ""
     var waitPanel = newPanel()
@@ -2584,7 +2618,9 @@ proc main(): int =
       var active = triUnknown
       ew.selectorActive = false
       ew.otherScreenActive = false
+      inc ew.polls
       if screens(u, "Menu UI", ss):
+        inc ew.answered
         ew.menuRootPresent = ss.rootPresent
         if ss.rootPresent: ew.sawMenuRoot = true
         for sc in ss.screens:
@@ -2620,6 +2656,7 @@ proc main(): int =
         ws.cliCol = (if ew.clientAlive: ColGreen else: ColRed)
         ws.enterState = verdict
         ws.enterWaitedMs = ew.elapsedMs
+        ws.enterDetail = enterWaitDetail(ew, verdict)
         if not paintPhase(waitPanel, logs, ws, ew.elapsedMs):
           waitPainting = false
       if not enterWaitDone(verdict):
@@ -2638,15 +2675,20 @@ proc main(): int =
       note "auto-enter skipped -- " & verdictWhy
       flushOut()
     elif not screenUp:
-      let msg = "auto-enter verdict: INCONCLUSIVE -- " &
-        "CharacterSelectionScreen under Menu UI never became active " &
-        "within 270s. " & waitErr
+      # The reason comes from the verdict rather than being restated here, so
+      # the message cannot claim "never became active within 270s" for a wait
+      # that actually stopped after 20s, or for one that never observed
+      # anything at all. Stating a cause the code did not establish is the
+      # confidently-wrong diagnostic rule 6 is about.
+      let msg = "auto-enter verdict: INCONCLUSIVE -- " & verdictWhy &
+        (if waitErr.len > 0: " Last channel error: " & waitErr else: "")
       warn msg
       discard writeTextFile(verdictPath, entryLine & "\n" & msg & "\n")
       note "left at whatever screen is actually up; check liveInspector is " &
            "on in aowlspt-host.json, or pass --no-auto-enter to silence this"
     else:
-      ok "character-select is up (waited " & $(waitTries * 3) & "s) -- matching now"
+      ok "character-select is up (waited " & secsText(ew.elapsedMs) &
+         ") -- matching now"
       u.timeoutMs = 60000
       u.timeoutPinned = true
       var pressed = false
