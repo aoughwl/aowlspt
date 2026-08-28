@@ -211,3 +211,73 @@ proc handbookCategories*(tpl: string): seq[string] =
       return
     current = next
     inc steps
+# ---------------------------------------------------------------------------
+# Container roots that must never be posted as mail
+# ---------------------------------------------------------------------------
+#
+# A stash is a *container the player owns*, not cargo. It reached the mailbox
+# because `EFT.TransferItemsController` keys its containers by profile id and
+# the container it hands back IS a `Stash` -- `TryGetTransferContainer(string
+# profileId, Stash)` -- so a `transferItems` body serialises the container's
+# own root item alongside whatever was inside it. Posting the root posts a
+# single item named "Stash" with no icon, and hides the actual cargo under it.
+#
+# MEASURED in the live mailbox on 2026-08-28, `store\aowl.tarkov\
+# mail.00000000000a00000000004f`: one message, `hasRewards: true`, exactly one
+# attachment, `_tpl 566abbc34bdc2d92178b4576` = "Standard stash 10x30", and an
+# `_id` (`656f0f98d80a697f855d34b1`) that is in NO profile item list -- so it
+# was the client's transfer container, not the player's own stash.
+#
+# MEASURED in `db.json`: `566abbb64bdc2d144c8b457d` is the node named "Stash",
+# and exactly nine templates hang off it.
+
+const StashNodeTpl* = "566abbb64bdc2d144c8b457d"
+  ## The "Stash" node in `templates.items`. MEASURED from `db.json`.
+
+const KnownStashTpls* = [
+  "566abbc34bdc2d92178b4576",  # Standard stash 10x30
+  "5811ce572459770cba1a34ea",  # Left Behind stash 10x40
+  "5811ce662459770f6f490f32",  # Prepare for escape stash 10x50
+  "5811ce772459770e9e5f9532",  # Edge of darkness stash 10x68
+  "5963866286f7747bf429b572",  # stash 8x6
+  "5963866b86f7747bfa1c4462",  # stash 8x40
+  "5c0a596086f7747bef5731c2",  # stash 10x300
+  "6602bcf19cc643f44a04274b",  # The Unheard Edition stash 10x72
+  "6050cac987d3f925bf016837",  # SortingTable (a Node, but the same shape)
+  StashNodeTpl]
+  ## The nine children of the Stash node plus the node itself, MEASURED from
+  ## `db.json` on 2026-08-28.
+  ##
+  ## Listed rather than only walked, on purpose. `isStashTpl` must give the
+  ## right answer with **no database loaded at all** -- `emutest` runs against
+  ## a small staged fixture, and a check that silently passes because the
+  ## database it consults is empty is exactly the shape CLAUDE.md 9b forbids.
+
+proc isStashTpl*(tpl: string): bool =
+  ## Is this template a stash / player container root?
+  ##
+  ## Two independent signals, either sufficient: the measured list above, and a
+  ## walk up `_parent` to the Stash node for anything a mod or a newer database
+  ## adds. The walk is capped -- a database with a parent cycle must return
+  ## false, not hang the mailbox.
+  if tpl.len == 0:
+    return false
+  for k in KnownStashTpls:
+    if k == tpl:
+      return true
+  var current = tpl
+  var steps = 0
+  while current.len > 0 and steps < 16:
+    let v = dbRead("templates.items." & current & "._parent")
+    if not v.ok:
+      return false
+    let parent = whole(v.raw).asText("")
+    if parent.len == 0:
+      return false
+    if parent == StashNodeTpl:
+      return true
+    if parent == current:
+      return false
+    current = parent
+    inc steps
+  result = false
