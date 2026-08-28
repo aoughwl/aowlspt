@@ -729,6 +729,21 @@ proc buildOverlayTests(e: Env): bool =
                quoted(joinPath(dir, "nativeuitest.exe")), dir):
     okAll = false
 
+  # The BACKEND-AGNOSTIC widget core (abi/aowlspt_ui.h): layout arithmetic, the
+  # tab-selection state machine, the polled hit-test/dispatch, and config
+  # binding. It sits ABOVE the overlay/native backend split and is pure state,
+  # so all of it -- the whole shared core of the unified UI framework -- is
+  # checkable here. Half the cases assert a negative and `falsify()` feeds the
+  # predicates wrong values, so a check replaced by `return 1` turns this red.
+  if not run(e, "the unified UI widget core",
+    "gcc -O2 -Wall -Wno-unused-function -I" & inc & " " &
+    quoted(joinPath(dir, "uitest.c")) & " -o " &
+    quoted(joinPath(dir, "uitest.exe")) & " -lm", dir):
+    okAll = false
+  elif not run(e, "unified UI widget-core checks",
+               quoted(joinPath(dir, "uitest.exe")), dir):
+    okAll = false
+
   # THE OVERLAY CURSOR-FREE DECISION. `abi/aowlspt_cursor.h` splits so that the
   # whole decision -- the ref count that is a level rather than a counter, the
   # save/restore edges, the re-assert hold, the unwind-on-disable -- is pure

@@ -574,6 +574,10 @@ proc mi2LadderFired(regs: Il2CppPtr) =
   # Nothing above this line is changed by it.
   if nuProofWanted():
     nuProofRun(tab)
+  # The unified framework's dual-backend proof rides the SAME drain (already
+  # inside this postfix's guard -- it opens none of its own, per §3 no nesting).
+  if auProofWanted():
+    auProofRun(tab)
 
 proc bindManagedInvoke(verbose: bool): bool =
   ## Installs the kind=9 POSTFIX detour on `SettingsScreen::EnsureTabInitialized`
