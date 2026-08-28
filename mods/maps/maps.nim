@@ -167,18 +167,18 @@ proc spatialSchema(): seq[Setting] =
   ## a control that does nothing.
   result = @[
     boolSetting("enabled", "Live position feed", false, category = "Feed",
-                description = "Read positions on the Unity thread. OFF means " &
+                description = "Specified from the pre-1.0 BepInEx map/radar mods (no upstream code carried; map art and calibration provenance in mods/maps/data/maps/README.md). Read positions on the Unity thread. OFF means " &
                               "this mod touches no game memory at all"),
     intSetting("hz", "Feed rate (Hz)", 10, lo = 1, hi = 30, category = "Feed",
-               description = "How often the snapshot is published to the map page"),
+               description = "Specified from the pre-1.0 BepInEx map/radar mods (no upstream code carried; map art and calibration provenance in mods/maps/data/maps/README.md). How often the snapshot is published to the map page"),
     floatSetting("radiusM", "Radar radius (m)", 120.0, lo = 10.0, hi = 1000.0,
                  step = 5.0, category = "Feed",
-                 description = "Anything further away than this is not drawn"),
+                 description = "Specified from the pre-1.0 BepInEx map/radar mods (no upstream code carried; map art and calibration provenance in mods/maps/data/maps/README.md). Anything further away than this is not drawn"),
 
     boolSetting("hudRadar", "In-game radar", true, category = "HUD",
-                description = "Draw the radar over the game, via the shared region"),
+                description = "Specified from the pre-1.0 BepInEx map/radar mods (no upstream code carried; map art and calibration provenance in mods/maps/data/maps/README.md). Draw the radar over the game, via the shared region"),
     boolSetting("hudIndicators", "Direction indicators", false, category = "HUD",
-                description = "A marker per contact, clamped to the screen " &
+                description = "Specified from the pre-1.0 BepInEx map/radar mods (no upstream code carried; map art and calibration provenance in mods/maps/data/maps/README.md). A marker per contact, clamped to the screen " &
                               "edge in its direction. Camera-relative when the " &
                               "region has a projector installed; a NORTH-UP " &
                               "bearing ring when it does not, and the status " &
@@ -190,7 +190,7 @@ proc spatialSchema(): seq[Setting] =
     floatSetting("radarY", "Radar Y (px)", 24.0, lo = 0.0, hi = 4096.0,
                  step = 4.0, category = "HUD"),
     boolSetting("hudMap", "In-game map", false, category = "Map",
-                description = "A large top-down map pane drawn over the game " &
+                description = "Specified from the pre-1.0 BepInEx map/radar mods (no upstream code carried; map art and calibration provenance in mods/maps/data/maps/README.md). A large top-down map pane drawn over the game " &
                               "by the shared region. Player-centred: anchoring " &
                               "it to the level needs the pocketmap pyramid's " &
                               "world origin, which nothing has measured"),
@@ -202,44 +202,44 @@ proc spatialSchema(): seq[Setting] =
                  step = 8.0, category = "Map"),
     floatSetting("mapSpanM", "Map span (m across)", 500.0, lo = 50.0,
                  hi = 4000.0, step = 25.0, category = "Map",
-                 description = "How much world the pane covers edge to edge"),
+                 description = "Specified from the pre-1.0 BepInEx map/radar mods (no upstream code carried; map art and calibration provenance in mods/maps/data/maps/README.md). How much world the pane covers edge to edge"),
     intSetting("mapGrid", "Map grid divisions", 8, lo = 0, hi = 32,
                category = "Map",
-               description = "A scale reference, not scenery. There is no map " &
+               description = "Specified from the pre-1.0 BepInEx map/radar mods (no upstream code carried; map art and calibration provenance in mods/maps/data/maps/README.md). A scale reference, not scenery. There is no map " &
                              "ARTWORK: the region's command set is fill/box/" &
                              "line/text with no textured quad, so the " &
                              "pocketmap tiles cannot be submitted through it"),
     floatSetting("indicatorInset", "Indicator edge inset (px)", 48.0, lo = 8.0,
                  hi = 400.0, step = 4.0, category = "HUD",
-                 description = "How far in from the screen edge an off-screen " &
+                 description = "Specified from the pre-1.0 BepInEx map/radar mods (no upstream code carried; map art and calibration provenance in mods/maps/data/maps/README.md). How far in from the screen edge an off-screen " &
                                "contact's marker is clamped"),
     boolSetting("showBots", "Show bots", true, category = "HUD"),
     boolSetting("showPlayers", "Show players", true, category = "HUD"),
     intSetting("hudBudgetUs", "HUD draw budget (us)", 400, lo = 50, hi = 5000,
                category = "HUD",
-               description = "The shared region throttles this participant if " &
+               description = "Specified from the pre-1.0 BepInEx map/radar mods (no upstream code carried; map art and calibration provenance in mods/maps/data/maps/README.md). The shared region throttles this participant if " &
                              "it overruns for 8 frames running"),
 
     intSetting("screenW", "Screen width (px)", 1920, lo = 640, hi = 7680,
                category = "HUD",
-               description = "FALLBACK only. The region now publishes the " &
+               description = "Specified from the pre-1.0 BepInEx map/radar mods (no upstream code carried; map art and calibration provenance in mods/maps/data/maps/README.md). FALLBACK only. The region now publishes the " &
                              "measured back-buffer size and this is used only " &
                              "until it does"),
     intSetting("screenH", "Screen height (px)", 1080, lo = 480, hi = 4320,
                category = "HUD",
-               description = "Only needed because the shared region does not " &
+               description = "Specified from the pre-1.0 BepInEx map/radar mods (no upstream code carried; map art and calibration provenance in mods/maps/data/maps/README.md). Only needed because the shared region does not " &
                              "yet expose the back-buffer size to a mod"),
 
     boolSetting("heading", "Rotate radar to facing", false, category = "HUD",
                 implemented = false,
-                description = "Read; sp/world.nim measures no heading yet, so " &
+                description = "Specified from the pre-1.0 BepInEx map/radar mods (no upstream code carried; map art and calibration provenance in mods/maps/data/maps/README.md). Read; sp/world.nim measures no heading yet, so " &
                               "the radar AND the map pane are north-up and say " &
                               "so rather than rotating by a guessed zero. Both " &
                               "take their rotation from one place, so a " &
                               "measured heading turns both heading-up at once"),
     boolSetting("markers", "Loot / extract / corpse / quest markers", false,
                 category = "HUD", implemented = false,
-                description = "Not collected: no field offset for any of those " &
+                description = "Specified from the pre-1.0 BepInEx map/radar mods (no upstream code carried; map art and calibration provenance in mods/maps/data/maps/README.md). Not collected: no field offset for any of those " &
                               "lists has been measured on this build"),
   ]
 
