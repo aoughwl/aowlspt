@@ -3,15 +3,15 @@
 ## A map's loot is three tables the database keeps apart, and the client wants
 ## them as one flat array:
 ##
-## - `locations.<map>.staticContainers` — the crates, safes and jackets that are
+## - `locations.<map>.staticContainers` ??? the crates, safes and jackets that are
 ##   welded to the map. Each one carries the transform the level was built with,
 ##   and a probability that this particular crate exists at all this raid.
-## - the **static loot distribution** for a container's own template — a pool of
+## - the **static loot distribution** for a container's own template ??? a pool of
 ##   item templates with relative weights, plus a distribution over *how many*
 ##   things are in it. Read from `loot.staticLoot`, with
 ##   `locations.<map>.staticLoot` accepted as well because databases dumped at
 ##   different times put it in different places.
-## - `locations.<map>.looseLoot` — spawn points on the ground, each with a
+## - `locations.<map>.looseLoot` ??? spawn points on the ground, each with a
 ##   probability and a set of candidate items already laid out in the point's
 ##   own template.
 ##
@@ -23,7 +23,7 @@
 ##   box that gives nothing when opened,
 ## - a **weapon** is a receiver plus every mod bolted to it. A rifle with no
 ##   preset expanded is a floating receiver with no magazine, no handguard and
-##   no sights — the client draws it, and it is not a gun.
+##   no sights ??? the client draws it, and it is not a gun.
 ##
 ## ## Placement
 ##
@@ -38,27 +38,27 @@
 ## packed through it could only ever be tested against a live database. The
 ## occupancy code below reads sizes through `LootDb`, which is what lets the
 ## whole of this module be run against a fixture. Closing that would take one
-## addition to `emu/grid` — see the note at `packInto`.
+## addition to `emu/grid` ??? see the note at `packInto`.
 ##
 ## ## Determinism
 ##
 ## Every roll comes out of `emu/rand`, seeded from the raid id and the map name
 ## and nothing else. The same raid id against the same database produces the
 ## same floor down to the item ids, so "the crate by the gas station on raid
-## 65f1a2… was empty" is a reproducible statement rather than a story. This is
+## 65f1a2??? was empty" is a reproducible statement rather than a story. This is
 ## the reason there is no ambient RNG in this project.
 ##
 ## ## With no tables at all
 ##
 ## Every read has a fallback and the fallback is always "nothing here". A
-## database with no locations, no item table and no globals yields `[]` — an
+## database with no locations, no item table and no globals yields `[]` ??? an
 ## empty, well-formed loot list that loads and plays. That property is what
 ## makes a raid testable against the small fixture, and it is why nothing below
 ## is allowed to assume a table exists.
 ##
 ## ## Magazines
 ##
-## A preset's magazine spawns **loaded**, from `locations.<map>.staticAmmo` —
+## A preset's magazine spawns **loaded**, from `locations.<map>.staticAmmo` ???
 ## the map's own weighted cartridge table, which was imported and read by
 ## nothing until this. The cartridge is the intersection of the weapon's
 ## `ammoCaliber` bucket and the magazine's own `Cartridges` filter, so it both
@@ -249,7 +249,7 @@ proc pick(dist: Distribution; r: var Rng): string =
   result = dist.keys[i]
 
 proc readCount(listJson: string; r: var Rng): int =
-  ## `itemcountDistribution` — how many things are in this container. One when
+  ## `itemcountDistribution` ??? how many things are in this container. One when
   ## the table says nothing, because a container that exists and is empty is
   ## indistinguishable from a bug.
   if listJson.len == 0:
@@ -431,6 +431,92 @@ proc presetFor(p: PresetIndex; tpl: string): string =
     if p.tpls[i] == tpl:
       return p.items[i]
   result = ""
+
+proc effectiveSizeOf(d: LootDb; p: PresetIndex; tpl: string;
+                     width, height: var int) =
+  ## The footprint the CLIENT will compute for this item, which for a weapon is
+  ## NOT its template's `Width`/`Height`.
+  ##
+  ## A weapon receiver is a 1x1 stub in `templates.items`; the gun the player
+  ## sees is the receiver plus every mod the preset bolts on, and a barrel, a
+  ## stock or a scope each declares how far past the receiver it sticks out.
+  ## `packInto` reserved the stub, the client drew the whole gun, and the
+  ## overflow landed on top of whatever was packed next -- "(x:0,y:0) in grid
+  ## main in item barrel_cache is taken by another item".
+  ##
+  ## The rule, measured rather than remembered:
+  ##
+  ## - only a template with `MergesWithChildren` grows at all (2,226 of 4,673
+  ##   in `build/db/db.json`),
+  ## - a child WITHOUT `ExtraSizeForceAdd` contributes the MAXIMUM of its
+  ##   `ExtraSize{Up,Down,Left,Right}` against the other children -- two mods
+  ##   that each hang one cell below hang one cell below, not two,
+  ##   (`ExtraSizeLeft` is non-zero on 340 templates, `Right` 153, `Down` 224,
+  ##   `Up` 9)
+  ## - a child WITH it contributes ADDITIVELY on top of that (120 templates,
+  ##   e.g. `stock_ar15_colt_stock_tube`, the buffer tube every AR stock sits
+  ##   on).
+  ##
+  ## Checked against real BSG placement, not against itself: in the captured
+  ## player stash (`capture/raid1/responses/large/208.json`, one 10x30 grid,
+  ## 105 items) a `weapon_colt_m4a1_556x45` -- template 1x1 -- sits at (0,14)
+  ## with the next item on row 14 at x=5 and row 15 empty below it until row 16
+  ## begins again at x=0. That hole is 5 wide and 2 tall. This rule answers
+  ## 5x2. The second M4A1, rotated, at (6,19) abuts a backpack that starts at
+  ## y=24 exactly five rows later. A width-only variant of the same rule
+  ## (5x1) leaves row 15 unexplained, so the vertical term is measured too.
+  ##
+  ## Folding is NOT modelled, and does not need to be here: every `Foldable`
+  ## in every one of the 399 `globals.ItemPresets` is `{"Folded": false}` (42
+  ## occurrences, zero true), and `spawnItem` emits the root with no `upd`
+  ## fold state at all, so the client computes the unfolded size -- which is
+  ## what this returns. Should a folded preset ever appear, this over-states
+  ## the footprint, and over-stating leaves a gap where under-stating throws
+  ## `InventoryException`.
+  sizeOf(d, tpl, width, height)
+  let props = itemProps(d, tpl)
+  if props.len == 0:
+    return
+  if not field(props, "MergesWithChildren").asBool(false):
+    return
+  let preset = presetFor(p, tpl)
+  if preset.len == 0:
+    return
+  let list = parseArray(preset)
+  if not list.ok or list.len < 2:
+    return
+  var maxUp = 0
+  var maxDown = 0
+  var maxLeft = 0
+  var maxRight = 0
+  var addUp = 0
+  var addDown = 0
+  var addLeft = 0
+  var addRight = 0
+  for i in 1 ..< list.len:
+    let childTpl = field(list.items[i], "_tpl").asText("")
+    let cp = itemProps(d, childTpl)
+    if cp.len == 0:
+      continue
+    let j = whole(cp)
+    let up = j.field("ExtraSizeUp").asInt(0)
+    let down = j.field("ExtraSizeDown").asInt(0)
+    let left = j.field("ExtraSizeLeft").asInt(0)
+    let right = j.field("ExtraSizeRight").asInt(0)
+    if j.field("ExtraSizeForceAdd").asBool(false):
+      addUp = addUp + up
+      addDown = addDown + down
+      addLeft = addLeft + left
+      addRight = addRight + right
+    else:
+      if up > maxUp: maxUp = up
+      if down > maxDown: maxDown = down
+      if left > maxLeft: maxLeft = left
+      if right > maxRight: maxRight = right
+  width = width + maxLeft + maxRight + addLeft + addRight
+  height = height + maxUp + maxDown + addUp + addDown
+  if width < 1: width = 1
+  if height < 1: height = 1
 
 # --- the map's ammunition --------------------------------------------------
 #
@@ -712,7 +798,7 @@ proc packInto(s: var ItemSink; d: LootDb; p: PresetIndex; a: AmmoTable;
   ## can be picked up.
   var w = 1
   var h = 1
-  sizeOf(d, tpl, w, h)
+  effectiveSizeOf(d, p, tpl, w, h)
   for gi in 0 ..< grids.len:
     var y = 0
     while y < grids[gi].h:
@@ -773,7 +859,7 @@ proc itemsArray(s: ItemSink): string =
 # ---------------------------------------------------------------------------
 
 proc forcedFor(forcedJson, containerId: string): seq[string] =
-  ## `staticForced` — the items a specific crate always holds, quest items
+  ## `staticForced` ??? the items a specific crate always holds, quest items
   ## mostly. Keyed by the *spawn point's* id, not by the template, because two
   ## crates of the same kind on one map do not both hold the quest item.
   result = @[]
@@ -1331,10 +1417,11 @@ const Fixture* = """{
   "loot": {
     "staticLoot": {
       "ccccbox00000000000000001": {
-        "itemcountDistribution": [ { "count": 2, "relativeProbability": 1 } ],
+        "itemcountDistribution": [ { "count": 3, "relativeProbability": 1 } ],
         "itemDistribution": [
           { "tpl": "aaaaammo0000000000000001", "relativeProbability": 5 },
-          { "tpl": "bbbbbox00000000000000002", "relativeProbability": 5 }
+          { "tpl": "bbbbbox00000000000000002", "relativeProbability": 5 },
+          { "tpl": "wwwwgun00000000000000001", "relativeProbability": 40 }
         ]
       }
     }
@@ -1347,7 +1434,11 @@ const Fixture* = """{
         "_items": [
           { "_id": "r0000000000000000000000r", "_tpl": "wwwwgun00000000000000001" },
           { "_id": "m0000000000000000000000m", "_tpl": "mmmmmag00000000000000001",
-            "parentId": "r0000000000000000000000r", "slotId": "mod_magazine" }
+            "parentId": "r0000000000000000000000r", "slotId": "mod_magazine" },
+          { "_id": "b0000000000000000000000b", "_tpl": "bbbbbrl00000000000000001",
+            "parentId": "r0000000000000000000000r", "slotId": "mod_barrel" },
+          { "_id": "s0000000000000000000000s", "_tpl": "sssstck00000000000000001",
+            "parentId": "r0000000000000000000000r", "slotId": "mod_stock" }
         ]
       }
     }
@@ -1359,7 +1450,7 @@ const Fixture* = """{
         "_props": {
           "Name": "Test crate",
           "Width": 2, "Height": 2,
-          "Grids": [ { "_name": "main", "_props": { "cellsH": 3, "cellsV": 3 } } ]
+          "Grids": [ { "_name": "main", "_props": { "cellsH": 8, "cellsV": 4 } } ]
         }
       },
       "aaaaammo0000000000000001": {
@@ -1385,12 +1476,24 @@ const Fixture* = """{
       },
       "wwwwgun00000000000000001": {
         "_id": "wwwwgun00000000000000001",
-        "_props": { "Name": "Test rifle", "Width": 4, "Height": 2, "StackMaxSize": 1,
+        "_props": { "Name": "Test rifle", "Width": 1, "Height": 1, "StackMaxSize": 1,
+                    "MergesWithChildren": true,
                     "ammoCaliber": "TestCaliber" }
+      },
+      "bbbbbrl00000000000000001": {
+        "_id": "bbbbbrl00000000000000001",
+        "_props": { "Name": "Test barrel", "Width": 2, "Height": 1, "StackMaxSize": 1,
+                    "ExtraSizeLeft": 2, "ExtraSizeForceAdd": false }
+      },
+      "sssstck00000000000000001": {
+        "_id": "sssstck00000000000000001",
+        "_props": { "Name": "Test buffer tube", "Width": 1, "Height": 1, "StackMaxSize": 1,
+                    "ExtraSizeRight": 1, "ExtraSizeForceAdd": true }
       },
       "mmmmmag00000000000000001": {
         "_id": "mmmmmag00000000000000001",
         "_props": { "Name": "Test magazine", "Width": 1, "Height": 1, "StackMaxSize": 1,
+          "ExtraSizeDown": 1,
           "Cartridges": [
             {
               "_name": "cartridges",
@@ -1476,6 +1579,127 @@ proc scanAddresses*(payload: string; collisions: var int;
           firstCollision = slotAddr
       seen.add slotAddr
 
+proc scanCells*(d: LootDb; payload: string; overlaps: var int;
+                firstOverlap: var string; gridItems: var int;
+                modded: var int; placed: var string) =
+  ## NO TWO ITEMS IN A GRID MAY OCCUPY OVERLAPPING CELLS, where each item's
+  ## footprint is the one the CLIENT computes -- template size PLUS whatever
+  ## its attached mods add.
+  ##
+  ## This is deliberately not "no two items START in the same cell", which is
+  ## the weaker claim the check above it makes and which a 5x2 rifle reserved
+  ## as 1x1 walks straight through: the two rifles in the Woods `barrel_cache`
+  ## had different origins and still landed on top of each other.
+  ##
+  ## It reads the footprint off the FINISHED payload -- the children actually
+  ## emitted, found by `parentId` -- and not off `PresetIndex`. That is the
+  ## point: if it asked the same preset table `packInto` asked, it would be
+  ## comparing the generator against itself and could not fail. Here the input
+  ## that makes it fail is exactly the one that made the client throw.
+  ##
+  ## `modded` is the denominator and must be asserted separately: a payload
+  ## with no multi-cell weapon in it satisfies this vacuously.
+  let spots = parseArray(payload)
+  for i in 0 ..< spots.len:
+    let e = whole(spots.items[i])
+    let inside = parseArray(e.field("Items"))
+    var ids: seq[string] = @[]
+    var tpls: seq[string] = @[]
+    var parents: seq[string] = @[]
+    for k in 0 ..< inside.len:
+      let it = whole(inside.items[k])
+      ids.add it.field("_id").asText("")
+      tpls.add it.field("_tpl").asText("")
+      parents.add it.field("parentId").asText("")
+    # occupied cells, keyed by grid
+    var cellGrid: seq[string] = @[]
+    var cellX: seq[int] = @[]
+    var cellY: seq[int] = @[]
+    var cellBy: seq[string] = @[]
+    for k in 0 ..< inside.len:
+      let it = whole(inside.items[k])
+      let loc = it.field("location")
+      if not loc.found or not loc.field("x").found:
+        continue
+      let tpl = tpls[k]
+      var w = 1
+      var h = 1
+      sizeOf(d, tpl, w, h)
+      let bareW = w
+      let bareH = h
+      let props = itemProps(d, tpl)
+      if props.len > 0 and field(props, "MergesWithChildren").asBool(false):
+        # every descendant of this item, gathered from the payload itself
+        var frontier: seq[string] = @[ids[k]]
+        var maxUp = 0
+        var maxDown = 0
+        var maxLeft = 0
+        var maxRight = 0
+        var addUp = 0
+        var addDown = 0
+        var addLeft = 0
+        var addRight = 0
+        var guard = 0
+        while frontier.len > 0 and guard < 4096:
+          inc guard
+          let cur = frontier[frontier.len - 1]
+          frontier.setLen(frontier.len - 1)
+          for n in 0 ..< ids.len:
+            if parents[n] != cur:
+              continue
+            frontier.add ids[n]
+            let cp = itemProps(d, tpls[n])
+            if cp.len == 0:
+              continue
+            let j = whole(cp)
+            let up = j.field("ExtraSizeUp").asInt(0)
+            let down = j.field("ExtraSizeDown").asInt(0)
+            let left = j.field("ExtraSizeLeft").asInt(0)
+            let right = j.field("ExtraSizeRight").asInt(0)
+            if j.field("ExtraSizeForceAdd").asBool(false):
+              addUp = addUp + up
+              addDown = addDown + down
+              addLeft = addLeft + left
+              addRight = addRight + right
+            else:
+              if up > maxUp: maxUp = up
+              if down > maxDown: maxDown = down
+              if left > maxLeft: maxLeft = left
+              if right > maxRight: maxRight = right
+        w = w + maxLeft + maxRight + addLeft + addRight
+        h = h + maxUp + maxDown + addUp + addDown
+      if w < 1: w = 1
+      if h < 1: h = 1
+      if w != bareW or h != bareH:
+        inc modded
+      inc gridItems
+      if placed.len < 400:
+        placed.add tpl & ":" & $bareW & "x" & $bareH & "->" & $w & "x" & $h & " "
+      if loc.field("r").asText("") == "Vertical":
+        let t = w
+        w = h
+        h = t
+      let grid = parents[k] & "|" & it.field("slotId").asText("")
+      let x0 = loc.field("x").asInt(-1)
+      let y0 = loc.field("y").asInt(-1)
+      var yy = y0
+      while yy < y0 + h:
+        var xx = x0
+        while xx < x0 + w:
+          for n in 0 ..< cellX.len:
+            if cellGrid[n] == grid and cellX[n] == xx and cellY[n] == yy:
+              inc overlaps
+              if firstOverlap.len == 0:
+                firstOverlap = grid & " cell (" & $xx & "," & $yy & ") " &
+                               tpls[k] & " " & $w & "x" & $h &
+                               " over " & cellBy[n]
+          cellGrid.add grid
+          cellX.add xx
+          cellY.add yy
+          cellBy.add tpls[k]
+          inc xx
+        inc yy
+
 proc check(report: var string; ok: bool; what: string) =
   if ok:
     report.add "ok    " & what & "\n"
@@ -1554,6 +1778,29 @@ proc selfCheck*(document: string): string =
       xs.add x
       ys.add y
   check(result, overlapFree, "no two items start in the same cell")
+
+  # And the stronger claim the one above cannot make: no two items in a grid
+  # OVERLAP, footprints computed the way the client computes them. The fixture
+  # rifle is a 1x1 template that a 2-cell barrel, a forced-add buffer tube and
+  # a magazine grow to 4x2 -- the same shape as a real M4A1 -- and the crate is
+  # 8x4, so two of them fit side by side and only side by side. Sized off the
+  # bare template they are both placed within one cell of the origin.
+  var cellOverlaps = 0
+  var firstCellOverlap = ""
+  var gridPlaced = 0
+  var grownPlaced = 0
+  var placedSample = ""
+  scanCells(d, a, cellOverlaps, firstCellOverlap, gridPlaced, grownPlaced,
+            placedSample)
+  scanCells(d, c, cellOverlaps, firstCellOverlap, gridPlaced, grownPlaced,
+            placedSample)
+  check(result, grownPlaced > 0,
+        "a weapon whose mods grow it past its template was placed at all" &
+        " (grid-placed " & $gridPlaced & ", grown " & $grownPlaced & "): " &
+        placedSample)
+  check(result, cellOverlaps == 0,
+        "no two items in a grid overlap, mod extensions included" &
+        (if cellOverlaps == 0: "" else: " -- " & firstCellOverlap))
 
   # A weapon arrives with its preset expanded.
   check(result, countOccurrences(a, "mmmmmag00000000000000001") >= 1,

@@ -418,6 +418,85 @@ proc slotKey(s: string; itemAt: int): string =
   result = parent & "|" & slot & "|" & loc
 
 # ---------------------------------------------------------------------------
+# Footprints, the way the CLIENT computes them
+# ---------------------------------------------------------------------------
+#
+# A weapon receiver is a 1x1 template. The gun is the receiver plus its mods,
+# and a barrel, a stock or a scope each declares how far past the receiver it
+# reaches (`ExtraSize{Up,Down,Left,Right}`, summed rather than maxed when the
+# mod sets `ExtraSizeForceAdd`). The client computes that; the emulator's
+# packer did not, so it reserved one cell for a five-cell rifle and the next
+# item went on top of it:
+#
+#   "(x:0,y:0,r:Horizontal) in grid main in item barrel_cache ... is taken by
+#    another item when trying to add item weapon_..."
+#
+# The index below is built ONCE from the imported database, because the check
+# runs over every grid item on every map.
+
+type
+  TplSizes = object
+    ids: seq[string]
+    w: seq[int]
+    h: seq[int]
+    merges: seq[bool]
+    eu: seq[int]
+    ed: seq[int]
+    el: seq[int]
+    er: seq[int]
+    forced: seq[bool]
+
+proc buildTplSizes(db: string): TplSizes =
+  result = TplSizes(ids: @[], w: @[], h: @[], merges: @[], eu: @[], ed: @[],
+                    el: @[], er: @[], forced: @[])
+  let tAt = memberValue(db, 0, "templates")
+  if tAt < 0:
+    return
+  let iAt = memberValue(db, tAt, "items")
+  if iAt < 0:
+    return
+  var keys: seq[string] = @[]
+  var vals: seq[int] = @[]
+  members(db, iAt, keys, vals)
+  for k in 0 ..< keys.len:
+    let pAt = memberValue(db, vals[k], "_props")
+    if pAt < 0:
+      continue
+    var w = intField(db, pAt, "Width")
+    var h = intField(db, pAt, "Height")
+    if w == low(int): w = 1
+    if h == low(int): h = 1
+    if w < 1: w = 1
+    if h < 1: h = 1
+    var e = intField(db, pAt, "ExtraSizeUp")
+    if e == low(int): e = 0
+    result.eu.add e
+    e = intField(db, pAt, "ExtraSizeDown")
+    if e == low(int): e = 0
+    result.ed.add e
+    e = intField(db, pAt, "ExtraSizeLeft")
+    if e == low(int): e = 0
+    result.el.add e
+    e = intField(db, pAt, "ExtraSizeRight")
+    if e == low(int): e = 0
+    result.er.add e
+    let fAt = memberValue(db, pAt, "ExtraSizeForceAdd")
+    result.forced.add(fAt >= 0 and fAt < db.len and db[fAt] == 't')
+    let mAt = memberValue(db, pAt, "MergesWithChildren")
+    result.merges.add(mAt >= 0 and mAt < db.len and db[mAt] == 't')
+    result.ids.add keys[k]
+    result.w.add w
+    result.h.add h
+
+proc indexOfTpl(t: TplSizes; tpl: string): int =
+  result = -1
+  if tpl.len == 0:
+    return
+  for i in 0 ..< t.ids.len:
+    if t.ids[i] == tpl:
+      return i
+
+# ---------------------------------------------------------------------------
 # Timing and size, reported rather than asserted
 # ---------------------------------------------------------------------------
 
@@ -1829,6 +1908,14 @@ proc main(): int =
   var lootOrphans = 0
   var slotDupes = 0
   var slotDupeSample = ""
+  var cellOverlaps = 0
+  var cellOverlapSample = ""
+  var gridPlaced = 0
+  var grownPlaced = 0
+  var sizeDb = ""
+  discard readTextFile(staged, sizeDb)
+  let tplSizes = buildTplSizes(sizeDb)
+  sizeDb = ""
   var magsSeen = 0
   var magsLoaded = 0
   var magsEmptyLoad = 0
@@ -1880,6 +1967,89 @@ proc main(): int =
             slotDupeSample = name & " " & k & "  <- " &
                              textField(floor1.body, it, "_tpl")
         incl(addrs, k)
+      # NO TWO ITEMS IN A GRID MAY OVERLAP, with each footprint computed the
+      # way the CLIENT computes it. The weaker "same starting cell" claim above
+      # is walked straight through by a 5x2 rifle reserved as 1x1: the two
+      # weapons in the Woods `barrel_cache` had different origins and still
+      # collided. Read off the FINISHED payload -- the children actually
+      # emitted -- so it is not the generator compared against itself.
+      var cells = initHashSet[string]()
+      for it in inner:
+        let locAt = memberValue(floor1.body, it, "location")
+        if locAt < 0 or memberValue(floor1.body, locAt, "x") < 0:
+          continue
+        let tpl = textField(floor1.body, it, "_tpl")
+        let ti = indexOfTpl(tplSizes, tpl)
+        if ti < 0:
+          continue
+        var w = tplSizes.w[ti]
+        var h = tplSizes.h[ti]
+        let bareW = w
+        let bareH = h
+        if tplSizes.merges[ti]:
+          # every descendant of this item, by parentage, capped at four hops
+          var fam = initHashSet[string]()
+          incl(fam, textField(floor1.body, it, "_id"))
+          var hop = 0
+          while hop < 4:
+            for c in inner:
+              if contains(fam, textField(floor1.body, c, "parentId")):
+                incl(fam, textField(floor1.body, c, "_id"))
+            inc hop
+          var mu = 0
+          var md = 0
+          var ml = 0
+          var mr = 0
+          var au = 0
+          var ad = 0
+          var al = 0
+          var ar = 0
+          for c in inner:
+            if c == it:
+              continue
+            if not contains(fam, textField(floor1.body, c, "_id")):
+              continue
+            let ci = indexOfTpl(tplSizes, textField(floor1.body, c, "_tpl"))
+            if ci < 0:
+              continue
+            if tplSizes.forced[ci]:
+              au = au + tplSizes.eu[ci]
+              ad = ad + tplSizes.ed[ci]
+              al = al + tplSizes.el[ci]
+              ar = ar + tplSizes.er[ci]
+            else:
+              if tplSizes.eu[ci] > mu: mu = tplSizes.eu[ci]
+              if tplSizes.ed[ci] > md: md = tplSizes.ed[ci]
+              if tplSizes.el[ci] > ml: ml = tplSizes.el[ci]
+              if tplSizes.er[ci] > mr: mr = tplSizes.er[ci]
+          w = w + ml + mr + al + ar
+          h = h + mu + md + au + ad
+        if w < 1: w = 1
+        if h < 1: h = 1
+        if w != bareW or h != bareH:
+          inc grownPlaced
+        inc gridPlaced
+        if textField(floor1.body, locAt, "r") == "Vertical":
+          let t = w
+          w = h
+          h = t
+        let grid = textField(floor1.body, it, "parentId") & "|" &
+                   textField(floor1.body, it, "slotId")
+        let x0 = intField(floor1.body, locAt, "x")
+        let y0 = intField(floor1.body, locAt, "y")
+        var yy = y0
+        while yy < y0 + h:
+          var xx = x0
+          while xx < x0 + w:
+            let key = grid & "|" & $xx & "|" & $yy
+            if contains(cells, key):
+              inc cellOverlaps
+              if cellOverlapSample.len == 0:
+                cellOverlapSample = name & " " & key & " <- " & tpl &
+                                    " " & $w & "x" & $h
+            incl(cells, key)
+            inc xx
+          inc yy
       var magIds = initHashSet[string]()
       for it in inner:
         if textField(floor1.body, it, "slotId") == "mod_magazine":
@@ -1932,6 +2102,18 @@ proc main(): int =
   check("no container puts two items at the same (slotId, location)",
         slotDupes == 0,
         $slotDupes & " colliding positions, first: " & slotDupeSample)
+  # The footprint negative, and its denominator asserted separately: a run in
+  # which no modded weapon was ever placed would satisfy the overlap claim
+  # vacuously, which is the "check that cannot fail" this exists to avoid.
+  check("weapons whose mods grow them past their template were placed",
+        grownPlaced > 0,
+        "of " & $gridPlaced & " grid-placed items, none was larger than its " &
+        "own template -- the overlap check below proves nothing")
+  check("no two items in a grid overlap, mod extensions included",
+        cellOverlaps == 0,
+        $cellOverlaps & " overlapping cells over " & $gridPlaced &
+        " grid-placed items (" & $grownPlaced & " mod-grown), first: " &
+        cellOverlapSample)
   check("weapon presets put magazines on the floor", magsSeen > 0,
         "no item on any of these maps is slotted mod_magazine")
   check("and the map's own `staticAmmo` table loads them", magsLoaded > 0,
