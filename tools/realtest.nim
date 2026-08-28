@@ -496,6 +496,143 @@ proc indexOfTpl(t: TplSizes; tpl: string): int =
     if t.ids[i] == tpl:
       return i
 
+proc matchedOf(body: string): int =
+  ## The spawner search route's `matched` count, read off the RAW body.
+  ##
+  ## Not through `dataAt`: MEASURED from a run against the real database, this
+  ## route answers `{"options":[...],"matched":N}` with no `data` envelope
+  ## around it, so `dataAt` returns -1 and every field read off it comes back
+  ## as garbage -- `matched=-9223372036854775808`, which is what sent the first
+  ## version of these checks red while the route was answering correctly.
+  ## -1 for absent, which is distinguishable from a legitimate 0.
+  result = -1
+  let at = findAt(body, "\"matched\":", 0)
+  if at < 0:
+    return
+  var i = at + 10
+  skipWs(body, i)
+  result = intVal(body, i)
+
+type
+  Collisions = object
+    ## The two placement negatives, counted over one set of item documents.
+    ##
+    ## The same pair the loot section asserts over a raid floor, factored so
+    ## the STASH can be held to them too. A spawn writes into the same grids
+    ## the client will later render, and "the request returned ok" says
+    ## nothing about whether what it wrote is renderable: the client throws
+    ## `InventoryException` on a duplicate address and draws one item on top
+    ## of another on an overlap, neither of which the server ever sees.
+    slotDupes*: int       ## two children of one parent at one (slotId, location)
+    cellOverlaps*: int    ## two items claiming one grid cell, mods included
+    gridPlaced*: int      ## denominator: items actually placed into a grid
+    grownPlaced*: int     ## of those, how many are bigger than their template
+    slotSample*: string
+    cellSample*: string
+
+proc collisionsIn(body: string; items: seq[int]; t: TplSizes;
+                  where: string): Collisions =
+  ## Both negatives over `items`, with each footprint computed the way the
+  ## CLIENT computes it -- template size grown by every descendant's
+  ## `ExtraSize{Up,Down,Left,Right}`, summed when the mod sets
+  ## `ExtraSizeForceAdd` and maxed when it does not.
+  ##
+  ## Read off the FINISHED documents rather than off whatever placed them, so
+  ## this is not a placer compared against itself: it is falsifiable by any
+  ## future writer into the same grids, including one that does not exist yet.
+  result = Collisions(slotDupes: 0, cellOverlaps: 0, gridPlaced: 0,
+                      grownPlaced: 0, slotSample: "", cellSample: "")
+  var addrs = initHashSet[string]()
+  for it in items:
+    let k = slotKey(body, it)
+    if k.len == 0:
+      continue
+    if contains(addrs, k):
+      inc result.slotDupes
+      if result.slotSample.len == 0:
+        result.slotSample = where & " " & k & "  <- " &
+                            textField(body, it, "_tpl")
+    incl(addrs, k)
+
+  var cells = initHashSet[string]()
+  for it in items:
+    let locAt = memberValue(body, it, "location")
+    # A bare-integer `location` is a StackSlot address, not a grid cell; only
+    # the object form `{"x":..,"y":..}` occupies area.
+    if locAt < 0 or memberValue(body, locAt, "x") < 0:
+      continue
+    let tpl = textField(body, it, "_tpl")
+    let ti = indexOfTpl(t, tpl)
+    if ti < 0:
+      continue
+    var w = t.w[ti]
+    var h = t.h[ti]
+    let bareW = w
+    let bareH = h
+    if t.merges[ti]:
+      var fam = initHashSet[string]()
+      incl(fam, textField(body, it, "_id"))
+      var hop = 0
+      while hop < 4:
+        for c in items:
+          if contains(fam, textField(body, c, "parentId")):
+            incl(fam, textField(body, c, "_id"))
+        inc hop
+      var mu = 0
+      var md = 0
+      var ml = 0
+      var mr = 0
+      var au = 0
+      var ad = 0
+      var al = 0
+      var ar = 0
+      for c in items:
+        if c == it:
+          continue
+        if not contains(fam, textField(body, c, "_id")):
+          continue
+        let ci = indexOfTpl(t, textField(body, c, "_tpl"))
+        if ci < 0:
+          continue
+        if t.forced[ci]:
+          au = au + t.eu[ci]
+          ad = ad + t.ed[ci]
+          al = al + t.el[ci]
+          ar = ar + t.er[ci]
+        else:
+          if t.eu[ci] > mu: mu = t.eu[ci]
+          if t.ed[ci] > md: md = t.ed[ci]
+          if t.el[ci] > ml: ml = t.el[ci]
+          if t.er[ci] > mr: mr = t.er[ci]
+      w = w + ml + mr + al + ar
+      h = h + mu + md + au + ad
+    if w < 1: w = 1
+    if h < 1: h = 1
+    if w != bareW or h != bareH:
+      inc result.grownPlaced
+    inc result.gridPlaced
+    if textField(body, locAt, "r") == "Vertical":
+      let sw = w
+      w = h
+      h = sw
+    let grid = textField(body, it, "parentId") & "|" &
+               textField(body, it, "slotId")
+    let x0 = intField(body, locAt, "x")
+    let y0 = intField(body, locAt, "y")
+    var yy = y0
+    while yy < y0 + h:
+      var xx = x0
+      while xx < x0 + w:
+        let key = grid & "|" & $xx & "|" & $yy
+        if contains(cells, key):
+          inc result.cellOverlaps
+          if result.cellSample.len == 0:
+            result.cellSample = where & " " & key & " <- " & tpl &
+                                " " & $w & "x" & $h
+        incl(cells, key)
+        inc xx
+      inc yy
+
 # ---------------------------------------------------------------------------
 # Timing and size, reported rather than asserted
 # ---------------------------------------------------------------------------
@@ -4664,6 +4801,274 @@ proc main(): int =
   check("a profile that saved nothing has no weapon or magazine builds",
         wpBuilds.len == 0 and mgBuilds.len == 0,
         $wpBuilds.len & " weapon, " & $mgBuilds.len & " magazine")
+
+  # -------------------------------------------------------------------------
+  # The item spawner
+  # -------------------------------------------------------------------------
+  #
+  # The F6 overlay and the settings page are two front ends onto ONE server
+  # implementation: `searchItemsCounted` and `spawnInto` in
+  # `mods/tarkov/emu/spawn.nim`, reached over the wire through the
+  # `optionsUrl` search route and the momentary `spawnNow` row. Until now
+  # nothing exercised either against real data, so "typing in the spawner
+  # produces nothing" had no test that could have caught it at any layer.
+  #
+  # Identity-free, like the rest of this file: the template it spawns is
+  # whichever one the profile already holds, so this works against a database
+  # imported next year.
+  heading "The item spawner"
+
+  listR = call("/client/game/profile/list", "")
+  var spProfAt = profileOf(listR.body, uid)
+  var spTpl = ""
+  if spProfAt >= 0:
+    let invA = memberValue(listR.body, spProfAt, "Inventory")
+    if invA >= 0:
+      for it in elements(listR.body, memberValue(listR.body, invA, "items")):
+        let c = textField(listR.body, it, "_tpl")
+        # A template this run can also SIZE, so the overlap assertion below is
+        # about a known footprint rather than a shrug.
+        if c.len != 24 or indexOfTpl(tplSizes, c) < 0:
+          continue
+        # It must have a PARENT. The first item in the list is the inventory
+        # root -- `55d7217a4bdc2d86028b456d`, "Default Inventory" -- which is a
+        # real template and a nonsensical thing to spawn a second copy of: it
+        # is the container everything else hangs off, not an item in a stash.
+        # Requiring a parentId picks something that is genuinely IN the
+        # inventory rather than being the inventory.
+        if textField(listR.body, it, "parentId").len == 0:
+          continue
+        spTpl = c
+        break
+
+  if spTpl.len == 0:
+    skip("the item spawner", "the profile holds no sizeable template to " &
+         "spawn a second copy of; nothing was searched or spawned")
+  else:
+    const SpawnItems = TarkovSettings & "/items"
+
+    # -- SEARCH ------------------------------------------------------------
+    #
+    # Three queries, because one cannot distinguish a working search from a
+    # search that answers the same thing to everything. The id must be FOUND,
+    # the nonsense must be MISSED, and the substring supplies a denominator:
+    # if all three came back the same the search is broken whichever way.
+    let byId = call(SpawnItems & "?q=" & spTpl & "&limit=50", "")
+    let idFound = findAt(byId.body, "\"value\":\"" & spTpl & "\"", 0) >= 0
+    check("searching the spawner for a known template id returns that item",
+          byId.ok and idFound and matchedOf(byId.body) == 1,
+          why(byId) & "; matched=" & $matchedOf(byId.body) & " for " & spTpl)
+
+    # The negative, and the reason it is a separate check: an empty options
+    # list with `matched: 0` is an ANSWER -- "no such item" -- and the route
+    # must say it rather than erroring or, worse, answering ok with a list it
+    # quietly truncated to nothing.
+    let byJunk = call(SpawnItems &
+                      "?q=zzqqxxnosuchitemzzqq&limit=50", "")
+    check("and a nonsense query is an explicit no-match, not an error",
+          byJunk.ok and matchedOf(byJunk.body) == 0 and
+            findAt(byJunk.body, "\"options\":[]", 0) >= 0,
+          why(byJunk) & "; matched=" & $matchedOf(byJunk.body))
+
+    # The denominator. A name substring every real database has, searched by
+    # NAME rather than by id so the locale scan -- the half the id path skips
+    # entirely -- is inside an assertion too.
+    # The term is taken from the LABEL the id search just returned, so it is
+    # guaranteed to match at least that item in whatever database this is --
+    # and it is a word rather than a letter. A one-character query was the
+    # first version here and it is the wrong test twice over: it matches most
+    # of the locale, so it asserts almost nothing, and counting `matched`
+    # visits all ~40,000 entries calling `itemExists` on each.
+    var nameTerm = ""
+    let labAt = findAt(byId.body, "\"label\":\"", 0)
+    if labAt >= 0:
+      var k = labAt + 9
+      while k < byId.body.len and byId.body[k] != '"' and nameTerm.len < 6:
+        # Letters only: a label starting with a digit or punctuation makes a
+        # poor substring and an escape would need decoding to be safe.
+        let ch = byId.body[k]
+        if (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z'):
+          nameTerm.add ch
+        elif nameTerm.len > 0:
+          break
+        inc k
+    if nameTerm.len < 3:
+      nameTerm = "bag"
+    let byName = call(SpawnItems & "?q=" & nameTerm & "&limit=50", "")
+    let nameMatched = matchedOf(byName.body)
+    let nameOpts = countAt(byName.body, "\"value\":\"")
+    check("and a name substring searches the locale, not just the id table",
+          byName.ok and nameMatched > 0 and nameOpts > 0,
+          why(byName) & "; q=\"" & nameTerm & "\" matched=" & $nameMatched &
+          ", returned " & $nameOpts)
+    # `matched` and the returned count are two different numbers, and the
+    # route exists to keep them apart: collapsing them is how the fifty-first
+    # match is reported as "no such item".
+    check("and it reports how many it really matched, not how many it sent",
+          nameMatched >= nameOpts,
+          "matched=" & $nameMatched & " is fewer than the " & $nameOpts &
+          " options it returned, so one of the two numbers is invented")
+
+    # -- SPAWN -------------------------------------------------------------
+    let unitsBefore = unitsOf(listR.body, spProfAt, spTpl)
+    var armed = setMapSetting("spawnQuery", "\"" & spTpl & "\"")
+    armed = armed and setMapSetting("spawnCount", "2")
+    armed = armed and setMapSetting("spawnCondition", "100")
+    check("the four spawn rows accept an edit through the real settings route",
+          armed, "one of spawnQuery/spawnCount/spawnCondition did not persist")
+
+    if not armed:
+      skip("the stash spawn", "the spawn rows would not arm, so a spawn " &
+           "would be testing the settings route rather than the spawner")
+    else:
+      let fired = setMapSetting("spawnNow", "true")
+      check("and flipping `spawnNow` is accepted as an action", fired,
+            "the momentary spawn row refused the POST")
+
+      # THE FINISHED STATE. Not "the POST returned ok" -- the profile is read
+      # back from the server and asked whether the items are THERE. Every
+      # earlier version of this feature could have passed a check on its own
+      # return value while putting nothing in the stash, which is exactly the
+      # report this section was written for.
+      listR = call("/client/game/profile/list", "")
+      spProfAt = profileOf(listR.body, uid)
+      let unitsAfter = unitsOf(listR.body, spProfAt, spTpl)
+      # `spawnResult` is quoted verbatim in the failure. The spawner declines
+      # in several distinguishable ways and each writes its own sentence there;
+      # a check that said only "nothing arrived" would send the reader back to
+      # the server to find out which one, which is the whole cost this row
+      # exists to remove.
+      let afterRows = call(TarkovSettings, "")
+      var said = ""
+      let rAt = findAt(afterRows.body, "\"spawnResult\"", 0)
+      if rAt >= 0:
+        let vAt = findAt(afterRows.body, "\"value\":", rAt)
+        if vAt >= 0:
+          said = slice(afterRows.body, vAt + 8)
+      check("two of that item are now in the stash, read back off the profile",
+            unitsAfter == unitsBefore + 2,
+            "held " & $unitsBefore & " before and " & $unitsAfter &
+            " after asking for 2 more of " & spTpl &
+            (if unitsAfter == unitsBefore:
+               " -- the spawn answered but placed NOTHING. spawnResult said: " &
+               said
+             else: ""))
+
+      # Placement, over the WHOLE stash rather than over the items this spawn
+      # created: a spawn that lands on top of something that was already there
+      # is the failure, and looking only at what we wrote cannot see it.
+      let invAfter = memberValue(listR.body, spProfAt, "Inventory")
+      let stashItems = elements(listR.body,
+                                memberValue(listR.body, invAfter, "items"))
+      let col = collisionsIn(listR.body, stashItems, tplSizes, "stash")
+      check("no two items in the stash share one (slotId, location)",
+            col.slotDupes == 0,
+            $col.slotDupes & " colliding addresses over " &
+            $stashItems.len & " items, first: " & col.slotSample)
+      check("and no two items in a stash grid overlap, mod extensions included",
+            col.cellOverlaps == 0,
+            $col.cellOverlaps & " overlapping cells over " &
+            $col.gridPlaced & " grid-placed items (" & $col.grownPlaced &
+            " mod-grown), first: " & col.cellSample)
+
+      # The parent chain. An item with a `parentId` naming nothing is invisible
+      # in the client -- it is in the payload and not in any container -- which
+      # reads to the player as the spawn having silently failed.
+      var ids = initHashSet[string]()
+      for it in stashItems:
+        incl(ids, textField(listR.body, it, "_id"))
+      var orphans = 0
+      var orphanSample = ""
+      for it in stashItems:
+        let par = textField(listR.body, it, "parentId")
+        if par.len > 0 and not contains(ids, par):
+          inc orphans
+          if orphanSample.len == 0:
+            orphanSample = textField(listR.body, it, "_id") & " -> " & par
+      check("and every item in the stash hangs off something that is there",
+            orphans == 0,
+            $orphans & " orphaned items, first: " & orphanSample)
+
+      line "  spawned 2 x " & spTpl & " into a stash of " & $stashItems.len &
+           " items (" & $col.gridPlaced & " grid-placed, " &
+           $col.grownPlaced & " mod-grown)"
+
+    # -- THE REFUSALS ------------------------------------------------------
+    #
+    # Each distinct way to decline says which one it was. A spawner that
+    # accepts input and produces nothing is the defect being fixed, so the
+    # messages are asserted, not just the absence of a crash.
+    discard setMapSetting("spawnQuery", "\"\"")
+    discard setMapSetting("spawnNow", "true")
+    let emptyRows = call(TarkovSettings, "")
+    check("an empty query is refused in writing, not silently ignored",
+          findAt(emptyRows.body, "type part of an item name", 0) >= 0,
+          "spawnResult does not explain what an empty query did")
+
+    discard setMapSetting("spawnQuery", "\"zzqqxxnosuchitemzzqq\"")
+    discard setMapSetting("spawnNow", "true")
+    let noneRows = call(TarkovSettings, "")
+    check("and a query that matches nothing says so by name",
+          findAt(noneRows.body, "no item matches", 0) >= 0,
+          "spawnResult does not report the no-match")
+
+    # -- IN A RAID ---------------------------------------------------------
+    #
+    # THE VERDICT ON IN-RAID SPAWNING, ASSERTED RATHER THAN ASSUMED.
+    #
+    # The client plays a raid holding its own copy of the profile and posts it
+    # back at `/client/match/local/end`, where `onMatchEnd` REPLACES the stored
+    # document with it. So a server-side spawn during a raid is written into a
+    # profile that is about to be discarded: the player sees nothing in the
+    # raid, nothing in the stash afterwards, and a 200 on the wire throughout.
+    #
+    # The spawner therefore refuses while a raid is running. This asserts BOTH
+    # halves -- that it refuses and says why, and that it works again once the
+    # raid ends -- because a guard that never lifts is the same defect wearing
+    # the opposite sign.
+    if raidMap.len == 0:
+      skip("the in-raid spawn guard", "no map was raidable in this database")
+    else:
+      discard setMapSetting("spawnQuery", "\"" & spTpl & "\"")
+      discard setMapSetting("spawnCount", "1")
+      listR = call("/client/game/profile/list", "")
+      let heldBeforeRaid = unitsOf(listR.body, profileOf(listR.body, uid), spTpl)
+
+      let rStart = call("/client/match/local/start",
+                        "{\"location\":\"" & raidMap & "\"}")
+      check("a raid can be started to test the spawner's raid guard",
+            rStart.contains("serverId"), rStart.body)
+
+      discard setMapSetting("spawnNow", "true")
+      let raidRows = call(TarkovSettings, "")
+      check("the spawner refuses mid-raid and names the raid as the reason",
+            findAt(raidRows.body, "a raid is in progress", 0) >= 0,
+            "spawnResult does not mention the raid; a mid-raid spawn that " &
+            "says nothing is silently discarded at extract")
+
+      # The negative that makes the refusal mean something: it must not have
+      # spawned anyway. A message alone would be satisfied by a guard that
+      # complains and then does the write regardless.
+      listR = call("/client/game/profile/list", "")
+      check("and nothing was written into the profile while it refused",
+            unitsOf(listR.body, profileOf(listR.body, uid), spTpl) ==
+              heldBeforeRaid,
+            "the mid-raid spawn refused in words and placed items anyway")
+
+      discard call("/client/match/local/end",
+                   "{\"serverId\":\"" & raidMap &
+                   "\",\"results\":{\"result\":\"Left\"}}")
+
+      # The guard LIFTS. Without this the whole feature could be "permanently
+      # broken" and every check above would still be green.
+      discard setMapSetting("spawnNow", "true")
+      listR = call("/client/game/profile/list", "")
+      check("and once the raid ends the spawner works again",
+            unitsOf(listR.body, profileOf(listR.body, uid), spTpl) ==
+              heldBeforeRaid + 1,
+            "held " & $heldBeforeRaid & " before the raid and " &
+            $unitsOf(listR.body, profileOf(listR.body, uid), spTpl) &
+            " after it ended -- the raid guard never lifted")
 
   if not keep:
     cSpawnKill(server)

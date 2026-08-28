@@ -481,6 +481,38 @@ static int32_t aowl_admin_spawn_pending(AowlAdminShared* s) {
     if (s->spawnReq == s->spawnAck) return 0;
     return (int32_t)s->spawnReq;
 }
+/* Write the result line WITHOUT acknowledging a request.
+ *
+ * This is the typeahead channel, and it is deliberately a separate entry point
+ * from `aowl_admin_spawn_done`: a live search must not touch `spawnAck` or
+ * `spawnBusy`, or the very first keystroke would ack a spawn nobody asked for.
+ *
+ * NO NEW FIELD, ON PURPOSE. The obvious design is a second request/ack pair
+ * for searches, but `CreateFileMappingA` keeps the size the FIRST process
+ * asked for, so growing `AowlAdminShared` hands whichever process started
+ * second a region shorter than the struct it is about to index -- which takes
+ * out the ESP and the whole F6 menu, not just the spawner. Reusing the result
+ * line costs nothing and cannot resize anything.
+ *
+ * The producer is expected to write here only when no spawn is in flight; a
+ * search landing on top of "working..." would replace a spawn's own answer
+ * with a search result, which is why the mod checks `spawnBusy` first. */
+static void aowl_admin_spawn_note(AowlAdminShared* s, const char* text) {
+    int32_t i = 0;
+    if (!s) return;
+    if (text) {
+        for (; i < AOWL_ADM_RESULT_LEN - 1 && text[i]; i++) s->spawnResult[i] = text[i];
+    }
+    s->spawnResult[i] = 0;
+}
+
+/* Is a spawn in flight? The producer asks before writing a search preview, so
+ * a typeahead line can never overwrite a real spawn's result. */
+static int32_t aowl_admin_spawn_inflight(AowlAdminShared* s) {
+    if (!s) return 0;
+    return s->spawnBusy ? 1 : 0;
+}
+
 /* Finish one. `text` is what the player is shown, and it is written BEFORE the
  * ack, so a HUD that sees the request complete can never read the previous
  * request's result. */
