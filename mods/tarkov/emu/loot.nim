@@ -553,6 +553,10 @@ proc fillMagazine(s: var ItemSink; d: LootDb; a: AmmoTable; r: var Rng;
     var doc = simpleItem(mongoId(r), cartridge)
     setText(doc, "parentId", magId)
     setText(doc, "slotId", slot.field("_name").asText("cartridges"))
+    # One stack per `Cartridges` slot, so index 0 -- stated, not implied.
+    # `bots.fillMagazine` already states it; an implied 0 is the same latent
+    # defect `expandAmmoBox` shipped.
+    setNumber(doc, "location", 0)
     var upd = newDoc()
     setNumber(upd, "StackObjectsCount", rounds)
     setRaw(doc, "upd", text(upd))
@@ -638,12 +642,22 @@ proc expandAmmoBox(s: var ItemSink; d: LootDb; r: var Rng;
     let perStack = stackMaxOf(d, cartridge)
     let slotName = slot.field("_name").asText("cartridges")
     var guard = 0
+    # `location` is MANDATORY here, and it is a bare integer -- not the
+    # `{x,y,r}` object a grid child carries. A `StackSlot` addresses its
+    # children by INDEX, and a child that omits `location` is read by the
+    # client as index 0, so a 120-round box split into two 60-round stacks
+    # threw exactly one `InventoryException` per box:
+    #   "... at position 0 but the slot already contains item ... at this
+    #    position."  (client log, Woods raid: six boxes, six exceptions)
+    # Shape measured on the wire, capture/raid1/requests/204.json:
+    #   {"slotId":"cartridges","location":0,"upd":{"StackObjectsCount":2},...}
     while total > 0 and guard < 64:
       var n2 = perStack
       if n2 > total: n2 = total
       var doc = simpleItem(mongoId(r), cartridge)
       setText(doc, "parentId", rootId)
       setText(doc, "slotId", slotName)
+      setNumber(doc, "location", guard)
       var upd = newDoc()
       setNumber(upd, "StackObjectsCount", n2)
       setRaw(doc, "upd", text(upd))
@@ -1408,6 +1422,60 @@ proc countOccurrences(haystack, needle: string): int =
     else:
       inc i
 
+proc scanAddresses*(payload: string; collisions: var int;
+                    firstCollision: var string; boxesSeen: var int) =
+  ## NO TWO CHILDREN OF ONE PARENT MAY SHARE ONE (slotId, location).
+  ##
+  ## An item's address inside its parent is (slotId, location). Two children at
+  ## one address is an `EFT.InventoryException` at load, and one of the two is
+  ## dropped:
+  ##   "... to slot StackSlot cartridges in item item_ammo_box_545x39_120_T
+  ##    at position 0 but the slot already contains item ... at this position."
+  ##
+  ## Stated as a property of the FINISHED payload rather than of any one
+  ## generator, so it catches ammo boxes, magazines, grids and presets alike.
+  ##
+  ## An ABSENT `location` normalises to `"0"`, and that is the whole point: the
+  ## client defaults it, so two stacks that both omit it are two stacks at
+  ## position 0 -- which is the bug. A key that gave "absent" a value of its own
+  ## would pass over the exact defect it was written to catch.
+  ##
+  ## The two shapes are kept distinct because they are not interchangeable on
+  ## the wire: a grid child carries `{"x","y","r"}` and a `StackSlot` child
+  ## carries a bare integer (measured, capture/raid1/requests/204.json), and
+  ## Newtonsoft throws on the mismatch.
+  let spots = parseArray(payload)
+  for i in 0 ..< spots.len:
+    let e = whole(spots.items[i])
+    let inside = parseArray(e.field("Items"))
+    var seen: seq[string] = @[]
+    for k in 0 ..< inside.len:
+      let it = whole(inside.items[k])
+      if it.field("_tpl").asText("") == "bbbbbox00000000000000002":
+        inc boxesSeen
+      let parent = it.field("parentId").asText("")
+      let slot = it.field("slotId").asText("")
+      if parent.len == 0 or slot.len == 0:
+        continue
+      let loc = it.field("location")
+      var pos = "0"
+      if loc.found:
+        if loc.field("x").found:
+          pos = "g" & $loc.field("x").asInt(-1) & "," &
+                $loc.field("y").asInt(-1) & "," & loc.field("r").asText("")
+        else:
+          pos = $loc.asInt(-1)
+      let slotAddr = parent & "|" & slot & "|" & pos
+      var dup = false
+      for n in 0 ..< seen.len:
+        if seen[n] == slotAddr:
+          dup = true
+      if dup:
+        inc collisions
+        if firstCollision.len == 0:
+          firstCollision = slotAddr
+      seen.add slotAddr
+
 proc check(report: var string; ok: bool; what: string) =
   if ok:
     report.add "ok    " & what & "\n"
@@ -1454,22 +1522,35 @@ proc selfCheck*(document: string): string =
         "the crate holds itself, the forced item and its pool roll")
 
   # No two items in one container may share a cell.
+  #
+  # GRID children only, and keyed by the grid they are in. This check used to
+  # take every item with a `location` and compare `x`/`y` defaulted to -1,
+  # which meant it also compared items that have no cell at all -- a
+  # `StackSlot` child carries a bare integer, so both its `x` and its `y` read
+  # -1 and two cartridge stacks in one box looked like two items in one cell.
+  # It only ever passed because those stacks were emitted with no `location`
+  # field at all, which was itself the bug. Scoping it is what makes it a
+  # statement about cells rather than about the shape of a JSON value.
   var overlapFree = true
   for i in 0 ..< entries.len:
     let e = whole(entries.items[i])
     let inside = parseArray(e.field("Items"))
+    var owners: seq[string] = @[]
     var xs: seq[int] = @[]
     var ys: seq[int] = @[]
     for k in 0 ..< inside.len:
       let it = whole(inside.items[k])
       let loc = it.field("location")
-      if not loc.found:
+      if not loc.found or not loc.field("x").found:
         continue
+      let owner = it.field("parentId").asText("") & "|" &
+                  it.field("slotId").asText("")
       let x = loc.field("x").asInt(-1)
       let y = loc.field("y").asInt(-1)
       for n in 0 ..< xs.len:
-        if xs[n] == x and ys[n] == y:
+        if owners[n] == owner and xs[n] == x and ys[n] == y:
           overlapFree = false
+      owners.add owner
       xs.add x
       ys.add y
   check(result, overlapFree, "no two items start in the same cell")
@@ -1564,5 +1645,23 @@ proc selfCheck*(document: string): string =
   check(result, countOccurrences(big, "\"_tpl\"") >
                countOccurrences(a, "\"_tpl\""),
         "the static multiplier puts more in the crate")
+
+  # -- THE NEGATIVE ---------------------------------------------------------
+  # Three different floors, because one seed is not a property.
+  var collisions = 0
+  var firstCollision = ""
+  var boxesSeen = 0
+  scanAddresses(a, collisions, firstCollision, boxesSeen)
+  scanAddresses(c, collisions, firstCollision, boxesSeen)
+  scanAddresses(big, collisions, firstCollision, boxesSeen)
+  # The denominator first: the check below is vacuously green on a floor with
+  # no multi-stack container in it at all. The fixture's ammo box holds 100
+  # rounds of a cartridge that stacks to 60, so every one that spawns splits
+  # into two stacks -- which is what makes the check falsifiable. It FAILS on
+  # the generator as it stood before the `location` fix.
+  check(result, boxesSeen > 0,
+        "the fixture spawned a multi-stack ammo box to check against")
+  check(result, collisions == 0,
+        "no container holds two items at the same (slotId, location)")
 
 proc selfCheck*(): string = selfCheck(Fixture)
