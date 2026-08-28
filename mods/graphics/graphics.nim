@@ -274,103 +274,89 @@ proc schema(): seq[Setting] =
   @[
     enumSetting("preset", "Preset", "filmic", presetNames(),
                 category = "Preset",
-                description = "A finished look in one word. While this is " &
-                    "anything but `custom` it OWNS every look slider below " &
-                    "and they are ignored -- pick `custom` to drive them " &
-                    "yourself. neutral = cleanup only; filmic = the default " &
-                    "look; cold-clinical = visibility first (no bloom, no " &
-                    "vignette, shadows pulled open); warm-cinematic = the " &
-                    "screenshot look; night-owl = dark interiors and night raids."),
+                description = "aowlspt original (native D3D11 post-process). A finished look in one word. While this is anything but `custom` it OWNS every look slider below and they are ignored -- pick `custom` to drive them yourself. neutral = cleanup only; filmic = the default look; cold-clinical = visibility first (no bloom, no vignette, shadows pulled open); warm-cinematic = the screenshot look; night-owl = dark interiors and night raids."),
     boolSetting("enabled", "Enable post-process", true,
                 category = "Post-process",
-                description = "Master switch. Off = the game renders untouched."),
+                description = "aowlspt original (native D3D11 post-process). Master switch. Off = the game renders untouched."),
     boolSetting("raidOnly", "Raid only (menu stays stock)", true,
                 category = "Post-process",
-                description = "Grade only in-raid; the menu and 2D UI stay " &
-                    "stock. Off = grade everywhere (also needed if you run " &
-                    "without the backend, which is what supplies the raid signal)."),
+                description = "aowlspt original (native D3D11 post-process). Grade only in-raid; the menu and 2D UI stay stock. Off = grade everywhere (also needed if you run without the backend, which is what supplies the raid signal)."),
     enumSetting("tonemapper", "Tonemapper", "1", @["0", "1", "2"],
                 category = "Tonemap",
-                description = "0 none, 1 AgX (filmic, neutral highlights), 2 ACES."),
+                description = "aowlspt original (native D3D11 post-process). 0 none, 1 AgX (filmic, neutral highlights), 2 ACES."),
     floatSetting("tonemapStrength", "Tonemap strength", 0.85,
                  lo = 0.0, hi = 1.0, step = 0.01, category = "Tonemap",
-                 description = "Blend of the tonemap look over the linear image."),
+                 description = "aowlspt original (native D3D11 post-process). Blend of the tonemap look over the linear image."),
     floatSetting("exposure", "Exposure (EV)", 0.0,
                  lo = -3.0, hi = 3.0, step = 0.05, category = "Tonemap",
-                 description = "EV bias applied before the tonemap."),
+                 description = "aowlspt original (native D3D11 post-process). EV bias applied before the tonemap."),
     floatSetting("contrast", "Contrast", 1.05,
                  lo = 0.5, hi = 1.8, step = 0.01, category = "Grade",
-                 description = "Contrast around 18% mid-grey, in linear."),
+                 description = "aowlspt original (native D3D11 post-process). Contrast around 18% mid-grey, in linear."),
     floatSetting("saturation", "Saturation", 1.05,
                  lo = 0.0, hi = 2.0, step = 0.01, category = "Grade",
-                 description = "0 greyscale, 1 neutral, >1 vivid."),
+                 description = "aowlspt original (native D3D11 post-process). 0 greyscale, 1 neutral, >1 vivid."),
     floatSetting("temperature", "Temperature", 0.0,
                  lo = -1.0, hi = 1.0, step = 0.01, category = "White balance",
-                 description = "Cool (-) to warm (+)."),
+                 description = "aowlspt original (native D3D11 post-process). Cool (-) to warm (+)."),
     floatSetting("tint", "Tint", 0.0,
                  lo = -1.0, hi = 1.0, step = 0.01, category = "White balance",
-                 description = "Green (-) to magenta (+)."),
+                 description = "aowlspt original (native D3D11 post-process). Green (-) to magenta (+)."),
     floatSetting("lift", "Lift (shadows)", 0.0,
-                 lo = -0.2, hi = 0.2, step = 0.005, category = "Lift/Gamma/Gain"),
+                 lo = -0.2, hi = 0.2, step = 0.005, category = "Lift/Gamma/Gain",
+      description = "aowlspt original (native D3D11 post-process)."),
     floatSetting("gamma", "Gamma (midtones)", 1.0,
-                 lo = 0.5, hi = 1.8, step = 0.01, category = "Lift/Gamma/Gain"),
+                 lo = 0.5, hi = 1.8, step = 0.01, category = "Lift/Gamma/Gain",
+      description = "aowlspt original (native D3D11 post-process)."),
     floatSetting("gain", "Gain (highlights)", 1.0,
-                 lo = 0.5, hi = 1.8, step = 0.01, category = "Lift/Gamma/Gain"),
+                 lo = 0.5, hi = 1.8, step = 0.01, category = "Lift/Gamma/Gain",
+      description = "aowlspt original (native D3D11 post-process)."),
     floatSetting("shadows", "Shadow lift (additive)", 0.0,
                  lo = -0.2, hi = 0.2, step = 0.005, category = "Legacy (AgX)",
-                 description = "Matches the original TarkovGraphics shadow knob."),
+                 description = "From TarkovGraphics (the original's grade knob), reimplemented in aowlspt's native post-process. Matches the original TarkovGraphics shadow knob."),
     floatSetting("highlights", "Highlight roll-off", 1.1,
                  lo = 0.5, hi = 2.0, step = 0.01, category = "Legacy (AgX)",
-                 description = "Pre-tonemap highlight compression."),
+                 description = "From TarkovGraphics (the original's grade knob), reimplemented in aowlspt's native post-process. Pre-tonemap highlight compression."),
     floatSetting("sharpness", "Sharpening (CAS)", 0.35,
-                 lo = 0.0, hi = 1.0, step = 0.01, category = "Sharpen"),
-    boolSetting("bloom", "Bloom", true, category = "Bloom"),
+                 lo = 0.0, hi = 1.0, step = 0.01, category = "Sharpen",
+      description = "aowlspt original (native D3D11 post-process)."),
+    boolSetting("bloom", "Bloom", true, category = "Bloom",
+      description = "aowlspt original (native D3D11 post-process)."),
     floatSetting("bloomStrength", "Bloom strength", 0.35,
-                 lo = 0.0, hi = 2.0, step = 0.01, category = "Bloom"),
+                 lo = 0.0, hi = 2.0, step = 0.01, category = "Bloom",
+      description = "aowlspt original (native D3D11 post-process)."),
     floatSetting("vignette", "Vignette", 0.18,
-                 lo = 0.0, hi = 1.0, step = 0.01, category = "Vignette"),
+                 lo = 0.0, hi = 1.0, step = 0.01, category = "Vignette",
+      description = "aowlspt original (native D3D11 post-process)."),
     floatSetting("vignetteRadius", "Vignette radius", 1.0,
-                 lo = 0.5, hi = 1.5, step = 0.01, category = "Vignette"),
+                 lo = 0.5, hi = 1.5, step = 0.01, category = "Vignette",
+      description = "aowlspt original (native D3D11 post-process)."),
     floatSetting("clarity", "Clarity (local contrast)", 0.30,
                  lo = 0.0, hi = 1.0, step = 0.01, category = "Detail",
-                 description = "Wide-radius local contrast. This is what makes " &
-                     "a flat, hazy frame read as three-dimensional. Costs 4 " &
-                     "texture taps; masked to mid-tones so it cannot crush " &
-                     "blacks or blow highlights."),
+                 description = "aowlspt original (native D3D11 post-process). Wide-radius local contrast. This is what makes a flat, hazy frame read as three-dimensional. Costs 4 texture taps; masked to mid-tones so it cannot crush blacks or blow highlights."),
     floatSetting("vibrance", "Vibrance", 0.35,
                  lo = 0.0, hi = 1.0, step = 0.01, category = "Grade",
-                 description = "Saturation weighted by how unsaturated a pixel " &
-                     "already is. Gains colour separation without turning " &
-                     "foliage neon, which a flat saturation multiplier does. " &
-                     "Free (no extra taps)."),
+                 description = "aowlspt original (native D3D11 post-process). Saturation weighted by how unsaturated a pixel already is. Gains colour separation without turning foliage neon, which a flat saturation multiplier does. Free (no extra taps)."),
     floatSetting("shadowDetail", "Shadow detail (toe lift)", 0.35,
                  lo = 0.0, hi = 1.0, step = 0.01, category = "Grade",
-                 description = "Re-lifts ONLY the toe after contrast, so " &
-                     "raising contrast does not cost you the ability to see a " &
-                     "player standing in a doorway. Free."),
+                 description = "aowlspt original (native D3D11 post-process). Re-lifts ONLY the toe after contrast, so raising contrast does not cost you the ability to see a player standing in a doorway. Free."),
     floatSetting("grain", "Film grain", 0.18,
                  lo = 0.0, hi = 1.0, step = 0.01, category = "Film",
-                 description = "Animated, weighted toward the shadows -- where " &
-                     "real grain lives and where banding lives. Free."),
+                 description = "aowlspt original (native D3D11 post-process). Animated, weighted toward the shadows -- where real grain lives and where banding lives. Free."),
     floatSetting("grainSize", "Grain size (px)", 1.5,
-                 lo = 1.0, hi = 4.0, step = 0.1, category = "Film"),
+                 lo = 1.0, hi = 4.0, step = 0.1, category = "Film",
+      description = "aowlspt original (native D3D11 post-process)."),
     floatSetting("dither", "Output dither (LSB)", 1.0,
                  lo = 0.0, hi = 2.0, step = 0.1, category = "Film",
-                 description = "Triangular-PDF noise at ~1 least-significant " &
-                     "bit before the 8-bit write. The cheapest real win here: " &
-                     "it is the only thing that kills banding in dark " &
-                     "interiors. Leave it on."),
+                 description = "aowlspt original (native D3D11 post-process). Triangular-PDF noise at ~1 least-significant bit before the 8-bit write. The cheapest real win here: it is the only thing that kills banding in dark interiors. Leave it on."),
     floatSetting("chroma", "Chromatic aberration", 0.0,
                  lo = 0.0, hi = 1.0, step = 0.01, category = "Lens",
-                 description = "Radial, red/blue only, exactly zero at the " &
-                     "screen centre so it never smears what you are aiming " &
-                     "at. Off by default. Costs 2 texture taps."),
+                 description = "aowlspt original (native D3D11 post-process). Radial, red/blue only, exactly zero at the screen centre so it never smears what you are aiming at. Off by default. Costs 2 texture taps."),
     floatSetting("bloomThreshold", "Bloom threshold", 0.70,
                  lo = 0.0, hi = 1.0, step = 0.01, category = "Bloom",
-                 description = "Luma knee for the bright pass. Raise it so " &
-                     "only real light sources bloom."),
+                 description = "aowlspt original (native D3D11 post-process). Luma knee for the bright pass. Raise it so only real light sources bloom."),
     boolSetting("diag", "Red-tint diagnostic", false, category = "Debug",
-                description = "Tints the frame red to confirm the blit lands.")]
+                description = "aowlspt original (native D3D11 post-process). Tints the frame red to confirm the blit lands.")]
 
 proc onSettings(url, body, session: string): string =
   ## GET returns the schema with live values; POST applies one edit to

@@ -817,12 +817,10 @@ proc onLoad(): Status =
   declareSettings(@[
     boolSetting("launchHint", "Show the \"Press F12\" hint at launch", true,
                 category = "Overlay/Launch",
-                description = "A small notice in the top-right corner, once " &
-                              "per launch, that fades after a few seconds"),
+                description = "aowlspt original (settings UI). A small notice in the top-right corner, once per launch, that fades after a few seconds"),
     boolSetting("launchHintFallbackPage", "Advertise the browser settings page",
                 false, category = "Overlay/Launch", implemented = false,
-                description = "Not wired yet: the toast names the in-game " &
-                              "screen only")])
+                description = "aowlspt original (settings UI). Not wired yet: the toast names the in-game screen only")])
   if serve("/aowlspt/settings/" & ModGuid, onSettings) != Ok:
     warn "could not register the uihub settings route -- the launch hint's " &
          "off-switch will not appear in the settings surface"

@@ -163,59 +163,47 @@ proc debugSchema(): seq[Setting] =
   result = @[
     # ---- the F3 overlay -------------------------------------------------
     boolSetting("overlayEnabled", "F3 overlay", true, category = "Overlay",
-                description = "Draw the debug panel at all. The host also has " &
-                              "its own debugUi flag; both must be on."),
+                description = "aowlspt original (F3 debug overlay). Draw the debug panel at all. The host also has its own debugUi flag; both must be on."),
     stringSetting("overlayFields", "Lines, in order", DefaultFields,
                   category = "Overlay",
-                  description = "Comma-separated, one panel line each, TOP TO " &
-                                "BOTTOM in this order. Known names: " &
-                                KnownFields & ". An unknown name prints " &
+                  description = "aowlspt original (F3 debug overlay). Comma-separated, one panel line each, TOP TO BOTTOM in this order. Known names: " & KnownFields & ". An unknown name prints " &
                                 "itself with a '?' rather than vanishing, so " &
                                 "a typo is visible on screen."),
     enumSetting("overlayAnchor", "Corner", "topleft",
                 @["topleft", "topright", "bottomleft", "bottomright",
-                  "top", "bottom", "center"], category = "Overlay"),
+                  "top", "bottom", "center"], category = "Overlay",
+      description = "aowlspt original (F3 debug overlay)."),
     floatSetting("overlayX", "X offset", 16.0, lo = -4000.0, hi = 4000.0,
-                 step = 1.0, category = "Overlay"),
+                 step = 1.0, category = "Overlay",
+      description = "aowlspt original (F3 debug overlay)."),
     floatSetting("overlayY", "Y offset", -16.0, lo = -4000.0, hi = 4000.0,
                  step = 1.0, category = "Overlay",
-                 description = "Unity's Y grows UPWARD, so a top anchor wants " &
-                               "a NEGATIVE Y to move down."),
+                 description = "aowlspt original (F3 debug overlay). Unity's Y grows UPWARD, so a top anchor wants a NEGATIVE Y to move down."),
     floatSetting("overlayFontSize", "Font size", 18.0, lo = 6.0, hi = 72.0,
-                 step = 1.0, category = "Overlay"),
+                 step = 1.0, category = "Overlay",
+      description = "aowlspt original (F3 debug overlay)."),
     floatSetting("overlayLineHeight", "Line spacing", 22.0, lo = 6.0, hi = 96.0,
-                 step = 1.0, category = "Overlay"),
+                 step = 1.0, category = "Overlay",
+      description = "aowlspt original (F3 debug overlay)."),
     intSetting("overlayThrottle", "Refresh every N frames", 10,
                lo = 1, hi = 600, category = "Overlay",
-               description = "The panel rebuilds its text every Nth frame. " &
-                             "1 is smoothest and costs the most; 10 is the " &
-                             "shipped default and is imperceptible."),
+               description = "aowlspt original (F3 debug overlay). The panel rebuilds its text every Nth frame. 1 is smoothest and costs the most; 10 is the shipped default and is imperceptible."),
     stringSetting("overlayColor", "Colour (r,g,b)", "1,1,0.62",
-                  category = "Overlay"),
+                  category = "Overlay",
+      description = "aowlspt original (F3 debug overlay)."),
     intSetting("overlayToggleKey", "Toggle key (virtual-key code)", 114,
                lo = 0, hi = 255, category = "Overlay",
-               description = "114 is VK_F3, which is the Minecraft key and " &
-                             "the shipped default. 0 disables the toggle."),
+               description = "aowlspt original (F3 debug overlay). 114 is VK_F3, which is the Minecraft key and the shipped default. 0 disables the toggle."),
 
     # ---- the profiler ---------------------------------------------------
     boolSetting("profiler", "Per-mod profiler", false, category = "Profiler",
-                description = "Time every mod's per-frame work and every host " &
-                              "rider on the shared Update hook. OFF costs one " &
-                              "load and a predicted branch per mod per tick. " &
-                              "Add 'prof1'..'prof8' to the overlay lines to " &
-                              "see the result in game."),
+                description = "aowlspt original (per-mod profiler; aowlspt's answer to ModProfiler). Time every mod's per-frame work and every host rider on the shared Update hook. OFF costs one load and a predicted branch per mod per tick. Add 'prof1'..'prof8' to the overlay lines to see the result in game."),
     intSetting("profilerWindowFrames", "Rolling window (frames)", 120,
                lo = 10, hi = 512, category = "Profiler",
-               description = "How many frames each reported window covers. " &
-                             "120 is about two seconds at 60 fps."),
+               description = "aowlspt original (per-mod profiler; aowlspt's answer to ModProfiler). How many frames each reported window covers. 120 is about two seconds at 60 fps."),
     floatSetting("selfTestSpinMs", "Self-test: burn N ms per tick, in THIS mod",
                  0.0, lo = 0.0, hi = 50.0, step = 0.5, category = "Profiler",
-                 description = "THE FALSIFIER, not a feature. Set it to 5 and " &
-                               "this mod should jump to the top of the " &
-                               "profile at ~5 ms per tick with every other " &
-                               "mod unchanged. If the cost lands anywhere " &
-                               "else, the attribution is wrong and the " &
-                               "profile should not be believed. Leave at 0.")]
+                 description = "aowlspt original (per-mod profiler; aowlspt's answer to ModProfiler). THE FALSIFIER, not a feature. Set it to 5 and this mod should jump to the top of the profile at ~5 ms per tick with every other mod unchanged. If the cost lands anywhere else, the attribution is wrong and the profile should not be believed. Leave at 0.")]
 
 # ---------------------------------------------------------------------------
 # Applying the settings

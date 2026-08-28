@@ -157,49 +157,47 @@ proc spatialSchema(): seq[Setting] =
   ## a control that does nothing.
   result = @[
     boolSetting("enabled", "Live position feed", false, category = "Feed",
-                description = "Read positions on the Unity thread. OFF means " &
-                              "this mod touches no game memory at all"),
+                description = "Specified from the pre-1.0 BepInEx map/radar mods (no upstream code carried; map art and calibration provenance in mods/maps/data/maps/README.md). Read positions on the Unity thread. OFF means this mod touches no game memory at all"),
     intSetting("hz", "Feed rate (Hz)", 10, lo = 1, hi = 30, category = "Feed",
-               description = "How often the snapshot is published to the map page"),
+               description = "Specified from the pre-1.0 BepInEx map/radar mods (no upstream code carried; map art and calibration provenance in mods/maps/data/maps/README.md). How often the snapshot is published to the map page"),
     floatSetting("radiusM", "Radar radius (m)", 120.0, lo = 10.0, hi = 1000.0,
                  step = 5.0, category = "Feed",
-                 description = "Anything further away than this is not drawn"),
+                 description = "Specified from the pre-1.0 BepInEx map/radar mods (no upstream code carried; map art and calibration provenance in mods/maps/data/maps/README.md). Anything further away than this is not drawn"),
 
     boolSetting("hudRadar", "In-game radar", true, category = "HUD",
-                description = "Draw the radar over the game, via the shared region"),
+                description = "Specified from the pre-1.0 BepInEx map/radar mods (no upstream code carried; map art and calibration provenance in mods/maps/data/maps/README.md). Draw the radar over the game, via the shared region"),
     boolSetting("hudIndicators", "Direction indicators", false, category = "HUD",
-                description = "A bearing mark per contact on a ring around screen centre"),
+                description = "Specified from the pre-1.0 BepInEx map/radar mods (no upstream code carried; map art and calibration provenance in mods/maps/data/maps/README.md). A bearing mark per contact on a ring around screen centre"),
     floatSetting("radarSize", "Radar size (px)", 220.0, lo = 64.0, hi = 640.0,
-                 step = 8.0, category = "HUD"),
+                 step = 8.0, category = "HUD",
+      description = "Specified from the pre-1.0 BepInEx map/radar mods (no upstream code carried; map art and calibration provenance in mods/maps/data/maps/README.md)."),
     floatSetting("radarX", "Radar X (px)", 24.0, lo = 0.0, hi = 4096.0,
-                 step = 4.0, category = "HUD"),
+                 step = 4.0, category = "HUD",
+      description = "Specified from the pre-1.0 BepInEx map/radar mods (no upstream code carried; map art and calibration provenance in mods/maps/data/maps/README.md)."),
     floatSetting("radarY", "Radar Y (px)", 24.0, lo = 0.0, hi = 4096.0,
-                 step = 4.0, category = "HUD"),
-    boolSetting("showBots", "Show bots", true, category = "HUD"),
-    boolSetting("showPlayers", "Show players", true, category = "HUD"),
+                 step = 4.0, category = "HUD",
+      description = "Specified from the pre-1.0 BepInEx map/radar mods (no upstream code carried; map art and calibration provenance in mods/maps/data/maps/README.md)."),
+    boolSetting("showBots", "Show bots", true, category = "HUD",
+      description = "Specified from the pre-1.0 BepInEx map/radar mods (no upstream code carried; map art and calibration provenance in mods/maps/data/maps/README.md)."),
+    boolSetting("showPlayers", "Show players", true, category = "HUD",
+      description = "Specified from the pre-1.0 BepInEx map/radar mods (no upstream code carried; map art and calibration provenance in mods/maps/data/maps/README.md)."),
     intSetting("hudBudgetUs", "HUD draw budget (us)", 400, lo = 50, hi = 5000,
                category = "HUD",
-               description = "The shared region throttles this participant if " &
-                             "it overruns for 8 frames running"),
+               description = "Specified from the pre-1.0 BepInEx map/radar mods (no upstream code carried; map art and calibration provenance in mods/maps/data/maps/README.md). The shared region throttles this participant if it overruns for 8 frames running"),
 
     intSetting("screenW", "Screen width (px)", 1920, lo = 640, hi = 7680,
                category = "HUD",
-               description = "Only needed because the shared region does not " &
-                             "yet expose the back-buffer size to a mod"),
+               description = "Specified from the pre-1.0 BepInEx map/radar mods (no upstream code carried; map art and calibration provenance in mods/maps/data/maps/README.md). Only needed because the shared region does not yet expose the back-buffer size to a mod"),
     intSetting("screenH", "Screen height (px)", 1080, lo = 480, hi = 4320,
                category = "HUD",
-               description = "Only needed because the shared region does not " &
-                             "yet expose the back-buffer size to a mod"),
+               description = "Specified from the pre-1.0 BepInEx map/radar mods (no upstream code carried; map art and calibration provenance in mods/maps/data/maps/README.md). Only needed because the shared region does not yet expose the back-buffer size to a mod"),
 
     boolSetting("heading", "Rotate radar to facing", false, category = "HUD",
                 implemented = false,
-                description = "Read; sp/world.nim measures no heading yet, so " &
-                              "the radar is north-up and says so rather than " &
-                              "rotating by a guessed zero"),
+                description = "Specified from the pre-1.0 BepInEx map/radar mods (no upstream code carried; map art and calibration provenance in mods/maps/data/maps/README.md). Read; sp/world.nim measures no heading yet, so the radar is north-up and says so rather than rotating by a guessed zero"),
     boolSetting("markers", "Loot / extract / corpse / quest markers", false,
                 category = "HUD", implemented = false,
-                description = "Not collected: no field offset for any of those " &
-                              "lists has been measured on this build"),
+                description = "Specified from the pre-1.0 BepInEx map/radar mods (no upstream code carried; map art and calibration provenance in mods/maps/data/maps/README.md). Not collected: no field offset for any of those lists has been measured on this build"),
   ]
 
 proc onSpatialSettings(url, body, session: string): string =
