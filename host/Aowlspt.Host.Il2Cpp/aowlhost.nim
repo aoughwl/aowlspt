@@ -122,10 +122,94 @@ import invoke
 ## because the layer follows the same startup-snapshot discipline, and it
 ## needs `aowlspt_shim.h` (guard + VirtualQuery), which is already above.
 ##
-## Nothing here runs unless `il2cppGates` is set. It ships DEFAULT OFF and
-## no mod resolves by name through it yet.
+## Nothing here runs unless `il2cppGates` is set. It ships DEFAULT OFF.
 {.emit: """#include "aowlspt_il2cpp_gates.h" """.}
 {.emit: """#include "aowlspt_il2cpp_gatetest.h" """.}
+
+## THE ONE SYMBOL MOD DLLs MAY USE TO REACH THE GATE LAYER.
+##
+## Every function in `aowlspt_il2cpp_gates.h` is `static` -- internal linkage,
+## this translation unit only -- so a mod DLL could not reach any of it, and
+## `mods/sain`'s `findClass` still called `il2cpp_class_from_name` with NO
+## token. That call does not fail: it returns MT19937-64 output, and the first
+## dereference kills the client.
+##
+## `{.exportc.}` alone would NOT fix this. It gives the generated C function an
+## unmangled name; it does NOT put it in the PE export table (no .def file in
+## this build), so `GetProcAddress` returns NULL and the mod logs "host too
+## old" against a host that has the code. That measured defect silently
+## disabled four mods once already -- hence the explicit `__declspec(dllexport)`
+## thunk below, and the `exports` assertion in `tools/deploy.json`.
+##
+## WHAT IS DELIBERATELY *NOT* EXPORTED, and must never be:
+##   * `aowl_gate_token` / `il2cpp_nonce` -- arming a nonce TLS slot without
+##     consuming it in the same breath leaves a loaded gun on the thread. The
+##     slot being zero is the ONLY reason SAIN's ~20 stock-signature by-name
+##     calls have returned garbage rather than faulting inside the gate's own
+##     memcmp at GameAssembly+0x6206E0. Killed the client three times.
+##   * `aowl_gate_can_arm` -- a survey verb whose result reads like permission.
+## `aowl_gate_call` arms and consumes atomically, so a caller never sees a slot.
+##
+## AND WHAT A WORKING GATE STILL DOES NOT BUY YOU: resolution by name becomes
+## POSSIBLE, not SAFE. 28.3% of by-name lookups land on a SHARED RVA (property
+## accessors funnel through `0x692A50` get_* / `0x692A60` set_*): CALLING one is
+## fine, DETOURING one fires for hundreds of unrelated properties. And this
+## build has a universal empty-body stub at `0x628110` shared by 6,438 methods,
+## so a resolved, signature-checked address can still be a no-op that passes
+## every check you wrote.
+##
+## Contract (all out-params optional, each VirtualQuery-checked before write):
+##   int aowl_host_gate_call(const char* name, void** argv, int argc,
+##                           void** out_ret, int* out_why,
+##                           const char** out_whytext, int* out_outstanding)
+## Returns 1 ONLY when the gate was satisfied AND the call completed. A non-zero
+## `*out_ret` proves nothing on its own -- the trap never returns NULL -- so a
+## caller must branch on the return value, never on the payload. With the
+## `il2cppGates` flag off (the default) it refuses cleanly with
+## `*out_why == AOWL_GATE_DISABLED`; a caller must then take its own refusal
+## path and NEVER fall back to an un-tokened call.
+##
+## No `aowl_p_p_seh` is taken here: `aowl_gate_call` takes exactly one, and that
+## guard is NOT re-entrant -- a guard around this thunk would DISARM it.
+{.emit: """
+__declspec(dllexport) int aowl_host_gate_call(
+        const char* name, void** argv, int argc,
+        void** out_ret, int* out_why, const char** out_whytext,
+        int* out_outstanding) {
+    aowl_gate_call_t c;
+    int ok = 0, i;
+    int why = AOWL_GATE_UNKNOWN;
+    memset(&c, 0, sizeof(c));
+    /* rule 2: VirtualQuery every pointer that crossed the module boundary,
+     * including the ones we only WRITE. A mod passing a stack address that has
+     * already unwound would otherwise be a blind write (rule 8). */
+    if (out_why         && !aowl_is_readable((void*)out_why, sizeof(int)))    return 0;
+    if (out_ret         && !aowl_is_readable((void*)out_ret, sizeof(void*)))  return 0;
+    if (out_whytext     && !aowl_is_readable((void*)out_whytext, sizeof(void*))) return 0;
+    if (out_outstanding && !aowl_is_readable((void*)out_outstanding, sizeof(int))) return 0;
+    if (!name || !aowl_is_readable((void*)name, 1)) why = AOWL_GATE_BAD_ARG;
+    else if (argc < 0 || argc > 3)                  why = AOWL_GATE_ARITY;
+    else if (argc > 0 && (!argv || !aowl_is_readable((void*)argv, (int)(sizeof(void*) * (size_t)argc))))
+                                                    why = AOWL_GATE_BAD_ARG;
+    else {
+        /* rule 4: bounded -- argc is already capped at 3 above. */
+        for (i = 0; i < argc; i++) {
+            if (argv[i] && !aowl_is_readable(argv[i], 1)) { why = AOWL_GATE_BAD_ARG; break; }
+        }
+        if (why != AOWL_GATE_BAD_ARG) {
+            ok  = aowl_gate_call(name, argv, argc, &c);
+            why = c.why;
+        }
+    }
+    if (out_ret)         *out_ret         = ok ? c.ret : (void*)0;
+    if (out_why)         *out_why         = why;
+    if (out_whytext)     *out_whytext     = aowl_gate_why(why);
+    /* The leaked-arm counter, handed out so a consumer can assert the negative:
+     * after a completed call NOTHING may be left armed on this thread. */
+    if (out_outstanding) *out_outstanding = aowl_gate_nonce_outstanding_count();
+    return (ok && aowl_gate_call_ok(&c)) ? 1 : 0;
+}
+""".}
 ## PATCH BY VERIFIED STATIC RVA -- the address side of it, in C because it is
 ## three Win32 calls and no Nim.
 ##
