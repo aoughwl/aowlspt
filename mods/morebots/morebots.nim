@@ -1200,6 +1200,32 @@ proc simSelfTest(): Status =
        " faction(s)"
 
   # --- the client half.
+  #
+  # THE ONE PLACE `findClass` IS PERMITTED, and only because this is not the
+  # client. `census.nim`'s value-type size calibration resolves `System.Int32`
+  # and `System.Double` BY NAME, and `il2cpp_class_from_name` is token-gated on
+  # the real build: on mismatch it answers a uniform random NON-ZERO uint64, so
+  # the nil check below it cannot fire and `classInstanceSize` dereferences a
+  # random address (fact #198). The census itself no longer needs any of it --
+  # it reads fields -- so the calibration is default-OFF and opted into HERE,
+  # in `aowlspt-sim`, against a stand-in or offline-loaded runtime with no live
+  # client to kill.
+  #
+  # AND IT IS STILL NOT TURNED ON, BECAUSE IT WAS MEASURED.
+  #
+  # This line was `censusAllowReflection(true)` for exactly one run. With the
+  # gate open, `aowlspt-sim mods\morebots --side sim` against
+  # `D:\Games\Tarkov\GameAssembly.dll` printed the Win64-rule line, entered
+  # `calibrateHeader()`, and the PROCESS DIED -- exit 5, no further output, no
+  # diagnostic, the very next log line never reached. That is
+  # `findClass("System.Int32")` -> `classInstanceSize`, with no game running
+  # and no client to blame, and it is the clearest reproduction of fact #198
+  # this repo has outside the client: the nil check passes and the dereference
+  # is fatal.
+  #
+  # So the gate stays SHUT even here, `headerBytes()` stays -1, and the size
+  # guards below report INCONCLUSIVE rather than a number. An honest "I could
+  # not look" beats a self-test that has to survive a crash to pass.
   let wanted = selfTestRuntime(setting("selfTestRuntime").asText(""))
   if wanted.refusal.len > 0:
     warn "  " & wanted.refusal
@@ -1311,6 +1337,49 @@ proc simSelfTest(): Status =
   censusReport()
   let c = runCensus()
   info "  census: " & describe(c, setting("expectedBotCap").asInt(0))
+
+  # --- THE NEGATIVE CONTROL FOR THE PROLOGUE GUARD.
+  #
+  # `censusReport()` above prints "prologue verified 16/16" for
+  # `EFT.Player::get_IsAI`. On its own that line proves nothing, because a
+  # comparator that returned true unconditionally would print it too -- and a
+  # check that cannot fail IS the bug (CLAUDE.md 9b). So the SAME binder is put
+  # to the SAME known-good address with ONE BYTE of the expected prologue
+  # changed, and is required to REFUSE.
+  #
+  # The byte changed is the first, `40` -> `41`. If the guard is real the bind
+  # fails and its `why` names the mismatch; if it is theatre, this succeeds and
+  # says so. Three outcomes, not two: with no GameAssembly.dll bound the binder
+  # refuses for a DIFFERENT reason (no imagebase), and that is INCONCLUSIVE
+  # rather than a pass, so it is reported as such.
+  const GoodPro = "40 53 48 83 EC 20 80 3D AA 18 99 06 00 48 8B D9"
+  const BadPro  = "41 53 48 83 EC 20 80 3D AA 18 99 06 00 48 8B D9"
+  var noKinds: seq[FastKind] = @[]
+  if not censusLive():
+    warn "  prologue guard: INCONCLUSIVE -- no GameAssembly.dll is bound in " &
+         "this process, so neither the positive nor the negative case was " &
+         "actually executed. Set AOWLSPT_SELFTEST_RUNTIME to an absolute " &
+         "path to a GameAssembly.dll to run it. 'I could not look' is not a " &
+         "pass."
+  else:
+    let proGood = bindAtRva("negctl(good) EFT.Player::get_IsAI", 0x726890,
+                            GoodPro, noKinds, fkBool, false)
+    let proBad = bindAtRva("negctl(one byte wrong) EFT.Player::get_IsAI",
+                           0x726890, BadPro, noKinds, fkBool, false)
+    if proGood.ok and not proBad.ok:
+      success "  prologue guard: the correct 16 bytes VERIFY and a " &
+              "one-byte-wrong copy of them at the SAME address is REFUSED. " &
+              "Both branches executed, so the comparator is real."
+      info "    refusal: " & proBad.why
+    elif proBad.ok:
+      error "  prologue guard: a DELIBERATELY WRONG prologue was ACCEPTED at " &
+            "0x726890. The 'verified 16/16' line is theatre and every RVA " &
+            "call in this mod is unguarded."
+      bad = bad + 1
+    else:
+      warn "  prologue guard: INCONCLUSIVE -- the wrong prologue was refused " &
+           "but so was the CORRECT one (" & proGood.why & "), so the refusal " &
+           "is not evidence that the comparator discriminates."
 
   # --- what a hook is told about the instance it fired on.
   #

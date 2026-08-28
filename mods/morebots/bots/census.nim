@@ -49,36 +49,52 @@
 ## HOW IT REACHES THE GAME
 ## ---------------------------------------------------------------------------
 ##
-## Through `aowlspt/fast`, not through the host. A census of forty bots is forty
-## `IsAI` reads, forty spawn-type reads and forty positions -- 120 calls -- and
-## on the boxed path that is 120 microseconds of marshalling for a diagnostic.
-## Bound, it is about a microsecond. `docs/PERF.md` is the whole argument.
+## Through raw field offsets, not through the host and not through a name. A
+## census of forty bots is forty `IsAI` reads, forty spawn-type reads and forty
+## positions, and on the boxed path that would be 120 microseconds of
+## marshalling for a diagnostic. As field reads it is a few hundred nanoseconds
+## and 39 of the 120 are not calls at all. `docs/PERF.md` is the argument for
+## binding; this file went one step past it.
 ##
-## Everything except the world's static `get_Instance` is bound **against the
-## object it is reached on**, because a bound call is non-virtual by
-## construction and this chain is nothing but subclasses and generics: SPT's
-## raid world is a `GameWorld` subclass, the alive-player list is a
-## `List<IPlayer>` that `findClass` cannot name at all, and bots and the local
-## player are different `Player` subclasses.
+## THE PARAGRAPHS THAT USED TO BE HERE WERE THE BUG, so what they said is kept.
+## They said everything except the world's static `get_Instance` is bound
+## **against the object it is reached on**, because the chain is nothing but
+## subclasses and generics that `findClass` cannot name. The reasoning was
+## sound and the mechanism was fatal: binding against an object is
+## `il2cpp_object_get_class` -> `il2cpp_class_get_name`, and on this build the
+## first validates nothing (`mov rax,[rcx]; ret`) while the second is
+## TOKEN-GATED and answers a uniform random NON-ZERO uint64 on mismatch. Every
+## nil check passes; the first dereference is 0xC0000005. That is fact #198 and
+## it is how `fov.dll` killed the client 0.6s after a Woods spawn. This file ran
+## the same chain PER BOT PER SCAN.
 ##
-## Two things are **asserted** rather than inferred, and both are guarded by
-## asking the runtime first:
+## It also could not have worked: `EFT.GameWorld::get_Instance` does not exist
+## on this build, so the one binding made before the raid always refused and
+## `runCensus` returned at its first guard every time.
 ##
-##  * `get_Position` returns a `UnityEngine.Vector3`, which `bindMethod`
-##    correctly refuses -- 12 bytes is not a register class. Win64 returns it
-##    through a hidden pointer the caller supplies, so the compiled function is
-##    `void* get_Position(void* sret, void* this, MethodInfo*)` and `bindRaw`
-##    says so. `shapedRetOk` confirms from the runtime that the return type
-##    really is a value type of a non-register size before that shape is
-##    claimed, and refuses otherwise. This is `mods/sain`'s `tryShaped`
-##    discipline, and the guard is the whole of it.
-##  * `WildSpawnType` is an enum, and `classifyType` refuses every enum because
-##    the C API does not say which integer width backs it. `enumRetOk` asks
-##    whether the type is a value type whose payload is exactly four bytes, and
-##    only then is `fkI32` asserted.
+## Both are gone. The world comes from the host's `RegisterPlayer` cache
+## (`aowl_host_gameworld`), and everything reached from it is a validated field
+## read at an offset derived with `tools/fldoff.py` and cross-checked against
+## the compiled accessor's own bytes. The two things this file used to ASSERT
+## by asking the runtime are now ANSWERED OFFLINE, which is strictly better
+## than a guarded assertion:
+##
+##  * The position was a hidden-return-pointer call to `get_Position` whose
+##    shape was confirmed at runtime. It is now three `float32` reads from
+##    `EFT.MovementContext.PreviousPosition` @+0x370 -- a `Vector3` already
+##    sitting in a field does not need to be returned at all.
+##  * `WildSpawnType`'s integer width was asked of the runtime because the C API
+##    does not state it. Metadata states it: `EFT.ProfileSettings` places `Role`
+##    at +0x10 and `BotDifficulty` at +0x14, so the field IS four bytes. Nothing
+##    is asserted.
+##
+## ONE call survives, because it is not a field: `EFT.Player::get_IsAI`, at the
+## byte-verified static RVA 0x726890. Its body proves `AIData == null` means
+## not-AI but makes an interface call when it is non-null, so substituting the
+## null test for the call would have been a plausible wrong answer.
 ##
 ## Every refusal keeps the census running on what it could read. A bot whose
-## spawn type will not bind is counted as a bot with an unknown type, not
+## spawn type will not read is counted as a bot with an unknown type, not
 ## dropped and not invented.
 ##
 ## **Nothing in this file has ever run against BSG's game.** Every `EFT.` name
@@ -151,57 +167,444 @@ proc openCensusAt*(path: string; domainName: string): bool =
   result = true
 
 # ---------------------------------------------------------------------------
-# Binding against the object, once
+# Reaching the world WITHOUT asking the runtime a question by name
 # ---------------------------------------------------------------------------
 #
-# `bindOnObject` needs an object, so it cannot happen before the raid -- which
-# puts the attempt on the scan path. That is fine exactly once and ruinous every
-# scan: it walks a whole base chain, measured in microseconds. A *refused*
-# binding retried per bot per scan is the worst case, because it never succeeds
-# and never stops costing.
+# WHAT USED TO BE HERE, AND WHY IT IS GONE.
 #
-# So an attempt is keyed on the class it was made against: one
-# `il2cpp_object_get_class` and one pointer compare afterwards, whether the bind
-# succeeded or not. A different class -- a scav where the last one was a PMC --
-# is a new question and is asked again. That is `mods/sain`'s `LazyCall` rule.
+# This block used to be `ObjBind` / `changedClass` / `ensureCall`: bind a
+# member against the CLASS OF A LIVE OBJECT, cache the attempt per class, and
+# re-ask when a scav turned up where the last one was a PMC. It read as the
+# careful option, and on this build it is the one that kills the process.
+#
+# MEASURED (fact #198, `docs/IL2CPP_EXPORTS.md`). `bindOnObject` is
+# `il2cpp_object_get_class` -> `il2cpp_class_get_name` -> `readCString`.
+# `il2cpp_object_get_class` is literally `mov rax,[rcx]; ret` -- it validates
+# nothing, so a bad receiver yields a plausible NON-NIL number rather than a
+# nil. `il2cpp_class_get_name` is one of the 38 TOKEN-GATED exports: it takes
+# a trailing 32-byte token this code has never passed, `memcmp`s it, and on
+# mismatch tail-calls a trap that seeds a per-thread MT19937-64 and returns a
+# **uniform random non-zero uint64**. Every nil check on that chain therefore
+# PASSES, and the first dereference is 0xC0000005. That is exactly how
+# `fov.dll` killed the client 0.6s after a Woods spawn.
+#
+# `census.nim` ran the same chain **per bot per scan**, walking a whole base
+# chain with `fullName` on every hop. It was the widest instance of the bug in
+# the tree.
+#
+# WHAT REPLACES IT: raw static field offsets, and ONE byte-verified static
+# RVA. A field read cannot be gated -- there is no export in the path at all.
+# Every offset below was derived with `tools/fldoff.py` against the installed
+# `GameAssembly.dll` and then CROSS-CHECKED against the compiled accessor's
+# own bytes, which is the standard `mods/fov` set:
+#
+#   EFT.GameWorld     +0x1C8  AllAlivePlayersList : List<Player>
+#                     +0x230  MainPlayer          : Player
+#     (no accessor exists for either -- they are plain public fields, and
+#      `EFT.GameWorld::get_Instance` DOES NOT EXIST on this build at all,
+#      which is why the world comes from the host export below and not from a
+#      static getter. The old `bindMethod(rt,"EFT.GameWorld","get_Instance")`
+#      could only ever refuse, so `runCensus` returned at its first `if` on
+#      every call and this whole file has never produced a number.)
+#
+#   System.Collections.Generic.List<T>
+#                     +0x10   _items -> T[]   +0x18  _size : int32
+#     T[] elements start at +0x20.
+#     NOT from `fldoff.py`: a generic type DEFINITION has no laid-out field
+#     offsets and the tool honestly prints 0x0 for all of them, which is the
+#     single most dangerous number this file could have used. The layout used
+#     here is the one `abi/aowlspt_botdiag.h` already reads in the shipped
+#     host, against this same `GameWorld+0x1C8` list. It is stated as a
+#     BORROWED constant, not a derived one, and the bounds check below is what
+#     makes a wrong one a refusal instead of a fault.
+#
+#   EFT.Player        +0x60   <MovementContext>k__BackingField
+#                       cross-check: Player::get_MovementContext @0x690D20 is
+#                       `48 8B 41 60 C3` = mov rax,[rcx+0x60]; ret
+#                     +0x9C0  <Profile>k__BackingField
+#                       cross-check: Player::get_Profile @0x726390 is
+#                       `48 8B 81 C0 09 00 00 C3` = mov rax,[rcx+0x9C0]; ret
+#   EFT.MovementContext
+#                     +0x370  PreviousPosition : Vector3 (3 x float32)
+#   EFT.Profile       +0x48   Info : ProfileInfo   (a plain public field)
+#   EFT.ProfileInfo   +0x78   <Settings>k__BackingField
+#                       cross-check: ProfileInfo::get_Settings @0x690E60 is
+#                       `48 8B 41 78 C3` = mov rax,[rcx+0x78]; ret
+#   EFT.ProfileSettings
+#                     +0x10   Role : WildSpawnType
+#                       The enum-width question the old `enumRetOk` asked the
+#                       runtime is ANSWERED offline instead: metadata reports
+#                       `Role` at +0x10 and `BotDifficulty` at +0x14, so the
+#                       field is exactly four bytes wide. Nothing is asserted.
+#
+# The ONE thing that stays a call is `EFT.Player::get_IsAI` @0x726890, because
+# it is not a field. Its compiled body, read with `il2cpp_resolve.py bytes`, is
+#
+#     cmp qword [rbx+0xA00], 0     ; <AIData>k__BackingField
+#     jne  .have
+#     xor  al, al                  ; -> false
+#     ret
+#   .have:
+#     mov  r8,[rbx+0xA00] ; mov ecx,3 ; jmp <interface dispatch>
+#
+# so `AIData == null` PROVES not-AI, but a non-null `AIData` does NOT prove
+# AI -- there is an interface call after it. Substituting `AIData != null` for
+# the call would have been a plausible wrong answer, so it was not done. The
+# RVA is `('unique', 1)` per `Resolver.sharedness`, and `EFT.Player` is the
+# most derived declarer of `get_IsAI` reachable from a `List<Player>` element
+# (15 types declare that name; none of them is a subclass of `EFT.Player`), so
+# a non-virtual call at this address is what a virtual dispatch would reach.
 
-type
-  ObjBind* = object
-    b*: Binding
-    cls: Il2CppClass
-    tried*: bool
-    why*: string
+{.emit: """
+#include <stdint.h>
+#include <string.h>
+#include <windows.h>
 
-proc noObjBind*(): ObjBind =
-  ObjBind(b: Binding(ok: false, why: "", target: "", fn: nullPtr(),
-                     info: nullPtr(), argc: 0'i32, slots: 0'i32, mask: 0'u32,
-                     ret: fkNone, isStatic: false, bindNs: 0'i64),
-          cls: cast[Il2CppClass](0), tried: false, why: "not attempted")
+/* THE WHOLE OF THIS FILE'S MEMORY SAFETY. Same body as `aowl_is_readable` in
+ * abi/aowlspt_shim.h, restated locally because that header is not in this
+ * mod's translation unit. Committed, not a guard page, carrying a readable
+ * protection, and the WHOLE range inside ONE region. */
+static int32_t mb_is_readable(void* p, int32_t size) {
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!p || size <= 0) return 0;
+    if (VirtualQuery(p, &mbi, sizeof(mbi)) == 0) return 0;
+    if (mbi.State != MEM_COMMIT) return 0;
+    if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return 0;
+    if (!(mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                         PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                         PAGE_EXECUTE_WRITECOPY))) return 0;
+    {   uintptr_t start = (uintptr_t)mbi.BaseAddress;
+        uintptr_t end   = start + (uintptr_t)mbi.RegionSize;
+        uintptr_t need  = (uintptr_t)p + (uintptr_t)size;
+        if (need < (uintptr_t)p) return 0;   /* overflow */
+        return need <= end ? 1 : 0;
+    }
+}
 
-proc changedClass(o: var ObjBind; obj: Il2CppPtr): bool =
-  ## True when this member has not yet been asked about the class `obj` is.
-  let c = objectClass(gRt, obj)
-  if c == nil:
-    return false
-  if o.tried and o.cls == c:
-    return false
-  o.cls = c
-  result = true
+/* None of these four is ever reached without `mb_is_readable` having said yes
+ * for the exact span they touch -- see `mbField` / `mbI32` / `mbF32`. */
+static void* mb_read_ptr(void* p, int32_t off) {
+    void* v = 0; if (!p) return 0;
+    memcpy(&v, (const char*)p + off, sizeof(void*)); return v;
+}
+static int32_t mb_read_i32(void* p, int32_t off) {
+    int32_t v = 0; if (!p) return 0;
+    memcpy(&v, (const char*)p + off, 4); return v;
+}
+static float mb_read_f32(void* p, int32_t off) {
+    float v = 0.0f; if (!p) return 0.0f;
+    memcpy(&v, (const char*)p + off, 4); return v;
+}
+static uint8_t mb_byte_at(void* p, uint64_t i) { return ((const uint8_t*)p)[i]; }
+static void*   mb_ptr_add(void* p, int64_t d) { return (void*)((char*)p + d); }
 
-proc ensureCall(o: var ObjBind; obj: Il2CppPtr; member: string;
-                kinds: openArray[FastKind]; ret: FastKind): bool =
-  if obj == nil or not gLive:
-    return false
-  if changedClass(o, obj):
-    o.tried = true
-    o.b = bindOnObject(gRt, obj, member, kinds, ret)
-    o.why = o.b.why
-  result = o.b.ok
+/* Calling a raw address needs C: nimony refuses `cast[proc(...)](pointer)`.
+ * The int32 form is a REAL int32 thunk rather than the low half of a pointer
+ * return -- an int32 return leaves the upper 32 bits of RAX undefined, so a
+ * pointer-shaped read of it is a plausible non-zero answer for a function
+ * that returned 0, which is a check that cannot fail. */
+static void*   mb_call_p_v  (void* f) { return ((void*  (*)(void))f)(); }
+static int32_t mb_call_i32_v(void* f) { return ((int32_t(*)(void))f)(); }
+""".}
 
-proc noKinds(): seq[FastKind] =
-  ## An empty argument list for `bindOnObject`. A bare `[]` literal has no type
-  ## for nimony to infer at that call site, so the empty seq is named once.
-  result = @[]
+proc mbIsReadable(p: Il2CppPtr; size: int32): int32 {.
+  importc: "mb_is_readable", nodecl.}
+proc mbReadPtr(p: Il2CppPtr; off: int32): Il2CppPtr {.
+  importc: "mb_read_ptr", nodecl.}
+proc mbReadI32(p: Il2CppPtr; off: int32): int32 {.
+  importc: "mb_read_i32", nodecl.}
+proc mbReadF32(p: Il2CppPtr; off: int32): float32 {.
+  importc: "mb_read_f32", nodecl.}
+proc mbByteAt(p: Il2CppPtr; i: uint64): uint8 {.importc: "mb_byte_at", nodecl.}
+proc mbPtrAdd(p: Il2CppPtr; d: int64): Il2CppPtr {.
+  importc: "mb_ptr_add", nodecl.}
+proc mbCallPV(f: Il2CppPtr): Il2CppPtr {.importc: "mb_call_p_v", nodecl.}
+proc mbCallI32V(f: Il2CppPtr): int32 {.importc: "mb_call_i32_v", nodecl.}
+
+proc mbGetModuleHandleA(name: cstring): Il2CppPtr {.
+  stdcall, dynlib: "kernel32", importc: "GetModuleHandleA", sideEffect.}
+proc mbGetProcAddress(m: Il2CppPtr; name: cstring): Il2CppPtr {.
+  stdcall, dynlib: "kernel32", importc: "GetProcAddress", sideEffect.}
+
+proc mbReadable(p: Il2CppPtr; size: int): bool =
+  result = p != nil and mbIsReadable(p, int32(size)) != 0'i32
+
+proc mbField(obj: Il2CppPtr; off: int): Il2CppPtr =
+  ## One hop along a reference-field chain, with the hop validated.
+  ##
+  ## Every hop is checked, not just the first: `a->b->c` is three checks. The
+  ## object must be readable for `off+8` bytes before the load, and the result
+  ## must itself be readable before anyone treats it as an object. Returns nil
+  ## -- which every caller already handles -- rather than faulting.
+  result = cast[Il2CppPtr](0)
+  if obj == nil:
+    return
+  if not mbReadable(obj, off + 8):
+    return
+  let p = mbReadPtr(obj, int32(off))
+  if p == nil:
+    return
+  if not mbReadable(p, 16):
+    return
+  result = p
+
+proc mbI32(obj: Il2CppPtr; off: int; ok: var bool): int32 =
+  ## A four-byte read, with the read itself reported. `0` is a legitimate
+  ## count and a legitimate `WildSpawnType`, so "could not read" MUST NOT be
+  ## expressed as zero -- that would be a third check that cannot fail.
+  ok = false
+  result = 0'i32
+  if obj == nil or not mbReadable(obj, off + 4):
+    return
+  ok = true
+  result = mbReadI32(obj, int32(off))
+
+# ---------------------------------------------------------------------------
+# The offsets, named once
+# ---------------------------------------------------------------------------
+
+const
+  OffGwAliveList  = 0x1C8   ## EFT.GameWorld.AllAlivePlayersList : List<Player>
+  OffGwMainPlayer = 0x230   ## EFT.GameWorld.MainPlayer          : Player
+  OffListItems    = 0x010   ## List<T>._items -> T[]      (borrowed, see above)
+  OffListSize     = 0x018   ## List<T>._size  : int32     (borrowed, see above)
+  OffArrElems     = 0x020   ## T[] element zero           (borrowed, see above)
+  OffPlProfile    = 0x9C0   ## EFT.Player.<Profile>k__BackingField
+  OffPlMoveCtx    = 0x060   ## EFT.Player.<MovementContext>k__BackingField
+  OffMcPrevPos    = 0x370   ## EFT.MovementContext.PreviousPosition : Vector3
+  OffProfInfo     = 0x048   ## EFT.Profile.Info : ProfileInfo
+  OffInfoSettings = 0x078   ## EFT.ProfileInfo.<Settings>k__BackingField
+  OffSetRole      = 0x010   ## EFT.ProfileSettings.Role : WildSpawnType (4 B)
+
+  RvaPlayerIsAI = 0x726890
+    ## `EFT.Player::get_IsAI()` -> bool. arity 0, INSTANCE, section `il2cpp`,
+    ## `('unique', 1)` per `Resolver.sharedness` -- no other method folds onto
+    ## this address, so even the sharedness hazard that makes 28.3% of by-name
+    ## lookups unsafe to reason about does not apply.
+  ProPlayerIsAI = "40 53 48 83 EC 20 80 3D AA 18 99 06 00 48 8B D9"
+    ## The first sixteen bytes as `il2cpp_resolve.py bytes 0x726890` read them
+    ## out of the installed `GameAssembly.dll`:
+    ##   40 53              push rbx
+    ##   48 83 EC 20        sub  rsp,0x20
+    ##   80 3D AA189906 00  cmp  byte [rip+0x69918AA],0   ; cctor-ran flag
+    ##   48 8B D9           mov  rbx,rcx
+    ## The `cmp`'s disp32 is included only to PIN THE BUILD; nothing is stolen
+    ## and nothing is detoured -- this address is only ever CALLED.
+
+  MaxPlayers = 4096
+    ## Capped iteration. A corrupt `_size` must be a refused scan, never an
+    ## unbounded loop inside a frame.
+
+var gRvaVerified = 0
+var gRvaRejected = 0
+var gFaults = 0
+
+const MaxFaults = 8
+  ## Self-disable. After this many hops came back unreadable in one session the
+  ## census stops trying: a path that faults every scan forever is an outage of
+  ## its own, and a mod that will not work is better off saying so once.
+
+proc censusFaults*(): int = gFaults
+
+proc hexDigit(v: int): char =
+  const D = "0123456789ABCDEF"
+  result = D[v and 15]
+
+proc hex2(v: int): string =
+  result = ""
+  result.add hexDigit(v shr 4)
+  result.add hexDigit(v)
+
+proc hexs(v: int): string =
+  const D = "0123456789abcdef"
+  if v == 0:
+    return "0"
+  var n = v
+  var buf = ""
+  while n > 0:
+    buf.add D[n and 15]
+    n = n shr 4
+  result = ""
+  var i = buf.len - 1
+  while i >= 0:
+    result.add buf[i]
+    dec i
+
+proc prologueMatches(p: Il2CppPtr; expect: string; got: var string): bool =
+  ## An exact 16-byte compare against the bytes `il2cpp_resolve.py` read out of
+  ## `GameAssembly.dll` ON DISK, with the LIVE bytes printed on a mismatch so
+  ## the refusal carries its own evidence.
+  ##
+  ## Compared against live memory on purpose, and that is the same considered
+  ## choice `mods/fov` documents. The startup-snapshot rule exists for DETOUR
+  ## targets, where an earlier feature's trampoline makes a perfectly correct
+  ## RVA self-reject. Nothing here detours anything -- `get_IsAI` is only ever
+  ## CALLED -- and `abi/aowlspt_prologue.h`'s table is `static`, i.e.
+  ## host-internal, so a mod that included it would get its own EMPTY table and
+  ## lazily capture whatever is in memory NOW, which is strictly worse than
+  ## comparing against the bytes on disk. A mismatch here means a stale RVA or
+  ## somebody else's hook, and declining to call is right in both cases.
+  got = ""
+  result = false
+  if p == nil:
+    got = "(null)"
+    return
+  if not mbReadable(p, 16):
+    got = "(not readable -- VirtualQuery says this is not committed memory)"
+    return
+  var i = 0
+  var ok = true
+  while i < 16:
+    let b = int(mbByteAt(p, uint64(i)))
+    var hi = 0
+    var lo = 0
+    let ch = expect[i * 3]
+    let cl = expect[i * 3 + 1]
+    if ch >= '0' and ch <= '9': hi = int(ch) - int('0')
+    else: hi = 10 + int(ch) - int('A')
+    if cl >= '0' and cl <= '9': lo = int(cl) - int('0')
+    else: lo = 10 + int(cl) - int('A')
+    if b != hi * 16 + lo:
+      ok = false
+    if i > 0:
+      got.add ' '
+    got = got & hex2(b)
+    inc i
+  result = ok
+
+proc bindAtRva*(label: string; rva: int; expect: string;
+                argKinds: openArray[FastKind]; ret: FastKind;
+                isStatic: bool): Binding =
+  ## A `Binding` built from a static RVA instead of from a NAME.
+  ##
+  ## This is the whole point of the file's rewrite: a direct call at a
+  ## byte-verified static RVA bypasses the export ABI outright and is
+  ## unaffected by any token gate. `info` -- the hidden trailing
+  ## `const MethodInfo*` -- is left NULL, which is legal for everything except
+  ## a shared generic; `get_IsAI` has no type parameters and no generic
+  ## container.
+  result = Binding(ok: false, why: "", target: label,
+                   fn: nullPtr(), info: nullPtr(),
+                   argc: 0'i32, slots: 0'i32, mask: 0'u32, ret: ret,
+                   isStatic: isStatic, bindNs: 0'i64)
+  if not gLive or gRt.handle == nil:
+    result.why = label & ": GameAssembly.dll is not bound, so there is no " &
+                 "imagebase to add an RVA to"
+    gRvaRejected = gRvaRejected + 1
+    return
+  if ret == fkNone:
+    result.why = label & ": the return shape was not stated"
+    gRvaRejected = gRvaRejected + 1
+    return
+  # Runtime address = module base + (VA - 0x180000000), and the RVA above is
+  # already VA-minus-imagebase.
+  let fn = mbPtrAdd(gRt.handle, int64(rva))
+  var got = ""
+  if not prologueMatches(fn, expect, got):
+    result.why = label & " @0x" & hexs(rva) & ": PROLOGUE MISMATCH -- " &
+                 "expected " & expect & ", found " & got & ". REFUSED; " &
+                 "nothing was called. Either this RVA is stale for the " &
+                 "installed GameAssembly.dll (a Tarkov update), or another " &
+                 "feature has already detoured it."
+    gRvaRejected = gRvaRejected + 1
+    return
+  let base = (if isStatic: 0'i32 else: 1'i32)
+  var mask = 0'u32
+  var i = 0
+  while i < argKinds.len:
+    let k = argKinds[i]
+    if k == fkNone or k == fkVoid or k == fkF64:
+      result.why = label & ": argument " & $i & " is a kind the fast path " &
+                   "does not pass"
+      gRvaRejected = gRvaRejected + 1
+      return
+    if k == fkF32:
+      mask = mask or (1'u32 shl uint32(int32(i) + base))
+    inc i
+  result.fn = fn
+  result.argc = int32(argKinds.len)
+  result.slots = int32(argKinds.len) + base
+  result.mask = mask
+  result.ok = true
+  gRvaVerified = gRvaVerified + 1
+  result.why = label & " @0x" & hexs(rva) & ": prologue verified 16/16, " &
+               (if isStatic: "static" else: "instance") & ", " &
+               $argKinds.len & " arg(s)"
+
+proc rvaVerifiedCount*(): int = gRvaVerified
+proc rvaRejectedCount*(): int = gRvaRejected
+
+# ---------------------------------------------------------------------------
+# The live GameWorld, borrowed from the host
+# ---------------------------------------------------------------------------
+#
+# `EFT.GameWorld::get_Instance` DOES NOT EXIST on this build -- measured, and
+# independently of `mods/fov`'s identical finding: `il2cpp_resolve.py type
+# 6172` lists every member of `EFT.GameWorld` and none of them is named
+# `get_Instance`. So the old `bindMethod(gRt, "EFT.GameWorld", "get_Instance")`
+# was a binding that could only ever refuse, and `runCensus`'s very first
+# guard (`not gB.world.ok`) returned on every call. This file has never once
+# counted a bot; the by-name apparatus above it was dangerous AND inert.
+#
+# The only honest source is the host's own cache, populated by its
+# `RegisterPlayer` detour and published as two exports -- the same route
+# `mods/fov` and `mods/sain` take.
+
+var gGwFn: Il2CppPtr = cast[Il2CppPtr](0)
+var gGwArmedFn: Il2CppPtr = cast[Il2CppPtr](0)
+var gGwTried = false
+
+proc gwResolve() =
+  if gGwTried:
+    return
+  gGwTried = true
+  var hostDll = "aowlspt-host-il2cpp.dll"
+  let h = mbGetModuleHandleA(toCString(hostDll))
+  if h == nil:
+    return
+  var n1 = "aowl_host_gameworld"
+  var n2 = "aowl_host_gameworld_armed"
+  gGwFn = mbGetProcAddress(h, toCString(n1))
+  gGwArmedFn = mbGetProcAddress(h, toCString(n2))
+
+proc gwState*(): int =
+  ## 0 no host export -- host too old, or this is not the client
+  ## 1 export present but NO detour armed -- INCONCLUSIVE, not "no raid"
+  ## 2 armed, cache empty -- genuinely not in a raid
+  ## 3 world live
+  ##
+  ## Three-way on purpose (CLAUDE.md 9b): "I could not look" is not "no bots".
+  ## The armed flag is read through a REAL int32 thunk, because an int32
+  ## return leaves the upper 32 bits of RAX undefined and a pointer-shaped
+  ## read of it would be a plausible non-zero answer for a function that
+  ## returned 0.
+  gwResolve()
+  if gGwFn == nil:
+    return 0
+  if gGwArmedFn != nil and mbCallI32V(gGwArmedFn) == 0'i32:
+    return 1
+  if mbCallPV(gGwFn) == nil:
+    return 2
+  result = 3
+
+proc gwStateText*(): string =
+  case gwState()
+  of 0: "no host export aowl_host_gameworld -- this host predates it, or " &
+        "this mod is not running in the client. INCONCLUSIVE."
+  of 1: "the host exports the world but NO detour is armed to populate it " &
+        "(host flag debugEsp or botDiag). INCONCLUSIVE -- not 'no raid'."
+  of 2: "armed; no GameWorld cached, which is exactly what a menu looks like"
+  else: "GameWorld LIVE, borrowed from the host's RegisterPlayer cache"
+
+proc gwWorld(): Il2CppPtr =
+  ## The live world object, or nil. Never a type handle.
+  if gwState() != 3:
+    return cast[Il2CppPtr](0)
+  let w = mbCallPV(gGwFn)
+  if not mbReadable(w, 0x238):
+    # The largest offset this file reads off a world is MainPlayer at +0x230.
+    return cast[Il2CppPtr](0)
+  result = w
 
 # ---------------------------------------------------------------------------
 # The two assertions, and the guards that earn them
@@ -229,8 +632,42 @@ proc noKinds(): seq[FastKind] =
 var gHeaderBytes = -1
   ## -1: not yet asked. -2: asked, and the answer made no sense.
 
+var gAllowReflection = false
+  ## `findClass` is `il2cpp_class_from_name`, which is TOKEN-GATED on this
+  ## build: on mismatch it answers a uniform random NON-ZERO uint64, so
+  ## `if c == nil` PASSES and `classInstanceSize(gRt, c)` dereferences a random
+  ## address (fact #198). Nothing below is on the scan path any more -- the
+  ## census is field reads now -- so the only caller left is `morebots.nim`'s
+  ## SELF-TEST, which runs out of process against a stand-in runtime where
+  ## there is no gate and no client to kill.
+  ##
+  ## Default OFF, therefore, and the self-test opts in explicitly. In the
+  ## injected client this stays off and every proc below returns its existing
+  ## "unknown" answer, which every caller already handles.
+
+proc censusAllowReflection*(v: bool) =
+  ## Only `morebots.nim`'s self-test may turn this on, and only because it is
+  ## not the client. See `gAllowReflection`.
+  gAllowReflection = v
+
+var gReflectionNoted = false
+
+proc reflectionRefused(what: string): bool =
+  result = not gAllowReflection
+  if result and not gReflectionNoted:
+    gReflectionNoted = true
+    warn "morebots: refusing to resolve '" & what & "' by NAME. " &
+         "il2cpp_class_from_name is token-gated on this build and answers a " &
+         "random non-zero value on mismatch, so the nil check below it cannot " &
+         "fire and the first dereference is 0xC0000005. The census does not " &
+         "need it -- it reads fields -- so this is a degraded self-test, not " &
+         "a degraded census."
+
 proc calibrateHeader*() =
   if gHeaderBytes != -1:
+    return
+  if reflectionRefused("System.Int32 / System.Double"):
+    gHeaderBytes = -2
     return
   let i32 = findClass(gRt, "System.Int32")
   let f64 = findClass(gRt, "System.Double")
@@ -255,9 +692,12 @@ proc headerBytes*(): int = gHeaderBytes
 
 proc payloadSize*(tn: string): int =
   ## The payload size of a value type, or 0 when the type is a reference, is
-  ## unknown, or comes back at a size this will not reason about.
+  ## unknown, is not resolvable by name on this build, or comes back at a size
+  ## this will not reason about.
   result = 0
   if tn.len == 0:
+    return
+  if reflectionRefused(tn):
     return
   calibrateHeader()
   if gHeaderBytes < 0:
@@ -271,30 +711,6 @@ proc payloadSize*(tn: string): int =
   if sz <= 0 or sz > 64:
     return
   result = sz
-
-proc shapedRetOk(m: Il2CppMethod; size: var int): bool =
-  ## Whether this method's return really is an aggregate Win64 hands back
-  ## through a hidden pointer.
-  ##
-  ## The rule is the ABI's, not this mod's: an aggregate of 1, 2, 4 or 8 bytes
-  ## comes back in a register; everything else goes to memory the caller
-  ## supplies. Nothing here is keyed off the name `Vector3` -- the runtime is
-  ## asked whether the type is a value type and how big it is, and a size that
-  ## would fit in a register refuses the shape outright.
-  size = 0
-  if m == nil:
-    return false
-  if methodIsStatic(gRt, m):
-    # The shape below puts `this` in slot 1. A static returning a struct has a
-    # different shape again and nothing here is one.
-    return false
-  let tn = typeName(gRt, methodReturnType(gRt, m))
-  # Anything wider than sixteen bytes is refused too, because that is the buffer
-  # `readPosition` provides; refusing beats writing past it.
-  if not shapedRetSizeOk(tn):
-    return false
-  size = payloadSize(tn)
-  result = true
 
 proc shapedSizeAccepted*(sz: int): bool =
   ## **The Win64 rule itself**, as a function of a size and nothing else.
@@ -323,18 +739,6 @@ proc enumSizeOk*(tn: string): bool =
   ## asserting `fkI32` for an enum is safe. Same split, same reason.
   result = payloadSize(tn) == 4
 
-proc enumRetOk(m: Il2CppMethod): bool =
-  ## Whether this method's return is a value type of exactly four bytes -- which
-  ## is what an `Int32`-backed enum is, and is the only case in which asserting
-  ## `fkI32` for it is safe.
-  ##
-  ## `classifyType` refuses every enum, and it is right to: the C API says
-  ## nothing about which integer backs one, and `long` enums exist. Asking for
-  ## the size is what turns "probably an int" into an answer.
-  if m == nil:
-    return false
-  result = enumSizeOk(typeName(gRt, methodReturnType(gRt, m)))
-
 # ---------------------------------------------------------------------------
 # The bindings
 # ---------------------------------------------------------------------------
@@ -342,162 +746,91 @@ proc enumRetOk(m: Il2CppMethod): bool =
 type
   CensusBindings = object
     ready: bool
-    world: Binding          ## EFT.GameWorld::get_Instance, static, by name
-    worldWhy: string
-    alive: ObjBind          ## on the world object
-    mainPlayer: ObjBind     ## on the world object
-    count: ObjBind          ## on the list -- a generic with no nameable class
-    item: ObjBind           ## on the list, [fkI32] -> fkPtr, stated
-    isAI: ObjBind           ## on a player
-    profile: ObjBind        ## on a player
-    info: ObjBind           ## on a profile
-    settings: ObjBind       ## on an info
-    role: ObjBind           ## on a settings -- an enum, asserted as fkI32
-    roleWhy: string
-    position: ObjBind       ## on a player -- Vector3, shaped
-    positionWhy: string
+    isAI: Binding           ## EFT.Player::get_IsAI, byte-verified static RVA
+    isAIWhy: string
 
 var gB: CensusBindings
 
 proc censusBind*() =
-  ## Bind what can be bound without an object. Everything else is bound on the
-  ## first object of its class the scan meets.
+  ## Verify the ONE address this file calls. Everything else it needs is a
+  ## field read, which has nothing to bind.
   ##
-  ## Never from `onLoad`: `findClass` walks every loaded assembly and the game's
-  ## are not among them then, so a binding made there would correctly refuse and
-  ## never be retried.
+  ## Safe to call before a raid and safe to call from `onLoad`: the old warning
+  ## on this proc ("never from `onLoad`: `findClass` walks every loaded
+  ## assembly") described the by-name apparatus that is gone. A prologue
+  ## compare is sixteen byte loads behind a `VirtualQuery`.
   if gB.ready:
     return
-  gB.alive = noObjBind()
-  gB.mainPlayer = noObjBind()
-  gB.count = noObjBind()
-  gB.item = noObjBind()
-  gB.isAI = noObjBind()
-  gB.profile = noObjBind()
-  gB.info = noObjBind()
-  gB.settings = noObjBind()
-  gB.role = noObjBind()
-  gB.position = noObjBind()
-  gB.roleWhy = "not attempted"
-  gB.positionWhy = "not attempted"
-  gB.world = bindMethod(gRt, "EFT.GameWorld", "get_Instance", 0)
-  gB.worldWhy = gB.world.why
+  var none: seq[FastKind] = @[]
+  gB.isAI = bindAtRva("EFT.Player::get_IsAI", RvaPlayerIsAI, ProPlayerIsAI,
+                      none, fkBool, false)
+  gB.isAIWhy = gB.isAI.why
   gB.ready = true
 
-proc bindRole(player: Il2CppPtr; settings: Il2CppPtr): bool =
-  ## `get_Role`, asserted as a four-byte enum after the runtime has confirmed
-  ## the size. Bound against the settings object because the settings class is
-  ## a nested type on some builds and `findClass` cannot name a nested type.
-  if settings == nil:
-    return false
-  if not changedClass(gB.role, settings):
-    return gB.role.b.ok
-  gB.role.tried = true
-  var cls = objectClass(gRt, settings)
-  var found: Il2CppMethod = cast[Il2CppMethod](0)
-  var declaring: Il2CppClass = cast[Il2CppClass](0)
-  var c = cls
-  while c != nil:
-    let m = findMethod(gRt, c, "get_Role", 0)
-    if m != nil:
-      found = m
-      declaring = c
-      break
-    c = classParent(gRt, c)
-  if found == nil:
-    gB.roleWhy = "no get_Role on " & fullName(gRt, cls) &
-                 " or any of its base classes"
-    gB.role.b.ok = false
-    gB.role.why = gB.roleWhy
-    return false
-  if not enumRetOk(found):
-    gB.roleWhy = fullName(gRt, declaring) & "::get_Role returns " &
-      typeName(gRt, methodReturnType(gRt, found)) &
-      ", which is not a four-byte value type. This will not assert an " &
-      "integer width the runtime did not confirm; spawn types are reported " &
-      "as unknown."
-    gB.role.b.ok = false
-    gB.role.why = gB.roleWhy
-    return false
-  var none = noKinds()
-  gB.role.b = bindInClass(gRt, declaring, fullName(gRt, declaring), "get_Role",
-                          none, fkI32)
-  gB.role.why = gB.role.b.why
-  gB.roleWhy = gB.role.b.why & " [enum asserted as Int32; the runtime " &
-               "confirmed a four-byte value type]"
-  result = gB.role.b.ok
-
-proc bindPosition(player: Il2CppPtr): bool =
-  ## `get_Position`, by its **native slot shape** rather than its signature.
-  ##
-  ## A `Vector3` is twelve bytes, and Win64 returns anything larger than eight
-  ## and not a power of two through a hidden pointer the caller supplies: the
-  ## compiled function is `void* get_Position(void* sret, void* this,
-  ## MethodInfo*)`. Two pointer slots, in that order, no float slot -- which is
-  ## why the mask is 0. That is the assertion, and `shapedRetOk` above is what
-  ## earns it: the runtime is asked whether the return is a value type and how
-  ## big it is, and a register-sized one refuses the shape.
-  ##
-  ## Getting a slot count wrong here would not crash; it would read an
-  ## uninitialised register as an argument and hand back a plausible position.
-  ## That is why the guard is a guard and not a comment.
-  if player == nil:
-    return false
-  if not changedClass(gB.position, player):
-    return gB.position.b.ok
-  gB.position.tried = true
-  var cls = objectClass(gRt, player)
-  var found: Il2CppMethod = cast[Il2CppMethod](0)
-  var declaring: Il2CppClass = cast[Il2CppClass](0)
-  var c = cls
-  while c != nil:
-    let m = findMethod(gRt, c, "get_Position", 0)
-    if m != nil:
-      found = m
-      declaring = c
-      break
-    c = classParent(gRt, c)
-  if found == nil:
-    gB.positionWhy = "no get_Position on " & fullName(gRt, cls) &
-                     " or any of its base classes"
-    gB.position.b.ok = false
-    gB.position.why = gB.positionWhy
-    return false
-  var size = 0
-  if not shapedRetOk(found, size):
-    gB.positionWhy = fullName(gRt, declaring) & "::get_Position returns " &
-      typeName(gRt, methodReturnType(gRt, found)) &
-      ", which the runtime does not report as a value type of a " &
-      "non-register size. The hidden-return-pointer shape is refused rather " &
-      "than assumed; distances are not reported."
-    gB.position.b.ok = false
-    gB.position.why = gB.positionWhy
-    return false
-  gB.position.b = bindRaw(gRt, declaring, fullName(gRt, declaring),
-                          "get_Position", 0, 2, 0'u32, fkPtr)
-  gB.position.why = gB.position.b.why
-  gB.positionWhy = gB.position.b.why & " [hidden return pointer + this; the " &
-                   "runtime reports the return as " & $size & " bytes]"
-  result = gB.position.b.ok
-
 proc readPosition(player: Il2CppPtr; x, y, z: var float): bool =
-  ## One shaped call. `buf` is four floats rather than three so that a value
-  ## type of up to sixteen bytes -- which `shapedRetOk` permits -- cannot write
-  ## past it. The return value is discarded because it *is* `buf`: the callee
-  ## writes through the pointer it was handed and gives the same address back.
+  ## The player's world position, as THREE RAW FLOAT READS.
+  ##
+  ## WHAT THIS REPLACES. The old version bound `get_Position` by walking the
+  ## receiver's base chain with `fullName` on every hop, then asked the runtime
+  ## whether the return was a value type of a non-register size, then made a
+  ## shaped call with a hidden return pointer. Every one of those steps went
+  ## through a token-gated export, and the base-chain walk ran PER BOT PER
+  ## SCAN. The shape reasoning was correct and completely beside the point: a
+  ## `Vector3` that is already sitting in a field does not need to be returned
+  ## at all.
+  ##
+  ## `EFT.MovementContext.PreviousPosition` @+0x370 is that field.
+  ## `BifacialTransform.position` is a delegate rather than a field, so this
+  ## cached `Vector3` is the reflection-free source -- the same one the shipped
+  ## host reads in `abi/aowlspt_botdiag.h`.
+  ##
+  ## Two validated hops, and a THIRD check on the twelve bytes themselves, so a
+  ## `MovementContext` that is readable but whose tail is not cannot be read
+  ## past.
   x = 0.0
   y = 0.0
   z = 0.0
-  if not bindPosition(player):
-    return false
-  var buf: array[4, float32] = [0.0'f32, 0.0'f32, 0.0'f32, 0.0'f32]
-  var s = shaped()
-  addSlotPtr(s, cast[Il2CppPtr](addr buf[0]))
-  addSlotPtr(s, player)
-  discard callShapedPtr(gB.position.b, s)
-  x = float(buf[0])
-  y = float(buf[1])
-  z = float(buf[2])
+  result = false
+  let mc = mbField(player, OffPlMoveCtx)
+  if mc == nil:
+    return
+  if not mbReadable(mc, OffMcPrevPos + 12):
+    return
+  x = float(mbReadF32(mc, int32(OffMcPrevPos)))
+  y = float(mbReadF32(mc, int32(OffMcPrevPos + 4)))
+  z = float(mbReadF32(mc, int32(OffMcPrevPos + 8)))
+  result = true
+
+proc readRole(player: Il2CppPtr; role: var int): bool =
+  ## Player -> Profile -> Info -> Settings -> Role, four validated hops and a
+  ## reported four-byte read.
+  ##
+  ## The old version bound `get_Profile` / `get_Info` / `get_Settings` against
+  ## the class of each object it met, then bound `get_Role` after asking the
+  ## runtime to confirm the return was a four-byte value type. The confirmation
+  ## is now offline and stronger: metadata places `Role` at +0x10 and
+  ## `BotDifficulty` at +0x14 on `EFT.ProfileSettings`, so the field IS four
+  ## bytes wide. Nothing is asserted and nothing is asked at runtime.
+  ##
+  ## `-1` is never written on failure -- `ok` carries that -- because `0` is a
+  ## real `WildSpawnType` and a failure expressed as a value is a check that
+  ## cannot fail.
+  role = 0
+  result = false
+  let prof = mbField(player, OffPlProfile)
+  if prof == nil:
+    return
+  let info = mbField(prof, OffProfInfo)
+  if info == nil:
+    return
+  let settings = mbField(info, OffInfoSettings)
+  if settings == nil:
+    return
+  var ok = false
+  let v = mbI32(settings, OffSetRole, ok)
+  if not ok:
+    return
+  role = int(v)
   result = true
 
 # ---------------------------------------------------------------------------
@@ -549,43 +882,87 @@ const VanillaRoleCeiling = 100
   ## happen post-1.0. Counting them is how that claim gets tested rather than
   ## repeated.
 
+var gWhy = "not attempted"
+
+proc censusWhy*(): string = gWhy
+  ## Why the last scan produced what it produced. THREE outcomes, not two: a
+  ## census that walked the list and found no bots, and a census that could not
+  ## reach the list at all, are different facts, and `ok == false` alone cannot
+  ## tell them apart.
+
 proc runCensus*(): Census =
   ## One pass over the world's alive players. Called at whatever interval the
   ## caller chooses; nothing here is per-frame, and nothing here writes.
+  ##
+  ## NOT ONE NAME IS RESOLVED AT RUNTIME. The whole body is validated field
+  ## reads plus, per AI candidate, one call at a prologue-verified static RVA.
+  ## There is no `il2cpp_object_get_class`, no `il2cpp_class_get_name`, no
+  ## `il2cpp_class_from_name` and no `readCString` anywhere on this path, which
+  ## is what makes it safe to run per tick.
+  ##
+  ## No managed allocation happens here either: `roleIds`/`roleCounts` grow to
+  ## at most `MaxRoles` entries and are the caller's, not the runtime's.
   result = emptyCensus()
-  if not gLive or not gB.ready or not gB.world.ok:
+  if not gLive:
+    gWhy = "GameAssembly.dll is not bound in this process"
+    return
+  if not gB.ready:
+    gWhy = "censusBind() has not run"
+    return
+  if gFaults >= MaxFaults:
+    gWhy = "SELF-DISABLED after " & $gFaults & " unreadable hops -- a path " &
+           "that faults every scan is an outage of its own"
     return
   let t0 = perfCounter()
-  var none = noKinds()
 
-  var a = noArgs()
-  let world = callPtr(gB.world, nullPtr(), a)
+  let world = gwWorld()
   if world == nil:
+    gWhy = gwStateText()
     return
 
-  if not ensureCall(gB.alive, world, "get_AllAlivePlayersList", none, fkPtr):
-    return
-  a.reset()
-  let list = callPtr(gB.alive.b, world, a)
+  let list = mbField(world, OffGwAliveList)
   if list == nil:
+    gWhy = "GameWorld+0x1C8 (AllAlivePlayersList) did not read back as a " &
+           "readable object. The world pointer was live, so this is a LAYOUT " &
+           "answer, not a 'no raid' answer."
+    gFaults = gFaults + 1
     return
 
-  # `List<T>` is a generic instantiation: it has no name `findClass` accepts,
-  # and binding on the instance is the only way to reach it at all. `get_Item`'s
-  # signature is one integer in and one reference out -- a shape the fast path
-  # covers -- so it is *stated* rather than inferred, because the inference
-  # would have to name the declaring type to classify it.
-  if not ensureCall(gB.count, list, "get_Count", none, fkI32):
+  var sizeOk = false
+  let rawN = mbI32(list, OffListSize, sizeOk)
+  if not sizeOk:
+    gWhy = "the alive-players List was readable but its _size at +0x18 was not"
+    gFaults = gFaults + 1
     return
-  a.reset()
-  let n = int(callInt32(gB.count.b, list, a))
-  if n <= 0 or n > 4096:
-    result.ok = true
-    result.scanNs = nanosBetween(t0, perfCounter())
+  let n = int(rawN)
+  if n < 0 or n > MaxPlayers:
+    gWhy = "the alive-players List reports _size = " & $n &
+           ", which is outside 0.." & $MaxPlayers &
+           ". REFUSED rather than iterated -- a corrupt count must not become " &
+           "an unbounded loop inside a frame."
+    gFaults = gFaults + 1
     return
-  var oneInt: seq[FastKind] = @[]
-  oneInt.add fkI32
-  if not ensureCall(gB.item, list, "get_Item", oneInt, fkPtr):
+
+  let items = mbField(list, OffListItems)
+  if items == nil:
+    if n == 0:
+      # An empty List legitimately holds the shared empty array, and a menu
+      # looks exactly like this. Not a fault.
+      result.ok = true
+      gWhy = "the alive-players List is empty (a menu, or a raid that has " &
+             "registered nobody yet)"
+      result.scanNs = nanosBetween(t0, perfCounter())
+      return
+    gWhy = "the alive-players List reports " & $n & " entries but its " &
+           "_items array at +0x10 did not read back"
+    gFaults = gFaults + 1
+    return
+  # The whole element span, checked ONCE and up front rather than per index:
+  # the array header is 0x20 and each element is a pointer.
+  if not mbReadable(items, OffArrElems + n * 8):
+    gWhy = "the alive-players array is not readable for all " & $n &
+           " elements; refusing to walk part of it"
+    gFaults = gFaults + 1
     return
 
   # The local player, for the distances. Its absence is not a failure: a census
@@ -594,49 +971,42 @@ proc runCensus*(): Census =
   var py = 0.0
   var pz = 0.0
   var havePlayer = false
-  if ensureCall(gB.mainPlayer, world, "get_MainPlayer", none, fkPtr):
-    a.reset()
-    let me = callPtr(gB.mainPlayer.b, world, a)
-    if me != nil:
-      havePlayer = readPosition(me, px, py, pz)
+  let me = mbField(world, OffGwMainPlayer)
+  if me != nil:
+    havePlayer = readPosition(me, px, py, pz)
 
   result.ok = true
+  gWhy = "walked " & $n & " alive players from the host's cached GameWorld " &
+         "by field offset; " &
+         (if gB.isAI.ok: "get_IsAI is bound at a verified RVA"
+          else: "get_IsAI is REFUSED (" & gB.isAIWhy & "), so no player " &
+                "can be classified as AI and every one is counted unreadable")
+  var a = noArgs()
   var i = 0
   while i < n:
-    a.reset()
-    addInt(a, int64(i))
-    let p = callPtr(gB.item.b, list, a)
+    let p = mbField(items, OffArrElems + i * 8)
     inc i
     if p == nil:
       continue
     result.total = result.total + 1
-    if not ensureCall(gB.isAI, p, "get_IsAI", none, fkBool):
+
+    # The one call. Refused bindings are handled by not calling: a census that
+    # cannot classify says so in `unreadable` rather than guessing.
+    if not gB.isAI.ok:
+      result.unreadable = result.unreadable + 1
+      continue
+    # `get_IsAI` dereferences [this+0xA00]; the receiver must cover it.
+    if not mbReadable(p, 0xA08):
+      result.unreadable = result.unreadable + 1
+      gFaults = gFaults + 1
       continue
     a.reset()
-    if not callBool(gB.isAI.b, p, a):
+    if not callBool(gB.isAI, p, a):
       continue
     result.ai = result.ai + 1
 
-    # Profile -> Info -> Settings -> Role. Every step bound against the object,
-    # because `Info` and `Settings` are nested types on some builds and a
-    # nested type is `Settings` with the outer type's namespace as far as the C
-    # API is concerned -- so no qualified name reaches them.
-    var role = -1
-    a.reset()
-    if ensureCall(gB.profile, p, "get_Profile", none, fkPtr):
-      a.reset()
-      let prof = callPtr(gB.profile.b, p, a)
-      if prof != nil and ensureCall(gB.info, prof, "get_Info", none, fkPtr):
-        a.reset()
-        let inf = callPtr(gB.info.b, prof, a)
-        if inf != nil and ensureCall(gB.settings, inf, "get_Settings", none,
-                                     fkPtr):
-          a.reset()
-          let st = callPtr(gB.settings.b, inf, a)
-          if st != nil and bindRole(p, st):
-            a.reset()
-            role = int(callInt32(gB.role.b, st, a))
-    if role < 0:
+    var role = 0
+    if not readRole(p, role):
       result.unreadable = result.unreadable + 1
     else:
       result.withRole = result.withRole + 1
@@ -655,17 +1025,11 @@ proc runCensus*(): Census =
         var d2 = dx * dx + dy * dy + dz * dz
         if d2 < 0.0:
           d2 = 0.0
-        # No `sqrt` import for one number: ten Newton steps from a sane seed
+        # No `sqrt` import for one number: twenty Newton steps from a sane seed
         # converge well past the precision a distance report needs, and pulling
         # in the maths module for this would be the tail wagging the dog.
         var d = d2
-        if d > 1.0:
-          var k = 0
-          while k < 20:
-            d = 0.5 * (d + d2 / d)
-            inc k
-        elif d2 > 0.0:
-          d = d2
+        if d2 > 0.0:
           var k = 0
           while k < 20:
             d = 0.5 * (d + d2 / d)
@@ -685,47 +1049,45 @@ proc runCensus*(): Census =
 # Reporting
 # ---------------------------------------------------------------------------
 
-proc reportOne(label: string; o: ObjBind) =
-  if o.b.ok:
-    info "morebots:   fast     " & label & " -- " & o.why
-  elif o.tried:
-    warn "morebots:   REFUSED  " & label & " -- " & o.why
-  else:
-    debug "morebots:   unused   " & label & " (no object of that class yet)"
-
 proc censusReport*() =
-  ## Every binding's own account of itself.
+  ## Everything this file depends on, and its own account of itself.
   ##
-  ## docs/PERF.md asks for exactly this: read the binding's `why` into the log
-  ## once, because "a refused binding is a mod that will quietly do nothing
+  ## docs/PERF.md asks for exactly this: read the reason into the log once,
+  ## because "a refused binding is a mod that will quietly do nothing
   ## otherwise". A census that reports zero bots and a census that could not
-  ## read the list are different facts and this is the only thing that tells
-  ## them apart.
-  info "morebots: census bindings --"
-  if gB.world.ok:
-    info "morebots:   fast     GameWorld::get_Instance -- " & gB.worldWhy
+  ## read the list are different facts and this is what tells them apart.
+  ##
+  ## There is no per-member binding table any more, because there are no
+  ## per-member bindings. What is listed instead is the ONE verified call and
+  ## the field offsets everything else is, so a Tarkov update that moves a
+  ## field shows up here as a refusal with the offset printed rather than as a
+  ## census that quietly counts nothing.
+  info "morebots: census --"
+  info "morebots:   world    " & gwStateText()
+  if gB.isAI.ok:
+    info "morebots:   RVA      " & gB.isAIWhy
   else:
-    warn "morebots:   REFUSED  GameWorld::get_Instance -- " & gB.worldWhy
-  reportOne("GameWorld::get_AllAlivePlayersList", gB.alive)
-  reportOne("GameWorld::get_MainPlayer", gB.mainPlayer)
-  reportOne("List<IPlayer>::get_Count", gB.count)
-  reportOne("List<IPlayer>::get_Item", gB.item)
-  reportOne("Player::get_IsAI", gB.isAI)
-  reportOne("Player::get_Profile", gB.profile)
-  reportOne("Profile::get_Info", gB.info)
-  reportOne("Info::get_Settings", gB.settings)
-  if gB.role.b.ok:
-    info "morebots:   asserted Settings::get_Role -- " & gB.roleWhy
-  elif gB.role.tried:
-    warn "morebots:   REFUSED  Settings::get_Role -- " & gB.roleWhy
-  else:
-    debug "morebots:   unused   Settings::get_Role (no settings object yet)"
-  if gB.position.b.ok:
-    info "morebots:   shaped   Player::get_Position -- " & gB.positionWhy
-  elif gB.position.tried:
-    warn "morebots:   REFUSED  Player::get_Position -- " & gB.positionWhy
-  else:
-    debug "morebots:   unused   Player::get_Position (no player object yet)"
+    warn "morebots:   REFUSED  " & gB.isAIWhy
+  info "morebots:   offsets  GameWorld.AllAlivePlayersList@0x" &
+       hexs(OffGwAliveList) & " MainPlayer@0x" & hexs(OffGwMainPlayer) &
+       "; List _items@0x" & hexs(OffListItems) & " _size@0x" &
+       hexs(OffListSize) & " elems@0x" & hexs(OffArrElems)
+  info "morebots:   offsets  Player.Profile@0x" & hexs(OffPlProfile) &
+       " .MovementContext@0x" & hexs(OffPlMoveCtx) &
+       "; MovementContext.PreviousPosition@0x" & hexs(OffMcPrevPos)
+  info "morebots:   offsets  Profile.Info@0x" & hexs(OffProfInfo) &
+       "; ProfileInfo.Settings@0x" & hexs(OffInfoSettings) &
+       "; ProfileSettings.Role@0x" & hexs(OffSetRole)
+  info "morebots:   verified " & $rvaVerifiedCount() & " RVA(s), rejected " &
+       $rvaRejectedCount() & "; " & $censusFaults() & " unreadable hop(s) so " &
+       "far (self-disables at " & $MaxFaults & ")"
+  info "morebots:   last     " & censusWhy()
+  info "morebots:   NO NAME IS RESOLVED AT RUNTIME on the scan path -- no " &
+       "il2cpp_object_get_class, no il2cpp_class_get_name, no " &
+       "il2cpp_class_from_name. That is deliberate: those exports are " &
+       "token-gated and answer a random NON-ZERO uint64 on mismatch, so a " &
+       "nil check passes and the first dereference kills the client (fact " &
+       "#198). A field read has no export in the path at all."
 
 proc describe*(c: Census; cap: int): string =
   ## One line, and the one line somebody actually reads.

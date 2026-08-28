@@ -1094,6 +1094,105 @@ const
   OffCamManagerOptic  = 0x10   ## CameraManager.<OpticCameraManager>k__BackingField
   OffOpticCamera      = 0x70   ## OpticCameraManager.<Camera>k__BackingField
 
+  # ---------------------------------------------------------------------
+  # The four members that used to be reached BY NAME, and are not any more.
+  # ---------------------------------------------------------------------
+  #
+  # `bindOnObject` reached `get_MainPlayer`, `get_ProceduralWeaponAnimation`,
+  # `get_IsAiming` and `get_fieldOfView` through
+  # `il2cpp_object_get_class` -> `il2cpp_class_get_name`. The second of those
+  # is TOKEN-GATED: on gate mismatch it answers a uniform random NON-ZERO
+  # uint64, `readCString`'s nil check passes, and the first dereference kills
+  # the process. MEASURED (fact #198): Application Error 1000 at 10:30:54,
+  # faulting module fov.dll, 0xC0000005 at fault offset 0x47B85, which `nm`
+  # places at +0x31 inside `readCString`. That by-name path had never
+  # executed before aadbc0b removed the world gate that was returning on
+  # frame 1 forever.
+  #
+  # Three of the four are not calls at all -- they are FIELD READS, and a
+  # field read cannot be gated. The fourth is a real Unity property with no
+  # backing field, so it is a byte-verified static RVA.
+  #
+  # Everything below is the verbatim output of
+  #   python tools/il2cpp_resolve.py <GameAssembly.dll> <metadec> fields <T>
+  #   python tools/il2cpp_resolve.py <GameAssembly.dll> <metadec> type <idx>
+  #   python tools/il2cpp_symtab.py  find-method <GameAssembly.dll> <metadec> <m>
+  # against the installed D:/Games/Tarkov/GameAssembly.dll, after
+  # `verify-fields` printed the System.String self-check
+  # (_stringLength@0x10, _firstChar@0x14) and PASSED. Nothing is guessed and
+  # nothing is remembered.
+
+  OffGameWorldMainPlayer = 0x230
+    ## `EFT.GameWorld.MainPlayer`, a PUBLIC FIELD of declared type `Player`
+    ## (attrs 0x0006). There is no `get_MainPlayer` on this build at all --
+    ## the property the old code asked for does not exist, so `bindOnObject`
+    ## was walking the WHOLE base chain to the root and taking a class name
+    ## at every hop before it could say so.
+    ##
+    ## The subclass question that motivated `bindOnObject` does not arise for
+    ## a field: IL2CPP lays base-class fields first, so a base offset is
+    ## valid on every subclass. VERIFIED rather than assumed -- `fields`
+    ## reports MainPlayer at 0x230 declared by EFT.GameWorld on
+    ## ClientLocalGameWorld, ClientNetworkGameWorld, EFT.ClientGameWorld and
+    ## HideoutGameWorld alike, which is every GameWorld the host can hand us.
+
+  OffPlayerPwa = 0x3c0
+    ## `EFT.Player.<ProceduralWeaponAnimation>k__BackingField`. Same
+    ## subclass check: `fields EFT.LocalPlayer` reports it at 0x3c0, declared
+    ## by EFT.Player.
+
+  OffPwaIsAiming = 0x16d
+    ## `EFT.Animations.ProceduralWeaponAnimation._isAiming`, a private bool.
+    ##
+    ## CROSS-CHECKED against the getter's own machine code rather than
+    ## trusted from the field table alone:
+    ## `ProceduralWeaponAnimation::get_IsAiming` is at 0xEBB130 and begins
+    ## `48 83 EC 28 80 B9 6D 01 00 00 00` -- `sub rsp,0x28;
+    ## cmp byte [rcx+0x16D],0`. The getter IS this field read. Two
+    ## independent instruments agreeing on 0x16D is what makes reading it
+    ## directly safe rather than convenient.
+
+  RvaCurrentScope = 0xebb990
+    ## `EFT.Animations.ProceduralWeaponAnimation::get_CurrentScope()`
+    ## -> SightNBone. rid unique, arity 0, INSTANCE, section `il2cpp`,
+    ## owners=1 per `il2cpp_symtab.py find-method` -- NOT a shared RVA and
+    ## not the universal empty-body stub at 0x628110.
+    ##
+    ## This one has no backing field (there is no
+    ## `<CurrentScope>k__BackingField` in the type's field table), so it is a
+    ## real computed property and has to be a call.
+  ProCurrentScope = "48 89 5C 24 08 57 48 83 EC 20 80 3D 43 F5 1F 06"
+
+  RvaIsOptic = 0xed4c30
+    ## `SightNBone::get_IsOptic()` -> bool. arity 0, INSTANCE, `il2cpp`,
+    ## owners=1.
+    ##
+    ## The old comment here claimed "CurrentScope's declared type is not the
+    ## type of the object it returns", and used that to justify binding
+    ## against the object. Metadata says otherwise: `get_CurrentScope`
+    ## RETURNS `SightNBone` and `get_IsOptic` is declared BY `SightNBone`, so
+    ## the declared type and the owner agree and there is nothing to
+    ## discover. Note the trap the name alone would have walked into --
+    ## `find-method get_IsOptic` also reports
+    ## `GPUInstancer.GPUInstancerCameraData::get_IsOptic` at 0xBBA010 with
+    ## FIFTEEN owners.
+  ProIsOptic = "48 89 5C 24 08 57 48 83 EC 20 80 3D EA 62 1E 06"
+
+  RvaCamFieldOfView = 0x525dce0
+    ## `UnityEngine.Camera::get_fieldOfView()` -> float. arity 0, INSTANCE,
+    ## `il2cpp`, owners=1, in UnityEngine.CoreModule.dll's methodPointers
+    ## table (which is why a per-module resolver matters here).
+    ##
+    ## The only one of the four that stays a call: `UnityEngine.Camera`
+    ## declares no il2cpp field for it -- the value lives native-side -- so
+    ## there is no offset to read. The float comes back in XMM0.
+    ##
+    ## Again the by-name hazard the RVA sidesteps:
+    ## `ProceduralWeaponAnimation::get_FieldOfView` and
+    ## `EFT.Hideout.HideoutCamera::get_FieldOfView` (2 owners) both answer to
+    ## a case-insensitive search for this name.
+  ProCamFieldOfView = "40 53 48 83 EC 20 48 8B 05 63 4D E7 01 48 8B D9"
+
 var gRvaVerified = 0
 var gRvaRejected = 0
 var gByNameRefusals = 0
@@ -1584,141 +1683,79 @@ proc armed(state: string): bool =
   result = state.len >= 5 and state.substr(0, 4) == "armed"
 
 # ---------------------------------------------------------------------------
-# Binding against the object, once
+# THE OBJECT-BINDING PATH IS GONE. Deleted, not disabled.
 # ---------------------------------------------------------------------------
 #
-# A bound call is **non-virtual by construction**: it jumps to a compiled body.
-# So `bindMethod(rt, "EFT.Player", "get_ProceduralWeaponAnimation", 0)` binds
-# `EFT.Player`'s body and calls it even when the object in hand is the
-# `LocalPlayer` the game actually hands over -- silently, with a plausible
-# answer. Half this chain is like that: the raid `GameWorld` is a subclass, the
-# main player is a subclass, and `CurrentScope`'s declared type is not the type
-# of the object it returns.
+# What used to be here: `ObjBind`, `noObjBind`, `statedKindsDisagree` and
+# `ensureCall` -- a cache that bound a member against the class a LIVE object
+# reports, walking its base chain, keyed on that class so the walk happened
+# once per class rather than per frame.
 #
-# `bindOnObject` binds against the class the object *is*, walking its base
-# chain, so there is no name to be wrong about. What it cannot do is happen
-# before the object exists -- which puts the attempt on the frame path, and that
-# is fine exactly once and ruinous every frame: `bindOnObject` walks a whole
-# base chain and the self-test measures it in microseconds. A *refused* binding
-# retried per frame is the worst case, because it never succeeds and never stops
-# costing.
+# The reasoning was sound and the mechanism was fatal. `bindOnObject` reaches
+# `il2cpp_object_get_class` (which is `mov rax,[rcx]; ret` and validates
+# nothing) and then `il2cpp_class_get_name`, which is one of the 38
+# TOKEN-GATED exports: called without the trailing 32-byte token it answers a
+# uniform random NON-ZERO uint64 instead of NULL. `readCString` nil-checked
+# that, passed, and dereferenced it. MEASURED: 0xC0000005, faulting module
+# fov.dll, fault offset 0x47B85 = `readCString` +0x31 (fact #198).
 #
-# So an attempt is keyed on the class it was made against. The first object of
-# that class binds; after that it is one `il2cpp_object_get_class` and one
-# pointer compare, whether the bind succeeded or not. A different class -- a
-# different `Player` subclass, a scope swap that changes the sight's type -- is
-# a new question and is asked again. That is `mods/sain`'s `LazyCall` rule,
-# for the same reason.
+# `ensureCall`'s own `if c == nil: return false` was a CHECK THAT COULD NOT
+# FIRE, which is the shape CLAUDE.md 9b names. It is not fixed here; it is
+# removed, because the thing it was guarding should not run in this client at
+# all.
+#
+# The replacement is not a safer lookup. It is NO lookup: three field reads at
+# offsets derived offline from `Il2CppMetadataRegistration.fieldOffsets`, and
+# three calls at static RVAs whose 16 prologue bytes are compared against the
+# installed DLL before anything is called. A field read cannot be gated, and a
+# direct RVA call bypasses the export ABI entirely.
+#
+# The subclass problem `bindOnObject` existed to solve does not survive the
+# change. For the two reference hops it never applied: IL2CPP lays base-class
+# fields first, so `EFT.GameWorld.MainPlayer@0x230` and
+# `EFT.Player.<ProceduralWeaponAnimation>k__BackingField@0x3c0` read correctly
+# from any subclass -- verified against ClientLocalGameWorld,
+# ClientNetworkGameWorld, EFT.ClientGameWorld, HideoutGameWorld and
+# EFT.LocalPlayer. For the three calls, none of the three methods is virtual
+# on a type with an overriding subclass, and each was checked to have
+# owners=1 (not a shared RVA, not the universal stub).
+#
+# What is LOST, and is worth stating rather than hiding: the stated-kinds
+# cross-check. `statedKindsDisagree` compared this mod's asserted register
+# classes against the runtime's own `MethodInfo`, so a future build that
+# changed `get_fieldOfView` to return a `System.Double` would have been
+# caught. That check ran through `il2cpp_method_get_return_type`, i.e.
+# through the same export surface, so it cannot be kept. The equivalent
+# guarantee now lives OFFLINE and is stronger: the prologue byte-compare in
+# `bindAtRva` fails closed the moment BSG recompiles the body, and the
+# signatures above came from metadata rather than from memory.
 
-type
-  ObjBind = object
-    b: Binding
-    cls: Il2CppClass     ## the class the attempt was made against
-    tried: bool
-    why: string
-
-proc noObjBind(): ObjBind =
-  ObjBind(b: Binding(ok: false, why: "", target: "", fn: nullPtr(),
-                     info: nullPtr(), argc: 0'i32, slots: 0'i32, mask: 0'u32,
-                     ret: fkNone, isStatic: false, bindNs: 0'i64),
-          cls: cast[Il2CppClass](0), tried: false, why: "not attempted")
-
-proc statedKindsDisagree(b: Binding; kinds: openArray[FastKind];
-                         ret: FastKind): string =
-  ## What the runtime says about a binding whose register classes this mod
-  ## **asserted**, or `""` when the two agree.
-  ##
-  ## `bindMethod` infers the signature from the runtime's own metadata and
-  ## refuses what it cannot classify. `bindOnObject` cannot: it has a class
-  ## rather than a name, and the inference path takes a name -- so every call
-  ## bound here states its kinds, and `fast.nim` says in as many words that
-  ## "the mod is asserting the register classes, and it is on the mod to be
-  ## right".
-  ##
-  ## An assertion nobody checks is a remembered signature, which is the thing
-  ## this whole file is arranged not to rely on. And the failure it produces is
-  ## the worst one available rather than a crash: a `System.Double` asserted as
-  ## `fkF32` reads the wrong half of XMM0 and answers a plausible number; a
-  ## `System.Int32` asserted as `fkBool` answers `true` for any value whose low
-  ## byte is not zero. Both arrive with `ok` true and both get acted on.
-  ##
-  ## So the assertion is checked against the method the bind actually landed
-  ## on. `Binding.info` is that `MethodInfo*`, which is the whole cost of the
-  ## check: no second lookup, and it happens once per class rather than per
-  ## call. `fkNone` from the runtime is a disagreement rather than a pass --
-  ## it means a value type wider than a register, which does not travel in the
-  ## register this mod named at all.
-  result = ""
-  if not b.ok or b.info == nil:
-    return
-  let n = methodParamCount(rt, b.info)
-  if n != kinds.len:
-    result = b.target & " declares " & $n & " parameter(s); this mod bound " &
-             "it as " & $kinds.len
-    return
-  for i in 0 ..< kinds.len:
-    let d = classifyDeclared(rt, methodParam(rt, b.info, i))
-    if d != kinds[i]:
-      result = b.target & ": parameter " & $i & " is " & describe(d) &
-               " and this mod passed " & describe(kinds[i])
-      return
-  let rk = classifyDeclared(rt, methodReturnType(rt, b.info))
-  if rk != ret:
-    result = b.target & ": returns " & describe(rk) &
-             " and this mod read " & describe(ret)
-
-proc ensureCall(o: var ObjBind; obj: Il2CppPtr; member: string;
-                kinds: openArray[FastKind]; ret: FastKind): bool =
-  ## Bind `member` against the object's own class, at most once per class, and
-  ## check the kinds this mod asserted against the method it landed on.
-  if obj == nil:
-    return false
-  let c = objectClass(rt, obj)
-  if c == nil:
-    return false
-  if (not o.tried) or o.cls != c:
-    o.cls = c
-    o.tried = true
-    o.b = bindOnObject(rt, obj, member, kinds, ret)
-    o.why = o.b.why
-    let disagreement = statedKindsDisagree(o.b, kinds, ret)
-    if disagreement.len > 0:
-      # The bind succeeded and is being thrown away, which is the point: a
-      # binding that resolves against a signature this mod does not have is
-      # the one that answers a plausible number. `get_fieldOfView` returning a
-      # `System.Double` on some future build would otherwise set the camera's
-      # field of view from the wrong half of a register.
-      o.b.ok = false
-      o.why = disagreement
-      o.b.why = disagreement
-  result = o.b.ok
 
 proc noKinds(): seq[FastKind] =
-  ## An empty argument list for `bindOnObject`. A bare `[]` literal has no type
+  ## An empty argument list for `bindAtRva`. A bare `[]` literal has no type
   ## for nimony to infer at that call site, so the empty seq is named once.
   result = @[]
 
-# The FOV chain. The two statics are bound by name -- `bindMethod` is right for
-# a static, which has no subclass to dispatch on -- and everything else is bound
-# against the object it is reached through. Declared bare and assigned from a
-# proc: a nimony `--app:lib` global initialised by a *call* is silently left
-# zeroed, and a zeroed `Binding` has `ok = false`, so it fails safe but never
-# becomes true. See fast.nim's rule 1.
+# The FOV chain, in full. EVERY entry is a byte-verified static RVA; there is
+# no by-name binding left in this mod's frame path at all. Declared bare and
+# assigned from a proc: a nimony `--app:lib` global initialised by a *call* is
+# silently left zeroed, and a zeroed `Binding` has `ok = false`, so it fails
+# safe but never becomes true. See fast.nim's rule 1.
 var bCamInstance: Binding      ## CameraManager::get_Instance, static RVA
 var bSetFov: Binding           ## CameraManager::SetFov(f,f,b), static RVA
 var bGetKey: Binding           ## Input::GetKey(KeyCode), static RVA
 var bGetKeyDown: Binding       ## Input::GetKeyDown(KeyCode), static RVA
+var bCamFov: Binding           ## UnityEngine.Camera::get_fieldOfView, static RVA
+var bCurrentScope: Binding     ## ProceduralWeaponAnimation::get_CurrentScope, static RVA
+var bIsOptic: Binding          ## SightNBone::get_IsOptic, static RVA
   ## `bWorld` is GONE. There is no `EFT.GameWorld::get_Instance` on this
   ## build (409 members, zero matches), the by-name attempt to find one was
   ## the statement that killed the client, and the world now arrives from
   ## the host export `aowl_host_gameworld` as an already-live object.
-
-var obMainPlayer: ObjBind      ## on the world object
-var obPwa: ObjBind             ## on the player object
-var obIsAiming: ObjBind        ## on the weapon animation object
-var obScope: ObjBind           ## on the weapon animation object
-var obIsOptic: ObjBind         ## on the scope object, whose class is not CurrentScope's declared type
-var obCamFov: ObjBind          ## on the UnityEngine.Camera object
+  ##
+  ## `obMainPlayer`, `obPwa`, `obIsAiming` and `obCamFov` are gone with it.
+  ## The first three are FIELD READS now (OffGameWorldMainPlayer,
+  ## OffPlayerPwa, OffPwaIsAiming) and the fourth is `bCamFov` above.
 
 var gSetFovArgc = 0
 var gOpticChainState = "not attempted"
@@ -1809,14 +1846,12 @@ proc setFovKinds3(): seq[FastKind] =
   result.add fkBool
 
 proc bindFovStatics(): bool =
-  ## The two members that have no object to bind against yet. Everything else in
-  ## the chain is bound on the first frame the object it lives on exists.
-  obMainPlayer = noObjBind()
-  obPwa = noObjBind()
-  obIsAiming = noObjBind()
-  obScope = noObjBind()
-  obIsOptic = noObjBind()
-  obCamFov = noObjBind()
+  ## EVERY member the frame path calls, bound HERE, once, at a byte-verified
+  ## static RVA. Nothing is bound per frame and nothing is bound by name.
+  ##
+  ## This proc used to reset six `ObjBind` caches that the frame path would
+  ## then fill in by asking a live object for its class. That is the path
+  ## that killed the client; see the comment block above the FOV chain.
 
   # Both are attempted before either is judged, so the report has a `why` for
   # each. An early return here left the second `Binding` zeroed, and a zeroed
@@ -1900,7 +1935,42 @@ proc bindFovStatics(): bool =
          (if bGetKey.ok: bGetKeyDown.why else: bGetKey.why)
   gZoomKeyDirty = true
 
-  bc "S3 both RVAs verified; bindFovStatics returning true"
+  # The three members that used to be bound against a live object, now bound
+  # exactly like the four above. NON-FATAL, individually, and in descending
+  # order of how much the effect loses without them:
+  #
+  #   * `get_fieldOfView` gone  -> no base FOV can be captured, so the write
+  #     is refused outright. Fatal to the effect, and said so below.
+  #   * `get_CurrentScope` / `get_IsOptic` gone -> every aim is treated as
+  #     UNMAGNIFIED. That is a REDUCED effect, not a wrong one, and it is
+  #     reported on its own line rather than folded into success.
+  bc "S3b about to prologue-verify Camera::get_fieldOfView"
+  bCamFov = bindAtRva("UnityEngine.Camera::get_fieldOfView", RvaCamFieldOfView,
+                      ProCamFieldOfView, noKinds(), fkF32, false)
+  if not bCamFov.ok:
+    gFovState = "refused: " & bCamFov.why
+    warn "FOV: " & gFovState
+    return false
+  info "FOV: " & bCamFov.why
+
+  bc "S3c about to prologue-verify get_CurrentScope / get_IsOptic"
+  bCurrentScope = bindAtRva(
+    "ProceduralWeaponAnimation::get_CurrentScope", RvaCurrentScope,
+    ProCurrentScope, noKinds(), fkPtr, false)
+  bIsOptic = bindAtRva("SightNBone::get_IsOptic", RvaIsOptic, ProIsOptic,
+                       noKinds(), fkBool, false)
+  if bCurrentScope.ok and bIsOptic.ok:
+    gOpticChainState = "armed (get_CurrentScope @0x" & hexs(RvaCurrentScope) &
+                       " -> get_IsOptic @0x" & hexs(RvaIsOptic) &
+                       ", both prologue-verified 16/16)"
+    info "FOV: " & bCurrentScope.why
+    info "FOV: " & bIsOptic.why
+  else:
+    gOpticChainState = "REFUSED -- every aim will be treated as unmagnified: " &
+                       (if bCurrentScope.ok: bIsOptic.why else: bCurrentScope.why)
+    warn "FOV: optic detection " & gOpticChainState
+
+  bc "S3 all seven RVAs verified; bindFovStatics returning true"
   gFovState = "arming: SetFov verified at 0x" & hexs(RvaSetFov3) &
               " with 3 argument(s); the CameraManager is acquired per frame " &
               "from the verified static get_Instance"
@@ -1955,11 +2025,10 @@ proc opticFieldOfView(): float =
   let cam = guardedField(container, OffOpticCamera, "OpticCameraManager.Camera")
   if cam == nil:
     return
-  var none = noKinds()
-  if not ensureCall(obCamFov, cam, "get_fieldOfView", none, fkF32):
+  if not bCamFov.ok:
     return
   a.reset()
-  result = callFloat(obCamFov.b, cam, a)
+  result = callFloat(bCamFov, cam, a)
 
 # ---------------------------------------------------------------------------
 # Effect 1: the per-frame FOV write
@@ -2091,7 +2160,6 @@ proc applyFov() =
 
   let firstPass = gFovWrites == 0'i64 and not gFovBoundSaid
   if firstPass: bc "A1 applyFov: past the rate gate"
-  var none = noKinds()
   var a = noArgs()
   # The world, from the host's cache rather than from a type probe. `gwWorld`
   # returns nil for states 0, 1 and 2 alike -- and states 0 and 1 are
@@ -2151,37 +2219,39 @@ proc applyFov() =
     if firstPass: bc "A2y world pointer not readable -- aim inert"
   else:
     if firstPass: bc "A3 world in hand and readable"
-    if firstPass: bc "A4 about to bindOnObject get_MainPlayer on the world"
-    if ensureCall(obMainPlayer, w, "get_MainPlayer", none, fkPtr):
-      a.reset()
-      if firstPass: bc "A5 get_MainPlayer bound; about to CALL it"
-      let player = callPtr(obMainPlayer.b, w, a)
-      if player != nil:
-        if firstPass: bc "A6 player in hand"
-        if ensureCall(obPwa, player, "get_ProceduralWeaponAnimation", none,
-                      fkPtr):
-          a.reset()
-          pwa = callPtr(obPwa.b, player, a)
-          if pwa != nil:
-            if firstPass: bc "A7 weapon animation in hand"
-            gAimSourceState = "live (world -> MainPlayer -> " &
-                              "ProceduralWeaponAnimation)"
-          else:
-            gAimSourceState = "NO aiming input -- ProceduralWeaponAnimation " &
-                              "was null"
-        else:
-          gAimSourceState = "NO aiming input -- " & obPwa.why
-      else:
-        gAimSourceState = "NO aiming input -- MainPlayer was null"
+    # TWO FIELD READS, NOT TWO BY-NAME CALLS. `guardedField` VirtualQueries
+    # the object for `off+8` bytes, loads, and VirtualQueries the result
+    # before anyone treats it as an object -- every hop checked, not just the
+    # first. A field read cannot reach a token-gated export, so there is no
+    # random-value failure mode on this path any more.
+    if firstPass: bc "A4 about to READ GameWorld.MainPlayer @0x230"
+    let player = guardedField(w, OffGameWorldMainPlayer, "GameWorld.MainPlayer")
+    if player == nil:
+      gAimSourceState = "NO aiming input -- GameWorld.MainPlayer @0x" &
+                        hexs(OffGameWorldMainPlayer) &
+                        " is null or unreadable (out of raid, or the world " &
+                        "is not the one this offset was measured on)"
+      if firstPass: bc "A5x MainPlayer field null -- aim inert"
     else:
-      gAimSourceState = "NO aiming input -- " & obMainPlayer.why
+      if firstPass: bc "A6 player in hand"
+      pwa = guardedField(player, OffPlayerPwa, "Player.ProceduralWeaponAnimation")
+      if pwa != nil:
+        if firstPass: bc "A7 weapon animation in hand"
+        gAimSourceState = "live (world -> MainPlayer@0x" &
+                          hexs(OffGameWorldMainPlayer) &
+                          " -> ProceduralWeaponAnimation@0x" &
+                          hexs(OffPlayerPwa) & ", both field reads)"
+      else:
+        gAimSourceState = "NO aiming input -- " &
+                          "Player.ProceduralWeaponAnimation @0x" &
+                          hexs(OffPlayerPwa) & " is null or unreadable"
   a.reset()
 
-  if firstPass: bc "B4 about to bindOnObject get_fieldOfView on the camera"
-  if not ensureCall(obCamFov, cam, "get_fieldOfView", none, fkF32):
-    gFovState = "refused: " & obCamFov.why
+  # Bound at arm time at a verified RVA, not per frame against the object.
+  if not bCamFov.ok:
+    gFovState = "refused: " & bCamFov.why
     return
-  if firstPass: bc "B5 get_fieldOfView bound"
+  if firstPass: bc "B5 get_fieldOfView available at a verified RVA"
 
   if not gFovBoundSaid:
     gFovBoundSaid = true
@@ -2196,7 +2266,7 @@ proc applyFov() =
   # does not take effect until the next one, which is stated rather than hidden.
   if gBaseFov <= 0.0:
     a.reset()
-    let seen = callFloat(obCamFov.b, cam, a)
+    let seen = callFloat(bCamFov, cam, a)
     if seen <= 0.0:
       return
     gBaseFov = seen
@@ -2204,28 +2274,37 @@ proc applyFov() =
 
   var aiming = false
   if pwa != nil:
-    if not ensureCall(obIsAiming, pwa, "get_IsAiming", none, fkBool):
-      gFovState = "refused: " & obIsAiming.why
+    # A BYTE FIELD READ, not a call. `ProceduralWeaponAnimation::get_IsAiming`
+    # @0xEBB130 begins `cmp byte [rcx+0x16D],0` -- the getter IS this read, so
+    # the two instruments agree and there is nothing left for a call to add.
+    if fovReadable(pwa, OffPwaIsAiming + 1):
+      aiming = fovByteAt(pwa, uint64(OffPwaIsAiming)) != 0'u8
+    else:
+      # Not a silent false: an unreadable object here means the pointer is
+      # not what this offset was measured against, and acting on it would be
+      # a blind write.
+      gFovState = "refused: the ProceduralWeaponAnimation is not readable " &
+                  "to +0x" & hexs(OffPwaIsAiming + 1) & ", so _isAiming " &
+                  "cannot be read"
       return
-    a.reset()
-    aiming = callBool(obIsAiming.b, pwa, a)
 
   var optic = false
   if aiming:
     # Optic detection is optional. Without it every aim is treated as
     # unmagnified, which is a *reduced* effect rather than a wrong one, so a
     # refusal here does not veto the write -- but it is recorded and reported.
-    if ensureCall(obScope, pwa, "get_CurrentScope", none, fkPtr):
+    if bCurrentScope.ok and bIsOptic.ok:
       a.reset()
-      let scope = callPtr(obScope.b, pwa, a)
-      if scope != nil:
-        # `CurrentScope`'s declared type is not the type of the object it
-        # returns, and `get_IsOptic` lives on the latter. Binding against the
-        # object is what makes that a non-question rather than a lookup this
-        # file has to spell.
-        if ensureCall(obIsOptic, scope, "get_IsOptic", none, fkBool):
-          a.reset()
-          optic = callBool(obIsOptic.b, scope, a)
+      let scope = callPtr(bCurrentScope, pwa, a)
+      # `get_CurrentScope` RETURNS SightNBone and `get_IsOptic` is declared BY
+      # SightNBone -- checked in metadata rather than assumed, which is what
+      # retires the old claim that the declared type was not the returned
+      # one. The result is still VirtualQueried before it is used as a
+      # receiver, because a call's return value is a pointer hop like any
+      # other.
+      if scope != nil and fovReadable(scope, 16):
+        a.reset()
+        optic = callBool(bIsOptic, scope, a)
 
   gLastAiming = aiming
 
@@ -3192,6 +3271,64 @@ proc checkGuards(): int =
          "on the sim " &
          "side against selfTestRuntime instead."
     return
+  # --- 1. the prologue verifier, PROVED to be able to say no ---------------
+  #
+  # This replaces the old stated-kinds check, which exercised `ensureCall`
+  # and is gone with it. That check is not merely relocated -- it could only
+  # run through `il2cpp_method_get_return_type`, i.e. through the same gated
+  # export surface that killed the client, so keeping it would have meant
+  # keeping the fatal path alive inside a self-test.
+  #
+  # What replaces it is deliberately a NEGATIVE, per CLAUDE.md 9b: not "the
+  # seven RVAs verified" (which passes trivially on any DLL the bytes were
+  # copied from, and is what `bindFovStatics` already reports), but "the
+  # verifier REFUSES a prologue that does not match". If this cannot fail,
+  # every 16/16 result printed anywhere in this mod is worthless.
+  #
+  # The wrong-prologue probe uses a REAL, verified RVA with one byte
+  # corrupted, so a pass cannot be explained by the address being bad.
+  #
+  # ORDER MATTERS HERE, and getting it wrong would reproduce exactly the
+  # defect this check exists to catch. `bindAtRva` refuses with "GameAssembly
+  # .dll is not bound, so there is no imagebase to add an RVA to" LONG before
+  # it compares a byte, so running the negative with no runtime open would
+  # see a refusal, call it a pass, and prove nothing at all. So: no runtime,
+  # no verdict.
+  if not rtOpen:
+    warn "  INCONCLUSIVE: no GameAssembly.dll is bound, so neither the " &
+         "prologue verifier nor the seven static RVAs could be exercised " &
+         "against anything. This is not a pass. Set selfTestRuntime to an " &
+         "absolute path to a GameAssembly.dll to get a real verdict."
+  else:
+    var bogus = ProCamInstance
+    # Flip the first byte: "48 83 ..." -> "49 83 ...". Same length, same shape,
+    # one byte different from the DLL.
+    bogus[1] = '9'
+    let refused = bindAtRva("CameraManager::get_Instance (DELIBERATELY WRONG " &
+                            "prologue -- this must be refused)",
+                            RvaCamInstance, bogus, noKinds(), fkPtr, true)
+    if refused.ok:
+      guardBad "bindAtRva ACCEPTED a prologue that differs from the installed " &
+               "GameAssembly.dll in its first byte. Every \"prologue-verified " &
+               "16/16\" line this mod prints is therefore unfalsifiable, and " &
+               "a stale RVA after a Tarkov update would bind silently."
+      inc result
+    else:
+      guardOk "bindAtRva refuses a one-byte-wrong prologue at a known-good " &
+              "RVA -- " & refused.why
+
+    # And the positive, which is only meaningful because the negative above
+    # passed.
+    if bindFovStatics():
+      guardOk "all seven static RVAs prologue-verified 16/16 against the " &
+              "installed GameAssembly.dll: get_Instance, SetFov, GetKey, " &
+              "GetKeyDown, get_fieldOfView, get_CurrentScope, get_IsOptic"
+    else:
+      guardBad "at least one of the seven static RVAs did not verify: " &
+               gFovState
+      inc result
+
+
   if not rtOpen:
     warn "  guards not checked: no runtime is bound, so there is nothing to " &
          "ask. Set selfTestRuntime to exercise them."
@@ -3202,7 +3339,7 @@ proc checkGuards(): int =
          "built -- measured to be a 0xC0000005, not a nil."
     return
 
-  # --- 1. the placeholder gate, which could not fail until today ------------
+  # --- 2. the placeholder gate, which could not fail until today ------------
   var why = ""
   var wide: seq[string] = @[]
   wide.add "UnityEngine.Vector3"
@@ -3231,39 +3368,15 @@ proc checkGuards(): int =
   else:
     guardOk "argsUsable accepts (System.Single, System.Boolean)"
 
-  # --- 2. the stated-kinds check on ensureCall ------------------------------
+  # --- 3. no by-name route survives in the frame path -----------------------
   #
-  # Every call in the FOV chain states its register classes, because
-  # `bindOnObject` cannot infer them. An assertion nobody checks is a
-  # remembered signature.
-  let bw = bindMethod(rt, TyGameWorld, "get_Instance", 0)
-  var w = nullPtr()
-  if bw.ok:
-    var a = noArgs()
-    w = callPtr(bw, nullPtr(), a)
-  if w == nil:
-    warn "  guard skipped: no live " & TyGameWorld & " on this runtime, so " &
-         "the stated-kinds check has nothing to disagree with"
-  else:
-    var none = noKinds()
-    var right = noObjBind()
-    if not ensureCall(right, w, "get_MainPlayer", none, fkPtr):
-      guardBad "ensureCall refused get_MainPlayer stated correctly as " &
-               "returning a reference: " & right.why
-      inc result
-    else:
-      guardOk "ensureCall accepts get_MainPlayer stated as returning a " &
-              "reference"
-    var wrong = noObjBind()
-    if ensureCall(wrong, w, "get_MainPlayer", none, fkF32):
-      guardBad "ensureCall accepted get_MainPlayer stated as returning a " &
-               "float. The address would be read out of XMM0, which holds " &
-               "whatever the last floating-point operation left there -- a " &
-               "number, not a crash."
-      inc result
-    else:
-      guardOk "ensureCall refuses get_MainPlayer stated as returning a " &
-              "float -- " & wrong.why
+  # `gByNameRefusals` counts every time `signatureOf` turned back. The frame
+  # path no longer calls it at all, so this is a statement about the REPORT
+  # path only, and it is printed rather than asserted because a non-zero
+  # count there is correct behaviour.
+  info "  by-name lookups refused so far: " & $gByNameRefusals &
+       " (the frame path makes none -- three field reads and four verified " &
+       "RVA calls)"
 
 proc simSelfTest(): Status =
   info "FOV self-test (--side sim)"
@@ -3328,23 +3441,35 @@ proc simSelfTest(): Status =
   info "    GameWorld::get_Instance -- NOT BOUND, and never will be: it " &
        "does not exist on this build (409 members, zero matches). The world " &
        "comes from the host export aowl_host_gameworld: " & gwStateText()
-  probeMember(TyGameWorld, "get_MainPlayer", 0)
-  probeMember(TyPlayer, "get_ProceduralWeaponAnimation", 0)
   reportBinding("CameraManager::get_Instance (verified static RVA)",
                 bCamInstance)
   reportBinding("CameraManager::SetFov (verified static RVA)", bSetFov)
   reportBinding("Input::GetKey (verified static RVA)", bGetKey)
   reportBinding("Input::GetKeyDown (verified static RVA)", bGetKeyDown)
-  probeMember(TyCamera, "get_Camera", 0)
-  probeMember(TyUnityCamera, "get_fieldOfView", 0)
-  # -1 when the arity check above did not settle on one, so the probe reports
-  # whatever `SetFov` actually is rather than asking about an arity of zero.
-  probeMember(TyCamera, "SetFov", (if gSetFovArgc > 0: gSetFovArgc else: -1))
-  probeMember(TyPwa, "get_IsAiming", 0)
-  probeMember(TyPwa, "get_CurrentScope", 0)
-  info "    get_IsOptic -- no name to probe: it lives on the class the scope " &
-       "object turns out to be, which is not CurrentScope's declared type. " &
-       "Bound against the object, and only in a raid."
+  reportBinding("Camera::get_fieldOfView (verified static RVA)", bCamFov)
+  reportBinding("ProceduralWeaponAnimation::get_CurrentScope (verified " &
+                "static RVA)", bCurrentScope)
+  reportBinding("SightNBone::get_IsOptic (verified static RVA)", bIsOptic)
+  info "    GameWorld.MainPlayer -- FIELD READ @0x" &
+       hexs(OffGameWorldMainPlayer) & ", no lookup"
+  info "    Player.ProceduralWeaponAnimation -- FIELD READ @0x" &
+       hexs(OffPlayerPwa) & ", no lookup"
+  info "    ProceduralWeaponAnimation._isAiming -- FIELD READ @0x" &
+       hexs(OffPwaIsAiming) & ", no lookup"
+  info "    optic detection: " & gOpticChainState
+  # The by-name probes that used to print here are GONE, and their absence is
+  # the report. `probeMember` was informational -- it asked the live runtime
+  # whether a name was declared on a type -- but every line it printed for
+  # this chain was actively misleading now that nothing is resolved by name:
+  # it reported `EFT.GameWorld::get_MainPlayer` and
+  # `UnityEngine.Camera::get_fieldOfView` as "NO NAME ... not declared on that
+  # type" while both are reached correctly, one by field read and one by
+  # verified RVA. A report that says a working path is missing is worse than
+  # no report.
+  #
+  # `probeMember` itself is kept, and is still used for the two by-name
+  # EFFECTS below that have not been ported to a verified RVA; it refuses
+  # client-side in `signatureOf` and says so.
 
   info "  the optic camera, for the sensitivity table:"
   if bindOpticCamera():
