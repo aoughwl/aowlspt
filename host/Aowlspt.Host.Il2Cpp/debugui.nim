@@ -1273,75 +1273,66 @@ proc duPx(cy, ch: float64): float32 =
 # Ctrl+F3 toggles it. Same key as the panel, plus a modifier read from the same
 # async table, so there is no second key to document or collide with.
 # ---------------------------------------------------------------------------
-var gDuDragIdx = -1
-
 proc duDragTick() =
-  ## One drag step. Runs only in edit mode, only while our window has the
-  ## foreground, and only on the panel's throttled refresh.
+  ## THE ADAPTER. Everything impure happens here and nothing else does:
+  ## sample the canvas and the pointer, hand the pure state machine in
+  ## `wgeom.nim` a plain set of numbers, and persist when it says a drop
+  ## happened. The decision, the hit test and the arithmetic are all in
+  ## `duDragStep`, which `tests/wgeom_test.nim` drives with no client.
+  ##
+  ## WHICH INPUT SOURCE, AND WHY IT IS NOT THE F12 PANEL'S.
+  ## The F12 panel reads the mouse from the overlay's hooked WndProc
+  ## (`WM_LBUTTONDOWN`/`WM_MOUSEMOVE`/`WM_INPUT` -> `g_ov.clickDown`,
+  ## `g_ov.mouseHeld`, `g_ov.mx/my`). That source is wrong here for two
+  ## measured reasons, not one:
+  ##
+  ##   1. It is gated on `g_ov.visible` -- the whole mouse block in
+  ##      `aowl_ov_wndproc` is inside `if (g_ov.visible)`. The F3 widgets are a
+  ##      separate overlay with a separate key, so with the F12 panel closed
+  ##      that source publishes NOTHING and a drag would silently never start.
+  ##   2. Every one of those cases `return 0` -- it SWALLOWS the message. That
+  ##      is correct for a modal settings panel and completely wrong for F3,
+  ##      whose banner promises the click still reaches the game. Routing the
+  ##      widget drag through it would take the left mouse button away from the
+  ##      player for as long as edit mode is on.
+  ##
+  ## So this keeps the polled source in `abi/aowlspt_widget.h`:
+  ## `GetCursorPos` + `GetAsyncKeyState(VK_LBUTTON)`, sampled exactly once per
+  ## frame in `duRegionDraw` before anything reads it. It consumes nothing, it
+  ## needs no second hook on a window another feature already subclasses, and
+  ## it is gated on our own process owning the foreground, so it cannot move a
+  ## widget while the player is alt-tabbed. Its one honest limitation is that a
+  ## raid CLIPS the cursor, so absolute positions there are pinned -- edit mode
+  ## is a menu activity and the banner does not claim otherwise.
+  # EDIT MODE OFF IS THE COMMON CASE AND MUST COST WHAT IT COST BEFORE. The
+  # early-out is here, ahead of the canvas and cursor reads, so an open panel
+  # that is not being edited does exactly the same work per frame as it did
+  # before the drag was wired up: nothing. The machine still gets to decide what
+  # a drag in progress means, so the release path is the tested one rather than
+  # a second copy written out here.
   if not gDuEdit:
-    if gDuDragIdx >= 0:
-      gDuDragIdx = -1
+    if duDragActive():
+      discard duDragStep(false, false, 0.0, 0.0, 1.0, 1.0, false, false, false)
     return
   var cw = 0.0
   var ch = 0.0
   if not duCanvasSize(cw, ch):
+    # No measured screen. Do NOT step the machine against a zero canvas; drop
+    # any drag in progress instead of snapping every widget to the origin.
+    if duDragActive():
+      duDragRelease()
     return
   var cx = 0.0
   var cy = 0.0
   let haveCursor = duCursorCanvas(cx, cy)
-
-  # RELEASE first, so a release in the same refresh as a press cannot leave a
-  # widget stuck to the cursor.
-  if cWgLmbReleased() != 0'i32:
-    if gDuDragIdx >= 0 and gDuDragIdx < gDuWidgets.len:
-      gDuWidgets[gDuDragIdx].dragging = false
-      duSnapWidget(gDuDragIdx, cw, ch)
-      duSaveWidgets()
-    gDuDragIdx = -1
-    return
-
-  # GRAB. Topmost-last wins: later widgets are drawn later, so iterating
-  # backwards picks the one visually on top when two overlap.
-  if cWgLmbPressed() != 0'i32 and gDuDragIdx < 0 and haveCursor:
-    var i = gDuWidgets.len - 1
-    while i >= 0:
-      if gDuWidgets[i].on and gDuWidgets[i].w > 0.0 and gDuWidgets[i].h > 0.0:
-        var l = 0.0
-        var t = 0.0
-        var r = 0.0
-        var b = 0.0
-        duWidgetRect(gDuWidgets[i], cw, ch, l, t, r, b)
-        if cx >= l and cx <= r and cy <= t and cy >= b:
-          var pvx = 0.0
-          var pvy = 0.0
-          duWidgetPivotPoint(gDuWidgets[i], cw, ch, pvx, pvy)
-          gDuWidgets[i].grabDx = cx - pvx
-          gDuWidgets[i].grabDy = cy - pvy
-          gDuWidgets[i].dragging = true
-          gDuDragIdx = i
-          break
-      dec i
-    return
-
-  # MOVE. `haveCursor` false (cursor left the client area mid-drag) HOLDS the
-  # widget where it is rather than teleporting it to a clamped edge.
-  if gDuDragIdx >= 0 and gDuDragIdx < gDuWidgets.len and
-     cWgLmbHeld() != 0'i32 and haveCursor:
-    var ax = 0.0
-    var ay = 1.0
-    var px = 0.0
-    var py = 1.0
-    duAnchorVec(gDuWidgets[gDuDragIdx].anchor, ax, ay, px, py)
-    gDuWidgets[gDuDragIdx].x = (cx - gDuWidgets[gDuDragIdx].grabDx) - ax * cw
-    gDuWidgets[gDuDragIdx].y = (cy - gDuWidgets[gDuDragIdx].grabDy) - ay * ch
-  elif gDuDragIdx >= 0 and cWgLmbHeld() == 0'i32:
-    # The button went up in a refresh we skipped. Treat it as a drop rather
-    # than leaving a widget welded to the cursor forever.
-    if gDuDragIdx < gDuWidgets.len:
-      gDuWidgets[gDuDragIdx].dragging = false
-      duSnapWidget(gDuDragIdx, cw, ch)
-      duSaveWidgets()
-    gDuDragIdx = -1
+  let rc = duDragStep(gDuEdit, haveCursor, cx, cy, cw, ch,
+                      cWgLmbPressed() != 0'i32,
+                      cWgLmbHeld() != 0'i32,
+                      cWgLmbReleased() != 0'i32)
+  if rc == duDragDropped:
+    # The ONLY impure consequence, and it happens at human speed -- once per
+    # drop, never per frame.
+    duSaveWidgets()
 
 # ---------------------------------------------------------------------------
 # The PROFILER widget: budget vs actual, per region participant
@@ -1879,16 +1870,25 @@ proc debugUiBodyImpl(a: Il2CppPtr): Il2CppPtr {.
               "hid F10 from the D3D overlay's wndproc cannot apply here)"
       # CTRL+F3 IS EDIT MODE, plain F3 is show/hide. Same key, one modifier read
       # from the same async table: no second key to collide with anything.
-      if cWgCtrlDown() != 0'i32:
+      #
+      # WHICH BRANCH THIS PRESS TOOK IS LOGGED EVERY TIME, and it is logged
+      # because the previous run could not answer it. The host log for that run
+      # (tools/hostlog.py) shows four F3 edges and four `panel ON`/`panel OFF`
+      # lines and NO edit-mode line at all -- which is consistent with two
+      # different causes that the log could not tell apart: Ctrl was never
+      # actually held, or Ctrl WAS held and `GetAsyncKeyState(VK_CONTROL)` read
+      # 0 at the instant the F3 edge was taken. Printing the modifier reading on
+      # every toggle turns that into a measurement instead of an argument. It is
+      # one line per physical key press, at human speed.
+      let ctrl = cWgCtrlDown() != 0'i32
+      if ctrl:
         if not gDuVisible:
           gDuVisible = true
           duLoadLayout()
           duLoadWidgets()
         gDuEdit = not gDuEdit
         if not gDuEdit:
-          gDuDragIdx = -1
-          for i in 0 ..< gDuWidgets.len:
-            gDuWidgets[i].dragging = false
+          duDragRelease()
         okLog "debugui: edit mode " & (if gDuEdit: "ON -- drag widgets with " &
               "the left mouse button; drops snap and are saved"
               else: "OFF")
@@ -1902,13 +1902,16 @@ proc debugUiBodyImpl(a: Il2CppPtr): Il2CppPtr {.
         if gDuCfg.espVk <= 0:
           gDuEspVisible = gDuCfg.espOn
         okLog "debugui: panel ON (" & $gDuWidgets.len & " widget(s); layout " &
-              "re-read from " & gDuCfg.source & " + " & gDuLayoutSource & ")"
+              "re-read from " & gDuCfg.source & " + " & gDuLayoutSource &
+              "). Ctrl was NOT down at this edge; hold Ctrl and press the " &
+              "toggle key again for edit mode."
       else:
         gDuEdit = false
-        gDuDragIdx = -1
+        duDragRelease()
         if gDuCfg.espVk <= 0:
           gDuEspVisible = false
-        okLog "debugui: panel OFF"
+        okLog "debugui: panel OFF (ctrl was NOT down at the edge -- Ctrl+F3 " &
+              "is edit mode)"
     if gDuCfg.espVk > 0 and cDuKeyEdge(int32(gDuCfg.espVk)) != 0'i32:
       gDuEspVisible = not gDuEspVisible
 

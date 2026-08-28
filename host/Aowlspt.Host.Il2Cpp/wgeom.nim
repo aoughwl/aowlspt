@@ -218,17 +218,39 @@ proc duSnapWidget(idx: int; cw, ch: float64) =
   var lockR = false
   var lockT = false
   var lockB = false
+  # TWO DIFFERENT QUESTIONS, WHICH USED TO SHARE ONE ANSWER.
+  #
+  #   lock*  -- "this EDGE decides the anchor". Only a screen edge or a flush
+  #             edge-to-edge alignment sets one, because only those mean the
+  #             widget belongs to that side of the screen.
+  #   claim* -- "this AXIS is settled; stop scanning". Every successful snap
+  #             sets one, including the abutting ones.
+  #
+  # They were the same flag, and the offline drag test caught what that cost: a
+  # widget released 3 units under its neighbour correctly moved to one gap below
+  # it (t = 2056 at 4K), then was moved AGAIN, to 2052, by a later widget in the
+  # loop whose bottom edge happened to be 4 units away -- because an abutting
+  # snap set no flag, nothing stopped the scan, and the LAST widget in the list
+  # won however far away it was. The resting place depended on the order the
+  # widgets appear in the config file, not on what the user was aiming at.
+  #
+  # Making abutting set `lock*` instead would fix the scan and break the anchor:
+  # a widget stacked under a TOP-anchored neighbour would be bound to "bottom"
+  # and would then walk across the screen at a different resolution, which is
+  # the one thing anchor+offset exists to prevent.
+  var claimX = false
+  var claimY = false
 
   # 1. SCREEN EDGES. Nearest edge wins per axis; both can win, which is what a
   #    corner snap IS.
   if duAbs(l - cDuSnapMargin) <= cDuSnapPx:
-    l = cDuSnapMargin; lockL = true
+    l = cDuSnapMargin; lockL = true; claimX = true
   elif duAbs((cw - cDuSnapMargin) - (l + wdt)) <= cDuSnapPx:
-    l = cw - cDuSnapMargin - wdt; lockR = true
+    l = cw - cDuSnapMargin - wdt; lockR = true; claimX = true
   if duAbs((ch - cDuSnapMargin) - t) <= cDuSnapPx:
-    t = ch - cDuSnapMargin; lockT = true
+    t = ch - cDuSnapMargin; lockT = true; claimY = true
   elif duAbs((t - hgt) - cDuSnapMargin) <= cDuSnapPx:
-    t = cDuSnapMargin + hgt; lockB = true
+    t = cDuSnapMargin + hgt; lockB = true; claimY = true
 
   # 2. OTHER WIDGETS -- edge alignment and abutting, but only on an axis the
   #    screen did not already claim, so a corner snap is never dragged back off
@@ -243,20 +265,20 @@ proc duSnapWidget(idx: int; cw, ch: float64) =
     var orr = 0.0
     var ob = 0.0
     duWidgetRect(gDuWidgets[j], cw, ch, ol, ot, orr, ob)
-    if not lockL and not lockR:
+    if not claimX:
       if duAbs(l - ol) <= cDuSnapPx:                 # left edges flush
-        l = ol; lockL = true
+        l = ol; lockL = true; claimX = true
       elif duAbs(l - (orr + cDuSnapGap)) <= cDuSnapPx:   # sits to its right
-        l = orr + cDuSnapGap
+        l = orr + cDuSnapGap; claimX = true
       elif duAbs((l + wdt + cDuSnapGap) - ol) <= cDuSnapPx:  # sits to its left
-        l = ol - cDuSnapGap - wdt
-    if not lockT and not lockB:
+        l = ol - cDuSnapGap - wdt; claimX = true
+    if not claimY:
       if duAbs(t - ot) <= cDuSnapPx:                 # top edges flush
-        t = ot; lockT = true
+        t = ot; lockT = true; claimY = true
       elif duAbs(t - (ob - cDuSnapGap)) <= cDuSnapPx:    # stacks below it
-        t = ob - cDuSnapGap
+        t = ob - cDuSnapGap; claimY = true
       elif duAbs((t - hgt - cDuSnapGap) - ot) <= cDuSnapPx: # stacks above it
-        t = ot + cDuSnapGap + hgt
+        t = ot + cDuSnapGap + hgt; claimY = true
 
   # 3. Never off-screen, whatever the drag did. A widget dropped past the edge
   #    and then unreachable is a layout the user cannot undo without deleting
@@ -308,3 +330,163 @@ proc duClampOnScreen(idx: int; cw, ch: float64) =
     t = ch - 24.0 + gDuWidgets[idx].h; fixed = true
   if fixed:
     duWidgetSetTopLeft(gDuWidgets[idx], cw, ch, l, t)
+
+
+# ---------------------------------------------------------------------------
+# THE DRAG, AS A PURE STATE MACHINE
+#
+# WHY IT LIVES HERE AND NOT IN `debugui.nim`. It used to be one proc,
+# `duDragTick`, that sampled the pointer, decided what to do, did the
+# arithmetic, and wrote the layout file -- four jobs, three of them impure, so
+# the ONE job that is pure arithmetic could not be exercised without a running
+# client. That is exactly the shape CLAUDE.md 9b warns about: the only available
+# "check" was to launch the game, press a key and look, and a look that shows
+# nothing is indistinguishable from a look at a feature that was never reached.
+#
+# So the decision half is here, in the file whose hard constraint is that
+# NOTHING in it may call the game or Windows. `duDragTick` in `debugui.nim` is
+# now a thin adapter: it samples (impure), calls `duDragStep` (pure), and
+# persists on a drop (impure). `tests/wgeom_test.nim` drives `duDragStep`
+# directly with synthetic pointer states -- press, move, release, focus loss,
+# cursor off the client area -- and asserts the FINISHED widget rectangle, not
+# the write it just made.
+#
+# It deliberately reuses the geometry already in this file rather than
+# recomputing anything: `duWidgetRect` for the hit box (so the box the user
+# grabs is by construction the box that was drawn), `duWidgetPivotPoint` +
+# `duAnchorVec` for the offset arithmetic, and `duSnapWidget` for the drop.
+# ---------------------------------------------------------------------------
+
+const
+  duDragNone    = 0'i32   ## nothing happened this tick
+  duDragGrabbed = 1'i32   ## a widget was picked up
+  duDragMoved   = 2'i32   ## the held widget followed the cursor
+  duDragDropped = 3'i32   ## released and snapped -- THE CALLER MUST PERSIST
+  duDragEnded   = 4'i32   ## edit mode left mid-drag; nothing to persist
+
+var gDuDragIdx = -1
+
+proc duDragActive(): bool = gDuDragIdx >= 0
+
+proc duDragRelease() =
+  ## Forget any drag in progress without moving or saving anything.
+  if gDuDragIdx >= 0 and gDuDragIdx < gDuWidgets.len:
+    gDuWidgets[gDuDragIdx].dragging = false
+  gDuDragIdx = -1
+
+proc duHitTest(cx, cy, cw, ch: float64): int =
+  ## Which widget is under the cursor, or -1.
+  ##
+  ## TOPMOST-LAST WINS. Widgets are submitted in order and the region rasterises
+  ## in submission order, so the LAST one drawn is the one visually on top; the
+  ## search therefore runs backwards. Picking the first match would hand the
+  ## user the widget hidden underneath the one they can see, which looks like
+  ## the drag grabbing nothing at all.
+  ##
+  ## A widget with no measured extent is not hit-testable and is skipped: `w`
+  ## and `h` are written by the draw loop, so a widget that has never been drawn
+  ## has a zero box, and a zero box must never match -- `cx >= l and cx <= r`
+  ## with l == r is true on the exact pixel, which is a one-pixel invisible
+  ## grab handle.
+  var i = gDuWidgets.len - 1
+  while i >= 0:
+    if gDuWidgets[i].on and gDuWidgets[i].w > 0.0 and gDuWidgets[i].h > 0.0:
+      var l = 0.0
+      var t = 0.0
+      var r = 0.0
+      var b = 0.0
+      duWidgetRect(gDuWidgets[i], cw, ch, l, t, r, b)
+      if cx >= l and cx <= r and cy <= t and cy >= b:
+        return i
+    dec i
+  -1
+
+proc duDragGrab(idx: int; cx, cy, cw, ch: float64) =
+  ## Record where the cursor sits relative to the widget's PIVOT, so the widget
+  ## does not jump to have its pivot under the cursor on the first move. The
+  ## offset is stored against the pivot rather than the top-left because the
+  ## pivot is what `x`/`y` are measured from, which makes the move arithmetic a
+  ## subtraction instead of an anchor-dependent case analysis.
+  if idx < 0 or idx >= gDuWidgets.len:
+    return
+  var pvx = 0.0
+  var pvy = 0.0
+  duWidgetPivotPoint(gDuWidgets[idx], cw, ch, pvx, pvy)
+  gDuWidgets[idx].grabDx = cx - pvx
+  gDuWidgets[idx].grabDy = cy - pvy
+  gDuWidgets[idx].dragging = true
+  gDuDragIdx = idx
+
+proc duDragTo(cx, cy, cw, ch: float64) =
+  ## Move the held widget so its pivot keeps the grab offset. NO SNAP HERE --
+  ## a snap that engaged every frame fights the cursor and is unusable; the
+  ## snap happens once, on the drop.
+  if gDuDragIdx < 0 or gDuDragIdx >= gDuWidgets.len:
+    return
+  var ax = 0.0
+  var ay = 1.0
+  var px = 0.0
+  var py = 1.0
+  duAnchorVec(gDuWidgets[gDuDragIdx].anchor, ax, ay, px, py)
+  gDuWidgets[gDuDragIdx].x =
+    (cx - gDuWidgets[gDuDragIdx].grabDx) - ax * cw
+  gDuWidgets[gDuDragIdx].y =
+    (cy - gDuWidgets[gDuDragIdx].grabDy) - ay * ch
+
+proc duDragDrop(cw, ch: float64) =
+  ## End the drag: snap to edges, corners and neighbours, and rebind the anchor
+  ## so the resulting layout is anchor+offset rather than a pixel pair.
+  if gDuDragIdx >= 0 and gDuDragIdx < gDuWidgets.len:
+    gDuWidgets[gDuDragIdx].dragging = false
+    duSnapWidget(gDuDragIdx, cw, ch)
+  gDuDragIdx = -1
+
+proc duDragStep(edit, haveCursor: bool; cx, cy, cw, ch: float64;
+                pressed, held, released: bool): int32 =
+  ## ONE TICK OF THE DRAG, DECIDED PURELY.
+  ##
+  ## `cw`/`ch` are the canvas the caller has ALREADY established is known and
+  ## positive; a caller that has no measured screen must not call this at all,
+  ## because snapping against a zero canvas drags every widget to the origin.
+  ## That precondition is asserted here as a refusal rather than trusted.
+  if not edit:
+    if gDuDragIdx >= 0:
+      duDragRelease()
+      return duDragEnded
+    return duDragNone
+  if cw <= 0.0 or ch <= 0.0:
+    return duDragNone
+
+  # RELEASE IS TESTED FIRST, so a press and a release observed in the same tick
+  # (a click faster than the refresh) cannot leave a widget welded to the
+  # cursor. The old order let that happen and there was no way to see it
+  # without a client.
+  if released:
+    if gDuDragIdx >= 0:
+      duDragDrop(cw, ch)
+      return duDragDropped
+    gDuDragIdx = -1
+    return duDragNone
+
+  if pressed and gDuDragIdx < 0 and haveCursor:
+    let idx = duHitTest(cx, cy, cw, ch)
+    if idx >= 0:
+      duDragGrab(idx, cx, cy, cw, ch)
+      return duDragGrabbed
+    return duDragNone
+
+  if gDuDragIdx >= 0:
+    if held:
+      # A cursor that has left the client area HOLDS the widget where it is
+      # rather than teleporting it to a clamped edge.
+      if haveCursor:
+        duDragTo(cx, cy, cw, ch)
+        return duDragMoved
+      return duDragNone
+    # The button went up in a tick we did not observe (a skipped refresh, or a
+    # focus change that cleared the button state). Treat it as a drop rather
+    # than leaving a widget stuck to the cursor forever -- which is a state the
+    # user cannot escape except by restarting the game.
+    duDragDrop(cw, ch)
+    return duDragDropped
+  duDragNone
