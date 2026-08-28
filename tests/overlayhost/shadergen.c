@@ -44,6 +44,27 @@ static const char* kPS =
 "  return float4(i.col.rgb, i.col.a * a);\n"
 "}\n";
 
+/* The SECOND pixel shader, for AOWL_REGION_CMD_QUAD.
+ *
+ * `kPS` above samples `.r` ONLY, because the font atlas is R8_UNORM coverage
+ * and a solid quad points at an opaque texel in it. Map artwork is colour, so
+ * that shader cannot draw it -- it would discard the tile's RGB entirely and
+ * paint a flat tint. Hence a second one, rather than a branch: two pipeline
+ * states cost one extra PSSetShader per textured batch, and a dynamic branch
+ * in the pixel shader costs it on every pixel of every glyph.
+ *
+ * `col` is a MULTIPLICATIVE tint here, not a colour: 0xFFFFFFFF draws the tile
+ * untouched, and the alpha byte is the quad's opacity. That is the contract
+ * `aowl_region_quad` documents. */
+static const char* kPSTex =
+"Texture2D tex : register(t0);\n"
+"SamplerState smp : register(s0);\n"
+"struct VOut { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; float4 col : COLOR0; };\n"
+"float4 main(VOut i) : SV_Target {\n"
+"  float4 t = tex.Sample(smp, i.uv);\n"
+"  return t * i.col;\n"
+"}\n";
+
 static int emit(const char* src, const char* profile, const char* name) {
     ID3DBlob* code = NULL;
     ID3DBlob* errs = NULL;
@@ -66,5 +87,6 @@ static int emit(const char* src, const char* profile, const char* name) {
 int main(void) {
     if (emit(kVS, "vs_4_0", "aowl_ov_vs")) return 1;
     if (emit(kPS, "ps_4_0", "aowl_ov_ps")) return 1;
+    if (emit(kPSTex, "ps_4_0", "aowl_ov_ps_tex")) return 1;
     return 0;
 }
