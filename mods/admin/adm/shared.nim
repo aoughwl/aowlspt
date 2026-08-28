@@ -105,6 +105,8 @@ proc cRp(o: pointer; off: int32): pointer {.importc: "aowl_admin_rp", nodecl.}
 proc cRi(o: pointer; off: int32): int32 {.importc: "aowl_admin_ri", nodecl.}
 proc cRf(o: pointer; off: int32): cfloat {.importc: "aowl_admin_rf", nodecl.}
 proc cWf(o: pointer; off: int32; v: cfloat) {.importc: "aowl_admin_wf", nodecl.}
+proc cRb(o: pointer; off: int32): int32 {.importc: "aowl_admin_rb", nodecl.}
+proc cWb(o: pointer; off: int32; v: int32): int32 {.importc: "aowl_admin_wb", nodecl.}
 
 # --------------------------------------------------------------- public
 
@@ -463,3 +465,16 @@ proc rdF32*(o: pointer; off: int): float =
   result = float(cRf(o, int32(off)))
 proc wrF32*(o: pointer; off: int; v: float) =
   if o != nil: cWf(o, int32(off), cfloat(v))
+
+proc rdBool*(o: pointer; off: int): int32 =
+  ## A one-byte managed bool. THREE outcomes, not two: 1, 0, or -1 for "the
+  ## address was not readable". `rdI32` on a bool field reads the three bytes
+  ## that follow it as well, which is a number, not the field.
+  if o == nil: return -1'i32
+  result = cRb(o, int32(off))
+
+proc wrBool*(o: pointer; off: int; v: bool): bool =
+  ## Returns whether the byte was actually written, so a caller cannot report
+  ## success for a write the guard refused.
+  if o == nil: return false
+  result = cWb(o, int32(off), (if v: 1'i32 else: 0'i32)) != 0'i32

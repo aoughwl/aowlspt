@@ -115,6 +115,64 @@ const
   # Stamina
   StCurrent         = 0x10    ## float
 
+  # ---- NO WEIGHT ----------------------------------------------------------
+  # MEASURED 2026-08-28, `python tools/fldoff.py fields PhysicalBase`, which
+  # printed a real offset (not `--`, not `GENERIC -- NO LAYOUT`) for every one:
+  #   0x1c  Overweight        float   public
+  #   0x20  WalkOverweight    float   public
+  #   0x24  WalkSpeedLimit    float   public
+  #   0xd0  SprintOverweight  float   protected
+  #   0x11c _encumbered       bool    private
+  #   0x11d _overEncumbered   bool    private
+  # These are the SAME object the already-shipping stamina write reaches
+  # (Player+0x9D8 -> PhysicalBase), so no new hop is introduced: the pointer
+  # chain is one the mod has been validating in a live raid all along.
+  #
+  # WHY THESE SIX AND NOT A WEIGHT FIELD. `PreviousWeight` @0xd4 is a CACHE of
+  # the inventory total, recomputed from the inventory whenever
+  # `_weightIsOutOfDate` is set; writing it changes a number nothing reads back
+  # out. The four floats above are what the movement code consumes, and the two
+  # bools are what the HUD and the sprint gate consume. Zeroing the inputs the
+  # consumers read is the write; faking the source is not.
+  PhOverweight       = 0x1C
+  PhWalkOverweight   = 0x20
+  PhWalkSpeedLimit   = 0x24
+  PhSprintOverweight = 0xD0
+  PhEncumbered       = 0x11C
+  PhOverEncumbered   = 0x11D
+
+  # ---- NO RECOIL / SWAY ---------------------------------------------------
+  # MEASURED 2026-08-28 with `tools/fldoff.py fields <T>` at each hop; the type
+  # at each step is the DECLARED field type printed by that command, so the
+  # chain is typed the whole way down rather than assumed from a name:
+  #   EFT.Player                      0x3c0 <ProceduralWeaponAnimation>k__BackingField
+  #                                         : ProceduralWeaponAnimation
+  #   ProceduralWeaponAnimation       0x70  Shootingg      : ShotEffector
+  #                                   0x2b0 AimSwayMax     : Vector3
+  #                                   0x2bc AimSwayMin     : Vector3
+  #                                   0x3f8 _swayStrength  : float
+  #                                   0x4a4 _swayFactor    : float
+  #   ShotEffector                    0x20  NewShotRecoil  : NewRecoilShotEffect
+  #   NewRecoilShotEffect             0x11  RecoilEffectOn : bool
+  #
+  # `RecoilEffectOn` is the pipeline's OWN master switch -- a field the game
+  # already reads as a kill switch -- which is why it is preferred over zeroing
+  # the twenty-odd strength vectors underneath it. It is a `bool`, i.e. ONE
+  # byte, and is read/written through `rdBool`/`wrBool` for that reason.
+  #
+  # NOT A DETOUR AND NOT A PATCH. Every line of this is a field write on an
+  # instance owned by the local player, so there is no shared-RVA blast radius
+  # to check and nothing to byte-verify: `sharedness()` is a question about code
+  # addresses and none is taken here.
+  PlPwAnim           = 0x3C0
+  PwShootingg        = 0x70
+  PwAimSwayMax       = 0x2B0   ## Vector3
+  PwAimSwayMin       = 0x2BC   ## Vector3
+  PwSwayStrength     = 0x3F8
+  PwSwayFactor       = 0x4A4
+  SeNewShotRecoil    = 0x20
+  NrRecoilEffectOn   = 0x11    ## bool -- ONE byte
+
 ## Box height. The position read at MovementContext+0x370 is the player ROOT
 ## (feet), so the head is one standing height above it. 1.8 m is a drawing
 ## constant, NOT a measured field -- it is deliberately not dressed up as one.
@@ -151,6 +209,27 @@ var gDefect = ""
 var gPosOk = false
 var gStamOk = false
 var gFaults = 0
+
+# NO WEIGHT / NO RECOIL -- the FINISHED-STATE evidence, not the write's own
+# return value (CLAUDE.md 9b). Each `apply*` reads, on the NEXT tick and BEFORE
+# it writes again, the fields it wrote on the previous one:
+#
+#   gWtWrote / gRcWrote  -- a write was attempted at least once
+#   gWtHeld  / gRcHeld   -- and the value was STILL applied when we looked back
+#   gWtBroke / gRcBroke  -- the game had re-raised it between ticks
+#
+# Both counters can move in the same session; the diag reports the LAST
+# observation, so "the toggle is on and the game is out-writing us" is a FAIL a
+# reader can act on rather than a silent nothing. This check can fail -- that is
+# the point of it. A check that only ever says yes is the bug.
+var gWtWrote = false
+var gWtHeld  = false
+var gWtBroke = false
+var gWtNote  = "not attempted"
+var gRcWrote = false
+var gRcHeld  = false
+var gRcBroke = false
+var gRcNote  = "not attempted"
 
 const MaxFaults = 8   ## self-disable budget
 
@@ -431,6 +510,161 @@ proc applyStamina*() =
   wrF32(stam, StCurrent, maxVal)
 
 # ---------------------------------------------------------------------------
+# No weight -- PhysicalBase's four overweight floats and two encumbrance bools
+# ---------------------------------------------------------------------------
+
+proc physPtr(): pointer =
+  ## The local player's PhysicalBase, every hop validated. Shared by the stamina
+  ## write and the two below so there is ONE chain to be wrong, not three.
+  ## `cast[pointer](0)`, not `nil`: nimony refuses a bare nil literal on the
+  ## right of an assignment ("expected non-nil value").
+  result = cast[pointer](0)
+  if not gLive or not dataReady() or dataDisabled(): return
+  let world = worldPtr()
+  if world == nil: return
+  let me = rdPtr(world, GwMainPlayer)
+  if me == nil: return
+  let phys = rdPtr(me, PlPhysical)
+  if phys == nil:
+    note("Player+0x9D8 Physical read null"); return
+  result = phys
+
+proc noWeightCapable*(): bool =
+  ## Capability is "a write has been attempted and the object read back sanely",
+  ## never "the offsets compile". Drives the region capability bit, so the F6
+  ## menu cannot offer a hotkey for something that is not writing.
+  gLive and gInRaid and gWtWrote and not dataDisabled()
+
+proc applyNoWeight*() =
+  let phys = physPtr()
+  if phys == nil: return
+
+  # --- look BACK first. This reads what the previous tick wrote, before this
+  # tick overwrites it, so it is an observation of the finished state and not a
+  # readback of our own store. If the game re-raised Overweight in between, this
+  # is where that shows up.
+  if gWtWrote:
+    let ow  = rdF32(phys, PhOverweight)
+    let enc = rdBool(phys, PhEncumbered)
+    if enc < 0:
+      gWtNote = "PhysicalBase+0x11C not readable on the look-back"
+    elif ow == 0.0 and enc == 0'i32:
+      gWtHeld = true; gWtBroke = false
+      gWtNote = "Overweight and _encumbered were still 0 on the next tick"
+    else:
+      gWtHeld = false; gWtBroke = true
+      gWtNote = "the game re-raised Overweight between ticks (read back " &
+                "non-zero), so the suppression is not holding"
+
+  # --- validate before writing. `Overweight` is a ratio the movement code
+  # divides by; a wild value here means the offset is not this field on this
+  # build, and writing into it anyway is the blind write rule 8 forbids.
+  let cur = rdF32(phys, PhOverweight)
+  if cur != cur or cur < -1.0e3 or cur > 1.0e3:
+    note("PhysicalBase+0x1C Overweight implausible (" & $cur &
+         "); no-weight write REFUSED")
+    return
+  if rdBool(phys, PhEncumbered) < 0'i32:
+    note("PhysicalBase+0x11C _encumbered not readable; no-weight write REFUSED")
+    return
+
+  wrF32(phys, PhOverweight, 0.0)
+  wrF32(phys, PhWalkOverweight, 0.0)
+  wrF32(phys, PhSprintOverweight, 0.0)
+  # WalkSpeedLimit is a CAP, not a penalty: 0 would pin the player still. 1.0 is
+  # "no limit" in the same units the four ratios above use.
+  wrF32(phys, PhWalkSpeedLimit, 1.0)
+  discard wrBool(phys, PhEncumbered, false)
+  discard wrBool(phys, PhOverEncumbered, false)
+  gWtWrote = true
+
+# ---------------------------------------------------------------------------
+# No recoil / sway -- the recoil pipeline's own switch, plus the sway inputs
+# ---------------------------------------------------------------------------
+
+proc pwAnimPtr(): pointer =
+  result = cast[pointer](0)
+  if not gLive or not dataReady() or dataDisabled(): return
+  let world = worldPtr()
+  if world == nil: return
+  let me = rdPtr(world, GwMainPlayer)
+  if me == nil: return
+  let pw = rdPtr(me, PlPwAnim)
+  if pw == nil:
+    note("Player+0x3C0 ProceduralWeaponAnimation read null"); return
+  result = pw
+
+proc noRecoilCapable*(): bool =
+  gLive and gInRaid and gRcWrote and not dataDisabled()
+
+proc applyNoRecoil*() =
+  let pw = pwAnimPtr()
+  if pw == nil: return
+  let shoot = rdPtr(pw, PwShootingg)
+  if shoot == nil:
+    gRcNote = "ProceduralWeaponAnimation+0x70 Shootingg read null -- no weapon " &
+              "in hands yet"
+    # NOT a defect: with empty hands there is no ShotEffector to switch off. The
+    # sway half below still applies, so this returns only after doing that.
+    discard
+  var nr = cast[pointer](0)
+  if shoot != nil:
+    nr = rdPtr(shoot, SeNewShotRecoil)
+    if nr == nil:
+      gRcNote = "ShotEffector+0x20 NewShotRecoil read null (this weapon may be " &
+                "on the OLD recoil pipeline, which this row does not touch)"
+
+  # --- look back, before overwriting. RecoilEffectOn is re-set by the game on a
+  # weapon change, and this is what makes that visible instead of silent.
+  # A stale PASS is the trap here: with no weapon in hands `nr` is nil, there is
+  # nothing to look back AT, and leaving gRcHeld set from an earlier tick would
+  # let the diag keep reporting PASS for a suppression nobody can observe. Clear
+  # both verdicts so that case reads INCONCLUSIVE with the reason attached.
+  if gRcWrote and nr == nil:
+    gRcHeld = false; gRcBroke = false
+  if gRcWrote and nr != nil:
+    let on = rdBool(nr, NrRecoilEffectOn)
+    if on < 0:
+      gRcNote = "NewRecoilShotEffect+0x11 not readable on the look-back"
+    elif on == 0'i32:
+      gRcHeld = true; gRcBroke = false
+      gRcNote = "RecoilEffectOn was still 0 on the next tick"
+    else:
+      gRcHeld = false; gRcBroke = true
+      gRcNote = "the game re-enabled RecoilEffectOn between ticks (a weapon " &
+                "change does this); it is re-suppressed each tick"
+
+  if nr != nil:
+    # Validate: a bool byte is 0 or 1. Anything else means +0x11 is not this
+    # field on this build, and the write is refused rather than smeared over
+    # whatever is really there.
+    let on = rdBool(nr, NrRecoilEffectOn)
+    if on != 0'i32 and on != 1'i32:
+      note("NewRecoilShotEffect+0x11 RecoilEffectOn read " & $on &
+           ", which is not a bool; no-recoil write REFUSED")
+      return
+    if wrBool(nr, NrRecoilEffectOn, false):
+      gRcWrote = true
+
+  # Sway: four floats on the animation object itself. Zeroing the two Vector3
+  # limits and the two scalars removes the aim-sway input; it does not touch the
+  # code that consumes them.
+  let sf = rdF32(pw, PwSwayFactor)
+  if sf != sf or sf < -1.0e4 or sf > 1.0e4:
+    note("ProceduralWeaponAnimation+0x4A4 _swayFactor implausible; sway write " &
+         "REFUSED")
+    return
+  wrF32(pw, PwSwayStrength, 0.0)
+  wrF32(pw, PwSwayFactor, 0.0)
+  wrF32(pw, PwAimSwayMax + 0, 0.0)
+  wrF32(pw, PwAimSwayMax + 4, 0.0)
+  wrF32(pw, PwAimSwayMax + 8, 0.0)
+  wrF32(pw, PwAimSwayMin + 0, 0.0)
+  wrF32(pw, PwAimSwayMin + 4, 0.0)
+  wrF32(pw, PwAimSwayMin + 8, 0.0)
+  gRcWrote = true
+
+# ---------------------------------------------------------------------------
 # Diagnostics -- what bound, what did not, and WHY. Three outcomes, never two.
 # ---------------------------------------------------------------------------
 
@@ -479,6 +713,26 @@ proc dataDiag*(): string =
         (if not gInRaid: "INCONCLUSIVE  no raid, nothing to read"
          elif gStamOk: "PASS  PhysicalBase+0x8C -> Stamina+0x10 written"
          else: "INCONCLUSIVE  not attempted or capacity implausible") & "\n"
+  # NO WEIGHT / NO RECOIL. PASS is granted ONLY by the look-back -- a read taken
+  # on a later tick, before the next write, of the state the previous write left
+  # behind. "We wrote it" is INCONCLUSIVE, never PASS, and the game winning the
+  # race is a FAIL that says so.
+  r.add "  no weight    : " &
+        (if not gInRaid: "INCONCLUSIVE  no raid, nothing to write"
+         elif not gWtWrote: "INCONCLUSIVE  toggle off, or the write was refused" &
+                            " -- " & gWtNote
+         elif gWtBroke: "FAIL  " & gWtNote
+         elif gWtHeld: "PASS  PhysicalBase 0x1C/0x20/0xD0/0x24 + 0x11C/0x11D; " &
+                       gWtNote
+         else: "INCONCLUSIVE  written once, but no look-back tick yet") & "\n"
+  r.add "  no recoil    : " &
+        (if not gInRaid: "INCONCLUSIVE  no raid, nothing to write"
+         elif not gRcWrote: "INCONCLUSIVE  toggle off, or nothing to write -- " &
+                            gRcNote
+         elif gRcBroke: "FAIL  " & gRcNote
+         elif gRcHeld: "PASS  NewRecoilShotEffect+0x11 off + sway zeroed; " &
+                       gRcNote
+         else: "INCONCLUSIVE  written once, but no look-back tick yet") & "\n"
   r.add "  faults       : " & $gFaults & " of " & $MaxFaults &
         (if dataDisabled(): "  SELF-DISABLED" else: "") & "\n"
   r.add "  first defect : " & dataDefectText()

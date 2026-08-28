@@ -15,5 +15,17 @@
   "timeOfDay": false,
 
   "_espMaxDistance": "Do not box players farther than this many metres from you. 400 is a sane raid default; raise it for open maps.",
-  "espMaxDistance": 400.0
+  "espMaxDistance": 400.0,
+
+  "_hotkeys": "MEASURED DEFECT, fixed 2026-08-28: these six keys were declared in the F12 schema and read by loadHotkeyConfig(), but were NOT MEMBERS OF THIS FILE. configGet answered ErrNotFound for every one, so the mod ran on its compiled-in fallbacks and the settings page had nothing to show a current value from -- four rows that rendered and resolved to nothing. Listing them here is the config path.",
+
+  "_hotkeysGate": "Master gate for the action keys below. ON. Measured from aowl_admin_hotkey_poll: with the gate on and every key unbound (the shipped state) the poll makes ZERO calls into the game -- it scans twelve LONGs in our own shared-memory block and returns before it ever binds Input::GetKeyDown. The first game call happens only once you bind a key. Set this to false to stop the poll entirely.",
+  "hotkeys": true,
+
+  "_hotkeyNames": "A UnityEngine.KeyCode NAME -- F7, Insert, KeypadPlus, ... -- or \"\" for unbound. An unrecognised name is REFUSED with the name printed in the host log and under the F6 menu; it is never read as KeyCode.None, which is a real key with ordinal 0. A key is also refused for an action that reports no capability, because a key on an unbound action does nothing, which is worse than no key. Rebinding in the F6 menu (select the row, press K) writes back here, so an in-game rebind survives a restart. Only the five actions this mod can actually perform have a row; the other seven are not bindable.",
+  "hotkeyEsp": "",
+  "hotkeyGodmode": "",
+  "hotkeyStamina": "",
+  "hotkeyNoRecoil": "",
+  "hotkeyNoWeight": ""
 }
