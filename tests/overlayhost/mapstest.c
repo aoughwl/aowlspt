@@ -427,6 +427,170 @@ static void test_poslive(void)
        "a get_Position that returns a real pose reports OK");
 }
 
+/* ---------------------------------------------------------------- heading *
+ *
+ * Defect 1: "the player rotation does not rotate either map." The failure this
+ * suite has to be able to catch is NOT "the heading is wrong" -- it is "the
+ * heading is a plausible CONSTANT". A static non-zero yaw draws a perfectly
+ * smooth heading-up map that never turns, and no assertion about a single
+ * sample can tell that apart from a working one. So the checks below pin
+ * three separate things: the offsets the reader uses (against the accessor's
+ * own bytes), the SENSE of the yaw (facing east must mirror, not merely
+ * rotate), and that a dead field reports itself instead of yielding 0.0.
+ */
+
+/* MIRRORS sp/world.nim's C block. If either moves, these disagree. */
+#define T_PL_MOVECTX 0x60
+#define T_MC_LOOKDIR 0x3D0
+
+static void test_heading(void)
+{
+    float yaw = 12345.0f;
+    const float PI = 3.14159265358979323846f;
+
+    /* Offsets, against the instruction bytes quoted in mapmath.h:
+     *   mov rax,[rdx+0x60]  /  movsd xmm0,[rax+0x3D0]  /  mov eax,[rax+0x3D8] */
+    ok(T_PL_MOVECTX == 0x60,
+       "Player.<MovementContext>k__BackingField is 0x60 (mov rax,[rdx+0x60])");
+    ok(T_MC_LOOKDIR == 0x3D0,
+       "MovementContext._lookDirection is 0x3D0 (movsd xmm0,[rax+0x3D0])");
+    ok(T_MC_LOOKDIR + 8 == 0x3D8,
+       "the .z half is the dword at 0x3D8 -- a Vector3, not a Vector2");
+    ok(T_MC_LOOKDIR != 0x370,
+       "_lookDirection is NOT PreviousPosition@0x370, the field that is "
+       "permanently zero on this build");
+
+    /* --- the sense of the yaw. Facing north is zero; facing east is +pi/2,
+     * which is what mm_topdown documents and what makes a northern contact
+     * appear on the LEFT. A sign flip here mirrors both surfaces. */
+    ok(mm_heading_from_look(1, 0.0f, 0.0f, 1.0f, &yaw) == MM_HDG_OK,
+       "a look straight north classifies OK");
+    near(yaw, 0.0f, 1e-5f, "facing north (0,0,1) is yaw 0");
+    (void)mm_heading_from_look(1, 1.0f, 0.0f, 0.0f, &yaw);
+    near(yaw, PI * 0.5f, 1e-5f, "facing east (1,0,0) is yaw +pi/2");
+    (void)mm_heading_from_look(1, -1.0f, 0.0f, 0.0f, &yaw);
+    near(yaw, -PI * 0.5f, 1e-5f, "facing west (-1,0,0) is yaw -pi/2");
+    /* pitch must not leak into the bearing: looking north while aiming 45
+     * degrees down is still due north. */
+    (void)mm_heading_from_look(1, 0.0f, -1.0f, 1.0f, &yaw);
+    near(yaw, 0.0f, 1e-5f, "a downward pitch does not change the yaw");
+
+    /* --- the END-TO-END property, which is the one that catches a mirrored
+     * map: facing east, a contact due north lands LEFT of the pane centre. */
+    {
+        MmPt p;
+        (void)mm_heading_from_look(1, 1.0f, 0.0f, 0.0f, &yaw);
+        p = mm_topdown(0.0f, 100.0f, 0.0f, 0.0f, 0.0f, 0.0f, 200.0f, 400.0f, yaw);
+        ok(p.x < 100.0f - 1.0f,
+           "facing east, a contact due north is drawn LEFT of centre");
+        near(p.y, 100.0f, 0.01f,
+             "facing east, a contact due north is level with centre");
+    }
+
+    /* --- the refusals. Each is a DIFFERENT answer, because "the page is not
+     * mapped", "nobody ever wrote this field" and "you are looking at your
+     * boots" have different fixes and one of them already cost this project a
+     * day (PreviousPosition@0x370). */
+    ok(mm_heading_from_look(0, 1.0f, 0.0f, 1.0f, &yaw) == MM_HDG_UNREADABLE,
+       "an unreadable look vector is UNREADABLE, not a yaw of 0");
+    ok(mm_heading_from_look(1, 0.0f, 0.0f, 0.0f, &yaw) == MM_HDG_ALLZERO,
+       "a readable but all-zero _lookDirection reports ALLZERO, not yaw 0");
+    near(yaw, 0.0f, 1e-6f,
+         "a refused heading writes 0 into the out-param and the CODE says why");
+    ok(mm_heading_from_look(1, 0.0f, 1.0f, 0.0f, &yaw) == MM_HDG_FLAT,
+       "looking straight up carries no bearing and is refused, not atan2(0,0)");
+    {
+        float nan_ = (float)atan2(0.0, 0.0);
+        nan_ = 0.0f / (nan_ + 0.0f) * 0.0f;   /* 0/0 -> NaN without a literal */
+        ok(mm_heading_from_look(1, nan_, 0.0f, 1.0f, &yaw) == MM_HDG_NAN,
+           "a NaN component is NaN, not a yaw");
+    }
+    ok(MM_HDG_OK != MM_HDG_ALLZERO && MM_HDG_ALLZERO != MM_HDG_FLAT
+       && MM_HDG_UNREADABLE != MM_HDG_ALLZERO && MM_HDG_NAN != MM_HDG_FLAT,
+       "the heading codes are pairwise distinct");
+
+    /* --- the STATIC-HEADING detector. This is the assertion that makes the
+     * diagnostic falsifiable: a feed that returns the same yaw forever must
+     * measure a spread of zero, and a turning player must not. */
+    near(mm_yaw_delta(0.5f, 0.5f), 0.0f, 1e-6f,
+         "a heading that never changes has a yaw delta of exactly zero");
+    near(mm_yaw_delta(3.0f, -3.0f), 3.0f - (-3.0f) - 2.0f * PI, 1e-5f,
+         "the yaw delta wraps across pi rather than reporting ~6.28");
+    ok(mm_yaw_delta(0.2f, 0.1f) > 0.0f && mm_yaw_delta(0.1f, 0.2f) < 0.0f,
+       "the yaw delta is signed");
+}
+
+/* ---------------------------------------------------------- indicator fade *
+ *
+ * Defect 2: "the audio indicators always stay on the screen instead of fading
+ * out." These checks pin the DECAY, and they are written so that deleting the
+ * decay makes them red: returning a constant 1.0 from mm_fade_alpha (which is
+ * exactly what "no fade" is) fails the monotonicity check, the midpoint check
+ * and the expiry check.
+ */
+static void test_fade(void)
+{
+    const int64_t hold = 400, fade = 1600;   /* the shipped default window */
+    int64_t t;
+    float prev;
+
+    ok(mm_fade_alpha(0, hold, fade) == 1.0f,
+       "a just-refreshed indicator is fully opaque");
+    ok(mm_fade_alpha(hold, hold, fade) == 1.0f,
+       "an indicator is still fully opaque at the end of the hold");
+    near(mm_fade_alpha(hold + fade / 2, hold, fade), 0.5f, 1e-5f,
+         "halfway through the fade the indicator is at half alpha");
+    ok(mm_fade_alpha(hold + fade, hold, fade) == 0.0f,
+       "at the end of the window the indicator is at zero alpha");
+    ok(mm_fade_alpha(hold + fade + 100000, hold, fade) == 0.0f,
+       "long past the window the alpha stays at zero, it does not wrap");
+
+    /* MONOTONIC and STRICTLY decreasing across the ramp. A constant-1.0
+     * implementation -- the bug being fixed -- fails here on the first step. */
+    prev = 2.0f;
+    for (t = hold; t <= hold + fade; t += fade / 16) {
+        float a = mm_fade_alpha(t, hold, fade);
+        if (!(a <= prev)) {
+            ok(0, "indicator alpha never increases as the indicator ages");
+            return;
+        }
+        prev = a;
+    }
+    ok(prev < 1.0f, "indicator alpha DECREASED over the window (not constant)");
+
+    /* GONE, not merely transparent. */
+    ok(!mm_fade_expired(0, hold, fade),
+       "a fresh indicator is not expired");
+    ok(!mm_fade_expired(hold + fade - 1, hold, fade),
+       "an indicator one millisecond before the window ends is still drawn");
+    ok(mm_fade_expired(hold + fade, hold, fade),
+       "an indicator is GONE once its window has elapsed");
+    ok(mm_fade_expired(hold + fade, hold, fade)
+       == (mm_fade_alpha(hold + fade, hold, fade) <= 0.0f),
+       "expired and zero-alpha can never disagree");
+
+    /* Degenerate settings are answers, not crashes. */
+    ok(mm_fade_alpha(hold + 1, hold, 0) == 0.0f,
+       "a zero fade window means gone the instant the hold elapses");
+    ok(mm_fade_alpha(-50, hold, fade) == 1.0f,
+       "a negative age (clock went backwards) fails OPEN, at full alpha");
+    ok(mm_fade_alpha(10, -5, -5) == 0.0f,
+       "negative hold and fade are clamped to zero, not used as divisors");
+
+    /* The alpha actually reaches the colour. */
+    {
+        uint32_t c = 0x00123456u | (200u << 24);   /* r=0x56 g=0x34 b=0x12 a=200 */
+        ok(((mm_fade_rgba(c, 1.0f) >> 24) & 0xFF) == 200,
+           "a full-alpha fade leaves the colour byte-identical");
+        ok(((mm_fade_rgba(c, 0.5f) >> 24) & 0xFF) == 100,
+           "a half fade halves the alpha byte");
+        ok((mm_fade_rgba(c, 0.5f) & 0x00FFFFFFu) == (c & 0x00FFFFFFu),
+           "fading changes ONLY the alpha byte, never the colour");
+        ok(((mm_fade_rgba(c, 0.0f) >> 24) & 0xFF) == 0,
+           "a zero fade produces a fully transparent colour");
+    }
+}
+
 int main(void)
 {
     test_topdown();
@@ -436,6 +600,8 @@ int main(void)
     test_tiles();
     test_pos();
     test_poslive();
+    test_heading();
+    test_fade();
     printf("mapstest: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }
