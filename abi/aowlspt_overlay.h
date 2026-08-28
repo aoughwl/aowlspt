@@ -352,6 +352,7 @@ static int32_t aowl_ov_sync_attempts(void);
  * response once, non-blocking, same shape as the GET feed above. */
 static void    aowl_ov_post_start(const char* path, const char* body);
 static int32_t aowl_ov_post_pending(void);
+static int32_t aowl_ov_take_edit_kick(void);
 static int32_t aowl_ov_post_take(char* out, int32_t cap, int32_t* ok);
 /* 0 = idle, 1 = armed and NOT YET SENT by the worker, 2 = sent and awaiting a
  * response. `aowl_ov_post_pending` collapses 1 and 2 into "busy", which is
@@ -846,6 +847,24 @@ typedef struct AowlOvSPage {
  * worker fills it under the lock and the render thread reads a snapshot. `raw`
  * is the value as a JSON literal (`1.5`, `true`, `"M"`) -- what an edit POSTs
  * back -- and `value` is the same thing formatted for the row. */
+/* THE THREE DISPLAY STATES OF AN EDITED ROW.
+ *
+ * Deliberately the same three outcomes the verify ladder already produces, in
+ * the same words, so the row badge and the banner can never disagree:
+ *   NONE      nothing in flight -- the row shows the served value
+ *   SAVING    the player's value, not yet confirmed (verify still running)
+ *   REJECTED  verify said NOT APPLIED -- the row shows the AUTHORITATIVE value
+ *             and says the edit was not accepted
+ *   UNKNOWN   verify said INCONCLUSIVE -- authoritative value, and says so
+ * There is no fourth state meaning "probably fine". A row that cannot be
+ * confirmed says it cannot be confirmed. */
+enum {
+    AOWL_OV_PEND_NONE = 0,
+    AOWL_OV_PEND_SAVING,
+    AOWL_OV_PEND_REJECTED,
+    AOWL_OV_PEND_UNKNOWN
+};
+
 typedef struct AowlOvSItem {
     char    key[80];
     char    label[64];
@@ -871,6 +890,19 @@ typedef struct AowlOvSItem {
     int32_t depth;
     char    desc[192];
     int32_t implemented;
+    /* THE AUTHORITATIVE VALUE, and it is NOT `raw`.
+     *
+     * `raw` is what the row DISPLAYS. Once an optimistic edit is in flight the
+     * panel paints the value the player asked for, so `raw` is theirs and not
+     * the server's -- and a verify that compared `raw` against what it had
+     * just written would be comparing a value with itself. That is the check
+     * that cannot fail, which is the shape of every defect this screen has
+     * had. `auth` is set ONLY by `aowl_ov_sval_display`, straight off the
+     * parsed document, and `aowl_ov_pend_apply` never touches it. Everything
+     * that asks "did it take?" reads `auth`. */
+    char    auth[64];
+    /* Which of the three display states this row is in -- AOWL_OV_PEND_*. */
+    int32_t pend;
 } AowlOvSItem;
 
 /* One second-level tab on the loaded page. `items` is SORTED by category (see
@@ -982,6 +1014,30 @@ typedef struct AowlOvState {
      * all three read as "the mod may not be loaded" -- which sent one session
      * looking at the registry for a fault that was a 32 KB buffer. */
     char             itemsWhy[192];
+    /* THE OPTIMISTIC EDIT -- the one edit currently in flight, if any.
+     *
+     * MEASURED (facts #204, #210): the write pipeline is healthy and takes
+     * 13.7 s. `sbCollect()` snapshots the rows BEFORE the sync whose reply
+     * drains the edit, so the re-GET this panel performs ~1 s after the POST
+     * carries PRE-EDIT rows, and the new value only appears on the push after
+     * that. The panel therefore painted the player's own edit away within a
+     * second and put it back thirteen seconds later, which four separate
+     * reports read -- correctly, from where they were sitting -- as "the
+     * setting reverted".
+     *
+     * The fix is not to make the pipeline faster. It is to stop the panel
+     * claiming to know something it does not: between the POST and a verdict
+     * the authoritative value is UNKNOWN, so the row shows what the player
+     * asked for, marked SAVING, and is reconciled when the existing verify
+     * ladder returns APPLIED / NOT APPLIED / INCONCLUSIVE. Three states, not
+     * two -- the same three words the verdict already uses.
+     *
+     * Written only by the worker (POST and verify both run there) and read by
+     * the render thread through the `sItems` snapshot, so no extra lock. */
+    char             optPage[80];  /* page the edit belongs to ("" = none)     */
+    char             optKey[80];   /* the row's key                            */
+    char             optRaw[64];   /* the JSON literal the player asked for    */
+    int32_t          optState;     /* AOWL_OV_PEND_*                           */
     /* THE WRITE DID NOT TAKE.
      *
      * Set by `aowl_ov_settings_set` when the value it POSTed is NOT the value
@@ -1067,6 +1123,23 @@ typedef struct AowlOvState {
      * arming another, same discipline as the GET slot's single path. */
     char    postPath[192];
     char    postBody[AOWL_OV_POST_BODY];
+    /* THE EDIT KICK -- the whole reason a settings write is fast now.
+      *
+      * MEASURED: `cSbPeriodMs = 5000` in `settingsbridge.nim`. An F12 edit was
+      * queued at settingshub and only drained by the reply to the host's NEXT
+      * scheduled push, and the rows that push carried had been collected
+      * BEFORE the drain, so the new value needed the cycle after that too.
+      * Two full 5 s cycles for a value that was known the instant the player
+      * let go of the control -- 5-10 s typical, 13.7 s measured worst case.
+      *
+      * The overlay and the settings bridge are IN THE SAME PROCESS, so the
+      * bridge never had to wait to be told. This bit is set by the overlay
+      * worker the moment it POSTs an edit and taken by the host tick, which
+      * collects and publishes immediately instead of at its next cycle. It is
+      * a one-way notification -- nothing waits on it, nothing blocks on it,
+      * and the overlay worker is not held for a moment by it, so the fact #210
+      * circular wait cannot come back through this path. */
+    volatile LONG editKick;              /* an F12 edit was just POSTed        */
     volatile LONG postArm;              /* 1 = queued, not yet sent           */
     volatile LONG postInFlight;         /* 1 = sent, waiting on the response  */
     char    postResp[AOWL_OV_SYNC_MAX];
@@ -1269,6 +1342,7 @@ typedef struct AowlOvState {
     int32_t dragGrip;          /* the resize grip is held                    */
     float   dragDX, dragDY;    /* cursor-to-corner at grab, in panel units   */
     volatile LONG prefsDirty;  /* geometry changed; the WORKER writes it out */
+    int32_t prefsSaveFailed;   /* the file could not be opened; said once      */
     char    prefsPath[300];
 
     /* --- THE PANEL'S OWN PREFERENCES ------------------------------------
@@ -2743,7 +2817,11 @@ static int32_t aowl_ov_skind(const char* t) {
 
 /* `raw`, unquoted, for a row's display cell. Numbers and bools pass through;
  * strings, enums and keybinds lose their surrounding quotes. */
-static void aowl_ov_sval_display(AowlOvSItem* si) {
+/* `value` (what the row prints) derived from `raw` (the JSON literal it
+ * displays). Deliberately does NOT touch `auth` or `pend`, so the optimistic
+ * overlay can re-derive the printed text after replacing `raw` without
+ * disturbing the authoritative value the verify reads. */
+static void aowl_ov_sval_text(AowlOvSItem* si) {
     if ((si->kind == AOWL_S_STRING || si->kind == AOWL_S_ENUM ||
          si->kind == AOWL_S_KEYBIND) && si->raw[0] == '"') {
         int32_t n = (int32_t)strlen(si->raw);
@@ -2754,6 +2832,97 @@ static void aowl_ov_sval_display(AowlOvSItem* si) {
         }
     }
     aowl_ov_copy(si->value, (int32_t)sizeof(si->value), si->raw);
+}
+
+static void aowl_ov_sval_display(AowlOvSItem* si) {
+    /* The ONLY place `auth` is ever written, and it is written from the parsed
+     * document before any optimistic overlay can touch `raw`. See the comment
+     * on `AowlOvSItem::auth`. */
+    aowl_ov_copy(si->auth, (int32_t)sizeof(si->auth), si->raw);
+    si->pend = AOWL_OV_PEND_NONE;
+    aowl_ov_sval_text(si);
+}
+
+/* ------------------------------------------------------------------ *
+ * The optimistic edit
+ * ------------------------------------------------------------------ */
+
+static void aowl_ov_pend_clear(void) {
+    g_ov.optPage[0] = 0;
+    g_ov.optKey[0]  = 0;
+    g_ov.optRaw[0]  = 0;
+    g_ov.optState   = AOWL_OV_PEND_NONE;
+}
+
+/* Called on the worker the instant an edit is issued -- BEFORE the POST, so
+ * that even the re-GET the POST performs cannot paint the old value back. */
+static void aowl_ov_pend_begin(const char* page, const char* key,
+                               const char* raw) {
+    if (!key || !key[0]) { aowl_ov_pend_clear(); return; }
+    aowl_ov_copy(g_ov.optPage, (int32_t)sizeof(g_ov.optPage), page ? page : "");
+    aowl_ov_copy(g_ov.optKey,  (int32_t)sizeof(g_ov.optKey),  key);
+    aowl_ov_copy(g_ov.optRaw,  (int32_t)sizeof(g_ov.optRaw),  raw ? raw : "");
+    g_ov.optState = AOWL_OV_PEND_SAVING;
+}
+
+/* Record the verdict the verify ladder reached. `state` is one of the three
+ * AOWL_OV_PEND_* outcomes; NONE means the value was confirmed and the row goes
+ * back to being an ordinary row. */
+static void aowl_ov_pend_settle(int32_t state) {
+    int32_t i;
+    char key[80];
+    if (g_ov.optState == AOWL_OV_PEND_NONE) return;
+    aowl_ov_copy(key, (int32_t)sizeof(key), g_ov.optKey);
+    /* The verdict must reach the screen NOW, not on whatever load happens
+     * next: a row that is still badged SAVING thirty seconds after the verdict
+     * is the same lie in the other direction. Never called with `cs` held --
+     * `aowl_ov_settings_load` takes and releases it itself. */
+    EnterCriticalSection(&g_ov.cs);
+    for (i = 0; i < g_ov.itemCount; i++) {
+        AowlOvSItem* si = &g_ov.items[i];
+        if (strcmp(si->key, key) != 0) continue;
+        si->pend = state;
+        if (state != AOWL_OV_PEND_SAVING) {
+            /* Back to the authoritative value on every non-SAVING outcome,
+             * including a confirmed one -- where `auth` and the overlay are by
+             * definition the same text, so this is a no-op that cannot drift.
+             * On REJECTED/UNKNOWN it is the whole point. */
+            aowl_ov_copy(si->raw, (int32_t)sizeof(si->raw), si->auth);
+            aowl_ov_sval_text(si);
+        }
+        break;
+    }
+    if (state == AOWL_OV_PEND_NONE) aowl_ov_pend_clear();
+    else g_ov.optState = state;
+    LeaveCriticalSection(&g_ov.cs);
+    g_ov.dataSerial++;
+}
+
+/* Stamp the in-flight edit onto the freshly parsed rows. Called at the END of
+ * `aowl_ov_read_items`, under `cs`, on every load -- which is the point: the
+ * re-GET at t+1 s and every re-GET the verify loop performs all run through
+ * here, so none of them can put the stale value back on screen.
+ *
+ * While SAVING it replaces the DISPLAYED literal only. After a verdict it
+ * leaves the served value alone -- a rejected edit must show the value that
+ * actually holds, not the one that was asked for -- and only tags the row so
+ * the draw can say the edit was not accepted. Silent snap-back is the failure
+ * mode this whole change exists to remove; a snap-back that ANNOUNCES itself
+ * is the correct behaviour. */
+static void aowl_ov_pend_apply(void) {
+    int32_t i;
+    if (g_ov.optState == AOWL_OV_PEND_NONE || !g_ov.optKey[0]) return;
+    if (strcmp(g_ov.itemsPage, g_ov.optPage) != 0) return;
+    for (i = 0; i < g_ov.itemCount; i++) {
+        AowlOvSItem* si = &g_ov.items[i];
+        if (strcmp(si->key, g_ov.optKey) != 0) continue;
+        si->pend = g_ov.optState;
+        if (g_ov.optState == AOWL_OV_PEND_SAVING) {
+            aowl_ov_copy(si->raw, (int32_t)sizeof(si->raw), g_ov.optRaw);
+            aowl_ov_sval_text(si);          /* never touches `auth` */
+        }
+        return;
+    }
 }
 
 /* One control object into one slot. Returns 1 on a usable row. */
@@ -3164,6 +3333,8 @@ static void aowl_ov_read_items(const char* body, int32_t len) {
     }
     aowl_ov_sort_items();
     aowl_ov_build_cats();
+    /* AFTER the sort, so the row that gets stamped is the row that will draw. */
+    aowl_ov_pend_apply();
     /* Check the FINISHED nav, every load, and say so on the panel when it is
      * wrong. A tree that quietly loses a branch is the exact failure mode this
      * screen has had before: a row that exists, is not on any page, and nobody
@@ -3504,7 +3675,10 @@ static void aowl_ov_settings_load(const char* pageId, int32_t isMod,
         /* A "did not take" banner belongs to the page it was measured on. It
          * is cleared on a page CHANGE only -- never on the re-read a write
          * itself performs, which is the read the banner is computed from. */
-        if (strcmp(g_ov.itemsPage, pageId) != 0) g_ov.writeWhy[0] = 0;
+        if (strcmp(g_ov.itemsPage, pageId) != 0) {
+            g_ov.writeWhy[0] = 0;
+            aowl_ov_pend_clear();
+        }
         aowl_ov_copy(g_ov.itemsPage, (int32_t)sizeof(g_ov.itemsPage), pageId);
         g_ov.itemsWhy[0] = 0;
         aowl_ov_read_items(buf, (int32_t)strlen(buf));
@@ -3517,7 +3691,10 @@ static void aowl_ov_settings_load(const char* pageId, int32_t isMod,
     rc = aowl_ov_fetch(L"GET", path, NULL, buf, cap);
     trunc = (int32_t)InterlockedCompareExchange(&g_ov.lastTrunc, 0, 0);
     EnterCriticalSection(&g_ov.cs);
-    if (strcmp(g_ov.itemsPage, pageId) != 0) g_ov.writeWhy[0] = 0;
+    if (strcmp(g_ov.itemsPage, pageId) != 0) {
+        g_ov.writeWhy[0] = 0;
+        aowl_ov_pend_clear();
+    }
     aowl_ov_copy(g_ov.itemsPage, (int32_t)sizeof(g_ov.itemsPage), pageId);
     g_ov.itemsWhy[0] = 0;
     if (rc > 0 && (unsigned char)buf[0] != 0x78 && aowl_ov_jwhole(buf, rc)) {
@@ -3669,7 +3846,12 @@ static int32_t aowl_ov_verify_match(const char* key, const char* sent,
     for (i = 0; i < g_ov.itemCount; i++) {
         if (strcmp(g_ov.items[i].key, key) != 0) continue;
         *found = 1;
-        a = g_ov.items[i].raw;
+        /* `auth`, NOT `raw`. `raw` may be carrying the optimistic overlay --
+         * the very value `sent` holds -- and comparing it here would make this
+         * function incapable of returning 0. `auth` is written only from the
+         * served document, so this comparison can still fail, which is the
+         * only reason it is worth making. */
+        a = g_ov.items[i].auth;
         b = sent ? sent : "";
         while (*a == ' ') a++;
         while (*b == ' ') b++;
@@ -3691,7 +3873,7 @@ static void aowl_ov_settings_verify(const char* guid, const char* key,
     int32_t windowOpen = 0;
     int32_t tries = AOWL_OV_VERIFY_TRIES;
     const char* last = "";
-    if (!key || !key[0]) { g_ov.writeWhy[0] = 0; return; }
+    if (!key || !key[0]) { g_ov.writeWhy[0] = 0; aowl_ov_pend_clear(); return; }
     for (try_ = 0; try_ < tries; try_++) {
         /* 1. THE FINISHED STATE. What the row reads NOW against what was sent
          *    -- never the status code (200 on the silent-revert path and the
@@ -3699,6 +3881,7 @@ static void aowl_ov_settings_verify(const char* guid, const char* key,
          *    settles it on either transport and needs no window. */
         if (aowl_ov_verify_match(key, sent, &found, &last)) {
             g_ov.writeWhy[0] = 0;
+            aowl_ov_pend_settle(AOWL_OV_PEND_NONE);   /* APPLIED */
             return;
         }
         /* 2. WHERE IS IT? Read the stage instead of guessing from a clock. */
@@ -3746,6 +3929,7 @@ static void aowl_ov_settings_verify(const char* guid, const char* key,
         aowl_ov_settings_load(guid, isMod, buf, cap);
         if (aowl_ov_verify_match(key, sent, &found, &last)) {
             g_ov.writeWhy[0] = 0;
+            aowl_ov_pend_settle(AOWL_OV_PEND_NONE);   /* APPLIED */
             return;
         }
         if (found)
@@ -3789,6 +3973,12 @@ static void aowl_ov_settings_verify(const char* guid, const char* key,
                     last[0] ? last : "(nothing)");
     }
     aowl_ov_note(g_ov.writeWhy);
+    /* The verdict, onto the row. NOT APPLIED is the only REJECTED case: it is
+     * the only branch above that has proof the pipeline finished. Every other
+     * branch is INCONCLUSIVE and must say so rather than borrowing REJECTED`s
+     * certainty -- "I could not look" is not a failure verdict either. */
+    aowl_ov_pend_settle(windowOpen && found ? AOWL_OV_PEND_REJECTED
+                                            : AOWL_OV_PEND_UNKNOWN);
 }
 
 static void aowl_ov_settings_set(const AowlOvCmd* cmd, char* buf, int32_t cap) {
@@ -3798,6 +3988,9 @@ static void aowl_ov_settings_set(const AowlOvCmd* cmd, char* buf, int32_t cap) {
     int32_t i = 0;
     for (; cmd->guid[i] && i < 95; i++) warg[i] = (wchar_t)(unsigned char)cmd->guid[i];
     warg[i] = 0;
+    /* BEFORE either write leg, so the re-GET each one performs is already
+     * overlaid and the player`s value never leaves the screen. */
+    aowl_ov_pend_begin(cmd->guid, cmd->skey, cmd->sval);
     if (!strcmp(cmd->guid, AOWL_OV_PANEL_PAGE)) {
         /* Applied locally and re-generated, which is the same shape the HTTP
          * path has: write, then RE-READ, so the row shows what was actually
@@ -3815,6 +4008,10 @@ static void aowl_ov_settings_set(const AowlOvCmd* cmd, char* buf, int32_t cap) {
     aowl_ov_fmt(jbody, (int32_t)sizeof(jbody), "{\"key\":\"%s\",\"value\":%s}",
                 cmd->skey, cmd->sval);
     (void)aowl_ov_fetch(L"POST", path, jbody, buf, cap);
+    /* Tell the settings bridge NOW rather than letting it find out on its own
+     * five-second schedule. Set after the POST, so the edit is already queued
+     * at settingshub by the time the host tick collects. */
+    InterlockedExchange(&g_ov.editKick, 1);
     aowl_ov_settings_load(cmd->guid, 1, buf, cap);
     aowl_ov_settings_verify(cmd->guid, cmd->skey, cmd->sval, 1, buf, cap);
 }
@@ -4612,6 +4809,14 @@ static void aowl_ov_post_start(const char* path, const char* body) {
 /* 1 while a request is armed or has been sent and not yet answered; 0 once the
  * response has landed (whether or not it has been taken yet -- `post_take`
  * still has it). The caller polls this to know when it may arm the next one. */
+/* Read-and-clear. The host tick calls this once per tick; a kick that arrives
+ * while a push is already in flight still lands, because the taker only clears
+ * the bit and the bridge turns it into "collect on the next idle", not into an
+ * action that has to happen right here. */
+static int32_t aowl_ov_take_edit_kick(void) {
+    return (int32_t)InterlockedExchange(&g_ov.editKick, 0);
+}
+
 static int32_t aowl_ov_post_pending(void) {
     if (!g_ov.started) return 0;
     int32_t n;
@@ -5244,6 +5449,17 @@ static void aowl_ov_prefs_path(void) {
     if (g_ov.prefsPath[0]) return;
     n = GetEnvironmentVariableA("LOCALAPPDATA", base, (DWORD)sizeof(base));
     if (n == 0 || n >= sizeof(base)) { g_ov.prefsPath[0] = 0; return; }
+    /* `"\aowlspt"`, NOT `"\aowlspt"`. It was the latter for the whole life of
+     * this file, and `\a` is BEL (0x07) -- a control character Windows refuses
+     * in a path -- so `CreateDirectoryA` failed with ERROR_INVALID_NAME every
+     * launch, the `aowlspt` directory was never created, and `fopen(.., "wb")`
+     * in `aowl_ov_prefs_save` then failed and returned silently. MEASURED: the
+     * `aowlspt` folder under LOCALAPPDATA did not exist on a machine that has
+     * run this overlay hundreds of times. Nothing here has ever persisted --
+     * not the theme, not showFooter/savePos/animate/showUnimpl/navW/scalePref,
+     * not the window geometry. The user reported it as "the theme is back to
+     * normal every launch" and guessed "a general settings persistence bug";
+     * they were right, and it was one character. */
     _snprintf(g_ov.prefsPath, sizeof(g_ov.prefsPath) - 1, "%s\aowlspt", base);
     g_ov.prefsPath[sizeof(g_ov.prefsPath) - 1] = 0;
     CreateDirectoryA(g_ov.prefsPath, NULL);   /* fine if it is already there */
@@ -5355,7 +5571,21 @@ static void aowl_ov_prefs_save(void) {
     FILE* f;
     if (!g_ov.prefsPath[0]) return;
     f = fopen(g_ov.prefsPath, "wb");
-    if (!f) return;
+    /* SAY SO. This returned silently for the whole life of the file, which is
+     * how a broken path spent months looking like a working one: every
+     * preference appeared to take, and every one was gone next launch. A
+     * setting that cannot be persisted must announce that it cannot be
+     * persisted -- the silent-reset shape is exactly what made this panel feel
+     * broken. Announced once per path, not once per keystroke. */
+    if (!f) {
+        if (!g_ov.prefsSaveFailed) {
+            g_ov.prefsSaveFailed = 1;
+            aowl_ov_note("window prefs: CANNOT WRITE the preferences file, so "
+                         "nothing set here will survive a restart");
+        }
+        return;
+    }
+    g_ov.prefsSaveFailed = 0;
     fprintf(f, "%d %d %d %d %d %d %d\n",
             (int)g_ov.panX, (int)g_ov.panY, (int)g_ov.panW, (int)g_ov.panH,
             g_ov.panMax, g_ov.panAlpha, g_ov.hintEnabled);
@@ -8371,8 +8601,20 @@ static void aowl_ov_view_settings(float x, float y, float w, float bodyH) {
             if (ry + (float)AOWL_OV_ROW_H > itemsBottom) break;
 
             isSel = (at == g_ov.selItem);
-            canEdit = si->implemented && P->isMod && si->kind != AOWL_S_NESTED;
-            lblCol = si->implemented ? AOWL_OV_TEXT : AOWL_OV_DIM;
+            /* A ROW BEING WRITTEN IS DISABLED, not merely annotated. The
+             * request the user asked for: "while we are sending the request we
+             * should completely gray out / disable the value". Every widget
+             * below already draws itself dim and ignores clicks when `canEdit`
+             * is 0, so one term here greys the control, the slider, the toggle
+             * and the value box together and makes a second edit on top of an
+             * unconfirmed one unrepresentable. In the normal case this is a
+             * flicker: the edit kick means the confirmation arrives in one
+             * round trip, not in five seconds. */
+            canEdit = si->implemented && P->isMod && si->kind != AOWL_S_NESTED
+                      && si->pend != AOWL_OV_PEND_SAVING;
+            lblCol = !si->implemented ? AOWL_OV_DIM
+                   : si->pend == AOWL_OV_PEND_SAVING ? AOWL_OV_DIM
+                                                     : AOWL_OV_TEXT;
             cx = ctlX; cyy = ry + 3.0f;
             rowX = rx + (aowl_ov_searching() ? 0.0f : 10.0f);
             rowHot = aowl_ov_hit(rx - 2.0f, ry, rw, (float)AOWL_OV_ROW_H);
@@ -8389,6 +8631,22 @@ static void aowl_ov_view_settings(float x, float y, float w, float bodyH) {
              * `rowX`, not `rx`, everywhere the label column is used below. */
             aowl_ov_textn(rowX, cyy, si->label, lblCol,
                           (int32_t)((ctlX - rowX - 8.0f) / AOWL_OV_CW));
+
+            /* THE THIRD STATE, ON THE ROW. A player must be able to tell
+             * "saving" from "saved" from "rejected" without reading a banner
+             * at the bottom of the panel. `NI` (unimplemented) can never
+             * collide here: an unimplemented row is not editable, so it can
+             * never carry a pending edit. */
+            if (si->pend != AOWL_OV_PEND_NONE) {
+                const char* bt = si->pend == AOWL_OV_PEND_SAVING   ? "SAVING"
+                               : si->pend == AOWL_OV_PEND_REJECTED ? "NOT SAVED"
+                                                                   : "UNCONFIRMED";
+                uint32_t bc = si->pend == AOWL_OV_PEND_SAVING   ? AOWL_OV_ACCENT
+                            : si->pend == AOWL_OV_PEND_REJECTED ? AOWL_OV_ERR
+                                                                : AOWL_OV_WARN;
+                aowl_ov_text(rrEdge - (float)strlen(bt) * AOWL_OV_CW, ry + 3.0f,
+                             bt, bc);
+            }
 
             /* Clicking any editable row selects it, so the keyboard follows the
              * mouse. The controls below may also consume the click. */
@@ -11105,7 +11363,21 @@ static int32_t aowl_ov_start(int32_t toggleVk, int32_t backendPort) {
      * reporting the name the player chose. */
     aowl_ov_themes_load();
     aowl_ov_prefs_load();
+    /* THE ROUND TRIP, asserted on the FINISHED state rather than on the read:
+     * the theme that is actually live after start-up, not the name the prefs
+     * file happened to contain. A remembered name that no longer names a theme
+     * (the file was deleted, renamed, or never parsed) silently left the
+     * palette on Dark while the picker went on displaying the missing name --
+     * the panel claiming a selection it does not have. */
     aowl_ov_theme_apply(g_ov.themeName);
+    if (aowl_ov_theme_find(g_ov.themeName) < 0) {
+        char tw[160];
+        aowl_ov_fmt(tw, (int32_t)sizeof(tw),
+                    "overlay theme: %s is not installed, so the palette fell "
+                    "back to Dark", g_ov.themeName);
+        aowl_ov_note(tw);
+        aowl_ov_copy(g_ov.themeName, (int32_t)sizeof(g_ov.themeName), "Dark");
+    }
     g_ov.viewLo = 0; g_ov.viewHi = 0;
     g_ov.capturing = 0;
     g_ov.curPage[0] = 0;

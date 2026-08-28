@@ -42,7 +42,18 @@
 # Self-disables after `cSbMaxFaults`.
 
 const
-  cSbPeriodMs = 5000'u64    ## a full collect+push cycle, at most this often
+  cSbPeriodMs = 5000'u64    ## the IDLE cycle: how often we publish when
+                            ## nothing has changed. It is NOT the latency of an
+                            ## edit any more -- see `overlayTakeEditKick` and
+                            ## `gSbRepublish`. It used to be both, and that is
+                            ## where the 5-10 s the user reported came from:
+                            ## an edit waited out one cycle to be DRAINED (the
+                            ## drain rides on the reply to our push) and a
+                            ## second cycle to become VISIBLE (`sbCollect`
+                            ## snapshots the rows before that reply arrives,
+                            ## fact #204). Both waits are gone; this constant
+                            ## now only bounds how stale an UNEDITED page can
+                            ## get.
   cSbMaxMods = 16
   cSbMaxPending = 16
   cSbMaxFaults = 6
@@ -65,6 +76,11 @@ var gSbOff = false
 var gSbFaults = 0
 var gSbPhase = SbPhase.sbIdle
 var gSbNextMs = 0'u64
+var gSbRepublish = false
+  ## An edit was applied on the reply we just read, so the rows we published
+  ## this cycle are already out of date -- collect and publish again on the
+  ## very next tick rather than at `gSbNextMs`. This is the second of the two
+  ## five-second waits, and it is the one fact #204 is about.
 var gSbArmedAt = 0'u64
 var gSbMods: seq[SbMod] = @[]
 var gSbIdx = 0
@@ -245,6 +261,14 @@ proc sbApplyPending(reply: string) =
         sbFault("'" & guid & "' refused an F12 edit: " &
                 (if err.len > 0: err else: "no reason given"))
     inc n
+  if n > 0:
+    # THE SECOND FIVE SECONDS. The rows this cycle published were collected
+    # before this reply existed, so they cannot contain what we have just
+    # applied (fact #204). Republish on the next tick instead of at the next
+    # scheduled cycle -- the panel is polling and will show the confirmed value
+    # within one round trip rather than within five seconds.
+    gSbRepublish = true
+    gSbNextMs = 0'u64
 
 proc sbTick(now: uint64) =
   ## One bounded step per host tick. Never loops on the network and never
@@ -263,10 +287,21 @@ proc sbTick(now: uint64) =
                "modSyncMs is 0 in aowlspt-host.json), so no client-side " &
                "settings page can be pushed")
     return
+  # THE FIRST FIVE SECONDS. The overlay is in THIS process: when the F12 panel
+  # POSTs an edit it sets a bit, and the edit is drained by the reply to our
+  # push -- so there is no reason at all to wait for the next scheduled cycle
+  # before pushing. Taken every tick, in both phases, so a kick that lands
+  # mid-push is not lost.
+  if overlayTakeEditKick():
+    gSbNextMs = 0'u64
+    okLog "client settings bridge: an F12 edit was just sent from this " &
+          "process; collecting and publishing NOW rather than waiting out " &
+          "the " & $cSbPeriodMs & " ms idle cycle"
   case gSbPhase
   of SbPhase.sbIdle:
-    if now < gSbNextMs:
+    if now < gSbNextMs and not gSbRepublish:
       return
+    gSbRepublish = false
     sbCollect()
     gSbNextMs = now + cSbPeriodMs
     if gSbMods.len == 0:

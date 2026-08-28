@@ -67,6 +67,7 @@ proc cOvSyncAttempts(): int32 {.importc: "aowl_ov_sync_attempts", nodecl.}
 proc cOvPostStart(path: cstring; body: cstring) {.
   importc: "aowl_ov_post_start", nodecl.}
 proc cOvPostPending(): int32 {.importc: "aowl_ov_post_pending", nodecl.}
+proc cOvTakeEditKick(): int32 {.importc: "aowl_ov_take_edit_kick", nodecl.}
 proc cOvPostStage(): int32 {.importc: "aowl_ov_post_stage", nodecl.}
 proc cOvPostTake(buf: ptr char; cap: int32; ok: ptr int32): int32 {.
   importc: "aowl_ov_post_take", nodecl.}
@@ -202,6 +203,17 @@ proc overlayPostPending*(): bool =
   ## landed (whether or not `overlayPostTake` has read it yet) -- poll this
   ## before arming the next write into the single slot.
   cOvPostPending() != 0'i32
+
+proc overlayTakeEditKick*(): bool =
+  ## READ AND CLEAR: has the F12 panel POSTed a settings edit since the last
+  ## call? The overlay worker sets this the moment it sends the edit, so the
+  ## settings bridge can collect and publish IMMEDIATELY instead of waiting out
+  ## its 5 s cycle -- which is where 5-10 s of the measured latency lived.
+  ##
+  ## Nothing blocks on this in either direction. It is one interlocked
+  ## exchange, so it cannot reintroduce the fact #210 circular wait where the
+  ## thread being waited on is the only thread that can send the thing.
+  cOvTakeEditKick() != 0'i32
 
 proc overlayPostStageName*(): string =
   ## WHICH KIND of busy `overlayPostPending` is reporting, in words a log line
