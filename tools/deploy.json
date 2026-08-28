@@ -475,7 +475,11 @@
     "Rotate radar to facing",
     "Loot / extract / corpse / quest markers",
     "GameWorld live, borrowed from the host's already-armed RegisterPlayer cache",
-    "the shared region refused the in-game HUD: "
+    "the shared region refused the in-game HUD: ",
+    "maptiles.bin",
+    "aowl build maptiles",
+    "  art          : ",
+    "the region QUAD is axis-aligned"
    ],
    "data": [
     {

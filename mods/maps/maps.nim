@@ -76,6 +76,7 @@
 ## still serves the terrain and the calibration -- browsing the maps offline is
 ## harmless and needs no client.
 
+import std/syncio
 import aowlspt
 import aowlspt/server as sv
 import aowlspt/sync
@@ -282,6 +283,99 @@ proc onSpatialSettings(url, body, session: string): string =
     st = applySettingFromBody(body)
   result = declaredSchemaReply(st).text
 
+# ---------------------------------------------------------------- map ART
+#
+# The tiles `tools/maptiles.py` produced, loaded and kept resident.
+#
+# WHY THE FILE IO IS ON THE UNITY TICK, when that tick's own comment says it
+# does no IO. Because the alternative is worse, and the exception is bounded:
+#
+#   * `aowl_region_texture_define` copies into region state the RENDER thread
+#     reads. Driving it from the mod's own timer thread would add a third
+#     writer to that state; driving it from the Unity tick keeps it on the
+#     thread the region already expects to own the CPU-side bytes.
+#   * so the bytes have to arrive on this thread too, or they would be written
+#     by one thread while another copied them -- a torn tile.
+#
+# The cost is therefore capped hard: AT MOST ONE tile file per tick. A map's
+# whole layer set is at most 32 tiles of 128 KiB, so a map change costs one
+# 128 KiB read per frame for under 32 frames and then nothing at all, forever.
+# Nothing is re-read, nothing is allocated per frame, and the loop that finds
+# the next missing tile is bounded by MA_MAX_TILES.
+proc artJoin(a, b: string): string =
+  ## Local, and deliberately not shared with `sp/serve.nim`'s identical helper:
+  ## serve.nim is the SERVER side and this runs in the CLIENT. Importing it here
+  ## would drag the whole route table into the client build for four lines.
+  if a.len == 0: return b
+  if a[a.len - 1] == '\\' or a[a.len - 1] == '/': return a & b
+  result = a & "\\" & b
+
+var gArtBin = ""
+var gArtTried = false
+var gArtRoot = ""
+var gArtWhy = ""
+var gArtLoaded = 0
+var gArtReadFails = 0
+
+proc artSlurp(path: string; into: var string): bool =
+  ## `readFile` raises in nimony, so this is the same non-raising open/readAll
+  ## pair `sp/serve.nim` uses. `fmRead` is binary on this toolchain, which is
+  ## required: a text-mode read would eat 0x0D bytes out of BC1 blocks and
+  ## produce art that is subtly, unfalsifiably wrong.
+  into = ""
+  var f: File
+  try:
+    if not open(f, path, fmRead): return false
+  except:
+    return false
+  var got = ""
+  var okRead = false
+  try:
+    got = readAll(f)
+    okRead = true
+  except:
+    okRead = false
+  try: close(f)
+  except: discard
+  if not okRead: return false
+  into = got
+  result = true
+
+proc artTick(px, pz: float) =
+  ## Unity's thread. Binds the map the player is on and feeds at most one tile.
+  if not gArtTried:
+    gArtTried = true
+    gArtRoot = artJoin(artJoin(modDir(), "data"), "maptiles")
+    if not artSlurp(artJoin(gArtRoot, "maptiles.bin"), gArtBin):
+      gArtBin = ""
+      gArtWhy = "data/maptiles/maptiles.bin is not installed -- the art is a " &
+                "BUILD PRODUCT; run `aowl build maptiles` and redeploy"
+      return
+  if gArtBin.len == 0: return
+
+  let n = artBindAt(gArtBin, px, pz)
+  if n <= 0: return
+
+  var i = 0
+  while i < n and i < 32:          # capped by construction, never by the file
+    if not artTileHave(i):
+      let rel = artTileFile(i)
+      var raw = ""
+      if artSlurp(artJoin(gArtRoot, rel), raw):
+        if artGiveTileDds(i, raw):
+          inc gArtLoaded
+          gArtWhy = ""
+        else:
+          inc gArtReadFails
+          gArtWhy = "tile " & rel & " was read but REFUSED: its payload is " &
+                    "not the " & $artTileLen() & " bytes the manifest declares"
+      else:
+        inc gArtReadFails
+        gArtWhy = "tile file could not be read: " & rel
+      break                        # exactly ONE file per tick
+    inc i
+  discard artUpload()
+
 proc onMainTick(payload: string): string =
   ## Unity's thread. Raw guarded reads into a preallocated buffer, and nothing
   ## else: no formatting, no file IO, no allocation beyond the bounded id
@@ -299,6 +393,11 @@ proc onMainTick(payload: string): string =
   # which is the ambiguity this mod keeps paying for.
   if not gHeadingOn: gSnap.hasHeading = false
   if gHudOn: hudPublish(gSnap)   # same thread as the region's draw; see sp/hud.nim
+  # The ART, on the same thread and after the mirror is filled. Gated on a
+  # VALIDATED local position: binding a map from a position that failed
+  # `mm_pos_classify` would pick a map by a number we already know is wrong.
+  if gHudOn and gSnap.ok and gSnap.localIdx >= 0 and gSnap.localIdx < gSnap.n:
+    artTick(gSnap.ents[gSnap.localIdx].x, gSnap.ents[gSnap.localIdx].z)
   unlockMod()
   result = ""
 
@@ -480,6 +579,36 @@ proc mapsDiagText(): string =
           "live entry of GameWorld.AllAlivePlayersList, refreshed every " &
           "collection. An indicator that persists for a contact that is still " &
           "present is the FEED working as built, not a failed decay"
+  # 7. the ART. The failure this whole feature exists to make impossible is a
+  # silent fall back to a bare grid, so this line NEVER just reports a count:
+  # it names the map, the layer and WHY that layer, or it names the reason
+  # there is no art. Three outcomes, and "I could not look" is not a pass.
+  var lArt = ""
+  if not artLoaded():
+    lArt = "FAIL  " & (if gArtWhy.len > 0: gArtWhy
+                       else: "the tile manifest has not been read yet")
+  elif not artValid():
+    lArt = "INCONCLUSIVE  the manifest loaded (" &
+           $artTiles() & " tiles bound) but no calibrated map matches this " &
+           "raid, so the pane draws the LABELLED GRID and no art. " &
+           artRefusalText()
+  elif artDrawn() > 0:
+    lArt = "PASS  map=" & artMapId() &
+           " layer level=" & $artLayerLevel() & " (" & artLayerWhy() & ")" &
+           "  tiles " & $artDrawn() & " drawn / " & $artResident() &
+           " resident / " & $artTiles() & " bound" &
+           "  " & $artTilePx() & "px BC1" &
+           (if artCandidates() > 1:
+              "  [GUESS: " & $artCandidates() & " maps' bounds contain this " &
+              "position; the smallest was taken. The raid's location id is " &
+              "not available to this mod]"
+            else: "")
+  else:
+    lArt = "FAIL  map=" & artMapId() & " bound with " & $artTiles() &
+           " tiles (" & $artResident() & " resident) but NOTHING was drawn: " &
+           artRefusalText() &
+           (if gArtWhy.len > 0: "  [" & gArtWhy & "]" else: "") &
+           "  loads=" & $gArtLoaded & " readFails=" & $gArtReadFails
 
   result = "maps diag:\n" &
            "  region       : " & lRegion & "\n" &
@@ -490,6 +619,7 @@ proc mapsDiagText(): string =
            "  projector    : " & lProj   & "\n" &
            "  heading      : " & lHdg    & "\n" &
            "  indLifetime  : " & lLife   & "\n" &
+           "  art          : " & lArt    & "\n" &
            "  feed         : ticks=" & $gTicks & " published=" & $gPublished &
              " faults=" & $feedFaults() & " defect=" & feedDefect()
 
