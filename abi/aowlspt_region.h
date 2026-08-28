@@ -270,7 +270,22 @@
 extern "C" {
 #endif
 
-#define AOWL_REGION_ABI            1
+/* ABI 2. Bumped, not extended-in-place, and deliberately so.
+ *
+ * `AowlRegionCmd` grew five fields (the UV rect and the texture key) so that a
+ * TEXTURED QUAD could be submitted at all. That struct is the wire format of a
+ * buffer written by the host DLL and read by a SEPARATELY COMPILED module (the
+ * D3D11 overlay, and any mod that drains it), so its `sizeof` is the stride
+ * both sides index with. There is no `size` field on it to negotiate with --
+ * unlike `AowlRegionDesc`, which has one -- so a silent change would have the
+ * reader stride past the writer's records and decode garbage that still looks
+ * like plausible coordinates. That is the exact failure mode this project
+ * refuses to ship.
+ *
+ * So the number moves and `AOWL_REGION_REFUSE_ABI` becomes a LOUD refusal for
+ * every module not rebuilt against this header. Every consumer must be
+ * recompiled; none needs a source change for the bump itself. */
+#define AOWL_REGION_ABI            2
 #define AOWL_REGION_MAX            32     /* participants                     */
 #define AOWL_REGION_NAME_LEN       32
 #define AOWL_REGION_TEXT_LEN       64
@@ -280,6 +295,39 @@ extern "C" {
 #define AOWL_REGION_THROTTLE_EVERY 8      /* run 1 frame in N while throttled */
 #define AOWL_REGION_REASON_LEN     192
 #define AOWL_REGION_DEFAULT_BUDGET 500    /* microseconds, if a mod gives 0   */
+
+/* ---- the texture cache's EXPLICIT BOUNDS -------------------------- *
+ *
+ * These two numbers are the whole eviction policy's input, and they are stated
+ * here rather than buried so that "how much memory does this cost" has an
+ * answer that does not require reading the implementation.
+ *
+ *   AOWL_REGION_TEX_MAX          32 slots
+ *   AOWL_REGION_TEX_SLOT_BYTES   1 MiB per slot
+ *   ---------------------------------------------
+ *   arena                        32 MiB, static .bss, allocated ONCE
+ *
+ * 1 MiB is one 1024x1024 BC7 tile (1 byte/texel) or one 512x512 BGRA8 tile.
+ * A definition larger than a slot is REFUSED with a named code, never
+ * truncated -- a half-uploaded tile renders as plausible garbage.
+ *
+ * WHY A BOUND AT ALL. The in-game pocket map on this build is 731 MB of
+ * zoom-tiled artwork (MEASURED: 41 files under
+ * `StreamingAssets/Windows/assets/content/pocketmap`, every one of them a
+ * `UnityFS` bundle, NOT an image file -- see the decode note on
+ * `aowl_region_texture_define`). Nothing may hold a working set proportional
+ * to that. 32 tiles is roughly a 4K screen's worth of one zoom level plus a
+ * ring of neighbours, which is what a pan actually touches.
+ *
+ * EVICTION IS LRU BY FRAME. Every QUAD that names a key stamps that slot with
+ * the region's current frame number; a `define` that needs room takes the slot
+ * with the OLDEST stamp. A slot referenced this frame is never evicted -- if
+ * every slot is that fresh, the define is refused rather than made to evict a
+ * texture the caller is about to draw. LRU rather than "clear it all when
+ * full", because a map pan touches a moving window of neighbours and a flush
+ * would re-upload the entire window on the frame after every flush. */
+#define AOWL_REGION_TEX_MAX        32
+#define AOWL_REGION_TEX_SLOT_BYTES (1u << 20)
 
 /* ------------------------------------------------------------------ *
  * What a participant asks to be called for.
@@ -303,7 +351,11 @@ enum {
     AOWL_REGION_REFUSE_NESTED   = -6,  /* dispatch called inside a live guard */
     AOWL_REGION_REFUSE_REENTER  = -7,  /* dispatch called inside dispatch     */
     AOWL_REGION_REFUSE_CLOSED   = -8,  /* draw submitted outside a draw call  */
-    AOWL_REGION_REFUSE_NOPROJ   = -9   /* projection asked for, none installed*/
+    AOWL_REGION_REFUSE_NOPROJ   = -9,  /* projection asked for, none installed*/
+    AOWL_REGION_REFUSE_TEXBIG   = -10, /* a texture larger than one slot      */
+    AOWL_REGION_REFUSE_TEXFULL  = -11, /* every slot is in use THIS frame     */
+    AOWL_REGION_REFUSE_TEXARGS  = -12, /* bad key/dims/format/NULL bytes      */
+    AOWL_REGION_REFUSE_NOTEX    = -13  /* a QUAD named a key nothing defined  */
 };
 
 static const char* aowl_region_refusal_text(int32_t r) {
@@ -334,6 +386,20 @@ static const char* aowl_region_refusal_text(int32_t r) {
         case AOWL_REGION_REFUSE_NOPROJ: return
             "world-to-screen projection was asked for, but the host has not "
             "installed a projector -- refused rather than guessed";
+        case AOWL_REGION_REFUSE_TEXBIG: return
+            "the texture definition is larger than AOWL_REGION_TEX_SLOT_BYTES "
+            "-- refused whole, never truncated, because a partially uploaded "
+            "tile renders as plausible garbage rather than as an error";
+        case AOWL_REGION_REFUSE_TEXFULL:return
+            "every texture slot was referenced by a draw command THIS frame, "
+            "so there is nothing to evict that is not about to be drawn";
+        case AOWL_REGION_REFUSE_TEXARGS:return
+            "a zero key, a non-positive width/height, an unknown format, a "
+            "NULL pointer, or a byte count that does not match the format";
+        case AOWL_REGION_REFUSE_NOTEX:  return
+            "a textured quad named a texture key that was never defined -- "
+            "refused, because drawing it with the font atlas bound would put "
+            "recognisable glyph soup on screen where map artwork belongs";
         default:                        return "unknown refusal";
     }
 }
@@ -386,8 +452,59 @@ enum {
     AOWL_REGION_CMD_LINE = 1,
     AOWL_REGION_CMD_BOX  = 2,   /* outline; `t` is the stroke width          */
     AOWL_REGION_CMD_FILL = 3,   /* filled rect                               */
-    AOWL_REGION_CMD_TEXT = 4
+    AOWL_REGION_CMD_TEXT = 4,
+    AOWL_REGION_CMD_QUAD = 5    /* textured: dest rect + UV rect + tex key   */
 };
+
+/* ---- texture formats ---------------------------------------------- *
+ * A deliberately tiny set. Each maps 1:1 onto a DXGI format the renderer
+ * hands straight to `CreateTexture2D`; there is no conversion step anywhere,
+ * on any thread. */
+enum {
+    AOWL_REGION_TEXFMT_BGRA8 = 1,  /* DXGI_FORMAT_B8G8R8A8_UNORM, 4 B/texel  */
+    AOWL_REGION_TEXFMT_BC7   = 2,  /* DXGI_FORMAT_BC7_UNORM,  16 B / 4x4 blk */
+    AOWL_REGION_TEXFMT_BC3   = 3,  /* DXGI_FORMAT_BC3_UNORM,  16 B / 4x4 blk */
+    AOWL_REGION_TEXFMT_BC1   = 4   /* DXGI_FORMAT_BC1_UNORM,   8 B / 4x4 blk */
+};
+
+/* The exact byte count a definition must supply, or 0 if the format/dims are
+ * not ones we accept. This is what makes `bytes` a CHECK rather than a hint:
+ * a caller that gets it wrong is refused with TEXARGS instead of having the
+ * renderer read off the end of its buffer. */
+static uint32_t aowl_region_tex_bytes(int32_t fmt, int32_t w, int32_t h) {
+    uint32_t bw, bh;
+    if (w <= 0 || h <= 0 || w > 8192 || h > 8192) return 0;
+    if (fmt == AOWL_REGION_TEXFMT_BGRA8)
+        return (uint32_t)w * (uint32_t)h * 4u;
+    /* Block formats: 4x4 blocks, rounded up. */
+    bw = ((uint32_t)w + 3u) / 4u;
+    bh = ((uint32_t)h + 3u) / 4u;
+    if (fmt == AOWL_REGION_TEXFMT_BC7 || fmt == AOWL_REGION_TEXFMT_BC3)
+        return bw * bh * 16u;
+    if (fmt == AOWL_REGION_TEXFMT_BC1)
+        return bw * bh * 8u;
+    return 0;
+}
+
+/* One cache slot. `AOWL_REGION_TEX_SLOT_BYTES` of storage INLINE -- the whole
+ * table is one flat static object, so a `define` is a bounds check and a
+ * memcpy and there is no allocator on any path, ever.
+ *
+ * `gen` is what makes the GPU-side cache correct. The renderer keeps its own
+ * SRV per key and remembers the `gen` it built that SRV from; when a slot is
+ * redefined or evicted-and-reused, `gen` moves and the renderer rebuilds. A
+ * key alone is not enough -- a recycled key with stale pixels is a silent
+ * wrong picture, which is exactly the class of bug this project keeps
+ * finding. */
+typedef struct AowlRegionTexSlot {
+    uint64_t key;         /* 0 = empty                                      */
+    int32_t  fmt;
+    int32_t  w, h;
+    uint32_t bytes;
+    int32_t  gen;         /* bumped whenever `data` changes meaning         */
+    int64_t  lastFrame;   /* last frame a QUAD named this key (LRU input)   */
+    uint8_t  data[AOWL_REGION_TEX_SLOT_BYTES];
+} AowlRegionTexSlot;
 
 /* `t` ON A TEXT COMMAND IS AN INTEGER FONT SCALE (1..8); 0 means 1. It has no
  * other meaning for TEXT, every submitter that predates this leaves it 0, and
@@ -396,19 +513,61 @@ enum {
  * divides the position out before applying the scale, so a submitter never has
  * a second coordinate system to get wrong. An 8x16 cell is unreadable at 4K,
  * which is the whole reason this exists. */
+/* FOR `AOWL_REGION_CMD_QUAD`: `x,y,w,h` are the DEST RECT in back-buffer
+ * pixels, `u0,v0,u1,v1` are the SOURCE UV rect in 0..1 of the named texture,
+ * `col` is a MULTIPLICATIVE TINT (0xFFFFFFFF = untinted, and the alpha byte is
+ * the quad's opacity), `tex` is the key passed to `aowl_region_texture_define`,
+ * and `t` is unused. Every other command kind leaves `tex` 0 and the UVs 0. */
 typedef struct AowlRegionCmd {
     int32_t  kind;
     int32_t  owner;                        /* participant index, for blame   */
     float    x, y, w, h, t;
     uint32_t col;
     char     text[AOWL_REGION_TEXT_LEN];   /* inline: no lifetime question   */
+    float    u0, v0, u1, v1;               /* QUAD only: source UV rect      */
+    uint64_t tex;                          /* QUAD only: texture key         */
 } AowlRegionCmd;
 
-/* The projector the host installs. Returns 1 and writes screen pixels, or 0 if
- * the point is behind the camera / there is no camera. It is the host's job to
- * have byte-verified whatever it is calling; this header never resolves it. */
+/* ---- projection outcome ------------------------------------------- *
+ *
+ * THE DEFECT THIS FIXES. `Camera::WorldToScreenPoint` on a point BEHIND the
+ * camera returns a fully-formed, entirely plausible screen position -- it is
+ * the MIRRORED one, because the perspective divide by a negative depth flips
+ * both axes. The old five-argument `aowl_region_project` had exactly two
+ * outcomes: 1 with pixels, or 0. It could not say WHY it said 0, and worse, it
+ * had no way to say "here are pixels, and they are a lie". A caller drawing a
+ * direction indicator therefore pointed confidently backwards for every target
+ * behind the player, and there was no way for it to know.
+ *
+ * The out-parameter is not optional politeness. It is the difference between
+ * a two-outcome check that cannot express doubt and a three-outcome one that
+ * can. Callers MUST branch on it; `AOWL_REGION_PROJ_BEHIND` means the written
+ * sx/sy are mirrored and must be used only as a BEARING (mirror them back, or
+ * clamp to a screen edge), never as a position.
+ * ------------------------------------------------------------------- */
+enum {
+    AOWL_REGION_PROJ_INFRONT   = 0x01, /* real depth > 0: sx/sy are truth    */
+    AOWL_REGION_PROJ_BEHIND    = 0x02, /* depth <= 0: sx/sy are MIRRORED     */
+    AOWL_REGION_PROJ_OFFSCREEN = 0x04, /* outside 0..screenW / 0..screenH    */
+    AOWL_REGION_PROJ_NOCAM     = 0x08  /* no projector/camera: sx/sy UNSET   */
+};
+
+/* The projector the host installs.
+ *
+ * Writes screen pixels into sx/sy and the outcome bits above into `flags`,
+ * which is NEVER NULL when the host calls it. Returns 1 when sx/sy were
+ * written at all (in front OR behind -- behind still writes the mirrored
+ * position, because a bearing is useful), 0 only when there is no camera.
+ *
+ * `depth` receives the camera-space z the projector actually measured, so a
+ * caller can sort by distance and so a test can assert on the sign rather than
+ * on a flag the projector could have set by accident. Never NULL either.
+ *
+ * It is the host's job to have byte-verified whatever it is calling; this
+ * header never resolves it. */
 typedef int32_t (*AowlRegionProjFn)(float wx, float wy, float wz,
-                                    float* sx, float* sy);
+                                    float* sx, float* sy,
+                                    int32_t* flags, float* depth);
 
 /* ================================================================== *
  * THE HOST SIDE
@@ -466,6 +625,13 @@ typedef struct AowlRegionState {
     volatile LONG    seqlock;
     int64_t          dropped;    /* commands refused for want of room        */
     int64_t          frameUs;    /* the whole dispatch, last frame           */
+    /* The texture table. CPU side only: this header never touches D3D11. See
+     * the long note above `aowl_region_texture_define`. */
+    AowlRegionTexSlot tex[AOWL_REGION_TEX_MAX];
+    int32_t           texGen;    /* bumped on every define/evict             */
+    int64_t           texDefines;
+    int64_t           texEvictions;
+    int64_t           texRedefines; /* define of a key already resident      */
 } AowlRegionState;
 
 static AowlRegionState g_region;
@@ -714,11 +880,203 @@ static int32_t aowl_region_push(int32_t kind, float x, float y, float w,
         return AOWL_REGION_REFUSE_FULL;
     }
     c = &g_region.buf[ix][g_region.n[ix]++];
+    /* Cleared WHOLE, not field by field. A command record is reused every
+     * other frame; a slot that held a QUAD last time would otherwise hand the
+     * renderer a stale `tex` key on a FILL, and the renderer would find a
+     * live texture for it. That is a wrong picture with no error anywhere. */
+    memset(c, 0, sizeof(*c));
     c->kind = kind; c->owner = g_region.drawOwner;
     c->x = x; c->y = y; c->w = w; c->h = h; c->t = t; c->col = col;
-    c->text[0] = 0;
     if (text) { strncpy(c->text, text, AOWL_REGION_TEXT_LEN - 1);
                 c->text[AOWL_REGION_TEXT_LEN - 1] = 0; }
+    return AOWL_REGION_OK;
+}
+
+/* ---- the texture table -------------------------------------------- *
+ *
+ * WHAT THIS IS AND IS NOT. This is the CPU half. It owns bytes and keys and
+ * nothing else; it never sees a D3D11 device, because the device belongs to
+ * the overlay DLL and lives on the render thread, and the whole point of the
+ * existing region contract is that the Unity thread PUBLISHES and the render
+ * thread DRAINS. A texture follows the same road as a draw command -- there is
+ * no second submission path here.
+ *
+ * THE DECODE PATH, AND WHY IT IS "NONE".
+ *
+ * MEASURED, and it contradicts the assumption the map work started from: the
+ * pocket-map artwork on this build is NOT a directory of image files. It is 41
+ * files under `StreamingAssets/Windows/assets/content/pocketmap`, 731 MB in
+ * total, and every one of them begins `55 6E 69 74 79 46 53` -- `UnityFS`,
+ * Unity 2022.3.43f2 asset bundles. The `map_tile_<col>x<row>_<scale>` names are
+ * ASSET names INSIDE those bundles, not file names; on disk the tiles are
+ * grouped by row range (`map_tile_scale_1_0-6.bundle`, 71 MB). There is no PNG
+ * anywhere in that tree, so "prefer an existing decoder over adding one" turns
+ * out not to be the question that needed answering.
+ *
+ * What is inside a Unity Texture2D asset for a PC build is already GPU block
+ * data -- BC7 or BC3 -- because that is what Unity ships to a D3D11 target. So
+ * the correct decode path is NO DECODER AT ALL: the block data goes to
+ * `CreateTexture2D` byte-for-byte, which is both the fastest possible path and
+ * the only one with no third-party dependency, no allocation, and no code that
+ * can be fed a malformed image. `AOWL_REGION_TEXFMT_BC7`/`BC3`/`BC1` exist for
+ * exactly that, and `BGRA8` exists for the things a mod generates itself.
+ *
+ * That leaves ONE job, and it is deliberately NOT in this header: getting the
+ * block data out of a `UnityFS` bundle (an LZ4 block table plus a
+ * SerializedFile parse). That is bulk I/O over 71 MB files. It must not happen
+ * on the Unity thread and it must not happen inside `Present`, so it belongs
+ * to the mod, off-thread, at load time -- and the mod then calls `define` once
+ * per tile with the bytes it extracted. A one-line summary for the maps agent:
+ * the ABI takes BLOCKS, you supply the bundle reader, and nothing about this
+ * contract changes if you decide to pre-extract to files instead.
+ *
+ * IDEMPOTENCE IS THE NO-RE-UPLOAD PROPERTY. `define` with a key already
+ * resident and the same dimensions/format is a no-op that returns OK without
+ * copying a byte. That is what makes a per-frame `define` of the visible tile
+ * set correct AND free, which is the shape the map draw actually wants -- it
+ * does not have to remember what it uploaded.
+ * ------------------------------------------------------------------- */
+
+static AowlRegionTexSlot* aowl_region_tex_find(uint64_t key) {
+    int32_t i;
+    if (!key) return 0;
+    for (i = 0; i < AOWL_REGION_TEX_MAX; i++)
+        if (g_region.tex[i].key == key) return &g_region.tex[i];
+    return 0;
+}
+
+/* 1 if the key is resident. A caller uses this to decide whether it needs to
+ * go and read a bundle at all. */
+static int32_t aowl_region_texture_have(uint64_t key) {
+    return aowl_region_tex_find(key) ? 1 : 0;
+}
+
+static int32_t aowl_region_texture_define(uint64_t key, int32_t fmt,
+                                          int32_t w, int32_t h,
+                                          const void* data, uint32_t bytes) {
+    AowlRegionTexSlot* s;
+    uint32_t need;
+    int32_t i, victim = -1;
+    int64_t oldest = 0;
+
+    if (!g_region.ready) aowl_region_init(g_region.sink);
+
+    /* Every argument is CHECKED, not trusted. `need` is derived from the
+     * format and the dimensions, so a caller whose `bytes` disagrees is
+     * refused rather than having the renderer read past its buffer. */
+    need = aowl_region_tex_bytes(fmt, w, h);
+    if (!key || !data || !need || need != bytes) {
+        g_region.lastRefusal = AOWL_REGION_REFUSE_TEXARGS;
+        return AOWL_REGION_REFUSE_TEXARGS;
+    }
+    if (need > AOWL_REGION_TEX_SLOT_BYTES) {
+        g_region.lastRefusal = AOWL_REGION_REFUSE_TEXBIG;
+        return AOWL_REGION_REFUSE_TEXBIG;
+    }
+
+    s = aowl_region_tex_find(key);
+    if (s) {
+        /* Resident. Identical shape -> no-op, and NO memcpy: this is the
+         * property that lets a submitter call `define` every frame. */
+        if (s->fmt == fmt && s->w == w && s->h == h && s->bytes == bytes) {
+            g_region.texRedefines++;
+            return AOWL_REGION_OK;
+        }
+        /* Same key, different shape: replace in place and move `gen` so the
+         * renderer's SRV for this key is known stale. */
+        s->fmt = fmt; s->w = w; s->h = h; s->bytes = bytes;
+        memcpy(s->data, data, need);
+        s->gen = ++g_region.texGen;
+        g_region.texDefines++;
+        return AOWL_REGION_OK;
+    }
+
+    /* Free slot first; otherwise LRU. A slot stamped with the CURRENT frame is
+     * never a victim -- it is about to be drawn. */
+    for (i = 0; i < AOWL_REGION_TEX_MAX; i++) {
+        if (!g_region.tex[i].key) { victim = i; break; }
+        if (g_region.tex[i].lastFrame >= g_region.frame) continue;
+        if (victim < 0 || g_region.tex[i].lastFrame < oldest) {
+            victim = i; oldest = g_region.tex[i].lastFrame;
+        }
+    }
+    if (victim < 0) {
+        g_region.lastRefusal = AOWL_REGION_REFUSE_TEXFULL;
+        return AOWL_REGION_REFUSE_TEXFULL;
+    }
+
+    s = &g_region.tex[victim];
+    if (s->key) g_region.texEvictions++;
+    s->key = key; s->fmt = fmt; s->w = w; s->h = h; s->bytes = bytes;
+    /* -1, NOT the current frame. `lastFrame` means "a QUAD referenced this
+     * key", and only `aowl_region_quad` may stamp it. Stamping it here made
+     * every freshly-defined slot un-evictable for the rest of the frame it was
+     * defined in -- and on frame 0, which is every slot, that made the table
+     * fill to 32 and then refuse everything for ever with the eviction counter
+     * still reading zero. MEASURED by the eviction check in
+     * `tests/overlayhost/texprojtest.c`, which failed on exactly this. */
+    s->lastFrame = -1;
+    memcpy(s->data, data, need);
+    s->gen = ++g_region.texGen;   /* a recycled slot NEVER reuses a gen */
+    g_region.texDefines++;
+    return AOWL_REGION_OK;
+}
+
+/* Drop a key. Returns OK if it was there, NOTEX if it was not -- so a caller
+ * unloading a map can tell "I released it" from "it was already gone". */
+static int32_t aowl_region_texture_forget(uint64_t key) {
+    AowlRegionTexSlot* s = aowl_region_tex_find(key);
+    if (!s) return AOWL_REGION_REFUSE_NOTEX;
+    s->key = 0; s->bytes = 0; s->w = 0; s->h = 0; s->fmt = 0;
+    s->lastFrame = -1;
+    s->gen = ++g_region.texGen;
+    return AOWL_REGION_OK;
+}
+
+/* The RENDERER's read side, by index. Returns 0 for an empty slot. The
+ * renderer walks 0..AOWL_REGION_TEX_MAX-1 once and matches on `key`/`gen`. */
+static const AowlRegionTexSlot* aowl_region_texture_slot(int32_t i) {
+    if (i < 0 || i >= AOWL_REGION_TEX_MAX) return 0;
+    if (!g_region.tex[i].key) return 0;
+    return &g_region.tex[i];
+}
+static int32_t aowl_region_texture_count(void) {
+    int32_t i, n = 0;
+    for (i = 0; i < AOWL_REGION_TEX_MAX; i++) if (g_region.tex[i].key) n++;
+    return n;
+}
+static int64_t aowl_region_texture_evictions(void) { return g_region.texEvictions; }
+
+/* The textured quad. REFUSED when the key is not resident -- see the refusal
+ * text: falling through to an untextured quad would paint the font atlas into
+ * the map's footprint, which looks like a rendering bug and is actually a
+ * cache miss, and those two must not be confusable. */
+static int32_t aowl_region_quad(float x, float y, float w, float h,
+                                float u0, float v0, float u1, float v1,
+                                uint64_t key, uint32_t tint) {
+    AowlRegionTexSlot* s;
+    AowlRegionCmd* c;
+    int32_t ix = (int32_t)g_region.cur;
+    if (!g_region.drawOpen) {
+        g_region.lastRefusal = AOWL_REGION_REFUSE_CLOSED;
+        return AOWL_REGION_REFUSE_CLOSED;
+    }
+    s = aowl_region_tex_find(key);
+    if (!s) {
+        g_region.lastRefusal = AOWL_REGION_REFUSE_NOTEX;
+        return AOWL_REGION_REFUSE_NOTEX;
+    }
+    if (g_region.n[ix] >= AOWL_REGION_MAX_CMDS) {
+        g_region.dropped++;
+        return AOWL_REGION_REFUSE_FULL;
+    }
+    s->lastFrame = g_region.frame;      /* the LRU stamp */
+    c = &g_region.buf[ix][g_region.n[ix]++];
+    memset(c, 0, sizeof(*c));
+    c->kind = AOWL_REGION_CMD_QUAD; c->owner = g_region.drawOwner;
+    c->x = x; c->y = y; c->w = w; c->h = h; c->col = tint;
+    c->u0 = u0; c->v0 = v0; c->u1 = u1; c->v1 = v1;
+    c->tex = key;
     return AOWL_REGION_OK;
 }
 
@@ -751,13 +1109,60 @@ static int32_t aowl_region_text_scaled(float x, float y, const char* s,
 
 /* World space, via the projector the host installed. Returns 0 -- and records
  * REFUSE_NOPROJ -- when there is no projector, rather than inventing pixels. */
-static int32_t aowl_region_project(float wx, float wy, float wz,
-                                   float* sx, float* sy) {
+static int32_t aowl_region_project_ex(float wx, float wy, float wz,
+                                      float* sx, float* sy,
+                                      int32_t* flags, float* depth) {
+    float lx = 0.0f, ly = 0.0f, ld = 0.0f;
+    int32_t lf = 0, r;
+    if (!sx) sx = &lx;
+    if (!sy) sy = &ly;
+    if (!depth) depth = &ld;
+    if (!flags) flags = &lf;
+    *sx = 0.0f; *sy = 0.0f; *depth = 0.0f; *flags = 0;
+
     if (!g_region.proj) {
         g_region.lastRefusal = AOWL_REGION_REFUSE_NOPROJ;
+        *flags = AOWL_REGION_PROJ_NOCAM;
         return 0;
     }
-    return g_region.proj(wx, wy, wz, sx, sy);
+    r = g_region.proj(wx, wy, wz, sx, sy, flags, depth);
+    if (!r) { *flags = AOWL_REGION_PROJ_NOCAM; return 0; }
+
+    /* BELT AND BRACES, and it is not redundant. The projector is supposed to
+     * set the direction bit; if it set neither -- an older or buggy projector,
+     * or one that faulted past the assignment -- we DERIVE it from the depth
+     * it reported rather than leaving `flags` at 0. A zero `flags` reads as
+     * "no information" to a caller that tests bits, and would be treated by a
+     * sloppy one as "not behind", which is the very lie being fixed. */
+    if (!(*flags & (AOWL_REGION_PROJ_INFRONT | AOWL_REGION_PROJ_BEHIND)))
+        *flags |= (*depth > 0.0f) ? AOWL_REGION_PROJ_INFRONT
+                                  : AOWL_REGION_PROJ_BEHIND;
+
+    /* Off-screen is only decidable once a real back-buffer size is published;
+     * `aowl_region_screen_known()` being 0 means we do not know, and we say
+     * nothing rather than declaring everything on-screen against a 0x0 rect. */
+    if (aowl_region_screen_known()) {
+        if (*sx < 0.0f || *sy < 0.0f ||
+            *sx > (float)g_region.screenW || *sy > (float)g_region.screenH)
+            *flags |= AOWL_REGION_PROJ_OFFSCREEN;
+    }
+    return 1;
+}
+
+/* THE COMPATIBILITY WRAPPER, and the reason the old shape stays safe.
+ *
+ * The five-argument call returns 1 ONLY for a point that is genuinely in
+ * front. A behind-camera point returns 0 -- which is precisely what every
+ * existing caller already treats as "do not draw this". So a caller that is
+ * never updated becomes CORRECT rather than merely unchanged: it stops drawing
+ * the mirrored indicator it used to draw. A caller that wants the bearing must
+ * ask for it explicitly through `_ex`, which is the right way round. */
+static int32_t aowl_region_project(float wx, float wy, float wz,
+                                   float* sx, float* sy) {
+    int32_t flags = 0;
+    float d = 0.0f;
+    if (!aowl_region_project_ex(wx, wy, wz, sx, sy, &flags, &d)) return 0;
+    return (flags & AOWL_REGION_PROJ_BEHIND) ? 0 : 1;
 }
 
 /* ---- the guarded single-callback invocation ------------------------ *
@@ -1029,6 +1434,90 @@ static int32_t aowl_region_project(float wx, float wy, float wz,
     return aowl_rg_proj_fn ? aowl_rg_proj_fn(wx, wy, wz, sx, sy) : 0;
 }
 
+/* ---- the three-outcome projection, from the client side ------------ *
+ * Returns 0 AND sets AOWL_REGION_PROJ_NOCAM when the host is too old to export
+ * it. That is deliberately the same shape as "there is no camera": in both
+ * cases the caller has no position and must not invent one. `flags` is written
+ * on every path, so a caller may branch on it unconditionally. */
+typedef int32_t (*AowlRegionProjectExFn)(float, float, float,
+                                         float*, float*, int32_t*, float*);
+static AowlRegionProjectExFn aowl_rg_projex_fn = 0;
+static int32_t               aowl_rg_projex_try = 0;
+
+static int32_t aowl_region_project_ex(float wx, float wy, float wz,
+                                      float* sx, float* sy,
+                                      int32_t* flags, float* depth) {
+    float lx, ly, ld; int32_t lf;
+    if (!sx) sx = &lx;
+    if (!sy) sy = &ly;
+    if (!depth) depth = &ld;
+    if (!flags) flags = &lf;
+    *sx = 0.0f; *sy = 0.0f; *depth = 0.0f;
+    *flags = AOWL_REGION_PROJ_NOCAM;
+    if (!aowl_rg_projex_try) {
+        HMODULE h;
+        aowl_rg_projex_try = 1;
+        h = GetModuleHandleA("aowlspt-host-il2cpp.dll");
+        if (h) aowl_rg_projex_fn = (AowlRegionProjectExFn)(void*)
+            GetProcAddress(h, "aowl_region_project_ex_x");
+    }
+    if (!aowl_rg_projex_fn) return 0;
+    return aowl_rg_projex_fn(wx, wy, wz, sx, sy, flags, depth);
+}
+
+/* ---- the texture cache, from the client side ---------------------- */
+typedef int32_t (*AowlRegionTexDefFn)(uint64_t, int32_t, int32_t, int32_t,
+                                      const void*, uint32_t);
+typedef int32_t (*AowlRegionTexKeyFn)(uint64_t);
+typedef int32_t (*AowlRegionQuadFn)(float, float, float, float,
+                                    float, float, float, float,
+                                    uint64_t, uint32_t);
+static AowlRegionTexDefFn aowl_rg_texdef_fn  = 0;
+static AowlRegionTexKeyFn aowl_rg_texhave_fn = 0;
+static AowlRegionTexKeyFn aowl_rg_texforget_fn = 0;
+static AowlRegionQuadFn   aowl_rg_quad_fn    = 0;
+static int32_t            aowl_rg_tex_try    = 0;
+
+static void aowl_region_resolve_tex(void) {
+    HMODULE h;
+    if (aowl_rg_tex_try) return;
+    aowl_rg_tex_try = 1;
+    h = GetModuleHandleA("aowlspt-host-il2cpp.dll");
+    if (!h) return;
+    aowl_rg_texdef_fn    = (AowlRegionTexDefFn)(void*)
+        GetProcAddress(h, "aowl_region_texture_define_x");
+    aowl_rg_texhave_fn   = (AowlRegionTexKeyFn)(void*)
+        GetProcAddress(h, "aowl_region_texture_have_x");
+    aowl_rg_texforget_fn = (AowlRegionTexKeyFn)(void*)
+        GetProcAddress(h, "aowl_region_texture_forget_x");
+    aowl_rg_quad_fn      = (AowlRegionQuadFn)(void*)
+        GetProcAddress(h, "aowl_region_quad_x");
+}
+static int32_t aowl_region_texture_define(uint64_t key, int32_t fmt,
+                                          int32_t w, int32_t h,
+                                          const void* data, uint32_t bytes) {
+    aowl_region_resolve_tex();
+    return aowl_rg_texdef_fn ? aowl_rg_texdef_fn(key, fmt, w, h, data, bytes)
+                             : AOWL_REGION_REFUSE_NOHOST;
+}
+static int32_t aowl_region_texture_have(uint64_t key) {
+    aowl_region_resolve_tex();
+    return aowl_rg_texhave_fn ? aowl_rg_texhave_fn(key) : 0;
+}
+static int32_t aowl_region_texture_forget(uint64_t key) {
+    aowl_region_resolve_tex();
+    return aowl_rg_texforget_fn ? aowl_rg_texforget_fn(key)
+                                : AOWL_REGION_REFUSE_NOHOST;
+}
+static int32_t aowl_region_quad(float x, float y, float w, float h,
+                                float u0, float v0, float u1, float v1,
+                                uint64_t key, uint32_t tint) {
+    aowl_region_resolve_tex();
+    return aowl_rg_quad_fn
+        ? aowl_rg_quad_fn(x, y, w, h, u0, v0, u1, v1, key, tint)
+        : AOWL_REGION_REFUSE_NOHOST;
+}
+
 /* The RENDERER's side. `aowlspt_overlay.h` is a separate DLL from the host, so
  * it is a client of the region like any mod: it drains the published command
  * buffer once a frame inside Present and rasterises it. Returns 0 when the
@@ -1059,6 +1548,44 @@ static int32_t aowl_region_is_armed(void) {
     const AowlRegionCmd* ignore = 0;
     aowl_region_commands(&ignore);
     return aowl_rg_armed_fn ? aowl_rg_armed_fn() : 0;
+}
+
+/* The region's monotonic frame counter, from the client side. The renderer
+ * uses it as the LRU stamp on its own texture cache, so that the CPU table and
+ * the GPU cache age on the SAME clock -- two clocks would let the GPU evict a
+ * tile the host still considers hot. 0 when the host is too old, which makes
+ * every entry equally old and the cache degrade to FIFO rather than misbehave. */
+typedef int64_t (*AowlRegionFramesFn)(void);
+static AowlRegionFramesFn aowl_rg_frames_fn = 0;
+static int32_t            aowl_rg_frames_try = 0;
+static int64_t aowl_region_frames(void) {
+    if (!aowl_rg_frames_try) {
+        HMODULE h;
+        aowl_rg_frames_try = 1;
+        h = GetModuleHandleA("aowlspt-host-il2cpp.dll");
+        if (h) aowl_rg_frames_fn = (AowlRegionFramesFn)(void*)
+            GetProcAddress(h, "aowl_region_frames_x");
+    }
+    return aowl_rg_frames_fn ? aowl_rg_frames_fn() : 0;
+}
+
+/* The renderer's view of the texture table. A const pointer into the host's
+ * static arena, valid until the slot is redefined -- which the renderer
+ * detects by `gen`, never by assuming the pointer went stale. NULL for an
+ * empty slot or an old host. */
+typedef const AowlRegionTexSlot* (*AowlRegionTexSlotFn)(int32_t);
+static AowlRegionTexSlotFn aowl_rg_texslot_fn = 0;
+static int32_t             aowl_rg_texslot_try = 0;
+static const AowlRegionTexSlot* aowl_region_texture_slot(int32_t i) {
+    if (!aowl_rg_texslot_try) {
+        HMODULE h;
+        aowl_rg_texslot_try = 1;
+        h = GetModuleHandleA("aowlspt-host-il2cpp.dll");
+        if (h) aowl_rg_texslot_fn = (AowlRegionTexSlotFn)(void*)
+            GetProcAddress(h, "aowl_region_texture_slot_x");
+    }
+    if (!aowl_rg_texslot_fn) return 0;
+    return aowl_rg_texslot_fn(i);
 }
 
 /* The back-buffer size, from the client side. `aowl_region_screen_known()` is
