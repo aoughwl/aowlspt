@@ -286,7 +286,11 @@ ungated -- but nothing about constructing a valid `Il2CppClass` has been checked
 `RCX=this, RDX/R8/R9=args`, then a **hidden trailing `const MethodInfo*`**; NULL is fine
 except for shared generics. Imagebase `0x180000000`; generated code lives in the
 **`il2cpp` PE section, not `.text`**. Offsets come from `Il2CppMetadataRegistration.fieldOffsets`
-via `tools/il2cpp_resolve.py` (`find` / `type` / `bytes <RVA>` / `fields <Type>`) or
+via `tools/il2cpp_resolve.py` — **every verb takes the two paths FIRST**:
+`il2cpp_resolve.py GAMEASM METADEC <verb> ...`, verbs `find` / `methods` /
+`type [--shared]` / `bytes <RVA>` / `shared <RVA-or-VA>` / `fields <Type>`
+(writing `il2cpp_resolve.py bytes <RVA>` without the paths used to traceback out
+of `Resolver`; it now refuses with the full command line) — or
 `tools/fldoff.py` (`fields <Type>` / `field <Type> <fieldName>`) — a thin CLI over the
 same `Resolver`, with a mandatory self-check (`System.String._stringLength@0x10`,
 `_firstChar@0x14`) that must pass, printing nothing else, before any offset is
@@ -307,7 +311,14 @@ encrypted (`tools/metablob.py`; decrypted cache at `.cache/global-metadata.dec.d
 - **28.3% of by-name lookups land on a SHARED RVA** (6,261 RVAs have more than one
   owner). *Calling* a shared address is fine — it is correct code for the receiver
   you pass. **Detouring one is a write with unbounded blast radius**, because it
-  fires for every method that shares it. Check sharedness before patching by name.
+  fires for every method that shares it. Check sharedness before patching by name
+  with `il2cpp_resolve.py ... shared <RVA-or-VA>`, or `Resolver.sharedness(addr)`
+  in Python — **one function, three outcomes**: `shared` / `unique` / `unknown`.
+  `unknown` (the address is not in the methodPointers histogram at all — a live
+  ASLR address, a typo, a non-code RVA) is **not** "unsafe to assume unshared";
+  it is a refusal. Never re-derive this from `shared_rva_counts()` with a
+  `.get(rva, 1)` default: that default made every unknown address read back as
+  "1 owner, safe to detour".
 - **Two detours on one function**: the second overwrites the first's trampoline. Ride an
   existing detour as a drain. Verify prologues against the **startup snapshot**
   (`abi/aowlspt_prologue.h`), never against live memory — verifying after another feature
