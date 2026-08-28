@@ -96,6 +96,13 @@ type
     ## someone can flip this to re-measure rather than re-derive. Turning it on
     ## is turning on a known process-killer on THIS build.
     allowIl2cppReflection*: bool
+    ## Bot AI > Loadout: a global multiplier on how much loose loot a generated
+    ## bot carries. Unlike every other field above, this one reaches the game on
+    ## THIS build: it is not consumed by the client decision cascade (which never
+    ## ticks) but by the server's own bot generator in `mods/tarkov/emu/bots.nim`,
+    ## which the server publishes it to over the shared database at load. 1.0 is
+    ## stock generosity, 2.0 "crazy full", 0.0 empties pockets. Clamped [0,5].
+    lootRichness*: float
 
 const RoleCount = 8      ## must match the number of `BotRole` members
 
@@ -268,7 +275,15 @@ proc loadPreset*(): Preset =
     driveFromHostThread:
       doc.field("driveFromHostThread").asBool(true),
     allowIl2cppReflection:
-      doc.field("allowIl2cppReflection").asBool(false))
+      doc.field("allowIl2cppReflection").asBool(false),
+    lootRichness: block:
+      # Absent -> 1.0 (stock), never 0.0: a loot pass that read a missing knob
+      # as empty is a silent regression to naked bots. Clamped so a typo in the
+      # config cannot build one bot the size of a raid.
+      var m = doc.field("botLoot.richnessMultiplier").asFloat(1.0)
+      if m < 0.0: m = 0.0
+      if m > 5.0: m = 5.0
+      m)
 
   # The difficulty scale is folded in here rather than at every spawn: a bot
   # spawning gets `resolvedFor(preset.byRole[role], personality, scale)` and

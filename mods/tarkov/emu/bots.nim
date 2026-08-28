@@ -325,6 +325,49 @@ proc fillMagazine(inv: JsonRef; items: var List; magId, magTpl, caliber: string;
   setRaw(d, "upd", text(upd))
   items.add d
 
+proc slotDefs(tpl: string): JsonRef =
+  ## `templates.items.<tpl>._props.Slots` -- the item's OWN slot definitions,
+  ## the source of `_required` (which slots make a functional weapon: receiver,
+  ## barrel, pistol grip, gas block) and of each slot's compatible-item filter.
+  ## Read once per mod-tree node, not once per slot, because a `dbRead` per slot
+  ## per bot in a 20-bot batch is exactly the loading-screen cost this module is
+  ## written to avoid. `notFound` when the item declares no slots.
+  let v = dbRead("templates.items." & tpl & "._props.Slots")
+  if not v.ok:
+    return notFound()
+  result = whole(v.raw)
+
+proc slotDefFor(defs: JsonRef; name: string): JsonRef =
+  ## The one slot definition whose `_name` matches, case-insensitively -- stock
+  ## data spells the same slot in either casing (`Helmet_top`/`helmet_top`), the
+  ## same fact `memberCI` exists for one level up.
+  if not defs.found:
+    return notFound()
+  let wanted = toLowerAscii(name)
+  let n = count(defs)
+  for i in 0 ..< n:
+    let s = at(defs, i)
+    if toLowerAscii(s.field("_name").asText("")) == wanted:
+      return s
+  result = notFound()
+
+proc slotFilter(def: JsonRef; r: var Rng): string =
+  ## A random compatible template from a slot's own filter --
+  ## `_props.Slots[i].filters[0].Filter`. This is the fallback for a REQUIRED
+  ## slot the bot table names no pool for (measured: 2 of 2,878 required root
+  ## slots in stock data, plus required child slots). A weapon missing a required
+  ## part does not function on the client, so fitting a stock-compatible part is
+  ## strictly better than serving the broken gun the player actually saw.
+  if not def.found:
+    return ""
+  let filters = def.field("filters")
+  let f0 = at(filters, 0)
+  let list = f0.field("Filter")
+  let n = count(list)
+  if n <= 0:
+    return ""
+  result = at(list, nextInt(r, n)).asText("")
+
 proc addMods(t: BotTables; inv, chances: JsonRef; items: var List;
              rootId, rootTpl: string; weapon: bool; r: var Rng;
              budget: var int) =
@@ -359,21 +402,37 @@ proc addMods(t: BotTables; inv, chances: JsonRef; items: var List;
     if not slots.found or not isObject(slots):
       continue
     let named = keys(slots)
+    # The item's own slot definitions, read once for this parent. `_required`
+    # lives here, not in the chance table, and it is the whole of the fix: a
+    # required slot is filled REGARDLESS of what the chance table says, because
+    # stock data lists `mod_pistol_grip` at chance 0 and `mod_stock` at 48 on an
+    # AK that cannot function without either -- honouring the chance produced the
+    # receiver-only weapon a player pulled off a dead scav. The chance roll and
+    # the zero-skip govern OPTIONAL slots only.
+    let defs = slotDefs(parentTpl)
     for slotName in named:
       if budget <= 0:
         return
+      let def = slotDefFor(defs, slotName)
+      let required = def.found and def.field("_required").asBool(false)
       let pool = slots.field(slotName)
       let n = count(pool)
-      if n <= 0:
-        continue
-      # A required slot is one no chance table lists, and it is filled. A slot
-      # the table gives a zero to is never filled and is not rolled for.
-      let pct = chanceFor(chances, group, slotName, 100)
-      if pct <= 0:
-        continue
-      if pct < 100 and not chance(r, float(pct) / 100.0):
-        continue
-      let tpl = at(pool, nextInt(r, n)).asText("")
+      if not required:
+        if n <= 0:
+          continue
+        let pct = chanceFor(chances, group, slotName, 100)
+        if pct <= 0:
+          continue
+        if pct < 100 and not chance(r, float(pct) / 100.0):
+          continue
+      var tpl = ""
+      if n > 0:
+        tpl = at(pool, nextInt(r, n)).asText("")
+      if tpl.len == 0 and required:
+        # The bot table named no usable pool for a slot the weapon must have.
+        # Fit a stock-compatible part from the item's own filter rather than
+        # ship a gun with a hole in it.
+        tpl = slotFilter(def, r)
       if tpl.len == 0:
         continue
       let modId = newId()
@@ -498,14 +557,38 @@ proc drawCount(generation: JsonRef; kind: string; r: var Rng): int =
   if result < 0:
     result = 0
 
+proc lootRichness(): float =
+  ## A global multiplier on how much loose loot a bot carries. Owned by the
+  ## Bot AI mod and published into `configs.botLoot.richnessMultiplier` on the
+  ## shared database at server start; read here rather than compiled in, so the
+  ## Bot AI > Loadout page changes bot loot with no rebuild. 1.0 is stock
+  ## generosity (what the weight tables say), 2.0 is "crazy full", 0.0 empties
+  ## the pockets. Absent or unparseable -> 1.0, never 0.0: a loot pass that read
+  ## a missing knob as zero is a silent regression to naked bots, which is the
+  ## exact failure this module was written to end. Clamped to [0, 5] so a typo
+  ## in the config cannot build one bot the size of a raid.
+  let v = dbRead("configs.botLoot.richnessMultiplier")
+  if not v.ok:
+    return 1.0
+  var m = v.asFloat(1.0)
+  if m < 0.0: m = 0.0
+  if m > 5.0: m = 5.0
+  result = m
+
 proc addContainerLoot(inv, generation: JsonRef; items: var List;
                       c: var Container; kind: string; r: var Rng;
-                      budget: var int) =
+                      budget: var int; richness: float) =
   ## Fills one equipped container from its own pool.
   let pool = inv.field("items").field(c.slot)
   if not pool.found or not isObject(pool):
     return
   var wanted = drawCount(generation, kind, r)
+  # The Bot AI richness knob scales what the weight table rolled. It multiplies
+  # a real count rather than inventing one, so a table that said "nothing this
+  # time" still yields nothing -- richness makes a stocked bot richer, it does
+  # not conjure loot into an empty roll.
+  if richness != 1.0 and wanted > 0:
+    wanted = int(float(wanted) * richness + 0.5)
   if wanted <= 0:
     return
   # The same bound the mod tree has, and for the same reason: `generation` is
@@ -610,7 +693,13 @@ proc addLoadout(t: BotTables; items: var List; equipmentId: string;
   # generous `vestLoot` table left the pockets empty. Each container gets an
   # even share of what is left when its turn comes, so the first cannot spend
   # the last one's, and whatever it does not use passes on.
+  # The richness knob also raises the per-bot loot BOUND when it is above one,
+  # or the extra items the multiplier asks for would have nowhere in the budget
+  # to go -- the cap stays a cap (5x at most), it just tracks the setting.
+  let richness = lootRichness()
   var lootBudget = MaxLootPerBot
+  if richness > 1.0:
+    lootBudget = int(float(MaxLootPerBot) * richness)
   for i in 0 ..< carried.len:
     if lootBudget <= 0:
       break
@@ -623,7 +712,7 @@ proc addLoadout(t: BotTables; items: var List; equipmentId: string;
     if share < 1:
       share = 1
     let had = share
-    addContainerLoot(inv, generation, items, c, kind, r, share)
+    addContainerLoot(inv, generation, items, c, kind, r, share, richness)
     lootBudget = lootBudget - (had - share)
 
 proc difficultyOf*(role, difficulty: string): string =

@@ -347,6 +347,23 @@ proc onPreset(url, body, session: string): string =
     inc i
   result = done(a).text
 
+proc publishBotLoot(p: Preset) =
+  ## Hand the Bot AI > Loadout knobs to the server's own bot generator.
+  ##
+  ## The generator lives in `mods/tarkov/emu/bots.nim` and reads
+  ## `configs.botLoot.richnessMultiplier` off the shared database. This is the
+  ## bridge: one `dbWrite` at load creates that path, and every bot generated
+  ## for the rest of the session reads it. Unlike `patchBrains`, whose consumer
+  ## is SPT's generator (absent here), THIS write's consumer is present -- the
+  ## emulator's generator is the thing making the bots -- so the knob genuinely
+  ## reaches a raid, and a player who kills a scav can see the difference.
+  let patch = "{\"botLoot\":{\"richnessMultiplier\":" & $p.lootRichness & "}}"
+  if dbWrite("configs", patch) != Ok:
+    warn "sain: could not publish bot-loot richness; bots use stock loot"
+  else:
+    info "sain: bot-loot richness published to the generator at " &
+         $p.lootRichness & "x"
+
 proc startServer*(p: Preset) =
   ## Called from `onLoad` on the server side only.
   gPreset = p
@@ -355,6 +372,7 @@ proc startServer*(p: Preset) =
     return
   if p.patchBrains:
     patchBrains()
+  publishBotLoot(p)
   if p.neutraliseLocationModifiers:
     # Not `neutraliseLocationModifiers()` on its own any more: that decorates
     # the maps that exist at this instant, and which maps those are is decided

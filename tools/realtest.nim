@@ -48,7 +48,7 @@
 ## 39 MiB database has told the reader nothing, and that is the failure mode
 ## this file is written against.
 
-import std/[strutils, syncio, cmdline, sets]
+import std/[strutils, syncio, cmdline, sets, tables]
 import aowlsptinstall/[winfs, log]
 import wire
 
@@ -829,6 +829,43 @@ proc boolField(s: string; objAt: int; key: string): bool =
   ## when it is absent.
   let at = memberValue(s, objAt, key)
   result = at >= 0 and at < s.len and s[at] == 't'
+
+proc requiredSlotsOf(itemsBody: string; tplAt: int): seq[string] =
+  ## The `_name` of every slot the item at `tplAt` declares `_required: true`.
+  ##
+  ## This is the source of truth the bot generator was NOT consulting: a weapon
+  ## with a required receiver, barrel, pistol grip or gas block that comes out of
+  ## generation with that slot empty is a non-functional gun -- the receiver-only
+  ## scav a player pulled off a corpse. Read straight off `_props.Slots` in the
+  ## served item table, so the check is against the same data the client parses.
+  result = @[]
+  let propsAt = memberValue(itemsBody, tplAt, "_props")
+  if propsAt < 0:
+    return
+  let slotsAt = memberValue(itemsBody, propsAt, "Slots")
+  if slotsAt < 0 or itemsBody[slotsAt] != '[':
+    return
+  for s in elements(itemsBody, slotsAt):
+    if not boolField(itemsBody, s, "_required"):
+      continue
+    let nm = textField(itemsBody, s, "_name")
+    if nm.len == 0:
+      continue
+    # Only a slot that SOMETHING can fill is a fair test of the generator. A
+    # required slot whose own `filters[0].Filter` is empty cannot be filled from
+    # any pool or fallback -- that is a database gap, not a generation bug, and
+    # counting it would turn an unfixable datum into a permanent red.
+    let filtersAt = memberValue(itemsBody, s, "filters")
+    if filtersAt < 0 or itemsBody[filtersAt] != '[':
+      continue
+    let fe = elements(itemsBody, filtersAt)
+    if fe.len == 0:
+      continue
+    let filterAt = memberValue(itemsBody, fe[0], "Filter")
+    if filterAt < 0 or itemsBody[filterAt] != '[' or
+       elements(itemsBody, filterAt).len == 0:
+      continue
+    result.add nm
 
 # -- the map lock/unlock post-condition ------------------------------------
 #
@@ -2643,6 +2680,128 @@ proc main(): int =
             $botHeadKinds & " distinct heads over " & $botList.len & " " &
             botRole & " bots drawn from " & $bestHeads & " weighted ids, and " &
             $noVoice & " of them have no voice")
+
+  # =========================================================================
+  heading "Generated bot weapons are COMPLETE weapons"
+  # =========================================================================
+  #
+  # The receiver-only scav. A weapon is a root item plus a tree of mods parented
+  # by (parentId, slotId); each item's template declares in `_props.Slots` which
+  # of its slots are `_required`. A functional gun has every required slot on
+  # every item in that tree filled -- the receiver, the barrel under it, the
+  # pistol grip and gas block on the frame. The generator used to honour only the
+  # per-slot CHANCE table, which lists `mod_pistol_grip` at 0 and `mod_stock` at
+  # 48 on an AK, so it shipped guns missing parts a player then found on a corpse.
+  #
+  # The assertion is a NEGATIVE over the FINISHED loadout, not over the write:
+  # across many bots and roles, ZERO items in any weapon tree have a fillable
+  # required slot left empty. A single empty required slot turns it red, which is
+  # exactly the state a player saw.
+  block weaponCompleteness:
+    # A tpl -> index into the served item table, built once.
+    var tplIndex = initTable[string, int]()
+    var ti = 0
+    while ti < tplKeys.len:
+      tplIndex[tplKeys[ti]] = tplVals[ti]
+      inc ti
+
+    var rolesTested = 0
+    var weaponsChecked = 0
+    var treesInconclusive = 0    # a tpl the served item table does not carry
+    var violations = 0
+    var firstViol = ""
+
+    # A handful of roles, discovered from the database rather than named, so the
+    # check survives an import that ships a different roster. Read from `dbText`
+    # (the staged database, in outer scope) rather than the `roleNames` the
+    # appearance block built inside its own `else:`.
+    var rolesToTry: seq[string] = @[]
+    if dbText.len > 0:
+      var rootAt2 = 0
+      while rootAt2 < dbText.len and dbText[rootAt2] != '{':
+        inc rootAt2
+      let typesAt = memberValue(dbText, memberValue(dbText, rootAt2, "bots"),
+                                "types")
+      if typesAt >= 0 and dbText[typesAt] == '{':
+        var rNames: seq[string] = @[]
+        var rVals: seq[int] = @[]
+        members(dbText, typesAt, rNames, rVals)
+        var rr = 0
+        while rr < rNames.len and rolesToTry.len < 5:
+          rolesToTry.add rNames[rr]
+          inc rr
+
+    for role in rolesToTry:
+      let batch = call("/client/game/bot/generate",
+        "{\"conditions\":[{\"Role\":\"" & role &
+        "\",\"Limit\":8,\"Difficulty\":\"normal\"}]}")
+      let bots = elements(batch.body, dataAt(batch))
+      if not batch.ok or bots.len == 0:
+        continue
+      inc rolesTested
+      for b in bots:
+        let invAt = memberValue(batch.body, b, "Inventory")
+        let itemsAt = memberValue(batch.body, invAt, "items")
+        if itemsAt < 0 or batch.body[itemsAt] != '[':
+          continue
+        let items = elements(batch.body, itemsAt)
+        # Group children by parentId, each as the lowercased set of slotIds it
+        # fills. `slotId` on an equipment item is its equipment slot; on a mod it
+        # is the mod slot it occupies -- exactly the `_name` a `_props.Slots`
+        # entry carries, which is what the required-slot test matches against.
+        var childSlots = initTable[string, HashSet[string]]()
+        var roots: seq[int] = @[]
+        for it in items:
+          let parent = textField(batch.body, it, "parentId")
+          let slot = textField(batch.body, it, "slotId")
+          if parent.len > 0:
+            var s0 = childSlots.getOrDefault(parent, initHashSet[string]())
+            s0.incl toLowerAscii(slot)
+            childSlots[parent] = s0
+          if slot == "FirstPrimaryWeapon" or slot == "SecondPrimaryWeapon" or
+             slot == "Holster":
+            roots.add it
+        # Walk each weapon tree, an explicit queue with a head index (nimony has
+        # no `seq.pop`), depth-bounded like the generator itself.
+        for root in roots:
+          inc weaponsChecked
+          var queue: seq[int] = @[root]
+          var head = 0
+          while head < queue.len and head < 400:
+            let cur = queue[head]
+            inc head
+            let curId = textField(batch.body, cur, "_id")
+            let curTpl = textField(batch.body, cur, "_tpl")
+            let idx = tplIndex.getOrDefault(curTpl, -1)
+            if idx < 0:
+              inc treesInconclusive
+            else:
+              let req = requiredSlotsOf(itemsR.body, idx)
+              let curSet = childSlots.getOrDefault(curId, initHashSet[string]())
+              for slotName in req:
+                if not curSet.contains(toLowerAscii(slotName)):
+                  inc violations
+                  if firstViol.len == 0:
+                    firstViol = role & " " & curTpl & " missing required " &
+                                slotName
+              # Descend into this item's children.
+              if curId.len > 0:
+                for it in items:
+                  if textField(batch.body, it, "parentId") == curId:
+                    queue.add it
+
+    if rolesTested == 0 or weaponsChecked == 0:
+      skip("every generated bot weapon fills its required mod slots",
+           "no role produced a bot carrying a weapon in this database")
+    else:
+      check("every generated bot weapon fills its required mod slots",
+            violations == 0,
+            $violations & " empty required slot(s) over " & $weaponsChecked &
+            " weapon trees on " & $rolesTested & " roles" &
+            (if firstViol.len > 0: "; e.g. " & firstViol else: "") &
+            (if treesInconclusive > 0:
+               " (" & $treesInconclusive & " mod tpls not in item table, skipped)"
+             else: ""))
 
   # =========================================================================
   heading "A session, on the real tables"

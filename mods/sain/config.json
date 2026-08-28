@@ -65,5 +65,21 @@
   "server": {
     "patchBrains": true,
     "neutraliseLocationModifiers": true
+  },
+
+  "_botLoot": "Bot AI > Loadout. How much loose loot generated bots carry, and how their weapons are built. `richnessMultiplier` is live on this build: the server's own bot generator reads it, so changing it changes what a killed scav drops. The `tier` and min/max keys below are the config SCHEMA for a fuller loadout system and are NOT yet read by the generator -- they are declared so the keys exist and a later pass can wire them without a config migration; each is greyed on the settings page until it does.",
+  "botLoot": {
+    "richnessMultiplier": 1.0,
+    "realisticLoot": true,
+    "weaponTier": "role",
+    "ammoTier": "role",
+    "armorTier": "role",
+    "pocketLootMin": 0,
+    "pocketLootMax": 4,
+    "rigLootMin": 0,
+    "rigLootMax": 6,
+    "backpackLootMin": 0,
+    "backpackLootMax": 6,
+    "factionOverrides": {}
   }
 }
