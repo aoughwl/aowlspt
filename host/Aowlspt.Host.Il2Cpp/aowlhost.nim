@@ -5704,6 +5704,17 @@ include "settingsui.nim"
 proc nuProofWanted(): bool
 proc nuProofRun(tab: Il2CppPtr)
 
+## The Graphics subtabs feature (`graphicsSubtabs`, default OFF) also rides
+## invoke2's postfix as a drain, for the same reason: a second detour on
+## `EnsureTabInitialized` would overwrite the first's trampoline. Defined in
+## `graphicssubtabs.nim`, included after `nativeui.nim` (it stands on the
+## polled-mouse primitives that file adds), so these forward declarations make
+## the ride legal. `gfxSubtabsProbe` is handed the group and the tab pointer
+## the ladder already resolved; it builds nothing in this increment -- it
+## discovers the Graphics content root defensively and refuses loudly.
+proc gfxSubtabsWanted(): bool
+proc gfxSubtabsProbe(group: int32; tab: Il2CppPtr)
+
 include "invoke2.nim"
 
 ## THE NATIVE UNITY UI CONSTRUCTION LAYER -- the API mods build real UI on.
@@ -5784,6 +5795,13 @@ include "inspect.nim"
 ## `debugui.nim`'s guarded call primitives and `settingspages.nim`'s row
 ## renderer. Default OFF (`settingsModsTab`).
 include "modstab.nim"
+
+## NATIVE GRAPHICS SUBTABS (General / PostFX). Included AFTER `modstab.nim`
+## and `nativeui.nim`/`inspect.nim` because it stands on nativeui's polled-mouse
+## primitives and Component/Transform accessors, inspect's child walkers, and
+## settingsui's createdCtrls offset. Rides invoke2's postfix as a drain via the
+## `gfxSubtabsWanted`/`gfxSubtabsProbe` forward declarations above. Default OFF.
+include "graphicssubtabs.nim"
 
 ## THE SHARED PER-FRAME REGION. Included AFTER `modstab.nim` because
 ## `bindRegion` names `gModsSlot` and `cDuPreloaderTarget`, and nimony
@@ -7340,6 +7358,36 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
          "panels. Neither panel is cloned or written to; only their active " &
          "state is driven, because the game switches panels by ESettingsGroup " &
          "and a subtab of ours is not one."
+  # NATIVE GRAPHICS SUBTABS (`graphicsSubtabs`, default OFF) -- the from-scratch
+  # successor to `settingsPostFxSubtab`. Increment 1 only DISCOVERS the Graphics
+  # tab's real content tree and logs it (fact #104/#117: never assume the tree,
+  # never clone native toggles). It rides invoke2's `EnsureTabInitialized`
+  # postfix as a drain, so it needs `managedInvokeProbe` armed; turn it on with
+  # this flag rather than making the human discover the dependency.
+  gGfxSubtabs = readBoolKey("graphicsSubtabs")
+  if gGfxSubtabs:
+    if not gMi2Probe:
+      gMi2Probe = true
+      info "graphicsSubtabs is set, so managedInvokeProbe has been turned on " &
+           "with it -- the discovery hook rides that probe's EnsureTabInitialized " &
+           "postfix as a drain (a second detour would kill the first)."
+    # NEVER run BOTH Graphics-tab mechanisms at once: `settingsPostFxSubtab`
+    # hides the stock POSTFX tab and switches the stock panels; this one owns
+    # the Graphics tab from scratch. Two mechanisms on one tab is exactly the
+    # "two features fighting" the brief warns against, so the new flag wins and
+    # the old one is forced OFF, loudly.
+    if gGfxOn:
+      gGfxOn = false
+      warn "graphicsSubtabs AND settingsPostFxSubtab are both set; they both " &
+           "drive the Graphics tab and would fight. settingsPostFxSubtab has " &
+           "been forced OFF for this session -- graphicsSubtabs owns the tab."
+    info "graphicsSubtabs is set: increment 1 is DISCOVERY-ONLY. On the first " &
+         "open of Settings > Graphics the host walks from the live tab and logs " &
+         "its real content tree (`graphicsSubtabs: DISCOVERY ...`), building " &
+         "NOTHING. Confirm that tree live; increment 2 builds the strip. The " &
+         "polled-mouse primitive (Input::GetMouseButtonDown / " &
+         "get_mousePosition_Injected) and the pure strip state machine are in " &
+         "place and offline-tested."
   gSeasonsOn = readBoolKey("uxHideSeasons")
   gBetaNoticeOn = readBoolKey("uxBetaNotice")
   # BOTH LOGGED AS ACTUALLY READ, not as defaulted, and then resolved here

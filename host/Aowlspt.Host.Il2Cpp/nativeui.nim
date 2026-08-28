@@ -87,6 +87,11 @@ proc cNuCallBS1(fn, a0: Il2CppPtr): int32 {.
 proc cNuCallGeneric0(fn, self, mi: Il2CppPtr): Il2CppPtr {.
   importc: "aowl_nu_call_generic0", nodecl.}
 
+proc cNuCallBI(fn: Il2CppPtr; a0: int32): int32 {.importc: "aowl_nu_call_b_i", nodecl.}
+proc cNuV3Ptr(): Il2CppPtr {.importc: "aowl_nu_v3_ptr", nodecl.}
+proc cNuV3X(): float32 {.importc: "aowl_nu_v3_x", nodecl.}
+proc cNuV3Y(): float32 {.importc: "aowl_nu_v3_y", nodecl.}
+proc cNuV3Z(): float32 {.importc: "aowl_nu_v3_z", nodecl.}
 proc cNuV2InSet(x, y: float32) {.importc: "aowl_nu_v2in_set", nodecl.}
 proc cNuV2InPtr(): Il2CppPtr {.importc: "aowl_nu_v2in_ptr", nodecl.}
 proc cNuV2OutPtr(): Il2CppPtr {.importc: "aowl_nu_v2out_ptr", nodecl.}
@@ -177,6 +182,9 @@ const
   NuTLocSetLabelText = 23'i32  ## LocalizedText::SetLabelText
   NuTSetParentAlign  = 24'i32  ## TMPro.TMP_DefaultControls::SetParentAndAlign
   NuTMetaInit        = 25'i32  ## il2cpp_codegen_initialize_runtime_metadata
+  NuTMouseDown       = 26'i32  ## UnityEngine.Input::GetMouseButtonDown(int)
+  NuTMouseHeld       = 27'i32  ## UnityEngine.Input::GetMouseButton(int)
+  NuTMousePos        = 28'i32  ## UnityEngine.Input::get_mousePosition_Injected
 
 # ---- field offsets for wiring a from-scratch TMP's dependencies ---------
 #
@@ -793,6 +801,33 @@ proc nuHitTest(rt: Il2CppPtr; px, py: float32): bool =
   let (ok, rx, ry, rw, rh) = nuGetRect(rt)
   if not ok: return false
   cNuRectContains(rx, ry, rw, rh, px, py) != 0'i32
+
+# --- polled mouse. STATIC calls on the Unity thread only. The caller is
+# already inside the one per-frame guard; these add no guard of their own. ---
+proc nuMouseDown(button: int32): bool =
+  ## `Input::GetMouseButtonDown(button)` -- true only on the frame it went down.
+  if not gNuOn or cNuDisabled() != 0'i32: return false
+  let fn = nuFn(NuTMouseDown)
+  if fn == nil: return false
+  cNuCallBI(fn, button) != 0'i32
+
+proc nuMouseHeld(button: int32): bool =
+  ## `Input::GetMouseButton(button)` -- true every frame it is held.
+  if not gNuOn or cNuDisabled() != 0'i32: return false
+  let fn = nuFn(NuTMouseHeld)
+  if fn == nil: return false
+  cNuCallBI(fn, button) != 0'i32
+
+proc nuMousePos(): (bool, float32, float32) =
+  ## Screen-space pointer position in pixels (bottom-left origin), via the
+  ## sret `_Injected` form -- the same struct-return discipline the layout
+  ## getters use, so there is no by-value ABI to get wrong. Returns
+  ## (false,0,0) if the input target is unverified on this build.
+  if not gNuOn or cNuDisabled() != 0'i32: return (false, 0.0'f32, 0.0'f32)
+  let fn = nuFn(NuTMousePos)
+  if fn == nil: return (false, 0.0'f32, 0.0'f32)
+  cNuCallVS1(fn, cNuV3Ptr())        # RCX = ret buffer, RDX = MethodInfo* = NULL
+  (true, cNuV3X(), cNuV3Y())
 
 # ---------------------------------------------------------------------------
 # TEARDOWN -- creating UI that cannot be torn down is a leak

@@ -575,6 +575,13 @@ proc mi2LadderFired(regs: Il2CppPtr) =
   if nuProofWanted():
     nuProofRun(tab)
 
+  # THE GRAPHICS-SUBTABS FEATURE RIDES THE SAME DRAIN. Also not a second hook.
+  # It only acts for the Graphics group; for every other group it is a no-op.
+  # `gfxSubtabsProbe` carries its own single `aowl_p_p_seh`, correct here for
+  # the same reason `nuProofRun` is: the ladder's per-step guards have returned.
+  if gfxSubtabsWanted():
+    gfxSubtabsProbe(group, tab)
+
 proc bindManagedInvoke(verbose: bool): bool =
   ## Installs the kind=9 POSTFIX detour on `SettingsScreen::EnsureTabInitialized`
   ## from the verified static target in `aowlspt_bridge.h` -- the same target the

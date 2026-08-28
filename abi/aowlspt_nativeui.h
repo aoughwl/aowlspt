@@ -415,6 +415,25 @@ static const AowlNuTarget aowl_nu_targets[] = {
     { "il2cpp_codegen_initialize_runtime_metadata", 0x5251C0u,
       { 0x88,0x54,0x24,0x10,0x41,0x56,0x48,0x83,0xEC,0x30,0x45,0x33,0xC9,
         0x4C,0x8B,0xF1 }, 16 },
+    /* --- POLLED INPUT (the interaction primitive nativeui v1 documented as
+     * absent -- "the caller supplies the pointer position it already has").
+     * All STATIC. Resolved offline from GameAssembly.dll +
+     * global-metadata.dec.dat via il2cpp_resolve.py; UnityEngine.Input lives
+     * in UnityEngine.InputLegacyModule.dll, so its RVAs come from THAT image's
+     * methodPointers table. Each opens with a real register-save prologue, not
+     * the 0x628110 `ret 0` stub. These are CALLED every frame on the Unity
+     * thread, never detoured. */
+    { "UnityEngine.Input::GetMouseButtonDown(int)", 0x531EC20u,
+      { 0x40,0x53,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,0x0B,0x71,0xDB,0x01,
+        0x8B,0xD9,0x48 }, 16 },
+    { "UnityEngine.Input::GetMouseButton(int)", 0x531EBD0u,
+      { 0x40,0x53,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,0x53,0x71,0xDB,0x01,
+        0x8B,0xD9,0x48 }, 16 },
+    /* get_mousePosition_Injected(Vector3* ret): STATIC sret. RCX = ret buffer
+     * (3 floats, screen pixels, bottom-left origin), RDX = MethodInfo*. */
+    { "UnityEngine.Input::get_mousePosition_Injected", 0x531F740u,
+      { 0x40,0x53,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,0x73,0x66,0xDB,0x01,
+        0x48,0x8B,0xD9 }, 16 },
 };
 
 #define AOWL_NU_TARGET_COUNT \
@@ -618,6 +637,15 @@ static int32_t aowl_nu_call_b_s1(void* fn, void* a0) {
     if (!fn || !a0) return 0;
     return ((AowlNu_B_S1)fn)(a0, NULL) ? 1 : 0;
 }
+/* STATIC bool f(int, MethodInfo*). Distinct from `b_s1` for one reason that
+ * matters: the argument is a VALUE, not a pointer, so button 0 (left mouse)
+ * must NOT be refused the way a null pointer is. `b_s1` would drop every
+ * left-click on the floor. */
+typedef unsigned char (*AowlNu_B_I)(int32_t, void*);
+static int32_t aowl_nu_call_b_i(void* fn, int32_t a0) {
+    if (!fn) return 0;
+    return ((AowlNu_B_I)fn)(a0, NULL) ? 1 : 0;
+}
 /* The generic shape. A NULL MethodInfo* is REFUSED rather than passed: the
  * shared body dereferences it at +0x38, so a NULL there is an immediate access
  * violation with nothing learned. */
@@ -655,6 +683,17 @@ static float aowl_nu_rect_x(void) { return g_nu_rect[0]; }
 static float aowl_nu_rect_y(void) { return g_nu_rect[1]; }
 static float aowl_nu_rect_w(void) { return g_nu_rect[2]; }
 static float aowl_nu_rect_h(void) { return g_nu_rect[3]; }
+
+/* Vector3 sret buffer for Input::get_mousePosition_Injected. Same file-scope,
+ * once-allocated, Unity-thread-only discipline as the Vector2/Rect buffers
+ * above -- zeroed on hand-out so a call that faults under the guard cannot
+ * leave a stale pointer position readable as a fresh one. */
+static float g_nu_v3[3];
+static void* aowl_nu_v3_ptr(void) { g_nu_v3[0]=0.0f; g_nu_v3[1]=0.0f;
+                                    g_nu_v3[2]=0.0f; return (void*)g_nu_v3; }
+static float aowl_nu_v3_x(void) { return g_nu_v3[0]; }
+static float aowl_nu_v3_y(void) { return g_nu_v3[1]; }
+static float aowl_nu_v3_z(void) { return g_nu_v3[2]; }
 
 /* Pure arithmetic, no game state: is (px,py) inside the rect a
  * `get_rect_Injected` just produced, given the element's world-space origin?
