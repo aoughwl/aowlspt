@@ -435,11 +435,16 @@ proc nuAdd(go: Il2CppPtr; kind: int32): Il2CppPtr =
          "time the owning method runs. Refusing rather than passing a NULL " &
          "MethodInfo, which the shared generic body dereferences at +0x38."
     return nil
+  okLog "nativeui: add(" & kname & "): mi=0x" & hexOf(cast[uint64](mi)) &
+        " fn=0x" & hexOf(cast[uint64](fn)) & " -- about to call AddComponent<T>"
   let comp = cNuCallGeneric0(fn, go, mi)
+  okLog "nativeui: add(" & kname & "): AddComponent<T> returned comp=0x" &
+        hexOf(cast[uint64](comp)) & " -- survived the call; about to validate"
   if not nuOk(comp, 0x10'i32):
     warn "nativeui: add(" & kname & "): AddComponent<T> returned null or " &
          "unreadable"
     return nil
+  okLog "nativeui: add(" & kname & "): comp readable -- about to judge its klass"
   let verdict = cNuSlotJudge(kind, comp)
   if verdict == NuSlotVerified:
     if cNuSlotState(kind) == NuSlotVerified:
@@ -632,30 +637,56 @@ proc nuWireTextDeps(fresh, donor: Il2CppPtr): bool =
   ## refusal, not a maybe. The materials are best-effort: a null donor material
   ## is copied as null only if it was already null (TMP rebuilds it from the
   ## font in that case), never fabricated.
+  okLog "nativeui: wireTextDeps: ENTER fresh=0x" & hexOf(cast[uint64](fresh)) &
+        " donor=0x" & hexOf(cast[uint64](donor)) & " -- VirtualQuerying both"
   if not nuOk(fresh, 0x120'i32) or not nuOk(donor, 0x120'i32):
     warn "nativeui: wireTextDeps: the fresh or donor TMP is null/too-small to " &
-         "hold m_sharedMaterial@0x118; refusing"
+         "hold m_sharedMaterial@0x118; refusing (fresh readable=" &
+         $(nuOk(fresh, 0x120'i32)) & " donor readable=" &
+         $(nuOk(donor, 0x120'i32)) & ")"
     return false
+
+  okLog "nativeui: wireTextDeps: about to GET m_fontAsset@0x100 from the DONOR"
   let font = cNuGetRef(donor, NuOffTmpFontAsset)
+  okLog "nativeui: wireTextDeps: got font=0x" & hexOf(cast[uint64](font)) &
+        " from donor"
   if not nuOk(font, 0x10'i32):
     warn "nativeui: wireTextDeps: the donor's m_fontAsset@0x100 is null or " &
          "unreadable -- without it TMP's Awake faults on the default-font " &
          "path, so refusing to build a TMP that cannot render"
     return false
+
+  okLog "nativeui: wireTextDeps: about to GET m_sharedMaterial@0x118 from DONOR"
   let sharedMat = cNuGetRef(donor, NuOffTmpSharedMaterial)
-  let gMat      = cNuGetRef(donor, NuOffGraphicMaterial)
+  okLog "nativeui: wireTextDeps: got sharedMat=0x" &
+        hexOf(cast[uint64](sharedMat)) & "; about to GET Graphic m_Material@0x20"
+  let gMat = cNuGetRef(donor, NuOffGraphicMaterial)
+  okLog "nativeui: wireTextDeps: got gMat=0x" & hexOf(cast[uint64](gMat)) &
+        "; about to SET m_fontAsset on the FRESH component"
+
   if cNuSetRef(fresh, NuOffTmpFontAsset, font) == 0'i32:
     warn "nativeui: wireTextDeps: m_fontAsset slot on the fresh TMP is not " &
          "writable; refusing"
     return false
-  okLog "nativeui: wireTextDeps: font asset 0x" & hexOf(cast[uint64](font)) &
-        " copied from donor 0x" & hexOf(cast[uint64](donor))
+  okLog "nativeui: wireTextDeps: SET m_fontAsset ok (font 0x" &
+        hexOf(cast[uint64](font)) & " copied from donor 0x" &
+        hexOf(cast[uint64](donor)) & ")"
+
   if nuOk(sharedMat, 0x10'i32):
+    okLog "nativeui: wireTextDeps: about to SET m_sharedMaterial on the FRESH"
     if cNuSetRef(fresh, NuOffTmpSharedMaterial, sharedMat) != 0'i32:
-      okLog "nativeui: wireTextDeps: shared material 0x" &
-            hexOf(cast[uint64](sharedMat)) & " copied"
+      okLog "nativeui: wireTextDeps: SET m_sharedMaterial ok (0x" &
+            hexOf(cast[uint64](sharedMat)) & ")"
+  else:
+    okLog "nativeui: wireTextDeps: donor m_sharedMaterial null/unreadable -- " &
+          "leaving the fresh one null (TMP rebuilds it from the font)"
+
   if nuOk(gMat, 0x10'i32):
+    okLog "nativeui: wireTextDeps: about to SET Graphic m_Material on the FRESH"
     discard cNuSetRef(fresh, NuOffGraphicMaterial, gMat)
+    okLog "nativeui: wireTextDeps: SET Graphic m_Material ok (0x" &
+          hexOf(cast[uint64](gMat)) & ")"
+  okLog "nativeui: wireTextDeps: DONE -- all reachable deps copied"
   result = true
 
 # ---------------------------------------------------------------------------
@@ -1088,6 +1119,8 @@ proc nuProofStageB(tabPtr: Il2CppPtr) =
               "font+material wired. If the log stops here, TMP needs more than " &
               "font+material.")
   discard nuSetActive(go, true)
+  okLog "nativeui PROOF B: SetActive(true) returned -- TMP's Awake/OnEnable " &
+        "SURVIVED with font+material wired"
   nuStep("B", "set_text through the real setter + re-apply after activation")
   discard nuSetText(tmp, NuProofTextB)
   discard nuSetText(tmp, NuProofTextB)
