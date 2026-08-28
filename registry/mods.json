@@ -80,9 +80,9 @@
     {
       "id": "aowl.morebots",
       "parent": "aowl.sain",
-      "name": "Bot AI: population",
+      "name": "Bot AI — Population",
       "internal": true,
-      "author": "TacticalToaster (ported to aowlspt)",
+      "author": "aowlspt",
       "version": "1.0.0",
       "description": "The population and bot-type/faction half of Bot AI. Raises how many AI a map runs (cap, per-zone limit and scav wave slots, computed from a stock baseline) and is the bot-type and faction API other mods register against. Hidden from the mod list on purpose: it is not a separate mod to the player, its settings render inside the Bot AI page tree under Population, and its guid, path, dll and routes are internal identifiers kept unchanged.",
       "pipeline": ">=0.1.0",
@@ -141,8 +141,8 @@
       },
       "upstream": {
         "name": "Bot AI",
-        "author": "Solarint, maintained by ArchangelWTF",
-        "url": "https://github.com/Solarint/SAIN"
+        "author": "aowlspt",
+        "url": null
       },
       "license": null,
       "download": null,
@@ -484,10 +484,10 @@
       "id": "aowl.waypoints",
       "internal": true,
       "parent": "aowl.sain",
-      "name": "Waypoints",
+      "name": "Bot AI — Patrols",
       "author": "savannt",
       "version": "1.0.0",
-      "description": "Bot patrol waypoint data for ten maps, served from the backend: 87 zones, 197 patrols, 8556 points, ported from DrakiaXYZ's SPT-Waypoints 1.3.4 (points by Solarint, MIT) into schema aowlspt.waypoints/1. Routes: /waypoints/status, /waypoints/maps, /waypoints/points/<map>. Also applies the parts of upstream's server-side patrol pacing tweak that this database actually carries, probing each key first and reporting the ones post-1.0 dropped. The data is inert until something consumes it: the only live consumption path on this build is aowlspt/botnav's advisory sendBotTo, and upstream's own navmesh-bundle injection is out of reach here. It is in no shipped list on purpose: the data is inert until a consumer is wired to it, so it is meant to be switched on by hand.",
+      "description": "Bot patrol waypoint data for ten maps, served from the backend: 87 zones, 197 patrols, 8556 points, into schema aowlspt.waypoints/1. Routes: /waypoints/status, /waypoints/maps, /waypoints/points/<map>. Also applies the parts of upstream's server-side patrol pacing tweak that this database actually carries, probing each key first and reporting the ones post-1.0 dropped. The data is inert until something consumes it: the only live consumption path on this build is aowlspt/botnav's advisory sendBotTo, and upstream's own navmesh-bundle injection is out of reach here. It is in no shipped list on purpose: the data is inert until a consumer is wired to it, so it is meant to be switched on by hand.",
       "pipeline": ">=0.1.0",
       "sides": [
         "server"

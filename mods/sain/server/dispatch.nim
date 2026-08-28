@@ -222,7 +222,7 @@ proc onPlan(payload: string): string =
   if not asBool(field(j, "ok"), false):
     gHavePlan = false
     gAnchorLen = 0
-    warn "sain/dispatch: the ORBIT plan arrived with ok=false (" &
+    warn "sain/dispatch: the flanking plan arrived with ok=false (" &
          asText(field(j, "why"), "no reason given") &
          "). No bot will be sent anywhere this raid, and that is the plan " &
          "being empty rather than the channel being down"
@@ -280,7 +280,7 @@ proc onPlan(payload: string): string =
     inc k
   gSlotLen = 0
   gHavePlan = gAnchorLen > 0
-  info "sain/dispatch: ORBIT plan for '" & gPlanMap & "' -- " &
+  info "sain/dispatch: flanking plan for '" & gPlanMap & "' -- " &
        $gAnchorLen & " anchors, leash " & $int(gLeash) & "m, reach " &
        $int(gReach) & "m. Bots will be dispatched on the next census"
 
@@ -299,7 +299,7 @@ proc startDispatch*(forcePersonality: types.Personality;
            "'. Every bot will use that coverage roll and sprint rule when " &
            "choosing objectives. THIS is the channel that setting never had"
     else:
-      warn "sain/dispatch: forcePersonality does not map onto an ORBIT " &
+      warn "sain/dispatch: forcePersonality does not map onto a flanking " &
            "personality and is REFUSED; personalities will be drawn from " &
            "the plan's distribution instead"
   result = onEvent("tarkov.orbit.plan", onPlan) == Ok
