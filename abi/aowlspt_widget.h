@@ -102,38 +102,45 @@ static int32_t aowl_wg_lmb_rel   = 0;
  *
  * Returns 1 when the sample is usable: our process owns the foreground, the
  * window has a real client area, and the cursor is inside it. */
-static int32_t aowl_wg_mouse_sample(void) {
-    POINT p;
-    RECT  rc;
-    HWND  h;
-    DWORD pid = 0;
-    int32_t down;
-
+/* THE EDGE MACHINE, SEPARATED FROM THE WIN32 CALLS THAT FEED IT.
+ *
+ * `aowl_wg_mouse_sample` below is now only the four Win32 reads; every DECISION
+ * -- press edge, release edge, whether the sample is usable, what a focus loss
+ * does to a held button -- is here, in a function that takes plain integers.
+ * That is what `tests/overlayhost/dragtest.c` drives, and it is the half where
+ * a drag silently dies: a press edge reported twice grabs the widget under a
+ * click the player aimed at the game, and a held state carried across a focus
+ * change comes back as a release the drag acts on.
+ *
+ * `focused` 0 means the foreground window is not ours (or there is none).
+ * `w`/`h` are the client size; `x`/`y` the cursor in client pixels. Returns 1
+ * only when the sample is usable, which is what `aowl_wg_mouse_ok` publishes. */
+static int32_t aowl_wg_mouse_apply(int32_t focused, int32_t haveRect,
+                                   int32_t x, int32_t y,
+                                   int32_t w, int32_t h, int32_t down) {
     aowl_wg_ms_ok = 0;
     aowl_wg_lmb_press = 0;
     aowl_wg_lmb_rel   = 0;
 
-    h = GetForegroundWindow();
-    if (!h) { aowl_wg_lmb_was = 0; aowl_wg_lmb_down = 0; return 0; }
-    GetWindowThreadProcessId(h, &pid);
-    if (pid != GetCurrentProcessId()) {
-        /* Not our window. Forget the button entirely rather than carry a held
+    if (!focused) {
+        /* Not our window. FORGET the button entirely rather than carry a held
          * state across a focus change -- otherwise alt-tabbing away mid-drag
-         * and clicking elsewhere comes back as a release we act on. */
-        aowl_wg_lmb_was = 0; aowl_wg_lmb_down = 0;
+         * and clicking elsewhere comes back as a release we act on. No release
+         * EDGE is reported either: the drag is ended by the held state going
+         * to 0, which the Nim side treats as a drop, and reporting a synthetic
+         * release as well would drop the widget twice. */
+        aowl_wg_lmb_was = 0;
+        aowl_wg_lmb_down = 0;
         return 0;
     }
-    if (!GetClientRect(h, &rc)) return 0;
-    if (rc.right <= rc.left || rc.bottom <= rc.top) return 0;
-    if (!GetCursorPos(&p)) return 0;
-    if (!ScreenToClient(h, &p)) return 0;
+    if (!haveRect || w <= 0 || h <= 0) return 0;
 
-    aowl_wg_ms_w = (int32_t)(rc.right - rc.left);
-    aowl_wg_ms_h = (int32_t)(rc.bottom - rc.top);
-    aowl_wg_ms_x = (int32_t)p.x;
-    aowl_wg_ms_y = (int32_t)p.y;
+    aowl_wg_ms_w = w;
+    aowl_wg_ms_h = h;
+    aowl_wg_ms_x = x;
+    aowl_wg_ms_y = y;
 
-    down = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) ? 1 : 0;
+    down = down ? 1 : 0;
     if (down && !aowl_wg_lmb_was)  aowl_wg_lmb_press = 1;
     if (!down && aowl_wg_lmb_was)  aowl_wg_lmb_rel   = 1;
     aowl_wg_lmb_was  = down;
@@ -142,12 +149,34 @@ static int32_t aowl_wg_mouse_sample(void) {
     /* The cursor may legitimately be outside the client area (title bar,
      * another monitor) while the window still has focus. The sample is then
      * NOT ok, so a drag in progress holds its last good position rather than
-     * teleporting the widget to a negative coordinate. */
-    if (p.x < 0 || p.y < 0 || p.x >= aowl_wg_ms_w || p.y >= aowl_wg_ms_h)
-        return 0;
+     * teleporting the widget to a negative coordinate. The BUTTON state above
+     * is still updated, because a release that happens off the client area is
+     * still a release. */
+    if (x < 0 || y < 0 || x >= w || y >= h) return 0;
 
     aowl_wg_ms_ok = 1;
     return 1;
+}
+
+static int32_t aowl_wg_mouse_sample(void) {
+    POINT p;
+    RECT  rc;
+    HWND  h;
+    DWORD pid = 0;
+
+    h = GetForegroundWindow();
+    if (!h) return aowl_wg_mouse_apply(0, 0, 0, 0, 0, 0, 0);
+    GetWindowThreadProcessId(h, &pid);
+    if (pid != GetCurrentProcessId())
+        return aowl_wg_mouse_apply(0, 0, 0, 0, 0, 0, 0);
+    if (!GetClientRect(h, &rc))  return aowl_wg_mouse_apply(1, 0, 0, 0, 0, 0, 0);
+    if (!GetCursorPos(&p))       return aowl_wg_mouse_apply(1, 0, 0, 0, 0, 0, 0);
+    if (!ScreenToClient(h, &p))  return aowl_wg_mouse_apply(1, 0, 0, 0, 0, 0, 0);
+
+    return aowl_wg_mouse_apply(1, 1, (int32_t)p.x, (int32_t)p.y,
+                               (int32_t)(rc.right - rc.left),
+                               (int32_t)(rc.bottom - rc.top),
+                               (GetAsyncKeyState(VK_LBUTTON) & 0x8000) ? 1 : 0);
 }
 
 static int32_t aowl_wg_mouse_ok(void) { return aowl_wg_ms_ok; }
