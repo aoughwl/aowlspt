@@ -582,7 +582,7 @@ proc fovSchema(): seq[Setting] =
     # that disagrees with the code's default is a row that lies before it is
     # ever touched.
     boolSetting("verifyHooksByName", "Verify hooks by name at load", false,
-                category = "Advanced",
+                category = "Advanced", appliesOn = "restart",
                 description = "From Fontaine's FOV Fix (com.fontaine.fovfix), rewritten from scratch for aowlspt. Attach the by-name target-verification watch, which resolves each patched method by name at raid start and reports whether the live target still matches the one the detour bound. DIAGNOSTIC: it does not drive the FOV write -- that has its own driver and is armed regardless -- so leaving this off does not switch the mod off. Off by default because by-name resolution on this build can return a non-nil handle into unmapped memory")]
 
 proc onFovSettings(url, body, session: string): string =
@@ -595,15 +595,6 @@ proc onFovSettings(url, body, session: string): string =
     st = applySettingFromBody(body)
     if st == Ok: loadConfig()
   result = declaredSchemaReply(st).text
-
-proc onSettingsHotApply(key: string) =
-  ## fov is client-side, so its `/aowlspt/settings/<guid>` route is registered
-  ## into nothing and the handlers above never run in the client. Without this
-  ## an F12 edit persists to config.json and the live FOV keeps the value it
-  ## was loaded with until the next launch -- a slider that moves and changes
-  ## nothing. Same call the route handler makes: ONE apply path, not two.
-  discard key
-  loadConfig()
 
 proc onFovSettingsReset(url, body, session: string): string =
   let st = resetFromBody(body)
@@ -3589,6 +3580,42 @@ proc simSelfTest(): Status =
 # ---------------------------------------------------------------------------
 
 var gElapsedMs = 0'i64
+
+proc onSettingsHotApply(key: string) =
+  ## fov is client-side, so its `/aowlspt/settings/<guid>` route is registered
+  ## into nothing and the handlers above never run in the client. Without this
+  ## an F12 edit persists to config.json and the live FOV keeps the value it
+  ## was loaded with until the next launch -- a slider that moves and changes
+  ## nothing. Same call the route handler makes: ONE apply path, not two.
+  ##
+  ## Re-reading the config IS enough for the multipliers: `applyFov` reads the
+  ## `cfg*` globals every frame and never caches them, so `loadConfig` alone
+  ## puts a new multiplier in force on the next frame. What it is NOT enough
+  ## for is anything decided at load -- which driver was installed, and whether
+  ## one was installed at all -- and those must say "restart" rather than let
+  ## the caller assume the re-read did something.
+  ##
+  ## This proc lives HERE, below `gFovState`/`gDriverState`/`armed`, rather
+  ## than next to the route handlers it mirrors, because it now reports the
+  ## arming state and those are declared later in the file.
+  loadConfig()
+  if key == "enableFovWrite" or key == "verifyHooksByName" or
+     key == "hookFrameDriver" or key == "deferUntilUnityThread":
+    settingAppliesOnRestart("this key is read once, at load, to decide what " &
+                            "gets installed; re-reading the config cannot " &
+                            "install or remove a driver mid-run")
+    return
+  if not cfgEnableFovWrite:
+    settingIgnored("the FOV write is not installed this run -- " & gDriverState)
+    return
+  if not armed(gFovState):
+    settingIgnored("the FOV effect is not armed -- " & gFovState &
+                   " (last camera reason: " & gCamWhy & ")")
+    return
+  settingApplied("now writing optic x" & $cfgOpticFovMulti & ", unmagnified x" &
+                 $cfgNonOpticFovMulti & ", base FOV clamped to " &
+                 $cfgMinBaseFov & ".." & $cfgMaxBaseFov & "; sensitivity " &
+                 (if cfgChangeMouseSensitivity: "scaled" else: "untouched"))
 
 proc onLoad(): Status =
   loadConfig()

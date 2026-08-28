@@ -64,6 +64,15 @@ enum {
     AOWL_OV_PEND_UNKNOWN
 };
 
+#define AOWL_OV_PEND_MAX 8
+
+typedef struct AowlOvPend {
+    char    page[80];
+    char    key[80];
+    char    raw[64];
+    int32_t state;
+} AowlOvPend;
+
 typedef struct AowlOvSItem {
     char    key[80];
     int32_t kind;
@@ -77,10 +86,8 @@ static struct {
     AowlOvSItem items[AOWL_OV_MAX_SITEMS];
     int32_t     itemCount;
     char        itemsPage[80];
-    char        optPage[80];
-    char        optKey[80];
-    char        optRaw[64];
-    int32_t     optState;
+    AowlOvPend  opt[AOWL_OV_PEND_MAX];
+    int32_t     optCountP;
     char        writeWhy[512];
     int32_t     dataSerial;
     AowlFakeCS  cs;
@@ -205,7 +212,7 @@ static void run(const Scenario* sc, int32_t prefix) {
     /* THE ONE LINE THAT DIFFERS BETWEEN THE TWO MODES. Pre-fix, the panel
      * opened no optimistic edit and simply displayed whatever the document
      * said -- which for 13.7 s was the old value. */
-    if (!prefix) aowl_ov_pend_begin("aowl.tarkov", "opticFovMulti", sc->newValue);
+    if (!prefix) (void)aowl_ov_pend_begin("aowl.tarkov", "opticFovMulti", sc->newValue);
     /* POST, then the immediate re-read. */
     aowl_ov_settings_load("aowl.tarkov", 1, buf, (int32_t)sizeof(buf));
     aowl_ov_settings_verify("aowl.tarkov", "opticFovMulti", sc->newValue, 1,
@@ -300,7 +307,7 @@ int main(void) {
             check("settles on the new value",
                   strcmp(last, sc->newValue) == 0);
             check("and stops saying SAVING once confirmed",
-                  g_ov.optState == AOWL_OV_PEND_NONE &&
+                  g_ov.optCountP == 0 &&
                   g_ov.items[0].pend == AOWL_OV_PEND_NONE);
             check("with no banner",  g_ov.writeWhy[0] == 0);
         } else {

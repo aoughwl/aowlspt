@@ -232,6 +232,12 @@ proc onSettingsHotApply(key: string) =
   ## silent is indistinguishable from a broken one.
   discard key
   loadConfig()
+  # Say WHICH of the two it was. The docstring above already knew this mod
+  # mostly cannot act live; the log did not, and printed the same "applied"
+  # line a mod that really re-graded its renderer would print.
+  settingAppliesOnRestart("the manifest and the redirect arm are read once at " &
+                          "load; the in-memory config is refreshed now, but " &
+                          "the replacement set changes on the next launch")
 # ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------

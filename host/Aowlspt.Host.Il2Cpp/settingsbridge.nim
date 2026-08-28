@@ -87,6 +87,26 @@ var gSbIdx = 0
 var gSbCycles = 0
 var gSbLastPushed = 0
 
+# THE LEDGER THAT MAKES THE FAILURE COUNTABLE.
+#
+# `edits` counts values that reached config.json. `applied` counts mods that
+# said the change is in force NOW. Before this existed the two were the same
+# line, and one live session read: 9 graphics edits, 1 grade push -- and that
+# one push was at boot. The invariant a live-tunable mod must satisfy is
+#
+#     stored == applied + restart + ignored
+#
+# with `unreported` and `nohook` at ZERO. Any nonzero `unreported`/`nohook`, or
+# an `applied` that lags `stored` for a mod with no restart/ignored reasons, is
+# the bug -- and it is now visible without a rebuild.
+var gSbEdStored = 0
+var gSbEdApplied = 0
+var gSbEdRestart = 0
+var gSbEdIgnored = 0
+var gSbEdSilent = 0
+var gSbEdNoHook = 0
+var gSbEdRefused = 0
+
 proc sbFault(why: string) =
   inc gSbFaults
   warn "client settings bridge: " & why & " (fault " & $gSbFaults & "/" &
@@ -254,8 +274,53 @@ proc sbApplyPending(reply: string) =
       var okTxt = ""
       discard pathGet(gSbApply, "ok", okTxt)
       if okTxt == "true":
-        okLog "client settings bridge: applied an F12 edit to '" & guid & "'"
+        # TWO EVENTS, TWO LINES. This used to be one line reading "applied an
+        # F12 edit to '<guid>'", which was true only of the STORE and read as
+        # success for the EFFECT. Nine of those lines sat next to one grade
+        # push and nobody could tell from the log that the renderer had never
+        # been re-graded.
+        var key = ""
+        discard pathGet(gSbApply, "key", key)
+        if key.len == 0: key = "?"
+        var effect = ""
+        discard pathGet(gSbApply, "effect", effect)
+        var detail = ""
+        discard pathGet(gSbApply, "effectDetail", detail)
+        let tail = (if detail.len > 0: " -- " & detail else: "")
+        inc gSbEdStored
+        okLog "client settings bridge: STORED '" & guid & "'." & key &
+              " to config.json"
+        if effect == "applied":
+          inc gSbEdApplied
+          okLog "client settings bridge: APPLIED '" & guid & "'." & key &
+                " -- the mod re-read its config and the change is in force now" &
+                tail
+        elif effect == "restart":
+          inc gSbEdRestart
+          info "client settings bridge: APPLIES ON RESTART '" & guid & "'." &
+               key & " -- stored, and it cannot take effect until the game is " &
+               "relaunched" & tail
+        elif effect == "ignored":
+          inc gSbEdIgnored
+          warn "client settings bridge: IGNORED '" & guid & "'." & key &
+               " -- stored, and the mod deliberately did not act on it" & tail
+        elif effect == "nohook":
+          inc gSbEdNoHook
+          warn "client settings bridge: NO EFFECT '" & guid & "'." & key &
+               " -- stored, but this mod registered no onSettingsApplied hook, " &
+               "so nothing re-read it. It will not take effect before a restart."
+        else:
+          inc gSbEdSilent
+          warn "client settings bridge: EFFECT UNKNOWN '" & guid & "'." & key &
+               " -- stored, the mod's apply hook ran and reported nothing. " &
+               "Do not read this as success: the hook must call " &
+               "settingApplied/settingAppliesOnRestart/settingIgnored."
+        info "client settings bridge: edit ledger -- stored=" & $gSbEdStored &
+             " applied=" & $gSbEdApplied & " restart=" & $gSbEdRestart &
+             " ignored=" & $gSbEdIgnored & " unreported=" & $gSbEdSilent &
+             " nohook=" & $gSbEdNoHook & " refused=" & $gSbEdRefused
       else:
+        inc gSbEdRefused
         var err = ""
         discard pathGet(gSbApply, "err", err)
         sbFault("'" & guid & "' refused an F12 edit: " &

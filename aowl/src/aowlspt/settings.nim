@@ -77,6 +77,15 @@ type
     optionsUrl*: string   ## for stSelect: a route serving choices on demand
     description*: string  ## one sentence of help
     implemented*: bool    ## false → drawn greyed with the reason in `description`
+    appliesOn*: string    ## when an edit takes effect: `"live"` (default) or
+                          ## `"restart"`. A row that CANNOT take effect until the
+                          ## game is relaunched must say `"restart"` here, so the
+                          ## panel can label it. A control that changes nothing
+                          ## and does not say why is the failure this whole
+                          ## mechanism exists to stop; "restart" is an honest
+                          ## answer, silence is not. NOTE: this is unrelated to
+                          ## `mods/manager`'s `appliesOn` wire field, which
+                          ## carries a mod's SIDE (`client`/`server`/`both`).
 
 proc kindName*(k: SettingType): string =
   ## The wire name of a type, matching what the UI switches on.
@@ -98,66 +107,66 @@ proc kindName*(k: SettingType): string =
 # chosen so the shortest possible call still produces a usable control.
 
 proc boolSetting*(key, label: string; default: bool;
-                  category = ""; subcategory = ""; description = ""; implemented = true): Setting =
+                  category = ""; subcategory = ""; description = ""; implemented = true; appliesOn = "live"): Setting =
   result = Setting(key: key, label: label, kind: stBool,
                    defaultJson: (if default: "true" else: "false"),
                    lo: 0.0, hi: 0.0, step: 0.0, hasRange: false,
                    options: @[], category: category, subcategory: subcategory,
                    optionLabels: @[], optionsUrl: "", description: description,
-                   implemented: implemented)
+                   implemented: implemented, appliesOn: appliesOn)
 
 proc intSetting*(key, label: string; default: int;
                  lo = 0; hi = 0; step = 1;
-                 category = ""; subcategory = ""; description = ""; implemented = true): Setting =
+                 category = ""; subcategory = ""; description = ""; implemented = true; appliesOn = "live"): Setting =
   result = Setting(key: key, label: label, kind: stInt,
                    defaultJson: $default,
                    lo: float(lo), hi: float(hi), step: float(step),
                    hasRange: hi > lo,
                    options: @[], category: category, subcategory: subcategory,
                    optionLabels: @[], optionsUrl: "", description: description,
-                   implemented: implemented)
+                   implemented: implemented, appliesOn: appliesOn)
 
 proc floatSetting*(key, label: string; default: float;
                    lo = 0.0; hi = 0.0; step = 0.0;
-                   category = ""; subcategory = ""; description = ""; implemented = true): Setting =
+                   category = ""; subcategory = ""; description = ""; implemented = true; appliesOn = "live"): Setting =
   result = Setting(key: key, label: label, kind: stFloat,
                    defaultJson: $default,
                    lo: lo, hi: hi, step: step, hasRange: hi > lo,
                    options: @[], category: category, subcategory: subcategory,
                    optionLabels: @[], optionsUrl: "", description: description,
-                   implemented: implemented)
+                   implemented: implemented, appliesOn: appliesOn)
 
 proc enumSetting*(key, label: string; default: string; options: seq[string];
-                  category = ""; subcategory = ""; description = ""; implemented = true): Setting =
+                  category = ""; subcategory = ""; description = ""; implemented = true; appliesOn = "live"): Setting =
   result = Setting(key: key, label: label, kind: stEnum,
                    defaultJson: "\"" & server.escapeText(default) & "\"",
                    lo: 0.0, hi: 0.0, step: 0.0, hasRange: false,
                    options: options, category: category, subcategory: subcategory,
                    optionLabels: @[], optionsUrl: "",
-                   description: description, implemented: implemented)
+                   description: description, implemented: implemented, appliesOn: appliesOn)
 
 proc stringSetting*(key, label: string; default: string;
-                    category = ""; subcategory = ""; description = ""; implemented = true): Setting =
+                    category = ""; subcategory = ""; description = ""; implemented = true; appliesOn = "live"): Setting =
   result = Setting(key: key, label: label, kind: stString,
                    defaultJson: "\"" & server.escapeText(default) & "\"",
                    lo: 0.0, hi: 0.0, step: 0.0, hasRange: false,
                    options: @[], category: category, subcategory: subcategory,
                    optionLabels: @[], optionsUrl: "", description: description,
-                   implemented: implemented)
+                   implemented: implemented, appliesOn: appliesOn)
 
 proc keybindSetting*(key, label: string; default: string;
-                     category = ""; subcategory = ""; description = ""; implemented = true): Setting =
+                     category = ""; subcategory = ""; description = ""; implemented = true; appliesOn = "live"): Setting =
   result = Setting(key: key, label: label, kind: stKeybind,
                    defaultJson: "\"" & server.escapeText(default) & "\"",
                    lo: 0.0, hi: 0.0, step: 0.0, hasRange: false,
                    options: @[], category: category, subcategory: subcategory,
                    optionLabels: @[], optionsUrl: "", description: description,
-                   implemented: implemented)
+                   implemented: implemented, appliesOn: appliesOn)
 
 proc selectSetting*(key, label: string; default: string; options: seq[string];
                     optionLabels: seq[string] = @[]; optionsUrl = "";
                     category = ""; subcategory = ""; description = "";
-                    implemented = true): Setting =
+                    implemented = true; appliesOn = "live"): Setting =
   ## A choice out of a set too large to draw as a `<select>` -- an item id out
   ## of the whole handbook, a map, a trader. The VALUE is a plain string, the
   ## same as `enumSetting`, so nothing about persistence or `configSet`
@@ -182,7 +191,7 @@ proc selectSetting*(key, label: string; default: string; options: seq[string];
                    options: options, category: category, subcategory: subcategory,
                    optionLabels: optionLabels, optionsUrl: optionsUrl,
                    description: description,
-                   implemented: implemented)
+                   implemented: implemented, appliesOn: appliesOn)
 
 # ---------------------------------------------------------------------------
 # Serialisation
@@ -280,6 +289,10 @@ proc toJson*(s: Setting): JsonObject =
       o.put("path", pa)
   if s.description.len > 0: o.put("description", s.description)
   o.put("implemented", s.implemented)
+  # Always emitted, never conditionally: a renderer must be able to tell
+  # "this row applies live" from "this row said nothing", and an absent field
+  # cannot carry that difference.
+  o.put("appliesOn", (if s.appliesOn.len > 0: s.appliesOn else: "live"))
   result = o
 
 proc schemaJson*(settings: seq[Setting]): Json =
@@ -559,6 +572,62 @@ type
 var gApplyHook: SettingsApplyHook = nil
 var gBusSubscribed = false
 
+# ---------------------------------------------------------------------------
+# What the mod DID with the value — the missing half of the apply path
+# ---------------------------------------------------------------------------
+#
+# The notification path already existed (`onSettingsApplied`, below) and both
+# `mods/graphics` and `mods/fov` already registered a hook. What did NOT exist
+# was any way for a hook to say what it did, so nothing downstream could tell
+# apart:
+#
+#   * the mod re-read its config and pushed the change into the live runtime,
+#   * the mod cannot change this live and needs a relaunch,
+#   * the mod deliberately ignored the value (a preset owns that slider, a
+#     master switch is off, the feature is not armed in this session),
+#   * the mod has no hook at all.
+#
+# All four produced the single line "applied an F12 edit to '<guid>'", which
+# means only "the value reached config.json" and reads as success. That one
+# line is why nine graphics edits and one grade push looked like a working
+# feature. Every branch below now names itself.
+#
+# The mod reports by CALLING one of these from inside its hook. Not by a return
+# value: `SettingsApplyHook` is already registered by five mods and by two
+# tests, and a signature change there is a wide edit with nothing to gain --
+# a hook that reports nothing is a distinguishable state on its own ("ran but
+# said nothing"), which is exactly what we want to be able to see.
+
+const
+  ApplyEffectApplied*  = "applied"
+  ApplyEffectRestart*  = "restart"
+  ApplyEffectIgnored*  = "ignored"
+  ApplyEffectNoHook*   = "nohook"
+  ApplyEffectSilent*   = "unreported"
+
+var gApplyEffect = ""
+var gApplyDetail = ""
+
+proc settingApplied*(detail = "") =
+  ## Call from inside an apply hook: the change is IN FORCE NOW, and `detail`
+  ## should name the value that is now live (not the value that was stored --
+  ## those differ whenever a preset, a clamp or a master switch is involved).
+  gApplyEffect = ApplyEffectApplied
+  gApplyDetail = detail
+
+proc settingAppliesOnRestart*(detail = "") =
+  ## Call from inside an apply hook: stored, but it cannot take effect until
+  ## the game is relaunched. This is a legitimate answer; silence is not.
+  gApplyEffect = ApplyEffectRestart
+  gApplyDetail = detail
+
+proc settingIgnored*(reason: string) =
+  ## Call from inside an apply hook: stored, and deliberately NOT acted on.
+  ## `reason` is mandatory, because "ignored" without a reason is the same
+  ## dead end as saying nothing.
+  gApplyEffect = ApplyEffectIgnored
+  gApplyDetail = reason
+
 proc onSettingsApplied*(cb: SettingsApplyHook) =
   ## Register the hot-apply hook. A mod without one still gets its page and
   ## still persists edits -- it just will not SHOW them until it next re-reads
@@ -586,12 +655,40 @@ proc onApplyQuery(payload: string): string =
     st = resetFromBody(payload)
   else:
     st = applySettingFromBody(payload)
+  let key = field(payload, "key").asText("")
+  # THE STORE AND THE EFFECT ARE TWO DIFFERENT EVENTS. `st` is the store; the
+  # three fields below are the effect. They are reported separately all the way
+  # to the host log, because conflating them is the bug.
+  gApplyEffect = ""
+  gApplyDetail = ""
   if st == Ok and gApplyHook != nil:
-    let k = field(payload, "key")
-    gApplyHook(k.asText(""))
+    gApplyHook(key)
+    if gApplyEffect.len == 0:
+      # The hook RAN and reported nothing. Not a failure -- but not a success
+      # either, and it must not be printed as one. A row declared
+      # `appliesOn = "restart"` is the one case where silence has a documented
+      # meaning, so honour that; otherwise say plainly that nobody knows.
+      let i = findDeclared(key)
+      if i >= 0 and gDeclared[i].appliesOn == "restart":
+        gApplyEffect = ApplyEffectRestart
+        gApplyDetail = "declared appliesOn=restart"
+      else:
+        gApplyEffect = ApplyEffectSilent
+  elif st == Ok:
+    let i = findDeclared(key)
+    if i >= 0 and gDeclared[i].appliesOn == "restart":
+      gApplyEffect = ApplyEffectRestart
+      gApplyDetail = "declared appliesOn=restart"
+    else:
+      gApplyEffect = ApplyEffectNoHook
   var o = obj()
   o.put("guid", modGuid())
   o.put("ok", st == Ok)
+  o.put("key", key)
+  if st == Ok:
+    o.put("effect", gApplyEffect)
+    if gApplyDetail.len > 0:
+      o.put("effectDetail", gApplyDetail)
   if st != Ok:
     o.put("err", statusMessage(st))
   o.put("rows", schemaJson(gDeclared))
