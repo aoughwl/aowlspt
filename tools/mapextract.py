@@ -30,6 +30,10 @@ import struct
 import sys
 from collections import Counter, OrderedDict
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import mapextract_terrain as TER   # noqa: E402
+import mapextract_tex as TEX       # noqa: E402
+
 GAME_DIR = r"D:\Games\Tarkov\EscapeFromTarkov_Data"
 DEFAULT_OUT = r"D:\MapExtract"
 
@@ -472,8 +476,40 @@ def _v4(d):
     return tuple(float(x) for x in d)
 
 
+def _trs(t, r, s):
+    """4x4 row-major TRS matrix in UNITY coordinates."""
+    x, y, z, w = r
+    xx, yy, zz = x * x, y * y, z * z
+    xy, xz, yz, wx, wy, wz = x * y, x * z, y * z, w * x, w * y, w * z
+    m = [
+        (1 - 2 * (yy + zz)) * s[0], (2 * (xy - wz)) * s[1], (2 * (xz + wy)) * s[2], t[0],
+        (2 * (xy + wz)) * s[0], (1 - 2 * (xx + zz)) * s[1], (2 * (yz - wx)) * s[2], t[1],
+        (2 * (xz - wy)) * s[0], (2 * (yz + wx)) * s[1], (1 - 2 * (xx + yy)) * s[2], t[2],
+        0.0, 0.0, 0.0, 1.0,
+    ]
+    return m
+
+
+def _matmul(a, b):
+    out = [0.0] * 16
+    for i in range(4):
+        for j in range(4):
+            out[i * 4 + j] = sum(a[i * 4 + k] * b[k * 4 + j] for k in range(4))
+    return out
+
+
+_IDENTITY = [1.0, 0, 0, 0, 0, 1.0, 0, 0, 0, 0, 1.0, 0, 0, 0, 0, 1.0]
+
+
+def _xform(m, p):
+    return (m[0] * p[0] + m[1] * p[1] + m[2] * p[2] + m[3],
+            m[4] * p[0] + m[5] * p[1] + m[6] * p[2] + m[7],
+            m[8] * p[0] + m[9] * p[1] + m[10] * p[2] + m[11])
+
+
 def extract_scene(ddir, level_path, out_dir, scene_label, convert=True,
-                  max_meshes=None, skip_lods=False, verbose=True):
+                  max_meshes=None, skip_lods=False, verbose=True,
+                  tex_exporter=None, terrain=True, terrain_stride=1):
     from UnityPy.helpers.MeshHelper import MeshHandler
 
     env, opened, missing = open_scene_env(ddir, level_path)
@@ -501,8 +537,10 @@ def extract_scene(ddir, level_path, out_dir, scene_label, convert=True,
         sys.stderr.write("  %s: %d GameObjects, %d Transforms, %d tracked components\n"
                          % (scene_label, len(gameobjects), len(transforms), len(comps)))
 
-    # ---- material / texture name resolution (best effort, cached)
+    # ---- material / texture resolution (cached).  Full property dump plus,
+    # when a TextureExporter is supplied, the actual image files.
     mat_cache = {}
+    tex_cache = {}
 
     def resolve_material(ptr):
         key = (ptr.get("m_FileID", 0), ptr.get("m_PathID", 0))
@@ -510,25 +548,8 @@ def extract_scene(ddir, level_path, out_dir, scene_label, convert=True,
             return None
         if key in mat_cache:
             return mat_cache[key]
-        info = {"name": None, "textures": [], "ref": "%d:%d" % key}
-        try:
-            reader = _deref(env, main_file, ptr)
-            if reader is not None:
-                tree = reader.read_typetree()
-                info["name"] = tree.get("m_Name")
-                saved = tree.get("m_SavedProperties") or {}
-                for entry in saved.get("m_TexEnvs") or []:
-                    tname = entry[0] if isinstance(entry, (list, tuple)) else entry.get("first")
-                    tex = entry[1] if isinstance(entry, (list, tuple)) else entry.get("second")
-                    texptr = (tex or {}).get("m_Texture") or {}
-                    if texptr.get("m_PathID", 0):
-                        info["textures"].append(
-                            {"slot": tname,
-                             "ref": "%d:%d" % (texptr.get("m_FileID", 0), texptr["m_PathID"]),
-                             "name": _try_name(env, main_file, texptr)}
-                        )
-        except Exception as exc:
-            info["error"] = repr(exc)
+        info = TEX.read_material(env, main_file, ptr, _deref, _try_name,
+                                 tex_exporter, tex_cache)
         mat_cache[key] = info
         return info
 
@@ -605,8 +626,94 @@ def extract_scene(ddir, level_path, out_dir, scene_label, convert=True,
 
     hierarchy = []
     node_index = {}
+    terrain_records = []
+    terrain_stats = {"seen": 0, "meshes": 0, "vertices": 0, "triangles": 0,
+                     "pass": 0, "fail": 0, "inconclusive": 0}
 
-    def build(pid, depth, hier_parent):
+    def build_terrain(ctree, name, world_m, hnode_entry):
+        """Emit a real grid mesh for one Terrain component. Returns mesh idx."""
+        terrain_stats["seen"] += 1
+        rec = {"object": name, "scene": scene_label}
+        tdptr = ctree.get("m_TerrainData") or {}
+        rec["terrainDataRef"] = "%d:%d" % (tdptr.get("m_FileID", 0), tdptr.get("m_PathID", 0))
+        if not terrain:
+            rec["verdict"] = "INCONCLUSIVE"
+            rec["reason"] = "terrain extraction disabled (--no-terrain)"
+            terrain_stats["inconclusive"] += 1
+            terrain_records.append(rec)
+            return None
+        try:
+            reader = _deref(env, main_file, tdptr)
+            if reader is None:
+                raise ValueError("TerrainData pointer did not resolve")
+            tdtree = reader.read_typetree()
+        except Exception as exc:
+            rec["verdict"] = "INCONCLUSIVE"
+            rec["reason"] = "TerrainData unreadable: %r" % (exc,)
+            terrain_stats["inconclusive"] += 1
+            terrain_records.append(rec)
+            return None
+
+        td = TER.read_terrain_data(tdtree)
+        rec["terrainDataName"] = td["name"]
+        rec["heightmapResolution"] = td["resolution"]
+        rec["heightmapScale"] = list(td["scale"])
+        rec["declaredSize"] = td["size"]
+        built, meta = TER.build_terrain_mesh(td, stride=terrain_stride)
+        if built is None:
+            rec["verdict"] = "INCONCLUSIVE"
+            rec["reason"] = meta
+            terrain_stats["inconclusive"] += 1
+            terrain_records.append(rec)
+            return None
+        verts, normals, uvs, idx = built
+        verdict, problems = TER.check_terrain_mesh(meta, td)
+        rec["verdict"] = verdict
+        rec["problems"] = problems
+        rec.update({k: meta[k] for k in ("resolution", "stride", "gridDim",
+                                         "vertexCount", "triangleCount",
+                                         "fullResolution", "localBBoxMin",
+                                         "localBBoxMax", "heightDivisor")})
+        terrain_stats[verdict.lower()] += 1
+
+        # world bbox of the terrain mesh corners, composed through the node
+        # chain -- this is the check that can falsify a wrong hierarchy.
+        lo, hi = meta["localBBoxMin"], meta["localBBoxMax"]
+        corners = [(lo[0] if a else hi[0], lo[1] if b else hi[1], lo[2] if c else hi[2])
+                   for a in (0, 1) for b in (0, 1) for c in (0, 1)]
+        wpts = [_xform(world_m, p) for p in corners]
+        rec["worldBBoxMin"] = [min(p[i] for p in wpts) for i in range(3)]
+        rec["worldBBoxMax"] = [max(p[i] for p in wpts) for i in range(3)]
+        origin = _xform(world_m, (0.0, 0.0, 0.0))
+        rec["worldOrigin"] = list(origin)
+
+        mi = builder.add_mesh("terrain_" + (td["name"] or name), verts, normals,
+                              uvs, [idx], [material_index(
+                                  {"ref": "terrain:" + rec["terrainDataRef"],
+                                   "name": "TERRAIN_PLACEHOLDER_" + (td["name"] or name)})])
+        if mi is None:
+            rec["verdict"] = "INCONCLUSIVE"
+            rec["reason"] = "grid produced no primitive"
+            return None
+        terrain_stats["meshes"] += 1
+        terrain_stats["vertices"] += meta["vertexCount"]
+        terrain_stats["triangles"] += meta["triangleCount"]
+        stats["vertices"] += meta["vertexCount"]
+        stats["triangles"] += meta["triangleCount"]
+
+        rec["splat"] = TER.read_splat(tdtree, env, reader.assets_file, _deref,
+                                      _try_name, tex_exporter, tex_cache)
+        rec["detail"] = TER.read_detail(tdtree, td, origin, env,
+                                        reader.assets_file, _try_name)
+        terrain_records.append(rec)
+        hnode_entry["terrain"] = {
+            "verdict": verdict, "vertexCount": meta["vertexCount"],
+            "declaredSize": td["size"],
+            "worldBBox": [rec["worldBBoxMin"], rec["worldBBoxMax"]],
+        }
+        return mi
+
+    def build(pid, depth, hier_parent, parent_m=None):
         tr = transforms[pid]
         go_id = (tr.get("m_GameObject") or {}).get("m_PathID", 0)
         go = gameobjects.get(go_id) or {}
@@ -614,6 +721,7 @@ def extract_scene(ddir, level_path, out_dir, scene_label, convert=True,
         t = _v3(tr.get("m_LocalPosition"))
         r = _v4(tr.get("m_LocalRotation"))
         s = _v3(tr.get("m_LocalScale"), (1.0, 1.0, 1.0))
+        world_m = _matmul(parent_m if parent_m is not None else _IDENTITY, _trs(t, r, s))
 
         hnode = {
             "name": name,
@@ -631,6 +739,7 @@ def extract_scene(ddir, level_path, out_dir, scene_label, convert=True,
         else:
             mat_infos = []
             mesh_ptr = None
+            terrain_ctree = None
             for cptr in go.get("m_Component") or []:
                 cid = (cptr.get("component") or cptr).get("m_PathID", 0)
                 if cid not in comps:
@@ -675,13 +784,21 @@ def extract_scene(ddir, level_path, out_dir, scene_label, convert=True,
                     entry["height"] = ctree.get("m_Height")
                 elif tn == "LODGroup":
                     entry["lodCount"] = len(ctree.get("m_LODs") or [])
+                elif tn == "Terrain":
+                    entry["drawHeightmap"] = ctree.get("m_DrawHeightmap")
+                    entry["terrainDataRef"] = "%d:%d" % (
+                        (ctree.get("m_TerrainData") or {}).get("m_FileID", 0),
+                        (ctree.get("m_TerrainData") or {}).get("m_PathID", 0))
+                    terrain_ctree = ctree
                 hnode["components"].append(entry)
             if mesh_ptr is not None:
                 mesh_idx = get_mesh(mesh_ptr, mat_infos)
+            if mesh_idx is None and terrain_ctree is not None:
+                mesh_idx = build_terrain(terrain_ctree, name, world_m, hnode)
 
         kids = []
         for ch in sorted(children_of.get(pid, [])):
-            kids.append(build(ch, depth + 1, hnode))
+            kids.append(build(ch, depth + 1, hnode, world_m))
         ni = builder.add_node(name, t, r, s, mesh=mesh_idx, children=kids or None,
                               extras={"active": hnode["active"]} if not hnode["active"] else None)
         node_index[pid] = ni
@@ -703,6 +820,19 @@ def extract_scene(ddir, level_path, out_dir, scene_label, convert=True,
               newline="\n", encoding="utf-8") as fh:
         json.dump({"scene": scene_label, "source": os.path.basename(level_path),
                    "roots": hierarchy}, fh, separators=(",", ":"))
+
+    # ---- sidecars: materials (rebuildable) and terrain (with its own verdicts)
+    mats = [m for m in mat_cache.values() if m]
+    mat_summary = TEX.summarize(mats)
+    with open(os.path.join(out_dir, base + ".materials.json"), "w",
+              newline="\n", encoding="utf-8") as fh:
+        json.dump({"scene": scene_label, "summary": mat_summary,
+                   "materials": mats}, fh, separators=(",", ":"))
+    if terrain_records:
+        with open(os.path.join(out_dir, base + ".terrain.json"), "w",
+                  newline="\n", encoding="utf-8") as fh:
+            json.dump({"scene": scene_label, "stats": terrain_stats,
+                       "terrains": terrain_records}, fh, separators=(",", ":"))
 
     # ---- manifest: what the SOURCE said, for an independent re-read to check
     bbox_min = [1e30] * 3
@@ -731,10 +861,15 @@ def extract_scene(ddir, level_path, out_dir, scene_label, convert=True,
             "sourceVertices": stats["vertices"],
             "sourceTriangles": stats["triangles"],
         },
+        "terrain": terrain_stats,
+        "terrains": terrain_records,
+        "materials": mat_summary,
         "outputs": {
             "gltf": base + ".gltf",
             "bin": base + ".bin",
             "hierarchy": base + ".hierarchy.json",
+            "materials": base + ".materials.json",
+            "terrain": (base + ".terrain.json") if terrain_records else None,
         },
         "sizes": {
             "gltf": file_size(gltf_path),
@@ -1076,8 +1211,15 @@ def cmd_extract(args):
     info = presets.get(args.map)
     if info is None:
         raise SystemExit("unknown map %r; known: %s" % (args.map, ", ".join(presets)))
-    out_dir = os.path.join(args.out or DEFAULT_OUT, args.map)
+    root = args.out or DEFAULT_OUT
+    out_dir = os.path.join(root, args.map)
     os.makedirs(out_dir, exist_ok=True)
+    # Textures are deduplicated by content hash into ONE pool shared by every
+    # scene and every map, because the same atlas is reused everywhere.
+    tex_exporter = None
+    if not args.no_textures:
+        tex_exporter = TEX.TextureExporter(os.path.join(root, "_textures"),
+                                           mode=args.tex_format)
     results = []
     for sc in info["scenes"]:
         i = idx.get(sc["path"])
@@ -1092,16 +1234,137 @@ def cmd_extract(args):
         man = extract_scene(ddir, main, out_dir, label,
                             convert=not args.raw_axes,
                             max_meshes=args.max_meshes,
-                            skip_lods=args.skip_lods)
+                            skip_lods=args.skip_lods,
+                            tex_exporter=tex_exporter,
+                            terrain=not args.no_terrain,
+                            terrain_stride=args.terrain_stride)
         results.append(man)
         c = man["counts"]
-        print("%-44s meshes=%-6d verts=%-9d tris=%-9d bin=%s"
+        t = man["terrain"]
+        print("%-40s meshes=%-6d verts=%-9d tris=%-9d bin=%-9s terrain=%d(%dP/%dF/%dI) slots=%d/%d"
               % (label, c["gltfMeshes"], c["sourceVertices"], c["sourceTriangles"],
-                 human(man["sizes"]["bin"])))
+                 human(man["sizes"]["bin"]), t["seen"], t["pass"], t["fail"],
+                 t["inconclusive"], man["materials"]["slotsResolved"],
+                 man["materials"]["slotsResolved"] + man["materials"]["slotsUnresolved"]))
+    summary = {"map": args.map, "preset": info.get("presetName"),
+               "serverName": info.get("serverName"), "scenes": results}
+    if tex_exporter is not None:
+        summary["textures"] = dict(tex_exporter.stats)
+        summary["textures"]["uniqueFiles"] = len(tex_exporter.by_hash)
+        with open(os.path.join(root, "_textures", "_index.json"), "w",
+                  newline="\n", encoding="utf-8") as fh:
+            json.dump({"mode": args.tex_format,
+                       "note": ("colorSpace comes from Texture2D.m_ColorSpace "
+                                "(1=sRGB colour, 0=linear DATA -- fact #36), "
+                                "not from the file name"),
+                       "stats": summary["textures"],
+                       "unresolved": tex_exporter.unresolved,
+                       "textures": tex_exporter.records}, fh, indent=1)
     with open(os.path.join(out_dir, "_map.json"), "w", newline="\n", encoding="utf-8") as fh:
-        json.dump({"map": args.map, "preset": info.get("presetName"),
-                   "serverName": info.get("serverName"), "scenes": results}, fh, indent=1)
+        json.dump(summary, fh, indent=1)
+    if tex_exporter is not None:
+        s = tex_exporter.stats
+        print("\ntextures: %d unique written (%s), %d references deduped (%s saved), "
+              "%d UNRESOLVED" % (s["exported"], human(s["bytesWritten"]),
+                                 s["deduped"], human(s["bytesSaved"]),
+                                 s["unresolved"]))
     print("\noutput: %s" % out_dir)
+
+
+def verify_sidecars(out_dir, base, tex_dir):
+    """Independent re-check of the texture and terrain sidecars.
+
+    Textures: every material slot that claims status OK must name a file that
+    EXISTS, and -- for DDS -- whose width/height/mipCount re-read FROM THE
+    BYTES ON DISK must equal what the Unity metadata declared.  A slot that
+    claims OK and whose file is absent or mismatched is a FAIL, not a
+    rounding error.  Unresolved slots are counted and reported, never
+    silently dropped.
+
+    Terrain: the per-terrain verdict is recomputed here from the recorded
+    declaredSize and vertex counts rather than trusted from the manifest.
+    """
+    det = {"slotsOK": 0, "slotsUnresolved": 0, "slotsEmpty": 0,
+           "filesChecked": 0, "filesMissing": 0, "headerMismatch": 0,
+           "terrainPass": 0, "terrainFail": 0, "terrainInconclusive": 0,
+           "failures": []}
+    mpath = os.path.join(out_dir, base + ".materials.json")
+    if os.path.isfile(mpath):
+        with open(mpath, "rb") as fh:
+            mats = json.loads(fh.read().decode("utf-8"))
+        checked = set()
+        for m in mats.get("materials", []):
+            for t in m.get("textures", []):
+                st = t.get("status")
+                if st == "EMPTY":
+                    det["slotsEmpty"] += 1
+                    continue
+                if st != "OK":
+                    det["slotsUnresolved"] += 1
+                    if len(det["failures"]) < 40:
+                        det["failures"].append(
+                            "UNRESOLVED slot %s on material %s: %s"
+                            % (t.get("slot"), m.get("name"), t.get("reason") or st))
+                    continue
+                det["slotsOK"] += 1
+                fn = t.get("file")
+                if not fn:
+                    det["failures"].append("slot %s claims OK with no file" % t.get("slot"))
+                    det["filesMissing"] += 1
+                    continue
+                if fn in checked:
+                    continue
+                checked.add(fn)
+                path = os.path.join(tex_dir, fn)
+                det["filesChecked"] += 1
+                if not os.path.isfile(path):
+                    det["filesMissing"] += 1
+                    det["failures"].append("texture file MISSING: %s" % fn)
+                    continue
+                if fn.endswith(".dds"):
+                    with open(path, "rb") as fh:
+                        head = fh.read(160)
+                    hdr = TEX.parse_dds(head)
+                    if hdr is None:
+                        det["headerMismatch"] += 1
+                        det["failures"].append("not a readable DDS: %s" % fn)
+                    else:
+                        for key in ("width", "height", "mipCount"):
+                            want = t.get(key)
+                            if want is not None and hdr.get(key) != want:
+                                det["headerMismatch"] += 1
+                                det["failures"].append(
+                                    "%s: on-disk %s=%s but metadata declared %s"
+                                    % (fn, key, hdr.get(key), want))
+                                break
+    tpath = os.path.join(out_dir, base + ".terrain.json")
+    if os.path.isfile(tpath):
+        with open(tpath, "rb") as fh:
+            terr = json.loads(fh.read().decode("utf-8"))
+        for rec in terr.get("terrains", []):
+            v = rec.get("verdict")
+            if v == "PASS":
+                # recompute rather than trust
+                n = rec.get("gridDim") or 0
+                ok = rec.get("vertexCount") == n * n
+                lo, hi = rec.get("localBBoxMin"), rec.get("localBBoxMax")
+                size = rec.get("declaredSize")
+                if ok and lo and hi and size:
+                    ok = (abs((hi[0] - lo[0]) - size[0]) <= max(1e-3, abs(size[0]) * 1e-5)
+                          and abs((hi[2] - lo[2]) - size[2]) <= max(1e-3, abs(size[2]) * 1e-5))
+                if ok:
+                    det["terrainPass"] += 1
+                else:
+                    det["terrainFail"] += 1
+                    det["failures"].append(
+                        "terrain %s recorded PASS but re-check disagrees" % rec.get("object"))
+            elif v == "FAIL":
+                det["terrainFail"] += 1
+                det["failures"].append("terrain %s FAIL: %s"
+                                       % (rec.get("object"), "; ".join(rec.get("problems") or [])))
+            else:
+                det["terrainInconclusive"] += 1
+    return det
 
 
 def cmd_verify(args):
@@ -1115,6 +1378,8 @@ def cmd_verify(args):
         print("INCONCLUSIVE: no manifests in %s -- nothing was extracted" % out_dir)
         return 2
     verdicts = Counter()
+    side = []
+    tex_dir = os.path.join(args.out or DEFAULT_OUT, "_textures")
     for b in bases:
         if args.scene and args.scene.lower() not in b.lower():
             continue
@@ -1132,8 +1397,36 @@ def cmd_verify(args):
             print("         FAIL: %s" % f)
         if det.get("reason"):
             print("         %s" % det["reason"])
+
+        sc = verify_sidecars(out_dir, b, tex_dir)
+        side.append(sc)
+        if sc["slotsOK"] or sc["slotsUnresolved"] or sc["terrainPass"] or sc["terrainFail"]:
+            print("         textures: %d slots OK / %d UNRESOLVED / %d empty; "
+                  "%d files checked, %d missing, %d header mismatch"
+                  % (sc["slotsOK"], sc["slotsUnresolved"], sc["slotsEmpty"],
+                     sc["filesChecked"], sc["filesMissing"], sc["headerMismatch"]))
+            if sc["terrainPass"] or sc["terrainFail"] or sc["terrainInconclusive"]:
+                print("         terrain:  %d PASS / %d FAIL / %d INCONCLUSIVE"
+                      % (sc["terrainPass"], sc["terrainFail"], sc["terrainInconclusive"]))
+            for f in sc["failures"][:6]:
+                print("         SIDECAR: %s" % f)
+
+    agg = {}
+    for sc in side:
+        for k, v in sc.items():
+            if isinstance(v, int):
+                agg[k] = agg.get(k, 0) + v
     print("\n%s" % ", ".join("%s=%d" % kv for kv in sorted(verdicts.items())))
-    return 1 if verdicts["FAIL"] else 0
+    if agg:
+        print("textures: %d slots resolved, %d UNRESOLVED, %d files missing, "
+              "%d header mismatches" % (agg.get("slotsOK", 0), agg.get("slotsUnresolved", 0),
+                                        agg.get("filesMissing", 0), agg.get("headerMismatch", 0)))
+        print("terrain:  %d PASS / %d FAIL / %d INCONCLUSIVE"
+              % (agg.get("terrainPass", 0), agg.get("terrainFail", 0),
+                 agg.get("terrainInconclusive", 0)))
+    bad = (verdicts["FAIL"] or agg.get("filesMissing", 0) or
+           agg.get("headerMismatch", 0) or agg.get("terrainFail", 0))
+    return 1 if bad else 0
 
 
 def main(argv=None):
@@ -1159,6 +1452,14 @@ def main(argv=None):
     p.add_argument("--max-meshes", type=int, default=None)
     p.add_argument("--skip-lods", action="store_true",
                    help="omit objects whose name contains _LOD but not _LOD0")
+    p.add_argument("--no-textures", action="store_true",
+                   help="do not export texture images (names only, old behaviour)")
+    p.add_argument("--tex-format", choices=("dds", "png"), default="dds",
+                   help="dds = lossless block copy (default); png = decode, lossy for BC")
+    p.add_argument("--no-terrain", action="store_true",
+                   help="do not emit terrain grid meshes")
+    p.add_argument("--terrain-stride", type=int, default=1,
+                   help="heightmap sample stride; 1 = full resolution (default)")
     p.set_defaults(fn=cmd_extract)
 
     p = sub.add_parser("verify")
