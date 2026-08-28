@@ -291,6 +291,44 @@ static void test_targets(void) {
 }
 
 /* ------------------------------------------------------------------ *
+ * 6b. REFUSAL REASONS -- the regression test for the first live failure
+ *
+ * Live run 1 logged "0 of 25 managed targets verified ... (25 REJECTED)" at
+ * boot and then went on to add a component and read a real rect. The census
+ * had run before GameAssembly.dll was loaded, and reported that benign
+ * condition as 25 prologue rejections blaming the game build.
+ *
+ * This test process has NO GameAssembly.dll either -- which makes it the exact
+ * condition that caused the bug, and therefore the right place to pin it.
+ * ------------------------------------------------------------------ */
+static void test_why(void) {
+    int i;
+    printf("refusal reasons\n");
+
+    ck(aowl_nu_base_ok() == 0,
+       "GameAssembly.dll is absent in the test process -- the same condition "
+       "that produced the false '25 REJECTED' live");
+
+    for (i = 0; i < aowl_nu_target_count(); i++)
+        ck(aowl_nu_fn(i) == NULL, "with no module, every target refuses");
+
+    for (i = 0; i < aowl_nu_target_count(); i++)
+        ck(aowl_nu_why_of(i) == AOWL_NU_WHY_NO_MODULE,
+           "and each names NO_MODULE as the reason -- NOT a prologue mismatch");
+
+    /* THE ASSERTION THAT WOULD HAVE CAUGHT THE LIVE BUG. */
+    ck(aowl_nu_mismatch_count() == 0,
+       "zero targets are counted as a BYTE MISMATCH. If this is 25, the layer "
+       "is again blaming the game build for a host start-order problem");
+    ck(aowl_nu_bad_count() == 0,
+       "and the prologue-rejection counter is untouched by a missing module");
+
+    ck(aowl_nu_why_of(-1) == AOWL_NU_WHY_BADINDEX &&
+       aowl_nu_why_of(aowl_nu_target_count()) == AOWL_NU_WHY_BADINDEX,
+       "an out-of-range index reports BADINDEX rather than a plausible reason");
+}
+
+/* ------------------------------------------------------------------ *
  * 7. Fault budget
  * ------------------------------------------------------------------ */
 static void test_faults(void) {
@@ -355,6 +393,7 @@ int main(void) {
     test_owned();
     test_intern();
     test_targets();
+    test_why();
     falsify();
     test_faults();        /* LAST: it permanently disables the layer */
 

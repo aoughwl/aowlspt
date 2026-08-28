@@ -28,15 +28,25 @@
 # the settings canvas and activated it. Eight steps, each verified. Nothing
 # appeared on screen, and `findtext` over 60k+ nodes found no trace.
 #
-# The missing piece was never creation. It was LAYOUT. A `RectTransform` fresh
-# out of `AddComponent` has `sizeDelta == (0,0)`, and a zero-area rect renders
-# nothing while every call on the way there reports success.
+# The hypothesis was that the missing piece was LAYOUT -- that a `RectTransform`
+# fresh out of `AddComponent` has `sizeDelta == (0,0)`, and a zero-area rect
+# renders nothing while every call on the way there reports success.
 #
-# `nuProofRun` does not assert that. It MEASURES it: it reads the rect back
-# BEFORE laying out and AFTER, in that order, on the same element, and logs
-# both. If the "before" is zero-area and the "after" is not, layout was the
-# cause and the log says so with numbers. If the "before" already has area,
-# the diagnosis was WRONG and the log says that instead. See `nuProofRun`.
+# `nuProofRun` MEASURES that rather than asserting it, and on the first live run
+# it came back:
+#
+#   nativeui PROOF: rect BEFORE layout = (-50.0, -50.0, 100.0, 100.0) renderable=true
+#
+# So a fresh RectTransform on this build is Unity's default 100x100, NOT
+# zero-area. THE HYPOTHESIS IS FALSIFIED, and this file says so rather than
+# keeping a tidy story. Layout is still required -- Unity's default position and
+# size is not what any caller means -- but it is no longer offered as the
+# explanation for the invisible invoke2 label. That cause is still open.
+#
+# The same run proved something that IS settled, and it is the bigger result:
+# the `.data` cache-slot route for generic `AddComponent<T>` works live. The
+# component it produced had the same header klass as an independently walked
+# live RectTransform. See `nuAdd`.
 
 # ---------------------------------------------------------------------------
 # The C surface (abi/aowlspt_nativeui.h)
@@ -50,6 +60,9 @@ proc cNuBadCount(): int32 {.importc: "aowl_nu_bad_count", nodecl.}
 proc cNuNoteFault() {.importc: "aowl_nu_note_fault", nodecl.}
 proc cNuFaultCount(): int32 {.importc: "aowl_nu_fault_count", nodecl.}
 proc cNuDisabled(): int32 {.importc: "aowl_nu_disabled", nodecl.}
+proc cNuBaseOk(): int32 {.importc: "aowl_nu_base_ok", nodecl.}
+proc cNuWhyOf(i: int32): int32 {.importc: "aowl_nu_why_of", nodecl.}
+proc cNuMismatchCount(): int32 {.importc: "aowl_nu_mismatch_count", nodecl.}
 
 proc cNuCallVPP(fn, self, a0: Il2CppPtr) {.importc: "aowl_nu_call_v_pp", nodecl.}
 proc cNuCallVPB(fn, self: Il2CppPtr; a0: int32) {.
@@ -189,14 +202,31 @@ proc nuProofWanted(): bool = gNuProof and not gNuProofDone
 # ---------------------------------------------------------------------------
 # Primitives
 # ---------------------------------------------------------------------------
+proc nuWhyName(w: int32): string =
+  ## The five distinct reasons `aowl_nu_fn` can refuse. Naming them apart is
+  ## not cosmetic: the first live run reported all of them as "did not verify
+  ## on this build", which blamed the game build for a host start-order bug.
+  case int(w)
+  of 0: "verified"
+  of 1: "GameAssembly.dll is NOT LOADED YET -- a start-order problem in the " &
+        "host, NOT a bad RVA and NOT a stale build"
+  of 2: "the address is not committed memory"
+  of 3: "the address is committed but not executable"
+  of 4: "PROLOGUE MISMATCH -- the bytes are not what this build's metadata " &
+        "says; this is the real 'wrong build' signal"
+  of 5: "the layer has self-disabled after repeated faults"
+  else: "index out of range"
+
 proc nuFn(i: int32): Il2CppPtr =
-  ## A verified code pointer, or nil. Refusal is LOGGED: a target that never
-  ## bound must not be indistinguishable from a step that ran and did nothing.
+  ## A verified code pointer, or nil. Refusal is LOGGED WITH ITS REASON: a
+  ## target that never bound must not be indistinguishable from a step that ran
+  ## and did nothing -- and, equally, "the module is not loaded yet" must not be
+  ## reported as "the bytes are wrong".
   result = cNuFn(i)
   if result == nil:
     warn "nativeui: target " & readCString(cNuName(i)) & " @ 0x" &
-         hexOf(uint64(cNuRva(i))) & " did not verify against the startup " &
-         "prologue snapshot on this build; the operation needing it is refused"
+         hexOf(uint64(cNuRva(i))) & " refused: " &
+         nuWhyName(cNuWhyOf(i)) & ". The operation needing it is refused."
 
 proc nuOk(p: Il2CppPtr; n: int32): bool =
   ## Every hop, not just the first. `a->b->c` is three of these.
@@ -619,223 +649,375 @@ proc nuDestroyAll(): int =
 # call against itself. This asserts the FINISHED STATE instead, and states one
 # of THREE verdicts.
 #
-# It also MEASURES the diagnosis rather than assuming it: the rect is read
-# BEFORE layout and AFTER, on the same element. If the "before" is zero-area
-# and the "after" is not, missing layout was the cause of the invisible label
-# and the numbers say so. If the "before" already has area, the diagnosis was
-# wrong, and the log says THAT.
+# WHAT THE FIRST LIVE RUN TAUGHT US, AND WHAT CHANGED BECAUSE OF IT
+# -----------------------------------------------------------------
+# Run 1 got as far as
 #
-# What the human should see in aowlspt-host.log, in order:
+#   nativeui PROOF: rect BEFORE layout = (-50.0, -50.0, 100.0, 100.0) renderable=true
+#   nativeui PROOF: FAULTED -- the VEH guard caught it and the game survived.
 #
-#   nativeui PROOF: ... rect BEFORE layout = (x,y,w,h) ...  w=0.0 h=0.0
-#   nativeui PROOF: ... rect AFTER  layout = (x,y,w,h) ...  w=520.0 h=44.0
-#   nativeui PROOF: get_text round-trip = "AOWLSPT NATIVE UI ..."
-#   nativeui PROOF: activeInHierarchy = true
-#   nativeui PROOF: VERDICT = PASS
+# Two findings, and they pull in opposite directions:
 #
-# and, on screen, that text near the top-left of the settings panel. It is
-# also findable with the inspector, by the text it DISPLAYS:
-#   findtext AOWLSPT NATIVE UI
+#   * GOOD: the `.data` cache-slot route for generic `AddComponent<T>` is
+#     PROVEN LIVE. `add(UnityEngine.RectTransform)` returned a component whose
+#     header klass equalled that of an independently walked live RectTransform.
+#     The whole slot mechanism, the reference-instance check and the refusal
+#     paths all work. None of that is touched below.
+#   * The zero-area hypothesis is FALSIFIED: a fresh RectTransform is Unity's
+#     default 100x100, not (0,0). See the header comment.
+#
+# And the fault landed on the FIRST call after that read. Structurally, the
+# problem is that run 1 combined two independent unknowns into one guarded body
+# -- building a TextMeshProUGUI FROM SCRATCH (`AddComponent<TextMeshProUGUI>`
+# on a bare GameObject, which runs TMP's `Awake`) AND laying it out -- so a
+# fault in either hid the answer to both, and the log could not say which.
+#
+# So the proof is now TWO STAGES, each with its OWN single `aowl_p_p_seh`,
+# run one after the other. Sequential, never nested: the guard is not
+# re-entrant and an inner guard disarms the outer one.
+#
+#   STAGE A -- CLONE + LAYOUT. Everything here except the layout was already
+#     proven live by invoke2 step 5: `Object::Instantiate` on a live label's
+#     GameObject, parented with `SetParentAndAlign`. The ONE new variable is
+#     the layout call. If Stage A passes, a mod can build visible UI today.
+#   STAGE B -- FROM SCRATCH. `il2cpp_object_new` + ctor + `AddComponent
+#     <RectTransform>` + `AddComponent<TextMeshProUGUI>`. This is where run 1
+#     faulted, and running it SECOND means it can no longer take Stage A's
+#     verdict down with it.
+#
+# Every risky call is now preceded by its own breadcrumb line, so the next run
+# names the exact call that faulted instead of leaving a gap between "rect
+# BEFORE layout" and the guard's report.
+#
+# What the human should see in aowlspt-host.log:
+#
+#   nativeui PROOF A: rect BEFORE layout = (-50.0, -50.0, 100.0, 100.0)
+#   nativeui PROOF A: rect AFTER  layout = (..., 520.0, 44.0)  renderable=true
+#   nativeui PROOF A: get_text round-trip = "AOWLSPT NATIVE UI PROOF"
+#   nativeui PROOF A: activeInHierarchy = true
+#   nativeui PROOF A: VERDICT = PASS
+#   nativeui PROOF B: ... (and, if it faults, the breadcrumb naming where)
+#   nativeui PROOF: OVERALL A=PASS B=<...>
+#
+# and, on screen, that text in the settings panel. Also findable by the text it
+# DISPLAYS:  findtext AOWLSPT NATIVE UI
 # ---------------------------------------------------------------------------
 
-const NuProofText = "AOWLSPT NATIVE UI PROOF"
-const NuProofName = "aowlspt-nativeui-proof"
+const NuProofText  = "AOWLSPT NATIVE UI PROOF"
+const NuProofTextB = "AOWLSPT NATIVE UI SCRATCH"
+const NuProofName  = "aowlspt-nativeui-proof"
 
-var gNuProofVerdict = "not run"
+var gNuVerdictA = "not run"
+var gNuVerdictB = "not run"
 
-proc nuProofBody(tabPtr: Il2CppPtr) =
-  ## The whole proof. Called ONLY from inside `nuProofRun`'s single guard --
-  ## it must not add one of its own, because `aowl_p_p_seh` is not re-entrant
-  ## and a nested guard would DISARM the outer one.
-  gNuProofVerdict = "INCONCLUSIVE"
-  okLog "nativeui PROOF: BEGIN. " & $int(cNuOkCount()) & " of " &
-        $int(cNuTargetCount()) & " targets verified against the startup " &
-        "prologue snapshot (" & $int(cNuBadCount()) & " rejected)."
+proc nuStep(stage, what: string) =
+  ## A breadcrumb before every call that could fault. The cost of one log line
+  ## is nothing; the cost of NOT having it was a whole live run that could only
+  ## say the fault was somewhere after `rect BEFORE layout`.
+  okLog "nativeui PROOF " & stage & ": -> " & what
 
-  # -- 1. a live anchor, reached by WALKING, never by an offset that can read
-  #       null. `mi2FindTmp` walks the settings tab down to a TextMeshProUGUI
-  #       whose m_text decodes to real text -- so the anchor is proven to BE a
-  #       TMP before it is used as one.
+proc nuReportFinished(stage: string; go, rt, tmp: Il2CppPtr;
+                      want: string): string =
+  ## The FINISHED STATE, read back three independent ways, none of them a
+  ## comparison against our own write. Returns PASS / FAIL / INCONCLUSIVE.
+  nuStep(stage, "reading the finished state back")
+  let (okA, ax, ay, aw, ah) = nuGetRect(rt)
+  let back = nuGetText(tmp)
+  let active = nuActiveInHierarchy(go)
+  let renderable = okA and cNuRectRenderable(aw, ah) != 0'i32
+  if okA:
+    okLog "nativeui PROOF " & stage & ": rect AFTER  layout = (" & nuF(ax) &
+          ", " & nuF(ay) & ", " & nuF(aw) & ", " & nuF(ah) &
+          ")  renderable=" & $renderable
+  else:
+    warn "nativeui PROOF " & stage & ": the rect could not be read back"
+  okLog "nativeui PROOF " & stage & ": get_text round-trip = \"" & back & "\"" &
+        (if back == want: "  <-- EXACT MATCH"
+         else: "  <-- does NOT match what was set")
+  okLog "nativeui PROOF " & stage & ": activeInHierarchy = " & $active
+  let (okP, px, py) = nuGetPos(rt)
+  if okP:
+    okLog "nativeui PROOF " & stage & ": anchoredPosition = (" & nuF(px) &
+          ", " & nuF(py) & ")"
+  if not okA:
+    warn "nativeui PROOF " & stage & ": VERDICT = INCONCLUSIVE -- the rect " &
+         "could not be read back, so nothing is settled. This is NOT a pass."
+    return "INCONCLUSIVE"
+  if renderable and active and back == want:
+    okLog "nativeui PROOF " & stage & ": VERDICT = PASS. The element is " &
+          "parented into the live settings canvas, has a non-zero rect, is " &
+          "active in the hierarchy, and reports the text it was given. " &
+          "Confirm on screen and with `findtext " & want & "`."
+    return "PASS"
+  warn "nativeui PROOF " & stage & ": VERDICT = FAIL -- renderable=" &
+       $renderable & " activeInHierarchy=" & $active & " textMatches=" &
+       $(back == want) & ". The element exists and does not render. Left in " &
+       "place so the inspector can be pointed at it: 0x" &
+       hexOf(cast[uint64](go))
+  result = "FAIL"
+
+# ---------------------------------------------------------------------------
+# STAGE A -- clone a live label, then LAY IT OUT
+#
+# Everything but the layout was proven live by invoke2 step 5. This isolates
+# the one variable that has never been exercised.
+# ---------------------------------------------------------------------------
+proc nuProofStageA(tabPtr: Il2CppPtr) =
+  gNuVerdictA = "INCONCLUSIVE"
+  okLog "nativeui PROOF A: BEGIN -- clone a live label and lay it out. " &
+        $int(cNuOkCount()) & " of " & $int(cNuTargetCount()) &
+        " targets verified so far, " & $int(cNuMismatchCount()) &
+        " prologue mismatch(es)."
+
+  # A live anchor, reached by WALKING from something already validated.
+  nuStep("A", "mi2FindTmp: walk the tab for a TextMeshProUGUI with real text")
   mi2FindTmp(tabPtr)
   if gMi2Tmp == nil or gMi2TmpOwner == nil:
-    warn "nativeui PROOF: INCONCLUSIVE -- no readable TextMeshProUGUI on this " &
-         "tab, so there is no validated live object to walk from. Nothing was " &
-         "created. Open another settings tab to retry."
+    warn "nativeui PROOF A: INCONCLUSIVE -- no readable TextMeshProUGUI on " &
+         "this tab, so there is no validated live object to walk from. " &
+         "Nothing was created. Open another settings tab to retry."
     return
   let anchorGo = nuGameObjectOf(gMi2Tmp)
   let parentGo = nuGameObjectOf(gMi2TmpOwner)
   if anchorGo == nil or parentGo == nil:
-    warn "nativeui PROOF: INCONCLUSIVE -- the anchor TMP or its owner has no " &
-         "readable GameObject; nothing was created"
+    warn "nativeui PROOF A: INCONCLUSIVE -- the anchor TMP or its owner has " &
+         "no readable GameObject; nothing was created"
     return
-  okLog "nativeui PROOF: anchor TMP=0x" & hexOf(cast[uint64](gMi2Tmp)) &
+  okLog "nativeui PROOF A: anchor TMP=0x" & hexOf(cast[uint64](gMi2Tmp)) &
         " anchorGO=0x" & hexOf(cast[uint64](anchorGo)) &
         " parentGO=0x" & hexOf(cast[uint64](parentGo))
 
-  # -- 2. reference instances, so the slot check can be conclusive.
-  #       TMP: the anchor itself, which we just proved reads real text.
-  #       RectTransform: the anchor's own transform -- a TextMeshProUGUI is a
-  #       Graphic, so its transform is necessarily a RectTransform. That is
-  #       the independent source; it does not come from any .data slot.
+  # Reference instances, so Stage B's slot checks can be conclusive. Registered
+  # here because this is where the live objects are; both are read-only.
   discard nuRegisterReference(NuKindTmpText, gMi2Tmp)
+  nuStep("A", "get_transform on the anchor (a TMP is a Graphic, so its " &
+              "transform is necessarily a RectTransform)")
   let anchorRt = nuTransformOf(anchorGo)
   if anchorRt != nil:
     discard nuRegisterReference(NuKindRectTransform, anchorRt)
-  else:
-    warn "nativeui PROOF: the anchor's transform is unreadable, so the " &
-         "RectTransform slot cannot be verified; it will report INCONCLUSIVE"
 
-  # -- 3. create
-  let go = nuCreate(NuProofName, parentGo)
-  if go == nil:
-    warn "nativeui PROOF: FAIL -- creation refused (see the reason above)"
-    gNuProofVerdict = "FAIL"
+  # THE CLONE. Proven live; the clone's klass must equal the original's.
+  nuStep("A", "Object::Instantiate on the anchor's GameObject")
+  let cloneGo = nuClone(anchorGo)
+  if cloneGo == nil:
+    warn "nativeui PROOF A: INCONCLUSIVE -- Instantiate did not return a " &
+         "usable clone; nothing to lay out"
+    return
+  discard cNuOwn(cloneGo)
+  okLog "nativeui PROOF A: cloneGO=0x" & hexOf(cast[uint64](cloneGo))
+
+  nuStep("A", "SetParentAndAlign the clone into the live canvas")
+  if not nuParentAligned(cloneGo, parentGo):
+    warn "nativeui PROOF A: INCONCLUSIVE -- could not parent the clone; " &
+         "tearing it down"
+    discard nuDestroy(cloneGo)
     return
 
-  # -- 4. RectTransform, through the generalised slot, klass-judged
-  let rt = nuAdd(go, NuKindRectTransform)
+  nuStep("A", "get_transform on the clone -> its RectTransform")
+  let rt = nuTransformOf(cloneGo)
   if rt == nil:
-    warn "nativeui PROOF: " &
-         (if cNuSlotState(NuKindRectTransform) == NuSlotPoisoned:
-            "FAIL -- the RectTransform slot produced the wrong class"
-          else: "INCONCLUSIVE -- the RectTransform slot could not be settled") &
-         ". Tearing the object down rather than leaving a half-built node."
-    gNuProofVerdict = (if cNuSlotState(NuKindRectTransform) == NuSlotPoisoned:
-                         "FAIL" else: "INCONCLUSIVE")
-    discard nuDestroy(go)
+    warn "nativeui PROOF A: INCONCLUSIVE -- the clone has no readable " &
+         "transform; tearing it down"
+    discard nuDestroy(cloneGo)
     return
 
-  # -- 5. into the live hierarchy, on the UI layer
-  if not nuParentAligned(go, parentGo):
-    warn "nativeui PROOF: INCONCLUSIVE -- could not parent into the live " &
-         "canvas; tearing down"
-    discard nuDestroy(go)
-    return
-  discard nuSetLayer(go, 5'i32)          # Unity's built-in `UI` layer
-
-  # -- 6. THE MEASUREMENT THAT SETTLES THE DIAGNOSIS.
-  #       Read the rect BEFORE any layout. If missing layout is what made the
-  #       invoke2 label invisible, this is zero-area.
+  # THE MEASUREMENT. Read the rect BEFORE any layout call. Run 1 measured
+  # (-50,-50,100,100) here, which is what falsified the zero-area hypothesis;
+  # it is read again because it is the control for the "after" below.
+  nuStep("A", "get_rect_Injected BEFORE layout")
   let (okB, bx, by, bw, bh) = nuGetRect(rt)
   if okB:
-    okLog "nativeui PROOF: rect BEFORE layout = (" & nuF(bx) & ", " & nuF(by) &
-          ", " & nuF(bw) & ", " & nuF(bh) & ")  renderable=" &
-          $(cNuRectRenderable(bw, bh) != 0'i32) &
-          "   <-- a zero-area rect here is the invoke2 ladder's invisible " &
-          "label, measured"
-  else:
-    warn "nativeui PROOF: could not read the rect before layout; the " &
-         "before/after comparison will be inconclusive"
+    okLog "nativeui PROOF A: rect BEFORE layout = (" & nuF(bx) & ", " &
+          nuF(by) & ", " & nuF(bw) & ", " & nuF(bh) & ")  renderable=" &
+          $(cNuRectRenderable(bw, bh) != 0'i32)
 
-  # -- 7. text, then layout
-  let tmp = nuAdd(go, NuKindTmpText)
-  if tmp == nil:
-    warn "nativeui PROOF: " &
-         (if cNuSlotState(NuKindTmpText) == NuSlotPoisoned:
-            "FAIL -- the TextMeshProUGUI slot produced the wrong class"
-          else: "INCONCLUSIVE -- the TextMeshProUGUI slot could not be settled") &
-         "; tearing down"
-    gNuProofVerdict = (if cNuSlotState(NuKindTmpText) == NuSlotPoisoned:
-                         "FAIL" else: "INCONCLUSIVE")
-    discard nuDestroy(go)
+  # The clone is a TMP COMPONENT's GameObject, so the component is on it. The
+  # anchor component's class is the reference we already registered.
+  nuStep("A", "set_text on the clone's TMP")
+  # The clone of a GameObject carries a clone of its TextMeshProUGUI. We hold
+  # the ORIGINAL component, and the clone's copy sits at the same class; the
+  # honest way to reach it without GetComponent<T> is the transform we already
+  # have plus the component pointer Instantiate returned for the COMPONENT
+  # clone. invoke2 step 5 cloned the component directly, so do that too -- it
+  # is the pointer we can actually name.
+  let tmpClone = nuClone(gMi2Tmp)
+  if tmpClone == nil:
+    warn "nativeui PROOF A: INCONCLUSIVE -- could not clone the TMP component " &
+         "itself, so there is no text object to verify; tearing down"
+    discard nuDestroy(cloneGo)
     return
-  discard nuSetFontSize(tmp, 28.0'f32)
-  discard nuSetText(tmp, NuProofText)
+  let tmpCloneGo = nuGameObjectOf(tmpClone)
+  if tmpCloneGo == nil:
+    warn "nativeui PROOF A: INCONCLUSIVE -- the cloned TMP has no GameObject"
+    discard nuDestroy(cloneGo)
+    return
+  discard cNuOwn(tmpCloneGo)
+  # The GameObject clone above was only ever the control for the rect read; the
+  # element we actually show is this one. Destroy the first so the screen is
+  # not ambiguous -- two near-identical labels would make the visual evidence
+  # useless.
+  discard nuDestroy(cloneGo)
 
-  # Top-left corner of the parent, 520x44, inset 24px. Anchored to the parent's
-  # top-left so the position does not depend on the parent's size.
-  if not nuLayout(rt,
+  nuStep("A", "SetParentAndAlign the cloned TMP into the live canvas")
+  if not nuParentAligned(tmpCloneGo, parentGo):
+    warn "nativeui PROOF A: INCONCLUSIVE -- could not parent the cloned TMP"
+    discard nuDestroy(tmpCloneGo)
+    return
+  discard nuSetLayer(tmpCloneGo, 5'i32)          # Unity's built-in `UI` layer
+
+  nuStep("A", "get_transform on the cloned TMP")
+  let rt2 = nuTransformOf(tmpCloneGo)
+  if rt2 == nil:
+    warn "nativeui PROOF A: INCONCLUSIVE -- the cloned TMP has no transform"
+    discard nuDestroy(tmpCloneGo)
+    return
+
+  nuStep("A", "set_text")
+  discard nuSetText(tmpClone, NuProofText)
+  nuStep("A", "set_fontSize")
+  discard nuSetFontSize(tmpClone, 28.0'f32)
+
+  nuStep("A", "nuLayout -- THE ONE NEW VARIABLE in this stage")
+  if not nuLayout(rt2,
                   0.0'f32, 1.0'f32,      # anchorMin  (left, top)
                   0.0'f32, 1.0'f32,      # anchorMax  (left, top)
                   0.0'f32, 1.0'f32,      # pivot      (left, top)
                   520.0'f32, 44.0'f32,   # size
                   24.0'f32, -24.0'f32):  # position
-    warn "nativeui PROOF: FAIL -- layout refused; tearing down"
-    gNuProofVerdict = "FAIL"
+    warn "nativeui PROOF A: FAIL -- layout refused; tearing down"
+    gNuVerdictA = "FAIL"
+    discard nuDestroy(tmpCloneGo)
+    return
+
+  nuStep("A", "SetActive(true)")
+  discard nuSetActive(tmpCloneGo, true)
+  nuStep("A", "re-apply set_text after activation (LocalizedText clobbers it)")
+  discard nuSetText(tmpClone, NuProofText)
+
+  gNuVerdictA = nuReportFinished("A", tmpCloneGo, rt2, tmpClone, NuProofText)
+  okLog "nativeui PROOF A: END (verdict " & gNuVerdictA & ")"
+
+# ---------------------------------------------------------------------------
+# STAGE B -- build one FROM SCRATCH
+#
+# This is where run 1 faulted, immediately after the rect read. Running it
+# second, under its own guard, means it can no longer take Stage A down with
+# it -- and every call now has a breadcrumb, so the next run names the exact
+# one rather than leaving a gap.
+#
+# The most likely candidate, stated as a hypothesis and NOT as a finding:
+# `AddComponent<TextMeshProUGUI>` runs TMP's `Awake`, which reaches for
+# TMP_Settings and a default font asset. That is a far larger blast radius than
+# `AddComponent<RectTransform>`, which is a pure native component and worked.
+# The breadcrumbs below are what will settle it; nothing here assumes it.
+# ---------------------------------------------------------------------------
+proc nuProofStageB(tabPtr: Il2CppPtr) =
+  gNuVerdictB = "INCONCLUSIVE"
+  okLog "nativeui PROOF B: BEGIN -- build a label FROM SCRATCH " &
+        "(il2cpp_object_new + ctor + AddComponent<T>)"
+  if gMi2Tmp == nil or gMi2TmpOwner == nil:
+    warn "nativeui PROOF B: INCONCLUSIVE -- Stage A never found a live anchor"
+    return
+  let parentGo = nuGameObjectOf(gMi2TmpOwner)
+  if parentGo == nil:
+    warn "nativeui PROOF B: INCONCLUSIVE -- no parent GameObject"
+    return
+
+  nuStep("B", "il2cpp_object_new + GameObject::.ctor(String) + get_name round-trip")
+  let go = nuCreate(NuProofName, parentGo)
+  if go == nil:
+    warn "nativeui PROOF B: FAIL -- creation refused (reason logged above)"
+    gNuVerdictB = "FAIL"
+    return
+
+  nuStep("B", "AddComponent<RectTransform> via the .data cache slot " &
+              "(PROVEN LIVE in run 1 -- klass matched the live reference)")
+  let rt = nuAdd(go, NuKindRectTransform)
+  if rt == nil:
+    gNuVerdictB = (if cNuSlotState(NuKindRectTransform) == NuSlotPoisoned:
+                     "FAIL" else: "INCONCLUSIVE")
+    warn "nativeui PROOF B: " & gNuVerdictB & " -- the RectTransform slot " &
+         "could not be settled; tearing down"
     discard nuDestroy(go)
     return
 
+  nuStep("B", "SetParentAndAlign into the live canvas")
+  if not nuParentAligned(go, parentGo):
+    warn "nativeui PROOF B: INCONCLUSIVE -- could not parent; tearing down"
+    discard nuDestroy(go)
+    return
+  discard nuSetLayer(go, 5'i32)
+
+  nuStep("B", "get_rect_Injected BEFORE layout")
+  let (okB2, bx, by, bw, bh) = nuGetRect(rt)
+  if okB2:
+    okLog "nativeui PROOF B: rect BEFORE layout = (" & nuF(bx) & ", " &
+          nuF(by) & ", " & nuF(bw) & ", " & nuF(bh) & ")  renderable=" &
+          $(cNuRectRenderable(bw, bh) != 0'i32)
+
+  # THE CALL RUN 1 FAULTED ON (or just after). It is now the last thing
+  # attempted, it is breadcrumbed, and a fault here costs Stage A nothing.
+  nuStep("B", "AddComponent<TextMeshProUGUI> -- THIS is the call run 1 " &
+              "faulted on or immediately after. It runs TMP's Awake. If the " &
+              "log stops here, that is the answer.")
+  let tmp = nuAdd(go, NuKindTmpText)
+  if tmp == nil:
+    gNuVerdictB = (if cNuSlotState(NuKindTmpText) == NuSlotPoisoned:
+                     "FAIL" else: "INCONCLUSIVE")
+    warn "nativeui PROOF B: " & gNuVerdictB & " -- the TextMeshProUGUI slot " &
+         "could not be settled; tearing down"
+    discard nuDestroy(go)
+    return
+  okLog "nativeui PROOF B: AddComponent<TextMeshProUGUI> SURVIVED -- building " &
+        "a TMP label from scratch is possible on this build"
+
+  nuStep("B", "set_fontSize + set_text")
+  discard nuSetFontSize(tmp, 28.0'f32)
+  discard nuSetText(tmp, NuProofTextB)
+
+  nuStep("B", "nuLayout")
+  if not nuLayout(rt,
+                  0.0'f32, 1.0'f32,
+                  0.0'f32, 1.0'f32,
+                  0.0'f32, 1.0'f32,
+                  520.0'f32, 44.0'f32,
+                  24.0'f32, -80.0'f32):   # below Stage A's label
+    warn "nativeui PROOF B: FAIL -- layout refused; tearing down"
+    gNuVerdictB = "FAIL"
+    discard nuDestroy(go)
+    return
+
+  nuStep("B", "SetActive(true) + re-apply set_text")
   discard nuSetActive(go, true)
-  discard nuSetText(tmp, NuProofText)     # re-apply after activation
+  discard nuSetText(tmp, NuProofTextB)
 
-  # -- 8. THE FINISHED STATE. Three independent reads, none of them a
-  #       comparison against our own write.
-  let (okA, ax, ay, aw, ah) = nuGetRect(rt)
-  let back = nuGetText(tmp)
-  let active = nuActiveInHierarchy(go)
-  let renderable = okA and cNuRectRenderable(aw, ah) != 0'i32
+  gNuVerdictB = nuReportFinished("B", go, rt, tmp, NuProofTextB)
+  okLog "nativeui PROOF B: END (verdict " & gNuVerdictB & ")"
 
-  if okA:
-    okLog "nativeui PROOF: rect AFTER  layout = (" & nuF(ax) & ", " & nuF(ay) &
-          ", " & nuF(aw) & ", " & nuF(ah) & ")  renderable=" & $renderable
-  okLog "nativeui PROOF: get_text round-trip = \"" & back & "\"" &
-        (if back == NuProofText: "  <-- EXACT MATCH"
-         else: "  <-- does NOT match what was set")
-  okLog "nativeui PROOF: activeInHierarchy = " & $active
-  let (okP, px, py) = nuGetPos(rt)
-  if okP:
-    okLog "nativeui PROOF: anchoredPosition = (" & nuF(px) & ", " & nuF(py) & ")"
-
-  # -- 9. the diagnosis, stated from the two measurements
-  if okB and okA:
-    if cNuRectRenderable(bw, bh) == 0'i32 and renderable:
-      okLog "nativeui PROOF: DIAGNOSIS CONFIRMED -- the element was zero-area " &
-            "(" & nuF(bw) & "x" & nuF(bh) & ") before layout and " &
-            nuF(aw) & "x" & nuF(ah) & " after. Missing layout, not missing " &
-            "creation, is what made the invoke2 label invisible."
-    elif cNuRectRenderable(bw, bh) != 0'i32:
-      warn "nativeui PROOF: DIAGNOSIS WRONG -- the element ALREADY had area (" &
-           nuF(bw) & "x" & nuF(bh) & ") before any layout call, so a missing " &
-           "size is NOT what made the invoke2 label invisible. Look elsewhere."
-    else:
-      warn "nativeui PROOF: DIAGNOSIS UNSETTLED -- the rect was zero-area " &
-           "before layout AND after it (" & nuF(aw) & "x" & nuF(ah) & ")"
-
-  # -- 10. ONE verdict, from the finished state only.
-  if renderable and active and back == NuProofText:
-    gNuProofVerdict = "PASS"
-    okLog "nativeui PROOF: VERDICT = PASS. A GameObject built from scratch " &
-          "inside a detour is parented into the live settings canvas, has a " &
-          "non-zero rect, is active in the hierarchy, and reports the text it " &
-          "was given. Confirm on screen, and with the inspector: " &
-          "`findtext " & NuProofText & "`."
-  elif not okA or not okB:
-    gNuProofVerdict = "INCONCLUSIVE"
-    warn "nativeui PROOF: VERDICT = INCONCLUSIVE -- the rect could not be " &
-         "read back, so nothing is settled. This is NOT a pass."
-  else:
-    gNuProofVerdict = "FAIL"
-    warn "nativeui PROOF: VERDICT = FAIL -- renderable=" & $renderable &
-         " activeInHierarchy=" & $active & " textMatches=" &
-         $(back == NuProofText) & ". The element exists and does not render. " &
-         "Leaving it in place so the inspector can be pointed at it: " &
-         "0x" & hexOf(cast[uint64](go))
-
-  # -- 11. the slot census, so the log alone says which kinds are usable
-  for k in 0 ..< int(cNuKindCount()):     # capped: AOWL_NU_MAX_KINDS
-    okLog "nativeui PROOF: slot " & readCString(cNuKindName(int32(k))) &
-          " @ .data 0x" & hexOf(uint64(cNuKindSlotRva(int32(k)))) & " -> " &
-          nuSlotStateName(cNuSlotState(int32(k)))
-  okLog "nativeui PROOF: END (verdict " & gNuProofVerdict & ")"
-
-# ---- the single guard ------------------------------------------------------
-# ONE `aowl_p_p_seh` around the WHOLE proof. Not one per step: the guard is not
-# re-entrant, and a nested inner guard disarms the outer one. The cost of the
-# coarser grain is that a fault names the proof rather than the step -- which
-# is why every stage above logs its own line, so the last line without a
-# successor names where it died.
+# ---- the guards ------------------------------------------------------------
+# ONE `aowl_p_p_seh` per stage, run SEQUENTIALLY. Not nested: the guard is not
+# re-entrant and an inner guard disarms the outer one. Two sequential guards
+# are two separate protected regions, which is exactly what lets a fault in B
+# leave A's verdict standing.
 {.emit: """
 extern void* aowl_nu_proof_body(void* a);
-static void* aowl_nu_proof_guarded(void* a) {
+static int g_aowl_nu_stage = 0;
+static int aowl_nu_stage_get(void) { return g_aowl_nu_stage; }
+static void* aowl_nu_proof_guarded(void* a, int stage) {
+    g_aowl_nu_stage = stage;
     return aowl_p_p_seh((void*)aowl_nu_proof_body, a);
 }
 """.}
-proc cNuProofGuarded(a: Il2CppPtr): Il2CppPtr {.
+proc cNuStageGet(): int32 {.importc: "aowl_nu_stage_get", nodecl.}
+proc cNuProofGuarded(a: Il2CppPtr; stage: int32): Il2CppPtr {.
   importc: "aowl_nu_proof_guarded", nodecl.}
 
 proc nuProofBodyC(a: Il2CppPtr): Il2CppPtr {.
     exportc: "aowl_nu_proof_body", cdecl.} =
-  nuProofBody(a)
+  case int(cNuStageGet())
+  of 1: nuProofStageA(a)
+  of 2: nuProofStageB(a)
+  else: discard
   result = cast[Il2CppPtr](1)
 
 proc nuProofRun(tab: Il2CppPtr) =
@@ -847,11 +1029,39 @@ proc nuProofRun(tab: Il2CppPtr) =
          $int(cNuFaultCount()) & " fault(s); the proof will not run"
     return
   gNuProofDone = true
-  if cNuProofGuarded(tab) == nil:
+
+  if cNuProofGuarded(tab, 1'i32) == nil:
     cNuNoteFault()
-    warn "nativeui PROOF: FAULTED -- the VEH guard caught it and the game " &
-         "survived. The last `nativeui PROOF:` line above names how far it " &
-         "got. Fault count is now " & $int(cNuFaultCount()) & " of 6."
+    gNuVerdictA = "FAULTED"
+    warn "nativeui PROOF A: FAULTED -- the VEH guard caught it and the game " &
+         "survived. The last `nativeui PROOF A: ->` breadcrumb above names " &
+         "the exact call it died in. Fault count is now " &
+         $int(cNuFaultCount()) & " of 6."
+
+  # Stage B runs even if A faulted: they are independent questions, and the
+  # fault budget (6) is what stops a genuinely broken build from retrying
+  # forever.
+  if cNuDisabled() == 0'i32:
+    if cNuProofGuarded(tab, 2'i32) == nil:
+      cNuNoteFault()
+      gNuVerdictB = "FAULTED"
+      warn "nativeui PROOF B: FAULTED -- the VEH guard caught it and the " &
+           "game survived. The last `nativeui PROOF B: ->` breadcrumb above " &
+           "names the exact call it died in. Fault count is now " &
+           $int(cNuFaultCount()) & " of 6."
+  else:
+    warn "nativeui PROOF B: skipped -- the layer self-disabled during Stage A"
+
+  okLog "nativeui PROOF: OVERALL  A=" & gNuVerdictA & "  B=" & gNuVerdictB &
+        ".  A is the CLONE+LAYOUT path (everything but the layout was already " &
+        "proven live); B is the FROM-SCRATCH path. A passing while B does not " &
+        "still means mods can build visible UI today."
+
+  # The slot census, so the log alone says which kinds are usable.
+  for k in 0 ..< int(cNuKindCount()):     # capped: AOWL_NU_MAX_KINDS
+    okLog "nativeui PROOF: slot " & readCString(cNuKindName(int32(k))) &
+          " @ .data 0x" & hexOf(uint64(cNuKindSlotRva(int32(k)))) & " -> " &
+          nuSlotStateName(cNuSlotState(int32(k)))
 
 proc bindNativeUi(verbose: bool) =
   ## No detour of its own, by design. Two detours on one function have the
@@ -865,18 +1075,39 @@ proc bindNativeUi(verbose: bool) =
   ## obvious in the log before any operation is attempted rather than as
   ## twenty-five separate refusals.
   if not gNuOn: return
+  # ORDER MATTERS, and getting it wrong is what the first live run reported.
+  # This census must run AFTER `cProPrimeAll()` and after GameAssembly.dll is
+  # loaded -- i.e. from the same `gReady` bind region every other feature binds
+  # in, not from the flag-reading pass. Run early, every `aowl_nu_fn` refuses
+  # with WHY_NO_MODULE, and the old census called that "25 REJECTED" and
+  # blamed the build. Ask the question once, here, and say so plainly.
+  if cNuBaseOk() == 0'i32:
+    warn "nativeui: GameAssembly.dll is not loaded, so no target can be " &
+         "verified yet. This is a START-ORDER problem in the host, NOT a bad " &
+         "RVA and NOT a stale game build. Refusing to run the census -- " &
+         "reporting 25 rejections here would be a confidently wrong " &
+         "diagnostic, which is worse than none."
+    return
   var ok = 0
   var bad = 0
   for i in 0 ..< int(cNuTargetCount()):   # capped by the table size
     if cNuFn(int32(i)) != nil: inc ok else: inc bad
+  let mism = int(cNuMismatchCount())
   okLog "nativeui: " & $ok & " of " & $int(cNuTargetCount()) &
         " managed targets verified by RVA + startup-snapshot prologue on this " &
-        "build" & (if bad > 0: " (" & $bad & " REJECTED)" else: "")
-  if bad > 0:
-    warn "nativeui: " & $bad & " target(s) did not match. Every refusal is " &
-         "logged individually above with its name and RVA. This layer refuses " &
-         "the operations that need them rather than calling an address whose " &
-         "bytes are not what this build's metadata says."
+        "build" &
+        (if bad > 0: " (" & $bad & " refused, of which " & $mism &
+                     " for a PROLOGUE MISMATCH)" else: "")
+  if mism > 0:
+    warn "nativeui: " & $mism & " target(s) failed the BYTE COMPARE against " &
+         "the startup snapshot. That is the real 'this is not the build these " &
+         "RVAs came from' signal, and the operations needing them are refused " &
+         "rather than calling an address whose bytes are not what this " &
+         "build's metadata says."
+  elif bad > 0:
+    warn "nativeui: " & $bad & " target(s) were refused, but NONE of them for " &
+         "a byte mismatch -- so this is not a wrong-build problem. Each " &
+         "refusal above names its own reason."
   for k in 0 ..< int(cNuKindCount()):
     if verbose:
       info "nativeui: component kind " & readCString(cNuKindName(int32(k))) &

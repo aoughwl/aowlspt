@@ -7005,8 +7005,12 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   # all; `nativeUiProof` additionally runs the one-shot visual self-proof.
   gNuOn = readBoolKey("nativeUi")
   gNuProof = gNuOn and readBoolKey("nativeUiProof")
-  if gNuOn:
-    bindNativeUi(true)
+  # NOTE: `bindNativeUi` is deliberately NOT called here. It was, and the first
+  # live run showed why that is wrong: this pass runs before il2cpp is attached
+  # and before GameAssembly.dll is loaded, so all 25 targets refused with "no
+  # module" and the census reported them as 25 prologue REJECTIONS -- twenty-
+  # five confident warnings blaming the game build for a start-order bug. The
+  # census now runs in the `gReady` bind region below, after `cProPrimeAll()`.
   gMi2Probe = readBoolKey("managedInvokeProbe")
   # The proof RIDES invoke2's postfix detour rather than binding a second one,
   # so asking for the proof implies arming that detour. Saying so here, rather
@@ -7310,6 +7314,15 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
       # trampoline. Only the registry is given up -- the Phase-1.6 control walk
       # above is on a different target and keeps running, falling back to
       # naming tabs by klass when the registry is absent.
+      # The native-UI layer's target census. HERE, not in the flag pass: this
+      # is after `cProPrimeAll()` and after GameAssembly.dll is loaded, which
+      # are both preconditions for a verify to mean anything. Running it early
+      # is what produced "0 of 25 verified (25 REJECTED)" on a build where all
+      # 25 were in fact fine. It binds no detour of its own -- the proof rides
+      # invoke2's postfix below.
+      if gNuOn:
+        bindNativeUi(true)
+
       if gMi2Probe and not bindManagedInvoke(true):
         info "the managed-invoke probe did not verify " &
              "SettingsScreen.EnsureTabInitialized on this build"
