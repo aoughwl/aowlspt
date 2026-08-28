@@ -433,6 +433,21 @@ static void test_wire_refs(void) {
     ck(rejected == 6,
        "all six bad get/set addresses were REFUSED (a different count means a "
        "guard accepts an address it must not, which is exactly a blind write)");
+
+    /* The cold-MethodInfo discriminator, pinned to the exact value measured
+     * live. 0xc00804f3 is an UNRESOLVED IL2CPP metadata-usage token, not a
+     * pointer; the readability check that gates the AddComponent<T> call must
+     * judge it NON-readable so a cold slot is REFUSED, not passed to the call.
+     * A real MethodInfo* (a mapped region) would pass -- this asserts only the
+     * negative, which is the one that stops the crash. */
+    ck(aowl_nu_region_ok((void*)(uintptr_t)0xc00804f3u, 0x48, 0) == 0,
+       "the live cold-slot token 0xc00804f3 is judged NON-readable, so the "
+       "AddComponent<T> guard refuses it instead of faulting");
+    ck(aowl_nu_region_ok((void*)(uintptr_t)0xc00804f3u, 0x48, 1) == 0,
+       "same token is non-writable too");
+    ck(aowl_nu_region_ok(donor, 0x48, 0) == 1,
+       "a genuinely mapped region IS judged readable (the guard is not a "
+       "blanket reject-everything)");
 }
 
 int main(void) {
