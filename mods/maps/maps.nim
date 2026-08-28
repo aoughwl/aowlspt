@@ -182,7 +182,8 @@ proc spatialSchema(): seq[Setting] =
                               "edge in its direction. Camera-relative when the " &
                               "region has a projector installed; a NORTH-UP " &
                               "bearing ring when it does not, and the status " &
-                              "line says which is happening"),
+                              "line says which is happening. " &
+                              "A bearing mark per contact on a ring around screen centre"),
     floatSetting("radarSize", "Radar size (px)", 220.0, lo = 64.0, hi = 640.0,
                  step = 8.0, category = "HUD"),
     floatSetting("radarX", "Radar X (px)", 24.0, lo = 0.0, hi = 4096.0,
