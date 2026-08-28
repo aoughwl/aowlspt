@@ -278,20 +278,142 @@ proc missingEssential*(rt: Il2Cpp): seq[string] =
 # Strings
 # ---------------------------------------------------------------------------
 
-proc readCString*(p: Il2CppPtr): string =
-  ## Copies a NUL-terminated UTF-8 string the runtime owns.
+## The last refusal `readCString` made, and how many it has made.
+##
+## A refusal that returns "" and says nothing is indistinguishable from an empty
+## string, which is exactly the shape of failure this project has lost the most
+## time to. Nothing here can log -- this module is below the logger -- so the
+## reason is left where the caller can pick it up and report it, and the counter
+## makes a path that is refusing EVERY time visible without one.
+var gStrRefusal*: string = ""
+var gStrRefusals*: int = 0
+
+const StrMaxLen = 512
+  ## Every string this is used for is a type, namespace, method or field name.
+  ## The old cap was 4096, which is not a bound on a name -- it is a bound on
+  ## how far a *wrong* pointer walks before giving up, and 4 KB of a random
+  ## non-zero address is 4 KB of faults waiting to happen.
+
+proc toHexStr*(v: uint64): string =
+  ## Local, because this module is below anything that could be imported for it
+  ## and a refusal message that cannot print the address it refused is not a
+  ## refusal message.
+  const D = "0123456789abcdef"
+  if v == 0'u64:
+    return "0"
+  var x = v
+  var buf = ""
+  while x > 0'u64:
+    buf.add D[int(x and 15'u64)]
+    x = x shr 4
   result = ""
+  for i in countdown(buf.len - 1, 0):
+    result.add buf[i]
+
+proc strRefuse(why: string) =
+  gStrRefusal = why
+  inc gStrRefusals
+
+proc readCStringChecked*(p: Il2CppPtr; ok: var bool; why: var string): string =
+  ## Copies a NUL-terminated ASCII name the runtime owns -- or REFUSES.
+  ##
+  ## ## The check this replaces could not fail
+  ##
+  ## The old body was `if p == nil: return`, and that check is worthless here.
+  ## The exports that produce these pointers -- `il2cpp_class_get_name` and its
+  ## neighbours -- are TOKEN-GATED on this build: handed the wrong token they do
+  ## not return NULL and do not abort, they return a uniform random NON-ZERO
+  ## uint64 from a per-thread MT19937-64. So the nil check passes, always, and
+  ## the first byte read faults at 0xc0000005. That is fact #198, and it is how
+  ## `fov.dll` hard-crashed the live client.
+  ##
+  ## The right long-term answer is to PASS THE TOKEN, and a concurrent branch
+  ## (`feat-il2cpp-gates`) is building that. This is the other half: until a
+  ## caller has a token, the un-tokened path must REFUSE LOUDLY rather than hand
+  ## back a plausible value.
+  ##
+  ## ## What is actually checked
+  ##
+  ##   RANGE      -- a plausible user-space address. A random uint64 is
+  ##                 astronomically unlikely to look like one, so this alone
+  ##                 catches nearly every gated-export failure BEFORE any read.
+  ##   READABLE   -- `VirtualQuery`, one byte at a time as the string grows,
+  ##                 re-checked at every page boundary. A name that starts in a
+  ##                 committed page and runs off the end of it is the other way
+  ##                 this faults, and one check at the front does not see it.
+  ##   ASCII      -- these are identifiers. A byte outside 0x20..0x7E means the
+  ##                 pointer was not a name, and stopping there turns a fault
+  ##                 into an answer.
+  ##   BOUNDED    -- StrMaxLen, and hitting the cap is a REFUSAL, not a
+  ##                 truncated success.
+  ok = false
+  why = ""
+  result = ""
+  let a = cast[uint64](p)
   if p == nil:
+    why = "readCString: the pointer is NULL."
+    strRefuse(why)
+    return
+  if a < 0x10000'u64 or a >= 0x7FFFFFFFFFFF'u64:
+    why = "readCString: REFUSING 0x" & toHexStr(a) & " -- not a plausible " &
+          "user-space address. On this build the il2cpp name exports are " &
+          "TOKEN-GATED and an un-tokened call returns a uniform random " &
+          "NON-ZERO uint64, which passes a nil check and faults on the first " &
+          "dereference (fact #198). Nothing was read."
+    strRefuse(why)
+    return
+  # First page, before a single byte is touched.
+  if isReadable(p, 1'i32) == 0'i32:
+    why = "readCString: REFUSING 0x" & toHexStr(a) & " -- VirtualQuery says " &
+          "the first byte is not committed readable memory. Non-nil is not " &
+          "readable. Nothing was read."
+    strRefuse(why)
     return
   var i = 0'u64
   while true:
-    let b = byteAt(p, i)
+    if i >= uint64(StrMaxLen):
+      why = "readCString: REFUSING 0x" & toHexStr(a) & " -- no NUL in " &
+            $StrMaxLen & " bytes. A name is not this long; an unterminated " &
+            "run means the pointer was never a string. The partial read is " &
+            "DISCARDED rather than returned as a truncated name."
+      strRefuse(why)
+      result = ""
+      return
+    # Re-query at every page boundary: a string may start inside a committed
+    # page and walk off the end of it, and one check at the front cannot see
+    # that. `a + i` is the address of the byte about to be read.
+    if ((a + i) and 0xFFF'u64) == 0'u64 and i > 0'u64:
+      if isReadable(cast[Il2CppPtr](a + i), 1'i32) == 0'i32:
+        why = "readCString: REFUSING 0x" & toHexStr(a) & " -- the string ran " &
+              "off the end of its committed region at +" & $int(i) &
+              " with no NUL. Nothing is returned."
+        strRefuse(why)
+        result = ""
+        return
+    let b = byteAt(cast[Il2CppPtr](a), i)
     if b == 0'u8:
       break
+    if b < 0x20'u8 or b > 0x7E'u8:
+      why = "readCString: REFUSING 0x" & toHexStr(a) & " -- byte 0x" &
+            toHexStr(uint64(b)) & " at +" & $int(i) & " is outside printable " &
+            "ASCII. Every string read through here is an identifier, so a " &
+            "byte like this means the pointer was not one. Nothing is returned."
+      strRefuse(why)
+      result = ""
+      return
     result.add char(b)
     i = i + 1'u64
-    if i > 4096'u64:   # a runaway read means the pointer was not a string
-      break
+  ok = true
+
+proc readCString*(p: Il2CppPtr): string =
+  ## The unchanged-shaped face of `readCStringChecked`, for the call sites that
+  ## only want the name. A refusal comes back as "" -- and, because "" is also a
+  ## legitimate empty name, the reason is left in `gStrRefusal` and the count in
+  ## `gStrRefusals` so a caller can tell the two apart. Prefer the `Checked`
+  ## form in anything new.
+  var ok = false
+  var why = ""
+  result = readCStringChecked(p, ok, why)
 
 # ---------------------------------------------------------------------------
 # The typed API
@@ -537,9 +659,39 @@ proc objectNew*(rt: Il2Cpp; c: Il2CppClass): Il2CppObject =
   if not rt.has(eObjectNew): return nullPtr()
   result = tpP(rt.fns[ord(eObjectNew)], c)
 
+proc plausiblePtr*(p: Il2CppPtr): bool =
+  ## A user-space-shaped address. THE cheap first gate against a gated export's
+  ## random non-zero return, applied before any dereference.
+  let a = cast[uint64](p)
+  result = a >= 0x10000'u64 and a < 0x7FFFFFFFFFFF'u64
+
 proc objectClass*(rt: Il2Cpp; obj: Il2CppObject): Il2CppClass =
+  ## `il2cpp_object_get_class`, which is literally `mov rax,[rcx]; ret` on this
+  ## build: three instructions that VALIDATE NOTHING. Handed a bad pointer it
+  ## does not fault and does not return NULL -- it returns whatever eight bytes
+  ## were there, which is a plausible number, silently. So the checks are here,
+  ## because they are nowhere in the export.
+  ##
+  ## Both hops are gated: `obj` must be readable for its first word before the
+  ## export reads it, and the class handed back must itself be plausible and
+  ## readable before any caller walks it. A refusal is `nil`, which every caller
+  ## already handles; the reason lands in `gStrRefusal`.
   if not rt.has(eObjectGetClass): return nullPtr()
-  result = tpP(rt.fns[ord(eObjectGetClass)], obj)
+  if not plausiblePtr(obj) or isReadable(obj, 8'i32) == 0'i32:
+    strRefuse("objectClass: REFUSING 0x" & toHexStr(cast[uint64](obj)) &
+              " -- the object's first word is not readable. " &
+              "il2cpp_object_get_class is `mov rax,[rcx]; ret` and would " &
+              "have returned a plausible number from unreadable memory " &
+              "rather than faulting or returning NULL.")
+    return nullPtr()
+  let c = tpP(rt.fns[ord(eObjectGetClass)], obj)
+  if not plausiblePtr(c) or isReadable(c, 8'i32) == 0'i32:
+    strRefuse("objectClass: the class read out of 0x" &
+              toHexStr(cast[uint64](obj)) & " is 0x" &
+              toHexStr(cast[uint64](c)) & ", which is not a readable " &
+              "address. That is not a class; REFUSED.")
+    return nullPtr()
+  result = c
 
 proc arrayNew*(rt: Il2Cpp; elementClass: Il2CppClass; count: int): Il2CppPtr =
   ## Allocate a managed 1-D array of `elementClass` with `count` elements, e.g.

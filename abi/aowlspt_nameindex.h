@@ -656,4 +656,43 @@ static uint32_t aowl_nameidx_lookup(const char *spec, int32_t arity) {
     return aowl_nameidx_lookup_shared(spec, arity, &share);
 }
 
+/* ------------------------------------------------------------------------
+ * SHAREDNESS FOR AN ADDRESS THE CALLER ALREADY HAS.
+ *
+ * The by-name path refuses a shared detour (see `sharedRefusal` in the host).
+ * The `@0x` path -- a spec that states an RVA outright -- bypassed all of it,
+ * so the safest-looking way to name a target was also the only unguarded one.
+ * That is backwards, and it is the exact shape of a check that cannot fail.
+ *
+ * The index is keyed by NAME hash, so an address cannot be binary-searched.
+ * A linear pass over the dense `rva[]` array is the honest answer: one 4-byte
+ * stride over ~165k entries, done ONCE at patch-install time, never per frame,
+ * and hard-capped so a corrupt count cannot spin.
+ *
+ * Returns the LARGEST share count of any entry at that RVA, or
+ * AOWL_NIDX_SHARE_UNKNOWN (0) when the index is unusable, the cap was hit, or
+ * the address is absent. 0 is never "unshared" -- it is "nobody knows", and
+ * the caller must treat it as a refusal, not as permission. */
+static uint32_t aowl_nameidx_share_for_rva(uint32_t rva) {
+    const uint32_t *rvas;
+    const uint16_t *shares;
+    uint32_t i, best = AOWL_NIDX_SHARE_UNKNOWN, hits = 0;
+    if (!aowl_nidx_ok || !aowl_nidx_buf || !rva) return AOWL_NIDX_SHARE_UNKNOWN;
+    if (aowl_nidx_count == 0 || aowl_nidx_count > 4000000u)
+        return AOWL_NIDX_SHARE_UNKNOWN;
+    rvas   = (const uint32_t *)(aowl_nidx_buf + AOWL_NIDX_HEADER +
+                                (size_t)aowl_nidx_count * 8u);
+    shares = (const uint16_t *)(aowl_nidx_buf + AOWL_NIDX_HEADER +
+                                (size_t)aowl_nidx_count * 16u);
+    for (i = 0; i < aowl_nidx_count; i++) {
+        if (rvas[i] != rva) continue;
+        hits++;
+        if ((uint32_t)shares[i] > best) best = (uint32_t)shares[i];
+    }
+    /* Two DIFFERENT keys landing on one address is itself sharedness, even if
+     * each entry's own share field says 1 -- report what was actually seen. */
+    if (hits > 1u && best < hits) best = hits;
+    return best;
+}
+
 #endif /* AOWLSPT_NAMEINDEX_H */

@@ -619,6 +619,33 @@ proc duOk(p: Il2CppPtr; size: int32): bool =
   ## bytes by VirtualQuery -- never a faulting deref to find out.
   result = p != nil and bdSanePtr(p) and cIsReadable(p, size) != 0'i32
 
+proc cUnityAlive(p: Il2CppPtr): int32 {.importc: "aowl_unity_alive", nodecl.}
+proc cUnityAliveEx(p: Il2CppPtr): int32 {.
+  importc: "aowl_unity_alive_ex", nodecl.}
+proc cUnityAliveName(k: int32): cstring {.
+  importc: "aowl_unity_alive_name", nodecl.}
+
+proc duAlive(p: Il2CppPtr; size: int32): bool =
+  ## `duOk` PLUS the only question `duOk` cannot answer: is the object still
+  ## alive?
+  ##
+  ## `Destroy` does not free the managed wrapper. It zeroes the native handle
+  ## at `UnityEngine.Object.m_CachedPtr`+0x10 and leaves the wrapper mapped and
+  ## fully readable, so `duOk` returns TRUE for a destroyed object every single
+  ## time -- a check that cannot fail. The field read that follows returns a
+  ## plausible number, and the first icall through it dies inside Unity's C++,
+  ## where `aowl_p_p_seh` does not reach (fact #182: `duCanvasRootGo` is three
+  ## managed calls, and it is the internal call that takes the process down).
+  ##
+  ## READABILITY IS NOT LIVENESS. Every site below that hands a
+  ## `UnityEngine.Object` to a managed CALL uses this; the sites that only read
+  ## a field out of a plain buffer -- a List, an array -- keep `duOk`, because
+  ## those are not Unity objects and have no `m_CachedPtr` to ask about.
+  ## Calling this on a non-Unity pointer would report INCONCLUSIVE and, since
+  ## INCONCLUSIVE collapses to NO, would refuse everything.
+  result = duOk(p, size) and cUnityAlive(p) != 0'i32
+
+
 # ---------------------------------------------------------------------------
 # Read-back helpers
 #
@@ -633,7 +660,7 @@ proc duGetVec2(target: int32; self: Il2CppPtr; ok: var bool;
   x = 0.0
   y = 0.0
   let fn = cDuFn(target)
-  if fn == nil or not duOk(self, 0x20'i32):
+  if fn == nil or not duAlive(self, 0x20'i32):
     return
   let packed = cDuCallUP(fn, self)
   x = cDuVec2X(packed)
@@ -645,7 +672,7 @@ proc duGetSret(target: int32; self: Il2CppPtr; n: int32; ok: var bool) =
   ## Vector3, 4 for a Rect).
   ok = false
   let fn = cDuFn(target)
-  if fn == nil or not duOk(self, 0x20'i32):
+  if fn == nil or not duAlive(self, 0x20'i32):
     return
   ok = cDuCallSretP(fn, self, n) != 0'i32
 
@@ -653,7 +680,7 @@ proc duGetInt(target: int32; self: Il2CppPtr; ok: var bool): int32 =
   ok = false
   result = 0'i32
   let fn = cDuFn(target)
-  if fn == nil or not duOk(self, 0x20'i32):
+  if fn == nil or not duAlive(self, 0x20'i32):
     return
   result = cDuCallIP(fn, self)
   ok = true
@@ -661,10 +688,10 @@ proc duGetInt(target: int32; self: Il2CppPtr; ok: var bool): int32 =
 proc duGameObjectOf(comp: Il2CppPtr): Il2CppPtr =
   result = nil
   let fn = mi2Fn(Mi2GetGameObject)
-  if fn == nil or not duOk(comp, 0x20'i32):
+  if fn == nil or not duAlive(comp, 0x20'i32):
     return
   let go = cMi2CallPP(fn, comp)
-  if duOk(go, 0x20'i32):
+  if duAlive(go, 0x20'i32):
     result = go
 
 proc duNameOf(obj: Il2CppPtr): string =
@@ -673,7 +700,7 @@ proc duNameOf(obj: Il2CppPtr): string =
   ## heap and a per-frame allocation is the one cost this overlay refuses.
   result = ""
   let fn = mi2Fn(Mi2GetName)
-  if fn == nil or not duOk(obj, 0x20'i32):
+  if fn == nil or not duAlive(obj, 0x20'i32):
     return
   let s = cMi2CallPP(fn, obj)
   if s == nil or cIsReadable(s, 0x14'i32) == 0'i32:
@@ -1688,7 +1715,7 @@ proc duDrawMarkers(): bool =
   if not duCanvasSize(cw, ch):
     return true                 # no measured screen yet; not a build problem
   let cam = cDuCallPV(fnCam)
-  if not duOk(cam, 0x20'i32):
+  if not duAlive(cam, 0x20'i32):
     return true                 # menu or loading screen: not an error
   var eyeOk = false
   var ex = 0.0
@@ -1786,7 +1813,7 @@ proc duDescribeInt(target: int32; self: Il2CppPtr): string =
 
 proc duDescribeScale(canvas: Il2CppPtr): string =
   let fn = cDuFn(DuCanvasScale)
-  if fn == nil or not duOk(canvas, 0x20'i32):
+  if fn == nil or not duAlive(canvas, 0x20'i32):
     return "?"
   result = duFmt2(cDuCallFP(fn, canvas))
 

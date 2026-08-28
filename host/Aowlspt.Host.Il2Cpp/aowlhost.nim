@@ -110,6 +110,12 @@ import invoke
 ## prologue check now compares against the snapshot instead of live memory; the
 ## check itself is unchanged and just as strict. See `aowlspt_prologue.h`.
 {.emit: """#include "aowlspt_prologue.h" """.}
+## THE ONE LIVENESS PREDICATE for a `UnityEngine.Object`. `Destroy` zeroes the
+## native handle at +0x10 and leaves the managed wrapper readable, so every
+## readability check in this host says YES to a corpse and the next internal
+## call dies inside Unity's C++. Readability is not liveness. See
+## `aowlspt_ualive.h`.
+{.emit: """#include "aowlspt_ualive.h" """.}
 ## PATCH BY VERIFIED STATIC RVA -- the address side of it, in C because it is
 ## three Win32 calls and no Nim.
 ##
@@ -818,6 +824,17 @@ proc cProVerify(rva: uint32; sig: ptr uint8; siglen: int32): int32 {.
 proc cRvaCodeAt(rva: uint32): Il2CppPtr {.importc: "aowl_rva_code_at", nodecl.}
 proc cGaBase(): uint64 {.importc: "aowl_ga_base", nodecl.}
 proc cRvaIsCode(rva: uint32): int32 {.importc: "aowl_rva_is_code", nodecl.}
+proc cProShape(rva: uint32): int32 {.importc: "aowl_pro_shape", nodecl.}
+  ## The SHAPE of the ORIGINAL bytes at an RVA, classified from the startup
+  ## snapshot -- never from live memory, for the same reason `cProVerify` uses
+  ## the snapshot. -1 is UNKNOWN and means the bytes could not be read; it is
+  ## never "fine".
+proc cProShapeName(k: int32): cstring {.
+  importc: "aowl_pro_shape_name", nodecl.}
+proc cProShapeIsStub(k: int32): int32 {.
+  importc: "aowl_pro_shape_is_stub", nodecl.}
+proc cProShapeNoDetour(k: int32): int32 {.
+  importc: "aowl_pro_shape_no_detour", nodecl.}
 proc cInIl2cpp(p: Il2CppPtr): int32 {.
   importc: "aowl_in_il2cpp_section", nodecl.}
 proc cIl2cppRvaOf(p: Il2CppPtr): int64 {.
@@ -3960,7 +3977,7 @@ proc rvaPostfixRefusal(rs: RvaSpec): string =
   result = ""
 
 proc resolveByRva*(rva: uint32; sig: var array[16, uint8]; siglen: int32;
-                   label: string; why: var string): Il2CppPtr =
+                   label: string; forPatch: bool; why: var string): Il2CppPtr =
   ## THE ADDRESS-SUBSTITUTION MECHANISM. Given a module-relative RVA, hand back
   ## a code pointer that has passed every check, or nil with `why` naming the
   ## check that failed.
@@ -3975,6 +3992,21 @@ proc resolveByRva*(rva: uint32; sig: var array[16, uint8]; siglen: int32;
   ##   IL2CPP SECTION -- inside the `il2cpp` PE section, where generated code
   ##                     lives. `.text` holds no managed method bodies.
   ##   PROLOGUE       -- the declared bytes against the STARTUP SNAPSHOT.
+  ##   BODY SHAPE     -- what those bytes ARE. An empty body is refused for a
+  ##                     CALL and for a DETOUR alike; a thunk only for a detour.
+  ##
+  ## The BODY SHAPE check has no analogue anywhere else here, and it exists
+  ## because every other check on this list PASSES for `TMP_Text::
+  ## ForceMeshUpdate` at 0x628110 -- a mapped, executable, in-section address
+  ## whose bytes are `C2 00 00`, `ret 0`. That is this build's universal
+  ## empty-body stub, which 6,438 methods fold onto. A lookup that succeeds and
+  ## a call that silently does nothing is the worst outcome this project
+  ## produces, and prologue verification cannot catch it: a signature copied
+  ## from a stub matches the stub perfectly. So the shape is CLASSIFIED, not
+  ## compared, from the same table `tools/il2cpp_resolve.py` uses offline.
+  ##
+  ## `forPatch` has no default, so a new call site cannot inherit the more
+  ## permissive answer by saying nothing.
   ##
   ## The prologue check is against the snapshot, never live memory: verifying
   ## after another feature patched the same function reads that feature's
@@ -4024,6 +4056,36 @@ proc resolveByRva*(rva: uint32; sig: var array[16, uint8]; siglen: int32;
          " passed the module, code-page and il2cpp-section checks only. " &
          "Append the !<hex> suffix to the spec to have its original bytes " &
          "verified."
+  # THE BODY-SHAPE GATE. Last, because it is the only check that can refuse an
+  # address every other check has just approved -- and naming which check
+  # declined matters more than saving four instructions.
+  let shape = cProShape(rva)
+  let shapeName = $cProShapeName(shape)
+  if cProShapeIsStub(shape) != 0'i32:
+    why = "by-RVA " & label & ": check BODY SHAPE failed -- il2cpp+0x" &
+          hexOf(uint64(rva)) & " is " & shapeName & ". This is NOT the method " &
+          "you named. This build folds every empty-bodied method onto a " &
+          "shared stub -- 0x628110 alone is shared by 6,438 of them -- and " &
+          "the module, code-page, il2cpp-section and even PROLOGUE checks all " &
+          "pass on it, because a signature copied from a stub matches the " &
+          "stub. Calling it would do nothing and report success. REFUSED for " &
+          "calling and for patching alike."
+    return cast[Il2CppPtr](0)
+  if forPatch and cProShapeNoDetour(shape) != 0'i32:
+    why = "by-RVA " & label & ": check BODY SHAPE failed -- il2cpp+0x" &
+          hexOf(uint64(rva)) & " is " & shapeName & ". CALLING this address " &
+          "is meaningful; DETOURING it is not, so only the patch is refused. " &
+          (if shape < 0'i32:
+             "The original bytes were never captured, so nothing was " &
+             "classified: this check fails CLOSED rather than assume a body " &
+             "it could not see."
+           else: "")
+    return cast[Il2CppPtr](0)
+  if shape == 4'i32:      # AOWL_SHAPE_TRIVIAL
+    warn "by-RVA " & label & ": il2cpp+0x" & hexOf(uint64(rva)) & " is " &
+         shapeName & ". It is a real body and is NOT refused, but a detour " &
+         "here very probably fires for methods you never named. Check the " &
+         "share count first."
   result = p
 ## ## The offline name index
 ##
@@ -4049,6 +4111,11 @@ proc cNameIdxLookup(spec: cstring; arity: int32): uint32 {.
 proc cNameIdxLookupShared(spec: cstring; arity: int32;
                           shareOut: ptr uint32): uint32 {.
   importc: "aowl_nameidx_lookup_shared", nodecl.}
+proc cNameIdxShareForRva(rva: uint32): uint32 {.
+  importc: "aowl_nameidx_share_for_rva", nodecl.}
+  ## Sharedness for an address the caller already has, for the `@0x` spec form
+  ## -- which stated an RVA outright and so bypassed the by-name share gate
+  ## entirely. 0 is UNKNOWN, never "unshared".
   ## Same search, and it also hands back the entry's SHARE COUNT.
   ##
   ## 0 is UNKNOWN and is what every failure path leaves behind -- it is never
@@ -4175,7 +4242,7 @@ proc nameIndexResolve(spec: string; arity: int32; forPatch: bool;
     var sig: array[16, uint8] = [0'u8, 0, 0, 0, 0, 0, 0, 0,
                                  0, 0, 0, 0, 0, 0, 0, 0]
     var why = ""
-    result = resolveByRva(rva, sig, 0'i32, spec, why)
+    result = resolveByRva(rva, sig, 0'i32, spec, forPatch, why)
     if result == nil:
       warn "name index: " & spec & " is at il2cpp+0x" & hexOf(uint64(rva)) &
            ", but the by-RVA binder REFUSED that address: " & why &
@@ -4295,7 +4362,38 @@ proc installPatch(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
       return ErrUnsupported
     var sig = rs.sig
     var whyRva = ""
-    fn = resolveByRva(rs.rva, sig, rs.siglen, rs.name, whyRva)
+    # THE @0x SHARE GATE. A spec that names an address outright used to be the
+    # ONLY route to a detour with no sharedness check on it -- the most explicit
+    # form was the least guarded, which is backwards. The index cannot binary-
+    # search by address, so this is a one-shot capped linear pass at install
+    # time; it never runs per frame.
+    let rvaShare = cNameIdxShareForRva(rs.rva)
+    if rvaShare >= 2'u32:
+      let m = "patch @0x" & hexOf(uint64(rs.rva)) & " (" & rs.name &
+              "): SHARED RVA -- " & $int(rvaShare) & " method(s) in this " &
+              "build resolve to this one address, because the IL2CPP backend " &
+              "folded their identical bodies. A detour is a WRITE and its " &
+              "blast radius is all of them; nothing at run time tells one " &
+              "from another. A direct CALL here stays correct. Append " &
+              "!shared to the spec to override this deliberately."
+      if allowShared:
+        warn "OVERRIDE (!shared): " & m
+      else:
+        warn m
+        gLastError = m
+        return ErrUnsupported
+    elif rvaShare == ShareUnknown:
+      # NOT a refusal here: an @0x spec may legitimately name an address the
+      # index has no key for (a nested or closure type the generator dropped).
+      # But it is not silence either -- a reader must not mistake "nobody
+      # looked" for "nobody else is there".
+      warn "patch @0x" & hexOf(uint64(rs.rva)) & " (" & rs.name &
+           "): sharedness is UNKNOWN for this address -- the name index has " &
+           "no entry at it, or is not loaded. That is NOT a statement that " &
+           "the address is unshared; 28.3% of exact keys on this build land " &
+           "on a folded RVA. Proceeding because an explicit @0x spec is an " &
+           "explicit choice, but nothing verified the blast radius."
+    fn = resolveByRva(rs.rva, sig, rs.siglen, rs.name, true, whyRva)
     if fn == nil:
       warn whyRva
       gLastError = whyRva

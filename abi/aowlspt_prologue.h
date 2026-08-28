@@ -159,6 +159,112 @@ static int32_t aowl_pro_verify(uint32_t rva,
     return memcmp(r->b, sig, (size_t)siglen) == 0 ? 1 : 0;
 }
 
+/* ------------------------------------------------------------------------
+ * THE EMPTY-BODY STUB GATE.
+ *
+ * Resolving `TMP_Text::ForceMeshUpdate` by name lands on 0x628110, whose bytes
+ * are `C2 00 00` -- `ret 0`. That is NOT that method's code. It is this build's
+ * UNIVERSAL EMPTY-BODY STUB, and 6,438 methods fold onto it. The lookup
+ * succeeds, every existing check (module, code page, il2cpp section, even a
+ * 16-byte prologue compare against a signature copied from that same address)
+ * PASSES, and the call is a no-op. A verification that cannot fail is the bug.
+ *
+ * So classify the SHAPE of the body before trusting the address. This is the
+ * runtime twin of `Resolver.classify_thunk` in tools/il2cpp_resolve.py and the
+ * two are deliberately the same table of shapes; if one grows a case the other
+ * must. The stub set is DERIVED from the bytes, not from a hardcoded 0x628110:
+ * any address whose body is an immediate return is refused, wherever it is.
+ *
+ * Conservative in one direction only: NOT matching is not evidence of a real
+ * body, and that is stated at every call site rather than assumed away.
+ *
+ * `aowl_pro_classify` is a PURE function of bytes so it can be exercised
+ * offline against constructed inputs -- a guard nobody has seen fire is not a
+ * guard. See tools/shapetest.c. */
+enum {
+    AOWL_SHAPE_UNKNOWN  = -1, /* bytes unavailable: fail CLOSED, never "fine" */
+    AOWL_SHAPE_BODY     = 0,  /* no non-body shape matched (NOT "verified")   */
+    AOWL_SHAPE_RET      = 1,  /* C3                       -- empty body       */
+    AOWL_SHAPE_RETN     = 2,  /* C2 imm16                 -- empty body       */
+    AOWL_SHAPE_XORRET   = 3,  /* [48] 33 C0 C3            -- returns 0        */
+    AOWL_SHAPE_TRIVIAL  = 4,  /* mov rax,[rcx+d8]; ret    -- real, but FOLDED */
+    AOWL_SHAPE_JMPTABLE = 5,  /* FF 25                    -- indirect jump    */
+    AOWL_SHAPE_TAILJUMP = 6   /* E9 rel32                 -- tail-call thunk  */
+};
+
+static int32_t aowl_pro_classify(const unsigned char* b, int32_t n) {
+    int32_t i;
+    if (!b || n < 4) return AOWL_SHAPE_UNKNOWN;
+    if (b[0] == 0xC3) return AOWL_SHAPE_RET;
+    if (b[0] == 0xC2) return AOWL_SHAPE_RETN;
+    if ((b[0] == 0x33 && b[1] == 0xC0 && b[2] == 0xC3) ||
+        (b[0] == 0x48 && b[1] == 0x33 && b[2] == 0xC0 && b[3] == 0xC3))
+        return AOWL_SHAPE_XORRET;
+    if (b[0] == 0x48 && b[1] == 0x8B && b[2] == 0x41 && n > 4 && b[4] == 0xC3)
+        return AOWL_SHAPE_TRIVIAL;
+    if (b[0] == 0xFF && b[1] == 0x25) return AOWL_SHAPE_JMPTABLE;
+    for (i = 0; i < 9 && i < n - 4; i++) {
+        if (b[i] == 0xE9) {
+            int32_t pad = (i + 5 >= n) || b[i + 5] == 0xCC || b[i + 5] == 0x90;
+            if (i == 0 || pad) return AOWL_SHAPE_TAILJUMP;
+            break;
+        }
+    }
+    return AOWL_SHAPE_BODY;
+}
+
+static const char* aowl_pro_shape_name(int32_t k) {
+    switch (k) {
+    case AOWL_SHAPE_RET:      return "STUB (immediate ret -- EMPTY BODY)";
+    case AOWL_SHAPE_RETN:     return "STUB (ret imm16 -- EMPTY BODY; this is "
+                                     "the shape of the universal stub at "
+                                     "0x628110 that 6,438 methods fold onto)";
+    case AOWL_SHAPE_XORRET:   return "STUB (xor eax,eax; ret -- returns 0, no "
+                                     "body)";
+    case AOWL_SHAPE_TRIVIAL:  return "TRIVIAL (one-instruction field getter; a "
+                                     "real body, but bodies this small are "
+                                     "FOLDED, so expect the RVA to be SHARED)";
+    case AOWL_SHAPE_JMPTABLE: return "JMPTABLE (jmp [rip+disp32] -- an indirect "
+                                     "jump, not a body)";
+    case AOWL_SHAPE_TAILJUMP: return "TAILJUMP (jmp rel32 -- a tail-call thunk; "
+                                     "a postfix detour here has no return site)";
+    case AOWL_SHAPE_BODY:     return "BODY (no empty-body or thunk shape "
+                                     "matched -- which is NOT proof of a real "
+                                     "body, only absence of a known bad one)";
+    default:                  return "UNKNOWN (the original bytes could not be "
+                                     "read, so nothing was classified)";
+    }
+}
+
+/* The shape of the ORIGINAL bytes at an RVA, from the startup snapshot --
+ * never from live memory, for exactly the reason `aowl_pro_verify` uses the
+ * snapshot: after another feature detours a function, live memory holds that
+ * feature's trampoline and every shape read from it is a lie. */
+static int32_t aowl_pro_shape(uint32_t rva) {
+    AowlProRow* r = aowl_pro_find(rva);
+    if (!r) {
+        r = aowl_pro_capture(rva);
+        if (!r) return AOWL_SHAPE_UNKNOWN;    /* fail closed */
+        aowl_pro_lazy++;
+    }
+    return aowl_pro_classify(r->b, r->len);
+}
+
+/* Is this shape an EMPTY BODY? Refused for a call AND for a detour: calling it
+ * silently does nothing, which is this project's worst failure mode. */
+static int32_t aowl_pro_shape_is_stub(int32_t k) {
+    return (k == AOWL_SHAPE_RET || k == AOWL_SHAPE_RETN ||
+            k == AOWL_SHAPE_XORRET) ? 1 : 0;
+}
+
+/* Is this shape unsafe to DETOUR specifically? Adds the thunks: a tail jump
+ * has no return site for a postfix, and an indirect jump is not a body at all.
+ * Calling either is still meaningful, so this is not `is_stub`. */
+static int32_t aowl_pro_shape_no_detour(int32_t k) {
+    return (aowl_pro_shape_is_stub(k) || k == AOWL_SHAPE_JMPTABLE ||
+            k == AOWL_SHAPE_TAILJUMP || k == AOWL_SHAPE_UNKNOWN) ? 1 : 0;
+}
+
 /* Whether an RVA's ORIGINAL bytes are on record. Lets a caller say in the log
  * that it verified against a snapshot rather than against live memory. */
 static int32_t aowl_pro_have(uint32_t rva) {

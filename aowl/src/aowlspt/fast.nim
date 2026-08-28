@@ -692,15 +692,46 @@ proc bindOnObject*(rt: Il2Cpp; obj: Il2CppPtr; member: string;
   ## instantiations that cannot be named.
   if obj == nil:
     return noBinding("::" & member, "no object to bind against")
+  # THE POINTER GATE, before `il2cpp_object_get_class` -- which on this build is
+  # `mov rax,[rcx]; ret`, three instructions that validate nothing. Handed a
+  # pointer that is not an object it neither faults nor returns NULL: it hands
+  # back a plausible number, silently, and everything downstream walks it.
+  # `objectClass` now refuses such a pointer itself; this is the other half, so
+  # that the binding's own `why` names the hop that declined instead of
+  # reporting "no such method" for a pointer that was never an object.
+  if not plausiblePtr(obj):
+    return noBinding("::" & member,
+      "REFUSING to bind on 0x" & toHexStr(cast[uint64](obj)) & " -- that is " &
+      "not a plausible user-space address. A token-gated il2cpp export " &
+      "returns a uniform random NON-ZERO uint64 on a mismatch, which passes " &
+      "a nil check and faults on the first dereference (fact #198, the " &
+      "0xc0000005 that killed the live client). Nothing was dereferenced.")
   var cls = objectClass(rt, obj)
+  if cls == nil:
+    return noBinding("::" & member,
+      "REFUSING to bind on 0x" & toHexStr(cast[uint64](obj)) & " -- its " &
+      "class could not be read safely: " & gStrRefusal)
   var name = fullName(rt, cls)
-  while cls != nil:
+  # CAPPED. A fabricated class pointer can yield a parent chain that never
+  # terminates, and an unbounded walk inside a frame is a hang, not an error.
+  # No hierarchy in this game is remotely this deep.
+  var hops = 0
+  while cls != nil and hops < 64:
+    inc hops
     let b = bindInClass(rt, cls, name, member, argKinds, ret)
     if b.ok:
       return b
     cls = classParent(rt, cls)
+    if cls != nil and not plausiblePtr(cls):
+      return noBinding(name & "::" & member,
+        "the base-class walk reached 0x" & toHexStr(cast[uint64](cls)) &
+        ", which is not a plausible address. REFUSED rather than followed.")
     if cls != nil:
       name = fullName(rt, cls)
+  if hops >= 64:
+    return noBinding(name & "::" & member,
+      "the base-class walk hit its 64-hop cap without terminating, so the " &
+      "chain is not a real hierarchy. REFUSED.")
   result = noBinding(name & "::" & member,
                      "no method " & member & "/" & $argKinds.len &
                      " on that object or any of its base classes")
