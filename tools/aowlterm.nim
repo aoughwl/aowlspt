@@ -588,14 +588,38 @@ proc bar*(filled, width: int): string =
 # intact -- so on quit the player still has every line the launcher printed
 # about their install, which is exactly what they will be asked to paste.
 
+var gAltScreen = false
+  ## Whether we are currently on the alternate buffer with the cursor hidden.
+  ##
+  ## Tracked rather than assumed, because "restore the terminal" is spread over
+  ## six exit paths in `aowllaunch` (`q`, the quit confirmation, `d`, Ctrl+C,
+  ## both processes gone, and the resize bail-out that hands over to
+  ## `streamLogs`) and every one of them has to get it right. A program that
+  ## exits with the console still on the alternate buffer, or still with the
+  ## cursor hidden, has broken the shell the player ran it from -- which is a
+  ## worse outcome than any frame it could have drawn. `termRestore` now closes
+  ## over all of them at once, and calling `leaveFullScreen` twice is a no-op.
+
 proc enterFullScreen*() =
   if termMode() != tmFull: return
   flushFile(stdout)
+  gAltScreen = true
   termWrite("\e[?1049h\e[?25l\e[2J\e[H")
 
 proc leaveFullScreen*() =
   if termMode() != tmFull: return
+  if not gAltScreen: return
+  gAltScreen = false
   termWrite("\e[?25h\e[?1049l\e[0m")
+
+proc termShutdown*() =
+  ## The ONE call every exit path can end on. Leaves the alternate buffer if we
+  ## are on it, shows the cursor unconditionally (cheap, and the only way to be
+  ## sure after a path that hid it without going full screen), resets attributes
+  ## and restores the console mode. Safe to call when none of that applies.
+  leaveFullScreen()
+  if termMode() == tmFull: termWrite("\e[?25h\e[0m")
+  cTermRestore()
 
 # ---------------------------------------------------------------------------
 # A block that repaints in place

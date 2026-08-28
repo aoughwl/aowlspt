@@ -84,6 +84,46 @@ proc widest(rows: seq[Row]): int =
     let c = colsOf(r.text)
     if c > result: result = c
 
+proc lastIndexOf(rows: seq[Row]; needle: string): int =
+  result = -1
+  for i in 0 ..< rows.len:
+    if find(rows[i].text, needle) >= 0: result = i
+
+proc firstInk(s: string): int =
+  ## The column of the first character that is not a space. -1 for a blank row.
+  ## `forcePlain()` is in force, so there are no escapes to skip.
+  result = -1
+  for i in 0 ..< s.len:
+    if s[i] != ' ': return i
+
+proc alignedAtTwo(rows: seq[Row]; label: string): bool =
+  ## THE COLUMN CHECK. Every row the layout produces starts its text in column
+  ## 2 -- or column 0 if it is a box edge, whose vertical/corner IS the text.
+  ##
+  ## Before this, `screenHeader` and the status line started in column 1 while
+  ## `stepRow` started in column 2, so the top of the frame was one column left
+  ## of the ticks under it and one column left of the box under those. Nobody
+  ## reports that as a bug; they report "formatting issues" and "it sucks".
+  ##
+  ## A positive column assertion rather than "looks tidy": it fails for a single
+  ## added or removed leading space, anywhere.
+  result = true
+  for i in 0 ..< rows.len:
+    let t = rows[i].text
+    let c = firstInk(t)
+    if c < 0: continue                      # blank filler row
+    if c == 0: continue                     # a box edge: '+' or '|'
+    # Column 5 is the step NAME column: `stepRow` writes a two-cell marker at
+    # column 2 and a space, so a PENDING step -- whose marker is deliberately
+    # blank -- has its first ink at 5 while its name is in the same column as
+    # every other step's. Two legal columns, and nothing else: this still fails
+    # for the header at column 1, which is what it was written for.
+    if c == 5 and i > 0: continue
+    if c != 2:
+      result = false
+      echo "      MISALIGNED " & label & " row " & $i & " first ink at col " &
+           $c & ": |" & t & "|"
+
 # ---------------------------------------------------------------------------
 # Two logs with content that cannot be confused for each other
 # ---------------------------------------------------------------------------
@@ -100,26 +140,41 @@ proc fakeTail(marker: string; n: int): Tail =
 
 proc buildHelp(w: int): Row =
   result = newRow()
-  result.put " "
+  result.put "  "
   result.putIn ColDim, fit("q quit   d detach   tab swap   f full   space " &
-                           "pause   pgup/pgdn scroll", w - 2)
+                           "pause   pgup/pgdn scroll", w - 3)
 
 proc buildHeader(w: int): Row =
+  ## The same shape, and the same right-to-left dropping, as `screenHeader` in
+  ## the launcher. It has to be: this row arrives at the layout already built,
+  ## so the layout's "no row wider than w" check is only meaningful if the test
+  ## feeds it a header built the way the launcher builds one. A test header that
+  ## always fit would have hidden the 41-column header at a 40-column window.
   result = newRow()
-  result.put " "
-  result.putIn ColWhite, "aowlspt"
   result.put "  "
-  result.putIn ColDim, bxV()
-  result.put " "
-  result.putIn ColCyan, fit("Bear", 26)
-  result.put " "
-  result.putIn ColDim, bxV()
-  result.put " "
-  result.putIn ColGreen, fit("server up", 30)
-  result.put " "
-  result.putIn ColDim, bxV()
-  result.put " "
-  result.putIn ColGreen, fit("client up", 22)
+  result.putIn ColWhite, "aowlspt"
+  var labelW = 26
+  var srvW = 30
+  var cliW = 22
+  if 9 + (3 + labelW) + (3 + srvW) + (3 + cliW) + 2 + 6 > w:
+    labelW = 14
+    srvW = 16
+    cliW = 14
+  if result.width + 3 + labelW <= w:
+    result.put "  "
+    result.putIn ColDim, bxV()
+    result.put " "
+    result.putIn ColCyan, fit("Bear", labelW)
+  if result.width + 3 + srvW <= w:
+    result.put " "
+    result.putIn ColDim, bxV()
+    result.put " "
+    result.putIn ColGreen, fit("server up", srvW)
+  if result.width + 3 + cliW <= w:
+    result.put " "
+    result.putIn ColDim, bxV()
+    result.put " "
+    result.putIn ColGreen, fit("client up", cliW)
   if result.width <= w - 10:
     result.padTo w - 10
     result.putIn ColDim, secsText(12345'i64)
@@ -135,7 +190,7 @@ proc buildSteps(w: int): seq[Row] =
 proc runSize(w, h: int; expectRenderable: bool; label: string) =
   var srv = fakeTail("SRVLINE", 40)
   var cli = fakeTail("CLILINE", 40)
-  let lay = logViewRows(w, h, buildHeader(w), buildSteps(w),
+  let lay = logViewRows(w, h, buildHeader(w),
                         stepRow(MarkDone, "launch", "SUMMARYLINE ready", w),
                         srv, cli, "SRVPANE 40", "CLIPANE 40",
                         0, 0, 0, false, buildHelp(w))
@@ -183,27 +238,53 @@ proc runSize(w, h: int; expectRenderable: bool; label: string) =
     if t.len == 0 or t[0] != '|' or t[t.len - 1] != '|': bodyOk = false
   check(bodyOk, label & ": every body row is bounded by both outer verticals")
 
-  # The progress region, and BOTH logs, in the same grid.
-  if lay.collapsedSteps:
-    check(has(lay.rows, "SUMMARYLINE"),
-          label & ": the progress region collapsed to its summary line")
-    check(lay.note.len > 0, label & ": says on screen that it collapsed")
-    echo "      note: " & lay.note
-  else:
-    check(has(lay.rows, "STEPMODS"),
-          label & ": the progress steps are drawn in full")
-  check(lay.stepsShown > 0, label & ": a progress region is present")
+  # THE COMPLAINT. "i can still see those checkboxes for the il2cpp and the
+  # other few items when we are side by side."
+  #
+  # Screen 2 must carry the ONE summary line and not one row of the launch
+  # progress region -- at EVERY size, not only at the small ones where it used
+  # to fold. Three independent negatives, because the step rows could come back
+  # by their text, by their glyph, or by a leftover row of the region:
+  #
+  #   * no step's detail text ("STEPMODS", from the mods step) is in the grid;
+  #   * no row outside the panes carries a tick or an arrow marker;
+  #   * the summary line is present, and it is row 1.
+  #
+  # `buildSteps` is still constructed above and deliberately NOT passed: the
+  # falsifiability proof for this check is to hand those rows back to
+  # `logViewRows` and watch all three go red.
+  check(has(lay.rows, "SUMMARYLINE"),
+        label & ": the launch is one summary line")
+  check(rowIndexOf(lay.rows, "SUMMARYLINE") == 1,
+        label & ": ...and it is the row under the header, not buried in a " &
+        "progress region")
+  check(not has(lay.rows, "STEPMODS"),
+        label & ": NO progress step text on the split screen")
+  var strayMark = -1
+  for i in 0 ..< lay.rows.len:
+    let t = lay.rows[i].text
+    if t.len > 0 and (t[0] == '+' or t[0] == '|'): continue   # the panes
+    if i == 1: continue                                       # the summary
+    if find(t, "ok ") == 2 or find(t, ">> ") == 2 or find(t, "!! ") == 2:
+      strayMark = i
+  check(strayMark < 0,
+        label & ": no stray checkbox row above the panes (row " &
+        $strayMark & ")")
+  check(lay.bodyH >= MinBody,
+        label & ": the body is at least MinBody=" & $MinBody & " lines (got " &
+        $lay.bodyH & ")")
+  check(alignedAtTwo(lay.rows, label),
+        label & ": every row starts its text in column 2")
   check(has(lay.rows, "SRVLINE"), label & ": the server log is on screen")
   check(has(lay.rows, "CLILINE"), label & ": the client log is on screen")
-  echo "      stepsShown=" & $lay.stepsShown & " bodyH=" & $lay.bodyH &
-       " maxWidth=" & $lay.maxWidth
+  echo "      bodyH=" & $lay.bodyH & " maxWidth=" & $lay.maxWidth
 
 proc runSolo(w, h: int) =
   ## `f` -- one pane, full width. The arithmetic is different (no junction), so
   ## a frame that is correct split can still be one column out solo.
   var srv = fakeTail("SRVLINE", 40)
   var cli = fakeTail("CLILINE", 40)
-  let lay = logViewRows(w, h, buildHeader(w), buildSteps(w),
+  let lay = logViewRows(w, h, buildHeader(w),
                         stepRow(MarkDone, "launch", "SUMMARYLINE ready", w),
                         srv, cli, "SRVPANE 40", "CLIPANE 40",
                         0, 0, 0, true, buildHelp(w))
@@ -285,16 +366,63 @@ proc runLauncher(w, h, nProfiles: int; expectRenderable: bool; label: string) =
   check(top >= 0, label & ": the panel title is drawn")
   check(top >= 0 and lay.rows[top].text[0] == '+',
         label & ": the panel top border starts with a corner")
-  let bottom = lay.rows.len - 2
-  check(lay.rows[bottom].text[0] == '+' and
+  # FOUND BY SCANNING, not by assuming it is the second-to-last row. The box no
+  # longer reaches the bottom of the window -- it is sized to its contents and
+  # the slack is blank rows underneath -- and a test that indexed `len - 2`
+  # would have gone green on a border that had stopped closing entirely.
+  let bottom = lastIndexOf(lay.rows, "+-")
+  check(bottom > top, label & ": the panel closes below its title")
+  check(bottom > top and lay.rows[bottom].text[0] == '+' and
         lay.rows[bottom].text[lay.rows[bottom].text.len - 1] == '+',
         label & ": the panel bottom border is a full rule with both corners")
+  check(bottom > top and
+        colsOf(lay.rows[bottom].text) == colsOf(lay.rows[top].text),
+        label & ": the bottom border is exactly as wide as the top one")
   var bodyOk = true
-  if top >= 0:
+  if top >= 0 and bottom > top:
     for i in (top + 1) ..< bottom:
       let t = lay.rows[i].text
       if t.len == 0 or t[0] != '|' or t[t.len - 1] != '|': bodyOk = false
   check(bodyOk, label & ": every panel row is bounded by both verticals")
+
+  # THE HALF-DRAWN BOX. At 120x30 with six profiles the panel used to be
+  # twenty-one rows tall: six names and FIFTEEN empty rows inside the border.
+  # At 200x50 it was thirty-five. The box is now sized to its contents, so at
+  # most one blank row is left inside it (breathing space), and whatever the
+  # window has left over is blank space BELOW the box, where it reads as space
+  # rather than as a box nobody finished filling.
+  #
+  # Counted on the grid between the two borders, so it fails on the real defect
+  # and cannot be satisfied by a field the layout reports about itself.
+  var blanksInside = 0
+  if top >= 0 and bottom > top:
+    for i in (top + 1) ..< bottom:
+      let t = lay.rows[i].text
+      if firstInk(t) == 0 and t.len > 2:
+        var inkAfter = false
+        for j in 1 ..< (t.len - 1):
+          if t[j] != ' ': inkAfter = true
+        if not inkAfter: inc blanksInside
+  check(blanksInside <= 1,
+        label & ": at most one blank row inside the panel (got " &
+        $blanksInside & ")")
+  check(alignedAtTwo(lay.rows, label),
+        label & ": every row starts its text in column 2")
+
+  # No gap between the box and the keys. The slack the box gives back belongs
+  # at the BOTTOM of the window, not between two things that have to read as
+  # one block -- the first attempt at the shrinking box put it in the middle
+  # and marooned the status line fourteen rows below the panel.
+  check(bottom > top and bottom + 1 < lay.rows.len and
+        firstInk(lay.rows[bottom + 1].text) == 2,
+        label & ": the status line is the row immediately under the panel")
+  check(lay.usedRows > 0 and lay.usedRows == bottom + 2,
+        label & ": usedRows (" & $lay.usedRows & ") ends at the status line")
+  var trailingBlank = true
+  for i in lay.usedRows ..< lay.rows.len:
+    if firstInk(lay.rows[i].text) >= 0: trailingBlank = false
+  check(trailingBlank,
+        label & ": everything after usedRows is genuinely blank")
 
   # The progress region.
   if lay.collapsedSteps:
@@ -360,7 +488,7 @@ proc notFused(w, h: int) =
                          stepRow(MarkActive, "launch", "SUMMARYLINE starting", w),
                          "PANELTITLE profiles", buildProfiles(3, w),
                          buildEmpty(w), buildHelp(w))
-  let two = logViewRows(w, h, buildHeader(w), buildSteps(w),
+  let two = logViewRows(w, h, buildHeader(w),
                         stepRow(MarkDone, "launch", "SUMMARYLINE ready", w),
                         srv, cli, "SRVPANE 40", "CLIPANE 40",
                         0, 0, 0, false, buildHelp(w))
@@ -405,6 +533,51 @@ proc handoff(w: int) =
   check(colsOf(r.text) <= w, "handoff: fits in " & $w & " columns (got " &
         $colsOf(r.text) & ")")
 
+proc leakProof(w, h: int) =
+  ## FALSIFIABILITY, executed rather than asserted in a comment.
+  ##
+  ## The check that screen 2 carries no progress steps is only worth having if
+  ## it can go red. So this reintroduces the leak by hand -- it builds exactly
+  ## the frame the old `logViewRows` built, header then the five step rows then
+  ## the panes -- and runs the SAME three predicates over it. They must all say
+  ## "leak present". If they do not, the checks above are decoration.
+  echo ""
+  echo "--- leak proof: the OLD fused frame, checked by the NEW predicates" &
+       "  (w=" & $w & " h=" & $h & ") ---"
+  var srv = fakeTail("SRVLINE", 40)
+  var cli = fakeTail("CLILINE", 40)
+  let good = logViewRows(w, h, buildHeader(w),
+                         stepRow(MarkDone, "launch", "SUMMARYLINE ready", w),
+                         srv, cli, "SRVPANE 40", "CLIPANE 40",
+                         0, 0, 0, false, buildHelp(w))
+  if not good.renderable: return
+
+  # The leaky frame: the header, then the steps where the summary line is, then
+  # the rest of the real frame untouched.
+  var leaky: seq[Row] = @[]
+  leaky.add good.rows[0]
+  for r in buildSteps(w): leaky.add r
+  for i in 2 ..< good.rows.len: leaky.add good.rows[i]
+  for r in leaky: echo "|" & r.text & "|"
+
+  check(has(leaky, "STEPMODS"),
+        "leak proof: the step-text predicate SEES the reintroduced leak")
+  var stray = -1
+  for i in 0 ..< leaky.len:
+    let t = leaky[i].text
+    if t.len > 0 and (t[0] == '+' or t[0] == '|'): continue
+    if i == 1: continue
+    if find(t, "ok ") == 2 or find(t, ">> ") == 2 or find(t, "!! ") == 2:
+      stray = i
+  check(stray >= 0,
+        "leak proof: the stray-checkbox predicate SEES it too (row " &
+        $stray & ")")
+  check(rowIndexOf(leaky, "SUMMARYLINE") != 1,
+        "leak proof: and the summary line is no longer row 1")
+  check(not has(good.rows, "STEPMODS") and
+        rowIndexOf(good.rows, "SUMMARYLINE") == 1,
+        "leak proof: while the REAL frame passes all three")
+
 proc main(): int =
   # Pin the rendering so the grid is plain ASCII and a match means what it says.
   discard termStart()
@@ -435,8 +608,14 @@ proc main(): int =
   # than quietly showing the first few.
   runLauncher(80, 24, 40, true, "80x24 overflow")
 
+  # Screen 1 at a tall window with a SHORT list -- the size at which the panel
+  # used to be a border round thirty-five blank rows.
+  runLauncher(200, 50, 2, true, "200x50 short list")
+
   notFused(120, 30)
   notFused(80, 24)
+  leakProof(120, 30)
+  leakProof(80, 24)
   handoff(119)
   handoff(39)
 

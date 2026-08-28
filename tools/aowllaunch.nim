@@ -706,27 +706,57 @@ proc screenSummary(s: Screen; width: int): Row =
   result = stepRow(kind, progressName(s), what, width)
 
 proc screenHeader(s: Screen; w: int; elapsed: int64): Row =
+  # Column 2, like every other row on both screens: `stepRow`, `handoffRow` and
+  # the box interiors all start their text there. It was column 1 here, which
+  # left the header a column adrift from the ticks directly under it.
   result = newRow()
-  result.put " "
-  result.putIn ColWhite, "aowlspt"
   result.put "  "
-  result.putIn ColDim, bxV()
-  result.put " "
+  result.putIn ColWhite, "aowlspt"
+  # EVERY field from here is conditional on fitting.
+  #
+  # This header is four fixed-width columns and three separators: 2 + 7 + 2 + 1
+  # + 1 + 26 = 39 before the SECOND column has even started, so at a 40-column
+  # window it ran off the end. A row wider than the console does not get
+  # clipped -- it WRAPS, the frame is then one row taller than the window, and
+  # the whole thing scrolls up by a line every repaint. That is the "formatting
+  # issue" a narrow terminal actually sees, and the layout cannot catch it
+  # because the header arrives already built.
+  #
+  # Fields are dropped right to left, least important first: the clock, then
+  # the client state, then the server state, then the profile. `aowlspt` is
+  # always there, so the row is never empty.
   let label =
     case s.phase
     of phBoot: "starting the server"
     of phClient: "starting the client"
     of phRun: (if s.who.len > 0: s.who else: "no profile")
-  result.putIn (if s.phase == phRun and s.who.len > 0: ColCyan else: ColDim),
-               fit(label, 26)
-  result.put " "
-  result.putIn ColDim, bxV()
-  result.put " "
-  result.putIn s.srvCol, fit(s.srvText, 30)
-  result.put " "
-  result.putIn ColDim, bxV()
-  result.put " "
-  result.putIn s.cliCol, fit(s.cliText, 22)
+  var labelW = 26
+  var srvW = 30
+  var cliW = 22
+  # 2 + 7, then " | " + field, three times, then two spaces before the clock.
+  let need = 9 + (3 + labelW) + (3 + srvW) + (3 + cliW) + 2 + 6
+  if need > w:
+    # Squeeze the columns before dropping any of them: a narrow header that
+    # still says all four things beats a wide one that says two.
+    labelW = 14
+    srvW = 16
+    cliW = 14
+  if result.width + 3 + labelW <= w:
+    result.put "  "
+    result.putIn ColDim, bxV()
+    result.put " "
+    result.putIn (if s.phase == phRun and s.who.len > 0: ColCyan else: ColDim),
+                 fit(label, labelW)
+  if result.width + 3 + srvW <= w:
+    result.put " "
+    result.putIn ColDim, bxV()
+    result.put " "
+    result.putIn s.srvCol, fit(s.srvText, srvW)
+  if result.width + 3 + cliW <= w:
+    result.put " "
+    result.putIn ColDim, bxV()
+    result.put " "
+    result.putIn s.cliCol, fit(s.cliText, cliW)
   # Guarded rather than padded blindly: `padTo` cannot shorten, so a header that
   # has already run past `w - 10` would otherwise have the clock appended past
   # the right-hand edge and shear the frame.
@@ -862,8 +892,17 @@ proc paintPhase(panel: var Panel; logs: var Logs; s: Screen;
                          screenSteps(s, dw), screenSummary(s, dw),
                          title, prof, empty, newRow())
   if not lay.renderable: return false
-  if not fitsInWindow(lay.rows.len): return false
-  panel.paint lay.rows
+  # `usedRows`, not `rows.len`. The layout always returns a full window's worth
+  # so a full-screen caller has every row; this one repaints a BLOCK in the
+  # scrollback, and painting the trailing filler would push a screenful of
+  # blank lines into the transcript on every tick -- and, worse, would make the
+  # block taller than `fitsInWindow` needs it to be, which is what turns a
+  # repaint into a paint that walks up the screen.
+  var used: seq[Row] = @[]
+  for i in 0 ..< lay.usedRows:
+    used.add lay.rows[i]
+  if not fitsInWindow(used.len): return false
+  panel.paint used
   result = true
 
 proc waitForBackend(port: int; tls: bool; backendProc: uint64;
@@ -1594,7 +1633,7 @@ proc runLogView(who: string; backendProc: uint64; launch: LaunchPtr;
     s.cliText = (if clientAlive: "client up" else: "client exited")
 
     var help = newRow()
-    help.put " "
+    help.put "  "
     if gWd.givenUp:
       # The hard, user-facing error. The backend is gone for good and the game
       # cannot reach its server; say so loudly and say what to do, rather than
@@ -1623,7 +1662,7 @@ proc runLogView(who: string; backendProc: uint64; launch: LaunchPtr;
     var cli = ""
     paneTitles(logs, scrollServer, scrollClient, srv, cli)
     let lay = logViewRows(dw, h, screenHeader(s, dw, cNowMs() - began),
-                          screenSteps(s, dw), screenSummary(s, dw),
+                          screenSummary(s, dw),
                           logs.server, logs.client, srv, cli,
                           focus, scrollServer, scrollClient, solo, help)
     if not lay.renderable:
@@ -1802,7 +1841,7 @@ proc main(): int =
     logs.clientStarted = true
     runLogView("", 0'u64, nil, false, logs, MarkPending,
                "attached to a session this launcher did not start", detachedOnly)
-    termRestore()
+    termShutdown()
     return 0
 
   heading "Install"
@@ -2608,7 +2647,7 @@ proc main(): int =
 
   cLaunchClose(launch)
   cLaunchFree(launch)
-  termRestore()
+  termShutdown()
   result = 0
 
 quit(main())
