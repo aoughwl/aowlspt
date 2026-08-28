@@ -30,17 +30,28 @@
 # This feature relabels the heading + description to SINGLEPLAYER branding and
 # SetActive(false)s the checkbox's GameObject.
 #
-# WHY HIDING THE TOGGLE IS SAFE FOR ROUTING
-# -----------------------------------------
-# The user reports the checkbox is UNCHECKED and the raid is ALREADY offline
-# against our emulated backend. That proves the offline ROUTING does not depend
-# on this toggle -- our backend is the server regardless. SetActive(false) hides
-# the GameObject; it does NOT change the toggle's boolean value (it stays
-# whatever it was, i.e. unchecked), and this feature never calls set_isOn. So
-# neither the routing nor the practice/persistence semantics are altered -- only
-# the control's visibility. Persistence (loot/XP saving) is decided by the
-# backend, not by a client field we touch here; this feature makes no claim
-# about it and changes nothing that would affect it.
+# FORCE THE TOGGLE, THEN HIDE (corrected 2026-08-28)
+# --------------------------------------------------
+# The coordinator's correction: offline/singleplayer likely REQUIRES the box
+# CHECKED, so hiding it while unchecked could drop the raid out of offline. So
+# this now FORCES the value before hiding, in this order (order matters):
+#   1. `Toggle::set_isOn(SplForceIsOn)` on the UpdatableToggle -- the NOTIFYING
+#      setter, byte-verified @0x55BA430 (fact #71), re-asserted once. It runs the
+#      game's onValueChanged listener (the thing that actually selects the mode);
+#      a raw m_IsOn store would move the field WITHOUT running it.
+#   2. read m_IsOn(+0x120) BACK and assert it equals the wanted value -- a
+#      readback that can FAIL (CLAUDE.md 9b). Only on PASS do we hide.
+#   3. `SetActive(false)` to hide the (now correctly-valued) checkbox.
+# If set_isOn does not verify, or the readback does not match, this REFUSES to
+# hide and leaves the box VISIBLE rather than hidden-with-an-unknown-value.
+#
+# WHICH WAY IT GATES IS UNCONFIRMED -- INCONCLUSIVE, flagged for live check.
+# The original report ("unchecked AND offline") and the correction ("offline
+# needs checked") conflict, and it cannot be settled offline on this machine
+# (no decrypted metadata / no GameAssembly.dll here to disassemble the
+# UpdatableToggle handler). So `SplForceIsOn = true` follows the user's stated
+# expectation; if a live raid comes up ONLINE after this, flip that ONE const.
+# This feature never claims anything about loot/XP persistence.
 #
 # DISCOVERY IS LIVE AND BY CONTENT, NEVER A HARDCODED PATH (fact #104)
 # -------------------------------------------------------------------
@@ -78,6 +89,20 @@ const
   # ---- what we replace them with. Factual; no persistence claim. ----
   SplHeadNew      = "SINGLEPLAYER"
   SplDescNew      = "aowlspt - a local single-player raid against the emulated server."
+  # ---- the practice toggle, forced ON before it is hidden ----
+  # `aowl_sw_targets[AOWL_SW_TOGGLE_SET_ISON]` = UnityEngine.UI.Toggle::set_isOn
+  # @0x55BA430, byte-verified (16-byte prologue vs the startup snapshot) inside
+  # `cSwFn2`; a mismatch returns nil and this feature REFUSES to touch the box.
+  SplToggleSetIsOn = 1'i32
+  # WHICH WAY DOES THE BOX GATE OFFLINE? UNCONFIRMED. The user's original report
+  # was "unchecked AND offline"; the correction is "offline likely REQUIRES
+  # checked". I cannot settle it offline on this machine (no decrypted metadata,
+  # no GameAssembly.dll here, so the UpdatableToggle::onValueChanged handler
+  # cannot be disassembled), so this is INCONCLUSIVE and must be confirmed live.
+  # We force the box to the user's stated expectation (ON = checked). If a live
+  # deploy shows forcing ON drops us ONLINE, flip this ONE const to `false`
+  # (force OFF) -- do NOT re-derive the plumbing.
+  SplForceIsOn    = true
 
 # ---- bounds ----
 const
@@ -115,6 +140,9 @@ var gSplHeadLoc: Il2CppPtr = nil   ## its LocalizedText sibling (optional; nil o
 var gSplDescTmp: Il2CppPtr = nil   ## the description TMP (optional)
 var gSplDescLoc: Il2CppPtr = nil
 var gSplCheckGo: Il2CppPtr = nil   ## the SoloModeCheckmarkBlocker GameObject
+var gSplToggle: Il2CppPtr = nil    ## the EFT.UI.UpdatableToggle component (a Toggle)
+var gSplForceRefused = false       ## set_isOn did not verify; box left VISIBLE
+var gSplForceRefusedLogged = false
 var gSplConfirmed = false          ## finished-state assertion has passed+logged
 var gSplSummaryLogged = false
 
@@ -129,6 +157,18 @@ proc splLocTypeStr(): Il2CppPtr =
   var nm = "LocalizedText"
   gSplLocStr = cNavNewString(toCString(nm))
   result = gSplLocStr
+
+var gSplTogStr: Il2CppPtr = nil
+proc splTogTypeStr(): Il2CppPtr =
+  ## Interned "UpdatableToggle" for GetComponent (fact #71: the control is
+  ## EFT.UI.UpdatableToggle). It derives from UnityEngine.UI.Toggle, so the
+  ## returned component is a valid `this` for Toggle::set_isOn and carries
+  ## m_IsOn at +0x120.
+  if gSplTogStr != nil and duOk(gSplTogStr, 0x18'i32):
+    return gSplTogStr
+  var nm = "UpdatableToggle"
+  gSplTogStr = cNavNewString(toCString(nm))
+  result = gSplTogStr
 
 proc splComponent(node, typeStr: Il2CppPtr): Il2CppPtr =
   ## `Component::GetComponent(String)` on a Transform node. Returns nil on any
@@ -187,6 +227,42 @@ proc splSetText(tmp, loc: Il2CppPtr; s: string): bool =
       cNuCallVPP(fnLoc, loc, str)
       cNuCallVPP(fnSet, tmp, str)          # re-apply after LocalizedText clobber
   result = true
+
+proc splForceToggle(): int =
+  ## Force the practice toggle to `SplForceIsOn` via the NOTIFYING setter
+  ## `Toggle::set_isOn`, so the game's own onValueChanged listener runs (that
+  ## listener is what actually selects the mode -- a raw m_IsOn store would move
+  ## the field and NOT run it). Re-asserts once, like a LocalizedText re-apply,
+  ## in case something flips it on the same frame. Then reads m_IsOn BACK and
+  ## returns the FINISHED STATE, never the fact that the setter ran:
+  ##   1 -> readback matches the wanted value (PASS)
+  ##   0 -> readback does NOT match (FAIL -- caller must REFUSE to hide)
+  ##  -1 -> could not act at all (set_isOn did not verify, or the component is
+  ##        unreadable) -- INCONCLUSIVE, caller must REFUSE to hide.
+  result = -1
+  let fn = cSwFn2(SplToggleSetIsOn)
+  if fn == nil:
+    if not gSplForceRefusedLogged:
+      gSplForceRefusedLogged = true
+      warn "singleplayer rebrand: Toggle::set_isOn @0x55BA430 did NOT verify " &
+           "against the startup prologue snapshot on this build, so the " &
+           "practice toggle CANNOT be forced. REFUSING to hide the checkbox -- " &
+           "it is left VISIBLE (and at whatever value the game set) rather than " &
+           "hidden with an unknown value. This is a REFUSAL, not a success."
+    gSplForceRefused = true
+    return
+  let off = cSwOffToggleIsOn()
+  if not duOk(gSplToggle, off + 8'i32):
+    return
+  let want = (if SplForceIsOn: 1'i32 else: 0'i32)
+  cSwCallVPB2(fn, gSplToggle, want)        # force
+  cSwCallVPB2(fn, gSplToggle, want)        # re-assert once
+  # READBACK on the finished state. `cSwReadU8` is the guarded byte read.
+  let got = cSwReadU8(gSplToggle, off)
+  if got == want:
+    result = 1
+  else:
+    result = 0
 
 # ---------------------------------------------------------------------------
 # Discovery: bounded, time-sliced.
@@ -254,7 +330,8 @@ proc splScanNode(t: Il2CppPtr; depth: int; budget: var int; deadline: uint64) =
         gSplDescTmp = tmp
         gSplDescLoc = splComponent(t, splLocTypeStr())
       elif gSplCheckGo == nil and iContains(low, SplToggleStock):
-        # Climb to the SoloModeCheckmarkBlocker and take its GameObject.
+        # Climb to the SoloModeCheckmarkBlocker and take BOTH its GameObject
+        # (to hide) and its UpdatableToggle component (to force ON, fact #71).
         var up = t
         var k = 0
         while k < SplBlockerUp and up != nil:
@@ -262,6 +339,9 @@ proc splScanNode(t: Il2CppPtr; depth: int; budget: var int; deadline: uint64) =
             let go = iGameObjectOf(up)
             if go != nil and duOk(go, 0x20'i32):
               gSplCheckGo = go
+            let tog = splComponent(up, splTogTypeStr())
+            if tog != nil and duOk(tog, cSwOffToggleIsOn() + 8'i32):
+              gSplToggle = tog
             break
           up = splParent(up)
           k = k + 1
@@ -306,31 +386,63 @@ proc splMaintain() =
       discard splSetText(gSplDescTmp, gSplDescLoc, SplDescNew)
       descState = 0
 
-  # Checkbox -- SetActive(false) on drift; assert activeInHierarchy == false.
-  var hideState = 2
-  if gSplCheckGo != nil and duOk(gSplCheckGo, 0x20'i32) and iUnityAlive(gSplCheckGo):
+  # Practice toggle -- FORCE to the wanted value, THEN hide. Order matters: the
+  # notifying `set_isOn` must run while the GameObject is ACTIVE so the game's
+  # onValueChanged listener (which selects the mode) fires. The box is hidden
+  # ONLY once its m_IsOn has read back as the wanted value -- a hidden box with
+  # an unknown value is exactly the failure this guards against.
+  var forceState = 2   # 2 INCONCLUSIVE/REFUSED, 1 PASS (readback == wanted), 0 FAIL
+  var hideState  = 2   # 2 INCONCLUSIVE/REFUSED, 1 PASS (activeInHierarchy==false), 0 acting
+  let wantOn = (if SplForceIsOn: 1'i32 else: 0'i32)
+  if gSplToggle != nil and duOk(gSplToggle, cSwOffToggleIsOn() + 8'i32) and
+     gSplCheckGo != nil and duOk(gSplCheckGo, 0x20'i32) and iUnityAlive(gSplCheckGo):
     if nuActiveInHierarchy(gSplCheckGo):
-      discard nuSetActive(gSplCheckGo, false)
-      hideState = 0
-    else:
+      let fr = splForceToggle()             # forces + re-asserts + reads back
+      if fr == 1:
+        discard nuSetActive(gSplCheckGo, false)   # PASS -> now hide
+      # fr == 0 (readback mismatch) or -1 (set_isOn unverified): do NOT hide.
+    # Assert the FINISHED STATE, whoever acted and whenever.
+    if not gSplForceRefused:
+      forceState = (if cSwReadU8(gSplToggle, cSwOffToggleIsOn()) == wantOn: 1 else: 0)
+    if gSplForceRefused or forceState == 0:
+      hideState = 2                          # box left VISIBLE on any doubt
+    elif not nuActiveInHierarchy(gSplCheckGo):
       hideState = 1
+    else:
+      hideState = 0
 
-  # Finished-state summary, once, when the heading has taken.
+  # Finished-state summary, once, when the heading has taken. The two lines the
+  # coordinator asked for are logged explicitly, plus a combined per-target line.
   if headOk and not gSplSummaryLogged:
-    let descStr = (case descState
-      of 1: "PASS (reads the new description)"
-      of 0: "FAIL (still not the new description -- re-applying)"
-      else: "INCONCLUSIVE (no description TMP was found on this screen)")
+    let onWord = (if SplForceIsOn: "true" else: "false")
+    let forceStr = (case forceState
+      of 1: "PASS"
+      of 0: "FAIL"
+      else: "INCONCLUSIVE")
+    okLog "singleplayer: forced isOn=" & onWord & " (readback " & forceStr &
+          "). NOTE: whether checked==offline is UNCONFIRMED on this build; if a " &
+          "live raid comes up ONLINE after this, the fix is to force the " &
+          "opposite value (flip SplForceIsOn), not to re-derive the plumbing."
     let hideStr = (case hideState
-      of 1: "PASS (checkbox GameObject activeInHierarchy == false)"
-      of 0: "FAIL (checkbox still active -- re-applying SetActive(false))"
-      else: "INCONCLUSIVE (the practice-mode checkbox was not found)")
+      of 1: "PASS"
+      of 0: "acting (SetActive(false) issued; confirm next tick)"
+      else: (if gSplForceRefused:
+               "REFUSED (set_isOn did not verify -- box left VISIBLE)"
+             elif forceState == 0:
+               "REFUSED (isOn readback did not match -- box left VISIBLE)"
+             else: "INCONCLUSIVE (no practice checkbox found)"))
+    okLog "singleplayer: hide: " & hideStr
+    let descStr = (case descState
+      of 1: "PASS"
+      of 0: "FAIL (re-applying)"
+      else: "INCONCLUSIVE (no description TMP found)")
     okLog "singleplayer rebrand: FINISHED-STATE readback -- heading: PASS " &
           "(the rendered TMP no longer reads \"PRACTICE GAME MODE\"); " &
-          "description: " & descStr & "; hide: " & hideStr & ". This asserts " &
-          "the live tree, not that the setter ran."
+          "description: " & descStr & "; forced isOn: " & forceStr &
+          "; hide: " & hideStr & ". This asserts the live tree, not that a " &
+          "setter ran."
     gSplSummaryLogged = true
-    if descState != 0 and hideState != 0:
+    if descState != 0 and forceState == 1 and hideState == 1:
       gSplConfirmed = true
 
 # ---------------------------------------------------------------------------
@@ -350,6 +462,8 @@ proc splRebrandTickBody(a: Il2CppPtr): Il2CppPtr {.
     gSplHeadTmp = nil; gSplHeadLoc = nil
     gSplDescTmp = nil; gSplDescLoc = nil
     gSplCheckGo = nil
+    gSplToggle = nil
+    gSplForceRefused = false
     gSplConfirmed = false
     gSplSummaryLogged = false
 
@@ -367,6 +481,8 @@ proc splRebrandTickBody(a: Il2CppPtr): Il2CppPtr {.
           ", description TMP " & (if gSplDescTmp != nil: "found" else: "not found") &
           ", checkbox GameObject " &
           (if gSplCheckGo != nil: "found" else: "NOT found") &
+          ", UpdatableToggle component " &
+          (if gSplToggle != nil: "found" else: "NOT found") &
           ". Walking from the live scene root, by displayed text -- no " &
           "hardcoded child path."
 
