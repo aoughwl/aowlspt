@@ -8,11 +8,23 @@
 #
 # WHAT IT IS PROVING
 # ------------------
-# Reflection is dead on this build (the P2-P5 verdict: `il2cpp_object_get_class`,
-# `il2cpp_class_get_name`, `il2cpp_value_box`, field iteration and
-# `il2cpp_runtime_invoke` all fault, even on the Unity main thread). Raw field
-# reads and writes work, which is enough to CHANGE the UI and not enough to
-# CREATE it.
+# CORRECTION (measured 2026-08-26, docs/IL2CPP_EXPORTS.md): reflection is NOT
+# dead on this build, it is TOKEN-GATED, and the older wording here was wrong
+# about the mechanism. This is stock IL2CPP with a gated export ABI: 38 of the
+# 241 `il2cpp_*` exports take an extra trailing argument we never passed -- a
+# pointer to 32 bytes -- and memcmp it before doing any work. On mismatch they
+# neither return NULL nor abort; they tail-call a trap that lazily seeds a
+# per-thread MT19937-64 and returns a uniform random non-zero uint64. THAT is
+# why a nil check passes and the first dereference kills the client. It was
+# never poisoned metadata; it was a random number.
+#
+# The P2-P5 symptoms were real, so the CONCLUSION below stands unchanged -- but
+# state the cause correctly: `il2cpp_object_get_class` does not fault at all
+# (it is `mov rax,[rcx]; ret`, which is worse: a bad pointer yields a plausible
+# number silently), and `il2cpp_value_box` is intact and ungated.
+#
+# Raw field reads and writes work, which is enough to CHANGE the UI and not
+# enough to CREATE it.
 #
 # The way out is that IL2CPP compiles every managed method to an ordinary native
 # function. So we call those functions DIRECTLY at their RVA, with IL2CPP's
@@ -551,6 +563,17 @@ proc mi2LadderFired(regs: Il2CppPtr) =
            "remaining steps still run."
   okLog "invoke2: ladder complete. Every step above is logged BEGIN/END, so the " &
         "last BEGIN without an END names exactly where a fault landed."
+
+  # THE NATIVE-UI LAYER RIDES THIS DETOUR AS A DRAIN.
+  #
+  # It is not a second hook: two detours on one function have the second
+  # overwrite the first's trampoline and silently kill the first feature. This
+  # is the same tab pointer, the same Unity-thread frame, after the ladder has
+  # finished -- and `nuProofRun` carries its own single `aowl_p_p_seh`, which is
+  # correct here because the ladder's per-step guards have all returned by now.
+  # Nothing above this line is changed by it.
+  if nuProofWanted():
+    nuProofRun(tab)
 
 proc bindManagedInvoke(verbose: bool): bool =
   ## Installs the kind=9 POSTFIX detour on `SettingsScreen::EnsureTabInitialized`

@@ -120,6 +120,27 @@ TABLES = [
         ],
         "accessors": ["mi2Fn", "cMi2Fn", "cMi2Name", "cMi2Rva"],
     },
+    # The native UI construction layer. Registered with its FIRST commit rather
+    # than after a coverage sweep caught it, because this table is 25 rows of
+    # near-identical `_Injected` setters and getters: an inserted row would
+    # shift `set_sizeDelta` onto `set_pivot`, every call would still succeed,
+    # and the element would simply be laid out wrongly. That is precisely the
+    # failure this whole layer exists to stop being invisible.
+    {
+        "mode": "positional",
+        "header": "abi/aowlspt_nativeui.h",
+        "array": "aowl_nu_targets",
+        # `NuT`, not `Nu`: the same module also defines `NuKind*` (component
+        # kinds) and `NuSlot*` (verdicts), which are NOT indices into this
+        # table. A prefix of `Nu` made this tool report four confident
+        # duplicate-index collisions between constants that have nothing to do
+        # with each other -- a wrong answer delivered plausibly.
+        "const_prefix": "NuT",
+        "const_file": "host/Aowlspt.Host.Il2Cpp/nativeui.nim",
+        "expect_file": None,
+        "users": ["host/Aowlspt.Host.Il2Cpp/nativeui.nim"],
+        "accessors": ["nuFn", "cNuFn", "cNuName", "cNuRva"],
+    },
     # ------------------------------------------------------------------
     # The ten tables the first version of this tool reported INCONCLUSIVE by
     # name (fact #190). Surveyed 2026-08-27: NONE of them is addressed by a
