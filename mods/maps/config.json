@@ -11,5 +11,12 @@
   "showPlayers": true,
   "screenW": 1920,
   "screenH": 1080,
-  "hudBudgetUs": 400
+  "hudBudgetUs": 400,
+  "hudMap": false,
+  "mapX": 320,
+  "mapY": 120,
+  "mapSize": 720,
+  "mapSpanM": 500,
+  "mapGrid": 8,
+  "indicatorInset": 48
 }
