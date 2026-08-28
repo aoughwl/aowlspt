@@ -87,6 +87,23 @@ AOWL_RG_EXPORT int32_t aowl_region_box_x(float a, float b, float c, float d, flo
 AOWL_RG_EXPORT int32_t aowl_region_fill_x(float a, float b, float c, float d, uint32_t k) { return aowl_region_fill(a,b,c,d,k); }
 AOWL_RG_EXPORT int32_t aowl_region_text_x(float a, float b, const char* s, uint32_t k) { return aowl_region_text(a,b,s,k); }
 AOWL_RG_EXPORT int32_t aowl_region_project_x(float a, float b, float c, float* x, float* y) { return aowl_region_project(a,b,c,x,y); }
+/* The three-outcome projection. `aowl_region_project_x` above is kept, and is
+ * now the STRICTER of the two: it returns 0 for a behind-camera point, which
+ * every existing caller already reads as "do not draw". A caller that wants
+ * the mirrored bearing must ask for it here, explicitly. */
+AOWL_RG_EXPORT int32_t aowl_region_project_ex_x(float a, float b, float c, float* x, float* y, int32_t* f, float* d) { return aowl_region_project_ex(a,b,c,x,y,f,d); }
+/* The texture table. `_define_x` copies into the host's static arena and is
+ * idempotent for a resident key, so a submitter may call it every frame. */
+AOWL_RG_EXPORT int32_t aowl_region_texture_define_x(uint64_t k, int32_t f, int32_t w, int32_t h, const void* p, uint32_t n) { return aowl_region_texture_define(k,f,w,h,p,n); }
+AOWL_RG_EXPORT int32_t aowl_region_texture_have_x(uint64_t k) { return aowl_region_texture_have(k); }
+AOWL_RG_EXPORT int32_t aowl_region_texture_forget_x(uint64_t k) { return aowl_region_texture_forget(k); }
+AOWL_RG_EXPORT int32_t aowl_region_texture_count_x(void) { return aowl_region_texture_count(); }
+AOWL_RG_EXPORT int64_t aowl_region_texture_evictions_x(void) { return aowl_region_texture_evictions(); }
+/* The renderer needs the SAME frame clock the CPU table ages on, or the two
+ * caches evict against each other. */
+AOWL_RG_EXPORT int64_t aowl_region_frames_x(void) { return aowl_region_frames(); }
+AOWL_RG_EXPORT const AowlRegionTexSlot* aowl_region_texture_slot_x(int32_t i) { return aowl_region_texture_slot(i); }
+AOWL_RG_EXPORT int32_t aowl_region_quad_x(float x, float y, float w, float h, float u0, float v0, float u1, float v1, uint64_t k, uint32_t t) { return aowl_region_quad(x,y,w,h,u0,v0,u1,v1,k,t); }
 AOWL_RG_EXPORT int32_t aowl_region_commands_x(const AowlRegionCmd** o) { return aowl_region_commands(o); }
 AOWL_RG_EXPORT int32_t aowl_region_is_armed_x(void) { return aowl_region_is_armed(); }
 AOWL_RG_EXPORT int32_t aowl_region_count_x(void) { return aowl_region_count(); }
