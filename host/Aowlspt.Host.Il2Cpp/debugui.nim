@@ -236,6 +236,24 @@ proc cWgCrumbGet(): int32 {.importc: "aowl_wg_crumb_get", nodecl.}
 proc cWgCrumbGetW(): int32 {.importc: "aowl_wg_crumb_get_w", nodecl.}
 proc cWgCrumbTextC(s: int32): cstring {.importc: "aowl_wg_crumb_text", nodecl.}
 
+## PER-STAGE COST, hung off the same breadcrumb seams (`abi/aowlspt_widget.h`).
+## Every getter answers -1 for "no complete frame measured yet", which is a
+## THIRD state and not a zero: a stage that genuinely cost 0 us and a stage
+## nobody has looked at yet must not print the same thing.
+proc cWgStageBegin() {.importc: "aowl_wg_stage_begin", nodecl.}
+proc cWgStageEnd() {.importc: "aowl_wg_stage_end", nodecl.}
+proc cWgStageFrames(): int64 {.importc: "aowl_wg_stage_frames", nodecl.}
+proc cWgStageCount(): int32 {.importc: "aowl_wg_stage_count", nodecl.}
+proc cWgStageUs(i: int32): int64 {.importc: "aowl_wg_stage_us", nodecl.}
+proc cWgStagePeakUs(i: int32): int64 {.
+  importc: "aowl_wg_stage_peak_us", nodecl.}
+proc cWgStageWorstUs(i: int32): int64 {.
+  importc: "aowl_wg_stage_worst_us", nodecl.}
+proc cWgStageFrameUs(): int64 {.importc: "aowl_wg_stage_frame_us", nodecl.}
+proc cWgStageWorstTotalUs(): int64 {.
+  importc: "aowl_wg_stage_worst_total_us", nodecl.}
+proc cWgStageBackwards(): int64 {.importc: "aowl_wg_stage_backwards", nodecl.}
+
 const
   WgCrumbEnter     = 1'i32
   WgCrumbToggle    = 2'i32
@@ -980,6 +998,57 @@ proc duProfLine(n: int): string =
            "  peak " & duMsText(cProfSlotMaxNs(i)) & " ms" &
            (if noise > 0 and ns < noise: "  [at the noise floor]" else: "")
 
+## THE OVERLAY MEASURING ITSELF.
+##
+## The region's own accounting says `debugui: 24552 us against 900 us` and stops
+## there. That names the participant, which was never the question. This breaks
+## the same interval down across the 16 breadcrumb stages, so the answer is a
+## stage NAME and a number rather than an invitation to guess.
+##
+## Sorted by the WORST FRAME's breakdown, not by the last frame's: the last
+## frame is whatever happened to be cheap, and the complaint is about the peak.
+## `--` means no complete frame has been measured; it never prints 0.
+proc duStagesLine(maxRows: int): string =
+  if cWgStageFrames() <= 0:
+    return "stages  no complete refresh measured yet (three states, not two:\n" &
+           "  this is 'not looked at', not 'costs nothing')"
+  var res = "stages us  last " & $cWgStageFrameUs() & "  worst frame " &
+            $cWgStageWorstTotalUs() & "  over " & $cWgStageFrames() &
+            " refresh(es)"
+  if cWgStageBackwards() > 0:
+    res.add "  [QPC went backwards " & $cWgStageBackwards() & "x]"
+  # Selection sort over at most 17 fixed slots, capped twice: by `maxRows` and
+  # by the stage count itself, so a bad count cannot make this loop.
+  var n = int(cWgStageCount())
+  if n > 17: n = 17
+  # Explicitly cleared, not merely declared: nimony will not assume an array is
+  # zeroed, and a stale `true` here would silently drop a stage from the table.
+  var taken: array[17, bool] = default(array[17, bool])
+  for i in 0 ..< 17:
+    taken[i] = false
+  var rows = 0
+  var lim = maxRows
+  if lim > n: lim = n
+  while rows < lim:
+    var best = -1
+    var bestV: int64 = 0
+    for i in 0 ..< n:
+      if taken[i]: continue
+      let v = cWgStageWorstUs(int32(i))
+      if v > bestV or best < 0:
+        best = i
+        bestV = v
+    if best < 0 or bestV <= 0:
+      break
+    taken[best] = true
+    res.add "\n  " & $cWgCrumbTextC(int32(best)) & "  worst " & $bestV &
+            "  last " & $cWgStageUs(int32(best)) & "  peak " &
+            $cWgStagePeakUs(int32(best))
+    inc rows
+  if rows == 0:
+    res.add "\n  every stage measured 0 us in the worst frame recorded"
+  res
+
 proc duPanelLine(field: string): string =
   ## One panel line's text for one field name. An unrecognised name prints
   ## itself with a marker rather than being silently dropped, so a typo in the
@@ -1465,6 +1534,8 @@ proc duWidgetText(w: DuWidget; lineCount: var int; widest: var int): string =
     # `duPanelLine` the single-column panel used, so no field regressed.
     if f == "region":
       text = duRegionLines(cDuMaxWidgetLines - lineCount - 1)
+    elif f == "stages":
+      text = duStagesLine(cDuMaxWidgetLines - lineCount - 1)
     elif f == "mem":
       text = duMemLine()
     else:
@@ -1539,6 +1610,104 @@ proc duEmitLine(x, y: float32; s: string; col: uint32; scale: int32) =
     gDuLineBuf[n] = chr(0)
   discard cWgDrText(x, y, cast[cstring](addr gDuLineBuf[0]), col, scale)
 
+# ---------------------------------------------------------------------------
+# THE COMPOSITION CACHE
+#
+# THE DEFECT THIS FIXES, stated as measured behaviour: `debugui` was reported by
+# the region's own accounting at 22,000-40,000 us against a 900 us budget, every
+# frame, sustained, with the peak CLIMBING. `panelThrottle` was supposed to be
+# the answer to exactly that -- but it gated ONLY `duScanWorld`. Everything
+# downstream of it ran at full frame rate, and everything downstream of it is
+# the expensive half:
+#
+#   * `duWidgetText` splits `fields` into a fresh `seq[string]` and builds a
+#     fresh `string` per widget PER FRAME -- a per-frame managed allocation,
+#     which CLAUDE.md 5 forbids outright.
+#   * the `mem` field calls `K32GetProcessMemoryInfo` and `GlobalMemoryStatusEx`
+#     through `cWgMemSample()` -- two Win32 calls, per frame.
+#   * the `region` field loops up to 64 participant slots and builds a table.
+#   * the `map` field reads a managed string out of GameWorld.
+#   * the `botlist` field walks the bot snapshot -- which GROWS as a raid fills
+#     with bots, which is the shape of a peak that climbs.
+#
+# None of that is per-frame INFORMATION: the numbers behind it only change when
+# `duScanWorld` runs, which is every `panelThrottle`th frame. Composing it every
+# frame was work whose output was, by construction, usually identical.
+#
+# So the composed text is cached per widget and recomposed on a cadence, while
+# SUBMISSION stays every frame -- the command buffer is rebuilt from empty each
+# frame, so throttling submission would flicker the panel off. Recomposition is
+# STAGGERED by widget index (`(gDuFires + i) mod cadence`) so the cost is spread
+# rather than landing as one spike every Nth frame.
+#
+# Edit mode recomposes every frame on purpose: the extent is the drag hit-box,
+# and a hit-box computed from stale text is a drag that misses.
+var gDuWText: seq[string] = @[]
+var gDuWLines: seq[int] = @[]
+var gDuWWidest: seq[int] = @[]
+var gDuWStamp: seq[int] = @[]      ## `gDuFires` at composition; -1 = never
+
+## THE SELF-THROTTLE. A participant that overruns its budget hundreds of times
+## in a row must DEGRADE, not keep costing 40 ms: the F3 window has to be usable
+## while playing, and an instrument that is itself the largest cost in the frame
+## is measuring mostly itself. This raises only the RECOMPOSITION cadence -- the
+## panel keeps drawing every frame, its numbers just refresh less often -- and
+## it recovers on its own once the cost fits again.
+const cDuBudgetUs   = 900'i64    ## declared at registration; kept in step here
+const cDuOverStreak = 30         ## consecutive over-budget refreshes to act on
+const cDuCadenceCap = 120        ## never slower than this, whatever happens
+var gDuCadence = 0               ## 0 = follow the config alone
+var gDuOverStreak = 0
+var gDuUnderStreak = 0
+var gDuThrottleSaid = 0
+
+proc duCadence(): int =
+  ## The effective recomposition cadence: the configured throttle, or the
+  ## self-imposed one if the overlay has had to slow itself down.
+  result = gDuCfg.panelThrottle
+  if result < 1: result = 1
+  if gDuCadence > result: result = gDuCadence
+
+proc duThrottleTick() =
+  ## Read back what the STAGE ACCOUNTING measured for the refresh that just
+  ## finished and react to it. This asserts a property of the finished frame --
+  ## its measured cost -- not a property of anything this code just did, so it
+  ## can fail: if the cost fits, the streak resets and the cadence winds back.
+  let us = cWgStageFrameUs()
+  if us < 0:
+    return                        # not measured yet: not an overrun, not a fit
+  if us > cDuBudgetUs:
+    inc gDuOverStreak
+    gDuUnderStreak = 0
+    if gDuOverStreak >= cDuOverStreak:
+      gDuOverStreak = 0
+      let was = duCadence()
+      var next = was * 2
+      if next > cDuCadenceCap: next = cDuCadenceCap
+      if next > was:
+        gDuCadence = next
+        if gDuThrottleSaid < 3:
+          inc gDuThrottleSaid
+          warn "debugui: the F3 refresh measured " & $us & " us against a " &
+               $cDuBudgetUs & " us budget for " & $cDuOverStreak &
+               " refreshes running, so it has SLOWED ITSELF DOWN -- widget " &
+               "text now recomposes every " & $next & " frames instead of " &
+               $was & ". The panel still draws every frame; only its numbers " &
+               "refresh less often. `stages` names where the time went."
+  else:
+    gDuOverStreak = 0
+    inc gDuUnderStreak
+    # Wind back only after a long, quiet run, so a single cheap frame cannot
+    # undo a throttle that a sustained overrun earned.
+    if gDuUnderStreak >= 600 and gDuCadence > 0:
+      gDuUnderStreak = 0
+      gDuCadence = gDuCadence div 2
+      if gDuCadence <= gDuCfg.panelThrottle:
+        gDuCadence = 0
+      okLog "debugui: the F3 refresh has fitted its " & $cDuBudgetUs &
+            " us budget for 600 refreshes, so the self-imposed throttle is " &
+            "being wound back (cadence now " & $duCadence() & " frames)"
+
 proc duDrawWidgets() =
   ## Lay out and SUBMIT every enabled widget. Called from inside the region's
   ## DRAW callback and nowhere else: `aowl_region_push` refuses outside one, so
@@ -1556,6 +1725,20 @@ proc duDrawWidgets() =
   let cellW = cDuCellW * float64(scale)
   let cellH = cDuCellH * float64(scale)
   let base = duCfgColour()
+  # Keep the cache the same shape as the widget list. A reload rebuilds
+  # `gDuWidgets` wholesale, so any length change means every cached entry is
+  # suspect and the whole cache is dropped rather than re-indexed.
+  if gDuWText.len != gDuWidgets.len:
+    gDuWText = @[]
+    gDuWLines = @[]
+    gDuWWidest = @[]
+    gDuWStamp = @[]
+    for _ in 0 ..< gDuWidgets.len:
+      gDuWText.add ""
+      gDuWLines.add 0
+      gDuWWidest.add 0
+      gDuWStamp.add -1
+  let cadence = duCadence()
   var drawn = 0
   for i in 0 ..< gDuWidgets.len:
     if drawn >= cDuMaxWidgets:
@@ -1568,10 +1751,21 @@ proc duDrawWidgets() =
       continue
     cWgCrumbW(int32(i))
     cWgCrumb(WgCrumbWText)
-    var lines = 0
-    var widest = 0
-    let text = duWidgetText(gDuWidgets[i], lines, widest)
-    if widest > cDuCmdText: widest = cDuCmdText
+    # RECOMPOSE, OR REUSE. Staggered by index so N widgets do not all rebuild
+    # on the same frame. Edit mode always recomposes: the extent doubles as the
+    # drag hit-box and a stale hit-box is a drag that misses.
+    if gDuWStamp[i] < 0 or gDuEdit or
+       ((gDuFires + i) mod cadence) == 0:
+      var nl = 0
+      var nw = 0
+      gDuWText[i] = duWidgetText(gDuWidgets[i], nl, nw)
+      if nw > cDuCmdText: nw = cDuCmdText
+      gDuWLines[i] = nl
+      gDuWWidest[i] = nw
+      gDuWStamp[i] = gDuFires
+    let text = gDuWText[i]
+    let lines = gDuWLines[i]
+    let widest = gDuWWidest[i]
     # THE EXTENT IS NOW EXACT, not estimated. The overlay's font is a fixed
     # 8x16 cell, so the box the user grabs is the box that is on screen -- the
     # old estimate against TMP's unknown metrics is gone with it.
@@ -1667,6 +1861,45 @@ proc duDrawWidgets() =
 # is the distance in front of the camera, so `z <= 0` is BEHIND the camera and
 # the marker must be dropped; drawing those is the classic ESP ghost bug.
 # ---------------------------------------------------------------------------
+## THE CAMERA, RESOLVED ON A CADENCE RATHER THAN EVERY FRAME.
+##
+## `Camera.get_main` is not a field read. On this Unity generation it resolves
+## the main camera by TAG, and the cost of that grows with the number of objects
+## in the scene -- which is precisely the shape of an overlay cost that climbs
+## through a raid as bots and loot spawn. Whether it is THE cost here is a
+## question for the `stages` read-out, which now charges it to "the ESP
+## markers"; caching it is defensible either way, because a per-frame IL2CPP
+## call with an unbounded internal cost has no business on a draw path.
+##
+## The pointer is re-resolved every `cDuCamRefresh` refreshes and dropped the
+## moment it stops reading back, so a camera torn down at the end of a raid is
+## never projected against. A failed resolve is remembered as a failed ATTEMPT,
+## not retried every frame.
+const cDuCamRefresh = 120
+var gDuCam: Il2CppPtr = nil
+var gDuCamAt = -1000000
+
+proc duCamera(fnCam: Il2CppPtr): Il2CppPtr =
+  if (gDuFires - gDuCamAt) >= cDuCamRefresh or
+     (gDuCam != nil and not duOk(gDuCam, 0x20'i32)):
+    gDuCam = cDuCallPV(fnCam)
+    gDuCamAt = gDuFires
+    if not duOk(gDuCam, 0x20'i32):
+      gDuCam = nil
+  gDuCam
+
+## The ESP field list, split ONCE per config load instead of once per frame.
+## `duSplit` returns a fresh `seq[string]`; doing it inside the marker loop's
+## caller was a per-frame managed allocation on the draw path.
+var gDuEspWant: seq[string] = @[]
+var gDuEspWantOf = "\x00"
+
+proc duEspFields(): seq[string] =
+  if gDuEspWantOf != gDuCfg.espFields:
+    gDuEspWant = duSplit(gDuCfg.espFields, ',')
+    gDuEspWantOf = gDuCfg.espFields
+  gDuEspWant
+
 proc duDrawMarkers(): bool =
   ## False means projection is UNAVAILABLE on this build -- a third answer, not
   ## "nothing to draw" -- so the caller can say so once.
@@ -1678,15 +1911,15 @@ proc duDrawMarkers(): bool =
   var ch = 0.0
   if not duCanvasSize(cw, ch):
     return true                 # no measured screen yet; not a build problem
-  let cam = cDuCallPV(fnCam)
-  if not duOk(cam, 0x20'i32):
+  let cam = duCamera(fnCam)
+  if cam == nil or not duOk(cam, 0x20'i32):
     return true                 # menu or loading screen: not an error
   var eyeOk = false
   var ex = 0.0
   var ey = 0.0
   var ez = 0.0
   duPlayerPos(gDuYou, eyeOk, ex, ey, ez)
-  let want = duSplit(gDuCfg.espFields, ',')
+  let want = duEspFields()
   let scale = duTextScale(ch)
   var used = 0
   for i in 0 ..< gDuBots.len:
@@ -1957,12 +2190,20 @@ proc duRegionDraw(user: pointer; frame: int64) {.exportc: "aowl_du_region_draw",
   cDuFpsSample()
   if not gDuVisible and not gDuEspVisible:
     return
+  # OPEN THE STAGE WINDOW. Everything between here and `cWgStageEnd` is charged,
+  # crumb by crumb, to the stage that was running -- so the region's "debugui
+  # overran its budget" grows a breakdown instead of staying a single number
+  # that names only the participant. Opened AFTER the early return above, so a
+  # hidden overlay never records a frame at all.
+  cWgStageBegin()
+  cWgCrumb(WgCrumbEnter)
   # Throttle. The panel is a debug read-out, not an instrument: recomposing it
   # every Nth frame is indistinguishable to a human and costs a fraction as
   # much. The SUBMISSION is not throttled -- the command buffer is rebuilt from
   # empty every frame, so skipping a submission would flicker the panel off.
-  # What is throttled is the expensive half: the world census.
-  if (gDuFires mod gDuCfg.panelThrottle) == 0:
+  # What is throttled is the expensive half: the world census AND, since this
+  # fix, the text composition that reads what the census found.
+  if (gDuFires mod duCadence()) == 0:
     # The cached GameWorld goes stale at the end of a raid; drop it rather than
     # keep reading a dead object.
     if gDuGameWorld != nil and
@@ -1992,6 +2233,9 @@ proc duRegionDraw(user: pointer; frame: int64) {.exportc: "aowl_du_region_draw",
              "panel's `botlist` field still shows every AI bot's world " &
              "coordinates and distance -- add it to panelFields."
   cWgCrumb(WgCrumbDone)
+  cWgStageEnd()
+  # React to what was just MEASURED, not to anything this code believes it did.
+  duThrottleTick()
 
 var gDuRegionHandle = -1
 

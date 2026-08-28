@@ -435,10 +435,188 @@ enum {
 static volatile int32_t aowl_wg_crumb_stage  = 0;
 static volatile int32_t aowl_wg_crumb_widget = -1;
 
-static void aowl_wg_crumb(int32_t stage) { aowl_wg_crumb_stage = stage; }
-static void aowl_wg_crumb_w(int32_t idx) { aowl_wg_crumb_widget = idx; }
+/* ==================================================================
+ * PER-STAGE COST ACCOUNTING -- the crumb seams, timed
+ * ==================================================================
+ *
+ * WHY THIS EXISTS. The shared region already times the WHOLE `debugui`
+ * participant against its budget, and in a live raid it reported 22,000 to
+ * 40,000 us against 900 us, sustained, with the peak CLIMBING. That number
+ * names the participant and nothing else: it cannot distinguish "the world
+ * census is walking more bots than it used to" from "composing a widget's
+ * text re-reads every field every frame". A total with no breakdown is the
+ * measurement equivalent of a check that cannot fail -- it can only ever say
+ * "debugui is slow", which was already known.
+ *
+ * WHY IT COSTS ALMOST NOTHING. It reuses the breadcrumb call sites, which
+ * already bracket exactly the 16 stages of a refresh, so there are NO new
+ * call sites to keep in step with the code. A crumb becomes one
+ * QueryPerformanceCounter (~20-25 ns on this machine) and an add: with
+ * ~7 frame-level crumbs plus 5 per widget, a frame of 8 widgets pays about
+ * 47 QPCs, on the order of 1-2 us against a 900 us budget.
+ *
+ * WHAT IS CHARGED TO WHAT. The interval between two crumbs is charged to the
+ * stage named by the EARLIER one -- that is the stage that was actually
+ * running. `aowl_wg_crumb_w` charges first and switches second, for the same
+ * reason: without that, widget A's composition time lands on widget B.
+ *
+ * THREE STATES, NOT TWO. Accumulation only happens between
+ * `aowl_wg_stage_begin` and `aowl_wg_stage_end`. Outside that window --
+ * including the separate PreloaderUI detour body, which also drops crumbs --
+ * `aowl_wg_st_open` is 0 and every charge is dropped rather than attributed
+ * to whatever stage happened to be current. `aowl_wg_stage_frames()` is 0
+ * until a frame has completed, so a reader can tell "nothing measured yet"
+ * from "measured, and it was cheap"; every getter returns -1 in that state.
+ *
+ * Ticks are accumulated raw and converted to microseconds only on READ, so
+ * the per-crumb path has no division in it.
+ *
+ * Unity thread only. No lock, and none is needed: one writer.
+ */
+#define AOWL_WG_STAGE_MAX   17   /* crumb ids 0..16                        */
+#define AOWL_WG_STAGEW_MAX  16   /* widget indices charged individually    */
+
+static int64_t aowl_wg_st_qpf  = 0;
+static int64_t aowl_wg_st_mark = 0;
+static int32_t aowl_wg_st_prev = -1;
+static int32_t aowl_wg_st_open = 0;
+static int64_t aowl_wg_st_cur  [AOWL_WG_STAGE_MAX];
+static int64_t aowl_wg_st_last [AOWL_WG_STAGE_MAX];
+static int64_t aowl_wg_st_peak [AOWL_WG_STAGE_MAX];
+static int64_t aowl_wg_st_worst[AOWL_WG_STAGE_MAX];   /* the worst FRAME's
+                                                       * breakdown, kept as
+                                                       * one coherent set */
+static int64_t aowl_wg_stw_cur [AOWL_WG_STAGEW_MAX];
+static int64_t aowl_wg_stw_last[AOWL_WG_STAGEW_MAX];
+static int64_t aowl_wg_stw_peak[AOWL_WG_STAGEW_MAX];
+static int64_t aowl_wg_st_frame_t   = 0;   /* last complete frame, ticks   */
+static int64_t aowl_wg_st_worst_t   = 0;
+static int64_t aowl_wg_st_frames    = 0;
+static int64_t aowl_wg_st_backwards = 0;   /* QPC went backwards N times   */
+
+static int64_t aowl_wg_st_us(int64_t ticks) {
+    if (aowl_wg_st_qpf <= 0) return -1;
+    return (int64_t)((ticks * 1000000ll) / aowl_wg_st_qpf);
+}
+
+static void aowl_wg_st_charge(void) {
+    LARGE_INTEGER c;
+    int64_t d;
+    if (!aowl_wg_st_open) return;
+    if (!QueryPerformanceCounter(&c)) return;
+    d = c.QuadPart - aowl_wg_st_mark;
+    aowl_wg_st_mark = c.QuadPart;
+    /* A negative delta is not a fast stage; it is a broken clock. Counting it
+     * would make the hot stage look cheap, so it is dropped AND counted. */
+    if (d < 0) { aowl_wg_st_backwards++; return; }
+    if (aowl_wg_st_prev >= 0 && aowl_wg_st_prev < AOWL_WG_STAGE_MAX)
+        aowl_wg_st_cur[aowl_wg_st_prev] += d;
+    if (aowl_wg_crumb_widget >= 0 && aowl_wg_crumb_widget < AOWL_WG_STAGEW_MAX)
+        aowl_wg_stw_cur[aowl_wg_crumb_widget] += d;
+}
+
+static void aowl_wg_crumb(int32_t stage) {
+    aowl_wg_st_charge();
+    aowl_wg_st_prev = stage;
+    aowl_wg_crumb_stage = stage;
+}
+static void aowl_wg_crumb_w(int32_t idx) {
+    aowl_wg_st_charge();
+    aowl_wg_crumb_widget = idx;
+}
 static int32_t aowl_wg_crumb_get(void)   { return aowl_wg_crumb_stage; }
 static int32_t aowl_wg_crumb_get_w(void) { return aowl_wg_crumb_widget; }
+
+static void aowl_wg_stage_begin(void) {
+    LARGE_INTEGER f, c;
+    int i;
+    if (aowl_wg_st_qpf <= 0) {
+        if (!QueryPerformanceFrequency(&f) || f.QuadPart <= 0) return;
+        aowl_wg_st_qpf = f.QuadPart;
+    }
+    for (i = 0; i < AOWL_WG_STAGE_MAX;  i++) aowl_wg_st_cur[i]  = 0;
+    for (i = 0; i < AOWL_WG_STAGEW_MAX; i++) aowl_wg_stw_cur[i] = 0;
+    if (!QueryPerformanceCounter(&c)) return;
+    aowl_wg_st_mark = c.QuadPart;
+    aowl_wg_st_prev = -1;
+    aowl_wg_st_open = 1;
+}
+
+static void aowl_wg_stage_end(void) {
+    int i;
+    int64_t tot = 0;
+    if (!aowl_wg_st_open) return;
+    aowl_wg_st_charge();
+    aowl_wg_st_open = 0;
+    for (i = 0; i < AOWL_WG_STAGE_MAX; i++) {
+        aowl_wg_st_last[i] = aowl_wg_st_cur[i];
+        if (aowl_wg_st_cur[i] > aowl_wg_st_peak[i])
+            aowl_wg_st_peak[i] = aowl_wg_st_cur[i];
+        tot += aowl_wg_st_cur[i];
+    }
+    for (i = 0; i < AOWL_WG_STAGEW_MAX; i++) {
+        aowl_wg_stw_last[i] = aowl_wg_stw_cur[i];
+        if (aowl_wg_stw_cur[i] > aowl_wg_stw_peak[i])
+            aowl_wg_stw_peak[i] = aowl_wg_stw_cur[i];
+    }
+    aowl_wg_st_frame_t = tot;
+    aowl_wg_st_frames++;
+    if (tot > aowl_wg_st_worst_t) {
+        aowl_wg_st_worst_t = tot;
+        for (i = 0; i < AOWL_WG_STAGE_MAX; i++)
+            aowl_wg_st_worst[i] = aowl_wg_st_cur[i];
+    }
+}
+
+/* Readers. -1 everywhere means NOT MEASURED YET -- never 0, because 0 us is a
+ * legitimate answer for a stage that did nothing and must not be confused
+ * with "I could not look". */
+static int64_t aowl_wg_stage_frames(void) { return aowl_wg_st_frames; }
+static int32_t aowl_wg_stage_count(void)  { return AOWL_WG_STAGE_MAX; }
+static int32_t aowl_wg_stage_wcount(void) { return AOWL_WG_STAGEW_MAX; }
+static int64_t aowl_wg_stage_backwards(void) { return aowl_wg_st_backwards; }
+
+static int64_t aowl_wg_stage_us(int32_t i) {
+    if (aowl_wg_st_frames <= 0 || i < 0 || i >= AOWL_WG_STAGE_MAX) return -1;
+    return aowl_wg_st_us(aowl_wg_st_last[i]);
+}
+static int64_t aowl_wg_stage_peak_us(int32_t i) {
+    if (aowl_wg_st_frames <= 0 || i < 0 || i >= AOWL_WG_STAGE_MAX) return -1;
+    return aowl_wg_st_us(aowl_wg_st_peak[i]);
+}
+static int64_t aowl_wg_stage_worst_us(int32_t i) {
+    if (aowl_wg_st_frames <= 0 || i < 0 || i >= AOWL_WG_STAGE_MAX) return -1;
+    return aowl_wg_st_us(aowl_wg_st_worst[i]);
+}
+static int64_t aowl_wg_stage_w_us(int32_t i) {
+    if (aowl_wg_st_frames <= 0 || i < 0 || i >= AOWL_WG_STAGEW_MAX) return -1;
+    return aowl_wg_st_us(aowl_wg_stw_last[i]);
+}
+static int64_t aowl_wg_stage_w_peak_us(int32_t i) {
+    if (aowl_wg_st_frames <= 0 || i < 0 || i >= AOWL_WG_STAGEW_MAX) return -1;
+    return aowl_wg_st_us(aowl_wg_stw_peak[i]);
+}
+static int64_t aowl_wg_stage_frame_us(void) {
+    if (aowl_wg_st_frames <= 0) return -1;
+    return aowl_wg_st_us(aowl_wg_st_frame_t);
+}
+static int64_t aowl_wg_stage_worst_total_us(void) {
+    if (aowl_wg_st_frames <= 0) return -1;
+    return aowl_wg_st_us(aowl_wg_st_worst_t);
+}
+/* For the offline harness and for a deliberate "start measuring from here". */
+static void aowl_wg_stage_reset(void) {
+    int i;
+    for (i = 0; i < AOWL_WG_STAGE_MAX; i++) {
+        aowl_wg_st_cur[i] = aowl_wg_st_last[i] = 0;
+        aowl_wg_st_peak[i] = aowl_wg_st_worst[i] = 0;
+    }
+    for (i = 0; i < AOWL_WG_STAGEW_MAX; i++)
+        aowl_wg_stw_cur[i] = aowl_wg_stw_last[i] = aowl_wg_stw_peak[i] = 0;
+    aowl_wg_st_frame_t = 0; aowl_wg_st_worst_t = 0;
+    aowl_wg_st_frames = 0; aowl_wg_st_backwards = 0;
+    aowl_wg_st_open = 0; aowl_wg_st_prev = -1;
+}
 
 static const char* aowl_wg_crumb_text(int32_t s) {
     switch (s) {

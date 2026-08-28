@@ -71,7 +71,10 @@ const cDuDefaultWidgets = [
   ("pos",     "POSITION", "pos,rot"),
   ("mem",     "MEMORY",   "mem"),
   ("bots",    "BOTS",     "bots,botlist"),
-  ("prof",    "PROFILER", "region"),
+  # `region` is the per-participant total; `stages` is that total broken down
+  # across the F3 refresh's own breadcrumb stages. The total alone can only ever
+  # say "debugui is slow", which is the question, not the answer.
+  ("prof",    "PROFILER", "region,stages"),
   ("build",   "BUILD",    "build,frame"),
   ("notes",   "NOTES",    "note1,note2,note3")]
 
