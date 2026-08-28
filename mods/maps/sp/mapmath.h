@@ -188,4 +188,47 @@ static int mm_tile_index(float wx, float wz, float originX, float originZ,
     return 1;
 }
 
+/* ------------------------------------------------------------------ position
+ *
+ * WHY a position was rejected, as a value rather than as a silent `return`.
+ *
+ * `sp/world.nim`'s `posOf` used to have six ways to fail and reported none of
+ * them: it set ok=false and returned, spending no fault budget and writing no
+ * defect string. The live snapshot from the raid that prompted this read
+ * `ok:false localIdx:-1 ents:[] faults:0 defect:"none"` -- every player
+ * discarded, nothing recorded. The radar then drew nothing and said nothing.
+ *
+ * The predicate lives HERE, in the header the offline test compiles, so the
+ * gate that ships is the gate that is tested. `world.nim` calls this and maps
+ * the code onto its counters; it does not re-implement the thresholds.
+ *
+ * `readable` is passed in by the caller because readability is a VirtualQuery
+ * result, not a property of the floats -- and conflating "the page is not
+ * mapped" with "the value is zero" is the specific ambiguity that hid this
+ * bug. MM_POS_UNREADABLE and MM_POS_ALLZERO are therefore distinct answers.
+ */
+#define MM_POS_OK         0
+#define MM_POS_UNREADABLE 1
+#define MM_POS_NAN        2
+#define MM_POS_RANGE      3
+#define MM_POS_ALLZERO    4
+
+#define MM_POS_LIMIT 1.0e6f
+
+static int mm_pos_classify(int readable, float x, float y, float z)
+{
+    if (!readable) return MM_POS_UNREADABLE;
+    /* NaN is the only value that compares unequal to itself. Written this way
+     * rather than with isnan() so it survives -ffast-math builds unchanged. */
+    if (x != x || y != y || z != z) return MM_POS_NAN;
+    if (x > MM_POS_LIMIT || x < -MM_POS_LIMIT) return MM_POS_RANGE;
+    if (y > MM_POS_LIMIT || y < -MM_POS_LIMIT) return MM_POS_RANGE;
+    if (z > MM_POS_LIMIT || z < -MM_POS_LIMIT) return MM_POS_RANGE;
+    /* Exactly (0,0,0). No Tarkov map places a player on the world origin, and
+     * an unmapped page read as zeroes lands here -- which is why `readable`
+     * must be answered ABOVE and not inferred from this. */
+    if (x == 0.0f && y == 0.0f && z == 0.0f) return MM_POS_ALLZERO;
+    return MM_POS_OK;
+}
+
 #endif /* AOWL_MAPMATH_H */

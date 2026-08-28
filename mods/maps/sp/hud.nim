@@ -451,6 +451,29 @@ proc cHudScreenMeasured(): int32 {.importc: "mhud_screen_measured", nodecl.}
 proc cHudScreenW(): int32 {.importc: "mhud_screen_w", nodecl.}
 proc cHudScreenH(): int32 {.importc: "mhud_screen_h", nodecl.}
 
+# The counters, as ORDINARY Nim procs so another module can read them.
+#
+# The `importc ... nodecl` declarations above name `static` C functions that
+# live in THIS file's {.emit.} block and are therefore invisible outside this
+# translation unit -- exporting the Nim declaration exports a name that does
+# not link (`implicit declaration of function 'mhud_frames'`). These wrappers
+# are compiled here, where those statics are in scope, and are what maps.nim's
+# diagnostic reads.
+#
+# They are the FINISHED-STATE evidence the diag asserts on: `frames` counts
+# dispatches, `drawn` counts the dispatches that had a local player to centre
+# on, and `blips` counts marks actually emitted. frames > 0 with drawn == 0 is
+# precisely the silent failure this mod shipped with.
+proc hudFrames*(): int64 = cHudFrames()
+proc hudDrawn*(): int64 = cHudDrawn()
+proc hudBlips*(): int64 = cHudBlips()
+proc hudIndProjected*(): int64 = cHudIndProjected()
+proc hudIndBearing*(): int64 = cHudIndBearing()
+proc hudScreenMeasured*(): int32 = cHudScreenMeasured()
+proc hudScreenW*(): int32 = cHudScreenW()
+proc hudScreenH*(): int32 = cHudScreenH()
+
+
 type
   HudOpts* = object
     radar*, indicators*: bool

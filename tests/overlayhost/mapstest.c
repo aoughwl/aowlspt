@@ -27,18 +27,34 @@
 
 static int g_fail = 0, g_pass = 0;
 
+/* OUTPUT PROTOCOL. `tests/overlayhost/run-all.py` counts lines matching
+ * `^ok <text>` and `^(error|fail|not ok) <text>`, and a file that emits
+ * NEITHER is reported RUN-FAILED / INCONCLUSIVE rather than passing. This file
+ * used to print only a `mapstest: N passed, M failed` summary, so all 63 of
+ * its checks were invisible to run-all.py -- measured 2026-08-28:
+ *
+ *   python tests/overlayhost/run-all.py --only mapstest
+ *   RUN-FAILED    mapstest     produced no ok/error lines at all (exit 0)
+ *
+ * (Note for the record: `-lm` was NOT the cause. MinGW folds libm into libc;
+ * building this file without `-lm` succeeds and produces an executable.)
+ *
+ * Every assertion therefore now emits one protocol line, PASS or FAIL, so the
+ * count run-all.py reports is the count this file actually made. */
 static void ok(int cond, const char* what)
 {
-    if (cond) { g_pass++; }
-    else { g_fail++; printf("FAIL: %s\n", what); }
+    if (cond) { g_pass++; printf("ok %s\n", what); }
+    else { g_fail++; printf("error %s\n", what); }
 }
 
 static void near(float got, float want, float tol, const char* what)
 {
-    if (fabs((double)(got - want)) <= (double)tol) { g_pass++; }
-    else {
+    if (fabs((double)(got - want)) <= (double)tol) {
+        g_pass++;
+        printf("ok %s\n", what);
+    } else {
         g_fail++;
-        printf("FAIL: %s (got %.4f, want %.4f, tol %.4f)\n",
+        printf("error %s (got %.4f, want %.4f, tol %.4f)\n",
                what, got, want, tol);
     }
 }
@@ -251,6 +267,66 @@ static void test_tiles(void)
        "an empty pyramid is refused");
 }
 
+/* ------------------------------------------------------------------ position
+ *
+ * The gate that silently ate every player in the raid of 2026-08-28. These
+ * assertions are falsifiable in the direction that matters: each one names a
+ * DIFFERENT input that must produce a DIFFERENT code, so collapsing any two
+ * reasons back into one bool -- which is what the bug was -- fails here.
+ */
+static void test_pos(void)
+{
+    float zero = 0.0f;
+
+    /* An ordinary Tarkov position passes. Customs-ish coordinates. */
+    ok(mm_pos_classify(1, 123.5f, 2.25f, -456.75f) == MM_POS_OK,
+       "a plausible world position is accepted");
+    ok(mm_pos_classify(1, -0.5f, 0.0f, 0.0f) == MM_POS_OK,
+       "a position with two zero components is still accepted");
+
+    /* THE distinction the bug turned on. Same floats, different readability:
+     * they MUST NOT produce the same answer. If this ever passes with both
+     * sides equal, the ambiguity is back. */
+    ok(mm_pos_classify(0, 0.0f, 0.0f, 0.0f) == MM_POS_UNREADABLE,
+       "an UNREADABLE vector is UNREADABLE, not all-zero");
+    ok(mm_pos_classify(1, 0.0f, 0.0f, 0.0f) == MM_POS_ALLZERO,
+       "a readable (0,0,0) is ALLZERO, not unreadable");
+    ok(mm_pos_classify(0, 0.0f, 0.0f, 0.0f)
+       != mm_pos_classify(1, 0.0f, 0.0f, 0.0f),
+       "unreadable and readable-zero are DISTINGUISHABLE (the whole bug)");
+
+    /* Readability is decided before the floats are looked at, so a garbage
+     * value on an unmapped page still reports UNREADABLE. */
+    ok(mm_pos_classify(0, 1.0f, 2.0f, 3.0f) == MM_POS_UNREADABLE,
+       "readability outranks plausibility: unreadable wins over a good value");
+
+    /* NaN. Only value unequal to itself. */
+    ok(mm_pos_classify(1, zero / zero, 1.0f, 1.0f) == MM_POS_NAN,
+       "NaN in x is reported as NaN");
+    ok(mm_pos_classify(1, 1.0f, zero / zero, 1.0f) == MM_POS_NAN,
+       "NaN in y is reported as NaN");
+    ok(mm_pos_classify(1, 1.0f, 1.0f, zero / zero) == MM_POS_NAN,
+       "NaN in z is reported as NaN");
+
+    /* Range, each axis independently -- a per-axis check that only tested x
+     * would pass a y-only or z-only outlier. */
+    ok(mm_pos_classify(1, 2.0e6f, 1.0f, 1.0f) == MM_POS_RANGE,
+       "an out-of-range x is RANGE");
+    ok(mm_pos_classify(1, 1.0f, -2.0e6f, 1.0f) == MM_POS_RANGE,
+       "an out-of-range negative y is RANGE");
+    ok(mm_pos_classify(1, 1.0f, 1.0f, 2.0e6f) == MM_POS_RANGE,
+       "an out-of-range z is RANGE");
+    ok(mm_pos_classify(1, 999999.0f, 1.0f, 1.0f) == MM_POS_OK,
+       "a large but in-range coordinate is still accepted");
+
+    /* Every code is distinct -- the counters in world.nim index on these, so
+     * two codes colliding would merge two reasons into one tally. */
+    ok(MM_POS_OK != MM_POS_UNREADABLE && MM_POS_UNREADABLE != MM_POS_NAN
+       && MM_POS_NAN != MM_POS_RANGE && MM_POS_RANGE != MM_POS_ALLZERO
+       && MM_POS_OK != MM_POS_ALLZERO,
+       "the five position codes are pairwise distinct");
+}
+
 int main(void)
 {
     test_topdown();
@@ -258,6 +334,7 @@ int main(void)
     test_indicator();
     test_bearing();
     test_tiles();
+    test_pos();
     printf("mapstest: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }
