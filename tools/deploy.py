@@ -18,6 +18,7 @@ feature and adding its fingerprint are one edit in one place.
     python tools/deploy.py deploy                # verify, back up, copy
     python tools/deploy.py deploy --only host,tarkov
     python tools/deploy.py deploy --dry-run      # print the plan, do nothing
+    python tools/deploy.py status                # what is OFF / MISSING / stale
     python tools/deploy.py rollback              # list restorable backups
     python tools/deploy.py rollback host         # restore host's newest backup
 
@@ -248,6 +249,51 @@ def _sha(path):
             if not b:
                 return h.hexdigest()
             h.update(b)
+
+
+ENABLED = "ENABLED"
+SWITCHED_OFF = "SWITCHED OFF"
+MISSING = "MISSING"
+AMBIGUOUS = "AMBIGUOUS"
+
+
+def off_path(dst):
+    return dst + ".off"
+
+
+def live_state(dst):
+    """Which of four states the live install is in for one artifact path.
+
+    Returns (state, path_that_exists_or_None).
+
+    The only name that counts as switched off is EXACTLY `<dst>.off`, and the
+    lookup is two `isfile` calls on known paths -- never a glob and never a
+    walk. Both of those restrictions are load-bearing:
+
+      * the live install carries `mods/fov/fov.dll.off.disabled-orig`, a stale
+        rename from 2026-08-19, sitting beside a perfectly live `fov.dll`.
+        Any pattern loose enough to match `*.off*` reports fov as switched
+        off, which is wrong -- fov is ENABLED.
+      * `<install>/mods-newbuilds-20260825/` holds seven more `.dll.off` files
+        (blackdivision, classicmovement, fov, morebots, perf, sain, sway).
+        Those are a BACKUP DIRECTORY, not live state. A recursive glob picks
+        them up and reports mods as switched off that the install does not
+        even have -- the same shape of error that made fact #128 read as
+        current when it was stale.
+      * there are 140+ `.bak-<timestamp>` files across the install. Keying off
+        exact paths ignores all of them for free.
+
+    AMBIGUOUS -- both `<dst>` and `<dst>.off` present -- is reported rather
+    than resolved. The loader takes the enabled one, but the pair means some
+    earlier deploy or hand-edit left a stray behind, and silently calling that
+    ENABLED hides it.
+    """
+    off = off_path(dst)
+    if os.path.isfile(dst):
+        return (AMBIGUOUS if os.path.isfile(off) else ENABLED), dst
+    if os.path.isfile(off):
+        return SWITCHED_OFF, off
+    return MISSING, None
 
 
 def verify_data(art, install, C):
@@ -613,8 +659,8 @@ def cmd_deploy(args, cfg, C):
         src = os.path.join(REPO, art["src"].replace("/", os.sep))
         dst = os.path.join(install, art["dst"].replace("/", os.sep))
         if args.dry_run:
-            off = dst + ".off"
-            if not os.path.isfile(dst) and os.path.isfile(off):
+            off = off_path(dst)
+            if live_state(dst)[0] == SWITCHED_OFF:
                 print("%s(dry-run)%s %-8s is switched OFF -> would refresh %s "
                       "and LEAVE it off%s"
                       % (dim, reset, art["name"], os.path.basename(off),
@@ -648,8 +694,8 @@ def cmd_deploy(args, cfg, C):
         # it back on later silently gets you an old build -- but they go to the
         # `.off` path, and the state is left as it was found. `--re-enable`
         # opts in to the old behaviour, loudly, one artifact at a time.
-        off = dst + ".off"
-        if not os.path.isfile(dst) and os.path.isfile(off):
+        off = off_path(dst)
+        if live_state(dst)[0] == SWITCHED_OFF:
             if not getattr(args, "re_enable", False):
                 try:
                     shutil.copy2(off, backup_name(off))
@@ -775,6 +821,151 @@ def cmd_deploy(args, cfg, C):
     return 0
 
 
+def _mtime(path):
+    return time.strftime("%Y-%m-%d %H:%M",
+                         time.localtime(os.path.getmtime(path)))
+
+
+CURRENT = "current"
+STALE = "STALE"
+UNKNOWN = "?"
+
+
+def freshness(live, src):
+    """Does the live file hold the bytes of the built one?
+
+    Returns (verdict, detail). UNKNOWN whenever the question could not be
+    ASKED -- nothing live, nothing built, or a read that failed -- because
+    "I could not compare" must not print as "they match" (CLAUDE.md 9b).
+    """
+    if live is None:
+        return UNKNOWN, "nothing in the install to compare"
+    if not src or not os.path.isfile(src):
+        return UNKNOWN, "not built in this checkout -- cannot compare"
+    try:
+        same = _sha(live) == _sha(src)
+    except OSError as e:
+        return UNKNOWN, "unreadable: %s" % e
+    if same:
+        return CURRENT, "matches the built artifact"
+    return STALE, ("live %s (%s) DIFFERS from built %s (%s)"
+                   % (os.path.basename(live), _mtime(live),
+                      os.path.basename(src), _mtime(src)))
+
+
+def unmanaged_mods(install, arts):
+    """Mod directories present in the live install that no artifact declares.
+
+    One level deep under `<install>/mods` only. It does NOT recurse, so the
+    sibling backup tree `<install>/mods-newbuilds-*` is never even opened --
+    that directory is where every other `.dll.off` on the machine lives.
+    """
+    root = os.path.join(install, "mods")
+    if not os.path.isdir(root):
+        return []
+    known = set()
+    for art in arts:
+        parts = art["dst"].replace("\\", "/").split("/")
+        if len(parts) > 1 and parts[0] == "mods":
+            known.add(parts[1].lower())
+    out = []
+    for name in sorted(os.listdir(root)):
+        d = os.path.join(root, name)
+        if not os.path.isdir(d) or name.lower() in known:
+            continue
+        dll = os.path.join(d, name + ".dll")
+        out.append((name, live_state(dll)))
+    return out
+
+
+def cmd_status(args, cfg, C):
+    """Report the SWITCHED-OFF and staleness state of the live install.
+
+    `check` verifies the bytes of a BUILT file and is blind to this by
+    construction: a mod the install has switched off as `<name>.dll.off` has
+    correct bytes, so every marker passes while the mod does not load at all
+    (fact #156). This is the verb that says so out loud.
+    """
+    red, green, yellow, dim, reset = C
+    install = args.install or cfg["install"]
+    # Which checkout's build outputs the live files are compared AGAINST.
+    # Defaults to this one. A worktree that has not been built has no build
+    # outputs at all, and then every artifact honestly reports "not built in
+    # this checkout -- cannot compare" rather than a freshness verdict; point
+    # --repo at the checkout you actually build in to get one.
+    repo = os.path.abspath(args.repo) if args.repo else REPO
+    arts = select(cfg, args.only)
+    print("install: %s" % install)
+    if repo != REPO:
+        print("compared against build outputs in: %s" % repo)
+    if not os.path.isdir(install):
+        print("%sthe install directory does not exist -- nothing to "
+              "report.%s" % (red, reset))
+        return 3
+    print("")
+
+    off_n = miss_n = stale_n = amb_n = unknown_n = 0
+    for art in arts:
+        dst = os.path.join(install, art["dst"].replace("/", os.sep))
+        src = os.path.join(repo, art["src"].replace("/", os.sep))
+        state, live = live_state(dst)
+        fresh, detail = freshness(live, src)
+
+        if state == ENABLED:
+            tag, col = "ENABLED     ", green
+        elif state == SWITCHED_OFF:
+            tag, col = "SWITCHED OFF", yellow
+            off_n += 1
+        elif state == AMBIGUOUS:
+            tag, col = "AMBIGUOUS   ", red
+            amb_n += 1
+        else:
+            tag, col = "MISSING     ", yellow
+            miss_n += 1
+        if fresh == STALE:
+            stale_n += 1
+        elif fresh == UNKNOWN:
+            unknown_n += 1
+
+        print("%s%s%s %-14s %s" % (col, tag, reset, art["name"], detail))
+        if state == SWITCHED_OFF:
+            print("     %soff since %s  (%s)%s"
+                  % (dim, _mtime(live), os.path.basename(live), reset))
+        elif state == AMBIGUOUS:
+            print("     %sboth exist: %s (%s) is LIVE, and %s.off (%s) is a "
+                  "stray. This is the fact-#156 shape -- a deploy re-created "
+                  "the enabled dll beside an .off somebody switched off on "
+                  "purpose, so the mod is loading again.%s"
+                  % (dim, os.path.basename(dst), _mtime(dst),
+                     os.path.basename(dst), _mtime(off_path(dst)), reset))
+        elif state == MISSING:
+            print("     %sneither %s nor %s.off is in the install%s"
+                  % (dim, art["dst"], art["dst"], reset))
+
+    extra = unmanaged_mods(install, select(cfg, None))
+    if extra:
+        print("\nmod directories in the install that no artifact declares "
+              "(not deployed by this tool):")
+        for name, (state, live) in extra:
+            note = ("off since %s" % _mtime(live)) if state == SWITCHED_OFF \
+                else state.lower()
+            print("     %s%-14s %s%s" % (dim, name, note, reset))
+
+    print("\n%d artifact(s): %d switched off, %d missing, %d ambiguous, "
+          "%d stale, %d not comparable."
+          % (len(arts), off_n, miss_n, amb_n, stale_n, unknown_n))
+    if off_n:
+        print("%sa switched-off mod does NOT load. `check` cannot see this -- "
+              "its bytes are correct. Nothing here re-enables anything; "
+              "`deploy --re-enable` does, one artifact at a time.%s"
+              % (yellow, reset))
+    if stale_n or amb_n:
+        return 1
+    if off_n or miss_n or unknown_n:
+        return 3
+    return 0
+
+
 def find_backups(install, art):
     dst = os.path.join(install, art["dst"].replace("/", os.sep))
     d = os.path.dirname(dst)
@@ -820,7 +1011,8 @@ def main():
         description="verify, back up and deploy aowlspt build artifacts",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__)
-    p.add_argument("command", choices=["check", "deploy", "rollback"])
+    p.add_argument("command", choices=["check", "deploy", "rollback",
+                                     "status"])
     p.add_argument("target", nargs="?", default=None,
                    help="artifact name(s), comma separated; same as --only")
     p.add_argument("--only", default=None,
@@ -832,6 +1024,9 @@ def main():
                         "staging dir, or a downloaded binary). `check` only. "
                         "Skips the install-side data check, which does not "
                         "apply to a file that has not been deployed.")
+    p.add_argument("--repo", default=None, metavar="PATH",
+                   help="`status` only: the checkout whose build outputs the "
+                        "live files are compared against (default: this one)")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--re-enable", action="store_true",
                    help="switch a mod back ON that the install had switched "
@@ -847,6 +1042,8 @@ def main():
     if args.artifact and args.command != "check":
         sys.exit("--artifact is only meaningful with `check`: it verifies a "
                  "file in place and never copies anything.")
+    if args.command == "status":
+        return cmd_status(args, cfg, C)
     if args.command == "check":
         return cmd_check(args, cfg, C)
     if args.command == "deploy":
