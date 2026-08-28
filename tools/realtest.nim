@@ -711,9 +711,15 @@ proc boolField(s: string; objAt: int; key: string): bool =
 
 const TarkovSettings = "/aowlspt/settings/aowl.tarkov"
 
-proc setMapSetting(key, valueJson: string): bool =
+proc setTarkovSetting(key, valueJson: string): bool =
   ## One settings edit through the REAL route, so the persist path, the
   ## re-apply and the serve path are all inside the assertion.
+  ##
+  ## Was `setMapSetting`. It is not map-specific and never was -- it POSTs to
+  ## `/aowlspt/settings/aowl.tarkov`, which is every setting the tarkov mod
+  ## declares -- and the name is why the progression settings got a pure
+  ## self-check instead of one that drives the real write path: this helper
+  ## already existed and did not look applicable.
   let r: Response = call(TarkovSettings,
                "{\"key\":\"" & key & "\",\"value\":" & valueJson & "}")
   # A POST that did not persist answers `{"err":...,"rows":[...]}` rather than
@@ -1994,7 +2000,7 @@ proc main(): int =
         $m0 & " map(s) with no bool Locked; " & $(l0 + u0) & " of " &
         $mapKeys.len & " readable")
 
-  if not setMapSetting("mapsUnlockedByDefault", "false"):
+  if not setTarkovSetting("mapsUnlockedByDefault", "false"):
     skip("locking every map is served to the client",
          "the settings POST did not persist, so nothing was changed to look at")
     skip("unlocking every map is served to the client", "same POST failure")
@@ -2009,7 +2015,7 @@ proc main(): int =
           $u1 & " map(s) still unlocked, " & $m1 & " unreadable, " & $l1 &
           " locked of " & $mapKeys.len)
 
-    discard setMapSetting("mapsUnlockedByDefault", "true")
+    discard setTarkovSetting("mapsUnlockedByDefault", "true")
     var l2 = 0
     var u2 = 0
     var m2 = 0
@@ -2026,7 +2032,7 @@ proc main(): int =
     # `canonicalLocation`, this locks nothing and the count stays 0 -- so the
     # check fails rather than passing quietly, which is the whole point of
     # asserting an exact count instead of ">= 0".
-    discard setMapSetting("mapsLocked", "\"Woods\"")
+    discard setTarkovSetting("mapsLocked", "\"Woods\"")
     var l3 = 0
     var u3 = 0
     var m3 = 0
@@ -2038,7 +2044,7 @@ proc main(): int =
           "the database key, which is fact #183")
 
     # Put it back, so a run does not leave the install locked.
-    discard setMapSetting("mapsLocked", "\"\"")
+    discard setTarkovSetting("mapsLocked", "\"\"")
     var l4 = 0
     var u4 = 0
     var m4 = 0
@@ -4618,6 +4624,148 @@ proc main(): int =
   # It was EMPTY, and emptiness is invisible to a shape check. So these
   # checks are about CONTENT, and each is stated as a negative that a real
   # regression can falsify.
+  # -- the progression cheats, asserted on the SERVED PROFILE ---------------
+  #
+  # `emu/progression` already has a self-check, and it is pure: it exercises
+  # the family filter and the exp-table arithmetic. Every one of those
+  # assertions passed for the whole time the feature was UNREACHABLE, because
+  # none of them touches a profile and none of them touches config.json. The
+  # three keys were declared, wired and absent from the live
+  # `mods/tarkov/config.json`, so `configGet` answered ErrNotFound, the rows
+  # rendered at their schema defaults and the code below them never ran.
+  #
+  # So this asserts the finished state and nothing else: drive the setting
+  # through the REAL settings route, then re-read `/client/game/profile/list`
+  # and check the field THE CLIENT reads. For the level that is
+  # `Info.Experience` -- the client derives the level it draws from the exp
+  # table and does not trust `Info.Level` (see `emu/progression`'s header), so
+  # a check on `Info.Level` alone is one this feature can pass while being
+  # recomputed away on the client's first frame.
+  #
+  # The expected experience is recomputed HERE, from the exp table the server
+  # itself served over `/client/globals`, rather than taken from the emulator.
+  # A shared `xpForLevel` on both sides could only compare the code with
+  # itself.
+  heading "Progression"
+  block progression:
+    let expTableAt = memberValue(globalsR.body,
+                       memberValue(globalsR.body,
+                         memberValue(globalsR.body,
+                           memberValue(globalsR.body, dataAt(globalsR),
+                                       "config"), "exp"), "level"), "exp_table")
+    let expRows = elements(globalsR.body, expTableAt)
+    if expRows.len < 20:
+      skip("a player level set on the settings page reaches the served profile",
+           "globals.config.exp.level.exp_table has " & $expRows.len &
+           " entries, so there is no table to compute an experience from -- " &
+           "INCONCLUSIVE, not a pass")
+      break progression
+
+    # The floor to ask for. Deliberately not 1 (level 1 is zero experience, so
+    # a server that wrote nothing at all would pass) and not the top of the
+    # table (which clamps, and a clamp can hide an off-by-one).
+    const WantLevel = 20
+    var wantXp = 0
+    var i = 0
+    while i < expRows.len and i < WantLevel:
+      wantXp = wantXp + intField(globalsR.body, expRows[i], "exp")
+      inc i
+    check("the exp table gives level " & $WantLevel & " a non-zero experience",
+          wantXp > 0, $wantXp)
+
+    let before = call("/client/game/profile/list", "")
+    let beforeAt = profileOf(before.body, uid)
+    let infoBefore = memberValue(before.body, beforeAt, "Info")
+    let xpBefore = intField(before.body, infoBefore, "Experience")
+
+    if not setTarkovSetting("progressionPlayerLevel", $WantLevel):
+      skip("a player level set on the settings page reaches the served profile",
+           "the settings POST for progressionPlayerLevel did not persist -- " &
+           "that is the ORIGINAL bug (no such key in config.json), and it is " &
+           "a failure of the write path, not of progression")
+    else:
+      let after = call("/client/game/profile/list", "")
+      let afterAt = profileOf(after.body, uid)
+      let infoAfter = memberValue(after.body, afterAt, "Info")
+      let xpAfter = intField(after.body, infoAfter, "Experience")
+      let lvlAfter = intField(after.body, infoAfter, "Level")
+      # THE assertion. Not "config.json now has the key" and not "the POST
+      # returned 200" -- both of those were true on the broken build.
+      check("the field the client derives the level from carries it",
+            xpAfter >= wantXp,
+            "Info.Experience is " & $xpAfter & ", the table wants " &
+            $wantXp & " for level " & $WantLevel & " (was " & $xpBefore &
+            " before the edit)")
+      check("and Info.Level agrees with it",
+            lvlAfter >= WantLevel,
+            "Info.Level is " & $lvlAfter)
+
+      # The floor, stated as the negative that a ceiling-shaped bug fails:
+      # lowering the setting must take nothing away.
+      discard setTarkovSetting("progressionPlayerLevel", "1")
+      let lowered = call("/client/game/profile/list", "")
+      let loweredXp = intField(lowered.body,
+                        memberValue(lowered.body,
+                          profileOf(lowered.body, uid), "Info"), "Experience")
+      check("lowering the setting takes no experience away (it is a floor)",
+            loweredXp >= xpAfter,
+            "Info.Experience went " & $xpAfter & " -> " & $loweredXp)
+      discard setTarkovSetting("progressionPlayerLevel", "0")
+
+    # Mastery. Per weapon FAMILY, and the threshold is the family's own
+    # `Level2` out of `globals.config.Mastering` -- read here from the served
+    # globals for the same reason the exp table is.
+    let masteringAt = memberValue(globalsR.body,
+                        memberValue(globalsR.body, dataAt(globalsR), "config"),
+                        "Mastering")
+    let famRows = elements(globalsR.body, masteringAt)
+    if famRows.len == 0:
+      skip("weapon mastery set on the settings page reaches the served profile",
+           "globals.config.Mastering is empty, so no family has a threshold " &
+           "to raise to -- INCONCLUSIVE, not a pass")
+    elif not setTarkovSetting("progressionMasteryLevel", "2"):
+      skip("weapon mastery set on the settings page reaches the served profile",
+           "the settings POST for progressionMasteryLevel did not persist")
+    else:
+      let after = call("/client/game/profile/list", "")
+      let afterAt = profileOf(after.body, uid)
+      let mastering = elements(after.body,
+                        memberValue(after.body,
+                          memberValue(after.body, afterAt, "Skills"),
+                          "Mastering"))
+      # Every family in the table must be present on the profile at or above
+      # its OWN Level2 -- a negative over the whole set, so a server that
+      # raised one family and stopped fails, and one that wrote a single
+      # constant into every family fails too (the thresholds differ: M4 is
+      # 1600, SKS 200).
+      var short = 0
+      var missing = 0
+      var firstShort = ""
+      for f in famRows:
+        let name = textField(globalsR.body, f, "Name")
+        if name.len == 0:
+          continue
+        let want = intField(globalsR.body, f, "Level2")
+        var found = -1
+        for m in mastering:
+          if textField(after.body, m, "Id") == name:
+            found = intField(after.body, m, "Progress")
+        if found < 0:
+          inc missing
+          if firstShort.len == 0: firstShort = name & " absent"
+        elif found < want:
+          inc short
+          if firstShort.len == 0:
+            firstShort = name & " at " & $found & ", wants " & $want
+      check("no weapon family is served below its own level-2 threshold",
+            short == 0 and missing == 0,
+            $short & " below threshold, " & $missing &
+            " absent, of " & $famRows.len & " families; first: " & firstShort)
+      check("and the profile carries a mastery row per family",
+            mastering.len >= famRows.len,
+            $mastering.len & " rows for " & $famRows.len & " families")
+      discard setTarkovSetting("progressionMasteryLevel", "0")
+
   heading "Saved builds"
   let blist = call("/client/builds/list", "")
   let blAt = dataAt(blist)

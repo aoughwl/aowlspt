@@ -695,11 +695,74 @@ proc onApplyQuery(payload: string): string =
   discard emit(SettingsApplyAnnounce, done(o).text)
   result = ""
 
+proc backfillDeclaredDefaults*(settings: seq[Setting]): int =
+  ## Write the declared default into `config.json` for every declared key the
+  ## file does not already hold. Returns how many keys were added.
+  ##
+  ## THIS IS HOW A NEW KEY REACHES AN EXISTING INSTALL, and without it there
+  ## was no such path at all. The deploy `seed` rule copies a mod's
+  ## `config.json` only when the file is ABSENT -- deliberately, because
+  ## overwriting one is overwriting the player's settings -- so a key added to
+  ## the repo's config.json after the first deploy never arrives. That is
+  ## exactly what happened to `progressionPlayerLevel`,
+  ## `progressionSkillLevel` and `progressionMasteryLevel`: present in the
+  ## repo, declared, wired to `emu/progression`, and absent from the live
+  ## `mods/tarkov/config.json`, so `configGet` answered `ErrNotFound`, the rows
+  ## rendered at their schema defaults and resolved to nothing.
+  ##
+  ## Backfill only, never overwrite: a key the file already holds is left
+  ## alone, whatever its value, so a player's edits survive every upgrade. The
+  ## only observable change to an install that is already complete is zero
+  ## writes.
+  ##
+  ## A file that exists and does not PARSE is refused outright rather than
+  ## backfilled: `configSet` would merge into a document we cannot read, and
+  ## the honest answer to "which keys are missing" from an unparseable file is
+  ## that we do not know. It warns and writes nothing.
+  result = 0
+  if settings.len == 0:
+    return
+  if configFaulted():
+    warn "settings: this mod's config.json does not parse, so no declared " &
+         "default was backfilled -- every setting on this mod is running on " &
+         "its schema default and nothing can persist (" & lastError() & ")"
+    return
+  var added: seq[string] = @[]
+  for s in settings:
+    if setting(s.key).ok:
+      continue
+    let st = applySetting(s.key, s.defaultJson)
+    if st == Ok:
+      added.add s.key
+    else:
+      # One line per key would be N lines of the same fault; but silence here
+      # is the very failure mode this proc exists to end, so the FIRST one
+      # names the status and stops the loop -- if the mod has no config.json
+      # at all, no later key will fare differently.
+      warn "settings: could not backfill \"" & s.key & "\" into config.json " &
+           "(" & statusMessage(st) & ") -- that row renders and resolves to " &
+           "nothing"
+      return added.len
+  if added.len > 0:
+    var names = ""
+    for k in added:
+      if names.len > 0: names.add ", "
+      names.add k
+    info "settings: backfilled " & $added.len & " declared key(s) missing " &
+         "from config.json: " & names
+  result = added.len
+
 proc declareSettings*(settings: seq[Setting]; inIndex = true) =
   ## Register this mod's schema. Replaces any previous declaration — call it
   ## once with the whole list, not once per row.
   gDeclared = settings
   gInIndex = inIndex
+  # Self-healing on load. See `backfillDeclaredDefaults`: the deploy seed rule
+  # cannot carry a NEW key into an install that already has a config.json, so
+  # without this every setting added after a player's first deploy is a control
+  # that renders and does nothing, on their machine only, where no repo-side
+  # check can see it.
+  discard backfillDeclaredDefaults(settings)
   if not gAnnounceSubscribed and settings.len > 0:
     # Subscribe once, lazily, the first time a mod actually has something to
     # announce — a mod that never declares settings never joins the

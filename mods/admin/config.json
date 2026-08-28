@@ -27,5 +27,8 @@
   "hotkeyGodmode": "",
   "hotkeyStamina": "",
   "hotkeyNoRecoil": "",
-  "hotkeyNoWeight": ""
+  "hotkeyNoWeight": "",
+
+  "_adminSurface": "A signpost row (implemented = false in admin.nim -- it sets nothing; the live admin surface is the in-game F6 overlay). It is given a path here anyway so that no declared setting is missing one: tools/settingscheck.py cannot tell a deliberate signpost from a control that renders and resolves to nothing, and neither can a player. The caption is also a deploy marker in tools/deploy.json.",
+  "adminSurface": "press F6 in game"
 }
