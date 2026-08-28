@@ -317,6 +317,11 @@ static int aowl_rva_is_code(unsigned int rva) {
 ## OFFLINE) and the guarded tick body. The implementation is in `cursorfree.nim`
 ## (included below). MUST follow `aowlspt_prologue.h`. See `aowlspt_cursor.h`.
 {.emit: """#include "aowlspt_cursor.h" """.}
+## The mod-facing "which blocking UI surface is open" mask export
+## (`aowl_ui_overlay_mask`) and the byte-verified getters behind its game-Settings
+## bit. MUST follow `aowlspt_prologue.h` and `aowlspt_cursor.h`. See
+## `aowlspt_uistate.h`.
+{.emit: """#include "aowlspt_uistate.h" """.}
 ## The in-game, Unity-native debug overlay: the F3 info panel and the
 ## in-world AI markers. Target table, call thunks, guarded scalar stores,
 ## the toggle key and the frame-rate estimate. See `aowlspt_debugui.h`.
@@ -3303,6 +3308,9 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
     # overlay panel cannot be clicked. Idle cost is a publish and two integer
     # compares; it makes NO call into the game on a frame where no panel is open
     # and no saved state is held.
+    # Publish the mod-facing UI overlay mask FIRST, so cursorFreeDrainTick's
+    # host-mask publication this frame sees this frame's game-Settings state.
+    uiStateDrainTick()
     cursorFreeDrainTick()
     return 0'i32
   # The render-phase drain, likewise by identity: a second detour on a
@@ -5773,6 +5781,13 @@ include "modetext.nim"
 ## detours are on functions nothing else in this host names.
 include "modeskip.nim"
 
+## THE UI OVERLAY-MASK SIGNAL. Included BEFORE cursorfree.nim because
+## `cursorFreeHostMask` calls its `uiStateSettingsOpen()` to free the cursor
+## while the game's own Settings screen is up. Reads `gSettingsLiveSelf`
+## (settingsui.nim) and the cursor level; installs NO detour, rides the
+## TarkovApplication::Update drain. See `aowlspt_uistate.h`.
+include "uistate.nim"
+
 ## FREE THE MOUSE WHILE AN OVERLAY PANEL IS OPEN. Included after `debugui.nim`
 ## because it reads that file's `gDuEdit` to know whether the F3 layout editor
 ## is claiming the cursor, and it installs NO detour of its own: it rides the
@@ -7186,6 +7201,18 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   # correct RVAs and blame the game build. It is called from the FIRST drain
   # tick instead, which by construction runs on Unity's thread with the module
   # loaded.
+  # THE UI OVERLAY-MASK SIGNAL (aowl_ui_overlay_mask export). Default OFF. When
+  # on, a guarded, self-disabling managed probe reads the game Settings screen's
+  # live activeInHierarchy each tick for bit0; bit1/bit2 (F6/F3) are pure reads
+  # of the cursor level and publish regardless. This flag also enables freeing
+  # the cursor over the game's Settings screen (via cursorFreeHostMask), which
+  # additionally needs overlayCursorFree on to act.
+  gUiStateOn = readBoolKey("overlayStateSignal")
+  if gUiStateOn:
+    info "overlayStateSignal is set: aowl_ui_overlay_mask bit0 will report the " &
+         "game Settings screen open by reading its live activeInHierarchy off " &
+         "gSettingsLiveSelf at byte-verified static RVAs; with overlayCursorFree " &
+         "also on, the cursor is freed while that screen is up."
   gCursorFreeOn = readBoolKey("overlayCursorFree")
   if gCursorFreeOn:
     info "overlayCursorFree is set: while any aowlspt overlay panel is open " &
