@@ -389,6 +389,34 @@ proc slice(s: string; at: int): string =
     stop = at + 220
   result = s.substr(at, stop - 1)
 
+proc slotKey(s: string; itemAt: int): string =
+  ## The address a child item occupies inside its parent: parent, slot, and
+  ## the position within that slot. Empty for a root item, which has no
+  ## address to collide on.
+  ##
+  ## **An ABSENT `location` normalises to `0`, and that is the whole point.**
+  ## The client defaults it, so two stacks that both omit it are two stacks at
+  ## position 0 -- which is the `InventoryException` this check exists for. A
+  ## key that treated "absent" as its own value would pass over the exact bug
+  ## it was written to catch.
+  ##
+  ## The location is taken as RAW TEXT, not decoded, because the two shapes
+  ## BSG uses are not interchangeable: a grid child carries the object
+  ## `{"x":0,"y":0,"r":"Horizontal"}` and a `StackSlot` child carries the bare
+  ## integer `0` (measured, capture/raid1/requests/204.json). Comparing the
+  ## text compares the address the client will actually compute.
+  let parent = textField(s, itemAt, "parentId")
+  let slot = textField(s, itemAt, "slotId")
+  if parent.len == 0 or slot.len == 0:
+    return ""
+  var loc = "0"
+  let at = memberValue(s, itemAt, "location")
+  if at >= 0:
+    let stop = endOf(s, at)
+    if stop > at:
+      loc = s.substr(at, stop - 1)
+  result = parent & "|" & slot & "|" & loc
+
 # ---------------------------------------------------------------------------
 # Timing and size, reported rather than asserted
 # ---------------------------------------------------------------------------
@@ -1799,6 +1827,8 @@ proc main(): int =
   var lootItems = 0
   var lootDangling = 0
   var lootOrphans = 0
+  var slotDupes = 0
+  var slotDupeSample = ""
   var magsSeen = 0
   var magsLoaded = 0
   var magsEmptyLoad = 0
@@ -1835,6 +1865,21 @@ proc main(): int =
       # floor. The claim is checked through *parentage* rather than by counting
       # cartridge templates, because the static pools spawn loose cartridges of
       # their own and a count would be green with the feature deleted.
+      # NO TWO CHILDREN OF ONE PARENT MAY SHARE ONE (slotId, location).
+      # Stated as a negative over the FINISHED payload rather than over any
+      # particular generator: it is falsifiable, and it catches every future
+      # variant -- ammo boxes, magazines, grids, presets alike.
+      var addrs = initHashSet[string]()
+      for it in inner:
+        let k = slotKey(floor1.body, it)
+        if k.len == 0:
+          continue
+        if contains(addrs, k):
+          inc slotDupes
+          if slotDupeSample.len == 0:
+            slotDupeSample = name & " " & k & "  <- " &
+                             textField(floor1.body, it, "_tpl")
+        incl(addrs, k)
       var magIds = initHashSet[string]()
       for it in inner:
         if textField(floor1.body, it, "slotId") == "mod_magazine":
@@ -1881,6 +1926,12 @@ proc main(): int =
   # The magazines. `magsSeen` is the denominator and is asserted separately:
   # "no magazine was loaded" and "no weapon spawned at all" are different
   # answers and a single check cannot tell them apart.
+  # The negative. `lootItems > 0` above is its denominator: zero items would
+  # make this vacuously green, and the two claims are asserted separately for
+  # that reason.
+  check("no container puts two items at the same (slotId, location)",
+        slotDupes == 0,
+        $slotDupes & " colliding positions, first: " & slotDupeSample)
   check("weapon presets put magazines on the floor", magsSeen > 0,
         "no item on any of these maps is slotted mod_magazine")
   check("and the map's own `staticAmmo` table loads them", magsLoaded > 0,
