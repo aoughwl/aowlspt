@@ -252,18 +252,42 @@ proc probe*(): Capability =
   # loudly, which CLAUDE.md 6 asks for, rather than a mod that kills the
   # client -- and it is honestly worse than the old behaviour looked, because
   # the old behaviour never worked at all.
-  crumb("step 7/7: NOT counting the list -- refused")
+  # STEP 7 NOW COUNTS THE LIST, without calling into game code. `listLen` reads
+  # `_size` off the measured `List<Player>` layout (fact #226, MEASURED LIVE in
+  # a 40-player raid): every hop VirtualQueried, `_size` clamped to the backing
+  # array's `max_length`, no by-name binding. So the count sub-blocker is lifted
+  # and this is an observable, self-validating fact (CLAUDE.md 9b): the note
+  # reports the live count, which is falsifiable against the raid.
+  #
+  # capFull IS STILL NOT REACHED, and the reason is now precisely the SECOND
+  # blocker, not the count: every sensor read and every driving call past the
+  # count still goes through `LazyCall`/`ensure` -> `resolveOn` -> `findOn` ->
+  # `findMethod`, which calls `il2cpp_class_get_method_from_name` DIRECTLY on the
+  # runtime entry table (confirmed: `il2cpp.findMethod` invokes `rt.fns[...]`,
+  # NOT the host gate). That export is TOKEN-GATED on this build: called in the
+  # stock shape it returns a uniform random non-zero uint64, the nil check
+  # passes, and the first dereference kills the client. Lifting capFull requires
+  # replacing those by-name call sites with the byte-verified static-RVA table
+  # (docs/SAIN_RVA.md) -- the ~6 drive setters AND the ~50 sensor getters -- not
+  # re-enabling `capFull` over the fatal path. That conversion is not done here.
+  let liveCount = listLen(list)
+  crumb("step 7/7: counted the alive-players list = " & $liveCount &
+        " (measured layout, no game call); capFull still refused -- by-name " &
+        "sensor/drive binding")
   gCapability = capReadOnly
   gProbeNote = "the world and the alive-players list were both reached " &
-               "without calling into game code, and that is as far as this " &
-               "build allows. " & listLenWhy() &
-               ". Everything past a count needs LazyCall/ensure, which binds " &
-               "BY NAME through il2cpp_class_from_name -- a TOKEN-GATED " &
-               "export on this build that returns a plausible RANDOM handle " &
-               "instead of failing, so the nil check passes and the first " &
-               "dereference kills the client. This half therefore stays in " &
-               "observer mode and drives nothing. The blocker is the BINDING " &
-               "MECHANISM, not the operation: difficulty and per-role " &
+               "without calling into game code, and the list now COUNTS: " &
+               $liveCount & " alive players (fact #226 measured layout, every " &
+               "hop VirtualQueried, no by-name binding). What still refuses " &
+               "capFull is the SECOND blocker: every sensor read and driving " &
+               "call past the count binds BY NAME through " &
+               "il2cpp_class_get_method_from_name -- called directly on the " &
+               "runtime entry table (il2cpp.findMethod), a TOKEN-GATED export " &
+               "that returns a plausible RANDOM handle instead of failing, so " &
+               "the nil check passes and the first dereference kills the " &
+               "client. Reviving to capFull needs those call sites replaced " &
+               "with the byte-verified RVA table (docs/SAIN_RVA.md), not the " &
+               "fatal path re-enabled. Meanwhile difficulty and per-role " &
                "difficulty do reach bots, over server/drive.nim's botnav " &
                "path, which uses byte-verified RVAs and no name lookup"
   crumb("step 7/7 refused; the arming path is complete and this trace stops")

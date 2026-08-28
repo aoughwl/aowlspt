@@ -2011,49 +2011,109 @@ proc alivePlayers*(world: Il2CppPtr): Il2CppPtr =
                        offset: AliveListOffset, kind: fkPtr, bindNs: 0'i64)
   result = readPtr(f, world)
 
-proc listLenWhy*(): string =
-  ## Why there is no count. Read into the log rather than asserted, because a
-  ## count of 0 and "I cannot count" are different answers and reporting the
-  ## second as the first is the silent decline CLAUDE.md 6 forbids.
-  result = "List<Player> cannot be counted on this build. `get_Count` is a " &
-           "SHARED GENERIC, so it needs a real MethodInfo* -- a NULL one is " &
-           "only safe for non-generics -- and the only route to one here is " &
-           "by-name resolution, which returns a handle into unmapped memory " &
-           "(fact #35). The field route is closed too: `List`1._size` has " &
-           "offset 0 in the metadata table because a generic instantiation's " &
-           "field offsets are allocated at RUNTIME, so there is no static " &
-           "number to read and this mod will not guess one. Settling it needs " &
-           "a LIVE measurement -- `dump`/`scan` on a real list pointer inside " &
-           "a raid through the inspector -- not another offline pass"
+# The measured `List<Player>` layout (fact #226, MEASURED LIVE via the read-only
+# inspector in a raid with 40 players). These are the standard il2cpp
+# `List<T>`-of-reference offsets and are consistent with fact #78
+# (`Il2CppArray.max_length@0x18`, element data from `+0x20`), stable across T.
+#
+#   List + 0x10 (ptr) -> Il2CppArray*  (_items)
+#   List + 0x18 (i32) -> _size          (= 40 live: 39 bots + local player)
+#   Array + 0x18 (i32)-> max_length     (= 64, backing capacity)
+#   Array + 0x20 + i*8 (ptr) -> Player[i]
+#
+# Every hop was confirmed readable live. The read below still VirtualQueries
+# every hop, because a between-raid or dying-bot list can hold a stale entry --
+# so this is a self-validating read (CLAUDE.md 9b), not a guessed offset trusted
+# blind: an unreadable `_items`, an absurd `_size`, or an unreadable element is
+# each handled without a dereference.
+const ListItemsOffset*   = 0x10'i32   ## `List<T>._items` (Il2CppArray*)
+const ListSizeOffset*    = 0x18'i32   ## `List<T>._size`  (int)
+const ArrayMaxLenOffset* = 0x18'i32   ## `Il2CppArray.max_length` (int)
+const ArrayDataOffset*   = 0x20'i32   ## first element of the backing array
+const ListWalkHardCap*   = 512        ## absolute run-away guard, above any raid
+
+proc arrayOf(list: Il2CppPtr): Il2CppPtr =
+  ## The backing `Il2CppArray*` of a `List<T>`, or null if the list or its
+  ## `_items` slot is not safely readable. One guarded hop.
+  result = cast[Il2CppPtr](0)
+  if not sainReadable(list, ListItemsOffset + 8):
+    return
+  var f = FieldBinding(ok: true, why: "List._items@0x10 (measured, fact #226)",
+                       target: "List`1._items", offset: ListItemsOffset,
+                       kind: fkPtr, bindNs: 0'i64)
+  let arr = readPtr(f, list)
+  if arr == nil:
+    return
+  if not sainReadable(arr, ArrayDataOffset):
+    return
+  result = arr
+
+proc listBound(list, arr: Il2CppPtr): int =
+  ## The number of live elements to walk: `_size`, clamped to the array's own
+  ## `max_length` (a corrupt `_size` cannot run past the backing store) and to
+  ## a hard cap. Negative or zero returns 0.
+  result = 0
+  if list == nil or arr == nil:
+    return
+  var fs = FieldBinding(ok: true, why: "List._size@0x18 (measured, fact #226)",
+                        target: "List`1._size", offset: ListSizeOffset,
+                        kind: fkI32, bindNs: 0'i64)
+  var fm = FieldBinding(ok: true, why: "Array.max_length@0x18 (fact #78)",
+                        target: "Il2CppArray.max_length", offset: ArrayMaxLenOffset,
+                        kind: fkI32, bindNs: 0'i64)
+  let size = int(readInt32(fs, list))
+  let cap = int(readInt32(fm, arr))
+  if size <= 0 or cap <= 0:
+    return
+  var n = size
+  if n > cap: n = cap
+  if n > ListWalkHardCap: n = ListWalkHardCap
+  result = n
 
 proc listLen*(list: Il2CppPtr): int =
-  ## Always 0, and `listLenWhy()` says why. It used to call `get_Count` through
-  ## a by-name binding; on this build that is the same unmapped-memory jump
-  ## that killed the client at `get_Instance`, and it had simply never been
-  ## reached.
+  ## `List<Player>.Count`, read as `_size` off the measured field layout
+  ## (fact #226) rather than through the shared-generic `get_Count` -- which
+  ## needs a real `MethodInfo*` a NULL one cannot substitute for, the fatal
+  ## by-name path. Every hop is VirtualQueried; an unreadable list or array
+  ## returns 0, which is an ordinary answer between raids.
   result = 0
-
-proc listAt*(list: Il2CppPtr; index: int): Il2CppPtr =
-  ## `List<T>.get_Item(int)`.
-  ##
-  ## `classifyType` refuses the *declaring* type, because a generic
-  ## instantiation has no name `findClass` accepts. The signature itself is one
-  ## integer in and one reference out, which is a shape the fast path covers --
-  ## so it is stated with `lazyAs` rather than inferred, and walking a
-  ## thirty-player list is thirty bound calls rather than thirty reflective
-  ## ones.
-  result = cast[Il2CppPtr](0)
   if list == nil:
     return
-  if not ensure(gB.listItem, list):
+  let arr = arrayOf(list)
+  if arr == nil:
     return
-  if gB.listItem.b.ok:
-    var a = noArgs()
-    addInt(a, int64(index))
-    return callPtr(gB.listItem.b, list, a)
-  var slot = int32(index)
-  var argv: array[1, Il2CppPtr] = [cast[Il2CppPtr](addr slot)]
-  result = reflect(gB.listItem.m, list, cast[Il2CppPtr](addr argv[0]))
+  result = listBound(list, arr)
+
+proc listAt*(list: Il2CppPtr; index: int): Il2CppPtr =
+  ## `List<Player>.get_Item(int)`, read as `Array[index]` off the measured
+  ## layout (fact #226). No call into game code: the element pointer is a
+  ## guarded field read at `Array + 0x20 + index*8`. An out-of-range index, an
+  ## unreadable element slot, or a stale null entry returns null and the caller
+  ## skips it -- never a dereference, never a fault.
+  result = cast[Il2CppPtr](0)
+  if list == nil or index < 0:
+    return
+  let arr = arrayOf(list)
+  if arr == nil:
+    return
+  let n = listBound(list, arr)
+  if index >= n:
+    return
+  let elemOff = ArrayDataOffset + int32(index) * 8'i32
+  if not sainReadable(arr, elemOff + 8):
+    return
+  var f = FieldBinding(ok: true, why: "Array[i]@0x20+i*8 (measured, fact #226)",
+                       target: "Il2CppArray element", offset: elemOff,
+                       kind: fkPtr, bindNs: 0'i64)
+  let p = readPtr(f, arr)
+  if p == nil:
+    return
+  # The element must itself be a readable managed object before it reaches the
+  # driver, which will call `get_IsAI`/`get_ProfileId` on it. A stale slot from
+  # a list being rebuilt is skipped here rather than faulting there.
+  if not sainReadable(p, 8):
+    return
+  result = p
 
 proc grenadeList*(world: Il2CppPtr): Il2CppPtr =
   ## The world's in-flight grenades, or null on a build that does not carry
