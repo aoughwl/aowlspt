@@ -514,6 +514,40 @@ class Resolver:
             self._fields_meta()
             self._find_metadata_registration()
 
+    def generic_container_index(self, t):
+        """Il2CppTypeDefinition.genericContainerIndex@+0x18, or -1 for a
+        non-generic type. Measured on this build: >= 0 for exactly the 1,569
+        types-with-instance-fields whose whole fieldOffsets array is zero, and
+        -1 for all 19,930 others -- no exceptions in either direction. It is
+        also strictly better than testing the name for a backtick, which
+        misclassifies 638 types (compiler display classes and nested generics
+        carry no backtick)."""
+        self._ensure_fields()
+        return struct.unpack_from("<i", self.m, self.TD_OFF + t*self.TDS + 24)[0]
+
+    def is_generic_definition(self, t):
+        return self.generic_container_index(t) >= 0
+
+    # The ONE place a field-offset table is decided, for the same reason
+    # sharedness() is (CLAUDE.md 9b). Three outcomes, never two:
+    #   ("concrete", file_offset)  the type has a real static layout
+    #   ("generic",  None)         an UNINSTANTIATED generic definition. IL2CPP
+    #                              writes an all-zero array here because the
+    #                              layout depends on the type arguments and is
+    #                              built at runtime in Il2CppClass setup. Those
+    #                              zeros are NOT offsets. Reading them as 0x0
+    #                              is a field read of the object header.
+    #   ("absent",   None)         fieldOffsets[t] is a null pointer
+    def field_offsets_base(self, t):
+        self._ensure_fields()
+        if self.is_generic_definition(t):
+            return ("generic", None)
+        entry = self.rq(self.FOFF_PTR + t*8)
+        base = self.v2f(entry) if entry else None
+        if base is None:
+            return ("absent", None)
+        return ("concrete", base)
+
     def _typename_va(self, tva, depth=0):
         """Readable name of the Il2CppType at VA `tva`."""
         if tva is None or depth > 4:
@@ -704,8 +738,7 @@ class Resolver:
         bb = self.TD_OFF + t*self.TDS
         fs = struct.unpack_from("<i", self.m, bb+32)[0]
         fc = struct.unpack_from("<H", self.m, bb+68)[0]
-        entry = self.rq(self.FOFF_PTR + t*8)
-        base = self.v2f(entry) if entry else None
+        layout, base = self.field_offsets_base(t)
         out = []
         for i in range(fc):
             ni, ti = struct.unpack_from("<ii", self.m, self.FLD_OFF + (fs+i)*12)
@@ -715,6 +748,7 @@ class Resolver:
             dv = self.field_default(fs + i)
             out.append({"fidx": fs + i, "name": self.s(ni), "off": off,
                         "attrs": attrs, "static": bool(attrs & 0x10),
+                        "layout": layout,
                         "literal": lit, "has_storage": not lit,
                         "typename": self.field_typename(ti),
                         "default": None if dv is None else dv[0]})
@@ -743,8 +777,7 @@ class Resolver:
         bb = self.TD_OFF + t*self.TDS
         fs = struct.unpack_from("<i", self.m, bb+32)[0]
         fc = struct.unpack_from("<H", self.m, bb+68)[0]
-        entry = self.rq(self.FOFF_PTR + t*8)
-        base = self.v2f(entry) if entry else None
+        _layout, base = self.field_offsets_base(t)
         out = []
         for i in range(fc):
             ni, ti = struct.unpack_from("<ii", self.m, self.FLD_OFF + (fs+i)*12)
@@ -863,12 +896,25 @@ def print_field_rows(rows):
     STORAGE (a C# `const` = LITERAL|STATIC|HASDEFAULT). It used to print 0x0
     there, which is a real offset for a real static and so made a const
     indistinguishable from a `static readonly` -- a distinction that decides
-    whether a field can be written at all."""
+    whether a field can be written at all.
+
+    It also prints `GENERIC` for a field of an UNINSTANTIATED generic
+    definition (``List`1``), where IL2CPP's fieldOffsets array is all zeros
+    because the layout is built per-instantiation at runtime. That case used
+    to render as a confident `0x0` for every field -- a caller obeying
+    CLAUDE.md 5's "never guess" got a fabricated offset that reads the object
+    header."""
     print("  %-8s %-34s %-30s %-40s %-22s %s" %
           ("Offset", "Field", "FieldType", "Attrs", "Const", "DeclaredBy"))
+    generic = False
     for r in rows:
         if not r["has_storage"]:
             off = "--"
+        elif r.get("layout") == "generic":
+            off = "GENERIC"
+            generic = True
+        elif r.get("layout") == "absent":
+            off = "ABSENT"
         elif r["off"] is None:
             off = "?"
         else:
@@ -878,6 +924,19 @@ def print_field_rows(rows):
               (off, r["name"], r["typename"],
                "%#06x %s" % (r["attrs"], "|".join(Resolver.attr_names(r["attrs"]))),
                "" if dv is None else repr(dv), r["declared_by"]))
+    if generic:
+        print("  GENERIC -- NO LAYOUT: this is an uninstantiated generic type "
+              "definition.")
+        print("  IL2CPP has no static field offsets for it (the fieldOffsets "
+              "array is all zeros);")
+        print("  a concrete layout exists only per instantiation, built at "
+              "runtime in Il2CppClass")
+        print("  setup, and is NOT in GameAssembly.dll -- every "
+              "Il2CppGenericClass.cached_class in")
+        print("  the file is null. This tool cannot give you List<int>'s "
+              "offsets; read them from a")
+        print("  LIVE object's klass, or take the layout from a verified "
+              "header and say it is borrowed.")
 
 
 def const_check(R):
