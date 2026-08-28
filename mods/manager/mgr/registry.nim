@@ -52,6 +52,19 @@ type
     provides*: seq[string]
     loadAfter*: seq[string]
     tags*: seq[string]
+    parent*: string
+      ## PRESENTATION ONLY. The id of the mod this one belongs UNDER in the
+      ## player-facing tree -- e.g. `aowl.morebots` and `aowl.waypoints` are
+      ## halves of `aowl.sain` ("Bot AI") and are not separate mods to a
+      ## player. Empty means root-level. Nothing in resolution reads it: a
+      ## child is resolved, ordered, required and loaded exactly as before,
+      ## and its guid, path, dll and routes are unchanged, so no stored
+      ## config path moves when a mod acquires a parent. It is a separate
+      ## axis from `internal`: `internal` says "do not draw this row at all",
+      ## `parent` says "draw it there". A parent id the registry does not
+      ## know is left as written and reported, never silently dropped --
+      ## making an unrecognised value disappear is the one outcome this must
+      ## not produce.
     internal*: bool
       ## PRESENTATION ONLY. True for infrastructure a player has no business
       ## seeing on the mod list -- the settings index, the fallback browser
@@ -229,7 +242,7 @@ proc readMod(j: JsonRef; warnings: var seq[string]): ModEntry =
                     sourceUrl: "", artifactDir: "", artifactLib: "",
                     license: "", downloadUrl: "", downloadHash: "",
                     requires: @[], conflicts: @[], provides: @[],
-                    loadAfter: @[], tags: @[],
+                    loadAfter: @[], tags: @[], parent: "",
                     internal: false, shipped: true)
   result.id = textOf(j.field("id"), "")
   if result.id.len == 0:
@@ -252,6 +265,7 @@ proc readMod(j: JsonRef; warnings: var seq[string]): ModEntry =
   result.provides = textList(j.field("provides"))
   result.loadAfter = textList(j.field("loadAfter"))
   result.tags = textList(j.field("tags"))
+  result.parent = textOf(j.field("parent"), "")
   result.internal = j.field("internal").asBool(false)
   result.shipped = j.field("shipped").asBool(true)
 

@@ -82,6 +82,7 @@ import std/syncio
 import aowlspt
 import aowlspt/server as sv
 import aowlspt/json as jr
+import aowlspt/settings # the F12 schema this mod declares, nested under Bot AI
 
 const
   ModGuid = "aowl.waypoints"
@@ -362,6 +363,44 @@ proc onStatus(url, body, session: string): string =
   root.put("tuning", done(tune))
   result = done(root).text
 
+# ---------------------------------------------------------------------------
+# Settings, rendered INSIDE the Bot AI page tree
+# ---------------------------------------------------------------------------
+#
+# This mod is a half of Bot AI to a player, not a mod of its own: patrol
+# geometry is bot behaviour. So it declares its rows with `inIndex = false` --
+# still served, still page-queryable and still writable, but claiming no
+# top-level entry in the F12 nav -- and `mods/sain` proxies them into its own
+# page under `Bot AI > Waypoints`.
+#
+# NOTHING ELSE MOVES. The guid stays `aowl.waypoints`, the routes stay
+# `/waypoints/*` and `/aowlspt/settings/aowl.waypoints`, and the value is
+# still persisted by THIS mod into `mods/waypoints/config.json` under the same
+# key it has always had. A write that arrives through the Bot AI page is
+# forwarded here over `SettingsApplyQuery` and lands on the same code path a
+# direct POST takes, so nesting moves no stored config path and needs no
+# migration -- exactly one owner per value.
+
+proc waypointsSchema(): seq[Setting] =
+  result = @[
+    boolSetting("patrolTuning", "Patrol pacing tuning", true,
+                category = "Bot AI/Waypoints", subcategory = "Patrols",
+                description = "Apply upstream SPT-Waypoints' server-side patrol pacing tweaks to bots.types.*.difficulty.*.Patrol at server start. Only keys this database already carries are written; the three names post-1.0 dropped are probed, skipped and listed on /waypoints/status. Read at load, so a change takes effect on the next server start -- the patrol point data itself is served either way.",
+                implemented = true)]
+
+proc onWaypointsSettings(url, body, session: string): string =
+  ## GET serves the schema; a POST body persists one edit into config.json.
+  ## The value is read at load, so the write is saved and applied at the next
+  ## server start rather than made live here.
+  var st = Ok
+  if body.len > 0:
+    st = applySettingFromBody(body)
+  result = declaredSchemaReply(st).text
+
+proc onWaypointsSettingsReset(url, body, session: string): string =
+  let st = resetFromBody(body)
+  result = declaredSchemaReply(st).text
+
 proc onLoad(): Status =
   if side() != sideServer:
     info ModName & " is a server mod; nothing to do on this side"
@@ -371,6 +410,9 @@ proc onLoad(): Status =
     tunePatrol()
   else:
     gTuneError = "disabled in config.json"
+  declareSettings(waypointsSchema(), inIndex = false)
+  discard serve("/aowlspt/settings/" & ModGuid, onWaypointsSettings)
+  discard serve("/aowlspt/settings/" & ModGuid & "/reset", onWaypointsSettingsReset)
   if serve(StatusRoute, onStatus) != Ok: warn "could not register " & StatusRoute
   if serve(MapsRoute, onMaps) != Ok: warn "could not register " & MapsRoute
   if servePrefix(PointsPrefix, onPoints) != Ok:

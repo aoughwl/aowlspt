@@ -481,6 +481,21 @@ proc isInternal(id: string): bool =
   if not findMod(gRegistry, id, idx): return false
   result = gRegistry.mods[idx].internal
 
+proc registryParent(id: string): string =
+  ## PRESENTATION ONLY -- `parent` in `registry/mods.json`. The mod this one
+  ## is drawn UNDER in the player-facing tree. Empty for a root-level mod AND
+  ## for an id the registry does not know: the same answer for two different
+  ## reasons, which is why the route carries the field only when it is
+  ## non-empty. An absent field means "claims no parent", never "the tree is
+  ## unknown". Nothing here reaches resolution -- a child is resolved,
+  ## ordered and loaded exactly as before, and its guid, path, dll, routes
+  ## and config.json are untouched, so nesting moves no stored value.
+  ## (Named `registryParent`, not `parentOf`: `parentOf` in this module is
+  ## the filesystem path helper and shadowing it would be a live bug.)
+  var idx = -1
+  if not findMod(gRegistry, id, idx): return ""
+  result = gRegistry.mods[idx].parent
+
 proc selectionDocument(): string =
   ## The resolved order, as the host would need it at startup.
   ##
@@ -792,6 +807,11 @@ proc decisionJson(d: Decision): JsonObject =
   # is the route that must never hide anything, so it names the rows the
   # player-facing panel omits rather than omitting them too.
   put(o, "internal", isInternal(d.id))
+  # The nesting the settings page renders, stated as data on the route that
+  # must never hide anything. Present only when non-empty -- see above.
+  let par = registryParent(d.id)
+  if par.len > 0:
+    put(o, "parent", par)
   # Same rule as the panel row: present only when the client host has actually
   # answered about this guid, so that absence stays the one way of saying "no
   # answer yet" on every route that carries it.
