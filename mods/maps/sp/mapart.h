@@ -258,16 +258,75 @@ static int32_t ma_rect_has(const MaRect* r, float mapX, float mapY)
 
 /* The single gate the caller asks before drawing anything. It exists so the
  * refusal is produced in ONE place and can therefore be printed by the diag in
- * the same words every time. `rot` is the pane rotation in radians. */
+ * the same words every time. `rot` is the pane rotation in radians.
+ *
+ * ROTATION IS NO LONGER REFUSED. The region gained a ROTATED textured quad
+ * (AOWL_REGION_CMD_QUADR, ABI 3): the renderer rotates the four dest corners
+ * about the pane centre and clips to the pane, so heading-up art registers
+ * against the blips instead of being misregistered. `rot` is therefore ignored
+ * here; a heading-up pane draws its art via `ma_tile_rect_rot` below rather
+ * than falling back to the labelled grid. MA_REFUSE_ROTATED is kept defined for
+ * ABI/diag stability but is never returned. */
 static int32_t ma_can_draw(const MaArt* a, int32_t hasPos, float rot)
 {
+    (void)rot;
     if (!hasPos) return MA_REFUSE_NOPOS;
     if (!a || !a->valid) return MA_REFUSE_NOMAP;
     if (a->nLayers <= 0) return MA_REFUSE_NOLAYER;
-    /* Not `rot != 0`: a heading of a few micro-radians is a measurement, not a
-     * rotation, and refusing on it would blank the art at random. */
-    if (rot > 0.001f || rot < -0.001f) return MA_REFUSE_ROTATED;
     return MA_OK;
+}
+
+/* HEADING-UP tile geometry. Unlike `ma_tile_quad`, this neither clips the dest
+ * rect nor narrows the UV: it returns the tile's UNCLIPPED north-up (rot=0)
+ * dest rect (dx,dy,dw,dh) with the full 0..1 UV implied, because the RENDERER
+ * rotates those four corners about the pane centre (rcos,rsin) and clips to the
+ * pane square (AOWL_REGION_CMD_QUADR). `rcos`/`rsin` are the SAME cos/sin the
+ * renderer will apply, so the cull here and the draw there agree by
+ * construction: rotating a rot=0 corner about the pane centre reproduces
+ * mm_topdown's heading-up projection exactly (proven in mapstest).
+ *
+ * Returns 1 with the rect filled when the tile's ROTATED bounding box overlaps
+ * the pane square (a cheap cull so an off-pane tile costs no command), 0 to
+ * skip. The v axis is already oriented: dy is placed from maxY (the TOP), so
+ * v=0 belongs to the top exactly as in ma_tile_quad. */
+static int32_t ma_tile_rect_rot(const MaRect* t, float cx, float cz,
+                                float px, float py, float size, float spanM,
+                                float rcos, float rsin,
+                                float* dx, float* dy, float* dw, float* dh)
+{
+    float scale, x0, x1, y0, y1, pcx, pcy;
+    float minx, miny, maxx, maxy, xs[4], ys[4];
+    int32_t i;
+    if (!t || !dx || !dy || !dw || !dh) return 0;
+    if (!(size > 0.0f) || !(spanM > 0.0001f)) return 0;
+    if (!(t->maxX > t->minX) || !(t->maxY > t->minY)) return 0;
+
+    scale = size / spanM;
+    x0 = px + size * 0.5f + (t->minX - cx) * scale;
+    x1 = px + size * 0.5f + (t->maxX - cx) * scale;
+    y0 = py + size * 0.5f - (t->maxY - cz) * scale;   /* maxY is the TOP */
+    y1 = py + size * 0.5f - (t->minY - cz) * scale;
+    if (!(x1 > x0) || !(y1 > y0)) return 0;
+    *dx = x0; *dy = y0; *dw = x1 - x0; *dh = y1 - y0;
+
+    /* Cull: rotate the four corners about the pane centre, take their AABB,
+     * test overlap with the pane square. */
+    pcx = px + size * 0.5f; pcy = py + size * 0.5f;
+    xs[0] = x0; ys[0] = y0; xs[1] = x1; ys[1] = y0;
+    xs[2] = x1; ys[2] = y1; xs[3] = x0; ys[3] = y1;
+    minx = miny = 1e30f; maxx = maxy = -1e30f;
+    for (i = 0; i < 4; i++) {
+        float ddx = xs[i] - pcx, ddy = ys[i] - pcy;
+        float rx = pcx + ddx * rcos - ddy * rsin;
+        float ry = pcy + ddx * rsin + ddy * rcos;
+        if (rx < minx) minx = rx;
+        if (rx > maxx) maxx = rx;
+        if (ry < miny) miny = ry;
+        if (ry > maxy) maxy = ry;
+    }
+    if (maxx < px || minx > px + size || maxy < py || miny > py + size)
+        return 0;                                     /* wholly off the pane */
+    return 1;
 }
 
 #endif /* AOWL_MAPART_H */

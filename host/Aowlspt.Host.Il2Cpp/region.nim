@@ -104,6 +104,7 @@ AOWL_RG_EXPORT int64_t aowl_region_texture_evictions_x(void) { return aowl_regio
 AOWL_RG_EXPORT int64_t aowl_region_frames_x(void) { return aowl_region_frames(); }
 AOWL_RG_EXPORT const AowlRegionTexSlot* aowl_region_texture_slot_x(int32_t i) { return aowl_region_texture_slot(i); }
 AOWL_RG_EXPORT int32_t aowl_region_quad_x(float x, float y, float w, float h, float u0, float v0, float u1, float v1, uint64_t k, uint32_t t) { return aowl_region_quad(x,y,w,h,u0,v0,u1,v1,k,t); }
+AOWL_RG_EXPORT int32_t aowl_region_quadr_x(float x, float y, float w, float h, float u0, float v0, float u1, float v1, uint64_t k, uint32_t t, float rc, float rs, float rpx, float rpy, float cx, float cy, float cw, float ch) { return aowl_region_quadr(x,y,w,h,u0,v0,u1,v1,k,t,rc,rs,rpx,rpy,cx,cy,cw,ch); }
 AOWL_RG_EXPORT int32_t aowl_region_commands_x(const AowlRegionCmd** o) { return aowl_region_commands(o); }
 AOWL_RG_EXPORT int32_t aowl_region_is_armed_x(void) { return aowl_region_is_armed(); }
 AOWL_RG_EXPORT int32_t aowl_region_count_x(void) { return aowl_region_count(); }

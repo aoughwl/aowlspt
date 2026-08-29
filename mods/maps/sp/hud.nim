@@ -707,6 +707,17 @@ static int32_t mhud_art_draw_pane(float px, float py, float size, float spanM,
 {
     int32_t r, li, why = MA_LAYER_NONE, i, drawn = 0;
     const MaLayer* L;
+    /* HEADING-UP art. When the pane is rotated the tiles are submitted as
+     * ROTATED textured quads (AOWL_REGION_CMD_QUADR): the renderer rotates each
+     * tile's four dest corners about the pane centre and clips to the pane
+     * square, so the baked art turns with the grid and the blips instead of
+     * being refused (the old MA_REFUSE_ROTATED fallback). The screen rotation is
+     * theta = -heading -- rotating a rot=0 corner about the pane centre by -h
+     * reproduces mm_topdown's heading-up projection exactly, so art, grid and
+     * blips share one transform. cos/sin are computed ONCE here, not per tile,
+     * and passed to the host so the overlay needs no trig. */
+    int32_t rotated = (rot > 0.001f || rot < -0.001f);
+    float rcos = 1.0f, rsin = 0.0f, pcx, pcy;
 
     r = ma_can_draw(&g_art.art, g_mhud.hasLocal, rot);
     if (r != MA_OK) { g_art.refusal = r; return 0; }
@@ -718,17 +729,39 @@ static int32_t mhud_art_draw_pane(float px, float py, float size, float spanM,
     g_art.layerLevel = g_art.art.layer[li].level;
     L = &g_art.art.layer[li];
 
+    if (rotated) {
+        rcos =  (float)cos((double)rot);   /* cos(-h) =  cos h */
+        rsin = -(float)sin((double)rot);   /* sin(-h) = -sin h */
+    }
+    pcx = px + size * 0.5f;
+    pcy = py + size * 0.5f;
+
     for (i = 0; i < L->nTiles && i < MA_MAX_TILES; i++) {
         int32_t slot = L->tile0 + i;
         float dx, dy, dw, dh, u0, v0, u1, v1;
+        int32_t sub;
         if (slot < 0 || slot >= g_art.art.nTiles) continue;
         if (!g_art.haveBytes[slot]) continue;
-        if (!ma_tile_quad(&g_art.art.tile[slot].world,
-                          g_mhud.px, g_mhud.pz, px, py, size, spanM,
-                          &dx, &dy, &dw, &dh, &u0, &v0, &u1, &v1))
-            continue;                                  /* off-pane, not an error */
-        if (aowl_region_quad(dx, dy, dw, dh, u0, v0, u1, v1,
-                             g_art.art.tile[slot].key, tint) == AOWL_REGION_OK)
+        if (rotated) {
+            if (!ma_tile_rect_rot(&g_art.art.tile[slot].world,
+                                  g_mhud.px, g_mhud.pz, px, py, size, spanM,
+                                  rcos, rsin, &dx, &dy, &dw, &dh))
+                continue;                              /* off-pane, not an error */
+            /* Full 0..1 UV: the tile texture spans the whole tile rect, and the
+             * dest rect is unclipped -- the renderer does the clipping. */
+            sub = aowl_region_quadr(dx, dy, dw, dh, 0.0f, 0.0f, 1.0f, 1.0f,
+                                    g_art.art.tile[slot].key, tint,
+                                    rcos, rsin, pcx, pcy,
+                                    px, py, size, size);
+        } else {
+            if (!ma_tile_quad(&g_art.art.tile[slot].world,
+                              g_mhud.px, g_mhud.pz, px, py, size, spanM,
+                              &dx, &dy, &dw, &dh, &u0, &v0, &u1, &v1))
+                continue;                              /* off-pane, not an error */
+            sub = aowl_region_quad(dx, dy, dw, dh, u0, v0, u1, v1,
+                                   g_art.art.tile[slot].key, tint);
+        }
+        if (sub == AOWL_REGION_OK)
             drawn++;
         else
             g_art.tilesRefused++;
@@ -829,15 +862,17 @@ static void mhud_draw(void* user, int64_t frame) {
      * `hasHeading` upstream (maps.nim discards the measurement when the setting
      * is OFF), so this one read gates the entire behaviour.
      *
-     * THE ART CANNOT ROTATE, and that is an ABI limit, not a choice. The region's
-     * textured QUAD is an axis-aligned dest rect with an axis-aligned UV rect: it
-     * can represent neither a rotated dest nor rotated UV sampling, and a
-     * 4-corner quad command is a host+overlay ABI change owned elsewhere. So when
-     * `rot` is non-zero `ma_can_draw` refuses the tiles (MA_REFUSE_ROTATED) and
-     * the pane falls back to the ROTATING labelled grid + blips. Heading-up
-     * therefore turns the world with a grid; north-up (heading off) shows the
-     * baked art. The diag's `art` line says which, by name, every tick -- it
-     * never degrades silently. Reported to the coordinator as the ABI gap it is.
+     * THE ART NOW ROTATES WITH THE PANE (region ABI 3). The region gained a
+     * ROTATED textured quad, AOWL_REGION_CMD_QUADR: `mhud_art_draw_pane` submits
+     * each tile's UNCLIPPED north-up rect plus the pane centre and cos/sin of
+     * -heading, and the overlay rotates the four dest corners about that centre
+     * and clips to the pane square. Because rotating a north-up corner about the
+     * pane centre by -heading reproduces mm_topdown's heading-up projection
+     * exactly, the baked art, the grid and the blips share one transform and a
+     * blip lands ON its art feature. Heading-up now turns the WORLD (art and
+     * all); north-up (heading off) is the same axis-aligned art as before. The
+     * diag's `art` line still says by name what happened, and never degrades
+     * silently -- but MA_REFUSE_ROTATED is no longer among the outcomes.
      *
      * `headRot` drives the player nub only. On a heading-up pane the player faces
      * UP by construction, so the nub points up (0); with no heading there is no
