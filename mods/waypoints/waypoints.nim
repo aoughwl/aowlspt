@@ -86,7 +86,7 @@ import aowlspt/settings # the F12 schema this mod declares, nested under Bot AI
 
 const
   ModGuid = "aowl.waypoints"
-  ModName = "Waypoints"
+  ModName = "Bot AI — Patrols"
   ModAuthor = "savannt"
   ModVersion = "1.0.0"
   DataSchema = "aowlspt.waypoints/1"
@@ -304,8 +304,8 @@ proc onPoints(url, body, session: string): string =
     for u in Unsupported:
       if u == want:
         return "{\"err\":\"no waypoint data for " & want &
-               "\",\"reason\":\"this location postdates SPT-Waypoints 1.3.4, " &
-               "which is the last release that shipped patrol points as JSON\"}"
+               "\",\"reason\":\"this location postdates the shipped patrol dataset, " &
+               "which is the last revision that carried patrol points as JSON\"}"
     return "{\"err\":\"no such map\",\"map\":\"" & want & "\"}"
   if gDocs[i].text.len == 0:
     return "{\"err\":\"data file missing or wrong schema\",\"map\":\"" &
@@ -384,8 +384,8 @@ proc onStatus(url, body, session: string): string =
 proc waypointsSchema(): seq[Setting] =
   result = @[
     boolSetting("patrolTuning", "Patrol pacing tuning", true,
-                category = "Bot AI/Waypoints", subcategory = "Patrols",
-                description = "Apply upstream SPT-Waypoints' server-side patrol pacing tweaks to bots.types.*.difficulty.*.Patrol at server start. Only keys this database already carries are written; the three names post-1.0 dropped are probed, skipped and listed on /waypoints/status. Read at load, so a change takes effect on the next server start -- the patrol point data itself is served either way.",
+                category = "Bot AI/Patrols", subcategory = "Patrols",
+                description = "Apply the shipped server-side patrol pacing tweaks to bots.types.*.difficulty.*.Patrol at server start. Only keys this database already carries are written; the three names post-1.0 dropped are probed, skipped and listed on /waypoints/status. Read at load, so a change takes effect on the next server start -- the patrol point data itself is served either way.",
                 implemented = true)]
 
 proc onWaypointsSettings(url, body, session: string): string =

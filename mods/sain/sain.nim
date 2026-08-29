@@ -1225,7 +1225,7 @@ proc runSelfTest(s: Settings): int =
     for line in dispatchFails:
       error "sain: " & line
   else:
-    success "sain: ORBIT dispatcher arithmetic, " &
+    success "sain: flanking dispatcher arithmetic, " &
             "distance and personality draw both check out"
   result = r.failed + dispatchFails.len + runCostReport(s)
 
