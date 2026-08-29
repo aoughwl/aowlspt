@@ -367,7 +367,29 @@ static const AowlNavTarget aowl_nav_targets[] = {
         0x57,
         0x48,0x83,0xEC,0x40,
         0x80,0x3D,0xEF,0xBD,0xE2,0x01 }, 16 },
+
+    /* ---- CLICK RECORDER. Which UI element the human just clicked.
+     *
+     * `EventSystem::get_current` is a STATIC getter (no `this`; the trailing
+     * MethodInfo* lands in RCX and NULL is fine -- it is not generic). It
+     * returns the singleton EventSystem, whose `currentSelectedGameObject`
+     * lives at [this+0x40] -- confirmed by that getter's own inlined body
+     * `48 8B 41 40 C3` (mov rax,[rcx+0x40]; ret), so the recorder reads the
+     * field directly and never has to call the FOLDED (shared) getter RVA.
+     * get_current is UNIQUE and a real body (measured: sharedness=UNIQUE,
+     * owners=1), so detour-blast-radius does not apply -- and we only CALL it.
+     * Resolved offline via tools/il2cpp_resolve.py (rid 1615). */
+    { "UnityEngine.EventSystems.EventSystem::get_current", 0x55C71E0u,
+      { 0x48,0x83,0xEC,0x28,
+        0x80,0x3D,0xC5,0x0F,0xB1,0x01,0x00,
+        0x75,0x3A,
+        0x48,0x8D,0x0D }, 16 },
 };
+
+/* EventSystem.m_CurrentSelected -> GameObject, from get_currentSelectedGameObject's
+ * inlined body `mov rax,[rcx+0x40]; ret` @0x6A9390. */
+#define AOWL_NAV_ES_CURSELECTED  0x040
+static int32_t aowl_nav_off_curselected(void) { return AOWL_NAV_ES_CURSELECTED; }
 
 /* ---- FIELD OFFSETS, corroborated by the accessors' own inlined bodies.
  *
