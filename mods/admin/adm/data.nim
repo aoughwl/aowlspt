@@ -110,6 +110,29 @@ const
                               ## independent of GameWorld+0x230, which can read
                               ## null on a frame and let self leak into the draw.
 
+  # ---- FACTION / SIDE ------------------------------------------------------
+  # The "all bots show as SCAV" bug (task 1) was a check that could ONLY ever
+  # say scav: the old code set the side purely from whether AIData was non-null
+  # -- every bot has AIData, so every bot read as scav and the REAL faction was
+  # never read at all (CLAUDE.md 9b). The real side lives on the Profile, not on
+  # the Player, and is reached through:
+  #     Player -> Profile -> Info(ProfileInfo) -> Side (EPlayerSide, i32 inline)
+  #                                            -> Settings(ProfileSettings) -> Role
+  # MEASURED 2026-08-28, each dump's mandatory System.String self-check
+  # (_stringLength@0x10 / _firstChar@0x14) PASSED so the offsets are trusted
+  # (CLAUDE.md 5):
+  #     python tools/fldoff.py fields EFT.Player          -> <Profile>@0x9C0
+  #     python tools/fldoff.py fields EFT.Profile         -> Info@0x48
+  #     python tools/fldoff.py fields EFT.ProfileInfo     -> <Side>@0x48, <Settings>@0x78
+  #     python tools/fldoff.py fields EFT.ProfileSettings -> Role@0x10
+  # EPlayerSide and WildSpawnType are enums (value types): the value__ is stored
+  # INLINE where the field sits, so each is a plain guarded i32 read, not a hop.
+  PlProfile         = 0x9C0   ## EFT.Player.<Profile>k__BackingField : Profile
+  ProfInfo          = 0x48    ## EFT.Profile.Info : ProfileInfo
+  PInfoSide         = 0x48    ## EFT.ProfileInfo.<Side> : EPlayerSide (i32 inline)
+  PInfoSettings     = 0x78    ## EFT.ProfileInfo.<Settings> : ProfileSettings
+  PSettingsRole     = 0x10    ## EFT.ProfileSettings.Role : WildSpawnType (i32 inline)
+
   # ---- EFT.MovementContext -------------------------------------------------
   # THERE IS NO POSITION FIELD HERE. `PreviousPosition` @0x370 used to be read
   # as "the real world position" and it is not: the offset is CORRECT (metadata
@@ -296,6 +319,17 @@ proc espProjectable*(): bool =
 # The world, borrowed from the host's existing RegisterPlayer detour
 # ---------------------------------------------------------------------------
 
+proc overlayMaskOpen*(): bool =
+  ## TODO(merge -- overlay mask). Returns whether a menu/settings overlay is
+  ## open, so ESP can suppress itself mid-raid. The host export
+  ## `aowl_ui_overlay_mask` (uint32 bitmask; bit0=game Settings, bit1=F6,
+  ## bit2=F3) does NOT exist on this branch yet, so this is a hard `false` stub
+  ## -- ESP is never suppressed by it today. When the export lands, wire it here
+  ## (resolve once, read per call, return mask != 0); DO NOT invent the export.
+  ## The single ESP call site is the `if overlayMaskOpen()` guard in
+  ## collectAndPublish.
+  false
+
 proc worldPtr(): pointer =
   ## The live GameWorld. We do NOT install our own detour: a second detour on
   ## one function overwrites the first's trampoline and silently kills the first
@@ -414,6 +448,65 @@ proc distance(ax, ay, az, bx, by, bz: float): float =
     d = 0.5 * (d + d2 / d); inc k
   result = d
 
+# ---------------------------------------------------------------------------
+# Faction, read from the REAL side field, not inferred from "is a bot".
+# ---------------------------------------------------------------------------
+
+# EPlayerSide literals, MEASURED from EFT.EPlayerSide:
+#     Usec = 1, Bear = 2, Savage = 4   (3 is unused -- note it is NOT 3).
+# PMC is Usec|Bear; scav is Savage.
+const
+  SideUsec   = 1'i32
+  SideBear   = 2'i32
+  SideSavage = 4'i32
+
+# WildSpawnType (EFT.WildSpawnType) literals used to refine a Savage into
+# scav / boss / raider / rogue. MEASURED from the enum's own constants
+# (`python tools/il2cpp_resolve.py ... fields WildSpawnType`). Only the values
+# that change the LABEL are named; everything else on the Savage side is an
+# ordinary scav.
+const
+  RoleRaider = 9'i32    ## pmcBot -- Raiders
+  RoleRogue  = 24'i32   ## exUsec -- Rogues
+  BossRoles  = [2'i32, 3, 6, 7, 11, 17, 20, 21, 22, 26, 29, 32, 36, 43, 47]
+                        ## bossTest,bossBully,bossKilla,bossKojaniy,bossGluhar,
+                        ## bossSanitar,sectantWarrior,sectantPriest,bossTagilla,
+                        ## bossKnight,bossZryachiy,bossBoar,bossBoarSniper,
+                        ## bossKolontay,bossPartisan
+
+proc isBossRole(r: int32): bool =
+  for b in BossRoles:
+    if b == r: return true
+  false
+
+proc factionOf(p: pointer): tuple[side: int32, label: string] =
+  ## The REAL faction, read Player -> Profile -> Info -> Side (EPlayerSide),
+  ## refining Savage via Settings.Role (WildSpawnType). Every hop is guarded
+  ## (rdPtr/rdI32 VirtualQuery first), so a stale offset or moved object is a
+  ## zero, never a fault. An UNREADABLE or genuinely-zero side returns
+  ## sideUnknown -- it does NOT fall back to scav. That is the whole point of
+  ## the fix (CLAUDE.md 9b): the previous code could only ever say scav for a
+  ## bot; this one distinguishes USEC/BEAR/scav/boss/raider/rogue AND can say
+  ## "unknown", so it is falsifiable.
+  result = (sideUnknown, "?")
+  let prof = rdPtr(p, PlProfile)
+  if prof == nil: return
+  let info = rdPtr(prof, ProfInfo)
+  if info == nil: return
+  let side = rdI32(info, PInfoSide)
+  case side
+  of SideUsec: return (sideEnemy, "USEC")
+  of SideBear: return (sideEnemy, "BEAR")
+  of SideSavage:
+    var role = -1'i32
+    let settings = rdPtr(info, PInfoSettings)
+    if settings != nil: role = rdI32(settings, PSettingsRole)
+    if isBossRole(role): return (sideBoss, "Boss")
+    if role == RoleRaider: return (sideBoss, "Raider")
+    if role == RoleRogue:  return (sideBoss, "Rogue")
+    return (sideScav, "Scav")
+  else: return (sideUnknown, "?")
+
 proc dataResolved*(): bool =
   ## ESP is live only when there is a world, a validated position read, AND a
   ## way to put a pixel on the screen. Drives the ESP capability bit, so the HUD
@@ -480,6 +573,46 @@ proc collectAndPublish*(s: AdminRegion; maxDistance: float; bbW, bbH: int) =
     gStatus = "player list empty/out of range (" & $n & ")"
     frameBegin(s, bbW, bbH); frameCommit(s); return
 
+  # LIFECYCLE GATE (task 3), mirrored from the maps mod's activeRaid()
+  # (mods/maps/sp/world.nim, commit d10c95d on fix-maps-lifecycle). The borrowed
+  # RegisterPlayer cache makes `world` non-null in the menu, during loading
+  # BEFORE the player spawns, and after extract (fact #141: whenReady(
+  # "EFT.GameWorld") goes true ~47ms after boot with NO raid). LocationId can
+  # likewise be answered from a stale cache, which is why maps uses it only to
+  # SELECT the map and NOT as the gate. The signal that goes false the instant
+  # the local player is not a spawned participant is membership in the LIVE
+  # AllAlivePlayersList -- the game's own "spawned and in-world" set. Require it
+  # before drawing, and idle (an empty committed frame -> 0 boxes) when absent,
+  # so ESP never draws in menu / loading / post-extract. `localPtr` is 0 when
+  # GameWorld+0x230 read null, in which case we cannot prove we are spawned and
+  # correctly treat it as not-in-raid rather than guessing.
+  var localAlive = false
+  if localPtr != 0'u64:
+    var j = 0
+    while j < n:
+      let q = rdPtr(items, ArrDataOff + j*8)
+      inc j
+      if q != nil and cast[uint64](q) == localPtr:
+        localAlive = true
+        break
+  gInRaid = localAlive
+  setInRaid(s, gInRaid)
+  if not localAlive:
+    gStatus = "world live but the local player is NOT in AllAlivePlayersList -- " &
+              "menu, loading-before-spawn, or post-extract, not an active raid"
+    frameBegin(s, bbW, bbH); frameCommit(s); return
+
+  # OVERLAY-MASK SUPPRESSION HOOK (task, coordinate item).
+  # TODO(merge): the host export `aowl_ui_overlay_mask` (uint32 bitmask;
+  # bit0=game Settings open, bit1=F6, bit2=F3) is NOT present in this branch.
+  # When it lands, replace `overlayMaskOpen()` below (defined near the top of
+  # this file as a `false` stub) with a read of that export so ESP hides while a
+  # menu/settings screen is open mid-raid. The single suppression point is the
+  # next two lines; nothing else needs changing.
+  if overlayMaskOpen():
+    gStatus = "in raid, but an overlay/menu mask is open -- ESP suppressed"
+    frameBegin(s, bbW, bbH); frameCommit(s); return
+
   frameBegin(s, bbW, bbH)
   # Snapshotted ONCE per frame, not per entity: the Unity-thread sampler can
   # flip readiness mid-loop, and half a frame of boxes is a worse artifact than
@@ -513,11 +646,14 @@ proc collectAndPublish*(s: AdminRegion; maxDistance: float; bbW, bbH: int) =
       dist = distance(hx, hy, hz, lx, ly, lz)
       if maxDistance > 0.0 and dist > maxDistance: continue
 
+    # AIData still tags the entity as AI for the overlay's flag, but it NO
+    # LONGER decides the side/label -- that is the check that could only ever
+    # say scav (task 1). The side is the REAL faction, read from the Profile.
     var flags = 0'u32
-    var side = sideEnemy
     if rdPtr(p, PlAIData) != nil:
       flags = flags or flagIsAI
-      side = sideScav
+    let fac = factionOf(p)
+    let side = fac.side
 
     if projecting:
       # The box: feet at the validated world position, head one standing height
@@ -539,8 +675,7 @@ proc collectAndPublish*(s: AdminRegion; maxDistance: float; bbW, bbH: int) =
       let cx = 0.5 * (bx + tx)
       if cx < float(-bbW) or cx > float(bbW * 2): continue
       flags = flags or flagOnScreen
-      frameAdd(s, cx, ty, by, -1.0, -1.0, dist, side, flags,
-               (if (flags and flagIsAI) != 0'u32: "Scav" else: "PMC"))
+      frameAdd(s, cx, ty, by, -1.0, -1.0, dist, side, flags, fac.label)
       published = published + 1
   gLastCount = published
   gLastSeen = seen
