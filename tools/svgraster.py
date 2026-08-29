@@ -79,6 +79,26 @@ NAMED = {
 }
 
 
+def _opacity(s):
+    """An opacity / fill-opacity / stroke-opacity value -> a float in [0,1].
+    Absent or unparseable reads as fully opaque (1.0), which is SVG's initial
+    value and the safe default: a bad opacity must never silently blank a shape.
+    A trailing '%' is honoured."""
+    if s is None:
+        return 1.0
+    s = s.strip().lower()
+    if not s:
+        return 1.0
+    try:
+        if s.endswith("%"):
+            v = float(s[:-1]) / 100.0
+        else:
+            v = float(s)
+    except ValueError:
+        return 1.0
+    return max(0.0, min(1.0, v))
+
+
 def parse_color(s, stats):
     """-> (r,g,b) or None for 'no paint'. An unrecognised paint is COUNTED."""
     if s is None:
@@ -415,8 +435,19 @@ class Canvas:
         self.h = h
         self.buf = bytearray(bytes(bg) * (w * h))
 
-    def fill_polys(self, polys, rgb, evenodd):
-        """Scanline-fill a set of subpaths as ONE shape (so holes work)."""
+    def fill_polys(self, polys, rgb, evenodd, alpha=1.0):
+        """Scanline-fill a set of subpaths as ONE shape (so holes work).
+
+        `alpha` is the effective paint opacity (opacity * fill-opacity, or the
+        stroke equivalent). At alpha >= 1 this is the original opaque write --
+        byte-for-byte, so opaque art is unchanged. Below 1 each covered texel is
+        SRC-OVER composited onto what is already there: dst = src*a + dst*(1-a).
+        This is why the Woods no-go zones -- declared `fill-opacity: .4` in the
+        source SVG and previously painted SOLID RED -- now bake as a translucent
+        red tint over the terrain. There is no alpha channel to carry forward
+        (the canvas is opaque RGB); the blend is resolved against the current
+        canvas at draw time, so ORDER matters and these overlays must be drawn
+        after the terrain they tint, which the SVG document order already is."""
         edges = []
         ymin, ymax = 1e30, -1e30
         for pts in polys:
@@ -433,11 +464,16 @@ class Canvas:
                 ymax = max(ymax, y0, y1)
         if not edges:
             return
+        if alpha <= 0.0:
+            return
         y0i = max(0, int(math.floor(ymin)))
         y1i = min(self.h - 1, int(math.ceil(ymax)))
         r, g, b = rgb
         buf = self.buf
         W = self.w
+        # Integer 0..256 blend weight; 256 is the opaque fast path.
+        ai = 256 if alpha >= 1.0 else max(0, min(256, int(alpha * 256.0 + 0.5)))
+        na = 256 - ai
         for y in range(y0i, y1i + 1):
             sy = y + 0.5
             xs = []
@@ -465,13 +501,20 @@ class Canvas:
             for (sa, sb) in spans:
                 a = max(0, int(math.ceil(sa - 0.5)))
                 bb = min(W - 1, int(math.floor(sb - 0.5)))
-                for x in range(a, bb + 1):
-                    o = base + x * 3
-                    buf[o] = r
-                    buf[o + 1] = g
-                    buf[o + 2] = b
+                if ai >= 256:
+                    for x in range(a, bb + 1):
+                        o = base + x * 3
+                        buf[o] = r
+                        buf[o + 1] = g
+                        buf[o + 2] = b
+                else:
+                    for x in range(a, bb + 1):
+                        o = base + x * 3
+                        buf[o] = (r * ai + buf[o] * na) >> 8
+                        buf[o + 1] = (g * ai + buf[o + 1] * na) >> 8
+                        buf[o + 2] = (b * ai + buf[o + 2] * na) >> 8
 
-    def stroke(self, pts, closed, rgb, width):
+    def stroke(self, pts, closed, rgb, width, alpha=1.0):
         """Stroke as a run of quads plus a square join at each vertex.
 
         Not a real join/cap model. At the widths in this art (fractions of a
@@ -493,12 +536,12 @@ class Canvas:
             nx, ny = -dy / L * hw, dx / L * hw
             self.fill_polys([[(x0 + nx, y0 + ny), (x1 + nx, y1 + ny),
                               (x1 - nx, y1 - ny), (x0 - nx, y0 - ny)]],
-                            rgb, False)
+                            rgb, False, alpha)
         if hw > 0.6:
             for (x, y) in pts:
                 self.fill_polys([[(x - hw, y - hw), (x + hw, y - hw),
                                   (x + hw, y + hw), (x - hw, y + hw)]],
-                                rgb, False)
+                                rgb, False, alpha)
 
     def downsample(self, ss):
         """ss x ss box downsample -> a new Canvas. This IS the anti-aliasing."""
@@ -712,26 +755,35 @@ def render(svg_text, width, height, bg=(20, 24, 30), supersample=3,
 
         # SVG's initial fill is black. An element with no fill declared anywhere
         # is therefore FILLED, not skipped -- getting this wrong empties a map.
+        # OPACITY. `props_of` already collected opacity / fill-opacity /
+        # stroke-opacity; before this they were read and then DROPPED, so a
+        # `fill-opacity: .4` overlay was baked SOLID -- the Woods no-go zones
+        # coming out as opaque red blobs was exactly this. The element `opacity`
+        # multiplies both paints; the per-paint opacity applies to its own paint.
+        op = _opacity(p.get("opacity"))
+        fillA = op * _opacity(p.get("fill-opacity"))
+        strokeA = op * _opacity(p.get("stroke-opacity"))
+
         fspec = p.get("fill", "black")
         fill = parse_color(fspec, stats)
         if fill == "PATTERN":
             fill = fallback_rgb
-        if fill is not None:
+        if fill is not None and fillA > 0.0:
             evenodd = (p.get("fill-rule", "nonzero").strip().lower() == "evenodd")
-            cv.fill_polys([pts for (pts, _) in dev], fill, evenodd)
+            cv.fill_polys([pts for (pts, _) in dev], fill, evenodd, fillA)
             stats.fills += 1
 
         stroke = parse_color(p.get("stroke"), stats)
         if stroke == "PATTERN":
             stroke = fallback_rgb
-        if stroke is not None:
+        if stroke is not None and strokeA > 0.0:
             try:
                 sw = float(_NUM_RE.findall(p.get("stroke-width", "1"))[0])
             except Exception:
                 sw = 1.0
             sw *= scale_of(m2)
             for (pts, cl) in dev:
-                cv.stroke(pts, cl, stroke, max(sw, 0.9))
+                cv.stroke(pts, cl, stroke, max(sw, 0.9), strokeA)
             stats.strokes += 1
 
     walk(root, base, {})

@@ -419,6 +419,27 @@ def selftest():
     chk(at(cv, 50, 50) == (0, 0, 0), "evenodd hole was filled")
     chk(at(cv, 20, 50) == (255, 255, 255), "evenodd ring body not filled")
 
+    # 7b. fill-opacity composites, it does not paint solid. A red rect at
+    #     fill-opacity .5 over a white ground must come out ~ (255,127,127) --
+    #     NOT (255,0,0). This is the Woods RED-blob bug: the no-go zones are
+    #     `fill-opacity: .4` and were baked opaque. Assert the FINISHED texel,
+    #     the negative ("it is not solid red") being the falsifiable half.
+    svg = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10">'
+           '<rect x="0" y="0" width="10" height="10" '
+           'style="fill: red; fill-opacity: .5"/></svg>')
+    cv, _ = svgraster.render(svg, 8, 8, bg=(255, 255, 255), supersample=1)
+    r, g, b = at(cv, 4, 4)
+    chk(r == 255 and 110 <= g <= 145 and 110 <= b <= 145,
+        "fill-opacity .5 red over white did not composite: %r" % ((r, g, b),))
+    chk((r, g, b) != (255, 0, 0), "fill-opacity was IGNORED (baked solid red)")
+    # A .4 opacity over white -> ~ (255,153,153), and 0 opacity paints nothing.
+    svg0 = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10">'
+            '<rect x="0" y="0" width="10" height="10" fill="red" '
+            'fill-opacity="0"/></svg>')
+    cv0, _ = svgraster.render(svg0, 8, 8, bg=(255, 255, 255), supersample=1)
+    chk(at(cv0, 4, 4) == (255, 255, 255),
+        "fill-opacity 0 still painted: %r" % (at(cv0, 4, 4),))
+
     # 8. tile_world_rect: row 0 is the TOP of the image, i.e. the HIGH-y end.
     ib = {"Min": {"x": -65.0, "y": -64.5}, "Max": {"x": 77.6, "y": 67.2}}
     t00 = tile_world_rect(ib, 2, 2, 0, 0)

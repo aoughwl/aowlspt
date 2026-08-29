@@ -137,6 +137,11 @@ var gLastErr = ""
 
 var gOpts: HudOpts
 var gHudOn = false
+var gFeedRunning = false
+  ## True once the client-side collector and publish timer are actually
+  ## registered (they are load-time registrations, so this cannot become true
+  ## from the apply hook). The hook uses it to tell "toggled off live" (which it
+  ## can honour now) apart from "toggled on live" (which still needs a relaunch).
 var gHeadingOn = false
   ## The `heading` setting. Flag-gated and default OFF, like everything else
   ## here. When off, the measured heading is DISCARDED at publish time rather
@@ -259,7 +264,7 @@ proc spatialSchema(): seq[Setting] =
                              "window governs a contact that has DROPPED OUT of " &
                              "the feed. 0 means gone the instant the hold ends"),
 
-    boolSetting("heading", "Rotate radar to facing", false, category = "HUD",
+    boolSetting("heading", "Rotate radar to facing", true, category = "HUD",
                 description = "Specified from the pre-1.0 BepInEx map/radar mods (no upstream code carried; map art and calibration provenance in mods/maps/data/maps/README.md). Rotate BOTH the radar and the map pane to " &
                               "the player's VIEW direction, from " &
                               "MovementContext._lookDirection @0x3D0 -- the " &
@@ -270,7 +275,11 @@ proc spatialSchema(): seq[Setting] =
                               "indicators. OFF means north-up. If the field " &
                               "ever reads all-zero the surfaces stay north-up " &
                               "and the diagnostic says so, rather than " &
-                              "rotating by a fake zero"),
+                              "rotating by a fake zero. NOTE: the region's " &
+                              "textured quad is axis-aligned, so heading-up " &
+                              "cannot rotate the baked ART -- the pane falls " &
+                              "back to the rotating labelled grid + blips while " &
+                              "rotating; turn this OFF to see the map artwork"),
     boolSetting("markers", "Loot / extract / corpse / quest markers", false,
                 category = "HUD", implemented = false,
                 description = "Specified from the pre-1.0 BepInEx map/radar mods (no upstream code carried; map art and calibration provenance in mods/maps/data/maps/README.md). Not collected: no field offset for any of those " &
@@ -450,7 +459,11 @@ proc onMainTick(payload: string): string =
   # Gated on an ACTIVE RAID (bug 1), not merely a validated pose: a stale
   # borrowed GameWorld cache in the menu can validate a pose but is not a raid,
   # and binding art there would upload tiles and paint an overlay off-raid.
-  if gHudOn and activeRaid(gSnap) and gSnap.localIdx >= 0 and gSnap.localIdx < gSnap.n:
+  # Only the MAP and RADAR panes render art; gate the tile IO/upload on one of
+  # them being on (bug 4). An indicator-only or all-off config used to slurp and
+  # upload a tile per tick for a surface nothing drew.
+  if gHudOn and (gOpts.map or gOpts.radar) and
+     activeRaid(gSnap) and gSnap.localIdx >= 0 and gSnap.localIdx < gSnap.n:
     artTick(gSnap.ents[gSnap.localIdx].x, gSnap.ents[gSnap.localIdx].z,
             gSnap.locationId)
   unlockMod()
@@ -524,8 +537,8 @@ proc mapsDiagText(): string =
   var lRegion = ""
   if not gHudOn:
     lRegion = "FAIL  the in-game HUD was never registered with the shared " &
-              "region (radar and indicators are both off in config.json, or " &
-              "registration was refused at load -- see the load line above)"
+              "region (radar, map and indicators are all off in config.json, " &
+              "or registration was refused at load -- see the load line above)"
   elif not hudArmed():
     lRegion = "FAIL  registered, but the region is NOT armed, so the draw " &
               "callback can never fire. Set host flag `sharedRegion`"
@@ -683,11 +696,26 @@ proc mapsDiagText(): string =
            (if gArtWhy.len > 0: "  [" & gArtWhy & "]" else: "") &
            "  loads=" & $gArtLoaded & " readFails=" & $gArtReadFails
 
+  # perf. The draw's own cost, in microseconds, measured on the render thread
+  # (bug 4). Reported only once the callback has drawn at least one frame; before
+  # that it is genuinely unmeasured, not "fast".
+  var lPerf = ""
+  if not gHudOn:
+    lPerf = "INCONCLUSIVE  no HUD registered, so nothing has been timed"
+  elif hudDrawn() <= 0'i64:
+    lPerf = "INCONCLUSIVE  the callback has not drawn yet, so its cost is unmeasured"
+  else:
+    lPerf = "last=" & $hudDrawUsLast() & "us avg=" & $hudDrawUsAvg() &
+            "us peak=" & $hudDrawUsPeak() & "us  tiles/frame=" & $hudTilesLast() &
+            " (budget " & $gOpts.budgetUs & "us; the region throttles this " &
+            "participant after 8 consecutive overruns)"
+
   result = "maps diag:\n" &
            "  region       : " & lRegion & "\n" &
            "  world        : " & lWorld  & "\n" &
            "  positions    : " & lPos    & "\n" &
            "  draw         : " & lDraw   & "\n" &
+           "  drawCost     : " & lPerf   & "\n" &
            "  screen       : " & lScreen & "\n" &
            "  projector    : " & lProj   & "\n" &
            "  heading      : " & lHdg    & "\n" &
@@ -708,6 +736,45 @@ proc onDiagTick(payload: string): string =
     info text
   result = ""
 
+proc onMapsApply(key: string) =
+  ## THE HOT-APPLY HOOK (bug 1). Before this proc existed maps registered NONE,
+  ## so an F12 edit reached config.json and stopped there: the live HUD kept
+  ## whatever it read at startup, and "turn the map off in settings" left the map
+  ## on screen (fact #213 -- settings queued and never applied). The draw reads
+  ## `mapOn`/`radarOn`/`indicatorsOn` from the C mirror every frame, so applying
+  ## an edit is just re-reading config and pushing it back into that mirror.
+  ##
+  ## The verdict is reported honestly (settingApplied / -Restart / -Ignored) so
+  ## the host log distinguishes "in force now" from "stored, relaunch needed"
+  ## from "stored but nothing draws it".
+  if side() != sideClient:
+    settingIgnored("this is the server instance; the client instance owns the HUD")
+    return
+  let nowEnabled = asBool(setting("enabled"), false)
+  loadHudOpts()                       # refresh gOpts + gHeadingOn from config
+  let live = nowEnabled and gFeedRunning
+  hudReconfigure(gOpts, live)         # next frame honours it; no position reset
+  if key == "enabled":
+    if nowEnabled and not gFeedRunning:
+      settingAppliesOnRestart("the position collector is only registered at " &
+        "load; relaunch with enabled=true to start the feed")
+      return
+    gEnabled = nowEnabled             # gates onMainTick/onPublishTick live
+    if nowEnabled:
+      settingApplied("feed ON")
+    else:
+      settingApplied("feed OFF -- HUD blanked (0 tiles, 0 blips)")
+    return
+  if not (gEnabled and gFeedRunning and
+          (gOpts.radar or gOpts.indicators or gOpts.map)):
+    settingIgnored("stored; nothing is drawn because the feed is off or every " &
+      "HUD surface (radar/map/indicators) is off")
+    return
+  settingApplied("radar=" & $gOpts.radar & " map=" & $gOpts.map &
+                 " indicators=" & $gOpts.indicators & " heading=" & $gHeadingOn &
+                 (if gHeadingOn: " (heading-up: art refuses, grid+blips rotate)"
+                  else: " (north-up: baked art drawn)"))
+
 proc onLoad(): Status =
   gEnabled = asBool(setting("enabled"), false)
   gHz = asInt(setting("hz"), 10)
@@ -719,6 +786,10 @@ proc onLoad(): Status =
   # Declared on BOTH sides, before the split -- see the block above `loadHudOpts`
   # for why that is what puts this client-side feature into the F12 nav.
   declareSettings(spatialSchema())
+  # Register the hot-apply hook UNCONDITIONALLY and before the enabled gate, so
+  # a live F12 edit is always either applied or honestly reported -- never
+  # silently dropped, which is the whole of bug 1.
+  onSettingsApplied(onMapsApply)
   discard serve("/aowlspt/settings/" & ModGuid, onSpatialSettings)
 
   if side() == sideServer:
@@ -756,6 +827,7 @@ proc onLoad(): Status =
     warn ModName & ": collector registered but the publish timer did not; " &
          "positions are being read and nothing is being written."
     return Ok
+  gFeedRunning = true
 
   # The in-game draw. It rides the SHARED region (abi/aowlspt_region.h) as one
   # more participant on the existing PreloaderUI::Update rider chain -- it does
@@ -764,7 +836,11 @@ proc onLoad(): Status =
   # always succeeds, and a registered participant on an unarmed region simply
   # never fires. Flattening those two into "the radar is on" would be a claim
   # that cannot be falsified.
-  if gOpts.radar or gOpts.indicators:
+  # Register when ANY surface is on -- map included. The map draw is gated on
+  # `mapOn` inside the callback, so a map-only config must still register the
+  # participant; the earlier `radar or indicators` gate silently denied the map
+  # its own callback whenever the radar happened to be off.
+  if gOpts.radar or gOpts.indicators or gOpts.map:
     hudInit(gOpts)
     var whyHud = ""
     if hudRegister(gOpts, whyHud):
@@ -772,7 +848,7 @@ proc onLoad(): Status =
       if hudArmed():
         success ModName & ": in-game HUD registered with the shared region " &
                 "and the region is ARMED -- radar=" & $gOpts.radar &
-                " indicators=" & $gOpts.indicators
+                " map=" & $gOpts.map & " indicators=" & $gOpts.indicators
       else:
         warn ModName & ": in-game HUD registered, but the shared region is " &
              "NOT armed, so the callback will never fire and nothing will be " &
