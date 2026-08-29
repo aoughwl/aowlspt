@@ -151,6 +151,28 @@ var gClientPages: seq[ClientPage] = @[]
 var gClientPending: seq[string] = @[]   ## queued edits, oldest first
 var gClientSyncs = 0
 
+# The assembled `/aowlspt/settings/index` reply, cached.
+#
+# WHY. Every GET of that route used to rebuild the whole list by broadcasting
+# `SettingsIndexQuery` to every server mod AND running `panelRefresh()` (a
+# second `SettingsPageQuery` broadcast) purely to count the panel's rows -- on
+# EVERY request. The overlay/settings surface polls this route continuously at
+# an idle main menu (measured), so that was a fan-out to every declaring mod,
+# several times a second, producing nothing new: the server-side half of the
+# index is STATIC after load (`count`/`done` come from the declared schema, not
+# from values -- see `onIndexQuery` in aowlspt/settings) and the panel's row
+# count only changes when uihub re-declares, which it never does at runtime.
+#
+# So the ONLY input that can change the reply at runtime is `gClientPages`,
+# pushed over `/settings/client/sync`. The cache is invalidated there, and only
+# when a push actually DIFFERS from what that guid last sent -- an unchanged
+# re-push (the bridge's 5s idle heartbeat) leaves the cache valid, so a truly
+# idle menu serves this route from memory with no broadcast at all. A real
+# settings change still propagates: it flips `gClientCacheValid` the moment the
+# owning value moves, so the next poll rebuilds.
+var gIndexCache = ""
+var gIndexCacheValid = false
+
 proc clientIndexOf(guid: string): int =
   result = -1
   for i, p in gClientPages:
@@ -177,9 +199,17 @@ proc onClientSync(url, body, session: string): string =
   if pg.rows.len == 0: pg.rows = "[]"
   let i = clientIndexOf(pg.guid)
   if i >= 0:
-    pg.pushes = gClientPages[i].pushes + 1
+    # Only a CHANGE to what the index actually shows (name/count/done) or to the
+    # rows invalidates the cache. An identical re-push -- the bridge's idle
+    # heartbeat -- must not, or the cache would rebuild every 5s for nothing.
+    let prev = gClientPages[i]
+    if prev.name != pg.name or prev.count != pg.count or
+       prev.done != pg.done or prev.rows != pg.rows:
+      gIndexCacheValid = false
+    pg.pushes = prev.pushes + 1
     gClientPages[i] = pg
   else:
+    gIndexCacheValid = false   # a new guid always changes the list
     pg.pushes = 1
     gClientPages.add pg
   root.put("ok", true)
@@ -459,6 +489,13 @@ proc onModsIndex(url, body, session: string): string =
   ## a client transport also carries this page, as `client:true`. So the list
   ## stays exactly as long as the number of DISTINCT mods declaring settings,
   ## which is the property `tools/settingsdump.py` asserts.
+  ##
+  ## Served from cache when nothing that affects the reply has changed since it
+  ## was last built -- see `gIndexCache`. This is what keeps an idle main menu
+  ## quiet: the poll still arrives, but it no longer fans a `SettingsIndexQuery`
+  ## and a `SettingsPageQuery` out to every mod on every request.
+  if gIndexCacheValid and gIndexCache.len > 0:
+    return gIndexCache
   gAnnounced = @[]
   discard emit(settings.SettingsIndexQuery, "")
   var guids: seq[string] = @[]
@@ -510,6 +547,13 @@ proc onModsIndex(url, body, session: string): string =
   var root = obj()
   root.put("mods", a)
   result = done(root).text
+  # Cache only a list that actually gathered mods. An empty list means the
+  # server-side broadcast raced mod load (or nothing declared yet); caching that
+  # would pin an empty nav until the next client push. A non-empty list is the
+  # steady state and is what the idle poll should be served from.
+  if guids.len > 0:
+    gIndexCache = result
+    gIndexCacheValid = true
 
 proc onLoad(): Status =
   if side() != sideServer:
