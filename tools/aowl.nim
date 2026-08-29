@@ -57,6 +57,12 @@ aowl -- build, test and install aowlspt
 
 Options
   --debug            build with debug info and no optimisation
+  --fast             host inner-loop: gcc at -O0 not -O1 for `build host`.
+                     Shaves the gcc step; the gates and every nimony pass are
+                     UNCHANGED, so it is a few seconds, not a rewrite -- the
+                     real cost is nimony's whole-program dceLive over the
+                     include-merged host module. Dev only; a release build
+                     (no --fast) stays -O1.
   --nimony PATH      nimony checkout (default: %USERPROFILE%\nimony)
   --ucrt64 PATH      msys2 ucrt64 bin (default: C:\msys64\ucrt64\bin)
   -v, --verbose      show every command
@@ -69,6 +75,7 @@ type
     nimony: string
     ucrt64: string
     debugBuild: bool
+    fastBuild: bool
     verbose: bool
 
 var failures = 0
@@ -591,6 +598,13 @@ proc buildIl2CppHost(e: Env): bool =
   cmd.add abiInclude(e)
   if e.debugBuild:
     cmd.add " -d:debug"
+  if e.fastBuild:
+    # Inner-loop only: drop gcc to -O0. This trims the `cc` step (~12s -> ~5s
+    # here); it does NOT touch a single gate, nor any nimony pass, so it is a
+    # few seconds and no more -- the build's real cost is nimony's whole-program
+    # dceLive over the include-merged host module, which no flag here reaches.
+    # A release build (without --fast) stays at nimony's default -O1.
+    cmd.add " --opt:none"
   cmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
   cmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
   cmd.add " -p:" & quoted(joinPath(e.repo, "host\\common"))
@@ -3156,7 +3170,7 @@ proc cmdClean(e: Env): int =
 
 proc main(): int =
   var e = Env(repo: "", nimony: "", ucrt64: "C:\\msys64\\ucrt64\\bin",
-              debugBuild: false, verbose: false)
+              debugBuild: false, fastBuild: false, verbose: false)
   e.repo = repoRoot()
   e.nimony = joinPath(getEnv("USERPROFILE", "C:\\"), "nimony")
 
@@ -3176,6 +3190,8 @@ proc main(): int =
       extra.add a
     elif a == "--debug":
       e.debugBuild = true
+    elif a == "--fast":
+      e.fastBuild = true
     elif a == "--nimony":
       inc i
       if i <= n: e.nimony = paramStr(i)
