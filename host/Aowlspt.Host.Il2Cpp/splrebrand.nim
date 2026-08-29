@@ -86,6 +86,16 @@ const
   SplHeadStock    = "practice game mode"
   SplDescStock    = "in this mode"
   SplToggleStock  = "enable practice mode for this raid"
+  # ---- the co-op / Edge-of-Darkness "your progress is not saved/shared"
+  # warning, hidden whole. Matched by DISPLAYED TEXT within THIS screen only
+  # (the global findtext could never surface it -- the 16-root search exhausted
+  # its node budget every time). The predicate is deliberately narrow so it can
+  # NEVER catch the unrelated weapon warning "ATTENTION! Your weapon doesn't
+  # have the required vital part": it requires "progress" AND a corroborating
+  # co-op/not-saved token, AND explicitly EXCLUDES "vital part"/"weapon".
+  SplWarnStock    = "progress"
+  SplWarnExclA    = "vital part"
+  SplWarnExclB    = "weapon"
   # ---- what we replace them with. Factual; no persistence claim. ----
   SplHeadNew      = "SINGLEPLAYER"
   SplDescNew      = "aowlspt - a local single-player raid against the emulated server."
@@ -115,6 +125,7 @@ const
   SplFindDepth    = 8          ## depth for the screen-by-name descent.
   SplScanDepth    = 12         ## depth for the by-text scan within the screen.
   SplBlockerUp    = 5          ## how far to climb from the toggle label to the blocker.
+  SplWarnUp       = 4          ## how far to climb from the warning TMP to its panel container.
   SplMaxFaults    = 3
 
 # ---- the guarded-body thunk (ONE aowl_p_p_seh, never nested) ----
@@ -143,6 +154,11 @@ var gSplCheckGo: Il2CppPtr = nil   ## the SoloModeCheckmarkBlocker GameObject
 var gSplToggle: Il2CppPtr = nil    ## the EFT.UI.UpdatableToggle component (a Toggle)
 var gSplForceRefused = false       ## set_isOn did not verify; box left VISIBLE
 var gSplForceRefusedLogged = false
+var gSplWarnGo: Il2CppPtr = nil    ## the co-op/EoD "progress" warning container to hide
+var gSplWarnText = ""              ## the matched displayed text (evidence for the readback)
+var gSplWarnName = ""              ## name of the node we hide (container or the TMP node)
+var gSplWarnMatched = false        ## a valid co-op/progress text match was found this discovery
+var gSplWarnRefused = false        ## screen resolved but NO co-op/progress warning matched
 var gSplConfirmed = false          ## finished-state assertion has passed+logged
 var gSplSummaryLogged = false
 
@@ -310,6 +326,43 @@ proc splFindScreen(): Il2CppPtr =
       if m != nil: return m
     i = i + 1
 
+proc splIsCoopWarn(low: string): bool =
+  ## True only for the co-op / Edge-of-Darkness "your progress is not saved/
+  ## shared" warning. Requires "progress" AND a corroborating token, and hard-
+  ## EXCLUDES the weapon warning ("...your weapon doesn't have the required
+  ## vital part") so it can never hide the wrong node. `low` is already lowered.
+  if not iContains(low, SplWarnStock): return false
+  if iContains(low, SplWarnExclA) or iContains(low, SplWarnExclB): return false
+  result = iContains(low, "not") or iContains(low, "co-op") or
+           iContains(low, "coop") or iContains(low, "shared") or
+           iContains(low, "saved") or iContains(low, "edge of darkness")
+
+proc splWarnContainer(t: Il2CppPtr; nameOut: var string): Il2CppPtr =
+  ## Climb up to `SplWarnUp` levels toward the warning-panel container and return
+  ## its GameObject, mirroring the SoloModeCheckmarkBlocker climb. Falls back to
+  ## the matched TMP node's OWN GameObject if no named panel is found -- so it
+  ## always hides the matched warning, never a random sibling. Every hop guarded.
+  result = nil
+  nameOut = ""
+  # default target: the matched node's own GameObject (hides at least the line).
+  let selfGo = iGameObjectOf(t)
+  if selfGo != nil and duOk(selfGo, 0x20'i32):
+    result = selfGo
+    nameOut = iObjName(t)
+  var up = t
+  var k = 0
+  while k < SplWarnUp and up != nil and duOk(up, 0x20'i32):
+    let low = iLower(iObjName(up))
+    if iContains(low, "warn") or iContains(low, "progress") or
+       iContains(low, "panel"):
+      let go = iGameObjectOf(up)
+      if go != nil and duOk(go, 0x20'i32):
+        result = go
+        nameOut = iObjName(up)
+      break
+    up = splParent(up)
+    k = k + 1
+
 proc splScanNode(t: Il2CppPtr; depth: int; budget: var int; deadline: uint64) =
   ## DFS the screen subtree; at each node read its TMP text and, by CONTENT,
   ## fill whichever of the three targets it is. Bounded exactly like the name
@@ -345,6 +398,18 @@ proc splScanNode(t: Il2CppPtr; depth: int; budget: var int; deadline: uint64) =
             break
           up = splParent(up)
           k = k + 1
+      # The co-op / EoD "progress is not saved/shared" warning is an INDEPENDENT
+      # target (its text collides with none of the three above), so this is its
+      # own `if`, not part of the elif chain. Matched by content, weapon warning
+      # excluded, container taken by climbing like the checkbox blocker.
+      if gSplWarnGo == nil and splIsCoopWarn(low):
+        var wn = ""
+        let wg = splWarnContainer(t, wn)
+        if wg != nil:
+          gSplWarnGo = wg
+          gSplWarnText = low
+          gSplWarnName = wn
+          gSplWarnMatched = true
   if depth == 0: return
   var n = 0
   if not iChildCount(t, n): return
@@ -411,6 +476,20 @@ proc splMaintain() =
     else:
       hideState = 0
 
+  # Co-op / Edge-of-Darkness "progress is not saved/shared" warning -- hide the
+  # whole container (content-discovery + SetActive, no write into game code).
+  # Assert the FINISHED STATE (activeInHierarchy == false), not that SetActive
+  # was called. If the screen resolved but nothing matched the co-op/progress
+  # predicate, REFUSE -- never hide a random node.
+  var warnState = 3   # 3 not-found-yet, 2 REFUSED, 1 PASS (hidden), 0 acting/FAIL
+  if gSplWarnGo != nil and duOk(gSplWarnGo, 0x20'i32) and iUnityAlive(gSplWarnGo):
+    if nuActiveInHierarchy(gSplWarnGo):
+      discard nuSetActive(gSplWarnGo, false)
+    warnState = (if not nuActiveInHierarchy(gSplWarnGo): 1 else: 0)
+  elif not gSplWarnMatched:
+    gSplWarnRefused = true
+    warnState = 2
+
   # Finished-state summary, once, when the heading has taken. The two lines the
   # coordinator asked for are logged explicitly, plus a combined per-target line.
   if headOk and not gSplSummaryLogged:
@@ -432,6 +511,17 @@ proc splMaintain() =
                "REFUSED (isOn readback did not match -- box left VISIBLE)"
              else: "INCONCLUSIVE (no practice checkbox found)"))
     okLog "singleplayer: hide: " & hideStr
+    let warnStr = (case warnState
+      of 1: "PASS"
+      of 0: "FAIL (SetActive(false) issued but node still activeInHierarchy)"
+      of 2: "REFUSED (no co-op/progress warning matched on this screen -- " &
+            "nothing hidden; the weapon \"vital part\" warning is excluded)"
+      else: "INCONCLUSIVE (warning not present yet)")
+    let warnEvidence = (if gSplWarnMatched:
+      " (matched text contains \"progress\"+co-op token, weapon warning " &
+      "excluded; hid container \"" & gSplWarnName & "\")"
+      else: "")
+    okLog "singleplayer: coop-warning hidden " & warnStr & warnEvidence
     let descStr = (case descState
       of 1: "PASS"
       of 0: "FAIL (re-applying)"
@@ -439,10 +529,10 @@ proc splMaintain() =
     okLog "singleplayer rebrand: FINISHED-STATE readback -- heading: PASS " &
           "(the rendered TMP no longer reads \"PRACTICE GAME MODE\"); " &
           "description: " & descStr & "; forced isOn: " & forceStr &
-          "; hide: " & hideStr & ". This asserts the live tree, not that a " &
-          "setter ran."
+          "; hide: " & hideStr & "; coop-warning: " & warnStr &
+          ". This asserts the live tree, not that a setter ran."
     gSplSummaryLogged = true
-    if descState != 0 and forceState == 1 and hideState == 1:
+    if descState != 0 and forceState == 1 and hideState == 1 and warnState != 0:
       gSplConfirmed = true
 
 # ---------------------------------------------------------------------------
@@ -464,6 +554,8 @@ proc splRebrandTickBody(a: Il2CppPtr): Il2CppPtr {.
     gSplCheckGo = nil
     gSplToggle = nil
     gSplForceRefused = false
+    gSplWarnGo = nil; gSplWarnText = ""; gSplWarnName = ""
+    gSplWarnMatched = false; gSplWarnRefused = false
     gSplConfirmed = false
     gSplSummaryLogged = false
 
@@ -483,6 +575,9 @@ proc splRebrandTickBody(a: Il2CppPtr): Il2CppPtr {.
           (if gSplCheckGo != nil: "found" else: "NOT found") &
           ", UpdatableToggle component " &
           (if gSplToggle != nil: "found" else: "NOT found") &
+          ", co-op/progress warning " &
+          (if gSplWarnGo != nil: "found (\"" & gSplWarnName & "\")"
+           else: "not found") &
           ". Walking from the live scene root, by displayed text -- no " &
           "hardcoded child path."
 
