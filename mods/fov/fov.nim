@@ -3698,6 +3698,27 @@ var gPending = false
 var gPendingMs = 0'i64
 var gPollMs = 0'i64
 var gDeferSaid = false
+var gInertSaid = false
+
+proc anyFovEffectEnabled(): bool =
+  ## Does this run have ANY effect to arm?
+  ##
+  ## Every effect in this mod is one of three flags: `enableFovWrite` drives the
+  ## per-frame FOV write (and, through `applyFov`, the zoom poll); `enableFovScaleFix`
+  ## arms the viewmodel-scale patch; `changeMouseSensitivity` arms both sensitivity
+  ## patches. With all three OFF there is nothing to arm and nothing to drive.
+  ##
+  ## `verifyHooksByName` is DELIBERATELY not in this set. `onUpdate` runs only on the
+  ## client (it early-returns on every other side), and on the client every `watch`
+  ## declines outright -- a by-name host detour is fatal when USED (facts #198/#145) --
+  ## so the diagnostic counts nothing here regardless. Letting it trigger the arm would
+  ## pay the one-time ~4.3 ms `onWorldReady` cost (openRuntime + seven by-name type
+  ## resolves + seven prologue verifies + four arm procs that all immediately no-op) to
+  ## produce a page of "watch DECLINED" lines and nothing else. Measured: with all
+  ## three effects off the host attributes `mod aowl.fovfix 4.386 ms x92 peak 4.263 ms`
+  ## -- essentially ALL of it that one arm firing (the other 91 onUpdate ticks summed
+  ## ~0.12 ms). Gating the arm on a real effect drops that peak to nothing.
+  cfgEnableFovWrite or cfgEnableFovScaleFix or cfgChangeMouseSensitivity
 
 proc onUpdate(elapsedMs: int64): Status =
   if side() != sideClient:
@@ -3721,7 +3742,31 @@ proc onUpdate(elapsedMs: int64): Status =
   # falsified: if a run with `deferUntilUnityThread` on still dies at ~1.4s in
   # `openRuntime`, the thread was never the cause and the breadcrumbs there say
   # which sub-step it was instead.
-  if world.ready():
+  # The whole arm is gated on there being something to arm. `world.ready()` is a
+  # one-shot (true on exactly the first tick the type resolves), so this branch runs
+  # at most once per run -- but it is where the ~4.3 ms `onWorldReady` cost lives, and
+  # paying it to arm four effects that are all switched off is the top FPS cost this
+  # mod ever showed in a live raid, for no visible effect. With every effect off the
+  # mod stays fully inert: nothing is resolved, nothing is verified, nothing is
+  # patched, and the per-frame cost is a single one-shot boolean read.
+  # `world.ready()` is a one-shot -- it returns true on exactly the first tick the
+  # type resolves and false forever after -- so it MUST be read once per frame, into
+  # a local, or a second read consumes the edge and the arm never happens.
+  let worldReady = world.ready()
+  if worldReady and not anyFovEffectEnabled():
+    if not gInertSaid:
+      gInertSaid = true
+      gFovState = "inert: enableFovWrite, enableFovScaleFix and " &
+                  "changeMouseSensitivity are all off, so nothing was armed " &
+                  "(no runtime bind, no RVA verify, no patch). Turn one on to arm."
+      gScaleState = gFovState
+      gSensState = gFovState
+      gAimSensState = gFovState
+      gDriverState = gFovState
+      info "FOV: all effects are disabled; not arming. This mod is inert this " &
+           "run and costs ~0 -- the ~4.3 ms one-time arm is skipped. Enable " &
+           "enableFovWrite / enableFovScaleFix / changeMouseSensitivity to arm."
+  elif worldReady:
     if not cfgDeferUntilUnityThread:
       info "FOV: deferUntilUnityThread is off; arming immediately on the " &
            "host's own thread, which is what the 2026-08-25 crash did"
