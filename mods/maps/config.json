@@ -22,7 +22,7 @@
   "indicatorHoldMs": 400,
   "indicatorFadeMs": 1600,
 
-  "_notImplementedYet": "heading and markers are declared implemented=false in maps.nim and the settings UI marks them so -- they are NOT silent no-ops. They are given a path here anyway so the player's choice survives a restart and is already in place the day the missing measurement lands: heading needs a bot/player facing out of sp/world.nim (none is measured, so radar and map pane are north-up and say so), and markers needs a field offset for the loot/extract/corpse/quest lists on build 1.1.0.1.46777 (none has been measured). Both captions are deploy markers in tools/deploy.json, so the rows are not removable without moving those.",
-  "heading": false,
+  "_notImplementedYet": "markers is still declared implemented=false in maps.nim and the settings UI marks it so -- it is NOT a silent no-op: it needs a field offset for the loot/extract/corpse/quest lists on build 1.1.0.1.46777 (none has been measured). heading IS now implemented: the player VIEW facing is measured (MovementContext._lookDirection) and rotates both surfaces heading-up. One ABI limit remains and is stated in the schema and the diag: the region's textured quad is axis-aligned, so heading-up cannot rotate the baked map ART and falls back to a rotating grid+blips; turn heading OFF to see the artwork north-up.",
+  "heading": true,
   "markers": false
 }

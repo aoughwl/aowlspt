@@ -158,6 +158,14 @@ static struct {
     int64_t  indFaded, indExpired, indStale;
     int32_t  screenFromRegion; /* 1 = measured back buffer, 0 = config guess */
     int32_t  handle;
+    /* PER-FRAME DRAW COST (bug 4), measured in microseconds on the render thread
+     * with QPC. `drawUsLast` is the most recent submit, `drawUsPeak` the worst
+     * seen, `drawUsEwma` a smoothed average (1/16 step). The diag reports these
+     * so "maps is slow on Woods" is a number, not a hunch -- and so a frame that
+     * drew NOTHING (gated off) can be told from one that drew and was cheap. */
+    int64_t  drawUsLast, drawUsPeak;
+    double   drawUsEwma;
+    int32_t  tilesLastFrame;   /* tiles submitted on the most recent drawn frame */
 } g_mhud;
 
 /* THE CLOCK. `GetTickCount64` is declared here rather than by including
@@ -177,8 +185,22 @@ static struct {
 #if defined(_WIN32)
 __declspec(dllimport) unsigned long long __stdcall GetTickCount64(void);
 static int64_t mhud_now_ms(void) { return (int64_t)GetTickCount64(); }
+/* A MICROSECOND clock for the draw-cost profiler. QPC, not GetTickCount64: a
+ * whole map submit is well under one 15ms tick, so the coarse clock would read
+ * 0us on every good frame and be useless exactly when the answer matters.
+ * QueryPerformance* are NOT redeclared here -- abi/aowlspt_region.h has already
+ * pulled in windows.h by this point, so declaring them again would conflict with
+ * the winbase.h prototypes (LARGE_INTEGER*, not long long*). Use them straight. */
+static int64_t mhud_now_us(void) {
+    LARGE_INTEGER c, f;
+    if (!QueryPerformanceCounter(&c) || !QueryPerformanceFrequency(&f) ||
+        f.QuadPart <= 0)
+        return 0;
+    return (int64_t)((c.QuadPart * 1000000LL) / f.QuadPart);
+}
 #else
 static int64_t mhud_now_ms(void) { return 0; }
+static int64_t mhud_now_us(void) { return 0; }
 #endif
 
 static void mhud_reset(void) {
@@ -726,6 +748,7 @@ static void mhud_player_arrow(float cx, float cy, float headRot, int32_t has,
 static void mhud_draw(void* user, int64_t frame) {
     float rot, headRot, scrW, scrH;
     int32_t i;
+    int64_t _t0;
     (void)user; (void)frame;
 
     g_mhud.frames++;
@@ -738,26 +761,35 @@ static void mhud_draw(void* user, int64_t frame) {
     if (!g_mhud.inRaid) { g_art.refusal = MA_REFUSE_NORAID; return; }
     if (!g_mhud.hasLocal) return;   /* no centre => nothing truthful to draw */
     g_mhud.drawn++;
+    _t0 = mhud_now_us();
 
     mhud_screen(&scrW, &scrH);
 
-    /* THE MAP AND RADAR ARE NORTH-UP, ALWAYS (bug 3).
+    /* HEADING-UP (bug 3). The player asked for the map to TURN as they turn, so
+     * `rot` is the measured facing whenever a heading is live, and 0 (north-up)
+     * only when it is not. `mm_topdown` takes the heading STRAIGHT (0 = +Z north,
+     * increasing toward +X east) and does the inverse rotation itself, so passing
+     * `g_mhud.heading` gives a pane whose UP edge is the direction the player
+     * faces -- the offline test pins it: facing east, a contact due north lands
+     * to the LEFT. The whole `heading` setting is already folded into
+     * `hasHeading` upstream (maps.nim discards the measurement when the setting
+     * is OFF), so this one read gates the entire behaviour.
      *
-     * The region's textured QUAD is an axis-aligned dest rect with an
-     * axis-aligned UV rect: it can represent NEITHER a rotated dest nor rotated
-     * UV sampling, and a 4-corner quad command would be a host+overlay ABI
-     * change owned elsewhere. So the earlier code REFUSED to draw the art
-     * whenever a heading was measured (MA_REFUSE_ROTATED), which is why
-     * heading-up showed grid+dots and no art. The correct, cheapest fix that
-     * lives entirely in this mod is the standard minimap: keep the map and every
-     * blip NORTH-UP (`rot = 0`, so the tiles are axis-aligned and DO draw) and
-     * show heading with a rotating PLAYER ARROW instead of spinning the world.
+     * THE ART CANNOT ROTATE, and that is an ABI limit, not a choice. The region's
+     * textured QUAD is an axis-aligned dest rect with an axis-aligned UV rect: it
+     * can represent neither a rotated dest nor rotated UV sampling, and a
+     * 4-corner quad command is a host+overlay ABI change owned elsewhere. So when
+     * `rot` is non-zero `ma_can_draw` refuses the tiles (MA_REFUSE_ROTATED) and
+     * the pane falls back to the ROTATING labelled grid + blips. Heading-up
+     * therefore turns the world with a grid; north-up (heading off) shows the
+     * baked art. The diag's `art` line says which, by name, every tick -- it
+     * never degrades silently. Reported to the coordinator as the ABI gap it is.
      *
-     * `headRot` is the measured facing (0 = +Z north, increasing toward +X
-     * east), used only for that arrow, and only when a heading was actually
-     * MEASURED -- never a guessed zero that looks like "facing north". */
-    rot = 0.0f;
-    headRot = g_mhud.hasHeading ? g_mhud.heading : 0.0f;
+     * `headRot` drives the player nub only. On a heading-up pane the player faces
+     * UP by construction, so the nub points up (0); with no heading there is no
+     * nub at all. Never a guessed zero that looks like "facing north". */
+    rot = g_mhud.hasHeading ? g_mhud.heading : 0.0f;
+    headRot = 0.0f;
 
     /* ---- the MAP pane: the same top-down view, at map scale -------------- *
      * Player-CENTRED, not map-anchored. Anchoring to the level would need the
@@ -812,8 +844,9 @@ static void mhud_draw(void* user, int64_t frame) {
             mhud_player_arrow(me.x, me.y, headRot, g_mhud.hasHeading,
                               ms * 0.12f, MHUD_RGBA(255, 255, 255, 255));
         }
-        /* A north pip, so which way is up is never a guess. The pane is now
-         * always north-up, so it sits fixed at the top of the pane. */
+        /* A north pip, so which way is up is never a guess. On a heading-up pane
+         * it swings around as the player turns (mm_topdown takes `rot`); on a
+         * north-up pane it sits fixed at the top. */
         {
             MmPt np = mm_topdown(g_mhud.px, g_mhud.pz + g_mhud.mapSpanM * 0.45f,
                                  g_mhud.px, g_mhud.pz, mx, my, ms,
@@ -976,7 +1009,26 @@ static void mhud_draw(void* user, int64_t frame) {
         }
     }
     g_mhud.blips += (int64_t)g_mhud.n;
+
+    /* DRAW COST (bug 4). Measured only on frames that actually drew, so an idle
+     * HUD reports nothing rather than a misleading zero. `tilesLastFrame` is the
+     * art submitted this frame -- 0 when the map/radar are off or the pane is
+     * heading-up (art refused), which is precisely the "is it drawing when it
+     * shouldn't?" question bug 1 was about. */
+    {
+        int64_t us = mhud_now_us() - _t0;
+        if (us < 0) us = 0;
+        g_mhud.drawUsLast = us;
+        if (us > g_mhud.drawUsPeak) g_mhud.drawUsPeak = us;
+        g_mhud.drawUsEwma += ((double)us - g_mhud.drawUsEwma) / 16.0;
+        g_mhud.tilesLastFrame = g_art.tilesDrawn;
+    }
 }
+
+static int64_t mhud_draw_us_last(void) { return g_mhud.drawUsLast; }
+static int64_t mhud_draw_us_peak(void) { return g_mhud.drawUsPeak; }
+static int64_t mhud_draw_us_avg(void)  { return (int64_t)(g_mhud.drawUsEwma + 0.5); }
+static int32_t mhud_tiles_last(void)   { return g_mhud.tilesLastFrame; }
 
 /* ---- art accessors, for the diag ------------------------------------- *
  * These are what the ART line reports. They are DELIBERATELY separate numbers:
@@ -1130,6 +1182,10 @@ proc cHudHeading(): cfloat {.importc: "mhud_heading", nodecl.}
 proc cHudScreenMeasured(): int32 {.importc: "mhud_screen_measured", nodecl.}
 proc cHudScreenW(): int32 {.importc: "mhud_screen_w", nodecl.}
 proc cHudScreenH(): int32 {.importc: "mhud_screen_h", nodecl.}
+proc cHudDrawUsLast(): int64 {.importc: "mhud_draw_us_last", nodecl.}
+proc cHudDrawUsPeak(): int64 {.importc: "mhud_draw_us_peak", nodecl.}
+proc cHudDrawUsAvg(): int64 {.importc: "mhud_draw_us_avg", nodecl.}
+proc cHudTilesLast(): int32 {.importc: "mhud_tiles_last", nodecl.}
 
 # The counters, as ORDINARY Nim procs so another module can read them.
 #
@@ -1152,6 +1208,10 @@ proc hudIndBearing*(): int64 = cHudIndBearing()
 proc hudScreenMeasured*(): int32 = cHudScreenMeasured()
 proc hudScreenW*(): int32 = cHudScreenW()
 proc hudScreenH*(): int32 = cHudScreenH()
+proc hudDrawUsLast*(): int64 = cHudDrawUsLast()
+proc hudDrawUsPeak*(): int64 = cHudDrawUsPeak()
+proc hudDrawUsAvg*(): int64 = cHudDrawUsAvg()
+proc hudTilesLast*(): int32 = cHudTilesLast()
 
 # ---------------------------------------------------------------- map ART
 
@@ -1315,6 +1375,29 @@ proc hudInit*(o: HudOpts) =
                 (if o.showBots: 1'i32 else: 0'i32),
                 (if o.showPlayers: 1'i32 else: 0'i32))
   cHudConfigureMap((if o.map: 1'i32 else: 0'i32),
+                   cfloat(o.mapX), cfloat(o.mapY), cfloat(o.mapSize),
+                   cfloat(o.mapSpanM), int32(o.mapGrid),
+                   cfloat(o.indicatorInset))
+  cHudLifetime(int64(o.indicatorHoldMs), int64(o.indicatorFadeMs))
+
+proc hudReconfigure*(o: HudOpts; live: bool) =
+  ## LIVE re-apply of the layout and visibility WITHOUT `cHudReset` -- so an F12
+  ## edit mid-raid does not blank the current player position for a frame. This
+  ## is the other half of the settings-apply fix (bug 1): the draw reads
+  ## `mapOn`/`radarOn`/`indicatorsOn` from this mirror every frame, so pushing a
+  ## new value here makes the NEXT frame honour it. `live` is the master gate --
+  ## the feed being enabled AND already collecting -- and every visibility flag
+  ## is ANDed with it, so turning `enabled` off blanks all three surfaces (0
+  ## tiles, 0 blips) even though their own keys are still true in config.json.
+  let radarOn = (if o.radar and live: 1'i32 else: 0'i32)
+  let indOn   = (if o.indicators and live: 1'i32 else: 0'i32)
+  let mapOn   = (if o.map and live: 1'i32 else: 0'i32)
+  cHudConfigure(cfloat(o.radiusM), cfloat(o.screenW), cfloat(o.screenH),
+                radarOn, indOn,
+                cfloat(o.size), cfloat(o.x), cfloat(o.y),
+                (if o.showBots: 1'i32 else: 0'i32),
+                (if o.showPlayers: 1'i32 else: 0'i32))
+  cHudConfigureMap(mapOn,
                    cfloat(o.mapX), cfloat(o.mapY), cfloat(o.mapSize),
                    cfloat(o.mapSpanM), int32(o.mapGrid),
                    cfloat(o.indicatorInset))
