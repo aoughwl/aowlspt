@@ -10958,8 +10958,23 @@ static int32_t aowl_ov_admin_active(void) {
 
 /* The consumer's stable copy of the frame, taken under the seqlock. Static
  * because the render thread is the only reader and a per-frame stack copy of a
- * 256-entity frame is a needless 10 KB memmove on the stack. */
-static AowlAdminShared g_ovAdminSnap;
+ * 256-entity frame is a needless 10 KB memmove on the stack.
+ *
+ * TWO slots, not one, so the reader can HOLD the last good committed frame
+ * (task: the ESP FLICKER). `aowl_admin_snapshot` writes incrementally into its
+ * `out` and returns 0 on a torn read (the publisher's odd-seqlock window on
+ * the host thread overlapping this render-thread read) -- leaving that buffer
+ * half-written. The old single-slot reader then drew NOTHING that Present, so a
+ * torn read blanked every box for one frame; at 144Hz against a per-Unity-frame
+ * publisher that lands on a large fraction of Presents and reads as flicker.
+ * The publisher's committed frame persists in the shared region until the next
+ * commit, so the correct behaviour is to re-draw the last frame we successfully
+ * copied whenever this Present's copy tears. We snapshot into the BACK slot and
+ * only flip `g_ovAdminSnapCur` to it on success; a torn read leaves the front
+ * slot (the last good frame) untouched and we draw that. `-1` means we have not
+ * yet copied any good frame this raid. */
+static AowlAdminShared g_ovAdminSnap[2];
+static int32_t         g_ovAdminSnapCur = -1;
 
 /* ------------------------------------------------------------------ *
  * WHICH PANELS WANT THE MOUSE
@@ -11396,10 +11411,20 @@ static void aowl_ov_admin_append(void) {
 
     /* ---- ESP boxes, in true pixels ---- */
     if (aowl_admin_toggle_get(g_ov_admin, AOWL_ADM_ESP) && g_ov_admin->inRaid) {
-        if (aowl_admin_snapshot(g_ov_admin, &g_ovAdminSnap)) {
+        /* HELD FRAME (task: the ESP FLICKER). Copy into the back slot; keep the
+         * last good frame on a torn read so the boxes persist across every
+         * Present between publisher commits instead of blanking for one frame.
+         * A successful copy publishes the new frame by flipping the index; a
+         * failure (return 0) leaves g_ovAdminSnapCur -- and thus what we draw --
+         * pointing at the previous good frame. */
+        int32_t nx = (g_ovAdminSnapCur < 0) ? 0 : ((g_ovAdminSnapCur + 1) & 1);
+        if (aowl_admin_snapshot(g_ov_admin, &g_ovAdminSnap[nx]))
+            g_ovAdminSnapCur = nx;
+        if (g_ovAdminSnapCur >= 0) {
+            AowlAdminShared* snap = &g_ovAdminSnap[g_ovAdminSnapCur];
             g_ov.scale = 1;
-            for (int32_t i = 0; i < g_ovAdminSnap.count; i++) {
-                AowlAdminEntity* e = &g_ovAdminSnap.ents[i];
+            for (int32_t i = 0; i < snap->count; i++) {
+                AowlAdminEntity* e = &snap->ents[i];
                 if (!(e->flags & AOWL_ADM_F_ONSCREEN)) continue;
                 float h = e->bottom - e->top;
                 if (h < 2.0f || h > (float)g_ov.bbH) continue;
@@ -11428,6 +11453,12 @@ static void aowl_ov_admin_append(void) {
                     aowl_ov_text(l, e->top - (float)AOWL_OV_CH - 1.0f, e->name, col);
             }
         }
+    } else {
+        /* Not drawing ESP this Present (raid ended, or ESP toggled off while
+         * the F6 menu keeps this append alive): drop the held frame so the
+         * NEXT raid never shows this one's boxes for the Present or two before
+         * its first fresh snapshot lands. */
+        g_ovAdminSnapCur = -1;
     }
 
     /* ---- The F6 menu, at panel scale ---- */
