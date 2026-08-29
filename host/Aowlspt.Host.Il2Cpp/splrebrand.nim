@@ -94,7 +94,10 @@ const
   # and the description is a LocalizedText whose m_text does not even contain the
   # visible words, so text-matching could never find it.
   SplHeadNode     = "MainCaption"              # heading TMP ("Practice game mode")
-  SplWarnNode     = "WarningTextVertLayout"    # co-op/EoD progress warning box
+  SplDescNode     = "Description"              # the "In this mode..." blurb (LocalizedText)
+  SplWarnNode     = "WarningPanelHorLayout"    # the WHOLE co-op/EoD warning panel
+                                               # (Background+Glow+Icon+WarningTextVertLayout);
+                                               # hiding only the text layout left the Icon.
   SplBlockerName  = "SoloModeCheckmarkBlocker"
   SplHeadStock    = "practice game mode"
   SplDescStock    = "in this mode"
@@ -564,6 +567,11 @@ proc splScanNode(t: Il2CppPtr; depth: int; budget: var int; deadline: uint64) =
         if tmp != nil:
           gSplHeadTmp = tmp
           gSplHeadLoc = splComponent(node, splLocTypeStr())
+      elif gSplDescTmp == nil and nm == SplDescNode:
+        let tmp = splTmpOf(node)
+        if tmp != nil:
+          gSplDescTmp = tmp
+          gSplDescLoc = splComponent(node, splLocTypeStr())
       elif gSplCheckGo == nil and nm == SplBlockerName:
         let go = iGameObjectOf(node)
         if go != nil and duOk(go, 0x20'i32):
@@ -631,15 +639,22 @@ proc splMaintain() =
   if gSplToggle != nil and duOk(gSplToggle, cSwOffToggleIsOn() + 8'i32) and
      gSplCheckGo != nil and duOk(gSplCheckGo, 0x20'i32) and iUnityAlive(gSplCheckGo):
     if nuActiveInHierarchy(gSplCheckGo):
-      let fr = splForceToggle()             # forces + re-asserts + reads back
-      if fr == 1:
-        discard nuSetActive(gSplCheckGo, false)   # PASS -> now hide
-      # fr == 0 (readback mismatch) or -1 (set_isOn unverified): do NOT hide.
-    # Assert the FINISHED STATE, whoever acted and whenever.
+      discard splForceToggle()              # forces set_isOn (sets gSplForceRefused if the RVA is UNVERIFIED)
+      # Hide once set_isOn was actually CALLED. fact #71: Toggle::set_isOn
+      # @0x55BA430 DOES tick this UpdatableToggle (human-confirmed on screen), so
+      # a verified RVA means the value was applied AND the onValueChanged listener
+      # fired -- we do NOT gate the hide on the m_IsOn readback, whose offset is
+      # unreliable for UpdatableToggle (it read FAIL while the box visibly ticks).
+      # Offline is decided by the emulated backend, not by this client checkbox,
+      # so hiding a correctly-forced box cannot strand us online. Only if the RVA
+      # itself could not be verified (gSplForceRefused) is the box left visible.
+      if not gSplForceRefused:
+        discard nuSetActive(gSplCheckGo, false)
+    # Assert the FINISHED STATE.
     if not gSplForceRefused:
       forceState = (if cSwReadU8(gSplToggle, cSwOffToggleIsOn()) == wantOn: 1 else: 0)
-    if gSplForceRefused or forceState == 0:
-      hideState = 2                          # box left VISIBLE on any doubt
+    if gSplForceRefused:
+      hideState = 2                          # could not force -> box left VISIBLE
     elif not nuActiveInHierarchy(gSplCheckGo):
       hideState = 1
     else:
