@@ -613,19 +613,28 @@ proc botZonesFor(spawnPointParams: JsonRef): seq[string] =
     if not seen:
       result.add zn
 
-proc oneWave(number, tmin, tmax, smin, smax: int; zone: string): JsonObject =
-  ## One assault-scav wave in BSG's own `waves[]` shape (capture seq 158). Every
-  ## member the client's `WildSpawnWave` reads is present, so nothing
-  ## deserialises to a null: `SpawnMode` lists all three modes so the wave is
-  ## never filtered out by the session's mode, `WildSpawnType`/`BotSide` make it
-  ## a scav.
+proc oneWave(number, tmin, tmax, smin, smax: int; zone: string;
+             wildType = "assault"; botSide = "Savage"): JsonObject =
+  ## One wave in BSG's own `waves[]` shape (capture seq 158). Every member the
+  ## client's `WildSpawnWave` reads is present, so nothing deserialises to a
+  ## null: `SpawnMode` lists all three modes so the wave is never filtered out by
+  ## the session's mode, and `WildSpawnType`/`BotSide` name what spawns.
+  ##
+  ## `wildType`/`botSide` default to an assault scav (`assault`/`Savage`), which
+  ## is what all but the PMC seed waves want. A PMC wave passes `pmcUSEC`/`Usec`
+  ## or `pmcBEAR`/`Bear`: the client `Enum.Parse`s both against its own
+  ## `WildSpawnType`/`EPlayerSide`, requests bots from `bot/generate` under that
+  ## role, and `emu/bots` answers with a PMC-side profile (see `botSideForRole`).
+  ## The `Run(1)`/`Run(2)` split that `offlineScavWaves` documents keys off the
+  ## time SIGN only, never the type, so a negative-time PMC wave is dispatched
+  ## synchronously exactly like a scav one.
   ##
   ## `time_min`/`time_max` are seconds, and their *sign* selects which of the
   ## client's two dispatch arms the wave takes -- see `offlineScavWaves`. A
   ## negative pair is not a disabled wave; it is the wave that spawns at once.
   var w = obj()
   put(w, "BotPreset", "normal")
-  put(w, "BotSide", "Savage")
+  put(w, "BotSide", botSide)
   put(w, "KeepZoneOnSpawn", false)
   var modes = arr()
   modes.add "regular"
@@ -633,7 +642,7 @@ proc oneWave(number, tmin, tmax, smin, smax: int; zone: string): JsonObject =
   modes.add "pvp-season"
   put(w, "SpawnMode", modes)
   put(w, "SpawnPoints", zone)
-  put(w, "WildSpawnType", "assault")
+  put(w, "WildSpawnType", wildType)
   put(w, "isPlayers", false)
   put(w, "number", number)
   put(w, "slots_max", smax)
@@ -732,6 +741,11 @@ proc offlineScavWaves(zones: seq[string]): string =
   ## returns at least `S`. Either way a wave is worth >= S scavs.
   const perWave = 4      ## S: bots requested per seed wave. trunc(1.05*4+0.5)=4.
   const trickle = 3      ## S for the timer-arm bonus waves.
+  const pmcWave = 2      ## S per PMC seed wave -- a smaller span than the scav
+                         ## seeds, so an offline raid reads like the real thing:
+                         ## more scavs than PMCs, PMCs a minority that is
+                         ## actually present. Two USEC + two BEAR waves of span 2
+                         ## is ~8 PMCs against ~16-32 scavs.
   var useZones = zones
   if useZones.len == 0:
     useZones = @[""]
@@ -750,6 +764,24 @@ proc offlineScavWaves(zones: seq[string]): string =
     a.add oneWave(number, -1, -1, perWave, perWave * 2,
                   useZones[number mod useZones.len])
     inc number
+  # The PMCs. This is the whole of fix (1): a stock offline raid served only
+  # `assault`/`Savage` waves, so the client never asked `bot/generate` for a PMC
+  # and a raid spawned ~40 scavs, the bosses, and zero PMCs. These waves name
+  # `pmcUSEC`/`pmcBEAR` (WildSpawnType 52/51) on the `Usec`/`Bear` side; the
+  # client parses both against its own enums, requests those roles, and
+  # `emu/bots` fills them from `bots.types.pmcusec`/`pmcbear` -- the full PMC
+  # loadout tables -- with `Info.Side` set by `botSideForRole`. Negative time so
+  # they seed synchronously alongside the scavs. Spread across the same zones the
+  # scav seeds use, so a PMC has an open zone to place into. Two of each side.
+  var pmc = 0
+  while pmc < 2:
+    a.add oneWave(number, -1, -1, pmcWave, pmcWave * 2,
+                  useZones[number mod useZones.len], "pmcUSEC", "Usec")
+    inc number
+    a.add oneWave(number, -1, -1, pmcWave, pmcWave * 2,
+                  useZones[number mod useZones.len], "pmcBEAR", "Bear")
+    inc number
+    inc pmc
   # The trickle. Non-negative, so these take `Run(2)`'s timer arm: a bonus if
   # that arm works offline and harmless if it does not. Staggered from 20 s so
   # a swept map does not go quiet after the seed.
