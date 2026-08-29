@@ -239,6 +239,27 @@ var gStatus = "not attempted"
 var gInRaid = false
 var gLastCount = 0
 var gLastSeen = 0
+
+# ---- DRAW-STABILITY COUNTERS (task: the ESP FLICKER, CLAUDE.md 9b) ----------
+# The position double-buffer's carry-forward bridges a per-PLAYER 1-sweep gap in
+# the pos snapshot. It CANNOT touch a WHOLE-FRAME blank: every tick
+# collectAndPublish reaches a bail that commits an empty frame (0 boxes) makes
+# every box vanish for that tick regardless of how fresh the positions are. That
+# is the flicker that survived the pos fix. These count each whole-frame outcome
+# so the once-per-raid diag stops being unfalsifiable: a hold that "cannot fail"
+# never moves gBlankNotAlive; a real regression makes it climb. The assertion to
+# check LIVE is `gReached > 0 and gBoxed*k >= gReached` (nearly every projecting
+# in-raid tick carried boxes) with gBlankNotAlive ~ 0 -- see dataDiag's
+# "draw stable" line.
+var gReached      = 0   ## ticks that reached the draw loop in-raid AND projecting
+var gBoxed        = 0   ## ...of those, ticks that published >= 1 box
+var gBlankNotAlive = 0  ## bailed: local player not found in AllAlivePlayersList
+var gBlankOverlay = 0   ## bailed: an overlay/menu mask was open
+var gBlankWorldNull = 0 ## bailed: GameWorld read null
+var gBlankListNull = 0  ## bailed: player list null / out of range
+var gLocalByIsYou = 0   ## times localAlive was rescued via IsYourPlayer because
+                        ## GameWorld+0x230 (GwMainPlayer) read null this tick
+
 var gRuntimeUp = false
 var gWorldReady: WhenReady
 
@@ -526,6 +547,7 @@ proc collectAndPublish*(s: AdminRegion; maxDistance: float; bbW, bbH: int) =
   gInRaid = (world != nil)
   setInRaid(s, gInRaid)
   if world == nil:
+    gBlankWorldNull = gBlankWorldNull + 1
     gStatus = "no GameWorld: " & gwStateText()
     frameBegin(s, bbW, bbH); frameCommit(s); return
 
@@ -566,6 +588,7 @@ proc collectAndPublish*(s: AdminRegion; maxDistance: float; bbW, bbH: int) =
   # Capped iteration: a corrupt count must not become an unbounded loop inside a
   # frame. 1024 is far above any real raid population.
   if items == nil or n < 0 or n > 1024:
+    gBlankListNull = gBlankListNull + 1
     note("player list size out of range (" & $n & ")")
     gStatus = "player list empty/out of range (" & $n & ")"
     frameBegin(s, bbW, bbH); frameCommit(s); return
@@ -583,18 +606,39 @@ proc collectAndPublish*(s: AdminRegion; maxDistance: float; bbW, bbH: int) =
   # so ESP never draws in menu / loading / post-extract. `localPtr` is 0 when
   # GameWorld+0x230 read null, in which case we cannot prove we are spawned and
   # correctly treat it as not-in-raid rather than guessing.
+  # ROBUST LIFECYCLE GATE (task: the ESP FLICKER that survived the pos fix).
+  # Identifying WHICH list entry is us must NOT depend on GameWorld+0x230
+  # (GwMainPlayer): it reads null intermittently on this build -- the very
+  # transient the self-box and distance-cull guards above already exist for. When
+  # it does, `localPtr` is 0, no entry matched the OLD `if localPtr != 0` scan,
+  # `localAlive` went false, and the WHOLE frame committed empty -- every box
+  # vanished for that one tick. The position carry-forward cannot bridge a
+  # whole-frame blank, which is why the flicker persisted. IsYourPlayer
+  # (Player+0xB89) is true only on the local instance and never depends on
+  # GwMainPlayer (see PlIsYou's note), so it identifies us on every frame. Scan
+  # once: an entry is us if it equals `localPtr` OR reads IsYou==1. When
+  # GwMainPlayer gave nothing this tick, adopt our own list entry as `localPtr`
+  # (for the draw loop's self-exclusion) and take the distance anchor from its
+  # validated snapshot, so a null GwMainPlayer no longer blanks the frame.
   var localAlive = false
-  if localPtr != 0'u64:
-    var j = 0
-    while j < n:
-      let q = rdPtr(items, ArrDataOff + j*8)
-      inc j
-      if q != nil and cast[uint64](q) == localPtr:
-        localAlive = true
-        break
+  var j = 0
+  while j < n:
+    let q = rdPtr(items, ArrDataOff + j*8)
+    inc j
+    if q == nil: continue
+    if (localPtr != 0'u64 and cast[uint64](q) == localPtr) or
+       rdBool(q, PlIsYou) == 1'i32:
+      localAlive = true
+      if localPtr == 0'u64:
+        localPtr = cast[uint64](q)
+        gLocalByIsYou = gLocalByIsYou + 1
+        if not haveLocal:
+          playerPos(q, haveLocal, lx, ly, lz)
+      break
   gInRaid = localAlive
   setInRaid(s, gInRaid)
   if not localAlive:
+    gBlankNotAlive = gBlankNotAlive + 1
     gStatus = "world live but the local player is NOT in AllAlivePlayersList -- " &
               "menu, loading-before-spawn, or post-extract, not an active raid"
     frameBegin(s, bbW, bbH); frameCommit(s); return
@@ -604,6 +648,7 @@ proc collectAndPublish*(s: AdminRegion; maxDistance: float; bbW, bbH: int) =
   # bit2=F3), so ESP hides while a menu/settings screen is open mid-raid. The
   # single suppression point is the next two lines.
   if overlayMaskOpen():
+    gBlankOverlay = gBlankOverlay + 1
     gStatus = "in raid, but an overlay/menu mask is open -- ESP suppressed"
     frameBegin(s, bbW, bbH); frameCommit(s); return
 
@@ -673,6 +718,17 @@ proc collectAndPublish*(s: AdminRegion; maxDistance: float; bbW, bbH: int) =
       published = published + 1
   gLastCount = published
   gLastSeen = seen
+  if projecting:
+    # Whole-frame draw-stability tally. `gReached` counts every projecting
+    # in-raid commit; `gBoxed` the subset that carried >=1 box. The falsifiable
+    # assertion (CLAUDE.md 9b) is that once we are in-raid-projecting with enemies
+    # present, gBoxed tracks gReached -- a large gap means frames are blanking,
+    # and the gBlank*/gLocalByIsYou counters say which gate. `seen > 0` scopes it
+    # to ticks where at least one other player position validated, so a genuine
+    # all-behind-camera moment does not read as a flicker.
+    if seen > 0:
+      gReached = gReached + 1
+      if published > 0: gBoxed = gBoxed + 1
   frameCommit(s)
   if projecting:
     gStatus = "in raid; boxed " & $published & " of " & $seen &
@@ -965,6 +1021,26 @@ proc dataDiag*(): string =
          else: "INCONCLUSIVE  " & $gLastSeen & " positions validated, 0 " &
                "projected on screen -- everyone behind the camera, or the " &
                "view-projection is wrong") & "\n"
+  # DRAW STABILITY (task: the ESP FLICKER). The whole-frame outcome tally the
+  # once-per-raid diag lacked. A PASS asserts the FINISHED STATE, not our write:
+  # of the projecting in-raid ticks that saw >=1 other player, (nearly) all
+  # carried boxes, and the whole-frame blank that GwMainPlayer-null used to cause
+  # (gBlankNotAlive) did not climb. It is falsifiable -- gBlankNotAlive CAN move,
+  # so a flicker that persists shows here instead of hiding.
+  r.add "  draw stable  : " &
+        (if not gInRaid: "INCONCLUSIVE  no raid, nothing drawn"
+         elif gReached == 0: "INCONCLUSIVE  no projecting in-raid tick has seen " &
+              "another player yet"
+         elif gBoxed * 20 >= gReached * 19 and gBlankNotAlive == 0:
+              "PASS  boxed " & $gBoxed & " of " & $gReached &
+              " projecting ticks; 0 whole-frame blanks from a null GwMainPlayer" &
+              (if gLocalByIsYou > 0: " (IsYou rescued " & $gLocalByIsYou &
+                 " tick(s) where GameWorld+0x230 read null)" else: "")
+         else: "FAIL  boxed only " & $gBoxed & " of " & $gReached &
+              " projecting ticks; whole-frame blanks: notAlive=" &
+              $gBlankNotAlive & " overlay=" & $gBlankOverlay & " worldNull=" &
+              $gBlankWorldNull & " listNull=" & $gBlankListNull &
+              " (IsYou rescues=" & $gLocalByIsYou & ")") & "\n"
   r.add "  god mode     : " &
         (if not godCapable(): "FAIL  GameAssembly.dll not present"
          elif godmodeIsOn(): "PASS  patch installed at 0x731480"

@@ -575,8 +575,13 @@ var gTick = 0'i64
 var gReported = false
 var gRaidReported = false
 var gRaidSettle = 0
+var gLastDiagTick = 0'i64
 
 const RaidSettleTicks = 300
+const DiagReEmitTicks = 3600'i64
+  ## Re-dump adminDiag this many in-raid ticks after the last, so an intermittent
+  ## in-raid defect (the ESP flicker) is measurable from the log rather than
+  ## invisible behind a once-per-raid latch.
   ## onUpdate ticks to wait after a GameWorld appears before accepting that a
   ## still-empty position walk is real. Stated as a falsifiable bound, not a
   ## safe number: at the mod tick rate this is several seconds -- far longer
@@ -838,7 +843,16 @@ proc onUpdate(elapsedMs: int64): Status =
     gRaidSettle = gRaidSettle + 1
     if espSeen() > 0 or gRaidSettle >= RaidSettleTicks:
       gRaidReported = true
+      gLastDiagTick = gTick
       info adminDiag()
+  elif dataInRaid() and (gTick - gLastDiagTick) >= DiagReEmitTicks:
+    # RE-EMIT while in raid. The old once-per-raid latch meant an intermittent
+    # in-raid defect (the ESP flicker) could never be measured from the log: the
+    # single dump was taken at raid start, before any steady state. A periodic
+    # re-emit surfaces the draw-stability tally so the flicker is falsifiable
+    # (CLAUDE.md 9b) without a human re-entering the raid.
+    gLastDiagTick = gTick
+    info adminDiag()
   elif not dataInRaid():
     # Re-arm for the NEXT raid. Leaving these latched meant a session that
     # entered a second raid reported nothing at all about it.
