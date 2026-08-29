@@ -128,6 +128,7 @@ proc cNavOffOnClick(): int32 {.importc: "aowl_nav_off_onclick", nodecl.}
 proc cNavOffInteract(): int32 {.importc: "aowl_nav_off_interact", nodecl.}
 proc cNavOffIsOn(): int32 {.importc: "aowl_nav_off_ison", nodecl.}
 proc cNavOffCachedPtr(): int32 {.importc: "aowl_nav_off_cachedptr", nodecl.}
+proc cNavOffCurSelected(): int32 {.importc: "aowl_nav_off_curselected", nodecl.}
 proc cNavOffArrLen(): int32 {.importc: "aowl_nav_off_arrlen", nodecl.}
 proc cNavOffArrData(): int32 {.importc: "aowl_nav_off_arrdata", nodecl.}
 proc cNavSetSceneHandle(h: int32) {.importc: "aowl_nav_set_scene_handle", nodecl.}
@@ -142,6 +143,18 @@ proc cNavNewString(s: cstring): Il2CppPtr {.
 ## GetComponent needs none of it, and this build's standing verdict is that
 ## most of the reflection surface faults with no probe result ever recorded.
 ## Binding an unproven fallback that is never reached would be dead risk.
+## CLICK-RECORDER MOUSE EDGE. Read via Win32 GetAsyncKeyState(VK_LBUTTON), NOT
+## through IL2CPP: UnityEngine.Input is not in the verified nav table, and a
+## plain kernel/user32 call cannot fault inside Unity's C++ the way a managed
+## icall on a dead wrapper can. This is a pure native read of the OS's async
+## key state -- cheap enough to poll every armed frame, and it touches no
+## managed object at all, so it stays outside the IL2CPP guard's concerns.
+{.emit: """
+static int32_t aowl_rec_lbutton_down(void) {
+    return (GetAsyncKeyState(VK_LBUTTON) & 0x8000) ? 1 : 0;
+}
+""".}
+proc cRecLButtonDown(): int32 {.importc: "aowl_rec_lbutton_down", nodecl.}
 proc cNavReason(): int32 {.importc: "aowl_nav_last_reason", nodecl.}
 proc cNavActualValid(): int32 {.importc: "aowl_nav_actual_valid", nodecl.}
 proc cNavActualAt(i: int32): int32 {.importc: "aowl_nav_actual_at", nodecl.}
@@ -1901,6 +1914,54 @@ proc iFindFirstByName(want: string; root: Il2CppPtr; budget: int): Il2CppPtr =
         if c != nil:
           queue.add c
         inc k
+
+proc iCollectByName(want: string; roots: seq[Il2CppPtr]; budget: int;
+                    maxHits: int; into: var seq[Il2CppPtr];
+                    exhaustive: var bool): int =
+  ## Collect EVERY node whose GameObject name contains `want`, breadth-first
+  ## from `roots`, bounded by BOTH a node budget and a single 12ms time slice.
+  ## `exhaustive` reports whether the frontier was drained (a complete answer)
+  ## or the walk stopped early -- `pressname` MUST treat a non-exhaustive walk
+  ## as INCONCLUSIVE, never as "that many candidates exist". Atomic on purpose:
+  ## one call, one frame's slice, no cross-frame resume, because a navigation
+  ## press must decide on a single consistent snapshot of the tree.
+  into = @[]
+  exhaustive = true
+  var queue: seq[Il2CppPtr] = @[]
+  for r in roots:
+    if r != nil:
+      queue.add r
+  var head = 0
+  var seen = 0
+  let started = cNowMs()
+  let w = iLower(want)
+  while head < queue.len:
+    if seen >= budget:
+      exhaustive = false
+      break
+    if (seen and 255) == 0 and cNowMs() - started > InspFindSliceMs:
+      exhaustive = false
+      break
+    if into.len >= maxHits:
+      exhaustive = false
+      break
+    let cur = queue[head]
+    inc head
+    inc seen
+    if not duOk(cur, 0x20'i32) or not iUnityAlive(cur):
+      continue
+    let nm = iObjName(cur)
+    if nm.len > 0 and iContains(iLower(nm), w):
+      into.add cur
+    var n = 0
+    if iChildCount(cur, n):
+      var k = 0
+      while k < n and k < InspMaxChildren:
+        let c = iChildAt(cur, k)
+        if c != nil:
+          queue.add c
+        inc k
+  result = into.len
 
 proc iFindTextStep(): int =
   ## One FRAME's slice of the breadth-first walk, mirroring `iFindStep` exactly
@@ -4542,33 +4603,31 @@ proc iCmdCanvasOrder(toks: seq[string]) =
 # visible
 # ---------------------------------------------------------------------------
 
-proc iCmdVisible(toks: seq[string]) =
-  ## `visible EXPR` -- the composite answer, with a VERDICT and the factor that
-  ## produced it.
+proc iVisEval(p: Il2CppPtr; verbose: bool): int =
+  ## The measurement behind `visible`, factored out so `visible` (verbose) and
+  ## `pressname` (silent) share ONE implementation and CANNOT DRIFT -- the only
+  ## difference is whether each factor line is printed. Returns a THREE-STATE
+  ## verdict, never two: 1 = VISIBLE, 0 = NOT VISIBLE (a factor was MEASURED to
+  ## kill it), -1 = INCONCLUSIVE (a factor could not be read). "Could not look"
+  ## is never a yes.
   ##
   ## The factors are evaluated in the order the renderer would kill them, and
   ## the FIRST definite killer wins the verdict. A factor that could not be
   ## read does not become a killer and does not become a pass -- it downgrades
   ## the verdict to INCONCLUSIVE and is named.
-  if toks.len < 2:
-    iErr("usage: visible EXPR")
-    return
-  var v = 0'u64
-  var err = ""
-  if not iEval(toks[1], v, err):
-    iErr(err)
-    return
-  let p = cast[Il2CppPtr](v)
+  template vo(s: string) =
+    if verbose: iOut(s)
   if not iVisSelfOk(p):
-    iErr("not readable, or its native half is null; refusing to call. " &
-         "That is itself an answer: a destroyed Unity wrapper draws nothing.")
-    return
+    if verbose:
+      iErr("not readable, or its native half is null; refusing to call. " &
+           "That is itself an answer: a destroyed Unity wrapper draws nothing.")
+    return -1
 
   var killer = ""      ## the first DEFINITE reason it is not visible
   var unknowns: seq[string] = @[]
   var w = ""
 
-  iOut("  node = " & iPtr(p) & "  '" & iObjName(p) & "'")
+  vo("  node = " & iPtr(p) & "  '" & iObjName(p) & "'")
 
   # 1. activeInHierarchy.
   let (actOk, active) = iActiveInHierarchy(p)
@@ -4576,9 +4635,9 @@ proc iCmdVisible(toks: seq[string]) =
     unknowns.add ("activeInHierarchy could not be read (Component::" &
                  "get_gameObject / GameObject::get_activeInHierarchy did not " &
                  "resolve, or a hop was unreadable)")
-    iOut("  activeInHierarchy : UNKNOWN")
+    vo("  activeInHierarchy : UNKNOWN")
   else:
-    iOut("  activeInHierarchy : " & (if active: "yes" else: "NO"))
+    vo("  activeInHierarchy : " & (if active: "yes" else: "NO"))
     if not active and killer == "":
       killer = "the GameObject is INACTIVE in the hierarchy. Nothing under " &
                "an inactive object renders, and it is not pressable either " &
@@ -4590,27 +4649,27 @@ proc iCmdVisible(toks: seq[string]) =
   if not iVisFindGraphic(p, graphic, gname, w):
     unknowns.add ("whether this node has a Graphic could not be determined (" &
                  w & ")")
-    iOut("  graphic           : UNKNOWN")
+    vo("  graphic           : UNKNOWN")
   elif graphic == nil:
-    iOut("  graphic           : none (asked for TextMeshProUGUI, Image, " &
-         "RawImage, Text, MaskableGraphic, Graphic). This node draws " &
-         "nothing ITSELF -- it may still be a container whose CHILDREN draw.")
+    vo("  graphic           : none (asked for TextMeshProUGUI, Image, " &
+       "RawImage, Text, MaskableGraphic, Graphic). This node draws " &
+       "nothing ITSELF -- it may still be a container whose CHILDREN draw.")
   else:
-    iOut("  graphic           : " & gname & " @" & iPtr(graphic))
+    vo("  graphic           : " & gname & " @" & iPtr(graphic))
     var gEn = false
     if iVisBool("Behaviour::get_enabled", graphic, gEn, w):
-      iOut("  graphic.enabled   : " & (if gEn: "yes" else: "NO"))
+      vo("  graphic.enabled   : " & (if gEn: "yes" else: "NO"))
       if not gEn and killer == "":
         killer = "the " & gname & " component is DISABLED. The object is " &
                  "there, the rect is there, and the renderer skips it."
     else:
       unknowns.add ("Graphic.enabled: " & w)
-      iOut("  graphic.enabled   : UNKNOWN")
+      vo("  graphic.enabled   : UNKNOWN")
     if iVisSret("UI.Graphic::get_color", graphic, 4'i32, w):
       let ca = cDuSret3_2()
-      iOut("  graphic.color     : rgba(" & iFmtF(cDuSret0_2()) & ", " &
-           iFmtF(cDuSret1_2()) & ", " & iFmtF(cDuSret2_2()) & ", " &
-           iFmtF(ca) & ")")
+      vo("  graphic.color     : rgba(" & iFmtF(cDuSret0_2()) & ", " &
+         iFmtF(cDuSret1_2()) & ", " & iFmtF(cDuSret2_2()) & ", " &
+         iFmtF(ca) & ")")
       let inv = int(cVisAlphaInvisible(ca))
       if inv == 1 and killer == "":
         killer = "the Graphic's own colour alpha is " & iFmtF(ca) &
@@ -4619,7 +4678,7 @@ proc iCmdVisible(toks: seq[string]) =
         unknowns.add ("the Graphic's colour alpha was not a finite number")
     else:
       unknowns.add ("Graphic.color: " & w)
-      iOut("  graphic.color     : UNKNOWN")
+      vo("  graphic.color     : UNKNOWN")
 
   # 3. The CanvasGroup alpha chain, folded with `ignoreParentGroups` honoured.
   cVisAlphaReset()
@@ -4652,23 +4711,23 @@ proc iCmdVisible(toks: seq[string]) =
                      " level(s) up: " & w2 & " -- without it the fold would " &
                      "be a guess, so it stopped here")
         break
-      iOut("  canvasGroup       : depth=" & $d & " alpha=" & iFmtF(a) &
-           (if ign: " ignoreParentGroups=YES (chain ends here)" else: ""))
+      vo("  canvasGroup       : depth=" & $d & " alpha=" & iFmtF(a) &
+         (if ign: " ignoreParentGroups=YES (chain ends here)" else: ""))
       if cVisAlphaPush(a, (if ign: 1'i32 else: 0'i32)) != 0'i32:
         break
     cur = iVisParentOf(cur)
     inc d
   if groupsAsked == 0 and chainBroken:
-    iOut("  canvasGroup alpha : UNKNOWN")
+    vo("  canvasGroup alpha : UNKNOWN")
   elif cVisAlphaOk() == 0'i32:
     unknowns.add ("a CanvasGroup returned an alpha that is not a usable " &
                  "number, so the folded alpha is UNKNOWN")
-    iOut("  canvasGroup alpha : UNKNOWN (a group returned an unusable value)")
+    vo("  canvasGroup alpha : UNKNOWN (a group returned an unusable value)")
   else:
     let fa = cVisAlphaValue()
-    iOut("  canvasGroup alpha : " & iFmtF(fa) & "  (from " &
-         $int(cVisAlphaCount()) & " group(s)" &
-         (if chainBroken: ", chain INCOMPLETE" else: "") & ")")
+    vo("  canvasGroup alpha : " & iFmtF(fa) & "  (from " &
+       $int(cVisAlphaCount()) & " group(s)" &
+       (if chainBroken: ", chain INCOMPLETE" else: "") & ")")
     if not chainBroken and int(cVisAlphaInvisible(fa)) == 1 and killer == "":
       killer = "a CanvasGroup above this node folds the alpha to " &
                iFmtF(fa) & ". The object is built, positioned and enabled, " &
@@ -4679,14 +4738,14 @@ proc iCmdVisible(toks: seq[string]) =
   var cdepth = 0
   if not iVisNearestCanvas(p, canvas, cdepth, w):
     unknowns.add ("the Canvas above this node could not be determined (" & w & ")")
-    iOut("  canvas            : UNKNOWN")
+    vo("  canvas            : UNKNOWN")
   elif canvas == nil:
-    iOut("  canvas            : NONE within " & $VisMaxClimb & " ancestors")
+    vo("  canvas            : NONE within " & $VisMaxClimb & " ancestors")
     if killer == "":
       killer = "there is NO Canvas at or above this node. A UI graphic " &
                "with no Canvas is never submitted to the renderer at all."
   else:
-    iVisReportCanvas("canvas            : depth=" & $cdepth, canvas)
+    if verbose: iVisReportCanvas("canvas            : depth=" & $cdepth, canvas)
     var cEn = false
     if iVisBool("Behaviour::get_enabled", canvas, cEn, w):
       if not cEn and killer == "":
@@ -4702,8 +4761,8 @@ proc iCmdVisible(toks: seq[string]) =
   if iVisSret("Transform::get_lossyScale", iToTransform(p), 3'i32, w):
     let sx = cDuSret0_2()
     let sy = cDuSret1_2()
-    iOut("  lossyScale        : (" & iFmtF(sx) & ", " & iFmtF(sy) & ", " &
-         iFmtF(cDuSret2_2()) & ")")
+    vo("  lossyScale        : (" & iFmtF(sx) & ", " & iFmtF(sy) & ", " &
+       iFmtF(cDuSret2_2()) & ")")
     let sc = int(cVisScaleCollapsed(sx, sy))
     if sc == 1 and killer == "":
       killer = "the world (lossy) scale is collapsed to zero in x or y, so " &
@@ -4712,7 +4771,7 @@ proc iCmdVisible(toks: seq[string]) =
       unknowns.add ("the lossy scale was not a finite number")
   else:
     unknowns.add ("Transform.lossyScale: " & w)
-    iOut("  lossyScale        : UNKNOWN")
+    vo("  lossyScale        : UNKNOWN")
 
   # 6. The pixel rect.
   var x0 = 0.0
@@ -4723,16 +4782,16 @@ proc iCmdVisible(toks: seq[string]) =
   var note = ""
   if not iVisScreenRect(p, x0, y0, x1, y1, mode, note):
     unknowns.add ("the screen rect could not be computed (" & note & ")")
-    iOut("  screen rect       : UNKNOWN -- " & note)
+    vo("  screen rect       : UNKNOWN -- " & note)
   else:
     var rw = x1 - x0
     var rh = y1 - y0
     if rw < 0.0: rw = -rw
     if rh < 0.0: rh = -rh
     let known = cVisScrKnown()
-    iOut("  screen rect       : (" & iFmtF(x0) & ", " & iFmtF(y0) & ") .. (" &
-         iFmtF(x1) & ", " & iFmtF(y1) & ")  = " & iFmtF(rw) & " x " &
-         iFmtF(rh) & " px   [" & note & "]")
+    vo("  screen rect       : (" & iFmtF(x0) & ", " & iFmtF(y0) & ") .. (" &
+       iFmtF(x1) & ", " & iFmtF(y1) & ")  = " & iFmtF(rw) & " x " &
+       iFmtF(rh) & " px   [" & note & "]")
     let deg = int(cVisDegenerate(rw, rh))
     if deg == 1 and killer == "":
       killer = "the rect is DEGENERATE on screen -- " & iFmtF(rw) & " x " &
@@ -4745,16 +4804,16 @@ proc iCmdVisible(toks: seq[string]) =
       unknowns.add ("the back-buffer size has not been published " &
                    "(aowl_region_screen_known = 0), so on-screen-ness is " &
                    "UNKNOWN -- explicitly NOT 'off screen'")
-      iOut("  on screen         : UNKNOWN (back-buffer size not published)")
+      vo("  on screen         : UNKNOWN (back-buffer size not published)")
     else:
       let cls = int(cVisOnScreen(x0, y0, x1, y1, cVisScrW(), cVisScrH(), known))
       case cls
-      of 2: iOut("  on screen         : YES (" & $int(cVisScrW()) & "x" &
-                 $int(cVisScrH()) & " back buffer)")
-      of 1: iOut("  on screen         : PARTIALLY -- crosses an edge")
+      of 2: vo("  on screen         : YES (" & $int(cVisScrW()) & "x" &
+               $int(cVisScrH()) & " back buffer)")
+      of 1: vo("  on screen         : PARTIALLY -- crosses an edge")
       of 0:
-        iOut("  on screen         : NO -- outside the " & $int(cVisScrW()) &
-             "x" & $int(cVisScrH()) & " back buffer")
+        vo("  on screen         : NO -- outside the " & $int(cVisScrW()) &
+           "x" & $int(cVisScrH()) & " back buffer")
         if killer == "":
           killer = "the node's pixel rect lies entirely OFF the back " &
                    "buffer. Everything about it is correct except where it is."
@@ -4763,30 +4822,324 @@ proc iCmdVisible(toks: seq[string]) =
                      "finite number)")
 
   # ---- the verdict -------------------------------------------------------
-  iOut("")
+  vo("")
   if killer != "":
-    iOut("  VERDICT: NOT VISIBLE.")
-    iOut("  CAUSE:   " & killer)
+    vo("  VERDICT: NOT VISIBLE.")
+    vo("  CAUSE:   " & killer)
     if unknowns.len > 0:
-      iOut("  (Also " & $unknowns.len & " factor(s) could not be read; the " &
-           "cause above was MEASURED, so it stands regardless.)")
+      vo("  (Also " & $unknowns.len & " factor(s) could not be read; the " &
+         "cause above was MEASURED, so it stands regardless.)")
+    return 0
   elif unknowns.len > 0:
-    iOut("  VERDICT: INCONCLUSIVE -- every factor that could be read passed, " &
-         "and " & $unknowns.len & " could NOT be read. This is not a 'yes'.")
+    vo("  VERDICT: INCONCLUSIVE -- every factor that could be read passed, " &
+       "and " & $unknowns.len & " could NOT be read. This is not a 'yes'.")
     var i = 0
     while i < unknowns.len and i < 8:
-      iOut("    - " & unknowns[i])
+      vo("    - " & unknowns[i])
       inc i
     if unknowns.len > 8:
-      iOut("    - ... and " & $(unknowns.len - 8) & " more")
+      vo("    - ... and " & $(unknowns.len - 8) & " more")
+    return -1
   else:
-    iOut("  VERDICT: VISIBLE as far as this node's own state goes -- active, " &
-         "graphic enabled, opaque, on an enabled Canvas, non-degenerate, and " &
-         "on the back buffer.")
-    iOut("  NOT PROVEN: whether something DRAWS OVER IT. Occlusion is a " &
-         "question about other Canvases' sortingOrder and about siblings " &
-         "later in the draw order, and no field read on this node can " &
-         "settle it. Run `canvasorder` and compare.")
+    vo("  VERDICT: VISIBLE as far as this node's own state goes -- active, " &
+       "graphic enabled, opaque, on an enabled Canvas, non-degenerate, and " &
+       "on the back buffer.")
+    vo("  NOT PROVEN: whether something DRAWS OVER IT. Occlusion is a " &
+       "question about other Canvases' sortingOrder and about siblings " &
+       "later in the draw order, and no field read on this node can " &
+       "settle it. Run `canvasorder` and compare.")
+    return 1
+
+proc iCmdVisible(toks: seq[string]) =
+  ## `visible EXPR` -- the composite answer, with a VERDICT and the factor that
+  ## produced it. Delegates the measurement to `iVisEval` in verbose mode, so it
+  ## and `pressname` can never disagree.
+  if toks.len < 2:
+    iErr("usage: visible EXPR")
+    return
+  var v = 0'u64
+  var err = ""
+  if not iEval(toks[1], v, err):
+    iErr(err)
+    return
+  discard iVisEval(cast[Il2CppPtr](v), true)
+
+# ---------------------------------------------------------------------------
+# pressname -- the atomic find -> visible-filter -> component -> press.
+# ---------------------------------------------------------------------------
+const
+  PressNameMaxHits = 48
+    ## Cap on name matches collected. A name that matches this many nodes is
+    ## too ambiguous to be a press target anyway; the verdict will refuse.
+
+proc iPressComponentAndFire(node: Il2CppPtr): bool =
+  ## Resolve `DefaultUIButton` on `node` (a Transform or component) and fire its
+  ## OnClick at +0x120, exactly as `press` does -- read/validate the UnityEvent
+  ## slot, then call UnityEvent::Invoke. Returns true iff it actually fired.
+  ## Every failure names itself and returns false; nothing is ever blind-called.
+  var comp: Il2CppPtr = nil
+  var w = ""
+  if not iVisComponent(node, "DefaultUIButton", comp, w):
+    iErr("could not ask for a DefaultUIButton on the chosen node (" & w &
+         "). Nothing was pressed.")
+    return false
+  if comp == nil:
+    iErr("the chosen VISIBLE node has NO DefaultUIButton component. It is the " &
+         "right node by name and it is on screen, but it is not an EFT button. " &
+         "Nothing was pressed.")
+    return false
+  let off = cNavOffOnClick()   ## 0x120 on this build (DefaultUIButton.OnClick)
+  if not duOk(comp, off + 8'i32) or not iUnityAlive(comp):
+    iErr("the DefaultUIButton is not readable to +0x" & iHexPad(uint64(off), 3) &
+         ", or its native half is null. Nothing was pressed.")
+    return false
+  let ev = cReadPtrAt(comp, off)
+  var what = ""
+  if duOk(comp, 0xC0'i32):
+    let tp = cReadPtrAt(comp, 0xB8'i32)
+    if tp != nil and not iIsKnownKlass(cast[uint64](tp)):
+      what = suiReadString(tp)
+  iOut("  DefaultUIButton = " & iPtr(comp) &
+       (if what.len > 0: "   _text(+0xB8) = \"" & what & "\"" else: "") &
+       "   OnClick(+0x" & iHexPad(uint64(off), 3) & ") = " & iPtr(ev))
+  if ev == nil:
+    iErr("the OnClick slot is NULL -- no handler is wired to this button. " &
+         "Nothing was pressed.")
+    return false
+  if iIsGameObject(ev) or iIsKnownKlass(cast[uint64](ev)):
+    iErr("the OnClick slot does not hold a per-instance UnityEvent (it is a " &
+         "GameObject or a known klass pointer). Refusing to call it.")
+    return false
+  var fn: Il2CppPtr = nil
+  var rva = 0'u32
+  if not iNavFind("UnityEvent::Invoke", fn, rva):
+    return false
+  iMark("pressname: UnityEvent::Invoke", ev)
+  discard cInspUP(fn, ev, nil)
+  iOut("  pressed via UnityEngine.Events.UnityEvent::Invoke @0x" &
+       iHexPad(uint64(rva), 6) & ". NOTE: that the handler returned is NOT " &
+       "proof the intended effect happened -- confirm with `state`/`roots`.")
+  result = true
+
+proc iCmdPressName(toks: seq[string]) =
+  ## `pressname NAME [ROOT]` -- find GameObjects named like NAME (under ROOT, or
+  ## across every scene root), keep ONLY the ones whose `visible` verdict is
+  ## VISIBLE, and press that one -- but ONLY if there is EXACTLY ONE. Zero,
+  ## many, an incomplete search, or an unresolved button all REFUSE and say why.
+  ## This collapses the find -> visible -> component -> press dance (fact #240)
+  ## into one atomic, falsifiable step: the property it guarantees is "exactly
+  ## one VISIBLE candidate was pressed, or nothing was".
+  if toks.len < 2:
+    iErr("usage: pressname NAME [ROOT]")
+    return
+  if not iNavGate("pressname"):
+    return
+  let want = toks[1]
+  var roots: seq[Il2CppPtr] = @[]
+  var rootDesc = ""
+  if toks.len > 2:
+    var rv = 0'u64
+    var e = ""
+    if not iEval(toks[2], rv, e):
+      iErr(e)
+      return
+    let rp = iToTransform(cast[Il2CppPtr](rv))
+    if rp == nil or not duOk(rp, 0x20'i32) or not iUnityAlive(rp):
+      iErr("the ROOT \"" & toks[2] & "\" does not read back as a live " &
+           "Transform; nothing was searched. (An unreadable ROOT is exactly " &
+           "how a search reports a false 'not present'.)")
+      return
+    roots.add rp
+    rootDesc = "from " & iPtr(rp) & " name=\"" & iObjName(rp) & "\""
+  else:
+    let n = iSceneRoots(roots, false)
+    if n == 0:
+      iErr("scene-root enumeration did not work on this build, so pressname " &
+           "has nothing to search from. Pass an explicit ROOT. (INCONCLUSIVE)")
+      return
+    rootDesc = "ALL " & $n & " scene root(s)"
+  var hits: seq[Il2CppPtr] = @[]
+  var exhaustive = false
+  let nHits = iCollectByName(want, roots, InspFindDefBudget, PressNameMaxHits,
+                             hits, exhaustive)
+  iOut("  pressname \"" & want & "\": searched " & rootDesc & " and found " &
+       $nHits & " name match(es)" &
+       (if exhaustive: " (search EXHAUSTIVE)"
+        else: " (search STOPPED EARLY -- budget/time/hit cap)"))
+  if nHits == 0:
+    if exhaustive:
+      iErr("FAIL: no GameObject named like \"" & want & "\" exists under the " &
+           "searched roots. Nothing was pressed.")
+    else:
+      iErr("INCONCLUSIVE: no match found, but the search did not finish, so " &
+           "absence is not proven. Narrow with a ROOT and retry. Nothing was " &
+           "pressed.")
+    return
+  # Filter to the VISIBLE ones, reusing the SAME measurement `visible` prints.
+  var visible: seq[Il2CppPtr] = @[]
+  var inconclusive = 0
+  var i = 0
+  while i < hits.len:
+    case iVisEval(hits[i], false)
+    of 1: visible.add hits[i]
+    of -1: inc inconclusive
+    else: discard
+    inc i
+  iOut("  of those, VISIBLE=" & $visible.len & "  not-visible=" &
+       $(hits.len - visible.len - inconclusive) & "  inconclusive=" &
+       $inconclusive)
+  if visible.len == 1:
+    let node = visible[0]
+    iOut("  pressing the single VISIBLE candidate " & iPtr(node) &
+         " name=\"" & iObjName(node) & "\"")
+    if iPressComponentAndFire(node):
+      iOut("  pressname: PASS -- exactly one VISIBLE candidate, pressed.")
+    else:
+      iOut("  pressname: FAIL -- the single VISIBLE candidate could not be " &
+           "pressed (see the line above). Nothing else was tried.")
+    return
+  if visible.len == 0:
+    if inconclusive > 0:
+      iErr("INCONCLUSIVE: no candidate proved VISIBLE, but " & $inconclusive &
+           " could not be fully evaluated. Nothing was pressed.")
+    else:
+      iErr("FAIL: " & $hits.len & " name match(es), but NONE is visible " &
+           "(inactive, off-screen, transparent, or on a disabled Canvas). An " &
+           "inactive node is not pressable (fact #72). Nothing was pressed.")
+    return
+  iErr("REFUSED (ambiguous): " & $visible.len & " candidates are ALL VISIBLE, " &
+       "so pressing one would be a guess. Narrow with a ROOT, or press the " &
+       "specific one with `component`+`press`. Nothing was pressed.")
+
+# ---------------------------------------------------------------------------
+# CLICK RECORDER. Log what UI control a human just clicked, so a real
+# play-through can be turned into a menu-navigation script.
+#
+# CAPTURE ROUTE: EventSystem.current.currentSelectedGameObject. On a left-mouse
+# DOWN edge (detected with Win32 GetAsyncKeyState -- a native read, never an
+# IL2CPP call), the input module selects the pressed Selectable, so the
+# EventSystem's currentSelectedGameObject IS the clicked control for any
+# selectable UI (which EFT buttons are). Reliability caveat, stated honestly: a
+# click on a NON-selectable clickable, or on empty space, does not change the
+# selection, so a `clickrec:` line then names the LAST selected control or says
+# it had none -- it never invents one.
+#
+# SAFETY: armed OFF by default; only READS (no `allow write`); the whole body
+# runs under the inspector's single SEH guard (body mode 2), never nested; the
+# managed capture happens ONLY in a short window after a click edge, never on an
+# idle frame; every hop is VirtualQuery/liveness-checked; and it self-disables
+# after RecMaxFaults caught faults.
+# ---------------------------------------------------------------------------
+const
+  RecMaxAncestors  = 32   ## cap on the parent-path walk
+  RecCaptureFrames = 6    ## frames to look for the selection after a click edge
+  RecMaxFaults     = 8    ## caught faults before the recorder disarms itself
+
+var
+  gRecOn      = false     ## armed by `record on`; read-only, persists across batches
+  gRecPrevDown = false    ## previous frame's left-button state, for edge detect
+  gRecPending  = 0        ## >0 while trying to capture after a click edge
+  gRecFaults   = 0        ## caught faults; self-disable at RecMaxFaults
+
+proc iRecCaption(node: Il2CppPtr): string =
+  ## The EFT DefaultUIButton caption on `node`, if it has one: _text at +0xB8.
+  result = ""
+  var comp: Il2CppPtr = nil
+  var w = ""
+  if iVisComponent(node, "DefaultUIButton", comp, w) and comp != nil:
+    if duOk(comp, 0xC0'i32):
+      let tp = cReadPtrAt(comp, 0xB8'i32)
+      if tp != nil and not iIsKnownKlass(cast[uint64](tp)):
+        result = suiReadString(tp)
+
+proc iRecReport(go: Il2CppPtr) =
+  ## Emit exactly ONE `clickrec:` line to the host log for GameObject `go`:
+  ## its name, full root->leaf transform path, the nearest DefaultUIButton
+  ## caption at/above it, and the scene-root (screen) name. Uses okLog, not
+  ## iOut, because the recorder runs OUTSIDE any batch and iOut's buffer is only
+  ## flushed when a batch completes.
+  let nm = iObjName(go)
+  var chainNames: seq[string] = @[]
+  var caption = ""
+  var rootName = ""
+  var cur = iTransformOfGameObject(go)
+  var d = 0
+  while cur != nil and d < RecMaxAncestors:
+    let cn = iObjName(cur)
+    chainNames.add cn
+    rootName = cn
+    if caption == "":
+      let cap = iRecCaption(cur)
+      if cap.len > 0: caption = cap
+    cur = iVisParentOf(cur)
+    inc d
+  var path = ""
+  var i = chainNames.len - 1
+  while i >= 0:
+    if path.len > 0: path.add "/"
+    path.add chainNames[i]
+    dec i
+  okLog "clickrec: go=\"" & nm & "\"" &
+        (if caption.len > 0: "  caption=\"" & caption & "\"" else: "") &
+        "  screen=\"" & rootName & "\"  path=" & path
+
+proc inspRecorderBody() =
+  ## Body mode 2, run once per armed frame under the inspector's single SEH
+  ## guard (never nested -- inspTick invokes it through the same cInspGuarded
+  ## machinery as a command, sequentially). Native mouse read first; managed
+  ## capture only inside the post-click window.
+  let downNow = cRecLButtonDown() != 0'i32
+  let edge = downNow and not gRecPrevDown
+  gRecPrevDown = downNow
+  if edge and gRecPending == 0:
+    # A fresh click. The input module sets the selection in ITS Update, whose
+    # order against ours is undefined, so allow a few frames for it to land
+    # rather than reading a stale selection on the edge frame itself.
+    gRecPending = RecCaptureFrames
+  if gRecPending <= 0:
+    return
+  dec gRecPending
+  let lastTry = gRecPending == 0
+  var fn: Il2CppPtr = nil
+  if not iNavFindQuiet("EventSystem::get_current", fn) or fn == nil:
+    if lastTry:
+      okLog "clickrec: (EventSystem::get_current did not resolve/verify on " &
+            "this build -- cannot name the clicked control)"
+    return
+  iMark("clickrec: EventSystem::get_current", nil)
+  let es = cast[Il2CppPtr](cInspUV(fn, nil))   ## static getter: RCX = MethodInfo* (nil)
+  if es == nil or not duOk(es, cNavOffCurSelected() + 8'i32) or
+     not iUnityAlive(es):
+    if lastTry:
+      okLog "clickrec: (no active EventSystem, or it is not readable)"
+    return
+  let go = cReadPtrAt(es, cNavOffCurSelected())
+  if go == nil or not duOk(go, 0x20'i32) or not iUnityAlive(go):
+    if lastTry:
+      okLog "clickrec: (click selected nothing -- a non-selectable control or " &
+            "empty space)"
+    return
+  gRecPending = 0     ## captured; close the window so it emits exactly once
+  iRecReport(go)
+
+proc iCmdRecord(toks: seq[string]) =
+  ## `record on` / `record off` -- arm or disarm the click recorder. Read-only,
+  ## so it needs `liveInspector` but NOT `liveInspectorWrite`.
+  if toks.len < 2 or (iLower(toks[1]) != "on" and iLower(toks[1]) != "off"):
+    iOut("  usage: record on | record off   (currently " &
+         (if gRecOn: "ON" else: "OFF") & ")")
+    return
+  if iLower(toks[1]) == "on":
+    gRecOn = true
+    gRecPrevDown = false
+    gRecPending = 0
+    iOut("  click recorder ARMED. Left-click UI controls in the client; each " &
+         "click writes one `clickrec:` line to aowlspt-host.log. It only " &
+         "READS. Route: EventSystem.currentSelectedGameObject (reliable for " &
+         "selectable controls; a non-selectable click names the last selection).")
+  else:
+    gRecOn = false
+    iOut("  click recorder DISARMED.")
 
 # ---------------------------------------------------------------------------
 # whydidntitdraw
@@ -4877,6 +5230,10 @@ proc iCmdHelp() =
   iOut("    settext EXPR TEXT...          WRITE a label, via the real setters")
   iOut("                                  e.g.  find PvE")
   iOut("    press EXPR [OFF]              EFT DefaultUIButton.OnClick (+0x120)")
+  iOut("    pressname NAME [ROOT]         find -> keep the ONE VISIBLE -> press")
+  iOut("                                  it. Refuses on 0 or >1 visible (write)")
+  iOut("    record on | record off        log every UI click as `clickrec:`")
+  iOut("                                  to the host log (read-only)")
   iOut("    click EXPR                    Button::Press (checks interactable)")
   iOut("                                  e.g.  allow write | click $f1")
   iOut("    invoke EXPR                   fire m_OnClick directly, no checks")
@@ -5049,6 +5406,8 @@ proc iExec(line: string) =
     iCmdSetText(toks)
   of "press":
     iCmdPress(toks)
+  of "pressname":
+    iCmdPressName(toks)
   of "click":
     iCmdClick(toks, false)
   of "invoke":
@@ -5059,6 +5418,8 @@ proc iExec(line: string) =
     iCmdTab(toks)
   of "state", "where":
     iCmdState(toks)
+  of "record", "rec":
+    iCmdRecord(toks)
   of "wait", "until":
     # Handled by the batch runner itself, which has to park and resume across
     # frames. Reaching here means the runner did not intercept it, which would
@@ -5115,6 +5476,8 @@ proc inspBody(a: Il2CppPtr): Il2CppPtr {.
   ## branches runs per guarded call, and neither branch enters the guard again.
   if gInspBodyMode == 1:
     iRefreshAnchors()
+  elif gInspBodyMode == 2:
+    inspRecorderBody()
   else:
     iExec(gInspCmds[gInspCurIdx])
   result = cast[Il2CppPtr](1)
@@ -5293,6 +5656,23 @@ proc inspTick() =
     return
   # Watch the HOST thread from here, because a stuck poll cannot watch itself.
   inspPollWatchdog()
+  # THE CLICK RECORDER. Its own guarded pass, BEFORE any batch handling and
+  # never nested inside one. Gated on `record on`, so an unarmed session pays
+  # only this branch. A caught fault counts toward a self-disable rather than
+  # faulting every frame forever.
+  if gRecOn:
+    gInspBodyMode = 2
+    let recOk = cInspGuarded(cast[Il2CppPtr](0)) != nil
+    gInspBodyMode = 0
+    if not recOk:
+      inc gRecFaults
+      okLog "clickrec: !! recorder FAULTED (caught; game survived). LAST HOP: " &
+            readCString(cInspCrumb()) & "  at " & iPtr(cInspCrumbPtr()) &
+            "  (fault " & $gRecFaults & " of " & $RecMaxFaults & ")"
+      gRecPending = 0
+      if gRecFaults >= RecMaxFaults:
+        gRecOn = false
+        okLog "clickrec: !! too many faults; recorder DISARMED for this session."
   # ESCAPE RECOVERY. If a batch is still marked in-flight when the rider is
   # next entered, the previous run did not return normally -- it left through
   # a longjmp, taking the completion handshake with it. An escape cannot log
