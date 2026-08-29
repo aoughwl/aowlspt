@@ -119,9 +119,14 @@ const
   SplWarmupMs     = 5000'u64   ## the menu is not up before this; do not walk.
   SplHuntFrames   = 60         ## ~1 s at 60 fps while hunting/maintaining.
   SplSteadyFrames = 180        ## ~3 s once confirmed done -- just guards clobber.
-  SplWalkMs       = 6'u64      ## per-pass wall-clock slice, checked INSIDE the walk.
-  SplNodeBudget   = 3000       ## per-pass node cap, threaded through the recursion.
-  SplFanout       = 64         ## children examined per level.
+  SplWalkMs       = 18'u64     ## per-pass wall-clock slice, checked INSIDE the walk.
+  SplNodeBudget   = 24000      ## per-ROOT node cap (reset per root), threaded through the
+                               ## recursion. The offline-raid screen sits deep in the large
+                               ## "UI" root (the live inspector only reached it after ~thousands
+                               ## of nodes), so 3000 shared across all roots exhausted before
+                               ## reaching it -- the silent nil that hid this bug.
+  SplFanout       = 256        ## children examined per level -- the "UI" root has many child
+                               ## screens; 64 could cut off the target sibling.
   SplFindDepth    = 8          ## depth for the screen-by-name descent.
   SplScanDepth    = 12         ## depth for the by-text scan within the screen.
   SplBlockerUp    = 5          ## how far to climb from the toggle label to the blocker.
@@ -144,6 +149,10 @@ var gSplOff = false                ## self-disabled after faults
 var gSplFaults = 0
 var gSplT0 = 0'u64
 var gSplFrames = 0
+
+var gSplDiagPasses = 0             ## hunt passes since the last diag line (rate limiter)
+var gSplLastWhy = ""              ## the last discovery-failure reason we logged
+var gSplLastNodes = 0             ## nodes visited on the last screen descent
 
 var gSplResolved = false           ## heading TMP found; cache below is trusted
 var gSplHeadTmp: Il2CppPtr = nil   ## the "PRACTICE GAME MODE" TMP
@@ -287,6 +296,12 @@ proc splFindByName(t: Il2CppPtr; name: string; depth: int;
                    budget: var int; deadline: uint64): Il2CppPtr =
   ## A bounded, TIME-SLICED descent by object name. Three bounds (budget,
   ## in-walk deadline, depth+fan-out), mirroring `mtxDescend`.
+  ## BREADTH-BEFORE-DEPTH: at each node we check ALL of its direct children's
+  ## names before recursing into any subtree. The target here is a DIRECT child
+  ## of the large "UI" root, so a pure DFS would burn the whole budget on the
+  ## earlier siblings' (also large) subtrees before ever reaching it -- exactly
+  ## the budget-exhaustion that returned nil forever. Checking the sibling names
+  ## first reaches a direct child in O(#siblings) nodes, not O(subtree).
   result = nil
   if t == nil or depth < 0 or budget <= 0 or not duOk(t, 0x20'i32): return
   budget = budget - 1
@@ -298,7 +313,20 @@ proc splFindByName(t: Il2CppPtr; name: string; depth: int;
   if depth == 0: return
   var n = 0
   if not iChildCount(t, n): return
+  # Pass 1 -- breadth: name-check every direct child (cheap; no descent).
   var i = 0
+  while i < n and i < SplFanout and budget > 0:
+    let c = iChildAt(t, i)
+    if c != nil and duOk(c, 0x20'i32):
+      budget = budget - 1
+      if (budget and 31) == 0 and cNowMs() > deadline:
+        budget = 0
+        return
+      if iObjName(c) == name:
+        return c
+    i = i + 1
+  # Pass 2 -- depth: recurse only after the whole level missed by name.
+  i = 0
   while i < n and i < SplFanout and budget > 0:
     let c = iChildAt(t, i)
     if c != nil:
@@ -306,25 +334,65 @@ proc splFindByName(t: Il2CppPtr; name: string; depth: int;
       if result != nil: return
     i = i + 1
 
-proc splFindScreen(): Il2CppPtr =
-  ## The "Matchmaker Offline Raid Screen" transform, from every scene root, ONE
-  ## shared node budget and in-walk deadline across all roots. `iSceneRoots`
-  ## reaches `Menu UI` (a SceneManager-listed scene on this build), so this does
-  ## not depend on the live inspector's `gInspPreloader` anchor. A nil return
-  ## means the screen is not up right now, which is the common case.
+proc splAnchor(): Il2CppPtr =
+  ## A DURABLE, inspector-independent anchor into the DontDestroyOnLoad scene --
+  ## where the live UI (and the "Matchmaker Offline Raid Screen") actually lives,
+  ## since SceneManager excludes that scene BY DESIGN (CLAUDE.md 2).
+  ##
+  ## `iSceneRoots(roots, false)` with anchor=nil falls back to `gInspPreloader`,
+  ## which has exactly ONE writer: the LIVE INSPECTOR's rider. With
+  ## liveInspector=false (every beta user) that global is never set, the
+  ## DontDestroyOnLoad scene is never enumerated, and this feature was DEAD.
+  ## `gVerPreloader` is the version-brand's PreloaderUI `this`, captured in a
+  ## postfix at ~1.3 s independent of the inspector (aowlhost.nim) -- the same
+  ## dual-anchor cure the mode button and version brand already use. Both are
+  ## PreloaderUI, which lives in DontDestroyOnLoad, so either makes
+  ## `iAnchorSceneHandle` enumerate that scene's roots (including "UI").
   result = nil
+  if gVerPreloader != nil and duOk(gVerPreloader, 0x20'i32):
+    return gVerPreloader
+  if gInspPreloader != nil and duOk(gInspPreloader, 0x20'i32):
+    return gInspPreloader
+
+proc splFindScreen(): Il2CppPtr =
+  ## The "Matchmaker Offline Raid Screen" transform. Reaches DontDestroyOnLoad
+  ## via our own durable anchor (NOT the inspector), and gives EACH root the full
+  ## node budget (reset per root) so the deep, wide "UI" root is not starved by
+  ## whatever was walked before it. Sets `gSplLastWhy`/`gSplLastNodes` so the
+  ## caller can log WHY, rate-limited -- a nil here used to be silent, which is
+  ## what hid this bug (CLAUDE.md 6/9b).
+  result = nil
+  gSplLastNodes = 0
+  let anchor = splAnchor()
   var roots: seq[Il2CppPtr] = @[]
-  discard iSceneRoots(roots, false)
-  if roots.len == 0: return
+  discard iSceneRoots(roots, false, anchor)
+  if roots.len == 0:
+    gSplLastWhy = (if anchor == nil:
+      "iSceneRoots returned NO roots and this feature has no durable anchor " &
+      "yet (gVerPreloader/gInspPreloader both null). If liveInspector is off " &
+      "this resolves once the version-brand PreloaderUI postfix has fired (~1.3s)."
+      else:
+      "iSceneRoots returned NO roots even WITH a durable anchor -- the menu is " &
+      "likely not up yet.")
+    return
   let deadline = cNowMs() + SplWalkMs
-  var budget = SplNodeBudget
   var i = 0
-  while i < roots.len and budget > 0:
+  while i < roots.len:
+    var budget = SplNodeBudget                 # per-ROOT budget, reset each root
     let r = iToTransform(roots[i])
     if r != nil and duOk(r, 0x20'i32):
       let m = splFindByName(r, SplScreenName, SplFindDepth, budget, deadline)
-      if m != nil: return m
+      gSplLastNodes = gSplLastNodes + (SplNodeBudget - budget)
+      if m != nil:
+        gSplLastWhy = ""
+        return m
+    if cNowMs() > deadline: break
     i = i + 1
+  gSplLastWhy = "screen \"" & SplScreenName & "\" NOT found across " &
+    $roots.len & " root(s) with a per-root budget of " & $SplNodeBudget &
+    " (" & $gSplLastNodes & " nodes visited, " & $int(SplWalkMs) &
+    " ms slice). Normal when the offline-raid screen is not open; if it IS " &
+    "open and this persists, raise the budget or the slice."
 
 proc splIsCoopWarn(low: string): bool =
   ## True only for the co-op / Edge-of-Darkness "your progress is not saved/
@@ -538,6 +606,18 @@ proc splMaintain() =
 # ---------------------------------------------------------------------------
 # The guarded body + the drain rider.
 # ---------------------------------------------------------------------------
+var gSplLastWhyLogged = ""
+proc splDiag(reason: string) =
+  ## Rate-limited "why discovery has not fired" line. Logs when the reason
+  ## CHANGES, or at most once per ~30 hunt passes (~30 s), so a failure path can
+  ## no longer decline silently (CLAUDE.md 6) without spamming the log.
+  if reason.len == 0: return
+  inc gSplDiagPasses
+  if reason != gSplLastWhyLogged or gSplDiagPasses >= 30:
+    gSplDiagPasses = 0
+    gSplLastWhyLogged = reason
+    warn "singleplayer rebrand: not resolved -- " & reason
+
 proc splRebrandTickBody(a: Il2CppPtr): Il2CppPtr {.
     exportc: "aowl_spl_tick_body", cdecl.} =
   ## Everything that touches managed memory, under ONE guard. Returns a non-nil
@@ -561,11 +641,17 @@ proc splRebrandTickBody(a: Il2CppPtr): Il2CppPtr {.
 
   if not gSplResolved:
     let screen = splFindScreen()
-    if screen == nil: return              # not up right now -- quiet, not a fault
+    if screen == nil:
+      splDiag(gSplLastWhy)                # announce WHY, rate-limited (was silent)
+      return
     var budget = SplNodeBudget
     let deadline = cNowMs() + SplWalkMs
     splScanNode(screen, SplScanDepth, budget, deadline)
     if gSplHeadTmp == nil:
+      splDiag("screen \"" & SplScreenName & "\" WAS found, but its heading TMP " &
+        "(text containing \"" & SplHeadStock & "\") was not read within depth " &
+        $SplScanDepth & "/" & $int(SplWalkMs) & " ms -- the screen may still be " &
+        "building; retrying.")
       return                              # screen present but heading not read yet
     gSplResolved = true
     okLog "singleplayer rebrand: resolved on \"" & SplScreenName &
