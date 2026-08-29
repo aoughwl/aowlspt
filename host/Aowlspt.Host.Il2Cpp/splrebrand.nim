@@ -82,6 +82,12 @@
 # ---- the exact stock text this screen ships (lower-cased for matching) ----
 const
   SplScreenName   = "Matchmaker Offline Raid Screen"
+  # The offline-raid screen lives under one of these DontDestroyOnLoad roots
+  # (measured: "Menu UI"). Search them FIRST -- the early roots like
+  # "Application (Main Client)" are enormous and a plain 0..N walk burns the
+  # whole time-slice on them before ever reaching Menu UI (root ~#20 of 22).
+  SplUiRoot0      = "Menu UI"
+  SplUiRoot1      = "Common UI"
   SplBlockerName  = "SoloModeCheckmarkBlocker"
   SplHeadStock    = "practice game mode"
   SplDescStock    = "in this mode"
@@ -381,16 +387,38 @@ proc splFindScreen(): Il2CppPtr =
       "likely not up yet.")
     return
   let deadline = cNowMs() + SplWalkMs
+  # Pass 1 -- the UI-bearing roots BY NAME ("Menu UI"/"Common UI"), where the
+  # screen actually is. This is the fix: a plain 0..N walk let the giant early
+  # roots ("Application (Main Client)") consume the whole 18ms slice before
+  # reaching "Menu UI" (~root #20), so the screen was NEVER found though it was
+  # present. Searching the UI roots first reaches it with budget to spare.
   var i = 0
   while i < roots.len:
-    var budget = SplNodeBudget                 # per-ROOT budget, reset each root
     let r = iToTransform(roots[i])
     if r != nil and duOk(r, 0x20'i32):
-      let m = splFindByName(r, SplScreenName, SplFindDepth, budget, deadline)
-      gSplLastNodes = gSplLastNodes + (SplNodeBudget - budget)
-      if m != nil:
-        gSplLastWhy = ""
-        return m
+      let nm = iObjName(r)
+      if nm == SplUiRoot0 or nm == SplUiRoot1:
+        var budget = SplNodeBudget
+        let m = splFindByName(r, SplScreenName, SplFindDepth, budget, deadline)
+        gSplLastNodes = gSplLastNodes + (SplNodeBudget - budget)
+        if m != nil:
+          gSplLastWhy = ""
+          return m
+    if cNowMs() > deadline: break
+    i = i + 1
+  # Pass 2 -- fallback: every other root, in case the screen ever moves.
+  i = 0
+  while i < roots.len:
+    let r = iToTransform(roots[i])
+    if r != nil and duOk(r, 0x20'i32):
+      let nm = iObjName(r)
+      if nm != SplUiRoot0 and nm != SplUiRoot1:
+        var budget = SplNodeBudget                 # per-ROOT budget, reset each root
+        let m = splFindByName(r, SplScreenName, SplFindDepth, budget, deadline)
+        gSplLastNodes = gSplLastNodes + (SplNodeBudget - budget)
+        if m != nil:
+          gSplLastWhy = ""
+          return m
     if cNowMs() > deadline: break
     i = i + 1
   gSplLastWhy = "screen \"" & SplScreenName & "\" NOT found across " &
