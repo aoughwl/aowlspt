@@ -479,62 +479,84 @@ proc splWarnContainer(t: Il2CppPtr; nameOut: var string): Il2CppPtr =
     up = splParent(up)
     k = k + 1
 
-proc splScanNode(t: Il2CppPtr; depth: int; budget: var int; deadline: uint64) =
-  ## DFS the screen subtree; at each node read its TMP text and, by CONTENT,
-  ## fill whichever of the three targets it is. Bounded exactly like the name
-  ## descent. Records into the module-level cache.
-  if t == nil or depth < 0 or budget <= 0 or not duOk(t, 0x20'i32): return
-  budget = budget - 1
-  if (budget and 31) == 0 and cNowMs() > deadline:
-    budget = 0
-    return
+proc splScanOne(t: Il2CppPtr) =
+  ## Read ONE node's TMP text and, by CONTENT, fill whichever target it is.
   let tmp = splTmpOf(t)
-  if tmp != nil:
-    let low = iLower(splTmpText(tmp))
-    if low.len > 0:
-      if gSplHeadTmp == nil and iContains(low, SplHeadStock):
-        gSplHeadTmp = tmp
-        gSplHeadLoc = splComponent(t, splLocTypeStr())
-      elif gSplDescTmp == nil and iContains(low, SplDescStock):
-        gSplDescTmp = tmp
-        gSplDescLoc = splComponent(t, splLocTypeStr())
-      elif gSplCheckGo == nil and iContains(low, SplToggleStock):
-        # Climb to the SoloModeCheckmarkBlocker and take BOTH its GameObject
-        # (to hide) and its UpdatableToggle component (to force ON, fact #71).
-        var up = t
-        var k = 0
-        while k < SplBlockerUp and up != nil:
-          if iObjName(up) == SplBlockerName:
-            let go = iGameObjectOf(up)
-            if go != nil and duOk(go, 0x20'i32):
-              gSplCheckGo = go
-            let tog = splComponent(up, splTogTypeStr())
-            if tog != nil and duOk(tog, cSwOffToggleIsOn() + 8'i32):
-              gSplToggle = tog
-            break
-          up = splParent(up)
-          k = k + 1
-      # The co-op / EoD "progress is not saved/shared" warning is an INDEPENDENT
-      # target (its text collides with none of the three above), so this is its
-      # own `if`, not part of the elif chain. Matched by content, weapon warning
-      # excluded, container taken by climbing like the checkbox blocker.
-      if gSplWarnGo == nil and splIsCoopWarn(low):
-        var wn = ""
-        let wg = splWarnContainer(t, wn)
-        if wg != nil:
-          gSplWarnGo = wg
-          gSplWarnText = low
-          gSplWarnName = wn
-          gSplWarnMatched = true
-  if depth == 0: return
-  var n = 0
-  if not iChildCount(t, n): return
-  var i = 0
-  while i < n and i < SplFanout and budget > 0:
-    let c = iChildAt(t, i)
-    if c != nil:
-      splScanNode(c, depth - 1, budget, deadline)
-    i = i + 1
+  if tmp == nil: return
+  let low = iLower(splTmpText(tmp))
+  if low.len == 0: return
+  if gSplHeadTmp == nil and iContains(low, SplHeadStock):
+    gSplHeadTmp = tmp
+    gSplHeadLoc = splComponent(t, splLocTypeStr())
+  elif gSplDescTmp == nil and iContains(low, SplDescStock):
+    gSplDescTmp = tmp
+    gSplDescLoc = splComponent(t, splLocTypeStr())
+  elif gSplCheckGo == nil and iContains(low, SplToggleStock):
+    # Climb to the SoloModeCheckmarkBlocker and take BOTH its GameObject
+    # (to hide) and its UpdatableToggle component (to force ON, fact #71).
+    var up = t
+    var k = 0
+    while k < SplBlockerUp and up != nil:
+      if iObjName(up) == SplBlockerName:
+        let go = iGameObjectOf(up)
+        if go != nil and duOk(go, 0x20'i32):
+          gSplCheckGo = go
+        let tog = splComponent(up, splTogTypeStr())
+        if tog != nil and duOk(tog, cSwOffToggleIsOn() + 8'i32):
+          gSplToggle = tog
+        break
+      up = splParent(up)
+      k = k + 1
+  # The co-op / EoD "progress is not saved/shared" warning is an INDEPENDENT
+  # target (its text collides with none of the three above), so this is its own
+  # check, not part of the elif chain. Matched by content, weapon warning
+  # excluded, container taken by climbing like the checkbox blocker.
+  if gSplWarnGo == nil and splIsCoopWarn(low):
+    var wn = ""
+    let wg = splWarnContainer(t, wn)
+    if wg != nil:
+      gSplWarnGo = wg
+      gSplWarnText = low
+      gSplWarnName = wn
+      gSplWarnMatched = true
+
+proc splScanNode(t: Il2CppPtr; depth: int; budget: var int; deadline: uint64) =
+  ## BREADTH-FIRST scan of the screen subtree. The three targets (MainCaption
+  ## under CaptionsHolder, the checkbox Label under SoloModeCheckmarkBlocker, the
+  ## Warning Caption under WarningTextVertLayout) are all SHALLOW; the deep,
+  ## expensive subtrees are the settings-list rows. A DFS dove into those first
+  ## and the 18 ms slice expired before it reached the shallow captions (measured
+  ## live: the whole subtree is ~494 nodes but each TMP read is costly). BFS
+  ## visits shallow nodes first, so the captions are hit in the first ~100 nodes,
+  ## and it EARLY-OUTs the moment all targets are in hand.
+  if t == nil or depth < 0 or budget <= 0 or not duOk(t, 0x20'i32): return
+  var frontier: seq[Il2CppPtr] = @[t]
+  var d = 0
+  while frontier.len > 0 and d <= depth and budget > 0:
+    var nextf: seq[Il2CppPtr] = @[]
+    var fi = 0
+    while fi < frontier.len and budget > 0:
+      let node = frontier[fi]
+      fi = fi + 1
+      if node == nil or not duOk(node, 0x20'i32): continue
+      budget = budget - 1
+      if (budget and 31) == 0 and cNowMs() > deadline:
+        budget = 0
+        return
+      splScanOne(node)
+      # Early-out: everything we relabel/hide is in hand (desc is optional).
+      if gSplHeadTmp != nil and gSplCheckGo != nil and gSplWarnGo != nil:
+        return
+      if d < depth:
+        var n = 0
+        if iChildCount(node, n):
+          var i = 0
+          while i < n and i < SplFanout:
+            let c = iChildAt(node, i)
+            if c != nil: nextf.add c
+            i = i + 1
+    frontier = nextf
+    d = d + 1
 
 # ---------------------------------------------------------------------------
 # Maintain + assert the FINISHED STATE (never our own write -- fact #9b).
