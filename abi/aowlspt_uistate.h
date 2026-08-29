@@ -15,15 +15,20 @@
  *   bit0  AOWL_UI_OVL_SETTINGS  the GAME's Settings screen is open
  *   bit1  AOWL_UI_OVL_ADMIN     our F6 admin overlay is open
  *   bit2  AOWL_UI_OVL_DEBUG     our F3 debug overlay is open
+ *   bit3  AOWL_UI_OVL_OVERLAY   our F12 mod-manager / settings panel is open
  * Higher bits are reserved; a surface whose state cannot be determined reads 0
  * (an honestly-absent signal, never a guessed 1 -- CLAUDE.md 9b).
  *
  * HOW EACH BIT IS SOURCED
  * -----------------------
- * bit1/bit2 are LEVELS already maintained by the cursor module
- * (`aowlspt_cursor.h`): the overlay DLL publishes F6 (ADMIN) and the host
- * publishes F3 (DEBUGUI) every frame, and a publication expires after
- * `AOWL_CUR_STALE_MS`. We read that union -- no game call, no new detour.
+ * bit1/bit2/bit3 are LEVELS already maintained by the cursor module
+ * (`aowlspt_cursor.h`): the overlay DLL publishes F12 (OVERLAY, the mod-manager
+ * / settings panel) and F6 (ADMIN) and the host publishes F3 (DEBUGUI) every
+ * frame, and a publication expires after `AOWL_CUR_STALE_MS`. We read that union
+ * -- no game call, no new detour. bit3 was added because the F12 panel is the
+ * one the launch hint tells the player to press ("F12 for Mod Settings"); it is
+ * a full-screen blocking surface, yet its cursor bit (AOWL_CUR_P_OVERLAY) was
+ * never folded into this mask, so a HUD polling the mask kept drawing over it.
  *
  * bit0 is NOT a level the host already maintained. `gSettingsLiveSelf` is the
  * LAST-KNOWN SettingsScreen `this` (settingsui.nim); it is set on the ShowScreen
@@ -66,10 +71,11 @@
 #include <stdint.h>
 
 /* Public, for mod consumers. */
-#define AOWL_UI_OVL_SETTINGS  0x1u   /* the GAME's Settings screen is open */
-#define AOWL_UI_OVL_ADMIN     0x2u   /* our F6 admin overlay is open       */
-#define AOWL_UI_OVL_DEBUG     0x4u   /* our F3 debug overlay is open       */
-#define AOWL_UI_OVL_ALL       0x7u
+#define AOWL_UI_OVL_SETTINGS  0x1u   /* the GAME's Settings screen is open  */
+#define AOWL_UI_OVL_ADMIN     0x2u   /* our F6 admin overlay is open        */
+#define AOWL_UI_OVL_DEBUG     0x4u   /* our F3 debug overlay is open        */
+#define AOWL_UI_OVL_OVERLAY   0x8u   /* our F12 mod-manager/settings panel  */
+#define AOWL_UI_OVL_ALL       0xFu
 
 #define AOWL_UI_MAX_FAULTS  3
 
