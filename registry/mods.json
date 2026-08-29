@@ -520,6 +520,47 @@
         "bots",
         "data"
       ]
+    },
+    {
+      "id": "aowl.voice",
+      "name": "Voice Agents",
+      "author": "savannt",
+      "version": "0.1.0",
+      "description": "Server-side conversational agents with voice: a STT (whisper.cpp) -> LLM -> TTS (piper) pipeline served from the backend under /aowlspt/voice/*, plus a response+line cache that returns previously generated replies and their wav without re-running the LLM or TTS. An agent is an identity (a raid scav and your personal assistant are two rows of one table); a radio routes utterances to whichever agent can answer. Default OFF because turning it on spawns subprocesses and loads large models. There is no local .gguf on this machine, so the default reasoning engine is 'builtin', a template responder that says so in every reply; llamacpp/openai are wired and probed honestly. In no shipped list on purpose: it is meant to be switched on by hand.",
+      "pipeline": ">=0.1.0",
+      "sides": [
+        "server",
+        "sim"
+      ],
+      "source": {
+        "kind": "intree",
+        "path": "mods/voice",
+        "url": null
+      },
+      "artifact": {
+        "dir": "voice",
+        "library": "voice.dll"
+      },
+      "upstream": {
+        "name": "EscapeFromMyBasement",
+        "author": "savannt",
+        "url": null
+      },
+      "license": "see repository",
+      "download": null,
+      "requires": [],
+      "conflicts": [],
+      "provides": [
+        "aowl.capability.voiceagents"
+      ],
+      "loadAfter": [
+        "aowl.tarkov"
+      ],
+      "tags": [
+        "server",
+        "voice",
+        "ai"
+      ]
     }
   ],
   "lists": [
