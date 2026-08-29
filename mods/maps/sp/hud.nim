@@ -166,6 +166,28 @@ static struct {
     int64_t  drawUsLast, drawUsPeak;
     double   drawUsEwma;
     int32_t  tilesLastFrame;   /* tiles submitted on the most recent drawn frame */
+
+    /* THE HELD FRAME (the ESP/radar flicker fix). The publisher fills the mirror
+     * above on the everyMain collector tick; the region dispatches `mhud_draw`
+     * on its OWN, faster and unaligned cadence, so most dispatches arrive
+     * between publishes -- and a collector tick that failed to resolve a local
+     * centre (a 1-frame classification miss in AllAlivePlayersList, a momentarily
+     * null MainPlayer) publishes hasLocal=0. The draw used to return on every
+     * such dispatch, blanking the whole HUD for that Present -- the measured
+     * "drawn on N of MANY dispatched" -- which the player sees as flicker.
+     *
+     * So the last dispatch that had a fresh centre is COPIED here, and any later
+     * dispatch that arrives without a fresh centre RE-DRAWS this held frame
+     * instead of submitting nothing. It is cleared ONLY when the publisher says
+     * the raid has ended (inRaid == 0), which is the one explicit empty commit --
+     * so a stale radar cannot linger into the menu, but a transient one-frame
+     * feed gap no longer flickers. */
+    int32_t  heldValid;
+    int32_t  heldN;
+    MHudEnt  heldE[MHUD_MAX];
+    float    heldPx, heldPy, heldPz;
+    float    heldHeading;
+    int32_t  heldHasHeading;
 } g_mhud;
 
 /* THE CLOCK. `GetTickCount64` is declared here rather than by including
@@ -758,8 +780,40 @@ static void mhud_draw(void* user, int64_t frame) {
      * cache that lingers in the menu, on the deploy screen before spawn, and
      * after extract no longer paints an overlay. Nothing is submitted, and the
      * diag says `not in a raid, HUD idle`. */
-    if (!g_mhud.inRaid) { g_art.refusal = MA_REFUSE_NORAID; return; }
-    if (!g_mhud.hasLocal) return;   /* no centre => nothing truthful to draw */
+    if (!g_mhud.inRaid) {
+        /* Left the raid: the one explicit empty commit. Drop the held frame so a
+         * stale radar cannot linger into the menu, and submit nothing. */
+        g_art.refusal = MA_REFUSE_NORAID;
+        g_mhud.heldValid = 0;
+        return;
+    }
+    if (g_mhud.hasLocal) {
+        /* A fresh centre: draw it, and remember it as the held frame so the
+         * dispatches that arrive between the next two publishes can re-draw it. */
+        int32_t hn = g_mhud.n < 0 ? 0 : (g_mhud.n > MHUD_MAX ? MHUD_MAX : g_mhud.n);
+        g_mhud.heldN = hn;
+        g_mhud.heldPx = g_mhud.px; g_mhud.heldPy = g_mhud.py; g_mhud.heldPz = g_mhud.pz;
+        g_mhud.heldHeading = g_mhud.heading;
+        g_mhud.heldHasHeading = g_mhud.hasHeading;
+        memcpy(g_mhud.heldE, g_mhud.e, sizeof(MHudEnt) * (size_t)hn);
+        g_mhud.heldValid = 1;
+    } else {
+        /* No fresh centre on this dispatch (a one-frame feed gap). Re-draw the
+         * held frame rather than blanking -- that is the flicker fix. Nothing to
+         * hold yet means there has genuinely been nothing to draw. */
+        if (!g_mhud.heldValid) return;
+        g_mhud.n = g_mhud.heldN;
+        g_mhud.px = g_mhud.heldPx; g_mhud.py = g_mhud.heldPy; g_mhud.pz = g_mhud.heldPz;
+        g_mhud.heading = g_mhud.heldHeading;
+        g_mhud.hasHeading = g_mhud.heldHasHeading;
+        memcpy(g_mhud.e, g_mhud.heldE,
+               sizeof(MHudEnt) * (size_t)(g_mhud.heldN < 0 ? 0 : g_mhud.heldN));
+        /* The art layer and the player arrow gate on hasLocal; a held redraw HAS
+         * a centre (the held one), so present it as such for this frame. The
+         * publisher rewrites hasLocal on its next tick, so this local override
+         * never outlives the frame's own data. */
+        g_mhud.hasLocal = 1;
+    }
     g_mhud.drawn++;
     _t0 = mhud_now_us();
 
@@ -1197,9 +1251,12 @@ proc cHudTilesLast(): int32 {.importc: "mhud_tiles_last", nodecl.}
 # diagnostic reads.
 #
 # They are the FINISHED-STATE evidence the diag asserts on: `frames` counts
-# dispatches, `drawn` counts the dispatches that had a local player to centre
-# on, and `blips` counts marks actually emitted. frames > 0 with drawn == 0 is
-# precisely the silent failure this mod shipped with.
+# dispatches, `drawn` counts the dispatches that submitted a frame -- one with a
+# fresh centre OR the held frame re-drawn over a one-frame feed gap (the flicker
+# fix), so in a raid `drawn` now tracks `frames` closely instead of lagging it,
+# and that gap closing IS the confirmation the flicker is gone. `blips` counts
+# marks actually emitted. frames > 0 with drawn == 0 is still the silent failure
+# this mod shipped with (no centre has EVER validated), which stays visible.
 proc hudFrames*(): int64 = cHudFrames()
 proc hudDrawn*(): int64 = cHudDrawn()
 proc hudBlips*(): int64 = cHudBlips()
@@ -1436,11 +1493,21 @@ proc hudPublish*(snap: Snapshot) =
   ## Unity's thread, right after `collect`. Copies the already-guarded POD
   ## positions into the C mirror. Reads no game memory of its own.
   let active = activeRaid(snap)
-  if snap.localIdx < 0 or snap.localIdx >= snap.n or not active:
-    # No validated centre, or not an active raid: publish an idle mirror so the
-    # draw callback submits nothing. The `not active` arm is the lifecycle gate
-    # (bug 1) -- it holds even when a stale borrowed cache still yields a pose.
+  if not active:
+    # NOT an active raid: the lifecycle gate (bug 1). This is the one explicit
+    # empty commit -- inRaid=0 tells the draw to DROP its held frame and submit
+    # nothing, so a stale radar cannot linger into the menu. It holds even when a
+    # stale borrowed cache still yields a pose.
     cHudBegin(0.0, 0.0, 0.0, 0'i32, 0.0, 0'i32, 0'i32)
+    return
+  if snap.localIdx < 0 or snap.localIdx >= snap.n:
+    # In a raid, but this collector tick did not resolve a local centre (a
+    # one-frame classification miss in the alive-players list, a momentarily
+    # null MainPlayer). Publish an IN-RAID mirror with no fresh centre
+    # (hasLocal=0, inRaid=1): the draw RE-DRAWS its held frame rather than
+    # blanking, which is the ESP/radar flicker fix. The held frame is cleared
+    # only by the `not active` arm above, never by a transient gap like this.
+    cHudBegin(0.0, 0.0, 0.0, 0'i32, 0.0, 0'i32, 1'i32)
     return
   let me = snap.ents[snap.localIdx]
   cHudBegin(cfloat(me.x), cfloat(me.y), cfloat(me.z), 1'i32,
