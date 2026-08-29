@@ -300,22 +300,87 @@ proc weaponCaliber(tpl: string): string =
     return ""
   result = v.asText()
 
+proc magAcceptedAmmo(magTpl: string): JsonRef =
+  ## `_props.Cartridges[0]._props.filters[0].Filter` -- the list of ammo
+  ## templates a magazine will physically accept, verified against a real
+  ## database (`564ca99c...` lists 13). This is the coherence oracle for what
+  ## goes in a mag: the client refuses to load a cartridge that is not in here,
+  ## so a mag "filled" with an ammo the filter omits is a bot that spawns with
+  ## an empty gun. `notFound` when the item declares no cartridge filter, which
+  ## the caller reads as "no constraint to check against".
+  let v = dbRead("templates.items." & magTpl & "._props.Cartridges")
+  if not v.ok:
+    return notFound()
+  let first = at(whole(v.raw), 0)
+  if not first.found:
+    return notFound()
+  result = first.field("_props").field("filters").at(0).field("Filter")
+
+proc listContains(list: JsonRef; want: string): bool =
+  ## Whether a JSON array of strings carries `want`.
+  if not list.found or not isArray(list):
+    return false
+  let n = count(list)
+  var i = 0
+  while i < n:
+    if at(list, i).asText("") == want:
+      return true
+    inc i
+  result = false
+
+proc pickAcceptedAmmo(pool, accepted: JsonRef; r: var Rng): string =
+  ## One ammo template that the caliber pool offers AND the magazine accepts.
+  ##
+  ## The pool is `inventory.Ammo.<caliber>`, a weight map the role prefers; the
+  ## filter is the magazine's own accepted list. Their intersection is the only
+  ## coherent answer: a round the role wants but the mag cannot hold jams the
+  ## gun, and a round the mag holds but the role never lists is not this role's
+  ## ammo. Rebuilds the weight map down to the accepted entries and draws from
+  ## it, so the role's weighting still decides *which* accepted round. When the
+  ## magazine declares no filter (`accepted` absent) the whole pool is eligible,
+  ## which is the pre-existing behaviour and the right one -- an unfiltered mag
+  ## constrains nothing.
+  if not pool.found or not isObject(pool):
+    return ""
+  let haveFilter = accepted.found and isArray(accepted) and count(accepted) > 0
+  let entries = members(pool)
+  var names: seq[string] = @[]
+  var weights: seq[float] = @[]
+  for m in entries:
+    let w = whole(m.value).asFloat(0.0)
+    if w <= 0.0:
+      continue
+    if haveFilter and not listContains(accepted, m.name):
+      continue
+    names.add m.name
+    weights.add w
+  let at1 = pickWeighted(r, weights)
+  if at1 < 0:
+    return ""
+  result = names[at1]
+
 proc fillMagazine(inv: JsonRef; items: var List; magId, magTpl, caliber: string;
                   r: var Rng) =
-  ## Puts rounds in a magazine, drawn from `inventory.Ammo.<caliber>`.
+  ## Puts rounds in a magazine, drawn from `inventory.Ammo.<caliber>` and
+  ## constrained to what the magazine itself accepts.
   ##
-  ## Silent when the caliber is unknown, the pool is empty or the capacity is
-  ## not in the item table. An empty magazine is a bot that fires once and then
-  ## does not; a magazine full of the wrong caliber is a bot the client refuses
-  ## to spawn, and of the two only the first is recoverable by the player
-  ## shooting it.
+  ## Silent when the caliber is unknown, the pool is empty, the capacity is not
+  ## in the item table, or no round satisfies both the role's pool and the mag's
+  ## filter. An empty magazine is a bot that fires once and then does not; a
+  ## magazine loaded with a round it does not accept is a bot the client refuses
+  ## to spawn -- so the ammo is intersected with the mag's own
+  ## `Cartridges[0].filters` (`pickAcceptedAmmo`) rather than assuming the role's
+  ## caliber pool and this specific magazine agree. They do on stock data; the
+  ## check is what keeps a caliber-conversion mag or a hand-edited table from
+  ## producing the empty gun a player pulled off a corpse.
   if caliber.len == 0 or magTpl.len == 0:
     return
   let capacity = magazineCapacity(magTpl)
   if capacity <= 0:
     return
   let pool = inv.field("Ammo").field(caliber)
-  let ammo = pickTemplate(pool, r)
+  let accepted = magAcceptedAmmo(magTpl)
+  let ammo = pickAcceptedAmmo(pool, accepted, r)
   if ammo.len == 0:
     return
   var d = botItem(newId(), ammo, magId, "cartridges")
@@ -960,6 +1025,21 @@ proc botBase*(): string =
       gBotBase = v.raw
   result = gBotBase
 
+proc botSideForRole(role: string): string =
+  ## The `Info.Side` a role spawns on. Read off the role name because that is
+  ## the only thing the client hands us: a PMC wave asks for `pmcUSEC`/`pmcBEAR`,
+  ## and a bot generated for one has to come back on the `Usec`/`Bear` side or
+  ## the client counts it as a scav -- the whole point of spawning PMCs.
+  ##
+  ## Everything not named here is `Savage`, which is the honest default: a scav,
+  ## a boss and his followers, the cultists and the infected all fight as
+  ## Savage. `pmcBot` stays `Bear` as it was, and `exUsec` (the Rogues) is
+  ## Savage in this generation of the game, not a PMC.
+  case toLowerAscii(role)
+  of "pmcusec", "usec": "Usec"
+  of "pmcbear", "bear", "pmcbot": "Bear"
+  else: "Savage"
+
 proc generateProfile*(t: BotTables; base: string; req: BotRequest;
                       index: int): string =
   ## One bot, as a copy of `base` with everything this module computes written
@@ -996,8 +1076,7 @@ proc generateProfile*(t: BotTables; base: string; req: BotRequest;
 
   var info = parseObject(field(base, "Info"))
   setText(info, "Nickname", pickName(t, index))
-  setText(info, "Side",
-          if toLowerAscii(req.role) == "pmcbot": "Bear" else: "Savage")
+  setText(info, "Side", botSideForRole(req.role))
   # **Not `Voice`.** `Info` on the client's `BotBase` has no such member; the
   # voice is a `Nullable<MongoId>` on `Customization` and is written there.
   # Removed rather than merely not written, so that a base carrying the old

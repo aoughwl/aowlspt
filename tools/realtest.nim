@@ -867,6 +867,46 @@ proc requiredSlotsOf(itemsBody: string; tplAt: int): seq[string] =
       continue
     result.add nm
 
+proc propTextOf(itemsBody: string; tplAt: int; field: string): string =
+  ## A text member of an item's `_props` -- `ammoCaliber` on a weapon,
+  ## `Caliber` on a cartridge. "" when absent.
+  let propsAt = memberValue(itemsBody, tplAt, "_props")
+  if propsAt < 0:
+    return ""
+  result = textField(itemsBody, propsAt, field)
+
+proc magFilterOf(itemsBody: string; tplAt: int): seq[string] =
+  ## The ammo templates a magazine accepts:
+  ## `_props.Cartridges[0]._props.filters[0].Filter`. Empty when the item is not
+  ## a magazine or declares no cartridge filter -- which the caller reads as "not
+  ## a magazine to check", not as "accepts nothing".
+  result = @[]
+  let propsAt = memberValue(itemsBody, tplAt, "_props")
+  if propsAt < 0:
+    return
+  let cartsAt = memberValue(itemsBody, propsAt, "Cartridges")
+  if cartsAt < 0 or itemsBody[cartsAt] != '[':
+    return
+  let ce = elements(itemsBody, cartsAt)
+  if ce.len == 0:
+    return
+  let cpAt = memberValue(itemsBody, ce[0], "_props")
+  if cpAt < 0:
+    return
+  let filtersAt = memberValue(itemsBody, cpAt, "filters")
+  if filtersAt < 0 or itemsBody[filtersAt] != '[':
+    return
+  let fe = elements(itemsBody, filtersAt)
+  if fe.len == 0:
+    return
+  let filterAt = memberValue(itemsBody, fe[0], "Filter")
+  if filterAt < 0 or itemsBody[filterAt] != '[':
+    return
+  for a in elements(itemsBody, filterAt):
+    let t = textVal(itemsBody, a)
+    if t.len > 0:
+      result.add t
+
 # -- the map lock/unlock post-condition ------------------------------------
 #
 # Module level rather than nested inside the check block that uses them, for
@@ -2092,6 +2132,57 @@ proc main(): int =
           "it is in the body, which is what made this route 560 MiB")
   line "  " & $mapKeys.len & " maps, " & kib(locR.body.len) & " of map data"
 
+  # -- PMCs are seeded into every offline raid -----------------------------
+  #
+  # fix(1). A stock offline raid served only `assault`/`Savage` waves, so the
+  # client never asked `bot/generate` for a PMC and a Woods raid spawned ~40
+  # scavs, the bosses, and zero PMCs. `tuneOfflineSpawns` now seeds
+  # `pmcUSEC`/`pmcBEAR` waves, and `/client/locations` is the payload the client
+  # builds its wave scenario from -- so the served `waves[]` are the finished
+  # state to assert, not the generator's intent.
+  #
+  # The assertion is a NEGATIVE that can be falsified: no map that seeds scav
+  # waves may be left with zero PMC waves. It fails the instant the PMC seeding
+  # is dropped, and does not pass merely because the code ran. Woods is named
+  # explicitly because that is the map the defect was observed on.
+  var mapsWithPmc = 0
+  var mapsWithScav = 0
+  var pmcWavesTotal = 0
+  var woodsPmc = -1
+  for i in 0 ..< mapKeys.len:
+    let wavesAt = memberValue(locR.body, mapVals[i], "waves")
+    if wavesAt < 0 or locR.body[wavesAt] != '[':
+      continue
+    var pmc = 0
+    var scav = 0
+    for w in elements(locR.body, wavesAt):
+      let wt = textField(locR.body, w, "WildSpawnType")
+      if wt == "pmcUSEC" or wt == "pmcBEAR":
+        inc pmc
+      elif wt == "assault":
+        inc scav
+    if pmc > 0: inc mapsWithPmc
+    if scav > 0: inc mapsWithScav
+    pmcWavesTotal = pmcWavesTotal + pmc
+    # The served map is keyed by `_Id` (a MongoId), so Woods is found by its
+    # human `Id`/`Name` field, not the dict key -- fact #183, the same id split
+    # `canonicalLocation` exists for.
+    let mapId = textVal(locR.body, memberValue(locR.body, mapVals[i], "Id"))
+    let mapName = textVal(locR.body, memberValue(locR.body, mapVals[i], "Name"))
+    if mapKeys[i] == "Woods" or mapKeys[i] == "woods" or
+       mapId == "Woods" or mapName == "Woods":
+      woodsPmc = pmc
+  check("every offline map that seeds scavs also seeds PMC waves",
+        mapKeys.len > 0 and mapsWithScav > 0 and mapsWithPmc == mapsWithScav,
+        $mapsWithPmc & " of " & $mapsWithScav &
+        " scav-seeded maps also seed PMCs (" & $pmcWavesTotal & " PMC waves)")
+  if woodsPmc < 0:
+    skip("an offline Woods raid seeds PMC waves",
+         "no Woods map in this database's locations table")
+  else:
+    check("an offline Woods raid seeds PMC waves", woodsPmc > 0,
+          $woodsPmc & " pmcUSEC/pmcBEAR waves served for Woods")
+
   # -- the ORBIT loot-table census, over EVERY map -------------------------
   #
   # The bug this replaces was a live `warn` reading "0 of 429 static-container
@@ -2710,6 +2801,12 @@ proc main(): int =
     var treesInconclusive = 0    # a tpl the served item table does not carry
     var violations = 0
     var firstViol = ""
+    # fix(2): magazine/ammo coherence, asserted over the FINISHED loadout.
+    var magsChecked = 0
+    var magsNoAmmo = 0        # a mod_magazine with no loaded cartridge
+    var magsWrongCaliber = 0  # loaded round's Caliber != the weapon's ammoCaliber
+    var magsRejected = 0      # loaded round not in the magazine's own filter
+    var firstMagViol = ""
 
     # A handful of roles, discovered from the database rather than named, so the
     # check survives an import that ships a different roster. Read from `dbText`
@@ -2790,6 +2887,66 @@ proc main(): int =
                   if textField(batch.body, it, "parentId") == curId:
                     queue.add it
 
+        # Magazine/ammo coherence over the same served items. A weapon with a
+        # magazine must have a mag whose caliber matches the weapon and which
+        # holds a round it accepts -- otherwise the client refuses the round and
+        # the bot spawns with an empty gun. Built from an id->tpl map so a mag's
+        # parent weapon can be named. Negatives, all falsifiable: no mag empty,
+        # none holding a round its own filter omits, none whose round is the
+        # wrong caliber for the weapon it hangs on.
+        var idTpl = initTable[string, string]()
+        var idParent = initTable[string, string]()
+        for it in items:
+          let iid = textField(batch.body, it, "_id")
+          if iid.len > 0:
+            idTpl[iid] = textField(batch.body, it, "_tpl")
+            idParent[iid] = textField(batch.body, it, "parentId")
+        for it in items:
+          if toLowerAscii(textField(batch.body, it, "slotId")) != "mod_magazine":
+            continue
+          let magId = textField(batch.body, it, "_id")
+          let magTpl = textField(batch.body, it, "_tpl")
+          let weaponTpl = idTpl.getOrDefault(
+            idParent.getOrDefault(magId, ""), "")
+          let magIdx = tplIndex.getOrDefault(magTpl, -1)
+          let wIdx = tplIndex.getOrDefault(weaponTpl, -1)
+          if magIdx < 0 or wIdx < 0:
+            continue    # not in the served item table -- inconclusive, skipped
+          inc magsChecked
+          let wCaliber = propTextOf(itemsR.body, wIdx, "ammoCaliber")
+          let accepts = magFilterOf(itemsR.body, magIdx)
+          # The loaded round: a child of the mag slotted `cartridges` with a
+          # positive stack.
+          var roundTpl = ""
+          var stack = 0
+          for c in items:
+            if textField(batch.body, c, "parentId") == magId and
+               toLowerAscii(textField(batch.body, c, "slotId")) == "cartridges":
+              roundTpl = textField(batch.body, c, "_tpl")
+              let updAt = memberValue(batch.body, c, "upd")
+              if updAt >= 0:
+                stack = intField(batch.body, updAt, "StackObjectsCount")
+              break
+          if roundTpl.len == 0 or stack <= 0:
+            inc magsNoAmmo
+            if firstMagViol.len == 0:
+              firstMagViol = role & " " & magTpl & " on " & weaponTpl &
+                             " holds no ammo"
+            continue
+          if accepts.len > 0 and not contains(accepts, roundTpl):
+            inc magsRejected
+            if firstMagViol.len == 0:
+              firstMagViol = role & " mag " & magTpl & " loaded " & roundTpl &
+                             ", not in its own filter"
+          let rIdx = tplIndex.getOrDefault(roundTpl, -1)
+          if rIdx >= 0 and wCaliber.len > 0:
+            let rCaliber = propTextOf(itemsR.body, rIdx, "Caliber")
+            if rCaliber.len > 0 and rCaliber != wCaliber:
+              inc magsWrongCaliber
+              if firstMagViol.len == 0:
+                firstMagViol = role & " " & weaponTpl & " (" & wCaliber &
+                               ") loaded " & rCaliber & " round " & roundTpl
+
     if rolesTested == 0 or weaponsChecked == 0:
       skip("every generated bot weapon fills its required mod slots",
            "no role produced a bot carrying a weapon in this database")
@@ -2802,6 +2959,18 @@ proc main(): int =
             (if treesInconclusive > 0:
                " (" & $treesInconclusive & " mod tpls not in item table, skipped)"
              else: ""))
+      if magsChecked == 0:
+        skip("every generated bot magazine holds matching ammo",
+             "no weapon in any generated bot carried a magazine in the item " &
+             "table -- INCONCLUSIVE, not a pass")
+      else:
+        check("every generated bot magazine holds ammo it accepts, of the " &
+              "weapon's caliber",
+              magsNoAmmo == 0 and magsRejected == 0 and magsWrongCaliber == 0,
+              $magsNoAmmo & " empty, " & $magsRejected &
+              " holding a rejected round, " & $magsWrongCaliber &
+              " wrong-caliber, over " & $magsChecked & " magazines" &
+              (if firstMagViol.len > 0: "; e.g. " & firstMagViol else: ""))
 
   # =========================================================================
   heading "A session, on the real tables"
