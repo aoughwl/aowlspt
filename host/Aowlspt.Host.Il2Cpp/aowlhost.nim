@@ -3312,6 +3312,11 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
     # host-mask publication this frame sees this frame's game-Settings state.
     uiStateDrainTick()
     cursorFreeDrainTick()
+    # SINGLEPLAYER REBRAND of the Matchmaker Offline Raid Screen. Rides THIS
+    # drain (TarkovApplication::Update ticks the whole session, including the
+    # matchmaker screens which are up before the main menu's PreloaderUI can be
+    # assumed), not a second detour. Idle cost is two integer compares.
+    splRebrandDrainTick()
     return 0'i32
   # The render-phase drain, likewise by identity: a second detour on a
   # render-phase method that drains the render queue where GL drawing lands.
@@ -5816,6 +5821,13 @@ include "inspect.nim"
 ## renderer. Default OFF (`settingsModsTab`).
 include "modstab.nim"
 
+## SINGLEPLAYER REBRAND of the Matchmaker Offline Raid Screen. Included AFTER
+## `inspect.nim` (it stands on the transform walkers and `gTxtTypeStr`) and
+## `nativeui.nim` (the byte-verified setters + SetActive). It adds NO detour:
+## `splRebrandDrainTick` rides the `TarkovApplication::Update` drain the same
+## way the cursor-free feature does. Default OFF (`singleplayerRebrand`).
+include "splrebrand.nim"
+
 ## THE SHARED PER-FRAME REGION. Included AFTER `modstab.nim` because
 ## `bindRegion` names `gModsSlot` and `cDuPreloaderTarget`, and nimony
 ## forward-resolves procs across an include boundary but NOT variables.
@@ -7222,6 +7234,20 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
          "put back verbatim when the last panel closes. The targets are " &
          "verified on the first drain tick, not here, because il2cpp is not " &
          "attached yet at this point in boot."
+  # SINGLEPLAYER REBRAND of the Matchmaker Offline Raid Screen. Default OFF. It
+  # relabels the "PRACTICE GAME MODE" heading + description and hides the
+  # practice-mode checkbox, reusing the byte-verified nativeui setters; it never
+  # ticks the toggle, so offline routing is untouched. Discovery is live and by
+  # displayed text, and it rides the TarkovApplication::Update drain.
+  gSplOn = readBoolKey("singleplayerRebrand")
+  if gSplOn:
+    info "singleplayerRebrand is set: the Matchmaker Offline Raid Screen's " &
+         "\"PRACTICE GAME MODE\" heading and description will be relabelled to " &
+         "SINGLEPLAYER branding via the real TMP_Text/LocalizedText setters, " &
+         "and the \"Enable practice mode for this raid\" checkbox GameObject " &
+         "will be SetActive(false). The screen is discovered live by displayed " &
+         "text from a scene root (no hardcoded path); the toggle's value is " &
+         "never changed, so the raid still routes to the emulated backend."
   # The native-UI layer. Both default OFF. `nativeUi` makes the API answer at
   # all; `nativeUiProof` additionally runs the one-shot visual self-proof.
   gNuOn = readBoolKey("nativeUi")
