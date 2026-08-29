@@ -88,6 +88,13 @@ const
   # whole time-slice on them before ever reaching Menu UI (root ~#20 of 22).
   SplUiRoot0      = "Menu UI"
   SplUiRoot1      = "Common UI"
+  # The three targets are found by CONTAINER NAME (measured live within the
+  # screen), NOT by reading TMP text on every node -- the ~494-node subtree's
+  # per-node TMP reads blew the 18ms slice before reaching the shallow captions,
+  # and the description is a LocalizedText whose m_text does not even contain the
+  # visible words, so text-matching could never find it.
+  SplHeadNode     = "MainCaption"              # heading TMP ("Practice game mode")
+  SplWarnNode     = "WarningTextVertLayout"    # co-op/EoD progress warning box
   SplBlockerName  = "SoloModeCheckmarkBlocker"
   SplHeadStock    = "practice game mode"
   SplDescStock    = "in this mode"
@@ -521,42 +528,49 @@ proc splScanOne(t: Il2CppPtr) =
       gSplWarnMatched = true
 
 proc splScanNode(t: Il2CppPtr; depth: int; budget: var int; deadline: uint64) =
-  ## BREADTH-FIRST scan of the screen subtree. The three targets (MainCaption
-  ## under CaptionsHolder, the checkbox Label under SoloModeCheckmarkBlocker, the
-  ## Warning Caption under WarningTextVertLayout) are all SHALLOW; the deep,
-  ## expensive subtrees are the settings-list rows. A DFS dove into those first
-  ## and the 18 ms slice expired before it reached the shallow captions (measured
-  ## live: the whole subtree is ~494 nodes but each TMP read is costly). BFS
-  ## visits shallow nodes first, so the captions are hit in the first ~100 nodes,
-  ## and it EARLY-OUTs the moment all targets are in hand.
+  ## Find the targets by CONTAINER NAME within the screen -- cheap name-reads
+  ## with early-return, not a TMP-text read of every node (which timed out on the
+  ## ~494-node subtree). Names measured live inside this screen:
+  ##   heading  -> "MainCaption"              (its TMP text is "Practice game mode")
+  ##   checkbox -> "SoloModeCheckmarkBlocker" (GameObject to hide + Toggle to force)
+  ##   warning  -> "WarningTextVertLayout"    (GameObject to hide)
+  ## The description is a LocalizedText whose m_text does not contain the visible
+  ## words, so it is intentionally NOT relabelled here (a known gap; the heading,
+  ## checkbox and warning are what the player reacts to).
   if t == nil or depth < 0 or budget <= 0 or not duOk(t, 0x20'i32): return
-  var frontier: seq[Il2CppPtr] = @[t]
-  var d = 0
-  while frontier.len > 0 and d <= depth and budget > 0:
-    var nextf: seq[Il2CppPtr] = @[]
-    var fi = 0
-    while fi < frontier.len and budget > 0:
-      let node = frontier[fi]
-      fi = fi + 1
-      if node == nil or not duOk(node, 0x20'i32): continue
-      budget = budget - 1
-      if (budget and 31) == 0 and cNowMs() > deadline:
-        budget = 0
-        return
-      splScanOne(node)
-      # Early-out: everything we relabel/hide is in hand (desc is optional).
-      if gSplHeadTmp != nil and gSplCheckGo != nil and gSplWarnGo != nil:
-        return
-      if d < depth:
-        var n = 0
-        if iChildCount(node, n):
-          var i = 0
-          while i < n and i < SplFanout:
-            let c = iChildAt(node, i)
-            if c != nil: nextf.add c
-            i = i + 1
-    frontier = nextf
-    d = d + 1
+  # Heading: the MainCaption TMP.
+  if gSplHeadTmp == nil:
+    var b = budget
+    let h = splFindByName(t, SplHeadNode, depth, b, deadline)
+    budget = b
+    if h != nil:
+      let tmp = splTmpOf(h)
+      if tmp != nil:
+        gSplHeadTmp = tmp
+        gSplHeadLoc = splComponent(h, splLocTypeStr())
+  # Checkbox: the SoloModeCheckmarkBlocker -- GameObject (hide) + Toggle (force).
+  if gSplCheckGo == nil:
+    var b = budget
+    let cb = splFindByName(t, SplBlockerName, depth, b, deadline)
+    budget = b
+    if cb != nil:
+      let go = iGameObjectOf(cb)
+      if go != nil and duOk(go, 0x20'i32):
+        gSplCheckGo = go
+      let tog = splComponent(cb, splTogTypeStr())
+      if tog != nil and duOk(tog, cSwOffToggleIsOn() + 8'i32):
+        gSplToggle = tog
+  # Co-op / EoD progress warning: hide the whole WarningTextVertLayout box.
+  if gSplWarnGo == nil:
+    var b = budget
+    let wc = splFindByName(t, SplWarnNode, depth, b, deadline)
+    budget = b
+    if wc != nil:
+      let go = iGameObjectOf(wc)
+      if go != nil and duOk(go, 0x20'i32):
+        gSplWarnGo = go
+        gSplWarnName = SplWarnNode
+        gSplWarnMatched = true
 
 # ---------------------------------------------------------------------------
 # Maintain + assert the FINISHED STATE (never our own write -- fact #9b).
