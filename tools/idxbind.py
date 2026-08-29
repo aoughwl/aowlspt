@@ -159,6 +159,23 @@ TABLES = [
         "users": ["host/Aowlspt.Host.Il2Cpp/nativeui.nim"],
         "accessors": ["nuFn", "cNuFn", "cNuName", "cNuRva"],
     },
+    # The scene / hierarchy-walk API added with abi/aowlspt_scene.h. Same shape
+    # as the cursor and modetext tables: five rows addressed by POSITION through
+    # `Sc*` constants, each carrying a `## RowName` annotation that ties the
+    # constant to the C row it means. get_parent / get_childCount / GetChild sit
+    # adjacent here, and GetChild's int-arg thunk handed get_parent's shape would
+    # read its index argument as a MethodInfo* -- a valid call of the wrong shape
+    # (fact #187), which is exactly what the annotation cross-check catches.
+    {
+        "mode": "positional",
+        "header": "abi/aowlspt_scene.h",
+        "array": "aowl_scene_targets",
+        "const_prefix": "Sc",
+        "const_file": "host/Aowlspt.Host.Il2Cpp/aowlscene.nim",
+        "expect_file": None,
+        "users": ["host/Aowlspt.Host.Il2Cpp/aowlscene.nim"],
+        "accessors": ["cSceneFn", "cSceneName", "cSceneRva"],
+    },
     # ------------------------------------------------------------------
     # The ten tables the first version of this tool reported INCONCLUSIVE by
     # name (fact #190). Surveyed 2026-08-27: NONE of them is addressed by a

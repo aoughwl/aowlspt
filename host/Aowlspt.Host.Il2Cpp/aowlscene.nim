@@ -110,11 +110,11 @@ const
 
 # scene target indices (mirroring the AOWL_SCENE_* defines).
 const
-  ScGetParent     = 0'i32
-  ScGetChildCount = 1'i32
-  ScGetChild      = 2'i32
-  ScFind          = 3'i32
-  ScGetComponent  = 4'i32
+  ScGetParent     = 0'i32   ## UnityEngine.Transform::get_parent
+  ScGetChildCount = 1'i32   ## UnityEngine.Transform::get_childCount
+  ScGetChild      = 2'i32   ## UnityEngine.Transform::GetChild
+  ScFind          = 3'i32   ## UnityEngine.Transform::Find
+  ScGetComponent  = 4'i32   ## UnityEngine.Component::GetComponent(string)
 
 # ---------------------------------------------------------------------------
 # Three-outcome results. PASS / FAIL / INCONCLUSIVE, never two. (CLAUDE.md 9b)
