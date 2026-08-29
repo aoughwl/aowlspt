@@ -47,7 +47,20 @@ What it does
   extension the *URL* asks for, because that is the name `File.Exists` tests.
 
 It never overwrites a file that is already there, so a genuine download always
-wins, and re-running it is free.
+wins, and re-running it is free -- with ONE exception. When the client is
+launched before this tool has seeded an icon, step 3 fetches it over the
+network and, against this emulator, gets back the tiny grey PLACEHOLDER PNG
+(`onFiles` in `mods/tarkov/tarkov.nim` serves one dark-grey 16x16 image for
+every `/files/*` it cannot supply a real asset for) -- and then WRITES THAT
+PLACEHOLDER INTO THE CACHE. From then on step 2 finds the placeholder on disk
+and the quest renders grey forever, and a plain "skip anything already there"
+re-run cannot fix it because the poison file exists. So an existing cache file
+whose size is at or below `--placeholder-max` bytes (default 1024) is treated
+as poison, not as a genuine download, and is RESEEDED from the source: no real
+trader/quest/handbook asset is that small (the smallest source icon measured is
+~8 KB), while the emulator placeholder is under 100 bytes. This was the observed
+"some quest images are grey" bug: five quest icons the player had opened before
+seeding sat in the cache as ~93-byte placeholders.
 
 Where the cache is
 ------------------------------------------------------------------------------
@@ -179,6 +192,11 @@ def main(argv=None):
     ap.add_argument("--force", action="store_true",
                     help="overwrite cache files that already exist "
                          "(default is to leave a real download alone)")
+    ap.add_argument("--placeholder-max", type=int, default=1024,
+                    help="an existing cache file at or below this many bytes is "
+                         "treated as the emulator's grey placeholder (poison "
+                         "written by the client) and RESEEDED from source; no "
+                         "genuine asset is this small (default 1024)")
     args = ap.parse_args(argv)
 
     if not os.path.isfile(args.db):
@@ -192,8 +210,9 @@ def main(argv=None):
     urls = urls_from_db(args.db)
     exact, by_stem = index_source(args.src)
 
-    copied = skipped = missing = 0
+    copied = skipped = missing = reseeded = 0
     missing_examples = []
+    reseeded_examples = []
     for rel in urls:
         src = resolve(rel, exact, by_stem)
         if not src:
@@ -203,7 +222,22 @@ def main(argv=None):
             continue
         dst = os.path.join(files_root, rel.replace("/", os.sep))
         if os.path.exists(dst) and not args.force:
-            skipped += 1
+            # A genuine seed matches its source's size; a poisoned placeholder
+            # the client wrote is tiny. Reseed the poison, leave real art alone.
+            try:
+                dst_size = os.path.getsize(dst)
+            except OSError:
+                dst_size = -1
+            if dst_size < 0 or dst_size > args.placeholder_max:
+                skipped += 1
+                continue
+            reseeded += 1
+            if len(reseeded_examples) < 10:
+                reseeded_examples.append(rel)
+            if args.dry_run:
+                continue
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copyfile(src, dst)
             continue
         if args.dry_run:
             copied += 1
@@ -216,7 +250,11 @@ def main(argv=None):
     print("urls       : %d" % len(urls))
     print("%s: %d" % ("would copy " if args.dry_run else "copied     ", copied))
     print("already there: %d" % skipped)
+    print("%s: %d" % ("would reseed" if args.dry_run else "reseeded    ", reseeded)
+          + "  (poisoned placeholders <= %d bytes)" % args.placeholder_max)
     print("no source  : %d" % missing)
+    for r in reseeded_examples:
+        print("   reseed  " + r)
     for m in missing_examples:
         print("   missing " + m)
     return 0
