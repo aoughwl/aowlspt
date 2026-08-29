@@ -2513,16 +2513,27 @@ var gSbYieldUntil = 0'u64
   ## Set by `modSetQueueWrite` when a NATIVE settings page write takes the
   ## single POST slot, so the bridge does not arm over an in-flight edit.
 
-proc sbCapture(n, body: string) =
+proc sbCapture(n, body: string): bool =
+  ## Returns true when this direct hook CONSUMED the event -- i.e. it is one of
+  ## the `Sb*Announce` replies and we were collecting, so it was stored here
+  ## rather than delivered to a registered subscriber. The caller uses this to
+  ## suppress the misleading "no subscribers" log for events that were in fact
+  ## consumed, exactly as `control` already exempts mod-control requests. An
+  ## announce that arrives while NOT collecting is deliberately NOT reported as
+  ## consumed, so a genuinely-undelivered event still logs.
   if not gSbCollecting:
-    return
+    return false
   if n == SbIndexAnnounce:
     if gSbIndex.len < 64:
       gSbIndex.add body
+    return true
   elif n == SbPageAnnounce:
     gSbPage = body
+    return true
   elif n == SbApplyAnnounce:
     gSbApply = body
+    return true
+  return false
 
 proc hostEventEmit(ctx: Il2CppPtr; name: Il2CppPtr; nameLen: int32;
                    payload: Il2CppPtr; payloadLen: int32): int32 {.
@@ -2534,13 +2545,13 @@ proc hostEventEmit(ctx: Il2CppPtr; name: Il2CppPtr; nameLen: int32;
   let n = readBytes(name, nameLen)
   let body = readBytes(payload, payloadLen)
   let from1 = int(cast[uint](ctx))
-  sbCapture(n, body)
+  let captured = sbCapture(n, body)
   # A mod-control request is recorded and performed from the host's own loop.
   # Never from here: this stack is usually the game thread inside a patch, and
   # for an unload it can run through the very mod being unloaded.
   let control = modcontrol.submit(n, body)
   let delivered = deliverEvent(n, body, from1)
-  if delivered == 0 and not control:
+  if delivered == 0 and not control and not captured:
     info "event " & n & " (no subscribers)"
   result = StatusOk
 
