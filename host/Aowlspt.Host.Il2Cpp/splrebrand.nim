@@ -392,26 +392,36 @@ proc splFindScreen(): Il2CppPtr =
   # roots ("Application (Main Client)") consume the whole 18ms slice before
   # reaching "Menu UI" (~root #20), so the screen was NEVER found though it was
   # present. Searching the UI roots first reaches it with budget to spare.
-  var i = 0
   var dbgRoots = ""
   var dbgUiMatched = 0
-  while i < roots.len:
-    let r = iToTransform(roots[i])
-    if r != nil and duOk(r, 0x20'i32):
-      let nm = iObjName(r)
-      if dbgRoots.len < 400: dbgRoots = dbgRoots & "[" & nm & "]"
-      if nm == SplUiRoot0 or nm == SplUiRoot1:
-        dbgUiMatched = dbgUiMatched + 1
-        var budget = SplNodeBudget
-        let m = splFindByName(r, SplScreenName, SplFindDepth, budget, deadline)
-        gSplLastNodes = gSplLastNodes + (SplNodeBudget - budget)
-        if m != nil:
-          gSplLastWhy = ""
-          return m
+  # Search the UI roots in PRIORITY ORDER: "Menu UI" FIRST (that is where the
+  # offline-raid screen lives, measured: Menu UI -> UI -> screen, depth 2), THEN
+  # "Common UI". The shared 18ms deadline was being consumed by "Common UI"
+  # (which precedes "Menu UI" in the root list and is a large tree) before
+  # "Menu UI" was ever reached -- so the screen, though shallow, was never found
+  # (diag: UI-roots matched=1, 24001 nodes). A named priority order fixes it:
+  # Menu UI is searched first and the shallow screen is found in ~100 nodes.
+  for want in [SplUiRoot0, SplUiRoot1]:
+    var i = 0
+    while i < roots.len:
+      let r = iToTransform(roots[i])
+      if r != nil and duOk(r, 0x20'i32):
+        let nm = iObjName(r)
+        if want == SplUiRoot0 and dbgRoots.len < 400:
+          dbgRoots = dbgRoots & "[" & nm & "]"      # dump once, on the first pass
+        if nm == want:
+          dbgUiMatched = dbgUiMatched + 1
+          var budget = SplNodeBudget
+          let m = splFindByName(r, SplScreenName, SplFindDepth, budget, deadline)
+          gSplLastNodes = gSplLastNodes + (SplNodeBudget - budget)
+          if m != nil:
+            gSplLastWhy = ""
+            return m
+      if cNowMs() > deadline: break
+      i = i + 1
     if cNowMs() > deadline: break
-    i = i + 1
   # Pass 2 -- fallback: every other root, in case the screen ever moves.
-  i = 0
+  var i = 0
   while i < roots.len:
     let r = iToTransform(roots[i])
     if r != nil and duOk(r, 0x20'i32):
