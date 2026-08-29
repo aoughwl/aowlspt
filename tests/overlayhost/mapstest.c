@@ -590,6 +590,9 @@ static void test_fade(void)
            "fading changes ONLY the alpha byte, never the colour");
         ok(((mm_fade_rgba(c, 0.0f) >> 24) & 0xFF) == 0,
            "a zero fade produces a fully transparent colour");
+    }
+}
+
 /* ------------------------------------------------------------------ map ART
  *
  * These run against Factory's REAL shipped calibration, transcribed from
@@ -823,11 +826,13 @@ static void test_art_refusals(void)
     ok(ma_can_draw(&a, 0, 0.0f) == MA_REFUSE_NOPOS,
        "no validated position refuses as NOPOS, not as 'no map'");
 
-    /* The stated limit of the axis-aligned QUAD. */
-    ok(ma_can_draw(&a, 1, 1.57f) == MA_REFUSE_ROTATED,
-       "a heading-up pane refuses art rather than drawing it misregistered");
+    /* ROTATION IS NOW DRAWN, not refused (region ABI 3, AOWL_REGION_CMD_QUADR).
+     * A heading-up pane must draw its art via the rotated quad rather than fall
+     * back to the grid, so ma_can_draw no longer returns MA_REFUSE_ROTATED. */
+    ok(ma_can_draw(&a, 1, 1.57f) == MA_OK,
+       "a heading-up pane now DRAWS art (rotated quad), it is not refused");
     ok(ma_can_draw(&a, 1, 0.0001f) == MA_OK,
-       "a micro-radian heading is a measurement, not a rotation, and still draws");
+       "a micro-radian heading still draws, as before");
 
     /* Every refusal has distinct text, so the diag can never print two
      * different failures with the same words. */
@@ -847,6 +852,75 @@ static void test_art_refusals(void)
     }
 }
 
+static void test_art_rotquad(void)
+{
+    /* THE ALIGNMENT GUARANTEE between the rotated art quad and the blips.
+     *
+     * The overlay draws a heading-up tile by rotating each north-up (rot=0)
+     * dest corner about the pane centre by cos/sin of -heading. That MUST land
+     * where mm_topdown -- which the grid and the blips use -- puts the same
+     * world point at rot=heading, or a blip would sit off its art feature. This
+     * is a real cross-check, not a self-comparison: the two land points come
+     * from DIFFERENT expressions (a north-up rect plus a rotation here, vs
+     * mm_topdown's single rotate-then-project there). If they disagree the art
+     * and the blips would drift apart, which is exactly the failure the brief
+     * forbids. */
+    const float PX = 100.0f, PY = 200.0f, SZ = 400.0f, span = 200.0f;
+    float cx = 500.0f, cz = 900.0f;          /* player = pane centre, world */
+    float pcx = PX + SZ * 0.5f, pcy = PY + SZ * 0.5f, scale = SZ / span;
+    float h = 1.0f;                           /* an arbitrary non-trivial yaw */
+    float rcos = (float)cos(-(double)h), rsin = (float)sin(-(double)h);
+    float wxs[3] = { cx + 30.0f, cx - 12.0f, cx };
+    float wzs[3] = { cz,          cz + 25.0f, cz + 50.0f };
+    int k;
+
+    for (k = 0; k < 3; k++) {
+        float X0 = pcx + (wxs[k] - cx) * scale;      /* north-up corner */
+        float Y0 = pcy - (wzs[k] - cz) * scale;      /* maxY/+Z is UP */
+        float dx = X0 - pcx, dy = Y0 - pcy;
+        float Xr = pcx + dx * rcos - dy * rsin;
+        float Yr = pcy + dx * rsin + dy * rcos;
+        MmPt m = mm_topdown(wxs[k], wzs[k], cx, cz, PX, PY, SZ, span, h);
+        near(Xr, m.x, 0.02f,
+             "rotated art corner x == mm_topdown x (art and blips share one transform)");
+        near(Yr, m.y, 0.02f,
+             "rotated art corner y == mm_topdown y (art and blips share one transform)");
+    }
+
+    /* Facing EAST, a point due NORTH of the player lands LEFT of centre -- the
+     * same sense test_topdown pins for mm_topdown, now pinned for the art path,
+     * so a backwards rotation sense fails here too. */
+    {
+        float he = 1.57079633f;
+        float rc = (float)cos(-(double)he), rs = (float)sin(-(double)he);
+        float X0 = pcx + (cx - cx) * scale;
+        float Y0 = pcy - ((cz + 40.0f) - cz) * scale;   /* due north, +Z */
+        float dx = X0 - pcx, dy = Y0 - pcy;
+        float Xr = pcx + dx * rc - dy * rs;
+        ok(Xr < pcx - 1.0f,
+           "facing east, the rotated art point due north lands LEFT of centre");
+    }
+
+    /* ma_tile_rect_rot returns the UNCLIPPED north-up rect (the renderer clips)
+     * and culls a tile whose rotated bounding box misses the pane. */
+    {
+        MaRect t; float dx, dy, dw, dh;
+        t.minX = cx - 20.0f; t.maxX = cx + 20.0f;
+        t.minY = cz - 10.0f; t.maxY = cz + 10.0f;
+        ok(ma_tile_rect_rot(&t, cx, cz, PX, PY, SZ, span, 1.0f, 0.0f,
+                            &dx, &dy, &dw, &dh) == 1,
+           "ma_tile_rect_rot resolves an on-pane tile");
+        near(dx, pcx + (t.minX - cx) * scale, 0.01f,
+             "the returned dest rect is the UNCLIPPED north-up left edge");
+        near(dw, (t.maxX - t.minX) * scale, 0.01f,
+             "the returned dest width is the FULL tile width (renderer clips it)");
+        t.minX = cx + 100000.0f; t.maxX = t.minX + 40.0f;
+        ok(ma_tile_rect_rot(&t, cx, cz, PX, PY, SZ, span, 1.0f, 0.0f,
+                            &dx, &dy, &dw, &dh) == 0,
+           "a tile far off the pane is culled by the rotated-corner AABB");
+    }
+}
+
 int main(void)
 {
     test_topdown();
@@ -862,6 +936,7 @@ int main(void)
     test_art_quad();
     test_art_tiling();
     test_art_refusals();
+    test_art_rotquad();
     printf("mapstest: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }

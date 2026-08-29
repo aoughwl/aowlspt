@@ -270,22 +270,24 @@
 extern "C" {
 #endif
 
-/* ABI 2. Bumped, not extended-in-place, and deliberately so.
+/* ABI 3. Bumped, not extended-in-place, and deliberately so.
  *
- * `AowlRegionCmd` grew five fields (the UV rect and the texture key) so that a
- * TEXTURED QUAD could be submitted at all. That struct is the wire format of a
- * buffer written by the host DLL and read by a SEPARATELY COMPILED module (the
- * D3D11 overlay, and any mod that drains it), so its `sizeof` is the stride
- * both sides index with. There is no `size` field on it to negotiate with --
- * unlike `AowlRegionDesc`, which has one -- so a silent change would have the
- * reader stride past the writer's records and decode garbage that still looks
- * like plausible coordinates. That is the exact failure mode this project
- * refuses to ship.
+ * `AowlRegionCmd` grew five fields at ABI 2 (the UV rect and the texture key) so
+ * that a TEXTURED QUAD could be submitted at all, and grew eight more at ABI 3
+ * (`rcos,rsin,rpx,rpy` and the `rclip*` rect) so that a ROTATED textured quad --
+ * `AOWL_REGION_CMD_QUADR`, the heading-up map's rotating art -- could be too.
+ * That struct is the wire format of a buffer written by the host DLL and read by
+ * a SEPARATELY COMPILED module (the D3D11 overlay, and any mod that drains it),
+ * so its `sizeof` is the stride both sides index with. There is no `size` field
+ * on it to negotiate with -- unlike `AowlRegionDesc`, which has one -- so a
+ * silent change would have the reader stride past the writer's records and
+ * decode garbage that still looks like plausible coordinates. That is the exact
+ * failure mode this project refuses to ship.
  *
  * So the number moves and `AOWL_REGION_REFUSE_ABI` becomes a LOUD refusal for
  * every module not rebuilt against this header. Every consumer must be
  * recompiled; none needs a source change for the bump itself. */
-#define AOWL_REGION_ABI            2
+#define AOWL_REGION_ABI            3
 #define AOWL_REGION_MAX            32     /* participants                     */
 #define AOWL_REGION_NAME_LEN       32
 #define AOWL_REGION_TEXT_LEN       64
@@ -453,7 +455,8 @@ enum {
     AOWL_REGION_CMD_BOX  = 2,   /* outline; `t` is the stroke width          */
     AOWL_REGION_CMD_FILL = 3,   /* filled rect                               */
     AOWL_REGION_CMD_TEXT = 4,
-    AOWL_REGION_CMD_QUAD = 5    /* textured: dest rect + UV rect + tex key   */
+    AOWL_REGION_CMD_QUAD = 5,   /* textured: dest rect + UV rect + tex key   */
+    AOWL_REGION_CMD_QUADR = 6   /* textured + ROTATED about a pivot, clipped */
 };
 
 /* ---- texture formats ---------------------------------------------- *
@@ -524,8 +527,23 @@ typedef struct AowlRegionCmd {
     float    x, y, w, h, t;
     uint32_t col;
     char     text[AOWL_REGION_TEXT_LEN];   /* inline: no lifetime question   */
-    float    u0, v0, u1, v1;               /* QUAD only: source UV rect      */
-    uint64_t tex;                          /* QUAD only: texture key         */
+    float    u0, v0, u1, v1;               /* QUAD/QUADR: source UV rect     */
+    uint64_t tex;                          /* QUAD/QUADR: texture key        */
+    /* AOWL_REGION_CMD_QUADR ONLY (all zero for every other kind). The dest
+     * rect x,y,w,h and the UV rect above are the UNROTATED (north-up) layout;
+     * the renderer takes the four dest corners, rotates each about the pivot
+     * (rpx,rpy) in back-buffer pixels using the caller-supplied cos/sin --
+     *     x' = rpx + (X-rpx)*rcos - (Y-rpy)*rsin
+     *     y' = rpy + (X-rpx)*rsin + (Y-rpy)*rcos
+     * -- and emits triangles; the UVs ride the corners unchanged. cos/sin are
+     * passed rather than an angle so the renderer needs no math.h and the trig
+     * is done ONCE per frame by the submitter, not per tile. When
+     * rclipW>0 && rclipH>0 the rotated quad is clipped to the axis-aligned rect
+     * (rclipX,rclipY,rclipW,rclipH) so a heading-up pane cannot bleed past its
+     * own square; a zero clip rect means no clip. */
+    float    rcos, rsin;                   /* QUADR: cos/sin of the rotation */
+    float    rpx, rpy;                     /* QUADR: pivot, back-buffer px   */
+    float    rclipX, rclipY, rclipW, rclipH; /* QUADR: clip rect (0=none)    */
 } AowlRegionCmd;
 
 /* ---- projection outcome ------------------------------------------- *
@@ -1080,6 +1098,45 @@ static int32_t aowl_region_quad(float x, float y, float w, float h,
     return AOWL_REGION_OK;
 }
 
+/* The ROTATED textured quad. Identical residency/liveness rules as the
+ * axis-aligned quad above -- REFUSED, not silently degraded, when the key is
+ * not resident -- with a rotation carried as pre-computed cos/sin about the
+ * pivot (rpx,rpy) and an optional clip rect. See the note on AowlRegionCmd for
+ * the exact corner transform; the renderer, not this function, applies it. */
+static int32_t aowl_region_quadr(float x, float y, float w, float h,
+                                 float u0, float v0, float u1, float v1,
+                                 uint64_t key, uint32_t tint,
+                                 float rcos, float rsin, float rpx, float rpy,
+                                 float clipX, float clipY,
+                                 float clipW, float clipH) {
+    AowlRegionTexSlot* s;
+    AowlRegionCmd* c;
+    int32_t ix = (int32_t)g_region.cur;
+    if (!g_region.drawOpen) {
+        g_region.lastRefusal = AOWL_REGION_REFUSE_CLOSED;
+        return AOWL_REGION_REFUSE_CLOSED;
+    }
+    s = aowl_region_tex_find(key);
+    if (!s) {
+        g_region.lastRefusal = AOWL_REGION_REFUSE_NOTEX;
+        return AOWL_REGION_REFUSE_NOTEX;
+    }
+    if (g_region.n[ix] >= AOWL_REGION_MAX_CMDS) {
+        g_region.dropped++;
+        return AOWL_REGION_REFUSE_FULL;
+    }
+    s->lastFrame = g_region.frame;      /* the LRU stamp */
+    c = &g_region.buf[ix][g_region.n[ix]++];
+    memset(c, 0, sizeof(*c));
+    c->kind = AOWL_REGION_CMD_QUADR; c->owner = g_region.drawOwner;
+    c->x = x; c->y = y; c->w = w; c->h = h; c->col = tint;
+    c->u0 = u0; c->v0 = v0; c->u1 = u1; c->v1 = v1;
+    c->tex = key;
+    c->rcos = rcos; c->rsin = rsin; c->rpx = rpx; c->rpy = rpy;
+    c->rclipX = clipX; c->rclipY = clipY; c->rclipW = clipW; c->rclipH = clipH;
+    return AOWL_REGION_OK;
+}
+
 static int32_t aowl_region_line(float x0, float y0, float x1, float y1,
                                 float t, uint32_t col) {
     return aowl_region_push(AOWL_REGION_CMD_LINE, x0, y0, x1, y1, t, col, 0);
@@ -1472,10 +1529,16 @@ typedef int32_t (*AowlRegionTexKeyFn)(uint64_t);
 typedef int32_t (*AowlRegionQuadFn)(float, float, float, float,
                                     float, float, float, float,
                                     uint64_t, uint32_t);
+typedef int32_t (*AowlRegionQuadRFn)(float, float, float, float,
+                                     float, float, float, float,
+                                     uint64_t, uint32_t,
+                                     float, float, float, float,
+                                     float, float, float, float);
 static AowlRegionTexDefFn aowl_rg_texdef_fn  = 0;
 static AowlRegionTexKeyFn aowl_rg_texhave_fn = 0;
 static AowlRegionTexKeyFn aowl_rg_texforget_fn = 0;
 static AowlRegionQuadFn   aowl_rg_quad_fn    = 0;
+static AowlRegionQuadRFn  aowl_rg_quadr_fn   = 0;
 static int32_t            aowl_rg_tex_try    = 0;
 
 static void aowl_region_resolve_tex(void) {
@@ -1492,6 +1555,8 @@ static void aowl_region_resolve_tex(void) {
         GetProcAddress(h, "aowl_region_texture_forget_x");
     aowl_rg_quad_fn      = (AowlRegionQuadFn)(void*)
         GetProcAddress(h, "aowl_region_quad_x");
+    aowl_rg_quadr_fn     = (AowlRegionQuadRFn)(void*)
+        GetProcAddress(h, "aowl_region_quadr_x");
 }
 static int32_t aowl_region_texture_define(uint64_t key, int32_t fmt,
                                           int32_t w, int32_t h,
@@ -1515,6 +1580,21 @@ static int32_t aowl_region_quad(float x, float y, float w, float h,
     aowl_region_resolve_tex();
     return aowl_rg_quad_fn
         ? aowl_rg_quad_fn(x, y, w, h, u0, v0, u1, v1, key, tint)
+        : AOWL_REGION_REFUSE_NOHOST;
+}
+/* The rotated quad, client side. AOWL_REGION_REFUSE_NOHOST when the host
+ * predates ABI 3 and never exported `aowl_region_quadr_x`, so a mod can fall
+ * back to the axis-aligned QUAD (north-up) rather than draw nothing. */
+static int32_t aowl_region_quadr(float x, float y, float w, float h,
+                                 float u0, float v0, float u1, float v1,
+                                 uint64_t key, uint32_t tint,
+                                 float rcos, float rsin, float rpx, float rpy,
+                                 float clipX, float clipY,
+                                 float clipW, float clipH) {
+    aowl_region_resolve_tex();
+    return aowl_rg_quadr_fn
+        ? aowl_rg_quadr_fn(x, y, w, h, u0, v0, u1, v1, key, tint,
+                           rcos, rsin, rpx, rpy, clipX, clipY, clipW, clipH)
         : AOWL_REGION_REFUSE_NOHOST;
 }
 

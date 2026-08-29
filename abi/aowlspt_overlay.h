@@ -11200,6 +11200,81 @@ static void aowl_ov_tex_quad(float x, float y, float w, float h,
     aowl_ov_vert(x,     y + h, u0, v1, tint);
 }
 
+/* One ROTATED textured quad. The dest rect's four corners are rotated about the
+ * pivot (px,py) by the pre-computed (rcos,rsin) -- see the note on
+ * AowlRegionCmd for the exact formula and why cos/sin are passed rather than an
+ * angle (the overlay stays free of <math.h> and the trig is one call per frame
+ * upstream, not one per tile). When clipW>0 && clipH>0 the rotated quad is
+ * clipped to the axis-aligned rect (clipX..clipX+clipW, clipY..clipY+clipH) by
+ * Sutherland-Hodgman with the UV interpolated affinely at each new vertex, then
+ * emitted as a triangle fan; without a clip it is the two triangles the corners
+ * make. Fixed local arrays, no allocation; the polygon is at most 8 vertices
+ * (a rectangle cut by four half-planes), so at most 6 triangles / 18 verts. */
+typedef struct { float x, y, u, v; } AowlOvClipV;
+
+static void aowl_ov_tex_quad_rot(float x, float y, float w, float h,
+                                 float u0, float v0, float u1, float v1,
+                                 float rcos, float rsin, float px, float py,
+                                 float clipX, float clipY,
+                                 float clipW, float clipH,
+                                 uint32_t tint) {
+    AowlOvClipV in[8], out[8];
+    int32_t nin = 0, i, e;
+    /* Corners TL, TR, BR, BL with their UVs, rotated about the pivot. */
+    const float cxs[4] = { x,     x + w, x + w, x     };
+    const float cys[4] = { y,     y,     y + h, y + h };
+    const float cus[4] = { u0,    u1,    u1,    u0    };
+    const float cvs[4] = { v0,    v0,    v1,    v1    };
+    for (i = 0; i < 4; i++) {
+        float dx = cxs[i] - px, dy = cys[i] - py;
+        in[i].x = px + dx * rcos - dy * rsin;
+        in[i].y = py + dx * rsin + dy * rcos;
+        in[i].u = cus[i];
+        in[i].v = cvs[i];
+    }
+    nin = 4;
+
+    if (clipW > 0.0f && clipH > 0.0f) {
+        /* Four half-planes, each "keep points with nx*X + ny*Y <= d". */
+        float ex[4] = { -1.0f, 1.0f,  0.0f, 0.0f };
+        float ey[4] = {  0.0f, 0.0f, -1.0f, 1.0f };
+        float ed[4] = { -clipX, clipX + clipW, -clipY, clipY + clipH };
+        for (e = 0; e < 4 && nin > 0; e++) {
+            int32_t nout = 0, j;
+            for (j = 0; j < nin; j++) {
+                AowlOvClipV A = in[j];
+                AowlOvClipV B = in[(j + 1) % nin];
+                float da = ex[e] * A.x + ey[e] * A.y - ed[e];
+                float db = ex[e] * B.x + ey[e] * B.y - ed[e];
+                int32_t Ain = (da <= 0.0f), Bin = (db <= 0.0f);
+                if (Ain && nout < 8) out[nout++] = A;
+                if (Ain != Bin) {
+                    float denom = da - db;
+                    float tpar = (denom != 0.0f) ? da / denom : 0.0f;
+                    AowlOvClipV I;
+                    I.x = A.x + tpar * (B.x - A.x);
+                    I.y = A.y + tpar * (B.y - A.y);
+                    I.u = A.u + tpar * (B.u - A.u);
+                    I.v = A.v + tpar * (B.v - A.v);
+                    if (nout < 8) out[nout++] = I;
+                }
+            }
+            nin = nout;
+            for (j = 0; j < nin; j++) in[j] = out[j];
+        }
+    }
+
+    if (nin < 3) return;                       /* fully clipped away */
+    if (g_ov.vtxCount + (nin - 2) * 3 > AOWL_OV_MAX_VERTS) {
+        g_ov.vtxDropped += (nin - 2) * 3; return;
+    }
+    for (i = 1; i + 1 < nin; i++) {
+        aowl_ov_vert(in[0].x,     in[0].y,     in[0].u,     in[0].v,     tint);
+        aowl_ov_vert(in[i].x,     in[i].y,     in[i].u,     in[i].v,     tint);
+        aowl_ov_vert(in[i + 1].x, in[i + 1].y, in[i + 1].u, in[i + 1].v, tint);
+    }
+}
+
 static void aowl_ov_region_append(void) {
     const AowlRegionCmd* cmds = 0;
     int32_t n = aowl_region_commands(&cmds);
@@ -11275,6 +11350,25 @@ static void aowl_ov_region_append(void) {
                 aowl_ov_span_begin(srv);
                 aowl_ov_tex_quad(c->x, c->y, c->w, c->h,
                                  c->u0, c->v0, c->u1, c->v1, c->col);
+                break;
+            }
+            case AOWL_REGION_CMD_QUADR: {
+                /* The rotated sibling of QUAD -- heading-up map art. Same
+                 * residency contract (a cache miss is a COUNTED MISS that draws
+                 * nothing, never the font atlas), same span/SRV path; only the
+                 * geometry differs: the four dest corners are rotated about the
+                 * pivot and clipped to the pane before the triangles are made. */
+                ID3D11ShaderResourceView* srv;
+                if (!g_ov.psTex) { g_ov.texMisses++; break; }
+                if (c->w <= 0.0f || c->h <= 0.0f) break;
+                srv = aowl_ov_tex_srv(c->tex, aowl_region_frames());
+                if (!srv) { g_ov.texMisses++; break; }
+                aowl_ov_span_begin(srv);
+                aowl_ov_tex_quad_rot(c->x, c->y, c->w, c->h,
+                                     c->u0, c->v0, c->u1, c->v1,
+                                     c->rcos, c->rsin, c->rpx, c->rpy,
+                                     c->rclipX, c->rclipY, c->rclipW, c->rclipH,
+                                     c->col);
                 break;
             }
             default: break;
