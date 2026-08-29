@@ -270,6 +270,46 @@ worst outcome we produce, and a confidently wrong diagnostic is worse than none 
 cycles have been lost to messages that asserted a cause with no evidence. State a measured
 fact or say you do not know.
 
+## 6b. Diagnose the WHOLE batch live FIRST, then build ONCE. Be progressive.
+
+The slowest, most trust-burning way to work here — measured over a full session
+of it — is one live-behaviour bug per build→deploy→human-test cycle, fixed by a
+subagent that CANNOT run the game. It does not converge: half the "fixes" miss,
+because the agent was guessing at a live cause it could never see, and every miss
+costs the human another 10-minute restart-and-retry. Six such cycles in a row
+produced a rebrand that never fired, an ESP still flickering, a cursor still
+locked, a map that would not toggle — every one "verified" by a build check that
+could not fail (see §9b).
+
+Do it the other way round, and batch aggressively:
+
+1. **Diagnose EVERYTHING live before touching code.** The inspector and the host
+   log answer *why* in SECONDS with no rebuild. Pin the exact root cause AND the
+   exact fix for every open bug in one live pass — the right scene anchor, what
+   re-locks the cursor each frame, why the overlay draws on 34% of frames, the
+   precise gate condition. In one session this pass turned "the rebrand is
+   broken, no idea why" into "splFindScreen anchors to the wrong 197-root scene;
+   the screen is in the 22-root DontDestroyOnLoad `Menu UI` scene" — two
+   inspector calls, a one-line fix.
+2. **The inspector reading and the human's eyes must AGREE before you believe
+   either.** ESP logged "draw stable, 0 blanks" while the player watched it
+   flicker — the truth was one layer down (the region drew the participant on 34%
+   of Presents). A host counter that says PASS is a claim, not the finished
+   state; reconcile it against what renders (§9b).
+3. **Then batch every pinned fix into ONE build → ONE deploy → ONE live test.**
+   Collapse ten cycles into one. Subagents are for IMPLEMENTING a pinned
+   diagnosis in parallel, never for diagnosing a live bug blind — that division
+   is the whole point. The coordinator (who can drive the client) does the live
+   verification after the single deploy.
+4. **State drifts across restarts — re-read, don't assume.** A config you set
+   (`maps.enabled`) read back false a restart later; the deployed `itemsadd.json`
+   silently differed from the integ worktree and would have re-broken profile
+   load. Before each deploy, verify on disk what you think you set.
+
+The escape hatch is real: if a class of bug genuinely needs the live client in a
+tight loop and it is dragging, SAY SO and batch harder — do not grind it one
+restart at a time.
+
 ## 7. Consistency-check landmine
 
 The client refuses to boot if a file listed in `D:\Aowlspt\ConsistencyInfo` changes SIZE.
