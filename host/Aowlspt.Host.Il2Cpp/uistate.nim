@@ -49,7 +49,9 @@ const
   UiOvlSettings = 0x1'u32
   UiOvlAdmin    = 0x2'u32
   UiOvlDebug    = 0x4'u32
+  UiOvlOverlay  = 0x8'u32
   # Cursor panel bits, matching abi/aowlspt_cursor.h.
+  CurPOverlay   = 0x1'u32   ## F12 -- the mod-manager / settings panel
   CurPAdmin2    = 0x2'u32
   CurPDebugUi2  = 0x4'u32
   UiMaxFaults   = 3
@@ -71,6 +73,7 @@ proc uiStateDrainTick() =
   ## call. bit0 is the guarded managed probe, gated by `overlayStateSignal`.
   var mask = 0'u32
   let cm = cCurLiveMaskNow()
+  if (cm and CurPOverlay) != 0'u32:  mask = mask or UiOvlOverlay
   if (cm and CurPAdmin2) != 0'u32:   mask = mask or UiOvlAdmin
   if (cm and CurPDebugUi2) != 0'u32: mask = mask or UiOvlDebug
 
@@ -103,5 +106,6 @@ proc uiStateDrainTick() =
     info "overlay state: aowl_ui_overlay_mask -> 0x" & hexOf(uint64(mask)) &
          " (settings=" & (if (mask and UiOvlSettings) != 0'u32: "1" else: "0") &
          " admin=" & (if (mask and UiOvlAdmin) != 0'u32: "1" else: "0") &
-         " debug=" & (if (mask and UiOvlDebug) != 0'u32: "1" else: "0") & ")" &
+         " debug=" & (if (mask and UiOvlDebug) != 0'u32: "1" else: "0") &
+         " overlay=" & (if (mask and UiOvlOverlay) != 0'u32: "1" else: "0") & ")" &
          (if gUiStateOn: "" else: " [overlayStateSignal OFF: bit0 forced 0]")

@@ -607,6 +607,12 @@ proc mapsDiagText(): string =
   else:
     lDraw = "PASS  drawn on " & $hudDrawn() & " frame(s), " & $hudBlips() &
             " blip(s)"
+  # BUG 2: dispatches skipped because a blocking UI surface (F12/Settings, F6,
+  # F3) was open. Stated as its own countable clause so "hidden behind a panel"
+  # never reads as the flicker failure. Zero when no panel was ever open.
+  if hudMasked() > 0'i64:
+    lDraw = lDraw & "; " & $hudMasked() & " dispatch(es) SKIPPED with an " &
+            "overlay open (aowl_ui_overlay_mask != 0 -- map hidden behind a panel)"
 
   # 5. the back buffer. A 0x0 screen puts every mark in the corner.
   var lScreen = ""
@@ -755,6 +761,66 @@ proc onDiagTick(payload: string): string =
     info text
   result = ""
 
+proc armFeed(): bool =
+  ## Register the position collector, the publish timer, and -- when any HUD
+  ## surface is on -- the in-game draw participant. This is the ONE arming path,
+  ## called from onLoad AND from the hot-apply hook when `enabled` flips
+  ## false->true in a live raid (the map hot-starts without a relaunch). It is
+  ## IDEMPOTENT: gFeedRunning guards the two timers and gHudOn guards the region
+  ## participant, so a repeated toggle can never double-register a timer or add a
+  ## second region participant. It does NOT read game memory itself and it does
+  ## not decide whether anything DRAWS -- the in-raid lifecycle gate in hud.nim
+  ## still owns that -- so calling it outside a raid arms the feed and waits.
+  ## Returns true when the collector timers are running.
+  if not gFeedRunning:
+    # everyMain, NOT whenReady("EFT.GameWorld"). Fact #141: that gate tests
+    # whether a TYPE RESOLVES, which is true from il2cpp_init onward whether or
+    # not a world or a Unity thread exists -- a check that cannot fail, and it
+    # has killed the client for three separate mods. The real liveness test is
+    # `gwState()`, which asks the host's already-armed detour whether it has
+    # actually cached a world, and reports "no host export" and "armed but
+    # empty" as DIFFERENT answers.
+    if everyMain(onMainTick) != Ok:
+      warn ModName & ": could not register the main-thread collector; the live " &
+           "feed will not run. The map still opens with terrain and no markers."
+      return false
+    if every(1000 div gHz, onPublishTick) != Ok:
+      warn ModName & ": collector registered but the publish timer did not; " &
+           "positions are being read and nothing is being written."
+      return false
+    gFeedRunning = true
+
+  # The in-game draw. It rides the SHARED region (abi/aowlspt_region.h) as one
+  # more participant on the existing PreloaderUI::Update rider chain -- it does
+  # NOT add a second detour, and it does not borrow mods/admin's private HUD.
+  # Registration and ARMING are reported separately on purpose: registration
+  # always succeeds, and a registered participant on an unarmed region simply
+  # never fires. Flattening those two into "the radar is on" would be a claim
+  # that cannot be falsified.
+  # Register when ANY surface is on -- map included. The map draw is gated on
+  # `mapOn` inside the callback, so a map-only config must still register the
+  # participant; the earlier `radar or indicators` gate silently denied the map
+  # its own callback whenever the radar happened to be off. Guarded by gHudOn so
+  # a hot-start re-toggle does not add a second participant.
+  if (gOpts.radar or gOpts.indicators or gOpts.map) and not gHudOn:
+    hudInit(gOpts)
+    var whyHud = ""
+    if hudRegister(gOpts, whyHud):
+      gHudOn = true
+      if hudArmed():
+        success ModName & ": in-game HUD registered with the shared region " &
+                "and the region is ARMED -- radar=" & $gOpts.radar &
+                " map=" & $gOpts.map & " indicators=" & $gOpts.indicators
+      else:
+        warn ModName & ": in-game HUD registered, but the shared region is " &
+             "NOT armed, so the callback will never fire and nothing will be " &
+             "drawn. Set the host flag `sharedRegion` in aowlspt-host.json. " &
+             "This is not 'the radar is off' -- it is 'nothing is dispatching'."
+    else:
+      warn ModName & ": the shared region refused the in-game HUD: " & whyHud &
+           ". The map page still works; the radar and the indicators do not."
+  result = gFeedRunning
+
 proc onMapsApply(key: string) =
   ## THE HOT-APPLY HOOK (bug 1). Before this proc existed maps registered NONE,
   ## so an F12 edit reached config.json and stopped there: the live HUD kept
@@ -788,14 +854,29 @@ proc onMapsApply(key: string) =
        $(gOpts.map and live) & " radarOn=" & $(gOpts.radar and live) &
        " indicatorsOn=" & $(gOpts.indicators and live)
   if key == "enabled":
-    if nowEnabled and not gFeedRunning:
-      settingAppliesOnRestart("the position collector is only registered at " &
-        "load; relaunch with enabled=true to start the feed")
-      return
     gEnabled = nowEnabled             # gates onMainTick/onPublishTick live
     if nowEnabled:
-      settingApplied("feed ON")
+      # HOT-START (bug: this used to be a relaunch-only no-op --
+      # settingAppliesOnRestart). Arm the SAME collector + draw path onLoad uses,
+      # idempotently via armFeed(). gEnabled is set first so the freshly
+      # registered onMainTick/onPublishTick do real work on their first fire. The
+      # in-raid lifecycle gate in hud.nim still owns whether anything DRAWS, so
+      # this only makes the map begin drawing on the next IN-RAID frame; outside a
+      # raid the feed arms and waits. Re-push the mirror with live=true, because
+      # the hudReconfigure above ran while gFeedRunning was still false (live=0).
+      if armFeed():
+        hudReconfigure(gOpts, gEnabled and gFeedRunning)
+        settingApplied("feed HOT-STARTED without relaunch -- collector armed" &
+          (if gHudOn: "; in-game HUD registered" else: "") &
+          "; draws on the next in-raid frame (in-raid lifecycle gate applies)")
+      else:
+        settingIgnored("could not arm the live collector; see the warning above")
     else:
+      # true->false: gEnabled now gates the collector ticks to no-ops, and the
+      # hudReconfigure above already pushed live=false into the mirror (mapOn=
+      # radarOn=indicatorsOn=0), so the very next draw frame submits nothing. The
+      # timers and the region participant stay registered but idle -- a later
+      # re-enable hot-starts through armFeed's idempotent guards.
       settingApplied("feed OFF -- HUD blanked (0 tiles, 0 blips)")
     return
   if not (gEnabled and gFeedRunning and
@@ -845,51 +926,12 @@ proc onLoad(): Status =
          "that no feed is arriving."
     return Ok
 
-  # everyMain, NOT whenReady("EFT.GameWorld"). Fact #141: that gate tests
-  # whether a TYPE RESOLVES, which is true from il2cpp_init onward whether or
-  # not a world or a Unity thread exists -- a check that cannot fail, and it
-  # has killed the client for three separate mods. The real liveness test is
-  # `gwState()`, which asks the host's already-armed detour whether it has
-  # actually cached a world, and reports "no host export" and "armed but
-  # empty" as DIFFERENT answers.
-  if everyMain(onMainTick) != Ok:
-    warn ModName & ": could not register the main-thread collector; the live " &
-         "feed will not run. The map still opens with terrain and no markers."
+  # Arm the collector + draw through the shared armFeed() path (also used by the
+  # hot-apply hook so enabled=false->true hot-starts without a relaunch). A
+  # collector-registration failure returns Ok here exactly as before: the map
+  # page still opens; the diag timer below is what will report it.
+  if not armFeed():
     return Ok
-  if every(1000 div gHz, onPublishTick) != Ok:
-    warn ModName & ": collector registered but the publish timer did not; " &
-         "positions are being read and nothing is being written."
-    return Ok
-  gFeedRunning = true
-
-  # The in-game draw. It rides the SHARED region (abi/aowlspt_region.h) as one
-  # more participant on the existing PreloaderUI::Update rider chain -- it does
-  # NOT add a second detour, and it does not borrow mods/admin's private HUD.
-  # Registration and ARMING are reported separately on purpose: registration
-  # always succeeds, and a registered participant on an unarmed region simply
-  # never fires. Flattening those two into "the radar is on" would be a claim
-  # that cannot be falsified.
-  # Register when ANY surface is on -- map included. The map draw is gated on
-  # `mapOn` inside the callback, so a map-only config must still register the
-  # participant; the earlier `radar or indicators` gate silently denied the map
-  # its own callback whenever the radar happened to be off.
-  if gOpts.radar or gOpts.indicators or gOpts.map:
-    hudInit(gOpts)
-    var whyHud = ""
-    if hudRegister(gOpts, whyHud):
-      gHudOn = true
-      if hudArmed():
-        success ModName & ": in-game HUD registered with the shared region " &
-                "and the region is ARMED -- radar=" & $gOpts.radar &
-                " map=" & $gOpts.map & " indicators=" & $gOpts.indicators
-      else:
-        warn ModName & ": in-game HUD registered, but the shared region is " &
-             "NOT armed, so the callback will never fire and nothing will be " &
-             "drawn. Set the host flag `sharedRegion` in aowlspt-host.json. " &
-             "This is not 'the radar is off' -- it is 'nothing is dispatching'."
-    else:
-      warn ModName & ": the shared region refused the in-game HUD: " & whyHud &
-           ". The map page still works; the radar and the indicators do not."
 
   # THE DIAGNOSTIC TIMER. Registered LAST and unconditionally, because it is
   # the thing that explains every branch above -- including the branches that

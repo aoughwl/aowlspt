@@ -141,6 +141,11 @@ static struct {
     float    indicatorInset;   /* margin the edge markers clamp onto */
 
     int64_t  frames, drawn, blips;
+    /* BUG 2: dispatches SKIPPED because a blocking UI surface (game Settings,
+     * F6 admin, F3 debug) was open. Counted apart from `drawn` so the diag can
+     * say "hidden behind a panel" instead of letting a masked frame read as the
+     * flicker failure -- a countable reason, never a silent decline. */
+    int64_t  masked;
     /* Indicators are drawn one of TWO ways and the two are counted apart, on
      * purpose. `indProjected` is the real, camera-relative answer via the
      * region's projector; `indBearing` is the north-up fallback used when no
@@ -800,6 +805,31 @@ static void mhud_player_arrow(float cx, float cy, float headRot, int32_t has,
     }
 }
 
+/* BUG 2: is a blocking UI surface open in front of the HUD? Reads the host
+ * export `aowl_ui_overlay_mask` (abi/aowlspt_uistate.h) -- a uint32 bitmask,
+ * bit0 game Settings, bit1 F6 admin, bit2 F3 debug; non-zero => a panel is up.
+ * Resolved ONCE from the already-loaded host DLL with GetModuleHandle +
+ * GetProcAddress, the exact runtime pattern admin/shared.nim and fov.nim use --
+ * never linked, never via the impl header. Returns 0 (draw as normal) when the
+ * export is absent (an older host, or not running inside the client): the safe
+ * default is to KEEP drawing, not to vanish. Called on the region's draw thread
+ * only, which is single-threaded, so the one-shot resolve needs no lock. */
+typedef uint32_t (*MHudOverlayMaskFn)(void);
+static MHudOverlayMaskFn g_mhud_maskFn = 0;
+static int32_t           g_mhud_maskTried = 0;
+static uint32_t mhud_overlay_mask(void) {
+    if (!g_mhud_maskTried) {
+        HMODULE h;
+        g_mhud_maskTried = 1;
+        h = GetModuleHandleA("aowlspt-host-il2cpp.dll");
+        if (h)
+            g_mhud_maskFn =
+                (MHudOverlayMaskFn)(void*)GetProcAddress(h, "aowl_ui_overlay_mask");
+    }
+    if (!g_mhud_maskFn) return 0u;
+    return g_mhud_maskFn();
+}
+
 static void mhud_draw(void* user, int64_t frame) {
     float rot, headRot, scrW, scrH;
     int32_t i;
@@ -807,6 +837,16 @@ static void mhud_draw(void* user, int64_t frame) {
     (void)user; (void)frame;
 
     g_mhud.frames++;
+    /* BUG 2: a blocking UI surface is up (F12/Settings, F6 or F3). Submit
+     * NOTHING -- neither tiles nor blips -- so the map never draws over a screen
+     * the player is trying to read. Counted, not silent. The held frame is left
+     * INTACT (not cleared): when the panel closes the very next Present resumes
+     * drawing the last committed frame, no re-acquire flicker. Checked before the
+     * raid gate so it holds on every dispatch regardless of lifecycle state. */
+    if (mhud_overlay_mask() != 0u) {
+        g_mhud.masked++;
+        return;
+    }
     /* THE LIFECYCLE GATE (bug 1). The HUD draws ONLY during an active, spawned,
      * in-world raid. `inRaid` is world.activeRaid() -- a validated local pose
      * that is ALSO in the live alive-players list -- so the borrowed GameWorld
@@ -1206,6 +1246,7 @@ static int32_t mhud_armed(void)   { return aowl_region_is_armed(); }
 static int64_t mhud_frames(void)  { return g_mhud.frames; }
 static int64_t mhud_drawn(void)   { return g_mhud.drawn; }
 static int64_t mhud_blips(void)   { return g_mhud.blips; }
+static int64_t mhud_masked(void)  { return g_mhud.masked; }
 static int32_t mhud_handle(void)  { return g_mhud.handle; }
 static int64_t mhud_ind_projected(void) { return g_mhud.indProjected; }
 static int64_t mhud_ind_bearing(void)   { return g_mhud.indBearing; }
@@ -1253,6 +1294,7 @@ proc cHudArmed(): int32 {.importc: "mhud_armed", nodecl.}
 proc cHudFrames(): int64 {.importc: "mhud_frames", nodecl.}
 proc cHudDrawn(): int64 {.importc: "mhud_drawn", nodecl.}
 proc cHudBlips(): int64 {.importc: "mhud_blips", nodecl.}
+proc cHudMasked(): int64 {.importc: "mhud_masked", nodecl.}
 proc cHudHandle(): int32 {.importc: "mhud_handle", nodecl.}
 proc cHudConfigureMap(mapOn: int32; mapX, mapY, mapSize, mapSpanM: cfloat;
                       mapGrid: int32; indicatorInset: cfloat) {.
@@ -1295,6 +1337,7 @@ proc cHudTilesLast(): int32 {.importc: "mhud_tiles_last", nodecl.}
 proc hudFrames*(): int64 = cHudFrames()
 proc hudDrawn*(): int64 = cHudDrawn()
 proc hudBlips*(): int64 = cHudBlips()
+proc hudMasked*(): int64 = cHudMasked()
 proc hudIndProjected*(): int64 = cHudIndProjected()
 proc hudIndBearing*(): int64 = cHudIndBearing()
 proc hudScreenMeasured*(): int32 = cHudScreenMeasured()
@@ -1527,21 +1570,37 @@ proc hudUnregister*() =
 proc hudPublish*(snap: Snapshot) =
   ## Unity's thread, right after `collect`. Copies the already-guarded POD
   ## positions into the C mirror. Reads no game memory of its own.
-  let active = activeRaid(snap)
-  if not active:
-    # NOT an active raid: the lifecycle gate (bug 1). This is the one explicit
-    # empty commit -- inRaid=0 tells the draw to DROP its held frame and submit
-    # nothing, so a stale radar cannot linger into the menu. It holds even when a
-    # stale borrowed cache still yields a pose.
+  # THE FLICKER FIX, corrected (bug: drawn was ~24% of dispatched). The clear of
+  # the held frame must be driven by the ONE signal that genuinely means "the
+  # raid is over" -- the host has no live GameWorld (state != 3) -- and NOT by
+  # `activeRaid()`. `activeRaid()` also requires `ok` and `localAlive`, and both
+  # flicker false intermittently WITHIN a live raid because GwMainPlayer
+  # (GameWorld+0x230) reads null on ~3 of every 4 frames (fact #235). The old
+  # code sent inRaid=0 on every such frame, which told the draw to DROP the held
+  # frame and submit nothing -- so the held-frame redraw was reached on only the
+  # ~24% of frames the pose happened to resolve. That is why the prior hold fix
+  # did not take: the intermittent miss was being treated as raid-end.
+  #
+  # Now: world gone (state != 3) is the single explicit empty commit; anything
+  # with a live world but no fresh centre this tick -- whether the pre-spawn
+  # window or the GwMainPlayer null flicker -- is a TRANSIENT gap that re-draws
+  # the held frame. Pre-spawn is still safe because heldValid is 0 until the
+  # first real active-raid frame draws, so nothing is shown before spawn.
+  if snap.state != 3:
+    # World genuinely not live (menu, loading before the world, or the borrowed
+    # RegisterPlayer cache torn down after extract): the one explicit empty
+    # commit. inRaid=0 tells the draw to DROP its held frame and submit nothing,
+    # so a stale radar cannot linger into the menu.
     cHudBegin(0.0, 0.0, 0.0, 0'i32, 0.0, 0'i32, 0'i32)
     return
-  if snap.localIdx < 0 or snap.localIdx >= snap.n:
-    # In a raid, but this collector tick did not resolve a local centre (a
-    # one-frame classification miss in the alive-players list, a momentarily
-    # null MainPlayer). Publish an IN-RAID mirror with no fresh centre
-    # (hasLocal=0, inRaid=1): the draw RE-DRAWS its held frame rather than
-    # blanking, which is the ESP/radar flicker fix. The held frame is cleared
-    # only by the `not active` arm above, never by a transient gap like this.
+  if not activeRaid(snap) or snap.localIdx < 0 or snap.localIdx >= snap.n:
+    # World is LIVE but this tick did not resolve an in-world local centre: the
+    # local player is momentarily not in AllAlivePlayersList / MainPlayer read
+    # null (the intermittent flicker), the pose did not validate, or we have not
+    # spawned yet. Publish an IN-RAID mirror with no fresh centre (hasLocal=0,
+    # inRaid=1): the draw RE-DRAWS its held frame rather than blanking. The held
+    # frame is cleared ONLY by the state!=3 arm above, never by a transient gap
+    # like this -- which is what makes `drawn` track `dispatched` in a raid.
     cHudBegin(0.0, 0.0, 0.0, 0'i32, 0.0, 0'i32, 1'i32)
     return
   let me = snap.ents[snap.localIdx]
@@ -1568,6 +1627,7 @@ proc hudStatusText*(): string =
   " frames=" & $cHudFrames() &
   " drawn=" & $cHudDrawn() &
   " blips=" & $cHudBlips() &
+  " masked=" & $cHudMasked() &
   " screen=" & $cHudScreenW() & "x" & $cHudScreenH() &
   (if cHudScreenMeasured() != 0'i32: " (measured back buffer)"
    else: " (CONFIG FALLBACK -- the region has not been told the real size)") &
