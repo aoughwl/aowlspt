@@ -9,10 +9,13 @@
 ## region, not two copies of a global.
 
 {.emit: """#include "aowlspt_admin.h" """.}
-# The overlay-mask suppression hook reads `aowl_ui_overlay_mask`, whose
-# prototype lives in aowlspt_uistate.h (a different header from admin's own),
-# so the importc below has a real C declaration rather than an implicit one.
-{.emit: """#include "aowlspt_uistate.h" """.}
+# The overlay-mask suppression hook binds the host export `aowl_ui_overlay_mask`.
+# We declare ONLY its prototype here rather than #include-ing aowlspt_uistate.h:
+# that header carries the host-side IMPLEMENTATION (a dllexport body plus its own
+# shim dependencies aowl_pro_verify / aowl_is_readable / aowl_p_p_seh), none of
+# which the mod links, so pulling it in breaks the mod compile. A single extern
+# prototype gives the importc below a real C declaration.
+{.emit: """extern uint32_t aowl_ui_overlay_mask(void);""".}
 
 type
   AdminRegion* = pointer   ## an `AowlAdminShared*`, opaque on this side
