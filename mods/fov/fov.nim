@@ -337,6 +337,15 @@ var cfgPistolCameraYOffset = 0.04
 var cfgPistolCameraZOffset = 0.025
 
 var cfgEnableFovScaleFix = false
+var cfgEnableRvaDetours = false
+  ## MASTER GATE for the three by-RVA typed detours that replace the fatal
+  ## by-name (`signatureOf` + name-target) path for the scale/scope/aim effects.
+  ## DEFAULT OFF (host-safety rule 5): even with `changeMouseSensitivity` or
+  ## `enableFovScaleFix` on, NOTHING is detoured into the live client until this
+  ## is turned on deliberately. The install itself is fully guarded by the host
+  ## (prologue byte-verify against the startup snapshot, VirtualQuery, il2cpp
+  ## section check, sharedness), so the worst case with it off-by-default is a
+  ## logged refusal -- never a fault. Turn on per-effect flag AND this to arm.
 var cfgEnableFovWrite = false
   ## THE PER-FRAME FOV WRITE ITSELF. DEFAULT OFF.
   ##
@@ -440,6 +449,7 @@ proc loadConfig() =
   cfgUnaimedToggleZoomSensMulti = cfgFloat("unaimedToggleZoomSensMulti", 0.7)
 
   cfgChangeMouseSensitivity = cfgBool("changeMouseSensitivity", true)
+  cfgEnableRvaDetours = cfgBool("enableRvaDetours", false)
   cfgNonOpticSensMulti = cfgFloat("nonOpticSensMulti", 1.0)
   cfgOneSensMulti = cfgFloat("oneSensMulti", 0.75)
   cfgTwoSensMulti = cfgFloat("twoSensMulti", 0.45)
@@ -1194,6 +1204,48 @@ const
     ## `EFT.Hideout.HideoutCamera::get_FieldOfView` (2 owners) both answer to
     ## a case-insensitive search for this name.
   ProCamFieldOfView = "40 53 48 83 EC 20 48 8B 05 63 4D E7 01 48 8B D9"
+
+# ---------------------------------------------------------------------------
+# The three effects that used to be reached BY NAME (fatal on the client), now
+# expressed as host patch-by-RVA specs.
+# ---------------------------------------------------------------------------
+#
+# Each is `Type::Method@0xRVA/<shape>!<hexprologue>` -- the grammar the host's
+# `installPatch` parses (`parseRvaSpec`/`resolveByRva` in the IL2CPP host). The
+# host resolves the ADDRESS from the RVA, so no `il2cpp_*` name lookup happens
+# and the token-gated export ABI (fact #217) is never touched; it then
+# byte-verifies the declared prologue against the STARTUP SNAPSHOT (not live
+# memory, so another feature's trampoline cannot make a correct RVA self-reject),
+# checks the target is committed executable memory inside the il2cpp PE section,
+# and refuses out loud on any miss. The `<shape>` (instance/static, one letter
+# per DECLARED argument, `>` + return letter) is what a bare RVA cannot carry and
+# is REQUIRED; ours are DERIVED offline, not guessed:
+#
+#   il2cpp_resolve.py <GA> <metadec> type 6835  -> float get_AimingSensitivity()      i>f
+#   il2cpp_resolve.py <GA> <metadec> type 11841 -> float get_GetCurrentSensitivity()  i>f
+#   il2cpp_resolve.py <GA> <metadec> type 7013  -> void  CalculateScaleValueByFov(float) if>x
+#
+# and each RVA was checked `shared` == UNIQUE (owners=1), so a detour there fires
+# for exactly one method. Prologues are the verbatim `bytes <RVA> 16` output,
+# spaces stripped (the grammar wants an even run of hex digits).
+const
+  SpecAimSens =
+    "EFT.Player.FirearmController::get_AimingSensitivity" &
+    "@0x7773F0/i>f!40534883EC20488B11488BD9488B82C8"
+    ## rid 43152, arity 0, instance, returns float. POSTFIX (scale the result).
+  SpecScopeSens =
+    "EFT.InventoryLogic.SightComponent::get_GetCurrentSensitivity" &
+    "@0x104A140/i>f!40534883EC20803D4817070600488BD9"
+    ## rid 72574, arity 0, instance, returns float. PREFIX-replace with the
+    ## magnification-table value (a postfix would only scale the game's own
+    ## answer; upstream `ScopeSensitivityPatch` replaces it outright).
+  SpecScaleValue =
+    "EFT.Player::CalculateScaleValueByFov" &
+    "@0x6FC250/if>x!F30F5C0D40A6EB05F30F1005A09DEB05"
+    ## rid 42126, arity 1 (float), instance, returns VOID -- confirmed
+    ## `il2cpp_resolve.py type 7013`, which CONTRADICTS the old `armScaleFix`
+    ## that required a `System.Single` return. PREFIX that suppresses the
+    ## original, so the viewmodel stops being rescaled as the FOV changes.
 
 var gRvaVerified = 0
 var gRvaRejected = 0
@@ -2359,47 +2411,46 @@ proc fovCostNs(): int64 =
 # Effect 2: CalculateScaleValueByFov
 # ---------------------------------------------------------------------------
 
-proc onScaleValue(target, args: string): HookResult =
-  ## Upstream's `CalculateScaleValueByFovPatch`: the body is replaced by a
-  ## constant, so the viewmodel stops being rescaled as the field of view
-  ## changes. A prefix that returns a `__result` and `false` is exactly
-  ## `stopWith`, and this is the case where the two are the same thing.
+proc onScaleValueTyped(f: PatchFrame): TypedResult =
+  ## Upstream's `CalculateScaleValueByFovPatch`, as a TYPED PREFIX on the
+  ## by-RVA target. The method is `void CalculateScaleValueByFov(float fov)`
+  ## (confirmed `il2cpp_resolve.py type 7013`), so there is no float to return
+  ## and the old `stopWith($cfgFovScale)` was returning a value a void method
+  ## never yields. Suppressing the original outright is what stops the viewmodel
+  ## being rescaled as the FOV changes -- the scale field keeps whatever value it
+  ## last held rather than tracking the widened FOV.
+  ##
+  ## `setResultVoid()` says "I mean to suppress this" rather than "I forgot", and
+  ## `frameReplace()` only sticks if it succeeded -- otherwise the original runs,
+  ## which is the game's own behaviour and the correct failure.
   gScaleHits = gScaleHits + 1
-  result = stopWith($cfgFovScale)
+  if f.setResultVoid():
+    return frameReplace()
+  frameContinue()
 
 proc armScaleFix() =
   if not cfgEnableFovScaleFix:
     gScaleState = "off (enableFovScaleFix is false)"
     return
-  var params: seq[string] = @[]
-  var ret = ""
-  if not signatureOf(TyPlayer, "CalculateScaleValueByFov", -1, params, ret):
-    gScaleState = "REFUSED (INCONCLUSIVE, not absent): confirming the signature of " &
-                  TyPlayer & "::CalculateScaleValueByFov" & " needs a by-name IL2CPP " &
-                  "lookup, and this build's IL2CPP exports are " &
-                  "TOKEN-GATED: 38 of 241 take a trailing 32-byte token we " &
-                  "do not pass, and on mismatch they return a uniform " &
-                  "random non-zero uint64 from a per-thread MT19937-64. So " &
-                  "the handle is garbage, the nil check passes, and the " &
-                  "first dereference kills the process. This " &
-                  "effect is NOT ported to a verified static RVA yet; " &
-                  "it needs one from tools/il2cpp_resolve.py plus a " &
-                  "PatchKind the host can install by address."
+  if not cfgEnableRvaDetours:
+    gScaleState = "gated off (enableRvaDetours is false; the by-RVA detour is " &
+                  "not installed until it is turned on deliberately)"
     return
-  if ret != "System.Single":
-    gScaleState = "refused: it is " & describeSig(params, ret) &
-                  " and this replaces a float"
+  if not typedPatchesReady():
+    gScaleState = "refused (INCONCLUSIVE): the host is ABI revision " &
+                  $hostApiSize() & " bytes of HostApi and the typed patch " &
+                  "frame wants revision 4. A by-RVA detour is TYPED-only " &
+                  "(the JSON patch-by-RVA path is refused by the host, and a " &
+                  "by-name JSON fallback is the fatal token-gated route this " &
+                  "port exists to avoid), so nothing was armed."
     return
-  var unusable = ""
-  if not argsUsable(params, unusable):
-    # This one replaces the body with a constant and reads no argument, so an
-    # unreadable parameter would not stop it -- but refusing a hook whose
-    # payload this mod cannot fully account for is the conservative side, and
-    # the reason is printed rather than implied.
-    gScaleState = "refused: " & describeSig(params, ret) & " -- " & unusable
-    return
-  if hookArgs(TyPlayer & "::CalculateScaleValueByFov", onScaleValue) == Ok:
-    gScaleState = "armed, returning " & $cfgFovScale
+  # No `signatureOf` here, on purpose: it is the by-name IL2CPP lookup that is
+  # fatal when USED on this build (fact #198). The shape and prologue are in
+  # SpecScaleValue, derived offline, and the host byte-verifies the prologue
+  # against its startup snapshot before it writes a single byte.
+  if hookTyped(SpecScaleValue, onScaleValueTyped) == Ok:
+    gScaleState = "armed by-RVA (typed prefix, suppresses the rescale) at " &
+                  "il2cpp+0x6FC250"
   else:
     gScaleState = "refused: " & lastError()
 
@@ -2407,68 +2458,47 @@ proc armScaleFix() =
 # Effect 3: SightComponent::get_GetCurrentSensitivity
 # ---------------------------------------------------------------------------
 
-proc onScopeSensitivity(target, args: string): HookResult =
-  ## Upstream's `ScopeSensitivityPatch`. The magnification→sensitivity table is
-  ## the arithmetic at the top of this file; what it is applied to is the optic
-  ## camera's field of view, read live on the fast path.
+proc onScopeSensitivityTyped(f: PatchFrame): TypedResult =
+  ## Upstream's `ScopeSensitivityPatch`, as a TYPED PREFIX on the by-RVA target.
+  ## `float get_GetCurrentSensitivity()` (arity 0, instance) is REPLACED by the
+  ## magnification-table value applied to the optic camera's live field of view.
+  ## A prefix that provides a result and suppresses the original is exactly the
+  ## "replace the return" upstream does; a postfix would only scale the game's
+  ## own answer, which is a different effect.
   ##
-  ## The one thing this cannot do is tell *which* sight is being asked, and the
-  ## reason used to be stated wrongly here: "a hook is not given the instance it
-  ## fired on, only the declared arguments". **A hook is given the instance** --
-  ## `hookArgs` carries `this`, `thisPointer` turns it into an address, and this
-  ## file says so twice, at :128 and :1607. The claim was false where it
-  ## mattered most, in the one place a reader would take it as the reason for a
-  ## limitation.
-  ##
-  ## What is actually true is narrower and does not go away. The host reports
-  ## the receiver's *concrete class name* and a handle, which is enough to know
-  ## it is a `SightComponent` and not enough to know **which** one: telling two
-  ## sights apart means reading a member off the object, and every candidate
-  ## member name here is a pre-1.0 guess. So this is unverifiable rather than
-  ## inexpressible -- a real difference, and not the same as being closed.
-  ##
-  ## The assumption therefore stands unchanged: in a raid the sight being
-  ## queried for sensitivity is the one being aimed through, which is the one
-  ## the optic camera is showing, so the answer is the same. It is an
-  ## assumption, it is written down rather than left implied, and **nothing
-  ## here has ever run against BSG's client**.
+  ## The same one caveat the JSON form carried still holds and is written down
+  ## rather than implied: this cannot tell WHICH sight is being queried, so it
+  ## answers from the optic camera's FOV -- the sight being aimed through -- and
+  ## nothing here has ever run against BSG's client.
   gSensHits = gSensHits + 1
-  result = stopWith($zoomSensFor(opticFieldOfView()))
+  if f.setResultFloat(zoomSensFor(opticFieldOfView())):
+    return frameReplace()
+  # The setter refused (declared return not a float, or the frame expired):
+  # let the original run rather than hand back register residue.
+  frameContinue()
 
 proc armScopeSensitivity() =
   if not cfgChangeMouseSensitivity:
     gSensState = "off (changeMouseSensitivity is false)"
     return
-  var params: seq[string] = @[]
-  var ret = ""
-  if not signatureOf(TySight, "get_GetCurrentSensitivity", -1, params, ret):
-    gSensState = "REFUSED (INCONCLUSIVE, not absent): confirming the signature of " &
-                  TySight & "::get_GetCurrentSensitivity" & " needs a by-name IL2CPP " &
-                  "lookup, and this build's IL2CPP exports are " &
-                  "TOKEN-GATED: 38 of 241 take a trailing 32-byte token we " &
-                  "do not pass, and on mismatch they return a uniform " &
-                  "random non-zero uint64 from a per-thread MT19937-64. So " &
-                  "the handle is garbage, the nil check passes, and the " &
-                  "first dereference kills the process. This " &
-                  "effect is NOT ported to a verified static RVA yet; " &
-                  "it needs one from tools/il2cpp_resolve.py plus a " &
-                  "PatchKind the host can install by address."
+  if not cfgEnableRvaDetours:
+    gSensState = "gated off (enableRvaDetours is false)"
     return
-  if ret != "System.Single":
-    gSensState = "refused: it is " & describeSig(params, ret) &
-                 " and this replaces a float"
+  if not typedPatchesReady():
+    gSensState = "refused (INCONCLUSIVE): the host is ABI revision " &
+                 $hostApiSize() & " bytes and the typed patch frame wants " &
+                 "revision 4; a by-RVA detour is typed-only, so nothing armed."
     return
-  var unusable = ""
-  if not argsUsable(params, unusable):
-    gSensState = "refused: " & describeSig(params, ret) & " -- " & unusable
-    return
+  # No `signatureOf` (the fatal by-name lookup); the shape and prologue live in
+  # SpecScopeSens and the host byte-verifies the prologue before writing.
   if not bindOpticCamera():
     gSensState = "refused: the optic camera is unreachable (" &
                  gOpticChainState & "), so the table has no field of view " &
                  "to read and would be answering from nothing"
     return
-  if hookArgs(TySight & "::get_GetCurrentSensitivity", onScopeSensitivity) == Ok:
-    gSensState = "armed, " & gOpticChainState
+  if hookTyped(SpecScopeSens, onScopeSensitivityTyped) == Ok:
+    gSensState = "armed by-RVA (typed prefix, replaces with the magnification " &
+                 "table) at il2cpp+0x104A140, " & gOpticChainState
   else:
     gSensState = "refused: " & lastError()
 
@@ -2506,19 +2536,9 @@ proc armScopeSensitivity() =
 # follows it for why the conversion was worth doing on a hook that fires once a
 # frame rather than once per bot per frame.
 
-proc onAimingSensitivity(target, payload: string): HookResult =
-  gAimSensHits = gAimSensHits + 1
-  let r = hookResult(payload)
-  if not r.ok:
-    # No result in the payload means this is not a postfix payload, which
-    # would mean the host had run the handler on the way *in*. Leaving the
-    # value alone is the only safe answer: scaling a number that has not been
-    # produced yet is worse than not scaling one.
-    return keepResult()
-  replaceResult($(r.asFloat() * cfgNonOpticSensMulti))
-
 # ---------------------------------------------------------------------------
-# ...and the same scaling on the typed path
+# The scaling on the typed path (the only path now: the by-name JSON form was
+# removed with the by-name targets, because using it on this build is fatal)
 # ---------------------------------------------------------------------------
 #
 # `onAimingSensitivity` above is the JSON form and stays, because a host older
@@ -2596,57 +2616,30 @@ proc armAimingSensitivity() =
   if not cfgChangeMouseSensitivity:
     gAimSensState = "off (changeMouseSensitivity is false)"
     return
-  var params: seq[string] = @[]
-  var ret = ""
-  if not signatureOf(TyFirearm, "get_AimingSensitivity", -1, params, ret):
-    gAimSensState = "REFUSED (INCONCLUSIVE, not absent): confirming the signature of " &
-                  TyFirearm & "::get_AimingSensitivity" & " needs a by-name IL2CPP " &
-                  "lookup, and this build's IL2CPP exports are " &
-                  "TOKEN-GATED: 38 of 241 take a trailing 32-byte token we " &
-                  "do not pass, and on mismatch they return a uniform " &
-                  "random non-zero uint64 from a per-thread MT19937-64. So " &
-                  "the handle is garbage, the nil check passes, and the " &
-                  "first dereference kills the process. This " &
-                  "effect is NOT ported to a verified static RVA yet; " &
-                  "it needs one from tools/il2cpp_resolve.py plus a " &
-                  "PatchKind the host can install by address."
+  if not cfgEnableRvaDetours:
+    gAimSensState = "gated off (enableRvaDetours is false)"
     return
-  if ret != "System.Single":
-    # A postfix on a wider value-type return is refused by the host anyway;
-    # refusing here as well means the message names the *mod's* assumption
-    # rather than the engine's constraint, which is the more useful one.
-    gAimSensState = "refused: it is " & describeSig(params, ret) &
-                    " and this scales a float"
+  # TYPED-ONLY, by RVA. The old code called `signatureOf` first (the by-name
+  # IL2CPP lookup that is fatal when USED, fact #198) and fell back to a by-name
+  # JSON postfix (fatal for the same reason). Both are gone. The shape
+  # (instance, no args, returns float) and prologue are in SpecAimSens, derived
+  # offline from `il2cpp_resolve.py type 6835`, and the host byte-verifies the
+  # prologue against its startup snapshot before writing.
+  if not typedPatchesReady():
+    gAimSensState = "refused (INCONCLUSIVE): the host is ABI revision " &
+                    $hostApiSize() & " bytes and the typed patch frame wants " &
+                    "revision 4; a by-RVA detour is typed-only, so nothing " &
+                    "armed. There is deliberately no by-name JSON fallback -- " &
+                    "it is the fatal token-gated route this port exists to avoid."
     return
-  if params.len != 0:
-    gAimSensState = "refused: it is " & describeSig(params, ret) &
-                    " and a property getter should take none; the name is " &
-                    "probably stale on this build"
-    return
-  # The typed form when the host has it, and the JSON one when it does not.
-  #
-  # Not "typed or nothing": a host at revision 3 can still run this effect, and
-  # 1.6 us once per aiming frame is a real cost rather than a disqualifying
-  # one. Which form armed goes in the state line rather than being implied,
-  # because the two are thirty-six-fold apart and a log that says only "armed"
-  # cannot be used to tell them apart afterwards.
-  if typedPatchesReady() and
-     hookReturnTyped(TyFirearm & "::get_AimingSensitivity",
-                     onAimingSensitivityTyped) == Ok:
+  if hookReturnTyped(SpecAimSens, onAimingSensitivityTyped) == Ok:
     gAimSensTyped = true
-    gAimSensState = "armed on the typed path, scaling the original's result " &
-                    "by " & $cfgNonOpticSensMulti
-  elif hookReturn(TyFirearm & "::get_AimingSensitivity", onAimingSensitivity,
-                  withArgs = false) == Ok:
-    gAimSensState = "armed on the JSON path (this host is ABI revision " &
-                    $hostApiSize() & " bytes of HostApi, and the typed frame " &
-                    "wants revision 4), scaling the original's result by " &
-                    $cfgNonOpticSensMulti & " at about 1.6 us a call"
+    gAimSensState = "armed by-RVA (typed postfix) at il2cpp+0x7773F0, scaling " &
+                    "the original's result by " & $cfgNonOpticSensMulti
   else:
-    # The host refuses a postfix on two shapes -- a value-type return wider
-    # than a register, and a compiled call needing more than four register
-    # slots -- and says which. Neither should apply to a float getter, so if
-    # one does, the name resolved to something other than the property.
+    # The host refuses a postfix on two shapes -- a value-type return wider than
+    # a register, and a compiled call needing more than four register slots --
+    # and says which; neither should apply to a no-arg float getter.
     gAimSensState = "refused: " & lastError()
 
 # ---------------------------------------------------------------------------
