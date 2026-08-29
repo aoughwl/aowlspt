@@ -393,11 +393,15 @@ proc splFindScreen(): Il2CppPtr =
   # reaching "Menu UI" (~root #20), so the screen was NEVER found though it was
   # present. Searching the UI roots first reaches it with budget to spare.
   var i = 0
+  var dbgRoots = ""
+  var dbgUiMatched = 0
   while i < roots.len:
     let r = iToTransform(roots[i])
     if r != nil and duOk(r, 0x20'i32):
       let nm = iObjName(r)
+      if dbgRoots.len < 400: dbgRoots = dbgRoots & "[" & nm & "]"
       if nm == SplUiRoot0 or nm == SplUiRoot1:
+        dbgUiMatched = dbgUiMatched + 1
         var budget = SplNodeBudget
         let m = splFindByName(r, SplScreenName, SplFindDepth, budget, deadline)
         gSplLastNodes = gSplLastNodes + (SplNodeBudget - budget)
@@ -424,7 +428,8 @@ proc splFindScreen(): Il2CppPtr =
   gSplLastWhy = "screen \"" & SplScreenName & "\" NOT found across " &
     $roots.len & " root(s) with a per-root budget of " & $SplNodeBudget &
     " (" & $gSplLastNodes & " nodes visited, " & $int(SplWalkMs) &
-    " ms slice). Normal when the offline-raid screen is not open; if it IS " &
+    " ms slice; UI-roots matched=" & $dbgUiMatched & "; roots=" & dbgRoots &
+    "). Normal when the offline-raid screen is not open; if it IS " &
     "open and this persists, raise the budget or the slice."
 
 proc splIsCoopWarn(low: string): bool =
