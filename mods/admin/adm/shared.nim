@@ -9,13 +9,13 @@
 ## region, not two copies of a global.
 
 {.emit: """#include "aowlspt_admin.h" """.}
-# The overlay-mask suppression hook binds the host export `aowl_ui_overlay_mask`.
-# We declare ONLY its prototype here rather than #include-ing aowlspt_uistate.h:
-# that header carries the host-side IMPLEMENTATION (a dllexport body plus its own
-# shim dependencies aowl_pro_verify / aowl_is_readable / aowl_p_p_seh), none of
-# which the mod links, so pulling it in breaks the mod compile. A single extern
-# prototype gives the importc below a real C declaration.
-{.emit: """extern uint32_t aowl_ui_overlay_mask(void);""".}
+# The overlay-mask suppression hook binds the HOST export `aowl_ui_overlay_mask`,
+# which lives in the host DLL, not in this mod. The mod links standalone, so the
+# symbol cannot be resolved at link time (and #include-ing aowlspt_uistate.h is
+# wrong -- it carries the host-side dllexport body plus its shim deps). It is
+# resolved at RUNTIME with GetModuleHandle/GetProcAddress, exactly as the fov mod
+# does for aowl_host_gameworld, and called through this zero-arg C thunk.
+{.emit: """static uint32_t aowl_adm_u32_v(void* f) { return ((uint32_t(*)(void))f)(); }""".}
 
 type
   AdminRegion* = pointer   ## an `AowlAdminShared*`, opaque on this side
@@ -76,7 +76,11 @@ proc cMatMul(a, b, outp: ptr cfloat) {.importc: "aowl_admin_mat_mul", nodecl.}
 
 proc cGameWorld(): pointer {.importc: "aowl_admin_gameworld", nodecl.}
 proc cGwState(): int32 {.importc: "aowl_admin_gw_state", nodecl.}
-proc cUiOverlayMask(): uint32 {.importc: "aowl_ui_overlay_mask", nodecl.}
+proc admGetModuleHandleA(name: cstring): pointer {.
+  stdcall, dynlib: "kernel32", importc: "GetModuleHandleA", sideEffect.}
+proc admGetProcAddress(m: pointer; name: cstring): pointer {.
+  stdcall, dynlib: "kernel32", importc: "GetProcAddress", sideEffect.}
+proc admU32V(f: pointer): uint32 {.importc: "aowl_adm_u32_v", nodecl.}
 
 proc cCamSample(): int32 {.importc: "aowl_admin_cam_sample", nodecl.}
 proc cCamState(): int32 {.importc: "aowl_admin_cam_state", nodecl.}
@@ -351,10 +355,25 @@ proc hostGameWorld*(): pointer =
   ## detour cache. nil is AMBIGUOUS on its own -- always pair with gwState().
   cGameWorld()
 
+var gUiMaskFn: pointer = nil
+var gUiMaskTried = false
+
 proc hostUiOverlayMask*(): uint32 =
   ## The host `aowl_ui_overlay_mask` export (uint32 bitmask; bit0=game Settings,
-  ## bit1=F6, bit2=F3). Non-zero means a menu/settings overlay is open.
-  cUiOverlayMask()
+  ## bit1=F6, bit2=F3). Non-zero means a menu/settings overlay is open. Resolved
+  ## once from the host DLL at runtime; 0 (no overlay) if the export is absent --
+  ## an older host, or this mod not running inside the client -- which is the
+  ## safe default (ESP simply is not suppressed rather than always suppressed).
+  if not gUiMaskTried:
+    gUiMaskTried = true
+    var hostDll = "aowlspt-host-il2cpp.dll"
+    let h = admGetModuleHandleA(toCString(hostDll))
+    if h != nil:
+      var n = "aowl_ui_overlay_mask"
+      gUiMaskFn = admGetProcAddress(h, toCString(n))
+  if gUiMaskFn == nil:
+    return 0'u32
+  admU32V(gUiMaskFn)
 
 proc gwState*(): int =
   ## 0 no host export | 1 export but no detour armed (INCONCLUSIVE) |
