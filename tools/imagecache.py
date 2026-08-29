@@ -46,6 +46,14 @@ What it does
 * copies it to `<temporaryCachePath>/files/<same relative path>`, using the
   extension the *URL* asks for, because that is the name `File.Exists` tests.
 
+It also seeds the raid LOADING-SCREEN billboards (`LocationBanner`), which are
+the one asset class stored WITHOUT a `/files/` prefix -- as a bare
+`banners/<id>.<ext>` in the served post-1.0 `locations` table (see `--locations`
+and `BANNER_RE`). These were never seeded before and rendered grey. Banner ids
+with no source asset anywhere (newer post-1.0 banners SPT never shipped) are
+seeded with a neutral fallback billboard (`--banner-fallback`) rather than the
+alarming grey placeholder.
+
 It never overwrites a file that is already there, so a genuine download always
 wins, and re-running it is free -- with ONE exception. When the client is
 launched before this tool has seeded an icon, step 3 fetches it over the
@@ -99,6 +107,19 @@ IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".tga")
 URL_PREFIX = "/files/"
 URL_RE = re.compile(r"/files/[A-Za-z0-9_.\-/]+")
 
+# Location banners (the raid LOADING-SCREEN billboards) are the one asset class
+# the client fetches from `/files/banners/<id>.<ext>` yet the database stores
+# WITHOUT the `/files/` prefix: they live as a bare `banners/<id>.<ext>` string
+# in `locations.<map>.base.Banners[].pic.path` (served out of the post-1.0
+# `locations` table, see `onLocations`). `URL_RE` never matched them, so no
+# banner was ever seeded and every one rendered as the grey placeholder --
+# `JsonType.LocationBanner:GetAndAssignSprite` -> `LoadTextureWithCache` ->
+# `/files/banners/...` -> onFiles's 93-byte placeholder -> written to cache.
+# The client turns the bare path into `/files/banners/...`, so the cache-tree
+# relative path is exactly `banners/<id>.<ext>`.
+BANNER_RE = re.compile(r"banners/[A-Za-z0-9_.\-]+\.(?:png|jpe?g|bmp|tga)",
+                       re.IGNORECASE)
+
 
 def read_text(path):
     with open(path, "r", encoding="utf-8", errors="replace") as f:
@@ -126,6 +147,20 @@ def urls_from_db(db_path):
         if rel:
             out.add(rel)
     return sorted(out)
+
+
+def banner_urls_from_file(path):
+    """Location-banner cache-relative paths (`banners/<id>.<ext>`) referenced by
+    a JSON file. Scanned as text for the same reason `urls_from_db` is: the
+    literal is stable across builds while the surrounding key shape is not. The
+    served map list is the post-1.0 `locations` table, whose banner ids differ
+    from db.json's (db.json carries the SPT `67e4...` set; the served table also
+    carries newer `6a...`/`6901...` ids), so BOTH files are scanned and unioned.
+    """
+    if not path or not os.path.isfile(path):
+        return set()
+    text = read_text(path).replace(chr(92) + "/", "/")
+    return set(m.lower() for m in BANNER_RE.findall(text))
 
 
 def index_source(src_root):
@@ -183,6 +218,17 @@ def main(argv=None):
                     help="emulator database json (the deployed db.json)")
     ap.add_argument("--src", required=True,
                     help="image source tree laid out like the /files/ URL tree")
+    ap.add_argument("--locations", default="",
+                    help="post-1.0 locations table (JSON) to also scan for "
+                         "loading-screen banner ids; defaults to "
+                         "<db-dir>/mods/tarkov/data/post1/locations.json when "
+                         "that exists (that is the table onLocations serves)")
+    ap.add_argument("--banner-fallback", default="",
+                    help="neutral banner image to seed for banner ids that have "
+                         "NO source asset anywhere, instead of leaving the "
+                         "alarming grey placeholder; defaults to "
+                         "<src>/banners/banner_default.png when present. Pass "
+                         "'none' to disable and count them as no-source")
     ap.add_argument("--game", default="",
                     help="game install dir, read for app.info company/product")
     ap.add_argument("--cache", default="",
@@ -207,14 +253,44 @@ def main(argv=None):
     cache_root = args.cache or unity_temp_cache(args.game)
     files_root = os.path.join(cache_root, "files")
 
-    urls = urls_from_db(args.db)
+    # The loading-screen banner table the client is actually served.
+    loc_path = args.locations
+    if not loc_path:
+        cand = os.path.join(os.path.dirname(os.path.abspath(args.db)),
+                            "mods", "tarkov", "data", "post1", "locations.json")
+        if os.path.isfile(cand):
+            loc_path = cand
+
+    banner_rel = banner_urls_from_file(args.db) | banner_urls_from_file(loc_path)
+    urls = sorted(set(urls_from_db(args.db)) | banner_rel)
     exact, by_stem = index_source(args.src)
 
-    copied = skipped = missing = reseeded = 0
+    # Neutral fallback for banner ids with no source asset (newer post-1.0
+    # banners SPT's image tree has never shipped). An honest neutral billboard
+    # beats the 93-byte grey the client would otherwise cache forever.
+    banner_fallback = args.banner_fallback
+    if banner_fallback == "none":
+        banner_fallback = ""
+    elif not banner_fallback:
+        cand = os.path.join(args.src, "banners", "banner_default.png")
+        if os.path.isfile(cand):
+            banner_fallback = cand
+    if banner_fallback and not os.path.isfile(banner_fallback):
+        sys.exit("no banner-fallback image at " + banner_fallback)
+
+    copied = skipped = missing = reseeded = fell_back = 0
     missing_examples = []
     reseeded_examples = []
+    fallback_examples = []
     for rel in urls:
         src = resolve(rel, exact, by_stem)
+        is_banner = rel.startswith("banners/")
+        used_fallback = False
+        if not src and is_banner and banner_fallback:
+            # No real asset for this banner id -- seed the neutral default so it
+            # renders as an honest billboard rather than the grey placeholder.
+            src = banner_fallback
+            used_fallback = True
         if not src:
             missing += 1
             if len(missing_examples) < 10:
@@ -231,32 +307,49 @@ def main(argv=None):
             if dst_size < 0 or dst_size > args.placeholder_max:
                 skipped += 1
                 continue
-            reseeded += 1
-            if len(reseeded_examples) < 10:
-                reseeded_examples.append(rel)
+            # Poisoned placeholder on disk -> reseed (with the real asset, or
+            # with the neutral fallback for a sourceless banner id).
+            if used_fallback:
+                fell_back += 1
+                if len(fallback_examples) < 10:
+                    fallback_examples.append(rel)
+            else:
+                reseeded += 1
+                if len(reseeded_examples) < 10:
+                    reseeded_examples.append(rel)
             if args.dry_run:
                 continue
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             shutil.copyfile(src, dst)
             continue
-        if args.dry_run:
+        if used_fallback:
+            fell_back += 1
+            if len(fallback_examples) < 10:
+                fallback_examples.append(rel)
+        else:
             copied += 1
+        if args.dry_run:
             continue
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         shutil.copyfile(src, dst)
-        copied += 1
 
     print("cache      : " + files_root)
-    print("urls       : %d" % len(urls))
+    print("locations  : " + (loc_path or "(none found -- banners from db.json only)"))
+    print("urls       : %d  (of which banners: %d)" % (len(urls), len(banner_rel)))
     print("%s: %d" % ("would copy " if args.dry_run else "copied     ", copied))
     print("already there: %d" % skipped)
     print("%s: %d" % ("would reseed" if args.dry_run else "reseeded    ", reseeded)
           + "  (poisoned placeholders <= %d bytes)" % args.placeholder_max)
+    print("%s: %d" % ("would fallback" if args.dry_run else "fell back   ", fell_back)
+          + "  (sourceless banner ids -> neutral " +
+          (os.path.basename(banner_fallback) if banner_fallback else "(disabled)") + ")")
     print("no source  : %d" % missing)
     for r in reseeded_examples:
-        print("   reseed  " + r)
+        print("   reseed   " + r)
+    for r in fallback_examples:
+        print("   fallback " + r)
     for m in missing_examples:
-        print("   missing " + m)
+        print("   missing  " + m)
     return 0
 
 
