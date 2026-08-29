@@ -529,6 +529,7 @@ proc mapsDiagText(): string =
   # reads a torn string. `hudInRaid()` reads the C mirror and needs no lock.
   lockMod()
   let diagInRaid = hudInRaid()
+  let diagActive = activeRaid(gSnap)
   let diagRaidWhy = activeRaidWhy(gSnap)
   let diagLocKey = gSnap.locationId
   unlockMod()
@@ -558,6 +559,23 @@ proc mapsDiagText(): string =
   of 2: lWorld = "INCONCLUSIVE  armed, no GameWorld cached -- consistent with " &
                  "being in the menu, but it is not proof of it"
   else: lWorld = "PASS  GameWorld live (borrowed from the host's RegisterPlayer cache)"
+
+  # 2b. THE RAID LIFECYCLE GATE (bug 1), stated as its OWN line and never folded
+  # into `world` above. `world PASS` means only that the borrowed RegisterPlayer
+  # cache is non-null -- which fact #141 says is true ~15s BEFORE the player
+  # deploys, in the menu, and after extract. The HUD must NOT draw then. This
+  # line reports `activeRaid()` -- state 3 AND a validated local pose AND the
+  # local player present in the live AllAlivePlayersList (the game's own
+  # spawned-and-in-world set) -- so a reader can tell "world is cached" apart
+  # from "I have actually spawned into the raid". It is the finished-state gate
+  # the draw/publish/art paths all consult; naming it here makes visible WHICH
+  # condition opened or closed it.
+  var lRaid = ""
+  if diagActive:
+    lRaid = "PASS  gate OPEN -- the local player is in the live " &
+            "AllAlivePlayersList (spawned, in-world this frame); HUD draws"
+  else:
+    lRaid = "CLOSED  HUD idle -- " & diagRaidWhy
 
   # 3. positions. THE stage that was silent. Never collapses to a bool.
   var lPos = ""
@@ -713,6 +731,7 @@ proc mapsDiagText(): string =
   result = "maps diag:\n" &
            "  region       : " & lRegion & "\n" &
            "  world        : " & lWorld  & "\n" &
+           "  raid         : " & lRaid   & "\n" &
            "  positions    : " & lPos    & "\n" &
            "  draw         : " & lDraw   & "\n" &
            "  drawCost     : " & lPerf   & "\n" &
@@ -754,6 +773,20 @@ proc onMapsApply(key: string) =
   loadHudOpts()                       # refresh gOpts + gHeadingOn from config
   let live = nowEnabled and gFeedRunning
   hudReconfigure(gOpts, live)         # next frame honours it; no position reset
+  # A MAPS-OWNED TRACE, unconditional and BEFORE the verdict branches below
+  # (bug 2). The earlier apply hook left no line of its own in the host log, so
+  # "the toggle did nothing" and "the hook never fired" were indistinguishable.
+  # This prints the exact values just pushed into the C mirror the draw callback
+  # reads every frame -- `mapOn`/`radarOn`/`indicatorsOn` are each ANDed with
+  # `live`, so an off edit shows the surface at 0 here and the NEXT draw frame
+  # honours it (0 tiles / 0 blips). This is the finished-state assertion the fix
+  # is judged on: not "apply returned ok" but "the mirror now reads off".
+  info "maps: apply " & (if key.len > 0: key else: "(all)") &
+       " -> config hudMap=" & $gOpts.map & " hudRadar=" & $gOpts.radar &
+       " indicators=" & $gOpts.indicators & " enabled=" & $nowEnabled &
+       " live=" & $live & " -> mirror pushed mapOn=" &
+       $(gOpts.map and live) & " radarOn=" & $(gOpts.radar and live) &
+       " indicatorsOn=" & $(gOpts.indicators and live)
   if key == "enabled":
     if nowEnabled and not gFeedRunning:
       settingAppliesOnRestart("the position collector is only registered at " &
