@@ -339,18 +339,22 @@ proc splAnchor(): Il2CppPtr =
   ## where the live UI (and the "Matchmaker Offline Raid Screen") actually lives,
   ## since SceneManager excludes that scene BY DESIGN (CLAUDE.md 2).
   ##
-  ## `iSceneRoots(roots, false)` with anchor=nil falls back to `gInspPreloader`,
-  ## which has exactly ONE writer: the LIVE INSPECTOR's rider. With
-  ## liveInspector=false (every beta user) that global is never set, the
-  ## DontDestroyOnLoad scene is never enumerated, and this feature was DEAD.
-  ## `gVerPreloader` is the version-brand's PreloaderUI `this`, captured in a
-  ## postfix at ~1.3 s independent of the inspector (aowlhost.nim) -- the same
-  ## dual-anchor cure the mode button and version brand already use. Both are
-  ## PreloaderUI, which lives in DontDestroyOnLoad, so either makes
-  ## `iAnchorSceneHandle` enumerate that scene's roots (including "UI").
+  ## MEASURED live (inspector `roots`/`find`): the offline-raid screen is a
+  ## shallow descendant of "Menu UI" in the DontDestroyOnLoad scene (handle -12,
+  ## 22 roots). `gVerPreloader` -- the version-brand's `PreloaderUI::Awake`
+  ## `this` -- does NOT belong to that scene: `GameObject::get_scene_Injected`
+  ## puts it in a game/environment scene enumerating 197-274 roots, so anchoring
+  ## on it made `splFindScreen` walk the WRONG scene and report "NOT found across
+  ## 197 roots". The correct object is the `PreloaderUI::Update` `this`, which
+  ## DOES land in scene -12. `gSplUpdatePreloader` captures exactly that,
+  ## unconditionally, from the shared Update rider block (aowlhost.nim) -- so it
+  ## is populated for beta users with liveInspector OFF. `gInspPreloader` is the
+  ## same Update `this` but only the inspector writes it; kept as a fallback for
+  ## the case where a rider slot has not yet been claimed. `gVerPreloader` is
+  ## NO LONGER used as an anchor -- it points at the wrong scene by construction.
   result = nil
-  if gVerPreloader != nil and duOk(gVerPreloader, 0x20'i32):
-    return gVerPreloader
+  if gSplUpdatePreloader != nil and duOk(gSplUpdatePreloader, 0x20'i32):
+    return gSplUpdatePreloader
   if gInspPreloader != nil and duOk(gInspPreloader, 0x20'i32):
     return gInspPreloader
 
@@ -369,8 +373,9 @@ proc splFindScreen(): Il2CppPtr =
   if roots.len == 0:
     gSplLastWhy = (if anchor == nil:
       "iSceneRoots returned NO roots and this feature has no durable anchor " &
-      "yet (gVerPreloader/gInspPreloader both null). If liveInspector is off " &
-      "this resolves once the version-brand PreloaderUI postfix has fired (~1.3s)."
+      "yet (gSplUpdatePreloader/gInspPreloader both null). This resolves once a " &
+      "PreloaderUI::Update rider slot has been claimed and the menu is ticking " &
+      "-- independent of liveInspector."
       else:
       "iSceneRoots returned NO roots even WITH a durable anchor -- the menu is " &
       "likely not up yet.")

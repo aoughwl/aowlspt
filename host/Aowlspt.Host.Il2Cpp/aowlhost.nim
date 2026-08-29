@@ -1538,6 +1538,20 @@ var gVerOn = false
 ## halves (the argument registers are saved on entry either way), so the brand
 ## captures it itself now, from the very rider call it already receives.
 var gVerPreloader: Il2CppPtr = nil
+## THE SINGLEPLAYER-REBRAND'S DURABLE ANCHOR into the DontDestroyOnLoad menu
+## scene, and it exists because `gVerPreloader` DOES NOT LAND THERE. Measured
+## live with the inspector: `gVerPreloader` (the `PreloaderUI::Awake` `this`,
+## above) resolves through `GameObject::get_scene_Injected` to a game/environment
+## scene enumerating 197-274 roots, NOT the 22-root DontDestroyOnLoad scene
+## (handle -12) that actually holds "Menu UI" -> ... -> "Matchmaker Offline Raid
+## Screen". The `PreloaderUI::Update` `this` DOES land in scene -12 -- it is the
+## same object `gInspPreloader` captures -- but that global has exactly ONE
+## writer, the live inspector's rider, so with liveInspector off (every beta
+## user) `splFindScreen` had no correct anchor and reported "NOT found across
+## 197 roots". Captured here UNCONDITIONALLY from the shared PreloaderUI::Update
+## rider block (which modetext/debugui/inspector/region all drive), so the
+## rebrand no longer depends on any other feature's flag being on.
+var gSplUpdatePreloader: Il2CppPtr = nil
 var gSeasonsOn = false
 ## THE BETA NOTICE IN THE SEASONS BANNER SLOT. A SEPARATE KEY from
 ## `uxHideSeasons` on purpose: a player may well want the KORD BREACH banner
@@ -3322,6 +3336,15 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
   # render-phase method that drains the render queue where GL drawing lands.
   if i == gRenderDrainSlot:
     renderDrain()
+    # RE-CLOBBER THE CURSOR at end of frame, AFTER the game's Update-time re-lock.
+    # The update-drain branch above frees/holds at the PREFIX of
+    # TarkovApplication::Update, which in a raid runs BEFORE the game re-locks --
+    # so it lost the per-frame race (reasserts climbed while current stayed
+    # Locked/hidden). The render drain (OnRenderObject/OnPostRender) is the last
+    # main-thread point in the frame, so a reassert here wins. It opens its own
+    # single guard, exactly like cursorFreeDrainTick, and is inert unless a panel
+    # is open and the update tick is already holding.
+    cursorFreeRenderReassert()
     return 0'i32
   # Experiment A: the read-only settings probe, likewise by identity.
   if i == gSettingsSlot:
@@ -3390,6 +3413,17 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
     # installs NO detour: it rides the chain that already exists, per the
     # two-detours-one-trampoline rule.
     profFrameTick()
+    # THE DURABLE PRELOADER ANCHOR for the singleplayer rebrand. RCX here is the
+    # live `PreloaderUI` for every slot in this block (they all ride
+    # `EFT.UI.PreloaderUI::Update`), and this `this` -- unlike the Awake `this`
+    # in `gVerPreloader` -- belongs to the DontDestroyOnLoad menu scene the
+    # offline-raid screen lives in. Captured every frame, ungated, so it holds
+    # the CURRENT live object regardless of the liveInspector flag. One register
+    # read and one store; no call into the game, no allocation.
+    block:
+      let splPre = cast[Il2CppPtr](cRegsInt(regs, 0'i32))
+      if splPre != nil:
+        gSplUpdatePreloader = splPre
     if i == gDebugUiSlot:
       cProfBegin(profSlotDebugUi)
       debugUiFired(regs)
@@ -3554,6 +3588,17 @@ proc patchReturned(slot: int32; regs: Il2CppPtr): int32 {.
     # halves ever fires for a given slot (the engine routes on the postfix
     # flag), so this cannot double-count a frame.
     profFrameTick()
+    # THE DURABLE PRELOADER ANCHOR for the singleplayer rebrand. RCX here is the
+    # live `PreloaderUI` for every slot in this block (they all ride
+    # `EFT.UI.PreloaderUI::Update`), and this `this` -- unlike the Awake `this`
+    # in `gVerPreloader` -- belongs to the DontDestroyOnLoad menu scene the
+    # offline-raid screen lives in. Captured every frame, ungated, so it holds
+    # the CURRENT live object regardless of the liveInspector flag. One register
+    # read and one store; no call into the game, no allocation.
+    block:
+      let splPre = cast[Il2CppPtr](cRegsInt(regs, 0'i32))
+      if splPre != nil:
+        gSplUpdatePreloader = splPre
     if i == gDebugUiSlot:
       cProfBegin(profSlotDebugUi)
       debugUiFired(regs)

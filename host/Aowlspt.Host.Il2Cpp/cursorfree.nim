@@ -21,6 +21,15 @@
 # `gInspSlot2` alias onto this same drain. A raid is the entire point of this
 # feature, so it rides the drain that ticks in one.
 #
+# AND, IN A RAID, THE RENDER DRAIN TOO. The update-drain tick frees and holds at
+# the PREFIX of `TarkovApplication::Update`, which runs BEFORE the client's own
+# Update-time cursor re-lock each frame -- so in a raid it lost the per-frame
+# race (measured: reasserts climbed every tick while `current` stayed
+# Locked/hidden). `cursorFreeRenderReassert` (below) re-applies None/visible from
+# the RENDER drain (OnRenderObject/OnPostRender), the last main-thread point in
+# the frame, which runs AFTER the re-lock and therefore wins. It only re-applies;
+# the state machine stays on the update drain.
+#
 # THE MOUSELOOK DECISION -- deliberately NOT suppressed
 # -----------------------------------------------------
 # A freed cursor that still turns the player is arguably worse than the current
@@ -132,9 +141,57 @@ __declspec(dllexport) int32_t aowl_cursor_panels_x(int32_t mask) {
     aowl_cursor_panels(mask, (uint32_t)GetTickCount64());
     return 1;
 }
+/* THE RENDER-PHASE RE-CLOBBER. In a RAID the client re-locks the cursor
+ * (lockState=Locked, visible=false) every frame from inside its Update-time
+ * input path, which runs LATER in the frame than the update-drain tick (the
+ * prefix of EFT.TarkovApplication::Update) -- so that tick's HOLD lost the race:
+ * measured in-raid, reasserts climbed every tick while `current` stayed
+ * Locked/hidden and the mouse could not move. This body re-applies None/visible
+ * from the RENDER drain (OnRenderObject / OnPostRender), which Unity runs at the
+ * END of the frame on the main thread, AFTER the game's re-lock -- so the cursor
+ * the overlay is drawn over (at Present) is free.
+ *
+ * It does ONE thing. FREE (the save of the game's real state) and RESTORE (on
+ * close) and the whole state machine stay with the update-drain tick; this only
+ * fires while that tick is already holding (haveSaved), never saves, never
+ * restores, and touches only the `reasserts` counter. READ BEFORE WRITE, and a
+ * getter that refused (returns <0, meaning it did not verify against the startup
+ * snapshot) makes this skip rather than blind-write. It is defined here rather
+ * than in the ABI header so a fix stays a 48s host rebuild, and it references
+ * `g_cur` and the file-static helpers because this emit is in the SAME
+ * translation unit that #included aowlspt_cursor.h. */
+void* aowl_cur_reassert_body(void* a) {
+    int32_t curLock, curVis;
+    (void)a;
+    if (!g_cur.haveSaved || !g_cur.enabled || g_cur.off) return (void*)1;
+    if (aowl_cur_live_mask(&g_cur, (uint64_t)GetTickCount64()) == 0)
+        return (void*)1;               /* panel closed; the update tick restores */
+    curLock = aowl_cur_get_lock();
+    curVis  = aowl_cur_get_vis();
+    if (curLock < 0 || curVis < 0) return (void*)1;   /* getter refused */
+    if (curLock != AOWL_CUR_LOCK_NONE || curVis == 0) {
+        if (aowl_cur_set_lock(AOWL_CUR_LOCK_NONE) && aowl_cur_set_vis(1)) {
+            aowl_cur_did_hold(&g_cur);
+            aowl_cur_last_lock = AOWL_CUR_LOCK_NONE;
+            aowl_cur_last_vis  = 1;
+        } else {
+            aowl_cur_last_lock = curLock;
+            aowl_cur_last_vis  = curVis;
+        }
+    } else {
+        aowl_cur_last_lock = curLock;   /* already None/visible: nothing to do */
+        aowl_cur_last_vis  = curVis;
+    }
+    return (void*)1;
+}
+static void* aowl_cur_reassert_guarded(void* a) {
+    return aowl_p_p_seh((void*)aowl_cur_reassert_body, a);
+}
 """.}
 proc cCurTickGuarded(a: Il2CppPtr): Il2CppPtr {.
   importc: "aowl_cur_tick_guarded", nodecl.}
+proc cCurReassertGuarded(a: Il2CppPtr): Il2CppPtr {.
+  importc: "aowl_cur_reassert_guarded", nodecl.}
 
 # ---------------------------------------------------------------------------
 # State
@@ -281,6 +338,33 @@ proc cursorFreeDrainTick() =
          " (reasserts~=ticks means the client re-asserts the lock every " &
          "frame and the per-tick hold is what makes this work; 0 means a " &
          "one-shot set survives)"
+
+proc cursorFreeRenderReassert() =
+  ## THE RENDER-PHASE RE-CLOBBER, riding the render drain (OnRenderObject /
+  ## OnPostRender) -- end of frame, on Unity's main thread, AFTER the game's
+  ## Update-time cursor re-lock. The update-drain tick runs at the PREFIX of
+  ## `EFT.TarkovApplication::Update`, BEFORE the game re-locks each frame, so in a
+  ## raid its HOLD lost the race: measured, reasserts climbed every tick while
+  ## `current` stayed Locked/hidden. This runs late enough to win, so `current`
+  ## reads None/visible -- the falsifiable check the fix is judged on.
+  ##
+  ## Re-applies ONLY: FREE, RESTORE and the state machine stay with the update
+  ## tick, and this fires only while that tick is already holding (haveSaved). It
+  ## opens its OWN single `aowl_p_p_seh`, never nested: `patchFired`'s render
+  ## branch is not itself guarded, exactly like the update branch that already
+  ## calls `cursorFreeDrainTick`. Idle cost when nothing is freed is one integer
+  ## compare and NO call into the game.
+  if not gCursorFreeOn or gCursorFreeOff: return
+  if cCurStHaveSaved() == 0: return
+  if cCurReassertGuarded(cast[Il2CppPtr](0)) == nil:
+    inc gCursorFreeFaults
+    warn "overlay cursor: the render-phase reassert faulted (" &
+         $gCursorFreeFaults & " of " & $CurMaxFaults & ")"
+    if gCursorFreeFaults >= CurMaxFaults:
+      gCursorFreeOff = true
+      cCurStEnable(0)
+      warn "overlay cursor: too many faults (render reassert); switching itself " &
+           "off for this session. This is a REFUSAL, not a success."
 
 # ---------------------------------------------------------------------------
 # Boot
