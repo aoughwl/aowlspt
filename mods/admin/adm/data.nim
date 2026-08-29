@@ -320,15 +320,12 @@ proc espProjectable*(): bool =
 # ---------------------------------------------------------------------------
 
 proc overlayMaskOpen*(): bool =
-  ## TODO(merge -- overlay mask). Returns whether a menu/settings overlay is
-  ## open, so ESP can suppress itself mid-raid. The host export
-  ## `aowl_ui_overlay_mask` (uint32 bitmask; bit0=game Settings, bit1=F6,
-  ## bit2=F3) does NOT exist on this branch yet, so this is a hard `false` stub
-  ## -- ESP is never suppressed by it today. When the export lands, wire it here
-  ## (resolve once, read per call, return mask != 0); DO NOT invent the export.
-  ## The single ESP call site is the `if overlayMaskOpen()` guard in
+  ## Returns whether a menu/settings overlay is open, so ESP can suppress itself
+  ## mid-raid. Reads the host export `aowl_ui_overlay_mask` (uint32 bitmask;
+  ## bit0=game Settings, bit1=F6, bit2=F3) per call; non-zero means an overlay
+  ## is open. The single ESP call site is the `if overlayMaskOpen()` guard in
   ## collectAndPublish.
-  false
+  hostUiOverlayMask() != 0'u32
 
 proc worldPtr(): pointer =
   ## The live GameWorld. We do NOT install our own detour: a second detour on
@@ -602,13 +599,10 @@ proc collectAndPublish*(s: AdminRegion; maxDistance: float; bbW, bbH: int) =
               "menu, loading-before-spawn, or post-extract, not an active raid"
     frameBegin(s, bbW, bbH); frameCommit(s); return
 
-  # OVERLAY-MASK SUPPRESSION HOOK (task, coordinate item).
-  # TODO(merge): the host export `aowl_ui_overlay_mask` (uint32 bitmask;
-  # bit0=game Settings open, bit1=F6, bit2=F3) is NOT present in this branch.
-  # When it lands, replace `overlayMaskOpen()` below (defined near the top of
-  # this file as a `false` stub) with a read of that export so ESP hides while a
-  # menu/settings screen is open mid-raid. The single suppression point is the
-  # next two lines; nothing else needs changing.
+  # OVERLAY-MASK SUPPRESSION HOOK. `overlayMaskOpen()` reads the host export
+  # `aowl_ui_overlay_mask` (uint32 bitmask; bit0=game Settings open, bit1=F6,
+  # bit2=F3), so ESP hides while a menu/settings screen is open mid-raid. The
+  # single suppression point is the next two lines.
   if overlayMaskOpen():
     gStatus = "in raid, but an overlay/menu mask is open -- ESP suppressed"
     frameBegin(s, bbW, bbH); frameCommit(s); return

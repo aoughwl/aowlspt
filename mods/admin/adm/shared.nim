@@ -69,6 +69,7 @@ proc cMatMul(a, b, outp: ptr cfloat) {.importc: "aowl_admin_mat_mul", nodecl.}
 
 proc cGameWorld(): pointer {.importc: "aowl_admin_gameworld", nodecl.}
 proc cGwState(): int32 {.importc: "aowl_admin_gw_state", nodecl.}
+proc cUiOverlayMask(): uint32 {.importc: "aowl_ui_overlay_mask", nodecl.}
 
 proc cCamSample(): int32 {.importc: "aowl_admin_cam_sample", nodecl.}
 proc cCamState(): int32 {.importc: "aowl_admin_cam_state", nodecl.}
@@ -342,6 +343,11 @@ proc hostGameWorld*(): pointer =
   ## The live `EFT.GameWorld`, borrowed from the host's existing RegisterPlayer
   ## detour cache. nil is AMBIGUOUS on its own -- always pair with gwState().
   cGameWorld()
+
+proc hostUiOverlayMask*(): uint32 =
+  ## The host `aowl_ui_overlay_mask` export (uint32 bitmask; bit0=game Settings,
+  ## bit1=F6, bit2=F3). Non-zero means a menu/settings overlay is open.
+  cUiOverlayMask()
 
 proc gwState*(): int =
   ## 0 no host export | 1 export but no detour armed (INCONCLUSIVE) |
