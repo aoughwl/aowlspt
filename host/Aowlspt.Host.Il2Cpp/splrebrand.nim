@@ -537,40 +537,57 @@ proc splScanNode(t: Il2CppPtr; depth: int; budget: var int; deadline: uint64) =
   ## The description is a LocalizedText whose m_text does not contain the visible
   ## words, so it is intentionally NOT relabelled here (a known gap; the heading,
   ## checkbox and warning are what the player reacts to).
+  ## TRUE level-order BFS matching NAMES. splFindByName is per-node
+  ## breadth-then-DFS: it found the shallow SCREEN fine, but the targets are
+  ## ~3-4 levels down, so it recursed depth-first into the deep settings subtree
+  ## and the 18 ms slice expired before reaching CaptionsHolder. A real BFS
+  ## visits every depth-1 node, then every depth-2, etc., so the shallow targets
+  ## are reached before the deep settings. Name-reads (not TMP reads) keep each
+  ## node cheap; early-out the moment all three are in hand.
   if t == nil or depth < 0 or budget <= 0 or not duOk(t, 0x20'i32): return
-  # Heading: the MainCaption TMP.
-  if gSplHeadTmp == nil:
-    var b = budget
-    let h = splFindByName(t, SplHeadNode, depth, b, deadline)
-    budget = b
-    if h != nil:
-      let tmp = splTmpOf(h)
-      if tmp != nil:
-        gSplHeadTmp = tmp
-        gSplHeadLoc = splComponent(h, splLocTypeStr())
-  # Checkbox: the SoloModeCheckmarkBlocker -- GameObject (hide) + Toggle (force).
-  if gSplCheckGo == nil:
-    var b = budget
-    let cb = splFindByName(t, SplBlockerName, depth, b, deadline)
-    budget = b
-    if cb != nil:
-      let go = iGameObjectOf(cb)
-      if go != nil and duOk(go, 0x20'i32):
-        gSplCheckGo = go
-      let tog = splComponent(cb, splTogTypeStr())
-      if tog != nil and duOk(tog, cSwOffToggleIsOn() + 8'i32):
-        gSplToggle = tog
-  # Co-op / EoD progress warning: hide the whole WarningTextVertLayout box.
-  if gSplWarnGo == nil:
-    var b = budget
-    let wc = splFindByName(t, SplWarnNode, depth, b, deadline)
-    budget = b
-    if wc != nil:
-      let go = iGameObjectOf(wc)
-      if go != nil and duOk(go, 0x20'i32):
-        gSplWarnGo = go
-        gSplWarnName = SplWarnNode
-        gSplWarnMatched = true
+  var frontier: seq[Il2CppPtr] = @[t]
+  var d = 0
+  while frontier.len > 0 and d <= depth and budget > 0:
+    var nextf: seq[Il2CppPtr] = @[]
+    var fi = 0
+    while fi < frontier.len and budget > 0:
+      let node = frontier[fi]
+      fi = fi + 1
+      if node == nil or not duOk(node, 0x20'i32): continue
+      budget = budget - 1
+      if (budget and 31) == 0 and cNowMs() > deadline:
+        budget = 0
+        return
+      let nm = iObjName(node)
+      if gSplHeadTmp == nil and nm == SplHeadNode:
+        let tmp = splTmpOf(node)
+        if tmp != nil:
+          gSplHeadTmp = tmp
+          gSplHeadLoc = splComponent(node, splLocTypeStr())
+      elif gSplCheckGo == nil and nm == SplBlockerName:
+        let go = iGameObjectOf(node)
+        if go != nil and duOk(go, 0x20'i32):
+          gSplCheckGo = go
+        let tog = splComponent(node, splTogTypeStr())
+        if tog != nil and duOk(tog, cSwOffToggleIsOn() + 8'i32):
+          gSplToggle = tog
+      elif gSplWarnGo == nil and nm == SplWarnNode:
+        let go = iGameObjectOf(node)
+        if go != nil and duOk(go, 0x20'i32):
+          gSplWarnGo = go
+          gSplWarnName = SplWarnNode
+          gSplWarnMatched = true
+      if gSplHeadTmp != nil and gSplCheckGo != nil and gSplWarnGo != nil:
+        return
+      var n = 0
+      if iChildCount(node, n):
+        var i = 0
+        while i < n and i < SplFanout:
+          let c = iChildAt(node, i)
+          if c != nil: nextf.add c
+          i = i + 1
+    frontier = nextf
+    d = d + 1
 
 # ---------------------------------------------------------------------------
 # Maintain + assert the FINISHED STATE (never our own write -- fact #9b).
