@@ -95,6 +95,7 @@ const
   CurTSetLock = 3'i32            ## UnityEngine.Cursor::set_lockState
 
   CurPDebugUi = 0x4'u32          ## F3  -- the widget layout editor
+  CurPSettings = 0x8'u32         ## the GAME's own Settings screen (uistate.nim)
   CurActFree    = 1'i32
   CurActHold    = 2'i32
   CurActRestore = 3'i32
@@ -180,6 +181,12 @@ proc cursorFreeHostMask(): uint32 =
   ## the cursor by itself.
   result = 0'u32
   if gDuEdit: result = result or CurPDebugUi
+  # The GAME's own Settings screen, when the `overlayStateSignal` probe has
+  # confirmed it is active-in-hierarchy this tick (uistate.nim, included just
+  # before this file). This is what frees the cursor for the reported bug --
+  # "when I open settings my mouse is not free" -- and it is a LEVEL, republished
+  # every tick, so it releases itself the moment the screen closes.
+  if uiStateSettingsOpen(): result = result or CurPSettings
 
 # ---------------------------------------------------------------------------
 # THE TICK

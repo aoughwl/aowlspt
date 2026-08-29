@@ -187,7 +187,8 @@
 #define AOWL_CUR_P_OVERLAY  0x1u   /* F12 -- the manager / settings panel  */
 #define AOWL_CUR_P_ADMIN    0x2u   /* F6  -- the admin menu (NOT ESP)      */
 #define AOWL_CUR_P_DEBUGUI  0x4u   /* F3  -- the widget layout editor      */
-#define AOWL_CUR_P_ALL      0x7u
+#define AOWL_CUR_P_SETTINGS 0x8u   /* the GAME's own Settings screen       */
+#define AOWL_CUR_P_ALL      0xFu
 
 #define AOWL_CUR_SRC_HOST     0
 #define AOWL_CUR_SRC_OVERLAY  1
@@ -525,6 +526,18 @@ static void aowl_cur_publish_host(uint32_t mask, uint64_t nowMs) {
 /* Diagnostics, so `cursorfree.nim` can name the state in one line. */
 static int32_t aowl_cur_st_panels(void)    { return g_cur.panels; }
 static int32_t aowl_cur_st_mask(void)      { return (int32_t)g_cur.liveMask; }
+/* The union of the unexpired panel publications RIGHT NOW -- read by the UI
+ * overlay-mask signal (aowlspt_uistate.h) to source its F6/F3 bits from the
+ * same level the cursor feature already maintains. Folds in the overlay DLL's
+ * cross-module publication so a caller need not run the tick body first. */
+static uint32_t aowl_cur_live_mask_now(void) {
+    LONG m = g_curOvMask, s = g_curOvStamp;
+    if (s != 0) {
+        g_cur.pub[AOWL_CUR_SRC_OVERLAY].mask    = (uint32_t)m & AOWL_CUR_P_ALL;
+        g_cur.pub[AOWL_CUR_SRC_OVERLAY].stampMs = (uint64_t)(uint32_t)s;
+    }
+    return aowl_cur_live_mask(&g_cur, (uint64_t)GetTickCount64());
+}
 static int32_t aowl_cur_st_have_saved(void){ return g_cur.haveSaved; }
 static int32_t aowl_cur_st_saved_lock(void){ return g_cur.savedLock; }
 static int32_t aowl_cur_st_saved_vis(void) { return g_cur.savedVis; }

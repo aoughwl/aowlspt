@@ -99,6 +99,32 @@ TABLES = [
         "users": ["host/Aowlspt.Host.Il2Cpp/cursorfree.nim"],
         "accessors": ["cCurFn", "cCurName", "cCurRva"],
     },
+    # The game-Settings-open probe behind aowl_ui_overlay_mask's bit0. Two
+    # instance getters, indexed by the AOWL_UI_T_* #defines in the C header and
+    # mirrored by the annotated UiT* constants here, which is what ties each row
+    # to the method it means.
+    {
+        "mode": "positional",
+        "header": "abi/aowlspt_uistate.h",
+        "array": "aowl_ui_targets",
+        "const_prefix": "UiT",
+        "const_file": "host/Aowlspt.Host.Il2Cpp/uistate.nim",
+        "expect_file": None,
+        "users": ["host/Aowlspt.Host.Il2Cpp/uistate.nim"],
+        "accessors": ["cUiFn"],
+    },
+    # The scene-walk getters (get_parent/childCount/GetChild/Find/GetComponent),
+    # indexed positionally from aowlscene.nim by the annotated Sc* constants.
+    {
+        "mode": "positional",
+        "header": "abi/aowlspt_scene.h",
+        "array": "aowl_scene_targets",
+        "const_prefix": "Sc",
+        "const_file": "host/Aowlspt.Host.Il2Cpp/aowlscene.nim",
+        "expect_file": None,
+        "users": ["host/Aowlspt.Host.Il2Cpp/aowlscene.nim"],
+        "accessors": ["cSceneFn", "cSceneName", "cSceneRva"],
+    },
     {
         "mode": "positional",
         "header": "abi/aowlspt_modetext.h",
