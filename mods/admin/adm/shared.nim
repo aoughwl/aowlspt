@@ -355,7 +355,7 @@ proc hostGameWorld*(): pointer =
   ## detour cache. nil is AMBIGUOUS on its own -- always pair with gwState().
   cGameWorld()
 
-var gUiMaskFn: pointer = nil
+var gUiMaskFn: pointer = cast[pointer](0)
 var gUiMaskTried = false
 
 proc hostUiOverlayMask*(): uint32 =
