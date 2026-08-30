@@ -257,6 +257,11 @@ static int aowl_rva_is_code(unsigned int rva) {
 ## `EFT.GameWorld::RegisterPlayer` detour target. Offsets/target only; the walk
 ## is in `botdiag.nim` (included below). See `aowlspt_botdiag.h`.
 {.emit: """#include "aowlspt_botdiag.h" """.}
+## READ-ONLY raid-deploy edge detector: the verified `EFT.GameWorld::OnGameStarted`
+## (ON, currently unbindable -- relative-branch prologue) and `EFT.GameWorld::Dispose`
+## (OFF, clean prologue) postfix targets. Targets only; the flag flip and gate live
+## in `debugui.nim`. See `aowlspt_deploygate.h`.
+{.emit: """#include "aowlspt_deploygate.h" """.}
 ## OFFLINE SCAV-CAP LIFT: the MaxBots (+0xC0) offset + the verified
 ## `EFT.BotSpawner::AddPlayer` detour target + the guarded int32 read/write. The
 ## one field poke is in `botcap.nim` (included below). See `aowlspt_botcap.h`.
@@ -1466,6 +1471,16 @@ var gDebugUiSlot = -1
 var gDebugEspSlot = -1
 var gDebugUi = false
 var gDebugEsp = false
+
+## RAID-DEPLOY GATE (kind=19/20 read-only POSTFIX detours). `gDeployStartSlot`
+## rides `EFT.GameWorld::OnGameStarted` (the ON edge -- see the relocation note in
+## `aowlspt_deploygate.h`; it does NOT arm on this build) and `gDeployEndSlot`
+## rides `EFT.GameWorld::Dispose` (the OFF edge, clean prologue). Both flip the
+## host-side `gRaidDeployed` flag in `debugui.nim`, which gates the ESP draw when
+## `raidDeployGate` is on. Default OFF -- the ESP behaves exactly as before unless
+## the gate flag is set. Dispatched by slot identity in `patchReturned`.
+var gDeployStartSlot = -1
+var gDeployEndSlot = -1
 
 ## THE MENU'S BOTTOM-RIGHT GAME-MODE LABEL (stock: "PVE ZONE").
 ##
@@ -3559,6 +3574,14 @@ proc patchReturned(slot: int32; regs: Il2CppPtr): int32 {.
   if i == gVersionSlot:
     versionBrandFired(regs)
     return 0'i32
+  # Raid-deploy gate, by identity: read-only host drains (meth == nil) that flip
+  # `gRaidDeployed` at the two raid-lifecycle edges and never change a result.
+  if i == gDeployStartSlot:
+    deployStartedFired(regs)
+    return 0'i32
+  if i == gDeployEndSlot:
+    deployEndedFired(regs)
+    return 0'i32
   # SKIP THE MODE SCREEN: the two READ-ONLY postfix captures, by identity and
   # before the generic postfix path -- both are host drains (meth == nil), so
   # they must be handled here rather than falling through to the meth-driven
@@ -4771,6 +4794,8 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
               elif kind == 15: "bot-nav"
               elif kind == 17: "skip-mode-screen-ctor"
               elif kind == 18: "skip-mode-screen-showslot"
+              elif kind == 19: "deploy-gate-on"
+              elif kind == 20: "deploy-gate-off"
               else: "main-thread")
   tablesLock()
   let claimed = cHookClaim()
@@ -4848,6 +4873,10 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
     gModeSkipCtorSlot = int(claimed)
   elif kind == 18:
     gModeSkipShowSlot = int(claimed)
+  elif kind == 19:
+    gDeployStartSlot = int(claimed)
+  elif kind == 20:
+    gDeployEndSlot = int(claimed)
   else:
     gDrainSlot = int(claimed)
   tablesUnlock()
@@ -4856,7 +4885,7 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
   elif kind == 2 or kind == 3 or kind == 4 or kind == 5 or kind == 6 or
        kind == 7 or kind == 8 or kind == 9 or kind == 10 or
        kind == 11 or kind == 12 or kind == 13 or kind == 14 or kind == 15 or
-       kind == 16 or kind == 17 or kind == 18:
+       kind == 16 or kind == 17 or kind == 18 or kind == 19 or kind == 20:
     discard
   else:
     gDrainMethod = spec
@@ -4867,7 +4896,7 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
             kind == 6 or kind == 7 or kind == 8 or kind == 9 or
             kind == 10 or kind == 11 or kind == 12 or kind == 13 or
             kind == 14 or kind == 15 or kind == 16 or kind == 17 or
-            kind == 18: "" else:
+            kind == 18 or kind == 19 or kind == 20: "" else:
            "; it runs more than once a frame, so its firing count is not a " &
            "frame count")
   return true
@@ -7359,6 +7388,18 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
          " in game to toggle it; layout is " & gDuCfg.source &
          " and is re-read on every toggle-on, so it can be edited live. The " &
          "whole body is VEH-guarded and writes only into labels it created."
+  # RAID-DEPLOY GATE (`raidDeployGate`). Default OFF. When on, the ESP markers are
+  # held dark until the raid is actually deployed (GameWorld.OnGameStarted) rather
+  # than lighting up per-bot during the ~2 minute scene load. MEASURED: the ON
+  # edge does NOT arm on this build (relative-branch prologue), so with the gate
+  # on the ESP would never draw -- keep it OFF until that is unblocked. The flag
+  # lives in debugui.nim; the boot arming reads it back through gRaidDeployGate.
+  gRaidDeployGate = readBoolKey("raidDeployGate")
+  if gRaidDeployGate:
+    warn "raidDeployGate is set: ESP markers will be held until " &
+         "GameWorld.OnGameStarted -- but that ON edge is UNBINDABLE on this " &
+         "build (relative-branch prologue), so the markers may never draw. See " &
+         "aowlspt_deploygate.h; turn this OFF unless the ON edge has been unblocked."
   # The main menu's bottom-right game-mode label. Default OFF until proven live:
   # it is the first thing this host does that CALLS a managed method on the
   # Unity thread as a feature rather than as a probe.
@@ -7755,6 +7796,16 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
       if gBotNav and not bindBotNav(true):
         info "botnav did not arm (EFT.BotOwner.UpdateManual unverified on this " &
              "build, or drain disabled)"
+
+      # RAID-DEPLOY GATE (opt-in). GameWorld.OnGameStarted / .Dispose are static
+      # code, so the two postfix detours install now and never fire until a raid.
+      # The ON edge (OnGameStarted) does NOT arm on this build -- its prologue has
+      # a relative branch the engine cannot relocate -- and bindDeployGate reports
+      # that loudly. It is armed whenever the ESP is on so the OFF edge can still
+      # clear the flag; the gate itself only bites when `raidDeployGate` is set.
+      if (gDebugEsp or gRaidDeployGate) and not bindDeployGate(true):
+        info "deploygate did not arm (GameWorld.OnGameStarted/.Dispose unverified " &
+             "on this build, or drain disabled)"
 
       # THE IN-GAME DEBUG OVERLAY (opt-in). PreloaderUI::Update is static code,
       # so the detour installs now and starts ticking as soon as the preloader

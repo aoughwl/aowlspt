@@ -236,6 +236,18 @@ TABLES = [
         "users": ["host/Aowlspt.Host.Il2Cpp/botdiag.nim"],
     },
     {
+        # Swept, and the sweeper dispatches on the target NAME (OnGameStarted vs
+        # Dispose), never on the index -- so an inserted row cannot silently
+        # remap the ON/OFF edges.
+        "mode": "sweep",
+        "header": "abi/aowlspt_deploygate.h",
+        "array": "aowl_deploy_targets",
+        "at": "cDeployTargetAt",
+        "name": "cDeployTargetName",
+        "count": "cDeployTargetCount",
+        "users": ["host/Aowlspt.Host.Il2Cpp/debugui.nim"],
+    },
+    {
         "mode": "sweep",
         "header": "abi/aowlspt_bridge.h",
         "array": "aowl_bridge_targets",

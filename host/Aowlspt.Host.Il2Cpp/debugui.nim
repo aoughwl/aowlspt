@@ -620,6 +620,26 @@ proc duLoadLayout() =
 
 var gDuGameWorld: Il2CppPtr = nil
 
+## RAID-DEPLOY GATE. `gRaidDeployed` is flipped true by the kind=19 postfix on
+## `EFT.GameWorld::OnGameStarted` (the real deploy edge) and false by the kind=20
+## postfix on `EFT.GameWorld::Dispose` (raid teardown). It exists because
+## RegisterPlayer -- which caches the GameWorld and would otherwise "light up" the
+## overlay -- fires per-bot during the ~2 minute scene LOAD, not at deploy. When
+## `gRaidDeployGate` is on the ESP markers stay dark until `gRaidDeployed` is true.
+##
+## MEASURED CAVEAT (build 1.1.0.1.46777): OnGameStarted's prologue has a `je` at
+## +0xa, so the 14-byte trampoline steal crosses a relative branch the detour
+## engine cannot relocate; the ON edge therefore does NOT arm on this build (see
+## aowlspt_deploygate.h). `bindDeployGate` logs that plainly. Until the engine can
+## relocate a conditional branch (or a clean-prologue deploy method is measured),
+## leave `raidDeployGate` OFF -- with it off the ESP behaves exactly as before.
+var gRaidDeployed = false
+var gRaidDeployGate = false
+
+proc cDeployTargetAt(i: int32): Il2CppPtr {.importc: "aowl_deploy_target_at", nodecl.}
+proc cDeployTargetName(i: int32): Il2CppPtr {.importc: "aowl_deploy_target_name", nodecl.}
+proc cDeployTargetCount(): int32 {.importc: "aowl_deploy_target_count", nodecl.}
+
 ## Whether the overlay is currently visible, and whether the markers are.
 var gDuVisible = false
 var gDuEspVisible = false
@@ -1069,6 +1089,8 @@ proc duPanelLine(field: string): string =
                        else: "menu / no GameWorld")
   of "raid":
     result = "raid " & (if gDuGameWorld != nil: "LIVE" else: "not in raid") &
+             (if gRaidDeployGate: (if gRaidDeployed: " DEPLOYED"
+                                   else: " (loading -- not deployed)") else: "") &
              "   world=0x" & hexOf(cast[uint64](gDuGameWorld))
   of "bots":
     result = "players " & $gDuRegistered & " registered / " & $gDuAiCount &
@@ -2224,7 +2246,13 @@ proc duRegionDraw(user: pointer; frame: int64) {.exportc: "aowl_du_region_draw",
     duDragTick()
     duDrawWidgets()
   cWgCrumb(WgCrumbMarkers)
-  if gDuEspVisible:
+  # THE DEPLOY GATE. With `raidDeployGate` on, the markers stay dark until the
+  # raid is actually DEPLOYED (`OnGameStarted`) rather than lighting up per-bot
+  # during the ~2 minute scene LOAD (`RegisterPlayer`, which is what caches the
+  # GameWorld). With the gate off (default) this is a no-op and the ESP behaves
+  # exactly as before. The world SAMPLE and reprojection are untouched -- only
+  # SUBMISSION of the markers is suppressed -- so nothing else is disturbed.
+  if gDuEspVisible and (not gRaidDeployGate or gRaidDeployed):
     if not duDrawMarkers():
       if not gDuEspUnavailableLogged:
         gDuEspUnavailableLogged = true
@@ -2612,3 +2640,72 @@ proc bindDebugEspWorld(verbose: bool): bool =
     info "debugui: EFT.GameWorld::RegisterPlayer did not verify on this " &
          "build; in-world markers will have no bot list"
   result = false
+
+proc deployStartedFired(regs: Il2CppPtr) =
+  ## kind=19 read-only POSTFIX on `EFT.GameWorld::OnGameStarted`: the raid is
+  ## deployed. One flag write, nothing walked, never suppresses the original.
+  ## Off the host thread only, exactly like the RegisterPlayer riders.
+  if int(cThreadId()) == int(gHostThreadId):
+    return
+  if not gRaidDeployed:
+    gRaidDeployed = true
+    okLog "deploygate: OnGameStarted -- raid DEPLOYED; ESP/markers may now draw"
+
+proc deployEndedFired(regs: Il2CppPtr) =
+  ## kind=20 read-only POSTFIX on `EFT.GameWorld::Dispose`: the raid is over.
+  ## Clears the flag so the next raid's LOAD does not inherit "deployed".
+  if int(cThreadId()) == int(gHostThreadId):
+    return
+  if gRaidDeployed:
+    gRaidDeployed = false
+    okLog "deploygate: Dispose -- raid ended; ESP/markers gated off again"
+
+proc bindDeployGate(verbose: bool): bool =
+  ## Arms the two read-only POSTFIX detours that drive `gRaidDeployed`: index 0 =
+  ## `OnGameStarted` (ON, kind=19), index 1 = `Dispose` (OFF, kind=20). Each is
+  ## armed by index so a failed ON bind cannot disable the OFF bind. GameWorld is
+  ## raid-only, so both install now and simply never fire until a raid.
+  ##
+  ## OnGameStarted does NOT arm on this build: its prologue has a `je` at +0xa and
+  ## the detour engine cannot relocate a conditional branch into a 14-byte steal
+  ## (see aowlspt_deploygate.h). That failure is reported LOUDLY here rather than
+  ## left as a flag that silently never turns on -- with the ON edge dead, the
+  ## gate can only ever hold the ESP dark, which is why `raidDeployGate` is OFF by
+  ## default and this says so.
+  if not gReady or gDisableDrain:
+    return false
+  var onArmed = false
+  var offArmed = false
+  let count = cDeployTargetCount()
+  for i in 0 ..< int(count):
+    let fn = cDeployTargetAt(int32(i))
+    let spec = readCString(cDeployTargetName(int32(i)))
+    # Dispatch on the target NAME, never the index: an inserted row cannot then
+    # silently remap the ON/OFF edges (idxbind fact #187).
+    let isOn = spec.contains("OnGameStarted")
+    if fn == nil:
+      if verbose:
+        info "deploygate: " & spec & " did not verify on this build"
+      continue
+    if isOn and gDeployStartSlot >= 0: continue
+    if not isOn and gDeployEndSlot >= 0: continue
+    let kind = (if isOn: 19'i32 else: 20'i32)
+    if attachDrain(spec, fn, cast[Il2CppMethod](0), false, verbose, kind,
+                   postfix = true):
+      if isOn: onArmed = true else: offArmed = true
+      okLog "deploygate: " & (if isOn: "ON" else: "OFF") &
+            " edge armed on " & spec
+    else:
+      warn "deploygate: could NOT arm the " & (if isOn: "ON" else: "OFF") &
+           " edge on " & spec &
+           (if isOn: " -- its prologue has a relative branch the detour " &
+                     "engine cannot relocate (see aowlspt_deploygate.h). The " &
+                     "raid-deployed flag will NEVER be set on this build, so " &
+                     "keep raidDeployGate OFF until this is unblocked."
+            else: "")
+  if not onArmed:
+    warn "deploygate: the ON edge (OnGameStarted) is UNAVAILABLE on this build; " &
+         "gRaidDeployed cannot become true, so raidDeployGate must stay OFF or " &
+         "the ESP will never draw. The OFF edge (Dispose) " &
+         (if offArmed: "armed and will still clear the flag." else: "also failed.")
+  result = onArmed or offArmed
