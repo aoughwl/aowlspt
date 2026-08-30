@@ -1471,12 +1471,6 @@ const
     ## Ceiling on an explicit request. Large, because the real constraint is
     ## not the node count -- it is not stalling the Unity thread, which the
     ## time slice below enforces directly.
-  InspFindSliceMs = 12'u64
-    ## THE REAL BUDGET. A node count is a poor proxy for "am I about to make
-    ## the game stutter"; wall time is the actual thing that matters. One
-    ## invocation gives up after this many milliseconds and reports exactly
-    ## where it stopped, so a deep hierarchy costs several resumptions rather
-    ## than one long freeze.
   InspFindMaxHits = 24
   InspFindMaxFrames = 240
     ## HOW LONG ONE SEARCH MAY HOLD THE CHANNEL. A parked batch is still an
@@ -1502,6 +1496,25 @@ const
   InspTextFindMaxBudget = 60000
     ## Ceiling on an explicit request. Kept well under `find`'s ceiling for the
     ## same reason: a managed call per node is heavier than a pointer chase.
+
+var InspFindSliceMs = 12'u64
+  ## THE REAL BUDGET, and now a runtime var (was a const) so the host flag
+  ## `inspectorSliceMs` can raise it. A node count is a poor proxy for "am I
+  ## about to make the game stutter"; wall time is the actual thing that matters.
+  ## One frame of a find/findtext/tree walk gives up after this many ms and
+  ## reports exactly where it stopped, so a deep hierarchy costs several
+  ## resumptions rather than one long freeze.
+  ##
+  ## DEFAULT 12 ms -- unchanged unless `inspectorSliceMs` is set -- so nothing
+  ## about the shipped behaviour moves. Raising it (e.g. 100-250 ms) lets a big
+  ## menu-time search finish in one or a few frames, near-instant at the cost of
+  ## a brief hang, which is fine for DEV/inspecting at the MENU.
+  ##
+  ## DANGER (fact #261): a large slice must NOT be used during a raid LOAD -- it
+  ## stalls the Unity main thread and errors the deploy. It is an opt-in dev/menu
+  ## accelerator; keep it modest (or 0/unset) for any run that will load a raid.
+  ## This is the per-FRAME time cap, SEPARATE from the per-command NODE budget
+  ## that find/findtext already accept.
 
 proc iInspSeedTextType(): bool =
   ## Allocate the "TextMeshProUGUI" managed string ONCE, at search start, and

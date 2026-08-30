@@ -75,11 +75,23 @@ const
                                 ## it again rather than waiting forever.
   ArMenuWaitMs    = 180000'u64  ## the menu can take >60 s on a cold launch.
   ArStepTimeoutMs = 45000'u64   ## per non-menu step: if the control never appears.
-  ArWalkMs        = 18'u64      ## per-walk wall-clock slice, checked INSIDE the walk.
-  ArNodeBudget    = 24000       ## per-walk node cap (the offline screens sit deep).
-  ArFanout        = 256         ## children examined per level.
-  ArFindDepth     = 12          ## descent depth.
+  ArWalkMs        = 120'u64     ## per-walk wall-clock slice, checked INSIDE the walk.
+                                ## GENEROUS on purpose: this runs at the MENU only --
+                                ## autoRaid stops at ArDone the instant READY is pressed,
+                                ## so it NEVER walks during a raid LOAD (fact #261). A
+                                ## brief main-thread hang at the menu is acceptable and it
+                                ## makes the path-walk discovery near-instant and immune
+                                ## to the breadth-vs-depth fragility a tight slice caused.
+  ArNodeBudget    = 120000      ## per-walk node cap -- large so a walk of a known root
+                                ## (Common UI / Menu UI) completes in ONE tick even if it
+                                ## has thousands of nodes, rather than starving mid-walk.
+  ArFanout        = 512         ## children examined per level (a wide root has many).
+  ArFindDepth     = 16          ## descent depth.
   ArMapDepth      = 8           ## depth to find a "Label" under a map toggle.
+  ArMaxMenuScreens = 3          ## corpse-safety cap on collected MenuScreens. Low so
+                                ## the collect-all cannot recurse the whole Common UI
+                                ## subtree hunting for phantoms and starve the slice.
+  ArMaxToggles    = 32          ## cap on collected map AnimatedToggles (same reason).
   ArMaxFaults     = 3
   ArMaxPlayExtends = 6          ## popup-wait extensions on the PLAY step. The daily-
                                 ## reward RewardInfo popup deactivates MenuScreen for
@@ -308,14 +320,23 @@ proc arPlayUnder(root: Il2CppPtr; deadline: uint64;
   if root == nil: return
   var menus: seq[Il2CppPtr] = @[]
   var b = ArNodeBudget
-  arCollect(root, "MenuScreen", ArFindDepth, b, deadline, menus, 8)
+  arCollect(root, "MenuScreen", ArFindDepth, b, deadline, menus, ArMaxMenuScreens)
   nMs = nMs + menus.len
+  # NOTE the loop is NOT gated on the outer `deadline`: the MenuScreen collect
+  # above may well have exhausted it (it recurses looking for more MenuScreens
+  # than exist), and gating here is exactly what starved the PlayButton search to
+  # 0. Each PlayButton search gets its OWN fresh 18 ms slice below, and the loop
+  # is bounded by ArMaxMenuScreens (2-3 in practice).
   var mi = 0
-  while mi < menus.len and cNowMs() <= deadline:
+  while mi < menus.len:
     let ms = menus[mi]
     var pbs: seq[Il2CppPtr] = @[]
     var b2 = ArNodeBudget
-    arCollect(ms, "PlayButton", ArFindDepth, b2, deadline, pbs, 8)
+    let pbDeadline = cNowMs() + ArWalkMs   # FRESH slice -- never starved by the
+                                           # MenuScreen collect. Breadth-first, so a
+                                           # PlayButton that is a near-direct child of
+                                           # MenuScreen is found in the first pass.
+    arCollect(ms, "PlayButton", ArFindDepth, b2, pbDeadline, pbs, 8)
     nPb = nPb + pbs.len
     var pi = 0
     while pi < pbs.len:
@@ -327,6 +348,7 @@ proc arPlayUnder(root: Il2CppPtr; deadline: uint64;
           if result == nil:
             result = pb                    # first active; keep counting for the log
       pi = pi + 1
+    if result != nil: return               # a pressable PlayButton -- stop
     mi = mi + 1
 
 proc arFindPlay(nMs, nPb, nActive: var int): Il2CppPtr =
@@ -420,18 +442,22 @@ proc arTrim(s: string): string =
 
 proc arSelectMapUnder(root: Il2CppPtr; want: string; deadline: uint64): bool =
   ## Scan the AnimatedToggles under `root` for one whose descendant "Label" TMP
-  ## text == `want`, and press it. Bounded by the shared `deadline`.
+  ## text == `want`, and press it. Breadth-first collect, and each Label search
+  ## gets its OWN fresh slice so the toggle collect cannot starve it -- the same
+  ## discipline the PlayButton search needs.
   result = false
   if root == nil: return
   var toggles: seq[Il2CppPtr] = @[]
   var b = ArNodeBudget
-  arCollect(root, "AnimatedToggle", ArFindDepth, b, deadline, toggles, 64)
+  let tglDeadline = cNowMs() + ArWalkMs
+  arCollect(root, "AnimatedToggle", ArFindDepth, b, tglDeadline, toggles, ArMaxToggles)
   var i = 0
-  while i < toggles.len and cNowMs() <= deadline:
+  while i < toggles.len:
     let tog = toggles[i]
     var labels: seq[Il2CppPtr] = @[]
     var b2 = ArNodeBudget
-    arCollect(tog, "Label", ArMapDepth, b2, deadline, labels, 8)
+    let lblDeadline = cNowMs() + ArWalkMs         # fresh slice per toggle
+    arCollect(tog, "Label", ArMapDepth, b2, lblDeadline, labels, 8)
     var j = 0
     while j < labels.len:
       let tmp = splTmpOf(labels[j])

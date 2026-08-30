@@ -6508,6 +6508,30 @@ proc readWaitMs(): int =
   if any:
     result = v
 
+proc readIntKey(key: string; def: int): int =
+  ## A shallow non-negative integer read of one `aowlspt-host.json` key, same
+  ## shape as `readWaitMs` / `readBoolKey`. Returns `def` when the key is absent,
+  ## unreadable, or not a run of digits. No JSON parser, on purpose.
+  result = def
+  var text = ""
+  if not readTextFile(joinPath(gDir, "aowlspt-host.json"), text):
+    return
+  let needle = "\"" & key & "\""
+  let at = find(text, needle)
+  if at < 0:
+    return
+  var i = at + needle.len
+  while i < text.len and (text[i] == ' ' or text[i] == ':' or text[i] == '\t'):
+    inc i
+  var v = 0
+  var any = false
+  while i < text.len and text[i] >= '0' and text[i] <= '9':
+    v = v * 10 + (ord(text[i]) - ord('0'))
+    any = true
+    inc i
+  if any:
+    result = v
+
 # ------------------------------------------------------- backend key dump
 #
 # One-shot, diagnostic: read the client's baked HTTP body-crypto material so a
@@ -7441,6 +7465,20 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   # nothing queued is one interlocked load.
   gInspOn = readBoolKey("liveInspector")
   gInspWriteOn = readBoolKey("liveInspectorWrite")
+  # OPT-IN dev/menu accelerator: raise the find/findtext/tree-walk PER-FRAME time
+  # slice so a big search finishes in one or a few frames instead of many. Default
+  # keeps the shipped 12ms so nothing changes unless set. Clamped to a sane range.
+  # DANGER (fact #261): a large slice stalls the Unity main thread -- do NOT use a
+  # big value on a run that will LOAD a raid; it is for reading the MENU fast.
+  block:
+    let s = readIntKey("inspectorSliceMs", 12)
+    if s >= 1 and s <= 1000:
+      InspFindSliceMs = uint64(s)
+      if s != 12:
+        info "inspectorSliceMs=" & $s & " ms: the live inspector's find/findtext/" &
+             "tree-walk per-frame time slice is raised from the default 12 ms. This " &
+             "makes big MENU searches near-instant. Do NOT run a raid LOAD with a " &
+             "large slice -- it stalls the Unity main thread (fact #261)."
   inspectInit(gDir)
   if gInspOn:
     info "liveInspector is set: drop commands into aowlspt-inspect.txt beside " &
