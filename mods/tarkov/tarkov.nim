@@ -3354,17 +3354,118 @@ proc tarkovSchema(): seq[Setting] =
                 category = "Flea Market/Selling", implemented = false,
                 description = "aowlspt original (server emulator); acts on the SPT-derived database. NOT WIRED: this server never stamps upd.SpawnedInSession on raid loot, so a found-in-raid check could only ever refuse every listing rather than restrict any. The client-side flag is separately available as Flea Market > RagFair > Is Only Found In Raid Allowed"),
 
-    boolSetting("lootEnabled", "Loot enabled", true, category = "Loot",
-      description = "aowlspt original (server emulator); acts on the SPT-derived database."),
-    floatSetting("staticLootMultiplier", "Static loot multiplier", 1.0,
-                 lo = 0.0, hi = 10.0, step = 0.1, category = "Loot",
-      description = "aowlspt original (server emulator); acts on the SPT-derived database."),
+    # ---- THE LOOT PAGE -------------------------------------------------
+    #
+    # Six `category` values, not one, because a category is the ONE structural
+    # device this settings system has: `modSetGroupByCategory` in the host
+    # renderer buckets rows by `category` and draws a header row ahead of each
+    # bucket. There is no sub-page, no tab and no two-column layout in
+    # `settingspages.nim` -- a page IS a flat `seq[SwRow]` -- so grouped
+    # sections in a fixed order is the richest screen this build can express,
+    # and these six are it. `subcategory` is NOT read by the renderer (it
+    # parses `category` only), so it is not used to carry structure here.
+    #
+    # `lootPreset` and `lootSummary` are the two rows that make the page
+    # legible without the documentation: a one-click preset that writes the
+    # knobs below it, and a sentence the SERVER writes describing what the
+    # current combination will actually do. Both follow the pattern
+    # `spawnNow`/`spawnResult` already established -- see `onTarkovSettings`.
+    enumSetting("lootPreset", "Loot preset", "custom",
+                @["custom", "vanilla", "scarce", "richer", "goblin"],
+                category = "Loot/Presets",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Picking anything other than `custom` WRITES the knobs in the sections below and then the page shows what it wrote, so a preset is a starting point you can then fine-tune rather than a mode that locks the sliders. `vanilla` restores every loot knob to its shipped default. `scarce` halves both passes and biases toward cheap items; `richer` is 1.5x with fuller containers; `goblin` is 3x with the container cap raised and a bias toward valuables. Changing any individual knob afterwards does NOT reset this row -- it is a button, not a mode."),
+    stringSetting("lootSummary", "What this configuration does", "",
+                  category = "Loot/Presets",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. WRITTEN BY THE SERVER, not by you: one sentence describing what the current loot configuration will actually do, recomputed from emu/loot.lootConfig() -- the same object the generator reads -- every time any loot row is saved. If this line disagrees with what you set, the generator agrees with THIS line."),
+
+    boolSetting("lootEnabled", "Loot enabled", true, category = "Loot/Global",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. The master switch. Off means every map serves an empty floor, and the server says so in its log rather than serving a silent []."),
+    floatSetting("lootGlobalMultiplier", "Global loot multiplier", 1.0,
+                 lo = 0.0, hi = 10.0, step = 0.1, category = "Loot/Global",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies BOTH the container pass and the loose pass, on top of their own multipliers (emu/loot.generateLoot). 1.0 is the shipped behaviour; 0 empties the map."),
+    floatSetting("staticLootMultiplier", "Container loot multiplier", 1.0,
+                 lo = 0.0, hi = 10.0, step = 0.1, category = "Loot/Global",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Scales both how OFTEN a container spawns and how FULL it is. Split the two with the Containers section below."),
     floatSetting("looseLootMultiplier", "Loose loot multiplier", 1.0,
-                 lo = 0.0, hi = 10.0, step = 0.1, category = "Loot",
-      description = "aowlspt original (server emulator); acts on the SPT-derived database."),
+                 lo = 0.0, hi = 10.0, step = 0.1, category = "Loot/Global",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Scales the probability of every loose spawn point on the map (emu/loot.looseLoot)."),
     intSetting("maxLootItems", "Max loot items", 20000, lo = 0, hi = 200000,
-               step = 1000, category = "Loot",
-      description = "aowlspt original (server emulator); acts on the SPT-derived database."),
+               step = 1000, category = "Loot/Global",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. A hard ceiling on the items in one raid's Loot array. Three real maps produce 1,826 items between them against this default, so it binds only a pathological table or a very large multiplier."),
+    floatSetting("lootStaticBudgetShare", "Container share of the item budget",
+                 0.5, lo = 0.0, hi = 1.0, step = 0.05,
+                 category = "Loot/Global",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. How much of Max loot items the container pass may spend before the loose pass runs; whatever it does not spend is handed on. 0.5 is the half-and-half split the generator used to hardcode. Raise it only if containers are being cut off."),
+
+    boolSetting("staticLootEnabled", "Containers spawn loot", true,
+                category = "Loot/Containers",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Off skips the static-container pass entirely: no crates, safes, jackets or weapon boxes anywhere on the map."),
+    floatSetting("containerSpawnChanceMultiplier",
+                 "Container spawn chance multiplier", 1.0,
+                 lo = 0.0, hi = 10.0, step = 0.1,
+                 category = "Loot/Containers",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Scales each container's own `probability` -- HOW MANY crates exist this raid, without changing how full they are. Containers marked IsAlwaysSpawn ignore this, as they do every other chance."),
+    floatSetting("containerFillMultiplier", "Container fill density", 1.0,
+                 lo = 0.0, hi = 10.0, step = 0.1,
+                 category = "Loot/Containers",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Scales the item COUNT drawn from a container's own itemcountDistribution -- how full each crate is, without changing how many crates there are. An item that does not fit the grid is still dropped rather than stacked on one that did."),
+    intSetting("containerMaxItems", "Container item cap", 64, lo = 1, hi = 512,
+               step = 1, category = "Loot/Containers",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. The most items one container may be asked to hold, after the fill multiplier. 64 is the number the generator used to hardcode. Raise it if a high fill density is being clipped; the container's own grid is still the real limit."),
+    stringSetting("containerTypeChances", "Per-container-type chances", "",
+                  category = "Loot/Containers",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. `templateId=multiplier` pairs, comma separated, applied to that container TEMPLATE's spawn chance only -- e.g. `578f87b7245977356274f2cd=2` doubles the ground caches. The id is the container item's own template (`Items[0]._tpl` of the spawn point). A malformed pair is dropped and the count that survived is reported in the summary line; it is never read as zero."),
+
+    boolSetting("looseLootEnabled", "Loose loot spawns", true,
+                category = "Loot/Loose",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Off skips the loose pass entirely: nothing on the floor, in jackets' place, or on shelves. Loose-loot spawn points are SERVER-side data (they are not recoverable from the client's scene files), so this switch is the only thing that controls them."),
+    boolSetting("lootForcedSpawns", "Forced quest/key spawns", true,
+                category = "Loot/Loose",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. `spawnpointsForced` -- the quest items and keys that ignore probability entirely. Leave this ON unless you know a quest you are running does not need its item; turning it off can make a quest uncompletable."),
+    intSetting("looseLootPointLimit", "Loose spawn point limit", 0, lo = 0,
+               hi = 100000, step = 50, category = "Loot/Loose",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. At most this many non-forced loose points may spawn on one map. 0, the default, is no limit. Use it to thin a map without changing WHICH points can spawn -- the multiplier changes the odds, this changes the ceiling."),
+
+    floatSetting("lootValueBias", "Bias toward valuables", 0.0, lo = -2.0,
+                 hi = 2.0, step = 0.1, category = "Loot/Item mix",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Reweights every loot pool by the item's HANDBOOK price. Above 0 favours expensive items, below 0 favours cheap ones, 0 is off and the shaping code is not run at all. An item the handbook does not list is left unweighted rather than treated as worthless. The effect is bounded at 20x the pivot so one absurd price cannot swallow a pool."),
+    floatSetting("lootValuePivot", "Value bias pivot (roubles)", 20000.0,
+                 lo = 1.0, hi = 1000000.0, step = 1000.0,
+                 category = "Loot/Item mix",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. The handbook price at which Bias toward valuables has no effect. Items above it are favoured by a positive bias, items below it by a negative one."),
+    intSetting("lootMinHandbookPrice", "Minimum item value (roubles)", 0,
+               lo = 0, hi = 1000000, step = 500, category = "Loot/Item mix",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Items cheaper than this are removed from every loot pool before anything is drawn. 0 is off. An item the handbook does not list is NOT removed."),
+    intSetting("lootMaxHandbookPrice", "Maximum item value (roubles)", 0,
+               lo = 0, hi = 10000000, step = 5000, category = "Loot/Item mix",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Items dearer than this are removed from every loot pool. 0 is off."),
+    floatSetting("lootRarityCommon", "Common item weight", 1.0, lo = 0.0,
+                 hi = 10.0, step = 0.1, category = "Loot/Item mix",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies the pool weight of every item whose template declares `_props.RarityPvE` (or `_props.Rarity`) = Common. If NO item in a pool declares a rarity, the server says so in its log rather than letting the slider read as broken."),
+    floatSetting("lootRarityRare", "Rare item weight", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Loot/Item mix",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. As above, for Rare."),
+    floatSetting("lootRaritySuperrare", "Superrare item weight", 1.0, lo = 0.0,
+                 hi = 10.0, step = 0.1, category = "Loot/Item mix",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. As above, for Superrare. 0 removes superrare items from every pool."),
+    stringSetting("lootCategoryWeights", "Category weights", "",
+                  category = "Loot/Item mix",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. `id=multiplier` pairs, comma separated, where `id` is any item template id OR any BASE CLASS id on its `_parent` chain -- so one entry covers a whole family. The chain is walked up to 12 hops and refuses to revisit a template. The community's usual base classes: money 543be5dd4bdc2deb348b4569, ammo 5485a8684bdc2da71d8b4567, meds 543be5664bdc2dd4348b4569, keys 543be5e94bdc2df1348b4568, barter 5448eb774bdc2d0a728b4567. Those five ids are SPT-community-known and were NOT verified against this install's database by the change that added this row -- check the log line the server prints, which reports how many pool entries the weights actually touched."),
+
+    boolSetting("lootStackRandomRange", "Use the item's own stack range", false,
+                category = "Loot/Money & stacks",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. OFF (the shipped behaviour) rolls a stack uniformly over 1..StackMaxSize, which for currency is a far larger number than the game itself ever spawns. ON uses the template's declared `_props.StackMinRandom`..`StackMaxRandom` where it has one -- the SAME discriminator emu/bots.randomStackCount already uses for scav money, read here rather than duplicated. On stock data that is currency and loose ammunition and nothing else; everything else is unaffected either way. Turn this on if world money stacks look absurd."),
+    floatSetting("lootStackMultiplier", "Stack size multiplier", 1.0, lo = 0.0,
+                 hi = 10.0, step = 0.1, category = "Loot/Money & stacks",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Scales the rolled stack count for anything stackable, after the roll and before the cap. Never produces a stack below 1 or above the item's own StackMaxSize."),
+    floatSetting("lootStackMaxFraction", "Stack size cap (fraction)", 1.0,
+                 lo = 0.0, hi = 1.0, step = 0.05,
+                 category = "Loot/Money & stacks",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Caps every spawned stack at this fraction of the item's own StackMaxSize. 1.0, the default, is no cap. 0.05 on a 500,000-limit rouble stack caps it at 25,000."),
+
+    stringSetting("lootPerMapMultipliers", "Per-map multipliers", "",
+                  category = "Loot/Per-map",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. `map=multiplier` pairs, comma separated, applied to BOTH passes on that map only -- e.g. `factory4_day=2, lighthouse=0.5`. The name must be the DATABASE location key (bigmap, woods, factory4_day, rezervbase), not the client-side Id, because the generator is handed the resolved key. A map set to 0 serves an empty floor and the server names this setting in its log when it does."),
 
     floatSetting("skillMaxPerRaid", "Skill max per raid", 100.0, lo = 0.0,
                  hi = 1000.0, step = 1.0, category = "Skills",
@@ -3581,6 +3682,76 @@ proc runSpawn(session: string): string =
   else:
     warn "spawn refused: " & outcome.message
 
+proc isLootKey(key: string): bool =
+  ## Every key on the Loot page. Written as a prefix test plus the four rows
+  ## whose names predate the page, rather than as a list -- a `const seq` is not
+  ## constant-foldable here, and a list would be a second place to remember to
+  ## add a row to. `lootSummary` is deliberately EXCLUDED: it is written by the
+  ## server, and treating the server's own write as an edit would recompute the
+  ## summary from the summary.
+  if key == "lootSummary":
+    return false
+  if key.startsWith("loot") or key.startsWith("container"):
+    return true
+  result = key == "staticLootMultiplier" or key == "looseLootMultiplier" or
+           key == "maxLootItems" or key == "staticLootEnabled" or
+           key == "looseLootEnabled"
+
+proc applyLootPreset(name: string) =
+  ## A preset WRITES the knobs and then gets out of the way -- it is a button,
+  ## not a mode. Every preset sets every knob it cares about explicitly, so
+  ## picking one twice with edits in between lands in the same place both times;
+  ## a preset that only set the knobs that differ from the last one would make
+  ## the result depend on history.
+  ##
+  ## `vanilla` is the important one: it is the exact set of defaults
+  ## `emu/loot.defaultLootConfig` returns, so it is also the way back from any
+  ## experiment.
+  if name == "custom" or name.len == 0:
+    return
+  # Everything starts from vanilla; the named preset then overrides.
+  discard applySetting("lootEnabled", "true")
+  discard applySetting("lootGlobalMultiplier", "1.0")
+  discard applySetting("staticLootMultiplier", "1.0")
+  discard applySetting("looseLootMultiplier", "1.0")
+  discard applySetting("maxLootItems", "20000")
+  discard applySetting("lootStaticBudgetShare", "0.5")
+  discard applySetting("staticLootEnabled", "true")
+  discard applySetting("containerSpawnChanceMultiplier", "1.0")
+  discard applySetting("containerFillMultiplier", "1.0")
+  discard applySetting("containerMaxItems", "64")
+  discard applySetting("looseLootEnabled", "true")
+  discard applySetting("lootForcedSpawns", "true")
+  discard applySetting("looseLootPointLimit", "0")
+  discard applySetting("lootValueBias", "0.0")
+  discard applySetting("lootValuePivot", "20000.0")
+  discard applySetting("lootMinHandbookPrice", "0")
+  discard applySetting("lootMaxHandbookPrice", "0")
+  discard applySetting("lootRarityCommon", "1.0")
+  discard applySetting("lootRarityRare", "1.0")
+  discard applySetting("lootRaritySuperrare", "1.0")
+  discard applySetting("lootStackRandomRange", "false")
+  discard applySetting("lootStackMultiplier", "1.0")
+  discard applySetting("lootStackMaxFraction", "1.0")
+  case name
+  of "scarce":
+    discard applySetting("lootGlobalMultiplier", "0.5")
+    discard applySetting("containerFillMultiplier", "0.7")
+    discard applySetting("lootValueBias", "-0.5")
+    discard applySetting("lootStackMaxFraction", "0.5")
+  of "richer":
+    discard applySetting("lootGlobalMultiplier", "1.5")
+    discard applySetting("containerFillMultiplier", "1.3")
+    discard applySetting("lootStackRandomRange", "true")
+  of "goblin":
+    discard applySetting("lootGlobalMultiplier", "3.0")
+    discard applySetting("containerFillMultiplier", "2.0")
+    discard applySetting("containerMaxItems", "128")
+    discard applySetting("lootValueBias", "0.8")
+    discard applySetting("lootStackRandomRange", "true")
+  else:
+    discard  # "vanilla": the block above IS vanilla
+
 proc onTarkovSettings(url, body, session: string): string =
   ## GET serves the emulator's schema; a POST body persists one edit into
   ## config.json. The emulator reads these at load, so the write is saved and
@@ -3627,6 +3798,15 @@ proc onTarkovSettings(url, body, session: string): string =
     # `spawnNow` is a button, not a value. Run it, record what happened, and
     # put the key back to false so the control is armed again -- a checkbox
     # that stays on after its action is one nobody can press twice.
+    # The Loot page. `lootPreset` is a button that writes the rows below it,
+    # and `lootSummary` is recomputed after ANY loot edit -- including the
+    # preset's own writes, which is why the summary is taken last and read out
+    # of `lootConfig()` rather than out of the value that was just posted. A
+    # summary derived from the incoming edit would be a check that cannot fail.
+    if isLootKey(key):
+      if key == "lootPreset":
+        applyLootPreset(setting("lootPreset").asText("custom"))
+      discard applySetting("lootSummary", jstr(lootConfigSummary()).text)
     if key == "spawnNow" and setting("spawnNow").asBool(false):
       let outcome = runSpawn(session)
       discard applySetting("spawnResult", jstr(outcome).text)
@@ -3802,6 +3982,9 @@ proc onLoad(): Status =
     setting("hideoutConstructionMultiplier").asFloat(1.0))
   configureCraftTimes(setting("hideoutProductionMultiplier").asFloat(1.0))
   configureQuestXp(setting("questXpMultiplier").asFloat(1.0))
+  # Seed the Loot page's summary line at boot, so it is right the first time the
+  # page is opened rather than only after something on it has been edited.
+  discard applySetting("lootSummary", jstr(lootConfigSummary()).text)
 
   applyMapLockSettings()
   configureMarket(setting("fleaSpreadPercent").asInt(20),

@@ -15,10 +15,41 @@
   "mailKeepHours": 72,
   "mailKeepCollected": 1,
 
+  "_lootComment": "The Loot page. Every default below is the behaviour this emulator shipped with, so an untouched config generates the same floor it always did -- emu/loot.selfCheck asserts exactly that ('every new knob at its default reproduces the previous floor EXACTLY'). lootPreset is MOMENTARY (it writes the rows below and the page then shows what it wrote) and lootSummary is written BY the server, the same way spawnNow/spawnResult work. Docs: docs/LOOT-CONFIG.md.",
+  "lootPreset": "custom",
+  "lootSummary": "",
+
   "lootEnabled": true,
+  "lootGlobalMultiplier": 1.0,
   "staticLootMultiplier": 1.0,
   "looseLootMultiplier": 1.0,
   "maxLootItems": 20000,
+  "lootStaticBudgetShare": 0.5,
+
+  "staticLootEnabled": true,
+  "containerSpawnChanceMultiplier": 1.0,
+  "containerFillMultiplier": 1.0,
+  "containerMaxItems": 64,
+  "containerTypeChances": "",
+
+  "looseLootEnabled": true,
+  "lootForcedSpawns": true,
+  "looseLootPointLimit": 0,
+
+  "lootValueBias": 0.0,
+  "lootValuePivot": 20000.0,
+  "lootMinHandbookPrice": 0,
+  "lootMaxHandbookPrice": 0,
+  "lootRarityCommon": 1.0,
+  "lootRarityRare": 1.0,
+  "lootRaritySuperrare": 1.0,
+  "lootCategoryWeights": "",
+
+  "lootStackRandomRange": false,
+  "lootStackMultiplier": 1.0,
+  "lootStackMaxFraction": 1.0,
+
+  "lootPerMapMultipliers": "",
 
   "fleaSpreadPercent": 20,
   "fleaOfferHours": 12,
