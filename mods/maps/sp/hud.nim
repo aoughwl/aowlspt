@@ -59,10 +59,18 @@ import world  # the Snapshot this file mirrors; no game memory is read here
 #include <string.h>
 #include <math.h>
 #include "aowlspt_region.h"
+#include "aowlspt_keycode.h"
 #include "sp/mapmath.h"
 #include "sp/mapart.h"
 
 #define MHUD_MAX 128
+
+/* The ONE spatial widget's mode. See the `mode` field's comment. */
+#define MHUD_MODE_OFF     0
+#define MHUD_MODE_RADAR   1
+#define MHUD_MODE_NORTHUP 2
+#define MHUD_MODE_HEADUP  3
+
 #define MHUD_RGBA(r, g, b, a) \
     ((uint32_t)((uint32_t)(r) | ((uint32_t)(g) << 8) | \
                 ((uint32_t)(b) << 16) | ((uint32_t)(a) << 24)))
@@ -147,6 +155,52 @@ static struct {
     float    mapX, mapY, mapSize, mapSpanM;
     int32_t  mapGrid;          /* grid line count per axis, 0 = none */
     float    indicatorInset;   /* margin the edge markers clamp onto */
+
+    /* ---- THE UNIFIED SPATIAL WIDGET -----------------------------------
+     *
+     * There used to be TWO panes here -- `mapOn` (a big top-down map) and
+     * `radarOn` (a small radius-clipped circle) -- with two independent
+     * toggles, two geometries, two art calls and two contact loops that could
+     * disagree about which floor you were on. They were never two features:
+     * they are the same top-down projection at two scales with two cull rules.
+     *
+     * So there is ONE widget with a MODE, and the two legacy booleans are now
+     * DERIVED from it (`mhud_live_map` / `mhud_live_radar` still answer, so the
+     * diag, the reconcile and every existing consumer keep their meaning):
+     *
+     *   MHUD_MODE_OFF      nothing (contacts and the full-screen key still work)
+     *   MHUD_MODE_RADAR    radius-culled, heading-rotated, NO map art
+     *   MHUD_MODE_NORTHUP  rect-culled minimap with art, north is up
+     *   MHUD_MODE_HEADUP   rect-culled minimap with art, rotated to facing
+     *
+     * `mapX/mapY/mapSize/mapSpanM` above are THE PANE's rect and span in every
+     * mode -- radar mode simply takes its span from `radiusM * 2` instead. */
+    int32_t  mode;
+    float    zoom;             /* > 0. Effective span = span / zoom. */
+    float    opacity;          /* 0..1, scales the backdrop and the art tint */
+    int32_t  drawArt;          /* 0 = grid + blips only, no textured quad */
+    float    contactPx;        /* half-extent of a contact mark, pixels */
+    uint32_t colBot, colPlayer, colSelf;
+
+    /* ---- THE FULL-SCREEN OVERLAY --------------------------------------
+     *
+     * The same pane renderer at screen scale. It is NOT a second surface: it
+     * calls `mhud_draw_pane_full`, the one code path the small widget uses, so
+     * the two cannot drift apart. While it is open the small widget is not
+     * reached at all -- and that is asserted with a COUNT of primitives the
+     * small widget actually submitted, not with a comment (see fsSmallPrims). */
+    int32_t  fsOn;
+    int32_t  fsNorthUp;        /* 1 = the overlay ignores heading (a wall map) */
+    float    fsMargin, fsSpanM, fsZoom, fsOpacity;
+    int64_t  fsFrames;            /* dispatches drawn with the overlay OPEN */
+    int64_t  fsSmallSuppressed;   /* ... of those, ones where the small widget
+                                   * submitted ZERO primitives. The two must be
+                                   * equal; if they ever differ, the overlay is
+                                   * drawing over a live minimap and the diag
+                                   * says FAIL rather than PASS. */
+    int64_t  fsToggles;           /* key-driven open/close edges */
+    int32_t  fsSmallPrims;        /* small-widget submissions, most recent frame */
+    int32_t  fsLastPrims;         /* overlay submissions, most recent frame */
 
     int64_t  frames, drawn, blips;
     /* BUG 2: dispatches SKIPPED because a blocking UI surface (game Settings,
@@ -253,6 +307,25 @@ static void mhud_reset(void) {
     g_mhud.indicatorInset = 48.0f;
     g_mhud.holdMs         = 400;
     g_mhud.fadeMs         = 1600;
+    /* Unified-widget defaults. memset left these at 0, and a 0 zoom or a 0
+     * opacity is not "unset" -- it is an invisible, degenerate pane that would
+     * read exactly like a feature that failed to arm. Every one of them is
+     * given a working value here and re-clamped in the configure setters, so no
+     * path can leave a divide-by-zero or an alpha-0 widget behind. */
+    g_mhud.mode           = MHUD_MODE_OFF;
+    g_mhud.zoom           = 1.0f;
+    g_mhud.opacity        = 0.85f;
+    g_mhud.drawArt        = 1;
+    g_mhud.contactPx      = 2.0f;
+    g_mhud.colBot         = MHUD_RGBA(230,  70,  60, 235);
+    g_mhud.colPlayer      = MHUD_RGBA( 70, 190, 255, 235);
+    g_mhud.colSelf        = MHUD_RGBA(255, 255, 255, 255);
+    g_mhud.fsOn           = 0;
+    g_mhud.fsNorthUp      = 1;
+    g_mhud.fsMargin       = 48.0f;
+    g_mhud.fsSpanM        = 1200.0f;
+    g_mhud.fsZoom         = 1.0f;
+    g_mhud.fsOpacity      = 0.92f;
 }
 
 /* ---- the mirror, filled on Unity's thread before the draw ------------- */
@@ -338,6 +411,61 @@ static void mhud_configure_map(int32_t mapOn, float mapX, float mapY,
     g_mhud.mapGrid        = (mapGrid > 0 && mapGrid <= 32) ? mapGrid : 0;
     g_mhud.indicatorInset = indicatorInset > 4.0f ? indicatorInset : 4.0f;
 }
+
+/* ---- THE UNIFIED WIDGET's configure, and the FULL-SCREEN overlay's ------ *
+ *
+ * One call, one widget. `mode` decides everything the two old booleans used to
+ * decide between them, so there is no state in which "the radar is on and the
+ * map is on" -- that combination is not expressible any more.
+ *
+ * EVERY numeric is clamped HERE and nowhere else. A clamp in the schema alone
+ * is not a clamp: config.json is hand-editable, the reconcile path reads it
+ * directly, and a zoom of 0 would divide by zero on the render thread. */
+static void mhud_configure_pane(int32_t mode, float zoom, float opacity,
+                                int32_t drawArt, float contactPx,
+                                uint32_t colBot, uint32_t colPlayer,
+                                uint32_t colSelf) {
+    g_mhud.mode = (mode >= MHUD_MODE_OFF && mode <= MHUD_MODE_HEADUP)
+                  ? mode : MHUD_MODE_OFF;
+    g_mhud.zoom = (zoom >= 0.1f && zoom <= 16.0f) ? zoom : 1.0f;
+    g_mhud.opacity = opacity < 0.05f ? 0.05f : (opacity > 1.0f ? 1.0f : opacity);
+    g_mhud.drawArt = drawArt ? 1 : 0;
+    g_mhud.contactPx = contactPx < 1.0f ? 1.0f
+                       : (contactPx > 16.0f ? 16.0f : contactPx);
+    g_mhud.colBot    = colBot;
+    g_mhud.colPlayer = colPlayer;
+    g_mhud.colSelf   = colSelf;
+    /* The two legacy surface bits, kept CONSISTENT with the mode rather than
+     * settable. Everything that used to read them -- the diag's `toggle` line,
+     * mirrorDrift, armFeed's art gate -- keeps working and can no longer be
+     * put into a state the draw does not actually implement. */
+    g_mhud.mapOn   = (g_mhud.mode == MHUD_MODE_NORTHUP ||
+                      g_mhud.mode == MHUD_MODE_HEADUP) ? 1 : 0;
+    g_mhud.radarOn = (g_mhud.mode == MHUD_MODE_RADAR) ? 1 : 0;
+}
+
+static void mhud_configure_fs(float margin, float spanM, float zoom,
+                              float opacity, int32_t northUp) {
+    g_mhud.fsNorthUp = northUp ? 1 : 0;
+    g_mhud.fsMargin  = margin < 0.0f ? 0.0f : (margin > 512.0f ? 512.0f : margin);
+    g_mhud.fsSpanM   = spanM < 50.0f ? 50.0f : (spanM > 8000.0f ? 8000.0f : spanM);
+    g_mhud.fsZoom    = (zoom >= 0.1f && zoom <= 16.0f) ? zoom : 1.0f;
+    g_mhud.fsOpacity = opacity < 0.05f ? 0.05f
+                       : (opacity > 1.0f ? 1.0f : opacity);
+}
+
+/* THE OVERLAY's open/closed bit. Set ONLY from the Unity-thread key poll below
+ * and from the explicit close paths; read on the render thread. It is a single
+ * aligned int32, so the two threads cannot see a torn value.
+ *
+ * FAULT BEHAVIOUR, stated because "never leave input captured" is a promise
+ * this has to keep: THIS FEATURE NEVER CAPTURES INPUT. It installs no wndproc,
+ * hooks nothing, and swallows no key -- it asks Unity's own
+ * `Input::GetKeyDown` whether a key went down this frame, exactly as the game
+ * does. There is therefore no capture to leak on a fault, and closing the
+ * overlay is never a prerequisite for the player getting their mouse back. */
+static void mhud_fs_set(int32_t on) { g_mhud.fsOn = on ? 1 : 0; }
+static int32_t mhud_fs_open(void)   { return g_mhud.fsOn; }
 
 /* THE MASTER GATE setter (hot-stop / hot-start). Driven from maps.nim's
  * gEnabled: 1 when the feature is armed, 0 the instant the `enabled` setting is
@@ -855,6 +983,240 @@ static uint32_t mhud_overlay_mask(void) {
     return g_mhud_maskFn();
 }
 
+/* ==================== THE FULL-SCREEN TOGGLE KEY =======================
+ *
+ * UNITY THREAD ONLY. Driven from maps.nim's `onMainTick` (everyMain), the same
+ * tick the collector runs on -- never from the render thread and never from the
+ * mod's own timer thread.
+ *
+ * WHY `UnityEngine.Input::GetKeyDown` AND NOT GetAsyncKeyState OR A WNDPROC.
+ * The reasoning is `abi/aowlspt_admin.h`'s and is not repeated in full: async
+ * key state fires while the game is in the BACKGROUND and while the player is
+ * typing somewhere else, and a wndproc speaks Win32 virtual-keys rather than
+ * KeyCodes, so a user-assignable bind would need a hand-typed 328-entry
+ * mapping. `Input::GetKeyDown` is the input the game itself reads, is already
+ * false when the window is not focused, and is edge-triggered by construction.
+ *
+ * WHY THIS IS NOT `aowl_admin_hotkey_poll`. That poll is bound to
+ * `AowlAdminShared` and to admin's twelve action rows; using it here would make
+ * this mod a client of admin's private region for one key. What IS shared is
+ * the MEASUREMENT, and it is re-verified here rather than trusted:
+ *
+ *   UnityEngine.Input::GetKeyDown(KeyCode) -> bool, STATIC, arity 1,
+ *   RVA 0x531EB80, section `il2cpp`, prologue
+ *   40 53 48 83 EC 20 48 8B 05 9B 71 DB 01 8B D9 48
+ *   -- build 1.1.0.1.46777, per abi/aowlspt_admin.h's own measurement.
+ *
+ * It is CALLED, never detoured. The RVA is shared with `GetKeyDownInt(KeyCode)`
+ * -- the same body under its internal name -- which is a hazard for a detour
+ * (unbounded blast radius) and is harmless for a call made with the argument
+ * the body is correct for. A KeyCode is an enum over Int32, so the argument is
+ * one integer register, and the trailing hidden `const MethodInfo*` is NULL,
+ * which is legal because the method is not generic.
+ *
+ * THE EIGHT RULES, concretely: the 16-byte prologue is byte-compared before the
+ * pointer is ever called (rule 1); the target is VirtualQuery'd readable first
+ * (rule 2); the whole thing is bounded and allocates nothing (rules 4, 7); it
+ * is flag-gated and the key defaults to UNBOUND unless config names one (rule
+ * 5); and it SELF-DISABLES after MHUD_HK_MAXFAIL consecutive bind failures
+ * (rule 6) rather than probing GetModuleHandle every frame forever. There is no
+ * detour, so rules 3 and 8 have no surface here at all. */
+#define MHUD_RVA_GETKEYDOWN 0x531EB80u
+static const unsigned char MHUD_SIG_GETKEYDOWN[16] = {
+    0x40,0x53,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,0x9B,0x71,0xDB,0x01,0x8B,0xD9,0x48 };
+#define MHUD_HK_MAXFAIL 240
+
+typedef int32_t (*MHudGetKeyDownFn)(int32_t keyCode, void* methodInfo);
+static MHudGetKeyDownFn g_mhud_keyFn = 0;
+/* 0 not attempted | 1 GameAssembly.dll not mapped yet (TRANSIENT, must not
+ * latch) | 2 PROLOGUE MISMATCH -- refused, nothing is ever called | 3 bound. */
+static int32_t g_mhud_keyBind = 0;
+static int32_t g_mhud_keyFail = 0;
+
+static int32_t mhud_readable(const void* p, size_t n) {
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!p) return 0;
+    if (VirtualQuery(p, &mbi, sizeof(mbi)) != sizeof(mbi)) return 0;
+    if (mbi.State != MEM_COMMIT) return 0;
+    if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return 0;
+    return ((uintptr_t)p + n) <=
+           ((uintptr_t)mbi.BaseAddress + mbi.RegionSize) ? 1 : 0;
+}
+
+static int32_t mhud_key_state(void) {
+    HMODULE ga;
+    unsigned char* p;
+    if (g_mhud_keyBind == 1) g_mhud_keyBind = 0;   /* transient, retry */
+    if (g_mhud_keyBind != 0) return g_mhud_keyBind;
+    ga = GetModuleHandleA("GameAssembly.dll");
+    if (!ga) { g_mhud_keyBind = 1; return 1; }
+    p = (unsigned char*)ga + MHUD_RVA_GETKEYDOWN;
+    if (!mhud_readable(p, 16) || memcmp(p, MHUD_SIG_GETKEYDOWN, 16) != 0) {
+        g_mhud_keyFn = 0;
+        g_mhud_keyBind = 2;                       /* refuse; call nothing */
+        return 2;
+    }
+    g_mhud_keyFn = (MHudGetKeyDownFn)(void*)p;
+    g_mhud_keyBind = 3;
+    return 3;
+}
+
+static int32_t mhud_key_bind_state(void) { return g_mhud_keyBind; }
+static int32_t mhud_key_disabled(void) {
+    return g_mhud_keyFail >= MHUD_HK_MAXFAIL ? 1 : 0;
+}
+
+/* Returns the overlay's state AFTER this poll. `kc` is AOWL_KC_UNBOUND when no
+ * key is configured, and in that case NOTHING is called -- not GetModuleHandle,
+ * not GetKeyDown -- so the shipped default costs one compare per tick.
+ *
+ * ESCAPE always closes, and is only tested while the overlay is OPEN, so this
+ * can never swallow the player's Escape in normal play (it does not swallow it
+ * even then -- GetKeyDown only READS). */
+static int32_t mhud_fs_poll(int32_t kc, int32_t enabled) {
+    if (!enabled || kc == AOWL_KC_UNBOUND) return g_mhud.fsOn;
+    if (g_mhud_keyFail >= MHUD_HK_MAXFAIL) return g_mhud.fsOn;  /* self-disabled */
+    if (mhud_key_state() != 3) { g_mhud_keyFail++; return g_mhud.fsOn; }
+    g_mhud_keyFail = 0;
+    if (g_mhud_keyFn(kc, 0)) {
+        g_mhud.fsOn = g_mhud.fsOn ? 0 : 1;
+        g_mhud.fsToggles++;
+        return g_mhud.fsOn;
+    }
+    if (g_mhud.fsOn && g_mhud_keyFn(aowl_keycode_of("Escape"), 0)) {
+        g_mhud.fsOn = 0;
+        g_mhud.fsToggles++;
+    }
+    return g_mhud.fsOn;
+}
+
+/* ==================== THE ONE PANE RENDERER ============================
+ *
+ * The single code path the minimap, the radar and the full-screen overlay all
+ * go through. Before this existed the map pane and the radar pane were two
+ * near-identical blocks with two art calls and two contact loops, which is
+ * exactly how they came to disagree about which floor the player was on.
+ *
+ * Returns the number of primitives SUBMITTED. That count is not decoration: it
+ * is what lets the full-screen check be a falsifiable negative ("the overlay
+ * was open AND the small widget submitted zero primitives") instead of an
+ * assertion that the small widget was skipped, which is a check that cannot
+ * fail. It is incremented at the submission sites, so a submission added later
+ * outside this function's guards is still counted.
+ *
+ * `radiusCull` > 0 culls contacts to a circle (radar behaviour); 0 culls to the
+ * pane RECT (map behaviour), so the corners of a map pane are not dead. */
+static int32_t mhud_draw_pane_full(float px, float py, float size, float spanM,
+                                   float rot, int32_t withArt, float opacity,
+                                   float radiusCull)
+{
+    int32_t prims = 0, i;
+    uint32_t backA = (uint32_t)(190.0f * opacity);
+    uint32_t artA  = (uint32_t)(225.0f * opacity);
+    if (backA > 255u) backA = 255u;
+    if (artA  > 255u) artA  = 255u;
+
+    aowl_region_fill(px, py, size, size, MHUD_RGBA(8, 10, 14, backA));
+    prims++;
+
+    /* THE ART, under everything, so the frame, the grid, the blips and the
+     * player all land on top of it. `drawArt` is the player's switch and
+     * `withArt` is the mode's -- radar mode passes 0, which is what makes a
+     * radar a radar rather than a small map. */
+    if (withArt && g_mhud.drawArt) {
+        int32_t art = mhud_art_draw_pane(px, py, size, spanM, rot,
+                                         MHUD_RGBA(255, 255, 255, artA));
+        g_art.tilesDrawn += art;
+        prims += art;
+        /* The grid is a SCALE REFERENCE when art is present and the FALLBACK
+         * PICTURE when it is not; it is only drawn when no art landed, and the
+         * diag's ART line -- not this -- says which happened. */
+        if (art == 0 && g_mhud.mapGrid > 0) {
+            int32_t g;
+            float step = size / (float)g_mhud.mapGrid;
+            for (g = 1; g < g_mhud.mapGrid; g++) {
+                float o = (float)g * step;
+                /* 1px FILLs, not LINEs: the overlay renders a LINE as the
+                 * axis-aligned quad spanning its endpoints, which is right for
+                 * these two and wrong for anything diagonal, so this file uses
+                 * FILL everywhere and never has to remember the exception. */
+                aowl_region_fill(px + o, py, 1.0f, size,
+                                 MHUD_RGBA(60, 75, 95, 120));
+                aowl_region_fill(px, py + o, size, 1.0f,
+                                 MHUD_RGBA(60, 75, 95, 120));
+                prims += 2;
+            }
+        }
+    } else if (g_mhud.mapGrid > 0) {
+        int32_t g;
+        float step = size / (float)g_mhud.mapGrid;
+        for (g = 1; g < g_mhud.mapGrid; g++) {
+            float o = (float)g * step;
+            aowl_region_fill(px + o, py, 1.0f, size, MHUD_RGBA(60, 75, 95, 90));
+            aowl_region_fill(px, py + o, size, 1.0f, MHUD_RGBA(60, 75, 95, 90));
+            prims += 2;
+        }
+    }
+
+    aowl_region_box(px, py, size, size, 2.0f, MHUD_RGBA(150, 180, 210, 220));
+    prims++;
+
+    /* the player, at the pane centre by construction */
+    {
+        MmPt me = mm_topdown(g_mhud.px, g_mhud.pz, g_mhud.px, g_mhud.pz,
+                             px, py, size, spanM, rot);
+        mhud_player_arrow(me.x, me.y, 0.0f, g_mhud.hasHeading,
+                          size * 0.14f, g_mhud.colSelf);
+        prims += 2;
+    }
+    /* A north pip, so which way is up is never a guess. On a heading-up pane it
+     * swings as the player turns; on a north-up pane it sits fixed at the top. */
+    {
+        MmPt np = mm_topdown(g_mhud.px, g_mhud.pz + spanM * 0.45f,
+                             g_mhud.px, g_mhud.pz, px, py, size, spanM, rot);
+        aowl_region_fill(np.x - 2.0f, np.y - 2.0f, 4.0f, 4.0f,
+                         MHUD_RGBA(255, 210, 90, 230));
+        prims++;
+    }
+
+    /* ---- every contact, ONCE, for this pane -----------------------------
+     * Command budget: 1 backdrop + at most 2*31 grid + 1 frame + 2 player + 1
+     * pip = 71, plus at most 2 per entity. With MHUD_MAX 128 that is 71 + 256 =
+     * 327 for one pane. At most ONE pane is drawn per frame (the overlay
+     * replaces the small widget, it does not add to it), and the indicator loop
+     * that follows contributes at most 2 each -- 327 + 256 = 583 against
+     * AOWL_REGION_MAX_CMDS (2048). It cannot overrun. */
+    for (i = 0; i < g_mhud.n && i < MHUD_MAX; i++) {
+        float ex = g_mhud.e[i].x, ez = g_mhud.e[i].z;
+        float dy = g_mhud.e[i].y - g_mhud.py;
+        float cp = g_mhud.contactPx;
+        uint32_t col;
+        MmPt p;
+
+        if (g_mhud.e[i].bot && !g_mhud.showBots) continue;
+        if (!g_mhud.e[i].bot && !g_mhud.showPlayers) continue;
+        if (radiusCull > 0.0f &&
+            mm_dist2d(ex, ez, g_mhud.px, g_mhud.pz) > radiusCull) continue;
+
+        col = g_mhud.e[i].bot ? g_mhud.colBot : g_mhud.colPlayer;
+        p = mm_topdown(ex, ez, g_mhud.px, g_mhud.pz, px, py, size, spanM, rot);
+        if (!mm_in_rect(p, px, py, size, size)) continue;
+
+        aowl_region_fill(p.x - cp, p.y - cp, cp * 2.0f, cp * 2.0f, col);
+        prims++;
+        /* elevation: a tick above or below the blip, only when the difference
+         * is big enough to mean a different floor. */
+        if (dy > 2.0f) {
+            aowl_region_fill(p.x - 1.0f, p.y - cp - 3.0f, 2.0f, 2.0f, col);
+            prims++;
+        } else if (dy < -2.0f) {
+            aowl_region_fill(p.x - 1.0f, p.y + cp + 1.0f, 2.0f, 2.0f, col);
+            prims++;
+        }
+    }
+    return prims;
+}
+
 static void mhud_draw(void* user, int64_t frame) {
     float rot, headRot, scrW, scrH;
     int32_t i;
@@ -970,132 +1332,59 @@ static void mhud_draw(void* user, int64_t frame) {
      * feature of the map a constant distance off and still look like a map,
      * so the anchored version waits for a measurement rather than a guess.
      *
-     * There is NO map ARTWORK under these blips. The region command set is
-     * FILL / BOX / LINE / TEXT -- there is no textured-quad command, so the
-     * pocketmap tiles cannot be submitted through this contract at all. The
-     * grid is a scale reference and is drawn as such, not as scenery. */
+     * (That paragraph once said there is NO map artwork, because the region's
+     * command set was FILL/BOX/LINE/TEXT with no textured quad. The region
+     * gained AOWL_REGION_CMD_QUAD and QUADR; the art is real and is drawn by
+     * `mhud_art_draw_pane`. The grid is now the FALLBACK picture, drawn only
+     * when no tile landed.) */
     g_art.tilesDrawn = 0;
     g_art.artFrames++;
 
-    if (g_mhud.mapOn) {
-        float mx = g_mhud.mapX, my = g_mhud.mapY, ms = g_mhud.mapSize;
-        int32_t art;
-        aowl_region_fill(mx, my, ms, ms, MHUD_RGBA(8, 10, 14, 190));
+    /* ---- THE ONE SPATIAL WIDGET, or THE FULL-SCREEN OVERLAY -------------
+     *
+     * Exactly ONE of these two draws on any frame. The overlay REPLACES the
+     * small widget rather than covering it, and that is asserted with a count
+     * of what the small widget actually submitted, not with a comment:
+     * `fsSmallPrims` is the small widget's own return value, and on an
+     * overlay-open frame it must be 0. `fsFrames` and `fsSmallSuppressed` are
+     * counted apart so the diag can say FAIL when they diverge -- a single
+     * "overlay ok" counter could not be falsified.
+     *
+     * The overlay is the same renderer at screen scale, so it cannot drift from
+     * the minimap: same art, same projection, same contact colours, same
+     * heading rule. Its span and zoom are its own, because a full-screen map
+     * showing 120 m would be a very large radar. */
+    g_mhud.fsSmallPrims = 0;
+    g_mhud.fsLastPrims  = 0;
 
-        /* THE ART, under everything. Drawn first so the frame, the grid, the
-         * blips and the label all land on top of it. */
-        art = mhud_art_draw_pane(mx, my, ms, g_mhud.mapSpanM, rot,
-                                 MHUD_RGBA(255, 255, 255, 225));
-        g_art.tilesDrawn += art;
-
-        aowl_region_box(mx, my, ms, ms, 2.0f, MHUD_RGBA(150, 180, 210, 220));
-        /* The grid is a SCALE REFERENCE when art is present and the FALLBACK
-         * PICTURE when it is not, so it is drawn thinner over art -- and the
-         * diag's ART line, not this, is what says which happened. */
-        if (art == 0 && g_mhud.mapGrid > 0) {
-            int32_t g;
-            float step = ms / (float)g_mhud.mapGrid;
-            for (g = 1; g < g_mhud.mapGrid; g++) {
-                float o = (float)g * step;
-                /* 1px FILLs, not LINEs: the overlay renders a LINE as the
-                 * axis-aligned quad spanning its endpoints, which is right for
-                 * these two but wrong for anything diagonal, so this file uses
-                 * FILL everywhere and never has to remember the exception. */
-                aowl_region_fill(mx + o, my, 1.0f, ms,
-                                 MHUD_RGBA(60, 75, 95, 120));
-                aowl_region_fill(mx, my + o, ms, 1.0f,
-                                 MHUD_RGBA(60, 75, 95, 120));
-            }
-        }
-        /* the player, at the pane's centre by construction, drawn as a
-         * facing arrow (north-up map, rotating player -- see mhud_player_arrow). */
-        {
-            MmPt me = mm_topdown(g_mhud.px, g_mhud.pz, g_mhud.px, g_mhud.pz,
-                                 mx, my, ms, g_mhud.mapSpanM, rot);
-            mhud_player_arrow(me.x, me.y, headRot, g_mhud.hasHeading,
-                              ms * 0.12f, MHUD_RGBA(255, 255, 255, 255));
-        }
-        /* A north pip, so which way is up is never a guess. On a heading-up pane
-         * it swings around as the player turns (mm_topdown takes `rot`); on a
-         * north-up pane it sits fixed at the top. */
-        {
-            MmPt np = mm_topdown(g_mhud.px, g_mhud.pz + g_mhud.mapSpanM * 0.45f,
-                                 g_mhud.px, g_mhud.pz, mx, my, ms,
-                                 g_mhud.mapSpanM, rot);
-            aowl_region_fill(np.x - 2.0f, np.y - 2.0f, 4.0f, 4.0f,
-                             MHUD_RGBA(255, 210, 90, 230));
-        }
-    }
-
-    /* ---- the RADAR frame ------------------------------------------------ */
-    if (g_mhud.radarOn) {
-        MmPt me;
-        aowl_region_fill(g_mhud.radarX, g_mhud.radarY,
-                         g_mhud.radarSize, g_mhud.radarSize,
-                         MHUD_RGBA(10, 12, 16, 150));
-        /* The SAME art on the compact radar, at radar scale. One code path, so
-         * the two surfaces cannot disagree about which floor you are on. */
-        g_art.tilesDrawn += mhud_art_draw_pane(
-            g_mhud.radarX, g_mhud.radarY, g_mhud.radarSize,
-            g_mhud.radiusM * 2.0f, rot, MHUD_RGBA(255, 255, 255, 200));
-        aowl_region_box(g_mhud.radarX, g_mhud.radarY,
-                        g_mhud.radarSize, g_mhud.radarSize, 1.0f,
-                        MHUD_RGBA(120, 160, 200, 200));
-        me = mm_topdown(g_mhud.px, g_mhud.pz, g_mhud.px, g_mhud.pz,
-                        g_mhud.radarX, g_mhud.radarY, g_mhud.radarSize,
-                        g_mhud.radiusM * 2.0f, rot);
-        mhud_player_arrow(me.x, me.y, headRot, g_mhud.hasHeading,
-                          g_mhud.radarSize * 0.18f, MHUD_RGBA(255, 255, 255, 255));
-    }
-
-    /* ---- every contact, on all three surfaces ---------------------------- *
-     * Command budget: the map frame is at most 2 + 2*31 + 2 = 66, the radar
-     * frame 3, and each entity contributes at most 1 (map) + 2 (radar) = 3.
-     * The indicator loop that follows is over a SEPARATE table, also capped at
-     * MHUD_MAX, contributing at most 2 each. With MHUD_MAX 128 that is
-     * 66 + 3 + 384 + 256 = 709 against AOWL_REGION_MAX_CMDS (2048) -- the same
-     * bound as before the indicators moved out of this loop. It cannot
-     * overrun.
-     */
-    for (i = 0; i < g_mhud.n; i++) {
-        float ex = g_mhud.e[i].x, ez = g_mhud.e[i].z;
-        float dy = g_mhud.e[i].y - g_mhud.py;
-        float d;
-        uint32_t col;
-
-        if (g_mhud.e[i].bot && !g_mhud.showBots) continue;
-        if (!g_mhud.e[i].bot && !g_mhud.showPlayers) continue;
-
-        col = g_mhud.e[i].bot ? MHUD_RGBA(230, 70, 60, 235)
-                              : MHUD_RGBA(70, 190, 255, 235);
-        d = mm_dist2d(ex, ez, g_mhud.px, g_mhud.pz);
-
-        /* map pane: everything within the pane's span, culled by the RECT and
-         * not by a radius, so the corners of the pane are not dead. */
-        if (g_mhud.mapOn) {
-            MmPt p = mm_topdown(ex, ez, g_mhud.px, g_mhud.pz,
-                                g_mhud.mapX, g_mhud.mapY, g_mhud.mapSize,
-                                g_mhud.mapSpanM, rot);
-            if (mm_in_rect(p, g_mhud.mapX, g_mhud.mapY,
-                           g_mhud.mapSize, g_mhud.mapSize))
-                aowl_region_fill(p.x - 2.0f, p.y - 2.0f, 4.0f, 4.0f, col);
-        }
-
-        /* radar: a tighter radius, and the radius CULL stays a radius here
-         * because a radar is a circle. */
-        if (g_mhud.radarOn && d <= g_mhud.radiusM) {
-            MmPt b = mm_topdown(ex, ez, g_mhud.px, g_mhud.pz,
-                                g_mhud.radarX, g_mhud.radarY,
-                                g_mhud.radarSize, g_mhud.radiusM * 2.0f, rot);
-            aowl_region_fill(b.x - 2.0f, b.y - 2.0f, 4.0f, 4.0f, col);
-            /* elevation: a 2px tick above or below the blip, only when the
-             * difference is big enough to mean a different floor. */
-            if (dy > 2.0f)
-                aowl_region_fill(b.x - 1.0f, b.y - 5.0f, 2.0f, 2.0f, col);
-            else if (dy < -2.0f)
-                aowl_region_fill(b.x + -1.0f, b.y + 4.0f, 2.0f, 2.0f, col);
-        }
-
+    if (g_mhud.fsOn) {
+        /* Full-screen: a centred square, inset by the margin, sized to the
+         * SHORTER screen axis so it is never clipped on an ultrawide monitor. */
+        float m = g_mhud.fsMargin;
+        float avail = (scrW < scrH ? scrW : scrH) - m * 2.0f;
+        float span;
+        if (avail < 64.0f) avail = 64.0f;
+        span = g_mhud.fsSpanM / (g_mhud.fsZoom > 0.1f ? g_mhud.fsZoom : 1.0f);
+        g_mhud.fsLastPrims = mhud_draw_pane_full(
+            (scrW - avail) * 0.5f, (scrH - avail) * 0.5f, avail, span,
+            g_mhud.fsNorthUp ? 0.0f : rot, 1, g_mhud.fsOpacity, 0.0f);
+        g_mhud.fsFrames++;
+        /* THE FALSIFIABLE NEGATIVE. The small widget was not reached on this
+         * frame, and this counts that rather than asserting it. */
+        if (g_mhud.fsSmallPrims == 0) g_mhud.fsSmallSuppressed++;
+    } else if (g_mhud.mode != MHUD_MODE_OFF) {
+        /* The small widget. Radar mode takes its span from the radius and
+         * draws NO art; the two minimap modes take theirs from `mapSpanM` and
+         * differ only in whether `rot` is the measured heading or zero -- which
+         * is decided once, above, so art, grid and blips share one transform. */
+        int32_t radar = (g_mhud.mode == MHUD_MODE_RADAR);
+        float baseSpan = radar ? g_mhud.radiusM * 2.0f : g_mhud.mapSpanM;
+        float span = baseSpan / (g_mhud.zoom > 0.1f ? g_mhud.zoom : 1.0f);
+        float cull = radar ? (span * 0.5f) : 0.0f;
+        g_mhud.fsSmallPrims = mhud_draw_pane_full(
+            g_mhud.mapX, g_mhud.mapY, g_mhud.mapSize, span,
+            (g_mhud.mode == MHUD_MODE_NORTHUP) ? 0.0f : rot,
+            radar ? 0 : 1, g_mhud.opacity, cull);
     }
 
     /* ---- the DIRECTIONAL indicators, which are TRANSIENTS ---------------- *
@@ -1138,7 +1427,12 @@ static void mhud_draw(void* user, int64_t frame) {
             g_mhud.indExpired++;
             continue;
         }
-        if (!g_mhud.indicatorsOn) continue;
+        /* Suppressed while the FULL-SCREEN overlay is open: every one of these
+         * contacts is already drawn on the overlay at its true map position, so
+         * an edge marker for it would be the same contact twice. The track is
+         * still AGED and EVICTED above, so closing the overlay does not resume
+         * a frozen set of indicators. */
+        if (!g_mhud.indicatorsOn || g_mhud.fsOn) continue;
         if (g_mhud.tr[i].bot && !g_mhud.showBots) continue;
         if (!g_mhud.tr[i].bot && !g_mhud.showPlayers) continue;
 
@@ -1150,8 +1444,7 @@ static void mhud_draw(void* user, int64_t frame) {
         d = mm_dist2d(ex, ez, g_mhud.px, g_mhud.pz);
         if (!(d > 0.001f)) continue;
 
-        col = g_mhud.tr[i].bot ? MHUD_RGBA(230, 70, 60, 235)
-                               : MHUD_RGBA(70, 190, 255, 235);
+        col = g_mhud.tr[i].bot ? g_mhud.colBot : g_mhud.colPlayer;
         col = mm_fade_rgba(col, alpha);
 
         if (aowl_region_project(ex, ey, ez, &sx, &sy)) {
@@ -1200,6 +1493,40 @@ static int64_t mhud_draw_us_last(void) { return g_mhud.drawUsLast; }
 static int64_t mhud_draw_us_peak(void) { return g_mhud.drawUsPeak; }
 static int64_t mhud_draw_us_avg(void)  { return (int64_t)(g_mhud.drawUsEwma + 0.5); }
 static int32_t mhud_tiles_last(void)   { return g_mhud.tilesLastFrame; }
+
+/* ---- READBACK of the live mirror -------------------------------------- *
+ *
+ * These exist so the reconcile can compare config.json against WHAT THE DRAW
+ * CALLBACK IS ACTUALLY HOLDING, rather than against a copy of its own last
+ * write. A fingerprint of what we pushed would agree with itself forever and
+ * would be a check that cannot fail; these read the struct the render thread
+ * dereferences every frame. Every numeric setting has one, because a setting
+ * with no readback is a setting the reconcile cannot notice drifting -- which
+ * is exactly how `radarSize` used to be storable and inert. */
+static int32_t mhud_live_mode(void)      { return g_mhud.mode; }
+static float   mhud_live_zoom(void)      { return g_mhud.zoom; }
+static float   mhud_live_opacity(void)   { return g_mhud.opacity; }
+static int32_t mhud_live_drawart(void)   { return g_mhud.drawArt; }
+static float   mhud_live_contactpx(void) { return g_mhud.contactPx; }
+static uint32_t mhud_live_colbot(void)   { return g_mhud.colBot; }
+static uint32_t mhud_live_colplayer(void){ return g_mhud.colPlayer; }
+static float   mhud_live_panex(void)     { return g_mhud.mapX; }
+static float   mhud_live_paney(void)     { return g_mhud.mapY; }
+static float   mhud_live_panesize(void)  { return g_mhud.mapSize; }
+static float   mhud_live_panespan(void)  { return g_mhud.mapSpanM; }
+static float   mhud_live_radius(void)    { return g_mhud.radiusM; }
+static int32_t mhud_live_grid(void)      { return g_mhud.mapGrid; }
+static float   mhud_live_fsmargin(void)  { return g_mhud.fsMargin; }
+static float   mhud_live_fsspan(void)    { return g_mhud.fsSpanM; }
+static float   mhud_live_fszoom(void)    { return g_mhud.fsZoom; }
+static float   mhud_live_fsopacity(void) { return g_mhud.fsOpacity; }
+static int32_t mhud_live_fsnorthup(void) { return g_mhud.fsNorthUp; }
+
+static int64_t mhud_fs_frames(void)      { return g_mhud.fsFrames; }
+static int64_t mhud_fs_suppressed(void)  { return g_mhud.fsSmallSuppressed; }
+static int64_t mhud_fs_toggles(void)     { return g_mhud.fsToggles; }
+static int32_t mhud_fs_small_prims(void) { return g_mhud.fsSmallPrims; }
+static int32_t mhud_fs_last_prims(void)  { return g_mhud.fsLastPrims; }
 
 /* ---- art accessors, for the diag ------------------------------------- *
  * These are what the ART line reports. They are DELIBERATELY separate numbers:
@@ -1377,6 +1704,41 @@ proc cHudDrawUsLast(): int64 {.importc: "mhud_draw_us_last", nodecl.}
 proc cHudDrawUsPeak(): int64 {.importc: "mhud_draw_us_peak", nodecl.}
 proc cHudDrawUsAvg(): int64 {.importc: "mhud_draw_us_avg", nodecl.}
 proc cHudTilesLast(): int32 {.importc: "mhud_tiles_last", nodecl.}
+proc cHudConfigurePane(mode: int32; zoom, opacity: cfloat; drawArt: int32;
+                       contactPx: cfloat;
+                       colBot, colPlayer, colSelf: uint32) {.
+  importc: "mhud_configure_pane", nodecl.}
+proc cHudConfigureFs(margin, spanM, zoom, opacity: cfloat; northUp: int32) {.
+  importc: "mhud_configure_fs", nodecl.}
+proc cHudFsSet(on: int32) {.importc: "mhud_fs_set", nodecl.}
+proc cHudFsOpen(): int32 {.importc: "mhud_fs_open", nodecl.}
+proc cHudFsPoll(kc, enabled: int32): int32 {.importc: "mhud_fs_poll", nodecl.}
+proc cHudKeyBindState(): int32 {.importc: "mhud_key_bind_state", nodecl.}
+proc cHudKeyDisabled(): int32 {.importc: "mhud_key_disabled", nodecl.}
+proc cKeycodeOf(name: cstring): int32 {.importc: "aowl_keycode_of", nodecl.}
+proc cHudLiveMode(): int32 {.importc: "mhud_live_mode", nodecl.}
+proc cHudLiveZoom(): cfloat {.importc: "mhud_live_zoom", nodecl.}
+proc cHudLiveOpacity(): cfloat {.importc: "mhud_live_opacity", nodecl.}
+proc cHudLiveDrawArt(): int32 {.importc: "mhud_live_drawart", nodecl.}
+proc cHudLiveContactPx(): cfloat {.importc: "mhud_live_contactpx", nodecl.}
+proc cHudLiveColBot(): uint32 {.importc: "mhud_live_colbot", nodecl.}
+proc cHudLiveColPlayer(): uint32 {.importc: "mhud_live_colplayer", nodecl.}
+proc cHudLivePaneX(): cfloat {.importc: "mhud_live_panex", nodecl.}
+proc cHudLivePaneY(): cfloat {.importc: "mhud_live_paney", nodecl.}
+proc cHudLivePaneSize(): cfloat {.importc: "mhud_live_panesize", nodecl.}
+proc cHudLivePaneSpan(): cfloat {.importc: "mhud_live_panespan", nodecl.}
+proc cHudLiveRadius(): cfloat {.importc: "mhud_live_radius", nodecl.}
+proc cHudLiveGrid(): int32 {.importc: "mhud_live_grid", nodecl.}
+proc cHudLiveFsMargin(): cfloat {.importc: "mhud_live_fsmargin", nodecl.}
+proc cHudLiveFsSpan(): cfloat {.importc: "mhud_live_fsspan", nodecl.}
+proc cHudLiveFsZoom(): cfloat {.importc: "mhud_live_fszoom", nodecl.}
+proc cHudLiveFsOpacity(): cfloat {.importc: "mhud_live_fsopacity", nodecl.}
+proc cHudLiveFsNorthUp(): int32 {.importc: "mhud_live_fsnorthup", nodecl.}
+proc cHudFsFrames(): int64 {.importc: "mhud_fs_frames", nodecl.}
+proc cHudFsSuppressed(): int64 {.importc: "mhud_fs_suppressed", nodecl.}
+proc cHudFsToggles(): int64 {.importc: "mhud_fs_toggles", nodecl.}
+proc cHudFsSmallPrims(): int32 {.importc: "mhud_fs_small_prims", nodecl.}
+proc cHudFsLastPrims(): int32 {.importc: "mhud_fs_last_prims", nodecl.}
 
 # The counters, as ORDINARY Nim procs so another module can read them.
 #
@@ -1566,6 +1928,58 @@ type
     ## then gone.
     indicatorHoldMs*: int
     indicatorFadeMs*: int
+    ## THE UNIFIED WIDGET. `mode` is the one control: 0 off, 1 radar, 2 north-up
+    ## minimap, 3 heading-up minimap. `map` and `radar` above are DERIVED from it
+    ## by `spatialModeSurfaces` and are kept only because armFeed and the art
+    ## gate already read them; nothing sets them independently any more.
+    mode*: int
+    heading*: bool     ## the `heading` setting, carried here so readOpts is pure
+    zoom*: float
+    opacity*: float
+    drawArt*: bool
+    contactPx*: float
+    colBot*: uint32
+    colPlayer*: uint32
+    colSelf*: uint32
+    ## THE FULL-SCREEN OVERLAY.
+    fsEnabled*: bool     ## poll the key at all
+    fsKey*: string       ## a UnityEngine.KeyCode NAME, "" = unbound
+    fsMargin*: float
+    fsSpanM*: float
+    fsZoom*: float
+    fsOpacity*: float
+    fsNorthUp*: bool
+
+const
+  ModeOff*     = 0
+  ModeRadar*   = 1
+  ModeNorthUp* = 2
+  ModeHeadUp*  = 3
+
+proc modeName*(m: int): string =
+  case m
+  of ModeRadar:   "radar"
+  of ModeNorthUp: "minimap-northup"
+  of ModeHeadUp:  "minimap-headingup"
+  else:           "off"
+
+proc modeOf*(s: string): int =
+  ## Names, not magic numbers, in config.json. An UNRECOGNISED name is `off` --
+  ## a refusal the diag reports by name, never a silent fall-through to some
+  ## mode the player did not ask for.
+  case s
+  of "radar":             ModeRadar
+  of "northup", "minimap", "north-up": ModeNorthUp
+  of "headingup", "heading-up", "rotating": ModeHeadUp
+  else:                   ModeOff
+
+proc keycodeOf*(name: string): int =
+  ## The KeyCode ordinal for a name, or -1 (AOWL_KC_UNBOUND). "" is unbound and
+  ## is not an error; a MISSPELLED name is also -1, and the diag says which of
+  ## the two it was rather than reporting a dead key as "bound".
+  if name.len == 0: return -1
+  var buf = name & "\0"
+  result = int(cKeycodeOf(toCString(buf)))
 
 proc hudInit*(o: HudOpts) =
   ## Resets the mirror and installs the layout. Safe to call before the region
@@ -1588,6 +2002,15 @@ proc hudInit*(o: HudOpts) =
                    cfloat(o.mapSpanM), int32(o.mapGrid),
                    cfloat(o.indicatorInset))
   cHudLifetime(int64(o.indicatorHoldMs), int64(o.indicatorFadeMs))
+  cHudConfigurePane(int32(o.mode), cfloat(o.zoom), cfloat(o.opacity),
+                    (if o.drawArt: 1'i32 else: 0'i32), cfloat(o.contactPx),
+                    o.colBot, o.colPlayer, o.colSelf)
+  cHudConfigureFs(cfloat(o.fsMargin), cfloat(o.fsSpanM), cfloat(o.fsZoom),
+                  cfloat(o.fsOpacity), (if o.fsNorthUp: 1'i32 else: 0'i32))
+  # The overlay always starts CLOSED. Arming (or re-arming) a feature must never
+  # leave a full-screen panel over the player's raid because it happened to be
+  # open when they last toggled the feed off.
+  cHudFsSet(0'i32)
 
 proc hudReconfigure*(o: HudOpts; live: bool) =
   ## LIVE re-apply of the layout and visibility WITHOUT `cHudReset` -- so an F12
@@ -1619,6 +2042,21 @@ proc hudReconfigure*(o: HudOpts; live: bool) =
                    cfloat(o.mapSpanM), int32(o.mapGrid),
                    cfloat(o.indicatorInset))
   cHudLifetime(int64(o.indicatorHoldMs), int64(o.indicatorFadeMs))
+  # THE UNIFIED WIDGET, live. `mode` is forced to OFF when the feature is not
+  # live, for the same reason the three legacy surface bits are ANDed with
+  # `live`: the master gate is checked first in the draw, and this makes the
+  # mirror READ off as well, so the reconcile's finished-state comparison is
+  # against a mirror that agrees with itself.
+  cHudConfigurePane((if live: int32(o.mode) else: 0'i32),
+                    cfloat(o.zoom), cfloat(o.opacity),
+                    (if o.drawArt: 1'i32 else: 0'i32), cfloat(o.contactPx),
+                    o.colBot, o.colPlayer, o.colSelf)
+  cHudConfigureFs(cfloat(o.fsMargin), cfloat(o.fsSpanM), cfloat(o.fsZoom),
+                  cfloat(o.fsOpacity), (if o.fsNorthUp: 1'i32 else: 0'i32))
+  # Turning the feature OFF closes the overlay. Otherwise an off edit made with
+  # the map open would blank the draw and leave `fsOn` set, so re-enabling would
+  # snap a full-screen panel back over the raid with no key press.
+  if not live: cHudFsSet(0'i32)
 
 proc hudArmed*(): bool =
   ## Whether the HOST has armed the shared region at all. This is the host flag
@@ -1742,3 +2180,67 @@ proc hudFadeMs*(): int = int(cHudFadeMs())
 proc hudHasHeading*(): bool = cHudHasHeading() != 0'i32
 proc hudHeading*(): float = float(cHudHeading())
 proc hudInRaid*(): bool = cHudInRaid() != 0'i32
+
+# ---- the unified widget and the full-screen overlay, read back LIVE -------
+#
+# Every one of these reads the C mirror the render thread dereferences, never a
+# Nim copy of what we last wrote. That distinction is the whole point: the
+# reconcile compares config.json against THESE, so a setting that was stored and
+# not pushed shows up as drift instead of agreeing with itself.
+proc hudLiveMode*(): int = int(cHudLiveMode())
+proc hudLiveZoom*(): float = float(cHudLiveZoom())
+proc hudLiveOpacity*(): float = float(cHudLiveOpacity())
+proc hudLiveDrawArt*(): bool = cHudLiveDrawArt() != 0'i32
+proc hudLiveContactPx*(): float = float(cHudLiveContactPx())
+proc hudLiveColBot*(): uint32 = cHudLiveColBot()
+proc hudLiveColPlayer*(): uint32 = cHudLiveColPlayer()
+proc hudLivePaneX*(): float = float(cHudLivePaneX())
+proc hudLivePaneY*(): float = float(cHudLivePaneY())
+proc hudLivePaneSize*(): float = float(cHudLivePaneSize())
+proc hudLivePaneSpan*(): float = float(cHudLivePaneSpan())
+proc hudLiveRadius*(): float = float(cHudLiveRadius())
+proc hudLiveGrid*(): int = int(cHudLiveGrid())
+proc hudLiveFsMargin*(): float = float(cHudLiveFsMargin())
+proc hudLiveFsSpan*(): float = float(cHudLiveFsSpan())
+proc hudLiveFsZoom*(): float = float(cHudLiveFsZoom())
+proc hudLiveFsOpacity*(): float = float(cHudLiveFsOpacity())
+proc hudLiveFsNorthUp*(): bool = cHudLiveFsNorthUp() != 0'i32
+
+proc hudFsOpen*(): bool = cHudFsOpen() != 0'i32
+proc hudFsClose*() = cHudFsSet(0'i32)
+proc hudFsFrames*(): int64 = cHudFsFrames()
+proc hudFsSuppressed*(): int64 = cHudFsSuppressed()
+proc hudFsToggles*(): int64 = cHudFsToggles()
+proc hudFsSmallPrims*(): int = int(cHudFsSmallPrims())
+proc hudFsLastPrims*(): int = int(cHudFsLastPrims())
+
+proc hudFsPoll*(kc: int; enabled: bool): bool =
+  ## UNITY THREAD ONLY -- called from maps.nim's everyMain collector tick, the
+  ## same thread `Input::GetKeyDown` belongs to. Returns the overlay's state
+  ## after the poll. With `enabled` false or `kc` -1 it calls NOTHING at all.
+  cHudFsPoll(int32(kc), (if enabled: 1'i32 else: 0'i32)) != 0'i32
+
+proc hudKeyBindText*(): string =
+  ## The bind state IN WORDS. Four outcomes, never two -- "not attempted",
+  ## "GameAssembly not mapped yet" (transient, must not read as a failure),
+  ## "PROLOGUE MISMATCH -- refused" (the RVA moved; nothing was called), and
+  ## "bound". A bare boolean here would make a build change look like an idle
+  ## poll.
+  if cHudKeyDisabled() != 0'i32:
+    return "SELF-DISABLED after 240 consecutive bind failures; nothing is polled"
+  case int(cHudKeyBindState())
+  of 0: "not attempted (no key configured, or the tick has not run)"
+  of 1: "GameAssembly.dll not mapped yet -- transient, retried next tick"
+  of 2: "REFUSED: the 16-byte prologue at RVA 0x531EB80 does not match " &
+        "Input::GetKeyDown for this build. Nothing was called."
+  of 3: "bound to UnityEngine.Input::GetKeyDown @0x531EB80 (prologue verified)"
+  else: "unknown"
+
+proc spatialModeSurfaces*(o: var HudOpts) =
+  ## The ONE place the two legacy booleans are derived from the mode. armFeed's
+  ## registration gate and onMainTick's art gate still read `map`/`radar`; they
+  ## are now a VIEW of `mode` rather than independent switches, so the state
+  ## "map on AND radar on" -- which the draw never implemented -- is no longer
+  ## reachable from any config.
+  o.map   = (o.mode == ModeNorthUp or o.mode == ModeHeadUp)
+  o.radar = (o.mode == ModeRadar)
