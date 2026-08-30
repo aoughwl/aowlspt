@@ -121,6 +121,14 @@ static struct {
     int64_t  holdMs, fadeMs;
     float    px, py, pz;
     int32_t  hasLocal;
+    int32_t  enabled;        /* MASTER draw gate (hot-stop, symmetric with the
+                              * hot-start). Mirrors maps.nim's gEnabled: 1 while
+                              * the feature is switched on, 0 the instant the
+                              * `enabled` setting is turned off. When 0 the draw
+                              * callback early-returns and submits NOTHING, so
+                              * the OFF transition can no longer depend on every
+                              * one of mapOn/radarOn/indicatorsOn being zeroed
+                              * on every path -- one authoritative bit does it. */
     int32_t  inRaid;         /* active, spawned, in-world raid (bug 1 gate).
                               * Set by the publisher from world.activeRaid().
                               * When 0 the draw submits NOTHING. */
@@ -322,6 +330,16 @@ static void mhud_configure_map(int32_t mapOn, float mapX, float mapY,
     g_mhud.mapSpanM       = mapSpanM > 10.0f ? mapSpanM : 10.0f;
     g_mhud.mapGrid        = (mapGrid > 0 && mapGrid <= 32) ? mapGrid : 0;
     g_mhud.indicatorInset = indicatorInset > 4.0f ? indicatorInset : 4.0f;
+}
+
+/* THE MASTER GATE setter (hot-stop / hot-start). Driven from maps.nim's
+ * gEnabled: 1 when the feature is armed, 0 the instant the `enabled` setting is
+ * turned off. Kept separate from mhud_configure so that mhud_reset (which zeroes
+ * the whole mirror, enabled included) and the per-surface flags cannot each
+ * disagree about whether the feature is on -- there is now exactly one bit the
+ * draw callback consults first. */
+static void mhud_set_enabled(int32_t on) {
+    g_mhud.enabled = on ? 1 : 0;
 }
 
 /* THE BACK-BUFFER SIZE, asked of the region rather than guessed.
@@ -837,6 +855,17 @@ static void mhud_draw(void* user, int64_t frame) {
     (void)user; (void)frame;
 
     g_mhud.frames++;
+    /* THE MASTER GATE (hot-stop). The feature is switched OFF: the `enabled`
+     * setting was turned off. Submit NOTHING and drop the held frame so a stale
+     * radar/minimap cannot linger for even one Present after the toggle. This is
+     * the authoritative negative -- when enabled is 0 the callback draws nothing
+     * regardless of mapOn/radarOn/indicatorsOn -- and it is symmetric with the
+     * hot-start, which sets enabled=1. Checked FIRST so no later branch can
+     * submit a command while the feature is off. */
+    if (!g_mhud.enabled) {
+        g_mhud.heldValid = 0;
+        return;
+    }
     /* BUG 2: a blocking UI surface is up (F12/Settings, F6 or F3). Submit
      * NOTHING -- neither tiles nor blips -- so the map never draws over a screen
      * the player is trying to read. Counted, not silent. The held frame is left
@@ -1273,6 +1302,7 @@ static int32_t mhud_screen_h(void) { float w, h; mhud_screen(&w, &h);
 """.}
 
 proc cHudReset() {.importc: "mhud_reset", nodecl.}
+proc cHudSetEnabled(on: int32) {.importc: "mhud_set_enabled", nodecl.}
 proc cHudBegin(px, py, pz: cfloat; hasLocal: int32;
                heading: cfloat; hasHeading: int32; inRaid: int32) {.
   importc: "mhud_begin", nodecl.}
@@ -1501,8 +1531,14 @@ type
 
 proc hudInit*(o: HudOpts) =
   ## Resets the mirror and installs the layout. Safe to call before the region
-  ## exists; it touches nothing but this file's own struct.
+  ## exists; it touches nothing but this file's own struct. Only ever called from
+  ## the arming path (armFeed), i.e. when the feature is being switched ON, so it
+  ## sets the master draw gate: cHudReset zeroed `enabled`, and without this the
+  ## initial onLoad arm (which does not go through hudReconfigure) would leave the
+  ## gate off and nothing would ever draw. hudReconfigure re-drives the same bit
+  ## from `live` on every subsequent apply, so an off edit still hot-stops.
   cHudReset()
+  cHudSetEnabled(1'i32)
   cHudConfigure(cfloat(o.radiusM), cfloat(o.screenW), cfloat(o.screenH),
                 (if o.radar: 1'i32 else: 0'i32),
                 (if o.indicators: 1'i32 else: 0'i32),
@@ -1524,9 +1560,17 @@ proc hudReconfigure*(o: HudOpts; live: bool) =
   ## the feed being enabled AND already collecting -- and every visibility flag
   ## is ANDed with it, so turning `enabled` off blanks all three surfaces (0
   ## tiles, 0 blips) even though their own keys are still true in config.json.
+  ##
+  ## `live` ALSO drives the master draw gate (the hot-stop): the very first thing
+  ## the draw callback checks is `enabled`, so an off edit (live=false) makes the
+  ## callback early-return and submit nothing -- the OFF path no longer depends on
+  ## every one of the three surface flags being zeroed on every code path. This is
+  ## the negative assertion (§9b): enabled=0 => nothing is drawn, whatever the
+  ## per-surface flags say.
   let radarOn = (if o.radar and live: 1'i32 else: 0'i32)
   let indOn   = (if o.indicators and live: 1'i32 else: 0'i32)
   let mapOn   = (if o.map and live: 1'i32 else: 0'i32)
+  cHudSetEnabled(if live: 1'i32 else: 0'i32)
   cHudConfigure(cfloat(o.radiusM), cfloat(o.screenW), cfloat(o.screenH),
                 radarOn, indOn,
                 cfloat(o.size), cfloat(o.x), cfloat(o.y),
