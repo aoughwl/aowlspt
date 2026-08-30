@@ -19,6 +19,7 @@ import ids
 import loot
 import questcond
 import post1
+import rand
 import templates
 
 type
@@ -865,6 +866,140 @@ proc offlineScavWaves(zones: seq[string]; pmcZones: seq[string] = @[]): string =
   a.add oneWave(number, 360, 420, trickle, trickle * 2, useZones[0])
   result = done(a).text
 
+# ---------------------------------------------------------------------------
+# The boss roll
+# ---------------------------------------------------------------------------
+#
+# MEASURED 2026-08-30, one live Woods raid, `wirelog.py grep 'Role='` against
+# the backend log: `bossKojaniy`, `bossKnight` (+ `followerBigPipe` and
+# `followerBirdEye`), `bossPartisan` AND `sectantPriest`/`sectantWarrior` were
+# all requested from `bot/generate` inside the same second. Woods'
+# `BossLocationSpawn` in `data/post1/locations.json` gives those four
+# `BossChance` 45 / 15 / 10 / 10, so all four landing together is a 0.07%
+# event. It is not a bad roll: nothing was rolling.
+#
+# The chance field IS present and IS vanilla -- 29 distinct `BossName`s across
+# the 24 maps carry chances from 2 to 100 -- and, before this, NO code in
+# `mods/tarkov` read `BossChance` at all (grep: the only hits were four
+# comments in this file). The array went out verbatim and the client treated
+# every entry in it as a boss that spawns.
+#
+# So the roll happens here, server-side, once per raid, seeded from the raid
+# id so a raid can be reproduced from a bug report -- the same rule
+# `emu/loot` follows. A winner is emitted with `BossChance` rewritten to 100,
+# which is what "this one is in this raid" means on the wire; a loser is
+# removed from the array entirely.
+#
+# THREE GROUPS, and the classification is deliberately narrow:
+#
+#   * the MAP BOSS slot -- `boss*` except `bossPartisan`. Shturman and the
+#     Goons compete for one Woods; Reshala and Wedge compete for one Customs.
+#     They are rolled in the table's own order and the first winner takes the
+#     slot, so a map never hosts two map bosses at once.
+#   * `bossPartisan` -- a roaming event, independent of the map boss.
+#   * `sectant*` (the Cultists) -- independent, and additionally gated by a
+#     setting, because they are the most expensive AI in the game.
+#
+# Everything else in `BossLocationSpawn` is left EXACTLY as it was: `assault`,
+# `exUsec`, `pmcBot`, `civilian`, `sentry`, `vsRF` and the `blackDivision`
+# event entries all live in this array too, and several of ours are load-
+# bearing (the PMC entries -- fact #265). Rolling those would be a second,
+# unmeasured change riding on this one.
+
+proc bossRollGroup(name: string): int =
+  ## 0 = not rolled here, 1 = map-boss slot, 2 = independent boss, 3 = cultist.
+  if name.len == 0: return 0
+  if name.startsWith("sectant"): return 3
+  if name == "bossPartisan": return 2
+  if name.startsWith("boss"): return 1
+  return 0
+
+proc rollBossSpawnList*(bossLocationSpawn, seed: string; chanceMul: float;
+                        cultists, exclusive: bool): string =
+  ## The `BossLocationSpawn` array a raid actually gets, from the array the
+  ## data ships. Pure: same inputs, same output, no globals, no database --
+  ## which is what lets `selfCheckRaid` run it ten thousand times.
+  ##
+  ## A non-array (or an unparseable entry) is returned untouched rather than
+  ## replaced by `[]`: serving no bosses because the document surprised us is
+  ## a silent behaviour change, and this module's rule is that a failure
+  ## announces itself instead.
+  let v = whole(bossLocationSpawn)
+  if not v.isArray:
+    return bossLocationSpawn
+  var r = seededRng(seed)
+  var out1 = arr()
+  var slotTaken = false
+  let n = count(v)
+  var i = 0
+  while i < n:
+    let e = v.at(i)
+    inc i
+    let name = e.field("BossName").asText("")
+    let group = bossRollGroup(name)
+    if group == 0:
+      out1.add raw(e.raw)
+      continue
+    if group == 3 and not cultists:
+      continue
+    if group == 1 and exclusive and slotTaken:
+      # The slot is gone. The roll is still CONSUMED above only for the
+      # entries that got as far as one, so the stream stays a function of the
+      # table -- but this entry cannot win, so do not spend a draw on it.
+      continue
+    var p = float(e.field("BossChance").asInt(0)) / 100.0 * chanceMul
+    if p > 1.0: p = 1.0
+    if p <= 0.0:
+      continue
+    if not chance(r, p):
+      continue
+    var w = parseObject(e.raw)
+    if not w.ok:
+      out1.add raw(e.raw)
+      continue
+    # 100 is how the wire says "this one is in". The client is handed a list
+    # of bosses that are all present rather than a list it has to re-roll,
+    # so the server's decision is the one that stands.
+    setNumber(w, "BossChance", 100)
+    out1.add raw(text(w))
+    if group == 1:
+      slotTaken = true
+  result = done(out1).text
+
+proc applyBossPolicy*(d: var Doc; seed: string) =
+  ## Roll this raid's bosses into the `LocationBase` about to be served.
+  ##
+  ## Settings, read here rather than threaded through, exactly as `emu/loot`
+  ## reads its multipliers: `bossSpawnChanceMultiplier` scales every rolled
+  ## chance (0 means no bosses at all, 1.0 is the data's own numbers),
+  ## `cultistsEnabled` drops the Cultists, `bossSlotExclusive` is the
+  ## one-map-boss-at-a-time rule.
+  if not has(d, "BossLocationSpawn"):
+    return
+  let before = getRaw(d, "BossLocationSpawn")
+  let rolled = rollBossSpawnList(
+    before, seed,
+    setting("bossSpawnChanceMultiplier").asFloat(1.0),
+    setting("cultistsEnabled").asBool(true),
+    setting("bossSlotExclusive").asBool(true))
+  setRaw(d, "BossLocationSpawn", rolled)
+  # Say what was decided. The whole defect was invisible because nothing on
+  # the server ever named a boss; `bot/generate` naming one afterwards is the
+  # client's consequence, not the server's decision.
+  var kept = ""
+  let rv = whole(rolled)
+  if rv.isArray:
+    let n = count(rv)
+    var i = 0
+    while i < n:
+      let nm = rv.at(i).field("BossName").asText("")
+      if bossRollGroup(nm) != 0:
+        if kept.len > 0: kept.add ","
+        kept.add nm
+      inc i
+  if kept.len == 0: kept = "(none)"
+  info "boss roll: seed=" & seed & " kept=" & kept
+
 proc tuneOfflineSpawns*(d: var Doc) =
   ## Turn one `LocationBase` document into one that populates an offline raid.
   ##
@@ -1171,6 +1306,9 @@ proc localLoot*(locationId: string; nowSeconds: int;
     # this stays per-map correct rather than a Factory-only constant. The boss
     # path and the loot are untouched.
     tuneOfflineSpawns(d)
+    # And the bosses. Seeded from the same `seed` the floor is -- the raid id
+    # when there is one -- so one raid id names one floor AND one boss set.
+    applyBossPolicy(d, seed)
 
     result = text(d)
   else:
@@ -1452,9 +1590,174 @@ const
   ChkWeather = """{"season": 3, "acceleration": 5,
                    "weather": {"temp": -14, "cloud": 0.8, "timestamp": 1}}"""
 
+const ChkBossSpawn = """[
+  {"BossName":"bossKojaniy","BossChance":45,"BossZone":"ZoneWoodCutter",
+   "BossPlayer":false,"BossDifficult":"normal","BossEscortType":"followerKojaniy",
+   "BossEscortDifficult":"normal","BossEscortAmount":"2,3","Time":-1,
+   "TriggerId":"","TriggerName":"","Supports":[],"RandomTimeSpawn":false},
+  {"BossName":"bossKnight","BossChance":15,"BossZone":"ZoneScavBase2",
+   "BossPlayer":false,"BossDifficult":"normal","BossEscortType":"exUsec",
+   "BossEscortDifficult":"normal","BossEscortAmount":"2","Time":-1,
+   "TriggerId":"","TriggerName":"","RandomTimeSpawn":true,
+   "Supports":[{"BossEscortType":"followerBigPipe","BossEscortAmount":"1",
+                "BossEscortDifficult":["normal"]},
+               {"BossEscortType":"followerBirdEye","BossEscortAmount":"1",
+                "BossEscortDifficult":["normal"]}]},
+  {"BossName":"bossPartisan","BossChance":10,"BossZone":"",
+   "BossPlayer":false,"BossDifficult":"normal","BossEscortType":"sectantWarrior",
+   "BossEscortDifficult":"normal","BossEscortAmount":"0","Time":900,
+   "TriggerId":"","TriggerName":"","Supports":[],"RandomTimeSpawn":false},
+  {"BossName":"sectantPriest","BossChance":10,
+   "BossZone":"ZoneMiniHouse,ZoneBrokenVill","BossPlayer":false,
+   "BossDifficult":"normal","BossEscortType":"sectantWarrior",
+   "BossEscortDifficult":"normal","BossEscortAmount":"4","Time":-1,
+   "TriggerId":"","TriggerName":"","Supports":[],"RandomTimeSpawn":false},
+  {"BossName":"pmcBot","BossChance":100,"BossZone":"ZoneRedHouse",
+   "BossPlayer":false,"BossDifficult":"normal","BossEscortType":"pmcBot",
+   "BossEscortDifficult":"normal","BossEscortAmount":"2","Time":-1,
+   "TriggerId":"","TriggerName":"","Supports":[],"RandomTimeSpawn":false}
+]"""
+  ## Woods' real `BossLocationSpawn`, copied field-for-field out of
+  ## `data/post1/locations.json` (map `5704e3c2d2720bac5b8b4567`), plus one
+  ## `pmcBot` entry standing in for the non-boss entries the array also carries.
+  ## The chances -- 45 / 15 / 10 / 10 -- are BSG's, not ours.
+
+proc bossBand(got, want: int; who: string; into: var seq[string]) =
+  ## `got` out of 2000 must sit within 80 of `want` -- 4 percentage points,
+  ## about 3.6 sigma on the widest of the four bands, so a correct generator
+  ## does not trip it and an unconditional one misses by hundreds.
+  let lo = want - 80
+  let hi = want + 80
+  if got < lo or got > hi:
+    into.add "raid: " & who & " appeared in " & $got & " of 2000 raids, " &
+             "outside " & $lo & ".." & $hi & " for its data chance"
+
+proc bossRollFailures(forced: bool; into: var seq[string]) =
+  ## The boss roll, over `ChkBossSpawn`, 2000 raids.
+  ##
+  ## `forced` is the NEGATIVE CONTROL, and it is the point of this check. It
+  ## reproduces the defect exactly -- every boss emitted unconditionally, no
+  ## exclusive slot -- by passing a multiplier that pins every probability at
+  ## 1.0. `selfCheckRaid` requires the forced run to FAIL. A check that has
+  ## only ever been run on a working generator is `return @[]` wearing a hat,
+  ## and this file has shipped that mistake before.
+  const Runs = 2000
+  let mul = if forced: 1000.0 else: 1.0
+  let exclusive = not forced
+  var kojaniy = 0
+  var knight = 0
+  var partisan = 0
+  var priest = 0
+  var bothMapBosses = 0
+  var allFour = 0
+  var lostPmc = 0
+  var unparsed = 0
+  var i = 0
+  while i < Runs:
+    let outText = rollBossSpawnList(ChkBossSpawn, "chk-raid-" & $i, mul,
+                                    true, exclusive)
+    inc i
+    # STRICT parse, every run. A payload that is not valid JSON must not be
+    # able to satisfy any assertion below by looking right as a substring.
+    let v = whole(outText)
+    if not v.isArray:
+      inc unparsed
+      continue
+    var hasK, hasN, hasP, hasS, hasPmc = false
+    let n = count(v)
+    var j = 0
+    while j < n:
+      let e = v.at(j)
+      inc j
+      let nm = e.field("BossName").asText("")
+      if nm == "bossKojaniy": hasK = true
+      elif nm == "bossKnight": hasN = true
+      elif nm == "bossPartisan": hasP = true
+      elif nm == "sectantPriest": hasS = true
+      elif nm == "pmcBot": hasPmc = true
+    if hasK: inc kojaniy
+    if hasN: inc knight
+    if hasP: inc partisan
+    if hasS: inc priest
+    if hasK and hasN: inc bothMapBosses
+    if hasK and hasN and hasP and hasS: inc allFour
+    if not hasPmc: inc lostPmc
+  if unparsed > 0:
+    into.add "raid: the boss roll produced " & $unparsed &
+             " payload(s) that are not a JSON array"
+  # (a) The finished state, as a negative: no raid hosts two map bosses, and
+  # no raid hosts every boss group at once -- which is what was measured live.
+  if bothMapBosses > 0:
+    into.add "raid: Shturman and the Goons were both in " & $bothMapBosses &
+             " of " & $Runs & " raids; the map-boss slot is not exclusive"
+  if allFour > 0:
+    into.add "raid: every boss group spawned together in " & $allFour &
+             " of " & $Runs & " raids"
+  # (b) Frequency tracks the data's own chance. Kojaniy 45%, Partisan 10%,
+  # the Priest 10%; the Goons only get the slot when Kojaniy lost it, so
+  # 0.55 * 0.15 = 8.25%. +/- 4 points at n=2000 is ~3.6 sigma on the widest
+  # of them, so a correct generator does not trip this and a broken one does.
+  bossBand(kojaniy, 900, "bossKojaniy (45%)", into)
+  bossBand(knight, 165, "bossKnight (15% of the 55% Kojaniy leaves)", into)
+  bossBand(partisan, 200, "bossPartisan (10%)", into)
+  bossBand(priest, 200, "sectantPriest (10%)", into)
+  # (c) Nothing that is not a boss may be touched. `pmcBot` lives in this same
+  # array and is load-bearing.
+  if lostPmc > 0:
+    into.add "raid: the boss roll dropped the non-boss pmcBot entry from " &
+             $lostPmc & " of " & $Runs & " raids"
+
+proc bossRollReport*(forced: bool; into: var seq[string]) =
+  ## Exported only so `tools/bosscheck.nim` can print both runs without
+  ## starting a backend. `selfCheckRaid` is the gate; this is the microscope.
+  bossRollFailures(forced, into)
+
 proc selfCheckRaid*(into: var seq[string]): bool =
   ## Pure, over the literals above. True when it added nothing.
   let before = into.len
+
+  # The boss roll, and the proof that its check can fail. The forced run is
+  # the pre-fix behaviour -- every boss, every raid -- and it must produce
+  # failures; if it does not, the assertions above are vacuous and this load
+  # is refused on that ground alone rather than on a boss.
+  var forcedFails: seq[string] = @[]
+  bossRollFailures(true, forcedFails)
+  if forcedFails.len == 0:
+    into.add "raid: the boss-roll check passed a generator that emits every " &
+             "boss unconditionally, so it cannot fail and is not a check"
+  bossRollFailures(false, into)
+  # The settings have to bite, or they are decoration -- five of those shipped
+  # in one day. Asserted as absences over 200 raids each.
+  var i = 0
+  var mulZeroBosses = 0
+  var cultistsOffPriests = 0
+  while i < 200:
+    let off = rollBossSpawnList(ChkBossSpawn, "chk-off-" & $i, 0.0, true, true)
+    let noCult = rollBossSpawnList(ChkBossSpawn, "chk-cult-" & $i, 1.0,
+                                   false, true)
+    inc i
+    let vOff = whole(off)
+    let vCult = whole(noCult)
+    if not vOff.isArray or not vCult.isArray:
+      into.add "raid: a boss-roll setting produced a non-array payload"
+      continue
+    var j = 0
+    while j < count(vOff):
+      if bossRollGroup(vOff.at(j).field("BossName").asText("")) != 0:
+        inc mulZeroBosses
+      inc j
+    j = 0
+    while j < count(vCult):
+      if bossRollGroup(vCult.at(j).field("BossName").asText("")) == 3:
+        inc cultistsOffPriests
+      inc j
+  if mulZeroBosses > 0:
+    into.add "raid: bossSpawnChanceMultiplier=0 still spawned " &
+             $mulZeroBosses & " boss entrie(s)"
+  if cultistsOffPriests > 0:
+    into.add "raid: cultistsEnabled=false still spawned " &
+             $cultistsOffPriests & " cultist entrie(s)"
+
   let d = textDb(ChkLocations)
   let idx = buildLocationIndex(d)
 
