@@ -433,9 +433,59 @@ proc slotFilter(def: JsonRef; r: var Rng): string =
     return ""
   result = at(list, nextInt(r, n)).asText("")
 
+proc chamberRounds(inv: JsonRef; items: var List;
+                   weaponId, weaponTpl, caliber: string; r: var Rng) =
+  ## A live round in each of the weapon's chamber slots, drawn from the same
+  ## caliber pool the magazine draws from and constrained the same way -- to what
+  ## the chamber itself accepts (`Chambers[i]._props.filters[0].Filter`, fed to
+  ## `pickAcceptedAmmo`). Read from the weapon's own `_props.Chambers` so a
+  ## revolver's cylinder or a break-action's two barrels are chambered exactly as
+  ## the data describes them, not assumed to be one `patron_in_weapon`.
+  ##
+  ## Silent, like `fillMagazine`: an unchambered weapon is a bot that racks the
+  ## bolt before its first shot, which it will; a chamber loaded with a round it
+  ## does not accept is a bot the client refuses to spawn, so a chamber for which
+  ## no accepted round exists is left empty rather than forced.
+  if caliber.len == 0 or weaponTpl.len == 0:
+    return
+  let ch = dbRead("templates.items." & weaponTpl & "._props.Chambers")
+  if not ch.ok:
+    return
+  let pool = inv.field("Ammo").field(caliber)
+  let list = each(whole(ch.raw))
+  for slot in list:
+    let name = slot.field("_name").asText("")
+    if name.len == 0:
+      continue
+    let accepted = slot.field("_props").field("filters").at(0).field("Filter")
+    let ammo = pickAcceptedAmmo(pool, accepted, r)
+    if ammo.len == 0:
+      continue
+    var d = botItem(newId(), ammo, weaponId, name)
+    var upd = newDoc()
+    setNumber(upd, "StackObjectsCount", 1)
+    setRaw(d, "upd", text(upd))
+    items.add d
+
+type
+  SpareMag = object
+    ## A magazine model the bot was given in a weapon, remembered so a spare of
+    ## the same model -- guaranteed to fit -- can be put in a carried container.
+    tpl: string
+    caliber: string
+
+const
+  SparesPerWeapon = 2
+    ## Spare magazines carried per weapon that took one. Two is a reload and a
+    ## bit, which is what a real PMC's rig holds; a target, not a floor -- a spare
+    ## is dropped silently when the rig has no room for it.
+  MaxSpareMags = 4
+    ## The cap across all weapons, so a bot with two rifles and a pistol does not
+    ## turn into a walking magazine dump.
+
 proc addMods(t: BotTables; inv, chances: JsonRef; items: var List;
              rootId, rootTpl: string; weapon: bool; r: var Rng;
-             budget: var int) =
+             budget: var int; spares: var seq[SpareMag]) =
   ## The mod tree under one piece of equipment, resolved breadth-first.
   ##
   ## An explicit stack rather than recursion, and a depth *and* a count bound on
@@ -448,6 +498,12 @@ proc addMods(t: BotTables; inv, chances: JsonRef; items: var List;
     return
   let group = if weapon: "weaponMods" else: "equipmentMods"
   let caliber = if weapon: weaponCaliber(rootTpl) else: ""
+
+  # A round in the chamber, once, before the mod tree is walked. Costs no mod
+  # budget -- it is not a mod, it is the weapon being loaded -- and is skipped
+  # for a knife (empty caliber) by `chamberRounds` itself.
+  if weapon and caliber.len > 0:
+    chamberRounds(inv, items, rootId, rootTpl, caliber, r)
 
   var ids: seq[string] = @[]
   var tpls: seq[string] = @[]
@@ -506,6 +562,10 @@ proc addMods(t: BotTables; inv, chances: JsonRef; items: var List;
       if toLowerAscii(slotName) == "mod_magazine":
         fillMagazine(inv, items, modId, tpl, caliber, r)
         dec budget
+        # Remember the model so a spare of it can go in the rig. Same tpl, so it
+        # is guaranteed to fit the weapon; same caliber, so it can be loaded.
+        if caliber.len > 0:
+          spares.add SpareMag(tpl: tpl, caliber: caliber)
       ids.add modId
       tpls.add tpl
       depths.add depth + 1
@@ -684,6 +744,41 @@ proc addContainerLoot(inv, generation: JsonRef; items: var List;
     inc placed
     dec budget
 
+proc addSpareMags(inv: JsonRef; items: var List; carried: var seq[Container];
+                  spares: seq[SpareMag]; r: var Rng) =
+  ## Spare, loaded magazines in a carried container -- the reason a bot with a
+  ## rifle is still in the fight after the first reload rather than swinging it
+  ## like a club. Each is the same model the weapon was given, so it fits, and is
+  ## filled through `fillMagazine`, so it carries the correct caliber. Bounded by
+  ## `MaxSpareMags`; a spare that finds no room in any grid is dropped rather
+  ## than written to a cell that overlaps something.
+  if carried.len == 0:
+    return
+  var placed = 0
+  for m in spares:
+    if placed >= MaxSpareMags:
+      break
+    if m.tpl.len == 0:
+      continue
+    var n = 0
+    while n < SparesPerWeapon and placed < MaxSpareMags:
+      inc n
+      var gridName = ""
+      var location = ""
+      var idx = -1
+      for i in 0 ..< carried.len:
+        if placeIn(carried[i], m.tpl, gridName, location):
+          idx = i
+          break
+      if idx < 0:
+        break
+      let magId = newId()
+      var d = botItem(magId, m.tpl, carried[idx].id, gridName)
+      setRaw(d, "location", location)
+      items.add d
+      fillMagazine(inv, items, magId, m.tpl, m.caliber, r)
+      inc placed
+
 proc addLoadout(t: BotTables; items: var List; equipmentId: string;
                 r: var Rng) =
   ## Everything the bot is wearing and carrying, slot by slot.
@@ -698,6 +793,9 @@ proc addLoadout(t: BotTables; items: var List; equipmentId: string;
     return
   var weaponBudget = MaxWeaponModsPerBot
   var gearBudget = MaxGearModsPerBot
+  # The magazine models the weapons took, so spares of them can be added to the
+  # rig once the rig is known to exist.
+  var spares: seq[SpareMag] = @[]
   let slots = equipmentSlots()
   # The containers that got filled, remembered as they are placed: loot goes in
   # after every slot is decided, because a bot's rig has to *exist* before there
@@ -728,9 +826,9 @@ proc addLoadout(t: BotTables; items: var List; equipmentId: string;
     if slot == "TacticalVest" or slot == "Pockets" or slot == "Backpack":
       carried.add openContainer(itemId, slot, tpl)
     if isWeaponSlot(slot):
-      addMods(t, inv, chances, items, itemId, tpl, true, r, weaponBudget)
+      addMods(t, inv, chances, items, itemId, tpl, true, r, weaponBudget, spares)
     else:
-      addMods(t, inv, chances, items, itemId, tpl, false, r, gearBudget)
+      addMods(t, inv, chances, items, itemId, tpl, false, r, gearBudget, spares)
 
   # Pockets is the one slot that is not allowed to come out empty.
   #
@@ -746,6 +844,11 @@ proc addLoadout(t: BotTables; items: var List; equipmentId: string;
     let pocketsId = newId()
     items.add botItem(pocketsId, PocketsTpl, equipmentId, "Pockets")
     carried.add openContainer(pocketsId, "Pockets", PocketsTpl)
+
+  # Spare magazines go in before loose loot does, so a full `vestLoot` table
+  # cannot leave a rifleman with no reload -- the ammo is what makes the bot a
+  # threat, and the trinkets can have whatever room is left.
+  addSpareMags(inv, items, carried, spares, r)
 
   # And what is in them. A separate budget from the mod tree's: a bot with a
   # heavily modded rifle should still have something in its pockets, and one
