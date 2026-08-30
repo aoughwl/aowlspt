@@ -1099,6 +1099,24 @@ const
     ## shape matched, and the bytes below are a stack frame, not a jump).
   ProCamInstance = "48 83 EC 28 80 3D E6 8B E5 05 00 75 18 48 8D 0D"
 
+  RvaCameraGetMain = 0x5260400
+    ## UnityEngine.Camera::get_main() -> Camera. rid=517, arity 0, STATIC,
+    ## section `il2cpp`, sharedness=UNIQUE (owners=1), NOT the empty-body stub.
+    ##
+    ## This is the SAME acquisition the ESP overlay uses every frame in a live
+    ## raid (host/Aowlspt.Host.Il2Cpp/debugui.nim resolves
+    ## "UnityEngine.Camera::get_main" through its C target table and calls it as
+    ## `cDuCallPV`). Added because CameraManager.Instance.<Camera>@0x70 reads
+    ## NULL in-raid on this build -- MEASURED live: "CameraManager is live but
+    ## its Camera backing field @0x70 is null". get_main returns the tagged main
+    ## camera directly and does not depend on that offset, so the base-FOV
+    ## capture and get_fieldOfView read from a camera that is actually there.
+    ##
+    ## Bytes below via `il2cpp_resolve.py ... bytes 0x5260400 16`; the prologue
+    ## is `sub rsp,0x28; mov rax,[rip+0x1E727D5]; test rax,rax; jne ...` -- the
+    ## cached-main-camera fast path, a real body, not a thunk.
+  ProCameraGetMain = "48 83 EC 28 48 8B 05 D5 27 E7 01 48 85 C0 75 18"
+
   RvaSetFov3 = 0x1268d20
     ## EFT.CameraControl.CameraManager::SetFov(float x, float time,
     ## bool applyFovOnCamera). rid=81746, arity 3, INSTANCE, real body.
@@ -1840,6 +1858,7 @@ proc noKinds(): seq[FastKind] =
 # silently left zeroed, and a zeroed `Binding` has `ok = false`, so it fails
 # safe but never becomes true. See fast.nim's rule 1.
 var bCamInstance: Binding      ## CameraManager::get_Instance, static RVA
+var bCamMain: Binding          ## UnityEngine.Camera::get_main, static RVA (ESP's proven path)
 var bSetFov: Binding           ## CameraManager::SetFov(f,f,b), static RVA
 var bGetKey: Binding           ## Input::GetKey(KeyCode), static RVA
 var bGetKeyDown: Binding       ## Input::GetKeyDown(KeyCode), static RVA
@@ -1997,6 +2016,20 @@ proc bindFovStatics(): bool =
     warn "FOV: " & gFovState
     return false
   info "FOV: " & bCamInstance.why
+
+  # Camera::get_main -- the SAME acquisition the ESP overlay uses live every
+  # frame. NON-FATAL: if it refuses, applyFov falls back to the
+  # CameraManager.Instance.<Camera>@0x70 field read. It is preferred there
+  # because @0x70 was MEASURED null in-raid on this build while get_main
+  # returns the tagged main camera the ESP successfully reads.
+  bc "S1b about to prologue-verify Camera::get_main"
+  bCamMain = bindAtRva("UnityEngine.Camera::get_main", RvaCameraGetMain,
+                       ProCameraGetMain, noKinds(), fkPtr, true)
+  if bCamMain.ok:
+    info "FOV: " & bCamMain.why
+  else:
+    warn "FOV: Camera::get_main refused (" & bCamMain.why & ") -- will fall " &
+         "back to CameraManager.Instance.Camera@0x70 for the camera"
 
   # `SetFov` is the one place upstream's call shape has to be confirmed rather
   # than remembered. Two overloads are accepted, and only if the runtime says
@@ -2229,8 +2262,10 @@ proc noCamera(why: string) =
      gCamBrokenFrames == 2_500'i64 or gCamBrokenFrames == 25_000'i64:
     gCamBrokenSaid = gCamBrokenSaid + 1'i64
     warn "FOV: " & gFovState & " -- this is a BUG in the mod's camera " &
-         "acquisition, not patience. CameraManager::get_Instance is " &
-         "byte-verified at 0x" & hexs(RvaCamInstance) & "."
+         "acquisition, not patience. Camera::get_main (0x" &
+         hexs(RvaCameraGetMain) & ", the ESP's proven path) and " &
+         "CameraManager::get_Instance (0x" & hexs(RvaCamInstance) &
+         ") are both byte-verified."
 
 proc camIsLive() =
   gCamAcq = ccLive
@@ -2293,21 +2328,37 @@ proc applyFov() =
     if firstPass: bc "B2x get_Instance returned NULL -- returning"
     noCamera("CameraManager::get_Instance returned NULL")
     return
-  if not fovReadable(cm, OffCamManagerCamera + 8):
-    if firstPass: bc "B2y CameraManager not readable to +0x78 -- returning"
-    noCamera("CameraManager is non-null but not readable to +0x78")
-    return
-  # `get_Camera` is not called: it resolves to 0x65ED10, which is literally
-  # `mov rax,[rcx+0x70]; ret` and is a FOLDED body shared with every other
-  # `+0x70` reference getter in the build. The field read is the same answer
-  # with one fewer call and no shared-RVA exposure. Offset from
-  # `tools/fldoff.py`: CameraManager.<Camera>k__BackingField @0x70.
-  let cam = guardedField(cm, OffCamManagerCamera, "CameraManager.Camera")
+  # THE CAMERA TO READ FROM. cm (the CameraManager) is kept for SetFov below,
+  # but the camera whose field of view we CAPTURE is acquired the way the ESP
+  # overlay proves works every frame in a live raid: UnityEngine.Camera::get_main
+  # (debugui.nim / DuCameraMain). CameraManager.Instance.<Camera>@0x70 was
+  # MEASURED null in-raid on this build, so it is only a fallback now, not the
+  # primary path -- and a null camera is treated as "not ready yet", the same
+  # decaying INCONCLUSIVE report as before, never a claim that the offset works.
+  var cam: Il2CppPtr = nil
+  if bCamMain.ok:
+    if firstPass: bc "B2m about to CALL Camera::get_main @0x5260400"
+    a.reset()
+    let m = callPtr(bCamMain, nullPtr(), a)
+    if firstPass: bc "B2n get_main returned without faulting"
+    if m != nil and fovReadable(m, 0x20):
+      cam = m
+      if firstPass: bc "B3 camera in hand (Camera::get_main)"
   if cam == nil:
-    if firstPass: bc "B3x CameraManager.Camera is null -- returning"
-    noCamera("CameraManager is live but its Camera backing field @0x70 is null")
+    # Fallback: the old field read. `get_Camera` folds to 0x65ED10
+    # (`mov rax,[rcx+0x70]; ret`), so reading the field is the same answer with
+    # no shared-RVA exposure -- but on this build it reads null in a raid, which
+    # is why get_main is tried first.
+    if fovReadable(cm, OffCamManagerCamera + 8):
+      let c2 = guardedField(cm, OffCamManagerCamera, "CameraManager.Camera")
+      if c2 != nil:
+        cam = c2
+        if firstPass: bc "B3 camera in hand (CameraManager.Camera@0x70 fallback)"
+  if cam == nil:
+    if firstPass: bc "B3x no camera from get_main or @0x70 -- returning"
+    noCamera("no usable camera: Camera::get_main returned null/unreadable and " &
+             "CameraManager.Camera@0x70 is null (both tried)")
     return
-  if firstPass: bc "B3 camera in hand"
   camIsLive()
 
   # ---- 2. THE PLAYER, OPTIONALLY. Only the AIM multipliers need it.
