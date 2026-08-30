@@ -24,6 +24,31 @@ feature and adding its fingerprint are one edit in one place.
 
 `--install PATH` overrides the destination from `deploy.json`.
 
+IS MY CHANGE ACTUALLY IN THIS BUILD?
+------------------------------------
+Markers answer "is this a valid build of that target"; they were written
+before your edit existed and cannot answer "did tonight's edit land". And
+`aowl build-mod` prints `ok mod X` with NO verification at all. So `check`
+takes ad-hoc literals, repeatable, ADDITIVE to the markers:
+
+    python tools/deploy.py check --artifact PATH --only host \
+        --contains "launchHint WRITTEN to aowl.uihub" \
+        --contains "/aowlspt/settings/aowl.uihub"
+    python tools/deploy.py check --artifact PATH --only settingshub \
+        --absent "Settings Panel"          # prove a REMOVAL
+    ... --encoding utf8|utf16|any          # default any
+
+A literal is searched in the RAW BYTES as UTF-8 *and* UTF-16LE, and the
+report says which matched -- a string that only exists in the UTF-16 table
+must never read as absent. Do NOT hand-roll this in PowerShell:
+`[Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes(p)).Contains(s)`
+gives SELECTIVE false negatives (facts #151/#152).
+
+`--contains` is a CLI argument on purpose: `tools/deploy.json`'s marker list
+must never be edited to make a check pass, and a passing literal can only
+add to the verdict, never rescue a missing marker. An unreadable artifact is
+INCONCLUSIVE, not a pass and not a content failure.
+
 Three outcomes, never two (CLAUDE.md 9b). An artifact whose own INPUT is
 absent was not verified -- it did not fail. `.cache/global-metadata.dec.dat`
 is gitignored, so in a fresh worktree `aowl build host` cannot emit the name
@@ -581,6 +606,82 @@ def verify(art, src, C):
     return (OK if not problems else FAIL), problems
 
 
+def _encodings(mode):
+    """(label, bytes-encoder) pairs to search for, in order."""
+    utf8 = ("utf8", lambda s: s.encode("utf-8"))
+    utf16 = ("utf16le", lambda s: s.encode("utf-16-le"))
+    if mode == "utf8":
+        return [utf8]
+    if mode == "utf16":
+        return [utf16]
+    return [utf8, utf16]
+
+
+def verify_literals(src, contains, absent, mode, C):
+    """Assert raw-byte presence/absence of ad-hoc literals in ONE file.
+
+    Additive to the marker check, never a substitute for it: markers say "this
+    is a valid build of that target", a literal says "tonight's edit is in
+    THIS file". `aowl build-mod` prints `ok mod X` without verifying anything,
+    so a successful build is not evidence your edit landed.
+
+    Raw bytes, like the marker scan -- deliberately NOT the PowerShell idiom
+    `[Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes(p)).Contains(s)`,
+    which returns SELECTIVE false negatives (facts #151/#152: False for four
+    markers `grep -c` finds in the same bytes, True for a fifth in the same
+    loop).
+
+    A literal may be embedded UTF-8 or UTF-16LE (Nim/C# string tables differ
+    within one artifact), so by default BOTH are searched and the matching
+    encoding is reported. A literal present only as UTF-16 must never read as
+    absent.
+
+    Returns (verdict, lines). An unreadable file is INCONCLUSIVE: nothing was
+    searched, which is neither a pass nor a content failure (CLAUDE.md 9b).
+    """
+    red, green, yellow, dim, reset = C
+    encs = _encodings(mode)
+    searched = "/".join(lbl for lbl, _ in encs)
+    if not os.path.isfile(src):
+        return INCONCLUSIVE, ["--contains/--absent: no such file: %s" % src,
+                              "nothing was searched -- this is NOT evidence "
+                              "the literal is absent."]
+    try:
+        with open(src, "rb") as f:
+            blob = f.read()
+    except OSError as e:
+        return INCONCLUSIVE, ["--contains/--absent: could not read %s: %s"
+                              % (src, e),
+                              "nothing was searched -- this is NOT evidence "
+                              "the literal is absent."]
+    size = len(blob)
+    lines = []
+    bad = 0
+    for lit in contains:
+        hits = [lbl for lbl, enc in encs if blob.find(enc(lit)) >= 0]
+        if hits:
+            lines.append("%scontains%s PASS  %r  as %s"
+                         % (green, reset, lit, "+".join(hits)))
+        else:
+            bad += 1
+            lines.append("%scontains%s FAIL  %r  NOT in the raw bytes"
+                         % (red, reset, lit))
+            lines.append("    searched encodings: %s" % searched)
+            lines.append("    artifact: %s (%d bytes)" % (src, size))
+    for lit in absent:
+        hits = [lbl for lbl, enc in encs if blob.find(enc(lit)) >= 0]
+        if not hits:
+            lines.append("%sabsent%s   PASS  %r  in neither %s"
+                         % (green, reset, lit, searched))
+        else:
+            bad += 1
+            lines.append("%sabsent%s   FAIL  %r  IS STILL PRESENT as %s"
+                         % (red, reset, lit, "+".join(hits)))
+            lines.append("    searched encodings: %s" % searched)
+            lines.append("    artifact: %s (%d bytes)" % (src, size))
+    return (FAIL if bad else OK), lines
+
+
 def cmd_check(args, cfg, C, check_data=True):
     """`check_data=False` verifies markers only.
 
@@ -623,12 +724,30 @@ def cmd_check(args, cfg, C, check_data=True):
         print("%s--artifact%s verifying %s against marker set %r "
               "(install-side data check NOT performed)"
               % (dim, reset, override, arts[0]["name"]))
+    contains = list(getattr(args, "contains", None) or [])
+    absent = list(getattr(args, "absent", None) or [])
+    encmode = getattr(args, "encoding", "any") or "any"
     bad = 0
     unknown = 0
     for art in arts:
         src = (override if override
                else os.path.join(REPO, art["src"].replace("/", os.sep)))
         verdict, problems = verify(art, src, C)
+        if contains or absent:
+            # ADDITIVE. The literal scan can only make the verdict worse; a
+            # passing --contains never masks a missing marker.
+            lverdict, llines = verify_literals(src, contains, absent,
+                                               encmode, C)
+            for ln in llines:
+                print("     %s" % ln)
+            if lverdict == FAIL:
+                verdict = FAIL
+                problems = list(problems) + [
+                    "%d literal check(s) FAILED (see the contains/absent lines "
+                    "above)." % sum(1 for l in llines if "FAIL" in l)]
+            elif lverdict == INCONCLUSIVE and verdict == OK:
+                verdict = INCONCLUSIVE
+                problems = list(problems) + llines
         if verdict == OK and check_data:
             dverdict, dproblems = verify_data(art, install, C)
             if dverdict != OK:
@@ -1112,6 +1231,22 @@ def main():
                         "staging dir, or a downloaded binary). `check` only. "
                         "Skips the install-side data check, which does not "
                         "apply to a file that has not been deployed.")
+    p.add_argument("--contains", action="append", default=None,
+                   metavar="LITERAL",
+                   help="`check` only, repeatable: additionally assert the "
+                        "artifact's RAW BYTES contain this literal. Searched "
+                        "as UTF-8 and UTF-16LE by default; the matching "
+                        "encoding is reported. ADDITIVE to the marker check, "
+                        "never a substitute for it.")
+    p.add_argument("--absent", action="append", default=None,
+                   metavar="LITERAL",
+                   help="`check` only, repeatable: assert the literal is NOT "
+                        "in the artifact's raw bytes (proving a removal). "
+                        "Same encoding rules as --contains.")
+    p.add_argument("--encoding", default="any",
+                   choices=["utf8", "utf16", "any"],
+                   help="which encoding(s) --contains/--absent search "
+                        "(default: any = UTF-8 and UTF-16LE)")
     p.add_argument("--repo", default=None, metavar="PATH",
                    help="`status` only: the checkout whose build outputs the "
                         "live files are compared against (default: this one)")
@@ -1127,6 +1262,8 @@ def main():
 
     C = _color(not args.no_color and sys.stdout.isatty())
     cfg = load_config()
+    if (args.contains or args.absent) and args.command != "check":
+        sys.exit("--contains/--absent are only meaningful with `check`.")
     if args.artifact and args.command != "check":
         sys.exit("--artifact is only meaningful with `check`: it verifies a "
                  "file in place and never copies anything.")
