@@ -229,7 +229,10 @@ def menu_ready():
 
 def main():
     log("map = %s" % MAP)
-    clear_mode_selector()
+    # NOTE: no mode-selector step. uxSkipModeScreen (host flag, default ON here)
+    # auto-skips the PvE/PvP character-selection screen on launch, so the client
+    # boots straight to the main menu. Running entergame.py here just polled for a
+    # screen that no longer appears -- pure wasted time. Go straight to the menu.
     log("waiting for menu (fast poll for a visible PlayButton under MenuScreen)...")
     if not ui.wait_until(menu_ready, timeout=180.0, poll=1.0):
         log("FAIL: menu never became ready"); return 2
