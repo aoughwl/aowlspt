@@ -1275,9 +1275,28 @@ proc generateOne*(t: BotTables; req: BotRequest; index: int): string =
 
 proc generate*(body: string; generated: var int): string =
   ## The whole batch, as the array the client expects.
+  ##
+  ## Offline PMCs are NOT produced here. Server-side conversion of a fraction of
+  ## an `assault` batch into `pmcUSEC`/`pmcBEAR` profiles was tried and PROVEN
+  ## inert live (2026-08-30): the client sets a spawned bot's `Side` from the
+  ## ROLE it requested for the wave, not from the `Info.Side` of the profile it
+  ## is handed, so a converted PMC in an `assault` batch still spawns Savage.
+  ## PMCs are produced instead by emitting real `pmcUSEC`/`pmcBEAR` waves that
+  ## can place -- see `emu/raid.offlineScavWaves` and the `BotPmc` spawn-point
+  ## sides in `post1/locations.json`. This proc simply honours whatever role the
+  ## client asks for.
   generated = 0
   var out1 = arr()
   let requests = parseRequests(body)
+  # Diagnostic: make the requested role/limit/difficulty visible. The backend
+  # logs only "REQ POST /client/game/bot/generate" with no body, so before this
+  # there was no way to see what role the client actually asked for -- exactly
+  # the gap that made the offline-PMC problem hard to see. This is how the wave
+  # approach is confirmed: a `Role=pmcUSEC` line here proves the client acted on
+  # a placeable PMC wave.
+  for req in requests:
+    info "bot/generate request: Role=" & req.role & " Limit=" & $req.count &
+         " Difficulty=" & req.difficulty
   # Once for the batch, not once per bot: the same reason the role's tables are
   # read once. It is cached either way, and a cache hit still copies 2 KB.
   let base = botBase()

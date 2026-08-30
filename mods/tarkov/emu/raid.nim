@@ -613,6 +613,54 @@ proc botZonesFor(spawnPointParams: JsonRef): seq[string] =
     if not seen:
       result.add zn
 
+proc botPmcZonesFor(spawnPointParams: JsonRef): seq[string] =
+  ## The zones a PMC bot can actually spawn in on this map: the distinct
+  ## `BotZoneName` of every `SpawnPointParams` point in the `BotPmc` category
+  ## that admits a `Usec` or `Bear` side.
+  ##
+  ## This is the other half of the offline-PMC fix, and it exists because
+  ## conversion does not work. A converted PMC profile handed back in an
+  ## `assault` batch spawns Savage anyway -- the client sets a bot's side from
+  ## the ROLE it requested for the wave, not from the profile's `Info.Side`
+  ## (measured live 2026-08-30). So a PMC only appears if the client actually
+  ## REQUESTS `pmcUSEC`/`pmcBEAR`, which it does only for a wave it can PLACE,
+  ## which needs a spawn point that admits the wave's PMC side. Stock maps tag
+  ## every `BotPmc` point `Sides:["Savage"]`; `post1/locations.json` is patched
+  ## to add `Usec`/`Bear` to all 291 of them, and these are the zones those
+  ## points live in -- the only zones a `pmcUSEC`/`pmcBEAR` wave can target.
+  result = @[]
+  let spp = spawnPointParams
+  if not spp.isArray:
+    return
+  let n = count(spp)
+  var i = 0
+  while i < n:
+    let p = spp.at(i)
+    inc i
+    let cats = p.field("Categories")
+    var isBotPmc = false
+    if cats.isArray:
+      var c = 0
+      while c < count(cats):
+        if cats.at(c).asText("") == "BotPmc": isBotPmc = true
+        inc c
+    if not isBotPmc: continue
+    let sides = p.field("Sides")
+    var isPmcSide = false
+    if sides.isArray:
+      var s = 0
+      while s < count(sides):
+        let sv = sides.at(s).asText("")
+        if sv == "Usec" or sv == "Bear" or sv == "All": isPmcSide = true
+        inc s
+    if not isPmcSide: continue
+    let zn = p.field("BotZoneName").asText("")
+    var seen = false
+    for z in result:
+      if z == zn: seen = true
+    if not seen:
+      result.add zn
+
 proc oneWave(number, tmin, tmax, smin, smax: int; zone: string;
              wildType = "assault"; botSide = "Savage"): JsonObject =
   ## One wave in BSG's own `waves[]` shape (capture seq 158). Every member the
@@ -651,7 +699,7 @@ proc oneWave(number, tmin, tmax, smin, smax: int; zone: string;
   put(w, "time_min", tmin)
   result = w
 
-proc offlineScavWaves(zones: seq[string]): string =
+proc offlineScavWaves(zones: seq[string]; pmcZones: seq[string] = @[]): string =
   ## Fresh assault waves that fill the map with scavs early and reliably,
   ## replacing BSG's online-tuned table.
   ##
@@ -764,24 +812,44 @@ proc offlineScavWaves(zones: seq[string]): string =
     a.add oneWave(number, -1, -1, perWave, perWave * 2,
                   useZones[number mod useZones.len])
     inc number
-  # The PMCs. This is the whole of fix (1): a stock offline raid served only
-  # `assault`/`Savage` waves, so the client never asked `bot/generate` for a PMC
-  # and a raid spawned ~40 scavs, the bosses, and zero PMCs. These waves name
-  # `pmcUSEC`/`pmcBEAR` (WildSpawnType 52/51) on the `Usec`/`Bear` side; the
-  # client parses both against its own enums, requests those roles, and
-  # `emu/bots` fills them from `bots.types.pmcusec`/`pmcbear` -- the full PMC
-  # loadout tables -- with `Info.Side` set by `botSideForRole`. Negative time so
-  # they seed synchronously alongside the scavs. Spread across the same zones the
-  # scav seeds use, so a PMC has an open zone to place into. Two of each side.
-  var pmc = 0
-  while pmc < 2:
-    a.add oneWave(number, -1, -1, pmcWave, pmcWave * 2,
-                  useZones[number mod useZones.len], "pmcUSEC", "Usec")
-    inc number
-    a.add oneWave(number, -1, -1, pmcWave, pmcWave * 2,
-                  useZones[number mod useZones.len], "pmcBEAR", "Bear")
-    inc number
-    inc pmc
+  # The PMCs. A stock offline raid served only `assault`/`Savage` waves, so it
+  # spawned ~40 scavs, the bosses, and zero PMCs. The earlier attempt here --
+  # dedicated `pmcUSEC`/`pmcBEAR` waves on the `Usec`/`Bear` side -- CANNOT work,
+  # and this is measured, not reasoned: every bot-category `SpawnPointParams` on
+  # every stock map (Woods: 86 `Bot`, 32 `BotPmc`, 68 `Boss`) is tagged
+  # `Sides:["Savage"]`, so a `Usec`/`Bear`-sided wave finds no spawn point and
+  # places nothing; and a `pmcUSEC` wave re-sided to `Savage` places an assault
+  # SCAV, because the client keys the requested role off the wave `BotSide` and
+  # ignores `WildSpawnType` (fact #259). Neither wave puts a PMC on the map.
+  #
+  # Server-side conversion was tried and PROVEN inert live (2026-08-30): a
+  # converted PMC profile returned in an `assault` batch still spawns Savage,
+  # because the client sets a bot's side from the ROLE it requested for the
+  # wave, not from the profile's `Info.Side`. So the PMC has to come from a wave
+  # the client will actually REQUEST `pmcUSEC`/`pmcBEAR` for -- one it can PLACE.
+  #
+  # A wave places only where a `SpawnPointParams` admits its `BotSide`. Stock
+  # maps tag every `BotPmc` point `Sides:["Savage"]`, so a `Usec`/`Bear` wave
+  # found no point and placed nothing; `post1/locations.json` is patched to add
+  # `Usec`/`Bear` to all 291 `BotPmc` points, and `pmcZones` are the zones those
+  # points occupy. These waves name `pmcUSEC`/`pmcBEAR` (WildSpawnType 52/51) on
+  # the `Usec`/`Bear` side and target only those zones; negative time so they
+  # seed synchronously with the scavs. Two of each side, span 2 -> ~8 PMCs.
+  #
+  # If a map exposes no PMC zone (none patched, or an odd base), emit nothing
+  # rather than aim a PMC wave at a Savage-only zone -- that only ever produced
+  # the assault-scav-in-a-PMC-wave failure this replaces.
+  var pmcUse = pmcZones
+  if pmcUse.len > 0:
+    var pmc = 0
+    while pmc < 2:
+      a.add oneWave(number, -1, -1, pmcWave, pmcWave * 2,
+                    pmcUse[number mod pmcUse.len], "pmcUSEC", "Usec")
+      inc number
+      a.add oneWave(number, -1, -1, pmcWave, pmcWave * 2,
+                    pmcUse[number mod pmcUse.len], "pmcBEAR", "Bear")
+      inc number
+      inc pmc
   # The trickle. Non-negative, so these take `Run(2)`'s timer arm: a bonus if
   # that arm works offline and harmless if it does not. Staggered from 20 s so
   # a swept map does not go quiet after the seed.
@@ -830,7 +898,8 @@ proc tuneOfflineSpawns*(d: var Doc) =
   ## scavs roam. The boss path, the PMC `BossLocationSpawn` entries and the loot
   ## are untouched here.
   let zones = botZonesFor(whole(getRaw(d, "SpawnPointParams")))
-  setRaw(d, "waves", offlineScavWaves(zones))
+  let pmcZones = botPmcZonesFor(whole(getRaw(d, "SpawnPointParams")))
+  setRaw(d, "waves", offlineScavWaves(zones, pmcZones))
   setNumber(d, "BotStart", 0)
   setNumber(d, "BotStop", 86400)
   # Budgets. These are the two throttles that can silently eat the waves above:
@@ -853,13 +922,31 @@ proc tuneOfflineSpawns*(d: var Doc) =
   if get(d, "MaxBotPerZone").asInt(0) < perZone:
     setNumber(d, "MaxBotPerZone", perZone)
   # `OpenZones` must name the zones the waves point at, or the wave has no open
-  # zone to spawn into. Built from the same real bot zones; left as the base's
-  # own when every bot point is unzoned (`""`, e.g. Ground Zero).
+  # zone to spawn into. Built from the real bot zones AND the PMC zones the PMC
+  # waves target -- a `BotPmc` zone is usually also a Savage bot zone, but the
+  # union is taken so a PMC wave never aims at a zone missing from `OpenZones`.
+  # Left as the base's own when every bot point is unzoned (`""`, e.g. Ground
+  # Zero).
   var openZones = ""
+  var openSeen: seq[string] = @[]
   for z in zones:
     if z.len > 0:
-      if openZones.len > 0: openZones.add ","
-      openZones.add z
+      var have = false
+      for s in openSeen:
+        if s == z: have = true
+      if not have:
+        openSeen.add z
+        if openZones.len > 0: openZones.add ","
+        openZones.add z
+  for z in pmcZones:
+    if z.len > 0:
+      var have = false
+      for s in openSeen:
+        if s == z: have = true
+      if not have:
+        openSeen.add z
+        if openZones.len > 0: openZones.add ","
+        openZones.add z
   if openZones.len > 0: setText(d, "OpenZones", openZones)
   # Spawn-lock. `BotLocationModifier` runs the client's anti-spawn-in-sight
   # system: every bot spawn point within `LockSpawnCheckRadius` (120 m on
