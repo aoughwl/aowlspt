@@ -816,10 +816,10 @@ proc onLoad(): Status =
   # toggle is a real row on a real settings page the player can reach.
   declareSettings(@[
     boolSetting("launchHint", "Show the \"Press F12\" hint at launch", true,
-                category = "Overlay/Launch",
+                category = "",
                 description = "aowlspt original (settings UI). A small notice in the top-right corner, once per launch, that fades after a few seconds"),
     boolSetting("launchHintFallbackPage", "Advertise the browser settings page",
-                false, category = "Overlay/Launch", implemented = false,
+                false, category = "", implemented = false,
                 description = "aowlspt original (settings UI). Not wired yet: the toast names the in-game screen only")],
     # NO NAV ENTRY OF ITS OWN. This mod is infrastructure -- one HTML fallback
     # page -- and a player asked, fairly, why "Browser Settings Page" was a
