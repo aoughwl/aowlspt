@@ -115,6 +115,13 @@ const
   # ---- what we replace them with. Factual; no persistence claim. ----
   SplHeadNew      = "SINGLEPLAYER"
   SplDescNew      = "aowlspt - a local single-player raid against the emulated server."
+  # Pre-lowered forms of the two above. The steady-state check now runs EVERY
+  # frame (see `SplSteadyFrames`), so lowering a compile-time constant on every
+  # frame would be two pointless heap allocations per frame; these are the same
+  # strings, written lowercase by hand. If SplHeadNew/SplDescNew change, change
+  # these with them.
+  SplHeadNewLow   = "singleplayer"
+  SplDescNewLow   = "aowlspt - a local single-player raid against the emulated server."
   # ---- the practice toggle, forced ON before it is hidden ----
   # `aowl_sw_targets[AOWL_SW_TOGGLE_SET_ISON]` = UnityEngine.UI.Toggle::set_isOn
   # @0x55BA430, byte-verified (16-byte prologue vs the startup snapshot) inside
@@ -133,8 +140,25 @@ const
 # ---- bounds ----
 const
   SplWarmupMs     = 5000'u64   ## the menu is not up before this; do not walk.
-  SplHuntFrames   = 60         ## ~1 s at 60 fps while hunting/maintaining.
-  SplSteadyFrames = 180        ## ~3 s once confirmed done -- just guards clobber.
+  SplHuntFrames   = 60         ## ~1 s at 60 fps while NOTHING is cached (the
+                               ## `iSceneRoots` enumeration allocates; it may not
+                               ## run per frame).
+  SplRescanFrames = 6          ## ~100 ms once the SCREEN transform is cached but
+                               ## its TMPs are not: a depth-12 scan bounded by
+                               ## SplWalkMs, no root enumeration.
+  SplSteadyFrames = 1          ## EVERY FRAME once the targets are cached.
+                               ## THIS IS THE FLASH FIX. It was 180 (~3 s), and
+                               ## that is exactly the window in which the player
+                               ## saw BSG's "PRACTICE GAME MODE" after the screen
+                               ## was (re)opened and LocalizedText re-applied the
+                               ## stock caption. Mirrors `hide seasons`
+                               ## (modstab.nim ~3439): the expensive walk stays
+                               ## throttled, the cheap re-assert from the CACHED
+                               ## object runs every frame. Cost per frame in this
+                               ## state: three ICALLs (activeInHierarchy) and two
+                               ## raw m_text reads -- no scene walk, no managed
+                               ## allocation, no set_isOn (the checkbox is
+                               ## already hidden, so that branch is skipped).
   SplWalkMs       = 18'u64     ## per-pass wall-clock slice, checked INSIDE the walk.
   SplNodeBudget   = 24000      ## per-ROOT node cap (reset per root), threaded through the
                                ## recursion. The offline-raid screen sits deep in the large
@@ -178,6 +202,32 @@ var gSplFrames = 0
 var gSplDiagPasses = 0             ## hunt passes since the last diag line (rate limiter)
 var gSplLastWhy = ""              ## the last discovery-failure reason we logged
 var gSplLastNodes = 0             ## nodes visited on the last screen descent
+
+var gSplScreen: Il2CppPtr = nil    ## the cached "Matchmaker Offline Raid Screen"
+                                   ## transform. Cached SEPARATELY from the TMPs
+                                   ## so that a rebuild which kills the captions
+                                   ## but keeps the screen can be re-scanned from
+                                   ## here, without the allocating `iSceneRoots`
+                                   ## enumeration. Always liveness-checked before
+                                   ## use: a destroyed UnityEngine.Object stays
+                                   ## READABLE with m_CachedPtr zeroed (fact
+                                   ## #182), so `duOk` alone is not enough and
+                                   ## `iUnityAlive` is always asked too.
+
+# ---- the falsifiable flash measurement (CLAUDE.md 9b) ----
+# Frames between OBSERVING the stock BSG caption on the live TMP and reading OUR
+# caption back off that same TMP. This asserts the FINISHED STATE of the screen,
+# not that a setter ran, and it is falsifiable: if the re-assert is slow the
+# number is large and the verdict says FAIL.
+var gSplRescanMisses = 0           ## consecutive fruitless re-scans from the
+                                   ## CACHED screen; capped so the cache can
+                                   ## never permanently suppress the full walk.
+const SplMaxRescanMiss = 20
+
+var gSplStockSeen = false          ## the live heading currently reads stock
+var gSplFlashFrames = 0            ## frames counted since gSplStockSeen went true
+var gSplEpisodes = 0               ## how many stock->ours transitions we measured
+const SplFlashLogMax = 8           ## log at most this many episodes (no spam)
 
 var gSplResolved = false           ## heading TMP found; cache below is trusted
 var gSplHeadTmp: Il2CppPtr = nil   ## the "PRACTICE GAME MODE" TMP
@@ -630,12 +680,30 @@ proc splMaintain() =
   var descState = 2   # 0 FAIL, 1 PASS, 2 INCONCLUSIVE (not found / not wanted)
   if gSplOn:
     let headLow = iLower(splTmpText(gSplHeadTmp))
-    if iContains(headLow, iLower(SplHeadNew)):
+    if iContains(headLow, SplHeadNewLow):
       headOk = true
+      # ---- the flash window CLOSED. Report it, and judge it. ----
+      if gSplStockSeen:
+        gSplStockSeen = false
+        inc gSplEpisodes
+        if gSplEpisodes <= SplFlashLogMax:
+          let verdict = (if gSplFlashFrames <= 2: "PASS"
+                         elif gSplFlashFrames >= 6: "FAIL"
+                         else: "INCONCLUSIVE")
+          okLog "singleplayer rebrand: frames-to-apply=" & $gSplFlashFrames &
+                " verdict " & verdict & " (episode " & $gSplEpisodes &
+                "). Frames between the live heading TMP reading BSG's stock " &
+                "caption and that SAME TMP reading ours back. PASS <=2 (no " &
+                "visible flash), FAIL >=6 (the player sees vanilla text), " &
+                "INCONCLUSIVE between. This reads the finished state of the " &
+                "rendered tree, not that a setter was called."
     else:
+      if not gSplStockSeen:
+        gSplStockSeen = true          # the window OPENS here; the drain tick counts
+        gSplFlashFrames = 0
       discard splSetText(gSplHeadTmp, gSplHeadLoc, SplHeadNew)
     if gSplDescTmp != nil and duOk(gSplDescTmp, 0xE8'i32) and iUnityAlive(gSplDescTmp):
-      if iContains(iLower(splTmpText(gSplDescTmp)), iLower(SplDescNew)):
+      if iContains(iLower(splTmpText(gSplDescTmp)), SplDescNewLow):
         descState = 1
       else:
         discard splSetText(gSplDescTmp, gSplDescLoc, SplDescNew)
@@ -772,9 +840,20 @@ proc splRebrandTickBody(a: Il2CppPtr): Il2CppPtr {.
   result = cast[Il2CppPtr](1)
   discard a
 
+  # The cached SCREEN is validated on its own, every pass, before anything is
+  # allowed to reuse it. `duOk` is not sufficient: a destroyed UnityEngine.Object
+  # remains readable with m_CachedPtr zeroed (fact #182) and the next internal
+  # call dies inside Unity's C++, so liveness is asked explicitly.
+  if gSplScreen != nil and
+     (not duOk(gSplScreen, 0x20'i32) or not iUnityAlive(gSplScreen)):
+    gSplScreen = nil
+
   if gSplResolved and splCacheStale():
     # The screen went away and came back (or was rebuilt). Re-discover from
-    # scratch rather than writing into a dead object.
+    # scratch rather than writing into a dead object. `gSplScreen` is NOT dropped
+    # here -- if the screen object itself survived the rebuild (only its children
+    # were replaced) we re-scan from it directly and skip the allocating scene
+    # enumeration, which is what lets the re-apply land within a few frames.
     gSplResolved = false
     gSplHeadTmp = nil; gSplHeadLoc = nil
     gSplDescTmp = nil; gSplDescLoc = nil
@@ -787,10 +866,32 @@ proc splRebrandTickBody(a: Il2CppPtr): Il2CppPtr {.
     gSplSummaryLogged = false
 
   if not gSplResolved:
-    let screen = splFindScreen()
+    # Reuse the validated screen when we have one; only walk the scene roots when
+    # we do not. The walk is the allocating step and the reason discovery was
+    # ever throttled.
+    var screen = gSplScreen
+    let reusedScreen = screen != nil
+    if screen == nil:
+      screen = splFindScreen()
     if screen == nil:
       splDiag(gSplLastWhy)                # announce WHY, rate-limited (was silent)
       return
+    gSplScreen = screen
+    # A cached screen that keeps yielding nothing must NOT lock us out of the
+    # full walk for the session -- that would be a check that cannot fail. After
+    # a capped number of fruitless re-scans the cache is dropped and the next
+    # pass does the real root enumeration again.
+    if reusedScreen:
+      inc gSplRescanMisses
+      if gSplRescanMisses > SplMaxRescanMiss:
+        gSplRescanMisses = 0
+        gSplScreen = nil
+        splDiag("the CACHED \"" & SplScreenName & "\" yielded no targets on " &
+          $SplMaxRescanMiss & " consecutive re-scans; dropping the cached " &
+          "screen and re-walking the scene roots.")
+        return
+    else:
+      gSplRescanMisses = 0
     var budget = SplNodeBudget
     let deadline = cNowMs() + SplWalkMs
     splScanNode(screen, SplScanDepth, budget, deadline)
@@ -810,6 +911,7 @@ proc splRebrandTickBody(a: Il2CppPtr): Il2CppPtr {.
         "may still be building; retrying.")
       return                              # screen present but toggle not read yet
     gSplResolved = true
+    gSplRescanMisses = 0
     okLog "singleplayer rebrand: resolved on \"" & SplScreenName &
           "\" -- heading TMP " & (if gSplHeadTmp != nil: "found" else: "MISSING") &
           ", description TMP " & (if gSplDescTmp != nil: "found" else: "not found") &
@@ -832,8 +934,23 @@ proc splRebrandDrainTick() =
   if (not gSplOn and not gSplForceOffline) or gSplOff: return
   if gSplT0 == 0'u64: gSplT0 = cNowMs()
   if cNowMs() - gSplT0 < SplWarmupMs: return   # the menu cannot be up yet
+  # Count REAL frames for the flash measurement, before any throttle, so the
+  # number reported is frames the player actually saw -- not ticks we took.
+  if gSplStockSeen and gSplFlashFrames < 100000: inc gSplFlashFrames
   inc gSplFrames
-  let every = (if gSplResolved and gSplConfirmed: SplSteadyFrames
+  # THE ADAPTIVE THROTTLE, and it lives here because this is the side that
+  # decides whether to enter the guard at all (the shape `hide seasons` uses,
+  # modstab.nim ~3439):
+  #   * targets cached -> EVERY frame. The body then only re-asserts the
+  #     finished state from cached, liveness-checked pointers: no scene
+  #     enumeration, no managed allocation. This is what closes the "vanilla
+  #     screen for a few seconds" window on (re)open and on rebuild.
+  #   * screen cached  -> every SplRescanFrames: a depth-limited scan inside the
+  #     screen, bounded by SplWalkMs.
+  #   * nothing cached -> SplHuntFrames: `iSceneRoots` allocates and must not run
+  #     per frame.
+  let every = (if gSplResolved: SplSteadyFrames
+               elif gSplScreen != nil: SplRescanFrames
                else: SplHuntFrames)
   if gSplFrames < every: return
   gSplFrames = 0
