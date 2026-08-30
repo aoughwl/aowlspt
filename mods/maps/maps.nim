@@ -184,36 +184,144 @@ var gHeadingOn = false
   ## decision made in one place; hud.nim reads `rot` from a single variable and
   ## both the radar and the map pane follow it together.
 
-proc loadHudOpts() =
-  gOpts.radar       = asBool(setting("hudRadar"), true)
-  gOpts.indicators  = asBool(setting("hudIndicators"), false)
-  gOpts.radiusM     = gRadius
-  gOpts.screenW     = asFloat(setting("screenW"), 1920.0)
-  gOpts.screenH     = asFloat(setting("screenH"), 1080.0)
-  gOpts.size        = asFloat(setting("radarSize"), 220.0)
-  gOpts.x           = asFloat(setting("radarX"), 24.0)
-  gOpts.y           = asFloat(setting("radarY"), 24.0)
-  gOpts.showBots    = asBool(setting("showBots"), true)
-  gOpts.showPlayers = asBool(setting("showPlayers"), true)
-  gOpts.budgetUs    = asInt(setting("hudBudgetUs"), 400)
-  gOpts.order       = 500
+var gFsKeyName = ""
+var gFsKeyKc = -1
+  ## The full-screen toggle key, resolved from its NAME once per apply. -1 is
+  ## UNBOUND and is the shipped default for `hotkeys` being off; a name that is
+  ## not a KeyCode also resolves to -1, and the diag distinguishes the two
+  ## rather than reporting a misspelling as "no key configured".
+var gFsHotkeysOn = false
+
+proc parseRgb(s: string; dflt: uint32): uint32 =
+  ## "RRGGBB" or "#RRGGBB" -> the region's RGBA packing, alpha 235.
+  ##
+  ## A MALFORMED string returns the DEFAULT and does not silently become black:
+  ## a black contact mark on a dark map is invisible, which is indistinguishable
+  ## from "contacts are not being drawn" -- the exact ambiguity this project
+  ## keeps paying for. The diag prints the colour actually in force.
+  var t = ""
+  for c in s:
+    if c != '#' and c != ' ': t.add c
+  if t.len != 6: return dflt
+  var v = 0'u32
+  for c in t:
+    var d = 0'u32
+    if c >= '0' and c <= '9': d = uint32(ord(c) - ord('0'))
+    elif c >= 'a' and c <= 'f': d = uint32(ord(c) - ord('a') + 10)
+    elif c >= 'A' and c <= 'F': d = uint32(ord(c) - ord('A') + 10)
+    else: return dflt
+    v = v * 16'u32 + d
+  let r = (v shr 16) and 0xFF'u32
+  let g = (v shr 8) and 0xFF'u32
+  let b = v and 0xFF'u32
+  result = r or (g shl 8) or (b shl 16) or (235'u32 shl 24)
+
+proc readOpts(o: var HudOpts) =
+  ## READS config.json into a FRESH options object and touches no global.
+  ##
+  ## It is a pure read on purpose. `loadHudOpts` uses it to refresh the live
+  ## `gOpts`, and `mirrorDrift` uses it to work out what config CURRENTLY
+  ## asks for -- so the reconcile and the apply cannot read the same keys two
+  ## different ways. When they were two separate readers, every setting added
+  ## to one and forgotten in the other became a control that stores and does
+  ## nothing; that has cost this project five separate bugs.
+  o.radar       = asBool(setting("hudRadar"), true)
+  o.indicators  = asBool(setting("hudIndicators"), false)
+  o.radiusM     = asFloat(setting("radiusM"), 120.0)
+  o.screenW     = asFloat(setting("screenW"), 1920.0)
+  o.screenH     = asFloat(setting("screenH"), 1080.0)
+  o.size        = asFloat(setting("radarSize"), 220.0)
+  o.x           = asFloat(setting("radarX"), 24.0)
+  o.y           = asFloat(setting("radarY"), 24.0)
+  o.showBots    = asBool(setting("showBots"), true)
+  o.showPlayers = asBool(setting("showPlayers"), true)
+  o.budgetUs    = asInt(setting("hudBudgetUs"), 400)
+  o.order       = 500
   # The MAP pane. Bigger than the radar, wider span, its own toggle -- three
   # separate deliverables, three separate switches, so a player who wants the
   # radar and not a half-screen map is not forced to take both.
-  gOpts.map         = asBool(setting("hudMap"), false)
-  gOpts.mapX        = asFloat(setting("mapX"), 320.0)
-  gOpts.mapY        = asFloat(setting("mapY"), 120.0)
-  gOpts.mapSize     = asFloat(setting("mapSize"), 720.0)
-  gOpts.mapSpanM    = asFloat(setting("mapSpanM"), 500.0)
-  gOpts.mapGrid     = asInt(setting("mapGrid"), 8)
-  gOpts.indicatorInset = asFloat(setting("indicatorInset"), 48.0)
+  o.map         = asBool(setting("hudMap"), false)
+  o.mapX        = asFloat(setting("mapX"), 320.0)
+  o.mapY        = asFloat(setting("mapY"), 120.0)
+  o.mapSize     = asFloat(setting("mapSize"), 720.0)
+  o.mapSpanM    = asFloat(setting("mapSpanM"), 500.0)
+  o.mapGrid     = asInt(setting("mapGrid"), 8)
+  o.indicatorInset = asFloat(setting("indicatorInset"), 48.0)
   # Indicator LIFETIME. Defaults chosen so the ramp is visible rather than a
   # blink: 0.4 s at full alpha, then 1.6 s of fade -- two seconds from the last
   # refresh to gone. Both are clamped by the schema, and a 0 fade is legal and
   # means "vanish the instant the hold elapses".
-  gOpts.indicatorHoldMs = asInt(setting("indicatorHoldMs"), 400)
-  gOpts.indicatorFadeMs = asInt(setting("indicatorFadeMs"), 1600)
-  gHeadingOn            = asBool(setting("heading"), false)
+  o.indicatorHoldMs = asInt(setting("indicatorHoldMs"), 400)
+  o.indicatorFadeMs = asInt(setting("indicatorFadeMs"), 1600)
+  o.heading             = asBool(setting("heading"), false)
+
+  # ---- THE UNIFIED WIDGET's mode, and the MIGRATION of the old toggles ----
+  #
+  # `hudMap` and `hudRadar` were two independent switches over two overlapping
+  # surfaces. `spatialMode` replaces both. An existing config has no
+  # `spatialMode` key at all, and `asText(..., "")` gives "" for that case, so
+  # the old pair is READ and translated -- a user who had the radar on still
+  # has a radar after the update, and a user who had both on gets the MAP,
+  # which is the surface that was drawn on top anyway. The translation is only
+  # consulted while the key is absent; the first edit through F12 writes
+  # `spatialMode` and the legacy pair stops mattering.
+  let modeTxt = asText(setting("spatialMode"), "auto")
+  if modeTxt.len > 0 and modeTxt != "auto":
+    o.mode = modeOf(modeTxt)
+  else:
+    let legacyMap = asBool(setting("hudMap"), false)
+    let legacyRad = asBool(setting("hudRadar"), true)
+    o.mode =
+      if legacyMap: (if o.heading: ModeHeadUp else: ModeNorthUp)
+      elif legacyRad: ModeRadar
+      else: ModeOff
+    if o.mode == ModeRadar:
+      # The radar had its OWN rect (radarX/radarY/radarSize). The unified widget
+      # has one rect, `mapX/mapY/mapSize`, so a migrated radar takes its old
+      # geometry with it -- otherwise the update would silently move the radar
+      # to the map pane's corner and resize it, and the user would read that as
+      # the feature breaking. Once `spatialMode` is written these three legacy
+      # keys are never consulted again, and the schema says so.
+      o.mapX    = asFloat(setting("radarX"), 24.0)
+      o.mapY    = asFloat(setting("radarY"), 24.0)
+      o.mapSize = asFloat(setting("radarSize"), 220.0)
+  # `heading` still folds into the two minimap modes, so the setting a user
+  # already has keeps meaning what it meant: with heading OFF a heading-up mode
+  # is a north-up mode. One decision, made in one place, exactly as before.
+  if o.mode == ModeHeadUp and not o.heading: o.mode = ModeNorthUp
+  spatialModeSurfaces(o)         # the legacy map/radar bools, derived
+
+  o.zoom      = asFloat(setting("zoom"), 1.0)
+  o.opacity   = asFloat(setting("opacity"), 0.85)
+  o.drawArt   = asBool(setting("drawArt"), true)
+  o.contactPx = asFloat(setting("contactSize"), 2.0)
+  o.colBot    = parseRgb(asText(setting("colorBot"), "E6463C"),
+                             0xEB3C46E6'u32)
+  o.colPlayer = parseRgb(asText(setting("colorPlayer"), "46BEFF"),
+                             0xEBFFBE46'u32)
+  o.colSelf   = 0xFFFFFFFF'u32
+
+  o.fsEnabled = asBool(setting("hotkeys"), false)
+  o.fsKey     = asText(setting("fullscreenKey"), "M")
+  o.fsMargin  = asFloat(setting("fullscreenMargin"), 48.0)
+  o.fsSpanM   = asFloat(setting("fullscreenSpanM"), 1200.0)
+  o.fsZoom    = asFloat(setting("fullscreenZoom"), 1.0)
+  o.fsOpacity = asFloat(setting("fullscreenOpacity"), 0.92)
+  o.fsNorthUp = asBool(setting("fullscreenNorthUp"), true)
+  
+  
+  
+
+proc loadHudOpts() =
+  ## The live refresh: the same read, plus the few globals that are not part
+  ## of the draw mirror (the heading gate the collector applies, and the
+  ## resolved KeyCode ordinal the Unity tick polls).
+  readOpts(gOpts)
+  gHeadingOn   = gOpts.heading
+  gFsHotkeysOn = gOpts.fsEnabled
+  gFsKeyName   = gOpts.fsKey
+  gFsKeyKc     = (if gOpts.fsEnabled: keycodeOf(gOpts.fsKey) else: -1)
+
 
 proc spatialSchema(): seq[Setting] =
   ## `implemented` is the honest column, not a decoration. Everything declared
@@ -229,7 +337,112 @@ proc spatialSchema(): seq[Setting] =
                  step = 5.0, category = "Feed",
                  description = "Specified from the pre-1.0 BepInEx map/radar mods (no upstream code carried; map art and calibration provenance in mods/maps/data/maps/README.md). Anything further away than this is not drawn"),
 
-    boolSetting("hudRadar", "In-game radar", true, category = "HUD",
+    # ---- THE ONE SPATIAL WIDGET -----------------------------------------
+    enumSetting("spatialMode", "Spatial widget", "auto",
+                @["auto", "off", "radar", "northup", "headingup"],
+                category = "Widget",
+                description = "ONE widget, one mode -- this replaces the " &
+                              "separate `In-game radar` and `In-game map` " &
+                              "toggles, which were two overlapping views of " &
+                              "the same top-down projection. " &
+                              "off = nothing (contacts and the full-screen " &
+                              "key still work); radar = radius-culled, " &
+                              "rotates with your facing, NO map art; " &
+                              "northup = minimap with the baked map art, " &
+                              "north at the top; headingup = the same " &
+                              "minimap rotated to your facing (art included " &
+                              "-- the region rotates the tiles). " &
+                              "auto = derive the mode from the old " &
+                              "hudRadar/hudMap/heading keys. " &
+                              "MIGRATION: while this key reads `auto` the old " &
+                              "hudMap/hudRadar pair is read and translated, " &
+                              "so an existing config keeps the surface it " &
+                              "had. The first edit here writes the key and " &
+                              "the old pair stops being consulted"),
+    floatSetting("zoom", "Widget zoom", 1.0, lo = 0.25, hi = 8.0, step = 0.25,
+                 category = "Widget",
+                 description = "Multiplies the scale. The pane covers " &
+                               "span / zoom metres, so 2.0 shows half as much " &
+                               "world at twice the size. Clamped in the draw " &
+                               "mirror as well as here, because config.json " &
+                               "is hand-editable and a zoom of 0 would divide " &
+                               "by zero on the render thread"),
+    floatSetting("opacity", "Widget opacity", 0.85, lo = 0.05, hi = 1.0,
+                 step = 0.05, category = "Widget",
+                 description = "Scales the backdrop and the map-art tint. " &
+                               "Never reaches 0: an invisible widget and a " &
+                               "widget that failed to arm would look the same"),
+    boolSetting("drawArt", "Draw the map artwork", true, category = "Widget",
+                description = "OFF draws the grid, the player and the " &
+                              "contacts and submits no textured quad at all " &
+                              "-- the cheapest mode, and the one to use if a " &
+                              "map's tiles are wrong. Radar mode never draws " &
+                              "art regardless"),
+    floatSetting("contactSize", "Contact mark size (px)", 2.0, lo = 1.0,
+                 hi = 16.0, step = 0.5, category = "Widget",
+                 description = "Half-extent of a contact's mark. 2.0 is the " &
+                               "4x4 px dot this mod has always drawn"),
+    stringSetting("colorBot", "Bot colour (RRGGBB)", "E6463C",
+                  category = "Widget",
+                  description = "Hex, with or without a leading #. A " &
+                                "malformed value keeps the DEFAULT rather " &
+                                "than becoming black, because a black mark on " &
+                                "a dark map is indistinguishable from no mark " &
+                                "at all. The diag prints the colour in force"),
+    stringSetting("colorPlayer", "Player colour (RRGGBB)", "46BEFF",
+                  category = "Widget",
+                  description = "Hex, as above. `Faction` here is bot vs " &
+                                "human-controlled player -- that is the only " &
+                                "classification sp/world.nim measures on this " &
+                                "build, so a per-side (USEC/BEAR/Scav) colour " &
+                                "is not offered rather than offered and wrong"),
+
+    # ---- THE FULL-SCREEN OVERLAY ----------------------------------------
+    boolSetting("hotkeys", "Enable the full-screen map key", false,
+                category = "Full-screen map",
+                description = "OFF (the shipped default) means NOTHING is " &
+                              "polled: no key is read, GameAssembly is not " &
+                              "even looked up. ON binds " &
+                              "UnityEngine.Input::GetKeyDown at a " &
+                              "byte-verified RVA and reads one key per Unity " &
+                              "tick. This never CAPTURES input -- it installs " &
+                              "no window hook and swallows no key -- so there " &
+                              "is nothing that can stay captured if it faults"),
+    keybindSetting("fullscreenKey", "Full-screen map key", "M",
+                   category = "Full-screen map",
+                   description = "A UnityEngine.KeyCode NAME. Press it to " &
+                                 "open the full-screen map and again (or " &
+                                 "Escape) to close it. Default M. An empty " &
+                                 "value is UNBOUND; a name that is not a " &
+                                 "KeyCode is also unbound, and the diag says " &
+                                 "which of the two happened rather than " &
+                                 "reporting a dead key as bound"),
+    floatSetting("fullscreenSpanM", "Full-screen span (m across)", 1200.0,
+                 lo = 50.0, hi = 8000.0, step = 50.0,
+                 category = "Full-screen map",
+                 description = "How much world the full-screen map covers " &
+                               "edge to edge, before `fullscreenZoom`"),
+    floatSetting("fullscreenZoom", "Full-screen zoom", 1.0, lo = 0.25, hi = 8.0,
+                 step = 0.25, category = "Full-screen map"),
+    floatSetting("fullscreenMargin", "Full-screen margin (px)", 48.0, lo = 0.0,
+                 hi = 512.0, step = 8.0, category = "Full-screen map",
+                 description = "Inset from the screen edge. The map is a " &
+                               "SQUARE sized to the shorter screen axis, so " &
+                               "it is never clipped on an ultrawide monitor"),
+    floatSetting("fullscreenOpacity", "Full-screen opacity", 0.92, lo = 0.05,
+                 hi = 1.0, step = 0.05, category = "Full-screen map"),
+    boolSetting("fullscreenNorthUp", "Full-screen map is north-up", true,
+                category = "Full-screen map",
+                description = "ON is a wall map: north at the top whatever " &
+                              "you are facing. OFF rotates it to your facing " &
+                              "like the minimap. While the overlay is open " &
+                              "the minimap draws NOTHING (asserted with a " &
+                              "count of primitives it submitted, not with a " &
+                              "claim) and the direction indicators are " &
+                              "suppressed, because every contact is already " &
+                              "on the map at its true position"),
+
+    boolSetting("hudRadar", "LEGACY: in-game radar", true, category = "Legacy",
                 description = "Specified from the pre-1.0 BepInEx map/radar mods (no upstream code carried; map art and calibration provenance in mods/maps/data/maps/README.md). Draw the radar over the game, via the shared region"),
     boolSetting("hudIndicators", "Direction indicators", false, category = "HUD",
                 description = "Specified from the pre-1.0 BepInEx map/radar mods (no upstream code carried; map art and calibration provenance in mods/maps/data/maps/README.md). A marker per contact, clamped to the screen " &
@@ -238,28 +451,37 @@ proc spatialSchema(): seq[Setting] =
                               "bearing ring when it does not, and the status " &
                               "line says which is happening. " &
                               "A bearing mark per contact on a ring around screen centre"),
-    floatSetting("radarSize", "Radar size (px)", 220.0, lo = 64.0, hi = 640.0,
-                 step = 8.0, category = "HUD"),
-    floatSetting("radarX", "Radar X (px)", 24.0, lo = 0.0, hi = 4096.0,
-                 step = 4.0, category = "HUD"),
-    floatSetting("radarY", "Radar Y (px)", 24.0, lo = 0.0, hi = 4096.0,
-                 step = 4.0, category = "HUD"),
-    boolSetting("hudMap", "In-game map", false, category = "Map",
+    floatSetting("radarSize", "LEGACY: radar size (px)", 220.0, lo = 64.0,
+                 hi = 640.0, step = 8.0, category = "Legacy",
+                 description = "Only read while `spatialMode` is absent, to " &
+                               "carry a migrated radar's geometry into the " &
+                               "unified widget's `mapSize`. Inert after that"),
+    floatSetting("radarX", "LEGACY: radar X (px)", 24.0, lo = 0.0, hi = 4096.0,
+                 step = 4.0, category = "Legacy",
+                 description = "Migration only -- see radarSize"),
+    floatSetting("radarY", "LEGACY: radar Y (px)", 24.0, lo = 0.0, hi = 4096.0,
+                 step = 4.0, category = "Legacy",
+                 description = "Migration only -- see radarSize"),
+    boolSetting("hudMap", "LEGACY: in-game map", false, category = "Legacy",
                 description = "Specified from the pre-1.0 BepInEx map/radar mods (no upstream code carried; map art and calibration provenance in mods/maps/data/maps/README.md). A large top-down map pane drawn over the game " &
                               "by the shared region. Player-centred: anchoring " &
                               "it to the level needs the pocketmap pyramid's " &
                               "world origin, which nothing has measured"),
-    floatSetting("mapSize", "Map size (px)", 720.0, lo = 128.0, hi = 2160.0,
-                 step = 16.0, category = "Map"),
-    floatSetting("mapX", "Map X (px)", 320.0, lo = 0.0, hi = 7680.0,
-                 step = 8.0, category = "Map"),
-    floatSetting("mapY", "Map Y (px)", 120.0, lo = 0.0, hi = 4320.0,
-                 step = 8.0, category = "Map"),
-    floatSetting("mapSpanM", "Map span (m across)", 500.0, lo = 50.0,
-                 hi = 4000.0, step = 25.0, category = "Map",
+    floatSetting("mapSize", "Widget size (px)", 720.0, lo = 128.0, hi = 2160.0,
+                 step = 16.0, category = "Widget",
+                 description = "The unified widget's square, in EVERY mode " &
+                               "including radar. One widget, one rect"),
+    floatSetting("mapX", "Widget X (px)", 320.0, lo = 0.0, hi = 7680.0,
+                 step = 8.0, category = "Widget",
+                 description = "Top-left corner, pixels, origin top-left"),
+    floatSetting("mapY", "Widget Y (px)", 120.0, lo = 0.0, hi = 4320.0,
+                 step = 8.0, category = "Widget",
+                 description = "Top-left corner, pixels, origin top-left"),
+    floatSetting("mapSpanM", "Widget span (m across)", 500.0, lo = 50.0,
+                 hi = 4000.0, step = 25.0, category = "Widget",
                  description = "Specified from the pre-1.0 BepInEx map/radar mods (no upstream code carried; map art and calibration provenance in mods/maps/data/maps/README.md). How much world the pane covers edge to edge"),
-    intSetting("mapGrid", "Map grid divisions", 8, lo = 0, hi = 32,
-               category = "Map",
+    intSetting("mapGrid", "Grid divisions", 8, lo = 0, hi = 32,
+               category = "Widget",
                description = "Specified from the pre-1.0 BepInEx map/radar mods (no upstream code carried; map art and calibration provenance in mods/maps/data/maps/README.md). A scale reference, not scenery. There is no map " &
                              "ARTWORK: the region's command set is fill/box/" &
                              "line/text with no textured quad, so the " &
@@ -518,6 +740,22 @@ proc onMainTick(payload: string): string =
   # which is the ambiguity this mod keeps paying for.
   if not gHeadingOn: gSnap.hasHeading = false
   if gHudOn: hudPublish(gSnap)   # same thread as the region's draw; see sp/hud.nim
+  # THE FULL-SCREEN MAP KEY. Unity's thread, which is where
+  # `Input::GetKeyDown` belongs and the only thread it is ever called from. With
+  # `hotkeys` off or the key unbound this is one compare and NOTHING is called
+  # -- not GetModuleHandle, not the game method -- which is the shipped state.
+  #
+  # It is polled here rather than on the publish timer for two reasons: that
+  # timer is not Unity's thread, and this tick is already gated on `enabled`, so
+  # a disabled feature cannot open a panel over the player's raid.
+  if gHudOn and gFsHotkeysOn and gFsKeyKc >= 0:
+    discard hudFsPoll(gFsKeyKc, true)
+  elif hudFsOpen():
+    # The key was just turned off (or unbound) while the overlay was OPEN. Close
+    # it, on the tick that notices, rather than leaving a full-screen panel the
+    # player now has no key to dismiss. This is the fault path too: if the poll
+    # ever stops running for any reason, the overlay does not outlive it.
+    hudFsClose()
   # The ART, on the same thread and after the mirror is filled. Gated on a
   # VALIDATED local position: binding a map from a position that failed
   # `mm_pos_classify` would pick a map by a number we already know is wrong.
@@ -527,7 +765,12 @@ proc onMainTick(payload: string): string =
   # Only the MAP and RADAR panes render art; gate the tile IO/upload on one of
   # them being on (bug 4). An indicator-only or all-off config used to slurp and
   # upload a tile per tick for a surface nothing drew.
-  if gHudOn and (gOpts.map or gOpts.radar) and
+  # The tile IO/upload is gated on a surface that can actually SHOW art: a
+  # minimap mode, or the full-screen overlay being available. Radar mode draws
+  # no art by construction and `drawArt` off asks for none, so neither slurps a
+  # tile per tick for something nothing draws.
+  if gHudOn and gOpts.drawArt and
+     (gOpts.map or (gOpts.fsEnabled and gFsKeyKc >= 0)) and
      activeRaid(gSnap) and gSnap.localIdx >= 0 and gSnap.localIdx < gSnap.n:
     artTick(gSnap.ents[gSnap.localIdx].x, gSnap.ents[gSnap.localIdx].z,
             gSnap.locationId)
@@ -849,9 +1092,10 @@ proc mapsDiagText(): string =
                 "drawing nothing. Toggling `enabled` on will LATE ARM."
   else:
     let cfgEnabled = cfgEnabledTop
-    let cfgMap     = asBool(setting("hudMap"), false)
-    let cfgRadar   = asBool(setting("hudRadar"), true)
-    let cfgInd     = asBool(setting("hudIndicators"), false)
+    var cfgOpts = HudOpts()
+    readOpts(cfgOpts)
+    let cfgMode    = cfgOpts.mode
+    let cfgInd     = cfgOpts.indicators
     # The mirror's per-surface flags are config ANDed with `live`, so the only
     # legal disagreement is mirror=off while config=on (the feed is not
     # running). mirror=ON while config=off is ALWAYS a defect: it means an edit
@@ -859,14 +1103,13 @@ proc mapsDiagText(): string =
     # switched off.
     var leaked: seq[string] = @[]
     if (not cfgEnabled) and hudLiveEnabled(): leaked.add "enabled"
-    if (not cfgMap)     and hudLiveMap():     leaked.add "hudMap"
-    if (not cfgRadar)   and hudLiveRadar():   leaked.add "hudRadar"
+    if cfgMode == ModeOff and hudLiveMode() != ModeOff: leaked.add "spatialMode"
     if (not cfgInd)     and hudLiveIndicators(): leaked.add "hudIndicators"
-    var mirrorTxt = "config(enabled=" & $cfgEnabled & " map=" & $cfgMap &
-                    " radar=" & $cfgRadar & " ind=" & $cfgInd & ")" &
-                    " vs mirror(enabled=" & $hudLiveEnabled() &
-                    " map=" & $hudLiveMap() & " radar=" & $hudLiveRadar() &
-                    " ind=" & $hudLiveIndicators() & ")"
+    var mirrorTxt = "config(enabled=" & $cfgEnabled & " mode=" &
+                    modeName(cfgMode) & " ind=" & $cfgInd & ")" &
+                    " vs mirror(enabled=" & $hudLiveEnabled() & " mode=" &
+                    modeName(hudLiveMode()) & " ind=" &
+                    $hudLiveIndicators() & ")"
     if leaked.len > 0:
       var names = ""
       for k in leaked:
@@ -897,8 +1140,67 @@ proc mapsDiagText(): string =
                " reconciles=" & $gReconciles &
                " consecutiveNoEffect=" & $gReconcileFails
 
+  # ---- THE UNIFIED WIDGET, as the mirror actually holds it ---------------
+  #
+  # Printed from the LIVE MIRROR, never from gOpts, so "what I meant to push"
+  # and "what the render thread is reading" cannot be confused for each other.
+  let lWidget = "mode=" & modeName(hudLiveMode()) &
+                " rect=" & $hudLivePaneX() & "," & $hudLivePaneY() &
+                " size=" & $hudLivePaneSize() &
+                " span=" & $hudLivePaneSpan() & "m radius=" & $hudLiveRadius() &
+                "m zoom=" & $hudLiveZoom() & " opacity=" & $hudLiveOpacity() &
+                " art=" & $hudLiveDrawArt() & " contactPx=" &
+                $hudLiveContactPx() & " grid=" & $hudLiveGrid() &
+                " colours(bot/player)=" & $hudLiveColBot() & "/" &
+                $hudLiveColPlayer()
+
+  # ---- THE FULL-SCREEN OVERLAY -------------------------------------------
+  #
+  # THREE OUTCOMES, and the PASS is a falsifiable NEGATIVE: the overlay was open
+  # on N frames AND the small widget submitted ZERO primitives on all N of them.
+  # `fsSuppressed` is counted at the draw site from the small widget's own
+  # return value, so a small-widget submission added later outside the guard
+  # would make the two numbers differ and this would read FAIL. A single
+  # "overlay drew" counter could not be falsified and would not be a check.
+  var lFs = ""
+  if not gFsHotkeysOn:
+    lFs = "INCONCLUSIVE  the `hotkeys` setting is OFF (the shipped default), " &
+          "so no key is polled and the full-screen map cannot be opened. " &
+          "Nothing was called -- not GetModuleHandle, not Input::GetKeyDown."
+  elif gFsKeyKc < 0:
+    lFs = "INCONCLUSIVE  `hotkeys` is ON but `fullscreenKey` = \"" & gFsKeyName &
+          "\" is not a UnityEngine.KeyCode name, so it resolved to UNBOUND " &
+          "and nothing is polled. This is a misspelling, not an idle key."
+  elif not gHudOn:
+    lFs = "INCONCLUSIVE  key " & gFsKeyName & " (kc=" & $gFsKeyKc &
+          ") is bound but no draw participant is registered, so opening the " &
+          "overlay would draw nothing. bind: " & hudKeyBindText()
+  elif hudFsToggles() == 0'i64:
+    lFs = "INCONCLUSIVE  key " & gFsKeyName & " (kc=" & $gFsKeyKc &
+          ") is armed and polled and has NEVER been pressed -- 0 toggles, so " &
+          "the overlay has never opened and nothing about it is proven. " &
+          "bind: " & hudKeyBindText()
+  elif hudFsFrames() == 0'i64:
+    lFs = "FAIL  the key was pressed " & $hudFsToggles() & " time(s) and the " &
+          "overlay drew on 0 frame(s): the toggle reached the mirror and the " &
+          "draw never honoured it. bind: " & hudKeyBindText()
+  elif hudFsSuppressed() != hudFsFrames():
+    lFs = "FAIL  the overlay was open on " & $hudFsFrames() & " frame(s) but " &
+          "the small widget submitted primitives on " &
+          $(hudFsFrames() - hudFsSuppressed()) & " of them -- the full-screen " &
+          "map is drawing OVER a live minimap instead of replacing it"
+  else:
+    lFs = "PASS  open on " & $hudFsFrames() & " frame(s), and the small " &
+          "widget submitted ZERO primitives on all " & $hudFsFrames() &
+          " of them (toggles=" & $hudFsToggles() & ", key=" & gFsKeyName &
+          ", currently " & (if hudFsOpen(): "OPEN" else: "closed") &
+          ", last overlay submit=" & $hudFsLastPrims() & " primitive(s)). " &
+          "bind: " & hudKeyBindText()
+
   result = "maps diag:\n" &
            "  arm          : " & lArm & "\n" &
+           "  widget       : " & lWidget & "\n" &
+           "  fullscreen   : " & lFs & "\n" &
            "  reconcile    : " & lRecon & "\n" &
            "  region       : " & lRegion & "\n" &
            "  world        : " & lWorld  & "\n" &
@@ -968,15 +1270,21 @@ proc armFeed(): bool =
   # participant; the earlier `radar or indicators` gate silently denied the map
   # its own callback whenever the radar happened to be off. Guarded by gHudOn so
   # a hot-start re-toggle does not add a second participant.
-  if (gOpts.radar or gOpts.indicators or gOpts.map) and not gHudOn:
+  # Register when ANY surface can draw -- including the FULL-SCREEN overlay,
+  # which is a surface even with the widget mode OFF. Without that clause a
+  # player whose only spatial surface is the full-screen map would get no draw
+  # participant at all and the key would open nothing, silently.
+  if (gOpts.mode != ModeOff or gOpts.indicators or
+      (gOpts.fsEnabled and gFsKeyKc >= 0)) and not gHudOn:
     hudInit(gOpts)
     var whyHud = ""
     if hudRegister(gOpts, whyHud):
       gHudOn = true
       if hudArmed():
         success ModName & ": in-game HUD registered with the shared region " &
-                "and the region is ARMED -- radar=" & $gOpts.radar &
-                " map=" & $gOpts.map & " indicators=" & $gOpts.indicators
+                "and the region is ARMED -- mode=" & modeName(gOpts.mode) &
+                " indicators=" & $gOpts.indicators &
+                " fullscreenKey=" & (if gFsKeyKc >= 0: gFsKeyName else: "(unbound)")
       else:
         warn ModName & ": in-game HUD registered, but the shared region is " &
              "NOT armed, so the callback will never fire and nothing will be " &
@@ -1047,11 +1355,12 @@ proc onMapsApply(key: string) =
   # honours it (0 tiles / 0 blips). This is the finished-state assertion the fix
   # is judged on: not "apply returned ok" but "the mirror now reads off".
   info "maps: apply " & (if key.len > 0: key else: "(all)") &
-       " -> config hudMap=" & $gOpts.map & " hudRadar=" & $gOpts.radar &
+       " -> config spatialMode=" & modeName(gOpts.mode) &
        " indicators=" & $gOpts.indicators & " enabled=" & $nowEnabled &
-       " live=" & $live & " -> mirror pushed mapOn=" &
-       $(gOpts.map and live) & " radarOn=" & $(gOpts.radar and live) &
-       " indicatorsOn=" & $(gOpts.indicators and live)
+       " live=" & $live & " -> mirror pushed mode=" &
+       modeName(hudLiveMode()) & " indicatorsOn=" &
+       $(gOpts.indicators and live) & " fullscreenKey=" &
+       (if gFsKeyKc >= 0: gFsKeyName else: "(unbound)")
   # The verdict is driven by the TRANSITION (or by an explicit `enabled` key),
   # never by the key alone -- see the late-arm comment above.
   if nowEnabled != wasEnabled or key == "enabled":
@@ -1083,11 +1392,12 @@ proc onMapsApply(key: string) =
       settingApplied("feed OFF -- HUD blanked (0 tiles, 0 blips)")
     return
   if not (gEnabled and gFeedRunning and
-          (gOpts.radar or gOpts.indicators or gOpts.map)):
+          (gOpts.mode != ModeOff or gOpts.indicators or
+           (gOpts.fsEnabled and gFsKeyKc >= 0))):
     settingIgnored("stored; nothing is drawn because the feed is off or every " &
-      "HUD surface (radar/map/indicators) is off")
+      "spatial surface (widget mode / indicators / full-screen key) is off")
     return
-  settingApplied("radar=" & $gOpts.radar & " map=" & $gOpts.map &
+  settingApplied("mode=" & modeName(gOpts.mode) &
                  " indicators=" & $gOpts.indicators & " heading=" & $gHeadingOn &
                  (if gHeadingOn: " (heading-up: art refuses, grid+blips rotate)"
                   else: " (north-up: baked art drawn)"))
@@ -1136,6 +1446,18 @@ proc onMapsApply(key: string) =
 # `MaxReconcileFails` consecutive such ticks it stops and says so, rather than
 # calling `onMapsApply` once a second forever.
 
+proc near(a, b: float): bool =
+  ## Float equality with a tolerance, for the reconcile's finished-state
+  ## comparison. 0.01 px/m is far below anything a control can express and far
+  ## above JSON round-tripping, so it can absorb a re-serialisation and nothing
+  ## a user could have typed.
+  let d = a - b
+  (if d < 0.0: -d else: d) <= 0.01
+
+proc numDrift(name: string; want, got: float): string =
+  ## "" when the mirror agrees; otherwise the disagreement, named.
+  if near(want, got): "" else: name & " config=" & $want & " mirror=" & $got
+
 proc mirrorDrift(): string =
   ## "" when the live draw mirror agrees with config.json; otherwise a line
   ## naming the disagreement. NEGATIVE-shaped: it can only be non-empty when a
@@ -1150,15 +1472,66 @@ proc mirrorDrift(): string =
       return "config enabled=false, no draw participant, mirror enabled=ON"
     return ""
   let live = cfgEnabled and gFeedRunning
-  let wantMap = asBool(setting("hudMap"), false) and live
-  let wantRad = asBool(setting("hudRadar"), true) and live
-  let wantInd = asBool(setting("hudIndicators"), false) and live
-  if hudLiveEnabled() != live or hudLiveMap() != wantMap or
-     hudLiveRadar() != wantRad or hudLiveIndicators() != wantInd:
-    return "config(enabled=" & $live & " map=" & $wantMap & " radar=" & $wantRad &
+  # WHAT CONFIG ASKS FOR, read by the SAME code the apply path uses. Reading it
+  # a second, hand-written way here is how `radarSize` came to be storable and
+  # inert: the boolean comparison below noticed nothing, so the reconcile never
+  # fired, so no numeric edit ever reached the mirror.
+  var w = HudOpts()
+  readOpts(w)
+  let wantMode = (if live: w.mode else: ModeOff)
+  let wantInd = w.indicators and live
+  if hudLiveEnabled() != live or hudLiveMode() != wantMode or
+     hudLiveIndicators() != wantInd:
+    return "config(enabled=" & $live & " mode=" & modeName(wantMode) &
            " ind=" & $wantInd & ") vs mirror(enabled=" & $hudLiveEnabled() &
-           " map=" & $hudLiveMap() & " radar=" & $hudLiveRadar() &
+           " mode=" & modeName(hudLiveMode()) &
            " ind=" & $hudLiveIndicators() & ")"
+
+  # EVERY NUMERIC, compared against the LIVE MIRROR -- the struct the render
+  # thread dereferences -- and not against a copy of our own last write. A
+  # setting with no line here is a setting that can be stored and never applied,
+  # so adding one to the schema without adding it here is the bug, not an
+  # omission. `near` tolerates float round-tripping through JSON and nothing
+  # else; the clamps live in the C setters, so a value the mirror clamped shows
+  # up as PERSISTENT drift and the reconcile self-disables and says so rather
+  # than re-applying forever.
+  var d = ""
+  d = numDrift("mapX", w.mapX, hudLivePaneX());            if d.len > 0: return d
+  d = numDrift("mapY", w.mapY, hudLivePaneY());            if d.len > 0: return d
+  d = numDrift("mapSize", w.mapSize, hudLivePaneSize());   if d.len > 0: return d
+  d = numDrift("mapSpanM", w.mapSpanM, hudLivePaneSpan()); if d.len > 0: return d
+  d = numDrift("radiusM", w.radiusM, hudLiveRadius());     if d.len > 0: return d
+  d = numDrift("zoom", w.zoom, hudLiveZoom());             if d.len > 0: return d
+  d = numDrift("opacity", w.opacity, hudLiveOpacity());    if d.len > 0: return d
+  d = numDrift("contactSize", w.contactPx, hudLiveContactPx())
+  if d.len > 0: return d
+  d = numDrift("fullscreenMargin", w.fsMargin, hudLiveFsMargin())
+  if d.len > 0: return d
+  d = numDrift("fullscreenSpanM", w.fsSpanM, hudLiveFsSpan())
+  if d.len > 0: return d
+  d = numDrift("fullscreenZoom", w.fsZoom, hudLiveFsZoom())
+  if d.len > 0: return d
+  d = numDrift("fullscreenOpacity", w.fsOpacity, hudLiveFsOpacity())
+  if d.len > 0: return d
+  if w.mapGrid != hudLiveGrid():
+    return "mapGrid config=" & $w.mapGrid & " mirror=" & $hudLiveGrid()
+  if w.drawArt != hudLiveDrawArt():
+    return "drawArt config=" & $w.drawArt & " mirror=" & $hudLiveDrawArt()
+  if w.fsNorthUp != hudLiveFsNorthUp():
+    return "fullscreenNorthUp config=" & $w.fsNorthUp &
+           " mirror=" & $hudLiveFsNorthUp()
+  if w.colBot != hudLiveColBot():
+    return "colorBot config=" & $w.colBot & " mirror=" & $hudLiveColBot()
+  if w.colPlayer != hudLiveColPlayer():
+    return "colorPlayer config=" & $w.colPlayer &
+           " mirror=" & $hudLiveColPlayer()
+  # The hotkey is not in the C mirror -- the ORDINAL this process resolved is
+  # what the Unity tick polls, so that is what is compared.
+  let wantKc = (if w.fsEnabled: keycodeOf(w.fsKey) else: -1)
+  if wantKc != gFsKeyKc or w.fsEnabled != gFsHotkeysOn:
+    return "fullscreenKey config=" & (if w.fsEnabled: w.fsKey else: "(hotkeys off)") &
+           " kc=" & $wantKc & " but this instance polls kc=" & $gFsKeyKc &
+           " hotkeys=" & $gFsHotkeysOn
   result = ""
 
 proc onReconcileTick(payload: string): string =

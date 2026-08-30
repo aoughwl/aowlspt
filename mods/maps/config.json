@@ -22,6 +22,24 @@
   "indicatorHoldMs": 400,
   "indicatorFadeMs": 1600,
 
+  "_widget": "ONE spatial widget replaces the separate hudRadar/hudMap surfaces. spatialMode 'auto' means: derive the mode from the legacy hudRadar/hudMap/heading keys above, so an existing config keeps the surface it had (a migrated radar also carries radarX/radarY/radarSize into mapX/mapY/mapSize). Pick any other mode and the legacy keys stop being consulted.",
+  "spatialMode": "auto",
+  "zoom": 1.0,
+  "opacity": 0.85,
+  "drawArt": true,
+  "contactSize": 2.0,
+  "colorBot": "E6463C",
+  "colorPlayer": "46BEFF",
+
+  "_fullscreen": "The full-screen map, on a key. hotkeys is OFF by default: with it off NOTHING is polled -- GameAssembly is not even looked up -- and the key does nothing. Turning it on binds UnityEngine.Input::GetKeyDown at a byte-verified RVA and reads one key per Unity tick. It never CAPTURES input, so there is nothing that can stay captured if it faults; press the key again or Escape to close.",
+  "hotkeys": false,
+  "fullscreenKey": "M",
+  "fullscreenSpanM": 1200,
+  "fullscreenZoom": 1.0,
+  "fullscreenMargin": 48,
+  "fullscreenOpacity": 0.92,
+  "fullscreenNorthUp": true,
+
   "_notImplementedYet": "markers is still declared implemented=false in maps.nim and the settings UI marks it so -- it is NOT a silent no-op: it needs a field offset for the loot/extract/corpse/quest lists on build 1.1.0.1.46777 (none has been measured). heading IS now implemented: the player VIEW facing is measured (MovementContext._lookDirection) and rotates both surfaces heading-up. One ABI limit remains and is stated in the schema and the diag: the region's textured quad is axis-aligned, so heading-up cannot rotate the baked map ART and falls back to a rotating grid+blips; turn heading OFF to see the artwork north-up.",
   "heading": true,
   "markers": false
