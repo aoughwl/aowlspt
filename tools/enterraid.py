@@ -271,7 +271,13 @@ def main():
     deadline = time.time() + 300.0
     while time.time() < deadline:
         if raid_marker_since(base):
-            log("IN RAID (host-log marker)."); return 0
+            # The marker fires during scene LOAD, not at actual DEPLOY (fact #258).
+            # Running any inspector command now stalls the still-loading main thread
+            # and errors the load (fact #261). So STAY inspector-silent and give the
+            # load ~60s more to actually deploy the player before declaring success.
+            log("raid marker seen (loading); settling 60s to actual deploy (inspector-silent)...")
+            time.sleep(60.0)
+            log("IN RAID (loaded + settled). Do NOT issue inspector reads until a camera is confirmed."); return 0
         time.sleep(3.0)
     log("FAIL: no raid marker in the host log within 300s"); return 6
 
