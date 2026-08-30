@@ -384,7 +384,7 @@ proc onStatus(url, body, session: string): string =
 proc waypointsSchema(): seq[Setting] =
   result = @[
     boolSetting("patrolTuning", "Patrol pacing tuning", true,
-                category = "Bot AI/Patrols", subcategory = "Patrols",
+                category = "Patrols",
                 description = "Apply the shipped server-side patrol pacing tweaks to bots.types.*.difficulty.*.Patrol at server start. Only keys this database already carries are written; the three names post-1.0 dropped are probed, skipped and listed on /waypoints/status. Read at load, so a change takes effect on the next server start -- the patrol point data itself is served either way.",
                 implemented = true)]
 
