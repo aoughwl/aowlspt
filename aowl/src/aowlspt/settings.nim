@@ -498,7 +498,19 @@ proc applySetting*(key, valueJson: string): Status =
   ## a mod that wants the new value live re-reads it (most call their own
   ## `loadConfig` again) rather than this function applying it, because only the
   ## mod knows which of its runtime writes a given key feeds.
+  ##
+  ## OBSERVABILITY, and why it is here rather than in each transport. This is
+  ## the ONE proc every settings write in this process passes through --
+  ## `applySettingFromBody` (the route and the bus both), `resetSetting`,
+  ## `resetAllSettings` and `backfillDeclaredDefaults`. A write logged per
+  ## transport can only ever name the transports we already knew about; logged
+  ## here, a transport nobody has thought of still announces itself. That is
+  ## what the maps OFF-toggle hunt needed and did not have: three transports
+  ## were each patched and the bug survived, with nothing in the log saying
+  ## which process had done the write.
   result = configSet(key, valueJson)
+  info "settings: config write " & modGuid() & "." & key & " = " & valueJson &
+       " -> " & (if result == Ok: "stored" else: statusMessage(result))
 
 proc applySettingFromBody*(body: string): Status =
   ## The edit a settings-UI POST carries, applied. The body is
