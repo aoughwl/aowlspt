@@ -80,6 +80,8 @@ const
   ArFanout        = 256         ## children examined per level.
   ArFindDepth     = 12          ## descent depth.
   ArMapDepth      = 8           ## depth to find a "Label" under a map toggle.
+  ArPlayUp        = 14          ## levels to climb from a PlayButton looking for a
+                                ## MenuScreen ancestor (to skip the RewardInfo one).
   ArMaxFaults     = 3
   ArMaxPlayExtends = 6          ## popup-wait extensions on the PLAY step. The daily-
                                 ## reward RewardInfo popup deactivates MenuScreen for
@@ -287,16 +289,46 @@ proc arNamedRoot(roots: seq[Il2CppPtr]; name: string): Il2CppPtr =
       return r
     i = i + 1
 
+proc arHasAncestorNamed(node: Il2CppPtr; name: string; maxUp: int): bool =
+  ## Climb the parent chain (`Transform::get_parent`, guarded, via splrebrand's
+  ## `splParent`) looking for an ancestor named `name`. Bounded by `maxUp`.
+  result = false
+  var cur = node
+  var k = 0
+  while cur != nil and k < maxUp:
+    if iObjName(cur) == name:
+      return true
+    cur = splParent(cur)
+    k = k + 1
+
 proc arPlayUnder(root: Il2CppPtr; deadline: uint64): Il2CppPtr =
-  ## MenuScreen under `root`, then the ACTIVE PlayButton under MenuScreen
-  ## (scoping to MenuScreen skips the RewardInfo popup's second PlayButton).
+  ## Re-find the LIVE PlayButton FRESH, PlayButton-first: collect PlayButton
+  ## nodes under `root`, then return the first that is activeInHierarchy AND has
+  ## a MenuScreen ancestor. NEVER cached across ticks.
+  ##
+  ## WHY NOT MenuScreen-first: the daily-reward RewardInfo popup rebuilds the
+  ## MenuScreen/PlayButton GameObjects during its cycle, so a MenuScreen found by
+  ## name (breadth-first, first match) can be the DEAD old instance, and the
+  ## PlayButton search under that corpse finds nothing active -- while a
+  ## brand-new active PlayButton exists under a fresh MenuScreen. The inspector
+  ## sees the live one because it re-FINDS PlayButton directly each call; this
+  ## now does the same. The active check skips the corpse and the inactive
+  ## RewardInfo PlayButton; the MenuScreen-ancestor check skips the RewardInfo
+  ## PlayButton even if it is momentarily active (it lives under
+  ## RewardDetailsView/RewardInfo, never under MenuScreen).
   result = nil
   if root == nil: return
+  var cands: seq[Il2CppPtr] = @[]
   var b = ArNodeBudget
-  let ms = arWalkAny(root, "MenuScreen", ArFindDepth, b, deadline)
-  if ms == nil: return
-  var b2 = ArNodeBudget
-  result = arWalkActive(ms, "PlayButton", ArFindDepth, b2, deadline, nil)
+  arCollect(root, "PlayButton", ArFindDepth, b, deadline, cands, 16)
+  var i = 0
+  while i < cands.len:
+    let pb = cands[i]
+    if duOk(pb, 0x20'i32):
+      let a = iActiveInHierarchy(pb)
+      if a[0] and a[1] and arHasAncestorNamed(pb, "MenuScreen", ArPlayUp):
+        return pb
+    i = i + 1
 
 proc arFindPlay(): Il2CppPtr =
   ## The active PlayButton under Common UI -> MenuScreen, with a fallback across
