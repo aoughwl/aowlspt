@@ -222,11 +222,32 @@ const
 # ---- bounds ----
 const
   NrWarmupMs     = 8000'u64     ## nothing is up before this; make no call.
-  NrTickFrames   = 60           ## ~1 s at 60 fps between probe attempts.
+  NrTickFrames   = 6            ## ~100 ms at 60 fps between readiness checks.
+    ## Was 60 (~1 s). MEASURED on the 2026-08-30 live run: the main menu was
+    ## rebuilt at 0:00:46.234 ("hide seasons: the banner came back after a menu
+    ## rebuild"), readiness read non-null at 0:00:46.469, and the drive landed at
+    ## 0:00:48.953 -- so the whole window in which the player looked at a menu he
+    ## never touches was 2.75 s, ALL of it ours: 1500 ms of NrDriveSettleMs plus
+    ## ~984 ms of this divisor. Nothing before 46 s is menu time (the client is
+    ## loading, and the one human-blocking screen is already auto-submitted 15 ms
+    ## after it appears -- "skip mode screen: Submit called ... after 15ms").
+    ## A tick that is not ready is a handful of integer compares and two guarded
+    ## pointer reads and makes NO call, so 10 Hz costs nothing; the WAITING line
+    ## is de-duped by reason, so it does not spam either.
   NrReportMs     = 15000'u64    ## min gap between two IDENTICAL probe reports.
   NrMaxReports   = 16           ## bounded: never a report per second forever.
   NrProbeWindowMs = 300000'u64  ## after 5 min of probing, stop and say so.
-  NrDriveSettleMs = 1500'u64    ## gap between the writes and OnReadyPressed.
+  NrDriveSettleMs = 250'u64     ## gap between the probe VERDICT and the drive.
+    ## Was 1500 ms, and that number carried NO structural load: `nrDrive` does
+    ## not trust the probe's verdict at all. It re-reads the matchmaker graph,
+    ## re-reads MatchmakerOperation._raidSettings@0x40, re-checks
+    ## _selectedLocation@0xa8 and MatchmakerPlayersController@0xa0, and asserts
+    ## the FINISHED STATE of the offline gate object before it presses -- every
+    ## one of those refuses rather than pressing. Waiting longer therefore buys
+    ## no safety it does not already have; it only lengthens the menu the player
+    ## stares at. 250 ms is kept (not 0) purely so the drive does not land on the
+    ## same frame the menu is still rebuilding, and if the graph is swapped
+    ## during it the generation check disarms and re-probes.
   NrMaxFaults    = 3
   NrMaxLocTries  = 12           ## capped: never retry the lookup forever.
 
@@ -1143,6 +1164,31 @@ proc nrDrive() =
         "offline gate reads (" & nrHex(taRs) & ") holds RaidMode@0x44=" &
         $gateMode & " (Local) and Ready()'s object (" & nrHex(rs) &
         ") holds Local too -- 0x9CCB97 should take LocalGameMatching@0x984170"
+
+  # ---- THE MENU-VISIBLE WINDOW, as a MEASURED number rather than a felt one.
+  # Reference point: the readiness TRANSITION (`gNrReadySince`) -- the first tick
+  # on which the matchmaker graph read non-null. That graph is built BY the main
+  # menu, so it is the closest in-feature proxy for "the menu is on screen"; on
+  # the 2026-08-30 run it trailed the menu rebuild by 235 ms (menu rebuild
+  # 0:00:46.234, readiness 0:00:46.469). The number below is therefore a slight
+  # UNDER-estimate of what the player sees, and is stated as such.
+  if gNrReadySince == 0'u64:
+    warn "nativeRaid MENU-VISIBLE WINDOW: INCONCLUSIVE -- the readiness " &
+         "timestamp was not set, so the window could not be measured. This is " &
+         "not a pass."
+  else:
+    let winMs = cNowMs() - gNrReadySince
+    var verdict = "INCONCLUSIVE"
+    if winMs < 800'u64: verdict = "PASS"
+    elif winMs >= 2484'u64: verdict = "FAIL"
+    okLog "nativeRaid MENU-VISIBLE WINDOW: " & $int(winMs) & " ms from the " &
+          "readiness transition to OnReadyPressed -- " & verdict &
+          ". Baseline before this change: 2484 ms (readiness 0:00:46.469, " &
+          "drive 0:00:48.953 on the 2026-08-30 live run), of which 1500 ms was " &
+          "NrDriveSettleMs and ~984 ms was the 60-frame tick divisor. PASS is " &
+          "under 800 ms, FAIL is at or above the 2484 ms baseline, anything " &
+          "between is INCONCLUSIVE. Add ~235 ms to compare against the frame " &
+          "the menu itself was rebuilt."
 
   gNrPressed = true
   gNrStep = NrDone
