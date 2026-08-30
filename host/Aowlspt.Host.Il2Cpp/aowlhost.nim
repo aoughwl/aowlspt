@@ -341,6 +341,11 @@ static int aowl_rva_is_code(unsigned int rva) {
 ## (included below) and rides the existing TarkovApplication::Update drain.
 ## MUST follow `aowlspt_prologue.h`. See `aowlspt_natraid.h`.
 {.emit: """#include "aowlspt_natraid.h" """.}
+
+## THE NATIVE uGUI ESP's pure-C half -- the single SEH shim, the fixed caps,
+## the faction colour table, the fault budget and the three-outcome verdict
+## vocabulary. No il2cpp; nothing in it can fault.
+{.emit: """#include "aowlspt_natesp.h" """.}
 ## THE EAGER PROLOGUE SNAPSHOT. Defined here because it needs every target
 ## table above it, and CALLED from `hostReady` before any feature binds -- that
 ## ordering is the whole guarantee. Once this has run, no later verify can be
@@ -3376,6 +3381,13 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
     # OFF (`uxNativeRaid` probe, `uxNativeRaidDrive` write+press); idle cost is
     # two integer compares and no call into the game.
     nativeRaidDrainTick(regs)
+    # THE NATIVE uGUI ESP. Rides THIS drain as well -- it installs no detour of
+    # its own, because a second detour on one function overwrites the first's
+    # trampoline and silently kills it. Its whole body is inside ONE
+    # `aowl_p_p_seh` opened by `aowl_ne_tick_guarded`, so this call site opens
+    # none (the guard is not re-entrant). Flag `natEsp`, default OFF; idle cost
+    # is one compare and no call into the game.
+    natEspDrainTick()
     return 0'i32
   # The render-phase drain, likewise by identity: a second detour on a
   # render-phase method that drains the render queue where GL drawing lands.
@@ -5947,6 +5959,20 @@ include "autoraid.nim"
 ## Both flags default OFF (`uxNativeRaid`, `uxNativeRaidDrive`).
 include "natraid.nim"
 
+## THE NATIVE uGUI ESP -- contact boxes as REAL Tarkov GameObjects rather than
+## our own overlay pixels. `include`d HERE, after `inspect.nim`, because it is
+## the first file that can stand on all four of the layers it needs at once:
+## `nativeui.nim`'s `nu*` construction primitives and its bounded intern table,
+## `debugui.nim`'s cached `gDuGameWorld`, guarded `duPlayerPos`, `duCamera` and
+## `WorldToScreenPoint` thunk, `botdiag.nim`'s `bdReadSideRole`/`bdIsYou` and
+## the GameWorld offsets, and `inspect.nim`'s scene-root enumeration plus the
+## byte-verified `Component::GetComponent(String)` the canvas discovery walks
+## with. It resolves NO address of its own and installs NO detour:
+## `natEspDrainTick` rides the `TarkovApplication::Update` drain above. Flags
+## `natEsp` and `natEspDiag`, both default OFF; `natEsp` additionally requires
+## `nativeUi`, because the nu* primitives are its only way to draw.
+include "natesp.nim"
+
 ## THE SHARED PER-FRAME REGION. Included AFTER `modstab.nim` because
 ## `bindRegion` names `gModsSlot` and `cDuPreloaderTarget`, and nimony
 ## forward-resolves procs across an include boundary but NOT variables.
@@ -7554,6 +7580,13 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   # `aowlUiProof` runs the one-shot dual-backend self-proof.
   gAuOn = readBoolKey("aowlUi") and gNuOn
   gAuProof = gAuOn and readBoolKey("aowlUiProof")
+  # The NATIVE uGUI ESP. Both default OFF. `natEsp` arms discovery + the pool;
+  # `natEspDiag` additionally logs the three-outcome verdict every 5s. The
+  # `and gNuOn` is not belt-and-braces: without the nu* layer this feature has
+  # no way to construct a single box, and arming it would only produce a
+  # feature that reports "the callback ran" forever.
+  gNeOn = readBoolKey("natEsp") and gNuOn
+  gNeDiag = gNeOn and readBoolKey("natEspDiag")
   # NOTE: `bindNativeUi` is deliberately NOT called here. It was, and the first
   # live run showed why that is wrong: this pass runs before il2cpp is attached
   # and before GameAssembly.dll is loaded, so all 25 targets refused with "no
@@ -7979,6 +8012,12 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
         bindNativeUi(true)
       if gAuOn:
         bindAowlUi(true)
+      # The native uGUI ESP, for the same reason and in the same place: its
+      # readiness report is only meaningful after GameAssembly.dll is loaded
+      # and `cProPrimeAll()` has primed the prologue snapshot the layers it
+      # stands on verify against. It binds no detour.
+      if gNeOn:
+        bindNativeEsp(true)
 
       if gMi2Probe and not bindManagedInvoke(true):
         info "the managed-invoke probe did not verify " &
