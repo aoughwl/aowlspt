@@ -1170,81 +1170,40 @@ proc generateProfile*(t: BotTables; base: string; req: BotRequest;
 proc generateOne*(t: BotTables; req: BotRequest; index: int): string =
   result = generateProfile(t, botBase(), req, index)
 
-const
-  PmcConversionChance = 0.28
-    ## SPT-style offline PMC spawning. Every bot-category `SpawnPointParams` on
-    ## every stock map -- including the 32 dedicated `BotPmc`-category points on
-    ## Woods -- is tagged `Sides:["Savage"]` (measured 2026-08-30 against
-    ## `post1/locations.json`), and the client keys the role it requests off the
-    ## wave's `BotSide`, ignoring `WildSpawnType` (fact #259). So a `pmcUSEC`
-    ## wave on `BotSide:"Usec"` finds no spawn point and places nothing, while
-    ## the same wave on `BotSide:"Savage"` places an assault SCAV. Neither wave
-    ## can put a PMC on the map. The only mechanism the data supports is SPT's:
-    ## the client asks `bot/generate` for `assault` bots (which DO have Savage
-    ## spawn points), and the server converts a fraction of that batch into
-    ## `pmcUSEC`/`pmcBEAR` profiles -- correct `Info.Side` and PMC loadout --
-    ## which the client then places at the assault spawn points it already chose.
-    ##
-    ## 0.28 against the ~32 assault bots a Woods offline raid requests yields a
-    ## mean of ~9 PMCs, mixed Usec/Bear -- a minority present in every raid, as
-    ## intended, with the rest still scavs. Independent per bot, so it is robust
-    ## to however the client batches its `bot/generate` calls.
-
-proc convertsToPmc(role: string): bool =
-  ## Which requested scav roles are eligible to become a PMC. Only the plain
-  ## wandering scav; bosses, followers, cultists and the infected stay what the
-  ## wave asked for.
-  case toLowerAscii(role)
-  of "assault", "cursedassault": true
-  else: false
-
 proc generate*(body: string; generated: var int): string =
   ## The whole batch, as the array the client expects.
+  ##
+  ## Offline PMCs are NOT produced here. Server-side conversion of a fraction of
+  ## an `assault` batch into `pmcUSEC`/`pmcBEAR` profiles was tried and PROVEN
+  ## inert live (2026-08-30): the client sets a spawned bot's `Side` from the
+  ## ROLE it requested for the wave, not from the `Info.Side` of the profile it
+  ## is handed, so a converted PMC in an `assault` batch still spawns Savage.
+  ## PMCs are produced instead by emitting real `pmcUSEC`/`pmcBEAR` waves that
+  ## can place -- see `emu/raid.offlineScavWaves` and the `BotPmc` spawn-point
+  ## sides in `post1/locations.json`. This proc simply honours whatever role the
+  ## client asks for.
   generated = 0
   var out1 = arr()
   let requests = parseRequests(body)
   # Diagnostic: make the requested role/limit/difficulty visible. The backend
   # logs only "REQ POST /client/game/bot/generate" with no body, so before this
-  # there was no way to see what the client actually asked for -- exactly the
-  # gap that made the offline-PMC problem hard to see.
+  # there was no way to see what role the client actually asked for -- exactly
+  # the gap that made the offline-PMC problem hard to see. This is how the wave
+  # approach is confirmed: a `Role=pmcUSEC` line here proves the client acted on
+  # a placeable PMC wave.
   for req in requests:
     info "bot/generate request: Role=" & req.role & " Limit=" & $req.count &
          " Difficulty=" & req.difficulty
   # Once for the batch, not once per bot: the same reason the role's tables are
   # read once. It is cached either way, and a cache hit still copies 2 KB.
   let base = botBase()
-  # PMC tables read once for the whole batch. Convert only if at least one side
-  # actually has tables -- an empty db must not turn scavs into naked PMCs.
-  let usecTables = loadTables("pmcUSEC")
-  let bearTables = loadTables("pmcBEAR")
-  let canConvert = usecTables.ok or bearTables.ok
-  var rng = seededRng(body & ":pmcconv")
-  var pmcUsec = 0
-  var pmcBear = 0
   for req in requests:
     let tables = loadTables(req.role)
-    let eligible = canConvert and convertsToPmc(req.role)
     var i = 0
     while i < req.count:
-      var useReq = req
-      var useTables = tables
-      if eligible and chance(rng, PmcConversionChance):
-        # Bear when Bear tables exist and (Usec absent or the coin says Bear).
-        let wantBear = bearTables.ok and (not usecTables.ok or nextInt(rng, 2) == 0)
-        if wantBear:
-          useReq = BotRequest(role: "pmcBEAR", difficulty: req.difficulty, count: 1)
-          useTables = bearTables
-          inc pmcBear
-        else:
-          useReq = BotRequest(role: "pmcUSEC", difficulty: req.difficulty, count: 1)
-          useTables = usecTables
-          inc pmcUsec
-      out1.add raw(generateProfile(useTables, base, useReq, i))
+      out1.add raw(generateProfile(tables, base, req, i))
       inc generated
       inc i
-  if pmcUsec > 0 or pmcBear > 0:
-    info "bot/generate: converted " & $(pmcUsec + pmcBear) & " scav(s) to PMC (" &
-         $pmcUsec & " USEC, " & $pmcBear & " BEAR)"
   result = done(out1).text
 
 # ---------------------------------------------------------------------------
