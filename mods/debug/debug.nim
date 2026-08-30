@@ -78,6 +78,7 @@ import aowlspt/settings
 import aowlspt/json
 
 import "dbg" / prof
+import "dbg" / overlaydiag
 
 const
   ModGuid = "aowl.debug"
@@ -292,34 +293,41 @@ proc writeOverlayConfig() =
   # back off disk and check the field list the HOST will parse is the one that
   # was asked for. A `writeFile` that did not raise is not evidence the file on
   # disk says what it should.
+  #
+  # It is checked through `overlayDiag` against the OTHER document -- the
+  # `config.json` the settings surface writes -- and not against the local
+  # variables this proc just used, because a check that compares our own write
+  # to our own intent is the check that cannot fail (§9b). The earlier version
+  # here did exactly that: it re-read the file it had just written and
+  # confirmed the two strings it had itself produced matched. It passed on
+  # every single one of the applies the player reported as doing nothing,
+  # because it was never the write that was broken -- this proc was simply
+  # never called.
   var back = ""
   try: back = readFile(path)
   except: back = ""
-  let want = setting("overlayFields").asText(DefaultFields)
-  # The COLOUR is checked the same way and for a sharper reason: a colour is the
+  var cfgWhole = setting("").raw
+  # The COLOUR is inside that comparison for a sharper reason: a colour is the
   # one value here that can come back *plausible but different*. A field list
   # either survives or is visibly mangled, but a colour that drifts from
   # "1,1,0.62" to "1,1,0.6200000000000001" still renders as the right yellow, so
   # nothing on screen would ever reveal it -- and the next save would drift it
-  # again. Asserting the EXACT text off disk is what makes that falsifiable.
-  let wantColor = setting("overlayColor").asText("1,1,0.62")
-  if back.len == 0:
-    gOverlayWriteState = "INCONCLUSIVE: wrote " & path &
-                         " but could not read it back"
-  elif not back.contains(jstr(want)):
-    gOverlayWriteState = "FAILED: " & path &
-                         " does not read back with the requested line list"
-  elif not back.contains(jstr(wantColor)):
-    gOverlayWriteState = "FAILED: " & path & " does not read back the colour " &
-                         "that was set (wanted " & wantColor & " verbatim) -- " &
-                         "the value drifted between the settings edit and disk"
-  else:
+  # again. `overlayDiag` compares colours as EXACT text for that reason, and
+  # only the numeric rows tolerate `16` vs `16.0`.
+  var detail = ""
+  let v = overlayDiag(cfgWhole, back, detail)
+  case v
+  of dvInconclusive:
+    gOverlayWriteState = "INCONCLUSIVE: wrote " & path & " -- " & detail
+  of dvFail:
+    gOverlayWriteState = "FAILED: " & detail
+  of dvPass:
     gOverlayWrites = gOverlayWrites + 1
-    gOverlayWriteState = "PASS: " & path & " reads back with " &
-                         $(want.split(',').len) & " lines and colour " &
-                         wantColor & " byte-for-byte (write #" &
-                         $gOverlayWrites & "). The host picks this up live " &
-                         "while the panel is on screen; no F3 cycle needed."
+    gOverlayWriteState = "PASS: " & path & " -- " & detail &
+                         " (write #" & $gOverlayWrites & "). The host " &
+                         "re-reads this file while the panel is on screen " &
+                         "(panelLiveReload defaults ON), so no F3 cycle is " &
+                         "needed."
 
 proc applyConfig() =
   gSpinMs = setting("selfTestSpinMs").asFloat(0.0)
@@ -328,6 +336,107 @@ proc applyConfig() =
   # middle of an already-running window.
   profSetEnabled(setting("profiler").asBool(false))
   writeOverlayConfig()
+
+# ---------------------------------------------------------------------------
+# The hot-apply hook -- MEASURED to be the whole bug
+# ---------------------------------------------------------------------------
+#
+# This mod is `sides = {sideClient, sideSim}`, so it lives in the GAME process
+# and the client host refuses `route_register` outright ("the client does not
+# serve HTTP; routes are server-side", aowlhost.nim:1802). The `serve()` calls
+# in `onLoad` therefore register into nothing, and `onDebugSettings` -- the only
+# thing that ever called `applyConfig` after load -- could never run.
+#
+# What actually happens when the player drags a slider:
+#
+#   overlay -> POST /aowlspt/settings/aowl.debug   (modsettingsrender.nim:376)
+#           -> the BACKEND process answers it; `mods/settingshub` catches it on
+#              its `/aowlspt/settings/` prefix and QUEUES it, because the
+#              backend does not own this mod (settingshub.nim:286)
+#           -> the game process drains the queue on its ~5s sync
+#              (settingsbridge.nim) and republishes it on the event bus
+#           -> `onApplyQuery` (settings.nim:697) stores it into config.json
+#              and then calls the mod's apply hook
+#           -> THERE WAS NO APPLY HOOK.
+#
+# So config.json was written and `aowlspt-debugui.json` was not, which is
+# exactly the two timestamps the user measured. The host said so, in as many
+# words, on every single edit -- `aowlspt-host.log`:
+#
+#   warn  client settings bridge: NO EFFECT 'aowl.debug'.overlayFontSize --
+#         stored, but this mod registered no onSettingsApplied hook, so nothing
+#         re-read it.
+#
+# Every other client-side settings mod (fov, graphics, maps, textures, admin)
+# registers one. This one did not. That is the fix; the reconcile below is the
+# belt-and-braces for the paths a hook cannot cover.
+
+proc onDebugApply(key: string) =
+  applyConfig()
+  if gOverlayWriteState.len >= 4 and gOverlayWriteState.substr(0, 3) == "PASS":
+    settingApplied("aowlspt-debugui.json now agrees with config.json on " &
+                   "every overlay key; the host re-reads it live")
+  elif gOverlayWriteState.len >= 7 and
+       gOverlayWriteState.substr(0, 6) == "REFUSED":
+    settingIgnored("the overlay config file could not be located, so nothing " &
+                   "was written: " & gOverlayPathFault)
+  else:
+    # Deliberately NOT reported as applied. A hook that says "applied" when the
+    # finished-state check did not pass is the same lie this whole change is
+    # about.
+    settingIgnored("the overlay file was not brought into agreement with " &
+                   "config.json: " & gOverlayWriteState)
+
+# ---------------------------------------------------------------------------
+# The reconcile -- the file is the only thing both processes share
+# ---------------------------------------------------------------------------
+
+const cReconcilePeriodMs = 1000'i64
+
+var gReconcileAt = 0'i64
+var gCfgSeen = ""
+var gReconciles = 0
+var gReconcileState = "not run yet"
+
+proc reconcileTick() =
+  ## Once a second, ask whether `config.json` has changed under us and, if it
+  ## has, redo the translation.
+  ##
+  ## The apply hook above covers the edit that arrives on the bus. This covers
+  ## every OTHER way the file can change -- an edit applied while this mod was
+  ## mid-load, a hand edit of config.json, a future transport, a queued edit
+  ## drained by a bridge that does not fire the bus -- and it is the same
+  ## pattern the maps mod ended up needing for the identical cross-process
+  ## split, for the identical reason: the FILE is the only thing the backend
+  ## and the game process both touch, so the file is what gets reconciled.
+  ##
+  ## Cheap by construction: one read of a ~1 KB file per second, and a write
+  ## only when the bytes actually differ, so a session where nothing is edited
+  ## performs zero writes.
+  let now = nowMs()
+  if now < gReconcileAt:
+    return
+  gReconcileAt = now + cReconcilePeriodMs
+  let whole = setting("").raw
+  if whole.len == 0:
+    gReconcileState = "INCONCLUSIVE: config.json could not be read this tick"
+    return
+  if whole == gCfgSeen:
+    return
+  let first = gCfgSeen.len == 0
+  gCfgSeen = whole
+  if first:
+    # The first observation is a baseline, not a change. Reconcile anyway --
+    # `onLoad` already did, and doing it twice is idempotent -- but do not
+    # claim a change was detected.
+    gReconcileState = "baseline taken"
+    return
+  gReconciles = gReconciles + 1
+  applyConfig()
+  gReconcileState = "reconcile #" & $gReconciles & ": " & gOverlayWriteState
+  if gReconciles <= 3:
+    info "debug: mods/debug/config.json changed -- retranslated it into " &
+         "aowlspt-debugui.json. " & gOverlayWriteState
 
 # ---------------------------------------------------------------------------
 # The profile report -- text for the log, JSON for a tool
@@ -459,6 +568,62 @@ proc onDebugSettingsReset(url, body, session: string): string =
 proc onProfileRoute(url, body, session: string): string =
   result = profileJson()
 
+proc overlayDiagText*(): string =
+  ## PASS / FAIL / INCONCLUSIVE on the question the player actually asked:
+  ## "did changing that setting reach the panel?"
+  ##
+  ## It compares two documents that neither belong to this proc: the
+  ## `config.json` the SETTINGS SURFACE writes, and the `aowlspt-debugui.json`
+  ## the HOST consumes. Both are read fresh off disk at the moment of the
+  ## question. It is not a re-read of our own write -- when the translation
+  ## does not run, the two documents disagree and this goes RED, which is
+  ## precisely the state that was live and undetected.
+  ##
+  ## HONEST LIMIT, stated because leaving it out would make this look stronger
+  ## than it is: a mod cannot read the host's in-memory `gDuCfg`, so the last
+  ## hop -- file on disk -> pixels -- is not covered here. That hop is the
+  ## host's `duHotReloadTick`, which is ON by default (`panelLiveReload`
+  ## defaults to `true`, debugui.nim:683), re-reads this exact file, and
+  ## announces itself in the host log with the font/x/y/colour it adopted. So
+  ## the evidence for the last hop exists; it is just in the host's log and not
+  ## in this string, and this string must not be read as covering it.
+  var cfgWhole = setting("").raw
+  var panel = ""
+  let path = overlayPath()
+  if path.len > 0:
+    try: panel = readFile(path)
+    except: panel = ""
+  var detail = ""
+  let v = overlayDiag(cfgWhole, panel, detail)
+  result = "debug overlay settings: " & verdictName(v) & "\n" &
+           "  " & detail & "\n" &
+           "  panel writes : mods/debug/config.json (overlay* keys)\n" &
+           "  host reads   : " &
+           (if path.len > 0: path else: "UNLOCATED -- " & gOverlayPathFault) &
+           " (panel* keys)\n" &
+           "  last write   : " & gOverlayWriteState & "\n" &
+           "  reconcile    : " & gReconcileState & "\n" &
+           "  NOT COVERED  : whether the host has re-read the file into the " &
+           "live panel. See 'debugui: aowlspt-debugui.json changed on disk' " &
+           "in aowlspt-host.log for that hop.\n"
+
+proc onOverlayDiagRoute(url, body, session: string): string =
+  var d = ""
+  var cfgWhole = setting("").raw
+  var panel = ""
+  let path = overlayPath()
+  if path.len > 0:
+    try: panel = readFile(path)
+    except: panel = ""
+  let v = overlayDiag(cfgWhole, panel, d)
+  result = "{\"verdict\":" & jstr(verdictName(v)) &
+           ",\"detail\":" & jstr(d) &
+           ",\"overlayFile\":" & jstr(path) &
+           ",\"lastWrite\":" & jstr(gOverlayWriteState) &
+           ",\"reconcile\":" & jstr(gReconcileState) &
+           ",\"reconciles\":" & $gReconciles &
+           ",\"coversLivePanel\":false}"
+
 # ---------------------------------------------------------------------------
 # The tick
 # ---------------------------------------------------------------------------
@@ -492,6 +657,7 @@ proc burn(ms: float) =
 proc onUpdate(elapsedMs: int64): Status =
   gTick = gTick + 1
   burn(gSpinMs)
+  reconcileTick()
   # Report once the run has settled. Not on the first tick: at tick 1 no window
   # has completed and the only honest report is "INCONCLUSIVE", which would
   # then be the only line in the log for the rest of the session.
@@ -505,10 +671,38 @@ proc onUpdate(elapsedMs: int64): Status =
 # ---------------------------------------------------------------------------
 
 proc onLoad(): Status =
-  declareSettings(debugSchema())
+  let schema = debugSchema()
+  declareSettings(schema)
+
+  # THE HOOK. Without this line the whole settings page for this mod is a set
+  # of controls that move, persist, and change nothing until the next restart
+  # -- see `onDebugApply` for the measured chain. Registered BEFORE the routes,
+  # because the routes are the half that does not work in this process.
+  onSettingsApplied(onDebugApply)
+
+  # The three-copies-of-one-decision hazard, named in config.json's own
+  # `_comment`, checked instead of hoped for. It is loud on purpose: a drift
+  # here is a control that renders and does nothing, which is the failure mode
+  # that is invisible from every side.
+  var keys: seq[string] = @[]
+  for s in schema: keys.add s.key
+  var xdetail = ""
+  let xv = schemaCrossCheck(setting("").raw, keys, xdetail)
+  case xv
+  of dvFail:
+    warn "debug: SCHEMA DRIFT -- " & xdetail
+  of dvInconclusive:
+    warn "debug: the schema/translation cross-check could not run -- " & xdetail
+  of dvPass:
+    discard
+
+  # These register into nothing in the game process (the client host refuses
+  # route_register) and into the backend when this mod is loaded server-side.
+  # Kept because they are the correct server-side transport; NOT relied on.
   discard serve("/aowlspt/settings/" & ModGuid, onDebugSettings)
   discard serve("/aowlspt/settings/" & ModGuid & "/reset", onDebugSettingsReset)
   discard serve("/aowlspt/debug/profile", onProfileRoute)
+  discard serve("/aowlspt/debug/overlay", onOverlayDiagRoute)
 
   if not profReady():
     warn ModName & " " & ModVersion & ": the shared profile region could not " &
@@ -524,6 +718,7 @@ proc onLoad(): Status =
        "profiler is OFF by default -- turn on 'Per-mod profiler' and add " &
        "'prof1'..'prof8' to the overlay lines, or GET /aowlspt/debug/profile."
   info "  overlay config: " & gOverlayWriteState
+  info overlayDiagText()
   result = Ok
 
 proc onUnload(): Status =
