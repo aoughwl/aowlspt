@@ -293,6 +293,14 @@ proc nrRaidModeName(v: int32): string =
   of 3: "Narrate"
   else: "OUT-OF-RANGE"
 
+proc nrSame(a, b: Il2CppPtr): string =
+  ## Never print two pointers without saying whether they are the same object.
+  ## Three outcomes, not two: a null on either side is INCONCLUSIVE, not
+  ## "different".
+  if a == nil or b == nil: "INCONCLUSIVE (one of them is null)"
+  elif a == b: "SAME object"
+  else: "DIFFERENT objects"
+
 proc nrReadStr(p: Il2CppPtr): string =
   ## A `System.String` by its FIXED runtime layout -- length int32 @+0x10,
   ## UTF-16 chars inline @+0x14 -- with NO reflection, every read
@@ -849,6 +857,29 @@ proc nrProbe(): bool =
        nrHex(moOffRs) & " is only read in the RaidMode==Online branch; " &
        "TarkovApplication CurrentRaidSettings=" & nrHex(rs) & ") -- " & s
 
+  # k) THE OFFLINE GATE. `<OnReadyToStartMatchingAsync>d__195::MoveNext`@0x9CC7B0
+  # branches at 0x9CCB97 on `[[rbx+0xd8]+0x44] == 1`, and rbx is PROVED to be the
+  # TarkovApplication by 0x9CCB81 `inc dword [rbx+0x1e4]`
+  # (<CurrentTotalRaidNum>k__BackingField). Print all four references side by
+  # side with their RaidMode, so ONE read-only run settles which object is which
+  # instead of a rebuild per question. `forceOfflinePractice` is a UI-toggle
+  # mechanism and does NOT apply to the native path, which bypasses the UI.
+  let taRsP = cNrReadPtr(app, NrTaRaidSettings)
+  var kMode = -1'i32
+  discard cNrReadI32(taRsP, NrRsRaidMode, addr kMode)
+  var kModeMo = -1'i32
+  discard cNrReadI32(moRs, NrRsRaidMode, addr kModeMo)
+  var kModeOff = -1'i32
+  discard cNrReadI32(moOffRs, NrRsRaidMode, addr kModeOff)
+  info "nativeRaid PROBE k) OFFLINE GATE @0x9CCB87 reads TarkovApplication." &
+       "_raidSettings@0xd8=" & nrHex(taRsP) & " RaidMode=" & $kMode & "(" &
+       nrRaidModeName(kMode) & "); get_CurrentRaidSettings()=" & nrHex(rs) &
+       " [" & nrSame(taRsP, rs) & "]; MatchmakerOperation._raidSettings@0x40=" &
+       nrHex(moRs) & " RaidMode=" & $kModeMo & " [vs gate: " &
+       nrSame(taRsP, moRs) & "]; MatchmakerOperation._offlineRaidSettings@0x48=" &
+       nrHex(moOffRs) & " RaidMode=" & $kModeOff & " [vs gate: " &
+       nrSame(taRsP, moOffRs) & "]"
+
   if prereq:
     s = "PREREQS-PASS -- every prerequisite for a native READY is satisfied"
     if gNrDrive:
@@ -874,6 +905,81 @@ proc nrWriteText(r: int32): string =
   of 2: "already correct, nothing written"
   of 1: "WRITTEN and read back"
   else: "REFUSED (unreadable, unwritable, or the store did not stick)"
+
+proc nrIsRaidSettings(p, refRs: Il2CppPtr; why: var string): bool =
+  ## POSITIVE identification before ANY write, per CLAUDE.md rule 8. Three
+  ## independent things must hold; a failure REFUSES with a reason and writes
+  ## nothing. `refRs` is the object STAGE 2 has already written and read back
+  ## `LocationId == "Woods"` from, so its `Il2CppClass*` at +0x0 is a KNOWN-GOOD
+  ## RaidSettings klass -- comparing headers is a raw pointer compare and needs
+  ## no reflection export (all of which are token-gated on this build).
+  if p == nil:
+    why = "it is null"
+    return false
+  if refRs == nil or cIsReadable(refRs, 0xb8'i32) == 0'i32:
+    why = "there is no readable reference RaidSettings to compare a klass against"
+    return false
+  if cIsReadable(p, 0xb8'i32) == 0'i32:
+    why = "it is not readable for 0xb8 bytes"
+    return false
+  let k = cNrReadPtr(p, 0'i32)
+  let kr = cNrReadPtr(refRs, 0'i32)
+  if k == nil or kr == nil:
+    why = "the Il2CppClass* in the object header at +0x0 did not read"
+    return false
+  if k != kr:
+    why = "its klass " & nrHex(k) & " differs from the known-good RaidSettings " &
+          "klass " & nrHex(kr) & " -- this is NOT a RaidSettings"
+    return false
+  var v = 0'i32
+  if cNrReadI32(p, NrRsSide, addr v) == 0'i32 or v < 0'i32 or v > 2'i32:
+    why = "Side@0x20 reads " & $v & ", outside the 0..2 the enum allows"
+    return false
+  if cNrReadI32(p, NrRsRaidMode, addr v) == 0'i32 or v < 0'i32 or v > 3'i32:
+    why = "RaidMode@0x44 reads " & $v & ", outside the 0..3 the enum allows"
+    return false
+  why = "klass " & nrHex(k) & " matches, Side and RaidMode both in range"
+  true
+
+proc nrApplyOffline(p, refRs, app: Il2CppPtr; label: string) =
+  ## Install Pmc(0) / Local(1) / the resolved Woods Location into ONE FURTHER
+  ## RaidSettings object. Not fatal: the primary object is already written and
+  ## verified, so a refusal here is logged and the caller's own finished-state
+  ## assert decides whether READY may be pressed.
+  var why = ""
+  if not nrIsRaidSettings(p, refRs, why):
+    warn "nativeRaid DRIVE GATE: REFUSING to write " & label & "=" & nrHex(p) &
+         " -- " & why & ". Nothing was written to it."
+    return
+  if cNrReadPtr(p, NrRsSelectedLoc) == nil:
+    # The primary object may already have had a selection, in which case
+    # `gNrLoc` was never resolved. Resolve from THIS object's own
+    # `_locationSettings@0xb0`; the resolve sets `gNrLoc` only after reading
+    # back Id == "Woods", and is a no-op if one is already in hand.
+    if gNrLoc == nil:
+      nrResolveWoods(p, app)
+    let fnSet = cNrFn(NrTSetSelectedLoc)
+    if gNrLoc == nil or fnSet == nil:
+      warn "nativeRaid DRIVE GATE " & label & "=" & nrHex(p) &
+           " has _selectedLocation@0xa8 null and no verified " &
+           "set_SelectedLocation route to fill it -- leaving 0xa8 alone rather " &
+           "than storing a pointer by hand"
+    else:
+      # Through the SETTER, never a raw store: 0xa8 is a managed reference and
+      # the setter also writes LocationId@0x30 under the GC write barrier.
+      cNrSetSelectedLocation(fnSet, p, gNrLoc)
+  let wSide = cNrWriteI32Checked(p, NrRsSide, NrSidePmc)
+  let wMode = cNrWriteI32Checked(p, NrRsRaidMode, NrRaidModeLocal)
+  # Assert the FINISHED STATE of the object, re-read fresh -- not our own write.
+  var back = -1'i32
+  discard cNrReadI32(p, NrRsRaidMode, addr back)
+  let bid = nrReadStr(cNrReadPtr(p, NrRsLocationId))
+  okLog "nativeRaid DRIVE GATE " & label & "=" & nrHex(p) & " IDENTIFIED (" &
+        why & "): Side@0x20 " & nrWriteText(wSide) & "; RaidMode@0x44 " &
+        nrWriteText(wMode) & " -- READ BACK RaidMode@0x44=" & $back & " (" &
+        nrRaidModeName(back) & "), _selectedLocation@0xa8=" &
+        nrHex(cNrReadPtr(p, NrRsSelectedLoc)) & ", LocationId@0x30=\"" & bid &
+        "\" -- read from the live object"
 
 proc nrDrive() =
   let app = gNrApp
@@ -969,6 +1075,74 @@ proc nrDrive() =
     nrFail("STAGE 2: RaidSettings.RaidMode does not read Local(1) after the " &
            "write (reads " & $back & ") -- refusing to press READY")
     return
+
+  # -------------------------------------------------------------------------
+  # THE OFFLINE GATE IS IN A DIFFERENT STATE MACHINE. Measured 2026-08-30 by
+  # disassembling `EFT.TarkovApplication::<OnReadyToStartMatchingAsync>d__195::
+  # MoveNext` @0x9CC7B0 (capstone over the `il2cpp` section of
+  # GameAssembly.dll):
+  #   009ccb35  mov  rbx, [rdi+0x28]     <- the state machine's `<>4__this`
+  #   009ccb81  inc  dword [rbx+0x1e4]   <- TarkovApplication
+  #                                         .<CurrentTotalRaidNum>k__Backing-
+  #                                         Field@0x1e4  == THE PROOF rbx is a
+  #                                         TarkovApplication
+  #   009ccb87  mov  rax, [rbx+0xd8]     <- TarkovApplication._raidSettings@0xd8
+  #   009ccb97  cmp  dword [rax+0x44], 1
+  #             je  -> LocalGameMatching   0x984170   (OFFLINE)
+  #             else-> NetworkGameMatching 0x984360   (ONLINE)
+  # rbx also feeds +0x128 (_menuOperation) and +0xb0, both TarkovApplication
+  # fields per `fldoff.py fields EFT.TarkovApplication`, so the identification
+  # is over-determined, not inferred from one offset.
+  # So the gate reads `TarkovApplication._raidSettings@0xd8` -- the SAME slot
+  # `get_CurrentRaidSettings`@0x691340 returns (its whole body is
+  # `48 8B 81 D8 00 00 00 C3`) -- which need NOT be
+  # `MatchmakerOperation._raidSettings@0x40` that `<Ready>d__40` reads. On the
+  # 2026-08-30 live run we wrote only @0x40, and the client took
+  # NetworkGameMatching (`NetworkGameMatching` x8, zero `Geometry`/
+  # `LocationLoaded` in output_000.log). So write EVERY RaidSettings the commit
+  # path can read -- each POSITIVELY IDENTIFIED first, never blind-written.
+  # NOTE: the `forceOfflinePractice` flag does NOT cover this path. It is a
+  # UI-toggle mechanism, and the native drive bypasses the UI entirely; do not
+  # assume it makes any of the writes below redundant.
+  let taRs = cNrReadPtr(app, NrTaRaidSettings)
+  let moOffRs = cNrReadPtr(mo, NrMoOfflineRs)
+  info "nativeRaid DRIVE GATE the RaidSettings references, side by side: " &
+       "TarkovApplication._raidSettings@0xd8=" & nrHex(taRs) &
+       " (THE OFFLINE GATE, and what get_CurrentRaidSettings@0x691340 returns)" &
+       "; MatchmakerOperation._raidSettings@0x40=" & nrHex(rs) &
+       " (what <Ready>d__40 reads); MatchmakerOperation._offlineRaidSettings" &
+       "@0x48=" & nrHex(moOffRs) & " -- gate vs Ready: " & nrSame(taRs, rs) &
+       "; gate vs offline: " & nrSame(taRs, moOffRs) & "; Ready vs offline: " &
+       nrSame(rs, moOffRs)
+  if taRs != nil and taRs != rs:
+    nrApplyOffline(taRs, rs, app,
+      "TarkovApplication._raidSettings@0xd8 (THE OFFLINE GATE)")
+  if moOffRs != nil and moOffRs != rs and moOffRs != taRs:
+    nrApplyOffline(moOffRs, rs, app,
+      "MatchmakerOperation._offlineRaidSettings@0x48")
+
+  # FINISHED-STATE ASSERT ON THE GATE ITSELF, and it can fail: if the object
+  # `<OnReadyToStartMatchingAsync>d__195` will read does not hold Local(1) at
+  # this instant, pressing READY reproduces the ONLINE run exactly.
+  var gateMode = -1'i32
+  if taRs == nil:
+    nrFail("STAGE 2: TarkovApplication._raidSettings@0xd8 is null. That is the " &
+           "object the offline gate at 0x9CCB87 dereferences; pressing READY " &
+           "would either NRE there or take NetworkGameMatching. Refusing.")
+    return
+  if cNrReadI32(taRs, NrRsRaidMode, addr gateMode) == 0'i32 or
+     gateMode != NrRaidModeLocal:
+    nrFail("STAGE 2: the OFFLINE GATE object " &
+           "TarkovApplication._raidSettings@0xd8=" & nrHex(taRs) &
+           " does not read RaidMode Local(1) -- it reads " & $gateMode & " (" &
+           nrRaidModeName(gateMode) & "). The gate at 0x9CCB97 compares THIS " &
+           "field, so pressing READY now would take NetworkGameMatching " &
+           "exactly as the 2026-08-30 live run did. Refusing to press.")
+    return
+  okLog "nativeRaid DRIVE GATE finished-state assert PASSES: the object the " &
+        "offline gate reads (" & nrHex(taRs) & ") holds RaidMode@0x44=" &
+        $gateMode & " (Local) and Ready()'s object (" & nrHex(rs) &
+        ") holds Local too -- 0x9CCB97 should take LocalGameMatching@0x984170"
 
   gNrPressed = true
   gNrStep = NrDone
