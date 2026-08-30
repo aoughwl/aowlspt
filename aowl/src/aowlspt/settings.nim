@@ -60,6 +60,24 @@ type
       ## is told up front to draw a searchable typeahead rather than a `<select>`
       ## with ten thousand `<option>`s in it, and that the choices may be fetched
       ## on demand from `optionsUrl` instead of shipped inline.
+    stColor
+      ## A COLOUR, drawn as a picker (saturation/value field + hue strip + RGBA
+      ## sliders + a hex box), stored as a STRING.
+      ##
+      ## The on-disk shape is deliberately the one the host ALREADY parses for
+      ## `panelColor`/`espColor` in `aowlspt-debugui.json` -- `"r,g,b"` or
+      ## `"r,g,b,a"`, each component a decimal in 0..1. That choice is the whole
+      ## reason this is a safe addition rather than a migration: `stColor` is a
+      ## RENDERING HINT over `stString`'s exact value shape, the same way
+      ## `stSelect` is a hint over `stEnum`'s. Every existing colour key on disk
+      ## (they are all `stringSetting` today) keeps parsing, byte for byte, and a
+      ## renderer that has never heard of `color` degrades to the free-text box
+      ## it draws right now -- which is the current behaviour, so nothing can
+      ## regress by adding this.
+      ##
+      ## Alpha is OPTIONAL and preserved: a value that arrives with three
+      ## components is written back with three, so a target that has no alpha
+      ## channel never grows a spurious fourth number in its config.
 
   Setting* = object
     key*: string          ## the config.json key, verbatim
@@ -97,6 +115,7 @@ proc kindName*(k: SettingType): string =
   of stString:  result = "string"
   of stKeybind: result = "keybind"
   of stSelect:  result = "select"
+  of stColor:   result = "color"
 
 # ---------------------------------------------------------------------------
 # Builders — one per type, so a mod never hand-fills the object
@@ -157,6 +176,27 @@ proc stringSetting*(key, label: string; default: string;
 proc keybindSetting*(key, label: string; default: string;
                      category = ""; subcategory = ""; description = ""; implemented = true; appliesOn = "live"): Setting =
   result = Setting(key: key, label: label, kind: stKeybind,
+                   defaultJson: "\"" & server.escapeText(default) & "\"",
+                   lo: 0.0, hi: 0.0, step: 0.0, hasRange: false,
+                   options: @[], category: category, subcategory: subcategory,
+                   optionLabels: @[], optionsUrl: "", description: description,
+                   implemented: implemented, appliesOn: appliesOn)
+
+proc colorSetting*(key, label: string; default: string;
+                   category = ""; subcategory = ""; description = "";
+                   implemented = true; appliesOn = "live"): Setting =
+  ## A colour row. `default` is `"r,g,b"` or `"r,g,b,a"`, components in 0..1 --
+  ## the exact text the host's `duParseRgb` already reads out of
+  ## `aowlspt-debugui.json`, so switching an existing `stringSetting` colour key
+  ## to this builder changes the DRAWN CONTROL and nothing on disk.
+  ##
+  ## Note what is deliberately NOT done here: the default is not normalised,
+  ## re-formatted or round-tripped through a float. A colour that goes in as
+  ## `"1,1,0.62"` is stored as `"1,1,0.62"`. Re-formatting is how a colour picks
+  ## up drift -- `0.62` becoming `0.6200000000000001` on every save -- and drift
+  ## in a value the user typed is indistinguishable, from the outside, from the
+  ## setting not persisting.
+  result = Setting(key: key, label: label, kind: stColor,
                    defaultJson: "\"" & server.escapeText(default) & "\"",
                    lo: 0.0, hi: 0.0, step: 0.0, hasRange: false,
                    options: @[], category: category, subcategory: subcategory,
@@ -250,7 +290,7 @@ proc toJson*(s: Setting): JsonObject =
   # way, so it is used verbatim.
   if cur.ok:
     case s.kind
-    of stEnum, stString, stKeybind, stSelect:
+    of stEnum, stString, stKeybind, stSelect, stColor:
       o.put("value", jstr(asText(cur, "")))
     of stBool, stInt, stFloat:
       o.put("value", Json(text: cur.raw))
