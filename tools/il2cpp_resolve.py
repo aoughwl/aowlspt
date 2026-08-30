@@ -130,8 +130,32 @@ Anything not matching prints nothing -- absence of an annotation is NOT proof a
 function is a real body.
 
 Usage:
+
+EVERY verb takes the two paths FIRST:
+  il2cpp_resolve.py <GameAssembly.dll> <global-metadata.dec.dat> <verb> ...
+Invoking a verb without them is REFUSED with the full command line; it is not
+guessed at.
+
   il2cpp_resolve.py <GameAssembly.dll> <global-metadata.dec.dat> find <substr>
-  il2cpp_resolve.py <GameAssembly.dll> <global-metadata.dec.dat> type <idx>...
+        # searches TYPE names ONLY. To search member names use `member`.
+  il2cpp_resolve.py <GameAssembly.dll> <global-metadata.dec.dat> member <name>
+                                       [--argc N] [--limit=N] [--exact]
+        # searches METHOD/MEMBER names across all types. Per hit: owning type,
+        # member name, RVA, arity, full DERIVED signature, thunk shape, and a
+        # three-state sharedness verdict (shared/unique/unknown) that is ALWAYS
+        # printed -- `unknown` is a refusal, never "safe to detour".
+        # --argc N filters by parameter count: a member that exists only at an
+        # arity you never call is a member you can never bind.
+  il2cpp_resolve.py <GameAssembly.dll> <global-metadata.dec.dat> methods <name>
+                                       [--shared] [--limit=N]
+        # the older, terser member search. Same walk; sharedness is OPT-IN via
+        # --shared and there is no --argc. Prefer `member`.
+  il2cpp_resolve.py <GameAssembly.dll> <global-metadata.dec.dat> shared <RVA-or-VA>
+        # the three-state detour-safety verdict for ONE address:
+        # shared (n owners -- do not detour) / unique / unknown (a refusal:
+        # the address is not in the methodPointers histogram at all).
+        # exit 0 only for `unique`.
+  il2cpp_resolve.py <GameAssembly.dll> <global-metadata.dec.dat> type <idx-or-Name>...
         # per method: rid, RVA, arity, full signature, section, thunk shape.
         # add --shared to also annotate RVAs shared with other methods (this
         # costs one full metadata walk, ~1.2s)
@@ -155,6 +179,56 @@ Usage:
         # the SettingsScreen/SettingControl offset table Phase 1 will probe
 """
 import os, struct, sys
+
+# ---- output encoding ------------------------------------------------------
+# MEASURED: `fldoff.py fields EFT.MatchmakerOperation` died with
+#   UnicodeEncodeError: 'charmap' codec can't encode character ''
+# on a stock Windows cp1252 console. Some IL2CPP field/type/method names in
+# this metadata carry Private-Use-Area characters (U+E000..U+F8FF), and cp1252
+# has no mapping for them, so the tool CRASHED at print time after having
+# already done all the work correctly.
+#
+# Two-part fix, and the order matters:
+#  1. `vis()` escapes anything outside printable ASCII to a literal \uXXXX
+#     BEFORE it is printed. The substitution is therefore VISIBLE in the
+#     output -- a name containing U+E000 reads as ``, never as a
+#     silently dropped character. A silently mangled field name is a
+#     confidently wrong answer, which CLAUDE.md 10 rates worse than a crash.
+#  2. stdout/stderr are reconfigured to UTF-8 with errors="backslashreplace"
+#     as a backstop, so any path that forgets `vis()` still cannot die on
+#     encoding -- it degrades to a visible \uXXXX escape too, never to a
+#     dropped character and never to a traceback.
+def _force_utf8_streams():
+    for st in (sys.stdout, sys.stderr):
+        try:
+            st.reconfigure(encoding="utf-8", errors="backslashreplace")
+        except Exception:
+            pass          # non-reconfigurable stream (a pipe wrapper, a test
+                          # capture); vis() still carries the guarantee.
+
+
+_force_utf8_streams()
+
+
+def vis(s):
+    """Render a metadata string with every non-printable-ASCII character as a
+    visible \\uXXXX escape. Never drops a character silently."""
+    if s is None:
+        return s
+    if not isinstance(s, str):
+        return s
+    if all(0x20 <= ord(c) < 0x7F for c in s):
+        return s
+    out = []
+    for c in s:
+        o = ord(c)
+        if 0x20 <= o < 0x7F:
+            out.append(c)
+        elif o <= 0xFFFF:
+            out.append("\\u%04x" % o)
+        else:
+            out.append("\\U%08x" % o)
+    return "".join(out)
 
 
 def load_pe(path):
@@ -920,10 +994,12 @@ def print_field_rows(rows):
         else:
             off = hex(r["off"])
         dv = r["default"]
+        # vis(): field names in this metadata can carry Private-Use-Area
+        # characters, which killed this function outright on a cp1252 console.
         print("  %-8s %-34s %-30s %-40s %-22s %s" %
-              (off, r["name"], r["typename"],
+              (off, vis(r["name"]), vis(r["typename"]),
                "%#06x %s" % (r["attrs"], "|".join(Resolver.attr_names(r["attrs"]))),
-               "" if dv is None else repr(dv), r["declared_by"]))
+               "" if dv is None else vis(repr(dv)), vis(r["declared_by"])))
     if generic:
         print("  GENERIC -- NO LAYOUT: this is an uninstantiated generic type "
               "definition.")
@@ -961,11 +1037,151 @@ def const_check(R):
     return ok, rows
 
 
-VERBS = ("find", "methods", "type", "bytes", "shared", "verify-be", "fields",
-         "verify-fields", "enum", "verify-consts", "settings-table")
+VERBS = ("find", "methods", "member", "type", "bytes", "shared", "verify-be",
+         "fields", "verify-fields", "enum", "verify-consts", "settings-table")
+
+
+def cmd_member(R, argv):
+    """`member <name> [--argc N] [--limit=N] [--exact]`.
+
+    `find` searches TYPE names only. Before this verb existed, answering "who
+    declares get_Stamina, at what arity, and is that RVA safe to detour?"
+    meant hand-rolling a ~40-line walk over all 31,282 types -- which every
+    RVA-table session then rewrote from scratch.
+
+    Three things this prints that a hand-rolled walk reliably omits:
+
+    * the DERIVED signature (returnType@8 / parameterStart@16 /
+      parameterCount@34), never a shape inferred from the method's name;
+    * the three-state sharedness verdict from Resolver.sharedness(), ALWAYS,
+      not opt-in. `unknown` means the address is not in the methodPointers
+      histogram at all and is a REFUSAL, not "one owner, safe to detour" --
+      that was exactly the `shared_rva_counts().get(rva, 1)` bug CLAUDE.md
+      calls out;
+    * a STUB flag when the body is this build's universal empty-body stub
+      (`C2 00 00` / `C3`), shared by 6,438 methods. A stub that passes a
+      signature check is the worst case there is: it binds, it returns, and
+      it does nothing.
+
+    Bounded by --limit (default 60) because a bare `member get_Position` hits
+    many types; hitting the limit says so explicitly and is never reported as
+    "no more matches".
+    """
+    needle_raw = argv[0]
+    needle = needle_raw.lower()
+    exact = "--exact" in argv[1:]
+    lim = 60
+    argc = None
+    rest = argv[1:]
+    for i, a in enumerate(rest):
+        if a.startswith("--limit="):
+            lim = int(a.split("=", 1)[1])
+        elif a == "--argc":
+            if i + 1 >= len(rest):
+                sys.exit("usage error: --argc needs a parameter count, "
+                         "e.g. --argc 2")
+            argc = int(rest[i + 1], 0)
+        elif a.startswith("--argc="):
+            argc = int(a.split("=", 1)[1], 0)
+
+    def matches(n):
+        return (n.lower() == needle) if exact else (needle in n.lower())
+
+    hits = 0
+    arity_rejected = 0
+    truncated = False
+    for t in range(R.NTYPES):
+        ms = list(R.type_methods(t))
+        names = [R.mname(mi) for mi in ms]
+        if not any(matches(n) for n in names):
+            continue
+        full, img, resolved = R.resolve_type(t)
+        for (nm, _rid, va), mi in zip(resolved, ms):
+            if not matches(nm):
+                continue
+            try:
+                sig, pc = R.sig_string(mi, nm)
+            except Exception:
+                sig, pc = nm + "(?)", -1
+            if argc is not None and pc != argc:
+                # Counted, not hidden: "several members exist but ONLY at an
+                # arity the caller never asks for" is the answer, and it is
+                # only visible if the filtered-out hits are reported.
+                arity_rejected += 1
+                continue
+            if hits >= lim:
+                truncated = True
+                break
+            hits += 1
+            rva = (va - R.IB) if va else None
+            print("%s::%s" % (vis(full), vis(sig)))
+            print("    arity=%s  RVA=%s  image=%s"
+                  % (pc if pc >= 0 else "?",
+                     hex(rva) if rva is not None else "None (no method pointer)",
+                     img))
+            if rva is None:
+                print("    UNBINDABLE: no entry in this image's "
+                      "Il2CppCodeGenModule.methodPointers.")
+                continue
+            sec, fo, _ = R.section_of_rva(rva)
+            th = R.classify_thunk(R.code_bytes(rva, 32)) if fo is not None else None
+            state, n = R.sharedness(rva)
+            print("    section=%s  sharedness=%s owners=%d"
+                  % (sec or "UNMAPPED", state.upper(), n))
+            if th:
+                if th[0] == "STUB":
+                    print("    STUB: %s" % th[1])
+                    print("    WARNING: this is an empty body. It will bind and "
+                          "pass a signature check and DO NOTHING.")
+                else:
+                    print("    %s: %s" % th)
+            note = R.sharedness_note(rva)
+            if note:
+                print("    " + note)
+        if truncated:
+            break
+
+    if truncated:
+        print("... limit %d reached; re-run with --limit=N. This is NOT "
+              "'no more matches'." % lim)
+        return 0
+    if hits == 0:
+        if argc is not None and arity_rejected:
+            print("NO MEMBER NAMED %r EXISTS AT ARITY %d (searched all %d types "
+                  "EXHAUSTIVELY)." % (needle_raw, argc, R.NTYPES))
+            print("It DOES exist at %d other aritie(s). Re-run without --argc "
+                  "to see them." % arity_rejected)
+            print("A member that exists only at an arity you never call is a "
+                  "member you can never bind.")
+            return 1
+        print("NO METHOD NAME %s %r ANYWHERE IN THE IMAGE (searched all %d "
+              "types EXHAUSTIVELY). This is a genuine zero-hit answer, not an "
+              "error." % ("EQUALS" if exact else "CONTAINS",
+                          needle_raw, R.NTYPES))
+        return 1
+    print("-- %d member(s) %s %r (searched all %d types EXHAUSTIVELY%s)"
+          % (hits, "named" if exact else "matching", needle_raw, R.NTYPES,
+             "; %d more rejected by --argc %d" % (arity_rejected, argc)
+             if argc is not None and arity_rejected else ""))
+    return 0
 
 
 def main():
+    # The VERB-in-argv[1] check runs BEFORE the arity check. It used to run
+    # after, so `il2cpp_resolve.py member get_Position` (3 args) fell through
+    # to `sys.exit(__doc__)` and dumped ~200 lines of module docstring -- in
+    # which the one-line answer ("argv[1] must be GameAssembly.dll") is buried.
+    # A refusal nobody reads is a refusal that does not work.
+    if len(sys.argv) > 1 and sys.argv[1] in VERBS:
+        sys.exit(
+            "usage error: %r is a VERB, but argv[1] must be the path to "
+            "GameAssembly.dll.\n"
+            "  every verb is:  il2cpp_resolve.py GAMEASM METADEC %s ...\n"
+            "  you ran:        il2cpp_resolve.py %s\n"
+            "  e.g.  python tools/il2cpp_resolve.py D:/Games/Tarkov/"
+            "GameAssembly.dll .cache/global-metadata.dec.dat %s\n"
+            % (sys.argv[1], sys.argv[1], " ".join(sys.argv[1:]),
+               " ".join(sys.argv[1:])))
     if len(sys.argv) < 4:
         sys.exit(__doc__)
     # EVERY verb takes GAMEASM and METADEC FIRST. Agents read CLAUDE.md 5's
@@ -973,15 +1189,6 @@ def main():
     # `il2cpp_resolve.py bytes 0x52a8a80 8`, and got a raw FileNotFoundError
     # traceback out of Resolver -- one hand-rolled a PE section walker rather
     # than work out that argv[1] was being opened as GameAssembly.dll. Say it.
-    if sys.argv[1] in VERBS:
-        sys.exit(
-            "usage error: %r is a VERB, but argv[1] must be the path to "
-            "GameAssembly.dll.\n"
-            "  every verb is:  il2cpp_resolve.py GAMEASM METADEC %s ...\n"
-            "  e.g.  python tools/il2cpp_resolve.py D:/Games/Tarkov/"
-            "GameAssembly.dll .cache/global-metadata.dec.dat %s\n"
-            % (sys.argv[1], sys.argv[1],
-               " ".join(sys.argv[1:]) or sys.argv[1]))
     for p in (sys.argv[1], sys.argv[2]):
         if not os.path.exists(p):
             sys.exit("usage error: %r does not exist. argv[1] must be "
@@ -1009,8 +1216,8 @@ def main():
                 print("`find` matches TYPE names ONLY -- %r looks like a "
                       "Type::Method spec." % needle)
                 print("Try instead:")
-                print("  ... methods %s          # search by METHOD name"
-                      % (meth or "<name>"))
+                print("  ... member %s           # search by MEMBER name "
+                      "(+ arity, signature, sharedness)" % (meth or "<name>"))
                 print("  ... type %s             # every method on that type"
                       % (ty or "<Type>"))
                 sys.exit(1)
@@ -1020,6 +1227,12 @@ def main():
             sys.exit(1)
         print("-- %d type name(s) contain %r (searched all %d EXHAUSTIVELY)"
               % (n, needle, R.NTYPES))
+    elif cmd == "member":
+        if len(sys.argv) < 5:
+            sys.exit("usage error: `member` needs a member name.\n"
+                     "  il2cpp_resolve.py GAMEASM METADEC member <name> "
+                     "[--argc N] [--limit=N] [--exact]")
+        sys.exit(cmd_member(R, sys.argv[4:]))
     elif cmd == "methods":
         # `find` searches TYPE names only; this searches METHOD names, which is
         # what you want when you know a call site's name (LocalRaidEnded) but
