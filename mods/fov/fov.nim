@@ -395,6 +395,33 @@ var cfgUnAimSpeedX = 5.5
 var cfgUnAimSpeedY = 4.5
 var cfgUnAimSpeedZ = 4.5
 
+var cfgEnableAdsSmoothing = true
+  ## Interpolate the field of view between the hip target and the ADS target
+  ## instead of snapping. The user-visible complaint this exists for was "it
+  ## should smoothly change the FOV when I ADS": before this, `applyFov`
+  ## computed a multiplier and wrote `base * mult` outright, so the transition
+  ## was a single-frame step.
+var cfgAdsSmoothTime = 0.16
+  ## Seconds for the hip -> ADS/zoom transition, when the aim speeds are not
+  ## driving it. A DURATION, not a lerp coefficient: the value reaches its
+  ## target at a stated time, which is what makes the PASS/FAIL/INCONCLUSIVE
+  ## transition verdict below expressible at all. An asymptotic
+  ## `lerp(cur, target, k)` never arrives and so can never be asserted.
+var cfgUnAdsSmoothTime = 0.12
+  ## Seconds for the ADS/zoom -> hip transition.
+var cfgUseAimSpeedsForFov = true
+  ## Take the two durations from `rifleAimSpeedZ` / `unAimSpeedZ` instead of
+  ## from the two settings above: duration = 1 / speed. Upstream's aim speeds
+  ## are `Lerp(a, b, speed * dt)` rates on the camera offset vector, so 1/speed
+  ## is that lerp's time constant; the mapping is STATED here and printed at
+  ## load rather than being an unexplained coincidence of units. Z is the axis
+  ## used because Z is the forward/zoom axis. The X and Y speeds, and all three
+  ## pistol speeds, stay INERT: nothing in this mod reads the weapon class, so
+  ## choosing between the rifle and pistol tables would be a guess.
+var cfgAdsSmoothLinear = false
+  ## false = smoothstep easing (p*p*(3-2p)), true = constant rate. Two curves
+  ## and no `pow`, because this runs per frame and must not call into libm.
+
 var cfgVerifyHooks = false
   ## The target-verification detours. DEFAULT OFF as of the crash fix: every
   ## one of them is `patch(<name>, ...)`, i.e. a by-name host detour, and
@@ -529,6 +556,12 @@ proc loadConfig() =
   cfgUnAimSpeedY = cfgFloat("unAimSpeedY", 4.5)
   cfgUnAimSpeedZ = cfgFloat("unAimSpeedZ", 4.5)
 
+  cfgEnableAdsSmoothing = cfgBool("enableAdsSmoothing", true)
+  cfgAdsSmoothTime = cfgFloat("adsSmoothTime", 0.16)
+  cfgUnAdsSmoothTime = cfgFloat("unAdsSmoothTime", 0.12)
+  cfgUseAimSpeedsForFov = cfgBool("useAimSpeedsForFovSmoothing", true)
+  cfgAdsSmoothLinear = cfgBool("adsSmoothLinear", false)
+
   # RENAMED, and the rename IS the fix.
   #
   # MEASURED 2026-08-26: the client died at 8.328s with the breadcrumb trail
@@ -617,13 +650,32 @@ proc fovSchema(): seq[Setting] =
     boolSetting("holdToZoom", "Hold to zoom", true, category = "Toggle zoom",
                 description = "From Fontaine's FOV Fix (com.fontaine.fovfix), rewritten from scratch for aowlspt. On: zoom lasts while the key is held (Input::GetKey, a level). Off: each press toggles it (Input::GetKeyDown, an edge, latched in this mod). Both are polled ahead of the FOV rate gate, because an edge is one frame wide and that gate skips frames."),
 
+    boolSetting("enableAdsSmoothing", "Smooth the ADS transition", true,
+                category = "Field of view",
+                description = "Interpolate the field of view between the hip target and the ADS target instead of stepping to it in one frame. The transition is driven by MEASURED elapsed time, so it takes the same wall-clock duration at any frame rate, and it always eases FROM WHERE THE VIEW IS -- an ADS cancelled half-way does not snap. Off reproduces the old single-frame step."),
+    floatSetting("adsSmoothTime", "ADS-in time (seconds)", 0.16, lo = 0.01,
+                 hi = 1.0, step = 0.01, category = "Field of view",
+                 description = "How long the hip -> ADS field-of-view transition takes. IGNORED while 'Use aim speeds for FOV smoothing' is on, which is the default -- that setting takes the duration from rifleAimSpeedZ instead."),
+    floatSetting("unAdsSmoothTime", "ADS-out time (seconds)", 0.12, lo = 0.01,
+                 hi = 1.0, step = 0.01, category = "Field of view",
+                 description = "How long the ADS -> hip field-of-view transition takes. IGNORED while 'Use aim speeds for FOV smoothing' is on, which takes it from unAimSpeedZ instead."),
+    boolSetting("useAimSpeedsForFovSmoothing", "Use aim speeds for FOV smoothing",
+                true, category = "Field of view",
+                description = "Take the two transition durations from rifleAimSpeedZ and unAimSpeedZ as duration = 1 / speed, rather than from adsSmoothTime / unAdsSmoothTime. Upstream's aim speeds are Lerp(a, b, speed * dt) rates on the camera offset vector, so 1/speed is that lerp's time constant; Z is used because Z is the forward/zoom axis. This is the ONLY thing that reads those two settings -- the X and Y speeds and the whole pistol table are still inert, because nothing in this mod reads the weapon class and choosing a table would be a guess."),
+    boolSetting("adsSmoothLinear", "Linear ADS easing", false,
+                category = "Field of view",
+                description = "Off: smoothstep easing, p*p*(3-2p) -- eases in and out, which is what reads as 'smooth'. On: constant rate. No other curves, because this runs every frame and must not call into libm."),
+
     floatSetting("rifleCameraZOffset", "Rifle camera Z offset", 0.025,
                  lo = -0.2, hi = 0.2, step = 0.005, category = "Camera",
                  implemented = false,
                  description = "From Fontaine's FOV Fix (com.fontaine.fovfix), rewritten from scratch for aowlspt. Read only. ProceduralWeaponAnimation's field list IS now resolvable offline (tools/fldoff.py), so the old 'cannot confirm the name' reason has expired. What blocks it now is semantics: upstream's LerpCameraPatch is not vendored beside this file, so WHICH of _cameraByFOVOffset / RotationCameraOffset / _vCameraTarget it writes, and how, would be a guess about behaviour rather than about a name."),
-    floatSetting("rifleAimSpeedZ", "Rifle aim speed Z", 3.0, lo = 0.0, hi = 10.0,
-                 step = 0.1, category = "Camera", implemented = false,
-                 description = "From Fontaine's FOV Fix (com.fontaine.fovfix), rewritten from scratch for aowlspt. Read only. Same LerpCameraPatch semantics gap as rifleCameraZOffset; the per-axis speed fields are not identifiable without the upstream source."),
+    floatSetting("rifleAimSpeedZ", "Aim-in speed (Z)", 3.0, lo = 0.1, hi = 20.0,
+                 step = 0.1, category = "Field of view",
+                 description = "WIRED, as of the ADS-smoothing work: while 'Use aim speeds for FOV smoothing' is on, the hip -> ADS field-of-view transition takes 1/this seconds (3.0 = 333 ms). It does NOT drive the camera OFFSET vector -- that half is still blocked by the LerpCameraPatch semantics gap described on rifleCameraZOffset, and the X/Y and pistol speeds remain read-only for the same reason."),
+    floatSetting("unAimSpeedZ", "Aim-out speed (Z)", 4.5, lo = 0.1, hi = 20.0,
+                 step = 0.1, category = "Field of view",
+                 description = "WIRED: while 'Use aim speeds for FOV smoothing' is on, the ADS -> hip field-of-view transition takes 1/this seconds (4.5 = 222 ms). Same caveat as the aim-in speed: it does not move the camera offset vector."),
 
     # The KEY is `verifyHooksByName`, not `verifyHooks`. This row used to
     # declare `verifyHooks` -- a key `loadConfig` deliberately stopped reading,
@@ -1935,6 +1987,88 @@ var gZoomFrames = 0'i64        ## FOV writes taken with the zoom key asserted
 var gLastAiming = false
 var gLastKeyTicks = 0'i64
 
+# ---------------------------------------------------------------------------
+# The ADS transition smoother
+# ---------------------------------------------------------------------------
+#
+# THE FORMULA, stated once here and printed into the log at arm time so it can
+# be checked against what the player sees:
+#
+#   mult   = 1.0                                      hip, no zoom key
+#          = opticFovMulti | nonOpticFovMulti         aiming
+#          x opticToggleZoomMulti | nonOpticToggleZoomMulti   aiming + zoom key
+#          x unaimedToggleZoomMulti                   not aiming + zoom key
+#   target = BASE_FOV * mult
+#   fov(t) = from + (target - from) * ease(t / duration)
+#
+# Every multiplier composes onto BASE_FOV -- the field of view captured once
+# from a camera this mod has never written to -- and NEVER onto the previous
+# frame's output. A per-frame multiply against the live value compounds
+# geometrically and is the classic drift bug; the smoother interpolates a
+# POSITION between two absolute endpoints, so it cannot drift either.
+var gCurFov = 0.0        ## what we last asked the camera to render
+var gSmFrom = 0.0        ## the FOV this transition started from
+var gSmTo = 0.0          ## the FOV this transition is heading to
+var gSmT = 0.0           ## seconds elapsed in this transition
+var gSmDur = 0.0         ## seconds this transition is allowed to take
+var gSmToAds = false     ## direction: true = into ADS/zoom
+var gSmSettled = true    ## the transition has finished
+var gSmVerified = true   ## ...and its finished state has been read back
+var gSmElapsed = 0.0     ## how long the last completed transition really took
+var gSmVerdict = "INCONCLUSIVE -- no ADS transition has completed yet"
+var gSmPasses = 0
+var gSmFails = 0
+var gLastRest = false    ## the previous write left us at rest on the base FOV
+var gBaseCam: Il2CppPtr = nil
+  ## WHICH camera `gBaseFov` was captured from. The menu camera and the raid
+  ## camera are different objects, and `Camera::get_main` answers in both. A
+  ## base captured at the main menu and then multiplied against a raid camera
+  ## is exactly the "it is wrong / not calibrated" report: the number is
+  ## plausible, applied, and derived from the wrong screen. Identity change
+  ## forces a re-capture rather than being invisible.
+
+proc adsInDuration(): float =
+  ## Seconds, hip -> ADS. Never zero: a zero duration is a step change, which
+  ## is the bug this is fixing, and it would also divide by zero below.
+  if cfgUseAimSpeedsForFov:
+    let s = (if cfgRifleAimSpeedZ > 0.01: cfgRifleAimSpeedZ else: 0.01)
+    result = 1.0 / s
+  else:
+    result = cfgAdsSmoothTime
+  if result < 0.01: result = 0.01
+  if result > 2.0: result = 2.0
+
+proc adsOutDuration(): float =
+  if cfgUseAimSpeedsForFov:
+    let s = (if cfgUnAimSpeedZ > 0.01: cfgUnAimSpeedZ else: 0.01)
+    result = 1.0 / s
+  else:
+    result = cfgUnAdsSmoothTime
+  if result < 0.01: result = 0.01
+  if result > 2.0: result = 2.0
+
+proc easeAt(p: float): float =
+  ## `p` is progress in 0..1. Smoothstep by default; linear when asked. No
+  ## allocation, no libm, no branchless cleverness -- this runs every frame.
+  if p <= 0.0: return 0.0
+  if p >= 1.0: return 1.0
+  if cfgAdsSmoothLinear: return p
+  result = p * p * (3.0 - 2.0 * p)
+
+proc fabsf(x: float): float =
+  if x < 0.0: -x else: x
+
+proc resetSmoother(baseline: float) =
+  ## Called when the camera identity changes, i.e. when everything the
+  ## smoother believed was measured against an object that is gone.
+  gCurFov = baseline
+  gSmFrom = baseline
+  gSmTo = baseline
+  gSmT = 0.0
+  gSmDur = 0.0
+  gSmSettled = true
+  gLastRest = false
+
 # --- the CameraManager acquisition, reported three ways, never two.
 #
 # The receiver is obtained from the STATIC, byte-verified
@@ -2374,6 +2508,18 @@ proc applyFov() =
   if gLastFovTicks != 0'i64 and
      nanosBetween(gLastFovTicks, now) < FovIntervalNs:
     return
+  # The REAL elapsed time since the last tick that got through this gate, in
+  # seconds. The smoother must be driven by measured time and not by a frame
+  # count: the gate above skips frames by design, so a per-tick constant would
+  # make the transition take a different wall-clock time on every machine.
+  # Clamped: a first tick, an alt-tab, or a loading screen produces a huge dt
+  # that would jump the transition straight to its endpoint -- i.e. the step
+  # change this is replacing.
+  var dt = 0.0
+  if gLastFovTicks != 0'i64:
+    dt = float(nanosBetween(gLastFovTicks, now)) / 1_000_000_000.0
+    if dt < 0.0: dt = 0.0
+    if dt > 0.25: dt = 0.25
   gLastFovTicks = now
   let measuring = gFovSamples < CostSamples
 
@@ -2499,13 +2645,31 @@ proc applyFov() =
   # the camera's field of view, so the second frame would multiply the first
   # frame's product. The cost is that changing the in-game FOV slider mid-raid
   # does not take effect until the next one, which is stated rather than hidden.
+  #
+  # ...FOR THIS CAMERA. `Camera::get_main` answers at the main menu too, and
+  # the menu camera is a DIFFERENT object with a different field of view. A
+  # base locked to it and then multiplied against the raid camera produces a
+  # plausible, applied, wrong number -- which is what "it is not calibrated"
+  # looks like from the outside. So the capture is keyed on camera IDENTITY,
+  # and a new camera invalidates it. The new camera has never been written to
+  # by us, so what is read back is the game's own value, not our output.
+  if cam != gBaseCam:
+    gBaseCam = cam
+    gBaseFov = 0.0
+    gLastTarget = 0.0
+    gLastMult = -1.0
+    gHeldVerdict = "INCONCLUSIVE -- the camera changed; nothing has been " &
+                   "written to this one yet"
   if gBaseFov <= 0.0:
     a.reset()
     let seen = callFloat(bCamFov, cam, a)
     if seen <= 0.0:
       return
     gBaseFov = seen
-    info "FOV: base field of view captured at " & $gBaseFov
+    resetSmoother(seen)
+    info "FOV: base field of view captured at " & $gBaseFov &
+         " from a camera this mod has not written to. Every multiplier " &
+         "composes onto THIS number, never onto the previous frame's output."
 
   var aiming = false
   if pwa != nil:
@@ -2556,15 +2720,54 @@ proc applyFov() =
       mult = mult * cfgUnaimedToggleZoomMulti
     gZoomFrames = gZoomFrames + 1
 
-  # An unchanged multiplier of exactly 1.0 is the camera's own value; writing
-  # it every frame would be a call that cannot be observed. Skipped -- but only
-  # when the PREVIOUS multiplier was also 1.0, so the frame that RETURNS to 1.0
-  # is still written and the effect actually clears.
-  if mult == 1.0 and gLastMult == 1.0:
-    return
   gLastMult = mult
 
-  let target = gBaseFov * mult
+  # ---- THE TRANSITION.
+  #
+  # `endpoint` is where the FOV belongs for the CURRENT state; `target` is
+  # where it should be RIGHT NOW, part-way there. The old code wrote `endpoint`
+  # directly, which is the step change the player reported.
+  let endpoint = gBaseFov * mult
+  let wantAds = aiming or gZoomOn
+  var target = endpoint
+  if not cfgEnableAdsSmoothing:
+    gCurFov = endpoint
+    gSmSettled = true
+  else:
+    # A new endpoint starts a new transition FROM WHERE WE ARE, not from the
+    # previous endpoint -- so an ADS cancelled half-way through does not snap
+    # back before easing out.
+    if fabsf(endpoint - gSmTo) > 0.001:
+      gSmFrom = gCurFov
+      gSmTo = endpoint
+      gSmT = 0.0
+      gSmToAds = wantAds
+      gSmDur = (if wantAds: adsInDuration() else: adsOutDuration())
+      gSmSettled = false
+      gSmVerified = false
+    if not gSmSettled:
+      gSmT = gSmT + dt
+      var p = 0.0
+      if gSmDur > 0.0: p = gSmT / gSmDur
+      if p >= 1.0:
+        p = 1.0
+        gSmSettled = true
+        gSmElapsed = gSmT
+      gCurFov = gSmFrom + (gSmTo - gSmFrom) * easeAt(p)
+    else:
+      gCurFov = gSmTo
+    target = gCurFov
+
+  # An unchanged multiplier of exactly 1.0 is the camera's own value; writing
+  # it every frame would be a call that cannot be observed. Skipped -- but only
+  # once the transition has SETTLED there, so the ease back out to the base FOV
+  # is written every tick instead of being cut off after one frame. (The old
+  # condition compared this multiplier with the previous one, which with
+  # smoothing would have terminated the un-ADS ease on its second tick.)
+  let atRest = mult == 1.0 and gSmSettled and fabsf(target - gBaseFov) < 0.01
+  if atRest and gLastRest:
+    return
+  gLastRest = atRest
   let sampling = gFovWrites <= 4 or (gFovWrites and 511) == 0
   # ---- DID THE PREVIOUS WRITE SURVIVE THE FRAME?
   #
@@ -2643,6 +2846,42 @@ proc applyFov() =
                       "NOTHING. Route: " & gWriteRoute
     if gWriteTook + gWriteMissed == 1:
       info "FOV: write verdict: " & gWriteVerdict
+
+  # ---- DID THE ADS TRANSITION ACTUALLY ARRIVE?  (CLAUDE.md 9b)
+  #
+  # This asserts the FINISHED STATE read off the camera, not the value this
+  # code just computed -- comparing `gCurFov` with `gSmTo` would be comparing
+  # our own arithmetic with itself and could only ever say yes. Exactly one
+  # extra `get_fieldOfView` per completed transition, on the tick the
+  # transition ends; nothing per frame, and no string is built while one is
+  # running. Three outcomes:
+  #   PASS         the camera renders the endpoint, and here is how long it took
+  #   FAIL         the transition finished and the camera is somewhere else
+  #   INCONCLUSIVE there is no readable getter, so we could not look
+  if cfgEnableAdsSmoothing and gSmSettled and not gSmVerified:
+    gSmVerified = true
+    if not bCamFov.ok:
+      gSmVerdict = "INCONCLUSIVE -- the transition to " & $gSmTo &
+                   " finished but Camera::get_fieldOfView did not verify, " &
+                   "so the rendered value could not be read. Not a pass."
+    else:
+      a.reset()
+      let arrived = callFloat(bCamFov, cam, a)
+      let ms = gSmElapsed * 1000.0
+      if fabsf(arrived - gSmTo) <= 0.5:
+        gSmPasses = gSmPasses + 1
+        gSmVerdict = "PASS -- " & (if gSmToAds: "ADS-in" else: "ADS-out") &
+                     " transition ended with the camera reading " & $arrived &
+                     " against an endpoint of " & $gSmTo & ", in " & $ms &
+                     " ms (asked for " & $(gSmDur * 1000.0) & " ms)"
+      else:
+        gSmFails = gSmFails + 1
+        gSmVerdict = "FAIL -- " & (if gSmToAds: "ADS-in" else: "ADS-out") &
+                     " transition ended after " & $ms & " ms and the camera " &
+                     "reads " & $arrived & ", not the endpoint " & $gSmTo &
+                     ". Something else is writing the field of view."
+      if gSmPasses + gSmFails == 1:
+        info "FOV: first ADS transition verdict: " & gSmVerdict
   if measuring:
     gFovNs = gFovNs + nanosBetween(now, perfCounter())
     gFovSamples = gFovSamples + 1
@@ -3362,6 +3601,15 @@ proc reportWatch() =
        "]"
   info "    DID IT HOLD (sampled a tick later, before the next write): " &
        gHeldVerdict
+  info "    DID THE ADS TRANSITION ARRIVE (camera read back on the tick the " &
+       "ease ended): " & gSmVerdict & "  [passed " & $gSmPasses & ", failed " &
+       $gSmFails & "]"
+  info "    smoothing: " &
+       (if not cfgEnableAdsSmoothing: "OFF -- the FOV steps in one frame"
+        else: "in " & $(adsInDuration() * 1000.0) & " ms / out " &
+              $(adsOutDuration() * 1000.0) & " ms, " &
+              (if cfgAdsSmoothLinear: "linear" else: "smoothstep")) &
+       "; base FOV " & $gBaseFov & ", current " & $gCurFov
   reportEffect("per-frame FOV write", gFovState, gFovWrites)
   info "    driven by " & gDriverState
   if gDriverIsEveryMain:
@@ -3930,6 +4178,31 @@ proc onLoad(): Status =
   info "config: optic FOV x" & $cfgOpticFovMulti & ", unmagnified x" &
        $cfgNonOpticFovMulti & ", base FOV range " & $cfgMinBaseFov & ".." &
        $cfgMaxBaseFov
+  # THE FORMULA, in the log, so the calibration can be checked rather than
+  # believed. See the comment block above `gCurFov`.
+  info "config: FOV formula -- target = BASE_FOV x mult, where mult is 1.0 " &
+       "at the hip, x" & $cfgOpticFovMulti & " aiming through an optic, x" &
+       $cfgNonOpticFovMulti & " aiming without one, and the toggle-zoom " &
+       "multiplier composes ON TOP. Every multiplier is applied to the " &
+       "captured BASE, never to the previous frame's value."
+  if cfgOpticFovMulti > 0.999 and cfgOpticFovMulti < 1.001:
+    warn "config: opticFovMulti is 1.0, so aiming THROUGH AN OPTIC will " &
+         "change the field of view by exactly nothing. That is a working " &
+         "mod producing an invisible result, not a broken one -- if ADS " &
+         "'does nothing' with a scope equipped, this setting is why."
+  if cfgEnableAdsSmoothing:
+    info "config: ADS smoothing ON -- in " & $(adsInDuration() * 1000.0) &
+         " ms, out " & $(adsOutDuration() * 1000.0) & " ms, " &
+         (if cfgAdsSmoothLinear: "linear" else: "smoothstep") & " easing, " &
+         (if cfgUseAimSpeedsForFov:
+            "durations taken from rifleAimSpeedZ / unAimSpeedZ as 1/speed " &
+            "(these two settings are WIRED now; the other seven aim speeds " &
+            "are not, because nothing here reads the weapon class)"
+          else: "durations from adsSmoothTime / unAdsSmoothTime")
+  else:
+    warn "config: ADS smoothing is OFF -- the field of view will STEP " &
+         "between hip and ADS in a single frame, which is the behaviour the " &
+         "smoothing was added to replace."
   info "config: toggle zoom on " & cfgZoomToggleKey &
        " (KeyCode " &
        (if keyCodeOrdinal(cfgZoomToggleKey) < 0: "UNKNOWN -- refused"
@@ -3948,16 +4221,20 @@ proc onLoad(): Status =
     info "config: FOV scale fix requested at " & $cfgFovScale
   info "INERT config: camera speeds rifle " & $cfgRifleCameraSpeed & ", pistol " &
        $cfgPistolCameraSpeed & ", optic " & $cfgOpticCameraSpeed &
-       "; un-aim " & $cfgUnAimSpeedX & "/" & $cfgUnAimSpeedY & "/" &
-       $cfgUnAimSpeedZ
+       "; un-aim X/Y " & $cfgUnAimSpeedX & "/" & $cfgUnAimSpeedY &
+       " (unAimSpeedZ " & $cfgUnAimSpeedZ & " is NOT inert -- it sets the " &
+       "ADS-out FOV transition time when useAimSpeedsForFovSmoothing is on)"
   info "INERT config: ADS camera distance optic " & $cfgOpticCameraDistanceOffset &
        ", non-optic " & $cfgNonOpticCameraDistanceOffset & ", pistol " &
        $cfgPistolCameraDistanceOffset & "; left shoulder rifle " &
        $cfgRifleLeftShoulderOffset & ", pistol " & $cfgPistolLeftShoulderOffset
-  info "INERT config: aim speeds rifle " & $cfgRifleAimSpeedX & "/" &
-       $cfgRifleAimSpeedY & "/" & $cfgRifleAimSpeedZ & ", pistol " &
-       $cfgPistolAimSpeedX & "/" & $cfgPistolAimSpeedY & "/" &
-       $cfgPistolAimSpeedZ
+  info "INERT config: aim speeds rifle X/Y " & $cfgRifleAimSpeedX & "/" &
+       $cfgRifleAimSpeedY & ", pistol " & $cfgPistolAimSpeedX & "/" &
+       $cfgPistolAimSpeedY & "/" & $cfgPistolAimSpeedZ &
+       " -- rifleAimSpeedZ " & $cfgRifleAimSpeedZ & " is WIRED (ADS-in FOV " &
+       "transition time = 1/speed). The pistol table stays inert because " &
+       "nothing in this mod reads the weapon class, so picking between the " &
+       "two tables would be a guess about behaviour."
   info "INERT config: camera XY offsets rifle " & $cfgRifleCameraXOffset & "/" &
        $cfgRifleCameraYOffset & ", pistol " & $cfgPistolCameraXOffset & "/" &
        $cfgPistolCameraYOffset
@@ -3978,7 +4255,10 @@ proc onLoad(): Status =
   info "note: every line above prefixed INERT is read and printed and NEVER " &
        "reaches the game -- there is no write path for it in this build, and " &
        "changing it will do nothing. The FOV multipliers, the toggle-zoom " &
-       "key and its FOV multipliers, enableFovScaleFix and the sensitivity " &
+       "key and its FOV multipliers, the five ADS-smoothing settings " &
+       "(enableAdsSmoothing, adsSmoothTime, unAdsSmoothTime, " &
+       "useAimSpeedsForFovSmoothing, adsSmoothLinear) plus rifleAimSpeedZ " &
+       "and unAimSpeedZ, enableFovScaleFix and the sensitivity " &
        "table are the ones with a write path. minBaseFov/maxBaseFov are not " &
        "writable AT ALL: GameSettingsGroup.MIN/MAX_FIELD_OF_VIEW are C# " &
        "consts (attrs 0x8056, LITERAL) inlined at every use with no storage " &
