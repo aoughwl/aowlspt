@@ -334,6 +334,13 @@ static int aowl_rva_is_code(unsigned int rva) {
 ## against it OFFLINE -- the client-side verbs then contain no arithmetic of
 ## their own to get wrong.
 {.emit: """#include "aowlspt_visible.h" """.}
+## NATIVE RAID ENTRY -- no UI clicking. The three byte-verified commit-path
+## targets (`get_CurrentRaidSettings`, `get_MatchmakerOperation`,
+## `OnReadyPressed`), their call thunks, and the guarded scalar read/write
+## primitives. It DETOURS NOTHING; the implementation is in `natraid.nim`
+## (included below) and rides the existing TarkovApplication::Update drain.
+## MUST follow `aowlspt_prologue.h`. See `aowlspt_natraid.h`.
+{.emit: """#include "aowlspt_natraid.h" """.}
 ## THE EAGER PROLOGUE SNAPSHOT. Defined here because it needs every target
 ## table above it, and CALLED from `hostReady` before any feature binds -- that
 ## ordering is the whole guarantee. Once this has run, no later verify can be
@@ -395,6 +402,10 @@ static void aowl_pro_prime_all(void) {
      * features reach for, so this is not a precaution, it is the case the
      * snapshot exists for. */
     aowl_nu_prime_all();
+    /* The native-raid commit path. Uncontended by anything in this host today
+     * -- primed anyway, because the eager pass exists precisely so no verify
+     * ever depends on "nothing else patches that". */
+    aowl_nr_prime_all();
 }
 """.}
 {.emit: """#include "aowlspt_detour.h" """.}
@@ -3359,6 +3370,12 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
     # main menu's PreloaderUI can be assumed), not a second detour. Default OFF
     # (uxAutoRaid); idle cost is two integer compares and no call into the game.
     autoRaidDrainTick()
+    # NATIVE RAID ENTRY. Rides THIS drain too, and takes `regs` because on this
+    # anchor RCX IS the `TarkovApplication` -- the receiver its two getters
+    # need. No GameObject is found and none is pressed. Both its flags default
+    # OFF (`uxNativeRaid` probe, `uxNativeRaidDrive` write+press); idle cost is
+    # two integer compares and no call into the game.
+    nativeRaidDrainTick(regs)
     return 0'i32
   # The render-phase drain, likewise by identity: a second detour on a
   # render-phase method that drains the render queue where GL drawing lands.
@@ -5921,6 +5938,15 @@ include "splrebrand.nim"
 ## the same way `splRebrandDrainTick` does. Default OFF (`uxAutoRaid`).
 include "autoraid.nim"
 
+## NATIVE RAID ENTRY -- the replacement for the UI-automation path above, which
+## stalls on the unpressable character/side-select screen. It finds and presses
+## NOTHING: it calls the game's own commit path at byte-verified static RVAs.
+## Included here only because it uses `hexOf`, `cIsReadable`, `cReadI32At`,
+## `cWordAt` and `cRegsInt` -- it stands on none of the UI walkers. Adds NO
+## detour: `nativeRaidDrainTick` rides the `TarkovApplication::Update` drain.
+## Both flags default OFF (`uxNativeRaid`, `uxNativeRaidDrive`).
+include "natraid.nim"
+
 ## THE SHARED PER-FRAME REGION. Included AFTER `modstab.nim` because
 ## `bindRegion` names `gModsSlot` and `cDuPreloaderTarget`, and nimony
 ## forward-resolves procs across an include boundary but NOT variables.
@@ -7499,6 +7525,26 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
          "reuses the inspector's find/active/press primitives and rides the " &
          "TarkovApplication::Update drain -- no second detour, no Python, no " &
          "live inspector. Run WITH singleplayerRebrand so the raid stays offline."
+  # NATIVE RAID ENTRY. Both default OFF, and deliberately SEPARATE:
+  # `uxNativeRaid` runs STAGE 1 only -- a read-only probe that calls two getters
+  # and reports the seven prerequisites as PASS/FAIL/INCONCLUSIVE. It writes
+  # nothing and presses nothing, so it is safe to run on its own and answers the
+  # open unknowns in ONE launch. `uxNativeRaidDrive` additionally arms STAGE 2
+  # (write Side=Pmc, RaidMode=Local, then call OnReadyPressed) and does nothing
+  # at all unless STAGE 1's verdict in the same session was PREREQS-PASS.
+  gNrOn = readBoolKey("uxNativeRaid")
+  gNrDrive = gNrOn and readBoolKey("uxNativeRaidDrive")
+  if gNrOn:
+    var nrTail = " uxNativeRaidDrive is OFF, so STAGE 2 will not write or press."
+    if gNrDrive:
+      nrTail = " uxNativeRaidDrive is ALSO set: if every prerequisite passes " &
+               "it will then write RaidSettings.Side=Pmc(0) and " &
+               "RaidMode=Local(1) and call MatchmakerOperation::" &
+               "OnReadyPressed(), once, then go hands-off."
+    info "uxNativeRaid is set: on the TarkovApplication::Update drain the host " &
+         "will run a READ-ONLY probe of the native raid-entry path (its RCX is " &
+         "the TarkovApplication) and log a `nativeRaid PROBE` report. It " &
+         "detours nothing and presses no GameObject." & nrTail
   # The native-UI layer. Both default OFF. `nativeUi` makes the API answer at
   # all; `nativeUiProof` additionally runs the one-shot visual self-proof.
   gNuOn = readBoolKey("nativeUi")
