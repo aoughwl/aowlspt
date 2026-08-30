@@ -135,11 +135,16 @@ proc arGoto(s: int) =
   gArStepT0 = cNowMs()
 
 # ---------------------------------------------------------------------------
-# Discovery: bounded, time-sliced -- mirrors splrebrand's `splFindByName`, but
-# returns the first node named `name` that is activeInHierarchy (so an INACTIVE
-# NextButton on a screen we are not on can never be pressed, fact #72), and can
-# EXCLUDE one pointer (the button we just pressed, so we do not re-press the same
-# screen before it transitions).
+# Discovery: bounded, time-sliced. BREADTH-BEFORE-DEPTH, exactly like
+# splrebrand's proven `splFindByName`: at each node, name-check ALL direct
+# children before recursing into any subtree. A container like MenuScreen is a
+# DIRECT child of a wide root (Common UI has many sibling screens); a pure DFS
+# burns the whole 18 ms slice descending the first sibling's subtree before it
+# ever reaches MenuScreen -- which is exactly how the first cut sat at WAIT-MENU
+# for 180 s and self-disabled. `arWalkActive` additionally requires the match be
+# activeInHierarchy (so an INACTIVE NextButton on a screen we are not on can
+# never be pressed, fact #72) and can EXCLUDE one pointer (the button we just
+# pressed).
 # ---------------------------------------------------------------------------
 proc arWalkActive(t: Il2CppPtr; name: string; depth: int; budget: var int;
                   deadline: uint64; exclude: Il2CppPtr): Il2CppPtr =
@@ -157,7 +162,22 @@ proc arWalkActive(t: Il2CppPtr; name: string; depth: int; budget: var int;
   if depth == 0: return
   var n = 0
   if not iChildCount(t, n): return
+  # Pass 1 -- breadth: name+active check every direct child (no descent).
   var i = 0
+  while i < n and i < ArFanout and budget > 0:
+    let c = iChildAt(t, i)
+    if c != nil and duOk(c, 0x20'i32):
+      budget = budget - 1
+      if (budget and 31) == 0 and cNowMs() > deadline:
+        budget = 0
+        return
+      if c != exclude and iObjName(c) == name:
+        let a = iActiveInHierarchy(c)
+        if a[0] and a[1]:
+          return c
+    i = i + 1
+  # Pass 2 -- depth: recurse only after the whole level missed.
+  i = 0
   while i < n and i < ArFanout and budget > 0:
     let c = iChildAt(t, i)
     if c != nil:
@@ -168,7 +188,8 @@ proc arWalkActive(t: Il2CppPtr; name: string; depth: int; budget: var int;
 proc arWalkAny(t: Il2CppPtr; name: string; depth: int; budget: var int;
                deadline: uint64): Il2CppPtr =
   ## Like `arWalkActive` but returns the first name match regardless of active
-  ## state -- for containers (MenuScreen) whose own active flag we do not gate on.
+  ## state -- for containers (MenuScreen) whose own active flag we do not gate
+  ## on. Breadth-before-depth, same reason.
   result = nil
   if t == nil or depth < 0 or budget <= 0 or not duOk(t, 0x20'i32): return
   budget = budget - 1
@@ -181,7 +202,18 @@ proc arWalkAny(t: Il2CppPtr; name: string; depth: int; budget: var int;
   var n = 0
   if not iChildCount(t, n): return
   var i = 0
-  while i < n and i < ArFanout and budget > 0:
+  while i < n and i < ArFanout and budget > 0:      # pass 1 -- breadth
+    let c = iChildAt(t, i)
+    if c != nil and duOk(c, 0x20'i32):
+      budget = budget - 1
+      if (budget and 31) == 0 and cNowMs() > deadline:
+        budget = 0
+        return
+      if iObjName(c) == name:
+        return c
+    i = i + 1
+  i = 0
+  while i < n and i < ArFanout and budget > 0:      # pass 2 -- depth
     let c = iChildAt(t, i)
     if c != nil:
       result = arWalkAny(c, name, depth - 1, budget, deadline)
@@ -211,15 +243,35 @@ proc arCollect(t: Il2CppPtr; name: string; depth: int; budget: var int;
       arCollect(c, name, depth - 1, budget, deadline, into, cap)
     i = i + 1
 
-proc arRoot(name: string): Il2CppPtr =
-  ## The scene root named `name` ("Menu UI" / "Common UI"), reached via our own
-  ## durable DontDestroyOnLoad anchor (`splAnchor`, the PreloaderUI::Update
-  ## `this`) -- NOT the inspector. Returns nil if the menu scene is not up yet or
-  ## no anchor has been captured.
-  result = nil
+# ---------------------------------------------------------------------------
+# Scene-root enumeration -- reuse inspect.nim's `iSceneRoots` (the same path
+# `splFindScreen` uses successfully), which asks the anchor GameObject for its
+# scene via GameObject::get_scene_Injected and enumerates ALL its roots via
+# Scene::GetRootGameObjects. The first cut scoped the search to the anchor
+# (Preloader UI) subtree, which holds AlphaLabel but NOT PlayButton -- PlayButton
+# lives under a DIFFERENT root (Common UI -> MenuScreen). So every step searches
+# a PREFERRED root by name, then FALLS BACK across every enumerated root, so a
+# wrong scope can never silently starve the search.
+# ---------------------------------------------------------------------------
+var gArRootsLogged = false
+
+proc arEnumRoots(into: var seq[Il2CppPtr]) =
   let anchor = splAnchor()
-  var roots: seq[Il2CppPtr] = @[]
-  discard iSceneRoots(roots, false, anchor)
+  discard iSceneRoots(into, false, anchor)
+  if not gArRootsLogged and into.len > 0:
+    gArRootsLogged = true
+    var names = ""
+    var i = 0
+    while i < into.len and names.len < 600:
+      let r = iToTransform(into[i])
+      if r != nil and duOk(r, 0x20'i32):
+        names = names & "[" & iObjName(r) & "]"
+      i = i + 1
+    okLog "autoRaid: enumerated " & $into.len &
+          " DontDestroyOnLoad root(s): " & names
+
+proc arNamedRoot(roots: seq[Il2CppPtr]; name: string): Il2CppPtr =
+  result = nil
   var i = 0
   while i < roots.len:
     let r = iToTransform(roots[i])
@@ -227,29 +279,66 @@ proc arRoot(name: string): Il2CppPtr =
       return r
     i = i + 1
 
-proc arFindPlay(): Il2CppPtr =
-  ## The active PlayButton scoped to MenuScreen (under "Common UI"), so the
-  ## RewardInfo popup's PlayButton is never a candidate.
+proc arPlayUnder(root: Il2CppPtr; deadline: uint64): Il2CppPtr =
+  ## MenuScreen under `root`, then the ACTIVE PlayButton under MenuScreen
+  ## (scoping to MenuScreen skips the RewardInfo popup's second PlayButton).
   result = nil
-  let cu = arRoot("Common UI")
-  if cu == nil: return
+  if root == nil: return
   var b = ArNodeBudget
-  let dl = cNowMs() + ArWalkMs
-  let ms = arWalkAny(cu, "MenuScreen", ArFindDepth, b, dl)
+  let ms = arWalkAny(root, "MenuScreen", ArFindDepth, b, deadline)
   if ms == nil: return
   var b2 = ArNodeBudget
-  let dl2 = cNowMs() + ArWalkMs
-  result = arWalkActive(ms, "PlayButton", ArFindDepth, b2, dl2, nil)
+  result = arWalkActive(ms, "PlayButton", ArFindDepth, b2, deadline, nil)
+
+proc arFindPlay(): Il2CppPtr =
+  ## The active PlayButton under Common UI -> MenuScreen, with a fallback across
+  ## every enumerated root. One shared 18 ms deadline bounds the whole search.
+  result = nil
+  var roots: seq[Il2CppPtr] = @[]
+  arEnumRoots(roots)
+  if roots.len == 0: return
+  let deadline = cNowMs() + ArWalkMs
+  let cu = arNamedRoot(roots, "Common UI")
+  if cu != nil:
+    result = arPlayUnder(cu, deadline)
+    if result != nil: return
+  var i = 0
+  while i < roots.len and cNowMs() <= deadline:
+    let r = iToTransform(roots[i])
+    if r != nil and r != cu and duOk(r, 0x20'i32):
+      result = arPlayUnder(r, deadline)
+      if result != nil: return
+    i = i + 1
+
+proc arFindActiveAcross(prefName, ctrlName: string;
+                        exclude: Il2CppPtr): Il2CppPtr =
+  ## The active control named `ctrlName`, searched under the root named
+  ## `prefName` FIRST (fact #237: the shared-name search must hit the intended
+  ## root before Common UI eats the name), then across every enumerated root.
+  ## One shared 18 ms deadline bounds the whole search.
+  result = nil
+  var roots: seq[Il2CppPtr] = @[]
+  arEnumRoots(roots)
+  if roots.len == 0: return
+  let deadline = cNowMs() + ArWalkMs
+  let pref = arNamedRoot(roots, prefName)
+  if pref != nil:
+    var b = ArNodeBudget
+    result = arWalkActive(pref, ctrlName, ArFindDepth, b, deadline, exclude)
+    if result != nil: return
+  var i = 0
+  while i < roots.len and cNowMs() <= deadline:
+    let r = iToTransform(roots[i])
+    if r != nil and r != pref and duOk(r, 0x20'i32):
+      var b = ArNodeBudget
+      result = arWalkActive(r, ctrlName, ArFindDepth, b, deadline, exclude)
+      if result != nil: return
+    i = i + 1
 
 proc arFindNext(exclude: Il2CppPtr): Il2CppPtr =
-  ## The active NextButton under "Menu UI", excluding `exclude` (the one we just
-  ## pressed).
-  result = nil
-  let mu = arRoot("Menu UI")
-  if mu == nil: return
-  var b = ArNodeBudget
-  let dl = cNowMs() + ArWalkMs
-  result = arWalkActive(mu, "NextButton", ArFindDepth, b, dl, exclude)
+  ## The active NextButton under "Menu UI" (fact #237), else any root, excluding
+  ## `exclude` (the one we just pressed).
+  result = arFindActiveAcross("Menu UI", "NextButton", exclude)
 
 # ---------------------------------------------------------------------------
 # The press: DefaultUIButton / AnimatedToggle OnClick(+0x120) via UnityEvent::
@@ -288,26 +377,20 @@ proc arTrim(s: string): string =
     result.add s[i]
     inc i
 
-proc arSelectMap(): bool =
-  ## Find the AnimatedToggle whose descendant "Label" TMP text == `gArMap`
-  ## (case-insensitive), and press it. Returns true only once a real match was
-  ## pressed -- an unmatched map is a REFUSAL (stay on this step), never a
-  ## silent advance.
+proc arSelectMapUnder(root: Il2CppPtr; want: string; deadline: uint64): bool =
+  ## Scan the AnimatedToggles under `root` for one whose descendant "Label" TMP
+  ## text == `want`, and press it. Bounded by the shared `deadline`.
   result = false
-  let mu = arRoot("Menu UI")
-  if mu == nil: return
+  if root == nil: return
   var toggles: seq[Il2CppPtr] = @[]
   var b = ArNodeBudget
-  let dl = cNowMs() + ArWalkMs
-  arCollect(mu, "AnimatedToggle", ArFindDepth, b, dl, toggles, 64)
-  let want = iLower(arTrim(gArMap))
+  arCollect(root, "AnimatedToggle", ArFindDepth, b, deadline, toggles, 64)
   var i = 0
-  while i < toggles.len:
+  while i < toggles.len and cNowMs() <= deadline:
     let tog = toggles[i]
     var labels: seq[Il2CppPtr] = @[]
     var b2 = ArNodeBudget
-    let dl2 = cNowMs() + ArWalkMs
-    arCollect(tog, "Label", ArMapDepth, b2, dl2, labels, 8)
+    arCollect(tog, "Label", ArMapDepth, b2, deadline, labels, 8)
     var j = 0
     while j < labels.len:
       let tmp = splTmpOf(labels[j])
@@ -317,6 +400,28 @@ proc arSelectMap(): bool =
           if arPress(tog, "AnimatedToggle"):
             return true
       j = j + 1
+    i = i + 1
+
+proc arSelectMap(): bool =
+  ## Find the AnimatedToggle whose descendant "Label" TMP text == `gArMap`
+  ## (case-insensitive), under "Menu UI" first (fact #237) then any root, and
+  ## press it. Returns true only once a real match was pressed -- an unmatched
+  ## map is a REFUSAL (stay on this step), never a silent advance.
+  result = false
+  var roots: seq[Il2CppPtr] = @[]
+  arEnumRoots(roots)
+  if roots.len == 0: return
+  let deadline = cNowMs() + ArWalkMs
+  let want = iLower(arTrim(gArMap))
+  let pref = arNamedRoot(roots, "Menu UI")
+  if pref != nil and arSelectMapUnder(pref, want, deadline):
+    return true
+  var i = 0
+  while i < roots.len and cNowMs() <= deadline:
+    let r = iToTransform(roots[i])
+    if r != nil and r != pref and duOk(r, 0x20'i32):
+      if arSelectMapUnder(r, want, deadline):
+        return true
     i = i + 1
 
 # ---------------------------------------------------------------------------
