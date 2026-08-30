@@ -237,6 +237,45 @@ proc cInspF32Bits(v: float32): uint32 {.importc: "aowl_insp_f32_to_bits", nodecl
 proc cInspF64Bits(v: float64): uint64 {.importc: "aowl_insp_f64_to_bits", nodecl.}
 
 # ---------------------------------------------------------------------------
+# THE F2 LIVE-INSPECTOR OVERLAY CAPTURE TAP (abi/aowlspt_inspoverlay.h)
+#
+# A ring of the inspector's recent commands + answer lines, plus a snapshot of
+# its bound anchors, both written from HERE (Unity's thread, as a batch runs)
+# and read by the D3D11 overlay in `Present` to draw the F2 panel -- see
+# `inspoverlay.nim`, included right after this file. The native side owns the
+# lock, the fixed buffers and the truncation; this side only feeds it. Every
+# feed is gated on `gIoCapture`, which stays false (zero cost) until the overlay
+# feature actually arms itself, so a build with `inspectorOverlay` off pays
+# nothing but a not-taken branch on each answer line.
+# ---------------------------------------------------------------------------
+{.emit: """#include "aowlspt_inspoverlay.h" """.}
+proc cIoPush(kind: int32; s: cstring) {.importc: "aowl_io_push", nodecl.}
+proc cIoAnchorBegin() {.importc: "aowl_io_anchor_begin", nodecl.}
+proc cIoAnchorAdd(s: cstring) {.importc: "aowl_io_anchor_add", nodecl.}
+proc cIoAnchorCommit() {.importc: "aowl_io_anchor_commit", nodecl.}
+
+var gIoCapture = false   ## set true by inspoverlay.nim once the panel is armed
+var gIoTapBuf: array[64, char]   ## Unity-thread scratch; nimony forbids cstring()
+
+proc ioBufC(s: string): cstring =
+  ## Copy a Nim string into a fixed NUL-terminated char buffer and hand back a
+  ## cstring to it -- nimony refuses `cstring(nonLiteral)`, and the C side copies
+  ## immediately (under its own lock), so reusing one buffer is safe. Written on
+  ## Unity's thread only, sequentially, so no second writer races it.
+  var n = s.len
+  if n > 63: n = 63
+  for i in 0 ..< n:
+    gIoTapBuf[i] = s[i]
+  gIoTapBuf[n] = chr(0)
+  cast[cstring](addr gIoTapBuf[0])
+
+proc ioTap(kind: int32; s: string) {.inline.} =
+  ## One captured activity line. The C side reads and truncates to 63, so a huge
+  ## `dump` line costs one bounded copy, not an unbounded one.
+  if gIoCapture:
+    cIoPush(kind, ioBufC(s))
+
+# ---------------------------------------------------------------------------
 # State
 #
 # Two threads touch this: the host's TICK thread (loads a batch, publishes the
@@ -633,6 +672,10 @@ proc iOut(s: string) =
   ## Every answer line. Capped twice -- per line and per batch -- because this
   ## runs on the game's main thread and an unbounded `dump` would be a stall
   ## the player feels.
+  # THE OVERLAY TAP, before the output cap: the F2 panel is a live glance and
+  # must keep scrolling even after the file transcript has hit its per-batch
+  # ceiling. The ring has its own capacity and discards its own oldest.
+  ioTap(1'i32, s)
   if gInspOut.len >= InspMaxOutLines:
     return
   if s.len > InspMaxLineLen:
@@ -703,6 +746,23 @@ proc iRefreshAnchors() =
   for i in 0 ..< 8:
     if gSuiTabPtr[i] != 0'u64:
       iSetVar("tab" & $i, gSuiTabPtr[i])
+  # PUBLISH the freshly-rebound anchors to the F2 overlay's snapshot, so the
+  # panel shows exactly what this batch is walking from. Runs on Unity's thread,
+  # inside the batch's own guard; `$` of a uint is allocation but this is once
+  # per batch (~4 Hz at most), not per frame. Only when the overlay is armed.
+  if gIoCapture:
+    cIoAnchorBegin()
+    var published = 0
+    for i in 0 ..< gInspVarName.len:
+      if published >= 24:
+        break
+      # Skip the scratch `_` and zero-valued slots -- a "$x=0x0" line is noise;
+      # the panel's job is to show what is actually bound.
+      if gInspVarName[i] == "_" or gInspVarVal[i] == 0'u64:
+        continue
+      cIoAnchorAdd(ioBufC("$" & gInspVarName[i] & "=" & iPtrU(gInspVarVal[i])))
+      inc published
+    cIoAnchorCommit()
 
 # ---------------------------------------------------------------------------
 # Address expressions
@@ -5628,6 +5688,9 @@ proc inspRunBatch() =
       gInspPhase = 0
       return
     iMark(("start of command: " & gInspCmds[i]), cast[Il2CppPtr](0))
+    # The command itself into the F2 panel's ring, tagged as a command so the
+    # overlay can colour it apart from the answer lines that follow.
+    ioTap(0'i32, "> " & gInspCmds[i])
     if cInspGuarded(cast[Il2CppPtr](0)) == nil:
       # THE ONE LINE THIS WHOLE FEATURE EXISTS TO MAKE POSSIBLE. A caught fault
       # that does not say where it landed is worth almost nothing; this names
