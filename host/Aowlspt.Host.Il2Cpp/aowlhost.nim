@@ -1579,6 +1579,18 @@ var gCodeGenProbeSlot = -1
 var gRegionSlot = -1
 var gRegionOn = false
 
+var gSplPreloaderSlot = -1
+  ## THE SINGLEPLAYER-REBRAND / forceOfflinePractice rider on
+  ## `EFT.UI.PreloaderUI::Update`. It carries NO feature handler -- its ONLY job
+  ## is to make the shared per-frame block capture `gSplUpdatePreloader` (the
+  ## live PreloaderUI `this`, which belongs to the DontDestroyOnLoad menu scene
+  ## -12 where the offline-raid screen lives). Without it that capture only ran
+  ## when some OTHER PreloaderUI rider (the live inspector, mode-text, mods,
+  ## region, ...) happened to be on -- so with liveInspector OFF (the shipped
+  ## beta) the durable anchor was never populated and splFindScreen enumerated no
+  ## roots (fact #234, second bug). Aliases onto an existing slot if one is held,
+  ## else attaches its own (kind 19); either way NO second detour.
+
 var gInspSlot2 = -1
   ## The inspector's SECOND anchor: the main drain's slot, aliased so the
   ## instrument keeps ticking inside a raid where `PreloaderUI::Update` does
@@ -3412,7 +3424,8 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
   # be on at once over ONE detour and ONE trampoline. Its per-frame cost when
   # no command is queued is a single interlocked load (`aowl_insp_have`).
   if i == gDebugUiSlot or i == gModeTextSlot or i == gInspSlot or
-     i == gCodeGenProbeSlot or i == gModsSlot or i == gRegionSlot:
+     i == gCodeGenProbeSlot or i == gModsSlot or i == gRegionSlot or
+     i == gSplPreloaderSlot:
     if not gSharedRidersLoggedPf:
       gSharedRidersLoggedPf = true
       logSharedRiders("patchFired", i)
@@ -3591,7 +3604,7 @@ proc patchReturned(slot: int32; regs: Il2CppPtr): int32 {.
   # it out here would silently kill the inspector in precisely the arming order
   # (mode-text first, inspector second) that the multiplex exists to tolerate.
   if i == gModeTextSlot or i == gDebugUiSlot or i == gInspSlot or
-     i == gModsSlot or i == gRegionSlot:
+     i == gModsSlot or i == gRegionSlot or i == gSplPreloaderSlot:
     if not gSharedRidersLoggedPr:
       gSharedRidersLoggedPr = true
       logSharedRiders("patchReturned", i)
@@ -4771,6 +4784,7 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
               elif kind == 15: "bot-nav"
               elif kind == 17: "skip-mode-screen-ctor"
               elif kind == 18: "skip-mode-screen-showslot"
+              elif kind == 19: "spl-preloader-anchor"
               else: "main-thread")
   tablesLock()
   let claimed = cHookClaim()
@@ -4848,6 +4862,8 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
     gModeSkipCtorSlot = int(claimed)
   elif kind == 18:
     gModeSkipShowSlot = int(claimed)
+  elif kind == 19:
+    gSplPreloaderSlot = int(claimed)
   else:
     gDrainSlot = int(claimed)
   tablesUnlock()
@@ -4856,7 +4872,7 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
   elif kind == 2 or kind == 3 or kind == 4 or kind == 5 or kind == 6 or
        kind == 7 or kind == 8 or kind == 9 or kind == 10 or
        kind == 11 or kind == 12 or kind == 13 or kind == 14 or kind == 15 or
-       kind == 16 or kind == 17 or kind == 18:
+       kind == 16 or kind == 17 or kind == 18 or kind == 19:
     discard
   else:
     gDrainMethod = spec
@@ -4867,7 +4883,7 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
             kind == 6 or kind == 7 or kind == 8 or kind == 9 or
             kind == 10 or kind == 11 or kind == 12 or kind == 13 or
             kind == 14 or kind == 15 or kind == 16 or kind == 17 or
-            kind == 18: "" else:
+            kind == 18 or kind == 19: "" else:
            "; it runs more than once a frame, so its firing count is not a " &
            "frame count")
   return true
@@ -5951,6 +5967,81 @@ proc bindCodeGenProbe(verbose: bool): bool =
   result = false
 
 
+proc bindSplPreloaderAnchor(verbose: bool): bool =
+  ## Guarantee the durable DontDestroyOnLoad anchor (`gSplUpdatePreloader`) is
+  ## captured whenever singleplayerRebrand OR forceOfflinePractice is on -- the
+  ## SECOND half of fact #234's fix. That anchor is captured in the shared
+  ## `EFT.UI.PreloaderUI::Update` block, which only runs when SOME rider holds
+  ## that function. With liveInspector OFF (the shipped beta) and no other
+  ## PreloaderUI rider on, it never ran, so `splFindScreen` had no anchor and
+  ## enumerated no DontDestroyOnLoad roots -- the rebrand/offline-force silently
+  ## never fired. This makes the singleplayer feature its OWN rider so it no
+  ## longer depends on the inspector or any other feature.
+  ##
+  ## Same alias-or-attach discipline as `bindCodeGenProbe` (two detours on one
+  ## function have the second overwrite the first's trampoline): if another
+  ## feature already holds `PreloaderUI::Update`, the anchor is ALREADY being
+  ## captured every frame, so this only records the slot and installs nothing.
+  ## Only when nobody holds it does this verify the ORIGINAL prologue (via
+  ## `cDuPreloaderTarget`, against the startup snapshot, so it cannot self-reject)
+  ## and attach its own read-only rider. It carries no handler and never
+  ## suppresses the original.
+  if gSplPreloaderSlot >= 0:
+    return true
+  if not (gSplOn or gSplForceOffline):
+    return false
+  if not gReady or gDisableDrain:
+    return false
+  if gDebugUiSlot >= 0:
+    gSplPreloaderSlot = gDebugUiSlot
+    okLog "singleplayer anchor: riding the debug overlay's existing " &
+          "EFT.UI.PreloaderUI::Update detour (slot " & $gSplPreloaderSlot &
+          ") to capture the DontDestroyOnLoad menu anchor"
+    return true
+  if gModeTextSlot >= 0:
+    gSplPreloaderSlot = gModeTextSlot
+    okLog "singleplayer anchor: riding the menu mode-text feature's existing " &
+          "EFT.UI.PreloaderUI::Update detour (slot " & $gSplPreloaderSlot & ")"
+    return true
+  if gInspSlot >= 0:
+    gSplPreloaderSlot = gInspSlot
+    okLog "singleplayer anchor: riding the live inspector's existing " &
+          "EFT.UI.PreloaderUI::Update detour (slot " & $gSplPreloaderSlot & ")"
+    return true
+  if gCodeGenProbeSlot >= 0:
+    gSplPreloaderSlot = gCodeGenProbeSlot
+    okLog "singleplayer anchor: riding the codeGen audit's existing " &
+          "EFT.UI.PreloaderUI::Update detour (slot " & $gSplPreloaderSlot & ")"
+    return true
+  if gModsSlot >= 0:
+    gSplPreloaderSlot = gModsSlot
+    okLog "singleplayer anchor: riding the mods tab's existing " &
+          "EFT.UI.PreloaderUI::Update detour (slot " & $gSplPreloaderSlot & ")"
+    return true
+  if gRegionSlot >= 0:
+    gSplPreloaderSlot = gRegionSlot
+    okLog "singleplayer anchor: riding the shared region's existing " &
+          "EFT.UI.PreloaderUI::Update detour (slot " & $gSplPreloaderSlot & ")"
+    return true
+  let fn = cDuPreloaderTarget()
+  if fn == nil:
+    if verbose:
+      warn "singleplayer anchor: EFT.UI.PreloaderUI::Update did not verify on " &
+           "this build and no other feature holds it, so the durable " &
+           "DontDestroyOnLoad menu anchor cannot be captured. The rebrand and " &
+           "forceOfflinePractice will only resolve if the live inspector or " &
+           "another PreloaderUI rider is on. This is a REFUSAL, not a success."
+    return false
+  if attachDrain("EFT.UI.PreloaderUI::Update", fn, cast[Il2CppMethod](0),
+                 true, verbose, 19'i32):
+    okLog "singleplayer anchor: armed its OWN EFT.UI.PreloaderUI::Update rider " &
+          "(slot " & $gSplPreloaderSlot & ") to capture the DontDestroyOnLoad " &
+          "menu anchor -- independent of liveInspector (fact #234). Read-only; " &
+          "no handler, never suppresses the original."
+    return true
+  result = false
+
+
 proc hostEventSubscribe(ctx: Il2CppPtr; name: Il2CppPtr; nameLen: int32;
                         cb: Il2CppPtr; user: Il2CppPtr): int32 {.
     exportc: "aowlspt_nim_event_subscribe", cdecl.} =
@@ -6428,6 +6519,32 @@ proc readBoolKey(key: string): bool =
     inc i
   if i < text.len and text[i] == 't':
     result = true
+  elif i < text.len and text[i] >= '1' and text[i] <= '9':
+    result = true
+
+proc readBoolKeyDef(key: string; dflt: bool): bool =
+  ## Like `readBoolKey`, but distinguishes ABSENT (return `dflt`) from PRESENT-
+  ## and-false. Used for flags that default ON: `forceOfflinePractice`. Same
+  ## shallow shape as `readBoolKey` -- no JSON parser. `tools/hostcfg.py` knows
+  ## this reader (its BOOL_CALL regex accepts the `Def` suffix), so a key read
+  ## this way is still one `set` can write.
+  result = dflt
+  var text = ""
+  if not readTextFile(joinPath(gDir, "aowlspt-host.json"), text):
+    return
+  let needle = "\"" & key & "\""
+  let at = find(text, needle)
+  if at < 0:
+    return                                   # absent -> the default
+  var i = at + needle.len
+  while i < text.len and (text[i] == ' ' or text[i] == ':' or text[i] == '\t'):
+    inc i
+  if i < text.len and text[i] == 't':
+    result = true
+  elif i < text.len and text[i] == 'f':
+    result = false
+  elif i < text.len and text[i] == '0':
+    result = false
   elif i < text.len and text[i] >= '1' and text[i] <= '9':
     result = true
 
@@ -7295,6 +7412,20 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   # practice-mode checkbox, reusing the byte-verified nativeui setters; it never
   # ticks the toggle, so offline routing is untouched. Discovery is live and by
   # displayed text, and it rides the TarkovApplication::Update drain.
+  # FORCE OFFLINE / PRACTICE MODE. Default ON. Independent of the rebrand: when
+  # set, the Matchmaker Offline Raid Screen's practice/offline toggle is auto-
+  # forced ON (Toggle::set_isOn @0x55BA430, fact #71) the moment the screen
+  # appears, so a raid entered by pressing straight through the menus (no manual
+  # tick) stays OFFLINE and never enters the online NetworkGameMatching that
+  # times out and crashes the load (fact #263). It never relabels or hides.
+  gSplForceOffline = readBoolKeyDef("forceOfflinePractice", true)
+  if gSplForceOffline:
+    info "forceOfflinePractice is set (default ON): the Matchmaker Offline Raid " &
+         "Screen's practice/offline toggle will be AUTO-enabled via the byte-" &
+         "verified Toggle::set_isOn @0x55BA430, so solo raids stay offline no " &
+         "matter how the user navigates. Discovery is live and by displayed " &
+         "text; the toggle is left VISIBLE and ticked unless singleplayerRebrand " &
+         "also hides it."
   gSplOn = readBoolKey("singleplayerRebrand")
   if gSplOn:
     info "singleplayerRebrand is set: the Matchmaker Offline Raid Screen's " &
@@ -7841,6 +7972,16 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
       # this list.
       if gRegionOn:
         discard bindRegion(true)
+
+      # THE SINGLEPLAYER ANCHOR (opt-in via singleplayerRebrand OR the default-ON
+      # forceOfflinePractice). Armed LAST of the PreloaderUI::Update riders, so by
+      # here any of the others may have claimed the slot and this aliases onto it
+      # for free; only if NONE is on does it attach its own read-only rider. This
+      # is what makes the offline-force and the rebrand work in the shipped beta
+      # with liveInspector OFF (fact #234): it guarantees `gSplUpdatePreloader` is
+      # captured so `splFindScreen` has a DontDestroyOnLoad anchor to walk.
+      if gSplOn or gSplForceOffline:
+        discard bindSplPreloaderAnchor(true)
 
       # THE MAIN-MENU BETA NOTICE (opt-in, `uxBetaOverlay`). Not a rider
       # and not a detour: a REGISTRATION with the region armed just above.

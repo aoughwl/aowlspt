@@ -66,7 +66,7 @@ INT_KEYS = {
     "modSyncMs": 3000,
 }
 
-BOOL_CALL = re.compile(r'readBoolKey\(\s*"([A-Za-z0-9_]+)"')
+BOOL_CALL = re.compile(r'readBoolKey(?:Def)?\(\s*"([A-Za-z0-9_]+)"')
 # String-valued flags go through `readStrKey`, a shape `scrape_keys` did not
 # know about at all, so every string key was invisible to this tool -- measured
 # missing: `launchProfileId` (aowlhost.nim) and `uxBetaOverlayPos`
