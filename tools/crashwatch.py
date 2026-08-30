@@ -40,10 +40,18 @@ session inside ordinary async stack dumps -- is NEVER matched on its own.
   * aggregate-exception    "One or more errors occurred" / AggregateException --
                            the raid-load NRE cascade shows up exactly this way.
   * raid-load-abort        "A task was canceled" / TaskCanceledException.
-  * matchmaking-timeout    a NetworkGameMatching trace armed, then no raid-start
-                           marker (LocationLoaded / MatchingCompleted /
-                           GameStarted) within --match-timeout seconds. This one
-                           is the softest signature; see the caveat on it below.
+  * matchmaking-timeout    a NetworkGameMatching trace armed, then ZERO load
+                           progress of ANY kind for --match-timeout seconds
+                           (default 150). Load progress = the raid is loading,
+                           not a matchmaking hang, so ANYTHING loading disarms
+                           it: geometry/asset loads, scene/location progress,
+                           prewarm, a raid-start marker. Measured: a healthy
+                           OFFLINE Woods load emits a NetworkGameMatching trace
+                           (it resolves offline) and then does not touch geometry
+                           for ~47s -- so an earlier 45s/raid-marker-only version
+                           killed a perfectly healthy load. This signature now
+                           fires ONLY when nothing loads at all for 150s+, which
+                           is a genuinely stuck matchmaking with no assets moving.
 
 Known-benign stock EFT/Unity noise (convex-mesh, spawn-marker snap, missing
 bundle script) is suppressed -- the list is shared in spirit with clientlog.py.
@@ -96,11 +104,24 @@ EXTYPE = re.compile(r"([A-Za-z][\w.`+]*(?:Exception|Error))\b")
 # at Error but recoverable, and killing the game on them is a false positive.
 STACKISH = re.compile(r"(?::MoveNext\(|\bMoveNext\s*\(|^\s*at |Rethrow as )", re.M)
 
-# Progress markers that DISARM the matchmaking timer. LocationLoaded fires well
-# before MatchingCompleted on a healthy boot (~19s vs ~47s measured), so it MUST
-# be here or a healthy load would trip a 35-45s timer.
-MATCH_PROGRESS = ("LocationLoaded", "MatchingCompleted", "GameStarted",
-                  "GameSpawn", "OnGameStarted")
+# ANY of these DISARMS the matchmaking timer: the raid is loading, not hung.
+# Deliberately broad -- the failure mode we are fixing is over-firing, and a
+# NetworkGameMatching trace appears even in a healthy OFFLINE load (it resolves
+# offline), so its mere presence is NOT a hang. A healthy offline Woods load can
+# go ~47s from the matchmaking trace to the first geometry load with nothing in
+# between, so the timeout is long (150s) AND anything loading clears it.
+# Substrings, matched anywhere in a line (case-insensitive via LOAD_PROGRESS_RX).
+MATCH_PROGRESS = (
+    # raid-start / handshake milestones
+    "LocationLoaded", "MatchingCompleted", "GameStarted", "GameSpawn",
+    "OnGameStarted", "GamePrepared", "GameCreated", "PlayerSpawn",
+    # asset / geometry / scene loading -- the raid is actively coming up
+    "loaded Geometry", "[Geometry]", "MetaXRAcoustic", "StreamingAssets",
+    "Loading ", "prewarm", "scene preset", "SceneLoad", "LevelLoad",
+    "loading level", "bundle",
+)
+LOAD_PROGRESS_RX = re.compile(
+    "|".join(re.escape(s) for s in MATCH_PROGRESS), re.IGNORECASE)
 
 # Stock, documented-benign noise. If a record matches one of these it is NOT a
 # crash no matter what level it was logged at. The prewarm-shot NRE fires on
@@ -218,11 +239,13 @@ class Tailer:
         self.rec_level = ""
         return out
 
-    def poll(self):
+    def poll(self, on_line=None):
         """Read new bytes; yield (signature, detail, record_text) for hits.
 
         A record is closed when the NEXT timestamped header arrives. A trailing
-        record with no following header is closed by flush() on idle.
+        record with no following header is closed by flush() on idle. `on_line`,
+        if given, is called with every raw line exactly once (used to feed the
+        matchmaking watcher without re-slicing the ring).
         """
         try:
             size = os.path.getsize(self.path)
@@ -244,6 +267,8 @@ class Tailer:
         for raw in lines:
             line = raw.rstrip("\r")
             self.ring.append(line)
+            if on_line is not None:
+                on_line(line)
             if TS.match(line):
                 done = self._finish_record()
                 if done:
@@ -268,28 +293,35 @@ class Tailer:
 
 
 class MatchWatch:
-    """Arms on a NetworkGameMatching trace, disarms on a raid-start marker.
+    """Fires only when NOTHING loads for `timeout` seconds after a matchmaking
+    trace -- i.e. a genuinely stuck matchmaking with no assets moving.
 
-    Fires once if armed longer than `timeout`. The softest signature here: on a
-    slow box a genuine load could exceed the timer. Kept conservative (disarms on
-    the earliest progress marker, LocationLoaded) and the timeout is tunable.
+    Arms on a NetworkGameMatching trace. Disarms the moment ANY load-progress
+    line appears (LOAD_PROGRESS_RX: geometry/asset/scene/prewarm/raid-start),
+    because that means the raid IS loading. So a surviving armed timer past the
+    timeout means zero progress happened in the whole window. The clock is
+    injected (`now`) so this is deterministically testable against a static log.
     """
 
     def __init__(self, timeout):
         self.timeout = timeout
         self.armed_at = None
 
-    def feed(self, line):
-        if any(p in line for p in MATCH_PROGRESS):
+    def feed(self, line, now=None):
+        if LOAD_PROGRESS_RX.search(line):
             self.armed_at = None
             return
         if "NetworkGameMatching" in line:
-            self.armed_at = time.time()
+            # Arm only if not already counting -- keep the ORIGINAL arm time so a
+            # repeated trace with no progress does not perpetually reset the clock.
+            if self.armed_at is None:
+                self.armed_at = time.time() if now is None else now
 
-    def expired(self):
+    def expired(self, now=None):
         if self.armed_at is None:
             return False
-        return (time.time() - self.armed_at) > self.timeout
+        t = time.time() if now is None else now
+        return (t - self.armed_at) > self.timeout
 
 
 def kill_game(dry_run):
@@ -372,15 +404,13 @@ def run(args):
 
     while True:
         hit = None
+        feed = match.feed if match is not None else None
         for suf, t in list(tailers.items()):
-            for sig, detail, text in t.poll():
+            for sig, detail, text in t.poll(on_line=feed):
                 hit = (sig, detail, text, t)
                 break
             if hit:
                 break
-            if match is not None:
-                for line in list(t.ring)[-4:]:
-                    match.feed(line)
         now = time.time()
 
         # Close dangling trailing records if the log paused mid-record.
@@ -400,8 +430,8 @@ def run(args):
             path = files.get("application_000.log", cur_dir) if files else cur_dir
             action = kill_game(args.dry_run)
             report("matchmaking-timeout",
-                   "no raid start within %ds of a NetworkGameMatching trace"
-                   % args.match_timeout, "", path, tail, action)
+                   "no load progress at all within %ds of a NetworkGameMatching "
+                   "trace" % args.match_timeout, "", path, tail, action)
             match.armed_at = None
             if not args.watch:
                 return 1
@@ -449,9 +479,11 @@ def main():
                    help="also scan text already in the newest dir at start "
                         "(off by default so a stale crash can't kill a "
                         "freshly relaunched game)")
-    p.add_argument("--match-timeout", type=int, default=45,
-                   help="seconds a NetworkGameMatching trace may stay unresolved "
-                        "before it counts as a hang (default 45)")
+    p.add_argument("--match-timeout", type=int, default=150,
+                   help="seconds with ZERO load progress after a "
+                        "NetworkGameMatching trace before it counts as a hang "
+                        "(default 150; a healthy offline load can idle ~47s "
+                        "between the trace and the first geometry load)")
     p.add_argument("--no-matchmaking", action="store_true",
                    help="disable the (softest) matchmaking-timeout signature")
     p.add_argument("--interval", type=float, default=0.5,
