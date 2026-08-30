@@ -298,9 +298,26 @@ proc arNamedRoot(roots: seq[Il2CppPtr]; name: string): Il2CppPtr =
       return r
     i = i + 1
 
+proc arOnClickOff(compType: string): int32 =
+  ## The UnityEvent slot that `arPress` fires and `arIsPressable` reads -- the
+  ## SINGLE source of that offset for BOTH, so the check and the action can never
+  ## again read different slots (the §9b divergence lesson).
+  ##
+  ## EFT's DefaultUIButton keeps its OnClick UnityEvent at +0x120, NOT at the
+  ## generic UnityEngine.UI.Button.m_OnClick@0x100 that `cNavOffOnClick()`
+  ## returns. Confirmed live on the MenuScreen PlayButton: comp+0x120 is the real
+  ## OnClick UnityEvent (valid), comp+0x100 is a different field the guards reject
+  ## -- so reading 0x100 made arIsPressable return false forever on a genuinely
+  ## pressable button and auto-raid self-disabled having pressed nothing. Every
+  ## other compType (AnimatedToggle) keeps the generic 0x100: 0x120 on a Toggle is
+  ## m_IsOn (a bool), not an event, so remapping it would fire garbage.
+  if compType == "DefaultUIButton": 0x120'i32
+  else: cNavOffOnClick()
+
 proc arIsPressable(node: Il2CppPtr; compType: string): bool =
   ## READ-ONLY check (no Invoke) that `node` carries a live `compType`
-  ## (DefaultUIButton / AnimatedToggle) with a valid OnClick(+0x120) UnityEvent --
+  ## (DefaultUIButton / AnimatedToggle) with a valid OnClick UnityEvent at the
+  ## offset `arPress` would fire (arOnClickOff) --
   ## i.e. that `arPress` WOULD fire it. This is the fix for the atomic-press gap:
   ## several GameObjects can share the name "PlayButton" (a wrapper/container plus
   ## the real button); returning the first merely-ACTIVE one and then pressing it
@@ -312,7 +329,7 @@ proc arIsPressable(node: Il2CppPtr; compType: string): bool =
   var comp: Il2CppPtr = nil
   var w = ""
   if not iVisComponent(node, compType, comp, w) or comp == nil: return
-  let off = cNavOffOnClick()
+  let off = arOnClickOff(compType)
   if not duOk(comp, off + 8'i32) or not iUnityAlive(comp): return
   let ev = cReadPtrAt(comp, off)
   if ev == nil or iIsGameObject(ev) or iIsKnownKlass(cast[uint64](ev)): return
@@ -438,7 +455,7 @@ proc arPress(node: Il2CppPtr; compType: string): bool =
   var comp: Il2CppPtr = nil
   var w = ""
   if not iVisComponent(node, compType, comp, w) or comp == nil: return
-  let off = cNavOffOnClick()                  # 0x120 on this build
+  let off = arOnClickOff(compType)            # 0x120 for DefaultUIButton, else 0x100
   if not duOk(comp, off + 8'i32) or not iUnityAlive(comp): return
   let ev = cReadPtrAt(comp, off)
   if ev == nil or iIsGameObject(ev) or iIsKnownKlass(cast[uint64](ev)): return
