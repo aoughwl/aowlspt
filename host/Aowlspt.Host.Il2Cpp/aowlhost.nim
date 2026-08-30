@@ -3342,6 +3342,11 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
     # matchmaker screens which are up before the main menu's PreloaderUI can be
     # assumed), not a second detour. Idle cost is two integer compares.
     splRebrandDrainTick()
+    # HOST-NATIVE AUTO-RAID. Rides THIS drain (TarkovApplication::Update ticks
+    # the whole session, including the matchmaker screens that are up before the
+    # main menu's PreloaderUI can be assumed), not a second detour. Default OFF
+    # (uxAutoRaid); idle cost is two integer compares and no call into the game.
+    autoRaidDrainTick()
     return 0'i32
   # The render-phase drain, likewise by identity: a second detour on a
   # render-phase method that drains the render queue where GL drawing lands.
@@ -5884,6 +5889,14 @@ include "modstab.nim"
 ## way the cursor-free feature does. Default OFF (`singleplayerRebrand`).
 include "splrebrand.nim"
 
+## HOST-NATIVE AUTO-RAID. Included AFTER `inspect.nim` (it stands on the
+## transform walkers, the activeInHierarchy check and the DefaultUIButton press
+## path) and AFTER `splrebrand.nim` (it reuses `splAnchor`/`splTmpOf`/`splTmpText`
+## and depends on the same practice-toggle forcing to keep the raid offline). It
+## adds NO detour: `autoRaidDrainTick` rides the `TarkovApplication::Update` drain
+## the same way `splRebrandDrainTick` does. Default OFF (`uxAutoRaid`).
+include "autoraid.nim"
+
 ## THE SHARED PER-FRAME REGION. Included AFTER `modstab.nim` because
 ## `bindRegion` names `gModsSlot` and `cDuPreloaderTarget`, and nimony
 ## forward-resolves procs across an include boundary but NOT variables.
@@ -7304,6 +7317,25 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
          "will be SetActive(false). The screen is discovered live by displayed " &
          "text from a scene root (no hardcoded path); the toggle's value is " &
          "never changed, so the raid still routes to the emulated backend."
+  # HOST-NATIVE AUTO-RAID. Default OFF (`uxAutoRaid`). On launch it drives the
+  # menu into an OFFLINE raid on `autoRaidMap` (default "Woods") natively -- no
+  # Python, no inspector -- by riding the TarkovApplication::Update drain and
+  # reusing inspect.nim's find/active/press primitives. It only advances screens;
+  # it relies on `singleplayerRebrand` to force the practice toggle so the raid
+  # stays offline, so it should be run WITH that flag on.
+  gArOn = readBoolKey("uxAutoRaid")
+  block:
+    let m = readStrKey("autoRaidMap")
+    if m.len > 0:
+      gArMap = m
+  if gArOn:
+    info "uxAutoRaid is set: on launch the host will drive the main menu into " &
+         "an OFFLINE raid on map \"" & gArMap & "\" natively (PLAY -> NEXT -> " &
+         "select map -> NEXT... -> READY), advancing only when each expected " &
+         "control is visible, then going hands-off once READY is pressed. It " &
+         "reuses the inspector's find/active/press primitives and rides the " &
+         "TarkovApplication::Update drain -- no second detour, no Python, no " &
+         "live inspector. Run WITH singleplayerRebrand so the raid stays offline."
   # The native-UI layer. Both default OFF. `nativeUi` makes the API answer at
   # all; `nativeUiProof` additionally runs the one-shot visual self-proof.
   gNuOn = readBoolKey("nativeUi")
