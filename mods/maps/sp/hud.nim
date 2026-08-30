@@ -154,6 +154,13 @@ static struct {
      * say "hidden behind a panel" instead of letting a masked frame read as the
      * flicker failure -- a countable reason, never a silent decline. */
     int64_t  masked;
+    /* Dispatches turned away by the MASTER GATE (`enabled == 0`) -- the feature
+     * is switched OFF. Counted apart from `masked` and from `drawn` because the
+     * three are different answers to "why is nothing on screen", and the OFF
+     * case is the one the player just asked for. A rising `gated` alongside a
+     * frozen `drawn` is the POSITIVE evidence that the off-toggle reached the
+     * draw path; `gated` staying at 0 after an off edit is the falsification. */
+    int64_t  gated;
     /* Indicators are drawn one of TWO ways and the two are counted apart, on
      * purpose. `indProjected` is the real, camera-relative answer via the
      * region's projector; `indBearing` is the north-up fallback used when no
@@ -864,6 +871,12 @@ static void mhud_draw(void* user, int64_t frame) {
      * submit a command while the feature is off. */
     if (!g_mhud.enabled) {
         g_mhud.heldValid = 0;
+        g_mhud.gated++;
+        /* The finished-state assertion (§9b), recorded rather than assumed: this
+         * dispatch submitted ZERO primitives. `tilesDrawn` is what the `art`
+         * line reports, and leaving it holding the last ON frame's count would
+         * let the diag claim tiles were drawn on a frame that drew nothing. */
+        g_art.tilesDrawn = 0;
         return;
     }
     /* BUG 2: a blocking UI surface is up (F12/Settings, F6 or F3). Submit
@@ -1276,6 +1289,18 @@ static int64_t mhud_frames(void)  { return g_mhud.frames; }
 static int64_t mhud_drawn(void)   { return g_mhud.drawn; }
 static int64_t mhud_blips(void)   { return g_mhud.blips; }
 static int64_t mhud_masked(void)  { return g_mhud.masked; }
+static int64_t mhud_gated(void)   { return g_mhud.gated; }
+/* THE MIRROR, READ BACK. The diag must be able to compare what config.json says
+ * against what the draw callback is ACTUALLY holding, because those two
+ * disagreeing IS the bug this exists to catch: an edit that stores and never
+ * reaches the mirror leaves the map on screen while every config read says off.
+ * Reading our own struct back is the only way that disagreement is observable
+ * from the Nim side; without it the diag can only re-report the config value it
+ * just read, which is a check that cannot fail. */
+static int32_t mhud_live_enabled(void) { return g_mhud.enabled; }
+static int32_t mhud_live_map(void)     { return g_mhud.mapOn; }
+static int32_t mhud_live_radar(void)   { return g_mhud.radarOn; }
+static int32_t mhud_live_ind(void)     { return g_mhud.indicatorsOn; }
 static int32_t mhud_handle(void)  { return g_mhud.handle; }
 static int64_t mhud_ind_projected(void) { return g_mhud.indProjected; }
 static int64_t mhud_ind_bearing(void)   { return g_mhud.indBearing; }
@@ -1325,6 +1350,11 @@ proc cHudFrames(): int64 {.importc: "mhud_frames", nodecl.}
 proc cHudDrawn(): int64 {.importc: "mhud_drawn", nodecl.}
 proc cHudBlips(): int64 {.importc: "mhud_blips", nodecl.}
 proc cHudMasked(): int64 {.importc: "mhud_masked", nodecl.}
+proc cHudGated(): int64 {.importc: "mhud_gated", nodecl.}
+proc cHudLiveEnabled(): int32 {.importc: "mhud_live_enabled", nodecl.}
+proc cHudLiveMap(): int32 {.importc: "mhud_live_map", nodecl.}
+proc cHudLiveRadar(): int32 {.importc: "mhud_live_radar", nodecl.}
+proc cHudLiveInd(): int32 {.importc: "mhud_live_ind", nodecl.}
 proc cHudHandle(): int32 {.importc: "mhud_handle", nodecl.}
 proc cHudConfigureMap(mapOn: int32; mapX, mapY, mapSize, mapSpanM: cfloat;
                       mapGrid: int32; indicatorInset: cfloat) {.
@@ -1368,6 +1398,14 @@ proc hudFrames*(): int64 = cHudFrames()
 proc hudDrawn*(): int64 = cHudDrawn()
 proc hudBlips*(): int64 = cHudBlips()
 proc hudMasked*(): int64 = cHudMasked()
+proc hudGated*(): int64 = cHudGated()
+  ## Dispatches turned away by the master gate (the feature is switched OFF).
+proc hudLiveEnabled*(): bool = cHudLiveEnabled() != 0'i32
+proc hudLiveMap*(): bool = cHudLiveMap() != 0'i32
+proc hudLiveRadar*(): bool = cHudLiveRadar() != 0'i32
+proc hudLiveIndicators*(): bool = cHudLiveInd() != 0'i32
+  ## What the DRAW CALLBACK is holding right now -- not what config.json says.
+  ## The diag compares the two; they must never be allowed to be the same read.
 proc hudIndProjected*(): int64 = cHudIndProjected()
 proc hudIndBearing*(): int64 = cHudIndBearing()
 proc hudScreenMeasured*(): int32 = cHudScreenMeasured()

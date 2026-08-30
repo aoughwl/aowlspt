@@ -81,6 +81,7 @@ import aowlspt
 import aowlspt/server as sv
 import aowlspt/sync
 import aowlspt/settings   # the F12 schema this mod declares -- see `spatialSchema`
+import aowlspt/json as jr # field/asText -- the edited KEY out of a POST body
 import sp / world
 import sp / hud
 import sp / serve
@@ -286,10 +287,40 @@ proc spatialSchema(): seq[Setting] =
                               "lists has been measured on this build"),
   ]
 
+proc onMapsApply(key: string)
+  ## Forward-declared so the ROUTE below can run the same hot-apply the event-bus
+  ## path runs. See the comment in `onSpatialSettings`.
+
 proc onSpatialSettings(url, body, session: string): string =
+  ## THE SECOND WRITE PATH, and the one that used to lose the edit.
+  ##
+  ## There are two transports into this mod's settings and they were NOT
+  ## symmetric:
+  ##
+  ##   * the event bus -- `SettingsApplyQuery` -> the SDK's `onApplyQuery`
+  ##     (aowl/src/aowlspt/settings.nim:664) -> `applySettingFromBody` AND THEN
+  ##     `gApplyHook(key)`, i.e. `onMapsApply`, which pushes the new visibility
+  ##     into the C mirror the draw callback reads every frame.
+  ##   * this ROUTE -- which called `applySettingFromBody` and stopped there.
+  ##
+  ## So an edit that arrived over the route was PERSISTED to config.json and
+  ## never applied: `hudReconfigure` never ran, `mhud_set_enabled`/`mapOn`/
+  ## `radarOn` kept whatever they held at startup, and the map went on being
+  ## drawn on every frame while every config read said it was off. The store
+  ## succeeded, the reply carried the new schema, and nothing on screen changed
+  ## -- the exact "control that moves and changes nothing" the apply mechanism
+  ## exists to prevent.
+  ##
+  ## The fix is to make the two transports converge on the SAME hook rather than
+  ## to add a second off-switch: one predicate (`enabled`/`mapOn`/`radarOn`/
+  ## `indicatorsOn` in the C mirror) still owns whether anything draws, and both
+  ## write paths now drive it. `onMapsApply` is idempotent and reports its own
+  ## verdict, so running it here costs one config re-read.
   var st = Ok
   if body.len > 0:
     st = applySettingFromBody(body)
+    if st == Ok:
+      onMapsApply(jr.asText(jr.field(body, "key"), ""))
   result = declaredSchemaReply(st).text
 
 # ---------------------------------------------------------------- map ART
@@ -613,6 +644,10 @@ proc mapsDiagText(): string =
   if hudMasked() > 0'i64:
     lDraw = lDraw & "; " & $hudMasked() & " dispatch(es) SKIPPED with an " &
             "overlay open (aowl_ui_overlay_mask != 0 -- map hidden behind a panel)"
+  if hudGated() > 0'i64:
+    lDraw = lDraw & "; " & $hudGated() & " dispatch(es) GATED OFF by the " &
+            "master switch (enabled == 0 -- 0 primitives submitted, held frame " &
+            "dropped)"
 
   # 5. the back buffer. A 0x0 screen puts every mark in the corner.
   var lScreen = ""
@@ -734,11 +769,65 @@ proc mapsDiagText(): string =
             " (budget " & $gOpts.budgetUs & "us; the region throttles this " &
             "participant after 8 consecutive overruns)"
 
+  # THE TOGGLE LINE (Â§9b). The one check that would have caught the bug this
+  # block exists for: an edit that STORES and never reaches the draw path.
+  #
+  # It compares two INDEPENDENT reads -- what config.json says right now, and
+  # what the C mirror the draw callback dereferences every frame is actually
+  # holding -- and it is deliberately NOT a re-read of our own write. A
+  # self-comparison ("I pushed off, and off is what I pushed") cannot fail; this
+  # can, and the input that makes it fail is exactly the reported bug: turn the
+  # map off and see `config=off` next to `mirror=ON`.
+  #
+  # Three outcomes, never two. INCONCLUSIVE when no HUD is registered, because
+  # there is then no mirror to disagree with and "I could not look" is not a
+  # pass.
+  var lToggle = ""
+  if not gHudOn:
+    lToggle = "INCONCLUSIVE  no HUD is registered, so there is no live mirror " &
+              "to compare config.json against"
+  else:
+    let cfgEnabled = asBool(setting("enabled"), false)
+    let cfgMap     = asBool(setting("hudMap"), false)
+    let cfgRadar   = asBool(setting("hudRadar"), true)
+    let cfgInd     = asBool(setting("hudIndicators"), false)
+    # The mirror's per-surface flags are config ANDed with `live`, so the only
+    # legal disagreement is mirror=off while config=on (the feed is not
+    # running). mirror=ON while config=off is ALWAYS a defect: it means an edit
+    # was persisted and never applied, and the player is looking at art they
+    # switched off.
+    var leaked: seq[string] = @[]
+    if (not cfgEnabled) and hudLiveEnabled(): leaked.add "enabled"
+    if (not cfgMap)     and hudLiveMap():     leaked.add "hudMap"
+    if (not cfgRadar)   and hudLiveRadar():   leaked.add "hudRadar"
+    if (not cfgInd)     and hudLiveIndicators(): leaked.add "hudIndicators"
+    var mirrorTxt = "config(enabled=" & $cfgEnabled & " map=" & $cfgMap &
+                    " radar=" & $cfgRadar & " ind=" & $cfgInd & ")" &
+                    " vs mirror(enabled=" & $hudLiveEnabled() &
+                    " map=" & $hudLiveMap() & " radar=" & $hudLiveRadar() &
+                    " ind=" & $hudLiveIndicators() & ")"
+    if leaked.len > 0:
+      var names = ""
+      for k in leaked:
+        if names.len > 0: names = names & ", "
+        names = names & k
+      lToggle = "FAIL  " & names & " is OFF in config.json and still ON in the " &
+                "live draw mirror -- the edit was STORED and never APPLIED, so " &
+                "the overlay is still being painted. " & mirrorTxt
+    elif not hudLiveEnabled():
+      lToggle = "PASS  the master switch is OFF and the draw callback is " &
+                "submitting nothing (" & $hudGated() & " gated dispatch(es), " &
+                "0 tiles). " & mirrorTxt
+    else:
+      lToggle = "PASS  no surface is off in config while still on in the live " &
+                "mirror. " & mirrorTxt
+
   result = "maps diag:\n" &
            "  region       : " & lRegion & "\n" &
            "  world        : " & lWorld  & "\n" &
            "  raid         : " & lRaid   & "\n" &
            "  positions    : " & lPos    & "\n" &
+           "  toggle       : " & lToggle & "\n" &
            "  draw         : " & lDraw   & "\n" &
            "  drawCost     : " & lPerf   & "\n" &
            "  screen       : " & lScreen & "\n" &
