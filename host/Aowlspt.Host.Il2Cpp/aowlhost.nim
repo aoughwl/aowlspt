@@ -5870,6 +5870,14 @@ include "cursorfree.nim"
 ## thing available on the client side.
 include "inspect.nim"
 
+## THE F2 LIVE-INSPECTOR OVERLAY -- a read-only D3D11 panel that surfaces the
+## inspector's own activity (bound anchors + a scrolling ring of commands and
+## their answers) so a human can WATCH a find/press/auto-raid happen on screen.
+## Included right after `inspect.nim` because it reads that file's published
+## snapshot and sets its `gIoCapture` tap; it draws through `debugui.nim`'s
+## shared-region submitter, so it is a registration, not a detour.
+include "inspoverlay.nim"
+
 ## THE MODS TAB -- a sixth tab in the game's own settings screen, with a row of
 ## SUBTABS inside it, every widget of it a clone of one of the game's own. It is
 ## included LAST because it stands on `inspect.nim`'s transform walkers,
@@ -7425,6 +7433,22 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   elif gInspWriteOn:
     info "liveInspectorWrite is set but liveInspector is not, so the inspector " &
          "is off entirely; set liveInspector to arm it"
+  # THE F2 LIVE-INSPECTOR OVERLAY (opt-in, `inspectorOverlay`). Default OFF. It
+  # draws through the shared region, so it also needs `sharedRegion` armed; and
+  # it only has anything to show when `liveInspector` is on. All three are read
+  # here so a bad combination is a boot-log line, not a silent empty panel.
+  gIoOn = readBoolKey("inspectorOverlay")
+  if gIoOn:
+    info "inspectorOverlay is set: a read-only D3D11 panel will surface the " &
+         "live inspector's activity (bound anchors + a scrolling ring of the " &
+         "commands it runs and their answers). Press F2 in game to toggle it " &
+         "(configurable in aowlspt-inspoverlay.json, written with defaults on " &
+         "first run). It is a shared-region DRAW participant -- the F3/F12/F6 " &
+         "path -- so it needs sharedRegion armed" &
+         (if not gInspOn:
+            ", and liveInspector too (it is currently OFF, so the panel would " &
+            "be empty)."
+          else: ".")
   gVersionBrand = readBoolKey("uxVersionBrand")
   gVersionWrite = readBoolKey("uxVersionBrandWrite")
   if gVersionWrite:
@@ -7819,6 +7843,12 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
         info "the live inspector did not arm (PreloaderUI.Update is neither " &
              "claimed by another feature nor verifiable on this build, or the " &
              "drain is disabled); the command file will not be read"
+
+      # THE F2 OVERLAY (opt-in, `inspectorOverlay`). A REGISTRATION with the
+      # shared region, not a rider and not a detour; armed here, after the
+      # inspector, so it starts feeding its ring only once the inspector exists.
+      if gIoOn:
+        discard ioArm(true)
 
       # THE CODEGEN AUDIT (opt-in, `codeGenAudit`). Armed LAST of the four
       # riders on `EFT.UI.PreloaderUI::Update`, so by here any of the other
