@@ -2828,19 +2828,26 @@ proc gfxContentContainerT(panelT: Il2CppPtr; why: var string): Il2CppPtr =
     return
   var candidate: Il2CppPtr = nil
   var candidates = 0
+  var seen = ""
   var i = 0
   while i < n and i < 16:
     let c = iChildAt(panelT, i)
     if c != nil and duOk(c, 0x20'i32):
       let nm = iObjName(c)
+      if seen.len > 0: seen = seen & ", "
+      seen = seen & "'" & nm & "'"
       if nm != "Overlay Layer" and nm != "SettingsTooltip":
         candidates = candidates + 1
         candidate = c
     i = i + 1
   if candidates != 1:
+    # NAME THE CHILDREN, not just the count. A bare count reproduced the exact
+    # #104 symptom (faults 4/4, self-disables) with no way to tell WHY from the
+    # log; the next live run needs the actual child names to decide whether the
+    # measured "Other Settings / Overlay Layer" tree still holds on this build.
     why = iObjName(panelT) & " has " & $candidates & " non-overlay child(ren) " &
-          "(expected exactly 1); refusing to guess which one is the content " &
-          "container"
+          "(expected exactly 1) out of " & $n & " total [" & seen & "]; " &
+          "refusing to guess which one is the content container"
     return
   result = candidate
 
@@ -3004,10 +3011,24 @@ proc gfxBuildStrip(panelT, donorStripGo, donorButtonGo, donorButtonT: Il2CppPtr;
             "left alone -- exclusivity stays OURS, enforced every frame by " &
             "gfxApply/gfxTickBody"
   else:
-    okLog "postfx subtab: " & iObjName(panelT) & "'s strip clone carries no " &
-          "reachable ToggleGroup component, so m_Group could not be wired; " &
-          "exclusivity stays OURS, enforced every frame by " &
-          "gfxApply/gfxTickBody"
+    # THE LOAD-BEARING #117 PATH DID NOT RUN, and that must be LOUD, not a quiet
+    # okLog. The donor strip is `Control Settings/Toggles` -- a checkbox/keybind
+    # list, which need not be a radio ToggleGroup at all -- so a clone of it may
+    # carry no ToggleGroup for m_Group to point at. Report the toggles' ACTUAL
+    # m_Group so the next live run can tell "no group anywhere" (frame
+    # enforcement is the only exclusivity) from "inherited a stray group".
+    var mg0 = "n/a"
+    var mg1 = "n/a"
+    if into.len == 2:
+      if duOk(into[0], ModsOffGroup + 8'i32): mg0 = iPtr(cReadPtrAt(into[0], ModsOffGroup))
+      if duOk(into[1], ModsOffGroup + 8'i32): mg1 = iPtr(cReadPtrAt(into[1], ModsOffGroup))
+    warn "postfx subtab: " & iObjName(panelT) & "'s strip clone carries NO " &
+         "reachable ToggleGroup component (donor 'Control Settings'/Toggles is " &
+         "not a radio group), so the #117 m_Group wiring could NOT run. " &
+         "GRAPHICS m_Group=" & mg0 & " POSTFX m_Group=" & mg1 & ". Exclusivity " &
+         "stays OURS, enforced every frame by gfxApply/gfxTickBody -- a real " &
+         "click STILL sets m_IsOn (Unity's Toggle.Set writes m_IsOn regardless " &
+         "of m_Group), which is what the rising-edge tick reads."
   # THE CLICK QUESTION, MEASURED NOT ASSUMED. A group wiring fix does nothing
   # if the click never reaches the Toggle at all. Read (never blind-write)
   # Selectable.m_Interactable and the target Graphic's m_RaycastTarget for
