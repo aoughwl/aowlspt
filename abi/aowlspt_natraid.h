@@ -64,10 +64,67 @@ typedef struct {
     int32_t       siglen;
 } AowlNrTarget;
 
+/* ------------------------------------------------------------------ *
+ * THE LOCATION ROUTE (added after the live probe reported
+ * `_selectedLocation@0xa8 = null` as the last blocker)
+ *
+ * MEASURED OFFLINE, by disassembly, not inferred from names:
+ *
+ * 1. `RaidSettings::set_SelectedLocation` @0x6D7FF0 (UNIQUE) is NOT a plain
+ *    store. Its body is:
+ *        [this+0xa8] = value                      (with the GC write barrier)
+ *        [this+0x30] = (value == NULL) ? NULL : value->Id@0x28
+ *    So `LocationId` is DERIVED FROM `_selectedLocation`, never the reverse.
+ *    That kills the cheap hypothesis outright: writing the string "Woods" into
+ *    LocationId@0x30 resolves NOTHING. Ready() does not look a Location up from
+ *    it -- `LocationLevelVariants::ResolveByPlayerLevel` @0x2345F30 takes a
+ *    Location as its FIRST ARGUMENT, i.e. one must already exist.
+ *
+ * 2. `JsonType.LocationLevelVariants::TryGetLocation(LocationSettings,
+ *    string locationReference, out Location)` @0x2345770 (UNIQUE, static) is
+ *    the lookup, and it is FULLY SELF-GUARDING on its inputs -- disassembled:
+ *        mov [rsi], 0           ; the out param is nulled FIRST
+ *        test rbx,rbx / je fail ; locationSettings == NULL      -> false
+ *        cmp [rbx+0x10],0 / je  ; .locations == NULL            -> false
+ *        test r15,r15 / je fail ; locationReference == NULL     -> false
+ *        cmp [r15+0x10],0 / jbe ; the string is EMPTY           -> false
+ *    then `Dictionary`2::TryGetValue` with the game's OWN MethodInfo* loaded
+ *    from `[rip+...]` -- which is precisely why this entry point is used rather
+ *    than calling TryGetValue ourselves: the shared-generic MethodInfo problem
+ *    is solved by the game's code, not guessed by ours. On a miss it returns
+ *    false with the out param still NULL. There is no path here that faults on
+ *    a null input and no path that returns a non-null Location it did not find.
+ *
+ * 3. The dictionary is keyed by the MONGO ID, not by "Woods". Measured on the
+ *    payload OUR OWN BACKEND SERVES (`mods/tarkov/data/post1/locations.json`,
+ *    read with tools/bigjson.py, never raw):
+ *        locations["5704e3c2d2720bac5b8b4567"]._Id = "5704e3c2d2720bac5b8b4567"
+ *        locations["5704e3c2d2720bac5b8b4567"].Id  = "Woods"
+ *        locations["5704e3c2d2720bac5b8b4567"].Enabled = true
+ *    and `TarkovApplication::TryGetLocationById`'s LINQ predicate @0x9B2C90
+ *    compares `loc->[0x28]` (= Location.Id) against its captured string, which
+ *    independently confirms which field carries "Woods".
+ *
+ * 4. `TarkovApplication::TryGetLocationById(string, out Location)` @0x987350
+ *    (UNIQUE) is the FALLBACK, keyed by Location.Id ("Woods"). It is NOT the
+ *    first choice because it dereferences `[this+0x30]` -- a base-class field
+ *    this build's metadata gives no offset for -- and NREs if it is null. Its
+ *    inputs are therefore not all ours to check. It is attempted only after the
+ *    primary misses, and only with `[this+0x30]` confirmed non-null first.
+ *
+ * THE FINISHED-STATE ASSERT (CLAUDE.md 9b): after a resolve, the Location's own
+ * `Id@0x28` is read back as a String and must equal "Woods". A resolve that
+ * returns SOME object is not evidence it returned the RIGHT one, and comparing
+ * the pointer to what we asked for is a check that cannot fail.
+ * ------------------------------------------------------------------ */
+
 /* Target indices. Keep in step with the table below. */
 #define AOWL_NR_T_GET_RAIDSETTINGS   0
 #define AOWL_NR_T_GET_MATCHMAKEROP   1
 #define AOWL_NR_T_ONREADYPRESSED     2
+#define AOWL_NR_T_TRYGETLOCATION     3
+#define AOWL_NR_T_SET_SELECTEDLOC    4
+#define AOWL_NR_T_TRYGETLOCBYID      5
 
 /* The bytes were read out of D:/Games/Tarkov/GameAssembly.dll with
  * `tools/il2cpp_resolve.py ... bytes <RVA>` and are recorded here so the host
@@ -83,6 +140,23 @@ static AowlNrTarget aowl_nr_targets[] = {
     { "EFT.MatchmakerOperation::OnReadyPressed", 0xA312E0u,
       { 0x40,0x53,0x48,0x83,0xEC,0x20,0x80,0x3D,
         0x95,0x7F,0x68,0x06,0x00,0x48,0x8B,0xD9 }, 16 },
+    /* STATIC. (LocationSettings, string, out Location) -> bool.
+     * sharedness=UNIQUE (1 owner), section=il2cpp, no thunk shape. */
+    { "JsonType.LocationLevelVariants::TryGetLocation", 0x2345770u,
+      { 0x48,0x89,0x5C,0x24,0x10,0x4C,0x89,0x44,
+        0x24,0x18,0x56,0x57,0x41,0x54,0x41,0x56 }, 16 },
+    /* INSTANCE. (Location) -> void. Also sets LocationId@0x30 from Id@0x28,
+     * with the GC write barrier -- which is exactly why this is CALLED rather
+     * than the two slots being stored by hand.
+     * sharedness=UNIQUE (1 owner), section=il2cpp, no thunk shape. */
+    { "EFT.RaidSettings::set_SelectedLocation", 0x6D7FF0u,
+      { 0x8B,0x05,0x4A,0xE5,0x9D,0x06,0x4C,0x8D,
+        0x15,0x23,0x11,0xA0,0x06,0x48,0x89,0x91 }, 16 },
+    /* INSTANCE, the FALLBACK. (string, out Location) -> bool.
+     * sharedness=UNIQUE (1 owner), section=il2cpp, no thunk shape. */
+    { "EFT.TarkovApplication::TryGetLocationById", 0x987350u,
+      { 0x48,0x89,0x5C,0x24,0x10,0x48,0x89,0x74,
+        0x24,0x18,0x48,0x89,0x7C,0x24,0x20,0x41 }, 16 },
 };
 
 #define AOWL_NR_TARGET_COUNT \
@@ -99,6 +173,7 @@ static AowlNrTarget aowl_nr_targets[] = {
 #define AOWL_NR_WHY_UNTRIED    7   /* never asked for                        */
 
 static int32_t aowl_nr_why[AOWL_NR_TARGET_COUNT] = {
+    AOWL_NR_WHY_UNTRIED, AOWL_NR_WHY_UNTRIED, AOWL_NR_WHY_UNTRIED,
     AOWL_NR_WHY_UNTRIED, AOWL_NR_WHY_UNTRIED, AOWL_NR_WHY_UNTRIED
 };
 static int32_t aowl_nr_faults = 0;
@@ -195,6 +270,115 @@ static void* aowl_nr_call_getter(void* fn, void* self) {
 static void aowl_nr_call_void(void* fn, void* self) {
     if (!fn || !self) return;
     ((AowlNr_V_P)fn)(self, NULL);
+}
+
+/* ------------------------------------------------------------------ *
+ *  The location-resolve thunks.
+ *
+ *  NEITHER target is a shared generic (both `shared <RVA>` = UNIQUE, 1 owner)
+ *  and NEITHER reads its trailing MethodInfo* -- verified by disassembly: R9 at
+ *  0x2345770 and R8 at 0x6D7FF0 are both dead on entry and are reloaded before
+ *  first use. A NULL MethodInfo* is therefore correct here, not merely "usually
+ *  fine".
+ *
+ *  Static, 3 declared params:  RCX, RDX, R8, then MethodInfo* in R9.
+ *  Instance, 1 declared param: RCX = this, RDX = arg, then MethodInfo* in R8.
+ * ------------------------------------------------------------------ */
+typedef unsigned char (*AowlNr_B_PPPP)(void*, void*, void*, void*);
+typedef void          (*AowlNr_V_PPP) (void*, void*, void*);
+/* the fallback is an INSTANCE method with 2 declared params, so its hidden
+ * MethodInfo* lands in R9 -- same four-slot shape as the static above. */
+
+/* TryGetLocation(locationSettings, id, &out). Returns 1 on a hit AND a
+ * non-NULL out; 0 otherwise. The callee nulls `out` itself before doing
+ * anything, so a 0 here cannot leave a stale pointer behind -- but it is
+ * pre-nulled on this side too, because relying on the callee to initialise our
+ * own stack is exactly the assumption that would not survive a build change. */
+static int32_t aowl_nr_try_get_location(void* fn, void* locSettings,
+                                        void* idStr, void** out) {
+    void* loc = NULL;
+    unsigned char ok;
+    if (out) *out = NULL;
+    if (!fn || !locSettings || !idStr || !out) return 0;
+    ok = ((AowlNr_B_PPPP)fn)(locSettings, idStr, (void*)&loc, NULL);
+    if (!ok || !loc) return 0;
+    *out = loc;
+    return 1;
+}
+
+/* TarkovApplication::TryGetLocationById(id, &out) -- the fallback. */
+static int32_t aowl_nr_try_get_location_by_id(void* fn, void* self,
+                                              void* idStr, void** out) {
+    void* loc = NULL;
+    unsigned char ok;
+    if (out) *out = NULL;
+    if (!fn || !self || !idStr || !out) return 0;
+    ok = ((AowlNr_B_PPPP)fn)(self, idStr, (void*)&loc, NULL);
+    if (!ok || !loc) return 0;
+    *out = loc;
+    return 1;
+}
+
+/* RaidSettings::set_SelectedLocation(loc). */
+static void aowl_nr_set_selected_location(void* fn, void* self, void* loc) {
+    if (!fn || !self || !loc) return;
+    ((AowlNr_V_PPP)fn)(self, loc, NULL);
+}
+
+/* ------------------------------------------------------------------ *
+ *  `il2cpp_string_new`, resolved by name and CACHED.
+ *
+ *  Rule 7 is "no per-frame managed allocation", not "no allocation": this
+ *  allocates AT MOST ONCE per distinct literal for the whole session and hands
+ *  back the same Il2CppString* thereafter, so the drain can ask for it every
+ *  tick without ever allocating again. `il2cpp_string_new` is NOT one of the
+ *  token-gated exports (it takes no trailing 32-byte token), so calling it by
+ *  name is safe -- unlike `il2cpp_object_get_class` and friends.
+ *
+ *  NOTE the string is NOT GC-rooted. It is created and consumed inside the same
+ *  guarded tick on the Unity main thread, and the cache is only ever re-USED
+ *  as an argument to a lookup that copies nothing. If this ever needs to
+ *  survive a collection, it needs a gchandle -- say so rather than assuming.
+ * ------------------------------------------------------------------ */
+#define AOWL_NR_MAX_STRINGS 4
+#define AOWL_NR_STR_LEN     40
+
+typedef struct { char text[AOWL_NR_STR_LEN]; void* str; } AowlNrStr;
+static AowlNrStr g_nr_strings[AOWL_NR_MAX_STRINGS];
+static int32_t   g_nr_string_n = 0;
+static void*     (*g_nr_string_new)(const char*) = 0;
+static int32_t   g_nr_string_export_tried = 0;
+
+static void* aowl_nr_string(const char* s) {
+    int32_t i;
+    size_t n;
+    HMODULE ga;
+    if (!s) return NULL;
+    n = strlen(s);
+    if (n == 0 || n >= AOWL_NR_STR_LEN) return NULL;
+    for (i = 0; i < g_nr_string_n && i < AOWL_NR_MAX_STRINGS; i++)
+        if (strcmp(g_nr_strings[i].text, s) == 0)
+            return g_nr_strings[i].str;
+    if (g_nr_string_n >= AOWL_NR_MAX_STRINGS) return NULL;
+    if (!g_nr_string_export_tried) {
+        g_nr_string_export_tried = 1;
+        ga = GetModuleHandleA("GameAssembly.dll");
+        if (ga)
+            g_nr_string_new = (void* (*)(const char*))(void*)
+                GetProcAddress(ga, "il2cpp_string_new");
+    }
+    if (!g_nr_string_new) return NULL;
+    {
+        void* v = g_nr_string_new(s);
+        if (!v) return NULL;
+        memcpy(g_nr_strings[g_nr_string_n].text, s, n + 1);
+        g_nr_strings[g_nr_string_n].str = v;
+        g_nr_string_n++;
+        return v;
+    }
+}
+static int32_t aowl_nr_string_export_ok(void) {
+    return g_nr_string_new ? 1 : 0;
 }
 
 /* ------------------------------------------------------------------ *
