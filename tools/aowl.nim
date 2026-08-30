@@ -39,6 +39,12 @@ aowl -- build, test and install aowlspt
   bootstrap          rebuild aowl.exe ITSELF -- `build` never does, and a
                      worktree with no aowl.exe or a stale one runs old code
                      while reporting ok
+  worktree-init      make a FRESH git worktree buildable: installer\build,
+                     seed .cache\global-metadata.dec.dat from a sibling
+                     checkout, then bootstrap. From NO aowl.exe at all:
+                     powershell -ExecutionPolicy Bypass -File tools\bootstrap.ps1
+  selfcheck PATH     run a mod's selfCheckFailures() OUT OF PROCESS -- no
+                     backend, no install, no running game
   build-mod PATH     compile one nimony mod into a native library
   build-hosts        aowlspt-sim (nimony) and the .NET tools left
   build-installer    aowlspt-install.exe
@@ -204,6 +210,50 @@ proc sourceOf(modPath: string): string =
 
 proc placeLibrary(dir, stem, outPath: string): bool
 
+var gSkippedSymTab = false
+var gSkippedNameIndex = false
+var gSkipHadGameAsm = false
+
+proc metaCachePath(e: Env): string =
+  result = joinPath(e.repo, ".cache\\global-metadata.dec.dat")
+
+proc reportSkippedGates(e: Env): int =
+  ## The defect this exists for: both IL2CPP gates decline politely, mid-build,
+  ## in a wall of otherwise-green output, and an agent shipped a build without
+  ## noticing. A skipped check must never read as a pass -- so the verdict is
+  ## repeated LAST, where the eye lands, and it is fatal when the skip was
+  ## avoidable.
+  ##
+  ## Avoidable is a measurable thing, not a judgement call: if
+  ## `GameAssembly.dll` is on this machine and `.cache\global-metadata.dec.dat`
+  ## is not, the only thing missing is a per-worktree file that
+  ## `aowl worktree-init` copies in seconds. That is a REFUSAL. If the game
+  ## itself is absent the machine simply cannot run these gates, and refusing
+  ## would make the repo unbuildable off the game box -- so that is a loud
+  ## summary and exit 0.
+  if not (gSkippedSymTab or gSkippedNameIndex):
+    return 0
+  if gSkipHadGameAsm:
+    err "IL2CPP GATES SKIPPED -- this build is NOT verified against GameAssembly.dll"
+    if gSkippedSymTab:
+      note "  * abi\\aowlspt_symtab.h was NOT checked for staleness"
+    if gSkippedNameIndex:
+      note "  * no aowlspt-names.idx was emitted; by-name resolution is unavailable"
+    note "cause: there is no " & metaCachePath(e)
+    note "it is gitignored and NOT shared between worktrees. Fix, one command:"
+    note "  aowl worktree-init      (copies it from a sibling checkout)"
+    note "or decrypt it with tools\\metablob.py. Refusing rather than letting " &
+         "a skipped gate read as a pass."
+    return 1
+  warn "IL2CPP GATES SKIPPED -- no GameAssembly.dll on this machine"
+  if gSkippedSymTab:
+    note "  * abi\\aowlspt_symtab.h was NOT checked for staleness (INCONCLUSIVE, not a pass)"
+  if gSkippedNameIndex:
+    note "  * no aowlspt-names.idx was emitted"
+  note "this artifact is fine to compile with and NOT fit to deploy to the " &
+       "live client until both are run on the game box."
+  return 0
+
 var gSymTabRan = false
 
 proc symTab(e: Env): bool =
@@ -274,6 +324,8 @@ proc symTab(e: Env): bool =
                e.repo)
 
   gSymTabRan = true
+  gSkippedSymTab = true
+  gSkipHadGameAsm = fileExists(gameasm)
   if fileExists(outH):
     note "abi\\aowlspt_symtab.h is present but " &
          (if fileExists(gameasm): "there is no .cache\\global-metadata.dec.dat"
@@ -562,6 +614,9 @@ proc nameIndex(e: Env, binDir: string): bool =
          "build stamp at load and refuses the whole index on mismatch."
     return true
 
+  gSkippedNameIndex = true
+  if fileExists(gameasm):
+    gSkipHadGameAsm = true
   note "no aowlspt-names.idx generated: " &
        (if fileExists(gameasm): "no .cache\\global-metadata.dec.dat (decrypt " &
                                 "it with tools/metablob.py)"
@@ -1356,10 +1411,74 @@ proc warnStaleDriver(e: Env) =
     warn "there is no installer\\build\\aowl.exe in this worktree"
     note "run `aowl bootstrap` -- `aowl build` never builds the driver itself"
     return
-  if was != now:
-    warn "tools\\aowl.nim has changed since aowl.exe was last built"
-    note "this build is running the OLD driver; your change to it is not in it"
-    note "run `aowl bootstrap`, then build again"
+  if was == now:
+    return
+  # Three states, not two. Collapsing the middle one is what made this warning
+  # fire on EVERY invocation in a fresh worktree and trained people to ignore
+  # it -- and a warning that always fires is worth less than no warning, since
+  # the case it exists for looks identical.
+  #
+  # `.aowlstamp` lives in the gitignored `installer\build\`, so a worktree
+  # whose driver was COPIED in from another checkout has an aowl.exe and no
+  # stamp at all. That is a real hazard (CLAUDE.md 3: the copy runs the OTHER
+  # checkout's aowl.nim), so it still warns -- but it is a different fault with
+  # a different fix, and it now says which one it is.
+  if was.len == 0:
+    warn "installer\\build\\aowl.exe has NO build stamp beside it"
+    note "it was not built from this worktree's tools\\aowl.nim -- most likely " &
+         "copied in from another checkout, in which case it runs THAT " &
+         "checkout's driver and any build step added on this branch goes " &
+         "silently unexercised"
+    note "run `aowl bootstrap` (or powershell tools\\bootstrap.ps1) to replace " &
+         "it with a local build; that writes the stamp and this stops"
+    return
+  warn "tools\\aowl.nim has changed since aowl.exe was last built"
+  note "this build is running the OLD driver; your change to it is not in it"
+  note "run `aowl bootstrap`, then build again"
+
+proc seedCache(e: Env): bool =
+  ## `.cache\global-metadata.dec.dat` is gitignored, so it is NOT shared between
+  ## worktrees -- and without it both IL2CPP build gates decline. It is the same
+  ## bytes in every checkout (it is derived from the installed game, not from
+  ## the branch), so copying it in is safe and is the whole of "worktree setup".
+  ##
+  ## Candidates are named, never enumerated: a recursive scan of a Projects
+  ## directory is slow and can pick up something unrelated. Whatever it uses,
+  ## it says.
+  let dst = metaCachePath(e)
+  if fileExists(dst):
+    ok "metadata cache present (" & dst & ")"
+    return true
+  var candidates: seq[string] = @[]
+  let fromEnv = getEnv("AOWLSPT_METADATA", "")
+  if fromEnv.len > 0:
+    candidates.add fromEnv
+  var cur = parentOf(e.repo)
+  var hops = 0
+  while cur.len > 0 and hops < 4:
+    candidates.add joinPath(cur, "aowlspt\\.cache\\global-metadata.dec.dat")
+    let up = parentOf(cur)
+    if up.len == 0 or up == cur:
+      break
+    cur = up
+    inc hops
+  for c in candidates:
+    if c == dst:
+      continue
+    if not fileExists(c):
+      continue
+    discard ensureDir(joinPath(e.repo, ".cache"))
+    let r = copyFileAt(c, dst)
+    if r.ok:
+      ok "seeded .cache\\global-metadata.dec.dat from " & c
+      return true
+    warn "could not copy " & c & " (error " & $r.err & ")"
+  warn "no .cache\\global-metadata.dec.dat, and none found to copy"
+  note "looked for a sibling checkout's copy; set AOWLSPT_METADATA to point at " &
+       "one, or decrypt it with tools\\metablob.py"
+  note "without it `aowl build host` cannot check the symbol table and emits " &
+       "no name index -- it will say so and refuse"
+  result = false
 
 proc cmdBootstrap(e: Env): int =
   ## Rebuild `aowl.exe` itself.
@@ -1399,9 +1518,156 @@ proc cmdBootstrap(e: Env): int =
     err "could not put the new aowl.exe in place (error " & $placed.err & ")"
     return 1
   discard writeTextFile(driverStampPath(e), textStamp(driverSource(e)))
+  discard seedCache(e)
   ok "aowl.exe rebuilt"
   note "the copy that is running is still the old one; the next invocation is new"
   result = 0
+
+proc escapeForNim(p: string): string =
+  ## A Windows path inside a generated Nim string literal. Every backslash is
+  ## doubled; without this `C:\Users\...\tarkov` ends up containing a tab and a
+  ## form feed and the generated file does not compile, or worse, compiles.
+  result = ""
+  for ch in p:
+    if ch == chr(92):
+      result.add chr(92)
+      result.add chr(92)
+    else:
+      result.add ch
+
+proc cmdSelfCheck(e: Env; modPath: string): int =
+  ## Run a mod's `selfCheckFailures()` OUT OF PROCESS.
+  ##
+  ## Before this, reading a load-time self-check meant standing up a whole
+  ## backend -- impossible while a human is playing -- so one agent wrote a
+  ## throwaway `tools/bosscheck.nim` to get at it and another hit the same wall
+  ## with `emutest.exe`, which wants a full install. The checks themselves need
+  ## none of that: they are arithmetic over tables in `emu/selfchecks`, with no
+  ## database, no host and no profile, which is the whole reason they are the
+  ## ones that run at load.
+  ##
+  ## So this generates a four-line main that imports that module, compiles it
+  ## with nimony, and runs it. `mods\tarkov\emu\selfchecks.nim` is the
+  ## convention; a mod without one is told so rather than reported as passing,
+  ## because "there was nothing to check" and "everything checked out" are not
+  ## the same answer.
+  var dir = modPath
+  if not isDirectory(dir):
+    dir = joinPath(e.repo, modPath)
+  if not isDirectory(dir):
+    err "no such mod directory: " & modPath
+    return 1
+  let checks = joinPath(dir, "emu\\selfchecks.nim")
+  if not fileExists(checks):
+    err "no emu\\selfchecks.nim under " & dir
+    note "there is nothing to run here. That is INCONCLUSIVE, not a pass."
+    return 1
+
+  let outDir = joinPath(e.repo, "installer\\build")
+  discard ensureDir(outDir)
+  let shim = joinPath(outDir, "selfcheck_main.nim")
+  let exe = joinPath(outDir, "selfcheck.exe")
+  discard removeFileAt(exe)
+  # A host MUST be bound before the checks run. `modDir()` comes from the host
+  # info block and is `""` without one, so `data/post1/*.json` resolves to
+  # `/data/post1/...` and three checks report "is not installed" -- a FALSE
+  # FAIL, and a self-check tool that invents failures is worse than no tool.
+  # `aowl_hostapi_new` in abi/aowlspt_shim.h is exactly the stub needed: it
+  # takes modDir and dataDir as strings.
+  var src = "import std/syncio\n"
+  src.add "import aowlspt\n"
+  src.add "import emu/selfchecks\n"
+  src.add "{.emit: \"\"\"#include <stdint.h>\"\"\".}\n"
+  src.add "{.emit: \"\"\"#include <stdlib.h>\"\"\".}\n"
+  src.add "{.emit: \"\"\"#include <string.h>\"\"\".}\n"
+  src.add "{.emit: \"\"\"#include \"aowlspt_abi.h\" \"\"\".}\n"
+  src.add "{.emit: \"\"\"#include \"aowlspt_shim.h\" \"\"\".}\n"
+  # aowlspt_shim.h's host block forwards every callback to an `aowlspt_nim_*`
+  # symbol that the SIMULATOR provides. None of them is reachable from a check
+  # that touches no route, no database and no game -- but the linker still
+  # wants all eighteen, so they are stubbed here. Each refuses (`-1`) rather
+  # than returning a plausible zero: if a check ever does reach one, it must
+  # fail loudly and not quietly read an empty answer as a real one. `log` is
+  # the exception and really prints, because the checks warn through it.
+  src.add "{.emit: \"\"\"\n"
+  src.add "#include <stdio.h>\n"
+  src.add "void aowlspt_nim_log(void* c, int32_t lv, void* m, int32_t n)" &
+          " { (void)c; (void)lv; fprintf(stderr, \"    host: %.*s\\n\", (int)n, (const char*)m); }\n"
+  src.add "void aowlspt_nim_last_error(void* c, void* p, void* n)" &
+          " { (void)c; *(void**)p = 0; *(int32_t*)n = 0; }\n"
+  src.add "int32_t aowlspt_nim_config_get(void* c, void* k, int32_t kl, void* p, void* n) { return -1; }\n"
+  src.add "int32_t aowlspt_nim_config_set(void* c, void* k, int32_t kl, void* v, int32_t vl) { return -1; }\n"
+  src.add "int32_t aowlspt_nim_call(void* c, void* t, int32_t tl, void* a, int32_t al, void* p, void* n) { return -1; }\n"
+  src.add "int32_t aowlspt_nim_resolve(void* c, void* t, int32_t tl, void* h) { return -1; }\n"
+  src.add "void aowlspt_nim_handle_release(void* c, uint64_t h) { (void)c; (void)h; }\n"
+  src.add "int32_t aowlspt_nim_event_emit(void* c, void* nm, int32_t nl, void* p, int32_t pl) { return -1; }\n"
+  src.add "int64_t aowlspt_nim_now_ms(void* c) { (void)c; return 0; }\n"
+  src.add "int32_t aowlspt_nim_invoke_main(void* c, void* cb, void* u) { return -1; }\n"
+  src.add "int32_t aowlspt_nim_schedule(void* c, int32_t d, void* cb, void* u) { return -1; }\n"
+  src.add "int32_t aowlspt_nim_event_subscribe(void* c, void* nm, int32_t nl, void* h, void* u) { return -1; }\n"
+  src.add "int32_t aowlspt_nim_patch(void* c, void* t, int32_t tl, int32_t k, void* h, void* u) { return -1; }\n"
+  src.add "int32_t aowlspt_nim_db_get(void* c, void* p, int32_t pl, void* op, void* on) { return -1; }\n"
+  src.add "int32_t aowlspt_nim_db_patch(void* c, void* p, int32_t pl, void* v, int32_t vl) { return -1; }\n"
+  src.add "int32_t aowlspt_nim_route_register(void* c, void* u, int32_t ul, int32_t k, void* h, void* us) { return -1; }\n"
+  src.add "int32_t aowlspt_nim_store_get(void* c, void* k, int32_t kl, void* op, void* on) { return -1; }\n"
+  src.add "int32_t aowlspt_nim_store_set(void* c, void* k, int32_t kl, void* v, int32_t vl) { return -1; }\n"
+  src.add "int32_t aowlspt_nim_store_list(void* c, void* p, int32_t pl, void* op, void* on) { return -1; }\n"
+  src.add "\"\"\".}\n"
+  src.add "proc cHostNew(ctx: pointer; side: int32; hostName, hostVersion, " &
+          "sptVersion, gameVersion, modDir, dataDir: cstring): pointer " &
+          "{.importc: \"aowl_hostapi_new\", nodecl.}\n"
+  src.add "var api: ModApi\n"
+  src.add "let hostPtr = cHostNew(cast[pointer](0), 3, \"aowl selfcheck\", " &
+          "\"0\", \"0\", \"0\", \"" & escapeForNim(dir) & "\", \"" &
+          escapeForNim(joinPath(e.repo, "mods")) & "\")\n"
+  src.add "if bindHost(cast[ptr HostApi](hostPtr), addr api) != Ok:\n"
+  src.add "  echo \"FAIL could not bind the stub host; modDir would be empty " &
+          "and every data-file check would report a false failure\"\n"
+  src.add "  quit(2)\n"
+  src.add "let fails = selfCheckFailures()\n"
+  src.add "for f in fails:\n"
+  src.add "  echo \"FAIL \" & f\n"
+  src.add "echo \"selfcheck failures: \" & $(fails.len)\n"
+  src.add "quit(if fails.len > 0: 1 else: 0)\n"
+  let w = writeTextFile(shim, src)
+  if not w.ok:
+    err "could not write " & shim & " (error " & $w.err & ")"
+    return 1
+
+  var cmd = quoted(nimonyExe(e))
+  cmd.add " c"
+  cmd.add abiInclude(e)
+  cmd.add " -p:" & quoted(dir)
+  cmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
+  cmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
+  cmd.add " -p:" & quoted(joinPath(e.nimony, "src\\lib"))
+  cmd.add " -o:" & quoted(exe)
+  cmd.add " " & quoted(shim)
+  if not run(e, "the self-check harness for " & baseName(dir), cmd, e.repo):
+    return 1
+  if not fileExists(exe):
+    err "the compile reported success but produced no selfcheck.exe"
+    return 1
+  # The exit code is the verdict; the failures print themselves.
+  if not run(e, baseName(dir) & " self-checks", quoted(exe), e.repo):
+    return 1
+  result = 0
+
+proc cmdWorktreeInit(e: Env): int =
+  ## Everything a FRESH `git worktree add` needs before it can build, in one
+  ## command, because the worktree-per-agent rule (CLAUDE.md 3) makes this a
+  ## per-agent ritual and three agents in one night each rediscovered it by
+  ## hand.
+  ##
+  ## Note what this does NOT need: an existing `aowl.exe`. If you are reading
+  ## this you already have one. From nothing at all the entry point is
+  ## `powershell -File tools\bootstrap.ps1`, which runs the same nimony command
+  ## `cmdBootstrap` does.
+  heading "Worktree setup"
+  discard ensureDir(joinPath(e.repo, "installer\\build"))
+  ok "installer\\build exists"
+  discard seedCache(e)
+  result = cmdBootstrap(e)
 
 proc cmdBuildOne(e: Env; target: string): int =
   ## One named target, for the loop that dominates a working day: change one
@@ -1470,6 +1736,8 @@ proc cmdBuildOne(e: Env; target: string): int =
          "settings realtest maptiles mods examples deploy"
     note "or a mod path, with `aowl build-mod mods\\tarkov`"
     result = 1
+  if reportSkippedGates(e) != 0:
+    result = 1
 
 proc cmdBuild(e: Env): int =
   dropStaleCaches(e)
@@ -1506,7 +1774,8 @@ proc cmdBuild(e: Env): int =
   let real = modDirs(e)
   for m in real:
     discard buildMod(e, m)
-  result = if failures > 0: 1 else: 0
+  let gates = reportSkippedGates(e)
+  result = if failures > 0 or gates != 0: 1 else: 0
 
 proc report(what: string; ok1: bool; detail: string; problems: var int) =
   ## A free proc with the counter passed in, rather than a nested one closing
@@ -3216,6 +3485,11 @@ proc main(): int =
   of "build":
     result = if arg.len == 0: cmdBuild(e) else: cmdBuildOne(e, arg)
   of "bootstrap": result = cmdBootstrap(e)
+  of "worktree-init": result = cmdWorktreeInit(e)
+  of "selfcheck":
+    if arg.len == 0:
+      fatal "selfcheck needs a mod path, e.g. `aowl selfcheck mods\\tarkov`"
+    result = cmdSelfCheck(e, arg)
   of "build-mod":
     if arg.len == 0:
       fatal "build-mod needs a path"
