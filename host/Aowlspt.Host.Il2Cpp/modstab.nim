@@ -2780,6 +2780,11 @@ var gGfxLast: seq[bool] = @[]
 var gGfxSel = 0
 var gGfxSaid = false
 var gGfxBothActiveSaid = false
+## The two STOCK panel TRANSFORMS, kept alongside their GameObjects purely so
+## the verdict below can ask `activeInHierarchy` (which takes a Component) and
+## not just `activeSelf`. Read-only, never written.
+var gGfxPanelT: Il2CppPtr = nil
+var gGfxPostT: Il2CppPtr = nil
 
 proc gfxNoteFault(what: string) =
   inc gGfxFaults
@@ -3148,6 +3153,8 @@ proc gfxBuild(): bool =
   let donorButtonGo = iGameObjectOf(donorButton)
   gGfxPanelGo = iGameObjectOf(gfxPanel)
   gGfxPostGo = iGameObjectOf(postPanel)
+  gGfxPanelT = gfxPanel
+  gGfxPostT = postPanel
   if donorStripGo == nil or donorButtonGo == nil or gGfxPanelGo == nil or
      gGfxPostGo == nil:
     gfxNoteFault("a GameObject was not reachable; nothing was changed")
@@ -3223,6 +3230,118 @@ proc gfxBuild(): bool =
   gfxSeedSelection()
   result = true
 
+# ---------------------------------------------------------------------------
+# THE VERDICT. Everything above logs what it DID; none of it says whether the
+# feature ended up WORKING, and this feature's whole history is checks that
+# could only say yes (it self-disabled 4-of-4 while every individual log line
+# read fine). So: one line, once per settings-screen open, asserting the
+# FINISHED STATE of objects we did not write this frame -- `m_IsOn`@0x120 and
+# `activeInHierarchy` read back off the live toggles and the live STOCK
+# panels. Three outcomes, never two.
+#
+# What each outcome would take to be FALSIFIED, which is the point:
+#   PASS         exactly one subtab reads m_IsOn=1, both subtabs are
+#                activeInHierarchy, and the panel that names it is the ONLY
+#                one of the two that is active. Two-on, zero-on, or the wrong
+#                panel up all break it.
+#   FAIL inert   the strip is on screen and NO subtab reads m_IsOn=1 (or both
+#                do). That is the live signature of #117 recurring: a press
+#                never reaches `m_IsOn`, or nothing enforces exclusivity.
+#                NOTE, honestly: we cannot observe a PRESS -- there is no
+#                click hook here -- so this is the finished-state signature of
+#                bug 2, not a press observation. Said so in the line itself.
+#   FAIL blind   discovery never produced the strips (#104 recurring).
+#   FAIL desync  one subtab is on but the other panel is the one drawn.
+#   INCONCLUSIVE the screen never opened, or a read did not come back. "I
+#                could not look" is NOT a pass.
+# ---------------------------------------------------------------------------
+
+var gGfxVerdictSaid = false
+var gGfxArmSaid = false
+
+proc gfxVerdict() =
+  ## Read-only. No writes, no calls into game state-changing code -- only the
+  ## `activeInHierarchy` / `activeSelf` getters the rest of this file already
+  ## uses, each behind `iUnityAlive`, and guarded byte reads for `m_IsOn`.
+  if gGfxVerdictSaid:
+    return
+  if not gGfxBuilt:
+    # Discovery never finished. Only a verdict once the build has actually
+    # given up (the ceiling), otherwise it is simply still trying.
+    if gGfxFaults >= GfxMaxFaults or gGfxTried >= GfxMaxBuildTries:
+      gGfxVerdictSaid = true
+      warn "postfx subtab VERDICT FAIL: the subtab strip was never built" &
+           " -- discovery gave up after " & $gGfxTried & " attempt(s) and " &
+           $gGfxFaults & " fault(s). The stock POSTFX tab is untouched or has " &
+           "been put back; the screen is stock. See the 'no content container' " &
+           "or 'pieces this needs were not all found' line above for which hop " &
+           "failed and what the children were actually named."
+    return
+  if gGfxTogA.len != 2 or gGfxTogB.len != 2:
+    return
+  # WHICH STRIP IS ON SCREEN. Only the visible one can be pressed (fact #72),
+  # so only the visible one can carry a meaningful m_IsOn.
+  let gfxUp = modsGoActive(gGfxPanelGo)
+  let postUp = modsGoActive(gGfxPostGo)
+  if not gfxUp and not postUp:
+    return                       # player is on another tab; nothing to judge yet
+  let strip = (if postUp: gGfxTogB else: gGfxTogA)
+  let hostT = (if postUp: gGfxPostT else: gGfxPanelT)
+  # activeInHierarchy on the panel we believe is up, and on each subtab.
+  let (pOk, pAct) = iActiveInHierarchy(hostT)
+  let (a0Ok, a0) = iActiveInHierarchy(strip[0])
+  let (a1Ok, a1) = iActiveInHierarchy(strip[1])
+  if not pOk or not a0Ok or not a1Ok:
+    gGfxVerdictSaid = true
+    warn "postfx subtab VERDICT INCONCLUSIVE: activeInHierarchy could not be " &
+         "read back off the live objects (panel ok=" & $pOk & " subtab0 ok=" &
+         $a0Ok & " subtab1 ok=" & $a1Ok & "), so the finished state was not " &
+         "observed. This is NOT a pass."
+    return
+  var onCount = 0
+  var onIdx = -1
+  var i = 0
+  while i < 2:
+    if modsToggleIsOn(strip[i]):
+      onCount = onCount + 1
+      onIdx = i
+    i = i + 1
+  let both = gfxUp and postUp
+  let which = (if postUp: "PostFX Settings" else: "Graphics Settings")
+  gGfxVerdictSaid = true
+  if not a0 or not a1:
+    warn "postfx subtab VERDICT FAIL: a subtab button is not " &
+         "activeInHierarchy (GRAPHICS=" & $a0 & " POSTFX=" & $a1 & ") while " &
+         which & " is up, so it cannot be pressed at all (fact #72: a press " &
+         "on an inactive object reports success and does nothing)."
+  elif not pAct:
+    warn "postfx subtab VERDICT INCONCLUSIVE: " & which & " reads activeSelf " &
+         "true but activeInHierarchy FALSE -- an ancestor is off, so what is " &
+         "on screen was not established. This is NOT a pass."
+  elif both:
+    warn "postfx subtab VERDICT FAIL: both stock panels are active at once, " &
+         "so the visible page is whichever draws last rather than the one the " &
+         "strip names. Selection reads " & $onCount & " subtab(s) on."
+  elif onCount != 1:
+    warn "postfx subtab VERDICT FAIL: the subtab strip is inert -- " &
+         $onCount & " of 2 subtabs read m_IsOn=1 while " & which & " is up. " &
+         "Exactly 1 is the only correct answer; 0 means a click never reached " &
+         "m_IsOn (fact #117) and 2 means nothing is enforcing exclusivity. " &
+         "Read back off the live toggles at 0x120, not from anything we wrote " &
+         "this frame. (We cannot see the PRESS itself -- there is no click " &
+         "hook here -- so this is bug 2's finished-state signature, not a " &
+         "press observation.)"
+  elif (onIdx == 1) != postUp:
+    warn "postfx subtab VERDICT FAIL: the selection and the visible panel " &
+         "disagree -- subtab " & $onIdx & " reads m_IsOn=1 but " & which &
+         " is the panel that is up. The switch ran and did not take."
+  else:
+    okLog "postfx subtab VERDICT PASS: exactly one subtab is selected and " &
+          "its panel is the only one active" &
+          " -- subtab " & $onIdx & " reads m_IsOn=1, both subtabs are " &
+          "activeInHierarchy, " & which & " is up and the other stock panel " &
+          "is off. Read back off the live objects."
+
 ## Throttled tick diagnostic (fact from the live run: gfxTickBody's neither-
 ## panel-active early return is CORRECT behaviour, but it also made an
 ## experiment look like "enforcement is dead" when the player was simply on
@@ -3231,15 +3350,33 @@ proc gfxBuild(): bool =
 ## idle" from "silently broken" without re-running the experiment.
 var gGfxTickDiagSaid = false
 
+## Frames for which one of the two stock panels has ACTUALLY been up. A settle
+## count on a POSITIVE condition on purpose: counting plain ticks would reach
+## its threshold while the screen was still closed and judge nothing at all.
+var gGfxUpTicks = 0
+const GfxVerdictSettle = 30
+
 proc gfxTickBody() =
   if not gGfxOn or gGfxFaults >= GfxMaxFaults:
     return
+  if not gGfxArmSaid:
+    # The standing verdict before anything has been seen, so the log ALWAYS
+    # carries one and its ABSENCE can never be read as success.
+    gGfxArmSaid = true
+    okLog "postfx subtab VERDICT INCONCLUSIVE: armed, but the settings screen " &
+          "has not been opened yet, so nothing has been observed. Any later " &
+          "'postfx subtab VERDICT' line supersedes this one; if this is the " &
+          "last one in the log, the feature was never exercised -- that is " &
+          "not a pass and not a failure."
   if not gGfxBuilt:
     if gModsLastTabPtr != nil and gGfxTried < GfxMaxBuildTries:
       discard gfxBuild()
+    gfxVerdict()
     return
   if gModsLastTabPtr == nil:
     gGfxTickDiagSaid = false          # settings screen closed; re-arm for next open
+    gGfxVerdictSaid = false
+    gGfxUpTicks = 0
   if gGfxPanelGo == nil or gGfxPostGo == nil:
     return
   if not duOk(gGfxPanelGo, 0x20'i32) or not duOk(gGfxPostGo, 0x20'i32):
@@ -3298,8 +3435,18 @@ proc gfxTickBody() =
   # STEADY STATE: the panel that is up must be the one the selection names.
   if postUp and gGfxSel != 1:
     gfxApply(gGfxSel)
+    gGfxUpTicks = 0                   # something moved; let it settle again
+    return
   elif gfxUp and gGfxSel == 1:
     gfxApply(1)
+    gGfxUpTicks = 0
+    return
+  # NOTHING MOVED THIS FRAME. Only now does the settle count advance, and only
+  # then is a verdict on the finished state meaningful.
+  if gGfxUpTicks < GfxVerdictSettle:
+    gGfxUpTicks = gGfxUpTicks + 1
+  else:
+    gfxVerdict()
 
 proc gfxTick() =
   ## Every frame while armed: the steady state is two `activeSelf` reads and a
