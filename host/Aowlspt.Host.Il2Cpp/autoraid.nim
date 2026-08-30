@@ -81,6 +81,12 @@ const
   ArFindDepth     = 12          ## descent depth.
   ArMapDepth      = 8           ## depth to find a "Label" under a map toggle.
   ArMaxFaults     = 3
+  ArMaxPlayExtends = 6          ## popup-wait extensions on the PLAY step. The daily-
+                                ## reward RewardInfo popup deactivates MenuScreen for
+                                ## ~30-60 s AFTER the menu first loads, hiding PLAY;
+                                ## "seen once then hidden" is a transient popup, not a
+                                ## refusal -- extend the wait rather than self-disable.
+                                ## 6 * ArMenuWaitMs is a generous but BOUNDED cap.
 
 # ---- step ids ----
 const
@@ -116,6 +122,8 @@ var gArStepT0 = 0'u64             ## when the current step began (per-step timeo
 var gArLastPressed: Il2CppPtr = nil ## last NextButton pressed (screen-transition dedup)
 var gArLastActionMs = 0'u64        ## time of the last successful press
 var gArStarted = false
+var gArPlaySeen = false            ## the MenuScreen PlayButton has been visible >=1x
+var gArPlayExtends = 0             ## popup-wait extensions granted on the PLAY step
 
 proc arStepName(s: int): string =
   case s
@@ -448,25 +456,43 @@ proc arTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ar_tick_body", cdecl.}
   if gArStepT0 == 0'u64: gArStepT0 = now
   let stepTimeout = (if gArStep == ArWaitMenu: ArMenuWaitMs else: ArStepTimeoutMs)
   if now - gArStepT0 > stepTimeout:
+    # The PLAY step is patient about a TRANSIENT popup. The daily-reward
+    # RewardInfo popup deactivates MenuScreen ~30-60 s after the menu loads, so
+    # the PlayButton flips visible -> hidden -> visible; "seen once then hidden"
+    # is a popup, not a refusal, so keep waiting (bounded) for it to clear rather
+    # than self-disabling. If PLAY was NEVER seen, the menu genuinely did not
+    # come up and this DOES fail out.
+    if gArStep == ArWaitMenu and gArPlaySeen and gArPlayExtends < ArMaxPlayExtends:
+      inc gArPlayExtends
+      gArStepT0 = now
+      warn "autoRaid: the MenuScreen PlayButton was seen but is currently " &
+           "hidden (a daily-reward popup is likely up over MenuScreen); still " &
+           "waiting for it to clear (extension " & $gArPlayExtends & " of " &
+           $ArMaxPlayExtends & ")."
+      return
     arFail("step " & arStepName(gArStep) & " never completed within " &
            $(int(stepTimeout div 1000'u64)) & " s (control never became visible)")
     return
 
+  # WAIT-MENU and PLAY are ONE step: the instant the MenuScreen PlayButton reads
+  # visible, PRESS it in the SAME tick. The old two-step form re-clocked a fresh
+  # 45 s PLAY window exactly as the RewardInfo popup came up and hid the button,
+  # so PLAY self-disabled though the button had been visible moments earlier.
+  # Pressing on first-visible wins that race (at menu-ready the popup is not yet
+  # up); if the popup IS up, arFindPlay returns nil (the button is inactive) and
+  # we wait patiently above for it to clear.
   if gArStep == ArWaitMenu:
     let pb = arFindPlay()
     if pb != nil:
-      okLog "autoRaid: menu ready (PlayButton visible under MenuScreen); " &
-            "driving into an OFFLINE raid on map \"" & gArMap & "\"."
-      arGoto(ArPressPlay)
-    return
-
-  if gArStep == ArPressPlay:
-    let pb = arFindPlay()
-    if pb != nil and arPress(pb, "DefaultUIButton"):
-      okLog "autoRaid: pressed PLAY"
-      gArLastPressed = nil
-      gArLastActionMs = now
-      arGoto(ArNext1)
+      if not gArPlaySeen:
+        gArPlaySeen = true
+        okLog "autoRaid: menu ready (PlayButton visible under MenuScreen); " &
+              "driving into an OFFLINE raid on map \"" & gArMap & "\"."
+      if arPress(pb, "DefaultUIButton"):
+        okLog "autoRaid: pressed PLAY"
+        gArLastPressed = nil
+        gArLastActionMs = now
+        arGoto(ArNext1)
     return
 
   if gArStep == ArNext1 or gArStep == ArNext2 or gArStep == ArNext3 or
