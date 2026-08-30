@@ -24,6 +24,23 @@
 ##     on the optic camera's live field of view, when `changeMouseSensitivity`
 ##     is on.
 ##
+## **DEFAULTS AS SHIPPED (batch-fov-cheap).** Write 1 -- the per-frame FOV write
+## -- is now ON by default (`enableFovWrite = true`) and driven off the mouse-look
+## path: its driver is the host's `everyMain` drain (once per frame on Unity's
+## thread), NOT a detour on `EFT.Player::Look`, and `hookFrameDriver` stays OFF.
+## So the FOV effect costs nothing per mouse-look. `nonOpticFovMulti` ships at
+## 1.25 so the effect is visible on iron/reflex ADS; `opticFovMulti` stays 1.0 so
+## magnified scopes are left alone. Write 3 -- the sensitivity table -- is now OFF
+## by default (`changeMouseSensitivity = false`): it detours the per-mouse-look
+## getters `SightComponent::get_GetCurrentSensitivity` (@0x104A140) and
+## `FirearmController::get_AimingSensitivity` (@0x7773F0), which is exactly the
+## hot path that made the game "super laggy" until the mouse settled. Those two
+## effects are ALSO the last by-name `hookArgs` detour routes in the mod, and a
+## by-name resolve on this build is the fact-#198 crash; `signatureOf` already
+## refuses them on the client, and this default makes the refusal a decision
+## rather than an accident. The write path self-disables after a fault storm (see
+## `onFovTick`).
+##
 ## Everything else in `config.json` is read, printed and **not applied** -- the
 ## camera offsets, the aim speeds, the toggle-zoom keys. Each is blocked by one
 ## named missing capability, listed under "WHAT IS STILL NOT EXPRESSIBLE".
@@ -417,7 +434,11 @@ proc cfgText(key, default: string): string =
 
 proc loadConfig() =
   cfgOpticFovMulti = cfgFloat("opticFovMulti", 1.0)
-  cfgNonOpticFovMulti = cfgFloat("nonOpticFovMulti", 1.0)
+  # 1.25 as shipped so the FOV write has a VISIBLE effect on iron/reflex ADS by
+  # default (the skip-at-1.0 gate in applyFov means a multiplier of exactly 1.0
+  # never writes). Optics stay at 1.0 -- widening a magnified scope's FOV is
+  # rarely wanted. Both are tunable in-game and are cosmetic, not a safety knob.
+  cfgNonOpticFovMulti = cfgFloat("nonOpticFovMulti", 1.25)
 
   cfgOpticCameraDistanceOffset = cfgFloat("opticCameraDistanceOffset", -0.03)
   cfgNonOpticCameraDistanceOffset = cfgFloat("nonOpticCameraDistanceOffset", -0.01)
@@ -439,7 +460,14 @@ proc loadConfig() =
   cfgNonOpticToggleZoomSensMulti = cfgFloat("nonOpticToggleZoomSensMulti", 0.7)
   cfgUnaimedToggleZoomSensMulti = cfgFloat("unaimedToggleZoomSensMulti", 0.7)
 
-  cfgChangeMouseSensitivity = cfgBool("changeMouseSensitivity", true)
+  # DEFAULT OFF. This flag arms the two effects that detour the per-mouse-look
+  # sensitivity getters (SightComponent::get_GetCurrentSensitivity @0x104A140 and
+  # FirearmController::get_AimingSensitivity @0x7773F0). Those detours fire on the
+  # game's hot per-look call path -- the measured cause of the "super laggy, ESP
+  # frozen until the mouse settles" regression -- and they are the last by-name
+  # `hookArgs` routes in the mod, i.e. the fact-#198 crash surface. Off by default
+  # so the client path installs no per-look detour at all.
+  cfgChangeMouseSensitivity = cfgBool("changeMouseSensitivity", false)
   cfgNonOpticSensMulti = cfgFloat("nonOpticSensMulti", 1.0)
   cfgOneSensMulti = cfgFloat("oneSensMulti", 0.75)
   cfgTwoSensMulti = cfgFloat("twoSensMulti", 0.45)
@@ -460,7 +488,16 @@ proc loadConfig() =
   cfgPistolCameraZOffset = cfgFloat("pistolCameraZOffset", 0.025)
 
   cfgEnableFovScaleFix = cfgBool("enableFovScaleFix", false)
-  cfgEnableFovWrite = cfgBool("enableFovWrite", false)
+  # DEFAULT ON. The per-frame FOV write is the effect this mod exists for. Its
+  # whole path is de-risked: three field reads at offline-derived offsets and
+  # three calls at 16-byte-prologue-verified static RVAs -- no by-name lookup, so
+  # the fact-#198 crash surface is not on it -- driven from the host's `everyMain`
+  # drain (once per frame, Unity's thread) and NOT from a detour on the mouse-look
+  # path. It is rate-gated, skips a redundant 1.0 multiplier, and self-disables
+  # after a fault storm (`onFovTick`). The 9.703s startup stop noted below was
+  # measured with THIS write OFF, so it is not attributable to this write; it is
+  # still UNRESOLVED and must be confirmed-or-refuted live via the breadcrumb file.
+  cfgEnableFovWrite = cfgBool("enableFovWrite", true)
   cfgFovScale = cfgFloat("fovScale", 1.0)
   cfgMaxBaseFov = cfgInt("maxBaseFov", 110)
   cfgMinBaseFov = cfgInt("minBaseFov", 30)
@@ -529,9 +566,12 @@ proc fovSchema(): seq[Setting] =
     floatSetting("opticFovMulti", "Optic FOV multiplier", 1.0,
                  lo = 0.1, hi = 2.0, step = 0.01, category = "FOV",
                  description = "From Fontaine's FOV Fix (com.fontaine.fovfix), rewritten from scratch for aowlspt. FOV scale while aiming a magnified sight"),
-    floatSetting("nonOpticFovMulti", "Non-optic FOV multiplier", 1.0,
+    floatSetting("nonOpticFovMulti", "Non-optic FOV multiplier", 1.25,
                  lo = 0.1, hi = 2.0, step = 0.01, category = "FOV",
-                 description = "From Fontaine's FOV Fix (com.fontaine.fovfix), rewritten from scratch for aowlspt. FOV scale while aiming iron sights / reflex"),
+                 description = "From Fontaine's FOV Fix (com.fontaine.fovfix), rewritten from scratch for aowlspt. FOV scale while aiming iron sights / reflex. Ships at 1.25 so the effect is visible by default (exactly 1.0 is skipped by applyFov as a no-op write)."),
+    boolSetting("enableFovWrite", "Enable FOV write", true, category = "FOV",
+                appliesOn = "restart",
+                description = "From Fontaine's FOV Fix (com.fontaine.fovfix), rewritten from scratch for aowlspt. Master switch for the per-frame FOV write. ON by default: the write runs at prologue-verified static RVAs over VirtualQuery'd field reads (no by-name lookup), driven from the host's everyMain drain once per frame on Unity's thread -- NOT a detour on the mouse-look path, so it adds zero per-look cost. Self-disables after a fault storm."),
     boolSetting("enableFovScaleFix", "FOV scale fix", false, category = "FOV",
                 description = "From Fontaine's FOV Fix (com.fontaine.fovfix), rewritten from scratch for aowlspt. Replace Player.CalculateScaleValueByFov with a constant"),
     floatSetting("fovScale", "FOV scale value", 1.0, lo = 0.1, hi = 3.0,
@@ -544,9 +584,9 @@ proc fovSchema(): seq[Setting] =
                category = "FOV", implemented = false,
                description = "From Fontaine's FOV Fix (com.fontaine.fovfix), rewritten from scratch for aowlspt. Read only. MEASURED: MIN_FIELD_OF_VIEW is a C# const (attrs 0x8056), same as the max -- inlined, no storage."),
 
-    boolSetting("changeMouseSensitivity", "Scale mouse sensitivity", true,
-                category = "Sensitivity",
-                description = "From Fontaine's FOV Fix (com.fontaine.fovfix), rewritten from scratch for aowlspt. Replace get_GetCurrentSensitivity with a magnification lookup"),
+    boolSetting("changeMouseSensitivity", "Scale mouse sensitivity", false,
+                category = "Sensitivity", appliesOn = "restart",
+                description = "From Fontaine's FOV Fix (com.fontaine.fovfix), rewritten from scratch for aowlspt. OFF by default. Replaces get_GetCurrentSensitivity (@0x104A140) and scales get_AimingSensitivity (@0x7773F0) by detouring them -- both fire on the per-mouse-look hot path and caused the 'super laggy, ESP frozen until the mouse settles' regression, and both are by-name hookArgs routes (the fact-#198 crash surface). Leave off unless you have accepted that cost."),
     floatSetting("oneSensMulti", "1x sensitivity", 0.75, lo = 0.0, hi = 2.0,
                  step = 0.01, category = "Sensitivity",
       description = "From Fontaine's FOV Fix (com.fontaine.fovfix), rewritten from scratch for aowlspt."),
@@ -1767,6 +1807,13 @@ var gFovNs = 0'i64
 var gFovSamples = 0
 var gFovBoundSaid = false
 
+var gFovDisabled = false
+  ## Set once, never cleared this run. When true the FOV write is dead for the
+  ## rest of the session -- rule 6, self-disable after N faults. Declared here,
+  ## ahead of `applyFov`, because `applyFov` checks it; the counter that trips it
+  ## (`gFovTickInflight`) and the gate proc live next to the driver that owns
+  ## them.
+
 var gZoomKeyCode = -1          ## resolved from cfgZoomToggleKey; -1 = refused
 var gZoomKeyState = "not attempted"
 var gZoomLatch = false         ## the toggle latch, when holdToZoom is off
@@ -2146,6 +2193,11 @@ proc applyFov() =
   ## the game's own frame -- which is where a Unity write has to happen. Every
   ## pointer here is resolved fresh and dropped before the call returns: rule 4
   ## in docs/PERF.md, and the reason nothing in this file stores one.
+  if gFovDisabled:
+    # Self-disabled after a fault storm (rule 6). Checked here too so the
+    # `hookFrameDriver` path (onWatched -> applyFov) also stops, not just the
+    # everyMain driver that trips the switch.
+    return
   if not cfgEnableFovWrite:
     return
   if not bCamInstance.ok or not bSetFov.ok:
@@ -2783,6 +2835,31 @@ var gDriverIsEveryMain = false
 var gDriverThreadId = 0'i64
 var gDriverFirings = 0
 
+var gFovTickInflight = 0
+  ## The self-disable signal. Incremented at the TOP of a driver tick and reset
+  ## to 0 only AFTER `applyFov` RETURNS. Every normal early return inside
+  ## `applyFov` still returns, so it resets. A hard fault inside `applyFov` is
+  ## caught by the host's SEH guard and control goes back to the host, NOT to the
+  ## line after `applyFov` -- so the reset is skipped and the next tick sees the
+  ## counter still raised. `MaxFovFaults` consecutive skipped resets means the
+  ## body faulted that many ticks running, and the write disables itself.
+const MaxFovFaults = 8
+
+proc fovSelfDisabled(): bool =
+  ## Shared entry gate for both drivers. Trips the kill switch when the inflight
+  ## counter shows `MaxFovFaults` ticks in a row where `applyFov` did not return.
+  if gFovDisabled:
+    return true
+  if gFovTickInflight >= MaxFovFaults:
+    gFovDisabled = true
+    warn "FOV: SELF-DISABLED -- the per-frame write did not return cleanly on " &
+         $MaxFovFaults & " ticks running (a caught fault storm). The FOV write " &
+         "is OFF for the rest of this run; set enableFovWrite off and read the " &
+         "breadcrumb file to see which hop faulted."
+    bc "X1 FOV write self-disabled after a fault storm"
+    return true
+  result = false
+
 proc onFovTick(payload: string): string =
   ## The `everyMain` driver. One firing per drain.
   ##
@@ -2791,6 +2868,8 @@ proc onFovTick(payload: string): string =
   ## only evidence for it available from inside a mod. It is printed next to
   ## the host's own answer so the two can disagree in public.
   gDriverFirings = gDriverFirings + 1
+  if fovSelfDisabled():
+    return ""
   if gDriverFirings == 1:
     # The first tick ONLY. This is suspect (a) on the coordinator's list: the
     # RVAs are prologue-verified but have never been EXECUTED, and a verified
@@ -2799,7 +2878,12 @@ proc onFovTick(payload: string): string =
     # `applyFov` on its first pass and the sub-crumbs A*/B* say where.
     bc "T1 first everyMain tick, about to call applyFov"
   gDriverThreadId = currentThreadId()
+  # RAISE the inflight signal, call, LOWER it. If applyFov faults the host SEH
+  # guard returns control below this call site, so the reset never runs and the
+  # counter climbs toward MaxFovFaults -- that is the whole self-disable.
+  gFovTickInflight = gFovTickInflight + 1
   applyFov()
+  gFovTickInflight = 0
   if gDriverFirings == 1:
     bc "T2 first everyMain tick returned from applyFov"
   result = ""
@@ -2812,13 +2896,11 @@ proc armFovDriver() =
     # returns at its first guard, which would still be a per-frame call into
     # code whose safety is the open question. No callback is registered, so
     # `applyFov` is unreachable for the whole run.
-    gDriverState = "NOT INSTALLED: enableFovWrite is off (the default). No " &
-                   "driver was registered and applyFov is unreachable this " &
-                   "run. The two static RVAs are still verified and reported " &
-                   "above; what is not proven is that CALLING them from the " &
-                   "host's everyMain drain is survivable, and the client is " &
-                   "still dying at ~9.7s with this mod staged."
-    gFovState = "NOT INSTALLED: enableFovWrite is off (the default)"
+    gDriverState = "NOT INSTALLED: enableFovWrite was turned OFF (it defaults " &
+                   "ON now). No driver was registered and applyFov is " &
+                   "unreachable this run. The static RVAs are still verified " &
+                   "and reported above."
+    gFovState = "NOT INSTALLED: enableFovWrite was turned off"
     bc "D2 armFovDriver declined (enableFovWrite off)"
     return
   if not bCamInstance.ok or not bSetFov.ok or

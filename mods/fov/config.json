@@ -1,6 +1,6 @@
 {
   "opticFovMulti": 1.0,
-  "nonOpticFovMulti": 1.0,
+  "nonOpticFovMulti": 1.25,
 
   "opticCameraDistanceOffset": -0.03,
   "nonOpticCameraDistanceOffset": -0.01,
@@ -21,7 +21,7 @@
   "nonOpticToggleZoomSensMulti": 0.7,
   "unaimedToggleZoomSensMulti": 0.7,
 
-  "changeMouseSensitivity": true,
+  "changeMouseSensitivity": false,
   "nonOpticSensMulti": 1.0,
   "oneSensMulti": 0.75,
   "twoSensMulti": 0.45,
@@ -59,7 +59,7 @@
   "unAimSpeedY": 4.5,
   "unAimSpeedZ": 4.5,
 
-  "enableFovWrite": false,
+  "enableFovWrite": true,
   "verifyHooksByName": false,
   "deferUntilUnityThread": true,
   "hookFrameDriver": false,
