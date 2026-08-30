@@ -80,8 +80,6 @@ const
   ArFanout        = 256         ## children examined per level.
   ArFindDepth     = 12          ## descent depth.
   ArMapDepth      = 8           ## depth to find a "Label" under a map toggle.
-  ArPlayUp        = 14          ## levels to climb from a PlayButton looking for a
-                                ## MenuScreen ancestor (to skip the RewardInfo one).
   ArMaxFaults     = 3
   ArMaxPlayExtends = 6          ## popup-wait extensions on the PLAY step. The daily-
                                 ## reward RewardInfo popup deactivates MenuScreen for
@@ -126,6 +124,7 @@ var gArLastActionMs = 0'u64        ## time of the last successful press
 var gArStarted = false
 var gArPlaySeen = false            ## the MenuScreen PlayButton has been visible >=1x
 var gArPlayExtends = 0             ## popup-wait extensions granted on the PLAY step
+var gArWaitLogMs = 0'u64          ## rate limiter for the WAIT-MENU candidate line
 
 proc arStepName(s: int): string =
   case s
@@ -195,41 +194,6 @@ proc arWalkActive(t: Il2CppPtr; name: string; depth: int; budget: var int;
       if result != nil: return
     i = i + 1
 
-proc arWalkAny(t: Il2CppPtr; name: string; depth: int; budget: var int;
-               deadline: uint64): Il2CppPtr =
-  ## Like `arWalkActive` but returns the first name match regardless of active
-  ## state -- for containers (MenuScreen) whose own active flag we do not gate
-  ## on. Breadth-before-depth, same reason.
-  result = nil
-  if t == nil or depth < 0 or budget <= 0 or not duOk(t, 0x20'i32): return
-  budget = budget - 1
-  if (budget and 31) == 0 and cNowMs() > deadline:
-    budget = 0
-    return
-  if iObjName(t) == name:
-    return t
-  if depth == 0: return
-  var n = 0
-  if not iChildCount(t, n): return
-  var i = 0
-  while i < n and i < ArFanout and budget > 0:      # pass 1 -- breadth
-    let c = iChildAt(t, i)
-    if c != nil and duOk(c, 0x20'i32):
-      budget = budget - 1
-      if (budget and 31) == 0 and cNowMs() > deadline:
-        budget = 0
-        return
-      if iObjName(c) == name:
-        return c
-    i = i + 1
-  i = 0
-  while i < n and i < ArFanout and budget > 0:      # pass 2 -- depth
-    let c = iChildAt(t, i)
-    if c != nil:
-      result = arWalkAny(c, name, depth - 1, budget, deadline)
-      if result != nil: return
-    i = i + 1
-
 proc arCollect(t: Il2CppPtr; name: string; depth: int; budget: var int;
                deadline: uint64; into: var seq[Il2CppPtr]; cap: int) =
   ## Collect up to `cap` nodes named `name` under `t` (active or not) -- for the
@@ -289,64 +253,68 @@ proc arNamedRoot(roots: seq[Il2CppPtr]; name: string): Il2CppPtr =
       return r
     i = i + 1
 
-proc arHasAncestorNamed(node: Il2CppPtr; name: string; maxUp: int): bool =
-  ## Climb the parent chain (`Transform::get_parent`, guarded, via splrebrand's
-  ## `splParent`) looking for an ancestor named `name`. Bounded by `maxUp`.
-  result = false
-  var cur = node
-  var k = 0
-  while cur != nil and k < maxUp:
-    if iObjName(cur) == name:
-      return true
-    cur = splParent(cur)
-    k = k + 1
-
-proc arPlayUnder(root: Il2CppPtr; deadline: uint64): Il2CppPtr =
-  ## Re-find the LIVE PlayButton FRESH, PlayButton-first: collect PlayButton
-  ## nodes under `root`, then return the first that is activeInHierarchy AND has
-  ## a MenuScreen ancestor. NEVER cached across ticks.
+proc arPlayUnder(root: Il2CppPtr; deadline: uint64;
+                 nMs, nPb, nActive: var int): Il2CppPtr =
+  ## Re-find the LIVE PlayButton FRESH every tick, MenuScreen-first -- the shape
+  ## that discovered menu-ready at 42 s -- but robust to the corpse: COLLECT ALL
+  ## MenuScreens under `root` (not just the first breadth-first match), and under
+  ## each, collect PlayButtons and return the first that is activeInHierarchy.
   ##
-  ## WHY NOT MenuScreen-first: the daily-reward RewardInfo popup rebuilds the
-  ## MenuScreen/PlayButton GameObjects during its cycle, so a MenuScreen found by
-  ## name (breadth-first, first match) can be the DEAD old instance, and the
-  ## PlayButton search under that corpse finds nothing active -- while a
-  ## brand-new active PlayButton exists under a fresh MenuScreen. The inspector
-  ## sees the live one because it re-FINDS PlayButton directly each call; this
-  ## now does the same. The active check skips the corpse and the inactive
-  ## RewardInfo PlayButton; the MenuScreen-ancestor check skips the RewardInfo
-  ## PlayButton even if it is momentarily active (it lives under
-  ## RewardDetailsView/RewardInfo, never under MenuScreen).
+  ## WHY collect-all: the daily-reward RewardInfo popup rebuilds the
+  ## MenuScreen/PlayButton GameObjects during its cycle, so the FIRST MenuScreen
+  ## by name can be the DEAD old instance whose PlayButton is inactive, while a
+  ## brand-new active PlayButton exists under a SECOND, live MenuScreen. Trying
+  ## every MenuScreen and pressing the first ACTIVE PlayButton finds the live one
+  ## without a parent-climb (which rejected valid buttons live). Nothing is
+  ## cached across ticks: each call re-enumerates and re-collects.
+  ##
+  ## `nMs`/`nPb`/`nActive` accumulate: MenuScreens seen, PlayButtons under them,
+  ## and active PlayButtons -- so a tick that fails to find a pressable button can
+  ## log exactly WHY (§9b) instead of a silent timeout.
   result = nil
   if root == nil: return
-  var cands: seq[Il2CppPtr] = @[]
+  var menus: seq[Il2CppPtr] = @[]
   var b = ArNodeBudget
-  arCollect(root, "PlayButton", ArFindDepth, b, deadline, cands, 16)
-  var i = 0
-  while i < cands.len:
-    let pb = cands[i]
-    if duOk(pb, 0x20'i32):
-      let a = iActiveInHierarchy(pb)
-      if a[0] and a[1] and arHasAncestorNamed(pb, "MenuScreen", ArPlayUp):
-        return pb
-    i = i + 1
+  arCollect(root, "MenuScreen", ArFindDepth, b, deadline, menus, 8)
+  nMs = nMs + menus.len
+  var mi = 0
+  while mi < menus.len and cNowMs() <= deadline:
+    let ms = menus[mi]
+    var pbs: seq[Il2CppPtr] = @[]
+    var b2 = ArNodeBudget
+    arCollect(ms, "PlayButton", ArFindDepth, b2, deadline, pbs, 8)
+    nPb = nPb + pbs.len
+    var pi = 0
+    while pi < pbs.len:
+      let pb = pbs[pi]
+      if duOk(pb, 0x20'i32):
+        let a = iActiveInHierarchy(pb)
+        if a[0] and a[1]:
+          inc nActive
+          if result == nil:
+            result = pb                    # first active; keep counting for the log
+      pi = pi + 1
+    mi = mi + 1
 
-proc arFindPlay(): Il2CppPtr =
+proc arFindPlay(nMs, nPb, nActive: var int): Il2CppPtr =
   ## The active PlayButton under Common UI -> MenuScreen, with a fallback across
   ## every enumerated root. One shared 18 ms deadline bounds the whole search.
+  ## Counters accumulate across roots for the WAIT-MENU candidate log.
   result = nil
+  nMs = 0; nPb = 0; nActive = 0
   var roots: seq[Il2CppPtr] = @[]
   arEnumRoots(roots)
   if roots.len == 0: return
   let deadline = cNowMs() + ArWalkMs
   let cu = arNamedRoot(roots, "Common UI")
   if cu != nil:
-    result = arPlayUnder(cu, deadline)
+    result = arPlayUnder(cu, deadline, nMs, nPb, nActive)
     if result != nil: return
   var i = 0
   while i < roots.len and cNowMs() <= deadline:
     let r = iToTransform(roots[i])
     if r != nil and r != cu and duOk(r, 0x20'i32):
-      result = arPlayUnder(r, deadline)
+      result = arPlayUnder(r, deadline, nMs, nPb, nActive)
       if result != nil: return
     i = i + 1
 
@@ -514,7 +482,10 @@ proc arTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ar_tick_body", cdecl.}
   # up); if the popup IS up, arFindPlay returns nil (the button is inactive) and
   # we wait patiently above for it to clear.
   if gArStep == ArWaitMenu:
-    let pb = arFindPlay()
+    var nMs = 0
+    var nPb = 0
+    var nActive = 0
+    let pb = arFindPlay(nMs, nPb, nActive)
     if pb != nil:
       if not gArPlaySeen:
         gArPlaySeen = true
@@ -525,6 +496,15 @@ proc arTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ar_tick_body", cdecl.}
         gArLastPressed = nil
         gArLastActionMs = now
         arGoto(ArNext1)
+    else:
+      # No pressable PlayButton this tick -- log the candidate census (§9b), so a
+      # failure is EVIDENCE (was MenuScreen found? a PlayButton under it? active?)
+      # rather than a silent 180 s timeout. Rate-limited to ~10 s.
+      if now - gArWaitLogMs > 10000'u64:
+        gArWaitLogMs = now
+        info "autoRaid WAIT-MENU: MenuScreen found=" & $nMs &
+             ", PlayButton under it=" & $nPb & ", active=" & $nActive &
+             " (nothing pressable this tick)"
     return
 
   if gArStep == ArNext1 or gArStep == ArNext2 or gArStep == ArNext3 or
