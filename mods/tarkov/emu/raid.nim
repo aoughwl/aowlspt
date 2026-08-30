@@ -767,25 +767,19 @@ proc offlineScavWaves(zones: seq[string]): string =
   # The PMCs. This is the whole of fix (1): a stock offline raid served only
   # `assault`/`Savage` waves, so the client never asked `bot/generate` for a PMC
   # and a raid spawned ~40 scavs, the bosses, and zero PMCs. These waves name
-  # `pmcUSEC`/`pmcBEAR` (WildSpawnType 52/51); `emu/bots` fills them from
-  # `bots.types.pmcusec`/`pmcbear` -- the full PMC loadout tables -- with
-  # `Info.Side` set by `botSideForRole`, so the bot still comes back Usec/Bear.
-  #
-  # MEASURED FIX (fact #252): the BotSide must be "Savage", NOT "Usec"/"Bear".
-  # Every bot-category SpawnPointParams on every map is Sides:["Savage"]; a wave
-  # declaring BotSide "Usec"/"Bear" finds NO eligible spawn point and places
-  # nothing -- which is exactly why the first attempt spawned zero PMCs while the
-  # byte-identical Savage scav waves filled the map. The wave rides the Savage
-  # spawn pool; the WildSpawnType (pmcUSEC/pmcBEAR) is what drives the PMC role
-  # and loadout, and the faction is set independently in emu/bots. Negative time
-  # so they seed synchronously alongside the scavs. Two of each side.
+  # `pmcUSEC`/`pmcBEAR` (WildSpawnType 52/51) on the `Usec`/`Bear` side; the
+  # client parses both against its own enums, requests those roles, and
+  # `emu/bots` fills them from `bots.types.pmcusec`/`pmcbear` -- the full PMC
+  # loadout tables -- with `Info.Side` set by `botSideForRole`. Negative time so
+  # they seed synchronously alongside the scavs. Spread across the same zones the
+  # scav seeds use, so a PMC has an open zone to place into. Two of each side.
   var pmc = 0
   while pmc < 2:
     a.add oneWave(number, -1, -1, pmcWave, pmcWave * 2,
-                  useZones[number mod useZones.len], "pmcUSEC", "Savage")
+                  useZones[number mod useZones.len], "pmcUSEC", "Usec")
     inc number
     a.add oneWave(number, -1, -1, pmcWave, pmcWave * 2,
-                  useZones[number mod useZones.len], "pmcBEAR", "Savage")
+                  useZones[number mod useZones.len], "pmcBEAR", "Bear")
     inc number
     inc pmc
   # The trickle. Non-negative, so these take `Run(2)`'s timer arm: a bonus if
