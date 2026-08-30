@@ -140,9 +140,29 @@ var gOpts: HudOpts
 var gHudOn = false
 var gFeedRunning = false
   ## True once the client-side collector and publish timer are actually
-  ## registered (they are load-time registrations, so this cannot become true
-  ## from the apply hook). The hook uses it to tell "toggled off live" (which it
-  ## can honour now) apart from "toggled on live" (which still needs a relaunch).
+  ## registered. This is NO LONGER load-time-only: `armFeed` is called from the
+  ## apply hook too, so a session that booted with `enabled=false` can arm the
+  ## feed mid-raid. It is the guard that makes `armFeed` idempotent for the two
+  ## timers, and the diag reads it to tell "ON in config but NEVER ARMED" (the
+  ## late-arm bug) apart from "ON and drawing".
+var gArmedAtBoot = false
+  ## Whether onLoad itself armed the feed. False means the session booted with
+  ## `enabled=false`; any drawing after that came from a LATE ARM, and the diag
+  ## says so rather than leaving the two indistinguishable.
+var gLateArms = 0
+  ## How many times the apply hook actually performed an arming step. IDEMPOTENCE
+  ## EVIDENCE: toggling on/off/on/off/on must leave this at the number of
+  ## false->true transitions that found something unarmed -- in practice 1 --
+  ## because `armFeed` is guarded by gFeedRunning and gHudOn. A value that climbs
+  ## with every toggle would mean duplicate timers or duplicate draw
+  ## participants, and it would be visible here on the very next diag tick.
+var gDiagOn = false
+  ## The periodic diagnostic timer is registered exactly once, UNCONDITIONALLY,
+  ## before the `enabled` gate in onLoad. It used to be registered after that
+  ## gate, so a session that booted disabled produced NO `maps diag` block at
+  ## all -- which is how a silent late-arm no-op survived a whole session: there
+  ## was nothing in the log that could have contradicted it. A diag that only
+  ## runs when the feature already works is a check that cannot fail.
 var gHeadingOn = false
   ## The `heading` setting. Flag-gated and default OFF, like everything else
   ## here. When off, the measured heading is DISCARDED at publish time rather
@@ -782,12 +802,39 @@ proc mapsDiagText(): string =
   # Three outcomes, never two. INCONCLUSIVE when no HUD is registered, because
   # there is then no mirror to disagree with and "I could not look" is not a
   # pass.
+  # THE LATE-ARM CASE, and why it is its own outcome. The reported bug was
+  # `enabled=false` at boot -> onLoad returned before armFeed -> flipping the
+  # setting on in a raid stored the value and armed nothing. The old code
+  # reported that as INCONCLUSIVE ("no HUD is registered"), which reads like a
+  # missing instrument rather than the defect it is. It is now a FAIL with a
+  # falsifiable statement: config says ON, and the collector is provably not
+  # running. Three states, distinguishable, and a wrong one is observable:
+  #   (a) config ON  + armed        -> the mirror comparison below
+  #   (b) config ON  + NOT armed    -> FAIL, this bug
+  #   (c) config OFF + not armed    -> PASS only if the mirror also reads off
   var lToggle = ""
-  if not gHudOn:
-    lToggle = "INCONCLUSIVE  no HUD is registered, so there is no live mirror " &
-              "to compare config.json against"
+  let cfgEnabledTop = asBool(setting("enabled"), false)
+  if cfgEnabledTop and not gFeedRunning:
+    lToggle = "FAIL  enabled=true in config.json but the live feed was NEVER " &
+              "ARMED (gFeedRunning=false): no collector, no publish timer, so " &
+              "nothing reads game memory and nothing can be drawn. This is the " &
+              "late-arm defect -- the setting was stored and no arming ran. " &
+              "Expect a 'maps: LATE ARM' line in this log if the apply hook fired."
+  elif cfgEnabledTop and not gHudOn:
+    lToggle = "FAIL  enabled=true and the collector IS running, but no draw " &
+              "participant is registered (gHudOn=false), so the map page has a " &
+              "feed and the in-game overlay submits no geometry."
+  elif not gHudOn:
+    if hudLiveEnabled():
+      lToggle = "FAIL  enabled=false in config.json and no draw participant is " &
+                "registered, yet the live mirror still reads enabled=ON -- the " &
+                "mirror and the config disagree with nothing to reconcile them."
+    else:
+      lToggle = "PASS  enabled=false in config.json, no draw participant is " &
+                "registered, and the live mirror reads enabled=OFF -- correctly " &
+                "drawing nothing. Toggling `enabled` on will LATE ARM."
   else:
-    let cfgEnabled = asBool(setting("enabled"), false)
+    let cfgEnabled = cfgEnabledTop
     let cfgMap     = asBool(setting("hudMap"), false)
     let cfgRadar   = asBool(setting("hudRadar"), true)
     let cfgInd     = asBool(setting("hudIndicators"), false)
@@ -822,7 +869,15 @@ proc mapsDiagText(): string =
       lToggle = "PASS  no surface is off in config while still on in the live " &
                 "mirror. " & mirrorTxt
 
+  # The raw arming state, printed as three independent bits rather than as a
+  # single "is it working" verdict, because collapsing them is what let the
+  # late-arm bug hide: gEnabled could be true while gFeedRunning was false.
+  let lArm = "gEnabled=" & $gEnabled & " gFeedRunning=" & $gFeedRunning &
+             " gHudOn=" & $gHudOn & " armedAtBoot=" & $gArmedAtBoot &
+             " lateArms=" & $gLateArms
+
   result = "maps diag:\n" &
+           "  arm          : " & lArm & "\n" &
            "  region       : " & lRegion & "\n" &
            "  world        : " & lWorld  & "\n" &
            "  raid         : " & lRaid   & "\n" &
@@ -924,9 +979,42 @@ proc onMapsApply(key: string) =
   if side() != sideClient:
     settingIgnored("this is the server instance; the client instance owns the HUD")
     return
+  let wasEnabled = gEnabled
   let nowEnabled = asBool(setting("enabled"), false)
   loadHudOpts()                       # refresh gOpts + gHeadingOn from config
-  let live = nowEnabled and gFeedRunning
+
+  # THE LATE ARM (bug 3), and why it is NOT under `if key == "enabled"`.
+  #
+  # `gEnabled` used to be refreshed ONLY inside that branch, and `key` is
+  # `field(payload,"key").asText("")` (aowl/src/aowlspt/settings.nim:698) -- it is
+  # "" for a whole-page apply and for a RESET, and it is whatever the UI happens
+  # to name otherwise. So a reset that restored `enabled=true`, or any apply that
+  # did not carry exactly the string "enabled", fell through to the generic
+  # verdict below with `gEnabled` still holding its stale boot-time `false`, and
+  # answered settingIgnored("stored; nothing is drawn..."). That is the reported
+  # bug: turn the map on in a raid, nothing happens. The transition is now
+  # derived from the CONFIG VALUE, not from the key, so no key spelling can lose
+  # it. `key` is used for the message only.
+  gEnabled = nowEnabled               # unconditional; gates onMainTick/onPublishTick
+  var armWanted = false
+  var armOk = true
+  if nowEnabled and ((not gFeedRunning) or (not gHudOn)):
+    # Something is genuinely unarmed. armFeed is IDEMPOTENT -- gFeedRunning
+    # guards the two timers and gHudOn guards the draw participant -- so calling
+    # it on every apply could not double-register; we gate anyway so that
+    # `gLateArms` counts real arming work and stays flat across repeated
+    # toggling, which is the idempotence evidence the diag prints.
+    armWanted = true
+    armOk = armFeed()
+    if armOk: inc gLateArms
+    info ModName & ": LATE ARM " & (if armOk: "SUCCEEDED" else: "FAILED") &
+         " (booted with enabled=" & $gArmedAtBoot &
+         ") -> gFeedRunning=" & $gFeedRunning & " gHudOn=" & $gHudOn &
+         " lateArms=" & $gLateArms
+
+  # `live` is computed AFTER the arm, so a false->true transition pushes
+  # live=true into the mirror on this same apply instead of one apply later.
+  let live = gEnabled and gFeedRunning
   hudReconfigure(gOpts, live)         # next frame honours it; no position reset
   # A MAPS-OWNED TRACE, unconditional and BEFORE the verdict branches below
   # (bug 2). The earlier apply hook left no line of its own in the host log, so
@@ -942,24 +1030,28 @@ proc onMapsApply(key: string) =
        " live=" & $live & " -> mirror pushed mapOn=" &
        $(gOpts.map and live) & " radarOn=" & $(gOpts.radar and live) &
        " indicatorsOn=" & $(gOpts.indicators and live)
-  if key == "enabled":
-    gEnabled = nowEnabled             # gates onMainTick/onPublishTick live
+  # The verdict is driven by the TRANSITION (or by an explicit `enabled` key),
+  # never by the key alone -- see the late-arm comment above.
+  if nowEnabled != wasEnabled or key == "enabled":
     if nowEnabled:
-      # HOT-START (bug: this used to be a relaunch-only no-op --
-      # settingAppliesOnRestart). Arm the SAME collector + draw path onLoad uses,
-      # idempotently via armFeed(). gEnabled is set first so the freshly
-      # registered onMainTick/onPublishTick do real work on their first fire. The
-      # in-raid lifecycle gate in hud.nim still owns whether anything DRAWS, so
-      # this only makes the map begin drawing on the next IN-RAID frame; outside a
-      # raid the feed arms and waits. Re-push the mirror with live=true, because
-      # the hudReconfigure above ran while gFeedRunning was still false (live=0).
-      if armFeed():
-        hudReconfigure(gOpts, gEnabled and gFeedRunning)
-        settingApplied("feed HOT-STARTED without relaunch -- collector armed" &
-          (if gHudOn: "; in-game HUD registered" else: "") &
-          "; draws on the next in-raid frame (in-raid lifecycle gate applies)")
+      # HOT-START. The arming already happened above, through the SAME armFeed()
+      # path onLoad uses. gEnabled was set before it, so the freshly registered
+      # onMainTick/onPublishTick do real work on their first fire. The in-raid
+      # lifecycle gate in hud.nim still owns whether anything DRAWS, so this only
+      # makes the map begin drawing on the next IN-RAID frame; outside a raid the
+      # feed arms and waits.
+      if gFeedRunning and armOk:
+        settingApplied("feed " &
+          (if armWanted: "LATE-ARMED in place" else: "already armed") &
+          " without relaunch -- collector running" &
+          (if gHudOn: "; in-game HUD registered"
+           else: "; NO draw participant (every HUD surface is off in config)") &
+          "; draws on the next in-raid frame (in-raid lifecycle gate applies). " &
+          "lateArms=" & $gLateArms)
       else:
-        settingIgnored("could not arm the live collector; see the warning above")
+        settingIgnored("could not arm the live collector (gFeedRunning=" &
+          $gFeedRunning & "); see the warning above -- the map page still opens " &
+          "and will report that no feed is arriving")
     else:
       # true->false: gEnabled now gates the collector ticks to no-ops, and the
       # hudReconfigure above already pushed live=false into the mirror (mapOn=
@@ -1008,30 +1100,43 @@ proc onLoad(): Status =
   if side() != sideClient:
     return Ok
 
+  # THE DIAGNOSTIC TIMER, registered FIRST and UNCONDITIONALLY -- before the
+  # `enabled` gate below, not after it.
+  #
+  # It used to be registered at the very end of onLoad, i.e. only on the path
+  # where the feature was already enabled and already armed. A session that
+  # booted with `enabled=false` therefore emitted NO `maps diag` block at all,
+  # for its entire life. That is what made the late-arm bug invisible: the one
+  # instrument that could have said "config says ON and nothing is armed" was
+  # itself gated on the feature working. A diag that only runs when the thing
+  # works is a check that cannot fail (CLAUDE.md 9b), so it now runs always --
+  # including in the disabled case it exists to describe.
+  if not gDiagOn:
+    if every(2000, onDiagTick) != Ok:
+      warn ModName & ": the periodic diagnostic timer did NOT register, so this " &
+           "mod cannot report whether it is drawing. Everything else may still " &
+           "work -- but it will work silently, which is the failure mode this " &
+           "timer exists to stop. Treat any later 'the radar does not appear' " &
+           "as INCONCLUSIVE until this is fixed."
+    else:
+      gDiagOn = true
+
   if not gEnabled:
     info ModName & ": the live feed is OFF (config.json `enabled` is false), " &
          "so nothing here reads game memory. The map, the radar and the " &
          "indicators still open at " & PageRoute & " and will say plainly " &
-         "that no feed is arriving."
+         "that no feed is arriving. Turning `enabled` on in F12 LATE ARMS the " &
+         "feed in place -- no relaunch, and it works mid-raid; watch for " &
+         "'maps: LATE ARM' and for the 'arm' line in the maps diag block."
     return Ok
 
   # Arm the collector + draw through the shared armFeed() path (also used by the
-  # hot-apply hook so enabled=false->true hot-starts without a relaunch). A
+  # hot-apply hook so enabled=false->true late-arms without a relaunch). A
   # collector-registration failure returns Ok here exactly as before: the map
-  # page still opens; the diag timer below is what will report it.
+  # page still opens; the diag timer above is what will report it.
   if not armFeed():
     return Ok
-
-  # THE DIAGNOSTIC TIMER. Registered LAST and unconditionally, because it is
-  # the thing that explains every branch above -- including the branches that
-  # returned early. Its failure to register is itself announced: a diag that
-  # quietly never runs would reproduce the exact bug it exists to prevent.
-  if every(2000, onDiagTick) != Ok:
-    warn ModName & ": the periodic diagnostic timer did NOT register, so this " &
-         "mod cannot report whether it is drawing. Everything else may still " &
-         "work -- but it will work silently, which is the failure mode this " &
-         "timer exists to stop. Treat any later 'the radar does not appear' " &
-         "as INCONCLUSIVE until this is fixed."
+  gArmedAtBoot = true
 
   success ModName & " " & ModVersion & ": collector armed at " & $gHz &
           " Hz. " & feedStateText()
