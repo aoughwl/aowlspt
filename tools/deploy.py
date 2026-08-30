@@ -44,6 +44,17 @@ must never read as absent. Do NOT hand-roll this in PowerShell:
 `[Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes(p)).Contains(s)`
 gives SELECTIVE false negatives (facts #151/#152).
 
+A MATCH PROVES PRESENCE; A MISS PROVES NOTHING. nimony stores each
+`&`-concatenated source fragment as a SEPARATE rodata string, so a sentence
+assembled from fragments (or from variables, or a C function name from
+`abi/*.h`, which is a symbol and not a runtime string) can NEVER appear
+contiguously. A `--contains` miss is therefore reported as NO-MATCH and is
+INCONCLUSIVE (exit 3), not FAIL -- with the longest word-run of the literal
+that IS present, which usually shows you where the split is. Pick a
+substring that lives inside ONE source fragment. `--absent` carries the same
+caveat, and returns INCONCLUSIVE rather than PASS when a long fragment of
+the literal survives.
+
 `--contains` is a CLI argument on purpose: `tools/deploy.json`'s marker list
 must never be edited to make a check pass, and a passing literal can only
 add to the verdict, never rescue a missing marker. An unreadable artifact is
@@ -149,6 +160,7 @@ import hashlib
 import json
 import os
 import posixpath
+import re
 import shutil
 import sys
 import time
@@ -617,6 +629,49 @@ def _encodings(mode):
     return [utf8, utf16]
 
 
+FRAGMENT_NOTE = (
+    "a literal that spans a Nim `&` concatenation is stored as SEPARATE "
+    "rodata fragments and can NEVER appear contiguously, at any encoding. "
+    "Neither can text assembled from variables ($, %, formatIt), nor a C "
+    "function name from abi/*.h (a symbol, not a runtime string). Pick a "
+    "substring that lives inside ONE source fragment.")
+
+# Below this many characters a "longest present fragment" is noise ("the ").
+_MIN_FRAGMENT = 6
+
+
+def _fragments(lit):
+    """Contiguous whitespace-delimited word runs of `lit`, longest first.
+
+    The whole literal is excluded (the caller already searched for it) and so
+    is anything shorter than _MIN_FRAGMENT. Bounded: a literal of n words
+    yields n*(n+1)/2 runs, and these literals are one sentence.
+    """
+    parts = re.split(r"(\s+)", lit)                 # words AND separators
+    runs = []
+    for a in range(0, len(parts), 2):
+        for b in range(a, len(parts), 2):
+            frag = "".join(parts[a:b + 1])
+            if frag and frag != lit and len(frag) >= _MIN_FRAGMENT:
+                runs.append(frag)
+    runs.sort(key=len, reverse=True)
+    return runs
+
+
+def _longest_present_fragment(blob, encs, lit):
+    """(fragment, encodings) for the longest word-run of `lit` in `blob`.
+
+    Returns (None, []) when nothing above _MIN_FRAGMENT is present -- which is
+    the shape of a literal that is genuinely not in the binary, as opposed to
+    one that is merely split across rodata fragments.
+    """
+    for frag in _fragments(lit):
+        hits = [lbl for lbl, enc in encs if blob.find(enc(frag)) >= 0]
+        if hits:
+            return frag, hits
+    return None, []
+
+
 def verify_literals(src, contains, absent, mode, C):
     """Assert raw-byte presence/absence of ad-hoc literals in ONE file.
 
@@ -636,8 +691,29 @@ def verify_literals(src, contains, absent, mode, C):
     encoding is reported. A literal present only as UTF-16 must never read as
     absent.
 
-    Returns (verdict, lines). An unreadable file is INCONCLUSIVE: nothing was
-    searched, which is neither a pass nor a content failure (CLAUDE.md 9b).
+    WHAT A MISS DOES NOT MEAN. `--contains` is SOUND as a positive signal and
+    UNSOUND as a negative one: a contiguous match proves the text is in the
+    file, a miss proves nothing. nimony stores each `&`-concatenated source
+    fragment as a SEPARATE rodata string, so a sentence assembled from
+    fragments never appears contiguously and no substring search at any
+    encoding can ever match it. Measured on mods/maps/bin/maps.dll (764,416
+    bytes, fix-maps-late-arm@a62b427): "was NEVER ARMED", "LATE ARMS the feed
+    in place" and "no draw participant is registered" all missed while
+    "LATE ARM", "and no draw participant is " and five other single-fragment
+    literals from the same source lines matched. So a miss is INCONCLUSIVE,
+    never FAIL -- a flat FAIL there reads as "the feature is missing, do not
+    deploy", which is exactly the confidently-wrong answer this tool exists
+    to prevent. On a miss the longest whitespace-delimited word-run of the
+    literal that IS present is reported, which usually shows the split.
+
+    `--absent` inherits the same limitation in the more dangerous direction:
+    a literal can be "absent" merely because it was assembled. A contiguous
+    hit is still a hard FAIL (the text is demonstrably there); a clean miss
+    PASSes but carries the caveat; and if a long word-run of the literal is
+    still present the removal is NOT demonstrated -- that is INCONCLUSIVE.
+
+    Returns (verdict, lines). An unreadable file is INCONCLUSIVE too: nothing
+    was searched, which is neither a pass nor a content failure (CLAUDE.md 9b).
     """
     red, green, yellow, dim, reset = C
     encs = _encodings(mode)
@@ -657,29 +733,67 @@ def verify_literals(src, contains, absent, mode, C):
     size = len(blob)
     lines = []
     bad = 0
+    unknown = 0
+    where = "    searched %s over %s (%d bytes)" % (searched, src, size)
     for lit in contains:
         hits = [lbl for lbl, enc in encs if blob.find(enc(lit)) >= 0]
         if hits:
             lines.append("%scontains%s PASS  %r  as %s"
                          % (green, reset, lit, "+".join(hits)))
+            continue
+        # NOT a FAIL. A contiguous match PROVES presence; a miss does not
+        # prove absence, because the compiler is free to store the sentence
+        # in pieces. Reporting FAIL here reads as "the feature is missing,
+        # do not deploy" -- measured against mods/maps/bin/maps.dll, where
+        # three literals that are plainly in the source cannot ever match.
+        unknown += 1
+        lines.append("%scontains%s NO-MATCH  %r  (INCONCLUSIVE)"
+                     % (yellow, reset, lit))
+        lines.append(where)
+        frag, fhits = _longest_present_fragment(blob, encs, lit)
+        if frag:
+            lines.append("    no contiguous match; longest present fragment: "
+                         "%r (%d bytes, as %s) -- consistent with a literal "
+                         "split across rodata fragments."
+                         % (frag, len(frag), "+".join(fhits)))
         else:
-            bad += 1
-            lines.append("%scontains%s FAIL  %r  NOT in the raw bytes"
-                         % (red, reset, lit))
-            lines.append("    searched encodings: %s" % searched)
-            lines.append("    artifact: %s (%d bytes)" % (src, size))
+            lines.append("    no word-run of this literal is present either, "
+                         "so it may well be genuinely absent -- but that is "
+                         "still not proven here.")
+        lines.append("    NOTE: %s" % FRAGMENT_NOTE)
+        lines.append("    This is NOT proof the feature is absent.")
     for lit in absent:
         hits = [lbl for lbl, enc in encs if blob.find(enc(lit)) >= 0]
-        if not hits:
-            lines.append("%sabsent%s   PASS  %r  in neither %s"
-                         % (green, reset, lit, searched))
-        else:
+        if hits:
             bad += 1
             lines.append("%sabsent%s   FAIL  %r  IS STILL PRESENT as %s"
                          % (red, reset, lit, "+".join(hits)))
-            lines.append("    searched encodings: %s" % searched)
-            lines.append("    artifact: %s (%d bytes)" % (src, size))
-    return (FAIL if bad else OK), lines
+            lines.append(where)
+            continue
+        # The dangerous direction: this currently reads as proof of removal,
+        # and it is not. A literal is equally "absent" when it was merely
+        # assembled from fragments. If a long word-run of it IS present, the
+        # removal is very likely NOT done -- say so instead of passing.
+        frag, fhits = _longest_present_fragment(blob, encs, lit)
+        if frag:
+            unknown += 1
+            lines.append("%sabsent%s   NO-MATCH  %r  (INCONCLUSIVE)"
+                         % (yellow, reset, lit))
+            lines.append(where)
+            lines.append("    the whole literal is not contiguous, but %r "
+                         "(%d bytes, as %s) IS still in the artifact -- the "
+                         "removal is NOT demonstrated."
+                         % (frag, len(frag), "+".join(fhits)))
+            lines.append("    NOTE: %s" % FRAGMENT_NOTE)
+            continue
+        lines.append("%sabsent%s   PASS  %r  in neither %s"
+                     % (green, reset, lit, searched))
+        lines.append("    (caveat: %s -- so `absent` is evidence of removal, "
+                     "not proof, for any literal that was assembled.)"
+                     % FRAGMENT_NOTE)
+    if bad:
+        return FAIL, lines
+    return (INCONCLUSIVE if unknown else OK), lines
 
 
 def cmd_check(args, cfg, C, check_data=True):
@@ -747,7 +861,11 @@ def cmd_check(args, cfg, C, check_data=True):
                     "above)." % sum(1 for l in llines if "FAIL" in l)]
             elif lverdict == INCONCLUSIVE and verdict == OK:
                 verdict = INCONCLUSIVE
-                problems = list(problems) + llines
+                problems = list(problems) + [
+                    "%d literal check(s) returned NO-MATCH (see the lines "
+                    "above). A miss is INCONCLUSIVE, not a failure: %s"
+                    % (sum(1 for l in llines if "NO-MATCH" in l),
+                       FRAGMENT_NOTE)]
         if verdict == OK and check_data:
             dverdict, dproblems = verify_data(art, install, C)
             if dverdict != OK:
@@ -791,7 +909,8 @@ def cmd_check(args, cfg, C, check_data=True):
     if unknown:
         print("\n%s%d artifact(s) INCONCLUSIVE -- "
               "not built, or its declared data could not be derived, or its "
-              "export table could not be read.%s" % (yellow, unknown, reset))
+              "export table could not be read, or a --contains/--absent "
+              "literal returned NO-MATCH.%s" % (yellow, unknown, reset))
         print("This is not a pass and not a failure: nothing was verified. "
               "Read the reason printed above the summary, supply what is "
               "missing and re-run, or narrow to the artifacts you did build "
@@ -1237,12 +1356,21 @@ def main():
                         "artifact's RAW BYTES contain this literal. Searched "
                         "as UTF-8 and UTF-16LE by default; the matching "
                         "encoding is reported. ADDITIVE to the marker check, "
-                        "never a substitute for it.")
+                        "never a substitute for it. A MATCH proves presence; "
+                        "a MISS proves nothing and is reported NO-MATCH / "
+                        "INCONCLUSIVE (exit 3), because a literal spanning a "
+                        "Nim `&` concatenation is stored as separate rodata "
+                        "fragments and can never match contiguously -- pick a "
+                        "substring inside ONE source fragment.")
     p.add_argument("--absent", action="append", default=None,
                    metavar="LITERAL",
                    help="`check` only, repeatable: assert the literal is NOT "
-                        "in the artifact's raw bytes (proving a removal). "
-                        "Same encoding rules as --contains.")
+                        "in the artifact's raw bytes. Same encoding rules as "
+                        "--contains -- and the same limitation, in the more "
+                        "dangerous direction: a literal is equally 'absent' "
+                        "when it was merely assembled from fragments, so a "
+                        "clean miss is EVIDENCE of removal, not proof, and a "
+                        "surviving long fragment yields INCONCLUSIVE.")
     p.add_argument("--encoding", default="any",
                    choices=["utf8", "utf16", "any"],
                    help="which encoding(s) --contains/--absent search "
