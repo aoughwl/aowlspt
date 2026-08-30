@@ -154,8 +154,9 @@ var gClientSyncs = 0
 # The assembled `/aowlspt/settings/index` reply, cached.
 #
 # WHY. Every GET of that route used to rebuild the whole list by broadcasting
-# `SettingsIndexQuery` to every server mod AND running `panelRefresh()` (a
-# second `SettingsPageQuery` broadcast) purely to count the panel's rows -- on
+# `SettingsIndexQuery` to every server mod (and, until the duplicate "Settings
+# Panel" proxy page was removed, a second `SettingsPageQuery` broadcast purely
+# to count that page's rows) -- on
 # EVERY request. The overlay/settings surface polls this route continuously at
 # an idle main menu (measured), so that was a fan-out to every declaring mod,
 # several times a second, producing nothing new: the server-side half of the
@@ -359,117 +360,6 @@ proc onClientStatus(url, body, session: string): string =
     root.put("stamp", gClientPages[i].stamp)
   result = done(root).text
 
-# ---------------------------------------------------------------------------
-# "Settings Panel" -- the page the panel's OWN rows render on
-# ---------------------------------------------------------------------------
-#
-# A player reported: "Browser Settings Page??? can we remove this and put its
-# single setting under Settings Panel". They are right. `aowl.uihub` is
-# infrastructure -- one HTML fallback page -- and it was claiming a whole nav
-# entry to show ONE genuine player row, the F12 launch hint.
-#
-# **The row does not move, and could not.** `abi/aowlspt_overlay.h` fetches
-# `GET /aowlspt/settings/aowl.uihub` and reads the key `launchHint` out of it
-# by name (measured: that file, the `aowl_ov_fetch` call and the `strcmp`
-# beside it), so `aowl.uihub` stays the one owner of the value, keeps its
-# route, and keeps its `config.json` path. NOTHING about stored config
-# changes and there is nothing to migrate. What changes is only where the row
-# is DRAWN: uihub declares its schema with `inIndex = false`, so it claims no
-# nav entry of its own, and this page renders its rows and forwards a write
-# back to it -- the same one-owner proxy `mods/sain` uses for the two halves
-# of Bot AI.
-#
-# This hub is the right host for it because this hub IS the settings panel:
-# it is the aggregator every settings screen is built out of.
-
-const
-  PanelGuid = "aowl.settingshub"
-  PanelName = "Settings Panel"
-  PanelRoute = "/aowlspt/settings/" & PanelGuid
-  PanelResetRoute = PanelRoute & "/reset"
-  PanelChildGuid = "aowl.uihub"
-    ## The mods whose rows render on this page. One today. Each keeps its
-    ## guid, its route and its own config.json and remains the ONE owner of
-    ## its values -- a row that rendered here and also persisted here would be
-    ## two sources of truth and would drift.
-
-var gPanelRows = "[]"          ## what the child last announced
-var gPanelSubscribed = false
-
-proc onPanelChildRows(payload: string): string =
-  if jr.asText(jr.field(payload, "guid"), "") == PanelChildGuid:
-    let r = jr.raw(jr.field(payload, "rows"))
-    if r.len > 1:
-      gPanelRows = r
-  result = ""
-
-proc panelSubscribe() =
-  if gPanelSubscribed: return
-  discard on(settings.SettingsPageAnnounce, onPanelChildRows)
-  discard on(settings.SettingsApplyAnnounce, onPanelChildRows)
-  gPanelSubscribed = true
-
-proc panelRefresh() =
-  ## Ask the child for its rows. The broadcast is SYNCHRONOUS -- `deliverEvent`
-  ## calls every subscriber before `emit` returns -- so `gPanelRows` is current
-  ## when this returns, or stays as it was, which means the child is not
-  ## loaded. Not loaded is reported as an EMPTY page, never as a page with no
-  ## rows to offer: "I could not look" is not "there is nothing there".
-  panelSubscribe()
-  gPanelRows = "[]"
-  discard emit(settings.SettingsPageQuery, PanelChildGuid)
-
-proc panelPage(): string =
-  ## The BARE ARRAY, which is what `aowlspt/settings.declaredSchemaReply`
-  ## returns on success and therefore the only shape the F12 overlay and the
-  ## fallback page parse. This originally answered `{"guid","name","rows"}`,
-  ## which is a perfectly reasonable-looking object that both readers render
-  ## as an empty page -- caught by asserting the FINISHED payload rather than
-  ## by reading this function.
-  panelRefresh()
-  result = gPanelRows
-
-proc panelError(msg: string): string =
-  ## The failure shape, matching `declaredSchemaReply`: `err` plus the rows, so
-  ## a caller that only checks `Array.isArray` cannot mistake a refused write
-  ## for a persisted one.
-  var o = obj()
-  o.put("err", msg)
-  o.put("rows", sv.raw(gPanelRows))
-  result = done(o).text
-
-proc onPanelSettings(url, body, session: string): string =
-  ## GET serves the rows; a POST forwards ONE edit to the mod that owns it.
-  ## The forward is what keeps the owner single: this page never writes a
-  ## value into its own config.json.
-  if body.len > 0:
-    let k = jr.asText(jr.field(body, "key"), "")
-    if k.len == 0:
-      panelRefresh()
-      return panelError("a settings write must name a key")
-    panelRefresh()
-    var known = false
-    for r in jr.each(jr.whole(gPanelRows)):
-      if jr.asText(jr.child(r, "key"), "") == k:
-        known = true
-    if not known:
-      # REFUSED, and said so. Emitting the apply anyway would return the
-      # unchanged rows with a 200 -- the silent no-op shape CLAUDE.md 9b names.
-      return panelError("'" & k & "' is not a row on the " & PanelName &
-                        " page; nothing was written")
-    var q = "{\"guid\":\"" & PanelChildGuid & "\",\"key\":\"" & k &
-            "\",\"value\":" & jr.raw(jr.field(body, "value")) & "}"
-    discard emit(settings.SettingsApplyQuery, q)
-  result = panelPage()
-
-proc onPanelReset(url, body, session: string): string =
-  let k = jr.asText(jr.field(body, "key"), "")
-  if k.len > 0:
-    discard emit(settings.SettingsApplyQuery,
-                 "{\"guid\":\"" & PanelChildGuid & "\",\"key\":\"" & k &
-                 "\",\"reset\":true}")
-  result = panelPage()
-
 proc onModsIndex(url, body, session: string): string =
   ## ONE ENTRY PER GUID. A mod whose `sides` include both the server and the
   ## client -- `aowl.sain`, `aowl.maps`, `aowl.admin` today -- is loaded TWICE,
@@ -530,20 +420,23 @@ proc onModsIndex(url, body, session: string): string =
     o.put("done", p.done)
     o.put("client", true)
     a.add done(o)
-  # This hub's own page, LAST. It is not declared through `declareSettings`
-  # because it owns no value of its own -- every row on it belongs to another
-  # mod -- so it would never answer the broadcast above. Its count is the
-  # child's live row count, not a constant: a page that claims rows it cannot
-  # produce is the nav entry that opens on nothing.
-  panelRefresh()
-  let panelCount = jr.count(jr.whole(gPanelRows))
-  if panelCount > 0 and not guids.contains(PanelGuid):
-    var o = obj()
-    o.put("guid", PanelGuid)
-    o.put("name", PanelName)
-    o.put("count", panelCount)
-    o.put("done", panelCount)
-    a.add done(o)
+  # This hub NO LONGER contributes a page of its own. It used to append one
+  # named "Settings Panel" carrying uihub's `launchHint` row -- and the F12
+  # overlay ALSO synthesises a built-in page with the identical label (see
+  # `AOWL_OV_PANEL_PAGE` in `abi/aowlspt_overlay.h`). Two guids, one label:
+  # the player saw the same page twice, one of them holding a single row that
+  # the other already had ("Startup message"; both drive `g_ov.hintEnabled`).
+  #
+  # The proxy could not simply be deleted before, because the overlay's own
+  # `hint` row persisted ONLY to the overlay prefs file, which the launch-time
+  # `GET /aowlspt/settings/aowl.uihub` overwrites on every start -- so this
+  # page was the only DURABLE off-switch for the launch toast. It is not any
+  # more: `aowl_ov_panel_set` now mirrors a `hint` write back to
+  # `POST /aowlspt/settings/aowl.uihub`, the same place that GET reads from,
+  # and says so in the host log whether it succeeds or fails.
+  #
+  # `aowl.uihub` is untouched -- same guid, same route, same `launchHint` key,
+  # same config.json -- so every existing saved value keeps working.
   var root = obj()
   root.put("mods", a)
   result = done(root).text
@@ -573,13 +466,6 @@ proc onLoad(): Status =
     warn "could not register " & ClientStatusPrefix &
          " -- the F12 panel will fall back to a wall-clock wait and may " &
          "report a slow-but-working client edit as NOT APPLIED"
-  # Exact routes, so they beat the `ClientPagePrefix` fallback below.
-  if serve(PanelRoute, onPanelSettings) != Ok:
-    warn "could not register " & PanelRoute &
-         " -- the '" & PanelName & "' page will be listed and open on nothing"
-  if serve(PanelResetRoute, onPanelReset) != Ok:
-    warn "could not register " & PanelResetRoute
-  panelSubscribe()
   if servePrefix(ClientPagePrefix, onClientPage) != Ok:
     warn "could not register " & ClientPagePrefix
   if on(settings.SettingsIndexAnnounce, onAnnounce) != Ok:
