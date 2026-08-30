@@ -96,6 +96,14 @@ type
     ## someone can flip this to re-measure rather than re-derive. Turning it on
     ## is turning on a known process-killer on THIS build.
     allowIl2cppReflection*: bool
+    ## Bot AI > Advanced > Diagnostics: bind SAIN's members from the static-RVA
+    ## table in `client/rvatable.nim` instead of by name. Default FALSE, like
+    ## every new live path in this repo. OFF the mod is exactly what it was --
+    ## every member refused at `ensure`, nothing read. ON, 23 members are bound
+    ## from byte-verified static RVAs and the ~27 that could not be resolved
+    ## offline are refused BY NAME in the log rather than being retried through
+    ## the token-gated by-name lookup that kills the client.
+    rvaTable*: bool
     ## Bot AI > Loadout: a global multiplier on how much loose loot a generated
     ## bot carries. Unlike every other field above, this one reaches the game on
     ## THIS build: it is not consumed by the client decision cascade (which never
@@ -276,6 +284,8 @@ proc loadPreset*(): Preset =
       doc.field("driveFromHostThread").asBool(true),
     allowIl2cppReflection:
       doc.field("allowIl2cppReflection").asBool(false),
+    rvaTable:
+      doc.field("sainRvaTable").asBool(false),
     lootRichness: block:
       # Absent -> 1.0 (stock), never 0.0: a loot pass that read a missing knob
       # as empty is a silent regression to naked bots. Clamped so a typo in the

@@ -52,6 +52,15 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # failure mode this file exists to stop, so `--list` prints the coverage and
 # the FAIL text names any table found in abi/ that is not listed.
 TABLES = [
+    # SAIN's member table. Keyed by STRING, not by index, so it gets the
+    # `keymap` mode rather than the positional one -- see check_keymap for
+    # exactly which three properties that asserts and how each can fail.
+    {
+        "mode": "keymap",
+        "array": "sainRvaRows/sainRvaRefusals",
+        "table_file": "mods/sain/client/rvatable.nim",
+        "user_file": "mods/sain/client/live.nim",
+    },
     {
         "mode": "positional",
         "header": "abi/aowlspt_debugui.h",
@@ -573,6 +582,76 @@ def check_unused(t, verbose):
                 % (t["array"], rel, sites[0][0], t["at"]))
 
 
+def check_keymap(t, verbose):
+    """A table indexed by STRING KEY, not by position.
+
+    `mods/sain/client/rvatable.nim` is not a C array and cannot shift an index,
+    so the positional check does not apply to it. The failure it CAN have is
+    the same shape one layer up: a `keyed(lazy("get_X"), "kX")` call site whose
+    key names no row and no refusal binds nothing, silently, and the member
+    then behaves exactly like a member nobody wired -- which is the outcome
+    this whole conversion exists to abolish.
+
+    So three properties are asserted, and each of them can fail:
+
+      * every key used at a call site EXISTS, as a row or as a refusal;
+      * no key is BOTH a row and a refusal (that would make binding depend on
+        lookup order, and `resolveFromRva` deliberately prefers the refusal);
+      * every declared row and refusal IS used by a call site -- an unreferenced
+        row is a member somebody meant to convert and did not, and it would sit
+        in the table looking converted.
+    """
+    src = read(t["table_file"])
+    if src is None:
+        inconclusive.append("%s: table file not found" % t["table_file"])
+        return
+    usrc = read(t["user_file"])
+    if usrc is None:
+        inconclusive.append("%s: user file not found" % t["user_file"])
+        return
+
+    rows = re.findall(r'SainRvaRow\(\s*key:\s*"([^"]+)"', src)
+    refs = re.findall(r'SainRvaRefusal\(\s*key:\s*"([^"]+)"', src)
+    # A `keyed(...)` call site, on one line or wrapped onto two. Both forms
+    # occur in live.nim and matching only the first would under-count `used`,
+    # which would turn the "declared but never referenced" check below into a
+    # false alarm rather than into silence -- the safe direction, but still a
+    # tool telling a lie.
+    used = set(re.findall(r'keyed\(.*?,\s*"([^"]+)"\)', usrc, re.S))
+
+    if verbose:
+        print("  %s: %d row(s), %d refusal(s), %d call-site key(s)"
+              % (t["array"], len(rows), len(refs), len(used)))
+
+    for dup in sorted(set(k for k in rows if rows.count(k) > 1)):
+        problems.append("%s: key %r is declared as a ROW twice."
+                        % (t["array"], dup))
+    for dup in sorted(set(k for k in refs if refs.count(k) > 1)):
+        problems.append("%s: key %r is declared as a REFUSAL twice."
+                        % (t["array"], dup))
+    for both in sorted(set(rows) & set(refs)):
+        problems.append(
+            "%s: key %r is BOTH a bound row and a stated refusal. Binding "
+            "would then depend on lookup order." % (t["array"], both))
+
+    known = set(rows) | set(refs)
+    for k in sorted(used - known):
+        problems.append(
+            "%s:%s calls keyed(..., %r) but %s declares neither a row nor a "
+            "refusal with that key. That member would bind NOTHING and refuse "
+            "SILENTLY, which is the exact failure this table removes."
+            % (t["user_file"], "", k, t["table_file"]))
+    for k in sorted(known - used):
+        problems.append(
+            "%s declares %r but no keyed(...) call site in %s uses it. An "
+            "unreferenced entry looks converted and is not."
+            % (t["table_file"], k, t["user_file"]))
+    if not rows:
+        problems.append("%s: zero rows parsed out of %s -- the regex no "
+                        "longer matches the table, so this check silently "
+                        "passed on nothing." % (t["array"], t["table_file"]))
+
+
 def check_table(t, verbose):
     hdr = read(t["header"])
     if hdr is None:
@@ -727,6 +806,8 @@ def main():
             check_byname(t, verbose)
         elif mode == "unused":
             check_unused(t, verbose)
+        elif mode == "keymap":
+            check_keymap(t, verbose)
         else:
             problems.append(
                 "%s: unknown mode %r in TABLES." % (t["array"], mode))
