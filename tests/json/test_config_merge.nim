@@ -49,22 +49,75 @@ block:
   check("nested existing path edited in place, siblings untouched", merged,
         "{\n  \"global\": {\n    \"brainOn\": true\n  },\n  \"server\": {\n    \"port\": 1\n  }\n}\n")
 
-# --- nested document, ABSENT dotted path: REFUSED, document unchanged ------
+# --- nested document, ABSENT LEAF under an existing object: CREATED ---------
 #
-# The whole reason this module exists rather than the backend's merge: that
-# one would have produced a top-level "global.missing" member here.
+# This is the bug the whole change fixes. The client host used to REFUSE this,
+# so 23 of sain's own settings (roles.*, botLoot.*) silently failed to persist.
+# The member must land INSIDE the existing "global" object -- NOT as a flat
+# top-level "global.missing" the mod would never read (the backend's failure).
+# The finished-state assertion is a byte check AND a re-read: pathGet must find
+# exactly what was written, which is what "re-read at boot" reduces to.
 block:
   let doc = "{\n  \"global\": {\n    \"brainOn\": false\n  }\n}\n"
   var err = ""
   var merged = ""
-  checkRc("absent dotted path is REFUSED",
-          configMerge(doc, "global.missing", "true", err, merged), mgNotFound)
+  checkRc("absent leaf under an existing object is CREATED",
+          configMerge(doc, "global.missing", "true", err, merged), mgOk)
+  check("new leaf inserted inside the existing object, sibling kept", merged,
+        "{\n  \"global\": {\n    \"brainOn\": false,\n    \"missing\": true\n  }\n}\n")
+  var back = ""
+  if not pathGet(merged, "global.missing", back) or back != "true":
+    inc failures
+    echo "FAIL  the created key does not read back: got \"", back, "\""
+  else:
+    echo "ok    the created key reads back at the dotted path"
+  # The negative that a flat-insert bug would trip: there must be NO top-level
+  # member literally named "global.missing".
+  if merged.contains("\"global.missing\""):
+    inc failures
+    echo "FAIL  a flat \"global.missing\" member was created -- the old backend bug"
+  else:
+    echo "ok    no flat dotted member was created"
+
+# --- nested document, ABSENT INTERMEDIATE segment: whole chain CREATED ------
+#
+# "roles" exists, "roles.pmc" does not. The created scaffold is compact JSON;
+# the pre-existing bytes keep their own formatting. Correctness is the re-read.
+block:
+  let doc = "{\n  \"roles\": {\n    \"scav\": {\n      \"difficulty\": \"normal\"\n    }\n  }\n}\n"
+  var err = ""
+  var merged = ""
+  checkRc("absent intermediate segment: chain created",
+          configMerge(doc, "roles.pmc.difficulty", "\"hard\"", err, merged), mgOk)
+  var back = ""
+  if not pathGet(merged, "roles.pmc.difficulty", back) or back != "hard":
+    inc failures
+    echo "FAIL  created nested chain does not read back: got \"", back, "\""
+  else:
+    echo "ok    created nested chain reads back"
+  var kept = ""
+  if not pathGet(merged, "roles.scav.difficulty", kept) or kept != "normal":
+    inc failures
+    echo "FAIL  the pre-existing sibling was disturbed: got \"", kept, "\""
+  else:
+    echo "ok    the pre-existing sibling survived untouched"
+
+# --- absent path whose prefix is a SCALAR: still REFUSED -------------------
+#
+# "a" is a number; "a.b" cannot be created without overwriting it. Refusing is
+# the only safe answer, and the refusal must name the offending segment.
+block:
+  let doc = "{\n  \"a\": 1\n}\n"
+  var err = ""
+  var merged = ""
+  checkRc("dotted path through a scalar is REFUSED",
+          configMerge(doc, "a.b", "2", err, merged), mgNotFound)
   check("a refused merge produces NO document", merged, "")
-  if err.len == 0 or not err.contains("global.missing"):
+  if err.len == 0 or not err.contains("a"):
     inc failures
     echo "FAIL  the refusal must name the path; err was: ", err
   else:
-    echo "ok    the refusal names the path"
+    echo "ok    the scalar-conflict refusal names the segment"
 
 # --- flat document, absent top-level key: inserted, CRLF preserved ---------
 block:
