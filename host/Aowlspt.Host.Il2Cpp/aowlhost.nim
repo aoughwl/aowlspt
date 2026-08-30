@@ -7538,13 +7538,24 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
     var nrTail = " uxNativeRaidDrive is OFF, so STAGE 2 will not write or press."
     if gNrDrive:
       nrTail = " uxNativeRaidDrive is ALSO set: if every prerequisite passes " &
-               "it will then write RaidSettings.Side=Pmc(0) and " &
-               "RaidMode=Local(1) and call MatchmakerOperation::" &
-               "OnReadyPressed(), once, then go hands-off."
-    info "uxNativeRaid is set: on the TarkovApplication::Update drain the host " &
-         "will run a READ-ONLY probe of the native raid-entry path (its RCX is " &
-         "the TarkovApplication) and log a `nativeRaid PROBE` report. It " &
-         "detours nothing and presses no GameObject." & nrTail
+               "it will then write Side=Pmc(0) and RaidMode=Local(1) into " &
+               "MatchmakerOperation._raidSettings@0x40 (the object Ready() " &
+               "actually reads) and call MatchmakerOperation::" &
+               "OnReadyPressed(), at most once per readiness transition, then " &
+               "go hands-off."
+    # ACCURACY. This line used to say the probe was READ-ONLY and that it
+    # "presses no GameObject" -- half of which was false, and the false half
+    # killed the client on 2026-08-30 (NRE in OfflineInventoryController..ctor
+    # under get_MatchmakerOperation). State what it really does.
+    info "uxNativeRaid is set: on the TarkovApplication::Update drain (its RCX " &
+         "is the TarkovApplication) the host will probe the native raid-entry " &
+         "path and log a `nativeRaid PROBE` report. The probe DETOURS NOTHING, " &
+         "WRITES NO GAME FIELD and PRESSES NO GameObject, but it is NOT " &
+         "read-only: it CALLS get_CurrentRaidSettings (byte-verified to be a " &
+         "pure field read) and a capped Location lookup. It REQUIRES that the " &
+         "client has already built the matchmaker graph, waits for that with " &
+         "guarded reads, and REFUSES with a logged reason if it never arrives." &
+         nrTail
   # The native-UI layer. Both default OFF. `nativeUi` makes the API answer at
   # all; `nativeUiProof` additionally runs the one-shot visual self-proof.
   gNuOn = readBoolKey("nativeUi")

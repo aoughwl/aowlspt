@@ -46,12 +46,48 @@
 #
 # TWO STAGES, TWO FLAGS
 # ---------------------
-#   `uxNativeRaid`      STAGE 1, read-only. Reports the seven prerequisites as
-#                       PASS / FAIL / INCONCLUSIVE and writes nothing, calls
-#                       nothing but two getters.
+#   `uxNativeRaid`      STAGE 1, the PROBE. It is NOT read-only, and the log
+#                       must never say it is. It writes no game field and
+#                       presses no GameObject, but it CALLS into game code:
+#                       `get_CurrentRaidSettings` (byte-verified pure) and, at
+#                       most NrMaxLocTries times, a Location lookup. It reports
+#                       the prerequisites as PASS / FAIL / INCONCLUSIVE.
 #   `uxNativeRaidDrive` STAGE 2. Requires STAGE 1's verdict to be PREREQS-PASS
-#                       in the SAME session, then writes Side=Pmc(0) and
-#                       RaidMode=Local(1) and calls `OnReadyPressed()`.
+#                       in the SAME readiness generation, then writes Side=Pmc(0)
+#                       and RaidMode=Local(1) INTO
+#                       `MatchmakerOperation._raidSettings@0x40` and calls
+#                       `OnReadyPressed()`.
+#
+# BOTH STAGES ARE GATED ON READINESS AND REFUSE, LOUDLY, IF IT NEVER ARRIVES.
+# `get_MatchmakerOperation`@0x977360 is NEVER CALLED -- see the READINESS block
+# further down for the disassembly and for the crash that rule exists for.
+#
+# PURITY OF EVERY CALL THIS FILE MAKES -- classified from the DISASSEMBLY
+# (capstone over the `il2cpp` section), not from the fact that C# calls them
+# properties. Measured 2026-08-30.
+#
+#   get_CurrentRaidSettings @0x691340  PURE READ. The entire body is
+#       `48 8B 81 D8 00 00 00 C3` = `mov rax,[rcx+0xd8]; ret`, i.e.
+#       `TarkovApplication._raidSettings`. SHARED by 36 methods -- irrelevant,
+#       we call it and never patch it. SAFE AT ANY TIME. Still CALLED.
+#   get_MatchmakerOperation @0x977360  CONSTRUCTS + ALLOCATES + DISPOSES.
+#       UNIQUE. NEVER CALLED ANY MORE. See READINESS.
+#   TryGetLocation          @0x2345770 PURE LOOKUP, NO managed allocation --
+#       it makes no call to the object-new thunk 0x5D9E20 anywhere in its body;
+#       its only writes are to the caller's out-parameter. Null-guards its
+#       inputs, raises via 0x5D2530 only on paths we do not take. CALLED, capped.
+#   set_SelectedLocation    @0x6D7FF0  WRITES, NO allocation, NO dispatch. Two
+#       stores under the GC write barrier: `[this+0xa8]=value` then
+#       `[this+0x30]=value.Id@0x28`. That barrier is exactly why we call it
+#       instead of storing 0xa8 by hand. STAGE 2 ONLY.
+#   TryGetLocationById      @0x987350  ALLOCATES. At 0x987401 it calls the
+#       object-new thunk 0x5D9E20 and initialises `[rax+0x10]` -- a per-call
+#       managed allocation (a lookup closure). It also NREs on `this+0x30`.
+#       FALLBACK ONLY, gated on `this+0x30` non-null and capped at
+#       NrMaxLocTries for the whole session, so it is never per-frame.
+#   OnReadyPressed          @0xA312E0  THE COMMIT. Reads `[this+0x40]` (Side
+#       @0x20, RaidMode@0x44) and tail-calls the Ready() state machine. STAGE 2
+#       ONLY, once, behind PREREQS-PASS.
 #
 # The brief asked for one flag. This is two on purpose and it is strictly more
 # conservative: the probe has to be independently runnable and independently
@@ -148,6 +184,27 @@ const
                                  ##   set_SelectedLocation copies into LocationId
   NrLocEnabled      = 0x30'i32   ## Location.Enabled (bool)
 
+  # ---- THE READINESS ROUTE. Measured 2026-08-30 by disassembling
+  # `EFT.TarkovApplication::get_MatchmakerOperation` @0x977360 (capstone over the
+  # `il2cpp` section of GameAssembly.dll) and naming every offset it touches with
+  # `tools/fldoff.py fields EFT.TarkovApplication` / `fields
+  # EFT.MainMenuShowOperation`. See the READINESS block in the header comment.
+  NrTaSession       = 0x30'i32   ## a base-class field the CONSTRUCT path
+                                 ##   dereferences (interface dispatch) and NREs
+                                 ##   on. Metadata gives no name for it -- it is
+                                 ##   below TarkovApplication's own first field
+                                 ##   (0xb8) -- so it is only ever NULL-CHECKED,
+                                 ##   never interpreted.
+  NrTaRaidSettings  = 0xd8'i32   ## TarkovApplication._raidSettings. This IS what
+                                 ##   get_CurrentRaidSettings@0x691340 returns:
+                                 ##   its whole body is
+                                 ##   `48 8B 81 D8 00 00 00 C3`.
+  NrTaLocalMmOp     = 0x100'i32  ## TarkovApplication._localMatchmakerOperation
+  NrTaMenuOp        = 0x128'i32  ## TarkovApplication._menuOperation
+                                 ##   (EFT.MainMenuShowOperation)
+  NrMmsoMatchmaker  = 0x118'i32  ## MainMenuShowOperation
+                                 ##   .<Matchmaker>k__BackingField
+
 const
   NrSidePmc      = 0'i32
   NrRaidModeLocal = 1'i32
@@ -204,6 +261,13 @@ var gNrLoc: Il2CppPtr = nil
 var gNrLocVia = ""                 ## which route produced it, for the log
 var gNrLocTries = 0
 var gNrLocWhy = ""                 ## why the last attempt did not produce one
+## Readiness. `gNrReadyGen` counts false->true TRANSITIONS of "the matchmaker
+## graph exists"; the probe and the drive each run AT MOST ONCE per generation.
+var gNrReadySince = 0'u64
+var gNrReadyGen = 0
+var gNrProbedGen = -1
+var gNrDrivenGen = -1
+var gNrLastReadyWhy = ""           ## de-dup for the WAITING line
 
 proc nrFail(why: string) =
   gNrOff = true
@@ -249,6 +313,81 @@ proc nrReadStr(p: Il2CppPtr): string =
     if c == 0'u16 or c < 0x20'u16 or c > 0x7E'u16:
       return ""
     result.add char(c)
+
+# ---------------------------------------------------------------------------
+# READINESS. THE GATE THAT WAS MISSING, AND THE CRASH IT EXISTS FOR.
+#
+# On 2026-08-30 18:14 this feature KILLED the client 12 s after start with
+#   NullReferenceException
+#     EFT.InventoryLogic.OfflineInventoryController..ctor (IClientSession)
+#     EFT.TarkovApplication.get_MatchmakerOperation ()
+# (instrument: the client's own errors log,
+#  D:/Aowlspt/Logs/log_2026.08.30_18-14-16_1.1.0.1.46777). No `nativeRaid PROBE`
+# line was ever written, so it died inside the probe's FIRST call.
+#
+# `get_MatchmakerOperation` is NOT a getter. Disassembled (@0x977360) it is:
+#
+#   if (_menuOperation != null && _menuOperation.Matchmaker != null) {
+#       if (_localMatchmakerOperation != null) <dispose>(_localMatchmakerOperation);
+#       _localMatchmakerOperation = null;                    // + GC write barrier
+#       return _menuOperation.Matchmaker;                    // 0x977479..0x977490
+#   }
+#   if (_localMatchmakerOperation != null) return it;        // 0x977495..0x977498
+#   // 0x97749E onward -- THE CONSTRUCT PATH:
+#   //   r8 = this+0x30 ; null => raise NRE (0x5D2530)
+#   //   new OfflineHealthController / OfflineInventoryController(session...)
+#   //   new MatchmakerOperation(..., this->_raidSettings@0xd8, ...)  @0x180A2D440
+#   //   _localMatchmakerOperation = it                       // + GC write barrier
+#
+# The construct path allocates on the managed heap and NREs before the session
+# graph is up. Earlier probe-only runs fired at 0:00:43.7 -- after the session
+# existed -- so the IDENTICAL call returned a pointer and reported PASS. Safe
+# late, fatal early: which is exactly why "it passed last time" is not evidence.
+#
+# So this host NEVER CALLS IT AGAIN. `nrMatchmaker` reproduces the two
+# NON-constructing branches with plain VirtualQuery-guarded pointer reads. If
+# neither branch holds, the object does not exist yet and we WAIT -- we do not
+# ask the game to build it.
+#
+# The corroborating clue we under-weighted: probe step j) saw
+# `_raidSettings@0x40` and `_offlineRaidSettings@0x48` as the same object on one
+# run and different on another. That was the lazy graph being built at different
+# times, not noise.
+# ---------------------------------------------------------------------------
+proc nrMatchmaker(app: Il2CppPtr; why: var string): Il2CppPtr =
+  ## The MatchmakerOperation, or nil -- WITHOUT calling
+  ## `get_MatchmakerOperation`. Mirrors that method's two non-constructing
+  ## branches, in its own order, using guarded reads only. Never constructs,
+  ## never allocates, never disposes, writes nothing.
+  result = nil
+  why = ""
+  if app == nil or cIsReadable(app, 0x130'i32) == 0'i32:
+    why = "no readable TarkovApplication instance"
+    return
+  let menuOp = cNrReadPtr(app, NrTaMenuOp)
+  if menuOp != nil and cIsReadable(menuOp, 0x120'i32) != 0'i32:
+    let mm = cNrReadPtr(menuOp, NrMmsoMatchmaker)
+    if mm != nil and cIsReadable(mm, 0xb0'i32) != 0'i32:
+      why = "_menuOperation@0x128=" & nrHex(menuOp) & " .Matchmaker@0x118"
+      return mm
+  let localMm = cNrReadPtr(app, NrTaLocalMmOp)
+  if localMm != nil and cIsReadable(localMm, 0xb0'i32) != 0'i32:
+    why = "_localMatchmakerOperation@0x100 (already built by the client)"
+    return localMm
+  why = "_menuOperation@0x128=" & nrHex(menuOp) &
+        " has no .Matchmaker@0x118 yet and _localMatchmakerOperation@0x100=" &
+        nrHex(localMm) & " -- the client has not built the matchmaker graph. " &
+        "Calling get_MatchmakerOperation() here is what killed the client on " &
+        "2026-08-30: it would CONSTRUCT the graph and NRE inside " &
+        "OfflineInventoryController..ctor. WAITING instead."
+
+proc nrSessionUp(app: Il2CppPtr): bool =
+  ## The one dereference in the construct path we cannot otherwise account for.
+  ## Not sufficient for readiness on its own and never used as such -- it is
+  ## reported alongside `nrMatchmaker` so the log can distinguish "no session
+  ## yet" from "session up, matchmaker not built yet".
+  if app == nil or cIsReadable(app, 0x40'i32) == 0'i32: return false
+  cNrReadPtr(app, NrTaSession) != nil
 
 proc nrLogTargets() =
   ## State, ONCE, which targets verified and -- when one did not -- WHICH of the
@@ -393,10 +532,16 @@ proc nrProbe(): bool =
 
   var rs: Il2CppPtr = nil
   var mo: Il2CppPtr = nil
+  var moWhy = ""
+  # `get_CurrentRaidSettings`@0x691340 is byte-verified to be the WHOLE of
+  # `48 8B 81 D8 00 00 00 C3` -- `mov rax,[rcx+0xd8]; ret`. That is a pure read
+  # of `_raidSettings@0xd8` and nothing else, so calling it is provably free of
+  # side effects. `get_MatchmakerOperation` is NOT called at all any more; see
+  # the READINESS block above.
   if appOk and fnRs != nil: rs = cNrCallGetter(fnRs, app)
-  if appOk and fnMo != nil: mo = cNrCallGetter(fnMo, app)
+  if appOk: mo = nrMatchmaker(app, moWhy)
   if rs != nil and cIsReadable(rs, 0xb8'i32) == 0'i32: rs = nil
-  if mo != nil and cIsReadable(mo, 0xb0'i32) == 0'i32: mo = nil
+  let sessionUp = nrSessionUp(app)
 
   var side = 0'i32
   var mode = 0'i32
@@ -406,36 +551,44 @@ proc nrProbe(): bool =
   var modeOk = false
   var pveOk = false
   var readyOk = false
-  if rs != nil:
-    sideOk = cNrReadI32(rs, NrRsSide, addr side) != 0'i32
-    modeOk = cNrReadI32(rs, NrRsRaidMode, addr mode) != 0'i32
-    pveOk  = cNrReadU8(rs, NrRsIsPveOffline, addr pve) != 0'i32
   var loc: Il2CppPtr = nil
   var locId = ""
   var ctrl: Il2CppPtr = nil
   var moRs: Il2CppPtr = nil
   var moOffRs: Il2CppPtr = nil
-  if rs != nil:
-    loc = cNrReadPtr(rs, NrRsSelectedLoc)
-    locId = nrReadStr(cNrReadPtr(rs, NrRsLocationId))
   if mo != nil:
     ctrl = cNrReadPtr(mo, NrMoPlayersCtrl)
     moRs = cNrReadPtr(mo, NrMoRaidSettings)
     moOffRs = cNrReadPtr(mo, NrMoOfflineRs)
     readyOk = cNrReadU8(mo, NrMoReadyPressed, addr ready) != 0'i32
+  if moRs != nil and cIsReadable(moRs, 0xb8'i32) == 0'i32: moRs = nil
+
+  ## THE TARGET OBJECT. Every RaidSettings item below, and every STAGE 2 write,
+  ## is about `MatchmakerOperation._raidSettings@0x40` -- the object
+  ## `<Ready>d__40::MoveNext`@0xA32E30 actually reads (see j). We fall back to
+  ## `get_CurrentRaidSettings()` ONLY so the probe still has something to report
+  ## before the matchmaker exists; STAGE 2 refuses unless @0x40 is in hand.
+  let tgt = (if moRs != nil: moRs else: rs)
+
+  if tgt != nil:
+    sideOk = cNrReadI32(tgt, NrRsSide, addr side) != 0'i32
+    modeOk = cNrReadI32(tgt, NrRsRaidMode, addr mode) != 0'i32
+    pveOk  = cNrReadU8(tgt, NrRsIsPveOffline, addr pve) != 0'i32
+    loc = cNrReadPtr(tgt, NrRsSelectedLoc)
+    locId = nrReadStr(cNrReadPtr(tgt, NrRsLocationId))
 
   # The location route. Read the two hops first (cheap, guarded), then attempt
   # the resolve -- at most NrMaxLocTries times for the whole session, and never
   # again once it has succeeded.
   var ls: Il2CppPtr = nil
   var dict: Il2CppPtr = nil
-  if rs != nil:
-    ls = cNrReadPtr(rs, NrRsLocSettings)
+  if tgt != nil:
+    ls = cNrReadPtr(tgt, NrRsLocSettings)
     if ls != nil and cIsReadable(ls, 0x20'i32) != 0'i32:
       dict = cNrReadPtr(ls, NrLsLocations)
     elif ls != nil:
       ls = nil
-  if rs != nil: nrResolveWoods(rs, app)
+  if tgt != nil: nrResolveWoods(tgt, app)
   var woodsEnabled = -1'i32
   var woodsUnderId = ""
   if gNrLoc != nil:
@@ -456,15 +609,19 @@ proc nrProbe(): bool =
   let sig = nrHex(app) & "|" & nrHex(rs) & "|" & nrHex(mo) & "|" & sideTxt &
             "|" & modeTxt & "|" & nrHex(loc) & "|" & locId & "|" &
             nrHex(ctrl) & "|" & readyTxt & "|" & nrHex(ls) & "|" &
-            nrHex(dict) & "|" & nrHex(gNrLoc) & "|" & gNrLocWhy
+            nrHex(dict) & "|" & nrHex(gNrLoc) & "|" & gNrLocWhy & "|" &
+            (if sessionUp: "S1" else: "S0")
   let now = cNowMs()
   let quiet = sig == gNrLastSig and now - gNrLastReportMs < NrReportMs
 
   let fnSet = cNrFn(NrTSetSelectedLoc)
-  let prereq = appOk and fnRs != nil and fnMo != nil and rs != nil and
-               mo != nil and ctrl != nil and useLoc != nil and
+  ## PREREQS. `moRs != nil` is now REQUIRED, not `rs != nil`: STAGE 2 writes the
+  ## object Ready() reads or it writes nothing at all.
+  let prereq = appOk and fnRs != nil and mo != nil and moRs != nil and
+               ctrl != nil and useLoc != nil and
                (loc != nil or fnSet != nil) and sideOk and modeOk
   result = prereq
+  discard fnMo  ## verified for the record only; this host never CALLS it.
 
   if quiet or gNrReports >= NrMaxReports:
     return
@@ -472,8 +629,20 @@ proc nrProbe(): bool =
   gNrLastReportMs = now
   inc gNrReports
 
-  info "nativeRaid PROBE #" & $gNrReports & " BEGIN (read-only; nothing was " &
-       "written and nothing was pressed)"
+  # ACCURACY. The old banner said "read-only; nothing was written and nothing
+  # was pressed" and called the probe READ-ONLY. That was FALSE and it is the
+  # exact class of confidently-wrong message CLAUDE.md sections 6 and 10 name.
+  # The probe writes no game field and presses no GameObject, but it DOES call
+  # into game code, and one of those calls used to construct an object graph and
+  # killed the client. Say what it really does and what it really requires.
+  info "nativeRaid PROBE #" & $gNrReports & " BEGIN. This probe WRITES NO GAME " &
+       "FIELD and PRESSES NO GameObject, but it is NOT read-only: it CALLS " &
+       "get_CurrentRaidSettings@0x691340 (byte-verified to be the whole of " &
+       "`mov rax,[rcx+0xd8]; ret`, so a pure field read) and, at most " &
+       $int(NrMaxLocTries) & " times per session, a Location LOOKUP. It " &
+       "REQUIRES that the matchmaker graph ALREADY EXISTS -- it reads the " &
+       "MatchmakerOperation out of the object graph and never calls " &
+       "get_MatchmakerOperation@0x977360, which CONSTRUCTS it and NREs early."
 
   var s = ""
   # a) the instance
@@ -486,17 +655,25 @@ proc nrProbe(): bool =
     s = "FAIL -- the drain's RCX " & nrHex(app) & " is not readable"
   info "nativeRaid PROBE a) TarkovApplication instance: " & s
 
-  # b) get_MatchmakerOperation
-  if fnMo == nil:
-    s = "INCONCLUSIVE -- the target did not verify: " &
-        $cNrWhyText(cNrWhyOf(NrTGetMatchmakerOp))
-  elif not appOk:
-    s = "INCONCLUSIVE -- no usable TarkovApplication to call it on"
-  elif mo == nil:
-    s = "FAIL -- returned null or an unreadable pointer"
+  # a2) the session field the construct path NREs on
+  if not appOk:
+    s = "INCONCLUSIVE -- no usable TarkovApplication"
+  elif sessionUp:
+    s = "PASS non-null (the field get_MatchmakerOperation's CONSTRUCT path " &
+        "dereferences; reported for diagnosis only, never as readiness)"
   else:
-    s = "PASS ptr=" & nrHex(mo)
-  info "nativeRaid PROBE b) get_MatchmakerOperation() -> MatchmakerOperation: " & s
+    s = "null -- the session graph is not up"
+  info "nativeRaid PROBE a2) TarkovApplication+0x30 session: " & s
+
+  # b) the MatchmakerOperation, obtained WITHOUT calling the constructing getter
+  if not appOk:
+    s = "INCONCLUSIVE -- no usable TarkovApplication to read from"
+  elif mo == nil:
+    s = "NOT-READY -- " & moWhy
+  else:
+    s = "PASS ptr=" & nrHex(mo) & " read from " & moWhy
+  info "nativeRaid PROBE b) MatchmakerOperation (READ from the object graph; " &
+       "get_MatchmakerOperation@0x977360 is NEVER called -- it CONSTRUCTS): " & s
 
   # c) get_CurrentRaidSettings
   if fnRs == nil:
@@ -504,7 +681,7 @@ proc nrProbe(): bool =
         $cNrWhyText(cNrWhyOf(NrTGetRaidSettings))
   elif not appOk:
     s = "INCONCLUSIVE -- no usable TarkovApplication to call it on"
-  elif rs == nil:
+  elif tgt == nil:
     s = "FAIL -- returned null or an unreadable pointer"
   else:
     s = "PASS ptr=" & nrHex(rs) &
@@ -512,7 +689,7 @@ proc nrProbe(): bool =
   info "nativeRaid PROBE c) get_CurrentRaidSettings() -> RaidSettings: " & s
 
   # d) Side
-  if rs == nil:
+  if tgt == nil:
     s = "INCONCLUSIVE -- no RaidSettings"
   elif not sideOk:
     s = "INCONCLUSIVE -- the slot is not readable"
@@ -524,7 +701,7 @@ proc nrProbe(): bool =
   info "nativeRaid PROBE d) RaidSettings+0x20 Side: " & s
 
   # e) RaidMode -- THE OFFLINE GATE
-  if rs == nil:
+  if tgt == nil:
     s = "INCONCLUSIVE -- no RaidSettings"
   elif not modeOk:
     s = "INCONCLUSIVE -- the slot is not readable"
@@ -537,7 +714,7 @@ proc nrProbe(): bool =
   info "nativeRaid PROBE e) RaidSettings+0x44 RaidMode: " & s
 
   # f) _selectedLocation
-  if rs == nil:
+  if tgt == nil:
     s = "INCONCLUSIVE -- no RaidSettings"
   elif loc == nil:
     s = "null -- no map is selected by the UI. This host will NOT construct a " &
@@ -548,7 +725,7 @@ proc nrProbe(): bool =
   info "nativeRaid PROBE f) RaidSettings+0xa8 _selectedLocation: " & s
 
   # f2) LocationId, the human-readable half of f)
-  if rs == nil:
+  if tgt == nil:
     s = "INCONCLUSIVE -- no RaidSettings"
   elif locId.len == 0:
     s = "INCONCLUSIVE -- null, empty, or not a plain ASCII System.String there"
@@ -558,7 +735,7 @@ proc nrProbe(): bool =
 
   # ---- the location route (k..n) -------------------------------------------
   # k) the registry the client built from /client/locations
-  if rs == nil:
+  if tgt == nil:
     s = "INCONCLUSIVE -- no RaidSettings"
   elif ls == nil:
     s = "FAIL null or unreadable -- the RaidSettings was constructed without " &
@@ -596,7 +773,7 @@ proc nrProbe(): bool =
         " -- VERIFIED by reading the Location's OWN Id@0x28 back as \"" &
         NrWoodsId & "\" (_Id@0x20=\"" & woodsUnderId & "\", Enabled@0x30=" &
         $woodsEnabled & ")"
-  elif rs == nil:
+  elif tgt == nil:
     s = "INCONCLUSIVE -- no RaidSettings to look it up from"
   elif gNrLocTries == 0:
     s = "INCONCLUSIVE -- not attempted yet"
@@ -648,16 +825,29 @@ proc nrProbe(): bool =
     s = "PASS value=" & $ready
   info "nativeRaid PROBE i) MatchmakerOperation+0x60 _readyPressed: " & s
 
-  if rs != nil and moRs == rs:
-    s = "the operation uses THE SAME RaidSettings object"
-  elif rs != nil and moOffRs == rs:
-    s = "CurrentRaidSettings IS the operation's OFFLINE RaidSettings"
+  # j) SETTLED 2026-08-30 by disassembling
+  # `EFT.MatchmakerOperation::<Ready>d__40::MoveNext` @0xA32E30: the state
+  # machine reads its `<>4__this` at +0x40 (`_raidSettings`) in eleven places --
+  # `Side@0x20` at 0xA33336/0xA3361B/0xA33671, `RaidMode@0x44` at
+  # 0xA33378/0xA33566/0xA335A3/0xA336D9 (and WRITES 1 there at 0xA336B1), and
+  # `_selectedLocation@0xa8` at 0xA3333D/0xA3362D/0xA3366A. `+0x48`
+  # (`_offlineRaidSettings`) is touched only at 0xA336E8/0xA33704, inside the
+  # RaidMode==Online branch. `OnReadyPressed`@0xA312E0 likewise gates on
+  # `[this+0x40]+0x20` and `[this+0x40]+0x44` (0xA31377..0xA31398).
+  # So the object that matters is `MatchmakerOperation._raidSettings@0x40`, and
+  # that -- NOT `get_CurrentRaidSettings()` -- is what STAGE 2 targets.
+  if moRs == nil:
+    s = "STAGE 2 would REFUSE: there is no object for Ready() to read"
+  elif rs != nil and moRs == rs:
+    s = "they are THE SAME object here, so the distinction does not bite " &
+        "this run -- STAGE 2 still targets @0x40 explicitly"
   else:
-    s = "they are DIFFERENT objects; a write to CurrentRaidSettings may not " &
-        "be the one Ready() reads"
-  info "nativeRaid PROBE j) MatchmakerOperation._raidSettings@0x40=" &
-       nrHex(moRs) & " _offlineRaidSettings@0x48=" & nrHex(moOffRs) &
-       " vs CurrentRaidSettings=" & nrHex(rs) & " -- " & s
+    s = "they are DIFFERENT objects. STAGE 2 writes @0x40, the one Ready() " &
+        "reads, and never CurrentRaidSettings"
+  info "nativeRaid PROBE j) Ready() consumes MatchmakerOperation." &
+       "_raidSettings@0x40=" & nrHex(moRs) & " (_offlineRaidSettings@0x48=" &
+       nrHex(moOffRs) & " is only read in the RaidMode==Online branch; " &
+       "TarkovApplication CurrentRaidSettings=" & nrHex(rs) & ") -- " & s
 
   if prereq:
     s = "PREREQS-PASS -- every prerequisite for a native READY is satisfied"
@@ -690,20 +880,29 @@ proc nrDrive() =
   if app == nil or cIsReadable(app, 0x100'i32) == 0'i32:
     nrFail("STAGE 2: the TarkovApplication instance stopped being readable")
     return
-  let fnRs = cNrFn(NrTGetRaidSettings)
-  let fnMo = cNrFn(NrTGetMatchmakerOp)
   let fnRp = cNrFn(NrTOnReadyPressed)
-  if fnRs == nil or fnMo == nil or fnRp == nil:
+  if fnRp == nil:
     nrFail("STAGE 2: a target that verified during the probe no longer " &
            "verifies (OnReadyPressed: " & $cNrWhyText(cNrWhyOf(NrTOnReadyPressed)) &
            ")")
     return
-  let rs = cNrCallGetter(fnRs, app)
-  let mo = cNrCallGetter(fnMo, app)
-  if rs == nil or cIsReadable(rs, 0xb8'i32) == 0'i32 or
-     mo == nil or cIsReadable(mo, 0xb0'i32) == 0'i32:
-    nrFail("STAGE 2: RaidSettings or MatchmakerOperation went null between " &
-           "the probe and the drive")
+  ## Re-establish READINESS at the moment of writing -- by READING the graph,
+  ## never by calling `get_MatchmakerOperation`, which constructs.
+  var moWhy = ""
+  let mo = nrMatchmaker(app, moWhy)
+  if mo == nil:
+    nrFail("STAGE 2: the matchmaker graph is no longer readable (" & moWhy & ")")
+    return
+  ## THE OBJECT `Ready()` READS. Settled by disassembling
+  ## `<Ready>d__40::MoveNext`@0xA32E30: it reads `<>4__this+0x40`
+  ## (`_raidSettings`) for Side@0x20, RaidMode@0x44 and _selectedLocation@0xa8,
+  ## and `OnReadyPressed`@0xA312E0 gates on the same object. So STAGE 2 writes
+  ## THAT, not `get_CurrentRaidSettings()` -- the two can be different objects.
+  let rs = cNrReadPtr(mo, NrMoRaidSettings)
+  if rs == nil or cIsReadable(rs, 0xb8'i32) == 0'i32:
+    nrFail("STAGE 2: MatchmakerOperation._raidSettings@0x40 is null or " &
+           "unreadable. That is the ONLY object Ready() reads; this host does " &
+           "not write hopefully into CurrentRaidSettings and press anyway")
     return
   # RE-CHECK the prerequisites at the moment of writing, not only at the moment
   # of deciding. A check that ran a second ago is not a check.
@@ -797,8 +996,38 @@ proc nrTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_nr_tick_body", cdecl.}
   nrLogTargets()
   let now = cNowMs()
 
+  # ---- THE READINESS GATE. Nothing below this touches the game until the
+  # matchmaker graph EXISTS, established by guarded reads only. Before it does,
+  # the tick is integer compares plus two pointer reads and makes NO call.
+  var readyWhy = ""
+  let mmNow = nrMatchmaker(gNrApp, readyWhy)
+  if mmNow == nil:
+    # Not ready. Say so -- once, and again only when the reason CHANGES -- and
+    # never call anyway.
+    if readyWhy != gNrLastReadyWhy:
+      gNrLastReadyWhy = readyWhy
+      info "nativeRaid WAITING for readiness (nothing called, nothing " &
+           "written): " & readyWhy
+    if now - gNrT0 > NrProbeWindowMs:
+      nrFail("readiness was never established within " &
+             $int(NrProbeWindowMs div 1000'u64) & " s: " & readyWhy &
+             ". REFUSING -- this host does not call " &
+             "get_MatchmakerOperation@0x977360 to force the graph into " &
+             "existence, because doing so NREs inside " &
+             "OfflineInventoryController..ctor and kills the client")
+    gNrReadySince = 0'u64
+    return
+  if gNrReadySince == 0'u64:
+    # A false -> true readiness TRANSITION. One generation, one probe, one drive.
+    gNrReadySince = now
+    inc gNrReadyGen
+    okLog "nativeRaid READY (generation " & $gNrReadyGen & "): " & readyWhy &
+          " -- the matchmaker graph already exists, so no call of ours can " &
+          "construct it. Probing at most once for this generation."
+
   if gNrStep == NrWait or gNrStep == NrProbe:
     gNrStep = NrProbe
+    gNrProbedGen = gNrReadyGen
     let ready = nrProbe()
     if ready:
       if not gNrDrive:
@@ -821,6 +1050,21 @@ proc nrTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_nr_tick_body", cdecl.}
 
   if gNrStep == NrArmed:
     if now - gNrArmedMs < NrDriveSettleMs: return
+    # AT MOST ONCE PER READINESS TRANSITION. If readiness dropped and came back
+    # while armed, this generation has not been probed, so disarm rather than
+    # drive on a stale verdict.
+    if gNrProbedGen != gNrReadyGen:
+      gNrStep = NrProbe
+      warn "nativeRaid: readiness changed between arming and driving " &
+           "(probed generation " & $gNrProbedGen & ", current " & $gNrReadyGen &
+           ") -- DISARMING and re-probing rather than driving on a stale verdict"
+      return
+    if gNrDrivenGen == gNrReadyGen:
+      gNrStep = NrIdle
+      warn "nativeRaid: STAGE 2 has already run once for readiness generation " &
+           $gNrReadyGen & " -- refusing to run it again"
+      return
+    gNrDrivenGen = gNrReadyGen
     nrDrive()
     return
 
