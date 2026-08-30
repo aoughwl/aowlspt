@@ -514,23 +514,89 @@ proc lastMemberIndent(text: string; closeBrace: int): string =
   if result.len == 0:
     result = "  "
 
+proc insertMember(text: string; objStart, objEnd: int; member: string): string =
+  ## `text` with `member` (a `"key": value` fragment -- no surrounding braces,
+  ## no trailing comma) spliced into the JSON object occupying
+  ## `text[objStart ..< objEnd]`. Every other byte of the document is the bytes
+  ## that were already there. `objEnd` is one past the object's closing `}`.
+  ##
+  ## Generalises the top-level insertion that used to be inlined below: the only
+  ## added freedom is WHICH object receives the member, which is what creating a
+  ## nested path needs -- the member lands in the deepest existing object of the
+  ## path, not always the document root.
+  let eol = dominantEol(text)
+  var closeBrace = objEnd - 1
+  while closeBrace > objStart and text[closeBrace] != '}':
+    dec closeBrace
+  var k = closeBrace - 1
+  while k > objStart and (text[k] == ' ' or text[k] == '\t' or
+                          text[k] == '\r' or text[k] == '\n'):
+    dec k
+  if text[k] == '{':
+    # Empty object: there is no sibling line to align with, so the member sits
+    # one level in from the object's OWN opening-brace line. `lastMemberIndent`
+    # is wrong here -- its "no indent found" fallback is `"  "`, which for a
+    # root `{}` would double to four spaces (this exact regression). Read the
+    # brace line's leading whitespace directly instead, no fallback.
+    var lineStart = k
+    while lineStart > 0 and text[lineStart - 1] != '\n':
+      dec lineStart
+    var objIndent = ""
+    var p = lineStart
+    while p < text.len and (text[p] == ' ' or text[p] == '\t'):
+      objIndent.add text[p]
+      inc p
+    result = text.substr(0, k) & eol & objIndent & "  " & member & eol &
+             text.substr(closeBrace)
+  else:
+    let indent = lastMemberIndent(text, closeBrace)
+    result = text.substr(0, k) & "," & eol & indent & member &
+             text.substr(k + 1)
+
+proc nestedMember(segs: seq[string]; firstIdx: int; valueJson: string): string =
+  ## The `"key": value` member for `segs[firstIdx]`, where every segment AFTER
+  ## `firstIdx` is CREATED as a nested object, the innermost holding
+  ## `valueJson`. `@["roles","pmc","difficulty"]` from index 1 becomes
+  ## `"pmc": {"difficulty": <valueJson>}`.
+  ##
+  ## Created objects are single-line on purpose: they are valid JSON, they
+  ## re-read byte-for-byte the same, and keeping them compact sidesteps guessing
+  ## at the indentation of a level that did not exist a moment ago. The bytes
+  ## that WERE on disk keep their own formatting untouched -- only the freshly
+  ## created scaffold is compact.
+  result = "\"" & jsonEscapeKey(segs[firstIdx]) & "\": "
+  if firstIdx >= segs.high:
+    result.add valueJson
+  else:
+    result.add "{" & nestedMember(segs, firstIdx + 1, valueJson) & "}"
+
 proc configMerge*(text, key, valueJson: string; err: var string;
                   merged: var string): MergeResult =
   ## `text` with `key` set to `valueJson`, or a refusal that says why.
   ##
-  ## The reason this is not the backend's `mergeConfigKey`: that one INSERTS a
-  ## member for any key it cannot locate, including a DOTTED one.
-  ## `mods/sain/config.json` is nested (`global`/`roles`/`server`), so an edit
-  ## to `global.brainOn` that missed would create a literal top-level member
-  ## named `"global.brainOn"` -- a key the mod never reads, sitting beside the
-  ## real one, and a POST that answers `Ok` for a value that can never take
-  ## effect. That is exactly the "renders but changes nothing" failure this
-  ## write path exists to stop, so a dotted path that is not already in the
-  ## document is REFUSED, by status, and named in `err`.
+  ## An ABSENT dotted key is now CREATED, not refused -- but structurally, never
+  ## as the flat member the backend's `mergeConfigKey` would leave behind. The
+  ## old failure this guards against: `mods/sain/config.json` is nested
+  ## (`global`/`roles`/`server`), and a naive insert of `roles.pmc.difficulty`
+  ## produced a literal top-level member named `"roles.pmc.difficulty"` -- a key
+  ## the mod never reads, sitting beside the real tree, so a POST answered `Ok`
+  ## for a value that could never take effect ("renders but changes nothing").
+  ## The client host went the other way and REFUSED every absent dotted key, so
+  ## 23 of sain's own declared settings (`roles.*`, `botLoot.*`) could be edited
+  ## in the F12 panel and would silently fail to persist across a restart --
+  ## measured against the deployed `mods/sain/config.json`.
   ##
-  ## A single-segment key is still inserted when absent: a declared setting the
-  ## shipped `config.json` does not list yet is ordinary, and the top level is
-  ## the one place a member can be added without guessing at structure.
+  ## The fix: walk to the DEEPEST existing object along the path and insert the
+  ## remaining segments there as real nested objects, so `roles.pmc.difficulty`
+  ## on a config that has `roles` but not `roles.pmc` yields
+  ## `"roles": { ..., "pmc": {"difficulty": <value>} }` -- a member the mod DOES
+  ## read, and one `locatePath`/`pathGet` find again at boot. A single-segment
+  ## absent key is inserted at the top level exactly as before.
+  ##
+  ## Two things are still refused, because creating them would corrupt data: a
+  ## document whose root is not a JSON object, and a path whose existing prefix
+  ## resolves to a SCALAR (e.g. `a.b` where `a` is a number) -- descending into
+  ## that would mean overwriting a value the user did not ask to change.
   merged = ""
   err = ""
   if key.len == 0:
@@ -560,30 +626,41 @@ proc configMerge*(text, key, valueJson: string; err: var string;
       dec vEnd
     merged = text.substr(0, vs - 1) & valueJson & text.substr(vEnd)
     return mgOk
-  if contains(key, "."):
-    err = "no such key: " & key &
-          " -- this config is nested and that path is not in it. Refusing to " &
-          "create a flat member of that name: the mod would never read it, " &
-          "and the edit would report success while changing nothing."
-    return mgNotFound
   let trimmed = strip(text)
   if trimmed.len < 2 or trimmed[0] != '{' or trimmed[trimmed.len - 1] != '}':
     err = "config is not a JSON object; refusing to insert " & key
     return mgNotObject
-  let member = "\"" & jsonEscapeKey(key) & "\": " & valueJson
-  var closeBrace = text.len - 1
-  while closeBrace > 0 and text[closeBrace] != '}':
-    dec closeBrace
-  var k = closeBrace - 1
-  while k > 0 and (text[k] == ' ' or text[k] == '\t' or text[k] == '\r' or
-                   text[k] == '\n'):
-    dec k
-  let eol = dominantEol(text)
-  if text[k] == '{':
-    merged = text.substr(0, k) & eol & "  " & member & eol &
-             text.substr(closeBrace)
-  else:
-    let indent = lastMemberIndent(text, closeBrace)
-    merged = text.substr(0, k) & "," & eol & indent & member &
-             text.substr(k + 1)
+  if not contains(key, "."):
+    # Single-segment absent key: insert at the top level, exactly as before.
+    let member = "\"" & jsonEscapeKey(key) & "\": " & valueJson
+    merged = insertMember(text, 0, text.len, member)
+    return mgOk
+  # Absent dotted key: create the nested path. Walk to the deepest existing
+  # object-valued prefix, then splice the remaining segments in as real nested
+  # objects. `locatePath` failed above, so at least the leaf is missing.
+  let segs = key.split('.')
+  for s in segs:
+    if s.len == 0:
+      err = "malformed key: " & key & " -- an empty path segment"
+      return mgBadArg
+  var objStart = 0
+  var objEnd = text.len
+  var depth = 0
+  while depth < segs.high:
+    var mvs = 0
+    var mve = 0
+    if not memberOf(text, objStart, segs[depth], mvs, mve):
+      break                     # segment absent -- create from here down
+    var j = mvs
+    skipWs(text, j)
+    if j >= mve or text[j] != '{':
+      err = "no such key: " & key & " -- the path segment \"" & segs[depth] &
+            "\" already exists and is not an object, so a nested member cannot " &
+            "be created under it without overwriting a value."
+      return mgNotFound
+    objStart = mvs
+    objEnd = mve
+    inc depth
+  merged = insertMember(text, objStart, objEnd,
+                        nestedMember(segs, depth, valueJson))
   result = mgOk
