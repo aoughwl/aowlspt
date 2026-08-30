@@ -1267,6 +1267,40 @@ const
     ## a case-insensitive search for this name.
   ProCamFieldOfView = "40 53 48 83 EC 20 48 8B 05 63 4D E7 01 48 8B D9"
 
+  RvaCamSetFieldOfView = 0x525dd30
+    ## `UnityEngine.Camera::set_fieldOfView(float)`. rid=427, arity 1,
+    ## INSTANCE, image UnityEngine.CoreModule.dll, section `il2cpp`,
+    ## sharedness=UNIQUE (owners=1), NOT the 0x628110 empty-body stub.
+    ##
+    ## WHY THIS EXISTS AT ALL, and it is the fix for "the FOV stuff doesn't
+    ## appear to do anything". MEASURED, by disassembling
+    ## `CameraManager::SetFov(float,float,bool)` @0x1268D20 off the installed
+    ## GameAssembly.dll:
+    ##
+    ##     181268D9D  mov rdi, [rbx+0x70]      ; CameraManager.<Camera>
+    ##     181268E06  test rdi, rdi
+    ##     181268E09  je   0x181268F6C         ; <- THE EPILOGUE
+    ##     181268E24  cmp qword [rdi+0x10], 0  ; Unity m_CachedPtr
+    ##     181268E29  je   0x181268F6C         ; <- THE EPILOGUE
+    ##
+    ## So `SetFov` reads the SAME `<Camera>k__BackingField` @0x70 that was
+    ## MEASURED NULL in-raid on this build (fact #260), and when it is null it
+    ## RETURNS WITHOUT DOING ANYTHING. Everything after those two branches --
+    ## the `ApplyDovFovOnCamera` store @0xa0, the coroutine object that carries
+    ## `x` @0x20 and `time` @0x30, `StartCoroutine`, `_fovCoroutine` @0x100 --
+    ## is unreachable.
+    ##
+    ## The earlier fix swapped the camera we READ from `@0x70` to
+    ## `Camera::get_main`. It did not change where the write GOES, so the write
+    ## still went to a method that returns immediately. The call succeeded,
+    ## `gFovWrites` counted up, and the rendered FOV never moved: a check that
+    ## cannot fail (CLAUDE.md 9b). Writing the camera we actually hold is the
+    ## only route that does not depend on the null offset.
+    ##
+    ## Bytes below from `il2cpp_resolve.py ... bytes 0x525dd30 16` against
+    ## D:/Games/Tarkov/GameAssembly.dll.
+  ProCamSetFieldOfView = "40 53 48 83 EC 30 48 8B 05 1B 4D E7 01 48 8B D9"
+
 # ---------------------------------------------------------------------------
 # The three effects that used to be reached BY NAME (fatal on the client), now
 # expressed as host patch-by-RVA specs.
@@ -1863,6 +1897,10 @@ var bSetFov: Binding           ## CameraManager::SetFov(f,f,b), static RVA
 var bGetKey: Binding           ## Input::GetKey(KeyCode), static RVA
 var bGetKeyDown: Binding       ## Input::GetKeyDown(KeyCode), static RVA
 var bCamFov: Binding           ## UnityEngine.Camera::get_fieldOfView, static RVA
+var bCamSetFov: Binding        ## UnityEngine.Camera::set_fieldOfView, static RVA
+  ## THE WRITE THAT ACTUALLY LANDS. `bSetFov` (CameraManager::SetFov) reads
+  ## `<Camera>@0x70` and returns immediately when it is null, which it
+  ## MEASURED is on this build -- see `RvaCamSetFieldOfView`.
 var bCurrentScope: Binding     ## ProceduralWeaponAnimation::get_CurrentScope, static RVA
 var bIsOptic: Binding          ## SightNBone::get_IsOptic, static RVA
   ## `bWorld` is GONE. There is no `EFT.GameWorld::get_Instance` on this
@@ -1926,6 +1964,18 @@ var gCamWhy = "not attempted"  ## the LAST concrete reason there was no camera
 var gCamLiveSaid = false
 var gLastMult = -1.0
 var gAimSourceState = "not attempted"
+var gWriteRoute = "not attempted"
+  ## Which of the two writes actually ran: `Camera::set_fieldOfView` (lands)
+  ## or `CameraManager::SetFov` (MEASURED inert while <Camera>@0x70 is null).
+var gWriteVerdict = "INCONCLUSIVE -- no write has been read back yet"
+  ## THE FINISHED-STATE CHECK (CLAUDE.md 9b), not a self-comparison. After a
+  ## write, `get_fieldOfView` is read back off the SAME camera and compared to
+  ## the target. It can genuinely fail: that is exactly what the shipped
+  ## `SetFov` path does, every frame, while counting itself a success.
+var gWriteTook = 0
+var gWriteMissed = 0
+var gLastTarget = 0.0
+var gHeldVerdict = "INCONCLUSIVE -- no second sample yet"
 
 const
   FovIntervalNs = 4_000_000'i64
@@ -1968,6 +2018,13 @@ proc setFovKinds3(): seq[FastKind] =
   result.add fkF32
   result.add fkF32
   result.add fkBool
+
+proc setFieldOfViewKinds(): seq[FastKind] =
+  ## `void set_fieldOfView(float value)` -- one float, XMM0 after `this`.
+  ## From the offline signature (`il2cpp_resolve.py type 22882`, rid=427),
+  ## not from `classifyType`.
+  result = @[]
+  result.add fkF32
 
 proc bindFovStatics(): bool =
   ## EVERY member the frame path calls, bound HERE, once, at a byte-verified
@@ -2090,6 +2147,23 @@ proc bindFovStatics(): bool =
     warn "FOV: " & gFovState
     return false
   info "FOV: " & bCamFov.why
+
+  # THE WRITE ITSELF. Non-fatal on its own -- if it refuses we fall back to
+  # CameraManager::SetFov, which is what shipped, and which is MEASURED inert
+  # whenever CameraManager.<Camera>@0x70 is null. That fallback is therefore
+  # reported as a DEGRADED path, never as success.
+  bc "S3b2 about to prologue-verify Camera::set_fieldOfView"
+  bCamSetFov = bindAtRva("UnityEngine.Camera::set_fieldOfView",
+                         RvaCamSetFieldOfView, ProCamSetFieldOfView,
+                         setFieldOfViewKinds(), fkVoid, false)
+  if bCamSetFov.ok:
+    info "FOV: " & bCamSetFov.why
+  else:
+    warn "FOV: Camera::set_fieldOfView refused (" & bCamSetFov.why &
+         ") -- falling back to CameraManager::SetFov @0x" & hexs(RvaSetFov3) &
+         ", which is MEASURED to return without writing anything whenever " &
+         "CameraManager.<Camera>@0x70 is null (it is, on this build). " &
+         "Expect the FOV to visibly do NOTHING on that path."
 
   bc "S3c about to prologue-verify get_CurrentScope / get_IsOptic"
   bCurrentScope = bindAtRva(
@@ -2491,16 +2565,84 @@ proc applyFov() =
   gLastMult = mult
 
   let target = gBaseFov * mult
-  a.reset()
-  addFloat(a, target)
-  if gSetFovArgc == 3:
-    addFloat(a, 0.0)     # lerp time: upstream sets the value outright
-    addBool(a, true)
-  # SUSPECT (a), the other half.
-  if firstPass: bc "C1 about to CALL CameraManager::SetFov @0x1268d20"
-  callVoid(bSetFov, cm, a)
-  if firstPass: bc "C2 SetFov returned without faulting"
+  let sampling = gFovWrites <= 4 or (gFovWrites and 511) == 0
+  # ---- DID THE PREVIOUS WRITE SURVIVE THE FRAME?
+  #
+  # Reading back immediately after a write only proves the setter stored
+  # something. It does NOT prove the game is not recomputing the field later
+  # in the same frame (the WalkEffector shape, fact #37) -- and a value the
+  # game recomputes every frame is a no-op the player sees as "does nothing".
+  # So the value is ALSO read at the top of a later tick, before this one
+  # writes, and a drift there is reported as CLOBBERED rather than hidden.
+  if sampling and bCamFov.ok and gLastTarget > 0.0:
+    a.reset()
+    let pre = callFloat(bCamFov, cam, a)
+    let pd = (if pre > gLastTarget: pre - gLastTarget else: gLastTarget - pre)
+    if pd > 0.5 and gLastTarget == target:
+      gHeldVerdict = "CLOBBERED -- last tick wrote " & $gLastTarget &
+                     ", this tick found " & $pre & " before writing. The " &
+                     "game recomputes the field between frames; a one-shot " &
+                     "write cannot win and the per-frame write is what holds it."
+    elif gLastTarget == target:
+      gHeldVerdict = "HELD -- " & $pre & " still standing from the previous " &
+                     "write of " & $gLastTarget
+  gLastTarget = target
+  # ---- THE WRITE.
+  #
+  # PRIMARY: `UnityEngine.Camera::set_fieldOfView` on the camera we are
+  # HOLDING -- the one `Camera::get_main` returned and that we captured the
+  # base FOV from. This is the value the renderer uses.
+  #
+  # FALLBACK: `CameraManager::SetFov`. Kept only so a refused prologue verify
+  # still does the thing that shipped, and reported as DEGRADED, because its
+  # disassembly (quoted at `RvaCamSetFieldOfView`) shows it branches straight
+  # to its epilogue when `CameraManager.<Camera>@0x70` is null -- which it is,
+  # measured, on this build. Calling it is not writing.
+  if bCamSetFov.ok:
+    a.reset()
+    addFloat(a, target)
+    if firstPass: bc "C1 about to CALL Camera::set_fieldOfView @0x525dd30"
+    callVoid(bCamSetFov, cam, a)
+    if firstPass: bc "C2 set_fieldOfView returned without faulting"
+    gWriteRoute = "Camera::set_fieldOfView @0x" & hexs(RvaCamSetFieldOfView) &
+                  " on the Camera::get_main camera"
+  else:
+    a.reset()
+    addFloat(a, target)
+    if gSetFovArgc == 3:
+      addFloat(a, 0.0)   # lerp time: upstream sets the value outright
+      addBool(a, true)
+    if firstPass: bc "C1 about to CALL CameraManager::SetFov @0x1268d20"
+    callVoid(bSetFov, cm, a)
+    if firstPass: bc "C2 SetFov returned without faulting"
+    gWriteRoute = "DEGRADED: CameraManager::SetFov @0x" & hexs(RvaSetFov3) &
+                  " (set_fieldOfView refused) -- inert while <Camera>@0x70 " &
+                  "is null"
   gFovWrites = gFovWrites + 1
+
+  # ---- DID IT TAKE? Read the finished state back off the same camera.
+  #
+  # A negative, falsifiable check: if the rendered FOV is not within half a
+  # degree of what was asked for, the write did NOT take, and that is said in
+  # the roll-call instead of a write count that only proves a call returned.
+  # Sampled for the first few writes and then every 512th, so it is not a
+  # per-frame call.
+  if sampling and bCamFov.ok:
+    a.reset()
+    let back = callFloat(bCamFov, cam, a)
+    let d = (if back > target: back - target else: target - back)
+    if d <= 0.5:
+      gWriteTook = gWriteTook + 1
+      gWriteVerdict = "PASS -- read back " & $back & " after asking for " &
+                      $target & " (base " & $gBaseFov & " x " & $mult &
+                      "), via " & gWriteRoute
+    else:
+      gWriteMissed = gWriteMissed + 1
+      gWriteVerdict = "FAIL -- asked for " & $target & ", the camera still " &
+                      "reads " & $back & ". The call returned and wrote " &
+                      "NOTHING. Route: " & gWriteRoute
+    if gWriteTook + gWriteMissed == 1:
+      info "FOV: write verdict: " & gWriteVerdict
   if measuring:
     gFovNs = gFovNs + nanosBetween(now, perfCounter())
     gFovSamples = gFovSamples + 1
@@ -3214,6 +3356,12 @@ proc reportWatch() =
   of ccUnknown:
     info "    camera: never asked for (the per-frame path never ran)"
   info "    aiming input: " & gAimSourceState
+  info "    write route: " & gWriteRoute
+  info "    DID IT TAKE (read back off the camera, not a self-comparison): " &
+       gWriteVerdict & "  [took " & $gWriteTook & ", missed " & $gWriteMissed &
+       "]"
+  info "    DID IT HOLD (sampled a tick later, before the next write): " &
+       gHeldVerdict
   reportEffect("per-frame FOV write", gFovState, gFovWrites)
   info "    driven by " & gDriverState
   if gDriverIsEveryMain:
@@ -3579,6 +3727,8 @@ proc simSelfTest(): Status =
   reportBinding("Input::GetKey (verified static RVA)", bGetKey)
   reportBinding("Input::GetKeyDown (verified static RVA)", bGetKeyDown)
   reportBinding("Camera::get_fieldOfView (verified static RVA)", bCamFov)
+  reportBinding("Camera::set_fieldOfView (verified static RVA -- THE WRITE)",
+                bCamSetFov)
   reportBinding("ProceduralWeaponAnimation::get_CurrentScope (verified " &
                 "static RVA)", bCurrentScope)
   reportBinding("SightNBone::get_IsOptic (verified static RVA)", bIsOptic)
@@ -3790,37 +3940,49 @@ proc onLoad(): Status =
   info "config: mouse sensitivity " &
        (if cfgChangeMouseSensitivity: "managed" else: "left alone") &
        ", 4x would use x" & $zoomSensFor(10.0) & ", 12x x" & $zoomSensFor(3.0)
-  info "config: camera offset keys " & cfgCameraIncreaseOffsetKey & " / " &
+  info "INERT config (read, printed, NEVER written to the game): camera " &
+       "offset keys " & cfgCameraIncreaseOffsetKey & " / " &
        cfgCameraDecreaseOffsetKey & ", rifle Z " & $cfgRifleCameraZOffset &
        ", pistol Z " & $cfgPistolCameraZOffset
   if cfgEnableFovScaleFix:
     info "config: FOV scale fix requested at " & $cfgFovScale
-  info "config: camera speeds rifle " & $cfgRifleCameraSpeed & ", pistol " &
+  info "INERT config: camera speeds rifle " & $cfgRifleCameraSpeed & ", pistol " &
        $cfgPistolCameraSpeed & ", optic " & $cfgOpticCameraSpeed &
        "; un-aim " & $cfgUnAimSpeedX & "/" & $cfgUnAimSpeedY & "/" &
        $cfgUnAimSpeedZ
-  info "config: ADS camera distance optic " & $cfgOpticCameraDistanceOffset &
+  info "INERT config: ADS camera distance optic " & $cfgOpticCameraDistanceOffset &
        ", non-optic " & $cfgNonOpticCameraDistanceOffset & ", pistol " &
        $cfgPistolCameraDistanceOffset & "; left shoulder rifle " &
        $cfgRifleLeftShoulderOffset & ", pistol " & $cfgPistolLeftShoulderOffset
-  info "config: aim speeds rifle " & $cfgRifleAimSpeedX & "/" &
+  info "INERT config: aim speeds rifle " & $cfgRifleAimSpeedX & "/" &
        $cfgRifleAimSpeedY & "/" & $cfgRifleAimSpeedZ & ", pistol " &
        $cfgPistolAimSpeedX & "/" & $cfgPistolAimSpeedY & "/" &
        $cfgPistolAimSpeedZ
-  info "config: camera XY offsets rifle " & $cfgRifleCameraXOffset & "/" &
+  info "INERT config: camera XY offsets rifle " & $cfgRifleCameraXOffset & "/" &
        $cfgRifleCameraYOffset & ", pistol " & $cfgPistolCameraXOffset & "/" &
        $cfgPistolCameraYOffset
-  info "config: toggle-zoom sensitivity optic x" &
+  info "config: toggle-zoom un-aimed FOV x" & $cfgUnaimedToggleZoomMulti &
+       " (APPLIED)" &
+       (if cfgCancelZoomOnUnAds: ", cancelled on un-ADS (APPLIED)" else: "")
+  info "INERT config: toggle-zoom SENSITIVITY optic x" &
        $cfgOpticToggleZoomSensMulti & ", aimed x" &
        $cfgNonOpticToggleZoomSensMulti & ", un-aimed x" &
-       $cfgUnaimedToggleZoomSensMulti & "; un-aimed FOV x" &
-       $cfgUnaimedToggleZoomMulti &
-       (if cfgCancelZoomOnUnAds: ", cancelled on un-ADS" else: "") &
-       (if cfgZoomOnHoldBreath: ", driven by hold-breath" else: "")
-  info "note: the camera offsets, aim speeds and toggle-zoom settings above " &
-       "are read and reported but not applied -- the patches that would use " &
-       "them are the ones this build cannot express. The module comment says " &
-       "which capability each one is waiting on."
+       $cfgUnaimedToggleZoomSensMulti &
+       (if cfgZoomOnHoldBreath: "; zoomOnHoldBreath" else: "")
+  # The note this replaces said the TOGGLE-ZOOM SETTINGS were not applied.
+  # That was false and had been for a while: the toggle-zoom key, holdToZoom,
+  # cancelZoomOnUnAds and all three toggle-zoom FOV multipliers are read in
+  # `pollZoomKey` and multiplied into `mult` in `applyFov`. Only the
+  # toggle-zoom SENSITIVITY multipliers are inert. A note that indicts the
+  # wrong knobs is worse than none: it made a working feature read as dead.
+  info "note: every line above prefixed INERT is read and printed and NEVER " &
+       "reaches the game -- there is no write path for it in this build, and " &
+       "changing it will do nothing. The FOV multipliers, the toggle-zoom " &
+       "key and its FOV multipliers, enableFovScaleFix and the sensitivity " &
+       "table are the ones with a write path. minBaseFov/maxBaseFov are not " &
+       "writable AT ALL: GameSettingsGroup.MIN/MAX_FIELD_OF_VIEW are C# " &
+       "consts (attrs 0x8056, LITERAL) inlined at every use with no storage " &
+       "to write -- they only sanity-swap each other here."
   Ok
 
 ## Deferral state. See `onUpdate`.
