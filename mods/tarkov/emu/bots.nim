@@ -700,6 +700,34 @@ proc lootRichness(): float =
   if m > 5.0: m = 5.0
   result = m
 
+proc randomStackCount(tpl: string; r: var Rng): int =
+  ## How large a stack of `tpl` a bot carries, or **zero** for an item that is
+  ## not stacked at spawn.
+  ##
+  ## This is the fix for scav money always being a single unit. A plain scav's
+  ## pocket/vest/backpack pool contains currency template ids (dollars, roubles,
+  ## euros), and `addContainerLoot` placed whatever it drew as one item with no
+  ## `StackObjectsCount` -- which the client renders as a stack of ONE, i.e. the
+  ## $1 bill the player kept pulling off corpses. The stack size was never rolled
+  ## because the loot generator treats a pool as "template ids, no counts".
+  ##
+  ## The stackable items are exactly the ones whose template declares a random
+  ## spawn range -- `_props.StackMinRandom`/`StackMaxRandom` -- which on stock
+  ## data is currency and loose ammunition and nothing else (a medkit has no such
+  ## field). So the discriminator is the data's own, not a hardcoded currency
+  ## list: an item that declares the range gets a stack rolled inside it, off the
+  ## client's own numbers (dollars 45..100, roubles 5500..13500, euros 35..90),
+  ## and everything else keeps the single-item behaviour by returning zero.
+  let hi = itemProp(tpl, "StackMaxRandom")
+  if not hi.ok:
+    return 0
+  let lo = itemProp(tpl, "StackMinRandom")
+  var a = lo.asInt(1)
+  var b = hi.asInt(1)
+  if a < 1: a = 1
+  if b < a: b = a
+  result = a + nextInt(r, b - a + 1)
+
 proc addContainerLoot(inv, generation: JsonRef; items: var List;
                       c: var Container; kind: string; r: var Rng;
                       budget: var int; richness: float) =
@@ -737,9 +765,18 @@ proc addContainerLoot(inv, generation: JsonRef; items: var List;
       return
     var d = botItem(newId(), tpl, c.id, gridName)
     setRaw(d, "location", location)
-    # One of the thing, and no `StackObjectsCount`. The pool gives template ids
-    # and no counts, and `generation.items.<kind>` counts *items* rather than
-    # rounds or roubles -- so a stack size here would be this file's invention.
+    # Most loot is one of the thing with no `StackObjectsCount`: the pool gives
+    # template ids and no counts, and `generation.items.<kind>` counts *items*
+    # rather than rounds or roubles, so a stack size for an ordinary item would
+    # be this file's invention. The exception is a template that declares its own
+    # spawn range -- currency and loose ammo -- where the count is the client's
+    # data, not ours: `randomStackCount` rolls it, and a currency stack is
+    # therefore a realistic amount instead of a flat $1.
+    let stack = randomStackCount(tpl, r)
+    if stack >= 1:
+      var upd = newDoc()
+      setNumber(upd, "StackObjectsCount", stack)
+      setRaw(d, "upd", text(upd))
     items.add d
     inc placed
     dec budget
