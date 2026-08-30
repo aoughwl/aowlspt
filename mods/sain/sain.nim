@@ -1624,6 +1624,10 @@ proc sainSchema(): seq[Setting] =
                 category = "Advanced", subcategory = "Diagnostics",
                 description = "From SAIN (Solarint, maintained by ArchangelWTF), rewritten from scratch for aowlspt. A re-measurement switch, not a feature. Turning it on lets this mod resolve game types BY NAME, which on this build returns a plausible random handle and kills the client on first use. Deliberately left un-editable so nobody flips it by accident.",
                 implemented = false),
+    boolSetting("sainRvaTable", "Bind members from the RVA table", false,
+                category = "Advanced", subcategory = "Diagnostics",
+                description = "From SAIN (Solarint, maintained by ArchangelWTF), rewritten from scratch for aowlspt. Binds 23 of SAIN's members from static RVAs derived offline with tools/il2cpp_resolve.py and byte-verified 16/16 before any call, instead of resolving them by name -- by-name resolution is the token-gated path that returns a random non-zero handle and kills the client. The other ~27 members SAIN asks for are REFUSED by name in the log (absent from the image, wrong arity, wrong owner, a shared RVA with hundreds of owners, or an instantiated generic whose layout is not reachable offline) and are never retried reflectively. This does NOT make bots fight: the movement, sprint, stop and shoot calls are all in the refused set. Default OFF.",
+                implemented = true),
 
     # Bot AI > Loadout. These knobs are declared and owned here; the generation
     # they govern lives in the server's own bot generator. `richnessMultiplier`
@@ -1877,12 +1881,18 @@ proc onLoad(): Status =
     # resolution unless this says otherwise, and it must be told at load
     # rather than at arming time, because arming is where the fault was.
     setAllowReflection(gPreset.allowIl2cppReflection)
+    # Same reason, same moment: the RVA table decides what `ensure` does, so it
+    # must be set before the first member is touched rather than at arming.
+    setRvaTable(gPreset.rvaTable)
     if gPreset.allowIl2cppReflection:
       warn "sain: allowIl2cppReflection is ON. On this build that is a " &
            "known process-killer (fact #35): il2cpp_class_from_name returns " &
            "a non-nil handle into unmapped memory and the first dereference " &
            "takes the client down. This is a re-measurement switch, not a " &
            "feature switch"
+    # EAGER, at load, and deliberately not inside `report()`: a refusal for a
+    # member no bot ever reaches would otherwise print as `unused`.
+    rvaReport()
     info "sain: client half loaded; waiting for the game world"
   else:
     discard

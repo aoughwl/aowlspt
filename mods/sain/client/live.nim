@@ -75,6 +75,7 @@ import aowlspt/il2cpp
 import aowlspt/fast
 import ".." / core / vec
 import ".." / core / sig
+import rvatable
 
 # ---------------------------------------------------------------------------
 # The runtime
@@ -244,6 +245,36 @@ static int32_t sain_is_readable(void* p, int32_t size) {
     }
 }
 
+/* The two primitives the RVA table needs and nothing else in this file did.
+ *
+ * `sain_rva_exec_readable` is DELIBERATELY stricter than `sain_is_readable`: a
+ * call target must be COMMITTED EXECUTABLE memory, not merely readable. A
+ * static RVA that has gone stale across a Tarkov update can land in a data
+ * section that reads back perfectly well, and calling into one is a crash with
+ * no diagnostic. Insisting on an executable protection is what makes a stale
+ * RVA a refusal instead. */
+static uint8_t sain_byte_at(void* p, uint64_t off) {
+    return ((const uint8_t*)p)[off];
+}
+static void* sain_ptr_add(void* p, int64_t d) {
+    return (void*)((uintptr_t)p + (uintptr_t)d);
+}
+static int32_t sain_rva_exec_readable(void* p, int32_t size) {
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!p || size <= 0) return 0;
+    if (VirtualQuery(p, &mbi, sizeof(mbi)) == 0) return 0;
+    if (mbi.State != MEM_COMMIT) return 0;
+    if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return 0;
+    if (!(mbi.Protect & (PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                         PAGE_EXECUTE_WRITECOPY))) return 0;
+    {   uintptr_t start = (uintptr_t)mbi.BaseAddress;
+        uintptr_t end   = start + (uintptr_t)mbi.RegionSize;
+        uintptr_t need  = (uintptr_t)p + (uintptr_t)size;
+        if (need < (uintptr_t)p) return 0;   /* overflow */
+        return need <= end ? 1 : 0;
+    }
+}
+
 /* THE ONLY WAY THIS MOD MAY REACH A TOKEN-GATED IL2CPP EXPORT.
  *
  * `aowl_host_gate_call` is a single `__declspec(dllexport)` symbol on
@@ -281,6 +312,12 @@ proc sainGwPV(f: Il2CppPtr): Il2CppPtr {.importc: "sain_gw_p_v", nodecl.}
 proc sainGwI32V(f: Il2CppPtr): int32 {.importc: "sain_gw_i32_v", nodecl.}
 proc sainIsReadable(p: Il2CppPtr; size: int32): int32 {.
   importc: "sain_is_readable", nodecl.}
+proc sainByteAt(p: Il2CppPtr; off: uint64): uint8 {.
+  importc: "sain_byte_at", nodecl.}
+proc sainPtrAdd(p: Il2CppPtr; d: int64): Il2CppPtr {.
+  importc: "sain_ptr_add", nodecl.}
+proc sainExecReadable(p: Il2CppPtr; size: int32): int32 {.
+  importc: "sain_rva_exec_readable", nodecl.}
 
 proc sainReadable(p: Il2CppPtr; size: int): bool =
   result = p != nil and sainIsReadable(p, int32(size)) != 0'i32
@@ -487,6 +524,44 @@ proc setAllowReflection*(v: bool) =
 
 proc reflectionAllowed*(): bool = gAllowReflection
 
+# --- the RVA table gate. Default OFF, like every new live path in this repo.
+#
+# ON, a member carrying an `rvaKey` is resolved from `client/rvatable.nim` --
+# a static RVA, byte-verified, called directly, with the token-gated export ABI
+# never touched. OFF, the whole mod behaves exactly as it did before this file
+# existed: `ensure` refuses at `reflectionRefused()` and every sensor declines.
+#
+# There is deliberately NO state in between and no fallback FROM the table TO
+# the by-name path. A key that the table refuses is refused, permanently, by
+# name, in the log. Falling back would reinstate precisely the fatal call this
+# whole change removes.
+var gRvaTable = false
+var gRvaRows: seq[SainRvaRow] = @[]
+var gRvaRefusals: seq[SainRvaRefusal] = @[]
+var gRvaLoaded = false
+var gRvaVerified = 0
+var gRvaRejected = 0
+var gRvaRefused = 0
+var gRvaFaults = 0
+
+const RvaFaultCap = 8
+  ## Self-disable. A bind that cannot verify its prologue is not retried
+  ## forever: after this many the table turns itself off for the session and
+  ## says so once, rather than producing the same refusal every frame.
+
+proc setRvaTable*(v: bool) =
+  ## From `onLoad`, out of the preset. Default false.
+  gRvaTable = v
+
+proc rvaTableOn*(): bool = gRvaTable
+
+proc rvaLoad() =
+  if gRvaLoaded:
+    return
+  gRvaLoaded = true
+  gRvaRows = sainRvaRows()
+  gRvaRefusals = sainRvaRefusals()
+
 const ReflectionRefusal* =
   "IL2CPP by-name resolution is refused on this build: " &
   "il2cpp_class_from_name and il2cpp_class_get_method_from_name return " &
@@ -683,6 +758,14 @@ type
     gateRefused*: bool
     tried*: bool
     why*: string
+    ## The row this member takes from `client/rvatable.nim`, or "" for a member
+    ## the table does not cover at all. Non-empty is what routes `ensure` away
+    ## from `il2cpp_object_get_class` and the two token-gated name lookups
+    ## behind it; empty leaves the old, refused, by-name path exactly as it was.
+    rvaKey*: string
+    ## True once the table has been consulted for `rvaKey`, whichever way it
+    ## answered. Separate from `tried`, which means the by-name path ran.
+    rvaTried*: bool
 
 proc emptyBinding(): Binding =
   Binding(ok: false, why: "", target: "", fn: cast[Il2CppPtr](0),
@@ -695,7 +778,19 @@ proc lazy*(member: string; argc: int32 = 0'i32): LazyCall =
            ret: fkNone, cls: cast[Il2CppClass](0), m: cast[Il2CppMethod](0),
            b: emptyBinding(), shape: csNone, fills: @[],
            gated: false, shapeWanted: dsNoArgs, gateRefused: false,
-           tried: false, why: "")
+           tried: false, why: "", rvaKey: "", rvaTried: false)
+
+proc keyed*(l: LazyCall; key: string): LazyCall =
+  ## Point a member at its row -- or its refusal -- in `client/rvatable.nim`.
+  ##
+  ## The key is the `SainBindings` FIELD name, not the member name, because two
+  ## different fields legitimately ask for the same member on different classes
+  ## (`faHave` and `stimHave` are both `get_HaveSmth2Use`) and they resolve
+  ## differently. `tools/idxbind.py` checks that every key handed to this proc
+  ## in `bindAll` names a row or a refusal that actually exists, so a typo is a
+  ## BUILD failure rather than a member that silently falls back to nothing.
+  result = l
+  result.rvaKey = key
 
 proc lazyAs*(member: string; kinds: openArray[FastKind];
              ret: FastKind): LazyCall =
@@ -1080,6 +1175,202 @@ proc resolveOn(l: var LazyCall; cls: Il2CppClass) =
           ": a type the fast path will not classify and a shape it cannot " &
           "express; using il2cpp_runtime_invoke"
 
+# ---------------------------------------------------------------------------
+# Resolving from the RVA table instead
+# ---------------------------------------------------------------------------
+
+proc rvaHexDigit(v: int): char =
+  const D = "0123456789ABCDEF"
+  result = D[v and 15]
+
+proc rvaHex2(v: int): string =
+  result = ""
+  result.add rvaHexDigit(v shr 4)
+  result.add rvaHexDigit(v)
+
+proc rvaHexs(v: int): string =
+  const D = "0123456789abcdef"
+  if v == 0:
+    return "0"
+  var n = v
+  var buf = ""
+  while n > 0:
+    buf.add D[n and 15]
+    n = n shr 4
+  result = ""
+  var i = buf.len - 1
+  while i >= 0:
+    result.add buf[i]
+    dec i
+
+proc rvaPrologueMatches(p: Il2CppPtr; expect: string; got: var string): bool =
+  ## An exact 16-byte compare against the bytes `il2cpp_resolve.py bytes` read
+  ## out of `GameAssembly.dll` on disk, with the LIVE bytes printed on a
+  ## mismatch so the refusal carries its own evidence.
+  ##
+  ## **Compared against live memory, and that is the considered choice rather
+  ## than the trap CLAUDE.md warns about.** The startup-snapshot rule exists for
+  ## DETOUR targets, where an earlier feature's trampoline makes a correct RVA
+  ## self-reject. Nothing in this mod detours any of these 23 -- they are only
+  ## ever CALLED -- and `abi/aowlspt_prologue.h`'s table is `static`, i.e. one
+  ## per translation unit, so a mod that included it would get its OWN empty
+  ## table and lazily capture whatever is there NOW. That is strictly worse
+  ## than reading the bytes: it would record a trampoline and then "verify"
+  ## against it, which is a check that cannot fail. Reading directly means a
+  ## mismatch has exactly two causes -- a stale RVA (a Tarkov update) or
+  ## somebody else's hook -- and declining to call is right for both.
+  got = ""
+  result = false
+  if p == nil:
+    got = "(null)"
+    return
+  if sainExecReadable(p, 16) == 0'i32:
+    got = "(not committed EXECUTABLE memory -- VirtualQuery refused it)"
+    return
+  var i = 0
+  var ok = true
+  while i < 16:
+    let b = int(sainByteAt(p, uint64(i)))
+    var hi = 0
+    var lo = 0
+    let ch = expect[i * 3]
+    let cl = expect[i * 3 + 1]
+    if ch >= '0' and ch <= '9': hi = int(ch) - int('0')
+    else: hi = 10 + int(ch) - int('A')
+    if cl >= '0' and cl <= '9': lo = int(cl) - int('0')
+    else: lo = 10 + int(cl) - int('A')
+    if b != hi * 16 + lo:
+      ok = false
+    if i > 0:
+      got.add ' '
+    got = got & rvaHex2(b)
+    inc i
+  result = ok
+
+proc resolveFromRva(l: var LazyCall) =
+  ## Fill `l` from `client/rvatable.nim`, or refuse out loud. Runs at most once
+  ## per member per session; `rvaTried` is what makes that true, so a refusal
+  ## is one log line rather than one per frame.
+  ##
+  ## NOTHING here touches `il2cpp_object_get_class`, `il2cpp_class_from_name`,
+  ## `il2cpp_class_get_method_from_name` or `il2cpp_class_get_name`. That is the
+  ## entire deliverable: the address comes from a constant, so the token-gated
+  ## export ABI is not on the path and no gate can hand back a random non-zero
+  ## pointer for a nil check to pass.
+  l.rvaTried = true
+  l.tried = true
+  l.m = cast[Il2CppMethod](0)
+  l.b = emptyBinding()
+  l.shape = csNone
+  l.fills = @[]
+  l.gateRefused = false
+  rvaLoad()
+
+  # --- a stated refusal comes first, so a key that is BOTH (which would be a
+  # table bug) refuses rather than binds.
+  var ref0 = emptyRvaRefusal()
+  if findRvaRefusal(gRvaRefusals, l.rvaKey, ref0):
+    gRvaRefused = gRvaRefused + 1
+    l.gateRefused = true
+    l.why = "RVA TABLE REFUSES " & l.rvaKey & " (" & ref0.symbol & "): " &
+            whyText(ref0.why) & " -- " & ref0.detail &
+            ". Measured offline against " & SainRvaScope &
+            ". NOT retried by name: the by-name lookup is the fatal path this " &
+            "table exists to remove."
+    return
+
+  var row = emptyRvaRow()
+  if not findRvaRow(gRvaRows, l.rvaKey, row):
+    # Neither a row nor a refusal. `tools/idxbind.py` makes this a build
+    # failure, so reaching it live means the checker was bypassed.
+    gRvaRejected = gRvaRejected + 1
+    l.why = "RVA TABLE HAS NO ENTRY for key '" & l.rvaKey & "' (member " &
+            l.member & ") -- neither a bound row nor a stated refusal. This " &
+            "is a TABLE BUG, not a client fact. Nothing was bound and nothing " &
+            "was called."
+    return
+
+  if not gLive or gRt.handle == nil:
+    l.rvaTried = false          # retry once the runtime is up
+    l.tried = false
+    l.why = row.label & ": GameAssembly.dll is not bound yet, so there is no " &
+            "imagebase to add an RVA to"
+    return
+
+  # Runtime address = module base + (VA - 0x180000000); the table's RVAs are
+  # already VA-minus-imagebase.
+  let fn = sainPtrAdd(gRt.handle, int64(row.rva))
+  var got = ""
+  if not rvaPrologueMatches(fn, row.prologue, got):
+    gRvaRejected = gRvaRejected + 1
+    gRvaFaults = gRvaFaults + 1
+    l.gateRefused = true
+    l.why = row.label & " @0x" & rvaHexs(row.rva) & ": PROLOGUE MISMATCH -- " &
+            "expected " & row.prologue & ", found " & got & ". REFUSED; " &
+            "nothing was called. Either this RVA is stale for the installed " &
+            "GameAssembly.dll (the table was derived against " & SainRvaScope &
+            "), or another feature has detoured it."
+    if gRvaFaults >= RvaFaultCap:
+      gRvaTable = false
+      warn "sain: the RVA table has SELF-DISABLED after " & $gRvaFaults &
+           " prologue mismatches. Every row was derived against " &
+           SainRvaScope & "; if the installed GameAssembly.dll is a different " &
+           "build, every RVA in the table is stale and must be re-derived " &
+           "with tools/il2cpp_resolve.py. No further binding will be attempted."
+    return
+
+  var b = emptyBinding()
+  b.target = row.label
+  b.fn = fn
+  # The hidden trailing `const MethodInfo*` is left NULL. Legal for everything
+  # except a SHARED GENERIC, and none of the 23 is one: every row is a concrete
+  # member of a concrete class, and the four generic ones (`List<T>`
+  # count/item) are in the refusal list precisely because they are not.
+  b.info = cast[Il2CppMethod](0)
+  b.argc = row.argc
+  b.ret = row.ret
+  b.isStatic = false
+  b.mask = 0'u32
+
+  case row.shape
+  of srPlain:
+    b.slots = row.argc + 1'i32   # `this`, then each declared argument
+    l.shape = csPlain
+  of srStructReturn:
+    # Slot 0 is the caller's return buffer, slot 1 is `this`. Only ever used
+    # with `argc == 0`, which the table's three such rows all are.
+    if row.argc != 0'i32:
+      gRvaRejected = gRvaRejected + 1
+      l.why = row.label & ": a struct return declared with arguments; this " &
+              "mod plans one buffer per call and cannot express that. REFUSED."
+      return
+    b.slots = 2'i32
+    b.ret = fkPtr
+    l.shape = csStructReturn
+  of srVectorArg:
+    # Slot 0 is `this`, slot 1 is the address of the caller's Vector3.
+    if row.argc != 1'i32:
+      gRvaRejected = gRvaRejected + 1
+      l.why = row.label & ": a by-pointer value argument at arity " &
+              $row.argc & "; the table only expresses arity 1. REFUSED."
+      return
+    b.slots = 2'i32
+    l.fills = @[sfValuePtr]
+    l.shape = csVectorArg
+  b.ok = true
+  l.b = b
+  l.argc = row.argc
+  gRvaVerified = gRvaVerified + 1
+  l.why = row.label & " @0x" & rvaHexs(row.rva) &
+          ": prologue verified 16/16 against " & SainRvaScope & ", instance, " &
+          $row.argc & " arg(s), " & $row.owners & " owner(s) of this RVA " &
+          "(CALLING a folded address is correct; NEVER detour it). " &
+          "Dispatch: " & row.virt &
+          (if row.needsPlayer:
+             ". RECEIVER MUST BE an EFT.Player -- this is EFT.Player's own " &
+             "body and its field offsets are meaningless on a look-alike."
+           else: "")
+
 proc ensure*(l: var LazyCall; obj: Il2CppPtr): bool =
   ## True when the member is callable on this object, by one path or the other.
   ##
@@ -1087,6 +1378,26 @@ proc ensure*(l: var LazyCall; obj: Il2CppPtr): bool =
   ## `il2cpp_object_get_class` and one pointer compare.
   if obj == nil or not gLive:
     return false
+  # --- THE RVA PATH, taken before anything reflective is even considered.
+  #
+  # A member carrying an `rvaKey` never reaches `il2cpp_object_get_class` at
+  # all: its address is a constant, so there is no class to ask for and no
+  # token-gated export on the path. The receiver is still validated -- the
+  # bound body is going to dereference it -- but nothing about its TYPE is
+  # asked, because asking is the fatal call.
+  #
+  # `l.m` stays nil on this path on purpose, so every `reflect` fallback below
+  # is a guarded no-op rather than an `il2cpp_runtime_invoke` on a null
+  # MethodInfo. What makes the call happen is `l.b.ok`, which is the only thing
+  # this returns true on.
+  if l.rvaKey.len > 0:
+    if not gRvaTable:
+      return false
+    if not sainReadable(obj, 8):
+      return false
+    if not l.rvaTried:
+      resolveFromRva(l)
+    return l.b.ok
   # AND THE SAME REFUSAL, at the root of the whole lazy table.
   #
   # This is the widest consequence of fact #35 and it is worth stating plainly:
@@ -1130,6 +1441,16 @@ proc reflect(m: Il2CppMethod; obj: Il2CppPtr; argv: Il2CppPtr): Il2CppPtr =
   ## read. A managed throw does not unwind through a C caller: it comes back as
   ## a written pointer, and ignoring it means using a null return as data.
   result = cast[Il2CppPtr](0)
+  # A NULL MethodInfo is now REACHABLE and must be a no-op, not a call.
+  #
+  # Every caller below is shaped `if l.b.ok: <fast>; else: reflect(l.m, ...)`,
+  # and an RVA-bound member satisfies `l.b.ok` with `l.m` deliberately nil. Any
+  # caller whose fast-path predicate is narrower than `b.ok` -- an argc that
+  # does not match, a shape that does not -- would otherwise fall through to
+  # `il2cpp_runtime_invoke(NULL, ...)`. Refusing here is one check that closes
+  # all of them at once.
+  if m == nil:
+    return cast[Il2CppPtr](0)
   var exc: Il2CppException = cast[Il2CppException](0)
   let r = invoke(gRt, m, obj, argv, exc)
   if exc != nil:
@@ -1319,6 +1640,12 @@ proc callVec*(l: var LazyCall; obj: Il2CppPtr; p: Vec3; flag: bool): bool =
                                    cast[Il2CppPtr](0), cast[Il2CppPtr](0)]
   let n = int(l.argc)
   if n < 1 or n > 8:
+    return false
+  # `methodParam(gRt, l.m, i)` below is a reflective read off the MethodInfo,
+  # and an RVA-bound member has none. Reached only if the shaped branch above
+  # declined, which for a table row cannot happen -- but "cannot happen" is not
+  # a check, and this is.
+  if l.m == nil:
     return false
   argv[0] = cast[Il2CppPtr](addr xyz[0])
   var i = 1
@@ -1614,74 +1941,81 @@ proc bindAll*() =
                 "world"
 
   info "sain: bindAll phase 4/5 -- the lazy member table (~70 names)"
-  gB.listCount = lazy("get_Count")
-  gB.listItem = lazyAs("get_Item", [fkI32], fkPtr)
+  # Every member below now carries its `client/rvatable.nim` key. A key that
+  # names a ROW binds from a byte-verified static RVA; a key that names a
+  # REFUSAL declines by name in the log and is never retried reflectively.
+  # `tools/idxbind.py sain-rva` fails the build on a key that is neither.
+  gB.listCount = keyed(lazy("get_Count"), "listCount")
+  gB.listItem = keyed(lazyAs("get_Item", [fkI32], fkPtr), "listItem")
 
-  gB.pIsAI = lazy("get_IsAI")
-  gB.pProfileId = lazy("get_ProfileId")
-  gB.pAIData = lazy("get_AIData")
-  gB.pHealth = lazy("get_HealthController")
-  gB.pMovement = lazy("get_MovementContext")
-  gB.pPhysical = lazy("get_Physical")
-  gB.pPosition = lazy("get_Position")
-  gB.pLookDir = lazy("get_LookDirection")
+  gB.pIsAI = keyed(lazy("get_IsAI"), "pIsAI")
+  gB.pProfileId = keyed(lazy("get_ProfileId"), "pProfileId")
+  gB.pAIData = keyed(lazy("get_AIData"), "pAIData")
+  gB.pHealth = keyed(lazy("get_HealthController"), "pHealth")
+  gB.pMovement = keyed(lazy("get_MovementContext"), "pMovement")
+  gB.pPhysical = keyed(lazy("get_Physical"), "pPhysical")
+  gB.pPosition = keyed(lazy("get_Position"), "pPosition")
+  gB.pLookDir = keyed(lazy("get_LookDirection"), "pLookDir")
 
-  gB.aiBotOwner = lazy("get_BotOwner")
-  gB.mcSprint = lazy("get_IsSprintEnabled")
+  gB.aiBotOwner = keyed(lazy("get_BotOwner"), "aiBotOwner")
+  gB.mcSprint = keyed(lazy("get_IsSprintEnabled"), "mcSprint")
 
-  gB.phStamina = lazy("get_Stamina")
-  gB.stNormal = lazy("get_NormalValue")
+  gB.phStamina = keyed(lazy("get_Stamina"), "phStamina")
+  gB.stNormal = keyed(lazy("get_NormalValue"), "stNormal")
 
-  gB.hcAlive = lazy("get_IsAlive")
-  gB.hcBodyPart = lazyAs("GetBodyPartHealth", [fkI32], fkNone)
+  gB.hcAlive = keyed(lazy("get_IsAlive"), "hcAlive")
+  gB.hcBodyPart = keyed(lazyAs("GetBodyPartHealth", [fkI32], fkNone),
+                        "hcBodyPart")
   gB.vsCurrent = lazyField("Current")
   gB.vsMaximum = lazyField("Maximum")
 
-  gB.boBotsGroup = lazy("get_BotsGroup")
+  gB.boBotsGroup = keyed(lazy("get_BotsGroup"), "boBotsGroup")
 
-  gB.wGrenades = lazy("get_Grenades")
-  gB.glCount = lazy("get_Count")
-  gB.glItem = lazyAs("get_Item", [fkI32], fkPtr)
-  gB.grPosition = lazy("get_Position")
+  gB.wGrenades = keyed(lazy("get_Grenades"), "wGrenades")
+  gB.glCount = keyed(lazy("get_Count"), "glCount")
+  gB.glItem = keyed(lazyAs("get_Item", [fkI32], fkPtr), "glItem")
+  gB.grPosition = keyed(lazy("get_Position"), "grPosition")
 
-  gB.boMemory = lazy("get_Memory")
-  gB.boWeapon = lazy("get_WeaponManager")
-  gB.boMover = lazy("get_Mover")
-  gB.boSteering = lazy("get_Steering")
-  gB.boShoot = lazy("get_ShootData")
-  gB.boMedecine = lazy("get_Medecine")
-  gB.boAiming = lazy("get_AimingData")
+  gB.boMemory = keyed(lazy("get_Memory"), "boMemory")
+  gB.boWeapon = keyed(lazy("get_WeaponManager"), "boWeapon")
+  gB.boMover = keyed(lazy("get_Mover"), "boMover")
+  gB.boSteering = keyed(lazy("get_Steering"), "boSteering")
+  gB.boShoot = keyed(lazy("get_ShootData"), "boShoot")
+  gB.boMedecine = keyed(lazy("get_Medecine"), "boMedecine")
+  gB.boAiming = keyed(lazy("get_AimingData"), "boAiming")
 
-  gB.memUnderFire = lazy("get_IsUnderFire")
-  gB.memGoalEnemy = lazy("get_GoalEnemy")
+  gB.memUnderFire = keyed(lazy("get_IsUnderFire"), "memUnderFire")
+  gB.memGoalEnemy = keyed(lazy("get_GoalEnemy"), "memGoalEnemy")
 
-  gB.enPerson = lazy("get_Person")
-  gB.enVisible = lazy("get_IsVisible")
-  gB.enCanShoot = lazy("get_CanShoot")
-  gB.enPosition = lazy("get_CurrPosition")
+  gB.enPerson = keyed(lazy("get_Person"), "enPerson")
+  gB.enVisible = keyed(lazy("get_IsVisible"), "enVisible")
+  gB.enCanShoot = keyed(lazy("get_CanShoot"), "enCanShoot")
+  gB.enPosition = keyed(lazy("get_CurrPosition"), "enPosition")
 
-  gB.wmHaveBullets = lazy("get_HaveBullets")
-  gB.wmReady = lazy("get_IsReady")
-  gB.wmReload = lazy("get_Reload")
-  gB.rlTryReload = withGate(lazy("TryReload"), dsNoArgs)
-  gB.rlBullets = lazy("get_BulletCount")
-  gB.rlMaxBullets = lazy("get_MaxBulletCount")
+  gB.wmHaveBullets = keyed(lazy("get_HaveBullets"), "wmHaveBullets")
+  gB.wmReady = keyed(lazy("get_IsReady"), "wmReady")
+  gB.wmReload = keyed(lazy("get_Reload"), "wmReload")
+  gB.rlTryReload = keyed(withGate(lazy("TryReload"), dsNoArgs), "rlTryReload")
+  gB.rlBullets = keyed(lazy("get_BulletCount"), "rlBullets")
+  gB.rlMaxBullets = keyed(lazy("get_MaxBulletCount"), "rlMaxBullets")
 
-  gB.medFirstAid = lazy("get_FirstAid")
-  gB.medStims = lazy("get_Stimulators")
-  gB.medSurgery = lazy("get_SurgicalKit")
-  gB.faHave = lazy("get_HaveSmth2Use")
-  gB.stimHave = lazy("get_HaveSmth2Use")
-  gB.surgHave = lazy("get_HaveWork")
+  gB.medFirstAid = keyed(lazy("get_FirstAid"), "medFirstAid")
+  gB.medStims = keyed(lazy("get_Stimulators"), "medStims")
+  gB.medSurgery = keyed(lazy("get_SurgicalKit"), "medSurgery")
+  gB.faHave = keyed(lazy("get_HaveSmth2Use"), "faHave")
+  gB.stimHave = keyed(lazy("get_HaveSmth2Use"), "stimHave")
+  gB.surgHave = keyed(lazy("get_HaveWork"), "surgHave")
   # The three self-actions are gated too, and for a smaller reason than the
   # movers: `TryApply` on a stimulator component takes no arguments here, and
   # a build where it takes an item or a body part would resolve at arity zero
   # only if such an overload also existed -- but `callVoidOn` hands over a null
   # argument array either way, so the gate is what makes "found at arity zero"
   # mean "declares no parameters".
-  gB.faApply = withGate(lazy("TryApplyToCurrentPart"), dsNoArgs)
-  gB.stimApply = withGate(lazy("TryApply"), dsNoArgs)
-  gB.surgApply = withGate(lazy("TryApplyToCurrentPart"), dsNoArgs)
+  gB.faApply = keyed(withGate(lazy("TryApplyToCurrentPart"), dsNoArgs),
+                     "faApply")
+  gB.stimApply = keyed(withGate(lazy("TryApply"), dsNoArgs), "stimApply")
+  gB.surgApply = keyed(withGate(lazy("TryApplyToCurrentPart"), dsNoArgs),
+                       "surgApply")
 
   # `GoToPoint` is overloaded by arity across client versions -- one argument in
   # the shortest form, five or six in the fullest. Trying arities in order of
@@ -1697,7 +2031,7 @@ proc bindAll*() =
   # says so, rather than a bot walking to an address reinterpreted as a float.
   info "sain: bindAll phase 5/5 -- the gated driving calls, whose gates read " &
        "declared parameter types back out of the runtime"
-  gB.mvGoTo = withGate(lazy("GoToPoint", 1'i32), dsVectorFirst)
+  gB.mvGoTo = keyed(withGate(lazy("GoToPoint", 1'i32), dsVectorFirst), "mvGoTo")
   gB.mvGoTo.argcAlts = @[2'i32, 3'i32, 4'i32, 5'i32, 6'i32]
   # `Sprint` was `lazyAs([fkBool])`, which *stated* the signature rather than
   # asking for it: `resolveOn` skips the runtime's declared types entirely when
@@ -1705,11 +2039,13 @@ proc bindAll*() =
   # have had a bool put in a general-purpose register and the speed read out of
   # XMM. The stated kinds are kept -- they are still what the fast path binds
   # with -- and the gate is what now checks they are true.
-  gB.mvSprint = withGate(lazyAs("Sprint", [fkBool], fkVoid), dsOneBool)
-  gB.mvStop = withGate(lazy("Stop"), dsNoArgs)
-  gB.stLookTo = withGate(lazy("LookToPoint", 1'i32), dsVectorFirst)
+  gB.mvSprint = keyed(withGate(lazyAs("Sprint", [fkBool], fkVoid), dsOneBool),
+                      "mvSprint")
+  gB.mvStop = keyed(withGate(lazy("Stop"), dsNoArgs), "mvStop")
+  gB.stLookTo = keyed(withGate(lazy("LookToPoint", 1'i32), dsVectorFirst),
+                      "stLookTo")
   gB.stLookTo.argcAlts = @[2'i32]
-  gB.sdShoot = withGate(lazy("Shoot"), dsNoArgs)
+  gB.sdShoot = keyed(withGate(lazy("Shoot"), dsNoArgs), "sdShoot")
 
   info "sain: bindAll complete -- all five phases returned"
   gB.ready = true
@@ -1736,6 +2072,61 @@ proc reportOne(name: string; l: LazyCall) =
     warn "sain:   MISSING " & name & " -- " & l.why
   else:
     debug "sain:   unused  " & name & " (" & l.member & ")"
+
+var gRvaReported = false
+
+proc rvaReport*() =
+  ## The RVA table's own account of itself, EAGERLY and once -- before any
+  ## member has been used.
+  ##
+  ## `report()` cannot do this job. It walks `LazyCall`s, and a `LazyCall`
+  ## resolves on FIRST USE, so a refusal for a member no bot ever reached
+  ## prints as `unused` rather than as a refusal. That is a check that cannot
+  ## fail (CLAUDE.md 9b): the loudest refusals in this table are exactly the
+  ## ones on paths that never run, `mvSprint` above all -- the row whose whole
+  ## value is that a by-name lookup WOULD have wrongly taken
+  ## `EFT.Player::Sprint(EPlayerState)` and started a coroutine.
+  ##
+  ## So this walks the TABLE, not the bindings, and prints every refusal
+  ## whether or not anything asked for it.
+  ##
+  ## The self-report is deliberately NOT "0 by-name bindings remain". It is
+  ## "0 remain AMONG THE ROWS THE TABLE COVERS", plus the count that does not
+  ## -- which is falsifiable and cannot be misread as "SAIN works".
+  if gRvaReported:
+    return
+  gRvaReported = true
+  rvaLoad()
+  if not gRvaTable:
+    warn "sain: the RVA table is OFF (sainRvaTable false). Every member is " &
+         "refused at `ensure` and the mod reads nothing. " & $gRvaRows.len &
+         " row(s) and " & $gRvaRefusals.len & " stated refusal(s) are " &
+         "loaded but unused."
+    return
+  info "sain: RVA table -- " & $gRvaRows.len & " row(s) bindable by static " &
+       "RVA, " & $gRvaRefusals.len & " member(s) REFUSED. Derived against " &
+       SainRvaScope & "."
+  var i = 0
+  while i < gRvaRefusals.len:
+    let r = gRvaRefusals[i]
+    warn "sain:   REFUSED " & r.key & " (" & r.symbol & ") -- " &
+         whyText(r.why) & ": " & r.detail
+    inc i
+  info "sain: RVA table scope statement -- of the " & $gRvaRows.len &
+       " members THIS TABLE COVERS, zero are resolved by name; each is a " &
+       "static RVA whose 16 prologue bytes are compared before it is called. " &
+       "The other " & $gRvaRefusals.len & " members SAIN asks for are refused " &
+       "by name above and are NOT retried reflectively. This does NOT make " &
+       "SAIN's combat brain work: the movement call, the sprint call, the " &
+       "stop call, the shoot call and the whole alive-players list are all in " &
+       "the refused set, so no bot is driven by this mod. What it does is " &
+       "replace a silent client kill with a named refusal."
+
+proc rvaTally*(): (int, int, int, int) =
+  ## (rows, refusals, verified, rejected) -- numbers for a self-test to assert
+  ## on, so a refusal cannot degrade into a silent zero unnoticed.
+  rvaLoad()
+  result = (gRvaRows.len, gRvaRefusals.len, gRvaVerified, gRvaRejected)
 
 proc report*() =
   ## Every binding's own account of itself, once.
