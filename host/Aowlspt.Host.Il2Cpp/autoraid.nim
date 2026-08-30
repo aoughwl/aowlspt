@@ -194,12 +194,46 @@ proc arWalkActive(t: Il2CppPtr; name: string; depth: int; budget: var int;
       if result != nil: return
     i = i + 1
 
+proc arCollectChildren(t: Il2CppPtr; name: string; depth: int; budget: var int;
+                       deadline: uint64; into: var seq[Il2CppPtr]; cap: int) =
+  ## The BREADTH-BEFORE-DEPTH body: name-check every DIRECT child of `t` first,
+  ## then recurse. It does NOT check `t` itself -- the caller already did -- so
+  ## each node is name-checked EXACTLY once (as some parent's direct child, or as
+  ## the collect root) and there are no duplicate hits. Breadth-first matters for
+  ## the same reason it does in `arWalkActive`: a container like MenuScreen /
+  ## AnimatedToggle is a DIRECT child of a WIDE root (Common UI, Menu UI), and a
+  ## pure DFS burns the whole 18 ms slice descending the first sibling's subtree
+  ## before ever reaching it -- which is exactly why the pure-DFS collect found 0
+  ## MenuScreens live while the breadth-first walk had found it at 42 s.
+  if depth <= 0 or budget <= 0 or into.len >= cap: return
+  var n = 0
+  if not iChildCount(t, n): return
+  # Pass 1 -- breadth: name-check every direct child (no descent).
+  var i = 0
+  while i < n and i < ArFanout and budget > 0 and into.len < cap:
+    let c = iChildAt(t, i)
+    if c != nil and duOk(c, 0x20'i32):
+      budget = budget - 1
+      if (budget and 31) == 0 and cNowMs() > deadline:
+        budget = 0
+        return
+      if iObjName(c) == name:
+        into.add c
+        if into.len >= cap: return
+    i = i + 1
+  # Pass 2 -- depth: recurse only after the whole level missed.
+  i = 0
+  while i < n and i < ArFanout and budget > 0 and into.len < cap:
+    let c = iChildAt(t, i)
+    if c != nil:
+      arCollectChildren(c, name, depth - 1, budget, deadline, into, cap)
+    i = i + 1
+
 proc arCollect(t: Il2CppPtr; name: string; depth: int; budget: var int;
                deadline: uint64; into: var seq[Il2CppPtr]; cap: int) =
-  ## Collect up to `cap` nodes named `name` under `t` (active or not) -- for the
-  ## map tiles, which we must scan by their child Label text.
-  if t == nil or depth < 0 or budget <= 0 or into.len >= cap or
-     not duOk(t, 0x20'i32): return
+  ## Collect up to `cap` nodes named `name` under `t` (active or not),
+  ## breadth-before-depth. Checks `t` itself once, then walks its subtree.
+  if t == nil or budget <= 0 or into.len >= cap or not duOk(t, 0x20'i32): return
   budget = budget - 1
   if (budget and 31) == 0 and cNowMs() > deadline:
     budget = 0
@@ -207,15 +241,7 @@ proc arCollect(t: Il2CppPtr; name: string; depth: int; budget: var int;
   if iObjName(t) == name:
     into.add t
     if into.len >= cap: return
-  if depth == 0: return
-  var n = 0
-  if not iChildCount(t, n): return
-  var i = 0
-  while i < n and i < ArFanout and budget > 0 and into.len < cap:
-    let c = iChildAt(t, i)
-    if c != nil:
-      arCollect(c, name, depth - 1, budget, deadline, into, cap)
-    i = i + 1
+  arCollectChildren(t, name, depth, budget, deadline, into, cap)
 
 # ---------------------------------------------------------------------------
 # Scene-root enumeration -- reuse inspect.nim's `iSceneRoots` (the same path
@@ -227,13 +253,20 @@ proc arCollect(t: Il2CppPtr; name: string; depth: int; budget: var int;
 # a PREFERRED root by name, then FALLS BACK across every enumerated root, so a
 # wrong scope can never silently starve the search.
 # ---------------------------------------------------------------------------
-var gArRootsLogged = false
+var gArLastRootCount = -1        ## last logged root count (re-log when it changes)
+var gArRootCount = 0             ## roots enumerated on the most recent call
 
 proc arEnumRoots(into: var seq[Il2CppPtr]) =
+  ## Re-enumerate the DontDestroyOnLoad scene roots FRESH on every call (no
+  ## cache): iSceneRoots asks the anchor for its scene and lists its CURRENT
+  ## roots, so Common UI / Menu UI enter scope the moment they load (~40 s),
+  ## after the boot set (~11). Re-logs whenever the count CHANGES -- so the log
+  ## proves the set grows (11 -> 13) rather than being cached, per 9b.
   let anchor = splAnchor()
   discard iSceneRoots(into, false, anchor)
-  if not gArRootsLogged and into.len > 0:
-    gArRootsLogged = true
+  gArRootCount = into.len
+  if into.len != gArLastRootCount:
+    gArLastRootCount = into.len
     var names = ""
     var i = 0
     while i < into.len and names.len < 600:
@@ -502,9 +535,9 @@ proc arTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ar_tick_body", cdecl.}
       # rather than a silent 180 s timeout. Rate-limited to ~10 s.
       if now - gArWaitLogMs > 10000'u64:
         gArWaitLogMs = now
-        info "autoRaid WAIT-MENU: MenuScreen found=" & $nMs &
-             ", PlayButton under it=" & $nPb & ", active=" & $nActive &
-             " (nothing pressable this tick)"
+        info "autoRaid WAIT-MENU: roots=" & $gArRootCount &
+             ", MenuScreen found=" & $nMs & ", PlayButton under it=" & $nPb &
+             ", active=" & $nActive & " (nothing pressable this tick)"
     return
 
   if gArStep == ArNext1 or gArStep == ArNext2 or gArStep == ArNext3 or
