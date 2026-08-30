@@ -764,22 +764,28 @@ proc offlineScavWaves(zones: seq[string]): string =
     a.add oneWave(number, -1, -1, perWave, perWave * 2,
                   useZones[number mod useZones.len])
     inc number
-  # The PMCs. This is the whole of fix (1): a stock offline raid served only
-  # `assault`/`Savage` waves, so the client never asked `bot/generate` for a PMC
-  # and a raid spawned ~40 scavs, the bosses, and zero PMCs. These waves name
-  # `pmcUSEC`/`pmcBEAR` (WildSpawnType 52/51) on the `Usec`/`Bear` side; the
-  # client parses both against its own enums, requests those roles, and
-  # `emu/bots` fills them from `bots.types.pmcusec`/`pmcbear` -- the full PMC
-  # loadout tables -- with `Info.Side` set by `botSideForRole`. Negative time so
-  # they seed synchronously alongside the scavs. Spread across the same zones the
-  # scav seeds use, so a PMC has an open zone to place into. Two of each side.
+  # The PMCs. A stock offline raid served only `assault`/`Savage` waves, so it
+  # spawned ~40 scavs, the bosses, and zero PMCs. The earlier attempt here --
+  # dedicated `pmcUSEC`/`pmcBEAR` waves on the `Usec`/`Bear` side -- CANNOT work,
+  # and this is measured, not reasoned: every bot-category `SpawnPointParams` on
+  # every stock map (Woods: 86 `Bot`, 32 `BotPmc`, 68 `Boss`) is tagged
+  # `Sides:["Savage"]`, so a `Usec`/`Bear`-sided wave finds no spawn point and
+  # places nothing; and a `pmcUSEC` wave re-sided to `Savage` places an assault
+  # SCAV, because the client keys the requested role off the wave `BotSide` and
+  # ignores `WildSpawnType` (fact #259). Neither wave puts a PMC on the map.
+  #
+  # PMCs are produced instead the way SPT produces them offline: extra
+  # `assault`/`Savage` seed waves (which DO have spawn points), a fraction of
+  # whose `bot/generate` batch `emu/bots.generate` converts into
+  # `pmcUSEC`/`pmcBEAR` profiles -- correct `Info.Side` and the full PMC loadout
+  # from `bots.types.pmcusec`/`pmcbear` -- which the client then places at the
+  # assault points it already picked. So these are ordinary scav waves; the PMCs
+  # come out of them server-side, and the extra spawn density here is what makes
+  # the offline PMC yield tunable alongside `PmcConversionChance`.
   var pmc = 0
-  while pmc < 2:
+  while pmc < 4:
     a.add oneWave(number, -1, -1, pmcWave, pmcWave * 2,
-                  useZones[number mod useZones.len], "pmcUSEC", "Usec")
-    inc number
-    a.add oneWave(number, -1, -1, pmcWave, pmcWave * 2,
-                  useZones[number mod useZones.len], "pmcBEAR", "Bear")
+                  useZones[number mod useZones.len])
     inc number
     inc pmc
   # The trickle. Non-negative, so these take `Run(2)`'s timer arm: a bonus if
