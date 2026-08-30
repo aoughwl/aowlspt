@@ -334,12 +334,15 @@ proc botZonesFor(spawnPointParams: JsonRef): seq[string] =
     if not seen:
       result.add zn
 
-proc oneWave(number, tmin, tmax, smin, smax: int; zone: string): JsonObject =
-  ## One assault-scav wave in BSG's own `waves[]` shape (capture seq 158). Every
+proc oneWave(number, tmin, tmax, smin, smax: int; zone, spawnType: string): JsonObject =
+  ## One wave in BSG's own `waves[]` shape (capture seq 158). Every
   ## member the client's `WildSpawnWave` reads is present, so nothing
   ## deserialises to a null: `SpawnMode` lists all three modes so the wave is
-  ## never filtered out by the session's mode, `WildSpawnType`/`BotSide` make it
-  ## a scav.
+  ## never filtered out by the session's mode. `BotSide` is always `"Savage"`
+  ## because that is the only side the maps' bot spawn points accept (fact #252);
+  ## `spawnType` becomes `WildSpawnType` and is what makes the wave a scav
+  ## (`"assault"`) or a PMC (`"pmcUSEC"`/`"pmcBEAR"`) -- the `Role` the client
+  ## then asks `/client/game/bot/generate` for.
   ##
   ## `time_min`/`time_max` are seconds, and their *sign* selects which of the
   ## client's two dispatch arms the wave takes -- see `offlineScavWaves`. A
@@ -354,7 +357,7 @@ proc oneWave(number, tmin, tmax, smin, smax: int; zone: string): JsonObject =
   modes.add "pvp-season"
   put(w, "SpawnMode", modes)
   put(w, "SpawnPoints", zone)
-  put(w, "WildSpawnType", "assault")
+  put(w, "WildSpawnType", spawnType)
   put(w, "isPlayers", false)
   put(w, "number", number)
   put(w, "slots_max", smax)
@@ -469,7 +472,7 @@ proc offlineScavWaves(zones: seq[string]): string =
   if seeds > 8: seeds = 8
   while number < seeds:
     a.add oneWave(number, -1, -1, perWave, perWave * 2,
-                  useZones[number mod useZones.len])
+                  useZones[number mod useZones.len], "assault")
     inc number
   # The trickle. Non-negative, so these take `Run(2)`'s timer arm: a bonus if
   # that arm works offline and harmless if it does not. Staggered from 20 s so
@@ -480,10 +483,45 @@ proc offlineScavWaves(zones: seq[string]): string =
   var i = 0
   while i < early:
     let zone = useZones[(seeds + i) mod useZones.len]
-    a.add oneWave(number, 20 + i * 30, 40 + i * 30, trickle, trickle * 2, zone)
+    a.add oneWave(number, 20 + i * 30, 40 + i * 30, trickle, trickle * 2, zone,
+                  "assault")
     inc i
     inc number
-  a.add oneWave(number, 360, 420, trickle, trickle * 2, useZones[0])
+  a.add oneWave(number, 360, 420, trickle, trickle * 2, useZones[0], "assault")
+
+  # PMCs. They ride the SAME wave machinery as the scavs, and the one thing that
+  # makes them PMCs rather than a second flavour of scav is `WildSpawnType`:
+  # `pmcUSEC` / `pmcBEAR`, which is the `Role` the client then asks
+  # `/client/game/bot/generate` for. **`BotSide` stays `"Savage"`**, and that is
+  # the whole fix (fact #252): every bot-category `SpawnPointParams` on every map
+  # ships `Sides:["Savage"]`, so a wave sided `"Usec"`/`"Bear"` finds no eligible
+  # spawn point and places nothing. The profile that comes back is still a real
+  # USEC/BEAR because `botSideForRole` in `emu/bots` sets the faction from the
+  # role, independently of the wave's side. Kept to ~8 across the raid: half on
+  # the negative-time seed arm that is proven to place, half staggered on the
+  # timer arm as a bonus, so the raid opens with a couple of PMCs rather than a
+  # firing squad.
+  const pmcWave = 2      ## S per PMC wave: span 2 -> toSpawn 2 (see the model above).
+  # Two seed PMC waves, one USEC one BEAR, placed synchronously at raid start.
+  var p = 0
+  while p < 2:
+    let role = if (p and 1) == 0: "pmcUSEC" else: "pmcBEAR"
+    a.add oneWave(number, -1, -1, pmcWave, pmcWave * 2, useZones[p mod useZones.len],
+                  role)
+    info("raid: PMC seed wave emitted Role=" & role & " count~" & $pmcWave &
+         " zone=" & useZones[p mod useZones.len])
+    inc p
+    inc number
+  # Two more on the timer arm, staggered, as reinforcement if that arm fires.
+  var q = 0
+  while q < 2:
+    let role = if ((q + 1) and 1) == 0: "pmcUSEC" else: "pmcBEAR"
+    a.add oneWave(number, 90 + q * 90, 150 + q * 90, pmcWave, pmcWave * 2,
+                  useZones[(seeds + q) mod useZones.len], role)
+    info("raid: PMC timer wave emitted Role=" & role & " count~" & $pmcWave &
+         " at=" & $(90 + q * 90) & "s")
+    inc q
+    inc number
   result = done(a).text
 
 proc tuneOfflineSpawns*(d: var Doc) =
