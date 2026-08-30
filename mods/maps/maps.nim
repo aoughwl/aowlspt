@@ -163,6 +163,20 @@ var gDiagOn = false
   ## all -- which is how a silent late-arm no-op survived a whole session: there
   ## was nothing in the log that could have contradicted it. A diag that only
   ## runs when the feature already works is a check that cannot fail.
+const
+  ReconcilePeriodMs* = 1000
+  MaxReconcileFails* = 5
+
+var gReconcileOn = false
+  ## Whether the cross-process config reconcile timer is registered. See the
+  ## long block above `mirrorDrift`: the F12 write lands in the SERVER process
+  ## and the draw mirror lives here, so watching config.json is the only choke
+  ## point both sides share.
+var gReconciles = 0
+var gReconcileFails = 0
+var gReconcileOff = false
+var gLastDrift = ""
+
 var gHeadingOn = false
   ## The `heading` setting. Flag-gated and default OFF, like everything else
   ## here. When off, the measured heading is DISCARDED at publish time rather
@@ -875,9 +889,17 @@ proc mapsDiagText(): string =
   let lArm = "gEnabled=" & $gEnabled & " gFeedRunning=" & $gFeedRunning &
              " gHudOn=" & $gHudOn & " armedAtBoot=" & $gArmedAtBoot &
              " lateArms=" & $gLateArms
+  # The reconcile is the cross-process half of the apply path, so its state has
+  # to be visible next to the toggle verdict it exists to clear.
+  let lRecon = "timer=" & (if gReconcileOn: "registered" else: "NOT REGISTERED") &
+               (if gReconcileOff: " DISABLED after repeated no-effect applies"
+                else: "") &
+               " reconciles=" & $gReconciles &
+               " consecutiveNoEffect=" & $gReconcileFails
 
   result = "maps diag:\n" &
            "  arm          : " & lArm & "\n" &
+           "  reconcile    : " & lRecon & "\n" &
            "  region       : " & lRegion & "\n" &
            "  world        : " & lWorld  & "\n" &
            "  raid         : " & lRaid   & "\n" &
@@ -1070,6 +1092,102 @@ proc onMapsApply(key: string) =
                  (if gHeadingOn: " (heading-up: art refuses, grid+blips rotate)"
                   else: " (north-up: baked art drawn)"))
 
+# ---------------------------------------------------------------------------
+# THE RECONCILE TICK -- the choke point, and why it is not a fourth transport
+# patch
+# ---------------------------------------------------------------------------
+#
+# Three transports have now each been patched to call `onMapsApply` and the OFF
+# direction survived all three. It survived because THE WRITE AND THE DRAW ARE
+# IN DIFFERENT PROCESSES.
+#
+#   * `sides = {sideServer, sideClient}`, so this mod loads twice.
+#   * `registerRoutes`/`serve` only succeed in the BACKEND process, so the F12
+#     panel's `POST /aowlspt/settings/aowl.maps` (overlay:
+#     abi/aowlspt_overlay.h:3922 `if (isMod) .../aowlspt/settings/<guid>`) is
+#     answered by the SERVER instance.
+#   * that instance runs `onSpatialSettings` -> `applySettingFromBody` ->
+#     `onMapsApply`, and `onMapsApply`'s FIRST line is
+#     `if side() != sideClient: settingIgnored(...); return`.
+#
+# So the store happened in one process and the C draw mirror lives in the other,
+# which never heard anything. No amount of hooking the server-side transports
+# can fix that, and there is no in-process choke point that both sides pass
+# through -- the event bus does not cross the process boundary and settingshub's
+# client queue is only fed by `/aowlspt/settings/client/page/<guid>`, which
+# nothing in the overlay ever requests.
+#
+# The one thing EVERY writer does converge on is `config.json` itself: the
+# SDK's `applySetting`, `resetSetting`, `resetAllSettings`, the backfill, this
+# mod's own route, the bus path, the uihub page and any transport not yet
+# written all end in `hostConfigSet` merging a key into that file. So the
+# CLIENT instance watches the file, on its own timer, and reconciles the live
+# mirror to it. A future fourth transport cannot bypass this, because bypassing
+# it would mean not persisting the edit at all.
+#
+# The check is the finished-state comparison (Â§9b), not a re-read of our own
+# write: what config.json says NOW versus what the C mirror the draw callback
+# dereferences every frame is actually holding. It is the same comparison the
+# `toggle` diag line makes -- deliberately, so the instrument that detects the
+# bug and the mechanism that fixes it cannot drift apart.
+#
+# Bounded, and it self-disables. If a reconcile runs and the SAME drift is
+# still there on the next tick, the reconcile is not working; after
+# `MaxReconcileFails` consecutive such ticks it stops and says so, rather than
+# calling `onMapsApply` once a second forever.
+
+proc mirrorDrift(): string =
+  ## "" when the live draw mirror agrees with config.json; otherwise a line
+  ## naming the disagreement. NEGATIVE-shaped: it can only be non-empty when a
+  ## stored value is provably not in force.
+  let cfgEnabled = asBool(setting("enabled"), false)
+  if cfgEnabled != gEnabled:
+    return "config enabled=" & $cfgEnabled & " but this instance holds gEnabled=" &
+           $gEnabled
+  if not gHudOn:
+    # No draw participant: there is a master switch to compare and nothing else.
+    if (not cfgEnabled) and hudLiveEnabled():
+      return "config enabled=false, no draw participant, mirror enabled=ON"
+    return ""
+  let live = cfgEnabled and gFeedRunning
+  let wantMap = asBool(setting("hudMap"), false) and live
+  let wantRad = asBool(setting("hudRadar"), true) and live
+  let wantInd = asBool(setting("hudIndicators"), false) and live
+  if hudLiveEnabled() != live or hudLiveMap() != wantMap or
+     hudLiveRadar() != wantRad or hudLiveIndicators() != wantInd:
+    return "config(enabled=" & $live & " map=" & $wantMap & " radar=" & $wantRad &
+           " ind=" & $wantInd & ") vs mirror(enabled=" & $hudLiveEnabled() &
+           " map=" & $hudLiveMap() & " radar=" & $hudLiveRadar() &
+           " ind=" & $hudLiveIndicators() & ")"
+  result = ""
+
+proc onReconcileTick(payload: string): string =
+  result = ""
+  if gReconcileOff: return
+  let drift = mirrorDrift()
+  if drift.len == 0:
+    gReconcileFails = 0
+    gLastDrift = ""
+    return
+  if drift == gLastDrift:
+    inc gReconcileFails
+    if gReconcileFails >= MaxReconcileFails:
+      gReconcileOff = true
+      warn ModName & ": the config/mirror reconcile ran " & $MaxReconcileFails &
+           " times and the SAME disagreement is still there (" & drift &
+           "), so applying is not what is failing -- it is disabled now rather " &
+           "than running once a second forever. The maps diag `toggle` line " &
+           "still reports the disagreement."
+      return
+  else:
+    gReconcileFails = 0
+  gLastDrift = drift
+  inc gReconciles
+  info ModName & ": RECONCILE #" & $gReconciles & " -- config.json changed " &
+       "underneath the live mirror and no apply hook ran in this process " &
+       "(the F12 POST is answered by the SERVER instance). " & drift
+  onMapsApply("")
+
 proc onLoad(): Status =
   gEnabled = asBool(setting("enabled"), false)
   gHz = asInt(setting("hz"), 10)
@@ -1120,6 +1238,18 @@ proc onLoad(): Status =
            "as INCONCLUSIVE until this is fixed."
     else:
       gDiagOn = true
+
+  # THE RECONCILE TIMER. Client-side, unconditional, and registered before the
+  # `enabled` gate for the same reason the diag timer is: a session that booted
+  # disabled is exactly the session in which an F12 edit has to be noticed.
+  if not gReconcileOn:
+    if every(ReconcilePeriodMs, onReconcileTick) != Ok:
+      warn ModName & ": the config reconcile timer did NOT register. Settings " &
+           "edits made from the F12 panel are answered by the SERVER instance " &
+           "and will NOT reach this process's draw mirror, so a map turned off " &
+           "in settings will stay on screen until the next launch."
+    else:
+      gReconcileOn = true
 
   if not gEnabled:
     info ModName & ": the live feed is OFF (config.json `enabled` is false), " &
