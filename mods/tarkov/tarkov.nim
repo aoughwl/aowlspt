@@ -3378,6 +3378,17 @@ proc tarkovSchema(): seq[Setting] =
                   category = "Loot/Presets",
       description = "aowlspt original (server emulator); acts on the SPT-derived database. WRITTEN BY THE SERVER, not by you: one sentence describing what the current loot configuration will actually do, recomputed from emu/loot.lootConfig() -- the same object the generator reads -- every time any loot row is saved. If this line disagrees with what you set, the generator agrees with THIS line."),
 
+    floatSetting("bossSpawnChanceMultiplier", "Boss spawn chance multiplier",
+                 1.0, lo = 0.0, hi = 5.0, step = 0.1,
+                 category = "Bots/Bosses",
+      description = "aowlspt original (server emulator); acts on the post-1.0 location table. Scales every boss's own BossChance before the server rolls it, once per raid, seeded from the raid id (emu/raid.rollBossSpawnList). 1.0 is BSG's own numbers -- Woods is Shturman 45%, the Goons 15%, Partisan 10%, Cultists 10%. 0 means no bosses at all. Anything at or above 2.0 makes most bosses certain, which is what the server used to do by accident."),
+    boolSetting("cultistsEnabled", "Cultists may spawn", true,
+                category = "Bots/Bosses",
+      description = "aowlspt original (server emulator); acts on the post-1.0 location table. The sectantPriest/sectantWarrior entries. They are the most expensive AI in the game and they roll independently of the map boss, so turning them off is the cheapest single thing you can do for raid framerate. On means they still only spawn at their data chance (10% on Woods), not every raid."),
+    boolSetting("bossSlotExclusive", "One map boss per raid", true,
+                category = "Bots/Bosses",
+      description = "aowlspt original (server emulator); acts on the post-1.0 location table. Bosses that compete for a map's boss slot -- Shturman OR the Goons on Woods, Reshala OR Wedge on Customs -- are rolled in the table's order and the first winner takes the slot. Off lets every one of them roll independently, which is the pre-fix behaviour and can put four boss groups in one raid. Partisan and the Cultists are not part of the slot and always roll on their own."),
+
     boolSetting("lootEnabled", "Loot enabled", true, category = "Loot/Global",
       description = "aowlspt original (server emulator); acts on the SPT-derived database. The master switch. Off means every map serves an empty floor, and the server says so in its log rather than serving a silent []."),
     floatSetting("lootGlobalMultiplier", "Global loot multiplier", 1.0,

@@ -15,6 +15,11 @@
   "mailKeepHours": 72,
   "mailKeepCollected": 1,
 
+  "_bossComment": "The Bosses page. Defaults are VANILLA: the server rolls each map's own BossChance once per raid, seeded from the raid id (emu/raid.rollBossSpawnList). Before this existed nothing read BossChance at all and every boss in a map's BossLocationSpawn spawned every raid -- one live Woods raid produced Shturman, the Goons, Partisan and the Cultists together, which the data puts at 0.07%.",
+  "bossSpawnChanceMultiplier": 1.0,
+  "cultistsEnabled": true,
+  "bossSlotExclusive": true,
+
   "_lootComment": "The Loot page. Every default below is the behaviour this emulator shipped with, so an untouched config generates the same floor it always did -- emu/loot.selfCheck asserts exactly that ('every new knob at its default reproduces the previous floor EXACTLY'). lootPreset is MOMENTARY (it writes the rows below and the page then shows what it wrote) and lootSummary is written BY the server, the same way spawnNow/spawnResult work. Docs: docs/LOOT-CONFIG.md.",
   "lootPreset": "custom",
   "lootSummary": "",
