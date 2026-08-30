@@ -3820,6 +3820,7 @@ static int32_t aowl_ov_panel_set(const char* key, const char* val) {
      * bools -- the same text `aowl_ov_settings_set` would have POSTed. */
     char v[64];
     int32_t n = 0;
+    int32_t mirrorHint = 0;
     const char* p = val;
     if (*p == '"') p++;
     while (*p && *p != '"' && n < (int32_t)sizeof(v) - 1) v[n++] = *p++;
@@ -3840,7 +3841,10 @@ static int32_t aowl_ov_panel_set(const char* key, const char* val) {
         g_ov.navW = a;
     } else if (!strcmp(key, "showFooter")) g_ov.showFooter = (v[0] == 't' || v[0] == '1');
     else if (!strcmp(key, "savePos"))      g_ov.savePos    = (v[0] == 't' || v[0] == '1');
-    else if (!strcmp(key, "hint"))         g_ov.hintEnabled= (v[0] == 't' || v[0] == '1');
+    else if (!strcmp(key, "hint")) {
+        g_ov.hintEnabled = (v[0] == 't' || v[0] == '1');
+        mirrorHint = 1;
+    }
     else if (!strcmp(key, "animate"))      g_ov.animate    = (v[0] == 't' || v[0] == '1');
     else if (!strcmp(key, "showUnimpl")) {
         g_ov.showUnimpl = (v[0] == 't' || v[0] == '1');
@@ -3855,6 +3859,52 @@ static int32_t aowl_ov_panel_set(const char* key, const char* val) {
         LeaveCriticalSection(&g_ov.cs);
         g_ov.dataSerial++;
     } else return 0;
+    /* THE LAUNCH TOAST'S OFF-SWITCH IS NOT DURABLE IN THE PREFS FILE ALONE.
+     *
+     * `hint` and `aowl.uihub`'s `launchHint` are the SAME value: both drive
+     * `g_ov.hintEnabled`. But the worker re-fetches
+     * `GET /aowlspt/settings/aowl.uihub` once per launch and OVERWRITES
+     * whatever the prefs file remembered (see the `!g_ov.hintFetched` block
+     * further down this file). So a `hint` write that only touched the prefs
+     * file came back on every launch -- the row LOOKED like an off-switch and
+     * was not one, which is exactly the silent-no-op shape CLAUDE.md 9b names.
+     *
+     * Mirroring it to the owner is what makes this row durable on its own, and
+     * that is what let the duplicate "Settings Panel" proxy page in
+     * `mods/settingshub` be deleted rather than merged.
+     *
+     * The value POSTed is `g_ov.hintEnabled` re-rendered as a BARE JSON bool,
+     * never the caller's `v` text: `v` has already had its quotes stripped, so
+     * forwarding it would persist the string "true" where a bool belongs, and
+     * a value that persists with the wrong type reads back as truthy forever.
+     *
+     * One owner, still: uihub keeps the guid, the route and the config key.
+     * This is a forward to the owner, not a second store. */
+    if (mirrorHint) {
+        char jbody[96];
+        char resp[1024];
+        int32_t rc;
+        aowl_ov_fmt(jbody, (int32_t)sizeof(jbody),
+                    "{\"key\":\"launchHint\",\"value\":%s}",
+                    g_ov.hintEnabled ? "true" : "false");
+        rc = aowl_ov_fetch(L"POST", L"/aowlspt/settings/aowl.uihub", jbody,
+                           resp, (int32_t)sizeof(resp));
+        /* BOTH outcomes are said out loud. A settings write that fails
+         * silently is the defect class this project keeps hitting: the row
+         * would flip on screen, persist to prefs, and be undone at the next
+         * launch with nothing anywhere saying why. */
+        aowl_ov_fmt(g_ov.hintWhy, (int32_t)sizeof(g_ov.hintWhy),
+                    rc > 0
+                      ? "launchHint WRITTEN to aowl.uihub = %d (durable)"
+                      : "launchHint = %d applied to this session ONLY: "
+                        "POST /aowlspt/settings/aowl.uihub did not answer, so "
+                        "the next launch will re-read the old value",
+                    g_ov.hintEnabled);
+        aowl_ov_note(g_ov.hintWhy);
+        /* Same kick the HTTP write path uses, so the settings bridge collects
+         * this edit now instead of on its own five-second schedule. */
+        InterlockedExchange(&g_ov.editKick, 1);
+    }
     /* Every one of these persists, and it persists NOW rather than at exit --
      * a crash must not be able to eat a preference the player just set. This
      * runs on the worker, which is the only thread allowed to write the file. */
