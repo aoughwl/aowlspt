@@ -298,6 +298,26 @@ proc arNamedRoot(roots: seq[Il2CppPtr]; name: string): Il2CppPtr =
       return r
     i = i + 1
 
+proc arIsPressable(node: Il2CppPtr; compType: string): bool =
+  ## READ-ONLY check (no Invoke) that `node` carries a live `compType`
+  ## (DefaultUIButton / AnimatedToggle) with a valid OnClick(+0x120) UnityEvent --
+  ## i.e. that `arPress` WOULD fire it. This is the fix for the atomic-press gap:
+  ## several GameObjects can share the name "PlayButton" (a wrapper/container plus
+  ## the real button); returning the first merely-ACTIVE one and then pressing it
+  ## a beat later hit a node with no DefaultUIButton and did nothing. Discovery
+  ## now returns only a node that is BOTH active AND pressable, so the immediate
+  ## press in the same tick always lands on the real button.
+  result = false
+  if node == nil: return
+  var comp: Il2CppPtr = nil
+  var w = ""
+  if not iVisComponent(node, compType, comp, w) or comp == nil: return
+  let off = cNavOffOnClick()
+  if not duOk(comp, off + 8'i32) or not iUnityAlive(comp): return
+  let ev = cReadPtrAt(comp, off)
+  if ev == nil or iIsGameObject(ev) or iIsKnownKlass(cast[uint64](ev)): return
+  result = true
+
 proc arPlayUnder(root: Il2CppPtr; deadline: uint64;
                  nMs, nPb, nActive: var int): Il2CppPtr =
   ## Re-find the LIVE PlayButton FRESH every tick, MenuScreen-first -- the shape
@@ -345,10 +365,13 @@ proc arPlayUnder(root: Il2CppPtr; deadline: uint64;
         let a = iActiveInHierarchy(pb)
         if a[0] and a[1]:
           inc nActive
-          if result == nil:
-            result = pb                    # first active; keep counting for the log
+          # Require BOTH active AND pressable: a same-named wrapper GameObject is
+          # active but has no DefaultUIButton, and returning it is what made the
+          # atomic press a no-op. Only a node arPress would actually fire wins.
+          if result == nil and arIsPressable(pb, "DefaultUIButton"):
+            result = pb
       pi = pi + 1
-    if result != nil: return               # a pressable PlayButton -- stop
+    if result != nil: return               # an active, PRESSABLE PlayButton -- stop
     mi = mi + 1
 
 proc arFindPlay(nMs, nPb, nActive: var int): Il2CppPtr =
@@ -544,21 +567,29 @@ proc arTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ar_tick_body", cdecl.}
     var nMs = 0
     var nPb = 0
     var nActive = 0
+    # arFindPlay returns an ACTIVE, PRESSABLE MenuScreen PlayButton (or nil) --
+    # arIsPressable already confirmed it carries a live DefaultUIButton with an
+    # OnClick UnityEvent. Press THAT EXACT node in THIS SAME tick: no "driving"
+    # log then a press on a later tick, and no re-find between finding and
+    # pressing (a re-find could return a transient/wrong node). The found node is
+    # the pressed node, atomically.
     let pb = arFindPlay(nMs, nPb, nActive)
     if pb != nil:
-      if not gArPlaySeen:
-        gArPlaySeen = true
-        okLog "autoRaid: menu ready (PlayButton visible under MenuScreen); " &
-              "driving into an OFFLINE raid on map \"" & gArMap & "\"."
+      gArPlaySeen = true
       if arPress(pb, "DefaultUIButton"):
-        okLog "autoRaid: pressed PLAY"
+        okLog "autoRaid: menu ready -- pressed PLAY (MenuScreen PlayButton, " &
+              "atomic find-and-press); driving into an OFFLINE raid on map \"" &
+              gArMap & "\"."
         gArLastPressed = nil
         gArLastActionMs = now
         arGoto(ArNext1)
     else:
       # No pressable PlayButton this tick -- log the candidate census (§9b), so a
-      # failure is EVIDENCE (was MenuScreen found? a PlayButton under it? active?)
-      # rather than a silent 180 s timeout. Rate-limited to ~10 s.
+      # failure is EVIDENCE (roots enumerated? MenuScreen found? a PlayButton
+      # under it? active?) rather than a silent 180 s timeout. `active` counts
+      # activeInHierarchy PlayButtons; a non-zero `active` with no press means the
+      # active one was not pressable (a same-named wrapper without a button).
+      # Rate-limited to ~10 s.
       if now - gArWaitLogMs > 10000'u64:
         gArWaitLogMs = now
         info "autoRaid WAIT-MENU: roots=" & $gArRootCount &
