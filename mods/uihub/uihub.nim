@@ -366,6 +366,268 @@ function numeric(row, onSave) {
   return wrap;
 }
 
+/* ---- the colour picker ------------------------------------------------
+ *
+ * ONE widget, used by every `type:"color"` row anywhere in the tree. That
+ * reusability is the point: a mod declares `colorSetting(...)` and gets this,
+ * rather than each overlay growing its own one-off swatch.
+ *
+ * The value on the wire is the shape the HOST already parses out of
+ * `aowlspt-debugui.json` -- "r,g,b" or "r,g,b,a", components 0..1. Nothing
+ * downstream had to learn a new format.
+ *
+ * ROUND-TRIP, which is the part that is easy to get quietly wrong: the floats
+ * are the source of truth and hex is a LOSSY VIEW of them, never the storage.
+ * Storing 0..255 ints instead would turn 0.62 into 158/255 = 0.6196... on the
+ * first save -- a change the user never asked for, that looks exactly like the
+ * setting failing to persist. Values are emitted at 4 decimal places, which is
+ * idempotent: parse(fmt(x)) === fmt(x) for anything this widget ever writes, so
+ * re-saving an untouched colour cannot drift it.
+ *
+ * ALPHA is preserved but never invented: a value that arrived with three
+ * components is written back with three. */
+function cfmt(v) {
+  if (!isFinite(v)) v = 0;
+  if (v < 0) v = 0; if (v > 1) v = 1;
+  return String(Math.round(v * 10000) / 10000);
+}
+function chex2(v) {
+  var n = Math.round(v * 255);
+  if (n < 0) n = 0; if (n > 255) n = 255;
+  var s = n.toString(16);
+  return s.length < 2 ? '0' + s : s;
+}
+function parseColor(text) {
+  /* Returns {r,g,b,a,hasA}. Anything unparseable falls back to opaque white --
+   * a visible, obviously-wrong colour beats a silently black swatch that reads
+   * as a legitimate choice. */
+  var c = { r: 1, g: 1, b: 1, a: 1, hasA: false };
+  var s = String(text === undefined || text === null ? '' : text).trim();
+  if (s.charAt(0) === '#') {
+    var h = s.slice(1);
+    if (h.length === 3) h = h.charAt(0) + h.charAt(0) + h.charAt(1) + h.charAt(1) + h.charAt(2) + h.charAt(2);
+    if (h.length === 6 || h.length === 8) {
+      var v = parseInt(h, 16);
+      if (!isNaN(v)) {
+        if (h.length === 8) {
+          c.r = ((v >>> 24) & 255) / 255; c.g = ((v >>> 16) & 255) / 255;
+          c.b = ((v >>> 8) & 255) / 255;  c.a = (v & 255) / 255; c.hasA = true;
+        } else {
+          c.r = ((v >>> 16) & 255) / 255; c.g = ((v >>> 8) & 255) / 255;
+          c.b = (v & 255) / 255;
+        }
+      }
+    }
+    return c;
+  }
+  var parts = s.split(',');
+  var nums = [];
+  for (var i = 0; i < parts.length; i++) {
+    var n = parseFloat(parts[i]);
+    if (isNaN(n)) return c;
+    /* Tolerate a 0..255 colour written by hand: if ANY component exceeds 1 the
+     * whole tuple is read as 0..255. Per-component guessing would turn
+     * "255,0,0" into "1,0,0" only for the red channel. */
+    nums.push(n);
+  }
+  if (nums.length < 3) return c;
+  var scale = 1;
+  for (var j = 0; j < nums.length; j++) if (nums[j] > 1) scale = 255;
+  c.r = nums[0] / scale; c.g = nums[1] / scale; c.b = nums[2] / scale;
+  if (nums.length >= 4) { c.a = nums[3] / (scale === 255 ? 255 : 1); c.hasA = true; }
+  return c;
+}
+function colorText(c) {
+  var s = cfmt(c.r) + ',' + cfmt(c.g) + ',' + cfmt(c.b);
+  if (c.hasA) s += ',' + cfmt(c.a);
+  return s;
+}
+function cssOf(c) {
+  return 'rgba(' + Math.round(c.r * 255) + ',' + Math.round(c.g * 255) + ',' +
+         Math.round(c.b * 255) + ',' + c.a + ')';
+}
+/* HSV <-> RGB, so the saturation/value field and the hue strip mean what they
+ * look like they mean. */
+function rgb2hsv(c) {
+  var mx = Math.max(c.r, c.g, c.b), mn = Math.min(c.r, c.g, c.b), d = mx - mn;
+  var h = 0;
+  if (d > 0) {
+    if (mx === c.r) h = ((c.g - c.b) / d + (c.g < c.b ? 6 : 0)) / 6;
+    else if (mx === c.g) h = ((c.b - c.r) / d + 2) / 6;
+    else h = ((c.r - c.g) / d + 4) / 6;
+  }
+  return { h: h, s: mx === 0 ? 0 : d / mx, v: mx };
+}
+function hsv2rgb(h, s, v) {
+  var i = Math.floor(h * 6), f = h * 6 - i;
+  var p = v * (1 - s), q = v * (1 - f * s), t = v * (1 - (1 - f) * s);
+  switch (i % 6) {
+    case 0: return { r: v, g: t, b: p };
+    case 1: return { r: q, g: v, b: p };
+    case 2: return { r: p, g: v, b: t };
+    case 3: return { r: p, g: q, b: v };
+    case 4: return { r: t, g: p, b: v };
+    default: return { r: v, g: p, b: q };
+  }
+}
+function colorpicker(row, onSave) {
+  var c = parseColor(row.value);
+  var hsv = rgb2hsv(c);
+  var wrap = el('span', 'cp');
+  var sw = el('button', 'cp-sw');           /* the preview, and the opener */
+  sw.type = 'button';
+  var pop = el('div', 'cp-pop');
+  pop.style.display = 'none';
+
+  /* Live apply while dragging, without one POST per mouse-move. The trailing
+   * call is unconditional, so the value the user let go on is always the one
+   * that gets persisted -- a debounce that can drop the LAST event would leave
+   * the screen and the disk disagreeing. */
+  var timer = null, pending = null;
+  function commit(now) {
+    pending = colorText(c);
+    if (now) {
+      if (timer) { clearTimeout(timer); timer = null; }
+      onSave(pending);
+      return;
+    }
+    if (timer) return;
+    timer = setTimeout(function () { timer = null; onSave(pending); }, 60);
+  }
+
+  var field = el('div', 'cp-field');        /* saturation x value */
+  var fdot = el('div', 'cp-dot');
+  field.appendChild(fdot);
+  var hue = el('div', 'cp-hue');
+  var hdot = el('div', 'cp-hdot');
+  hue.appendChild(hdot);
+  var hexbox = el('input', 'cp-hex');
+  hexbox.type = 'text';
+  var rows = el('div', 'cp-rgba');
+  var chans = [];
+
+  function paint() {
+    var pure = hsv2rgb(hsv.h, 1, 1);
+    field.style.background =
+      'linear-gradient(to top, #000, transparent), ' +
+      'linear-gradient(to right, #fff, ' + cssOf({ r: pure.r, g: pure.g, b: pure.b, a: 1 }) + ')';
+    fdot.style.left = (hsv.s * 100) + '%';
+    fdot.style.top = ((1 - hsv.v) * 100) + '%';
+    hdot.style.left = (hsv.h * 100) + '%';
+    sw.style.background = cssOf(c);
+    hexbox.value = '#' + chex2(c.r) + chex2(c.g) + chex2(c.b) + (c.hasA ? chex2(c.a) : '');
+    for (var i = 0; i < chans.length; i++) {
+      var ch = chans[i];
+      ch.sl.value = c[ch.k];
+      ch.nb.value = cfmt(c[ch.k]);
+    }
+  }
+  function fromHsv() {
+    var n = hsv2rgb(hsv.h, hsv.s, hsv.v);
+    c.r = n.r; c.g = n.g; c.b = n.b;
+  }
+
+  /* The two 2-D/1-D drags. Pointer events, captured, so a drag that leaves the
+   * element still tracks and still ends -- a mouseup lost outside the popover
+   * is how a picker gets stuck painting. */
+  function dragger(elm, move) {
+    function at(ev) {
+      var b = elm.getBoundingClientRect();
+      var x = (ev.clientX - b.left) / b.width, y = (ev.clientY - b.top) / b.height;
+      move(Math.max(0, Math.min(1, x)), Math.max(0, Math.min(1, y)));
+      paint();
+      commit(false);
+    }
+    elm.onpointerdown = function (ev) {
+      elm.setPointerCapture(ev.pointerId);
+      elm.__drag = true; at(ev); ev.preventDefault();
+    };
+    elm.onpointermove = function (ev) { if (elm.__drag) at(ev); };
+    elm.onpointerup = function (ev) {
+      if (!elm.__drag) return;
+      elm.__drag = false;
+      try { elm.releasePointerCapture(ev.pointerId); } catch (e) {}
+      commit(true);                         /* the drop always persists */
+    };
+    elm.onpointercancel = elm.onpointerup;
+  }
+  dragger(field, function (x, y) { hsv.s = x; hsv.v = 1 - y; fromHsv(); });
+  dragger(hue, function (x) { hsv.h = x; fromHsv(); });
+
+  /* R/G/B/A sliders + typed boxes. Alpha is offered only when the declared
+   * value carried one -- see the note on `hasA`. */
+  var keys = c.hasA ? ['r', 'g', 'b', 'a'] : ['r', 'g', 'b'];
+  keys.forEach(function (k) {
+    var line = el('div', 'cp-ch');
+    var lab = el('span', 'cp-chl'); lab.textContent = k.toUpperCase();
+    var sl = el('input', 'cp-chs');
+    sl.type = 'range'; sl.min = 0; sl.max = 1; sl.step = 0.0001;
+    var nb = el('input', 'cp-chn');
+    nb.type = 'number'; nb.min = 0; nb.max = 1; nb.step = 0.01;
+    sl.oninput = function () {
+      c[k] = parseFloat(sl.value);
+      if (k !== 'a') hsv = rgb2hsv(c);
+      paint(); commit(false);
+    };
+    sl.onchange = function () { commit(true); };
+    nb.onchange = function () {
+      var v = parseFloat(nb.value);
+      if (isNaN(v)) { paint(); return; }
+      c[k] = Math.max(0, Math.min(1, v));
+      if (k !== 'a') hsv = rgb2hsv(c);
+      paint(); commit(true);
+    };
+    chans.push({ k: k, sl: sl, nb: nb });
+    line.appendChild(lab); line.appendChild(sl); line.appendChild(nb);
+    rows.appendChild(line);
+  });
+
+  hexbox.onchange = function () {
+    var p = parseColor(hexbox.value.trim());
+    /* A hex edit must not silently GAIN or LOSE the alpha channel the config
+     * key is declared with; only the RGB (and A, when there already was one)
+     * are taken. */
+    c.r = p.r; c.g = p.g; c.b = p.b;
+    if (c.hasA && p.hasA) c.a = p.a;
+    hsv = rgb2hsv(c);
+    paint(); commit(true);
+  };
+
+  sw.onclick = function () {
+    pop.style.display = pop.style.display === 'none' ? 'block' : 'none';
+  };
+  pop.appendChild(field); pop.appendChild(hue); pop.appendChild(rows);
+  var hexline = el('div', 'cp-hexline');
+  var hexlab = el('span', 'cp-chl'); hexlab.textContent = 'HEX';
+  hexline.appendChild(hexlab); hexline.appendChild(hexbox);
+  pop.appendChild(hexline);
+  wrap.appendChild(sw); wrap.appendChild(pop);
+  paint();
+  return wrap;
+}
+
+/* THE FALSIFIABLE NEGATIVE (CLAUDE.md 9b).
+ *
+ * The claim this project keeps needing to make is "every settings row is bound
+ * to a real control". The tempting way to check it is to count the rows that
+ * were wired -- which is a self-comparison and cannot fail: the counter is
+ * incremented by the same code that does the wiring, so it agrees with itself
+ * whatever happens.
+ *
+ * So the check is stated the other way round, as a property of the FINISHED
+ * SCREEN that a change can break: after drawing, NO row fell through to the
+ * generic text box carrying a type this switch does not deliberately handle.
+ * The input that makes it fail is real and cheap to produce -- a mod declaring
+ * a new `SettingType` whose `kindName` is not added here. It fails LOUDLY, on
+ * screen, naming the offending keys, rather than rendering them as text boxes
+ * that look bound and are not.
+ *
+ * Three outcomes, not two: an empty screen reports INCONCLUSIVE, because "no
+ * rows were examined" is not "no rows are unbound". */
+var BOUND_TYPES = ['bool', 'int', 'float', 'enum', 'select', 'string',
+                   'keybind', 'color'];
+var UNBOUND = [];
+
 /* The one switch on `row.type`. Everything that draws a settings row in this
  * project goes through here. */
 function controlFor(row, onSave) {
@@ -391,8 +653,15 @@ function controlFor(row, onSave) {
     e.onchange = function () { onSave(e.value); };
   } else if (row.type === 'int' || row.type === 'float') {
     e = numeric(row, onSave);
+  } else if (row.type === 'color') {
+    e = colorpicker(row, onSave);
   } else {
-    e = el('input');                        /* string / keybind */
+    /* string / keybind -- AND anything this switch has never heard of. That
+     * fallthrough is the thing the check below exists to catch: a text box is a
+     * reasonable degrade for a `string`, and a silent LIE for a type that was
+     * supposed to get a real control. See BOUND_TYPES. */
+    if (BOUND_TYPES.indexOf(row.type) < 0) UNBOUND.push(row.key + ' (' + row.type + ')');
+    e = el('input');
     e.type = 'text';
     e.value = row.value;
     e.onchange = function () { onSave(e.value); };
@@ -422,6 +691,7 @@ function mount(root, opts) {
     '<div id="aw-mods"></div><div id="aw-cats"></div></nav>' +
     '<main id="aw-main"><div id="aw-titlebar"><h1 id="aw-title">aowlspt settings</h1>' +
     '<span id="aw-count"></span><button id="aw-resetall" style="display:none">Reset everything to default</button></div>' +
+    '<div id="aw-unbound" class="aw-verdict" style="display:none"></div>' +
     '<div id="aw-body"></div><div id="aw-sentinel"></div></main>';
 
   var $ = function (id) { return root.querySelector('#' + id); };
@@ -490,6 +760,7 @@ function mount(root, opts) {
     });
     state.flat = flat;
     state.drawn = 0;
+    UNBOUND = [];                 /* re-measured every render, never cumulative */
     body.innerHTML = '';
     $('aw-count').textContent = state.query
       ? shownCount + ' of ' + total + ' settings match'
@@ -505,6 +776,37 @@ function mount(root, opts) {
     /* If the batch did not fill the viewport there is nothing to scroll and
      * the sentinel would never fire again -- keep going until it does. */
     if (state.drawn < state.flat.length && main.scrollHeight <= main.clientHeight + 40) drawMore();
+    reportBinding();
+  }
+
+  /* The verdict for the check described above BOUND_TYPES. Deliberately scoped
+   * to the rows ACTUALLY DRAWN so far -- the list is chunked, so claiming
+   * anything about rows that have not been reached yet would be the "I could
+   * not look, therefore PASS" failure this is written to avoid. */
+  function reportBinding() {
+    var banner = $('aw-unbound');
+    if (!banner) return;
+    var drawnRows = 0;
+    for (var i = 0; i < state.drawn; i++) if (state.flat[i].t === 'row') drawnRows++;
+    if (drawnRows === 0) {
+      banner.style.display = 'block';
+      banner.className = 'aw-verdict aw-inconc';
+      banner.textContent = 'INCONCLUSIVE: no settings rows were drawn, so ' +
+        'nothing was examined for unbound controls.';
+      return;
+    }
+    if (UNBOUND.length === 0) {
+      banner.style.display = 'none';
+      banner.textContent = '';
+      return;
+    }
+    banner.style.display = 'block';
+    banner.className = 'aw-verdict aw-fail';
+    banner.textContent = 'FAIL: ' + UNBOUND.length + ' of ' + drawnRows +
+      ' drawn rows fell through to a plain text box because this UI has no ' +
+      'control for their declared type -- ' + UNBOUND.slice(0, 8).join(', ') +
+      (UNBOUND.length > 8 ? ', ...' : '') +
+      '. They render but are not really bound.';
   }
 
   function nodeFor(item) {
@@ -756,6 +1058,31 @@ const PageHtml = """<!doctype html>
   .aw-row.dim { opacity:.5; }
   .aw-row input[type=text], .aw-row select, .ta-input { background:#222; color:#ddd; border:1px solid #333; border-radius:4px; padding:5px 8px; min-width:170px; }
   .num { display:inline-flex; align-items:center; gap:10px; }
+  .aw-verdict { margin:8px 0; padding:8px 10px; border-radius:5px; font-size:12px; line-height:1.5; }
+  .aw-fail { background:#3a1f1f; border:1px solid #6a3030; color:#f0b0b0; }
+  .aw-inconc { background:#332d1c; border:1px solid #63552c; color:#e6d29a; }
+  .cp { position:relative; display:inline-block; }
+  .cp-sw { width:54px; height:26px; border:1px solid #444; border-radius:4px; cursor:pointer; padding:0;
+           background-image:linear-gradient(45deg,#555 25%,transparent 25%,transparent 75%,#555 75%),
+                            linear-gradient(45deg,#555 25%,transparent 25%,transparent 75%,#555 75%);
+           background-size:8px 8px; background-position:0 0,4px 4px; }
+  .cp-pop { position:absolute; right:0; top:30px; z-index:40; background:#1b1b1b; border:1px solid #383838;
+            border-radius:7px; padding:10px; width:212px; box-shadow:0 6px 20px rgba(0,0,0,.6); }
+  .cp-field { position:relative; height:120px; border-radius:4px; cursor:crosshair; touch-action:none; }
+  .cp-dot { position:absolute; width:11px; height:11px; margin:-6px 0 0 -6px; border:2px solid #fff;
+            border-radius:50%; box-shadow:0 0 2px #000; pointer-events:none; }
+  .cp-hue { position:relative; height:13px; margin-top:9px; border-radius:3px; cursor:ew-resize; touch-action:none;
+            background:linear-gradient(to right,#f00,#ff0,#0f0,#0ff,#00f,#f0f,#f00); }
+  .cp-hdot { position:absolute; top:-2px; width:5px; height:17px; margin-left:-3px; border:2px solid #fff;
+             border-radius:3px; box-shadow:0 0 2px #000; pointer-events:none; }
+  .cp-ch { display:flex; align-items:center; gap:6px; margin-top:6px; }
+  .cp-chl { width:26px; font-size:10px; color:#8a8a8a; letter-spacing:.05em; }
+  .cp-chs { flex:1; min-width:0; accent-color:#5a86c9; }
+  .cp-chn { width:62px; background:#222; color:#ddd; border:1px solid #333; border-radius:4px;
+            padding:2px 4px; font-size:11px; }
+  .cp-hexline { display:flex; align-items:center; gap:6px; margin-top:8px; }
+  .cp-hex { flex:1; min-width:0; background:#222; color:#ddd; border:1px solid #333; border-radius:4px;
+            padding:3px 6px; font-size:11px; font-family:ui-monospace, Consolas, monospace; }
   .num-slider { width:150px; accent-color:#5a86c9; }
   .num-box { background:#222; color:#ddd; border:1px solid #333; border-radius:4px; padding:5px 8px; width:86px; }
   .aw-row input[type=checkbox] { width:18px; height:18px; }

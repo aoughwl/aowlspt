@@ -188,9 +188,11 @@ proc debugSchema(): seq[Setting] =
     intSetting("overlayThrottle", "Refresh every N frames", 10,
                lo = 1, hi = 600, category = "Overlay",
                description = "aowlspt original (F3 debug overlay). The panel rebuilds its text every Nth frame. 1 is smoothest and costs the most; 10 is the shipped default and is imperceptible."),
-    stringSetting("overlayColor", "Colour (r,g,b)", "1,1,0.62",
-                  category = "Overlay",
-      description = "aowlspt original (F3 debug overlay)."),
+    colorSetting("overlayColor", "Text colour", "1,1,0.62",
+                 category = "Overlay",
+      description = "aowlspt original (F3 debug overlay). Applies as you drag: " &
+                    "the host re-reads aowlspt-debugui.json while the panel is " &
+                    "on screen, so no F3 off/on cycle is needed."),
     intSetting("overlayToggleKey", "Toggle key (virtual-key code)", 114,
                lo = 0, hi = 255, category = "Overlay",
                description = "aowlspt original (F3 debug overlay). 114 is VK_F3, which is the Minecraft key and the shipped default. 0 disables the toggle."),
@@ -294,17 +296,30 @@ proc writeOverlayConfig() =
   try: back = readFile(path)
   except: back = ""
   let want = setting("overlayFields").asText(DefaultFields)
+  # The COLOUR is checked the same way and for a sharper reason: a colour is the
+  # one value here that can come back *plausible but different*. A field list
+  # either survives or is visibly mangled, but a colour that drifts from
+  # "1,1,0.62" to "1,1,0.6200000000000001" still renders as the right yellow, so
+  # nothing on screen would ever reveal it -- and the next save would drift it
+  # again. Asserting the EXACT text off disk is what makes that falsifiable.
+  let wantColor = setting("overlayColor").asText("1,1,0.62")
   if back.len == 0:
     gOverlayWriteState = "INCONCLUSIVE: wrote " & path &
                          " but could not read it back"
   elif not back.contains(jstr(want)):
     gOverlayWriteState = "FAILED: " & path &
                          " does not read back with the requested line list"
+  elif not back.contains(jstr(wantColor)):
+    gOverlayWriteState = "FAILED: " & path & " does not read back the colour " &
+                         "that was set (wanted " & wantColor & " verbatim) -- " &
+                         "the value drifted between the settings edit and disk"
   else:
     gOverlayWrites = gOverlayWrites + 1
     gOverlayWriteState = "PASS: " & path & " reads back with " &
-                         $(want.split(',').len) & " lines (write #" &
-                         $gOverlayWrites & "). Press F3 off and on to reload."
+                         $(want.split(',').len) & " lines and colour " &
+                         wantColor & " byte-for-byte (write #" &
+                         $gOverlayWrites & "). The host picks this up live " &
+                         "while the panel is on screen; no F3 cycle needed."
 
 proc applyConfig() =
   gSpinMs = setting("selfTestSpinMs").asFloat(0.0)

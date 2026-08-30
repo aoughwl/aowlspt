@@ -377,6 +377,14 @@ var gDuCfg = DuLayout(panelOn: true, panelAnchor: "topleft",
                       note1: "", note2: "", note3: "",
                       loaded: false, source: "")
 
+var gDuCfgText = ""
+  ## The exact text of `aowlspt-debugui.json` as of the last successful load.
+  ## Held so the live-reload check can tell "the file changed" from "the file
+  ## is still there", WITHOUT re-parsing it every time it looks. Comparing the
+  ## raw text is the honest test: comparing parsed fields would miss a change
+  ## to any key this struct does not carry, and comparing a modification
+  ## timestamp would fire on a rewrite that changed nothing.
+
 proc duTrim(s: string): string =
   ## Leading/trailing ASCII whitespace off a value token. Written out rather
   ## than reached for in strutils because the value may legitimately contain
@@ -617,6 +625,95 @@ proc duLoadLayout() =
   gDuCfg.espB = eb
   gDuCfg.loaded = true
   gDuCfg.source = "aowlspt-debugui.json"
+  gDuCfgText = text
+
+# ---------------------------------------------------------------------------
+# LIVE APPLY -- re-read the layout file while the panel is on screen
+#
+# THE BUG THIS CLOSES, stated as a measurement rather than a belief: before
+# this, `duLoadLayout` had exactly three call sites -- once at arm time, and
+# twice on the F3 toggle-ON edge (`duEditKeys`). So a settings change made
+# while the overlay was VISIBLE -- font size, X/Y offset, colour, throttle --
+# reached `aowlspt-debugui.json` correctly and then sat there, because nothing
+# read the file again until the user toggled the panel off and on. From the
+# player's seat that is indistinguishable from "the setting does nothing",
+# which is exactly the complaint.
+#
+# What this is NOT: it is not an il2cpp path. It reads a file and writes our
+# own struct; there is no managed pointer to hop, no method to byte-verify and
+# nothing for `aowl_p_p_seh` to guard that the enclosing region does not already
+# guard. Saying "guarded" about it would be theatre. What it DOES carry is the
+# rest of the discipline that applies: it is throttled (never per-frame), it is
+# bounded (one read of one small file), it self-disables after
+# `cDuReloadMaxFaults` consecutive read failures rather than retrying forever,
+# and it can be switched off from the file it watches.
+#
+# The re-parse is skipped unless the file's TEXT actually changed, so the steady
+# state costs one read and one string compare per second and never touches the
+# config the renderer is reading.
+# ---------------------------------------------------------------------------
+
+const
+  cDuReloadEveryFires = 30
+    ## Check about twice a second at 60fps. Fast enough that dragging a colour
+    ## picker looks continuous; slow enough to be free.
+  cDuReloadMaxFaults = 5
+
+var gDuReloadFaults = 0
+var gDuReloadOff = false
+var gDuReloads = 0
+
+proc duHotReloadTick(fires: int): bool =
+  ## Re-read `aowlspt-debugui.json` if it has changed since the last read.
+  ## Called from the draw region, only while something is actually on screen.
+  ## Returns TRUE when the config was re-parsed, so the caller can refresh the
+  ## widget layout too.
+  ##
+  ## `fires` is passed in rather than read from the module's frame counter, and
+  ## the widget reload is left to the caller, purely so this can sit beside
+  ## `duLoadLayout` -- the loader it reuses -- instead of being pushed to the
+  ## bottom of the file away from the schema it is about.
+  result = false
+  if gDuReloadOff:
+    return
+  if (fires mod cDuReloadEveryFires) != 0:
+    return
+  # An explicit off switch, honoured from the config we last successfully read
+  # -- so a user who does not want their file watched can say so in the file.
+  if not duCfgBool(gDuCfgText, "panelLiveReload", true):
+    return
+  var text = ""
+  if not readTextFile(joinPath(gDir, "aowlspt-debugui.json"), text):
+    # A read that fails is usually the writer holding the file for the instant
+    # it takes to rewrite it -- transient, and not worth a log line. Only a
+    # PERSISTENT failure means something is wrong, and that is what the counter
+    # measures.
+    gDuReloadFaults = gDuReloadFaults + 1
+    if gDuReloadFaults >= cDuReloadMaxFaults:
+      gDuReloadOff = true
+      warn "debugui: live config reload DISABLED after " & $gDuReloadFaults &
+           " consecutive failures to read aowlspt-debugui.json. The panel " &
+           "keeps the settings it last read; toggle it off and on to pick up " &
+           "a change."
+    return
+  gDuReloadFaults = 0
+  if text.len == 0 or text == gDuCfgText:
+    return
+  # Changed. Re-parse through the SAME loader the boot path uses -- a second
+  # parser here is how the file would come to mean two different things
+  # depending on which code path read it.
+  duLoadLayout()
+  result = true
+  gDuReloads = gDuReloads + 1
+  if gDuReloads <= 3:
+    # Say so the first few times, then stop: this fires on every drag of a
+    # slider and would otherwise bury the log.
+    okLog "debugui: aowlspt-debugui.json changed on disk -- re-read and " &
+          "applied live (font=" & $int(gDuCfg.panelFont) &
+          " x=" & $int(gDuCfg.panelX) & " y=" & $int(gDuCfg.panelY) &
+          " colour=" & $int(gDuCfg.panelR * 255.0) & "," &
+          $int(gDuCfg.panelG * 255.0) & "," & $int(gDuCfg.panelB * 255.0) &
+          "). No F3 off/on cycle was needed."
 
 var gDuGameWorld: Il2CppPtr = nil
 
@@ -2197,6 +2294,13 @@ proc duRegionDraw(user: pointer; frame: int64) {.exportc: "aowl_du_region_draw",
   # hidden overlay never records a frame at all.
   cWgStageBegin()
   cWgCrumb(WgCrumbEnter)
+  # LIVE APPLY. Placed here, after the "is anything on screen" early return and
+  # inside the stage window, so it is measured like every other stage and a
+  # hidden overlay never reads the file at all. When the file really changed,
+  # the widget layout is refreshed too -- the config and the widget file are
+  # written by the same settings action and must not be applied a second apart.
+  if duHotReloadTick(gDuFires):
+    duLoadWidgets()
   # Throttle. The panel is a debug read-out, not an instrument: recomposing it
   # every Nth frame is indistinguishable to a human and costs a fraction as
   # much. The SUBMISSION is not throttled -- the command buffer is rebuilt from
