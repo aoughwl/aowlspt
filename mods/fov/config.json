@@ -59,6 +59,12 @@
   "unAimSpeedY": 4.5,
   "unAimSpeedZ": 4.5,
 
+  "enableAdsSmoothing": true,
+  "adsSmoothTime": 0.16,
+  "unAdsSmoothTime": 0.12,
+  "useAimSpeedsForFovSmoothing": true,
+  "adsSmoothLinear": false,
+
   "enableFovWrite": true,
   "verifyHooksByName": false,
   "deferUntilUnityThread": true,
