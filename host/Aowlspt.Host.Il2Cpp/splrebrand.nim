@@ -159,8 +159,17 @@ static void* aowl_spl_tick_guarded(void* a) {
 proc cSplTickGuarded(a: Il2CppPtr): Il2CppPtr {.
   importc: "aowl_spl_tick_guarded", nodecl.}
 
-# ---- state (gSplOn is set in the flag-reading pass in aowlhost.nim) ----
+# ---- state (gSplOn / gSplForceOffline are set in the flag pass in aowlhost.nim) ----
 var gSplOn = false                 ## the `singleplayerRebrand` flag; DEFAULT OFF
+var gSplForceOffline = false       ## the `forceOfflinePractice` flag; DEFAULT ON.
+                                   ## When set, the practice/offline toggle on the
+                                   ## Matchmaker Offline Raid Screen is AUTO-forced
+                                   ## ON (Toggle::set_isOn @0x55BA430, fact #71) as
+                                   ## soon as the screen appears, so a raid entered
+                                   ## by pressing straight through the menus (no
+                                   ## manual tick) stays OFFLINE and never enters
+                                   ## NetworkGameMatching (fact #263). Independent of
+                                   ## the rebrand: it never relabels or hides.
 var gSplOff = false                ## self-disabled after faults
 var gSplFaults = 0
 var gSplT0 = 0'u64
@@ -608,35 +617,40 @@ proc splCacheStale(): bool =
     not iUnityAlive(gSplHeadTmp)
 
 proc splMaintain() =
-  ## Re-apply the branding on drift (LocalizedText re-clobbers m_text on a
-  ## localisation refresh) and keep the checkbox hidden. Then, ONCE, assert the
-  ## finished state and log PASS/FAIL/INCONCLUSIVE per target.
-  # Heading -- the primary deliverable.
-  let headLow = iLower(splTmpText(gSplHeadTmp))
+  ## Two independent jobs, each gated by its own flag:
+  ##   * forceOfflinePractice (gSplForceOffline): keep the practice/offline
+  ##     toggle forced ON so a raid stays offline (fact #263/#71). Box left
+  ##     VISIBLE and ticked -- no relabel, no hide.
+  ##   * singleplayerRebrand (gSplOn): relabel the heading/description, force the
+  ##     toggle ON and then HIDE the checkbox, and hide the co-op warning.
+  ## Then, ONCE, assert the FINISHED STATE and log PASS/FAIL/INCONCLUSIVE.
+
+  # ---- Heading + description: the REBRAND only. ----
   var headOk = false
-  if iContains(headLow, iLower(SplHeadNew)):
-    headOk = true
-  else:
-    discard splSetText(gSplHeadTmp, gSplHeadLoc, SplHeadNew)
-
-  # Description -- optional; only maintained if it was found.
-  var descState = 2   # 0 FAIL, 1 PASS, 2 INCONCLUSIVE (not found)
-  if gSplDescTmp != nil and duOk(gSplDescTmp, 0xE8'i32) and iUnityAlive(gSplDescTmp):
-    if iContains(iLower(splTmpText(gSplDescTmp)), iLower(SplDescNew)):
-      descState = 1
+  var descState = 2   # 0 FAIL, 1 PASS, 2 INCONCLUSIVE (not found / not wanted)
+  if gSplOn:
+    let headLow = iLower(splTmpText(gSplHeadTmp))
+    if iContains(headLow, iLower(SplHeadNew)):
+      headOk = true
     else:
-      discard splSetText(gSplDescTmp, gSplDescLoc, SplDescNew)
-      descState = 0
+      discard splSetText(gSplHeadTmp, gSplHeadLoc, SplHeadNew)
+    if gSplDescTmp != nil and duOk(gSplDescTmp, 0xE8'i32) and iUnityAlive(gSplDescTmp):
+      if iContains(iLower(splTmpText(gSplDescTmp)), iLower(SplDescNew)):
+        descState = 1
+      else:
+        discard splSetText(gSplDescTmp, gSplDescLoc, SplDescNew)
+        descState = 0
 
-  # Practice toggle -- FORCE to the wanted value, THEN hide. Order matters: the
-  # notifying `set_isOn` must run while the GameObject is ACTIVE so the game's
-  # onValueChanged listener (which selects the mode) fires. The box is hidden
-  # ONLY once its m_IsOn has read back as the wanted value -- a hidden box with
-  # an unknown value is exactly the failure this guards against.
+  # ---- Practice toggle: FORCE ON whenever EITHER feature is active (the offline
+  # mechanism -- the notifying `set_isOn` runs while the GameObject is ACTIVE so
+  # the game's onValueChanged listener, which selects the mode, fires). HIDE the
+  # checkbox ONLY for the rebrand; forceOfflinePractice leaves the (now ticked)
+  # box VISIBLE so the user can see practice mode is on.
   var forceState = 2   # 2 INCONCLUSIVE/REFUSED, 1 PASS (readback == wanted), 0 FAIL
-  var hideState  = 2   # 2 INCONCLUSIVE/REFUSED, 1 PASS (activeInHierarchy==false), 0 acting
+  var hideState  = 2   # 2 INCONCLUSIVE/REFUSED/not-wanted, 1 PASS (hidden), 0 acting
   let wantOn = (if SplForceIsOn: 1'i32 else: 0'i32)
-  if gSplToggle != nil and duOk(gSplToggle, cSwOffToggleIsOn() + 8'i32) and
+  if (gSplForceOffline or gSplOn) and
+     gSplToggle != nil and duOk(gSplToggle, cSwOffToggleIsOn() + 8'i32) and
      gSplCheckGo != nil and duOk(gSplCheckGo, 0x20'i32) and iUnityAlive(gSplCheckGo):
     if nuActiveInHierarchy(gSplCheckGo):
       discard splForceToggle()              # forces set_isOn (sets gSplForceRefused if the RVA is UNVERIFIED)
@@ -647,77 +661,94 @@ proc splMaintain() =
       # unreliable for UpdatableToggle (it read FAIL while the box visibly ticks).
       # Offline is decided by the emulated backend, not by this client checkbox,
       # so hiding a correctly-forced box cannot strand us online. Only if the RVA
-      # itself could not be verified (gSplForceRefused) is the box left visible.
-      if not gSplForceRefused:
+      # itself could not be verified (gSplForceRefused) is the box left visible,
+      # and hiding is a REBRAND concern only.
+      if gSplOn and not gSplForceRefused:
         discard nuSetActive(gSplCheckGo, false)
-    # Assert the FINISHED STATE.
+    # Assert the FINISHED STATE of the FORCE (both features care about this).
     if not gSplForceRefused:
       forceState = (if cSwReadU8(gSplToggle, cSwOffToggleIsOn()) == wantOn: 1 else: 0)
-    if gSplForceRefused:
-      hideState = 2                          # could not force -> box left VISIBLE
-    elif not nuActiveInHierarchy(gSplCheckGo):
-      hideState = 1
-    else:
-      hideState = 0
+    # The HIDE finished-state is a rebrand-only assertion.
+    if gSplOn:
+      if gSplForceRefused:
+        hideState = 2                        # could not force -> box left VISIBLE
+      elif not nuActiveInHierarchy(gSplCheckGo):
+        hideState = 1
+      else:
+        hideState = 0
 
-  # Co-op / Edge-of-Darkness "progress is not saved/shared" warning -- hide the
-  # whole container (content-discovery + SetActive, no write into game code).
-  # Assert the FINISHED STATE (activeInHierarchy == false), not that SetActive
+  # ---- Co-op / Edge-of-Darkness "progress is not saved/shared" warning: the
+  # REBRAND only -- hide the whole container (content-discovery + SetActive, no
+  # write into game code). Assert activeInHierarchy == false, not that SetActive
   # was called. If the screen resolved but nothing matched the co-op/progress
   # predicate, REFUSE -- never hide a random node.
   var warnState = 3   # 3 not-found-yet, 2 REFUSED, 1 PASS (hidden), 0 acting/FAIL
-  if gSplWarnGo != nil and duOk(gSplWarnGo, 0x20'i32) and iUnityAlive(gSplWarnGo):
-    if nuActiveInHierarchy(gSplWarnGo):
-      discard nuSetActive(gSplWarnGo, false)
-    warnState = (if not nuActiveInHierarchy(gSplWarnGo): 1 else: 0)
-  elif not gSplWarnMatched:
-    gSplWarnRefused = true
-    warnState = 2
+  if gSplOn:
+    if gSplWarnGo != nil and duOk(gSplWarnGo, 0x20'i32) and iUnityAlive(gSplWarnGo):
+      if nuActiveInHierarchy(gSplWarnGo):
+        discard nuSetActive(gSplWarnGo, false)
+      warnState = (if not nuActiveInHierarchy(gSplWarnGo): 1 else: 0)
+    elif not gSplWarnMatched:
+      gSplWarnRefused = true
+      warnState = 2
 
-  # Finished-state summary, once, when the heading has taken. The two lines the
-  # coordinator asked for are logged explicitly, plus a combined per-target line.
-  if headOk and not gSplSummaryLogged:
+  # ---- Finished-state summary, once. Ready when each ACTIVE feature has acted:
+  # the rebrand once its heading has taken; forceOfflinePractice once the toggle
+  # force has a readback (or refused, which is announced separately). ----
+  let forceStr = (case forceState
+    of 1: "PASS"
+    of 0: "FAIL"
+    else: (if gSplForceRefused: "REFUSED (set_isOn @0x55BA430 did not verify)"
+           else: "INCONCLUSIVE (no toggle found)"))
+  let readyToLog = ((not gSplOn) or headOk) and
+                   ((not gSplForceOffline) or forceState != 2 or gSplForceRefused)
+  if readyToLog and not gSplSummaryLogged:
     let onWord = (if SplForceIsOn: "true" else: "false")
-    let forceStr = (case forceState
-      of 1: "PASS"
-      of 0: "FAIL"
-      else: "INCONCLUSIVE")
-    okLog "singleplayer: forced isOn=" & onWord & " (readback " & forceStr &
-          "). NOTE: whether checked==offline is UNCONFIRMED on this build; if a " &
-          "live raid comes up ONLINE after this, the fix is to force the " &
-          "opposite value (flip SplForceIsOn), not to re-derive the plumbing."
-    let hideStr = (case hideState
-      of 1: "PASS"
-      of 0: "acting (SetActive(false) issued; confirm next tick)"
-      else: (if gSplForceRefused:
-               "REFUSED (set_isOn did not verify -- box left VISIBLE)"
-             elif forceState == 0:
-               "REFUSED (isOn readback did not match -- box left VISIBLE)"
-             else: "INCONCLUSIVE (no practice checkbox found)"))
-    okLog "singleplayer: hide: " & hideStr
-    let warnStr = (case warnState
-      of 1: "PASS"
-      of 0: "FAIL (SetActive(false) issued but node still activeInHierarchy)"
-      of 2: "REFUSED (no co-op/progress warning matched on this screen -- " &
-            "nothing hidden; the weapon \"vital part\" warning is excluded)"
-      else: "INCONCLUSIVE (warning not present yet)")
-    let warnEvidence = (if gSplWarnMatched:
-      " (matched text contains \"progress\"+co-op token, weapon warning " &
-      "excluded; hid container \"" & gSplWarnName & "\")"
-      else: "")
-    okLog "singleplayer: coop-warning hidden " & warnStr & warnEvidence
-    let descStr = (case descState
-      of 1: "PASS"
-      of 0: "FAIL (re-applying)"
-      else: "INCONCLUSIVE (no description TMP found)")
-    okLog "singleplayer rebrand: FINISHED-STATE readback -- heading: PASS " &
-          "(the rendered TMP no longer reads \"PRACTICE GAME MODE\"); " &
-          "description: " & descStr & "; forced isOn: " & forceStr &
-          "; hide: " & hideStr & "; coop-warning: " & warnStr &
-          ". This asserts the live tree, not that a setter ran."
+    # THE forceOfflinePractice MARKER the coordinator watches for.
+    if gSplForceOffline:
+      okLog "singleplayer: forceOfflinePractice -- practice/offline toggle " &
+            "forced isOn=" & onWord & ": " & forceStr & ". This is the offline " &
+            "mechanism (fact #263/#71): a raid entered from here does NOT enter " &
+            "NetworkGameMatching. NOTE: whether checked==offline is UNCONFIRMED " &
+            "on this build; if a live raid comes up ONLINE after this, flip " &
+            "SplForceIsOn, do not re-derive the plumbing."
+    if gSplOn:
+      let hideStr = (case hideState
+        of 1: "PASS"
+        of 0: "acting (SetActive(false) issued; confirm next tick)"
+        else: (if gSplForceRefused:
+                 "REFUSED (set_isOn did not verify -- box left VISIBLE)"
+               elif forceState == 0:
+                 "REFUSED (isOn readback did not match -- box left VISIBLE)"
+               else: "INCONCLUSIVE (no practice checkbox found)"))
+      okLog "singleplayer: hide: " & hideStr
+      let warnStr = (case warnState
+        of 1: "PASS"
+        of 0: "FAIL (SetActive(false) issued but node still activeInHierarchy)"
+        of 2: "REFUSED (no co-op/progress warning matched on this screen -- " &
+              "nothing hidden; the weapon \"vital part\" warning is excluded)"
+        else: "INCONCLUSIVE (warning not present yet)")
+      let warnEvidence = (if gSplWarnMatched:
+        " (matched text contains \"progress\"+co-op token, weapon warning " &
+        "excluded; hid container \"" & gSplWarnName & "\")"
+        else: "")
+      okLog "singleplayer: coop-warning hidden " & warnStr & warnEvidence
+      let descStr = (case descState
+        of 1: "PASS"
+        of 0: "FAIL (re-applying)"
+        else: "INCONCLUSIVE (no description TMP found)")
+      okLog "singleplayer rebrand: FINISHED-STATE readback -- heading: PASS " &
+            "(the rendered TMP no longer reads \"PRACTICE GAME MODE\"); " &
+            "description: " & descStr & "; forced isOn: " & forceStr &
+            "; hide: " & hideStr & "; coop-warning: " & warnStr &
+            ". This asserts the live tree, not that a setter ran."
     gSplSummaryLogged = true
-    if descState != 0 and forceState == 1 and hideState == 1 and warnState != 0:
-      gSplConfirmed = true
+    var confirmed = true
+    if gSplOn and not (headOk and descState != 0 and hideState == 1 and warnState != 0):
+      confirmed = false
+    if gSplForceOffline and forceState != 1:
+      confirmed = false
+    gSplConfirmed = confirmed
 
 # ---------------------------------------------------------------------------
 # The guarded body + the drain rider.
@@ -763,12 +794,21 @@ proc splRebrandTickBody(a: Il2CppPtr): Il2CppPtr {.
     var budget = SplNodeBudget
     let deadline = cNowMs() + SplWalkMs
     splScanNode(screen, SplScanDepth, budget, deadline)
-    if gSplHeadTmp == nil:
+    # Resolve only once every ACTIVE feature has the target it needs: the rebrand
+    # needs the heading TMP, forceOfflinePractice needs the UpdatableToggle. A
+    # missing one is "screen still building", not a failure -- retry.
+    if gSplOn and gSplHeadTmp == nil:
       splDiag("screen \"" & SplScreenName & "\" WAS found, but its heading TMP " &
         "(text containing \"" & SplHeadStock & "\") was not read within depth " &
         $SplScanDepth & "/" & $int(SplWalkMs) & " ms -- the screen may still be " &
         "building; retrying.")
       return                              # screen present but heading not read yet
+    if gSplForceOffline and gSplToggle == nil:
+      splDiag("screen \"" & SplScreenName & "\" WAS found, but its practice " &
+        "UpdatableToggle (under \"" & SplBlockerName & "\") was not read within " &
+        "depth " & $SplScanDepth & "/" & $int(SplWalkMs) & " ms -- the screen " &
+        "may still be building; retrying.")
+      return                              # screen present but toggle not read yet
     gSplResolved = true
     okLog "singleplayer rebrand: resolved on \"" & SplScreenName &
           "\" -- heading TMP " & (if gSplHeadTmp != nil: "found" else: "MISSING") &
@@ -789,7 +829,7 @@ proc splRebrandDrainTick() =
   ## Rides the `EFT.TarkovApplication::Update` drain (slot alias, no second
   ## detour). Cheap when idle: off, self-disabled, or inside the warm-up it is
   ## a handful of integer compares and makes NO call into the game.
-  if not gSplOn or gSplOff: return
+  if (not gSplOn and not gSplForceOffline) or gSplOff: return
   if gSplT0 == 0'u64: gSplT0 = cNowMs()
   if cNowMs() - gSplT0 < SplWarmupMs: return   # the menu cannot be up yet
   inc gSplFrames
