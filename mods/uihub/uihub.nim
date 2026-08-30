@@ -368,9 +368,31 @@ function numeric(row, onSave) {
 
 /* The one switch on `row.type`. Everything that draws a settings row in this
  * project goes through here. */
+/* Is this row the player's to write? The schema says so explicitly
+ * (`readOnly`, always emitted by settings.toJson from the ONE predicate
+ * `isReadOnly`); the type-name test is only the fallback for an older backend
+ * that predates the field, and must stay in step with it. */
+function isReadOnlyRow(row) {
+  if (row.readOnly !== undefined) return !!row.readOnly;
+  return row.type === 'text';
+}
+
 function controlFor(row, onSave) {
   var wrap = el('span', 'ctl');
   var e;
+  if (isReadOnlyRow(row)) {
+    /* Display-only: the SERVER owns this value. Drawn as static text, with no
+     * input element at all -- a disabled input still looks like a control the
+     * player could earn the right to type in, and this one they never can.
+     * It refreshes for free: every save calls refreshFrom() with the server's
+     * whole reply, so a summary the backend recomputed appears on the next
+     * repaint without a poll. */
+    e = el('span', 'aw-ro', row.value === undefined || row.value === null || row.value === ''
+                            ? '—' : String(row.value));
+    e.title = 'Written by the server; not editable';
+    wrap.appendChild(e);
+    return wrap;
+  }
   if (row.type === 'bool') {
     e = el('input');
     e.type = 'checkbox';
@@ -555,6 +577,10 @@ function mount(root, opts) {
     });
     ctl.appendChild(saved);
     r.appendChild(ctl);
+    /* No per-row Reset on a read-only row: "reset" is a write, and this row's
+     * value is the server's. Resetting it would blank the display until the
+     * next recompute, which reads as the feature being broken. */
+    if (isReadOnlyRow(row)) return r;
     var rb = el('button', 'aw-reset', 'Reset');
     rb.title = 'Reset this to its declared default';
     rb.onclick = async function () {
@@ -708,7 +734,7 @@ global.AowlSettings = {
   setValue: setValue, resetKey: resetKey, resetAll: resetAll,
   matches: matches, groupRows: groupRows,
   inlineOptions: inlineOptions, labelForValue: labelForValue,
-  controlFor: controlFor, mount: mount
+  controlFor: controlFor, isReadOnlyRow: isReadOnlyRow, mount: mount
 };
 })(window);
 """
@@ -769,6 +795,7 @@ const PageHtml = """<!doctype html>
   .ta-note { font-size:10px; color:#a08a5a; }
   .aw-saved { color:#6fbf6f; font-size:11px; margin-left:8px; opacity:0; transition:opacity .2s; }
   .aw-saved.show { opacity:1; }
+  .aw-ro { display:inline-block; max-width:520px; color:#cfc9a8; background:#1e1e1a; border:1px solid #33332a; border-radius:4px; padding:5px 9px; font-size:12px; line-height:1.45; white-space:normal; cursor:default; }
   .aw-reset { background:#262626; color:#aaa; border:1px solid #383838; border-radius:4px; padding:4px 9px; font-size:11px; cursor:pointer; }
   .aw-reset:hover { background:#333; color:#eee; }
 </style>

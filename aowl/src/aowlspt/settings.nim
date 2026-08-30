@@ -60,6 +60,16 @@ type
       ## is told up front to draw a searchable typeahead rather than a `<select>`
       ## with ten thousand `<option>`s in it, and that the choices may be fetched
       ## on demand from `optionsUrl` instead of shipped inline.
+    stText
+      ## DISPLAY-ONLY text. A string underneath -- same value shape as
+      ## `stString` -- but the value is written by the SERVER and the player
+      ## must not edit it. `lootSummary` and `spawnResult` are the cases: a
+      ## sentence the backend recomputes after every edit. Drawn as static
+      ## text, and the write path REFUSES a client POST for one (see
+      ## `applySettingFromBody`), because a control that renders read-only but
+      ## still accepts a write is exactly the "renders and silently does
+      ## nothing" failure this module exists to stop. The server writes it via
+      ## `applySetting`, which deliberately bypasses that refusal.
 
   Setting* = object
     key*: string          ## the config.json key, verbatim
@@ -97,6 +107,13 @@ proc kindName*(k: SettingType): string =
   of stString:  result = "string"
   of stKeybind: result = "keybind"
   of stSelect:  result = "select"
+  of stText:    result = "text"
+
+proc isReadOnly*(k: SettingType): bool =
+  ## The ONE definition of "the player may not write this". Both the renderer
+  ## and the write path ask this, so the drawn control and the accepted POST
+  ## cannot drift apart.
+  result = k == stText
 
 # ---------------------------------------------------------------------------
 # Builders — one per type, so a mod never hand-fills the object
@@ -148,6 +165,18 @@ proc enumSetting*(key, label: string; default: string; options: seq[string];
 proc stringSetting*(key, label: string; default: string;
                     category = ""; subcategory = ""; description = ""; implemented = true; appliesOn = "live"): Setting =
   result = Setting(key: key, label: label, kind: stString,
+                   defaultJson: "\"" & server.escapeText(default) & "\"",
+                   lo: 0.0, hi: 0.0, step: 0.0, hasRange: false,
+                   options: @[], category: category, subcategory: subcategory,
+                   optionLabels: @[], optionsUrl: "", description: description,
+                   implemented: implemented, appliesOn: appliesOn)
+
+proc textSetting*(key, label: string; default: string;
+                  category = ""; subcategory = ""; description = ""; implemented = true; appliesOn = "live"): Setting =
+  ## A read-only line of text the SERVER owns. Same value shape as
+  ## `stringSetting`; the difference is that the UI draws it as text rather
+  ## than an input, and a client POST for the key is refused.
+  result = Setting(key: key, label: label, kind: stText,
                    defaultJson: "\"" & server.escapeText(default) & "\"",
                    lo: 0.0, hi: 0.0, step: 0.0, hasRange: false,
                    options: @[], category: category, subcategory: subcategory,
@@ -250,7 +279,7 @@ proc toJson*(s: Setting): JsonObject =
   # way, so it is used verbatim.
   if cur.ok:
     case s.kind
-    of stEnum, stString, stKeybind, stSelect:
+    of stEnum, stString, stKeybind, stSelect, stText:
       o.put("value", jstr(asText(cur, "")))
     of stBool, stInt, stFloat:
       o.put("value", Json(text: cur.raw))
@@ -289,6 +318,11 @@ proc toJson*(s: Setting): JsonObject =
       o.put("path", pa)
   if s.description.len > 0: o.put("description", s.description)
   o.put("implemented", s.implemented)
+  # Always emitted, like `implemented` and `appliesOn`, and derived from the
+  # ONE predicate `isReadOnly` -- so a renderer never re-derives editability by
+  # matching on type names, and a new read-only kind cannot be added without
+  # every renderer picking it up.
+  o.put("readOnly", isReadOnly(s.kind))
   # Always emitted, never conditionally: a renderer must be able to tell
   # "this row applies live" from "this row said nothing", and an absent field
   # cannot carry that difference.
@@ -478,6 +512,15 @@ proc applySettingFromBody*(body: string): Status =
   let key = k.asText("")
   if key.len == 0:
     return ErrBadArg
+  # A read-only row is refused HERE, not merely undrawn. The UI not rendering
+  # an input is cosmetic -- anyone can POST the route -- and a display the
+  # server owns that a client can overwrite would show a value the next
+  # server-side recompute silently discards.
+  for s in gDeclared:
+    if s.key == key and isReadOnly(s.kind):
+      warn "settings: POST for \"" & key & "\" refused -- that row is " &
+           "read-only (kind " & kindName(s.kind) & "); the server writes it"
+      return ErrUnsupported
   result = applySetting(key, v.raw)
   if result != Ok:
     # The route handler's contract is "reply with the schema regardless" (see

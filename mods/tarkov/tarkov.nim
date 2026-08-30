@@ -3374,8 +3374,8 @@ proc tarkovSchema(): seq[Setting] =
                 @["custom", "vanilla", "scarce", "richer", "goblin"],
                 category = "Loot/Presets",
       description = "aowlspt original (server emulator); acts on the SPT-derived database. Picking anything other than `custom` WRITES the knobs in the sections below and then the page shows what it wrote, so a preset is a starting point you can then fine-tune rather than a mode that locks the sliders. `vanilla` restores every loot knob to its shipped default. `scarce` halves both passes and biases toward cheap items; `richer` is 1.5x with fuller containers; `goblin` is 3x with the container cap raised and a bias toward valuables. Changing any individual knob afterwards does NOT reset this row -- it is a button, not a mode."),
-    stringSetting("lootSummary", "What this configuration does", "",
-                  category = "Loot/Presets",
+    textSetting("lootSummary", "What this configuration does", "",
+                category = "Loot/Presets",
       description = "aowlspt original (server emulator); acts on the SPT-derived database. WRITTEN BY THE SERVER, not by you: one sentence describing what the current loot configuration will actually do, recomputed from emu/loot.lootConfig() -- the same object the generator reads -- every time any loot row is saved. If this line disagrees with what you set, the generator agrees with THIS line."),
 
     boolSetting("lootEnabled", "Loot enabled", true, category = "Loot/Global",
