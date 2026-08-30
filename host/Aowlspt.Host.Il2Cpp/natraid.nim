@@ -941,7 +941,7 @@ proc nrIsRaidSettings(p, refRs: Il2CppPtr; why: var string): bool =
   why = "klass " & nrHex(k) & " matches, Side and RaidMode both in range"
   true
 
-proc nrApplyOffline(p, refRs: Il2CppPtr; label: string) =
+proc nrApplyOffline(p, refRs, app: Il2CppPtr; label: string) =
   ## Install Pmc(0) / Local(1) / the resolved Woods Location into ONE FURTHER
   ## RaidSettings object. Not fatal: the primary object is already written and
   ## verified, so a refusal here is logged and the caller's own finished-state
@@ -952,6 +952,12 @@ proc nrApplyOffline(p, refRs: Il2CppPtr; label: string) =
          " -- " & why & ". Nothing was written to it."
     return
   if cNrReadPtr(p, NrRsSelectedLoc) == nil:
+    # The primary object may already have had a selection, in which case
+    # `gNrLoc` was never resolved. Resolve from THIS object's own
+    # `_locationSettings@0xb0`; the resolve sets `gNrLoc` only after reading
+    # back Id == "Woods", and is a no-op if one is already in hand.
+    if gNrLoc == nil:
+      nrResolveWoods(p, app)
     let fnSet = cNrFn(NrTSetSelectedLoc)
     if gNrLoc == nil or fnSet == nil:
       warn "nativeRaid DRIVE GATE " & label & "=" & nrHex(p) &
@@ -1109,10 +1115,10 @@ proc nrDrive() =
        "; gate vs offline: " & nrSame(taRs, moOffRs) & "; Ready vs offline: " &
        nrSame(rs, moOffRs)
   if taRs != nil and taRs != rs:
-    nrApplyOffline(taRs, rs,
+    nrApplyOffline(taRs, rs, app,
       "TarkovApplication._raidSettings@0xd8 (THE OFFLINE GATE)")
   if moOffRs != nil and moOffRs != rs and moOffRs != taRs:
-    nrApplyOffline(moOffRs, rs,
+    nrApplyOffline(moOffRs, rs, app,
       "MatchmakerOperation._offlineRaidSettings@0x48")
 
   # FINISHED-STATE ASSERT ON THE GATE ITSELF, and it can fail: if the object
