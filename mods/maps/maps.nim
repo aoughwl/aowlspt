@@ -264,6 +264,103 @@ proc rendererChoice*(): string =
   of RendAuto, RendLegacy, RendUnified: r
   else: RendAuto
 
+proc explicitOff*(): bool =
+  ## THE ONE UNAMBIGUOUS "I WANT NO WIDGET" CONTROL, and it is authoritative
+  ## under BOTH providers.
+  ##
+  ## This exists because the two providers do not express "off" the same way.
+  ## `unified` has a named OFF (`spatialMode="off"`). `legacy` has none -- its
+  ## off is the ACCIDENT of every surface bool happening to be false, which is
+  ## indistinguishable from "this config predates the surface I care about" and
+  ## is exactly the state the player fell into. So the named one is promoted to
+  ## mean off everywhere, and the accidental one is no longer allowed to blank
+  ## the screen on its own (see rendererOwner).
+  asText(setting("spatialMode"), "") == "off"
+
+proc legacySurfacesOn*(): bool =
+  ## Does the LEGACY provider have anything switched on? Defaults match readOpts
+  ## exactly (hudMap false, hudRadar true) -- two readers with two defaults is
+  ## how a provider reports "I have a surface" while readOpts derives ModeOff.
+  asBool(setting("hudMap"), false) or asBool(setting("hudRadar"), true)
+
+proc unifiedSurfacesOn*(): bool =
+  ## Does the UNIFIED provider have anything switched on? An unwritten or "auto"
+  ## `spatialMode` is the historic default surface (radar), NEVER off -- the
+  ## same rule readOpts applies. Only an explicit off, or a mode name this build
+  ## does not recognise, is empty.
+  let m = asText(setting("spatialMode"), "")
+  if m.len == 0 or m == "auto": true
+  else: modeOf(m) != ModeOff
+
+proc rendererOwnerSelected*(): string =
+  ## WHICH PROVIDER THE CONFIG NAMES, before any fall-through. `auto` resolves
+  ## to unified only once `spatialMode` has actually been written; that is the
+  ## migration rule and it is unchanged.
+  let rend = rendererChoice()
+  let modeTxt = asText(setting("spatialMode"), "auto")
+  let spatialWritten = modeTxt.len > 0 and modeTxt != "auto"
+  if rend == RendUnified or (rend == RendAuto and spatialWritten): RendUnified
+  else: RendLegacy
+
+proc rendererOwner*(): string =
+  ## WHICH PROVIDER ACTUALLY OWNS THE WIDGET, after the EMPTY-PROVIDER
+  ## FALL-THROUGH.
+  ##
+  ## THE BUG THIS FIXES, measured live: mapsRenderer="legacy" with hudRadar=false
+  ## and hudMap=false, while spatialMode="radar" sat there fully configured. The
+  ## selected provider had zero surfaces, so the widget resolved to ModeOff and
+  ## the player saw nothing -- from a config in which every visible control read
+  ## as "a map is configured". "The renderer ran" and "the player can see a map"
+  ## are different claims and only the first was ever asserted.
+  ##
+  ## The rule, and it is deliberately ONE-DIRECTIONAL:
+  ##
+  ##   * selected provider has a surface            -> it owns the widget.
+  ##   * selected provider is EMPTY, the other has  -> the other owns it, and
+  ##     rendererDecision() says so by name on every apply. Blank-by-accident is
+  ##     now UNREACHABLE.
+  ##   * `spatialMode="off"` is set                 -> NO fall-through. An
+  ##     explicit off is an instruction, not an accident, and overriding it
+  ##     would leave the player with no way to hide the widget at all.
+  ##   * both providers empty                       -> nothing to fall through
+  ##     to; the diag reports it INCONCLUSIVE and names the disabled surfaces.
+  ##
+  ## Only LEGACY->UNIFIED can fire in practice, because `unifiedSurfacesOn` is
+  ## false only when `spatialMode` explicitly says off -- which `explicitOff`
+  ## has already excluded. The UNIFIED->LEGACY arm is kept so a future mode name
+  ## that resolves empty for some other reason still cannot blank the screen.
+  let sel = rendererOwnerSelected()
+  if explicitOff(): return sel
+  if sel == RendLegacy and (not legacySurfacesOn()) and unifiedSurfacesOn():
+    RendUnified
+  elif sel == RendUnified and (not unifiedSurfacesOn()) and legacySurfacesOn():
+    RendLegacy
+  else:
+    sel
+
+proc rendererFellThrough*(): bool =
+  rendererOwner() != rendererOwnerSelected()
+
+proc rendererSurfaces*(): string =
+  ## THE ENABLED-SURFACE LIST, so a reader of one diag line can see the CAUSE of
+  ## a blank widget without opening config.json. Both providers are always
+  ## printed, on or off, because "the key I care about is missing from this
+  ## line" and "the key is off" must not look the same.
+  let m = asText(setting("spatialMode"), "")
+  "surfaces: LEGACY hudRadar=" &
+  (if asBool(setting("hudRadar"), true): "ON" else: "off") & " hudMap=" &
+  (if asBool(setting("hudMap"), false): "ON" else: "off") &
+  " -> " & (if legacySurfacesOn(): "has a surface" else: "EMPTY") &
+  " | UNIFIED spatialMode=" &
+  (if m.len == 0: "(unwritten -> radar)" else: "\"" & m & "\"") &
+  " -> " & (if unifiedSurfacesOn(): "has a surface" else: "EMPTY") &
+  " | owner=" & (if rendererOwner() == RendUnified: "UNIFIED" else: "LEGACY") &
+  (if rendererFellThrough():
+     " (FELL THROUGH from " &
+     (if rendererOwnerSelected() == RendUnified: "UNIFIED" else: "LEGACY") &
+     ", whose every surface is off)"
+   else: "")
+
 proc rendererDecision*(): string =
   ## THE DECISION, IN WORDS -- who won, what was suppressed, and why the loser
   ## is still armed. Modelled on the host's `espProvider` line, and for the same
@@ -282,6 +379,20 @@ proc rendererDecision*(): string =
     pre = "mapsRenderer is ABSENT (a config written before this setting " &
           "existed), so \"auto\" is in force and nothing about this widget " &
           "changed on update. "
+  # THE FALL-THROUGH, ANNOUNCED. This runs on every apply (onMapsApply logs
+  # rendererDecision unconditionally), so a widget that moved provider says so
+  # by name instead of appearing to ignore the setting.
+  if rendererFellThrough():
+    return pre & "mapsRenderer=\"" & rendererOwnerSelected() &
+      "\" was SELECTED but every one of its surfaces is off, which would have " &
+      "drawn NOTHING from a config that reads as fully set up -- the reported " &
+      "defect. FELL THROUGH to " &
+      (if rendererOwner() == RendUnified: "UNIFIED" else: "LEGACY") &
+      ", which has a surface, so the widget is visible. " & rendererSurfaces() &
+      ". To hide the widget deliberately set spatialMode=\"off\" (honoured " &
+      "under BOTH renderers, and it suppresses this fall-through) or " &
+      "enabled=false. To make the selected renderer own it again, switch one " &
+      "of its own surfaces on."
   if rend == RendUnified:
     pre & "renderer=UNIFIED: `spatialMode` (=" &
     (if spatialWritten: "\"" & modeTxt & "\"" else: "unwritten -> radar") &
@@ -391,12 +502,15 @@ proc readOpts(o: var HudOpts) =
   # Either way the loser is only DESELECTED, never unbound: the single draw
   # path stays armed and both key sets stay readable, so flipping this back is
   # one live apply and no relaunch.
-  let rend = rendererChoice()
+  #
+  # AND THE EMPTY-PROVIDER FALL-THROUGH (the follow-up bug). Selecting a
+  # provider whose every surface is off used to resolve the widget to ModeOff
+  # and draw nothing, from a config that read as fully set up. `rendererOwner`
+  # -- not the raw selection -- decides here, so that state is unreachable
+  # unless `spatialMode="off"` was asked for explicitly. See rendererOwner.
   let modeTxt = asText(setting("spatialMode"), "auto")
   let spatialWritten = modeTxt.len > 0 and modeTxt != "auto"
-  let unifiedOwns =
-    rend == RendUnified or (rend == RendAuto and spatialWritten)
-  if unifiedOwns:
+  if rendererOwner() == RendUnified:
     o.mode = if spatialWritten: modeOf(modeTxt) else: ModeRadar
   else:
     let legacyMap = asBool(setting("hudMap"), false)
@@ -558,10 +672,19 @@ proc spatialSchema(): seq[Setting] =
                               "The losing key set is only DESELECTED, never " &
                               "unbound -- the draw path stays armed and " &
                               "switching back applies live with no relaunch. " &
+                              "SELECTING A RENDERER WHOSE SURFACES ARE ALL OFF " &
+                              "CANNOT BLANK YOUR SCREEN: the widget FALLS " &
+                              "THROUGH to whichever key set does have a " &
+                              "surface, and the host log names the fall-through " &
+                              "on every apply. The ONE deliberate way to hide " &
+                              "the widget is `Spatial widget` = `off`, which is " &
+                              "honoured under BOTH renderers and suppresses the " &
+                              "fall-through (or turn the mod off entirely). " &
                               "The maps diag's `renderer` line names the " &
-                              "winner, what was suppressed, and counts the " &
-                              "frames the winner actually submitted geometry " &
-                              "on, so `nothing drew` can never read as a pass"),
+                              "winner, what was suppressed, WHICH SURFACES ARE " &
+                              "ENABLED on both key sets, and counts the frames " &
+                              "the winner actually submitted geometry on, so " &
+                              "`nothing drew` can never read as a pass"),
 
     # ---- THE ONE SPATIAL WIDGET -----------------------------------------
     enumSetting("spatialMode", "Spatial widget", "auto",
@@ -1849,8 +1972,44 @@ proc mapsDiagText(): string =
   let selF = hudSelFrames()
   let selD = hudSelDrew()
   let selB = hudSelBlank()
+  # THE CONFIG-LEVEL ASSERTION, ahead of every counter branch, because the
+  # counters could not express this failure at all. MEASURED: this verdict read
+  # "PASS ... 42 of 42 dispatch(es) (0 blank) ... renderer=LEGACY" while the
+  # player's screen was empty, from mapsRenderer="legacy" + hudRadar=false +
+  # hudMap=false. Every counter was asserting "the renderer ran"; none was
+  # asserting "a surface the player can see was switched on". Those are
+  # different claims and only the first was ever checked.
+  #
+  # `ownerBlank` is the falsifiable negative that was missing. With the
+  # fall-through in rendererOwner in place it is UNREACHABLE unless the player
+  # explicitly asked for off -- so if the FAIL arm below ever fires, the
+  # fall-through is broken, and that is precisely a check that CAN fail.
+  let ownerEff = rendererOwner()
+  let ownerBlank =
+    if ownerEff == RendUnified: not unifiedSurfacesOn()
+    else: not legacySurfacesOn()
   let lRend =
-    if selD + selB != selF:
+    if ownerBlank and not explicitOff():
+      "FAIL  every surface belonging to the renderer that owns the widget is " &
+      "DISABLED, so nothing visible can be drawn no matter how many dispatches " &
+      "reach the draw path (" & $selD & " of " & $selF & " submitted geometry " &
+      "-- a count of dispatches is NOT a count of visible pixels). " &
+      (if not (legacySurfacesOn() or unifiedSurfacesOn()):
+         "BOTH key sets are empty, so there was nothing to fall through to. " &
+         "The usual cause is a `spatialMode` spelling this build does not " &
+         "recognise (which resolves to off) while both Legacy toggles are also " &
+         "off. Fix either key set, or say spatialMode=\"off\" if you meant off."
+       else:
+         "The other key set DOES have a surface, so the empty-provider " &
+         "fall-through should have made this state unreachable -- this is a " &
+         "REGRESSION in rendererOwner, not a config the player can reach.") &
+      " " & rendererSurfaces() & ". " & rendererDecision()
+    elif ownerBlank:
+      "INCONCLUSIVE  the widget is OFF because spatialMode=\"off\" was asked " &
+      "for EXPLICITLY, and that is honoured under both renderers. Nothing drew " &
+      "and nothing was asked to -- this is not a pass and not a fault. " &
+      rendererSurfaces()
+    elif selD + selB != selF:
       "FAIL  the draw-site counters do not add up (selDrew " & $selD &
       " + selBlank " & $selB & " != selFrames " & $selF & "), so no verdict " &
       "about the renderer can be trusted. " & rendererDecision()
@@ -1862,17 +2021,19 @@ proc mapsDiagText(): string =
       "reached the draw section with any surface switched on (the widget " &
       "mode is " & modeName(gOpts.mode) & " and the overlay has not been " &
       "opened). Nothing drew and nothing was asked to -- this is NOT a pass. " &
-      rendererDecision()
+      rendererSurfaces() & ". " & rendererDecision()
     elif selD == 0'i64:
       "FAIL  a surface was selected on all " & $selF & " dispatch(es) and " &
       "the renderer submitted ZERO primitives on every one of them -- the " &
       "map/radar is switched on and NOTHING IS BEING DRAWN. This is the " &
-      "reported defect, not a quiet widget. " & rendererDecision()
+      "reported defect, not a quiet widget. " & rendererSurfaces() & ". " &
+      rendererDecision()
     else:
       "PASS  the selected renderer submitted geometry on " & $selD & " of " &
       $selF & " dispatch(es) (" & $selB & " blank), and no dispatch ever " &
-      "rendered more than one pane (" & $hudPaneCallsOver() & " violation(s)). " &
-      rendererDecision()
+      "rendered more than one pane (" & $hudPaneCallsOver() & " violation(s)), " &
+      "AND the owning renderer has at least one surface switched on. " &
+      rendererSurfaces() & ". " & rendererDecision()
 
   # ---- THE FULL-SCREEN OVERLAY -------------------------------------------
   #
