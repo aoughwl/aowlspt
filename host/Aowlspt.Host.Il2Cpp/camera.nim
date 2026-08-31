@@ -254,6 +254,23 @@ var gCamWantOn = false         ## an export asked for the free camera; the DRAIN
 var gCamWantOff = false        ## acts on it, never the caller's thread
 var gCamSaidAt = 0'u64         ## throttle for the periodic status line
 
+# ---- the config-driven engage latch (`cameraFreeCamEngage`) ----
+#
+# WHY THIS EXISTS: F7 is the only way in, and synthetic function keys do NOT
+# reach this client (measured: SendKeys `m` toggled the maps overlay, `{F7}`
+# produced no log line at all), so the restore verdict -- the whole point of
+# the feature -- could never be obtained without a human at the keyboard. This
+# is a LIVE RECONCILE of one host-config boolean, polled off the same drain,
+# and it drives the SAME `camFreeEnter` / `camFreeExit` pair F7 drives. It adds
+# no target, no detour and no new RVA.
+var gCamEngageCfg = false      ## the last value read out of the file
+var gCamEngageSeen = false     ## have we ever read it? (first read is not an edge)
+var gCamEngagePollAt = 0'u64   ## throttle: the file is re-read at most every 2s
+var gCamEngageLatch = false    ## config says ON and we are not on yet -- KEEP
+                               ## trying, because "not deployed yet" is a
+                               ## reason to wait, not a reason to forget
+var gCamEngageWhy = "the config key cameraFreeCamEngage has not been seen true"
+
 proc camDisabled*(): bool = gCamFaults >= CamMaxFaults
 
 ## Forward-declared: the deferred bind lives below (it needs `camIndicesOk`),
@@ -669,6 +686,27 @@ proc camTickBody(a: Il2CppPtr): Il2CppPtr {.
     if gCamFree and not gCamFreeOn and rpPhase() == RpPhaseDeployed:
       discard camFreeEnter()
 
+  # THE CONFIG ENGAGE LATCH. Held, not consumed: `cameraFreeCamEngage` true
+  # while the player is still in the menu must engage when the raid starts,
+  # not be dropped on the floor. Every refusal names itself in `gCamEngageWhy`
+  # so a run where nothing happened reads as INCONCLUSIVE with a reason,
+  # rather than as silence.
+  if gCamEngageLatch and not gCamFreeOn:
+    if not gCamFree:
+      gCamEngageWhy = "cameraFreeCamEngage is true but cameraFreeCam is OFF " &
+                      "-- nothing is armed. INCONCLUSIVE."
+    elif rpPhase() != RpPhaseDeployed:
+      gCamEngageWhy = "cameraFreeCamEngage is true and WAITING: the raid " &
+                      "phase is " & rpPhaseName(rpPhase()) & ", not DEPLOYED " &
+                      "(" & rpWhy() & "). INCONCLUSIVE."
+    else:
+      if camFreeEnter():
+        gCamEngageLatch = false
+        gCamEngageWhy = "engaged by the config key cameraFreeCamEngage"
+      else:
+        gCamEngageWhy = "cameraFreeCamEngage is true but the entry was " &
+                        "refused: " & gCamExitReason & ". INCONCLUSIVE."
+
   if gCamFree and rpPhase() == RpPhaseDeployed:
     if cDuForeground() != 0'i32 and cDuKeyEdge(CamVkF7) != 0'i32:
       if gCamFreeOn:
@@ -720,11 +758,49 @@ proc camDrainTick*() =
   # code. Cheap and self-latching: one integer compare once bound.
   camBindRetry()
   gCamTicks = gCamTicks + 1
-  # THE STATUS LINE IN THE LOG. Emitted at most once every 10s and ONLY while
-  # the free camera is active, so a run with the flags on but the feature idle
-  # costs nothing. Without this `camStatus` would exist and never be read,
-  # which is the same as not measuring at all.
-  if gCamFreeOn and (cNowMs() - gCamSaidAt) >= 10000'u64:
+
+  # LIVE RECONCILE of `cameraFreeCamEngage`. Outside the guard on purpose: this
+  # is a file read and touches no game memory, and the guard below is not
+  # re-entrant. Throttled to 0.5Hz so the drain never does per-frame file IO.
+  # Only the EDGES act, so a config left true does not re-enter after an F7
+  # exit, and a config left false does not fight a hand-driven F7 session.
+  let nowCfg = cNowMs()
+  if (nowCfg - gCamEngagePollAt) >= 2000'u64:
+    gCamEngagePollAt = nowCfg
+    let want = readBoolKey("cameraFreeCamEngage")
+    if not gCamEngageSeen:
+      gCamEngageSeen = true
+      gCamEngageCfg = want
+      if want:
+        gCamEngageLatch = true
+        gCamEngageWhy = "cameraFreeCamEngage was already true at the first poll"
+        info "camera: cameraFreeCamEngage is true at startup -- the free " &
+             "camera will engage as soon as the raid phase is DEPLOYED."
+    elif want != gCamEngageCfg:
+      gCamEngageCfg = want
+      if want:
+        gCamEngageLatch = true
+        gCamEngageWhy = "cameraFreeCamEngage went false -> true"
+        info "camera: cameraFreeCamEngage went ON (config reconcile). " &
+             "Engaging the free camera on the next DEPLOYED frame."
+      else:
+        gCamEngageLatch = false
+        gCamEngageWhy = "cameraFreeCamEngage went true -> false"
+        info "camera: cameraFreeCamEngage went OFF (config reconcile). " &
+             "Disengaging; look for the RESTORE verdict on the next line."
+        gCamWantOff = true
+
+  # THE STATUS LINE IN THE LOG. Every 10s while the free camera is active, and
+  # every 60s when it is not.
+  #
+  # THE DEFECT THIS REPLACES, measured 2026-08-31: this was gated on
+  # `gCamFreeOn`, so a whole run with `cameraApi` on and the camera never
+  # engaged printed NOTHING -- "camera never sampled" and "acquire failed"
+  # were indistinguishable, and both read as silence rather than as
+  # INCONCLUSIVE. A status line that only appears on success cannot report a
+  # failure.
+  let quiet = if gCamFreeOn: 10000'u64 else: 60000'u64
+  if (cNowMs() - gCamSaidAt) >= quiet:
     gCamSaidAt = cNowMs()
     info camStatus()
   if cCamTickGuarded(nil) == nil:
@@ -817,6 +893,11 @@ proc camBindAttempt(fromRetry: bool) =
          "look for 'RESTORE PASS' or 'RESTORE FAIL' in this log. It exits and " &
          "restores automatically the moment the raid phase stops reading " &
          "DEPLOYED, which includes the post-raid results screen."
+    info "camera: NO KEYBOARD NEEDED. Setting \"cameraFreeCamEngage\": true " &
+         "in aowlspt-host.json engages the free camera live (polled off this " &
+         "drain every 2s, no restart); setting it back to false disengages " &
+         "and runs the SAME readback restore check. Measured reason F7 is not " &
+         "enough: synthetic function keys do not reach this client."
 
 proc camBind*() =
   ## Read the flags at boot and make the FIRST bind attempt. If the module is
@@ -871,6 +952,8 @@ proc camStatus*(): string =
      duFmt2(gCamFar)
    else: "") &
   " freecam=" & (if gCamFreeOn: "ON(" & $gCamHeld & " frames)" else: "off") &
+  " engage=" & (if gCamEngageCfg: "cfg ON" else: "cfg off") &
+  "/" & (if gCamEngageLatch: "LATCHED" else: "idle") & " (" & gCamEngageWhy & ")" &
   (if gCamExitReason.len > 0: "[last exit: " & gCamExitReason & "]" else: "") &
   " hold=" & gCamHoldVerdict &
   " restore=" & gCamRestoreVerdict &
