@@ -36,7 +36,7 @@ type
     numeric*: bool    ## compare as a number (16 == 16.0), not as text
 
 const
-  OverlayKeyMap*: array[10, KeyMap] = [
+  OverlayKeyMap*: array[11, KeyMap] = [
     KeyMap(cfgKey: "overlayEnabled",    panelKey: "panelEnabled",    numeric: false),
     KeyMap(cfgKey: "overlayAnchor",     panelKey: "panelAnchor",     numeric: false),
     KeyMap(cfgKey: "overlayX",          panelKey: "panelX",          numeric: true),
@@ -46,7 +46,14 @@ const
     KeyMap(cfgKey: "overlayThrottle",   panelKey: "panelThrottle",   numeric: true),
     KeyMap(cfgKey: "overlayColor",      panelKey: "panelColor",      numeric: false),
     KeyMap(cfgKey: "overlayFields",     panelKey: "panelFields",     numeric: false),
-    KeyMap(cfgKey: "overlayToggleKey",  panelKey: "toggleKey",       numeric: true)]
+    KeyMap(cfgKey: "overlayToggleKey",  panelKey: "toggleKey",       numeric: true),
+    # The ESP marker colour: the one esp* key `debug.nim` now WRITES rather than
+    # passes through, because it has a picker. It is in this table for the same
+    # reason every other row is -- so the diag ASSERTS the finished state, i.e.
+    # that dragging the picker actually moved the byte the host reads. Both
+    # sides spell it `espColor`; that is the exception to the overlay*->panel*
+    # rule going the other way, and spelling it out keeps it from being assumed.
+    KeyMap(cfgKey: "espColor",          panelKey: "espColor",        numeric: false)]
     ## THE translation, in one place. `debug.nim` writes the overlay file from
     ## this table and the diag checks the overlay file against this table, so
     ## the writer and the check cannot drift apart into two different opinions

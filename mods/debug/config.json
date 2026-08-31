@@ -16,7 +16,8 @@
   "_overlayThrottle": "The panel rebuilds its text every Nth frame. 1 is smoothest and costs the most.",
   "overlayThrottle": 10,
   "overlayColor": "1,1,0.62",
-  "_overlayToggleKey": "Virtual-key code. 114 is VK_F3 -- the Minecraft key, and the shipped default. 0 disables the toggle.",
+  "espColor": "1,0.35,0.3",
+  "_overlayToggleKey":"Virtual-key code. 114 is VK_F3 -- the Minecraft key, and the shipped default. 0 disables the toggle.",
   "overlayToggleKey": 114,
 
   "_profiler": "Per-mod and per-host-rider timing. OFF is the shipped default and costs one load and a predicted branch per mod per tick. Nothing is measured while it is off, and the report says INCONCLUSIVE rather than reporting zero cost.",

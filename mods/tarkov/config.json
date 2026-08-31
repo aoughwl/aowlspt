@@ -48,6 +48,11 @@
   "lootRarityCommon": 1.0,
   "lootRarityRare": 1.0,
   "lootRaritySuperrare": 1.0,
+  "lootWeightMoney": 1.0,
+  "lootWeightAmmo": 1.0,
+  "lootWeightMeds": 1.0,
+  "lootWeightKeys": 1.0,
+  "lootWeightBarter": 1.0,
   "lootCategoryWeights": "",
 
   "lootStackRandomRange": false,
