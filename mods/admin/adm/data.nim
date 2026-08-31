@@ -85,6 +85,9 @@ import aowlspt/il2cpp
 import aowlspt/fast
 import aowlspt/game    # whenReady/ready -- the boot-safe readiness poll
 import shared
+import admprof
+# Prototypes only -- `adm/admprof.nim` owns the state (AOWL_ADMPROF_IMPL).
+{.emit: """#include "aowlspt_admprof.h" """.}
 
 # il2cpp x64 memory layout -- ABI constants, stable across builds.
 const
@@ -408,40 +411,64 @@ proc posSample*() =
   ## sample each, publish. Capped, allocation-free, and a no-op until the world
   ## and the prologue are both good.
   if not gLive or not dataReady() or dataDisabled(): return
+  # L2 BRACKETS. Every one of these wraps a call site that already existed;
+  # nothing here changes what runs or in what order. They sit outside any
+  # aowl_p_p_seh (that guard is not re-entrant) and are no-ops when the
+  # profiler is off.
+  let tArm = apNow()
   let armed = posArm()
+  apAdd(ApPArm, tArm)
   if armed != 1:
     gPosCode = posNoCall
     if armed < 0:
       note("EFT.Player::get_Position @0x6F32C0 prologue did NOT byte-verify " &
            "against this build -- position sampling REFUSED, permanently")
     return
+  let tWorld = apNow()
   let world = worldPtr()
-  if world == nil: return
+  if world == nil:
+    apAdd(ApPWorld, tWorld)
+    return
 
   let list = playersList(world)
-  if list == nil: return
+  if list == nil:
+    apAdd(ApPWorld, tWorld)
+    return
   let items = rdPtr(list, ListItemsOff)
   var n = int(rdI32(list, ListSizeOff))
+  let me = rdPtr(world, GwMainPlayer)
+  apAdd(ApPWorld, tWorld)
   if items == nil or n < 0 or n > 1024: return
 
   gPosSweeps = gPosSweeps + 1
   posBegin()
-  let me = rdPtr(world, GwMainPlayer)
   var good = 0
   if me != nil:
+    let tMe = apNow()
     let c = posAdd(me)
+    apAdd(ApPMe, tMe)
     gPosCode = c
     if c == posOk: good = good + 1
+  let tLoop = apNow()
   var i = 0
   while i < n:
+    let tF = apNow()
     let p = rdPtr(items, ArrDataOff + i*8)
+    apAdd(ApEFetch, tF)
     inc i
     if p == nil or p == me: continue
-    if posAdd(p) == posOk: good = good + 1
+    let tA = apNow()
+    let code = posAdd(p)
+    apAdd(ApEAdd, tA)
+    if code == posOk: good = good + 1
+  apAdd(ApPLoop, tLoop)
+  let tCommit = apNow()
   posCommit()
+  apAdd(ApPCommit, tCommit)
   if good > 0: gPosGood = gPosGood + 1
 
   # The movement check, taken on the FINISHED published snapshot.
+  let tMove = apNow()
   if me != nil:
     var x = 0.0; var y = 0.0; var z = 0.0
     if posGet(me, x, y, z):
@@ -455,6 +482,7 @@ proc posSample*() =
       gPosHavePrev = true
     elif gPosCode != posOk:
       note("player position: " & posCodeText(gPosCode))
+  apAdd(ApPMove, tMove)
 
 proc distance(ax, ay, az, bx, by, bz: float): float =
   let dx = ax - bx; let dy = ay - by; let dz = az - bz

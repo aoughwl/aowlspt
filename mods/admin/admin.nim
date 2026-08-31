@@ -73,6 +73,9 @@ import aowlspt/json
 
 import "adm" / shared
 import "adm" / data
+import "adm" / admprof
+# Prototypes only -- `adm/admprof.nim` owns the state (AOWL_ADMPROF_IMPL).
+{.emit: """#include "aowlspt_admprof.h" """.}
 
 const
   ModGuid = "aowl.admin"
@@ -425,10 +428,28 @@ proc onCamTick(payload: string): string =
   # It byte-verifies the prologue before its first call, caps its iteration at
   # two compile-time table sizes, allocates nothing, and self-disables after
   # 240 consecutive bind refusals.
+  # L0/L1 BRACKETS. Two QPC reads per pair around call sites that already
+  # exist; no-ops when the profiler is off (flag-gated, DEFAULT OFF). The
+  # WHOLE bracket is closed on EVERY return path -- including the ESP-off one
+  # below -- so a tick that returns early is counted as a cheap tick rather
+  # than silently vanishing from the denominator.
+  # The control runs OUTSIDE the WHOLE bracket on purpose: inside, its cost
+  # would land in the UNEXPLAINED residual of L1 and be attributed to work
+  # admin does not do.
+  apControl()
+  let tWhole = apNow()
+  let tHk = apNow()
   discard hotkeyPoll(gRegion, cfgHotkeys)
-  if not toggleOn(gRegion, admEsp): return
+  apAdd(ApHotkey, tHk)
+  if not toggleOn(gRegion, admEsp):
+    apAdd(ApWhole, tWhole)
+    apTick()
+    return
   gSamplerFirings = gSamplerFirings + 1
-  if camSample(): gSamplerGood = gSamplerGood + 1
+  let tCam = apNow()
+  let camOk = camSample()
+  apAdd(ApCam, tCam)
+  if camOk: gSamplerGood = gSamplerGood + 1
   # UNITY THREAD, and it has to be. `EFT.Player::get_Position` @0x6F32C0 ends in
   # `Transform::get_position_Injected`, a Unity native ICall -- it is not legal
   # from `onUpdate` (host thread), which is where the ESP data pass runs. So the
@@ -438,7 +459,11 @@ proc onCamTick(payload: string): string =
   # a live raid. `posSample` arms itself once behind a 16-byte prologue verify,
   # validates every hop, caps its sweep, allocates nothing, and declines with a
   # named reason rather than silently.
+  let tPos = apNow()
   posSample()
+  apAdd(ApPos, tPos)
+  apAdd(ApWhole, tWhole)
+  apTick()
 
 proc armCamSampler() =
   ## Idempotent, retried from onUpdate until it arms or refuses for a reason
@@ -751,6 +776,18 @@ proc serviceSpawn() =
          "has DISABLED itself for this session rather than refuse every tick " &
          "forever. Nothing else in this mod is affected."
 
+proc emitProfile() =
+  ## The phase decomposition and the cache's own behaviour, on the SAME timer as
+  ## the diag they exist to explain. Unconditional when the flag is set: the
+  ## numbers are CUMULATIVE, so an unchanged-looking line is still new
+  ## information (the means moved). `admProfLine` reports INCONCLUSIVE below its
+  ## tick threshold rather than a number, so "I could not look yet" cannot read
+  ## as a pass; `rdCacheText` reports NEVER RAN separately from a 0% hit rate,
+  ## and FAILs outright if the replicated predicate ever disagreed.
+  if apEnabled() == 0'i32: return
+  info ModName & ": " & admProfLine()
+  info ModName & ": " & rdCacheText()
+
 proc onUpdate(elapsedMs: int64): Status =
   if gRegion == nil:
     return Ok
@@ -845,6 +882,7 @@ proc onUpdate(elapsedMs: int64): Status =
       gRaidReported = true
       gLastDiagTick = gTick
       info adminDiag()
+      emitProfile()
   elif dataInRaid() and (gTick - gLastDiagTick) >= DiagReEmitTicks:
     # RE-EMIT while in raid. The old once-per-raid latch meant an intermittent
     # in-raid defect (the ESP flicker) could never be measured from the log: the
@@ -853,6 +891,7 @@ proc onUpdate(elapsedMs: int64): Status =
     # (CLAUDE.md 9b) without a human re-entering the raid.
     gLastDiagTick = gTick
     info adminDiag()
+    emitProfile()
   elif not dataInRaid():
     # Re-arm for the NEXT raid. Leaving these latched meant a session that
     # entered a second raid reported nothing at all about it.
@@ -874,6 +913,26 @@ proc onLoad(): Status =
     return Ok
 
   applyConfigToggles()
+
+  # THE PHASE PROFILER. Flag-gated, DEFAULT OFF (CLAUDE.md 5). It installs no
+  # detour, resolves no name and touches no game memory -- it is two QPC reads
+  # per bracket -- but it is still off by default and still announces itself
+  # when it is on, because an instrument nobody knows is running is an
+  # instrument whose cost gets attributed to the thing it is measuring.
+  let profOn = cfgBool("profile", false)
+  apSetEnabled(if profOn: 1'i32 else: 0'i32)
+  if profOn:
+    info ModName & ": phase profiler ON. onCamTick is bracketed with " &
+         "QueryPerformanceCounter at FOUR DISJOINT levels (tick phases, " &
+         "posSample phases, per-list-slot phases, per-hop inside pos_live), " &
+         "each summed against its OWN parent bracket so the unbracketed " &
+         "remainder is named as UNEXPLAINED rather than attributed. Every " &
+         "duration is MICROSECONDS (us) or NANOSECONDS (ns), always spelled. " &
+         "It carries a positive control of 512 integer adds through the same " &
+         "bracket -- expected order 0.1-1.0us; 0.0us or milliseconds means " &
+         "the meter is lying and EVERY row is VOID. One line beside each " &
+         "in-raid adminDiag dump."
+
   declareSettings(adminSchema())
   onSettingsApplied(onSettingsHotApply)
   discard serve("/aowlspt/settings/" & ModGuid, onAdminSettings)

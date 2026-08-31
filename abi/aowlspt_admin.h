@@ -50,6 +50,24 @@
 #include <stdint.h>
 #include <string.h>
 
+/* OPT-IN PHASE INSTRUMENTATION. `mods/admin` defines AOWL_ADM_PROF before
+ * including this header, so the L4 brackets inside `aowl_admin_pos_live` below
+ * exist only in the mod's translation units. The OVERLAY includes this same
+ * header and does NOT define it, so it gets no brackets, no extern references
+ * and no link dependency on the profiler's translation unit. With the macro
+ * undefined every bracket compiles to `((void)0)` -- there is no runtime test,
+ * so an un-instrumented build pays nothing at all rather than paying a branch.
+ * With it defined the brackets are still no-ops until `aowl_ap_set_enabled(1)`
+ * is called, which is flag-gated and DEFAULT OFF (CLAUDE.md 5). */
+#ifdef AOWL_ADM_PROF
+#include "aowlspt_admprof.h"
+#define AOWL_APB(v)       int64_t v = aowl_ap_now()
+#define AOWL_APE(slot, v) aowl_ap_add((slot), (v))
+#else
+#define AOWL_APB(v)       ((void)0)
+#define AOWL_APE(slot, v) ((void)0)
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -630,7 +648,7 @@ static int32_t aowl_admin_snapshot(AowlAdminShared* s, AowlAdminShared* out) {
  * "the ESP shows nothing" and "the game crashed".
  * ------------------------------------------------------------------ */
 
-static int32_t aowl_admin_readable(const void* p, int32_t size) {
+static int32_t aowl_admin_readable_raw(const void* p, int32_t size) {
     MEMORY_BASIC_INFORMATION mbi;
     if (!p || size <= 0) return 0;
     if (VirtualQuery(p, &mbi, sizeof(mbi)) == 0) return 0;
@@ -644,6 +662,216 @@ static int32_t aowl_admin_readable(const void* p, int32_t size) {
         return need <= end ? 1 : 0;
     }
 }
+
+/* ------------------------------------------------------------------ *
+ * THE REGION-READABILITY CACHE.
+ *
+ * WHY. `aowl_admin_readable_raw` above is a raw `VirtualQuery` -- a SYSCALL
+ * that walks this process's very large VAD tree -- and this header issues one
+ * PER FIELD HOP. `aowl_admin_pos_live` alone pays five of them per player per
+ * Unity frame, on top of one per player-list slot in the sweep that drives it.
+ * The identical defect in `mods/maps` was MEASURED at 4394us/tick for the
+ * entity loop and fell to 645us/tick (-85%) when the region answer was cached;
+ * live counters there read `hits=670100 misses=48902 (93% hit)` with
+ * `pred-audit=agrees/191`, i.e. the fast path never once disagreed with the
+ * real predicate. This is that fix, ported -- and ported by replicating THIS
+ * header's predicate, not maps': the two are NOT the same. `aowl_is_readable`
+ * in abi/aowlspt_shim.h additionally requires a READ protection bit;
+ * `aowl_admin_readable_raw` only rejects PAGE_NOACCESS and PAGE_GUARD. Copying
+ * maps' clause list here would have silently CHANGED admin's guard.
+ *
+ * THE CHECK IS NOT REMOVED AND NOT WEAKENED. The question asked is exactly the
+ * one asked before -- "does [p, p+size) lie wholly inside ONE committed,
+ * non-guard, non-NOACCESS region?" -- and it is answered from a
+ * MEMORY_BASIC_INFORMATION describing a REGION, not an address. That answer is
+ * therefore valid for every address in that region, and re-asking it per hop
+ * re-derives an identical answer at syscall price. A miss falls straight
+ * through to a real VirtualQuery; there is no path here that returns 1 without
+ * one having said so.
+ *
+ * THE HAZARD, NAMED, AND WHY THE TWO TTLs DIFFER. A cached POSITIVE gone stale
+ * is a read of a decommitted page, i.e. a crash. A cached NEGATIVE gone stale
+ * is a refused read, i.e. a decline -- which this mod already reports as a
+ * named exit code and counts. So: positives 250 ms and ONLY for regions
+ * >= 64 KB (heap segments and image sections; a sub-64KB region is a transient
+ * VirtualAlloc and is never cached positively, it just pays the syscall);
+ * negatives 2000 ms, any size.
+ *
+ * IT NEVER CLAIMED LIVENESS. Unity FAKE NULL means readability is not liveness
+ * and type confusion beats both guards. A region reused for a different
+ * allocation is still committed and still readable, so the cached answer is
+ * still TRUE -- what changed is the OBJECT, and nothing here substitutes for
+ * the callers' own null, flag and plausibility checks, which are untouched.
+ *
+ * CAPACITY, because that is what the maps port got wrong first. A 32-slot
+ * round-robin table thrashed against ~35 entities x >=3 distinct regions and
+ * every FIRST touch of a region within a call missed. This is 1024 sets x 2
+ * ways, hashed on the address's 64KB chunk (`a >> 16`), with an epoch-based
+ * O(1) flush. Lookup cannot be hashed on the region base -- the base is not
+ * known until a VirtualQuery has been made -- so a region spanning many chunks
+ * installs one entry per chunk it is actually touched in; every such entry
+ * carries the SAME base/end, so they cannot disagree. Every answer re-checks,
+ * in order: epoch, chunk tag, containment, TTL. A stale tag or an aliased set
+ * therefore cannot produce a wrong answer, only a miss.
+ *
+ * THE REPLICATION IS AUDITED LIVE. One miss in AOWL_ADM_RDC_AUDIT_EVERY also
+ * calls `aowl_admin_readable_raw` and compares; `disagree` counts any
+ * difference and MUST stay 0. A non-zero disagree means this block has drifted
+ * from the predicate above and must be resynced -- it is a measurement, not a
+ * claim.
+ *
+ * IT OPENS NO GUARD AND INSTALLS NOTHING. Fixed static storage, no allocation,
+ * no detour, no name resolved, nothing of the game's dereferenced.
+ * ------------------------------------------------------------------ */
+
+#define AOWL_ADM_RDC_SETS         1024   /* 1024 sets x 2 ways = 2048 entries  */
+#define AOWL_ADM_RDC_WAYS         2
+#define AOWL_ADM_RDC_CHUNK_SHIFT  16     /* 64KB granule: Windows alloc unit   */
+#define AOWL_ADM_RDC_POS_TTL_MS   250    /* stale positive == crash; keep short*/
+#define AOWL_ADM_RDC_NEG_TTL_MS  2000    /* stale negative == a decline; cheap */
+#define AOWL_ADM_RDC_MIN_POS_SIZE 0x10000
+#define AOWL_ADM_RDC_AUDIT_EVERY  256
+
+typedef struct {
+    uintptr_t tag;       /* address >> CHUNK_SHIFT, +1; 0 == empty slot */
+    uintptr_t base;
+    uintptr_t end;
+    uint64_t  stamp;     /* GetTickCount64 at the VirtualQuery */
+    uint32_t  epoch;     /* != rdc.epoch => flushed, treat as empty */
+    int32_t   ok;
+} AowlAdmRdcEntry;
+
+typedef struct {
+    AowlAdmRdcEntry e[AOWL_ADM_RDC_SETS][AOWL_ADM_RDC_WAYS];
+    uint32_t epoch;
+    uint32_t auditTick;
+    int64_t  hits;
+    int64_t  misses;
+    int64_t  flushes;
+    int64_t  uncacheable;  /* answered by syscall, deliberately not stored */
+    int64_t  evictLive;    /* victim was USED and INSIDE its TTL: capacity   */
+    int64_t  expired;
+    int64_t  auditChecks;
+    int64_t  auditDisagree;/* MUST stay 0; non-zero == drift from the raw one */
+} AowlAdmRdcState;
+
+static AowlAdmRdcState aowl_adm_rdc;   /* zero-initialised; epoch 0 */
+
+static void aowl_admin_rdc_flush(void) {
+    aowl_adm_rdc.epoch++;
+    if (aowl_adm_rdc.epoch == 0) aowl_adm_rdc.epoch = 1;
+    aowl_adm_rdc.flushes++;
+}
+
+/* THE PREDICATE, replicated clause-for-clause from aowl_admin_readable_raw,
+ * applied to an mbi WE already hold so a miss costs one syscall instead of two.
+ * If you change one of these, change both -- and expect `disagree` to say so if
+ * you do not. */
+static int32_t aowl_admin_rdc_pred(const MEMORY_BASIC_INFORMATION* mbi,
+                                   uintptr_t a, uintptr_t need) {
+    if (mbi->State != MEM_COMMIT) return 0;
+    if (mbi->Protect & (PAGE_NOACCESS | PAGE_GUARD)) return 0;
+    {
+        uintptr_t start = (uintptr_t)mbi->BaseAddress;
+        uintptr_t end   = start + (uintptr_t)mbi->RegionSize;
+        if (a < start) return 0;
+        return need <= end ? 1 : 0;
+    }
+}
+
+static uint32_t aowl_admin_rdc_set_of(uintptr_t tag) {
+    /* Mix, so regions laid out at a regular stride do not all alias into one
+     * set -- the failure a plain (tag & MASK) would reintroduce. */
+    uint64_t h = (uint64_t)tag * 0x9E3779B97F4A7C15ull;
+    return (uint32_t)((h >> 40) & (uint64_t)(AOWL_ADM_RDC_SETS - 1));
+}
+
+/* Contract IDENTICAL to aowl_admin_readable_raw. */
+static int32_t aowl_admin_readable(const void* p, int32_t size) {
+    uintptr_t a, need, tag;
+    uint64_t now;
+    uint32_t set;
+    int32_t w, ans;
+    MEMORY_BASIC_INFORMATION mbi;
+
+    if (!p || size <= 0) return 0;
+    a = (uintptr_t)p;
+    need = a + (uintptr_t)size;
+    if (need < a) return 0;            /* overflow -- the guard's own refusal */
+
+    now = GetTickCount64();
+    /* +1, not |1: the tag must stay INJECTIVE. `| 1` would give adjacent 64KB
+     * chunks the same tag, which containment would then reject -- correct, but
+     * a self-inflicted conflict. */
+    tag = (a >> AOWL_ADM_RDC_CHUNK_SHIFT) + 1u;
+    set = aowl_admin_rdc_set_of(tag);
+
+    for (w = 0; w < AOWL_ADM_RDC_WAYS; w++) {
+        AowlAdmRdcEntry* e = &aowl_adm_rdc.e[set][w];
+        uint64_t ttl;
+        if (e->tag != tag) continue;
+        if (e->epoch != aowl_adm_rdc.epoch) continue;    /* flushed */
+        if (a < e->base || need > e->end) continue;      /* containment */
+        ttl = e->ok ? (uint64_t)AOWL_ADM_RDC_POS_TTL_MS
+                    : (uint64_t)AOWL_ADM_RDC_NEG_TTL_MS;
+        if (now - e->stamp > ttl) { e->tag = 0; aowl_adm_rdc.expired++; continue; }
+        aowl_adm_rdc.hits++;
+        return e->ok;
+    }
+
+    /* MISS. ONE VirtualQuery, and the same predicate the raw guard applies. */
+    aowl_adm_rdc.misses++;
+    if (VirtualQuery(p, &mbi, sizeof(mbi)) == 0) return 0;
+    ans = aowl_admin_rdc_pred(&mbi, a, need);
+
+    /* Live audit of the replication, on a sample of misses. One extra syscall
+     * 1 time in N, and the only thing that can prove this has not drifted from
+     * aowl_admin_readable_raw. */
+    if (++aowl_adm_rdc.auditTick >= (uint32_t)AOWL_ADM_RDC_AUDIT_EVERY) {
+        aowl_adm_rdc.auditTick = 0;
+        aowl_adm_rdc.auditChecks++;
+        if (aowl_admin_readable_raw(p, size) != ans) aowl_adm_rdc.auditDisagree++;
+    }
+
+    {
+        uintptr_t base = (uintptr_t)mbi.BaseAddress;
+        uintptr_t end  = base + (uintptr_t)mbi.RegionSize;
+        if (end <= base) return ans;
+        if (ans && (end - base) < (uintptr_t)AOWL_ADM_RDC_MIN_POS_SIZE) {
+            aowl_adm_rdc.uncacheable++;   /* answered honestly, then forgotten */
+            return ans;
+        }
+        {
+            /* Victim: an empty/flushed way first, else the OLDER stamp. */
+            AowlAdmRdcEntry* v = &aowl_adm_rdc.e[set][0];
+            for (w = 0; w < AOWL_ADM_RDC_WAYS; w++) {
+                AowlAdmRdcEntry* c = &aowl_adm_rdc.e[set][w];
+                if (c->tag == 0 || c->epoch != aowl_adm_rdc.epoch) { v = c; break; }
+                if (c->stamp < v->stamp) v = c;
+            }
+            /* Was this eviction forced by CAPACITY rather than by time? That is
+             * the number which decides whether the table is big enough, and it
+             * is the number that can FALSIFY the capacity diagnosis. */
+            if (v->tag != 0 && v->tag != tag && v->epoch == aowl_adm_rdc.epoch) {
+                uint64_t vttl = v->ok ? (uint64_t)AOWL_ADM_RDC_POS_TTL_MS
+                                      : (uint64_t)AOWL_ADM_RDC_NEG_TTL_MS;
+                if (now - v->stamp <= vttl) aowl_adm_rdc.evictLive++;
+            }
+            v->tag = tag; v->base = base; v->end = end; v->stamp = now;
+            v->epoch = aowl_adm_rdc.epoch; v->ok = ans ? 1 : 0;
+        }
+    }
+    return ans;
+}
+
+static int64_t aowl_admin_rdc_hits(void)        { return aowl_adm_rdc.hits; }
+static int64_t aowl_admin_rdc_misses(void)      { return aowl_adm_rdc.misses; }
+static int64_t aowl_admin_rdc_flushes(void)     { return aowl_adm_rdc.flushes; }
+static int64_t aowl_admin_rdc_uncacheable(void) { return aowl_adm_rdc.uncacheable; }
+static int64_t aowl_admin_rdc_evict_live(void)  { return aowl_adm_rdc.evictLive; }
+static int64_t aowl_admin_rdc_expired(void)     { return aowl_adm_rdc.expired; }
+static int64_t aowl_admin_rdc_audits(void)      { return aowl_adm_rdc.auditChecks; }
+static int64_t aowl_admin_rdc_disagree(void)    { return aowl_adm_rdc.auditDisagree; }
 static void* aowl_admin_rp(const void* o, int32_t off) {
     void* v = 0;
     const char* a = (const char*)o + off;
@@ -966,30 +1194,54 @@ static int32_t aowl_adm_rd_u8(const void* o, int32_t off, unsigned char* out) {
  * inferred from the name -- it is read off `48 8B D9` (mov rbx,rcx) at entry
  * and `F2 0F 11 03 / 89 43 08 / 48 8B C3` (store 12 bytes to [rbx], return rbx)
  * at exit. MethodInfo* NULL is safe: get_Position is not a shared generic. */
+/* L4 BRACKETS. `w` brackets the WHOLE body on EVERY return path, including the
+ * two that return before any hop is attempted -- that is what makes it a valid
+ * parent for the per-hop rows (see the header comment in aowlspt_admprof.h on
+ * why AP_E_ADD is the WRONG parent and produced 104.3%). Each `return` below
+ * therefore closes it. Nothing else about the function changed. */
 static int32_t aowl_admin_pos_live(void* player, float* out3) {
     void* bones; void* bt; void* orig;
     unsigned char flag = 0;
     float tmp[3];
+    AOWL_APB(w);
     out3[0] = 0.0f; out3[1] = 0.0f; out3[2] = 0.0f;
-    if (aowl_adm_getpos_state != 1) return AOWL_ADM_POS_NOCALL;
-    if (!player)                    return AOWL_ADM_POS_NILBONES;
-    bones = aowl_admin_rp(player, AOWL_ADM_PL_BONES);
-    if (!bones)                     return AOWL_ADM_POS_NILBONES;
-    bt = aowl_admin_rp(bones, AOWL_ADM_PB_BODYXF);
-    if (!bt)                        return AOWL_ADM_POS_NILXFORM;
+    if (aowl_adm_getpos_state != 1) { AOWL_APE(AP_L_WHOLE, w); return AOWL_ADM_POS_NOCALL; }
+    if (!player)                    { AOWL_APE(AP_L_WHOLE, w); return AOWL_ADM_POS_NILBONES; }
+    { AOWL_APB(h);
+      bones = aowl_admin_rp(player, AOWL_ADM_PL_BONES);
+      AOWL_APE(AP_L_H1, h); }
+    if (!bones)                     { AOWL_APE(AP_L_WHOLE, w); return AOWL_ADM_POS_NILBONES; }
+    { AOWL_APB(h);
+      bt = aowl_admin_rp(bones, AOWL_ADM_PB_BODYXF);
+      AOWL_APE(AP_L_H2, h); }
+    if (!bt)                        { AOWL_APE(AP_L_WHOLE, w); return AOWL_ADM_POS_NILXFORM; }
     /* Both imitation flags must be clear, or get_position takes a delegate path
      * we have NOT proven throw-free. Declining is an ANSWER, not a silence. */
-    if (!aowl_adm_rd_u8(bt, AOWL_ADM_BT_ACCUM, &flag)   || flag) return AOWL_ADM_POS_IMITATED;
-    if (!aowl_adm_rd_u8(bt, AOWL_ADM_BT_USEIMIT, &flag) || flag) return AOWL_ADM_POS_IMITATED;
-    orig = aowl_admin_rp(bt, AOWL_ADM_BT_ORIGINAL);
-    if (!orig)                      return AOWL_ADM_POS_NILXFORM;
+    { int32_t r; AOWL_APB(h);
+      r = aowl_adm_rd_u8(bt, AOWL_ADM_BT_ACCUM, &flag);
+      AOWL_APE(AP_L_H3, h);
+      if (!r || flag) { AOWL_APE(AP_L_WHOLE, w); return AOWL_ADM_POS_IMITATED; } }
+    { int32_t r; AOWL_APB(h);
+      r = aowl_adm_rd_u8(bt, AOWL_ADM_BT_USEIMIT, &flag);
+      AOWL_APE(AP_L_H4, h);
+      if (!r || flag) { AOWL_APE(AP_L_WHOLE, w); return AOWL_ADM_POS_IMITATED; } }
+    { AOWL_APB(h);
+      orig = aowl_admin_rp(bt, AOWL_ADM_BT_ORIGINAL);
+      AOWL_APE(AP_L_H5, h); }
+    if (!orig)                      { AOWL_APE(AP_L_WHOLE, w); return AOWL_ADM_POS_NILXFORM; }
     tmp[0] = 0.0f; tmp[1] = 0.0f; tmp[2] = 0.0f;
-    ((void* (*)(void*, void*, void*))aowl_adm_getpos_fn)((void*)tmp, player, (void*)0);
-    out3[0] = tmp[0]; out3[1] = tmp[1]; out3[2] = tmp[2];
-    /* readable=1: the buffer is OUR stack, so readability is not in question --
-     * it was answered by the guarded walk above. The plausibility gates
-     * (NaN / out-of-range / exactly-zero) still apply unchanged. */
-    return aowl_admin_pos_classify(1, tmp[0], tmp[1], tmp[2]);
+    { AOWL_APB(h);
+      ((void* (*)(void*, void*, void*))aowl_adm_getpos_fn)((void*)tmp, player, (void*)0);
+      AOWL_APE(AP_L_CALL, h); }
+    { int32_t code; AOWL_APB(h);
+      out3[0] = tmp[0]; out3[1] = tmp[1]; out3[2] = tmp[2];
+      /* readable=1: the buffer is OUR stack, so readability is not in question
+       * -- it was answered by the guarded walk above. The plausibility gates
+       * (NaN / out-of-range / exactly-zero) still apply unchanged. */
+      code = aowl_admin_pos_classify(1, tmp[0], tmp[1], tmp[2]);
+      AOWL_APE(AP_L_TAIL, h);
+      AOWL_APE(AP_L_WHOLE, w);
+      return code; }
 }
 
 /* ------------------------------------------------------------------ *

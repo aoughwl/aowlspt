@@ -14,6 +14,9 @@
   "teleport": false,
   "timeOfDay": false,
 
+  "_profile": "The phase profiler, DEFAULT OFF. Brackets onCamTick (the everyMain callback that the host drain profiler measured at 6579.2us/frame) with QueryPerformanceCounter at four disjoint levels, and prints one decomposition line plus one region-cache line beside each in-raid adminDiag dump. It installs no detour, resolves no name and reads no game memory of its own -- it is two QPC reads per bracket -- but it is off by default because an instrument nobody knows is running is an instrument whose cost gets attributed to what it measures.",
+  "profile": false,
+
   "_espMaxDistance": "Do not box players farther than this many metres from you. 400 is a sane raid default; raise it for open maps.",
   "espMaxDistance": 400.0,
 

@@ -8,7 +8,16 @@
 ## mapping `aowl_admin_map` returns, so both talking to it is two views of one
 ## region, not two copies of a global.
 
-{.emit: """#include "aowlspt_admin.h" """.}
+# AOWL_ADM_PROF opts this translation unit into the L4 phase brackets inside
+# `aowl_admin_pos_live` (see the macro block at the top of aowlspt_admin.h). The
+# OVERLAY includes the same header WITHOUT this define and therefore gets no
+# brackets and no link dependency on `adm/admprof.nim`'s translation unit. The
+# brackets are additionally no-ops at runtime until the profiler is enabled,
+# which is flag-gated and DEFAULT OFF.
+{.emit: """
+#define AOWL_ADM_PROF
+#include "aowlspt_admin.h"
+""".}
 # The overlay-mask suppression hook binds the HOST export `aowl_ui_overlay_mask`,
 # which lives in the host DLL, not in this mod. The mod links standalone, so the
 # symbol cannot be resolved at link time (and #include-ing aowlspt_uistate.h is
@@ -123,6 +132,52 @@ proc cRf(o: pointer; off: int32): cfloat {.importc: "aowl_admin_rf", nodecl.}
 proc cWf(o: pointer; off: int32; v: cfloat) {.importc: "aowl_admin_wf", nodecl.}
 proc cRb(o: pointer; off: int32): int32 {.importc: "aowl_admin_rb", nodecl.}
 proc cWb(o: pointer; off: int32; v: int32): int32 {.importc: "aowl_admin_wb", nodecl.}
+
+# The region-readability cache that sits under every rd*/wr* above and under
+# every hop in `aowl_admin_pos_live`. Counters, not claims -- see the block in
+# abi/aowlspt_admin.h.
+proc cRdcHits(): int64 {.importc: "aowl_admin_rdc_hits", nodecl.}
+proc cRdcMisses(): int64 {.importc: "aowl_admin_rdc_misses", nodecl.}
+proc cRdcFlushes(): int64 {.importc: "aowl_admin_rdc_flushes", nodecl.}
+proc cRdcUncacheable(): int64 {.importc: "aowl_admin_rdc_uncacheable", nodecl.}
+proc cRdcEvictLive(): int64 {.importc: "aowl_admin_rdc_evict_live", nodecl.}
+proc cRdcExpired(): int64 {.importc: "aowl_admin_rdc_expired", nodecl.}
+proc cRdcAudits(): int64 {.importc: "aowl_admin_rdc_audits", nodecl.}
+proc cRdcDisagree(): int64 {.importc: "aowl_admin_rdc_disagree", nodecl.}
+proc cRdcFlush*() {.importc: "aowl_admin_rdc_flush", nodecl.}
+
+proc rdCacheText*(): string =
+  ## The cache's OWN behaviour as a measured number. Three outcomes: a hit rate
+  ## it actually achieved, "NEVER RAN" when nothing was ever looked up (which is
+  ## not the same as "every lookup missed"), and a hard FAIL if the replicated
+  ## predicate ever disagreed with `aowl_admin_readable_raw`.
+  let h = cRdcHits()
+  let m = cRdcMisses()
+  let tot = h + m
+  if tot <= 0:
+    return "rdcache: NEVER RAN -- 0 lookups. That is NOT 'every lookup " &
+           "missed' and NOT 'the cache works'; nothing was measured."
+  let pct = (h * 100'i64) div tot
+  var s = "rdcache: hits=" & $h & " misses=" & $m & " (" & $pct &
+          "% hit) syscalls-avoided=" & $h & " expired=" & $cRdcExpired() &
+          " evict-live=" & $cRdcEvictLive() &
+          " small-region-positives-not-cached=" & $cRdcUncacheable() &
+          " flushes=" & $cRdcFlushes()
+  # THE CHECK THAT CAN FAIL: the fast path is compared against the real
+  # predicate on a sample of misses, and a single disagreement condemns it.
+  let a = cRdcAudits()
+  if a <= 0:
+    s = s & ". pred-audit: INCONCLUSIVE -- 0 audits sampled, so the " &
+        "replication is UNVERIFIED in this run"
+  elif cRdcDisagree() > 0:
+    s = s & ". pred-audit: FAIL -- " & $cRdcDisagree() & " of " & $a &
+        " audited misses DISAGREED with aowl_admin_readable_raw. The " &
+        "replicated predicate has DRIFTED; every guarded read in this run is " &
+        "suspect"
+  else:
+    s = s & ". pred-audit=agrees/" & $a &
+        " (the fast path never disagreed with the real predicate)"
+  s
 
 # The live world position: a byte-verified direct call at EFT.Player::get_Position
 # @0x6F32C0, sampled on Unity's thread into a double-buffered snapshot the host
