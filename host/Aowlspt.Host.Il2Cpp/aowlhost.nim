@@ -346,6 +346,12 @@ static int aowl_rva_is_code(unsigned int rva) {
 ## the faction colour table, the fault budget and the three-outcome verdict
 ## vocabulary. No il2cpp; nothing in it can fault.
 {.emit: """#include "aowlspt_natesp.h" """.}
+## THE FRAME METER's pure-C half -- a QPC frame-interval histogram that depends
+## on NOTHING under test. It is here, beside natesp, only because both are pure
+## C over their own statics; it shares no state with it and no flag with it.
+## Nothing in it dereferences a game pointer, so nothing in it can fault, and it
+## arms no SEH guard on purpose. See `abi/aowlspt_frametime.h`.
+{.emit: """#include "aowlspt_frametime.h" """.}
 ## THE ONE WildSpawnType numeric table, shared verbatim with mods/maps so the
 ## minimap and the ESP boxes cannot disagree about who is a Rogue. Pure integer
 ## classification over a value the caller already read -- it dereferences
@@ -3345,6 +3351,22 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
   # The host's own drain hook comes first, and by identity rather than by
   # scanning: it fires on every frame of the game and must not walk anything.
   if i == gDrainSlot:
+    # THE FRAME METER, first and above everything, so the interval it measures
+    # is the interval every rider below is charged against. It rides THIS drain
+    # and nothing else: `gDrainSlot` is bound by the bridge, not by a feature
+    # flag, and `TarkovApplication::Update` ticks for the whole session,
+    # including raid. That independence is the entire point -- every other frame
+    # counter in the host lives inside a feature (natEspDiag, the maps diag),
+    # and the maps HUD only draws once the raid-phase latch reads DEPLOYED, a
+    # latch driven from the ESP path. So frame instrumentation was transitively
+    # gated on `natEsp`, and the one experiment that matters -- what is the
+    # frame rate with the ESP OFF -- could not be run. This can run it.
+    #
+    # It opens NO guard: its whole working set is its own statics plus
+    # QueryPerformanceCounter, it dereferences no game pointer and allocates
+    # nothing on the per-frame path. Flag `frameMeter`, default OFF; idle cost
+    # is one boolean compare.
+    ftTick()
     mainDrain()
     # THE LIVE INSPECTOR'S IN-RAID TICK. `PreloaderUI::Update` only runs in the
     # menu, so an inspector anchored solely to it goes silent the moment a raid
@@ -6061,6 +6083,11 @@ include "nuikit.nim"
 
 include "natesp.nim"
 
+## THE FRAME METER. Included anywhere after the log helpers and `readBoolKey`;
+## it names nothing from any feature module, which is the property that makes it
+## a valid instrument for bisecting those features.
+include "frametime.nim"
+
 ## THE SHARED PER-FRAME REGION. Included AFTER `modstab.nim` because
 ## `bindRegion` names `gModsSlot` and `cDuPreloaderTarget`, and nimony
 ## forward-resolves procs across an include boundary but NOT variables.
@@ -7722,6 +7749,10 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   # `and gNuOn` is not belt-and-braces: without the nu* layer this feature has
   # no way to construct a single box, and arming it would only produce a
   # feature that reports "the callback ran" forever.
+  # THE FRAME METER. Read FIRST among the per-frame features and ANDed with
+  # nothing, on purpose: it is the instrument the others are measured with, and
+  # an instrument that can be disabled by the subject is not an instrument.
+  ftConfigure()
   gNeOn = readBoolKey("natEsp") and gNuOn
   gNeDiag = gNeOn and readBoolKey("natEspDiag")
   # THE PER-CLASS COLOURS, from `colorSetting(format="hex")`. Read ONCE here, at
