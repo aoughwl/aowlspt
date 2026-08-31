@@ -1,4 +1,60 @@
-# aowl.loadammoanim — Ammo Loading Animations
+# aowl.ammoloading — "Ammo Loading"
+
+Everything about putting rounds into a magazine and taking them out again.
+**Two features**, and one of them deliberately lives somewhere else.
+
+## Feature 1 — the loading ANIMATION
+
+Status, plainly: **ARMED but NEVER FIRED.** The hooks install and byte-verify,
+and the mod has never been observed to fire on a real magazine load while
+armed. Do not read anything below as "this works"; read it as "this is what is
+installed and waiting". The ladder is `off -> probe -> read -> spawn ->
+animate` and **only `animate` is visible**.
+
+### The dependency nobody expects: `spawn` and `animate` need aowl.textures
+
+The `spawn` and `animate` rungs cannot work until a bundle is riding an
+existing vanilla bundle key. This build **cannot add** a bundle key -- the game
+builds one `EasyBundle` per entry in BSG's own manifest -- so
+`stanags_container.bundle` must **replace** an existing key, and that redirect
+is performed by **`mods/textures`** with `redirectMode=full` plus a
+`bundleRoot` containing a file named exactly like the key you put in
+`hijackKey`. This mod never detours `EasyBundle::Load` itself, because a second
+detour on that function would overwrite `mods/textures`' trampoline and
+silently kill the first.
+
+**That redirect is NOT set up as shipped.** `hijackKey` is empty by default and
+`spawn` refuses loudly when it is. So on a stock install the highest rung that
+can do anything at all is `read`. Setting up the textures redirect is a
+prerequisite, not a detail.
+
+## Feature 2 — the load/unload SPEED (not implemented here, on purpose)
+
+How long loading and unloading a magazine takes **is a server database value**,
+not client code, and it is already exposed:
+
+| what | database path | shipped value | tuning row |
+|---|---|---:|---|
+| load time | `globals.config.BaseLoadTime` | 0.85 | `g_BaseLoadTime` |
+| unload time | `globals.config.BaseUnloadTime` | 0.3 | `g_BaseUnloadTime` |
+| skill scaling | `globals.config.LoadTimeSpeedProgress` | 1 | `g_LoadTimeSpeedProgress` |
+
+All three are already among the 770 `globals.config` rows that
+`mods/tarkov/emu/globaltunedata.nim` serves, under category **Globals**
+("Base Load Time", "Base Unload Time", "Load Time Speed Progress"). Change them
+there.
+
+This mod does **not** declare its own control for them. Two settings writing
+one value is exactly the shape that produces "I changed it and nothing
+happened".
+
+(Mag Drills also scales load speed at runtime via
+`globals.config.SkillsSettings.MagDrills.*`, which is likewise already exposed
+under **Skills**.)
+
+---
+
+## Upstream and what this port loses
 
 A port of [ManimalAmmoLoadingAnimations](https://github.com/danauraborealis/ManimalAmmoLoadingAnimations)
 (v1.6.0, MIT) to the post-1.0 IL2CPP client. Upstream's animation bundle is
@@ -92,7 +148,7 @@ Escalate **one rung at a time** (`mode` in `config.json`):
 
 ## Acceptance
 
-`GET /aowlspt/loadammoanim/stats`.
+`GET /aowlspt/ammoloading/stats`.
 
 The falsifiable negative is **behavioural**: a magazine load must take
 measurable time and pass through intermediate states. An instant transfer with

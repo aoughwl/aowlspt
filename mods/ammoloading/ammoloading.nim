@@ -1,6 +1,22 @@
-## aowl.loadammoanim — first-person magazine loading animations.
+## aowl.ammoloading — "Ammo Loading". Everything about putting rounds into a
+## magazine and taking them out again.
 ##
-##     aowl build-mod mods/loadammoanim
+##     aowl build-mod mods/ammoloading
+##
+## TWO FEATURES, ONE OF WHICH LIVES SOMEWHERE ELSE ON PURPOSE:
+##
+## 1. **the ANIMATION** — first-person hands thumbing rounds in. That is all
+##    the code in this file. Status, honestly: ARMED but NEVER FIRED; see
+##    README.md.
+## 2. **the SPEED** — how long a load or unload takes. This is NOT implemented
+##    here and must not be. It is a server database value,
+##    `globals.config.BaseLoadTime` (0.85), `globals.config.BaseUnloadTime`
+##    (0.3) and `globals.config.LoadTimeSpeedProgress` (1), and all three are
+##    ALREADY among the 770 rows `mods/tarkov/emu/globaltunedata.nim` exposes
+##    (`g_BaseLoadTime`, `g_BaseUnloadTime`, `g_LoadTimeSpeedProgress`, category
+##    "Globals"). Declaring a control for them here would mean two settings
+##    writing one value, which is the exact shape that produces "I changed it
+##    and nothing happened". This mod LINKS to them; it does not own them.
 ##
 ## A port of Manimal's **ManimalAmmoLoadingAnimations** (v1.6.0, MIT) to the
 ## post-1.0 IL2CPP client. The upstream animation assets are reused verbatim
@@ -144,8 +160,8 @@ import aowlspt/server
 import aowlspt/settings
 
 const
-  ModGuid    = "aowl.loadammoanim"
-  ModName    = "Ammo Loading Animations"
+  ModGuid    = "aowl.ammoloading"
+  ModName    = "Ammo Loading"
   ModAuthor  = "aowlspt (port of Manimal's ManimalAmmoLoadingAnimations, MIT)"
   ModVersion = "0.1.0"
 
@@ -459,7 +475,7 @@ proc fault(): bool =
   inc gFaults
   if not gRetired and gFaults >= int64(gMaxFaults):
     gRetired = true
-    warn "loadammoanim  RETIRED after " & $gMaxFaults & " faults " &
+    warn "ammoloading  RETIRED after " & $gMaxFaults & " faults " &
          "(self-disable, rule 6). The hooks stay installed and keep counting; " &
          "nothing will be dereferenced, called or written again this session. " &
          "Vanilla magazine loading is unaffected. See faults/unreadable in " &
@@ -599,7 +615,7 @@ proc onFactoryCtor(frame: PatchFrame): TypedResult =
   gEasyAssets = cast[Il2CppPtr](ea)
   if not gLatched:
     gLatched = true
-    success "loadammoanim  latched IEasyAssets from ObjectsFactory::.ctor " &
+    success "ammoloading  latched IEasyAssets from ObjectsFactory::.ctor " &
             "@0x938430 (factory and easyAssets both non-null). This is the " &
             "holder problem solved by taking the pointer from a place it is " &
             "known live, rather than from an offset that could read null."
@@ -685,14 +701,14 @@ proc spawnPrefab(): bool =
     return false
   if not gLatched:
     inc gSpawnRefused
-    warn "loadammoanim  spawn REFUSED: no IEasyAssets has been latched yet. " &
+    warn "ammoloading  spawn REFUSED: no IEasyAssets has been latched yet. " &
          "ObjectsFactory::.ctor @0x938430 has not fired this session, so " &
          "there is nothing to hand InstantiateWithoutPool. This is a refusal, " &
          "not a zero result."
     return false
   if gHijackKey.len == 0:
     inc gSpawnRefused
-    warn "loadammoanim  spawn REFUSED: hijackKey is empty. We cannot ADD a " &
+    warn "ammoloading  spawn REFUSED: hijackKey is empty. We cannot ADD a " &
          "bundle key on this build, so the bundle must ride an existing " &
          "vanilla key redirected by mods/textures. Set hijackKey and put the " &
          "bundle in the textures bundleRoot under that exact name."
@@ -701,7 +717,7 @@ proc spawnPrefab(): bool =
   let o = verify(tInstantiate)
   if o.kind != coOk:
     inc gSpawnRefused
-    warn "loadammoanim  spawn REFUSED: " & o.why
+    warn "ammoloading  spawn REFUSED: " & o.why
     return false
 
   var a = callArgs()
@@ -711,7 +727,7 @@ proc spawnPrefab(): bool =
   let key = newString(gRt, gHijackKey)
   if cast[uint](key) == 0'u:
     inc gSpawnRefused
-    warn "loadammoanim  spawn REFUSED: il2cpp_string_new returned NULL for " &
+    warn "ammoloading  spawn REFUSED: il2cpp_string_new returned NULL for " &
          "the resource key. Nothing was called."
     return false
   addPtr(a, key)
@@ -723,13 +739,13 @@ proc spawnPrefab(): bool =
     inc gSpawnRefused
     if r.kind == coFaulted:
       discard fault()
-    warn "loadammoanim  InstantiateWithoutPool did not return an object: " & r.why
+    warn "ammoloading  InstantiateWithoutPool did not return an object: " & r.why
     return false
 
   let inst = asPtr(r)
   if not instanceIsLive(inst):
     inc gSpawnRefused
-    warn "loadammoanim  InstantiateWithoutPool returned an object whose " &
+    warn "ammoloading  InstantiateWithoutPool returned an object whose " &
          "m_CachedPtr is zero (Unity fake null) -- treating it as NOT spawned. " &
          "Readability is not liveness."
     return false
@@ -744,7 +760,7 @@ proc animPlay(state: string; layer: int; normalized: float): bool =
     return false
   let o = verify(tAnimPlay)
   if o.kind != coOk:
-    warn "loadammoanim  Animator::Play refused: " & o.why
+    warn "ammoloading  Animator::Play refused: " & o.why
     return false
   let s = newString(gRt, state)
   if cast[uint](s) == 0'u:
@@ -833,7 +849,7 @@ proc onLoadMagazineProcCtor(frame: PatchFrame): TypedResult =
   result = frameContinue()
   inc gCtorFires
   if gCtorFires == 1'i64:
-    success "loadammoanim  BROAD PROBE FIRED: LoadMagazineProcess::.ctor " &
+    success "ammoloading  BROAD PROBE FIRED: LoadMagazineProcess::.ctor " &
             "@0x768D40 constructed. The TYPE is on the player's magazine-load " &
             "path. If `Start` never follows this, the type is right and the " &
             "hooked entry point is wrong."
@@ -860,7 +876,7 @@ proc onLoadMagazineStart(frame: PatchFrame): TypedResult =
   # never firing at all. Silence is never the output of a working feature.
   if not gFirstLogged:
     gFirstLogged = true
-    success "loadammoanim  FIRST FIRING: LoadMagazineProcess::Start @0x768F50 " &
+    success "ammoloading  FIRST FIRING: LoadMagazineProcess::Start @0x768F50 " &
             "entered (ctorFires=" & $gCtorFires & " before it). The trigger " &
             "IS on the path the player took. mode=" & modeName(gMode) &
             (if gMode <= ModeProbe:
@@ -891,7 +907,7 @@ proc onLoadMagazineStart(frame: PatchFrame): TypedResult =
 
   if gLogSessions and gSessionsLogged < MaxSessionsLogged:
     inc gSessionsLogged
-    info "loadammoanim  session " & $gSessions & ": mag tpl " & tpl &
+    info "ammoloading  session " & $gSessions & ": mag tpl " & tpl &
          " -> mesh " & mesh & (if hit: " (table hit)" else: " (FALLBACK)") &
          ", " & $speed & "s per round" &
          (if gSessionsLogged == MaxSessionsLogged:
@@ -989,12 +1005,12 @@ proc maybeArm(): bool =
   let whyStart = verifyTarget(TgtStartRva, "LoadMagazineProcess::Start",
                               StartProlog)
   if whyStart.len > 0:
-    warn "loadammoanim  NOT hooking LoadMagazineProcess::Start: " & whyStart
+    warn "ammoloading  NOT hooking LoadMagazineProcess::Start: " & whyStart
     return false
   let whyCtor = verifyTarget(TgtFactoryCtorRva, "EFT.ObjectsFactory::.ctor",
                              FactoryCtorProlog)
   if whyCtor.len > 0:
-    warn "loadammoanim  NOT hooking EFT.ObjectsFactory::.ctor: " & whyCtor &
+    warn "ammoloading  NOT hooking EFT.ObjectsFactory::.ctor: " & whyCtor &
          " -- without this latch nothing can be spawned, so the feature will " &
          "run at most in `read`."
 
@@ -1011,19 +1027,19 @@ proc maybeArm(): bool =
                            RvaAnimUpdate, SigAnimUpdate, 1)
 
   if gMode >= ModeSpawn and not gRt.has(eStringNew):
-    warn "loadammoanim  the runtime has no il2cpp_string_new, so no resource " &
+    warn "ammoloading  the runtime has no il2cpp_string_new, so no resource " &
          "key or animator state name can be built -- running at most in " &
          "`read`. This is a refusal that says so, not a silent degradation."
 
   let st = hookTyped(TgtStart, onLoadMagazineStart)
   if st != Ok:
-    warn "loadammoanim  hookTyped refused LoadMagazineProcess::Start: " &
+    warn "ammoloading  hookTyped refused LoadMagazineProcess::Start: " &
          lastError()
     return false
   if whyCtor.len == 0:
     let st2 = hookTyped(TgtFactoryCtor, onFactoryCtor)
     if st2 != Ok:
-      warn "loadammoanim  hookTyped refused EFT.ObjectsFactory::.ctor: " &
+      warn "ammoloading  hookTyped refused EFT.ObjectsFactory::.ctor: " &
            lastError() & " -- the EasyAssets latch is unavailable."
 
   # The broad probe. Verified and installed exactly like the others; a refusal
@@ -1032,7 +1048,7 @@ proc maybeArm(): bool =
   let whyPCtor = verifyTarget(TgtProcCtorRva, "LoadMagazineProcess::.ctor",
                               ProcCtorProlog)
   if whyPCtor.len > 0:
-    warn "loadammoanim  NOT hooking the broad probe LoadMagazineProcess::.ctor: " &
+    warn "ammoloading  NOT hooking the broad probe LoadMagazineProcess::.ctor: " &
          whyPCtor & " -- the heartbeat will report ctorProbe=NOT INSTALLED, " &
          "so a zero there must NOT be read as 'never constructed'."
   else:
@@ -1040,23 +1056,23 @@ proc maybeArm(): bool =
     if st4 == Ok:
       gCtorHooked = true
     else:
-      warn "loadammoanim  hookTyped refused the broad probe " &
+      warn "ammoloading  hookTyped refused the broad probe " &
            "LoadMagazineProcess::.ctor: " & lastError()
 
   let whyEnd = verifyTarget(TgtEndRva, "LoadMagazineProcess::RaiseLoadEventArgs",
                             EndProlog)
   if whyEnd.len > 0:
-    warn "loadammoanim  NOT hooking LoadMagazineProcess::RaiseLoadEventArgs: " &
+    warn "ammoloading  NOT hooking LoadMagazineProcess::RaiseLoadEventArgs: " &
          whyEnd & " -- sessions will close on the safety cap instead, which " &
          "will show up as a non-zero `timedOut`."
   else:
     let st3 = hookTyped(TgtEnd, onLoadMagazineEnd)
     if st3 != Ok:
-      warn "loadammoanim  hookTyped refused " &
+      warn "ammoloading  hookTyped refused " &
            "LoadMagazineProcess::RaiseLoadEventArgs: " & lastError()
 
   gArmed = true
-  success "loadammoanim  ARMED in mode " & modeName(gMode) &
+  success "ammoloading  ARMED in mode " & modeName(gMode) &
           "; trigger LoadMagazineProcess::Start @0x768F50 (UNIQUE, prologue " &
           "verified), latch ObjectsFactory::.ctor @0x938430. Vanilla magazine " &
           "loading is never suppressed on any rung."
@@ -1108,11 +1124,11 @@ proc reportText(): string =
   ##   ARMED, FIRED n     -- entered n times, and here is what happened next.
   ##
   ## Under the old code all three printed nothing at all, and the counters were
-  ## reachable only through `serve("/aowlspt/loadammoanim/stats")` -- a route
+  ## reachable only through `serve("/aowlspt/ammoloading/stats")` -- a route
   ## the GAME PROCESS CANNOT SERVE, because the client host runs no HTTP
   ## server. The numbers existed and were unreadable by construction.
   if not gArmed:
-    return "loadammoanim  NOT ARMED" &
+    return "ammoloading  NOT ARMED" &
            (if not gEnabled: " (enabled=false)"
             elif gMode == ModeOff: " (mode=off)"
             elif not gArmTried: " (waiting out armDelayMs)"
@@ -1126,7 +1142,7 @@ proc reportText(): string =
     else: "fired " & $gCtorFires
 
   if gStartFires == 0'i64 and gCtorFires == 0'i64:
-    return "loadammoanim  ARMED but NEVER FIRED. mode=" & modeName(gMode) &
+    return "ammoloading  ARMED but NEVER FIRED. mode=" & modeName(gMode) &
            ", latched=" & (if gLatched: "yes" else: "no") &
            ". LoadMagazineProcess::Start @0x768F50 has been entered ZERO " &
            "times and the broad probe LoadMagazineProcess::.ctor @0x768D40 is " &
@@ -1137,13 +1153,13 @@ proc reportText(): string =
            "is wrong. If no magazine was loaded, this line is INCONCLUSIVE."
 
   if gStartFires == 0'i64:
-    return "loadammoanim  ARMED; broad probe " & probeState & " but " &
+    return "ammoloading  ARMED; broad probe " & probeState & " but " &
            "LoadMagazineProcess::Start @0x768F50 fired ZERO times. The TYPE " &
            "is right and the hooked ENTRY POINT is wrong -- the process is " &
            "constructed and Start is not the method that runs. Look at " &
            "LoadProcess @0x7693E0 / PlaySound @0x7695E0 instead."
 
-  result = "loadammoanim  ARMED and FIRING. mode=" & modeName(gMode) &
+  result = "ammoloading  ARMED and FIRING. mode=" & modeName(gMode) &
            " startFires=" & $gStartFires &
            " ctorProbe=" & probeState &
            " sessions=" & $gSessions &
@@ -1182,27 +1198,27 @@ proc onStats(url, body, session: string): string {.used.} =
 proc schema(): seq[Setting] =
   @[
     boolSetting("enabled", "Enable loading animations", false,
-                category = "Ammo loading",
+                category = "Animation",
                 description = "Port of Manimal's Ammo Loading Animations (MIT). " &
                   "Plays a first-person animation of hands thumbing rounds into " &
                   "the magazine while it loads. DEFAULT OFF: this detours the " &
                   "live magazine-loading flow during gameplay. Vanilla loading " &
-                  "is never suppressed -- the animation is added alongside it."),
+                  "is never suppressed -- the animation is added alongside it. This is ONE of this mod's two features; how LONG a load or unload takes is the OTHER, and it is NOT a knob here -- it is a server database value (globals.config.BaseLoadTime / BaseUnloadTime / LoadTimeSpeedProgress) already exposed by aowl.tarkov's Globals tuning page as 'Base Load Time', 'Base Unload Time' and 'Load Time Speed Progress'. Change it THERE. Declaring a second control for the same value here is how you get 'I changed it and nothing happened'."),
     enumSetting("mode", "Escalation rung", "off",
                 @["off", "probe", "read", "spawn", "animate"],
-                category = "Ammo loading",
+                category = "Animation",
                 description = "Move up ONE rung at a time. probe: count " &
                   "detections only. read: also resolve which magazine is being " &
                   "loaded (nothing called or written). spawn: also instantiate " &
                   "the animation prefab. animate: also play it -- only this rung " &
                   "is visible. Each rung is strictly additive over the one below."),
     stringSetting("bundlePath", "Bundle file", "",
-                category = "Ammo loading",
+                category = "Animation",
                 description = "Absolute path to stanags_container.bundle, the " &
                   "upstream mod's shipped asset. A copy ships in this mod's " &
                   "data/ directory and is used when this is empty."),
     stringSetting("hijackKey", "Bundle key to ride", "",
-                category = "Ammo loading",
+                category = "Animation",
                 description = "This build cannot ADD a bundle key, so our " &
                   "bundle must replace an existing vanilla one, redirected by " &
                   "mods/textures. That key's real asset is unavailable while " &
@@ -1238,7 +1254,7 @@ proc onLoad(): Status =
   loadConfig()
   declareSettings(schema())
   gLoadedAtMs = nowMs()
-  # NO `serve("/aowlspt/loadammoanim/stats", onStats)` HERE, DELIBERATELY.
+  # NO `serve("/aowlspt/ammoloading/stats", onStats)` HERE, DELIBERATELY.
   # This mod runs CLIENT-SIDE, inside the game process, and the game process
   # runs no HTTP server: `serve` from a client mod registers a route into
   # nothing. The route existed, returned correct JSON, and was unreachable by
@@ -1250,17 +1266,17 @@ proc onLoad(): Status =
   discard
 
   if not gEnabled:
-    info "loadammoanim  disabled (enabled=false). No hook is installed and " &
+    info "ammoloading  disabled (enabled=false). No hook is installed and " &
          "magazine loading is exactly vanilla."
     return Ok
   if gMode == ModeOff:
-    info "loadammoanim  enabled but mode=off, so nothing is installed. Set " &
+    info "ammoloading  enabled but mode=off, so nothing is installed. Set " &
          "mode to `probe` and escalate one rung at a time."
     return Ok
   if gBundlePath.len == 0:
-    info "loadammoanim  bundlePath is empty; the copy shipped in this mod's " &
+    info "ammoloading  bundlePath is empty; the copy shipped in this mod's " &
          "data/ directory is the one that will be used."
-  info "loadammoanim  will arm in " & $gArmDelayMs & "ms, mode " & modeName(gMode)
+  info "ammoloading  will arm in " & $gArmDelayMs & "ms, mode " & modeName(gMode)
   Ok
 
 proc onUpdate(elapsedMs: int64): Status =
@@ -1281,7 +1297,7 @@ proc onUpdate(elapsedMs: int64): Status =
     # put-away cap. This is a backstop, not the normal path.
     if ageMs > 120000:
       inc gTimedOut
-      warn "loadammoanim  session closed by the SAFETY CAP after " & $ageMs &
+      warn "ammoloading  session closed by the SAFETY CAP after " & $ageMs &
            "ms, not by LoadMagazineProcess::RaiseLoadEventArgs. The terminal " &
            "signal did not arrive -- see timedOut in loadAmmoAnimStats."
       endSession(false)

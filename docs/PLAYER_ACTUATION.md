@@ -142,7 +142,7 @@ pactStatus(): string
 
 `pactMagCycle` unloads the magazine currently in the weapon and loads the same
 ammunition back into it, driving `LoadMagazineProcess` — which is exactly what
-`mods/loadammoanim` hooks.
+`mods/ammoloading` hooks.
 
 The chain reaches a **type-correct `Ammo` with no inventory-grid walk at all**,
 which is the whole reason this was buildable safely:

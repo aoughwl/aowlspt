@@ -79,15 +79,15 @@ Since this change the client host says so, in the host log, in the same breath
 as the unload:
 
 ```
-MOD REJECTED BY THE PLATFORM, not broken: aowl.loadammoanim is being UNLOADED
+MOD REJECTED BY THE PLATFORM, not broken: aowl.ammoloading is being UNLOADED
 because the backend's mod set says NOT SELECTED -- it is in the registry, but no
 active mod list mentions it and there is no override for it, so nothing ever
 asked for it. This is the DEFAULT state of every newly added mod and it is not a
 fault in the mod. TO ENABLE IT, ask the backend once: GET
-/aowlspt/mods/enable/aowl.loadammoanim -- or add it to a list in
+/aowlspt/mods/enable/aowl.ammoloading -- or add it to a list in
 registry/mods.json. Do NOT hand-edit mods\aowlspt-selection.json; aowl.manager
 owns that file and overwrites it. [the manager's own words: no active list
-mentions it]. Anything aowl.loadammoanim says after this about not being armed
+mentions it]. Anything aowl.ammoloading says after this about not being armed
 is a CONSEQUENCE of this unload, not a cause.
 ```
 
@@ -107,7 +107,7 @@ So the two cases are now distinguishable in the log, which is the point:
 
 ## A worked example
 
-`aowl.loadammoanim` is a client mod with a 12-second `armDelayMs`. It was
+`aowl.ammoloading` is a client mod with a 12-second `armDelayMs`. It was
 loading, being unloaded at roughly t=5s, and then honestly reporting that it had
 not armed. Nothing was wrong with it: it was in `registry/mods.json` and in no
 list. It is now an entry in `aowl.list.beta`, and stays loaded.

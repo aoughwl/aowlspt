@@ -28,7 +28,7 @@
 ##      input funnel, with `CanTranslateCommand` as a pre-check that can say no.
 ##   3. THE MAGAZINE CASE IS REAL AND CLOSED-LOOP. `pactMagCycle` unloads the
 ##      magazine in the weapon and loads the same ammunition back, driving
-##      `LoadMagazineProcess` -- which is what `mods/loadammoanim` hooks and
+##      `LoadMagazineProcess` -- which is what `mods/ammoloading` hooks and
 ##      what a human previously had to do by hand.
 ##
 ## ---------------------------------------------------------------------------
