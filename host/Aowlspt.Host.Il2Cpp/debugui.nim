@@ -2244,6 +2244,13 @@ proc debugUiBodyImpl(a: Il2CppPtr): Il2CppPtr {.
               "is edit mode)"
     if gDuCfg.espVk > 0 and cDuKeyEdge(int32(gDuCfg.espVk)) != 0'i32:
       gDuEspVisible = not gDuEspVisible
+      if gDuEspSuppressed:
+        # A key that reports success and draws nothing is the silent decline
+        # CLAUDE.md 6 forbids, so the edge says why every time it is pressed.
+        warn "debugui: the marker toggle key was pressed, but the in-world " &
+             "markers are SUPPRESSED because espProvider selected natEsp as " &
+             "the ESP for this session. Nothing will be drawn. Set " &
+             "espProvider to \"overlay\" or \"both\" to get them back."
 
   # NOTHING IS DRAWN FROM THIS DETOUR ANY MORE. Turning the panel on or off only
   # moves a flag; the drawing is `duRegionDraw` below, dispatched by the shared
@@ -2328,7 +2335,11 @@ proc duRegionDraw(user: pointer; frame: int64) {.exportc: "aowl_du_region_draw",
     duDragTick()
     duDrawWidgets()
   cWgCrumb(WgCrumbMarkers)
-  if gDuEspVisible:
+  # THE ARBITRATION POINT for the two ESPs. `gDuEspSuppressed` is decided once
+  # at config load (see espProvider in aowlhost.nim) and logged there with the
+  # loser and the reason; this is the single place the decision takes effect,
+  # so the markers cannot come back through the toggle key or a layout reload.
+  if gDuEspVisible and not gDuEspSuppressed:
     if not duDrawMarkers():
       if not gDuEspUnavailableLogged:
         gDuEspUnavailableLogged = true

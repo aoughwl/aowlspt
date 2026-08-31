@@ -335,6 +335,70 @@ var gNeOnScreen = 0
 var gNeDropped = 0
 var gNeDiagAt = 0'u64
 
+# ---------------------------------------------------------------------------
+# THE FLICKER METER -- the instrument, not the fix.
+#
+# A flicker is a TRANSITION-COUNT problem, so it is measured as transition
+# counts and every transition carries the reason that caused it. The four
+# things that can make a box stop being drawn between one frame and the next
+# are counted SEPARATELY, because they are fixed in four different places:
+#
+#   gateEdges     the raid gate went NeRNone -> refused (per-reason tally)
+#   teardowns     our canvas + pool were actually destroyed
+#   censusDrops   a census pass REFUSED (unreadable list) and would have
+#                 collapsed the contact count to zero
+#   boxOff/boxOn  individual `GameObject::SetActive` transitions on pool boxes
+#
+# It reports at most once a second and ONLY when something transitioned, so a
+# steady raid prints nothing at all and one printed line is itself the finding.
+# `activeInHierarchy` is transitive, so the line also names the state of the
+# ancestor we own (the canvas) at the moment of the report -- "the box is off"
+# without "and its canvas was off too" is half an answer.
+# ---------------------------------------------------------------------------
+const NeFlkReasons = 18
+const NeGateGrace = 30
+  ## Consecutive REFUSED gate ticks tolerated before the canvas and pool are
+  ## torn down. The teardown is the expensive, visible edge: it costs a full
+  ## rediscover + settle + build (tens of frames) before a box can be drawn
+  ## again, so a ONE-FRAME blip in Camera.main or in the MainPlayer read used
+  ## to cost a visible flash. The boxes are simply LEFT ALONE inside the grace
+  ## window -- their positions are already up to AOWL_NE_SCAN_EVERY ticks old
+  ## by design, so half a second of extra staleness changes nothing that was
+  ## not already true. The cost is that at a genuine raid end the boxes linger
+  ## for at most NeGateGrace frames over the results screen; that is stated
+  ## here rather than discovered later.
+const NeCensusGrace = 4
+  ## Consecutive REFUSED census passes tolerated before the contact list is
+  ## cleared. `neScan` used to zero `gNeCn` at the top and then `return` on any
+  ## unreadable hop, so a REFUSAL ("I could not look") was indistinguishable
+  ## from an observation ("there is nobody"), and one unreadable frame hid
+  ## every box until the next scan. Beyond this cap the census IS cleared, so
+  ## the boxes can never become permanent ghosts of a world that is gone.
+var gNeGateBad = 0            ## consecutive refused gate ticks
+var gNeFlkGateEdges = 0       ## OK -> refused transitions this window
+var gNeFlkGateReason: array[NeFlkReasons, int32]  ## per-NeR* tally this window
+var gNeFlkTeardowns = 0
+var gNeFlkCensusDrop = 0
+var gNeFlkBoxOff = 0
+var gNeFlkBoxOn = 0
+var gNeFlkAt = 0'u64          ## last report, ms
+var gNeFlkSince = 0'u64       ## start of the current window, ms
+var gNeScanBad = 0            ## consecutive refused census passes
+var gNeFlkGateEdgesEver = 0'i64
+var gNeFlkTeardownsEver = 0'i64
+var gNeFlkBoxOffEver = 0'i64
+var gNeFlkStableTicks = 0'i64 ## consecutive RUN ticks with no transition at all
+var gNeFlkStableBest = 0'i64  ## the longest such run this raid -- the negative
+var gNeFlkCanvasActive = false
+  ## The last READBACK of our canvas's `activeInHierarchy`, cached inside the
+  ## guarded tick so the report -- which runs outside it -- never calls into
+  ## the game. `false` here also means "not measured yet", which is why the
+  ## report prints it beside the state rather than on its own.
+
+proc neFlkNoteBoxOff(n: int) =
+  gNeFlkBoxOff = gNeFlkBoxOff + n
+  gNeFlkBoxOffEver = gNeFlkBoxOffEver + int64(n)
+
 # ---- discovery walk state (breadth-first, sliced across frames) ----------
 var gNeQueue: seq[Il2CppPtr] = @[]
 var gNeDepth: seq[int32] = @[]       ## depth of the node at the same index
@@ -893,6 +957,13 @@ proc neDestroyOwnCanvas(why: string) =
   ## canvas is ever left behind, and on teardown so it cannot leak into the
   ## next raid.
   if gNeOwnCanvasGo != nil:
+    gNeFlkTeardowns = gNeFlkTeardowns + 1
+    gNeFlkTeardownsEver = gNeFlkTeardownsEver + 1
+    # PER-RAID, not per-session: the longest quiet run is a claim about THIS
+    # raid's canvas, and carrying it across a teardown would let a good raid
+    # vouch for a bad one -- a check that cannot fail.
+    gNeFlkStableBest = 0
+    gNeFlkStableTicks = 0
     okLog "natesp: destroying OUR canvas 0x" &
           hexOf(cast[uint64](gNeOwnCanvasGo)) & " -- " & why
     discard nuDestroy(gNeOwnCanvasGo)
@@ -1739,22 +1810,31 @@ proc neClsVerdict(): string =
   "PASS (distribution spans " & $nonEmpty & " classes over " & $total &
     " contacts -- not degenerate)"
 
-proc neScan() =
+proc neScanBody(): bool =
   ## `GameWorld.RegisteredPlayers` +0x1D0, capped at NeMaxContacts, every hop
   ## guarded, read-only. Fills FIXED arrays -- botdiag's discipline with the
   ## logging and the seq allocation both removed.
+  ##
+  ## RETURNS THREE THINGS IN TWO, deliberately: `true` means "I LOOKED" (the
+  ## list was readable and `gNeCn` is an observation, zero or not); `false`
+  ## means "I COULD NOT LOOK" and `gNeCn` is meaningless. The caller
+  ## (`neScan`) is what turns the second case into carry-forward rather than
+  ## into an empty screen. This used to be one proc that returned nothing and
+  ## left `gNeCn = 0` on both, which is the classic check that cannot fail:
+  ## a refusal rendered exactly like an empty raid.
   gNeCn = 0
   var h = 0
   while h < NeClsCount:
     gNeClsHist[h] = 0'i32
     inc h
   let gw = gDuGameWorld
-  if not duOk(gw, cBdOffRegPlayers() + 8'i32): return
+  if not duOk(gw, cBdOffRegPlayers() + 8'i32): return false
   let lst = cReadPtrAt(gw, cBdOffRegPlayers())
-  if not duOk(lst, cBdOffListSize() + 4'i32): return
+  if not duOk(lst, cBdOffListSize() + 4'i32): return false
   let arr = cReadPtrAt(lst, cBdOffListItems())
   let size = cReadI32At(duPtrAdd(lst, cBdOffListSize()))
-  if not duOk(arr, cBdOffArrElems() + 8'i32) or size <= 0'i32: return
+  if not duOk(arr, cBdOffArrElems() + 8'i32): return false
+  if size <= 0'i32: return true
   let n = (if size > int32(NeMaxContacts): int32(NeMaxContacts) else: size)
   var i = 0'i32
   while i < n:
@@ -1790,6 +1870,37 @@ proc neScan() =
     gNeClsEver[int(cls)] = gNeClsEver[int(cls)] + 1'i64
     inc gNeCn
   gNeContactsEver = gNeContactsEver + int64(gNeCn)
+  true
+
+proc neScan() =
+  ## THE CARRY-FORWARD. A refused pass keeps the PREVIOUS pass's contacts --
+  ## the coordinate arrays are untouched by every refusal path above, which
+  ## return before writing a single element, so restoring `gNeCn` and the
+  ## histogram restores a coherent census rather than a half-written one.
+  ## Bounded by NeCensusGrace so a world that really has gone away cannot
+  ## leave ghost boxes on screen for ever.
+  let prevCn = gNeCn
+  var prevHist: array[NeClsCount, int32] = [0'i32, 0'i32, 0'i32, 0'i32, 0'i32]
+  var h = 0
+  while h < NeClsCount:
+    prevHist[h] = gNeClsHist[h]
+    inc h
+  if neScanBody():
+    gNeScanBad = 0
+    return
+  gNeScanBad = gNeScanBad + 1
+  if gNeScanBad > NeCensusGrace:
+    # We have now refused NeCensusGrace+1 passes in a row. `gNeCn` is already
+    # 0 and stays 0: past this point carrying forward would be inventing
+    # contacts, not preserving an observation.
+    return
+  gNeCn = prevCn
+  h = 0
+  while h < NeClsCount:
+    gNeClsHist[h] = prevHist[h]
+    inc h
+  if prevCn > 0:
+    gNeFlkCensusDrop = gNeFlkCensusDrop + 1
 
 # ---------------------------------------------------------------------------
 # THE UPDATE -- show/hide by toggling active, place by the _Injected setters
@@ -1800,6 +1911,7 @@ proc neHideAllFrom(first: int) =
     if gNeBoxActive[k]:
       discard nuSetActive(gNeBoxGo[k], false)
       gNeBoxActive[k] = false
+      neFlkNoteBoxOff(1)
     inc k
 
 proc nePlace(sw, sh: float64) =
@@ -1930,6 +2042,7 @@ proc nePlace(sw, sh: float64) =
       if gNeBoxActive[idx]:
         discard nuSetActive(gNeBoxGo[idx], false)
         gNeBoxActive[idx] = false
+        neFlkNoteBoxOff(1)
       inc idx
       continue
     # FADE: colour + banded alpha, only when the pair changed.
@@ -1948,6 +2061,7 @@ proc nePlace(sw, sh: float64) =
         inc idx
         continue
       gNeBoxActive[idx] = true
+      gNeFlkBoxOn = gNeFlkBoxOn + 1
     inc gNeShown
     inc idx
   # hide the tail of the flat pool that this frame did not use
@@ -2340,6 +2454,54 @@ proc neVerdictBody(sw, sh: float64): string =
        else: "") &
       " I could not look; that is NOT a pass."
 
+proc neFlickerPending(): bool =
+  ## Did ANYTHING transition in this window? A steady raid answers false and
+  ## the host prints nothing, so one printed line is itself the finding.
+  gNeFlkGateEdges > 0 or gNeFlkTeardowns > 0 or gNeFlkCensusDrop > 0 or
+  gNeFlkBoxOff > 0 or gNeFlkBoxOn > 0
+
+proc neFlickerLine(ms: uint64): string =
+  ## THE FLICKER METER'S REPORT. Counts first, then the reason, then the
+  ## ancestor. Everything in it is a count of something that HAPPENED; there
+  ## is no assertion here that could come out true by construction.
+  result = "natesp FLICKER METER over the last " & $ms & "ms: " &
+    "gateEdges=" & $gNeFlkGateEdges &
+    " (OK->refused transitions; the run currently refusing is " &
+    $gNeGateBad & " tick(s) long, grace is " & $NeGateGrace & ")" &
+    " teardowns=" & $gNeFlkTeardowns &
+    " censusCarryForward=" & $gNeFlkCensusDrop &
+    " boxSetActive(false)=" & $gNeFlkBoxOff &
+    " boxSetActive(true)=" & $gNeFlkBoxOn
+  if gNeFlkGateEdges > 0:
+    result = result & ". Gate reasons this window:"
+    var i = 0
+    while i < NeFlkReasons:
+      if gNeFlkGateReason[i] > 0'i32:
+        result = result & " [" & $gNeFlkGateReason[i] & "x " &
+                 readCString(cNeRefusalText(int32(i))) & "]"
+      inc i
+  result = result &
+    ". state=" & $gNeState & " origin=" & neOriginName(gNeCanvasOrigin) &
+    " contacts=" & $gNeCn & " placed=" & $gNeShown & " built=" & $gNeBuilt &
+    " ourCanvas.activeInHierarchy(last readback)=" &
+    (if gNeFlkCanvasActive: "true" else: "false/not-measured") &
+    ". Longest run of CONSECUTIVE RUN ticks with zero visibility " &
+    "transitions this raid = " & $gNeFlkStableBest & " (this is the " &
+    "falsifiable negative: one toggle resets it to 0). Session totals: " &
+    "gateEdges=" & $gNeFlkGateEdgesEver & " teardowns=" &
+    $gNeFlkTeardownsEver & " boxOff=" & $gNeFlkBoxOffEver & "."
+
+proc neFlickerReset() =
+  gNeFlkGateEdges = 0
+  gNeFlkTeardowns = 0
+  gNeFlkCensusDrop = 0
+  gNeFlkBoxOff = 0
+  gNeFlkBoxOn = 0
+  var i = 0
+  while i < NeFlkReasons:
+    gNeFlkGateReason[i] = 0'i32
+    inc i
+
 proc neVerdictLine(sw, sh: float64): string =
   ## The classification histogram rides along on EVERY branch -- including the
   ## FAIL and INCONCLUSIVE ones, because a broken classifier and a broken
@@ -2368,6 +2530,28 @@ proc neTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ne_tick_body", cdecl.}
   let gate = neRaidGate(sw, sh)
   cNeSubEnd(NeSubGate)
   if gate != NeRNone:
+    # ---- THE FLICKER EDGE, COUNTED BEFORE ANYTHING IS DECIDED -------------
+    # This is the transition the user sees. It is recorded with its reason on
+    # the EDGE (first refused tick after a good one), never per refused tick,
+    # so "the gate refuses in the menu for ten minutes" is one edge and "the
+    # gate refuses every fourth frame in a raid" is fifteen edges a second --
+    # two situations the old code could not tell apart at all.
+    if gNeGateBad == 0:
+      gNeFlkGateEdges = gNeFlkGateEdges + 1
+      gNeFlkGateEdgesEver = gNeFlkGateEdgesEver + 1
+      if gate >= 0'i32 and int(gate) < NeFlkReasons:
+        gNeFlkGateReason[int(gate)] = gNeFlkGateReason[int(gate)] + 1'i32
+    gNeGateBad = gNeGateBad + 1
+    gNeFlkStableTicks = 0
+    # ---- THE GRACE WINDOW -------------------------------------------------
+    # Inside it, DO NOTHING AT ALL. Not a teardown, not a hide, not even
+    # `gNeCn = 0`: every one of those is visible on screen, and a gate that
+    # refuses for one frame is not a raid that ended. See NeGateGrace.
+    if gNeGateBad <= NeGateGrace and gNeState == NeRun and
+       gNeOwnCanvasGo != nil:
+      gNeWhy = gate
+      cNeCostPhase(NePhGate)
+      return cast[Il2CppPtr](1)
     # NOT a refusal to remember: the menu and the loading screen are legitimate
     # states. Drop back to waiting and tear nothing down unless the canvas
     # itself died -- which is the one thing that must not be used again.
@@ -2406,6 +2590,10 @@ proc neTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ne_tick_body", cdecl.}
     # The tag is set at the point the work is chosen, never afterwards.
     cNeCostPhase(NePhGate)
     return cast[Il2CppPtr](1)
+  # The gate is OPEN. If it had been refusing, this is the recovery edge; the
+  # counter is cleared here and nowhere else, so `gNeGateBad` is always the
+  # length of the CURRENT refusal run and never a total.
+  gNeGateBad = 0
   case gNeState
   of NeIdle:
     cNeCostPhase(NePhGate)
@@ -2444,6 +2632,11 @@ proc neTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ne_tick_body", cdecl.}
     cNeSubBegin(NeSubLive)
     let canvasLive = neLive(gNeCanvasTr) and neActiveInHier(gNeCanvasGo)
     cNeSubEnd(NeSubLive)
+    # CACHED FOR THE FLICKER REPORT, which runs OUTSIDE the guard and must
+    # therefore not call into the game itself. `activeInHierarchy` is
+    # TRANSITIVE, so this is the ancestor readback that turns "a box went
+    # inactive" into "a box went inactive AND its canvas was/was not active".
+    gNeFlkCanvasActive = canvasLive
     if not canvasLive:
       # the raid canvas went away (scene change): drop the pool and rediscover
       neDestroyPool()
@@ -2473,7 +2666,21 @@ proc neTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ne_tick_body", cdecl.}
       cNeSubBegin(NeSubScan)
       neScan()
       cNeSubEnd(NeSubScan)
+    # THE FALSIFIABLE NEGATIVE (§9b), measured rather than asserted: how many
+    # consecutive RUN ticks passed with NO visibility transition of any kind.
+    # A fix that cannot report a flicker is not a fix, so the fix reports the
+    # longest quiet run it has ever achieved this raid, and that number is
+    # falsified by a single toggle.
+    let flkBefore = gNeFlkBoxOff + gNeFlkBoxOn + gNeFlkTeardowns +
+                    gNeFlkCensusDrop
     nePlace(sw, sh)
+    if (gNeFlkBoxOff + gNeFlkBoxOn + gNeFlkTeardowns + gNeFlkCensusDrop) ==
+       flkBefore:
+      gNeFlkStableTicks = gNeFlkStableTicks + 1
+      if gNeFlkStableTicks > gNeFlkStableBest:
+        gNeFlkStableBest = gNeFlkStableTicks
+    else:
+      gNeFlkStableTicks = 0
     # THE READBACK VERDICT, THROTTLED -- NOT REPLACED BY BOOKKEEPING. It is
     # still the same three game reads per box and it is still the only thing
     # that can falsify "the boxes are on screen". It just answers a question
@@ -2570,6 +2777,18 @@ proc natEspDrainTick() =
            "the budget). State=" & $gNeState & "; self-disables at the cap."
     return
   cNeCostEnd()
+  # THE FLICKER METER, at most once a second and ONLY when something
+  # transitioned. It is NOT gated on `natEspDiag`: a flickering overlay is
+  # user-visible and the whole point is that the log names the cause without
+  # anyone having to have turned an extra flag on first. A steady raid prints
+  # nothing, so the presence of this line is the finding.
+  if gNeFlkSince == 0'u64: gNeFlkSince = cNowMs()
+  if (cNowMs() - gNeFlkAt) >= 1000'u64:
+    if neFlickerPending():
+      warn neFlickerLine(cNowMs() - gNeFlkSince)
+    gNeFlkAt = cNowMs()
+    gNeFlkSince = cNowMs()
+    neFlickerReset()
   if gNeDiag and (cNowMs() - gNeDiagAt) > 5000'u64:
     gNeDiagAt = cNowMs()
     var sw = 0.0

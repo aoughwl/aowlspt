@@ -1528,6 +1528,32 @@ var gDebugEspSlot = -1
 var gDebugUi = false
 var gDebugEsp = false
 
+## THE ESP PROVIDER ARBITRATION.
+##
+## There are TWO ESPs in this host and they draw the same contacts by two
+## completely different routes: `natEsp` builds real uGUI boxes on a canvas it
+## owns, and `debugEsp` publishes in-world markers that the D3D11 overlay
+## rasterises in `Present`. With both flags on the player sees every contact
+## twice, which is exactly what was reported live.
+##
+## `espProvider` is the SETTING, so this is a choice rather than a flag
+## collision the user has to know about:
+##
+##   "native"   natEsp draws; the debugEsp MARKERS are suppressed
+##   "overlay"  debugEsp draws; natEsp is not armed
+##   "both"     the old behaviour, explicitly asked for
+##   "auto"     (default) natEsp wins if it is armed, else debugEsp
+##
+## SUPPRESSION IS OF THE DRAWING ONLY. `debugEsp` also arms the read-only
+## detour that CACHES the live GameWorld pointer, and the admin mod's F6 ESP,
+## botdiag and raidphase all read that cache -- switching the flag itself off
+## would silently break three other features. So the flag stays on, the detour
+## stays armed, and only `gDuEspVisible` is held down.
+var gEspProvider = "auto"
+var gDuEspSuppressed = false
+  ## Read by debugui.nim: when true the in-world markers are never made
+  ## visible, whatever the toggle key or the layout file says.
+
 ## THE MENU'S BOTTOM-RIGHT GAME-MODE LABEL (stock: "PVE ZONE").
 ##
 ## The slot and the flag live HERE rather than in `modetext.nim`, because
@@ -7860,7 +7886,27 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   # THE DRAIN PROFILER, for the identical reason and on the identical terms: it
   # is an instrument over the other features, so it is ANDed with none of them.
   dpConfigure()
-  gNeOn = readBoolKey("natEsp") and gNuOn
+  # THE ESP PROVIDER, read BEFORE natEsp is armed so the "overlay" choice can
+  # veto arming rather than arm a feature and then hide it. An absent or
+  # unrecognised value falls back to "auto" LOUDLY -- a typo that silently
+  # selected a provider would be a setting that cannot be got wrong, which is
+  # the same thing as a setting that cannot be checked.
+  gEspProvider = readStrKey("espProvider")
+  if gEspProvider.len == 0: gEspProvider = "auto"
+  if gEspProvider != "auto" and gEspProvider != "native" and
+     gEspProvider != "overlay" and gEspProvider != "both":
+    warn "espProvider = \"" & gEspProvider & "\" is not one of native / " &
+         "overlay / both / auto. Falling back to \"auto\" (natEsp wins if it " &
+         "is armed, otherwise debugEsp draws)."
+    gEspProvider = "auto"
+  let natEspAsked = readBoolKey("natEsp")
+  gNeOn = natEspAsked and gNuOn and gEspProvider != "overlay"
+  if natEspAsked and gNuOn and gEspProvider == "overlay":
+    info "natEsp is set but espProvider=\"overlay\", so the NATIVE uGUI ESP " &
+         "is NOT armed for this session and debugEsp's in-world markers are " &
+         "the only ESP drawing. Set espProvider to \"native\" or \"auto\" to " &
+         "swap them, or \"both\" to draw both (which is what produced the " &
+         "doubled boxes)."
   gNeDiag = gNeOn and readBoolKey("natEspDiag")
   # THE PER-CLASS COLOURS, from `colorSetting(format="hex")`. Read ONCE here, at
   # config load, never per frame. A key that is absent or that does not parse
@@ -7926,6 +7972,30 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   # line rather than a surprise the first time the key is pressed.
   gDebugUi = readBoolKey("debugUi")
   gDebugEsp = readBoolKey("debugEsp")
+  # ---- THE ARBITRATION, STATED OUT LOUD --------------------------------
+  # Both ESPs draw the same contacts by different routes, so both on means
+  # every contact is boxed twice. The decision is made HERE, once, at config
+  # load, and it is LOGGED with the loser and the reason -- a feature that
+  # vanishes without saying so is the failure mode this repo keeps paying for.
+  # Only the DRAWING is suppressed: `gDebugEsp` stays true so the GameWorld
+  # cache detour it arms keeps feeding botdiag, raidphase and the admin mod.
+  if gDebugEsp and gNeOn and gEspProvider != "both":
+    gDuEspSuppressed = true
+    warn "TWO ESPs were armed: natEsp (native uGUI boxes) and debugEsp " &
+         "(in-world markers drawn by the D3D11 overlay). They render the " &
+         "same contacts, so both on draws every contact TWICE -- this is the " &
+         "doubled ESP that was reported live. espProvider=\"" & gEspProvider &
+         "\", so natEsp WINS and debugEsp's MARKERS are suppressed for this " &
+         "session. debugEsp itself stays ON and its detour stays armed, " &
+         "because that is what caches the live GameWorld pointer for botdiag, " &
+         "raidphase and the admin mod -- switching the flag off instead would " &
+         "have broken three other features silently. Set espProvider to " &
+         "\"overlay\" to swap the winner, or \"both\" to get the doubled " &
+         "boxes back deliberately."
+  elif gDebugEsp and gNeOn and gEspProvider == "both":
+    warn "espProvider=\"both\": natEsp AND debugEsp are both drawing. Every " &
+         "contact will be boxed twice. This is what was asked for, said once " &
+         "so it is not mistaken for a bug."
   if gDebugUi or gDebugEsp:
     duLoadLayout()
     info "debugUi/debugEsp is set: a per-frame detour on EFT.UI.PreloaderUI." &
