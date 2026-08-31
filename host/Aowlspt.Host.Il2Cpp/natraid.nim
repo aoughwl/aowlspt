@@ -248,6 +248,26 @@ const
     ## stares at. 250 ms is kept (not 0) purely so the drive does not land on the
     ## same frame the menu is still rebuilding, and if the graph is swapped
     ## during it the generation check disarms and re-probes.
+  NrMaxDriveAttempts = 5        ## capped: at most 5 presses, EVER, per session.
+    ## The 250 ms settle above makes the drive land ~2.1 s earlier in boot than
+    ## the old 1500 ms did, and that is a RACE, measured: two live runs of the
+    ## SAME build, one pressed at 0:00:48.953 and read back
+    ## `_readyPressed@0x60=1` (LocalGameMatching x4, raid loaded), the other
+    ## pressed at 0:00:42.734 and read back 0 -- no LocalGameMatching, no
+    ## geometry, the client sat at the menu. Every prerequisite, the write-backs
+    ## and the offline-gate finished-state assert all PASSED on the failing run,
+    ## so the predicate is not what is wrong: the game was simply not yet
+    ## willing to run the handler. `_readyPressed == 0` after the call is
+    ## therefore treated as "the press DID NOT TAKE", not as a curiosity, and
+    ## the drive re-arms and RE-VALIDATES EVERYTHING from scratch instead of
+    ## going hands-off. The fast path stays fast; the slow boot still gets in.
+  NrRetryDelaysMs: array[NrMaxDriveAttempts, uint64] =
+    [250'u64, 500'u64, 1000'u64, 1500'u64, 2000'u64]
+    ## Growing back-off, indexed by (attempts already made - 1): a failed first
+    ## press waits 250 ms, a failed second 500 ms, and so on. The last entry is
+    ## never consumed, because attempt 5 gives up instead of re-arming. Worst
+    ## case added menu time is 250 + 500 + 1000 + 1500 = 3.25 s before the loud
+    ## give-up -- bounded and stated, not open-ended.
   NrMaxFaults    = 3
   NrMaxLocTries  = 12           ## capped: never retry the lookup forever.
 
@@ -273,6 +293,9 @@ var gNrReports = 0
 var gNrLastReportMs = 0'u64
 var gNrLastSig = ""                ## report de-dup: only log when it CHANGED
 var gNrArmedMs = 0'u64
+var gNrSettleMs = NrDriveSettleMs  ## the CURRENT arm's delay; grows per retry.
+var gNrAttempts = 0                ## presses actually made this session, capped.
+var gNrLastRp = -1                 ## last `_readyPressed@0x60` read-back, or -1.
 var gNrPressed = false
 var gNrBoundLogged = false
 ## The location resolve. `gNrLoc` is set ONLY by a resolve that both returned a
@@ -1165,6 +1188,49 @@ proc nrDrive() =
         $gateMode & " (Local) and Ready()'s object (" & nrHex(rs) &
         ") holds Local too -- 0x9CCB97 should take LocalGameMatching@0x984170"
 
+  # ---- THE PRESS. At most one per attempt, at most NrMaxDriveAttempts per
+  # session. Everything above this line has just been re-read and re-asserted
+  # from the live objects, so a retry is a FULL re-validation, not a replay.
+  inc gNrAttempts
+  okLog "nativeRaid DRIVE attempt " & $gNrAttempts & "/" & $NrMaxDriveAttempts &
+        ": calling EFT.MatchmakerOperation::OnReadyPressed() @0xA312E0 on " &
+        nrHex(mo) & " (instance, zero args, NULL MethodInfo* -- not a shared " &
+        "generic)."
+  cNrCallVoid(fnRp, mo)
+  var rp = 0'i32
+  if cNrReadU8(mo, NrMoReadyPressed, addr rp) == 0'i32:
+    gNrLastRp = -1
+    nrFail("STAGE 2 attempt " & $gNrAttempts & ": OnReadyPressed returned but " &
+           "MatchmakerOperation._readyPressed@0x60 was not readable. That is " &
+           "INCONCLUSIVE, not a pass -- this host will not retry a press when " &
+           "it cannot read whether the last one took")
+    return
+  gNrLastRp = rp
+  if rp == 0'i32:
+    # THE PRESS DID NOT TAKE. Measured failure mode, not a curiosity.
+    if gNrAttempts >= NrMaxDriveAttempts:
+      nrFail("STAGE 2 GAVE UP: all " & $NrMaxDriveAttempts & " attempts to " &
+             "press READY were made and NONE took -- the last read-back of " &
+             "MatchmakerOperation._readyPressed@0x60 was " & $gNrLastRp &
+             ", so the game's own OnReadyPressed handler never ran. Every " &
+             "prerequisite, both field write-backs and the offline-gate " &
+             "finished-state assert PASSED before each press, so this is not " &
+             "a bad predicate: the client is refusing the press at this point " &
+             "in boot. FAIL -- no raid was entered and nothing further will " &
+             "be pressed")
+      return
+    let waitMs = NrRetryDelaysMs[gNrAttempts - 1]
+    gNrSettleMs = waitMs
+    gNrArmedMs = cNowMs()
+    gNrStep = NrArmed
+    warn "nativeRaid DRIVE attempt " & $gNrAttempts & "/" &
+         $NrMaxDriveAttempts & ": _readyPressed=0 after press -- the handler " &
+         "did not run, re-arming in " & $int(waitMs) & "ms. The next attempt " &
+         "re-reads the matchmaker operation, re-checks the RaidSettings " &
+         "identities and re-asserts RaidMode@0x44=Local(1) on the gate object " &
+         "from scratch; nothing from this attempt is assumed to survive."
+    return
+
   # ---- THE MENU-VISIBLE WINDOW, as a MEASURED number rather than a felt one.
   # Reference point: the readiness TRANSITION (`gNrReadySince`) -- the first tick
   # on which the matchmaker graph read non-null. That graph is built BY the main
@@ -1182,7 +1248,10 @@ proc nrDrive() =
     if winMs < 800'u64: verdict = "PASS"
     elif winMs >= 2484'u64: verdict = "FAIL"
     okLog "nativeRaid MENU-VISIBLE WINDOW: " & $int(winMs) & " ms from the " &
-          "readiness transition to OnReadyPressed -- " & verdict &
+          "readiness transition to the SUCCESSFUL OnReadyPressed (attempt " &
+          $gNrAttempts & " of " & $NrMaxDriveAttempts &
+          "; retries are INSIDE this number, so it never understates entry) -- " &
+          verdict &
           ". Baseline before this change: 2484 ms (readiness 0:00:46.469, " &
           "drive 0:00:48.953 on the 2026-08-30 live run), of which 1500 ms was " &
           "NrDriveSettleMs and ~984 ms was the 60-frame tick divisor. PASS is " &
@@ -1192,19 +1261,11 @@ proc nrDrive() =
 
   gNrPressed = true
   gNrStep = NrDone
-  okLog "nativeRaid DRIVE calling EFT.MatchmakerOperation::OnReadyPressed() " &
-        "@0xA312E0 on " & nrHex(mo) & " (instance, zero args, NULL MethodInfo* " &
-        "-- not a shared generic). After this the feature is HANDS-OFF for the " &
-        "rest of the session."
-  cNrCallVoid(fnRp, mo)
-  var rp = 0'i32
-  if cNrReadU8(mo, NrMoReadyPressed, addr rp) != 0'i32:
-    okLog "nativeRaid DRIVE read-back MatchmakerOperation._readyPressed@0x60=" &
-          $rp & " -- 1 means the game's own handler ran. This is EVIDENCE the " &
-          "call took, NOT proof a raid loads; only a live launch settles that."
-  else:
-    warn "nativeRaid DRIVE: OnReadyPressed returned but _readyPressed@0x60 " &
-         "was not readable -- INCONCLUSIVE, not a failure."
+  okLog "nativeRaid DRIVE read-back MatchmakerOperation._readyPressed@0x60=" &
+        $rp & " on attempt " & $gNrAttempts & " of " & $NrMaxDriveAttempts &
+        " -- 1 means the game's own handler ran. This is EVIDENCE the call " &
+        "took, NOT proof a raid loads; only a live launch settles that. The " &
+        "feature is HANDS-OFF for the rest of the session."
 
 # ---------------------------------------------------------------------------
 proc nrTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_nr_tick_body", cdecl.} =
@@ -1241,6 +1302,12 @@ proc nrTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_nr_tick_body", cdecl.}
     # A false -> true readiness TRANSITION. One generation, one probe, one drive.
     gNrReadySince = now
     inc gNrReadyGen
+    # A new generation is a new matchmaker graph: the attempt budget and the
+    # back-off both start over, and the previous generation's read-back says
+    # nothing about this one.
+    gNrAttempts = 0
+    gNrLastRp = -1
+    gNrSettleMs = NrDriveSettleMs
     okLog "nativeRaid READY (generation " & $gNrReadyGen & "): " & readyWhy &
           " -- the matchmaker graph already exists, so no call of ours can " &
           "construct it. Probing at most once for this generation."
@@ -1258,8 +1325,9 @@ proc nrTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_nr_tick_body", cdecl.}
         return
       gNrStep = NrArmed
       gNrArmedMs = now
+      gNrSettleMs = NrDriveSettleMs
       okLog "nativeRaid: prerequisites satisfied and uxNativeRaidDrive is ON " &
-            "-- STAGE 2 arms in " & $int(NrDriveSettleMs) & " ms."
+            "-- STAGE 2 arms in " & $int(gNrSettleMs) & " ms."
       return
     if now - gNrT0 > NrProbeWindowMs:
       nrFail("the prerequisites never all became satisfiable within " &
@@ -1269,7 +1337,7 @@ proc nrTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_nr_tick_body", cdecl.}
     return
 
   if gNrStep == NrArmed:
-    if now - gNrArmedMs < NrDriveSettleMs: return
+    if now - gNrArmedMs < gNrSettleMs: return
     # AT MOST ONCE PER READINESS TRANSITION. If readiness dropped and came back
     # while armed, this generation has not been probed, so disarm rather than
     # drive on a stale verdict.
@@ -1279,10 +1347,16 @@ proc nrTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_nr_tick_body", cdecl.}
            "(probed generation " & $gNrProbedGen & ", current " & $gNrReadyGen &
            ") -- DISARMING and re-probing rather than driving on a stale verdict"
       return
-    if gNrDrivenGen == gNrReadyGen:
+    # The per-generation guard is now bounded by the ATTEMPT budget rather than
+    # by "once", because a press whose read-back is 0 did not happen as far as
+    # the game is concerned. It is still a hard cap: NrMaxDriveAttempts and no
+    # more, and `nrDrive` itself refuses loudly on the last one.
+    if gNrDrivenGen == gNrReadyGen and gNrAttempts >= NrMaxDriveAttempts:
       gNrStep = NrIdle
-      warn "nativeRaid: STAGE 2 has already run once for readiness generation " &
-           $gNrReadyGen & " -- refusing to run it again"
+      warn "nativeRaid: STAGE 2 has already used all " &
+           $NrMaxDriveAttempts & " press attempts for readiness generation " &
+           $gNrReadyGen & " (last _readyPressed read-back " & $gNrLastRp &
+           ") -- refusing to run it again"
       return
     gNrDrivenGen = gNrReadyGen
     nrDrive()
