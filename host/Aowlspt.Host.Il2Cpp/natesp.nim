@@ -253,6 +253,71 @@ var gNeSeedSkip: seq[int32] = @[]   ## indices proven to fault; capped
 var gNeSeedGiven = false      ## the try cap was reached; stop re-enumerating
 var gNeSeedGoSeen = 0         ## roots that arrived as an UNTRANSLATED GameObject
 
+# ---- WHY THE WALK IS TWO-PHASE ------------------------------------------
+#
+# MEASURED (integ-beta6 @1288f5a, DEPLOYED raid, seed fixed): `anchor=yes
+# rootsObtained=178 liveRootsSeeded=178 rootsFaulted=0` and then
+# `visited=15296 candidates=0 deepest=3/8 budgetLeft=4704 head=15296/30170
+# discFaults=0`. NOTHING faulted. The walk simply DROWNED IN BREADTH: a
+# loaded raid accumulates roots from every SceneManager scene, and the
+# overwhelming majority of those 178 are MAP GEOMETRY. A flat breadth-first
+# over all of them spends the entire node budget three levels deep in
+# terrain and never reaches the UI at all -- `deepest=3/8` says depth was
+# never the binding constraint.
+#
+# The UI is not in those scenes. It is in DontDestroyOnLoad, which
+# SceneManager does not list and which `iSceneRoots` appends LAST, i.e. in
+# exactly the worst position for a flat FIFO. So the search is now SCOPED,
+# not merely ordered:
+#
+#   PHASE A  the anchor's own scene (DontDestroyOnLoad) ONLY, walked to the
+#            full depth cap with the full node budget. ~16 roots, so this
+#            is cheap and it is where `Common UI`, `Menu UI`, `Preloader
+#            UI`, `Environment UI`, `Login UI`, `Canvas` and `Game Scene`
+#            actually live.
+#   PHASE B  everything else, entered ONLY if phase A finished and produced
+#            no qualifying canvas, with its own fresh budget.
+#
+# Within each phase, roots whose NAME looks like UI are searched first --
+# names are one guarded `Object::get_name` per ROOT (178 max, once, at seed
+# time, inside the existing one-time allocating seed), never per node.
+#
+# The point of the phase split is the LEDGER, not the speed. `candidates=0`
+# alone cannot distinguish "searched the places the UI lives and there was
+# no canvas" from "never got there". Phase A reports its own scope, its own
+# exhaustiveness, and THE NAMES OF THE ROOTS IT SEARCHED, so those two
+# outcomes are now different lines.
+const
+  NeMaxRootUniverse  = 512  ## hard cap on roots considered, both phases
+  NeMaxRootNameChars = 480  ## cap on the reported phase-A root-name list
+  NePhaseA = 0   ## DontDestroyOnLoad (the anchor's scene)
+  NePhaseB = 1   ## every other loaded scene's roots
+
+var gNePhase = NePhaseA
+var gNePhaseBRoots: seq[Il2CppPtr] = @[]   ## deferred; seeded only if A fails
+var gNePhaseARootCount = 0    ## roots queued for phase A
+var gNePhaseBRootCount = 0    ## roots held back for phase B
+var gNePhaseARootNames = ""   ## the NAMES of the phase-A roots, comma separated
+var gNePhaseAVisited = 0      ## nodes phase A actually visited
+var gNePhaseACandidates = 0   ## Canvas components phase A found
+var gNePhaseAExhaustive = false  ## did phase A drain without truncating?
+var gNePhaseAUiNamed = 0      ## phase-A roots whose name looks like UI
+var gNeAnchorSceneOk = false  ## did GameObject::get_scene_Injected answer?
+
+proc neLooksUi(n: string): bool =
+  ## Cheap, purely lexical root-name preference. It is ONLY an ORDERING
+  ## hint -- a root that does not match is still searched, just later -- so
+  ## a miss here can delay the answer but can never turn a present canvas
+  ## into an absent one. That is deliberate: a name filter that could
+  ## EXCLUDE would be a check that cannot fail.
+  if n.len == 0: return false
+  var u = ""
+  for c in n:
+    if c >= 'a' and c <= 'z': u.add char(int(c) - 32)
+    else: u.add c
+  u.contains("CANVAS") or u.contains("UI") or u.contains("SCREEN") or
+    u.contains("HUD") or u.contains("MENU") or u.contains("GAME SCENE")
+
 proc neSeedSkipped(i: int): bool =
   for k in 0 ..< gNeSeedSkip.len:
     if gNeSeedSkip[k] == int32(i): return true
@@ -434,6 +499,16 @@ proc neSeed(): bool =
   gNeSeedFaulted = 0
   gNeSeedGoSeen = 0
   gNeSeedInFlight = -1
+  gNePhase = NePhaseA
+  gNePhaseBRoots = @[]
+  gNePhaseARootCount = 0
+  gNePhaseBRootCount = 0
+  gNePhaseARootNames = ""
+  gNePhaseAVisited = 0
+  gNePhaseACandidates = 0
+  gNePhaseAExhaustive = false
+  gNePhaseAUiNamed = 0
+  gNeAnchorSceneOk = false
   gNeSeedTries = gNeSeedTries + 1
   # STEP 1 -- THE ANCHOR, OBTAINED THE SAME WAY splFindScreen OBTAINS IT.
   #
@@ -457,6 +532,24 @@ proc neSeed(): bool =
   # exactly the per-frame allocating path the comment forbids. That is why the
   # fault budget must name this step and stop, rather than retry blindly.
   gNeSeedStep = NeSeedEnum
+  # 2a -- THE ANCHOR'S OWN SCENE, ASKED FOR SEPARATELY. `iSceneRoots` folds
+  # it in at the END of one flat list, which is precisely where a FIFO can
+  # never reach it in a raid. Asking `iAnchorSceneHandle` directly is the
+  # same two calls it would have made, and it gives us the one thing the
+  # flat list destroys: WHICH roots are the DontDestroyOnLoad ones.
+  var anchorRoots: seq[Il2CppPtr] = @[]
+  gNeAnchorSceneOk = false
+  if anchor != nil:
+    var haveAh = false
+    let ah = iAnchorSceneHandle(haveAh, anchor)
+    gNeAnchorSceneOk = haveAh
+    if haveAh:
+      var bound = 0
+      iRootsOfHandle(ah, "anchor", anchorRoots, false, bound)
+  # 2b -- EVERYTHING SceneManager lists (this also re-includes the anchor
+  # scene when SceneManager happens to list it; the dedupe below handles
+  # that, and a duplicate would only ever cost a second visit, never a
+  # wrong answer).
   var roots: seq[Il2CppPtr] = @[]
   discard iSceneRoots(roots, false, anchor)
   gNeSeedRootsGot = roots.len
@@ -485,8 +578,45 @@ proc neSeed(): bool =
   # -- so an untranslated GameObject arriving here is converted rather than
   # silently mis-called, and it is COUNTED.
   gNeSeedStep = NeSeedConvert
-  var idx = 0
+  # STEP 3a -- TIER. Build ONE ordered universe so the fault-skip list keeps a
+  # single stable index space, then split it at the phase-A boundary.
+  var universe: seq[Il2CppPtr] = @[]
+  var uIsA: seq[bool] = @[]
+  var uName: seq[string] = @[]
+  for g in anchorRoots:
+    if universe.len >= NeMaxRootUniverse: break
+    universe.add g
+    uIsA.add true
+    uName.add iObjName(g)
   for g in roots:
+    if universe.len >= NeMaxRootUniverse: break
+    var dup = false
+    for k in 0 ..< universe.len:
+      if universe[k] == g:
+        dup = true
+        break
+    if dup: continue
+    universe.add g
+    uIsA.add false
+    uName.add iObjName(g)
+  # Four buckets, appended in search order. A root is never DROPPED by this,
+  # only DEFERRED -- see neLooksUi.
+  var ordered: seq[Il2CppPtr] = @[]
+  var oIsA: seq[bool] = @[]
+  var oName: seq[string] = @[]
+  var pass = 0
+  while pass < 4:
+    let wantA = pass < 2
+    let wantUi = (pass and 1) == 0
+    for k in 0 ..< universe.len:
+      if uIsA[k] != wantA: continue
+      if neLooksUi(uName[k]) != wantUi: continue
+      ordered.add universe[k]
+      oIsA.add uIsA[k]
+      oName.add uName[k]
+    inc pass
+  var idx = 0
+  for g in ordered:
     let i = idx
     inc idx
     if neSeedSkipped(i):
@@ -505,13 +635,34 @@ proc neSeed(): bool =
     elif neLive(g):
       tr = g
     if tr != nil:
-      gNeQueue.add tr
-      gNeDepth.add 0'i32
       inc gNeSeedCount
+      if oIsA[i]:
+        # PHASE A: queued now.
+        gNeQueue.add tr
+        gNeDepth.add 0'i32
+        inc gNePhaseARootCount
+        if neLooksUi(oName[i]): inc gNePhaseAUiNamed
+        if gNePhaseARootNames.len < NeMaxRootNameChars:
+          if gNePhaseARootNames.len > 0: gNePhaseARootNames.add ","
+          gNePhaseARootNames.add (if oName[i].len > 0: oName[i] else: "<unnamed>")
+      else:
+        # PHASE B: held back, entered only if A finishes empty.
+        gNePhaseBRoots.add tr
+        inc gNePhaseBRootCount
     else:
       inc gNeSeedDead
     gNeSeedInFlight = -1
   gNeSeedStep = NeSeedDone
+  gNePhase = NePhaseA
+  if gNeQueue.len == 0 and gNePhaseBRoots.len > 0:
+    # No DontDestroyOnLoad root survived -- there is nothing to run phase A
+    # over, so start in phase B rather than refusing. The ledger still says
+    # phase A had a scope of zero, which is the honest reading.
+    gNePhase = NePhaseB
+    for t in gNePhaseBRoots:
+      gNeQueue.add t
+      gNeDepth.add 0'i32
+    gNePhaseBRoots = @[]
   gNeQueue.len > 0
 
 proc neSeedLedger(): string =
@@ -527,6 +678,10 @@ proc neSeedLedger(): string =
   " rootsSkippedDead=" & $gNeSeedDead &
   " rootsFaulted=" & $gNeSeedFaulted &
   " rootsAsGameObject=" & $gNeSeedGoSeen &
+  " anchorSceneResolved=" & (if gNeAnchorSceneOk: "yes" else: "NO") &
+  " phaseARoots=" & $gNePhaseARootCount &
+  " phaseARootNames=\"" & gNePhaseARootNames & "\"" &
+  " phaseBRoots=" & $gNePhaseBRootCount &
   " inFlightIdx=" & $gNeSeedInFlight &
   " step=" & neSeedStepName(gNeSeedStep) &
   " lastInternalCall=\"" & neCrumb() & "\" on 0x" &
@@ -663,7 +818,52 @@ proc neDiscoverStep() =
   # -- budget exhausted, depth cap hit -- are stated separately from the
   # verdict, so "no canvas" is never confused with "I could not look".
   let exhaustive = gNeHead >= gNeQueue.len and gNeBudget > 0 and gNeTruncated == 0
-  let ledger = "visited=" & $gNeVisited & " fakeNullsSkipped=" & $gNeFakeNull &
+  # PHASE A FINISHED WITHOUT A WINNER -> FALL THROUGH TO PHASE B.
+  #
+  # Phase A's numbers are FROZEN here, before phase B overwrites the shared
+  # counters, because they are the ones that answer the question that
+  # `candidates=0` alone could not: did we search where the UI lives, and
+  # did we finish? A phase-A line reading `phaseA scope=EXHAUSTIVE
+  # roots="Common UI,Menu UI,Canvas,..." candidates=0` is a real absence in
+  # DontDestroyOnLoad. A phase-A line reading `roots=0` or
+  # `scope=TRUNCATED` is "I never got there", and says so.
+  if (gNeCanvasTr == nil or gNeCanvasGo == nil) and gNePhase == NePhaseA:
+    gNePhaseAVisited = gNeVisited
+    gNePhaseACandidates = gNeCandidates
+    gNePhaseAExhaustive = exhaustive
+    okLog "natesp: PHASE A (DontDestroyOnLoad, " & $gNePhaseARootCount &
+          " root(s), " & $gNePhaseAUiNamed & " UI-named, searched first) " &
+          "found no qualifying Canvas. roots=\"" & gNePhaseARootNames &
+          "\" visited=" & $gNePhaseAVisited & " candidates=" &
+          $gNePhaseACandidates & " deepest=" & $gNeDeepest & "/" &
+          $int(cNeMaxDepth()) & " budgetLeft=" & $gNeBudget & " scope=" &
+          (if exhaustive: "EXHAUSTIVE" else: "TRUNCATED") &
+          ". Falling through to PHASE B (" & $gNePhaseBRootCount &
+          " remaining scene root(s), fresh budget)."
+    if gNePhaseBRoots.len > 0:
+      gNePhase = NePhaseB
+      gNeQueue = @[]
+      gNeDepth = @[]
+      gNeHead = 0
+      gNeBudget = int(cNeMaxNodes())
+      gNeTruncated = 0
+      for t in gNePhaseBRoots:
+        gNeQueue.add t
+        gNeDepth.add 0'i32
+      gNePhaseBRoots = @[]
+      return                       # phase B starts on the next frame's slice
+  let phaseLedger =
+    " phaseA=" & (if gNePhaseARootCount == 0: "NOT-SEARCHED(0 roots)"
+                  else: (if gNePhaseAExhaustive: "EXHAUSTIVE" else: "TRUNCATED")) &
+    " phaseARoots=" & $gNePhaseARootCount &
+    " phaseAUiNamed=" & $gNePhaseAUiNamed &
+    " phaseAVisited=" & $gNePhaseAVisited &
+    " phaseACandidates=" & $gNePhaseACandidates &
+    " phaseARootNames=\"" & gNePhaseARootNames & "\"" &
+    " phaseBRoots=" & $gNePhaseBRootCount &
+    " anchorSceneResolved=" & (if gNeAnchorSceneOk: "yes" else: "NO") &
+    " phaseNow=" & (if gNePhase == NePhaseA: "A" else: "B")
+  let ledger = phaseLedger & " visited=" & $gNeVisited & " fakeNullsSkipped=" & $gNeFakeNull &
                " canvasCandidates=" & $gNeCandidates & " rejected=" &
                $gNeRejected & " deepest=" & $gNeDeepest & "/" &
                $int(cNeMaxDepth()) & " budgetLeft=" & $gNeBudget &
@@ -675,12 +875,25 @@ proc neDiscoverStep() =
           ledger & ". A canvas qualifies only if it is alive, " &
           "activeInHierarchy and its rect READS BACK at least " &
           neF(cNeMinCanvasPx()) & "px on both axes. " &
-          (if exhaustive:
-             "The search was exhaustive within its cap, so this is a real " &
+          (if gNePhaseARootCount == 0:
+             "PHASE A WAS NEVER SEARCHED: zero DontDestroyOnLoad roots were " &
+             "queued (anchorSceneResolved=" &
+             (if gNeAnchorSceneOk: "yes" else: "NO") & "), and the live UI on " &
+             "this build lives ONLY in DontDestroyOnLoad. This is " &
+             "INCONCLUSIVE -- we did not look where the canvas is."
+           elif not gNePhaseAExhaustive:
+             "PHASE A itself was TRUNCATED (budget or depth cap) over its " &
+             $gNePhaseARootCount & " DontDestroyOnLoad root(s), so the place " &
+             "the canvas actually lives was not fully searched. INCONCLUSIVE."
+           elif exhaustive:
+             "PHASE A was EXHAUSTIVE over the DontDestroyOnLoad roots named " &
+             "above and phase B was exhaustive too, so this is a real " &
              "absence, not a truncation."
            else:
-             "The search was TRUNCATED (budget or depth cap), so this is " &
-             "INCONCLUSIVE, not proof no canvas exists.")
+             "PHASE A was EXHAUSTIVE over the DontDestroyOnLoad roots named " &
+             "above -- so no canvas is present WHERE THE UI LIVES -- but " &
+             "phase B was TRUNCATED, so the remaining scenes are " &
+             "INCONCLUSIVE.")
     neRefuse(NeRNoCanvas)
     return
   if gNeGraphicDonor == nil:
