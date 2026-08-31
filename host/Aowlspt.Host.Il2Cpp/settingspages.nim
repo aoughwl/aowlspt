@@ -73,6 +73,15 @@ const
 ## worker thread -- never blocks this (the Unity main) thread.
 proc modSetQueueWrite(guid, key, val: string)
 
+## Also forward-declared, same file, same reason. Drains the mod pages the host
+## tick thread has parsed and STAGED into `gSwPages`, on THIS (the Unity main)
+## thread. `gSwPages` is a Nim seq read by `swPagesOnTabBuilt` and
+## `modsBuildPages` on this thread; the fetch thread appending to it directly
+## reallocated the buffer under those readers, which is a use-after-free by
+## construction. It stages now, and this is the only place the registry grows
+## from a fetch.
+proc modSetDrainStaged()
+
 proc swFn(i: int32): Il2CppPtr =
   ## A byte-verified setter, or nil. Logged on refusal so a target that did not
   ## verify on this build is never mistaken for a row that rendered and did
@@ -1250,6 +1259,13 @@ proc swPagesOnTabBuilt(tabPtr: Il2CppPtr; tabName: string; revisit: bool) =
           ". A zero here means the stock anchor label for that type was not " &
           "found on this tab (a non-English client will do that), which is why " &
           "the donor is no longer required to be a learned toggle."
+  # PICK UP ANY MOD PAGES THE FETCH THREAD STAGED. This is the Unity main
+  # thread and the only writer of `gSwPages` from a fetch; see the forward
+  # declaration at the top of this file for why the fetch thread no longer
+  # registers directly. It runs BEFORE the emptiness test below so a staged mod
+  # page counts as a non-empty registry.
+  swCrumb("STAGE: swPagesOnTabBuilt -- modSetDrainStaged")
+  modSetDrainStaged()
   # The registry is rebuilt from the config each time the tab is opened, so the
   # rows show what the file currently says.
   if gSwPages.len == 0:
