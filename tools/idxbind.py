@@ -150,6 +150,25 @@ TABLES = [
         "users": ["host/Aowlspt.Host.Il2Cpp/camera.nim"],
         "accessors": ["cCamFn", "cCamName", "cCamRva"],
     },
+    # The thirty-one in-raid player-actuation targets, indexed positionally from
+    # pact.nim by the annotated PactT* constants. This is the highest-stakes
+    # table in the repo to get wrong: adjacent rows carry DIFFERENT calling
+    # shapes on purpose -- get_Position is sret (retbuf, this, MI*) and Move is
+    # (this, packed-Vector2-in-RDX, MI*) -- so a one-row shift hands a setter a
+    # return buffer where it expects `this` and faults inside a perfectly valid,
+    # byte-verified function. pact.nim ALSO checks the same agreement at runtime
+    # by comparing the C table's name at each index against the name it calls
+    # it; the two checks are deliberately independent.
+    {
+        "mode": "positional",
+        "header": "abi/aowlspt_pact.h",
+        "array": "aowl_pact_targets",
+        "const_prefix": "PactT",
+        "const_file": "host/Aowlspt.Host.Il2Cpp/pact.nim",
+        "expect_file": None,
+        "users": ["host/Aowlspt.Host.Il2Cpp/pact.nim"],
+        "accessors": ["cPactFn", "cPactName", "cPactRva", "pactFn"],
+    },
     {
         "mode": "positional",
         "header": "abi/aowlspt_modetext.h",
