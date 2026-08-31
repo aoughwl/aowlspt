@@ -1665,6 +1665,30 @@ var gCodeGenProbeSlot = -1
 ## include point. Flag `sharedRegion`, default OFF.
 var gRegionSlot = -1
 var gRegionOn = false
+var gUnityPostProbeOn = false
+  ## THE UNITY POST-PROCESSING SURVEY (`abi/aowlspt_unitypp.h`). Flag
+  ## `unityPostProbe`, default OFF. Declared here for the same reason
+  ## `gRegionOn` is: `region.nim` is included below this point and reads it.
+  ##
+  ## MEASURED OFFLINE, before any code was written: this build ships
+  ## `Unity.Postprocessing.Runtime.dll` UNSTRIPPED -- 118 types in
+  ## `UnityEngine.Rendering.PostProcessing`, including PostProcessLayer,
+  ## PostProcessVolume, PostProcessProfile, ColorGrading, Bloom, Vignette,
+  ## Grain, ChromaticAberration, AmbientOcclusion and the whole
+  ## ParameterOverride family. So driving the game's OWN grading is possible
+  ## in principle, and the D3D11 back-buffer-copy path in `aowlspt_graphics.h`
+  ## can eventually be retired rather than merely wrapped.
+  ##
+  ## What is NOT possible offline is `ParameterOverride<T>.value`'s offset:
+  ## `tools/fldoff.py` reports it GENERIC-NO-LAYOUT, because IL2CPP writes an
+  ## all-zero fieldOffsets array for uninstantiated generic definitions and
+  ## every `Il2CppGenericClass.cached_class` in the file is null. A guessed
+  ## offset there does not fault -- it reads a plausible float, and a WRITE
+  ## corrupts a live managed object. So this probe is READ-ONLY and dumps the
+  ## raw bytes instead, to settle the offset from one run's log.
+  ##
+  ## GRADING PROVIDER: still D3D11. Nothing here suppresses it, and the survey
+  ## says so in its own verdict line so the change cannot look bigger than it is.
 var gRegionProjectorOn = false
   ## THE PROJECTOR SEAT in the shared region (`abi/aowlspt_regproj.h`). Flag
   ## `regionProjector`, default OFF, and it is a SEPARATE flag from
@@ -7463,6 +7487,22 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
          "name through it: no mod has been switched over."
   gCodeGenAudit = readBoolKey("codeGenAudit")
   gRegionOn = readBoolKey("sharedRegion")
+  gUnityPostProbeOn = readBoolKey("unityPostProbe")
+  if gUnityPostProbeOn and not gRegionOn:
+    warn "unityPostProbe is ON but sharedRegion is OFF. The Unity " &
+         "post-processing survey is driven from the region's own per-frame " &
+         "tick, so with the region unarmed it will NEVER run and no verdict " &
+         "will ever be logged. Turn on sharedRegion (python tools/hostcfg.py " &
+         "set sharedRegion on) or turn unityPostProbe back off."
+  if gUnityPostProbeOn:
+    info "graphics provider: D3D11 (aowlspt_graphics.h, back-buffer copy in " &
+         "the overlay's Present). unityPostProbe is ON, but it is a READ-ONLY " &
+         "SURVEY -- it writes no Unity post-processing state and suppresses " &
+         "nothing, so the D3D11 path remains the only thing that grades a " &
+         "frame. WHY: this build does ship Unity Post Processing Stack v2 " &
+         "unstripped (measured offline, 118 types), but " &
+         "ParameterOverride<T>.value is an instantiated-generic field offset " &
+         "that GameAssembly.dll does not contain, and it will not be guessed."
   gRegionProjectorOn = readBoolKey("regionProjector")
   if gRegionProjectorOn and not gRegionOn:
     warn "regionProjector is ON but sharedRegion is OFF. The projector is " &
