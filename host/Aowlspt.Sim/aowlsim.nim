@@ -1352,7 +1352,7 @@ proc main(): int =
                                  flagsOf: opsFlags, indexOf: opsIndex,
                                  canUnload: opsCanUnload, load: opsLoad,
                                  unload: opsUnload, log: opsLog,
-                                 hotOf: nil, quiesce: nil))
+                                 hotOf: nil, quiesce: nil, released: nil))
   ## `hotOf: nil` and `quiesce: nil` are the SIMULATOR's answer and not an
   ## oversight. There is no game here to be mid-teardown, and the whole value of
   ## `--watch` is reloading a mod that has not been written to be reloadable yet

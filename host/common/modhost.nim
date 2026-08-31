@@ -110,6 +110,43 @@ static int32_t aowl_mod_alloc_teardown(void* module) {
     ((void(*)(void))f)();
     return 1;
 }
+
+/* THE TWO MEASUREMENTS BEHIND "did the unload actually release the file".
+ *
+ * A logical unload and a file release are different events, and until these
+ * existed the host reported the first and the user wanted the second. Measured
+ * live: an unload that logged `completed=1`, `epoch=1` and `unloaded Bot AI`
+ * left the DLL locked, so a rebuild could not be copied over it. Every counter
+ * said success and the feature was impossible.
+ *
+ * Neither of these mutates anything. They are the instrument, not the fix. */
+
+/* Is this path still a loaded module? UNCHANGED_REFCOUNT is the whole point:
+ * asking must not itself take a reference, which is the bug this is hunting. */
+static int32_t aowl_sys_module_loaded(const char* path) {
+    HMODULE h = NULL;
+    if (!path) return 0;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           path, &h)) return 1;
+    return 0;
+}
+
+/* Can this path be opened for writing with no sharing -- i.e. could a rebuild
+ * be copied over it? Returns 0 for yes, otherwise the Win32 error, of which
+ * ERROR_SHARING_VIOLATION (32) is the one that means "still mapped".
+ *
+ * OPEN_EXISTING and an immediate CloseHandle: this opens for write and writes
+ * nothing, so a probe that runs on a file we then decide to keep has not
+ * touched it. */
+static int32_t aowl_sys_path_writable(const char* path) {
+    HANDLE f;
+    if (!path) return -1;
+    f = CreateFileA(path, GENERIC_WRITE, 0, NULL, OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f == INVALID_HANDLE_VALUE) return (int32_t)GetLastError();
+    CloseHandle(f);
+    return 0;
+}
 """.}
 
 
@@ -127,6 +164,10 @@ proc cSysModulePath*(buf: HostPtr; cap: int32): int32 {.
 proc cLoadLibrary*(path: cstring): HostPtr {.
   importc: "aowl_sys_load_library", nodecl.}
 proc cFreeLibrary*(h: HostPtr) {.importc: "aowl_sys_free_library", nodecl.}
+proc cModuleLoaded*(path: cstring): int32 {.
+  importc: "aowl_sys_module_loaded", nodecl.}
+proc cPathWritable*(path: cstring): int32 {.
+  importc: "aowl_sys_path_writable", nodecl.}
 proc cGetProc*(h: HostPtr; name: cstring): HostPtr {.
   importc: "aowl_sys_get_proc", nodecl.}
 proc cSysLastError*(): uint32 {.importc: "aowl_sys_last_error", nodecl.}
@@ -1427,6 +1468,33 @@ proc modIsLive*(index: int): bool =
     return false
   result = gMods[index].live
 
+## THE RELEASE PROBE'S ANSWER, from the last `unloadOne` that got as far as
+## freeing a library. `0` means the file was writable afterwards -- a rebuild
+## can be copied over it and the reload is real. Anything else is the Win32
+## error, and `32` (ERROR_SHARING_VIOLATION) means the module is still mapped.
+##
+## `-1` is "no unload has reached the probe this run", which is neither pass nor
+## fail. Three states, and the caller must not flatten them: a run that never
+## unloaded anything has not demonstrated release, and reporting that as 0 would
+## be the same shape of lie this whole probe exists to catch.
+var gLastRelease = -1'i32
+var gLastReleaseStillMapped = false
+var gForceRelease = false
+
+proc lastReleaseCode*(): int32 = gLastRelease
+proc lastReleaseStillMapped*(): bool = gLastReleaseStillMapped
+
+proc setForceRelease*(on: bool) =
+  ## Arms the capped extra-`FreeLibrary` loop in `unloadOne`.
+  ##
+  ## **Default OFF, and it stays off until the measurement says what the
+  ## refcount actually is.** Dropping references until a module unmaps is a fix
+  ## for exactly one cause -- somebody took a reference and never gave it back --
+  ## and it is a way to unmap a library out from under a legitimate holder for
+  ## every other cause. The probe below reports the number without this; turn it
+  ## on only once the report says the count is what you think it is.
+  gForceRelease = on
+
 proc unloadOne*(index: int; error: var string): bool =
   ## Takes one mod out. The slot is kept rather than removed: every context
   ## pointer the host handed to a mod is that index, and compacting the
@@ -1475,6 +1543,46 @@ proc unloadOne*(index: int; error: var string): bool =
   # host holds has been freed, so nothing points into the arena this releases.
   discard cModAllocTeardown(gMods[index].module)
   cFreeLibrary(gMods[index].module)
+
+  # AND THEN MEASURE, rather than assume. `cFreeLibrary` returns nothing and
+  # decrements a refcount; if something took a second reference, this returns
+  # normally, the mod is logically gone, and the file stays mapped and locked.
+  # That is precisely what a live run produced: `completed=1`, `epoch=1`,
+  # `unloaded Bot AI`, and a DLL that could not be overwritten.
+  var probePath = gMods[index].path
+  var stillMapped = cModuleLoaded(toCString(probePath)) != 0'i32
+  if stillMapped and gForceRelease:
+    # Capped, and each pass CONDITIONED on a fresh read rather than counted out
+    # in advance -- this is not a blind write. It stops the moment the module is
+    # gone, and after `ForceReleaseMax` it gives up and lets the probe below
+    # report the failure honestly.
+    const ForceReleaseMax = 8
+    var drops = 0
+    while stillMapped and drops < ForceReleaseMax:
+      cFreeLibrary(gMods[index].module)
+      inc drops
+      stillMapped = cModuleLoaded(toCString(probePath)) != 0'i32
+    warn "forceRelease dropped " & $drops & " extra reference(s) on " &
+         baseName(probePath) & "; still mapped: " &
+         (if stillMapped: "YES" else: "no") &
+         ". Every one of those was a reference something took and never gave " &
+         "back -- this is a workaround, and the count is the bug report."
+  gLastReleaseStillMapped = stillMapped
+  gLastRelease = cPathWritable(toCString(probePath))
+  # Said always, both numbers, pass or fail. This is the line that tells a
+  # logical unload from a real one, and the whole reason it exists is that the
+  # counters said success while the feature was impossible.
+  if gLastRelease == 0'i32 and not stillMapped:
+    okLog "RELEASED " & baseName(probePath) &
+          ": the file is writable, so a rebuild can replace it"
+  else:
+    warn "NOT RELEASED " & baseName(probePath) & ": stillMapped=" &
+         (if stillMapped: "YES" else: "no") & " writeProbe=" & $int(gLastRelease) &
+         (if gLastRelease == 32'i32: " (ERROR_SHARING_VIOLATION -- the image " &
+                                     "is still mapped by this process)" else: "") &
+         ". The mod is logically unloaded and its registrations are gone, but " &
+         "the library was NOT freed, so a rebuilt DLL cannot be copied over it."
+
   # The draining flag is deliberately left set. The slot is never reused, so a
   # late `modEnter` for this index -- a worker that copied a route out of the
   # table before the teardown emptied it -- must go on being refused for the
