@@ -1161,6 +1161,193 @@ proc swReadBackPage(page: var SwPage) =
                  "onSettingsApplied."
     i = i + 1
 
+## ---------------------------------------------------------------------------
+## LIFECYCLE -- what we rendered onto ONE tab must not still be on screen while
+## a DIFFERENT tab is displayed.
+##
+## MEASURED, live, on the user's client (host log, one settings-screen visit):
+##
+##   entry #5 tab='game'     tabPtr=0x21e5927bdc0 renderedFor=0x21e5927bdc0
+##                                                row0.clone=0x21ff4589300
+##   entry #6 tab='graphics' tabPtr=0x21e59239c60 renderedFor=0x21e5927bdc0
+##                                                row0.clone=0x21ff4589300
+##   DECLINED -- pages render only onto the Game tab and this is 'graphics'
+##
+## The DECLINE is correct and always was: we do not RENDER onto graphics. What
+## was missing is the other half of the lifecycle -- nothing ever took the Game
+## tab's rows back OFF when graphics came up. The clones stayed parented into a
+## container the Graphics panel still lays out, so the player saw a block of
+## blank rows and the real graphics content pushed halfway down the page.
+##
+## `renderedFor != tabKey` is precisely that condition, it was already being
+## computed for the diagnostic above, and it was never acted on. It is now.
+##
+## HIDDEN, NEVER DESTROYED. Same discipline as the postfx subtab: a clone we
+## destroyed is a clone we must rebuild, and `swRenderPage`'s re-render path is
+## driven off `clone` still reading back live. Destroying here would make every
+## tab switch a full re-clone, which is the row-accumulation bug wearing a hat.
+proc swRowGoLive(row: SwRow): Il2CppPtr =
+  ## The row clone's GameObject, or nil. THREE guards, not one, and the order
+  ## matters: `clone` is a raw `uint64` that outlives the object it names, so
+  ## `cIsReadable` proves only that the page is still mapped, and `iUnityAlive`
+  ## is the only one of the three that separates a live UI object from Unity's
+  ## FAKE NULL (a managed shell whose native half is gone -- readable, non-nil,
+  ## and fatal to call into). Never dereference a stored clone handle with
+  ## fewer than all three.
+  result = nil
+  if row.clone == 0'u64:
+    return
+  let ctrl = cast[Il2CppPtr](row.clone)
+  if cIsReadable(ctrl, 8'i32) == 0'i32 or not iUnityAlive(ctrl):
+    return
+  let go = duGameObjectOf(ctrl)
+  if go == nil or not iUnityAlive(go):
+    return
+  result = go
+
+proc swPageDriveActive(page: SwPage; on: bool; drove, refused: var int) =
+  ## `GameObject::SetActive(on)` on every live row clone of `page`. Read-only
+  ## with respect to the GAME's own objects: every object touched here is one
+  ## this host cloned, and the only thing written is its active state.
+  drove = 0
+  refused = 0
+  let fnAct = mi2Fn(Mi2GoSetActive)
+  if fnAct == nil:
+    refused = page.rows.len
+    return
+  var r = 0
+  while r < page.rows.len and r < cSwMaxRows:      # rule 4: capped iteration
+    if page.rows[r].clone != 0'u64:
+      let go = swRowGoLive(page.rows[r])
+      if go != nil:
+        cMi2CallVPB(fnAct, go, (if on: 1'i32 else: 0'i32))
+        drove = drove + 1
+      else:
+        refused = refused + 1
+    r = r + 1
+
+proc swPageCountActive(page: SwPage; active, incon: var int) =
+  ## READ BACK `activeInHierarchy` off the live tree. Not `activeSelf`, and not
+  ## anything this host wrote a moment ago: the question the player's screen
+  ## answers is whether the object is DRAWN, and an ancestor being off decides
+  ## that just as much as our own write does.
+  ##
+  ## `incon` is the third outcome and it is load-bearing. A row whose getter did
+  ## not come back has not been shown to be hidden; folding that into `active=0`
+  ## would be a check that cannot fail.
+  active = 0
+  incon = 0
+  var r = 0
+  while r < page.rows.len and r < cSwMaxRows:
+    if page.rows[r].clone != 0'u64:
+      let go = swRowGoLive(page.rows[r])
+      if go == nil:
+        incon = incon + 1
+      else:
+        var ok = false
+        let v = duGetInt(DuGoActiveInHier, go, ok)
+        if not ok:
+          incon = incon + 1
+        elif v != 0'i32:
+          active = active + 1
+    r = r + 1
+
+## Once per session the lifecycle explains itself; the VERDICT line below is
+## emitted on every tab change, because it is the falsifiable one.
+var gSwLifeSaid = false
+var gSwLifeVerdicts = 0
+
+proc swPagesEnforceTabOwnership(tabKey: uint64; tabName: string) =
+  ## THE BUG-1 FIX AND ITS ACCEPTANCE TEST, in that order.
+  ##
+  ## Every page whose `renderedFor` names a DIFFERENT tab object than the one
+  ## now displayed is switched off; every page whose `renderedFor` names THIS
+  ## tab is switched back on (a tab the player returns to must get its rows
+  ## back, and `swPagesOnTabBuilt`'s "still rendered, nothing to rebuild" fast
+  ## path would otherwise leave them hidden forever after one excursion).
+  ##
+  ## Then the FALSIFIABLE NEGATIVE, stated as a count and read off the live
+  ## tree AFTER the writes, never from the writes themselves:
+  ##
+  ##     no element whose `renderedFor` differs from the currently active tab
+  ##     is active in the hierarchy      -> violations must be 0
+  ##
+  ## What would falsify a PASS: a single foreign row still reading
+  ## `activeInHierarchy=1`. What makes it INCONCLUSIVE: a row whose getter did
+  ## not come back, so it was not observed either way. "I could not look" is not
+  ## a pass.
+  var hidPages = 0
+  var hidRows = 0
+  var showPages = 0
+  var showRows = 0
+  var refused = 0
+  var i = 0
+  while i < gSwPages.len and i < 32:
+    if gSwPages[i].renderedFor != 0'u64:
+      var drove = 0
+      var ref2 = 0
+      if gSwPages[i].renderedFor != tabKey:
+        swPageDriveActive(gSwPages[i], false, drove, ref2)
+        if drove > 0: hidPages = hidPages + 1
+        hidRows = hidRows + drove
+      else:
+        swPageDriveActive(gSwPages[i], true, drove, ref2)
+        if drove > 0: showPages = showPages + 1
+        showRows = showRows + drove
+      refused = refused + ref2
+    i = i + 1
+  # THE READBACK. Separate loop on purpose: it must see the finished state of
+  # the whole registry, not the state midway through driving it.
+  var violations = 0
+  var incon = 0
+  var foreignRows = 0
+  i = 0
+  while i < gSwPages.len and i < 32:
+    if gSwPages[i].renderedFor != 0'u64 and gSwPages[i].renderedFor != tabKey:
+      var act = 0
+      var inc2 = 0
+      swPageCountActive(gSwPages[i], act, inc2)
+      violations = violations + act
+      incon = incon + inc2
+      var r = 0
+      while r < gSwPages[i].rows.len and r < cSwMaxRows:
+        if gSwPages[i].rows[r].clone != 0'u64:
+          foreignRows = foreignRows + 1
+        r = r + 1
+    i = i + 1
+  if not gSwLifeSaid and (hidRows > 0 or showRows > 0):
+    gSwLifeSaid = true
+    okLog "settings pages: LIFECYCLE armed -- rows are rendered onto the Game " &
+          "tab and are now SetActive(false) whenever a different tab object is " &
+          "displayed, and SetActive(true) again on return. Hidden, never " &
+          "destroyed. This is what was leaving Game-tab rows sitting in the " &
+          "Graphics layout as blank space with the real content pushed below."
+  if foreignRows == 0 and hidRows == 0 and showRows == 0:
+    return                    # nothing rendered anywhere yet; nothing to judge
+  inc gSwLifeVerdicts
+  if gSwLifeVerdicts <= 12:
+    if violations > 0:
+      warn "settings pages LIFECYCLE VERDICT FAIL: " & $violations & " of " &
+           $foreignRows & " row clone(s) rendered for a DIFFERENT tab are still " &
+           "activeInHierarchy while tab '" & tabName & "' (0x" & hexOf(tabKey) &
+           ") is displayed. Those are the blank rows on screen. Hid " &
+           $hidRows & " row(s) across " & $hidPages & " page(s) this pass; " &
+           $refused & " clone(s) were unreachable."
+    elif incon > 0:
+      warn "settings pages LIFECYCLE VERDICT INCONCLUSIVE: 0 foreign row(s) " &
+           "read back active, but " & $incon & " of " & $foreignRows &
+           " could not be read at all (dead handle or the getter did not " &
+           "return), so they were not observed either way. This is NOT a pass. " &
+           "Tab '" & tabName & "', hid " & $hidRows & " row(s), showed " &
+           $showRows & "."
+    else:
+      okLog "settings pages LIFECYCLE VERDICT PASS: 0 of " & $foreignRows &
+            " row clone(s) rendered for another tab are activeInHierarchy " &
+            "while tab '" & tabName & "' is displayed; " & $showRows &
+            " row(s) belonging to THIS tab are shown. Hid " & $hidRows &
+            " row(s) across " & $hidPages & " page(s) this pass. Read back off " &
+            "the live GameObjects, not from the writes."
+
 proc swPagesOnTabBuilt(tabPtr: Il2CppPtr; tabName: string; revisit: bool) =
   ## Phase 3, driven off the same ShowScreen postfix everything else here uses.
   ##
@@ -1229,12 +1416,19 @@ proc swPagesOnTabBuilt(tabPtr: Il2CppPtr; tabName: string; revisit: bool) =
   if tabPtr == nil:
     okLog "settings pages: DECLINED -- the tab pointer was nil"
     return
+  let tabKey = cast[uint64](tabPtr)
+  # LIFECYCLE FIRST, BEFORE ANY DECLINE. This runs for EVERY tab, including the
+  # ones we refuse to render onto -- that is the whole point. The old code
+  # returned out of the `tabName != "game"` branch below with the Game tab's
+  # clones still parented and still active, which is Bug 1.
+  swPagesEnforceTabOwnership(tabKey, tabName)
   if tabName != "game":
     if gSwPagesFires <= 8:
       okLog "settings pages: DECLINED -- pages render only onto the Game tab " &
-            "and this is '" & tabName & "' (expected; open Settings -> Game)"
+            "and this is '" & tabName & "' (expected; open Settings -> Game). " &
+            "Anything previously rendered for another tab has been hidden by " &
+            "the lifecycle pass above; see its VERDICT line for the count."
     return
-  let tabKey = cast[uint64](tabPtr)
   # Learn the widget-klass census OURSELVES rather than relying on Phase 2
   # having been switched on. Phase 3 previously depended on `settingsRelabel
   # Probe`/`settingsBindProbe` for its klass pointers without saying so, which
