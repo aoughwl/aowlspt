@@ -104,7 +104,23 @@ proc cNeFaultCount(): int32 {.importc: "aowl_ne_fault_count", nodecl.}
 proc cNeDisabled(): int32 {.importc: "aowl_ne_disabled", nodecl.}
 proc cNePool(): int32 {.importc: "aowl_ne_pool", nodecl.}
 proc cNeFactions(): int32 {.importc: "aowl_ne_factions", nodecl.}
-proc cNePerFaction(): int32 {.importc: "aowl_ne_per_faction", nodecl.}
+proc cNeSetFactionRgba(f: int32; r, g, b, a: float32): int32 {.
+  importc: "aowl_ne_set_faction_rgba", nodecl.}
+proc cNeColSource(f: int32): int32 {.importc: "aowl_ne_col_source", nodecl.}
+proc cNeFadeAlpha(depth: float32): float32 {.
+  importc: "aowl_ne_fade_alpha", nodecl.}
+proc cNeFadeBand(depth: float32): int32 {.importc: "aowl_ne_fade_band", nodecl.}
+proc cNeBandAlpha(band: int32): float32 {.
+  importc: "aowl_ne_band_alpha", nodecl.}
+proc cNeDropPolicy(): cstring {.importc: "aowl_ne_drop_policy", nodecl.}
+proc cNeCostBegin() {.importc: "aowl_ne_cost_begin", nodecl.}
+proc cNeCostEnd() {.importc: "aowl_ne_cost_end", nodecl.}
+proc cNeCostReset() {.importc: "aowl_ne_cost_reset", nodecl.}
+proc cNeCostSamples(): int64 {.importc: "aowl_ne_cost_samples", nodecl.}
+proc cNeCostMaxUs(): int64 {.importc: "aowl_ne_cost_max_us", nodecl.}
+proc cNeCostMeanNs(): int64 {.importc: "aowl_ne_cost_mean_ns", nodecl.}
+proc cNeNoteRecolour() {.importc: "aowl_ne_note_recolour", nodecl.}
+proc cNeRecolours(): int64 {.importc: "aowl_ne_recolours", nodecl.}
 proc cNeMaxNodes(): int32 {.importc: "aowl_ne_max_nodes", nodecl.}
 proc cNeMaxChildren(): int32 {.importc: "aowl_ne_max_children", nodecl.}
 proc cNeMaxDepth(): int32 {.importc: "aowl_ne_max_depth", nodecl.}
@@ -173,7 +189,7 @@ proc neOriginName(o: int32): string =
   of 2: "CREATED(ours)"
   else: "NONE"
 
-const NeMaxPool = 32          ## must equal AOWL_NE_POOL; asserted at bind
+const NeMaxPool = 64          ## must equal AOWL_NE_POOL; asserted at bind
 const NeMaxContacts = 64      ## players read per census pass
 const NeOffGraphicColor  = 0x28'i32
 
@@ -215,7 +231,17 @@ var gNeRootGo: Il2CppPtr = nil
 var gNeRootTr: Il2CppPtr = nil
 var gNeBoxGo: array[NeMaxPool, Il2CppPtr]
 var gNeBoxRt: array[NeMaxPool, Il2CppPtr]
+var gNeBoxImg: array[NeMaxPool, Il2CppPtr]
+  ## The box's Graphic. Kept because colour is now set PER PLACEMENT on a flat
+  ## pool rather than baked in per faction sub-pool at build time.
 var gNeBoxActive: array[NeMaxPool, bool]
+var gNeBoxFac: array[NeMaxPool, int32]
+  ## The faction this box is CURRENTLY coloured for, and the fade band it is
+  ## currently at. -1 means "never coloured". These two are the whole reason the
+  ## flat pool does not cost 64 `Graphic::set_color` calls a frame: a box is
+  ## recoloured only when the pair changes, and `aowl_ne_recolours` counts every
+  ## time it does, so the claim is measured rather than asserted.
+var gNeBoxBand: array[NeMaxPool, int32]
 var gNeBuilt = 0
 
 # the census, in FIXED arrays -- no seq, so no allocation per pass
@@ -225,6 +251,25 @@ var gNeCz: array[NeMaxContacts, float64]
 var gNeCf: array[NeMaxContacts, int32]
 var gNeCn = 0
 var gNeContactsEver = 0'i64
+
+# ---- the per-frame PROJECTION scratch, fixed-size like the census --------
+# Filled by `nePlace` from the projection, then partially selection-sorted so
+# the NEAREST AOWL_NE_POOL contacts win the pool. `gNeOrd` is an index
+# permutation; nothing is copied and nothing is allocated.
+var gNePx: array[NeMaxContacts, float32]
+var gNePy: array[NeMaxContacts, float32]
+var gNePz: array[NeMaxContacts, float32]
+var gNeOrd: array[NeMaxContacts, int32]
+var gNePn = 0
+
+# ---- the placement ACCOUNTING. Every contact lands in exactly one bucket. --
+# The falsifiable negative for the pool is "no contact was dropped without being
+# counted", and it is only falsifiable if the buckets are exhaustive and
+# disjoint. They are checked to sum to gNeCn every frame and the verdict says so
+# out loud when they do not.
+var gNeBehind = 0     ## projected behind the camera / projection refused
+var gNeOffScr = 0     ## projected, but off-screen this frame
+var gNeSetFail = 0    ## a layout setter refused on an otherwise good contact
 
 # the last verdict, so the diag and the report agree by construction
 var gNeVerdict = NeVInconclusive
@@ -392,6 +437,13 @@ proc neCrumb(): string =
   let c = cInspCrumb()
   if c == nil: return "<none>"
   readCString(c)
+
+proc cNeOnScreenB(x, y, w, h, sw, sh: float32): bool =
+  ## ONE predicate, shared by the placement and the verdict. They must not
+  ## drift: a placement that shows a box the verdict would not count, or the
+  ## reverse, makes the verdict a measurement of a different thing than the
+  ## feature does.
+  cNeOnScreen(x, y, w, h, sw, sh) != 0'i32
 
 proc neOk(p: Il2CppPtr; n: int32): bool =
   p != nil and cIsReadable(p, n) != 0'i32
@@ -1269,22 +1321,53 @@ proc neDiscoverStep() =
 # ---------------------------------------------------------------------------
 # THE POOL -- built ONCE
 # ---------------------------------------------------------------------------
-proc neColour(box: Il2CppPtr; faction: int32): bool =
-  ## Graphic.m_Color at +0x28, four floats, written ONCE before this box has
-  ## ever been enabled -- so before any mesh exists and no rebuild is needed.
+proc neColour(box: Il2CppPtr; faction: int32; alpha: float32): bool =
+  ## Graphic.m_Color at +0x28, four floats.
   ##
-  ## The readback below is honest about what it is: it proves the STORE LANDED
-  ## (the four floats are not still zero), which is what catches a guarded write
-  ## silently refusing. It does NOT prove the colour reaches the screen -- that
-  ## is what `neVerdict` is for, and even that stops short of "a human saw it".
+  ## AT BUILD TIME this is a raw store, which is legal because the box has never
+  ## been enabled and therefore has no mesh to rebuild. It is NOT legal once the
+  ## box is live -- a raw m_Color store on an enabled Graphic changes the field
+  ## and not the vertex colours, so the box would keep its old colour while the
+  ## readback below cheerfully reported the new one. That is precisely the
+  ## "check that cannot fail" shape, so the live path uses `neRecolour` below,
+  ## which calls the real `Graphic::set_color`.
+  ##
+  ## The readback here is honest about what it is: it proves the STORE LANDED
+  ## (alpha is not still zero), which catches a guarded write silently refusing.
+  ## It does NOT prove the colour reaches the screen -- that is `neVerdict`, and
+  ## even that stops short of "a human saw it".
   if not neOk(box, NeOffGraphicColor + 16'i32): return false
   var i = 0'i32
   while i < 4'i32:
-    if cDuWriteF32(box, NeOffGraphicColor + i * 4'i32,
-                   float64(cNeFactionRgba(faction, i))) == 0'i32:
+    let v = (if i == 3'i32: alpha else: cNeFactionRgba(faction, i))
+    if cDuWriteF32(box, NeOffGraphicColor + i * 4'i32, float64(v)) == 0'i32:
       return false
     inc i
   cReadI32At(duPtrAdd(box, NeOffGraphicColor + 12'i32)) != 0'i32
+
+proc neRecolour(idx: int; faction, band: int32): bool =
+  ## THE LIVE recolour, through `UnityEngine.UI.Graphic::set_color` -- the same
+  ## byte-verified nav row (`NuTGrSetColor`) nativeui's Image proof exercised,
+  ## whose first instruction is `movups xmm2,[rdx]`, i.e. the 16-byte Color goes
+  ## BY REFERENCE. No allocation: the Color buffer is a static C struct.
+  ##
+  ## It is called only when the (faction, band) pair CHANGES, and every call is
+  ## counted by `aowl_ne_note_recolour`, so "the flat pool does not recolour per
+  ## frame" is a number in the log and not a claim in a comment.
+  if idx < 0 or idx >= gNeBuilt: return false
+  if gNeBoxFac[idx] == faction and gNeBoxBand[idx] == band: return true
+  let img = gNeBoxImg[idx]
+  if img == nil or not neOk(img, NeOffGraphicColor + 16'i32): return false
+  if not nuImgSetColor(img,
+                       cNeFactionRgba(faction, 0'i32),
+                       cNeFactionRgba(faction, 1'i32),
+                       cNeFactionRgba(faction, 2'i32),
+                       cNeFactionRgba(faction, 3'i32) * cNeBandAlpha(band)):
+    return false
+  cNeNoteRecolour()
+  gNeBoxFac[idx] = faction
+  gNeBoxBand[idx] = band
+  true
 
 proc neDestroyPool() =
   var i = 0
@@ -1292,7 +1375,10 @@ proc neDestroyPool() =
     if gNeBoxGo[i] != nil: discard nuDestroy(gNeBoxGo[i])
     gNeBoxGo[i] = nil
     gNeBoxRt[i] = nil
+    gNeBoxImg[i] = nil
     gNeBoxActive[i] = false
+    gNeBoxFac[i] = -1'i32
+    gNeBoxBand[i] = -1'i32
     inc i
   if gNeRootGo != nil: discard nuDestroy(gNeRootGo)
   gNeRootGo = nil
@@ -1333,7 +1419,12 @@ proc neBuildPool(): bool =
                   gNeCanvasW, gNeCanvasH, 0'f32, 0'f32): return false
   var i = 0
   while i < NeMaxPool:
-    let faction = int32(i div int(cNePerFaction()))
+    # THE POOL IS FLAT. There is no per-faction partition any more, so the
+    # build-time colour is a placeholder only: `gNeBoxFac[i] = -1` below forces
+    # the first placement of every box through `neRecolour`, which is the real
+    # `Graphic::set_color` call. Faction 0's palette entry is used purely so the
+    # box is not built with an all-zero (invisible) colour.
+    let faction = 0'i32
     let go = nuCreate("aowlspt-esp-box", gNeCanvasGo)
     if go == nil: return false
     if nuAdd(go, NuKindRectTransform) == nil: return false
@@ -1346,11 +1437,14 @@ proc neBuildPool(): bool =
     # then a plain screen pixel and matches WorldToScreenPoint's own origin.
     if not nuLayout(rt, 0'f32, 0'f32, 0'f32, 0'f32, 0.5'f32, 0.5'f32,
                     24'f32, 48'f32, 0'f32, 0'f32): return false
-    if not neColour(img, faction): return false
+    if not neColour(img, faction, cNeFactionRgba(faction, 3'i32)): return false
     discard nuSetActive(go, false)
     gNeBoxGo[i] = go
     gNeBoxRt[i] = rt
+    gNeBoxImg[i] = img
     gNeBoxActive[i] = false
+    gNeBoxFac[i] = -1'i32     # force the first real set_color on first use
+    gNeBoxBand[i] = -1'i32
     inc gNeBuilt
     inc i
 
@@ -1606,63 +1700,153 @@ proc neScan() =
 # ---------------------------------------------------------------------------
 # THE UPDATE -- show/hide by toggling active, place by the _Injected setters
 # ---------------------------------------------------------------------------
+proc neHideAllFrom(first: int) =
+  var k = first
+  while k < gNeBuilt:
+    if gNeBoxActive[k]:
+      discard nuSetActive(gNeBoxGo[k], false)
+      gNeBoxActive[k] = false
+    inc k
+
 proc nePlace(sw, sh: float64) =
+  ## THREE THINGS CHANGED HERE, and they are one change.
+  ##
+  ## 1. THE POOL IS FLAT AND THE POLICY IS NEAREST-N. The old code walked the
+  ##    contacts in census order and pushed each into its own faction's sub-pool
+  ##    of 8; a raid of 32 scavs therefore drew 8 of them and left 24 undrawn
+  ##    while 24 boxes of other factions sat idle. MEASURED: "21 placed, 45
+  ##    contact(s), 24 over the per-faction pool" -- a partition failure wearing
+  ##    a capacity failure's name. Now every projected contact is ranked by
+  ##    camera depth and the NEAREST gNeBuilt win. What does not fit is the
+  ##    FARTHEST, which is the right thing to lose, and it is counted.
+  ##
+  ## 2. COLOUR IS PER PLACEMENT. A flat pool means a box's class changes, so the
+  ##    colour must follow it. It goes through `Graphic::set_color` (the real
+  ##    setter -- a raw m_Color store on an ENABLED Graphic updates the field and
+  ##    not the vertices) and only when the (faction, fade band) pair actually
+  ##    changes.
+  ##
+  ## 3. DISTANCE FADE AND SCALE. Both are pure functions of the projected depth
+  ##    the placement already has. NO CLOCK IS READ and no second timer exists:
+  ##    the maps mod's contact fade ages against OBSERVED time because it is
+  ##    answering a STALENESS question; every contact here was observed on the
+  ##    most recent census pass, so staleness is not a question this feature has.
+  ##
+  ## THE ACCOUNTING IS EXHAUSTIVE. behind + offscreen + setfail + shown +
+  ## dropped must equal gNeCn. That is the falsifiable negative for the pool --
+  ## "no contact was dropped without being counted" -- and the verdict states it
+  ## as an arithmetic identity that can come out false, not as a reassurance.
   let fnW2S = cDuFn(DuWorldToScreen)
   let cam = neCamera()
   gNeShown = 0
   gNeDropped = 0
-  var used: array[4, int] = [0, 0, 0, 0]
+  gNeBehind = 0
+  gNeOffScr = 0
+  gNeSetFail = 0
+  gNePn = 0
   if fnW2S == nil or cam == nil:
     # hide everything rather than leave the last frame's boxes frozen on screen
-    var k = 0
-    while k < gNeBuilt:
-      if gNeBoxActive[k]:
-        discard nuSetActive(gNeBoxGo[k], false)
-        gNeBoxActive[k] = false
-      inc k
+    gNeBehind = gNeCn
+    neHideAllFrom(0)
     return
+
+  # ---- PASS 1: project every contact once, into fixed scratch arrays -------
+  # Capped by gNeCn <= NeMaxContacts (64), a compile-time constant.
   var c = 0
   while c < gNeCn:
-    let faction = int(gNeCf[c])
+    let ci = c
     inc c
-    if faction < 0 or faction >= 4: continue
-    let ci = c - 1
-    if cDuWorldToScreen(fnW2S, cam, gNeCx[ci], gNeCy[ci], gNeCz[ci]) == 0'i32:
+    let faction = int(gNeCf[ci])
+    if faction < 0 or faction >= 4:
+      inc gNeBehind                      # unclassifiable: counted, not ignored
       continue
-    if cDuScreenZ() <= 0.0: continue          # behind the camera
-    if used[faction] >= int(cNePerFaction()):
+    if cDuWorldToScreen(fnW2S, cam, gNeCx[ci], gNeCy[ci], gNeCz[ci]) == 0'i32:
+      inc gNeBehind
+      continue
+    if cDuScreenZ() <= 0.0:
+      inc gNeBehind                      # behind the camera
+      continue
+    if gNePn >= NeMaxContacts:
       inc gNeDropped
       continue
-    let idx = faction * int(cNePerFaction()) + used[faction]
-    inc used[faction]
-    if idx < 0 or idx >= gNeBuilt: continue
+    gNePx[gNePn] = float32(cDuScreenX())
+    gNePy[gNePn] = float32(cDuScreenY())
+    gNePz[gNePn] = float32(cDuScreenZ())
+    gNeOrd[gNePn] = int32(ci)
+    inc gNePn
+
+  # ---- PASS 2: partial selection sort, NEAREST FIRST ----------------------
+  # Only the first `want` positions are ever settled, so the cost is
+  # want * gNePn compares -- at most 64*64 = 4096 integer/float compares, which
+  # is the whole reason this is not a full sort and not a heap. Nothing is
+  # allocated; `gNeOrd` is an index permutation over the census arrays.
+  let want = (if gNePn < gNeBuilt: gNePn else: gNeBuilt)
+  var s = 0
+  while s < want:
+    var best = s
+    var j = s + 1
+    while j < gNePn:
+      if gNePz[j] < gNePz[best]: best = j
+      inc j
+    if best != s:
+      let tx = gNePx[s]; gNePx[s] = gNePx[best]; gNePx[best] = tx
+      let ty = gNePy[s]; gNePy[s] = gNePy[best]; gNePy[best] = ty
+      let tz = gNePz[s]; gNePz[s] = gNePz[best]; gNePz[best] = tz
+      let to = gNeOrd[s]; gNeOrd[s] = gNeOrd[best]; gNeOrd[best] = to
+    inc s
+
+  # everything past `want` is the FARTHEST of the projected contacts and is the
+  # bounded, named, counted miss the drop policy promises
+  gNeDropped = gNeDropped + (gNePn - want)
+
+  # ---- PASS 3: place the winners -----------------------------------------
+  var idx = 0
+  while idx < want:
+    let ci = int(gNeOrd[idx])
+    let faction = gNeCf[ci]
+    let depth = gNePz[idx]
     let rt = gNeBoxRt[idx]
-    if rt == nil: continue
-    # A nearer contact gets a bigger box. Bounded so nuLayout's renderability
+    if rt == nil:
+      inc gNeSetFail
+      inc idx
+      continue
+    # SCALE: a nearer contact gets a bigger box. Bounded so the renderability
     # check can never be handed an absurd extent.
-    let depth = cDuScreenZ()
-    var boxH = 900.0 / (if depth < 5.0: 5.0 else: depth)
-    if boxH < 6.0: boxH = 6.0
-    if boxH > 220.0: boxH = 220.0
-    let boxW = boxH * 0.45
-    if not nuSetV2(rt, NuTRtSetSizeDelta, float32(boxW), float32(boxH)): continue
-    if not nuSetV2(rt, NuTRtSetAnchoredPos,
-                   float32(cDuScreenX()), float32(cDuScreenY())): continue
-    if not gNeBoxActive[idx]:
-      if not nuSetActive(gNeBoxGo[idx], true): continue
-      gNeBoxActive[idx] = true
-    inc gNeShown
-  # hide the tail of every sub-pool that this frame did not use
-  var g = 0
-  while g < 4:
-    var s = used[g]
-    while s < int(cNePerFaction()):
-      let idx = g * int(cNePerFaction()) + s
-      if idx < gNeBuilt and gNeBoxActive[idx]:
+    var boxH = 900.0'f32 / (if depth < 5.0'f32: 5.0'f32 else: depth)
+    if boxH < 6.0'f32: boxH = 6.0'f32
+    if boxH > 220.0'f32: boxH = 220.0'f32
+    let boxW = boxH * 0.45'f32
+    if not cNeOnScreenB(gNePx[idx], gNePy[idx], boxW, boxH,
+                        float32(sw), float32(sh)):
+      # OFF-SCREEN IS ITS OWN OUTCOME. Placing it anyway would leave a box
+      # pinned to the screen edge, and counting it as `shown` would inflate the
+      # only number the verdict has.
+      inc gNeOffScr
+      if gNeBoxActive[idx]:
         discard nuSetActive(gNeBoxGo[idx], false)
         gNeBoxActive[idx] = false
-      inc s
-    inc g
+      inc idx
+      continue
+    # FADE: colour + banded alpha, only when the pair changed.
+    discard neRecolour(idx, faction, cNeFadeBand(depth))
+    if not nuSetV2(rt, NuTRtSetSizeDelta, boxW, boxH):
+      inc gNeSetFail
+      inc idx
+      continue
+    if not nuSetV2(rt, NuTRtSetAnchoredPos, gNePx[idx], gNePy[idx]):
+      inc gNeSetFail
+      inc idx
+      continue
+    if not gNeBoxActive[idx]:
+      if not nuSetActive(gNeBoxGo[idx], true):
+        inc gNeSetFail
+        inc idx
+        continue
+      gNeBoxActive[idx] = true
+    inc gNeShown
+    inc idx
+  # hide the tail of the flat pool that this frame did not use
+  neHideAllFrom(want)
 
 # ---------------------------------------------------------------------------
 # THE VERDICT -- §9b. Three outcomes, and PASS is a READBACK.
@@ -1728,6 +1912,57 @@ proc neCanvasLine(): string =
          "established. Phase 0 is the only gate; the nested walk's scope is " &
          "not part of this decision)")
 
+proc neAccountLine(): string =
+  ## THE POOL'S FALSIFIABLE NEGATIVE (CLAUDE.md 9b): "no contact was dropped
+  ## without being counted". Stated as an arithmetic identity over buckets that
+  ## are exhaustive and disjoint by construction, so it CAN come out false --
+  ## and when it does it says UNACCOUNTED and names the shortfall rather than
+  ## printing a reassuring total. The old line ("N over the per-faction pool")
+  ## could not fail: it reported the one bucket it happened to increment.
+  let acc = gNeShown + gNeDropped + gNeBehind + gNeOffScr + gNeSetFail
+  result = "contact accounting: shown=" & $gNeShown & " dropped(farthest, " &
+           "over pool)=" & $gNeDropped & " behindOrUnprojectable=" & $gNeBehind &
+           " offScreen=" & $gNeOffScr & " setterRefused=" & $gNeSetFail &
+           " = " & $acc & " of " & $gNeCn & " contact(s)"
+  if acc == gNeCn:
+    result = result & " -- BALANCED, so no contact left the frame uncounted"
+  else:
+    result = result & " -- UNACCOUNTED " & $(gNeCn - acc) & ". This FALSIFIES " &
+             "\"no contact was dropped without being counted\"; the buckets " &
+             "are meant to be exhaustive and disjoint and this frame they " &
+             "were not. Do not read the box count as complete."
+  result = result & ". Policy: " & readCString(cNeDropPolicy())
+
+proc neCostLine(): string =
+  ## What the per-frame path COSTS, measured, not bounded by assertion. Same
+  ## shape as the maps mod's drawCost line. The mean is in nanoseconds on
+  ## purpose: a steady state that rounds to "0us" is a cost line that cannot be
+  ## wrong, which is the same defect as a check that cannot fail.
+  let n = cNeCostSamples()
+  if n <= 0'i64:
+    return "cost: not measured yet (0 samples)"
+  "cost: mean " & $cNeCostMeanNs() & "ns, max " & $cNeCostMaxUs() & "us over " &
+    $n & " guarded tick(s) since the pool was built; recolours=" &
+    $cNeRecolours() & " Graphic::set_color call(s) TOTAL since arming (this " &
+    "is the number that falsifies \"the flat pool does not recolour per " &
+    "frame\" -- if it tracks " & $gNeBuilt & " per tick, the (class,band) " &
+    "cache is not working)"
+
+proc neColourLine(): string =
+  ## WHERE EACH COLOUR CAME FROM. A settings value that failed to parse leaves
+  ## the compiled default in place, and a log that did not distinguish the two
+  ## would report a user's colour choice as applied when it was refused.
+  result = "colours:"
+  var f = 0'i32
+  while f < cNeFactions():
+    result = result & " " & readCString(cNeFactionName(f)) & "=" &
+             (if cNeColSource(f) != 0'i32: "settings" else: "default") &
+             "(" & neF(cNeFactionRgba(f, 0'i32)) & "," &
+             neF(cNeFactionRgba(f, 1'i32)) & "," &
+             neF(cNeFactionRgba(f, 2'i32)) & "," &
+             neF(cNeFactionRgba(f, 3'i32)) & ")"
+    inc f
+
 proc neVerdictBody(sw, sh: float64): string =
   case int(gNeVerdict)
   of 2:
@@ -1735,8 +1970,7 @@ proc neVerdictBody(sw, sh: float64): string =
       $gNeOnScreen &
       " box(es) read BACK from the game as activeInHierarchy with a " &
       "renderable on-screen rect this frame (of " & $gNeShown &
-      " placed, " & $gNeCn & " contact(s), " & $gNeDropped &
-      " over the per-faction pool). This is the finished state, not a record " &
+      " placed). " & neAccountLine() & ". This is the finished state, not a record " &
       "of our own writes -- but it is still not proof a human can SEE them. " &
       "`activeInHierarchy` is TRANSITIVE, so a box reading back active is also " &
       "a readback of the whole parent chain box -> aowlspt-esp-root -> " &
@@ -1747,7 +1981,8 @@ proc neVerdictBody(sw, sh: float64): string =
       "with a valid on-screen rect. contacts=" & $gNeCn & " placed=" &
       $gNeShown & " built=" & $gNeBuilt & " canvas=" & neF(gNeCanvasW) & "x" &
       neF(gNeCanvasH) & " screen=" & duFmt0(sw) & "x" & duFmt0(sh) &
-      ". The pool exists and the placement ran; the finished state is empty."
+      ". The pool exists and the placement ran; the finished state is empty. " &
+      neAccountLine() & "."
   else:
     "natesp VERDICT INCONCLUSIVE -- " & neCanvasLine() & ". " &
       readCString(cNeRefusalText(gNeWhy)) &
@@ -1776,7 +2011,8 @@ proc neVerdictLine(sw, sh: float64): string =
   ## FAIL and INCONCLUSIVE ones, because a broken classifier and a broken
   ## placement are independent failures, and the branch that hides one behind
   ## the other is the branch that costs a session.
-  neVerdictBody(sw, sh) & "  [" & neClsHistText() & " -- " & neClsVerdict() & "]"
+  neVerdictBody(sw, sh) & "  [" & neClsHistText() & " -- " & neClsVerdict() &
+    "]  [" & neColourLine() & "]  [" & neCostLine() & "]"
 
 # ---------------------------------------------------------------------------
 # THE TICK -- one body, one guard, ridden on the existing Update drain
@@ -1828,11 +2064,19 @@ proc neTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ne_tick_body", cdecl.}
     neSettleStep()
   of NeBuild:
     if neBuildPool():
-      okLog "natesp: pool BUILT -- " & $gNeBuilt & " box(es) in " &
-            $int(cNeFactions()) & " faction sub-pools of " &
-            $int(cNePerFaction()) & ", parented under the discovered canvas. " &
-            "Every one is inactive and coloured; from here the update path " &
-            "allocates NOTHING and only toggles active and moves rects."
+      okLog "natesp: pool BUILT -- " & $gNeBuilt & " box(es) in ONE FLAT pool " &
+            "(no faction partition; the old 4x8 partition drew 21 of 45 " &
+            "contacts while idle boxes of other factions sat unused), " &
+            "parented under the discovered canvas. Every one is inactive. " &
+            "From here the update path allocates NOTHING: it projects, ranks " &
+            "by depth, moves rects, toggles active, and calls " &
+            "Graphic::set_color only when a box's (class, fade band) changes. " &
+            neColourLine() & ". Overflow policy: " &
+            readCString(cNeDropPolicy()) & "."
+      # The cost meter starts CLEAN at NeRun. Discovery's 6ms sliced walk is a
+      # different question from the steady-state per-frame cost, and averaging
+      # the two produces a number that describes neither.
+      cNeCostReset()
       gNeState = NeRun
     else:
       neDestroyPool()
@@ -1872,7 +2116,13 @@ proc natEspDrainTick() =
     return
   gNeTicks = gNeTicks + 1
   let wasDiscovering = gNeState == NeDiscover
+  # THE COST METER brackets the WHOLE guarded body, including the fault path --
+  # a tick that faults still spent time. `cost_end` is called on both exits for
+  # that reason; skipping it on the fault path would quietly bias the mean
+  # toward the cheap frames.
+  cNeCostBegin()
   if cNeTickGuarded(nil) == nil:
+    cNeCostEnd()
     if wasDiscovering:
       # Discovery has its OWN ledger. The walk touches thousands of foreign
       # objects per raid; letting it spend the steady-state budget is what
@@ -1926,6 +2176,7 @@ proc natEspDrainTick() =
       warn "natesp: the guarded tick FAULTED (" & $int(cNeFaultCount()) & " of " &
            "the budget). State=" & $gNeState & "; self-disables at the cap."
     return
+  cNeCostEnd()
   if gNeDiag and (cNowMs() - gNeDiagAt) > 5000'u64:
     gNeDiagAt = cNowMs()
     var sw = 0.0
@@ -1938,6 +2189,48 @@ proc natEspDrainTick() =
     # a line that cannot fail.
     okLog "natesp: raid phase = " & rpPhaseName(rpPhase()) & " -- " & rpWhy() &
           "  [" & rpSignals() & "]"
+
+proc neHexNib(ch: char): int =
+  if ch >= '0' and ch <= '9': ord(ch) - ord('0')
+  elif ch >= 'a' and ch <= 'f': 10 + ord(ch) - ord('a')
+  elif ch >= 'A' and ch <= 'F': 10 + ord(ch) - ord('A')
+  else: -1
+
+proc neApplyColour*(faction: int32; hex: string): bool =
+  ## Parse ONE `colorSetting(format="hex")` value and store it.
+  ##
+  ## `#RRGGBB` or `#RRGGBBAA`, leading `#` optional. Anything else is REFUSED
+  ## and the compiled default stays -- and `aowl_ne_col_source` keeps saying
+  ## "default", so the verdict line reports what is actually in force rather
+  ## than what the user asked for. A colour parser that silently yields black on
+  ## a typo produces an invisible box while every call reports success, which is
+  ## the exact failure mode this whole file is built against.
+  ##
+  ## The C setter additionally rejects any non-finite or out-of-range channel,
+  ## so a parse bug cannot reach `Graphic::set_color`.
+  if hex.len == 0: return false
+  var s = hex
+  if s[0] == '#': s = substr(s, 1)
+  if s.len != 6 and s.len != 8: return false
+  var ch: array[4, float32] = [0'f32, 0'f32, 0'f32, 1'f32]
+  var i = 0
+  while i * 2 + 1 < s.len and i < 4:
+    let hi = neHexNib(s[i * 2])
+    let lo = neHexNib(s[i * 2 + 1])
+    if hi < 0 or lo < 0: return false
+    ch[i] = float32(hi * 16 + lo) / 255'f32
+    inc i
+  cNeSetFactionRgba(faction, ch[0], ch[1], ch[2], ch[3]) != 0'i32
+
+proc neColourKey*(faction: int32): string =
+  ## The four setting keys, in ONE place, so the host's reader and any schema
+  ## cannot drift apart by a typo.
+  case int(faction)
+  of 0: "espColorUsec"
+  of 1: "espColorBear"
+  of 2: "espColorScav"
+  of 3: "espColorBoss"
+  else: ""
 
 proc bindNativeEsp*(verbose: bool) =
   ## Reports readiness once. Installs NO detour and resolves NO address of its
@@ -1958,5 +2251,7 @@ proc bindNativeEsp*(verbose: bool) =
   okLog "natesp: the native uGUI ESP is ARMED. It will discover a raid canvas " &
         "at runtime (Component::GetComponent(String) over the scene roots, " &
         "DontDestroyOnLoad included) and REFUSE if none qualifies -- it never " &
-        "parents to a guessed pointer. Pool of " & $NeMaxPool & " Image boxes, " &
-        "built once, shown by toggling active. Verdict every 5s with natEspDiag."
+        "parents to a guessed pointer. FLAT pool of " & $NeMaxPool &
+        " Image boxes, built once, shown by toggling active, coloured per " &
+        "placement by class with a distance fade. " & neColourLine() &
+        ". Verdict every 5s with natEspDiag."

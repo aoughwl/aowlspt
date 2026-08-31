@@ -7724,6 +7724,26 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   # feature that reports "the callback ran" forever.
   gNeOn = readBoolKey("natEsp") and gNuOn
   gNeDiag = gNeOn and readBoolKey("natEspDiag")
+  # THE PER-CLASS COLOURS, from `colorSetting(format="hex")`. Read ONCE here, at
+  # config load, never per frame. A key that is absent or that does not parse
+  # leaves the compiled default in place AND leaves `aowl_ne_col_source` saying
+  # "default", so the verdict line reports what is in force rather than what was
+  # asked for. Capped by cNeFactions(), a compile-time constant.
+  if gNeOn:
+    var nf = 0'i32
+    while nf < cNeFactions():
+      let key = neColourKey(nf)
+      if key.len > 0:
+        let v = readStrKey(key)
+        if v.len > 0 and not neApplyColour(nf, v):
+          warn "natesp: the colour setting \"" & key & "\" = \"" & v &
+               "\" did not parse as #RRGGBB or #RRGGBBAA, or a channel was " &
+               "out of range. The COMPILED DEFAULT for " &
+               readCString(cNeFactionName(nf)) & " stays in force and the " &
+               "verdict line will say `default`, not `settings` -- a colour " &
+               "that silently fell back to black would draw an invisible box " &
+               "while every call reported success."
+      inc nf
   # THE NATIVE COLOUR WIDGET on the in-game settings screen. Default OFF.
   #
   # The `and gNuOn` is the same load-bearing condition `natEsp` has above and
