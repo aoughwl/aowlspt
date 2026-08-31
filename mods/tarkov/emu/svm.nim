@@ -1,4 +1,4 @@
-﻿## The SVM rows that are NOT `globals.config` -- and the read ledger over them.
+## The SVM rows that are NOT `globals.config` -- and the read ledger over them.
 ##
 ## What already existed, and why this file is small
 ## ------------------------------------------------
