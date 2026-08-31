@@ -301,6 +301,39 @@ proc readOpts(o: var HudOpts) =
                              0xEBFFBE46'u32)
   o.colSelf   = 0xFFFFFFFF'u32
 
+  # ---- PER-CONTACT-CLASS VISIBILITY AND COLOUR -------------------------
+  #
+  # These are REAL controls, not placeholders: `sp/world.nim` now reads
+  # EPlayerSide and WildSpawnType per contact through a guarded four-hop field
+  # walk (Player+0x9C0 -> Profile+0x48 -> ProfileInfo, +0x48 side / +0x78
+  # Settings +0x10 role, every offset from tools/fldoff.py with its String
+  # self-check passing) and publishes a class with every entity. Until that walk
+  # existed these toggles WOULD have been dead controls, which is why the
+  # previous pass deliberately did not ship them.
+  #
+  # The PMC and scav colour defaults are seeded from the EXISTING colorPlayer /
+  # colorBot keys, so a config written before this build renders identically:
+  # nobody's map changes colour because they took the update. `unknown` gets a
+  # grey of its own -- if the Profile walk ever dies the map must LOOK wrong,
+  # not quietly paint a convincing field of scavs.
+  o.clsShow[ClsLocal]   = asBool(setting("showLocal"), true)
+  o.clsShow[ClsPmc]     = asBool(setting("showPmc"), true)
+  o.clsShow[ClsScav]    = asBool(setting("showScav"), true)
+  o.clsShow[ClsBoss]    = asBool(setting("showBoss"), true)
+  o.clsShow[ClsUnknown] = asBool(setting("showUnknown"), true)
+  o.clsCol[ClsLocal]    = parseRgb(asText(setting("colorLocal"), "FFFFFF"),
+                                   0xFFFFFFFF'u32)
+  o.clsCol[ClsPmc]      = parseRgb(asText(setting("colorPmc"),
+                                          asText(setting("colorPlayer"), "46BEFF")),
+                                   o.colPlayer)
+  o.clsCol[ClsScav]     = parseRgb(asText(setting("colorScav"),
+                                          asText(setting("colorBot"), "E6463C")),
+                                   o.colBot)
+  o.clsCol[ClsBoss]     = parseRgb(asText(setting("colorBoss"), "FF3CDC"),
+                                   0xF0DC3CFF'u32)
+  o.clsCol[ClsUnknown]  = parseRgb(asText(setting("colorUnknown"), "969696"),
+                                   0xC8969696'u32)
+
   # ---- PLACEMENT AND CHROME -------------------------------------------
   # `widgetAnchor` defaults to "manual", which is byte-for-byte the placement
   # every existing config already has: mapX/mapY as absolute top-left. Nobody's
@@ -537,8 +570,62 @@ proc spatialSchema(): seq[Setting] =
                  hi = 400.0, step = 4.0, category = "HUD",
                  description = "Specified from the pre-1.0 BepInEx map/radar mods (no upstream code carried; map art and calibration provenance in mods/maps/data/maps/README.md). How far in from the screen edge an off-screen " &
                                "contact's marker is clamped"),
-    boolSetting("showBots", "Show bots", true, category = "HUD"),
-    boolSetting("showPlayers", "Show players", true, category = "HUD"),
+    boolSetting("showBots", "Show bots", true, category = "HUD",
+                description = "The COARSE gate, kept: anything with a non-null " &
+                              "Player.AIData @0xA00. ANDed with the per-class " &
+                              "toggles below, never replaced by them, so each " &
+                              "can independently hide a contact"),
+    boolSetting("showPlayers", "Show players", true, category = "HUD",
+                description = "The coarse gate for anything whose AIData reads " &
+                              "null. ANDed with the per-class toggles below"),
+
+    # ---- PER-CONTACT-CLASS CONTROLS ------------------------------------
+    # Each of these is backed by a real per-contact read; see readOpts.
+    boolSetting("showLocal", "Show yourself", true, category = "Contacts",
+                description = "Your own marker. Class LOCAL is assigned from " &
+                              "GameWorld.MainPlayer @0x230 identity, not from " &
+                              "any profile read, so it is the one class that " &
+                              "cannot be wrong for the reason the others can"),
+    boolSetting("showPmc", "Show PMCs", true, category = "Contacts",
+                description = "EPlayerSide Usec(1) or Bear(2), read from " &
+                              "ProfileInfo+0x48. Includes AI PMCs (pmcBEAR 51 / " &
+                              "pmcUSEC 52), which carry a real PMC side"),
+    boolSetting("showScav", "Show scavs", true, category = "Contacts",
+                description = "EPlayerSide Savage(4) whose WildSpawnType is not " &
+                              "in the boss tier"),
+    boolSetting("showBoss", "Show bosses and their guards", true,
+                category = "Contacts",
+                description = "WildSpawnType from ProfileSettings+0x10, matched " &
+                              "against the boss/follower/sectant/raider/rogue " &
+                              "values BY NUMBER (never by a substring of a name " &
+                              "-- exUsec and pmcBot contain neither 'rogue' nor " &
+                              "'raider'). Outranks the side, because bosses are " &
+                              "Savage-sided and must not sink into the scav bucket"),
+    boolSetting("showUnknown", "Show unclassified contacts", true,
+                category = "Contacts",
+                description = "The contact is real and its POSITION validated, " &
+                              "but the Profile walk declined or the side was a " &
+                              "value EPlayerSide does not define. Leave this ON: " &
+                              "turning it off hides the evidence that the " &
+                              "classifier is broken, and the diagnostic's class " &
+                              "histogram is the only other place that shows it"),
+    stringSetting("colorLocal", "Colour: you", "FFFFFF", category = "Contacts",
+                description = "RRGGBB. A malformed value keeps the default " &
+                              "rather than becoming black"),
+    stringSetting("colorPmc", "Colour: PMC", "46BEFF", category = "Contacts",
+                description = "RRGGBB. Defaults to the legacy `colorPlayer` " &
+                              "value when unset, so an existing config renders " &
+                              "byte-identically to before this feature"),
+    stringSetting("colorScav", "Colour: scav", "E6463C", category = "Contacts",
+                description = "RRGGBB. Defaults to the legacy `colorBot` value " &
+                              "when unset"),
+    stringSetting("colorBoss", "Colour: boss", "FF3CDC", category = "Contacts",
+                description = "RRGGBB"),
+    stringSetting("colorUnknown", "Colour: unclassified", "969696",
+                category = "Contacts",
+                description = "RRGGBB. Deliberately a drab grey and NOT the " &
+                              "scav colour: if the classifier dies the map must " &
+                              "look wrong, not plausible"),
     intSetting("hudBudgetUs", "HUD draw budget (us)", 400, lo = 50, hi = 5000,
                category = "HUD",
                description = "Specified from the pre-1.0 BepInEx map/radar mods (no upstream code carried; map art and calibration provenance in mods/maps/data/maps/README.md). The shared region throttles this participant if " &
@@ -824,6 +911,11 @@ proc onMainTick(payload: string): string =
   unlockMod()
   result = ""
 
+var gClsHistLast = ""
+  ## Last histogram line EMITTED, so the log carries one line per change rather
+  ## than one per publish tick. "" also means "no raid line is outstanding",
+  ## which is what makes the raid-ended line fire exactly once.
+
 proc onPublishTick(payload: string): string =
   ## The mod's own timer thread. Formatting and file IO live here and only here.
   if not gEnabled: return ""
@@ -831,10 +923,28 @@ proc onPublishTick(payload: string): string =
   let have = gPending
   gPending = false
   var body = ""
+  var hist = ""
+  var inRaidNow = false
   if have:
     body = snapshotJson(gSnap, feedStateText(), feedDefect(), feedFaults(),
                         feedDisabled(), gRadius)
+    hist = clsHistogramText(gSnap.cls)
+    inRaidNow = activeRaid(gSnap)
   unlockMod()
+
+  # THE PER-RAID CLASS HISTOGRAM. Emitted on CHANGE while an active raid is in
+  # progress, and once more when the raid ends carrying the last live figures,
+  # so a session that never opened the diag page still has the numbers in the
+  # host log. It is deliberately the raw distribution and not a verdict: the
+  # verdict (clsVerdict) is printed beside it, and a reader who disagrees with
+  # the verdict can check it against the counts in the same line.
+  if inRaidNow and hist != gClsHistLast:
+    gClsHistLast = hist
+    info ModName & ": " & hist & "  " & clsVerdict()
+  elif (not inRaidNow) and gClsHistLast.len > 0:
+    info ModName & ": raid ended -- last " & gClsHistLast & "  " & clsVerdict()
+    gClsHistLast = ""
+
   if not have: return ""
   var err = ""
   if writeSnapshot(body, err):
@@ -1468,6 +1578,17 @@ proc mapsDiagText(): string =
            "  heading      : " & lHdg    & "\n" &
            "  indLifetime  : " & lLife   & "\n" &
            "  art          : " & lArt    & "\n" &
+           # TWO independent class stages, because they can fail independently
+           # and folding them would hide one behind the other. `classify` is
+           # about the READ (did the Profile walk produce a real distribution);
+           # `classFilter` is about the DRAW (did an OFF class still reach the
+           # screen). A perfect classifier feeding a broken filter, and a dead
+           # classifier feeding a correct filter, are both possible and both
+           # visible here.
+           "  classify     : " & clsVerdict() & "\n" &
+           "  classHist    : " & clsHistogramText(clsEver()) &
+             "  (cumulative, this session)\n" &
+           "  classFilter  : " & hudClassVerdict() & "\n" &
            "  feed         : ticks=" & $gTicks & " published=" & $gPublished &
              " faults=" & $feedFaults() & " defect=" & feedDefect()
 
@@ -1789,6 +1910,20 @@ proc mirrorDrift(): string =
   if w.colPlayer != hudLiveColPlayer():
     return "colorPlayer config=" & $w.colPlayer &
            " mirror=" & $hudLiveColPlayer()
+  # EVERY per-class toggle and colour, against the LIVE MIRROR. Ten more lines
+  # for ten more settings, by the rule stated above: a schema entry with no
+  # comparison here is a control that can be stored and never applied, and the
+  # per-class toggles are exactly the shape of control that would go unnoticed
+  # (a class you rarely see simply never appears, which looks like the raid).
+  var cc = 0
+  while cc < ClsCount:
+    if w.clsShow[cc] != hudLiveClsShow(cc):
+      return "show" & clsName(cc) & " config=" & $w.clsShow[cc] &
+             " mirror=" & $hudLiveClsShow(cc)
+    if w.clsCol[cc] != hudLiveClsColour(cc):
+      return "color" & clsName(cc) & " config=" & $w.clsCol[cc] &
+             " mirror=" & $hudLiveClsColour(cc)
+    inc cc
   # The hotkey is not in the C mirror -- the ORDINAL this process resolved is
   # what the Unity tick polls, so that is what is compared.
   let wantKc = (if w.fsEnabled: keycodeOf(w.fsKey) else: -1)

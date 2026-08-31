@@ -226,7 +226,19 @@ function el(n, cls, txt) {
   return e;
 }
 
-function colourOf(e) { return e.me ? '#4da3ff' : (e.bot ? '#e06c5a' : '#e8d24a'); }
+/* CLASS colours, matched to the in-game widget's defaults so the browser map
+ * and the overlay do not disagree about what a colour means. `cls` is 0 local,
+ * 1 pmc, 2 scav, 3 boss, 4 unknown; anything else -- including an OLD snapshot
+ * served by a host that predates the class feed, where `cls` is undefined --
+ * falls to the unknown grey rather than to a confident wrong colour. */
+var CLS_COL  = ['#ffffff', '#46beff', '#e6463c', '#ff3cdc', '#969696'];
+var CLS_NAME = ['you', 'pmc', 'scav', 'boss', 'unclassified'];
+function clsOf(e) {
+  var c = (e && typeof e.cls === 'number') ? e.cls : 4;
+  return (c >= 0 && c < 5) ? c : 4;
+}
+function colourOf(e) { return CLS_COL[clsOf(e)]; }
+function labelOf(e)  { return CLS_NAME[clsOf(e)]; }
 
 /* --- MAP view.
  * Steps 2 and 3 of the derivation. The <svg> viewBox spans the layer's
@@ -307,7 +319,7 @@ function MapView(host) {
                                        stroke: '#4da3ff', 'stroke-width': r * 0.3,
                                        opacity: 0.7}));
       var t = svgEl('title', {}); t.textContent =
-        (ents[i].me ? 'you' : (ents[i].bot ? 'bot' : 'player')) +
+        labelOf(ents[i]) +
         (ents[i].id ? ' …' + ents[i].id : '') +
         '  world (' + ents[i].x.toFixed(1) + ', ' + ents[i].y.toFixed(1) +
         ', ' + ents[i].z.toFixed(1) + ')';
@@ -414,7 +426,7 @@ function RadarView(host) {
         g.appendChild(c);
       }
       var t = svgEl('title', {});
-      t.textContent = (ents[i].bot ? 'bot' : 'player') + ' ' + d.toFixed(0) +
+      t.textContent = labelOf(ents[i]) + ' ' + d.toFixed(0) +
                       ' m' + (Math.abs(dh) > 3 ? ', ' + dh.toFixed(0) + ' m vertical' : '');
       g.appendChild(t);
       gBlip.appendChild(g);
@@ -484,7 +496,7 @@ function IndicatorView(host) {
         row.appendChild(el('span', 'sp-ind-b', Math.round(rows[j].b) + '°'));
         row.appendChild(el('span', 'sp-ind-d', Math.round(rows[j].d) + ' m'));
         row.appendChild(el('span', 'sp-ind-k',
-          (rows[j].e.bot ? 'bot' : 'player') +
+          labelOf(rows[j].e) +
           (Math.abs(rows[j].dh) > 3
             ? (rows[j].dh > 0 ? ' ▲' : ' ▼') + Math.abs(Math.round(rows[j].dh))
             : '')));

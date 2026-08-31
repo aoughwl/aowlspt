@@ -322,10 +322,29 @@ proc snapshotJson*(s: Snapshot; stateText, defect: string; faults: int;
     put(e, "z", s.ents[i].z)
     put(e, "bot", s.ents[i].bot)
     put(e, "me", s.ents[i].me)
+    # The CLASS, plus the two RAW enum values it was derived from. The raws are
+    # served deliberately: `cls` is this mod's opinion, `side`/`role` are what
+    # the client actually said, and a reader who thinks the classifier is wrong
+    # can check it without a rebuild. Both are -1 when the read declined, which
+    # is distinct from any value either enum defines.
+    put(e, "cls", s.ents[i].cls)
+    put(e, "clsName", clsName(s.ents[i].cls))
+    put(e, "side", int(s.ents[i].side))
+    put(e, "role", int(s.ents[i].role))
     put(e, "id", s.ents[i].id)
     a.add done(e)
     inc i
   put(o, "ents", done(a))
+  # The per-collection histogram, alongside the entities it summarises, so the
+  # page can show the distribution without recounting (and so a diff of the two
+  # would catch a serialiser that drops entities).
+  var h = obj()
+  var hi = 0
+  while hi < ClsCount:
+    put(h, clsName(hi), s.cls[hi])
+    inc hi
+  put(o, "classHistogram", done(h))
+  put(o, "classVerdict", clsVerdict())
   result = done(o).text
 
 # --------------------------------------------------------------------------
