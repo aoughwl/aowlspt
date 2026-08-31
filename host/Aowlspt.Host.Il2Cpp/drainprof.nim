@@ -236,6 +236,15 @@ proc dpReport() =
   if (now - gDpAt) > gDpPeriodMs:
     gDpAt = now
     okLog dpLine()
+    # The DECOMPOSITION of the splRebrandDrain row, emitted in the same window
+    # and on the same clock, so the row and its phases can never be read from
+    # two different runs. `splProfLines` lives in `splrebrand.nim`, which is
+    # `include`d before this file.
+    var splLines = splProfLines()
+    var li = 0
+    while li < splLines.len:
+      okLog splLines[li]
+      li = li + 1
 
 proc dpConfigure() =
   gDpOn = readBoolKey("drainProfiler")

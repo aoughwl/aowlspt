@@ -143,6 +143,15 @@ const
   SplHuntFrames   = 60         ## ~1 s at 60 fps while NOTHING is cached (the
                                ## `iSceneRoots` enumeration allocates; it may not
                                ## run per frame).
+  SplCheapHuntFrames = 1       ## EVERY FRAME once the UI ROOT ("Menu UI") is
+                               ## cached but the screen is not. This tier exists
+                               ## because the expensive part of a hunt was never
+                               ## the descent -- it was `iSceneRoots`. With the
+                               ## root cached the hunt is a depth-8, budgeted,
+                               ## 18ms-sliced name descent over a shallow tree
+                               ## and allocates nothing, so throttling it only
+                               ## bought latency the player pays for as vanilla
+                               ## text on screen.
   SplRescanFrames = 6          ## ~100 ms once the SCREEN transform is cached but
                                ## its TMPs are not: a depth-12 scan bounded by
                                ## SplWalkMs, no root enumeration.
@@ -183,6 +192,48 @@ static void* aowl_spl_tick_guarded(void* a) {
 proc cSplTickGuarded(a: Il2CppPtr): Il2CppPtr {.
   importc: "aowl_spl_tick_guarded", nodecl.}
 
+# ---- THE PHASE METER (abi/aowlspt_splprof.h) ------------------------------
+# Pure C over its own statics; hooks nothing, dereferences nothing, opens NO
+# guard. The TOTAL bracket is taken in `splRebrandDrainTick`, strictly OUTSIDE
+# `cSplTickGuarded`; every phase bracket is INSIDE the already-open guard and
+# opens none of its own. Active only while `drainProfiler` is on.
+proc cSpNow(): int64 {.importc: "aowl_sp_now", nodecl.}
+proc cSpAdd(slot: int32; t0: int64) {.importc: "aowl_sp_add", nodecl.}
+proc cSpCallBegin() {.importc: "aowl_sp_call_begin", nodecl.}
+proc cSpCallEnd(t0: int64) {.importc: "aowl_sp_call_end", nodecl.}
+proc cSpControl() {.importc: "aowl_sp_control", nodecl.}
+proc cSpNs(i: int32): int64 {.importc: "aowl_sp_ns", nodecl.}
+proc cSpCalls(i: int32): int64 {.importc: "aowl_sp_calls", nodecl.}
+proc cSpMax(i: int32): int64 {.importc: "aowl_sp_max", nodecl.}
+proc cSpSlowBy(i: int32): int64 {.importc: "aowl_sp_slow_by", nodecl.}
+proc cSpTotalNs(): int64 {.importc: "aowl_sp_total_ns", nodecl.}
+proc cSpTotalCalls(): int64 {.importc: "aowl_sp_total_calls", nodecl.}
+proc cSpTotalMax(): int64 {.importc: "aowl_sp_total_max", nodecl.}
+proc cSpSlowCalls(): int64 {.importc: "aowl_sp_slow_calls", nodecl.}
+proc cSpSlowNs(): int64 {.importc: "aowl_sp_slow_ns", nodecl.}
+proc cSpSlowUnexp(): int64 {.importc: "aowl_sp_slow_unexp", nodecl.}
+proc cSpDropped(): int64 {.importc: "aowl_sp_dropped", nodecl.}
+proc cSpSlowThresholdNs(): int64 {.importc: "aowl_sp_slow_ns_threshold", nodecl.}
+proc cSpSlots(): int32 {.importc: "aowl_sp_slots", nodecl.}
+proc cSpCtrlSlot(): int32 {.importc: "aowl_sp_ctrl_slot", nodecl.}
+
+const
+  SpPre     = 0'i32
+  SpRoots   = 1'i32
+  SpDescend = 2'i32
+  SpScan    = 3'i32
+  SpMaint   = 4'i32
+  SpDiag    = 5'i32
+
+const SpNames: array[7, string] = [
+  "PRE      liveness+staleness checks",
+  "ROOTS    scene-root enumeration (the allocating step)",
+  "DESCEND  splFindByName, by-name descent",
+  "SCAN     splScanNode, by-text scan inside the screen",
+  "MAINT    splMaintain, the steady-state re-assert",
+  "DIAG     diagnostics + summary string building",
+  "CONTROL  positive control (512 dependent adds)"]
+
 # ---- state (gSplOn / gSplForceOffline are set in the flag pass in aowlhost.nim) ----
 var gSplOn = false                 ## the `singleplayerRebrand` flag; DEFAULT OFF
 var gSplForceOffline = false       ## the `forceOfflinePractice` flag; DEFAULT ON.
@@ -213,6 +264,36 @@ var gSplScreen: Il2CppPtr = nil    ## the cached "Matchmaker Offline Raid Screen
                                    ## READABLE with m_CachedPtr zeroed (fact
                                    ## #182), so `duOk` alone is not enough and
                                    ## `iUnityAlive` is always asked too.
+
+# ---- THE THIRD CACHE LEVEL: the UI ROOT ("Menu UI"). ----------------------
+# MEASURED, by the drain profiler: `splRebrandDrain` averaged 1152.2us/frame
+# with a MAX of 194373.3us -- a 194 ms single call, in a rider whose own walk
+# carries an 18 ms slice. The slice cannot cover it because `iSceneRoots` runs
+# BEFORE the slice starts and takes no deadline at all: it enumerates EVERY
+# scene SceneManager lists AND the anchor scene, calling
+# `Scene::GetRootGameObjects` (a managed array allocation) per scene and
+# `GameObject::get_transform` + klass notes per root. The comment on `splAnchor`
+# already records that one of those scenes enumerates 197-274 roots -- and the
+# offline-raid screen is in NONE of them. It is in the anchor's own
+# DontDestroyOnLoad scene, under "Menu UI".
+#
+# So the enumeration was paying for every scene in the game to reach one root we
+# can name. This caches that root, and its scene handle, and asks Unity for only
+# THAT scene when the cache is cold. The cached root is liveness-checked
+# (`duOk` + `iUnityAlive`) on every use, exactly like `gSplScreen` -- fact #182
+# says a destroyed Object stays readable, so `duOk` alone is not an answer.
+var gSplUiRoot: Il2CppPtr = nil    ## the cached "Menu UI" root TRANSFORM
+var gSplUiRootName = ""            ## which of the UI roots it is (for the log)
+var gSplFullWalks = 0              ## how many FULL (all-scene) enumerations ran
+var gSplNarrowWalks = 0            ## how many anchor-scene-only enumerations ran
+var gSplUiRootHits = 0             ## hunts that skipped enumeration entirely
+var gSplFullWalkAt = 0'u64         ## last full walk, ms -- it is throttled hard
+const SplFullWalkEveryMs = 10000'u64
+  ## The all-scene enumeration is the 194 ms step. It is kept as a LAST RESORT
+  ## -- never removed -- so that if the screen ever moves out of the anchor
+  ## scene we still find it; but at most once per this interval, and only after
+  ## the narrow path has already failed on the same pass. Removing it would make
+  ## "not found" unfalsifiable for a screen that moved.
 
 # ---- the falsifiable flash measurement (CLAUDE.md 9b) ----
 # Frames between OBSERVING the stock BSG caption on the live TMP and reading OUR
@@ -433,6 +514,37 @@ proc splAnchor(): Il2CppPtr =
   if gInspPreloader != nil and duOk(gInspPreloader, 0x20'i32):
     return gInspPreloader
 
+proc splUiRootLive(): Il2CppPtr =
+  ## The cached UI root ("Menu UI"), or nil. Liveness-checked every time: a
+  ## destroyed UnityEngine.Object stays READABLE with m_CachedPtr zeroed (fact
+  ## #182), so `duOk` alone would hand back a corpse.
+  result = nil
+  if gSplUiRoot == nil: return
+  if not duOk(gSplUiRoot, 0x20'i32) or not iUnityAlive(gSplUiRoot):
+    gSplUiRoot = nil
+    return
+  result = gSplUiRoot
+
+proc splAnchorSceneRoots(roots: var seq[Il2CppPtr]): bool =
+  ## THE NARROW ENUMERATION: only the scene our own live anchor belongs to --
+  ## the DontDestroyOnLoad scene, which is where the offline-raid screen is and
+  ## which SceneManager excludes by design. One `Scene::GetRootGameObjects`,
+  ## not one per scene in the game.
+  ##
+  ## Returns false when it COULD NOT LOOK (no anchor, or Unity would not say
+  ## which scene the anchor is in). False is a refusal, never "no roots" --
+  ## flattening those two is how a bounded search comes to report a confident
+  ## "not present" (CLAUDE.md 9b).
+  result = false
+  let anchor = splAnchor()
+  if anchor == nil: return
+  var haveHandle = false
+  let ah = iAnchorSceneHandle(haveHandle, anchor)
+  if not haveHandle: return
+  var bound = 0
+  iRootsOfHandle(ah, "", roots, false, bound)
+  result = true
+
 proc splFindScreen(): Il2CppPtr =
   ## The "Matchmaker Offline Raid Screen" transform. Reaches DontDestroyOnLoad
   ## via our own durable anchor (NOT the inspector), and gives EACH root the full
@@ -440,20 +552,78 @@ proc splFindScreen(): Il2CppPtr =
   ## whatever was walked before it. Sets `gSplLastWhy`/`gSplLastNodes` so the
   ## caller can log WHY, rate-limited -- a nil here used to be silent, which is
   ## what hid this bug (CLAUDE.md 6/9b).
+  ##
+  ## THREE COST TIERS, cheapest first. Only the third one is the 194 ms step.
+  ##   1. the cached "Menu UI" root is live -> descend from it. NO enumeration,
+  ##      no managed allocation, ~100 nodes to a shallow screen.
+  ##   2. the anchor's OWN scene only -> one GetRootGameObjects.
+  ##   3. every scene (`iSceneRoots`) -> the historical path, now a THROTTLED
+  ##      last resort so a screen that moves scenes is still findable.
   result = nil
   gSplLastNodes = 0
+
+  # ---- Tier 1: descend straight from the cached UI root. ----
+  let cachedRoot = splUiRootLive()
+  if cachedRoot != nil:
+    inc gSplUiRootHits
+    var budget = SplNodeBudget
+    let dl = cNowMs() + SplWalkMs
+    let tD = cSpNow()
+    let m = splFindByName(cachedRoot, SplScreenName, SplFindDepth, budget, dl)
+    cSpAdd(SpDescend, tD)
+    gSplLastNodes = gSplLastNodes + (SplNodeBudget - budget)
+    if m != nil:
+      gSplLastWhy = ""
+      return m
+    # Not under the cached root THIS pass. That is the normal answer while the
+    # offline-raid screen is closed, so it is NOT a reason to drop the cache --
+    # dropping it would put us back on the expensive path every pass.
+    gSplLastWhy = "screen \"" & SplScreenName & "\" is not under the cached UI " &
+      "root \"" & gSplUiRootName & "\" (" & $gSplLastNodes & " nodes, " &
+      $int(SplWalkMs) & " ms slice). Normal while the offline-raid screen is " &
+      "not open."
+    # Fall through to a wider look only when the expensive path is due. Stamp
+    # the clock HERE, on the decision to go wide -- not inside tier 3, which
+    # normally does not run at all once tier 2 returns roots. Stamping only in
+    # tier 3 would leave this test true on every pass and hand back the
+    # per-frame enumeration this change exists to remove.
+    if cNowMs() - gSplFullWalkAt < SplFullWalkEveryMs:
+      return
+    gSplFullWalkAt = cNowMs()
+
   let anchor = splAnchor()
   var roots: seq[Il2CppPtr] = @[]
-  discard iSceneRoots(roots, false, anchor)
+
+  # ---- Tier 2: the anchor's own scene only. ----
+  let tR = cSpNow()
+  let narrowOk = splAnchorSceneRoots(roots)
+  if narrowOk: inc gSplNarrowWalks
+  # ---- Tier 3: every scene -- the 194 ms step, throttled, never removed. ----
+  # Escalate when the narrow scene gave NOTHING, or when it gave roots but none
+  # of them was a UI root -- otherwise a screen that moved to another scene
+  # would be permanently unfindable and "not found" would stop being falsifiable.
+  if (roots.len == 0 or gSplUiRoot == nil) and
+     cNowMs() - gSplFullWalkAt >= SplFullWalkEveryMs:
+    gSplFullWalkAt = cNowMs()
+    inc gSplFullWalks
+    roots.setLen(0)          # iSceneRoots enumerates the anchor scene too
+    discard iSceneRoots(roots, false, anchor)
+  cSpAdd(SpRoots, tR)
   if roots.len == 0:
+    # THREE OUTCOMES, never two: no anchor / could-not-look / looked-and-empty.
     gSplLastWhy = (if anchor == nil:
-      "iSceneRoots returned NO roots and this feature has no durable anchor " &
-      "yet (gSplUpdatePreloader/gInspPreloader both null). This resolves once a " &
+      "no roots, and this feature has no durable anchor yet " &
+      "(gSplUpdatePreloader/gInspPreloader both null). This resolves once a " &
       "PreloaderUI::Update rider slot has been claimed and the menu is ticking " &
       "-- independent of liveInspector."
+      elif not narrowOk:
+      "I COULD NOT LOOK: there IS a durable anchor, but " &
+      "GameObject::get_scene_Injected would not say which scene it is in, so " &
+      "the anchor-scene enumeration never ran. This is a REFUSAL, not " &
+      "\"no roots\"."
       else:
-      "iSceneRoots returned NO roots even WITH a durable anchor -- the menu is " &
-      "likely not up yet.")
+      "the anchor's own scene enumerated ZERO roots -- the menu is likely not " &
+      "up yet.")
     return
   let deadline = cNowMs() + SplWalkMs
   # Pass 1 -- the UI-bearing roots BY NAME ("Menu UI"/"Common UI"), where the
@@ -480,8 +650,18 @@ proc splFindScreen(): Il2CppPtr =
           dbgRoots = dbgRoots & "[" & nm & "]"      # dump once, on the first pass
         if nm == want:
           dbgUiMatched = dbgUiMatched + 1
+          # CACHE THE UI ROOT. This is the whole point of the change: every
+          # later hunt starts here and never enumerates a scene again while
+          # this root is alive. It is re-validated (duOk + iUnityAlive) on
+          # every use by `splUiRootLive`, so a menu teardown drops it and the
+          # enumeration comes back -- the cache cannot outlive its object.
+          if want == SplUiRoot0 or gSplUiRoot == nil:
+            gSplUiRoot = r
+            gSplUiRootName = nm
           var budget = SplNodeBudget
+          let tD2 = cSpNow()
           let m = splFindByName(r, SplScreenName, SplFindDepth, budget, deadline)
+          cSpAdd(SpDescend, tD2)
           gSplLastNodes = gSplLastNodes + (SplNodeBudget - budget)
           if m != nil:
             gSplLastWhy = ""
@@ -497,7 +677,9 @@ proc splFindScreen(): Il2CppPtr =
       let nm = iObjName(r)
       if nm != SplUiRoot0 and nm != SplUiRoot1:
         var budget = SplNodeBudget                 # per-ROOT budget, reset each root
+        let tD3 = cSpNow()
         let m = splFindByName(r, SplScreenName, SplFindDepth, budget, deadline)
+        cSpAdd(SpDescend, tD3)
         gSplLastNodes = gSplLastNodes + (SplNodeBudget - budget)
         if m != nil:
           gSplLastWhy = ""
@@ -839,6 +1021,10 @@ proc splRebrandTickBody(a: Il2CppPtr): Il2CppPtr {.
   ## sentinel on clean completion; the guard returns nil if this faulted.
   result = cast[Il2CppPtr](1)
   discard a
+  # THE POSITIVE CONTROL, in the same call, on the same clock, through the same
+  # bracket. Its printed cost is what rules out "the meter is lying".
+  cSpControl()
+  let tPre = cSpNow()
 
   # The cached SCREEN is validated on its own, every pass, before anything is
   # allowed to reuse it. `duOk` is not sufficient: a destroyed UnityEngine.Object
@@ -865,6 +1051,8 @@ proc splRebrandTickBody(a: Il2CppPtr): Il2CppPtr {.
     gSplConfirmed = false
     gSplSummaryLogged = false
 
+  cSpAdd(SpPre, tPre)
+
   if not gSplResolved:
     # Reuse the validated screen when we have one; only walk the scene roots when
     # we do not. The walk is the allocating step and the reason discovery was
@@ -872,9 +1060,13 @@ proc splRebrandTickBody(a: Il2CppPtr): Il2CppPtr {.
     var screen = gSplScreen
     let reusedScreen = screen != nil
     if screen == nil:
+      # splFindScreen brackets its OWN phases (ROOTS / DESCEND) internally, so
+      # the decomposition stays disjoint: no bracket here would double-count.
       screen = splFindScreen()
     if screen == nil:
+      let tG0 = cSpNow()
       splDiag(gSplLastWhy)                # announce WHY, rate-limited (was silent)
+      cSpAdd(SpDiag, tG0)
       return
     gSplScreen = screen
     # A cached screen that keeps yielding nothing must NOT lock us out of the
@@ -886,32 +1078,41 @@ proc splRebrandTickBody(a: Il2CppPtr): Il2CppPtr {.
       if gSplRescanMisses > SplMaxRescanMiss:
         gSplRescanMisses = 0
         gSplScreen = nil
+        let tG1 = cSpNow()
         splDiag("the CACHED \"" & SplScreenName & "\" yielded no targets on " &
           $SplMaxRescanMiss & " consecutive re-scans; dropping the cached " &
           "screen and re-walking the scene roots.")
+        cSpAdd(SpDiag, tG1)
         return
     else:
       gSplRescanMisses = 0
     var budget = SplNodeBudget
     let deadline = cNowMs() + SplWalkMs
+    let tS = cSpNow()
     splScanNode(screen, SplScanDepth, budget, deadline)
+    cSpAdd(SpScan, tS)
     # Resolve only once every ACTIVE feature has the target it needs: the rebrand
     # needs the heading TMP, forceOfflinePractice needs the UpdatableToggle. A
     # missing one is "screen still building", not a failure -- retry.
     if gSplOn and gSplHeadTmp == nil:
+      let tG2 = cSpNow()
       splDiag("screen \"" & SplScreenName & "\" WAS found, but its heading TMP " &
         "(text containing \"" & SplHeadStock & "\") was not read within depth " &
         $SplScanDepth & "/" & $int(SplWalkMs) & " ms -- the screen may still be " &
         "building; retrying.")
+      cSpAdd(SpDiag, tG2)
       return                              # screen present but heading not read yet
     if gSplForceOffline and gSplToggle == nil:
+      let tG3 = cSpNow()
       splDiag("screen \"" & SplScreenName & "\" WAS found, but its practice " &
         "UpdatableToggle (under \"" & SplBlockerName & "\") was not read within " &
         "depth " & $SplScanDepth & "/" & $int(SplWalkMs) & " ms -- the screen " &
         "may still be building; retrying.")
+      cSpAdd(SpDiag, tG3)
       return                              # screen present but toggle not read yet
     gSplResolved = true
     gSplRescanMisses = 0
+    let tG4 = cSpNow()
     okLog "singleplayer rebrand: resolved on \"" & SplScreenName &
           "\" -- heading TMP " & (if gSplHeadTmp != nil: "found" else: "MISSING") &
           ", description TMP " & (if gSplDescTmp != nil: "found" else: "not found") &
@@ -924,8 +1125,11 @@ proc splRebrandTickBody(a: Il2CppPtr): Il2CppPtr {.
            else: "not found") &
           ". Walking from the live scene root, by displayed text -- no " &
           "hardcoded child path."
+    cSpAdd(SpDiag, tG4)
 
+  let tM = cSpNow()
   splMaintain()
+  cSpAdd(SpMaint, tM)
 
 proc splRebrandDrainTick() =
   ## Rides the `EFT.TarkovApplication::Update` drain (slot alias, no second
@@ -949,12 +1153,26 @@ proc splRebrandDrainTick() =
   #     screen, bounded by SplWalkMs.
   #   * nothing cached -> SplHuntFrames: `iSceneRoots` allocates and must not run
   #     per frame.
+  #   * UI ROOT cached, screen not -> SplCheapHuntFrames: a depth-8 name descent
+  #     from the cached "Menu UI" transform. NO scene enumeration and NO managed
+  #     allocation, so it can run every frame -- and THAT is the fix for the
+  #     user-visible half: the frame the offline-raid screen appears is the frame
+  #     we find it, instead of up to SplHuntFrames (~1 s) later.
   let every = (if gSplResolved: SplSteadyFrames
                elif gSplScreen != nil: SplRescanFrames
+               elif gSplUiRoot != nil: SplCheapHuntFrames
                else: SplHuntFrames)
   if gSplFrames < every: return
   gSplFrames = 0
-  if cSplTickGuarded(nil) == nil:
+  # THE OUTER BRACKET: the WHOLE guarded call, strictly OUTSIDE
+  # `cSplTickGuarded` -- `aowl_p_p_seh` is not re-entrant and this opens no
+  # guard of its own. It is what makes `accounted of TOTAL` an honest ratio
+  # rather than a comparison of two instruments.
+  cSpCallBegin()
+  let tCall = cSpNow()
+  let rc = cSplTickGuarded(nil)
+  cSpCallEnd(tCall)
+  if rc == nil:
     inc gSplFaults
     warn "singleplayer rebrand: the guarded body faulted (" & $gSplFaults &
          " of " & $SplMaxFaults & ")"
@@ -963,3 +1181,93 @@ proc splRebrandDrainTick() =
       warn "singleplayer rebrand: too many faults; switching itself off for " &
            "this session and leaving the stock screen alone. This is a " &
            "REFUSAL, not a success."
+
+# ---------------------------------------------------------------------------
+# THE PHASE REPORT. Emitted by `drainprof.nim` on the same throttle as the
+# drain-profiler line, so the row and its decomposition are always read from
+# the same run.
+# ---------------------------------------------------------------------------
+proc splProfUs(ns: int64): string =
+  ## Microseconds, to one decimal, with the unit ATTACHED. `n/a` for a sentinel.
+  ## A sentinel is never printed as a value -- a `0.0us` reads as "free".
+  if ns < 0: return "n/a"
+  let tenths = (ns * 10'i64) div 1000'i64
+  $(tenths div 10) & "." & $(tenths mod 10) & "us"
+
+proc splProfPct(part, whole: int64): string =
+  if whole <= 0: return "n/a"
+  let t = (part * 1000'i64) div whole
+  $(t div 10) & "." & $(t mod 10) & "%"
+
+proc splProfLines(): seq[string] =
+  ## The disjoint, exhaustive decomposition of the `splRebrandDrain` row.
+  ## Prints `accounted=X of Y us (Z%)` and then, ALWAYS, the UNEXPLAINED
+  ## remainder as its own line -- the remainder is never folded into a phase.
+  result = @[]
+  let totalNs = cSpTotalNs()
+  let totalCalls = cSpTotalCalls()
+  if totalCalls <= 0:
+    result.add "  splRebrandDrain phases: the rider NEVER RAN under the meter " &
+      "(0 bracketed calls). This is \"not measured\", NOT \"free\"."
+    return
+  var accounted = 0'i64
+  let slots = cSpSlots()
+  var i = 0'i32
+  while i < slots and i < 7'i32:
+    if i != cSpCtrlSlot():
+      accounted = accounted + cSpNs(i)
+    inc i
+  result.add "  splRebrandDrain PHASE METER -- " & $totalCalls &
+    " bracketed calls, TOTAL " & splProfUs(totalNs) & ", mean " &
+    splProfUs(totalNs div totalCalls) & "/call, MAX " &
+    splProfUs(cSpTotalMax()) & ". All durations MICROSECONDS."
+  i = 0'i32
+  while i < slots and i < 7'i32:
+    let c = cSpCalls(i)
+    let ns = cSpNs(i)
+    let nm = (if int(i) < SpNames.len: SpNames[int(i)] else: "slot " & $int(i))
+    if c <= 0:
+      # RULE 4: "never ran" is not "cheap". It never prints as 0.0us.
+      result.add "    " & nm & ": NEVER RAN (0 calls) -- unmeasured, not free."
+    else:
+      result.add "    " & nm & ": " & splProfUs(ns) & " over " & $c &
+        " calls (mean " & splProfUs(ns div c) & ", max " &
+        splProfUs(cSpMax(i)) & ", " & splProfPct(ns, totalNs) & " of total)"
+    inc i
+  result.add "    accounted=" & splProfUs(accounted) & " of " &
+    splProfUs(totalNs) & " (" & splProfPct(accounted, totalNs) &
+    "); CONTROL is excluded from `accounted` on purpose -- it is the honesty " &
+    "probe, not work the feature does."
+  let unex = totalNs - accounted
+  result.add "    UNEXPLAINED: " & splProfUs(unex) & " (" &
+    splProfPct(unex, totalNs) & ") is OUTSIDE every bracket -- guard entry/exit " &
+    "and any statement no phase covers. If this is large the decomposition is " &
+    "WRONG and the phases above must not be trusted."
+  # THE TAIL, which is a different question from the mean.
+  let slow = cSpSlowCalls()
+  if slow <= 0:
+    result.add "    TAIL: NO call exceeded " & splProfUs(cSpSlowThresholdNs()) &
+      " in this run."
+  else:
+    var by = ""
+    i = 0'i32
+    while i < slots and i < 7'i32:
+      if cSpSlowBy(i) > 0:
+        let nm = (if int(i) < SpNames.len: SpNames[int(i)] else: $int(i))
+        by = by & " [" & nm & " x" & $cSpSlowBy(i) & "]"
+      inc i
+    if cSpSlowUnexp() > 0:
+      by = by & " [NO PHASE DOMINATED x" & $cSpSlowUnexp() & "]"
+    result.add "    TAIL: " & $slow & " of " & $totalCalls &
+      " calls exceeded " & splProfUs(cSpSlowThresholdNs()) & " (" &
+      splProfPct(slow, totalCalls) & " of calls, " &
+      splProfPct(cSpSlowNs(), totalNs) & " of total time). Dominated by:" & by &
+      ". \"Dominated\" = one phase held over half that call."
+  result.add "    discovery ladder: UI-root cache hits=" & $gSplUiRootHits &
+    ", anchor-scene-only enumerations=" & $gSplNarrowWalks &
+    ", FULL all-scene enumerations=" & $gSplFullWalks &
+    " (the last is the 194ms step; it is throttled to one per " &
+    $int(SplFullWalkEveryMs div 1000'u64) & "s and kept only so a screen that " &
+    "MOVED scenes stays findable). cached UI root=" &
+    (if gSplUiRoot != nil: "\"" & gSplUiRootName & "\"" else: "NONE") &
+    ", dropped samples=" & $cSpDropped() & "."
