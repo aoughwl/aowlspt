@@ -35,7 +35,8 @@ takes ad-hoc literals, repeatable, ADDITIVE to the markers:
         --contains "launchHint WRITTEN to aowl.uihub" \
         --contains "/aowlspt/settings/aowl.uihub"
     python tools/deploy.py check --artifact PATH --only settingshub \
-        --absent "Settings Panel"          # prove a REMOVAL
+        --absent "Settings Panel" \
+        --control "a literal you KNOW is there"   # prove a REMOVAL
     ... --encoding utf8|utf16|any          # default any
 
 A literal is searched in the RAW BYTES as UTF-8 *and* UTF-16LE, and the
@@ -51,9 +52,19 @@ assembled from fragments (or from variables, or a C function name from
 contiguously. A `--contains` miss is therefore reported as NO-MATCH and is
 INCONCLUSIVE (exit 3), not FAIL -- with the longest word-run of the literal
 that IS present, which usually shows you where the split is. Pick a
-substring that lives inside ONE source fragment. `--absent` carries the same
-caveat, and returns INCONCLUSIVE rather than PASS when a long fragment of
-the literal survives.
+substring that lives inside ONE source fragment.
+
+`--absent` carries the same caveat and is likewise THREE-way. It FAILs on a
+contiguous hit (reported with the byte offset), is INCONCLUSIVE when MOST of
+the literal survives as word-runs -- the shape of a `&`-split sentence rather
+than of a removal -- and PASSes only when the miss is backed by a POSITIVE
+CONTROL: a literal known to be in the artifact that the same search DOES
+find, by default one of the artifact's own declared markers, or `--control
+LIT`. Without a control that matches, "not found" cannot be told apart from
+"we could not look", so it is INCONCLUSIVE. The previous version treated any
+surviving 6-character word-run as INCONCLUSIVE, which made `--absent` unable
+to PASS at all on a sentence -- a check with no reachable pass, the mirror of
+the defect in 9b -- and quoted that one short generic run as the evidence.
 
 `--contains` is a CLI argument on purpose: `tools/deploy.json`'s marker list
 must never be edited to make a check pass, and a passing literal can only
@@ -639,6 +650,14 @@ FRAGMENT_NOTE = (
 # Below this many characters a "longest present fragment" is noise ("the ").
 _MIN_FRAGMENT = 6
 
+# For `--absent`: what share of the literal has to still be present, as
+# word-aligned fragments, before a non-contiguous miss is read as "this was
+# merely SPLIT, not removed". Below it the leftovers are generic English
+# ("the walk finished") that any binary of this size carries, and treating
+# those as evidence made `--absent` unable to pass AT ALL -- a check with no
+# reachable PASS is the same defect class as one with no reachable FAIL.
+_ABSENT_COVERAGE = 0.60
+
 
 def _fragments(lit):
     """Contiguous whitespace-delimited word runs of `lit`, longest first.
@@ -672,7 +691,74 @@ def _longest_present_fragment(blob, encs, lit):
     return None, []
 
 
-def verify_literals(src, contains, absent, mode, C):
+def _fragment_cover(blob, encs, lit):
+    """Greedily decompose `lit` into the longest word-aligned runs present.
+
+    Returns (fragments, covered_chars), fragments as (text, encodings) in
+    source order. This models the ONE thing a non-contiguous miss has to be
+    distinguished from: a Nim `&` concatenation is stored as several separate
+    rodata strings, so the whole sentence is missing from the bytes while
+    every piece of it is present. Near-total coverage is that shape; a single
+    short generic run is not.
+
+    A miss with LOW coverage is what a genuine removal looks like, and the
+    number is reported either way so the reader can judge rather than trust.
+    """
+    parts = re.split(r"(\s+)", lit)                 # words AND separators
+    n = len(parts)
+    frags = []
+    covered = 0
+    a = 0
+    while a < n:
+        best = None
+        for b in range(n - 1, a - 1, -2):           # longest run at word `a`
+            frag = "".join(parts[a:b + 1])
+            if len(frag) < _MIN_FRAGMENT or frag == lit:
+                continue
+            hits = [lbl for lbl, enc in encs if blob.find(enc(frag)) >= 0]
+            if hits:
+                best = (frag, hits, b)
+                break
+        if best is None:
+            a += 2
+            continue
+        frags.append((best[0], best[1]))
+        covered += len(best[0])
+        a = best[2] + 2
+    return frags, covered
+
+
+def _find_at(blob, encs, lit):
+    """(encodings, first byte offset) of a contiguous hit, or ([], -1)."""
+    hits = []
+    off = -1
+    for lbl, enc in encs:
+        i = blob.find(enc(lit))
+        if i >= 0:
+            hits.append(lbl)
+            if off < 0 or i < off:
+                off = i
+    return hits, off
+
+
+def _pick_control(blob, encs, controls):
+    """The first positive control that DOES match, or None.
+
+    A positive control is a literal already known to be in this artifact --
+    by default the artifact's own declared markers from deploy.json, which is
+    data this tool is forbidden to edit. It is what makes an `--absent` PASS
+    mean something: it proves the encoding handling, the file and the needle
+    path can find text in these bytes, so "not found" is a finding and not
+    merely "we could not look" (CLAUDE.md 9b).
+    """
+    for label, lit in controls or []:
+        hits, off = _find_at(blob, encs, lit)
+        if hits:
+            return (label, lit, hits, off)
+    return None
+
+
+def verify_literals(src, contains, absent, mode, C, controls=None):
     """Assert raw-byte presence/absence of ad-hoc literals in ONE file.
 
     Additive to the marker check, never a substitute for it: markers say "this
@@ -707,10 +793,30 @@ def verify_literals(src, contains, absent, mode, C):
     literal that IS present is reported, which usually shows the split.
 
     `--absent` inherits the same limitation in the more dangerous direction:
-    a literal can be "absent" merely because it was assembled. A contiguous
-    hit is still a hard FAIL (the text is demonstrably there); a clean miss
-    PASSes but carries the caveat; and if a long word-run of the literal is
-    still present the removal is NOT demonstrated -- that is INCONCLUSIVE.
+    a literal can be "absent" merely because it was assembled. So it is
+    THREE-way, and each outcome has to be reachable:
+
+      FAIL          a contiguous hit -- the text is demonstrably still there,
+                    reported with its byte offset.
+      INCONCLUSIVE  the literal is not contiguous but most of it survives as
+                    word-runs (the shape of a `&`-split sentence), OR no
+                    positive control matched, so the search was never shown
+                    to be capable of finding anything here.
+      PASS          a miss, with low fragment coverage, AND a positive
+                    control that DID match.
+
+    The positive control is what stops this from being a check that cannot
+    fail in the other direction. By default it is the artifact's own declared
+    markers from deploy.json (data, never edited to make a check pass);
+    `--control` supplies one explicitly.
+
+    The earlier version treated ANY surviving word-run of >=6 characters as
+    INCONCLUSIVE, which made `--absent` UNABLE TO PASS on any sentence-length
+    literal -- a generic run like 'the walk finished' matches almost any
+    build -- and then printed that short shared fragment as if it were the
+    evidence for a verdict about a 50-character literal. Both are fixed:
+    coverage is measured over the whole literal and every surviving run is
+    listed with its size, never one cherry-picked fragment.
 
     Returns (verdict, lines). An unreadable file is INCONCLUSIVE too: nothing
     was searched, which is neither a pass nor a content failure (CLAUDE.md 9b).
@@ -762,35 +868,64 @@ def verify_literals(src, contains, absent, mode, C):
                          "still not proven here.")
         lines.append("    NOTE: %s" % FRAGMENT_NOTE)
         lines.append("    This is NOT proof the feature is absent.")
+    control = _pick_control(blob, encs, controls) if absent else None
     for lit in absent:
-        hits = [lbl for lbl, enc in encs if blob.find(enc(lit)) >= 0]
+        hits, off = _find_at(blob, encs, lit)
         if hits:
             bad += 1
-            lines.append("%sabsent%s   FAIL  %r  IS STILL PRESENT as %s"
-                         % (red, reset, lit, "+".join(hits)))
+            lines.append("%sabsent%s   FAIL  %r  IS STILL PRESENT as %s "
+                         "at byte offset %d (0x%x)"
+                         % (red, reset, lit, "+".join(hits), off, off))
             lines.append(where)
             continue
-        # The dangerous direction: this currently reads as proof of removal,
-        # and it is not. A literal is equally "absent" when it was merely
-        # assembled from fragments. If a long word-run of it IS present, the
-        # removal is very likely NOT done -- say so instead of passing.
-        frag, fhits = _longest_present_fragment(blob, encs, lit)
-        if frag:
+        # A miss is THREE-WAY, never two. It is a removal only if (a) the
+        # literal is not merely SPLIT across rodata fragments, and (b) the
+        # search demonstrably could have found it. Anything else is
+        # INCONCLUSIVE, and INCONCLUSIVE never exits as success.
+        frags, covered = _fragment_cover(blob, encs, lit)
+        ratio = (float(covered) / len(lit)) if lit else 0.0
+        cover_txt = ("%d of %d bytes (%.0f%%) of it survive as %d word-run(s)"
+                     % (covered, len(lit), ratio * 100.0, len(frags)))
+        reasons = []
+        if ratio >= _ABSENT_COVERAGE:
+            reasons.append(
+                "the literal is not contiguous, but %s -- the shape of a "
+                "sentence SPLIT across rodata fragments, not of a removal."
+                % cover_txt)
+        if control is None:
+            reasons.append(
+                "no positive control matched, so this search was never shown "
+                "to be CAPABLE of finding text in these bytes; \"not found\" "
+                "here is indistinguishable from \"we could not look\". Pass "
+                "--control with a literal you know is present%s."
+                % ("" if controls else
+                   " (this artifact declares no markers to use as one)"))
+        if reasons:
             unknown += 1
             lines.append("%sabsent%s   NO-MATCH  %r  (INCONCLUSIVE)"
                          % (yellow, reset, lit))
             lines.append(where)
-            lines.append("    the whole literal is not contiguous, but %r "
-                         "(%d bytes, as %s) IS still in the artifact -- the "
-                         "removal is NOT demonstrated."
-                         % (frag, len(frag), "+".join(fhits)))
+            for r in reasons:
+                lines.append("    %s" % r)
+            for frag, fhits in frags:
+                lines.append("      still present: %r (%d bytes, as %s)"
+                             % (frag, len(frag), "+".join(fhits)))
             lines.append("    NOTE: %s" % FRAGMENT_NOTE)
             continue
         lines.append("%sabsent%s   PASS  %r  in neither %s"
                      % (green, reset, lit, searched))
-        lines.append("    (caveat: %s -- so `absent` is evidence of removal, "
-                     "not proof, for any literal that was assembled.)"
-                     % FRAGMENT_NOTE)
+        lines.append(where)
+        lines.append("    positive control %r (%s) DOES match as %s at byte "
+                     "offset %d -- the search can find text in these bytes, "
+                     "so this miss is a finding."
+                     % (control[1], control[0], "+".join(control[2]),
+                        control[3]))
+        lines.append("    only %s, below the %.0f%% that would indicate a "
+                     "merely SPLIT literal."
+                     % (cover_txt, _ABSENT_COVERAGE * 100.0))
+        for frag, fhits in frags:
+            lines.append("      still present: %r (%d bytes, as %s)"
+                         % (frag, len(frag), "+".join(fhits)))
     if bad:
         return FAIL, lines
     return (INCONCLUSIVE if unknown else OK), lines
@@ -840,6 +975,7 @@ def cmd_check(args, cfg, C, check_data=True):
               % (dim, reset, override, arts[0]["name"]))
     contains = list(getattr(args, "contains", None) or [])
     absent = list(getattr(args, "absent", None) or [])
+    controls = list(getattr(args, "control", None) or [])
     encmode = getattr(args, "encoding", "any") or "any"
     bad = 0
     unknown = 0
@@ -850,8 +986,14 @@ def cmd_check(args, cfg, C, check_data=True):
         if contains or absent:
             # ADDITIVE. The literal scan can only make the verdict worse; a
             # passing --contains never masks a missing marker.
+            # Positive controls for `--absent`: explicit --control first,
+            # then this artifact's own markers -- literals a valid build is
+            # required to contain, taken from deploy.json as DATA.
+            ctrls = ([("--control", c) for c in controls]
+                     + [("declared marker", m)
+                        for m in art.get("markers", [])])
             lverdict, llines = verify_literals(src, contains, absent,
-                                               encmode, C)
+                                               encmode, C, ctrls)
             for ln in llines:
                 print("     %s" % ln)
             if lverdict == FAIL:
@@ -1368,9 +1510,22 @@ def main():
                         "in the artifact's raw bytes. Same encoding rules as "
                         "--contains -- and the same limitation, in the more "
                         "dangerous direction: a literal is equally 'absent' "
-                        "when it was merely assembled from fragments, so a "
-                        "clean miss is EVIDENCE of removal, not proof, and a "
-                        "surviving long fragment yields INCONCLUSIVE.")
+                        "when it was merely assembled from fragments. Three "
+                        "outcomes: FAIL if it is contiguously present (with "
+                        "the byte offset); PASS if it is missing, MOST of it "
+                        "is missing too, and a positive control DID match; "
+                        "INCONCLUSIVE (exit 3) if most of the literal "
+                        "survives as word-runs, or if no control matched.")
+    p.add_argument("--control", action="append", default=None,
+                   metavar="LITERAL",
+                   help="`check` only, repeatable: a literal you KNOW is in "
+                        "the artifact, used as the positive control that lets "
+                        "an --absent check reach PASS. Without one, the "
+                        "artifact's declared markers are tried; if none of "
+                        "them match either, every --absent miss is "
+                        "INCONCLUSIVE, because a search not shown to be "
+                        "capable of finding anything cannot demonstrate a "
+                        "removal.")
     p.add_argument("--encoding", default="any",
                    choices=["utf8", "utf16", "any"],
                    help="which encoding(s) --contains/--absent search "
@@ -1390,8 +1545,13 @@ def main():
 
     C = _color(not args.no_color and sys.stdout.isatty())
     cfg = load_config()
-    if (args.contains or args.absent) and args.command != "check":
-        sys.exit("--contains/--absent are only meaningful with `check`.")
+    if (args.contains or args.absent
+            or args.control) and args.command != "check":
+        sys.exit("--contains/--absent/--control are only meaningful with "
+                 "`check`.")
+    if args.control and not args.absent:
+        sys.exit("--control is the positive control for --absent; it does "
+                 "nothing on its own. Use --contains to assert presence.")
     if args.artifact and args.command != "check":
         sys.exit("--artifact is only meaningful with `check`: it verifies a "
                  "file in place and never copies anything.")
