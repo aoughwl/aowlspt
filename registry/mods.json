@@ -4,8 +4,8 @@
     "id": "aowl.registry.official",
     "name": "aowlspt official registry",
     "description": "Every mod built in this repository, plus the lists that name them. One file with one git history, so a mod list is a document you can send someone.",
-    "revision": 16,
-    "updated": "2026-08-28"
+    "revision": 17,
+    "updated": "2026-08-31"
   },
   "mods": [
     {
@@ -519,6 +519,40 @@
         "server",
         "bots",
         "data"
+      ]
+    },
+    {
+      "id": "aowl.loadammoanim",
+      "name": "Ammo Loading Animations",
+      "author": "aowlspt",
+      "version": "0.1.0",
+      "description": "First-person animation of hands thumbing rounds into a magazine while it loads, at a speed tied to your Mag Drills skill. A port of Manimal's ManimalAmmoLoadingAnimations (MIT), whose animation bundle is reused verbatim. This is a host-native approximation, not a 1:1 port: the upstream mod injects a managed UsableItemController subclass, which IL2CPP does not allow, so we instantiate the bundle prefab directly and drive its Animator by verified static RVA. Lost relative to upstream: Fika co-op sync and ContinuousLoadAmmo compatibility. Default OFF, with a five-rung escalation ladder, because it detours the live magazine-loading flow.",
+      "pipeline": ">=0.1.0",
+      "sides": [
+        "client"
+      ],
+      "source": {
+        "kind": "intree",
+        "path": "mods/loadammoanim",
+        "url": null
+      },
+      "artifact": {
+        "dir": "loadammoanim",
+        "library": "loadammoanim.dll"
+      },
+      "upstream": "https://github.com/danauraborealis/ManimalAmmoLoadingAnimations",
+      "license": "MIT (upstream assets and design); see LICENSE.upstream.txt",
+      "download": null,
+      "requires": [],
+      "conflicts": [],
+      "provides": [],
+      "loadAfter": [
+        "aowl.textures"
+      ],
+      "tags": [
+        "client",
+        "animation",
+        "weapons"
       ]
     }
   ],
