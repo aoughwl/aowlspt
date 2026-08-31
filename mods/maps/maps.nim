@@ -386,6 +386,10 @@ proc readOpts(o: var HudOpts) =
   o.border          = asBool(setting("widgetBorder"), true)
   o.borderPx        = asFloat(setting("widgetBorderPx"), 2.0)
   o.backdropOpacity = asFloat(setting("widgetBackdropOpacity"), 1.0)
+  # The amber square near the pane centre. Defaults TRUE, which is byte-for-byte
+  # what every existing config already draws -- this switch exists so the thing
+  # is NAMED and removable, not to change anyone's map underneath them.
+  o.northPip        = asBool(setting("northPip"), true)
 
   o.fsEnabled = asBool(setting("hotkeys"), false)
   o.fsKey     = asText(setting("fullscreenKey"), "M")
@@ -512,6 +516,18 @@ proc spatialSchema(): seq[Setting] =
                               "the primitive count keeps meaning `things that " &
                               "can be seen`. Applies to the full-screen " &
                               "overlay too -- it is the same renderer"),
+    boolSetting("northPip", "Draw the north pip (the small yellow dot)", true,
+                category = "Widget",
+                description = "The small AMBER square a short way from the " &
+                              "centre of the map -- the `yellow dot in front " &
+                              "of your player dot`. It marks world NORTH, not " &
+                              "your heading and not a contact: with `north up` " &
+                              "it is pinned to the top edge, and on a " &
+                              "heading-up map it swings round as you turn, " &
+                              "which is how you tell which way you are facing. " &
+                              "Turn it off and no amber primitive is submitted " &
+                              "at all. Applies to the minimap, the radar and " &
+                              "the full-screen overlay alike -- one renderer"),
     floatSetting("widgetBorderPx", "Border thickness (px)", 2.0, lo = 0.5,
                  hi = 16.0, step = 0.5, category = "Widget",
                  description = "Clamped in the draw mirror as well as here"),
@@ -1643,6 +1659,20 @@ proc mapsDiagText(): string =
     lFs = "INCONCLUSIVE  key " & gFsKeyName & " (kc=" & $gFsKeyKc &
           ") is bound but no draw participant is registered, so opening the " &
           "overlay would draw nothing. bind: " & hudKeyBindText()
+  elif hudFsRejected() > 0'i64:
+    # THE CONTROL-KEY CHECK -- the one that could have caught the any-key bug.
+    # On every tick where the bound key reads DOWN we also ask the same
+    # function about Joystick8Button19, which the player cannot be holding. If
+    # that says down too, the read is not honouring its keycode argument and
+    # the toggle is REFUSED rather than opening a panel over the raid.
+    # `toggles` alone can never fail this way, which is exactly why the bug
+    # shipped behind a green line.
+    lFs = "FAIL  the input read is INDISCRIMINATE: on " & $hudFsRejected() &
+          " of " & $hudFsKeyDowns() & " tick(s) where " & gFsKeyName &
+          " read down, a key the player cannot be holding " &
+          "(Joystick8Button19) read down in the SAME poll. Those toggles were " &
+          "REFUSED, so the overlay did not open on them. bind: " &
+          hudKeyBindText()
   elif hudFsToggles() == 0'i64:
     lFs = "INCONCLUSIVE  key " & gFsKeyName & " (kc=" & $gFsKeyKc &
           ") is armed and polled and has NEVER been pressed -- 0 toggles, so " &
@@ -1670,7 +1700,9 @@ proc mapsDiagText(): string =
     lFs = "PASS  open on " & $hudFsFrames() & " frame(s), rect matched the " &
           "screen square on all " & $hudFsRectOk() & " of them, and the small " &
           "widget submitted ZERO primitives on all " & $hudFsFrames() &
-          " of them (toggles=" & $hudFsToggles() & ", key=" & gFsKeyName &
+          " of them (toggles=" & $hudFsToggles() & " from " &
+          $hudFsKeyDowns() & " key-down tick(s), 0 refused by the " &
+          "control-key check, key=" & gFsKeyName &
           ", currently " & (if hudFsOpen(): "OPEN" else: "closed") &
           ", last overlay submit=" & $hudFsLastPrims() & " primitive(s)). " &
           "bind: " & hudKeyBindText()
@@ -2054,6 +2086,8 @@ proc mirrorDrift(): string =
            " mirror=" & anchorName(hudLiveAnchor())
   if w.border != hudLiveBorder():
     return "widgetBorder config=" & $w.border & " mirror=" & $hudLiveBorder()
+  if w.northPip != hudLiveNorthPip():
+    return "northPip config=" & $w.northPip & " mirror=" & $hudLiveNorthPip()
   if w.mapGrid != hudLiveGrid():
     return "mapGrid config=" & $w.mapGrid & " mirror=" & $hudLiveGrid()
   if w.drawArt != hudLiveDrawArt():
