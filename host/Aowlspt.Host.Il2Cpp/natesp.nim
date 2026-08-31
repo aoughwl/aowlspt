@@ -151,7 +151,14 @@ const
   NeSubSort    = 2'i32
   NeSubApply   = 3'i32
   NeSubVerdict = 4'i32
-  NeSubN       = 5'i32
+  NeSubGate    = 5'i32
+  NeSubLive    = 6'i32
+  NeSubN       = 7'i32
+proc cNeAccMeanNs(): int64 {.importc: "aowl_ne_acc_mean_ns", nodecl.}
+proc cNeAccSamples(): int64 {.importc: "aowl_ne_acc_samples", nodecl.}
+proc cNeVerdictEvery(): int32 {.importc: "aowl_ne_verdict_every", nodecl.}
+proc cNuCacheHits(): int64 {.importc: "aowl_nu_cache_hit_count", nodecl.}
+proc cNuCacheVerifies(): int64 {.importc: "aowl_nu_cache_verify_count", nodecl.}
 proc cNeBudgetNs(): int64 {.importc: "aowl_ne_budget_ns", nodecl.}
 proc cNeMinSamples(): int64 {.importc: "aowl_ne_min_samples", nodecl.}
 proc cNePhaseName(ph: int32): cstring {.importc: "aowl_ne_phase_name", nodecl.}
@@ -317,6 +324,12 @@ var gNeSetFail = 0    ## a layout setter refused on an otherwise good contact
 
 # the last verdict, so the diag and the report agree by construction
 var gNeVerdict = NeVInconclusive
+  ## The last READBACK verdict. It is a cached answer now, not a per-tick one.
+var gNeVerdictAt = 0'i64
+  ## The tick `gNeVerdict` was last actually measured on. 0 means "never", and
+  ## is what forces a fresh readback on the first RUN tick of every raid --
+  ## a throttle that could return a verdict from the PREVIOUS raid would be a
+  ## check that cannot fail.
 var gNeShown = 0
 var gNeOnScreen = 0
 var gNeDropped = 0
@@ -2138,6 +2151,35 @@ proc neCostLine(): string =
                " n=" & $cNeSubSamples(sb)
     sb = sb + 1'i32
 
+  # ---- THE ACCOUNTING IDENTITY -------------------------------------------
+  # THE ONE LINE THAT MAKES THE DECOMPOSITION FALSIFIABLE. Per-sub means CANNOT
+  # be added: `scan` has one fifth the samples of `apply`, so their means are
+  # taken over different populations and a hand-summed total is wrong by
+  # construction. This is a per-TICK sum, filed against the same tick's body,
+  # both drawn from the RUN population only.
+  #
+  # Read it as: anything missing from 100% is cost sitting outside every
+  # bracket, and that is the next place to look -- not a rounding remark.
+  let accMean = cNeAccMeanNs()
+  if cNeAccSamples() <= 0'i64 or mean <= 0'i64 or accMean < 0'i64:
+    result = result & ". accounted: NOT SAMPLED -- the phase decomposition is " &
+             "INCONCLUSIVE, which is not the same as complete"
+  else:
+    let accPct = int((accMean * 100'i64) div mean)
+    result = result & ". accounted=" & neUs(accMean) & " of " & neUs(mean) &
+             " (" & $accPct & "%) over " & $cNeAccSamples() & " RUN tick(s)" &
+             (if accPct >= 90:
+                " -- the sub-phases ACCOUNT FOR the body"
+              else:
+                " -- " & $(100 - accPct) & "% of the body is OUTSIDE every " &
+                "sub-bracket and is therefore UNEXPLAINED; do not read the " &
+                "sub-phase lines as the answer")
+
+  # The verify cache, stated so its benefit is measured and not assumed: hits
+  # are calls that skipped a GetModuleHandleA + VirtualQuery + snapshot memcmp.
+  result = result & ". nuFn: " & $cNuCacheHits() & " cached / " &
+           $cNuCacheVerifies() & " full verify(s)"
+
   # Every other phase, named, so nothing is silently folded into the budgeted
   # one and a fat discovery walk is visible as a discovery walk.
   var ph = 0'i32
@@ -2172,6 +2214,19 @@ proc neColourLine(): string =
              neF(cNeFactionRgba(f, 3'i32)) & ")"
     inc f
 
+proc neVerdictAge(): string =
+  ## THE AGE OF THE READBACK, stated on every verdict. The verdict is measured
+  ## every AOWL_NE_VERDICT_EVERY ticks now, so "PASS" is an answer about a
+  ## recent tick, not this one -- and a reader who is not told that will treat
+  ## a stale PASS as a live one. Three outcomes, as always: never-measured is
+  ## its own answer and is NOT a pass.
+  if gNeVerdictAt <= 0'i64:
+    " (readback: NEVER measured in this raid -- INCONCLUSIVE, not a pass)"
+  else:
+    " (readback measured " & $(gNeTicks - gNeVerdictAt) & " tick(s) ago; it " &
+    "runs every " & $int(cNeVerdictEvery()) & " ticks, throttled because it " &
+    "is 3 il2cpp calls per box and was 6.8ms of a 14.5ms tick)"
+
 proc neVerdictBody(sw, sh: float64): string =
   case int(gNeVerdict)
   of 2:
@@ -2183,7 +2238,7 @@ proc neVerdictBody(sw, sh: float64): string =
       "of our own writes -- but it is still not proof a human can SEE them. " &
       "`activeInHierarchy` is TRANSITIVE, so a box reading back active is also " &
       "a readback of the whole parent chain box -> aowlspt-esp-root -> " &
-      neOriginName(gNeCanvasOrigin) & " canvas being active."
+      neOriginName(gNeCanvasOrigin) & " canvas being active." & neVerdictAge()
   of 1:
     "natesp VERDICT FAIL -- " & neCanvasLine() &
       ". Contacts exist but ZERO boxes read back active " &
@@ -2191,7 +2246,7 @@ proc neVerdictBody(sw, sh: float64): string =
       $gNeShown & " built=" & $gNeBuilt & " canvas=" & neF(gNeCanvasW) & "x" &
       neF(gNeCanvasH) & " screen=" & duFmt0(sw) & "x" & duFmt0(sh) &
       ". The pool exists and the placement ran; the finished state is empty. " &
-      neAccountLine() & "."
+      neAccountLine() & "." & neVerdictAge()
   else:
     "natesp VERDICT INCONCLUSIVE -- " & neCanvasLine() & ". " &
       readCString(cNeRefusalText(gNeWhy)) &
@@ -2234,7 +2289,14 @@ proc neTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ne_tick_body", cdecl.}
   cNeCtrlIn()
   var sw = 0.0
   var sh = 0.0
+  # EXHAUSTIVE BRACKETING. Every sub-bracket below is disjoint and together
+  # they cover the whole NeRun path, so `accounted` (mean of the per-tick sum,
+  # over mean of the body, both from the RUN population) is a number that can
+  # come out well under 100 and say so. A decomposition that summed to 11us of
+  # a 14460us body was not four cheap phases -- it was four phases and a hole.
+  cNeSubBegin(NeSubGate)
   let gate = neRaidGate(sw, sh)
+  cNeSubEnd(NeSubGate)
   if gate != NeRNone:
     # NOT a refusal to remember: the menu and the loading screen are legitimate
     # states. Drop back to waiting and tear nothing down unless the canvas
@@ -2266,6 +2328,7 @@ proc neTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ne_tick_body", cdecl.}
       gNeState = NeIdle
     gNeWhy = gate
     gNeVerdict = NeVInconclusive
+    gNeVerdictAt = 0            # the next RUN tick must MEASURE, not recall
     gNeCn = 0
     # PHASE TAGGING, not a reset edge. Every recorded tick is attributed to the
     # state that actually ran in it, so a teardown that sends the machine back
@@ -2308,7 +2371,10 @@ proc neTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ne_tick_body", cdecl.}
       neDestroyPool()
       neRefuse(NeRBuildFailed)
   of NeRun:
-    if not neLive(gNeCanvasTr) or not neActiveInHier(gNeCanvasGo):
+    cNeSubBegin(NeSubLive)
+    let canvasLive = neLive(gNeCanvasTr) and neActiveInHier(gNeCanvasGo)
+    cNeSubEnd(NeSubLive)
+    if not canvasLive:
       # the raid canvas went away (scene change): drop the pool and rediscover
       neDestroyPool()
       neDestroyOwnCanvas("the canvas stopped being alive/active in NeRun")
@@ -2320,6 +2386,8 @@ proc neTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ne_tick_body", cdecl.}
       gNeCreateTried = false
       gNeParentLine = "parent readback not run yet (torn down)"
       gNeState = NeIdle
+      gNeVerdict = NeVInconclusive
+      gNeVerdictAt = 0          # the pool is gone; the cached verdict is void
       cNeCostPhase(NePhGate)
       return cast[Il2CppPtr](1)
     # From here on this tick IS the steady state: the only phase under budget.
@@ -2329,9 +2397,18 @@ proc neTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ne_tick_body", cdecl.}
       neScan()
       cNeSubEnd(NeSubScan)
     nePlace(sw, sh)
-    cNeSubBegin(NeSubVerdict)
-    gNeVerdict = neVerdict(sw, sh)
-    cNeSubEnd(NeSubVerdict)
+    # THE READBACK VERDICT, THROTTLED -- NOT REPLACED BY BOOKKEEPING. It is
+    # still the same three game reads per box and it is still the only thing
+    # that can falsify "the boxes are on screen". It just answers a question
+    # about a STATE that is reported once every 5 seconds, so running it 300
+    # times per report was pure cost. `gNeVerdictAt` records WHEN, and the diag
+    # states the age, so a stale PASS cannot be read as a fresh one.
+    if (gNeTicks - gNeVerdictAt) >= int64(cNeVerdictEvery()) or
+       gNeVerdictAt == 0:
+      cNeSubBegin(NeSubVerdict)
+      gNeVerdict = neVerdict(sw, sh)
+      cNeSubEnd(NeSubVerdict)
+      gNeVerdictAt = gNeTicks
   else:
     discard
   cast[Il2CppPtr](1)

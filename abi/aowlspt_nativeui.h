@@ -661,7 +661,7 @@ static uint32_t aowl_nu_rva(int32_t i) {
  * `TMP_Text::set_text` and `LocalizedText::SetLabelText` are targets other
  * features touch, and a verify that reads a trampoline self-rejects with a
  * message blaming the game build. */
-static void* aowl_nu_fn(int32_t i) {
+static void* aowl_nu_fn_full(int32_t i) {
     HMODULE ga;
     const AowlNuTarget* t;
     unsigned char* p;
@@ -690,6 +690,62 @@ static void* aowl_nu_fn(int32_t i) {
     aowl_nu_verified++;
     return (void*)p;
 }
+
+/* ---- THE VERIFY CACHE, and why the verify is not weakened by it ---------
+ *
+ * MEASURED, not suspected: `aowl_nu_fn` was called on EVERY setter and EVERY
+ * getter, and each call did `GetModuleHandleA("GameAssembly.dll")` -- which
+ * takes the loader lock and walks the module list by name -- then a
+ * `VirtualQuery`, then a linear scan of the prologue snapshot and a memcmp.
+ * A steady natesp tick makes a few hundred of those. The natesp cost meter
+ * priced the two phases that do nothing else at 4.6ms (apply) and 6.8ms
+ * (verdict) out of a 14.5ms body, against sub-phases doing pure arithmetic at
+ * 1-12us. The per-call preamble WAS the feature's cost.
+ *
+ * What is cached is the RESULT of a verify that really happened, for a bounded
+ * time, and both the positive and the negative result -- a refused target must
+ * not re-run the full check (and re-warn) on every call either.
+ *
+ * WHAT THIS DOES NOT WEAKEN. The bytes are still compared against the STARTUP
+ * SNAPSHOT (`aowl_pro_verify`), the region is still required to be committed
+ * and executable, and the module is still required to be loaded. Every one of
+ * those is simply asked at most once per AOWL_NU_REVERIFY_MS per target
+ * instead of hundreds of times per frame. The exposure a cache adds is a
+ * window of at most that long in which a target patched by something else
+ * would still be called with the old verdict -- and this layer detours
+ * nothing, so nothing WE do can open that window.
+ *
+ * HONEST LIMIT: `GetTickCount64` has ~15ms resolution, so the window is
+ * "about 2 seconds", not exactly. That is deliberate -- a QPC read per call
+ * would put a clock back in the hot path this change exists to empty. */
+#define AOWL_NU_REVERIFY_MS 2000
+static void*    aowl_nu_cache[AOWL_NU_TARGET_COUNT];
+static uint64_t aowl_nu_cache_at[AOWL_NU_TARGET_COUNT];
+static int32_t  aowl_nu_cache_valid[AOWL_NU_TARGET_COUNT];
+static int64_t  aowl_nu_cache_hits = 0;
+static int64_t  aowl_nu_cache_verifies = 0;
+
+static void* aowl_nu_fn(int32_t i) {
+    uint64_t now;
+    void* p;
+    if (i < 0 || i >= AOWL_NU_TARGET_COUNT) return NULL;
+    /* The self-disable is NOT cacheable: it must take effect on the very next
+     * call, which is the whole point of a fault budget. */
+    if (aowl_nu_disabled()) { aowl_nu_why[i] = AOWL_NU_WHY_DISABLED; return NULL; }
+    now = (uint64_t)GetTickCount64();
+    if (aowl_nu_cache_valid[i] && (now - aowl_nu_cache_at[i]) < AOWL_NU_REVERIFY_MS) {
+        aowl_nu_cache_hits++;
+        return aowl_nu_cache[i];   /* may be NULL: a cached REFUSAL */
+    }
+    p = aowl_nu_fn_full(i);
+    aowl_nu_cache[i] = p;
+    aowl_nu_cache_at[i] = now;
+    aowl_nu_cache_valid[i] = 1;
+    aowl_nu_cache_verifies++;
+    return p;
+}
+static int64_t aowl_nu_cache_hit_count(void)    { return aowl_nu_cache_hits; }
+static int64_t aowl_nu_cache_verify_count(void) { return aowl_nu_cache_verifies; }
 
 /* Prime the snapshot for every target, at host startup, before any feature
  * has had a chance to patch one. Called from the same place the rest of the

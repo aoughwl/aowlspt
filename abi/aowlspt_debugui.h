@@ -598,7 +598,7 @@ static int32_t aowl_du_rejected = 0;
  * the point. */
 static unsigned char aowl_du_state[AOWL_DU_TARGET_COUNT];
 
-static void* aowl_du_fn(int32_t i) {
+static void* aowl_du_fn_full(int32_t i) {
     HMODULE ga;
     const AowlDuTarget* t;
     unsigned char* p;
@@ -623,6 +623,32 @@ static void* aowl_du_fn(int32_t i) {
     }
     if (aowl_du_state[i] == 0) { aowl_du_state[i] = 1; aowl_du_verified++; }
     return (void*)p;
+}
+
+/* The same verify cache `aowl_nu_fn` carries, for the same measured reason:
+ * `Camera::WorldToScreenPoint` and the player-position reads run per contact
+ * per tick, and each was paying a `GetModuleHandleA` + `VirtualQuery` +
+ * snapshot memcmp preamble. The verify still happens against the STARTUP
+ * SNAPSHOT and the region is still required committed+executable; it is asked
+ * at most once per AOWL_DU_REVERIFY_MS per target instead of per call. See the
+ * long note in aowlspt_nativeui.h for what this does and does NOT weaken. */
+#define AOWL_DU_REVERIFY_MS 2000
+static void*    aowl_du_cache[AOWL_DU_TARGET_COUNT];
+static uint64_t aowl_du_cache_at[AOWL_DU_TARGET_COUNT];
+static int32_t  aowl_du_cache_valid[AOWL_DU_TARGET_COUNT];
+
+static void* aowl_du_fn(int32_t i) {
+    uint64_t now;
+    void* p;
+    if (i < 0 || i >= AOWL_DU_TARGET_COUNT) return NULL;
+    now = (uint64_t)GetTickCount64();
+    if (aowl_du_cache_valid[i] && (now - aowl_du_cache_at[i]) < AOWL_DU_REVERIFY_MS)
+        return aowl_du_cache[i];       /* may be NULL: a cached REFUSAL */
+    p = aowl_du_fn_full(i);
+    aowl_du_cache[i] = p;
+    aowl_du_cache_at[i] = now;
+    aowl_du_cache_valid[i] = 1;
+    return p;
 }
 static const char* aowl_du_name(int32_t i) {
     if (i < 0 || i >= AOWL_DU_TARGET_COUNT) return "";

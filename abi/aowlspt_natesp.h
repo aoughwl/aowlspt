@@ -110,6 +110,21 @@
  * state cheap. Box rects are still updated EVERY tick from the last scan. */
 #define AOWL_NE_SCAN_EVERY    5
 
+/* THE READBACK VERDICT IS THROTTLED, NOT REMOVED. It asks the GAME, per box,
+ * for activeInHierarchy + anchoredPosition + sizeDelta -- three il2cpp calls
+ * for each of up to AOWL_NE_POOL boxes, i.e. the single most expensive thing
+ * a steady-state tick does, and it was measured at 6.8ms of a 14.5ms tick.
+ *
+ * Deleting it was never an option: it is the only check in this feature that
+ * cannot be satisfied by our own bookkeeping, and a self-comparison in its
+ * place would be a check that cannot fail (CLAUDE.md 9b). But it answers a
+ * question about a STATE, not about an EVENT, and the state is only ever
+ * REPORTED once every 5 seconds by the diag emit. Running it 300 times per
+ * report bought nothing. It now runs every N ticks; `gNeVerdict` holds the
+ * last real answer in between, and the diag line states the age of it so a
+ * stale PASS can never be read as a fresh one. */
+#define AOWL_NE_VERDICT_EVERY 30
+
 /* Self-disable after this many faults inside the guarded body. */
 #define AOWL_NE_MAX_FAULTS    6
 
@@ -348,6 +363,7 @@ static int32_t aowl_ne_max_seed_tries(void)  { return AOWL_NE_MAX_SEED_TRIES; }
 static int32_t aowl_ne_max_seed_skips(void)  { return AOWL_NE_MAX_SEED_SKIPS; }
 static int32_t aowl_ne_slice_ms(void)    { return AOWL_NE_SLICE_MS; }
 static int32_t aowl_ne_scan_every(void)  { return AOWL_NE_SCAN_EVERY; }
+static int32_t aowl_ne_verdict_every(void) { return AOWL_NE_VERDICT_EVERY; }
 static float   aowl_ne_min_canvas_px(void) { return AOWL_NE_MIN_CANVAS_PX; }
 static int32_t aowl_ne_canvas_sort_order(void) { return AOWL_NE_CANVAS_SORT_ORDER; }
 static int32_t aowl_ne_canvas_settle_ticks(void) { return AOWL_NE_CANVAS_SETTLE_TICKS; }
@@ -512,6 +528,11 @@ static int64_t aowl_ne_elapsed_ns(int64_t t0) {
     return ((aowl_ne_qpc() - t0) * 1000000000LL) / g_ne_qpf;
 }
 
+/* The accounting accumulator lives here, ABOVE `cost_begin`, because that is
+ * the first function that touches it. See the long note at the sub-brackets. */
+static aowl_ne_bucket g_ne_acc;
+static int64_t g_ne_acc_cur = 0;
+
 static void aowl_ne_cost_begin(void) {
     int64_t q = aowl_ne_qpc();
     /* The interval between consecutive tick STARTS. Sampled from the same
@@ -528,6 +549,7 @@ static void aowl_ne_cost_begin(void) {
     }
     g_ne_prev_t0 = q;
     g_ne_cost_t0 = q;
+    g_ne_acc_cur = 0;   /* the accounting identity is PER TICK */
     /* Default phase for a tick that faults before the body classified itself:
      * it is attributed, never silently dropped. */
     g_ne_phase = AOWL_NE_PH_GATE;
@@ -609,9 +631,22 @@ static int64_t aowl_ne_ctrl_samples(int32_t which) {
 #define AOWL_NE_SUB_SORT    2   /* pass 2: <=4096 float compares, no calls   */
 #define AOWL_NE_SUB_APPLY   3   /* pass 3: set_color / sizeDelta / SetActive */
 #define AOWL_NE_SUB_VERDICT 4   /* the readback: <=64 * 3 il2cpp calls       */
-#define AOWL_NE_SUB_N       5
+#define AOWL_NE_SUB_GATE    5   /* neRaidGate: rpDeployed, Camera.main, size */
+#define AOWL_NE_SUB_LIVE    6   /* the canvas liveness pair, 2 il2cpp calls  */
+#define AOWL_NE_SUB_N       7
 static aowl_ne_bucket g_ne_sub[AOWL_NE_SUB_N];
 static int64_t g_ne_sub_t0[AOWL_NE_SUB_N];
+
+/* ---- THE ACCOUNTING IDENTITY -------------------------------------------
+ * A decomposition that does not sum to the whole is not a decomposition; it is
+ * a hole with labels around it. Whatever the sub-brackets measure inside ONE
+ * tick is accumulated here, and `cost_end` files that total against the same
+ * tick's body. `accounted = mean(acc) / mean(body)` is therefore a ratio of
+ * two means over the SAME population -- unlike summing per-sub means, which
+ * are taken over different `n` (scan runs every Nth tick) and cannot be added.
+ *
+ * It is falsifiable in the direction that matters: if it comes out at 78%,
+ * 22% of the cost is somewhere no bracket is, and that is the answer. */
 static void aowl_ne_sub_begin(int32_t id) {
     if (id < 0 || id >= AOWL_NE_SUB_N) return;
     g_ne_sub_t0[id] = aowl_ne_qpc();
@@ -623,7 +658,13 @@ static void aowl_ne_sub_end(int32_t id) {
     g_ne_sub_t0[id] = 0;
     if (ns < 0 || ns > 10000000000LL) return;
     aowl_ne_bucket_add(&g_ne_sub[id], ns);
+    g_ne_acc_cur += ns;
 }
+static int64_t aowl_ne_acc_mean_ns(void) {
+    if (g_ne_acc.n <= 0) return -1;
+    return g_ne_acc.sum / g_ne_acc.n;
+}
+static int64_t aowl_ne_acc_samples(void) { return g_ne_acc.n; }
 static int64_t aowl_ne_sub_mean_ns(int32_t id) {
     if (id < 0 || id >= AOWL_NE_SUB_N || g_ne_sub[id].n <= 0) return -1;
     return g_ne_sub[id].sum / g_ne_sub[id].n;
@@ -643,6 +684,8 @@ static const char* aowl_ne_sub_name(int32_t id) {
     case AOWL_NE_SUB_SORT:    return "sort";
     case AOWL_NE_SUB_APPLY:   return "apply";
     case AOWL_NE_SUB_VERDICT: return "verdict";
+    case AOWL_NE_SUB_GATE:    return "gate";
+    case AOWL_NE_SUB_LIVE:    return "live";
     default: return "?";
     }
 }
@@ -669,6 +712,10 @@ static void aowl_ne_cost_end(void) {
      * how a meter stops being able to report a bad number. */
     if (ns < 0 || ns > 10000000000LL) { g_ne_dropped++; return; }
     aowl_ne_bucket_add(&g_ne_cost[g_ne_phase], ns);
+    /* Only the RUN phase is decomposed, so only RUN ticks may enter the
+     * accounting population -- mixing a gate tick (which runs no sub-bracket
+     * at all) into it would drag `accounted` down and read as a hole. */
+    if (g_ne_phase == AOWL_NE_PH_RUN) aowl_ne_bucket_add(&g_ne_acc, g_ne_acc_cur);
 }
 
 static void aowl_ne_cost_reset(void) {
@@ -681,7 +728,7 @@ static void aowl_ne_cost_reset(void) {
         aowl_ne_bucket z; memset(&z, 0, sizeof(z)); g_ne_sub[i] = z;
     }
     { aowl_ne_bucket z; memset(&z, 0, sizeof(z));
-      g_ne_gap = z; g_ne_ctrl_out = z; g_ne_ctrl_in = z; }
+      g_ne_gap = z; g_ne_ctrl_out = z; g_ne_ctrl_in = z; g_ne_acc = z; }
     g_ne_dropped = 0;
     /* t0 is deliberately LEFT ALONE: reset can be called from inside the
      * bracket, and clearing t0 there would make the enclosing tick vanish. */
