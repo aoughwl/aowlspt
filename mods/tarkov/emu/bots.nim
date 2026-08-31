@@ -894,23 +894,6 @@ type
     svOk        ## declared, and the filter accepts this template
     svBad       ## declared and refused, or not declared at all
 
-proc filterAccepts(def: JsonRef; tpl: string): bool =
-  ## `filters[0].Filter` / `ExcludedFilter`. A slot that declares no filter
-  ## constrains nothing and accepts everything -- that is stock behaviour and the
-  ## right reading; only a NON-EMPTY Filter is authoritative.
-  let f0 = def.field("_props").field("filters").at(0)
-  let f1 = if f0.found: f0 else: def.field("filters").at(0)
-  if not f1.found:
-    return true
-  let excluded = f1.field("ExcludedFilter")
-  if excluded.found and isArray(excluded) and count(excluded) > 0 and
-     listContains(excluded, tpl):
-    return false
-  let allow = f1.field("Filter")
-  if not allow.found or not isArray(allow) or count(allow) <= 0:
-    return true
-  result = listContains(allow, tpl)
-
 var gFixtureItems = ""
   ## A test-only item table, as raw JSON `{"<tpl>": {"_props": {...}}, ...}`.
   ## Empty in every real run, in which case the validator reads the real
@@ -935,6 +918,60 @@ proc itemMember(tpl, member: string): JsonRef =
   if not v.ok:
     return notFound()
   result = whole(v.raw)
+
+proc ancestry(tpl: string): seq[string] =
+  ## `<tpl>` followed by its `_parent` chain through `templates.items`, capped.
+  ##
+  ## THIS is what a slot filter is written against. Measured against the shipped
+  ## database on 2026-08-30: `templates.items.55d7217a4bdc2d86028b456d` (the
+  ## equipment root every bot hangs off) declares `Headwear` with a filter of
+  ## exactly ONE entry, `5a341c4086f77401f2541505` -- the Headwear *base class*,
+  ## not any concrete hat. An exact-membership test therefore refuses EVERY
+  ## helmet, vest, rig, backpack and weapon a bot is given; live, that dropped
+  ## 3,308 items in one raid, ~25 per bot, i.e. the entire loadout. The client
+  ## resolves the filter through the template inheritance chain, so we must too.
+  var out2: seq[string] = @[]
+  var cur = tpl
+  var hops = 0
+  while cur.len > 0 and hops < 12:
+    out2.add cur
+    let p = itemMember(cur, "_parent")
+    if not p.found:
+      break
+    let nxt = p.asText("")
+    if nxt.len == 0 or nxt == cur:
+      break
+    cur = nxt
+    hops = hops + 1
+  result = out2
+
+proc listContainsAny(list: JsonRef; names: seq[string]): bool =
+  for one in names:
+    if listContains(list, one):
+      return true
+  result = false
+
+proc filterAccepts(def: JsonRef; tpl: string): bool =
+  ## `filters[0].Filter` / `ExcludedFilter`, resolved through the template's own
+  ## inheritance chain (see `ancestry`). A slot that declares no filter
+  ## constrains nothing and accepts everything -- that is stock behaviour and the
+  ## right reading; only a NON-EMPTY Filter is authoritative.
+  let f0 = def.field("_props").field("filters").at(0)
+  let f1 = if f0.found: f0 else: def.field("filters").at(0)
+  if not f1.found:
+    return true
+  let excluded = f1.field("ExcludedFilter")
+  let allow = f1.field("Filter")
+  let hasExcl = excluded.found and isArray(excluded) and count(excluded) > 0
+  let hasAllow = allow.found and isArray(allow) and count(allow) > 0
+  if not hasExcl and not hasAllow:
+    return true
+  let chain = ancestry(tpl)
+  if hasExcl and listContainsAny(excluded, chain):
+    return false
+  if not hasAllow:
+    return true
+  result = listContainsAny(allow, chain)
 
 proc gridDeclares(parentTpl, slotName: string): bool =
   let g = itemMember(parentTpl, "_props.Grids")
@@ -972,6 +1009,49 @@ proc judgeSlot(parentTpl, slotName, tpl: string): SlotVerdict =
   if gridDeclares(parentTpl, slotName):
     return svGrid
   result = svBad
+
+var gDropKeys: seq[string] = @[]
+var gDropCounts: seq[int] = @[]
+  ## The permanent drop histogram: one bucket per
+  ## `<rule>|<parentTpl>|<childTpl>|<slotId>`. A total alone cannot tell an
+  ## over-rejecting validator from a mis-generating generator -- that is exactly
+  ## how "slot-dropped 3308" sat in the log for a whole raid reading like a
+  ## success. The buckets name the rule, so the next one is one grep.
+
+proc noteDrop(rule, parentTpl, childTpl, slotId: string) =
+  let key = rule & "|" & parentTpl & "|" & childTpl & "|" & slotId
+  for i in 0 ..< gDropKeys.len:
+    if gDropKeys[i] == key:
+      gDropCounts[i] = gDropCounts[i] + 1
+      return
+  if gDropKeys.len >= 400:
+    return
+  gDropKeys.add key
+  gDropCounts.add 1
+
+proc botDropHistogram*(top: int): string =
+  ## The top `top` buckets, most-dropped first, as `count rule|parent|child|slot`
+  ## lines. Empty string when nothing was dropped.
+  var order: seq[int] = @[]
+  for i in 0 ..< gDropKeys.len:
+    order.add i
+  for a in 0 ..< order.len:
+    for b in (a + 1) ..< order.len:
+      if gDropCounts[order[b]] > gDropCounts[order[a]]:
+        # Both sides read into locals first: `order[a] = order[b]` is rejected
+        # by this nimony as "mutable argument aliases with immutable parameter".
+        let ta = order[a]
+        let tb = order[b]
+        order[a] = tb
+        order[b] = ta
+  var out2 = ""
+  var shown = 0
+  for i in order:
+    if shown >= top:
+      break
+    out2 = out2 & "\n  " & $gDropCounts[i] & "  " & gDropKeys[i]
+    shown = shown + 1
+  result = out2
 
 proc validateSlots*(items: List; report: var seq[string];
                     kept: var seq[string]): int =
@@ -1042,11 +1122,13 @@ proc validateSlots*(items: List; report: var seq[string];
       discard
     of svBad:
       drop[i] = true
+      noteDrop("refused", parentTpl, tpl, slot)
       report.add "slot refused: " & tpl & " -> " & slot & " on " & parentTpl
     of svOk:
       let key = parent & "\x1f" & toLowerAscii(slot)
       if key in taken:
         drop[i] = true
+        noteDrop("duplicate", parentTpl, tpl, slot)
         report.add "slot already filled: " & tpl & " -> " & slot &
                    " on " & parentTpl
       else:
@@ -1067,6 +1149,8 @@ proc validateSlots*(items: List; report: var seq[string];
         if drop[j] and ids[j] == parent:
           drop[i] = true
           changed = true
+          noteDrop("descendant", tpls[j], tpls[i],
+                   at(doc, i).field("slotId").asText(""))
           break
 
   var removed = 0
@@ -1082,7 +1166,10 @@ proc botGuardCounters*(): string =
   ## The one line a live raid gets to say what happened, instead of nothing.
   "bots: chambered " & $gChambered & ", chamber-skipped " & $gChamberSkipped &
   " (no accepted round), slot-dropped " & $gSlotDropped &
-  ", slot-unjudged " & $gSlotUnknown
+  ", slot-unjudged " & $gSlotUnknown &
+  (if gSlotDropped > 0: ", top drops (count rule|parent|child|slot):" &
+                        botDropHistogram(10)
+   else: "")
 
 proc addLoadout(t: BotTables; items: var List; equipmentId: string;
                 r: var Rng) =
@@ -1526,8 +1613,16 @@ proc generateProfile*(t: BotTables; base: string; req: BotRequest;
     for s in survivors:
       cleaned.add s
     items = cleaned
-    aowlspt.warn("bots: dropped " & $removed &
-                 " invalid placement(s) from a bot: " & violations[0])
+    if removed > 6:
+      # A validator that quietly discards a whole loadout is the silent-success
+      # failure this file keeps producing. Six is above any plausible number of
+      # genuinely bad placements on one bot and far below a stripped one.
+      aowlspt.warn("bots: WARN dropped " & $removed & " placement(s) from ONE " &
+                   "bot -- that is a stripped loadout, not a stray extra: " &
+                   violations[0])
+    else:
+      aowlspt.warn("bots: dropped " & $removed &
+                   " invalid placement(s) from a bot: " & violations[0])
 
   var inventory = parseObject(field(base, "Inventory"))
   setRaw(inventory, "items", text(items))
@@ -1735,7 +1830,17 @@ const ChkItems = """{
   "rig": {"_props": {"Grids": [{"_name": "main",
                                 "_props": {"cellsH": 4, "cellsV": 4}}]}},
   "ammoOk": {"_props": {}},
-  "ammoNo": {"_props": {}}
+  "ammoNo": {"_props": {}},
+  "eqroot": {"_props": {"Slots": [
+    {"_name": "Headwear",
+     "_props": {"filters": [{"Filter": ["helmetClass"],
+                             "ExcludedFilter": ["helmetBanned"]}]}}]}},
+  "helmetClass": {"_props": {}},
+  "helmetReal": {"_parent": "helmetClass", "_props": {"Slots": [
+    {"_name": "mod_nvg", "_props": {"filters": [{"Filter": ["nvg"]}]}}]}},
+  "helmetBanned": {"_parent": "helmetClass", "_props": {}},
+  "nvg": {"_props": {}},
+  "notHelmet": {"_props": {}}
 }"""
   ## A five-template item table shaped exactly like the real one at the members
   ## the validator reads: a weapon with one chamber and one magazine slot, each
@@ -1945,6 +2050,21 @@ proc selfCheckBots*(into: var seq[string]): bool =
     v.add slotItem("r2", "mag", "nosuchparent", "main")        # unjudgeable
     v.add slotItem("x1", "mag", "a4", "mod_magazine")          # (e) orphan of d
     v.add slotItem("rig1", "rig", "", "")
+    # The inheritance cases. Stock equipment slots filter by BASE CLASS id, not
+    # by concrete template (`Headwear` on the equipment root names exactly one
+    # entry, the Headwear class), so an exact-membership test refuses every real
+    # helmet. Each of the three below fails for its OWN rule alone:
+    v.add slotItem("eq1", "eqroot", "", "")
+    v.add slotItem("h1", "helmetReal", "eq1", "Headwear")   # (f) via _parent
+    v.add slotItem("n1", "nvg", "h1", "mod_nvg")            # (g) mod under (f)
+    v.add slotItem("h2", "notHelmet", "eq1", "Headwear")    # (h) genuinely wrong
+    v.add slotItem("h3", "helmetBanned", "eq1", "Headwear") # (i) ExcludedFilter
+    # (h) is in the fixture so that "walk the parent chain" cannot degrade into
+    # "accept anything"; (i) so that ExcludedFilter is still consulted along the
+    # chain. (h) and (i) hang off `eq1` alongside (f), which is legal only
+    # because a REFUSED item never takes the slot -- if it did, (h)/(i) would be
+    # caught by the duplicate rule and the filter rule would go unexercised,
+    # which is exactly how rule 2 hid behind rule 3 above.
 
     var report: seq[string] = @[]
     var survivors: seq[string] = @[]
@@ -1959,19 +2079,21 @@ proc selfCheckBots*(into: var seq[string]): bool =
     let parsed = parseArray(whole(survivorText))
     if not parsed.ok:
       into.add "bots: validateSlots produced something that is not a JSON array"
-    if removed != 4:
+    if removed != 6:
       into.add "bots: validateSlots removed " & $removed &
-               " item(s); the fixture plants exactly 4 (duplicate chamber, " &
+               " item(s); the fixture plants exactly 6 (duplicate chamber, " &
                "filtered-out cartridge, undeclared slot, orphan of the " &
-               "undeclared slot)"
+               "undeclared slot, an item of the wrong class, an item its " &
+               "slot's ExcludedFilter names)"
     var survived: seq[string] = @[]
     for i in 0 ..< parsed.len:
       survived.add parsed.at(i).field("_id").asText("")
-    for bad in ["a2", "a3", "a4", "x1"]:
+    for bad in ["a2", "a3", "a4", "x1", "h2", "h3"]:
       if bad in survived:
         into.add "bots: an invalid placement (" & bad & ") survived the " &
                  "validator -- this is the placement FlatItemsToTree refuses"
-    for good in ["w1", "w2", "a1", "m1", "c1", "r1", "r2", "rig1"]:
+    for good in ["w1", "w2", "a1", "m1", "c1", "r1", "r2", "rig1",
+                 "eq1", "h1", "n1"]:
       if good notin survived:
         into.add "bots: the validator removed a LEGAL placement (" & good &
                  "); serving a bot without its gear is not the fix"
