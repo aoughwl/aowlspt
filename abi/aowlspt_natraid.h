@@ -171,6 +171,9 @@ static AowlNrTarget aowl_nr_targets[] = {
 #define AOWL_NR_WHY_DISABLED   5   /* the layer has self-disabled            */
 #define AOWL_NR_WHY_BADINDEX   6
 #define AOWL_NR_WHY_UNTRIED    7   /* never asked for                        */
+#define AOWL_NR_WHY_PROFULL    8   /* OURS: the shared prologue snapshot
+                                     * table was full; the RVA was never
+                                     * captured. NOT a client change. */
 
 static int32_t aowl_nr_why[AOWL_NR_TARGET_COUNT] = {
     AOWL_NR_WHY_UNTRIED, AOWL_NR_WHY_UNTRIED, AOWL_NR_WHY_UNTRIED,
@@ -186,6 +189,12 @@ static int32_t aowl_nr_disabled(void) {
 static void    aowl_nr_note_fault(void)  { aowl_nr_faults++; }
 static int32_t aowl_nr_fault_count(void) { return aowl_nr_faults; }
 static int32_t aowl_nr_target_count(void){ return AOWL_NR_TARGET_COUNT; }
+static int32_t aowl_nr_profull_count(void){
+    int32_t i, n = 0;
+    for (i = 0; i < AOWL_NR_TARGET_COUNT; i++)
+        if (aowl_nr_why[i] == AOWL_NR_WHY_PROFULL) n++;
+    return n;
+}
 
 static const char* aowl_nr_name(int32_t i) {
     if (i < 0 || i >= AOWL_NR_TARGET_COUNT) return "";
@@ -236,6 +245,14 @@ static void* aowl_nr_fn(int32_t i) {
         return NULL;
     }
     if (!aowl_pro_verify(t->rva, t->sig, t->siglen)) {
+        /* TWO DIFFERENT FAILURES, TWO DIFFERENT REASONS. A verify that failed
+         * because OUR snapshot table had no free row says nothing about the
+         * client, so it is counted separately and never latched as a
+         * signature mismatch. See aowl_pro_last_reason_text(). */
+        if (aowl_pro_last_was_table_full()) {
+            aowl_nr_why[i] = AOWL_NR_WHY_PROFULL;
+            return NULL;
+        }
         aowl_nr_why[i] = AOWL_NR_WHY_MISMATCH;
         return NULL;
     }

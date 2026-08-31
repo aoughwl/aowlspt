@@ -631,6 +631,9 @@ static int32_t aowl_nav_is_stub(const unsigned char* p) {
 #define AOWL_NAV_NOT_EXEC    4
 #define AOWL_NAV_SIG_MISMATCH 5
 #define AOWL_NAV_STUB        6
+#define AOWL_NAV_PRO_FULL    7   /* OURS: the shared prologue snapshot
+                                     * table was full; the RVA was never
+                                     * captured. NOT a client change. */
 
 static int32_t       aowl_nav_reason = AOWL_NAV_OK;
 static unsigned char aowl_nav_actual[AOWL_PRO_MAX_BYTES];
@@ -674,7 +677,12 @@ static void* aowl_nav_verify(uint32_t rva, const unsigned char* sig,
     }
     /* Against the SNAPSHOT, never live memory. */
     if (siglen > 0 && !aowl_pro_verify(rva, sig, siglen)) {
-        aowl_nav_reason = AOWL_NAV_SIG_MISMATCH;
+        /* TWO DIFFERENT FAILURES, TWO DIFFERENT REASONS. A verify that failed
+         * because OUR snapshot table had no free row says nothing about the
+         * client, so it is counted separately and never latched as a
+         * signature mismatch. See aowl_pro_last_reason_text(). */
+        aowl_nav_reason = aowl_pro_last_was_table_full()
+                        ? AOWL_NAV_PRO_FULL : AOWL_NAV_SIG_MISMATCH;
         return NULL;
     }
     return (void*)p;

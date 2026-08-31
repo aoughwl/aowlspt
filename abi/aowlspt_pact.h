@@ -593,18 +593,20 @@ static void* aowl_pact_fn(int32_t i) {
     if (t->siglen > 0 && !aowl_pro_verify(t->rva, t->sig, t->siglen)) {
         /* A CONFIDENTLY WRONG DIAGNOSTIC, DISARMED. `aowl_pro_verify` fails
          * CLOSED and returns 0 for two completely different reasons: the bytes
-         * really differ, OR the shared 128-row snapshot table was FULL and the
-         * row could never be captured. Reporting the second as the first would
-         * announce "this client build changed" when what actually happened is
-         * that this repo now declares 294 distinct RVAs across abi/*.h into a
-         * 128-row table. Rows are captured lazily, so exhaustion depends on how
-         * many features are enabled -- which makes it exactly the intermittent,
-         * feature-combination-dependent failure that a wrong message would send
-         * the next reader hunting a client update for.
+         * really differ, OR the shared snapshot table was FULL and the row was
+         * never captured. Reporting the second as the first announces "this
+         * client build changed" when what actually happened is our own table
+         * ran out of rows.
          *
-         * `aowl_pro_have` says whether the row exists at all. No row plus a
-         * non-zero full-count is exhaustion; anything else is a real mismatch. */
-        if (!aowl_pro_have(t->rva) && aowl_pro_full_count() > 0) {
+         * This used to reconstruct the distinction locally, from `aowl_pro_have`
+         * plus a non-zero full-count -- a good inference, but pact was the ONLY
+         * caller that made it, so every other feature in the host still reported
+         * exhaustion as a build change. The prologue header now states the
+         * reason directly and every caller asks it. MEASURED at the time this
+         * changed: 155 distinct RVAs were being asked of a 128-row table, so the
+         * exhaustion this guard was written against was real and pact, being
+         * captured last, wore almost all of it. */
+        if (aowl_pro_last_was_table_full()) {
             aowl_pact_last_reason = 8;
             return NULL;            /* RETRYABLE-ish, and NEVER latched */
         }
