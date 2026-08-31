@@ -181,6 +181,28 @@ Options
                  a profile was bound. The client still shows it, exactly as
                  before this feature; use this if the auto-press ever picks
                  the wrong slot, or to debug the selector itself.
+  --low-render   (alias: --headless) run the client CHEAP, not headless. It
+                 appends Unity's own player switches to the game's command
+                 line: -screen-width/-screen-height (default 1280x720),
+                 -screen-fullscreen 0 and -popupwindow. Use --render-size WxH
+                 to choose the size.
+                 WHAT IT DOES NOT DO: it is NOT headless. The renderer still
+                 runs, the window is still there and still on screen, there is
+                 no frame-rate cap, and nothing about the host's overlays
+                 changes. It does not pass -batchmode/-nographics -- see
+                 --nographics-anyway. For a run with NO game client at all,
+                 that is `python tools\headless.py`, which exercises the
+                 backend and the emulator and never starts Tarkov.
+  --render-size WxH
+                 the size --low-render asks for (default 1280x720)
+  --nographics-anyway
+                 also pass -batchmode -nographics. UNVERIFIED AND EXPECTED TO
+                 FAIL: this UnityPlayer.dll does contain both switches, but
+                 nothing here has ever booted this client with them, the whole
+                 aowlspt host drives the game through its UI, and BattlEye sits
+                 in front of the player's own argument handling. It is here so
+                 the experiment can be run deliberately, not so it can be run
+                 by accident. Requires --low-render.
   --wait         stay open until the game exits
   --no-backend   do not start the backend server
   --no-logs      do not show the live log view; exit once the game is up
@@ -254,6 +276,16 @@ type
       ## `--tail`: this process is a second console window showing one log.
       ## Not in the usage text because nobody types it; see `--client-window`.
     tailTitle: string
+    lowRender: bool
+      ## `--low-render` / `--headless`. Deliberately NOT called `headless`
+      ## internally: it does not make the client headless, it makes it small
+      ## and windowed. A name that overstates what a flag does is how a mode
+      ## that silently degrades gets shipped.
+    renderW: int
+    renderH: int
+    noGraphics: bool
+      ## `--nographics-anyway`: pass `-batchmode -nographics` too. Never on by
+      ## default and never implied by `--low-render`.
     help: bool
 
 proc parseArgs(): Options =
@@ -265,6 +297,8 @@ proc parseArgs(): Options =
                    pick: false, port: 0,
                    portGiven: false, allowPortMismatch: false,
                    backendWait: 300, tailPath: "", tailTitle: "log",
+                   lowRender: false, renderW: 1280, renderH: 720,
+                   noGraphics: false,
                    help: false)
   var i = 1
   let n = paramCount()
@@ -298,6 +332,40 @@ proc parseArgs(): Options =
       result.pick = true
     elif a == "--no-auto-enter":
       result.noAutoEnter = true
+    elif a == "--low-render" or a == "--headless":
+      result.lowRender = true
+    elif a == "--nographics-anyway":
+      result.noGraphics = true
+    elif a == "--render-size":
+      inc i
+      if i <= n:
+        let s = paramStr(i)
+        var w = 0
+        var h = 0
+        var seenX = false
+        var anyW = false
+        var anyH = false
+        for ch in s:
+          if ch == 'x' or ch == 'X':
+            seenX = true
+          elif ch >= '0' and ch <= '9':
+            let d = ord(ch) - ord('0')
+            if seenX:
+              h = h * 10 + d
+              anyH = true
+            else:
+              w = w * 10 + d
+              anyW = true
+          else:
+            fatal "--render-size wants WIDTHxHEIGHT, e.g. 1280x720, not: " & s
+        if not (anyW and anyH and seenX):
+          fatal "--render-size wants WIDTHxHEIGHT, e.g. 1280x720, not: " & s
+        if w < 320 or h < 240:
+          fatal "--render-size " & s & " is smaller than 320x240. The client " &
+                "has not been observed to survive that, and a size it " &
+                "silently clamps is a setting that lies."
+        result.renderW = w
+        result.renderH = h
     elif a == "--wait":
       result.wait = true
     elif a == "--no-backend":
@@ -347,6 +415,26 @@ proc parseArgs(): Options =
     elif result.root.len == 0:
       result.root = a
     inc i
+
+  # --------------------------------------------------------------------
+  # `--low-render` is nothing but a spelling of `--args`. It is folded in
+  # HERE, once, so that `--dry-run` prints the very command line a real
+  # launch would use: the dry run and the launch read the same field, and
+  # cannot drift into disagreeing about what was passed. Ours go FIRST so an
+  # explicit `--args` the user typed lands after them and wins.
+  if result.noGraphics and not result.lowRender:
+    fatal "--nographics-anyway only means anything with --low-render, and it " &
+          "is expected to fail even then. Nothing was started."
+  if result.lowRender:
+    var pre = "-screen-width " & $result.renderW &
+              " -screen-height " & $result.renderH &
+              " -screen-fullscreen 0 -popupwindow"
+    if result.noGraphics:
+      pre.add " -batchmode -nographics"
+    if result.extraArgs.len > 0:
+      result.extraArgs = pre & " " & result.extraArgs
+    else:
+      result.extraArgs = pre
 
 # ---------------------------------------------------------------------------
 # Small formatting
@@ -2367,6 +2455,15 @@ proc main(): int =
            "the host select the wrong profile."
 
   heading "Launching"
+  if o.lowRender:
+    note "--low-render: asking the client for a " & $o.renderW & "x" &
+         $o.renderH & " window (-screen-width/-screen-height, " &
+         "-screen-fullscreen 0, -popupwindow). This is NOT headless -- the " &
+         "renderer runs, the window is visible, and there is no frame cap."
+    if o.noGraphics:
+      warn "--nographics-anyway: also passing -batchmode -nographics. This " &
+           "has never been observed to boot this client. If the game exits " &
+           "immediately or never reaches the menu, that is why."
   let cmdLine = clientCommandLine(backendUrl, token, o.extraArgs)
   # Whole, not fitted. It is long, and it is the one line somebody will be
   # asked to paste when the client comes up talking to the wrong server.

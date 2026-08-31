@@ -702,7 +702,8 @@
     "aowlspt-launch",
     "host running",
     "backendUrl",
-    "could not write launchProfileId"
+    "could not write launchProfileId",
+    "-screen-fullscreen 0 -popupwindow"
    ]
   }
  ]
