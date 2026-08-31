@@ -68,6 +68,7 @@
   "adsSettleEps": 0.05,
   "adsObserveCap": 1.5,
   "adsMaxFights": 3,
+  "adsWriteFovField": true,
 
   "enableFovWrite": true,
   "verifyHooksByName": false,
