@@ -1957,6 +1957,42 @@ proc patchFired(slot: int32; regs: HostPtr): int32 {.
 # --------------------------------------------------------------- self test
 
 var gSelfFailures = 0
+var gSelfInconclusive = 0
+
+proc settingsRowsUsable(n: JsonNode; what, route, body: string): bool =
+  ## Is this settings payload actually the ARRAY OF ROWS the caller is about to
+  ## walk with `items()`?
+  ##
+  ## It has to be asked, because the failure it prevents is silent up to the
+  ## moment it is fatal. A backend running WITHOUT `mods/tarkov` staged answers
+  ## `/aowlspt/settings/aowl.tarkov` with the OBJECT `{"err":"no route"}`. That
+  ## is a 200, so `r.ok` is true; it is valid strict JSON, so `hasError` is
+  ## false. Both gates the selftest already had say yes. `items(root(tree))`
+  ## then hits `assert kind(n) == JArray, "items: not a JArray"` inside
+  ## std/json, which ABORTS THE PROCESS -- so every remaining check never runs,
+  ## and the thing the operator is told about is an assertion in a JSON library
+  ## rather than the mod that is not loaded.
+  ##
+  ## Reported as INCONCLUSIVE, not FAIL, when the route is simply absent: a
+  ## selftest run against a backend with no mods staged has not proven the
+  ## settings wire wrong, it has failed to look at it. `gSelfInconclusive` is
+  ## counted separately from `gSelfFailures` for exactly that reason -- "I could
+  ## not look" is not a pass and is not a failure.
+  if kind(n) == JArray:
+    return true
+  if body.contains("no route"):
+    console.warn what & ": INCONCLUSIVE -- route " & route &
+      " answered `no route`, so the mod that owns it (aowl.tarkov, i.e." &
+      " mods/tarkov) is NOT LOADED on this backend. The settings wire was" &
+      " never examined. Stage mods/tarkov and name it in" &
+      " mods\\aowlspt-selection.json, then re-run."
+    inc gSelfInconclusive
+    return false
+  console.err what & ": FAIL -- route " & route &
+    " answered a non-array payload (" & body & "); the settings wire is an" &
+    " array of {key,value} rows."
+  inc gSelfFailures
+  return false
 
 proc expect(what, path, body, want: string) =
   ## A free proc with a module-level counter rather than a nested one closing
@@ -2639,6 +2675,10 @@ proc main(): int =
       if hasError(tree):
         console.err "settings route did not parse as strict JSON: " & errorMsg(tree)
         inc gSelfFailures
+      elif not settingsRowsUsable(root(tree), "settings route",
+                                  "/aowlspt/settings/aowl.tarkov",
+                                  settingsResp.body):
+        discard  # already reported, as FAIL or INCONCLUSIVE; keep going
       else:
         var sawEdition = false
         for row in items(root(tree)):
@@ -2677,6 +2717,13 @@ proc main(): int =
         return
       var tree = parseJson(r.body)
       if hasError(tree):
+        return
+      # Same abort, second site: `cornerLabelValue` is called four times by the
+      # write/reset check below, and each one used to walk `{"err":"no route"}`
+      # straight into std/json's `items: not a JArray` assert. An empty string
+      # here reads as "no menuCornerLabel row", which the caller already knows
+      # how to report.
+      if kind(root(tree)) != JArray:
         return
       for row in items(root(tree)):
         var isCorner = false
@@ -2755,9 +2802,20 @@ proc main(): int =
     cNetStop()
     unloadMods()
     console.heading "Result"
+    # Three outcomes, never two. An INCONCLUSIVE run examined less than it
+    # meant to, so it does not get to say "served every route": that sentence
+    # was the whole reason a mods-less selftest read as a clean bill of health
+    # right up to the point it aborted.
+    if gSelfInconclusive > 0:
+      console.warn $gSelfInconclusive &
+        " check(s) INCONCLUSIVE -- not examined, so not passed"
     if gSelfFailures > 0:
       console.err $gSelfFailures & " failed"
       return 1
+    if gSelfInconclusive > 0:
+      console.warn "no check FAILED, but " & $gSelfInconclusive &
+        " could not be looked at; this is not a pass"
+      return 0
     console.ok "the backend served every route over the wire"
     return 0
 
