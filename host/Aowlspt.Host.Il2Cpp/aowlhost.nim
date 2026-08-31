@@ -7586,6 +7586,12 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   # all; `nativeUiProof` additionally runs the one-shot visual self-proof.
   gNuOn = readBoolKey("nativeUi")
   gNuProof = gNuOn and readBoolKey("nativeUiProof")
+  # `nativeUiImageProof` -- STAGE C, the Image-from-scratch spike. Its own flag
+  # and NOT implied by `nativeUiProof`, because it answers a different question
+  # (does a uGUI Graphic built from nothing render) that the native ESP is
+  # blocked on, and because running it alone puts exactly one object on screen
+  # instead of three, which keeps the visual evidence unambiguous.
+  gNuImgProof = gNuOn and readBoolKey("nativeUiImageProof")
   # The unified widget framework. `aowlUi` arms the framework (its native
   # realisation reuses the nativeui primitives, so it implies `nativeUi`);
   # `aowlUiProof` runs the one-shot dual-backend self-proof.
@@ -7609,9 +7615,10 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   # so asking for the proof implies arming that detour. Saying so here, rather
   # than leaving the human to discover that `nativeUiProof` alone does nothing,
   # is the difference between a feature and a silent decline.
-  if gNuProof and not gMi2Probe:
+  if (gNuProof or gNuImgProof) and not gMi2Probe:
     gMi2Probe = true
-    info "nativeUiProof is set, so managedInvokeProbe is being armed with it: " &
+    info "nativeUiProof/nativeUiImageProof is set, so managedInvokeProbe is " &
+         "being armed with it: " &
          "the proof rides that detour on SettingsScreen.EnsureTabInitialized " &
          "as a drain, because a second detour on one function overwrites the " &
          "first's trampoline"

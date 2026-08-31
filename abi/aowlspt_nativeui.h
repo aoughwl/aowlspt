@@ -314,6 +314,37 @@ typedef struct AowlNuTarget {
  * function (atomic `lock xadd`, kind decode `shr eax,0x1d`, jump-table
  * dispatch) -- not the 0x628110 empty stub. */
 #define AOWL_NU_META_INIT            25
+/* --- the IMAGE-VISIBILITY trio (spike `nativeUiImageProof`) ---------------
+ *
+ * An `Image` that EXISTS and shows nothing is this project's signature false
+ * positive, so the spike does not stop at AddComponent. Three things decide
+ * whether a Graphic puts pixels on screen, and each has a target here:
+ *
+ *   set_color            -- alpha 0 is invisible and every readback still says
+ *                           "the component is there". MEASURED ABI, from the
+ *                           prologue bytes themselves: `0F 10 12` is
+ *                           `movups xmm2,[rdx]`, so RDX is a POINTER to the
+ *                           Color (Win64 passes a 16-byte struct by reference),
+ *                           and `F3 0F 10 41 28` is `movss xmm0,[rcx+0x28]`,
+ *                           which independently CONFIRMS m_Color@0x28 from
+ *                           fldoff. Shape-compatible with the `_Injected`
+ *                           setters, so aowl_nu_call_v_pp serves it unchanged.
+ *   get_canvasRenderer   -- Graphic carries [RequireComponent(CanvasRenderer)]
+ *                           and Unity's native AddComponent is supposed to
+ *                           honour it. "Supposed to" is not measured; this is
+ *                           how the spike ASKS instead of assuming, and a null
+ *                           answer is the single most likely reason a created
+ *                           Image renders nothing.
+ *   SetAllDirty          -- a raw m_Color store would not mark the mesh dirty.
+ *                           We call the setter, but a from-scratch Graphic that
+ *                           was activated after layout has no guaranteed dirty
+ *                           pass, so this is called ONCE, explicitly.
+ *
+ * All three: sharedness UNIQUE / owners=1 (Resolver.sharedness, three-state),
+ * and none is the 0x628110 universal `C2 00 00` stub. */
+#define AOWL_NU_GR_SET_COLOR         26
+#define AOWL_NU_GR_GET_CANVASREND    27
+#define AOWL_NU_GR_SETALLDIRTY       28
 
 /* Every prologue below was read out of THIS build's GameAssembly.dll with
  * `tools/il2cpp_resolve.py bytes <RVA> 16`, and every RVA with
@@ -415,6 +446,16 @@ static const AowlNuTarget aowl_nu_targets[] = {
     { "il2cpp_codegen_initialize_runtime_metadata", 0x5251C0u,
       { 0x88,0x54,0x24,0x10,0x41,0x56,0x48,0x83,0xEC,0x30,0x45,0x33,0xC9,
         0x4C,0x8B,0xF1 }, 16 },
+    /* --- image visibility. (this, Color* value, MethodInfo*) --- */
+    { "UnityEngine.UI.Graphic::set_color", 0x53AD780u,
+      { 0x0F,0x10,0x12,0xF3,0x0F,0x10,0x41,0x28,0x0F,0x2E,0xC2,0x7A,0x38,
+        0x75,0x36,0xF3 }, 16 },
+    { "UnityEngine.UI.Graphic::get_canvasRenderer", 0x53AE5A0u,
+      { 0x40,0x53,0x48,0x83,0xEC,0x20,0x80,0x3D,0x3A,0x88,0xD2,0x01,0x00,
+        0x48,0x8B,0xD9 }, 16 },
+    { "UnityEngine.UI.Graphic::SetAllDirty", 0x53ADA90u,
+      { 0x40,0x53,0x48,0x83,0xEC,0x20,0x80,0x79,0x38,0x00,0x48,0x8B,0xD9,
+        0x75,0x15,0x48 }, 16 },
 };
 
 #define AOWL_NU_TARGET_COUNT \
@@ -651,6 +692,16 @@ static float aowl_nu_v2out_y(void)   { return g_nu_v2out[1]; }
 static void* aowl_nu_rect_ptr(void)  { g_nu_rect[0]=0.0f; g_nu_rect[1]=0.0f;
                                        g_nu_rect[2]=0.0f; g_nu_rect[3]=0.0f;
                                        return (void*)g_nu_rect; }
+/* A Color (4 floats, 16 bytes). Win64 passes a 16-byte struct BY REFERENCE, so
+ * `set_color(Color)` reads it through RDX -- which is not an inference, it is
+ * the first instruction of the method (`movups xmm2,[rdx]`). Same file-scope,
+ * allocate-once discipline as the Vector2 buffers above. */
+static float g_nu_c4in[4];
+static void  aowl_nu_c4in_set(float r, float g, float b, float a) {
+    g_nu_c4in[0]=r; g_nu_c4in[1]=g; g_nu_c4in[2]=b; g_nu_c4in[3]=a;
+}
+static void* aowl_nu_c4in_ptr(void) { return (void*)g_nu_c4in; }
+
 static float aowl_nu_rect_x(void) { return g_nu_rect[0]; }
 static float aowl_nu_rect_y(void) { return g_nu_rect[1]; }
 static float aowl_nu_rect_w(void) { return g_nu_rect[2]; }
@@ -1149,6 +1200,23 @@ static int32_t aowl_nu_set_ref(void* obj, int32_t off, void* val) {
     if (!aowl_nu_is_writable((char*)obj + off, (int32_t)sizeof(void*))) return 0;
     memcpy((char*)obj + off, &val, sizeof(void*));
     return 1;
+}
+
+/* Read a float field RAW, VirtualQuery-guarded like every other hop. Used ONLY
+ * to read a Graphic's m_Color BACK after calling set_color -- i.e. to check the
+ * finished state through a path that is NOT the setter we are testing. `ok` is
+ * an out-flag because 0.0f is a legitimate channel value and must not double as
+ * "could not read": that conflation is exactly the check-that-cannot-fail this
+ * repo keeps paying for. */
+static float aowl_nu_get_f32(void* obj, int32_t off, int32_t* ok) {
+    float v = 0.0f;
+    if (ok) *ok = 0;
+    if (!obj || off < 0) return 0.0f;
+    if (!aowl_nu_region_ok((char*)obj + off, (int32_t)sizeof(float), 0))
+        return 0.0f;
+    memcpy(&v, (const char*)obj + off, sizeof(float));
+    if (ok) *ok = 1;
+    return v;
 }
 
 #endif /* AOWLSPT_NATIVEUI_H */
