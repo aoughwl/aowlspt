@@ -2106,6 +2106,23 @@ proc hudPublish*(snap: Snapshot) =
   # window or the GwMainPlayer null flicker -- is a TRANSIENT gap that re-draws
   # the held frame. Pre-spawn is still safe because heldValid is 0 until the
   # first real active-raid frame draws, so nothing is shown before spawn.
+  # MEASURED LIVE, 2026-08-30, user sitting on the post-raid results screen with
+  # the map still visibly drawing: the maps diag read `world : PASS GameWorld
+  # live` and `raid : CLOSED`, and the map was on screen anyway. This is why:
+  # the ONLY explicit empty commit below is `state != 3`, and on the results
+  # screen the borrowed RegisterPlayer cache is still non-null, so publish took
+  # the `inRaid=1` transient-gap branch and the draw re-drew its held frame
+  # forever. `activeRaid()` was correct and simply never reached the draw.
+  #
+  # So there is now a SECOND explicit empty commit, and it is driven by a
+  # POSITIVE end-or-not-yet observation from the host (`raidOverOrNotYet`:
+  # SessionEndUIScene listed, Camera.main null, or no GameWorld -- see
+  # host/raidphase.nim), never by the flickering pose/alive reads. It closes
+  # BOTH ends: the results screen, and the ~2 minutes of scene load during which
+  # bots register into a live GameWorld before the player deploys.
+  if raidOverOrNotYet():
+    cHudBegin(0.0, 0.0, 0.0, 0'i32, 0.0, 0'i32, 0'i32)
+    return
   if snap.state != 3:
     # World genuinely not live (menu, loading before the world, or the borrowed
     # RegisterPlayer cache torn down after extract): the one explicit empty

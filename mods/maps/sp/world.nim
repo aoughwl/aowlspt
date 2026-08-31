@@ -536,6 +536,7 @@ type
 
 var gFn: Il2CppPtr = cast[Il2CppPtr](0)
 var gArmedFn: Il2CppPtr = cast[Il2CppPtr](0)
+var gPhaseFn: Il2CppPtr = cast[Il2CppPtr](0)
 var gTried = false
 
 proc resolveHost() =
@@ -546,8 +547,10 @@ proc resolveHost() =
   if h == nil: return
   var n1 = "aowl_host_gameworld"
   var n2 = "aowl_host_gameworld_armed"
+  var n3 = "aowl_host_raid_phase"
   gFn = wGetProcAddress(h, toCString(n1))
   gArmedFn = wGetProcAddress(h, toCString(n2))
+  gPhaseFn = wGetProcAddress(h, toCString(n3))
   # Arm the position accessor at the same time, and by the same OS-loader
   # route. GameAssembly.dll is already loaded in the client; GetModuleHandleA
   # does NOT load it, so this returns NULL server-side and the call is simply
@@ -568,6 +571,47 @@ proc gwState*(): int =
   if gArmedFn != nil and spI32V(gArmedFn) == 0'i32: return 1
   if spPV(gFn) == nil: return 2
   result = 3
+
+const
+  # Mirrors RpPhase* in host/Aowlspt.Host.Il2Cpp/raidphase.nim. Kept as named
+  # constants so a `case` over them is exhaustive.
+  RpNoExport* = -1  ## the host does not export it -- host too old, or server side
+  RpUnknown*  = 0   ## the host could not look. NOT "no raid".
+  RpMenu*     = 1
+  RpLoading*  = 2   ## world exists (bots registering) but the player is NOT in
+  RpDeployed* = 3
+  RpResults*  = 4   ## post-raid results screen
+
+proc hostPhase*(): int =
+  ## THE lifecycle answer, computed once per frame INSIDE the host under its own
+  ## guard and merely READ here. It is not recomputed on this side: the host's
+  ## guard is not re-entrant and this is called from inside the mod's own tick.
+  ##
+  ## `RpNoExport` is a distinct outcome from `RpUnknown` on purpose. A host that
+  ## predates this export must keep the OLD behaviour rather than have every
+  ## surface go dark, and a host that looked and could not tell must not be
+  ## reported as "you are not in a raid".
+  resolveHost()
+  if gPhaseFn == nil: return RpNoExport
+  result = int(spI32V(gPhaseFn))
+
+proc hostPhaseName*(p: int): string =
+  case p
+  of RpNoExport: "NO-EXPORT"
+  of RpMenu: "MENU"
+  of RpLoading: "LOADING"
+  of RpDeployed: "DEPLOYED"
+  of RpResults: "RESULTS"
+  else: "UNKNOWN"
+
+proc raidOverOrNotYet*(): bool =
+  ## TRUE only on a POSITIVE observation that the overlays must be dark: the
+  ## post-raid results screen, the menu, or the pre-deploy loading window. It is
+  ## deliberately FALSE for `RpUnknown` and `RpNoExport`, because "I could not
+  ## look" must not blank a live raid -- that failure mode (blanking on an
+  ## intermittent read) is the flicker bug this mod already paid for once.
+  let p = hostPhase()
+  p == RpResults or p == RpMenu or p == RpLoading
 
 proc gwStateText*(): string =
   case gwState()

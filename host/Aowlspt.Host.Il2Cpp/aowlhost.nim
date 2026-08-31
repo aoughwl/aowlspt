@@ -3387,6 +3387,13 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
     # `aowl_p_p_seh` opened by `aowl_ne_tick_guarded`, so this call site opens
     # none (the guard is not re-entrant). Flag `natEsp`, default OFF; idle cost
     # is one compare and no call into the game.
+    # THE SHARED RAID PHASE. Must run BEFORE `natEspDrainTick`, which reads the
+    # verdict it caches. Read-only, its own single `aowl_p_p_seh`, no detour.
+    # Unconditional on purpose: every consumer gate depends on it, and a gate
+    # that silently reads a stale phase because a flag was off is the failure
+    # mode this whole change exists to remove. Idle cost when no world is
+    # cached is one guarded pointer test plus one scene-name query per second.
+    rpDrainTick()
     natEspDrainTick()
     return 0'i32
   # The render-phase drain, likewise by identity: a second detour on a
@@ -5971,6 +5978,13 @@ include "natraid.nim"
 ## `natEspDrainTick` rides the `TarkovApplication::Update` drain above. Flags
 ## `natEsp` and `natEspDiag`, both default OFF; `natEsp` additionally requires
 ## `nativeUi`, because the nu* primitives are its only way to draw.
+## THE SHARED RAID-PHASE PREDICATE. `include`d BEFORE `natesp.nim` (which
+## consults it) and AFTER `inspect.nim` (whose `iSceneNamePresent` supplies the
+## `SessionEndUIScene` end-of-raid signal) and `debugui.nim` (whose
+## `gDuGameWorld` it borrows). It installs NO detour, resolves NO address and
+## writes nothing; `rpDrainTick` rides the `TarkovApplication::Update` drain.
+include "raidphase.nim"
+
 include "natesp.nim"
 
 ## THE SHARED PER-FRAME REGION. Included AFTER `modstab.nim` because
