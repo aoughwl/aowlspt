@@ -203,6 +203,95 @@ which is nothing at load and is a frame tax in `onUpdate`. `configSet` is refuse
 by the hosts that treat `config.json` as the operator's file rather than the
 mod's — ask, and log which kind of host you got, rather than assuming.
 
+## Game data: traders, stock and quests — `aowlspt/trader`
+
+`mods/tarkov` IS the game server, and it has no trader type and no quest type.
+It reads `traders.<id>` and `templates.quests.<id>` straight out of the loaded
+database and serves whatever is there. So the mechanism is `dbWrite` — and the
+difficulty is entirely the *shape*: a trader's `base` has 33 fields, a quest
+template 30, and a missing field hangs the client rather than erroring.
+
+`aowlspt/trader` is those shapes with a working default for every field. It is
+not a framework: each proc either builds JSON or performs one named `dbWrite`,
+and says which path it wrote.
+
+```nim
+import aowlspt/trader
+
+var t = newTrader(traderId("ad0000000000000000000001"), "Admin Trader")
+t.description = "Everything, free."
+discard t.stockWholeHandbook()               # ~4,300 items, free
+if install(t) != Ok: warn whyNot(t)          # dbWrite("traders.<id>", …)
+
+var q = newQuest(questId("ad0000000000000000000101"), t, "Admin Induction")
+q.requireLevel(1)
+q.requireHandover("544fb37f4bdc2dee738b4567", 1)
+q.rewardExperience(500)
+q.rewardStanding(0.1)
+discard install(q)                           # dbWrite("templates.quests.<id>", …)
+```
+
+The full worked example is `mods/admintrader` — 199 lines for a trader stocking
+4,288 items plus a quest, with a status route and a settings page. Its
+`tools/acceptance_admintrader.py` asserts the result against a real `db.json`.
+
+| you want | you call |
+|---|---|
+| a checked id | `traderId(hex)` / `questId(hex)` — refuses non-24-hex, loudly |
+| a trader | `newTrader(id, nickname)`, then set the fields that differ |
+| the 33-field `base` | `traderBase(t)` (called for you by `install`) |
+| an item on the shelf | `sell(t, freeOffer(tpl))` / `pricedOffer` / `barterOffer` |
+| everything, in stock | `stockWholeHandbook(t, maxOffers, price)` |
+| the three keyed collections | `traderAssort(t)` |
+| a quest | `newQuest(id, giver, name)` + `requireLevel` / `requireHandover` |
+| rewards | `rewardExperience(q, xp)` / `rewardStanding(q, n)` |
+| readable names | `localeText(loc, key, value)`; `traderNames` / `questWords` |
+| write it | `install(t)` / `install(q)` / `install(loc)` |
+| assert it worked | `auditTrader(t, o)` / `auditQuest(q, o)` |
+
+### What this module makes impossible, rather than documented
+
+Each of these was a real way to produce data that looks written and is silently
+broken. Knowing them still matters for debugging, but you can no longer spell
+them:
+
+* **An offer with no price.** An assort is three collections keyed to each other
+  (`items`, `barter_scheme`, `loyal_level_items`); an offer in the first and
+  missing from the second is drawn and unpriceable. An `Offer` carries its own
+  cost and all three collections come out of one loop over `t.offers`.
+* **"Free" as a price of zero.** There is no price field — a price IS a barter
+  requirement. `freeOffer` is a requirement for `count: 0` roubles.
+* **A locale name as a dotted path.** The text lives in `locales.global.en`
+  under `"<id> Nickname"`, with a SPACE, so a dotted path writes a key nobody
+  reads. `localeText` takes a key and a value; there is no path argument.
+* **Stock from `templates.items`.** That table is 4,673 raw templates including
+  hideout nodes and stashes, tens of megabytes, wrong for a shop.
+  `stockWholeHandbook` names `templates.handbook.Items` and takes no argument.
+* **A malformed id.** `traderId` / `questId` warn at construction and make
+  `install` return `ErrBadArg` rather than write something unreachable. An id
+  is never pasted into a db path unchecked — `dbRead("traders." & "")` reads the
+  *whole table*, whose every field then comes back empty rather than missing,
+  which reads as a trader that exists and is blank.
+* **An unstartable quest.** `install(q)` refuses a quest with no start
+  condition or no finish condition, and says which.
+
+Two things it deliberately does not hide, because they are not shapes: getting
+a mod to load at all (`docs/MOD-ENABLE-PATH.md` — the DLL, `registry/mods.json`,
+and the manager-owned selection, enabled via
+`GET /aowlspt/mods/enable/<guid>`), and `regcheck` comparing `sides` and
+`author` to your source verbatim.
+
+### Auditing, not self-congratulation
+
+`auditTrader` / `auditQuest` fill a `JsonObject` with counters read back out of
+the database — never out of your mod. Serve them from a status route and assert
+on them. Two are deliberately negative (`offersNotFree`, `offersUnpriced`)
+because "we wrote 4,288 free offers" cannot fail while "no offer in the
+database costs anything" can. And `listedInTradersTable` has three outcomes:
+`"yes"`, `"no"`, or `"unknown: …"` on a host that cannot enumerate keys —
+`aowlspt-sim` is such a host, and reporting `false` there would be a check that
+says the trader is missing whenever you were unable to look.
+
 ## Types
 
 ```nim
