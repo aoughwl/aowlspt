@@ -304,6 +304,13 @@ var gNePhaseAExhaustive = false  ## did phase A drain without truncating?
 var gNePhaseAUiNamed = 0      ## phase-A roots whose name looks like UI
 var gNeAnchorSceneOk = false  ## did GameObject::get_scene_Injected answer?
 
+## PHASE 0 -- the shared `nuCanvasFind`. Kept as its own three fields so the
+## ledger can never conflate "the shared finder said ABSENT" with "the shared
+## finder never ran". Run at most once per discovery attempt.
+var gNePhase0Done = false
+var gNePhase0Verdict = "not run"
+var gNePhase0Ledger = ""
+
 proc neLooksUi(n: string): bool =
   ## Cheap, purely lexical root-name preference. It is ONLY an ORDERING
   ## hint -- a root that does not match is still searched, just later -- so
@@ -698,6 +705,66 @@ proc neDiscoverStep() =
   if not iNavFindQuiet("Component::GetComponent(String)", fnGet) or fnGet == nil:
     neRefuse(NeRNoGetComp)
     return
+
+  # ------------------------------------------------------------------ PHASE 0
+  # THE SHARED FINDER, TRIED FIRST. `nuCanvasFind` (nuikit.nim) is the host's
+  # ONE canvas-acquisition function; the breadth-first walk below is now a
+  # fallback behind it, not a second implementation.
+  #
+  # WHY IT IS EXPECTED TO WIN WHERE THE WALK LOST. MEASURED, 2026-08-30: the
+  # walk reported `visited=20000 candidates=0 deepest=3/8 scope=TRUNCATED` --
+  # it burned the entire node budget on map geometry three levels down and
+  # never reached any UI at all. A Canvas sits AT or very near a scene root,
+  # so asking each root directly for a `Canvas` component is ~16 questions
+  # rather than 20,000 and cannot truncate before reaching the UI.
+  #
+  # ACCEPTANCE IS UNCHANGED and now lives in the shared function: alive +
+  # activeInHierarchy + rect READS BACK >= `aowl_ne_min_canvas_px` on both
+  # axes, largest area wins, nothing is created if none qualifies.
+  #
+  # GUARD: `nuCanvasFind` opens NO `aowl_p_p_seh` of its own (nuikit opens none
+  # anywhere, by design), so calling it from inside this tick body's single
+  # guarded region does NOT nest and does NOT disarm the outer guard.
+  #
+  # 9b: its verdict is three-state and is logged verbatim. `ABSENT` means the
+  # roots were examined and none qualified; `INCONCLUSIVE` means we never got
+  # to look. Only INCONCLUSIVE falls through to the walk -- an ABSENT verdict
+  # from the roots still falls through too, because the walk can reach nested
+  # canvases the root ask cannot, but the ledger says which happened.
+  if gNeCanvasTr == nil and not gNePhase0Done:
+    gNePhase0Done = true
+    var pick = NuCanvasPick()
+    let got = nuCanvasFind(splAnchor(), cNeMinCanvasPx(), pick)
+    gNePhase0Verdict = pick.verdict
+    gNePhase0Ledger = nuCanvasLedger(pick)
+    okLog "natesp: phase0 (shared nuCanvasFind, the host's ONE canvas " &
+          "acquisition) -- " & gNePhase0Ledger
+    if got and pick.go != nil and pick.tr != nil:
+      gNeCanvasGo = pick.go
+      gNeCanvasTr = pick.tr
+      gNeCanvasW = pick.w
+      gNeCanvasH = pick.h
+      gNeBestArea = pick.w * pick.h
+      gNeCandidates = pick.candidates
+      gNeRejected = pick.rejected
+      okLog "natesp: canvas ACCEPTED by phase0 at 0x" &
+            hexOf(cast[uint64](gNeCanvasGo)) & " name=\"" &
+            iObjName(gNeCanvasGo) & "\" rect=" & neF(gNeCanvasW) & "x" &
+            neF(gNeCanvasH) & " -- alive, activeInHierarchy, and the LARGEST " &
+            "of " & $pick.candidates & " candidate(s) at or above " &
+            neF(cNeMinCanvasPx()) & "px on both axes. The breadth-first walk " &
+            "was not needed and did not run."
+      gNeSeeded = true            # the walk is skipped, not merely finished
+      gNeHead = 0
+      gNeQueue = @[]
+      return
+    okLog "natesp: phase0 did not bind a canvas (verdict=" & gNePhase0Verdict &
+          "). Falling through to the breadth-first walk, which can reach " &
+          "canvases NESTED below a root that the root-level ask cannot see. " &
+          "If the walk also finds nothing, read the two verdicts TOGETHER: " &
+          "phase0=ABSENT plus a walk that ran EXHAUSTIVELY is a real absence; " &
+          "either one reading INCONCLUSIVE or TRUNCATED is not."
+
   if not gNeSeeded:
     # THE ATTEMPT CAP, checked BEFORE the enumeration, not after.
     # `Scene::GetRootGameObjects` allocates; a seed that can never succeed must
@@ -853,6 +920,8 @@ proc neDiscoverStep() =
       gNePhaseBRoots = @[]
       return                       # phase B starts on the next frame's slice
   let phaseLedger =
+    " phase0=" & gNePhase0Verdict &
+    " phase0Ledger=\"" & gNePhase0Ledger & "\"" &
     " phaseA=" & (if gNePhaseARootCount == 0: "NOT-SEARCHED(0 roots)"
                   else: (if gNePhaseAExhaustive: "EXHAUSTIVE" else: "TRUNCATED")) &
     " phaseARoots=" & $gNePhaseARootCount &
@@ -1189,6 +1258,7 @@ proc neTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ne_tick_body", cdecl.}
       neDestroyPool()
       gNeCanvasGo = nil
       gNeCanvasTr = nil
+      gNePhase0Done = false        # the canvas died: re-ask the shared finder
       gNeSeeded = false
       gNeState = NeIdle
     gNeWhy = gate
@@ -1218,6 +1288,7 @@ proc neTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ne_tick_body", cdecl.}
       neDestroyPool()
       gNeCanvasGo = nil
       gNeCanvasTr = nil
+      gNePhase0Done = false        # the canvas died: re-ask the shared finder
       gNeSeeded = false
       gNeState = NeIdle
       return cast[Il2CppPtr](1)

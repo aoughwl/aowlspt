@@ -6001,6 +6001,18 @@ include "natraid.nim"
 ## writes nothing; `rpDrainTick` rides the `TarkovApplication::Update` drain.
 include "raidphase.nim"
 
+## THE NATIVE-UI TOOLKIT -- `nuPanel`/`nuLabel` plus a generation-checked handle
+## table, the layer a mod actually calls. MOVED AHEAD OF `natesp.nim`: it now
+## also holds `nuCanvasFind`, THE HOST'S ONE CANVAS-ACQUISITION FUNCTION, and
+## nimony forward-resolves procs across an include boundary but not reliably
+## enough to leave natesp calling into a file included after it.
+##
+## `nuCanvasFind` CONSUMES the live inspector's proven `iSceneRoots` +
+## `iVisComponent("Canvas")` walk, which is why this must stay after
+## `inspect.nim`. natesp's own breadth-first canvas search is now a FALLBACK
+## behind it rather than a second implementation.
+include "nuikit.nim"
+
 include "natesp.nim"
 
 ## THE SHARED PER-FRAME REGION. Included AFTER `modstab.nim` because
@@ -6015,13 +6027,8 @@ include "region.nim"
 ## installs NO detour. Default OFF (`uxBetaOverlay`).
 include "betanotice.nim"
 
-## THE NATIVE-UI TOOLKIT -- `nuPanel`/`nuLabel` plus a generation-checked handle
-## table, the layer a mod actually calls. `include`d HERE, after `inspect.nim`,
-## because `nuFindCanvas` CONSUMES the live inspector's proven `iSceneRoots` +
-## `iVisComponent("Canvas")` walk. Writing a second canvas discovery was the
-## explicit thing to avoid: `natesp.nim` already has one (and is owned by
-## another change), and a third would be a third way to be wrong.
-include "nuikit.nim"
+## (`nuikit.nim` is now included further up, immediately before `natesp.nim`,
+## because natesp calls its `nuCanvasFind`.)
 
 
 proc bindCodeGenProbe(verbose: bool): bool =

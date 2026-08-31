@@ -15,15 +15,28 @@
 ##      version lethal: a destroyed UnityEngine.Object stays perfectly READABLE
 ##      with `m_CachedPtr` zeroed, so a pointer check passes and the next
 ##      internal call dies inside Unity's own C++. Readability is not liveness.
-##   3. ONE canvas discovery, `nuFindCanvas`, shared by every caller.
+##   3. `nuCanvasFind` -- THE HOST'S ONE CANVAS-ACQUISITION FUNCTION.
 ##
-## WHOSE CANVAS DISCOVERY THIS IS. It is the LIVE INSPECTOR'S, consumed, not a
-## third implementation: `iSceneRoots` + `iVisComponent("Canvas")` +
-## `Canvas::get_renderMode`, the path that reliably returns 16 scene roots.
-## `natesp.nim` has its own (obtains 178 roots and faults converting them) and
-## is owned by another change; nothing here touches it. That is also why this
-## file is `include`d AFTER `inspect.nim` -- the inspector's walkers are simply
-## not in scope any earlier.
+## WHOSE CANVAS DISCOVERY THIS IS. It is the LIVE INSPECTOR'S, consumed:
+## `iSceneRoots` + `iVisComponent("Canvas")` + `Canvas::get_renderMode`, the
+## path that reliably returns ~16 scene roots. That is why this file is
+## `include`d AFTER `inspect.nim` -- the inspector's walkers are not in scope
+## any earlier.
+##
+## THE CONSOLIDATION, 2026-08-30. There were three answers to "where is a
+## Canvas" and they disagreed:
+##   * `natesp.nim` breadth-first from every scene root. MEASURED failing:
+##     `visited=20000 candidates=0 deepest=3/8 scope=TRUNCATED` -- it spent the
+##     whole budget on map geometry and never reached UI. It is now a FALLBACK
+##     behind `nuCanvasFind`, not a rival implementation.
+##   * `nativeui.nim` Stage C never had one AT ALL. Its IMAGEPROOF PASS did not
+##     find a Canvas: it walked `SettingsTab._createdControls` for a live UI
+##     control (`mi2FindTmp`) and parented under that control's GameObject, and
+##     Unity's OnEnable then populated `Graphic.m_Canvas` by ANCESTOR WALK. That
+##     path needs a SettingsTab and exists only on the settings screen; it is
+##     not reusable in a raid and is deliberately left alone.
+##   * this file, which is the one that generalises, and now carries the
+##     acceptance rule natesp paid for.
 ##
 ## WHERE THIS SITS RELATIVE TO `aowlui.nim`. `aowlui` is a SCREEN-level retained
 ## framework (panels/labels/toggles/tabs/config binding) over two backends. This
@@ -294,15 +307,168 @@ const NkMaxRoots = 64          ## capped: the inspector reliably reports ~16
 
 var gNkCanvasGo: Il2CppPtr = nil     ## cached, but re-validated on every call
 
+type
+  NuCanvasPick* = object
+    ## THE result of canvas discovery, for every caller in the host.
+    ##
+    ## `verdict` is THREE-STATE on purpose (CLAUDE.md 9b). It is the field that
+    ## keeps "we searched the right place and there is no canvas" apart from
+    ## "we never got to look", and no consolidation may collapse it:
+    ##   "FOUND"        -- `go`/`tr`/`comp` are bound and passed acceptance
+    ##   "ABSENT"       -- roots WERE examined and none qualified. An answer.
+    ##   "INCONCLUSIVE" -- nothing was examined (no anchor, no roots, or the
+    ##                     component ask failed on every root). NOT an answer.
+    go*, tr*, comp*: Il2CppPtr   ## GameObject / RectTransform / Canvas component
+    w*, h*: float32              ## the winner's rect, READ BACK, not assumed
+    rootsSeen*: int              ## roots handed to us
+    walked*: int                 ## roots we actually examined
+    asked*: int                  ## roots iVisComponent could ASK (could-look)
+    candidates*: int             ## roots that carried a Canvas at all
+    rejected*: int               ## Canvases that failed the acceptance rule
+    worldSpace*: int             ## Canvases skipped as WorldSpace(2)
+    scope*: string               ## "EXHAUSTIVE" | "TRUNCATED"
+    verdict*: string
+    why*: string
+
+proc nuCanvasLedger*(p: NuCanvasPick): string =
+  "canvas: verdict=" & p.verdict & " rootsSeen=" & $p.rootsSeen &
+  " walked=" & $p.walked & " asked=" & $p.asked &
+  " candidates=" & $p.candidates & " rejected=" & $p.rejected &
+  " worldSpace=" & $p.worldSpace & " scope=" & p.scope &
+  (if p.verdict == "FOUND":
+     " w=" & formatFloat(float64(p.w), ffDecimal, 1) &
+     " h=" & formatFloat(float64(p.h), ffDecimal, 1)
+   else: "") &
+  " why=\"" & p.why & "\""
+
+proc nuCanvasFind*(anchor: Il2CppPtr; minPx: float32;
+                   pick: var NuCanvasPick): bool =
+  ## THE ONE canvas-acquisition function in this host. `nuFindCanvas` forwards
+  ## to it and natesp calls it directly; there is no second implementation.
+  ##
+  ## WHY THE ROOT WALK AND NOT A TREE WALK. Measured, 2026-08-30: natesp's own
+  ## breadth-first descent spent its entire 20,000-node budget on map geometry
+  ## and reported `candidates=0 deepest=3/8 scope=TRUNCATED` -- it never got
+  ## deep enough to reach any UI. A Canvas is at or very near a SCENE ROOT, so
+  ## asking each root directly for a `Canvas` component costs ~16 questions
+  ## instead of 20,000 and cannot truncate before reaching the UI.
+  ##
+  ## TYPES AT EVERY HOP, because a Transform passes BOTH readability and
+  ## liveness (it IS a UnityEngine.Object) and that is how the last type
+  ## confusion survived four rounds:
+  ##   `iSceneRoots` -> seq of TRANSFORM (converted at the inspector boundary)
+  ##   `iVisComponent(transform, "Canvas")` -> the CANVAS COMPONENT
+  ##   `nuGameObjectOf(canvas)` -> GAMEOBJECT
+  ##   `nuTransformOf(go)` -> the canvas's RECTTRANSFORM (what callers parent to)
+  ##
+  ## ACCEPTANCE (natesp's rule, kept verbatim and now applied for everyone):
+  ## alive AND activeInHierarchy AND the rect READS BACK >= `minPx` on BOTH
+  ## axes. LARGEST AREA WINS. `minPx <= 0` disables only the size test; the
+  ## liveness and active tests are never optional.
+  ##
+  ## GUARDS: this proc opens NO `aowl_p_p_seh` of its own -- like the rest of
+  ## nuikit it is designed to be called from INSIDE the caller's single guarded
+  ## region (natesp's tick body, invoke2's postfix). Nesting would disarm the
+  ## outer guard. Every pointer hop is `nuOk` + `nuAlive` checked and the root
+  ## loop is capped at `NkMaxRoots`.
+  ##
+  ## It deliberately does NOT go through `nkReady`: gating natesp's canvas
+  ## discovery on the `nativeUiKit` flag would be a hidden coupling between two
+  ## unrelated features. It requires only the `nativeUi` primitive layer, which
+  ## every caller already needs to create anything at all.
+  pick = NuCanvasPick(go: nil, tr: nil, comp: nil, w: 0'f32, h: 0'f32,
+                      rootsSeen: 0, walked: 0, asked: 0, candidates: 0,
+                      rejected: 0, worldSpace: 0, scope: "EXHAUSTIVE",
+                      verdict: "INCONCLUSIVE", why: "")
+  if not gNuOn or cNuDisabled() != 0'i32:
+    pick.why = "the nativeUi primitive layer is OFF or self-disabled; nothing " &
+               "was examined"
+    return false
+  if not nuOk(anchor, 0x10'i32) or not nuAlive(anchor):
+    pick.why = "the anchor is null, unreadable or destroyed. iSceneRoots(nil) " &
+               "falls back to the inspector's own preloader pointer, so " &
+               "guessing here would silently search nothing"
+    return false
+
+  var roots: seq[Il2CppPtr] = @[]
+  discard iSceneRoots(roots, false, anchor)
+  pick.rootsSeen = roots.len
+  if roots.len == 0:
+    pick.why = "the scene-root walk returned NO roots at all, so nothing was " &
+               "examined. This is not absence"
+    return false
+
+  var lim = roots.len
+  if lim > NkMaxRoots:
+    lim = NkMaxRoots                            # capped iteration
+    pick.scope = "TRUNCATED"
+  var bestArea = 0'f32
+  for i in 0 ..< lim:
+    let rootTr = roots[i]                       # TRANSFORM, by iSceneRoots' contract
+    if not nuOk(rootTr, 0x10'i32) or not nuAlive(rootTr): continue
+    inc pick.walked
+    var comp: Il2CppPtr = nil                   # the CANVAS COMPONENT
+    var why = ""
+    if not iVisComponent(rootTr, "Canvas", comp, why):
+      continue                                  # could not look != absent
+    inc pick.asked
+    if comp == nil: continue
+    if not nuOk(comp, 0x10'i32) or not nuAlive(comp): continue
+    inc pick.candidates
+    var mode = -1
+    var w2 = ""
+    if iVisI32("Canvas::get_renderMode", comp, mode, w2) and mode == 2:
+      # WorldSpace: UI parented here is somewhere in the map, not on the
+      # screen. Accepting it would be an INVISIBLE SUCCESS.
+      inc pick.worldSpace
+      continue
+    let go = nuGameObjectOf(comp)               # GAMEOBJECT
+    if go == nil or not nuOk(go, 0x10'i32) or not nuAlive(go):
+      inc pick.rejected
+      continue
+    if not nuActiveInHierarchy(go):
+      inc pick.rejected                         # inactive: renders nothing
+      continue
+    let tr = nuTransformOf(go)                  # RECTTRANSFORM
+    if tr == nil or not nuOk(tr, 0x10'i32) or not nuAlive(tr):
+      inc pick.rejected
+      continue
+    let (okR, _, _, rw, rh) = nuGetRect(tr)     # READ BACK, never assumed
+    if not okR or not (rw >= minPx) or not (rh >= minPx):
+      inc pick.rejected
+      continue
+    let area = rw * rh
+    if area > bestArea:
+      bestArea = area
+      pick.comp = comp
+      pick.go = go
+      pick.tr = tr
+      pick.w = rw
+      pick.h = rh
+
+  if pick.go == nil:
+    if pick.asked == 0:
+      pick.verdict = "INCONCLUSIVE"
+      pick.why = "walked " & $pick.walked & " root(s) and could ask NONE of " &
+                 "them for a Canvas component. Nothing was examined"
+    else:
+      pick.verdict = "ABSENT"
+      pick.why = "asked " & $pick.asked & " root(s), " & $pick.candidates &
+                 " carried a Canvas, " & $pick.worldSpace & " were WorldSpace " &
+                 "and " & $pick.rejected & " failed alive+active+>=" &
+                 formatFloat(float64(minPx), ffDecimal, 1) & "px. That IS an " &
+                 "answer for the roots reachable right now"
+    return false
+  pick.verdict = "FOUND"
+  pick.why = "largest of " & $pick.candidates & " Canvas candidate(s) that " &
+             "passed alive+activeInHierarchy+rect readback"
+  true
+
 proc nuFindCanvas*(anchor: Il2CppPtr): Il2CppPtr =
   ## The GameObject of a live, screen-space Canvas to parent UI into, or nil.
-  ##
-  ## Preference order, and each step is an ANSWER rather than an assumption:
-  ## a Canvas whose `get_renderMode` really reads ScreenSpaceOverlay(0) or
-  ## ScreenSpaceCamera(1) wins over one whose render mode could not be read at
-  ## all; a WorldSpace(2) canvas is skipped, because UI parented into one is
-  ## somewhere in the map rather than on the screen and would be an invisible
-  ## success.
+  ## A THIN FORWARD to `nuCanvasFind` -- kept only so existing callers do not
+  ## change. It applies no minimum size (`minPx = 0`), which is why nuikit's
+  ## self-test can still parent into a small menu canvas.
   result = nil
   if not nkReady("findCanvas"): return nil
 
@@ -315,64 +481,16 @@ proc nuFindCanvas*(anchor: Il2CppPtr): Il2CppPtr =
           "usual reason); re-walking"
     gNkCanvasGo = nil
 
-  if not nuOk(anchor, 0x10'i32) or not nuAlive(anchor):
-    nkRefuse("findCanvas", "the anchor is null, unreadable or destroyed. This " &
-             "toolkit will not guess a scene: pass a LIVE object you already " &
-             "validated (invoke2's `gMi2TmpOwner` is the one every proof uses)")
+  var pick = NuCanvasPick()
+  if not nuCanvasFind(anchor, 0'f32, pick):
+    nkRefuse("findCanvas", nuCanvasLedger(pick))
     return nil
-
-  var roots: seq[Il2CppPtr] = @[]
-  let n = iSceneRoots(roots, false, anchor)
-  if n <= 0 or roots.len == 0:
-    nkRefuse("findCanvas", "the inspector's scene-root walk returned no roots " &
-             "at all. NOTHING was examined, so this says nothing about whether " &
-             "a canvas exists -- it is INCONCLUSIVE, not absence")
-    return nil
-
-  var best: Il2CppPtr = nil
-  var bestMode = -1
-  var asked = 0
-  var lim = roots.len
-  if lim > NkMaxRoots: lim = NkMaxRoots        # capped iteration
-  for i in 0 ..< lim:
-    let root = roots[i]
-    if not nuOk(root, 0x10'i32): continue
-    var comp: Il2CppPtr = nil
-    var why = ""
-    if not iVisComponent(root, "Canvas", comp, why):
-      continue                                  # could not look != absent
-    inc asked
-    if comp == nil: continue
-    var mode = -1
-    var w2 = ""
-    let readMode = iVisI32("Canvas::get_renderMode", comp, mode, w2)
-    if readMode and mode == 2: continue         # WorldSpace: not on screen
-    let score = (if readMode and (mode == 0 or mode == 1): 2 else: 1)
-    if score > bestMode:
-      bestMode = score
-      best = comp
-
-  if best == nil:
-    nkRefuse("findCanvas", "walked " & $lim & " scene root(s) and could ask " &
-             $asked & " of them for a Canvas; none carried a screen-space one. " &
-             (if asked == 0: "Asking failed on every root, so this is " &
-                             "INCONCLUSIVE, not 'there is no canvas'."
-              else: "That is an ANSWER for the roots reachable right now."))
-    return nil
-
-  let go = nuGameObjectOf(best)
-  if go == nil or not nuAlive(go):
-    nkRefuse("findCanvas", "found a Canvas component but could not reach a " &
-             "live GameObject for it")
-    return nil
-  gNkCanvasGo = go
-  okLog "nuikit: canvas found -- Canvas=0x" & hexOf(cast[uint64](best)) &
-        " GameObject=0x" & hexOf(cast[uint64](go)) & " renderMode=" &
-        (if bestMode == 2: "screen-space (read back from Canvas::get_renderMode)"
-         else: "UNREAD (the canvas was accepted on presence alone)") &
-        ", via the LIVE INSPECTOR's iSceneRoots + iVisComponent walk over " &
-        $lim & " root(s)"
-  result = go
+  gNkCanvasGo = pick.go
+  okLog "nuikit: " & nuCanvasLedger(pick) & " Canvas=0x" &
+        hexOf(cast[uint64](pick.comp)) & " GameObject=0x" &
+        hexOf(cast[uint64](pick.go)) &
+        " -- via nuCanvasFind, the host's ONE canvas-acquisition function"
+  result = pick.go
 
 # ---------------------------------------------------------------------------
 # CONSTRUCTORS
