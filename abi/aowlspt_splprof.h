@@ -42,14 +42,27 @@
 
 /* Requires aowlspt_drainprof.h (aowl_dp_enabled / QPC frequency). */
 
+/* The phases PARTITION the guarded body: disjoint, and together exhaustive up
+ * to the UNEXPLAINED remainder the reporter always prints. CONTROL is not part
+ * of the partition -- it is the honesty probe.
+ *
+ * MAINT used to be ONE slot and measured 576.5us/call over 4400 calls (36.3% of
+ * the whole) in the 146412a run. One number over four independent jobs cannot
+ * say which of them costs that, so it is now split into three disjoint slots.
+ * DESCEND, likewise, measured 23578.8us/call over 113 calls (38.1%) while the
+ * code that calls it described it as "cheap"; CHEAPHUNT separates the per-frame
+ * tier-1 descent from the throttled wide one so that claim is falsifiable. */
 #define AOWL_SP_PRE       0   /* liveness + staleness checks before discovery */
 #define AOWL_SP_ROOTS     1   /* scene-root enumeration inside splFindScreen   */
-#define AOWL_SP_DESCEND   2   /* splFindByName: the by-name descent            */
-#define AOWL_SP_SCAN      3   /* splScanNode: the by-text scan in the screen   */
-#define AOWL_SP_MAINT     4   /* splMaintain: the steady-state re-assert       */
-#define AOWL_SP_DIAG      5   /* diagnostics + summary string building         */
-#define AOWL_SP_CTRL      6   /* THE POSITIVE CONTROL                          */
-#define AOWL_SP_SLOTS     7
+#define AOWL_SP_DESCEND   2   /* splFindByName under the WIDE (throttled) walk  */
+#define AOWL_SP_CHEAP     3   /* splFindByName under the tier-1 cached UI root  */
+#define AOWL_SP_SCAN      4   /* splScanNode: the by-text scan in the screen   */
+#define AOWL_SP_MHEAD     5   /* splMaintain: heading + description re-assert  */
+#define AOWL_SP_MTOG      6   /* splMaintain: practice toggle force + hide     */
+#define AOWL_SP_MWARN     7   /* splMaintain: co-op warning hide               */
+#define AOWL_SP_DIAG      8   /* diagnostics + summary string building         */
+#define AOWL_SP_CTRL      9   /* THE POSITIVE CONTROL                          */
+#define AOWL_SP_SLOTS     10
 
 /* The tail threshold. A call over this is a frame the player felt. */
 #define AOWL_SP_SLOW_NS   10000000LL   /* 10 ms */
@@ -58,6 +71,12 @@
 static int64_t g_sp_ns[AOWL_SP_SLOTS];
 static int64_t g_sp_calls[AOWL_SP_SLOTS];
 static int64_t g_sp_max_ns[AOWL_SP_SLOTS];
+/* Samples that measured EXACTLY zero nanoseconds -- i.e. below the QPC tick
+ * (100 ns on a 10 MHz counter). Splitting a phase into sub-phases makes this
+ * reachable, and a bucket that is mostly sub-tick samples is "too small for
+ * this clock", which is NOT the same claim as "cheap" and must not print as a
+ * plain 0.0us. Rule 4, one level down. */
+static int64_t g_sp_subtick[AOWL_SP_SLOTS];
 static int64_t g_sp_total_ns = 0;      /* the WHOLE guarded call, outer bracket */
 static int64_t g_sp_total_calls = 0;
 static int64_t g_sp_total_max_ns = 0;
@@ -97,6 +116,7 @@ static void aowl_sp_add(int32_t slot, int64_t t0) {
     if (slot < 0 || slot >= AOWL_SP_SLOTS) return;
     ns = aowl_sp_delta_ns(t0);
     if (ns < 0) return;
+    if (ns == 0) g_sp_subtick[slot]++;
     g_sp_ns[slot] += ns;
     g_sp_calls[slot]++;
     g_sp_cur[slot] += ns;
@@ -150,6 +170,7 @@ static void aowl_sp_control(void) {
 static int64_t aowl_sp_ns(int32_t i)      { return (i >= 0 && i < AOWL_SP_SLOTS) ? g_sp_ns[i] : -1; }
 static int64_t aowl_sp_calls(int32_t i)   { return (i >= 0 && i < AOWL_SP_SLOTS) ? g_sp_calls[i] : -1; }
 static int64_t aowl_sp_max(int32_t i)     { return (i >= 0 && i < AOWL_SP_SLOTS) ? g_sp_max_ns[i] : -1; }
+static int64_t aowl_sp_subtick(int32_t i) { return (i >= 0 && i < AOWL_SP_SLOTS) ? g_sp_subtick[i] : -1; }
 static int64_t aowl_sp_slow_by(int32_t i) { return (i >= 0 && i < AOWL_SP_SLOTS) ? g_sp_slow_by[i] : -1; }
 static int64_t aowl_sp_total_ns(void)     { return g_sp_total_ns; }
 static int64_t aowl_sp_total_calls(void)  { return g_sp_total_calls; }
