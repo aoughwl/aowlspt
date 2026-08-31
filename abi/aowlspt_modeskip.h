@@ -204,6 +204,10 @@ static const AowlMskTarget aowl_msk_targets[] = {
 static int32_t aowl_msk_base_found = 0;
 static int32_t aowl_msk_verified   = 0;
 static int32_t aowl_msk_rejected   = 0;
+/* Verifies refused because the SHARED prologue snapshot table was full --
+ * our capacity limit, not a client change. Kept apart from `rejected` so a
+ * refusal can never be reported as "this build changed". */
+static int32_t aowl_msk_profull = 0;
 
 static void* aowl_msk_fn(int32_t i) {
     HMODULE ga;
@@ -225,6 +229,11 @@ static void* aowl_msk_fn(int32_t i) {
         return NULL;
     /* Against the SNAPSHOT, never live memory. See aowlspt_prologue.h. */
     if (t->siglen > 0 && !aowl_pro_verify(t->rva, t->sig, t->siglen)) {
+        /* TWO DIFFERENT FAILURES, TWO DIFFERENT REASONS. A verify that failed
+         * because OUR snapshot table had no free row says nothing about the
+         * client, so it is counted separately and never latched as a
+         * signature mismatch. See aowl_pro_last_reason_text(). */
+        if (aowl_pro_last_was_table_full()) { aowl_msk_profull++; return NULL; }
         aowl_msk_rejected++;
         return NULL;
     }
@@ -244,6 +253,7 @@ static int32_t aowl_msk_target_count(void) { return AOWL_MSK_TARGET_COUNT; }
 static int32_t aowl_msk_base_ok(void)      { return aowl_msk_base_found; }
 static int32_t aowl_msk_ok_count(void)     { return aowl_msk_verified; }
 static int32_t aowl_msk_bad_count(void)    { return aowl_msk_rejected; }
+static int32_t aowl_msk_profull_count(void){ return aowl_msk_profull; }
 
 static int32_t aowl_msk_off_status(void)    { return AOWL_MSK_PD_STATUS_OFF; }
 static int32_t aowl_msk_off_nickname(void)  { return AOWL_MSK_PD_NICKNAME_OFF; }

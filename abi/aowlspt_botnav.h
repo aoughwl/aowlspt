@@ -182,6 +182,10 @@ typedef struct AowlBotNavTarget {
 static int32_t aowl_botnav_base_found = 0;
 static int32_t aowl_botnav_sig_ok     = 0;
 
+/* Refusals, kept apart so a capacity failure is never read as a build change. */
+static int32_t aowl_botnav_profull  = 0;
+static int32_t aowl_botnav_mismatch = 0;
+
 static const AowlBotNavTarget aowl_botnav_targets[] = {
     /* EFT.BotOwner::UpdateManual @ 0x81B7C0 -- per bot, per frame, RCX=BotOwner */
     { "EFT.BotOwner::UpdateManual", 0x81B7C0u,
@@ -221,7 +225,13 @@ static void* aowl_botnav_verify(uint32_t rva, const unsigned char* sig,
      * first, so a stale RVA on an uncommitted page is refused before any read.
      * The GoToPoint / StopMove / SetTargetMoveSpeed call targets go through the
      * same path for the same reason. */
-    if (siglen > 0 && !aowl_pro_verify(rva, sig, siglen)) return NULL;
+    if (siglen > 0 && !aowl_pro_verify(rva, sig, siglen)) {
+        /* Refusing is right either way, but WHY differs: a full snapshot
+         * table is our own capacity limit, not evidence about the client. */
+        if (aowl_pro_last_was_table_full()) aowl_botnav_profull++;
+        else aowl_botnav_mismatch++;
+        return NULL;
+    }
     return (void*)p;
 }
 
@@ -241,6 +251,8 @@ static const char* aowl_botnav_target_name(int32_t i) {
 }
 
 static int32_t aowl_botnav_target_count(void) { return AOWL_BOTNAV_TARGET_COUNT; }
+static int32_t aowl_botnav_profull_count(void){ return aowl_botnav_profull; }
+static int32_t aowl_botnav_mismatch_count(void){ return aowl_botnav_mismatch; }
 
 /* ===================== guarded raw primitives (read-only) ================== */
 

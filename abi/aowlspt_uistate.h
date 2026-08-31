@@ -143,6 +143,11 @@ static const AowlUiTarget aowl_ui_targets[] = {
 
 static int32_t aowl_ui_verified = 0;
 static int32_t aowl_ui_rejected = 0;
+/* Verifies refused because the SHARED prologue snapshot table was full --
+ * our capacity limit, not a client change. Kept apart from `rejected` so a
+ * refusal can never be reported as "this build changed". */
+static int32_t aowl_ui_profull = 0;
+static int32_t aowl_ui_profull_count(void){ return aowl_ui_profull; }
 static int32_t aowl_ui_faults   = 0;
 static int32_t aowl_ui_off      = 0;   /* self-disabled bit0 probe */
 static int32_t aowl_ui_last_open = -1; /* 1 open, 0 closed, -1 inconclusive */
@@ -163,6 +168,11 @@ static void* aowl_ui_fn(int32_t i) {
                          PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
         return NULL;
     if (t->siglen > 0 && !aowl_pro_verify(t->rva, t->sig, t->siglen)) {
+        /* TWO DIFFERENT FAILURES, TWO DIFFERENT REASONS. A verify that failed
+         * because OUR snapshot table had no free row says nothing about the
+         * client, so it is counted separately and never latched as a
+         * signature mismatch. See aowl_pro_last_reason_text(). */
+        if (aowl_pro_last_was_table_full()) { aowl_ui_profull++; return NULL; }
         aowl_ui_rejected++;
         return NULL;
     }

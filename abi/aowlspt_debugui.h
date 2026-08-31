@@ -576,6 +576,10 @@ static const AowlDuTarget aowl_du_targets[] = {
 
 static int32_t aowl_du_verified = 0;
 static int32_t aowl_du_rejected = 0;
+/* Verifies refused because the SHARED prologue snapshot table was full --
+ * our capacity limit, not a client change. Kept apart from `rejected` so a
+ * refusal can never be reported as "this build changed". */
+static int32_t aowl_du_profull = 0;
 
 /* PER-TARGET RESOLUTION STATE: 0 untried, 1 verified, 2 rejected.
  *
@@ -617,6 +621,10 @@ static void* aowl_du_fn_full(int32_t i) {
      * `aowlspt_prologue.h`. Symmetrical with the mode-text verifier: whichever
      * of the two features binds second must still be able to verify. */
     if (t->siglen > 0 && !aowl_pro_verify(t->rva, t->sig, t->siglen)) {
+        /* TWO DIFFERENT FAILURES. A verify refused because OUR snapshot
+         * table had no free row says nothing about the client build, so it
+         * is counted apart and NOT latched as a permanent rejection. */
+        if (aowl_pro_last_was_table_full()) { aowl_du_profull++; return NULL; }
         /* Counted ONCE, on first rejection. See `aowl_du_state`. */
         if (aowl_du_state[i] == 0) { aowl_du_state[i] = 2; aowl_du_rejected++; }
         return NULL;
@@ -659,6 +667,7 @@ static uint32_t aowl_du_rva(int32_t i) {
     return aowl_du_targets[i].rva;
 }
 static int32_t aowl_du_target_count(void) { return AOWL_DU_TARGET_COUNT; }
+static int32_t aowl_du_profull_count(void){ return aowl_du_profull; }
 /* Distinct targets, never call counts. Both are now bounded by
  * AOWL_DU_TARGET_COUNT by construction: a target transitions out of state 0
  * exactly once, and only one of the two counters is incremented when it does.
@@ -711,8 +720,14 @@ static void* aowl_du_preloader_update_target(void) {
      * patch, which is the only way the sharing can work. */
     if (!aowl_pro_verify(AOWL_DU_PRELOADER_UPDATE_RVA,
                          aowl_du_preloader_update_sig,
-                         (int32_t)sizeof(aowl_du_preloader_update_sig)))
+                         (int32_t)sizeof(aowl_du_preloader_update_sig))) {
+        /* Distinguish OUR capacity limit from a real byte mismatch: the
+         * shared-detour multiplex hangs off this verify, and reporting an
+         * exhausted table as "did not verify on this build" is precisely
+         * the confidently-wrong diagnostic this file was written to end. */
+        if (aowl_pro_last_was_table_full()) aowl_du_profull++;
         return NULL;
+    }
     return (void*)p;
 }
 static uint32_t aowl_du_preloader_update_rva(void) {

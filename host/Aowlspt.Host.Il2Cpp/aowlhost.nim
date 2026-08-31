@@ -1030,6 +1030,14 @@ proc cGtLine(i: int32): cstring {.importc: "aowl_gt_line", nodecl.}
 var gGatesOn = false
 proc cProBadCount(): int32 {.importc: "aowl_pro_bad_count", nodecl.}
 proc cProHave(rva: uint32): int32 {.importc: "aowl_pro_have", nodecl.}
+## THE OVERFLOW REPORT. `aowl_pro_full` was incremented on every refused row and
+## read by NOTHING, so a table that had run out of rows was invisible: the
+## affected features' verifies failed closed and each of them reported the
+## refusal as a prologue MISMATCH, i.e. as a claim about the game build. These
+## exist so the boot log states the snapshot's capacity health outright.
+proc cProCapacity(): int32 {.importc: "aowl_pro_capacity", nodecl.}
+proc cProFullCount(): int32 {.importc: "aowl_pro_full_count", nodecl.}
+proc cProHealthLine(): cstring {.importc: "aowl_pro_health_line", nodecl.}
 ## THE prologue verify, bound here because patch-by-RVA is its first caller on
 ## the Nim side. It compares against the STARTUP SNAPSHOT, never live memory --
 ## which is the whole reason a second feature can verify a function a first
@@ -8442,6 +8450,26 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
              else: "") & "). Every later prologue check compares against " &
             "this, not against live memory, so two features may share one " &
             "target and both still verify it."
+
+      # CAPACITY, STATED OUT LOUD. A full snapshot table makes `aowl_pro_verify`
+      # return 0 for an RVA that was never captured -- byte-for-byte the same
+      # answer as "the bytes differ" -- so every affected feature then reports
+      # itself unverified and blames the client build. `aowl_pro_full` counted
+      # exactly that and NOTHING read it, which is how it could have been
+      # happening for a whole release without anyone knowing.
+      #
+      # MEASURED when this was added: 155 distinct RVAs across abi/*.h against a
+      # 128-row table. The bound is now 512. This line exists so the next time
+      # it fills, the log says so instead of the features lying about why.
+      if int(cProFullCount()) > 0:
+        fail readCString(cProHealthLine())
+        fail "READ THAT AS: the features whose RVAs were dropped have NOT been " &
+            "verified and will refuse to bind. That is our capacity limit, " &
+            "not a changed game build -- do not go hunting a client update. " &
+            "Raise AOWL_PRO_MAX_ROWS in abi/aowlspt_prologue.h (currently " &
+            $int(cProCapacity()) & ") and rebuild."
+      else:
+        okLog readCString(cProHealthLine())
 
       # THE TOKEN-GATE LAYER, and it belongs exactly here: GameAssembly.dll
       # is now mapped (the runtime came up through it), and no `bind*`

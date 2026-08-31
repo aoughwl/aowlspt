@@ -156,6 +156,10 @@ static const AowlMtxTarget aowl_mtx_targets[] = {
 static int32_t aowl_mtx_base_found = 0;
 static int32_t aowl_mtx_verified   = 0;
 static int32_t aowl_mtx_rejected   = 0;
+/* Verifies refused because the SHARED prologue snapshot table was full --
+ * our capacity limit, not a client change. Kept apart from `rejected` so a
+ * refusal can never be reported as "this build changed". */
+static int32_t aowl_mtx_profull = 0;
 
 static void* aowl_mtx_fn(int32_t i) {
     HMODULE ga;
@@ -181,6 +185,11 @@ static void* aowl_mtx_fn(int32_t i) {
      * what made this feature reject a target that was always correct. See
      * `aowlspt_prologue.h`. */
     if (t->siglen > 0 && !aowl_pro_verify(t->rva, t->sig, t->siglen)) {
+        /* TWO DIFFERENT FAILURES, TWO DIFFERENT REASONS. A verify that failed
+         * because OUR snapshot table had no free row says nothing about the
+         * client, so it is counted separately and never latched as a
+         * signature mismatch. See aowl_pro_last_reason_text(). */
+        if (aowl_pro_last_was_table_full()) { aowl_mtx_profull++; return NULL; }
         aowl_mtx_rejected++;
         return NULL;
     }
@@ -196,6 +205,7 @@ static uint32_t aowl_mtx_rva(int32_t i) {
     return aowl_mtx_targets[i].rva;
 }
 static int32_t aowl_mtx_target_count(void) { return AOWL_MTX_TARGET_COUNT; }
+static int32_t aowl_mtx_profull_count(void){ return aowl_mtx_profull; }
 static int32_t aowl_mtx_base_ok(void)      { return aowl_mtx_base_found; }
 static int32_t aowl_mtx_ok_count(void)     { return aowl_mtx_verified; }
 static int32_t aowl_mtx_bad_count(void)    { return aowl_mtx_rejected; }

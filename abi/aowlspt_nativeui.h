@@ -576,6 +576,10 @@ static uint32_t aowl_nu_target_rva(int32_t i) {
 
 static int32_t aowl_nu_verified = 0;
 static int32_t aowl_nu_rejected = 0;
+/* Verifies refused because the SHARED prologue snapshot table was full --
+ * our capacity limit, not a client change. Kept apart from `rejected` so a
+ * refusal can never be reported as "this build changed". */
+static int32_t aowl_nu_profull = 0;
 static int32_t aowl_nu_faults   = 0;
 
 /* WHY A TARGET WAS REFUSED -- and the live bug that made this necessary.
@@ -605,6 +609,9 @@ static int32_t aowl_nu_faults   = 0;
 #define AOWL_NU_WHY_MISMATCH    4   /* THE REAL ONE: bytes differ            */
 #define AOWL_NU_WHY_DISABLED    5   /* the layer has self-disabled           */
 #define AOWL_NU_WHY_BADINDEX    6
+#define AOWL_NU_WHY_PROFULL     7   /* OURS: the shared prologue snapshot
+                                     * table was full; the RVA was never
+                                     * captured. NOT a client change. */
 
 static int32_t aowl_nu_why[AOWL_NU_TARGET_COUNT];
 
@@ -638,6 +645,7 @@ static int32_t aowl_nu_disabled(void) {
 static void aowl_nu_note_fault(void) { aowl_nu_faults++; }
 static int32_t aowl_nu_fault_count(void)  { return aowl_nu_faults; }
 static int32_t aowl_nu_target_count(void) { return AOWL_NU_TARGET_COUNT; }
+static int32_t aowl_nu_profull_count(void){ return aowl_nu_profull; }
 static int32_t aowl_nu_ok_count(void)     { return aowl_nu_verified; }
 static int32_t aowl_nu_bad_count(void)    { return aowl_nu_rejected; }
 
@@ -682,6 +690,15 @@ static void* aowl_nu_fn_full(int32_t i) {
         return NULL;
     }
     if (t->siglen > 0 && !aowl_pro_verify(t->rva, t->sig, t->siglen)) {
+        /* TWO DIFFERENT FAILURES, TWO DIFFERENT REASONS. A verify that failed
+         * because OUR snapshot table had no free row says nothing about the
+         * client, so it is counted separately and never latched as a
+         * signature mismatch. See aowl_pro_last_reason_text(). */
+        if (aowl_pro_last_was_table_full()) {
+            aowl_nu_why[i] = AOWL_NU_WHY_PROFULL;
+            aowl_nu_profull++;
+            return NULL;
+        }
         aowl_nu_why[i] = AOWL_NU_WHY_MISMATCH;
         aowl_nu_rejected++;
         return NULL;

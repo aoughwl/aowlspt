@@ -243,6 +243,10 @@ static const AowlCamTarget aowl_cam_targets[] = {
 
 static int32_t       aowl_cam_verified = 0;
 static int32_t       aowl_cam_rejected = 0;
+/* Verifies refused because the SHARED prologue snapshot table was full --
+ * our capacity limit, not a client change. Kept apart from `rejected` so a
+ * refusal can never be reported as "this build changed". */
+static int32_t aowl_cam_profull = 0;
 /* 0 untried, 1 verified, 2 rejected -- one entry per TARGET, so the counters
  * above cannot climb past AOWL_CAM_TARGET_COUNT however often we resolve. */
 static unsigned char aowl_cam_state[AOWL_CAM_TARGET_COUNT];
@@ -297,6 +301,15 @@ static void* aowl_cam_fn(int32_t i) {
     }
     /* STARTUP SNAPSHOT, not live memory. */
     if (t->siglen > 0 && !aowl_pro_verify(t->rva, t->sig, t->siglen)) {
+        /* TWO DIFFERENT FAILURES, TWO DIFFERENT REASONS. A verify that failed
+         * because OUR snapshot table had no free row is not evidence about the
+         * client at all, so it must not be reported as a signature mismatch
+         * and must NOT latch this target as permanently rejected. */
+        if (aowl_pro_last_was_table_full()) {
+            aowl_cam_profull++;
+            aowl_cam_last_reason = 9;   /* snapshot table full -- ours */
+            return NULL;
+        }
         if (aowl_cam_state[i] == 0) { aowl_cam_state[i] = 2; aowl_cam_rejected++; }
         aowl_cam_last_reason = 5;
         return NULL;
@@ -318,6 +331,7 @@ static int32_t aowl_cam_target_count(void) { return AOWL_CAM_TARGET_COUNT; }
 static int32_t aowl_cam_ok_count(void)     { return aowl_cam_verified; }
 static int32_t aowl_cam_bad_count(void)    { return aowl_cam_rejected; }
 static int32_t aowl_cam_reason(void)       { return aowl_cam_last_reason; }
+static int32_t aowl_cam_profull_count(void){ return aowl_cam_profull; }
 /* Human-readable form of the last reason, so a refusal in the log names the
  * cause instead of a bare integer the reader has to look up in this file. */
 static const char* aowl_cam_reason_text(void) {
