@@ -76,6 +76,7 @@ type
 
   Anchor = object
     isLoot: bool
+    isQuest: bool
     x, y, z: float
     score: float
 
@@ -115,6 +116,25 @@ var
   gMeasured = 0          ## distinct bots we ever had two readings for
   gSkipped = 0           ## anchors dropped by a coverage roll or a value gate
   gUnreachable = 0       ## anchors dropped because navStatus said 2
+
+  # ------------------------------------------------------------------
+  # The census counters. THE WHOLE POINT OF THIS BLOCK: before it, a raid in
+  # which no bot was ever dispatched printed the plan line ("Bots will be
+  # dispatched on the next census") and then NOTHING -- and "the dispatcher
+  # never ran" was indistinguishable from "it ran and declined every bot".
+  # That gap cost this project entire sessions. Every census now prints how
+  # many bots it saw, how many were eligible, how many were ordered, and the
+  # count for each named reason the rest were not.
+  # ------------------------------------------------------------------
+  gCensuses = 0          ## censuses `dispatchFor` was actually entered on
+  gCensusLogged = 0
+  gcNotAlive = 0         ## the census row said the bot is dead
+  gcNoSlot = 0           ## the 32-bot slot table is full
+  gcUnreachableNow = 0   ## navStatus == 2 this census, anchor surrendered
+  gcDeclined = 0         ## no anchor left this bot wants (coverage roll/gate)
+  gcTourReset = 0        ## toured every anchor it wanted; skip list cleared
+  gcArrived = 0          ## reached its anchor this census, re-assigned
+  gcCapped = 0           ## MaxOrdersPerCensus reached, bot not looked at
 
 proc toCorePersonality*(p: Personality): types.Personality =
   ## The bridge to `core/decide.nim`'s ladder, so that the same personality
@@ -234,8 +254,10 @@ proc onPlan(payload: string): string =
   var i = 0
   while i < n and gAnchorLen < MaxAnchors:
     let a = at(anchors, i)
+    let kind = asText(field(a, "kind"), "")
     gAnchors[gAnchorLen] = Anchor(
-      isLoot: asText(field(a, "kind"), "") == "loot",
+      isLoot: kind == "loot",
+      isQuest: kind == "questPoi",
       x: asFloat(field(a, "x"), 0.0),
       y: asFloat(field(a, "y"), 0.0),
       z: asFloat(field(a, "z"), 0.0),
@@ -280,9 +302,22 @@ proc onPlan(payload: string): string =
     inc k
   gSlotLen = 0
   gHavePlan = gAnchorLen > 0
+  gCensuses = 0
+  gCensusLogged = 0
+  var quest = 0
+  var loot = 0
+  var k2 = 0
+  while k2 < gAnchorLen:
+    if gAnchors[k2].isQuest: inc quest
+    if gAnchors[k2].isLoot: inc loot
+    inc k2
   info "sain/dispatch: flanking plan for '" & gPlanMap & "' -- " &
-       $gAnchorLen & " anchors, leash " & $int(gLeash) & "m, reach " &
-       $int(gReach) & "m. Bots will be dispatched on the next census"
+       $gAnchorLen & " anchors (" & $quest & " questPoi, " & $loot &
+       " loot, " & $(gAnchorLen - quest - loot) & " spawn-derived), leash " &
+       $int(gLeash) & "m, reach " & $int(gReach) &
+       "m. Every census from here on prints a `dispatch census` counter " &
+       "line, so a raid where nothing is dispatched now says WHY instead of " &
+       "printing nothing at all"
 
 proc startDispatch*(forcePersonality: types.Personality;
                     logDecisions: bool): bool =
@@ -423,6 +458,14 @@ proc dispatchFor*(bots: seq[BotInfo]): seq[BotCommand] =
   result = @[]
   if not dispatchArmed():
     return
+  inc gCensuses
+  var cNotAlive = 0
+  var cNoSlot = 0
+  var cUnreach = 0
+  var cDeclined = 0
+  var cTourReset = 0
+  var cArrived = 0
+  var cCapped = 0
 
   # The leader is the lowest live bot id in this census. It is not a squad in
   # the game's sense -- the census carries no group id and there is no member
@@ -442,13 +485,21 @@ proc dispatchFor*(bots: seq[BotInfo]): seq[BotCommand] =
       leaderAnchor = gSlots[ls].anchor
 
   i = 0
-  while i < bots.len and result.len < MaxOrdersPerCensus:
+  while i < bots.len:
     let b = bots[i]
     inc i
     if not b.alive:
+      inc cNotAlive
+      continue
+    if result.len >= MaxOrdersPerCensus:
+      # Counted rather than silently left out of the loop. A raid where the
+      # census is bigger than the order budget looks exactly like a raid where
+      # most bots were declined, unless this number exists.
+      inc cCapped
       continue
     let s = slotFor(b.id)
     if s < 0:
+      inc cNoSlot
       continue
     gSlots[s].role = b.role
     inc gSlots[s].sightings
@@ -459,6 +510,7 @@ proc dispatchFor*(bots: seq[BotInfo]): seq[BotCommand] =
     if b.navStatus == 2 and gSlots[s].anchor >= 0:
       markSkipped(s, gSlots[s].anchor)
       inc gUnreachable
+      inc cUnreach
       gSlots[s].anchor = -1
       gSlots[s].haveDist = false
 
@@ -480,6 +532,7 @@ proc dispatchFor*(bots: seq[BotInfo]): seq[BotCommand] =
         # Arrived. Give up this anchor for good and take another, which is what
         # makes a bot tour the map rather than stand on one crate all raid.
         markSkipped(s, a)
+        inc cArrived
         inc gSlots[s].arrivals
         gSlots[s].anchor = -1
         gSlots[s].haveDist = false
@@ -495,8 +548,10 @@ proc dispatchFor*(bots: seq[BotInfo]): seq[BotCommand] =
         # its verdicts, which is the coverage roll doing its job.
         if gSlots[s].arrivals > 0:
           gSlots[s].skip = 0'u32
+          inc cTourReset
         else:
           inc gSkipped
+          inc cDeclined
         continue
       gSlots[s].anchor = want
       gSlots[s].haveDist = false
@@ -528,7 +583,58 @@ proc dispatchFor*(bots: seq[BotInfo]): seq[BotCommand] =
     if gLog:
       info "sain/dispatch: bot " & $b.id & " (" & persName(gSlots[s].pers) &
            ") -> anchor " & $a & " at " & $int(tx) & "," & $int(tz) &
-           ", navStatus " & $b.navStatus
+           ", navStatus " & $b.navStatus & (if gAnchors[a].isQuest:
+             " [questPoi]" elif gAnchors[a].isLoot: " [loot]" else: "")
+
+  gcNotAlive = gcNotAlive + cNotAlive
+  gcNoSlot = gcNoSlot + cNoSlot
+  gcUnreachableNow = gcUnreachableNow + cUnreach
+  gcDeclined = gcDeclined + cDeclined
+  gcTourReset = gcTourReset + cTourReset
+  gcArrived = gcArrived + cArrived
+  gcCapped = gcCapped + cCapped
+
+  # WHEN this prints. Not `gLog`-gated: the whole defect being fixed is a raid
+  # that printed nothing, and a diagnostic behind a flag that is off by default
+  # would reproduce it exactly. Not every census either -- a 30-minute raid is
+  # thousands of them and a line per census buries everything else. So: the
+  # first three, then every 20th, PLUS every census that ordered nothing while
+  # there were live bots to order, because that is the case somebody is
+  # actually reading the log to understand.
+  let eligible = bots.len - cNotAlive - cNoSlot - cCapped
+  let loud = (eligible > 0 and result.len == 0)
+  if gCensuses <= 3 or (gCensuses mod 20) == 0 or loud:
+    inc gCensusLogged
+    var line = "sain/dispatch census " & $gCensuses & ": " & $bots.len &
+               " bots considered, " & $eligible & " eligible, " &
+               $result.len & " ordered."
+    if cNotAlive > 0: line = line & " " & $cNotAlive & " dead."
+    if cNoSlot > 0:
+      line = line & " " & $cNoSlot & " had no slot (the " & $MaxBots &
+             "-bot table is full)."
+    if cCapped > 0:
+      line = line & " " & $cCapped & " past the " & $MaxOrdersPerCensus &
+             "-order budget for this census."
+    if cUnreach > 0:
+      line = line & " " & $cUnreach &
+             " surrendered an anchor the navmesh reported unreachable " &
+             "(navStatus 2)."
+    if cArrived > 0:
+      line = line & " " & $cArrived & " arrived and were re-assigned."
+    if cDeclined > 0:
+      line = line & " " & $cDeclined &
+             " wanted no remaining anchor (coverage roll or value gate) and " &
+             "have never arrived anywhere, so their verdicts stand."
+    if cTourReset > 0:
+      line = line & " " & $cTourReset &
+             " had toured every anchor they wanted and had their skip list " &
+             "cleared."
+    if loud:
+      line = line & " NOTHING WAS DISPATCHED THIS CENSUS and there were " &
+             "live bots to dispatch -- the reasons above are the whole " &
+             "explanation, and if none of them is non-zero the bug is in " &
+             "this counting, not in the assignment."
+    info line
 
 proc dispatchCheck*(): string =
   ## PASS / FAIL / INCONCLUSIVE on the FINISHED STATE, as a negative.
@@ -552,11 +658,24 @@ proc dispatchCheck*(): string =
            "that was never BUILT and a plan that was built and never " &
            "DELIVERED look identical from here"
   if gOrdersSent == 0:
+    # NEVER RAN vs RAN AND ORDERED NOTHING. `gCensuses` is the only thing that
+    # separates them and the old message could not: it named both causes and
+    # left the reader to guess. Now it says which one happened.
+    if gCensuses == 0:
+      return "INCONCLUSIVE: a plan with " & $gAnchorLen & " anchors is " &
+             "loaded for '" & gPlanMap & "' and `dispatchFor` WAS NEVER " &
+             "ENTERED -- not one bot census reached it. That is no raid, or " &
+             "no bot in the raid, or `botNav` off in aowlspt-host.json. It " &
+             "is NOT evidence that assignment fails, because assignment " &
+             "never ran"
     return "INCONCLUSIVE: a plan with " & $gAnchorLen & " anchors is loaded " &
-           "for '" & gPlanMap & "' but no order has been issued. Either no " &
-           "census has arrived (no raid, or `botNav` off in " &
-           "aowlspt-host.json) or every anchor was declined -- " & $gSkipped &
-           " were"
+           "for '" & gPlanMap & "' and `dispatchFor` RAN on " & $gCensuses &
+           " censuses without issuing one order. Counted reasons: " &
+           $gcNotAlive & " dead, " & $gcNoSlot & " no slot, " & $gcCapped &
+           " over budget, " & $gcUnreachableNow & " unreachable, " &
+           $gcDeclined & " declined every anchor, " & $gcTourReset &
+           " tour-reset, " & $gcArrived & " arrived. This is a bot-selection " &
+           "failure, not a delivery failure"
   if gMeasured < 3:
     return "INCONCLUSIVE: only " & $gMeasured & " of the 3 bots needed were " &
            "seen twice against the same anchor. The census rotates and a " &
@@ -583,8 +702,18 @@ proc dispatchState*(): string =
   var forced = "drawn from the plan"
   if gForcedOn:
     forced = "forced to " & persName(gForced)
-  result = "dispatch: " & what & ", " & $gOrdersSent & " orders, " &
-           $gSlotLen & " bots, personality " & forced
+  var quest = 0
+  var qi = 0
+  while qi < gAnchorLen:
+    if gAnchors[qi].isQuest: inc quest
+    inc qi
+  result = "dispatch: " & what & " (" & $quest & " questPoi), " & $gCensuses &
+           " censuses entered, " & $gOrdersSent & " orders, " & $gSlotLen &
+           " bots, personality " & forced & "; skips -- " & $gcNotAlive &
+           " dead / " & $gcNoSlot & " no slot / " & $gcCapped &
+           " over budget / " & $gcUnreachableNow & " unreachable / " &
+           $gcDeclined & " declined / " & $gcTourReset & " tour-reset / " &
+           $gcArrived & " arrived"
 
 proc stopDispatch*() =
   gHavePlan = false

@@ -128,6 +128,7 @@ var
   gPairs = 0        ## how many times a bot was seen twice (the "could we look" number)
   gMovers = 0       ## how many DISTINCT bots were ever observed to move
   gReported = false
+  gNoPlanSaid = false
   gRoleScale: array[RoleCount, float]
   gRolesDiffer = false
     ## Whether any role's band differs from the global one. When false this
@@ -368,6 +369,20 @@ proc onCensus(payload: string): string =
   var orders: seq[BotCommand] = @[]
   if dispatchArmed():
     orders = dispatchFor(bots)
+  elif not gNoPlanSaid:
+    # THE GAP THIS CLOSES. A census arriving while no ORBIT plan is loaded used
+    # to take this branch and print nothing at all, so a raid in which orbit's
+    # "Bots will be dispatched on the next census" was never followed by
+    # anything looked identical to a raid in which the dispatcher ran and
+    # declined everyone. Said once, because the condition is per-raid, not
+    # per-census.
+    gNoPlanSaid = true
+    warn "sain: a bot census arrived with " & $bots.len & " bots but NO " &
+         "ORBIT plan is loaded, so no destination will be sent this raid -- " &
+         "only MoveSpeed. Either emu/orbit never built a plan for this map " &
+         "(check /aowlspt/orbit/plan) or it built one and the broadcast on " &
+         "`tarkov.orbit.plan` did not reach this mod. Those are different " &
+         "bugs and that route tells them apart"
   # The role rows are rebuilt every census the set goes out, because the
   # rotation is the whole point: a set that was not rebuilt would re-send the
   # same bots' rows and never reach the rest.
@@ -395,8 +410,11 @@ proc onCensus(payload: string): string =
     gReported = true
     info "sain: drive check " & driveCheck()
     info "sain: " & roleCoverage()
-    if dispatchArmed():
-      info "sain: dispatch check " & dispatchCheck()
+    # Unconditional now. Gating this on `dispatchArmed()` meant the one case
+    # worth reporting -- armed=false, so nothing was ever dispatched -- was the
+    # one case that printed nothing. `dispatchCheck` returns a specific
+    # INCONCLUSIVE for exactly that, which is the answer.
+    info "sain: dispatch check " & dispatchCheck()
 
 proc roleCoverage*(): string =
   ## COVERAGE, and deliberately not called a check.
