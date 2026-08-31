@@ -193,6 +193,30 @@ const
     0x48'u8, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C,
     0x24,    0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x48]
 
+  ## THE BROAD PROBE. `LoadMagazineProcess::.ctor(InventoryController,
+  ## Magazine, Ammo, int, bool, float)` @0x768D40 — measured UNIQUE
+  ## (owners=1) by `il2cpp_resolve.py shared 0x768d40`, real body (bytes
+  ## `48 89 5C 24 08 57 ...`, NOT the `C2 00 00` universal empty stub).
+  ##
+  ## It exists to make one distinction that `Start` alone cannot: whether
+  ## `LoadMagazineProcess` is CONSTRUCTED AT ALL during the load the player
+  ## performed. If the ctor fires and `Start` does not, the type is right and
+  ## the entry point is wrong. If NEITHER fires, the whole type is not on the
+  ## path the player took and the identification-by-shape was wrong. Those are
+  ## opposite fixes, and before this probe existed the log could not tell them
+  ## apart.
+  ##
+  ## It only ever does `inc`. It dereferences nothing, calls nothing and
+  ## writes nothing, on any rung.
+  ##
+  ## Shape: instance + 3 object args + int + bool + float, void return.
+  TgtProcCtor    = "LoadMagazineProcess::.ctor@0x768D40/ioooiif>x" &
+                   "!48895C2408574883EC208B05F0D79406"
+  TgtProcCtorRva = 0x768D40'u32
+  ProcCtorProlog: array[16, uint8] = [
+    0x48'u8, 0x89, 0x5C, 0x24, 0x08, 0x57, 0x48, 0x83,
+    0xEC,    0x20, 0x8B, 0x05, 0xF0, 0xD7, 0x94, 0x06]
+
   TgtFactoryCtor    = "EFT.ObjectsFactory::.ctor@0x938430/iooo>x" &
                       "!48895C240848896C2410488974241857"
   TgtFactoryCtorRva = 0x938430'u32
@@ -234,6 +258,11 @@ const
   TplIdChars = 24
 
   ## Caps, not expectations.
+  ## Heartbeat cadence for the counter report. Slow enough not to be noise in a
+  ## 40-minute raid, fast enough that a player who loads one magazine sees the
+  ## consequence within half a minute.
+  ReportEveryMs: int64 = 30000
+
   MaxSessionsLogged = 24
   MaxMeshEntries    = 32
 
@@ -386,6 +415,10 @@ var
   ## the entire guarded body silently, so a counter bumped afterwards would
   ## under-report exactly the cases that matter.
   gStartFires:   int64 = 0   ## LoadMagazineProcess::Start prefix firings
+  gCtorFires:    int64 = 0   ## LoadMagazineProcess::.ctor prefix firings (the
+                             ## broad probe: strictly earlier and broader than
+                             ## Start, so ctor>0 with start==0 is a DIFFERENT
+                             ## diagnosis from both being 0)
   gSessions:     int64 = 0   ## sessions we accepted and began
   gTplRead:      int64 = 0   ## magazine template ids successfully read
   gTplRefused:   int64 = 0   ## tpl id read that failed the 24-hex-char check
@@ -399,6 +432,14 @@ var
   gUnreadable:   int64 = 0
   gFakeNull:     int64 = 0   ## instances whose m_CachedPtr had gone zero
   gSessionsLogged = 0
+
+  ## ---- the reporting instrument (see `report`) ----
+  gCtorHooked   = false   ## did the broad probe actually install?
+  gFirstLogged  = false   ## has the unconditional FIRST-FIRING line printed?
+  gLastReportMs: int64 = 0
+  gLastReport   = ""      ## last heartbeat text, so an UNCHANGED state is
+                          ## printed on the slow cadence and a CHANGED one
+                          ## immediately.
 
   ## The live session. Exactly one at a time: this is a single-player client
   ## and upstream's per-player dictionary exists only for Fika, which we do not
@@ -779,6 +820,24 @@ proc playPutAway(): bool =
 # The trigger
 # ---------------------------------------------------------------------------
 
+proc onLoadMagazineProcCtor(frame: PatchFrame): TypedResult =
+  ## THE BROAD PROBE. Prefix on `LoadMagazineProcess::.ctor` @0x768D40.
+  ##
+  ## It counts, and on the first firing it says so. It touches NOTHING: no
+  ## pointer is dereferenced, no method is called, no memory is written, on any
+  ## rung and regardless of `mode`. That is deliberate -- a probe whose job is
+  ## to prove the plumbing must not be able to be the thing that breaks.
+  ##
+  ## No `aowl_p_p_seh` of its own: the host's guard already wraps this body and
+  ## it is NOT re-entrant.
+  result = frameContinue()
+  inc gCtorFires
+  if gCtorFires == 1'i64:
+    success "loadammoanim  BROAD PROBE FIRED: LoadMagazineProcess::.ctor " &
+            "@0x768D40 constructed. The TYPE is on the player's magazine-load " &
+            "path. If `Start` never follows this, the type is right and the " &
+            "hooked entry point is wrong."
+
 proc onLoadMagazineStart(frame: PatchFrame): TypedResult =
   ## Fires BEFORE `LoadMagazineProcess::Start` runs. This is the real
   ## equivalent of upstream's `Class1204.Start` prefix, re-identified by
@@ -794,6 +853,19 @@ proc onLoadMagazineStart(frame: PatchFrame): TypedResult =
   ## the outer rather than add protection.
   result = frameContinue()
   inc gStartFires
+  # THE FIRST FIRING ANNOUNCES ITSELF, UNCONDITIONALLY, ON EVERY RUNG
+  # INCLUDING `probe`. Before this line existed, `mode=probe` incremented a
+  # counter that only the (dead) HTTP stats route could read, so a real
+  # magazine load produced total silence -- indistinguishable from the hook
+  # never firing at all. Silence is never the output of a working feature.
+  if not gFirstLogged:
+    gFirstLogged = true
+    success "loadammoanim  FIRST FIRING: LoadMagazineProcess::Start @0x768F50 " &
+            "entered (ctorFires=" & $gCtorFires & " before it). The trigger " &
+            "IS on the path the player took. mode=" & modeName(gMode) &
+            (if gMode <= ModeProbe:
+               " -- probe counts only, nothing is read, spawned or animated."
+             else: "")
   if gRetired or gMode <= ModeProbe:
     return
 
@@ -954,6 +1026,23 @@ proc maybeArm(): bool =
       warn "loadammoanim  hookTyped refused EFT.ObjectsFactory::.ctor: " &
            lastError() & " -- the EasyAssets latch is unavailable."
 
+  # The broad probe. Verified and installed exactly like the others; a refusal
+  # is stated, never swallowed, because a MISSING probe and a probe that NEVER
+  # FIRED look identical in the heartbeat unless the heartbeat knows which.
+  let whyPCtor = verifyTarget(TgtProcCtorRva, "LoadMagazineProcess::.ctor",
+                              ProcCtorProlog)
+  if whyPCtor.len > 0:
+    warn "loadammoanim  NOT hooking the broad probe LoadMagazineProcess::.ctor: " &
+         whyPCtor & " -- the heartbeat will report ctorProbe=NOT INSTALLED, " &
+         "so a zero there must NOT be read as 'never constructed'."
+  else:
+    let st4 = hookTyped(TgtProcCtor, onLoadMagazineProcCtor)
+    if st4 == Ok:
+      gCtorHooked = true
+    else:
+      warn "loadammoanim  hookTyped refused the broad probe " &
+           "LoadMagazineProcess::.ctor: " & lastError()
+
   let whyEnd = verifyTarget(TgtEndRva, "LoadMagazineProcess::RaiseLoadEventArgs",
                             EndProlog)
   if whyEnd.len > 0:
@@ -991,6 +1080,8 @@ proc loadAmmoAnimStats*(): string =
            ",\"latched\":" & (if gLatched: "true" else: "false") &
            ",\"hijackKey\":\"" & gHijackKey & "\"" &
            ",\"startFires\":" & $gStartFires &
+           ",\"ctorProbeHooked\":" & (if gCtorHooked: "true" else: "false") &
+           ",\"ctorFires\":" & $gCtorFires &
            ",\"sessions\":" & $gSessions &
            ",\"tplRead\":" & $gTplRead &
            ",\"tplRefused\":" & $gTplRefused &
@@ -1007,7 +1098,81 @@ proc loadAmmoAnimStats*(): string =
            ",\"lastTpl\":\"" & gSessionTpl & "\"" &
            ",\"lastMesh\":\"" & gSessionMesh & "\"}"
 
-proc onStats(url, body, session: string): string =
+proc reportText(): string =
+  ## The heartbeat line. Its ONE job is to make the following three states
+  ## impossible to confuse, in words, without the reader having to know what a
+  ## zero means:
+  ##
+  ##   NOT ARMED          -- no hook is installed; a zero counter says nothing.
+  ##   ARMED, NEVER FIRED -- the hooks ARE installed and have not been entered.
+  ##   ARMED, FIRED n     -- entered n times, and here is what happened next.
+  ##
+  ## Under the old code all three printed nothing at all, and the counters were
+  ## reachable only through `serve("/aowlspt/loadammoanim/stats")` -- a route
+  ## the GAME PROCESS CANNOT SERVE, because the client host runs no HTTP
+  ## server. The numbers existed and were unreadable by construction.
+  if not gArmed:
+    return "loadammoanim  NOT ARMED" &
+           (if not gEnabled: " (enabled=false)"
+            elif gMode == ModeOff: " (mode=off)"
+            elif not gArmTried: " (waiting out armDelayMs)"
+            else: " (arming was TRIED and REFUSED -- see the warn above)") &
+           ". No hook is installed, so every counter below would be zero for " &
+           "that reason alone. This is NOT evidence about the trigger."
+
+  let probeState =
+    if not gCtorHooked: "NOT INSTALLED"
+    elif gCtorFires == 0'i64: "installed, never fired"
+    else: "fired " & $gCtorFires
+
+  if gStartFires == 0'i64 and gCtorFires == 0'i64:
+    return "loadammoanim  ARMED but NEVER FIRED. mode=" & modeName(gMode) &
+           ", latched=" & (if gLatched: "yes" else: "no") &
+           ". LoadMagazineProcess::Start @0x768F50 has been entered ZERO " &
+           "times and the broad probe LoadMagazineProcess::.ctor @0x768D40 is " &
+           probeState & ". Both are installed and verified, so this is " &
+           "'installed and never entered', NOT 'not installed'. If a magazine " &
+           "was loaded during this run, LoadMagazineProcess is NOT the type " &
+           "that in-raid load goes through and the shape-based identification " &
+           "is wrong. If no magazine was loaded, this line is INCONCLUSIVE."
+
+  if gStartFires == 0'i64:
+    return "loadammoanim  ARMED; broad probe " & probeState & " but " &
+           "LoadMagazineProcess::Start @0x768F50 fired ZERO times. The TYPE " &
+           "is right and the hooked ENTRY POINT is wrong -- the process is " &
+           "constructed and Start is not the method that runs. Look at " &
+           "LoadProcess @0x7693E0 / PlaySound @0x7695E0 instead."
+
+  result = "loadammoanim  ARMED and FIRING. mode=" & modeName(gMode) &
+           " startFires=" & $gStartFires &
+           " ctorProbe=" & probeState &
+           " sessions=" & $gSessions &
+           " tplRead=" & $gTplRead & " tplRefused=" & $gTplRefused &
+           " meshHits=" & $gMeshHits & " meshFallback=" & $gMeshFallback &
+           " spawned=" & $gSpawned & " spawnRefused=" & $gSpawnRefused &
+           " animDriven=" & $gAnimDriven & " teardowns=" & $gTeardowns &
+           " timedOut=" & $gTimedOut & " fakeNull=" & $gFakeNull &
+           " unreadable=" & $gUnreadable & " faults=" & $gFaults &
+           " retired=" & (if gRetired: "YES" else: "no") &
+           " lastTpl=" & (if gSessionTpl.len == 0: "-" else: gSessionTpl) &
+           " lastMesh=" & (if gSessionMesh.len == 0: "-" else: gSessionMesh)
+  if gMode <= ModeProbe:
+    result.add "  [mode=probe: Start is counted and NOTHING further is read, " &
+               "spawned or animated -- the zeros after startFires are the " &
+               "MODE, not a failure]"
+
+proc report(force: bool) =
+  ## Prints on CHANGE, and otherwise on a slow heartbeat, so a stuck state
+  ## cannot scroll away and a healthy one cannot spam. `force` is used for the
+  ## first report after arming.
+  let text = reportText()
+  let now = nowMs()
+  if force or text != gLastReport or (now - gLastReportMs) >= ReportEveryMs:
+    gLastReport   = text
+    gLastReportMs = now
+    info text
+
+proc onStats(url, body, session: string): string {.used.} =
   loadAmmoAnimStats()
 
 # ---------------------------------------------------------------------------
@@ -1073,7 +1238,16 @@ proc onLoad(): Status =
   loadConfig()
   declareSettings(schema())
   gLoadedAtMs = nowMs()
-  discard serve("/aowlspt/loadammoanim/stats", onStats)
+  # NO `serve("/aowlspt/loadammoanim/stats", onStats)` HERE, DELIBERATELY.
+  # This mod runs CLIENT-SIDE, inside the game process, and the game process
+  # runs no HTTP server: `serve` from a client mod registers a route into
+  # nothing. The route existed, returned correct JSON, and was unreachable by
+  # construction -- which is why a real magazine load produced zero readable
+  # evidence. The counters now go to the HOST LOG via `report`, which is the
+  # only channel a client mod actually has. `loadAmmoAnimStats` is kept because
+  # it is the machine-readable form the BACKEND side can serve if this mod ever
+  # grows one.
+  discard
 
   if not gEnabled:
     info "loadammoanim  disabled (enabled=false). No hook is installed and " &
@@ -1090,7 +1264,12 @@ proc onLoad(): Status =
   Ok
 
 proc onUpdate(elapsedMs: int64): Status =
-  discard maybeArm()
+  let justArmed = maybeArm()
+  # THE REPORT. This is the whole reason a magazine load is no longer silent.
+  # It runs only once the mod is enabled, so a disabled mod stays quiet, and it
+  # is throttled to ReportEveryMs unless the text CHANGED.
+  if gEnabled:
+    report(justArmed)
   # The safety cap. If the terminal hook never fires, a session would otherwise
   # hold a spawned instance forever. Bounded, cheap, and it COUNTS ITSELF: a
   # non-zero `timedOut` in the stats is evidence that the end signal is not

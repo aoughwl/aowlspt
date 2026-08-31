@@ -595,7 +595,10 @@
    "minBytes": 300000,
    "markers": [
     "aowl.loadammoanim",
-    "/aowlspt/loadammoanim/stats",
+    "LoadMagazineProcess::.ctor@0x768D40/ioooiif>x",
+    "ARMED but NEVER FIRED",
+    "FIRST FIRING: LoadMagazineProcess::Start",
+    "ARMED and FIRING",
     "LoadMagazineProcess::Start@0x768F50/i>o",
     "LoadMagazineProcess::RaiseLoadEventArgs@0x769260/ii>x",
     "EFT.ObjectsFactory::.ctor@0x938430/iooo>x",
