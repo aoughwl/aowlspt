@@ -5848,6 +5848,12 @@ proc nuProofRun(tab: Il2CppPtr)
 ## reason. Declared here, defined in `aowlui.nim` (included after invoke2).
 proc auProofWanted(): bool
 proc auProofRun(tab: Il2CppPtr)
+## The NATIVE-UI TOOLKIT's self-test rides the SAME drain, for the SAME reason.
+## Declared here, defined in `nuikit.nim`, which is `include`d after
+## `inspect.nim` because it CONSUMES the inspector's scene-root walk for canvas
+## discovery rather than writing a second implementation of it.
+proc nuKitSelfTestWanted(): bool
+proc nuKitSelfTestRun(tab: Il2CppPtr)
 
 include "invoke2.nim"
 
@@ -6008,6 +6014,14 @@ include "region.nim"
 ## back-buffer size through that file's byte-verified target table. It
 ## installs NO detour. Default OFF (`uxBetaOverlay`).
 include "betanotice.nim"
+
+## THE NATIVE-UI TOOLKIT -- `nuPanel`/`nuLabel` plus a generation-checked handle
+## table, the layer a mod actually calls. `include`d HERE, after `inspect.nim`,
+## because `nuFindCanvas` CONSUMES the live inspector's proven `iSceneRoots` +
+## `iVisComponent("Canvas")` walk. Writing a second canvas discovery was the
+## explicit thing to avoid: `natesp.nim` already has one (and is owned by
+## another change), and a third would be a third way to be wrong.
+include "nuikit.nim"
 
 
 proc bindCodeGenProbe(verbose: bool): bool =
@@ -7628,6 +7642,13 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   # `aowlUiProof` runs the one-shot dual-backend self-proof.
   gAuOn = readBoolKey("aowlUi") and gNuOn
   gAuProof = gAuOn and readBoolKey("aowlUiProof")
+  # The NATIVE-UI TOOLKIT. `nativeUiKit` arms nuPanel/nuLabel + the handle
+  # table; `nativeUiKitProof` runs the one-shot self-test. The `and gNuOn` is
+  # load-bearing, not defensive: the toolkit is a facade over the nu* layer and
+  # without it every call would refuse, so arming it alone would produce a
+  # feature whose only output is a refusal per call.
+  gNkOn = readBoolKey("nativeUiKit") and gNuOn
+  gNkProof = gNkOn and readBoolKey("nativeUiKitProof")
   # The NATIVE uGUI ESP. Both default OFF. `natEsp` arms discovery + the pool;
   # `natEspDiag` additionally logs the three-outcome verdict every 5s. The
   # `and gNuOn` is not belt-and-braces: without the nu* layer this feature has
@@ -7646,7 +7667,7 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   # so asking for the proof implies arming that detour. Saying so here, rather
   # than leaving the human to discover that `nativeUiProof` alone does nothing,
   # is the difference between a feature and a silent decline.
-  if (gNuProof or gNuImgProof) and not gMi2Probe:
+  if (gNuProof or gNuImgProof or gNkProof) and not gMi2Probe:
     gMi2Probe = true
     info "nativeUiProof/nativeUiImageProof is set, so managedInvokeProbe is " &
          "being armed with it: " &
@@ -8061,6 +8082,12 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
         bindNativeUi(true)
       if gAuOn:
         bindAowlUi(true)
+      # The native-UI toolkit's readiness report, in the same region and for the
+      # same reason: it names the nu* targets it stands on, and asking before
+      # GameAssembly.dll is loaded would report every one of them as a prologue
+      # rejection and blame the game build for a start-order problem.
+      if gNkOn:
+        bindNuiKit(true)
       # The native uGUI ESP, for the same reason and in the same place: its
       # readiness report is only meaningful after GameAssembly.dll is loaded
       # and `cProPrimeAll()` has primed the prologue snapshot the layers it

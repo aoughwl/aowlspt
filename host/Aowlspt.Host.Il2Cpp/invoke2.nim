@@ -578,6 +578,10 @@ proc mi2LadderFired(regs: Il2CppPtr) =
   # inside this postfix's guard -- it opens none of its own, per §3 no nesting).
   if auProofWanted():
     auProofRun(tab)
+  # The NATIVE-UI TOOLKIT's self-test rides the SAME drain. Also inside this
+  # postfix's guard, so it opens NONE of its own (§3: nesting disarms the outer).
+  if nuKitSelfTestWanted():
+    nuKitSelfTestRun(tab)
 
 proc bindManagedInvoke(verbose: bool): bool =
   ## Installs the kind=9 POSTFIX detour on `SettingsScreen::EnsureTabInitialized`
