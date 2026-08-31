@@ -30,12 +30,23 @@
 
 /* ---- caps. Every one of these bounds an iteration; none is a guess. ---- */
 
-/* Boxes in the pool. 4 faction sub-pools of 8. A raid can register far more
- * bots than this; the extra contacts simply get no box, which is a bounded
- * miss and is REPORTED (`dropped`) rather than being allowed to grow the pool. */
+/* Boxes in the pool.
+ *
+ * MEASURED 2026-08-31, live raid, natesp verdict line: "21 placed, 45
+ * contact(s), 24 over the per-faction pool". The pool was FOUR SUB-POOLS OF
+ * EIGHT and a contact could only ever be drawn by a box of its own faction, so
+ * a raid of 32 scavs drew 8 scavs and left 24 undrawn while 24 USEC/BEAR/boss
+ * boxes sat idle. That is a partition, not a capacity limit, and it is the
+ * worse of the two failures: the pool was 32 and only 21 of it was reachable.
+ *
+ * THE POOL IS NOW FLAT. Any box can draw any contact, because colour is set on
+ * the box per placement (`Graphic::set_color`, byte-verified, called only when
+ * the box's (class, fade band) actually CHANGES -- see g_ne_recolours) instead
+ * of being baked in at build time. 64 boxes is above the 45 contacts measured
+ * and above NeMaxContacts is NOT required: the overflow policy is NEAREST-N and
+ * it is explicit, counted, and printed. See aowl_ne_drop_policy(). */
 #define AOWL_NE_FACTIONS      4
-#define AOWL_NE_PER_FACTION   8
-#define AOWL_NE_POOL          (AOWL_NE_FACTIONS * AOWL_NE_PER_FACTION)
+#define AOWL_NE_POOL          64
 
 /* Discovery walk. Breadth-first over the scene roots, sliced across frames so
  * one frame can never spend the whole budget. Both bound the SAME walk: the
@@ -151,20 +162,105 @@ static const char *aowl_ne_faction_name(int32_t f) {
     }
 }
 
-/* Graphic.m_Color is a UnityEngine.Color -- four floats, 0..1, NOT bytes. The
- * colour is written ONCE at build time, before the box is ever enabled and so
- * before any mesh is built; nothing is re-coloured per frame. */
+/* Graphic.m_Color is a UnityEngine.Color -- four floats, 0..1, NOT bytes.
+ *
+ * The table is now MUTABLE, because the four colours are user settings
+ * (`colorSetting(format="hex")`). It is written ONCE, at host config load, from
+ * `aowl_ne_set_faction_rgba`; nothing writes it per frame. `aowl_ne_col_source`
+ * reports where each row came from so the log can never claim a setting took
+ * effect when the parse actually refused and the default was kept. */
+static float g_ne_col[AOWL_NE_FACTIONS][4] = {
+    { 0.30f, 0.65f, 1.00f, 0.85f },   /* USEC -- blue    */
+    { 1.00f, 0.45f, 0.25f, 0.85f },   /* BEAR -- orange  */
+    { 0.85f, 0.85f, 0.85f, 0.75f },   /* scav -- grey    */
+    { 1.00f, 0.20f, 0.85f, 0.90f },   /* boss -- magenta */
+};
+static int32_t g_ne_col_src[AOWL_NE_FACTIONS] = { 0, 0, 0, 0 };
+
 static float aowl_ne_faction_rgba(int32_t f, int32_t chan) {
-    /* r, g, b, a per faction */
-    static const float tbl[AOWL_NE_FACTIONS][4] = {
-        { 0.30f, 0.65f, 1.00f, 0.85f },   /* USEC -- blue   */
-        { 1.00f, 0.45f, 0.25f, 0.85f },   /* BEAR -- orange */
-        { 0.85f, 0.85f, 0.85f, 0.75f },   /* scav -- grey   */
-        { 1.00f, 0.20f, 0.85f, 0.90f },   /* boss -- magenta*/
-    };
     if (f < 0 || f >= AOWL_NE_FACTIONS) return 0.0f;
     if (chan < 0 || chan > 3) return 0.0f;
-    return tbl[f][chan];
+    return g_ne_col[f][chan];
+}
+
+/* Clamped, NaN-rejecting. A colour channel that is not finite would reach
+ * `Graphic::set_color` and produce an invisible box while every call reported
+ * success -- this project's signature failure. Returns 0 (refused, table
+ * untouched) or 1 (stored). */
+static int32_t aowl_ne_set_faction_rgba(int32_t f, float r, float g, float b,
+                                        float a) {
+    int i;
+    float v[4];
+    if (f < 0 || f >= AOWL_NE_FACTIONS) return 0;
+    v[0] = r; v[1] = g; v[2] = b; v[3] = a;
+    for (i = 0; i < 4; i++)
+        if (!(v[i] >= 0.0f) || !(v[i] <= 1.0f)) return 0;   /* NaN-safe */
+    for (i = 0; i < 4; i++) g_ne_col[f][i] = v[i];
+    g_ne_col_src[f] = 1;
+    return 1;
+}
+
+static int32_t aowl_ne_col_source(int32_t f) {
+    if (f < 0 || f >= AOWL_NE_FACTIONS) return 0;
+    return g_ne_col_src[f];   /* 0 = compiled default, 1 = from settings */
+}
+
+/* ---- DISTANCE FADE AND SCALE -------------------------------------------
+ *
+ * NO SECOND TIMER. There is a contact-fade in mods/maps that ages tracks
+ * against OBSERVED time; it is a different binary, a different data set, and a
+ * staleness question. This is not staleness. natesp re-reads the live world
+ * every AOWL_NE_SCAN_EVERY ticks and every contact it draws was observed on the
+ * most recent pass, so nothing here can be stale and nothing here needs a
+ * clock. Both functions below are pure functions of the projected DEPTH, which
+ * `Camera::WorldToScreenPoint` already produced for the placement -- so the fade
+ * costs one multiply and reads no new state.
+ *
+ * Fade: full alpha to AOWL_NE_FADE_NEAR m, then linear down to
+ * AOWL_NE_FADE_FLOOR at AOWL_NE_FADE_FAR m and no further. It never reaches
+ * zero, because a box that fades to invisible while `neVerdict` still counts it
+ * as on-screen would make PASS mean less than it says. */
+#define AOWL_NE_FADE_NEAR   30.0f
+#define AOWL_NE_FADE_FAR   250.0f
+#define AOWL_NE_FADE_FLOOR   0.30f
+
+static float aowl_ne_fade_alpha(float depth) {
+    float t;
+    if (!(depth > 0.0f)) return 1.0f;                       /* NaN-safe */
+    if (depth <= AOWL_NE_FADE_NEAR) return 1.0f;
+    if (depth >= AOWL_NE_FADE_FAR)  return AOWL_NE_FADE_FLOOR;
+    t = (depth - AOWL_NE_FADE_NEAR) / (AOWL_NE_FADE_FAR - AOWL_NE_FADE_NEAR);
+    return 1.0f - t * (1.0f - AOWL_NE_FADE_FLOOR);
+}
+
+/* The recolour QUANTISER. Calling `Graphic::set_color` every frame for every
+ * box is 64 managed calls a frame for a value that barely moves. The alpha is
+ * therefore banded, and a box is recoloured only when its (class, band) pair
+ * changes. 8 bands over the fade range is one recolour per ~27 m of travel. */
+#define AOWL_NE_FADE_BANDS 8
+static int32_t aowl_ne_fade_band(float depth) {
+    float a = aowl_ne_fade_alpha(depth);
+    int32_t b = (int32_t)(a * (float)(AOWL_NE_FADE_BANDS - 1) + 0.5f);
+    if (b < 0) b = 0;
+    if (b >= AOWL_NE_FADE_BANDS) b = AOWL_NE_FADE_BANDS - 1;
+    return b;
+}
+
+static float aowl_ne_band_alpha(int32_t band) {
+    if (band < 0) band = 0;
+    if (band >= AOWL_NE_FADE_BANDS) band = AOWL_NE_FADE_BANDS - 1;
+    return (float)band / (float)(AOWL_NE_FADE_BANDS - 1);
+}
+
+/* ---- THE OVERFLOW POLICY, NAMED --------------------------------------- */
+/* The old policy was "the first 8 contacts of each faction, and the rest are
+ * silently absent". This one is NEAREST-N over the whole flat pool, and the
+ * count that did not fit is reported every verdict. */
+static const char *aowl_ne_drop_policy(void) {
+    return "NEAREST-" "64" " by camera depth over a FLAT pool (any box may draw "
+           "any class; colour is set per placement). Contacts beyond the pool "
+           "are the FARTHEST ones and are counted in `dropped`, never dropped "
+           "silently";
 }
 
 /* ---- the three outcomes ----------------------------------------------- */
@@ -244,7 +340,6 @@ static int32_t aowl_ne_disabled(void)    { return g_aowl_ne_faults >= AOWL_NE_MA
 
 static int32_t aowl_ne_pool(void)        { return AOWL_NE_POOL; }
 static int32_t aowl_ne_factions(void)    { return AOWL_NE_FACTIONS; }
-static int32_t aowl_ne_per_faction(void) { return AOWL_NE_PER_FACTION; }
 static int32_t aowl_ne_max_nodes(void)   { return AOWL_NE_MAX_NODES; }
 static int32_t aowl_ne_max_children(void){ return AOWL_NE_MAX_CHILDREN; }
 static int32_t aowl_ne_max_depth(void)   { return AOWL_NE_MAX_DEPTH; }
@@ -270,5 +365,69 @@ static int32_t aowl_ne_on_screen(float x, float y, float w, float h,
     if (!(y > -h) || !(y < sh + h)) return 0;
     return 1;
 }
+
+/* ---- THE PER-FRAME COST METER -----------------------------------------
+ *
+ * The user has twice reported that the game "runs like crap" with host features
+ * on, and a per-frame path that cannot say what it costs is a per-frame path
+ * nobody can defend. This is the same shape as the maps mod's `drawCost` line:
+ * QueryPerformanceCounter around the guarded tick, kept as a running max and a
+ * running mean in MICROSECONDS, printed with the verdict.
+ *
+ * It measures the WHOLE guarded body, so it includes discovery while discovery
+ * is running -- which is why the max and the mean are reported separately and
+ * why the meter can be RESET when the state machine reaches NeRun. A mean that
+ * silently averaged the 6ms discovery slices into the steady state would be a
+ * number that cannot be wrong, i.e. a number that says nothing. */
+#include <windows.h>
+
+static int64_t g_ne_cost_n    = 0;
+static int64_t g_ne_cost_sum  = 0;   /* microseconds */
+static int64_t g_ne_cost_max  = 0;
+static int64_t g_ne_cost_t0   = 0;
+static int64_t g_ne_qpf       = 0;
+
+static void aowl_ne_cost_begin(void) {
+    LARGE_INTEGER v;
+    if (!g_ne_qpf) { LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+                     g_ne_qpf = (int64_t)f.QuadPart; }
+    QueryPerformanceCounter(&v);
+    g_ne_cost_t0 = (int64_t)v.QuadPart;
+}
+
+static void aowl_ne_cost_end(void) {
+    LARGE_INTEGER v;
+    int64_t us;
+    if (!g_ne_cost_t0 || g_ne_qpf <= 0) return;
+    QueryPerformanceCounter(&v);
+    us = (((int64_t)v.QuadPart - g_ne_cost_t0) * 1000000) / g_ne_qpf;
+    g_ne_cost_t0 = 0;
+    if (us < 0 || us > 10000000) return;         /* a suspended thread, not us */
+    g_ne_cost_n++;
+    g_ne_cost_sum += us;
+    if (us > g_ne_cost_max) g_ne_cost_max = us;
+}
+
+static void    aowl_ne_cost_reset(void) {
+    g_ne_cost_n = 0; g_ne_cost_sum = 0; g_ne_cost_max = 0;
+}
+static int64_t aowl_ne_cost_samples(void) { return g_ne_cost_n; }
+static int64_t aowl_ne_cost_max_us(void)  { return g_ne_cost_max; }
+static int64_t aowl_ne_cost_mean_ns(void) {
+    /* nanoseconds, so a sub-microsecond steady state does not read as "0us"
+     * -- "0" is exactly the number that makes a cost line unfalsifiable. */
+    if (g_ne_cost_n <= 0) return -1;
+    return (g_ne_cost_sum * 1000) / g_ne_cost_n;
+}
+
+/* ---- THE RECOLOUR METER ----------------------------------------------- */
+/* Colour is no longer baked in at build time, so the claim "nothing is
+ * recoloured per frame" is no longer free -- it has to be MEASURED. This counts
+ * every `Graphic::set_color` the placement issues; if the (class, band) cache is
+ * working the steady state is ~0 per frame and a walking player produces a
+ * trickle. A count that tracks the box count every frame falsifies the claim. */
+static int64_t g_ne_recolours = 0;
+static void    aowl_ne_note_recolour(void) { g_ne_recolours++; }
+static int64_t aowl_ne_recolours(void)     { return g_ne_recolours; }
 
 #endif /* AOWLSPT_NATESP_H */
