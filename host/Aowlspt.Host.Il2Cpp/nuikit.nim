@@ -1,0 +1,881 @@
+## ===========================================================================
+## nuikit -- THE NATIVE-UI TOOLKIT A MOD ACTUALLY CALLS
+##
+## `nativeui.nim` proved the primitives; this is the layer that makes them
+## USABLE without re-deriving the sequence by hand every time. It adds exactly
+## three things and nothing else:
+##
+##   1. TWO CONSTRUCTORS, `nuPanel` and `nuLabel`, that encode the ONE ordering
+##      proven live on 2026-08-30 (IMAGEPROOF VERDICT = PASS). Get the order
+##      wrong and every call still succeeds while nothing renders, which is the
+##      failure mode this whole layer exists to end.
+##   2. A HANDLE TABLE WITH GENERATION COUNTERS. This is the safety core. A mod
+##      that keeps a handle across a scene change must get a NAMED REFUSAL, not
+##      a dereference of a recycled slot. Unity's fake-null makes the naive
+##      version lethal: a destroyed UnityEngine.Object stays perfectly READABLE
+##      with `m_CachedPtr` zeroed, so a pointer check passes and the next
+##      internal call dies inside Unity's own C++. Readability is not liveness.
+##   3. ONE canvas discovery, `nuFindCanvas`, shared by every caller.
+##
+## WHOSE CANVAS DISCOVERY THIS IS. It is the LIVE INSPECTOR'S, consumed, not a
+## third implementation: `iSceneRoots` + `iVisComponent("Canvas")` +
+## `Canvas::get_renderMode`, the path that reliably returns 16 scene roots.
+## `natesp.nim` has its own (obtains 178 roots and faults converting them) and
+## is owned by another change; nothing here touches it. That is also why this
+## file is `include`d AFTER `inspect.nim` -- the inspector's walkers are simply
+## not in scope any earlier.
+##
+## WHERE THIS SITS RELATIVE TO `aowlui.nim`. `aowlui` is a SCREEN-level retained
+## framework (panels/labels/toggles/tabs/config binding) over two backends. This
+## is the ELEMENT level underneath it: one handle, one GameObject, no retained
+## screen, no reset. A mod that wants a whole settings screen should use
+## `aowlui`; a mod that wants to put one box and one caption on screen and keep
+## them for a while should use this. They are not rivals, but the overlap is
+## real and is called out in `docs/NATIVE_UI.md`.
+##
+## GUARDS. Every entry point here assumes THE CALLER IS ALREADY INSIDE ONE
+## `aowl_p_p_seh`, exactly like `nuCreate`/`nuAdd` do. This file opens NONE of
+## its own: the guard is not re-entrant and a nested inner guard DISARMS the
+## outer one. The self-test rides invoke2's postfix drain, which is already
+## guarded, for the same reason `auProofRun` does.
+##
+## ALLOCATION. Everything managed is allocated ONCE, at creation. Every setter
+## is a plain field write or a byte-verified setter call. Strings go through
+## `nuStr`, which interns, so even `nuSetText` in a per-frame path allocates at
+## most once per distinct string for the life of the process.
+## ===========================================================================
+
+# ---------------------------------------------------------------------------
+# THE HANDLE TABLE, in C.
+#
+# In C rather than the ABI header on purpose: touching `abi/*.h` correctly drops
+# every build cache and forces an 18-minute full rebuild, and this table has no
+# other consumer. It is a fixed 64 entries -- capped by construction, so no
+# iteration over it can run away.
+#
+# A handle is  (generation << 16) | (index + 1)  as a uint32.
+#   * index+1, so the all-zero handle is ALWAYS invalid, even at generation 0.
+#   * the generation is bumped on every allocation and compared on every lookup,
+#     so a handle to a slot that has since been freed and REUSED resolves to
+#     STALE rather than to somebody else's panel. That is the single case the
+#     naive index-only handle gets wrong, and it is the one that crashes.
+# ---------------------------------------------------------------------------
+{.emit: """
+#define AOWL_NK_MAX 64
+
+typedef struct {
+    void*    go;      /* the GameObject                          */
+    void*    rt;      /* its RectTransform                       */
+    void*    comp;    /* the Image (panel) or TMP_Text (label)   */
+    int      kind;    /* AOWL_NK_PANEL / AOWL_NK_LABEL           */
+    unsigned gen;     /* bumped per allocation; 0 is never used  */
+    int      used;
+} aowl_nk_slot_t;
+
+static aowl_nk_slot_t g_aowl_nk[AOWL_NK_MAX];
+static unsigned       g_aowl_nk_gen  = 1u;
+static int            g_aowl_nk_live = 0;
+
+/* Three refusals, told apart on purpose: "you handed me nonsense",
+   "you handed me something you already destroyed", and "you handed me
+   something whose slot has since been given to somebody else". Collapsing
+   them would make the log say the same thing for three different bugs. */
+#define AOWL_NK_ERR_RANGE  (-1)
+#define AOWL_NK_ERR_FREED  (-2)
+#define AOWL_NK_ERR_STALE  (-3)
+
+static int aowl_nk_slot_of(unsigned h) {
+    unsigned idx = (h & 0xFFFFu);
+    unsigned gen = (h >> 16) & 0xFFFFu;
+    int i;
+    if (idx == 0u || idx > (unsigned)AOWL_NK_MAX) return AOWL_NK_ERR_RANGE;
+    i = (int)idx - 1;
+    if (!g_aowl_nk[i].used)          return AOWL_NK_ERR_FREED;
+    if (g_aowl_nk[i].gen != gen)     return AOWL_NK_ERR_STALE;
+    return i;
+}
+
+static unsigned aowl_nk_alloc(void* go, void* rt, void* comp, int kind) {
+    int i;
+    for (i = 0; i < AOWL_NK_MAX; ++i) {
+        if (!g_aowl_nk[i].used) {
+            g_aowl_nk[i].used = 1;
+            g_aowl_nk[i].go   = go;
+            g_aowl_nk[i].rt   = rt;
+            g_aowl_nk[i].comp = comp;
+            g_aowl_nk[i].kind = kind;
+            /* wrap short of 0xFFFF and never to 0: generation 0 must not be a
+               legal live generation, or a zeroed slot would authenticate. */
+            if (g_aowl_nk_gen == 0u || g_aowl_nk_gen >= 0xFFFFu)
+                g_aowl_nk_gen = 1u;
+            g_aowl_nk[i].gen = g_aowl_nk_gen++;
+            g_aowl_nk_live++;
+            return ((g_aowl_nk[i].gen & 0xFFFFu) << 16) | (unsigned)(i + 1);
+        }
+    }
+    return 0u;   /* table full -- a refusal, never an overwrite */
+}
+
+static int   aowl_nk_resolve(unsigned h)   { return aowl_nk_slot_of(h); }
+static void* aowl_nk_go(unsigned h)   { int i=aowl_nk_slot_of(h); return i<0?(void*)0:g_aowl_nk[i].go; }
+static void* aowl_nk_rt(unsigned h)   { int i=aowl_nk_slot_of(h); return i<0?(void*)0:g_aowl_nk[i].rt; }
+static void* aowl_nk_comp(unsigned h) { int i=aowl_nk_slot_of(h); return i<0?(void*)0:g_aowl_nk[i].comp; }
+static int   aowl_nk_kind(unsigned h) { int i=aowl_nk_slot_of(h); return i<0?0:g_aowl_nk[i].kind; }
+
+static int aowl_nk_release(unsigned h) {
+    int i = aowl_nk_slot_of(h);
+    if (i < 0) return 0;
+    g_aowl_nk[i].used = 0;
+    g_aowl_nk[i].go   = (void*)0;
+    g_aowl_nk[i].rt   = (void*)0;
+    g_aowl_nk[i].comp = (void*)0;
+    g_aowl_nk[i].kind = 0;
+    /* gen is deliberately NOT cleared: the next alloc gives this slot a NEW
+       generation, and every handle carrying the old one now reads STALE. */
+    if (g_aowl_nk_live > 0) g_aowl_nk_live--;
+    return 1;
+}
+
+static int aowl_nk_live_count(void) { return g_aowl_nk_live; }
+static int aowl_nk_capacity(void)   { return AOWL_NK_MAX; }
+static unsigned aowl_nk_at(int i) {
+    if (i < 0 || i >= AOWL_NK_MAX || !g_aowl_nk[i].used) return 0u;
+    return ((g_aowl_nk[i].gen & 0xFFFFu) << 16) | (unsigned)(i + 1);
+}
+""".}
+
+proc cNkResolve(h: uint32): int32 {.importc: "aowl_nk_resolve", nodecl.}
+proc cNkGo(h: uint32): Il2CppPtr {.importc: "aowl_nk_go", nodecl.}
+proc cNkRt(h: uint32): Il2CppPtr {.importc: "aowl_nk_rt", nodecl.}
+proc cNkComp(h: uint32): Il2CppPtr {.importc: "aowl_nk_comp", nodecl.}
+proc cNkKind(h: uint32): int32 {.importc: "aowl_nk_kind", nodecl.}
+proc cNkAlloc(go, rt, comp: Il2CppPtr; kind: int32): uint32 {.
+  importc: "aowl_nk_alloc", nodecl.}
+proc cNkRelease(h: uint32): int32 {.importc: "aowl_nk_release", nodecl.}
+proc cNkLiveCount(): int32 {.importc: "aowl_nk_live_count", nodecl.}
+proc cNkCapacity(): int32 {.importc: "aowl_nk_capacity", nodecl.}
+proc cNkAt(i: int32): uint32 {.importc: "aowl_nk_at", nodecl.}
+
+# ---------------------------------------------------------------------------
+# The public handle type and the element kinds.
+# ---------------------------------------------------------------------------
+type
+  NuElem* = distinct uint32     ## an opaque, generation-checked element handle
+
+const
+  nuNone* = NuElem(0'u32)       ## the handle every refusal returns
+
+const
+  NkPanel = 1'i32
+  NkLabel = 2'i32
+
+proc nuValidHandle*(e: NuElem): bool =
+  ## Cheap syntactic check. NOT a liveness check -- see `nuLive`.
+  cNkResolve(uint32(e)) >= 0'i32
+
+proc nkKindName(k: int32): string =
+  case int(k)
+  of 1: "panel (UnityEngine.UI.Image)"
+  of 2: "label (TMPro.TextMeshProUGUI)"
+  else: "unknown"
+
+proc nkRefusalName(code: int32): string =
+  ## The refusal, named. A layer that says "invalid handle" for three different
+  ## bugs teaches the next reader nothing.
+  case int(code)
+  of -1: "OUT OF RANGE -- this is not a handle this toolkit ever issued " &
+         "(index 0 or beyond the 64-entry table)"
+  of -2: "RELEASED -- the element behind this handle was destroyed through " &
+         "nuDestroy/nuDestroyAllElems; the handle is spent"
+  of -3: "STALE GENERATION -- the slot exists but has since been re-issued to " &
+         "a DIFFERENT element. This is the case that would crash if handles " &
+         "were bare indices: it is exactly what a handle kept across a scene " &
+         "change looks like"
+  else: "resolved"
+
+# ---------------------------------------------------------------------------
+# Flags. Both default OFF.
+#   nativeUiKit      -- the toolkit answers at all (also needs `nativeUi`)
+#   nativeUiKitProof -- additionally run the one-shot toolkit self-test
+# ---------------------------------------------------------------------------
+var gNkOn = false
+var gNkProof = false
+var gNkProofDone = false
+
+## Self-disable. This layer has no guard of its own (§3), so it cannot count
+## FAULTS; what it can count is HARD REFUSALS -- a construction step that the
+## underlying primitive declined. Eight of those in a session means the build
+## is not the one these RVAs came from, or the canvas walk is wrong, and
+## continuing would only reprint the same refusal forever.
+const NkMaxRefusals = 8
+var gNkRefusals = 0
+var gNkOff = false
+
+proc nkRefuse(what, why: string) =
+  inc gNkRefusals
+  warn "nuikit: " & what & " REFUSED -- " & why
+  if gNkRefusals >= NkMaxRefusals and not gNkOff:
+    gNkOff = true
+    warn "nuikit: SELF-DISABLED after " & $gNkRefusals & " hard refusals. " &
+         "Every further call returns nuNone without touching the client. " &
+         "This is a refusal, not a verdict about any one element."
+
+proc nkReady(what: string): bool =
+  ## The four gates every entry point passes, in the order that makes the log
+  ## say which one stopped it.
+  if not gNkOn:
+    return false                              # flag off: silent by design
+  if gNkOff:
+    return false
+  if not gNuOn:
+    nkRefuse(what, "the `nativeUi` primitive layer is OFF; this toolkit is a " &
+                   "facade over it and can do nothing on its own")
+    return false
+  if cNuDisabled() != 0'i32:
+    nkRefuse(what, "the nativeui layer has SELF-DISABLED after " &
+                   $int(cNuFaultCount()) & " fault(s); refusing to build more")
+    return false
+  true
+
+# ---------------------------------------------------------------------------
+# RESOLVE -- the one function every entry point starts with.
+#
+# Three questions, in this order, because each is meaningless without the one
+# before it: is the handle ours, does its generation still match, and is the
+# GameObject still ALIVE by Unity's own reckoning.
+# ---------------------------------------------------------------------------
+proc nkResolve(e: NuElem; what: string;
+               go, rt, comp: var Il2CppPtr; kind: var int32): bool =
+  go = nil; rt = nil; comp = nil; kind = 0'i32
+  let slot = cNkResolve(uint32(e))
+  if slot < 0'i32:
+    nkRefuse(what, "handle 0x" & hexOf(uint64(uint32(e))) & ": " &
+                   nkRefusalName(slot))
+    return false
+  go = cNkGo(uint32(e))
+  rt = cNkRt(uint32(e))
+  comp = cNkComp(uint32(e))
+  kind = cNkKind(uint32(e))
+  if not nuOk(go, 0x10'i32) or not nuOk(rt, 0x10'i32):
+    nkRefuse(what, "handle 0x" & hexOf(uint64(uint32(e))) & ": its GameObject " &
+                   "or RectTransform is no longer readable")
+    return false
+  # THE FAKE-NULL GATE. Readability got us here; it is not the question.
+  if not nuAlive(go):
+    nkRefuse(what, "handle 0x" & hexOf(uint64(uint32(e))) & ": Unity reports " &
+                   "the GameObject DESTROYED (op_Implicit false). It is still " &
+                   "perfectly readable with m_CachedPtr zeroed -- which is why " &
+                   "a pointer check would have passed and the next internal " &
+                   "call would have died inside Unity's C++. Releasing the slot")
+    discard cNkRelease(uint32(e))
+    return false
+  true
+
+proc nuLive*(e: NuElem): bool =
+  ## Is the element behind this handle still one Unity would talk to? The
+  ## honest question a mod should ask before a per-frame update. Does not log.
+  let slot = cNkResolve(uint32(e))
+  if slot < 0'i32: return false
+  let go = cNkGo(uint32(e))
+  nuOk(go, 0x10'i32) and nuAlive(go)
+
+proc nuElemCount*(): int = int(cNkLiveCount())
+proc nuElemCapacity*(): int = int(cNkCapacity())
+
+# ---------------------------------------------------------------------------
+# CANVAS DISCOVERY -- the inspector's path, consumed.
+#
+# `anchor` is a LIVE object the caller has already validated. It is REQUIRED,
+# and that is not pedantry: `iSceneRoots(nil)` falls back to `gInspPreloader`,
+# which only the live inspector's rider ever writes, so a mod that passed nil
+# would get "no roots" on every run the inspector was not also driving.
+# ---------------------------------------------------------------------------
+const NkMaxRoots = 64          ## capped: the inspector reliably reports ~16
+
+var gNkCanvasGo: Il2CppPtr = nil     ## cached, but re-validated on every call
+
+proc nuFindCanvas*(anchor: Il2CppPtr): Il2CppPtr =
+  ## The GameObject of a live, screen-space Canvas to parent UI into, or nil.
+  ##
+  ## Preference order, and each step is an ANSWER rather than an assumption:
+  ## a Canvas whose `get_renderMode` really reads ScreenSpaceOverlay(0) or
+  ## ScreenSpaceCamera(1) wins over one whose render mode could not be read at
+  ## all; a WorldSpace(2) canvas is skipped, because UI parented into one is
+  ## somewhere in the map rather than on the screen and would be an invisible
+  ## success.
+  result = nil
+  if not nkReady("findCanvas"): return nil
+
+  # The cache, re-checked. A cached canvas that died in a scene change is
+  # exactly the fake-null case, so `nuAlive` decides, not non-nil.
+  if gNkCanvasGo != nil:
+    if nuOk(gNkCanvasGo, 0x10'i32) and nuAlive(gNkCanvasGo):
+      return gNkCanvasGo
+    okLog "nuikit: the cached canvas is no longer alive (a scene change is the " &
+          "usual reason); re-walking"
+    gNkCanvasGo = nil
+
+  if not nuOk(anchor, 0x10'i32) or not nuAlive(anchor):
+    nkRefuse("findCanvas", "the anchor is null, unreadable or destroyed. This " &
+             "toolkit will not guess a scene: pass a LIVE object you already " &
+             "validated (invoke2's `gMi2TmpOwner` is the one every proof uses)")
+    return nil
+
+  var roots: seq[Il2CppPtr] = @[]
+  let n = iSceneRoots(roots, false, anchor)
+  if n <= 0 or roots.len == 0:
+    nkRefuse("findCanvas", "the inspector's scene-root walk returned no roots " &
+             "at all. NOTHING was examined, so this says nothing about whether " &
+             "a canvas exists -- it is INCONCLUSIVE, not absence")
+    return nil
+
+  var best: Il2CppPtr = nil
+  var bestMode = -1
+  var asked = 0
+  var lim = roots.len
+  if lim > NkMaxRoots: lim = NkMaxRoots        # capped iteration
+  for i in 0 ..< lim:
+    let root = roots[i]
+    if not nuOk(root, 0x10'i32): continue
+    var comp: Il2CppPtr = nil
+    var why = ""
+    if not iVisComponent(root, "Canvas", comp, why):
+      continue                                  # could not look != absent
+    inc asked
+    if comp == nil: continue
+    var mode = -1
+    var w2 = ""
+    let readMode = iVisI32("Canvas::get_renderMode", comp, mode, w2)
+    if readMode and mode == 2: continue         # WorldSpace: not on screen
+    let score = (if readMode and (mode == 0 or mode == 1): 2 else: 1)
+    if score > bestMode:
+      bestMode = score
+      best = comp
+
+  if best == nil:
+    nkRefuse("findCanvas", "walked " & $lim & " scene root(s) and could ask " &
+             $asked & " of them for a Canvas; none carried a screen-space one. " &
+             (if asked == 0: "Asking failed on every root, so this is " &
+                             "INCONCLUSIVE, not 'there is no canvas'."
+              else: "That is an ANSWER for the roots reachable right now."))
+    return nil
+
+  let go = nuGameObjectOf(best)
+  if go == nil or not nuAlive(go):
+    nkRefuse("findCanvas", "found a Canvas component but could not reach a " &
+             "live GameObject for it")
+    return nil
+  gNkCanvasGo = go
+  okLog "nuikit: canvas found -- Canvas=0x" & hexOf(cast[uint64](best)) &
+        " GameObject=0x" & hexOf(cast[uint64](go)) & " renderMode=" &
+        (if bestMode == 2: "screen-space (read back from Canvas::get_renderMode)"
+         else: "UNREAD (the canvas was accepted on presence alone)") &
+        ", via the LIVE INSPECTOR's iSceneRoots + iVisComponent walk over " &
+        $lim & " root(s)"
+  result = go
+
+# ---------------------------------------------------------------------------
+# CONSTRUCTORS
+#
+# The ordering below is not a style choice. It is the sequence that produced
+# `IMAGEPROOF VERDICT = PASS` on 2026-08-30, and each step is here because
+# moving it broke something:
+#
+#   GameObject -> AddComponent<RectTransform> -> SetParentAndAlign -> layer 5
+#     -> SetActive(FALSE) -> AddComponent<Graphic> -> [wire deps] -> layout
+#     -> SetActive(true) -> set_color -> SetAllDirty
+#
+# SetActive(false) BEFORE the Graphic add is the one that is not obvious: on an
+# ACTIVE GameObject the add IS the render -- Awake/OnEnable fire synchronously
+# from inside AddComponent and reach for a material and a canvas that a
+# from-scratch component does not have yet. Deactivating first is the only
+# window there is between "the component exists" and "the component runs".
+# ---------------------------------------------------------------------------
+proc nuPanel*(parentGo: Il2CppPtr; x, y, w, h: float32;
+              r, g, b, a: float32; name: string = "aowl-panel"): NuElem =
+  ## A solid coloured quad -- a `UnityEngine.UI.Image` with NO sprite, which is
+  ## legal: with `m_Type == Simple` and a null sprite the Graphic emits one quad
+  ## over its rect in `m_Color`. That is exactly a panel, and it needs no asset.
+  ##
+  ## `parentGo` should be `nuFindCanvas(anchor)` or a GameObject already under
+  ## one; a Graphic with no live Canvas ancestor is inert however correct
+  ## everything else is. Colours are 0..1 floats, `a` is alpha -- alpha 0 is the
+  ## invisible success this signature makes you type out.
+  ##
+  ## Position is top-left anchored: (x, y) is offset from the canvas top-left,
+  ## with y NEGATIVE going down, the Unity convention the proof used.
+  result = nuNone
+  if not nkReady("panel(\"" & name & "\")"): return nuNone
+  if not nuOk(parentGo, 0x10'i32) or not nuAlive(parentGo):
+    nkRefuse("panel(\"" & name & "\")", "the parent is null, unreadable or a " &
+             "destroyed Unity object")
+    return nuNone
+
+  let go = nuCreate(name, parentGo)
+  if go == nil:
+    nkRefuse("panel(\"" & name & "\")", "the GameObject could not be created " &
+             "(the primitive layer logged the reason above)")
+    return nuNone
+  let rt = nuAdd(go, NuKindRectTransform)
+  if rt == nil:
+    nkRefuse("panel(\"" & name & "\")", "AddComponent<RectTransform> yielded " &
+             "nothing usable; tearing the GameObject down")
+    discard nuDestroy(go); return nuNone
+  if not nuParentAligned(go, parentGo):
+    nkRefuse("panel(\"" & name & "\")", "SetParentAndAlign failed; a Graphic " &
+             "with no Canvas ancestor is inert, so refusing to continue")
+    discard nuDestroy(go); return nuNone
+  discard nuSetLayer(go, 5'i32)              # Unity's built-in `UI` layer
+  if not nuSetActive(go, false):
+    nkRefuse("panel(\"" & name & "\")", "could not deactivate before the " &
+             "Graphic add; on an active object Awake fires from inside " &
+             "AddComponent and there is no window to wire anything")
+    discard nuDestroy(go); return nuNone
+
+  let img = nuAdd(go, NuKindImage)
+  if img == nil:
+    nkRefuse("panel(\"" & name & "\")", "AddComponent<UnityEngine.UI.Image> " &
+             "yielded nothing usable (slot state " &
+             nuSlotStateName(cNuSlotState(NuKindImage)) & ")")
+    discard nuDestroy(go); return nuNone
+
+  if not nuLayout(rt, 0.0'f32, 1.0'f32, 0.0'f32, 1.0'f32, 0.0'f32, 1.0'f32,
+                  w, h, x, y):
+    nkRefuse("panel(\"" & name & "\")", "layout refused this size/position, so " &
+             "the Image could never have a renderable rect")
+    discard nuDestroy(go); return nuNone
+  discard nuSetActive(go, true)
+  discard nuImgSetColor(img, r, g, b, a)
+  let dirtyFn = nuFn(NuTGrSetAllDirty)
+  if dirtyFn != nil and nuOk(img, 0x40'i32):
+    discard cNuCallPP(dirtyFn, img)
+
+  let hnd = cNkAlloc(go, rt, img, NkPanel)
+  if hnd == 0'u32:
+    nkRefuse("panel(\"" & name & "\")", "the handle table is full (" &
+             $int(cNkCapacity()) & " entries). Destroying the element rather " &
+             "than handing back an untracked GameObject that could never be " &
+             "torn down")
+    discard nuDestroy(go); return nuNone
+  okLog "nuikit: panel \"" & name & "\" built -- handle 0x" &
+        hexOf(uint64(hnd)) & ", Image=0x" & hexOf(cast[uint64](img)) &
+        ", " & $int(cNkLiveCount()) & " of " & $int(cNkCapacity()) &
+        " handles live"
+  result = NuElem(hnd)
+
+proc nuLabel*(parentGo, donorTmp: Il2CppPtr; x, y, w, h: float32;
+              text: string; fontSize: float32 = 22.0'f32;
+              r: float32 = 1.0'f32; g: float32 = 1.0'f32;
+              b: float32 = 1.0'f32; a: float32 = 1.0'f32;
+              name: string = "aowl-label"): NuElem =
+  ## A from-scratch `TextMeshProUGUI`. `donorTmp` is a LIVE TMP whose font asset
+  ## and materials are copied in while the object is inactive -- without them
+  ## TMP's Awake reaches for the default font through TMP_Settings and faults,
+  ## so a missing donor is a REFUSAL here, not a best-effort.
+  ##
+  ## The text is applied TWICE, deliberately: `LocalizedText` can clobber a raw
+  ## `m_text` store after ours, so the real setter is re-applied. Do not
+  ## "simplify" that away.
+  result = nuNone
+  if not nkReady("label(\"" & name & "\")"): return nuNone
+  if not nuOk(parentGo, 0x10'i32) or not nuAlive(parentGo):
+    nkRefuse("label(\"" & name & "\")", "the parent is null, unreadable or a " &
+             "destroyed Unity object")
+    return nuNone
+  if not nuOk(donorTmp, 0x10'i32) or not nuAlive(donorTmp):
+    nkRefuse("label(\"" & name & "\")", "no live donor TMP. A from-scratch " &
+             "TextMeshProUGUI with a null m_fontAsset faults in Awake, so " &
+             "there is nothing safe to build without one")
+    return nuNone
+  discard nuRegisterReference(NuKindTmpText, donorTmp)
+
+  let go = nuCreate(name, parentGo)
+  if go == nil:
+    nkRefuse("label(\"" & name & "\")", "the GameObject could not be created")
+    return nuNone
+  let rt = nuAdd(go, NuKindRectTransform)
+  if rt == nil:
+    nkRefuse("label(\"" & name & "\")", "AddComponent<RectTransform> yielded " &
+             "nothing usable")
+    discard nuDestroy(go); return nuNone
+  if not nuParentAligned(go, parentGo):
+    nkRefuse("label(\"" & name & "\")", "SetParentAndAlign failed")
+    discard nuDestroy(go); return nuNone
+  discard nuSetLayer(go, 5'i32)
+  if not nuSetActive(go, false):
+    nkRefuse("label(\"" & name & "\")", "could not deactivate before the TMP add")
+    discard nuDestroy(go); return nuNone
+  let tmp = nuAdd(go, NuKindTmpText)
+  if tmp == nil:
+    nkRefuse("label(\"" & name & "\")", "AddComponent<TextMeshProUGUI> yielded " &
+             "nothing usable (slot state " &
+             nuSlotStateName(cNuSlotState(NuKindTmpText)) & ")")
+    discard nuDestroy(go); return nuNone
+  if not nuWireTextDeps(tmp, donorTmp):
+    nkRefuse("label(\"" & name & "\")", "the donor's font/material could not " &
+             "be copied in; activating this TMP would fault in Awake")
+    discard nuDestroy(go); return nuNone
+  discard nuSetFontSize(tmp, fontSize)
+  if not nuLayout(rt, 0.0'f32, 1.0'f32, 0.0'f32, 1.0'f32, 0.0'f32, 1.0'f32,
+                  w, h, x, y):
+    nkRefuse("label(\"" & name & "\")", "layout refused this size/position")
+    discard nuDestroy(go); return nuNone
+  discard nuSetActive(go, true)
+  discard nuSetText(tmp, text)
+  discard nuSetText(tmp, text)               # re-apply after LocalizedText
+  discard nuImgSetColor(tmp, r, g, b, a)     # TMP_Text IS a Graphic
+
+  let hnd = cNkAlloc(go, rt, tmp, NkLabel)
+  if hnd == 0'u32:
+    nkRefuse("label(\"" & name & "\")", "the handle table is full (" &
+             $int(cNkCapacity()) & " entries); destroying the element")
+    discard nuDestroy(go); return nuNone
+  okLog "nuikit: label \"" & name & "\" built -- handle 0x" &
+        hexOf(uint64(hnd)) & ", TMP=0x" & hexOf(cast[uint64](tmp)) &
+        ", " & $int(cNkLiveCount()) & " of " & $int(cNkCapacity()) &
+        " handles live"
+  result = NuElem(hnd)
+
+# ---------------------------------------------------------------------------
+# SETTERS. Every one of them: resolve the handle, check liveness, then one
+# byte-verified setter call. No allocation except the interned string in
+# `nuSetText`.
+# ---------------------------------------------------------------------------
+proc nuSetRect*(e: NuElem; x, y, w, h: float32): bool =
+  if not nkReady("setRect"): return false
+  var go: Il2CppPtr = nil
+  var rt: Il2CppPtr = nil
+  var comp: Il2CppPtr = nil
+  var kind = 0'i32
+  if not nkResolve(e, "setRect", go, rt, comp, kind): return false
+  result = nuLayout(rt, 0.0'f32, 1.0'f32, 0.0'f32, 1.0'f32, 0.0'f32, 1.0'f32,
+                    w, h, x, y)
+
+proc nuSetColor*(e: NuElem; r, g, b, a: float32): bool =
+  ## Works for both kinds: `TMP_Text` derives from `Graphic`, so one
+  ## `Graphic::set_color` covers a panel's fill and a label's text colour.
+  if not nkReady("setColor"): return false
+  var go: Il2CppPtr = nil
+  var rt: Il2CppPtr = nil
+  var comp: Il2CppPtr = nil
+  var kind = 0'i32
+  if not nkResolve(e, "setColor", go, rt, comp, kind): return false
+  if not nuOk(comp, 0x40'i32):
+    nkRefuse("setColor", "the Graphic component is not readable to +0x40, " &
+             "where m_Color lives")
+    return false
+  result = nuImgSetColor(comp, r, g, b, a)
+
+proc nuSetText*(e: NuElem; s: string): bool =
+  if not nkReady("setText"): return false
+  var go: Il2CppPtr = nil
+  var rt: Il2CppPtr = nil
+  var comp: Il2CppPtr = nil
+  var kind = 0'i32
+  if not nkResolve(e, "setText", go, rt, comp, kind): return false
+  if kind != NkLabel:
+    nkRefuse("setText", "this handle is a " & nkKindName(kind) &
+             ", which has no text. Refusing rather than writing 0x28 bytes " &
+             "into an Image and hoping")
+    return false
+  result = nuSetText(comp, s)
+  if result: discard nuSetText(comp, s)      # re-apply
+
+proc nuSetActive*(e: NuElem; on: bool): bool =
+  if not nkReady("setActive"): return false
+  var go: Il2CppPtr = nil
+  var rt: Il2CppPtr = nil
+  var comp: Il2CppPtr = nil
+  var kind = 0'i32
+  if not nkResolve(e, "setActive", go, rt, comp, kind): return false
+  result = nuSetActive(go, on)
+
+proc nuDestroy*(e: NuElem): bool =
+  ## Destroy the element and SPEND the handle. Calling this twice is safe and
+  ## says so: the second call resolves RELEASED and refuses.
+  if not nkReady("destroy"): return false
+  var go: Il2CppPtr = nil
+  var rt: Il2CppPtr = nil
+  var comp: Il2CppPtr = nil
+  var kind = 0'i32
+  if not nkResolve(e, "destroy", go, rt, comp, kind): return false
+  result = nuDestroy(go)
+  discard cNkRelease(uint32(e))
+
+proc nuDestroyAllElems*(): int =
+  ## Tear down every element this toolkit still holds. Capped by construction.
+  result = 0
+  if not gNkOn: return 0
+  let cap = int(cNkCapacity())
+  for i in 0 ..< cap:
+    let h = cNkAt(int32(i))
+    if h == 0'u32: continue
+    let go = cNkGo(h)
+    if go != nil and nuOk(go, 0x10'i32) and nuAlive(go):
+      if nuDestroy(go): inc result
+    discard cNkRelease(h)
+  gNkCanvasGo = nil
+  okLog "nuikit: destroyAllElems destroyed " & $result & " element(s); every " &
+        "handle issued before this call now refuses as RELEASED"
+
+# ---------------------------------------------------------------------------
+# READBACK -- what the self-test asserts against, and what a mod uses to check
+# its own work. These read the FINISHED STATE from the live object.
+# ---------------------------------------------------------------------------
+proc nuElemRect*(e: NuElem): (bool, float32, float32, float32, float32) =
+  var go: Il2CppPtr = nil
+  var rt: Il2CppPtr = nil
+  var comp: Il2CppPtr = nil
+  var kind = 0'i32
+  if not nkResolve(e, "elemRect", go, rt, comp, kind):
+    return (false, 0'f32, 0'f32, 0'f32, 0'f32)
+  nuGetRect(rt)
+
+proc nuElemColor*(e: NuElem): (bool, float32, float32, float32, float32) =
+  var go: Il2CppPtr = nil
+  var rt: Il2CppPtr = nil
+  var comp: Il2CppPtr = nil
+  var kind = 0'i32
+  if not nkResolve(e, "elemColor", go, rt, comp, kind):
+    return (false, 0'f32, 0'f32, 0'f32, 0'f32)
+  nuImgReadColor(comp)
+
+proc nuElemText*(e: NuElem): string =
+  var go: Il2CppPtr = nil
+  var rt: Il2CppPtr = nil
+  var comp: Il2CppPtr = nil
+  var kind = 0'i32
+  if not nkResolve(e, "elemText", go, rt, comp, kind): return ""
+  if kind != NkLabel: return ""
+  nuGetText(comp)
+
+proc nuElemActive*(e: NuElem): bool =
+  var go: Il2CppPtr = nil
+  var rt: Il2CppPtr = nil
+  var comp: Il2CppPtr = nil
+  var kind = 0'i32
+  if not nkResolve(e, "elemActive", go, rt, comp, kind): return false
+  nuActiveInHierarchy(go)
+
+# ===========================================================================
+# THE SELF-TEST.  CLAUDE.md §9b, applied literally.
+#
+# It asserts the FINISHED STATE read back off the live objects -- never its own
+# writes -- and it prefers the NEGATIVE where it can: after teardown, NO handle
+# may still resolve. That is a check with an input that makes it fail (a handle
+# table without generations passes the positive half and fails this).
+#
+# Three outcomes. INCONCLUSIVE is used, not avoided: if there is no canvas or no
+# donor TMP, nothing was built and the toolkit has not been tested. "I could not
+# look" is not a pass.
+#
+# WHAT A PASS DOES NOT MEAN. It does NOT mean a human sees pixels. It means the
+# objects exist, are alive, are active in the hierarchy, sit under a live
+# Canvas, and read back the geometry, colour and text they were given. A canvas
+# hidden behind another, a zero scale factor, or a camera that does not render
+# it are all still possible and none of them are visible from here.
+# ===========================================================================
+const NkTestPanelName = "aowlspt-nuikit-selftest-panel"
+const NkTestLabelName = "aowlspt-nuikit-selftest-label"
+const NkTestText      = "AOWLSPT NUIKIT SELFTEST"
+
+var gNkVerdict = "not run"
+
+proc nkNear(v, target, tol: float32): bool =
+  (v - target) < tol and (target - v) < tol
+
+proc nuKitSelfTestWanted(): bool = gNkOn and gNkProof and not gNkProofDone
+
+proc nuKitSelfTestRun(tab: Il2CppPtr) =
+  ## Rides invoke2's postfix drain, ALREADY inside one `aowl_p_p_seh`. Opens
+  ## none of its own: nesting would disarm the outer guard.
+  if not nuKitSelfTestWanted(): return
+  gNkProofDone = true
+  gNkVerdict = "INCONCLUSIVE"
+
+  okLog "nuikit SELFTEST: BEGIN -- build one panel and one label through the " &
+        "TOOLKIT (not the primitives), read back rect/colour/text/active from " &
+        "the LIVE objects, destroy them, then assert the handles REFUSE."
+
+  if not nkReady("selftest"):
+    warn "nuikit SELFTEST: VERDICT = INCONCLUSIVE -- the toolkit is not " &
+         "armed (nativeUi off, or a layer self-disabled). NOTHING was built, " &
+         "so this says nothing about the toolkit."
+    return
+
+  # A live anchor: the same donor every other proof walks to.
+  mi2FindTmp(tab)
+  if gMi2Tmp == nil or gMi2TmpOwner == nil:
+    warn "nuikit SELFTEST: VERDICT = INCONCLUSIVE -- no live donor TMP on this " &
+         "tab, so there is no validated object to anchor the canvas walk on " &
+         "and no font to build a label from. Nothing was created."
+    return
+
+  let canvasGo = nuFindCanvas(gMi2TmpOwner)
+  let parentGo = (if canvasGo != nil: canvasGo else: nuGameObjectOf(gMi2TmpOwner))
+  if parentGo == nil:
+    warn "nuikit SELFTEST: VERDICT = INCONCLUSIVE -- neither nuFindCanvas nor " &
+         "the donor's own GameObject gave a live parent. Nothing was created."
+    return
+  if canvasGo == nil:
+    okLog "nuikit SELFTEST: nuFindCanvas found nothing usable, so this run " &
+          "parents into the DONOR's GameObject instead. That still exercises " &
+          "the constructors and the handle table, but it does NOT test canvas " &
+          "discovery -- that part of the run is INCONCLUSIVE whatever the " &
+          "final verdict says."
+
+  # ---------------------------------------------------------------- build
+  let panel = nuPanel(parentGo, 320.0'f32, -300.0'f32, 260.0'f32, 90.0'f32,
+                      0.10'f32, 0.55'f32, 0.95'f32, 0.85'f32, NkTestPanelName)
+  if uint32(panel) == 0'u32:
+    warn "nuikit SELFTEST: VERDICT = FAIL -- nuPanel refused; the reason is " &
+         "the `nuikit: panel(...) REFUSED` line above."
+    gNkVerdict = "FAIL"
+    return
+
+  let label = nuLabel(parentGo, gMi2Tmp, 330.0'f32, -320.0'f32,
+                      240.0'f32, 40.0'f32, NkTestText, 22.0'f32,
+                      1.0'f32, 1.0'f32, 1.0'f32, 1.0'f32, NkTestLabelName)
+  if uint32(label) == 0'u32:
+    warn "nuikit SELFTEST: VERDICT = FAIL -- the panel was built but nuLabel " &
+         "refused; tearing the panel down."
+    discard nuDestroy(panel)
+    gNkVerdict = "FAIL"
+    return
+
+  # ------------------------------------------------- read the FINISHED state
+  let (rectOk, _, _, pw, ph) = nuElemRect(panel)
+  let (colOk, cr, cg, cb, ca) = nuElemColor(panel)
+  let panelActive = nuElemActive(panel)
+  let (lrectOk, _, _, lw, lh) = nuElemRect(label)
+  let labelText = nuElemText(label)
+  let labelActive = nuElemActive(label)
+
+  let panelSized = rectOk and nkNear(pw, 260.0'f32, 1.0'f32) and
+                   nkNear(ph, 90.0'f32, 1.0'f32) and
+                   cNuRectRenderable(pw, ph) != 0'i32
+  # The colour is read RAW at m_Color+0x28, not through get_color: reading back
+  # through the property that wrote it would be a self-comparison.
+  let panelColoured = colOk and ca > 0.5'f32 and cb > 0.9'f32 and
+                      cr < 0.3'f32 and cg > 0.4'f32 and cg < 0.7'f32
+  let labelSized = lrectOk and cNuRectRenderable(lw, lh) != 0'i32
+  let textTook = labelText == NkTestText
+
+  okLog "nuikit SELFTEST: panel readback -- rect=(" & nuF(pw) & "x" & nuF(ph) &
+        ") sizedAsAsked=" & $panelSized & "  m_Color@0x28 raw=(" &
+        (if colOk: nuF(cr) & ", " & nuF(cg) & ", " & nuF(cb) & ", " & nuF(ca)
+         else: "UNREADABLE") & ") matchesWhatWasAskedFor=" & $panelColoured &
+        "  activeInHierarchy=" & $panelActive
+  okLog "nuikit SELFTEST: label readback -- rect=(" & nuF(lw) & "x" & nuF(lh) &
+        ") renderable=" & $labelSized & "  get_text round-trip=\"" & labelText &
+        "\" matchesWhatWasAskedFor=" & $textTook & "  activeInHierarchy=" &
+        $labelActive
+
+  # ------------------------------------------------- exercise the setters
+  let reRect = nuSetRect(panel, 320.0'f32, -300.0'f32, 300.0'f32, 100.0'f32)
+  let (rr2, _, _, pw2, ph2) = nuElemRect(panel)
+  let reSized = reRect and rr2 and nkNear(pw2, 300.0'f32, 1.0'f32) and
+                nkNear(ph2, 100.0'f32, 1.0'f32)
+  let reText = nuSetText(label, NkTestText & " OK")
+  let textBack = nuElemText(label)
+  let reTextTook = reText and textBack == (NkTestText & " OK")
+  # A panel has no text. The toolkit must REFUSE, not write into an Image.
+  let wrongKindRefused = not nuSetText(panel, "this must not be accepted")
+  okLog "nuikit SELFTEST: setters -- setRect readback=(" & nuF(pw2) & "x" &
+        nuF(ph2) & ") took=" & $reSized & "; setText readback=\"" & textBack &
+        "\" took=" & $reTextTook & "; setText on a PANEL refused=" &
+        $wrongKindRefused & " (that refusal is the point: a kind check that " &
+        "accepts everything is a check that cannot fail)"
+
+  # ------------------------------------------------- teardown, then the NEGATIVE
+  let stalePanel = panel
+  let staleLabel = label
+  let destroyedP = nuDestroy(panel)
+  let destroyedL = nuDestroy(label)
+  # THE ASSERTION THIS WHOLE FILE EXISTS FOR. After teardown NO operation on a
+  # spent handle may succeed. A bare-index handle table passes everything above
+  # and fails right here.
+  let refusesResolve = not nuValidHandle(stalePanel) and
+                       not nuValidHandle(staleLabel)
+  let refusesLive    = not nuLive(stalePanel) and not nuLive(staleLabel)
+  let refusesSetRect = not nuSetRect(stalePanel, 0'f32, 0'f32, 10'f32, 10'f32)
+  let refusesSetText = not nuSetText(staleLabel, "must not be accepted")
+  let refusesDestroy = not nuDestroy(stalePanel)
+  let refusesAll = refusesResolve and refusesLive and refusesSetRect and
+                   refusesSetText and refusesDestroy
+  okLog "nuikit SELFTEST: after teardown (panel destroyed=" & $destroyedP &
+        ", label destroyed=" & $destroyedL & ") the SPENT handles refuse -- " &
+        "resolve=" & $refusesResolve & " live=" & $refusesLive & " setRect=" &
+        $refusesSetRect & " setText=" & $refusesSetText & " destroy=" &
+        $refusesDestroy & "; live handles now " & $int(cNkLiveCount())
+  let tableDrained = int(cNkLiveCount()) == 0
+
+  # ------------------------------------------------------------- the verdict
+  if not rectOk or not colOk or not lrectOk:
+    gNkVerdict = "INCONCLUSIVE"
+    warn "nuikit SELFTEST: VERDICT = INCONCLUSIVE -- a required readback " &
+         "could not be performed (panel rect ok=" & $rectOk & ", panel colour " &
+         "ok=" & $colOk & ", label rect ok=" & $lrectOk & "). The elements " &
+         "were built and torn down, but the finished state could not be " &
+         "examined, so this is not a pass."
+  elif panelSized and panelColoured and panelActive and labelSized and
+       textTook and labelActive and reSized and reTextTook and
+       wrongKindRefused and refusesAll and tableDrained:
+    gNkVerdict = "PASS"
+    okLog "nuikit SELFTEST: VERDICT = PASS -- a panel and a label were built " &
+          "FROM SCRATCH through the toolkit, each read back the geometry, " &
+          "colour and text it was given, both were active in the hierarchy, " &
+          "both were destroyed, and every spent handle now REFUSES with a " &
+          "named reason. PASS DOES NOT PROVE A HUMAN SEES PIXELS: it proves " &
+          "the objects existed, were live, and answered correctly. A canvas " &
+          "behind another canvas, a zero scale factor, or a camera that does " &
+          "not render it are all still possible and invisible from here."
+  else:
+    gNkVerdict = "FAIL"
+    warn "nuikit SELFTEST: VERDICT = FAIL -- " &
+         (if not panelSized: "the panel's rect did not read back as asked. "
+          else: "") &
+         (if not panelColoured: "m_Color did not read back as asked. " else: "") &
+         (if not panelActive: "the panel was not activeInHierarchy. " else: "") &
+         (if not labelSized: "the label's rect is not renderable. " else: "") &
+         (if not textTook: "get_text did not round-trip. " else: "") &
+         (if not labelActive: "the label was not activeInHierarchy. " else: "") &
+         (if not reSized: "setRect did not take. " else: "") &
+         (if not reTextTook: "setText did not take. " else: "") &
+         (if not wrongKindRefused: "setText on a PANEL was ACCEPTED -- the " &
+                                   "kind check is not doing anything. "
+          else: "") &
+         (if not refusesAll: "A SPENT HANDLE STILL WORKED. That is the " &
+                             "generation counter failing, and it is the " &
+                             "crash this toolkit exists to prevent. "
+          else: "") &
+         (if not tableDrained: "the handle table did not drain to zero. "
+          else: "")
+
+  okLog "nuikit SELFTEST: OVERALL = " & gNkVerdict & ". Canvas discovery was " &
+        (if canvasGo != nil: "EXERCISED (the inspector's iSceneRoots walk)."
+         else: "NOT exercised this run; it is INCONCLUSIVE independently of " &
+               "the verdict above.")
+
+proc bindNuiKit*(verbose: bool) =
+  ## No detour of its own, by design -- the only proven Unity-thread point where
+  ## a live screen and built controls both exist is already taken by invoke2's
+  ## postfix on `SettingsScreen::EnsureTabInitialized`, and a second detour
+  ## there would overwrite the first's trampoline and silently kill it. This
+  ## rides that drain, exactly like `nuProofRun` and `auProofRun`.
+  if not gNkOn: return
+  if not gNuOn:
+    warn "nuikit: `nativeUiKit` is on but `nativeUi` is OFF. The toolkit is a " &
+         "facade over that layer and will refuse every call. Turn on nativeUi."
+    return
+  okLog "nuikit: the native-UI toolkit is ARMED -- nuPanel/nuLabel/nuSetRect/" &
+        "nuSetColor/nuSetText/nuSetActive/nuDestroy over a " &
+        $int(cNkCapacity()) & "-entry generation-checked handle table, and " &
+        "nuFindCanvas (the LIVE INSPECTOR's scene-root walk, consumed -- not a " &
+        "second implementation). Self-test is " &
+        (if gNkProof: "ENABLED (nativeUiKitProof): open Settings and click a tab."
+         else: "OFF (nativeUiKitProof).")
+  if verbose:
+    info "nuikit: handle layout is (generation << 16) | (index + 1); handle 0 " &
+         "is never valid, and a freed slot keeps its generation so every " &
+         "handle to it reads STALE rather than resolving to its successor."
