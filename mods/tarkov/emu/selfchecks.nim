@@ -50,6 +50,7 @@ import itemsgaps
 import itemsadd
 import mailcheck
 import spawn
+import loadout
 import decorate
 import dialogue
 import insurance
@@ -129,6 +130,13 @@ proc selfCheckFailures*(): seq[string] =
   # hole that made the client throw "Cannot find template ... for item".
   discard itemsadd.selfCheckItemsAdd(result)
   discard spawn.selfCheckSpawn(result)
+  # `loadout` is the automation library's gear minter. Its offline half proves
+  # only what it can: that every DECLINING path names a reason, that a spec
+  # which could not be looked at answers INCONCLUSIVE rather than PASS, and that
+  # the report carries requested/minted/placed as three separate numbers. It
+  # deliberately does NOT assert that gear arrived -- that needs a real profile,
+  # and a check written to pass without one is the check that cannot fail.
+  discard loadout.selfCheckLoadout(result)
   # `mailcheck` proves the served-mail payload check can FAIL. It is run on
   # the exact bad body measured in a live mailbox on 2026-08-28 -- a message
   # whose one attachment is the tpl of a stash -- and refuses the load if the

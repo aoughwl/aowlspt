@@ -85,6 +85,7 @@ import emu/itemsadd  # the WHOLE item templates BSG serves and db.json lacks
 import emu/tuning   # the globals overrides -- the settings that reach the CLIENT
 import emu/svm      # the SVM rows that are NOT globals.config, + the read ledger
 import emu/spawn    # spawning items into a stash from the settings page
+import emu/loadout  # the automation library's declarative gear minter
 
 const
   ModGuid = "aowl.tarkov"
@@ -1635,6 +1636,32 @@ proc onChatServerList(url, body, session: string): string =
   a.add srv
   result = envelope(a)
 
+proc onAutoscriptLoadout(url, body, session: string): string =
+  ## `/aowlspt/tarkov/autoscript/loadout` -- mint a declared loadout, then read
+  ## the profile back and say what really arrived.
+  ##
+  ## Not in the client's envelope. Nothing in the client asks for this: the
+  ## caller is `tools/autoscript.nim`, running as a separate process on behalf of
+  ## a test script, and an envelope would invite something to treat it as a game
+  ## route (the reason `/aowlspt/tarkov/selfcheck` is bare too).
+  ##
+  ## It is a route rather than an in-game mod hook because a CLIENT-side mod
+  ## cannot serve HTTP -- `serve()` inside the game process registers into
+  ## nothing. The backend is the only place a script can be answered from.
+  inc gRequests
+  let rep = applyLoadout(body)
+  info "autoscript loadout: " & rep.verdict & " -- " & rep.reason
+  result = reportJson(rep)
+
+proc onAutoscriptVerify(url, body, session: string): string =
+  ## `/aowlspt/tarkov/autoscript/verify` -- the read-back half alone. Mints
+  ## nothing and saves nothing; the same `countPlaced` decides. A script uses it
+  ## to assert a loadout survived a raid, or to check the ground truth before
+  ## minting on top of it.
+  inc gRequests
+  let rep = verifyLoadout(body)
+  result = reportJson(rep)
+
 proc onSelfCheck(url, body, session: string): string =
   ## `/aowlspt/tarkov/selfcheck` -- did this build's own arithmetic hold?
   ##
@@ -3087,6 +3114,11 @@ proc registerRoutes() =
   # answers, so that namespace does not reach a mod on this host.
   discard serve("/aowlspt/tarkov/orbit/plan", onOrbitPlan)
   discard serve("/aowlspt/tarkov/orbit/containers", onOrbitContainers)
+
+  # The automation library's gear side. Same namespace as the launcher routes,
+  # measured to be the one that reaches a mod on this host.
+  discard serve("/aowlspt/tarkov/autoscript/loadout", onAutoscriptLoadout)
+  discard serve("/aowlspt/tarkov/autoscript/verify", onAutoscriptVerify)
 
   discard serve("/client/profile/status", onProfileStatus)
   # `GetProfileSettings` answers a bare `true`; the client only checks that the
