@@ -32,6 +32,7 @@
   "indicatorInset": 48,
   "indicatorHoldMs": 400,
   "indicatorFadeMs": 1600,
+  "indicatorGraceMs": 1200,
 
   "_widget": "ONE spatial widget replaces the separate hudRadar/hudMap surfaces. spatialMode 'auto' means: derive the mode from the legacy hudRadar/hudMap/heading keys above, so an existing config keeps the surface it had (a migrated radar also carries radarX/radarY/radarSize into mapX/mapY/mapSize). Pick any other mode and the legacy keys stop being consulted.",
   "spatialMode": "auto",

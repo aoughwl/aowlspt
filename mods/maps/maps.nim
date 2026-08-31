@@ -275,6 +275,11 @@ proc readOpts(o: var HudOpts) =
   # means "vanish the instant the hold elapses".
   o.indicatorHoldMs = asInt(setting("indicatorHoldMs"), 400)
   o.indicatorFadeMs = asInt(setting("indicatorFadeMs"), 1600)
+  # THE FLICKER SETTING (bug 2). The feed drops a still-present contact for a
+  # publish or two routinely; without this every one of those gaps dimmed the
+  # mark and then snapped it back. 0 = the old behaviour, and is the control
+  # that makes the fix falsifiable.
+  o.indicatorGraceMs = asInt(setting("indicatorGraceMs"), 1200)
   o.heading             = asBool(setting("heading"), false)
 
   # ---- THE UNIFIED WIDGET's mode, and the MIGRATION of the old toggles ----
@@ -727,6 +732,18 @@ proc spatialSchema(): seq[Setting] =
                              "STILL THERE never ages and never fades. This " &
                              "window governs a contact that has DROPPED OUT of " &
                              "the feed. 0 means gone the instant the hold ends"),
+    intSetting("indicatorGraceMs", "Indicator absence grace (ms)", 1200, lo = 0,
+               hi = 20000, category = "HUD",
+               description = "How long a contact may be MISSING from the feed " &
+                             "before its mark begins to fade at all. This is " &
+                             "the flicker control: the feed drops a contact " &
+                             "that is still standing there for a publish or " &
+                             "two routinely, and without this grace every one " &
+                             "of those gaps dimmed the mark and then snapped " &
+                             "it back to full -- which is the blinking. A " &
+                             "contact that genuinely leaves is unaffected; it " &
+                             "simply fades this much later. Set 0 to reproduce " &
+                             "the old blinking behaviour exactly"),
 
     boolSetting("heading", "Rotate radar to facing", true, category = "HUD",
                 description = "Specified from the pre-1.0 BepInEx map/radar mods (no upstream code carried; map art and calibration provenance in mods/maps/data/maps/README.md). Rotate BOTH the radar and the map pane to " &
@@ -1379,6 +1396,42 @@ proc mapsDiagText(): string =
           "live entry of GameWorld.AllAlivePlayersList, refreshed every " &
           "collection. An indicator that persists for a contact that is still " &
           "present is the FEED working as built, not a failed decay"
+
+  # 6b. THE FLICKER VERDICT (bug 2). The line above cannot answer the user's
+  # actual question -- "why does it blink?" -- because reduced-alpha
+  # submissions are consistent with BOTH explanations. This one separates them
+  # and is the falsifiable negative the fix has to be judged against:
+  # NO track for a still-present contact was removed and re-added.
+  var lFlick = ""
+  if hudTracks() == 0 and hudIndExpired() == 0'i64:
+    lFlick = "INCONCLUSIVE  no track has ever been created, so nothing could " &
+             "have been re-created. This is 'I could not look', not a pass."
+  elif hudRecreated() > 0'i64:
+    lFlick = "FAIL  " & $hudRecreated() & " track(s) were EVICTED and then " &
+             "re-claimed for the SAME identity within 3000ms. That is not a " &
+             "fade -- the mark went out and popped back in, so the flicker is " &
+             "IDENTITY CHURN and the grace window is not the fix for it. " &
+             "(" & $hudRecreatedLate() & " later re-claim(s), which are " &
+             "genuine re-entries and are NOT counted as churn.)"
+  else:
+    lFlick = "PASS  ZERO tracks were evicted and re-claimed for the same " &
+             "identity within 3000ms (" & $hudRecreatedLate() & " genuine " &
+             "re-entr(ies) after that window, which are not flicker). The " &
+             "blink was therefore ALPHA OSCILLATION, not identity churn, and " &
+             "the absence grace is the fix for it: " & $hudGraceHeld() &
+             " mark(s) that the old code would have dimmed were held at FULL " &
+             "alpha by indicatorGraceMs=" & $hudLiveGraceMs() & "ms. Set that " &
+             "setting to 0 and this count must fall to zero and the blinking " &
+             "must return -- that is what makes this claim falsifiable."
+
+  # 6c. THE DRAW GATE (bug 1), reported as a COUNT of transitions rather than a
+  # claim. `drawArmWhy` is INCONCLUSIVE, never PASS, whenever the arm's state
+  # was carried across a phase the host could not read or does not export.
+  let lGate = "arm=" & (if drawArmed(): "ARMED" else: "clear") &
+              " phase=" & hostPhaseName(gArmLastPhase) &
+              " arms=" & $gArmArms & " disarms=" & $gArmDisarms &
+              " heldOnUnknown=" & $gArmUnknownHeld &
+              " heldOnNoExport=" & $gArmNoExportHeld & "  " & drawArmWhy()
   # 7. the ART. The failure this whole feature exists to make impossible is a
   # silent fall back to a bare grid, so this line NEVER just reports a count:
   # it names the map, the layer and WHY that layer, or it names the reason
@@ -1726,6 +1779,8 @@ proc mapsDiagText(): string =
            "  projector    : " & lProj   & "\n" &
            "  heading      : " & lHdg    & "\n" &
            "  indLifetime  : " & lLife   & "\n" &
+           "  indFlicker   : " & lFlick  & "\n" &
+           "  drawGate     : " & lGate   & "\n" &
            "  art          : " & lArt    & "\n" &
            # TWO independent class stages, because they can fail independently
            # and folding them would hide one behind the other. `classify` is
@@ -2075,6 +2130,11 @@ proc mirrorDrift(): string =
   d = numDrift("indicatorHoldMs", float(w.indicatorHoldMs), float(hudLiveHoldMs()))
   if d.len > 0: return d
   d = numDrift("indicatorFadeMs", float(w.indicatorFadeMs), float(hudLiveFadeMs()))
+  if d.len > 0: return d
+  # The new key is drift-checked like the other two, so "the setting exists"
+  # and "the setting reaches the renderer" cannot be confused for each other.
+  d = numDrift("indicatorGraceMs", float(w.indicatorGraceMs),
+               float(hudLiveGraceMs()))
   if d.len > 0: return d
   if w.showBots != hudLiveShowBots():
     return "showBots config=" & $w.showBots & " mirror=" & $hudLiveShowBots()
