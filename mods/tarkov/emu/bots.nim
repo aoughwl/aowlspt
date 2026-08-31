@@ -451,6 +451,25 @@ var gSlotUnknown = 0
   ## item list, or the parent template is absent from the database. INCONCLUSIVE
   ## is not a failure: these are KEPT, and counted separately so a database gap
   ## never reads as a clean run.
+var gModRefused = 0
+  ## Of `gSlotDropped`, the ones removed because a WEAPON MOD slot's own
+  ## `Filter` does not name that template -- the falsifiable negative for
+  ## "no generated weapon carries a mod in a slot whose Filter does not admit
+  ## it". **This is a number that must be zero.** It is not the same as
+  ## `gSlotDropped`, which also counts undeclared slots and duplicates, and a
+  ## total alone cannot tell the three apart.
+var gSlotDup = 0
+  ## Of `gSlotDropped`, the ones removed because that (parent, slot) pair was
+  ## ALREADY filled -- the falsifiable negative for "no generated weapon carries
+  ## more than one item in any single-cardinality slot", i.e. the two-magazines
+  ## half of the shotgun report. **Also must be zero.**
+var gWeapons = 0
+  ## Weapons served (an item in `FirstPrimaryWeapon` / `SecondPrimaryWeapon` /
+  ## `Holster` whose template declares a `weapClass`).
+var gShotguns = 0
+  ## Of those, shotguns. A batch that generated NO shotgun cannot say anything
+  ## about the shotgun bug: that run is INCONCLUSIVE, not a pass, and the
+  ## counter line has to make that readable without a second instrument.
 var gStackAudited = 0
   ## Items in a FINISHED, about-to-be-served bot inventory whose template
   ## declares a random spawn range (`_props.StackMaxRandom`) -- currency and
@@ -779,10 +798,62 @@ proc randomStackCount(tpl: string; r: var Rng): int =
   if b < a: b = a
   result = a + nextInt(r, b - a + 1)
 
+var gLooseMagRefused = 0
+  ## Loose magazines refused from container loot because no weapon the bot is
+  ## carrying can take them. See `addContainerLoot`.
+
+proc declaresCartridges(tpl: string): bool =
+  ## A MAGAZINE, discriminated by the template's own declaration rather than by
+  ## a base-class id written out from memory. MEASURED: exactly 224 templates in
+  ## the shipped database declare `_props.Cartridges`, and they are the
+  ## magazines; ammunition packs declare `StackSlots` instead, and weapons
+  ## declare `Chambers`.
+  ##
+  ## `dbRead` rather than `itemMember`: this proc is defined above `itemMember`,
+  ## and the loot path it guards has no fixture seam to honour anyway.
+  let v = dbRead("templates.items." & tpl & "._props.Cartridges")
+  if not v.ok:
+    return false
+  result = at(whole(v.raw), 0).found
+
+proc magazinesFitting(weaponTpls: seq[string]): seq[string] =
+  ## Every magazine template named by the `mod_magazine` filter of any weapon
+  ## the bot is actually carrying. Concrete ids -- see `isModSlot` for the
+  ## measurement that says a weapon mod filter never names a class.
+  result = @[]
+  for w in weaponTpls:
+    let def = slotDefFor(slotDefs(w), "mod_magazine")
+    if not def.found:
+      continue
+    let list = def.field("_props").field("filters").at(0).field("Filter")
+    if not list.found or not isArray(list):
+      continue
+    for i in 0 ..< count(list):
+      let one = at(list, i).asText("")
+      if one.len > 0 and one notin result:
+        result.add one
+
 proc addContainerLoot(inv, generation: JsonRef; items: var List;
                       c: var Container; kind: string; r: var Rng;
-                      budget: var int; richness: float) =
+                      budget: var int; richness: float;
+                      fittingMags: seq[string]) =
   ## Fills one equipped container from its own pool.
+  ##
+  ## ## Loose magazines are filtered against the bot's own guns
+  ##
+  ## The container pools are NOT weapon-aware: measured on the shipped database,
+  ## a plain scav's `TacticalVest` pool has 150 entries of which **39 are
+  ## magazines**, in every caliber the game has, and the `Backpack` pool has
+  ## **181 of 1,851** -- including 75-round drums. Drawn blind, a scav carrying a
+  ## single-fed shotgun ends up with two drum magazines in his rig that fit
+  ## nothing he owns. That is the reported bug, and it is a LOOT bug, not a slot
+  ## bug: nothing was ever attached to the shotgun (the mod-slot pools were
+  ## audited against every shotgun's own `Filter` and are clean), the magazines
+  ## were loose in the rig beside it.
+  ##
+  ## So a magazine is only placed here if some weapon the bot is carrying names
+  ## it. A bot with no firearm at all therefore carries no loose magazine, which
+  ## is the same rule and the right answer. Every other loot kind is untouched.
   let pool = inv.field("items").field(c.slot)
   if not pool.found or not isObject(pool):
     return
@@ -807,6 +878,9 @@ proc addContainerLoot(inv, generation: JsonRef; items: var List;
     let tpl = pickTemplate(pool, r)
     if tpl.len == 0:
       return
+    if declaresCartridges(tpl) and tpl notin fittingMags:
+      inc gLooseMagRefused
+      continue
     var gridName = ""
     var location = ""
     if not placeIn(c, tpl, gridName, location):
@@ -960,15 +1034,48 @@ proc ancestry(tpl: string): seq[string] =
     hops = hops + 1
   result = out2
 
+proc isModSlot(slot: string): bool =
+  ## True for a WEAPON MOD slot, where a filter is written against concrete
+  ## template ids, as opposed to an EQUIPMENT slot, where it is written against
+  ## base classes.
+  ##
+  ## MEASURED against the shipped database on 2026-08-31, over every `Slots`
+  ## entry of all 4,673 templates: of the **2,897** slots named `mod_*` or
+  ## `patron*`, **ZERO** name a base class in `filters[0].Filter` -- every entry
+  ## is a concrete item. Of the **868** equipment slots, **26** do name a class,
+  ## and those 26 are the whole reason `ancestry` exists (an exact test refused
+  ## every helmet and rig and dropped 3,308 items in one raid).
+  ##
+  ## So the generalisation is NEEDED on equipment and is never needed on a
+  ## weapon mod slot, where it can only ever say yes to something the client
+  ## will say no to: a Remington 870's `mod_magazine` filter is three specific
+  ## tube extensions, and every magazine in the database -- including the
+  ## MD Arms 20-round Saiga DRUM -- shares the ancestor `5448bc234bdc2d3c308b4569`.
+  ## That is the shotgun-with-a-drum-magazine bug, exactly.
+  ##
+  ## `Cartridges` and `Chambers` filters were measured the same way and are also
+  ## 0-of-224 and 0-of-148 class entries, so ammo is exact too.
+  let s = toLowerAscii(slot)
+  s.startsWith("mod_") or s.startsWith("patron") or s.startsWith("camora") or
+    s == "cartridges"
+
 proc listContainsAny(list: JsonRef; names: seq[string]): bool =
   for one in names:
     if listContains(list, one):
       return true
   result = false
 
-proc filterAccepts(def: JsonRef; tpl: string): bool =
+proc filterAccepts(def: JsonRef; tpl: string; exact: bool = false): bool =
   ## `filters[0].Filter` / `ExcludedFilter`, resolved through the template's own
-  ## inheritance chain (see `ancestry`). A slot that declares no filter
+  ## inheritance chain (see `ancestry`) -- unless `exact`, in which case the
+  ## ALLOW list is matched against the template id ITSELF and nothing else.
+  ## `exact` is set for weapon mod slots only; see `isModSlot` for the
+  ## measurement that says the chain buys nothing there and costs correctness.
+  ##
+  ## `ExcludedFilter` stays chain-resolved in both modes on purpose: a
+  ## denial written against a base class must still deny its members, and
+  ## widening a denial cannot admit anything the client would refuse.
+  ## A slot that declares no filter
   ## constrains nothing and accepts everything -- that is stock behaviour and the
   ## right reading; only a NON-EMPTY Filter is authoritative.
   let f0 = def.field("_props").field("filters").at(0)
@@ -986,6 +1093,8 @@ proc filterAccepts(def: JsonRef; tpl: string): bool =
     return false
   if not hasAllow:
     return true
+  if exact:
+    return listContains(allow, tpl)
   result = listContainsAny(allow, chain)
 
 proc gridDeclares(parentTpl, slotName: string): bool =
@@ -1006,12 +1115,13 @@ proc judgeSlot(parentTpl, slotName, tpl: string): SlotVerdict =
   if not itemMember(parentTpl, "").found:
     return svUnknown
   let wanted = toLowerAscii(slotName)
+  let exact = isModSlot(wanted)
 
   if wanted == "cartridges":
     let first = itemMember(parentTpl, "_props.Cartridges").at(0)
     if not first.found:
       return svBad
-    return if filterAccepts(first, tpl): svOk else: svBad
+    return if filterAccepts(first, tpl, exact): svOk else: svBad
 
   for member in ["_props.Slots", "_props.Chambers"]:
     let v = itemMember(parentTpl, member)
@@ -1019,7 +1129,7 @@ proc judgeSlot(parentTpl, slotName, tpl: string): SlotVerdict =
       continue
     let def = slotDefFor(v, slotName)
     if def.found:
-      return if filterAccepts(def, tpl): svOk else: svBad
+      return if filterAccepts(def, tpl, exact): svOk else: svBad
 
   if gridDeclares(parentTpl, slotName):
     return svGrid
@@ -1122,6 +1232,17 @@ proc validateSlots*(items: List; report: var seq[string];
     if parent.len == 0 or slot.len == 0:
       continue
     let tpl = tpls[i]
+    # What KIND of weapon this bot got, counted here because this loop already
+    # holds every item and its slot. A weapon is never a drop candidate, so
+    # counting before the drops is the same number as counting after. Only the
+    # three weapon-bearing equipment slots are looked up, so this is at most
+    # three template reads per bot, not one per item.
+    if isWeaponSlot(slot):
+      let wc = toLowerAscii(itemMember(tpl, "_props").field("weapClass").asText(""))
+      if wc.len > 0:
+        inc gWeapons
+        if wc == "shotgun":
+          inc gShotguns
     var parentTpl = ""
     for k in 0 ..< ids.len:
       if ids[k] == parent:
@@ -1137,12 +1258,15 @@ proc validateSlots*(items: List; report: var seq[string];
       discard
     of svBad:
       drop[i] = true
+      if isModSlot(slot):
+        inc gModRefused
       noteDrop("refused", parentTpl, tpl, slot)
       report.add "slot refused: " & tpl & " -> " & slot & " on " & parentTpl
     of svOk:
       let key = parent & "\x1f" & toLowerAscii(slot)
       if key in taken:
         drop[i] = true
+        inc gSlotDup
         noteDrop("duplicate", parentTpl, tpl, slot)
         report.add "slot already filled: " & tpl & " -> " & slot &
                    " on " & parentTpl
@@ -1233,6 +1357,10 @@ proc botGuardCounters*(): string =
   ## The one line a live raid gets to say what happened, instead of nothing.
   "bots: chambered " & $gChambered & ", chamber-skipped " & $gChamberSkipped &
   " (no accepted round), slot-dropped " & $gSlotDropped &
+  " (mod-filter-refused: " & $gModRefused & ", slot-dup: " & $gSlotDup & ")" &
+  ", weapons " & $gWeapons & " (shotguns: " & $gShotguns &
+  (if gShotguns == 0: " -- INCONCLUSIVE for the shotgun check" else: "") & ")" &
+  ", loose-mags-refused " & $gLooseMagRefused &
   ", slot-unjudged " & $gSlotUnknown &
   ", stackable " & $gStackAudited & " (flat<=1: " & $gStackFlat &
   ", avg " & (if gStackAudited > gStackFlat:
@@ -1264,6 +1392,10 @@ proc addLoadout(t: BotTables; items: var List; equipmentId: string;
   # after every slot is decided, because a bot's rig has to *exist* before there
   # is anywhere to put anything, and the equipment roll is what decides that.
   var carried: seq[Container] = @[]
+  ## Every weapon this bot ends up holding, so that loose loot can be told which
+  ## magazines are its own. Collected as the slots are decided, because the
+  ## loot pass runs after all of them.
+  var weaponTpls: seq[string] = @[]
   var gotPockets = false
   for slot in slots:
     let pool = equipment.field(slot)
@@ -1289,6 +1421,7 @@ proc addLoadout(t: BotTables; items: var List; equipmentId: string;
     if slot == "TacticalVest" or slot == "Pockets" or slot == "Backpack":
       carried.add openContainer(itemId, slot, tpl)
     if isWeaponSlot(slot):
+      weaponTpls.add tpl
       addMods(t, inv, chances, items, itemId, tpl, true, r, weaponBudget, spares)
     else:
       addMods(t, inv, chances, items, itemId, tpl, false, r, gearBudget, spares)
@@ -1328,6 +1461,7 @@ proc addLoadout(t: BotTables; items: var List; equipmentId: string;
   # or the extra items the multiplier asks for would have nowhere in the budget
   # to go -- the cap stays a cap (5x at most), it just tracks the setting.
   let richness = lootRichness()
+  let fittingMags = magazinesFitting(weaponTpls)
   var lootBudget = MaxLootPerBot
   if richness > 1.0:
     lootBudget = int(float(MaxLootPerBot) * richness)
@@ -1343,7 +1477,8 @@ proc addLoadout(t: BotTables; items: var List; equipmentId: string;
     if share < 1:
       share = 1
     let had = share
-    addContainerLoot(inv, generation, items, c, kind, r, share, richness)
+    addContainerLoot(inv, generation, items, c, kind, r, share, richness,
+                     fittingMags)
     lootBudget = lootBudget - (had - share)
 
 proc difficultyOf*(role, difficulty: string): string =
@@ -1923,8 +2058,20 @@ const ChkItems = """{
     {"_name": "mod_nvg", "_props": {"filters": [{"Filter": ["nvg"]}]}}]}},
   "helmetBanned": {"_parent": "helmetClass", "_props": {}},
   "nvg": {"_props": {}},
-  "notHelmet": {"_props": {}}
+  "notHelmet": {"_props": {}},
+  "magClass": {"_props": {}},
+  "tubemag": {"_parent": "magClass", "_props": {}},
+  "drummag": {"_parent": "magClass", "_props": {}},
+  "shotgun": {"_props": {"weapClass": "shotgun", "Slots": [
+    {"_name": "mod_magazine",
+     "_props": {"filters": [{"Filter": ["tubemag", "magClass"]}]}}]}}
 }"""
+  ## `shotgun`'s magazine filter names `tubemag` AND the class `magClass`, which
+  ## is the input that TELLS THE TWO RULES APART: the ancestry rule accepts
+  ## `drummag` through its `_parent`, the exact rule does not. Shipped data has
+  ## no such weapon-mod filter (measured: 0 of 2,897 name a class), so this is a
+  ## synthetic worst case on purpose -- a fixture that both rules answer the
+  ## same way would be a check that cannot fail.
   ## A five-template item table shaped exactly like the real one at the members
   ## the validator reads: a weapon with one chamber and one magazine slot, each
   ## with a filter; a magazine with a `Cartridges` filter; a rig with a grid.
@@ -2142,6 +2289,22 @@ proc selfCheckBots*(into: var seq[string]): bool =
     v.add slotItem("n1", "nvg", "h1", "mod_nvg")            # (g) mod under (f)
     v.add slotItem("h2", "notHelmet", "eq1", "Headwear")    # (h) genuinely wrong
     v.add slotItem("h3", "helmetBanned", "eq1", "Headwear") # (i) ExcludedFilter
+    # The reported bug, as a fixture. `sg1` is a tube-fed shotgun whose
+    # `mod_magazine` filter names exactly ONE concrete tube extension; `tubemag`
+    # and `drummag` are siblings under the same `magClass` ancestor, which is
+    # what EVERY magazine in the shipped database shares. Under the ancestry
+    # rule (f)'s generalisation reached here too and (k) was ACCEPTED -- a drum
+    # magazine bolted to a single-fed shotgun, which is what the player saw.
+    # (j) must still survive, or the fix has merely broken magazines.
+    v.add slotItem("sg1", "shotgun", "", "")
+    v.add slotItem("sm1", "tubemag", "sg1", "mod_magazine")  # (j) legal, exact
+    v.add slotItem("sg2", "shotgun", "", "")
+    v.add slotItem("sm2", "drummag", "sg2", "mod_magazine")  # (k) class-only
+    # (k) hangs off a SECOND shotgun, not off `sg1`, for the same reason (c)
+    # hangs off `w2`: parented to `sg1` it would also be a duplicate, the
+    # duplicate rule would drop it, and stubbing the exact rule back to the
+    # ancestry rule would leave this check GREEN. On its own weapon it goes RED.
+    #
     # (h) is in the fixture so that "walk the parent chain" cannot degrade into
     # "accept anything"; (i) so that ExcludedFilter is still consulted along the
     # chain. (h) and (i) hang off `eq1` alongside (f), which is legal only
@@ -2162,21 +2325,22 @@ proc selfCheckBots*(into: var seq[string]): bool =
     let parsed = parseArray(whole(survivorText))
     if not parsed.ok:
       into.add "bots: validateSlots produced something that is not a JSON array"
-    if removed != 6:
+    if removed != 7:
       into.add "bots: validateSlots removed " & $removed &
-               " item(s); the fixture plants exactly 6 (duplicate chamber, " &
+               " item(s); the fixture plants exactly 7 (duplicate chamber, " &
                "filtered-out cartridge, undeclared slot, orphan of the " &
                "undeclared slot, an item of the wrong class, an item its " &
-               "slot's ExcludedFilter names)"
+               "slot's ExcludedFilter names, a drum magazine on a tube-fed " &
+               "shotgun)"
     var survived: seq[string] = @[]
     for i in 0 ..< parsed.len:
       survived.add parsed.at(i).field("_id").asText("")
-    for bad in ["a2", "a3", "a4", "x1", "h2", "h3"]:
+    for bad in ["a2", "a3", "a4", "x1", "h2", "h3", "sm2"]:
       if bad in survived:
         into.add "bots: an invalid placement (" & bad & ") survived the " &
                  "validator -- this is the placement FlatItemsToTree refuses"
     for good in ["w1", "w2", "a1", "m1", "c1", "r1", "r2", "rig1",
-                 "eq1", "h1", "n1"]:
+                 "eq1", "h1", "n1", "sg1", "sg2", "sm1"]:
       if good notin survived:
         into.add "bots: the validator removed a LEGAL placement (" & good &
                  "); serving a bot without its gear is not the fix"
