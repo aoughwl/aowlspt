@@ -205,6 +205,49 @@ var gNeDeepest = 0       ## deepest level actually reached
 var gNeTruncated = 0     ## children NOT queued because of the depth cap
 var gNeDiscFaults = 0    ## faults charged to discovery, not to steady state
 
+# ---- THE SEED LEDGER -----------------------------------------------------
+#
+# MEASURED (integ-beta6 @4b66faf, fully loaded Woods raid, natEsp+natEspDiag
+# ON): the verdict line read `visited=0 fakeNullsSkipped=0 budgetLeft=20000
+# head=0/0 discFaults=24`. The breadth-first walk never popped a node and never
+# spent a unit of budget -- so it was NOT the walk that faulted and NOT a fake
+# null. It faulted in SEEDING, before the queue existed. The message still said
+# "the canvas WALK faulted", which is honest about the fault and useless about
+# where: CLAUDE.md 9b, a diagnostic that cannot distinguish two causes.
+#
+# So the seed now names its own step. `gNeSeedStep` is set BEFORE each call
+# that can fault, never after, so the value surviving a fault is the step that
+# faulted rather than the last one that succeeded.
+const
+  NeSeedIdle      = 0
+  NeSeedAnchor    = 1   ## obtaining the durable DontDestroyOnLoad anchor
+  NeSeedEnum      = 2   ## iSceneRoots -- SceneManager + the anchor's scene
+  NeSeedConvert   = 3   ## GameObject -> Transform for each root obtained
+  NeSeedDone      = 4
+
+var gNeSeedStep = NeSeedIdle
+var gNeSeedTries = 0        ## seed attempts made (it retries until it works)
+var gNeSeedRootsGot = 0     ## roots iSceneRoots handed back, before liveness
+var gNeSeedAnchor = false   ## did we obtain a durable anchor at all?
+
+proc neSeedStepName(s: int): string =
+  case s
+  of NeSeedAnchor:  "anchor(splAnchor)"
+  of NeSeedEnum:    "enumerate(iSceneRoots)"
+  of NeSeedConvert: "convert(GameObject::get_transform)"
+  of NeSeedDone:    "done"
+  else:             "idle"
+
+proc neCrumb(): string =
+  ## The native breadcrumb `aowl_insp_mark` writes before EVERY internal call
+  ## in the inspector's walkers -- including all six scene-root calls. It has
+  ## existed the whole time; natesp simply never read it, which is why 24
+  ## faults produced no name. This turns the next fault into "faulted at
+  ## <step>, last internal call was <crumb> on <ptr>".
+  let c = cInspCrumb()
+  if c == nil: return "<none>"
+  readCString(c)
+
 proc neOk(p: Il2CppPtr; n: int32): bool =
   p != nil and cIsReadable(p, n) != 0'i32
 
@@ -358,8 +401,35 @@ proc neSeed(): bool =
   gNeRejected = 0
   gNeDeepest = 0
   gNeTruncated = 0
+  gNeSeedRootsGot = 0
+  gNeSeedAnchor = false
+  gNeSeedTries = gNeSeedTries + 1
+  # STEP 1 -- THE ANCHOR, OBTAINED THE SAME WAY splFindScreen OBTAINS IT.
+  #
+  # This used to read the raw global `gSplUpdatePreloader` with no
+  # readability check and no fallback. `iSceneRoots(anchor = nil)` then falls
+  # through to `gInspPreloader`, which ONLY the live inspector's rider ever
+  # writes -- fact #234's exact shape: with `liveInspector` off, natesp would
+  # have been enumerating SceneManager's listed scenes alone, and on this build
+  # those truthfully report rootCount=0 because the live UI is in
+  # DontDestroyOnLoad. `splAnchor()` is the durable accessor: it prefers the
+  # PreloaderUI::Update `this` captured by the shared Update rider (populated
+  # with liveInspector OFF), falls back to the inspector's, and `duOk`s both.
+  gNeSeedStep = NeSeedAnchor
+  let anchor = splAnchor()
+  gNeSeedAnchor = anchor != nil
+  # STEP 2 -- ENUMERATE. `Scene::GetRootGameObjects` allocates a List and an
+  # array and runs class-init on first use (abi/aowlspt_navui.h says so in as
+  # many words: "never in a per-frame path"). It is ONE-TIME here -- gated by
+  # `gNeSeeded` -- which is the exception that comment allows. But a seed that
+  # FAULTS leaves `gNeSeeded` false and therefore repeats every frame, which is
+  # exactly the per-frame allocating path the comment forbids. That is why the
+  # fault budget must name this step and stop, rather than retry blindly.
+  gNeSeedStep = NeSeedEnum
   var roots: seq[Il2CppPtr] = @[]
-  discard iSceneRoots(roots, false, gSplUpdatePreloader)
+  discard iSceneRoots(roots, false, anchor)
+  gNeSeedRootsGot = roots.len
+  gNeSeedStep = NeSeedConvert
   for g in roots:
     # A scene root can be a fake null too -- during a raid load especially.
     # neTransformOf checks liveness on BOTH sides of GameObject::get_transform.
@@ -373,7 +443,23 @@ proc neSeed(): bool =
       inc gNeSeedCount
     else:
       inc gNeSeedDead
+  gNeSeedStep = NeSeedDone
   gNeQueue.len > 0
+
+proc neSeedLedger(): string =
+  ## THE SEED LEDGER, distinct from the walk's. Four facts, each independently
+  ## falsifiable: did we get an anchor, how many roots came back, how many
+  ## survived liveness, and which step we were on. `anchor=no` plus `roots=0`
+  ## is a different diagnosis from `anchor=yes roots=274 live=0`, and one line
+  ## that could not tell them apart is a line that cannot fail.
+  "seed: tries=" & $gNeSeedTries &
+  " anchor=" & (if gNeSeedAnchor: "yes" else: "NO") &
+  " rootsObtained=" & $gNeSeedRootsGot &
+  " liveRootsSeeded=" & $gNeSeedCount &
+  " rootsSkippedDead=" & $gNeSeedDead &
+  " step=" & neSeedStepName(gNeSeedStep) &
+  " lastInternalCall=\"" & neCrumb() & "\" on 0x" &
+  hexOf(cast[uint64](cInspCrumbPtr()))
 
 proc neDiscoverStep() =
   ## One frame's slice. Returns by mutating the state machine; the walk is
@@ -388,9 +474,31 @@ proc neDiscoverStep() =
     return
   if not gNeSeeded:
     if not neSeed():
+      # NOT a bare "no roots". Say which of the two distinguishable causes it
+      # was, and say plainly when the anchor is the missing piece -- natesp
+      # must never depend on `liveInspector` being on, so if that is what is
+      # missing it is named here rather than silently producing zero roots.
+      warn "natesp: SEEDING produced no usable scene root -- " & neSeedLedger() &
+           ". " &
+           (if not gNeSeedAnchor:
+              "NO durable DontDestroyOnLoad anchor was available " &
+              "(gSplUpdatePreloader and gInspPreloader are both null/unreadable), " &
+              "so only the scenes SceneManager LISTS could be enumerated -- and on " &
+              "this build those truthfully report rootCount=0 because the live UI " &
+              "is in DontDestroyOnLoad. This is INCONCLUSIVE, not proof there is " &
+              "no canvas. It resolves once a PreloaderUI::Update rider slot has " &
+              "been claimed; it does NOT require liveInspector."
+            elif gNeSeedRootsGot == 0:
+              "An anchor WAS obtained and iSceneRoots still returned nothing: " &
+              "the scene enumeration itself came back empty. INCONCLUSIVE."
+            else:
+              "An anchor was obtained and " & $gNeSeedRootsGot & " root(s) came " &
+              "back, but every one failed the liveness check or had no readable " &
+              "Transform. INCONCLUSIVE.")
       neRefuse(NeRNoRoots)
       return
     gNeSeeded = true
+    okLog "natesp: " & neSeedLedger()
     okLog "natesp: canvas discovery started -- " & $gNeSeedCount &
           " live scene roots seeded (DontDestroyOnLoad included via the live " &
           "anchor), " & $gNeSeedDead & " root(s) skipped as fake nulls, " &
@@ -753,7 +861,18 @@ proc neVerdictLine(sw, sh: float64): string =
       $gNeCandidates & " rejected=" & $gNeRejected & " deepest=" & $gNeDeepest &
       "/" & $int(cNeMaxDepth()) & " budgetLeft=" & $gNeBudget & " head=" &
       $gNeHead & "/" & $gNeQueue.len & " discFaults=" & $gNeDiscFaults &
-      ". I could not look; that is NOT a pass."
+      ". " & neSeedLedger() & ". " &
+      # `visited=0` WITH THE BUDGET UNTOUCHED IS A SEEDING FAILURE, and the
+      # line must say so itself rather than leaving the reader to notice.
+      # This exact combination was reported once as "the canvas walk itself
+      # faulted", which sent the investigation to the walk for a fault that
+      # happened before the queue existed.
+      (if not gNeSeeded and gNeVisited == 0 and gNeHead == 0:
+         "NOTE: the breadth-first WALK NEVER RAN -- nothing was queued, no " &
+         "budget was spent, no node was visited. Whatever went wrong is in " &
+         "SEEDING (see the `seed:` fields above), not in the walk."
+       else: "") &
+      " I could not look; that is NOT a pass."
 
 # ---------------------------------------------------------------------------
 # THE TICK -- one body, one guard, ridden on the existing Update drain
@@ -830,13 +949,29 @@ proc natEspDrainTick() =
       # killed the feature after six frames. It still self-disables -- at its
       # own, larger cap, with its own reason.
       inc gNeDiscFaults
-      warn "natesp: the canvas WALK faulted (" & $gNeDiscFaults & " of " &
+      # SEED OR WALK -- NEVER BOTH UNDER ONE NAME. `gNeSeeded` is set only
+      # after a seed has fully succeeded, so "not seeded" means the fault
+      # happened at or before seeding and the walk had not started. The old
+      # message called every discovery fault a "WALK" fault; that is how 24
+      # faults reported `visited=0 budgetLeft=20000 head=0/0` -- a walk that
+      # provably never ran -- and told us nothing.
+      let inSeed = not gNeSeeded
+      warn "natesp: " & (if inSeed: "SEEDING" else: "the canvas WALK") &
+           " faulted (" & $gNeDiscFaults & " of " &
            $int(cNeMaxDiscFaults()) & " discovery faults; the steady-state " &
            "budget is untouched at " & $int(cNeFaultCount()) & "). Fake nulls " &
-           "are skipped, not faulted, so this was something else. Walk so " &
-           "far: visited=" & $gNeVisited & " fakeNullsSkipped=" & $gNeFakeNull &
-           " head=" & $gNeHead & "/" & $gNeQueue.len &
-           "; the walk RESUMES at the next node, it does not restart."
+           "are skipped, not faulted, so this was something else. " &
+           (if inSeed:
+              "The breadth-first walk had NOT started -- nothing was queued and " &
+              "no budget was spent, so this is NOT a walk fault. " &
+              neSeedLedger() & ". `step` is set before each call that can " &
+              "fault, so it names the call that did; `lastInternalCall` is the " &
+              "native breadcrumb from the same body."
+            else:
+              "Walk so far: visited=" & $gNeVisited & " fakeNullsSkipped=" &
+              $gNeFakeNull & " head=" & $gNeHead & "/" & $gNeQueue.len &
+              " lastInternalCall=\"" & neCrumb() &
+              "\"; the walk RESUMES at the next node, it does not restart.")
       if gNeDiscFaults >= int(cNeMaxDiscFaults()):
         neRefuse(NeRDiscFaulted)
     else:
