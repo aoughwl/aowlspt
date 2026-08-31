@@ -72,6 +72,12 @@ import aowlgraphics
 import invoke
 
 {.emit: """#include "aowlspt_shim.h" """.}
+## THE READABILITY CACHE, in front of the shim's VirtualQuery syscall, for the
+## per-frame GAME-DATA read paths ONLY. It must come straight after the shim,
+## because it replicates the shim's predicate and audits itself against it.
+## Detour binding, prologue verification and `aowl_is_code_pointer` deliberately
+## keep calling the UNCACHED shim -- see the scope note in the header.
+{.emit: """#include "aowlspt_rdcache.h" """.}
 ## The revision-3 live-object entry points. A separate header, and only this
 ## host includes it: `handle_pointer` and `handle_pin` mean nothing without a
 ## managed heap, and naming them in the shared shim would make every nimony
@@ -970,6 +976,20 @@ proc cReadPtrAt(p: Il2CppPtr; off: int32): Il2CppPtr {.
   importc: "aowl_read_ptr", nodecl.}
 proc cIsReadable(p: Il2CppPtr; size: int32): int32 {.
   importc: "aowl_is_readable", nodecl.}
+# THE CACHED FORM. Same contract, same predicate, one VirtualQuery per 64KB
+# chunk per TTL instead of one per call. Use it ONLY for reading game data in a
+# per-frame path; anything that binds a detour, verifies a prologue or decides
+# to write keeps `cIsReadable` above. See abi/aowlspt_rdcache.h.
+proc cIsReadableC(p: Il2CppPtr; size: int32): int32 {.
+  importc: "aowl_rdc_readable", nodecl.}
+proc cRdcHits(): int64 {.importc: "aowl_rdc_hits", nodecl.}
+proc cRdcMisses(): int64 {.importc: "aowl_rdc_misses", nodecl.}
+proc cRdcUncacheable(): int64 {.importc: "aowl_rdc_uncacheable", nodecl.}
+proc cRdcEvictLive(): int64 {.importc: "aowl_rdc_evict_live", nodecl.}
+proc cRdcExpired(): int64 {.importc: "aowl_rdc_expired", nodecl.}
+proc cRdcAudits(): int64 {.importc: "aowl_rdc_audits", nodecl.}
+proc cRdcDisagree(): int64 {.importc: "aowl_rdc_disagree", nodecl.}
+proc cRdcFlush() {.importc: "aowl_rdc_flush", nodecl.}
 # THE ORIGINAL-PROLOGUE SNAPSHOT (`aowlspt_prologue.h`). `cProPrimeAll` is
 # called once from `hostReady`, before the first detour is installed; the rest
 # are diagnostics so the boot log can state the snapshot's health. `aowl_pro_

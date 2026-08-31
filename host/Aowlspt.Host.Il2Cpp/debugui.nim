@@ -732,7 +732,7 @@ proc duOk(p: Il2CppPtr; size: int32): bool =
   ## One gate for every pointer hop, identical in spirit to botdiag's `bdOk`:
   ## non-null, in a plausible user-space range, and page-readable for `size`
   ## bytes by VirtualQuery -- never a faulting deref to find out.
-  result = p != nil and bdSanePtr(p) and cIsReadable(p, size) != 0'i32
+  result = p != nil and bdSanePtr(p) and cIsReadableC(p, size) != 0'i32
 
 # ---------------------------------------------------------------------------
 # Read-back helpers
@@ -791,7 +791,7 @@ proc duNameOf(obj: Il2CppPtr): string =
   if fn == nil or not duOk(obj, 0x20'i32):
     return
   let s = cMi2CallPP(fn, obj)
-  if s == nil or cIsReadable(s, 0x14'i32) == 0'i32:
+  if s == nil or cIsReadableC(s, 0x14'i32) == 0'i32:
     return
   result = bdReadString(s)
 
@@ -812,7 +812,7 @@ proc duReadVec3(p: Il2CppPtr; off: int32; ok: var bool;
   z = 0.0
   if p == nil or not bdSanePtr(p):
     return
-  if cIsReadable(duPtrAdd(p, off), 12'i32) == 0'i32:
+  if cIsReadableC(duPtrAdd(p, off), 12'i32) == 0'i32:
     return
   x = cReadF32At(duPtrAdd(p, off))
   y = cReadF32At(duPtrAdd(p, off + 4'i32))
@@ -841,7 +841,7 @@ proc duPlayerRot(player: Il2CppPtr; ok: var bool; yaw, pitch: var float64) =
   let mc = cReadPtrAt(player, cBdOffPlMoveCtx())
   if mc == nil or not bdSanePtr(mc):
     return
-  if cIsReadable(duPtrAdd(mc, cDuOffMcRotation()), 8'i32) == 0'i32:
+  if cIsReadableC(duPtrAdd(mc, cDuOffMcRotation()), 8'i32) == 0'i32:
     return
   yaw = cReadF32At(duPtrAdd(mc, cDuOffMcRotation()))
   pitch = cReadF32At(duPtrAdd(mc, cDuOffMcRotation() + 4'i32))
@@ -918,7 +918,7 @@ proc duScanWorld() =
   var bots: seq[DuBot] = @[]
   for i in 0 ..< int(n):
     let slot = duPtrAdd(arr, cBdOffArrElems() + int32(i) * 8'i32)
-    if cIsReadable(slot, 8'i32) == 0'i32:
+    if cIsReadableC(slot, 8'i32) == 0'i32:
       continue
     let pl = cReadPtrAt(slot, 0'i32)
     if pl == nil or not bdSanePtr(pl):

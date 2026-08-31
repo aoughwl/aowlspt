@@ -503,7 +503,7 @@ proc cNeOnScreenB(x, y, w, h, sw, sh: float32): bool =
   cNeOnScreen(x, y, w, h, sw, sh) != 0'i32
 
 proc neOk(p: Il2CppPtr; n: int32): bool =
-  p != nil and cIsReadable(p, n) != 0'i32
+  p != nil and cIsReadableC(p, n) != 0'i32
 
 # ---------------------------------------------------------------------------
 # LIVENESS, NOT READABILITY
@@ -1161,7 +1161,25 @@ proc neDiscoverStep() =
   var spent = 0
   while gNeHead < gNeQueue.len:
     if gNeBudget <= 0: break
-    if (spent and 31) == 0 and cNowMs() - started > uint64(cNeSliceMs()):
+    # THE SLICE CHECK, ON EVERY NODE. It used to read the clock only when
+    # `(spent and 31) == 0`, i.e. once per 32 nodes -- and a node is not a cheap
+    # thing: it is two `Component::GetComponent(String)` calls plus up to
+    # AOWL_NE_MAX_CHILDREN (512) `iChildAt` calls in the push loop below. So up
+    # to 32 * 514 ~= 16,400 il2cpp calls could run between two consecutive
+    # readings of the clock, and the 6ms slice could not observe any of it.
+    #
+    # MEASURED, deployed build, natesp's own phase meter (aowlspt-host.log):
+    #     discover: mean=43764.0us max=675002.3us n=87   (NOT budgeted)
+    # against a declared slice of 6000us. A 675ms stall is ~20 frames lost in
+    # one hit and reads to the player as a freeze, not as low fps. The 32-node
+    # stride is the whole reason the declared slice was fiction.
+    #
+    # THIS CHANGES ONLY THE SCHEDULE, NEVER THE VERDICT. The same nodes are
+    # visited in the same order against the same node budget and the same depth
+    # cap; the walk still finishes and still reports EXHAUSTIVE vs TRUNCATED on
+    # exactly the same evidence. It spreads across more frames instead of
+    # blocking one. Nothing in the discovery ledger is weakened or skipped.
+    if cNowMs() - started > uint64(cNeSliceMs()):
       return                      # more next frame; state unchanged
     let cur = gNeQueue[gNeHead]
     let depth = int(gNeDepth[gNeHead])
@@ -1210,6 +1228,25 @@ proc neDiscoverStep() =
       else:
         var k = 0
         while k < n and k < int(cNeMaxChildren()):
+          # THE SLICE CHECK REACHES IN HERE TOO. This loop makes up to 512
+          # `iChildAt` il2cpp calls for ONE node, and it used to sit entirely
+          # outside the per-frame slice check -- so a single wide node could
+          # overrun the 6ms slice by two orders of magnitude on its own, with
+          # the clock never consulted once. Checked every 32 children: often
+          # enough to bound the overrun at ~32 calls, rare enough that the clock
+          # read is not itself the cost.
+          #
+          # `gNeHead` has ALREADY been advanced past `cur`, so returning here
+          # does NOT revisit this node next frame. The children pushed so far
+          # stay queued and the rest are lost -- so they are COUNTED in
+          # `gNeTruncated`, exactly like the queue-cap path just below. A
+          # truncation that went uncounted would let the ledger report
+          # EXHAUSTIVE over a walk that silently skipped a subtree, and the
+          # entire point of that ledger is that "no canvas" and "I could not
+          # look" stay distinguishable.
+          if (k and 31) == 31 and cNowMs() - started > uint64(cNeSliceMs()):
+            gNeTruncated = gNeTruncated + (n - k)
+            return
           # The node budget bounds POPS, not pushes. Without this the queue
           # grows without bound in a raid -- millions of pointers of native
           # memory for nodes that can never be reached before the budget runs
@@ -1724,7 +1761,7 @@ proc neScan() =
     if gNeCn >= NeMaxContacts: break
     let slot = duPtrAdd(arr, cBdOffArrElems() + i * 8'i32)
     inc i
-    if cIsReadable(slot, 8'i32) == 0'i32: continue
+    if cIsReadableC(slot, 8'i32) == 0'i32: continue
     let pl = cReadPtrAt(slot, 0'i32)
     if pl == nil or not bdSanePtr(pl): continue
     if bdIsYou(pl):
@@ -2180,6 +2217,39 @@ proc neCostLine(): string =
   result = result & ". nuFn: " & $cNuCacheHits() & " cached / " &
            $cNuCacheVerifies() & " full verify(s)"
 
+  # THE READABILITY CACHE, stated as measured behaviour rather than as a claim.
+  # `sub[scan]`'s cost was ~600 VirtualQuery SYSCALLS per pass, not 600 units of
+  # work, so this is the number that says whether the remedy engaged at all --
+  # and "0 lookups, NEVER RAN" must stay distinguishable from "every lookup
+  # missed", which a bare hit-rate would hide.
+  let rdcH = cRdcHits()
+  let rdcM = cRdcMisses()
+  let rdcT = rdcH + rdcM
+  if rdcT <= 0'i64:
+    result = result & ". rdcache: 0 lookup(s) -- NEVER RAN, so it has neither " &
+             "helped nor hurt and no saving may be read from this line"
+  else:
+    result = result & ". rdcache: " & $rdcH & " hit / " & $rdcM & " miss (" &
+             $((rdcH * 100'i64) div rdcT) & "% hit over " & $rdcT &
+             " lookup(s)), " & $cRdcUncacheable() & " positive(s) REFUSED as " &
+             "too small a region to be safe to remember, " & $cRdcExpired() &
+             " expired, " & $cRdcEvictLive() & " evicted while still live (a " &
+             "rising number here means the table is too SMALL, which is the " &
+             "failure the 32-slot v1 had)"
+    # The drift audit. It can come out non-zero, which is what makes it a check.
+    if cRdcAudits() <= 0'i64:
+      result = result & ". rdcache pred-audit: NOT SAMPLED yet -- whether the " &
+               "replicated predicate still agrees with aowl_is_readable is " &
+               "UNVERIFIED here, which is not the same as agreeing"
+    elif cRdcDisagree() != 0'i64:
+      result = result & ". rdcache pred-audit: FAIL -- " & $cRdcDisagree() &
+               " of " & $cRdcAudits() & " sampled miss(es) DISAGREED with the " &
+               "real aowl_is_readable. abi/aowlspt_rdcache.h has DRIFTED from " &
+               "abi/aowlspt_shim.h and the cached answers cannot be trusted"
+    else:
+      result = result & ". rdcache pred-audit: agrees/" & $cRdcAudits() &
+               " (1 miss in 256 re-checked against the real aowl_is_readable)"
+
   # Every other phase, named, so nothing is silently folded into the budgeted
   # one and a fat discovery walk is visible as a discovery walk.
   var ph = 0'i32
@@ -2378,6 +2448,13 @@ proc neTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ne_tick_body", cdecl.}
       # the raid canvas went away (scene change): drop the pool and rediscover
       neDestroyPool()
       neDestroyOwnCanvas("the canvas stopped being alive/active in NeRun")
+      # A SCENE TEARDOWN CAN UNMAP MEMORY UNDER US, and this is the edge that
+      # detects one. The readability cache's positives are already short-lived
+      # (250ms) and are only kept for regions >=64KB, but a TTL bounds how long
+      # a stale positive can survive; it is not a reason to keep one we already
+      # have cause to suspect. The flush is O(1) -- it bumps an epoch, it does
+      # not walk the table -- so there is no cost argument against taking it.
+      cRdcFlush()
       gNeCanvasGo = nil
       gNeCanvasTr = nil
       gNeCanvasOrigin = NeOriginNone

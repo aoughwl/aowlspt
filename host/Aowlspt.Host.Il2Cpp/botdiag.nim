@@ -72,7 +72,7 @@ proc bdOk(p: Il2CppPtr; size: int32): bool =
   ## Even so, a valid-looking pointer to an invalid NEXT pointer can still fault
   ## on the following hop's deref -- that residual risk is why the entire botdiag
   ## body runs under the VEH/SEH guard (`aowl_botdiag_body_guarded`).
-  result = p != nil and bdSanePtr(p) and cIsReadable(p, size) != 0'i32
+  result = p != nil and bdSanePtr(p) and cIsReadableC(p, size) != 0'i32
 
 proc bdReadString(p: Il2CppPtr): string =
   ## Decode a `System.String` at `p` by its FIXED IL2CPP layout (length int32 at
@@ -85,7 +85,7 @@ proc bdReadString(p: Il2CppPtr): string =
   if n <= 0'i32 or n > int32(cBdMaxNick):
     return
   let chars = bdPtrAdd(p, 0x14'i32)
-  if cIsReadable(chars, n * 2'i32) == 0'i32:
+  if cIsReadableC(chars, n * 2'i32) == 0'i32:
     return
   for i in 0 ..< int(n):
     let c = cWordAt(chars, uint64(i))
@@ -130,11 +130,11 @@ proc bdReadSideRole(player: Il2CppPtr; side, role: var int32) =
   let info = cReadPtrAt(profile, cBdOffProfInfo())
   if not bdOk(info, cBdOffInfoSettings() + 8'i32):
     return
-  if cIsReadable(bdPtrAdd(info, cBdOffInfoSide()), 4'i32) != 0'i32:
+  if cIsReadableC(bdPtrAdd(info, cBdOffInfoSide()), 4'i32) != 0'i32:
     side = cReadI32At(bdPtrAdd(info, cBdOffInfoSide()))
   let settings = cReadPtrAt(info, cBdOffInfoSettings())
   if settings != nil and bdSanePtr(settings) and
-     cIsReadable(bdPtrAdd(settings, cBdOffSetRole()), 4'i32) != 0'i32:
+     cIsReadableC(bdPtrAdd(settings, cBdOffSetRole()), 4'i32) != 0'i32:
     role = cReadI32At(bdPtrAdd(settings, cBdOffSetRole()))
 
 proc bdReadPos(player: Il2CppPtr; ok: var bool): string =
@@ -146,7 +146,7 @@ proc bdReadPos(player: Il2CppPtr; ok: var bool): string =
     return
   let mc = cReadPtrAt(player, cBdOffPlMoveCtx())
   if not bdSanePtr(mc) or mc == nil or
-     cIsReadable(bdPtrAdd(mc, cBdOffMcPrevPos()), 12'i32) == 0'i32:
+     cIsReadableC(bdPtrAdd(mc, cBdOffMcPrevPos()), 12'i32) == 0'i32:
     return
   let x = cReadF32At(bdPtrAdd(mc, cBdOffMcPrevPos()))
   let y = cReadF32At(bdPtrAdd(mc, cBdOffMcPrevPos() + 4'i32))
@@ -159,7 +159,7 @@ proc bdReadPos(player: Il2CppPtr; ok: var bool): string =
 proc bdIsYou(player: Il2CppPtr): bool =
   ## player.IsYourPlayer (+0xB89 bool). False if unreadable.
   if not bdSanePtr(player) or player == nil or
-     cIsReadable(bdPtrAdd(player, cBdOffPlIsYou()), 1'i32) == 0'i32:
+     cIsReadableC(bdPtrAdd(player, cBdOffPlIsYou()), 1'i32) == 0'i32:
     return false
   result = (cReadI32At(bdPtrAdd(player, cBdOffPlIsYou())) and 0xFF'i32) != 0'i32
 
@@ -185,7 +185,7 @@ proc bdCollectAlive(gw: Il2CppPtr): seq[uint64] =
   let n = (if size > int32(cBdMaxPlayers): int32(cBdMaxPlayers) else: size)
   for i in 0 ..< int(n):
     let slot = bdPtrAdd(arr, cBdOffArrElems() + int32(i) * 8'i32)
-    if cIsReadable(slot, 8'i32) == 0'i32:
+    if cIsReadableC(slot, 8'i32) == 0'i32:
       continue
     let pl = cReadPtrAt(slot, 0'i32)
     if pl != nil and bdSanePtr(pl):
@@ -237,7 +237,7 @@ proc bdEnumerate(gw: Il2CppPtr; reason: string) =
   var lines: seq[string] = @[]
   for i in 0 ..< int(n):
     let slot = bdPtrAdd(arr, cBdOffArrElems() + int32(i) * 8'i32)
-    if cIsReadable(slot, 8'i32) == 0'i32:
+    if cIsReadableC(slot, 8'i32) == 0'i32:
       continue
     let pl = cReadPtrAt(slot, 0'i32)
     if pl == nil or not bdSanePtr(pl):
