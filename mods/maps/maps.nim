@@ -1725,6 +1725,13 @@ proc onDiagTick(payload: string): string =
   # number, so "I could not look yet" cannot read as a pass.
   if mpEnabled() != 0'i32:
     info ModName & ": " & mapsProfLine()
+    # THE TWO CACHES, on the same timer as the profile they exist to move.
+    # `ecVerdict` is the falsifiable negative -- "no per-entity constant is
+    # recomputed on a tick where the entity list did not change" -- and it can
+    # say FAIL and INCONCLUSIVE, not only PASS.
+    info ModName & ": " & rdCacheText()
+    info ModName & ": " & ecText()
+    info ModName & ": " & ecVerdict()
   result = ""
 
 proc armFeed(): bool =

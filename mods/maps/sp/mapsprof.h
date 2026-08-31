@@ -51,14 +51,26 @@
 #define MP_C_LIST    9
 #define MP_C_ENTS   10
 
-#define MP_E_POS    11   /* L3 -- inside MP_C_ENTS, summed over entities */
-#define MP_E_AI     12
-#define MP_E_CLS    13
-#define MP_E_ID     14
-#define MP_E_STORE  15
+/* L3 -- inside MP_C_ENTS, summed over entities.
+ *
+ * MP_E_FETCH was added to chase the 9.6% (425.9us/tick) that the first live run
+ * reported as UNEXPLAINED at this level -- larger, on its own, than several
+ * whole riders. The only work inside MP_C_ENTS that no bracket covered was the
+ * per-slot `rdPtr(items, ArrDataOff + i*8)` array read (one guarded
+ * VirtualQuery per list slot, n per tick, INCLUDING the slots that are then
+ * skipped as nil or as the local player) plus the loop's own arithmetic. That
+ * read is now bracketed, so the next run ATTRIBUTES it instead of leaving it in
+ * the residual. This is an instrument change, not a claim: nothing here asserts
+ * that is where the 9.6% went. */
+#define MP_E_FETCH  11
+#define MP_E_POS    12
+#define MP_E_AI     13
+#define MP_E_CLS    14
+#define MP_E_ID     15
+#define MP_E_STORE  16
 
-#define MP_CTRL     16   /* the positive control */
-#define MP_SLOTS    17
+#define MP_CTRL     17   /* the positive control */
+#define MP_SLOTS    18
 
 #define MP_CTRL_ITERS 512
 #define MP_CAL_ITERS  256

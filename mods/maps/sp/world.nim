@@ -1,4 +1,4 @@
-## The entity feed -- the ONE place this mod touches game memory.
+﻿## The entity feed -- the ONE place this mod touches game memory.
 ##
 ## Three features (map, radar, indicators) all want the same thing: where the
 ## player is, where everything else is, and which way the player is facing. So
@@ -142,6 +142,7 @@ proc wGetProcAddress(module: Il2CppPtr; name: cstring): Il2CppPtr {.
 #include <string.h>
 #include "aowlspt_shim.h"
 #include "sp/mapmath.h"
+#include "sp/rdcache.h"    /* sp_rdc_readable -- aowl_is_readable, memoised BY REGION */
 #include "sp/mapsprof.h"   /* prototypes only; sp/mapsprof.nim owns the state */
 
 static void*   sp_p_v  (void* f) { return ((void*  (*)(void))f)(); }
@@ -150,14 +151,14 @@ static int32_t sp_i32_v(void* f) { return ((int32_t(*)(void))f)(); }
 static void* sp_rd_ptr(void* o, int32_t off) {
   unsigned char* a = (unsigned char*)o + off;
   void* v = 0;
-  if (!aowl_is_readable(a, (int32_t)sizeof(void*))) return 0;
+  if (!sp_rdc_readable(a, (int32_t)sizeof(void*))) return 0;
   memcpy(&v, a, sizeof(void*));
   return v;
 }
 static int32_t sp_rd_i32(void* o, int32_t off) {
   unsigned char* a = (unsigned char*)o + off;
   int32_t v = 0;
-  if (!aowl_is_readable(a, 4)) return 0;
+  if (!sp_rdc_readable(a, 4)) return 0;
   memcpy(&v, a, 4);
   return v;
 }
@@ -176,14 +177,14 @@ static int32_t sp_rd_i32(void* o, int32_t off) {
  * quietly cannot fail. */
 static int32_t sp_rd_i32_ok(void* o, int32_t off, int32_t* out) {
   unsigned char* a = (unsigned char*)o + off;
-  if (!aowl_is_readable(a, 4)) return 0;
+  if (!sp_rdc_readable(a, 4)) return 0;
   memcpy(out, a, 4);
   return 1;
 }
 static float sp_rd_f32(void* o, int32_t off) {
   unsigned char* a = (unsigned char*)o + off;
   float v = 0.0f;
-  if (!aowl_is_readable(a, 4)) return 0.0f;
+  if (!sp_rdc_readable(a, 4)) return 0.0f;
   memcpy(&v, a, 4);
   return v;
 }
@@ -201,7 +202,7 @@ static float sp_rd_f32(void* o, int32_t off) {
 static int32_t sp_rd_vec3(void* o, int32_t off, float* out3) {
   unsigned char* a = (unsigned char*)o + off;
   out3[0] = 0.0f; out3[1] = 0.0f; out3[2] = 0.0f;
-  if (!aowl_is_readable(a, 12)) return 0;
+  if (!sp_rdc_readable(a, 12)) return 0;
   memcpy(out3, a, 12);
   return 1;
 }
@@ -302,7 +303,7 @@ static int32_t sp_getpos_arm(void* base) {
   if (sp_getpos_state != 0) return sp_getpos_state;
   if (!base) { sp_getpos_state = -1; return -1; }
   fn = (unsigned char*)base + SP_GETPOS_RVA;
-  if (!aowl_is_readable(fn, 16))                        { sp_getpos_state = -1; return -1; }
+  if (!sp_rdc_readable(fn, 16))                        { sp_getpos_state = -1; return -1; }
   if (memcmp(fn, sp_getpos_prologue, 16) != 0)          { sp_getpos_state = -1; return -1; }
   sp_getpos_fn = (void*)fn;
   sp_getpos_state = 1;
@@ -313,7 +314,7 @@ static int32_t sp_getpos_armed(void) { return sp_getpos_state; }
 static int32_t sp_rd_u8(void* o, int32_t off, unsigned char* out) {
   unsigned char* a = (unsigned char*)o + off;
   *out = 0;
-  if (!aowl_is_readable(a, 1)) return 0;
+  if (!sp_rdc_readable(a, 1)) return 0;
   *out = *a;
   return 1;
 }
@@ -417,11 +418,11 @@ static int32_t sp_rd_chars(void* s, int32_t chOff, int32_t first, int32_t take,
                            char* out) {
   int32_t i;
   unsigned char* base = (unsigned char*)s + chOff + first * 2;
-  int32_t span = aowl_is_readable(base, take * 2);
+  int32_t span = sp_rdc_readable(base, take * 2);
   for (i = 0; i < take; i++) {
     unsigned short c = 0;
     unsigned char* a = base + i * 2;
-    if (!span && !aowl_is_readable(a, 2)) { out[i] = 0; return i; }
+    if (!span && !sp_rdc_readable(a, 2)) { out[i] = 0; return i; }
     memcpy(&c, a, 2);
     out[i] = (c >= 32 && c < 127) ? (char)c : '?';
   }
@@ -433,7 +434,7 @@ static int32_t sp_rd_idtail(void* s, int32_t lenOff, int32_t chOff, char* out) {
   int32_t n, take;
   out[0] = 0;
   if (!s) return 0;
-  if (!aowl_is_readable((unsigned char*)s + lenOff, 4)) return 0;
+  if (!sp_rdc_readable((unsigned char*)s + lenOff, 4)) return 0;
   memcpy(&n, (unsigned char*)s + lenOff, 4);
   if (n <= 0 || n > 4096) return 0;
   take = n > 8 ? 8 : n;
@@ -453,7 +454,7 @@ static int32_t sp_rd_str(void* s, int32_t lenOff, int32_t chOff,
   if (!out || cap <= 0) return 0;
   out[0] = 0;
   if (!s) return 0;
-  if (!aowl_is_readable((unsigned char*)s + lenOff, 4)) return 0;
+  if (!sp_rdc_readable((unsigned char*)s + lenOff, 4)) return 0;
   memcpy(&n, (unsigned char*)s + lenOff, 4);
   if (n <= 0 || n > 4096) return 0;
   take = n > (cap - 1) ? (cap - 1) : n;
@@ -496,6 +497,29 @@ proc cPosLive(player: pointer; out3: ptr cfloat): int32 {.
   importc: "sp_pos_live", nodecl.}
 proc cLookDir(player: pointer; mcOff: int32; yaw: ptr cfloat): int32 {.
   importc: "sp_look_dir", nodecl.}
+
+# THE REGION-READABILITY CACHE (sp/rdcache.h). `sp_rdc_readable` replaced
+# `aowl_is_readable` at all 12 read sites above; the PREDICATE is unchanged and
+# every miss still bottoms out in the real `aowl_is_readable`. Flushed
+# explicitly on fault and on player-list identity change -- see `collectInner`.
+proc cRdcFlush() {.importc: "sp_rdc_flush", nodecl.}
+proc cRdcHits(): int64 {.importc: "sp_rdc_hits", nodecl.}
+proc cRdcMisses(): int64 {.importc: "sp_rdc_misses", nodecl.}
+proc cRdcFlushes(): int64 {.importc: "sp_rdc_flushes", nodecl.}
+proc cRdcUncacheable(): int64 {.importc: "sp_rdc_uncacheable", nodecl.}
+
+proc rdCacheText*(): string =
+  ## The cache's OWN behaviour, as measured counters, never as an assumption.
+  ## "0 lookups, NEVER RAN" is a different fact from "every lookup missed", so
+  ## the two are printed differently.
+  let h = cRdcHits()
+  let m = cRdcMisses()
+  if h + m == 0'i64:
+    return "rdcache: 0 lookup(s) -- NEVER RAN (this is NOT 'free' and NOT measured)"
+  "rdcache: hits=" & $h & " misses=" & $m & " (" &
+    $((h * 100'i64) div (h + m)) & "% hit) syscalls-avoided=" & $h &
+    " small-region-positives-not-cached=" & $cRdcUncacheable() &
+    " flushes=" & $cRdcFlushes()
 
 const
   # Mirrors MM_HDG_* in sp/mapmath.h.
@@ -1233,6 +1257,232 @@ proc classOf(p: pointer; isMe: bool; side, role: var int32): int =
   inc gClsDecline.badSide
   ClsUnknown
 
+# --------------------------------------------------------------------------
+# THE PER-ENTITY CONSTANT CACHE -- lever 2.
+#
+# `classOf` (26.3% of c.entityLoop) and `idTailOf` (16.8%) -- together 43% --
+# are properties of the ENTITY, not of the frame. A player's side, role and
+# profile-id tail do not change while it is in the alive list; only its position
+# does. They were nonetheless being re-walked, four guarded hops and an 8-char
+# UTF-16 string read each, for every entity on every tick.
+#
+# THE HAZARD, WHICH IS THE WHOLE DESIGN PROBLEM. A cache keyed on a raw pointer
+# is wrong the moment the allocator hands that address to a different object,
+# and the three things this codebase can check do NOT cover it:
+#   * readability is not liveness -- Unity FAKE NULL leaves a destroyed object
+#     fully readable with m_CachedPtr zeroed;
+#   * liveness is not identity -- the address may hold a live object of a
+#     DIFFERENT type, which passes both guards (TYPE CONFUSION);
+#   * so a hit on the pointer alone would happily return another entity's class,
+#     which is strictly worse than paying the cost.
+#
+# WHAT IS DONE INSTEAD. Every entry carries a TAG: the Player's Profile pointer
+# at +0x9C0. A hit requires BOTH the pointer AND the tag to match, and the tag
+# is re-read, guarded, on EVERY lookup -- one hop, against the four-plus-string
+# it replaces. A reused address belonging to a different Player has a different
+# Profile; an address reused by a non-Player type holds something else at
+# +0x9C0 that would have to coincide exactly with the previous Profile pointer;
+# an unreadable or nil tag is refused outright and forces the full recompute.
+# This is not a proof of identity. It is a check that CAN fail, and it fails
+# closed -- which is the property the pointer alone does not have.
+#
+# The store is a flat, linearly-scanned array, NOT a hash: 160 uint64 compares
+# per entity are free next to one syscall, and an exact table means a miss on an
+# unchanged tick is always a real event and never a hash collision. That is what
+# makes the assertion below falsifiable.
+#
+# INVALIDATION. `gEcGen` bumps whenever the player-list identity (items pointer
+# or size) changes, which flushes both this cache and the region cache. A
+# recompute on a tick where the list did NOT change is the thing being asserted
+# against, so it is counted under its own name.
+# --------------------------------------------------------------------------
+
+const EntCacheSlots = 160   ## >= MaxEntities (128); eviction is then a fault, not routine
+
+type
+  EntConst = object
+    key: uint64      ## the entity pointer
+    tag: uint64      ## Player+0x9C0 Profile pointer -- the reuse detector
+    cls: int
+    side: int32
+    role: int32
+    id: string
+    used: bool
+
+  EcStats* = object
+    ## DISJOINT and EXHAUSTIVE over every lookup: hits + the five miss reasons
+    ## equal `lookups`. A residual would mean this decomposition is broken, and
+    ## `ecText` says so out loud rather than implying the parts sum.
+    lookups*: int64
+    hits*: int64
+    missGen*: int64        ## list identity changed this collect -- EXPECTED
+    missNoTag*: int64      ## Profile nil/unreadable -- cannot key safely
+    missCold*: int64       ## no entry, list UNCHANGED -- the asserted-against case
+    missTagDiff*: int64    ## key matched, TAG DID NOT -- pointer reuse CAUGHT
+    evicted*: int64
+    unchangedCollects*: int64
+
+var gEntCache: array[EntCacheSlots, EntConst]
+var gEc* = EcStats(lookups: 0, hits: 0, missGen: 0, missNoTag: 0, missCold: 0,
+                   missTagDiff: 0, evicted: 0, unchangedCollects: 0)
+var gEcListItems: uint64 = 0
+var gEcListN: int32 = -1
+var gEcGenChanged = true      ## did the list identity change THIS collect?
+var gEcNext = 0
+
+proc entCacheFlush() =
+  var i = 0
+  while i < EntCacheSlots:
+    gEntCache[i].used = false
+    gEntCache[i].key = 0'u64
+    gEntCache[i].tag = 0'u64
+    inc i
+  gEcNext = 0
+
+proc entCacheNoteList(items: pointer; n: int32) =
+  ## Called once per collect, BEFORE the entity loop. Both caches are dropped on
+  ## any change to the list's identity, because a torn-down world must never be
+  ## answered for out of a cache.
+  let it = cast[uint64](items)
+  if it != gEcListItems or n != gEcListN:
+    gEcListItems = it
+    gEcListN = n
+    gEcGenChanged = true
+    entCacheFlush()
+    cRdcFlush()
+  else:
+    gEcGenChanged = false
+    gEc.unchangedCollects = gEc.unchangedCollects + 1'i64
+
+proc entCacheOnFault*() =
+  ## Explicit invalidation on fault (CLAUDE.md 5: never let a cache outlive the
+  ## thing it describes). Both caches, together.
+  entCacheFlush()
+  cRdcFlush()
+  gEcListItems = 0'u64
+  gEcListN = -1'i32
+
+proc ecText*(): string =
+  if gEc.lookups == 0'i64:
+    return "entcache: 0 lookup(s) -- NEVER RAN (this is NOT 'free' and NOT measured)"
+  let acc = gEc.hits + gEc.missGen + gEc.missNoTag + gEc.missCold +
+            gEc.missTagDiff
+  var s = "entcache: lookups=" & $gEc.lookups & " hits=" & $gEc.hits &
+    " (" & $((gEc.hits * 100'i64) div gEc.lookups) & "%)" &
+    " miss.listChanged=" & $gEc.missGen &
+    " miss.noTag=" & $gEc.missNoTag &
+    " miss.cold(incl. evicted)=" & $gEc.missCold &
+    " miss.TAGDIFF(pointer reuse caught)=" & $gEc.missTagDiff &
+    " evictions=" & $gEc.evicted &
+    " unchanged-list collects=" & $gEc.unchangedCollects
+  if acc != gEc.lookups:
+    s = s & ". THE PARTS DO NOT SUM TO `lookups` (" & $acc & " vs " &
+        $gEc.lookups & ") -- treat this line as BROKEN, not as a result"
+  s
+
+proc ecVerdict*(): string =
+  ## THE FALSIFIABLE NEGATIVE, asserted on the FINISHED STATE and not on our own
+  ## write: "no per-entity constant is recomputed on a tick where the entity
+  ## list did not change." The input that makes it FAIL is a cold or evicted
+  ## miss on an unchanged-list collect, and both are counted independently of
+  ## the code that fills the cache. THREE OUTCOMES, never two.
+  if gEc.lookups == 0'i64:
+    return "entcache verdict: INCONCLUSIVE -- 0 lookups, the loop never ran. " &
+           "This is NOT a pass; it means I could not look."
+  if gEc.unchangedCollects == 0'i64:
+    return "entcache verdict: INCONCLUSIVE -- every collect saw a CHANGED " &
+           "player list, so the assertion 'nothing is recomputed on an " &
+           "unchanged tick' was never exercised. NOT a pass."
+  let bad = gEc.missCold
+  if bad == 0'i64:
+    return "entcache verdict: PASS -- over " & $gEc.unchangedCollects &
+      " unchanged-list collect(s), 0 per-entity constant was recomputed for a " &
+      "reason other than the list changing or the identity tag refusing. " &
+      "(noTag=" & $gEc.missNoTag & " and TAGDIFF=" & $gEc.missTagDiff &
+      " are the guard REFUSING, which is the intended fail-closed path, not a " &
+      "cache miss to be optimised away.)"
+  "entcache verdict: FAIL -- " & $bad & " constant(s) were recomputed on an " &
+    "unchanged-list collect (cold-or-evicted=" & $gEc.missCold &
+    "). The cache is not holding what it claims to hold."
+
+var gEcTag: uint64 = 0      ## the tag the last probe established, for the store
+
+proc entCacheProbe(p: pointer; cls: var int; side, role: var int32;
+                   id: var string): bool =
+  ## ONE guarded hop -- the Profile pointer -- decides hit or miss, and it is
+  ## re-read EVERY tick. Returns true only when the pointer AND the tag both
+  ## match a live entry, in which case `cls`/`side`/`role`/`id` are filled from
+  ## it. `entCacheStore` must be called after any false result.
+  ##
+  ## Kept separate from the store so the profiler can bracket the recompute
+  ## (`classOf`, `idTailOf`) exactly where it always did, instead of hiding both
+  ## inside one opaque call and losing the per-row attribution.
+  gEc.lookups = gEc.lookups + 1'i64
+  let key = cast[uint64](p)
+  let tag = cast[uint64](rdPtr(p, PlProfile))
+  gEcTag = tag
+
+  var slot = -1
+  var i = 0
+  while i < EntCacheSlots:
+    if gEntCache[i].used and gEntCache[i].key == key:
+      slot = i
+      break
+    inc i
+
+  if tag == 0'u64:
+    # Profile nil or unreadable: the identity tag cannot be established, so the
+    # cache MUST NOT answer. Fail closed and pay the full price. Any entry for
+    # this address is dropped -- we can no longer vouch for it.
+    gEc.missNoTag = gEc.missNoTag + 1'i64
+    if slot >= 0: gEntCache[slot].used = false
+    return false
+
+  if slot >= 0:
+    if gEntCache[slot].tag == tag:
+      gEc.hits = gEc.hits + 1'i64
+      cls = gEntCache[slot].cls
+      side = gEntCache[slot].side
+      role = gEntCache[slot].role
+      id = gEntCache[slot].id
+      return true
+    # The address is being reused by a different object, or this Player's
+    # Profile was swapped. Either way the stored constants describe something
+    # that is no longer here. Recompute; never return the stale answer.
+    gEc.missTagDiff = gEc.missTagDiff + 1'i64
+    gEntCache[slot].used = false
+  elif gEcGenChanged:
+    gEc.missGen = gEc.missGen + 1'i64
+  else:
+    gEc.missCold = gEc.missCold + 1'i64
+  false
+
+proc entCacheStore(p: pointer; cls: int; side, role: int32; id: string) =
+  ## Only ever called with the tag `entCacheProbe` just read, and never when
+  ## that tag was 0 -- an entry with no identity tag is exactly the stale-cache
+  ## hazard this design exists to refuse.
+  if gEcTag == 0'u64: return
+  var slot = -1
+  var j = 0
+  while j < EntCacheSlots:
+    if not gEntCache[j].used:
+      slot = j
+      break
+    inc j
+  if slot < 0:
+    # The table is full. Capacity is 160 against MaxEntities=128, so this is a
+    # fault condition, not routine -- it is counted rather than shrugged off.
+    slot = gEcNext
+    gEcNext = (gEcNext + 1) mod EntCacheSlots
+    gEc.evicted = gEc.evicted + 1'i64
+  gEntCache[slot].key = cast[uint64](p)
+  gEntCache[slot].tag = gEcTag
+  gEntCache[slot].cls = cls
+  gEntCache[slot].side = side
+  gEntCache[slot].role = role
+  gEntCache[slot].id = id
+  gEntCache[slot].used = true
+
 proc clsHistogramText*(h: array[ClsCount, int]): string =
   "contacts by class: local=" & $h[ClsLocal] & " pmc=" & $h[ClsPmc] &
   " scav=" & $h[ClsScav] & " boss=" & $h[ClsBoss] &
@@ -1412,6 +1662,7 @@ proc collectInner(snap: var Snapshot) =
   if list == nil:
     note("GameWorld player list (+0x1C8 / +0x1D0) read null")
     inc gFaults
+    entCacheOnFault()
     mpAdd(MpCList, tList)
     return
 
@@ -1420,8 +1671,13 @@ proc collectInner(snap: var Snapshot) =
   if items == nil or n < 0 or n > MaxListLen:
     note("player list size out of range (" & $n & ")")
     inc gFaults
+    entCacheOnFault()
     mpAdd(MpCList, tList)
     return
+  # BOTH caches are told about the list's identity BEFORE anything is read out
+  # of it. A change to the items pointer or the size drops everything either
+  # cache holds; an unchanged list is what `ecVerdict` then asserts against.
+  entCacheNoteList(items, int32(n))
   mpAdd(MpCList, tList)
 
   # L2 PHASE 5 of 5, and the L3 parent. ONE bracket around the WHOLE loop, so
@@ -1429,7 +1685,12 @@ proc collectInner(snap: var Snapshot) =
   let tEnts = mpNow()
   var i = 0
   while i < n and snap.n < MaxEntities:
+    # L3 PHASE 1 of 6, and the reason the L3 residual was 9.6%: this guarded
+    # array read runs for EVERY list slot, including the ones immediately
+    # skipped below, and was previously outside every bracket.
+    let tFetch = mpNow()
     let p = rdPtr(items, ArrDataOff + i * 8)
+    mpAdd(MpEFetch, tFetch)
     inc i
     if p == nil: continue
     if cast[uint64](p) == localPtr:
@@ -1459,12 +1720,23 @@ proc collectInner(snap: var Snapshot) =
     # or a non-bot classified Unknown (a dead walk -- a bug) and tell them apart.
     var eside = -1'i32
     var erole = -1'i32
+    var ecls = ClsUnknown
+    var eid = ""
+    # The per-entity CONSTANTS. `entCacheProbe` costs one guarded hop; on a hit
+    # nothing below runs. On a miss the original walk runs unchanged, under the
+    # SAME two brackets it always had, so the two rows stay comparable with the
+    # pre-cache measurement instead of being replaced by a new number that
+    # cannot be diffed against it.
     let tCls = mpNow()
-    let ecls = classOf(p, false, eside, erole)
+    let ehit = entCacheProbe(p, ecls, eside, erole, eid)
+    if not ehit:
+      ecls = classOf(p, false, eside, erole)
     mpAdd(MpECls, tCls)
-    let tId = mpNow()
-    let eid = idTailOf(p)
-    mpAdd(MpEId, tId)
+    if not ehit:
+      let tId = mpNow()
+      eid = idTailOf(p)
+      mpAdd(MpEId, tId)
+      entCacheStore(p, ecls, eside, erole, eid)
     let tStore = mpNow()
     snap.ents[snap.n] = Ent(x: px, y: py, z: pz, bot: bot, me: false,
                             cls: ecls, side: eside, role: erole,

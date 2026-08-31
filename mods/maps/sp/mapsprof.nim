@@ -55,14 +55,15 @@ const
   MpCLocal*  = 8'i32
   MpCList*   = 9'i32
   MpCEnts*   = 10'i32
-  MpEPos*    = 11'i32
-  MpEAi*     = 12'i32
-  MpECls*    = 13'i32
-  MpEId*     = 14'i32
-  MpEStore*  = 15'i32
-  MpCtrl*    = 16'i32
+  MpEFetch*  = 11'i32
+  MpEPos*    = 12'i32
+  MpEAi*     = 13'i32
+  MpECls*    = 14'i32
+  MpEId*     = 15'i32
+  MpEStore*  = 16'i32
+  MpCtrl*    = 17'i32
 
-const MpNames: array[17, string] = [
+const MpNames: array[18, string] = [
   "WHOLE(onMainTick)",     # 0
   "lockMod",               # 1
   "collect",               # 2
@@ -74,15 +75,16 @@ const MpNames: array[17, string] = [
   "c.localPlayer",         # 8
   "c.listHead",            # 9
   "c.entityLoop",          # 10
-  "e.posOf(RVA call)",     # 11
-  "e.aiDataRead",          # 12
-  "e.classOf",             # 13
-  "e.idTailOf(string)",    # 14
-  "e.storeEnt",            # 15
-  "CONTROL(512 adds)"]     # 16
+  "e.fetchSlot(list read)",# 11
+  "e.posOf(RVA call)",     # 12
+  "e.aiDataRead",          # 13
+  "e.classOf(+cacheProbe)",# 14
+  "e.idTailOf(cache MISS only)", # 15
+  "e.storeEnt",            # 16
+  "CONTROL(512 adds)"]     # 17
 
 proc mpName(i: int32): string =
-  if i >= 0'i32 and i < 17'i32: return MpNames[int(i)]
+  if i >= 0'i32 and i < 18'i32: return MpNames[int(i)]
   return "slot[" & $int(i) & ": UNNAMED]"
 
 proc mpUsPer(nsTotal, ticks: int64): string =
@@ -172,7 +174,7 @@ proc mapsProfLine*(): string =
       $ticks & " tick(s), max " & mpUs(mpMax(MpWhole)) & "."
   s = s & mpLevel(MpLock, MpArt, MpWhole, "L1 tick phases", ticks)
   s = s & "." & mpLevel(MpCPre, MpCEnts, MpCollect, "L2 collect phases", ticks)
-  s = s & "." & mpLevel(MpEPos, MpEStore, MpCEnts, "L3 per-entity phases", ticks)
+  s = s & "." & mpLevel(MpEFetch, MpEStore, MpCEnts, "L3 per-entity phases", ticks)
 
   # THE INSTRUMENT'S OWN SHARE, measured at enable time, never asserted.
   var calls = 0'i64
