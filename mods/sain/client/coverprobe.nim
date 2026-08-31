@@ -1,5 +1,10 @@
-## The cover sensor: two engine entry points, resolved by name, refused with a
-## reason.
+## The cover sensor: two engine entry points, called at byte-verified static
+## RVAs, refused with a reason.
+##
+## NOTHING IN THIS FILE RESOLVES A NAME AT RUN TIME. If you are reading a
+## version of this header that says otherwise, it is stale -- the by-name
+## bindings were deleted (see the note where they used to live, below) and the
+## whole sensor now goes through `client/drivecalls.nim`.
 ##
 ## This is the only file in the mod that calls **Unity** rather than EFT, and
 ## it is the only file whose calls are illegal from the host's own thread. Both
@@ -21,38 +26,38 @@
 ## a static with value arguments. `README.md` still lists path distance as
 ## blocked, and this file is why.
 ##
-## ## Every name is checked before it is called
+## ## The overload is picked OFFLINE, which is the whole reason this works
 ##
-## `il2cpp_class_get_method_from_name` matches on name and arity and hands back
-## the first overload it finds. `UnityEngine.Physics` has three
-## three-argument `Raycast` overloads and only one of them is the one meant, so
-## a resolution that stopped at "found something with the right arity" would be
-## calling `Raycast(Ray, out RaycastHit, float)` with a `Vector3` in the first
-## slot -- which does not crash. It reads adjacent stack as a ray and answers a
-## plausible bool.
+## `il2cpp_class_get_method_from_name` matched on name and arity and handed
+## back the first overload it found. `UnityEngine.Physics` carries THREE
+## arity-3 `Raycast` overloads on this build --
+##   (Vector3,Vector3,float)      0x5328830   <- the one meant
+##   (Vector3,Vector3,RaycastHit) 0x5328C30
+##   (Ray,float,int)              0x5328DD0
+## -- so a by-arity resolution could call `Raycast(Ray, RaycastHit)` with a
+## `Vector3` in the first slot, which does not crash: it reads adjacent stack
+## as a ray and answers a plausible bool. Worse, on this build that export is
+## token-gated and answers a random non-zero handle anyway, so the signature
+## check that guarded it was a check that could not fail (CLAUDE.md 9b).
 ##
-## So the declared parameter types are read out of the runtime's own metadata
-## and compared, exactly. A mismatch **refuses by name, with the signature the
-## runtime reported**, and the log carries it. That is the same discipline
-## `armAimHook` applies to a detour, applied to a call. What it costs is that a
-## build which spells the overload differently gets no cover sensor rather than
-## a wrong one, and that is the trade this mod makes everywhere else too.
+## The disambiguation is now done OFFLINE, by parameter type, and only the
+## winning RVA is compiled in. `client/drivecalls.nim` declares it with the
+## sixteen prologue bytes `il2cpp_resolve.py ... bytes 0x5328830 16` printed,
+## and `callrva.verify` compares them against the STARTUP PROLOGUE SNAPSHOT
+## before the first call. A stale RVA on a future game build is therefore a
+## loud refusal, not a jump into an unrelated function -- and this build's
+## universal `ret 0` empty-body stub (`C2 00 00`, shared by 6,438 methods)
+## cannot pass, because the declared bytes are not those.
 ##
-## The C API reachable from here cannot *enumerate* overloads -- it matches by
-## arity -- so "the first three-argument `Raycast` is not the one we want" is a
-## refusal rather than a search. Stated because it is a real limit: on a build
-## where the overload order differs, this sensor is off and says so, and
-## nothing here would silently pick the next one.
+## ## What IS read out of a hit, and what is not
 ##
-## ## Nothing is read out of a hit
-##
-## `NavMeshHit` is a value struct and the `out` parameter is a buffer this file
-## hands over. It is sized by asking the runtime how big the struct is, zeroed,
-## and **never read** -- only the method's `bool` return is used. Reading
-## `NavMeshHit.position` would mean a field offset inside a value type, which
-## is the one number nothing here can check, and it is the same refusal
-## `sain.nim` makes about `DamageInfo`. The consequence is small and stated: a
-## candidate is accepted where it was proposed rather than snapped to the
+## The `out NavMeshHit` is a 36-byte arena cell -- the MEASURED `native_size`
+## from `Il2CppMetadataRegistration.typeDefinitionsSizes`, not a header
+## subtracted off boxed field offsets. `drivecalls.navSample` reads the hit
+## position and distance back out of it through guarded reads that report
+## their own failure; this file uses only the `bool` return, so nothing here
+## depends on that layout either way. The consequence is stated and unchanged:
+## a candidate is accepted where it was proposed rather than snapped to the
 ## nearest navmesh point.
 ##
 ## ## The thread
