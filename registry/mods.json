@@ -554,6 +554,44 @@
         "animation",
         "weapons"
       ]
+    },
+    {
+      "id": "aowl.admintrader",
+      "name": "Admin Trader",
+      "author": "aowlspt",
+      "version": "1.0.0",
+      "description": "The canonical 'how to write an aowlspt mod' example, and a working test mod. Adds a brand new trader who stocks every tradeable item in the handbook for nothing, and gives out one complete example quest. It demonstrates the only server-side mechanism there is: the emulator serves traders and quests straight out of the loaded database, so a mod that wants a new one writes JSON at traders.<id> and templates.quests.<id> with dbWrite. Read it alongside its README, which is a tutorial rather than a reference. Ships on no default list -- a free-everything trader is a debugging tool, not a game.",
+      "pipeline": ">=0.1.0",
+      "shipped": false,
+      "sides": [
+        "server",
+        "sim"
+      ],
+      "source": {
+        "kind": "intree",
+        "path": "mods/admintrader",
+        "url": null
+      },
+      "artifact": {
+        "dir": "admintrader",
+        "library": "admintrader.dll"
+      },
+      "upstream": null,
+      "license": "see repository",
+      "download": null,
+      "requires": [],
+      "conflicts": [],
+      "provides": [],
+      "loadAfter": [
+        "aowl.tarkov"
+      ],
+      "tags": [
+        "server",
+        "example",
+        "trader",
+        "quest",
+        "cheat"
+      ]
     }
   ],
   "lists": [

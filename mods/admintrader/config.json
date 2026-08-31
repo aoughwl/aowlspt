@@ -1,0 +1,10 @@
+{
+  "//enabled": "Add the Admin Trader to the game at backend start. Turning this off does not remove a trader already written into a running server's database -- restart the backend.",
+  "enabled": true,
+
+  "//nickname": "What the trader is called on the trading screen. This is the one setting that applies live: change it on the in-game settings page and the trader is renamed on the spot.",
+  "nickname": "Admin Trader",
+
+  "//maxOffers": "How many handbook items he stocks. The handbook holds about 4,300 tradeable items, so the default is effectively 'all of them'. Lower it if you want a shorter list to scroll.",
+  "maxOffers": 4500
+}
