@@ -539,27 +539,51 @@ proc cLookDir(player: pointer; mcOff: int32; yaw: ptr cfloat): int32 {.
   importc: "sp_look_dir", nodecl.}
 
 # THE REGION-READABILITY CACHE (sp/rdcache.h). `sp_rdc_readable` replaced
-# `aowl_is_readable` at all 12 read sites above; the PREDICATE is unchanged and
-# every miss still bottoms out in the real `aowl_is_readable`. Flushed
+# `aowl_is_readable` at all 12 read sites above; the PREDICATE is unchanged --
+# replicated clause-for-clause in `sp_rdc_pred` so a miss costs ONE VirtualQuery
+# rather than two, and audited live against the real `aowl_is_readable` on a
+# sample of misses (`pred-disagree`, which must stay 0). Flushed
 # explicitly on fault and on player-list identity change -- see `collectInner`.
 proc cRdcFlush() {.importc: "sp_rdc_flush", nodecl.}
 proc cRdcHits(): int64 {.importc: "sp_rdc_hits", nodecl.}
 proc cRdcMisses(): int64 {.importc: "sp_rdc_misses", nodecl.}
 proc cRdcFlushes(): int64 {.importc: "sp_rdc_flushes", nodecl.}
 proc cRdcUncacheable(): int64 {.importc: "sp_rdc_uncacheable", nodecl.}
+proc cRdcEvictLive(): int64 {.importc: "sp_rdc_evict_live", nodecl.}
+proc cRdcExpired(): int64 {.importc: "sp_rdc_expired", nodecl.}
+proc cRdcAudits(): int64 {.importc: "sp_rdc_audits", nodecl.}
+proc cRdcDisagree(): int64 {.importc: "sp_rdc_disagree", nodecl.}
 
 proc rdCacheText*(): string =
   ## The cache's OWN behaviour, as measured counters, never as an assumption.
   ## "0 lookups, NEVER RAN" is a different fact from "every lookup missed", so
   ## the two are printed differently.
+  ##
+  ## The three numbers that carry a verdict, and what each one would FALSIFY:
+  ##   evict-live -- misses forced by CAPACITY (the victim was still used and
+  ##     still inside its TTL). If this stays large, the table is still too
+  ##     small and the diagnosis is wrong; it is not evidence that it is right.
+  ##   expired    -- misses caused by the TTL instead. Separates "too small"
+  ##     from "too short", which one combined miss count cannot.
+  ##   pred-disagree -- MUST be 0. Non-zero means sp_rdc_pred has drifted from
+  ##     aowl_is_readable in abi/aowlspt_shim.h and the guarantee is void.
+  ##     "audits=0" is INCONCLUSIVE, not a pass, and says so.
   let h = cRdcHits()
   let m = cRdcMisses()
   if h + m == 0'i64:
     return "rdcache: 0 lookup(s) -- NEVER RAN (this is NOT 'free' and NOT measured)"
+  let a = cRdcAudits()
+  let d = cRdcDisagree()
+  let audit =
+    if a == 0'i64: " pred-audit=INCONCLUSIVE(0 samples)"
+    elif d == 0'i64: " pred-audit=agrees/" & $a
+    else: " pred-audit=DRIFTED disagree=" & $d & "/" & $a
   "rdcache: hits=" & $h & " misses=" & $m & " (" &
     $((h * 100'i64) div (h + m)) & "% hit) syscalls-avoided=" & $h &
     " small-region-positives-not-cached=" & $cRdcUncacheable() &
-    " flushes=" & $cRdcFlushes()
+    " evict-live=" & $cRdcEvictLive() &
+    " expired=" & $cRdcExpired() &
+    " flushes=" & $cRdcFlushes() & audit
 
 const
   # Mirrors MM_HDG_* in sp/mapmath.h.
