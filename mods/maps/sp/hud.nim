@@ -114,7 +114,26 @@ import world  # the Snapshot this file mirrors; no game memory is read here
  * bytes out of it. If that packing ever changes, the colours here go wrong --
  * visibly and harmlessly, never fatally. */
 
-typedef struct { float x, y, z; int32_t bot; uint64_t key; } MHudEnt;
+/* THE CONTACT CLASS, mirrored from sp/world.nim's Cls* -- 0 local, 1 pmc,
+ * 2 scav, 3 boss, 4 unknown. This file reads NO game memory; the class arrives
+ * already derived, exactly as `bot` and `key` do.
+ *
+ * `bot` is KEPT alongside it and keeps its old meaning (AIData present). The
+ * two gates are ANDed at every draw site, so each can independently hide a
+ * contact and neither is a check that cannot fail: turning `showBots` off still
+ * hides bots even with every class enabled, and turning a class off still hides
+ * that class even with both legacy toggles on. */
+#define MHUD_CLS_N       5
+#define MHUD_CLS_LOCAL   0
+#define MHUD_CLS_PMC     1
+#define MHUD_CLS_SCAV    2
+#define MHUD_CLS_BOSS    3
+#define MHUD_CLS_UNKNOWN 4
+static int32_t mhud_cls_clamp(int32_t c) {
+    return (c >= 0 && c < MHUD_CLS_N) ? c : MHUD_CLS_UNKNOWN;
+}
+
+typedef struct { float x, y, z; int32_t bot; int32_t cls; uint64_t key; } MHudEnt;
 
 /* ---- indicator LIFETIME ------------------------------------------------ *
  *
@@ -149,6 +168,11 @@ typedef struct {
     uint64_t key;
     float    x, y, z;
     int32_t  bot;
+    int32_t  cls;       /* MHUD_CLS_*, carried so a GHOST fades in its own
+                         * class's colour and honours its own class toggle.
+                         * Without this a contact that dropped out of the feed
+                         * would change colour at the moment it started fading,
+                         * and a class switched OFF would still leave ghosts. */
     int64_t  lastMs;    /* when this contact was last REFRESHED by the feed */
     int32_t  live;      /* 1 = occupied slot */
     int32_t  seq;       /* the PUBLISH this track was last refreshed by. Equal to
@@ -220,6 +244,28 @@ static struct {
     int32_t  drawArt;          /* 0 = grid + blips only, no textured quad */
     float    contactPx;        /* half-extent of a contact mark, pixels */
     uint32_t colBot, colPlayer, colSelf;
+
+    /* ---- PER-CLASS VISIBILITY AND COLOUR ------------------------------
+     * Indexed by MHUD_CLS_*. `clsShow` is ANDed with the legacy
+     * showBots/showPlayers gate, never substituted for it. `clsCol` REPLACES
+     * colBot/colPlayer at the draw sites -- those two are still mirrored and
+     * still readable by the reconcile, and maps.nim seeds the PMC/scav/boss
+     * entries from them so a config that never mentions a class colour looks
+     * exactly like it did before this feature existed.
+     *
+     * UNKNOWN's default is a deliberately ugly grey, distinct from scav's: if
+     * the Profile walk dies, the map must LOOK wrong rather than quietly draw
+     * a plausible field of scavs. */
+    int32_t  clsShow[MHUD_CLS_N];
+    uint32_t clsCol[MHUD_CLS_N];
+    /* Ledger. `clsSeen` is every contact submitted, by class; `clsFiltered` is
+     * every one a class toggle DROPPED. The negative assertion the feature is
+     * judged on -- "no contact was drawn whose class toggle is OFF" -- is
+     * clsDrawn[c] == 0 for every c with clsShow[c] == 0, and it is falsifiable
+     * because clsDrawn is incremented at the point of submission. */
+    int32_t  clsSeen[MHUD_CLS_N];
+    int32_t  clsDrawn[MHUD_CLS_N];
+    int32_t  clsFiltered[MHUD_CLS_N];
 
     /* ---- WIDGET PLACEMENT AND CHROME ----------------------------------
      *
@@ -515,6 +561,17 @@ static void mhud_reset(void) {
     g_mhud.colBot         = MHUD_RGBA(230,  70,  60, 235);
     g_mhud.colPlayer      = MHUD_RGBA( 70, 190, 255, 235);
     g_mhud.colSelf        = MHUD_RGBA(255, 255, 255, 255);
+    /* Per-class defaults. memset left clsShow all-ZERO, which would be an
+     * invisible map that reads exactly like a broken feed, so every class
+     * starts VISIBLE and the toggles subtract from that. */
+    {   int32_t c;
+        for (c = 0; c < MHUD_CLS_N; c++) g_mhud.clsShow[c] = 1;
+    }
+    g_mhud.clsCol[MHUD_CLS_LOCAL]   = MHUD_RGBA(255, 255, 255, 255);
+    g_mhud.clsCol[MHUD_CLS_PMC]     = MHUD_RGBA( 70, 190, 255, 235);
+    g_mhud.clsCol[MHUD_CLS_SCAV]    = MHUD_RGBA(230,  70,  60, 235);
+    g_mhud.clsCol[MHUD_CLS_BOSS]    = MHUD_RGBA(255,  60, 220, 240);
+    g_mhud.clsCol[MHUD_CLS_UNKNOWN] = MHUD_RGBA(150, 150, 150, 200);
     /* Chrome, for the same reason: memset would leave a 0 backdrop alpha and a
      * 0-thickness border, which is an invisible widget, not an unset one. */
     g_mhud.anchor         = MHUD_ANCHOR_MANUAL;
@@ -534,6 +591,17 @@ static void mhud_reset(void) {
 static void mhud_begin(float px, float py, float pz, int32_t hasLocal,
                        float heading, int32_t hasHeading, int32_t inRaid) {
     g_mhud.n = 0;
+    /* The class ledger is PER PUBLISH, all three counters together. Zeroing
+     * `seen` without `drawn`/`filtered` would let drawn exceed seen across a
+     * quiet publish and make the "nothing off-class was drawn" assertion
+     * unfalsifiable. */
+    {   int32_t c;
+        for (c = 0; c < MHUD_CLS_N; c++) {
+            g_mhud.clsSeen[c] = 0;
+            g_mhud.clsDrawn[c] = 0;
+            g_mhud.clsFiltered[c] = 0;
+        }
+    }
     /* A new publish. Tracks refreshed by THIS publish carry this value; every
      * other live track is, by definition, a contact that dropped out of the
      * feed and must be drawn as a fading ghost rather than vanishing. */
@@ -546,6 +614,55 @@ static void mhud_begin(float px, float py, float pz, int32_t hasLocal,
     g_mhud.nowMs = mhud_now_ms();   /* diagnostic only; the draw re-reads it */
 }
 
+/* ---- THE ONE VISIBILITY DECISION, AND THE ONE COLOUR DECISION -----------
+ *
+ * Every draw site in this file routes through these two. They used to be six
+ * copies of `bot ? colBot : colPlayer` and six copies of the two-line filter,
+ * and six copies is how the pane and the edge indicators came to disagree
+ * about what was on screen. One function each, so a class toggle cannot apply
+ * to the blip and not to its indicator.
+ *
+ * `mhud_visible` ANDs two INDEPENDENT gates. Neither subsumes the other, so
+ * neither is decorative: with every class on, showBots=0 still hides bots;
+ * with showBots=1, clsShow[boss]=0 still hides bosses. */
+static int32_t mhud_visible(int32_t bot, int32_t cls) {
+    int32_t c = mhud_cls_clamp(cls);
+    if (bot && !g_mhud.showBots)     return 0;
+    if (!bot && !g_mhud.showPlayers) return 0;
+    if (!g_mhud.clsShow[c])          return 0;
+    return 1;
+}
+/* Which gate rejected, so the ledger can say WHY a contact is missing rather
+ * than only that the count dropped. Returns 1 if the CLASS gate was the one
+ * that said no (checked only when the legacy pair said yes). */
+static int32_t mhud_cls_rejected(int32_t bot, int32_t cls) {
+    int32_t c = mhud_cls_clamp(cls);
+    if (bot && !g_mhud.showBots)     return 0;
+    if (!bot && !g_mhud.showPlayers) return 0;
+    return g_mhud.clsShow[c] ? 0 : 1;
+}
+static uint32_t mhud_colour(int32_t bot, int32_t cls) {
+    (void)bot;   /* the class is now authoritative for colour; `bot` remains
+                  * authoritative only for the legacy visibility gate */
+    return g_mhud.clsCol[mhud_cls_clamp(cls)];
+}
+/* Ledger accessors -- read by the diagnostic in maps.nim. */
+static int32_t mhud_cls_seen(int32_t c)     { return g_mhud.clsSeen[mhud_cls_clamp(c)]; }
+static int32_t mhud_cls_drawn(int32_t c)    { return g_mhud.clsDrawn[mhud_cls_clamp(c)]; }
+static int32_t mhud_cls_filtered(int32_t c) { return g_mhud.clsFiltered[mhud_cls_clamp(c)]; }
+static int32_t mhud_cls_show(int32_t c)     { return g_mhud.clsShow[mhud_cls_clamp(c)]; }
+static uint32_t mhud_cls_colour(int32_t c)  { return g_mhud.clsCol[mhud_cls_clamp(c)]; }
+static int32_t mhud_cls_count(void)         { return MHUD_CLS_N; }
+
+/* The per-class configure. ONE call for all five classes, driven from
+ * hudInit/hudReconfigure like every other setter here, which is what puts it
+ * on the onSettingsApplied path rather than only on the boot path. */
+static void mhud_configure_class(int32_t c, int32_t show, uint32_t col) {
+    if (c < 0 || c >= MHUD_CLS_N) return;
+    g_mhud.clsShow[c] = show ? 1 : 0;
+    g_mhud.clsCol[c]  = col;
+}
+
 static void mhud_lifetime(int64_t holdMs, int64_t fadeMs) {
     g_mhud.holdMs = holdMs < 0 ? 0 : holdMs;
     g_mhud.fadeMs = fadeMs < 0 ? 0 : fadeMs;
@@ -556,13 +673,15 @@ static void mhud_lifetime(int64_t holdMs, int64_t fadeMs) {
  * frame and there is no unbounded loop and no allocation. A full table simply
  * declines the newcomer rather than evicting a live track: dropping a mark we
  * never had is a smaller lie than dropping one already on screen. */
-static void mhud_touch(uint64_t key, float x, float y, float z, int32_t bot) {
+static void mhud_touch(uint64_t key, float x, float y, float z, int32_t bot,
+                       int32_t cls) {
     int32_t i, free_ = -1;
     if (key == 0) return;              /* no identity => cannot be aged */
     for (i = 0; i < MHUD_MAX; i++) {
         if (g_mhud.tr[i].live && g_mhud.tr[i].key == key) {
             g_mhud.tr[i].x = x; g_mhud.tr[i].y = y; g_mhud.tr[i].z = z;
             g_mhud.tr[i].bot = bot;
+            g_mhud.tr[i].cls = mhud_cls_clamp(cls);
             g_mhud.tr[i].lastMs = mhud_now_ms();
             g_mhud.tr[i].seq    = g_mhud.pubSeq;
             return;
@@ -575,20 +694,25 @@ static void mhud_touch(uint64_t key, float x, float y, float z, int32_t bot) {
     g_mhud.tr[free_].y      = y;
     g_mhud.tr[free_].z      = z;
     g_mhud.tr[free_].bot    = bot;
+    g_mhud.tr[free_].cls    = mhud_cls_clamp(cls);
     g_mhud.tr[free_].lastMs = mhud_now_ms();
     g_mhud.tr[free_].seq    = g_mhud.pubSeq;
     g_mhud.tr[free_].live   = 1;
 }
 
-static void mhud_add(float x, float y, float z, int32_t bot, uint64_t key) {
+static void mhud_add(float x, float y, float z, int32_t bot, int32_t cls,
+                     uint64_t key) {
+    int32_t c = mhud_cls_clamp(cls);
     if (g_mhud.n >= MHUD_MAX) return;   /* capped by construction */
     g_mhud.e[g_mhud.n].x = x;
     g_mhud.e[g_mhud.n].y = y;
     g_mhud.e[g_mhud.n].z = z;
     g_mhud.e[g_mhud.n].bot = bot ? 1 : 0;
+    g_mhud.e[g_mhud.n].cls = c;
     g_mhud.e[g_mhud.n].key = key;
+    g_mhud.clsSeen[c]++;
     g_mhud.n++;
-    mhud_touch(key, x, y, z, bot ? 1 : 0);
+    mhud_touch(key, x, y, z, bot ? 1 : 0, c);
 }
 
 static void mhud_configure(float radiusM, float screenW, float screenH,
@@ -1469,15 +1593,20 @@ static int32_t mhud_draw_pane_full(float px, float py, float size, float spanM,
         uint32_t col;
         MmPt p;
 
-        if (g_mhud.e[i].bot && !g_mhud.showBots) continue;
-        if (!g_mhud.e[i].bot && !g_mhud.showPlayers) continue;
+        if (mhud_cls_rejected(g_mhud.e[i].bot, g_mhud.e[i].cls))
+            g_mhud.clsFiltered[mhud_cls_clamp(g_mhud.e[i].cls)]++;
+        if (!mhud_visible(g_mhud.e[i].bot, g_mhud.e[i].cls)) continue;
         if (radiusCull > 0.0f &&
             mm_dist2d(ex, ez, g_mhud.px, g_mhud.pz) > radiusCull) continue;
 
-        col = g_mhud.e[i].bot ? g_mhud.colBot : g_mhud.colPlayer;
+        col = mhud_colour(g_mhud.e[i].bot, g_mhud.e[i].cls);
         p = mm_topdown(ex, ez, g_mhud.px, g_mhud.pz, px, py, size, spanM, rot);
         if (!mm_in_rect(p, px, py, size, size)) continue;
 
+        /* Counted at the point of SUBMISSION, not at the point of the decision.
+         * A count taken before the rect cull would say "drawn" for a contact
+         * that was never submitted -- a number that cannot be wrong. */
+        g_mhud.clsDrawn[mhud_cls_clamp(g_mhud.e[i].cls)]++;
         aowl_region_fill(p.x - cp, p.y - cp, cp * 2.0f, cp * 2.0f, col);
         prims++;
         /* elevation: a tick above or below the blip, only when the difference
@@ -1521,8 +1650,9 @@ static int32_t mhud_draw_pane_full(float px, float py, float size, float spanM,
             if (!g_mhud.tr[i].live) continue;
             if (g_mhud.tr[i].seq == g_mhud.pubSeq) continue;  /* drawn above */
             g_mhud.ghostVisits++;      /* a contact HAS dropped out of the feed */
-            if (g_mhud.tr[i].bot && !g_mhud.showBots) continue;
-            if (!g_mhud.tr[i].bot && !g_mhud.showPlayers) continue;
+            if (mhud_cls_rejected(g_mhud.tr[i].bot, g_mhud.tr[i].cls))
+                g_mhud.clsFiltered[mhud_cls_clamp(g_mhud.tr[i].cls)]++;
+            if (!mhud_visible(g_mhud.tr[i].bot, g_mhud.tr[i].cls)) continue;
 
             alpha = mm_fade_alpha(now - g_mhud.tr[i].lastMs,
                                   g_mhud.holdMs, g_mhud.fadeMs);
@@ -1543,8 +1673,9 @@ static int32_t mhud_draw_pane_full(float px, float py, float size, float spanM,
             if (!mm_in_rect(p2, px, py, size, size)) continue;
 
             cp2 = g_mhud.contactPx;
-            col2 = mm_fade_rgba(g_mhud.tr[i].bot ? g_mhud.colBot
-                                                 : g_mhud.colPlayer, alpha);
+            col2 = mm_fade_rgba(mhud_colour(g_mhud.tr[i].bot, g_mhud.tr[i].cls),
+                                alpha);
+            g_mhud.clsDrawn[mhud_cls_clamp(g_mhud.tr[i].cls)]++;
             aowl_region_fill(p2.x - cp2, p2.y - cp2, cp2 * 2.0f, cp2 * 2.0f, col2);
             prims++;
             /* Counted HERE, after the submit. */
@@ -1855,8 +1986,11 @@ static void mhud_draw(void* user, int64_t frame) {
          * still AGED and EVICTED above, so closing the overlay does not resume
          * a frozen set of indicators. */
         if (!g_mhud.indicatorsOn || g_mhud.fsOn) { g_mhud.indGatedOff++; continue; }
-        if (g_mhud.tr[i].bot && !g_mhud.showBots)     { g_mhud.indFiltered++; continue; }
-        if (!g_mhud.tr[i].bot && !g_mhud.showPlayers) { g_mhud.indFiltered++; continue; }
+        if (mhud_cls_rejected(g_mhud.tr[i].bot, g_mhud.tr[i].cls))
+            g_mhud.clsFiltered[mhud_cls_clamp(g_mhud.tr[i].cls)]++;
+        if (!mhud_visible(g_mhud.tr[i].bot, g_mhud.tr[i].cls)) {
+            g_mhud.indFiltered++; continue;
+        }
         g_mhud.indAlphaCalc++;   /* mm_fade_alpha IS reached below */
 
         /* `indFaded` counts a decay that was COMPUTED. It is kept, because it is
@@ -1871,7 +2005,7 @@ static void mhud_draw(void* user, int64_t frame) {
         d = mm_dist2d(ex, ez, g_mhud.px, g_mhud.pz);
         if (!(d > 0.001f)) continue;
 
-        col = g_mhud.tr[i].bot ? g_mhud.colBot : g_mhud.colPlayer;
+        col = mhud_colour(g_mhud.tr[i].bot, g_mhud.tr[i].cls);
         col = mm_fade_rgba(col, alpha);
 
         /* THE THREE-OUTCOME PROJECTION, UNDER A PER-FRAME CALL CAP.
@@ -2186,8 +2320,16 @@ proc cHudBegin(px, py, pz: cfloat; hasLocal: int32;
                heading: cfloat; hasHeading: int32; inRaid: int32) {.
   importc: "mhud_begin", nodecl.}
 proc cHudInRaid(): int32 {.importc: "mhud_in_raid", nodecl.}
-proc cHudAdd(x, y, z: cfloat; bot: int32; key: uint64) {.
+proc cHudAdd(x, y, z: cfloat; bot: int32; cls: int32; key: uint64) {.
   importc: "mhud_add", nodecl.}
+proc cHudConfigureClass(c: int32; show: int32; col: uint32) {.
+  importc: "mhud_configure_class", nodecl.}
+proc cHudClsCount(): int32 {.importc: "mhud_cls_count", nodecl.}
+proc cHudClsShow(c: int32): int32 {.importc: "mhud_cls_show", nodecl.}
+proc cHudClsColour(c: int32): uint32 {.importc: "mhud_cls_colour", nodecl.}
+proc cHudClsSeen(c: int32): int32 {.importc: "mhud_cls_seen", nodecl.}
+proc cHudClsDrawn(c: int32): int32 {.importc: "mhud_cls_drawn", nodecl.}
+proc cHudClsFiltered(c: int32): int32 {.importc: "mhud_cls_filtered", nodecl.}
 proc cHudLifetime(holdMs, fadeMs: int64) {.importc: "mhud_lifetime", nodecl.}
 proc cHudConfigure(radiusM, screenW, screenH: cfloat;
                    radarOn, indicatorsOn: int32;
@@ -2556,6 +2698,14 @@ type
     colBot*: uint32
     colPlayer*: uint32
     colSelf*: uint32
+    ## PER-CLASS VISIBILITY AND COLOUR, indexed by world.Cls*. Carried in
+    ## HudOpts rather than pushed from maps.nim directly, so that they travel
+    ## the SAME hudInit/hudReconfigure funnel every other setting travels --
+    ## which is what puts them on the onSettingsApplied path. A setting pushed
+    ## by its own private call is exactly the setting that gets stored and never
+    ## applied, and that defect has been paid for five times in this repo.
+    clsShow*: array[ClsCount, bool]
+    clsCol*: array[ClsCount, uint32]
     ## PLACEMENT AND CHROME. `anchor` 0 = manual (mapX/mapY are absolute),
     ## 1..4 = TL/TR/BL/BR with mapX/mapY read as an inset from that corner.
     anchor*: int
@@ -2629,6 +2779,69 @@ proc keycodeOf*(name: string): int =
   var buf = name & "\0"
   result = int(cKeycodeOf(toCString(buf)))
 
+proc hudPushClasses(o: HudOpts) =
+  ## The ONE place a class toggle or colour reaches the live mirror. Called from
+  ## BOTH hudInit and hudReconfigure, so boot and hot-apply cannot diverge --
+  ## the divergence that made `radarSize` storable and inert.
+  var c = 0
+  while c < ClsCount:
+    cHudConfigureClass(int32(c), (if o.clsShow[c]: 1'i32 else: 0'i32),
+                       o.clsCol[c])
+    inc c
+
+proc hudLiveClsShow*(c: int): bool = cHudClsShow(int32(c)) != 0'i32
+proc hudLiveClsColour*(c: int): uint32 = cHudClsColour(int32(c))
+proc hudClsSeen*(c: int): int = int(cHudClsSeen(int32(c)))
+proc hudClsDrawn*(c: int): int = int(cHudClsDrawn(int32(c)))
+proc hudClsFiltered*(c: int): int = int(cHudClsFiltered(int32(c)))
+
+proc hudClassLedgerText*(): string =
+  var s = "class ledger (this publish):"
+  var c = 0
+  while c < ClsCount:
+    s = s & " " & clsName(c) & "=" & $hudClsSeen(c) & "/" &
+        $hudClsDrawn(c) & "/" & $hudClsFiltered(c) &
+        (if hudLiveClsShow(c): "" else: "[OFF]")
+    inc c
+  s & "  (seen/drawn/filtered)"
+
+proc hudClassVerdict*(): string =
+  ## THE NEGATIVE. "No contact was drawn whose class toggle is OFF" -- stated as
+  ## the falsifiable form, checked against the LIVE MIRROR's own drawn counter
+  ## and not against anything this file just wrote. It fails the moment a draw
+  ## site is added that forgets `mhud_visible`, which is the whole reason the
+  ## counter is incremented at the submission point.
+  ##
+  ## Three outcomes. If nothing has been submitted at all this publish, that is
+  ## INCONCLUSIVE -- "I could not look" is not a pass.
+  var offClasses = 0
+  var offDrawn: seq[string] = @[]
+  var totalSeen = 0
+  var c = 0
+  while c < ClsCount:
+    totalSeen = totalSeen + hudClsSeen(c)
+    if not hudLiveClsShow(c):
+      inc offClasses
+      if hudClsDrawn(c) > 0:
+        offDrawn.add clsName(c) & "(" & $hudClsDrawn(c) & " drawn)"
+    inc c
+  if offDrawn.len > 0:
+    var names = ""
+    for k in offDrawn:
+      if names.len > 0: names = names & ", "
+      names = names & k
+    return "FAIL  a class toggle is OFF and that class was still SUBMITTED: " &
+           names & ". " & hudClassLedgerText()
+  if totalSeen == 0:
+    return "INCONCLUSIVE  no contact was published this frame, so the " &
+           "per-class filter was never exercised. " & hudClassLedgerText()
+  if offClasses == 0:
+    return "INCONCLUSIVE  every class toggle is ON, so 'nothing off-class was " &
+           "drawn' is vacuously true and proves nothing. Turn one class off to " &
+           "make this check able to fail. " & hudClassLedgerText()
+  "PASS  " & $offClasses & " class(es) OFF and none of them reached the draw, " &
+  "over " & $totalSeen & " published contact(s). " & hudClassLedgerText()
+
 proc hudInit*(o: HudOpts) =
   ## Resets the mirror and installs the layout. Safe to call before the region
   ## exists; it touches nothing but this file's own struct. Only ever called from
@@ -2653,6 +2866,7 @@ proc hudInit*(o: HudOpts) =
   cHudConfigurePane(int32(o.mode), cfloat(o.zoom), cfloat(o.opacity),
                     (if o.drawArt: 1'i32 else: 0'i32), cfloat(o.contactPx),
                     o.colBot, o.colPlayer, o.colSelf)
+  hudPushClasses(o)
   cHudConfigureChrome(int32(o.anchor), (if o.border: 1'i32 else: 0'i32),
                       cfloat(o.borderPx), cfloat(o.backdropOpacity))
   cHudConfigureFs(cfloat(o.fsMargin), cfloat(o.fsSpanM), cfloat(o.fsZoom),
@@ -2701,6 +2915,7 @@ proc hudReconfigure*(o: HudOpts; live: bool) =
                     cfloat(o.zoom), cfloat(o.opacity),
                     (if o.drawArt: 1'i32 else: 0'i32), cfloat(o.contactPx),
                     o.colBot, o.colPlayer, o.colSelf)
+  hudPushClasses(o)
   cHudConfigureChrome(int32(o.anchor), (if o.border: 1'i32 else: 0'i32),
                       cfloat(o.borderPx), cfloat(o.backdropOpacity))
   cHudConfigureFs(cfloat(o.fsMargin), cfloat(o.fsSpanM), cfloat(o.fsZoom),
@@ -2806,7 +3021,7 @@ proc hudPublish*(snap: Snapshot) =
       # simply gets no track and therefore no indicator, rather than sharing
       # slot 0 with every other keyless contact.
       cHudAdd(cfloat(e.x), cfloat(e.y), cfloat(e.z),
-              (if e.bot: 1'i32 else: 0'i32), e.key)
+              (if e.bot: 1'i32 else: 0'i32), int32(e.cls), e.key)
     inc i
 
 proc hudStatusText*(): string =
