@@ -3405,6 +3405,21 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
     # cached is one guarded pointer test plus one scene-name query per second.
     rpDrainTick()
     natEspDrainTick()
+    # THE NATIVE COLOUR WIDGET's pointer poll. Rides THIS drain for the same
+    # reason everything above it does -- a second detour on
+    # TarkovApplication::Update would overwrite the first's trampoline and
+    # silently kill it. Its whole body is inside ONE `aowl_p_p_seh` opened by
+    # `aowl_cw_tick_guarded`, so this call site opens none: the guard is not
+    # re-entrant and a nested inner guard disarms the outer one.
+    #
+    # This is the ONLY pointer poll in the host. `nativeui.nim`'s INPUT section
+    # has prescribed polling since it was written and had no pointer source at
+    # all -- `nuHitTest` had zero call sites -- so this is the half that makes
+    # a built control usable rather than merely visible.
+    #
+    # Flag `settingsColorWidget`, default OFF; idle cost is one boolean compare
+    # and no call into the game.
+    cwDrainTick()
     return 0'i32
   # The render-phase drain, likewise by identity: a second detour on a
   # render-phase method that drains the render queue where GL drawing lands.
@@ -6974,6 +6989,17 @@ var gReportNextMs = 0'u64
 ## `settingspages.nim`'s forward declaration.
 include "modsettingsrender.nim"
 
+## THE NATIVE COLOUR WIDGET. Fulfils `settingspages.nim`'s three forward
+## declarations (`cwBuildForRow` / `cwRowColor` / `cwDestroySlot`) and defines
+## `cwDrainTick`, called from the `TarkovApplication::Update` drain.
+##
+## Included HERE, and the position is load-bearing in both directions: it needs
+## `nuikit.nim` (6014) for `nuPanel`/`nuLabel`/`nuSetColor` and
+## `modsettingsrender.nim` (just above) for the `color` row that produces the
+## work, and it must come BEFORE `gCwOn` is read in the flag pass, because
+## nimony forward-resolves procs across an include boundary but NOT variables.
+include "colorwidget.nim"
+
 ## Client-side mods' settings pages, published to the backend over the event
 ## bus so the F12 nav can list them at all. Stands on `modsettingsrender.nim`
 ## for the shared POST slot discipline (`gSbYieldUntil`) and on `gSyncMs`.
@@ -7663,6 +7689,16 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   # feature that reports "the callback ran" forever.
   gNeOn = readBoolKey("natEsp") and gNuOn
   gNeDiag = gNeOn and readBoolKey("natEspDiag")
+  # THE NATIVE COLOUR WIDGET on the in-game settings screen. Default OFF.
+  #
+  # The `and gNuOn` is the same load-bearing condition `natEsp` has above and
+  # for the same measured reason: without the nu*/nuikit layer this feature
+  # cannot construct a single panel, so arming it would produce a page of
+  # refusals rather than a control. It also needs `settingsPages`, which is
+  # what renders a page for it to put a row on -- but that flag is read further
+  # down, so the dependency is stated in the ledger line rather than ANDed here
+  # where it would silently read false.
+  gCwOn = readBoolKey("settingsColorWidget") and gNuOn
   # NOTE: `bindNativeUi` is deliberately NOT called here. It was, and the first
   # live run showed why that is wrong: this pass runs before il2cpp is attached
   # and before GameAssembly.dll is loaded, so all 25 targets refused with "no
@@ -8101,6 +8137,14 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
       # stands on verify against. It binds no detour.
       if gNeOn:
         bindNativeEsp(true)
+      # The native COLOUR WIDGET, in the same region and for the same reason:
+      # its banner names four managed targets and one field offset, and asking
+      # about any of them before GameAssembly.dll is loaded and
+      # `cProPrimeAll()` has primed the prologue snapshot would report them as
+      # prologue rejections and blame the game build for a start-order bug --
+      # the measured mistake that moved `bindNativeUi` here in the first place.
+      # It binds no detour; it rides the Update drain.
+      bindColorWidget(gCwOn)
 
       if gMi2Probe and not bindManagedInvoke(true):
         info "the managed-invoke probe did not verify " &

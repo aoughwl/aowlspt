@@ -108,6 +108,19 @@ proc cNuRectContains(rx, ry, rw, rh, px, py: float32): int32 {.
 proc cNuRectRenderable(w, h: float32): int32 {.
   importc: "aowl_nu_rect_renderable", nodecl.}
 
+proc cNuV3OutPtr(): Il2CppPtr {.importc: "aowl_nu_v3out_ptr", nodecl.}
+proc cNuV3OutX(): float32 {.importc: "aowl_nu_v3out_x", nodecl.}
+proc cNuV3OutY(): float32 {.importc: "aowl_nu_v3out_y", nodecl.}
+proc cNuV3OutZ(): float32 {.importc: "aowl_nu_v3out_z", nodecl.}
+proc cNuCallBSi(fn: Il2CppPtr; a0: int32): int32 {.
+  importc: "aowl_nu_call_b_si", nodecl.}
+proc cNuTargetName(i: int32): cstring {.importc: "aowl_nu_target_name", nodecl.}
+proc cNuTargetRva(i: int32): uint32 {.importc: "aowl_nu_target_rva", nodecl.}
+# `cNuTargetCount` is already declared at the top of this file -- do not
+# re-declare it here; nimony reports the duplicate as an AMBIGUOUS CALL at the
+# use site rather than as a redefinition, which reads like a name collision
+# with something else entirely.
+
 proc cNuKindName(k: int32): Il2CppPtr {.importc: "aowl_nu_kind_name", nodecl.}
 proc cNuKindEvidence(k: int32): Il2CppPtr {.
   importc: "aowl_nu_kind_evidence", nodecl.}
@@ -189,6 +202,10 @@ const
   NuTCanvasSetMode   = 29'i32  ## UnityEngine.Canvas::set_renderMode
   NuTCanvasGetMode   = 30'i32  ## UnityEngine.Canvas::get_renderMode
   NuTCanvasSetSort   = 31'i32  ## UnityEngine.Canvas::set_sortingOrder
+  NuTInputMouseBtn   = 32'i32  ## UnityEngine.Input::GetMouseButton
+  NuTInputMousePos   = 33'i32  ## UnityEngine.Input::get_mousePosition_Injected
+  NuTTrGetPosition   = 34'i32  ## UnityEngine.Transform::get_position_Injected
+  NuTTrGetLossyScale = 35'i32  ## UnityEngine.Transform::get_lossyScale_Injected
 
 const
   NuRenderModeOverlay = 0'i32  ## ScreenSpaceOverlay -- the only one we accept
@@ -866,6 +883,157 @@ proc nuHitTest(rt: Il2CppPtr; px, py: float32): bool =
   let (ok, rx, ry, rw, rh) = nuGetRect(rt)
   if not ok: return false
   cNuRectContains(rx, ry, rw, rh, px, py) != 0'i32
+
+# --- THE POINTER SOURCE. Added 2026-08-31 for the native colour widget. ------
+#
+# Until now this section was arithmetic only and the comment above said so:
+# "the caller supplies the pointer position it already has". NOTHING supplied
+# one -- `nuHitTest` had zero call sites in the whole host -- so interaction was
+# a half-built primitive, not a capability. These four calls are the missing
+# half, and they are polled from the Update drain exactly as that comment
+# prescribes: no delegate, no `UnityAction`, no EventSystem participation.
+#
+# All four RVAs are byte-verified against the STARTUP SNAPSHOT through the
+# ordinary `nuFn` path, and all four are sharedness=UNIQUE. Provenance is on
+# the rows themselves in `abi/aowlspt_nativeui.h`.
+
+proc nuTargetsBindOk(): bool =
+  ## THE POSITIONAL-BINDING SELF-CHECK for `aowl_nu_targets`.
+  ##
+  ## `aowl_du_targets` has had one since the 2026-08-24 defect (a row inserted
+  ## mid-table re-pointed `DuGetParent` at `Transform::set_localPosition`, a
+  ## byte-verified function of the wrong shape called with the wrong frame).
+  ## This table -- indexed the same way, by the `NuT*` constants -- had NONE,
+  ## and the change that adds this comment appends four rows to it. That is the
+  ## precise edit that causes that bug, so the check ships with it.
+  ##
+  ## Deliberately checks the rows a WRONG ANSWER WOULD BE SILENT ON: the input
+  ## trio (an int-shaped call to a pointer-shaped method), and one interior
+  ## `_Injected` setter, because those are near-identical for pages and a
+  ## mis-index there lays an element out wrongly while every call succeeds.
+  result = true
+  var bad = ""
+  var idx: seq[int32] = @[]
+  var want: seq[string] = @[]
+  idx.add NuTRtSetSizeDelta
+  want.add "UnityEngine.RectTransform::set_sizeDelta_Injected"
+  idx.add NuTGrSetColor
+  want.add "UnityEngine.UI.Graphic::set_color"
+  idx.add NuTInputMouseBtn
+  want.add "UnityEngine.Input::GetMouseButton"
+  idx.add NuTInputMousePos
+  want.add "UnityEngine.Input::get_mousePosition_Injected"
+  idx.add NuTTrGetPosition
+  want.add "UnityEngine.Transform::get_position_Injected"
+  idx.add NuTTrGetLossyScale
+  want.add "UnityEngine.Transform::get_lossyScale_Injected"
+  var i = 0
+  while i < idx.len:                      # capped: idx is built right here
+    let ix = idx[i]
+    if ix >= cNuTargetCount():
+      result = false
+      if bad.len == 0:
+        bad = "index " & $ix & " is past the end of the table (" &
+              $cNuTargetCount() & " rows)"
+    else:
+      let got = $cNuTargetName(ix)
+      if got != want[i]:
+        result = false
+        if bad.len == 0:
+          bad = "index " & $ix & " should be '" & want[i] & "' and is '" &
+                got & "' (RVA 0x" & hexOf(uint64(cNuTargetRva(ix))) & ")"
+    i = i + 1
+  if not result:
+    warn "nativeui: the aowl_nu_targets POSITIONAL binding self-check FAILED " &
+         "-- " & bad & ". Every NuT* call would be to the wrong method with " &
+         "the wrong frame. Nothing that indexes this table may run."
+
+proc nuMouseDown(button: int32): bool =
+  ## `UnityEngine.Input::GetMouseButton(int)` -- the LEGACY STATIC API in
+  ## UnityEngine.InputLegacyModule, not `UnityEngine.UIElements.Input`, whose
+  ## same-named member is an INSTANCE method on a SHARED (4-owner) RVA.
+  ##
+  ## "is held", not "went down this frame": a drag needs the held state, and
+  ## the press edge is derived from it here rather than binding a second RVA.
+  if not gNuOn: return false
+  let fn = nuFn(NuTInputMouseBtn)
+  if fn == nil: return false
+  cNuCallBSi(fn, button) != 0'i32
+
+proc nuMousePos(x, y: var float32): bool =
+  ## `Input::get_mousePosition_Injected(Vector3* ret)`, static: RCX = the out
+  ## buffer, RDX = MethodInfo* (NULL is fine; this is not a shared generic).
+  ##
+  ## Unity's screen origin is BOTTOM-LEFT, and it stays that way here -- an
+  ## overlay canvas's world space uses the same origin, so converting would
+  ## only create a second convention to get wrong.
+  x = 0.0'f32
+  y = 0.0'f32
+  if not gNuOn: return false
+  let fn = nuFn(NuTInputMousePos)
+  if fn == nil: return false
+  let buf = cNuV3OutPtr()
+  if buf == nil: return false
+  cNuCallVS1(fn, buf)
+  let px = cNuV3OutX()
+  let py = cNuV3OutY()
+  # NaN-safe, and a bounds check rather than a nil check: a pointer position
+  # off in the millions is what a getter that did not write looks like, and it
+  # would map to a channel value just as happily as a real one.
+  if not (px > -32768.0'f32) or not (px < 32768.0'f32): return false
+  if not (py > -32768.0'f32) or not (py < 32768.0'f32): return false
+  x = px
+  y = py
+  true
+
+proc nuScreenRectOf(rt: Il2CppPtr; sx, sy, sw, sh: var float32): bool =
+  ## The element's rect in SCREEN pixels, for an overlay canvas.
+  ##
+  ## For `RenderMode.ScreenSpaceOverlay` Unity places the canvas so that world
+  ## space IS screen space, so centre = `Transform::get_position` and the
+  ## half-extent = local `rect` size * `lossyScale`. Three `_Injected` getters,
+  ## no managed allocation.
+  ##
+  ## `RectTransform::GetWorldCorners(Vector3[])` would be the direct answer and
+  ## is NOT used: it takes a managed Vector3[], and allocating one on a frame
+  ## breaks rule 7 while caching a pinned one adds a GC-handle mechanism this
+  ## build has not demonstrated.
+  ##
+  ## This is only valid for an OVERLAY canvas. The caller must have established
+  ## that (`Canvas::get_renderMode` == 0); this proc cannot see the canvas and
+  ## deliberately does not guess at one.
+  sx = 0.0'f32; sy = 0.0'f32; sw = 0.0'f32; sh = 0.0'f32
+  if not gNuOn: return false
+  if not nuOk(rt, 0x20'i32): return false
+  let fnPos = nuFn(NuTTrGetPosition)
+  let fnScl = nuFn(NuTTrGetLossyScale)
+  if fnPos == nil or fnScl == nil: return false
+  let (okR, _, _, rw, rh) = nuGetRect(rt)
+  if not okR: return false
+  if cNuRectRenderable(rw, rh) == 0'i32: return false
+
+  var buf = cNuV3OutPtr()
+  if buf == nil: return false
+  cNuCallVPP(fnPos, rt, buf)
+  let cx = cNuV3OutX()
+  let cy = cNuV3OutY()
+  buf = cNuV3OutPtr()
+  cNuCallVPP(fnScl, rt, buf)
+  let kx = cNuV3OutX()
+  let ky = cNuV3OutY()
+  # A zero or absurd lossyScale means the element is under a collapsed or
+  # not-yet-laid-out parent. Mapping a pointer through it produces a finite,
+  # entirely fictional channel value -- refuse instead.
+  if not (kx > 0.0001'f32) or not (kx < 1000.0'f32): return false
+  if not (ky > 0.0001'f32) or not (ky < 1000.0'f32): return false
+  if not (cx > -65536.0'f32) or not (cx < 65536.0'f32): return false
+  if not (cy > -65536.0'f32) or not (cy < 65536.0'f32): return false
+  sw = rw * kx
+  sh = rh * ky
+  if cNuRectRenderable(sw, sh) == 0'i32: return false
+  sx = cx - sw * 0.5'f32
+  sy = cy - sh * 0.5'f32
+  true
 
 # ---------------------------------------------------------------------------
 # TEARDOWN -- creating UI that cannot be torn down is a leak

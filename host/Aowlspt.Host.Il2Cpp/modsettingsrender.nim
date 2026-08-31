@@ -126,6 +126,49 @@ proc modSetFinish(note: string) =
 ## the same shape the F12 overlay's own settings panel already reads (see
 ## `aowl_ov_read_one_item`), because both sides read the exact same backend
 ## response.
+proc modSetHexVal(c: char): int =
+  ## -1 for "not a hex digit". Three outcomes collapse to two safely here only
+  ## because the caller treats -1 as a hard parse failure, never as 0.
+  if c >= '0' and c <= '9': return int(c) - int('0')
+  if c >= 'a' and c <= 'f': return 10 + int(c) - int('a')
+  if c >= 'A' and c <= 'F': return 10 + int(c) - int('A')
+  -1
+
+proc modSetParseColor(s: string; r, g, b, a: var float32): bool =
+  ## `#rgb`, `#rrggbb`, `#rrggbbaa`, with or without the leading `#`. This is
+  ## the format `colorSetting(format=)` in `aowl/src/aowlspt/settings.nim`
+  ## declares and the one the web picker writes, so the two UIs read and write
+  ## the same string.
+  ##
+  ## STRICT ON PURPOSE. Every unrecognised shape is a refusal, not a fallback
+  ## to black: a colour control that silently shows black for a value it could
+  ## not read looks exactly like a colour control showing a black setting, and
+  ## the first drag would persist the invention over the real value.
+  r = 0.0'f32; g = 0.0'f32; b = 0.0'f32; a = 1.0'f32
+  var t = s
+  if t.len > 0 and t[0] == '#': t = t[1 .. t.len - 1]
+  if t.len != 3 and t.len != 6 and t.len != 8: return false
+  var n: seq[int] = @[]
+  var i = 0
+  while i < t.len:                        # capped: t.len is 3, 6 or 8
+    let v = modSetHexVal(t[i])
+    if v < 0: return false
+    n.add v
+    i = i + 1
+  if t.len == 3:
+    # `#abc` is `#aabbcc`, the CSS rule -- doubling the nibble, NOT shifting it
+    # left by four, which would make `#fff` 0xF0F0F0 instead of white.
+    r = float32(n[0] * 17) / 255.0'f32
+    g = float32(n[1] * 17) / 255.0'f32
+    b = float32(n[2] * 17) / 255.0'f32
+    return true
+  r = float32(n[0] * 16 + n[1]) / 255.0'f32
+  g = float32(n[2] * 16 + n[3]) / 255.0'f32
+  b = float32(n[4] * 16 + n[5]) / 255.0'f32
+  if t.len == 8:
+    a = float32(n[6] * 16 + n[7]) / 255.0'f32
+  true
+
 proc modSetParseRow(obj: string; row: var SwRow): bool =
   row = SwRow(kind: swkStub, implemented: true)
   if not pathGet(obj, "key", row.key) or row.key.len == 0:
@@ -162,6 +205,28 @@ proc modSetParseRow(obj: string; row: var SwRow): bool =
     # "(not done yet)" suffix the free-text/keybind case gets below, instead
     # of a slider that silently shows the DONOR's value and does nothing.
     row.implemented = false
+  of "color", "colour":
+    # THE COLOUR ROW. Until 2026-08-31 this fell through to the `else` below
+    # and rendered as `swkStub`/`implemented = false` -- an honest "(not done
+    # yet)" for a setting the WEB ui could already edit. It is now a real
+    # control, and the reason it could become one is that it does NOT need a
+    # game widget to clone: `colorwidget.nim` BUILDS it out of nuikit panels
+    # and labels, which is a proven path (IMAGEPROOF PASS), where cloning a
+    # colour control was blocked because the stock settings screen has none.
+    #
+    # `implemented` stays TRUE, and that is a claim this file is entitled to
+    # make only because the row is seeded at render time and read back from
+    # the LIVE swatch in `swReadBackPage` -- not because a widget was drawn.
+    # If `cwBuildForRow` refuses, `swRenderPage` clears `seeded` and warns; the
+    # row then displays but casts no vote.
+    row.kind = swkColor
+    if not modSetParseColor(v, row.cr, row.cg, row.cb, row.ca):
+      # An unparseable colour is NOT rendered as a colour. Falling back to a
+      # visible default would put a control on screen showing a value the mod
+      # does not hold, and the first drag would then persist that invention.
+      row.kind = swkStub
+      row.implemented = false
+      row.label = row.label & " [unreadable colour '" & v & "']"
   else:
     # enum / string / keybind / anything else: no native widget exists to
     # clone (`SETTINGS-CONTROLS-RE.md` sec.4 lists what does). Drawn and
