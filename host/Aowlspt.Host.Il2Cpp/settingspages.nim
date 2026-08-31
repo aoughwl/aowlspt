@@ -105,6 +105,18 @@ type
     ## the Update drain. See `colorwidget.nim`; `settingspages.nim` only calls
     ## the three entry points forward-declared below.
 
+const
+  # THE COLOUR FORMAT VOCABULARY, mirroring `cColorFmt*` /
+  # `normalizeColorFormat` in `aowl/src/aowlspt/settings.nim`. The host cannot
+  # import the mod SDK, so this is a mirror rather than a shared symbol -- but
+  # it is ONE mirror, named, in one place, referenced by both the parser and the
+  # writer, instead of the bare string literals that let the two UIs drift.
+  # `rgb` is the DEFAULT on both sides, and it is the default that was broken.
+  cSwColorFmtRgb* = "rgb"          ## "r,g,b" / "r,g,b,a", components 0..1
+  cSwColorFmtHex* = "hex"          ## "rrggbb" / "rrggbbaa", NO leading '#'
+  cSwColorFmtHexHash* = "hex#"     ## "#rrggbb" / "#rrggbbaa", WITH the '#'
+
+type
   SwRow* = object
     key*: string                ## the config key, verbatim
     label*: string              ## the text drawn on the row
@@ -147,6 +159,25 @@ type
     ## its own, and a raw pointer here would be exactly the stale-handle bug
     ## nuikit's generation counters exist to prevent.
     cwIdx*: int32
+    ## The colour row's DECLARED text shape -- one of the three `cSwColorFmt*`
+    ## constants below, mirroring `normalizeColorFormat` in
+    ## `aowl/src/aowlspt/settings.nim`. Carried because it decides what is
+    ## WRITTEN BACK: this used to be ignored and every colour edit was persisted
+    ## as `#rrggbb`, which the owning mod's own reader rejects for both of the
+    ## other two formats, so the edit reverted on the next read.
+    cfmt*: string
+    ## Did the stored value carry an alpha component? A colour written back with
+    ## an alpha the row never had is a value the mod did not store, and for the
+    ## `hex` format it also changes the LENGTH, which is what mod readers key
+    ## off. Never invent one.
+    cHasA*: bool
+    ## The SCHEMA said `type:"color"`, whatever this row ended up being rendered
+    ## as. Survives demotion to `swkStub` on purpose: it is the only thing that
+    ## makes the falsifiable negative -- "no setting whose schema declares a
+    ## colour format still renders as a stub or a bare text row" -- possible to
+    ## state at all. Without it a demoted colour row is indistinguishable from a
+    ## string row, and the check could only ever say yes.
+    declaredColor*: bool
 
   SwPage* = object
     id*: string                 ## stable key, e.g. "host"
@@ -908,6 +939,37 @@ proc swRenderPage(tabPtr, parentGo: Il2CppPtr; page: var SwPage): int =
         gSwGeomDumped = true
         swDumpRowGeometry(donorToggle, clone, parentGo)
     i = i + 1
+  # THE FALSIFIABLE NEGATIVE, over the FINISHED PAGE rather than over our own
+  # write: "no row whose SCHEMA declared a colour still ended up rendered as a
+  # stub or as an unbound text row". Stated as a negative because a negative can
+  # fail -- counting the widgets we built and comparing that to itself cannot.
+  # THREE OUTCOMES: no declared colour rows at all is INCONCLUSIVE, not a pass.
+  var declared = 0
+  var stillStub = 0
+  var unbound = 0
+  var k = 0
+  while k < page.rows.len:                 # capped: cSwMaxRows
+    if page.rows[k].declaredColor:
+      inc declared
+      if page.rows[k].kind != swkColor:
+        inc stillStub
+      elif page.rows[k].cwIdx == 0'i32 or not page.rows[k].seeded:
+        inc unbound
+    k = k + 1
+  if declared == 0:
+    okLog "settings pages: page '" & page.id & "' colour check INCONCLUSIVE " &
+          "-- this page's schema declared no colour row, so nothing was " &
+          "examined. That is not a pass."
+  elif stillStub > 0 or unbound > 0:
+    warn "settings pages: page '" & page.id & "' colour check FAIL -- of " &
+         $declared & " row(s) whose schema declared a colour, " & $stillStub &
+         " still render as a plain text/stub row (the value would not parse) " &
+         "and " & $unbound & " drew no working widget. THIS IS THE REPORTED " &
+         "BUG's SIGNATURE: a colour setting showing its raw value as text."
+  else:
+    okLog "settings pages: page '" & page.id & "' colour check PASS -- all " &
+          $declared & " row(s) whose schema declared a colour render a bound " &
+          "colour widget; none is left as a stub or a bare text row."
   okLog "settings pages: page '" & page.id & "' rendered " & $result &
         " row(s) of " & $page.rows.len &
         (if skipped > 0:
@@ -944,6 +1006,52 @@ proc swColorHex(r, g, b: float32): string =
     let b255 = int(v * 255.0'f32 + 0.5'f32)
     result = result & swHexNib(b255 div 16) & swHexNib(b255 mod 16)
     i = i + 1
+
+proc swColorChan01(v: float32): string =
+  ## One 0..1 component as short decimal text, at the SAME 8-bit resolution the
+  ## value is stored at (`swColorNear`). Deliberately not a float printer: a
+  ## `0.6200000000000001` written back on every save is the drift the SDK's
+  ## `colorSetting` docstring calls out by name.
+  var x = v
+  if x < 0.0'f32: x = 0.0'f32
+  if x > 1.0'f32: x = 1.0'f32
+  let n = int((x * 255.0'f32) + 0.5'f32)          # 0..255
+  if n == 0: return "0"
+  if n == 255: return "1"
+  # n/255 to three decimals, integer maths only -- no float formatting.
+  let m = (n * 1000 + 127) div 255                # 0..1000, rounded
+  var frac = $m
+  while frac.len < 3: frac = "0" & frac
+  while frac.len > 1 and frac[frac.len - 1] == '0':
+    frac = frac[0 .. frac.len - 2]
+  "0." & frac
+
+proc swColorText(fmt: string; hasA: bool; r, g, b, a: float32): string =
+  ## THE ONE WRITER. Emits the shape the OWNING MOD declared, because the mod's
+  ## own reader is the thing that has to parse it back -- writing `#rrggbb` for
+  ## every row (what this path did before) silently reverted every `rgb` and
+  ## every bare-`hex` setting on its next read. Alpha is emitted only when the
+  ## stored value carried one; it is never invented.
+  if fmt == cSwColorFmtHex or fmt == cSwColorFmtHexHash:
+    let h = swColorHex(r, g, b)                   # always "#rrggbb"
+    var body = h[1 .. h.len - 1]
+    if hasA:
+      let ah = swColorHex(a, a, a)
+      body = body & ah[1 .. 2]
+    return (if fmt == cSwColorFmtHexHash: "#" & body else: body)
+  result = swColorChan01(r) & "," & swColorChan01(g) & "," & swColorChan01(b)
+  if hasA: result = result & "," & swColorChan01(a)
+
+proc swJsonQuote(s: string): string =
+  ## `modSetQueueWrite` takes a JSON LITERAL, not a bare value -- its own
+  ## docstring says so, and the colour path was handing it `#rrggbb`, producing
+  ## `{"key":"...","value":#E6463C}`, which is not JSON at all. Colours are
+  ## strings on the wire, so they must arrive quoted.
+  result = "\""
+  for ch in s:                                    # capped: a settings value
+    if ch == '"' or ch == '\\': result.add '\\'
+    result.add ch
+  result.add '"'
 
 proc swColorNear(a, b: float32): bool =
   ## Same 8-bit colour? Compared at the resolution the value is STORED at, not
@@ -1021,16 +1129,22 @@ proc swReadBackPage(page: var SwPage) =
            not swColorNear(lb, page.rows[i].cb):
           let was = swColorHex(page.rows[i].cr, page.rows[i].cg,
                                page.rows[i].cb)
-          let now = swColorHex(lr, lg, lb)
+          # The LOG line stays `#rrggbb` (one readable form for a human), but
+          # what is PERSISTED is the mod's own declared shape.
+          let nowLog = swColorHex(lr, lg, lb)
+          let now = swColorText(page.rows[i].cfmt, page.rows[i].cHasA,
+                                lr, lg, lb, page.rows[i].ca)
           okLog "settings pages: row '" & page.rows[i].key & "' changed " &
-                was & " -> " & now & " in game"
+                was & " -> " & nowLog & " in game (persisted as " &
+                (if page.rows[i].cfmt.len > 0: page.rows[i].cfmt
+                 else: cSwColorFmtRgb) & ": " & now & ")"
           if page.modGuid.len > 0:
             # THE ONLY PERSISTENCE PATH, and the one that matters: this POSTs
             # to `/aowlspt/settings/<guid>`, which is what runs the mod's
             # `onSettingsApplied`. A value stored without that hook changes a
             # file and nothing else -- the setting appears to work and does
             # nothing, which is worse than a row that says it is not wired.
-            modSetQueueWrite(page.modGuid, page.rows[i].key, now)
+            modSetQueueWrite(page.modGuid, page.rows[i].key, swJsonQuote(now))
             page.rows[i].cr = lr
             page.rows[i].cg = lg
             page.rows[i].cb = lb

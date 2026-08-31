@@ -669,10 +669,45 @@ proc cwVerdict(): string =
            "(settingsColorWidget), so nothing was built and nothing was " &
            "examined. That is not a pass."
   if gCwBuilt == 0:
-    return "colorwidget VERDICT = INCONCLUSIVE -- no colour widget has been " &
-           "built (refused=" & $gCwRefused & "). Either no schema on any " &
-           "rendered page carries a `color` row, or the settings screen has " &
-           "not been opened. Nothing was examined; that is not a pass."
+    # THE THREE CAUSES, SEPARATED. This branch used to say "either ... or ...",
+    # which reads as a mystery and cost a whole session: the true cause was the
+    # first one below, and it is a PRECONDITION the host can simply state.
+    # `swkColor` rows exist only on MOD pages, and mod pages exist only if
+    # `modSettingsRender` fetched them -- the built-in host page is bools only.
+    if not gModSetOn:
+      return "colorwidget VERDICT = INCONCLUSIVE -- PRECONDITION NOT MET: " &
+             "`modSettingsRender` is OFF, so no mod schema was ever fetched " &
+             "and the only registered page is the host-flags page, which is " &
+             "toggles only. NO `color` ROW CAN EXIST in this configuration, " &
+             "so this feature was never asked to build anything. Turn " &
+             "modSettingsRender on (with settingsPages) and re-open Settings. " &
+             "Nothing was examined; that is not a pass. (built=0 refused=" &
+             $gCwRefused & " colourRowsSeen=" & $gModSetColorRowsSeen & ")"
+    if gModSetPagesParsed == 0:
+      return "colorwidget VERDICT = INCONCLUSIVE -- `modSettingsRender` is on " &
+             "but NOT ONE mod schema has parsed yet, so no page could carry a " &
+             "colour row. This is a fetch problem, not a colour problem -- see " &
+             "the `mod settings render:` lines above. Nothing was examined; " &
+             "that is not a pass. (built=0 refused=" & $gCwRefused & ")"
+    if gModSetColorRowsSeen == 0:
+      return "colorwidget VERDICT = INCONCLUSIVE -- " & $gModSetPagesParsed &
+             " mod schema(s) parsed and NOT ONE carried a `color` row, so " &
+             "there was nothing for this feature to build. That is a claim " &
+             "about the SCHEMAS, not about this code. Nothing was examined; " &
+             "that is not a pass. (built=0 refused=" & $gCwRefused & ")"
+    if gModSetColorRowsRefused >= gModSetColorRowsSeen:
+      return "colorwidget VERDICT = FAIL -- all " & $gModSetColorRowsSeen &
+             " colour row(s) seen were REFUSED by the value parser and " &
+             "demoted to unbound text rows, so no widget was ever built. The " &
+             "row labels above carry the value that would not parse. " &
+             "(built=0 refused=" & $gCwRefused & " parserRefused=" &
+             $gModSetColorRowsRefused & ")"
+    return "colorwidget VERDICT = INCONCLUSIVE -- " & $gModSetColorRowsSeen &
+           " colour row(s) reached the renderer and " &
+           $(gModSetColorRowsSeen - gModSetColorRowsRefused) & " parsed, but " &
+           "no widget has been built (refused=" & $gCwRefused & "). The " &
+           "settings screen has most likely not been opened on the tab these " &
+           "pages render onto. Nothing was examined; that is not a pass."
   var live = 0
   var mismatched = 0
   var unreadable = 0
