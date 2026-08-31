@@ -46,6 +46,14 @@ const
   cModSetPollMs = 300       ## floored to 250 by `aowl_ov_sync_start` anyway
   cModSetMaxFaults = 4      ## faults across the whole feature, not per mod
   cModSetStallMs = 8000'u64 ## no answer in this long on one step -> give up
+  cModSetTotalBorrowMs = 6000'u64
+    ## ...and no more than this for the WHOLE cycle, however many steps stall.
+    ## MEASURED: `cModSetStallMs` is per STEP, and three mods each burning the
+    ## full 8s held the shared slot from 0:00:02.1 to 0:00:26.5 -- 24 seconds
+    ## during which `modSetOwnsSlot` gates `takeModSet` off and live mod
+    ## control is blind. That starvation, not the parse, is what moved a mod
+    ## `FreeLibrary` from 4.8s into the character-select transition in two
+    ## crash runs. A per-step budget cannot bound the borrow; only this can.
   ## Measured live (coordinator report): the worker took ~2.1s of
   ## changeover latency before it fired the FIRST request for a newly
   ## armed path, on top of its own ~375ms poll cadence -- the budget must
@@ -117,6 +125,9 @@ var gModSetStagedTotal = 0
 var gModSetDrained = 0
 var gModSetXsWitness = false
   ## One-shot: has the character-select transition been observed from here?
+var gModSetCycleAt = 0'u64
+  ## When the CYCLE (not the step) first took the shared slot.
+var gModSetWaitLogged = false
 
 proc modSetStage(p: SwPage) =
   ## Hand one parsed page to the Unity thread. Bounded by the same ceiling the
@@ -469,11 +480,61 @@ proc modSetTickInner(now: uint64) =
     # borrow. Declines rather than spins.
     modSetFinish("no backend configured")
     return
+  # THE WHOLE-CYCLE DEADLINE. See `cModSetTotalBorrowMs`. Checked before the
+  # step, so an over-long borrow ends on the very next tick rather than after
+  # the step in progress has spent its own 8s.
+  if gModSetPhase != msIdle and gModSetCycleAt > 0'u64 and
+     now - gModSetCycleAt > cModSetTotalBorrowMs:
+    modSetFault("the whole fetch cycle has held the shared sync slot for " &
+                $(now - gModSetCycleAt) & "ms, over the " &
+                $cModSetTotalBorrowMs & "ms ceiling. MEASURED CONSEQUENCE: " &
+                "while this feature owns the slot, `takeModSet` is gated off " &
+                "and live mod control is BLIND -- in two crash runs that " &
+                "delayed a mod unload (FreeLibrary) from 4.8s into the " &
+                "character-select transition at 29.5s. Giving the slot back " &
+                "now matters more than the pages not yet fetched")
+    modSetFinish("whole-cycle borrow ceiling reached")
+    return
   case gModSetPhase
   of msDone:
     discard
   of msIdle:
+    # DO NOT BORROW THE SLOT BEFORE THE MENU IS UP. Measured, from
+    # `aowlspt-host.crash1.log` and `aowlspt-host.prev2.log` (two independent
+    # crash runs with this flag on) against the surviving flag-off run:
+    #
+    #   flag OFF: "unloaded Textures"/"unloaded Call Proof" at 0:00:04.843,
+    #             during the loading screen. Client lives.
+    #   flag ON : the same two unloads at 0:00:29.797 / 0:00:29.484, i.e.
+    #             INSIDE the character-select -> main-menu transition. Client
+    #             dies 0.4-1.0s later, both times, with no managed exception.
+    #
+    # The delta is not the parse and not a bad offset: it is that this feature
+    # armed the shared slot at 0:00:02.1 and held it to ~0:00:26.5 (three mods
+    # each burning the full 8s stall budget), during which `modSetOwnsSlot`
+    # gates `takeModSet` off and mod control cannot see its desired set. The
+    # backend's unload instruction was therefore delivered ~25s late, and a
+    # `FreeLibrary` of two mod DLLs landed in the middle of a scene teardown.
+    #
+    # So: wait for the menu. `gModeSkipSubmits` (modeskip.nim) is incremented
+    # when the profile/mode screen has been answered, which is the transition
+    # that was being damaged. After it, mod control has already drained its
+    # backlog and borrowing the slot costs it nothing that matters.
+    if gModeSkipSubmits <= 0:
+      if not gModSetWaitLogged:
+        gModSetWaitLogged = true
+        okLog "mod settings render: NOT arming yet -- the character/mode " &
+              "screen has not been answered. Borrowing the shared sync slot " &
+              "before that starves live mod control and pushes its mod " &
+              "load/unload work into the menu transition, which took the " &
+              "client down twice. This is a DEFERRAL, not a decline: the " &
+              "arm happens on the first tick after Submit and says so."
+      return
     gModSetStep = "msIdle: arming the index fetch"
+    gModSetCycleAt = now
+    okLog "mod settings render: the character/mode screen has been answered " &
+          "(Submit #" & $gModeSkipSubmits & "); THE DEFERRED ARM IS FIRING " &
+          "NOW. Whole-cycle borrow ceiling " & $cModSetTotalBorrowMs & "ms."
     gModSetPhase = msIndex
     gModSetArmedAt = now
     gModSetArmedAttempts = overlaySyncAttempts()
