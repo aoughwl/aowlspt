@@ -44,6 +44,7 @@ import production
 import gym
 import customise
 import tuning
+import svm
 import globalsgaps
 import itemsgaps
 import itemsadd
@@ -108,6 +109,10 @@ proc selfCheckFailures*(): seq[string] =
   # READS BACK correct -- not that the write happened, which is the check that
   # cannot fail. `spawn` proves every refusal path carries a reason.
   discard tuning.selfCheckTuning(result)
+  # `svm` proves the OTHER half of the SVM surface -- the rows that are not in
+  # globals.config. Its ledger assertion is the falsifiable one: add a key to
+  # `SvmKeys` that `applySvmSettings` does not read and this goes red naming it.
+  svm.selfCheckSvm(result)
   # `globalsgaps` proves the twelve config members REAL BSG sends and our
   # pre-1.0 database does not are actually PRESENT in the finished document --
   # a negative over the merged text, plus the two ways a merge silently lies

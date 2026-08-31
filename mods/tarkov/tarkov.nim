@@ -83,6 +83,7 @@ import emu/globalsgaps # the config members REAL BSG sends and db.json lacks
 import emu/itemsgaps # the `_props` members REAL BSG sends and db.json lacks
 import emu/itemsadd  # the WHOLE item templates BSG serves and db.json lacks
 import emu/tuning   # the globals overrides -- the settings that reach the CLIENT
+import emu/svm      # the SVM rows that are NOT globals.config, + the read ledger
 import emu/spawn    # spawning items into a stash from the settings page
 
 const
@@ -3794,6 +3795,14 @@ proc tarkovSchema(): seq[Setting] =
                category = "Progression/Player",
                description = "aowlspt original (server emulator); acts on the SPT-derived database. Raise the character to at least this level. The client derives the level it draws from Info.Experience against globals.config.exp.level.exp_table and does not trust Info.Level, so this writes the matching EXPERIENCE (emu/progression.xpForLevel) and sets Info.Level alongside it. 0 is off; 79 is the length of the exp table on this database"),
 
+    # The exact-XP row the old profile managers had. Not a duplicate of the row
+    # above: the level row snaps to an exp-table boundary, this one sets a
+    # number in between, and Info.Level is re-DERIVED from it rather than typed.
+    intSetting("progressionExperience", "Experience (exact)", 0,
+               lo = 0, hi = 100000000, step = 10000,
+               category = "Progression/Player",
+               description = "aowlspt original (server emulator); acts on the SPT-derived database. Raise Info.Experience to at least this number, and re-derive Info.Level from it against globals.config.exp.level.exp_table (emu/progression.levelForXp). A floor, like every row on this page: a profile already above it is untouched, and setting it back to 0 takes nothing away. 0 is off"),
+
     intSetting("progressionSkillLevel", "Skill level", 0, lo = 0, hi = 51,
                category = "Progression/Skills",
                description = "aowlspt original (server emulator); acts on the SPT-derived database. Raise every skill the profile already carries to at least this level, by writing Skills.Common[].Progress = level x 100. 51 is elite. Only ids ALREADY on the profile are touched, so this cannot reintroduce one of the 17 pre-1.0 ids the client answers \\\"Can't find skill to upgrade\\\" for. 0 is off"),
@@ -3874,6 +3883,43 @@ proc tarkovSchema(): seq[Setting] =
     stringSetting("mapsLockResult", "Last lock result", "",
                   category = "Maps",
                   description = "aowlspt original (server emulator); acts on the SPT-derived database. What the last apply did: how many maps were locked and unlocked, how many database writes succeeded, and any map name in the two lists above that resolved to NO map -- which is the case where the setting saves cleanly and locks nothing"),
+
+    # ---- raid timing and extracts (emu/svm -> emu/raid) ------------------
+    #
+    # These edit the LOCATION document, and are applied where that document is
+    # BUILT rather than written into the database, for the reason emu/maplock's
+    # header records in full: /client/locations is answered out of the post-1.0
+    # table, so 19 successful database writes were served to nobody.
+    floatSetting("raidTimeMultiplier", "Raid time multiplier", 1.0,
+                 lo = 0.1, hi = 10.0, step = 0.1, category = "Raid/Timing",
+                 description = "aowlspt original (server emulator); acts on the SPT-derived database. Scales every map's own EscapeTimeLimit (and EscapeTimeLimitCoop / EscapeTimeLimitPVE where the map has them) in the document /client/locations serves. Per map, not a flat number: Factory's 20 minutes and Streets' 50 stay in proportion. 1.0 is stock and costs nothing -- no location document is touched at all"),
+    intSetting("raidTimeMinutes", "Raid time (fixed minutes)", 0,
+               lo = 0, hi = 600, step = 5, category = "Raid/Timing",
+               description = "aowlspt original (server emulator); acts on the SPT-derived database. An ABSOLUTE raid length for every map, in minutes, overriding the multiplier above. 0 is off, which is what leaves the multiplier in charge"),
+
+    boolSetting("extractsAlwaysAvailable", "All extracts always available",
+                false, category = "Raid/Extracts",
+                description = "aowlspt original (server emulator); acts on the SPT-derived database. Sets every exit's Chance and ChancePVE to 100 in the served location document, so no extract is rolled away for the raid. Does NOT remove an extract's requirement -- that is the next row, and they are different fields"),
+    boolSetting("extractsNoRequirements", "Remove extract requirements", false,
+                category = "Raid/Extracts",
+                description = "aowlspt original (server emulator); acts on the SPT-derived database. Sets every exit's PassageRequirement to \\\"None\\\" and clears its RequirementTip, so a co-op / train / item-gated exfil opens without the condition. Measured shapes from data/post1/locations.json: PassageRequirement is a string (\\\"Train\\\", \\\"TransferItem\\\"), RequirementTip a string"),
+    boolSetting("extractsNoTimeWindow", "Extracts open for the whole raid",
+                false, category = "Raid/Extracts",
+                description = "aowlspt original (server emulator); acts on the SPT-derived database. Sets every exit's MinTime/MinTimePVE to 0 and MaxTime/MaxTimePVE wide open, so an exfil that only exists in the last ten minutes exists from the start. Seconds, per the served document"),
+    stringSetting("raidTuneResult", "Last raid tune result", "",
+                  category = "Raid/Extracts",
+                  description = "aowlspt original (server emulator); acts on the SPT-derived database. Written BY the server: what the raid rows are set to, and how many map bases and exits have actually been rewritten while building a served location document. Zero maps tuned with the rows switched on means no client has fetched /client/locations since the apply -- not that the rows did nothing"),
+
+    # ---- stash size (emu/svm) -------------------------------------------
+    intSetting("stashRows", "Stash rows", 0, lo = 0, hi = 500, step = 5,
+               category = "Profile/Stash",
+               description = "aowlspt original (server emulator); acts on the SPT-derived database. Sets cellsV on the first grid of all five edition stash templates (Standard 30, Left Behind 40, Prepare to Escape 50, Edge of Darkness 68, Unheard 72), which /client/items serves and which the server's own item placement reads back through emu/grid.stashGrid. Each id is checked against the stash _parent before it is written. 0 leaves every stash exactly as the database has it"),
+    intSetting("stashCols", "Stash columns", 0, lo = 0, hi = 50, step = 1,
+               category = "Profile/Stash",
+               description = "aowlspt original (server emulator); acts on the SPT-derived database. Sets cellsH the same way. NARROWING a stash that already holds items leaves items outside the grid, which the client draws where it cannot be picked up -- widening is safe, narrowing is not. 0 leaves it alone (every stash is 10 wide)"),
+    stringSetting("stashResult", "Last stash result", "",
+                  category = "Profile/Stash",
+                  description = "aowlspt original (server emulator); acts on the SPT-derived database. Written BY the server, and READ BACK from the database rather than reported from the write: how many of the five stash templates now report the requested size, naming any that does not, any id that is not a stash on this database, and any with no usable Grids"),
 
     # ---- item spawning -------------------------------------------------
     #
@@ -4126,6 +4172,15 @@ proc onTarkovApply(key: string) =
   if key == "mapsUnlockedByDefault" or key == "mapsLocked" or
      key == "mapsUnlocked":
     applyMapLockSettings()
+  # The four SVM rows that are not globals.config. One call reads ALL of them
+  # -- the stash pair, the exact-XP row and the five raid rows -- because
+  # `emu/svm`'s read ledger is what proves each key is consulted, and a
+  # per-key branch here would be a second place for a key to go missing from.
+  # Cheap: every row is off by default and `applyStashSize`/`setRaidTunePolicy`
+  # return without touching a document when nothing is configured.
+  if key.startsWith("stash") or key.startsWith("raid") or
+     key.startsWith("extracts") or key == "progressionExperience":
+    applySvmSettings()
   if key.startsWith("progression"):
     configureProgression(setting("progressionPlayerLevel").asInt(0),
                          setting("progressionSkillLevel").asInt(0),
@@ -4373,6 +4428,9 @@ proc onLoad(): Status =
   discard applySetting("lootSummary", jstr(lootConfigSummary()).text)
 
   applyMapLockSettings()
+  # The non-globals SVM rows: stash size, exact XP, raid time, extracts. One
+  # call, which is also the ledger's first run -- see `emu/svm`.
+  applySvmSettings()
   configureMarket(setting("fleaSpreadPercent").asInt(20),
                   setting("fleaOfferHours").asInt(12),
                   setting("fleaMaxOffers").asInt(600),
@@ -4404,6 +4462,19 @@ proc onLoad(): Status =
   for bad in rejected:
     warn "singleplayer: refusing a modifier whose value is not a JSON " &
          "literal: " & bad
+
+  # The non-globals SVM rows say what they did, for the same reason the globals
+  # ones do: a modifier that applied silently is indistinguishable from one that
+  # did not apply. The ledger line is the falsifiable half -- it names any key
+  # the schema declares and the server never read.
+  info "singleplayer: " & svmLedgerLine()
+  let svmNever = svmLedgerNeverRead()
+  if svmNever.len > 0:
+    for k in svmNever:
+      warn "singleplayer: SVM key declared and NEVER READ: " & k
+  if stashReport().len > 0:
+    info "singleplayer: " & stashReport()
+  info "singleplayer: " & raidTuneReport()
 
   # The emulator's own settings page, registered before the store gate below so
   # it answers even on a host where the emulator refuses to serve anything else.
