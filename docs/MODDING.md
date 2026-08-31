@@ -33,6 +33,16 @@ aowl doctor                          # once, before anything else
 aowl build-mod examples/highlevel
 ```
 
+That is the **client** half — a mod reaching into the running game. If what you
+want is a **server** mod — a new trader, a new quest, changed item stats, a new
+route — read `mods/admintrader/` first. It is a complete, commented, working
+example (a trader who sells everything for free and gives out one quest), its
+`README.md` is a tutorial rather than a reference, and it is short because the
+server-side mechanism is small: `mods/tarkov` serves traders and quests straight
+out of the loaded database, so a mod adds one by writing JSON at
+`traders.<id>` / `templates.quests.<id>` with `dbWrite`. There is no trader API
+to learn, and there is not meant to be one.
+
 `aowl doctor` checks the toolchain, and every check in it is there because
 something actually went wrong and pointed somewhere else when it did: nimony
 present, ucrt64 gcc present, `ld.lld` present (nimony passes `-fuse-ld=lld` on

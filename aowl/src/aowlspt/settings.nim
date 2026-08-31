@@ -882,3 +882,45 @@ proc declareSettings*(settings: seq[Setting]; inIndex = true) =
     discard on(SettingsPageQuery, onPageQuery)
     discard on(SettingsApplyQuery, onApplyQuery)
     gBusSubscribed = true
+
+# ---------------------------------------------------------------------------
+# The two HTTP routes, which every server mod was writing out by hand
+# ---------------------------------------------------------------------------
+
+proc onSettingsRoute(url, body, session: string): string =
+  result = declaredSchemaReply(applySettingFromBody(body)).text
+
+proc onSettingsResetRoute(url, body, session: string): string =
+  result = declaredSchemaReply(resetFromBody(body)).text
+
+proc serveSettingsRoutes*(): Status =
+  ## Register `/aowlspt/settings/<guid>` and `/aowlspt/settings/<guid>/reset`
+  ## with the standard handlers.
+  ##
+  ## This existed already, four times, copied by hand: `mods/waypoints`,
+  ## `mods/tarkov` and the rest each wrote the same two three-line handlers and
+  ## the same two `serve` calls. Copied boilerplate is where the drift lives --
+  ## a mod that spelled the route `/aowlspt/settings/<guid>/` with a trailing
+  ## slash, or forgot the reset half, gets a settings page whose controls store
+  ## nothing, and nothing anywhere says so.
+  ##
+  ## Call it AFTER `declareSettings`, from `onLoad`, on the server side. It is
+  ## a no-op returning `Ok` when this mod declared no settings, so it is safe
+  ## to call unconditionally.
+  ##
+  ## Not folded into `declareSettings` itself, deliberately: `declareSettings`
+  ## is called on the client side too, where there is no route table, and a mod
+  ## that already registers these routes by hand would double-register and get
+  ## a conflict it did not ask for.
+  if gDeclared.len == 0:
+    return Ok
+  let base = "/aowlspt/settings/" & modGuid()
+  result = serve(base, onSettingsRoute)
+  if result != Ok:
+    warn "settings: could not register " & base &
+         " -- this mod's settings page will not store anything"
+    return
+  let r = serve(base & "/reset", onSettingsResetRoute)
+  if r != Ok:
+    warn "settings: could not register " & base & "/reset -- Reset will fail"
+    return r
