@@ -588,22 +588,22 @@ proc clsName*(c: int): string =
   of ClsBoss:  "boss"
   else:        "unknown"
 
+{.emit: """#include "aowlspt_wildspawn.h" """.}
+
+proc cRoleIsBossTier(role: int32): int32 {.
+  importc: "aowl_role_is_boss_tier", nodecl.}
+
 proc roleIsBossTier(role: int32): bool =
   ## EFT.WildSpawnType members whose contact is a boss or a boss's escort, by
   ## NUMERIC VALUE from the enum dump -- never by a substring of a name. The
-  ## ESP's `neFactionOf` matches on the substrings "boss"/"raider"/"rogue"/
-  ## "follower", which silently misses `exUsec` (24, the Rogues) and `pmcBot`
-  ## (9, the Raiders) because neither name contains its own faction's word.
-  ## Listing the values is longer and cannot drift.
-  case int(role)
-  of 2, 3, 6, 7, 11, 17, 22, 26, 29, 32, 36, 43, 47,
-     65, 66, 76, 77:                                    true  # boss*
-  of 4, 5, 8, 12, 13, 14, 15, 16, 23, 27, 28, 30, 33,
-     41, 42, 44, 45, 67, 78:                            true  # follower*
-  of 20, 21, 39, 57, 58, 59:                            true  # sectant* (cultists)
-  of 9, 79:                                             true  # pmcBot* -- Raiders
-  of 24:                                                true  # exUsec  -- Rogues
-  else:                                                 false
+  ## values themselves now live in `abi/aowlspt_wildspawn.h`, ONCE, and the
+  ## host's native ESP calls the same function: the ESP used to match on the
+  ## substrings "boss"/"raider"/"rogue"/"follower", which silently missed
+  ## `exUsec` (24, the Rogues) and `pmcBot` (9, the Raiders) because neither
+  ## name contains its own faction's word. That is fixed there, and the table
+  ## was moved here rather than copied so the two cannot drift apart: two
+  ## tables that agree today disagree after the next enum addition.
+  cRoleIsBossTier(role) != 0'i32
 
 const
   MaxEntities* = 128
