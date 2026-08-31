@@ -36,6 +36,7 @@
   "containerFillMultiplier": 1.0,
   "containerMaxItems": 64,
   "containerTypeChances": "",
+  "containerTypeFill": "",
 
   "looseLootEnabled": true,
   "lootForcedSpawns": true,
@@ -72,6 +73,8 @@
   "lootWeightTools": 1.0,
   "lootWeightSpecial": 1.0,
   "lootCategoryWeights": "",
+  "lootRuleExplain": "",
+  "lootRules": "",
 
   "_moneyComment": "The currency mix and the stack range. MEASURED off this install's db.json: Rubles 5449016a4bdc2d6f028b456f spawn 5500..13500 (cap 1000000), Dollars 5696686a4bdc2da3298b456a 45..100 (cap 50000), Euro 569668774bdc2da2298b4568 35..90 (cap 50000); all three have _parent 543be5dd4bdc2deb348b4569 (Money). The three moneyStack* keys are read by BOTH generators -- emu/loot's world stack roller and emu/bots.randomStackCount, which is where the single-dollar drop was fixed -- through the shared emu/knobs.moneyStackConfig, so one row governs money on the floor and money in a scav's pocket.",
   "lootCurrencyRoubles": 1.0,
@@ -156,6 +159,8 @@
   "lootStackMaxFraction": 1.0,
 
   "lootPerMapMultipliers": "",
+  "looseLootPerMap": "",
+  "staticLootPerMap": "",
 
   "fleaSpreadPercent": 20,
   "fleaOfferHours": 12,
