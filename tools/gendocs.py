@@ -23,10 +23,14 @@ Inputs (all relative to the repo root):
 """
 
 import argparse
+import glob
 import json
 import os
 import re
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import nimapi  # noqa: E402  (sibling module, not a package)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -509,6 +513,390 @@ def page_mod(m):
 
 
 # --------------------------------------------------------------------------
+# The Nim mod API
+# --------------------------------------------------------------------------
+
+# The order a mod author meets these, not alphabetical: what you serve, what you
+# store, what you show, then the machinery underneath.
+API_ORDER = [
+    "server", "settings", "trader", "json",
+    "game", "capability", "callrva", "callproof", "il2cpp", "abi",
+    "fast", "botnav", "menutext", "ctext", "fixture", "sync",
+]
+
+API_BLURB = {
+    "server": "HTTP routes and the loaded database — `serve`, `dbRead`, `dbWrite`, `dbKeys`, and the JSON builders a handler returns.",
+    "settings": "Declaring a mod's settings, and reading them back.",
+    "trader": "Trader inventories, assortments and prices.",
+    "json": "Parsing and building JSON.",
+    "game": "The managed object surface — `GameType`, `GameObj`, and invoke/get/set.",
+    "capability": "What the host will and will not let a mod do.",
+    "callrva": "Byte-verified calls to a managed method at a static RVA.",
+    "callproof": "Proving a call target is what its name claims before calling it.",
+    "il2cpp": "The IL2CPP runtime surface the layers above are built on.",
+    "abi": "The nimony side of the host C ABI.",
+    "fast": "The hot-path helpers that must not allocate per frame.",
+    "botnav": "Bot navigation.",
+    "menutext": "Reading and writing menu text.",
+    "ctext": "C string interop.",
+    "fixture": "Test fixtures.",
+    "sync": "Main-thread synchronisation.",
+}
+
+
+def collect_api():
+    """Parse every module under aowl/src/aowlspt/, in the order above."""
+    found = {}
+    for p in sorted(glob.glob(os.path.join(ROOT, "aowl", "src", "aowlspt", "*.nim"))):
+        m = nimapi.parse(p)
+        m["rel"] = rel(p)
+        found[m["module"]] = m
+    ordered = [found[n] for n in API_ORDER if n in found]
+    ordered += [found[n] for n in sorted(found) if n not in API_ORDER]
+    return ordered
+
+
+def _entry_md(e, relpath, kind):
+    """One routine / type / const, with its signature and its source line.
+
+    The `file:line` is not decoration. It is the whole reason to trust the page:
+    every claim on it can be checked against the file it was taken from.
+    """
+    out = ["#### `%s`\n" % e["name"]]
+    body = e["signature"] if kind == "routine" else e["definition"]
+    out.append(fenced(body, "nim"))
+    out.append("")
+    if e["doc"]:
+        out.append(md_safe(e["doc"]))
+        out.append("")
+    out.append("<small>`%s:%d`</small>\n" % (relpath, e["line"]))
+    return "\n".join(out)
+
+
+def page_api_index(mods):
+    out = [GENERATED_BANNER, "# The mod API\n",
+           "Every exported symbol of `aowl/src/aowlspt/*.nim` — the library a mod",
+           "is written against — extracted from the source by `tools/gendocs.py`.",
+           "Signatures are lifted verbatim; nothing on these pages is retyped, so",
+           "nothing on them can drift away from the code while still reading as",
+           "authoritative.\n",
+           "Only **exported** symbols appear (a `*` on the name). An unexported proc",
+           "is not API and is deliberately absent.\n",
+           "Overloads are listed separately rather than merged, because in this",
+           "codebase they differ in behaviour — `server.put` has five, and collapsing",
+           "them would hide the thing a caller has to choose between.\n",
+           "| Module | Exports | What it is |", "| --- | --- | --- |"]
+    tr = tt = tc = 0
+    for m in mods:
+        n = len(m["routines"]) + len(m["types"]) + len(m["consts"])
+        tr += len(m["routines"])
+        tt += len(m["types"])
+        tc += len(m["consts"])
+        out.append("| [`aowlspt/%s`](./api/%s) | %d | %s |"
+                   % (m["module"], m["module"], n,
+                      md_safe(API_BLURB.get(m["module"], "UNKNOWN — no blurb recorded."))))
+    out.append("")
+    out.append("**Totals:** %d modules, %d routines, %d types, %d constants."
+               % (len(mods), tr, tt, tc))
+    unp = sum(m["unparsed"] for m in mods)
+    out.append("")
+    out.append("Declarations the extractor could not read back: **%d**. "
+               "It drops those rather than printing a guessed signature, and "
+               "prints the count here so a silent loss is impossible." % unp)
+    return "\n".join(out) + "\n"
+
+
+def page_api_module(m):
+    out = [GENERATED_BANNER, "# `aowlspt/%s`\n" % m["module"],
+           "<small>Source: `%s` — %d lines.</small>\n" % (m["rel"], m["lines"])]
+    if m["doc"]:
+        out.append(md_safe(m["doc"]))
+        out.append("")
+    else:
+        out.append("The module has no top-level doc comment. UNKNOWN — this "
+                   "generator will not invent one.\n")
+    for title, key, kind in (("Types", "types", "type"),
+                             ("Constants", "consts", "const"),
+                             ("Routines", "routines", "routine")):
+        if not m[key]:
+            continue
+        out.append("## %s\n" % title)
+        for e in m[key]:
+            out.append(_entry_md(e, m["rel"], kind))
+    return "\n".join(out) + "\n"
+
+
+# --------------------------------------------------------------------------
+# The automation library
+# --------------------------------------------------------------------------
+
+AUTOSCRIPT = os.path.join(ROOT, "tools", "autoscript.nim")
+SCRIPTS_DIR = os.path.join(ROOT, "scripts")
+
+
+def page_automation_verbs():
+    """Every exported verb of the automation library, from autoscript.nim.
+
+    The prose reference (docs/AUTOMATION-API.md, mirrored alongside) explains
+    what the verbs are FOR. This page exists so that the argument lists on that
+    page can be checked against the ones the compiler actually sees.
+    """
+    if not os.path.exists(AUTOSCRIPT):
+        return None
+    m = nimapi.parse(AUTOSCRIPT)
+    m["rel"] = rel(AUTOSCRIPT)
+    out = [GENERATED_BANNER, "# Automation — the verb index\n",
+           "Every exported symbol of `%s`, extracted from source." % m["rel"],
+           "This is the *signature* index; the narrative reference with failure",
+           "modes, the wire format and the refusal table is",
+           "[the automation API](./api).\n",
+           "If a signature here disagrees with one over there, **this page is the**",
+           "**one to believe** — it was read out of the file, not typed.\n"]
+    if m["doc"]:
+        out.append(md_safe(m["doc"]))
+        out.append("")
+    for title, key, kind in (("Types", "types", "type"),
+                             ("Constants", "consts", "const"),
+                             ("Verbs", "routines", "routine")):
+        if not m[key]:
+            continue
+        out.append("## %s\n" % title)
+        for e in m[key]:
+            out.append(_entry_md(e, m["rel"], kind))
+    return "\n".join(out) + "\n"
+
+
+def page_automation_scripts():
+    """The reference scripts, in full.
+
+    A worked script is the fastest way into this library and there are only
+    four, so they are reproduced whole rather than excerpted. Excerpts of
+    example code are how an example stops compiling.
+    """
+    paths = sorted(glob.glob(os.path.join(SCRIPTS_DIR, "*.nim")))
+    if not paths:
+        return None
+    out = [GENERATED_BANNER, "# Automation — the reference scripts\n",
+           "The scripts in `scripts/` of the aowlspt repo, reproduced in full and",
+           "verbatim. They are the working examples the library is exercised",
+           "against, so they are the ones that are known to compile.\n"]
+    for p in paths:
+        with open(p, "r", encoding="utf-8", errors="replace") as f:
+            body = f.read()
+        out.append("## `%s`\n" % rel(p))
+        out.append(fenced(body.rstrip("\n"), "nim"))
+        out.append("")
+    return "\n".join(out) + "\n"
+
+
+# --------------------------------------------------------------------------
+# Mirroring internal documents
+# --------------------------------------------------------------------------
+#
+# The aowlspt repo is PRIVATE and the docs site is PUBLIC, so copying a file
+# across is a publication decision, not a build step. Two things follow.
+#
+# First: the mirror SCRUBS machine-local paths, which are noise to a reader and
+# tell a stranger the layout of someone's disk.
+#
+# Second, and non-negotiable: it REFUSES to emit a page still carrying a
+# personal email address. The pattern is assembled at runtime from parts and is
+# never written out literally anywhere in this file, because a guard that spells
+# the string it is guarding has already leaked it. Refusal is loud and fails the
+# whole run -- a scrubber that silently drops a page is the same defect class as
+# a check that cannot fail.
+
+_D = "mumford" + "and" + "miller" + "." + "com"
+PRIVATE_EMAIL_RE = re.compile(
+    r"[A-Za-z0-9._%%+-]*@?[A-Za-z0-9.-]*%s" % re.escape(_D), re.I)
+
+HOMEPATH_RE = re.compile(r"[A-Za-z]:[\\/]+Users[\\/]+[A-Za-z0-9._-]+", re.I)
+WEBHOOK_RE = re.compile(r"https?://(?:\w+\.)?discord(?:app)?\.com/api/webhooks/\S+", re.I)
+
+# Which internal documents are published, and where they land. A file not in
+# this list is not published -- the default is closed.
+MIRRORS = [
+    ("docs/AUTOMATION-API.md", "automation/api.md",
+     "The automation library — complete API reference"),
+    ("docs/PLAYER_ACTUATION.md", "automation/player-actuation.md",
+     "Player actuation"),
+    ("docs/INSPECTOR-VERBS.md", "automation/inspector-verbs.md",
+     "The live inspector — verb reference"),
+    ("docs/MOD-ENABLE-PATH.md", "internals/mod-enable-path.md",
+     "How a mod gets enabled"),
+    ("docs/BOTNAV.md", "internals/botnav.md", "Bot navigation"),
+    ("docs/BOT_AI_OBJECTIVES.md", "internals/bot-ai-objectives.md",
+     "Bot AI objectives"),
+]
+
+
+def vue_safe_markdown(text):
+    """Make a markdown document survive VitePress's Vue SFC compile.
+
+    VitePress compiles every page as a Vue single-file component, so a bare
+    `<int>` or `<ptr>` in prose is an unclosed element and fails the BUILD --
+    not the page, the build. Fenced and inline code are left alone because
+    VitePress already escapes them, and rewriting them would print `&lt;` to
+    the reader verbatim.
+
+    Also escapes `{{`, which Vue reads as an interpolation.
+    """
+    out = []
+    in_fence = False
+    fence = ""
+    for line in text.split("\n"):
+        m = re.match(r"^\s*(`{3,}|~{3,})", line)
+        if m:
+            tok = m.group(1)
+            if not in_fence:
+                in_fence, fence = True, tok[0] * len(tok)
+            elif tok.startswith(fence[0]) and len(tok) >= len(fence):
+                in_fence, fence = False, ""
+            out.append(line)
+            continue
+        if in_fence:
+            out.append(line)
+            continue
+        out.append(md_safe(line).replace("{{", "&#123;&#123;"))
+    return "\n".join(out)
+
+
+def mirror_doc(src_rel, title):
+    """Read, scrub, verify, and wrap one internal document. None if absent."""
+    path = os.path.join(ROOT, src_rel)
+    if not os.path.exists(path):
+        return None
+    body = read(path)
+
+    dropped = 0
+    if PRIVATE_EMAIL_RE.search(body):
+        # Drop the offending section wholesale rather than patching the line:
+        # a document that mentions the address is discussing it, and the
+        # surrounding paragraphs will discuss it too.
+        kept, section, hit = [], [], False
+        for line in body.split("\n"):
+            if re.match(r"^#{1,6} ", line):
+                if section and not hit:
+                    kept.extend(section)
+                elif section:
+                    dropped += 1
+                section, hit = [line], bool(PRIVATE_EMAIL_RE.search(line))
+                continue
+            section.append(line)
+            if PRIVATE_EMAIL_RE.search(line):
+                hit = True
+        if section and not hit:
+            kept.extend(section)
+        elif section:
+            dropped += 1
+        body = "\n".join(kept)
+
+    body = HOMEPATH_RE.sub("<HOME>", body)
+    body = WEBHOOK_RE.sub("<REDACTED-WEBHOOK>", body)
+
+    # Assert the FINISHED state, not the edit. A negative that can actually be
+    # falsified: nothing matching any of the three patterns survives.
+    for name, pat in (("a personal email address", PRIVATE_EMAIL_RE),
+                      ("a machine-local user path", HOMEPATH_RE),
+                      ("a webhook URL", WEBHOOK_RE)):
+        m = pat.search(body)
+        if m:
+            raise SystemExit(
+                "gendocs: REFUSING to publish %s -- %s survived scrubbing at "
+                "offset %d. Fix the source or the scrubber; do NOT relax this "
+                "check." % (src_rel, name, m.start()))
+
+    banner = (
+        "<!-- MIRRORED from `%s` in the aowlspt repo by tools/gendocs.py. -->\n"
+        "<!-- DO NOT EDIT HERE. Edit the source and re-run the generator. -->\n"
+        % src_rel)
+    note = (
+        "\n::: info Mirrored document\n"
+        "This page is copied verbatim from `%s` in the aowlspt repository and "
+        "regenerated by `tools/gendocs.py`. Edits made here are lost on the "
+        "next run.\n" % src_rel)
+    if dropped:
+        note += ("\n%d section(s) were withheld by the publication scrubber.\n"
+                 % dropped)
+    note += ":::\n\n"
+
+    return banner + note + vue_safe_markdown(body).rstrip("\n") + "\n"
+
+
+# --------------------------------------------------------------------------
+# The fact store
+# --------------------------------------------------------------------------
+
+FACTS_SRC = "docs/AOWL_FACTS.md"
+
+
+def facts_asset():
+    """The scrubbed fact dump, as a STATIC file rather than a page.
+
+    It is ~640 KB. Rendering that as a VitePress page means the reader waits for
+    the whole store to paint before they can read the first fact, and the build
+    carries it through the markdown pipeline for nothing. It is served as a raw
+    download and linked instead.
+    """
+    body = mirror_doc(FACTS_SRC, "fact store")
+    if body is None:
+        return None
+    # Strip the VitePress container syntax: this is served raw, not rendered.
+    return re.sub(r"^::: info.*?:::\n\n", "", body, flags=re.S)
+
+
+def page_facts():
+    path = os.path.join(ROOT, FACTS_SRC)
+    if not os.path.exists(path):
+        return None
+    body = read(path)
+    counts = dict(re.findall(r"^\| (facts|recipes|provenance rows|edges|scopes) \| (\d+) \|",
+                             body, re.M))
+    recipes = re.findall(r"^### `?([A-Za-z0-9_.:-]+)`?\s*$", body, re.M)
+    rec_section = re.search(r"^## Recipes\n(.*?)^## ", body, re.M | re.S)
+    rec_names = (re.findall(r"^### (.+)$", rec_section.group(1), re.M)
+                 if rec_section else [])
+    out = [GENERATED_BANNER, "# The fact store\n",
+           "A measured assertion with provenance, or a replayable procedure that",
+           "is known to work. The store exists because re-deriving a field offset",
+           "costs a session and looking one up costs a second.\n",
+           "**Read the method line.** `measured` means someone observed it.",
+           "Anything else means they did not. A fact recorded as measured that was",
+           "not measured poisons the store, so that distinction carries the weight.\n",
+           "**Check the scope.** Every fact is filed under a key hashed from",
+           "`GameAssembly.dll` and `db.json`. When the game updates, the key changes",
+           "and facts under the old key describe a world that no longer exists —",
+           "stale, not wrong.\n", "## What is in it\n",
+           "| | count |", "|---|---|"]
+    for k in ("facts", "recipes", "provenance rows", "edges", "scopes"):
+        out.append("| %s | %s |" % (k, counts.get(k, "UNKNOWN")))
+    out.append("")
+    if rec_names:
+        out.append("## Recipes\n")
+        for r in rec_names:
+            out.append("- %s" % md_safe(r.strip()))
+        out.append("")
+    out.append("## The full dump\n")
+    # A plain <a>, and a .txt extension. Both are load-bearing: VitePress
+    # rewrites markdown links and COMPILES any .md under public/ as a page,
+    # which would render the whole 640 KB store as the page this one exists
+    # to avoid. A .txt served through a raw anchor is a download, not a route.
+    out.append('The complete export is <a href="/aowlspt/aowl-facts.txt" download>'
+               '<strong>aowl-facts.txt</strong></a>')
+    out.append("(~640 KB, %d headings). It is served as a download rather than rendered: as a page"
+               % len(recipes))
+    out.append("it would make a reader wait for the entire store to paint before the")
+    out.append("first fact appeared.\n")
+    out.append("::: warning What was withheld\n")
+    out.append("The published dump is **scrubbed**: machine-local user paths are")
+    out.append("replaced with `<HOME>`, and any section naming a private email address")
+    out.append("is withheld entirely. The generator refuses to emit the file at all if")
+    out.append("anything matching those patterns survives, so a partial scrub fails the")
+    out.append("build rather than shipping.\n:::\n")
+    return "\n".join(out) + "\n"
+
+
+# --------------------------------------------------------------------------
 
 def build():
     """Return {relative path: content} for the whole generated reference."""
@@ -523,6 +911,33 @@ def build():
     pages["mods.md"] = page_mods_index(mods)
     for m in mods:
         pages["mods/%s.md" % m["name"]] = page_mod(m)
+
+    # The Nim mod API, generated from aowl/src/aowlspt/*.nim.
+    api = collect_api()
+    pages["api.md"] = page_api_index(api)
+    for m in api:
+        pages["api/%s.md" % m["module"]] = page_api_module(m)
+
+    # The automation library: generated signatures, mirrored prose, whole scripts.
+    auto = []
+    for name, content in (("automation/verbs.md", page_automation_verbs()),
+                          ("automation/scripts.md", page_automation_scripts())):
+        if content is not None:
+            pages[name] = content
+            auto.append(name)
+
+    # Mirrored internal documents. `mirror_doc` raises SystemExit rather than
+    # publishing something that failed the scrub, so a leak stops the build.
+    mirrored = []
+    for src, dest, title in MIRRORS:
+        content = mirror_doc(src, title)
+        if content is not None:
+            pages[dest] = content
+            mirrored.append((dest, title))
+
+    facts = page_facts()
+    if facts is not None:
+        pages["facts.md"] = facts
 
     pages["index.md"] = (
         GENERATED_BANNER
@@ -540,11 +955,19 @@ def build():
         "  from its call site, with its type, default and read location.\n"
         "- **[The C ABI](./abi)** — every `abi/aowlspt_*.h`, what it owns, its\n"
         "  functions, types and constants.\n"
-        "- **[Mods](./mods)** — every mod, every settings key, every doc comment.\n\n"
+        "- **[Mods](./mods)** — every mod, every settings key, every doc comment.\n"
+        "- **[The mod API](./api)** — every exported symbol of\n"
+        "  `aowl/src/aowlspt/*.nim`, with its signature and the line it came from.\n"
+        "- **[Automation](./automation/api)** — the script library: the narrative\n"
+        "  reference, the generated verb index, and the reference scripts in full.\n"
+        "- **[The fact store](./facts)** — what has actually been measured about\n"
+        "  the live client, and the scrubbed full dump.\n\n"
         "## Regenerating\n\n"
         "```bash\n"
         "cd aowlspt\n"
-        "python tools/gendocs.py --out ../aoughwl.github.io/docs/aowlspt/reference\n"
+        "python tools/gendocs.py \\\n"
+        "  --out    ../aoughwl.github.io/docs/aowlspt/reference \\\n"
+        "  --public ../aoughwl.github.io/public/aowlspt\n"
         "```\n\n"
         "`--check` exits non-zero if the output would change, which is what a CI step\n"
         "should run so a source change that invalidates the docs fails loudly instead\n"
@@ -570,19 +993,83 @@ def build():
          "items": [{"text": m["name"],
                     "link": "/docs/aowlspt/reference/mods/%s" % m["name"]}
                    for m in mods]},
+        {"text": "The mod API", "link": "/docs/aowlspt/reference/api",
+         "collapsed": True,
+         "items": [{"text": "aowlspt/%s" % m["module"],
+                    "link": "/docs/aowlspt/reference/api/%s" % m["module"]}
+                   for m in api]},
+        {"text": "Automation",
+         "link": ("/docs/aowlspt/reference/automation/api"
+                  if "automation/api.md" in pages
+                  else "/docs/aowlspt/reference/automation/verbs"),
+         "collapsed": True,
+         "items": ([{"text": t, "link": "/docs/aowlspt/reference/" + d[:-3]}
+                    for d, t in mirrored if d.startswith("automation/")]
+                   + [{"text": "Verb index (generated)",
+                       "link": "/docs/aowlspt/reference/automation/verbs"}
+                      if "automation/verbs.md" in pages else None]
+                   + [{"text": "Reference scripts",
+                       "link": "/docs/aowlspt/reference/automation/scripts"}
+                      if "automation/scripts.md" in pages else None])},
+        {"text": "Internals", "collapsed": True,
+         "items": ([{"text": t, "link": "/docs/aowlspt/reference/" + d[:-3]}
+                    for d, t in mirrored if d.startswith("internals/")]
+                   + ([{"text": "The fact store",
+                        "link": "/docs/aowlspt/reference/facts"}]
+                      if facts is not None else []))},
     ]
+    # Drop the placeholders left by the conditional entries above, so a missing
+    # source file removes a link instead of emitting a null the config chokes on.
+    for group in sidebar:
+        if "items" in group:
+            group["items"] = [i for i in group["items"] if i]
+    sidebar = [g for g in sidebar if g.get("link") or g.get("items")]
     pages["sidebar.json"] = json.dumps(sidebar, indent=2) + "\n"
+
+    # ------------------------------------------------------------------
+    # The publication gate. EVERY page passes through here, not just the
+    # mirrored ones, because the first leak this caught came from neither a
+    # mirror nor a hand-written page: `mods/textures/config.json` has a
+    # `packRoot` default pointing at someone's home directory, and the mods
+    # generator published it verbatim. A scrub that only guards the inputs you
+    # thought were risky is a check that cannot fail.
+    #
+    # This is the LAST thing build() does, so a page added later cannot route
+    # around it by accident.
+    # ------------------------------------------------------------------
+    for name in list(pages):
+        if name.endswith(".json"):
+            continue
+        body = pages[name]
+        body = HOMEPATH_RE.sub("<HOME>", body)
+        body = WEBHOOK_RE.sub("<REDACTED-WEBHOOK>", body)
+        pages[name] = body
+        for what, pat in (("a personal email address", PRIVATE_EMAIL_RE),
+                          ("a machine-local user path", HOMEPATH_RE),
+                          ("a webhook URL", WEBHOOK_RE)):
+            m = pat.search(body)
+            if m:
+                raise SystemExit(
+                    "gendocs: REFUSING to emit %s -- %s survived the publication "
+                    "gate at offset %d. The site repo is PUBLIC. Fix the source "
+                    "or the scrubber; do NOT relax this check." % (name, what, m.start()))
     return pages
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--out", help="directory to write the reference pages into")
+    ap.add_argument("--public",
+                    help="directory for static assets (the site's public/aowlspt)")
     ap.add_argument("--check", action="store_true",
                     help="exit non-zero if the output would change")
     args = ap.parse_args()
 
     pages = build()
+    assets = {}
+    facts_raw = facts_asset()
+    if facts_raw is not None:
+        assets["aowl-facts.txt"] = facts_raw
     if not args.out:
         for p in sorted(pages):
             print(p)
@@ -598,6 +1085,22 @@ def main():
             if not args.check:
                 with open(dest, "w", encoding="utf-8", newline="\n") as f:
                     f.write(content)
+
+    if args.public and assets:
+        for name, content in sorted(assets.items()):
+            dest = os.path.join(args.public, name)
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            old = read(dest) if os.path.exists(dest) else None
+            if old != content:
+                changed.append("(asset) " + name)
+                if not args.check:
+                    with open(dest, "w", encoding="utf-8", newline="\n") as f:
+                        f.write(content)
+    elif assets and not args.check:
+        sys.stderr.write(
+            "gendocs: %d static asset(s) NOT written -- pass --public to emit "
+            "them. The fact-store page links one, so the link will 404 without "
+            "it.\n" % len(assets))
 
     if args.check:
         if changed:
