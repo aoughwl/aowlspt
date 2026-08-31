@@ -177,6 +177,26 @@ const
   SplFanout       = 256        ## children examined per level -- the "UI" root has many child
                                ## screens; 64 could cut off the target sibling.
   SplFindDepth    = 8          ## depth for the screen-by-name descent.
+  # ---- THE PER-FRAME TIER-1 DESCENT: its own, much smaller bounds. ----
+  # MEASURED (aowlspt-host.log of the 146412a run, phase meter):
+  #   `DESCEND splFindByName, by-name descent: 2664411.7us over 113 calls
+  #    (mean 23578.8us, max 40238.8us, 38.1% of total)`
+  # and `UI-root cache hits=92` -- i.e. most of those calls were the tier-1
+  # descent from the cached "Menu UI" root, which this file described as
+  # "cheap" and "~100 nodes to a shallow screen". It is only cheap when it
+  # HITS. On a MISS -- the normal state, because the offline-raid screen is
+  # closed most of the time -- it burns the whole SplNodeBudget (24000) and the
+  # whole SplWalkMs (18ms) proving a negative, every frame.
+  #
+  # The bounds below are sized from this file's OWN measured claim about the
+  # hit case: "Menu UI -> UI -> screen, depth 2", "found in ~100 nodes". Depth
+  # 4 and 2500 nodes is a >20x margin on both. A MISS at these bounds is not
+  # treated as proof of absence: it falls through to the wide walk, which is
+  # throttled but keeps the FULL SplFindDepth/SplNodeBudget, so nothing that
+  # was findable before becomes unfindable -- only the per-frame price drops.
+  SplCheapDepth   = 4
+  SplCheapBudget  = 2500
+  SplCheapMs      = 2'u64
   SplScanDepth    = 12         ## depth for the by-text scan within the screen.
   SplBlockerUp    = 5          ## how far to climb from the toggle label to the blocker.
   SplWarnUp       = 4          ## how far to climb from the warning TMP to its panel container.
@@ -205,6 +225,7 @@ proc cSpControl() {.importc: "aowl_sp_control", nodecl.}
 proc cSpNs(i: int32): int64 {.importc: "aowl_sp_ns", nodecl.}
 proc cSpCalls(i: int32): int64 {.importc: "aowl_sp_calls", nodecl.}
 proc cSpMax(i: int32): int64 {.importc: "aowl_sp_max", nodecl.}
+proc cSpSubtick(i: int32): int64 {.importc: "aowl_sp_subtick", nodecl.}
 proc cSpSlowBy(i: int32): int64 {.importc: "aowl_sp_slow_by", nodecl.}
 proc cSpTotalNs(): int64 {.importc: "aowl_sp_total_ns", nodecl.}
 proc cSpTotalCalls(): int64 {.importc: "aowl_sp_total_calls", nodecl.}
@@ -221,18 +242,25 @@ const
   SpPre     = 0'i32
   SpRoots   = 1'i32
   SpDescend = 2'i32
-  SpScan    = 3'i32
-  SpMaint   = 4'i32
-  SpDiag    = 5'i32
+  SpCheap   = 3'i32
+  SpScan    = 4'i32
+  SpMHead   = 5'i32
+  SpMTog    = 6'i32
+  SpMWarn   = 7'i32
+  SpDiag    = 8'i32
+  SpCtrl    = 9'i32
 
-const SpNames: array[7, string] = [
-  "PRE      liveness+staleness checks",
-  "ROOTS    scene-root enumeration (the allocating step)",
-  "DESCEND  splFindByName, by-name descent",
-  "SCAN     splScanNode, by-text scan inside the screen",
-  "MAINT    splMaintain, the steady-state re-assert",
-  "DIAG     diagnostics + summary string building",
-  "CONTROL  positive control (512 dependent adds)"]
+const SpNames: array[10, string] = [
+  "PRE       liveness+staleness checks",
+  "ROOTS     scene-root enumeration (the allocating step)",
+  "DESCEND   splFindByName under the WIDE, throttled walk",
+  "CHEAPHUNT splFindByName under the CACHED UI root (per-frame tier 1)",
+  "SCAN      splScanNode, by-text scan inside the screen",
+  "MAINT.head  heading + description re-assert",
+  "MAINT.tog   practice toggle force + hide",
+  "MAINT.warn  co-op warning hide",
+  "DIAG      diagnostics + summary string building",
+  "CONTROL   positive control (512 dependent adds)"]
 
 # ---- state (gSplOn / gSplForceOffline are set in the flag pass in aowlhost.nim) ----
 var gSplOn = false                 ## the `singleplayerRebrand` flag; DEFAULT OFF
@@ -566,12 +594,16 @@ proc splFindScreen(): Il2CppPtr =
   let cachedRoot = splUiRootLive()
   if cachedRoot != nil:
     inc gSplUiRootHits
-    var budget = SplNodeBudget
-    let dl = cNowMs() + SplWalkMs
+    # Tier 1 runs EVERY frame, so it carries the CHEAP bounds, not the full
+    # ones. Billed to its own phase slot (CHEAPHUNT) so "the cheap hunt is
+    # cheap" is a falsifiable claim in the next run's meter rather than a
+    # comment. A miss here is NOT a verdict -- it falls through below.
+    var budget = SplCheapBudget
+    let dl = cNowMs() + SplCheapMs
     let tD = cSpNow()
-    let m = splFindByName(cachedRoot, SplScreenName, SplFindDepth, budget, dl)
-    cSpAdd(SpDescend, tD)
-    gSplLastNodes = gSplLastNodes + (SplNodeBudget - budget)
+    let m = splFindByName(cachedRoot, SplScreenName, SplCheapDepth, budget, dl)
+    cSpAdd(SpCheap, tD)
+    gSplLastNodes = gSplLastNodes + (SplCheapBudget - budget)
     if m != nil:
       gSplLastWhy = ""
       return m
@@ -579,9 +611,11 @@ proc splFindScreen(): Il2CppPtr =
     # offline-raid screen is closed, so it is NOT a reason to drop the cache --
     # dropping it would put us back on the expensive path every pass.
     gSplLastWhy = "screen \"" & SplScreenName & "\" is not under the cached UI " &
-      "root \"" & gSplUiRootName & "\" (" & $gSplLastNodes & " nodes, " &
-      $int(SplWalkMs) & " ms slice). Normal while the offline-raid screen is " &
-      "not open."
+      "root \"" & gSplUiRootName & "\" (" & $gSplLastNodes & " nodes, depth " &
+      $SplCheapDepth & ", " & $int(SplCheapMs) & " ms CHEAP slice). Normal " &
+      "while the offline-raid screen is not open. This is a bounded miss, NOT " &
+      "a verdict of absence -- the throttled wide walk below keeps the full " &
+      "depth " & $SplFindDepth & "/" & $SplNodeBudget & " budget."
     # Fall through to a wider look only when the expensive path is due. Stamp
     # the clock HERE, on the decision to go wide -- not inside tier 3, which
     # normally does not run at all once tier 2 returns roots. Stamping only in
@@ -848,6 +882,48 @@ proc splCacheStale(): bool =
   gSplHeadTmp == nil or not duOk(gSplHeadTmp, 0xE8'i32) or
     not iUnityAlive(gSplHeadTmp)
 
+var gSplHeadStrOk: Il2CppPtr = nil   ## the LAST System.String pointer read out of
+                                     ## gSplHeadTmp.m_text that DECODED to our own
+                                     ## caption. See splTextIsOurs.
+var gSplDescStrOk: Il2CppPtr = nil
+var gSplLatchHits = 0                ## frames the latch answered without decoding
+var gSplLatchMiss = 0                ## frames it had to decode
+
+proc splTextIsOurs(tmp: Il2CppPtr; wantLow: string; latch: var Il2CppPtr): bool =
+  ## "Does this TMP currently render OUR caption?" -- answered, in the steady
+  ## state, by ONE guarded pointer read instead of a string decode plus two
+  ## whole-string allocations (`iLower`, `iContains`).
+  ##
+  ## WHY THIS IS SOUND, and it is the only reason it is allowed: `m_text` holds
+  ## a MANAGED System.String REFERENCE. `LocalizedText`'s clobber and
+  ## `TMP_Text::set_text` both STORE A DIFFERENT STRING OBJECT there; neither
+  ## mutates the one already present (System.String is immutable in the CLR and
+  ## IL2CPP keeps that). So an UNCHANGED pointer means an unchanged rendered
+  ## caption. The latch therefore accelerates the CHECK; it does NOT skip the
+  ## re-apply -- the instant anything writes m_text the pointer differs, the
+  ## latch misses, the full decode runs and the re-apply happens on that frame.
+  ##
+  ## THREE OUTCOMES. The latch can only ever answer TRUE-FAST. A miss falls all
+  ## the way through to the real decode; there is no fast "no". A check that
+  ## cannot fail would be one that also short-circuited the negative.
+  result = false
+  if not duOk(tmp, 0xE8'i32):
+    latch = nil
+    return
+  let sp = cReadPtrAt(tmp, 0xE0'i32)
+  if sp == nil:
+    latch = nil
+    return
+  if sp == latch:
+    inc gSplLatchHits
+    return true                       # same String object => same rendered text
+  inc gSplLatchMiss
+  latch = nil
+  if iIsKnownKlass(cast[uint64](sp)) or not duOk(sp, 0x18'i32): return
+  if iContains(iLower(suiReadString(sp)), wantLow):
+    latch = sp                        # remember the object that reads as ours
+    result = true
+
 proc splMaintain() =
   ## Two independent jobs, each gated by its own flag:
   ##   * forceOfflinePractice (gSplForceOffline): keep the practice/offline
@@ -860,9 +936,9 @@ proc splMaintain() =
   # ---- Heading + description: the REBRAND only. ----
   var headOk = false
   var descState = 2   # 0 FAIL, 1 PASS, 2 INCONCLUSIVE (not found / not wanted)
+  let tMH = cSpNow()
   if gSplOn:
-    let headLow = iLower(splTmpText(gSplHeadTmp))
-    if iContains(headLow, SplHeadNewLow):
+    if splTextIsOurs(gSplHeadTmp, SplHeadNewLow, gSplHeadStrOk):
       headOk = true
       # ---- the flash window CLOSED. Report it, and judge it. ----
       if gSplStockSeen:
@@ -883,13 +959,16 @@ proc splMaintain() =
       if not gSplStockSeen:
         gSplStockSeen = true          # the window OPENS here; the drain tick counts
         gSplFlashFrames = 0
+      gSplHeadStrOk = nil
       discard splSetText(gSplHeadTmp, gSplHeadLoc, SplHeadNew)
     if gSplDescTmp != nil and duOk(gSplDescTmp, 0xE8'i32) and iUnityAlive(gSplDescTmp):
-      if iContains(iLower(splTmpText(gSplDescTmp)), SplDescNewLow):
+      if splTextIsOurs(gSplDescTmp, SplDescNewLow, gSplDescStrOk):
         descState = 1
       else:
+        gSplDescStrOk = nil
         discard splSetText(gSplDescTmp, gSplDescLoc, SplDescNew)
         descState = 0
+  cSpAdd(SpMHead, tMH)
 
   # ---- Practice toggle: FORCE ON whenever EITHER feature is active (the offline
   # mechanism -- the notifying `set_isOn` runs while the GameObject is ACTIVE so
@@ -899,10 +978,17 @@ proc splMaintain() =
   var forceState = 2   # 2 INCONCLUSIVE/REFUSED, 1 PASS (readback == wanted), 0 FAIL
   var hideState  = 2   # 2 INCONCLUSIVE/REFUSED/not-wanted, 1 PASS (hidden), 0 acting
   let wantOn = (if SplForceIsOn: 1'i32 else: 0'i32)
+  let tMT = cSpNow()
   if (gSplForceOffline or gSplOn) and
      gSplToggle != nil and duOk(gSplToggle, cSwOffToggleIsOn() + 8'i32) and
      gSplCheckGo != nil and duOk(gSplCheckGo, 0x20'i32) and iUnityAlive(gSplCheckGo):
-    if nuActiveInHierarchy(gSplCheckGo):
+    # ONE activeInHierarchy call per pass, not three. It is an IL2CPP
+    # internal-call wrapper into Unity C++; the steady state asked the SAME
+    # question up to three times per frame and used the third answer to judge
+    # the first. Re-read ONLY after we act, so the readback still describes the
+    # FINISHED STATE and not the intent (9b).
+    var boxActive = nuActiveInHierarchy(gSplCheckGo)
+    if boxActive:
       discard splForceToggle()              # forces set_isOn (sets gSplForceRefused if the RVA is UNVERIFIED)
       # Hide once set_isOn was actually CALLED. fact #71: Toggle::set_isOn
       # @0x55BA430 DOES tick this UpdatableToggle (human-confirmed on screen), so
@@ -915,6 +1001,7 @@ proc splMaintain() =
       # and hiding is a REBRAND concern only.
       if gSplOn and not gSplForceRefused:
         discard nuSetActive(gSplCheckGo, false)
+        boxActive = nuActiveInHierarchy(gSplCheckGo)   # re-read AFTER acting
     # Assert the FINISHED STATE of the FORCE (both features care about this).
     if not gSplForceRefused:
       forceState = (if cSwReadU8(gSplToggle, cSwOffToggleIsOn()) == wantOn: 1 else: 0)
@@ -922,10 +1009,11 @@ proc splMaintain() =
     if gSplOn:
       if gSplForceRefused:
         hideState = 2                        # could not force -> box left VISIBLE
-      elif not nuActiveInHierarchy(gSplCheckGo):
+      elif not boxActive:
         hideState = 1
       else:
         hideState = 0
+  cSpAdd(SpMTog, tMT)
 
   # ---- Co-op / Edge-of-Darkness "progress is not saved/shared" warning: the
   # REBRAND only -- hide the whole container (content-discovery + SetActive, no
@@ -933,18 +1021,26 @@ proc splMaintain() =
   # was called. If the screen resolved but nothing matched the co-op/progress
   # predicate, REFUSE -- never hide a random node.
   var warnState = 3   # 3 not-found-yet, 2 REFUSED, 1 PASS (hidden), 0 acting/FAIL
+  let tMW = cSpNow()
   if gSplOn:
     if gSplWarnGo != nil and duOk(gSplWarnGo, 0x20'i32) and iUnityAlive(gSplWarnGo):
-      if nuActiveInHierarchy(gSplWarnGo):
+      # Same single-read discipline as the checkbox above: ask once, act only if
+      # needed, and re-ask ONLY after acting so the verdict is still a readback
+      # of the finished state rather than of our intent.
+      var warnActive = nuActiveInHierarchy(gSplWarnGo)
+      if warnActive:
         discard nuSetActive(gSplWarnGo, false)
-      warnState = (if not nuActiveInHierarchy(gSplWarnGo): 1 else: 0)
+        warnActive = nuActiveInHierarchy(gSplWarnGo)
+      warnState = (if not warnActive: 1 else: 0)
     elif not gSplWarnMatched:
       gSplWarnRefused = true
       warnState = 2
+  cSpAdd(SpMWarn, tMW)
 
   # ---- Finished-state summary, once. Ready when each ACTIVE feature has acted:
   # the rebrand once its heading has taken; forceOfflinePractice once the toggle
   # force has a readback (or refused, which is announced separately). ----
+  let tMD = cSpNow()
   let forceStr = (case forceState
     of 1: "PASS"
     of 0: "FAIL"
@@ -999,6 +1095,7 @@ proc splMaintain() =
     if gSplForceOffline and forceState != 1:
       confirmed = false
     gSplConfirmed = confirmed
+  cSpAdd(SpDiag, tMD)
 
 # ---------------------------------------------------------------------------
 # The guarded body + the drain rider.
@@ -1043,6 +1140,10 @@ proc splRebrandTickBody(a: Il2CppPtr): Il2CppPtr {.
     gSplResolved = false
     gSplHeadTmp = nil; gSplHeadLoc = nil
     gSplDescTmp = nil; gSplDescLoc = nil
+    gSplHeadStrOk = nil; gSplDescStrOk = nil   # the TMPs are going; so must the
+                                               # String-identity latches, or a
+                                               # recycled address could answer
+                                               # for a caption we never checked.
     gSplCheckGo = nil
     gSplToggle = nil
     gSplForceRefused = false
@@ -1127,9 +1228,10 @@ proc splRebrandTickBody(a: Il2CppPtr): Il2CppPtr {.
           "hardcoded child path."
     cSpAdd(SpDiag, tG4)
 
-  let tM = cSpNow()
+  # splMaintain brackets its OWN phases (MAINT.head / MAINT.tog / MAINT.warn and
+  # the once-only summary as DIAG), so no bracket here -- one here would
+  # double-count and break the partition.
   splMaintain()
-  cSpAdd(SpMaint, tM)
 
 proc splRebrandDrainTick() =
   ## Rides the `EFT.TarkovApplication::Update` drain (slot alias, no second
@@ -1211,18 +1313,44 @@ proc splProfLines(): seq[string] =
       "(0 bracketed calls). This is \"not measured\", NOT \"free\"."
     return
   var accounted = 0'i64
+  var anyPhaseCalls = 0'i64
   let slots = cSpSlots()
   var i = 0'i32
-  while i < slots and i < 7'i32:
+  while i < slots and int(i) < SpNames.len:
     if i != cSpCtrlSlot():
       accounted = accounted + cSpNs(i)
+      anyPhaseCalls = anyPhaseCalls + max(cSpCalls(i), 0'i64)
     inc i
   result.add "  splRebrandDrain PHASE METER -- " & $totalCalls &
     " bracketed calls, TOTAL " & splProfUs(totalNs) & ", mean " &
     splProfUs(totalNs div totalCalls) & "/call, MAX " &
     splProfUs(cSpTotalMax()) & ". All durations MICROSECONDS."
+  # ---- THE DEFECT GATE. It runs BEFORE the table, and when it fires the table
+  # below is a table of zeros, which is the single most misleading thing this
+  # file can print. `accounted == 0` while the whole recorded real time is not a
+  # measurement of a free feature -- it is a BROKEN INSTRUMENT, and it must
+  # scream rather than render. The two causes are distinguished, because they
+  # have different fixes: no phase bracket ran at all (the phases are on a code
+  # path the feature does not take) versus brackets ran but accumulated nothing
+  # (the accumulator being read is not the one being written, or every sample
+  # was rejected -- see `dropped samples` on the ladder line).
+  if accounted <= 0 and totalNs > 0:
+    result.add "    *** PHASE METER IS DEFECTIVE -- DO NOT READ THE TABLE " &
+      "BELOW. accounted=0us while the outer bracket recorded " &
+      splProfUs(totalNs) & " over " & $totalCalls & " call(s). That is 100% " &
+      "UNEXPLAINED. " &
+      (if anyPhaseCalls <= 0:
+         "NO phase bracket was entered even once, so the phases sit on a code " &
+         "path this feature never takes -- the decomposition does not describe " &
+         "the running code."
+       else:
+         $anyPhaseCalls & " phase bracket(s) WERE entered and still summed to " &
+         "zero, so the accumulator being reported is not the one being " &
+         "written, or every sample was rejected (check `dropped samples`).") &
+      " This attribution is VOID. Every phase figure below is INCONCLUSIVE, " &
+      "and INCONCLUSIVE is not a PASS."
   i = 0'i32
-  while i < slots and i < 7'i32:
+  while i < slots and int(i) < SpNames.len:
     let c = cSpCalls(i)
     let ns = cSpNs(i)
     let nm = (if int(i) < SpNames.len: SpNames[int(i)] else: "slot " & $int(i))
@@ -1230,9 +1358,16 @@ proc splProfLines(): seq[string] =
       # RULE 4: "never ran" is not "cheap". It never prints as 0.0us.
       result.add "    " & nm & ": NEVER RAN (0 calls) -- unmeasured, not free."
     else:
+      # A bucket whose samples were mostly BELOW the QPC tick is "too small for
+      # this clock", which is a different claim from "cheap" -- say which.
+      let sub = cSpSubtick(i)
+      let subNote = (if sub > 0: " [" & $sub & " of " & $c &
+        " samples measured BELOW the clock tick -- that part is 'too small to " &
+        "measure', not 'free']" else: "")
       result.add "    " & nm & ": " & splProfUs(ns) & " over " & $c &
         " calls (mean " & splProfUs(ns div c) & ", max " &
-        splProfUs(cSpMax(i)) & ", " & splProfPct(ns, totalNs) & " of total)"
+        splProfUs(cSpMax(i)) & ", " & splProfPct(ns, totalNs) & " of total)" &
+        subNote
     inc i
   result.add "    accounted=" & splProfUs(accounted) & " of " &
     splProfUs(totalNs) & " (" & splProfPct(accounted, totalNs) &
@@ -1251,7 +1386,7 @@ proc splProfLines(): seq[string] =
   else:
     var by = ""
     i = 0'i32
-    while i < slots and i < 7'i32:
+    while i < slots and int(i) < SpNames.len:
       if cSpSlowBy(i) > 0:
         let nm = (if int(i) < SpNames.len: SpNames[int(i)] else: $int(i))
         by = by & " [" & nm & " x" & $cSpSlowBy(i) & "]"
@@ -1271,3 +1406,18 @@ proc splProfLines(): seq[string] =
     "MOVED scenes stays findable). cached UI root=" &
     (if gSplUiRoot != nil: "\"" & gSplUiRootName & "\"" else: "NONE") &
     ", dropped samples=" & $cSpDropped() & "."
+  # THE STEADY-STATE CLAIM, stated so it can be FALSIFIED. The re-apply is not
+  # skipped -- only the string DECODE is, and only while the m_text String
+  # object is byte-identically the same reference we already verified as ours.
+  # A miss is a full decode AND, if it does not read as ours, a re-apply. So:
+  # `latch misses` is an upper bound on the frames that could have re-applied,
+  # and if the rebrand ever flickers back to BSG's caption this number must be
+  # non-zero on that frame -- a latch that hid a clobber would show hits with a
+  # visibly wrong screen, which is the observation that would refute this.
+  result.add "    m_text identity latch: " & $gSplLatchHits &
+    " hit(s) (one guarded pointer read, no decode, no allocation) vs " &
+    $gSplLatchMiss & " miss(es) (full decode; a miss that does not read as " &
+    "ours RE-APPLIES on that frame). The latch accelerates the CHECK only -- " &
+    "it never suppresses a re-apply. If the heading is ever seen reading " &
+    "\"PRACTICE GAME MODE\" while this shows hits and no misses, the latch is " &
+    "WRONG and must be removed."
