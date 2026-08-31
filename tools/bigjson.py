@@ -265,6 +265,20 @@ def main(argv=None):
     def add(name, fn, help_):
         p = sub.add_parser(name, help=help_)
         p.add_argument("file")
+        # MEASURED: `bigjson.py get FILE --path X --full 200000` died with
+        # "unrecognized arguments: --full 200000", which reads as though the
+        # flag does not exist at all -- it exists, but only BEFORE the
+        # subcommand. Accepting it in either position costs three lines.
+        # argparse.SUPPRESS is load-bearing: without it the subparser would
+        # re-set these attributes to its own defaults and SILENTLY DISCARD a
+        # value given in the global position -- trading a loud error for a
+        # quietly ignored flag, which is strictly worse.
+        p.add_argument("--width", type=int, default=argparse.SUPPRESS,
+                       help="clip every value to N chars")
+        p.add_argument("--full", type=int, default=argparse.SUPPRESS,
+                       help="raise the clip to N chars, deliberately")
+        p.add_argument("--max-rows", type=int, default=argparse.SUPPRESS,
+                       help="rows to print (0 = no cap)")
         # --path is DOT-separated, so it cannot address a key that contains a
         # dot -- which is EVERY key in Windows.json
         # ("assets/content/audio/voice/scav/scav6.bundle": the slashes are
