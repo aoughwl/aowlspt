@@ -60,6 +60,10 @@ aowl -- build, test and install aowlspt
   ui SUBCMD          drive the LIVE client's UI by the text a person SEES --
                      `aowl ui help` for the verbs. Talks to a running game
                      through the inspector channel; compiles nothing.
+  script PATH        build and RUN one automation script (tools\autoscript).
+                     LAUNCHES THE GAME. Exit code is the verdict: 0 PASS,
+                     1 FAIL, 2 INCONCLUSIVE -- 2 is never folded into 1.
+                     `--build-only` compiles it and does not run it.
   raid               enter an offline raid: `aowl raid --map factory`
   clean              remove build output
 
@@ -3527,7 +3531,10 @@ proc main(): int =
     # Forwarding everything after the verb verbatim keeps this parser from
     # having to learn a second command's flags, and keeps them from drifting.
     if command == "release" or command == "importdb" or
-       command == "ui" or command == "raid":
+       command == "ui" or command == "raid" or command == "script":
+      # `script` joins this list because an automation script takes its OWN
+      # arguments, and `aowl` must not eat them. `--build-only` is read out of
+      # `extra` by the `script` branch below.
       extra.add a
     elif a == "--debug":
       e.debugBuild = true
@@ -3601,15 +3608,48 @@ proc main(): int =
       simArgs.add quoted(a)
     result = cmdRun(e, arg, simArgs)
   of "script":
-    if arg.len == 0:
+    # `script` forwards ALL its arguments verbatim (a script takes its own), so
+    # the generic parser leaves `arg` empty and the path is the first non-flag
+    # token in `extra`.
+    var path = arg
+    if path.len == 0:
+      for a in extra:
+        if path.len == 0 and not a.startsWith("-"):
+          path = a
+    if path.len == 0:
       fatal "script needs a path to a .nim automation script " &
             "(try: aowl script scripts\\woods_pmc_m4.nim)"
+    # `--build-only` COMPILES the script and does not run it.
+    #
+    # It exists because running an automation script LAUNCHES THE GAME, and
+    # there was previously no way to ask "does this script compile?" without
+    # doing that. Type-checking a script by launching a raid is a very expensive
+    # syntax check, and in a subagent or a CI job it is not available at all.
     var sArgs = ""
+    var buildOnly = false
     for a in extra:
-      if a == arg: continue
+      if a == path: continue
+      if a == "--build-only":
+        buildOnly = true
+        continue
       if sArgs.len > 0: sArgs.add " "
       sArgs.add quoted(a)
-    result = cmdScript(e, arg, sArgs)
+    if buildOnly:
+      var exe = ""
+      if not buildScript(e, path, exe):
+        result = 2
+      elif not fileExists(exe):
+        # The silent-nimony failure, stated as such. A green exit code with no
+        # artifact is the worst outcome this build produces, so it is never
+        # reported as a pass.
+        err "the script compiled and produced no binary at " & exe &
+            " -- that is the silent-nimony failure; do not trust the exit code"
+        result = 2
+      else:
+        ok "script compiled: " & exe & " (NOT RUN -- --build-only)"
+        result = 0
+    else:
+      result = cmdScript(e, path, sArgs)
   of "payload": result = cmdPayload(e)
   of "release": result = cmdRelease(e, extra)
   of "importdb": result = cmdImportDb(e, extra)

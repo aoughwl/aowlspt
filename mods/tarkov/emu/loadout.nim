@@ -108,6 +108,30 @@ type
     inside*: string     ## the equipment slot of the container, for whInside
     count*: int
     ammo*: string       ## fill this magazine/chamber with that ammo template
+    magazine*: string
+      ## The magazine template to MOUNT INSIDE this item's `mod_magazine` slot.
+      ##
+      ## Only meaningful on a weapon, and it exists because a weapon is not a
+      ## magazine. MEASURED on this database: `5447a9cd4bdc2dbd208b4567` (M4A1)
+      ## declares `_props.Chambers[0]._name = "patron_in_weapon"` and NO
+      ## `_props.Cartridges` at all, while `55d4887d4bdc2d962f8b4570` (STANAG)
+      ## declares `_props.Cartridges` and no slots. So `ammo` alone on a weapon
+      ## used to hit `cartridgeCapacity` -> 0 and be REFUSED with "the database
+      ## declares no _props.Cartridges[0]._max_count", and even had it not been,
+      ## nothing was ever mounted in `mod_magazine` -- which is why the client's
+      ## `GetCurrentMagazine()` came back null and every in-raid magazine cycle
+      ## was dead on arrival.
+      ##
+      ## The magazine is NAMED by the script and never guessed. The M4A1's
+      ## `mod_magazine` filter admits 20 templates; picking "the first" is an
+      ## arbitrary document order, and this module already refuses that shape of
+      ## guess in `resolve`.
+    chamber*: bool
+      ## Whether to put one round of `ammo` in the template's chamber. Defaults
+      ## true whenever `ammo` is given and the template declares `_props.Chambers`
+      ## -- a weapon spawned with a full magazine and an empty chamber is a weapon
+      ## whose first trigger pull racks instead of fires, which is exactly the
+      ## kind of state that makes a trigger-fires test read as a feature bug.
     condition*: int     ## durability/resource percentage, 100 = untouched
     baseline*: int
       ## How many of this template were ALREADY where this request asks, read
@@ -122,6 +146,19 @@ type
       ## module asserting its own write.
     minted*: int
     placed*: int
+    magPlaced*: int
+      ## How many magazines of `magazine` were READ BACK parented to the item
+      ## this request minted, in slot `mod_magazine`. Counted from the re-read
+      ## profile like `placed`, never from a counter this module incremented.
+      ## `magazine` asked for and `magPlaced == 0` is a FAIL, and it is the
+      ## falsifiable half of the weapon fix: point `magazine` at a template the
+      ## weapon's filter does not admit and this number stays zero.
+    roundsPlaced*: int
+      ## Rounds READ BACK inside that mounted magazine (its `cartridges` child's
+      ## `StackObjectsCount`). Zero with a magazine present means a magazine
+      ## arrived empty, which looks identical to "the feature never fired" from
+      ## inside a raid and is why it is counted separately.
+    chambered*: int     ## rounds read back in the chamber slot, 0 or 1
     why*: string        ## why this request did not fully land
 
   LoadoutReport* = object
@@ -206,8 +243,10 @@ proc parseSpec*(body: string; profileId: var string; clear: var bool;
   for i in 0 ..< n:
     let e = at(gear, i)
     var r = GearReq(query: "", tpl: "", label: "", where: whStash, slot: "",
-                    inside: "", count: 1, ammo: "", condition: 100,
-                    baseline: 0, minted: 0, placed: 0, why: "")
+                    inside: "", count: 1, ammo: "", magazine: "", chamber: false,
+                    condition: 100,
+                    baseline: 0, minted: 0, placed: 0, magPlaced: 0,
+                    roundsPlaced: 0, chambered: 0, why: "")
     r.tpl = toLowerAscii(e.field("tpl").asText(""))
     r.query = e.field("query").asText("")
     if r.query.len == 0:
@@ -223,6 +262,19 @@ proc parseSpec*(body: string; profileId: var string; clear: var bool;
                    "; " & $MaxCountPerRequest & " is the cap"
       continue
     r.ammo = toLowerAscii(e.field("ammo").asText(""))
+    r.magazine = toLowerAscii(e.field("magazine").asText(""))
+    if r.magazine.len > 0 and r.ammo.len == 0:
+      problems.add "gear[" & $i & "] (" & r.query & ") names a `magazine` but " &
+                   "no `ammo`. A mounted magazine with nothing in it is a " &
+                   "weapon that spawns empty, which is indistinguishable in " &
+                   "raid from the magazine never having been mounted -- say " &
+                   "which round it holds."
+      continue
+    # `chamber` defaults to true when ammo was named. The default is only ACTED
+    # ON if the template really declares `_props.Chambers`; `chamberName` below
+    # is what decides that, so asking for a chamber on a magazine is a no-op
+    # rather than a fabricated slot.
+    r.chamber = e.field("chamber").asBool(r.ammo.len > 0)
     r.condition = e.field("condition").asInt(100)
     let slotRaw = e.field("slot").asText("")
     let insideRaw = e.field("inside").asText("")
@@ -317,6 +369,76 @@ proc cartridgeAccepts(tpl, ammoTpl: string): bool =
       return true
   result = false
 
+proc chamberName*(tpl: string): string =
+  ## `_props.Chambers[0]._name`, or "" when the template declares no chamber.
+  ##
+  ## MEASURED: the M4A1 answers "patron_in_weapon" here and has no
+  ## `_props.Cartridges` at all. This proc is the ONLY thing that decides a
+  ## template is chamber-shaped -- there is no name heuristic, because "it is
+  ## called a rifle" is not a fact about the database.
+  let v = dbRead("templates.items." & tpl & "._props.Chambers")
+  if not v.ok:
+    return ""
+  let first = at(whole(v.raw), 0)
+  if not first.found:
+    return ""
+  result = first.field("_name").asText("")
+
+proc slotAccepts*(parentTpl, slotName, childTpl: string; why: var string): bool =
+  ## Does `parentTpl`'s slot `slotName` admit `childTpl`?
+  ##
+  ## Three genuinely different answers, and they are NOT collapsed:
+  ##   true, why == ""    the filter names it
+  ##   false, why != ""   the slot exists and its filter EXCLUDES it, or the
+  ##                      slot does not exist on this template at all
+  ##   true, why != ""    the slot exists and declares no readable filter, so
+  ##                      nothing was checked. An unreadable filter constrains
+  ##                      nothing -- the same reading `cartridgeAccepts` takes --
+  ##                      but the caller is told it was not checked rather than
+  ##                      being handed a green light it did not earn.
+  ## BOTH `_props.Slots` AND `_props.Chambers` are searched, in that order.
+  ##
+  ## MEASURED, and it is the non-obvious part: the chamber `patron_in_weapon` is
+  ## NOT in the M4A1's `_props.Slots` -- it is a separate array, `_props.Chambers`,
+  ## with a byte-identical entry shape (`_name`, `_props.filters[0].Filter`, an
+  ## 11-template ammunition whitelist). Searching only `Slots` made this proc
+  ## answer "the M4A1 has no patron_in_weapon slot" for a chamber that plainly
+  ## exists, which would have silently left every weapon unchambered while
+  ## emitting a confident, wrong reason. In the ITEM TREE they are the same
+  ## thing: a child whose `slotId` is that name.
+  why = ""
+  var found = false
+  var filtered = false
+  for arrayName in ["Slots", "Chambers"]:
+    let v = dbRead("templates.items." & parentTpl & "._props." & arrayName)
+    if not v.ok:
+      continue
+    let slots = whole(v.raw)
+    if not isArray(slots):
+      continue
+    for s in each(slots):
+      if s.field("_name").asText("") != slotName:
+        continue
+      found = true
+      let f = s.field("_props").field("filters").at(0).field("Filter")
+      if not f.found or not isArray(f) or count(f) == 0:
+        why = parentTpl & "'s " & slotName & " slot declares no readable " &
+              "template filter, so COMPATIBILITY WAS NOT CHECKED"
+        return true
+      filtered = true
+      for one in each(f):
+        if one.asText("") == childTpl:
+          return true
+  if not found:
+    why = parentTpl & " has no " & slotName & " slot (neither _props.Slots " &
+          "nor _props.Chambers names one), so " & childTpl &
+          " cannot be mounted in it"
+    return false
+  if filtered:
+    why = parentTpl & "'s " & slotName & " filter does not admit " & childTpl &
+          "; the client would drop it on load, so it was not minted"
+  result = false
+
 proc fillCartridges(items: var List; parentId, parentTpl, ammoTpl: string;
                     why: var string): int =
   ## Load a magazine (or chamber a weapon) with `ammoTpl`. Returns the rounds
@@ -328,8 +450,20 @@ proc fillCartridges(items: var List; parentId, parentTpl, ammoTpl: string;
     return
   let cap = cartridgeCapacity(parentTpl)
   if cap <= 0:
-    why = "the database declares no _props.Cartridges[0]._max_count for " &
-          parentTpl & ", so no rounds were loaded"
+    let ch = chamberName(parentTpl)
+    if ch.len > 0:
+      # The distinguishing case, and the one that used to read as a database
+      # defect. This template is not a magazine: it is a CHAMBERED item, and it
+      # holds its ammunition in a mounted magazine plus one round in `ch`.
+      why = parentTpl & " declares no _props.Cartridges -- it is a CHAMBERED " &
+            "item (_props.Chambers[0]._name = " & ch & "), so it holds no " &
+            "rounds directly. Name a `magazine` alongside `ammo` and the " &
+            "magazine is mounted in its mod_magazine slot and loaded; the " &
+            "chamber is filled separately. Asking a weapon to behave like a " &
+            "magazine is what produced a null GetCurrentMagazine() in raid."
+    else:
+      why = "the database declares no _props.Cartridges[0]._max_count for " &
+            parentTpl & ", so no rounds were loaded"
     return
   if not cartridgeAccepts(parentTpl, ammoTpl):
     why = parentTpl & "'s cartridge filter does not accept " & ammoTpl &
@@ -346,6 +480,75 @@ proc fillCartridges(items: var List; parentId, parentTpl, ammoTpl: string;
   setRaw(d, "upd", text(upd))
   items.add d
   result = cap
+
+proc chamberRound(items: var List; parentId, parentTpl, ammoTpl: string;
+                  why: var string): int =
+  ## Put ONE round of `ammoTpl` in `parentTpl`'s chamber slot. Returns 1 or 0.
+  ##
+  ## The chamber is a SLOT, not a cartridge array, so this mints a child whose
+  ## `slotId` is the chamber's own `_name` -- "patron_in_weapon" on every weapon
+  ## measured here -- and never the literal string, because a template that
+  ## names its chamber differently would silently get an orphan child.
+  result = 0
+  why = ""
+  if ammoTpl.len == 0:
+    return
+  let ch = chamberName(parentTpl)
+  if ch.len == 0:
+    # NOT an error: `chamber` defaults on, and a magazine has no chamber. Saying
+    # nothing here is correct; saying "failed" would fail every magazine.
+    return
+  var w = ""
+  if not slotAccepts(parentTpl, ch, ammoTpl, w):
+    why = "the chamber was left empty -- " & w
+    return
+  var d = newDoc()
+  setText(d, "_id", newId())
+  setText(d, "_tpl", ammoTpl)
+  setText(d, "parentId", parentId)
+  setText(d, "slotId", ch)
+  var upd = newDoc()
+  setNumber(upd, "StackObjectsCount", 1)
+  setRaw(d, "upd", text(upd))
+  items.add d
+  if w.len > 0:
+    why = w      ## "compatibility was not checked" travels with the success
+  result = 1
+
+proc mountMagazine(items: var List; weaponId, weaponTpl, magTpl, ammoTpl: string;
+                   magId: var string; rounds: var int; why: var string): bool =
+  ## Mount `magTpl` in `weaponTpl`'s `mod_magazine` slot and load it.
+  ##
+  ## Returns false and populates `why` on every refusal. It refuses BEFORE
+  ## minting when the weapon's filter excludes the magazine, because a magazine
+  ## the client will drop on load is worse than no magazine: the profile saves,
+  ## the read-back finds it, and the raid starts without it.
+  magId = ""
+  rounds = 0
+  why = ""
+  var w = ""
+  if not slotAccepts(weaponTpl, "mod_magazine", magTpl, w):
+    why = w
+    return false
+  let notChecked = w
+  magId = newId()
+  var d = newDoc()
+  setText(d, "_id", magId)
+  setText(d, "_tpl", magTpl)
+  setText(d, "parentId", weaponId)
+  setText(d, "slotId", "mod_magazine")
+  items.add d
+  var w2 = ""
+  rounds = fillCartridges(items, magId, magTpl, ammoTpl, w2)
+  if rounds == 0:
+    # The magazine IS mounted; only the load failed. Both facts are reported,
+    # because "no magazine" and "an empty magazine" fail a raid differently.
+    why = "the magazine " & magTpl & " was mounted but loaded ZERO rounds -- " &
+          w2
+    return true
+  if notChecked.len > 0:
+    why = notChecked
+  result = true
 
 # ---------------------------------------------------------------------------
 # Container placement
@@ -536,6 +739,15 @@ proc reportJson*(rep: LoadoutReport): string =
     put(e, "baseline", r.baseline)
     put(e, "minted", r.minted)
     put(e, "placed", r.placed)
+    # The mounted-magazine numbers travel SEPARATELY from `placed`, for the same
+    # reason requested/minted/placed do: "the rifle arrived" and "the rifle
+    # arrived with a loaded magazine in it" are different claims, and a script
+    # that could only see the first would report PASS on a weapon that cannot
+    # be reloaded in raid.
+    put(e, "magazine", r.magazine)
+    put(e, "magPlaced", r.magPlaced)
+    put(e, "roundsPlaced", r.roundsPlaced)
+    put(e, "chambered", r.chambered)
     put(e, "why", r.why)
     per.add e
   put(o, "gear", per)
@@ -579,6 +791,68 @@ proc countPlaced(itemsJson: string; r: GearReq;
       continue
     let n = one.field("upd").field("StackObjectsCount").asInt(1)
     result = result + (if n > 0: n else: 1)
+
+proc countMounted(itemsJson: string; r: var GearReq; equipmentId: string) =
+  ## Read `magPlaced` / `roundsPlaced` / `chambered` OFF THE RE-READ PROFILE.
+  ##
+  ## Deliberately shaped as a walk of the FINISHED STATE and not as a re-read of
+  ## what `mountMagazine` just did: it starts from the equipment slot the script
+  ## named, finds the item actually worn there, and only then looks for a child.
+  ## Nothing it consults was produced by the mint path, so a magazine that was
+  ## minted and then dropped by `validateSlots`, lost in the save, or written
+  ## under the wrong parent lands here as a zero.
+  ##
+  ## The input that makes it fail is nameable: point `magazine` at a template the
+  ## weapon's `mod_magazine` filter excludes, or at a magazine and no `ammo`, and
+  ## `magPlaced` or `roundsPlaced` stays 0.
+  r.magPlaced = 0
+  r.roundsPlaced = 0
+  r.chambered = 0
+  if r.where != whEquip:
+    return
+  let list = parseArray(itemsJson)
+  # 1. the item worn in the named slot, by id.
+  var hostId = ""
+  for i in 0 ..< list.len:
+    let one = whole(list.items[i])
+    if one.field("parentId").asText("") == equipmentId and
+       one.field("slotId").asText("") == r.slot and
+       one.field("_tpl").asText("") == r.tpl:
+      hostId = one.field("_id").asText("")
+      break
+  if hostId.len == 0:
+    return
+  let ch = chamberName(r.tpl)
+  # 2. its direct children: the magazine in mod_magazine, the chambered round.
+  var magIds: seq[string] = @[]
+  for i in 0 ..< list.len:
+    let one = whole(list.items[i])
+    if one.field("parentId").asText("") != hostId:
+      continue
+    let slot = one.field("slotId").asText("")
+    if slot == "mod_magazine" and
+       (r.magazine.len == 0 or one.field("_tpl").asText("") == r.magazine):
+      r.magPlaced = r.magPlaced + 1
+      magIds.add one.field("_id").asText("")
+    elif ch.len > 0 and slot == ch:
+      let n = one.field("upd").field("StackObjectsCount").asInt(1)
+      r.chambered = r.chambered + (if n > 0: n else: 1)
+  # 3. the rounds inside those magazines.
+  if magIds.len == 0:
+    return
+  for i in 0 ..< list.len:
+    let one = whole(list.items[i])
+    if one.field("slotId").asText("") != "cartridges":
+      continue
+    let parent = one.field("parentId").asText("")
+    var mine = false
+    for m in magIds:
+      if m == parent:
+        mine = true
+    if not mine:
+      continue
+    let n = one.field("upd").field("StackObjectsCount").asInt(1)
+    r.roundsPlaced = r.roundsPlaced + (if n > 0: n else: 1)
 
 proc applyLoadout*(body: string): LoadoutReport =
   ## Mint a declared loadout into a profile, then read the profile back and say
@@ -688,12 +962,43 @@ proc applyLoadout*(body: string): LoadoutReport =
       inv.items.add d
       inv.dirty = true
       reqs[i].minted = 1
-      if reqs[i].ammo.len > 0:
+      if reqs[i].magazine.len > 0:
+        # A weapon. The magazine goes IN it, and the ammo goes in the magazine;
+        # `fillCartridges` on the weapon itself would refuse (measured: a weapon
+        # declares Chambers, not Cartridges) and that refusal was the whole bug.
+        var magId = ""
+        var rounds = 0
+        var why = ""
+        if not mountMagazine(inv.items, nid, tpl, reqs[i].magazine,
+                             reqs[i].ammo, magId, rounds, why):
+          reqs[i].why = why
+          result.rejected.add reqs[i].query & ": " & why
+        elif rounds == 0:
+          reqs[i].why = why
+          result.rejected.add reqs[i].query & ": " & why
+        elif why.len > 0:
+          result.observations.add reqs[i].query & ": " & why
+      elif reqs[i].ammo.len > 0 and chamberName(tpl).len == 0:
+        # Only fill the item itself when it is NOT chamber-shaped. A chambered
+        # item with `ammo` and no `magazine` falls through to the chamber below,
+        # and `fillCartridges`'s own refusal names the missing `magazine`.
         var why = ""
         let rounds = fillCartridges(inv.items, nid, tpl, reqs[i].ammo, why)
         if rounds == 0 and why.len > 0:
           reqs[i].why = why
           result.rejected.add reqs[i].query & ": " & why
+      if reqs[i].chamber and reqs[i].ammo.len > 0:
+        var cw = ""
+        if chamberRound(inv.items, nid, tpl, reqs[i].ammo, cw) == 0 and
+           cw.len > 0:
+          result.observations.add reqs[i].query & ": " & cw
+      if reqs[i].ammo.len > 0 and reqs[i].magazine.len == 0 and
+         chamberName(tpl).len > 0:
+        let w = tpl & " is a chambered item and no `magazine` was named, so " &
+                "it spawns with at most a chambered round and NO magazine. " &
+                "GetCurrentMagazine() will read null in raid."
+        reqs[i].why = w
+        result.rejected.add reqs[i].query & ": " & w
     of whInside:
       var containerTpl = ""
       let containerId = wornIn(inv.items, equipmentId, reqs[i].inside,
@@ -802,6 +1107,29 @@ proc applyLoadout*(body: string): LoadoutReport =
       reqs[i].why = "asked for " & $reqs[i].count & ", read back " &
                     $reqs[i].placed & " -- minted " & $reqs[i].minted &
                     ", so it was lost between the mint and the store"
+    countMounted(backItems, reqs[i], backEquip)
+    if reqs[i].magazine.len > 0:
+      # These are FAILS, not observations. A weapon whose magazine did not
+      # survive the round trip is the exact state that made every in-raid
+      # magazine cycle report a null GetCurrentMagazine(), and it is the thing
+      # this feature exists to make impossible to ship silently.
+      if reqs[i].magPlaced == 0:
+        let w = "a " & reqs[i].magazine & " was asked for in " & reqs[i].tpl &
+                "'s mod_magazine slot and NONE was read back off the saved " &
+                "profile. GetCurrentMagazine() will read null in raid."
+        if reqs[i].why.len == 0: reqs[i].why = w
+        result.rejected.add reqs[i].query & ": " & w
+      elif reqs[i].roundsPlaced == 0:
+        let w = "the " & reqs[i].magazine & " IS mounted in " & reqs[i].tpl &
+                " and read back ZERO rounds. An empty magazine is not a " &
+                "loaded one; a reload test against it proves nothing."
+        if reqs[i].why.len == 0: reqs[i].why = w
+        result.rejected.add reqs[i].query & ": " & w
+      else:
+        result.observations.add reqs[i].query & ": read back " &
+          $reqs[i].magPlaced & " x " & reqs[i].magazine & " in mod_magazine, " &
+          $reqs[i].roundsPlaced & " round(s) inside, " & $reqs[i].chambered &
+          " chambered"
   result.reqs = reqs
   result.placed = 0
   for r in reqs:
@@ -854,6 +1182,15 @@ proc verifyLoadout*(body: string): LoadoutReport =
     reqs[i].placed = countPlaced(itemsJson, reqs[i], equipmentId, stash)
     if reqs[i].placed < reqs[i].count:
       reqs[i].why = "expected " & $reqs[i].count & ", found " & $reqs[i].placed
+    # The same finished-state walk `applyLoadout` uses, so a "is my loadout
+    # still intact after the raid?" check sees a magazine that was fired dry or
+    # dropped, instead of only that the rifle is still worn.
+    countMounted(itemsJson, reqs[i], equipmentId)
+    if reqs[i].magazine.len > 0 and reqs[i].magPlaced == 0:
+      let w = "no " & reqs[i].magazine & " is in " & reqs[i].tpl &
+              "'s mod_magazine slot"
+      if reqs[i].why.len == 0: reqs[i].why = w
+      result.rejected.add reqs[i].query & ": " & w
   result.reqs = reqs
   for r in reqs:
     result.placed = result.placed + r.placed
@@ -951,3 +1288,91 @@ proc selfCheckLoadout*(into: var seq[string]): bool =
     into.add "loadout: the report does not carry requested/minted/placed as " &
              "three separate numbers"
     result = false
+
+  # ---- the weapon / magazine fix ------------------------------------------
+  #
+  # These need the DATABASE but no profile, so they run wherever the mod is
+  # loaded. Each one is a NEGATIVE: the thing that must be refused, refused.
+
+  # `magazine` without `ammo` must be refused by the parser and must SAY so. An
+  # empty mounted magazine is indistinguishable in raid from no magazine.
+  var pid4 = ""
+  var clr4 = false
+  var probs4: seq[string] = @[]
+  let noAmmo = parseSpec("{\"profileId\":\"a\",\"gear\":[{\"tpl\":" &
+    "\"5447a9cd4bdc2dbd208b4567\",\"slot\":\"FirstPrimaryWeapon\"," &
+    "\"magazine\":\"55d4887d4bdc2d962f8b4570\"}]}", pid4, clr4, probs4)
+  if noAmmo.len != 0:
+    into.add "loadout: `magazine` with no `ammo` was accepted; a magazine " &
+             "mounted empty is not a loaded weapon"
+    result = false
+  if probs4.len == 0 or probs4[0].find("magazine") < 0:
+    into.add "loadout: the refusal for `magazine` without `ammo` did not name " &
+             "the field"
+    result = false
+
+  # The database-shape facts this whole feature rests on. If a Tarkov update
+  # moves them, EVERY weapon loadout silently reverts to the old broken shape,
+  # so they are asserted rather than assumed. Skipped, not failed, when the
+  # database is not loaded -- "I could not look" is not a pass and is not a
+  # failure either.
+  if itemExists("5447a9cd4bdc2dbd208b4567") and
+     itemExists("55d4887d4bdc2d962f8b4570"):
+    if chamberName("5447a9cd4bdc2dbd208b4567") != "patron_in_weapon":
+      into.add "loadout: the M4A1 no longer declares " &
+               "_props.Chambers[0]._name = patron_in_weapon; the chambered-" &
+               "item detection this feature rests on is stale"
+      result = false
+    if chamberName("55d4887d4bdc2d962f8b4570").len != 0:
+      into.add "loadout: a STANAG magazine now reports a chamber, so " &
+               "chamberName no longer distinguishes weapons from magazines"
+      result = false
+    if cartridgeCapacity("5447a9cd4bdc2dbd208b4567") != 0:
+      into.add "loadout: the M4A1 now reports a cartridge capacity; the " &
+               "weapon/magazine split this feature rests on has changed"
+      result = false
+    if cartridgeCapacity("55d4887d4bdc2d962f8b4570") <= 0:
+      into.add "loadout: the STANAG magazine reports no cartridge capacity, " &
+               "so no magazine can be loaded at all"
+      result = false
+    # The filter must ADMIT the STANAG and must REFUSE something it does not
+    # list. A filter check that only ever says yes is not a check.
+    var w1 = ""
+    if not slotAccepts("5447a9cd4bdc2dbd208b4567", "mod_magazine",
+                       "55d4887d4bdc2d962f8b4570", w1):
+      into.add "loadout: the M4A1's mod_magazine filter no longer admits the " &
+               "STANAG -- " & w1
+      result = false
+    var w2 = ""
+    if slotAccepts("5447a9cd4bdc2dbd208b4567", "mod_magazine",
+                   "590c678286f77426c9660122", w2):
+      into.add "loadout: the M4A1's mod_magazine slot accepted an IFAK, so " &
+               "the filter is not being read and NOTHING is being validated"
+      result = false
+    if w2.len == 0:
+      into.add "loadout: a refused magazine produced no reason"
+      result = false
+    # A slot that does not exist must be refused as a missing slot, not as an
+    # empty filter that admits everything.
+    var w3 = ""
+    if slotAccepts("55d4887d4bdc2d962f8b4570", "mod_magazine",
+                   "55d4887d4bdc2d962f8b4570", w3):
+      into.add "loadout: a magazine was said to have a mod_magazine slot"
+      result = false
+    # THE CHAMBER IS NOT IN `_props.Slots`. This assertion exists because the
+    # first version of `slotAccepts` searched only `Slots`, answered "the M4A1
+    # has no patron_in_weapon slot" for a chamber that plainly exists, and would
+    # have left every weapon unchambered with a confident wrong reason. Caught
+    # by cross-checking against db.json, not by the compiler.
+    var w4 = ""
+    if not slotAccepts("5447a9cd4bdc2dbd208b4567", "patron_in_weapon",
+                       "54527ac44bdc2d36668b4567", w4):
+      into.add "loadout: the M4A1's chamber will not admit M855A1 -- " & w4 &
+               " (is _props.Chambers still being searched?)"
+      result = false
+    var w5 = ""
+    if slotAccepts("5447a9cd4bdc2dbd208b4567", "patron_in_weapon",
+                   "590c678286f77426c9660122", w5):
+      into.add "loadout: the M4A1's chamber accepted an IFAK, so the chamber " &
+               "filter is not being read"
+      result = false
