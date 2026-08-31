@@ -393,20 +393,45 @@ proc onProfileList(url, body, session: string): string =
   ## behaviour rather than something to avoid.
   var a = arr()
   let all = allProfileIds()
-  # Deduplicate by id. `allProfileIds` reads the store directory, and anything
-  # that parses to a profile there -- a stray backup a careless hand left beside
-  # the real file, a half-written temp -- would otherwise be listed as a second
-  # profile with the same `_id`. The client's own profile prep does a
-  # `SingleOrDefault` over this list and throws "Sequence contains more than one
-  # matching element" on the duplicate, which reads as a menu crash far from its
-  # cause. One entry per id, whatever the store dir happens to hold.
+  # Deduplicate on the PARSED `_id`, which is what the client keys on -- NOT on
+  # the id `allProfileIds` derives from the store FILENAME.
+  #
+  # This used to dedup on the filename key, and its own comment warned about "a
+  # stray backup a careless hand left beside the real file" while being unable to
+  # catch one: on 2026-08-31 a backup written as
+  # `profile.<id>.bak-availableAfter-<ts>` produced a DIFFERENT filename key and
+  # the SAME `_id` inside, so it sailed through the check and both were served.
+  # The client's profile prep does a `SingleOrDefault` over this list and threw
+  # `InvalidOperationException: Sequence contains more than one matching element`
+  # (EFT.TarkovApplication.IsLeaving / ProfileDataLoader.Apply), which reads as a
+  # menu crash a long way from its cause.
+  #
+  # Keying on the value the client itself keys on is the whole point: no stray
+  # file in the store dir can reproduce it, whatever it is named. A profile whose
+  # `_id` will not parse is NOT silently dropped -- it falls back to the filename
+  # key, because dropping a real profile is worse than serving an odd one.
+  #
+  # The migration's own backups use a `profilebak.` prefix and are not picked up
+  # by `allProfileIds` at all (measured: 3 `profile.*` files -> 3 PMC entries);
+  # this change is downstream of that and does not affect it.
   var seenIds: seq[string] = @[]
+  var seenScavIds: seq[string] = @[]
   for id in all:
-    if id in seenIds:
-      continue
-    seenIds.add id
     var p = loadProfile(id)
     if p.ok:
+      var key = p.docId
+      if key.len == 0:
+        key = id
+      if key in seenIds:
+        # Named, at warn level, because a silently deduped duplicate is how this
+        # bug stayed invisible: the client crashed and the server looked healthy.
+        warn "profile list: DROPPED a duplicate of _id " & key &
+             " served from store key " & profileKey(id) &
+             " -- a stray file beside the real profile. The client does " &
+             "SingleOrDefault over this list and throws on a duplicate; " &
+             "move or delete that file."
+        continue
+      seenIds.add key
       # The progression floors, applied to the STORED profile before it is
       # served. Here rather than at creation because the settings are editable
       # after a character exists, and a floor that only ran once would be a row
@@ -425,7 +450,20 @@ proc onProfileList(url, body, session: string): string =
       # order and shows the second as the scav character.
       let sc = scavText(p, nowSeconds())
       if sc.len > 0:
-        a.add raw(sc)
+        # Same rule for the scav, and it is NOT redundant: the scav's `_id` comes
+        # from the PMC's `savage` field, so two PMCs with distinct `_id`s can
+        # still name the same scav and put the same id in the list twice. Keyed
+        # on the scav document's own `_id`, falling back to the PMC's `savage`.
+        var sk = field(sc, "_id").asText("")
+        if sk.len == 0:
+          sk = p.scavId
+        if sk.len > 0 and sk in seenScavIds:
+          warn "profile list: DROPPED a duplicate SCAV of _id " & sk &
+               " (PMC " & key & ", store key " & profileKey(id) & ")"
+        else:
+          if sk.len > 0:
+            seenScavIds.add sk
+          a.add raw(sc)
   result = envelope(a)
 
 proc sideToInt(side: string): int =

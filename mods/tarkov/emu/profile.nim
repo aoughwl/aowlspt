@@ -101,6 +101,16 @@ proc experience*(p: Profile): int = p.field("Info.Experience").asInt(0)
 proc stashId*(p: Profile): string = p.field("Inventory.stash").asText("")
 proc scavId*(p: Profile): string = p.field("savage").asText("")
 
+proc docId*(p: Profile): string =
+  ## The `_id` INSIDE the document, which is what the client keys on -- NOT
+  ## `p.id`, which is derived from the store FILENAME. The two diverge exactly
+  ## when a stray copy sits beside the real file: on 2026-08-31 a backup named
+  ## `profile.<id>.bak-availableAfter-<ts>` gave a different filename key but
+  ## carried the same `_id`, so both were served and the client's
+  ## `SingleOrDefault` threw "Sequence contains more than one matching element".
+  ## Dedup on THIS, and no stray file in the store dir can reproduce it.
+  result = p.field("_id").asText("")
+
 # ---------------------------------------------------------------------------
 # What a new character looks like
 # ---------------------------------------------------------------------------

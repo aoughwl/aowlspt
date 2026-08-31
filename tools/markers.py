@@ -965,8 +965,27 @@ def deploy_parity(C):
 
 
 def _looks_like_path(s):
+    # `os.path.isfile`, NOT `os.path.exists`. MEASURED 2026-08-31: `--for host`
+    # was refused from the repo root as "looks like a path", because the repo
+    # root contains a DIRECTORY named `host/` and `exists()` said yes. `host` is
+    # a declared artifact name and the refusal was simply wrong -- an agent lost
+    # a check to it. A directory is never the artifact file, so it cannot be the
+    # thing that makes a name look like a path.
     return ("/" in s or "\\" in s or s.lower().endswith((".dll", ".exe"))
-            or os.path.exists(s))
+            or os.path.isfile(s))
+
+
+def _is_declared_artifact(name):
+    """True if `name` is a logical artifact declared in deploy.json.
+
+    Consulted BEFORE the heuristic: a name that is actually declared is a name,
+    whatever it happens to look like. The heuristic exists only to give a good
+    error for something that is NOT declared.
+    """
+    try:
+        return any(a.get("name") == name for a in load_deploy_artifacts())
+    except Exception:
+        return False
 
 
 def main(argv):
@@ -1028,7 +1047,8 @@ def main(argv):
         return 0
 
     declared_prov = None
-    if args.for_ and _looks_like_path(args.for_):
+    if (args.for_ and not _is_declared_artifact(args.for_)
+            and _looks_like_path(args.for_)):
         # Two agents hit this and could not tell WHY, because the old error
         # echoed the path back without saying what --for actually takes.
         print("markers.py: --for takes a LOGICAL ARTIFACT NAME declared in "
