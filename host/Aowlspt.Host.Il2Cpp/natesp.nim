@@ -125,6 +125,33 @@ proc cNeCostOver(ph: int32): int64 {.importc: "aowl_ne_cost_over", nodecl.}
 proc cNeGapMeanNs(): int64 {.importc: "aowl_ne_gap_mean_ns", nodecl.}
 proc cNeGapSamples(): int64 {.importc: "aowl_ne_gap_samples", nodecl.}
 proc cNeCostDropped(): int64 {.importc: "aowl_ne_cost_dropped", nodecl.}
+# p95 saturation -- see the header. A percentile that is a sentinel is not a
+# percentile, and the only safe shape is a value the caller MUST branch on.
+proc cNeP95Sat(): int64 {.importc: "aowl_ne_p95_sat", nodecl.}
+proc cNeTopEdgeNs(): int64 {.importc: "aowl_ne_top_edge_ns", nodecl.}
+proc cNeCostOvf(ph: int32): int64 {.importc: "aowl_ne_cost_ovf", nodecl.}
+proc cNeGapPhMeanNs(ph: int32): int64 {.importc: "aowl_ne_gap_ph_mean_ns", nodecl.}
+proc cNeGapPhSamples(ph: int32): int64 {.importc: "aowl_ne_gap_ph_samples", nodecl.}
+# THE POSITIVE CONTROL.
+proc cNeCtrlOut() {.importc: "aowl_ne_ctrl_out", nodecl.}
+proc cNeCtrlIn() {.importc: "aowl_ne_ctrl_in", nodecl.}
+proc cNeCtrlMeanNs(which: int32): int64 {.importc: "aowl_ne_ctrl_mean_ns", nodecl.}
+proc cNeCtrlMaxNs(which: int32): int64 {.importc: "aowl_ne_ctrl_max_ns", nodecl.}
+proc cNeCtrlSamples(which: int32): int64 {.importc: "aowl_ne_ctrl_samples", nodecl.}
+# SUB-PHASE brackets, for outcome (B).
+proc cNeSubBegin(id: int32) {.importc: "aowl_ne_sub_begin", nodecl.}
+proc cNeSubEnd(id: int32) {.importc: "aowl_ne_sub_end", nodecl.}
+proc cNeSubMeanNs(id: int32): int64 {.importc: "aowl_ne_sub_mean_ns", nodecl.}
+proc cNeSubMaxNs(id: int32): int64 {.importc: "aowl_ne_sub_max_ns", nodecl.}
+proc cNeSubSamples(id: int32): int64 {.importc: "aowl_ne_sub_samples", nodecl.}
+proc cNeSubName(id: int32): cstring {.importc: "aowl_ne_sub_name", nodecl.}
+const
+  NeSubScan    = 0'i32
+  NeSubProject = 1'i32
+  NeSubSort    = 2'i32
+  NeSubApply   = 3'i32
+  NeSubVerdict = 4'i32
+  NeSubN       = 5'i32
 proc cNeBudgetNs(): int64 {.importc: "aowl_ne_budget_ns", nodecl.}
 proc cNeMinSamples(): int64 {.importc: "aowl_ne_min_samples", nodecl.}
 proc cNePhaseName(ph: int32): cstring {.importc: "aowl_ne_phase_name", nodecl.}
@@ -1769,6 +1796,10 @@ proc nePlace(sw, sh: float64) =
 
   # ---- PASS 1: project every contact once, into fixed scratch arrays -------
   # Capped by gNeCn <= NeMaxContacts (64), a compile-time constant.
+  # SUB-PHASE BRACKET. Around the WHOLE loop, never per iteration: the loop has
+  # `continue` exits, and a per-iteration end that some paths skip is a meter
+  # that silently under-reports exactly the iterations that were unusual.
+  cNeSubBegin(NeSubProject)
   var c = 0
   while c < gNeCn:
     let ci = c
@@ -1791,6 +1822,7 @@ proc nePlace(sw, sh: float64) =
     gNePz[gNePn] = float32(cDuScreenZ())
     gNeOrd[gNePn] = int32(ci)
     inc gNePn
+  cNeSubEnd(NeSubProject)
 
   # ---- PASS 2: partial selection sort, NEAREST FIRST ----------------------
   # Only the first `want` positions are ever settled, so the cost is
@@ -1798,6 +1830,7 @@ proc nePlace(sw, sh: float64) =
   # is the whole reason this is not a full sort and not a heap. Nothing is
   # allocated; `gNeOrd` is an index permutation over the census arrays.
   let want = (if gNePn < gNeBuilt: gNePn else: gNeBuilt)
+  cNeSubBegin(NeSubSort)
   var s = 0
   while s < want:
     var best = s
@@ -1811,12 +1844,17 @@ proc nePlace(sw, sh: float64) =
       let tz = gNePz[s]; gNePz[s] = gNePz[best]; gNePz[best] = tz
       let to = gNeOrd[s]; gNeOrd[s] = gNeOrd[best]; gNeOrd[best] = to
     inc s
+  cNeSubEnd(NeSubSort)
 
   # everything past `want` is the FARTHEST of the projected contacts and is the
   # bounded, named, counted miss the drop policy promises
   gNeDropped = gNeDropped + (gNePn - want)
 
   # ---- PASS 3: place the winners -----------------------------------------
+  # This is the only sub-phase that CALLS INTO THE GAME per box (set_color,
+  # set_sizeDelta, set_anchoredPosition, SetActive), so if the control says the
+  # cost is real this is the first place to look.
+  cNeSubBegin(NeSubApply)
   var idx = 0
   while idx < want:
     let ci = int(gNeOrd[idx])
@@ -1864,6 +1902,7 @@ proc nePlace(sw, sh: float64) =
     inc idx
   # hide the tail of the flat pool that this frame did not use
   neHideAllFrom(want)
+  cNeSubEnd(NeSubApply)
 
 # ---------------------------------------------------------------------------
 # THE VERDICT -- §9b. Three outcomes, and PASS is a READBACK.
@@ -1968,30 +2007,96 @@ proc neCostLine(): string =
   let mx     = cNeCostMaxNs(NePhRun)
   let over   = cNeCostOver(NePhRun)
 
+  # HOW p95 IS ALLOWED TO BE PRINTED. Exactly one place, and it refuses to
+  # render the saturation code as a duration. The measured 2026-08-31 line read
+  # "FAIL: p95 9223372036854775.8us EXCEEDS the budget 250.0us" -- INT64_MAX/1000
+  # wearing the units of a measurement. Formatting is where that leaked, so the
+  # guard lives in the formatter.
+  let p95Sat = (p95 == cNeP95Sat())
+  let p95Txt =
+    if p95Sat:
+      ">= " & neUs(cNeTopEdgeNs()) & " (histogram SATURATED -- " &
+      $cNeCostOvf(NePhRun) & " sample(s) above the top bucket; this is NOT a " &
+      "number, it is the absence of one)"
+    else: neUs(p95)
+
   # THE VERDICT. Three outcomes, never two.
   var verdict: string
-  if n <= 0'i64:
+  if p95Sat and n > 0'i64:
+    # A saturated histogram cannot support ANY verdict, and above all not a
+    # FAIL quoting the sentinel. It is inconclusive about the budget while
+    # still being a loud statement that the samples are large.
+    verdict = "INCONCLUSIVE: the p95 is " & p95Txt & ", so the budget " &
+              neUs(budget) & " can be neither met nor missed on this evidence. " &
+              "The samples are LARGE -- mean " & neUs(mean) & ", max " &
+              neUs(mx) & " -- but the histogram cannot place the 95th, so no " &
+              "PASS and no FAIL is claimed here. Read the control below: it, " &
+              "not this line, says whether the bracket is measuring our work."
+  elif n <= 0'i64:
     verdict = "INCONCLUSIVE (0 steady-state tick(s) recorded -- the pool has " &
               "never run, so nothing was measured; this is NOT a pass)"
   elif n < cNeMinSamples():
     verdict = "INCONCLUSIVE (" & $n & " of the " & $cNeMinSamples() &
               " steady-state tick(s) needed before a verdict is meaningful)"
   elif p95 > budget:
-    verdict = "FAIL: p95 " & neUs(p95) & " EXCEEDS the budget " & neUs(budget) &
+    verdict = "FAIL: p95 " & p95Txt & " EXCEEDS the budget " & neUs(budget) &
               " for this path (" & $over & " of " & $n & " tick(s) over " &
               "budget). The per-frame ESP path is too expensive and must do " &
               "less work per frame, not the same work faster."
   elif mx > budget * 8:
-    verdict = "FAIL: p95 " & neUs(p95) & " is inside the budget " &
+    verdict = "FAIL: p95 " & p95Txt & " is inside the budget " &
               neUs(budget) & " but ONE tick cost " & neUs(mx) & " (>8x). A " &
               "single stall of that size is a visible hitch even though the " &
               "typical frame is cheap."
   else:
-    verdict = "PASS: p95 " & neUs(p95) & " <= budget " & neUs(budget) &
+    verdict = "PASS: p95 " & p95Txt & " <= budget " & neUs(budget) &
               ", max " & neUs(mx) & ", " & $over & " over-budget tick(s)"
 
   result = "cost[run]: " & verdict & ". mean=" & neUs(mean) & " p95<=" &
-           neUs(p95) & " max=" & neUs(mx) & " over " & $n & " tick(s)"
+           p95Txt & " max=" & neUs(mx) & " over " & $n & " tick(s)"
+
+  # ---- THE POSITIVE CONTROL, and it is read BEFORE the verdict is believed --
+  #
+  # WHY THIS EXISTS. The run phase measured a 30ms mean for a body bounded at
+  # <=64 projections, <=4096 float compares and <=64 setter calls. Those two
+  # cannot both be true, and no amount of reading the body settles which is
+  # wrong -- both stories produce the same source. So: 512 integer adds,
+  # bracketed by the SAME clock helpers, in the SAME place in the tick. It is
+  # the only thing here that discriminates, which is why it is printed next to
+  # the verdict and not in a footnote.
+  let ctrlO = cNeCtrlMeanNs(0'i32)
+  let ctrlI = cNeCtrlMeanNs(1'i32)
+  if cNeCtrlSamples(0'i32) <= 0'i64:
+    result = result & ". CONTROL: not sampled yet, so whether this bracket " &
+             "measures our work or the frame is UNDECIDED -- and an undecided " &
+             "control means the verdict above is not yet evidence of anything"
+  else:
+    result = result & ". CONTROL (512 integer adds, same clock, same place in " &
+             "the tick): out-of-guard mean=" & neUs(ctrlO) & " max=" &
+             neUs(cNeCtrlMaxNs(0'i32)) & " n=" & $cNeCtrlSamples(0'i32) &
+             ", in-guard mean=" & neUs(ctrlI) & " max=" &
+             neUs(cNeCtrlMaxNs(1'i32)) & " n=" & $cNeCtrlSamples(1'i32) & " -- "
+    # The reading is MECHANICAL. No judgement call is left to the reader,
+    # because "78% of a tick, which is near the ~80% line" is exactly the shape
+    # of non-answer this control was built to replace.
+    if ctrlO > 1000000'i64 or ctrlI > 1000000'i64:
+      result = result & "(A) THE BRACKET IS MEASURING THE FRAME, NOT THE WORK. " &
+               "Work that provably costs nanoseconds is being timed at " &
+               "milliseconds by this same bracket, so the run-phase number " &
+               "above is an INSTRUMENT ARTIFACT and the ESP path has NOT been " &
+               "shown to be expensive. Fix the bracket, not the ESP."
+    elif mean > cNeBudgetNs():
+      result = result & "(B) THE COST IS REAL. The identical bracket prices " &
+               "trivial work in microseconds while the ESP body reports " &
+               neUs(mean) & ", so the difference is work, not measurement. " &
+               "The sub-phase lines below say WHICH call carries it."
+    else:
+      result = result & "the control is cheap and so is the body; nothing to " &
+               "explain away"
+    if ctrlO <= 1000000'i64 and ctrlI > (ctrlO * 8 + 100000'i64):
+      result = result & " NOTE: the IN-GUARD control is far dearer than the " &
+               "out-of-guard one, so SEH guard entry itself is carrying cost. " &
+               "That is neither (A) nor (B) and has not been seen before."
 
   # IS THE METER MEASURING THE BODY, OR A FRAME? The decisive comparison, and
   # the reason it is printed rather than reasoned about: the bracket and the
@@ -1999,16 +2104,39 @@ proc neCostLine(): string =
   # within a whisker of the interval, the bracket is spanning the frame wait and
   # the number describes the game, not us. If it is a small fraction, the cost
   # is genuinely ours.
+  #
+  # AND IT MUST BE THE RUN PHASE'S OWN INTERVAL. The measured line compared a
+  # RUN-phase body mean against the LIFETIME interval mean over every phase --
+  # 654 raid ticks against 5477 ticks that were mostly menu. It printed 38ms for
+  # an interval that was ~100ms during the raid, and so reported "78% of a tick"
+  # for something nearer 30%. Two populations, one ratio, no meaning.
+  let gapPh = cNeGapPhMeanNs(NePhRun)
   let gap = cNeGapMeanNs()
-  if gap > 0 and mean > 0:
-    let pct = (mean * 100) div gap
-    result = result & ". Tick-to-tick interval mean=" & neUs(gap) & " over " &
-             $cNeGapSamples() & " tick(s), so the guarded body is " & $pct &
-             "% of one tick interval -- above ~80% would mean the BRACKET is " &
-             "spanning the frame wait and the cost is not ours to fix"
+  if gapPh > 0 and mean > 0:
+    let pct = (mean * 100) div gapPh
+    result = result & ". RUN-phase tick-to-tick interval mean=" & neUs(gapPh) &
+             " over " & $cNeGapPhSamples(NePhRun) & " run tick(s) (" &
+             $(1000000000'i64 div (if gapPh > 0: gapPh else: 1'i64)) &
+             " fps equivalent), so the guarded body is " & $pct &
+             "% of one RUN tick interval. This ratio is now phase-matched; it " &
+             "used to divide a run-phase body by an all-phase interval. It is " &
+             "still only a hint -- the CONTROL above is what decides"
   else:
-    result = result & ". Tick interval not sampled yet, so body-vs-frame is " &
-             "UNDECIDED"
+    result = result & ". RUN-phase tick interval not sampled yet, so " &
+             "body-vs-frame is UNDECIDED"
+  if gap > 0:
+    result = result & ". (All-phase interval mean=" & neUs(gap) & " over " &
+             $cNeGapSamples() & " tick(s), reported only so the two are never " &
+             "confused again; it is NOT the denominator.)"
+
+  # ---- WHICH CALL, if the control says (B) --------------------------------
+  var sb = 0'i32
+  while sb < NeSubN:
+    if cNeSubSamples(sb) > 0'i64:
+      result = result & ". sub[" & $cNeSubName(sb) & "]: mean=" &
+               neUs(cNeSubMeanNs(sb)) & " max=" & neUs(cNeSubMaxNs(sb)) &
+               " n=" & $cNeSubSamples(sb)
+    sb = sb + 1'i32
 
   # Every other phase, named, so nothing is silently folded into the budgeted
   # one and a fat discovery walk is visible as a discovery walk.
@@ -2099,6 +2227,11 @@ proc neVerdictLine(sw, sh: float64): string =
 # THE TICK -- one body, one guard, ridden on the existing Update drain
 # ---------------------------------------------------------------------------
 proc neTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ne_tick_body", cdecl.} =
+  # THE IN-GUARD HALF OF THE POSITIVE CONTROL. 512 integer adds, same clock, at
+  # the top of the guarded body -- so the pair (ctrl_out, ctrl_in) prices SEH
+  # guard entry as well as the bracket itself. It touches no pointer and calls
+  # nothing, so it cannot be the thing that faults.
+  cNeCtrlIn()
   var sw = 0.0
   var sh = 0.0
   let gate = neRaidGate(sw, sh)
@@ -2191,9 +2324,14 @@ proc neTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ne_tick_body", cdecl.}
       return cast[Il2CppPtr](1)
     # From here on this tick IS the steady state: the only phase under budget.
     cNeCostPhase(NePhRun)
-    if (gNeTicks mod int64(cNeScanEvery())) == 0: neScan()
+    if (gNeTicks mod int64(cNeScanEvery())) == 0:
+      cNeSubBegin(NeSubScan)
+      neScan()
+      cNeSubEnd(NeSubScan)
     nePlace(sw, sh)
+    cNeSubBegin(NeSubVerdict)
     gNeVerdict = neVerdict(sw, sh)
+    cNeSubEnd(NeSubVerdict)
   else:
     discard
   cast[Il2CppPtr](1)
@@ -2216,6 +2354,11 @@ proc natEspDrainTick() =
   # a tick that faults still spent time. `cost_end` is called on both exits for
   # that reason; skipping it on the fault path would quietly bias the mean
   # toward the cheap frames.
+  # THE OUT-OF-GUARD HALF OF THE POSITIVE CONTROL, taken immediately before the
+  # real bracket and therefore in the SAME PLACE IN THE TICK. If this trivial
+  # work also reports tens of milliseconds, the bracket is measuring the frame
+  # and not our work, and the run-phase FAIL is an instrument artifact.
+  cNeCtrlOut()
   cNeCostBegin()
   if cNeTickGuarded(nil) == nil:
     cNeCostEnd()

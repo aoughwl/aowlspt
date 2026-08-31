@@ -429,20 +429,55 @@ static int32_t aowl_ne_on_screen(float x, float y, float w, float h,
 #define AOWL_NE_MIN_SAMPLES 120
 
 /* Histogram edges in NANOSECONDS, for a real p95 instead of mean-and-max.
- * A mean plus a max cannot say whether one 350ms outlier carries the mean. */
-#define AOWL_NE_NB 14
+ * A mean plus a max cannot say whether one 350ms outlier carries the mean.
+ *
+ * WHY THE EDGES CHANGED -- measured 2026-08-31, live raid.
+ *
+ * The previous table's LAST edge was INT64_MAX, and `p95_ns` returned that edge
+ * when the 95th sample landed in it. The run phase measured a 30ms mean against
+ * a 20ms top edge, so EVERY sample fell in that final bucket and the verdict
+ * printed:
+ *
+ *     FAIL: p95 9223372036854775.8us EXCEEDS the budget 250.0us
+ *
+ * 9223372036854775.8us is INT64_MAX/1000. That is a SENTINEL rendered as a
+ * measurement -- a confidently wrong diagnostic, which this project treats as
+ * worse than no diagnostic, because a reader has no way to tell it from a
+ * number. Two changes, and they are one change:
+ *
+ *  1. The edge table is now entirely FINITE and reaches 1s, so a 30ms or 51ms
+ *     sample lands on a real bound instead of falling off the end.
+ *  2. Samples above the top edge go to a SEPARATE overflow counter, never to a
+ *     bucket with a printable edge. If the p95 lands there, `p95_ns` returns
+ *     AOWL_NE_P95_SAT and the caller is REQUIRED to say "histogram saturated,
+ *     INCONCLUSIVE". There is no longer any code path that can turn a
+ *     saturation into a numeral. */
+#define AOWL_NE_NB 19
 static const int64_t g_ne_edge[AOWL_NE_NB] = {
     1000LL, 2000LL, 5000LL, 10000LL, 20000LL, 50000LL, 100000LL,
-    250000LL, 500000LL, 1000000LL, 2000000LL, 5000000LL, 20000000LL,
-    0x7FFFFFFFFFFFFFFFLL };
+    250000LL, 500000LL, 1000000LL, 2000000LL, 5000000LL, 10000000LL,
+    20000000LL, 50000000LL, 100000000LL, 250000000LL, 500000000LL,
+    1000000000LL };
+/* Returned by `p95_ns` when the 95th sample is in the overflow counter. It is
+ * NEGATIVE precisely so that no arithmetic or formatting path can mistake it
+ * for a duration -- the old failure was a positive sentinel. */
+#define AOWL_NE_P95_SAT (-2LL)
 
 typedef struct {
     int64_t n, sum, max, over;      /* ns; `over` = samples > budget */
     int64_t h[AOWL_NE_NB];
+    int64_t ovf;                    /* samples ABOVE the top finite edge */
 } aowl_ne_bucket;
 
 static aowl_ne_bucket g_ne_cost[AOWL_NE_PH_N];
 static aowl_ne_bucket g_ne_gap;     /* tick-to-tick interval, all phases */
+/* PER-PHASE tick interval. The lifetime `g_ne_gap` mean folds menu ticks and
+ * raid ticks into one number: in the measured run it read 38ms while the raid's
+ * own interval was ~100ms, so "the body is 78% of a tick" was comparing a
+ * RUN-phase body against a mostly-MENU interval. The body-vs-frame question is
+ * only answerable when both sides come from the same phase. */
+static aowl_ne_bucket g_ne_gap_ph[AOWL_NE_PH_N];
+static int64_t g_ne_gap_pending = -1;   /* this tick's interval, ns; -1 = none */
 static int64_t g_ne_cost_t0   = 0;
 static int64_t g_ne_prev_t0   = 0;
 static int64_t g_ne_qpf       = 0;
@@ -454,25 +489,162 @@ static void aowl_ne_bucket_add(aowl_ne_bucket* b, int64_t ns) {
     b->n++; b->sum += ns;
     if (ns > b->max) b->max = ns;
     if (ns > AOWL_NE_BUDGET_NS) b->over++;
-    for (i = 0; i < AOWL_NE_NB; i++) { if (ns <= g_ne_edge[i]) { b->h[i]++; break; } }
+    for (i = 0; i < AOWL_NE_NB; i++) {
+        if (ns <= g_ne_edge[i]) { b->h[i]++; return; }
+    }
+    b->ovf++;                       /* above every finite edge: counted apart */
 }
 
-static void aowl_ne_cost_begin(void) {
+/* ---- THE ONE CLOCK ------------------------------------------------------
+ * Both the real bracket and the POSITIVE CONTROL below go through these two
+ * helpers, so the control cannot accidentally be timed by a different
+ * mechanism than the thing it is controlling for. That is the entire point of
+ * a control, and it is why these are factored out rather than duplicated. */
+static int64_t aowl_ne_qpc(void) {
     LARGE_INTEGER v;
     if (!g_ne_qpf) { LARGE_INTEGER f; QueryPerformanceFrequency(&f);
                      g_ne_qpf = (int64_t)f.QuadPart; }
     QueryPerformanceCounter(&v);
+    return (int64_t)v.QuadPart;
+}
+static int64_t aowl_ne_elapsed_ns(int64_t t0) {
+    if (g_ne_qpf <= 0) return -1;
+    return ((aowl_ne_qpc() - t0) * 1000000000LL) / g_ne_qpf;
+}
+
+static void aowl_ne_cost_begin(void) {
+    int64_t q = aowl_ne_qpc();
     /* The interval between consecutive tick STARTS. Sampled from the same
-     * clock as the body so the two are directly comparable. */
+     * clock as the body so the two are directly comparable. Held PENDING and
+     * filed at `cost_end`, once the tick has said which phase it was, so the
+     * per-phase interval and the per-phase body describe the same ticks. */
+    g_ne_gap_pending = -1;
     if (g_ne_prev_t0 && g_ne_qpf > 0) {
-        int64_t d = ((int64_t)v.QuadPart - g_ne_prev_t0);
-        if (d > 0 && d < g_ne_qpf * 10) aowl_ne_bucket_add(&g_ne_gap, (d * 1000000000LL) / g_ne_qpf);
+        int64_t d = q - g_ne_prev_t0;
+        if (d > 0 && d < g_ne_qpf * 10) {
+            g_ne_gap_pending = (d * 1000000000LL) / g_ne_qpf;
+            aowl_ne_bucket_add(&g_ne_gap, g_ne_gap_pending);
+        }
     }
-    g_ne_prev_t0 = (int64_t)v.QuadPart;
-    g_ne_cost_t0 = (int64_t)v.QuadPart;
+    g_ne_prev_t0 = q;
+    g_ne_cost_t0 = q;
     /* Default phase for a tick that faults before the body classified itself:
      * it is attributed, never silently dropped. */
     g_ne_phase = AOWL_NE_PH_GATE;
+}
+
+/* ---- THE POSITIVE CONTROL ----------------------------------------------
+ *
+ * THE QUESTION IT SETTLES, and why nothing else can settle it. The run phase
+ * measured a 30ms mean for a body whose declared bound is <=64 projections,
+ * <=4096 float compares and <=64 setter calls. That bound and that mean cannot
+ * both be true. Exactly two explanations survive:
+ *
+ *   (A) the BRACKET is wrong -- something between `cost_begin` and `cost_end`
+ *       blocks on the frame (a VSync wait, a render join, the drain being
+ *       invoked from a point that is not where we think it is), in which case
+ *       the number describes the game and the FAIL was an instrument artifact;
+ *   (B) the COST is real, and one of the calls inside is far more expensive
+ *       than a Win64 call has any right to be.
+ *
+ * No amount of reading the body distinguishes those, because both produce the
+ * same source. So: bracket a KNOWN-TRIVIAL operation with the SAME clock
+ * helpers, in the SAME place in the tick, and print what it says.
+ *
+ *   ctrl_out : taken immediately before the real bracket, OUTSIDE the SEH
+ *              guard.
+ *   ctrl_in  : taken at the top of the guarded body, INSIDE the SEH guard,
+ *              which additionally prices guard entry itself.
+ *
+ * Both do the identical trivial work: 512 integer adds into a volatile sink,
+ * so the optimiser cannot delete them and they cannot touch the game, the
+ * managed heap, or any pointer. Expected: single-digit microseconds.
+ *
+ * READING IT is mechanical, which is the point -- there is no judgement call:
+ *   ctrl tens of ms  -> (A). The bracket measures the frame. The run FAIL is an
+ *                       artifact and the ESP path was never shown to be costly.
+ *   ctrl microseconds
+ *   while run is ms  -> (B). The cost is real; read the sub-phase lines to see
+ *                       which call carries it.
+ *   ctrl_out cheap but ctrl_in expensive -> the SEH guard entry is the cost,
+ *                       which is neither of the above and would be new. */
+static aowl_ne_bucket g_ne_ctrl_out;
+static aowl_ne_bucket g_ne_ctrl_in;
+static volatile int64_t g_ne_ctrl_sink = 0;
+
+static void aowl_ne_ctrl_run(aowl_ne_bucket* into) {
+    int64_t t0 = aowl_ne_qpc();
+    int64_t acc = 0, ns;
+    int i;
+    for (i = 0; i < 512; i++) acc += (int64_t)i;
+    g_ne_ctrl_sink = acc;               /* volatile: not optimised away */
+    ns = aowl_ne_elapsed_ns(t0);
+    if (ns < 0 || ns > 10000000000LL) return;
+    aowl_ne_bucket_add(into, ns);
+}
+static void aowl_ne_ctrl_out(void) { aowl_ne_ctrl_run(&g_ne_ctrl_out); }
+static void aowl_ne_ctrl_in(void)  { aowl_ne_ctrl_run(&g_ne_ctrl_in);  }
+static int64_t aowl_ne_ctrl_mean_ns(int32_t which) {
+    aowl_ne_bucket* b = which ? &g_ne_ctrl_in : &g_ne_ctrl_out;
+    if (b->n <= 0) return -1;
+    return b->sum / b->n;
+}
+static int64_t aowl_ne_ctrl_max_ns(int32_t which) {
+    aowl_ne_bucket* b = which ? &g_ne_ctrl_in : &g_ne_ctrl_out;
+    return b->max;
+}
+static int64_t aowl_ne_ctrl_samples(int32_t which) {
+    aowl_ne_bucket* b = which ? &g_ne_ctrl_in : &g_ne_ctrl_out;
+    return b->n;
+}
+
+/* ---- SUB-PHASE BRACKETS, for outcome (B) -------------------------------
+ * If the control says the cost is real, the next question is WHICH call. These
+ * price the four things a steady-state tick does, each with its own t0 so they
+ * never nest and never clobber one another. They are only meaningful in the
+ * RUN phase; nothing else calls them. Cost of the instrument itself: two QPC
+ * reads per sub-phase per tick, ~30ns each. */
+#define AOWL_NE_SUB_SCAN    0   /* the census pass (every Nth tick)          */
+#define AOWL_NE_SUB_PROJECT 1   /* pass 1: <=64 WorldToScreen                */
+#define AOWL_NE_SUB_SORT    2   /* pass 2: <=4096 float compares, no calls   */
+#define AOWL_NE_SUB_APPLY   3   /* pass 3: set_color / sizeDelta / SetActive */
+#define AOWL_NE_SUB_VERDICT 4   /* the readback: <=64 * 3 il2cpp calls       */
+#define AOWL_NE_SUB_N       5
+static aowl_ne_bucket g_ne_sub[AOWL_NE_SUB_N];
+static int64_t g_ne_sub_t0[AOWL_NE_SUB_N];
+static void aowl_ne_sub_begin(int32_t id) {
+    if (id < 0 || id >= AOWL_NE_SUB_N) return;
+    g_ne_sub_t0[id] = aowl_ne_qpc();
+}
+static void aowl_ne_sub_end(int32_t id) {
+    int64_t ns;
+    if (id < 0 || id >= AOWL_NE_SUB_N || !g_ne_sub_t0[id]) return;
+    ns = aowl_ne_elapsed_ns(g_ne_sub_t0[id]);
+    g_ne_sub_t0[id] = 0;
+    if (ns < 0 || ns > 10000000000LL) return;
+    aowl_ne_bucket_add(&g_ne_sub[id], ns);
+}
+static int64_t aowl_ne_sub_mean_ns(int32_t id) {
+    if (id < 0 || id >= AOWL_NE_SUB_N || g_ne_sub[id].n <= 0) return -1;
+    return g_ne_sub[id].sum / g_ne_sub[id].n;
+}
+static int64_t aowl_ne_sub_max_ns(int32_t id) {
+    if (id < 0 || id >= AOWL_NE_SUB_N) return 0;
+    return g_ne_sub[id].max;
+}
+static int64_t aowl_ne_sub_samples(int32_t id) {
+    if (id < 0 || id >= AOWL_NE_SUB_N) return 0;
+    return g_ne_sub[id].n;
+}
+static const char* aowl_ne_sub_name(int32_t id) {
+    switch (id) {
+    case AOWL_NE_SUB_SCAN:    return "scan";
+    case AOWL_NE_SUB_PROJECT: return "project";
+    case AOWL_NE_SUB_SORT:    return "sort";
+    case AOWL_NE_SUB_APPLY:   return "apply";
+    case AOWL_NE_SUB_VERDICT: return "verdict";
+    default: return "?";
+    }
 }
 
 /* Called by the body once it knows which state it is executing. This is what
@@ -483,12 +655,16 @@ static void aowl_ne_cost_phase(int32_t ph) {
 }
 
 static void aowl_ne_cost_end(void) {
-    LARGE_INTEGER v;
     int64_t ns;
     if (!g_ne_cost_t0 || g_ne_qpf <= 0) return;
-    QueryPerformanceCounter(&v);
-    ns = (((int64_t)v.QuadPart - g_ne_cost_t0) * 1000000000LL) / g_ne_qpf;
+    ns = aowl_ne_elapsed_ns(g_ne_cost_t0);
     g_ne_cost_t0 = 0;
+    /* File this tick's INTERVAL under the phase the tick turned out to be, so
+     * body and interval are drawn from the same population. */
+    if (g_ne_gap_pending >= 0) {
+        aowl_ne_bucket_add(&g_ne_gap_ph[g_ne_phase], g_ne_gap_pending);
+        g_ne_gap_pending = -1;
+    }
     /* A refused sample is COUNTED. Silently dropping the pathological ones is
      * how a meter stops being able to report a bad number. */
     if (ns < 0 || ns > 10000000000LL) { g_ne_dropped++; return; }
@@ -498,9 +674,14 @@ static void aowl_ne_cost_end(void) {
 static void aowl_ne_cost_reset(void) {
     int i;
     for (i = 0; i < AOWL_NE_PH_N; i++) {
-        aowl_ne_bucket z; memset(&z, 0, sizeof(z)); g_ne_cost[i] = z;
+        aowl_ne_bucket z; memset(&z, 0, sizeof(z));
+        g_ne_cost[i] = z; g_ne_gap_ph[i] = z;
     }
-    { aowl_ne_bucket z; memset(&z, 0, sizeof(z)); g_ne_gap = z; }
+    for (i = 0; i < AOWL_NE_SUB_N; i++) {
+        aowl_ne_bucket z; memset(&z, 0, sizeof(z)); g_ne_sub[i] = z;
+    }
+    { aowl_ne_bucket z; memset(&z, 0, sizeof(z));
+      g_ne_gap = z; g_ne_ctrl_out = z; g_ne_ctrl_in = z; }
     g_ne_dropped = 0;
     /* t0 is deliberately LEFT ALONE: reset can be called from inside the
      * bracket, and clearing t0 there would make the enclosing tick vanish. */
@@ -523,7 +704,13 @@ static int64_t aowl_ne_cost_over(int32_t ph) {
     return g_ne_cost[ph].over;
 }
 /* Upper edge of the bucket holding the p95 sample -- an UPPER BOUND, stated as
- * such by the caller, never dressed up as an exact percentile. */
+ * such by the caller, never dressed up as an exact percentile.
+ *
+ * THREE RETURNS, never two: a real edge, -1 for "no samples", and
+ * AOWL_NE_P95_SAT for "the 95th sample is above the top finite edge". The old
+ * version had the overflow bucket carrying INT64_MAX as its edge and returned
+ * it, which is how a sentinel got printed as 9223372036854775.8us. There is now
+ * no edge in the table that is not a real duration. */
 static int64_t aowl_ne_cost_p95_ns(int32_t ph) {
     int64_t want, seen = 0; int i;
     if (ph < 0 || ph >= AOWL_NE_PH_N || g_ne_cost[ph].n <= 0) return -1;
@@ -532,13 +719,29 @@ static int64_t aowl_ne_cost_p95_ns(int32_t ph) {
         seen += g_ne_cost[ph].h[i];
         if (seen >= want) return g_ne_edge[i];
     }
-    return g_ne_cost[ph].max;
+    return AOWL_NE_P95_SAT;
+}
+static int64_t aowl_ne_p95_sat(void)  { return AOWL_NE_P95_SAT; }
+static int64_t aowl_ne_top_edge_ns(void) { return g_ne_edge[AOWL_NE_NB - 1]; }
+static int64_t aowl_ne_cost_ovf(int32_t ph) {
+    if (ph < 0 || ph >= AOWL_NE_PH_N) return 0;
+    return g_ne_cost[ph].ovf;
 }
 static int64_t aowl_ne_gap_mean_ns(void) {
     if (g_ne_gap.n <= 0) return -1;
     return g_ne_gap.sum / g_ne_gap.n;
 }
 static int64_t aowl_ne_gap_samples(void)  { return g_ne_gap.n; }
+/* The interval between the ticks OF ONE PHASE -- the only interval the
+ * body-vs-frame comparison may legitimately use. */
+static int64_t aowl_ne_gap_ph_mean_ns(int32_t ph) {
+    if (ph < 0 || ph >= AOWL_NE_PH_N || g_ne_gap_ph[ph].n <= 0) return -1;
+    return g_ne_gap_ph[ph].sum / g_ne_gap_ph[ph].n;
+}
+static int64_t aowl_ne_gap_ph_samples(int32_t ph) {
+    if (ph < 0 || ph >= AOWL_NE_PH_N) return 0;
+    return g_ne_gap_ph[ph].n;
+}
 static int64_t aowl_ne_cost_dropped(void) { return g_ne_dropped; }
 static int64_t aowl_ne_budget_ns(void)    { return AOWL_NE_BUDGET_NS; }
 static int64_t aowl_ne_min_samples(void)  { return AOWL_NE_MIN_SAMPLES; }
