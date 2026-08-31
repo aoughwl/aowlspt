@@ -92,6 +92,10 @@ proc cNuV2InPtr(): Il2CppPtr {.importc: "aowl_nu_v2in_ptr", nodecl.}
 proc cNuV2OutPtr(): Il2CppPtr {.importc: "aowl_nu_v2out_ptr", nodecl.}
 proc cNuV2OutX(): float32 {.importc: "aowl_nu_v2out_x", nodecl.}
 proc cNuV2OutY(): float32 {.importc: "aowl_nu_v2out_y", nodecl.}
+proc cNuC4InSet(r, g, b, a: float32) {.importc: "aowl_nu_c4in_set", nodecl.}
+proc cNuC4InPtr(): Il2CppPtr {.importc: "aowl_nu_c4in_ptr", nodecl.}
+proc cNuGetF32(obj: Il2CppPtr; off: int32; ok: ptr int32): float32 {.
+  importc: "aowl_nu_get_f32", nodecl.}
 proc cNuRectPtr(): Il2CppPtr {.importc: "aowl_nu_rect_ptr", nodecl.}
 proc cNuRectX(): float32 {.importc: "aowl_nu_rect_x", nodecl.}
 proc cNuRectY(): float32 {.importc: "aowl_nu_rect_y", nodecl.}
@@ -177,6 +181,9 @@ const
   NuTLocSetLabelText = 23'i32  ## LocalizedText::SetLabelText
   NuTSetParentAlign  = 24'i32  ## TMPro.TMP_DefaultControls::SetParentAndAlign
   NuTMetaInit        = 25'i32  ## il2cpp_codegen_initialize_runtime_metadata
+  NuTGrSetColor      = 26'i32  ## UnityEngine.UI.Graphic::set_color
+  NuTGrGetCanvasRend = 27'i32  ## UnityEngine.UI.Graphic::get_canvasRenderer
+  NuTGrSetAllDirty   = 28'i32  ## UnityEngine.UI.Graphic::SetAllDirty
 
 # ---- field offsets for wiring a from-scratch TMP's dependencies ---------
 #
@@ -191,6 +198,23 @@ const
   NuOffTmpFontAsset      = 0x100'i32  ## TMPro.TMP_Text.m_fontAsset (TMP_FontAsset)
   NuOffTmpSharedMaterial = 0x118'i32  ## TMPro.TMP_Text.m_sharedMaterial (Material)
   NuOffGraphicMaterial   = 0x20'i32   ## UnityEngine.UI.Graphic.m_Material (Material)
+
+# ---- field offsets for the IMAGE VISIBILITY proof -----------------------
+#
+# MEASURED offline, `tools/fldoff.py fields UnityEngine.UI.Image` (String
+# self-check passed), 2026-08-30. m_Color@0x28 is CROSS-CONFIRMED by
+# disassembly and not only by the table: `Graphic::set_color`'s prologue
+# contains `F3 0F 10 41 28` = `movss xmm0,[rcx+0x28]`, i.e. the method itself
+# reads m_Color at +0x28. Two independent derivations agreeing is what makes
+# these safe to read back through.
+const
+  NuOffGraphicColor      = 0x28'i32   ## Graphic.m_Color -- Color, 4 floats
+  NuOffGraphicColorA     = 0x34'i32   ## ...its alpha channel (0x28 + 3*4)
+  NuOffGraphicRaycast    = 0x3a'i32   ## Graphic.m_RaycastTarget (bool)
+  NuOffGraphicCanvasRend = 0x58'i32   ## Graphic.m_CanvasRenderer (lazy cache)
+  NuOffGraphicCanvas     = 0x60'i32   ## Graphic.m_Canvas (lazy cache)
+  NuOffImageSprite       = 0xe0'i32   ## Image.m_Sprite -- NULL is legal, see below
+  NuOffImageType         = 0xf0'i32   ## Image.m_Type -- 0 == Simple
 
 # ---- component kinds, mirroring the AOWL_NU_KIND_* defines --------------
 const
@@ -222,11 +246,16 @@ proc nuSlotStateName(s: int32): string =
 #   nativeUi       -- the layer answers at all
 #   nativeUiProof  -- additionally run the one-shot visual self-proof
 # ---------------------------------------------------------------------------
+#   nativeUiImageProof -- additionally run STAGE C, the Image-from-scratch
+#                         spike. Independent of `nativeUiProof`: it answers a
+#                         different question (does a uGUI *Graphic* built from
+#                         nothing render) and the native ESP is blocked on it.
 var gNuOn = false
 var gNuProof = false
+var gNuImgProof = false
 var gNuProofDone = false
 
-proc nuProofWanted(): bool = gNuProof and not gNuProofDone
+proc nuProofWanted(): bool = (gNuProof or gNuImgProof) and not gNuProofDone
 
 # ---------------------------------------------------------------------------
 # Primitives
@@ -1219,6 +1248,285 @@ proc nuProofStageB(tabPtr: Il2CppPtr) =
   gNuVerdictB = nuReportFinished("B", go, rt, tmp, NuProofTextB)
   okLog "nativeui PROOF B: END (verdict " & gNuVerdictB & ")"
 
+# ---------------------------------------------------------------------------
+# STAGE C -- THE IMAGE SPIKE
+#
+# THE QUESTION, and why it is worth its own stage: the native uGUI ESP draws
+# pooled `UnityEngine.UI.Image` boxes, and Image construction has NEVER been
+# proven live on this build. Only TextMeshProUGUI has. Everything the ESP does
+# rests on an assumption nobody has measured, so its first live outcome would
+# have been INCONCLUSIVE by construction.
+#
+# WHAT IS ALREADY SETTLED, OFFLINE, AND IS NOT RE-DERIVED HERE:
+#   * the Image AddComponent<T> slot is .data 0x6D50070, whose STATIC token
+#     0xC008040B decodes to AddComponent<UnityEngine.UI.Image> -- so the kind is
+#     `attested`, and `aowl_nu_verdict` returns ATTESTED (proceed, loudly)
+#     rather than NOREF even with no live donor Image to compare klasses
+#     against. That is the ONLY reason this stage can run in the settings
+#     screen, where a walked Image donor is not guaranteed.
+#   * `Graphic` carries [RequireComponent(typeof(CanvasRenderer))] and Unity's
+#     native AddComponent is documented to honour it. DOCUMENTED IS NOT
+#     MEASURED. This stage asks `get_canvasRenderer` and reports the answer; a
+#     null there is the most likely single cause of "created but invisible".
+#
+# WHAT MAKES AN IMAGE VISIBLE (the false-positive shape this stage refuses to
+# fall into -- an Image can exist, pass every structural check, and paint
+# nothing):
+#   1. a live parent Canvas. Without one a Graphic is inert. Read back from
+#      Graphic.m_Canvas@0x60, which OnEnable populates.
+#   2. a CanvasRenderer on the SAME GameObject. See above.
+#   3. a rect with real area. `nuLayout` + `get_rect_Injected` read-back.
+#   4. colour ALPHA > 0. This is the quiet one: the default Color for a
+#      from-scratch Graphic is whatever the managed ctor left, and an alpha of 0
+#      is invisible while every other check still says yes. So the stage SETS a
+#      known opaque colour and reads m_Color back RAW -- through a path that is
+#      not the setter under test.
+#   5. `sprite` may be NULL. That is not a defect: with m_Type == Simple and no
+#      sprite, `Image.OnPopulateMesh` falls through to `Graphic.OnPopulateMesh`,
+#      which emits a single quad over the rect in m_Color against the white
+#      texture. A solid rectangle is exactly what an ESP box is. The stage reads
+#      m_Sprite and m_Type back and SAYS what it found rather than assuming.
+#   6. raycastTarget is IRRELEVANT to whether pixels appear -- it only decides
+#      whether the box eats clicks. Read and reported so the ESP author knows
+#      to turn it OFF, never used in the verdict.
+#
+# AND THE LIMIT OF THIS STAGE, STATED IN THE LOG ITSELF: even PASS does not
+# prove a human would SEE the box. Every check here is a field read. Only a
+# screenshot or a person settles pixels.
+# ---------------------------------------------------------------------------
+
+const NuImgProofName = "aowlspt-image-proof"
+var gNuVerdictC = "not run"
+
+proc nuImgSetColor(img: Il2CppPtr; r, g, b, a: float32): bool =
+  ## `Graphic::set_color(Color)`. Win64 passes a 16-byte struct BY REFERENCE;
+  ## that is not an assumption -- the method's first instruction is
+  ## `movups xmm2,[rdx]`. Shape-identical to the `_Injected` setters, so the
+  ## same v_pp thunk carries it, with a NULL MethodInfo (not a shared generic).
+  let fn = nuFn(NuTGrSetColor)
+  if fn == nil or not nuOk(img, 0x40'i32): return false
+  cNuC4InSet(r, g, b, a)
+  cNuCallVPP(fn, img, cNuC4InPtr())
+  result = true
+
+proc nuImgReadColor(img: Il2CppPtr): (bool, float32, float32, float32, float32) =
+  ## m_Color read back RAW at 0x28. Deliberately NOT via `get_color`: reading a
+  ## value back through the same property that wrote it is a self-comparison,
+  ## and a self-comparison cannot fail.
+  var okR = 0'i32
+  var okG = 0'i32
+  var okB = 0'i32
+  var okA = 0'i32
+  let r = cNuGetF32(img, NuOffGraphicColor,          addr okR)
+  let g = cNuGetF32(img, NuOffGraphicColor + 4'i32,  addr okG)
+  let b = cNuGetF32(img, NuOffGraphicColor + 8'i32,  addr okB)
+  let a = cNuGetF32(img, NuOffGraphicColorA,         addr okA)
+  result = (okR != 0 and okG != 0 and okB != 0 and okA != 0, r, g, b, a)
+
+proc nuProofStageC(tabPtr: Il2CppPtr) =
+  gNuVerdictC = "INCONCLUSIVE"
+  okLog "nativeui PROOF C: BEGIN -- build a UnityEngine.UI.Image FROM SCRATCH " &
+        "and ask the finished object whether it can render. This is the " &
+        "question the native uGUI ESP is blocked on."
+
+  nuStep("C", "mi2FindTmp: walk the tab for a live control to parent into")
+  mi2FindTmp(tabPtr)
+  if gMi2TmpOwner == nil:
+    warn "nativeui PROOF C: IMAGEPROOF VERDICT = INCONCLUSIVE -- no readable " &
+         "control on this tab, so there is no validated live object to walk " &
+         "from and no canvas to parent into. NOTHING was created; this says " &
+         "nothing at all about AddComponent<Image>."
+    return
+  let parentGo = nuGameObjectOf(gMi2TmpOwner)
+  if parentGo == nil:
+    warn "nativeui PROOF C: IMAGEPROOF VERDICT = INCONCLUSIVE -- the walked " &
+         "owner has no readable GameObject; nothing was created"
+    return
+  okLog "nativeui PROOF C: parentGO=0x" & hexOf(cast[uint64](parentGo))
+
+  nuStep("C", "il2cpp_object_new + GameObject::.ctor(String)")
+  let go = nuCreate(NuImgProofName, parentGo)
+  if go == nil:
+    warn "nativeui PROOF C: IMAGEPROOF VERDICT = INCONCLUSIVE -- the " &
+         "GameObject could not be created at all, so AddComponent<Image> was " &
+         "never reached (reason logged above)"
+    return
+
+  nuStep("C", "AddComponent<RectTransform> (proven live; this is the control)")
+  let rt = nuAdd(go, NuKindRectTransform)
+  if rt == nil:
+    warn "nativeui PROOF C: IMAGEPROOF VERDICT = INCONCLUSIVE -- even the " &
+         "PROVEN RectTransform slot refused this run, so a refusal on Image " &
+         "would say nothing about Image. Tearing down."
+    discard nuDestroy(go)
+    return
+
+  nuStep("C", "SetParentAndAlign into the live canvas")
+  if not nuParentAligned(go, parentGo):
+    warn "nativeui PROOF C: IMAGEPROOF VERDICT = INCONCLUSIVE -- could not " &
+         "parent; a Graphic with no Canvas ancestor is inert and the test " &
+         "would be meaningless. Tearing down."
+    discard nuDestroy(go)
+    return
+  discard nuSetLayer(go, 5'i32)          # Unity's built-in `UI` layer
+
+  # Same lesson Stage B paid for with a fault: on an ACTIVE GameObject the add
+  # IS the render -- Awake/OnEnable fire synchronously from AddComponent, and a
+  # Graphic's Awake reaches for its material/canvas. Deactivate first so there
+  # is a window between "the component exists" and "the component runs".
+  nuStep("C", "SetActive(false) -- defer the Graphic's Awake/OnEnable so the " &
+              "add is separable from the first render")
+  if not nuSetActive(go, false):
+    warn "nativeui PROOF C: IMAGEPROOF VERDICT = INCONCLUSIVE -- could not " &
+         "deactivate; refusing to add a Graphic to an active object. Tearing down."
+    discard nuDestroy(go)
+    return
+
+  # ------------------------------------------------------------------ THE ASK
+  nuStep("C", "AddComponent<UnityEngine.UI.Image> via .data slot 0x6D50070 " &
+              "(static token 0xC008040B -> AddComponent<UI.Image>). If the log " &
+              "stops HERE, the answer to the whole spike is 'it faults'.")
+  let img = nuAdd(go, NuKindImage)
+  if img == nil:
+    let st = cNuSlotState(NuKindImage)
+    gNuVerdictC = (if st == NuSlotPoisoned: "FAIL" else: "INCONCLUSIVE")
+    warn "nativeui PROOF C: IMAGEPROOF VERDICT = " & gNuVerdictC &
+         " -- AddComponent<Image> did not yield a usable component (slot " &
+         "state " & nuSlotStateName(st) & "). The exact reason is the last " &
+         "`add(UnityEngine.UI.Image)` line above. THE FALLBACK, if this " &
+         "repeats: do NOT build the ESP box from scratch -- CLONE a live " &
+         "Image-bearing GameObject out of the tree (Object::Instantiate, the " &
+         "route Stage A and the settings-tab work both use successfully) and " &
+         "re-colour/re-size the clone. That path needs no AddComponent at all."
+    discard nuDestroy(go)
+    return
+  okLog "nativeui PROOF C: AddComponent<Image> SURVIVED -- comp=0x" &
+        hexOf(cast[uint64](img)) & ", slot state " &
+        nuSlotStateName(cNuSlotState(NuKindImage))
+
+  # What the fresh component came with, BEFORE we touch anything. Diagnostics,
+  # not assertions -- a NULL sprite is legal and expected.
+  let sprite0 = cNuGetRef(img, NuOffImageSprite)
+  let mat0    = cNuGetRef(img, NuOffGraphicMaterial)
+  let (okC0, r0, g0, b0, a0) = nuImgReadColor(img)
+  okLog "nativeui PROOF C: as created -- m_Sprite=0x" &
+        hexOf(cast[uint64](sprite0)) & " (NULL is LEGAL: with m_Type=Simple " &
+        "and no sprite, Graphic::OnPopulateMesh emits one quad over the rect " &
+        "in m_Color -- a solid box, which is what an ESP box is), " &
+        "m_Material=0x" & hexOf(cast[uint64](mat0)) &
+        " (NULL means the Graphic will use defaultGraphicMaterial), m_Color=" &
+        (if okC0: "(" & nuF(r0) & ", " & nuF(g0) & ", " & nuF(b0) & ", " &
+                  nuF(a0) & ")" else: "UNREADABLE")
+
+  nuStep("C", "nuLayout -- a KNOWN size and position, so 'nothing on screen' " &
+              "cannot be blamed on a zero-area or off-screen rect")
+  if not nuLayout(rt,
+                  0.0'f32, 1.0'f32,      # anchorMin  (top-left)
+                  0.0'f32, 1.0'f32,      # anchorMax
+                  0.0'f32, 1.0'f32,      # pivot
+                  240.0'f32, 120.0'f32,  # sizeDelta
+                  180.0'f32, -140.0'f32): # anchoredPosition, clear of A and B
+    warn "nativeui PROOF C: IMAGEPROOF VERDICT = FAIL -- layout refused, so " &
+         "the Image cannot be given a renderable rect. Tearing down."
+    gNuVerdictC = "FAIL"
+    discard nuDestroy(go)
+    return
+
+  nuStep("C", "SetActive(true) -- the Graphic's Awake/OnEnable runs HERE. If " &
+              "the log stops here, Image construction succeeds but ACTIVATION " &
+              "faults, and the fallback is the clone route.")
+  discard nuSetActive(go, true)
+  okLog "nativeui PROOF C: SetActive(true) returned -- the Graphic's " &
+        "Awake/OnEnable SURVIVED"
+
+  nuStep("C", "set_color(1, 0.15, 0.15, 1) -- OPAQUE. Alpha 0 is the invisible " &
+              "success this stage exists to rule out.")
+  let colorCalled = nuImgSetColor(img, 1.0'f32, 0.15'f32, 0.15'f32, 1.0'f32)
+  nuStep("C", "SetAllDirty -- a Graphic activated after layout has no " &
+              "guaranteed dirty pass; ask for one explicitly, once.")
+  let dirtyFn = nuFn(NuTGrSetAllDirty)
+  if dirtyFn != nil and nuOk(img, 0x40'i32):
+    discard cNuCallPP(dirtyFn, img)   # void(this, MethodInfo*): RAX is ignored
+
+  # -------------------------------------------------------- THE FINISHED STATE
+  nuStep("C", "reading the finished state back")
+  let (okC, cr, cg, cb, ca) = nuImgReadColor(img)
+  let crFn = nuFn(NuTGrGetCanvasRend)
+  var canvasRend: Il2CppPtr = nil
+  if crFn != nil and nuOk(img, 0x40'i32):
+    canvasRend = cNuCallPP(crFn, img)
+  let canvasCache = cNuGetRef(img, NuOffGraphicCanvas)
+  let (okRect, rx, ry, rw, rh) = nuGetRect(rt)
+  let (okSz, sw, sh) = nuGetSize(rt)
+  let active = nuActiveInHierarchy(go)
+  let alive = nuAlive(img)
+  let renderable = okRect and cNuRectRenderable(rw, rh) != 0'i32
+  let hasCr = nuOk(canvasRend, 0x10'i32)
+  let hasCanvas = nuOk(canvasCache, 0x10'i32)
+  let colorOk = okC and ca > 0.01'f32 and
+                cr > 0.9'f32 and cg < 0.3'f32 and cb < 0.3'f32
+  let sizeOk = okSz and sw > 239.0'f32 and sw < 241.0'f32 and
+               sh > 119.0'f32 and sh < 121.0'f32
+
+  okLog "nativeui PROOF C: CanvasRenderer = 0x" &
+        hexOf(cast[uint64](canvasRend)) & " readable=" & $hasCr &
+        "  <-- this is the [RequireComponent] question: true means Unity's " &
+        "native AddComponent DID auto-add it and no explicit add is needed"
+  okLog "nativeui PROOF C: Graphic.m_Canvas = 0x" &
+        hexOf(cast[uint64](canvasCache)) & " readable=" & $hasCanvas &
+        "  (OnEnable fills this from the parent chain; null means the object " &
+        "is not under a live Canvas and cannot render whatever else is true)"
+  okLog "nativeui PROOF C: m_Color read back RAW @0x28 = " &
+        (if okC: "(" & nuF(cr) & ", " & nuF(cg) & ", " & nuF(cb) & ", " &
+                 nuF(ca) & ")" else: "UNREADABLE") &
+        "  setterCalled=" & $colorCalled & " matchesWhatWasSet=" & $colorOk
+  if okRect:
+    okLog "nativeui PROOF C: rect AFTER layout = (" & nuF(rx) & ", " &
+          nuF(ry) & ", " & nuF(rw) & ", " & nuF(rh) & ")  renderable=" &
+          $renderable
+  else:
+    warn "nativeui PROOF C: the rect could not be read back"
+  okLog "nativeui PROOF C: sizeDelta = " &
+        (if okSz: "(" & nuF(sw) & ", " & nuF(sh) & ")" else: "UNREADABLE") &
+        " matches240x120=" & $sizeOk
+  okLog "nativeui PROOF C: activeInHierarchy=" & $active & " aliveByUnity=" &
+        $alive & " (a destroyed Unity object stays READABLE with m_CachedPtr " &
+        "zeroed, so readability is not liveness)"
+
+  if not okRect or not okC or not okSz:
+    warn "nativeui PROOF C: IMAGEPROOF VERDICT = INCONCLUSIVE -- a required " &
+         "read-back failed (rect=" & $okRect & " color=" & $okC & " size=" &
+         $okSz & "), so nothing is settled. 'I could not look' is NOT a pass. " &
+         "The object is left in place at 0x" & hexOf(cast[uint64](go)) &
+         " for the inspector."
+    gNuVerdictC = "INCONCLUSIVE"
+    okLog "nativeui PROOF C: END (verdict " & gNuVerdictC & ")"
+    return
+
+  if renderable and active and alive and hasCr and hasCanvas and
+     colorOk and sizeOk:
+    gNuVerdictC = "PASS"
+    okLog "nativeui PROOF C: IMAGEPROOF VERDICT = PASS -- a " &
+          "UnityEngine.UI.Image was built FROM SCRATCH (object_new + ctor + " &
+          "AddComponent<Image>), it carries an auto-added CanvasRenderer, it " &
+          "sits under a live Canvas, its rect is 240x120 with real area, and " &
+          "its colour reads back opaque red. THIS DOES NOT PROVE A HUMAN " &
+          "WOULD SEE IT. Every check above is a field read; only a screenshot " &
+          "or a person settles pixels. Look for a solid red 240x120 box near " &
+          "the top-left of the settings panel, or run " &
+          "`find " & NuImgProofName & "` in the live inspector."
+  else:
+    gNuVerdictC = "FAIL"
+    warn "nativeui PROOF C: IMAGEPROOF VERDICT = FAIL -- the Image was " &
+         "CREATED but a finished-state read disagrees: renderable=" &
+         $renderable & " activeInHierarchy=" & $active & " aliveByUnity=" &
+         $alive & " canvasRenderer=" & $hasCr & " underLiveCanvas=" &
+         $hasCanvas & " colorAsSet=" & $colorOk & " sizeAsSet=" & $sizeOk &
+         ". Whichever of those is false is the reason the ESP would draw " &
+         "nothing. Left in place at 0x" & hexOf(cast[uint64](go)) &
+         " so the inspector can be pointed at it."
+  okLog "nativeui PROOF C: END (verdict " & gNuVerdictC & ")"
+
 # ---- the guards ------------------------------------------------------------
 # ONE `aowl_p_p_seh` per stage, run SEQUENTIALLY. Not nested: the guard is not
 # re-entrant and an inner guard disarms the outer one. Two sequential guards
@@ -1242,20 +1550,21 @@ proc nuProofBodyC(a: Il2CppPtr): Il2CppPtr {.
   case int(cNuStageGet())
   of 1: nuProofStageA(a)
   of 2: nuProofStageB(a)
+  of 3: nuProofStageC(a)
   else: discard
   result = cast[Il2CppPtr](1)
 
 proc nuProofRun(tab: Il2CppPtr) =
   ## Runs at most once per session, whatever the outcome -- a second run would
   ## build a second label and the screen would stop being evidence.
-  if not gNuOn or not gNuProof or gNuProofDone: return
+  if not gNuOn or (not gNuProof and not gNuImgProof) or gNuProofDone: return
   if cNuDisabled() != 0'i32:
     warn "nativeui: the layer has self-disabled after " &
          $int(cNuFaultCount()) & " fault(s); the proof will not run"
     return
   gNuProofDone = true
 
-  if cNuProofGuarded(tab, 1'i32) == nil:
+  if gNuProof and cNuProofGuarded(tab, 1'i32) == nil:
     cNuNoteFault()
     gNuVerdictA = "FAULTED"
     warn "nativeui PROOF A: FAULTED -- the VEH guard caught it and the game " &
@@ -1266,18 +1575,42 @@ proc nuProofRun(tab: Il2CppPtr) =
   # Stage B runs even if A faulted: they are independent questions, and the
   # fault budget (6) is what stops a genuinely broken build from retrying
   # forever.
-  if cNuDisabled() == 0'i32:
-    if cNuProofGuarded(tab, 2'i32) == nil:
-      cNuNoteFault()
-      gNuVerdictB = "FAULTED"
-      warn "nativeui PROOF B: FAULTED -- the VEH guard caught it and the " &
-           "game survived. The last `nativeui PROOF B: ->` breadcrumb above " &
-           "names the exact call it died in. Fault count is now " &
-           $int(cNuFaultCount()) & " of 6."
-  else:
-    warn "nativeui PROOF B: skipped -- the layer self-disabled during Stage A"
+  if gNuProof:
+    if cNuDisabled() == 0'i32:
+      if cNuProofGuarded(tab, 2'i32) == nil:
+        cNuNoteFault()
+        gNuVerdictB = "FAULTED"
+        warn "nativeui PROOF B: FAULTED -- the VEH guard caught it and the " &
+             "game survived. The last `nativeui PROOF B: ->` breadcrumb above " &
+             "names the exact call it died in. Fault count is now " &
+             $int(cNuFaultCount()) & " of 6."
+    else:
+      warn "nativeui PROOF B: skipped -- the layer self-disabled during Stage A"
+
+  # STAGE C -- the Image spike. A THIRD sequential guarded region, never a
+  # nested one: `aowl_p_p_seh` is not re-entrant and an inner guard would
+  # disarm the outer. Sequential is what lets C fault without erasing A and B.
+  # Gated on its own flag so it can be run ALONE, which is the cheapest way to
+  # settle the ESP question without also rebuilding two labels on screen.
+  if gNuImgProof:
+    if cNuDisabled() == 0'i32:
+      if cNuProofGuarded(tab, 3'i32) == nil:
+        cNuNoteFault()
+        gNuVerdictC = "FAULTED"
+        warn "nativeui PROOF C: IMAGEPROOF VERDICT = FAULTED -- the VEH guard " &
+             "caught it and the game survived. The last `nativeui PROOF C: ->` " &
+             "breadcrumb above names the exact call it died in; if that " &
+             "breadcrumb is the AddComponent<Image> one, the answer to the " &
+             "spike is that Image CANNOT be constructed from scratch on this " &
+             "build and the ESP must clone a live Image instead. Fault count " &
+             "is now " & $int(cNuFaultCount()) & " of 6."
+    else:
+      warn "nativeui PROOF C: IMAGEPROOF VERDICT = INCONCLUSIVE -- skipped, " &
+           "the layer had already self-disabled after " &
+           $int(cNuFaultCount()) & " fault(s). Nothing was attempted."
 
   okLog "nativeui PROOF: OVERALL  A=" & gNuVerdictA & "  B=" & gNuVerdictB &
+        "  C(image)=" & gNuVerdictC &
         ".  A is the CLONE+LAYOUT path (everything but the layout was already " &
         "proven live); B is the FROM-SCRATCH path. A passing while B does not " &
         "still means mods can build visible UI today."
