@@ -27,6 +27,7 @@ import ids
 import numbers
 import starter
 import starterkit
+import shapes
 
 const
   KeyPrefix* = "profile."
@@ -630,6 +631,39 @@ proc readProfile*(id: string; why: var ProfileRead): Profile =
     result.text = stored.raw
     result.ok = true
     why = prLoaded
+    # Type-shape repair FIRST, before anything else reads a value out of this
+    # document. A boolean where the client's DTO declares an integer does not
+    # degrade -- Newtonsoft throws and the player gets a modal dialog we do not
+    # see (measured 2026-08-31: `Path '[0].Quests[558].availableAfter'`). See
+    # `emu/shapes` for how each rule is measured against the real db.
+    block shapeRepair:
+      let original = result.text
+      let findings = repairScalarShapes(result.text)
+      if findings.len == 0:
+        break shapeRepair
+      var repaired = 0
+      var refused = 0
+      for f in findings:
+        if f.repaired: inc repaired else: inc refused
+      if repaired > 0:
+        # Back up the pre-repair document ONCE per profile, keyed separately so
+        # `allProfileIds` (prefix "profile.") never sees it. Only if there is no
+        # backup yet: a second load must not overwrite the original evidence
+        # with an already-repaired copy.
+        let bak = "profilebak." & id & ".shapes"
+        let existing = load(bak)
+        if not (existing.ok and existing.raw.len > 0):
+          if save(bak, original) != Ok:
+            error "profile " & id & " type-shape repair: could NOT write the " &
+                  "pre-repair backup " & bak & "; repairing in memory anyway " &
+                  "(the on-disk document is still the original until a save)"
+        error "profile " & id & " had values of the WRONG JSON TYPE; " &
+              "repaired " & $repaired & " in memory (backup key " & bak & "): " &
+              summarise(findings)
+      if refused > 0:
+        error "profile " & id & " has " & $refused & " wrong-typed values this " &
+              "repair REFUSES to touch (not scalars): " & summarise(findings) &
+              " -- the client will still throw on these; fix them by hand"
     if ensurePockets(result):
       info "profile " & id & " had no Pockets item; added one (see PocketsTpl)"
     let reshaped = ensureDictionaryShapes(result)

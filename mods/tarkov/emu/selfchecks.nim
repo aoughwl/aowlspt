@@ -59,6 +59,7 @@ import bots
 import orbit
 import knobs
 import botgear
+import shapes
 
 proc failedLines(report, label: string; into: var seq[string]) =
   ## `loot.selfCheck` and `questcond.selfCheck` report one line per check,
@@ -81,6 +82,9 @@ proc selfCheckFailures*(): seq[string] =
   # whether it added none. The return is discarded because the list is the
   # answer and a second way of saying the same thing can disagree with it.
   discard skills.selfCheckSkills(result)
+  # Profile type-shape repair. Pure over literals; asserts the FINISHED document,
+  # and three of its five assertions are negative (see `emu/shapes`).
+  shapes.selfCheckShapes(result)
   # Two more of the same shape: the price of a treatment at a trader and the
   # roll of a scav case are both pure arithmetic over a table, and both are
   # reachable through a route only on a database that carries the table -- which
