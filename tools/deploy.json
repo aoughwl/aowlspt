@@ -177,7 +177,10 @@
     {
      "src": "mods/tarkov/data",
      "dst": "mods/tarkov/data",
-     "exclude": ["capture/**", "*.md"],
+     "exclude": [
+      "capture/**",
+      "*.md"
+     ],
      "minFiles": 14,
      "why": "the emulator answers seven menu routes out of post1/ and refuses to start a raid without post1/serversettings.json. On 2026-08-27 post1/globalsgaps.json was not shipped: tarkov.dll's self-check logged 'this build fails its own arithmetic; refusing to serve', registered ONLY its selfcheck route, and the launcher said 'unable to check client version'"
     }
@@ -274,7 +277,10 @@
     {
      "src": "mods/morebots/data",
      "dst": "mods/morebots/data",
-     "exclude": ["capture/**", "*.md"],
+     "exclude": [
+      "capture/**",
+      "*.md"
+     ],
      "minFiles": 1,
      "why": "the vanilla faction/spawn-type definitions this mod registers from; a morebots with no data registers nothing"
     }
@@ -435,7 +441,10 @@
     {
      "src": "mods/textures/data",
      "dst": "mods/textures/data",
-     "exclude": ["capture/**", "*.md"],
+     "exclude": [
+      "capture/**",
+      "*.md"
+     ],
      "minFiles": 1,
      "why": "the redirect manifest; without it every bundle redirect is a no-op and the log still says ARMED"
     }
@@ -485,7 +494,10 @@
     {
      "src": "mods/maps/data",
      "dst": "mods/maps/data",
-     "exclude": ["capture/**", "*.md"],
+     "exclude": [
+      "capture/**",
+      "*.md"
+     ],
      "minFiles": 40,
      "why": "every map JSON and every terrain SVG layer. On 2026-08-27 none of the 59 files were shipped and the backend logged 'data/bigmap.json is not on disk -- that map will report no data' for 8 maps"
     }
@@ -555,9 +567,58 @@
     {
      "src": "mods/waypoints/data",
      "dst": "mods/waypoints/data",
-     "exclude": ["capture/**", "*.md"],
+     "exclude": [
+      "capture/**",
+      "*.md"
+     ],
      "minFiles": 8,
      "why": "one patrol-point document per map, checked against schema aowlspt.waypoints/1. Without them every map answers 'no waypoint data for <map>' and the mod is a no-op that loads cleanly"
+    }
+   ]
+  },
+  {
+   "//": "`aowl.loadammoanim` is the Manimal Ammo Loading Animations port. The",
+   "//1": "markers below are the three DETOUR targets (all UNIQUE) and the one",
+   "//2": "SHARED call target, the mesh-table names the upstream bundle declares,",
+   "//3": "and the refusal strings -- because a build that silently lost the",
+   "//4": "refusals would look identical to one that works until it fails.",
+   "name": "loadammoanim",
+   "src": "mods/loadammoanim/bin/loadammoanim.dll",
+   "dst": "mods/loadammoanim/loadammoanim.dll",
+   "seed": [
+    {
+     "src": "mods/loadammoanim/config.json",
+     "dst": "mods/loadammoanim/config.json",
+     "why": "the escalation rung, the hijacked bundle key and the safety caps"
+    }
+   ],
+   "minBytes": 300000,
+   "markers": [
+    "aowl.loadammoanim",
+    "/aowlspt/loadammoanim/stats",
+    "LoadMagazineProcess::Start@0x768F50/i>o",
+    "LoadMagazineProcess::RaiseLoadEventArgs@0x769260/ii>x",
+    "EFT.ObjectsFactory::.ctor@0x938430/iooo>x",
+    "EFT.ObjectsFactory::InstantiateWithoutPool",
+    "UnityEngine.Animator::SetBool",
+    "OUT TO USE S",
+    "USE TO OUT S",
+    "stanag_troy_battlemag_MESH",
+    "pmag_window_FDE_MESH",
+    "UNIVERSAL EMPTY-BODY STUB",
+    "latched IEasyAssets from ObjectsFactory::.ctor",
+    "spawn REFUSED: no IEasyAssets has been latched yet",
+    "spawn REFUSED: hijackKey is empty",
+    "Unity fake null",
+    "closed by the SAFETY CAP after",
+    "Escalation rung"
+   ],
+   "data": [
+    {
+     "src": "mods/loadammoanim/data",
+     "dst": "mods/loadammoanim/data",
+     "minFiles": 1,
+     "why": "stanags_container.bundle, the upstream mod's shipped Animator graph and mag meshes (MIT). Without it there is nothing to instantiate and the spawn rung refuses; vanilla loading is unaffected"
     }
    ]
   },
