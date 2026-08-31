@@ -612,11 +612,20 @@ def verify(art, src, C):
     with open(src, "rb") as f:
         blob = f.read()
     missing = []
+    # Search the RAW bytes -- never decode the file (litscan's docstring says
+    # why). The needle is encoded, in every encoding this tool's --contains
+    # and --absent paths use: litscan.encodings("deploy") is utf8 + utf16le.
+    # Until 2026-08-31 this loop searched utf8 ONLY, so a declared marker
+    # stored as UTF-16LE would have read MISSING and REFUSED A DEPLOY -- a
+    # false negative in the one code path that is allowed to block a release.
+    # MEASURED when the fix landed: over all 20 declared artifacts, all built,
+    # the utf8-only and utf8+utf16le answers agreed on EVERY marker, so no
+    # artifact's verdict changed. The fix removes a latent false negative; it
+    # did not paper over a real miss.
+    _encs = litscan.encodings("deploy")
     for m in art.get("markers", []):
-        # The host writes its log text as plain bytes; markers are ASCII
-        # literals. Search the raw bytes so this works on a DLL, an EXE or
-        # anything else, with no assumption about encoding or sections.
-        if blob.find(m.encode("utf-8")) < 0:
+        hits, _off = litscan.find_at(blob, _encs, m)
+        if not hits:
             missing.append(m)
     if missing:
         problems.append("%d of %d marker(s) MISSING from the built file:"

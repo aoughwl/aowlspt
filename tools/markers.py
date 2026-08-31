@@ -52,7 +52,25 @@ USAGE
     python tools/markers.py DLL --markers-file mods/maps/markers.json
     python tools/markers.py DLL -f FILE --min-markers 21
     python tools/markers.py DLL --absent "old text" --control "known text"
+    python tools/markers.py --for maps
+    python tools/markers.py --for maps --artifact <worktree>/mods/maps/bin/maps.dll
+    python tools/markers.py --list-artifacts
     python tools/markers.py --selftest
+
+MARKERS FROM deploy.json: `--for ARTIFACT`
+------------------------------------------
+Until this existed, an agent verifying a DLL it had just built had to TYPE THE
+MARKERS IN -- i.e. re-read its own writes, which is the check-that-cannot-fail
+shape CLAUDE.md 9b is about. The deploy path never had that problem because
+its markers are DATA in `tools/deploy.json`. `--for NAME` reads that same
+declared set (read-only -- nothing here ever writes deploy.json, and there is
+no flag to drop, relax or override a declared marker), and `--artifact PATH`
+points the scan at a build that has NOT been deployed, which is the actual
+case: subagents build and must never deploy. `--artifact` changes WHICH FILE
+is scanned, never WHICH MARKERS are required. Declared PE exports are NOT
+checked here -- markers.py scans bytes, and an `{.exportc.}` name is present
+as text without being in the export directory; use `deploy.py check` for those
+(it says so in the provenance line, rather than leaving you to assume).
 
     --encoding any|ascii|utf8|utf16|latin1     default any
     --json          machine-readable result on stdout
@@ -92,6 +110,7 @@ the output, which is the most a tool on this side of the wall can do.
 
 import argparse
 import hashlib
+import io
 import json
 import os
 import sys
@@ -179,6 +198,70 @@ def load_markers_file(path):
             % (path, _sha(path)[:16], len(markers), len(absent),
                len(controls)))
     return markers, absent, controls, prov
+
+
+REPO = os.path.dirname(HERE)
+DEPLOY_JSON = os.path.join(HERE, "deploy.json")
+
+
+def load_deploy_artifacts(path=DEPLOY_JSON):
+    """The DECLARED artifact table from tools/deploy.json, as data.
+
+    READ-ONLY, always. `tools/deploy.json` is the deploy path's source of
+    truth for what a valid build must contain (CLAUDE.md 4), and the rule
+    "never edit it to make a check pass" is what makes it worth anything.
+    Nothing in this file writes it, and `--for` deliberately offers no way to
+    override, extend or disable an artifact's declared set from the command
+    line -- extra `markers` on argv are additive, exactly as elsewhere.
+    """
+    if not os.path.isfile(path):
+        raise UsageError("no deploy config at %s -- the declared marker sets "
+                         "could not be read, so nothing was checked." % path)
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            cfg = json.load(f)
+    except ValueError as e:
+        raise UsageError("%s is not valid JSON: %s" % (path, e))
+    arts = [a for a in cfg.get("artifacts", [])
+            if isinstance(a, dict) and not str(a.get("name", "")).startswith("//")]
+    if not arts:
+        raise UsageError("%s declares no artifacts" % path)
+    return arts
+
+
+def resolve_for(name, artifact=None, path=DEPLOY_JSON):
+    """(dll-path, markers, exports, provenance) for a DECLARED artifact.
+
+    This closes the gap that made every subagent verification tonight the
+    shape CLAUDE.md 9b warns about: `markers.py` took its markers from argv,
+    so an agent checking a DLL it had just built typed in the literals IT had
+    just written -- re-reading your own writes, which cannot fail. The deploy
+    path never had that problem because its markers are DATA. `--for` gives
+    the same data to the non-deploy path.
+
+    `artifact` overrides WHICH FILE is scanned (a build in a worktree that
+    must never be deployed), never WHICH MARKERS are required.
+    """
+    arts = load_deploy_artifacts(path)
+    known = ", ".join(a["name"] for a in arts)
+    match = [a for a in arts if a.get("name") == name]
+    if not match:
+        raise UsageError("--for %s: no such artifact in %s. Known: %s"
+                         % (name, path, known))
+    art = match[0]
+    markers = list(art.get("markers") or [])
+    exports = list(art.get("exports") or [])
+    if artifact:
+        dll = os.path.abspath(artifact)
+    else:
+        dll = os.path.join(REPO, str(art.get("src", "")).replace("/", os.sep))
+    prov = ("--for %s: %d declared marker(s) from %s  sha256=%s%s"
+            % (name, len(markers), path, _sha(path)[:16],
+               ("  (%d declared PE export(s) NOT checked here -- markers.py "
+                "scans bytes and an exportc name is present as TEXT without "
+                "being in the export directory; use `deploy.py check` for "
+                "those)" % len(exports)) if exports else ""))
+    return dll, markers, exports, prov
 
 
 def classify(blob, encs, lit, control):
@@ -357,7 +440,84 @@ def report(res, C, quiet=False):
 # against real artifacts, including a marker that is genuinely absent and a
 # literal that is present-but-SPLIT, plus the two cases that must degrade to
 # INCONCLUSIVE rather than lie: no control, and no file.
-_MODS = r"C:\Users\savant\Projects\aowlspt-wt-b6-settingsui\mods"
+#
+# The fixtures are BUILT mod DLLs, and `mods/*/bin/` is gitignored, so a fresh
+# worktree has none. They used to be a hardcoded path into one particular
+# worktree; when that worktree was removed the self-test went INCONCLUSIVE
+# (exit 3 -- correctly not a pass, but also not a check). Resolution order,
+# most trustworthy first, and the chosen root is always PRINTED so a fixture
+# borrowed from another checkout is visible rather than assumed:
+#
+#   1. $AOWLSPT_MARKERS_FIXTURES
+#   2. mods/ in THIS checkout
+#   3. mods/ in any sibling checkout under the parent directory
+#
+# If none of them yields the fixtures, the self-test says INCONCLUSIVE and
+# exits 3. It never silently passes on a reduced case list.
+# MEASURED while writing this: choosing a root by FILE EXISTENCE alone picked
+# a sibling worktree holding an OLDER build of uihub.dll in which the self-
+# test's own control literal `groupOf` is not present -- so six cases failed
+# and the whole run was reported as a broken tool rather than a stale fixture.
+# A root is therefore only accepted if the literals the cases DEPEND ON are
+# actually in those bytes. Same 9b rule as everywhere else: prove the search
+# can find text here before believing anything it says about these files.
+_FIXTURE_MODS = ["uihub", "debug", "tarkov", "maps"]
+_FIXTURE_SENTINELS = [
+    ("uihub", "groupOf"),
+    ("debug", "espColor"),
+    ("maps", "LATE ARM"),
+    ("tarkov", "lootWeightMoney"),
+]
+
+
+def _fixture_roots():
+    roots = []
+    env = os.environ.get("AOWLSPT_MARKERS_FIXTURES")
+    if env:
+        roots.append(env)
+    roots.append(os.path.join(REPO, "mods"))
+    parent = os.path.dirname(REPO)
+    try:
+        sibs = sorted(os.listdir(parent))
+    except OSError:
+        sibs = []
+    for s in sibs:
+        p = os.path.join(parent, s, "mods")
+        if p not in roots and os.path.isdir(p):
+            roots.append(p)
+    return roots
+
+
+def _pick_mods_root():
+    """(root, why) -- the first root holding EVERY fixture DLL, or (None, why)."""
+    tried = []
+    encs = litscan.encodings("any")
+    for root in _fixture_roots():
+        miss = [m for m in _FIXTURE_MODS
+                if not os.path.isfile(os.path.join(root, m, "bin", m + ".dll"))]
+        if miss:
+            tried.append("%s (not built: %s)" % (root, ", ".join(miss)))
+            continue
+        stale = []
+        for mod, lit in _FIXTURE_SENTINELS:
+            p = os.path.join(root, mod, "bin", mod + ".dll")
+            try:
+                with open(p, "rb") as f:
+                    blob = f.read()
+            except OSError as e:
+                stale.append("%s unreadable (%s)" % (mod, e))
+                continue
+            hits, _ = litscan.find_at(blob, encs, lit)
+            if not hits:
+                stale.append("%s.dll lacks %s" % (mod, ascii(lit)))
+        if stale:
+            tried.append("%s (STALE build: %s)" % (root, "; ".join(stale)))
+            continue
+        return root, root
+    return None, "; ".join(tried) if tried else "no candidate roots"
+
+
+_MODS = None
 
 
 def _dll(name):
@@ -402,7 +562,18 @@ SELFTEST = [
 
 
 def selftest(C):
+    global _MODS
     red, green, yellow, dim, reset = C
+    root, why = _pick_mods_root()
+    if root is None:
+        print("%sINCONCLUSIVE%s no checkout under %s has all of %s built, so "
+              "the self-test could NOT be performed. This is not a pass. "
+              "Tried: %s. Build the mods, or set AOWLSPT_MARKERS_FIXTURES."
+              % (yellow, reset, os.path.dirname(REPO),
+                 ", ".join(_FIXTURE_MODS), why))
+        return 3
+    _MODS = root
+    print("%sfixtures: %s%s" % (dim, root, reset))
     ok = True
     seen = set()
     for (label, mod, mk, ab, ctl, want_v, want_o) in SELFTEST:
@@ -446,12 +617,87 @@ def selftest(C):
         print("%sPASS%s INCONCLUSIVE: an unreadable artifact -- nothing was "
               "searched, so it is not a pass and not a failure" %
               (green, reset))
+    if not for_selftest(C):
+        ok = False
     if not deploy_parity(C):
         ok = False
     print("%s%s%s" % (green if ok else red,
                       "self-test OK -- all three outcomes demonstrated"
                       if ok else "SELF-TEST FAILED", reset))
     return 0 if ok else 1
+
+
+# ------------------------------------------------------- `--for` self-test
+#
+# A `--for` that can only ever pass is worse than no `--for`: it would hand
+# every subagent a green light with the authority of deploy.json behind it.
+# So these cases drive the REAL command line (main()) end to end -- argument
+# parsing, deploy.json load, artifact resolution, scan, exit code -- and
+# assert all three exit codes occur. The MISSING case applies debug.dll's
+# DECLARED marker set to uihub.dll with a uihub literal as the positive
+# control; the INCONCLUSIVE case is the same scan with the control removed,
+# which is exactly the distinction 9b demands.
+FOR_SELFTEST = [
+    ("--for PRESENT: uihub.dll against uihub's declared marker set",
+     ["--for", "uihub", "--artifact", ("uihub",)], 0),
+    ("--for MISSING: debug's declared markers against uihub.dll, with a "
+     "uihub literal as the positive control",
+     ["--for", "debug", "--artifact", ("uihub",), "--control", "groupOf"], 1),
+    ("--for INCONCLUSIVE: the same scan with NO control -- a miss cannot be "
+     "told apart from 'we could not look'",
+     ["--for", "debug", "--artifact", ("uihub",)], 3),
+    ("--for INCONCLUSIVE: --artifact naming a file that does not exist -- "
+     "nothing was searched, which is not evidence of absence",
+     ["--for", "uihub", "--artifact",
+      os.path.join(REPO, "mods", "uihub", "bin", "nope-not-built.dll")], 3),
+    ("--for INCONCLUSIVE: --min-markers above the declared count, so a "
+     "SHRUNK deploy.json marker list cannot read as a pass",
+     ["--for", "uihub", "--artifact", ("uihub",), "--min-markers", "9999"], 3),
+]
+
+
+def for_selftest(C):
+    red, green, yellow, dim, reset = C
+    ok = True
+    seen = set()
+    for (label, argv, want) in FOR_SELFTEST:
+        av = [(_dll(a[0]) if isinstance(a, tuple) else a) for a in argv]
+        av += ["--quiet", "--no-color"]
+        buf = io.StringIO()
+        keep = sys.stdout
+        sys.stdout = buf
+        try:
+            got = main(av)
+        except SystemExit as e:                 # argparse usage error
+            got = e.code
+        finally:
+            sys.stdout = keep
+        seen.add(got)
+        good = (got == want)
+        print("%s%s%s %s" % (green if good else red,
+                             "PASS" if good else "FAIL", reset, label))
+        if not good:
+            ok = False
+            print("    wanted exit %s, got %s  (argv: %s)" % (want, got, av))
+            for ln in buf.getvalue().splitlines():
+                print("      " + ln)
+    for code in (0, 1, 3):
+        if code not in seen:
+            ok = False
+            print("%sFAIL%s `--for` never exited %d, so that outcome is not "
+                  "demonstrated and may be unreachable." % (red, reset, code))
+    # And --for must refuse an artifact name it does not know, rather than
+    # checking nothing and calling it a pass.
+    try:
+        resolve_for("no-such-artifact-name")
+    except UsageError:
+        print("%sPASS%s --for refuses an undeclared artifact name" %
+              (green, reset))
+    else:
+        ok = False
+        print("%sFAIL%s --for accepted an undeclared artifact name" %
+              (red, reset))
+    return ok
 
 
 # `deploy.py check --contains` decides PRESENT/MISSING/INCONCLUSIVE by calling
@@ -537,6 +783,16 @@ def main(argv):
     ap.add_argument("--quiet", action="store_true",
                     help="suppress the PRESENT lines")
     ap.add_argument("--no-color", action="store_true")
+    ap.add_argument("--for", dest="for_", metavar="ARTIFACT",
+                    help="take the marker set from tools/deploy.json's "
+                         "DECLARED set for this artifact, instead of typing "
+                         "in literals you just wrote yourself")
+    ap.add_argument("--artifact", metavar="PATH",
+                    help="scan THIS file instead of the artifact's declared "
+                         "src -- for a build in a worktree that must not be "
+                         "deployed. Changes which FILE, never which MARKERS.")
+    ap.add_argument("--list-artifacts", action="store_true",
+                    help="print the declared artifact names and marker counts")
     ap.add_argument("--selftest", action="store_true",
                     help="prove all three outcomes against real mod DLLs")
     args = ap.parse_args(argv)
@@ -544,6 +800,43 @@ def main(argv):
 
     if args.selftest:
         return selftest(C)
+    if args.list_artifacts:
+        try:
+            for a in load_deploy_artifacts():
+                print("%-14s %3d marker(s)  %3d export(s)  %s"
+                      % (a["name"], len(a.get("markers") or []),
+                         len(a.get("exports") or []), a.get("src", "")))
+        except UsageError as e:
+            print("markers.py: %s" % e)
+            return 2
+        return 0
+
+    declared_prov = None
+    if args.for_:
+        try:
+            dll, dmarkers, _dexports, declared_prov = resolve_for(
+                args.for_, args.artifact)
+        except UsageError as e:
+            print("markers.py: %s" % e)
+            return 2
+        if args.dll:
+            print("markers.py: --for takes the artifact from --artifact PATH; "
+                  "a positional DLL as well is ambiguous. Drop one.")
+            return 2
+        if not dmarkers:
+            print("markers.py: artifact %r declares NO markers, so nothing "
+                  "would be checked. An empty declared set is INCONCLUSIVE, "
+                  "never a pass." % args.for_)
+            print(declared_prov)
+            return 3
+        args.dll = dll
+        args.markers = list(args.markers) + dmarkers
+    elif args.artifact:
+        if args.dll:
+            print("markers.py: pass the file EITHER positionally OR as "
+                  "--artifact, not both.")
+            return 2
+        args.dll = args.artifact
     if not args.dll:
         ap.print_usage()
         print("markers.py: a DLL is required (or --selftest)")
@@ -552,7 +845,7 @@ def main(argv):
     markers = list(args.markers)
     absent = list(args.absent)
     controls = list(args.control)
-    prov = []
+    prov = [declared_prov] if declared_prov else []
     try:
         for f in args.markers_file:
             m, a, c, p = load_markers_file(f)
