@@ -28,6 +28,19 @@
 
 import jsonpath
 
+# The guard trampoline, in C, exactly as `colorwidget.nim` does it -- rather
+# than casting a Nim proc to a pointer at the call site, which is a cast the
+# backend is under no obligation to make mean what it looks like.
+{.emit: """
+extern void* aowl_modset_tick_body(void* a);
+static void* aowl_modset_tick_guarded(void* a) {
+    return aowl_p_p_seh((void*)aowl_modset_tick_body, a);
+}
+""".}
+
+proc cModSetTickGuarded(a: Il2CppPtr): Il2CppPtr {.
+  importc: "aowl_modset_tick_guarded", nodecl.}
+
 const
   cModSetMaxMods = 16       ## bounds the fetch cycle, not the mods installed
   cModSetPollMs = 300       ## floored to 250 by `aowl_ov_sync_start` anyway
@@ -65,6 +78,79 @@ var gModSetMods: seq[tuple[guid: string, name: string]] = @[]
 var gModSetIdx = 0
 var gModSetArmedAttempts = 0'i32  ## `overlaySyncAttempts()` read right after arming
 var gModSetInstrumentTicks = 0     ## logs raw slot state for the first few ticks of a step
+
+# --- the crash-safety additions (2026-08-31) --------------------------------
+#
+# Turning `modSettingsRender` on took the client down at character-select with
+# NO managed exception in the client's own log -- a hard native fault. The
+# faulting dereference was never identified, because this path had no witness
+# that survives the death: its instrumentation stops after 20 ticks and the
+# breadcrumb ring was never armed.
+#
+# So this file now does three things it did not do before, and each is
+# independently worth having whether or not it is the cause:
+#
+#  1. THE WHOLE TICK BODY RUNS UNDER ONE `aowl_p_p_seh`. It is the host's own
+#     tick thread and nothing on that thread opens a guard, so there is no
+#     outer guard to disarm by nesting (rule 3 is satisfied, not violated).
+#     A fault becomes a REFUSAL that names its step instead of an AV.
+#  2. `gModSetStep` names the step in progress at all times, so the refusal in
+#     (1) -- and any future crash -- says WHERE, not merely THAT.
+#  3. `swPageRegister` is NO LONGER CALLED FROM THIS THREAD. `gSwPages` is
+#     read on the Unity main thread by `swPagesOnTabBuilt` and `modsBuildPages`;
+#     appending to a Nim seq from here while that thread indexes it reallocates
+#     the buffer under the reader, which is a use-after-free by construction.
+#     Parsed pages are staged under the process lock and drained BY the Unity
+#     thread. That is a real defect found while looking for the fault; it is
+#     NOT established to be the crash, and this file does not claim it is.
+var gModSetStep = "not started"
+var gModSetGuardFaults = 0
+const cModSetMaxGuardFaults = 2
+  ## Deliberately lower than `cModSetMaxFaults`. A parse that gave up is a
+  ## disappointment; an access violation inside our own tick is a bug, and the
+  ## second one buys no information the first did not.
+var gModSetStaged: seq[SwPage] = @[]
+  ## Host thread WRITES under `cMqLock`; Unity thread DRAINS under the same
+  ## lock. Nothing else touches it, and neither critical section calls anything
+  ## that could take the lock again (it is not reentrant).
+var gModSetStagedTotal = 0
+var gModSetDrained = 0
+var gModSetXsWitness = false
+  ## One-shot: has the character-select transition been observed from here?
+
+proc modSetStage(p: SwPage) =
+  ## Hand one parsed page to the Unity thread. Bounded by the same ceiling the
+  ## fetch cycle already has, so a backend answering forever cannot grow this.
+  cMqLock()
+  if gModSetStaged.len < cModSetMaxMods:
+    gModSetStaged.add p
+    inc gModSetStagedTotal
+  cMqUnlock()
+
+proc modSetDrainStaged() =
+  ## UNITY MAIN THREAD ONLY. Called from `swPagesOnTabBuilt` before it reads the
+  ## registry. Copies out under the lock and registers outside it, so the lock
+  ## is held for a pointer swap and never across the renderer.
+  var batch: seq[SwPage] = @[]
+  cMqLock()
+  if gModSetStaged.len > 0:
+    batch = gModSetStaged
+    gModSetStaged = @[]
+  cMqUnlock()
+  if batch.len == 0:
+    return
+  var i = 0
+  while i < batch.len:
+    swPageRegister(batch[i])
+    i = i + 1
+  gModSetDrained = gModSetDrained + batch.len
+  # THE DEFERRAL FIRED. This line is the proof asked for: staging without a
+  # drain is a feature that never renders, and the two counters below make that
+  # falsifiable -- `staged` above `drained` after a Game-tab visit is a FAIL,
+  # not a silence.
+  okLog "mod settings render: drained " & $batch.len & " staged mod page(s) " &
+        "onto the Unity main thread (staged=" & $gModSetStagedTotal &
+        " drained=" & $gModSetDrained & "); the deferral fired"
 
 proc modSetParseF64(s: string; dflt: float64): float64 =
   ## A tiny, dependency-free float parse -- this file has no `strutils`
@@ -363,11 +449,19 @@ proc modSetParseSchema(doc: string; guid, name: string; page: var SwPage): bool 
   inc gModSetPagesParsed
   result = true
 
-proc modSetTick(now: uint64) =
+var gModSetNow = 0'u64
+  ## `aowl_p_p_seh` passes exactly one opaque pointer, so the tick's clock is
+  ## handed over in a global rather than smuggled through it as an integer.
+
+proc modSetTickInner(now: uint64) =
   ## Advances the fetch cycle by exactly one step. Called once per host tick;
   ## every branch either returns immediately (nothing to do yet) or performs
   ## one bounded action -- never a loop that could spend an unbounded slice
   ## of this thread's time.
+  ##
+  ## NEVER CALL THIS DIRECTLY. `modSetTick` is the entry point and it is where
+  ## the guard lives.
+  gModSetStep = "entry"
   if not gModSetOn or gModSetOff or gModSetPhase == msDone:
     return
   if gSyncMs <= 0:
@@ -379,6 +473,7 @@ proc modSetTick(now: uint64) =
   of msDone:
     discard
   of msIdle:
+    gModSetStep = "msIdle: arming the index fetch"
     gModSetPhase = msIndex
     gModSetArmedAt = now
     gModSetArmedAttempts = overlaySyncAttempts()
@@ -388,6 +483,7 @@ proc modSetTick(now: uint64) =
           "/aowlspt/settings/index (worker attempt counter at arm: " &
           $gModSetArmedAttempts & ")"
   of msIndex:
+    gModSetStep = "msIndex: overlaySyncTake"
     let doc = overlaySyncTake()
     let attempts = overlaySyncAttempts() - gModSetArmedAttempts
     if gModSetInstrumentTicks < 20:
@@ -416,6 +512,7 @@ proc modSetTick(now: uint64) =
                       "take cursor before this reads it")
         modSetFinish("gave up waiting for the index")
       return
+    gModSetStep = "msIndex: parsing the index body (" & $doc.len & " byte(s))"
     var items: seq[string] = @[]
     if not pathItems(doc, "mods", items):
       modSetFault("the settings index did not parse as {\"mods\":[...]}")
@@ -443,11 +540,30 @@ proc modSetTick(now: uint64) =
       overlaySyncStart("/aowlspt/settings/" & gModSetMods[0].guid,
                        int32(cModSetPollMs))
   of msSchema:
+    gModSetStep = "msSchema[" & $gModSetIdx & "/" & $gModSetMods.len &
+                  "]: overlaySyncTake"
+    # BOUNDS, ONCE, AT THE TOP -- every read of `gModSetMods[gModSetIdx]` below
+    # (the instrument line, both stall messages, the re-arm and the parse) is
+    # covered by this one test. This host is built with runtime checks off, so
+    # an out-of-range seq index is not an exception: it is a raw read past the
+    # buffer that then dereferences whatever string header it finds, which is
+    # exactly the shape of native fault being hunted here. Every branch that
+    # advances `gModSetIdx` already maintains the invariant; this says so out
+    # loud instead of relying on it.
+    if gModSetIdx < 0 or gModSetIdx >= gModSetMods.len:
+      modSetFault("REFUSING to read mod index " & $gModSetIdx & " of " &
+                  $gModSetMods.len & " -- the cycle's own invariant was " &
+                  "broken, which is a bug in this file, not in the backend")
+      modSetFinish("index invariant broken")
+      return
     let doc = overlaySyncTake()
     let attempts = overlaySyncAttempts() - gModSetArmedAttempts
     if gModSetInstrumentTicks < 20:
       inc gModSetInstrumentTicks
-      okLog "mod settings render: schema step ('" & gModSetMods[gModSetIdx].guid &
+      okLog "mod settings render: schema step ('" &
+            (if gModSetIdx >= 0 and gModSetIdx < gModSetMods.len:
+               gModSetMods[gModSetIdx].guid
+             else: "OUT-OF-RANGE idx " & $gModSetIdx) &
             "'), tick " & $gModSetInstrumentTicks &
             ": worker attempts-since-arm=" & $attempts &
             " pending=" & (if doc.len > 0: $doc.len else: "0")
@@ -474,12 +590,16 @@ proc modSetTick(now: uint64) =
           overlaySyncStart("/aowlspt/settings/" & gModSetMods[gModSetIdx].guid,
                            int32(cModSetPollMs))
       return
-    let m = gModSetMods[gModSetIdx]
+    let m = gModSetMods[gModSetIdx]   # bounds-checked at the top of this branch
+    gModSetStep = "msSchema: parsing '" & m.guid & "' (" & $doc.len & " byte(s))"
     var page = SwPage()
     if modSetParseSchema(doc, m.guid, m.name, page):
-      swPageRegister(page)
+      # STAGED, not registered. `gSwPages` belongs to the Unity main thread --
+      # see the note beside `gModSetStaged`.
+      modSetStage(page)
       okLog "mod settings render: page '" & m.guid & "' -> " &
-            $page.rows.len & " row(s)"
+            $page.rows.len & " row(s), STAGED for the Unity main thread " &
+            "(it renders on the next Settings -> Game visit)"
     else:
       modSetFault("mod '" & m.guid & "' schema did not parse")
     gModSetIdx = gModSetIdx + 1
@@ -491,6 +611,66 @@ proc modSetTick(now: uint64) =
       gModSetInstrumentTicks = 0
       overlaySyncStart("/aowlspt/settings/" & gModSetMods[gModSetIdx].guid,
                        int32(cModSetPollMs))
+
+proc modSetTickBody(a: Il2CppPtr): Il2CppPtr {.
+     exportc: "aowl_modset_tick_body", cdecl.} =
+  ## The guarded body. Returns a non-nil sentinel on a normal return;
+  ## `aowl_p_p_seh` returns nil when it caught an access violation, so nil is
+  ## "this tick faulted" and cannot be confused with "this tick did nothing".
+  modSetTickInner(gModSetNow)
+  cast[Il2CppPtr](1)
+
+proc modSetTick(now: uint64) =
+  ## THE ENTRY POINT. One `aowl_p_p_seh` around the whole body and nothing
+  ## nested inside it -- this runs on the host's own tick thread, which opens no
+  ## guard of its own, so there is no outer guard to disarm.
+  ##
+  ## Known and accepted: `aowl_p_p_seh` unwinds by `longjmp`, so a fault taken
+  ## while the overlay's critical section is held would leak it. The sections in
+  ## question (`aowl_ov_sync_start` / `_take`) are a `memcpy` into a buffer this
+  ## process owns, between an `EnterCriticalSection` and a `LeaveCriticalSection`
+  ## with no allocation and no callback in between; every dereference this file
+  ## can plausibly fault on is in the Nim parse work OUTSIDE them. Leaking that
+  ## lock is a worse outcome than a fault but a far less likely one, and the
+  ## alternative on offer today is the crash we already have.
+  if not gModSetOn or gModSetOff:
+    return
+  gModSetNow = now
+  # THE CHARACTER-SELECT WITNESS. `modeskip.nim` increments `gModeSkipSubmits`
+  # when it answers the profile/mode screen -- the exact transition the client
+  # died on with this flag set. Logged ONCE, from inside this feature, naming
+  # the step this feature was on at the time, so "it survived" is distinguish-
+  # able from "it was never running". A silence here is INCONCLUSIVE, not a
+  # pass: it means either the submit never happened or this feature was already
+  # finished/disabled, and the `phase=` field says which.
+  if not gModSetXsWitness and gModeSkipSubmits > 0:
+    gModSetXsWitness = true
+    okLog "mod settings render: CHARACTER-SELECT TRANSITION SURVIVED -- the " &
+          "first host tick after Submit #" & $gModeSkipSubmits &
+          " reached this feature with it still armed. step='" & gModSetStep &
+          "' phase=" & (case gModSetPhase
+                        of msIdle: "msIdle"
+                        of msIndex: "msIndex"
+                        of msSchema: "msSchema"
+                        of msDone: "msDone") &
+          " staged=" & $gModSetStagedTotal & " drained=" & $gModSetDrained &
+          " guardFaults=" & $gModSetGuardFaults & ". This tick is about to run " &
+          "the step named above; if the client dies now, that step is where."
+  let r = cModSetTickGuarded(nil)
+  if r == nil:
+    gModSetGuardFaults = gModSetGuardFaults + 1
+    warn "mod settings render: ACCESS VIOLATION caught inside step '" &
+         gModSetStep & "' (guard fault " & $gModSetGuardFaults & " of " &
+         $cModSetMaxGuardFaults & "). The client did NOT die; this feature " &
+         "refused instead. The step name above is the location."
+    if gModSetGuardFaults >= cModSetMaxGuardFaults:
+      gModSetOff = true
+      gModSetPhase = msDone
+      warn "mod settings render: DISABLED for this session after " &
+           $gModSetGuardFaults & " access violation(s). The sync slot is " &
+           "handed back below; nothing further is fetched, staged or rendered."
+      if gSyncPath.len > 0 and gSyncMs > 0:
+        overlaySyncStart(gSyncPath, int32(gSyncMs))
 
 # ---------------------------------------------------------------------------
 # The write leg
