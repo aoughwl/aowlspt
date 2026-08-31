@@ -194,9 +194,28 @@ const
   # treated as proof of absence: it falls through to the wide walk, which is
   # throttled but keeps the FULL SplFindDepth/SplNodeBudget, so nothing that
   # was findable before becomes unfindable -- only the per-frame price drops.
-  SplCheapDepth   = 4
-  SplCheapBudget  = 2500
-  SplCheapMs      = 2'u64
+  # ---- THE TIER-1 BOUND. It was depth 4 / 2500 nodes / 2 ms, and THAT BROKE
+  # THE FEATURE (measured: the live log filled with `screen "Matchmaker Offline
+  # Raid Screen" WAS found, but its heading TMP ... was not read`, then
+  # `... yielded no targets on 20 consecutive re-scans`, on a loop -- the player
+  # saw vanilla). Those bounds came from a comment in this file claiming the hit
+  # case is "depth 2, ~100 nodes"; sizing a live bound from a comment is a
+  # guess, and it was wrong.
+  #
+  # `splFindByName` is breadth-before-depth PER NODE, so a DEPTH CAP does not
+  # merely truncate the search -- it can return a DIFFERENT node of the same
+  # name. A shallow same-named container whose subtree holds no `MainCaption`
+  # will then be cached as "the screen", the scan under it correctly finds
+  # nothing, and the feature spins. That is why the depth cap is gone entirely
+  # rather than merely raised: the bound is now the SAME one the wide walk
+  # uses, so tier 1 and the wide walk cannot disagree about which node is the
+  # screen.
+  #
+  # The per-frame cost this was meant to fix is bought back instead by not
+  # REPEATING fruitless work -- the rejected-screen ledger and the resolved-path
+  # cache below -- which is the only kind of saving that cannot shrink a search
+  # that has to succeed.
+  SplCheapMs      = SplWalkMs
   SplScanDepth    = 12         ## depth for the by-text scan within the screen.
   SplBlockerUp    = 5          ## how far to climb from the toggle label to the blocker.
   SplWarnUp       = 4          ## how far to climb from the warning TMP to its panel container.
@@ -328,6 +347,26 @@ const SplFullWalkEveryMs = 10000'u64
 # caption back off that same TMP. This asserts the FINISHED STATE of the screen,
 # not that a setter ran, and it is falsifiable: if the re-assert is slow the
 # number is large and the verdict says FAIL.
+var gSplScanCut = 0        ## why the last splScanNode stopped: 0 exhaustive,
+                           ## 1 node budget, 2 wall-clock, 3 could-not-start,
+                           ## 4 depth cap. 0 is the ONLY value that licenses a
+                           ## claim that something is absent.
+var gSplScanNodes = 0      ## nodes the last scan visited
+var gSplScanDeepest = 0    ## deepest BFS level the last scan reached
+var gSplHeadDepth = -1     ## MEASURED: BFS level of MainCaption below the screen
+var gSplHeadNodes = -1     ## MEASURED: nodes visited before reaching it
+var gSplHeadEverResolved = false  ## has the heading TMP EVER been resolved this
+                                  ## session? The missing negative: the old
+                                  ## acceptance measured how fast we apply ONCE
+                                  ## RESOLVED, so it read PASS while the feature
+                                  ## never resolved at all.
+var gSplUnresolvedRounds = 0      ## consecutive full discovery rounds that ended
+                                  ## without a heading TMP
+var gSplGaveUpLogged = false
+var gSplMeasureLogged = false
+
+const SplUnresolvedFail = 20      ## rounds after which this says FAIL, ONCE
+
 var gSplRescanMisses = 0           ## consecutive fruitless re-scans from the
                                    ## CACHED screen; capped so the cache can
                                    ## never permanently suppress the full walk.
@@ -476,8 +515,34 @@ proc splForceToggle(): int =
 # ---------------------------------------------------------------------------
 # Discovery: bounded, time-sliced.
 # ---------------------------------------------------------------------------
+const SplMaxRejected = 8
+
+var gSplRejected: seq[Il2CppPtr] = @[]
+  ## Nodes that MATCH `SplScreenName` and that an EXHAUSTIVE scan (one that ran
+  ## out of neither budget nor time) proved hold no heading TMP.
+  ##
+  ## This exists because `splFindByName` returns the FIRST node of that name and
+  ## there is no guarantee the first one is the right one. Without this ledger a
+  ## wrong-but-same-named node is re-found, re-scanned and re-rejected forever,
+  ## which is the loop the player sees as "the page is back to vanilla".
+  ## ONLY an exhaustive scan may add to it -- a scan that ran out of budget
+  ## proved nothing, and entering it here would be a check that cannot fail.
+  ## Capped, and cleared whenever the UI root changes, so a rebuilt screen at a
+  ## recycled address can never be permanently blacklisted.
+
+proc splRejected(p: Il2CppPtr): bool =
+  for i in 0 ..< gSplRejected.len:
+    if gSplRejected[i] == p: return true
+  false
+
+proc splReject(p: Il2CppPtr) =
+  if p == nil or splRejected(p): return
+  if gSplRejected.len >= SplMaxRejected: gSplRejected.delete(0)
+  gSplRejected.add p
+
 proc splFindByName(t: Il2CppPtr; name: string; depth: int;
-                   budget: var int; deadline: uint64): Il2CppPtr =
+                   budget: var int; deadline: uint64;
+                   skipRejected = false): Il2CppPtr =
   ## A bounded, TIME-SLICED descent by object name. Three bounds (budget,
   ## in-walk deadline, depth+fan-out), mirroring `mtxDescend`.
   ## BREADTH-BEFORE-DEPTH: at each node we check ALL of its direct children's
@@ -492,7 +557,7 @@ proc splFindByName(t: Il2CppPtr; name: string; depth: int;
   if (budget and 31) == 0 and cNowMs() > deadline:
     budget = 0                              # poison the budget: unwinds all levels
     return
-  if iObjName(t) == name:
+  if iObjName(t) == name and not (skipRejected and splRejected(t)):
     return t
   if depth == 0: return
   var n = 0
@@ -506,7 +571,7 @@ proc splFindByName(t: Il2CppPtr; name: string; depth: int;
       if (budget and 31) == 0 and cNowMs() > deadline:
         budget = 0
         return
-      if iObjName(c) == name:
+      if iObjName(c) == name and not (skipRejected and splRejected(c)):
         return c
     i = i + 1
   # Pass 2 -- depth: recurse only after the whole level missed by name.
@@ -514,7 +579,7 @@ proc splFindByName(t: Il2CppPtr; name: string; depth: int;
   while i < n and i < SplFanout and budget > 0:
     let c = iChildAt(t, i)
     if c != nil:
-      result = splFindByName(c, name, depth - 1, budget, deadline)
+      result = splFindByName(c, name, depth - 1, budget, deadline, skipRejected)
       if result != nil: return
     i = i + 1
 
@@ -550,6 +615,11 @@ proc splUiRootLive(): Il2CppPtr =
   if gSplUiRoot == nil: return
   if not duOk(gSplUiRoot, 0x20'i32) or not iUnityAlive(gSplUiRoot):
     gSplUiRoot = nil
+    # The menu was torn down. Every rejected-screen pointer belonged to that
+    # tree, and a rebuilt screen can land on a recycled address -- so the
+    # ledger must die with the root it was measured under. A blacklist that
+    # outlives its evidence is a check that cannot fail.
+    gSplRejected.setLen(0)
     return
   result = gSplUiRoot
 
@@ -594,16 +664,18 @@ proc splFindScreen(): Il2CppPtr =
   let cachedRoot = splUiRootLive()
   if cachedRoot != nil:
     inc gSplUiRootHits
-    # Tier 1 runs EVERY frame, so it carries the CHEAP bounds, not the full
-    # ones. Billed to its own phase slot (CHEAPHUNT) so "the cheap hunt is
-    # cheap" is a falsifiable claim in the next run's meter rather than a
-    # comment. A miss here is NOT a verdict -- it falls through below.
-    var budget = SplCheapBudget
+    # Tier 1 runs every frame and carries the SAME bounds as the wide walk, so
+    # the two cannot disagree about which node is the screen. Billed to its own
+    # phase slot (CHEAPHUNT) so its real cost stays visible and separable from
+    # the throttled wide DESCEND. A miss here is NOT a verdict of absence -- it
+    # falls through below.
+    var budget = SplNodeBudget
     let dl = cNowMs() + SplCheapMs
     let tD = cSpNow()
-    let m = splFindByName(cachedRoot, SplScreenName, SplCheapDepth, budget, dl)
+    let m = splFindByName(cachedRoot, SplScreenName, SplFindDepth, budget, dl,
+                          skipRejected = true)
     cSpAdd(SpCheap, tD)
-    gSplLastNodes = gSplLastNodes + (SplCheapBudget - budget)
+    gSplLastNodes = gSplLastNodes + (SplNodeBudget - budget)
     if m != nil:
       gSplLastWhy = ""
       return m
@@ -612,10 +684,10 @@ proc splFindScreen(): Il2CppPtr =
     # dropping it would put us back on the expensive path every pass.
     gSplLastWhy = "screen \"" & SplScreenName & "\" is not under the cached UI " &
       "root \"" & gSplUiRootName & "\" (" & $gSplLastNodes & " nodes, depth " &
-      $SplCheapDepth & ", " & $int(SplCheapMs) & " ms CHEAP slice). Normal " &
-      "while the offline-raid screen is not open. This is a bounded miss, NOT " &
-      "a verdict of absence -- the throttled wide walk below keeps the full " &
-      "depth " & $SplFindDepth & "/" & $SplNodeBudget & " budget."
+      $SplFindDepth & ", " & $int(SplCheapMs) & " ms slice" &
+      (if gSplRejected.len > 0: ", skipping " & $gSplRejected.len &
+         " node(s) of that name already proven to hold no heading" else: "") &
+      "). Normal while the offline-raid screen is not open."
     # Fall through to a wider look only when the expensive path is due. Stamp
     # the clock HERE, on the decision to go wide -- not inside tier 3, which
     # normally does not run at all once tier 2 returns roots. Stamping only in
@@ -822,10 +894,23 @@ proc splScanNode(t: Il2CppPtr; depth: int; budget: var int; deadline: uint64) =
   ## visits every depth-1 node, then every depth-2, etc., so the shallow targets
   ## are reached before the deep settings. Name-reads (not TMP reads) keep each
   ## node cheap; early-out the moment all three are in hand.
-  if t == nil or depth < 0 or budget <= 0 or not duOk(t, 0x20'i32): return
+  ## THREE OUTCOMES, and the caller must be able to tell them apart:
+  ##   * found what it needed                      -> gSplScanCut = 0
+  ##   * ran the WHOLE subtree and it is not there -> gSplScanCut = 0, exhaustive
+  ##   * ran out of node budget or wall-clock      -> gSplScanCut = 1 or 2
+  ## Collapsing the last two into "not resolved" is what let a bound that was
+  ## simply too small read exactly like a screen that genuinely has no heading.
+  gSplScanCut = 0
+  gSplScanNodes = 0
+  gSplScanDeepest = 0
+  let budget0 = budget
+  if t == nil or depth < 0 or budget <= 0 or not duOk(t, 0x20'i32):
+    gSplScanCut = 3                       # could not even start -- INCONCLUSIVE
+    return
   var frontier: seq[Il2CppPtr] = @[t]
   var d = 0
   while frontier.len > 0 and d <= depth and budget > 0:
+    gSplScanDeepest = d
     var nextf: seq[Il2CppPtr] = @[]
     var fi = 0
     while fi < frontier.len and budget > 0:
@@ -833,8 +918,10 @@ proc splScanNode(t: Il2CppPtr; depth: int; budget: var int; deadline: uint64) =
       fi = fi + 1
       if node == nil or not duOk(node, 0x20'i32): continue
       budget = budget - 1
+      gSplScanNodes = budget0 - budget
       if (budget and 31) == 0 and cNowMs() > deadline:
         budget = 0
+        gSplScanCut = 2                   # CUT OFF BY THE CLOCK
         return
       let nm = iObjName(node)
       if gSplHeadTmp == nil and nm == SplHeadNode:
@@ -842,6 +929,12 @@ proc splScanNode(t: Il2CppPtr; depth: int; budget: var int; deadline: uint64) =
         if tmp != nil:
           gSplHeadTmp = tmp
           gSplHeadLoc = splComponent(node, splLocTypeStr())
+          # THE MEASUREMENT. How far the heading actually is from the screen
+          # root, in BFS levels and in nodes visited. Every bound in this file
+          # that used to be a guess is now sized against these two numbers, and
+          # they are logged once so they can be argued with.
+          gSplHeadDepth = d
+          gSplHeadNodes = gSplScanNodes
       elif gSplDescTmp == nil and nm == SplDescNode:
         let tmp = splTmpOf(node)
         if tmp != nil:
@@ -871,6 +964,11 @@ proc splScanNode(t: Il2CppPtr; depth: int; budget: var int; deadline: uint64) =
           i = i + 1
     frontier = nextf
     d = d + 1
+  # Fell out of the loop. Say WHICH bound ended it -- an empty frontier means
+  # the subtree was searched EXHAUSTIVELY and the target is genuinely absent,
+  # which is a completely different claim from running out of room.
+  if budget <= 0: gSplScanCut = 1         # CUT OFF BY THE NODE BUDGET
+  elif frontier.len > 0 and d > depth: gSplScanCut = 4  # CUT OFF BY THE DEPTH CAP
 
 # ---------------------------------------------------------------------------
 # Maintain + assert the FINISHED STATE (never our own write -- fact #9b).
@@ -1197,10 +1295,56 @@ proc splRebrandTickBody(a: Il2CppPtr): Il2CppPtr {.
     # missing one is "screen still building", not a failure -- retry.
     if gSplOn and gSplHeadTmp == nil:
       let tG2 = cSpNow()
-      splDiag("screen \"" & SplScreenName & "\" WAS found, but its heading TMP " &
-        "(text containing \"" & SplHeadStock & "\") was not read within depth " &
-        $SplScanDepth & "/" & $int(SplWalkMs) & " ms -- the screen may still be " &
-        "building; retrying.")
+      inc gSplUnresolvedRounds
+      # THE TWO FAILURE MODES, which used to share one sentence. They have
+      # different causes and different fixes, and saying "not read within
+      # budget" for both is what let a bound that was simply too small look
+      # exactly like a screen that has no heading.
+      let where = "node \"" & SplHeadNode & "\" under screen \"" &
+        SplScreenName & "\" (scan reached level " & $gSplScanDeepest & " of " &
+        $SplScanDepth & ", visited " & $gSplScanNodes & " node(s))"
+      if gSplScanCut == 0:
+        # EXHAUSTIVE. Nothing was cut off, so this node genuinely does not
+        # contain the heading -- it is the wrong node of that name. Say so,
+        # and put it on the ledger so the next hunt looks PAST it instead of
+        # re-finding, re-scanning and re-rejecting it forever.
+        splReject(screen)
+        gSplScanCut = 0
+        splDiag("REAL ABSENCE, not a budget: the scan of " & where &
+          " ran to EXHAUSTION -- it ran out of neither nodes nor time -- and " &
+          "that heading is NOT under this node. This node of that name is now " &
+          "on the rejected ledger (" & $gSplRejected.len & " entry/entries) " &
+          "and the next hunt will look PAST it for another node named \"" &
+          SplScreenName & "\". Raising a budget CANNOT fix this.")
+      else:
+        let cut = (case gSplScanCut
+          of 1: "the NODE BUDGET (" & $SplNodeBudget & ")"
+          of 2: "the WALL-CLOCK SLICE (" & $int(SplWalkMs) & " ms)"
+          of 4: "the DEPTH CAP (" & $SplScanDepth & ")"
+          else: "an unreadable screen root (it could not start)")
+        splDiag("BUDGET, not absence: the scan for " & where &
+          " was CUT OFF by " & cut & ", so it never proved anything about " &
+          "whether the heading is there. This is a TUNING bug in this file, " &
+          "not a missing control -- raise that bound. The screen is NOT " &
+          "rejected on this evidence.")
+      # THE MISSING NEGATIVE. `frames-to-apply=1 PASS` measures how fast we
+      # apply ONCE RESOLVED; it passed for a whole session in which the heading
+      # was never resolved at all and the player saw vanilla throughout. So the
+      # thing that must be asserted is RESOLUTION, and it must be said ONCE,
+      # loudly, at error level -- not as a warn repeated forever.
+      if gSplUnresolvedRounds >= SplUnresolvedFail and not gSplGaveUpLogged:
+        gSplGaveUpLogged = true
+        fail "singleplayer rebrand: FAIL -- the heading TMP has NEVER been " &
+          "resolved this session, after " & $gSplUnresolvedRounds &
+          " consecutive discovery rounds. The screen \"" & SplScreenName &
+          "\" IS being found; the heading \"" & SplHeadNode & "\" under it is " &
+          "not. The player is seeing the VANILLA page. Last round ended " &
+          (if gSplScanCut == 0: "EXHAUSTIVELY (real absence -- wrong node of " &
+             "that name; see the rejected ledger)"
+           else: "CUT OFF by a bound (a TUNING bug -- raise it)") &
+          ", having reached level " & $gSplScanDeepest & " over " &
+          $gSplScanNodes & " node(s). This is a FAIL, not a warning, and it " &
+          "is stated once rather than repeated."
       cSpAdd(SpDiag, tG2)
       return                              # screen present but heading not read yet
     if gSplForceOffline and gSplToggle == nil:
@@ -1213,6 +1357,22 @@ proc splRebrandTickBody(a: Il2CppPtr): Il2CppPtr {.
       return                              # screen present but toggle not read yet
     gSplResolved = true
     gSplRescanMisses = 0
+    # RESOLUTION HAPPENED. Reset the give-up counter and publish the MEASUREMENT
+    # every bound in this file should have been sized against in the first
+    # place. Logged once per session, at ok level, with both numbers.
+    gSplHeadEverResolved = true
+    gSplUnresolvedRounds = 0
+    gSplGaveUpLogged = false
+    if not gSplMeasureLogged:
+      gSplMeasureLogged = true
+      okLog "singleplayer rebrand: MEASURED distance from the screen root to " &
+        "the heading -- \"" & SplHeadNode & "\" sits at BFS level " &
+        $gSplHeadDepth & " below \"" & SplScreenName & "\", reached after " &
+        $gSplHeadNodes & " node(s) of a " & $SplNodeBudget & "-node budget " &
+        "(scan depth cap " & $SplScanDepth & ", slice " & $int(SplWalkMs) &
+        " ms). THESE are the numbers any future bound must be sized from, " &
+        "with headroom -- the depth-4/2500-node tier-1 bound that broke this " &
+        "feature was sized from a code comment instead."
     let tG4 = cSpNow()
     okLog "singleplayer rebrand: resolved on \"" & SplScreenName &
           "\" -- heading TMP " & (if gSplHeadTmp != nil: "found" else: "MISSING") &
@@ -1414,6 +1574,19 @@ proc splProfLines(): seq[string] =
   # and if the rebrand ever flickers back to BSG's caption this number must be
   # non-zero on that frame -- a latch that hid a clobber would show hits with a
   # visibly wrong screen, which is the observation that would refute this.
+  # RESOLUTION FIRST -- it is the precondition for every other number here.
+  # A steady-state cost of "nearly nothing" is trivially achievable by never
+  # resolving, so the cost rows below are meaningless until this line says the
+  # heading was actually resolved.
+  result.add "    RESOLUTION: heading TMP " &
+    (if gSplHeadEverResolved:
+       "RESOLVED (MEASURED at BFS level " & $gSplHeadDepth & ", " &
+       $gSplHeadNodes & " nodes below the screen root)"
+     else:
+       "*** NEVER RESOLVED this session after " & $gSplUnresolvedRounds &
+       " round(s) -- the player is seeing the VANILLA page and every cost " &
+       "figure below is the cost of FAILING, not of working ***") &
+    "; rejected same-named screen nodes=" & $gSplRejected.len & "."
   result.add "    m_text identity latch: " & $gSplLatchHits &
     " hit(s) (one guarded pointer read, no decode, no allocation) vs " &
     $gSplLatchMiss & " miss(es) (full decode; a miss that does not read as " &
