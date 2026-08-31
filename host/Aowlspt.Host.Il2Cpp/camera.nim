@@ -90,6 +90,9 @@ proc cCamTargetCount(): int32 {.importc: "aowl_cam_target_count", nodecl.}
 proc cCamOkCount(): int32 {.importc: "aowl_cam_ok_count", nodecl.}
 proc cCamBadCount(): int32 {.importc: "aowl_cam_bad_count", nodecl.}
 proc cCamReason(): int32 {.importc: "aowl_cam_reason", nodecl.}
+proc cCamReasonText(): cstring {.importc: "aowl_cam_reason_text", nodecl.}
+proc cCamModuleReady(): int32 {.importc: "aowl_cam_module_ready", nodecl.}
+proc cCamWaitCount(): int32 {.importc: "aowl_cam_wait_count", nodecl.}
 
 proc cCamGetF(fn, self: Il2CppPtr): float64 {.importc: "aowl_cam_get_f", nodecl.}
 proc cCamGetFOk(fn, self: Il2CppPtr): int32 {.
@@ -185,6 +188,14 @@ var gCamFaults = 0
 var gCamTicks = 0'i64
 var gCamIndicesOk = -1'i32     ## -1 not checked, 1 ok, 0 MISMATCH
 var gCamWhy = "not attempted"
+# ---- binding state: THREE outcomes, never two ----
+# 0 not attempted, 1 DEFERRED (GameAssembly.dll was not mapped when we asked --
+# retryable, and NOT a verdict), 2 attempted with the module PRESENT and the
+# verdict recorded. Only state 2 is latched, because only state 2 is a fact
+# about the build.
+var gCamBindState = 0'i32
+var gCamBindTries = 0'i64      ## retries made from the main-thread drain
+var gCamBindSaidWait = false   ## the "still waiting" warning is said once
 
 # ---- the acquired camera, and the type-confusion pin ----
 var gCamObj: Il2CppPtr = nil   ## UnityEngine.Camera, by contract from get_main
@@ -244,6 +255,10 @@ var gCamWantOff = false        ## acts on it, never the caller's thread
 var gCamSaidAt = 0'u64         ## throttle for the periodic status line
 
 proc camDisabled*(): bool = gCamFaults >= CamMaxFaults
+
+## Forward-declared: the deferred bind lives below (it needs `camIndicesOk`),
+## but `camDrainTick` above it is the retry site.
+proc camBindRetry()
 
 proc camIndicesOk(): bool =
   ## Compare the NAME the C table holds at each index against the name this Nim
@@ -700,6 +715,10 @@ proc camDrainTick*() =
   if camDisabled(): return
   if not gCamApi and not gCamFree: return
   if not camIndicesOk(): return
+  # FINISH THE BIND. At boot GameAssembly.dll may not be mapped yet; here on
+  # the Update drain it is mapped by construction, because this drain IS game
+  # code. Cheap and self-latching: one integer compare once bound.
+  camBindRetry()
   gCamTicks = gCamTicks + 1
   # THE STATUS LINE IN THE LOG. Emitted at most once every 10s and ONLY while
   # the free camera is active, so a run with the flags on but the feature idle
@@ -731,23 +750,52 @@ proc camRenderTick*() =
     gCamFaults = gCamFaults + 1
     gCamFreeOn = false
 
-proc camBind*() =
-  ## Read the flags and say, at boot, exactly what is and is not armed.
-  gCamApi = readBoolKey("cameraApi")
-  gCamFree = readBoolKey("cameraFreeCam")
-  if not gCamApi and not gCamFree:
+proc camBindAttempt(fromRetry: bool) =
+  ## ONE bind attempt. Called at boot and, if that was too early, again from the
+  ## main-thread drain until GameAssembly.dll is mapped.
+  ##
+  ## THE DEFECT THIS REPLACES, measured live 2026-08-31: this ran once at
+  ## host-config time, ~1s before IL2CPP maps GameAssembly.dll, so all 15
+  ## targets came back reason code 1 (`!ga`) and the host PRINTED that as
+  ## "0 of 15 targets verified" -- a verdict about the build, computed before
+  ## the build's code was mapped. `mods/fov` byte-verified the very same
+  ## addresses moments later purely because it binds later. Nothing was ever
+  ## wrong with an RVA or a prologue.
+  ##
+  ## Nothing about the verification is relaxed here: `aowl_cam_fn` still
+  ## VirtualQuery-checks committed+executable and still compares 16 prologue
+  ## bytes against the STARTUP SNAPSHOT (`aowl_pro_verify`), and every operation
+  ## still refuses on an unverified target. The only change is WHEN we ask, and
+  ## that a "no module" answer is no longer mistaken for an answer.
+  if not camIndicesOk():
+    gCamBindState = 2'i32
     return
-  if gCamFree and not gCamApi:
-    gCamApi = true
-    info "camera: cameraFreeCam implies cameraApi; the read/write surface is " &
-         "armed because the free camera is built on it."
-  if not camIndicesOk(): return
+  if cCamModuleReady() == 0'i32:
+    # NOT a verdict. The startup prologue snapshot cannot be taken before the
+    # bytes are mapped either, so concluding anything here would be concluding
+    # from an unmapped module.
+    gCamBindState = 1'i32
+    if not fromRetry:
+      info "camera: binding DEFERRED -- GameAssembly.dll is not mapped yet " &
+           "(reason code " & $cCamReason() & ": " & $cCamReasonText() & "). " &
+           "This is NOT a byte mismatch and NOT a wrong RVA; the host runs at " &
+           "DLL-attach and IL2CPP maps the module about a second later. The " &
+           "bind will be RETRIED on the TarkovApplication::Update drain and " &
+           "the real verdict printed then. No NULL handle is cached."
+    return
   var ok = 0
   var bad = 0
   var i = 0
   while i < int(cCamTargetCount()):
-    if cCamFn(int32(i)) != nil: ok = ok + 1 else: bad = bad + 1
+    if cCamFn(int32(i)) != nil:
+      ok = ok + 1
+    else:
+      bad = bad + 1
+      warn "camera: target " & $i & " '" & $cCamName(int32(i)) & "' @0x" &
+           hexOf(uint64(cCamRva(int32(i)))) & " REJECTED, reason code " &
+           $cCamReason() & ": " & $cCamReasonText()
     i = i + 1
+  gCamBindState = 2'i32
   info "camera: " & $ok & " of " & $int(cCamTargetCount()) & " targets " &
        "verified by RVA + startup-snapshot prologue (" & $bad & " rejected, " &
        "last reason code " & $cCamReason() & "). ABI, MEASURED from the " &
@@ -770,6 +818,36 @@ proc camBind*() =
          "restores automatically the moment the raid phase stops reading " &
          "DEPLOYED, which includes the post-raid results screen."
 
+proc camBind*() =
+  ## Read the flags at boot and make the FIRST bind attempt. If the module is
+  ## not mapped yet the attempt defers and `camBindRetry` finishes the job.
+  gCamApi = readBoolKey("cameraApi")
+  gCamFree = readBoolKey("cameraFreeCam")
+  if not gCamApi and not gCamFree:
+    return
+  if gCamFree and not gCamApi:
+    gCamApi = true
+    info "camera: cameraFreeCam implies cameraApi; the read/write surface is " &
+         "armed because the free camera is built on it."
+  camBindAttempt(false)
+
+proc camBindRetry() =
+  ## Called from the main-thread drain, where GameAssembly.dll is mapped by
+  ## construction (the drain rides TarkovApplication::Update, which is game
+  ## code). At most one attempt per frame, and it stops the moment a real
+  ## verdict exists -- state 2 is latched, so this cannot re-verify or
+  ## re-count.
+  if gCamBindState == 2'i32: return
+  gCamBindTries = gCamBindTries + 1
+  camBindAttempt(true)
+  if gCamBindState != 2'i32 and gCamBindTries >= 600 and not gCamBindSaidWait:
+    gCamBindSaidWait = true
+    warn "camera: still UNBOUND after " & $gCamBindTries & " drain frames " &
+         "(" & $cCamWaitCount() & " resolves found no module). The camera API " &
+         "is INCONCLUSIVE, not failed: nothing has been verified and nothing " &
+         "will be called. Reason code " & $cCamReason() & ": " &
+         $cCamReasonText()
+
 proc camStatus*(): string =
   ## Every leg separately falsifiable, so a wrong verdict says WHICH one
   ## produced it instead of being a bare bool.
@@ -779,6 +857,11 @@ proc camStatus*(): string =
   if not gCamApi and not gCamFree:
     return "camera: both flags OFF (cameraApi, cameraFreeCam). Nothing is " &
            "armed; this is not a statement about the build."
+  if gCamBindState != 2'i32:
+    return "camera: NOT BOUND YET -- the bind is deferred until " &
+           "GameAssembly.dll is mapped (" & $gCamBindTries & " drain retries " &
+           "so far, reason code " & $cCamReason() & ": " & $cCamReasonText() &
+           "). INCONCLUSIVE, not a failure: nothing verified, nothing called."
   "camera: acquire=" & gCamWhy &
   " targets=" & $cCamOkCount() & "/" & $int(cCamTargetCount()) &
   " sampled=" & (if gCamSampled: "yes" else: "NO -- reads are refusals") &
