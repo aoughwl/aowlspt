@@ -263,6 +263,11 @@ static int aowl_rva_is_code(unsigned int rva) {
 ## `EFT.GameWorld::RegisterPlayer` detour target. Offsets/target only; the walk
 ## is in `botdiag.nim` (included below). See `aowlspt_botdiag.h`.
 {.emit: """#include "aowlspt_botdiag.h" """.}
+## THE TRUE DEPLOY SIGNAL: the two byte-verified, UNIQUE `AfterGameStarted`
+## subscriber targets that run inside `EFT.GameWorld::OnGameStarted` (which is
+## itself unhookable -- relative branch at prologue offset 10). Targets only; the
+## latch is in `raidphase.nim`. See `aowlspt_raidstart.h`.
+{.emit: """#include "aowlspt_raidstart.h" """.}
 ## OFFLINE SCAV-CAP LIFT: the MaxBots (+0xC0) offset + the verified
 ## `EFT.BotSpawner::AddPlayer` detour target + the guarded int32 read/write. The
 ## one field poke is in `botcap.nim` (included below). See `aowlspt_botcap.h`.
@@ -1432,8 +1437,24 @@ var gVersionBranded = false
 ## the other detour slots; the walk itself lives in `botdiag.nim` (included
 ## below), which reuses this file's guarded raw-read primitives. NEVER writes.
 var gBotDiagSlot = -1
+## THE TRUE DEPLOY SIGNAL (kind=20/21 read-only detours on the two UNIQUE
+## `AfterGameStarted` subscribers, which run inside `EFT.GameWorld::OnGameStarted`
+## -- that method cannot be hooked directly, see `abi/aowlspt_raidstart.h`).
+## Declared here beside the other detour slots because `attachDrain`, the
+## dispatch in `patchFired` and `raidphase.nim` all name them and the include
+## comes later. Read-only: the handler sets one bool and one timestamp.
+var gRpStartSlotA = -1
+var gRpStartSlotB = -1
 var gBotDiag = false
 var gBotDiagFires = 0
+## PLAYER ACTUATION (`pact.nim`): the slot of its ONE detour, a READ-ONLY
+## capture on `EFT.GamePlayerOwner::LateUpdate` @0xB29130 (UNIQUE, owners=1)
+## that records the `this` register and does nothing else. Declared here beside
+## the other detour slots because `attachDrain` above must be able to assign it.
+## Nothing else in this repo detours that RVA, so the double-detour trampoline
+## hazard does not apply; if that ever changes, pact must ride the existing
+## detour as a drain rather than bind a second one.
+var gPactOwnerSlot = -1
 ## One-shot guard for the full-list census. The per-registration detour now does
 ## only minimal single-hop work; the whole-list walk (the expensive, most
 ## fault-prone read) runs exactly once, after the list has had a few
@@ -3564,6 +3585,14 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
     dpT = cDpNow()
     camDrainTick()
     cDpAdd(DpCam, dpT)
+    # IN-RAID ACTUATION OF THE LOCAL PLAYER. Rides THIS drain; the only detour
+    # it owns is the read-only GamePlayerOwner capture. Must run AFTER
+    # `rpDrainTick`, whose DEPLOYED verdict it reads as a CACHED value -- it
+    # never re-evaluates the phase, because its own body is already inside ONE
+    # `aowl_p_p_seh` (`aowl_pact_tick_guarded`) and that guard is not
+    # re-entrant. Flag `playerActuation`, default OFF; idle cost with it off is
+    # one boolean compare and no call into the game.
+    pactDrainTick()
     dpT = cDpNow()
     natEspDrainTick()
     cDpAdd(DpNatEsp, dpT)
@@ -3583,6 +3612,17 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
     # and no call into the game.
     dpT = cDpNow()
     cwDrainTick()
+    # THE NATIVE INVENTORY / ITEM-SPAWNER SCREEN. Rides THIS drain for exactly
+    # the reason the colour widget above does, and its whole body is inside the
+    # ONE `aowl_p_p_seh` that `aowl_iu_tick_guarded` opens -- so this call site
+    # opens none. It shares the colour widget's profiler bucket rather than
+    # claiming a new one: both are the same phase (native UI polled off the
+    # Unity drain) and a bucket per feature would make the decomposition wider
+    # without making it more informative.
+    #
+    # Flag `nativeInvUi`, default OFF; idle cost is one boolean compare and no
+    # call into the game.
+    iuDrainTick()
     cDpAdd(DpCw, dpT)
     # THE POSITIVE CONTROL and the throttled report, LAST, after every rider so
     # the report reads this frame's accumulation rather than the previous
@@ -3635,6 +3675,22 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
   # the registered players and only logs -- it must never suppress the original.
   if i == gBotDiagSlot:
     botDiagRegisterFired(regs)
+    return 0'i32
+  # THE TRUE DEPLOY SIGNAL, by identity. These run INSIDE
+  # `EFT.GameWorld::OnGameStarted`; the handler reads no register and touches no
+  # game memory, so it needs no guard of its own, and it must never suppress the
+  # original subscriber (which is real gameplay audio).
+  if i == gRpStartSlotA:
+    rpStartFired(regs, 0'i32)
+    return 0'i32
+  if i == gRpStartSlotB:
+    rpStartFired(regs, 1'i32)
+    return 0'i32
+  # PLAYER ACTUATION's receiver capture, by identity. It stores ONE register
+  # value and returns; it writes no game state and must never suppress the
+  # original LateUpdate.
+  if i == gPactOwnerSlot:
+    pactOwnerFired(regs)
     return 0'i32
   # OFFLINE SCAV-CAP LIFT: the one-shot BotSpawner.MaxBots=0 poke, by identity. It
   # writes one int32 and must never suppress the original AddPlayer.
@@ -5043,6 +5099,8 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
               elif kind == 17: "skip-mode-screen-ctor"
               elif kind == 18: "skip-mode-screen-showslot"
               elif kind == 19: "spl-preloader-anchor"
+              elif kind == 20: "true-deploy-signal-a"
+              elif kind == 21: "true-deploy-signal-b"
               else: "main-thread")
   tablesLock()
   let claimed = cHookClaim()
@@ -5122,6 +5180,12 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
     gModeSkipShowSlot = int(claimed)
   elif kind == 19:
     gSplPreloaderSlot = int(claimed)
+  elif kind == 20:
+    gRpStartSlotA = int(claimed)
+  elif kind == 21:
+    gRpStartSlotB = int(claimed)
+  elif kind == 22:
+    gPactOwnerSlot = int(claimed)
   else:
     gDrainSlot = int(claimed)
   tablesUnlock()
@@ -5130,7 +5194,8 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
   elif kind == 2 or kind == 3 or kind == 4 or kind == 5 or kind == 6 or
        kind == 7 or kind == 8 or kind == 9 or kind == 10 or
        kind == 11 or kind == 12 or kind == 13 or kind == 14 or kind == 15 or
-       kind == 16 or kind == 17 or kind == 18 or kind == 19:
+       kind == 16 or kind == 17 or kind == 18 or kind == 19 or
+       kind == 20 or kind == 21 or kind == 22:
     discard
   else:
     gDrainMethod = spec
@@ -5141,7 +5206,8 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
             kind == 6 or kind == 7 or kind == 8 or kind == 9 or
             kind == 10 or kind == 11 or kind == 12 or kind == 13 or
             kind == 14 or kind == 15 or kind == 16 or kind == 17 or
-            kind == 18 or kind == 19: "" else:
+            kind == 18 or kind == 19 or kind == 20 or kind == 21 or
+            kind == 22: "" else:
            "; it runs more than once a frame, so its firing count is not a " &
            "frame count")
   return true
@@ -6218,6 +6284,21 @@ include "raidphase.nim"
 ## drain and `camRenderTick` rides the render drain.
 include "camera.nim"
 
+## IN-RAID ACTUATION OF THE LOCAL PLAYER -- walk / look / fire / aim / pose /
+## lean, the `ECommand` input channel (reload, weapon swap, inventory) and the
+## magazine unload+load cycle, so a test needs nobody at the keyboard.
+## `include`d AFTER `raidphase.nim` (it gates every actuation on `rpDeployed`),
+## after `debugui.nim` (it borrows `gDuGameWorld` rather than adding a second
+## world-acquisition path) and after `inspect.nim` (`iUnityAlive`, `iKlassOf`).
+## Its whole body is inside ONE `aowl_p_p_seh`; `pactDrainTick` rides the
+## `TarkovApplication::Update` drain. Flag `playerActuation`, default OFF.
+##
+## THE BOT DRIVE PATH DOES NOT TRANSFER, and that is measured rather than
+## assumed: `mods/sain/client/drivecalls.nim` drives a `BotOwner` through
+## BotMover/BotSteering/ShootData field offsets the local `EFT.Player` does not
+## have. See the header of `abi/aowlspt_pact.h`.
+include "pact.nim"
+
 ## THE NATIVE-UI TOOLKIT -- `nuPanel`/`nuLabel` plus a generation-checked handle
 ## table, the layer a mod actually calls. MOVED AHEAD OF `natesp.nim`: it now
 ## also holds `nuCanvasFind`, THE HOST'S ONE CANVAS-ACQUISITION FUNCTION, and
@@ -7223,6 +7304,22 @@ include "colorwidget.nim"
 ## include boundary but NOT variables.
 include "postfxrows.nim"
 
+## THE NATIVE INVENTORY / ITEM-SPAWNER SCREEN. Defines `iuDrainTick`, called
+## from the `TarkovApplication::Update` drain, and `bindInvUi`.
+##
+## Position is load-bearing in three directions, not two:
+##   * `nuikit.nim` (6231) for `nuPanel`/`nuLabel`/`nkResolve`/`nuLive`;
+##   * `inspect.nim` (6151) for `iVisComponent`/`iChildCount`/`iChildAt`, which
+##     the donor-TMP walk uses, and `splrebrand.nim` (6173) for `splAnchor` --
+##     the DontDestroyOnLoad anchor, since SceneManager excludes that scene by
+##     design and anchoring anywhere else walks the wrong scene;
+##   * `region.nim` (6248), which is the one translation unit that already
+##     `#include`s `aowlspt_admin.h`. This screen reads that region's typed
+##     query, and everything in that header is `static`.
+## And it must come BEFORE `gIuOn` is read in the flag pass, because nimony
+## forward-resolves procs across an include boundary but NOT variables.
+include "invui.nim"
+
 ## Client-side mods' settings pages, published to the backend over the event
 ## bus so the F12 nav can list them at all. Stands on `modsettingsrender.nim`
 ## for the shared POST slot discipline (`gSbYieldUntil`) and on `gSyncMs`.
@@ -7611,6 +7708,12 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   # (both default OFF) and byte-verifies its 15 targets against the startup
   # prologue snapshot. It installs no detour and resolves no name at runtime.
   camBind()
+  # IN-RAID PLAYER ACTUATION. `pactBind` reads `playerActuation` itself (default
+  # OFF) and does nothing else here: every byte-verify and the one capture
+  # detour happen on the main-thread drain, where GameAssembly.dll is mapped by
+  # construction. Asking at DLL-attach would read "no module" and latch that as
+  # a verdict about the build, which is a fact about WHEN we asked.
+  pactBind()
   gBotDiag = readBoolKey("botDiag")
   if gBotDiag:
     info "botDiag is set: a READ-ONLY detour on EFT.GameWorld.RegisterPlayer " &
@@ -7989,6 +8092,13 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   # down, so the dependency is stated in the ledger line rather than ANDed here
   # where it would silently read false.
   gCwOn = readBoolKey("settingsColorWidget") and gNuOn
+  # The NATIVE INVENTORY SCREEN. `and gNuOn` for the identical reason: without
+  # the nu*/nuikit layer it cannot construct a single panel, so arming it would
+  # produce a page of refusals rather than a screen. It additionally needs the
+  # admin mod loaded on the SERVER side to answer anything -- that is not a
+  # host flag and cannot be ANDed here, so the screen reports it on its own
+  # note line instead of failing silently.
+  gIuOn = readBoolKey("nativeInvUi") and gNuOn
   # NOTE: `bindNativeUi` is deliberately NOT called here. It was, and the first
   # live run showed why that is wrong: this pass runs before il2cpp is attached
   # and before GameAssembly.dll is loaded, so all 25 targets refused with "no
@@ -8486,6 +8596,12 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
       # the measured mistake that moved `bindNativeUi` here in the first place.
       # It binds no detour; it rides the Update drain.
       bindColorWidget(gCwOn)
+      # The native INVENTORY SCREEN, in the same region and for the same
+      # reason: its banner names two managed targets and one field offset, and
+      # asking about any of them before GameAssembly.dll is loaded would report
+      # them as prologue rejections and blame the game build for a start-order
+      # bug. It binds no detour; it rides the Update drain.
+      bindInvUi(gIuOn)
 
       if gMi2Probe and not bindManagedInvoke(true):
         info "the managed-invoke probe did not verify " &
@@ -8506,6 +8622,13 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
       # code, so the detour installs now and simply never fires until an offline
       # raid starts and players/bots begin registering. Fail-safe if the prologue
       # does not match on this build.
+      # THE TRUE DEPLOY SIGNAL for the shared raid-phase latch. NOT flag-gated:
+      # `raidphase` is the single gate ESP and the maps HUD both read, and a
+      # flag that turned this off would silently restore the ten-second early
+      # arm the user reported three times. Read-only, fires at most once per
+      # raid, and `bindRaidStart` announces loudly if neither target verifies.
+      discard bindRaidStart(true)
+
       if gBotDiag and not bindBotDiag(true):
         info "botdiag did not arm (EFT.GameWorld.RegisterPlayer unverified on " &
              "this build, or drain disabled)"

@@ -32,6 +32,8 @@
 ## document of a dozen items.
 
 import std/strutils
+import aowlspt
+import aowlspt/server
 import loot
 import market
 import questcond
@@ -42,6 +44,7 @@ import production
 import gym
 import customise
 import tuning
+import svm
 import globalsgaps
 import itemsgaps
 import itemsadd
@@ -53,6 +56,8 @@ import insurance
 import raid
 import bots
 import orbit
+import knobs
+import botgear
 
 proc failedLines(report, label: string; into: var seq[string]) =
   ## `loot.selfCheck` and `questcond.selfCheck` report one line per check,
@@ -104,6 +109,10 @@ proc selfCheckFailures*(): seq[string] =
   # READS BACK correct -- not that the write happened, which is the check that
   # cannot fail. `spawn` proves every refusal path carries a reason.
   discard tuning.selfCheckTuning(result)
+  # `svm` proves the OTHER half of the SVM surface -- the rows that are not in
+  # globals.config. Its ledger assertion is the falsifiable one: add a key to
+  # `SvmKeys` that `applySvmSettings` does not read and this goes red naming it.
+  svm.selfCheckSvm(result)
   # `globalsgaps` proves the twelve config members REAL BSG sends and our
   # pre-1.0 database does not are actually PRESENT in the finished document --
   # a negative over the merged text, plus the two ways a merge silently lies
@@ -186,5 +195,41 @@ proc selfCheckFailures*(): seq[string] =
   # every map onto the positive half and puts a whole map's anchors in one
   # quadrant -- a bug that produces a plausible plan, not an error.
   discard orbit.selfCheckOrbit(result)
+  # THE DEAD-CONTROL GATE. Arm the read ledger, run one real generation pass of
+  # each generator, and ask which declared key the generator never consulted.
+  #
+  # This is the falsifiable NEGATIVE for the settings surface, and the input
+  # that makes it fail is concrete: declare a row on the Loot or Bots page,
+  # forget to read it in `lootConfig`/`botGearConfig`, and this names it. That
+  # is the exact defect `mods/debug` shipped for weeks and `mods/maps` still
+  # carries in its dead `markers` key.
+  #
+  # Three outcomes. Only FAIL is appended, because only FAIL is a defect in
+  # this code: INCONCLUSIVE means the pass did not record, which is worth
+  # printing but is not grounds to refuse the load.
+  ledgerBegin()
+  discard loot.lootConfig()
+  var botLedgerScratch: seq[string] = @[]
+  discard bots.selfCheckBots(botLedgerScratch)
+  var declared = loot.declaredLootKeys()
+  let botKeys = botgear.declaredBotKeys()
+  for k in botKeys:
+    var seen = false
+    for d in declared:
+      if d == k:
+        seen = true
+    if not seen:
+      declared.add k
+  let verdict = ledgerLine(declared)
+  ledgerStop()
+  info "settings ledger: " & verdict
+  # INCONCLUSIVE is appended as well as FAIL, and that is deliberate. An empty
+  # ledger is indistinguishable from a pass that never ran, so treating it as
+  # "fine" would make this a check that cannot fail -- the exact shape CLAUDE.md
+  # 9b names. Passing therefore means one specific thing: a generation pass ran
+  # AND consulted every declared key.
+  if not verdict.startsWith("LEDGER PASS"):
+    result.add "knobs: " & verdict
+
   failedLines(loot.selfCheck(), "loot", result)
   failedLines(questcond.selfCheck(), "questcond", result)

@@ -9,21 +9,34 @@
 # screen the game scene root still exists, the borrowed GameWorld cache still
 # answers non-null, and the map kept drawing over the results screen.
 #
-# WHAT IS AND IS NOT PROVEN HERE. The signal one would WANT is
-# `EFT.AbstractGame.<Status>k__BackingField` (+0x38, enum EFT.GameStatus:
-# Stopped=0 Running=1 Runned=2 Starting=3 Started=4 Stopping=5 SoftStopping=6 --
-# decoded offline with `tools/fldoff.py enum EFT.GameStatus`). It is NOT read
+# THE TEN-SECOND ERROR (this is the third user report, and the reason for S6).
+# The five signals below are ALL satisfied at the END OF SCENE LOAD -- the world
+# is built, the local player is spawned into the alive list, a camera exists --
+# which is roughly TEN SECONDS before the player actually deploys. The latch
+# mechanics were right and the diag verdict said PASS, because it only asserted
+# that the arm was WELL-FORMED (armed on a positive observation), never that it
+# was TIMELY. That is the check-that-cannot-fail shape of CLAUDE.md 9b. So S6
+# below is the true deploy signal, and `rpDelta` measures and PRINTS the gap
+# between the proxy becoming ready and the true signal firing, every raid, with
+# a verdict that CAN say FAIL.
+#
+# WHAT IS AND IS NOT PROVEN HERE. `EFT.AbstractGame.<Status>k__BackingField` is
+# at +0x38 -- and that is proven from COMPILED CODE, not metadata alone: both
+# accessors are one instruction and they agree (`get_Status` @0x8AD140 is
+# `8B 41 38 C3`, `set_Status` @0x7C9AD0 is `89 51 38 C3`). It is still NOT read
 # here, and deliberately so: an exhaustive offline scan of every field of every
 # one of the 31282 types found exactly TWO non-compiler-generated fields typed
 # `AbstractGame` (`EFT.NonWavesSpawnScenario._game`,
 # `<LateFixedUpdateWorker>d__5.<>4__this`), and neither is reachable from any
-# object this host holds. The instance otherwise lives in
+# object this host holds; `EFT.TarkovApplication` and `EFT.Player` have no game
+# field either. The instance otherwise lives in
 # `Comfort.Common.Singleton<AbstractGame>`, an instantiated generic static whose
 # layout CLAUDE.md 5 says is not reachable offline. So there is no field path
 # from GameWorld or TarkovApplication to `Status` that could be byte-verified,
 # and inventing one would be exactly the guessed offset that reads a plausible
 # number. That leg is INCONCLUSIVE and is reported as such -- it is not silently
-# approximated.
+# approximated. Both accessor RVAs are additionally SHARED (60 and 35 owners --
+# identical one-instruction bodies get folded), so neither may be detoured.
 #
 # WHAT IS PROVEN, and is what this module gates on:
 #   S1  the borrowed GameWorld cache is non-null and readable
@@ -45,6 +58,31 @@
 #       loading screen, so this single readable signal closes BOTH ends that
 #       GameWorld-existence gets wrong. It is the discriminator this module
 #       could not derive offline and did not invent.
+#   S6  THE TRUE DEPLOY SIGNAL. `EFT.GameWorld::OnGameStarted` @0x2508000
+#       (UNIQUE) is the moment the raid actually starts, and its first two
+#       instructions are the proof of what it does: load
+#       `GameWorld.AfterGameStarted` (+0x130, an Action) and invoke it. It
+#       cannot itself be detoured -- a relative branch sits at prologue offset
+#       10 and the engine needs 14 relocatable bytes (see abi/aowlspt_raidstart.h
+#       for the disassembly and abi/aowlspt_detour.h for why the 5-byte island
+#       form does not exist). So the host rides the delegate instead: every
+#       subscriber to that Action runs INSIDE OnGameStarted, i.e. at exactly the
+#       same instant. Two UNIQUE, cleanly-relocatable subscribers are bound and
+#       either firing sets S6:
+#         Audio.SpatialSystem.SpatialAudioSystem::AfterGameStarted @0x2194770
+#         EFT.ExfiltrationTimerSoundPlayer::AfterGameStarted       @0xA4CAF0
+#       (`EFT.RaidTimerAnnouncementController::AfterGameStarted` @0xA43BC0 was
+#       REJECTED: SHARED, 2 owners.) Both are bound because a body EXISTING is
+#       not a body SUBSCRIBED, and that cannot be established offline.
+#
+# WHAT S6 CANNOT ESTABLISH OFFLINE, stated plainly: that either subscriber is
+# actually attached to the delegate in an offline raid. If NEITHER fires, the
+# latch does not arm, the overlays stay dark, and `rpDelta` reports
+# INCONCLUSIVE with the reason. It does NOT quietly fall back to the early
+# proxies -- that is the bug. The single exception is a target that failed to
+# BIND (a prologue mismatch on a different build), which is a structural,
+# observable condition: then the module says so loudly and reverts to the
+# five-signal arm, because a build we cannot hook must not lose the feature.
 #
 # WHY A LATCH AND NOT A PER-FRAME AND. Fact #235: `GameWorld.MainPlayer`
 # (+0x230) reads NULL on roughly three of every four frames DURING a live raid.
@@ -106,7 +144,52 @@ var gRpClearedBy = ""      ## which END signal cleared the latch, verbatim
 var gRpCam: Il2CppPtr = nil
 var gRpCamAt = 0'i64
 
+# ---- S6, the true deploy signal, and the timeliness measurement -------------
+## Set by `rpStartFired`, the read-only detour on an `AfterGameStarted`
+## subscriber. Cleared on every CLEAR edge so the next raid measures afresh.
+var gRpTrueStart = false
+var gRpTrueAtMs = 0'u64        ## cNowMs() when S6 fired
+var gRpTrueBy = ""             ## which subscriber fired, verbatim
+## cNowMs() at the FIRST tick on which the five proxy signals all held for this
+## raid. This is when the OLD code would have armed -- so `gRpTrueAtMs` minus
+## this is exactly the error the user has been seeing.
+var gRpProxyAtMs = 0'u64
+var gRpProxyReady = false
+## One-shot per raid: the delta line is emitted from `rpDrainTick`, OUTSIDE the
+## SEH-guarded body, so no string building happens inside the guard.
+var gRpDeltaPending = false
+var gRpInconclusivePending = false
+var gRpLastDelta = ""          ## the last verdict line, verbatim, for rpSignals
+
+## How far apart the proxy and the true signal may be before the proxy is
+## declared EARLY. The reported error is ~10s; 2s is generous and still catches
+## it. A FAIL here is not a crash -- it is the latch telling you the proxy is
+## still being trusted for something it cannot answer.
+const RpDeltaOkMs = 2000'u64
+
 proc rpDisabled*(): bool = gRpFaults >= RpMaxFaults
+
+proc rpStartBound*(): bool =
+  ## True when at least one `AfterGameStarted` subscriber detour is installed.
+  ## When FALSE the module has no true signal available on this build and falls
+  ## back to the five-signal arm -- loudly, in `bindRaidStart`.
+  gRpStartSlotA >= 0 or gRpStartSlotB >= 0
+
+proc rpStartFired*(regs: Il2CppPtr; which: int32) =
+  ## Fired from the read-only detours on the `AfterGameStarted` subscribers, on
+  ## the Unity main thread, INSIDE `EFT.GameWorld::OnGameStarted`. It reads no
+  ## register and touches NO game memory -- one bool, one timestamp, one string
+  ## constant -- so it opens no SEH guard of its own and cannot fault into the
+  ## game. `regs` is accepted only to match the dispatch signature.
+  discard regs
+  if gRpTrueStart: return
+  gRpTrueStart = true
+  gRpTrueAtMs = cNowMs()
+  gRpTrueBy = (if which == 0'i32:
+                 "SpatialAudioSystem::AfterGameStarted"
+               else:
+                 "ExfiltrationTimerSoundPlayer::AfterGameStarted")
+  gRpDeltaPending = true
 
 proc rpMemberOfAlive(gw, you: Il2CppPtr; n: var int): bool =
   ## Capped membership test over GameWorld.AllAlivePlayersList (+0x1C8). Pure
@@ -172,23 +255,49 @@ proc rpTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_rp_tick_body", cdecl.}
   # A positive end-of-raid observation always beats a positive deploy one. On
   # the results screen the GameWorld cache is still non-null and S2/S3 can
   # still read true; that is the exact case that kept the map drawing.
+  var cleared = false
   if gRpS4 == 1'i32:
     gRpLatched = false
+    cleared = true
     gRpClearedBy = "S4 SessionEndUIScene is listed by SceneManager"
   elif not gRpS1:
     gRpLatched = false
+    cleared = true
     gRpClearedBy = "S1 the GameWorld cache is gone"
   elif not gRpS5:
     gRpLatched = false
+    cleared = true
     gRpClearedBy = "S5 Camera.main is null"
 
+  if cleared:
+    # A raid that reached the proxy-ready state but never saw S6 is the case the
+    # delta line MUST report, and it can only be reported here -- at the end,
+    # once we know it never came. INCONCLUSIVE, never PASS.
+    if gRpProxyReady and not gRpTrueStart and rpStartBound():
+      gRpInconclusivePending = true
+    gRpTrueStart = false
+    gRpTrueAtMs = 0'u64
+    gRpTrueBy = ""
+    gRpProxyReady = false
+    gRpProxyAtMs = 0'u64
+
   # ---- the ARM edge ------------------------------------------------------
-  elif gRpS2 and gRpS3:
-    if not gRpLatched:
-      gRpArmedAt = gRpTicks
-      gRpClearedBy = ""
-    gRpLatched = true
-    gRpEverDeployed = true
+  else:
+    # The five readable signals. This is the OLD arm condition and is now only
+    # a PRECONDITION plus the zero point of the timeliness measurement.
+    let proxy = gRpS2 and gRpS3
+    if proxy and not gRpProxyReady:
+      gRpProxyReady = true
+      gRpProxyAtMs = cNowMs()
+    # S6 is what actually arms. `rpStartBound()` false means this build could
+    # not be hooked at all, and losing the feature entirely is worse than the
+    # early arm -- so on that build, and only there, the proxy arms alone.
+    if proxy and (gRpTrueStart or not rpStartBound()):
+      if not gRpLatched:
+        gRpArmedAt = gRpTicks
+        gRpClearedBy = ""
+      gRpLatched = true
+      gRpEverDeployed = true
 
   # ---- the reported phase ------------------------------------------------
   if gRpLatched:
@@ -207,10 +316,61 @@ proc rpTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_rp_tick_body", cdecl.}
     gRpPhase = RpPhaseUnknown
   cast[Il2CppPtr](1)
 
+proc rpEmitDelta() =
+  ## THE FALSIFIABLE NEGATIVE. Prints, once per raid, the interval between the
+  ## proxy signals becoming ready (where the latch USED to arm) and the true
+  ## deploy signal firing. A ten-second early arm shows up here as a ten-second
+  ## delta and a FAIL -- which the previous "armed on a positive observation"
+  ## verdict structurally could not say, because it asserted the shape of our own
+  ## write rather than a property of the finished state.
+  ##
+  ## Called from `rpDrainTick`, OUTSIDE the guarded body, so the string building
+  ## never happens inside `aowl_p_p_seh`.
+  if gRpDeltaPending:
+    gRpDeltaPending = false
+    if gRpProxyAtMs == 0'u64:
+      gRpLastDelta = "raidphase DELTA: true deploy signal fired at t=" &
+        $gRpTrueAtMs & "ms via " & gRpTrueBy & ", but the five proxy signals " &
+        "were NOT yet ready -- delta unmeasurable this raid. INCONCLUSIVE."
+    elif gRpTrueAtMs >= gRpProxyAtMs:
+      let d = gRpTrueAtMs - gRpProxyAtMs
+      gRpLastDelta = "raidphase DELTA: proxy-ready t=" & $gRpProxyAtMs &
+        "ms, true deploy t=" & $gRpTrueAtMs & "ms via " & gRpTrueBy &
+        ", delta=+" & $d & "ms -- " &
+        (if d <= RpDeltaOkMs:
+           "PASS (the five readable signals were TIMELY within " &
+             $RpDeltaOkMs & "ms)"
+         else:
+           "FAIL: the five readable signals were ready " & $d & "ms BEFORE " &
+             "the raid actually started. That is exactly the window in which " &
+             "ESP and the map used to draw over the loading screen. The latch " &
+             "held them dark; do NOT re-gate any consumer on the proxies.")
+    else:
+      let d = gRpProxyAtMs - gRpTrueAtMs
+      gRpLastDelta = "raidphase DELTA: true deploy t=" & $gRpTrueAtMs &
+        "ms via " & gRpTrueBy & " PRECEDED proxy-ready t=" & $gRpProxyAtMs &
+        "ms by " & $d & "ms -- PASS (the latch arms on the later of the two, " &
+        "so the overlays still wait for a live MainPlayer)."
+    okLog gRpLastDelta
+  if gRpInconclusivePending:
+    gRpInconclusivePending = false
+    gRpLastDelta = "raidphase DELTA: the raid ENDED and the true deploy signal " &
+      "NEVER fired, although the five proxy signals were ready at t=" &
+      $gRpProxyAtMs & "ms -- INCONCLUSIVE, not a pass. Neither " &
+      "SpatialAudioSystem::AfterGameStarted nor " &
+      "ExfiltrationTimerSoundPlayer::AfterGameStarted was invoked, so either " &
+      "neither subscribes to GameWorld.AfterGameStarted in this game mode or " &
+      "the raid never truly started. ESP and the map stayed DARK for the whole " &
+      "raid; that is the deliberate choice (a dark overlay is recoverable, an " &
+      "overlay on the loading screen is the reported bug), but this line is the " &
+      "one to act on."
+    warn gRpLastDelta
+
 proc rpDrainTick*() =
   ## Rides the existing Update drain. No detour of its own.
   if rpDisabled(): return
   gRpTicks = gRpTicks + 1
+  rpEmitDelta()
   if cRpTickGuarded(nil) == nil:
     gRpFaults = gRpFaults + 1
     gRpPhase = RpPhaseUnknown
@@ -245,6 +405,13 @@ proc rpWhy*(): string =
       "here (measured live on the results screen with the map still drawing), " &
       "which is exactly why world-existence must not decide this case."
   of RpPhaseDeployed:
+    (if gRpTrueStart:
+       "LATCHED on the TRUE deploy signal (" & gRpTrueBy & ", invoked from " &
+       "inside EFT.GameWorld::OnGameStarted) at t=" & $gRpTrueAtMs & "ms. "
+     else:
+       "LATCHED on the five readable signals ALONE, because no AfterGameStarted " &
+       "subscriber could be hooked on this build -- this is the pre-fix " &
+       "behaviour and arms about ten seconds early. ") &
     "LATCHED at tick " & $gRpArmedAt & " on a positive deploy observation " &
       "(GameWorld cached, MainPlayer Unity-ALIVE, MainPlayer in " &
       "AllAlivePlayersList with " & $gRpAliveN & " entries, Camera.main " &
@@ -262,6 +429,13 @@ proc rpWhy*(): string =
     elif not gRpS2:
       "NOT DEPLOYED -- S2: GameWorld is cached and Camera.main is live, but " &
         "MainPlayer is null, unreadable or Unity-fake-null (m_CachedPtr == 0)."
+    elif gRpProxyReady and not gRpTrueStart:
+      "NOT DEPLOYED -- S6: all five readable signals hold (they have since t=" &
+        $gRpProxyAtMs & "ms) but the TRUE deploy signal has not fired. This is " &
+        "the ~10-second window the user reported three times: the scene has " &
+        "finished loading and you are in the alive list, but the raid has not " &
+        "started. ESP and the map stay dark until an AfterGameStarted " &
+        "subscriber runs inside EFT.GameWorld::OnGameStarted."
     else:
       "NOT DEPLOYED -- S3: MainPlayer is alive but NOT in " &
         "GameWorld.AllAlivePlayersList (" & $gRpAliveN & " entries) -- created " &
@@ -285,10 +459,72 @@ proc rpSignals*(): string =
   " S4 sessionend-scene=" &
     (if gRpS4 == 1'i32: "PRESENT" elif gRpS4 == 0'i32: "absent" else: "UNKNOWN") &
   " S5 camera-main=" & (if gRpS5: "live" else: "NULL") &
+  " S6 true-deploy=" &
+    (if gRpTrueStart: "FIRED(" & gRpTrueBy & ")"
+     elif rpStartBound(): "not-yet"
+     else: "UNHOOKABLE-ON-THIS-BUILD") &
+  " proxy-ready=" & (if gRpProxyReady: $gRpProxyAtMs & "ms" else: "no") &
   " latch=" & (if gRpLatched: "ARMED@" & $gRpArmedAt else: "clear") &
   (if not gRpLatched and gRpClearedBy.len > 0: "(" & gRpClearedBy & ")" else: "") &
   " everDeployed=" & (if gRpEverDeployed: "yes" else: "no") &
-  " ticks=" & $gRpTicks & " faults=" & $gRpFaults
+  " ticks=" & $gRpTicks & " faults=" & $gRpFaults &
+  (if gRpLastDelta.len > 0: " | " & gRpLastDelta else:
+     " | delta: no raid measured yet -- INCONCLUSIVE")
+
+proc cRsTargetAt(i: int32): Il2CppPtr {.importc: "aowl_rs_target_at", nodecl.}
+proc cRsTargetName(i: int32): Il2CppPtr {.importc: "aowl_rs_target_name", nodecl.}
+proc cRsTargetCount(): int32 {.importc: "aowl_rs_target_count", nodecl.}
+
+proc bindRaidStart*(verbose: bool): bool =
+  ## Installs the read-only kind=20/21 detours on the two UNIQUE
+  ## `AfterGameStarted` subscribers verified in `abi/aowlspt_raidstart.h`. Both
+  ## are attempted; either one binding is enough for S6 to be available, and
+  ## both binding is the intent, because neither subscription can be proven
+  ## offline. Nothing is written to the game and no argument is read.
+  ##
+  ## NOT flag-gated. `raidphase` is the shared deploy gate for ESP and the maps
+  ## HUD and runs unconditionally; a flag that turned S6 off would silently
+  ## restore the ten-second early arm, which is the bug. The detours are
+  ## read-only, fire at most once per raid, and are inert until a raid starts.
+  if rpStartBound(): return true
+  if not gReady or gDisableDrain: return false
+  var bound = 0
+  for i in 0 ..< int(cRsTargetCount()):
+    let fn = cRsTargetAt(int32(i))
+    let spec = readCString(cRsTargetName(int32(i)))
+    # There are exactly two detour slots (kinds 20 and 21) for this table. A
+    # third row added to `aowl_rs_targets` would otherwise be swept up and bound
+    # to no slot, so it would fire into nothing -- silently. Refuse it aloud
+    # instead (fact #187: an inserted row shifts every index below it).
+    if i >= 2:
+      warn "raidphase: aowl_rs_targets row " & $i & " (" & spec & ") has NO " &
+           "detour slot -- only kinds 20/21 exist. It is NOT bound. Add a slot " &
+           "and a dispatch arm in aowlhost.nim before adding a row."
+      break
+    if fn == nil:
+      if verbose:
+        info "raidphase: true-deploy target " & spec & " did NOT byte-verify " &
+             "against its recorded prologue on this build -- not bound"
+      continue
+    if attachDrain(spec, fn, cast[Il2CppMethod](0), false, verbose,
+                   int32(20 + i)):
+      inc bound
+      okLog "raidphase: TRUE deploy signal armed on " & spec &
+            " (read-only; it runs inside EFT.GameWorld::OnGameStarted, which " &
+            "cannot be hooked directly -- a relative branch sits at prologue " &
+            "offset 10)"
+  if bound == 0:
+    warn "raidphase: NEITHER AfterGameStarted subscriber could be hooked on " &
+         "this build, so there is no true deploy signal. The latch FALLS BACK " &
+         "to the five readable signals, which are satisfied at the end of scene " &
+         "load and therefore arm ESP and the map about TEN SECONDS EARLY. This " &
+         "is the reported bug, announced rather than hidden."
+    return false
+  if bound == 1:
+    info "raidphase: only one of the two AfterGameStarted subscribers bound. " &
+         "That is sufficient -- but if the delta line reports INCONCLUSIVE " &
+         "next raid, the unbound one is the first thing to look at."
+  true
 
 proc aowlHostRaidPhase(): int32 {.exportc: "aowl_host_raid_phase_impl", cdecl.} =
   ## READ-ONLY export of the cached phase for out-of-host consumers (mods/maps,

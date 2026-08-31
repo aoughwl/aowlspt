@@ -48,6 +48,7 @@ produce one:
 
 USAGE
 
+    python tools/markers.py --string "some literal" path\to\built.dll
     python tools/markers.py DLL "marker one" "marker two" ...
     python tools/markers.py DLL --markers-file mods/maps/markers.json
     python tools/markers.py DLL -f FILE --min-markers 21
@@ -56,6 +57,34 @@ USAGE
     python tools/markers.py --for maps --artifact <worktree>/mods/maps/bin/maps.dll
     python tools/markers.py --list-artifacts
     python tools/markers.py --selftest
+
+THE ONE-LINER: `--string LITERAL FILE`
+-------------------------------------
+This is the mode that exists so that NOBODY reaches for the PowerShell idiom
+again. It answers exactly the ad-hoc question -- "is this exact string in this
+file?" -- against an arbitrary PATH (a build in a worktree; nothing here needs
+to be a declared artifact, and nothing here deploys):
+
+    python tools/markers.py --string "settingsColorWidget" mods/uihub/bin/uihub.dll
+
+`--string` is repeatable, is ADDITIVE to any positional markers, and goes
+through the identical machinery as every other mode: multi-encoding needle
+search (never decoding the file), byte offset and matched encoding on a hit,
+fragment-coverage so a nimony `&`-split literal is INCONCLUSIVE rather than
+MISSING, and the same exit codes 0/1/3.
+
+Positive-control gating still applies, and in this mode it is AUTOMATIC: the
+PE DOS-stub string is used as a last-resort control, so a lone `--string` that
+misses can still be reported as an honest MISSING rather than "we could not
+look". Any explicit `--control`, or any other marker that matched, is
+preferred over it. The scan additionally refuses (INCONCLUSIVE) if the file's
+own PE section table says it should be longer than the bytes we read -- the
+recorded case where a freshly-built DLL came back TRUNCATED and every marker
+therefore read MISSING.
+
+Use `--string` when you have just ADDED a marker and want to assert it landed
+in the build. Do NOT add it to `tools/deploy.json` for that purpose, and above
+all never relax an existing entry there to make a check pass.
 
 MARKERS FROM deploy.json: `--for ARTIFACT`
 ------------------------------------------
@@ -155,7 +184,13 @@ def load_markers_file(path):
     silently shrank.
     """
     if not os.path.isfile(path):
-        raise UsageError("no such markers file: %s" % path)
+        hint = ""
+        if not _looks_like_path(path):
+            hint = (" -- that does not look like a path at all. `-f/"
+                    "--markers-file` takes a FILE of markers; if you meant it "
+                    "as the literal to search for, use `--string %s` instead."
+                    % _q(path))
+        raise UsageError("no such markers file: %s%s" % (path, hint))
     with open(path, "r", encoding="utf-8-sig") as f:
         raw = f.read()
     markers, absent, controls = [], [], []
@@ -303,7 +338,53 @@ def classify(blob, encs, lit, control):
     return MISSING, d
 
 
-def scan(path, markers, absent, controls, mode):
+# A string every PE on this planet carries in its DOS stub. It is a LAST-RESORT
+# positive control for `--string`, where the caller may legitimately supply a
+# single literal that is genuinely absent: without some control, that miss is
+# INCONCLUSIVE forever and the mode is useless, which is exactly what pushes
+# people back to the PowerShell one-liner.
+DOS_STUB = "This program cannot be run in DOS mode"
+
+
+def pe_short(blob):
+    """None, or WHY the PE's own headers say this buffer is TRUNCATED.
+
+    Recorded case: `[IO.File]::ReadAllBytes` on a freshly-built DLL returned
+    2,399,232 bytes of a 2,454,016-byte file, so every marker past the cut
+    read MISSING. A short read must be INCONCLUSIVE, never absence.
+    Returns None as well when the bytes are not a PE at all -- this check
+    can only ever FIRE, never bless.
+    """
+    try:
+        if len(blob) < 0x40 or blob[:2] != b"MZ":
+            return None
+        e_lfanew = int.from_bytes(blob[0x3c:0x40], "little")
+        if e_lfanew + 24 > len(blob) or blob[e_lfanew:e_lfanew + 4] != b"PE\0\0":
+            return None
+        nsec = int.from_bytes(blob[e_lfanew + 6:e_lfanew + 8], "little")
+        opt = int.from_bytes(blob[e_lfanew + 20:e_lfanew + 22], "little")
+        base = e_lfanew + 24 + opt
+        end = 0
+        for i in range(nsec):
+            s = base + 40 * i
+            if s + 40 > len(blob):
+                return ("the PE section table itself is cut off at %d byte(s)"
+                        % len(blob))
+            raw = int.from_bytes(blob[s + 20:s + 24], "little")
+            size = int.from_bytes(blob[s + 16:s + 20], "little")
+            if raw:
+                end = max(end, raw + size)
+        if end > len(blob):
+            return ("the PE section table describes %d byte(s) of file data "
+                    "but only %d were read -- a TRUNCATED buffer. Anything "
+                    "past the cut would read MISSING, so nothing here is "
+                    "evidence of absence." % (end, len(blob)))
+    except Exception:                                   # pragma: no cover
+        return None
+    return None
+
+
+def scan(path, markers, absent, controls, mode, auto_control=False):
     """Scan ONE file. Returns a result dict; never raises on content."""
     encs = litscan.encodings(mode)
     searched = "/".join(lbl for lbl, _ in encs)
@@ -321,6 +402,10 @@ def scan(path, markers, absent, controls, mode):
                        % (path, e))
         return res
     res["size"] = len(blob)
+    short = pe_short(blob)
+    if short:
+        res["note"] = ("%s: %s" % (path, short))
+        return res
     if not markers and not absent:
         res["note"] = ("no markers were supplied, so nothing was checked. An "
                        "empty marker set is INCONCLUSIVE, never a pass.")
@@ -332,6 +417,8 @@ def scan(path, markers, absent, controls, mode):
     # can honestly be called MISSING.
     pool = [("--control", c) for c in (controls or [])]
     pool += [("marker", m) for m in markers]
+    if auto_control:
+        pool.append(("auto-control (PE DOS stub)", DOS_STUB))
     control = litscan.pick_control(blob, encs, pool)
     res["control"] = list(control) if control else None
     for lit in markers:
@@ -619,6 +706,8 @@ def selftest(C):
               (green, reset))
     if not for_selftest(C):
         ok = False
+    if not string_selftest(C):
+        ok = False
     if not deploy_parity(C):
         ok = False
     print("%s%s%s" % (green if ok else red,
@@ -700,6 +789,120 @@ def for_selftest(C):
     return ok
 
 
+# ------------------------------------------------------ `--string` self-test
+#
+# `--string` is the mode that exists to replace the PowerShell idiom, so it is
+# worth nothing unless it can FAIL. These cases drive the real command line end
+# to end and assert all three exit codes occur, plus the two defects that
+# actually fooled agents: a literal containing U+2026 (which the ASCII idiom
+# can NEVER find), and a TRUNCATED buffer (which made every marker read
+# MISSING). The non-ASCII case additionally re-derives the broken idiom in
+# Python and asserts it STILL gets the wrong answer -- if that ever starts
+# working, this case is telling you the regression fixture is stale.
+ELLIPSIS_LIT = "(ents[i].id ? ' …' + ents[i].id"
+
+STRING_SELFTEST = [
+    ("--string PRESENT: a literal that IS in uihub.dll",
+     ["--string", "groupOf", ("uihub",)], 0),
+    ("--string PRESENT (REGRESSION): the U+2026 literal in maps.dll that the "
+     "PowerShell ASCII.GetString idiom reports ABSENT",
+     ["--string", ELLIPSIS_LIT, ("maps",)], 0),
+    ("--string MISSING: a literal genuinely not in uihub.dll -- trustworthy "
+     "because the automatic PE DOS-stub control matched",
+     ["--string", "zzzNotAMarkerAtAll", ("uihub",)], 1),
+    ("--string INCONCLUSIVE: a nimony `&`-SPLIT literal is not a removal",
+     ["--string", "LATE ARMS the feed in place", ("maps",)], 3),
+    ("--string INCONCLUSIVE: a file that does not exist -- nothing searched",
+     ["--string", "groupOf",
+      os.path.join(REPO, "mods", "uihub", "bin", "nope-not-built.dll")], 3),
+    ("--for usage error: a PATH given where a LOGICAL NAME belongs",
+     ["--for", ("uihub",)], 2),
+]
+
+
+def string_selftest(C):
+    red, green, yellow, dim, reset = C
+    ok = True
+    seen = set()
+    for (label, argv, want) in STRING_SELFTEST:
+        av = [(_dll(a[0]) if isinstance(a, tuple) else a) for a in argv]
+        av += ["--quiet", "--no-color"]
+        buf, keep = io.StringIO(), sys.stdout
+        sys.stdout = buf
+        try:
+            got = main(av)
+        except SystemExit as e:
+            got = e.code
+        finally:
+            sys.stdout = keep
+        seen.add(got)
+        good = (got == want)
+        if not good:
+            ok = False
+        print("%s%s%s %s" % (green if good else red,
+                             "PASS" if good else "FAIL", reset, label))
+        if not good:
+            print("    wanted exit %s, got %s  (argv: %s)" % (want, got, av))
+            for ln in buf.getvalue().splitlines():
+                print("      " + ln)
+    for code in (0, 1, 3):
+        if code not in seen:
+            ok = False
+            print("%sFAIL%s `--string` never exited %d, so that outcome is "
+                  "not demonstrated and may be unreachable."
+                  % (red, reset, code))
+    # The defect itself, reproduced: ASCII decoding with '?' for every byte
+    # >= 0x80 -- exactly what PowerShell 5.1 does -- must still LOSE the
+    # ellipsis literal that --string found above.
+    try:
+        with open(_dll("maps"), "rb") as f:
+            blob = f.read()
+    except OSError as e:
+        ok = False
+        print("%sFAIL%s could not read maps.dll for the idiom repro: %s"
+              % (red, reset, e))
+    else:
+        lossy = "".join(chr(b) if b < 0x80 else "?" for b in blob)
+        if lossy.find(ELLIPSIS_LIT) != -1:
+            ok = False
+            print("%sFAIL%s the ASCII-lossy idiom FOUND the U+2026 literal; "
+                  "this regression fixture no longer reproduces the defect."
+                  % (red, reset))
+        elif litscan.find_at(blob, litscan.encodings("any"), ELLIPSIS_LIT)[0]:
+            print("%sPASS%s regression: the ASCII-lossy idiom loses the "
+                  "U+2026 literal that --string finds at 0x%x"
+                  % (green, reset,
+                     litscan.find_at(blob, litscan.encodings("any"),
+                                     ELLIPSIS_LIT)[1]))
+        else:
+            ok = False
+            print("%sFAIL%s neither method found the U+2026 literal -- the "
+                  "fixture is stale, not a pass." % (red, reset))
+    # And a TRUNCATED read must be INCONCLUSIVE, never MISSING.
+    import tempfile
+    src = _dll("uihub")
+    with open(src, "rb") as f:
+        full = f.read()
+    cut = full[:len(full) * 3 // 4]
+    tmp = os.path.join(tempfile.gettempdir(), "markers-truncated-fixture.dll")
+    with open(tmp, "wb") as f:
+        f.write(cut)
+    r = scan(tmp, ["groupOf"], [], [], "any", auto_control=True)
+    if r["verdict"] != INCONCLUSIVE or not r.get("note"):
+        ok = False
+        print("%sFAIL%s a TRUNCATED buffer must be INCONCLUSIVE, got %s"
+              % (red, reset, r["verdict"]))
+    else:
+        print("%sPASS%s INCONCLUSIVE: a truncated %d-of-%d-byte DLL is "
+              "refused, not read as MISSING" % (green, reset, len(cut),
+                                                len(full)))
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+    return ok
+
+
 # `deploy.py check --contains` decides PRESENT/MISSING/INCONCLUSIVE by calling
 # classify() above. That delegation is the whole point -- the host-side tool
 # and the mod-side tool must not answer the same question differently -- so it
@@ -761,6 +964,11 @@ def deploy_parity(C):
     return ok
 
 
+def _looks_like_path(s):
+    return ("/" in s or "\\" in s or s.lower().endswith((".dll", ".exe"))
+            or os.path.exists(s))
+
+
 def main(argv):
     ap = argparse.ArgumentParser(
         prog="markers.py", add_help=True,
@@ -768,6 +976,14 @@ def main(argv):
                     "PRESENT / MISSING / INCONCLUSIVE. Exit 0/1/3.")
     ap.add_argument("dll", nargs="?", help="the built artifact to scan")
     ap.add_argument("markers", nargs="*", help="markers expected PRESENT")
+    ap.add_argument("-s", "--string", action="append", default=[],
+                    metavar="LITERAL", dest="strings",
+                    help="an exact literal to look for in the given FILE "
+                         "(repeatable). This is the ad-hoc 'is this string in "
+                         "this DLL' check -- use it INSTEAD of a PowerShell "
+                         "ASCII.GetString(...).Contains(...) one-liner, which "
+                         "turns every byte >= 0x80 into '?' and reports real "
+                         "markers ABSENT.")
     ap.add_argument("-f", "--markers-file", action="append", default=[],
                     help="JSON or one-per-line marker data (repeatable); "
                          "ADDITIVE to markers given on the command line")
@@ -812,6 +1028,19 @@ def main(argv):
         return 0
 
     declared_prov = None
+    if args.for_ and _looks_like_path(args.for_):
+        # Two agents hit this and could not tell WHY, because the old error
+        # echoed the path back without saying what --for actually takes.
+        print("markers.py: --for takes a LOGICAL ARTIFACT NAME declared in "
+              "%s (see --list-artifacts), not a file path. You passed %s, "
+              "which looks like a path." % (DEPLOY_JSON, args.for_))
+        print("  to scan an arbitrary FILE for literals you choose:")
+        print("      python tools/markers.py --string \"some literal\" %s"
+              % args.for_)
+        print("  to scan an arbitrary FILE against a DECLARED marker set:")
+        print("      python tools/markers.py --for <name> --artifact %s"
+              % args.for_)
+        return 2
     if args.for_:
         try:
             dll, dmarkers, _dexports, declared_prov = resolve_for(
@@ -833,16 +1062,26 @@ def main(argv):
         args.markers = list(args.markers) + dmarkers
     elif args.artifact:
         if args.dll:
-            print("markers.py: pass the file EITHER positionally OR as "
-                  "--artifact, not both.")
+            # An agent hit this having meant the positional as a MARKER. Say
+            # what both readings are instead of only rejecting one.
+            print("markers.py: two files were named -- --artifact %s and the "
+                  "positional %r -- and the positional slot is the FILE, not "
+                  "a marker." % (args.artifact, args.dll))
+            print("  if %r was meant as a literal to look for, pass it as a "
+                  "string and drop --artifact:" % args.dll)
+            print("      python tools/markers.py --string %s %s"
+                  % (_q(args.dll), args.artifact))
             return 2
         args.dll = args.artifact
     if not args.dll:
         ap.print_usage()
-        print("markers.py: a DLL is required (or --selftest)")
+        print("markers.py: a FILE to scan is required (or --selftest). For an "
+              "ad-hoc check of one literal in one binary:")
+        print("      python tools/markers.py --string \"some literal\" "
+              "path/to/built.dll")
         return 2
 
-    markers = list(args.markers)
+    markers = list(args.markers) + list(args.strings)
     absent = list(args.absent)
     controls = list(args.control)
     prov = [declared_prov] if declared_prov else []
@@ -857,7 +1096,8 @@ def main(argv):
         print("markers.py: %s" % e)
         return 2
 
-    res = scan(args.dll, markers, absent, controls, args.encoding)
+    res = scan(args.dll, markers, absent, controls, args.encoding,
+               auto_control=bool(args.strings))
     res["provenance"] = prov
     res["markerCount"] = len(markers)
     if args.min_markers and len(markers) < args.min_markers:

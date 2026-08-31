@@ -67,6 +67,7 @@
   "adsDeferToGame": true,
   "adsSettleEps": 0.05,
   "adsObserveCap": 1.5,
+  "adsMaxFights": 3,
 
   "enableFovWrite": true,
   "verifyHooksByName": false,

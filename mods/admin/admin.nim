@@ -74,6 +74,7 @@ import aowlspt/json
 import "adm" / shared
 import "adm" / data
 import "adm" / admprof
+import "adm" / invui   # the native inventory screen's backend half
 # Prototypes only -- `adm/admprof.nim` owns the state (AOWL_ADMPROF_IMPL).
 {.emit: """#include "aowlspt_admprof.h" """.}
 
@@ -776,6 +777,285 @@ proc serviceSpawn() =
          "has DISABLED itself for this session rather than refuse every tick " &
          "forever. Nothing else in this mod is affected."
 
+# ---------------------------------------------------------------------------
+# The NATIVE INVENTORY SCREEN -- the backend half
+# ---------------------------------------------------------------------------
+#
+# Three drains, all on the same tick as `serviceSpawn` above and for the same
+# reason it is here rather than in mods/tarkov: `capability.invoke` refuses on
+# `sideClient`, and the screen runs in the game process.
+#
+# WHAT MAKES THIS DIFFERENT FROM `serviceSpawn`. That one moves a SENTENCE. This
+# one moves ROWS, and for a mint it moves a MEASUREMENT: the count of the minted
+# template in the profile before the spawn and again after it. Those two numbers
+# are what `aowl_invui_mint_done` turns into PASS / FAIL / INCONCLUSIVE, and
+# nothing on this side can spell a PASS -- it can only supply the numbers.
+#
+# Every drain is bounded: one request per tick per kind, a row loop capped by
+# the region's own `AOWL_IU_MAX_ROWS`, and a self-disable after twenty
+# consecutive refusals so a provider that is not answering costs twenty calls,
+# not one per tick forever.
+
+var gIuRegion: InvUiRegion   # default-initialised, exactly as `gRegion` above:
+                             # nimony refuses an explicit `= nil` on this
+                             # pointer alias, and the zero value is the same
+                             # "not mapped yet" state every reader tests for.
+var gIuFaults = 0
+var gIuOff = false
+var gIuServed = 0
+var gIuMints = 0
+var gIuDiagTick = 0
+var gIuLastDiag = ""
+
+proc iuJsonEscape(s: string): string =
+  ## The same escaping `spawnRequestJson` does, and here for the same reason:
+  ## this mod does not import the JSON builder, and a query carrying a quote or
+  ## a backslash must not be able to change the shape of the request. Anything
+  ## outside printable ASCII is DROPPED rather than encoded -- the screen only
+  ## accepts printable ASCII, so a control byte here means the region was
+  ## written by something that is not our screen.
+  result = ""
+  for i in 0 ..< s.len:
+    let c = s[i]
+    if c == '"' or c == '\\':
+      result.add '\\'
+      result.add c
+    elif c >= ' ' and c <= '~':
+      result.add c
+
+proc iuNoteFault(what, why: string) =
+  ## One place that counts a refusal, says it, and self-disables. A refusal that
+  ## is not shown is the same as a silent no-op, so the region's note carries it
+  ## too -- the screen has a line for exactly this.
+  gIuFaults = gIuFaults + 1
+  iuNote(gIuRegion, what & " unavailable: " & why)
+  warn ModName & ": invui " & what & " refused -- " & why
+  if gIuFaults >= 20:
+    gIuOff = true
+    warn ModName & ": twenty consecutive invui refusals -- the native " &
+         "inventory screen's drain has DISABLED itself for this session " &
+         "rather than call a provider that is not answering on every tick. " &
+         "Nothing else in this mod is affected; the F6 spawner is separate."
+
+proc iuServiceStash() =
+  ## Fill the right-hand column: `aowl.items` `op:"list"`, as ROWS.
+  if gIuOff: return
+  let req = iuStashPending(gIuRegion)
+  if req == 0'i32: return
+  let query = iuQuery(gIuRegion)
+
+  iuStashBegin(gIuRegion)      # clear FIRST: a query that matches nothing must
+                               # not leave the previous query's rows on screen
+  if query.len < 3:
+    # Not a refusal -- the honest state of a query that has not been typed yet.
+    # `searchItemsCounted` visits the whole 2.7 MB locale and calls `itemExists`
+    # on every name that matches, and for a one-letter query that is most of
+    # ~40,000 entries on every keystroke. Three is where the match set stops
+    # being "nearly everything".
+    iuNote(gIuRegion, (if query.len == 0:
+                         "type part of an item name, or paste a 24-hex id"
+                       else:
+                         "keep typing -- " & $query.len &
+                         " character(s); 3 are needed before searching"))
+    iuStashDone(gIuRegion, req)
+    return
+
+  let r = invoke("aowl.items", 1,
+                 "{\"op\":\"list\",\"limit\":" & $iuMaxRows() &
+                 ",\"query\":\"" & iuJsonEscape(query) & "\"}")
+  if not r.isOk:
+    iuNoteFault("search", r.message)
+    iuStashDone(gIuRegion, req)
+    return
+  gIuFaults = 0
+
+  let matched = field(r.body, "matched").asInt(0)
+  let rows = parseArray(field(r.body, "rows"))
+  var landed = 0
+  var dropped = 0
+  var i = 0
+  while i < rows.len and i < iuMaxRows():        # capped twice, deliberately
+    let row = at(rows, i)
+    let tpl = field(row, "tpl").asText("")
+    let nm  = field(row, "name").asText("")
+    if tpl.len > 0:
+      if iuStashAdd(gIuRegion, tpl, (if nm.len > 0: nm else: tpl)):
+        landed = landed + 1
+      else:
+        dropped = dropped + 1
+    i = i + 1
+  iuStashMatched(gIuRegion, matched)
+  # The note states BOTH numbers, always. `landed` is what the screen can show;
+  # `matched` is what really exists. Reporting only the first is how "no such
+  # item" gets said about the fifty-first match.
+  iuNote(gIuRegion, (if matched == 0:
+                       "no item matches \"" & query & "\""
+                     else:
+                       $landed & " of " & $matched & " match \"" & query &
+                       "\"" & (if dropped > 0:
+                                 " (" & $dropped & " would not fit the table)"
+                               else: "")))
+  gIuServed = gIuServed + 1
+  iuStashDone(gIuRegion, req)
+
+proc iuServiceInv() =
+  ## Fill the left-hand column: what is actually in the stash, read back.
+  if gIuOff: return
+  let req = iuInvPending(gIuRegion)
+  if req == 0'i32: return
+
+  iuInvBegin(gIuRegion)
+  let r = invoke("aowl.items", 1,
+                 "{\"op\":\"inventory\",\"limit\":" & $iuMaxRows() & "}")
+  if not r.isOk:
+    iuNoteFault("inventory", r.message)
+    iuInvDone(gIuRegion, req)
+    return
+  gIuFaults = 0
+
+  let total = field(r.body, "total").asInt(0)
+  let rows = parseArray(field(r.body, "rows"))
+  var landed = 0
+  var i = 0
+  while i < rows.len and i < iuMaxRows():
+    let row = at(rows, i)
+    let tpl = field(row, "tpl").asText("")
+    let nm  = field(row, "name").asText("")
+    let qty = field(row, "count").asInt(1)
+    if tpl.len > 0:
+      if iuInvAdd(gIuRegion, tpl, (if nm.len > 0: nm else: tpl), qty):
+        landed = landed + 1
+    i = i + 1
+  iuInvTotal(gIuRegion, total)
+  gIuServed = gIuServed + 1
+  iuInvDone(gIuRegion, req)
+
+proc iuTemplateCount(tpl: string; readable: var bool): int =
+  ## `aowl.items` `op:"count"`. Reports READABILITY separately from the number,
+  ## which is the whole point: "the profile holds zero" and "I could not open
+  ## the profile" must not both come back as 0, or a before/after comparison
+  ## reads an unreadable profile as a failed spawn.
+  readable = false
+  result = 0
+  let r = invoke("aowl.items", 1,
+                 "{\"op\":\"count\",\"tpl\":\"" & iuJsonEscape(tpl) & "\"}")
+  if not r.isOk: return
+  if not field(r.body, "readable").asBool(false): return
+  readable = true
+  result = field(r.body, "count").asInt(0)
+
+proc iuServiceMint() =
+  ## Mint one template into the stash, and MEASURE whether it arrived.
+  ##
+  ## The order is: count, spawn, count. The two counts bracket the spawn, so
+  ## what is published is a property of the FINISHED PROFILE and not of the call
+  ## we made. If either count could not be taken the outcome is INCONCLUSIVE --
+  ## `iuMintDone` is given `readable = false` and the header refuses to call
+  ## that a PASS or a FAIL.
+  if gIuOff: return
+  let req = iuMintPending(gIuRegion)
+  if req == 0'i32: return
+
+  let tpl = iuMintTpl(gIuRegion)
+  if tpl.len == 0:
+    iuMintDone(gIuRegion, req, 0, 0, false,
+               "the request carried no template id")
+    return
+  let count = iuMintCount(gIuRegion)
+  let condition = iuMintCondition(gIuRegion)
+
+  var beforeOk = false
+  let before = iuTemplateCount(tpl, beforeOk)
+
+  # The spawn goes through the SAME `aowl.items` path the F6 spawner uses --
+  # `spawnInto`, by template id, which `isTemplateId` makes exact and
+  # unambiguous. There is no second minting code path in this project and this
+  # screen deliberately does not add one.
+  let r = invoke("aowl.items", 1,
+                 "{\"query\":\"" & iuJsonEscape(tpl) & "\",\"count\":" &
+                 $count & ",\"condition\":" & $condition & "}")
+
+  var afterOk = false
+  let after = iuTemplateCount(tpl, afterOk)
+  let readable = beforeOk and afterOk
+
+  var msg = ""
+  if not r.isOk:
+    gIuFaults = gIuFaults + 1
+    msg = "REFUSED: " & r.message
+    warn ModName & ": invui mint refused -- " & r.message
+    if gIuFaults >= 20:
+      gIuOff = true
+      warn ModName & ": twenty consecutive invui refusals -- the native " &
+           "inventory screen's drain has DISABLED itself for this session."
+  else:
+    gIuFaults = 0
+    gIuMints = gIuMints + 1
+    let providerSaid = field(r.body, "message").asText("")
+    # The provider's sentence is carried verbatim and then the MEASUREMENT is
+    # appended, in that order, so a provider that said "spawned 5" while the
+    # profile gained nothing is visibly contradicted on the same line rather
+    # than believed.
+    msg = (if providerSaid.len > 0: providerSaid
+           else: "the provider answered OK but described nothing")
+    if readable:
+      msg = msg & " -- profile readback: " & $before & " -> " & $after
+    else:
+      msg = msg & " -- READBACK COULD NOT BE TAKEN (the profile would not " &
+            "open), so this is INCONCLUSIVE, not a success"
+    info ModName & ": invui mint -- " & msg
+
+  iuMintDone(gIuRegion, req, before, after, readable and r.isOk, msg)
+
+proc iuDrainTick() =
+  ## All three drains, once per tick, in the order the screen needs them: a
+  ## mint first (it is what the player just clicked), then the two fills. A
+  ## mint also invalidates the left-hand column, and the screen re-asks for it
+  ## itself rather than this side pushing -- the region's request/ack pair only
+  ## has one owner per direction and inventing a second writer here would break
+  ## that.
+  ##
+  ## Idle cost: three shared-memory integer compares.
+  if gIuRegion == nil or gIuOff: return
+  iuServiceMint()
+  iuServiceStash()
+  iuServiceInv()
+  # THE VERDICT, PRINTED. Caught by marker verification: `iuDiag` had no call
+  # site at all, so the linker stripped it and the literal `invui = PASS` was
+  # MISSING from the built DLL. A three-outcome verdict that nothing ever
+  # emits is not a check -- it is a function that could say anything.
+  #
+  # Emitted only when the verdict CHANGES, so the log carries the transitions
+  # rather than the same line on every tick of an idle backend.
+  gIuDiagTick = gIuDiagTick + 1
+  if (gIuDiagTick mod 600) == 0:
+    let v = iuDiag()
+    if v != gIuLastDiag:
+      gIuLastDiag = v
+      info ModName & ": " & v
+
+proc iuDiag*(): string =
+  ## Three outcomes, never two. INCONCLUSIVE is what "the screen has never asked
+  ## for anything" reports, because a drain that was never exercised has proved
+  ## nothing about itself.
+  if gIuRegion == nil:
+    return "invui = INCONCLUSIVE -- the region could not be mapped, so the " &
+           "native inventory screen has no backend this session"
+  if not iuCompatible(gIuRegion):
+    return "invui = FAIL -- the region exists but its magic/version/row-stride " &
+           "do not match this build. Refusing to parse another build's row " &
+           "table as ours"
+  if gIuOff:
+    return "invui = FAIL -- SELF-DISABLED after " & $gIuFaults &
+           " consecutive refusals (served=" & $gIuServed & " mints=" &
+           $gIuMints & ")"
+  if gIuServed == 0 and gIuMints == 0:
+    return "invui = INCONCLUSIVE -- the region is mapped and compatible but " &
+           "the screen has not asked for anything yet, so nothing has been " &
+           "exercised. That is not a pass"
+  "invui = PASS -- " & $gIuServed & " fill request(s) and " & $gIuMints &
+  " mint(s) serviced with no outstanding refusal (faults=" & $gIuFaults & ")"
+
 proc emitProfile() =
   ## The phase decomposition and the cache's own behaviour, on the SAME timer as
   ## the diag they exist to explain. Unconditional when the flag is set: the
@@ -789,8 +1069,11 @@ proc emitProfile() =
   info ModName & ": " & rdCacheText()
 
 proc onUpdate(elapsedMs: int64): Status =
-  if gRegion == nil:
-    return Ok
+  # THE SIDE CHECK COMES FIRST, ahead of the HUD region's null check. It used to
+  # come second, which coupled two unrelated regions: if `aowl_admin_map`
+  # failed, the SERVER side returned before servicing anything -- including the
+  # native inventory screen, whose region is a different mapping that had
+  # nothing to do with the failure. The server half has no HUD to be missing.
   if side() != sideClient:
     # The server-side copy of this mod exists for ONE reason: to service the
     # F6 spawner, which needs `invoke` and therefore needs a side that has a
@@ -800,6 +1083,15 @@ proc onUpdate(elapsedMs: int64): Status =
     # The typeahead runs AFTER the spawn drain, so a submit made on this tick
     # is serviced before any search can occupy the one result line they share.
     serviceSearch()
+    # The NATIVE inventory screen's three drains. A separate region, a separate
+    # self-disable counter and a separate provider call, so neither surface can
+    # turn the other off: the F6 spawner refusing does not stop the native
+    # screen and vice versa.
+    iuDrainTick()
+    return Ok
+  if gRegion == nil:
+    # Client side with no HUD region: no ESP, no cheats, no menu. Announced at
+    # load; nothing further to do per tick.
     return Ok
   gTick = gTick + 1
   discard dataOpen()
@@ -904,6 +1196,33 @@ proc onUpdate(elapsedMs: int64): Status =
 # ---------------------------------------------------------------------------
 
 proc onLoad(): Status =
+  # THE NATIVE INVENTORY SCREEN'S REGION, mapped on the SERVER side only. The
+  # client side of this mod has no use for it: the screen itself lives in the
+  # host DLL (it is Unity UI, on the Unity thread) and the host maps the region
+  # directly. Mapping it here as well would create the section from the wrong
+  # process on a cold start and prove nothing.
+  #
+  # Mapped BEFORE the HUD region and reported separately, because a failure of
+  # one says nothing about the other -- they are two different names.
+  if side() != sideClient:
+    gIuRegion = iuMap()
+    if gIuRegion == nil:
+      warn ModName & ": could not map the native inventory screen's region " &
+           "(" & "Local\\aowlspt_invui_v1" & "); that screen will report " &
+           "nothing is answering. The F6 spawner is unaffected."
+    elif not iuCompatible(gIuRegion):
+      warn ModName & ": the native inventory region exists but its magic, " &
+           "version or row stride disagrees with this build. REFUSING to " &
+           "service it rather than parse another build's row table as ours."
+      gIuOff = true
+    else:
+      info ModName & ": native inventory screen backend armed -- three " &
+           "drains (stash fill, inventory fill, mint) over " &
+           "Local\\aowlspt_invui_v1, all answered by aowl.items. A mint is " &
+           "bracketed by a profile READBACK of the minted template, and the " &
+           "PASS/FAIL/INCONCLUSIVE verdict is derived from those two counts, " &
+           "not from the call returning OK."
+
   gRegion = adminMap()
   if gRegion == nil:
     warn ModName & ": could not map the shared HUD region; the menu and ESP " &

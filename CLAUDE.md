@@ -226,13 +226,30 @@ line. Marker list is data in `tools/deploy.json`; **never edit it to make a chec
 <marker>...`, which shares `tools/litscan.py` with it and reports three outcomes
 (PRESENT / MISSING / **INCONCLUSIVE**, exits 0 / 1 / 3).
 
-**NEVER marker-check a binary with PowerShell.** `[Text.Encoding]::ASCII.GetString()`
-maps every byte >= 0x80 to `?`, so any marker containing a non-ASCII character reads as
-ABSENT — a confidently wrong answer. THREE separate agents hit this in one session; one
-lost ten minutes to 14 false MISSINGs, one nearly concluded its build had not picked up
-its own edits. `[Text.Encoding]::Latin1` is **`$null`** on PS 5.1, and PowerShell returns
-`$null` for a missing static property instead of throwing — so a `try/catch` probe reports
-"Latin1 exists", wrongly. Use `markers.py`, or `grep -a`.
+**"Is this exact string in this DLL?" — DO THIS:**
+
+```powershell
+python tools\markers.py --string "settingsColorWidget" <path-to-any-binary>
+```
+
+Repeatable (`--string A --string B`), takes an arbitrary PATH (a build in a worktree —
+nothing needs to be a declared artifact, and it never deploys), prints the byte offset and
+WHICH encoding matched, and exits 0 PRESENT / 1 MISSING / 3 INCONCLUSIVE. It is also the
+right way to assert a marker you **just added** landed in the build — do **not** add it to
+`tools/deploy.json` for that, and never relax an entry there to make a check pass.
+
+**NEVER marker-check a binary with PowerShell** —
+`[Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($p)).Contains($s)`.
+`ASCII.GetString` maps every byte >= 0x80 to `?`, so any marker containing a non-ASCII
+character reads as ABSENT — a confidently wrong answer. **FIVE separate agents** have hit
+this: one lost ten minutes to 14 false MISSINGs (including a literal that predated its own
+change), one nearly concluded its build had not picked up its own edits, one reported six
+literals absent that `markers.py` finds immediately. `[Text.Encoding]::Latin1` is **`$null`**
+on PS 5.1, and PowerShell returns `$null` for a missing static property instead of throwing
+— so a `try/catch` probe reports "Latin1 exists", wrongly. And `ReadAllBytes` has returned a
+**truncated** buffer on a freshly-built DLL (2,399,232 of 2,454,016 bytes), making every
+marker past the cut read MISSING; `markers.py` checks the PE section table for exactly that
+and answers INCONCLUSIVE. `grep -a` is acceptable; the one-liner is not.
 
 And remember Nimony stores each `&`-concatenated fragment as a **separate rodata entry**,
 so a long literal legitimately may not appear contiguously: that is INCONCLUSIVE, not

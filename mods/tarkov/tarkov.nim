@@ -83,6 +83,7 @@ import emu/globalsgaps # the config members REAL BSG sends and db.json lacks
 import emu/itemsgaps # the `_props` members REAL BSG sends and db.json lacks
 import emu/itemsadd  # the WHOLE item templates BSG serves and db.json lacks
 import emu/tuning   # the globals overrides -- the settings that reach the CLIENT
+import emu/svm      # the SVM rows that are NOT globals.config, + the read ledger
 import emu/spawn    # spawning items into a stash from the settings page
 
 const
@@ -3487,6 +3488,265 @@ proc tarkovSchema(): seq[Setting] =
     stringSetting("lootCategoryWeights", "Advanced: extra id=multiplier pairs", "",
                   category = "Loot/Item mix/Category weights",
       description = "aowlspt original (server emulator); acts on the SPT-derived database. APPLIED ON TOP OF THE FIVE SLIDERS ABOVE, and it wins where they overlap. `id=multiplier` pairs, comma separated, where `id` is any item template id OR any BASE CLASS id on its `_parent` chain -- so one entry covers a whole family. The chain is walked up to 12 hops and refuses to revisit a template. The community's usual base classes: money 543be5dd4bdc2deb348b4569, ammo 5485a8684bdc2da71d8b4567, meds 543be5664bdc2dd4348b4569, keys 543be5e94bdc2df1348b4568, barter 5448eb774bdc2d0a728b4567. Those five ids are SPT-community-known and were NOT verified against this install's database by the change that added this row -- check the log line the server prints, which reports how many pool entries the weights actually touched."),
+    # ---- Loot > Item mix > Category weights, the other seventeen ------
+    #
+    # Five families were named sliders; the other seventeen were reachable only
+    # by pasting a 24-character base-class id into the free-text row, which is
+    # not a control surface, it is a documentation lookup. Each id below was
+    # READ OUT OF THIS INSTALL'S OWN db.json on 2026-08-31 -- `bigjson.py get
+    # --path templates.items.<id>._name` returned the name in the description
+    # -- so none of them is community lore. One candidate that did NOT resolve
+    # against this database was dropped rather than shipped as a slider that
+    # reweights nothing.
+    #
+    # Every one is 1.0 by default and a slider at 1.0 emits NO pool entry, so
+    # the shaping pass is still skipped entirely and the RNG stream is
+    # unchanged for anyone who never opens the page.
+    floatSetting("lootWeightAmmoBoxes", "Ammo boxes", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Loot/Item mix/Category weights",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies the pool weight of every item whose `_parent` chain reaches base class 543be5cb4bdc2deb348b4568, which this install's db.json names `AmmoBox` (measured 2026-08-31). 1.0 emits no entry at all; 0 removes the family from every pool. The summary line reports how many pool entries the weights actually touched -- if it says none, no item in the pool descends from this class."),
+    floatSetting("lootWeightFood", "Food and drink", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Loot/Item mix/Category weights",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies the pool weight of every item whose `_parent` chain reaches base class 543be6674bdc2df1348b4569, which this install's db.json names `FoodDrink` (measured 2026-08-31). 1.0 emits no entry at all; 0 removes the family from every pool. The summary line reports how many pool entries the weights actually touched -- if it says none, no item in the pool descends from this class."),
+    floatSetting("lootWeightElectronics", "Electronics", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Loot/Item mix/Category weights",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies the pool weight of every item whose `_parent` chain reaches base class 57864a66245977548f04a81f, which this install's db.json names `Electronics` (measured 2026-08-31). 1.0 emits no entry at all; 0 removes the family from every pool. The summary line reports how many pool entries the weights actually touched -- if it says none, no item in the pool descends from this class."),
+    floatSetting("lootWeightValuables", "Valuables (jewellery)", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Loot/Item mix/Category weights",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies the pool weight of every item whose `_parent` chain reaches base class 57864a3d24597754843f8721, which this install's db.json names `Jewelry` (measured 2026-08-31). 1.0 emits no entry at all; 0 removes the family from every pool. The summary line reports how many pool entries the weights actually touched -- if it says none, no item in the pool descends from this class."),
+    floatSetting("lootWeightWeapons", "Weapons", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Loot/Item mix/Category weights",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies the pool weight of every item whose `_parent` chain reaches base class 5422acb9af1c889c16000029, which this install's db.json names `Weapon` (measured 2026-08-31). 1.0 emits no entry at all; 0 removes the family from every pool. The summary line reports how many pool entries the weights actually touched -- if it says none, no item in the pool descends from this class."),
+    floatSetting("lootWeightKnives", "Knives", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Loot/Item mix/Category weights",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies the pool weight of every item whose `_parent` chain reaches base class 5447e1d04bdc2dff2f8b4567, which this install's db.json names `Knife` (measured 2026-08-31). 1.0 emits no entry at all; 0 removes the family from every pool. The summary line reports how many pool entries the weights actually touched -- if it says none, no item in the pool descends from this class."),
+    floatSetting("lootWeightMods", "Weapon attachments", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Loot/Item mix/Category weights",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies the pool weight of every item whose `_parent` chain reaches base class 5448fe124bdc2da5018b4567, which this install's db.json names `Mod` (measured 2026-08-31). 1.0 emits no entry at all; 0 removes the family from every pool. The summary line reports how many pool entries the weights actually touched -- if it says none, no item in the pool descends from this class."),
+    floatSetting("lootWeightMagazines", "Magazines", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Loot/Item mix/Category weights",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies the pool weight of every item whose `_parent` chain reaches base class 5448bc234bdc2d3c308b4569, which this install's db.json names `Magazine` (measured 2026-08-31). 1.0 emits no entry at all; 0 removes the family from every pool. The summary line reports how many pool entries the weights actually touched -- if it says none, no item in the pool descends from this class."),
+    floatSetting("lootWeightArmor", "Body armour", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Loot/Item mix/Category weights",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies the pool weight of every item whose `_parent` chain reaches base class 5448e54d4bdc2dcc718b4568, which this install's db.json names `Armor` (measured 2026-08-31). 1.0 emits no entry at all; 0 removes the family from every pool. The summary line reports how many pool entries the weights actually touched -- if it says none, no item in the pool descends from this class."),
+    floatSetting("lootWeightHelmets", "Helmets", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Loot/Item mix/Category weights",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies the pool weight of every item whose `_parent` chain reaches base class 5a341c4086f77401f2541505, which this install's db.json names `Headwear` (measured 2026-08-31). 1.0 emits no entry at all; 0 removes the family from every pool. The summary line reports how many pool entries the weights actually touched -- if it says none, no item in the pool descends from this class."),
+    floatSetting("lootWeightRigs", "Chest rigs", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Loot/Item mix/Category weights",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies the pool weight of every item whose `_parent` chain reaches base class 5448e5284bdc2dcb718b4567, which this install's db.json names `Vest` (measured 2026-08-31). 1.0 emits no entry at all; 0 removes the family from every pool. The summary line reports how many pool entries the weights actually touched -- if it says none, no item in the pool descends from this class."),
+    floatSetting("lootWeightBackpacks", "Backpacks", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Loot/Item mix/Category weights",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies the pool weight of every item whose `_parent` chain reaches base class 5448e53e4bdc2d60728b4567, which this install's db.json names `Backpack` (measured 2026-08-31). 1.0 emits no entry at all; 0 removes the family from every pool. The summary line reports how many pool entries the weights actually touched -- if it says none, no item in the pool descends from this class."),
+    floatSetting("lootWeightGrenades", "Grenades", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Loot/Item mix/Category weights",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies the pool weight of every item whose `_parent` chain reaches base class 543be6564bdc2df4348b4568, which this install's db.json names `ThrowWeap` (measured 2026-08-31). 1.0 emits no entry at all; 0 removes the family from every pool. The summary line reports how many pool entries the weights actually touched -- if it says none, no item in the pool descends from this class."),
+    floatSetting("lootWeightContainers", "Cases and containers", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Loot/Item mix/Category weights",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies the pool weight of every item whose `_parent` chain reaches base class 5795f317245977243854e041, which this install's db.json names `SimpleContainer` (measured 2026-08-31). 1.0 emits no entry at all; 0 removes the family from every pool. The summary line reports how many pool entries the weights actually touched -- if it says none, no item in the pool descends from this class."),
+    floatSetting("lootWeightStims", "Stimulants", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Loot/Item mix/Category weights",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies the pool weight of every item whose `_parent` chain reaches base class 5448f3a64bdc2d60728b456a, which this install's db.json names `Stimulator` (measured 2026-08-31). 1.0 emits no entry at all; 0 removes the family from every pool. The summary line reports how many pool entries the weights actually touched -- if it says none, no item in the pool descends from this class."),
+    floatSetting("lootWeightTools", "Tools", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Loot/Item mix/Category weights",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies the pool weight of every item whose `_parent` chain reaches base class 57864bb7245977548b3b66c2, which this install's db.json names `Tool` (measured 2026-08-31). 1.0 emits no entry at all; 0 removes the family from every pool. The summary line reports how many pool entries the weights actually touched -- if it says none, no item in the pool descends from this class."),
+    floatSetting("lootWeightSpecial", "Special items", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Loot/Item mix/Category weights",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies the pool weight of every item whose `_parent` chain reaches base class 5447e0e74bdc2d3c308b4567, which this install's db.json names `SpecItem` (measured 2026-08-31). 1.0 emits no entry at all; 0 removes the family from every pool. The summary line reports how many pool entries the weights actually touched -- if it says none, no item in the pool descends from this class."),
+
+    # ---- Loot > Money ---------------------------------------------------
+    #
+    # The section the single-dollar drop earned. `emu/bots.randomStackCount`
+    # fixed the *absence* of a stack count; nothing made the resulting number
+    # visible or adjustable, so "why is this scav carrying one dollar" was
+    # still a question nobody could answer from the screen.
+    #
+    # The three currency template ids and their declared spawn ranges were read
+    # out of this install's db.json on 2026-08-31 and are quoted on each row, so
+    # the page states what the untouched game does before anyone moves a slider.
+    # All three descend from the Money base class, so the Money family weight
+    # above AND the currency row here both apply and both multiply; the
+    # currency row is the more specific of the two and is applied last.
+    floatSetting("lootCurrencyRoubles", "Roubles in loot pools", 1.0, lo = 0.0,
+                 hi = 10.0, step = 0.1, category = "Loot/Money",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies the pool weight of template 5449016a4bdc2d6f028b456f -- this database spawns it in stacks of 5500..13500 with a hard cap of 1,000,000. It is a weight on HOW OFTEN this currency is drawn, not on how much of it: the stack size is the three rows below. 0 removes this currency from every pool and leaves the other two."),
+    floatSetting("lootCurrencyDollars", "Dollars in loot pools", 1.0, lo = 0.0,
+                 hi = 10.0, step = 0.1, category = "Loot/Money",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies the pool weight of template 5696686a4bdc2da3298b456a -- this database spawns it in stacks of 45..100 with a hard cap of 50,000. It is a weight on HOW OFTEN this currency is drawn, not on how much of it: the stack size is the three rows below. 0 removes this currency from every pool and leaves the other two."),
+    floatSetting("lootCurrencyEuros", "Euros in loot pools", 1.0, lo = 0.0,
+                 hi = 10.0, step = 0.1, category = "Loot/Money",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies the pool weight of template 569668774bdc2da2298b4568 -- this database spawns it in stacks of 35..90 with a hard cap of 50,000. It is a weight on HOW OFTEN this currency is drawn, not on how much of it: the stack size is the three rows below. 0 removes this currency from every pool and leaves the other two."),
+    floatSetting("moneyStackMultiplier", "Money stack multiplier", 1.0,
+                 lo = 0.0, hi = 50.0, step = 0.1, category = "Loot/Money",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Scales every CURRENCY stack, in world loot AND in a bot's pockets -- both generators read this one key through emu/knobs.moneyStackConfig, so the floor and the corpse cannot disagree. Applied after the roll and after the generic stack cap, then bounded by the item's own StackMaxSize, which is the client's limit and not ours to exceed. Loose ammunition declares the same kind of spawn range and is deliberately NOT touched by this row."),
+    intSetting("moneyStackMin", "Minimum money stack", 0, lo = 0,
+               hi = 1000000, step = 100, category = "Loot/Money",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. The smallest currency stack that may spawn, after the multiplier. 0, the default, is no floor -- the item's own declared range decides. Set it to 1000 and no rouble pile below a thousand exists; note the same number is applied to dollars and euros, whose whole declared range is 45..100, so a floor set for roubles will flatten the other two."),
+    intSetting("moneyStackMax", "Maximum money stack", 0, lo = 0,
+               hi = 1000000, step = 100, category = "Loot/Money",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. The largest currency stack that may spawn, after the multiplier. 0, the default, is no ceiling. This is the row for the complaint that world money piles are absurd: this database lets a rouble stack reach 1,000,000, while the game's own declared spawn range is 5500..13500."),
+
+    # ---- Bots > Gear ----------------------------------------------------
+    #
+    # The other half of "what people spawn with", and the half that had no
+    # control surface at all: before this, one number -- the Bot AI mod's
+    # `configs.botLoot.richnessMultiplier` -- governed every bot in the game,
+    # and nothing at all governed what they WORE.
+    #
+    # Every row below is a MULTIPLIER ON THE DATABASE'S OWN NUMBER
+    # (`bots.types.<role>.chances`), never a replacement for it. None of them
+    # can put an item in a slot the role's pool does not name, and at exactly
+    # 1.0 `emu/botgear.scalePercent` returns its input with no arithmetic at
+    # all -- so an untouched page draws the same bot, roll for roll. That is
+    # what makes this a control surface rather than a second generator
+    # competing with the first.
+    #
+    # Composability is the answer to "a 200-row list": the number that reaches
+    # a slot is global x family x slot, all three defaulting to 1.0, so a
+    # player who only wants everyone better equipped moves ONE row.
+    boolSetting("botGearEnabled", "Bot gear tuning enabled", true,
+                category = "Bots/Gear",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. The master switch for every row in Bots > Gear and Bots > Loot. OFF makes all of them return 1.0 without acting on their values -- the database own chances, untouched -- so it is the one-click way back from any experiment without setting thirty rows to 1.0 by hand. It does NOT disable bot gear; a bot still wears what its table says."),
+    floatSetting("botGearMultiplier", "Global gear multiplier", 1.0,
+                 lo = 0.0, hi = 10.0, step = 0.1, category = "Bots/Gear",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies EVERY equipment slot chance, for every bot family, on top of the per-family and per-slot rows below. 2.0 roughly doubles how often an optional slot is filled -- a chance is still capped at certain, never more -- and 0 strips every optional slot, leaving bots in whatever their table marks required. Pockets are exempt: a bot without them does not spawn (emu/bots.addLoadout)."),
+    floatSetting("botWeaponModChance", "Weapon attachment chance", 1.0,
+                 lo = 0.0, hi = 10.0, step = 0.1, category = "Bots/Gear",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies `chances.weaponMods` -- how often an OPTIONAL attachment (a scope, a grip, a suppressor) is fitted. Slots the weapon marks `_required` are untouched, because a rifle missing a required part is a gun with a hole in it rather than a plainer gun. 0 gives every bot an iron-sighted stock weapon."),
+    floatSetting("botEquipmentModChance", "Gear attachment chance", 1.0,
+                 lo = 0.0, hi = 10.0, step = 0.1, category = "Bots/Gear",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. As above, for `chances.equipmentMods` -- helmet armour plates, visors, headset attachments and armour inserts. Lowering it is the cheapest way to make helmeted bots less bullet-proof without removing the helmet."),
+
+    # ---- Bots > Gear > Per bot type -------------------------------------
+    #
+    # Nine families, covering all 57 role keys read out of this install's
+    # `bots.types` on 2026-08-31. Classified by prefix, because that is how the
+    # database itself groups them; the ninth, `Other`, is the honest catch-all
+    # rather than a silent gap.
+    floatSetting("botGearScav", "scav gear", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Bots/Gear/Per bot type",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies every equipment slot chance for scav bots, on top of the global row and under the per-slot rows. Database roles in this family: assault, cursedassault, crazyassaultevent, marksman, arenafighterevent, peacemaker and gifter."),
+    floatSetting("botGearUsec", "PMC USEC gear", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Bots/Gear/Per bot type",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies every equipment slot chance for PMC USEC bots, on top of the global row and under the per-slot rows. Database roles in this family: pmcusec and usec."),
+    floatSetting("botGearBear", "PMC BEAR gear", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Bots/Gear/Per bot type",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies every equipment slot chance for PMC BEAR bots, on top of the global row and under the per-slot rows. Database roles in this family: pmcbear and bear."),
+    floatSetting("botGearRaider", "raider gear", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Bots/Gear/Per bot type",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies every equipment slot chance for raider bots, on top of the global row and under the per-slot rows. Database roles in this family: pmcbot."),
+    floatSetting("botGearRogue", "rogue gear", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Bots/Gear/Per bot type",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies every equipment slot chance for rogue bots, on top of the global row and under the per-slot rows. Database roles in this family: exusec."),
+    floatSetting("botGearBoss", "boss gear", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Bots/Gear/Per bot type",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies every equipment slot chance for boss bots, on top of the global row and under the per-slot rows. Database roles in this family: every role whose key starts `boss` -- 14 of them in this database."),
+    floatSetting("botGearFollower", "boss follower gear", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Bots/Gear/Per bot type",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies every equipment slot chance for boss follower bots, on top of the global row and under the per-slot rows. Database roles in this family: every role whose key starts `follower`, plus tagillahelperagro and shooterbtr."),
+    floatSetting("botGearCultist", "cultist gear", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Bots/Gear/Per bot type",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies every equipment slot chance for cultist bots, on top of the global row and under the per-slot rows. Database roles in this family: every role whose key starts `sectant`."),
+    floatSetting("botGearOther", "unclassified gear", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Bots/Gear/Per bot type",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies every equipment slot chance for unclassified bots, on top of the global row and under the per-slot rows. Database roles in this family: every role none of the eight rules above matches -- in this database that is the infected* and spirit* roles. It exists so that no role is silently ungoverned."),
+
+    # ---- Bots > Gear > Per slot -----------------------------------------
+    #
+    # The twelve slots that are actually ROLLED. `Pockets` and
+    # `SecuredContainer` are absent on purpose and the reason is measured, not
+    # stylistic: the client dereferences `Equipment.Slots[8]` (Pockets)
+    # unconditionally in `EFT.Player::HasMarkOfUnknown`, and `BotsGroup..ctor`
+    # runs that over every player in the raid while a bot activates -- so a bot
+    # whose pockets roll failed does not spawn without pockets, it does not
+    # spawn at all and takes the activation with it. A slider that can set that
+    # chance to zero is a slider that crashes raids, so it is not offered.
+    floatSetting("botSlotHeadwear", "Helmets and hats", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Bots/Gear/Per slot",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies the `chances.equipment.Headwear` percentage the role own table declares. 0 means no bot ever spawns with this slot filled; above 1 makes it commoner up to certain, never more. A role whose table does not mention the slot is treated as 100 per cent before this multiplier, which is what the generator already did."),
+    floatSetting("botSlotEarpiece", "Headsets", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Bots/Gear/Per slot",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies the `chances.equipment.Earpiece` percentage the role own table declares. 0 means no bot ever spawns with this slot filled; above 1 makes it commoner up to certain, never more. A role whose table does not mention the slot is treated as 100 per cent before this multiplier, which is what the generator already did."),
+    floatSetting("botSlotFaceCover", "Face covers", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Bots/Gear/Per slot",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies the `chances.equipment.FaceCover` percentage the role own table declares. 0 means no bot ever spawns with this slot filled; above 1 makes it commoner up to certain, never more. A role whose table does not mention the slot is treated as 100 per cent before this multiplier, which is what the generator already did."),
+    floatSetting("botSlotArmorVest", "Body armour", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Bots/Gear/Per slot",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies the `chances.equipment.ArmorVest` percentage the role own table declares. 0 means no bot ever spawns with this slot filled; above 1 makes it commoner up to certain, never more. A role whose table does not mention the slot is treated as 100 per cent before this multiplier, which is what the generator already did."),
+    floatSetting("botSlotEyewear", "Eyewear", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Bots/Gear/Per slot",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies the `chances.equipment.Eyewear` percentage the role own table declares. 0 means no bot ever spawns with this slot filled; above 1 makes it commoner up to certain, never more. A role whose table does not mention the slot is treated as 100 per cent before this multiplier, which is what the generator already did."),
+    floatSetting("botSlotArmBand", "Armbands", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Bots/Gear/Per slot",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies the `chances.equipment.ArmBand` percentage the role own table declares. 0 means no bot ever spawns with this slot filled; above 1 makes it commoner up to certain, never more. A role whose table does not mention the slot is treated as 100 per cent before this multiplier, which is what the generator already did."),
+    floatSetting("botSlotTacticalVest", "Chest rigs", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Bots/Gear/Per slot",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies the `chances.equipment.TacticalVest` percentage the role own table declares. 0 means no bot ever spawns with this slot filled; above 1 makes it commoner up to certain, never more. A role whose table does not mention the slot is treated as 100 per cent before this multiplier, which is what the generator already did."),
+    floatSetting("botSlotBackpack", "Backpacks", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Bots/Gear/Per slot",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies the `chances.equipment.Backpack` percentage the role own table declares. 0 means no bot ever spawns with this slot filled; above 1 makes it commoner up to certain, never more. A role whose table does not mention the slot is treated as 100 per cent before this multiplier, which is what the generator already did."),
+    floatSetting("botSlotPrimaryWeapon", "Primary weapon", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Bots/Gear/Per slot",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies the `chances.equipment.FirstPrimaryWeapon` percentage the role own table declares. 0 means no bot ever spawns with this slot filled; above 1 makes it commoner up to certain, never more. A role whose table does not mention the slot is treated as 100 per cent before this multiplier, which is what the generator already did."),
+    floatSetting("botSlotSecondaryWeapon", "Second primary weapon", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Bots/Gear/Per slot",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies the `chances.equipment.SecondPrimaryWeapon` percentage the role own table declares. 0 means no bot ever spawns with this slot filled; above 1 makes it commoner up to certain, never more. A role whose table does not mention the slot is treated as 100 per cent before this multiplier, which is what the generator already did."),
+    floatSetting("botSlotHolster", "Sidearm", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Bots/Gear/Per slot",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies the `chances.equipment.Holster` percentage the role own table declares. 0 means no bot ever spawns with this slot filled; above 1 makes it commoner up to certain, never more. A role whose table does not mention the slot is treated as 100 per cent before this multiplier, which is what the generator already did."),
+    floatSetting("botSlotScabbard", "Melee weapon", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Bots/Gear/Per slot",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies the `chances.equipment.Scabbard` percentage the role own table declares. 0 means no bot ever spawns with this slot filled; above 1 makes it commoner up to certain, never more. A role whose table does not mention the slot is treated as 100 per cent before this multiplier, which is what the generator already did."),
+
+    # ---- Bots > Loot ----------------------------------------------------
+    #
+    # What a bot CARRIES, as opposed to wears -- and therefore what the player
+    # gets off the corpse. `emu/bots.addContainerLoot` fills each carried
+    # container from that role's own pool and count table; these scale the
+    # count, never the pool, so a role that carries nothing still carries
+    # nothing (a multiplier on a roll of zero is zero, and that is the honest
+    # reading of a table that said nothing).
+    floatSetting("botLootMultiplier", "Global bot loot multiplier", 1.0,
+                 lo = 0.0, hi = 10.0, step = 0.1, category = "Bots/Loot",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Scales how much loose loot every bot carries. It is applied ON TOP OF the Bot AI mod published `configs.botLoot.richnessMultiplier` rather than replacing it -- two owners, one number, and the order is stated so neither control silently wins. Above 1.0 it also raises the per-bot item bound, or the extra items would have nowhere in the budget to go."),
+    intSetting("botLootMaxItems", "Loose items per bot (cap)", 24,
+               lo = 0, hi = 200, step = 1, category = "Bots/Loot",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. The most loose items one bot may carry across its rig, backpack and pockets together. 24 is the number `emu/bots` used to hardcode as MaxLootPerBot. The multipliers scale this cap when they are above 1.0, so raising it by hand is only needed if you want a fuller bot at a multiplier of 1.0."),
+    intSetting("botSpareMagazines", "Spare magazines per bot", 4,
+               lo = 0, hi = 16, step = 1, category = "Bots/Loot",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. How many loaded spare magazines go into a bot rig, at most, across all its weapons. 4 is the number `emu/bots` used to hardcode as MaxSpareMags. 0 is a real answer -- a bot with one magazine and no reload -- and it is the single largest thing you can change about how long a firefight lasts. Each spare is the model the weapon actually took and is filled with the correct calibre, so a spare that finds no room in any grid is dropped rather than written to a cell that overlaps something."),
+
+    # ---- Bots > Loot > Per bot type -------------------------------------
+    #
+    # The same nine families as the gear section, so "raiders carry more, scavs
+    # carry less" is two rows and not a table of template ids.
+    floatSetting("botLootScav", "scav loot", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Bots/Loot/Per bot type",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies how much loose loot scav bots carry, on top of the global row and the Bot AI mod published richness. 0 empties their pockets; the equipment they WEAR is the gear section and is unaffected."),
+    floatSetting("botLootUsec", "PMC USEC loot", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Bots/Loot/Per bot type",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies how much loose loot PMC USEC bots carry, on top of the global row and the Bot AI mod published richness. 0 empties their pockets; the equipment they WEAR is the gear section and is unaffected."),
+    floatSetting("botLootBear", "PMC BEAR loot", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Bots/Loot/Per bot type",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies how much loose loot PMC BEAR bots carry, on top of the global row and the Bot AI mod published richness. 0 empties their pockets; the equipment they WEAR is the gear section and is unaffected."),
+    floatSetting("botLootRaider", "raider loot", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Bots/Loot/Per bot type",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies how much loose loot raider bots carry, on top of the global row and the Bot AI mod published richness. 0 empties their pockets; the equipment they WEAR is the gear section and is unaffected."),
+    floatSetting("botLootRogue", "rogue loot", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Bots/Loot/Per bot type",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies how much loose loot rogue bots carry, on top of the global row and the Bot AI mod published richness. 0 empties their pockets; the equipment they WEAR is the gear section and is unaffected."),
+    floatSetting("botLootBoss", "boss loot", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Bots/Loot/Per bot type",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies how much loose loot boss bots carry, on top of the global row and the Bot AI mod published richness. 0 empties their pockets; the equipment they WEAR is the gear section and is unaffected."),
+    floatSetting("botLootFollower", "boss follower loot", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Bots/Loot/Per bot type",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies how much loose loot boss follower bots carry, on top of the global row and the Bot AI mod published richness. 0 empties their pockets; the equipment they WEAR is the gear section and is unaffected."),
+    floatSetting("botLootCultist", "cultist loot", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Bots/Loot/Per bot type",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies how much loose loot cultist bots carry, on top of the global row and the Bot AI mod published richness. 0 empties their pockets; the equipment they WEAR is the gear section and is unaffected."),
+    floatSetting("botLootOther", "unclassified loot", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Bots/Loot/Per bot type",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies how much loose loot unclassified bots carry, on top of the global row and the Bot AI mod published richness. 0 empties their pockets; the equipment they WEAR is the gear section and is unaffected."),
 
     boolSetting("lootStackRandomRange", "Use the item's own stack range", false,
                 category = "Loot/Money & stacks",
@@ -3534,6 +3794,14 @@ proc tarkovSchema(): seq[Setting] =
     intSetting("progressionPlayerLevel", "Player level", 0, lo = 0, hi = 79,
                category = "Progression/Player",
                description = "aowlspt original (server emulator); acts on the SPT-derived database. Raise the character to at least this level. The client derives the level it draws from Info.Experience against globals.config.exp.level.exp_table and does not trust Info.Level, so this writes the matching EXPERIENCE (emu/progression.xpForLevel) and sets Info.Level alongside it. 0 is off; 79 is the length of the exp table on this database"),
+
+    # The exact-XP row the old profile managers had. Not a duplicate of the row
+    # above: the level row snaps to an exp-table boundary, this one sets a
+    # number in between, and Info.Level is re-DERIVED from it rather than typed.
+    intSetting("progressionExperience", "Experience (exact)", 0,
+               lo = 0, hi = 100000000, step = 10000,
+               category = "Progression/Player",
+               description = "aowlspt original (server emulator); acts on the SPT-derived database. Raise Info.Experience to at least this number, and re-derive Info.Level from it against globals.config.exp.level.exp_table (emu/progression.levelForXp). A floor, like every row on this page: a profile already above it is untouched, and setting it back to 0 takes nothing away. 0 is off"),
 
     intSetting("progressionSkillLevel", "Skill level", 0, lo = 0, hi = 51,
                category = "Progression/Skills",
@@ -3615,6 +3883,43 @@ proc tarkovSchema(): seq[Setting] =
     stringSetting("mapsLockResult", "Last lock result", "",
                   category = "Maps",
                   description = "aowlspt original (server emulator); acts on the SPT-derived database. What the last apply did: how many maps were locked and unlocked, how many database writes succeeded, and any map name in the two lists above that resolved to NO map -- which is the case where the setting saves cleanly and locks nothing"),
+
+    # ---- raid timing and extracts (emu/svm -> emu/raid) ------------------
+    #
+    # These edit the LOCATION document, and are applied where that document is
+    # BUILT rather than written into the database, for the reason emu/maplock's
+    # header records in full: /client/locations is answered out of the post-1.0
+    # table, so 19 successful database writes were served to nobody.
+    floatSetting("raidTimeMultiplier", "Raid time multiplier", 1.0,
+                 lo = 0.1, hi = 10.0, step = 0.1, category = "Raid/Timing",
+                 description = "aowlspt original (server emulator); acts on the SPT-derived database. Scales every map's own EscapeTimeLimit (and EscapeTimeLimitCoop / EscapeTimeLimitPVE where the map has them) in the document /client/locations serves. Per map, not a flat number: Factory's 20 minutes and Streets' 50 stay in proportion. 1.0 is stock and costs nothing -- no location document is touched at all"),
+    intSetting("raidTimeMinutes", "Raid time (fixed minutes)", 0,
+               lo = 0, hi = 600, step = 5, category = "Raid/Timing",
+               description = "aowlspt original (server emulator); acts on the SPT-derived database. An ABSOLUTE raid length for every map, in minutes, overriding the multiplier above. 0 is off, which is what leaves the multiplier in charge"),
+
+    boolSetting("extractsAlwaysAvailable", "All extracts always available",
+                false, category = "Raid/Extracts",
+                description = "aowlspt original (server emulator); acts on the SPT-derived database. Sets every exit's Chance and ChancePVE to 100 in the served location document, so no extract is rolled away for the raid. Does NOT remove an extract's requirement -- that is the next row, and they are different fields"),
+    boolSetting("extractsNoRequirements", "Remove extract requirements", false,
+                category = "Raid/Extracts",
+                description = "aowlspt original (server emulator); acts on the SPT-derived database. Sets every exit's PassageRequirement to \\\"None\\\" and clears its RequirementTip, so a co-op / train / item-gated exfil opens without the condition. Measured shapes from data/post1/locations.json: PassageRequirement is a string (\\\"Train\\\", \\\"TransferItem\\\"), RequirementTip a string"),
+    boolSetting("extractsNoTimeWindow", "Extracts open for the whole raid",
+                false, category = "Raid/Extracts",
+                description = "aowlspt original (server emulator); acts on the SPT-derived database. Sets every exit's MinTime/MinTimePVE to 0 and MaxTime/MaxTimePVE wide open, so an exfil that only exists in the last ten minutes exists from the start. Seconds, per the served document"),
+    stringSetting("raidTuneResult", "Last raid tune result", "",
+                  category = "Raid/Extracts",
+                  description = "aowlspt original (server emulator); acts on the SPT-derived database. Written BY the server: what the raid rows are set to, and how many map bases and exits have actually been rewritten while building a served location document. Zero maps tuned with the rows switched on means no client has fetched /client/locations since the apply -- not that the rows did nothing"),
+
+    # ---- stash size (emu/svm) -------------------------------------------
+    intSetting("stashRows", "Stash rows", 0, lo = 0, hi = 500, step = 5,
+               category = "Profile/Stash",
+               description = "aowlspt original (server emulator); acts on the SPT-derived database. Sets cellsV on the first grid of all five edition stash templates (Standard 30, Left Behind 40, Prepare to Escape 50, Edge of Darkness 68, Unheard 72), which /client/items serves and which the server's own item placement reads back through emu/grid.stashGrid. Each id is checked against the stash _parent before it is written. 0 leaves every stash exactly as the database has it"),
+    intSetting("stashCols", "Stash columns", 0, lo = 0, hi = 50, step = 1,
+               category = "Profile/Stash",
+               description = "aowlspt original (server emulator); acts on the SPT-derived database. Sets cellsH the same way. NARROWING a stash that already holds items leaves items outside the grid, which the client draws where it cannot be picked up -- widening is safe, narrowing is not. 0 leaves it alone (every stash is 10 wide)"),
+    stringSetting("stashResult", "Last stash result", "",
+                  category = "Profile/Stash",
+                  description = "aowlspt original (server emulator); acts on the SPT-derived database. Written BY the server, and READ BACK from the database rather than reported from the write: how many of the five stash templates now report the requested size, naming any that does not, any id that is not a stash on this database, and any with no usable Grids"),
 
     # ---- item spawning -------------------------------------------------
     #
@@ -3729,6 +4034,13 @@ proc isLootKey(key: string): bool =
     return false
   if key.startsWith("loot") or key.startsWith("container"):
     return true
+  # The three money-stack rows are read by BOTH generators through
+  # `emu/knobs.moneyStackConfig`, so they are a loot key for the purposes of
+  # recomputing the summary even though they do not spell `loot`. Missing this
+  # would have left the page describing the previous money configuration --
+  # the exact stale-summary failure `onTarkovApply` documents.
+  if key.startsWith("moneyStack"):
+    return true
   result = key == "staticLootMultiplier" or key == "looseLootMultiplier" or
            key == "maxLootItems" or key == "staticLootEnabled" or
            key == "looseLootEnabled"
@@ -3774,6 +4086,37 @@ proc applyLootPreset(name: string) =
   discard applySetting("lootWeightMeds", "1.0")
   discard applySetting("lootWeightKeys", "1.0")
   discard applySetting("lootWeightBarter", "1.0")
+  # The other seventeen family weights and the three currency weights, for the
+  # same reason the five above are here: a preset that skipped them would leave
+  # a `Valuables = 0` from an earlier experiment in force under a "vanilla"
+  # label, which is exactly the history-dependence this proc's docstring says a
+  # preset must not have. Written out rather than looped, because the loop
+  # would have to import the emu module's key array into the settings
+  # declaration and the two are deliberately separate lists -- the disagreement
+  # between them is what `emu/knobs`' ledger is for.
+  discard applySetting("lootWeightAmmoBoxes", "1.0")
+  discard applySetting("lootWeightFood", "1.0")
+  discard applySetting("lootWeightElectronics", "1.0")
+  discard applySetting("lootWeightValuables", "1.0")
+  discard applySetting("lootWeightWeapons", "1.0")
+  discard applySetting("lootWeightKnives", "1.0")
+  discard applySetting("lootWeightMods", "1.0")
+  discard applySetting("lootWeightMagazines", "1.0")
+  discard applySetting("lootWeightArmor", "1.0")
+  discard applySetting("lootWeightHelmets", "1.0")
+  discard applySetting("lootWeightRigs", "1.0")
+  discard applySetting("lootWeightBackpacks", "1.0")
+  discard applySetting("lootWeightGrenades", "1.0")
+  discard applySetting("lootWeightContainers", "1.0")
+  discard applySetting("lootWeightStims", "1.0")
+  discard applySetting("lootWeightTools", "1.0")
+  discard applySetting("lootWeightSpecial", "1.0")
+  discard applySetting("lootCurrencyRoubles", "1.0")
+  discard applySetting("lootCurrencyDollars", "1.0")
+  discard applySetting("lootCurrencyEuros", "1.0")
+  discard applySetting("moneyStackMultiplier", "1.0")
+  discard applySetting("moneyStackMin", "0")
+  discard applySetting("moneyStackMax", "0")
   discard applySetting("lootStackRandomRange", "false")
   discard applySetting("lootStackMultiplier", "1.0")
   discard applySetting("lootStackMaxFraction", "1.0")
@@ -3783,6 +4126,7 @@ proc applyLootPreset(name: string) =
     discard applySetting("containerFillMultiplier", "0.7")
     discard applySetting("lootValueBias", "-0.5")
     discard applySetting("lootStackMaxFraction", "0.5")
+    discard applySetting("moneyStackMultiplier", "0.5")
   of "richer":
     discard applySetting("lootGlobalMultiplier", "1.5")
     discard applySetting("containerFillMultiplier", "1.3")
@@ -3793,6 +4137,7 @@ proc applyLootPreset(name: string) =
     discard applySetting("containerMaxItems", "128")
     discard applySetting("lootValueBias", "0.8")
     discard applySetting("lootStackRandomRange", "true")
+    discard applySetting("moneyStackMultiplier", "3.0")
   else:
     discard  # "vanilla": the block above IS vanilla
 
@@ -3827,6 +4172,15 @@ proc onTarkovApply(key: string) =
   if key == "mapsUnlockedByDefault" or key == "mapsLocked" or
      key == "mapsUnlocked":
     applyMapLockSettings()
+  # The four SVM rows that are not globals.config. One call reads ALL of them
+  # -- the stash pair, the exact-XP row and the five raid rows -- because
+  # `emu/svm`'s read ledger is what proves each key is consulted, and a
+  # per-key branch here would be a second place for a key to go missing from.
+  # Cheap: every row is off by default and `applyStashSize`/`setRaidTunePolicy`
+  # return without touching a document when nothing is configured.
+  if key.startsWith("stash") or key.startsWith("raid") or
+     key.startsWith("extracts") or key == "progressionExperience":
+    applySvmSettings()
   if key.startsWith("progression"):
     configureProgression(setting("progressionPlayerLevel").asInt(0),
                          setting("progressionSkillLevel").asInt(0),
@@ -3839,9 +4193,26 @@ proc onTarkovApply(key: string) =
                      setting("traderPriceMultiplier").asFloat(1.0),
                      setting("traderIgnoreStockLimits").asBool(false),
                      setting("traderMaxLoyalty").asBool(false))
+  # Bots > Gear and Bots > Loot. These are HOT: `refreshBotGear` re-reads the
+  # whole page off config.json -- not off the value that was just posted -- and
+  # the next `bot/generate` batch is built with it. That is the difference
+  # between this and the "stored, next start" answer at the bottom of this
+  # proc, and it is why the verdict says so explicitly rather than printing one
+  # "applied" for both cases.
+  if key.startsWith("botGear") or key.startsWith("botLoot") or
+     key.startsWith("botSlot") or key == "botSpareMagazines" or
+     key == "botWeaponModChance" or key == "botEquipmentModChance":
+    refreshBotGear()
+    settingApplied("re-read from config.json; the next bot batch is generated " &
+                   "with it, with no restart")
+    return
   if isLootKey(key):
     if key == "lootPreset":
       applyLootPreset(setting("lootPreset").asText("custom"))
+    # The money rows are shared with the bot generator, so the bot side has to
+    # be re-read too or a money edit would reach the floor and not the corpse.
+    if key.startsWith("moneyStack"):
+      refreshBotGear()
     # Taken LAST and read out of `lootConfig()` -- the same object the generator
     # reads -- not out of the value that was just posted. A summary derived from
     # the incoming edit would be a check that cannot fail.
@@ -3912,6 +4283,74 @@ proc onTarkovSettings(url, body, session: string): string =
 proc onItemsCapability(request: string): CapReply =
   if not strictObject(request):
     return capFail("the aowl.items request is not a JSON object")
+
+  # `op: "inventory"` and `op: "count"` are answered BEFORE the query check,
+  # because neither takes a query. Putting them below it would make "show me my
+  # stash" fail with "aowl.items needs a query", which is a refusal that
+  # describes the wrong thing.
+  let op0 = field(request, "op").asText("")
+
+  if op0 == "inventory" or op0 == "count":
+    var pid0 = field(request, "profileId").asText("")
+    if pid0.len == 0:
+      pid0 = spawnProfileId(field(request, "session").asText(""))
+    if pid0.len == 0:
+      let all = allProfileIds()
+      if all.len == 0:
+        return capFail("there is no profile yet; log in first")
+      return capFail("there are " & $all.len & " profiles and the request " &
+                     "named none; pass \"profileId\", or log in")
+
+    if op0 == "count":
+      # THE MINT READBACK, exposed. It reports READABILITY separately from the
+      # number and this handler keeps them separate: a profile that could not
+      # be opened must not come back as "you have 0", which a caller comparing
+      # a before and an after would read as a failed spawn rather than as a
+      # check that could not run.
+      let tplWanted = field(request, "tpl").asText("")
+      if tplWanted.len == 0:
+        return capFail("aowl.items op=count needs a \"tpl\"")
+      let cr = templateCount(pid0, tplWanted)
+      var oc = obj()
+      put(oc, "spawned", 0)
+      put(oc, "tpl", tplWanted)
+      put(oc, "readable", cr.readable)
+      put(oc, "count", cr.count)
+      put(oc, "message", (if cr.readable:
+                            "the profile holds " & $cr.count & " x " & tplWanted
+                          else:
+                            "COULD NOT LOOK: " & cr.why))
+      return capOk(done(oc).text)
+
+    var limI = field(request, "limit").asInt(32)
+    if limI < 1: limI = 1
+    if limI > 64: limI = 64
+    var distinct0 = 0
+    let rowsInv = stashRows(pid0, limI, distinct0)
+    var rawRows = "["
+    for i in 0 ..< rowsInv.len:
+      if i > 0: rawRows.add ","
+      var r = obj()
+      put(r, "tpl", rowsInv[i].tpl)
+      put(r, "name", rowsInv[i].name)
+      put(r, "count", rowsInv[i].count)
+      rawRows.add done(r).text
+    rawRows.add "]"
+    var oi = obj()
+    put(oi, "spawned", 0)
+    put(oi, "profileId", pid0)
+    put(oi, "total", distinct0)         # distinct templates in the stash
+    put(oi, "returned", rowsInv.len)
+    put(oi, "rows", raw(rawRows))
+    # `total == 0` is an ANSWER (an empty stash) and is reported as one. It is
+    # NOT distinguishable here from a profile whose item list would not parse,
+    # which `stashRows` returns empty for -- so the message says "reads as",
+    # not "is". The `count` op above is the one that separates those.
+    put(oi, "message", $rowsInv.len & " of " & $distinct0 &
+                       " distinct template(s) read back from the stash of " &
+                       pid0)
+    return capOk(done(oi).text)
+
   let query = field(request, "query").asText("")
   if query.len == 0:
     return capFail("aowl.items needs a \"query\": part of an item name, or a " &
@@ -3944,6 +4383,47 @@ proc onItemsCapability(request: string): CapReply =
     # the database genuinely has no such item. Saying so plainly is the whole
     # point, so it is `capOk` with a message, not `capFail`.
     put(o, "message", searchSummary(query, 10))
+    return capOk(done(o).text)
+
+  # `op: "list"` -- the same search, as ROWS instead of a sentence.
+  #
+  # WHY BOTH EXIST. `op:"search"` renders one line because the F6 overlay has
+  # one line to show. The native inventory screen has a COLUMN, and formatting a
+  # sentence only to split it apart again would make the row boundaries depend
+  # on the separator characters inside an item name -- "5.45x39mm BS gs" has a
+  # semicolon nowhere but nothing stops the locale from carrying one. So the
+  # rows cross the wire as rows. `searchSummary` is untouched and still the only
+  # renderer of the one-line form; this is not a second formatter of the same
+  # thing, it is the unformatted thing.
+  #
+  # `limit` is the caller's page size, clamped: the shared region that carries
+  # these has a fixed 64-row table and asking for more than fits would produce a
+  # silent truncation on the far side instead of an honest `matched` count here.
+  if field(request, "op").asText("") == "list":
+    var lim = field(request, "limit").asInt(32)
+    if lim < 1: lim = 1
+    if lim > 64: lim = 64
+    var matched = 0
+    let hits = searchItemsCounted(query, lim, matched)
+    var rows = "["
+    for i in 0 ..< hits.len:
+      if i > 0: rows.add ","
+      var r = obj()
+      put(r, "tpl", hits[i].tpl)
+      put(r, "name", (if hits[i].name.len > 0: hits[i].name else: hits[i].tpl))
+      rows.add done(r).text
+    rows.add "]"
+    var o = obj()
+    put(o, "spawned", 0)
+    put(o, "query", query)
+    put(o, "matched", matched)          # how many REALLY matched
+    put(o, "returned", hits.len)        # how many are in `rows`
+    put(o, "rows", raw(rows))
+    put(o, "message", (if matched == 0:
+                         "no item matches \"" & query & "\""
+                       else:
+                         $hits.len & " of " & $matched & " match \"" &
+                         query & "\""))
     return capOk(done(o).text)
 
   # Mid-raid, refuse before doing any work -- but only a SPAWN, which is why
@@ -4057,6 +4537,9 @@ proc onLoad(): Status =
   discard applySetting("lootSummary", jstr(lootConfigSummary()).text)
 
   applyMapLockSettings()
+  # The non-globals SVM rows: stash size, exact XP, raid time, extracts. One
+  # call, which is also the ledger's first run -- see `emu/svm`.
+  applySvmSettings()
   configureMarket(setting("fleaSpreadPercent").asInt(20),
                   setting("fleaOfferHours").asInt(12),
                   setting("fleaMaxOffers").asInt(600),
@@ -4088,6 +4571,19 @@ proc onLoad(): Status =
   for bad in rejected:
     warn "singleplayer: refusing a modifier whose value is not a JSON " &
          "literal: " & bad
+
+  # The non-globals SVM rows say what they did, for the same reason the globals
+  # ones do: a modifier that applied silently is indistinguishable from one that
+  # did not apply. The ledger line is the falsifiable half -- it names any key
+  # the schema declares and the server never read.
+  info "singleplayer: " & svmLedgerLine()
+  let svmNever = svmLedgerNeverRead()
+  if svmNever.len > 0:
+    for k in svmNever:
+      warn "singleplayer: SVM key declared and NEVER READ: " & k
+  if stashReport().len > 0:
+    info "singleplayer: " & stashReport()
+  info "singleplayer: " & raidTuneReport()
 
   # The emulator's own settings page, registered before the store gate below so
   # it answers even on a host where the emulator refuses to serve anything else.
