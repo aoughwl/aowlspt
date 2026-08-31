@@ -359,6 +359,13 @@ static int aowl_rva_is_code(unsigned int rva) {
 ## it defines sits OUTSIDE the bracketed rider's own `aowl_p_p_seh`, which is
 ## not re-entrant. See `abi/aowlspt_drainprof.h`.
 {.emit: """#include "aowlspt_drainprof.h" """.}
+## THE PHASE METER for the ONE rider the drain profiler priced at
+## `splRebrandDrain = 1152.2us/frame, max 194373.3us` -- a disjoint, exhaustive
+## decomposition of that single row, with its own positive control and an
+## explicit UNEXPLAINED remainder. Same non-hooking, non-guarding contract as
+## the drain profiler above, and gated by the SAME flag: with `drainProfiler`
+## off every entry point is one predicted compare. See `abi/aowlspt_splprof.h`.
+{.emit: """#include "aowlspt_splprof.h" """.}
 ## THE ONE WildSpawnType numeric table, shared verbatim with mods/maps so the
 ## minimap and the ESP boxes cannot disagree about who is a Rogue. Pure integer
 ## classification over a value the caller already read -- it dereferences
