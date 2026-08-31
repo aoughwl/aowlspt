@@ -61,12 +61,17 @@ const
   MpECls*    = 14'i32
   MpEId*     = 15'i32
   MpEStore*  = 16'i32
-  MpPWalk*   = 17'i32
-  MpPCall*   = 18'i32
-  MpPTail*   = 19'i32
-  MpCtrl*    = 20'i32
+  MpPH1*     = 17'i32
+  MpPH2*     = 18'i32
+  MpPH3*     = 19'i32
+  MpPH4*     = 20'i32
+  MpPH5*     = 21'i32
+  MpPCall*   = 22'i32
+  MpPTail*   = 23'i32
+  MpPWhole*  = 24'i32
+  MpCtrl*    = 25'i32
 
-const MpNames: array[21, string] = [
+const MpNames: array[26, string] = [
   "WHOLE(onMainTick)",     # 0
   "lockMod",               # 1
   "collect",               # 2
@@ -84,13 +89,18 @@ const MpNames: array[21, string] = [
   "e.classOf(+cacheProbe)",# 14
   "e.idTailOf(cache MISS only)", # 15
   "e.storeEnt",            # 16
-  "p.walk(5 guarded hops)",# 17
-  "p.rvaCall(0x6F32C0)",   # 18
-  "p.tail(copy+classify)", # 19
-  "CONTROL(512 adds)"]     # 20
+  "h1.bones(Pl+0xB40 ptr)",     # 17
+  "h2.bodyXf(PB+0x178 ptr)",    # 18
+  "h3.accumFlag(BT+0xA9 u8)",   # 19
+  "h4.useImit(BT+0xA8 u8)",     # 20
+  "h5.original(BT+0x10 ptr)",   # 21
+  "p.rvaCall(0x6F32C0)",        # 22
+  "p.tail(copy+classify)",      # 23
+  "p.WHOLE(sp_pos_live body)",  # 24
+  "CONTROL(512 adds)"]          # 25
 
 proc mpName(i: int32): string =
-  if i >= 0'i32 and i < 21'i32: return MpNames[int(i)]
+  if i >= 0'i32 and i < 26'i32: return MpNames[int(i)]
   return "slot[" & $int(i) & ": UNNAMED]"
 
 proc mpUsPer(nsTotal, ticks: int64): string =
@@ -181,7 +191,52 @@ proc mapsProfLine*(): string =
   s = s & mpLevel(MpLock, MpArt, MpWhole, "L1 tick phases", ticks)
   s = s & "." & mpLevel(MpCPre, MpCEnts, MpCollect, "L2 collect phases", ticks)
   s = s & "." & mpLevel(MpEFetch, MpEStore, MpCEnts, "L3 per-entity phases", ticks)
-  s = s & "." & mpLevel(MpPWalk, MpPTail, MpEPos, "L4 inside posOf", ticks)
+  # L4's parent is MP_P_WHOLE, the bracket around the WHOLE sp_pos_live body --
+  # NOT MP_E_POS. MP_E_POS brackets only the ENTITY-loop posOf; the local
+  # player's posOf runs inside MP_C_LOCAL at L2 and reaches the same C body, so
+  # the children legitimately counted more calls than that parent and summed to
+  # 104.3% of it. Wrong parent, not an unclosed bracket.
+  s = s & "." & mpLevel(MpPH1, MpPTail, MpPWhole, "L4 inside sp_pos_live", ticks)
+  # THE CHECK THAT CAN FAIL. mpLevel's own >=100% branch stays (it is the last
+  # line of defence), but it fires only AFTER the arithmetic has already been
+  # corrupted. This asserts the PROPERTY that makes the level sound -- every
+  # child bracket is opened exactly as often as the parent -- so a future call
+  # site that opens a child outside sp_pos_live announces itself by name.
+  block:
+    let pw = mpCalls(MpPWhole)
+    var bad = ""
+    var j = MpPH1
+    while j <= MpPTail:
+      let c = mpCalls(j)
+      # A phase is allowed to run FEWER times than the whole (an early return
+      # short-circuits it); running MORE times is the containment violation.
+      if c > pw:
+        if bad.len > 0: bad = bad & ", "
+        bad = bad & mpName(j) & "=" & $c
+      j = j + 1'i32
+    if pw <= 0:
+      s = s & ". L4 CONTAINMENT: UNCHECKED -- " & mpName(MpPWhole) &
+          " recorded 0 call(s), so nothing was enclosed and the level above " &
+          "is VOID, not cheap"
+    elif bad.len > 0:
+      s = s & ". L4 CONTAINMENT VIOLATED -- " & mpName(MpPWhole) & "=" & $pw &
+          " call(s) but " & bad & " ran MORE OFTEN, so a child bracket is " &
+          "opened OUTSIDE the parent. The L4 level above is BROKEN, not a result"
+    else:
+      s = s & ". L4 containment OK (" & mpName(MpPWhole) & "=" & $pw &
+          " call(s); no phase exceeds it)"
+  # The Nim-side dispatch cost, named rather than hidden: MP_E_POS is the whole
+  # of `posOf` as the entity loop sees it, MP_P_WHOLE is the C body. Only the
+  # entity-loop share of MP_P_WHOLE is comparable, so this is stated per-CALL.
+  if mpCalls(MpEPos) > 0 and mpCalls(MpPWhole) > 0:
+    let perPos = mpNs(MpEPos) div mpCalls(MpEPos)
+    let perWhole = mpNs(MpPWhole) div mpCalls(MpPWhole)
+    s = s & ". Nim-side dispatch around the C body = " & $(perPos - perWhole) &
+        "ns/call (" & mpName(MpEPos) & "=" & $perPos & "ns/call minus " &
+        mpName(MpPWhole) & "=" & $perWhole & "ns/call; the two have DIFFERENT " &
+        "call counts -- " & $mpCalls(MpEPos) & " vs " & $mpCalls(MpPWhole) &
+        ", the difference being the local player -- so this is a per-call " &
+        "difference and NOT a subtraction of totals)"
   # THE ONE NUMBER THIS LEVEL EXISTS FOR: a per-CALL cost, not a per-tick share.
   # us/tick is not comparable across runs -- it divides by ticks that include
   # MENU ticks, and the collect-to-tick ratio differs between runs. Two rows
@@ -195,11 +250,40 @@ proc mapsProfLine*(): string =
         mpName(MpEPos) & "=" & $(mpNs(MpEPos) div posCalls) & "ns over " &
         $posCalls & " call(s); " & mpName(MpPCall) & "=" &
         (if mpCalls(MpPCall) > 0: $(mpNs(MpPCall) div mpCalls(MpPCall)) & "ns"
-         else: "NEVER CALLED") & "; " & mpName(MpPWalk) & "=" &
-        (if mpCalls(MpPWalk) > 0: $(mpNs(MpPWalk) div mpCalls(MpPWalk)) & "ns"
          else: "NEVER CALLED") & "; " & mpName(MpEAi) & "=" &
         $(mpNs(MpEAi) div aiCalls) & "ns (ONE guarded hop -- the reference " &
         "cost of the cached readability guard, for scale)"
+    # THE ROW THIS BUILD EXISTS FOR: the five hops, EACH per-call, never
+    # averaged into one number. Each hop's call count is printed beside it,
+    # because a hop that ran 500 times and one that ran 80000 times are not
+    # comparable and an ns/call figure hides that on its own.
+    s = s & ". PER-HOP (ns/call, each hop of the guarded walk, in walk order): "
+    var walkSum = 0'i64
+    var hopsRan = 0
+    var k = MpPH1
+    while k <= MpPH5:
+      let c = mpCalls(k)
+      if k != MpPH1: s = s & "; "
+      if c <= 0:
+        s = s & mpName(k) & "=NEVER RAN (0 calls -- NOT 'free', NOT measured)"
+      else:
+        walkSum = walkSum + mpNs(k)
+        hopsRan = hopsRan + 1
+        s = s & mpName(k) & "=" & $(mpNs(k) div c) & "ns over " & $c &
+            " call(s), max " & mpUs(mpMax(k))
+      k = k + 1'i32
+    let pw = mpCalls(MpPWhole)
+    if hopsRan == 0:
+      s = s & ". WALK TOTAL: NOT MEASURED -- no hop bracket ever ran"
+    elif pw <= 0:
+      s = s & ". WALK TOTAL: INCONCLUSIVE -- " & mpName(MpPWhole) &
+          " recorded 0 call(s), so there is nothing to divide by"
+    else:
+      s = s & ". WALK TOTAL (the five hops summed, per " & mpName(MpPWhole) &
+          " call) = " & $(walkSum div pw) & "ns"
+      if hopsRan < 5:
+        s = s & " -- but only " & $hopsRan & " of 5 hops ever ran, so this " &
+            "total is a FLOOR, not the walk cost"
 
   # THE INSTRUMENT'S OWN SHARE, measured at enable time, never asserted.
   var calls = 0'i64

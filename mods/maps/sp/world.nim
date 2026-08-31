@@ -328,35 +328,57 @@ static int32_t sp_pos_live(void* player, float* out3) {
   void* bones; void* bt; void* orig;
   unsigned char flag = 0;
   float tmp[3];
-  int64_t tw, tc, tt;
+  int64_t tp, th, tc, tt;
   int32_t rc;
   out3[0] = 0.0f; out3[1] = 0.0f; out3[2] = 0.0f;
-  if (sp_getpos_state != 1) return SP_POS_NOCALL;
-  if (!player)              return SP_POS_NILBONES;
-  /* L4 PHASE 1 of 3 -- the guarded walk. The bracket is a pair of QPC reads
-   * around code that already exists; it opens no guard and closes over none.
-   * Every early return closes it first, so a declined walk is counted with the
-   * same weight as a completed one instead of vanishing from the row. */
-  tw = aowl_mp_now();
+  /* L4 PARENT -- opened FIRST, before any other bracket and before the two
+   * cheap refusals below, and closed on EVERY return path. It is what makes
+   * this level's arithmetic possible: it encloses every child bracket AND the
+   * meter's own QPC pairs, and it has by construction exactly the call count
+   * the children do. MP_E_POS could never do that -- it misses the local
+   * player's posOf entirely, which is why L4 read 104.3% of its parent. */
+  tp = aowl_mp_now();
+  if (sp_getpos_state != 1) { aowl_mp_add(MP_P_WHOLE, tp); return SP_POS_NOCALL; }
+  if (!player)              { aowl_mp_add(MP_P_WHOLE, tp); return SP_POS_NILBONES; }
+  /* L4 PHASES 1-5 -- the guarded walk, ONE BRACKET PER HOP. Each bracket is a
+   * pair of QPC reads around code that already exists; it opens no guard and
+   * closes over none. Every early return closes the parent first, so a declined
+   * walk is counted with the same weight as a completed one instead of
+   * vanishing from the rows.
+   *
+   * Per hop rather than one aggregate because the aggregate measured 138953
+   * ns/call for five hops that a single hop elsewhere prices at 2904 ns. An
+   * average cannot say which hop that is; five rows can. */
+  th = aowl_mp_now();
   bones = sp_rd_ptr(player, SP_PL_BONES);
-  if (!bones)               { aowl_mp_add(MP_P_WALK, tw); return SP_POS_NILBONES; }
+  aowl_mp_add(MP_P_H1, th);
+  if (!bones)               { aowl_mp_add(MP_P_WHOLE, tp); return SP_POS_NILBONES; }
+  th = aowl_mp_now();
   bt = sp_rd_ptr(bones, SP_PB_BODYXF);
-  if (!bt)                  { aowl_mp_add(MP_P_WALK, tw); return SP_POS_NILXFORM; }
+  aowl_mp_add(MP_P_H2, th);
+  if (!bt)                  { aowl_mp_add(MP_P_WHOLE, tp); return SP_POS_NILXFORM; }
   /* Both imitation flags must be clear, or get_position takes a delegate path
    * we have NOT proven throw-free. Declining is an ANSWER, not a silence. */
-  if (!sp_rd_u8(bt, SP_BT_ACCUM, &flag)   || flag) { aowl_mp_add(MP_P_WALK, tw); return SP_POS_IMITATED; }
-  if (!sp_rd_u8(bt, SP_BT_USEIMIT, &flag) || flag) { aowl_mp_add(MP_P_WALK, tw); return SP_POS_IMITATED; }
+  th = aowl_mp_now();
+  rc = (!sp_rd_u8(bt, SP_BT_ACCUM, &flag) || flag);
+  aowl_mp_add(MP_P_H3, th);
+  if (rc)                   { aowl_mp_add(MP_P_WHOLE, tp); return SP_POS_IMITATED; }
+  th = aowl_mp_now();
+  rc = (!sp_rd_u8(bt, SP_BT_USEIMIT, &flag) || flag);
+  aowl_mp_add(MP_P_H4, th);
+  if (rc)                   { aowl_mp_add(MP_P_WHOLE, tp); return SP_POS_IMITATED; }
+  th = aowl_mp_now();
   orig = sp_rd_ptr(bt, SP_BT_ORIGINAL);
-  if (!orig)                { aowl_mp_add(MP_P_WALK, tw); return SP_POS_NILXFORM; }
+  aowl_mp_add(MP_P_H5, th);
+  if (!orig)                { aowl_mp_add(MP_P_WHOLE, tp); return SP_POS_NILXFORM; }
   tmp[0] = 0.0f; tmp[1] = 0.0f; tmp[2] = 0.0f;
-  aowl_mp_add(MP_P_WALK, tw);
-  /* L4 PHASE 2 of 3 -- the ONE direct call, and NOTHING else between the two
+  /* L4 PHASE 6 -- the ONE direct call, and NOTHING else between the two
    * clock reads. This row is the whole question: if it is ~200us the cost is
    * the game function, and no amount of guard-caching touches it. */
   tc = aowl_mp_now();
   ((void* (*)(void*, void*, void*))sp_getpos_fn)((void*)tmp, player, (void*)0);
   aowl_mp_add(MP_P_CALL, tc);
-  /* L4 PHASE 3 of 3 -- copy-out and classification.
+  /* L4 PHASE 7 -- copy-out and classification.
    * readable=1: the buffer is OUR stack, so readability is not in question
    * here -- it was answered by the guarded walk above. The plausibility gates
    * (NaN / out-of-range / exactly-zero) still apply unchanged. */
@@ -364,6 +386,7 @@ static int32_t sp_pos_live(void* player, float* out3) {
   out3[0] = tmp[0]; out3[1] = tmp[1]; out3[2] = tmp[2];
   rc = (int32_t)mm_pos_classify(1, tmp[0], tmp[1], tmp[2]);
   aowl_mp_add(MP_P_TAIL, tt);
+  aowl_mp_add(MP_P_WHOLE, tp);
   return rc;
 }
 

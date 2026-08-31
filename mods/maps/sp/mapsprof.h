@@ -69,30 +69,59 @@
 #define MP_E_ID     15
 #define MP_E_STORE  16
 
-/* L4 -- inside MP_E_POS, summed over entities.
+/* L4 -- inside sp_pos_live, summed over entities.
  *
- * WHY. Measured live (aowlspt-host.log, this build): MP_E_POS is 98.2% of
- * MP_C_ENTS and, converted to a PER-CALL cost -- (us/tick * ticks) / calls --
- * runs 205-215us per call, FLAT across 220 profile lines and 236488 calls. One
- * guarded pointer hop (MP_E_AI, a single sp_rd_ptr) costs 0.5-1.0us on the same
- * clock in the same ticks, so the five guarded hops inside sp_pos_live cannot
- * account for more than ~2% of it. That is an ARITHMETIC INFERENCE from two
- * rows, not a measurement of the inside of posOf, and this level exists to
- * replace it with one:
+ * WHY IT WAS SPLIT PER HOP. The previous L4 measured the walk as ONE row and
+ * that row came back, live in a phase-confirmed raid, at 138953 ns/call against
+ * 661 ns/call for the RVA call it was supposed to indict. It also came back at
+ * ~10x the arithmetic prediction: one guarded hop measured elsewhere in the
+ * same ticks (MP_E_AI, a single sp_rd_ptr) costs 2904 ns/call, so five of them
+ * should be ~14500 ns. "Five hops cost ten times five hops" is not a result, it
+ * is a question, and a single aggregate row cannot answer it. Each hop now has
+ * its own bracket so the report can name WHICH one, instead of averaging the
+ * answer away:
  *
- *   MP_P_WALK  the guarded PlayerBones -> BodyTransform -> Original walk plus
- *              the two imitation-flag reads (5 sp_rdc_readable)
- *   MP_P_CALL  the ONE direct call at the byte-verified static RVA 0x6F32C0
- *   MP_P_TAIL  the 12-byte copy-out and mm_pos_classify
+ *   MP_P_H1  Player+0xB40  -> PlayerBones          (sp_rd_ptr, 8 bytes)
+ *   MP_P_H2  PlayerBones+0x178 -> BifacialTransform(sp_rd_ptr, 8 bytes)
+ *   MP_P_H3  BT+0xA9 _accumulatePositionAndRotation(sp_rd_u8,  1 byte)
+ *   MP_P_H4  BT+0xA8 _useImitation                 (sp_rd_u8,  1 byte)
+ *   MP_P_H5  BT+0x10 Original                      (sp_rd_ptr, 8 bytes)
+ *   MP_P_CALL the ONE direct call at byte-verified static RVA 0x6F32C0
+ *   MP_P_TAIL the 12-byte copy-out and mm_pos_classify
  *
- * Disjoint and exhaustive inside sp_pos_live; the difference against MP_E_POS
- * is the Nim-side case dispatch and is reported as UNEXPLAINED, not hidden. */
-#define MP_P_WALK   17
-#define MP_P_CALL   18
-#define MP_P_TAIL   19
+ * The five hop rows SUM to what MP_P_WALK used to report, so the new numbers
+ * are diffable against the old one rather than replacing it with something
+ * incomparable. Each bracket costs one extra QPC pair; MP_P_WHOLE below
+ * ENCLOSES those pairs, so the meter's own cost stays inside the parent and
+ * cannot push the level above 100%.
+ *
+ * MP_P_WHOLE -- THE FIX FOR THE LEVEL THAT SUMMED TO 104.3%.
+ *
+ * L4's parent used to be MP_E_POS, and MP_E_POS does NOT enclose every call
+ * that opens the child brackets. `collectInner` calls posOf TWICE per tick's
+ * worth of work: once for the LOCAL player (inside the MP_C_LOCAL bracket, at
+ * L2) and once per entity (inside MP_E_POS, at L3). Both reach sp_pos_live and
+ * both fire MP_P_*. So the children counted strictly more calls than the
+ * parent, and their sum exceeded it -- which the reporter correctly refused to
+ * present as a result. That is a WRONG PARENT, not an unclosed bracket.
+ *
+ * MP_P_WHOLE brackets the entire sp_pos_live body, on every return path
+ * including the two that return before any clock is read. It therefore has, by
+ * construction, EXACTLY the call count of each child that ran and encloses all
+ * of them. The reporter additionally asserts that equality out loud, so a
+ * future call site that opens a child outside the whole announces itself
+ * instead of quietly re-creating this bug. */
+#define MP_P_H1     17
+#define MP_P_H2     18
+#define MP_P_H3     19
+#define MP_P_H4     20
+#define MP_P_H5     21
+#define MP_P_CALL   22
+#define MP_P_TAIL   23
+#define MP_P_WHOLE  24   /* the L4 parent -- encloses H1..TAIL, same call count */
 
-#define MP_CTRL     20   /* the positive control */
-#define MP_SLOTS    21
+#define MP_CTRL     25   /* the positive control */
+#define MP_SLOTS    26
 
 #define MP_CTRL_ITERS 512
 #define MP_CAL_ITERS  256
