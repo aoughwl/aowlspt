@@ -443,6 +443,14 @@ var cfgAdsDeferToGame = true
   ## multiplier composes onto the game's real ADS FOV instead of onto the hip
   ## FOV -- which is also the reason `opticFovMulti` never behaved: `base * 1.38`
   ## has nothing to do with a scope's actual magnification.
+var cfgAdsMaxFights = 3
+  ## After this many consecutive ADS-in transitions whose endpoint did NOT
+  ## survive a frame, STOP WRITING THE FIELD OF VIEW WHILE AIMING, entirely,
+  ## for the rest of the run. Rule 6, and the standing judgement that a feature
+  ## which visibly fights the game is worse than one that declines: the player
+  ## sees "adsing gives me a smoothing, then jumps in and out, then finally in
+  ## again", which is what losing a per-frame tug-of-war looks like. Declining
+  ## leaves the hip field of view -- the part that works -- working.
 var cfgAdsSettleEps = 0.05
   ## Degrees. Two consecutive samples of the game's own FOV closer than this
   ## count as "not moving".
@@ -597,6 +605,7 @@ proc loadConfig() =
   cfgAdsDeferToGame = cfgBool("adsDeferToGame", true)
   cfgAdsSettleEps = cfgFloat("adsSettleEps", 0.05)
   cfgAdsObserveCap = cfgFloat("adsObserveCap", 1.5)
+  cfgAdsMaxFights = int(cfgFloat("adsMaxFights", 3.0))
 
   # RENAMED, and the rename IS the fix.
   #
@@ -2089,6 +2098,20 @@ var gAdsPendGameFov = 0.0   ## the game's OWN settled ADS fov, READ FROM THE
 var gAdsPendPath = ""       ## which branch produced it, named in the log line
 var gAdsIns = 0             ## how many aim-ins have been seen AT ALL
 var gAimWasAiming = false
+var gAdsConsecFails = 0     ## consecutive ADS-ins whose endpoint did not survive
+var gAdsNoFight = false     ## we have conceded the field of view while aiming
+var gAdsProbeN = 0          ## samples emitted by the read-only writer probe
+
+# ---- THE READ-ONLY WRITER PROBE.
+#
+# Once `gAdsNoFight` is set this mod writes NOTHING while aiming, which makes
+# the next aim-in a clean experiment: any movement in Camera.fieldOfView during
+# it is somebody else's, and its per-frame cadence says whether that somebody
+# assigns once or drives continuously. HARD-CAPPED at 40 lines for the whole
+# process lifetime, reusing the already-bound, already-prologue-verified
+# Camera::get_fieldOfView -- it adds no new RVA row, which matters while the
+# 128-row startup-snapshot table is known to be near its bound.
+const AdsProbeMax = 40
 var gBaseCam: Il2CppPtr = nil
   ## WHICH camera `gBaseFov` was captured from. The menu camera and the raid
   ## camera are different objects, and `Camera::get_main` answers in both. A
@@ -2855,7 +2878,12 @@ proc applyFov() =
          else:
            "FAIL -- the camera is at neither our endpoint nor the game's " &
            "settled ADS fov; a third writer, or the sight changed mid-aim.")
-      if dEnd <= 0.5: gSmPasses = gSmPasses + 1 else: gSmFails = gSmFails + 1
+      if dEnd <= 0.5:
+        gSmPasses = gSmPasses + 1
+        gAdsConsecFails = 0
+      else:
+        gSmFails = gSmFails + 1
+        gAdsConsecFails = gAdsConsecFails + 1
       gSmVerdict = verdict
       info "FOV: transition ADS-IN #" & $gAdsIns & " " & verdict &
            " -- game's own ADS fov " & $gAdsPendGameFov & " (read while we " &
@@ -2863,6 +2891,41 @@ proc applyFov() =
            ", our endpoint " & $gAdsPendTarget & ", camera ONE FRAME LATER " &
            $live & ", delta-to-endpoint " & $dEnd & ", delta-to-game " &
            $dGame & ", via " & gAdsPendPath
+      if not gAdsNoFight and gAdsConsecFails >= cfgAdsMaxFights:
+        gAdsNoFight = true
+        warn "FOV: CONCEDING the field of view while aiming. " &
+             $gAdsConsecFails & " consecutive ADS-in endpoints failed to " &
+             "survive a single frame, which means something writes " &
+             "Camera.fieldOfView after we do, every frame -- a per-frame " &
+             "tug-of-war this mod cannot win by writing the OUTPUT. What the " &
+             "player sees while we keep trying is the oscillation reported as " &
+             "'jumps in and out, then finally in again'. From now on this mod " &
+             "writes NOTHING while aiming; the HIP field of view is " &
+             "unaffected and still applied. The ADS multipliers " &
+             "(opticFovMulti, nonOpticFovMulti) are INERT until the injection " &
+             "point moves to the game's own input -- see the probe lines that " &
+             "follow, which sample the field while we write nothing."
+
+  # ---- WE HAVE CONCEDED: WRITE NOTHING WHILE AIMING.
+  #
+  # This is also the clean measurement asked for -- "sample the value across
+  # frames while we write nothing at all and show it moving under us". Every
+  # sample below is taken on a frame this mod did not write, so any delta
+  # between consecutive lines is somebody else's write, and the cadence answers
+  # "once, or continuously?" without a detour.
+  if gAdsNoFight and wantAds:
+    if gAdsProbeN < AdsProbeMax and bCamFov.ok:
+      a.reset()
+      let s = callFloat(bCamFov, cam, a)
+      gAdsProbeN = gAdsProbeN + 1
+      info "FOV: writer probe " & $gAdsProbeN & "/" & $AdsProbeMax &
+           " -- aiming, this mod wrote NOTHING this frame; " &
+           "Camera.fieldOfView reads " & $s & " (previous sample " &
+           $gAdsPrev & ", delta " & $fabsf(s - gAdsPrev) & ", dt " & $dt &
+           "). A non-zero delta here is ANOTHER writer, measured, not inferred."
+      gAdsPrev = s
+      gCurFov = s
+    return
 
   # ---- WHO OWNS THE FIELD OF VIEW RIGHT NOW.
   #
@@ -3905,6 +3968,19 @@ proc reportWatch() =
           " gave up. " & gAdsVerdict)
   # Absence of ADS-in lines must mean one thing only, and the log has to say
   # which. A silent instrument is what let the original defect survive.
+  info "    the game's ADS fov is a SUBTRACTION, not a scale -- measured: " &
+       "CameraManager.AimDeltaFov is a LITERAL const 15.0 and OpticsFov a " &
+       "LITERAL const 35.0 (attrs 0x8056, no storage, nothing to write). " &
+       "hip 75.0 - 15.0 = 60.0 against a live-measured settled ADS fov of " &
+       "60.00136. So 'base x nonOpticFovMulti' was the wrong SHAPE of model, " &
+       "which is exactly the player's 'the scale we zoom-in ads fov with is " &
+       "wrong'. Applying the multiplier to the settled value gets the right " &
+       "number; it does not get ownership of the field."
+  if gAdsNoFight:
+    warn "    ADS field of view: CONCEDED after " & $gAdsConsecFails &
+         " lost transitions. Hip FOV still applied; opticFovMulti and " &
+         "nonOpticFovMulti are INERT while aiming. This is a DECLINE, said " &
+         "out loud, not a silent no-op."
   info "    aim-ins seen this run: " & $gAdsIns &
        (if gAdsIns == 0:
           " -- SO THERE IS NOTHING TO REPORT. This is 'the player never " &
