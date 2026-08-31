@@ -69,8 +69,30 @@
 #define MP_E_ID     15
 #define MP_E_STORE  16
 
-#define MP_CTRL     17   /* the positive control */
-#define MP_SLOTS    18
+/* L4 -- inside MP_E_POS, summed over entities.
+ *
+ * WHY. Measured live (aowlspt-host.log, this build): MP_E_POS is 98.2% of
+ * MP_C_ENTS and, converted to a PER-CALL cost -- (us/tick * ticks) / calls --
+ * runs 205-215us per call, FLAT across 220 profile lines and 236488 calls. One
+ * guarded pointer hop (MP_E_AI, a single sp_rd_ptr) costs 0.5-1.0us on the same
+ * clock in the same ticks, so the five guarded hops inside sp_pos_live cannot
+ * account for more than ~2% of it. That is an ARITHMETIC INFERENCE from two
+ * rows, not a measurement of the inside of posOf, and this level exists to
+ * replace it with one:
+ *
+ *   MP_P_WALK  the guarded PlayerBones -> BodyTransform -> Original walk plus
+ *              the two imitation-flag reads (5 sp_rdc_readable)
+ *   MP_P_CALL  the ONE direct call at the byte-verified static RVA 0x6F32C0
+ *   MP_P_TAIL  the 12-byte copy-out and mm_pos_classify
+ *
+ * Disjoint and exhaustive inside sp_pos_live; the difference against MP_E_POS
+ * is the Nim-side case dispatch and is reported as UNEXPLAINED, not hidden. */
+#define MP_P_WALK   17
+#define MP_P_CALL   18
+#define MP_P_TAIL   19
+
+#define MP_CTRL     20   /* the positive control */
+#define MP_SLOTS    21
 
 #define MP_CTRL_ITERS 512
 #define MP_CAL_ITERS  256

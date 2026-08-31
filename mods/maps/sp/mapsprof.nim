@@ -61,9 +61,12 @@ const
   MpECls*    = 14'i32
   MpEId*     = 15'i32
   MpEStore*  = 16'i32
-  MpCtrl*    = 17'i32
+  MpPWalk*   = 17'i32
+  MpPCall*   = 18'i32
+  MpPTail*   = 19'i32
+  MpCtrl*    = 20'i32
 
-const MpNames: array[18, string] = [
+const MpNames: array[21, string] = [
   "WHOLE(onMainTick)",     # 0
   "lockMod",               # 1
   "collect",               # 2
@@ -81,10 +84,13 @@ const MpNames: array[18, string] = [
   "e.classOf(+cacheProbe)",# 14
   "e.idTailOf(cache MISS only)", # 15
   "e.storeEnt",            # 16
-  "CONTROL(512 adds)"]     # 17
+  "p.walk(5 guarded hops)",# 17
+  "p.rvaCall(0x6F32C0)",   # 18
+  "p.tail(copy+classify)", # 19
+  "CONTROL(512 adds)"]     # 20
 
 proc mpName(i: int32): string =
-  if i >= 0'i32 and i < 18'i32: return MpNames[int(i)]
+  if i >= 0'i32 and i < 21'i32: return MpNames[int(i)]
   return "slot[" & $int(i) & ": UNNAMED]"
 
 proc mpUsPer(nsTotal, ticks: int64): string =
@@ -175,6 +181,25 @@ proc mapsProfLine*(): string =
   s = s & mpLevel(MpLock, MpArt, MpWhole, "L1 tick phases", ticks)
   s = s & "." & mpLevel(MpCPre, MpCEnts, MpCollect, "L2 collect phases", ticks)
   s = s & "." & mpLevel(MpEFetch, MpEStore, MpCEnts, "L3 per-entity phases", ticks)
+  s = s & "." & mpLevel(MpPWalk, MpPTail, MpEPos, "L4 inside posOf", ticks)
+  # THE ONE NUMBER THIS LEVEL EXISTS FOR: a per-CALL cost, not a per-tick share.
+  # us/tick is not comparable across runs -- it divides by ticks that include
+  # MENU ticks, and the collect-to-tick ratio differs between runs. Two rows
+  # printed per-call, on the same clock, in the same ticks, so "the position
+  # read is expensive" can be checked against "a guarded hop is cheap" without
+  # anyone having to redo this arithmetic from a log.
+  let posCalls = mpCalls(MpEPos)
+  let aiCalls = mpCalls(MpEAi)
+  if posCalls > 0 and aiCalls > 0:
+    s = s & ". PER-CALL (ns/call, the tick-count-independent figure): " &
+        mpName(MpEPos) & "=" & $(mpNs(MpEPos) div posCalls) & "ns over " &
+        $posCalls & " call(s); " & mpName(MpPCall) & "=" &
+        (if mpCalls(MpPCall) > 0: $(mpNs(MpPCall) div mpCalls(MpPCall)) & "ns"
+         else: "NEVER CALLED") & "; " & mpName(MpPWalk) & "=" &
+        (if mpCalls(MpPWalk) > 0: $(mpNs(MpPWalk) div mpCalls(MpPWalk)) & "ns"
+         else: "NEVER CALLED") & "; " & mpName(MpEAi) & "=" &
+        $(mpNs(MpEAi) div aiCalls) & "ns (ONE guarded hop -- the reference " &
+        "cost of the cached readability guard, for scale)"
 
   # THE INSTRUMENT'S OWN SHARE, measured at enable time, never asserted.
   var calls = 0'i64
