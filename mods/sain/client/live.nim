@@ -259,6 +259,17 @@ static uint8_t sain_byte_at(void* p, uint64_t off) {
 static void* sain_ptr_add(void* p, int64_t d) {
     return (void*)((uintptr_t)p + (uintptr_t)d);
 }
+/* The two primitives the FIELD path reads through. Neither validates anything:
+ * `sain_is_readable` is called on `(base + off)` for the exact width first, at
+ * every hop, by the Nim caller. They are separate from `sain_byte_at` only
+ * because a field read is a different operation from a prologue compare and
+ * conflating them would let a prologue check silently accept a data page. */
+static void* sain_fld_ptr(void* p, int64_t off) {
+    return *(void* const*)((uintptr_t)p + (uintptr_t)off);
+}
+static int32_t sain_fld_u8(void* p, int64_t off) {
+    return (int32_t)(*(const uint8_t*)((uintptr_t)p + (uintptr_t)off));
+}
 static int32_t sain_rva_exec_readable(void* p, int32_t size) {
     MEMORY_BASIC_INFORMATION mbi;
     if (!p || size <= 0) return 0;
@@ -319,8 +330,36 @@ proc sainPtrAdd(p: Il2CppPtr; d: int64): Il2CppPtr {.
 proc sainExecReadable(p: Il2CppPtr; size: int32): int32 {.
   importc: "sain_rva_exec_readable", nodecl.}
 
+proc sainFldPtr(p: Il2CppPtr; off: int64): Il2CppPtr {.
+  importc: "sain_fld_ptr", nodecl.}
+proc sainFldU8(p: Il2CppPtr; off: int64): int32 {.
+  importc: "sain_fld_u8", nodecl.}
+
 proc sainReadable(p: Il2CppPtr; size: int): bool =
   result = p != nil and sainIsReadable(p, int32(size)) != 0'i32
+
+const UnityCachedPtrOff = 0x10
+  ## `UnityEngine.Object.m_CachedPtr`, the pointer to the native half.
+  ##
+  ## NOT measured here and deliberately not re-derived: this is the same
+  ## constant `host/Aowlspt.Host.Il2Cpp/aowlscene.nim` and `inspect.nim` already
+  ## use across the whole inspector, on this same build, and the host exports it
+  ## as `aowl_nav_off_cachedptr`. It is BORROWED, and saying so is the point.
+  ##
+  ## Why it matters here: **readability is not liveness on this build.** A
+  ## destroyed `MonoBehaviour` keeps a perfectly readable managed shell whose
+  ## `m_CachedPtr` is zero, and any engine-side call on it faults inside Unity
+  ## rather than in our code. So a receiver that is about to feed a bound
+  ## INTERNAL CALL is checked for a non-null native half first; a receiver we
+  ## only read a managed field off does not need it, and rows say which they are.
+
+proc sainUnityAlive(p: Il2CppPtr): bool =
+  ## True when `p` is readable through `m_CachedPtr` AND that pointer is
+  ## non-null. Three outcomes collapse to two here on purpose: unreadable and
+  ## dead are both "do not proceed", and the caller states which it saw.
+  if not sainReadable(p, UnityCachedPtrOff + 8):
+    return false
+  result = sainFldPtr(p, int64(UnityCachedPtrOff)) != nil
 
 var gGwFn: Il2CppPtr = cast[Il2CppPtr](0)
 var gGwArmedFn: Il2CppPtr = cast[Il2CppPtr](0)
@@ -537,12 +576,25 @@ proc reflectionAllowed*(): bool = gAllowReflection
 # whole change removes.
 var gRvaTable = false
 var gRvaRows: seq[SainRvaRow] = @[]
+var gRvaFieldRows: seq[SainRvaFieldRow] = @[]
 var gRvaRefusals: seq[SainRvaRefusal] = @[]
 var gRvaLoaded = false
 var gRvaVerified = 0
+var gRvaFieldBound = 0
 var gRvaRejected = 0
 var gRvaRefused = 0
 var gRvaFaults = 0
+var gRvaFieldFaults = 0
+
+const FieldFaultCap = 16
+  ## Self-disable for the FIELD path, counted separately from `RvaFaultCap`.
+  ##
+  ## Separate because the two failures mean different things. A prologue
+  ## mismatch is "the image moved"; a field hop that will not validate is "this
+  ## receiver was not what the chain promised", which in a raid can happen a few
+  ## times legitimately (an object collected between two hops) and then must
+  ## stop happening. Sixteen is a budget, not a threshold: past it the field
+  ## path turns itself off for the session rather than re-guessing every frame.
 
 const RvaFaultCap = 8
   ## Self-disable. A bind that cannot verify its prologue is not retried
@@ -560,6 +612,7 @@ proc rvaLoad() =
     return
   gRvaLoaded = true
   gRvaRows = sainRvaRows()
+  gRvaFieldRows = sainRvaFieldRows()
   gRvaRefusals = sainRvaRefusals()
 
 const ReflectionRefusal* =
@@ -766,6 +819,20 @@ type
     ## True once the table has been consulted for `rvaKey`, whichever way it
     ## answered. Separate from `tried`, which means the by-name path ran.
     rvaTried*: bool
+    ## --- THE FIELD PATH. `fldOk` is a THIRD callable state, alongside `b.ok`
+    ## (a bound RVA call) and `m != nil` (a reflective call). It means: there is
+    ## no function to call at all; the value is a field at `fldOff` on the
+    ## receiver, and reading it is the whole operation.
+    ##
+    ## It is kept as its own state rather than folded into `b` because a
+    ## `Binding` is a call and this is not one. Nothing here can be invoked,
+    ## which is why "no drive call is expressible through the field path" is a
+    ## structural fact and not a review promise.
+    fldOk*: bool
+    fldOff*: int
+    fldKind*: FastKind
+    fldNeedsPlayer*: bool
+    fldUnityObj*: bool   ## check m_CachedPtr on the receiver before reading
 
 proc emptyBinding(): Binding =
   Binding(ok: false, why: "", target: "", fn: cast[Il2CppPtr](0),
@@ -778,7 +845,9 @@ proc lazy*(member: string; argc: int32 = 0'i32): LazyCall =
            ret: fkNone, cls: cast[Il2CppClass](0), m: cast[Il2CppMethod](0),
            b: emptyBinding(), shape: csNone, fills: @[],
            gated: false, shapeWanted: dsNoArgs, gateRefused: false,
-           tried: false, why: "", rvaKey: "", rvaTried: false)
+           tried: false, why: "", rvaKey: "", rvaTried: false,
+           fldOk: false, fldOff: 0, fldKind: fkNone, fldNeedsPlayer: false,
+           fldUnityObj: false)
 
 proc keyed*(l: LazyCall; key: string): LazyCall =
   ## Point a member at its row -- or its refusal -- in `client/rvatable.nim`.
@@ -1264,6 +1333,9 @@ proc resolveFromRva(l: var LazyCall) =
   l.shape = csNone
   l.fills = @[]
   l.gateRefused = false
+  l.fldOk = false
+  l.fldOff = 0
+  l.fldKind = fkNone
   rvaLoad()
 
   # --- a stated refusal comes first, so a key that is BOTH (which would be a
@@ -1277,6 +1349,52 @@ proc resolveFromRva(l: var LazyCall) =
             ". Measured offline against " & SainRvaScope &
             ". NOT retried by name: the by-name lookup is the fatal path this " &
             "table exists to remove."
+    return
+
+  # --- THE FIELD PATH, consulted before the call rows.
+  #
+  # A field row has no function, so there is no prologue to compare and the
+  # 16-byte verify has nothing to verify. Saying that plainly matters more than
+  # inventing a substitute: what a field row rests on instead is (a) an offset
+  # taken verbatim from `Il2CppMetadataRegistration.fieldOffsets`, (b) a
+  # `VirtualQuery` for the exact width at `receiver + off` on EVERY read, at
+  # EVERY hop, and (c) the receiver argument written into `row.why`, which is
+  # the only thing standing between a correct read and a foreign one. There is
+  # no fourth thing and this comment does not pretend there is.
+  #
+  # It is also, structurally, read-only: nothing below produces a `Binding`, so
+  # no call site can invoke a field row even by mistake.
+  var frow = emptyRvaFieldRow()
+  if findRvaFieldRow(gRvaFieldRows, l.rvaKey, frow):
+    if frow.off <= 0 or frow.off > 0x10000:
+      gRvaRejected = gRvaRejected + 1
+      l.gateRefused = true
+      l.why = frow.label & ": field offset 0x" & rvaHexs(frow.off) &
+              " is outside the sane range for an instance field (0x1..0x10000)" &
+              ". REFUSED; an offset of 0 would read the object header and a " &
+              "huge one would read off the end of the object."
+      return
+    l.fldOk = true
+    l.fldOff = frow.off
+    l.fldKind = frow.kind
+    l.fldNeedsPlayer = frow.needsPlayer
+    l.fldUnityObj = frow.unityObj
+    gRvaFieldBound = gRvaFieldBound + 1
+    l.why = frow.label & ": FIELD READ, offset from fieldOffsets in " &
+            SainRvaScope & ". There is NO prologue to verify because there is " &
+            "no function; the receiver is bounds-checked with VirtualQuery for " &
+            "the exact width on every single read. RECEIVER MUST BE a " &
+            frow.recv & " -- a field read off the wrong object does not fault, " &
+            "it answers. " & frow.why &
+            (if frow.needsPlayer:
+               " Marked needsPlayer: these are EFT.Player's own offsets and " &
+               "are meaningless on an ObservedPlayerView."
+             else: "") &
+            (if frow.unityObj:
+               " Receiver is a UnityEngine.Object: m_CachedPtr is checked " &
+               "non-null before the chain continues, because readability is " &
+               "NOT liveness on this build."
+             else: "")
     return
 
   var row = emptyRvaRow()
@@ -1397,7 +1515,7 @@ proc ensure*(l: var LazyCall; obj: Il2CppPtr): bool =
       return false
     if not l.rvaTried:
       resolveFromRva(l)
-    return l.b.ok
+    return l.b.ok or l.fldOk
   # AND THE SAME REFUSAL, at the root of the whole lazy table.
   #
   # This is the widest consequence of fact #35 and it is worth stating plainly:
@@ -1457,11 +1575,64 @@ proc reflect(m: Il2CppMethod; obj: Il2CppPtr; argv: Il2CppPtr): Il2CppPtr =
     return cast[Il2CppPtr](0)
   result = r
 
+proc fldFault(l: var LazyCall; what: string) =
+  ## One field hop refused. Counted against a session budget, and past it the
+  ## whole table turns itself off rather than answering wrongly every frame.
+  gRvaFieldFaults = gRvaFieldFaults + 1
+  if gRvaFieldFaults == FieldFaultCap:
+    gRvaTable = false
+    warn "sain: the FIELD path has SELF-DISABLED after " & $gRvaFieldFaults &
+         " refused hops (last: " & l.rvaKey & " -- " & what & "). Every offset " &
+         "was derived against " & SainRvaScope & ". A hop that will not " &
+         "validate means the receiver was not the type the chain promised, " &
+         "and a field read off the wrong object ANSWERS rather than faults, " &
+         "so nothing further will be read."
+  elif gRvaFieldFaults < FieldFaultCap:
+    debug "sain: field hop refused for " & l.rvaKey & " -- " & what
+
+proc fldRecvOk(l: var LazyCall; obj: Il2CppPtr; width: int): bool =
+  ## The whole receiver gate for one field read, in the order that matters.
+  ##
+  ## `obj + off` is bounds-checked for the EXACT width being read rather than
+  ## for a nominal 8: reading a bool at 0xD9 touches one byte, and asking for
+  ## eight there could refuse a legitimate read at the tail of a page.
+  result = false
+  if obj == nil:
+    return
+  if not sainReadable(obj, 8):
+    fldFault(l, "receiver is not readable")
+    return
+  if l.fldUnityObj and not sainUnityAlive(obj):
+    # NOT a mere nil check. The managed shell of a destroyed MonoBehaviour
+    # reads back perfectly; its native half is what is gone.
+    fldFault(l, "receiver's native half (m_CachedPtr) is null -- destroyed")
+    return
+  if not sainReadable(sainPtrAdd(obj, int64(l.fldOff)), width):
+    fldFault(l, "receiver+0x" & rvaHexs(l.fldOff) & " is not readable for " &
+                $width & " byte(s)")
+    return
+  result = true
+
 proc callObj*(l: var LazyCall; obj: Il2CppPtr): Il2CppPtr =
   ## A member returning a reference: the next step along the graph.
   result = cast[Il2CppPtr](0)
   if not ensure(l, obj):
     return
+  # --- the field path. Read, validate what came back, and only then hand it on
+  # -- the value is about to become the RECEIVER of the next hop, so returning
+  # an unreadable pointer here would just move the fault one line down.
+  if l.fldOk:
+    if l.fldKind != fkPtr:
+      return
+    if not fldRecvOk(l, obj, 8):
+      return
+    let v = sainFldPtr(obj, int64(l.fldOff))
+    if v == nil:
+      return
+    if not sainReadable(v, 8):
+      fldFault(l, "the value read back is not a readable object")
+      return
+    return v
   if l.b.ok and l.b.ret == fkPtr and l.b.argc == 0'i32:
     var a = noArgs()
     return callPtr(l.b, obj, a)
@@ -1471,6 +1642,15 @@ proc callBoolOn*(l: var LazyCall; obj: Il2CppPtr; default: bool): bool =
   result = default
   if not ensure(l, obj):
     return
+  if l.fldOk:
+    # A managed `bool` is ONE byte. Anything non-zero is true, which is what
+    # IL2CPP itself emits; there is no need to insist on exactly 1 and doing so
+    # would turn a legitimate `true` into the default.
+    if l.fldKind != fkBool:
+      return
+    if not fldRecvOk(l, obj, 1):
+      return
+    return sainFldU8(obj, int64(l.fldOff)) != 0'i32
   if l.b.ok and l.b.argc == 0'i32:
     var a = noArgs()
     return callBool(l.b, obj, a)
@@ -1510,6 +1690,12 @@ proc callVoidOn*(l: var LazyCall; obj: Il2CppPtr): bool =
   ## Returns whether the call was made, which is what the driver counts.
   if not ensure(l, obj):
     return false
+  # A field row is a READ. There is no function behind it, so there is nothing
+  # to invoke -- and reporting `true` here would tell the driver a drive call
+  # happened when nothing did. This is the structural reason no drive call can
+  # be wired through the field table even by accident.
+  if l.fldOk:
+    return false
   if l.b.ok and l.b.argc == 0'i32:
     var a = noArgs()
     callVoid(l.b, obj, a)
@@ -1522,6 +1708,8 @@ proc callBoolArg*(l: var LazyCall; obj: Il2CppPtr; v: bool): bool =
   ## path is best at: one general-purpose register, no allocation anywhere,
   ## measured at 6-10 ns.
   if not ensure(l, obj):
+    return false
+  if l.fldOk:                       # see callVoidOn: a field row is a read
     return false
   if l.b.ok and l.b.argc == 1'i32:
     var a = noArgs()
@@ -2055,7 +2243,13 @@ proc reportOne(name: string; l: LazyCall) =
   ## binding is the one kind here that rests on an asserted calling convention
   ## rather than on the runtime'''s own answer, so anyone reading a log after a
   ## client update needs to be able to see at a glance which calls those are.
-  if l.b.ok and l.shape == csStructReturn:
+  if l.fldOk:
+    # Named separately from `fast` for the same reason `shaped` is: a field row
+    # rests on an offset and a receiver argument rather than on a verified
+    # prologue, and a reader after a client update has to be able to see which
+    # bindings those are without leaving the log.
+    info "sain:   field   " & name & " -- " & l.why
+  elif l.b.ok and l.shape == csStructReturn:
     info "sain:   shaped  " & name & " -- " & l.why
   elif l.b.ok and l.shape == csVectorArg:
     info "sain:   shaped  " & name & " -- " & l.why
@@ -2100,33 +2294,56 @@ proc rvaReport*() =
   if not gRvaTable:
     warn "sain: the RVA table is OFF (sainRvaTable false). Every member is " &
          "refused at `ensure` and the mod reads nothing. " & $gRvaRows.len &
-         " row(s) and " & $gRvaRefusals.len & " stated refusal(s) are " &
-         "loaded but unused."
+         " call row(s), " & $gRvaFieldRows.len & " field row(s) and " &
+         $gRvaRefusals.len & " stated refusal(s) are loaded but unused."
     return
   info "sain: RVA table -- " & $gRvaRows.len & " row(s) bindable by static " &
-       "RVA, " & $gRvaRefusals.len & " member(s) REFUSED. Derived against " &
+       "RVA, " & $gRvaFieldRows.len & " row(s) bindable by FIELD READ, " &
+       $gRvaRefusals.len & " member(s) REFUSED. Derived against " &
        SainRvaScope & "."
+  var f = 0
+  while f < gRvaFieldRows.len:
+    let fr = gRvaFieldRows[f]
+    info "sain:   field   " & fr.key & " (" & fr.label & ") -- receiver must " &
+         "be a " & fr.recv & ". " & fr.why
+    inc f
   var i = 0
   while i < gRvaRefusals.len:
     let r = gRvaRefusals[i]
     warn "sain:   REFUSED " & r.key & " (" & r.symbol & ") -- " &
          whyText(r.why) & ": " & r.detail
     inc i
-  info "sain: RVA table scope statement -- of the " & $gRvaRows.len &
-       " members THIS TABLE COVERS, zero are resolved by name; each is a " &
-       "static RVA whose 16 prologue bytes are compared before it is called. " &
-       "The other " & $gRvaRefusals.len & " members SAIN asks for are refused " &
-       "by name above and are NOT retried reflectively. This does NOT make " &
-       "SAIN's combat brain work: the movement call, the sprint call, the " &
-       "stop call, the shoot call and the whole alive-players list are all in " &
-       "the refused set, so no bot is driven by this mod. What it does is " &
-       "replace a silent client kill with a named refusal."
+  info "sain: RVA table scope statement -- of the " &
+       $(gRvaRows.len + gRvaFieldRows.len) &
+       " members THIS TABLE COVERS, zero are resolved by name: " &
+       $gRvaRows.len & " are static RVAs whose 16 prologue bytes are compared " &
+       "before they are called, and " & $gRvaFieldRows.len & " are FIELD " &
+       "READS at offsets from fieldOffsets, which have no prologue to compare " &
+       "and rest instead on a VirtualQuery per hop and on the receiver " &
+       "argument printed above. The other " & $gRvaRefusals.len & " members " &
+       "SAIN asks for are refused by name above and are NOT retried " &
+       "reflectively. This does NOT make SAIN's combat brain work: the " &
+       "movement call, the sprint call, the stop call, the shoot call and the " &
+       "whole alive-players list are all in the refused set, so no bot is " &
+       "driven by this mod. EVERY FIELD ROW IS A READ -- the field mechanism " &
+       "has no invoke path at all, so nothing added here can drive a bot. " &
+       "What the field rows buy is that stamina, suppression, the goal enemy, " &
+       "weapon readiness, sprint state and the three medical components are " &
+       "READABLE for the first time, which also makes the already-bound " &
+       "memUnderFire, surgHave and stNormal rows reachable at last."
 
 proc rvaTally*(): (int, int, int, int) =
   ## (rows, refusals, verified, rejected) -- numbers for a self-test to assert
   ## on, so a refusal cannot degrade into a silent zero unnoticed.
   rvaLoad()
   result = (gRvaRows.len, gRvaRefusals.len, gRvaVerified, gRvaRejected)
+
+proc rvaFieldTally*(): (int, int, int) =
+  ## (field rows, field rows bound, field hops refused). A separate tuple
+  ## rather than a wider one, so an existing assertion on `rvaTally` keeps
+  ## meaning exactly what it meant.
+  rvaLoad()
+  result = (gRvaFieldRows.len, gRvaFieldBound, gRvaFieldFaults)
 
 proc report*() =
   ## Every binding's own account of itself, once.

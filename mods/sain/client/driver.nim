@@ -658,9 +658,12 @@ proc updatePlayerPosition(dt: float) =
     return
   gPlayerPrev = gPlayerPosition
   gPlayerPosition = readVec(gB.pPosition, p)
-  let mc = callObj(gB.pMovement, p)
-  if mc != nil:
-    gPlayerSprint = callBoolOn(gB.mcSprint, mc, false)
+  # The receiver for `mcSprint` is the PhysicalBase, not the MovementContext --
+  # see the same change in `bridge.readSelf`. The key kept its name; the object
+  # its offset is measured against did not.
+  let ph = callObj(gB.pPhysical, p)
+  if ph != nil:
+    gPlayerSprint = callBoolOn(gB.mcSprint, ph, false)
   # The sound the human just made, derived rather than received. One
   # `motionSound` for the raid; every bot then asks `listen` whether it heard
   # it, which is arithmetic on the stack.

@@ -513,6 +513,232 @@ proc readStamina(l: BotLive): float =
     return
   result = clampf(callFloatOn(gB.stNormal, st, 1.0), 0.0, 1.0)
 
+# ---------------------------------------------------------------------------
+# The per-sensor verdict
+# ---------------------------------------------------------------------------
+#
+# CLAUDE.md 9b, applied to this change specifically. `report()` and `rvaReport()`
+# both say what BOUND. Neither can say whether anything was READ, and "the row
+# bound" is precisely the self-comparison that rule forbids: it asserts our own
+# write. So this walks each chain against a live bot and states, per sensor,
+# what came back.
+#
+# THREE outcomes, never two:
+#
+#   PASS          a value arrived and is plausible for its type -- a non-null
+#                 object, a stamina fraction inside [0,1].
+#   FAIL hop N    the chain broke, and WHICH hop broke is named. A break at
+#                 hop 1 is a receiver problem; at the last hop it is an offset
+#                 problem. Collapsing them would lose the only diagnostic here.
+#   INCONCLUSIVE  nothing was looked at -- the table is off, there is no bot,
+#                 or the receiver could not be confirmed. "I could not look" is
+#                 NOT a pass.
+#
+# What would make this FAIL: any hop returning null or refusing its guard. What
+# would make it INCONCLUSIVE: no live bot. It runs ONCE per session, off the
+# per-frame path, and allocates nothing managed.
+
+var gVerdictsDone = false
+
+proc verdict(sensor, outcome, detail: string) =
+  if outcome == "PASS":
+    info "sain: SENSOR PASS         " & sensor & " -- " & detail
+  elif outcome == "INCONCLUSIVE":
+    warn "sain: SENSOR INCONCLUSIVE " & sensor & " -- " & detail
+  else:
+    warn "sain: SENSOR FAIL         " & sensor & " -- " & detail
+
+proc sensorVerdicts*(l: BotLive) =
+  ## Run the newly-wired chains against one live bot and report each one.
+  if gVerdictsDone:
+    return
+  if not rvaTableOn():
+    gVerdictsDone = true
+    warn "sain: SENSOR verdicts INCONCLUSIVE for every sensor -- sainRvaTable " &
+         "is OFF (its default), so no chain was walked. This is not a pass."
+    return
+  if not l.ok or l.player == nil:
+    return                      # no bot yet; try again next tick, stay silent
+  gVerdictsDone = true
+  info "sain: per-sensor verdicts, one live bot, walked once. PASS means a " &
+       "value came back and is plausible FOR ITS TYPE -- it does not mean the " &
+       "value is correct, which nothing here can establish."
+
+  # --- pPhysical -> phStamina -> stNormal. Three hops, and the verdict names
+  # the one that broke.
+  let ph = callObj(gB.pPhysical, l.player)
+  if ph == nil:
+    verdict("pPhysical", "FAIL",
+            "hop 1 of 3 (EFT.Player.Physical@0x9D8) returned null or refused " &
+            "its guard. Either the receiver is not an EFT.Player, or the " &
+            "offset is stale for the installed GameAssembly.dll.")
+    verdict("phStamina", "INCONCLUSIVE", "not reached: pPhysical failed at hop 1")
+    verdict("mcSprint", "INCONCLUSIVE", "not reached: pPhysical failed at hop 1")
+  else:
+    verdict("pPhysical", "PASS",
+            "hop 1 of 3 returned a readable PhysicalBase. This member was " &
+            "ABSENT AS A METHOD on this build and is now read as a field.")
+    let st = callObj(gB.phStamina, ph)
+    if st == nil:
+      verdict("phStamina", "FAIL",
+              "hop 2 of 3 (PhysicalBase.Stamina@0x68) returned null off a " &
+              "PhysicalBase that hop 1 produced, so the receiver is right and " &
+              "the OFFSET is the suspect.")
+    else:
+      let v = callFloatOn(gB.stNormal, st, -1.0)
+      if v < 0.0 or v > 1.0:
+        verdict("phStamina", "FAIL",
+                "hop 3 of 3: the bound Stamina::get_NormalValue @0x1CB0720 " &
+                "answered " & $v & ", which is outside [0,1] and is therefore " &
+                "not a stamina fraction. Hops 1 and 2 succeeded, so this is " &
+                "the CALL, not the walk -- most likely the receiver at 0x68 " &
+                "is a sibling (HandsStamina@0x70, Oxygen@0x78) rather than " &
+                "Stamina, which would read plausibly and answer wrongly.")
+      else:
+        verdict("phStamina", "PASS",
+                "stamina read END TO END for the first time: normalised " &
+                "value " & $v & ", inside [0,1]. Three hops, two of them " &
+                "fields that were refusals until now.")
+    # `mcSprint` reads off the SAME PhysicalBase, so a receiver failure here
+    # cannot be confused with an offset failure.
+    let sp = callBoolOn(gB.mcSprint, ph, false)
+    let sp2 = callBoolOn(gB.mcSprint, ph, true)
+    if sp != sp2:
+      verdict("mcSprint", "FAIL",
+              "PhysicalBase._sprinting@0xD9 answered with the CALLER'S " &
+              "DEFAULT both times (false then true), which means the read was " &
+              "refused at its guard and no byte was ever examined. A bool " &
+              "sensor that returns the default is indistinguishable from a " &
+              "bot that is not sprinting -- asking twice with opposite " &
+              "defaults is what tells them apart.")
+    else:
+      verdict("mcSprint", "PASS",
+              "PhysicalBase._sprinting@0xD9 read a real byte: " & $sp &
+              ", identical under both defaults, so it is the object's value " &
+              "and not ours.")
+
+  if l.owner == nil:
+    verdict("boMemory", "INCONCLUSIVE", "no BotOwner on this bot this tick")
+    verdict("memUnderFire", "INCONCLUSIVE", "not reached: no BotOwner")
+    verdict("memGoalEnemy", "INCONCLUSIVE", "not reached: no BotOwner")
+    verdict("wmReady", "INCONCLUSIVE", "not reached: no BotOwner")
+    verdict("medFirstAid", "INCONCLUSIVE", "not reached: no BotOwner")
+    verdict("medStims", "INCONCLUSIVE", "not reached: no BotOwner")
+    verdict("medSurgery", "INCONCLUSIVE", "not reached: no BotOwner")
+    return
+
+  # --- boMemory -> { memUnderFire (a bound RVA call), memGoalEnemy }
+  let mem = callObj(gB.boMemory, l.owner)
+  if mem == nil:
+    verdict("boMemory", "FAIL",
+            "hop 1 (EFT.BotOwner.Memory@0x60) returned null or refused. The " &
+            "NAME get_Memory was refused as a profiler counter; this is the " &
+            "field route and it did not answer either.")
+    verdict("memUnderFire", "INCONCLUSIVE", "not reached: boMemory failed")
+    verdict("memGoalEnemy", "INCONCLUSIVE", "not reached: boMemory failed")
+  else:
+    verdict("boMemory", "PASS", "hop 1 returned a readable BotMemory.")
+    let uf = callBoolOn(gB.memUnderFire, mem, false)
+    let uf2 = callBoolOn(gB.memUnderFire, mem, true)
+    if uf != uf2:
+      verdict("memUnderFire", "FAIL",
+              "the ALREADY-BOUND BotMemory::get_IsUnderFire @0x24DEEC0 " &
+              "returned the caller's default under both defaults, so it was " &
+              "never called. The row has been bound and unreachable; this " &
+              "says it is still unreachable.")
+    else:
+      verdict("memUnderFire", "PASS",
+              "a row that has been BOUND AND UNREACHABLE since the table " &
+              "existed now has a receiver: IsUnderFire = " & $uf &
+              ", stable under both defaults.")
+    let goal = callObj(gB.memGoalEnemy, mem)
+    if goal == nil:
+      # Genuinely ambiguous, and saying so is the whole point: a bot with no
+      # enemy has a null `_goalEnemy` and that is CORRECT.
+      verdict("memGoalEnemy", "INCONCLUSIVE",
+              "BotMemory._goalEnemy@0x60 read null. A bot with no current " &
+              "enemy has a null goal enemy, so this is INDISTINGUISHABLE from " &
+              "a working read on a peaceful bot and is NOT reported as a " &
+              "failure. Re-run it on a bot in contact to settle it.")
+    else:
+      verdict("memGoalEnemy", "PASS",
+              "BotMemory._goalEnemy@0x60 returned a readable EnemyInfo, which " &
+              "is the receiver the bound enPerson/enPosition rows want.")
+
+  # --- boWeapon (bound RVA) -> wmReady (field)
+  let wm = callObj(gB.boWeapon, l.owner)
+  if wm == nil:
+    verdict("wmReady", "INCONCLUSIVE",
+            "not reached: the bound BotOwner::get_WeaponManager @0x80F040 " &
+            "returned null, so no receiver arrived.")
+  else:
+    let r1 = callBoolOn(gB.wmReady, wm, false)
+    let r2 = callBoolOn(gB.wmReady, wm, true)
+    if r1 != r2:
+      verdict("wmReady", "FAIL",
+              "BotWeaponManager.<IsReady>@0x80 returned the caller's default " &
+              "under both defaults -- the read was refused at its guard.")
+    else:
+      verdict("wmReady", "PASS",
+              "BotWeaponManager.<IsReady>@0x80 read a real byte: " & $r1 &
+              ". Replaces the AMBIGUOUS get_IsReady with no name to disambiguate.")
+
+  # --- boMedecine (bound, UNIQUE RVA) -> the three medical components
+  let med = callObj(gB.boMedecine, l.owner)
+  if med == nil:
+    verdict("medFirstAid", "INCONCLUSIVE", "not reached: get_Medecine null")
+    verdict("medStims", "INCONCLUSIVE", "not reached: get_Medecine null")
+    verdict("medSurgery", "INCONCLUSIVE", "not reached: get_Medecine null")
+  else:
+    let fa = callObj(gB.medFirstAid, med)
+    if fa == nil:
+      verdict("medFirstAid", "FAIL",
+              "BotMedecine.FirstAid@0x18 read null off a BotMedecine the " &
+              "UNIQUE get_Medecine produced -- receiver right, offset suspect.")
+    else:
+      verdict("medFirstAid", "PASS",
+              "BotMedecine.FirstAid@0x18 returned a readable BotFirstAid; " &
+              "canHeal = " & $callBoolOn(gB.faHave, fa, false))
+    let stim = callObj(gB.medStims, med)
+    if stim == nil:
+      verdict("medStims", "FAIL",
+              "BotMedecine.Stimulators@0x20 read null; receiver right, " &
+              "offset suspect.")
+    else:
+      verdict("medStims", "PASS",
+              "BotMedecine.Stimulators@0x20 returned a readable " &
+              "BotStimulators. NOTE: canUseStims stays FALSE regardless -- " &
+              "stimHave is still refused because whether BotStimulators " &
+              "derives from BotAbstractMedsToPart is UNMEASURED. Reaching the " &
+              "component is not reading it.")
+    let surg = callObj(gB.medSurgery, med)
+    if surg == nil:
+      verdict("medSurgery", "FAIL",
+              "BotMedecine.SurgicalKit@0x28 read null; receiver right, " &
+              "offset suspect.")
+    else:
+      verdict("medSurgery", "PASS",
+              "BotMedecine.SurgicalKit@0x28 returned a readable " &
+              "BotSurgicalKit, which is the receiver the bound " &
+              "BotSurgicalKit::get_HaveWork @0x1A24F20 wants; canDoSurgery = " &
+              $callBoolOn(gB.surgHave, surg, false))
+
+  # --- and the ones that stayed refused, said out loud here too, so a reader
+  # of the verdict block is not left to infer their absence.
+  verdict("wGrenades", "INCONCLUSIVE",
+          "REFUSED BY DESIGN, on receiver grounds: the field exists at 0x58 " &
+          "on BotWeaponManager, but `grenadeList` passes the GAMEWORLD. A " &
+          "foreign field read answers rather than faults, so it is not taken.")
+  verdict("boAiming", "INCONCLUSIVE",
+          "REFUSED BY DESIGN: BotOwner.<AimingManager>@0x290 is readable, but " &
+          "its only consumer matches the address against a hook on " &
+          "EFT.BotAimingData::get_IsReady, a class nothing in the image " &
+          "returns. Binding it would report a pass for a dead sensor.")
+  verdict("hcBodyPart", "INCONCLUSIVE",
+          "STILL REFUSED: GetBodyPartHealth is arity 2 and returns a " &
+          "ValueStruct by hidden sret pointer. The table expresses neither " &
+          "shape, so this is a call-site change, not a table change.")
+
 proc readSelf*(b: BotHandle; l: BotLive): SelfView =
   ## One pass of reads into a plain struct.
   ##
@@ -534,6 +760,11 @@ proc readSelf*(b: BotHandle; l: BotLive): SelfView =
   if not l.ok:
     return
 
+  # Once per session, on the first bot that is actually live -- not at load,
+  # because at load there is no receiver and every verdict would be
+  # INCONCLUSIVE, which is a report that cannot fail.
+  sensorVerdicts(l)
+
   # --- position and facing. Two shaped fast calls: the hidden return pointer
   # is a stack buffer in `live.readVec`, so these allocate nothing at all and
   # cost about what a bound call costs. They were the two most expensive reads
@@ -546,9 +777,18 @@ proc readSelf*(b: BotHandle; l: BotLive): SelfView =
   result.healthNormalized = readHealth(l)
   result.stamina = readStamina(l)
 
-  let mc = callObj(gB.pMovement, l.player)
-  if mc != nil:
-    result.isSprinting = callBoolOn(gB.mcSprint, mc, false)
+  # Sprint state comes off the PHYSICAL, not off the MovementContext.
+  #
+  # `mcSprint` used to be `MovementContext::get_IsSprintEnabled`, which the RVA
+  # table refuses -- the name is ambiguous across owners and nothing offline
+  # picks the right one. It is now `PhysicalBase._sprinting@0xD9`, a field, and
+  # a field offset is only meaningful on the type it was measured for. So the
+  # receiver had to move with it: `pPhysical` yields the PhysicalBase, and that
+  # is what is read. Passing the MovementContext here would still be readable,
+  # would not fault, and would answer with whatever it keeps at 0xD9.
+  let ph = callObj(gB.pPhysical, l.player)
+  if ph != nil:
+    result.isSprinting = callBoolOn(gB.mcSprint, ph, false)
 
   if l.owner == nil:
     return
