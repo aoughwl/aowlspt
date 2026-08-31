@@ -2171,6 +2171,23 @@ static float   mhud_live_borderpx(void)  { return g_mhud.borderPx; }
 static float   mhud_live_backdropa(void) { return g_mhud.backdropA; }
 static float   mhud_live_wx(void)        { return g_mhud.wx; }
 static float   mhud_live_wy(void)        { return g_mhud.wy; }
+/* ---- the rest of the mirror, so the DRIFT LEDGER can see all of it -------
+ *
+ * These exist for exactly one reason: a setting with no live getter cannot be
+ * compared against the mirror, and a setting that cannot be compared cannot
+ * make the reconcile fire. Every one of the ten below is pushed on every
+ * hudReconfigure and was, until now, invisible to mirrorDrift -- i.e. storable
+ * and never applied, which is this repo's most repeated defect. */
+static float   mhud_live_screenw(void)   { return g_mhud.screenW; }
+static float   mhud_live_screenh(void)   { return g_mhud.screenH; }
+static float   mhud_live_radarsize(void) { return g_mhud.radarSize; }
+static float   mhud_live_radarx(void)    { return g_mhud.radarX; }
+static float   mhud_live_radary(void)    { return g_mhud.radarY; }
+static int32_t mhud_live_showbots(void)  { return g_mhud.showBots; }
+static int32_t mhud_live_showplayers(void){ return g_mhud.showPlayers; }
+static float   mhud_live_indinset(void)  { return g_mhud.indicatorInset; }
+static int64_t mhud_live_holdms(void)    { return g_mhud.holdMs; }
+static int64_t mhud_live_fadems(void)    { return g_mhud.fadeMs; }
 /* THE THREE FALSIFIABLE LEDGERS. Each can be non-zero on the failing side. */
 static int64_t mhud_pane_calls_total(void) { return g_mhud.paneCallsTotal; }
 static int64_t mhud_pane_calls_over(void)  { return g_mhud.paneCallsOver; }
@@ -2437,6 +2454,16 @@ proc cHudLiveBorderPx(): cfloat {.importc: "mhud_live_borderpx", nodecl.}
 proc cHudLiveBackdropA(): cfloat {.importc: "mhud_live_backdropa", nodecl.}
 proc cHudLiveWx(): cfloat {.importc: "mhud_live_wx", nodecl.}
 proc cHudLiveWy(): cfloat {.importc: "mhud_live_wy", nodecl.}
+proc cHudLiveScreenW(): cfloat {.importc: "mhud_live_screenw", nodecl.}
+proc cHudLiveScreenH(): cfloat {.importc: "mhud_live_screenh", nodecl.}
+proc cHudLiveRadarSize(): cfloat {.importc: "mhud_live_radarsize", nodecl.}
+proc cHudLiveRadarX(): cfloat {.importc: "mhud_live_radarx", nodecl.}
+proc cHudLiveRadarY(): cfloat {.importc: "mhud_live_radary", nodecl.}
+proc cHudLiveShowBots(): int32 {.importc: "mhud_live_showbots", nodecl.}
+proc cHudLiveShowPlayers(): int32 {.importc: "mhud_live_showplayers", nodecl.}
+proc cHudLiveIndInset(): cfloat {.importc: "mhud_live_indinset", nodecl.}
+proc cHudLiveHoldMs(): int64 {.importc: "mhud_live_holdms", nodecl.}
+proc cHudLiveFadeMs(): int64 {.importc: "mhud_live_fadems", nodecl.}
 proc cHudPaneCallsTotal(): int64 {.importc: "mhud_pane_calls_total", nodecl.}
 proc cHudPaneCallsOver(): int64 {.importc: "mhud_pane_calls_over", nodecl.}
 proc cHudFsRectOk(): int64 {.importc: "mhud_fs_rect_ok", nodecl.}
@@ -2516,6 +2543,16 @@ proc hudRebaseMsMax*(): int64 = cHudRebaseMsMax()
 
 # ---- the widget's placement/chrome, read back from the LIVE mirror --------
 proc hudLiveAnchor*(): int = int(cHudLiveAnchor())
+proc hudLiveScreenW*(): float = float(cHudLiveScreenW())
+proc hudLiveScreenH*(): float = float(cHudLiveScreenH())
+proc hudLiveRadarSize*(): float = float(cHudLiveRadarSize())
+proc hudLiveRadarX*(): float = float(cHudLiveRadarX())
+proc hudLiveRadarY*(): float = float(cHudLiveRadarY())
+proc hudLiveShowBots*(): bool = cHudLiveShowBots() != 0'i32
+proc hudLiveShowPlayers*(): bool = cHudLiveShowPlayers() != 0'i32
+proc hudLiveIndicatorInset*(): float = float(cHudLiveIndInset())
+proc hudLiveHoldMs*(): int = int(cHudLiveHoldMs())
+proc hudLiveFadeMs*(): int = int(cHudLiveFadeMs())
 proc hudLiveBorder*(): bool = cHudLiveBorder() != 0'i32
 proc hudLiveBorderPx*(): float = float(cHudLiveBorderPx())
 proc hudLiveBackdropOpacity*(): float = float(cHudLiveBackdropA())
@@ -2769,7 +2806,26 @@ proc anchorOf*(s: string): int =
   of "topright", "top-right", "tr":       AnchorTR
   of "bottomleft", "bottom-left", "bl":   AnchorBL
   of "bottomright", "bottom-right", "br": AnchorBR
+  of "manual", "":                        AnchorManual
   else:                                   AnchorManual
+
+proc anchorRecognised*(s: string): bool =
+  ## Whether `s` is a spelling `anchorOf` actually knows.
+  ##
+  ## Separate from `anchorOf` ON PURPOSE. `anchorOf` returns AnchorManual for a
+  ## typo AND for the literal word "manual", so its return value cannot tell the
+  ## two apart -- a caller that only looks at the int has written a check that
+  ## cannot fail. This is the predicate that CAN fail, and it is what the loud
+  ## refusal in readOpts is driven by: an unrecognised `widgetAnchor` must name
+  ## itself in the host log, never quietly become the default corner-less
+  ## placement and leave the player believing they picked a corner.
+  case s
+  of "topleft", "top-left", "tl",
+     "topright", "top-right", "tr",
+     "bottomleft", "bottom-left", "bl",
+     "bottomright", "bottom-right", "br",
+     "manual", "": true
+  else: false
 
 proc keycodeOf*(name: string): int =
   ## The KeyCode ordinal for a name, or -1 (AOWL_KC_UNBOUND). "" is unbound and

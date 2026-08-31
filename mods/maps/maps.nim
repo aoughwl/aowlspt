@@ -177,6 +177,24 @@ var gReconcileFails = 0
 var gReconcileOff = false
 var gLastDrift = ""
 
+proc near(a, b: float): bool =
+  ## Float equality with a tolerance, for the reconcile's finished-state
+  ## comparison AND for the placement verdict. 0.01 px/m is far below anything a
+  ## control can express and far above JSON round-tripping, so it can absorb a
+  ## re-serialisation and nothing a user could have typed.
+  ##
+  ## Declared here, above both users, rather than beside the reconcile: the
+  ## placement verdict needs it too, and two tolerances for "is this the same
+  ## number" would be two ways to disagree.
+  let d = a - b
+  (if d < 0.0: -d else: d) <= 0.01
+
+var gAnchorRefused = ""
+  ## The last `widgetAnchor` text this build did not recognise, so the refusal is
+  ## logged once per distinct bad value rather than once a second forever
+  ## (readOpts is on the reconcile's tick). Empty means the configured spelling
+  ## is one we accept.
+
 var gHeadingOn = false
   ## The `heading` setting. Flag-gated and default OFF, like everything else
   ## here. When off, the measured heading is DISCARDED at publish time rather
@@ -339,7 +357,28 @@ proc readOpts(o: var HudOpts) =
   # every existing config already has: mapX/mapY as absolute top-left. Nobody's
   # widget moves because they took this build. Pick a corner and the same two
   # numbers become an inset from it, resolved against the measured back buffer.
-  o.anchor          = anchorOf(asText(setting("widgetAnchor"), "manual"))
+  # LOUD ON A SPELLING WE DO NOT KNOW. `anchorOf` answers AnchorManual for a
+  # typo and for the word "manual" alike, so the returned int cannot distinguish
+  # "the player asked for the historical placement" from "the player asked for a
+  # corner and we ignored them". `anchorRecognised` is the predicate that CAN
+  # fail; the refusal names the offending text and the accepted spellings, and it
+  # is emitted once per distinct bad value because readOpts is on the reconcile's
+  # once-a-second path.
+  let anchorText = asText(setting("widgetAnchor"), "manual")
+  if not anchorRecognised(anchorText):
+    if anchorText != gAnchorRefused:
+      gAnchorRefused = anchorText
+      warn ModName & ": REFUSED widgetAnchor=\"" & anchorText & "\" -- that is " &
+           "not a spelling this build accepts, so the widget is being placed " &
+           "with the historical MANUAL placement (mapX/mapY as absolute " &
+           "pixels) and your corner was NOT applied. Accepted: manual, " &
+           "topleft, topright, bottomleft, bottomright (hyphenated and the " &
+           "two-letter forms tl/tr/bl/br also work). The placement diag line " &
+           "reports the anchor actually in force."
+  else:
+    # Recognised again: forget the refusal so a later re-typo says so afresh.
+    gAnchorRefused = ""
+  o.anchor          = anchorOf(anchorText)
   o.border          = asBool(setting("widgetBorder"), true)
   o.borderPx        = asFloat(setting("widgetBorderPx"), 2.0)
   o.backdropOpacity = asFloat(setting("widgetBackdropOpacity"), 1.0)
@@ -1489,13 +1528,56 @@ proc mapsDiagText(): string =
   # path itself. In manual mode they are equal BY CONSTRUCTION -- and that is
   # stated, so their equality there is not read as evidence the anchor works.
   # In a corner mode they differ, and that difference is the evidence.
-  let lPlace = "anchor=" & anchorName(hudLiveAnchor()) &
-               " cfg=" & $hudLivePaneX() & "," & $hudLivePaneY() &
-               " drawnAt=" & $hudWidgetX() & "," & $hudWidgetY() &
-               (if hudLiveAnchor() == AnchorManual:
-                  "  (manual: drawnAt EQUALS cfg by construction -- this line " &
-                  "proves nothing about the anchor until a corner is chosen)"
-                else: "") &
+  # THREE OUTCOMES, never two (CLAUDE.md 9b). The old form printed the two
+  # coordinate pairs and a caveat and left the reader to judge -- so a corner
+  # anchor that had never drawn a frame reported `drawnAt=0.0,0.0`, which reads
+  # exactly like "the anchor put the widget in the top-left corner" and is in
+  # fact "nothing has been drawn". That is the INCONCLUSIVE case, and it now
+  # says so by name instead of being reported as a position.
+  #
+  # The falsifiable NEGATIVE for a corner anchor is concrete: drawnAt MUST NOT
+  # equal cfg, and the resolved origin must sit in the half of the screen the
+  # chosen corner names. Both can fail, which is what makes this a check.
+  let anch = hudLiveAnchor()
+  let cx = hudLivePaneX()
+  let cy = hudLivePaneY()
+  let dx = hudWidgetX()
+  let dy = hudWidgetY()
+  # int32 from the region, widened once here: mixing it with the float origins
+  # below is what the quadrant test compares, and one conversion in one place
+  # beats four at the use sites.
+  let sw: float = float(hudScreenW())
+  let sh: float = float(hudScreenH())
+  let wantRight: bool  = (anch == AnchorTR) or (anch == AnchorBR)
+  let wantBottom: bool = (anch == AnchorBL) or (anch == AnchorBR)
+  let inRightHalf: bool  = dx > (sw * 0.5)
+  let inBottomHalf: bool = dy > (sh * 0.5)
+  let placeVerdict =
+    if anch == AnchorManual:
+      "INCONCLUSIVE  manual placement: drawnAt EQUALS cfg by construction, so " &
+      "this line proves nothing about the anchor until a corner is chosen"
+    elif hudPaneCalls() == 0'i64:
+      "INCONCLUSIVE  the anchor is set to " & anchorName(anch) &
+      " but the pane renderer has NEVER run (0 draws), so drawnAt is the " &
+      "uninitialised 0,0 and NOT a resolved position. Nothing is proven " &
+      "until a frame is drawn in a raid"
+    elif near(dx, cx) and near(dy, cy):
+      "FAIL  anchor=" & anchorName(anch) & " but the drawn origin EQUALS the " &
+      "configured inset, which is the manual behaviour -- the corner was not " &
+      "resolved"
+    elif inRightHalf != wantRight or inBottomHalf != wantBottom:
+      "FAIL  anchor=" & anchorName(anch) & " resolved to " & $dx & "," & $dy &
+      " on a " & $sw & "x" & $sh & " buffer, which is not in that corner's " &
+      "quadrant"
+    else:
+      "PASS  anchor=" & anchorName(anch) & " resolved the origin to " &
+      $dx & "," & $dy & " from the inset " & $cx & "," & $cy & " on a " &
+      $sw & "x" & $sh & " buffer -- in the named quadrant and NOT equal to " &
+      "cfg, over " & $hudPaneCalls() & " pane draw(s)"
+  let lPlace = placeVerdict &
+               ". anchor=" & anchorName(anch) &
+               " cfg=" & $cx & "," & $cy &
+               " drawnAt=" & $dx & "," & $dy &
                "  border=" & (if hudLiveBorder(): "on@" & $hudLiveBorderPx() &
                                                   "px" else: "off") &
                " backdropOpacity=" & $hudLiveBackdropOpacity()
@@ -1835,14 +1917,6 @@ proc onMapsApply(key: string) =
 # `MaxReconcileFails` consecutive such ticks it stops and says so, rather than
 # calling `onMapsApply` once a second forever.
 
-proc near(a, b: float): bool =
-  ## Float equality with a tolerance, for the reconcile's finished-state
-  ## comparison. 0.01 px/m is far below anything a control can express and far
-  ## above JSON round-tripping, so it can absorb a re-serialisation and nothing
-  ## a user could have typed.
-  let d = a - b
-  (if d < 0.0: -d else: d) <= 0.01
-
 proc numDrift(name: string; want, got: float): string =
   ## "" when the mirror agrees; otherwise the disagreement, named.
   if near(want, got): "" else: name & " config=" & $want & " mirror=" & $got
@@ -1856,10 +1930,22 @@ proc mirrorDrift(): string =
     return "config enabled=" & $cfgEnabled & " but this instance holds gEnabled=" &
            $gEnabled
   if not gHudOn:
-    # No draw participant: there is a master switch to compare and nothing else.
+    # NO DRAW PARTICIPANT -- and this used to `return ""` here, unconditionally,
+    # which made the whole ledger a check that cannot fail. The C mirror is a
+    # plain struct in this process: every `hudLive*` getter reads it whether or
+    # not a draw participant is registered, so there was never a reason to stop
+    # comparing. The cost of stopping was concrete: with gHudOn false (which is
+    # exactly the state "every HUD surface is off in config"), an edit that
+    # turned a surface back on -- spatialMode, indicators, the anchor, any
+    # numeric -- produced NO drift, so no reconcile fired, so the edit was
+    # stored and never applied until relaunch. That is the stored-but-inert
+    # defect this ledger exists to catch, and the ledger was blind to it in
+    # precisely the state where it was most likely.
+    #
+    # The one thing that genuinely cannot be compared without a participant is
+    # nothing at all, so the walk simply continues below.
     if (not cfgEnabled) and hudLiveEnabled():
       return "config enabled=false, no draw participant, mirror enabled=ON"
-    return ""
   let live = cfgEnabled and gFeedRunning
   # WHAT CONFIG ASKS FOR, read by the SAME code the apply path uses. Reading it
   # a second, hand-written way here is how `radarSize` came to be storable and
@@ -1907,6 +1993,28 @@ proc mirrorDrift(): string =
   d = numDrift("widgetBackdropOpacity", w.backdropOpacity,
                hudLiveBackdropOpacity())
   if d.len > 0: return d
+  # THE TEN THAT HAD NO LINE HERE. Each is pushed on every hudReconfigure and
+  # each was invisible to this comparison, so none of them could ever MAKE the
+  # reconcile fire -- an edit to any of them was applied only if some other key
+  # happened to drift on the same tick. By the rule stated above, a schema entry
+  # with no line here is a control that can be stored and never applied, so this
+  # closes the audited gap rather than the one key that was reported.
+  d = numDrift("screenW", w.screenW, hudLiveScreenW());     if d.len > 0: return d
+  d = numDrift("screenH", w.screenH, hudLiveScreenH());     if d.len > 0: return d
+  d = numDrift("radarSize", w.size, hudLiveRadarSize());    if d.len > 0: return d
+  d = numDrift("radarX", w.x, hudLiveRadarX());             if d.len > 0: return d
+  d = numDrift("radarY", w.y, hudLiveRadarY());             if d.len > 0: return d
+  d = numDrift("indicatorInset", w.indicatorInset, hudLiveIndicatorInset())
+  if d.len > 0: return d
+  d = numDrift("indicatorHoldMs", float(w.indicatorHoldMs), float(hudLiveHoldMs()))
+  if d.len > 0: return d
+  d = numDrift("indicatorFadeMs", float(w.indicatorFadeMs), float(hudLiveFadeMs()))
+  if d.len > 0: return d
+  if w.showBots != hudLiveShowBots():
+    return "showBots config=" & $w.showBots & " mirror=" & $hudLiveShowBots()
+  if w.showPlayers != hudLiveShowPlayers():
+    return "showPlayers config=" & $w.showPlayers &
+           " mirror=" & $hudLiveShowPlayers()
   if w.anchor != hudLiveAnchor():
     return "widgetAnchor config=" & anchorName(w.anchor) &
            " mirror=" & anchorName(hudLiveAnchor())
