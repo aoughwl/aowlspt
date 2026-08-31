@@ -142,3 +142,34 @@ TF_GET_ROOT              = UnityEngine.Transform::get_root/0        shared-call 
 SCREEN_GET_WIDTH         = UnityEngine.Screen::get_width/0          shared-call why="2 owners, a static with no receiver at all. Reading the backbuffer width cannot be wrong for a caller; only a detour could be."
 SCREEN_GET_HEIGHT        = UnityEngine.Screen::get_height/0         shared-call why="2 owners, static, exactly as get_width. Used together with it for the overlay layout."
 TF_GET_PARENT            = UnityEngine.Transform::get_parent/0     shared-call why="3 owners -- the generator caught this one; it was written as a plain symbol first and rejected. Walking up from a live Transform is receiver-decided and safe to call."
+
+# ------------------------------------------------- Bot AI (mods/sain) driving
+# The five driving calls and the two sensors, resolved offline so that nothing
+# in mods/sain ever asks the runtime for a name again. Every RVA and every
+# signature below came from
+#   python tools\il2cpp_resolve.py <gameasm> <metadec> type <idx>
+# on 2026-08-26; the signatures are quoted in mods/sain/client/drivecalls.nim
+# next to the call that stages the arguments for them.
+#
+# THE ONE THAT IS NOT HERE, and why. `BotMover::GoToPoint(Vector3, bool, float,
+# bool, bool, bool, bool)` @0x1A2EE00 and `EFT.BotOwner::GoToPoint(Vector3,
+# bool, float, bool, bool, bool, bool, bool)` @0x81CB40 are the real
+# destination calls. They take 8 and 9 register slots INCLUDING `this`, and
+# `AOWL_FAST_MAX_SLOTS` is 5 -- Win64 puts everything past the fourth argument
+# on the STACK, which the shape dispatcher does not express and callrva.nim
+# refuses rather than spills. Listing them here would produce a symbol that
+# compiles and a call that can never be staged, so they are deliberately
+# absent. See the BLOCKED note in mods/sain/README.md.
+SAIN_MOVER_SPRINT       = BotMover::Sprint/2
+SAIN_MOVER_STOP         = BotMover::Stop/0
+SAIN_STEERING_LOOKTO    = BotSteering::LookToPoint/1
+SAIN_SHOOTDATA_SHOOT    = ShootData::Shoot/0
+SAIN_BOTOWNER_STOPMOVE  = EFT.BotOwner::StopMove/0
+
+# The two sensors. `Physics::Raycast` has THREE arity-3 overloads on this build
+# -- (Vector3,Vector3,float)@0x5328830, (Vector3,Vector3,RaycastHit)@0x5328C30
+# and (Ray,float,int)@0x5328DD0 -- so if the generator resolves this by arity
+# alone it will be AMBIGUOUS and rejected, which is the correct outcome and not
+# something to work around by picking one.
+SAIN_PHYSICS_RAYCAST    = UnityEngine.Physics::Raycast/3
+SAIN_NAVMESH_SAMPLE     = UnityEngine.AI.NavMesh::SamplePosition/4

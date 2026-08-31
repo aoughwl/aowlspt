@@ -1881,15 +1881,20 @@ proc onLoad(): Status =
     # resolution unless this says otherwise, and it must be told at load
     # rather than at arming time, because arming is where the fault was.
     setAllowReflection(gPreset.allowIl2cppReflection)
+    setClientLocomotion(gPreset.clientDrivesLocomotion)
     # Same reason, same moment: the RVA table decides what `ensure` does, so it
     # must be set before the first member is touched rather than at arming.
     setRvaTable(gPreset.rvaTable)
     if gPreset.allowIl2cppReflection:
       warn "sain: allowIl2cppReflection is ON. On this build that is a " &
-           "known process-killer (fact #35): il2cpp_class_from_name returns " &
-           "a non-nil handle into unmapped memory and the first dereference " &
-           "takes the client down. This is a re-measurement switch, not a " &
-           "feature switch"
+           "known process-killer, and the mechanism is measured rather than " &
+           "guessed (docs/IL2CPP_EXPORTS.md): il2cpp_class_from_name is one " &
+           "of 40 TOKEN-GATED exports. It takes a trailing 32-byte token the " &
+           "stock signature does not have, and when it does not match -- " &
+           "always, here -- it returns a uniform random non-zero uint64 " &
+           "rather than failing. The nil check passes, the checks after it " &
+           "pass, and the first real dereference takes the client down. This " &
+           "is a re-measurement switch, not a feature switch"
     # EAGER, at load, and deliberately not inside `report()`: a refusal for a
     # member no bot ever reaches would otherwise print as `unused`.
     rvaReport()

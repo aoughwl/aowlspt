@@ -70,6 +70,7 @@ import aowlspt/fast
 import ".." / core / vec
 import ".." / core / probe
 import live
+import drivecalls
 
 const
   RaycastOwner = "UnityEngine.Physics"
@@ -86,16 +87,15 @@ const
   NavAllAreas = -1'i32
     ## `NavMesh.AllAreas`. A constant of Unity's, not a guess about EFT.
 
-  HitBufferWords = 16
-    ## 128 bytes of scratch for the `out NavMeshHit`. The runtime is asked how
-    ## big the struct really is and the binding refuses if the answer does not
-    ## fit here, so this number is a ceiling rather than an assumption.
+  # `HitBufferWords = 16` (128 bytes of scratch for the `out NavMeshHit`) is
+  # gone with the boxed path. The buffer is now an arena cell of exactly 36
+  # bytes -- `UnityEngine.AI.NavMeshHit`'s MEASURED `native_size` out of
+  # `Il2CppMetadataRegistration.typeDefinitionsSizes` -- staged by
+  # `drivecalls.navSample`. See `NavMeshHitBytes` there for the measurement and
+  # for the control reading that validates it.
 
-var gRayM: Il2CppMethod = cast[Il2CppMethod](0)
 var gRayWhy = "not attempted"
-var gNavM: Il2CppMethod = cast[Il2CppMethod](0)
 var gNavWhy = "not attempted"
-var gNavHitBytes = 0
 var gTried = false
 
 ## Counters, for the state line. `gRays` is the number that has to stay
@@ -107,14 +107,14 @@ var gSamples = 0
 var gSampleNs = 0'i64
 var gPointsSeen = 0
 
-proc raycastReady*(): bool = gRayM != nil
-proc navMeshReady*(): bool = gNavM != nil
+proc raycastReady*(): bool = canRaycast()
+proc navMeshReady*(): bool = canSample()
 
 proc probeReady*(): bool =
   ## The sensor exists when the *ray* exists. The navmesh is a filter on top of
   ## it, and a build without one gets cover points chosen on the rays alone --
   ## which is worse and is not nothing.
-  result = gRayM != nil
+  result = canRaycast()
 
 proc raycastWhy*(): string = gRayWhy
 proc navMeshWhy*(): string = gNavWhy
@@ -130,142 +130,19 @@ proc sampleCostNs*(): int64 =
   if gSamples <= 0: return -1'i64
   result = gSampleNs div int64(gSamples)
 
-proc bindRaycast() =
-  # THE REFUSAL COMES FIRST, and it is the reason this file exists in its
-  # current shape. `signatureOf` below is `findClass` + `findMethod` +
-  # dereference, and on this build that sequence is what killed the client --
-  # MEASURED: the last line the mod ever logged was this function's own
-  # breadcrumb. See `client/live.nim` and fact #35.
-  #
-  # The offline route is already measured and is written down here so the next
-  # agent does not re-derive it. From
-  # `tools/il2cpp_resolve.py <GameAssembly.dll> <metadata.dec> type 29163
-  # --shared` (`UnityEngine.Physics`, image UnityEngine.PhysicsModule.dll):
-  #
-  #   bool Raycast(Vector3 origin, Vector3 direction, float maxDistance)
-  #     rid=45  arity=3  RVA=0x5328830   NOT [shared]
-  #     prologue 48 89 5C 24 08 57 48 83 EC 70 80 3D 51 D9 DA 01
-  #
-  # and it disambiguates what this file's own header warns cannot be
-  # disambiguated through the C API: there are THREE arity-3 `Raycast`
-  # overloads (rid 45, 50, 52) and the runtime hands back whichever it meets
-  # first.
-  #
-  # It is NOT wired up, deliberately. Two things are missing and neither is a
-  # detail: a mod has no byte-verified call-by-RVA facility (nothing in
-  # `aowlspt/il2cpp`, `aowlspt/fast` or `aowlspt/game` takes an RVA), and the
-  # ARGUMENT CONVENTION for two by-value `Vector3`s into an il2cpp static is
-  # unverified -- this file's own header already says `aowlspt/fast` refuses
-  # that shape. Asserting it would be a guess that returns a plausible bool,
-  # which is the failure this mod is arranged against. So the sensor declines.
-  if reflectionRefused():
-    gRayWhy = "refused: " & ReflectionRefusal &
-              " The cover sensor is OFF, so there are no cover points and " &
-              "the cover decisions stay unreachable -- bots fight, search " &
-              "and flank without taking cover. The offline RVA for the " &
-              "right overload is measured and recorded in the source " &
-              "(0x5328830, not shared); wiring it up needs a byte-verified " &
-              "call-by-RVA path for mods and a verified argument convention " &
-              "for two by-value Vector3s, and this mod will not assert " &
-              "either one"
-    return
-  var params: seq[string] = @[]
-  var ret = ""
-  if not signatureOf(RaycastOwner, RaycastMember, 3, params, ret):
-    gRayWhy = "refused: " & RaycastOwner & "::" & RaycastMember &
-              " has no three-argument form on this build, so there are no " &
-              "cover points and the cover decisions stay unreachable"
-    return
-  if params.len != 3 or params[0] != "UnityEngine.Vector3" or
-     params[1] != "UnityEngine.Vector3" or params[2] != "System.Single" or
-     ret != "System.Boolean":
-    # Named rather than attempted. `Physics` carries three three-argument
-    # `Raycast` overloads and the runtime hands back whichever it finds first;
-    # calling the wrong one with a Vector3 where it wants a Ray answers a
-    # plausible bool rather than failing.
-    gRayWhy = "refused: the three-argument " & RaycastOwner & "::" &
-              RaycastMember & " on this build is " & describeSig(params, ret) &
-              ", and this reads (Vector3 origin, Vector3 direction, float " &
-              "maxDistance) -> bool. The overload order differs here, and " &
-              "picking the next one would be guessing"
-    return
-  let m = staticMethodOf(RaycastOwner, RaycastMember, 3)
-  if m == nil:
-    gRayWhy = "refused: " & RaycastOwner & "::" & RaycastMember &
-              " resolved with the right signature but is not static, which " &
-              "is not the method this meant"
-    return
-  gRayM = m
-  gRayWhy = "boxed: " & RaycastOwner & "::" & RaycastMember & " " &
-            describeSig(params, ret) &
-            " through il2cpp_runtime_invoke -- two Vector3 arguments by " &
-            "pointer is a shape aowlspt/fast refuses and this mod does not " &
-            "assert a convention for a static"
-
-proc bindNavMesh() =
-  # Same refusal, same reason, and this one has NEVER RUN on this client: the
-  # process died in `bindRaycast` above before reaching it. Its offline route
-  # is measured too, from `type 30426 --shared` (`UnityEngine.AI.NavMesh`,
-  # image UnityEngine.AIModule.dll):
-  #
-  #   bool SamplePosition(Vector3, NavMeshHit, float, int)
-  #     rid=48  arity=4  RVA=0x5238930   NOT [shared]
-  #
-  # It additionally needs `payloadSizeOf(NavMeshHit)`, which is `findClass` +
-  # `classInstanceSize` -- the same dead path -- so an RVA alone would not be
-  # enough here even once the call path exists.
-  if reflectionRefused():
-    gNavWhy = "refused: " & ReflectionRefusal &
-              " The navmesh filter is OFF. It is a filter on a sensor that " &
-              "is itself off, so nothing further is lost today. Offline RVA " &
-              "0x5238930 (not shared) is recorded in the source, but sizing " &
-              "the `out NavMeshHit` buffer needs the same dead by-name path, " &
-              "so this one needs more than an RVA"
-    return
-  var params: seq[string] = @[]
-  var ret = ""
-  if not signatureOf(NavMeshOwner, NavMeshMember, 4, params, ret):
-    gNavWhy = "refused: " & NavMeshOwner & "::" & NavMeshMember &
-              " has no four-argument form on this build; candidates are " &
-              "accepted on the rays alone, so a bot may be sent to a place " &
-              "it cannot stand"
-    return
-  var hitOk = false
-  if params.len == 4:
-    # The `out` parameter's declared name may or may not carry a trailing `&`
-    # depending on how the runtime renders a byref, so the test is containment
-    # rather than equality -- and it is still a test rather than a position.
-    let p1 = params[1]
-    var k = 0
-    while k + 10 <= p1.len:
-      if p1.substr(k, k + 9) == "NavMeshHit":
-        hitOk = true
-        break
-      inc k
-  if params.len != 4 or params[0] != "UnityEngine.Vector3" or not hitOk or
-     params[2] != "System.Single" or params[3] != "System.Int32" or
-     ret != "System.Boolean":
-    gNavWhy = "refused: " & NavMeshOwner & "::" & NavMeshMember &
-              " on this build is " & describeSig(params, ret) & ", and this " &
-              "reads (Vector3, out NavMeshHit, float, int) -> bool"
-    return
-  let sz = payloadSizeOf(NavMeshHitType)
-  if sz <= 0 or sz > HitBufferWords * 8:
-    gNavWhy = "refused: the runtime reports " & NavMeshHitType & " as " &
-              $sz & " bytes, which is not a size this can hand over safely " &
-              "(the scratch buffer is " & $(HitBufferWords * 8) & ")"
-    return
-  let m = staticMethodOf(NavMeshOwner, NavMeshMember, 4)
-  if m == nil:
-    gNavWhy = "refused: " & NavMeshOwner & "::" & NavMeshMember &
-              " is not static on this build"
-    return
-  gNavM = m
-  gNavHitBytes = sz
-  gNavWhy = "boxed: " & NavMeshOwner & "::" & NavMeshMember & " " &
-            describeSig(params, ret) & " through il2cpp_runtime_invoke; the " &
-            "hit is a " & $sz & "-byte buffer this mod hands over and never " &
-            "reads, so nothing depends on its layout"
+# `bindRaycast` and `bindNavMesh` USED TO BE HERE, 137 lines of them, and they
+# are deleted rather than left unreferenced. Both resolved a class and a
+# method BY NAME at run time, checked the returned signature, and refused
+# when it did not classify. The checking was careful and it protected
+# nothing: on this build `il2cpp_class_from_name` and
+# `il2cpp_class_get_method_from_name` are TOKEN-GATED exports that return a
+# uniform random non-zero uint64 on a token mismatch, so the handle being
+# inspected was already a random number and every check ran on it happily.
+# A verification that cannot fail is the bug (CLAUDE.md 9b).
+#
+# Dead code that calls a fatal export is not inert -- it is one edit away from
+# being called again. The replacement is in `client/drivecalls.nim`, which
+# resolves nothing at run time at all.
 
 proc bindProbe*() =
   ## Resolve both, once, on the first tick the runtime is up. Never from
@@ -278,13 +155,35 @@ proc bindProbe*() =
     gRayWhy = "refused: no IL2CPP runtime is bound in this process"
     gNavWhy = gRayWhy
     return
-  # Named separately: these two resolve UnityEngine statics rather than EFT
-  # members, so a fault in one of them is a different bug from a fault in
-  # `bindAll`, and a single "bindProbe" line could not say which.
-  info "sain: bindProbe 1/2 -- UnityEngine.Physics::Raycast"
-  bindRaycast()
-  info "sain: bindProbe 2/2 -- UnityEngine.AI.NavMesh::SamplePosition"
-  bindNavMesh()
+  # NOTHING HERE RESOLVES A NAME ANY MORE, and that is the whole change.
+  #
+  # `bindRaycast` / `bindNavMesh` above went through
+  # `il2cpp_class_from_name` + `il2cpp_class_get_method_from_name`, which on
+  # this build are TOKEN-GATED exports: called the stock way they do not fail,
+  # they return a uniform random non-zero uint64. Fact #144 named this the
+  # place the client dies -- and that fact should be read with the caveat that
+  # the host log LOSES about six statements of tail on a hard death, so "died
+  # at bindProbe 1/2" names the last line LOGGED, not necessarily the last line
+  # EXECUTED. Either way the by-name route is the wrong route and it is gone.
+  #
+  # `client/drivecalls.nim` verifies both entry points at their offline-
+  # resolved static RVA against the startup prologue snapshot. It reads code
+  # pages; it patches nothing; it cannot return a random handle because it
+  # never asks for one.
+  info "sain: bindProbe -- byte-verifying Physics::Raycast @0x5328830 and " &
+       "NavMesh::SamplePosition @0x5238930 at their offline RVAs; no name is " &
+       "resolved at run time"
+  verifyAll()
+  gRayWhy = (if canRaycast():
+               "RVA 0x5328830, 1 owner, prologue verified against the startup " &
+               "snapshot -- bool Raycast(Vector3, Vector3, float)"
+             else:
+               "refused -- " & driveWhy())
+  gNavWhy = (if canSample():
+               "RVA 0x5238930, 1 owner, prologue verified; the out buffer is " &
+               "36 bytes, the MEASURED native_size of UnityEngine.AI.NavMeshHit"
+             else:
+               "refused -- " & driveWhy())
   info "sain: bindProbe complete"
 
 proc probeState*(): string =
@@ -300,51 +199,48 @@ proc probeState*(): string =
 proc castRay(r: ProbeRay): bool =
   ## True when something stopped the ray inside `maxDistance`.
   ##
-  ## A refused binding answers **false**, and that direction is deliberate:
-  ## false means "nothing in the way", which `core/probe.heightFrom` reads as
-  ## "this candidate is not cover", which leaves the set empty and the cover
-  ## decisions exactly as unreachable as they are on a build with no sensor at
-  ## all. The other direction would invent cover everywhere.
+  ## THREE OUTCOMES, NOT TWO. `drivecalls.raycastHits` answers through an `ok`
+  ## flag as well as a bool, because "the ray reached nothing" and "this sensor
+  ## could not answer" are different facts and the old code flattened them.
+  ## Unanswered is reported here as **false** -- "not cover" -- which leaves
+  ## the candidate set empty and the cover decisions exactly as unreachable as
+  ## on a build with no sensor. The other direction invents cover everywhere,
+  ## which is a bot walking confidently into open ground.
   result = false
-  if gRayM == nil or r.maxDistance <= 0.0:
+  if r.maxDistance <= 0.0 or not canRaycast():
     return
-  var origin: array[4, float32] = [float32(r.origin.x), float32(r.origin.y),
-                                   float32(r.origin.z), 0.0'f32]
-  var dir: array[4, float32] = [float32(r.direction.x),
-                                float32(r.direction.y),
-                                float32(r.direction.z), 0.0'f32]
-  var maxd: float32 = float32(r.maxDistance)
-  # The IL2CPP invoke convention, which is Mono's: a value-type slot points at
-  # the raw value and a reference slot *is* the pointer. Three value types
-  # here, so three addresses of locals that outlive the call.
-  var argv: array[3, Il2CppPtr] = [cast[Il2CppPtr](addr origin[0]),
-                                   cast[Il2CppPtr](addr dir[0]),
-                                   cast[Il2CppPtr](addr maxd)]
   gRays = gRays + 1
-  result = unboxBool(invokeStatic(gRayM, cast[Il2CppPtr](addr argv[0])))
+  var ok = false
+  let hit = raycastHits(r.origin.x, r.origin.y, r.origin.z,
+                        r.direction.x, r.direction.y, r.direction.z,
+                        r.maxDistance, ok)
+  if not ok:
+    return
+  result = hit
 
 proc standableAt(p: Vec3): bool =
   ## Whether the navmesh has ground within `NavSampleRadius` of a point.
   ##
-  ## True when the binding refused, because a sensor that is absent must not
-  ## reject: a build with no `NavMesh` gets its candidates filtered by the rays
-  ## alone.
+  ## True when the sensor could not answer, because a filter that is absent
+  ## must not REJECT: a build where `SamplePosition` refused gets its
+  ## candidates filtered by the rays alone. That is the opposite default from
+  ## `castRay` and the asymmetry is the point -- each one defaults to the
+  ## answer that makes the sensor inert rather than the answer that makes it
+  ## confidently wrong.
   result = true
-  if gNavM == nil:
+  if not canSample():
     return
-  var at: array[4, float32] = [float32(p.x), float32(p.y), float32(p.z),
-                               0.0'f32]
-  var hit: array[HitBufferWords, int64] = [
-    0'i64, 0'i64, 0'i64, 0'i64, 0'i64, 0'i64, 0'i64, 0'i64,
-    0'i64, 0'i64, 0'i64, 0'i64, 0'i64, 0'i64, 0'i64, 0'i64]
-  var radius: float32 = float32(NavSampleRadius)
-  var mask: int32 = NavAllAreas
-  var argv: array[4, Il2CppPtr] = [cast[Il2CppPtr](addr at[0]),
-                                   cast[Il2CppPtr](addr hit[0]),
-                                   cast[Il2CppPtr](addr radius),
-                                   cast[Il2CppPtr](addr mask)]
   gNavSamples = gNavSamples + 1
-  result = unboxBool(invokeStatic(gNavM, cast[Il2CppPtr](addr argv[0])))
+  var hx = 0.0
+  var hy = 0.0
+  var hz = 0.0
+  var hd = 0.0
+  var ok = false
+  let found = navSample(p.x, p.y, p.z, NavSampleRadius, int32(NavAllAreas),
+                        hx, hy, hz, hd, ok)
+  if not ok:
+    return
+  result = found
 
 proc runSample*(p: ProbePlan; a: var ProbeAnswers) =
   ## One sample, start to finish, on Unity's thread.
@@ -357,7 +253,7 @@ proc runSample*(p: ProbePlan; a: var ProbeAnswers) =
   ## Nothing here allocates, nothing here logs, nothing here touches the bot
   ## table. The counters are plain increments on this thread's own globals and
   ## are read for a log line rather than for a decision.
-  if gRayM == nil or not p.valid:
+  if not canRaycast() or not p.valid:
     return
   let t0 = perfCounter()
   var i = 0
