@@ -55,6 +55,20 @@ var
   gSkillIds = ""
   gMasteryLevel = 0
   gMasteryFamilies = ""
+  gExperience = 0
+  gExperienceReads = 0
+
+proc configureExperienceFloor*(xp: int) =
+  ## The SVM/profile-manager "set XP" knob, as a FLOOR like every other row in
+  ## this module. Kept off `configureProgression`'s parameter list on purpose:
+  ## that proc has two call sites, and widening a five-argument signature to six
+  ## is how a caller silently passes the new value into the old slot.
+  gExperience = xp
+  inc gExperienceReads
+
+proc experienceFloorReads*(): int = gExperienceReads
+  ## For the read ledger in `emu/svm`: proof this key was CONSULTED. It is not
+  ## proof the profile changed -- `applyExperienceFloor`'s note is that.
 
 proc configureProgression*(playerLevel, skillLevel: int; skillIds: string;
                            masteryLevel: int; masteryFamilies: string) =
@@ -65,7 +79,7 @@ proc configureProgression*(playerLevel, skillLevel: int; skillIds: string;
   gMasteryFamilies = masteryFamilies
 
 proc progressionActive*(): bool =
-  gPlayerLevel > 0 or gSkillLevel > 0 or gMasteryLevel > 0
+  gPlayerLevel > 0 or gSkillLevel > 0 or gMasteryLevel > 0 or gExperience > 0
 
 # ---------------------------------------------------------------------------
 # Level <-> experience
@@ -150,6 +164,27 @@ proc applyPlayerLevel(p: var Profile; notes: var seq[string]): bool =
   setNumber(p, "Info.Level", target)
   notes.add "progression: player level -> " & $target & " (Info.Experience " &
             "= " & $xp & ")"
+  result = true
+
+proc applyExperienceFloor(p: var Profile; notes: var seq[string]): bool =
+  ## Raise `Info.Experience` to an exact number, and re-derive `Info.Level` from
+  ## it rather than leaving the two disagreeing.
+  ##
+  ## `Info.Level` is written from `levelForXp`, not from anything the player
+  ## typed, because the client draws the level it shows from the EXPERIENCE
+  ## against `exp_table` (see the module header). Writing an experience without
+  ## re-deriving the level is the same defect the level row already documents,
+  ## in the other direction: the screen would agree with nothing.
+  if gExperience <= 0:
+    return false
+  if p.experience >= gExperience:
+    return false
+  let lvl = levelForXp(gExperience)
+  setNumber(p, "Info.Experience", gExperience)
+  if lvl > 0:
+    setNumber(p, "Info.Level", lvl)
+  notes.add "progression: Info.Experience -> " & $gExperience &
+            " (level " & $lvl & ", re-derived from the exp table)"
   result = true
 
 proc applySkillLevels(p: var Profile; notes: var seq[string]): bool =
@@ -274,6 +309,9 @@ proc applyProgression*(p: var Profile; notes: var seq[string]): bool =
   var changed = false
   if applyTraderLoyalty(p, notes): changed = true
   if applyPlayerLevel(p, notes): changed = true
+  # AFTER the level row, so that when both are set the higher of the two wins
+  # by the same floor rule rather than by which ran first.
+  if applyExperienceFloor(p, notes): changed = true
   if applySkillLevels(p, notes): changed = true
   if applyMastery(p, notes): changed = true
   result = changed

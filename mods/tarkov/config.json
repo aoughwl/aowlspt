@@ -69,6 +69,18 @@
   "fleaSellFeePercent": 0,
   "fleaSellRequiresFoundInRaid": false,
 
+  "_svmComment": "The SVM/profile-manager rows that are NOT globals.config (emu/svm). The 770 globals rows -- stamina, inertia, malfunction, overheat, armour, flea, exp tables, skills -- are declared programmatically from emu/globaltunedata and are absent from this file ON PURPOSE: an untouched key means no override and no reparse of the 694 KB globals document. stashResult and raidTuneResult are written BY the server, like spawnResult and mapsLockResult.",
+  "stashRows": 0,
+  "stashCols": 0,
+  "stashResult": "",
+  "progressionExperience": 0,
+  "raidTimeMultiplier": 1.0,
+  "raidTimeMinutes": 0,
+  "extractsAlwaysAvailable": false,
+  "extractsNoRequirements": false,
+  "extractsNoTimeWindow": false,
+  "raidTuneResult": "",
+
   "progressionPlayerLevel": 0,
   "progressionSkillLevel": 0,
   "progressionSkillIds": "",

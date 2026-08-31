@@ -350,6 +350,12 @@ proc resolveLocation*(idx: LocationIndex; id: string): string =
     inc i
   result = ""
 
+proc applyRaidTune*(one: var Doc)
+  ## Forward-declared: the raid timing/extract policy is defined beside the map
+  ## lock it shares a cache with (far below), but BOTH servable location
+  ## documents have to apply it, and this is the earlier of the two. Applying it
+  ## in only one place is exactly the bug the lock's own comment records.
+
 proc locationsBody*(d: LootDb; idx: LocationIndex): string =
   ## `{locations: {<_Id>: base}, paths: [...]}` -- the whole of what the client
   ## reads from `/client/locations`.
@@ -369,6 +375,7 @@ proc locationsBody*(d: LootDb; idx: LocationIndex): string =
       var one = parseObject(base)
       if one.ok:
         setBool(one, "Locked", lockedFor(idx.names[i]))
+        applyRaidTune(one)
         put(maps, key, raw(text(one)))
       else:
         put(maps, key, raw(base))
@@ -1173,6 +1180,122 @@ proc lockedFor*(id: string): bool =
       return false
   result = true
 
+# ---------------------------------------------------------------------------
+# Raid timing and extracts -- the SVM rows that live on the LOCATION document
+# ---------------------------------------------------------------------------
+#
+# Same trap as the map lock, and the same answer. `/client/locations` is not
+# answered out of the database, so a `dbWrite` to
+# `locations.<map>.base.EscapeTimeLimit` succeeds and is never served. The
+# policy is therefore held here and applied to whichever of the two documents
+# is being built, and installing it drops `gTunedLocations`.
+#
+# What each row edits, measured against `data/post1/locations.json`
+# (tools/bigjson.py keys, Lighthouse `5704e4dad2720bb55b8b4567`):
+#
+#   base.EscapeTimeLimit      int, minutes, 40 on Lighthouse
+#   base.EscapeTimeLimitCoop  int, minutes, 30 -- present, and NOT the same value
+#   base.exits[].Chance       int percent, 100 on the train exfil
+#   base.exits[].ChancePVE    int percent
+#   base.exits[].PassageRequirement  str, e.g. "Train"; "None" is the open form
+#   base.exits[].MinTime/MaxTime (+PVE)  int seconds, the window the exit exists
+#
+# `EscapeTimeLimitPVE` is written only where the document already HAS it: this
+# table spells the PvE variant `Coop` on the map I measured, and creating a
+# member the client never asked for is the guess CLAUDE.md forbids.
+
+type
+  RaidTunePolicy* = object
+    timeMultiplier*: float
+    timeMinutes*: int          ## absolute override; wins over the multiplier
+    extractsAlwaysAvailable*: bool
+    extractsNoRequirements*: bool
+    extractsNoTimeWindow*: bool
+
+var gRaidTune = RaidTunePolicy(timeMultiplier: 1.0, timeMinutes: 0,
+                               extractsAlwaysAvailable: false,
+                               extractsNoRequirements: false,
+                               extractsNoTimeWindow: false)
+var gRaidTuneApplies = 0
+var gRaidTuneExits = 0
+
+proc setRaidTunePolicy*(p: RaidTunePolicy) =
+  gRaidTune = p
+  gTunedLocations = ""
+
+proc raidTuneTimeActive*(): bool =
+  gRaidTune.timeMinutes > 0 or gRaidTune.timeMultiplier != 1.0
+
+proc raidTuneExitsActive*(): bool =
+  gRaidTune.extractsAlwaysAvailable or gRaidTune.extractsNoRequirements or
+  gRaidTune.extractsNoTimeWindow
+
+proc raidTuneApplies*(): int = gRaidTuneApplies
+proc raidTuneExitsTouched*(): int = gRaidTuneExits
+
+proc tunedMinutes(cur: int): int =
+  if gRaidTune.timeMinutes > 0:
+    return gRaidTune.timeMinutes
+  result = int(float(cur) * gRaidTune.timeMultiplier)
+  if result < 1:
+    result = 1
+
+proc tuneExits(one: var Doc) =
+  let raw = getRaw(one, "exits")
+  if raw.len == 0 or raw[0] != '[':
+    return
+  let list = parseArray(raw)
+  if not list.ok:
+    return
+  var rebuilt = parseArray("[]")
+  var i = 0
+  while i < list.len:
+    var e = parseObject(list.items[i])
+    if not e.ok:
+      # Carried through verbatim rather than dropped. An exit this cannot parse
+      # is an exit the player keeps; silently shortening the list would remove
+      # a way out of the map.
+      rebuilt.add list.items[i]
+      inc i
+      continue
+    if gRaidTune.extractsAlwaysAvailable:
+      if e.has("Chance"): setNumber(e, "Chance", 100)
+      if e.has("ChancePVE"): setNumber(e, "ChancePVE", 100)
+    if gRaidTune.extractsNoRequirements:
+      if e.has("PassageRequirement"): setText(e, "PassageRequirement", "None")
+      if e.has("RequirementTip"): setText(e, "RequirementTip", "")
+    if gRaidTune.extractsNoTimeWindow:
+      if e.has("MinTime"): setNumber(e, "MinTime", 0)
+      if e.has("MinTimePVE"): setNumber(e, "MinTimePVE", 0)
+      if e.has("MaxTime"): setNumber(e, "MaxTime", 999999)
+      if e.has("MaxTimePVE"): setNumber(e, "MaxTimePVE", 999999)
+    rebuilt.add text(e)
+    inc gRaidTuneExits
+    inc i
+  setRaw(one, "exits", text(rebuilt))
+
+proc applyRaidTune*(one: var Doc) =
+  ## One map's base, with the timing and extract policy applied in place.
+  ## A no-op -- and not even a member lookup -- when nothing is configured.
+  if not (raidTuneTimeActive() or raidTuneExitsActive()):
+    return
+  inc gRaidTuneApplies
+  if raidTuneTimeActive():
+    if one.has("EscapeTimeLimit"):
+      let cur = whole(getRaw(one, "EscapeTimeLimit")).asInt(0)
+      if cur > 0:
+        setNumber(one, "EscapeTimeLimit", tunedMinutes(cur))
+    if one.has("EscapeTimeLimitCoop"):
+      let cur = whole(getRaw(one, "EscapeTimeLimitCoop")).asInt(0)
+      if cur > 0:
+        setNumber(one, "EscapeTimeLimitCoop", tunedMinutes(cur))
+    if one.has("EscapeTimeLimitPVE"):
+      let cur = whole(getRaw(one, "EscapeTimeLimitPVE")).asInt(0)
+      if cur > 0:
+        setNumber(one, "EscapeTimeLimitPVE", tunedMinutes(cur))
+  if raidTuneExitsActive():
+    tuneExits(one)
+
 proc post1LocationsTuned*(): string =
   ## The post-1.0 `locations` table with every map's spawn tuning applied --
   ## what `/client/locations` must answer with.
@@ -1215,6 +1338,7 @@ proc post1LocationsTuned*(): string =
       if who.len == 0:
         who = k
       setBool(one, "Locked", lockedFor(who))
+      applyRaidTune(one)
       setRaw(tuned, k, text(one))
     else:
       setRaw(tuned, k, locs.field(k).raw)
