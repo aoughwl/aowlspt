@@ -397,6 +397,45 @@
    ]
   },
   {
+   "//": "The Admin Trader example mod. It was in registry/mods.json and had a",
+   "//1": "built DLL, but no entry HERE -- so `deploy.py deploy --only admintrader`",
+   "//2": "answered `unknown artifact` and the trader could never reach the install.",
+   "//3": "That is the same class of hole `maps` had. Markers below are the two",
+   "//4": "invented ids, the status route, every settings caption, and the quest",
+   "//5": "prose -- none of them generic, each one absent from a stale build.",
+   "name": "admintrader",
+   "src": "mods/admintrader/bin/admintrader.dll",
+   "dst": "mods/admintrader/admintrader.dll",
+   "seed": [
+    {
+     "src": "mods/admintrader/config.json",
+     "dst": "mods/admintrader/config.json",
+     "why": "the enable flag, the trader's display name and the stock cap"
+    }
+   ],
+   "minBytes": 300000,
+   "markers": [
+    "aowl.admintrader",
+    "/admintrader/status",
+    "ad0000000000000000000001",
+    "ad0000000000000000000101",
+    "544fb37f4bdc2dee738b4567",
+    "Add the Admin Trader",
+    "How many items he stocks",
+    "Everything in the handbook, capped.",
+    "Off removes nothing already written",
+    "What the trader is called on the trading ",
+    "Admin Induction",
+    "Bring me one pack of painkillers",
+    "Hand over 1 x Painkillers.",
+    "Good. You now know how a quest works.",
+    "A test trader added by the Admin Trader example ",
+    "the trader is now called \"",
+    "could not rewrite the trader: ",
+    "is disabled in config.json; no trader was added"
+   ]
+  },
+  {
    "name": "graphics",
    "src": "mods/graphics/bin/graphics.dll",
    "dst": "mods/graphics/graphics.dll",
@@ -586,24 +625,24 @@
    ]
   },
   {
-   "//": "`aowl.loadammoanim` is the Manimal Ammo Loading Animations port. The",
+   "//": "`aowl.ammoloading` is the Manimal Ammo Loading Animations port, renamed to 'Ammo Loading' on 2026-08-31. The",
    "//1": "markers below are the three DETOUR targets (all UNIQUE) and the one",
    "//2": "SHARED call target, the mesh-table names the upstream bundle declares,",
    "//3": "and the refusal strings -- because a build that silently lost the",
    "//4": "refusals would look identical to one that works until it fails.",
-   "name": "loadammoanim",
-   "src": "mods/loadammoanim/bin/loadammoanim.dll",
-   "dst": "mods/loadammoanim/loadammoanim.dll",
+   "name": "ammoloading",
+   "src": "mods/ammoloading/bin/ammoloading.dll",
+   "dst": "mods/ammoloading/ammoloading.dll",
    "seed": [
     {
-     "src": "mods/loadammoanim/config.json",
-     "dst": "mods/loadammoanim/config.json",
+     "src": "mods/ammoloading/config.json",
+     "dst": "mods/ammoloading/config.json",
      "why": "the escalation rung, the hijacked bundle key and the safety caps"
     }
    ],
    "minBytes": 300000,
    "markers": [
-    "aowl.loadammoanim",
+    "aowl.ammoloading",
     "LoadMagazineProcess::.ctor@0x768D40/ioooiif>x",
     "ARMED but NEVER FIRED",
     "FIRST FIRING: LoadMagazineProcess::Start",
@@ -627,8 +666,8 @@
    ],
    "data": [
     {
-     "src": "mods/loadammoanim/data",
-     "dst": "mods/loadammoanim/data",
+     "src": "mods/ammoloading/data",
+     "dst": "mods/ammoloading/data",
      "minFiles": 1,
      "why": "stanags_container.bundle, the upstream mod's shipped Animator graph and mag meshes (MIT). Without it there is nothing to instantiate and the spawn rung refuses; vanilla loading is unaffected"
     }

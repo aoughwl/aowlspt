@@ -522,23 +522,23 @@
       ]
     },
     {
-      "id": "aowl.loadammoanim",
-      "name": "Ammo Loading Animations",
-      "author": "aowlspt",
+      "id": "aowl.ammoloading",
+      "name": "Ammo Loading",
+      "author": "aowlspt (port of Manimal's ManimalAmmoLoadingAnimations, MIT)",
       "version": "0.1.0",
-      "description": "First-person animation of hands thumbing rounds into a magazine while it loads, at a speed tied to your Mag Drills skill. A port of Manimal's ManimalAmmoLoadingAnimations (MIT), whose animation bundle is reused verbatim. This is a host-native approximation, not a 1:1 port: the upstream mod injects a managed UsableItemController subclass, which IL2CPP does not allow, so we instantiate the bundle prefab directly and drive its Animator by verified static RVA. Lost relative to upstream: Fika co-op sync and ContinuousLoadAmmo compatibility. Default OFF, with a five-rung escalation ladder, because it detours the live magazine-loading flow.",
+      "description": "Everything about putting rounds into a magazine and taking them out again. TWO features. (1) THE ANIMATION: first-person animation of hands thumbing rounds into a magazine while it loads, at a speed tied to your Mag Drills skill. A port of Manimal's ManimalAmmoLoadingAnimations (MIT), whose animation bundle is reused verbatim. This is a host-native approximation, not a 1:1 port: the upstream mod injects a managed UsableItemController subclass, which IL2CPP does not allow, so we instantiate the bundle prefab directly and drive its Animator by verified static RVA. Lost relative to upstream: Fika co-op sync and ContinuousLoadAmmo compatibility. Default OFF, with a five-rung escalation ladder, because it detours the live magazine-loading flow. As of 2026-08-31 the animation is ARMED but NEVER FIRED -- installed and waiting, never observed on a live magazine load -- and its spawn/animate rungs additionally need a bundle riding a vanilla key via aowl.textures (redirectMode=full + bundleRoot), which is not set up. (2) THE SPEED of loading and unloading, which this mod deliberately does NOT own: it is globals.config.BaseLoadTime / BaseUnloadTime / LoadTimeSpeedProgress, already three rows of aowl.tarkov's Globals tuning page.",
       "pipeline": ">=0.1.0",
       "sides": [
         "client"
       ],
       "source": {
         "kind": "intree",
-        "path": "mods/loadammoanim",
+        "path": "mods/ammoloading",
         "url": null
       },
       "artifact": {
-        "dir": "loadammoanim",
-        "library": "loadammoanim.dll"
+        "dir": "ammoloading",
+        "library": "ammoloading.dll"
       },
       "upstream": "https://github.com/danauraborealis/ManimalAmmoLoadingAnimations",
       "license": "MIT (upstream assets and design); see LICENSE.upstream.txt",
@@ -560,9 +560,9 @@
       "name": "Admin Trader",
       "author": "aowlspt",
       "version": "1.0.0",
-      "description": "The canonical 'how to write an aowlspt mod' example, and a working test mod. Adds a brand new trader who stocks every tradeable item in the handbook for nothing, and gives out one complete example quest. It demonstrates the only server-side mechanism there is: the emulator serves traders and quests straight out of the loaded database, so a mod that wants a new one writes JSON at traders.<id> and templates.quests.<id> with dbWrite. Read it alongside its README, which is a tutorial rather than a reference. Ships on no default list -- a free-everything trader is a debugging tool, not a game.",
+      "description": "The canonical 'how to write an aowlspt mod' example, and a working test mod. Adds a brand new trader who stocks every tradeable item in the handbook for nothing, and gives out one complete example quest. It demonstrates the only server-side mechanism there is: the emulator serves traders and quests straight out of the loaded database, so a mod that wants a new one writes JSON at traders.<id> and templates.quests.<id> with dbWrite. Read it alongside its README, which is a tutorial rather than a reference. SHIPPED (the artifact is staged into every install, because it lives under mods/* and a user who wants to see it must be able to enable it without a rebuild) but on NO default list -- a free-everything trader is a debugging tool, not a game. Turn it on with GET /aowlspt/mods/enable/aowl.admintrader; see docs/MOD-ENABLE-PATH.md.",
       "pipeline": ">=0.1.0",
-      "shipped": false,
+      "shipped": true,
       "sides": [
         "server",
         "sim"
@@ -682,7 +682,7 @@
           "note": "registered and present but NOT enabled: it has never run against the live client. Flip this to true (or select it in the manager) to load it; both of its features are still individually default-OFF after that, so loading it changes nothing on screen until a setting is turned on."
         },
         {
-          "id": "aowl.loadammoanim",
+          "id": "aowl.ammoloading",
           "enabled": true,
           "note": "selected so the mod stays loaded long enough to reach its own arming ladder; before this it was resolved not-selected, served enabled:false, and unloaded by the client host seconds after loading -- long before its 12s armDelayMs -- which read as the mod being broken. Its animation detour is still default-OFF behind its own config, so selecting it installs no hook."
         }
