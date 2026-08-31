@@ -70,6 +70,24 @@
 
 #include <stdint.h>
 
+/* THIS HEADER IS SELF-SUFFICIENT ON PURPOSE.
+ *
+ * It used to declare nothing and rely on the includer (aowlhost.nim) having
+ * already emitted the shim and prologue headers above it. That is an ordering
+ * contract nothing enforces: any other translation unit that pulls this file in
+ * gets IMPLICIT DECLARATIONS of `aowl_is_readable`, `aowl_p_p_seh` and
+ * `aowl_pro_verify`, so C89 rules make them return `int` -- and on Win64 that
+ * TRUNCATES `aowl_p_p_seh`'s returned pointer to 32 bits. A warning about an
+ * int->void* conversion is the symptom; a silently halved pointer is the bug.
+ * The right fix is a real prototype, never a cast at the call site.
+ *
+ * Both files carry include guards, so this is idempotent and the existing host
+ * include order is unaffected. windows.h (LONG, InterlockedExchange,
+ * VirtualQuery) arrives through them.
+ */
+#include "aowlspt_shim.h"      /* aowl_is_readable, aowl_p_p_seh */
+#include "aowlspt_prologue.h"  /* aowl_pro_verify                */
+
 /* Public, for mod consumers. */
 #define AOWL_UI_OVL_SETTINGS  0x1u   /* the GAME's Settings screen is open  */
 #define AOWL_UI_OVL_ADMIN     0x2u   /* our F6 admin overlay is open        */
