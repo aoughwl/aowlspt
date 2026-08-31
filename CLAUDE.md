@@ -222,6 +222,24 @@ the exit patch, the version brand, image serving). Use `python tools/deploy.py c
 — it refuses on any missing marker, backs up with a timestamp, and prints the rollback
 line. Marker list is data in `tools/deploy.json`; **never edit it to make a check pass.**
 
+`deploy.py` covers only the **host** DLL. For a **mod** DLL use `tools/markers.py <dll>
+<marker>...`, which shares `tools/litscan.py` with it and reports three outcomes
+(PRESENT / MISSING / **INCONCLUSIVE**, exits 0 / 1 / 3).
+
+**NEVER marker-check a binary with PowerShell.** `[Text.Encoding]::ASCII.GetString()`
+maps every byte >= 0x80 to `?`, so any marker containing a non-ASCII character reads as
+ABSENT — a confidently wrong answer. THREE separate agents hit this in one session; one
+lost ten minutes to 14 false MISSINGs, one nearly concluded its build had not picked up
+its own edits. `[Text.Encoding]::Latin1` is **`$null`** on PS 5.1, and PowerShell returns
+`$null` for a missing static property instead of throwing — so a `try/catch` probe reports
+"Latin1 exists", wrongly. Use `markers.py`, or `grep -a`.
+
+And remember Nimony stores each `&`-concatenated fragment as a **separate rodata entry**,
+so a long literal legitimately may not appear contiguously: that is INCONCLUSIVE, not
+MISSING. `markers.py` measures fragment coverage and says which it is; a naive byte
+search cannot tell them apart, and `--absent` needs a positive control or it can pass
+vacuously.
+
 ## 5. IL2CPP facts
 
 Reflection is **NOT dead** -- it is **TOKEN-GATED**. This is stock IL2CPP with a gated export ABI (`docs/IL2CPP_EXPORTS.md` -- NOTE: that file currently lives ONLY on the
