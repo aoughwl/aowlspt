@@ -97,6 +97,13 @@ type
     swkStub                     ## drawn and labelled, bound to nothing yet
     swkToggle                   ## a bool -> SettingToggle clone
     swkSlider                   ## a float -> SettingFloatSlider clone
+    swkColor                    ## an RGB colour -> a NUIKIT-BUILT widget
+    ## `swkColor` is the ONE kind here that is not a clone of a game widget.
+    ## There is no colour control anywhere on a stock settings tab to clone, so
+    ## it is BUILT from `nuPanel`/`nuLabel` primitives (a swatch, three channel
+    ## tracks with fills, and a readout) and driven by POLLED pointer input off
+    ## the Update drain. See `colorwidget.nim`; `settingspages.nim` only calls
+    ## the three entry points forward-declared below.
 
   SwRow* = object
     key*: string                ## the config key, verbatim
@@ -116,6 +123,30 @@ type
     ## it was last seeded with, so a change made by the player can be spotted.
     clone*: uint64
     seeded*: bool
+    ## Current value for `swkColor`, 0..1 per channel. Kept as four floats
+    ## rather than a packed uint32 because that is the form every setter on the
+    ## path (`Graphic::set_color`, `nuSetColor`) actually takes, and a
+    ## conversion that exists only at the edges is one that cannot be got wrong
+    ## in the middle.
+    cr*: float32
+    cg*: float32
+    cb*: float32
+    ca*: float32
+    ## Index into `colorwidget.nim`'s fixed widget table, BIASED BY ONE:
+    ## 0 means "this row has no colour widget", n means table slot n-1.
+    ##
+    ## The bias is not cosmetic. `SwRow` is default-constructed in several
+    ## places (`swRow`, the header rows in `modSetGroupByCategory`, every
+    ## `SwRow(kind: ...)` literal), and a plain index would default to 0 --
+    ## which is a VALID slot. Every non-colour row in the host would then claim
+    ## to own widget 0, and the first colour row built would be driven, read
+    ## back and persisted through all of them. Biasing makes the default mean
+    ## what it has to mean.
+    ##
+    ## NOT a pointer: the widget owns several nuikit handles whose lifetime is
+    ## its own, and a raw pointer here would be exactly the stale-handle bug
+    ## nuikit's generation counters exist to prevent.
+    cwIdx*: int32
 
   SwPage* = object
     id*: string                 ## stable key, e.g. "host"
@@ -153,6 +184,19 @@ const cSwMaxRows = 48
 ## write) applies just as much to "never blind-render".
 const cSwMaxLabelLen = 200
 const cSwMaxKeyLen = 200
+
+## FORWARD DECLARATIONS into `colorwidget.nim`, which is `include`d AFTER this
+## file (it needs `nuikit.nim`'s constructors and `modsettingsrender.nim`'s
+## `modSetQueueWrite`, both of which come later in `aowlhost.nim`'s include
+## order). nimony forward-resolves procs across an include boundary but NOT
+## variables, which is why these are procs and why no `colorwidget` global is
+## named here.
+##
+## Three entry points, and nothing else crosses the boundary:
+proc cwBuildForRow(rowClone, parentGo: Il2CppPtr; key, modGuid: string;
+                   r, g, b, a: float32): int32
+proc cwRowColor(slot: int32; r, g, b, a: var float32): bool
+proc cwDestroySlot(slot: int32)
 
 proc swRowIsSane(row: SwRow; why: var string): bool =
   ## True if `row` is safe to hand to `swCloneRow`/`swSeedToggle`. Every check
@@ -832,6 +876,28 @@ proc swRenderPage(tabPtr, parentGo: Il2CppPtr; page: var SwPage): int =
       if page.rows[i].kind == swkToggle:
         swCrumbP("swSeedToggle for row '" & text & "' clone", clone)
         page.rows[i].seeded = swSeedToggle(clone, page.rows[i].bval)
+      elif page.rows[i].kind == swkColor:
+        # THE COLOUR WIDGET. Not a clone: there is no colour control on any
+        # stock settings tab to clone, so it is BUILT on top of the row's own
+        # clone (which supplies the label and the row styling) from nuikit
+        # primitives. A build failure is not fatal to the page -- the row stays
+        # as a labelled clone, `seeded` stays false, and read-back therefore
+        # gives it no vote, exactly like a toggle whose seed refused.
+        swCrumbP("cwBuildForRow for row '" & text & "' clone", clone)
+        let slot = cwBuildForRow(clone, parentGo, page.rows[i].key,
+                                 page.modGuid,
+                                 page.rows[i].cr, page.rows[i].cg,
+                                 page.rows[i].cb, page.rows[i].ca)
+        if slot >= 0'i32:
+          page.rows[i].cwIdx = slot + 1'i32     # biased: 0 means "none"
+          page.rows[i].seeded = true
+        else:
+          page.rows[i].cwIdx = 0'i32
+          page.rows[i].seeded = false
+          warn "settings pages: row '" & page.rows[i].key & "' is a colour " &
+               "row and its widget did NOT build (colorwidget logged the " &
+               "reason above). The row is drawn and labelled and is bound to " &
+               "nothing; no value will be written for it."
       result = result + 1
       # ONE-SHOT GEOMETRY DUMP. Rows are being cloned and labelled and the user
       # sees nothing, so the next question is WHERE they went -- and that is a
@@ -848,6 +914,44 @@ proc swRenderPage(tabPtr, parentGo: Il2CppPtr; page: var SwPage): int =
            " -- " & $skipped & " row(s) SKIPPED as unsafe (last reason: " &
            lastSkipWhy & ")"
          else: "")
+
+proc swHexNib(v: int): string =
+  const digits = "0123456789abcdef"
+  var n = v
+  if n < 0: n = 0
+  if n > 15: n = 15
+  $digits[n]
+
+proc swColorHex(r, g, b: float32): string =
+  ## `#rrggbb`, the exact form `aowl/src/aowlspt/settings.nim`'s
+  ## `colorSetting(format=)` reads back and the web picker already writes, so a
+  ## value set in game and a value set in the browser are the same string. A
+  ## second encoding here would be a second thing to get wrong.
+  ##
+  ## Clamped, not asserted: these floats come from a pointer position mapped
+  ## through a rect, and a value a hair outside 0..1 from float error must
+  ## produce `ff`, not wrap to `00`.
+  result = "#"
+  var ch: seq[float32] = @[]
+  ch.add r
+  ch.add g
+  ch.add b
+  var i = 0
+  while i < 3:                            # capped by construction
+    var v = ch[i]
+    if not (v > 0.0'f32): v = 0.0'f32     # NaN-safe: !(v > 0) catches NaN
+    if v > 1.0'f32: v = 1.0'f32
+    let b255 = int(v * 255.0'f32 + 0.5'f32)
+    result = result & swHexNib(b255 div 16) & swHexNib(b255 mod 16)
+    i = i + 1
+
+proc swColorNear(a, b: float32): bool =
+  ## Same 8-bit colour? Compared at the resolution the value is STORED at, not
+  ## at float resolution. A drag produces a new float every frame while the
+  ## byte it encodes to is unchanged, and comparing floats would POST a write
+  ## per frame for a colour that never actually changed.
+  let d = a - b
+  (if d < 0.0'f32: -d else: d) < (0.5'f32 / 255.0'f32)
 
 proc swReadBackPage(page: var SwPage) =
   ## Read every rendered row's live value and persist the ones the player
@@ -894,6 +998,53 @@ proc swReadBackPage(page: var SwPage) =
           page.rows[i].bval = live
         elif swSetHostFlag(page.rows[i].key, live):
           page.rows[i].bval = live
+    elif page.rows[i].kind == swkColor and page.rows[i].seeded and
+         page.rows[i].cwIdx > 0'i32:
+      # THE COLOUR ROW'S READ-BACK. Deliberately the same shape as the toggle
+      # branch above, including the `seeded` gate, and for the same measured
+      # reason: a row we never bound has no opinion, and letting it vote is
+      # what silently rewrote `uxVersionBrand` in a previous build.
+      #
+      # `cwRowColor` reads the LIVE swatch Graphic's `m_Color` back out of the
+      # scene -- it does not return the widget's own record of what it last
+      # wrote. That distinction is the whole of CLAUDE.md 9b: a comparison
+      # against our own write cannot fail, and this feature's ancestor
+      # ("0 did not take" for 16 visibly-wrong rows) is the reason it is
+      # spelled out here.
+      var lr = 0.0'f32
+      var lg = 0.0'f32
+      var lb = 0.0'f32
+      var la = 0.0'f32
+      if cwRowColor(page.rows[i].cwIdx - 1'i32, lr, lg, lb, la):
+        if not swColorNear(lr, page.rows[i].cr) or
+           not swColorNear(lg, page.rows[i].cg) or
+           not swColorNear(lb, page.rows[i].cb):
+          let was = swColorHex(page.rows[i].cr, page.rows[i].cg,
+                               page.rows[i].cb)
+          let now = swColorHex(lr, lg, lb)
+          okLog "settings pages: row '" & page.rows[i].key & "' changed " &
+                was & " -> " & now & " in game"
+          if page.modGuid.len > 0:
+            # THE ONLY PERSISTENCE PATH, and the one that matters: this POSTs
+            # to `/aowlspt/settings/<guid>`, which is what runs the mod's
+            # `onSettingsApplied`. A value stored without that hook changes a
+            # file and nothing else -- the setting appears to work and does
+            # nothing, which is worse than a row that says it is not wired.
+            modSetQueueWrite(page.modGuid, page.rows[i].key, now)
+            page.rows[i].cr = lr
+            page.rows[i].cg = lg
+            page.rows[i].cb = lb
+          else:
+            # A HOST page. `swSetHostFlag` writes a BOOL and there is no string
+            # equivalent on this path, so there is nothing here that could
+            # honestly persist a colour. Say so once per change rather than
+            # dropping the edit silently -- and do NOT update the row, so the
+            # widget keeps showing what is actually stored.
+            warn "settings pages: row '" & page.rows[i].key & "' is a colour " &
+                 "on a HOST page (modGuid empty). The host config writer takes " &
+                 "a bool only, so this edit is NOT persisted. Colour settings " &
+                 "belong on a mod page, where the write goes through " &
+                 "onSettingsApplied."
     i = i + 1
 
 proc swPagesOnTabBuilt(tabPtr: Il2CppPtr; tabName: string; revisit: bool) =

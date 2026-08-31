@@ -380,6 +380,11 @@ typedef struct AowlNuTarget {
 #define AOWL_NU_CANVAS_SET_RENDERMODE 29
 #define AOWL_NU_CANVAS_GET_RENDERMODE 30
 #define AOWL_NU_CANVAS_SET_SORTORDER  31
+/* --- polled pointer input, for the native colour widget ------------------ */
+#define AOWL_NU_INPUT_GET_MOUSEBTN    32
+#define AOWL_NU_INPUT_GET_MOUSEPOS    33
+#define AOWL_NU_TR_GET_POSITION       34
+#define AOWL_NU_TR_GET_LOSSYSCALE     35
 
 /* UnityEngine.RenderMode. Named, because `0` appearing bare in a refusal is
  * indistinguishable from "we did not read anything". */
@@ -508,10 +513,66 @@ static const AowlNuTarget aowl_nu_targets[] = {
     { "UnityEngine.Canvas::set_sortingOrder", 0x5584590u,
       { 0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,
         0xD7,0x39,0xB5 }, 16 },
+    /* --- POLLED POINTER INPUT (indices 32..35), added for the native colour
+     * widget. There is no delegate path on this build (see the INPUT header
+     * comment in nativeui.nim), so interaction is a per-frame READ made from
+     * the TarkovApplication::Update drain, on the Unity main thread.
+     *
+     * PROVENANCE, all four, measured with
+     *   tools/il2cpp_resolve.py <asm> <metadec> type <T>   (RVA)
+     *   ... shared <RVA>                                   (sharedness)
+     *   ... bytes  <RVA>                                   (the 16 bytes below)
+     * Every one is sharedness=UNIQUE (owners=1) and has a real body -- none is
+     * the 0x628110 `C2 00 00` universal empty-body stub.
+     *
+     * NOTE ON THE TYPE. This is `UnityEngine.Input` in
+     * UnityEngine.InputLegacyModule.dll -- the STATIC legacy API. It is NOT
+     * `UnityEngine.UIElements.Input`, an unrelated INSTANCE class in
+     * UIElementsModule whose `get_mousePosition` at 0xCF96D0 is SHARED by 4
+     * methods. Resolving "Input::get_mousePosition" by member name finds that
+     * one first; binding it would have been an instance call with no `this`. */
+    { "UnityEngine.Input::GetMouseButton", 0x531EBD0u,
+      { 0x40,0x53,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,0x53,0x71,0xDB,0x01,
+        0x8B,0xD9,0x48 }, 16 },
+    { "UnityEngine.Input::get_mousePosition_Injected", 0x531F740u,
+      { 0x40,0x53,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,0x73,0x66,0xDB,0x01,
+        0x48,0x8B,0xD9 }, 16 },
+    /* The screen-rect mapper. An overlay canvas puts world space AT screen
+     * space, so centre = get_position and half-extent = rect * lossyScale is
+     * the whole mapping -- and it needs NO managed array, which is why
+     * `RectTransform::GetWorldCorners(Vector3[])` was NOT used: it takes a
+     * managed Vector3[] and allocating one per frame breaks rule 7. */
+    { "UnityEngine.Transform::get_position_Injected", 0x52BA1E0u,
+      { 0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,
+        0x17,0xAA,0xE1 }, 16 },
+    { "UnityEngine.Transform::get_lossyScale_Injected", 0x52BAA50u,
+      { 0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,
+        0x4F,0xA2,0xE1 }, 16 },
 };
 
 #define AOWL_NU_TARGET_COUNT \
     ((int32_t)(sizeof(aowl_nu_targets) / sizeof(aowl_nu_targets[0])))
+
+/* THE POSITIONAL-BINDING SELF-CHECK, and the measured defect it exists for.
+ *
+ * `nativeui.nim` indexes this table by POSITION, through the `NuT*` constants.
+ * `aowl_du_targets` is indexed the same way and HAS had a self-check since the
+ * 2026-08-24 defect, where inserting a row in the middle silently re-pointed
+ * `DuGetParent` at `Transform::set_localPosition` -- a byte-verified function
+ * of the wrong shape, called with the wrong frame. This table had NO such
+ * check. Adding four rows is exactly the edit that causes that bug, so the
+ * check comes with them.
+ *
+ * A name lookup, not an assertion, so the Nim side can report WHICH index is
+ * wrong rather than failing anonymously. */
+static const char* aowl_nu_target_name(int32_t i) {
+    if (i < 0 || i >= AOWL_NU_TARGET_COUNT) return "";
+    return aowl_nu_targets[i].name;
+}
+static uint32_t aowl_nu_target_rva(int32_t i) {
+    if (i < 0 || i >= AOWL_NU_TARGET_COUNT) return 0u;
+    return aowl_nu_targets[i].rva;
+}
 
 static int32_t aowl_nu_verified = 0;
 static int32_t aowl_nu_rejected = 0;
@@ -724,6 +785,18 @@ static int32_t aowl_nu_call_b_s1(void* fn, void* a0) {
     if (!fn || !a0) return 0;
     return ((AowlNu_B_S1)fn)(a0, NULL) ? 1 : 0;
 }
+/* STATIC, ONE int32 ARG -> bool. `Input::GetMouseButton(0)` is the whole
+ * reason this exists and cannot use `aowl_nu_call_b_s1`: that one REFUSES a
+ * NULL a0, and button 0 -- the left mouse button, the only one this widget
+ * cares about -- is exactly the argument it would refuse. Passing an int
+ * through a void* parameter would have "worked" and been a lie about the ABI
+ * in the signature, which is the kind of thing that reads as correct for a
+ * year. */
+typedef unsigned char (*AowlNu_B_SI)(int32_t, void*);
+static int32_t aowl_nu_call_b_si(void* fn, int32_t a0) {
+    if (!fn) return 0;
+    return ((AowlNu_B_SI)fn)(a0, NULL) ? 1 : 0;
+}
 /* The generic shape. A NULL MethodInfo* is REFUSED rather than passed: the
  * shared body dereferences it at +0x38, so a NULL there is an immediate access
  * violation with nothing learned. */
@@ -766,6 +839,22 @@ static void  aowl_nu_c4in_set(float r, float g, float b, float a) {
     g_nu_c4in[0]=r; g_nu_c4in[1]=g; g_nu_c4in[2]=b; g_nu_c4in[3]=a;
 }
 static void* aowl_nu_c4in_ptr(void) { return (void*)g_nu_c4in; }
+
+/* A Vector3 (12 bytes) out-buffer for the three `_Injected` getters the colour
+ * widget's pointer mapping uses: `Input::get_mousePosition_Injected`,
+ * `Transform::get_position_Injected`, `Transform::get_lossyScale_Injected`.
+ * Zeroed on hand-out for the same reason `aowl_nu_v2out_ptr` is: a getter that
+ * does not write leaves the PREVIOUS reading in place, and a stale pointer
+ * position that happens to be plausible is worse than no reading at all.
+ * Same not-re-entrant, main-thread-only, one-call-at-a-time contract as the
+ * Vector2 buffers above. */
+static float g_nu_v3out[3];
+static void* aowl_nu_v3out_ptr(void) { g_nu_v3out[0]=0.0f; g_nu_v3out[1]=0.0f;
+                                       g_nu_v3out[2]=0.0f;
+                                       return (void*)g_nu_v3out; }
+static float aowl_nu_v3out_x(void) { return g_nu_v3out[0]; }
+static float aowl_nu_v3out_y(void) { return g_nu_v3out[1]; }
+static float aowl_nu_v3out_z(void) { return g_nu_v3out[2]; }
 
 static float aowl_nu_rect_x(void) { return g_nu_rect[0]; }
 static float aowl_nu_rect_y(void) { return g_nu_rect[1]; }
