@@ -40,9 +40,20 @@
 /* Discovery walk. Breadth-first over the scene roots, sliced across frames so
  * one frame can never spend the whole budget. Both bound the SAME walk: the
  * node budget bounds it in total, the millisecond slice bounds it per frame. */
-#define AOWL_NE_MAX_NODES     6000
+#define AOWL_NE_MAX_NODES     20000
 #define AOWL_NE_MAX_CHILDREN  512
 #define AOWL_NE_SLICE_MS      6
+
+/* DEPTH cap. A raid scene is orders of magnitude larger than a menu -- Woods
+ * alone reports 62 geometry chunks -- and an undepth-capped breadth-first walk
+ * spends its whole node budget on terrain before it ever reaches a UI root. A
+ * Canvas is the ROOT of a uGUI tree: it sits within a few levels of a scene
+ * root, never buried under terrain. Capping depth is therefore not a heuristic
+ * shortcut, it is the actual shape of the thing being looked for -- and it is
+ * what keeps the walk exhaustive WITHIN its cap instead of truncated at random.
+ * Nested canvases deeper than this are deliberately out of scope; the refusal
+ * line says so rather than implying the search was complete. */
+#define AOWL_NE_MAX_DEPTH     8
 
 /* A canvas smaller than this in either axis is not a HUD canvas; refusing it is
  * cheaper than parenting to a 0x0 rect and reporting success forever. */
@@ -55,6 +66,23 @@
 
 /* Self-disable after this many faults inside the guarded body. */
 #define AOWL_NE_MAX_FAULTS    6
+
+/* Discovery gets its OWN, separate fault ledger.
+ *
+ * MEASURED (integ-beta6, loaded Woods raid, host log): six consecutive guarded
+ * ticks faulted during state=1 and the feature self-disabled for the session
+ * before discovery had finished even one pass. The cause was Unity FAKE NULLS
+ * -- destroyed UnityEngine.Object wrappers that stay perfectly READABLE with
+ * m_CachedPtr zeroed -- reached through the nu* icall wrappers, which checked
+ * readability but never liveness. Those nodes are now liveness-checked and
+ * SKIPPED as a normal outcome, so they are not faults at all.
+ *
+ * Anything that still faults during the walk is genuinely unexpected, and it
+ * charges this ledger rather than the steady-state one: a per-frame walk that
+ * touches thousands of foreign objects must not be able to burn down the
+ * running feature's budget. It still self-disables -- rule 6 is not weakened,
+ * only given its own, honestly-named counter. */
+#define AOWL_NE_MAX_DISC_FAULTS 24
 
 /* ---- the faction sub-pools -------------------------------------------- */
 /* EPlayerSide is 1=Usec, 2=Bear, 4=Savage -- NOT 3. Savage is split by
@@ -119,6 +147,7 @@ static float aowl_ne_faction_rgba(int32_t f, int32_t chan) {
 #define AOWL_NE_R_BUILD_FAILED  10
 #define AOWL_NE_R_FAULTED       11
 #define AOWL_NE_R_NO_STRING     12
+#define AOWL_NE_R_DISC_FAULTED  13
 
 static const char *aowl_ne_refusal_text(int32_t r) {
     switch (r) {
@@ -140,6 +169,7 @@ static const char *aowl_ne_refusal_text(int32_t r) {
     case AOWL_NE_R_NO_GRAPHIC:   return "no live Graphic donor was found, so nuAdd could only ever answer INCONCLUSIVE for the box component";
     case AOWL_NE_R_BUILD_FAILED: return "the pool build refused partway; the partial pool was destroyed rather than left half-parented";
     case AOWL_NE_R_FAULTED:      return "self-disabled after AOWL_NE_MAX_FAULTS faults inside the guarded tick";
+    case AOWL_NE_R_DISC_FAULTED: return "the canvas walk itself faulted AOWL_NE_MAX_DISC_FAULTS times; every node is liveness-checked before any internal call, so these were NOT fake nulls and the cause is unknown -- discovery stopped rather than fault every frame";
     case AOWL_NE_R_NO_STRING:    return "the two managed type-name strings could not be interned (nativeui's intern table is full); GetComponent(String) has nothing to be asked with";
     default:                     return "?";
     }
@@ -156,6 +186,8 @@ static int32_t aowl_ne_factions(void)    { return AOWL_NE_FACTIONS; }
 static int32_t aowl_ne_per_faction(void) { return AOWL_NE_PER_FACTION; }
 static int32_t aowl_ne_max_nodes(void)   { return AOWL_NE_MAX_NODES; }
 static int32_t aowl_ne_max_children(void){ return AOWL_NE_MAX_CHILDREN; }
+static int32_t aowl_ne_max_depth(void)   { return AOWL_NE_MAX_DEPTH; }
+static int32_t aowl_ne_max_disc_faults(void) { return AOWL_NE_MAX_DISC_FAULTS; }
 static int32_t aowl_ne_slice_ms(void)    { return AOWL_NE_SLICE_MS; }
 static int32_t aowl_ne_scan_every(void)  { return AOWL_NE_SCAN_EVERY; }
 static float   aowl_ne_min_canvas_px(void) { return AOWL_NE_MIN_CANVAS_PX; }

@@ -107,6 +107,8 @@ proc cNeFactions(): int32 {.importc: "aowl_ne_factions", nodecl.}
 proc cNePerFaction(): int32 {.importc: "aowl_ne_per_faction", nodecl.}
 proc cNeMaxNodes(): int32 {.importc: "aowl_ne_max_nodes", nodecl.}
 proc cNeMaxChildren(): int32 {.importc: "aowl_ne_max_children", nodecl.}
+proc cNeMaxDepth(): int32 {.importc: "aowl_ne_max_depth", nodecl.}
+proc cNeMaxDiscFaults(): int32 {.importc: "aowl_ne_max_disc_faults", nodecl.}
 proc cNeSliceMs(): int32 {.importc: "aowl_ne_slice_ms", nodecl.}
 proc cNeScanEvery(): int32 {.importc: "aowl_ne_scan_every", nodecl.}
 proc cNeMinCanvasPx(): float32 {.importc: "aowl_ne_min_canvas_px", nodecl.}
@@ -127,6 +129,7 @@ const
   NeRBuildFailed  = 10'i32
   NeRFaulted      = 11'i32
   NeRNoString     = 12'i32
+  NeRDiscFaulted  = 13'i32
 
 const
   NeVInconclusive = 0'i32
@@ -185,14 +188,64 @@ var gNeDiagAt = 0'u64
 
 # ---- discovery walk state (breadth-first, sliced across frames) ----------
 var gNeQueue: seq[Il2CppPtr] = @[]
+var gNeDepth: seq[int32] = @[]       ## depth of the node at the same index
 var gNeHead = 0
 var gNeBudget = 0
 var gNeSeeded = false
 var gNeBestArea = 0'f32
 var gNeVisited = 0
 
+# ---- the discovery ledger, reported verbatim in the diag line -------------
+var gNeSeedCount = 0     ## scene roots that survived the liveness check
+var gNeSeedDead = 0      ## scene roots that were fake nulls at seed time
+var gNeFakeNull = 0      ## nodes SKIPPED because their native half was gone
+var gNeCandidates = 0    ## nodes that had a Canvas component at all
+var gNeRejected = 0      ## Canvases that failed the acceptance rule
+var gNeDeepest = 0       ## deepest level actually reached
+var gNeTruncated = 0     ## children NOT queued because of the depth cap
+var gNeDiscFaults = 0    ## faults charged to discovery, not to steady state
+
 proc neOk(p: Il2CppPtr; n: int32): bool =
   p != nil and cIsReadable(p, n) != 0'i32
+
+# ---------------------------------------------------------------------------
+# LIVENESS, NOT READABILITY
+#
+# MEASURED (integ-beta6, loaded Woods raid): discovery faulted on six
+# consecutive frames and self-disabled. Readability was never the missing
+# check -- a destroyed UnityEngine.Object keeps a perfectly READABLE managed
+# shell with `m_CachedPtr` (+0x10) zeroed. Unity's "fake null". The nu*
+# primitives in nativeui.nim guard with `nuOk`, which is readability only,
+# and every one of the four this walk uses -- Component::get_gameObject,
+# GameObject::get_transform, GameObject::get_activeInHierarchy and
+# RectTransform::get_rect_Injected -- is an ICALL that dereferences that
+# zeroed pointer inside Unity's C++, where no `aowl_p_p_seh` of ours reaches.
+# In a menu those objects are rare; in a raid the tree is full of them.
+#
+# So natesp calls the nu* layer ONLY through these wrappers. They are local on
+# purpose: nativeui is shared with other features and tightening it under them
+# is a change with a blast radius this fix has no business taking.
+# ---------------------------------------------------------------------------
+proc neLive(p: Il2CppPtr): bool =
+  ## duOk is readability; iUnityAlive reads m_CachedPtr. BOTH, in that order --
+  ## a plain guarded field read that cannot itself fault.
+  duOk(p, 0x20'i32) and iUnityAlive(p)
+
+proc neGameObjectOf(component: Il2CppPtr): Il2CppPtr =
+  if not neLive(component): return nil
+  let go = nuGameObjectOf(component)
+  if not neLive(go): return nil
+  go
+
+proc neTransformOf(go: Il2CppPtr): Il2CppPtr =
+  if not neLive(go): return nil
+  let tr = nuTransformOf(go)
+  if not neLive(tr): return nil
+  tr
+
+proc neActiveInHier(go: Il2CppPtr): bool =
+  if not neLive(go): return false
+  nuActiveInHierarchy(go)
 
 proc neF(v: float32): string = formatFloat(float64(v), ffDecimal, 1)
 
@@ -202,6 +255,9 @@ proc neRefuse(why: int32) =
   gNeState = NeRefused
   gNeWhy = why
   gNeVerdict = NeVInconclusive
+  gNeQueue = @[]
+  gNeDepth = @[]
+  gNeHead = 0
   warn "natesp: canvas discovery REFUSED -- " & readCString(cNeRefusalText(why))
 
 # ---------------------------------------------------------------------------
@@ -265,11 +321,13 @@ proc neCanvasRect(canvas: Il2CppPtr; w, h: var float32): bool =
   ## getter -- not an assumption and not a constant.
   w = 0'f32
   h = 0'f32
-  let go = nuGameObjectOf(canvas)
+  let go = neGameObjectOf(canvas)
   if go == nil: return false
-  if not nuActiveInHierarchy(go): return false
-  let tr = nuTransformOf(go)
+  if not neActiveInHier(go): return false
+  let tr = neTransformOf(go)
   if tr == nil: return false
+  # get_rect_Injected is an ICALL too; `tr` is already liveness-checked by
+  # neTransformOf, so this is the one hop that does not need its own re-check.
   let (okR, _, _, rw, rh) = nuGetRect(tr)
   if not okR: return false
   if not (rw >= cNeMinCanvasPx()) or not (rh >= cNeMinCanvasPx()): return false
@@ -282,16 +340,33 @@ proc neSeed(): bool =
   ## reach, INCLUDING DontDestroyOnLoad -- which SceneManager excludes by
   ## design, so it is reached through a live anchor instead.
   gNeQueue = @[]
+  gNeDepth = @[]
   gNeHead = 0
   gNeBudget = int(cNeMaxNodes())
   gNeVisited = 0
   gNeBestArea = 0'f32
+  gNeSeedCount = 0
+  gNeSeedDead = 0
+  gNeFakeNull = 0
+  gNeCandidates = 0
+  gNeRejected = 0
+  gNeDeepest = 0
+  gNeTruncated = 0
   var roots: seq[Il2CppPtr] = @[]
   discard iSceneRoots(roots, false, gSplUpdatePreloader)
   for g in roots:
-    if not duOk(g, 0x20'i32): continue
-    let tr = nuTransformOf(g)
-    if tr != nil: gNeQueue.add tr
+    # A scene root can be a fake null too -- during a raid load especially.
+    # neTransformOf checks liveness on BOTH sides of GameObject::get_transform.
+    if not neLive(g):
+      inc gNeSeedDead
+      continue
+    let tr = neTransformOf(g)
+    if tr != nil:
+      gNeQueue.add tr
+      gNeDepth.add 0'i32
+      inc gNeSeedCount
+    else:
+      inc gNeSeedDead
   gNeQueue.len > 0
 
 proc neDiscoverStep() =
@@ -310,9 +385,11 @@ proc neDiscoverStep() =
       neRefuse(NeRNoRoots)
       return
     gNeSeeded = true
-    okLog "natesp: canvas discovery started -- " & $gNeQueue.len &
-          " scene roots seeded (DontDestroyOnLoad included via the live " &
-          "anchor), budget " & $gNeBudget & " nodes, " & $int(cNeSliceMs()) &
+    okLog "natesp: canvas discovery started -- " & $gNeSeedCount &
+          " live scene roots seeded (DontDestroyOnLoad included via the live " &
+          "anchor), " & $gNeSeedDead & " root(s) skipped as fake nulls, " &
+          "budget " & $gNeBudget & " nodes, depth cap " & $int(cNeMaxDepth()) &
+          ", " & $int(cNeSliceMs()) &
           "ms per frame. Nothing is parented until a canvas PASSES."
   let started = cNowMs()
   var spent = 0
@@ -321,49 +398,105 @@ proc neDiscoverStep() =
     if (spent and 31) == 0 and cNowMs() - started > uint64(cNeSliceMs()):
       return                      # more next frame; state unchanged
     let cur = gNeQueue[gNeHead]
+    let depth = int(gNeDepth[gNeHead])
     inc gNeHead
     inc spent
     dec gNeBudget
-    if not duOk(cur, 0x20'i32) or not iUnityAlive(cur): continue
+    # A fake null is a NORMAL outcome of walking a live raid scene, not a
+    # failure: it is counted and skipped. Charging it to the fault budget is
+    # what disabled the feature after six of them.
+    if not neLive(cur):
+      inc gNeFakeNull
+      continue
     inc gNeVisited
+    if depth > gNeDeepest: gNeDeepest = depth
     let canvas = neGetComponent(fnGet, cur, gNeTypeCanvas)
     if canvas != nil:
+      inc gNeCandidates
       var cw = 0'f32
       var ch = 0'f32
       if neCanvasRect(canvas, cw, ch):
         let area = cw * ch
         if area > gNeBestArea:
-          gNeBestArea = area
-          gNeCanvasGo = nuGameObjectOf(canvas)
-          gNeCanvasTr = nuTransformOf(gNeCanvasGo)
-          gNeCanvasW = cw
-          gNeCanvasH = ch
+          # Bind the winner only through the liveness-checked hops; the raw
+          # nu* pair here could hand back a fake null we would then parent to.
+          let go = neGameObjectOf(canvas)
+          let tr = neTransformOf(go)
+          if go != nil and tr != nil:
+            gNeBestArea = area
+            gNeCanvasGo = go
+            gNeCanvasTr = tr
+            gNeCanvasW = cw
+            gNeCanvasH = ch
+          else:
+            inc gNeRejected
+      else:
+        inc gNeRejected
     if gNeGraphicDonor == nil:
       let img = neGetComponent(fnGet, cur, gNeTypeImage)
       if img != nil: gNeGraphicDonor = img
     var n = 0
     if iChildCount(cur, n):
-      var k = 0
-      while k < n and k < int(cNeMaxChildren()):
-        let c = iChildAt(cur, k)
-        if c != nil: gNeQueue.add c
-        inc k
+      if depth + 1 > int(cNeMaxDepth()):
+        # Not a silent truncation: counted, and named in the refusal line.
+        gNeTruncated = gNeTruncated + n
+      else:
+        var k = 0
+        while k < n and k < int(cNeMaxChildren()):
+          # The node budget bounds POPS, not pushes. Without this the queue
+          # grows without bound in a raid -- millions of pointers of native
+          # memory for nodes that can never be reached before the budget runs
+          # out. Cap it at twice the budget and COUNT what was dropped.
+          if gNeQueue.len >= int(cNeMaxNodes()) * 2:
+            gNeTruncated = gNeTruncated + (n - k)
+            break
+          let c = iChildAt(cur, k)
+          if c != nil:
+            gNeQueue.add c
+            gNeDepth.add int32(depth + 1)
+          inc k
   # The walk is FINISHED (queue drained or budget spent). Decide, out loud.
+  #
+  # THE DISCOVERY LEDGER. Every number here is a count of something that
+  # actually happened, and the two ways the search could have been INCOMPLETE
+  # -- budget exhausted, depth cap hit -- are stated separately from the
+  # verdict, so "no canvas" is never confused with "I could not look".
+  let exhaustive = gNeHead >= gNeQueue.len and gNeBudget > 0 and gNeTruncated == 0
+  let ledger = "visited=" & $gNeVisited & " fakeNullsSkipped=" & $gNeFakeNull &
+               " canvasCandidates=" & $gNeCandidates & " rejected=" &
+               $gNeRejected & " deepest=" & $gNeDeepest & "/" &
+               $int(cNeMaxDepth()) & " budgetLeft=" & $gNeBudget &
+               " queued=" & $gNeQueue.len & " childrenDropped=" & $gNeTruncated &
+               " discFaults=" & $gNeDiscFaults & " scope=" &
+               (if exhaustive: "EXHAUSTIVE" else: "TRUNCATED")
   if gNeCanvasTr == nil or gNeCanvasGo == nil:
-    okLog "natesp: the walk visited " & $gNeVisited & " node(s) with " &
-          $gNeBudget & " of the node budget left and found no qualifying " &
-          "Canvas. A canvas qualifies only if it is alive, activeInHierarchy " &
-          "and its rect READS BACK at least " & neF(cNeMinCanvasPx()) & "px."
+    okLog "natesp: discovery walk FINISHED with no qualifying Canvas. " &
+          ledger & ". A canvas qualifies only if it is alive, " &
+          "activeInHierarchy and its rect READS BACK at least " &
+          neF(cNeMinCanvasPx()) & "px on both axes. " &
+          (if exhaustive:
+             "The search was exhaustive within its cap, so this is a real " &
+             "absence, not a truncation."
+           else:
+             "The search was TRUNCATED (budget or depth cap), so this is " &
+             "INCONCLUSIVE, not proof no canvas exists.")
     neRefuse(NeRNoCanvas)
     return
   if gNeGraphicDonor == nil:
+    okLog "natesp: a canvas qualified but no Graphic donor was found. " & ledger
     neRefuse(NeRNoGraphic)
     return
   okLog "natesp: canvas ACCEPTED at 0x" & hexOf(cast[uint64](gNeCanvasGo)) &
-        " -- rect reads back " & neF(gNeCanvasW) & "x" & neF(gNeCanvasH) &
-        " (the largest qualifying of " & $gNeVisited & " nodes walked), name=\"" &
-        iObjName(gNeCanvasGo) & "\". Graphic donor 0x" &
-        hexOf(cast[uint64](gNeGraphicDonor)) & "."
+        " name=\"" & iObjName(gNeCanvasGo) & "\" -- it won because its rect " &
+        "reads back " & neF(gNeCanvasW) & "x" & neF(gNeCanvasH) & ", the " &
+        "LARGEST of " & $gNeCandidates & " Canvas candidate(s) that passed " &
+        "alive+activeInHierarchy+>=" & neF(cNeMinCanvasPx()) & "px. " &
+        ledger & ". Graphic donor 0x" & hexOf(cast[uint64](gNeGraphicDonor)) & "."
+  # The walk is over: release the queue rather than hold megabytes of raid
+  # scene pointers for the rest of the session.
+  gNeQueue = @[]
+  gNeDepth = @[]
+  gNeHead = 0
   gNeState = NeBuild
 
 # ---------------------------------------------------------------------------
@@ -609,8 +742,12 @@ proc neVerdictLine(sw, sh: float64): string =
   else:
     "natesp VERDICT INCONCLUSIVE -- " & readCString(cNeRefusalText(gNeWhy)) &
       "  (state=" & $gNeState & " built=" & $gNeBuilt & " contacts=" & $gNeCn &
-      " faults=" & $int(cNeFaultCount()) & "). I could not look; that is NOT " &
-      "a pass."
+      " faults=" & $int(cNeFaultCount()) & "). discovery: visited=" &
+      $gNeVisited & " fakeNullsSkipped=" & $gNeFakeNull & " candidates=" &
+      $gNeCandidates & " rejected=" & $gNeRejected & " deepest=" & $gNeDeepest &
+      "/" & $int(cNeMaxDepth()) & " budgetLeft=" & $gNeBudget & " head=" &
+      $gNeHead & "/" & $gNeQueue.len & " discFaults=" & $gNeDiscFaults &
+      ". I could not look; that is NOT a pass."
 
 # ---------------------------------------------------------------------------
 # THE TICK -- one body, one guard, ridden on the existing Update drain
@@ -651,7 +788,7 @@ proc neTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ne_tick_body", cdecl.}
       neDestroyPool()
       neRefuse(NeRBuildFailed)
   of NeRun:
-    if not duOk(gNeCanvasTr, 0x20'i32) or not nuActiveInHierarchy(gNeCanvasGo):
+    if not neLive(gNeCanvasTr) or not neActiveInHier(gNeCanvasGo):
       # the raid canvas went away (scene change): drop the pool and rediscover
       neDestroyPool()
       gNeCanvasGo = nil
@@ -679,10 +816,27 @@ proc natEspDrainTick() =
     if gNeWhy != NeRNoNativeUi: neRefuse(NeRNoNativeUi)
     return
   gNeTicks = gNeTicks + 1
+  let wasDiscovering = gNeState == NeDiscover
   if cNeTickGuarded(nil) == nil:
-    cNeNoteFault()
-    warn "natesp: the guarded tick FAULTED (" & $int(cNeFaultCount()) & " of " &
-         "the budget). State=" & $gNeState & "; self-disables at the cap."
+    if wasDiscovering:
+      # Discovery has its OWN ledger. The walk touches thousands of foreign
+      # objects per raid; letting it spend the steady-state budget is what
+      # killed the feature after six frames. It still self-disables -- at its
+      # own, larger cap, with its own reason.
+      inc gNeDiscFaults
+      warn "natesp: the canvas WALK faulted (" & $gNeDiscFaults & " of " &
+           $int(cNeMaxDiscFaults()) & " discovery faults; the steady-state " &
+           "budget is untouched at " & $int(cNeFaultCount()) & "). Fake nulls " &
+           "are skipped, not faulted, so this was something else. Walk so " &
+           "far: visited=" & $gNeVisited & " fakeNullsSkipped=" & $gNeFakeNull &
+           " head=" & $gNeHead & "/" & $gNeQueue.len &
+           "; the walk RESUMES at the next node, it does not restart."
+      if gNeDiscFaults >= int(cNeMaxDiscFaults()):
+        neRefuse(NeRDiscFaulted)
+    else:
+      cNeNoteFault()
+      warn "natesp: the guarded tick FAULTED (" & $int(cNeFaultCount()) & " of " &
+           "the budget). State=" & $gNeState & "; self-disables at the cap."
     return
   if gNeDiag and (cNowMs() - gNeDiagAt) > 5000'u64:
     gNeDiagAt = cNowMs()
