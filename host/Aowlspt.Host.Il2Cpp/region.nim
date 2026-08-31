@@ -67,6 +67,16 @@
  * both directions, and the behind-camera decision. */
 #include "aowlspt_regproj.h"
 
+/* THE UNITY POST-PROCESSING SURVEY. Read-only, one-shot, flag-gated
+ * (`unityPostProbe`, default OFF). It answers a question the D3D11 grading
+ * path in `aowlspt_graphics.h` never could: what post processing does the
+ * GAME itself have, live, on this camera. `aowlspt_components.h` comes first
+ * because the survey identifies every pointer it touches by reading the
+ * object's own klass name -- readability is not liveness, and type confusion
+ * beats both guards. */
+#include "aowlspt_components.h"
+#include "aowlspt_unitypp.h"
+
 /* The log sink. Nimony implements `aowlspt_nim_region_log`; this adapts the
  * plain `const char*` the header emits into it. */
 /* nimony renders a `cstring` parameter as `unsigned char*` (its NC8), so the
@@ -154,6 +164,16 @@ proc cWgWindowH(): int32 {.importc: "aowl_wg_window_h", nodecl.}
 # and opens its own single guard around the camera sample; everything else here
 # is a plain integer read of our own statics.
 proc cRegProjTick() {.importc: "aowl_regproj_tick", nodecl.}
+
+# THE UNITY POST-PROCESSING SURVEY (`abi/aowlspt_unitypp.h`). Same contract as
+# cRegProjTick: UNITY THREAD ONLY, opens its own single guard, must be entered
+# and exited BEFORE cRegionFrame because the dispatcher refuses if it finds a
+# guard already active on the thread. One-shot: it latches after one verdict.
+proc cUppTick() {.importc: "aowl_upp_tick", nodecl.}
+proc cUppDone(): int32 {.importc: "aowl_upp_is_done", nodecl.}
+proc cUppDisabled(): int32 {.importc: "aowl_upp_is_disabled", nodecl.}
+proc cUppEffects(): int32 {.importc: "aowl_upp_effect_count", nodecl.}
+proc cUppHasGrading(): int32 {.importc: "aowl_upp_has_grading", nodecl.}
 proc cRegProjInstalled(): int32 {.importc: "aowl_regproj_is_installed", nodecl.}
 proc cRegProjDisabled(): int32 {.importc: "aowl_regproj_is_disabled", nodecl.}
 proc cRegProjFaults(): int32 {.importc: "aowl_regproj_fault_count", nodecl.}
@@ -178,6 +198,7 @@ var gRegionAnnounced = false
 var gRegionScreenLogged = false
 var gRegProjInstallLogged = false
 var gRegProjSilentLogged = false
+var gUppVerdictLogged = false
 
 proc regionLog(line: cstring) {.exportc: "aowlspt_nim_region_log", cdecl.} =
   ## Every line the region emits -- a registration, a fault naming the
@@ -241,6 +262,26 @@ proc regionFired(regs: Il2CppPtr) =
   # the projector seat stays empty, `aowl_region_project` keeps refusing with
   # REFUSE_NOPROJ, and every consumer keeps drawing its bearing ring -- which is
   # what makes turning this on a change that DEGRADES rather than blanks.
+  # THE UNITY POST-PROCESSING SURVEY, same placement and for the same two
+  # reasons as the projector tick below: it calls into Unity and it opens the
+  # one guard, so it must run above cRegionFrame. Flag-gated, default OFF, and
+  # it latches after a single verdict -- this is a survey, not a per-frame
+  # feature, and with the flag off nothing is called at all.
+  if gUnityPostProbeOn:
+    cUppTick()
+    if not gUppVerdictLogged and (cUppDone() != 0 or cUppDisabled() != 0):
+      gUppVerdictLogged = true
+      okLog "unity post: survey verdict recorded -- " &
+            (if cUppDisabled() != 0: "DISABLED after faults"
+             else: $cUppEffects() & " effect settings object(s) named, " &
+                   "ColorGrading reached = " &
+                   (if cUppHasGrading() != 0: "YES" else: "no")) &
+            ". GRADING PROVIDER IS STILL D3D11 (aowlspt_graphics.h, Present " &
+            "hook): the Unity path writes NOTHING yet, because " &
+            "ParameterOverride<T>.value is an instantiated-generic offset " &
+            "that is not derivable offline. The per-parameter byte dumps " &
+            "above settle it; a write path follows in a separate change."
+
   if gRegionProjectorOn:
     cRegProjTick()
     if not gRegProjInstallLogged and cRegProjInstalled() != 0:
