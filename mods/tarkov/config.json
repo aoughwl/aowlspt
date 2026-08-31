@@ -114,6 +114,13 @@
   "orbitHoldMs": 30000,
   "orbitExtractFraction": 0.75,
 
+  "//orbitQuestPoi": "Merge mods/waypoints' patrol geometry (8,556 hand-authored, on-navmesh points across 10 maps) into ORBIT's anchor catalogue as questPoi anchors. These are the only anchors whose coordinates were authored on the navmesh rather than being the centroid of a grid cell. Set false to use the spawn layers only.",
+  "orbitQuestPoi": true,
+  "//orbitQuestAnchors": "How many questPoi anchors the quest layer may claim out of the 24-anchor budget. The layer runs LAST, so it fills what the loot and spawn layers left.",
+  "orbitQuestAnchors": 8,
+  "//orbitQuestBias": "How much a questPoi anchor outweighs the best spawn-derived anchor AFTER the quest layer is rescaled onto the same scale. 1.0 means no preference. Not a raw multiplier: the layers count different things (patrol points per cell run to the hundreds, spawn points to single digits) so a raw multiplier would be a takeover, not a preference.",
+  "orbitQuestBias": 1.25,
+
   "orbitPersonalityRat": 0.15,
   "orbitPersonalityCoward": 0.10,
   "orbitPersonalityNormal": 0.45,

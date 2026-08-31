@@ -93,6 +93,7 @@
 ## than retrying. So the failure is announced, not silent, but it IS a failure
 ## and a y-band in the key would fix it.
 
+import std/syncio
 import aowlspt
 import aowlspt/server
 import aowlspt/json
@@ -107,6 +108,11 @@ const
     ## Rows walked out of `staticContainers`. Customs has 552; Streets is the
     ## largest and is well under this.
   MaxSpawnPoints* = 2048
+  MaxQuestPoints* = 4096
+    ## Patrol points walked out of one `mods/waypoints/data/<key>.json`.
+    ## MEASURED over all ten shipped files: 8,556 points total, largest single
+    ## map 2,408 (Customs / `bigmap`). This bound is headroom, not a limit --
+    ## but a corrupt file must not turn the walk into an unbounded loop.
   MaxAnchors* = 24
     ## Anchors emitted. The dispatcher tracks 32 bots and gives each one a
     ## primary plus splinters, so more anchors than this buys nothing and makes
@@ -119,6 +125,10 @@ type
                     ## (0,0,0). See the header.
     akPvp           ## a cell dense in player-eligible spawn points
     akRoam          ## a cell dense in bot-eligible spawn points
+    akQuestPoi      ## a cell dense in SPT-Waypoints PATROL points. These are
+                    ## the only anchor source in this file whose coordinates
+                    ## were authored ON the navmesh by a human, rather than
+                    ## being a centroid of a grid cell -- see `questLayer`.
 
   Anchor* = object
     kind*: AnchorKind
@@ -135,6 +145,10 @@ type
     containerRows*: int      ## rows the database actually handed back
     spawnPointsSeen*: int
     spawnRows*: int
+    questPointsSeen*: int    ## patrol points binned out of the waypoints file
+    questZones*: int         ## zones the file carried
+    questSource*: string     ## the path that was READ, or "" if none was
+    questTried*: string      ## every path tried, when none of them opened
     why*: string      ## why `ok` is false, when it is
 
   ContainerCensus* = object
@@ -176,6 +190,7 @@ var
   gLootCells: array[MaxCells, Cell]
   gPvpCells: array[MaxCells, Cell]
   gRoamCells: array[MaxCells, Cell]
+  gQuestCells: array[MaxCells, Cell]
   gCheckCells: array[MaxCells, Cell]
     ## The self-check's own table, kept separate so that running the check can
     ## never disturb a plan that is live.
@@ -199,6 +214,15 @@ proc orbitReachM*(): float = setting("orbitReachM").asFloat(8.0)
 proc orbitHoldMs*(): int = setting("orbitHoldMs").asInt(30000)
 proc orbitExtractFraction*(): float =
   setting("orbitExtractFraction").asFloat(0.75)
+proc orbitQuestPoi*(): bool = setting("orbitQuestPoi").asBool(true)
+proc orbitQuestAnchors*(): int = setting("orbitQuestAnchors").asInt(8)
+proc orbitQuestBias*(): float = setting("orbitQuestBias").asFloat(1.25)
+  ## How much a quest POI outweighs the best spawn-derived anchor AFTER the
+  ## quest layer has been rescaled onto the same scale. Not a raw multiplier on
+  ## the raw score: the two layers count different things (patrol points per
+  ## cell runs to the hundreds, spawn points per cell to single digits), so a
+  ## raw multiplier would not be a preference, it would be a takeover. See
+  ## `rescaleKind`.
 
 proc clampf(v, lo, hi: float): float =
   if v < lo: lo elif v > hi: hi else: v
@@ -428,6 +452,169 @@ proc lootCensusFor*(locationId: string): string =
   result = censusJson(c)
 
 # ---------------------------------------------------------------------------
+# The quest / objective layer
+# ---------------------------------------------------------------------------
+#
+# ## Where these points come from, and why they are the best coordinates here
+#
+# `mods/waypoints` already ships, and already serves, upstream SPT-Waypoints'
+# patrol geometry: MEASURED 8,556 points across ten maps, in Unity world
+# metres, y up, in `mods/waypoints/data/<key>.json`. Those points were authored
+# BY HAND on each map's navmesh so that a bot patrol could walk them. That is
+# exactly the property every other anchor in this file lacks:
+#
+#   * the loot layer has no coordinates at all on this build (all 429
+#     staticContainers rows are (0,0,0) -- see `ContainerCensus`);
+#   * the pvp and roam layers have real coordinates, but the ANCHOR is a
+#     score-weighted CENTROID of a 50 m cell, which on a multi-storey map can
+#     land inside geometry, and `dispatchCheck` counts exactly that as
+#     `navStatus == 2`.
+#
+# A patrol point is a point a bot is known to be able to stand on. Binning them
+# is still done -- 2,408 points on Customs would otherwise swamp the anchor
+# budget -- but the emitted anchor is the centroid of a cluster of walkable
+# points, which is a much better prior than the centroid of a cluster of spawn
+# markers.
+#
+# ## What this does NOT do
+#
+# It is NOT the quest system. Nothing here reads `quests.json`, nothing knows
+# what a quest OBJECTIVE is, and no bot is told to complete one. What it does is
+# widen the catalogue of places worth walking to from "where players spawn" to
+# "where the map's authors routed patrols", and it labels them `questPoi` so the
+# dispatcher and `/aowlspt/orbit/plan` can tell the two apart. Calling it
+# questing would be the "setting that changes nothing" this repo keeps paying
+# for; calling it a better anchor source is what was measured.
+#
+# ## Why the file is read from a SIBLING mod directory
+#
+# `modDir()` is per-mod, and there is no cross-mod data API. The deployed layout
+# is flat (`mods/tarkov`, `mods/waypoints`, ... -- verified on
+# `D:\Aowlspt\aowlspt\mods`), so the sibling path resolves. Every candidate
+# tried is recorded and reported, because "the quest layer is empty" and "the
+# quest layer could not find its file" are different bugs and a silent zero
+# cannot tell them apart.
+
+proc readWholeFile(path: string; into: var string): bool =
+  ## Line by line and rejoined -- the same shape `mods/waypoints/waypoints.nim`
+  ## and `emu/post1.nim` use, and for the same reason: nimony's `readAll` is not
+  ## dependable across these sizes, and JSON does not care where newlines are.
+  var f: File
+  if not open(f, path, fmRead):
+    return false
+  into = ""
+  var line = ""
+  var first = true
+  while readLine(f, line):
+    if not first: into.add "\n"
+    into.add line
+    first = false
+  close(f)
+  result = true
+
+proc questCandidates(key: string): seq[string] =
+  ## Ordered, and ALL of them reported when none opens.
+  let md = modDir()
+  result = @[]
+  if md.len > 0:
+    result.add md & "/../waypoints/data/" & key & ".json"
+    result.add md & "/waypoints/data/" & key & ".json"
+  let dd = dataDir()
+  if dd.len > 0:
+    result.add dd & "/../mods/waypoints/data/" & key & ".json"
+
+proc questLayer(key: string; cell: float; bin: bool; questUsed: var int;
+                p: var OrbitPlan) =
+  ## Bin one map's patrol points. Shape, from the shipped schema
+  ## `aowlspt.waypoints/1`: `zones[].patrols[].points[]`, each point a bare
+  ## `[x, y, z]` array of metres.
+  if key.len == 0:
+    return
+  var text = ""
+  var tried = ""
+  var opened = ""
+  for cand in questCandidates(key):
+    if tried.len > 0: tried.add ", "
+    tried.add cand
+    if readWholeFile(cand, text):
+      opened = cand
+      break
+  if opened.len == 0:
+    p.questTried = tried
+    return
+  p.questSource = opened
+
+  let doc = whole(text)
+  # The schema is checked, not assumed. A file whose shape changed under this
+  # reader must say so rather than bin zero points and look like an empty map.
+  let schema = asText(field(doc, "schema"), "")
+  if schema != "aowlspt.waypoints/1":
+    warn "orbit: quest layer: " & opened & " says schema '" & schema &
+         "', not 'aowlspt.waypoints/1'. REFUSING to read it rather than " &
+         "binning a shape this reader cannot trust"
+    p.questSource = ""
+    p.questTried = opened & " (wrong schema '" & schema & "')"
+    return
+
+  let zones = field(doc, "zones")
+  let nz = count(zones)
+  p.questZones = nz
+  var seen = 0
+  var zi = 0
+  while zi < nz and zi < 256:
+    let pats = field(at(zones, zi), "patrols")
+    let np = count(pats)
+    var pi = 0
+    while pi < np and pi < 256:
+      let pts = field(at(pats, pi), "points")
+      let n = count(pts)
+      var i = 0
+      while i < n and seen < MaxQuestPoints:
+        let pt = at(pts, i)
+        if count(pt) >= 3:
+          let x = asFloat(at(pt, 0), 0.0)
+          let y = asFloat(at(pt, 1), 0.0)
+          let z = asFloat(at(pt, 2), 0.0)
+          if x != 0.0 or z != 0.0:
+            inc seen
+            if bin:
+              bump(gQuestCells, questUsed, floorDiv(x, cell), floorDiv(z, cell),
+                   x, y, z, 1.0)
+        inc i
+      inc pi
+    inc zi
+  p.questPointsSeen = seen
+
+proc rescaleKind(anchors: var seq[Anchor]; kind: AnchorKind;
+                 target: float): float =
+  ## Put one layer's scores onto another's scale, preserving order within the
+  ## layer. Returns the factor applied, so the caller can LOG it -- an implicit
+  ## rescale is indistinguishable from a bug in the binner.
+  result = 1.0
+  var mx = 0.0
+  var i = 0
+  while i < anchors.len:
+    if anchors[i].kind == kind and anchors[i].score > mx:
+      mx = anchors[i].score
+    inc i
+  if mx <= 0.0 or target <= 0.0:
+    return
+  result = target / mx
+  i = 0
+  while i < anchors.len:
+    if anchors[i].kind == kind:
+      anchors[i].score = anchors[i].score * result
+    inc i
+
+proc maxScoreExcept(anchors: seq[Anchor]; kind: AnchorKind): float =
+  result = 0.0
+  var i = 0
+  while i < anchors.len:
+    if anchors[i].kind != kind and anchors[i].score > result:
+      result = anchors[i].score
+    inc i
+
+# ---------------------------------------------------------------------------
 # The plan
 # ---------------------------------------------------------------------------
 
@@ -449,13 +636,18 @@ proc buildPlan*(locationId: string): OrbitPlan =
   let key = canonicalLocation(locationId)
   result = OrbitPlan(ok: false, map: locationId, cellSize: orbitCellSize(),
                      anchors: @[], containersSeen: 0, containerRows: 0,
-                     spawnPointsSeen: 0, spawnRows: 0, why: "")
+                     spawnPointsSeen: 0, spawnRows: 0, questPointsSeen: 0,
+                     questZones: 0, questSource: "", questTried: "", why: "")
   let cell = clampf(result.cellSize, 5.0, 500.0)
   result.cellSize = cell
 
   var lootUsed = 0
   var pvpUsed = 0
   var roamUsed = 0
+  var questUsed = 0
+
+  if orbitQuestPoi():
+    questLayer(key, cell, true, questUsed, result)
 
   let census = lootCensus(key, cell, true, lootUsed)
   result.containerRows = census.rows
@@ -521,7 +713,60 @@ proc buildPlan*(locationId: string): OrbitPlan =
   # Roam anchors fill whatever the other two layers left. With the loot layer
   # producing nothing on this build that is most of the budget, and it is spent
   # on the only other real coordinates the database has.
+  # The quest layer runs BEFORE roam, and the ORDER here is a measured decision
+  # rather than a preference. Two things follow from it:
+  #
+  #  * BUDGET. `MaxAnchors` is 24 and `topInto` stops at it. Loot wants 12 and
+  #    produces 0 on this build, pvp 6, roam 12 -- so a quest layer placed last
+  #    would be handed whatever the roam layer left, which on Woods is 6 of the
+  #    8 it asked for and on a map with a fuller loot layer would be none.
+  #  * COORDINATE QUALITY. `topInto` de-duplicates by cell and the FIRST layer
+  #    to claim a cell keeps it. Running before roam means a cell that both
+  #    layers like is represented by the centroid of hand-authored navmesh
+  #    points rather than by the centroid of spawn markers, which is the whole
+  #    reason this layer is worth having.
+  topInto(gQuestCells, questUsed, orbitQuestAnchors(), akQuestPoi,
+          result.anchors)
   topInto(gRoamCells, roamUsed, orbitLootAnchors(), akRoam, result.anchors)
+  # The rescale, AFTER every layer has been emitted so the comparison is
+  # against the final catalogue. Without it a Customs cell holding 109 patrol
+  # points -- MEASURED, the densest of the ten shipped maps is Streets at 128 --
+  # outscores every spawn anchor on the map, whose cell scores are single
+  # digits, by a factor of twenty. `pickAnchor` weights by score, so that is
+  # not a preference for quest POIs, it is ORBIT becoming a waypoints-only
+  # dispatcher wearing ORBIT's name.
+  let otherMax = maxScoreExcept(result.anchors, akQuestPoi)
+  var questAnchors = 0
+  var qi = 0
+  while qi < result.anchors.len:
+    if result.anchors[qi].kind == akQuestPoi:
+      inc questAnchors
+    inc qi
+  if questAnchors > 0:
+    let target = (if otherMax > 0.0: otherMax * orbitQuestBias()
+                  else: orbitQuestBias())
+    let factor = rescaleKind(result.anchors, akQuestPoi, target)
+    info "orbit: quest layer -- " & $questAnchors & " questPoi anchor(s) from " &
+         $result.questPointsSeen & " patrol points in " & $result.questZones &
+         " zones (" & result.questSource & "), rescaled by " & $factor &
+         " onto the spawn layers' scale (best non-quest anchor scored " &
+         $otherMax & ", quest bias " & $orbitQuestBias() & ")"
+  elif not orbitQuestPoi():
+    info "orbit: quest layer is OFF (orbitQuestPoi=false); anchors come from " &
+         "the spawn layers only"
+  elif result.questSource.len > 0:
+    warn "orbit: quest layer read " & result.questSource & " and binned " &
+         $result.questPointsSeen & " points, but produced NO anchor. That is " &
+         "the anchor budget of " & $MaxAnchors & " already being full before " &
+         "it ran, or a file whose every point duplicated a cell the loot or " &
+         "pvp layer had already taken -- not a missing file, which is a " &
+         "different message"
+  else:
+    warn "orbit: quest layer found no waypoints file for '" & key &
+         "'. Tried: " & (if result.questTried.len > 0: result.questTried
+                         else: "<no candidate path -- modDir() is empty>") &
+         ". Upstream SPT-Waypoints 1.3.4 ships ten maps; a map outside that " &
+         "ten legitimately has none, and this is that message either way"
 
   if result.anchors.len == 0:
     # Name BOTH ids. "no data for 'Interchange'" and "no data for
@@ -547,6 +792,7 @@ proc kindName(k: AnchorKind): string =
   of akLoot: "loot"
   of akPvp: "pvp"
   of akRoam: "roam"
+  of akQuestPoi: "questPoi"
 
 proc planJson*(p: OrbitPlan): string =
   ## The plan as it goes on the bus, and as `/aowlspt/orbit/plan` serves it.
@@ -563,6 +809,10 @@ proc planJson*(p: OrbitPlan): string =
   put(o, "containerRows", p.containerRows)
   put(o, "spawnPointsSeen", p.spawnPointsSeen)
   put(o, "spawnRows", p.spawnRows)
+  put(o, "questPointsSeen", p.questPointsSeen)
+  put(o, "questZones", p.questZones)
+  put(o, "questSource", p.questSource)
+  put(o, "questTried", p.questTried)
   if p.why.len > 0:
     put(o, "why", p.why)
 
@@ -663,8 +913,9 @@ proc emitPlan*(locationId: string) =
     warn "orbit: " & p.why
   else:
     info "orbit: plan for " & locationId & " -- " & $p.anchors.len &
-         " anchors from " & $p.containersSeen & " containers and " &
-         $p.spawnPointsSeen & " player spawn points at " &
+         " anchors from " & $p.containersSeen & " containers, " &
+         $p.spawnPointsSeen & " player spawn points and " &
+         $p.questPointsSeen & " patrol points at " &
          $int(p.cellSize) & "m cells"
   discard broadcast("tarkov.orbit.plan", gLastPlan)
 
@@ -750,6 +1001,31 @@ proc orbitCheck*(): string =
                "0 carried a non-zero Position. That is a measured property " &
                "of this db.json -- every staticContainers Position is " &
                "(0,0,0) -- and not a defect here; see emu/orbit.nim's header."
+  # The quest layer, asserted as the same negative. Falsified by: a waypoints
+  # file that opened and binned points and produced no anchor (a binning or
+  # budget bug), which is a different outcome from a file that was never found.
+  var questAnchors = 0
+  q = 0
+  while q < n:
+    if asText(field(at(anchors, q), "kind"), "") == "questPoi":
+      inc questAnchors
+    inc q
+  let qSeen = asInt(field(j, "questPointsSeen"), 0)
+  let qSrc = asText(field(j, "questSource"), "")
+  if questAnchors == 0 and qSeen > 0:
+    return "FAIL: " & $qSeen & " patrol points were binned for '" & gLastMap &
+           "' from " & qSrc & " and NOT ONE became a questPoi anchor. The " &
+           "binning or the selection is dropping them"
+  var questNote = ""
+  if questAnchors > 0:
+    questNote = " QUEST LAYER: " & $questAnchors & " questPoi anchor(s) from " &
+                $qSeen & " patrol points (" & qSrc & "). These are the only " &
+                "anchors here whose coordinates were authored on the navmesh."
+  else:
+    questNote = " NO QUEST LAYER: no waypoints file was read for '" &
+                gLastMap & "' (tried: " &
+                asText(field(j, "questTried"), "<nothing recorded>") &
+                "). Ten maps ship points; a map outside that ten has none."
   let cell = asFloat(field(j, "cellSize"), 50.0)
   if (maxX - minX) < cell and (maxZ - minZ) < cell:
     return "FAIL: all " & $n & " anchors for '" & gLastMap &
@@ -762,7 +1038,8 @@ proc orbitCheck*(): string =
            $int(maxX - minX) & "m by " & $int(maxZ - minZ) &
            "m across a " & $int(cell) & "m grid. This proves the PLAN is " &
            "well formed; it does NOT prove a bot ever walked to one -- that " &
-           "is `/sain/status`'s dispatchCheck, in a raid, with botNav on." & lootNote
+           "is `/sain/status`'s dispatchCheck, in a raid, with botNav on." &
+           lootNote & questNote
 
 proc orbitState*(): string =
   result = "orbit: " & $gPlans & " plan(s), last '" & gLastMap & "'"
