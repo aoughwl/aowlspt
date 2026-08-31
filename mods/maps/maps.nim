@@ -975,20 +975,61 @@ proc mapsDiagText(): string =
               "using the config fallback " & $hudScreenW() & "x" &
               $hudScreenH() & ". Edge-anchored marks may be misplaced"
 
-  # 6. the projector -- indicators are north-up bearings without one.
+  # 6. THE PROJECTOR -- a map, or merely a radar.
+  #
+  # This line used to have one useful outcome and two spellings of "no". It now
+  # has three, and the PASS is not a restatement of our own call.
+  #
+  # The trap being avoided is specific and has been paid for before: a
+  # view-projection that is transposed, multiplied in the wrong order, or read
+  # row-major from a column-major buffer is FINITE and NON-ZERO. Every contact
+  # still "projects"; they simply all land somewhere absurd. A count of
+  # projections would climb through all of that and report PASS. So the verdict
+  # is driven by the FINISHED COORDINATES read back out of the draw path --
+  # `indOnScreen` (in front of the camera AND inside the frame) and the last
+  # measured depth -- neither of which this mod can satisfy by writing them.
+  #
+  # And the behind-camera flag is part of the PASS rather than a footnote: it is
+  # the falsifier. If a projector is installed and NOTHING is ever behind the
+  # player, either nothing is being told or the depth sign is wrong.
   var lProj = ""
-  if hudIndProjected() > 0'i64:
-    lProj = "PASS  " & $hudIndProjected() & " indicator(s) projected"
+  let projLive = hudProjValid() != 0'i32
+  if projLive and hudIndOnScreen() > 0'i64:
+    lProj = "PASS  a projector IS installed and it is producing real screen " &
+            "positions: " & $hudIndOnScreen() & " contact(s) projected IN " &
+            "FRONT and inside the frame, " & $hudIndBehind() &
+            " rejected as BEHIND the camera (drawn as a mirrored bearing, " &
+            "which is correct), " & $hudIndProjected() &
+            " indicator(s) drawn in total. Last finished projection " &
+            $hudProjLastX() & "," & $hudProjLastY() & " px at depth " &
+            $hudProjLastDepth() & " m -- read back off the draw path, not " &
+            "asserted"
+  elif projLive:
+    lProj = "FAIL  a projector is installed and returned coordinates, but " &
+            "NOT ONE contact landed in front of the camera inside the frame " &
+            "(" & $hudIndBehind() & " behind, " & $hudIndProjected() &
+            " drawn). Last finished projection " & $hudProjLastX() & "," &
+            $hudProjLastY() & " px at depth " & $hudProjLastDepth() &
+            " m. That is the classic WRONG-MATRIX symptom -- a transposed " &
+            "view-projection, or P*V multiplied the other way round, is " &
+            "finite and non-zero and throws everything off-screen. The " &
+            "bearing-ring fallback is still selectable, so the display " &
+            "degrades rather than blanks"
   elif hudIndBearing() > 0'i64:
     lProj = "INCONCLUSIVE  " & $hudIndBearing() & " indicator(s) drawn as " &
-            "BEARING RINGS; no projector is installed (nothing calls " &
-            "aowl_region_set_projector), so they are a bearing and not a " &
-            "projected screen position. They are no longer NORTH-UP whenever " &
-            "a heading was measured -- the ring takes the same rotation the " &
-            "radar does -- so a turning player now turns them; see `heading` " &
-            "below for whether that is actually happening"
+            "BEARING RINGS; no projector is installed, so they are a bearing " &
+            "and not a projected screen position. The host installs one from " &
+            "the region's per-frame tick behind the `regionProjector` flag " &
+            "(python tools/hostcfg.py set regionProjector on, and " &
+            "sharedRegion must be on too); with the flag off this is the " &
+            "expected state, not a fault. They are no longer NORTH-UP " &
+            "whenever a heading was measured -- the ring takes the same " &
+            "rotation the radar does -- so a turning player now turns them; " &
+            "see `heading` below for whether that is actually happening"
   else:
-    lProj = "INCONCLUSIVE  no indicator has been drawn yet"
+    lProj = "INCONCLUSIVE  no indicator has been drawn yet, so neither the " &
+            "projector nor the bearing-ring fallback has been exercised. " &
+            "This is 'I could not look', which is not a pass"
 
   # 7. the HEADING. Defect 1: "the player rotation does not rotate either map."
   # The trap this line exists to avoid is reporting PASS for a heading that

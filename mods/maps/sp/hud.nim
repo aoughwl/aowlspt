@@ -223,6 +223,25 @@ static struct {
      * the projector never arrived read exactly like one in which it did --
      * which is the failure this project keeps paying for. */
     int64_t  indProjected, indBearing, indRefused;
+    /* THE PROJECTOR'S OWN OUTCOMES, and they are not decoration.
+     *
+     * `indProjected` alone cannot distinguish a working projector from a
+     * catastrophically wrong one: a transposed or wrongly-ordered
+     * view-projection is finite and non-zero, projects every contact to an
+     * absurd coordinate, and `indProjected` climbs happily the whole time. That
+     * is a check that cannot fail.
+     *
+     *   indOnScreen  contacts that landed IN FRONT and INSIDE the frame. The
+     *                positive evidence, read back off the finished coordinates.
+     *   indBehind    contacts the projector flagged behind the camera. These
+     *                are BEARINGS, correctly mirrored by mm_indicator, and they
+     *                are the falsifier for "every point projected off-screen":
+     *                if all contacts are behind, the matrix is suspect.
+     *   lastSx/Sy/Depth  the last finished projection, so the diagnostic can
+     *                quote a real coordinate instead of a count. */
+    int64_t  indOnScreen, indBehind;
+    float    lastSx, lastSy, lastDepth;
+    int32_t  lastProjValid;
     /* lifetime accounting, separate from the two draw paths above:
      *   indFaded   marks drawn at LESS than full alpha (the decay is running)
      *   indExpired tracks evicted because their window elapsed (it completes)
@@ -1418,6 +1437,8 @@ static void mhud_draw(void* user, int64_t frame) {
         MmPt m;
         int offscreen = 0;
         float sx = 0.0f, sy = 0.0f;
+        int32_t pflags = 0;
+        float pdepth = 0.0f;
 
         if (!g_mhud.tr[i].live) continue;
 
@@ -1447,14 +1468,37 @@ static void mhud_draw(void* user, int64_t frame) {
         col = g_mhud.tr[i].bot ? g_mhud.colBot : g_mhud.colPlayer;
         col = mm_fade_rgba(col, alpha);
 
-        if (aowl_region_project(ex, ey, ez, &sx, &sy)) {
-            /* The projector reports nothing about the camera plane through
-             * this ABI, so `behind` cannot be known here and is passed as 0.
-             * mm_indicator handles a behind-camera point correctly when told;
-             * it is simply never told, which is a capability gap in the
-             * projector contract and is named as one rather than papered over
-             * with a sign heuristic. */
-            if (mm_indicator(sx, sy, 0, scrW, scrH,
+        /* THE THREE-OUTCOME PROJECTION.
+         *
+         * This used to call the five-argument `aowl_region_project`, which
+         * collapses "behind the camera" into the same 0 as "no projector at
+         * all" -- so `behind` could not be known and was passed as 0, and the
+         * comment here said so. `_ex` closes exactly that gap: it returns 1 for
+         * a point in front OR behind, writes the outcome bits, and reports the
+         * camera-space depth it actually measured. `mm_indicator` has handled
+         * `behind` correctly all along; it is now finally TOLD.
+         *
+         * Returning 0 still means one thing only -- no usable camera snapshot
+         * -- and that is still the bearing-ring fallback, counted separately so
+         * the status line can never present a fallback as a look-relative
+         * answer. `projDepth` is kept for the diagnostic: it is a measured
+         * number, so a test can assert on its SIGN rather than on a flag the
+         * projector could have set by accident. */
+        if (aowl_region_project_ex(ex, ey, ez, &sx, &sy, &pflags, &pdepth)) {
+            int behind = (pflags & AOWL_REGION_PROJ_BEHIND) ? 1 : 0;
+            if (behind) g_mhud.indBehind++;
+            /* READ BACK THE FINISHED COORDINATES, not our own request. This is
+             * the only evidence that separates "a projector is installed" from
+             * "it is producing on-screen positions", and the diagnostic asserts
+             * on it rather than on the fact that we called something. */
+            g_mhud.lastSx = sx;
+            g_mhud.lastSy = sy;
+            g_mhud.lastDepth = pdepth;
+            g_mhud.lastProjValid = 1;
+            if (!behind && sx >= 0.0f && sy >= 0.0f &&
+                sx <= scrW && sy <= scrH)
+                g_mhud.indOnScreen++;
+            if (mm_indicator(sx, sy, behind, scrW, scrH,
                              g_mhud.indicatorInset, &m, &offscreen)) {
                 aowl_region_fill(m.x - 3.0f, m.y - 3.0f, 6.0f, 6.0f, col);
                 if (offscreen)
@@ -1632,6 +1676,12 @@ static int32_t mhud_handle(void)  { return g_mhud.handle; }
 static int64_t mhud_ind_projected(void) { return g_mhud.indProjected; }
 static int64_t mhud_ind_bearing(void)   { return g_mhud.indBearing; }
 static int64_t mhud_ind_refused(void)   { return g_mhud.indRefused; }
+static int64_t mhud_ind_onscreen(void)  { return g_mhud.indOnScreen; }
+static int64_t mhud_ind_behind(void)    { return g_mhud.indBehind; }
+static int32_t mhud_proj_valid(void)    { return g_mhud.lastProjValid; }
+static float   mhud_proj_last_x(void)   { return g_mhud.lastSx; }
+static float   mhud_proj_last_y(void)   { return g_mhud.lastSy; }
+static float   mhud_proj_last_depth(void) { return g_mhud.lastDepth; }
 static int64_t mhud_ind_faded(void)     { return g_mhud.indFaded; }
 static int64_t mhud_ind_expired(void)   { return g_mhud.indExpired; }
 static int64_t mhud_ind_stale(void)     { return g_mhud.indStale; }
@@ -1689,6 +1739,12 @@ proc cHudConfigureMap(mapOn: int32; mapX, mapY, mapSize, mapSpanM: cfloat;
 proc cHudIndProjected(): int64 {.importc: "mhud_ind_projected", nodecl.}
 proc cHudIndBearing(): int64 {.importc: "mhud_ind_bearing", nodecl.}
 proc cHudIndRefused(): int64 {.importc: "mhud_ind_refused", nodecl.}
+proc cHudIndOnScreen(): int64 {.importc: "mhud_ind_onscreen", nodecl.}
+proc cHudIndBehind(): int64 {.importc: "mhud_ind_behind", nodecl.}
+proc cHudProjValid(): int32 {.importc: "mhud_proj_valid", nodecl.}
+proc cHudProjLastX(): cfloat {.importc: "mhud_proj_last_x", nodecl.}
+proc cHudProjLastY(): cfloat {.importc: "mhud_proj_last_y", nodecl.}
+proc cHudProjLastDepth(): cfloat {.importc: "mhud_proj_last_depth", nodecl.}
 proc cHudIndFaded(): int64 {.importc: "mhud_ind_faded", nodecl.}
 proc cHudIndExpired(): int64 {.importc: "mhud_ind_expired", nodecl.}
 proc cHudIndStale(): int64 {.importc: "mhud_ind_stale", nodecl.}
@@ -1770,6 +1826,12 @@ proc hudLiveIndicators*(): bool = cHudLiveInd() != 0'i32
   ## The diag compares the two; they must never be allowed to be the same read.
 proc hudIndProjected*(): int64 = cHudIndProjected()
 proc hudIndBearing*(): int64 = cHudIndBearing()
+proc hudIndOnScreen*(): int64 = cHudIndOnScreen()
+proc hudIndBehind*(): int64 = cHudIndBehind()
+proc hudProjValid*(): int32 = cHudProjValid()
+proc hudProjLastX*(): cfloat = cHudProjLastX()
+proc hudProjLastY*(): cfloat = cHudProjLastY()
+proc hudProjLastDepth*(): cfloat = cHudProjLastDepth()
 proc hudScreenMeasured*(): int32 = cHudScreenMeasured()
 proc hudScreenW*(): int32 = cHudScreenW()
 proc hudScreenH*(): int32 = cHudScreenH()

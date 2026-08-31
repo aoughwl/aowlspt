@@ -39,6 +39,15 @@
 # not a silent failure. `aowl_region_is_armed` tells a mod which it is in.
 
 {.emit: """
+/* THE CAMERA. Included BEFORE the region so `aowlspt_regproj.h` below can use
+ * this file's already-measured RVAs, sret shapes and per-frame view-projection
+ * snapshot instead of introducing a second copy of any of them. Everything in
+ * it is `static`, so "using it" means sharing this translation unit -- which is
+ * exactly what makes this the right TU: it is the only one in the host that
+ * defines AOWL_REGION_HOST, so the projector and the seat it fills are compiled
+ * together and cannot drift onto two copies of the state. */
+#include "aowlspt_admin.h"
+
 #define AOWL_REGION_HOST
 #include "aowlspt_region.h"
 
@@ -49,6 +58,14 @@
  * overlay side instead would silently delete this whole facility from the
  * build. */
 #include "aowlspt_regview.h"
+
+/* THE PROJECTOR that fills the region's long-empty projector seat, so a map
+ * contact is drawn at its TRUE PROJECTED SCREEN POSITION instead of as a
+ * bearing on a ring. It must come after BOTH includes above and it says so
+ * itself with an #error. See that file for the frame split (three il2cpp calls
+ * per frame, pure arithmetic per contact), the single-guard rule it obeys in
+ * both directions, and the behind-camera decision. */
+#include "aowlspt_regproj.h"
 
 /* The log sink. Nimony implements `aowlspt_nim_region_log`; this adapts the
  * plain `const char*` the header emits into it. */
@@ -133,10 +150,34 @@ proc cRegionScreenKnown(): int32 {.
 proc cWgWindowW(): int32 {.importc: "aowl_wg_window_w", nodecl.}
 proc cWgWindowH(): int32 {.importc: "aowl_wg_window_h", nodecl.}
 
+# THE PROJECTOR (`abi/aowlspt_regproj.h`). `cRegProjTick` is UNITY THREAD ONLY
+# and opens its own single guard around the camera sample; everything else here
+# is a plain integer read of our own statics.
+proc cRegProjTick() {.importc: "aowl_regproj_tick", nodecl.}
+proc cRegProjInstalled(): int32 {.importc: "aowl_regproj_is_installed", nodecl.}
+proc cRegProjDisabled(): int32 {.importc: "aowl_regproj_is_disabled", nodecl.}
+proc cRegProjFaults(): int32 {.importc: "aowl_regproj_fault_count", nodecl.}
+proc cRegProjSamples(): int64 {.importc: "aowl_regproj_sample_count", nodecl.}
+proc cRegProjCalls(): int64 {.importc: "aowl_regproj_call_count", nodecl.}
+proc cRegProjInFront(): int64 {.importc: "aowl_regproj_infront_count", nodecl.}
+proc cRegProjBehind(): int64 {.importc: "aowl_regproj_behind_count", nodecl.}
+proc cRegProjNoCam(): int64 {.importc: "aowl_regproj_nocam_count", nodecl.}
+proc cRegProjNoScreen(): int64 {.
+  importc: "aowl_regproj_noscreen_count", nodecl.}
+proc cRegProjNonFinite(): int64 {.
+  importc: "aowl_regproj_nonfinite_count", nodecl.}
+proc cRegProjCamBind(): int32 {.importc: "aowl_regproj_cam_bind", nodecl.}
+proc cRegProjCamRoute(): int32 {.importc: "aowl_regproj_cam_route", nodecl.}
+proc cRegProjCamGen(): int32 {.importc: "aowl_regproj_cam_gen", nodecl.}
+proc cRegProjSelfTestFails(): int32 {.
+  importc: "aowl_regproj_cam_selftest_fails", nodecl.}
+
 var gRegionFaults = 0
 var gRegionBooted = false
 var gRegionAnnounced = false
 var gRegionScreenLogged = false
+var gRegProjInstallLogged = false
+var gRegProjSilentLogged = false
 
 proc regionLog(line: cstring) {.exportc: "aowlspt_nim_region_log", cdecl.} =
   ## Every line the region emits -- a registration, a fault naming the
@@ -188,6 +229,60 @@ proc regionFired(regs: Il2CppPtr) =
             $sw & "x" & $sh & " (measured from the game window's client rect; " &
             "aowl_region_screen_known() now reports " &
             $int(cRegionScreenKnown()) & ")"
+  # THE PROJECTOR, sampled BEFORE dispatch and never during it.
+  #
+  # Order matters twice over. First, a participant that projects this frame must
+  # see THIS frame's camera, not the previous one's. Second, `cRegProjTick`
+  # opens an `aowl_p_p_seh` and the dispatcher REFUSES outright if it finds a
+  # guard already active on the thread -- so the tick has to be entered and
+  # exited here, above `cRegionFrame`, rather than folded into it.
+  #
+  # Flag-gated, default OFF (`regionProjector`). With it off nothing is sampled,
+  # the projector seat stays empty, `aowl_region_project` keeps refusing with
+  # REFUSE_NOPROJ, and every consumer keeps drawing its bearing ring -- which is
+  # what makes turning this on a change that DEGRADES rather than blanks.
+  if gRegionProjectorOn:
+    cRegProjTick()
+    if not gRegProjInstallLogged and cRegProjInstalled() != 0:
+      gRegProjInstallLogged = true
+      okLog "region projector: INSTALLED -- world points now project to TRUE " &
+            "screen positions. Camera reached by route " & $cRegProjCamRoute() &
+            " (1 = UnityEngine.Camera::get_main, 2 = CameraManager.Instance." &
+            "<Camera>k__BackingField), " & $cRegProjSamples() &
+            " good sample(s) so far, and the view-projection passed the " &
+            "ten-metres-ahead-lands-centre self-test before the seat was " &
+            "filled. Behind-camera points are still projected, flagged " &
+            "BEHIND, and are a bearing rather than a position."
+    # The honest silence-breaker. A projector that never installs is exactly as
+    # invisible as one that was never written, so after ~30s of drains say
+    # WHICH of the three distinguishable causes it is, once.
+    if not gRegProjSilentLogged and cRegProjInstalled() == 0 and
+       cRegionFrames() >= 1800'i64:
+      gRegProjSilentLogged = true
+      let camBind = cRegProjCamBind()
+      if camBind == 2:
+        warn "region projector: NOT installed -- a camera prologue did not " &
+             "byte-match the recorded signature, i.e. a Tarkov update moved " &
+             "one of Camera::get_main / get_worldToCameraMatrix / " &
+             "get_projectionMatrix. Re-measure them before anything projects."
+      elif cRegProjSelfTestFails() > 0'i32:
+        warn "region projector: NOT installed -- the matrices were finite " &
+             "but " & $cRegProjSelfTestFails() & " sample(s) FAILED the " &
+             "finished-state self-test (a point ten metres straight ahead " &
+             "did not land in the middle fifth of the frame). That is a " &
+             "wrong view/projection pair or a wrong convention, NOT a " &
+             "missing camera."
+      elif cRegProjFaults() > 0'i32:
+        warn "region projector: NOT installed -- " & $cRegProjFaults() &
+             " camera sample(s) FAULTED through the guard" &
+             (if cRegProjDisabled() != 0: " and it has self-disabled." else: ".")
+      else:
+        info "region projector: not installed yet -- bind state " & $camBind &
+             ", " & $cRegProjCamGen() & " good sample(s). No fault and no " &
+             "self-test failure, so this is the ordinary 'no camera exists " &
+             "yet' state: Camera.main is untagged in Tarkov and " &
+             "CameraManager.Instance.Camera is null outside a raid. " &
+             "INCONCLUSIVE, not a failure."
   let r = cRegionFrame()
   if r < 0:
     inc gRegionFaults
@@ -207,6 +302,18 @@ proc regionFired(regs: Il2CppPtr) =
     okLog "region: 120 frames dispatched, " & $cRegionCount() &
           " participant(s), last frame " & $cRegionFrameUs() & " us, " &
           $cRegionDropped() & " draw command(s) dropped"
+    # The projector's own numbers, in the SAME line, because "installed" is a
+    # statement about our own write and says nothing about whether anything
+    # actually projected. These are read back off the finished projections.
+    if gRegionProjectorOn:
+      okLog "region projector: " &
+            (if cRegProjInstalled() != 0: "installed" else: "NOT installed") &
+            ", " & $cRegProjCalls() & " projection(s) asked for -- " &
+            $cRegProjInFront() & " in front, " & $cRegProjBehind() &
+            " BEHIND the camera (bearing only), " & $cRegProjNoCam() &
+            " refused for no camera snapshot, " & $cRegProjNoScreen() &
+            " refused for no published back-buffer size, " &
+            $cRegProjNonFinite() & " refused as NaN/absurd"
 
 proc bindRegion(verbose: bool): bool =
   ## Arms the region as a rider on the existing `PreloaderUI::Update` detour.
