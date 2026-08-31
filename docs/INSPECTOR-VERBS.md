@@ -496,10 +496,19 @@ selected it. Per-row outcomes and their named refusals:
 not this: it re-reads `registry/mods.json` from disk. It does not quiesce the
 mod, detach its detours, `FreeLibrary` it or re-arm it — and a `FreeLibrary`
 landing during scene teardown with detours still armed is a live crash. So the
-verb looks up `tools/modreload.py:reload_mod` (the entry point being built
-separately) and, when it is absent, refuses as `RELOAD_UNSUPPORTED` with the
-manual workaround, rather than calling the registry route and reporting success
-for an operation that never ran.
+verb refuses, with **two distinct named causes**, because they have different
+fixes:
+
+- `RELOAD_NOT_DECLARED` — the mod has not set `AOWLSPT_MOD_HOT_RELOADABLE`, so
+  since `ba46898` the client host refuses to unload it live and it stays loaded.
+  That gate exists because two undeclared mod DLLs were `FreeLibrary`'d during
+  scene teardown and took the client down inside a second. No mod in the repo
+  declares it today. The fix is in the mod, not here.
+- `RELOAD_UNSUPPORTED` — the mod *is* reloadable but no driver exists. The verb
+  looks up `tools/modreload.py:reload_mod` and starts working the day that
+  lands. It will not substitute `GET /aowlspt/mods/reload`, which is a registry
+  re-read, and reporting success for an operation that never ran is the whole
+  thing we are avoiding.
 
 ### Self-test
 

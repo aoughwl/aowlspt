@@ -330,7 +330,14 @@ class Repl(object):
             if not arg:
                 self.say("REFUSED: `modreload <mod-id>`.")
                 return INCONCLUSIVE
-            res = modctl.reload(arg)   # raises Refusal(RELOAD_UNSUPPORTED)
+            # Look the row up first so the refusal can name the RIGHT cause:
+            # "this mod has not declared it can come out live" and "no reload
+            # driver exists here" are different problems with different fixes.
+            # If we cannot reach the backend the lookup refuses on its own
+            # (BACKEND_UNREACHABLE) -- we do not fall through and guess.
+            rows, _ = modctl.list_mods(arg, live_dir=self.live_dir)
+            exact = [r for r in rows if r["id"] == arg]
+            res = modctl.reload(arg, row=exact[0] if exact else None)
             self.say("  %s" % (res,))
             return PASS
         self.say("REFUSED: unknown mod verb %r." % verb)
@@ -437,9 +444,16 @@ def selftest():
         case("modreload on an unknown id", e.name, "NOT_IN_REGISTRY")
     try:
         modctl.reload("aowl.good", registry=reg)
-        case("modreload on a known id", "no refusal", "Refusal")
+        case("modreload, no driver anywhere", "no refusal", "Refusal")
     except modctl.Refusal as e:
-        case("modreload on a known id", e.name, "RELOAD_UNSUPPORTED")
+        case("modreload, no driver anywhere", e.name, "RELOAD_UNSUPPORTED")
+    # ... and the DIFFERENT refusal, for a mod the host would refuse to unload
+    try:
+        modctl.reload("aowl.good", registry=reg,
+                      row={"id": "aowl.good", "hot_reloadable": False})
+        case("modreload, mod never declared it", "no refusal", "Refusal")
+    except modctl.Refusal as e:
+        case("modreload, mod never declared it", e.name, "RELOAD_NOT_DECLARED")
 
     print("== could not look at all ==")
     def dead(_p, **_k):

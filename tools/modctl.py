@@ -159,6 +159,13 @@ def classify(row, reg_entry=None, live_dir=None):
         "client_outcome": row.get("clientOutcome"),
         "client_code": row.get("clientCode"),
         "client_message": row.get("clientMessage"),
+        # AOWLSPT_MOD_HOT_RELOADABLE, as the client host reports it
+        # (`host/common/modcontrol.nim:ModHotReloadable`). Since ba46898 this
+        # GATES the unload: a mod that has not claimed it is refused BY NAME
+        # and stays loaded. Three-valued for the same reason `live` is --
+        # `mgr/control.nim` defaults it to false when the host has said
+        # nothing, so absence from the row is "not reported", not "no".
+        "hot_reloadable": row.get("hotReloadable"),
     }
 
     # Gates are reported in the order they are evaluated by the platform, so
@@ -303,8 +310,8 @@ def reload_entry_point():
     return getattr(modreload, "reload_mod", None)
 
 
-def reload(mid, get=http_get, registry=None):
-    """`modreload`. Three outcomes, and the refusal is BY NAME.
+def reload(mid, get=http_get, registry=None, row=None):
+    """`modreload`. Three outcomes, and TWO DISTINCT named refusals.
 
     There IS a `GET /aowlspt/mods/reload` route, and calling it here would be
     the wrong thing: it re-reads `registry/mods.json` from disk. It does not
@@ -314,6 +321,22 @@ def reload(mid, get=http_get, registry=None):
     it with a registry re-read would report success for something that did not
     happen."""
     _known_id(mid, get, registry)
+
+    # Gate first, driver second -- because this refusal is the one the user
+    # will actually hit. Since ba46898 the client host REFUSES to unload a mod
+    # that has not set AOWLSPT_MOD_HOT_RELOADABLE, and no mod in the repo
+    # declares it. Reporting "no driver" for a mod that would be refused
+    # anyway would name the wrong cause.
+    if row is not None and row.get("hot_reloadable") is False:
+        raise Refusal(
+            "RELOAD_NOT_DECLARED",
+            "%s has not declared AOWLSPT_MOD_HOT_RELOADABLE, so the client "
+            "host will REFUSE to unload it live and it stays loaded. That gate "
+            "exists because two undeclared mod DLLs were FreeLibrary'd during "
+            "scene teardown and took the client down inside a second. This is "
+            "a property of the mod, not of this tool: the mod must claim it. "
+            "Restart the client to pick up a new build of it." % mid)
+
     fn = reload_entry_point()
     if fn is None:
         raise Refusal(
