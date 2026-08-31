@@ -84,6 +84,20 @@
  * only given its own, honestly-named counter. */
 #define AOWL_NE_MAX_DISC_FAULTS 24
 
+/* SEED ATTEMPTS. `Scene::GetRootGameObjects` ALLOCATES (a List and an array),
+ * and a seed that faults leaves `gNeSeeded` false, so it re-runs on the NEXT
+ * frame -- MEASURED: 24 allocating enumerations of 178 roots each before the
+ * discovery ledger finally capped out. Even with the per-root fault now
+ * isolated and skipped, the seed must be bounded by attempts as well as by
+ * faults, so that "the seed cannot succeed" can never become a per-frame
+ * allocating path. */
+#define AOWL_NE_MAX_SEED_TRIES 8
+
+/* Roots whose conversion faulted and are therefore skipped on the retry. A
+ * fixed cap because it is an iteration bound like every other one here; a raid
+ * that faults on more roots than this is not a raid we can seed from. */
+#define AOWL_NE_MAX_SEED_SKIPS 64
+
 /* ---- the faction sub-pools -------------------------------------------- */
 /* EPlayerSide is 1=Usec, 2=Bear, 4=Savage -- NOT 3. Savage is split by
  * WildSpawnType into plain scav and everything scarier. */
@@ -148,6 +162,7 @@ static float aowl_ne_faction_rgba(int32_t f, int32_t chan) {
 #define AOWL_NE_R_FAULTED       11
 #define AOWL_NE_R_NO_STRING     12
 #define AOWL_NE_R_DISC_FAULTED  13
+#define AOWL_NE_R_SEED_TRIES    14
 
 static const char *aowl_ne_refusal_text(int32_t r) {
     switch (r) {
@@ -170,6 +185,7 @@ static const char *aowl_ne_refusal_text(int32_t r) {
     case AOWL_NE_R_BUILD_FAILED: return "the pool build refused partway; the partial pool was destroyed rather than left half-parented";
     case AOWL_NE_R_FAULTED:      return "self-disabled after AOWL_NE_MAX_FAULTS faults inside the guarded tick";
     case AOWL_NE_R_DISC_FAULTED: return "the canvas walk itself faulted AOWL_NE_MAX_DISC_FAULTS times; every node is liveness-checked before any internal call, so these were NOT fake nulls and the cause is unknown -- discovery stopped rather than fault every frame";
+    case AOWL_NE_R_SEED_TRIES:   return "seeding was attempted AOWL_NE_MAX_SEED_TRIES times without ever queueing a root; Scene::GetRootGameObjects ALLOCATES, so retrying it every frame forever is itself a defect. This is INCONCLUSIVE -- read the `seed:` ledger for which step and which root index";
     case AOWL_NE_R_NO_STRING:    return "the two managed type-name strings could not be interned (nativeui's intern table is full); GetComponent(String) has nothing to be asked with";
     default:                     return "?";
     }
@@ -188,6 +204,8 @@ static int32_t aowl_ne_max_nodes(void)   { return AOWL_NE_MAX_NODES; }
 static int32_t aowl_ne_max_children(void){ return AOWL_NE_MAX_CHILDREN; }
 static int32_t aowl_ne_max_depth(void)   { return AOWL_NE_MAX_DEPTH; }
 static int32_t aowl_ne_max_disc_faults(void) { return AOWL_NE_MAX_DISC_FAULTS; }
+static int32_t aowl_ne_max_seed_tries(void)  { return AOWL_NE_MAX_SEED_TRIES; }
+static int32_t aowl_ne_max_seed_skips(void)  { return AOWL_NE_MAX_SEED_SKIPS; }
 static int32_t aowl_ne_slice_ms(void)    { return AOWL_NE_SLICE_MS; }
 static int32_t aowl_ne_scan_every(void)  { return AOWL_NE_SCAN_EVERY; }
 static float   aowl_ne_min_canvas_px(void) { return AOWL_NE_MIN_CANVAS_PX; }

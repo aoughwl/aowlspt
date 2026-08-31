@@ -109,6 +109,8 @@ proc cNeMaxNodes(): int32 {.importc: "aowl_ne_max_nodes", nodecl.}
 proc cNeMaxChildren(): int32 {.importc: "aowl_ne_max_children", nodecl.}
 proc cNeMaxDepth(): int32 {.importc: "aowl_ne_max_depth", nodecl.}
 proc cNeMaxDiscFaults(): int32 {.importc: "aowl_ne_max_disc_faults", nodecl.}
+proc cNeMaxSeedTries(): int32 {.importc: "aowl_ne_max_seed_tries", nodecl.}
+proc cNeMaxSeedSkips(): int32 {.importc: "aowl_ne_max_seed_skips", nodecl.}
 proc cNeSliceMs(): int32 {.importc: "aowl_ne_slice_ms", nodecl.}
 proc cNeScanEvery(): int32 {.importc: "aowl_ne_scan_every", nodecl.}
 proc cNeMinCanvasPx(): float32 {.importc: "aowl_ne_min_canvas_px", nodecl.}
@@ -130,6 +132,7 @@ const
   NeRFaulted      = 11'i32
   NeRNoString     = 12'i32
   NeRDiscFaulted  = 13'i32
+  NeRSeedTries    = 14'i32
 
 const
   NeVInconclusive = 0'i32
@@ -226,9 +229,34 @@ const
   NeSeedDone      = 4
 
 var gNeSeedStep = NeSeedIdle
-var gNeSeedTries = 0        ## seed attempts made (it retries until it works)
+var gNeSeedTries = 0        ## seed attempts made (bounded by cNeMaxSeedTries)
 var gNeSeedRootsGot = 0     ## roots iSceneRoots handed back, before liveness
 var gNeSeedAnchor = false   ## did we obtain a durable anchor at all?
+
+# ---- FAULTED IS NOT DEAD ---------------------------------------------------
+#
+# MEASURED (integ-beta6 @8829a49, loaded raid): `rootsObtained=178
+# liveRootsSeeded=0 rootsSkippedDead=0 discFaults=24`. Zero seeded AND zero
+# classified dead is not a classification result at all -- every root FAULTED,
+# and the ledger had no field that could say so, so the two outcomes collapsed
+# into one indistinguishable pair of zeros. CLAUDE.md 9b in its purest form.
+#
+# `gNeSeedFaulted` is that missing third outcome. It is charged from the
+# TICK-LEVEL fault handler, because the guard is not re-entrant and a per-root
+# guard nested inside the tick's would DISARM the tick's -- so the seed instead
+# records the root index it is IN FLIGHT on before touching it, and the fault
+# handler converts that index into a permanent skip. The next attempt steps
+# over it. One bad root can therefore no longer consume the whole feature.
+var gNeSeedFaulted = 0        ## roots that FAULTED conversion (not "dead")
+var gNeSeedInFlight = -1      ## index of the root being converted right now
+var gNeSeedSkip: seq[int32] = @[]   ## indices proven to fault; capped
+var gNeSeedGiven = false      ## the try cap was reached; stop re-enumerating
+var gNeSeedGoSeen = 0         ## roots that arrived as an UNTRANSLATED GameObject
+
+proc neSeedSkipped(i: int): bool =
+  for k in 0 ..< gNeSeedSkip.len:
+    if gNeSeedSkip[k] == int32(i): return true
+  false
 
 proc neSeedStepName(s: int): string =
   case s
@@ -403,6 +431,9 @@ proc neSeed(): bool =
   gNeTruncated = 0
   gNeSeedRootsGot = 0
   gNeSeedAnchor = false
+  gNeSeedFaulted = 0
+  gNeSeedGoSeen = 0
+  gNeSeedInFlight = -1
   gNeSeedTries = gNeSeedTries + 1
   # STEP 1 -- THE ANCHOR, OBTAINED THE SAME WAY splFindScreen OBTAINS IT.
   #
@@ -429,20 +460,57 @@ proc neSeed(): bool =
   var roots: seq[Il2CppPtr] = @[]
   discard iSceneRoots(roots, false, anchor)
   gNeSeedRootsGot = roots.len
+  # STEP 3 -- QUEUE. THIS IS THE BUG THAT WAS MEASURED.
+  #
+  # `iSceneRoots` does NOT hand back GameObjects. `iRootsOfHandle` converts
+  # each element of the `GameObject[]` to a Transform AT THE BOUNDARY, once,
+  # and appends the TRANSFORM -- its own comment says so in as many words
+  # ("everything downstream ... operates on Transforms, so a $rN that meant
+  # something different from $c0 or $f1 would be a trap waiting for someone to
+  # walk into it later"). natesp walked into it: it called `neTransformOf`,
+  # i.e. `GameObject::get_transform`, with `this` = a TRANSFORM.
+  #
+  # That is why the ledger read 178/0/0. A Transform is a UnityEngine.Object,
+  # so it is readable AND `m_CachedPtr` is a live native pointer -- it passes
+  # `duOk` and it passes `iUnityAlive`, which is exactly why NOT ONE root was
+  # classified dead. The type confusion only surfaces inside Unity's C++ icall,
+  # where no `aowl_p_p_seh` of ours reaches. Every single root faulted.
+  #
+  # The array extraction was never at fault; it is the inspector's own and it
+  # is the code that produces `roots` correctly every time.
+  #
+  # So: queue the Transform directly. The one defensive branch uses the
+  # inspector's LEARNED klass blacklist -- `iIsGameObject` is populated only
+  # from pointers a target returned as a GameObject by contract, never guessed
+  # -- so an untranslated GameObject arriving here is converted rather than
+  # silently mis-called, and it is COUNTED.
   gNeSeedStep = NeSeedConvert
+  var idx = 0
   for g in roots:
-    # A scene root can be a fake null too -- during a raid load especially.
-    # neTransformOf checks liveness on BOTH sides of GameObject::get_transform.
-    if not neLive(g):
-      inc gNeSeedDead
+    let i = idx
+    inc idx
+    if neSeedSkipped(i):
+      # Proven to fault on an earlier attempt. Skipping it is the whole point:
+      # 24 faults on 178 roots killed the feature before the walk ever started.
+      inc gNeSeedFaulted
       continue
-    let tr = neTransformOf(g)
+    gNeSeedInFlight = i
+    var tr: Il2CppPtr = nil
+    if iIsGameObject(g):
+      # Not the contract, but not a guess either: the klass is KNOWN to be a
+      # GameObject. Convert it properly instead of calling a Transform method
+      # on it.
+      inc gNeSeedGoSeen
+      tr = neTransformOf(g)
+    elif neLive(g):
+      tr = g
     if tr != nil:
       gNeQueue.add tr
       gNeDepth.add 0'i32
       inc gNeSeedCount
     else:
       inc gNeSeedDead
+    gNeSeedInFlight = -1
   gNeSeedStep = NeSeedDone
   gNeQueue.len > 0
 
@@ -457,6 +525,9 @@ proc neSeedLedger(): string =
   " rootsObtained=" & $gNeSeedRootsGot &
   " liveRootsSeeded=" & $gNeSeedCount &
   " rootsSkippedDead=" & $gNeSeedDead &
+  " rootsFaulted=" & $gNeSeedFaulted &
+  " rootsAsGameObject=" & $gNeSeedGoSeen &
+  " inFlightIdx=" & $gNeSeedInFlight &
   " step=" & neSeedStepName(gNeSeedStep) &
   " lastInternalCall=\"" & neCrumb() & "\" on 0x" &
   hexOf(cast[uint64](cInspCrumbPtr()))
@@ -473,6 +544,19 @@ proc neDiscoverStep() =
     neRefuse(NeRNoGetComp)
     return
   if not gNeSeeded:
+    # THE ATTEMPT CAP, checked BEFORE the enumeration, not after.
+    # `Scene::GetRootGameObjects` allocates; a seed that can never succeed must
+    # not keep allocating once per frame forever. MEASURED: it did exactly that
+    # 24 times before the discovery fault ledger happened to cap out.
+    if gNeSeedTries >= int(cNeMaxSeedTries()):
+      if not gNeSeedGiven:
+        gNeSeedGiven = true
+        warn "natesp: giving up on SEEDING after " & $gNeSeedTries &
+             " attempts -- " & neSeedLedger() & ". Scene::GetRootGameObjects " &
+             "ALLOCATES, so retrying it every frame is itself a defect. This " &
+             "is INCONCLUSIVE, not proof there is no canvas."
+      neRefuse(NeRSeedTries)
+      return
     if not neSeed():
       # NOT a bare "no roots". Say which of the two distinguishable causes it
       # was, and say plainly when the anchor is the missing piece -- natesp
@@ -493,8 +577,11 @@ proc neDiscoverStep() =
               "the scene enumeration itself came back empty. INCONCLUSIVE."
             else:
               "An anchor was obtained and " & $gNeSeedRootsGot & " root(s) came " &
-              "back, but every one failed the liveness check or had no readable " &
-              "Transform. INCONCLUSIVE.")
+              "back, but none was queued: " & $gNeSeedDead & " failed the " &
+              "liveness check and " & $gNeSeedFaulted & " FAULTED and were " &
+              "skipped. Those two are deliberately separate -- when they were " &
+              "one field, 178 roots reported 0 seeded and 0 dead and the " &
+              "ledger could not say which had happened. INCONCLUSIVE.")
       neRefuse(NeRNoRoots)
       return
     gNeSeeded = true
@@ -956,6 +1043,23 @@ proc natEspDrainTick() =
       # faults reported `visited=0 budgetLeft=20000 head=0/0` -- a walk that
       # provably never ran -- and told us nothing.
       let inSeed = not gNeSeeded
+      # PER-ROOT FAULT ISOLATION. The guard is not re-entrant, so the seed can
+      # not wrap each root in its own; instead it records the index it is IN
+      # FLIGHT on, and that index becomes a permanent skip here. Without this,
+      # one unconvertible root among 178 burns a discovery fault per frame and
+      # the feature self-disables before the walk has ever run -- which is
+      # precisely what was measured.
+      if inSeed and gNeSeedInFlight >= 0:
+        if gNeSeedSkip.len < int(cNeMaxSeedSkips()) and
+           not neSeedSkipped(gNeSeedInFlight):
+          gNeSeedSkip.add int32(gNeSeedInFlight)
+        warn "natesp: scene root index " & $gNeSeedInFlight & " of " &
+             $gNeSeedRootsGot & " FAULTED during " &
+             neSeedStepName(gNeSeedStep) & "; it is now permanently SKIPPED " &
+             "(" & $gNeSeedSkip.len & " of " & $int(cNeMaxSeedSkips()) &
+             " skip slots used) and the next attempt steps over it. This is " &
+             "counted as rootsFaulted, which is NOT rootsSkippedDead."
+        gNeSeedInFlight = -1
       warn "natesp: " & (if inSeed: "SEEDING" else: "the canvas WALK") &
            " faulted (" & $gNeDiscFaults & " of " &
            $int(cNeMaxDiscFaults()) & " discovery faults; the steady-state " &
