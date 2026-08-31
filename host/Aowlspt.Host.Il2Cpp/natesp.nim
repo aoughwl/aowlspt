@@ -1401,28 +1401,165 @@ proc neBuildPool(): bool =
 # ---------------------------------------------------------------------------
 # THE CENSUS -- into fixed arrays, throttled, capped
 # ---------------------------------------------------------------------------
-proc neFactionOf(pl: Il2CppPtr): int32 =
-  ## EPlayerSide 1=Usec, 2=Bear, 4=Savage -- NOT 3. Savage is split by
-  ## WildSpawnType so a boss/raider/rogue does not read as a plain scav.
-  var side = 0'i32
-  var role = 0'i32
+proc cRoleIsBossTier(role: int32): int32 {.
+  importc: "aowl_role_is_boss_tier", nodecl.}
+  ## THE ONE numeric WildSpawnType table, `abi/aowlspt_wildspawn.h`, shared
+  ## verbatim with mods/maps. Pure integer classification -- it dereferences
+  ## nothing, so sharing it across two binaries with different safety envelopes
+  ## costs nothing.
+
+# ---------------------------------------------------------------------------
+# TWO TAXONOMIES, AND THE CONVERSION BETWEEN THEM IS WRITTEN OUT
+# ---------------------------------------------------------------------------
+# The ESP DRAWS four factions, because the colour palette in C
+# (`aowl_ne_faction_rgba`) has four entries and the box pool is laid out as
+# four contiguous per-faction runs. The maps mod CLASSIFIES five, because it
+# needs Local (you) and Unknown (the walk declined) to be first-class outcomes.
+#
+# These are NOT interchangeable and the previous code effectively pretended
+# they were. So both are computed, from ONE walk, and the fold from five to
+# four is a single explicit `case` below rather than an accident of ordering:
+#
+#   class (5)                     draw faction (4)
+#   ---------                     ----------------
+#   NeClsLocal   you              -- never drawn; the census skips you
+#   NeClsPmc     Usec/Bear side   NeFacUsec / NeFacBear, keeping the split
+#   NeClsScav    Savage, no boss  NeFacScav
+#   NeClsBoss    boss tier        NeFacBoss
+#   NeClsUnknown walk declined    NeFacScav, and SAID SO in the histogram
+#
+# The Unknown -> Scav fold is the one lossy step and it is deliberate: there is
+# no fifth colour to draw and hiding the contact would be worse than painting
+# it. It is only acceptable BECAUSE the histogram counts Unknown separately, so
+# a dead Profile walk shows up as `unknown=N` rather than as a convincing field
+# of scavs (CLAUDE.md 9b -- the count is the thing that can falsify this).
+const
+  NeClsLocal   = 0'i32
+  NeClsPmc     = 1'i32
+  NeClsScav    = 2'i32
+  NeClsBoss    = 3'i32
+  NeClsUnknown = 4'i32
+  NeClsCount   = 5
+
+const
+  NeFacUsec = 0'i32
+  NeFacBear = 1'i32
+  NeFacScav = 2'i32
+  NeFacBoss = 3'i32
+
+var gNeClsHist: array[NeClsCount, int32]
+  ## THIS pass's distribution. Reset by `neScan`, read by the diagnostic.
+var gNeClsEver: array[NeClsCount, int64]
+  ## Cumulative for the session, so a diag opened after the interesting moment
+  ## still has the numbers.
+
+proc neClassify(pl: Il2CppPtr; cls, faction: var int32) =
+  ## ONE guarded walk (`bdReadSideRole`: Player+0x9C0 -> Profile+0x48 ->
+  ## ProfileInfo, +0x48 side / +0x78 Settings +0x10 role, sentinel -1 on any
+  ## unreadable hop), producing BOTH taxonomies.
+  ##
+  ## THE FIX (fact #325, measured). This used to match the faction against a
+  ## case-insensitive SUBSTRING of the role NAME -- "boss"/"raider"/"rogue"/
+  ## "follower" -- which assigns a faction by SPELLING and therefore got two
+  ## whole populations wrong, silently:
+  ##
+  ##   exUsec (24) ARE the Rogues. No "rogue" in the name, and it was reached
+  ##     only after the side check had already claimed it, so a Rogue drew in
+  ##     the USEC colour.
+  ##   pmcBot (9) ARE the Raiders. No "raider" in the name, so a Raider fell
+  ##     through to the plain-scav bucket.
+  ##
+  ## Two ordering points are load-bearing, not stylistic:
+  ##
+  ##   1. THE ROLE IS TESTED BEFORE THE SIDE. Rogues carry a PMC-looking side;
+  ##      testing the side first is exactly what hid them. Boss tier outranks
+  ##      side, as it does in mods/maps.
+  ##   2. role == -1 is the SENTINEL for "could not read", not a role. It must
+  ##      not reach the table, and a contact whose side is also unreadable is
+  ##      Unknown -- never folded into Scav at the classification stage.
+  var side = -1'i32
+  var role = -1'i32
   bdReadSideRole(pl, side, role)
+
+  if role >= 0'i32 and cRoleIsBossTier(role) != 0'i32:
+    cls = NeClsBoss
+    faction = NeFacBoss
+    return
   case int(side)
-  of 1: return 0'i32          # USEC
-  of 2: return 1'i32          # BEAR
-  else: discard
-  let rn = duRoleName(role)
-  if rn.len == 0: return 2'i32
-  if iContains(iLower(rn), "boss") or iContains(iLower(rn), "raider") or
-     iContains(iLower(rn), "rogue") or iContains(iLower(rn), "follower"):
-    return 3'i32
-  2'i32
+  of 1:
+    cls = NeClsPmc
+    faction = NeFacUsec
+  of 2:
+    cls = NeClsPmc
+    faction = NeFacBear
+  of 4:
+    cls = NeClsScav
+    faction = NeFacScav
+  else:
+    cls = NeClsUnknown
+    faction = NeFacScav          # the lossy fold, documented above
+
+proc neFactionOf(pl: Il2CppPtr): int32 =
+  ## Kept as the draw-side entry point; the classification lives in
+  ## `neClassify` so the histogram and the colour can never disagree.
+  var cls = NeClsUnknown
+  var faction = NeFacScav
+  neClassify(pl, cls, faction)
+  faction
+
+proc neClsName(c: int): string =
+  case c
+  of 0: "local"
+  of 1: "pmc"
+  of 2: "scav"
+  of 3: "boss"
+  else: "unknown"
+
+proc neClsHistText(): string =
+  ## `contacts by class: local=N pmc=N scav=N boss=N unknown=N` -- the raw
+  ## distribution, never a verdict. The verdict is `neClsVerdict` and prints
+  ## beside it so a reader who disagrees can check it against these counts.
+  result = "contacts by class:"
+  var i = 0
+  while i < NeClsCount:
+    result = result & " " & neClsName(i) & "=" & $gNeClsHist[i]
+    inc i
+
+proc neClsVerdict(): string =
+  ## THREE OUTCOMES, never two (CLAUDE.md 9b). The falsifiable negative is
+  ## "the distribution is NOT DEGENERATE": a classifier reading garbage looks
+  ## exactly like every contact landing in one bucket, so one bucket holding
+  ## everything is INCONCLUSIVE, not a pass. So is an empty census -- "I could
+  ## not look" has never been a PASS.
+  var total = 0'i32
+  var nonEmpty = 0
+  var i = 0
+  while i < NeClsCount:
+    total = total + gNeClsHist[i]
+    if gNeClsHist[i] > 0'i32: inc nonEmpty
+    inc i
+  if total == 0'i32:
+    return "INCONCLUSIVE (no contacts classified this pass -- not a pass, " &
+           "there was nothing to look at)"
+  if gNeClsHist[int(NeClsUnknown)] == total:
+    return "FAIL (every contact is unknown -- the Profile walk is declining, " &
+           "which is what a broken read looks like, not a raid full of " &
+           "unclassifiable people)"
+  if nonEmpty <= 1:
+    return "INCONCLUSIVE (degenerate: all " & $total & " contacts in one " &
+           "class. Indistinguishable from a read that returns a constant)"
+  "PASS (distribution spans " & $nonEmpty & " classes over " & $total &
+    " contacts -- not degenerate)"
 
 proc neScan() =
   ## `GameWorld.RegisteredPlayers` +0x1D0, capped at NeMaxContacts, every hop
   ## guarded, read-only. Fills FIXED arrays -- botdiag's discipline with the
   ## logging and the seq allocation both removed.
   gNeCn = 0
+  var h = 0
+  while h < NeClsCount:
+    gNeClsHist[h] = 0'i32
+    inc h
   let gw = gDuGameWorld
   if not duOk(gw, cBdOffRegPlayers() + 8'i32): return
   let lst = cReadPtrAt(gw, cBdOffRegPlayers())
@@ -1439,7 +1576,15 @@ proc neScan() =
     if cIsReadable(slot, 8'i32) == 0'i32: continue
     let pl = cReadPtrAt(slot, 0'i32)
     if pl == nil or not bdSanePtr(pl): continue
-    if bdIsYou(pl): continue
+    if bdIsYou(pl):
+      # COUNTED, then skipped. The ESP deliberately does not draw a box on you,
+      # but omitting you from the histogram would make `local=0` permanent and
+      # therefore meaningless -- a bucket that can never be non-zero is a check
+      # that cannot fail. `local` here means "the census reached you", which is
+      # itself worth seeing go wrong.
+      gNeClsHist[int(NeClsLocal)] = gNeClsHist[int(NeClsLocal)] + 1'i32
+      gNeClsEver[int(NeClsLocal)] = gNeClsEver[int(NeClsLocal)] + 1'i64
+      continue
     var posOk = false
     var x = 0.0
     var y = 0.0
@@ -1449,7 +1594,12 @@ proc neScan() =
     gNeCx[gNeCn] = x
     gNeCy[gNeCn] = y
     gNeCz[gNeCn] = z
-    gNeCf[gNeCn] = neFactionOf(pl)
+    var cls = NeClsUnknown
+    var faction = NeFacScav
+    neClassify(pl, cls, faction)
+    gNeCf[gNeCn] = faction
+    gNeClsHist[int(cls)] = gNeClsHist[int(cls)] + 1'i32
+    gNeClsEver[int(cls)] = gNeClsEver[int(cls)] + 1'i64
     inc gNeCn
   gNeContactsEver = gNeContactsEver + int64(gNeCn)
 
@@ -1578,7 +1728,7 @@ proc neCanvasLine(): string =
          "established. Phase 0 is the only gate; the nested walk's scope is " &
          "not part of this decision)")
 
-proc neVerdictLine(sw, sh: float64): string =
+proc neVerdictBody(sw, sh: float64): string =
   case int(gNeVerdict)
   of 2:
     "natesp VERDICT PASS -- " & neCanvasLine() & ". Pool built, and " &
@@ -1620,6 +1770,13 @@ proc neVerdictLine(sw, sh: float64): string =
          "SEEDING (see the `seed:` fields above), not in the walk."
        else: "") &
       " I could not look; that is NOT a pass."
+
+proc neVerdictLine(sw, sh: float64): string =
+  ## The classification histogram rides along on EVERY branch -- including the
+  ## FAIL and INCONCLUSIVE ones, because a broken classifier and a broken
+  ## placement are independent failures, and the branch that hides one behind
+  ## the other is the branch that costs a session.
+  neVerdictBody(sw, sh) & "  [" & neClsHistText() & " -- " & neClsVerdict() & "]"
 
 # ---------------------------------------------------------------------------
 # THE TICK -- one body, one guard, ridden on the existing Update drain

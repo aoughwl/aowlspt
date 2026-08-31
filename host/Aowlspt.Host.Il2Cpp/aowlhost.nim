@@ -346,6 +346,11 @@ static int aowl_rva_is_code(unsigned int rva) {
 ## the faction colour table, the fault budget and the three-outcome verdict
 ## vocabulary. No il2cpp; nothing in it can fault.
 {.emit: """#include "aowlspt_natesp.h" """.}
+## THE ONE WildSpawnType numeric table, shared verbatim with mods/maps so the
+## minimap and the ESP boxes cannot disagree about who is a Rogue. Pure integer
+## classification over a value the caller already read -- it dereferences
+## nothing, which is why it is safe to share across the host/mod boundary.
+{.emit: """#include "aowlspt_wildspawn.h" """.}
 ## THE EAGER PROLOGUE SNAPSHOT. Defined here because it needs every target
 ## table above it, and CALLED from `hostReady` before any feature binds -- that
 ## ordering is the whole guarantee. Once this has run, no later verify can be

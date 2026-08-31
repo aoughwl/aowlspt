@@ -159,6 +159,25 @@ static int32_t sp_rd_i32(void* o, int32_t off) {
   memcpy(&v, a, 4);
   return v;
 }
+/* THE i32 READ WITH READABILITY ANSWERED SEPARATELY.
+ *
+ * `sp_rd_i32` returns 0 both for "this page is not mapped" and for "the value
+ * really is 0". For the CLASSIFICATION reads that is not a tolerable
+ * ambiguity: WildSpawnType.marksman IS 0, so an unreadable ProfileSettings and
+ * a live sniper scav would produce the identical answer and the class
+ * histogram would be a lie in exactly the direction that looks plausible.
+ *
+ * Returns 1 when all 4 bytes were readable and *out holds them, 0 otherwise
+ * (and *out is left alone). EPlayerSide has no 0 member either -- 1/2/4 -- so
+ * the side read could have got away with the sentinel; it uses this anyway so
+ * both halves of the walk fail the same way and neither can be the one that
+ * quietly cannot fail. */
+static int32_t sp_rd_i32_ok(void* o, int32_t off, int32_t* out) {
+  unsigned char* a = (unsigned char*)o + off;
+  if (!aowl_is_readable(a, 4)) return 0;
+  memcpy(out, a, 4);
+  return 1;
+}
 static float sp_rd_f32(void* o, int32_t off) {
   unsigned char* a = (unsigned char*)o + off;
   float v = 0.0f;
@@ -431,6 +450,8 @@ proc spPV(f: Il2CppPtr): Il2CppPtr {.importc: "sp_p_v", nodecl.}
 proc spI32V(f: Il2CppPtr): int32 {.importc: "sp_i32_v", nodecl.}
 proc cRdPtr(o: pointer; off: int32): pointer {.importc: "sp_rd_ptr", nodecl.}
 proc cRdI32(o: pointer; off: int32): int32 {.importc: "sp_rd_i32", nodecl.}
+proc cRdI32Ok(o: pointer; off: int32; outv: ptr int32): int32 {.
+  importc: "sp_rd_i32_ok", nodecl.}
 proc cRdF32(o: pointer; off: int32): cfloat {.importc: "sp_rd_f32", nodecl.}
 proc cRdVec3(o: pointer; off: int32; out3: ptr cfloat): int32 {.
   importc: "sp_rd_vec3", nodecl.}
@@ -508,6 +529,82 @@ const
   McPrevPos    = 0x370
   PrId         = 0x10
 
+  # ---- THE CONTACT-CLASS WALK ------------------------------------------
+  #
+  # Player(+0x9C0) -> Profile(+0x48) -> ProfileInfo, then
+  #   ProfileInfo(+0x48)  int32  EPlayerSide   1=Usec 2=Bear 4=Savage (NOT 3)
+  #   ProfileInfo(+0x78)  ptr    ProfileSettings
+  #   ProfileSettings(+0x10) int32 WildSpawnType
+  #
+  # RESOLVED OFFLINE 2026-08-31 with `python tools/fldoff.py fields <T>` on
+  # EFT.Player / EFT.Profile / EFT.ProfileInfo / EFT.ProfileSettings. That
+  # tool's mandatory System.String self-check (_stringLength@0x10,
+  # _firstChar@0x14) passed on every one of the four runs -- it prints nothing
+  # but the failure otherwise -- and the same dumps re-derived PlProfile@0x9C0,
+  # PlAIData@0xA00 and PrId@0x10 EXACTLY as this file already had them, which
+  # is four independent corroborations rather than one hopeful lookup.
+  #
+  # CORROBORATED A SECOND WAY: the host's own `bdReadSideRole`
+  # (host/Aowlspt.Host.Il2Cpp/botdiag.nim:120), which the native ESP's
+  # `neFactionOf` already ships on, walks these same four offsets. This mod and
+  # the ESP therefore classify from identical bytes; a disagreement between the
+  # minimap and the ESP boxes is now a bug in ONE of the two derivations, not
+  # in two different readings of the world.
+  #
+  # NOTHING HERE IS CALLED. `Player::get_Side` and `get_Profile` are properties
+  # and could be invoked at an RVA, but a getter that constructs is how
+  # `get_MatchmakerOperation` killed the client; these are plain backing fields
+  # and a guarded read is strictly weaker and strictly safer.
+  PrInfo       = 0x48   ## EFT.Profile.Info -> ProfileInfo
+  InfSide      = 0x48   ## EFT.ProfileInfo.<Side>k__BackingField (EPlayerSide)
+  InfSettings  = 0x78   ## EFT.ProfileInfo.<Settings>k__BackingField
+  SetRole      = 0x10   ## EFT.ProfileSettings.Role (WildSpawnType)
+
+const
+  # EPlayerSide members, from the same dump. There is no 0 and no 3.
+  SideUsec   = 1'i32
+  SideBear   = 2'i32
+  SideSavage = 4'i32
+
+const
+  ## THE CLASS ENUM. Deliberately five-valued, and Unknown is a FIRST-CLASS
+  ## outcome rather than a fold into Scav: "the walk declined" and "this is a
+  ## scav" are different facts and merging them is precisely the check that
+  ## cannot fail (CLAUDE.md 9b). Every consumer therefore has an Unknown colour
+  ## and an Unknown toggle, and the diagnostic prints an Unknown count that a
+  ## reader can see go wrong.
+  ClsLocal*   = 0
+  ClsPmc*     = 1
+  ClsScav*    = 2
+  ClsBoss*    = 3
+  ClsUnknown* = 4
+  ClsCount*   = 5
+
+proc clsName*(c: int): string =
+  case c
+  of ClsLocal: "local"
+  of ClsPmc:   "pmc"
+  of ClsScav:  "scav"
+  of ClsBoss:  "boss"
+  else:        "unknown"
+
+{.emit: """#include "aowlspt_wildspawn.h" """.}
+
+proc cRoleIsBossTier(role: int32): int32 {.
+  importc: "aowl_role_is_boss_tier", nodecl.}
+
+proc roleIsBossTier(role: int32): bool =
+  ## EFT.WildSpawnType members whose contact is a boss or a boss's escort, by
+  ## NUMERIC VALUE from the enum dump -- never by a substring of a name. The
+  ## values themselves now live in `abi/aowlspt_wildspawn.h`, ONCE, and the
+  ## host's native ESP calls the same function: the ESP used to match on the
+  ## substrings "boss"/"raider"/"rogue"/"follower", which silently missed
+  ## `exUsec` (24, the Rogues) and `pmcBot` (9, the Raiders) because neither
+  ## name contains its own faction's word. That is fixed there, and the table
+  ## was moved here rather than copied so the two cannot drift apart: two
+  ## tables that agree today disagree after the next enum addition.
+  cRoleIsBossTier(role) != 0'i32
+
 const
   MaxEntities* = 128
     ## Capped iteration. A raid is well under this; a corrupt count must not
@@ -523,6 +620,12 @@ type
     x*, y*, z*: float
     bot*: bool
     me*: bool
+    cls*: int          ## Cls* above. INDEPENDENT of `bot`: `bot` is the AIData
+                       ## presence test and is left exactly as it was, so a
+                       ## class walk that declines cannot also destroy the
+                       ## bot/player distinction that already worked.
+    side*: int32       ## raw EPlayerSide, or -1 if the read declined
+    role*: int32       ## raw WildSpawnType, or -1 if the read declined
     id*: string        ## last 8 chars of the profile id, or "" -- a label,
                        ## never used as an identity key
     key*: uint64       ## the Player pointer, as an opaque identity. NEVER
@@ -647,6 +750,12 @@ type
     heading*: float      ## radians, 0 = +Z (north), increasing toward +X
     state*: int          ## gwState() at collection time
     seq*: int64
+    cls*: array[ClsCount, int]
+      ## THIS COLLECTION's class histogram, indexed by Cls*. Published so the
+      ## degenerate cases are VISIBLE rather than inferable: all-Unknown means
+      ## the Profile walk is dead, all-Scav means the side read is returning a
+      ## constant. Both look exactly like a working feed on a coloured blip and
+      ## exactly like a broken one here, which is the point.
 
 var gDefect = ""
 var gFaults = 0
@@ -1038,6 +1147,136 @@ proc idTailOf(p: pointer): string =
     result.add buf[i]
     inc i
 
+# --------------------------------------------------------------------------
+# CONTACT CLASSIFICATION
+#
+# The cumulative ledger is the honest half of this feature. `gClsEver` is every
+# contact ever classified this session; `gClsDecline` counts each hop that
+# refused, SEPARATELY, so "unknown" always has a named cause. Without that,
+# "every contact is unknown" and "every contact is a scav" are both just
+# numbers, and the surfaces would render a confident colour over a dead read.
+# --------------------------------------------------------------------------
+
+type
+  ClsDecline* = object
+    nilProfile*: int   ## Player+0x9C0 read null / unreadable
+    nilInfo*: int      ## Profile+0x48 read null / unreadable
+    noSide*: int       ## ProfileInfo+0x48 four bytes not readable
+    badSide*: int      ## side read fine but was not 1, 2 or 4
+    nilSettings*: int  ## ProfileInfo+0x78 read null (role unavailable; side may
+                       ## still have decided the class, so this is NOT a failure
+                       ## on its own -- it only costs the boss split)
+    noRole*: int       ## ProfileSettings+0x10 four bytes not readable
+
+var gClsEver: array[ClsCount, int]
+var gClsDecline = ClsDecline(nilProfile: 0, nilInfo: 0, noSide: 0, badSide: 0,
+                             nilSettings: 0, noRole: 0)
+
+proc classOf(p: pointer; isMe: bool; side, role: var int32): int =
+  ## Guarded four-hop walk, read-only, no call, no allocation. Every hop is
+  ## VirtualQueried by `sp_rd_ptr` / `sp_rd_i32_ok`, so a wrong offset is a
+  ## decline and never a fault -- and a decline is Unknown, never a guess.
+  side = -1'i32
+  role = -1'i32
+  if isMe: return ClsLocal
+
+  let profile = rdPtr(p, PlProfile)
+  if profile == nil:
+    inc gClsDecline.nilProfile
+    return ClsUnknown
+  let info = rdPtr(profile, PrInfo)
+  if info == nil:
+    inc gClsDecline.nilInfo
+    return ClsUnknown
+
+  var sv = 0'i32
+  if cRdI32Ok(info, int32(InfSide), addr sv) == 0'i32:
+    inc gClsDecline.noSide
+    return ClsUnknown
+  side = sv
+
+  # The role is read BEFORE the side is acted on, because a boss outranks its
+  # side: bosses and their escorts are Savage-sided and must not land in the
+  # scav bucket. A missing role is not fatal -- it costs the boss split and
+  # nothing else -- so it is counted and walked past, not returned on.
+  let settings = rdPtr(info, InfSettings)
+  if settings == nil:
+    inc gClsDecline.nilSettings
+  else:
+    var rv = 0'i32
+    if cRdI32Ok(settings, int32(SetRole), addr rv) == 0'i32:
+      inc gClsDecline.noRole
+    else:
+      role = rv
+
+  if role >= 0'i32 and roleIsBossTier(role): return ClsBoss
+  if sv == SideUsec or sv == SideBear: return ClsPmc
+  if sv == SideSavage: return ClsScav
+  # A side outside {1,2,4} is a value this build's enum does not define. That is
+  # a read that LOOKED like it worked, which is the dangerous kind, so it is
+  # counted under its own name and reported as Unknown.
+  inc gClsDecline.badSide
+  ClsUnknown
+
+proc clsHistogramText*(h: array[ClsCount, int]): string =
+  "contacts by class: local=" & $h[ClsLocal] & " pmc=" & $h[ClsPmc] &
+  " scav=" & $h[ClsScav] & " boss=" & $h[ClsBoss] &
+  " unknown=" & $h[ClsUnknown]
+
+proc clsEver*(): array[ClsCount, int] = gClsEver
+
+proc clsDeclineText*(): string =
+  "class declines: nilProfile=" & $gClsDecline.nilProfile &
+  " nilInfo=" & $gClsDecline.nilInfo &
+  " noSide=" & $gClsDecline.noSide &
+  " badSide=" & $gClsDecline.badSide &
+  " nilSettings=" & $gClsDecline.nilSettings &
+  " noRole=" & $gClsDecline.noRole
+
+proc clsVerdict*(): string =
+  ## PASS / FAIL / INCONCLUSIVE over the SESSION's classifications -- never over
+  ## this mod's own writes. The negative it asserts is "the class histogram is
+  ## not degenerate": a distribution that is entirely one bucket is exactly what
+  ## a dead Profile walk and a constant side read both look like, and neither is
+  ## distinguishable from a real answer by looking at a coloured dot.
+  var total = 0
+  var nonLocal = 0
+  var buckets = 0
+  var i = 0
+  while i < ClsCount:
+    total = total + gClsEver[i]
+    if i != ClsLocal:
+      nonLocal = nonLocal + gClsEver[i]
+      if gClsEver[i] > 0: inc buckets
+    inc i
+  if total == 0:
+    return "INCONCLUSIVE  nothing has been classified yet -- no collection has " &
+           "produced a contact this session. Not a pass: this is 'I could not " &
+           "look'. " & clsDeclineText()
+  if nonLocal == 0:
+    return "INCONCLUSIVE  " & $gClsEver[ClsLocal] & " local-player " &
+           "classification(s) and NO other contact has ever been classified, " &
+           "so the Profile walk has never actually run. " & clsDeclineText()
+  if gClsEver[ClsUnknown] == nonLocal:
+    return "FAIL  every one of the " & $nonLocal & " non-local contacts " &
+           "classified UNKNOWN -- the Player+0x9C0 -> Profile walk is not " &
+           "reaching a readable ProfileInfo on this build. " & clsDeclineText()
+  if buckets == 1:
+    # Exactly one non-local bucket ever filled. On a scav-only map that is the
+    # truth; on any map with PMCs it is a constant masquerading as an answer.
+    # It cannot be told apart from here, so it is INCONCLUSIVE, not PASS.
+    var only = ClsUnknown
+    var k = 0
+    while k < ClsCount:
+      if k != ClsLocal and gClsEver[k] > 0: only = k
+      inc k
+    return "INCONCLUSIVE  all " & $nonLocal & " non-local contacts classified " &
+           "as '" & clsName(only) & "' and nothing else -- a genuinely " &
+           "single-faction raid and a read that returns a constant are " &
+           "indistinguishable from one bucket. " & clsDeclineText()
+  "PASS  " & $nonLocal & " non-local contacts split across " & $buckets &
+  " classes, " & $gClsEver[ClsUnknown] & " unknown. " & clsDeclineText()
+
 proc collectInner(snap: var Snapshot) =
   ## Fill `snap`. Runs on Unity's thread (the caller drives it from everyMain),
   ## so it does raw reads into a caller-owned buffer and allocates nothing per
@@ -1051,6 +1290,10 @@ proc collectInner(snap: var Snapshot) =
   snap.localIdx = -1
   snap.hasHeading = false
   snap.heading = 0.0
+  var ci = 0
+  while ci < ClsCount:
+    snap.cls[ci] = 0
+    inc ci
   inc gSeq
   snap.seq = gSeq
   # Per-collection reason tally starts empty; the cumulative one never resets.
@@ -1117,8 +1360,14 @@ proc collectInner(snap: var Snapshot) =
     snap.heading = hyaw
 
   if lok:
+    var lside = -1'i32
+    var lrole = -1'i32
+    let lcls = classOf(me, true, lside, lrole)
     snap.ents[0] = Ent(x: lx, y: ly, z: lz, bot: false, me: true,
+                       cls: lcls, side: lside, role: lrole,
                        id: idTailOf(me), key: localPtr)
+    inc snap.cls[lcls]
+    inc gClsEver[lcls]
     snap.localIdx = 0
     snap.n = 1
     snap.ok = true
@@ -1160,8 +1409,19 @@ proc collectInner(snap: var Snapshot) =
     # which is the safe way round: a human mislabelled as a bot is a worse lie
     # on a radar than the reverse.
     let bot = rdPtr(p, PlAIData) != nil
+    # The class walk is INDEPENDENT of the `bot` test above and runs whether or
+    # not it succeeded. Deriving one from the other would make the pair agree by
+    # construction, which is a consistency that proves nothing; keeping them
+    # separate means the diag can show a bot classified PMC (an AI PMC -- real)
+    # or a non-bot classified Unknown (a dead walk -- a bug) and tell them apart.
+    var eside = -1'i32
+    var erole = -1'i32
+    let ecls = classOf(p, false, eside, erole)
     snap.ents[snap.n] = Ent(x: px, y: py, z: pz, bot: bot, me: false,
+                            cls: ecls, side: eside, role: erole,
                             id: idTailOf(p), key: cast[uint64](p))
+    inc snap.cls[ecls]
+    inc gClsEver[ecls]
     inc snap.n
     snap.ok = true
 
