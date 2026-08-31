@@ -819,6 +819,83 @@ proc raidOverOrNotYet*(): bool =
   let p = hostPhase()
   p == RpResults or p == RpMenu or p == RpLoading
 
+# ---- THE POSITIVE DRAW ARM (bug 1) -------------------------------------
+#
+# `raidOverOrNotYet` above is a NEGATIVE gate: it darkens the overlays only on
+# a positive END observation. Its blind spot is every answer that is neither
+# "deployed" nor "over" -- `RpUnknown` most of all -- and on those it says
+# "keep drawing". That is why the map appeared before deploy and on the death
+# screen: one unreadable tick was enough to arm the surfaces, and nothing ever
+# re-checked. The host's own gate is spelled the other way round and says so
+# in its docstring: `rpDeployed()` is "False on UNKNOWN by design: 'I could
+# not look' must darken the overlays, not arm them."
+#
+# So the draw arm is POSITIVE and sticky, with three inputs and not two:
+#
+#   RpDeployed                -> ARM.   The latch fired on S1+S2+S3+S5.
+#   RpMenu / RpLoading /
+#   RpResults                 -> DISARM. A positive not-deployed observation.
+#   RpUnknown                 -> HOLD the current arm state. "I could not look"
+#                                must neither arm a menu nor blank a live raid;
+#                                holding is the only answer that does neither,
+#                                and because the arm starts CLEAR, holding
+#                                before the first deploy still draws NOTHING.
+#   RpNoExport                -> hold, and count it. A host that predates the
+#                                export keeps its old behaviour rather than
+#                                going dark; `drawArmWhy` says so, and the arm
+#                                is reported as INCONCLUSIVE, never as PASS.
+var gArmed = false
+var gArmUnknownHeld*: int64 = 0   ## ticks the arm was HELD across an RpUnknown
+var gArmNoExportHeld*: int64 = 0  ## ticks held because the host lacks the export
+var gArmDisarms*: int64 = 0       ## positive not-deployed observations
+var gArmArms*: int64 = 0          ## positive deploy observations
+var gArmLastPhase* = RpUnknown
+
+proc drawArm*(): bool =
+  ## Called ONCE per publish tick, from `hudPublish`. It is the only writer of
+  ## the arm, so the counters below are a complete account of every transition.
+  let p = hostPhase()
+  gArmLastPhase = p
+  case p
+  of RpDeployed:
+    if not gArmed: gArmArms = gArmArms + 1
+    gArmed = true
+  of RpMenu, RpLoading, RpResults:
+    if gArmed: gArmDisarms = gArmDisarms + 1
+    gArmed = false
+  of RpNoExport:
+    gArmNoExportHeld = gArmNoExportHeld + 1
+    gArmed = true            # old host: preserve the pre-existing behaviour
+  else:                      # RpUnknown
+    gArmUnknownHeld = gArmUnknownHeld + 1
+  result = gArmed
+
+proc drawArmed*(): bool = gArmed
+  ## Read-only. For diagnostics; never call this to make a draw decision, use
+  ## `drawArm()` so the transition is counted.
+
+proc drawArmWhy*(): string =
+  ## §9b: three outcomes. The arm being SET is only a PASS when the phase that
+  ## set it was a positive DEPLOYED observation; an arm held open across an
+  ## unreadable phase, or held because the host cannot answer at all, is
+  ## INCONCLUSIVE and must not be reported as if the gate had proved anything.
+  if gArmLastPhase == RpNoExport:
+    "INCONCLUSIVE  the host does not export aowl_host_raid_phase, so the " &
+    "positive deploy gate is INERT and the old world-existence behaviour is " &
+    "what is running. Held open " & $gArmNoExportHeld & " tick(s)."
+  elif gArmLastPhase == RpUnknown:
+    "INCONCLUSIVE  the host looked and could not tell (phase=UNKNOWN); the " &
+    "arm is HELD at " & (if gArmed: "ARMED" else: "clear") & " rather than " &
+    "flipped. Held " & $gArmUnknownHeld & " tick(s) so far. Before the first " &
+    "deploy the arm is clear, so holding still draws nothing."
+  elif gArmed:
+    "PASS  armed on a positive DEPLOYED observation (" & $gArmArms &
+    " arm(s), " & $gArmDisarms & " disarm(s))"
+  else:
+    "PASS  DISARMED on a positive not-deployed observation: phase=" &
+    hostPhaseName(gArmLastPhase) & " (" & $gArmDisarms & " disarm(s)). " &
+    "Nothing is submitted on this tick."
+
 proc gwStateText*(): string =
   case gwState()
   of 0: "no host export aowl_host_gameworld -- this host predates it, or this " &

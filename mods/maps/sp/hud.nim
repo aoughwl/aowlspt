@@ -64,6 +64,14 @@ import world  # the Snapshot this file mirrors; no game memory is read here
 #include "sp/mapart.h"
 
 #define MHUD_MAX 128
+/* Tombstone ring for the re-creation counter (bug 2). Sized to hold a whole
+ * table's worth of evictions so a mass expiry cannot push a key out of the
+ * ring before it is re-claimed and hide the very churn we are measuring. */
+#define MHUD_TOMBS 128
+/* How recently a key must have been evicted for its re-claim to count as a
+ * RE-CREATION rather than a genuine re-entry. Generous on purpose: a contact
+ * that really left and came back takes far longer than this. */
+#define MHUD_RECREATE_MS 3000
 
 /* THE PROJECTOR CALL CAP, per frame. `aowl_region_project` is the one thing in
  * this draw that is not local arithmetic: it leaves the mod and asks the host to
@@ -410,6 +418,38 @@ static struct {
      * itself the answer to "is the feed event-driven or persistent?". */
     int64_t  indFaded, indExpired, indStale;
 
+    /* ---- BUG 2: IS THE BLINK ALPHA, OR IS IT IDENTITY CHURN? ---------------
+     *
+     * The user calls this "the flickering ESP" and it is the maps direction
+     * indicators. A measured raid showed 374 marks SUBMITTED at reduced alpha
+     * against 45 live tracks, which is consistent with BOTH explanations and
+     * therefore proves NEITHER:
+     *
+     *   (a) ALPHA OSCILLATION -- one track's contact misses a publish or two,
+     *       its age crosses the hold, it dims, then the feed returns it and it
+     *       snaps back to full. Nothing is ever destroyed.
+     *   (b) IDENTITY CHURN -- the track for a still-present entity is EXPIRED
+     *       and then re-created from scratch, so the mark fades out, vanishes,
+     *       and pops back in. That is a matching bug, not a fade, and no
+     *       amount of tuning the window would fix it.
+     *
+     * These counters separate them, because a fix that cannot report the
+     * flicker is not a fix (CLAUDE.md 9b). `recreated` is the falsifiable
+     * negative the brief asks for: it counts a slot being claimed for a key
+     * this table EVICTED within MHUD_RECREATE_MS. If it stays 0 across a raid
+     * the flicker is (a) and the grace below is the whole fix; if it climbs,
+     * it is (b) and the identity path is the defect.
+     *
+     * The tombstone ring is FIXED SIZE and overwrites oldest-first -- no
+     * allocation, no unbounded scan (rule 7, rule 4). */
+    uint64_t tombKey[MHUD_TOMBS];
+    int64_t  tombMs[MHUD_TOMBS];
+    int32_t  tombHead;
+    int64_t  recreated;      /* evicted, then re-claimed within the window */
+    int64_t  recreatedLate;  /* re-claimed AFTER it -- a genuine re-entry */
+    int64_t  graceMs;        /* absence forgiven before the fade begins */
+    int64_t  graceHeld;      /* marks kept at FULL alpha by that forgiveness */
+
     /* ---- WHY THE DECAY WAS NOT COMPUTED -----------------------------------
      *
      * `indFaded == 0` collapsed three completely different worlds into one
@@ -547,6 +587,9 @@ static void mhud_reset(void) {
     g_mhud.mapSpanM       = 500.0f;
     g_mhud.indicatorInset = 48.0f;
     g_mhud.holdMs         = 400;
+    /* Default 1200ms: comfortably longer than the longest feed gap fact #235
+     * produces, and far shorter than a contact genuinely leaving the raid. */
+    g_mhud.graceMs        = 1200;
     g_mhud.fadeMs         = 1600;
     /* Unified-widget defaults. memset left these at 0, and a 0 zoom or a 0
      * opacity is not "unset" -- it is an invisible, degenerate pane that would
@@ -663,10 +706,44 @@ static void mhud_configure_class(int32_t c, int32_t show, uint32_t col) {
     g_mhud.clsCol[c]  = col;
 }
 
+/* THE FIX for bug 2, in one expression. `censusCarryForward` in natesp, applied
+ * here: an ABSENT read is not a DEPARTURE. The feed drops a still-present
+ * contact for a publish or two all the time -- GwMainPlayer reads null on ~3 of
+ * every 4 frames (fact #235) and the alive-list walk declines individual
+ * entries -- and every one of those gaps used to push the track's age across
+ * the hold, dim its mark, and then snap it back to full when the contact
+ * returned. That oscillation IS the blink the user reports.
+ *
+ * So the first `graceMs` of absence is FORGIVEN: age is measured from the end
+ * of the grace, not from the last refresh. A contact that genuinely leaves is
+ * unaffected -- it simply fades graceMs later. A contact that merely missed a
+ * publish never dims at all, and `graceHeld` counts exactly how many marks that
+ * saved, so the fix reports its own effect rather than being asserted.
+ *
+ * `graceMs = 0` restores the previous behaviour exactly, which is what makes
+ * this falsifiable: set it to 0 and the flicker must come back. */
+static int64_t mhud_forgiven_age(int64_t rawAge) {
+    if (g_mhud.graceMs <= 0) return rawAge;
+    if (rawAge <= g_mhud.graceMs) {
+        if (rawAge > g_mhud.holdMs) g_mhud.graceHeld++;
+        return 0;
+    }
+    return rawAge - g_mhud.graceMs;
+}
+
 static void mhud_lifetime(int64_t holdMs, int64_t fadeMs) {
     g_mhud.holdMs = holdMs < 0 ? 0 : holdMs;
     g_mhud.fadeMs = fadeMs < 0 ? 0 : fadeMs;
 }
+
+static void mhud_grace(int64_t graceMs) {
+    g_mhud.graceMs = graceMs < 0 ? 0 : graceMs;
+}
+
+static int64_t mhud_live_gracems(void)  { return g_mhud.graceMs; }
+static int64_t mhud_grace_held(void)    { return g_mhud.graceHeld; }
+static int64_t mhud_recreated(void)     { return g_mhud.recreated; }
+static int64_t mhud_recreated_late(void){ return g_mhud.recreatedLate; }
 
 /* Refresh this contact's track, or claim a free slot for it. Linear and
  * CAPPED at MHUD_MAX both ways, so the worst case is 128*128 comparisons in a
@@ -689,6 +766,22 @@ static void mhud_touch(uint64_t key, float x, float y, float z, int32_t bot,
         if (!g_mhud.tr[i].live && free_ < 0) free_ = i;
     }
     if (free_ < 0) return;
+    /* Claiming a slot for a key we do not currently hold. If this table evicted
+     * that same key recently, the mark the player saw went out and is now coming
+     * back -- that is a RE-CREATION, and it is the difference between "the fade
+     * is working as designed" and "the identity matching is broken". Counted
+     * before the claim, over a fixed ring, capped. */
+    {
+        int32_t t;
+        int64_t nowT = mhud_now_ms();
+        for (t = 0; t < MHUD_TOMBS; t++) {
+            if (g_mhud.tombKey[t] != key) continue;
+            if (nowT - g_mhud.tombMs[t] <= MHUD_RECREATE_MS) g_mhud.recreated++;
+            else                                            g_mhud.recreatedLate++;
+            g_mhud.tombKey[t] = 0;   /* consumed: one eviction, one verdict */
+            break;
+        }
+    }
     g_mhud.tr[free_].key    = key;
     g_mhud.tr[free_].x      = x;
     g_mhud.tr[free_].y      = y;
@@ -1654,7 +1747,11 @@ static int32_t mhud_draw_pane_full(float px, float py, float size, float spanM,
                 g_mhud.clsFiltered[mhud_cls_clamp(g_mhud.tr[i].cls)]++;
             if (!mhud_visible(g_mhud.tr[i].bot, g_mhud.tr[i].cls)) continue;
 
-            alpha = mm_fade_alpha(now - g_mhud.tr[i].lastMs,
+            /* Same forgiveness as the edge indicators, and deliberately the SAME
+             * helper: two grace windows that agree today disagree after the next
+             * edit, and the pane blip and the edge mark for one contact must
+             * never disagree about whether that contact is fading. */
+            alpha = mm_fade_alpha(mhud_forgiven_age(now - g_mhud.tr[i].lastMs),
                                   g_mhud.holdMs, g_mhud.fadeMs);
             if (alpha <= 0.0f) {
                 /* Already past hold+fade the FIRST time the draw looked at it.
@@ -1974,8 +2071,14 @@ static void mhud_draw(void* user, int64_t frame) {
         if (!g_mhud.tr[i].live) continue;
         g_mhud.indVisits++;   /* the loop IS being entered for a live track */
 
-        age = mhud_now_ms() - g_mhud.tr[i].lastMs;
+        age = mhud_forgiven_age(mhud_now_ms() - g_mhud.tr[i].lastMs);
         if (mm_fade_expired(age, g_mhud.holdMs, g_mhud.fadeMs)) {
+            /* EVICTING. Record a tombstone first, so that if this same contact
+             * is handed back by the very next publish -- i.e. it never actually
+             * left -- `recreated` says so instead of the churn being invisible. */
+            g_mhud.tombKey[g_mhud.tombHead] = g_mhud.tr[i].key;
+            g_mhud.tombMs[g_mhud.tombHead]  = mhud_now_ms();
+            g_mhud.tombHead = (g_mhud.tombHead + 1) % MHUD_TOMBS;
             g_mhud.tr[i].live = 0;
             g_mhud.indExpired++;
             continue;
@@ -2348,6 +2451,11 @@ proc cHudClsSeen(c: int32): int32 {.importc: "mhud_cls_seen", nodecl.}
 proc cHudClsDrawn(c: int32): int32 {.importc: "mhud_cls_drawn", nodecl.}
 proc cHudClsFiltered(c: int32): int32 {.importc: "mhud_cls_filtered", nodecl.}
 proc cHudLifetime(holdMs, fadeMs: int64) {.importc: "mhud_lifetime", nodecl.}
+proc cHudGrace(graceMs: int64) {.importc: "mhud_grace", nodecl.}
+proc cHudLiveGraceMs(): int64 {.importc: "mhud_live_gracems", nodecl.}
+proc cHudGraceHeld(): int64 {.importc: "mhud_grace_held", nodecl.}
+proc cHudRecreated(): int64 {.importc: "mhud_recreated", nodecl.}
+proc cHudRecreatedLate(): int64 {.importc: "mhud_recreated_late", nodecl.}
 proc cHudConfigure(radiusM, screenW, screenH: cfloat;
                    radarOn, indicatorsOn: int32;
                    radarSize, radarX, radarY: cfloat;
@@ -2553,6 +2661,10 @@ proc hudLiveShowPlayers*(): bool = cHudLiveShowPlayers() != 0'i32
 proc hudLiveIndicatorInset*(): float = float(cHudLiveIndInset())
 proc hudLiveHoldMs*(): int = int(cHudLiveHoldMs())
 proc hudLiveFadeMs*(): int = int(cHudLiveFadeMs())
+proc hudLiveGraceMs*(): int = int(cHudLiveGraceMs())
+proc hudGraceHeld*(): int64 = cHudGraceHeld()
+proc hudRecreated*(): int64 = cHudRecreated()
+proc hudRecreatedLate*(): int64 = cHudRecreatedLate()
 proc hudLiveBorder*(): bool = cHudLiveBorder() != 0'i32
 proc hudLiveBorderPx*(): float = float(cHudLiveBorderPx())
 proc hudLiveBackdropOpacity*(): float = float(cHudLiveBackdropA())
@@ -2722,6 +2834,11 @@ type
     ## then gone.
     indicatorHoldMs*: int
     indicatorFadeMs*: int
+    indicatorGraceMs*: int
+      ## How long a contact may be MISSING from the feed before its mark starts
+      ## to fade at all. This is the bug-2 fix: absence is not departure. 0
+      ## reproduces the old blinking behaviour exactly, which is what makes the
+      ## fix falsifiable rather than merely asserted.
     ## THE UNIFIED WIDGET. `mode` is the one control: 0 off, 1 radar, 2 north-up
     ## minimap, 3 heading-up minimap. `map` and `radar` above are DERIVED from it
     ## by `spatialModeSurfaces` and are kept only because armFeed and the art
@@ -2919,6 +3036,7 @@ proc hudInit*(o: HudOpts) =
                    cfloat(o.mapSpanM), int32(o.mapGrid),
                    cfloat(o.indicatorInset))
   cHudLifetime(int64(o.indicatorHoldMs), int64(o.indicatorFadeMs))
+  cHudGrace(int64(o.indicatorGraceMs))
   cHudConfigurePane(int32(o.mode), cfloat(o.zoom), cfloat(o.opacity),
                     (if o.drawArt: 1'i32 else: 0'i32), cfloat(o.contactPx),
                     o.colBot, o.colPlayer, o.colSelf)
@@ -2962,6 +3080,7 @@ proc hudReconfigure*(o: HudOpts; live: bool) =
                    cfloat(o.mapSpanM), int32(o.mapGrid),
                    cfloat(o.indicatorInset))
   cHudLifetime(int64(o.indicatorHoldMs), int64(o.indicatorFadeMs))
+  cHudGrace(int64(o.indicatorGraceMs))
   # THE UNIFIED WIDGET, live. `mode` is forced to OFF when the feature is not
   # live, for the same reason the three legacy surface bits are ANDed with
   # `live`: the master gate is checked first in the draw, and this makes the
@@ -3043,7 +3162,20 @@ proc hudPublish*(snap: Snapshot) =
   # host/raidphase.nim), never by the flickering pose/alive reads. It closes
   # BOTH ends: the results screen, and the ~2 minutes of scene load during which
   # bots register into a live GameWorld before the player deploys.
-  if raidOverOrNotYet():
+  # CORRECTED (bug 1, both edges). `raidOverOrNotYet()` was a NEGATIVE gate --
+  # it darkened the surfaces only on a positive END observation and said "keep
+  # drawing" for everything else, `RpUnknown` included. One unreadable tick
+  # therefore armed the overlay in the menu and on the loading screen, and left
+  # it armed on the death/results screen until an END was positively seen. Both
+  # of those are exactly what the user reported, and both are the same defect.
+  #
+  # `drawArm()` (sp/world.nim) is the POSITIVE form of the same question and is
+  # the one signal the brief names: it ARMS only on a latched DEPLOYED, DISARMS
+  # on any positive not-deployed phase, and HOLDS across an unreadable one --
+  # and because it starts CLEAR, holding before the first deploy still draws
+  # nothing. It is called exactly here, once per publish, so it is the sole
+  # writer of the arm and its transition counters are a complete account.
+  if not drawArm():
     cHudBegin(0.0, 0.0, 0.0, 0'i32, 0.0, 0'i32, 0'i32)
     return
   if snap.state != 3:
