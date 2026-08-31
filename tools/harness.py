@@ -10,6 +10,12 @@ staring at a loading screen each. They should cost nobody anything.
     python tools/harness.py run --until "settings pages:" --timeout 240
     python tools/harness.py run --profile <id> --keep
     python tools/harness.py watch --until "debugui:"     # game already running
+    python tools/harness.py run --offscreen --profile <id>   # off your screen
+
+`--offscreen` keeps the client off every monitor for the whole run and says
+PARKED / NOT PARKED / INCONCLUSIVE at the end, re-checked against the finished
+state rather than against the move it made minutes earlier. It is NOT a headless
+mode and never claims to be -- the GPU renders normally. See docs/HEADLESS.md.
 
 `run` starts `aowlspt-launch.exe --no-logs` (which starts the backend, starts
 the client suspended, injects the host and resumes it), watches the host log as
@@ -57,6 +63,43 @@ DEFAULT_ROOT = r"D:\Aowlspt"
 
 sys.path.insert(0, HERE)
 import hostlog  # noqa: E402  -- reuse the parser, do not write a second one
+import offscreen  # noqa: E402  -- one window classifier, not two
+
+
+def park_offscreen(deadline_s, first):
+    """Move the client's window off every monitor, once it HAS a window.
+
+    Called from `run --offscreen`. Three outcomes and it says which:
+
+      PARKED       the window verifiably intersects no monitor
+      NOT PARKED   there was a window and it is still visible
+      INCONCLUSIVE no window appeared inside the deadline
+
+    The deadline matters and is not a formality: the client takes over a
+    minute to put its render window up, so a check at 20s finds nothing and
+    "no window yet" must never be reported as "parked". This polls instead of
+    sleeping a fixed guess.
+    """
+    offscreen._dpi_aware()
+    ns = argparse.Namespace(exe=offscreen.CLIENT_EXE, first=first)
+    end = time.time() + deadline_s
+    hwnd = None
+    while time.time() < end:
+        hwnd, err = offscreen._one_client_window(ns)
+        if hwnd:
+            break
+        time.sleep(2.0)
+    if not hwnd:
+        return "INCONCLUSIVE", ("no client window inside %ds -- %s"
+                                % (deadline_s, err[1] if err else "unknown"))
+    verdict, state, d, why = offscreen.park(hwnd, offscreen.monitors())
+    if verdict == offscreen.PASS:
+        return "PARKED", ("%s; rect=%s intersects 0 of %d monitor(s)"
+                          % (why, d["rect"], len(d["monitors"])))
+    return "NOT PARKED", ("the window is %s (rect=%s, %d visible px). If the "
+                          "client is in exclusive fullscreen it cannot be "
+                          "moved -- add --low-render so it launches windowed."
+                          % (state, d.get("rect"), d.get("visible_pixels", -1)))
 
 
 def install_dir(root):
@@ -160,12 +203,28 @@ def cmd_run(args):
         # rather than in the sentinel unless the sentinel is a boot line.
         print("note: no --profile, so the client will stop at profile-select "
               "and wait. Expect IDLE unless --until names a boot line.")
+    if args.offscreen and not args.low_render:
+        # A borderless-fullscreen Unity window at the primary origin is the
+        # observed default here (measured 2026-08-31: rect (0,0)-(3840,2160)),
+        # and exclusive fullscreen cannot be moved off its display at all. So
+        # --offscreen implies --low-render rather than parking something that
+        # will bounce back and reporting success.
+        print("note: --offscreen implies --low-render (a fullscreen window "
+              "cannot be parked). Pass --low-render explicitly to silence this.")
+        args.low_render = True
+    if args.low_render:
+        cmd += ["--low-render", "--render-size", args.render_size]
     if args.args:
         cmd += ["--args", args.args]
 
     started = time.time()
     print("$ %s" % " ".join(cmd))
     proc = subprocess.Popen(cmd, cwd=install_dir(root))
+
+    park_state = park_why = None
+    if args.offscreen:
+        park_state, park_why = park_offscreen(args.park_deadline, args.first)
+        print("---- offscreen: %s -- %s ----" % (park_state, park_why))
 
     try:
         state, why = watch(root, args.until, args.timeout, args.stall,
@@ -175,6 +234,37 @@ def cmd_run(args):
 
     took = time.time() - started
     print("\n==== %s after %.0fs: %s" % (state, took, why))
+
+    if args.offscreen:
+        # RE-CHECK AT THE END. The move happened early; the client changes its
+        # own resolution and window mode several times during boot and can put
+        # itself back on a monitor. Asserting the state we WROTE minutes ago is
+        # exactly the check that cannot fail. Assert the finished state.
+        offscreen._dpi_aware()
+        ns = argparse.Namespace(exe=offscreen.CLIENT_EXE, first=args.first)
+        hwnd, err = offscreen._one_client_window(ns)
+        if not hwnd:
+            park_state, park_why = "INCONCLUSIVE", (
+                "no client window at the end of the run (%s), so I cannot say "
+                "whether anything was on your screen" % (err[1] if err else "?"))
+        else:
+            v, s, d = offscreen.classify(hwnd)
+            if v == offscreen.PASS:
+                park_state = "PARKED"
+                park_why = ("still off every monitor at the end: rect=%s"
+                            % (d["rect"],))
+            else:
+                park_state = "NOT PARKED"
+                park_why = ("the window is %s at the END of the run (%d "
+                            "visible px) -- it drifted back onto a display"
+                            % (s, d.get("visible_pixels", -1)))
+        print("==== offscreen (final): %s -- %s" % (park_state, park_why))
+        if park_state != "PARKED" and state == "REACHED":
+            # Do not report a clean 0. The run may have reached its sentinel,
+            # but the thing --offscreen promised did not happen.
+            print("     the sentinel was reached but the client was NOT kept "
+                  "off your screen. Reporting 3 (idle/incomplete), not 0.")
+            state = "IDLE"
 
     saved = capture(root, args.out)
     for s in saved:
@@ -233,6 +323,25 @@ def main():
                    help="leave the client and backend running")
     p.add_argument("-q", "--quiet", action="store_true",
                    help="do not echo the log while waiting")
+    p.add_argument("--offscreen", action="store_true",
+                   help="park the client's window off every monitor once it "
+                        "appears, and VERIFY it again at the end of the run. "
+                        "This is NOT headless: the renderer runs at full "
+                        "speed, the window is merely on no display. Implies "
+                        "--low-render, because a fullscreen window cannot be "
+                        "moved. See tools/offscreen.py and docs/HEADLESS.md.")
+    p.add_argument("--low-render", action="store_true",
+                   help="pass --low-render to aowlspt-launch (windowed, "
+                        "popupwindow, --render-size)")
+    p.add_argument("--render-size", default="1280x720")
+    p.add_argument("--park-deadline", type=int, default=180,
+                   help="seconds to wait for the client to put a window up "
+                        "before --offscreen reports INCONCLUSIVE. The default "
+                        "is deliberately >60s: the client is slow to appear "
+                        "and 'not yet' is not 'never'.")
+    p.add_argument("--first", action="store_true",
+                   help="if several client windows qualify, take the largest "
+                        "rather than refusing to choose")
     args = p.parse_args()
     return cmd_run(args) if args.command == "run" else cmd_watch(args)
 

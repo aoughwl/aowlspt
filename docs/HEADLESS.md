@@ -142,14 +142,25 @@ patch:
 * **Enumeration.** Whether this client offers the virtual monitor's modes in its
   own display list is unknown and has not been tested.
 
-**Does the launcher need to target a display?** Measured: **no such switch is
-available.** `UnityPlayer.dll` here contains `screen-width`, `screen-height`,
-`screen-fullscreen`, `window-mode` and `popupwindow` but **no `monitor` string
-at all**, so Unity's `-monitor N` is not usable on this build. Placing the
-client on a specific display would have to be done by moving the window (a
-`SetWindowPos` on the client HWND after it appears), which the launcher does not
-do today. That is the work an IDD would require of us, and it is small — the
-risk is entirely in the driver, not in the flag.
+**Does the launcher need to target a display?**
+
+> **CORRECTION, 2026-08-31.** This section previously said "no `monitor` string
+> at all", and that is **wrong**. Re-measured with `strings -a UnityPlayer.dll`:
+> the bare token `monitor` is present (`grep -Fx` count 1), and so is the
+> diagnostic **`"The command-line parameter 'adapter' has been removed. Please
+> use 'monitor' instead."`** — which is Unity's own message about `-monitor`.
+> Also present: `force-device-index`, `displays`, `displayRefreshRate`,
+> `force-driver-type-warp`. The earlier claim was most likely made with a search
+> that did not match a bare token. **`-monitor N` is very probably usable on
+> this build.** It has still NOT been passed to the client, so "the string is
+> there" is the measurement and "it works" is not.
+
+Independently of `-monitor`, a display can be chosen by moving the window after
+it appears. That is now built: **`tools/offscreen.py`**, and `tools/harness.py
+run --offscreen`. See below.
+
+An IDD is still the only thing that gets a raid onto a display that does not
+exist; the risk is entirely in the driver, not in the flag.
 
 ---
 
@@ -166,3 +177,66 @@ It does not pass `-batchmode`/`-nographics`.
 
 `--headless` is accepted as an alias only because it is what people will type.
 The flag is named `--low-render` everywhere else, on purpose.
+
+---
+
+## Option 6 — park the window off every monitor (BUILT, 2026-08-31)
+
+This is the cheap 80%, and it is the answer to "run a test raid while I do
+something else". The client renders normally on the GPU, in a window, at a
+position that intersects **no monitor**. Nothing is on the user's screen. It is
+not headless and the tool never says it is.
+
+```
+python tools\offscreen.py --selftest              # offline; no game needed
+python tools\offscreen.py monitors | where | rvas
+python tools\harness.py run --offscreen --profile <id> --until "host running"
+```
+
+`--offscreen` implies `--low-render`, because a **fullscreen** Unity window
+cannot be parked. Measured on the running client 2026-08-31: its window is
+`'EscapeFromTarkov'` at rect `(0,0)-(3840,2160)` — the full primary monitor.
+
+### The assertion is a negative, and it is the finished state
+
+Not "SetWindowPos returned non-zero". After the fact: does the window rect
+intersect any monitor? Answered two independent ways that must agree —
+`MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL)` (Windows' own opinion) and our
+own intersection of `GetWindowRect` against every `EnumDisplayMonitors` rect. A
+disagreement is **INCONCLUSIVE**, never a pass.
+
+**A minimised window is a distinct, non-passing outcome.** Windows reports a
+minimised window at `(-32000,-32000)`, which reads as "off-screen" to a naive
+check — and minimised is precisely the state Unity is most likely to throttle.
+That would have been a false pass.
+
+`harness.py --offscreen` **re-checks at the end of the run**, not only after the
+move: the client changes window mode several times during boot and can put
+itself back on a display. A run that reaches its sentinel but ends NOT PARKED is
+reported as incomplete, not 0.
+
+`--selftest` runs the classifier against a window the tool creates itself and
+demands VISIBLE → OFF-SCREEN → VISIBLE-when-straddling-an-edge → MINIMISED. A
+classifier that cannot say anything but OFF-SCREEN is useless, and that selftest
+is what makes shipping one impossible. **PASS on this machine, 2 monitors.**
+
+## The throttle question — NOT SETTLED
+
+An off-screen window is not minimised, so the position itself should not
+throttle anything. **Focus** is the variable, and it is not resolved:
+
+* **Measured:** `UnityEngine.Application::set_runInBackground` is **ABSENT from
+  this build's metadata** — the managed linker stripped the unused setter. We
+  therefore **cannot turn `runInBackground` on**. `get_runInBackground` exists
+  at RVA `0x525BE20` and `get_isFocused` at `0x525BDD0`, both
+  `sharedness=UNIQUE` with real bodies, so both are *readable* live.
+* **Not measured:** what BSG set `Run In Background` to. It lives in
+  `globalgamemanagers`, not in anything read here.
+* `python tools\offscreen.py throttle` settles it behaviourally off the host's
+  `frameMeter` line, comparing two windows of readings and refusing a verdict
+  from fewer than two readings per window. `frameMeter` is already set in the
+  live `aowlspt-host.json`.
+
+Until that has been run, **do not assume a parked client keeps full frame rate
+when it does not have the foreground.** `park --defocus` is opt-in for exactly
+this reason; the default leaves focus on the client.
