@@ -77,7 +77,16 @@ proc setState(list: var List; qid, state: string; nowSeconds: int) =
   setNumber(d, "startTime", nowSeconds)
   setNumber(d, "statusTimer", nowSeconds)
   setRaw(d, "completedConditions", "[]")
-  setBool(d, "availableAfter", false)
+  ## MEASURED, not assumed: `availableAfter` is a UNIX-second delay, an INTEGER.
+  ## All 783 occurrences in the live db.json are numbers (758 of them 0); not one
+  ## is a boolean. Writing `false` here produced valid JSON of the WRONG TYPE, and
+  ## the client's typed reader threw `Error reading integer. Unexpected token:
+  ## Boolean.` -- so every check that merely PARSES the payload still passed.
+  ##
+  ## It hid here because this branch only runs for a quest the profile does not
+  ## already have: every stock quest takes the update path above. A mod-added
+  ## quest was the only thing that ever reached this line.
+  setNumber(d, "availableAfter", 0)
   list.add d
 
 proc questTemplate*(qid: string): string =
