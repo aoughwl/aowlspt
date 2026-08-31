@@ -2081,6 +2081,14 @@ var gAdsStart = 0.0      ## the FOV when this ADS-in began (for the log line)
 var gAdsVerdict = "INCONCLUSIVE -- no ADS-in has been observed yet"
 var gAdsLearns = 0
 var gAdsGiveUps = 0
+var gAdsPendReport = false  ## an ADS-in endpoint was written last tick and its
+                            ## survival has not been read back yet
+var gAdsPendTarget = 0.0    ## ...that endpoint
+var gAdsPendGameFov = 0.0   ## the game's OWN settled ADS fov, READ FROM THE
+                            ## GAME -- never our own last write
+var gAdsPendPath = ""       ## which branch produced it, named in the log line
+var gAdsIns = 0             ## how many aim-ins have been seen AT ALL
+var gAimWasAiming = false
 var gBaseCam: Il2CppPtr = nil
   ## WHICH camera `gBaseFov` was captured from. The menu camera and the raid
   ## camera are different objects, and `Camera::get_main` answers in both. A
@@ -2798,6 +2806,64 @@ proc applyFov() =
   # directly, which is the step change the player reported.
   let wantAds = aiming or gZoomOn
 
+  # ---- THE AIM-IN HEARTBEAT.
+  #
+  # The previous instrument printed NOTHING for a whole run, and there was no
+  # way to tell "the feature is off" from "the player never aimed" -- which is
+  # the same unfalsifiability that let the original bug survive. This fires on
+  # the aiming edge itself, before any branch, gate or early return, so the
+  # ABSENCE of ADS-in lines now means the player did not aim. It is rate-capped
+  # to the first four and builds no string after that.
+  if aiming != gAimWasAiming:
+    gAimWasAiming = aiming
+    if aiming:
+      gAdsIns = gAdsIns + 1
+      if gAdsIns <= 4:
+        info "FOV: transition ADS-IN #" & $gAdsIns & " STARTED -- camera " &
+             "fov now " & $gCurFov & ", hip base " & $gBaseFov & ", mult x" &
+             $mult & ", strategy " &
+             (if cfgAdsDeferToGame: "defer-to-game (this mod writes nothing " &
+                                    "until the game's own ramp settles)"
+              else: "our own ramp to base*mult (adsDeferToGame is OFF)")
+
+  # ---- DID THE ADS-IN ENDPOINT SURVIVE A FRAME?  (CLAUDE.md 9b)
+  #
+  # Runs a full tick AFTER the endpoint was written, and BEFORE this tick writes
+  # anything, so it reads what survived the frame rather than our own store.
+  # `gAdsPendGameFov` is the game's own settled ADS field of view, read with
+  # get_fieldOfView while this mod was writing nothing -- so the comparison is
+  # against a value that came from the game, never against our arithmetic.
+  # Unconditional: no `sampling` gate, no `gLastTarget` gate. One line per
+  # aim-in, and it names the branch that produced it.
+  if gAdsPendReport:
+    gAdsPendReport = false
+    if not bCamFov.ok:
+      warn "FOV: transition ADS-IN #" & $gAdsIns & " INCONCLUSIVE -- " &
+           "Camera::get_fieldOfView did not verify, so the rendered value " &
+           "could not be read one frame on. Not a pass."
+    else:
+      a.reset()
+      let live = callFloat(bCamFov, cam, a)
+      let dEnd = fabsf(live - gAdsPendTarget)
+      let dGame = fabsf(live - gAdsPendGameFov)
+      let verdict =
+        (if dEnd <= 0.5: "PASS"
+         elif dGame <= 0.5:
+           "FAIL -- the camera came back to the GAME's own ADS fov " &
+           $gAdsPendGameFov & ". The game is still writing this field after " &
+           "we do; our value does not survive the frame. THIS IS THE SNAP."
+         else:
+           "FAIL -- the camera is at neither our endpoint nor the game's " &
+           "settled ADS fov; a third writer, or the sight changed mid-aim.")
+      if dEnd <= 0.5: gSmPasses = gSmPasses + 1 else: gSmFails = gSmFails + 1
+      gSmVerdict = verdict
+      info "FOV: transition ADS-IN #" & $gAdsIns & " " & verdict &
+           " -- game's own ADS fov " & $gAdsPendGameFov & " (read while we " &
+           "wrote nothing), hip base " & $gBaseFov & ", mult x" & $mult &
+           ", our endpoint " & $gAdsPendTarget & ", camera ONE FRAME LATER " &
+           $live & ", delta-to-endpoint " & $dEnd & ", delta-to-game " &
+           $dGame & ", via " & gAdsPendPath
+
   # ---- WHO OWNS THE FIELD OF VIEW RIGHT NOW.
   #
   # See cfgAdsDeferToGame. Leaving ADS drops everything learned about the game's
@@ -2855,6 +2921,10 @@ proc applyFov() =
         gAdsBase = seenNow
         gAdsLearns = gAdsLearns + 1
         endpoint = gAdsBase * mult
+        gAdsPendReport = true
+        gAdsPendTarget = endpoint
+        gAdsPendGameFov = gAdsBase
+        gAdsPendPath = "defer-to-game, settled"
         gAdsVerdict = "LEARNED -- the game ramped its own FOV from " &
                       $gAdsStart & " to " & $gAdsBase & " over " &
                       $(gAdsObsT * 1000.0) & " ms with this mod writing " &
@@ -2869,6 +2939,16 @@ proc applyFov() =
         gAdsBase = gAdsPrev
         gAdsGiveUps = gAdsGiveUps + 1
         endpoint = gAdsBase * mult
+        gAdsPendReport = true
+        gAdsPendTarget = endpoint
+        gAdsPendGameFov = gAdsPrev
+        gAdsPendPath = "defer-to-game, CAP EXPIRED (" &
+                       (if gAdsMoved: "never stopped moving"
+                        else: "the game never moved Camera.fieldOfView at " &
+                              "all -- if this is what the log says, the game " &
+                              "does NOT drive ADS through this field and the " &
+                              "whole defer strategy is aimed at the wrong " &
+                              "writer") & ")"
         gAdsVerdict = "INCONCLUSIVE -- the game's own field of view never " &
                       (if gAdsMoved: "stopped moving" else: "moved at all") &
                       " in " & $(gAdsObsT * 1000.0) & " ms of watching (it " &
@@ -2880,8 +2960,38 @@ proc applyFov() =
         # Still watching. The game owns the field this tick.
         return
 
+  # ---- THE TWO STRATEGIES ARE MUTUALLY EXCLUSIVE, AND THIS IS WHERE.
+  #
+  # WHAT WENT WRONG IN THE SHIPPED BUILD, exactly: with adsDeferToGame AND
+  # enableAdsSmoothing both true, BOTH ran, in sequence. The defer path waited
+  # for the game's aim-in ramp to finish, then fell through to the smoother,
+  # which saw a changed endpoint and started a SECOND ramp of adsInDuration()
+  # (333 ms at rifleAimSpeedZ 3.0) from the game's settled ADS fov to
+  # gAdsBase*mult -- a second FOV move, beginning only after the game's aim-in
+  # had already visibly completed. Deferring the start of our fight is not the
+  # same as not fighting.
+  #
+  # So: when we are deferring, the ADS-IN direction takes NO ramp of ours at
+  # all. The game already performed the ramp; the multiplier is a one-off
+  # correction applied to the value it settled on. `enableAdsSmoothing` is
+  # INERT for the in-direction and untouched for the out-direction, which the
+  # player has consistently reported as fine and which must stay that way --
+  # its endpoint is gBaseFov, the game's own hip fov, so both writers agree
+  # there and the ramp is invisible.
+  let inDirInert = cfgAdsDeferToGame and wantAds and mult != 1.0 and
+                   bCamFov.ok and gAdsBase > 0.0
   var target = endpoint
-  if not cfgEnableAdsSmoothing:
+  if inDirInert:
+    gCurFov = endpoint
+    gSmFrom = endpoint
+    gSmTo = endpoint
+    gSmT = 0.0
+    gSmDur = 0.0
+    gSmToAds = true
+    gSmSettled = true
+    gSmVerified = true    ## the ADS-in report above owns this verdict now
+    target = endpoint
+  elif not cfgEnableAdsSmoothing:
     gCurFov = endpoint
     gSmSettled = true
   else:
@@ -3790,8 +3900,19 @@ proc reportWatch() =
           "THIS MOD -- adsDeferToGame is off, so our ramp races the game's own"
         else:
           "THE GAME (adsDeferToGame on); this mod writes nothing until the " &
-          "game's ramp settles. " & $gAdsLearns & " settled, " & $gAdsGiveUps &
+          "game's ramp settles, and the ADS-IN direction takes no ramp of " &
+          "ours afterwards. " & $gAdsLearns & " settled, " & $gAdsGiveUps &
           " gave up. " & gAdsVerdict)
+  # Absence of ADS-in lines must mean one thing only, and the log has to say
+  # which. A silent instrument is what let the original defect survive.
+  info "    aim-ins seen this run: " & $gAdsIns &
+       (if gAdsIns == 0:
+          " -- SO THERE IS NOTHING TO REPORT. This is 'the player never " &
+          "aimed down sights while the mod was armed', NOT 'the feature is " &
+          "off'; the feature state is the line above. Every aim-in logs a " &
+          "'transition ADS-IN' line on the aiming edge, before any gate."
+        else: " (" & $gSmPasses & " survived a frame, " & $gSmFails &
+              " did not)")
   reportEffect("per-frame FOV write", gFovState, gFovWrites)
   info "    driven by " & gDriverState
   if gDriverIsEveryMain:
@@ -4372,6 +4493,23 @@ proc onLoad(): Status =
          "change the field of view by exactly nothing. That is a working " &
          "mod producing an invisible result, not a broken one -- if ADS " &
          "'does nothing' with a scope equipped, this setting is why."
+  # Two mutually-exclusive aim-in strategies must never be left BOTH enabled
+  # and silently sequenced -- that is the shipped defect. The resolution is
+  # stated out loud at load, so the config cannot be misread as "both apply".
+  if cfgAdsDeferToGame:
+    if cfgEnableAdsSmoothing:
+      warn "config: adsDeferToGame AND enableAdsSmoothing are BOTH on. These " &
+           "are two different aim-in strategies and they are NOT combined. " &
+           "RESOLVED: adsDeferToGame wins for the ADS-IN direction, which " &
+           "takes NO ramp of ours -- the game performs the ramp and our " &
+           "multiplier is applied once to the value it settles on. " &
+           "enableAdsSmoothing still governs the ADS-OUT direction only " &
+           "(out endpoint = the hip FOV, which the game agrees with, and " &
+           "which the player reports as correct). Set adsDeferToGame off to " &
+           "get the old both-ways behaviour back."
+    else:
+      info "config: aim-in strategy = defer to the game; aim-out is a step " &
+           "(enableAdsSmoothing is off)."
   if cfgEnableAdsSmoothing:
     info "config: ADS smoothing ON -- in " & $(adsInDuration() * 1000.0) &
          " ms, out " & $(adsOutDuration() * 1000.0) & " ms, " &
