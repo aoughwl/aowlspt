@@ -978,13 +978,25 @@ proc mapsDiagText(): string =
             "has expired yet. That is EXPECTED while every contact is still " &
             "in the feed: an indicator only ages once the feed STOPS " &
             "refreshing it"
-  elif hudIndFaded() == 0'i64:
-    lLife = "FAIL  " & $hudIndExpired() & " track(s) were evicted but NOT ONE " &
-            "was ever drawn at reduced alpha -- they are disappearing " &
-            "abruptly instead of fading. The decay is not reaching the draw"
+  elif (hudIndFadedDrawn() + hudPaneGhostsFaded()) == 0'i64:
+    # THE CHECK THAT CAN FAIL (Â§9b). It asks the FINISHED STATE -- was a region
+    # command actually SUBMITTED carrying a reduced alpha -- not whether a decay
+    # value was computed. `hudIndFaded()` is the computed count and is printed
+    # only as context; using it as the verdict is what made this pass while
+    # contacts popped out on screen, because every cull between the calculation
+    # and the fill threw the faded colour away.
+    lLife = "FAIL  " & $hudIndExpired() & " track(s) were evicted and NOT ONE " &
+            "faded primitive was ever SUBMITTED (pane ghosts=" &
+            $hudPaneGhosts() & ", of them faded=" & $hudPaneGhostsFaded() &
+            "; indicators submitted faded=" & $hudIndFadedDrawn() &
+            "; decay COMPUTED " & $hudIndFaded() & " time(s)). A computed " &
+            "alpha that never reaches a fill is the defect: contacts are " &
+            "disappearing abruptly instead of fading"
   else:
-    lLife = "PASS  " & $hudIndFaded() & " indicator(s) drawn mid-fade and " &
-            $hudIndExpired() & " removed after their window (" &
+    lLife = "PASS  " & $hudPaneGhostsFaded() & " pane contact(s) and " &
+            $hudIndFadedDrawn() & " indicator(s) were SUBMITTED at reduced " &
+            "alpha (of " & $hudPaneGhosts() & " ghost draw(s)), and " &
+            $hudIndExpired() & " track(s) were removed after their window (" &
             $hudHoldMs() & "+" & $hudFadeMs() & "ms); " & $hudTracks() &
             " track(s) live"
   lLife = lLife & ". NOTE: these are NOT audio indicators. This mod " &
@@ -1041,10 +1053,27 @@ proc mapsDiagText(): string =
   elif hudDrawn() <= 0'i64:
     lPerf = "INCONCLUSIVE  the callback has not drawn yet, so its cost is unmeasured"
   else:
+    # PER PATH, not one anonymous peak. A total of 494us said only "something
+    # spiked"; it could have been the tile submit, the small pane, the
+    # full-screen overlay, the indicator loop or the host projector, and there
+    # was no way to tell them apart without a rebuild. Each path now carries its
+    # own worst case, so the next spike names itself.
     lPerf = "last=" & $hudDrawUsLast() & "us avg=" & $hudDrawUsAvg() &
             "us peak=" & $hudDrawUsPeak() & "us  tiles/frame=" & $hudTilesLast() &
+            "  peak-by-path: art=" & $hudArtUsPeak() &
+            "us minimap=" & $hudPaneUsPeak() &
+            "us fullscreen=" & $hudFsUsPeak() &
+            "us indicators=" & $hudIndUsPeak() &
+            "us projector=" & $hudProjUsPeak() & "us" &
+            "  projector calls=" & $hudProjCalls() & " (peak " &
+            $hudProjCallsPeak() & "/frame, cap 24, deferred " &
+            $hudProjDeferred() & ")" &
             " (budget " & $gOpts.budgetUs & "us; the region throttles this " &
-            "participant after 8 consecutive overruns)"
+            "participant after 8 consecutive overruns)" &
+            (if hudDrawUsPeak() > int64(gOpts.budgetUs):
+               "  OVER BUDGET at peak -- read the per-path numbers above; the " &
+               "one whose peak is closest to the total is the spike"
+             else: "")
 
   # THE TOGGLE LINE (Â§9b). The one check that would have caught the bug this
   # block exists for: an edit that STORES and never reaches the draw path.

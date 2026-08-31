@@ -65,6 +65,17 @@ import world  # the Snapshot this file mirrors; no game memory is read here
 
 #define MHUD_MAX 128
 
+/* THE PROJECTOR CALL CAP, per frame. `aowl_region_project` is the one thing in
+ * this draw that is not local arithmetic: it leaves the mod and asks the host to
+ * project a world point. With a full track table that was up to 128 such calls
+ * on a single dispatch, which is the only path here whose cost scales with a
+ * number the player does not control -- and the draw-cost budget is 400us for
+ * the WHOLE participant. Capped, round-robin so no track is starved, and every
+ * skipped track is COUNTED (`projDeferred`), never silently dropped. A skipped
+ * track still falls through to the bearing-ring fallback, so it is still drawn
+ * and still fades; only its screen-relative placement is deferred a frame. */
+#define MHUD_PROJ_MAX 24
+
 /* The ONE spatial widget's mode. See the `mode` field's comment. */
 #define MHUD_MODE_OFF     0
 #define MHUD_MODE_RADAR   1
@@ -119,6 +130,13 @@ typedef struct {
     int32_t  bot;
     int64_t  lastMs;    /* when this contact was last REFRESHED by the feed */
     int32_t  live;      /* 1 = occupied slot */
+    int32_t  seq;       /* the PUBLISH this track was last refreshed by. Equal to
+                         * g_mhud.pubSeq => the contact is in THIS frame's entity
+                         * array and the pane already drew it at full alpha;
+                         * anything else => it dropped out of the feed and the
+                         * pane must draw it as a FADING GHOST. Without this the
+                         * decay existed only for the edge indicators and the
+                         * pane blip vanished abruptly -- the contact-fade bug. */
 } MHudTrack;
 
 static struct {
@@ -201,6 +219,41 @@ static struct {
     int64_t  fsToggles;           /* key-driven open/close edges */
     int32_t  fsSmallPrims;        /* small-widget submissions, most recent frame */
     int32_t  fsLastPrims;         /* overlay submissions, most recent frame */
+
+    /* THE PUBLISH COUNTER. Bumped once per mhud_begin, stamped into every track
+     * mhud_touch refreshes. Its only job is to tell "in this frame's feed" from
+     * "dropped out of it" in O(1) rather than by rescanning the entity array
+     * per track (which would be 128*128 per frame -- exactly the kind of scan
+     * the draw-cost budget forbids). */
+    int32_t  pubSeq;
+
+    /* ---- FADE, counted where it is SUBMITTED, not where it is COMPUTED ----
+     *
+     * The old `indFaded` was incremented right after mm_fade_alpha, BEFORE the
+     * distance cull, before the projector, before any fill. It therefore could
+     * not distinguish "a decayed alpha reached the renderer" from "a decayed
+     * alpha was calculated and then thrown away", which is exactly the failure
+     * the diag reported. These three are incremented at the SUBMISSION SITES,
+     * immediately after the region command that carries the faded colour, so a
+     * non-zero value cannot be produced by a draw that did not happen. */
+    int64_t  paneGhosts;        /* pane blips drawn from a DROPPED track ... */
+    int64_t  paneGhostsFaded;   /* ... of those, ones submitted at alpha < 1 */
+    int64_t  indFadedDrawn;     /* edge indicators SUBMITTED at alpha < 1 */
+
+    /* ---- PER-PATH draw cost ------------------------------------------------
+     * One aggregate peak cannot say WHICH path spiked, so a future spike could
+     * not name itself. Each of these is the worst microsecond cost seen for one
+     * path; they are measured with the same QPC clock as the total. */
+    int64_t  artUsPeak;         /* mhud_art_draw_pane (tile submit / bind) */
+    int64_t  paneUsPeak;        /* the small widget, whole pane */
+    int64_t  fsUsPeak;          /* the full-screen overlay, whole pane */
+    int64_t  indUsPeak;         /* the indicator loop */
+    int64_t  projUsPeak;        /* time inside aowl_region_project alone */
+    int64_t  projCalls;         /* projector calls, total */
+    int32_t  projCallsPeak;     /* ... most ever in ONE frame */
+    int64_t  projDeferred;      /* tracks skipped by the per-frame call cap --
+                                 * a NAMED decline, never a silent one */
+    int32_t  projCursor;        /* round-robin start, so the cap starves no track */
 
     int64_t  frames, drawn, blips;
     /* BUG 2: dispatches SKIPPED because a blocking UI surface (game Settings,
@@ -287,12 +340,18 @@ static int64_t mhud_now_ms(void) { return (int64_t)GetTickCount64(); }
  * QueryPerformance* are NOT redeclared here -- abi/aowlspt_region.h has already
  * pulled in windows.h by this point, so declaring them again would conflict with
  * the winbase.h prototypes (LARGE_INTEGER*, not long long*). Use them straight. */
+/* The FREQUENCY is fixed for the life of the process, so it is read once. This
+ * matters because the profiler now times five paths instead of one and the
+ * instrument must not become the cost it is measuring. */
+static int64_t g_mhud_qpf = 0;
 static int64_t mhud_now_us(void) {
     LARGE_INTEGER c, f;
-    if (!QueryPerformanceCounter(&c) || !QueryPerformanceFrequency(&f) ||
-        f.QuadPart <= 0)
-        return 0;
-    return (int64_t)((c.QuadPart * 1000000LL) / f.QuadPart);
+    if (g_mhud_qpf <= 0) {
+        if (!QueryPerformanceFrequency(&f) || f.QuadPart <= 0) return 0;
+        g_mhud_qpf = (int64_t)f.QuadPart;
+    }
+    if (!QueryPerformanceCounter(&c)) return 0;
+    return (int64_t)((c.QuadPart * 1000000LL) / g_mhud_qpf);
 }
 #else
 static int64_t mhud_now_ms(void) { return 0; }
@@ -333,6 +392,10 @@ static void mhud_reset(void) {
 static void mhud_begin(float px, float py, float pz, int32_t hasLocal,
                        float heading, int32_t hasHeading, int32_t inRaid) {
     g_mhud.n = 0;
+    /* A new publish. Tracks refreshed by THIS publish carry this value; every
+     * other live track is, by definition, a contact that dropped out of the
+     * feed and must be drawn as a fading ghost rather than vanishing. */
+    g_mhud.pubSeq++;
     g_mhud.px = px; g_mhud.py = py; g_mhud.pz = pz;
     g_mhud.hasLocal = hasLocal ? 1 : 0;
     g_mhud.inRaid = inRaid ? 1 : 0;
@@ -359,6 +422,7 @@ static void mhud_touch(uint64_t key, float x, float y, float z, int32_t bot) {
             g_mhud.tr[i].x = x; g_mhud.tr[i].y = y; g_mhud.tr[i].z = z;
             g_mhud.tr[i].bot = bot;
             g_mhud.tr[i].lastMs = mhud_now_ms();
+            g_mhud.tr[i].seq    = g_mhud.pubSeq;
             return;
         }
         if (!g_mhud.tr[i].live && free_ < 0) free_ = i;
@@ -370,6 +434,7 @@ static void mhud_touch(uint64_t key, float x, float y, float z, int32_t bot) {
     g_mhud.tr[free_].z      = z;
     g_mhud.tr[free_].bot    = bot;
     g_mhud.tr[free_].lastMs = mhud_now_ms();
+    g_mhud.tr[free_].seq    = g_mhud.pubSeq;
     g_mhud.tr[free_].live   = 1;
 }
 
@@ -1124,8 +1189,14 @@ static int32_t mhud_draw_pane_full(float px, float py, float size, float spanM,
      * `withArt` is the mode's -- radar mode passes 0, which is what makes a
      * radar a radar rather than a small map. */
     if (withArt && g_mhud.drawArt) {
+        /* Timed on its own: the tile path is the one that binds textures and is
+         * the first suspect for a spike, and an aggregate peak could not name
+         * it. Two QPC reads per frame, not per tile. */
+        int64_t _ta = mhud_now_us();
         int32_t art = mhud_art_draw_pane(px, py, size, spanM, rot,
                                          MHUD_RGBA(255, 255, 255, artA));
+        int64_t _tad = mhud_now_us() - _ta;
+        if (_tad > g_mhud.artUsPeak) g_mhud.artUsPeak = _tad;
         g_art.tilesDrawn += art;
         prims += art;
         /* The grid is a SCALE REFERENCE when art is present and the FALLBACK
@@ -1185,7 +1256,12 @@ static int32_t mhud_draw_pane_full(float px, float py, float size, float spanM,
      * 327 for one pane. At most ONE pane is drawn per frame (the overlay
      * replaces the small widget, it does not add to it), and the indicator loop
      * that follows contributes at most 2 each -- 327 + 256 = 583 against
-     * AOWL_REGION_MAX_CMDS (2048). It cannot overrun. */
+     * AOWL_REGION_MAX_CMDS (2048). It cannot overrun.
+     *
+     * The GHOST loop added below does not widen that bound: a ghost is a track
+     * that is NOT in this frame's entity array, so the live blips and the ghosts
+     * are disjoint subsets of one 128-slot table and together still contribute
+     * at most 2*128. */
     for (i = 0; i < g_mhud.n && i < MHUD_MAX; i++) {
         float ex = g_mhud.e[i].x, ez = g_mhud.e[i].z;
         float dy = g_mhud.e[i].y - g_mhud.py;
@@ -1214,13 +1290,74 @@ static int32_t mhud_draw_pane_full(float px, float py, float size, float spanM,
             prims++;
         }
     }
+
+    /* ---- CONTACTS THAT DROPPED OUT OF THE FEED: the FADE, on the pane ------
+     *
+     * THE BUG this fixes: the loop above draws THIS FRAME's entity array at a
+     * fixed alpha. A contact that dies, despawns, exceeds the list cap or fails
+     * its position read is simply absent from that array on the next publish, so
+     * its blip vanished between one frame and the next. The decay existed --
+     * mm_fade_alpha, the hold+fade window, the track table -- but it was read
+     * ONLY by the edge-indicator loop, which is itself gated on `indicatorsOn`
+     * and suppressed entirely while the overlay is open. So on the surface the
+     * player actually looks at, the decay never reached the draw.
+     *
+     * A track whose `seq` is not the current publish is exactly that dropped
+     * contact. It is drawn here, at its last known world position, with the
+     * fade alpha applied to the colour that is SUBMITTED -- and the counter is
+     * incremented after the submission, not after the calculation, so it cannot
+     * report a fade that never rendered.
+     *
+     * Bounded: MHUD_MAX, no allocation, no nested scan of the entity array (the
+     * publish stamp is what makes the "is it in this frame's feed" test O(1)).
+     * A contact with no identity (key 0) is never tracked and so never ghosts;
+     * that is a property of the feed, stated rather than papered over. */
+    {
+        int64_t now = mhud_now_ms();
+        for (i = 0; i < MHUD_MAX; i++) {
+            float ex, ez, dy2, cp2, alpha;
+            uint32_t col2;
+            MmPt p2;
+            if (!g_mhud.tr[i].live) continue;
+            if (g_mhud.tr[i].seq == g_mhud.pubSeq) continue;  /* drawn above */
+            if (g_mhud.tr[i].bot && !g_mhud.showBots) continue;
+            if (!g_mhud.tr[i].bot && !g_mhud.showPlayers) continue;
+
+            alpha = mm_fade_alpha(now - g_mhud.tr[i].lastMs,
+                                  g_mhud.holdMs, g_mhud.fadeMs);
+            if (alpha <= 0.0f) continue;   /* eviction is the indicator loop's */
+
+            ex = g_mhud.tr[i].x; ez = g_mhud.tr[i].z;
+            dy2 = g_mhud.tr[i].y - g_mhud.py;
+            if (radiusCull > 0.0f &&
+                mm_dist2d(ex, ez, g_mhud.px, g_mhud.pz) > radiusCull) continue;
+            p2 = mm_topdown(ex, ez, g_mhud.px, g_mhud.pz, px, py, size, spanM, rot);
+            if (!mm_in_rect(p2, px, py, size, size)) continue;
+
+            cp2 = g_mhud.contactPx;
+            col2 = mm_fade_rgba(g_mhud.tr[i].bot ? g_mhud.colBot
+                                                 : g_mhud.colPlayer, alpha);
+            aowl_region_fill(p2.x - cp2, p2.y - cp2, cp2 * 2.0f, cp2 * 2.0f, col2);
+            prims++;
+            /* Counted HERE, after the submit. */
+            g_mhud.paneGhosts++;
+            if (alpha < 1.0f) g_mhud.paneGhostsFaded++;
+            if (dy2 > 2.0f) {
+                aowl_region_fill(p2.x - 1.0f, p2.y - cp2 - 3.0f, 2.0f, 2.0f, col2);
+                prims++;
+            } else if (dy2 < -2.0f) {
+                aowl_region_fill(p2.x - 1.0f, p2.y + cp2 + 1.0f, 2.0f, 2.0f, col2);
+                prims++;
+            }
+        }
+    }
     return prims;
 }
 
 static void mhud_draw(void* user, int64_t frame) {
     float rot, headRot, scrW, scrH;
-    int32_t i;
-    int64_t _t0;
+    int32_t i, k, projLeft, projUsed = 0;
+    int64_t _t0, _tInd;
     (void)user; (void)frame;
 
     g_mhud.frames++;
@@ -1363,11 +1500,15 @@ static void mhud_draw(void* user, int64_t frame) {
         float m = g_mhud.fsMargin;
         float avail = (scrW < scrH ? scrW : scrH) - m * 2.0f;
         float span;
+        int64_t _tf, _tfd;
         if (avail < 64.0f) avail = 64.0f;
         span = g_mhud.fsSpanM / (g_mhud.fsZoom > 0.1f ? g_mhud.fsZoom : 1.0f);
+        _tf = mhud_now_us();
         g_mhud.fsLastPrims = mhud_draw_pane_full(
             (scrW - avail) * 0.5f, (scrH - avail) * 0.5f, avail, span,
             g_mhud.fsNorthUp ? 0.0f : rot, 1, g_mhud.fsOpacity, 0.0f);
+        _tfd = mhud_now_us() - _tf;
+        if (_tfd > g_mhud.fsUsPeak) g_mhud.fsUsPeak = _tfd;
         g_mhud.fsFrames++;
         /* THE FALSIFIABLE NEGATIVE. The small widget was not reached on this
          * frame, and this counts that rather than asserting it. */
@@ -1381,10 +1522,13 @@ static void mhud_draw(void* user, int64_t frame) {
         float baseSpan = radar ? g_mhud.radiusM * 2.0f : g_mhud.mapSpanM;
         float span = baseSpan / (g_mhud.zoom > 0.1f ? g_mhud.zoom : 1.0f);
         float cull = radar ? (span * 0.5f) : 0.0f;
+        int64_t _tp = mhud_now_us(), _tpd;
         g_mhud.fsSmallPrims = mhud_draw_pane_full(
             g_mhud.mapX, g_mhud.mapY, g_mhud.mapSize, span,
             (g_mhud.mode == MHUD_MODE_NORTHUP) ? 0.0f : rot,
             radar ? 0 : 1, g_mhud.opacity, cull);
+        _tpd = mhud_now_us() - _tp;
+        if (_tpd > g_mhud.paneUsPeak) g_mhud.paneUsPeak = _tpd;
     }
 
     /* ---- the DIRECTIONAL indicators, which are TRANSIENTS ---------------- *
@@ -1411,13 +1555,21 @@ static void mhud_draw(void* user, int64_t frame) {
      * no heading measured it is north-up exactly as before, and the diagnostic
      * still says which of the two happened.
      */
-    for (i = 0; i < MHUD_MAX; i++) {
+    _tInd = mhud_now_us();
+    projLeft = MHUD_PROJ_MAX;
+    for (k = 0; k < MHUD_MAX; k++) {
         float ex, ez, ey, d, alpha;
         int64_t age;
         uint32_t col;
         MmPt m;
         int offscreen = 0;
         float sx = 0.0f, sy = 0.0f;
+        int32_t projected = 0;
+
+        /* Round-robin, so the per-frame projector cap defers a DIFFERENT set of
+         * tracks each frame instead of permanently starving the tail of the
+         * table. `i` is the real slot; `k` only counts the visits. */
+        i = (g_mhud.projCursor + k) % MHUD_MAX;
 
         if (!g_mhud.tr[i].live) continue;
 
@@ -1436,6 +1588,10 @@ static void mhud_draw(void* user, int64_t frame) {
         if (g_mhud.tr[i].bot && !g_mhud.showBots) continue;
         if (!g_mhud.tr[i].bot && !g_mhud.showPlayers) continue;
 
+        /* `indFaded` counts a decay that was COMPUTED. It is kept, because it is
+         * still the right number for "is the ramp running at all", but it is NOT
+         * evidence that anything faded on screen -- every cull below it can
+         * throw the value away. `indFadedDrawn` is the submitted count. */
         alpha = mm_fade_alpha(age, g_mhud.holdMs, g_mhud.fadeMs);
         if (alpha < 1.0f) g_mhud.indFaded++;
         if (age > 0) g_mhud.indStale++;
@@ -1447,7 +1603,23 @@ static void mhud_draw(void* user, int64_t frame) {
         col = g_mhud.tr[i].bot ? g_mhud.colBot : g_mhud.colPlayer;
         col = mm_fade_rgba(col, alpha);
 
-        if (aowl_region_project(ex, ey, ez, &sx, &sy)) {
+        /* THE ONE NON-LOCAL CALL IN THIS DRAW. Everything else here is
+         * arithmetic on the mirror; this leaves the mod. Capped per frame and
+         * timed on its own so a spike in it names itself instead of showing up
+         * only in the participant's total. */
+        if (projLeft > 0) {
+            int64_t _tpj = mhud_now_us(), _tpjd;
+            projected = aowl_region_project(ex, ey, ez, &sx, &sy);
+            _tpjd = mhud_now_us() - _tpj;
+            if (_tpjd > g_mhud.projUsPeak) g_mhud.projUsPeak = _tpjd;
+            projLeft--;
+            projUsed++;
+            g_mhud.projCalls++;
+        } else {
+            g_mhud.projDeferred++;   /* named decline; falls back to the ring */
+        }
+
+        if (projected) {
             /* The projector reports nothing about the camera plane through
              * this ABI, so `behind` cannot be known here and is passed as 0.
              * mm_indicator handles a behind-camera point correctly when told;
@@ -1461,6 +1633,7 @@ static void mhud_draw(void* user, int64_t frame) {
                     aowl_region_box(m.x - 5.0f, m.y - 5.0f, 10.0f, 10.0f,
                                     1.0f, col);
                 g_mhud.indProjected++;
+                if (alpha < 1.0f) g_mhud.indFadedDrawn++;   /* SUBMITTED faded */
             } else {
                 g_mhud.indRefused++;
             }
@@ -1468,9 +1641,19 @@ static void mhud_draw(void* user, int64_t frame) {
                                    scrW, scrH, 0.35f, &m)) {
             aowl_region_fill(m.x - 3.0f, m.y - 3.0f, 6.0f, 6.0f, col);
             g_mhud.indBearing++;
+            if (alpha < 1.0f) g_mhud.indFadedDrawn++;       /* SUBMITTED faded */
         } else {
             g_mhud.indRefused++;
         }
+    }
+    /* Advance the round-robin by however many projector calls this frame spent,
+     * so the next frame starts where this one ran out of budget. */
+    g_mhud.projCursor = (g_mhud.projCursor + (projUsed > 0 ? projUsed : 1))
+                        % MHUD_MAX;
+    if (projUsed > g_mhud.projCallsPeak) g_mhud.projCallsPeak = projUsed;
+    {
+        int64_t _tid = mhud_now_us() - _tInd;
+        if (_tid > g_mhud.indUsPeak) g_mhud.indUsPeak = _tid;
     }
     g_mhud.blips += (int64_t)g_mhud.n;
 
@@ -1493,6 +1676,21 @@ static int64_t mhud_draw_us_last(void) { return g_mhud.drawUsLast; }
 static int64_t mhud_draw_us_peak(void) { return g_mhud.drawUsPeak; }
 static int64_t mhud_draw_us_avg(void)  { return (int64_t)(g_mhud.drawUsEwma + 0.5); }
 static int32_t mhud_tiles_last(void)   { return g_mhud.tilesLastFrame; }
+
+/* PER-PATH peaks, so a future spike names itself instead of arriving as one
+ * anonymous number that could be any of five code paths. */
+static int64_t mhud_art_us_peak(void)  { return g_mhud.artUsPeak; }
+static int64_t mhud_pane_us_peak(void) { return g_mhud.paneUsPeak; }
+static int64_t mhud_fs_us_peak(void)   { return g_mhud.fsUsPeak; }
+static int64_t mhud_ind_us_peak(void)  { return g_mhud.indUsPeak; }
+static int64_t mhud_proj_us_peak(void) { return g_mhud.projUsPeak; }
+static int64_t mhud_proj_calls(void)   { return g_mhud.projCalls; }
+static int32_t mhud_proj_calls_peak(void) { return g_mhud.projCallsPeak; }
+static int64_t mhud_proj_deferred(void)   { return g_mhud.projDeferred; }
+/* FADE, as SUBMITTED. */
+static int64_t mhud_ind_faded_drawn(void)  { return g_mhud.indFadedDrawn; }
+static int64_t mhud_pane_ghosts(void)      { return g_mhud.paneGhosts; }
+static int64_t mhud_pane_ghosts_faded(void){ return g_mhud.paneGhostsFaded; }
 
 /* ---- READBACK of the live mirror -------------------------------------- *
  *
@@ -1704,6 +1902,17 @@ proc cHudDrawUsLast(): int64 {.importc: "mhud_draw_us_last", nodecl.}
 proc cHudDrawUsPeak(): int64 {.importc: "mhud_draw_us_peak", nodecl.}
 proc cHudDrawUsAvg(): int64 {.importc: "mhud_draw_us_avg", nodecl.}
 proc cHudTilesLast(): int32 {.importc: "mhud_tiles_last", nodecl.}
+proc cHudArtUsPeak(): int64 {.importc: "mhud_art_us_peak", nodecl.}
+proc cHudPaneUsPeak(): int64 {.importc: "mhud_pane_us_peak", nodecl.}
+proc cHudFsUsPeak(): int64 {.importc: "mhud_fs_us_peak", nodecl.}
+proc cHudIndUsPeak(): int64 {.importc: "mhud_ind_us_peak", nodecl.}
+proc cHudProjUsPeak(): int64 {.importc: "mhud_proj_us_peak", nodecl.}
+proc cHudProjCalls(): int64 {.importc: "mhud_proj_calls", nodecl.}
+proc cHudProjCallsPeak(): int32 {.importc: "mhud_proj_calls_peak", nodecl.}
+proc cHudProjDeferred(): int64 {.importc: "mhud_proj_deferred", nodecl.}
+proc cHudIndFadedDrawn(): int64 {.importc: "mhud_ind_faded_drawn", nodecl.}
+proc cHudPaneGhosts(): int64 {.importc: "mhud_pane_ghosts", nodecl.}
+proc cHudPaneGhostsFaded(): int64 {.importc: "mhud_pane_ghosts_faded", nodecl.}
 proc cHudConfigurePane(mode: int32; zoom, opacity: cfloat; drawArt: int32;
                        contactPx: cfloat;
                        colBot, colPlayer, colSelf: uint32) {.
@@ -1777,6 +1986,17 @@ proc hudDrawUsLast*(): int64 = cHudDrawUsLast()
 proc hudDrawUsPeak*(): int64 = cHudDrawUsPeak()
 proc hudDrawUsAvg*(): int64 = cHudDrawUsAvg()
 proc hudTilesLast*(): int32 = cHudTilesLast()
+proc hudArtUsPeak*(): int64 = cHudArtUsPeak()
+proc hudPaneUsPeak*(): int64 = cHudPaneUsPeak()
+proc hudFsUsPeak*(): int64 = cHudFsUsPeak()
+proc hudIndUsPeak*(): int64 = cHudIndUsPeak()
+proc hudProjUsPeak*(): int64 = cHudProjUsPeak()
+proc hudProjCalls*(): int64 = cHudProjCalls()
+proc hudProjCallsPeak*(): int32 = cHudProjCallsPeak()
+proc hudProjDeferred*(): int64 = cHudProjDeferred()
+proc hudIndFadedDrawn*(): int64 = cHudIndFadedDrawn()
+proc hudPaneGhosts*(): int64 = cHudPaneGhosts()
+proc hudPaneGhostsFaded*(): int64 = cHudPaneGhostsFaded()
 
 # ---------------------------------------------------------------- map ART
 
@@ -2154,7 +2374,9 @@ proc hudStatusText*(): string =
   " indicators: projected=" & $cHudIndProjected() &
   " bearing=" & $cHudIndBearing() &
   " refused=" & $cHudIndRefused() &
-  " faded=" & $cHudIndFaded() &
+  " faded(computed)=" & $cHudIndFaded() &
+  " faded(SUBMITTED)=" & $cHudIndFadedDrawn() &
+  " paneGhosts=" & $cHudPaneGhosts() & "/faded=" & $cHudPaneGhostsFaded() &
   " expired=" & $cHudIndExpired() &
   " tracks=" & $cHudTracks() &
   " window=" & $cHudHoldMs() & "+" & $cHudFadeMs() & "ms" &
