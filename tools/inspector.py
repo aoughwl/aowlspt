@@ -24,38 +24,33 @@ Exit codes: 0 answered, 2 timed out, 3 the channel is not there at all.
 import argparse
 import os
 import sys
-import time
 
-LIVE = os.environ.get("AOWLSPT_LIVE", r"D:\Aowlspt\aowlspt")
-CMD = os.path.join(LIVE, "aowlspt-inspect.txt")
-OUT = os.path.join(LIVE, "aowlspt-inspect-out.txt")
-LOG = os.path.join(LIVE, "aowlspt-host" + ".log")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ichannel as _ch  # noqa: E402 -- the ONE python transport (channel.py)
 
+LIVE = _ch.paths()["live"]
+CMD = _ch.paths()["cmd"]
+OUT = _ch.paths()["out"]
+LOG = _ch.paths()["log"]
 
-def read(path):
-    try:
-        with open(path, "rb") as f:
-            return f.read().decode("utf-8", "replace").lstrip("\ufeff")
-    except OSError:
-        return ""
+read = _ch._read
 
 
 def diagnose():
     """Say WHY there was no answer, from the host's own words. A timeout with
     no explanation is the failure mode this whole project keeps paying for."""
-    log = read(LOG)
-    if not log:
-        return "the host log is absent or empty -- the host is not running."
-    hits = [l.strip() for l in log.splitlines() if "live inspector" in l]
-    if not hits:
-        return ("the host log never mentions the live inspector at all -- the "
-                "`liveInspector` flag is off in aowlspt-host.json.")
-    return "last of what the host said about the channel:\n   " + \
-           "\n   ".join(hits[-3:])
+    return _ch.diagnose(LOG)
 
 
-class Timeout(Exception):
-    """The host did not answer THIS batch. Distinct from an empty answer."""
+# `Timeout` is bound to channel.py's BASE error, not to TimeoutErr alone, on
+# purpose. Callers here (`tools/ui.py`, `tools/enterraid.py`) do `except
+# Timeout:` and print the message; channel.py can also raise ChannelMissing
+# ("D:\\Aowlspt\\aowlspt does not exist"), which the old hand-rolled loop
+# turned into a 25-second wait and then a timeout. Catching the base class
+# keeps those callers graceful AND lets the message name the real cause, rather
+# than reporting a missing install as a silent host. `.kind` distinguishes them
+# ("timeout" / "channel_missing") for anything that wants to branch.
+Timeout = _ch.InspectorError
 
 
 def run_batch(lines, timeout=25.0, write=False):
@@ -65,22 +60,18 @@ def run_batch(lines, timeout=25.0, write=False):
     menu is a sequence of batches whose later commands depend on pointers
     parsed out of earlier answers -- the per-batch anchors ($f1, $comp) do not
     survive across batches, so the pointers have to come back out to the caller.
+
+    DE-FORKED: this used to be a second hand-rolled sentinel/poll loop, and its
+    sentinel was `int(time.time()*1000) % 1000000` -- which WRAPS every ~17
+    minutes and is therefore reusable within one long session. Reading a stale
+    out-file whose sentinel happened to match is the exact failure the sentinel
+    exists to prevent. It now delegates to channel.py's `run_batch`, whose
+    sentinel is a never-reused monotonic counter plus wall clock. The return
+    shape here (answer text only, `Timeout` on failure) is unchanged, so
+    `tools/ui.py` and `tools/enterraid.py` are unaffected.
     """
-    if write:
-        lines = ["allow write"] + list(lines)
-    serial = int(time.time() * 1000) % 1000000
-    sentinel = "aowl-batch-%d" % serial
-    body = "#%d\n" % serial + "\n".join(lines) + "\necho %s\n" % sentinel
-    with open(CMD, "wb") as f:
-        f.write(body.encode("utf-8"))
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        out = read(OUT)
-        if sentinel in out:
-            return "\n".join(l for l in out.splitlines() if sentinel not in l)
-        time.sleep(0.15)
-    raise Timeout("no answer for batch %d within %gs. %s"
-                  % (serial, timeout, diagnose()))
+    _sentinel, text = _ch.run_batch(list(lines), timeout=timeout, write=write)
+    return text
 
 
 def main():
