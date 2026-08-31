@@ -443,6 +443,14 @@ var cfgAdsDeferToGame = true
   ## multiplier composes onto the game's real ADS FOV instead of onto the hip
   ## FOV -- which is also the reason `opticFovMulti` never behaved: `base * 1.38`
   ## has nothing to do with a scope's actual magnification.
+var cfgAdsWriteFovField = true
+  ## Write the endpoint into EFT.CameraControl.CameraManager._fov (a plain
+  ## float at +0xF8, from fieldOffsets) as well as into Camera.fieldOfView --
+  ## i.e. change the game's own INPUT rather than correcting its output. This
+  ## is what the 40-sample probe pointed at: nothing writes Camera.fieldOfView
+  ## per frame, so the snap-back seen earlier was a convergence provoked by our
+  ## write disagreeing with _fov. A field write, not a detour: no RVA row, no
+  ## trampoline, nothing for another feature to collide with.
 var cfgAdsMaxFights = 3
   ## After this many consecutive ADS-in transitions whose endpoint did NOT
   ## survive a frame, STOP WRITING THE FIELD OF VIEW WHILE AIMING, entirely,
@@ -606,6 +614,7 @@ proc loadConfig() =
   cfgAdsSettleEps = cfgFloat("adsSettleEps", 0.05)
   cfgAdsObserveCap = cfgFloat("adsObserveCap", 1.5)
   cfgAdsMaxFights = int(cfgFloat("adsMaxFights", 3.0))
+  cfgAdsWriteFovField = cfgBool("adsWriteFovField", true)
 
   # RENAMED, and the rename IS the fix.
   #
@@ -948,6 +957,43 @@ static uint8_t fov_byte_at(void* p, uint64_t i) {
     return ((const uint8_t*)p)[i];
 }
 
+/* A float FIELD read. memcpy, not a cast through float*, so it is defined
+ * behaviour at any alignment. Never called without fov_is_readable(p, off+4)
+ * having said yes -- the check belongs with the pointer hop, at the caller. */
+static double fov_float_at(void* p, int32_t off) {
+    float v = 0.0f;
+    if (!p) return 0.0;
+    memcpy(&v, (const char*)p + off, sizeof(float));
+    return (double)v;
+}
+
+/* fov_is_readable, plus the region must actually be WRITABLE. A readable page
+ * is not a writable one, and writing a game field through a read-only mapping
+ * is an access violation, not a no-op. PAGE_WRITECOPY is accepted because a
+ * write through it succeeds -- privately, which for a managed heap object is
+ * not what we want, so it is reported by the caller rather than trusted. */
+static int32_t fov_is_writable(void* p, int32_t size) {
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!fov_is_readable(p, size)) return 0;
+    if (VirtualQuery(p, &mbi, sizeof(mbi)) == 0) return 0;
+    if (!(mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY |
+                         PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
+        return 0;
+    return 1;
+}
+
+/* A float FIELD write. Returns 1 only if the guard passed AND the value read
+ * back equals what went in -- so the caller never has to assume a write took.
+ * This is the whole of rule 8 in three lines: check, write, read back. */
+static int32_t fov_write_float(void* p, int32_t off, double value) {
+    float v = (float)value;
+    float back = 0.0f;
+    if (!fov_is_writable(p, off + (int32_t)sizeof(float))) return 0;
+    memcpy((char*)p + off, &v, sizeof(float));
+    memcpy(&back, (const char*)p + off, sizeof(float));
+    return back == v ? 1 : 0;
+}
+
 /* Crash-proof breadcrumbs. See `bc` in the nimony below for why the host log
  * could not be used. fopen/fputs/fflush/fclose per call: once fclose returns
  * the bytes belong to the file rather than to this process, so they outlive
@@ -1071,6 +1117,21 @@ proc fovReadPtrAt(p: Il2CppPtr; off: int32): Il2CppPtr {.
   importc: "fov_read_ptr", nodecl.}
 proc fovIsReadable(p: Il2CppPtr; size: int32): int32 {.
   importc: "fov_is_readable", nodecl.}
+proc fovFloatAt(p: Il2CppPtr; off: int32): float {.
+  importc: "fov_float_at", nodecl.}
+proc fovWriteFloat(p: Il2CppPtr; off: int32; value: float): int32 {.
+  importc: "fov_write_float", nodecl.}
+
+# EFT.CameraControl.CameraManager._fov, a private float.
+#
+# From Il2CppMetadataRegistration.fieldOffsets via tools/fldoff.py -- NOT
+# guessed, and corroborated independently: CameraManager::get_Fov @0xBBA100
+# disassembles to `movss xmm0,[rcx+0xF8]; ret`. The two instruments agree.
+#
+# (That getter is SHARED by 6 methods, so it must never be DETOURED -- but a
+# shared body is still correct code for the receiver passed to it, and the
+# offset it names is confirmed by the metadata anyway.)
+const OffCamMgrFov = 0xF8'i32
 
 proc fovReadable(p: Il2CppPtr; size: int): bool =
   result = p != nil and fovIsReadable(p, int32(size)) != 0'i32
@@ -2101,6 +2162,10 @@ var gAimWasAiming = false
 var gAdsConsecFails = 0     ## consecutive ADS-ins whose endpoint did not survive
 var gAdsNoFight = false     ## we have conceded the field of view while aiming
 var gAdsProbeN = 0          ## samples emitted by the read-only writer probe
+var gHoldProbeN = 0         ## samples emitted by the one-shot hold probe
+var gAdsFieldState = "no CameraManager._fov write has been attempted yet"
+var gAdsFieldWrites = 0
+var gAdsFieldRefusals = 0
 
 # ---- THE READ-ONLY WRITER PROBE.
 #
@@ -2891,7 +2956,16 @@ proc applyFov() =
            ", our endpoint " & $gAdsPendTarget & ", camera ONE FRAME LATER " &
            $live & ", delta-to-endpoint " & $dEnd & ", delta-to-game " &
            $dGame & ", via " & gAdsPendPath
-      if not gAdsNoFight and gAdsConsecFails >= cfgAdsMaxFights:
+      # THE CONCESSION IS LIFTED while the input-side write is working.
+      #
+      # It was the right call while we believed we were losing a per-frame
+      # tug-of-war; the 40-sample probe disproved that belief, so keeping it
+      # would be acting on a measurement we know to be superseded. It now
+      # engages ONLY if we never managed to write CameraManager._fov at all --
+      # that is, only when there is no input-side route left and all that
+      # remains is the output-side fight the player can see.
+      if not gAdsNoFight and gAdsFieldWrites == 0 and
+         gAdsConsecFails >= cfgAdsMaxFights:
         gAdsNoFight = true
         warn "FOV: CONCEDING the field of view while aiming. " &
              $gAdsConsecFails & " consecutive ADS-in endpoints failed to " &
@@ -2913,18 +2987,32 @@ proc applyFov() =
   # sample below is taken on a frame this mod did not write, so any delta
   # between consecutive lines is somebody else's write, and the cadence answers
   # "once, or continuously?" without a detour.
-  if gAdsNoFight and wantAds:
-    if gAdsProbeN < AdsProbeMax and bCamFov.ok:
+  # ---- ONE SHOT, THEN WATCH.  This is both the experiment and the fix.
+  #
+  # The endpoint was written exactly once, on the settle tick. From here until
+  # the player lowers the weapon this mod writes NOTHING, and samples instead.
+  # So the log answers "does a single write HOLD, or snap back, and after how
+  # many frames" directly, in frames, with dt on every line -- which is the
+  # measurement asked for, and which no amount of reading the game's code can
+  # produce. Repeating the write every frame would destroy exactly this
+  # information, and is also what the player experiences as the fight.
+  if wantAds and gAdsBase > 0.0 and not gAdsObserving:
+    if gHoldProbeN < AdsProbeMax and bCamFov.ok:
       a.reset()
       let s = callFloat(bCamFov, cam, a)
-      gAdsProbeN = gAdsProbeN + 1
-      info "FOV: writer probe " & $gAdsProbeN & "/" & $AdsProbeMax &
-           " -- aiming, this mod wrote NOTHING this frame; " &
-           "Camera.fieldOfView reads " & $s & " (previous sample " &
-           $gAdsPrev & ", delta " & $fabsf(s - gAdsPrev) & ", dt " & $dt &
-           "). A non-zero delta here is ANOTHER writer, measured, not inferred."
+      gHoldProbeN = gHoldProbeN + 1
+      let fld = (if cm != nil and fovReadable(cm, int(OffCamMgrFov) + 4):
+                   $fovFloatAt(cm, OffCamMgrFov) else: "unreadable")
+      info "FOV: hold probe " & $gHoldProbeN & "/" & $AdsProbeMax &
+           " -- frame " & $gHoldProbeN & " after the ONE-SHOT write of " &
+           $gAdsPendTarget & "; no write since. Camera.fieldOfView " & $s &
+           ", CameraManager._fov " & fld & ", delta-to-our-endpoint " &
+           $fabsf(s - gAdsPendTarget) & ", delta-to-game's-own " &
+           $fabsf(s - gAdsBase) & ", dt " & $dt & ". " & gAdsFieldState
       gAdsPrev = s
       gCurFov = s
+    return
+  if gAdsNoFight and wantAds:
     return
 
   # ---- WHO OWNS THE FIELD OF VIEW RIGHT NOW.
@@ -2988,6 +3076,49 @@ proc applyFov() =
         gAdsPendTarget = endpoint
         gAdsPendGameFov = gAdsBase
         gAdsPendPath = "defer-to-game, settled"
+
+        # ---- INPUT-SIDE INJECTION: write the GAME's OWN field, not the
+        # camera's output.
+        #
+        # The 40-sample probe measured Camera.fieldOfView perfectly stable
+        # (delta 0.0 on every frame) while this mod wrote nothing, so there is
+        # NO per-frame writer -- the game assigns the ADS value once. What the
+        # earlier "78.4% back toward the game's value in one frame" measured was
+        # therefore a re-assertion PROVOKED BY OUR WRITE: something notices
+        # Camera.fieldOfView no longer agrees with CameraManager._fov and
+        # converges it back. If that is the mechanism, then writing _fov itself
+        # makes the game converge to OUR number and hold there, which is the
+        # input-side injection -- and it is a plain float field write, not a
+        # detour, so it costs no RVA row and cannot collide with another hook.
+        #
+        # Never blind: _fov is read first and must corroborate what the camera
+        # already told us, and the write is readback-verified by the helper.
+        if cfgAdsWriteFovField and cm != nil and
+           fovReadable(cm, int(OffCamMgrFov) + 4):
+          let fovField = fovFloatAt(cm, OffCamMgrFov)
+          if fovField < 10.0 or fovField > 180.0 or
+             fabsf(fovField - gAdsBase) > 2.0:
+            # The offset is metadata-confirmed, so a disagreement here is not a
+            # bad offset -- it is a different CameraManager, or an ADS fov this
+            # mod did not actually observe. Either way it is not a thing to
+            # write to. Refuse loudly; the camera write still happens.
+            gAdsFieldState = "REFUSED -- CameraManager._fov@0xF8 reads " &
+                             $fovField & ", which is not the settled ADS fov " &
+                             $gAdsBase & " the camera reported. Not writing a " &
+                             "field whose value we cannot corroborate."
+            if gAdsFieldRefusals == 0: warn "FOV: " & gAdsFieldState
+            gAdsFieldRefusals = gAdsFieldRefusals + 1
+          elif fovWriteFloat(cm, OffCamMgrFov, endpoint) != 0'i32:
+            gAdsFieldWrites = gAdsFieldWrites + 1
+            gAdsFieldState = "WROTE CameraManager._fov@0xF8 = " & $endpoint &
+                             " (was " & $fovField & "), readback-verified"
+            if gAdsFieldWrites == 1: info "FOV: " & gAdsFieldState
+          else:
+            gAdsFieldState = "REFUSED -- CameraManager._fov@0xF8 is not " &
+                             "writable, or the value did not read back. " &
+                             "Nothing was changed."
+            if gAdsFieldRefusals == 0: warn "FOV: " & gAdsFieldState
+            gAdsFieldRefusals = gAdsFieldRefusals + 1
         gAdsVerdict = "LEARNED -- the game ramped its own FOV from " &
                       $gAdsStart & " to " & $gAdsBase & " over " &
                       $(gAdsObsT * 1000.0) & " ms with this mod writing " &
@@ -3976,6 +4107,19 @@ proc reportWatch() =
        "which is exactly the player's 'the scale we zoom-in ads fov with is " &
        "wrong'. Applying the multiplier to the settled value gets the right " &
        "number; it does not get ownership of the field."
+  info "    input-side write: " & gAdsFieldState & " (" & $gAdsFieldWrites &
+       " written, " & $gAdsFieldRefusals & " refused). Camera.fieldOfView is " &
+       "written ONCE per aim-in, on the tick the game's own ramp settles, and " &
+       "never again while aiming -- so the 'hold probe' lines that follow " &
+       "measure whether a single write survives, in frames."
+  info "    the honest knob: because the game computes ADS fov as " &
+       "base - AimDeltaFov (75.0 - 15.0 = 60.0, matching the measured " &
+       "60.00136), a MULTIPLIER is the wrong user-facing shape -- x0.89 means " &
+       "different things at different base FOVs and cannot be reasoned about. " &
+       "A DELTA ('ADS fov = base - 15 - X') matches how the game models it " &
+       "and is predictable. The multipliers are kept for now because they are " &
+       "what the deployed config and the settings UI already carry; changing " &
+       "the knob is a separate, deliberate change and is NOT smuggled in here."
   if gAdsNoFight:
     warn "    ADS field of view: CONCEDED after " & $gAdsConsecFails &
          " lost transitions. Hip FOV still applied; opticFovMulti and " &
