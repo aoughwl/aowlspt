@@ -116,7 +116,12 @@
     "MOD REJECTED BY THE PLATFORM, not broken: ",
     "TO ENABLE IT, ask the backend once: ",
     "NOT SELECTED -- it is in the registry, but no active mod list ",
-    "the backend named no verdict (a manager older than this host). "
+    "the backend named no verdict (a manager older than this host). ",
+    "playerActuation",
+    "pact: armed. ",
+    "pact magcycle: COMPLETE -- ",
+    "EFT.GamePlayerOwner::TranslateCommand",
+    "PlayerInventoryController::LoadMagazine"
    ]
   },
   {

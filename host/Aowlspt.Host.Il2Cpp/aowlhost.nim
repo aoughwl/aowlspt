@@ -1447,6 +1447,14 @@ var gRpStartSlotA = -1
 var gRpStartSlotB = -1
 var gBotDiag = false
 var gBotDiagFires = 0
+## PLAYER ACTUATION (`pact.nim`): the slot of its ONE detour, a READ-ONLY
+## capture on `EFT.GamePlayerOwner::LateUpdate` @0xB29130 (UNIQUE, owners=1)
+## that records the `this` register and does nothing else. Declared here beside
+## the other detour slots because `attachDrain` above must be able to assign it.
+## Nothing else in this repo detours that RVA, so the double-detour trampoline
+## hazard does not apply; if that ever changes, pact must ride the existing
+## detour as a drain rather than bind a second one.
+var gPactOwnerSlot = -1
 ## One-shot guard for the full-list census. The per-registration detour now does
 ## only minimal single-hop work; the whole-list walk (the expensive, most
 ## fault-prone read) runs exactly once, after the list has had a few
@@ -3577,6 +3585,14 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
     dpT = cDpNow()
     camDrainTick()
     cDpAdd(DpCam, dpT)
+    # IN-RAID ACTUATION OF THE LOCAL PLAYER. Rides THIS drain; the only detour
+    # it owns is the read-only GamePlayerOwner capture. Must run AFTER
+    # `rpDrainTick`, whose DEPLOYED verdict it reads as a CACHED value -- it
+    # never re-evaluates the phase, because its own body is already inside ONE
+    # `aowl_p_p_seh` (`aowl_pact_tick_guarded`) and that guard is not
+    # re-entrant. Flag `playerActuation`, default OFF; idle cost with it off is
+    # one boolean compare and no call into the game.
+    pactDrainTick()
     dpT = cDpNow()
     natEspDrainTick()
     cDpAdd(DpNatEsp, dpT)
@@ -3658,6 +3674,12 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
     return 0'i32
   if i == gRpStartSlotB:
     rpStartFired(regs, 1'i32)
+    return 0'i32
+  # PLAYER ACTUATION's receiver capture, by identity. It stores ONE register
+  # value and returns; it writes no game state and must never suppress the
+  # original LateUpdate.
+  if i == gPactOwnerSlot:
+    pactOwnerFired(regs)
     return 0'i32
   # OFFLINE SCAV-CAP LIFT: the one-shot BotSpawner.MaxBots=0 poke, by identity. It
   # writes one int32 and must never suppress the original AddPlayer.
@@ -5151,6 +5173,8 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
     gRpStartSlotA = int(claimed)
   elif kind == 21:
     gRpStartSlotB = int(claimed)
+  elif kind == 22:
+    gPactOwnerSlot = int(claimed)
   else:
     gDrainSlot = int(claimed)
   tablesUnlock()
@@ -5160,7 +5184,7 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
        kind == 7 or kind == 8 or kind == 9 or kind == 10 or
        kind == 11 or kind == 12 or kind == 13 or kind == 14 or kind == 15 or
        kind == 16 or kind == 17 or kind == 18 or kind == 19 or
-       kind == 20 or kind == 21:
+       kind == 20 or kind == 21 or kind == 22:
     discard
   else:
     gDrainMethod = spec
@@ -5171,7 +5195,8 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
             kind == 6 or kind == 7 or kind == 8 or kind == 9 or
             kind == 10 or kind == 11 or kind == 12 or kind == 13 or
             kind == 14 or kind == 15 or kind == 16 or kind == 17 or
-            kind == 18 or kind == 19 or kind == 20 or kind == 21: "" else:
+            kind == 18 or kind == 19 or kind == 20 or kind == 21 or
+            kind == 22: "" else:
            "; it runs more than once a frame, so its firing count is not a " &
            "frame count")
   return true
@@ -6247,6 +6272,21 @@ include "raidphase.nim"
 ## installs NO detour: `camDrainTick` rides the `TarkovApplication::Update`
 ## drain and `camRenderTick` rides the render drain.
 include "camera.nim"
+
+## IN-RAID ACTUATION OF THE LOCAL PLAYER -- walk / look / fire / aim / pose /
+## lean, the `ECommand` input channel (reload, weapon swap, inventory) and the
+## magazine unload+load cycle, so a test needs nobody at the keyboard.
+## `include`d AFTER `raidphase.nim` (it gates every actuation on `rpDeployed`),
+## after `debugui.nim` (it borrows `gDuGameWorld` rather than adding a second
+## world-acquisition path) and after `inspect.nim` (`iUnityAlive`, `iKlassOf`).
+## Its whole body is inside ONE `aowl_p_p_seh`; `pactDrainTick` rides the
+## `TarkovApplication::Update` drain. Flag `playerActuation`, default OFF.
+##
+## THE BOT DRIVE PATH DOES NOT TRANSFER, and that is measured rather than
+## assumed: `mods/sain/client/drivecalls.nim` drives a `BotOwner` through
+## BotMover/BotSteering/ShootData field offsets the local `EFT.Player` does not
+## have. See the header of `abi/aowlspt_pact.h`.
+include "pact.nim"
 
 ## THE NATIVE-UI TOOLKIT -- `nuPanel`/`nuLabel` plus a generation-checked handle
 ## table, the layer a mod actually calls. MOVED AHEAD OF `natesp.nim`: it now
@@ -7641,6 +7681,12 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   # (both default OFF) and byte-verifies its 15 targets against the startup
   # prologue snapshot. It installs no detour and resolves no name at runtime.
   camBind()
+  # IN-RAID PLAYER ACTUATION. `pactBind` reads `playerActuation` itself (default
+  # OFF) and does nothing else here: every byte-verify and the one capture
+  # detour happen on the main-thread drain, where GameAssembly.dll is mapped by
+  # construction. Asking at DLL-attach would read "no module" and latch that as
+  # a verdict about the build, which is a fact about WHEN we asked.
+  pactBind()
   gBotDiag = readBoolKey("botDiag")
   if gBotDiag:
     info "botDiag is set: a READ-ONLY detour on EFT.GameWorld.RegisterPlayer " &
