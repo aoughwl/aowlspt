@@ -134,6 +134,22 @@ TABLES = [
         "users": ["host/Aowlspt.Host.Il2Cpp/aowlscene.nim"],
         "accessors": ["cSceneFn", "cSceneName", "cSceneRva"],
     },
+    # The camera API's fifteen Camera/Transform accessors, indexed positionally
+    # from camera.nim by the annotated CamT* constants. Getter and setter of the
+    # same property sit adjacent here (get_fieldOfView/set_fieldOfView,
+    # get_position/set_position, ...), which is exactly the shift that would be
+    # invisible without this check: calling `set_position` with `get_position`'s
+    # sret shape hands the setter a retbuf pointer where it expects `this`.
+    {
+        "mode": "positional",
+        "header": "abi/aowlspt_camera.h",
+        "array": "aowl_cam_targets",
+        "const_prefix": "CamT",
+        "const_file": "host/Aowlspt.Host.Il2Cpp/camera.nim",
+        "expect_file": None,
+        "users": ["host/Aowlspt.Host.Il2Cpp/camera.nim"],
+        "accessors": ["cCamFn", "cCamName", "cCamRva"],
+    },
     {
         "mode": "positional",
         "header": "abi/aowlspt_modetext.h",
