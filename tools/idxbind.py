@@ -610,7 +610,15 @@ def check_keymap(t, verbose):
         inconclusive.append("%s: user file not found" % t["user_file"])
         return
 
-    rows = re.findall(r'SainRvaRow\(\s*key:\s*"([^"]+)"', src)
+    # Two KINDS of bound row, one namespace of keys. `SainRvaRow` is a call at
+    # a byte-verified RVA; `SainRvaFieldRow` is a guarded field read. They bind
+    # differently and are checked identically on purpose: from the call site's
+    # point of view a key either binds something or it does not, and a key that
+    # is a field row AND a stated refusal is the same latent bug as a key that
+    # is a call row and a stated refusal. Adding the field table to `rows` here
+    # is what makes the duplicate check and the unreferenced check cover it.
+    rows = (re.findall(r'SainRvaRow\(\s*key:\s*"([^"]+)"', src) +
+            re.findall(r'SainRvaFieldRow\(\s*key:\s*"([^"]+)"', src))
     refs = re.findall(r'SainRvaRefusal\(\s*key:\s*"([^"]+)"', src)
     # A `keyed(...)` call site, on one line or wrapped onto two. Both forms
     # occur in live.nim and matching only the first would under-count `used`,

@@ -45,11 +45,32 @@
 ## resolved cleanly (unique RVA, real body, prologue captured) but are
 ## deliberately left UNBOUND.
 ##
-## **The runtime behaviour of this mod is unchanged by that work.** No key moved
-## from refused to bound, because binding a key changes what `live.nim` does and
-## none of it could be tested offline. Every DRIVE call -- GoToPoint, Sprint,
-## Stop, Shoot, and the medical `TryApply*` family -- remains refused on purpose:
-## a wrong pick there does not fail, it moves a bot.
+## ## The field rows now have a consumer (this is the change)
+##
+## `sainRvaFieldRows` promotes NINE of those measured offsets into keyed,
+## bindable rows -- pPhysical, phStamina, mcSprint, boMemory, memGoalEnemy,
+## medFirstAid, medStims, medSurgery, wmReady -- and `live.nim` reads them
+## through a guarded field path. Two ALREADY-BOUND RVA rows, `memUnderFire` and
+## `surgHave`, become reachable for the first time as a consequence, because the
+## receiver they needed was the thing that was missing. `stNormal` likewise:
+## stamina is readable end to end.
+##
+## **Every one of these is a READ.** There is no write path and no drive call in
+## the field mechanism at all -- `resolveFromRva` fills a read descriptor and
+## only `callObj`/`callBoolOn` consume it, so "no drive call was wired" is a
+## property of the shape rather than a promise about the contents. Every DRIVE
+## call -- GoToPoint, Sprint, Stop, Shoot, and the medical `TryApply*` family --
+## remains refused on purpose: a wrong pick there does not fail, it moves a bot.
+##
+## Three easy-looking wins are REFUSED on RECEIVER grounds, and that is the
+## sharpest thing in this change: `wGrenades` (the call site holds a GameWorld,
+## the field is BotWeaponManager's), `boAiming` (readable, but its only consumer
+## matches the address against a hook that can never fire, so binding it would
+## report success for a dead sensor), and `stimHave` (the receiver now arrives,
+## but the base body's ownership of BotStimulators is unmeasured). A field read
+## off the wrong object does not fault; it answers.
+##
+## The whole path stays behind `sainRvaTable`, which is DEFAULT OFF.
 ##
 ## ## Provenance
 ##
@@ -145,16 +166,55 @@ type
     ## so every one of those capabilities is recoverable -- by reading, not by
     ## calling.
     ##
-    ## NOTHING CONSUMES THIS TABLE YET. It is recorded as data so the next
-    ## session does not re-derive it, and so that wiring it up is a review of
-    ## numbers that are already written down rather than fresh archaeology.
-    ## Wiring it requires the same guard discipline as any other hop:
-    ## `aowl_is_readable` on the receiver AND on the value read back.
+    ## THIS TABLE IS STILL PURE ARCHAEOLOGY -- it is keyless and nothing binds
+    ## from it. Nine of its offsets have since been PROMOTED into
+    ## `sainRvaFieldRows` below, which is the keyed, bindable, consumed table.
+    ## The two are kept apart on purpose: a measurement is not a binding, and
+    ## collapsing them would make "measured" and "wired" the same claim again.
+    ## Three offsets here are deliberately NOT promoted (Grenades, IsReady's
+    ## sibling AimingManager, GetPlayer) and the refusals say why for each.
     owner*: string       ## the declaring type, exactly as metadata names it
     field*: string       ## the field name, exactly as metadata names it
     off*: int            ## byte offset from the object base
     ftype*: string       ## the field's declared type
     note*: string
+
+  SainRvaFieldRow* = object
+    ## A KEYED, BINDABLE field read -- the consumer `SainRvaField` never had.
+    ##
+    ## `SainRvaField` above is archaeology: a measured offset with no key and no
+    ## call site, recorded so nobody re-derives it. This type is the other half.
+    ## It carries a `SainBindings` key, so `tools/idxbind.py` treats it exactly
+    ## like a `SainRvaRow` -- a key that is both a field row and a refusal fails
+    ## the build, and a field row no `keyed(...)` site consumes fails it too.
+    ##
+    ## WHY A SEPARATE PATH AND NOT AN RVA ROW. There is no function to call and
+    ## therefore no prologue to verify. The verification that replaces it is
+    ## narrower and is stated per row: the offset came from
+    ## `Il2CppMetadataRegistration.fieldOffsets`, and five of the offsets in this
+    ## family are independently corroborated by prologues already in this file
+    ## (`get_Medecine` compiles to `mov rax,[rcx+0x2C8]`, and `Medecine` is
+    ## measured at 0x2C8). A field read cannot dispatch to the wrong body,
+    ## cannot be shared with 146 other methods, and cannot be detoured out from
+    ## under us. What it CAN do is read the right offset off the WRONG OBJECT,
+    ## and that is the entire risk surface:
+    ##
+    ## **`recv` is load-bearing.** It names the type the call site must already
+    ## be holding, and every row here was checked against the receiver its
+    ## `live.nim` call site actually passes. Three members that would otherwise
+    ## have been easy wins are REFUSED on exactly this ground -- `wGrenades`
+    ## (the site passes a GameWorld, the field is BotWeaponManager's) among
+    ## them. Readability is not type identity, and this build gives us no way to
+    ## ask; the chain is the proof, so every row is reachable only by walking
+    ## from a receiver another bound row or field row produced.
+    key*: string         ## the `SainBindings` field this fills
+    label*: string       ## "EFT.Player.Physical@0x9D8", for the log
+    recv*: string        ## the type the receiver MUST be; see above
+    off*: int            ## byte offset from the object base
+    kind*: FastKind      ## fkPtr for a reference, fkBool for a bool, ...
+    needsPlayer*: bool   ## receiver must be an EFT.Player, not a look-alike
+    unityObj*: bool      ## receiver is a UnityEngine.Object: check m_CachedPtr
+    why*: string         ## the measurement and the receiver argument
 
   SainRvaCandidate* = object
     ## A member that RESOLVED cleanly offline but is deliberately NOT bound.
@@ -438,6 +498,134 @@ proc sainRvaFields*(): seq[SainRvaField] =
     off: 0x290, ftype: "AimingManager",
     note: "<AimingManager>k__BackingField; the post-1.0 home of aim state")
 
+proc emptyRvaFieldRow*(): SainRvaFieldRow =
+  SainRvaFieldRow(key: "", label: "", recv: "", off: 0, kind: fkNone,
+                  needsPlayer: false, unityObj: false, why: "")
+
+proc sainRvaFieldRows*(): seq[SainRvaFieldRow] =
+  ## The nine sensors that move from REFUSED to BOUND by reading a field.
+  ##
+  ## Every offset here is one of `sainRvaFields`' measurements, promoted to a
+  ## key. Nothing new was derived; what is new is the `recv` column and the
+  ## argument in each `why` for why the call site's receiver is that type.
+  ##
+  ## READ-ONLY BY CONSTRUCTION. There is no write path for a field row anywhere
+  ## in `live.nim`; `resolveFromRva` fills a read descriptor and the only
+  ## consumers are `callObj` and `callBoolOn`. No drive call is expressible
+  ## here, which is a stronger statement than "none is present".
+  result = @[]
+
+  # --- Physical / stamina. `bridge.readStamina` holds `l.player`, and
+  # `l.player` is what `pIsAI`/`pPosition` (both needsPlayer rows) are already
+  # called on -- so if the receiver were not an EFT.Player the seven bound
+  # EFT.Player rows would already be reading garbage. Same receiver, same
+  # standing.
+  result.add SainRvaFieldRow(key: "pPhysical", label: "EFT.Player.Physical@0x9D8",
+    recv: "EFT.Player", off: 0x9D8, kind: fkPtr, needsPlayer: true,
+    unityObj: true,
+    why: "public instance field of type PhysicalBase; THE post-1.0 replacement " &
+         "for the ABSENT get_Physical. Receiver at the call site is " &
+         "`BotLive.player`, the same object the seven needsPlayer RVA rows " &
+         "already take. EFT.Player derives from MonoBehaviour, so liveness is " &
+         "checked via m_CachedPtr before the chain continues")
+  result.add SainRvaFieldRow(key: "phStamina",
+    label: "PhysicalBase.Stamina@0x68",
+    recv: "PhysicalBase", off: 0x68, kind: fkPtr, needsPlayer: false,
+    unityObj: false,
+    why: "public instance field; THE replacement for the ABSENT get_Stamina. " &
+         "Receiver is whatever pPhysical returned, so the type is established " &
+         "by the walk rather than assumed. Its value is exactly the receiver " &
+         "the ALREADY-BOUND Stamina::get_NormalValue @0x1CB0720 wants, which " &
+         "is what makes stamina readable END TO END for the first time. " &
+         "Siblings HandsStamina@0x70 and Oxygen@0x78 are the same type, so an " &
+         "off-by-8 here would read a plausible number -- the offset is taken " &
+         "verbatim from fieldOffsets, never counted by hand")
+  # `mcSprint` is bound to PhysicalBase._sprinting, NOT to a MovementContext.
+  # Its former call sites passed a MovementContext, which is a DIFFERENT object
+  # with different offsets; those two sites were changed to walk through
+  # pPhysical instead. That is the receiver rule applied, not worked around.
+  result.add SainRvaFieldRow(key: "mcSprint",
+    label: "PhysicalBase._sprinting@0xD9",
+    recv: "PhysicalBase", off: 0xD9, kind: fkBool, needsPlayer: false,
+    unityObj: false,
+    why: "a bool field. Replaces the AMBIGUOUS get_IsSprintEnabled, which " &
+         "could not be resolved without a live MovementContext. Receiver is " &
+         "the PhysicalBase pPhysical returned -- the two call sites in " &
+         "bridge.nim and driver.nim were CHANGED from a MovementContext " &
+         "receiver to this one, because reading 0xD9 off a MovementContext " &
+         "would be a foreign read that faults nowhere and answers wrongly")
+
+  # --- Bot memory. Receiver is `BotLive.owner`, the same object the five bound
+  # `EFT.BotOwner::get_*` rows are called on.
+  result.add SainRvaFieldRow(key: "boMemory", label: "EFT.BotOwner.Memory@0x60",
+    recv: "EFT.BotOwner", off: 0x60, kind: fkPtr, needsPlayer: false,
+    unityObj: true,
+    why: "public instance field of type BotMemory. The NAME get_Memory is " &
+         "refusable and was refused: the only one in the image is " &
+         "MemoryMetricCollector::get_Memory, a profiler counter on a " &
+         "341-owner RVA. The field is not that member under another name, it " &
+         "is the bot's memory. Its value is the receiver the ALREADY-BOUND " &
+         "BotMemory::get_IsUnderFire @0x24DEEC0 wants, so memUnderFire -- a " &
+         "row that has been bound and unreachable -- becomes readable")
+  result.add SainRvaFieldRow(key: "memGoalEnemy",
+    label: "EFT.BotMemory._goalEnemy@0x60",
+    recv: "EFT.BotMemory", off: 0x60, kind: fkPtr, needsPlayer: false,
+    unityObj: false,
+    why: "replaces the AMBIGUOUS get_GoalEnemy. Receiver is what boMemory " &
+         "returned. Feeds the two bound EnemyInfo rows (enPerson, enPosition). " &
+         "NOTE the coincidence that BotOwner.Memory and BotMemory._goalEnemy " &
+         "are BOTH at 0x60: they are different types and the walk is what " &
+         "keeps them apart, so a dropped hop would read an EnemyInfo off a " &
+         "BotOwner and not fault. The chain is validated hop by hop for " &
+         "exactly this reason")
+
+  # --- Medical. Receiver is the BotMedecine that the ALREADY-BOUND, UNIQUE
+  # BotOwner::get_Medecine @0x80ECC0 returned -- the strongest receiver
+  # provenance in this table, since it comes from a one-owner getter.
+  result.add SainRvaFieldRow(key: "medFirstAid",
+    label: "BotMedecine.FirstAid@0x18",
+    recv: "BotMedecine", off: 0x18, kind: fkPtr, needsPlayer: false,
+    unityObj: false,
+    why: "public field of type BotFirstAid; replaces the ABSENT get_FirstAid. " &
+         "Its value is the receiver the already-bound faHave " &
+         "(BotAbstractMedsToPart::get_HaveSmth2Use @0x8D1B80) wants")
+  result.add SainRvaFieldRow(key: "medStims",
+    label: "BotMedecine.Stimulators@0x20",
+    recv: "BotMedecine", off: 0x20, kind: fkPtr, needsPlayer: false,
+    unityObj: false,
+    why: "public field of type BotStimulators; replaces the ABSENT " &
+         "get_Stimulators. Reaching the component is NOT the same as reading " &
+         "it: stimHave stays refused, see its entry")
+  result.add SainRvaFieldRow(key: "medSurgery",
+    label: "BotMedecine.SurgicalKit@0x28",
+    recv: "BotMedecine", off: 0x28, kind: fkPtr, needsPlayer: false,
+    unityObj: false,
+    why: "public field of type BotSurgicalKit; replaces the ABSENT " &
+         "get_SurgicalKit. Its value is the receiver the already-bound " &
+         "BotSurgicalKit::get_HaveWork @0x1A24F20 wants, so surgHave -- bound " &
+         "and unreachable until now -- becomes readable")
+
+  # --- Weapon readiness.
+  result.add SainRvaFieldRow(key: "wmReady",
+    label: "BotWeaponManager.<IsReady>@0x80",
+    recv: "BotWeaponManager", off: 0x80, kind: fkBool, needsPlayer: false,
+    unityObj: false,
+    why: "<IsReady>k__BackingField. Resolves the AMBIGUOUS get_IsReady without " &
+         "picking among same-named getters on other classes -- the ambiguity " &
+         "was never about the field, only about the NAME. Receiver is what " &
+         "the bound, UNIQUE BotOwner::get_WeaponManager @0x80F040 returned")
+
+proc findRvaFieldRow*(rows: seq[SainRvaFieldRow]; key: string;
+                      hit: var SainRvaFieldRow): bool =
+  ## Linear over a literal table, once per member per session.
+  result = false
+  var i = 0
+  while i < rows.len:
+    if rows[i].key == key:
+      hit = rows[i]
+      return true
+    inc i
+
 proc emptyRvaCandidate*(): SainRvaCandidate =
   SainRvaCandidate(symbol: "", rva: 0, prologue: "", argc: 0'i32, owners: 0,
                    virt: "", why: "")
@@ -487,16 +675,11 @@ proc sainRvaRefusals*(): seq[SainRvaRefusal] =
   result = @[]
 
   # --- ABSENT: no such name in the image, at any arity.
-  result.add SainRvaRefusal(key: "pPhysical", symbol: "get_Physical",
-    why: swAbsent, detail: "no METHOD named get_Physical exists in the image " &
-    "at any arity (all 31282 types, EXHAUSTIVE) -- because on this build it " &
-    "was never a property. EFT.Player.Physical is a public FIELD at 0x9D8 of " &
-    "type PhysicalBase. RECOVERABLE by field read; see sainRvaFields")
-  result.add SainRvaRefusal(key: "phStamina", symbol: "get_Stamina",
-    why: swAbsent, detail: "no METHOD named get_Stamina exists at any arity. " &
-    "PhysicalBase.Stamina is a public FIELD at 0x68, and the object it holds " &
-    "is exactly the receiver the ALREADY-BOUND Stamina::get_NormalValue " &
-    "@0x1CB0720 wants. RECOVERABLE by field read; see sainRvaFields")
+  #
+  # `pPhysical`, `phStamina`, `medFirstAid`, `medStims` and `medSurgery` USED to
+  # be refused here. They are now BOUND, as field rows, in `sainRvaFieldRows`.
+  # None of them became a method; the members are still absent. What changed is
+  # that the read no longer needs one.
   result.add SainRvaRefusal(key: "boAiming", symbol: "get_AimingData",
     why: swAbsent, detail: "no method named get_AimingData exists at any " &
     "arity. The typed aim postfix in sain.nim therefore has no way to " &
@@ -506,19 +689,17 @@ proc sainRvaRefusals*(): seq[SainRvaRefusal] =
     "an `Aiming`, whose get_IsReady is @0x1AD48C0. All three are measured and " &
     "sit in sainRvaCandidates, deliberately unbound. The class literally " &
     "named BotAimingData is NOT it: no field or getter anywhere in the image " &
-    "returns one, so it is unreachable and is not the replacement")
-  result.add SainRvaRefusal(key: "medFirstAid", symbol: "get_FirstAid",
-    why: swAbsent, detail: "no METHOD named get_FirstAid exists at any arity. " &
-    "BotMedecine.FirstAid is a public FIELD at 0x18, off the BotMedecine the " &
-    "already-bound BotOwner::get_Medecine @0x80ECC0 returns. RECOVERABLE")
-  result.add SainRvaRefusal(key: "medStims", symbol: "get_Stimulators",
-    why: swAbsent, detail: "no METHOD named get_Stimulators exists at any " &
-    "arity. BotMedecine.Stimulators is a public FIELD at 0x20. RECOVERABLE")
-  result.add SainRvaRefusal(key: "medSurgery", symbol: "get_SurgicalKit",
-    why: swAbsent, detail: "no METHOD named get_SurgicalKit exists at any " &
-    "arity. BotMedecine.SurgicalKit is a public FIELD at 0x28, and its value " &
-    "is the receiver the already-bound BotSurgicalKit::get_HaveWork " &
-    "@0x1A24F20 wants. RECOVERABLE")
+    "returns one, so it is unreachable and is not the replacement. " &
+    "DELIBERATELY STILL REFUSED although the read is now trivially available: " &
+    "EFT.BotOwner.<AimingManager> is a FIELD at 0x290 and the call site holds " &
+    "a BotOwner, so binding it would succeed and return a plausible pointer. " &
+    "It is refused because of what the ONLY consumer does with it -- " &
+    "driver.nim caches the returned ADDRESS as `aimKey` and matches it against " &
+    "readings the typed postfix on EFT.BotAimingData::get_IsReady deposits. " &
+    "That hook is on a class nothing in the image ever returns, so it never " &
+    "fires and the key can never match. Binding this would therefore report a " &
+    "successful read for a sensor that is still dead: a check that cannot " &
+    "fail (CLAUDE.md 9b). Re-point the hook first, then bind")
 
   # --- WRONG ARITY: the name is here, at an arity this mod never calls.
   result.add SainRvaRefusal(key: "hcBodyPart", symbol: "GetBodyPartHealth",
@@ -555,23 +736,23 @@ proc sainRvaRefusals*(): seq[SainRvaRefusal] =
     "arity 0, bool, UNIQUE -- in sainRvaCandidates")
 
   # --- WRONG OWNER / SHARED beyond evidence.
-  result.add SainRvaRefusal(key: "boMemory", symbol: "get_Memory",
-    why: swOwner, detail: "the only get_Memory in the image is EFT.Utilities." &
-    "MemoryMetricCollector::get_Memory -- a profiler counter, not a bot's " &
-    "memory -- and its RVA has 341 owners. Binding it would read a garbage " &
-    "field off a BotOwner. The bot's memory is not reachable from this NAME, " &
-    "but it IS reachable: EFT.BotOwner.Memory is a public FIELD at 0x60 of " &
-    "type BotMemory, and BotMemory._goalEnemy is a FIELD at 0x60 of type " &
-    "EnemyInfo. So memUnderFire (already bound) and memGoalEnemy are BOTH " &
-    "RECOVERABLE by field read; see sainRvaFields")
+  #
+  # `boMemory` used to be refused here on the strength of the NAME being wrong.
+  # That measurement still stands and the name is still refused; the KEY is now
+  # bound as a field row instead, which is a different route to the same datum.
   result.add SainRvaRefusal(key: "wGrenades", symbol: "get_Grenades",
-    why: swShared, detail: "get_Grenades exists only on BotWeaponManager, not " &
-    "on the world this mod reads it off, and its RVA has 147 owners. " &
-    "Consequence: cdAvoidGrenade stays unreachable through this NAME. " &
-    "MEASURED, the 147-owner body at 0x690CB0 is `mov rax,[rcx+0x58]; ret` " &
-    "and BotWeaponManager.<Grenades>k__BackingField is at exactly 0x58, so " &
-    "reading the field is byte-identical to calling it, with no sharedness " &
-    "question. RECOVERABLE by field read; see sainRvaFields")
+    why: swOwner, detail: "REFUSED ON RECEIVER GROUNDS, which is a stronger " &
+    "and more specific reason than the sharedness this row used to cite. " &
+    "MEASURED: BotWeaponManager.<Grenades>k__BackingField is at 0x58 and the " &
+    "147-owner body at 0x690CB0 is literally `mov rax,[rcx+0x58]; ret`, so " &
+    "the sharedness question is moot and the field read is available. It is " &
+    "NOT taken, because live.nim's `grenadeList` passes the GAMEWORLD as the " &
+    "receiver, not a BotWeaponManager. Reading offset 0x58 off a GameWorld " &
+    "would be readable, would not fault, and would answer with whatever " &
+    "GameWorld keeps there -- a foreign read is the one failure mode a field " &
+    "row has, and this is it. Consequence unchanged: cdAvoidGrenade stays " &
+    "unreachable. RECOVERABLE only by changing the call site to walk " &
+    "BotOwner -> WeaponManager -> Grenades, which is a call-site decision")
 
   # --- NOT RESOLVABLE OFFLINE: instantiated generics.
   result.add SainRvaRefusal(key: "listCount", symbol: "List<Player>::get_Count",
@@ -618,31 +799,33 @@ proc sainRvaRefusals*(): seq[SainRvaRefusal] =
   result.add SainRvaRefusal(key: "aiBotOwner", symbol: "get_BotOwner",
     why: swAmbiguous, detail: "several owners match name and arity; which one " &
     "AIData holds cannot be decided without a live receiver")
-  result.add SainRvaRefusal(key: "mcSprint", symbol: "get_IsSprintEnabled",
-    why: swAmbiguous, detail: "owner ambiguous without a live MovementContext")
   result.add SainRvaRefusal(key: "hcAlive", symbol: "get_IsAlive",
     why: swAmbiguous, detail: "owner ambiguous without a live " &
     "HealthController. Consequence: every player is treated as alive")
   result.add SainRvaRefusal(key: "boBotsGroup", symbol: "get_BotsGroup",
     why: swAmbiguous, detail: "owner ambiguous without a live BotOwner. " &
     "Consequence: the squad layer falls back to same-faction-within-radius")
-  result.add SainRvaRefusal(key: "memGoalEnemy", symbol: "get_GoalEnemy",
-    why: swAmbiguous, detail: "owner ambiguous without a live BotMemory")
   result.add SainRvaRefusal(key: "enVisible", symbol: "get_IsVisible",
     why: swAmbiguous, detail: "owner ambiguous without a live EnemyInfo")
   result.add SainRvaRefusal(key: "enCanShoot", symbol: "get_CanShoot",
     why: swAmbiguous, detail: "owner ambiguous without a live EnemyInfo")
-  result.add SainRvaRefusal(key: "wmReady", symbol: "get_IsReady",
-    why: swAmbiguous, detail: "owner ambiguous without a live weapon manager")
   result.add SainRvaRefusal(key: "rlBullets", symbol: "get_BulletCount",
     why: swAmbiguous, detail: "owner ambiguous without a live BotReload")
   result.add SainRvaRefusal(key: "grPosition", symbol: "Throwable::get_Position",
     why: swAmbiguous, detail: "unreachable anyway: wGrenades is refused, so " &
     "no grenade is ever in hand to read a position off")
   result.add SainRvaRefusal(key: "stimHave", symbol: "get_HaveSmth2Use",
-    why: swAmbiguous, detail: "the BotAbstractMedsToPart body IS bound (see " &
-    "faHave), but medStims is ABSENT so no stimulator component is ever " &
-    "reached to call it on")
+    why: swAmbiguous, detail: "the OLD reason -- 'medStims is ABSENT so no " &
+    "stimulator component is ever reached' -- IS NO LONGER TRUE: medStims is " &
+    "now bound as a field row and a BotStimulators receiver does arrive here. " &
+    "The remaining reason is narrower and is the honest one: the bound body " &
+    "at 0x8D1B80 is BotAbstractMedsToPart::get_HaveSmth2Use, and whether " &
+    "BotStimulators DERIVES from BotAbstractMedsToPart is UNMEASURED. " &
+    "'Stimulators' and 'meds to a body part' are not obviously the same " &
+    "hierarchy, and a non-virtual call into a base body on a receiver that " &
+    "does not derive from it reads that base's field offsets off a foreign " &
+    "object. One resolver run on the parent chain settles it; until then this " &
+    "refuses. Consequence: canUseStims stays false")
 
 proc findRvaRow*(rows: seq[SainRvaRow]; key: string; hit: var SainRvaRow): bool =
   ## Linear over 23 rows, called once per member at bind time. Capped by
