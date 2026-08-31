@@ -31,6 +31,12 @@
   "colorBot": "E6463C",
   "colorPlayer": "46BEFF",
 
+  "_placement": "widgetAnchor 'manual' keeps mapX/mapY as the absolute top-left, which is what every existing config already means -- nobody's widget moves. Any corner value turns mapX/mapY into an INSET from that corner, resolved each frame against the MEASURED back buffer and clamped on-screen.",
+  "widgetAnchor": "manual",
+  "widgetBorder": true,
+  "widgetBorderPx": 2.0,
+  "widgetBackdropOpacity": 1.0,
+
   "_fullscreen": "The full-screen map, on a key. hotkeys is OFF by default: with it off NOTHING is polled -- GameAssembly is not even looked up -- and the key does nothing. Turning it on binds UnityEngine.Input::GetKeyDown at a byte-verified RVA and reads one key per Unity tick. It never CAPTURES input, so there is nothing that can stay captured if it faults; press the key again or Escape to close.",
   "hotkeys": false,
   "fullscreenKey": "M",
