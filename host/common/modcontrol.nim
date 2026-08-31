@@ -173,6 +173,16 @@ type
   IndexFn* = nil proc (guid: string): int
   LogFn* = nil proc (msg: string)
 
+  ReleasedFn* = nil proc (): bool
+    ## Whether the unload that just ran actually freed the library -- i.e.
+    ## whether the DLL file can now be overwritten by a rebuild.
+    ##
+    ## This is a SEPARATE question from "did the unload succeed", and the two
+    ## were conflated until a live run proved they differ: `completed=1`,
+    ## `epoch=1`, `unloaded Bot AI` in the log, and `cannot create regular file:
+    ## Device or resource busy` at the shell. Everything the host measured said
+    ## the reload worked; the one thing the user wanted was impossible.
+
   QuiesceFn* = nil proc (): int32
     ## Whether the host is at a point where freeing a library is safe.
     ##
@@ -218,6 +228,10 @@ type
       ## the start and, until this, was read in exactly one place: the `hot`
       ## column of `replyListed`. It decorated a list. It gated nothing, and the
       ## two DLLs that took the client down were both unflagged.
+    released*: ReleasedFn
+      ## Asked immediately after a successful unload; see `ReleasedFn`. Nil
+      ## means the host cannot measure it, and `released` then stays 0 rather
+      ## than being credited -- "I could not look" is not a release.
     quiesce*: QuiesceFn
       ## Asked immediately before each unload; see `QuiesceFn`. Nil means the
       ## host has no notion of a safe point and every unload proceeds -- which
@@ -289,15 +303,28 @@ var gRlAttempted = 0
 var gRlCompleted = 0
 var gRlRefused = 0
 var gRlDeferred = 0
+var gRlReleased = 0
+  ## Unloads after which the DLL file was actually writable again. This is the
+  ## number that means "a code swap is possible"; `completed` only ever meant
+  ## "the teardown ran". They were the same counter until a live run showed
+  ## completed=1 next to a locked file, which is the §9b shape exactly: a
+  ## success report for something that could not happen.
 var gRlEpoch = 0
   ## Bumped once per COMPLETED unload+load pair's unload half. A mod that prints
   ## this on load prints a different number every reload; if it prints the same
   ## number twice, the library did not actually change over and "it reloaded" was
   ## indistinguishable from "nothing happened".
 
-proc hotReloadCounters*(): (int, int, int, int, int) =
-  ## attempted / completed / refused / deferred / epoch.
-  result = (gRlAttempted, gRlCompleted, gRlRefused, gRlDeferred, gRlEpoch)
+proc hotReloadCounters*(): (int, int, int, int, int, int) =
+  ## attempted / completed / released / refused / deferred / epoch.
+  ##
+  ## `released` sits next to `completed` on purpose and not instead of it: the
+  ## gap between the two is the diagnosis. completed>0 with released==0 is "the
+  ## teardown works and something still holds the module"; both zero is "the
+  ## unload never ran". Collapsing them into one number would hide the first
+  ## case, which is the one that actually happened.
+  result = (gRlAttempted, gRlCompleted, gRlReleased, gRlRefused, gRlDeferred,
+            gRlEpoch)
 
 proc hotReloadEpoch*(): int = gRlEpoch
 
@@ -306,7 +333,7 @@ var gOps: HostOps = HostOps(count: nil, guidOf: nil, nameOf: nil,
                             versionOf: nil, pathOf: nil, liveOf: nil,
                             flagsOf: nil, indexOf: nil, canUnload: nil,
                             load: nil, unload: nil, log: nil,
-                            hotOf: nil, quiesce: nil)
+                            hotOf: nil, quiesce: nil, released: nil)
 var gHostName = ""
 var gHostVersion = ""
 var gSide = 0'i32
@@ -890,6 +917,16 @@ proc doUnload(p: Pending): bool =
   if err.len == 0:
     inc gRlCompleted
     inc gRlEpoch
+    # Credited ONLY on a measured release. A nil `released` seam means the host
+    # cannot tell, and cannot-tell is not a pass.
+    if gOps.released != nil and gOps.released():
+      inc gRlReleased
+    else:
+      if gOps.log != nil:
+        gOps.log("hotreload: " & p.guid & " unloaded but its library was NOT " &
+                 "released -- the teardown ran and the file is still locked, " &
+                 "so a rebuilt DLL cannot replace it. See the NOT RELEASED " &
+                 "line above for the write-probe error.")
     answer(p.guid, "unload", true, false, "", moOk, "")
   else:
     # `deferred`, not `refused`: everything that stops an unload here is

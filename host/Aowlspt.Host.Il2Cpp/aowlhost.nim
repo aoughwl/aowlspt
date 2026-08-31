@@ -1446,7 +1446,7 @@ var gQuietRun = 0
 ## always printed -- an all-zero start would make "nothing has been attempted"
 ## silent, and a run with zero reloads must say so rather than look like a run
 ## whose log line was lost. Zero attempts is INCONCLUSIVE and has to be visible.
-var gRlLast = (-1, -1, -1, -1, -1)
+var gRlLast = (-1, -1, -1, -1, -1, -1)
 
 ## The render-phase drain's slot, method and proof, mirroring the update drain's
 ## fields above. `-1` until a render-phase target binds. Kept entirely separate
@@ -6776,7 +6776,19 @@ proc dropModRegistrations(index: int) =
   # handles -- `sain` does -- should produce 0 here, so a non-zero count from one
   # that believes it cleans up is the bug report, and a silent zero would be
   # indistinguishable from never having looked.
-  okLog "released " & $freed & " GC handle(s) still held by mod slot " & $index
+  # Worded so the ZERO case cannot be misread. The first version said "released
+  # 0 GC handle(s) still held by mod slot 1", which a reader (and a relayed
+  # excerpt that clipped the leading count) took as "handles are still held" --
+  # i.e. as the cause of a locked DLL, which it was not. A diagnostic that reads
+  # as an accusation when it is reporting success costs more than it gives.
+  if freed == 0:
+    okLog "hotreload: mod slot " & $index & " held no GC handles at teardown " &
+          "(it released its own, which is what a well-behaved mod does)"
+  else:
+    warn "hotreload: mod slot " & $index & " still held " & $freed &
+         " GC handle(s) at teardown; the host has freed them. The mod's own " &
+         "on_unload should have -- this count is a bug report against the mod, " &
+         "not against the unload."
 
   # Under the lock, because the drain runs on the game thread and may be part
   # way through this same list while a mod is being unloaded.
@@ -6929,6 +6941,15 @@ proc opsLive(i: int): bool = modhost.modIsLive(i)
 proc opsFlags(i: int): uint32 = modhost.modFlagsOf(i)
 proc opsIndex(guid: string): int = modhost.modIndexOf(guid)
 
+proc opsReleased(): bool =
+  ## Did the last unload actually free the library? Both halves must agree: the
+  ## module must no longer be mapped AND the file must be writable. Either alone
+  ## has a false pass in it -- a path can be unwritable for reasons that have
+  ## nothing to do with us, and a module can be absent from the name lookup while
+  ## a handle keeps the file open.
+  result = not modhost.lastReleaseStillMapped() and
+           modhost.lastReleaseCode() == 0'i32
+
 proc opsHot(i: int): bool =
   ## Whether the mod at `i` declared AOWLSPT_MOD_HOT_RELOADABLE.
   ##
@@ -7027,7 +7048,8 @@ proc startModControl() =
                                  flagsOf: opsFlags, indexOf: opsIndex,
                                  canUnload: opsCanUnload, load: opsLoad,
                                  unload: opsUnload, log: opsLog,
-                                 hotOf: opsHot, quiesce: opsQuiesce))
+                                 hotOf: opsHot, quiesce: opsQuiesce,
+                                 released: opsReleased))
 
 # --------------------------------------------------------------- runtime
 
@@ -7920,6 +7942,11 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   # construction. Asking at DLL-attach would read "no module" and latch that as
   # a verdict about the build, which is a fact about WHEN we asked.
   pactBind()
+  # DEFAULT OFF, and it must stay off until the probe has said what the refcount
+  # is. It drops references until the module unmaps, which is the right fix for
+  # "something took a reference and never gave it back" and a way to unmap a
+  # library out from under a legitimate holder for every other cause.
+  modhost.setForceRelease(readBoolKey("modForceRelease"))
   gBotDiag = readBoolKey("botDiag")
   if gBotDiag:
     info "botDiag is set: a READ-ONLY detour on EFT.GameWorld.RegisterPlayer " &
@@ -9297,8 +9324,15 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
     let rl = modcontrol.hotReloadCounters()
     if rl != gRlLast:
       gRlLast = rl
-      info "hot reload: attempted=" & $rl[0] & " completed=" & $rl[1] &
-           " refused=" & $rl[2] & " deferred=" & $rl[3] & " epoch=" & $rl[4]
+      # `hotreload:` with no space is the grep handle. Measured complaint from a
+      # live run: a plain search for "refus" in this log is dominated by rdcache
+      # and natesp, so the two lines that mattered were buried. Every line this
+      # feature writes carries this prefix and nothing else in the host does.
+      info "hotreload: attempted=" & $rl[0] & " completed=" & $rl[1] &
+           " released=" & $rl[2] & " refused=" & $rl[3] &
+           " deferred=" & $rl[4] & " epoch=" & $rl[5] &
+           (if rl[1] > rl[2]: "  <-- COMPLETED BUT NOT RELEASED: the teardown " &
+                              "ran and the DLL is still locked" else: "")
     # And the answer, on the way back out. It rides the next poll of the same
     # route the desired set came in on -- see `publishReport`.
     publishReport(now)
