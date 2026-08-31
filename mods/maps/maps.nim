@@ -1058,6 +1058,38 @@ proc mapsDiagText(): string =
             "has expired yet. That is EXPECTED while every contact is still " &
             "in the feed: an indicator only ages once the feed STOPS " &
             "refreshing it"
+  elif (hudIndFadedDrawn() + hudPaneGhostsFaded()) == 0'i64 and hudFadeMs() == 0:
+    # A ZERO FADE WINDOW IS A SETTING, NOT A DEFECT. mm_fade_alpha returns 1.0
+    # up to the hold and 0.0 immediately after it, so no primitive at reduced
+    # alpha can EXIST. Reporting FAIL here would be a verdict on the player's
+    # own configuration, and it is exactly the shape §9b forbids: a check whose
+    # negative outcome was decided by something other than the code under test.
+    lLife = "INCONCLUSIVE  indicatorFadeMs is 0, so there is no ramp by " &
+            "construction: full alpha for " & $hudHoldMs() & "ms, then gone. " &
+            $hudIndExpired() & " track(s) were evicted, and NO faded primitive " &
+            "could ever be submitted at this setting. Raise indicatorFadeMs " &
+            "above 0 to exercise the decay"
+  elif (hudIndFadedDrawn() + hudPaneGhostsFaded()) == 0'i64 and
+       not hudLiveIndicators() and hudLiveMode() == 0:
+    # BOTH consumers of the decay are switched OFF -- the edge indicators by
+    # `indicators`, the ghost blips by the widget being in mode OFF. A switched
+    # off feature is INCONCLUSIVE, never FAIL: nothing could have faded, so
+    # nothing failed to. (This line used to report FAIL with hudIndicators
+    # false, which is a verdict no input could have changed.)
+    lLife = "INCONCLUSIVE  both surfaces that consume the decay are OFF " &
+            "(indicators=off, widget mode=off), so nothing could fade. " &
+            $hudIndExpired() & " track(s) still aged out correctly; the " &
+            "indicator loop declined " & $hudIndGatedOff() & " visit(s) at " &
+            "the on/overlay gate"
+  elif (hudIndFadedDrawn() + hudPaneGhostsFaded()) == 0'i64 and
+       hudIndVisits() == 0'i64 and hudGhostVisits() == 0'i64:
+    # (a) The loops were never entered for a live track. Distinct from "entered
+    # and culled" and from "computed and thrown away", which is the whole point
+    # of the three counters.
+    lLife = "INCONCLUSIVE  neither the indicator loop nor the pane ghost loop " &
+            "was entered for a single live track (indVisits=0, ghostVisits=0), " &
+            "so no decay could be computed. The draw itself is what did not " &
+            "run over these tracks -- look at the gate counters, not at the fade"
   elif (hudIndFadedDrawn() + hudPaneGhostsFaded()) == 0'i64:
     # THE CHECK THAT CAN FAIL (Â§9b). It asks the FINISHED STATE -- was a region
     # command actually SUBMITTED carrying a reduced alpha -- not whether a decay
@@ -1071,7 +1103,23 @@ proc mapsDiagText(): string =
             "; indicators submitted faded=" & $hudIndFadedDrawn() &
             "; decay COMPUTED " & $hudIndFaded() & " time(s)). A computed " &
             "alpha that never reaches a fill is the defect: contacts are " &
-            "disappearing abruptly instead of fading"
+            "disappearing abruptly instead of fading" &
+            # WHERE the control flow actually stopped. These four used to
+            # collapse into the single zero above, which is why three sessions
+            # read "the decay never runs" and could not say why.
+            ". WHERE IT STOPPED: indicator loop visited " & $hudIndVisits() &
+            " live track(s), declined " & $hudIndGatedOff() &
+            " at the on/overlay gate and " & $hudIndFiltered() &
+            " at the bot/player filter, and REACHED mm_fade_alpha " &
+            $hudIndAlphaCalc() & " time(s); the pane ghost loop saw " &
+            $hudGhostVisits() & " track(s) out of the feed, of which " &
+            $hudGhostZero() & " were ALREADY past hold+fade the first time it " &
+            "looked. Blackout rebases=" & $hudRebases() & " (" &
+            $hudRebasedTracks() & " track stamp(s) moved, worst gap " &
+            $hudRebaseMsMax() & "ms) -- a high ghostZero with rebases at 0 " &
+            "means the draw was starved while the clock ran; alphaCalc high " &
+            "with submitted at 0 means the culls below the calculation are " &
+            "eating it"
   else:
     lLife = "PASS  " & $hudPaneGhostsFaded() & " pane contact(s) and " &
             $hudIndFadedDrawn() & " indicator(s) were SUBMITTED at reduced " &

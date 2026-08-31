@@ -76,6 +76,13 @@ import world  # the Snapshot this file mirrors; no game memory is read here
  * and still fades; only its screen-relative placement is deferred a frame. */
 #define MHUD_PROJ_MAX 24
 
+/* A gap between two DRAWN frames longer than this is treated as a blackout --
+ * time in which the fade could not have been drawn, because the draw was not
+ * running -- and is given back to every live track's age. Chosen well above
+ * any plausible frame time (a 4 fps stutter is 250 ms) and well below the
+ * default 400 ms hold, so it can never swallow real fade time. */
+#define MHUD_BLACKOUT_MS 300
+
 /* The ONE spatial widget's mode. See the `mode` field's comment. */
 #define MHUD_MODE_OFF     0
 #define MHUD_MODE_RADAR   1
@@ -302,6 +309,62 @@ static struct {
      * All three are zero when nothing ever drops out of the feed -- which is
      * itself the answer to "is the feed event-driven or persistent?". */
     int64_t  indFaded, indExpired, indStale;
+
+    /* ---- WHY THE DECAY WAS NOT COMPUTED -----------------------------------
+     *
+     * `indFaded == 0` collapsed three completely different worlds into one
+     * zero, and the diag could not tell them apart:
+     *
+     *   (a) the loop was never entered for a live track at all,
+     *   (b) it was entered but every track was culled BEFORE mm_fade_alpha
+     *       (indicators off, overlay open, bot/player filter),
+     *   (c) alpha WAS computed and every value came back 1.0 -- i.e. no track
+     *       was ever seen mid-window.
+     *
+     * Each of those now has its own counter, incremented exactly where the
+     * control flow decides it, so a future zero names its own cause.
+     *
+     *   indVisits    live tracks the indicator loop reached (a)
+     *   indGatedOff  visits dropped by `!indicatorsOn || fsOn`            (b)
+     *   indFiltered  visits dropped by the showBots/showPlayers filter    (b)
+     *   indAlphaCalc visits that actually reached mm_fade_alpha           (c)
+     *
+     * And the ghost path on the pane, the same way:
+     *   ghostVisits  live tracks NOT in this publish's feed
+     *   ghostZero    ... of those, ones ALREADY past hold+fade the first
+     *                time the draw looked. A ghostZero with no ghosts is the
+     *                signature of time passing while the draw was NOT running.
+     */
+    int64_t  indVisits, indGatedOff, indFiltered, indAlphaCalc;
+    int64_t  ghostVisits, ghostZero;
+
+    /* ---- THE BLACKOUT REBASE ----------------------------------------------
+     *
+     * THE BUG. A track's age is wall clock since its last refresh, but the
+     * fade is only ever COMPUTED inside the draw -- and the draw has three
+     * gates in front of it (`enabled` off, a blocking UI panel, not in a
+     * raid) plus the ordinary case of the game being paused, stalled or
+     * alt-tabbed. Wall clock keeps running through all of them. So a track
+     * that was fresh when the draw stopped is, on the first frame the draw
+     * resumes, already older than hold+fade: it is evicted on that very frame
+     * WITHOUT the ramp ever being evaluated at an intermediate age. That is
+     * exactly the measured symptom -- tracks expired, decay computed zero
+     * times, no ghost ever submitted.
+     *
+     * The fix is to age tracks against time the draw could actually OBSERVE.
+     * On a resumed frame the unobserved gap is added back to every live
+     * track's stamp, bounded by the table size, so nothing is evicted for a
+     * window in which no fade could possibly have been drawn. Counted, so
+     * "the fade never ran because the draw was not running" is a reading and
+     * not an inference.
+     *
+     * `lastDrawMs` is 0 until the first ungated draw; the first frame
+     * therefore rebases nothing. */
+    int64_t  lastDrawMs;
+    int64_t  rebases;        /* resumed frames whose gap exceeded the budget */
+    int64_t  rebasedTracks;  /* live tracks whose stamp was moved forward */
+    int64_t  rebaseMsMax;    /* the biggest blackout observed, ms */
+
     int32_t  screenFromRegion; /* 1 = measured back buffer, 0 = config guess */
     int32_t  handle;
     /* PER-FRAME DRAW COST (bug 4), measured in microseconds on the render thread
@@ -1339,12 +1402,20 @@ static int32_t mhud_draw_pane_full(float px, float py, float size, float spanM,
             MmPt p2;
             if (!g_mhud.tr[i].live) continue;
             if (g_mhud.tr[i].seq == g_mhud.pubSeq) continue;  /* drawn above */
+            g_mhud.ghostVisits++;      /* a contact HAS dropped out of the feed */
             if (g_mhud.tr[i].bot && !g_mhud.showBots) continue;
             if (!g_mhud.tr[i].bot && !g_mhud.showPlayers) continue;
 
             alpha = mm_fade_alpha(now - g_mhud.tr[i].lastMs,
                                   g_mhud.holdMs, g_mhud.fadeMs);
-            if (alpha <= 0.0f) continue;   /* eviction is the indicator loop's */
+            if (alpha <= 0.0f) {
+                /* Already past hold+fade the FIRST time the draw looked at it.
+                 * With the blackout rebase in place this should be rare; a
+                 * ghostZero climbing while ghosts stays at 0 means the window
+                 * is degenerate (fadeMs = 0) or the draw is being starved. */
+                g_mhud.ghostZero++;
+                continue;   /* eviction is the indicator loop's */
+            }
 
             ex = g_mhud.tr[i].x; ez = g_mhud.tr[i].z;
             dy2 = g_mhud.tr[i].y - g_mhud.py;
@@ -1448,6 +1519,34 @@ static void mhud_draw(void* user, int64_t frame) {
         g_mhud.hasLocal = 1;
     }
     g_mhud.drawn++;
+
+    /* ---- AGE AGAINST OBSERVED TIME, NOT WALL CLOCK ------------------------
+     * See MHudState.lastDrawMs. Everything above this point can turn a
+     * dispatch away -- the master gate, the UI mask, the raid gate -- and the
+     * held-frame branch can return too. None of them stop the clock, so a gap
+     * here is time in which NO fade could have been drawn. Give it back to
+     * every live track before anything reads an age, so the ghost loop and
+     * the indicator loop both see the ramp instead of an instant expiry.
+     *
+     * Bounded: one pass over MHUD_MAX, no allocation. Only fires when the gap
+     * exceeds MHUD_BLACKOUT_MS, so ordinary frame-to-frame jitter (which the
+     * fade is supposed to absorb) is left alone. */
+    {
+        int64_t nowMs = mhud_now_ms();
+        int64_t gap   = (g_mhud.lastDrawMs > 0) ? (nowMs - g_mhud.lastDrawMs) : 0;
+        if (gap > MHUD_BLACKOUT_MS) {
+            int32_t t;
+            g_mhud.rebases++;
+            if (gap > g_mhud.rebaseMsMax) g_mhud.rebaseMsMax = gap;
+            for (t = 0; t < MHUD_MAX; t++) {
+                if (!g_mhud.tr[t].live) continue;
+                g_mhud.tr[t].lastMs += gap;
+                if (g_mhud.tr[t].lastMs > nowMs) g_mhud.tr[t].lastMs = nowMs;
+                g_mhud.rebasedTracks++;
+            }
+        }
+        g_mhud.lastDrawMs = nowMs;
+    }
     _t0 = mhud_now_us();
 
     mhud_screen(&scrW, &scrH);
@@ -1597,6 +1696,7 @@ static void mhud_draw(void* user, int64_t frame) {
         i = (g_mhud.projCursor + k) % MHUD_MAX;
 
         if (!g_mhud.tr[i].live) continue;
+        g_mhud.indVisits++;   /* the loop IS being entered for a live track */
 
         age = mhud_now_ms() - g_mhud.tr[i].lastMs;
         if (mm_fade_expired(age, g_mhud.holdMs, g_mhud.fadeMs)) {
@@ -1609,9 +1709,10 @@ static void mhud_draw(void* user, int64_t frame) {
          * an edge marker for it would be the same contact twice. The track is
          * still AGED and EVICTED above, so closing the overlay does not resume
          * a frozen set of indicators. */
-        if (!g_mhud.indicatorsOn || g_mhud.fsOn) continue;
-        if (g_mhud.tr[i].bot && !g_mhud.showBots) continue;
-        if (!g_mhud.tr[i].bot && !g_mhud.showPlayers) continue;
+        if (!g_mhud.indicatorsOn || g_mhud.fsOn) { g_mhud.indGatedOff++; continue; }
+        if (g_mhud.tr[i].bot && !g_mhud.showBots)     { g_mhud.indFiltered++; continue; }
+        if (!g_mhud.tr[i].bot && !g_mhud.showPlayers) { g_mhud.indFiltered++; continue; }
+        g_mhud.indAlphaCalc++;   /* mm_fade_alpha IS reached below */
 
         /* `indFaded` counts a decay that was COMPUTED. It is kept, because it is
          * still the right number for "is the ramp running at all", but it is NOT
@@ -1744,6 +1845,18 @@ static int64_t mhud_proj_deferred(void)   { return g_mhud.projDeferred; }
 static int64_t mhud_ind_faded_drawn(void)  { return g_mhud.indFadedDrawn; }
 static int64_t mhud_pane_ghosts(void)      { return g_mhud.paneGhosts; }
 static int64_t mhud_pane_ghosts_faded(void){ return g_mhud.paneGhostsFaded; }
+/* The four readings that split a zero `indFaded` into its causes, plus the
+ * two ghost-path ones and the blackout rebase. Read-only accessors on the
+ * same mirror the render thread writes; no state of their own. */
+static int64_t mhud_ind_visits(void)     { return g_mhud.indVisits; }
+static int64_t mhud_ind_gated_off(void)  { return g_mhud.indGatedOff; }
+static int64_t mhud_ind_filtered(void)   { return g_mhud.indFiltered; }
+static int64_t mhud_ind_alpha_calc(void) { return g_mhud.indAlphaCalc; }
+static int64_t mhud_ghost_visits(void)   { return g_mhud.ghostVisits; }
+static int64_t mhud_ghost_zero(void)     { return g_mhud.ghostZero; }
+static int64_t mhud_rebases(void)        { return g_mhud.rebases; }
+static int64_t mhud_rebased_tracks(void) { return g_mhud.rebasedTracks; }
+static int64_t mhud_rebase_ms_max(void)  { return g_mhud.rebaseMsMax; }
 
 /* ---- READBACK of the live mirror -------------------------------------- *
  *
@@ -1978,6 +2091,15 @@ proc cHudProjDeferred(): int64 {.importc: "mhud_proj_deferred", nodecl.}
 proc cHudIndFadedDrawn(): int64 {.importc: "mhud_ind_faded_drawn", nodecl.}
 proc cHudPaneGhosts(): int64 {.importc: "mhud_pane_ghosts", nodecl.}
 proc cHudPaneGhostsFaded(): int64 {.importc: "mhud_pane_ghosts_faded", nodecl.}
+proc cHudIndVisits(): int64 {.importc: "mhud_ind_visits", nodecl.}
+proc cHudIndGatedOff(): int64 {.importc: "mhud_ind_gated_off", nodecl.}
+proc cHudIndFiltered(): int64 {.importc: "mhud_ind_filtered", nodecl.}
+proc cHudIndAlphaCalc(): int64 {.importc: "mhud_ind_alpha_calc", nodecl.}
+proc cHudGhostVisits(): int64 {.importc: "mhud_ghost_visits", nodecl.}
+proc cHudGhostZero(): int64 {.importc: "mhud_ghost_zero", nodecl.}
+proc cHudRebases(): int64 {.importc: "mhud_rebases", nodecl.}
+proc cHudRebasedTracks(): int64 {.importc: "mhud_rebased_tracks", nodecl.}
+proc cHudRebaseMsMax(): int64 {.importc: "mhud_rebase_ms_max", nodecl.}
 proc cHudConfigurePane(mode: int32; zoom, opacity: cfloat; drawArt: int32;
                        contactPx: cfloat;
                        colBot, colPlayer, colSelf: uint32) {.
@@ -2068,6 +2190,18 @@ proc hudProjDeferred*(): int64 = cHudProjDeferred()
 proc hudIndFadedDrawn*(): int64 = cHudIndFadedDrawn()
 proc hudPaneGhosts*(): int64 = cHudPaneGhosts()
 proc hudPaneGhostsFaded*(): int64 = cHudPaneGhostsFaded()
+# The cause-splitting readings. See MHudState's "WHY THE DECAY WAS NOT
+# COMPUTED" comment: these exist so a zero fade count can never again mean
+# four different things at once.
+proc hudIndVisits*(): int64 = cHudIndVisits()
+proc hudIndGatedOff*(): int64 = cHudIndGatedOff()
+proc hudIndFiltered*(): int64 = cHudIndFiltered()
+proc hudIndAlphaCalc*(): int64 = cHudIndAlphaCalc()
+proc hudGhostVisits*(): int64 = cHudGhostVisits()
+proc hudGhostZero*(): int64 = cHudGhostZero()
+proc hudRebases*(): int64 = cHudRebases()
+proc hudRebasedTracks*(): int64 = cHudRebasedTracks()
+proc hudRebaseMsMax*(): int64 = cHudRebaseMsMax()
 
 # ---------------------------------------------------------------- map ART
 
