@@ -14,6 +14,16 @@ U='twill''its'
 D='mumfordand''miller.com'
 PAT="$U@$D"
 
+# MEASURED 2026-08-31: guarding only the full address is too narrow. A facts
+# dump carrying the BARE DOMAIN -- in a fact ABOUT the leak, with no local part
+# -- was committed and this hook correctly did not fire, because the full
+# address was genuinely absent. The domain alone still identifies, and the file
+# was headed for a PUBLIC docs site.
+#
+# So the domain is now refused on its own. The identity checks stay keyed on
+# the full address: a committer identity is an address, and the domain alone
+# cannot appear there without the address also appearing.
+
 fail=0
 
 ae=$(git var GIT_AUTHOR_IDENT 2>/dev/null)
@@ -29,11 +39,17 @@ case "$ce" in *"$PAT"*)
 esac
 
 # Staged content. --cached diff of what is about to be committed.
-if git diff --cached -U0 | grep -q "$PAT"; then
-  echo "pre-commit: REFUSED -- the personal address appears in staged content:" >&2
+#
+# Matched on the DOMAIN, which subsumes the full address -- so this one test
+# catches both, and catches the bare-domain case that got through before.
+if git diff --cached -U0 | grep -q "$D"; then
+  echo "pre-commit: REFUSED -- the personal domain appears in staged content:" >&2
   git diff --cached --name-only | while read -r f; do
-    if git show ":$f" 2>/dev/null | grep -q "$PAT"; then echo "    $f" >&2; fi
+    if git show ":$f" 2>/dev/null | grep -q "$D"; then echo "    $f" >&2; fi
   done
+  echo "  (redact it. tools/factexport.py shows the shape: reassemble the" >&2
+  echo "   pattern at runtime, never write it literally, and assert on the" >&2
+  echo "   FINISHED file rather than on the scrubbing you believe you did.)" >&2
   fail=1
 fi
 
