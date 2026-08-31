@@ -207,7 +207,7 @@ proc debugSchema(): seq[Setting] =
                     "drag: the host re-reads aowlspt-debugui.json while the " &
                     "markers are on screen."),
     intSetting("overlayToggleKey", "Toggle key (virtual-key code)", 114,
-               lo = 0, hi = 255, category = "Overlay",
+               lo = 0, hi = 255, category = "Overlay", keybind = true,
                description = "aowlspt original (F3 debug overlay). 114 is VK_F3, which is the Minecraft key and the shipped default. 0 disables the toggle."),
 
     # ---- the profiler ---------------------------------------------------
