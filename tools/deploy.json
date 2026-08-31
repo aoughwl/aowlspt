@@ -475,6 +475,8 @@
    "minBytes": 400000,
    "markers": [
     "aowl.maps",
+    "diag STILL NOT-PASS after ",
+    "Verbose diagnostics (the log firehose)",
     "/aowlspt/maps/index",
     "/aowlspt/maps/map/",
     "/aowlspt/maps/asset/",
@@ -685,7 +687,8 @@
    "minBytes": 100000,
    "markers": [
     "aowlspt-backend",
-    "listening on"
+    "listening on",
+    "verbose logging is OFF (the default)"
    ]
   },
   {

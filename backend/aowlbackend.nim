@@ -1336,8 +1336,19 @@ proc handleRequest(sock: uint64; buf: HostPtr; len: int32;
   var body = ""
   let tRoute = perfNow()
   # DIAGNOSTIC: every dispatched request, so a menu that stalls names what it
-  # was last waiting on. Remove once the freeze is understood.
-  modhost.info("REQ " & req.verb & " " & req.url)
+  # was last waiting on.
+  #
+  # This was `info`, i.e. unconditional, and it is the single largest source of
+  # noise in this log: MEASURED on a 182 s session, 890 of 1577 lines (56.4%,
+  # 4.9 lines/s) were this one statement, and 253 of those were the settings UI
+  # polling `/settings/client/sync` -- six times in one second. A polling UI
+  # logging every poll drowns everything that is not a poll.
+  #
+  # It is now `debug`: present in full when `--verbose` is passed, absent
+  # otherwise. Nothing else moved to debug. A route that FAILS still logs at
+  # its own level, so a quiet run still names a broken request -- what is gone
+  # is the record of the ones that worked.
+  modhost.debug("REQ " & req.verb & " " & req.url)
   let served1 = runRoute(route, req, body)
   perfAdd(PhaseRoute, tRoute)
   modhost.modLeave(route.modIndex)
@@ -1995,6 +2006,12 @@ aowlspt-backend -- the game backend
   --key PATH    TLS private key PEM (default <root>/aowlspt-tls-key.pem)
   --gen-cert    generate the self-signed cert+key and exit, without serving
   --db PATH     database JSON to load (default <root>/db.json)
+  --verbose, -v log every dispatched request (`REQ <verb> <url>`) and other
+                routine per-poll bookkeeping. DEFAULT OFF. Measured: with it on,
+                56% of this log is request lines at ~4.9 lines/s, because the
+                settings and mods panels poll continuously. Warnings, errors and
+                every verdict line are UNAFFECTED by this flag in both
+                directions -- a quiet log reaches the same conclusions.
   --once        serve until one request has been handled, then exit
   --perf        accumulate per-phase timings and print them at exit
   --selftest    serve, drive every route from inside this process, then exit
@@ -2083,6 +2100,7 @@ proc main(): int =
   var once = false
   var selftest = false
   var noLock = false
+  var verbose = false
   # TLS. `tlsMode` serves HTTPS (what a real post-1.0 client needs, on port 443
   # by default); the default stays plain HTTP so `emutest`/`realtest` and every
   # other tool keep speaking the wire they always did. `portSet` lets `--tls`
@@ -2187,6 +2205,13 @@ proc main(): int =
       # the server's, and rebuilding the instrument every time somebody asks
       # is how the answer goes back to being a guess.
       perfEnable()
+    elif a == "--verbose" or a == "-v":
+      # THE FIREHOSE, and it is opt-in. Default OFF, because the default log is
+      # the one a player sends us and 56% of it was per-poll request lines.
+      # This turns `modhost.debug` on and nothing else: no verdict, warning or
+      # error is gated on it in either direction, so a quiet log and a verbose
+      # log agree on every conclusion and differ only in bookkeeping.
+      verbose = true
     elif a == "--selftest":
       selftest = true
     elif a == "--store-flush":
@@ -2221,6 +2246,20 @@ proc main(): int =
   let logPath = joinPath(gRoot, "aowlspt-backend.log")
   openLog(logPath, HostName & " " & HostVersion & "\n" &
                    "root " & gRoot & "\n\n")
+  setLogVerbose(verbose)
+  # ANNOUNCE THE QUIET, at info, so a reader of a quiet log is never left to
+  # wonder whether the server handled no requests or merely did not say so.
+  # An instrument that is off and does not say it is off is how "no REQ lines"
+  # gets read as "the client never connected".
+  if verbose:
+    info "verbose logging is ON (--verbose): every dispatched request is " &
+         "logged as `REQ <verb> <url>`. This is the firehose; expect several " &
+         "lines per second while a settings or mods panel is open."
+  else:
+    info "verbose logging is OFF (the default): per-request `REQ` lines are " &
+         "NOT written. Their absence is this setting, not an idle server. " &
+         "Pass --verbose to get them. Warnings, errors and verdicts are " &
+         "unaffected and appear either way."
 
   # Before anything that spawns a thread or answers a request: a native fault in
   # the C net engine has no Nim handler above it and would otherwise leave the

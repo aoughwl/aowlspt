@@ -84,6 +84,7 @@ import aowlspt/settings   # the F12 schema this mod declares -- see `spatialSche
 import aowlspt/json as jr # field/asText -- the edited KEY out of a POST body
 import sp / world
 import sp / mapsprof
+import diagfilter   # the verdict-signature log filter; tested in tests/mapsdiag
 {.emit: """
 #include "sp/mapsprof.h"   /* prototypes only; sp/mapsprof.nim owns the state */
 """.}
@@ -845,6 +846,19 @@ proc spatialSchema(): seq[Setting] =
                               "suppressed, because every contact is already " &
                               "on the map at its true position"),
 
+    boolSetting("diagVerbose", "Verbose diagnostics (the log firehose)", false,
+                category = "Feed",
+                description = "OFF -- the default -- prints the full ~19-line " &
+                              "diag block on the FIRST tick and then only when " &
+                              "a VERDICT CHANGES, plus an all-PASS heartbeat " &
+                              "every 5 minutes and a warning naming any FAIL " &
+                              "or INCONCLUSIVE line every 60s for as long as " &
+                              "it lasts. Nothing is hidden by this: a not-PASS " &
+                              "verdict is LOUDER with it off than it was with " &
+                              "it on, because it is no longer buried in a wall " &
+                              "of repeated PASS. ON restores the old behaviour " &
+                              "exactly -- the whole block every 2 seconds, " &
+                              "which measured 40% of the entire host log."),
     boolSetting("hudRadar", "LEGACY: in-game radar", true, category = "Legacy",
                 description = "INERT unless `Map renderer` is `legacy` (or " &
                               "`auto` with `Spatial widget` still unwritten). " &
@@ -1351,7 +1365,15 @@ proc onPublishTick(payload: string): string =
 # session costs a handful of lines and a broken one cannot hide.
 
 var gDiagLast = ""
+  ## The last VERDICT SIGNATURE (see diagfilter.nim), NOT the last block text.
+  ## Holding the text here is what made the change-detection a check that could
+  ## not fail: the text carries counters and therefore always differed.
 var gDiagTicks = 0'i64
+var gDiagQuiet = 0'i64
+  ## Consecutive ticks on which the signature was unchanged.
+var gDiagVerbose = false
+  ## The `diagVerbose` setting. DEFAULT FALSE. True restores the old behaviour
+  ## exactly: the whole block, every tick, unconditionally.
 
 proc mapsDiagText(): string =
   ## Assembled from the FINISHED state -- the counters the collector and the
@@ -2148,9 +2170,46 @@ proc onDiagTick(payload: string): string =
   ## long-running stuck state cannot scroll away and be forgotten.
   inc gDiagTicks
   let text = mapsDiagText()
-  if gDiagLast.len == 0 or text != gDiagLast or (gDiagTicks mod 30'i64) == 0'i64:
-    gDiagLast = text
+  let sig = diagSignature(text)
+  let bad = diagNotPass(text)
+  if gDiagVerbose:
+    # THE FIREHOSE, opt-in. Byte-for-byte the old behaviour.
     info text
+  elif gDiagLast.len == 0 or sig != gDiagLast:
+    # A VERDICT MOVED -- or this is the first tick, which always prints in
+    # full, so a session broken from the very start still gets a whole report.
+    # Print the block, because context matters exactly when something has just
+    # changed, and then name the not-PASS lines on their OWN line at warn so
+    # they are greppable and cannot be lost inside eighteen lines of prose.
+    gDiagLast = sig
+    gDiagQuiet = 0'i64
+    info text
+    if bad.len > 0:
+      warn ModName & ": diag NOT-PASS: " & bad
+  else:
+    # NOTHING MOVED. This is the case that produced 40% of the host log.
+    inc gDiagQuiet
+    if bad.len > 0:
+      # A FAIL or INCONCLUSIVE is NEVER collapsed into an all-clear heartbeat
+      # and is never suppressed outright. It is re-announced at warn every 30
+      # ticks (60 s), naming itself, for as long as it lasts -- so it survives
+      # any amount of scrolling and a grep for FAIL still finds it in a quiet
+      # run. That is 1 line/60 s against the old 19 lines/2 s, and the FAIL is
+      # more visible than it was, not less: it is now on a line of its own at a
+      # higher level instead of buried mid-block.
+      if (gDiagQuiet mod 30'i64) == 0'i64:
+        warn ModName & ": diag STILL NOT-PASS after " & $gDiagQuiet &
+             " unchanged cycle(s) (" & $(gDiagQuiet * 2'i64) & "s): " & bad &
+             ". Turn on the `diagVerbose` setting for the full block every tick."
+    elif (gDiagQuiet mod 150'i64) == 0'i64:
+      # Everything reads PASS and has not moved. One line every 5 minutes, and
+      # it is a HEARTBEAT, not a verdict: it says the instrument is still
+      # running and how long the verdicts have stood. Pure silence here would
+      # be indistinguishable from a dead timer, which is the same "I could not
+      # look reads as a pass" failure this block exists to prevent.
+      info ModName & ": diag all-PASS, unchanged for " & $gDiagQuiet &
+           " cycle(s) (" & $(gDiagQuiet * 2'i64) & "s). The full block is " &
+           "re-printed the moment any verdict changes."
   # THE PHASE PROFILE, on the SAME 2s timer, and unconditional when the flag is
   # set: it is cumulative, so an unchanged line is still new information (the
   # means moved). It reports INCONCLUSIVE below its tick threshold rather than a
@@ -2571,6 +2630,7 @@ proc onLoad(): Status =
   # per bracket -- but it is still off by default and still announces itself
   # when it is on, because an instrument nobody knows is running is an
   # instrument whose cost gets attributed to the thing it is measuring.
+  gDiagVerbose = asBool(setting("diagVerbose"), false)
   let profOn = asBool(setting("profile"), false)
   mpSetEnabled(if profOn: 1'i32 else: 0'i32)
   if profOn:

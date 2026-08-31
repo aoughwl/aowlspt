@@ -658,6 +658,30 @@ proc logLine*(level, msg: string) =
   let text = "[" & fmtElapsed(int(elapsedMs())) & "] " & level & "  " & msg & NL
   sinkWrite(text)
 
+var gLogVerbose = false
+  ## THE VERBOSITY KNOB. Default FALSE -- quiet. It governs `debug` only; no
+  ## `info`, `warn`, `ok` or `error` line is ever suppressed by it, so turning
+  ## verbosity off can never hide a verdict or a failure. What it hides is
+  ## routine per-poll bookkeeping that is only interesting while something is
+  ## being debugged.
+
+proc setLogVerbose*(on: bool) =
+  gLogVerbose = on
+
+proc logVerbose*(): bool =
+  gLogVerbose
+
+proc debug*(msg: string) =
+  ## High-rate routine detail. DROPPED unless verbosity is on.
+  ##
+  ## Use this ONLY for a line that is bookkeeping -- "a request arrived", "a
+  ## tick ran". Never for a verdict, never for a failure, and never for the
+  ## sole evidence that a feature works: those must survive a quiet run, and a
+  ## line that only appears in verbose mode is a line that is absent from every
+  ## log a player ever sends us.
+  if gLogVerbose:
+    logLine("debug", msg)
+
 proc info*(msg: string) = logLine("info ", msg)
 proc warn*(msg: string) = logLine("warn ", msg)
 proc fail*(msg: string) = logLine("error", msg)

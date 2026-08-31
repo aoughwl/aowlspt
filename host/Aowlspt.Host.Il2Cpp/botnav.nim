@@ -501,19 +501,85 @@ proc bnRefresh(i: int; owner: Il2CppPtr; now: int64) =
         gBnReg[i].z = v[2]
   gBnReg[i].lastSeen = now
 
+# ---------------------------------------------------------------------------
+# ISSUE LOGGING: loud the first time, counted after that.
+#
+# `bnService` logged EVERY successful `SetSpeed` and `StopMove` at `ok`.
+# MEASURED on one 761 s host log: 9,201 lines -- 36.4% of the whole file, 12
+# lines/s -- were the single statement `botnav: bot id=N move speed -> N.NN`.
+# That is more of that log than the maps diag block and the backend's request
+# log put together.
+#
+# It is NOT gated away, because it is the only evidence in the log that botnav
+# is issuing anything at all, and a feature that works silently is the failure
+# mode this project treats as worst-case. Instead: the FIRST issue of each kind
+# announces itself in full, naming the bot and the value, and every issue after
+# that is counted into a rollup emitted at most once per 10 s.
+#
+# Precisely what survives, stated so nobody has to assume: the per-bot detail
+# line appears ONCE PER SESSION per kind -- these counters are session-scoped,
+# NOT reset per raid, because botnav has no per-raid reset hook to hang that on
+# and inventing one here would be a guess. What DOES appear in every raid that
+# has bot activity is the rollup, within 10 s of that raid's first issue,
+# carrying both the interval count and the session totals. So "botnav issued
+# commands in this raid" remains readable from a quiet log; "which bot, at what
+# speed, the first time" is a once-per-session detail. An issue that FAILS is
+# untouched by any of this and still logs at its own site.
+const BnRollupMs = 10000'i64
+
+var gBnSpeedTotal = 0'i64
+var gBnStopTotal = 0'i64
+var gBnSpeedSince = 0'i64
+var gBnStopSince = 0'i64
+var gBnRollupAt = 0'i64
+
+proc bnRollup(now: int64) =
+  ## One line for everything issued since the last one. Emitted only when
+  ## something WAS issued, so it is never a heartbeat for an idle raid -- an
+  ## idle raid is already described by the absence of issues after the first.
+  if gBnSpeedSince == 0'i64 and gBnStopSince == 0'i64:
+    return
+  if gBnRollupAt != 0'i64 and now - gBnRollupAt < BnRollupMs:
+    return
+  let prev = gBnRollupAt
+  gBnRollupAt = now
+  okLog "botnav: issued " & $gBnSpeedSince & " speed change(s) and " &
+        $gBnStopSince & " stop(s) in the last " &
+        $((if prev == 0'i64: BnRollupMs else: now - prev) div 1000'i64) & "s " &
+        "(session totals: " & $gBnSpeedTotal & " speed, " & $gBnStopTotal &
+        " stop). Per-issue lines are logged for the FIRST of each kind only; " &
+        "this rollup replaced 12 lines/s of them."
+  gBnSpeedSince = 0'i64
+  gBnStopSince = 0'i64
+
 proc bnService(i: int; owner: Il2CppPtr; now: int64) =
   ## Issue whatever this bot owes, at most once per `BnReissueMs`.
   if gBnReg[i].pend == 1'i32:
     gBnReg[i].pend = 0'i32
     if cBnStop(owner) != 0'i32:
-      okLog "botnav: bot id=" & $int(gBnReg[i].id) & " StopMove issued"
+      inc gBnStopTotal
+      if gBnStopTotal == 1'i64:
+        okLog "botnav: bot id=" & $int(gBnReg[i].id) & " StopMove issued " &
+              "(the FIRST of this session -- subsequent stops are counted " &
+              "into the 10s rollup instead of logged one per line)"
+      else:
+        inc gBnStopSince
+        bnRollup(now)
     return
   if gBnReg[i].pend == 2'i32:
     let s = gBnReg[i].pendSpeed
     gBnReg[i].pend = 0'i32
     if cBnSetSpeed(owner, s) != 0'i32:
-      okLog "botnav: bot id=" & $int(gBnReg[i].id) & " move speed -> " &
-            formatFloat(s, ffDecimal, 2)
+      inc gBnSpeedTotal
+      if gBnSpeedTotal == 1'i64:
+        okLog "botnav: bot id=" & $int(gBnReg[i].id) & " move speed -> " &
+              formatFloat(s, ffDecimal, 2) &
+              " (the FIRST of this session -- subsequent speed changes are " &
+              "counted into the 10s rollup instead of logged one per line, " &
+              "which was 12 lines/s and 36% of the host log)"
+      else:
+        inc gBnSpeedSince
+        bnRollup(now)
     # A speed change does not cancel a destination, so fall through rather than
     # return: a bot told "go there, at half speed" gets both on this same tick.
   if not gBnReg[i].hasCmd:

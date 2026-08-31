@@ -1,6 +1,7 @@
 {
   "enabled": false,
   "profile": false,
+  "diagVerbose": false,
   "hz": 10,
   "radiusM": 120,
   "hudRadar": true,
