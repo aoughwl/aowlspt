@@ -83,6 +83,10 @@ import aowlspt/sync
 import aowlspt/settings   # the F12 schema this mod declares -- see `spatialSchema`
 import aowlspt/json as jr # field/asText -- the edited KEY out of a POST body
 import sp / world
+import sp / mapsprof
+{.emit: """
+#include "sp/mapsprof.h"   /* prototypes only; sp/mapsprof.nim owns the state */
+""".}
 import sp / hud
 import sp / serve
 import sp / page
@@ -916,8 +920,17 @@ proc onMainTick(payload: string): string =
   ## labels. Everything expensive is the publish tick's job.
   if not gEnabled: return ""
   inc gTicks
+  # L0. The whole body, so every L1 phase can be summed against something it did
+  # not itself produce and the remainder named as UNEXPLAINED rather than
+  # silently attributed. mpNow()/mpAdd are no-ops when the profiler is off.
+  let tWhole = mpNow()
+  mpControl()
+  let tLock = mpNow()
   lockMod()
+  mpAdd(MpLock, tLock)
+  let tColl = mpNow()
   collect(gSnap)
+  mpAdd(MpCollect, tColl)
   gPending = true
   # The `heading` setting gates the ROTATION, not the measurement: the
   # heading is still read and still counted every collection, so
@@ -926,7 +939,9 @@ proc onMainTick(payload: string): string =
   # "the setting is off" and "the field is dead" produce the same diagnostic,
   # which is the ambiguity this mod keeps paying for.
   if not gHeadingOn: gSnap.hasHeading = false
+  let tPub = mpNow()
   if gHudOn: hudPublish(gSnap)   # same thread as the region's draw; see sp/hud.nim
+  mpAdd(MpPublish, tPub)
   # THE FULL-SCREEN MAP KEY. Unity's thread, which is where
   # `Input::GetKeyDown` belongs and the only thread it is ever called from. With
   # `hotkeys` off or the key unbound this is one compare and NOTHING is called
@@ -935,6 +950,7 @@ proc onMainTick(payload: string): string =
   # It is polled here rather than on the publish timer for two reasons: that
   # timer is not Unity's thread, and this tick is already gated on `enabled`, so
   # a disabled feature cannot open a panel over the player's raid.
+  let tFs = mpNow()
   if gHudOn and gFsHotkeysOn and gFsKeyKc >= 0:
     discard hudFsPoll(gFsKeyKc, true)
   elif hudFsOpen():
@@ -943,6 +959,8 @@ proc onMainTick(payload: string): string =
     # player now has no key to dismiss. This is the fault path too: if the poll
     # ever stops running for any reason, the overlay does not outlive it.
     hudFsClose()
+  mpAdd(MpFsPoll, tFs)
+  let tArt = mpNow()
   # The ART, on the same thread and after the mirror is filled. Gated on a
   # VALIDATED local position: binding a map from a position that failed
   # `mm_pos_classify` would pick a map by a number we already know is wrong.
@@ -961,7 +979,10 @@ proc onMainTick(payload: string): string =
      activeRaid(gSnap) and gSnap.localIdx >= 0 and gSnap.localIdx < gSnap.n:
     artTick(gSnap.ents[gSnap.localIdx].x, gSnap.ents[gSnap.localIdx].z,
             gSnap.locationId)
+  mpAdd(MpArt, tArt)
   unlockMod()
+  mpAdd(MpWhole, tWhole)
+  mpTick()
   result = ""
 
 var gClsHistLast = ""
@@ -1698,6 +1719,12 @@ proc onDiagTick(payload: string): string =
   if gDiagLast.len == 0 or text != gDiagLast or (gDiagTicks mod 30'i64) == 0'i64:
     gDiagLast = text
     info text
+  # THE PHASE PROFILE, on the SAME 2s timer, and unconditional when the flag is
+  # set: it is cumulative, so an unchanged line is still new information (the
+  # means moved). It reports INCONCLUSIVE below its tick threshold rather than a
+  # number, so "I could not look yet" cannot read as a pass.
+  if mpEnabled() != 0'i32:
+    info ModName & ": " & mapsProfLine()
   result = ""
 
 proc armFeed(): bool =
@@ -2088,6 +2115,22 @@ proc onLoad(): Status =
   if gHz < 1: gHz = 1
   if gHz > 30: gHz = 30
   gRadius = asFloat(setting("radiusM"), 120.0)
+  # THE PHASE PROFILER. Flag-gated, DEFAULT OFF (CLAUDE.md 5). It installs no
+  # detour, resolves no name and touches no game memory -- it is two QPC reads
+  # per bracket -- but it is still off by default and still announces itself
+  # when it is on, because an instrument nobody knows is running is an
+  # instrument whose cost gets attributed to the thing it is measuring.
+  let profOn = asBool(setting("profile"), false)
+  mpSetEnabled(if profOn: 1'i32 else: 0'i32)
+  if profOn:
+    info ModName & ": phase profiler ON. onMainTick is bracketed with " &
+         "QueryPerformanceCounter at three DISJOINT levels (tick phases, " &
+         "collect phases, per-entity phases), each summed against its own " &
+         "parent bracket so the unbracketed remainder is named as UNEXPLAINED " &
+         "rather than attributed. Every number is MICROSECONDS. It carries a " &
+         "positive control of 512 integer adds through the same bracket -- " &
+         "expected order 0.1-1.0us; 0.0us or milliseconds means the meter is " &
+         "lying and the line is VOID. One line every 2s on the diag timer."
   loadHudOpts()
 
   # Declared on BOTH sides, before the split -- see the block above `loadHudOpts`

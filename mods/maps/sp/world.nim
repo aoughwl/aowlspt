@@ -109,6 +109,7 @@
 
 import aowlspt
 import aowlspt/il2cpp
+import mapsprof
 
 # --------------------------------------------------------------------------
 # The host export, resolved through the OS loader rather than through anything
@@ -141,6 +142,7 @@ proc wGetProcAddress(module: Il2CppPtr; name: cstring): Il2CppPtr {.
 #include <string.h>
 #include "aowlspt_shim.h"
 #include "sp/mapmath.h"
+#include "sp/mapsprof.h"   /* prototypes only; sp/mapsprof.nim owns the state */
 
 static void*   sp_p_v  (void* f) { return ((void*  (*)(void))f)(); }
 static int32_t sp_i32_v(void* f) { return ((int32_t(*)(void))f)(); }
@@ -398,23 +400,44 @@ static int32_t sp_look_dir(void* player, int32_t mcOff, float* yaw) {
   return (int32_t)mm_heading_from_look(readable, v[0], v[1], v[2], yaw);
 }
 
+/* PERFORMANCE, WITH THE GUARD UNCHANGED. `aowl_is_readable` is a VirtualQuery,
+ * which in this process is a syscall walking a very large VAD tree -- and these
+ * two readers used to call it once PER UTF-16 CHARACTER: 8 for an id tail, up to
+ * 32 for a location key, on every collection, for every entity. So the whole
+ * span is checked ONCE first.
+ *
+ * That is not a weaker check. `aowl_is_readable(p, size)` already requires the
+ * ENTIRE range [p, p+size) to lie inside one committed, readable, non-guard
+ * region -- so a single span check is STRICTER than n per-character checks,
+ * which would each accept a different region. The only case the span check
+ * refuses and the loop accepted is a string straddling two adjacent committed
+ * regions, so the per-character loop is KEPT as the fallback and runs only
+ * then. Outcome-identical, one VirtualQuery instead of n in every real case. */
+static int32_t sp_rd_chars(void* s, int32_t chOff, int32_t first, int32_t take,
+                           char* out) {
+  int32_t i;
+  unsigned char* base = (unsigned char*)s + chOff + first * 2;
+  int32_t span = aowl_is_readable(base, take * 2);
+  for (i = 0; i < take; i++) {
+    unsigned short c = 0;
+    unsigned char* a = base + i * 2;
+    if (!span && !aowl_is_readable(a, 2)) { out[i] = 0; return i; }
+    memcpy(&c, a, 2);
+    out[i] = (c >= 32 && c < 127) ? (char)c : '?';
+  }
+  out[take] = 0;
+  return take;
+}
+
 static int32_t sp_rd_idtail(void* s, int32_t lenOff, int32_t chOff, char* out) {
-  int32_t n, take, i;
+  int32_t n, take;
   out[0] = 0;
   if (!s) return 0;
   if (!aowl_is_readable((unsigned char*)s + lenOff, 4)) return 0;
   memcpy(&n, (unsigned char*)s + lenOff, 4);
   if (n <= 0 || n > 4096) return 0;
   take = n > 8 ? 8 : n;
-  for (i = 0; i < take; i++) {
-    unsigned short c = 0;
-    unsigned char* a = (unsigned char*)s + chOff + (n - take + i) * 2;
-    if (!aowl_is_readable(a, 2)) { out[i] = 0; return i; }
-    memcpy(&c, a, 2);
-    out[i] = (c >= 32 && c < 127) ? (char)c : '?';
-  }
-  out[take] = 0;
-  return take;
+  return sp_rd_chars(s, chOff, n - take, take, out);
 }
 
 /* A System.String's HEAD, narrowed to ASCII, into `out` (>= cap bytes). Used
@@ -426,7 +449,7 @@ static int32_t sp_rd_idtail(void* s, int32_t lenOff, int32_t chOff, char* out) {
  * junk or an empty string, never a smuggled pointer. */
 static int32_t sp_rd_str(void* s, int32_t lenOff, int32_t chOff,
                          char* out, int32_t cap) {
-  int32_t n, take, i;
+  int32_t n, take;
   if (!out || cap <= 0) return 0;
   out[0] = 0;
   if (!s) return 0;
@@ -434,15 +457,7 @@ static int32_t sp_rd_str(void* s, int32_t lenOff, int32_t chOff,
   memcpy(&n, (unsigned char*)s + lenOff, 4);
   if (n <= 0 || n > 4096) return 0;
   take = n > (cap - 1) ? (cap - 1) : n;
-  for (i = 0; i < take; i++) {
-    unsigned short c = 0;
-    unsigned char* a = (unsigned char*)s + chOff + i * 2;
-    if (!aowl_is_readable(a, 2)) { out[i] = 0; return i; }
-    memcpy(&c, a, 2);
-    out[i] = (c >= 32 && c < 127) ? (char)c : '?';
-  }
-  out[take] = 0;
-  return take;
+  return sp_rd_chars(s, chOff, 0, take, out);
 }
 """.}
 
@@ -1290,6 +1305,10 @@ proc collectInner(snap: var Snapshot) =
   snap.localIdx = -1
   snap.hasHeading = false
   snap.heading = 0.0
+  # L2 PHASE 1 of 5. Closed on EVERY exit below, including the four early
+  # returns: a bracket that is only closed on the success path under-reports
+  # exactly the frames that went wrong, which is a check that cannot fail.
+  let tPre = mpNow()
   var ci = 0
   while ci < ClsCount:
     snap.cls[ci] = 0
@@ -1304,25 +1323,33 @@ proc collectInner(snap: var Snapshot) =
 
   if feedDisabled():
     snap.state = -1
+    mpAdd(MpCPre, tPre)
     return
 
   let st = gwState()
   snap.state = st
   if st != 3:
+    mpAdd(MpCPre, tPre)
     return
 
   let world = spPV(gFn)
   if world == nil:
+    mpAdd(MpCPre, tPre)
     # gwState said 3 and the very next read said nil. That is a race with the
     # host clearing its cache, not a fault -- do not spend fault budget on it.
     snap.state = 2
     return
   snap.inRaid = true
+  mpAdd(MpCPre, tPre)
 
   # The raid's map key, read from the live world. Guarded, capped, narrowed to
   # ASCII. A stale borrowed cache may still answer here, so this is used to
   # SELECT the map (bug: Woods was drawing Lighthouse art via a bounds guess),
   # NOT as the active-raid gate -- that is `localAlive` below.
+  # L2 PHASE 2 of 5. `sp_rd_str` VirtualQueries per UTF-16 CHARACTER, so this
+  # one field read is up to 32 VirtualQuery calls; that is exactly the kind of
+  # cost this bracket exists to make visible rather than to assume.
+  let tLoc = mpNow()
   block:
     let loc = rdPtr(world, GwLocationId)
     if loc != nil:
@@ -1336,7 +1363,10 @@ proc collectInner(snap: var Snapshot) =
           s.add lbuf[k]
           inc k
         snap.locationId = s
+  mpAdd(MpCLoc, tLoc)
 
+  # L2 PHASE 3 of 5.
+  let tLocal = mpNow()
   var localPtr = 0'u64
   let me = rdPtr(world, GwMainPlayer)
   var lok = false
@@ -1371,7 +1401,10 @@ proc collectInner(snap: var Snapshot) =
     snap.localIdx = 0
     snap.n = 1
     snap.ok = true
+  mpAdd(MpCLocal, tLocal)
 
+  # L2 PHASE 4 of 5. Closed on both of its early returns as well.
+  let tList = mpNow()
   # AllAlivePlayersList (List<Player>, concrete) first; RegisteredPlayers
   # (List<IPlayer>) only as a fallback.
   var list = rdPtr(world, GwAllAlive)
@@ -1379,6 +1412,7 @@ proc collectInner(snap: var Snapshot) =
   if list == nil:
     note("GameWorld player list (+0x1C8 / +0x1D0) read null")
     inc gFaults
+    mpAdd(MpCList, tList)
     return
 
   let items = rdPtr(list, ListItemsOff)
@@ -1386,8 +1420,13 @@ proc collectInner(snap: var Snapshot) =
   if items == nil or n < 0 or n > MaxListLen:
     note("player list size out of range (" & $n & ")")
     inc gFaults
+    mpAdd(MpCList, tList)
     return
+  mpAdd(MpCList, tList)
 
+  # L2 PHASE 5 of 5, and the L3 parent. ONE bracket around the WHOLE loop, so
+  # the per-entity rows below can be summed against it and the difference named.
+  let tEnts = mpNow()
   var i = 0
   while i < n and snap.n < MaxEntities:
     let p = rdPtr(items, ArrDataOff + i * 8)
@@ -1403,12 +1442,16 @@ proc collectInner(snap: var Snapshot) =
     var px = 0.0
     var py = 0.0
     var pz = 0.0
+    let tPos = mpNow()
     posOf(p, pok, px, py, pz)
+    mpAdd(MpEPos, tPos)
     if not pok: continue
     # AIData non-null => this player is a bot. A null read here is "not a bot",
     # which is the safe way round: a human mislabelled as a bot is a worse lie
     # on a radar than the reverse.
+    let tAi = mpNow()
     let bot = rdPtr(p, PlAIData) != nil
+    mpAdd(MpEAi, tAi)
     # The class walk is INDEPENDENT of the `bot` test above and runs whether or
     # not it succeeded. Deriving one from the other would make the pair agree by
     # construction, which is a consistency that proves nothing; keeping them
@@ -1416,14 +1459,22 @@ proc collectInner(snap: var Snapshot) =
     # or a non-bot classified Unknown (a dead walk -- a bug) and tell them apart.
     var eside = -1'i32
     var erole = -1'i32
+    let tCls = mpNow()
     let ecls = classOf(p, false, eside, erole)
+    mpAdd(MpECls, tCls)
+    let tId = mpNow()
+    let eid = idTailOf(p)
+    mpAdd(MpEId, tId)
+    let tStore = mpNow()
     snap.ents[snap.n] = Ent(x: px, y: py, z: pz, bot: bot, me: false,
                             cls: ecls, side: eside, role: erole,
-                            id: idTailOf(p), key: cast[uint64](p))
+                            id: eid, key: cast[uint64](p))
     inc snap.cls[ecls]
     inc gClsEver[ecls]
     inc snap.n
     snap.ok = true
+    mpAdd(MpEStore, tStore)
+  mpAdd(MpCEnts, tEnts)
 
 proc collect*(snap: var Snapshot) =
   ## Wrapper over `collectInner` whose ONLY job is that the reason tally is
