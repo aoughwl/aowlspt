@@ -3431,6 +3431,14 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
     # mode this whole change exists to remove. Idle cost when no world is
     # cached is one guarded pointer test plus one scene-name query per second.
     rpDrainTick()
+    # THE FEATURE-INDEPENDENT RAID-PHASE REPORT. Immediately after the tick that
+    # computes the phase, and gated by `raidPhaseLog` (default ON) and NOTHING
+    # else -- that is the whole point. With every optional feature off the host
+    # must still say whether we are in a raid; four performance bisects produced
+    # fast frame numbers that were later shown to be menu-only because the only
+    # reporter of this latch was behind `natEspDiag`. Formats already-computed
+    # state; it touches no game memory and opens no guard.
+    rpLogTick()
     # THE CAMERA API. Rides THIS drain; installs no detour of its own. Must run
     # AFTER `rpDrainTick`, because the free camera's end-of-raid exit reads the
     # phase that call just computed -- reading a one-frame-stale phase is
@@ -6057,6 +6065,13 @@ include "natraid.nim"
 ## `SessionEndUIScene` end-of-raid signal) and `debugui.nim` (whose
 ## `gDuGameWorld` it borrows). It installs NO detour, resolves NO address and
 ## writes nothing; `rpDrainTick` rides the `TarkovApplication::Update` drain.
+##
+## THE COST METER for that rider. `rpDrainTick` is the ONLY unconditional
+## per-frame rider that touches the game, so it is present in every arm of every
+## performance bisect and was in the budget of none of them. See
+## `abi/aowlspt_raidphase.h`: QPC brackets, a positive control on the same
+## clock, and a disjoint sub-decomposition that reports what it accounts for.
+{.emit: """#include "aowlspt_raidphase.h" """.}
 include "raidphase.nim"
 
 ## THE CAMERA API and the free camera built on it. `include`d AFTER
@@ -7753,6 +7768,12 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   # nothing, on purpose: it is the instrument the others are measured with, and
   # an instrument that can be disabled by the subject is not an instrument.
   ftConfigure()
+  # THE RAID-PHASE REPORT. ANDed with nothing, and default ON when the key is
+  # absent: like the frame meter this is an instrument, and an instrument that
+  # the subject can switch off is not one. Setting `raidPhaseLog` to false
+  # silences the line but does NOT stop the latch -- `rpDrainTick` stays
+  # unconditional.
+  rpConfigureLog(readBoolKeyDef("raidPhaseLog", true))
   gNeOn = readBoolKey("natEsp") and gNuOn
   gNeDiag = gNeOn and readBoolKey("natEspDiag")
   # THE PER-CLASS COLOURS, from `colorSetting(format="hex")`. Read ONCE here, at

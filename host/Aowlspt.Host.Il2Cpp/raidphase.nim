@@ -78,6 +78,48 @@ static void* aowl_rp_tick_guarded(void* a) {
 proc cRpTickGuarded(a: Il2CppPtr): Il2CppPtr {.
   importc: "aowl_rp_tick_guarded", nodecl.}
 
+# ---- the cost meter (abi/aowlspt_raidphase.h) -----------------------------
+# Statics plus QueryPerformanceCounter. Touches no game memory, resolves no
+# address, allocates nothing, opens NO SEH guard -- `rpDrainTick` already holds
+# the one guard this module is allowed and `aowl_p_p_seh` is not re-entrant.
+proc cRpCostBegin() {.importc: "aowl_rp_cost_begin", nodecl.}
+proc cRpCostEnd() {.importc: "aowl_rp_cost_end", nodecl.}
+proc cRpPhaseScene() {.importc: "aowl_rp_phase_scene", nodecl.}
+proc cRpSubBegin(s: int32) {.importc: "aowl_rp_sub_begin", nodecl.}
+proc cRpSubEnd(s: int32) {.importc: "aowl_rp_sub_end", nodecl.}
+proc cRpCtrlOut() {.importc: "aowl_rp_ctrl_out", nodecl.}
+proc cRpCtrlIn() {.importc: "aowl_rp_ctrl_in", nodecl.}
+proc cRpCtrlMeanNs(w: int32): int64 {.importc: "aowl_rp_ctrl_mean_ns", nodecl.}
+proc cRpCtrlMaxNs(w: int32): int64 {.importc: "aowl_rp_ctrl_max_ns", nodecl.}
+proc cRpCtrlSamples(w: int32): int64 {.importc: "aowl_rp_ctrl_samples", nodecl.}
+proc cRpCostMeanNs(p: int32): int64 {.importc: "aowl_rp_cost_mean_ns", nodecl.}
+proc cRpCostMaxNs(p: int32): int64 {.importc: "aowl_rp_cost_max_ns", nodecl.}
+proc cRpCostP95Ns(p: int32): int64 {.importc: "aowl_rp_cost_p95_ns", nodecl.}
+proc cRpCostN(p: int32): int64 {.importc: "aowl_rp_cost_n", nodecl.}
+proc cRpCostOver(p: int32): int64 {.importc: "aowl_rp_cost_over", nodecl.}
+proc cRpCostOvf(p: int32): int64 {.importc: "aowl_rp_cost_ovf", nodecl.}
+proc cRpP95Sat(): int64 {.importc: "aowl_rp_p95_sat", nodecl.}
+proc cRpTopEdgeNs(): int64 {.importc: "aowl_rp_top_edge_ns", nodecl.}
+proc cRpBudgetNs(): int64 {.importc: "aowl_rp_budget_ns", nodecl.}
+proc cRpMinSamples(): int64 {.importc: "aowl_rp_min_samples", nodecl.}
+proc cRpSubMeanNs(s: int32): int64 {.importc: "aowl_rp_sub_mean_ns", nodecl.}
+proc cRpSubMaxNs(s: int32): int64 {.importc: "aowl_rp_sub_max_ns", nodecl.}
+proc cRpSubN(s: int32): int64 {.importc: "aowl_rp_sub_n", nodecl.}
+proc cRpSubName(s: int32): cstring {.importc: "aowl_rp_sub_name", nodecl.}
+proc cRpSubCount(): int32 {.importc: "aowl_rp_sub_count", nodecl.}
+proc cRpAccMeanNs(): int64 {.importc: "aowl_rp_acc_mean_ns", nodecl.}
+proc cRpAccN(): int64 {.importc: "aowl_rp_acc_n", nodecl.}
+proc cRpGapMeanNs(): int64 {.importc: "aowl_rp_gap_mean_ns", nodecl.}
+proc cRpGapN(): int64 {.importc: "aowl_rp_gap_n", nodecl.}
+proc cRpDropped(): int64 {.importc: "aowl_rp_dropped", nodecl.}
+
+const
+  RpPhLight = 0'i32
+  RpPhScene = 1'i32
+  RpSubScene = 0'i32
+  RpSubCam = 1'i32
+  RpSubWorld = 2'i32
+
 const
   RpPhaseUnknown* = 0'i32   ## I could not look. NOT "no raid".
   RpPhaseMenu*    = 1'i32   ## no GameWorld cached
@@ -105,6 +147,20 @@ var gRpArmedAt = 0'i64
 var gRpClearedBy = ""      ## which END signal cleared the latch, verbatim
 var gRpCam: Il2CppPtr = nil
 var gRpCamAt = 0'i64
+var gRpArmed = false       ## a detour that populates the GameWorld cache exists
+
+# ---- the independent report -----------------------------------------------
+# `raidPhaseLog`, and NOTHING else, gates the lines below. It defaults ON, which
+# is a deliberate departure from "new features ship OFF": the entire point of
+# this emitter is that with all 28 optional features off the host must STILL say
+# whether we are in a raid, and a default-OFF flag would defeat exactly that.
+# The departure is bounded -- it adds no work in the tick (the tick is already
+# unconditional), touches no game memory of its own, and only formats state that
+# was already computed.
+var gRpLogOn = true
+var gRpLogAt = 0'u64
+var gRpLogLast = -2'i32    ## last phase PRINTED; -2 = nothing printed yet
+const RpLogEveryMs = 5000'u64
 
 proc rpDisabled*(): bool = gRpFaults >= RpMaxFaults
 
@@ -143,6 +199,12 @@ proc rpCameraMain(): Il2CppPtr =
   gRpCam
 
 proc rpTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_rp_tick_body", cdecl.} =
+  # THE IN-GUARD POSITIVE CONTROL. Same clock helpers, same place in the tick,
+  # 512 integer adds into a volatile sink. Taken FIRST so it also prices SEH
+  # guard entry: `ctrl_out` cheap while `ctrl_in` is dear would mean the guard
+  # itself is the cost, which is neither of the two explanations the control
+  # normally separates.
+  cRpCtrlIn()
   gRpS1 = false
   gRpS2 = false
   gRpS3 = false
@@ -151,11 +213,25 @@ proc rpTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_rp_tick_body", cdecl.}
   # ---- the raw signals ---------------------------------------------------
   # S4, at most once a second: the scene-name query is three calls into Unity
   # and the results screen does not appear between frames.
+  #
+  # The tick is classified SCENE or LIGHT here, and the two are counted apart:
+  # folding one ~1/s Unity query into sixty cheap ticks hides its entire cost
+  # inside the mean, which is the exact shape of hole that hid 11.4ms.
   if (cNowMs() - gRpSceneAt) >= RpSceneEveryMs:
     gRpSceneAt = cNowMs()
+    cRpPhaseScene()
+    cRpSubBegin(RpSubScene)
     gRpS4 = iSceneNamePresent(RpSessionEndScene)
+    cRpSubEnd(RpSubScene)
+  cRpSubBegin(RpSubCam)
   gRpS5 = rpCameraMain() != nil
+  cRpSubEnd(RpSubCam)
 
+  # The three sub-brackets are DISJOINT (none encloses another) and cover every
+  # call this body makes into the game. What is left over is local bookkeeping,
+  # and `rpCostLine` prints the identity `accounted=X of Y us` so the leftover
+  # is visible rather than assumed to be zero.
+  cRpSubBegin(RpSubWorld)
   let gw = gDuGameWorld
   gRpS1 = bdOk(gw, cBdOffMainPlayer() + 8'i32)
   var you: Il2CppPtr = nil
@@ -167,6 +243,7 @@ proc rpTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_rp_tick_body", cdecl.}
     gRpS2 = bdOk(you, 0x20'i32) and bdSanePtr(you) and iUnityAlive(you)
     if gRpS2:
       gRpS3 = rpMemberOfAlive(gw, you, gRpAliveN)
+  cRpSubEnd(RpSubWorld)
 
   # ---- the CLEAR edge, evaluated FIRST -----------------------------------
   # A positive end-of-raid observation always beats a positive deploy one. On
@@ -191,13 +268,17 @@ proc rpTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_rp_tick_body", cdecl.}
     gRpEverDeployed = true
 
   # ---- the reported phase ------------------------------------------------
+  # RECORDED, not just tested inline: the log line below must be able to say
+  # "S1/S2/S3 are INCONCLUSIVE because nothing populates the GameWorld cache"
+  # rather than printing them as `no`, which reads as a measurement of absence.
+  gRpArmed = gDebugEspSlot >= 0 or gBotDiagSlot >= 0
   if gRpLatched:
     gRpPhase = RpPhaseDeployed
   elif gRpS4 == 1'i32:
     gRpPhase = RpPhaseResults
   elif gRpS1:
     gRpPhase = RpPhaseLoading
-  elif gDebugEspSlot >= 0 or gBotDiagSlot >= 0:
+  elif gRpArmed:
     # No world cached, and something IS armed to populate the cache, so this is
     # a real observation of "no raid" rather than nobody watching.
     gRpPhase = RpPhaseMenu
@@ -211,7 +292,12 @@ proc rpDrainTick*() =
   ## Rides the existing Update drain. No detour of its own.
   if rpDisabled(): return
   gRpTicks = gRpTicks + 1
-  if cRpTickGuarded(nil) == nil:
+  # THE OUT-OF-GUARD POSITIVE CONTROL, immediately before the real bracket.
+  cRpCtrlOut()
+  cRpCostBegin()
+  let ok = cRpTickGuarded(nil)
+  cRpCostEnd()
+  if ok == nil:
     gRpFaults = gRpFaults + 1
     gRpPhase = RpPhaseUnknown
     if gRpFaults == 1 or gRpFaults == RpMaxFaults:
@@ -289,6 +375,189 @@ proc rpSignals*(): string =
   (if not gRpLatched and gRpClearedBy.len > 0: "(" & gRpClearedBy & ")" else: "") &
   " everDeployed=" & (if gRpEverDeployed: "yes" else: "no") &
   " ticks=" & $gRpTicks & " faults=" & $gRpFaults
+
+proc rpUs(ns: int64): string =
+  ## ONE unit, everywhere, always spelled. natesp's sub-means were read as
+  ## NANOseconds once and sent an agent after a phantom; every number this
+  ## module prints carries `us` and every line says so again in words.
+  if ns < 0: return "n/a"
+  $(ns div 1000) & "." & $((ns mod 1000) div 100) & "us"
+
+proc rpArmedNote(): string =
+  ## The difference between "measured absent" and "nobody looked". S1/S2/S3 all
+  ## read from `gDuGameWorld`, which is populated ONLY by the kind=11
+  ## RegisterPlayer detour (flag `debugEsp`) or botdiag's handler (`botDiag`).
+  ## With both off the cache is permanently null and S1/S2/S3 are permanently
+  ## `no` -- which is NOT a measurement of "not in a raid". This is the exact
+  ## confusion that made four bisect runs read as fast raids when they were
+  ## menu-only.
+  if gRpArmed:
+    "S1/S2/S3 ARE MEASURED (a GameWorld-populating detour is installed)"
+  else:
+    "S1/S2/S3 ARE INCONCLUSIVE, NOT 'no': neither debugEsp nor botDiag is " &
+    "armed, so NOTHING populates the GameWorld cache and those three can only " &
+    "ever read `no`. Do not read them as evidence of no raid."
+
+proc rpIndependentVerdict*(): string =
+  ## THE ANSWER THAT SURVIVES ALL 28 OPTIONAL FEATURES BEING OFF.
+  ##
+  ## S4 (SceneManager scene names) and S5 (`UnityEngine.Camera::get_main`) are
+  ## the only two of the five signals that depend on NO optional feature: S4
+  ## goes through inspect's nav table and S5 through debugui's byte-verified
+  ## static RVA table, and neither table is behind a flag.
+  ##
+  ## MEASURED (see this module's header): Camera.main is NULL in the menu, NULL
+  ## on the loading screen, and NULL on the post-raid results screen, and it is
+  ## live during a raid. So S5 alone is a genuine positive raid observation, and
+  ## it is the one this line reports. It is stated SEPARATELY from `rpPhase()`
+  ## and does not feed it -- the latch keeps its measured semantics and the
+  ## consumers keep their gate; this is an extra instrument, not a new gate.
+  ##
+  ## THREE OUTCOMES, never two.
+  if rpDisabled():
+    "INCONCLUSIVE -- raidphase self-disabled after " & $gRpFaults &
+      " faults. This is NOT 'not in a raid'."
+  elif gRpS4 == 1'i32:
+    "NOT IN A RAID (raid OVER) -- S4: SceneManager lists SessionEndUIScene, " &
+      "the post-raid results screen."
+  elif gRpS5:
+    "IN A RAID -- S5: Camera.main is LIVE. Measured NULL in the menu, NULL on " &
+      "the loading screen and NULL on the results screen, so a live " &
+      "Camera.main is a positive in-raid observation and needs no feature flag."
+  elif gRpS4 == 0'i32:
+    "NOT IN A RAID -- S5: Camera.main is NULL (menu or loading screen) and S4 " &
+      "confirms SceneManager was successfully enumerated with no " &
+      "SessionEndUIScene."
+  else:
+    "INCONCLUSIVE -- S5 Camera.main is null AND S4 could not enumerate " &
+      "SceneManager (a nav entry did not verify). Both legs refused; this is " &
+      "'I could not look', NOT 'not in a raid'."
+
+proc rpCostLine*(): string =
+  ## WHAT THE ONE UNCONDITIONAL RIDER COSTS. Every number is MICROSECONDS and
+  ## says so. A saturated histogram prints a bound and the word INCONCLUSIVE --
+  ## never a sentinel dressed as a measurement.
+  let budget = cRpBudgetNs()
+  var s = "raidphase cost (MICROSECONDS throughout, budget " & rpUs(budget) & "):"
+
+  # THE POSITIVE CONTROL FIRST, because it decides whether anything below it
+  # means anything at all. 512 integer adds, same clock, same place in the tick.
+  let co = cRpCtrlMeanNs(0'i32)
+  let ci = cRpCtrlMeanNs(1'i32)
+  s = s & " CONTROL(512 int adds, same clock): out-of-guard mean=" & rpUs(co) &
+      " max=" & rpUs(cRpCtrlMaxNs(0'i32)) & " n=" & $cRpCtrlSamples(0'i32) &
+      ", in-guard mean=" & rpUs(ci) & " max=" & rpUs(cRpCtrlMaxNs(1'i32)) &
+      " n=" & $cRpCtrlSamples(1'i32) & " --"
+  if co < 0 or ci < 0:
+    s = s & " NO CONTROL SAMPLES YET, so every cost below is UNVALIDATED."
+  elif co > 1000000'i64 or ci > 1000000'i64:
+    s = s & " the control itself costs over a millisecond, so THE BRACKET IS " &
+        "MEASURING THE FRAME, not this rider. Every cost below is an " &
+        "INSTRUMENT ARTIFACT -- do not attribute it to raidphase."
+  elif ci > co * 8 and ci > 50000'i64:
+    s = s & " out-of-guard is cheap but IN-GUARD is not: SEH guard ENTRY is " &
+        "carrying the cost, which is a finding in itself."
+  else:
+    s = s & " trivial work prices as trivial on this clock, so the costs " &
+        "below are WORK, not measurement."
+
+  # PER PHASE. Disjoint and exhaustive over ticks: a tick either ran the ~1/s
+  # SceneManager query (SCENE) or did not (LIGHT).
+  var ph = 0'i32
+  while ph < 2'i32:
+    let nm = (if ph == RpPhLight: "LIGHT(no scene query)" else: "SCENE(scene query ran)")
+    let n = cRpCostN(ph)
+    if n <= 0:
+      s = s & " [" & nm & "] no samples -- INCONCLUSIVE."
+    else:
+      let mean = cRpCostMeanNs(ph)
+      let p95 = cRpCostP95Ns(ph)
+      var p95Txt = ""
+      var verdict = ""
+      if p95 == cRpP95Sat():
+        p95Txt = ">= " & rpUs(cRpTopEdgeNs()) & " (histogram SATURATED)"
+        verdict = "INCONCLUSIVE: the 95th sample is above every finite edge, " &
+                  "so the budget can be neither met nor missed on this " &
+                  "evidence (mean=" & rpUs(mean) & ", max=" &
+                  rpUs(cRpCostMaxNs(ph)) & ", " & $cRpCostOvf(ph) &
+                  " sample(s) overflowed)"
+      else:
+        p95Txt = "<= " & rpUs(p95)
+        if n < cRpMinSamples():
+          verdict = "INCONCLUSIVE: only " & $n & " sample(s), fewer than the " &
+                    $cRpMinSamples() & " this verdict requires -- not a PASS"
+        elif p95 > budget:
+          verdict = "FAIL: p95 " & p95Txt & " exceeds the budget " & rpUs(budget)
+        else:
+          verdict = "PASS: p95 " & p95Txt & " within budget " & rpUs(budget)
+      s = s & " [" & nm & "] mean=" & rpUs(mean) & " p95" & p95Txt & " max=" &
+          rpUs(cRpCostMaxNs(ph)) & " n=" & $n & " over-budget=" &
+          $cRpCostOver(ph) & " -- " & verdict & "."
+    inc ph
+
+  # THE SUB-DECOMPOSITION, with its accounting identity printed. A decomposition
+  # that does not sum to the whole is a HOLE, and the only way to see the hole
+  # is to print `accounted=X of Y`.
+  var si = 0'i32
+  while si < cRpSubCount():
+    s = s & " sub[" & $cRpSubName(si) & "] mean=" & rpUs(cRpSubMeanNs(si)) &
+        " max=" & rpUs(cRpSubMaxNs(si)) & " n=" & $cRpSubN(si) & ";"
+    inc si
+  let acc = cRpAccMeanNs()
+  # The whole, for the identity, is the sample-weighted mean across both phases.
+  let nL = cRpCostN(RpPhLight)
+  let nS = cRpCostN(RpPhScene)
+  var whole = -1'i64
+  if (nL + nS) > 0:
+    let mL = (if nL > 0: cRpCostMeanNs(RpPhLight) else: 0'i64)
+    let mS = (if nS > 0: cRpCostMeanNs(RpPhScene) else: 0'i64)
+    whole = (mL * nL + mS * nS) div (nL + nS)
+  if acc < 0 or whole <= 0:
+    s = s & " accounted=n/a (no paired samples yet) -- INCONCLUSIVE, the " &
+        "decomposition has NOT been shown to be exhaustive."
+  else:
+    let pct = (acc * 100'i64) div whole
+    s = s & " accounted=" & rpUs(acc) & " of " & rpUs(whole) & " (" & $pct &
+        "%) over " & $cRpAccN() & " tick(s)"
+    if pct < 80:
+      s = s & " -- OVER A FIFTH IS UNACCOUNTED. The sub-brackets do NOT " &
+          "explain this body; do not conclude anything from them alone."
+    else:
+      s = s & " -- the sub-brackets account for the body."
+  s = s & " tick-interval mean=" & rpUs(cRpGapMeanNs()) & " over " &
+      $cRpGapN() & " tick(s), dropped=" & $cRpDropped() & " sample(s)."
+  s
+
+proc rpLogTick*() =
+  ## THE FEATURE-INDEPENDENT RAID-PHASE REPORT.
+  ##
+  ## WHY IT EXISTS, measured: the latch was only ever REPORTED through natesp's
+  ## diag line, so with `natEsp` off there was no way to confirm the client was
+  ## in a raid. Four performance bisects produced fast frame times (~18-19ms)
+  ## that were attributed to "features off is faster" and were afterwards shown
+  ## to be MENU-ONLY -- one run printed `raid phase = UNKNOWN` across 43,597
+  ## frames. A raid-ENTRY log line is not proof of raid STATE, and a ~74ms
+  ## claim had to be retracted because of it.
+  ##
+  ## Gated by `raidPhaseLog` alone (default ON) and by nothing else. Throttled
+  ## to one line every 5s, plus one on EVERY phase transition, so an entry or an
+  ## extraction is never missed between throttle windows.
+  if not gRpLogOn: return
+  let now = cNowMs()
+  let changed = gRpPhase != gRpLogLast
+  if not changed and (now - gRpLogAt) < RpLogEveryMs: return
+  gRpLogAt = now
+  gRpLogLast = gRpPhase
+  okLog "raid phase = " & rpPhaseName(gRpPhase) &
+        (if changed: " (TRANSITION)" else: "") & " -- " & rpWhy() &
+        "  [" & rpSignals() & "]" &
+        "  FEATURE-INDEPENDENT VERDICT: " & rpIndependentVerdict() &
+        "  " & rpArmedNote() &
+        "  " & rpCostLine()
+
+proc rpConfigureLog*(on: bool) =
+  ## Called once at config load, from the point where `readBoolKeyDef` exists.
+  gRpLogOn = on
 
 proc aowlHostRaidPhase(): int32 {.exportc: "aowl_host_raid_phase_impl", cdecl.} =
   ## READ-ONLY export of the cached phase for out-of-host consumers (mods/maps,
