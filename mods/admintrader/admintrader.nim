@@ -35,6 +35,7 @@
 ## written by `aowl.manager` and hand-editing it gets reverted — enable through
 ## `GET /aowlspt/mods/enable/<guid>`. See `docs/MOD-ENABLE-PATH.md`.
 
+import std/strutils
 import aowlspt
 import aowlspt/server
 import aowlspt/settings
@@ -80,7 +81,13 @@ proc adminSchema(): seq[Setting] =
                appliesOn = "restart",
                description = "Everything in the handbook, capped. The " &
                              "handbook holds about 4,300 items, so the " &
-                             "default is 'all of them'.")]
+                             "default is 'all of them'."),
+    boolSetting("soloTrader", "Hide every other trader", false,
+                category = "Admin Trader",
+                description = "Leaves the Admin Trader as the only trader on " &
+                              "the list. Nothing is deleted -- the others are " &
+                              "flagged hidden and come straight back when you " &
+                              "turn this off.")]
 
 # ---------------------------------------------------------------------------
 # The trader, his stock, and his quest
@@ -90,6 +97,9 @@ var gTrader: Trader
 var gQuest: Quest
 var gInstalled = false
 var gWhyNot = ""
+var gSoloHidden = 0
+  ## How many other traders are hidden RIGHT NOW, counted by reading the flag
+  ## back rather than by counting the writes we issued.
 
 proc identify() =
   ## Give both globals their ids and text. Called FIRST in `onLoad`, before the
@@ -108,6 +118,57 @@ proc identify() =
   gQuest.startedText = "Take your time. Or do not."
   gQuest.successText = "Good. You now know how a quest works."
   gQuest.failText = "That should not have been possible."
+
+proc applySolo(on: bool; hidden, shown, failed: var int): bool =
+  ## Hide, or unhide, every trader that is not ours.
+  ##
+  ## The mechanism is one flag: `traders.<id>.base.aowlHidden`, which
+  ## `emu/traders.nim` skips when it builds the client's trader list. It is a
+  ## MERGE, not a replace -- `dbWrite` merges a patch into the object at the
+  ## path -- so setting it leaves every other field of that trader's base
+  ## exactly as the database holds it. Nothing is deleted, which is the whole
+  ## reason turning this back off restores the traders intact rather than
+  ## needing them rebuilt from somewhere.
+  ##
+  ## Turning it OFF writes `false` rather than skipping the write: the flag has
+  ## to be cleared on traders a PREVIOUS session hid, and "off means do
+  ## nothing" would strand them hidden forever with no way back through the UI.
+  hidden = 0
+  shown = 0
+  failed = 0
+
+  var ids: seq[string] = @[]
+  var scanned = false
+  if dbKeysOrRead("traders", ids, scanned) != Ok:
+    warn ModName & ": could not enumerate traders, so nothing was hidden or " &
+         "restored: " & lastError()
+    return false
+
+  for id in ids:
+    if id == TraderHex:
+      continue                        # never hide ourselves
+    var patch = obj()
+    put(patch, "aowlHidden", on)
+    if dbWrite("traders." & id & ".base", patch) != Ok:
+      inc failed
+      continue
+    # Read the flag BACK. `dbWrite` returning Ok means the call succeeded, not
+    # that the value landed where it was aimed -- the same reason `install`
+    # re-reads the nickname. Counting writes we issued would be a check that
+    # cannot fail.
+    # `DbValue` has asText/asFloat/asInt but NO asBool -- `ConfigValue` has one
+    # and this does not. So the raw token is compared directly, which is what
+    # a `dbRead` of a JSON boolean yields.
+    let back = dbRead("traders." & id & ".base.aowlHidden")
+    let want = (if on: "true" else: "false")
+    if not back.ok or back.raw.strip() != want:
+      inc failed
+    elif on:
+      inc hidden
+    else:
+      inc shown
+
+  result = failed == 0
 
 proc build(): bool =
   ## Everything this mod is, in one proc. Three sections, and each one only
@@ -131,6 +192,24 @@ proc build(): bool =
     gWhyNot = whyNot(gQuest)
     return false
 
+  # Solo mode runs AFTER our own trader is in, so a failure here leaves a
+  # working Admin Trader beside the others rather than a list with nothing on
+  # it. The flag is re-applied on every start, not only when it changes,
+  # because the database is reloaded from disk and would otherwise come back
+  # with all the traders visible.
+  var hidden = 0
+  var shown = 0
+  var failed = 0
+  let solo = setting("soloTrader").asBool(false)
+  discard applySolo(solo, hidden, shown, failed)
+  gSoloHidden = hidden
+  if failed > 0:
+    warn ModName & ": " & $failed & " trader(s) did not take the " &
+         (if solo: "hidden" else: "visible") & " flag and are still " &
+         (if solo: "visible" else: "hidden")
+  elif solo:
+    info ModName & ": solo mode -- " & $hidden & " other trader(s) hidden"
+
   gInstalled = true
   result = true
 
@@ -148,6 +227,8 @@ proc onStatus(url, body, session: string): string =
   auditTrader(gTrader, o)
   auditQuest(gQuest, o)
   put(o, "offers", gTrader.offers.len)   # what we tried; the audit says what IS
+  put(o, "soloTrader", setting("soloTrader").asBool(false))
+  put(o, "otherTradersHidden", gSoloHidden)
   if gWhyNot.len > 0:
     put(o, "problem", gWhyNot)
   result = done(o).text
@@ -162,6 +243,26 @@ proc onApply(key: string) =
       settingApplied("the trader is now called \"" & gTrader.nickname & "\"")
     else:
       settingIgnored("could not rewrite the trader: " & whyNot(gTrader))
+  elif key == "soloTrader":
+    # This one applies live: it is database writes, and the trading screen
+    # re-fetches the list when it opens. If a screen is already open it shows
+    # the old list until it is reopened, and the message says so rather than
+    # claiming an instant change the player cannot see.
+    var hidden = 0
+    var shown = 0
+    var failed = 0
+    let on = setting("soloTrader").asBool(false)
+    if applySolo(on, hidden, shown, failed):
+      gSoloHidden = hidden
+      if on:
+        settingApplied($hidden & " other trader(s) hidden -- reopen the " &
+                       "trading screen to see it")
+      else:
+        settingApplied($shown & " trader(s) restored -- reopen the trading " &
+                       "screen to see them")
+    else:
+      settingIgnored($failed & " trader(s) did not take the flag; " &
+                     $hidden & " hidden, " & $shown & " restored")
   else:
     settingAppliesOnRestart("takes effect when the backend restarts")
 

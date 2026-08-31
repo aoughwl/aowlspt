@@ -33,13 +33,34 @@ proc traderBase*(id: string): string =
     return v.raw
   result = ""
 
+proc traderHidden*(base: string): bool =
+  ## Whether a trader's base carries the `aowlHidden` flag.
+  ##
+  ## A general mechanism rather than one mod's special case: any mod can write
+  ## `traders.<id>.base.aowlHidden = true` and that trader stops being offered
+  ## to the client. `dbWrite` MERGES, so setting it leaves every other field of
+  ## the base exactly as the database holds it, and clearing it restores the
+  ## trader with nothing lost. Nothing is deleted, which is why this is
+  ## reversible at all.
+  ##
+  ## Absent, or present and false, both mean visible. A trader is hidden only
+  ## by an explicit `true` -- so a database that has never heard of this flag
+  ## behaves exactly as it did before, which is the property that lets it ship
+  ## on by default.
+  if base.len == 0:
+    return false
+  let root = whole(base)
+  if not isObject(root):
+    return false
+  result = field(root, "aowlHidden").asBool(false)
+
 proc traderSettings*(): string =
   ## The array the client's trader screen is built from.
   var a = arr()
   let ids = traderIds()
   for id in ids:
     let base = traderBase(id)
-    if base.len > 0:
+    if base.len > 0 and not traderHidden(base):
       a.add raw(base)
   result = done(a).text
 
