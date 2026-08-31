@@ -1594,6 +1594,16 @@ var gCodeGenProbeSlot = -1
 ## include point. Flag `sharedRegion`, default OFF.
 var gRegionSlot = -1
 var gRegionOn = false
+var gRegionProjectorOn = false
+  ## THE PROJECTOR SEAT in the shared region (`abi/aowlspt_regproj.h`). Flag
+  ## `regionProjector`, default OFF, and it is a SEPARATE flag from
+  ## `sharedRegion` on purpose: arming the region is a pure book-keeping change,
+  ## whereas this one calls three il2cpp methods on the Unity thread every frame
+  ## to sample the camera. With it off the seat stays empty, `aowl_region_project`
+  ## keeps refusing with REFUSE_NOPROJ, and every consumer keeps its bearing-ring
+  ## fallback -- so a broken projector degrades the display rather than blanking
+  ## it. Declared here for the same reason `gRegionOn` is: `region.nim` is
+  ## included below this point.
 
 var gSplPreloaderSlot = -1
   ## THE SINGLEPLAYER-REBRAND / forceOfflinePractice rider on
@@ -7193,6 +7203,13 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
          "name through it: no mod has been switched over."
   gCodeGenAudit = readBoolKey("codeGenAudit")
   gRegionOn = readBoolKey("sharedRegion")
+  gRegionProjectorOn = readBoolKey("regionProjector")
+  if gRegionProjectorOn and not gRegionOn:
+    warn "regionProjector is ON but sharedRegion is OFF. The projector is " &
+         "sampled from the region's own per-frame tick, so with the region " &
+         "unarmed it will NEVER be installed and every consumer will keep " &
+         "drawing bearing rings. Turn on sharedRegion (python tools/" &
+         "hostcfg.py set sharedRegion on) or turn regionProjector back off."
   betaNoticeReadFlags()
   # The breadcrumb file: a second, independent witness for the log's tail.
   #
