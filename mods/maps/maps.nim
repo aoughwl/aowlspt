@@ -301,6 +301,16 @@ proc readOpts(o: var HudOpts) =
                              0xEBFFBE46'u32)
   o.colSelf   = 0xFFFFFFFF'u32
 
+  # ---- PLACEMENT AND CHROME -------------------------------------------
+  # `widgetAnchor` defaults to "manual", which is byte-for-byte the placement
+  # every existing config already has: mapX/mapY as absolute top-left. Nobody's
+  # widget moves because they took this build. Pick a corner and the same two
+  # numbers become an inset from it, resolved against the measured back buffer.
+  o.anchor          = anchorOf(asText(setting("widgetAnchor"), "manual"))
+  o.border          = asBool(setting("widgetBorder"), true)
+  o.borderPx        = asFloat(setting("widgetBorderPx"), 2.0)
+  o.backdropOpacity = asFloat(setting("widgetBackdropOpacity"), 1.0)
+
   o.fsEnabled = asBool(setting("hotkeys"), false)
   o.fsKey     = asText(setting("fullscreenKey"), "M")
   o.fsMargin  = asFloat(setting("fullscreenMargin"), 48.0)
@@ -396,6 +406,43 @@ proc spatialSchema(): seq[Setting] =
                                 "classification sp/world.nim measures on this " &
                                 "build, so a per-side (USEC/BEAR/Scav) colour " &
                                 "is not offered rather than offered and wrong"),
+
+    # ---- PLACEMENT AND CHROME -------------------------------------------
+    enumSetting("widgetAnchor", "Widget corner", "manual",
+                @["manual", "topleft", "topright", "bottomleft", "bottomright"],
+                category = "Widget",
+                description = "Where the widget sits. `manual` is the " &
+                              "historical behaviour and the default, so " &
+                              "taking this build moves nobody's widget: " &
+                              "`Widget X`/`Widget Y` are the absolute " &
+                              "top-left. Pick a corner and those same two " &
+                              "numbers become an INSET from that corner, " &
+                              "resolved every frame against the MEASURED " &
+                              "back-buffer size -- so the widget holds its " &
+                              "corner when you change resolution, which " &
+                              "absolute pixels cannot. In a corner mode the " &
+                              "result is clamped on-screen, because an " &
+                              "off-screen widget and a widget that failed to " &
+                              "arm look identical from the player's chair"),
+    boolSetting("widgetBorder", "Draw the widget border", true,
+                category = "Widget",
+                description = "The 2 px frame around the pane. OFF submits no " &
+                              "box at all rather than a transparent one, so " &
+                              "the primitive count keeps meaning `things that " &
+                              "can be seen`. Applies to the full-screen " &
+                              "overlay too -- it is the same renderer"),
+    floatSetting("widgetBorderPx", "Border thickness (px)", 2.0, lo = 0.5,
+                 hi = 16.0, step = 0.5, category = "Widget",
+                 description = "Clamped in the draw mirror as well as here"),
+    floatSetting("widgetBackdropOpacity", "Backdrop opacity", 1.0, lo = 0.0,
+                 hi = 1.0, step = 0.05, category = "Widget",
+                 description = "The dark panel BEHIND the map, as a multiplier " &
+                               "on `Widget opacity`. Separated from it because " &
+                               "`faint box, bright map` and `faint " &
+                               "everything` are different requests and one " &
+                               "slider could not express both. 0 draws no " &
+                               "backdrop quad at all -- the map art, grid and " &
+                               "contacts float directly over the game"),
 
     # ---- THE FULL-SCREEN OVERLAY ----------------------------------------
     boolSetting("hotkeys", "Enable the full-screen map key", false,
@@ -1311,6 +1358,43 @@ proc mapsDiagText(): string =
                 " colours(bot/player)=" & $hudLiveColBot() & "/" &
                 $hudLiveColPlayer()
 
+  # ---- PLACEMENT, as RESOLVED, next to what was configured ----------------
+  #
+  # Both numbers, always. `cfg` is the inset the player typed; `drawnAt` is the
+  # origin the anchor resolved to on the last drawn frame, written by the draw
+  # path itself. In manual mode they are equal BY CONSTRUCTION -- and that is
+  # stated, so their equality there is not read as evidence the anchor works.
+  # In a corner mode they differ, and that difference is the evidence.
+  let lPlace = "anchor=" & anchorName(hudLiveAnchor()) &
+               " cfg=" & $hudLivePaneX() & "," & $hudLivePaneY() &
+               " drawnAt=" & $hudWidgetX() & "," & $hudWidgetY() &
+               (if hudLiveAnchor() == AnchorManual:
+                  "  (manual: drawnAt EQUALS cfg by construction -- this line " &
+                  "proves nothing about the anchor until a corner is chosen)"
+                else: "") &
+               "  border=" & (if hudLiveBorder(): "on@" & $hudLiveBorderPx() &
+                                                  "px" else: "off") &
+               " backdropOpacity=" & $hudLiveBackdropOpacity()
+
+  # ---- ONE RENDERER, asserted as a NEGATIVE -------------------------------
+  #
+  # `paneCallsOver` counts dispatches on which mhud_draw_pane_full ran MORE THAN
+  # ONCE. It is incremented inside the renderer, so it counts draws that
+  # happened, not draws we believe happened. Non-zero = a second draw path
+  # exists and the minimap and the radar have forked again.
+  let lUnified =
+    if hudPaneCalls() == 0'i64:
+      "INCONCLUSIVE  the pane renderer has not run yet (0 calls), so nothing " &
+      "about the unified path has been observed. This is not a pass."
+    elif hudPaneCallsOver() > 0'i64:
+      "FAIL  " & $hudPaneCallsOver() & " dispatch(es) rendered MORE THAN ONE " &
+      "pane -- a second draw path is submitting behind the first (calls=" &
+      $hudPaneCalls() & ")"
+    else:
+      "PASS  " & $hudPaneCalls() & " pane render(s), and no dispatch ever " &
+      "rendered more than one: the minimap, the radar and the full-screen " &
+      "overlay are the same code path"
+
   # ---- THE FULL-SCREEN OVERLAY -------------------------------------------
   #
   # THREE OUTCOMES, and the PASS is a falsifiable NEGATIVE: the overlay was open
@@ -1346,8 +1430,18 @@ proc mapsDiagText(): string =
           "the small widget submitted primitives on " &
           $(hudFsFrames() - hudFsSuppressed()) & " of them -- the full-screen " &
           "map is drawing OVER a live minimap instead of replacing it"
+  elif hudFsRectBad() > 0'i64:
+    # THE RECT CHECK. The renderer recorded the rect it was HANDED; the draw
+    # site compared that against the screen square derived independently from
+    # the measured back buffer. A mismatch means the overlay is not full-screen,
+    # which no primitive count would have caught.
+    lFs = "FAIL  the overlay drew on " & $hudFsFrames() & " frame(s) but its " &
+          "pane rect did not match the screen square on " & $hudFsRectBad() &
+          " of them -- the full-screen map is not full-screen (ok=" &
+          $hudFsRectOk() & ")"
   else:
-    lFs = "PASS  open on " & $hudFsFrames() & " frame(s), and the small " &
+    lFs = "PASS  open on " & $hudFsFrames() & " frame(s), rect matched the " &
+          "screen square on all " & $hudFsRectOk() & " of them, and the small " &
           "widget submitted ZERO primitives on all " & $hudFsFrames() &
           " of them (toggles=" & $hudFsToggles() & ", key=" & gFsKeyName &
           ", currently " & (if hudFsOpen(): "OPEN" else: "closed") &
@@ -1357,6 +1451,8 @@ proc mapsDiagText(): string =
   result = "maps diag:\n" &
            "  arm          : " & lArm & "\n" &
            "  widget       : " & lWidget & "\n" &
+           "  placement    : " & lPlace & "\n" &
+           "  unifiedPane  : " & lUnified & "\n" &
            "  fullscreen   : " & lFs & "\n" &
            "  reconcile    : " & lRecon & "\n" &
            "  region       : " & lRegion & "\n" &
@@ -1671,6 +1767,16 @@ proc mirrorDrift(): string =
   if d.len > 0: return d
   d = numDrift("fullscreenOpacity", w.fsOpacity, hudLiveFsOpacity())
   if d.len > 0: return d
+  d = numDrift("widgetBorderPx", w.borderPx, hudLiveBorderPx())
+  if d.len > 0: return d
+  d = numDrift("widgetBackdropOpacity", w.backdropOpacity,
+               hudLiveBackdropOpacity())
+  if d.len > 0: return d
+  if w.anchor != hudLiveAnchor():
+    return "widgetAnchor config=" & anchorName(w.anchor) &
+           " mirror=" & anchorName(hudLiveAnchor())
+  if w.border != hudLiveBorder():
+    return "widgetBorder config=" & $w.border & " mirror=" & $hudLiveBorder()
   if w.mapGrid != hudLiveGrid():
     return "mapGrid config=" & $w.mapGrid & " mirror=" & $hudLiveGrid()
   if w.drawArt != hudLiveDrawArt():

@@ -89,6 +89,20 @@ import world  # the Snapshot this file mirrors; no game memory is read here
 #define MHUD_MODE_NORTHUP 2
 #define MHUD_MODE_HEADUP  3
 
+/* Where the small widget sits. MANUAL is the historical behaviour and stays
+ * the value an existing config resolves to, so nobody's widget moves because
+ * they upgraded. */
+#define MHUD_ANCHOR_MANUAL 0
+#define MHUD_ANCHOR_TL     1
+#define MHUD_ANCHOR_TR     2
+#define MHUD_ANCHOR_BL     3
+#define MHUD_ANCHOR_BR     4
+
+/* No <math.h> in this translation unit on purpose (it drags libm into a DLL
+ * that must load in the client's loader lock); this is the only absolute value
+ * the file needs. */
+#define MHUD_ABSF(v) ((v) < 0.0f ? -(v) : (v))
+
 #define MHUD_RGBA(r, g, b, a) \
     ((uint32_t)((uint32_t)(r) | ((uint32_t)(g) << 8) | \
                 ((uint32_t)(b) << 16) | ((uint32_t)(a) << 24)))
@@ -206,6 +220,46 @@ static struct {
     int32_t  drawArt;          /* 0 = grid + blips only, no textured quad */
     float    contactPx;        /* half-extent of a contact mark, pixels */
     uint32_t colBot, colPlayer, colSelf;
+
+    /* ---- WIDGET PLACEMENT AND CHROME ----------------------------------
+     *
+     * `anchor` replaces "type two absolute pixel coordinates and hope your
+     * monitor is the one they were typed for". 0 keeps the old MANUAL
+     * behaviour (mapX/mapY ARE the top-left); 1..4 make mapX/mapY an INSET
+     * from the named corner, computed against the MEASURED back-buffer size,
+     * so the widget stays in its corner at any resolution.
+     *
+     * `border` / `borderPx` are the frame; `backdropA` is the backdrop's own
+     * opacity, which used to be welded to `opacity`. They are separated
+     * because "I want a faint box behind a bright map" and "I want the whole
+     * widget faint" are different requests and one slider could not express
+     * both. Both are consumed INSIDE mhud_draw_pane_full, so the minimap, the
+     * radar and the full-screen overlay cannot end up with different chrome --
+     * there is no per-caller copy of them to drift. */
+    int32_t  anchor;           /* MHUD_ANCHOR_* */
+    int32_t  border;           /* 0 = no frame drawn at all */
+    float    borderPx;         /* frame thickness, pixels */
+    float    backdropA;        /* 0..1, the BACKDROP's own opacity */
+
+    /* THE UNIFIED-PATH LEDGER. `paneCalls` is zeroed at the top of every
+     * dispatch and incremented on entry to mhud_draw_pane_full -- the ONE pane
+     * renderer -- so it counts draw paths taken this frame, not draw paths we
+     * believe were taken. `paneCallsOver` counts frames where it exceeded 1,
+     * i.e. where a second surface got drawn behind the first. The diag reports
+     * FAIL on a non-zero value. This is the falsifiable form of "the radar and
+     * the minimap are one renderer": if anyone ever forks the draw again, this
+     * counter rises and says so. */
+    int32_t  paneCalls;
+    int64_t  paneCallsOver;
+    int64_t  paneCallsTotal;
+    /* The rect the renderer was LAST handed, recorded by the renderer itself
+     * rather than by the caller, so the full-screen check compares the pane
+     * that was actually drawn against the screen square it should have been. */
+    float    paneRectX, paneRectY, paneRectSize;
+    int64_t  fsRectOk, fsRectBad;
+    /* The widget origin the anchor resolved to, most recent frame -- readable,
+     * so "my minimap is off-screen" is answerable without a screenshot. */
+    float    wx, wy;
 
     /* ---- THE FULL-SCREEN OVERLAY --------------------------------------
      *
@@ -461,6 +515,12 @@ static void mhud_reset(void) {
     g_mhud.colBot         = MHUD_RGBA(230,  70,  60, 235);
     g_mhud.colPlayer      = MHUD_RGBA( 70, 190, 255, 235);
     g_mhud.colSelf        = MHUD_RGBA(255, 255, 255, 255);
+    /* Chrome, for the same reason: memset would leave a 0 backdrop alpha and a
+     * 0-thickness border, which is an invisible widget, not an unset one. */
+    g_mhud.anchor         = MHUD_ANCHOR_MANUAL;
+    g_mhud.border         = 1;
+    g_mhud.borderPx       = 2.0f;
+    g_mhud.backdropA      = 1.0f;
     g_mhud.fsOn           = 0;
     g_mhud.fsNorthUp      = 1;
     g_mhud.fsMargin       = 48.0f;
@@ -589,6 +649,48 @@ static void mhud_configure_pane(int32_t mode, float zoom, float opacity,
     g_mhud.mapOn   = (g_mhud.mode == MHUD_MODE_NORTHUP ||
                       g_mhud.mode == MHUD_MODE_HEADUP) ? 1 : 0;
     g_mhud.radarOn = (g_mhud.mode == MHUD_MODE_RADAR) ? 1 : 0;
+}
+
+/* Placement and chrome. Separate from mhud_configure_pane only so that an old
+ * caller that never learned about them still compiles; every clamp lives HERE,
+ * for the same reason the pane's do -- config.json is hand-editable and a
+ * borderPx of 400 on a 128 px widget is a solid rectangle. */
+static void mhud_configure_chrome(int32_t anchor, int32_t border,
+                                  float borderPx, float backdropA) {
+    g_mhud.anchor = (anchor >= MHUD_ANCHOR_MANUAL && anchor <= MHUD_ANCHOR_BR)
+                    ? anchor : MHUD_ANCHOR_MANUAL;
+    g_mhud.border = border ? 1 : 0;
+    g_mhud.borderPx = borderPx < 0.5f ? 0.5f : (borderPx > 16.0f ? 16.0f
+                                                                : borderPx);
+    g_mhud.backdropA = backdropA < 0.0f ? 0.0f
+                       : (backdropA > 1.0f ? 1.0f : backdropA);
+}
+
+/* THE ANCHOR RESOLUTION, one place, used by the one draw path.
+ *
+ * In MANUAL mode mapX/mapY are the top-left, exactly as before. In a corner
+ * mode they are an INSET from that corner, and the result is clamped so the
+ * widget cannot be pushed entirely off the back buffer by a large inset -- an
+ * off-screen widget and a widget that never armed look identical to the
+ * player, and that is the ambiguity this clamp removes. */
+static void mhud_widget_origin(float scrW, float scrH, float size,
+                               float* ox, float* oy) {
+    float x = g_mhud.mapX, y = g_mhud.mapY;
+    switch (g_mhud.anchor) {
+        case MHUD_ANCHOR_TL: x = g_mhud.mapX;                    y = g_mhud.mapY;                    break;
+        case MHUD_ANCHOR_TR: x = scrW - size - g_mhud.mapX;      y = g_mhud.mapY;                    break;
+        case MHUD_ANCHOR_BL: x = g_mhud.mapX;                    y = scrH - size - g_mhud.mapY;      break;
+        case MHUD_ANCHOR_BR: x = scrW - size - g_mhud.mapX;      y = scrH - size - g_mhud.mapY;      break;
+        default: break;   /* MANUAL: mapX/mapY verbatim */
+    }
+    if (g_mhud.anchor != MHUD_ANCHOR_MANUAL) {
+        if (x < 0.0f) x = 0.0f;
+        if (y < 0.0f) y = 0.0f;
+        if (x > scrW - size) x = (scrW - size) > 0.0f ? (scrW - size) : 0.0f;
+        if (y > scrH - size) y = (scrH - size) > 0.0f ? (scrH - size) : 0.0f;
+    }
+    g_mhud.wx = x; g_mhud.wy = y;
+    *ox = x; *oy = y;
 }
 
 static void mhud_configure_fs(float margin, float spanM, float zoom,
@@ -1258,13 +1360,26 @@ static int32_t mhud_draw_pane_full(float px, float py, float size, float spanM,
                                    float radiusCull)
 {
     int32_t prims = 0, i;
-    uint32_t backA = (uint32_t)(190.0f * opacity);
+    /* The BACKDROP now has its own opacity, multiplied by the pane's, so
+     * "faint box, bright map" is expressible. The art keeps following the
+     * pane opacity alone. */
+    uint32_t backA = (uint32_t)(190.0f * opacity * g_mhud.backdropA);
     uint32_t artA  = (uint32_t)(225.0f * opacity);
     if (backA > 255u) backA = 255u;
     if (artA  > 255u) artA  = 255u;
 
-    aowl_region_fill(px, py, size, size, MHUD_RGBA(8, 10, 14, backA));
-    prims++;
+    /* THE UNIFIED-PATH LEDGER. Incremented here, on entry to the ONE renderer,
+     * so it counts what actually drew. */
+    g_mhud.paneCalls++;
+    g_mhud.paneCallsTotal++;
+    g_mhud.paneRectX = px; g_mhud.paneRectY = py; g_mhud.paneRectSize = size;
+
+    /* A fully transparent backdrop submits NOTHING rather than an invisible
+     * quad, so the primitive count keeps meaning "things that can be seen". */
+    if (backA > 0u) {
+        aowl_region_fill(px, py, size, size, MHUD_RGBA(8, 10, 14, backA));
+        prims++;
+    }
 
     /* THE ART, under everything, so the frame, the grid, the blips and the
      * player all land on top of it. `drawArt` is the player's switch and
@@ -1311,8 +1426,11 @@ static int32_t mhud_draw_pane_full(float px, float py, float size, float spanM,
         }
     }
 
-    aowl_region_box(px, py, size, size, 2.0f, MHUD_RGBA(150, 180, 210, 220));
-    prims++;
+    if (g_mhud.border) {
+        aowl_region_box(px, py, size, size, g_mhud.borderPx,
+                        MHUD_RGBA(150, 180, 210, 220));
+        prims++;
+    }
 
     /* the player, at the pane centre by construction */
     {
@@ -1611,6 +1729,8 @@ static void mhud_draw(void* user, int64_t frame) {
      * showing 120 m would be a very large radar. */
     g_mhud.fsSmallPrims = 0;
     g_mhud.fsLastPrims  = 0;
+    /* Zeroed per dispatch; the renderer bumps it. See paneCallsOver. */
+    g_mhud.paneCalls    = 0;
 
     if (g_mhud.fsOn) {
         /* Full-screen: a centred square, inset by the margin, sized to the
@@ -1621,13 +1741,27 @@ static void mhud_draw(void* user, int64_t frame) {
         int64_t _tf, _tfd;
         if (avail < 64.0f) avail = 64.0f;
         span = g_mhud.fsSpanM / (g_mhud.fsZoom > 0.1f ? g_mhud.fsZoom : 1.0f);
+        float ex = (scrW - avail) * 0.5f, ey = (scrH - avail) * 0.5f;
         _tf = mhud_now_us();
         g_mhud.fsLastPrims = mhud_draw_pane_full(
-            (scrW - avail) * 0.5f, (scrH - avail) * 0.5f, avail, span,
+            ex, ey, avail, span,
             g_mhud.fsNorthUp ? 0.0f : rot, 1, g_mhud.fsOpacity, 0.0f);
         _tfd = mhud_now_us() - _tf;
         if (_tfd > g_mhud.fsUsPeak) g_mhud.fsUsPeak = _tfd;
         g_mhud.fsFrames++;
+        /* THE RECT CHECK, as a negative that can fail. The renderer recorded
+         * the rect it was handed; this compares it against the screen square
+         * computed independently from the MEASURED back-buffer. A margin of 0
+         * makes that square exactly the shorter screen axis, i.e. the screen
+         * rect. Comparing our own local to itself would be a check that cannot
+         * fail, so the comparison is against paneRect* written inside the
+         * renderer. */
+        if (MHUD_ABSF(g_mhud.paneRectX - ex) <= 0.5f &&
+            MHUD_ABSF(g_mhud.paneRectY - ey) <= 0.5f &&
+            MHUD_ABSF(g_mhud.paneRectSize - avail) <= 0.5f)
+            g_mhud.fsRectOk++;
+        else
+            g_mhud.fsRectBad++;
         /* THE FALSIFIABLE NEGATIVE. The small widget was not reached on this
          * frame, and this counts that rather than asserting it. */
         if (g_mhud.fsSmallPrims == 0) g_mhud.fsSmallSuppressed++;
@@ -1641,13 +1775,24 @@ static void mhud_draw(void* user, int64_t frame) {
         float span = baseSpan / (g_mhud.zoom > 0.1f ? g_mhud.zoom : 1.0f);
         float cull = radar ? (span * 0.5f) : 0.0f;
         int64_t _tp = mhud_now_us(), _tpd;
+        float ox, oy;
+        /* The anchor is resolved against the MEASURED back buffer, so a corner
+         * mode holds its corner at any resolution. MANUAL reproduces the old
+         * absolute placement exactly. */
+        mhud_widget_origin(scrW, scrH, g_mhud.mapSize, &ox, &oy);
         g_mhud.fsSmallPrims = mhud_draw_pane_full(
-            g_mhud.mapX, g_mhud.mapY, g_mhud.mapSize, span,
+            ox, oy, g_mhud.mapSize, span,
             (g_mhud.mode == MHUD_MODE_NORTHUP) ? 0.0f : rot,
             radar ? 0 : 1, g_mhud.opacity, cull);
         _tpd = mhud_now_us() - _tp;
         if (_tpd > g_mhud.paneUsPeak) g_mhud.paneUsPeak = _tpd;
     }
+
+    /* THE UNIFIED-PATH ASSERTION. At most ONE pane may be drawn per dispatch.
+     * This counts the renderer's own entries, so it fails loudly if a second
+     * draw path is ever added -- it is not a claim that the code above has an
+     * else-if. */
+    if (g_mhud.paneCalls > 1) g_mhud.paneCallsOver++;
 
     /* ---- the DIRECTIONAL indicators, which are TRANSIENTS ---------------- *
      *
@@ -1885,6 +2030,18 @@ static float   mhud_live_fsspan(void)    { return g_mhud.fsSpanM; }
 static float   mhud_live_fszoom(void)    { return g_mhud.fsZoom; }
 static float   mhud_live_fsopacity(void) { return g_mhud.fsOpacity; }
 static int32_t mhud_live_fsnorthup(void) { return g_mhud.fsNorthUp; }
+
+static int32_t mhud_live_anchor(void)    { return g_mhud.anchor; }
+static int32_t mhud_live_border(void)    { return g_mhud.border; }
+static float   mhud_live_borderpx(void)  { return g_mhud.borderPx; }
+static float   mhud_live_backdropa(void) { return g_mhud.backdropA; }
+static float   mhud_live_wx(void)        { return g_mhud.wx; }
+static float   mhud_live_wy(void)        { return g_mhud.wy; }
+/* THE THREE FALSIFIABLE LEDGERS. Each can be non-zero on the failing side. */
+static int64_t mhud_pane_calls_total(void) { return g_mhud.paneCallsTotal; }
+static int64_t mhud_pane_calls_over(void)  { return g_mhud.paneCallsOver; }
+static int64_t mhud_fs_rect_ok(void)       { return g_mhud.fsRectOk; }
+static int64_t mhud_fs_rect_bad(void)      { return g_mhud.fsRectBad; }
 
 static int64_t mhud_fs_frames(void)      { return g_mhud.fsFrames; }
 static int64_t mhud_fs_suppressed(void)  { return g_mhud.fsSmallSuppressed; }
@@ -2130,6 +2287,18 @@ proc cHudLiveFsSpan(): cfloat {.importc: "mhud_live_fsspan", nodecl.}
 proc cHudLiveFsZoom(): cfloat {.importc: "mhud_live_fszoom", nodecl.}
 proc cHudLiveFsOpacity(): cfloat {.importc: "mhud_live_fsopacity", nodecl.}
 proc cHudLiveFsNorthUp(): int32 {.importc: "mhud_live_fsnorthup", nodecl.}
+proc cHudConfigureChrome(anchor, border: int32; borderPx, backdropA: cfloat) {.
+  importc: "mhud_configure_chrome", nodecl.}
+proc cHudLiveAnchor(): int32 {.importc: "mhud_live_anchor", nodecl.}
+proc cHudLiveBorder(): int32 {.importc: "mhud_live_border", nodecl.}
+proc cHudLiveBorderPx(): cfloat {.importc: "mhud_live_borderpx", nodecl.}
+proc cHudLiveBackdropA(): cfloat {.importc: "mhud_live_backdropa", nodecl.}
+proc cHudLiveWx(): cfloat {.importc: "mhud_live_wx", nodecl.}
+proc cHudLiveWy(): cfloat {.importc: "mhud_live_wy", nodecl.}
+proc cHudPaneCallsTotal(): int64 {.importc: "mhud_pane_calls_total", nodecl.}
+proc cHudPaneCallsOver(): int64 {.importc: "mhud_pane_calls_over", nodecl.}
+proc cHudFsRectOk(): int64 {.importc: "mhud_fs_rect_ok", nodecl.}
+proc cHudFsRectBad(): int64 {.importc: "mhud_fs_rect_bad", nodecl.}
 proc cHudFsFrames(): int64 {.importc: "mhud_fs_frames", nodecl.}
 proc cHudFsSuppressed(): int64 {.importc: "mhud_fs_suppressed", nodecl.}
 proc cHudFsToggles(): int64 {.importc: "mhud_fs_toggles", nodecl.}
@@ -2202,6 +2371,27 @@ proc hudGhostZero*(): int64 = cHudGhostZero()
 proc hudRebases*(): int64 = cHudRebases()
 proc hudRebasedTracks*(): int64 = cHudRebasedTracks()
 proc hudRebaseMsMax*(): int64 = cHudRebaseMsMax()
+
+# ---- the widget's placement/chrome, read back from the LIVE mirror --------
+proc hudLiveAnchor*(): int = int(cHudLiveAnchor())
+proc hudLiveBorder*(): bool = cHudLiveBorder() != 0'i32
+proc hudLiveBorderPx*(): float = float(cHudLiveBorderPx())
+proc hudLiveBackdropOpacity*(): float = float(cHudLiveBackdropA())
+proc hudWidgetX*(): float = float(cHudLiveWx())
+proc hudWidgetY*(): float = float(cHudLiveWy())
+  ## The origin the ANCHOR resolved to on the most recent drawn frame -- not
+  ## the configured inset. These differ whenever the anchor is not MANUAL, and
+  ## that difference is the evidence the anchor is doing anything.
+
+# ---- the three falsifiable ledgers ---------------------------------------
+proc hudPaneCalls*(): int64 = cHudPaneCallsTotal()
+proc hudPaneCallsOver*(): int64 = cHudPaneCallsOver()
+  ## Dispatches on which MORE THAN ONE pane was rendered. Must be 0: one
+  ## renderer, one pane per frame. Non-zero means a second draw path exists.
+proc hudFsRectOk*(): int64 = cHudFsRectOk()
+proc hudFsRectBad*(): int64 = cHudFsRectBad()
+  ## Overlay frames whose rect did NOT match the screen square computed from
+  ## the measured back buffer. Must be 0.
 
 # ---------------------------------------------------------------- map ART
 
@@ -2366,6 +2556,12 @@ type
     colBot*: uint32
     colPlayer*: uint32
     colSelf*: uint32
+    ## PLACEMENT AND CHROME. `anchor` 0 = manual (mapX/mapY are absolute),
+    ## 1..4 = TL/TR/BL/BR with mapX/mapY read as an inset from that corner.
+    anchor*: int
+    border*: bool
+    borderPx*: float
+    backdropOpacity*: float
     ## THE FULL-SCREEN OVERLAY.
     fsEnabled*: bool     ## poll the key at all
     fsKey*: string       ## a UnityEngine.KeyCode NAME, "" = unbound
@@ -2397,6 +2593,33 @@ proc modeOf*(s: string): int =
   of "northup", "minimap", "north-up": ModeNorthUp
   of "headingup", "heading-up", "rotating": ModeHeadUp
   else:                   ModeOff
+
+const
+  AnchorManual* = 0
+  AnchorTL*     = 1
+  AnchorTR*     = 2
+  AnchorBL*     = 3
+  AnchorBR*     = 4
+
+proc anchorName*(a: int): string =
+  case a
+  of AnchorTL: "top-left"
+  of AnchorTR: "top-right"
+  of AnchorBL: "bottom-left"
+  of AnchorBR: "bottom-right"
+  else:        "manual"
+
+proc anchorOf*(s: string): int =
+  ## An UNRECOGNISED name resolves to `manual`, which is the historical
+  ## placement -- not to a corner the player did not ask for. The diag prints
+  ## `anchorName(hudLiveAnchor())`, so a typo is visible as "manual" rather
+  ## than silently becoming a corner.
+  case s
+  of "topleft", "top-left", "tl":         AnchorTL
+  of "topright", "top-right", "tr":       AnchorTR
+  of "bottomleft", "bottom-left", "bl":   AnchorBL
+  of "bottomright", "bottom-right", "br": AnchorBR
+  else:                                   AnchorManual
 
 proc keycodeOf*(name: string): int =
   ## The KeyCode ordinal for a name, or -1 (AOWL_KC_UNBOUND). "" is unbound and
@@ -2430,6 +2653,8 @@ proc hudInit*(o: HudOpts) =
   cHudConfigurePane(int32(o.mode), cfloat(o.zoom), cfloat(o.opacity),
                     (if o.drawArt: 1'i32 else: 0'i32), cfloat(o.contactPx),
                     o.colBot, o.colPlayer, o.colSelf)
+  cHudConfigureChrome(int32(o.anchor), (if o.border: 1'i32 else: 0'i32),
+                      cfloat(o.borderPx), cfloat(o.backdropOpacity))
   cHudConfigureFs(cfloat(o.fsMargin), cfloat(o.fsSpanM), cfloat(o.fsZoom),
                   cfloat(o.fsOpacity), (if o.fsNorthUp: 1'i32 else: 0'i32))
   # The overlay always starts CLOSED. Arming (or re-arming) a feature must never
@@ -2476,6 +2701,8 @@ proc hudReconfigure*(o: HudOpts; live: bool) =
                     cfloat(o.zoom), cfloat(o.opacity),
                     (if o.drawArt: 1'i32 else: 0'i32), cfloat(o.contactPx),
                     o.colBot, o.colPlayer, o.colSelf)
+  cHudConfigureChrome(int32(o.anchor), (if o.border: 1'i32 else: 0'i32),
+                      cfloat(o.borderPx), cfloat(o.backdropOpacity))
   cHudConfigureFs(cfloat(o.fsMargin), cfloat(o.fsSpanM), cfloat(o.fsZoom),
                   cfloat(o.fsOpacity), (if o.fsNorthUp: 1'i32 else: 0'i32))
   # Turning the feature OFF closes the overlay. Otherwise an off edit made with
