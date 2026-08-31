@@ -51,6 +51,14 @@ type
 var gModSetOn = false        ## `modSettingsRender` -- read once at boot
 var gModSetOff = false       ## self-disabled after `cModSetMaxFaults`
 var gModSetFaults = 0
+var gModSetColorRowsSeen = 0
+  ## How many `color` rows this host has CLASSIFIED off a fetched schema, ever.
+  ## Exists so `cwVerdict` can tell "no schema carried a colour row" from "the
+  ## schema fetch never ran at all" -- two causes that produced one identical
+  ## INCONCLUSIVE line, and the second one is what was actually true.
+var gModSetColorRowsRefused = 0
+  ## ...and how many of those were demoted because their value did not parse.
+var gModSetPagesParsed = 0
 var gModSetPhase = msIdle
 var gModSetArmedAt = 0'u64
 var gModSetMods: seq[tuple[guid: string, name: string]] = @[]
@@ -134,7 +142,8 @@ proc modSetHexVal(c: char): int =
   if c >= 'A' and c <= 'F': return 10 + int(c) - int('A')
   -1
 
-proc modSetParseColor(s: string; r, g, b, a: var float32): bool =
+proc modSetParseColor(s: string; r, g, b, a: var float32;
+                      hasA: var bool): bool =
   ## `#rgb`, `#rrggbb`, `#rrggbbaa`, with or without the leading `#`. This is
   ## the format `colorSetting(format=)` in `aowl/src/aowlspt/settings.nim`
   ## declares and the one the web picker writes, so the two UIs read and write
@@ -145,8 +154,49 @@ proc modSetParseColor(s: string; r, g, b, a: var float32): bool =
   ## not read looks exactly like a colour control showing a black setting, and
   ## the first drag would persist the invention over the real value.
   r = 0.0'f32; g = 0.0'f32; b = 0.0'f32; a = 1.0'f32
+  hasA = false
   var t = s
   if t.len > 0 and t[0] == '#': t = t[1 .. t.len - 1]
+  # ---- the `rgb` shape: `r,g,b` / `r,g,b,a`, components 0..1 -------------
+  #
+  # THIS BRANCH IS WHY THE FEATURE NEVER FIRED. `cColorFmtRgb` is the DEFAULT
+  # format every `colorSetting` gets, and until now this parser understood hex
+  # only -- so a default-format colour row failed to parse, was demoted to
+  # `swkStub`/`implemented = false` below, and rendered as an unbound text row
+  # carrying the raw value, which is exactly the reported symptom. It is a
+  # shape test, not a format-field test, on purpose: the row's declared format
+  # says what to WRITE, and trusting it to decide what to READ would turn one
+  # stale field into an unreadable colour.
+  var comma = false
+  for ch in t:
+    if ch == ',': comma = true
+  if comma:
+    var parts: seq[string] = @[]
+    var cur = ""
+    for ch in t:                          # capped: `t` is a settings value
+      if ch == ',':
+        parts.add cur
+        cur = ""
+      else:
+        cur.add ch
+    parts.add cur
+    if parts.len != 3 and parts.len != 4: return false
+    for p in parts:
+      if p.len == 0: return false
+    r = float32(modSetParseF64(parts[0], -1.0))
+    g = float32(modSetParseF64(parts[1], -1.0))
+    b = float32(modSetParseF64(parts[2], -1.0))
+    if parts.len == 4:
+      a = float32(modSetParseF64(parts[3], -1.0))
+      hasA = true
+    # STRICT, like the hex leg: an out-of-range component means the text was
+    # not a 0..1 colour at all (or `modSetParseF64` fell back), and inventing a
+    # clamped colour for it would put a control on screen showing a value the
+    # mod does not hold.
+    if r < 0.0'f32 or r > 1.0'f32 or g < 0.0'f32 or g > 1.0'f32 or
+       b < 0.0'f32 or b > 1.0'f32 or a < 0.0'f32 or a > 1.0'f32:
+      return false
+    return true
   if t.len != 3 and t.len != 6 and t.len != 8: return false
   var n: seq[int] = @[]
   var i = 0
@@ -167,6 +217,7 @@ proc modSetParseColor(s: string; r, g, b, a: var float32): bool =
   b = float32(n[4] * 16 + n[5]) / 255.0'f32
   if t.len == 8:
     a = float32(n[6] * 16 + n[7]) / 255.0'f32
+    hasA = true
   true
 
 proc modSetParseRow(obj: string; row: var SwRow): bool =
@@ -220,12 +271,28 @@ proc modSetParseRow(obj: string; row: var SwRow): bool =
     # If `cwBuildForRow` refuses, `swRenderPage` clears `seeded` and warns; the
     # row then displays but casts no vote.
     row.kind = swkColor
-    if not modSetParseColor(v, row.cr, row.cg, row.cb, row.ca):
+    row.declaredColor = true
+    # THE FORMAT, carried rather than assumed. `swReadBackPage` used to POST
+    # `#rrggbb` for EVERY colour row regardless of what the mod declared, so an
+    # in-game edit of a `hex` row (mods/maps, whose reader wants exactly six
+    # digits and no `#`) or of an `rgb` row silently wrote a shape the owning
+    # mod cannot read -- the setting reverts on the next read and looks like it
+    # did not persist. Defaulted through the SAME rule as the producer
+    # (`normalizeColorFormat` in aowl/src/aowlspt/settings.nim): unknown or
+    # absent means `rgb`, never "whatever this file happens to write".
+    row.cfmt = cSwColorFmtRgb
+    var fmtS = ""
+    if pathGet(obj, "colorFormat", fmtS):
+      if fmtS == cSwColorFmtHex or fmtS == cSwColorFmtHexHash:
+        row.cfmt = fmtS
+    inc gModSetColorRowsSeen
+    if not modSetParseColor(v, row.cr, row.cg, row.cb, row.ca, row.cHasA):
       # An unparseable colour is NOT rendered as a colour. Falling back to a
       # visible default would put a control on screen showing a value the mod
       # does not hold, and the first drag would then persist that invention.
       row.kind = swkStub
       row.implemented = false
+      inc gModSetColorRowsRefused
       row.label = row.label & " [unreadable colour '" & v & "']"
   else:
     # enum / string / keybind / anything else: no native widget exists to
@@ -293,6 +360,7 @@ proc modSetParseSchema(doc: string; guid, name: string; page: var SwPage): bool 
       rawRows.add row
     i = i + 1
   page.rows = modSetGroupByCategory(rawRows)
+  inc gModSetPagesParsed
   result = true
 
 proc modSetTick(now: uint64) =

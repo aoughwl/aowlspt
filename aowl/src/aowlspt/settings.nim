@@ -203,10 +203,27 @@ proc keybindSetting*(key, label: string; default: string;
                    optionLabels: @[], optionsUrl: "", description: description,
                    implemented: implemented, appliesOn: appliesOn)
 
+const
+  cColorFmtRgb* = "rgb"
+    ## `"r,g,b"` / `"r,g,b,a"`, components 0..1. THE DEFAULT.
+  cColorFmtHex* = "hex"
+    ## `"rrggbb"` / `"rrggbbaa"` -- NO leading `#`.
+  cColorFmtHexHash* = "hex#"
+    ## `"#rrggbb"` / `"#rrggbbaa"` -- WITH the leading `#`.
+
+proc normalizeColorFormat*(fmt: string): string =
+  ## THE ONE PLACE a colour format string is validated. Every producer and every
+  ## consumer goes through this or through the three constants above, so the two
+  ## UIs cannot drift apart on a bare literal -- which is exactly what happened:
+  ## the native settings renderer parsed `#rrggbb` only, while the default
+  ## format every mod gets is `r,g,b`, so every default-format colour row was
+  ## demoted to an unbound text stub in game while the web picker worked.
+  if fmt == cColorFmtHex or fmt == cColorFmtHexHash: fmt else: cColorFmtRgb
+
 proc colorSetting*(key, label: string; default: string;
                    category = ""; subcategory = ""; description = "";
                    implemented = true; appliesOn = "live";
-                   format = "rgb"): Setting =
+                   format = cColorFmtRgb): Setting =
   ## A colour row. `default` is `"r,g,b"` or `"r,g,b,a"`, components in 0..1 --
   ## the exact text the host's `duParseRgb` already reads out of
   ## `aowlspt-debugui.json`, so switching an existing `stringSetting` colour key
@@ -223,9 +240,7 @@ proc colorSetting*(key, label: string; default: string;
   ## `Setting.colorFormat`. Leave it alone unless the mod already parses hex;
   ## `"hex"`/`"hex#"` exist so an EXISTING hex key can be upgraded from a bare
   ## text box to this picker without touching a byte of what is on disk.
-  var fmt = format
-  if fmt != "hex" and fmt != "hex#":
-    fmt = "rgb"
+  let fmt = normalizeColorFormat(format)
   result = Setting(key: key, label: label, kind: stColor,
                    defaultJson: "\"" & server.escapeText(default) & "\"",
                    lo: 0.0, hi: 0.0, step: 0.0, hasRange: false,
@@ -350,7 +365,7 @@ proc toJson*(s: Setting): JsonObject =
   # nothing", and once one colour row carries a format an absent field on the
   # next one reads as an omission rather than as a choice.
   if s.kind == stColor:
-    o.put("colorFormat", (if s.colorFormat.len > 0: s.colorFormat else: "rgb"))
+    o.put("colorFormat", normalizeColorFormat(s.colorFormat))
   if s.subcategory.len > 0: o.put("subcategory", s.subcategory)
   if s.category.len > 0:  o.put("category", s.category)
   # The same grouping as an explicit, ordered path -- see `settingPath`. Always
