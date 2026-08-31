@@ -380,44 +380,177 @@ static int32_t aowl_ne_on_screen(float x, float y, float w, float h,
  * silently averaged the 6ms discovery slices into the steady state would be a
  * number that cannot be wrong, i.e. a number that says nothing. */
 #include <windows.h>
+#include <string.h>
 
-static int64_t g_ne_cost_n    = 0;
-static int64_t g_ne_cost_sum  = 0;   /* microseconds */
-static int64_t g_ne_cost_max  = 0;
+/* WHY THIS WAS REWRITTEN -- measured 2026-08-31.
+ *
+ * The previous meter reported `mean 15887868ns, max 350605us over 435 guarded
+ * tick(s) since the pool was built`. Two defects made that number undefendable,
+ * and NEITHER could be settled by reading it:
+ *
+ *  1. ONE POOL for every state. `aowl_ne_cost_reset` fires only on the
+ *     NeBuild->NeRun edge, so a canvas teardown that sends the machine back to
+ *     NeIdle/NeDiscover feeds SEEDING ticks (178 scene roots) and 6ms sliced
+ *     walk ticks into a total still LABELLED "since the pool was built". The
+ *     label asserted steady state; the samples were whatever happened.
+ *  2. The reset fired INSIDE the bracket -- `cost_begin` had already stamped
+ *     `t0`, so the pool-build tick itself (64 GameObject creations) was
+ *     recorded as sample #1 of the "clean" steady state. That is the only
+ *     credible source of a 350ms sample.
+ *
+ * And it could not answer the question that actually matters: is the number the
+ * BODY's own work, or a frame interval leaking into the bracket? So the meter
+ * now also samples the TICK-TO-TICK interval from the same clock. If body ~=
+ * interval the bracket is wrong; if body << interval the body cost is real.
+ * That comparison is printed, not inferred.
+ *
+ * Everything below is NANOSECONDS end to end. The old line mixed `...ns` and
+ * `...us` in one sentence, which is how a 15.9ms mean got read three different
+ * ways in one session.
+ *
+ * Phases are disjoint and exhaustive: every recorded tick lands in exactly one.
+ */
+
+#define AOWL_NE_PH_GATE     0   /* menu/loading gate: returned before work    */
+#define AOWL_NE_PH_DISCOVER 1   /* seed + sliced canvas walk                  */
+#define AOWL_NE_PH_SETTLE   2
+#define AOWL_NE_PH_BUILD    3   /* the one-off pool construction              */
+#define AOWL_NE_PH_RUN      4   /* THE STEADY STATE -- the only budgeted one  */
+#define AOWL_NE_PH_N        5
+
+/* THE BUDGET. Stated up front so the verdict can FAIL. The author's declared
+ * bound for the run path is <=64 projections, <=4096 float compares, <=64
+ * setter calls, <=64 Graphic::set_color. At Win64 call cost that is tens of
+ * microseconds; 250us is a generous ceiling that still leaves 15/16ths of a
+ * 16.6ms frame. p95 above it is a FAIL -- not a number for a human to judge. */
+#define AOWL_NE_BUDGET_NS   250000LL
+/* Fewer than this many RUN samples and the verdict is INCONCLUSIVE, never
+ * PASS. "I could not look" is not a pass. */
+#define AOWL_NE_MIN_SAMPLES 120
+
+/* Histogram edges in NANOSECONDS, for a real p95 instead of mean-and-max.
+ * A mean plus a max cannot say whether one 350ms outlier carries the mean. */
+#define AOWL_NE_NB 14
+static const int64_t g_ne_edge[AOWL_NE_NB] = {
+    1000LL, 2000LL, 5000LL, 10000LL, 20000LL, 50000LL, 100000LL,
+    250000LL, 500000LL, 1000000LL, 2000000LL, 5000000LL, 20000000LL,
+    0x7FFFFFFFFFFFFFFFLL };
+
+typedef struct {
+    int64_t n, sum, max, over;      /* ns; `over` = samples > budget */
+    int64_t h[AOWL_NE_NB];
+} aowl_ne_bucket;
+
+static aowl_ne_bucket g_ne_cost[AOWL_NE_PH_N];
+static aowl_ne_bucket g_ne_gap;     /* tick-to-tick interval, all phases */
 static int64_t g_ne_cost_t0   = 0;
+static int64_t g_ne_prev_t0   = 0;
 static int64_t g_ne_qpf       = 0;
+static int     g_ne_phase     = AOWL_NE_PH_GATE;
+static int64_t g_ne_dropped   = 0;  /* samples refused as absurd */
+
+static void aowl_ne_bucket_add(aowl_ne_bucket* b, int64_t ns) {
+    int i;
+    b->n++; b->sum += ns;
+    if (ns > b->max) b->max = ns;
+    if (ns > AOWL_NE_BUDGET_NS) b->over++;
+    for (i = 0; i < AOWL_NE_NB; i++) { if (ns <= g_ne_edge[i]) { b->h[i]++; break; } }
+}
 
 static void aowl_ne_cost_begin(void) {
     LARGE_INTEGER v;
     if (!g_ne_qpf) { LARGE_INTEGER f; QueryPerformanceFrequency(&f);
                      g_ne_qpf = (int64_t)f.QuadPart; }
     QueryPerformanceCounter(&v);
+    /* The interval between consecutive tick STARTS. Sampled from the same
+     * clock as the body so the two are directly comparable. */
+    if (g_ne_prev_t0 && g_ne_qpf > 0) {
+        int64_t d = ((int64_t)v.QuadPart - g_ne_prev_t0);
+        if (d > 0 && d < g_ne_qpf * 10) aowl_ne_bucket_add(&g_ne_gap, (d * 1000000000LL) / g_ne_qpf);
+    }
+    g_ne_prev_t0 = (int64_t)v.QuadPart;
     g_ne_cost_t0 = (int64_t)v.QuadPart;
+    /* Default phase for a tick that faults before the body classified itself:
+     * it is attributed, never silently dropped. */
+    g_ne_phase = AOWL_NE_PH_GATE;
+}
+
+/* Called by the body once it knows which state it is executing. This is what
+ * keeps a seeding tick out of the steady-state pool -- the old code relied on a
+ * reset that fired on one edge and could be bypassed by a teardown. */
+static void aowl_ne_cost_phase(int32_t ph) {
+    if (ph >= 0 && ph < AOWL_NE_PH_N) g_ne_phase = (int)ph;
 }
 
 static void aowl_ne_cost_end(void) {
     LARGE_INTEGER v;
-    int64_t us;
+    int64_t ns;
     if (!g_ne_cost_t0 || g_ne_qpf <= 0) return;
     QueryPerformanceCounter(&v);
-    us = (((int64_t)v.QuadPart - g_ne_cost_t0) * 1000000) / g_ne_qpf;
+    ns = (((int64_t)v.QuadPart - g_ne_cost_t0) * 1000000000LL) / g_ne_qpf;
     g_ne_cost_t0 = 0;
-    if (us < 0 || us > 10000000) return;         /* a suspended thread, not us */
-    g_ne_cost_n++;
-    g_ne_cost_sum += us;
-    if (us > g_ne_cost_max) g_ne_cost_max = us;
+    /* A refused sample is COUNTED. Silently dropping the pathological ones is
+     * how a meter stops being able to report a bad number. */
+    if (ns < 0 || ns > 10000000000LL) { g_ne_dropped++; return; }
+    aowl_ne_bucket_add(&g_ne_cost[g_ne_phase], ns);
 }
 
-static void    aowl_ne_cost_reset(void) {
-    g_ne_cost_n = 0; g_ne_cost_sum = 0; g_ne_cost_max = 0;
+static void aowl_ne_cost_reset(void) {
+    int i;
+    for (i = 0; i < AOWL_NE_PH_N; i++) {
+        aowl_ne_bucket z; memset(&z, 0, sizeof(z)); g_ne_cost[i] = z;
+    }
+    { aowl_ne_bucket z; memset(&z, 0, sizeof(z)); g_ne_gap = z; }
+    g_ne_dropped = 0;
+    /* t0 is deliberately LEFT ALONE: reset can be called from inside the
+     * bracket, and clearing t0 there would make the enclosing tick vanish. */
 }
-static int64_t aowl_ne_cost_samples(void) { return g_ne_cost_n; }
-static int64_t aowl_ne_cost_max_us(void)  { return g_ne_cost_max; }
-static int64_t aowl_ne_cost_mean_ns(void) {
-    /* nanoseconds, so a sub-microsecond steady state does not read as "0us"
-     * -- "0" is exactly the number that makes a cost line unfalsifiable. */
-    if (g_ne_cost_n <= 0) return -1;
-    return (g_ne_cost_sum * 1000) / g_ne_cost_n;
+
+static int64_t aowl_ne_cost_samples(int32_t ph) {
+    if (ph < 0 || ph >= AOWL_NE_PH_N) return 0;
+    return g_ne_cost[ph].n;
+}
+static int64_t aowl_ne_cost_max_ns(int32_t ph) {
+    if (ph < 0 || ph >= AOWL_NE_PH_N) return 0;
+    return g_ne_cost[ph].max;
+}
+static int64_t aowl_ne_cost_mean_ns(int32_t ph) {
+    if (ph < 0 || ph >= AOWL_NE_PH_N || g_ne_cost[ph].n <= 0) return -1;
+    return g_ne_cost[ph].sum / g_ne_cost[ph].n;
+}
+static int64_t aowl_ne_cost_over(int32_t ph) {
+    if (ph < 0 || ph >= AOWL_NE_PH_N) return 0;
+    return g_ne_cost[ph].over;
+}
+/* Upper edge of the bucket holding the p95 sample -- an UPPER BOUND, stated as
+ * such by the caller, never dressed up as an exact percentile. */
+static int64_t aowl_ne_cost_p95_ns(int32_t ph) {
+    int64_t want, seen = 0; int i;
+    if (ph < 0 || ph >= AOWL_NE_PH_N || g_ne_cost[ph].n <= 0) return -1;
+    want = (g_ne_cost[ph].n * 95 + 99) / 100;
+    for (i = 0; i < AOWL_NE_NB; i++) {
+        seen += g_ne_cost[ph].h[i];
+        if (seen >= want) return g_ne_edge[i];
+    }
+    return g_ne_cost[ph].max;
+}
+static int64_t aowl_ne_gap_mean_ns(void) {
+    if (g_ne_gap.n <= 0) return -1;
+    return g_ne_gap.sum / g_ne_gap.n;
+}
+static int64_t aowl_ne_gap_samples(void)  { return g_ne_gap.n; }
+static int64_t aowl_ne_cost_dropped(void) { return g_ne_dropped; }
+static int64_t aowl_ne_budget_ns(void)    { return AOWL_NE_BUDGET_NS; }
+static int64_t aowl_ne_min_samples(void)  { return AOWL_NE_MIN_SAMPLES; }
+static const char* aowl_ne_phase_name(int32_t ph) {
+    switch (ph) {
+    case AOWL_NE_PH_GATE:     return "gate";
+    case AOWL_NE_PH_DISCOVER: return "discover";
+    case AOWL_NE_PH_SETTLE:   return "settle";
+    case AOWL_NE_PH_BUILD:    return "build";
+    case AOWL_NE_PH_RUN:      return "run";
+    default:                  return "?";
+    }
 }
 
 /* ---- THE RECOLOUR METER ----------------------------------------------- */

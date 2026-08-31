@@ -116,9 +116,26 @@ proc cNeDropPolicy(): cstring {.importc: "aowl_ne_drop_policy", nodecl.}
 proc cNeCostBegin() {.importc: "aowl_ne_cost_begin", nodecl.}
 proc cNeCostEnd() {.importc: "aowl_ne_cost_end", nodecl.}
 proc cNeCostReset() {.importc: "aowl_ne_cost_reset", nodecl.}
-proc cNeCostSamples(): int64 {.importc: "aowl_ne_cost_samples", nodecl.}
-proc cNeCostMaxUs(): int64 {.importc: "aowl_ne_cost_max_us", nodecl.}
-proc cNeCostMeanNs(): int64 {.importc: "aowl_ne_cost_mean_ns", nodecl.}
+proc cNeCostPhase(ph: int32) {.importc: "aowl_ne_cost_phase", nodecl.}
+proc cNeCostSamples(ph: int32): int64 {.importc: "aowl_ne_cost_samples", nodecl.}
+proc cNeCostMaxNs(ph: int32): int64 {.importc: "aowl_ne_cost_max_ns", nodecl.}
+proc cNeCostMeanNs(ph: int32): int64 {.importc: "aowl_ne_cost_mean_ns", nodecl.}
+proc cNeCostP95Ns(ph: int32): int64 {.importc: "aowl_ne_cost_p95_ns", nodecl.}
+proc cNeCostOver(ph: int32): int64 {.importc: "aowl_ne_cost_over", nodecl.}
+proc cNeGapMeanNs(): int64 {.importc: "aowl_ne_gap_mean_ns", nodecl.}
+proc cNeGapSamples(): int64 {.importc: "aowl_ne_gap_samples", nodecl.}
+proc cNeCostDropped(): int64 {.importc: "aowl_ne_cost_dropped", nodecl.}
+proc cNeBudgetNs(): int64 {.importc: "aowl_ne_budget_ns", nodecl.}
+proc cNeMinSamples(): int64 {.importc: "aowl_ne_min_samples", nodecl.}
+proc cNePhaseName(ph: int32): cstring {.importc: "aowl_ne_phase_name", nodecl.}
+
+const
+  NePhGate     = 0'i32
+  NePhDiscover = 1'i32
+  NePhSettle   = 2'i32
+  NePhBuild    = 3'i32
+  NePhRun      = 4'i32
+  NePhN        = 5'i32
 proc cNeNoteRecolour() {.importc: "aowl_ne_note_recolour", nodecl.}
 proc cNeRecolours(): int64 {.importc: "aowl_ne_recolours", nodecl.}
 proc cNeMaxNodes(): int32 {.importc: "aowl_ne_max_nodes", nodecl.}
@@ -1933,20 +1950,84 @@ proc neAccountLine(): string =
              "were not. Do not read the box count as complete."
   result = result & ". Policy: " & readCString(cNeDropPolicy())
 
+proc neUs(ns: int64): string =
+  ## ONE unit, everywhere, always spelled. The line this replaced printed
+  ## "mean 15887868ns, max 350605us" in a single sentence; mixing the two units
+  ## is what let a 15.9ms mean be read three different ways in one session.
+  if ns < 0: return "n/a"
+  $(ns div 1000) & "." & $((ns mod 1000) div 100) & "us"
+
 proc neCostLine(): string =
-  ## What the per-frame path COSTS, measured, not bounded by assertion. Same
-  ## shape as the maps mod's drawCost line. The mean is in nanoseconds on
-  ## purpose: a steady state that rounds to "0us" is a cost line that cannot be
-  ## wrong, which is the same defect as a check that cannot fail.
-  let n = cNeCostSamples()
+  ## What the per-frame path COSTS, per PHASE, with an explicit budget and a
+  ## verdict that can FAIL. A cost meter that cannot report an unacceptable cost
+  ## is not a check.
+  let budget = cNeBudgetNs()
+  let n      = cNeCostSamples(NePhRun)
+  let mean   = cNeCostMeanNs(NePhRun)
+  let p95    = cNeCostP95Ns(NePhRun)
+  let mx     = cNeCostMaxNs(NePhRun)
+  let over   = cNeCostOver(NePhRun)
+
+  # THE VERDICT. Three outcomes, never two.
+  var verdict: string
   if n <= 0'i64:
-    return "cost: not measured yet (0 samples)"
-  "cost: mean " & $cNeCostMeanNs() & "ns, max " & $cNeCostMaxUs() & "us over " &
-    $n & " guarded tick(s) since the pool was built; recolours=" &
-    $cNeRecolours() & " Graphic::set_color call(s) TOTAL since arming (this " &
-    "is the number that falsifies \"the flat pool does not recolour per " &
-    "frame\" -- if it tracks " & $gNeBuilt & " per tick, the (class,band) " &
-    "cache is not working)"
+    verdict = "INCONCLUSIVE (0 steady-state tick(s) recorded -- the pool has " &
+              "never run, so nothing was measured; this is NOT a pass)"
+  elif n < cNeMinSamples():
+    verdict = "INCONCLUSIVE (" & $n & " of the " & $cNeMinSamples() &
+              " steady-state tick(s) needed before a verdict is meaningful)"
+  elif p95 > budget:
+    verdict = "FAIL: p95 " & neUs(p95) & " EXCEEDS the budget " & neUs(budget) &
+              " for this path (" & $over & " of " & $n & " tick(s) over " &
+              "budget). The per-frame ESP path is too expensive and must do " &
+              "less work per frame, not the same work faster."
+  elif mx > budget * 8:
+    verdict = "FAIL: p95 " & neUs(p95) & " is inside the budget " &
+              neUs(budget) & " but ONE tick cost " & neUs(mx) & " (>8x). A " &
+              "single stall of that size is a visible hitch even though the " &
+              "typical frame is cheap."
+  else:
+    verdict = "PASS: p95 " & neUs(p95) & " <= budget " & neUs(budget) &
+              ", max " & neUs(mx) & ", " & $over & " over-budget tick(s)"
+
+  result = "cost[run]: " & verdict & ". mean=" & neUs(mean) & " p95<=" &
+           neUs(p95) & " max=" & neUs(mx) & " over " & $n & " tick(s)"
+
+  # IS THE METER MEASURING THE BODY, OR A FRAME? The decisive comparison, and
+  # the reason it is printed rather than reasoned about: the bracket and the
+  # tick-to-tick interval come off the SAME clock. If the body duration is
+  # within a whisker of the interval, the bracket is spanning the frame wait and
+  # the number describes the game, not us. If it is a small fraction, the cost
+  # is genuinely ours.
+  let gap = cNeGapMeanNs()
+  if gap > 0 and mean > 0:
+    let pct = (mean * 100) div gap
+    result = result & ". Tick-to-tick interval mean=" & neUs(gap) & " over " &
+             $cNeGapSamples() & " tick(s), so the guarded body is " & $pct &
+             "% of one tick interval -- above ~80% would mean the BRACKET is " &
+             "spanning the frame wait and the cost is not ours to fix"
+  else:
+    result = result & ". Tick interval not sampled yet, so body-vs-frame is " &
+             "UNDECIDED"
+
+  # Every other phase, named, so nothing is silently folded into the budgeted
+  # one and a fat discovery walk is visible as a discovery walk.
+  var ph = 0'i32
+  while ph < NePhN:
+    if ph != NePhRun and cNeCostSamples(ph) > 0'i64:
+      result = result & ". " & $cNePhaseName(ph) & ": mean=" &
+               neUs(cNeCostMeanNs(ph)) & " max=" & neUs(cNeCostMaxNs(ph)) &
+               " n=" & $cNeCostSamples(ph) & " (NOT budgeted)"
+    ph = ph + 1'i32
+  if cNeCostDropped() > 0'i64:
+    result = result & ". " & $cNeCostDropped() & " sample(s) REFUSED as " &
+             "absurd (>10s -- a suspended thread, not us); they are counted " &
+             "here rather than dropped silently"
+
+  result = result & ". recolours=" & $cNeRecolours() &
+    " Graphic::set_color call(s) TOTAL since arming (this is the number that " &
+    "falsifies \"the flat pool does not recolour per frame\" -- if it tracks " &
+    $gNeBuilt & " per tick, the (class,band) cache is not working)"
 
 proc neColourLine(): string =
   ## WHERE EACH COLOUR CAME FROM. A settings value that failed to parse leaves
@@ -2053,16 +2134,25 @@ proc neTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ne_tick_body", cdecl.}
     gNeWhy = gate
     gNeVerdict = NeVInconclusive
     gNeCn = 0
+    # PHASE TAGGING, not a reset edge. Every recorded tick is attributed to the
+    # state that actually ran in it, so a teardown that sends the machine back
+    # through seeding can no longer contaminate a total labelled "steady state".
+    # The tag is set at the point the work is chosen, never afterwards.
+    cNeCostPhase(NePhGate)
     return cast[Il2CppPtr](1)
   case gNeState
   of NeIdle:
+    cNeCostPhase(NePhGate)
     gNeWhy = NeRNone
     gNeState = NeDiscover
   of NeDiscover:
+    cNeCostPhase(NePhDiscover)
     neDiscoverStep()
   of NeSettle:
+    cNeCostPhase(NePhSettle)
     neSettleStep()
   of NeBuild:
+    cNeCostPhase(NePhBuild)
     if neBuildPool():
       okLog "natesp: pool BUILT -- " & $gNeBuilt & " box(es) in ONE FLAT pool " &
             "(no faction partition; the old 4x8 partition drew 21 of 45 " &
@@ -2073,10 +2163,13 @@ proc neTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ne_tick_body", cdecl.}
             "Graphic::set_color only when a box's (class, fade band) changes. " &
             neColourLine() & ". Overflow policy: " &
             readCString(cNeDropPolicy()) & "."
-      # The cost meter starts CLEAN at NeRun. Discovery's 6ms sliced walk is a
-      # different question from the steady-state per-frame cost, and averaging
-      # the two produces a number that describes neither.
-      cNeCostReset()
+      # NO RESET HERE ANY MORE. The reset used to fire on this one edge, from
+      # INSIDE the cost bracket -- so `t0` survived it and THIS tick, the one
+      # that creates 64 GameObjects, was recorded as sample #1 of the supposedly
+      # clean steady state (the credible source of the 350ms max), while a later
+      # canvas teardown could route seeding ticks back into the same pool with
+      # the label unchanged. Phase tagging makes the separation structural
+      # instead of edge-triggered, so the build tick now lands in `build`.
       gNeState = NeRun
     else:
       neDestroyPool()
@@ -2094,7 +2187,10 @@ proc neTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ne_tick_body", cdecl.}
       gNeCreateTried = false
       gNeParentLine = "parent readback not run yet (torn down)"
       gNeState = NeIdle
+      cNeCostPhase(NePhGate)
       return cast[Il2CppPtr](1)
+    # From here on this tick IS the steady state: the only phase under budget.
+    cNeCostPhase(NePhRun)
     if (gNeTicks mod int64(cNeScanEvery())) == 0: neScan()
     nePlace(sw, sh)
     gNeVerdict = neVerdict(sw, sh)
