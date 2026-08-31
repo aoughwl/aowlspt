@@ -802,7 +802,7 @@ proc spatialSchema(): seq[Setting] =
 
     # ---- THE FULL-SCREEN OVERLAY ----------------------------------------
     boolSetting("hotkeys", "Enable the full-screen map key", false,
-                category = "Full-screen map",
+                category = "Full-screen map", keybind = true,
                 description = "OFF (the shipped default) means NOTHING is " &
                               "polled: no key is read, GameAssembly is not " &
                               "even looked up. ON binds " &

@@ -115,6 +115,37 @@ type
                           ## row already uses, so nothing can regress by adding
                           ## it.
     description*: string  ## one sentence of help
+    keybind*: bool        ## THE KEYBIND FACET. `true` means "this row belongs to
+                          ## the key-binding surface", which is a WIDER claim than
+                          ## `kind == stKeybind` and deliberately separate from it.
+                          ##
+                          ## `stKeybind` is a VALUE SHAPE (a key NAME string, drawn
+                          ## as a capture box). Two kinds of row are keybinds to a
+                          ## player and cannot be that shape:
+                          ##
+                          ## * a key stored as a VIRTUAL-KEY CODE -- `mods/debug`'s
+                          ##   `overlayToggleKey` is `114` (VK_F3) and its reader
+                          ##   parses an int. Retyping it `stKeybind` would change
+                          ##   the on-disk shape under a parser that would then
+                          ##   read the default instead. It declares the facet.
+                          ## * the GATE for a key -- `mods/maps` and `mods/admin`
+                          ##   both have a bool `hotkeys` that must be ON before
+                          ##   any key is polled at all. A "keybinds only" view
+                          ##   that hid the gate would show a key that provably
+                          ##   does nothing and no way to find out why. That is
+                          ##   the "control that changes nothing" failure, so the
+                          ##   gates declare the facet too.
+                          ##
+                          ## The alternative -- a filter that pattern-matches names
+                          ## containing "key" -- gets BOTH directions wrong on this
+                          ## repo's real data: it would hide `hotkeys`/`overlay
+                          ## ToggleKey`-style gates it did not recognise, and it
+                          ## would show `mods/loadammoanim`'s `hijackKey`, which is
+                          ## a BUNDLE NAME and not a key at all. Declared, not
+                          ## guessed.
+                          ##
+                          ## `keybindSetting` sets this itself; nothing else has
+                          ## to. Read it through `isKeybind`, never directly.
     implemented*: bool    ## false → drawn greyed with the reason in `description`
     appliesOn*: string    ## when an edit takes effect: `"live"` (default) or
                           ## `"restart"`. A row that CANNOT take effect until the
@@ -125,6 +156,12 @@ type
                           ## answer, silence is not. NOTE: this is unrelated to
                           ## `mods/manager`'s `appliesOn` wire field, which
                           ## carries a mod's SIDE (`client`/`server`/`both`).
+
+proc isKeybind*(s: Setting): bool =
+  ## THE single predicate for "is this row part of the key-binding surface".
+  ## Every filter, in every renderer, must ask this and nothing else -- the
+  ## whole point of the facet is that there is one answer and it is declared.
+  result = s.kind == stKeybind or s.keybind
 
 proc kindName*(k: SettingType): string =
   ## The wire name of a type, matching what the UI switches on.
@@ -147,24 +184,32 @@ proc kindName*(k: SettingType): string =
 # chosen so the shortest possible call still produces a usable control.
 
 proc boolSetting*(key, label: string; default: bool;
-                  category = ""; subcategory = ""; description = ""; implemented = true; appliesOn = "live"): Setting =
+                  category = ""; subcategory = ""; description = ""; implemented = true; appliesOn = "live";
+                  keybind = false): Setting =
+  ## `keybind = true` for a row that GATES a key (see `Setting.keybind`) -- a
+  ## bool is not a key, but hiding the gate from a keybinds-only view leaves a
+  ## key on screen that cannot fire.
   result = Setting(key: key, label: label, kind: stBool,
                    defaultJson: (if default: "true" else: "false"),
                    lo: 0.0, hi: 0.0, step: 0.0, hasRange: false,
                    options: @[], category: category, subcategory: subcategory,
                    optionLabels: @[], optionsUrl: "", description: description,
-                   implemented: implemented, appliesOn: appliesOn)
+                   implemented: implemented, appliesOn: appliesOn, keybind: keybind)
 
 proc intSetting*(key, label: string; default: int;
                  lo = 0; hi = 0; step = 1;
-                 category = ""; subcategory = ""; description = ""; implemented = true; appliesOn = "live"): Setting =
+                 category = ""; subcategory = ""; description = ""; implemented = true; appliesOn = "live";
+                 keybind = false): Setting =
+  ## `keybind = true` for a key stored as a VIRTUAL-KEY CODE. The int stays an
+  ## int on disk -- the facet is metadata, not a retype, so the mod's own parser
+  ## is untouched.
   result = Setting(key: key, label: label, kind: stInt,
                    defaultJson: $default,
                    lo: float(lo), hi: float(hi), step: float(step),
                    hasRange: hi > lo,
                    options: @[], category: category, subcategory: subcategory,
                    optionLabels: @[], optionsUrl: "", description: description,
-                   implemented: implemented, appliesOn: appliesOn)
+                   implemented: implemented, appliesOn: appliesOn, keybind: keybind)
 
 proc floatSetting*(key, label: string; default: float;
                    lo = 0.0; hi = 0.0; step = 0.0;
@@ -201,7 +246,7 @@ proc keybindSetting*(key, label: string; default: string;
                    lo: 0.0, hi: 0.0, step: 0.0, hasRange: false,
                    options: @[], category: category, subcategory: subcategory,
                    optionLabels: @[], optionsUrl: "", description: description,
-                   implemented: implemented, appliesOn: appliesOn)
+                   implemented: implemented, appliesOn: appliesOn, keybind: true)
 
 const
   cColorFmtRgb* = "rgb"
@@ -385,6 +430,12 @@ proc toJson*(s: Setting): JsonObject =
   # "this row applies live" from "this row said nothing", and an absent field
   # cannot carry that difference.
   o.put("appliesOn", (if s.appliesOn.len > 0: s.appliesOn else: "live"))
+  # Always emitted, never conditionally, for the same reason as `appliesOn`: a
+  # keybinds-only filter has to be able to tell "declared NOT a keybind" from
+  # "this server is too old to have an opinion". An absent field cannot carry
+  # that, and a filter that reads absence as `false` would silently empty itself
+  # against an older backend and look broken rather than say so.
+  o.put("keybind", isKeybind(s))
   result = o
 
 proc schemaJson*(settings: seq[Setting]): Json =

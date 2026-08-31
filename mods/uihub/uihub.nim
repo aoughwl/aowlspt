@@ -150,6 +150,25 @@ function haystack(row) {
   }
   return row.__hay;
 }
+/* THE keybind predicate. One place, asked by the row filter, the mod-list
+ * filter and the verdict counters alike, so those three cannot disagree.
+ *
+ * It reads the DECLARED facet (`aowl/src/aowlspt/settings.nim`, `isKeybind`) and
+ * never the key's name. Name-matching is wrong in both directions on this
+ * repo's own data: `mods/loadammoanim`'s `hijackKey` is a BUNDLE NAME and would
+ * be shown, while `mods/debug`'s `overlayToggleKey` (an int VK code) and the
+ * `hotkeys` gates in `mods/maps`/`mods/admin` would be hidden -- and hiding a
+ * gate leaves a key on screen that provably cannot fire. */
+function isKeybindRow(row) {
+  return row.keybind === true || row.type === 'keybind';
+}
+/* Does this server emit the facet at all? A row from a backend older than the
+ * facet has no `keybind` field, and reading that absence as `false` would empty
+ * the filter and look broken. Absence is reported, never silently filtered. */
+function declaresKeybindFacet(row) {
+  return row && row.keybind !== undefined;
+}
+
 /* Every whitespace-separated word must appear somewhere in the row's text.
  * AND, not OR, because with hundreds of rows an OR search returns the whole
  * list and reads as "search is broken". */
@@ -730,16 +749,27 @@ function mount(root, opts) {
   opts = opts || {};
   var state = {
     mods: [], guid: null, rows: [], schemas: {},
-    query: '', scope: 'mod', collapsed: {}, flat: [], drawn: 0, busy: false
+    query: '', scope: 'mod', collapsed: {}, flat: [], drawn: 0, busy: false,
+    /* Keybinds-only is PURE UI STATE. It is deliberately NOT a declared
+     * setting: it changes nothing on the server, it would never reach
+     * `onSettingsApplied`, and a key in some mod's config.json that no code
+     * reads is exactly the inert row the `aowl build mods` gate exists to
+     * refuse. It is remembered in localStorage and in the deep link instead. */
+    kbOnly: false,
+    /* The §9b counters, re-measured from the FINISHED list on every rebuild --
+     * never incremented by the code that does the filtering. */
+    kbAudit: null
   };
 
   root.innerHTML =
     '<nav id="aw-nav"><div class="aw-search"><input id="aw-q" type="search" placeholder="Search all settings"></div>' +
     '<label class="aw-scope"><input type="checkbox" id="aw-all"> search every mod</label>' +
+    '<label class="aw-scope aw-kbscope"><input type="checkbox" id="aw-kb"> keybinds only</label>' +
     '<div id="aw-mods"></div><div id="aw-cats"></div></nav>' +
     '<main id="aw-main"><div id="aw-titlebar"><h1 id="aw-title">aowlspt settings</h1>' +
     '<span id="aw-count"></span><button id="aw-resetall" style="display:none">Reset everything to default</button></div>' +
     '<div id="aw-unbound" class="aw-verdict" style="display:none"></div>' +
+    '<div id="aw-kbverdict" class="aw-verdict" style="display:none"></div>' +
     '<div id="aw-body"></div><div id="aw-sentinel"></div></main>';
 
   var $ = function (id) { return root.querySelector('#' + id); };
@@ -766,6 +796,7 @@ function mount(root, opts) {
      * resolve on reload because no category is called Core. */
     if (extra && extra.sub) parts.push('sub=' + encodeURIComponent(extra.sub));
     if (state.query) parts.push('q=' + encodeURIComponent(state.query));
+    if (state.kbOnly) parts.push('kb=1');
     var h = '#' + parts.join('&');
     if (location.hash !== h) history.replaceState(null, '', h);
   }
@@ -786,7 +817,9 @@ function mount(root, opts) {
     }
     var total = 0, shownCount = 0;
     sources.forEach(function (src) {
-      var kept = src.rows.filter(function (r) { return matches(r, state.query); });
+      var kept = src.rows.filter(function (r) {
+        return matches(r, state.query) && (!state.kbOnly || isKeybindRow(r));
+      });
       total += src.rows.length;
       shownCount += kept.length;
       if (!kept.length) return;
@@ -810,11 +843,101 @@ function mount(root, opts) {
     state.drawn = 0;
     UNBOUND = [];                 /* re-measured every render, never cumulative */
     body.innerHTML = '';
-    $('aw-count').textContent = state.query
+    $('aw-count').textContent = (state.query || state.kbOnly)
       ? shownCount + ' of ' + total + ' settings match'
       : total + ' settings';
+    auditKeybinds(sources);
     drawMore();
     drawSidebar(sources);
+    reportKeybinds();
+  }
+
+  /* ---- the §9b audit of the keybinds-only filter ----------------------
+   *
+   * Stated as two NEGATIVES over the FINISHED list, both of which a change can
+   * falsify. Neither is a self-comparison: both walk `state.flat` (what the
+   * screen will actually contain) and the untouched source schemas, not the
+   * predicate's own bookkeeping.
+   *
+   *   1. shown  -- rows that ARE in the list but are NOT keybinds. Must be 0.
+   *   2. hidden -- mods with >=1 declared keybind that the mod list dropped.
+   *                Must be 0. This is the one a naive filter gets wrong.
+   *
+   * Third outcome, not a boolean: a mod whose schema has not been fetched has
+   * an UNKNOWN keybind count. It is counted as `unknown`, never as zero, and it
+   * is never hidden -- "I could not look" is not "there is nothing there". */
+  function auditKeybinds(sources) {
+    if (!state.kbOnly) { state.kbAudit = null; return; }
+    var a = {shownNonKeybind: [], hiddenWithKeybind: [], unknownMods: [],
+             shownRows: 0, noFacet: 0, modsWithKeybinds: 0};
+    for (var i = 0; i < state.flat.length; i++) {
+      var it = state.flat[i];
+      if (it.t !== 'row') continue;
+      a.shownRows++;
+      if (!declaresKeybindFacet(it.row)) a.noFacet++;
+      if (!isKeybindRow(it.row)) a.shownNonKeybind.push(it.guid + '/' + it.row.key);
+    }
+    var visible = {};
+    sources.forEach(function (s) { visible[s.guid] = 1; });
+    state.mods.forEach(function (m) {
+      var sch = state.schemas[m.guid];
+      if (!sch) { a.unknownMods.push(m.guid); return; }
+      var n = sch.filter(isKeybindRow).length;
+      if (n > 0) {
+        a.modsWithKeybinds++;
+        /* Hidden = has keybinds, yet the mod list would not offer it. In `mod`
+         * scope only the open mod is a source, so the claim is about the
+         * SIDEBAR, which is what the user navigates by. */
+        if (!modListShows(m.guid)) a.hiddenWithKeybind.push(m.guid);
+      }
+    });
+    state.kbAudit = a;
+  }
+
+  /* Whether the mod list offers this mod under the current filter. UNKNOWN
+   * (schema not fetched) is `true` -- never hide what has not been examined. */
+  function modListShows(guid) {
+    if (!state.kbOnly) return true;
+    var sch = state.schemas[guid];
+    if (!sch) return true;
+    return sch.some(isKeybindRow);
+  }
+
+  function reportKeybinds() {
+    var b = $('aw-kbverdict');
+    if (!b) return;
+    var a = state.kbAudit;
+    if (!a) { b.style.display = 'none'; b.textContent = ''; return; }
+    b.style.display = 'block';
+    var head = 'Keybinds only: ' + a.shownRows + ' rows shown, ' +
+               a.modsWithKeybinds + ' mods have >=1 declared keybind. ';
+    if (a.shownNonKeybind.length || a.hiddenWithKeybind.length) {
+      b.className = 'aw-verdict aw-fail';
+      b.textContent = 'FAIL: ' + head +
+        a.shownNonKeybind.length + ' non-keybind rows are visible (' +
+        a.shownNonKeybind.slice(0, 6).join(', ') + '); ' +
+        a.hiddenWithKeybind.length + ' mods with keybinds were hidden (' +
+        a.hiddenWithKeybind.slice(0, 6).join(', ') + ').';
+      return;
+    }
+    if (a.shownRows === 0 || a.unknownMods.length || a.noFacet) {
+      b.className = 'aw-verdict aw-inconc';
+      b.textContent = 'INCONCLUSIVE: ' + head +
+        (a.shownRows === 0
+          ? 'No row was drawn, so nothing was examined -- an empty list is not proof the filter is right. '
+          : '') +
+        (a.unknownMods.length
+          ? a.unknownMods.length + ' mods have no schema loaded, so their keybind count is UNKNOWN and they are still listed (' +
+            a.unknownMods.slice(0, 6).join(', ') + '). '
+          : '') +
+        (a.noFacet
+          ? a.noFacet + ' drawn rows carry no `keybind` field at all -- this backend predates the facet, so the filter cannot be trusted here. '
+          : '');
+      return;
+    }
+    b.className = 'aw-verdict aw-pass';
+    b.textContent = 'PASS: ' + head +
+      '0 non-keybind rows visible, 0 mods with keybinds hidden.';
   }
 
   function drawMore() {
@@ -931,12 +1054,28 @@ function mount(root, opts) {
   function drawSidebar(sources) {
     var mods = $('aw-mods');
     mods.innerHTML = '';
+    var listed = 0;
     state.mods.forEach(function (m) {
+      /* THE MOD-LIST HALF of the filter: a mod with zero declared keybinds
+       * disappears entirely. A mod whose schema was never fetched is NOT
+       * hidden (see `modListShows`) -- it is listed with its count marked
+       * unknown, because hiding it would be a guess dressed up as an answer. */
+      if (!modListShows(m.guid)) return;
+      listed++;
+      var sch = state.schemas[m.guid];
+      var n = state.kbOnly
+                ? (sch ? String(sch.filter(isKeybindRow).length) : '?')
+                : String(m.count);
       var d = el('div', 'aw-mod' + (m.guid === state.guid && state.scope === 'mod' ? ' active' : ''),
-                 m.name + ' (' + m.count + ')');
+                 m.name + ' (' + n + ')');
       d.onclick = function () { state.scope = 'mod'; $('aw-all').checked = false; open(m.guid); };
       mods.appendChild(d);
     });
+    if (state.kbOnly && listed === 0) {
+      mods.appendChild(el('div', 'aw-note',
+        'No loaded mod declares a keybind. This is a real answer, not a blank ' +
+        'screen: ' + state.mods.length + ' mods were examined.'));
+    }
     var cats = $('aw-cats');
     cats.innerHTML = '';
     var seen = {};
@@ -990,6 +1129,27 @@ function mount(root, opts) {
     writeHash();
     rebuild();
   };
+  /* Turning the filter ON loads EVERY schema first. Without that, a mod whose
+   * keybind count is unknown could not be judged, and the tempting shortcut --
+   * treat unknown as zero and hide it -- is precisely violation #2: a mod with
+   * keybinds vanishing from the list. Loading first makes the answer knowable
+   * rather than making the wrong guess cheap. */
+  $('aw-kb').onchange = async function () {
+    state.kbOnly = $('aw-kb').checked;
+    try { global.localStorage.setItem('aowl.kbOnly', state.kbOnly ? '1' : '0'); } catch (e) {}
+    if (state.kbOnly) {
+      $('aw-count').textContent = 'loading every mod' + String.fromCharCode(0x2026);
+      await loadAll();
+      /* If the mod currently open has no keybinds, move to one that has --
+       * landing on an empty page is indistinguishable from a broken filter. */
+      if (state.scope === 'mod' && !modListShows(state.guid)) {
+        var alt = state.mods.filter(function (m) { return modListShows(m.guid); })[0];
+        if (alt) { await open(alt.guid, true); writeHash(); return; }
+      }
+    }
+    writeHash();
+    rebuild();
+  };
   $('aw-all').onchange = async function () {
     state.scope = $('aw-all').checked ? 'all' : 'mod';
     if (state.scope === 'all') {
@@ -1034,7 +1194,20 @@ function mount(root, opts) {
     }
     var h = readHash();
     if (h.q) { state.query = h.q; $('aw-q').value = h.q; }
+    /* The link wins over the remembered preference: a URL that says `kb=1` and
+     * opens unfiltered is a link that does not work. */
+    var stored = '0';
+    try { stored = global.localStorage.getItem('aowl.kbOnly') || '0'; } catch (e) {}
+    state.kbOnly = h.kb === '1' || (h.kb === undefined && stored === '1');
+    $('aw-kb').checked = state.kbOnly;
     var want = h.guid && state.mods.some(function (m) { return m.guid === h.guid; }) ? h.guid : state.mods[0].guid;
+    if (state.kbOnly) {
+      await loadAll();
+      if (!modListShows(want)) {
+        var alt0 = state.mods.filter(function (m) { return modListShows(m.guid); })[0];
+        if (alt0) want = alt0.guid;
+      }
+    }
     await open(want, true);
     if (h.cat) {
       var anchor = catId(want, h.cat, h.sub || '');
@@ -1057,6 +1230,7 @@ global.AowlSettings = {
   listMods: listMods, getSchema: getSchema,
   setValue: setValue, resetKey: resetKey, resetAll: resetAll,
   matches: matches, groupRows: groupRows,
+  isKeybindRow: isKeybindRow, declaresKeybindFacet: declaresKeybindFacet,
   inlineOptions: inlineOptions, labelForValue: labelForValue,
   controlFor: controlFor, mount: mount
 };
@@ -1109,6 +1283,9 @@ const PageHtml = """<!doctype html>
   .aw-verdict { margin:8px 0; padding:8px 10px; border-radius:5px; font-size:12px; line-height:1.5; }
   .aw-fail { background:#3a1f1f; border:1px solid #6a3030; color:#f0b0b0; }
   .aw-inconc { background:#332d1c; border:1px solid #63552c; color:#e6d29a; }
+  .aw-pass { background:#1c2f22; border:1px solid #2f5a3d; color:#a8dfba; }
+  .aw-kbscope { margin-top:-4px; }
+  .aw-kbscope input:checked + span, label.aw-kbscope:has(input:checked) { color:#9fd8ae; }
   .cp { position:relative; display:inline-block; }
   .cp-sw { width:54px; height:26px; border:1px solid #444; border-radius:4px; cursor:pointer; padding:0;
            background-image:linear-gradient(45deg,#555 25%,transparent 25%,transparent 75%,#555 75%),
