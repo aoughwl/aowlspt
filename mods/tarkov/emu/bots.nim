@@ -140,6 +140,8 @@ import ids
 import rand
 import templates
 import grid
+import knobs
+import botgear
 
 type
   BotRequest* = object
@@ -250,6 +252,22 @@ proc chanceFor(chances: JsonRef; group, slot: string; fallback: int): int =
   if not v.found:
     return fallback
   result = v.asInt(fallback)
+
+var gGear = defaultBotGearConfig()
+var gGearLoaded = false
+
+proc refreshBotGear*() =
+  ## Re-read the Bot gear/loot page. Called once per BATCH -- not once per bot,
+  ## which would be 30 config reads on the loading screen for one answer, and
+  ## not once per process, which would make an edit take a restart when the
+  ## whole point of the page is that it does not.
+  gGear = botGearConfig()
+  gGearLoaded = true
+
+proc botGear(): BotGearConfig =
+  if not gGearLoaded:
+    refreshBotGear()
+  result = gGear
 
 proc pickTemplate(pool: JsonRef; r: var Rng): string =
   ## One template id out of a weight map, in proportion to its weight.
@@ -592,7 +610,11 @@ proc addMods(t: BotTables; inv, chances: JsonRef; items: var List;
       if not required:
         if n <= 0:
           continue
-        let pct = chanceFor(chances, group, slotName, 100)
+        # Bots > Attachments. A multiplier on the TABLE'S OWN chance, so a
+        # slot the database never fills stays unfilled and a required slot is
+        # untouched (this branch only runs when `required` is false).
+        let pct = scalePercent(chanceFor(chances, group, slotName, 100),
+                               modMultiplier(botGear(), weapon))
         if pct <= 0:
           continue
         if pct < 100 and not chance(r, float(pct) / 100.0):
@@ -778,6 +800,13 @@ proc randomStackCount(tpl: string; r: var Rng): int =
   if a < 1: a = 1
   if b < a: b = a
   result = a + nextInt(r, b - a + 1)
+  # Loot > Money. The three money rows shape a CURRENCY stack only; loose
+  # ammunition declares the same range and is deliberately left alone, because
+  # a row labelled "money" that also halved every bot's ammo would be a control
+  # that does something other than it says. At the defaults (x1.0, no floor, no
+  # ceiling) `applyMoneyStack` returns its input and this costs one comparison.
+  if isMoneyTpl(tpl):
+    result = applyMoneyStack(botGear().moneyStacks, result)
 
 proc addContainerLoot(inv, generation: JsonRef; items: var List;
                       c: var Container; kind: string; r: var Rng;
@@ -842,14 +871,18 @@ proc addSpareMags(inv: JsonRef; items: var List; carried: var seq[Container];
   ## than written to a cell that overlaps something.
   if carried.len == 0:
     return
+  # Bots > Ammunition. `MaxSpareMags` was a compiled-in 4; it is now the
+  # default of a row, clamped to 0..16 in `botgear`. Zero is a real answer --
+  # a bot with one magazine and no reload -- and it is the player's to choose.
+  let maxSpares = botGear().spareMags
   var placed = 0
   for m in spares:
-    if placed >= MaxSpareMags:
+    if placed >= maxSpares:
       break
     if m.tpl.len == 0:
       continue
     var n = 0
-    while n < SparesPerWeapon and placed < MaxSpareMags:
+    while n < SparesPerWeapon and placed < maxSpares:
       inc n
       var gridName = ""
       var location = ""
@@ -1251,6 +1284,10 @@ proc addLoadout(t: BotTables; items: var List; equipmentId: string;
   if not inv.found:
     return
   let chances = field(t.raw, "chances")
+  # Read once for this bot, off the batch-cached object: the family the role
+  # belongs to decides which pair of family rows applies.
+  let g = botGear()
+  let fam = familyOf(t.role)
   let equipment = inv.field("equipment")
   if not equipment.found:
     return
@@ -1269,7 +1306,11 @@ proc addLoadout(t: BotTables; items: var List; equipmentId: string;
     let pool = equipment.field(slot)
     if not pool.found:
       continue
-    let pct = chanceFor(chances, "equipment", slot, 100)
+    # Bots > Gear. global x family x slot, all three defaulting to 1.0, and
+    # `scalePercent` returns its input unchanged at exactly 1.0 -- so an
+    # untouched page draws the same slot with the same roll as before.
+    let pct = scalePercent(chanceFor(chances, "equipment", slot, 100),
+                           gearMultiplier(g, fam, slot))
     if pct <= 0:
       continue
     if pct < 100 and not chance(r, float(pct) / 100.0):
@@ -1327,10 +1368,15 @@ proc addLoadout(t: BotTables; items: var List; equipmentId: string;
   # The richness knob also raises the per-bot loot BOUND when it is above one,
   # or the extra items the multiplier asks for would have nowhere in the budget
   # to go -- the cap stays a cap (5x at most), it just tracks the setting.
-  let richness = lootRichness()
-  var lootBudget = MaxLootPerBot
+  # The Bot AI mod's database-published richness, THEN the settings page's
+  # global x family multiplier on top of it. Two owners, one number, and the
+  # order is stated: the page scales whatever the Bot AI mod published rather
+  # than replacing it, so neither control silently wins.
+  let richness = lootRichness() * lootMultiplier(g, fam)
+  let cap = g.maxLootPerBot
+  var lootBudget = cap
   if richness > 1.0:
-    lootBudget = int(float(MaxLootPerBot) * richness)
+    lootBudget = int(float(cap) * richness)
   for i in 0 ..< carried.len:
     if lootBudget <= 0:
       break
@@ -1783,6 +1829,9 @@ proc generate*(body: string; generated: var int): string =
   ## sides in `post1/locations.json`. This proc simply honours whatever role the
   ## client asks for.
   generated = 0
+  # Once per batch, before any bot is built: an edit made on the settings page
+  # between two raids is in force for the next one without a restart.
+  refreshBotGear()
   var out1 = arr()
   let requests = parseRequests(body)
   # Diagnostic: make the requested role/limit/difficulty visible. The backend
@@ -1952,6 +2001,13 @@ proc selfCheckBots*(into: var seq[string]): bool =
   ## and not over somebody else's data. Those checks want `realtest`, which
   ## runs against a real database and reports rather than refuses.
   let before = into.len
+  # Force a real read of the whole Bot gear/loot page before the fixture pass,
+  # so the ledger in `emu/knobs` records what THIS generation actually asked
+  # for. Without it the lazy path would serve a default object and the ledger
+  # would show nothing read -- which the ledger reports as INCONCLUSIVE, not as
+  # a pass, but a check that is always inconclusive is no better than one that
+  # always passes.
+  refreshBotGear()
   let t = BotTables(ok: true, role: "assault", raw: ChkRole)
   let req = BotRequest(role: "assault", difficulty: "normal", count: 1)
 
