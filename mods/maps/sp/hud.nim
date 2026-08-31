@@ -1,4 +1,4 @@
-## sp/hud.nim -- the IN-GAME draw: radar and direction indicators, over the
+﻿## sp/hud.nim -- the IN-GAME draw: radar and direction indicators, over the
 ## SHARED per-frame region.
 ##
 ## ## Why this file exists, and what it replaced
@@ -286,6 +286,15 @@ static struct {
     int32_t  border;           /* 0 = no frame drawn at all */
     float    borderPx;         /* frame thickness, pixels */
     float    backdropA;        /* 0..1, the BACKDROP's own opacity */
+    /* THE NORTH PIP -- the small amber square that sits a short way from the
+     * pane centre, in the direction of world NORTH. It is what a player sees
+     * as "a yellow dot in front of the centre dot", and until this switch
+     * existed it was unexplained and unremovable UI. It is NOT the player, NOT
+     * a heading marker and NOT a contact: on a NORTH-UP pane it is pinned to
+     * the top edge (so it does look like it is "in front"), and on a
+     * HEADING-UP pane it swings as the player turns, which is the whole point
+     * of drawing it. 0 = do not draw it at all. */
+    int32_t  northPip;
 
     /* THE UNIFIED-PATH LEDGER. `paneCalls` is zeroed at the top of every
      * dispatch and incremented on entry to mhud_draw_pane_full -- the ONE pane
@@ -561,6 +570,9 @@ static void mhud_reset(void) {
     g_mhud.colBot         = MHUD_RGBA(230,  70,  60, 235);
     g_mhud.colPlayer      = MHUD_RGBA( 70, 190, 255, 235);
     g_mhud.colSelf        = MHUD_RGBA(255, 255, 255, 255);
+    /* memset left this 0, which would silently REMOVE the pip for every
+     * existing config. 1 is the historical behaviour; the setting subtracts. */
+    g_mhud.northPip       = 1;
     /* Per-class defaults. memset left clsShow all-ZERO, which would be an
      * invisible map that reads exactly like a broken feed, so every class
      * starts VISIBLE and the toggles subtract from that. */
@@ -780,7 +792,9 @@ static void mhud_configure_pane(int32_t mode, float zoom, float opacity,
  * for the same reason the pane's do -- config.json is hand-editable and a
  * borderPx of 400 on a 128 px widget is a solid rectangle. */
 static void mhud_configure_chrome(int32_t anchor, int32_t border,
-                                  float borderPx, float backdropA) {
+                                  float borderPx, float backdropA,
+                                  int32_t northPip) {
+    g_mhud.northPip = northPip ? 1 : 0;
     g_mhud.anchor = (anchor >= MHUD_ANCHOR_MANUAL && anchor <= MHUD_ANCHOR_BR)
                     ? anchor : MHUD_ANCHOR_MANUAL;
     g_mhud.border = border ? 1 : 0;
@@ -1399,7 +1413,27 @@ static const unsigned char MHUD_SIG_GETKEYDOWN[16] = {
     0x40,0x53,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,0x9B,0x71,0xDB,0x01,0x8B,0xD9,0x48 };
 #define MHUD_HK_MAXFAIL 240
 
-typedef int32_t (*MHudGetKeyDownFn)(int32_t keyCode, void* methodInfo);
+/* THE RETURN TYPE IS ONE BYTE, NOT FOUR. MEASURED, from the body at
+ * RVA 0x531EB80 (96 bytes read straight out of GameAssembly.dll's `il2cpp`
+ * section on 2026-08-31):
+ *
+ *   push rbx ; sub rsp,0x20 ; mov rax,[rip+0x1DB719B] ; mov ebx,ecx
+ *   test rax,rax ; jnz .have ; lea rcx,[..] ; call <resolve> ; test rax,rax
+ *   je .fail ; mov [rip+..],rax ; .have: mov ecx,ebx ; add rsp,0x20 ; pop rbx
+ *   jmp rax                       <-- TAIL JUMP into the native icall
+ *
+ * So this managed method never materialises a return value of its own: it
+ * TAIL-JUMPS into Unity's native `GetKeyDownInt`, whose C++ return type is
+ * `bool` -- AL only, upper 24 bits of EAX UNDEFINED by the Win64 ABI.
+ *
+ * Declaring the pointer as returning `int32_t` therefore made the caller test
+ * all 32 bits, so any junk left in EAX bits 8..31 by the icall read as "the
+ * key is down" -- for EVERY key, which is precisely the reported symptom
+ * ("the map is going fullscreen on any keypress") and precisely why the live
+ * ladder measured 41 toggles in a raid where M was pressed a handful of
+ * times. `unsigned char` makes the compiler read AL and nothing else, and the
+ * `& 1u` at the call sites is the second belt: a managed bool is 0 or 1. */
+typedef unsigned char (*MHudGetKeyDownFn)(int32_t keyCode, void* methodInfo);
 static MHudGetKeyDownFn g_mhud_keyFn = 0;
 /* 0 not attempted | 1 GameAssembly.dll not mapped yet (TRANSIENT, must not
  * latch) | 2 PROLOGUE MISMATCH -- refused, nothing is ever called | 3 bound. */
@@ -1446,22 +1480,57 @@ static int32_t mhud_key_disabled(void) {
  * ESCAPE always closes, and is only tested while the overlay is OPEN, so this
  * can never swallow the player's Escape in normal play (it does not swallow it
  * even then -- GetKeyDown only READS). */
+/* THE CONTROL KEY -- the check that CAN fail.
+ *
+ * `toggles=41` could not distinguish "the player pressed M 41 times" from "any
+ * key toggles", and that is exactly why the any-key bug shipped behind a green
+ * ladder line. A count of the thing you want cannot falsify itself.
+ *
+ * So on every tick where the bound key reads DOWN, ask the same function about
+ * a key the player provably is not holding: `Joystick8Button19` (ordinal 509),
+ * the last member of UnityEngine.KeyCode's eighth virtual gamepad. If THAT
+ * also reads down, the read is not honouring its argument, and the honest
+ * response is to REFUSE the toggle and count the refusal -- not to open a
+ * full-screen panel over the player's raid.
+ *
+ * Cost: zero on a normal tick. The control is only asked on ticks where the
+ * bound key already said yes, so the shipped path is still one il2cpp call per
+ * tick. Nothing is allocated and nothing is written to the game. */
+#define MHUD_KC_CONTROL 509
+static int64_t g_mhud_fsKeyDown  = 0;   /* ticks the bound key read DOWN      */
+static int64_t g_mhud_fsCtlDown  = 0;   /* ...on which the CONTROL also did   */
+
+static int32_t mhud_key_down(int32_t kc) {
+    /* AL only -- see the typedef. The mask is the second belt, not the first. */
+    return (int32_t)(g_mhud_keyFn(kc, 0) & 1u);
+}
+
 static int32_t mhud_fs_poll(int32_t kc, int32_t enabled) {
     if (!enabled || kc == AOWL_KC_UNBOUND) return g_mhud.fsOn;
     if (g_mhud_keyFail >= MHUD_HK_MAXFAIL) return g_mhud.fsOn;  /* self-disabled */
     if (mhud_key_state() != 3) { g_mhud_keyFail++; return g_mhud.fsOn; }
     g_mhud_keyFail = 0;
-    if (g_mhud_keyFn(kc, 0)) {
+    if (mhud_key_down(kc)) {
+        g_mhud_fsKeyDown++;
+        if (kc != MHUD_KC_CONTROL && mhud_key_down(MHUD_KC_CONTROL)) {
+            /* Indiscriminate read. Do NOT toggle -- and say so, loudly, in the
+             * ladder rather than silently swallowing it. */
+            g_mhud_fsCtlDown++;
+            return g_mhud.fsOn;
+        }
         g_mhud.fsOn = g_mhud.fsOn ? 0 : 1;
         g_mhud.fsToggles++;
         return g_mhud.fsOn;
     }
-    if (g_mhud.fsOn && g_mhud_keyFn(aowl_keycode_of("Escape"), 0)) {
+    if (g_mhud.fsOn && mhud_key_down(aowl_keycode_of("Escape"))) {
         g_mhud.fsOn = 0;
         g_mhud.fsToggles++;
     }
     return g_mhud.fsOn;
 }
+
+static int64_t mhud_fs_keydowns(void)  { return g_mhud_fsKeyDown; }
+static int64_t mhud_fs_rejected(void)  { return g_mhud_fsCtlDown; }
 
 /* ==================== THE ONE PANE RENDERER ============================
  *
@@ -1565,8 +1634,14 @@ static int32_t mhud_draw_pane_full(float px, float py, float size, float spanM,
         prims += 2;
     }
     /* A north pip, so which way is up is never a guess. On a heading-up pane it
-     * swings as the player turns; on a north-up pane it sits fixed at the top. */
-    {
+     * swings as the player turns; on a north-up pane it sits fixed at the top.
+     *
+     * THIS IS THE "YELLOW DOT IN FRONT OF THE CENTRE DOT". It is the only
+     * amber primitive this renderer submits (RGBA 255,210,90) and it is drawn
+     * 45% of the half-span from the player, which on a north-up pane puts it
+     * a short way ABOVE the player arrow -- exactly where a heading marker
+     * would be, which is why it reads as one. `northPip` turns it off. */
+    if (g_mhud.northPip) {
         MmPt np = mm_topdown(g_mhud.px, g_mhud.pz + spanM * 0.45f,
                              g_mhud.px, g_mhud.pz, px, py, size, spanM, rot);
         aowl_region_fill(np.x - 2.0f, np.y - 2.0f, 4.0f, 4.0f,
@@ -1710,7 +1785,7 @@ static void mhud_draw(void* user, int64_t frame) {
     if (!g_mhud.enabled) {
         g_mhud.heldValid = 0;
         g_mhud.gated++;
-        /* The finished-state assertion (§9b), recorded rather than assumed: this
+        /* The finished-state assertion (Â§9b), recorded rather than assumed: this
          * dispatch submitted ZERO primitives. `tilesDrawn` is what the `art`
          * line reports, and leaving it holding the last ON frame's count would
          * let the diag claim tiles were drawn on a frame that drew nothing. */
@@ -2167,6 +2242,7 @@ static int32_t mhud_live_fsnorthup(void) { return g_mhud.fsNorthUp; }
 
 static int32_t mhud_live_anchor(void)    { return g_mhud.anchor; }
 static int32_t mhud_live_border(void)    { return g_mhud.border; }
+static int32_t mhud_live_northpip(void)  { return g_mhud.northPip; }
 static float   mhud_live_borderpx(void)  { return g_mhud.borderPx; }
 static float   mhud_live_backdropa(void) { return g_mhud.backdropA; }
 static float   mhud_live_wx(void)        { return g_mhud.wx; }
@@ -2446,10 +2522,14 @@ proc cHudLiveFsSpan(): cfloat {.importc: "mhud_live_fsspan", nodecl.}
 proc cHudLiveFsZoom(): cfloat {.importc: "mhud_live_fszoom", nodecl.}
 proc cHudLiveFsOpacity(): cfloat {.importc: "mhud_live_fsopacity", nodecl.}
 proc cHudLiveFsNorthUp(): int32 {.importc: "mhud_live_fsnorthup", nodecl.}
-proc cHudConfigureChrome(anchor, border: int32; borderPx, backdropA: cfloat) {.
+proc cHudConfigureChrome(anchor, border: int32; borderPx, backdropA: cfloat;
+                         northPip: int32) {.
   importc: "mhud_configure_chrome", nodecl.}
 proc cHudLiveAnchor(): int32 {.importc: "mhud_live_anchor", nodecl.}
 proc cHudLiveBorder(): int32 {.importc: "mhud_live_border", nodecl.}
+proc cHudLiveNorthPip(): int32 {.importc: "mhud_live_northpip", nodecl.}
+proc cHudFsKeyDowns(): int64 {.importc: "mhud_fs_keydowns", nodecl.}
+proc cHudFsRejected(): int64 {.importc: "mhud_fs_rejected", nodecl.}
 proc cHudLiveBorderPx(): cfloat {.importc: "mhud_live_borderpx", nodecl.}
 proc cHudLiveBackdropA(): cfloat {.importc: "mhud_live_backdropa", nodecl.}
 proc cHudLiveWx(): cfloat {.importc: "mhud_live_wx", nodecl.}
@@ -2554,6 +2634,12 @@ proc hudLiveIndicatorInset*(): float = float(cHudLiveIndInset())
 proc hudLiveHoldMs*(): int = int(cHudLiveHoldMs())
 proc hudLiveFadeMs*(): int = int(cHudLiveFadeMs())
 proc hudLiveBorder*(): bool = cHudLiveBorder() != 0'i32
+proc hudLiveNorthPip*(): bool = cHudLiveNorthPip() != 0'i32
+proc hudFsKeyDowns*(): int64 = cHudFsKeyDowns()
+proc hudFsRejected*(): int64 = cHudFsRejected()
+  ## Ticks on which the bound key read DOWN, and of those, how many were
+  ## REFUSED because a key the player cannot be holding read down in the same
+  ## poll. `hudFsRejected() > 0` is a FAILED input read, not a busy player.
 proc hudLiveBorderPx*(): float = float(cHudLiveBorderPx())
 proc hudLiveBackdropOpacity*(): float = float(cHudLiveBackdropA())
 proc hudWidgetX*(): float = float(cHudLiveWx())
@@ -2747,6 +2833,7 @@ type
     ## 1..4 = TL/TR/BL/BR with mapX/mapY read as an inset from that corner.
     anchor*: int
     border*: bool
+    northPip*: bool      ## draw the amber NORTH pip near the pane centre
     borderPx*: float
     backdropOpacity*: float
     ## THE FULL-SCREEN OVERLAY.
@@ -2924,7 +3011,8 @@ proc hudInit*(o: HudOpts) =
                     o.colBot, o.colPlayer, o.colSelf)
   hudPushClasses(o)
   cHudConfigureChrome(int32(o.anchor), (if o.border: 1'i32 else: 0'i32),
-                      cfloat(o.borderPx), cfloat(o.backdropOpacity))
+                      cfloat(o.borderPx), cfloat(o.backdropOpacity),
+                      (if o.northPip: 1'i32 else: 0'i32))
   cHudConfigureFs(cfloat(o.fsMargin), cfloat(o.fsSpanM), cfloat(o.fsZoom),
                   cfloat(o.fsOpacity), (if o.fsNorthUp: 1'i32 else: 0'i32))
   # The overlay always starts CLOSED. Arming (or re-arming) a feature must never
@@ -2946,7 +3034,7 @@ proc hudReconfigure*(o: HudOpts; live: bool) =
   ## the draw callback checks is `enabled`, so an off edit (live=false) makes the
   ## callback early-return and submit nothing -- the OFF path no longer depends on
   ## every one of the three surface flags being zeroed on every code path. This is
-  ## the negative assertion (§9b): enabled=0 => nothing is drawn, whatever the
+  ## the negative assertion (Â§9b): enabled=0 => nothing is drawn, whatever the
   ## per-surface flags say.
   let radarOn = (if o.radar and live: 1'i32 else: 0'i32)
   let indOn   = (if o.indicators and live: 1'i32 else: 0'i32)
@@ -2973,7 +3061,8 @@ proc hudReconfigure*(o: HudOpts; live: bool) =
                     o.colBot, o.colPlayer, o.colSelf)
   hudPushClasses(o)
   cHudConfigureChrome(int32(o.anchor), (if o.border: 1'i32 else: 0'i32),
-                      cfloat(o.borderPx), cfloat(o.backdropOpacity))
+                      cfloat(o.borderPx), cfloat(o.backdropOpacity),
+                      (if o.northPip: 1'i32 else: 0'i32))
   cHudConfigureFs(cfloat(o.fsMargin), cfloat(o.fsSpanM), cfloat(o.fsZoom),
                   cfloat(o.fsOpacity), (if o.fsNorthUp: 1'i32 else: 0'i32))
   # Turning the feature OFF closes the overlay. Otherwise an off edit made with

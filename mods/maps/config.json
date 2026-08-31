@@ -45,6 +45,7 @@
   "_placement": "widgetAnchor 'manual' keeps mapX/mapY as the absolute top-left, which is what every existing config already means -- nobody's widget moves. Any corner value turns mapX/mapY into an INSET from that corner, resolved each frame against the MEASURED back buffer and clamped on-screen.",
   "widgetAnchor": "manual",
   "widgetBorder": true,
+  "northPip": true,
   "widgetBorderPx": 2.0,
   "widgetBackdropOpacity": 1.0,
 
