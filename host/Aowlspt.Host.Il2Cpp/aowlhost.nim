@@ -263,6 +263,11 @@ static int aowl_rva_is_code(unsigned int rva) {
 ## `EFT.GameWorld::RegisterPlayer` detour target. Offsets/target only; the walk
 ## is in `botdiag.nim` (included below). See `aowlspt_botdiag.h`.
 {.emit: """#include "aowlspt_botdiag.h" """.}
+## THE TRUE DEPLOY SIGNAL: the two byte-verified, UNIQUE `AfterGameStarted`
+## subscriber targets that run inside `EFT.GameWorld::OnGameStarted` (which is
+## itself unhookable -- relative branch at prologue offset 10). Targets only; the
+## latch is in `raidphase.nim`. See `aowlspt_raidstart.h`.
+{.emit: """#include "aowlspt_raidstart.h" """.}
 ## OFFLINE SCAV-CAP LIFT: the MaxBots (+0xC0) offset + the verified
 ## `EFT.BotSpawner::AddPlayer` detour target + the guarded int32 read/write. The
 ## one field poke is in `botcap.nim` (included below). See `aowlspt_botcap.h`.
@@ -1432,6 +1437,14 @@ var gVersionBranded = false
 ## the other detour slots; the walk itself lives in `botdiag.nim` (included
 ## below), which reuses this file's guarded raw-read primitives. NEVER writes.
 var gBotDiagSlot = -1
+## THE TRUE DEPLOY SIGNAL (kind=20/21 read-only detours on the two UNIQUE
+## `AfterGameStarted` subscribers, which run inside `EFT.GameWorld::OnGameStarted`
+## -- that method cannot be hooked directly, see `abi/aowlspt_raidstart.h`).
+## Declared here beside the other detour slots because `attachDrain`, the
+## dispatch in `patchFired` and `raidphase.nim` all name them and the include
+## comes later. Read-only: the handler sets one bool and one timestamp.
+var gRpStartSlotA = -1
+var gRpStartSlotB = -1
 var gBotDiag = false
 var gBotDiagFires = 0
 ## One-shot guard for the full-list census. The per-registration detour now does
@@ -3636,6 +3649,16 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
   if i == gBotDiagSlot:
     botDiagRegisterFired(regs)
     return 0'i32
+  # THE TRUE DEPLOY SIGNAL, by identity. These run INSIDE
+  # `EFT.GameWorld::OnGameStarted`; the handler reads no register and touches no
+  # game memory, so it needs no guard of its own, and it must never suppress the
+  # original subscriber (which is real gameplay audio).
+  if i == gRpStartSlotA:
+    rpStartFired(regs, 0'i32)
+    return 0'i32
+  if i == gRpStartSlotB:
+    rpStartFired(regs, 1'i32)
+    return 0'i32
   # OFFLINE SCAV-CAP LIFT: the one-shot BotSpawner.MaxBots=0 poke, by identity. It
   # writes one int32 and must never suppress the original AddPlayer.
   if i == gBotCapSlot:
@@ -5043,6 +5066,8 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
               elif kind == 17: "skip-mode-screen-ctor"
               elif kind == 18: "skip-mode-screen-showslot"
               elif kind == 19: "spl-preloader-anchor"
+              elif kind == 20: "true-deploy-signal-a"
+              elif kind == 21: "true-deploy-signal-b"
               else: "main-thread")
   tablesLock()
   let claimed = cHookClaim()
@@ -5122,6 +5147,10 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
     gModeSkipShowSlot = int(claimed)
   elif kind == 19:
     gSplPreloaderSlot = int(claimed)
+  elif kind == 20:
+    gRpStartSlotA = int(claimed)
+  elif kind == 21:
+    gRpStartSlotB = int(claimed)
   else:
     gDrainSlot = int(claimed)
   tablesUnlock()
@@ -5130,7 +5159,8 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
   elif kind == 2 or kind == 3 or kind == 4 or kind == 5 or kind == 6 or
        kind == 7 or kind == 8 or kind == 9 or kind == 10 or
        kind == 11 or kind == 12 or kind == 13 or kind == 14 or kind == 15 or
-       kind == 16 or kind == 17 or kind == 18 or kind == 19:
+       kind == 16 or kind == 17 or kind == 18 or kind == 19 or
+       kind == 20 or kind == 21:
     discard
   else:
     gDrainMethod = spec
@@ -5141,7 +5171,7 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
             kind == 6 or kind == 7 or kind == 8 or kind == 9 or
             kind == 10 or kind == 11 or kind == 12 or kind == 13 or
             kind == 14 or kind == 15 or kind == 16 or kind == 17 or
-            kind == 18 or kind == 19: "" else:
+            kind == 18 or kind == 19 or kind == 20 or kind == 21: "" else:
            "; it runs more than once a frame, so its firing count is not a " &
            "frame count")
   return true
@@ -8506,6 +8536,13 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
       # code, so the detour installs now and simply never fires until an offline
       # raid starts and players/bots begin registering. Fail-safe if the prologue
       # does not match on this build.
+      # THE TRUE DEPLOY SIGNAL for the shared raid-phase latch. NOT flag-gated:
+      # `raidphase` is the single gate ESP and the maps HUD both read, and a
+      # flag that turned this off would silently restore the ten-second early
+      # arm the user reported three times. Read-only, fires at most once per
+      # raid, and `bindRaidStart` announces loudly if neither target verifies.
+      discard bindRaidStart(true)
+
       if gBotDiag and not bindBotDiag(true):
         info "botdiag did not arm (EFT.GameWorld.RegisterPlayer unverified on " &
              "this build, or drain disabled)"

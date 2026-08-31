@@ -261,6 +261,19 @@ TABLES = [
         "users": ["host/Aowlspt.Host.Il2Cpp/botdiag.nim"],
     },
     {
+        # The two AfterGameStarted subscribers that carry the TRUE deploy signal.
+        # Swept, not indexed by name -- but the sweep DOES map row i to detour
+        # kind 20+i, so `bindRaidStart` refuses aloud any row beyond the two
+        # slots that exist rather than binding it to nothing.
+        "mode": "sweep",
+        "header": "abi/aowlspt_raidstart.h",
+        "array": "aowl_rs_targets",
+        "at": "cRsTargetAt",
+        "name": "cRsTargetName",
+        "count": "cRsTargetCount",
+        "users": ["host/Aowlspt.Host.Il2Cpp/raidphase.nim"],
+    },
+    {
         "mode": "sweep",
         "header": "abi/aowlspt_bridge.h",
         "array": "aowl_bridge_targets",
