@@ -108,15 +108,25 @@
 ## `unloadOne` refuses -- and this module reports that refusal as
 ## `deferred:true`, meaning "on restart", rather than unloading anyway.
 ##
-## The `AOWLSPT_MOD_HOT_RELOADABLE` flag is reported in `listed` but is **not**
-## required for an unload, and that is a deliberate reading of the ABI: the flag
-## says the mod implements `state_save`/`state_load` and can be taken out *and
-## put back* mid-session without losing what it was doing. Taking a mod out and
-## leaving it out needs less than that -- it needs `on_unload` to run and the
-## host to drop the registrations, both of which the host guarantees. A mod
-## without the flag that is unloaded and then loaded again comes up in its
-## initial state, which is exactly what "disable it, then enable it" means to
-## the person clicking the switch.
+## The `AOWLSPT_MOD_HOT_RELOADABLE` flag used to be reported in `listed` and
+## required for nothing, on the reading that the flag is about *state* across a
+## reload -- `state_save`/`state_load` -- while taking a mod out needs only
+## `on_unload` plus the host's teardown, both of which the host guarantees.
+##
+## That reading was correct about the ABI and wrong about the client, and it was
+## measured wrong. On the server a mod that leaves something behind costs a route
+## table. On the client it costs the player's raid: two unflagged mod DLLs were
+## freed during scene teardown and the client died with a native access violation
+## inside a second, twice out of two runs. The teardown's guarantee covers what
+## the mod registered THROUGH THE HOST -- subscriptions, queued callbacks,
+## detours. It cannot cover what the mod took directly: a strong GC handle on a
+## game object, a thread it started, a pointer it handed to the game.
+##
+## So `hotOf` in `HostOps` now gates the unload, and the CLIENT host sets it
+## while the server and the simulator leave it nil. A mod that has not declared
+## the flag is refused BY NAME and stays loaded; the change still holds on
+## restart, because the selection is stored rather than inferred from what is
+## running. Nothing is ever unloaded on the hope that it had nothing in flight.
 
 ## ---------------------------------------------------------------------------
 ## Why the host is passed in rather than imported
@@ -163,6 +173,24 @@ type
   IndexFn* = nil proc (guid: string): int
   LogFn* = nil proc (msg: string)
 
+  QuiesceFn* = nil proc (): int32
+    ## Whether the host is at a point where freeing a library is safe.
+    ##
+    ## **Three states, never two** -- `QuietYes` / `QuietBusy` / `QuietUnknown`.
+    ## The third is the whole reason this is an `int32` and not a `bool`: a host
+    ## that cannot see the game's main thread at all must not answer "quiet",
+    ## because "I could not look" read as a pass is precisely the check that
+    ## cannot fail. `QuietUnknown` refuses the unload exactly as `QuietBusy`
+    ## does; only the sentence in the log differs.
+    ##
+    ## Measured, and why this exists: with `modSettingsRender` on, the shared
+    ## sync slot was held from 0:00:02 to ~0:00:26, `takeModSet` never ran, and
+    ## the unload instruction arrived ~25 s late -- landing inside scene
+    ## teardown. `FreeLibrary` of two mod DLLs there killed the client with a
+    ## native access violation 0.4-1.0 s later, in two runs out of two. The
+    ## drain had no idea what the game was doing, and nothing in the protocol
+    ## asked.
+
   HostOps* = object
     count*: CountFn
     guidOf*: TextOfFn
@@ -179,6 +207,22 @@ type
     load*: LoadFn
     unload*: UnloadFn
     log*: LogFn
+    hotOf*: FlagFn
+      ## Whether the mod at this index declares `AOWLSPT_MOD_HOT_RELOADABLE`.
+      ## Nil from a host that does not gate on it -- the server and the
+      ## simulator, where a bad unload costs a route table and not a raid.
+      ## Non-nil on the client, where `doUnload` refuses BY NAME for any mod
+      ## that has not claimed it can come out live.
+      ##
+      ## The flag was declared in `abi/aowlspt_abi.h` and in both loaders from
+      ## the start and, until this, was read in exactly one place: the `hot`
+      ## column of `replyListed`. It decorated a list. It gated nothing, and the
+      ## two DLLs that took the client down were both unflagged.
+    quiesce*: QuiesceFn
+      ## Asked immediately before each unload; see `QuiesceFn`. Nil means the
+      ## host has no notion of a safe point and every unload proceeds -- which
+      ## is the behaviour every host had before this, kept deliberately for the
+      ## two where it is correct.
 
   DesiredMod* = object
     ## One row of the backend's answer to "what should be running on this
@@ -214,15 +258,55 @@ type
     kind: PendKind
     guid: string
     path: string
+    defers: int
+      ## How many drains have put this request back rather than performing it,
+      ## because the host was not at a safe point. Bounded by `DeferLimit`: an
+      ## unload that can never find a quiet moment must eventually be ANSWERED
+      ## -- a request that is silently carried forever is indistinguishable from
+      ## one that was lost, and the manager would wait on it for the life of the
+      ## process.
 
 const ControlPrefix* = "aowlspt.host.mods."
 const ModHotReloadable* = 1'u32   ## AOWLSPT_MOD_HOT_RELOADABLE
+
+const
+  QuietYes* = 0'i32      ## a safe point: perform the unload
+  QuietBusy* = 1'i32     ## the host is mid-something; put it back and ask again
+  QuietUnknown* = 2'i32  ## the host cannot tell. REFUSED, not permitted.
+
+const DeferLimit* = 600
+  ## Roughly ten seconds of drains at the client host's tick. Past this the
+  ## request is answered `deferred` with `CodeNotQuiet` and dropped, and the
+  ## backend's next poll re-states the same desired set, so the attempt repeats
+  ## on its own cadence rather than spinning inside one queue entry.
+
+## The reload ledger. Counters, not a verdict: a run with zero attempts is
+## INCONCLUSIVE and reads that way here, because `attempted` is 0 rather than
+## because `faults` is 0. Reported through `hotReloadCounters` and rendered into
+## the capabilities reply, so "it reloaded" can be falsified by a number instead
+## of by the absence of a crash.
+var gRlAttempted = 0
+var gRlCompleted = 0
+var gRlRefused = 0
+var gRlDeferred = 0
+var gRlEpoch = 0
+  ## Bumped once per COMPLETED unload+load pair's unload half. A mod that prints
+  ## this on load prints a different number every reload; if it prints the same
+  ## number twice, the library did not actually change over and "it reloaded" was
+  ## indistinguishable from "nothing happened".
+
+proc hotReloadCounters*(): (int, int, int, int, int) =
+  ## attempted / completed / refused / deferred / epoch.
+  result = (gRlAttempted, gRlCompleted, gRlRefused, gRlDeferred, gRlEpoch)
+
+proc hotReloadEpoch*(): int = gRlEpoch
 
 var gEmit: EmitFn = nil
 var gOps: HostOps = HostOps(count: nil, guidOf: nil, nameOf: nil,
                             versionOf: nil, pathOf: nil, liveOf: nil,
                             flagsOf: nil, indexOf: nil, canUnload: nil,
-                            load: nil, unload: nil, log: nil)
+                            load: nil, unload: nil, log: nil,
+                            hotOf: nil, quiesce: nil)
 var gHostName = ""
 var gHostVersion = ""
 var gSide = 0'i32
@@ -295,13 +379,13 @@ proc submit*(name, payload: string): bool =
 
   case verb
   of "probe":
-    gQueue.add Pending(kind: pkProbe, guid: "", path: "")
+    gQueue.add Pending(kind: pkProbe, guid: "", path: "", defers: 0)
   of "list":
-    gQueue.add Pending(kind: pkList, guid: "", path: "")
+    gQueue.add Pending(kind: pkList, guid: "", path: "", defers: 0)
   of "load":
-    gQueue.add Pending(kind: pkLoad, guid: guid, path: path)
+    gQueue.add Pending(kind: pkLoad, guid: guid, path: path, defers: 0)
   of "unload":
-    gQueue.add Pending(kind: pkUnload, guid: guid, path: "")
+    gQueue.add Pending(kind: pkUnload, guid: guid, path: "", defers: 0)
   else:
     # A verb from a newer manager than this host. Saying so beats silence: the
     # manager's contract is that every request produces exactly one reply, and
@@ -380,6 +464,12 @@ const
     ## this host cannot take a mod out live at all; the change holds on restart
   CodeUnloadFailed* = "unloadfailed"
     ## the unload itself failed; the host log carries the reason
+  CodeNotHot* = "nothot"
+    ## this mod does not declare AOWLSPT_MOD_HOT_RELOADABLE, and this side
+    ## refuses to free a library that has not claimed it can come out live
+  CodeNotQuiet* = "notquiet"
+    ## the host never reached a safe point to free a library in; the mod stays
+    ## loaded and the change holds on restart
 
 const ReportMaxPath* = 191
   ## What one report may cost, in characters of request path, **including the
@@ -740,14 +830,56 @@ proc doLoad(p: Pending) =
            "the host refused to load " & p.path & "; see the host log",
            moRefused, CodeLoadFailed)
 
-proc doUnload(p: Pending) =
+proc doUnload(p: Pending): bool =
+  ## `false` means "not performed, put it back" -- the host was not at a safe
+  ## point. Every other outcome, including every refusal, is `true` and has been
+  ## ANSWERED. A path that returns `false` without also being under the
+  ## `DeferLimit` would be a request that is never answered at all.
+  result = true
   if p.guid.len == 0:
     replyResult("", "unload", false, false, "no guid")
     return
-  if gOps.indexOf(p.guid) < 0:
+  let idx = gOps.indexOf(p.guid)
+  if idx < 0:
     # Already out, which is the same end state the caller asked for.
     answer(p.guid, "unload", true, false, "", moNoop, "")
     return
+
+  # THE CONTRACT, asked first and by name. A mod that has not declared
+  # AOWLSPT_MOD_HOT_RELOADABLE is refused here and STAYS LOADED -- it is never
+  # unloaded on the hope that it had nothing in flight. The refusal names the
+  # mod, because "some mod would not unload" is not something anyone can act on.
+  if gOps.hotOf != nil and not gOps.hotOf(idx):
+    inc gRlAttempted
+    inc gRlRefused
+    let nm = (if gOps.nameOf != nil: gOps.nameOf(idx) else: p.guid)
+    let why = nm & " does not declare AOWLSPT_MOD_HOT_RELOADABLE, so this " &
+              "host will not free its library while the game is running; it " &
+              "stays loaded and the change holds on restart"
+    if gOps.log != nil: gOps.log(why)
+    answer(p.guid, "unload", false, true, why, moDeferred, CodeNotHot)
+    return
+
+  # THE SAFE POINT. Three states and only one of them proceeds.
+  if gOps.quiesce != nil:
+    let q = gOps.quiesce()
+    if q != QuietYes:
+      if p.defers < DeferLimit:
+        return false
+      inc gRlAttempted
+      inc gRlDeferred
+      let nm = (if gOps.nameOf != nil: gOps.nameOf(idx) else: p.guid)
+      let what = (if q == QuietUnknown:
+                    "this host cannot see whether the game is at a safe point"
+                  else: "the game was never at a safe point")
+      let why = nm & " was not unloaded: " & what & " in " & $DeferLimit &
+                " drains, so its library was not freed. It stays loaded and " &
+                "the change holds on restart."
+      if gOps.log != nil: gOps.log(why)
+      answer(p.guid, "unload", false, true, why, moDeferred, CodeNotQuiet)
+      return
+
+  inc gRlAttempted
   # Asked *before* the attempt, so the reason can be told apart afterwards. A
   # host with no teardown refuses every unload for one reason and a host with
   # one refuses a particular unload for another; both answer `deferred`, and a
@@ -756,6 +888,8 @@ proc doUnload(p: Pending) =
   let live = gOps.canUnload != nil and gOps.canUnload(0)
   let err = gOps.unload(p.guid)
   if err.len == 0:
+    inc gRlCompleted
+    inc gRlEpoch
     answer(p.guid, "unload", true, false, "", moOk, "")
   else:
     # `deferred`, not `refused`: everything that stops an unload here is
@@ -777,12 +911,23 @@ proc drain*() =
     return
   var work = gQueue
   gQueue = @[]
+  var again: seq[Pending] = @[]
   for p in work:
     case p.kind
     of pkProbe: replyCapabilities()
     of pkList: replyListed()
     of pkLoad: doLoad(p)
-    of pkUnload: doUnload(p)
+    of pkUnload:
+      if not doUnload(p):
+        # Put back with the counter advanced, so the deferral is BOUNDED. The
+        # copy is appended to a separate sequence and merged after the walk, for
+        # the same reason the queue was taken wholesale: appending to what is
+        # being iterated is how a request runs twice or never.
+        var q = p
+        q.defers = p.defers + 1
+        again.add q
+  for q in again:
+    gQueue.add q
 
 ## ---------------------------------------------------------------------------
 ## Making the live set match a set the backend states
@@ -1181,7 +1326,7 @@ proc applyDesired*(want: seq[DesiredMod]; modsRoot: string) =
         recordOutcome(d.guid, d.enabled, moSkipped, CodeNoFile)
         continue
       note "the backend wants " & d.guid & " loaded; queueing " & path
-      gQueue.add Pending(kind: pkLoad, guid: d.guid, path: path)
+      gQueue.add Pending(kind: pkLoad, guid: d.guid, path: path, defers: 0)
     else:
       # LOUD, and it names the reason and the fix. A mod that loads and is
       # taken back out a second later, with nothing said but "the backend
@@ -1193,7 +1338,7 @@ proc applyDesired*(want: seq[DesiredMod]; modsRoot: string) =
            unloadExplanation(d) &
            ". Anything " & d.guid & " says after this about not being armed " &
            "is a CONSEQUENCE of this unload, not a cause."
-      gQueue.add Pending(kind: pkUnload, guid: d.guid, path: "")
+      gQueue.add Pending(kind: pkUnload, guid: d.guid, path: "", defers: 0)
     rememberAct(d.guid, d.enabled)
 
   # Rows for guids the backend has stopped naming go now. Everything above has

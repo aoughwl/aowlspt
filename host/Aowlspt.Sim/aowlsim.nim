@@ -1351,7 +1351,13 @@ proc main(): int =
                                  pathOf: opsPath, liveOf: opsLive,
                                  flagsOf: opsFlags, indexOf: opsIndex,
                                  canUnload: opsCanUnload, load: opsLoad,
-                                 unload: opsUnload, log: opsLog))
+                                 unload: opsUnload, log: opsLog,
+                                 hotOf: nil, quiesce: nil))
+  ## `hotOf: nil` and `quiesce: nil` are the SIMULATOR's answer and not an
+  ## oversight. There is no game here to be mid-teardown, and the whole value of
+  ## `--watch` is reloading a mod that has not been written to be reloadable yet
+  ## -- gating on the flag would refuse every mod in the repository, since none
+  ## declares it. The client sets both; see `opsHot` in `aowlhost.nim`.
 
   # Under `--watch`, and only under `--watch`, what is loaded is a copy. See
   # `shadowOf`: the file you are editing has to stay writable, and it cannot

@@ -1408,6 +1408,14 @@ var gLastFire = 0
 var gLastFireMs = 0'u64
 var gDrainStalled = false
 
+## `opsQuiesce`'s own view of the same counter, kept apart from `gLastFire`
+## above on purpose. `gLastFire` is the stall detector's and is written from the
+## tick loop; sharing it would make each reader's sample depend on whether the
+## other had already run this tick, and the answer to "is the game running" would
+## quietly become "did the other branch get here first".
+var gQuietLastFire = -1
+var gQuietRun = 0
+
 ## The render-phase drain's slot, method and proof, mirroring the update drain's
 ## fields above. `-1` until a render-phase target binds. Kept entirely separate
 ## from `gDrainSlot`: the two detours are two rows in the same engine slot table,
@@ -6789,6 +6797,63 @@ proc opsLive(i: int): bool = modhost.modIsLive(i)
 proc opsFlags(i: int): uint32 = modhost.modFlagsOf(i)
 proc opsIndex(guid: string): int = modhost.modIndexOf(guid)
 
+proc opsHot(i: int): bool =
+  ## Whether the mod at `i` declared AOWLSPT_MOD_HOT_RELOADABLE.
+  ##
+  ## Wired on the CLIENT ONLY. `modcontrol.doUnload` refuses by name for a mod
+  ## this answers false for, and the mod stays loaded. See the note at the head
+  ## of `modcontrol.nim` for why this side is the one that gates: the teardown
+  ## covers what a mod registered through the host and cannot cover what it took
+  ## directly -- a strong GC handle on a game object, a thread, a pointer handed
+  ## to the game -- and on the client that difference is an access violation in
+  ## a live raid rather than a stale route.
+  ##
+  ## `1'u32` written out rather than `modhost.ModHotReloadable`: an imported
+  ## `const` arrives untyped and `and` then has no overload to pick. Same
+  ## workaround, and same reason, as `aowlsim.nim` -- named here so a search for
+  ## either finds the other.
+  result = (modhost.modFlagsOf(i) and 1'u32) != 0'u32
+
+proc opsQuiesce(): int32 =
+  ## Is this a safe moment to call `FreeLibrary` on a mod?
+  ##
+  ## Answered from `cMqFireCount()` -- the fire counter of the main-thread drain
+  ## this host ALREADY owns. That is the point: it rides a detour that is bound,
+  ## proven and reported on elsewhere in this file, so it adds no second detour
+  ## to a function (which would overwrite the first's trampoline) and no new
+  ## prologue to verify.
+  ##
+  ## Three states, and the third is the reason this is not a bool:
+  ##
+  ##  * `QuietUnknown` when the drain is not bound, has never been proven to
+  ##    fire, or is currently stalled. The host cannot see Unity's main thread,
+  ##    so it does not know what the game is doing, so it must NOT answer quiet.
+  ##    "I could not look" counted as a pass is the check that cannot fail.
+  ##  * `QuietBusy` when the counter has not advanced since the last ask. A
+  ##    scene teardown is exactly this: the player loop stops calling the hooked
+  ##    method for hundreds of milliseconds. That is the window the two dead
+  ##    runs freed their libraries in.
+  ##  * `QuietYes` only after `QuietRuns` consecutive asks each saw the counter
+  ##    advance. One advancing sample is a frame; several in a row is a game
+  ##    that is running rather than one that is between things.
+  ##
+  ## Deliberately NOT derived from `gInRaidLast`: that is the backend's opinion,
+  ## it arrives on a poll that was measured 25 s stale in the very incident this
+  ## exists for, and a stale opinion read as a safe point is how we got here.
+  const QuietRuns = 8
+  if gDrainSlot < 0 or not gDrainProven or gDrainStalled:
+    gQuietRun = 0
+    return modcontrol.QuietUnknown
+  let fires = int(cMqFireCount())
+  if fires == gQuietLastFire:
+    gQuietRun = 0
+    return modcontrol.QuietBusy
+  gQuietLastFire = fires
+  if gQuietRun < QuietRuns:
+    gQuietRun = gQuietRun + 1
+    return modcontrol.QuietBusy
+  result = modcontrol.QuietYes
+
 proc opsCanUnload(ignored: int): bool = modhost.hasTeardown()
   ## True here in every run that reached `hostMain`, which installs
   ## `dropModRegistrations` before it loads anything. Asked of the loader
@@ -6829,7 +6894,8 @@ proc startModControl() =
                                  pathOf: opsPath, liveOf: opsLive,
                                  flagsOf: opsFlags, indexOf: opsIndex,
                                  canUnload: opsCanUnload, load: opsLoad,
-                                 unload: opsUnload, log: opsLog))
+                                 unload: opsUnload, log: opsLog,
+                                 hotOf: opsHot, quiesce: opsQuiesce))
 
 # --------------------------------------------------------------- runtime
 
