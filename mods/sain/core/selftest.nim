@@ -39,6 +39,7 @@ import hearing
 import vision
 import suppress
 import squad
+import objective
 import flank
 import sig
 
@@ -1582,6 +1583,24 @@ proc driveSignatureChecks(r: var TestReport) =
         consequenceOf(dsOneBool).len > 20,
         "a consequence string is missing")
 
+proc objectiveChecks(r: var TestReport) =
+  ## The squad-objective properties, from `core/objective.selfCheckObjective`.
+  ##
+  ## Written there rather than here because the assigner's tables are module
+  ## state and a check that cannot see them cannot assert on the finished
+  ## state -- only on its own inputs, which under CLAUDE.md 9b is not a check.
+  ## Each failure it reports becomes one failed line here, and a run with none
+  ## reports the single property it established rather than nothing at all.
+  var problems: seq[string] = @[]
+  let ok = selfCheckObjective(problems)
+  var i = 0
+  while i < problems.len:
+    check(r, "objective/" & $i, false, problems[i])
+    inc i
+  check(r, "objective: one squad shares one objective, two squads do not " &
+        "collapse onto one, the origin is refused, and oneWriterCheck FAILS " &
+        "when the retired writer fires", ok, "see the lines above")
+
 proc run*(): TestReport =
   ## Everything, in one pass. Roughly ordered from the reflexes outward.
   var r = TestReport(lines: @[], passed: 0, failed: 0)
@@ -1599,4 +1618,5 @@ proc run*(): TestReport =
   probeChecks(r, s)
   flickerChecks(r, s)
   driveSignatureChecks(r)
+  objectiveChecks(r)
   result = r

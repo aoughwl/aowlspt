@@ -66,6 +66,22 @@
     }
   },
 
+  "_objectives": "Bot AI > Objectives. Where a bot goes when it is NOT fighting. The backend ships a catalog of positions (patrol points from mods/waypoints, plus spawn-density anchors); the client partitions live bots by their real BSG group -- the BotOwner.BotsGroup pointer, which is the ONLY squad identity readable on this build -- and gives every member of one group a destination derived from ONE shared objective. TURNING THIS ON MOVES THE DESTINATION WRITER. With it off, server/dispatch.nim issues GoToPoint per bot census, as it always has. With it on, that path issues NO destination at all and the client decide ladder is the single writer -- there is no configuration in which both write, and /aowlspt/sain/status FAILS rather than passes if one is ever measured. REAL LOOTING IS NOT IN THIS: `seekLoot` means walk to a place worth searching and loiter there. Opening a container needs LootableContainer.Interact and an inventory-move RVA, neither of which is measured in docs/SAIN_RVA.md, and resolving them by name kills the client on this build. Off by default.",
+  "objectives": {
+    "objectivesEnabled": false,
+    "squadShareObjectives": true,
+    "seekQuestPoi": true,
+    "seekLoot": true,
+    "holdPositions": false,
+    "huntLastKnown": true,
+    "objectiveSplinterM": 25.0,
+    "objectiveLeashM": 45.0,
+    "objectiveReachM": 8.0,
+    "objectiveTimeoutS": 120.0,
+    "lootSeekAggressiveness": 0.5,
+    "questPoiBias": 1.25
+  },
+
   "server": {
     "patchBrains": true,
     "neutraliseLocationModifiers": true

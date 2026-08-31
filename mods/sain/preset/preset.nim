@@ -202,6 +202,18 @@ proc applyOverrides(s: var Settings; node: JsonRef) =
     of "decisionHz": s.decisionHz = f
     of "farFromPlayerDistance": s.farFromPlayerDistance = f
     of "maxBotsPerTick": s.maxBotsPerTick = int(f)
+    of "objectiveSplinterM": s.objectiveSplinterM = f
+    of "objectiveLeashM": s.objectiveLeashM = f
+    of "objectiveReachM": s.objectiveReachM = f
+    of "objectiveTimeoutS": s.objectiveTimeoutS = f
+    of "lootSeekAggressiveness": s.lootSeekAggressiveness = f
+    of "questPoiBias": s.questPoiBias = f
+    of "objectivesEnabled": s.objectivesEnabled = b
+    of "squadShareObjectives": s.squadShareObjectives = b
+    of "seekLoot": s.seekLoot = b
+    of "seekQuestPoi": s.seekQuestPoi = b
+    of "holdPositions": s.holdPositions = b
+    of "huntLastKnown": s.huntLastKnown = b
     of "willSearchForEnemy": s.willSearchForEnemy = b
     of "canShiftCoverPosition": s.canShiftCoverPosition = b
     of "difficulty":
@@ -245,6 +257,13 @@ proc loadPreset*(): Preset =
   let scale = difficultyScale(difficulty)
 
   applyOverrides(base, doc.field("global"))
+  # The objectives block, folded in AFTER `global` and BEFORE the per-role
+  # copies are taken, so every role inherits it and a role may still override
+  # any single key. It is its own block rather than more keys in `global`
+  # because it is one feature with one master switch, and a settings page
+  # that greys the whole group when the switch is off needs the group to
+  # exist as a group.
+  applyOverrides(base, doc.field("objectives"))
 
   var roles: seq[Settings] = @[]
   var i = 0

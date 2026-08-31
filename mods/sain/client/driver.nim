@@ -55,6 +55,7 @@ import ".." / core / rng
 import ".." / core / hearing
 import ".." / core / suppress
 import ".." / core / squad
+import ".." / core / objective
 import ".." / preset / preset
 import bridge
 import live
@@ -907,6 +908,29 @@ proc buildView(st: BotState; me: SelfView; heard: Heard): BotView =
                   lastDamagedAt: st.lastDamagedAt)
   let sq = squadViewFor(mine, gAllies, gAlliesN, st.settings, gTimeSeconds)
 
+  # This bot's ordinal within its own squad, and it must be STABLE: the role
+  # ring hands out one offset per index, so an index that changed with the
+  # table's ordering would move a bot between the cover slot and the stagger
+  # slot every tick and it would never arrive at either. Counting mates whose
+  # key sorts below ours is stable because the keys are.
+  var memberIndex = 0
+  var mi = 0
+  while mi < gAlliesN and mi < gAllies.len:
+    let a = gAllies[mi]
+    inc mi
+    if sameSquad(mine, a, st.settings) and a.key < mine.key:
+      inc memberIndex
+
+  # The objective, resolved to THIS member's destination. Done here rather
+  # than in `core/decide.nim` because the group pointer lives on this side;
+  # `decide` reads the answer and is still the only thing that chooses whether
+  # to act on it.
+  var objRole = omConverge
+  var objDest = zeroVec()
+  let haveObjective = objectiveFor(st.groupKey, mine.key, memberIndex,
+                                   sq.isLeader, me.position, st.settings,
+                                   gTimeSeconds, objRole, objDest)
+
   # The grenade, from the raid-level sample. Distance is per bot and is two
   # subtractions.
   var gren = GrenadeThreat(active: false, position: zeroVec(),
@@ -934,7 +958,8 @@ proc buildView(st: BotState; me: SelfView; heard: Heard): BotView =
                          else: 999.0),
     hasSearchTarget: active(st.searchState),
     searchTarget: st.searchState.target, extractRequested: false,
-    raidSeconds: gTimeSeconds, moveTarget: zeroVec(), hasMoveTarget: false)
+    raidSeconds: gTimeSeconds, moveTarget: zeroVec(), hasMoveTarget: false,
+    hasObjective: haveObjective, objectiveTarget: objDest)
 
 proc tickBot(index: int): bool =
   ## One bot's whole decision, start to finish. False when the bot has died and
@@ -1199,6 +1224,12 @@ proc tickBot(index: int): bool =
       st.lastAppliedCombat = d.combat
       st.lastAppliedMove = d.moveTo
       st.lastApplyAt = gTimeSeconds
+      # THE WRITER LEDGER. Counted here and nowhere else, because here is where
+      # a destination actually left this side. `oneWriterCheck` reads this
+      # against `server/dispatch.nim`'s own count and FAILS if both are
+      # non-zero while objectives are on.
+      if a.hasMoveTarget:
+        noteDestination(dwClient, gTimeSeconds)
       # ARM THE WITNESS, and only for an order that asked for LOCOMOTION. An
       # order that only steers the head or pulls a trigger must not be counted
       # as a movement order it never was -- that inflation is exactly the
@@ -1351,6 +1382,23 @@ proc tick*(elapsedMs: int64) =
       # would invalidate the cursor and the index this loop is holding. The
       # rest are picked up on the next tick, which is 16 ms away.
       died = gBots[i].handle.id
+      # PHASE 2: the body becomes an objective.
+      #
+      # This is the ONE loot position on this build that is real. `db.json`'s
+      # `staticContainers` are all (0,0,0) -- 7,092 of 7,092 rows, measured --
+      # so a loot objective derived from them is a bot walking to world zero.
+      # A corpse's position is a position this mod watched a live bot occupy
+      # one tick ago, and it needs no binding at all to know it.
+      #
+      # `okHunt`, not `okLoot`, and the distinction is the honest one: nothing
+      # on this build can OPEN a body. `LootableContainer.Interact` and the
+      # inventory-move RVA are both unmeasured (`docs/SAIN_RVA.md`), and
+      # resolving them by name is the call that kills the client. A bot sent
+      # here walks to where somebody died and loiters, which is what the
+      # config text says it does.
+      if gPreset.base.huntLastKnown:
+        discard addObjective(okHunt, gBots[i].lastPosition, 1.4,
+                             hashSeed(gBots[i].handle.id, 0'u64), true)
       break
     inc considered
   if considered > gPeakConsidered:

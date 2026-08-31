@@ -1014,6 +1014,13 @@ func actuationFor*(d: Decision; b: BotView): Actuation =
     a.hasLookTarget = false
   of cdMeleeAttack:
     a.sprint = true
+  of cdMoveToObjective:
+    # Walking, not sprinting, and looking where it is going. A squad crossing
+    # the map at a sprint with weapons down is both loud and visibly wrong, and
+    # the objective rung only ever fires when there is nothing to hurry for.
+    a.sprint = false
+    a.hasLookTarget = false
+    a.shoot = false
   of cdFreeze, cdHoldInCover, cdNone:
     discard
   of cdThrowGrenade:

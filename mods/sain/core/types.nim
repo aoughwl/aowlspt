@@ -43,6 +43,13 @@ type
     # destination is not, because exfiltration points come off a controller
     # this mod has no binding for. See `README.md`.
     cdExtract
+    # The lowest rung there is: "idle intent". Added by this port, from
+    # docs/BOT_AI_OBJECTIVES.md. It is the ONLY decision that fires with no
+    # enemy, no noise and no self-care outstanding, and it exists so that
+    # `decide` is the SINGLE chooser of a destination -- before it, the server
+    # dispatcher issued a second GoToPoint for the same bot and the later call
+    # won. Its urgency is below `cdSearch`, so anything at all outranks it.
+    cdMoveToObjective
 
   SquadDecision* = enum
     ## What the squad wants this bot to do. Runs *above* the combat decision:
@@ -164,6 +171,7 @@ type
     drSelfAction
     drSquadOrder
     drExtracting
+    drSquadObjective
 
 func personalityFromText*(s: string): Personality =
   case s
@@ -210,6 +218,7 @@ func decisionName*(d: CombatDecision): string =
   of cdHoldInCover: "HoldInCover"
   of cdFlank: "Flank"
   of cdExtract: "Extract"
+  of cdMoveToObjective: "MoveToObjective"
 
 func squadDecisionName*(d: SquadDecision): string =
   case d
@@ -260,6 +269,7 @@ func reasonText*(r: DecisionReason): string =
   of drSelfAction: "a self action needs doing"
   of drSquadOrder: "the squad said so"
   of drExtracting: "hurt, dry and out of reasons to stay"
+  of drSquadObjective: "nothing to fight; the squad has somewhere to be"
 
 func factionOf*(r: BotRole): Faction =
   case r
@@ -456,6 +466,16 @@ type
     ## chose to flank.
     moveTarget*: Vec3
     hasMoveTarget*: bool
+    ## The squad's shared objective, already resolved to THIS member's own
+    ## destination by `core/objective.objectiveFor`. Filled by the driver
+    ## before `decide` runs, because only the driver knows the bot's group
+    ## pointer; read by the lowest cascade rung and by nothing else.
+    ##
+    ## `false` is the ordinary case and is not a failure: objectives are off by
+    ## default, the catalog may be empty, and a bot in a fight is not given
+    ## one at all.
+    hasObjective*: bool
+    objectiveTarget*: Vec3
 
   Decision* = object
     ## The answer. Three simultaneous channels, exactly as SAIN has it: a bot
