@@ -3583,6 +3583,17 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
     # and no call into the game.
     dpT = cDpNow()
     cwDrainTick()
+    # THE NATIVE INVENTORY / ITEM-SPAWNER SCREEN. Rides THIS drain for exactly
+    # the reason the colour widget above does, and its whole body is inside the
+    # ONE `aowl_p_p_seh` that `aowl_iu_tick_guarded` opens -- so this call site
+    # opens none. It shares the colour widget's profiler bucket rather than
+    # claiming a new one: both are the same phase (native UI polled off the
+    # Unity drain) and a bucket per feature would make the decomposition wider
+    # without making it more informative.
+    #
+    # Flag `nativeInvUi`, default OFF; idle cost is one boolean compare and no
+    # call into the game.
+    iuDrainTick()
     cDpAdd(DpCw, dpT)
     # THE POSITIVE CONTROL and the throttled report, LAST, after every rider so
     # the report reads this frame's accumulation rather than the previous
@@ -7223,6 +7234,22 @@ include "colorwidget.nim"
 ## include boundary but NOT variables.
 include "postfxrows.nim"
 
+## THE NATIVE INVENTORY / ITEM-SPAWNER SCREEN. Defines `iuDrainTick`, called
+## from the `TarkovApplication::Update` drain, and `bindInvUi`.
+##
+## Position is load-bearing in three directions, not two:
+##   * `nuikit.nim` (6231) for `nuPanel`/`nuLabel`/`nkResolve`/`nuLive`;
+##   * `inspect.nim` (6151) for `iVisComponent`/`iChildCount`/`iChildAt`, which
+##     the donor-TMP walk uses, and `splrebrand.nim` (6173) for `splAnchor` --
+##     the DontDestroyOnLoad anchor, since SceneManager excludes that scene by
+##     design and anchoring anywhere else walks the wrong scene;
+##   * `region.nim` (6248), which is the one translation unit that already
+##     `#include`s `aowlspt_admin.h`. This screen reads that region's typed
+##     query, and everything in that header is `static`.
+## And it must come BEFORE `gIuOn` is read in the flag pass, because nimony
+## forward-resolves procs across an include boundary but NOT variables.
+include "invui.nim"
+
 ## Client-side mods' settings pages, published to the backend over the event
 ## bus so the F12 nav can list them at all. Stands on `modsettingsrender.nim`
 ## for the shared POST slot discipline (`gSbYieldUntil`) and on `gSyncMs`.
@@ -7989,6 +8016,13 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   # down, so the dependency is stated in the ledger line rather than ANDed here
   # where it would silently read false.
   gCwOn = readBoolKey("settingsColorWidget") and gNuOn
+  # The NATIVE INVENTORY SCREEN. `and gNuOn` for the identical reason: without
+  # the nu*/nuikit layer it cannot construct a single panel, so arming it would
+  # produce a page of refusals rather than a screen. It additionally needs the
+  # admin mod loaded on the SERVER side to answer anything -- that is not a
+  # host flag and cannot be ANDed here, so the screen reports it on its own
+  # note line instead of failing silently.
+  gIuOn = readBoolKey("nativeInvUi") and gNuOn
   # NOTE: `bindNativeUi` is deliberately NOT called here. It was, and the first
   # live run showed why that is wrong: this pass runs before il2cpp is attached
   # and before GameAssembly.dll is loaded, so all 25 targets refused with "no
@@ -8486,6 +8520,12 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
       # the measured mistake that moved `bindNativeUi` here in the first place.
       # It binds no detour; it rides the Update drain.
       bindColorWidget(gCwOn)
+      # The native INVENTORY SCREEN, in the same region and for the same
+      # reason: its banner names two managed targets and one field offset, and
+      # asking about any of them before GameAssembly.dll is loaded would report
+      # them as prologue rejections and blame the game build for a start-order
+      # bug. It binds no detour; it rides the Update drain.
+      bindInvUi(gIuOn)
 
       if gMi2Probe and not bindManagedInvoke(true):
         info "the managed-invoke probe did not verify " &

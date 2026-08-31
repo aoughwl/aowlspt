@@ -289,6 +289,139 @@ proc spawnInto*(profileId, query: string; count, condition: int): SpawnOutcome =
   result.message = "spawned " & $n & " x " & label & " (" & tpl &
                    ") into the stash"
 
+# ---------------------------------------------------------------------------
+# READING A PROFILE BACK -- what the native inventory screen renders, and what
+# makes a mint VERIFIABLE rather than merely acknowledged.
+# ---------------------------------------------------------------------------
+#
+# `spawnInto` above returns a sentence. A sentence is not a readback: it says
+# what the code believed it did. The two procs here answer the only questions
+# that settle it from the FINISHED STATE of the profile on disk --
+#
+#   `stashRows`      what is actually in the stash right now
+#   `templateCount`  how many of one template the profile holds, RIGHT NOW
+#
+# -- and `templateCount` reports READABILITY separately from the number, because
+# "the profile holds zero" and "I could not open the profile" are different
+# answers and a caller that collapses them turns "I could not look" into a FAIL.
+
+type
+  InvRow* = object
+    tpl*: string
+    name*: string
+    count*: int      ## stack size, or 1 for a non-stacking item
+
+  CountResult* = object
+    readable*: bool  ## the profile opened and its item list parsed
+    count*: int      ## total units of the template, 0 when unreadable
+    why*: string     ## populated only when `readable` is false
+
+proc stackOf(itemRaw: string): int =
+  ## `upd.StackObjectsCount`, defaulting to 1. An item with no `upd` is one
+  ## item, not zero -- reading a missing stack count as zero would make a rack
+  ## of loose items vanish from the screen that is meant to show them.
+  let upd = field(itemRaw, "upd")
+  if not exists(upd):
+    return 1
+  let n = field(upd.raw, "StackObjectsCount").asInt(1)
+  if n < 1: 1 else: n
+
+proc templateCount*(profileId, tpl: string): CountResult =
+  ## Units of `tpl` anywhere in the profile's item list.
+  ##
+  ## THE MINT READBACK. Deliberately counted over the WHOLE list rather than
+  ## just the stash root: `giveItem` decides placement, and a check that only
+  ## looked where it expected the item to land would report FAIL for an item
+  ## that was correctly placed somewhere else. The question being asked is "did
+  ## the profile gain these units", and the whole list is what answers it.
+  ##
+  ## One linear pass, bounded by the list length. No `descendantsOf`, whose
+  ## `seen` scan is quadratic and which answers a different question.
+  result = CountResult(readable: false, count: 0, why: "")
+  if profileId.len == 0 or tpl.len == 0:
+    result.why = "no profile id or no template id to count"
+    return
+  let p = loadProfile(profileId)
+  if not p.ok:
+    result.why = "could not read profile " & profileId
+    return
+  let itemsRaw = p.field("Inventory.items")
+  if not exists(itemsRaw):
+    result.why = "profile " & profileId & " has no Inventory.items to count"
+    return
+  let inv = openInventory(itemsRaw.raw)
+  let want = toLowerAscii(tpl)
+  var total = 0
+  for i in 0 ..< inv.items.len:
+    let raw = inv.items.items[i]
+    if toLowerAscii(field(raw, "_tpl").asText("")) == want:
+      total = total + stackOf(raw)
+  result.readable = true
+  result.count = total
+
+proc stashRows*(profileId: string; limit: int; total: var int): seq[InvRow] =
+  ## The TOP LEVEL of the stash, one row per distinct template, with the units
+  ## of each summed.
+  ##
+  ## Direct children of the stash root only -- `childrenOf`, not
+  ## `descendantsOf`. That is what an inventory screen shows: the things lying
+  ## in the grid, not every screw inside every rig. Descending would list a
+  ## magazine's rounds as top-level stash contents, which is not what is in the
+  ## stash.
+  ##
+  ## `limit` bounds what comes BACK; `total` reports how many distinct templates
+  ## there really are. Two numbers, for the same reason `searchItemsCounted`
+  ## returns two: a truncated list presented as a complete one is how "you have
+  ## no bandages" gets said about a stash with bandages in row 40.
+  result = @[]
+  total = 0
+  if profileId.len == 0:
+    return
+  let p = loadProfile(profileId)
+  if not p.ok:
+    return
+  let itemsRaw = p.field("Inventory.items")
+  if not exists(itemsRaw):
+    return
+  let inv = openInventory(itemsRaw.raw)
+  let stash = stashId(p)
+  if stash.len == 0:
+    return
+
+  # Two parallel seqs rather than a table: this module has no hash map and the
+  # row count is bounded by the stash's top level, so a linear "have I seen this
+  # template" scan is bounded by (rows seen)^2 with rows in the low hundreds.
+  var tpls: seq[string] = @[]
+  var qtys: seq[int] = @[]
+  for i in 0 ..< inv.items.len:               # bounded: the item list length
+    let raw = inv.items.items[i]
+    if field(raw, "parentId").asText("") != stash:
+      continue
+    let tpl = field(raw, "_tpl").asText("")
+    if tpl.len == 0:
+      continue
+    let n = stackOf(raw)
+    var at = -1
+    for k in 0 ..< tpls.len:
+      if tpls[k] == tpl:
+        at = k
+        break
+    if at >= 0:
+      qtys[at] = qtys[at] + n
+    else:
+      tpls.add tpl
+      qtys.add n
+  total = tpls.len
+  var emitted = 0
+  for k in 0 ..< tpls.len:
+    if emitted >= limit:
+      break
+    let nm = localeNameOf(tpls[k])
+    result.add InvRow(tpl: tpls[k],
+                      name: (if nm.len > 0: nm else: tpls[k]),
+                      count: qtys[k])
+    emitted = emitted + 1
+
 proc selfCheckSpawn*(into: var seq[string]): bool =
   ## What this module can prove with no database and no profile.
   result = true

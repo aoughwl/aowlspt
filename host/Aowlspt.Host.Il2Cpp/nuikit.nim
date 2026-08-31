@@ -74,7 +74,30 @@
 #     naive index-only handle gets wrong, and it is the one that crashes.
 # ---------------------------------------------------------------------------
 {.emit: """
-#define AOWL_NK_MAX 64
+/* RAISED 64 -> 256 on 2026-08-31, deliberately, for the native inventory
+ * screen. This is the bound the whole table's safety rests on, so it is a
+ * measured number and not a round one:
+ *
+ *   colorwidget   6 widgets x (1 swatch + 3 tracks + 3 fills + 1 readout) = 48
+ *   invui         1 backdrop + 1 title + 3 search + 2 headers
+ *                 + 2 columns x 14 rows x (panel + label) = 56
+ *                 + 2 button + 1 note                            = 65
+ *   natesp/selftest and any future single-element caller         ~ 16
+ *                                                        total  ~ 129
+ *
+ * 64 was not enough for ONE inventory column, let alone two beside the colour
+ * widgets: `nuPanel` would have started returning "the handle table is full",
+ * which is a correct refusal and a screen with half its rows missing. 256
+ * leaves roughly a 2x margin over the measured need and costs 256 * 40 bytes
+ * ~= 10 KB of static BSS, which is nothing.
+ *
+ * What did NOT change: the loop in `aowl_nk_alloc` is still bounded by this
+ * constant, `aowl_nk_slot_of` still range-checks against it, and the handle is
+ * still (gen << 16) | (idx + 1) -- 256 fits in the low 16 bits with three
+ * orders of magnitude to spare, so the encoding is untouched. Raising this
+ * further than 0xFFFF would collide the index with the generation field; if
+ * that is ever wanted, the encoding has to change first. */
+#define AOWL_NK_MAX 256
 
 typedef struct {
     void*    go;      /* the GameObject                          */
