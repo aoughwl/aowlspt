@@ -54,6 +54,13 @@ proc cUiSetRefusal(h, code: int32) {.importc: "aowl_ui_set_refusal", nodecl.}
 proc cUiValid(h: int32): int32 {.importc: "aowl_ui_valid", nodecl.}
 proc cUiRefusalText(code: int32): cstring {.
   importc: "aowl_ui_refusal_text", nodecl.}
+# generational handle identity -- a handle is (gen shl 16) or (idx+1), NOT an
+# index. Never subscript a side table with one; ask for the index.
+proc cUiIndexOf(h: int32): int32 {.importc: "aowl_ui_index_of", nodecl.}
+proc cUiHandleAt(index: int32): int32 {.importc: "aowl_ui_handle_at", nodecl.}
+proc cUiLastHandleRefusal(): int32 {.
+  importc: "aowl_ui_last_handle_refusal", nodecl.}
+proc cUiDisabled(): int32 {.importc: "aowl_ui_disabled", nodecl.}
 
 proc cUiTabAdd(strip, content: int32): int32 {.importc: "aowl_ui_tab_add", nodecl.}
 proc cUiTabApply(strip: int32): int32 {.importc: "aowl_ui_tab_apply", nodecl.}
@@ -89,7 +96,15 @@ type
     bkOverlay = 1     ## our D3D11 overlay pixels (aowl_region_*); menu + raid
     bkNative  = 2     ## real Tarkov GameObjects (nativeui); needs a canvas
 
-  Widget* = distinct int32   ## a handle into the retained core, or <0 refusal
+  Widget* = distinct int32
+    ## A GENERATIONAL handle into the retained core: `(gen shl 16) or (idx+1)`,
+    ## so a live widget is always > 0, a refusal is < 0, and `auRoot` (-1) means
+    ## "no parent". It is NOT an array index -- uiBegin recycles indices, and
+    ## before generations a handle held across a uiBegin silently addressed a
+    ## DIFFERENT widget. A spent handle now gets a named refusal
+    ## (RANGE / RELEASED / STALE-GENERATION) from the one decoder in the C core.
+
+const auRoot* = Widget(-1)   ## the "no parent" sentinel for the build API
 
 const
   auPanel    = 1'i32
@@ -104,15 +119,26 @@ const
   auBindFloat = 2'i32
   auBindInt   = 3'i32
 
-proc ok*(w: Widget): bool = int32(w) >= 0'i32
+proc ok*(w: Widget): bool = int32(w) > 0'i32 and cUiValid(int32(w)) != 0'i32
+  ## LIVE, not merely well-formed. A stale handle is > 0 too -- that is exactly
+  ## the bug this replaces -- so `ok` asks the core's decoder, which is the only
+  ## thing that knows the current generation.
 proc handle*(w: Widget): int32 = int32(w)
+proc refusalOf*(w: Widget): string =
+  ## Why a handle is unusable, by name. Answers for a REFUSAL widget (negative)
+  ## and for a stale/released one alike.
+  if int32(w) < 0: readCString(cUiRefusalText(-int32(w)))
+  elif cUiValid(int32(w)) != 0'i32: "ok"
+  else: readCString(cUiRefusalText(cUiLastHandleRefusal()))
 
 # A polled button/toggle callback. Pure Nim, invoked from uiPump on the Unity
 # thread; it must not itself allocate managed memory or call into game code
 # without its own guard (§7 no per-frame managed allocation).
 type AuCallback* = proc (w: Widget) {.nimcall.}
 
-var gAuCbs: array[128, AuCallback]     ## indexed by widget handle; capped
+var gAuCbs: array[128, AuCallback]
+  ## Indexed by SLOT INDEX (cUiIndexOf), never by a handle -- a generational
+  ## handle is not a subscript and would run off the end.
 
 # ---- flags --------------------------------------------------------------
 var gAuOn = false      ## master: the framework's own proof/realise paths
@@ -181,7 +207,8 @@ proc uiButton*(parent: Widget; x, y, w, h: float32; label: string;
   var lab = label
   cUiSetText(hnd, toCString(lab))
   cUiSetInteractive(hnd, 1)
-  if hnd < gAuCbs.len.int32: gAuCbs[hnd] = onClick
+  let slot = cUiIndexOf(hnd)
+  if slot >= 0'i32 and slot < gAuCbs.len.int32: gAuCbs[slot] = onClick
   Widget(hnd)
 
 proc uiTabStrip*(parent: Widget; x, y, w, h: float32;
@@ -250,9 +277,12 @@ proc uiPump*(px, py: float32; down: bool): int =
   let clicks = int(cUiPump(px, py, (if down: 1'i32 else: 0'i32)))
   if clicks > 0:
     for i in 0 ..< int(cUiCount()):     # capped by AOWL_UI_MAX
-      if cUiTakeClick(int32(i)) != 0'i32 and i < gAuCbs.len and
+      # i is a SLOT INDEX; ask the core for that slot's CURRENT handle. 0 means
+      # the slot is empty -- skip it without spending the fault budget.
+      let hnd = cUiHandleAt(int32(i))
+      if hnd != 0'i32 and cUiTakeClick(hnd) != 0'i32 and i < gAuCbs.len and
          gAuCbs[i] != nil:
-        gAuCbs[i](Widget(int32(i)))
+        gAuCbs[i](Widget(hnd))
   clicks
 
 proc uiToggleState*(w: Widget): bool = cUiToggleState(int32(w)) != 0'i32

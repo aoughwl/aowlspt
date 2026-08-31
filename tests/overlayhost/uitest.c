@@ -276,6 +276,101 @@ static void test_replay(void) {
     ck(g_boxes == 0 && drawn == 2, "a null box sink is skipped safely");
 }
 
+/* ------------------------------------------------------------------ *
+ * GENERATIONAL HANDLES -- the stale-handle bug, asserted as a NEGATIVE.
+ *
+ * Before generations, a handle was a bare slot index and aowl_ui_reset()
+ * recycled indices, so a handle held across a reset silently addressed a
+ * DIFFERENT widget: no crash, no error, the wrong element mutated. Every case
+ * below would PASS trivially under the old encoding except the ones that
+ * demand a refusal -- those are the ones that can fail.
+ * ------------------------------------------------------------------ */
+static void test_generations(void) {
+    int32_t old, fresh, idx;
+    AowlUiWidget* p;
+    printf("generational handles\n");
+
+    aowl_ui_reset();
+    aowl_ui_begin(AOWL_UI_BK_OVERLAY);
+    old = aowl_ui_new(AOWL_UI_LABEL, -1, 0, 0, 100, 20);
+    aowl_ui_set_text(old, "FIRST");
+    ck(old > 0, "a live handle is strictly positive (never 0, never an index)");
+    ck((old & 0xFFFF) - 1 == 0, "first widget lands in slot 0");
+    ck((old >> 16) > 0, "and carries a non-zero generation");
+    ck(aowl_ui_valid(old), "the fresh handle validates");
+    ck(aowl_ui_index_of(old) == 0, "index_of decodes it back to slot 0");
+
+    /* THE RECYCLE. A new screen reuses slot 0 for a DIFFERENT widget. */
+    aowl_ui_reset();
+    aowl_ui_begin(AOWL_UI_BK_OVERLAY);
+    fresh = aowl_ui_new(AOWL_UI_LABEL, -1, 0, 0, 100, 20);
+    aowl_ui_set_text(fresh, "SECOND");
+    ck(aowl_ui_index_of(fresh) == 0, "the new widget really did recycle slot 0");
+    ck(fresh != old, "but its handle is NOT the old one (generation moved)");
+
+    /* The negative that carries the whole fix. */
+    ck(aowl_ui_valid(old) == 0, "the SPENT handle is refused after the reset");
+    ck(aowl_ui_last_handle_refusal() == AOWL_UI_REFUSE_STALE,
+       "and it is refused by NAME: STALE-GENERATION");
+    ck(aowl_ui_at(old) == (AowlUiWidget*)0,
+       "aowl_ui_at(spent) is NULL, not a pointer at the recycled widget");
+
+    /* A stale handle is refused as a PARENT too -- otherwise a whole subtree
+     * silently reparents onto the wrong element. (Checked HERE, while the
+     * fault budget is still unspent; past the budget the core answers
+     * DISABLED, which is a different and also correct refusal.) */
+    ck(aowl_ui_new(AOWL_UI_PANEL, old, 0, 0, 50, 50) == -AOWL_UI_REFUSE_PARENT,
+       "building under a spent parent refuses PARENT, not a silent adoption");
+
+    /* ...and every mutator that took the spent handle must be a no-op on the
+     * element that now occupies the slot. This is the silent-wrong-write. */
+    aowl_ui_set_text(old, "CLOBBERED");
+    aowl_ui_set_colors(old, 0xFF00FF00u, 0xFF00FF00u);
+    aowl_ui_toggle_force(old, 1);
+    aowl_ui_set_rect(old, 999, 999, 999, 999);
+    p = aowl_ui_at(fresh);
+    ck(p != (AowlUiWidget*)0, "the live widget is still reachable");
+    ck(p && strcmp(p->text, "SECOND") == 0,
+       "a write through the spent handle did NOT reach the recycled widget");
+    ck(p && p->x == 0.0f && p->w == 100.0f,
+       "nor did it move it");
+
+    /* Malformed handles get their own name, not STALE. */
+    ck(aowl_ui_valid(0) == 0 &&
+       aowl_ui_last_handle_refusal() == AOWL_UI_REFUSE_RANGE,
+       "handle 0 is refused RANGE");
+    ck(aowl_ui_valid((1 << 16) | (AOWL_UI_MAX + 1)) == 0 &&
+       aowl_ui_last_handle_refusal() == AOWL_UI_REFUSE_RANGE,
+       "an out-of-range slot is refused RANGE");
+    ck(aowl_ui_index_of(old) == -1, "index_of(spent) is -1, not a slot");
+
+    /* Enumeration never spends the fault budget on empty slots. */
+    ck(aowl_ui_handle_at(0) == fresh, "handle_at(0) is the live handle");
+    ck(aowl_ui_handle_at(AOWL_UI_MAX - 1) == 0, "handle_at(empty slot) is 0");
+    ck(aowl_ui_handle_at(-1) == 0 && aowl_ui_handle_at(AOWL_UI_MAX) == 0,
+       "handle_at out of range is 0, not a fabricated handle");
+
+    /* Self-disable after the budget, re-armed only by an explicit reset. */
+    aowl_ui_reset();
+    aowl_ui_begin(AOWL_UI_BK_OVERLAY);
+    ck(aowl_ui_disabled() == 0, "a fresh core is armed");
+    for (idx = 0; idx < AOWL_UI_FAULT_BUDGET; idx++) aowl_ui_valid(old);
+    ck(aowl_ui_disabled() == 1,
+       "the core self-disables after AOWL_UI_FAULT_BUDGET handle faults");
+    ck(aowl_ui_new(AOWL_UI_PANEL, -1, 0, 0, 50, 50) == -AOWL_UI_REFUSE_DISABLED,
+       "and then refuses to build, by name");
+    aowl_ui_reset();
+    aowl_ui_begin(AOWL_UI_BK_OVERLAY);
+    ck(aowl_ui_disabled() == 0 &&
+       aowl_ui_new(AOWL_UI_PANEL, -1, 0, 0, 50, 50) > 0,
+       "an explicit reset re-arms it");
+
+    /* Two live handles are never equal -- the property the old encoding could
+     * not offer across a reset. */
+    ck(aowl_ui_refusal_text(AOWL_UI_REFUSE_STALE)[0] == 'S',
+       "STALE has its own refusal text");
+}
+
 /* falsify: if the predicates were replaced by `return 1`/`return 0` constants,
  * this must go red. */
 static void falsify(void) {
@@ -303,6 +398,7 @@ int main(void) {
     test_bindings();
     test_overlay_emit();
     test_replay();
+    test_generations();
     falsify();
     printf("\n%d checks, %d failures\n", g_checks, g_fails);
     return g_fails ? 1 : 0;

@@ -88,8 +88,18 @@ enum {
     AOWL_UI_REFUSE_RECT   =  5,  /* zero-area / non-finite rect              */
     AOWL_UI_REFUSE_TABS   =  6,  /* too many tabs                            */
     AOWL_UI_REFUSE_BINDS  =  7,  /* binding table full                       */
-    AOWL_UI_REFUSE_ARGS   =  8   /* null/empty required argument             */
+    AOWL_UI_REFUSE_ARGS   =  8,  /* null/empty required argument             */
+    /* --- handle-identity refusals (generational handles, see below) --- */
+    AOWL_UI_REFUSE_RANGE  =  9,  /* malformed handle / index out of range    */
+    AOWL_UI_REFUSE_RELEASED = 10,/* slot in range but not allocated          */
+    AOWL_UI_REFUSE_STALE  = 11,  /* right slot, WRONG generation             */
+    AOWL_UI_REFUSE_DISABLED = 12 /* core self-disabled after too many faults */
 };
+
+/* How many hard handle refusals (RANGE/RELEASED/STALE) before the core stops
+ * building and mutating altogether. Matches nuikit's budget. Re-armed only by
+ * an explicit aowl_ui_reset(). */
+enum { AOWL_UI_FAULT_BUDGET = 8 };
 
 static const char* aowl_ui_refusal_text(int32_t code) {
     switch (code) {
@@ -105,6 +115,16 @@ static const char* aowl_ui_refusal_text(int32_t code) {
         case AOWL_UI_REFUSE_TABS:    return "too many tabs (AOWL_UI_TABS)";
         case AOWL_UI_REFUSE_BINDS:   return "config binding table full";
         case AOWL_UI_REFUSE_ARGS:    return "a required argument was null/empty";
+        case AOWL_UI_REFUSE_RANGE:   return "RANGE -- malformed handle or slot "
+                                            "index out of range";
+        case AOWL_UI_REFUSE_RELEASED:return "RELEASED -- that slot holds no "
+                                            "widget";
+        case AOWL_UI_REFUSE_STALE:   return "STALE-GENERATION -- this handle "
+                                            "outlived its widget; uiBegin/reset "
+                                            "recycled the slot and it now holds "
+                                            "a DIFFERENT element";
+        case AOWL_UI_REFUSE_DISABLED:return "core self-disabled after "
+                                            "AOWL_UI_FAULT_BUDGET handle faults";
         default:                     return "unknown refusal";
     }
 }
@@ -174,6 +194,16 @@ typedef struct {
     AowlUiDrawOp ops[AOWL_UI_DRAWOPS];
     int32_t      opCount;
     int32_t      prevDown;  /* pointer button state last pump             */
+    /* --- generational handle identity ------------------------------- *
+     * gen[i] is the generation CURRENTLY living in slot i. It is bumped
+     * for every slot by aowl_ui_reset(), and it SURVIVES the memset --
+     * that is the whole point: a handle minted before a reset carries an
+     * older generation and is refused STALE instead of silently
+     * addressing whatever now occupies the recycled index.              */
+    int32_t      gen[AOWL_UI_MAX];
+    int32_t      handleFaults;   /* RANGE + RELEASED + STALE so far      */
+    int32_t      lastHandleRefusal;
+    int32_t      disabled;       /* budget spent; only reset() re-arms   */
 } AowlUiState;
 
 #ifdef AOWL_UI_HOST
@@ -200,8 +230,80 @@ static int32_t aowl_ui_rect_ok(float x, float y, float w, float h) {
 /* ------------------------------------------------------------------ *
  * Lifecycle.
  * ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------ *
+ * GENERATIONAL HANDLES.
+ *
+ *   handle = (gen << 16) | (index + 1)
+ *
+ * so a live handle is always > 0 (never 0, never negative -- refusals are
+ * negative and -1 stays the "no parent" sentinel), the index nibble is
+ * 1..AOWL_UI_MAX, and gen is 1..0x7FFF (bit 31 stays clear so the handle is
+ * a positive int32 on every compiler). This is the same encoding nuikit.nim
+ * uses for native widget handles, deliberately, so the two do not drift.
+ * ------------------------------------------------------------------ */
+enum { AOWL_UI_GEN_MAX = 0x7FFF };
+
+/* The CURRENT handle for a slot index, or 0 if that slot holds no widget.
+ * Enumeration (0..aowl_ui_count) goes through this, so walking the table never
+ * spends the fault budget on empty slots. */
+static int32_t aowl_ui_handle_at(int32_t index) {
+    if (index < 0 || index >= AOWL_UI_MAX) return 0;
+    if (!g_ui.w[index].used || g_ui.gen[index] <= 0) return 0;
+    return (g_ui.gen[index] << 16) | (index + 1);
+}
+
+/* The ONE decoder. Returns AOWL_UI_OK and writes *outIndex, or a POSITIVE
+ * refusal code naming exactly why the handle is not usable. Every hard
+ * refusal is counted against the fault budget. */
+static int32_t aowl_ui_handle_check(int32_t h, int32_t* outIndex) {
+    int32_t idx, gen, code;
+    idx = (h & 0xFFFF) - 1;
+    gen = (h >> 16) & 0xFFFF;
+    if (h <= 0 || idx < 0 || idx >= AOWL_UI_MAX || gen <= 0)
+        code = AOWL_UI_REFUSE_RANGE;
+    else if (gen != g_ui.gen[idx])
+        code = AOWL_UI_REFUSE_STALE;
+    else if (!g_ui.w[idx].used)
+        code = AOWL_UI_REFUSE_RELEASED;
+    else {
+        if (outIndex) *outIndex = idx;
+        return AOWL_UI_OK;
+    }
+    g_ui.lastHandleRefusal = code;
+    if (g_ui.handleFaults < AOWL_UI_FAULT_BUDGET) {
+        g_ui.handleFaults++;
+        if (g_ui.handleFaults >= AOWL_UI_FAULT_BUDGET) g_ui.disabled = 1;
+    }
+    return code;
+}
+
+/* The slot index behind a live handle, or -1. For callers that keep a
+ * per-slot side table (e.g. the Nim callback array) -- NEVER use a handle
+ * itself as an array subscript, it is not an index any more. */
+static int32_t aowl_ui_index_of(int32_t h) {
+    int32_t idx = 0;
+    return aowl_ui_handle_check(h, &idx) == AOWL_UI_OK ? idx : -1;
+}
+
+/* Why the last bad handle was refused (a positive AOWL_UI_REFUSE_* code). */
+static int32_t aowl_ui_last_handle_refusal(void) { return g_ui.lastHandleRefusal; }
+static int32_t aowl_ui_handle_faults(void)       { return g_ui.handleFaults; }
+static int32_t aowl_ui_disabled(void)            { return g_ui.disabled; }
+
 static void aowl_ui_reset(void) {
+    int32_t saved[AOWL_UI_MAX];
+    int32_t i;
+    /* Bump EVERY slot's generation across the wipe. Bumping only the `used`
+     * slots would leave a handle to a never-yet-allocated index validating
+     * after that index is later filled -- the same silent-wrong-element bug
+     * one step removed. */
+    for (i = 0; i < AOWL_UI_MAX; i++) {
+        int32_t g = g_ui.gen[i] + 1;
+        if (g > AOWL_UI_GEN_MAX || g <= 0) g = 1;   /* wraps after 32767 resets */
+        saved[i] = g;
+    }
     memset(&g_ui, 0, sizeof(g_ui));
+    for (i = 0; i < AOWL_UI_MAX; i++) g_ui.gen[i] = saved[i];
     g_ui.backend = AOWL_UI_BK_NONE;
 }
 
@@ -213,16 +315,20 @@ static int32_t aowl_ui_begin(int32_t backend) {
 }
 
 static int32_t aowl_ui_valid(int32_t h) {
-    return h >= 0 && h < AOWL_UI_MAX && g_ui.w[h].used;
+    int32_t idx = 0;
+    return aowl_ui_handle_check(h, &idx) == AOWL_UI_OK;
 }
 static AowlUiWidget* aowl_ui_at(int32_t h) {
-    return aowl_ui_valid(h) ? &g_ui.w[h] : (AowlUiWidget*)0;
+    int32_t idx = 0;
+    if (aowl_ui_handle_check(h, &idx) != AOWL_UI_OK) return (AowlUiWidget*)0;
+    return &g_ui.w[idx];
 }
 
 /* The one allocator. Returns a handle >= 0, or a NEGATED refusal code. */
 static int32_t aowl_ui_new(int32_t kind, int32_t parent,
                            float x, float y, float w, float h) {
     int32_t i;
+    if (g_ui.disabled) return -AOWL_UI_REFUSE_DISABLED;
     if (g_ui.backend != AOWL_UI_BK_OVERLAY && g_ui.backend != AOWL_UI_BK_NATIVE)
         return -AOWL_UI_REFUSE_BACKEND;
     if (kind < AOWL_UI_PANEL || kind > AOWL_UI_ROW)
@@ -247,7 +353,10 @@ static int32_t aowl_ui_new(int32_t kind, int32_t parent,
             p->cbId = -1;
             p->tabSel = 0;
             if (i + 1 > g_ui.count) g_ui.count = i + 1;
-            return i;
+            /* A never-reset global starts at gen 0, which decodes as RANGE.
+             * Claiming a slot mints generation 1 at the latest. */
+            if (g_ui.gen[i] <= 0) g_ui.gen[i] = 1;
+            return aowl_ui_handle_at(i);
         }
     }
     return -AOWL_UI_REFUSE_FULL;
@@ -534,8 +643,10 @@ static int32_t aowl_ui_pump(float px, float py, int32_t down) {
                 if (p->bindId >= 0)
                     aowl_ui_bind_set(p->bindId, p->toggleOn ? 1.0 : 0.0);
             } else if (p->kind == AOWL_UI_TABSTRIP) {
-                int32_t t = aowl_ui_tab_hit(i, px);
-                if (t >= 0) aowl_ui_tab_select(i, t);
+                /* i is a SLOT INDEX; the tab API takes a HANDLE. */
+                int32_t sh = aowl_ui_handle_at(i);
+                int32_t t = aowl_ui_tab_hit(sh, px);
+                if (t >= 0) aowl_ui_tab_select(sh, t);
             }
         }
     }
