@@ -64,6 +64,9 @@
   "unAdsSmoothTime": 0.12,
   "useAimSpeedsForFovSmoothing": true,
   "adsSmoothLinear": false,
+  "adsDeferToGame": true,
+  "adsSettleEps": 0.05,
+  "adsObserveCap": 1.5,
 
   "enableFovWrite": true,
   "verifyHooksByName": false,

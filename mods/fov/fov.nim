@@ -418,6 +418,39 @@ var cfgUseAimSpeedsForFov = true
   ## used because Z is the forward/zoom axis. The X and Y speeds, and all three
   ## pistol speeds, stay INERT: nothing in this mod reads the weapon class, so
   ## choosing between the rifle and pistol tables would be a guess.
+var cfgAdsDeferToGame = true
+  ## THE FIX for "ADS zoom-in smoothing is wrong, then at the end the FOV gets
+  ## set to its real ADS FOV".
+  ##
+  ## The game drives its OWN field of view while aiming in, along its own curve,
+  ## to a value that depends on the SIGHT. Our smoother was driving a second,
+  ## different curve to `gBaseFov * mult` at the same time, from
+  ## `TarkovApplication::Update`, every frame. Two writers on one field with two
+  ## different endpoints is exactly the reported symptom: the rendered FOV
+  ## alternates between the two curves for the length of the transition (which
+  ## reads as the "grass goes into warp speed" judder), and then the moment our
+  ## ramp stops changing the game's value is the only one still moving, which
+  ## reads as a SNAP to the real ADS FOV.
+  ##
+  ## Note the asymmetry the player reported and which this explains: un-ADS is
+  ## FINE. On the way out our endpoint is `gBaseFov`, which IS the game's hip
+  ## FOV, so both writers agree on the destination and the fight is invisible.
+  ## On the way in the game's endpoint is sight-dependent and ours is not.
+  ##
+  ## So: on the way in, DO NOT WRITE AT ALL. Let the game run its own ramp,
+  ## watch it, and only once it has SETTLED take that settled value as the true
+  ## ADS FOV and apply our multiplier to it. One writer at a time, and our
+  ## multiplier composes onto the game's real ADS FOV instead of onto the hip
+  ## FOV -- which is also the reason `opticFovMulti` never behaved: `base * 1.38`
+  ## has nothing to do with a scope's actual magnification.
+var cfgAdsSettleEps = 0.05
+  ## Degrees. Two consecutive samples of the game's own FOV closer than this
+  ## count as "not moving".
+var cfgAdsSettleTicks = 3
+  ## How many consecutive still samples end the observation.
+var cfgAdsObserveCap = 1.5
+  ## Seconds. If the game's FOV has not settled by now, give up, say so, and
+  ## fall back to the old base*mult endpoint rather than never applying at all.
 var cfgAdsSmoothLinear = false
   ## false = smoothstep easing (p*p*(3-2p)), true = constant rate. Two curves
   ## and no `pow`, because this runs per frame and must not call into libm.
@@ -561,6 +594,9 @@ proc loadConfig() =
   cfgUnAdsSmoothTime = cfgFloat("unAdsSmoothTime", 0.12)
   cfgUseAimSpeedsForFov = cfgBool("useAimSpeedsForFovSmoothing", true)
   cfgAdsSmoothLinear = cfgBool("adsSmoothLinear", false)
+  cfgAdsDeferToGame = cfgBool("adsDeferToGame", true)
+  cfgAdsSettleEps = cfgFloat("adsSettleEps", 0.05)
+  cfgAdsObserveCap = cfgFloat("adsObserveCap", 1.5)
 
   # RENAMED, and the rename IS the fix.
   #
@@ -662,6 +698,8 @@ proc fovSchema(): seq[Setting] =
     boolSetting("useAimSpeedsForFovSmoothing", "Use aim speeds for FOV smoothing",
                 true, category = "Field of view",
                 description = "Take the two transition durations from rifleAimSpeedZ and unAimSpeedZ as duration = 1 / speed, rather than from adsSmoothTime / unAdsSmoothTime. Upstream's aim speeds are Lerp(a, b, speed * dt) rates on the camera offset vector, so 1/speed is that lerp's time constant; Z is used because Z is the forward/zoom axis. This is the ONLY thing that reads those two settings -- the X and Y speeds and the whole pistol table are still inert, because nothing in this mod reads the weapon class and choosing a table would be a guess."),
+    boolSetting("adsDeferToGame", "Let the game drive the aim-in", true,
+                description = "ON (the fix for the reported ADS zoom being wrong): while aiming IN, this mod writes NOTHING and instead watches the field of view the GAME is driving. Once the game's own ramp has settled, that settled value is taken as the true ADS field of view and the multiplier is applied to it. OFF reproduces the old behaviour, where our smoothing raced the game's own aim-in along a different curve to a different endpoint -- which is what made the transition look wrong and then snap at the end. The settle test only accepts stillness AFTER it has seen the game's value actually move, so it cannot mistake 'the ramp has not started' for 'the ramp has finished'."),
     boolSetting("adsSmoothLinear", "Linear ADS easing", false,
                 category = "Field of view",
                 description = "Off: smoothstep easing, p*p*(3-2p) -- eases in and out, which is what reads as 'smooth'. On: constant rate. No other curves, because this runs every frame and must not call into libm."),
@@ -2019,6 +2057,30 @@ var gSmVerdict = "INCONCLUSIVE -- no ADS transition has completed yet"
 var gSmPasses = 0
 var gSmFails = 0
 var gLastRest = false    ## the previous write left us at rest on the base FOV
+
+# ---- Observing the GAME's own ADS ramp (cfgAdsDeferToGame).
+#
+# While `gAdsObserving` this mod writes NOTHING. It samples the field of view
+# the game itself is rendering and waits for that ramp to finish.
+#
+# The settle test is deliberately not "two samples the same". CLAUDE.md 9b: a
+# tick with no movement is INDISTINGUISHABLE from a tick before the game's ramp
+# has started, and a settle loop that accepts the second one declares victory
+# immediately and learns the HIP FOV as the ADS FOV -- which would be the same
+# class of bug, dressed differently. So stillness is only accepted AFTER motion
+# has actually been observed (`gAdsMoved`). If no motion is ever seen within
+# `cfgAdsObserveCap` seconds the answer is INCONCLUSIVE, said out loud, and the
+# old base*mult endpoint is used -- never a silent decline.
+var gAdsObserving = false
+var gAdsObsT = 0.0       ## seconds spent observing this ADS-in
+var gAdsPrev = 0.0       ## the previous sample of the game's own FOV
+var gAdsMoved = false    ## the game's FOV has been SEEN to move at least once
+var gAdsStill = 0        ## consecutive samples within cfgAdsSettleEps
+var gAdsBase = 0.0       ## the game's SETTLED ADS FOV; 0 = not learned yet
+var gAdsStart = 0.0      ## the FOV when this ADS-in began (for the log line)
+var gAdsVerdict = "INCONCLUSIVE -- no ADS-in has been observed yet"
+var gAdsLearns = 0
+var gAdsGiveUps = 0
 var gBaseCam: Il2CppPtr = nil
   ## WHICH camera `gBaseFov` was captured from. The menu camera and the raid
   ## camera are different objects, and `Camera::get_main` answers in both. A
@@ -2067,6 +2129,13 @@ proc resetSmoother(baseline: float) =
   gSmT = 0.0
   gSmDur = 0.0
   gSmSettled = true
+  # Anything learned about the GAME's ADS FOV was learned from the camera that
+  # is gone, so it is not carried across.
+  gAdsObserving = false
+  gAdsBase = 0.0
+  gAdsMoved = false
+  gAdsStill = 0
+  gAdsObsT = 0.0
   gLastRest = false
 
 # --- the CameraManager acquisition, reported three ways, never two.
@@ -2727,8 +2796,90 @@ proc applyFov() =
   # `endpoint` is where the FOV belongs for the CURRENT state; `target` is
   # where it should be RIGHT NOW, part-way there. The old code wrote `endpoint`
   # directly, which is the step change the player reported.
-  let endpoint = gBaseFov * mult
   let wantAds = aiming or gZoomOn
+
+  # ---- WHO OWNS THE FIELD OF VIEW RIGHT NOW.
+  #
+  # See cfgAdsDeferToGame. Leaving ADS drops everything learned about the game's
+  # ADS FOV, because the next ADS may be through a different sight and a
+  # remembered value would be a plausible wrong number -- the exact failure this
+  # whole path exists to remove.
+  if not wantAds:
+    if gAdsObserving or gAdsBase > 0.0:
+      gAdsObserving = false
+      gAdsBase = 0.0
+      gAdsMoved = false
+      gAdsStill = 0
+      gAdsObsT = 0.0
+
+  var endpoint = gBaseFov * mult
+  if cfgAdsDeferToGame and wantAds and mult != 1.0 and bCamFov.ok:
+    if gAdsBase > 0.0:
+      # Learned. Our multiplier composes onto the GAME's real ADS FOV.
+      endpoint = gAdsBase * mult
+    else:
+      # Not learned yet. Start, or continue, observing -- and WRITE NOTHING, so
+      # for the whole of the game's own aim-in ramp there is exactly one writer.
+      a.reset()
+      let seenNow = callFloat(bCamFov, cam, a)
+      if seenNow <= 0.0:
+        return
+      if not gAdsObserving:
+        gAdsObserving = true
+        gAdsObsT = 0.0
+        gAdsMoved = false
+        gAdsStill = 0
+        gAdsStart = seenNow
+        gAdsPrev = seenNow
+        # The smoother must not believe it is still sitting where it last wrote,
+        # or the ease that follows would start from a stale number.
+        gCurFov = seenNow
+        gSmFrom = seenNow
+        gSmTo = seenNow
+        gSmSettled = true
+        gLastTarget = 0.0
+      gAdsObsT = gAdsObsT + dt
+      let step = fabsf(seenNow - gAdsPrev)
+      gAdsPrev = seenNow
+      gCurFov = seenNow          ## track the game, so a cancelled ADS eases out
+                                 ## from where the view actually is
+      if step >= cfgAdsSettleEps:
+        gAdsMoved = true
+        gAdsStill = 0
+      elif gAdsMoved:
+        # Stillness only counts once motion has been SEEN. Before that it is
+        # "the ramp has not started", which is not the same answer.
+        gAdsStill = gAdsStill + 1
+      if gAdsMoved and gAdsStill >= cfgAdsSettleTicks:
+        gAdsObserving = false
+        gAdsBase = seenNow
+        gAdsLearns = gAdsLearns + 1
+        endpoint = gAdsBase * mult
+        gAdsVerdict = "LEARNED -- the game ramped its own FOV from " &
+                      $gAdsStart & " to " & $gAdsBase & " over " &
+                      $(gAdsObsT * 1000.0) & " ms with this mod writing " &
+                      "nothing; the multiplier x" & $mult & " now composes " &
+                      "onto " & $gAdsBase & " for an endpoint of " & $endpoint &
+                      " (the old code would have written " & $(gBaseFov * mult) &
+                      ", derived from the HIP fov " & $gBaseFov & ")"
+        if gAdsLearns == 1: info "FOV: " & gAdsVerdict
+      elif gAdsObsT >= cfgAdsObserveCap:
+        # Give up honestly and fall back, rather than never applying anything.
+        gAdsObserving = false
+        gAdsBase = gAdsPrev
+        gAdsGiveUps = gAdsGiveUps + 1
+        endpoint = gAdsBase * mult
+        gAdsVerdict = "INCONCLUSIVE -- the game's own field of view never " &
+                      (if gAdsMoved: "stopped moving" else: "moved at all") &
+                      " in " & $(gAdsObsT * 1000.0) & " ms of watching (it " &
+                      "read " & $gAdsStart & " at ADS-in and " & $gAdsPrev &
+                      " at the cap). Taking " & $gAdsPrev & " as the ADS FOV " &
+                      "anyway and saying so; this is NOT a pass."
+        if gAdsGiveUps == 1: warn "FOV: " & gAdsVerdict
+      else:
+        # Still watching. The game owns the field this tick.
+        return
+
   var target = endpoint
   if not cfgEnableAdsSmoothing:
     gCurFov = endpoint
@@ -2777,18 +2928,63 @@ proc applyFov() =
   # game recomputes every frame is a no-op the player sees as "does nothing".
   # So the value is ALSO read at the top of a later tick, before this one
   # writes, and a drift there is reported as CLOBBERED rather than hidden.
-  if sampling and bCamFov.ok and gLastTarget > 0.0:
+  # `gLastTarget == target` USED TO GATE BOTH BRANCHES. That made the detector
+  # structurally blind during exactly the transition it was needed for: while a
+  # transition runs, `target` changes every tick, so the gate was false on every
+  # transition frame and the verdict could only ever be formed at rest. It is
+  # gone -- the question "did what we wrote last tick survive the frame" does
+  # not depend on what we are about to write this tick.
+  if (sampling or not gSmVerified) and bCamFov.ok and gLastTarget > 0.0:
     a.reset()
     let pre = callFloat(bCamFov, cam, a)
     let pd = (if pre > gLastTarget: pre - gLastTarget else: gLastTarget - pre)
-    if pd > 0.5 and gLastTarget == target:
+    if pd > 0.5:
       gHeldVerdict = "CLOBBERED -- last tick wrote " & $gLastTarget &
                      ", this tick found " & $pre & " before writing. The " &
                      "game recomputes the field between frames; a one-shot " &
                      "write cannot win and the per-frame write is what holds it."
-    elif gLastTarget == target:
+    else:
       gHeldVerdict = "HELD -- " & $pre & " still standing from the previous " &
                      "write of " & $gLastTarget
+
+    # ---- DID THE ADS TRANSITION ACTUALLY ARRIVE?  (CLAUDE.md 9b)
+    #
+    # This verdict USED TO be formed straight after our own `set_fieldOfView`
+    # call, in the same Update tick. That is a read-back of our own write: the
+    # setter had just stored the value, so it could only ever say PASS -- and it
+    # DID say PASS ("ADS-in transition ended with the camera reading 66.75
+    # against an endpoint of 66.75") in the very run where the player was
+    # watching the field of view snap somewhere else. A check that cannot fail
+    # is the bug.
+    #
+    # It now runs on the FOLLOWING tick, BEFORE this tick writes, so what it
+    # reads is what SURVIVED the frame -- i.e. it can be beaten by the game's
+    # own drive, which is the only thing worth asking.
+    if cfgEnableAdsSmoothing and gSmSettled and not gSmVerified:
+      gSmVerified = true
+      let ms = gSmElapsed * 1000.0
+      if fabsf(pre - gSmTo) <= 0.5:
+        gSmPasses = gSmPasses + 1
+        gSmVerdict = "PASS -- " & (if gSmToAds: "ADS-in" else: "ADS-out") &
+                     " transition settled on " & $gSmTo & " in " & $ms &
+                     " ms, and a FULL FRAME LATER the camera still reads " &
+                     $pre & ". Nothing overwrote it."
+      else:
+        gSmFails = gSmFails + 1
+        gSmVerdict = "FAIL -- " & (if gSmToAds: "ADS-in" else: "ADS-out") &
+                     " transition settled on " & $gSmTo & " after " & $ms &
+                     " ms, but one frame later the camera reads " & $pre &
+                     " (delta " & $fabsf(pre - gSmTo) & "). Something else " &
+                     "is writing the field of view -- this is the snap the " &
+                     "player sees at the end of the transition."
+      if gSmPasses + gSmFails == 1:
+        info "FOV: first ADS transition verdict: " & gSmVerdict
+      info "FOV: transition -- from " & $gSmFrom & " to " & $gSmTo &
+           " (game's own ADS fov " &
+           (if gAdsBase > 0.0: $gAdsBase else: "not learned") &
+           ", hip base " & $gBaseFov & ", mult x" & $mult & "), settled in " &
+           $ms & " ms, camera one frame later " & $pre & ", delta " &
+           $fabsf(pre - gSmTo)
   gLastTarget = target
   # ---- THE WRITE.
   #
@@ -2847,41 +3043,20 @@ proc applyFov() =
     if gWriteTook + gWriteMissed == 1:
       info "FOV: write verdict: " & gWriteVerdict
 
-  # ---- DID THE ADS TRANSITION ACTUALLY ARRIVE?  (CLAUDE.md 9b)
+  # The arrival verdict is NOT formed here. It used to be, immediately after the
+  # write above, which made it a read-back of our own store -- see the block
+  # before the write, where it now runs one full frame later.
   #
-  # This asserts the FINISHED STATE read off the camera, not the value this
-  # code just computed -- comparing `gCurFov` with `gSmTo` would be comparing
-  # our own arithmetic with itself and could only ever say yes. Exactly one
-  # extra `get_fieldOfView` per completed transition, on the tick the
-  # transition ends; nothing per frame, and no string is built while one is
-  # running. Three outcomes:
-  #   PASS         the camera renders the endpoint, and here is how long it took
-  #   FAIL         the transition finished and the camera is somewhere else
-  #   INCONCLUSIVE there is no readable getter, so we could not look
-  if cfgEnableAdsSmoothing and gSmSettled and not gSmVerified:
+  # One case that block cannot reach: if `gLastTarget` is 0 (nothing was written
+  # last tick, e.g. we were observing the game's ramp) there is no survival
+  # question to ask, and the verdict stays INCONCLUSIVE rather than defaulting
+  # to a pass.
+  if cfgEnableAdsSmoothing and gSmSettled and not gSmVerified and
+     not bCamFov.ok:
     gSmVerified = true
-    if not bCamFov.ok:
-      gSmVerdict = "INCONCLUSIVE -- the transition to " & $gSmTo &
-                   " finished but Camera::get_fieldOfView did not verify, " &
-                   "so the rendered value could not be read. Not a pass."
-    else:
-      a.reset()
-      let arrived = callFloat(bCamFov, cam, a)
-      let ms = gSmElapsed * 1000.0
-      if fabsf(arrived - gSmTo) <= 0.5:
-        gSmPasses = gSmPasses + 1
-        gSmVerdict = "PASS -- " & (if gSmToAds: "ADS-in" else: "ADS-out") &
-                     " transition ended with the camera reading " & $arrived &
-                     " against an endpoint of " & $gSmTo & ", in " & $ms &
-                     " ms (asked for " & $(gSmDur * 1000.0) & " ms)"
-      else:
-        gSmFails = gSmFails + 1
-        gSmVerdict = "FAIL -- " & (if gSmToAds: "ADS-in" else: "ADS-out") &
-                     " transition ended after " & $ms & " ms and the camera " &
-                     "reads " & $arrived & ", not the endpoint " & $gSmTo &
-                     ". Something else is writing the field of view."
-      if gSmPasses + gSmFails == 1:
-        info "FOV: first ADS transition verdict: " & gSmVerdict
+    gSmVerdict = "INCONCLUSIVE -- the transition to " & $gSmTo &
+                 " finished but Camera::get_fieldOfView did not verify, so " &
+                 "the rendered value could not be read. Not a pass."
   if measuring:
     gFovNs = gFovNs + nanosBetween(now, perfCounter())
     gFovSamples = gFovSamples + 1
@@ -3610,6 +3785,13 @@ proc reportWatch() =
               $(adsOutDuration() * 1000.0) & " ms, " &
               (if cfgAdsSmoothLinear: "linear" else: "smoothstep")) &
        "; base FOV " & $gBaseFov & ", current " & $gCurFov
+  info "    who drives the aim-in: " &
+       (if not cfgAdsDeferToGame:
+          "THIS MOD -- adsDeferToGame is off, so our ramp races the game's own"
+        else:
+          "THE GAME (adsDeferToGame on); this mod writes nothing until the " &
+          "game's ramp settles. " & $gAdsLearns & " settled, " & $gAdsGiveUps &
+          " gave up. " & gAdsVerdict)
   reportEffect("per-frame FOV write", gFovState, gFovWrites)
   info "    driven by " & gDriverState
   if gDriverIsEveryMain:
