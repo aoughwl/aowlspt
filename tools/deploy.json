@@ -166,6 +166,7 @@
    "minBytes": 100000,
    "markers": [
     "aowl.tarkov",
+   "/aowlspt/tarkov/autoscript/loadout",
     "/client/game/start",
     "/client/game/profile/list",
     "/client/items",

@@ -1,5 +1,7 @@
 ## aowl -- the one command that builds, tests and installs this repo.
 ##
+##     aowl script PATH.nim       build and run one automation script
+##                                (0 PASS, 1 FAIL, 2 INCONCLUSIVE)
 ##     aowl build                 everything: hosts, installer, examples
 ##     aowl build-mod PATH        one nimony mod -> a native .dll
 ##     aowl build-hosts           the simulator and the .NET tools
@@ -3069,6 +3071,71 @@ proc cmdTest(e: Env): int =
     ok "everything passed"
     result = 0
 
+proc buildScript(e: Env; scriptPath: string; exeOut: var string): bool =
+  ## `aowl script <path.nim>` -- compile ONE automation script.
+  ##
+  ## An automation script is an ordinary nimony program that imports
+  ## `tools/autoscript`. Same shape as `emutest`: it opens sockets to the
+  ## backend's plain-HTTP control port and spawns processes, so it wants
+  ## `installer\src` (winfs, the spawn shim) and `tools` (autoscript,
+  ## aowlsession) on the path, and links winsock.
+  ##
+  ## It is compiled through `aowl` and never by hand: a raw `nimony` invocation
+  ## outside the paths this sets up **exits 0 and writes nothing**, and a green
+  ## exit code with no artifact is the worst failure this build has.
+  let outDir = joinPath(e.repo, "installer\\build\\scripts")
+  discard ensureDir(outDir)
+  let src = absolutePathOf(scriptPath)
+  if not fileExists(src):
+    err "no such script: " & src
+    return false
+  var stem = baseName(src)
+  if stem.len > 4 and stem.substr(stem.len - 4) == ".nim":
+    stem = stem.substr(0, stem.len - 5)
+  exeOut = joinPath(outDir, stem & ".exe")
+  var cmd = quoted(nimonyExe(e))
+  cmd.add " c"
+  cmd.add abiInclude(e)
+  cmd.add " --passL:-lws2_32"
+  cmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
+  cmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
+  cmd.add " -p:" & quoted(joinPath(e.repo, "tools"))
+  cmd.add " -p:" & quoted(parentOf(src))
+  cmd.add " -o:" & quoted(exeOut)
+  cmd.add " " & quoted(src)
+  result = run(e, "script " & stem, cmd, e.repo)
+
+proc cmdScript(e: Env; scriptPath: string; scriptArgs: string): int =
+  ## Build the script and RUN it, printing everything it says.
+  ##
+  ## The script's own exit code is passed straight through, because it IS the
+  ## verdict: 0 PASS, 1 FAIL, 2 INCONCLUSIVE. Collapsing 2 into 1 would report a
+  ## run that could not look as a run that looked and found a fault, and those
+  ## are different and differently actionable facts.
+  var exe = ""
+  if not buildScript(e, scriptPath, exe):
+    return 2
+  if not fileExists(exe):
+    err "the script compiled and produced no binary at " & exe &
+        " -- that is the silent-nimony failure; do not trust the exit code"
+    return 2
+  var cmd = quoted(exe)
+  if scriptArgs.len > 0:
+    cmd.add " " & scriptArgs
+  var code = -1
+  try:
+    code = execCmd(cmd)
+  except:
+    err "script: could not start " & exe
+    return 2
+  if code == 0:
+    ok "script PASS"
+  elif code == 1:
+    err "script FAIL"
+  else:
+    note "script INCONCLUSIVE (exit " & $code & ") -- the question was not asked"
+  result = code
+
 proc cmdRun(e: Env; modPath: string; simArgs: string = ""): int =
   ## `aowl run <mod>` — build it and run it under the simulator.
   ##
@@ -3514,6 +3581,16 @@ proc main(): int =
       if simArgs.len > 0: simArgs.add " "
       simArgs.add quoted(a)
     result = cmdRun(e, arg, simArgs)
+  of "script":
+    if arg.len == 0:
+      fatal "script needs a path to a .nim automation script " &
+            "(try: aowl script scripts\\woods_pmc_m4.nim)"
+    var sArgs = ""
+    for a in extra:
+      if a == arg: continue
+      if sArgs.len > 0: sArgs.add " "
+      sArgs.add quoted(a)
+    result = cmdScript(e, arg, sArgs)
   of "payload": result = cmdPayload(e)
   of "release": result = cmdRelease(e, extra)
   of "importdb": result = cmdImportDb(e, extra)
