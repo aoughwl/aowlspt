@@ -5281,6 +5281,867 @@ proc iCmdWhyDidntItDraw(toks: seq[string]) =
        "drawing BEHIND something is the one cause no field read on this " &
        "node can rule out.")
 
+# ===========================================================================
+# ASSERTIONS -- turning a batch from a transcript into a TEST
+#
+# Every assertion has THREE outcomes and reports one of exactly three prefixes:
+#
+#     PASS           the finished state was read, and it is what was claimed
+#     FAIL           the finished state was read, and it is NOT what was claimed
+#     INCONCLUSIVE   the state could NOT be read, so nothing was established
+#
+# INCONCLUSIVE is not a soft pass and is never folded into either of the other
+# two. "I could not look" is the outcome this whole instrument exists to keep
+# distinguishable (CLAUDE.md 9b), and an assertion verb that could only ever
+# say PASS would be exactly the defect it is meant to catch. Concretely, each
+# verb below is INCONCLUSIVE when the expression does not evaluate, when the
+# memory is not readable, when the object is Unity-fake-null, or when the
+# helper function it needs did not byte-verify on this build.
+#
+# The counters below are per BATCH, and a resumed batch keeps them -- the same
+# rule the output buffer and `allow write` already follow, because a batch that
+# parked on `until` is one test, not two.
+# ===========================================================================
+var gAssPass = 0
+var gAssFail = 0
+var gAssInc = 0
+
+proc iAssPass(msg: string) =
+  inc gAssPass
+  iOut("  PASS: " & msg)
+
+proc iAssFail(msg: string) =
+  inc gAssFail
+  iOut("  FAIL: " & msg)
+
+proc iAssInc(msg: string) =
+  inc gAssInc
+  iOut("  INCONCLUSIVE: " & msg &
+       "  -- nothing was established; this is NOT a pass and NOT a failure.")
+
+proc iAssRead(p: Il2CppPtr; t: string; raw: var uint64): bool =
+  ## Raw little-endian read of exactly the type's width. Separate from
+  ## `iReadTyped` on purpose: that one returns a HUMAN string (with the hex
+  ## suffix, the `readable` note, the quotes), and comparing rendered text
+  ## would make `assert X i32 == 5` depend on formatting rather than on the
+  ## value. Returns false for "could not look", which the callers turn into
+  ## INCONCLUSIVE rather than into a failure.
+  raw = 0'u64
+  let size = iTypeSize(t)
+  if size < 0:
+    return false
+  var buf = default(array[8, uint8])
+  iMark(("assert read " & t & " at " & iPtr(p)), p)
+  if cInspReadBytes(p, 0'i32, size, cast[ptr uint8](addr buf[0])) == 0'i32:
+    return false
+  for i in 0 ..< int(size):
+    raw = raw or (uint64(buf[i]) shl uint64(i * 8))
+  result = true
+
+proc iAssSigned(t: string; raw: uint64): int64 =
+  ## Sign-extend by declared width, so `assert p i32 == -1` means what it says.
+  case t
+  of "i8": result = (if raw >= 0x80'u64: int64(raw) - 256'i64 else: int64(raw))
+  of "i16": result = (if raw >= 0x8000'u64: int64(raw) - 65536'i64 else: int64(raw))
+  of "i32": result = int64(int32(uint32(raw)))
+  of "i64": result = cast[int64](raw)
+  else: result = cast[int64](raw)
+
+proc iAssIsSigned(t: string): bool =
+  result = (t == "i8" or t == "i16" or t == "i32" or t == "i64")
+
+proc iAssIsFloat(t: string): bool =
+  result = (t == "f32" or t == "f64")
+
+proc iAssFloatOf(t: string; raw: uint64): float64 =
+  if t == "f32": float64(cInspBitsF32(uint32(raw))) else: cInspBitsF64(raw)
+
+proc iAssCmpNum(op: string; a, b: float64; ok: var bool): bool =
+  ## Returns false for "that is not an operator I know" (a REFUSAL, not a
+  ## failure). Float equality uses a relative tolerance, because an exact `==`
+  ## on a value that came out of a matrix multiply is a check that can only
+  ## ever fail, which is the mirror image of a check that can only ever pass.
+  ok = false
+  result = true
+  var d = a - b
+  if d < 0.0: d = -d
+  var mag = (if a < 0.0: -a else: a)
+  let mb = (if b < 0.0: -b else: b)
+  if mb > mag: mag = mb
+  let tol = 0.000001 + mag * 0.000001
+  case op
+  of "==": ok = d <= tol
+  of "!=": ok = d > tol
+  of "<": ok = a < b
+  of "<=": ok = a <= b
+  of ">": ok = a > b
+  of ">=": ok = a >= b
+  else: result = false
+
+proc iCmdAssert(toks: seq[string]) =
+  ## `assert EXPR TYPE OP VALUE`
+  ##   OP is == != < <= > >=  for every numeric type;
+  ##   for `str` it is == != contains, compared against the REST of the line.
+  if toks.len < 5:
+    iErr("usage: assert EXPR TYPE OP VALUE   (OP: == != < <= > >= ; for " &
+         "TYPE str also `contains`).  Nothing was asserted.")
+    return
+  let t = iLower(toks[2])
+  let op = toks[3]
+  if iTypeSize(t) < 0:
+    iErr("assert: \"" & t & "\" is not a type this REPL knows, so no width " &
+         "could be chosen and NOTHING was read. Nothing was asserted.")
+    return
+  var v = 0'u64
+  var err = ""
+  if not iEval(toks[1], v, err):
+    iAssInc("assert " & toks[1] & ": the expression did not evaluate (" &
+            err & ")")
+    return
+  let p = cast[Il2CppPtr](v)
+  var raw = 0'u64
+  if not iAssRead(p, t, raw):
+    iAssInc("assert " & toks[1] & " " & t & ": " & iPtr(p) &
+            " is not readable for " & $int(iTypeSize(t)) & " byte(s)")
+    return
+  # Everything below here HAS the finished state in hand, so from this point
+  # the only two outcomes left are PASS and FAIL.
+  if t == "str":
+    var want = ""
+    for i in 4 ..< toks.len:
+      if i > 4: want.add ' '
+      want.add toks[i]
+    if raw == 0'u64:
+      # A null String* is a real, readable answer: the field IS null.
+      let hit = (op == "!=")
+      if hit: iAssPass("the String* at " & iPtr(p) & " is NULL, and != \"" &
+                       want & "\"")
+      else: iAssFail("the String* at " & iPtr(p) & " is NULL; expected " & op &
+                     " \"" & want & "\"")
+      return
+    let got = suiReadString(cast[Il2CppPtr](raw))
+    var ok = false
+    case op
+    of "==": ok = (got == want)
+    of "!=": ok = (got != want)
+    of "contains": ok = iContains(got, want)
+    else:
+      iErr("assert: \"" & op & "\" is not an operator for TYPE str (use == " &
+           "!= contains). Nothing was asserted.")
+      return
+    if ok:
+      iAssPass("string at " & iPtr(p) & " = \"" & got & "\"  " & op & "  \"" &
+               want & "\"")
+    else:
+      iAssFail("string at " & iPtr(p) & " = \"" & got & "\"  which is NOT " &
+               op & " \"" & want & "\"")
+    return
+  # Numeric / pointer / bool.
+  var wantTok = toks[4]
+  var got = 0.0
+  var wantV = 0.0
+  if iAssIsFloat(t):
+    got = iAssFloatOf(t, raw)
+    if not iParseF(wantTok, wantV):
+      iErr("assert: \"" & wantTok & "\" is not a number. Nothing was asserted.")
+      return
+  elif t == "bool":
+    got = (if (raw and 1'u64) != 0'u64: 1.0 else: 0.0)
+    let w = iLower(wantTok)
+    if w == "true": wantV = 1.0
+    elif w == "false": wantV = 0.0
+    else:
+      var wu = 0'u64
+      if not iParseU(wantTok, wu):
+        iErr("assert: \"" & wantTok & "\" is not true/false or a number. " &
+             "Nothing was asserted.")
+        return
+      wantV = (if wu != 0'u64: 1.0 else: 0.0)
+  elif iAssIsSigned(t):
+    got = float64(iAssSigned(t, raw))
+    var neg = false
+    var tok2 = wantTok
+    if tok2.len > 0 and tok2[0] == '-':
+      neg = true
+      var rest = ""
+      for k in 1 ..< tok2.len: rest.add tok2[k]
+      tok2 = rest
+    var wu = 0'u64
+    if not iParseU(tok2, wu):
+      iErr("assert: \"" & wantTok & "\" is not an integer. Nothing was asserted.")
+      return
+    wantV = (if neg: -float64(wu) else: float64(wu))
+  else:
+    got = float64(raw)
+    var wu = 0'u64
+    if not iParseU(wantTok, wu):
+      iErr("assert: \"" & wantTok & "\" is not an integer. Nothing was asserted.")
+      return
+    wantV = float64(wu)
+  var ok = false
+  if not iAssCmpNum(op, got, wantV, ok):
+    iErr("assert: \"" & op & "\" is not an operator I know (== != < <= > >=). " &
+         "Nothing was asserted.")
+    return
+  var shown = ""
+  discard iReadTyped(p, t, shown)
+  if ok:
+    iAssPass(toks[1] & " as " & t & " = " & shown & "   " & op & " " & wantTok)
+  else:
+    iAssFail(toks[1] & " as " & t & " = " & shown & "   is NOT " & op & " " &
+             wantTok)
+
+proc iCmdAssertActive(toks: seq[string]) =
+  ## `assert-active EXPR` / `assert-inactive EXPR`.
+  ##
+  ## Uses `GameObject::get_activeInHierarchy`, NOT `activeSelf`: fact #72 is
+  ## that a press on a node under an inactive ancestor returns success and does
+  ## nothing, so `activeSelf` would be a check that passes for an unpressable
+  ## node. `iActiveInHierarchy` reports (ok, active), and ok=false is exactly
+  ## the INCONCLUSIVE case -- the function did not verify on this build, or a
+  ## hop was unreadable.
+  let want = (iLower(toks[0]) != "assert-inactive")
+  if toks.len < 2:
+    iErr("usage: " & iLower(toks[0]) & " EXPR. Nothing was asserted.")
+    return
+  var v = 0'u64
+  var err = ""
+  if not iEval(toks[1], v, err):
+    iAssInc(iLower(toks[0]) & " " & toks[1] & ": expression did not evaluate (" &
+            err & ")")
+    return
+  let p = cast[Il2CppPtr](v)
+  if not duOk(p, 0x20'i32):
+    iAssInc(iLower(toks[0]) & " " & toks[1] & ": " & iPtr(p) &
+            " is not readable, so its active state was never asked for")
+    return
+  if not iUnityAlive(p):
+    iAssInc(iLower(toks[0]) & " " & toks[1] & ": " & iPtr(p) &
+            " is readable but Unity-FAKE-NULL (native half destroyed), so " &
+            "asking it for activeInHierarchy would be a call into a dead object")
+    return
+  let (okq, act) = iActiveInHierarchy(p)
+  if not okq:
+    iAssInc(iLower(toks[0]) & " " & toks[1] & ": activeInHierarchy could not " &
+            "be determined (Component::get_gameObject or " &
+            "GameObject::get_activeInHierarchy did not verify on this build, " &
+            "or a hop was unreadable)")
+    return
+  if act == want:
+    iAssPass(toks[1] & " activeInHierarchy = " &
+             (if act: "true" else: "false") & ", as claimed")
+  else:
+    iAssFail(toks[1] & " activeInHierarchy = " &
+             (if act: "true" else: "false") & ", but " & iLower(toks[0]) &
+             " claimed " & (if want: "true" else: "false") &
+             (if act: "" else: ".  An INACTIVE node is NOT pressable: a press " &
+              "on one reports success and does nothing (fact #72)."))
+
+proc iCmdAssertPtr(toks: seq[string]) =
+  ## `assert-null EXPR` / `assert-nonnull EXPR` / `assert-readable EXPR`.
+  ##
+  ## Deliberately three separate claims. `readable` is a claim about MEMORY;
+  ## `nonnull` is a claim about the VALUE STORED at that address. They are
+  ## different questions and conflating them is how "readability is liveness"
+  ## keeps getting re-invented -- so `assert-nonnull` additionally reports
+  ## Unity fake-null when the pointer is non-zero but its native half is gone,
+  ## and calls that a FAIL, because a fake-null object is not a live one.
+  let verb = iLower(toks[0])
+  if toks.len < 2:
+    iErr("usage: " & verb & " EXPR. Nothing was asserted.")
+    return
+  var v = 0'u64
+  var err = ""
+  if not iEval(toks[1], v, err):
+    iAssInc(verb & " " & toks[1] & ": expression did not evaluate (" & err & ")")
+    return
+  let p = cast[Il2CppPtr](v)
+  if verb == "assert-readable":
+    if duOk(p, 8'i32):
+      iAssPass(toks[1] & " = " & iPtr(p) & " is readable for 8 bytes. NOTE: " &
+               "readable is NOT alive -- use assert-nonnull or assert-active " &
+               "for that.")
+    else:
+      iAssFail(toks[1] & " = " & iPtr(p) &
+               " is NOT committed/readable memory (VirtualQuery refused)")
+    return
+  var raw = 0'u64
+  if not iAssRead(p, "ptr", raw):
+    iAssInc(verb & " " & toks[1] & ": " & iPtr(p) & " is not readable for 8 " &
+            "bytes, so the pointer stored there was never read")
+    return
+  if verb == "assert-null":
+    if raw == 0'u64: iAssPass(toks[1] & " holds NULL, as claimed")
+    else: iAssFail(toks[1] & " holds " & iPtrU(raw) & ", which is NOT null")
+    return
+  # assert-nonnull
+  if raw == 0'u64:
+    iAssFail(toks[1] & " holds NULL")
+    return
+  let q = cast[Il2CppPtr](raw)
+  if not duOk(q, 0x20'i32):
+    iAssFail(toks[1] & " holds " & iPtrU(raw) & ", which is non-zero but is " &
+             "NOT readable memory -- a non-zero value is not an object.")
+    return
+  if not iUnityAlive(q):
+    iAssFail(toks[1] & " holds " & iPtrU(raw) & ", readable, but Unity " &
+             "FAKE-NULL: the managed wrapper is there and the native object " &
+             "at +0x10 is gone. In C# this compares == null.")
+    return
+  iSetVar("_", raw)
+  iAssPass(toks[1] & " holds " & iPtrU(raw) &
+           ", readable and native-alive  ($_)")
+
+proc iCmdAssertName(toks: seq[string]) =
+  ## `assert-name EXPR SUBSTR` -- the object's GameObject name CONTAINS SUBSTR.
+  ## Case-insensitive, matching `find`'s own predicate exactly, so the two
+  ## cannot disagree about what "this node is called X" means.
+  if toks.len < 3:
+    iErr("usage: assert-name EXPR SUBSTR. Nothing was asserted.")
+    return
+  var v = 0'u64
+  var err = ""
+  if not iEval(toks[1], v, err):
+    iAssInc("assert-name " & toks[1] & ": expression did not evaluate (" &
+            err & ")")
+    return
+  let p = cast[Il2CppPtr](v)
+  if not duOk(p, 0x20'i32) or not iUnityAlive(p):
+    iAssInc("assert-name " & toks[1] & ": " & iPtr(p) & " is not readable, " &
+            "or is Unity-fake-null; its name was never asked for")
+    return
+  let nm = iObjName(p)
+  if nm.len == 0:
+    # An EMPTY name is not an answer -- `Object::get_name` returning "" is
+    # indistinguishable here from the call not having produced anything, and
+    # the `label` verb's `text = ""` trap is exactly this shape.
+    iAssInc("assert-name " & toks[1] & ": Object::get_name produced an EMPTY " &
+            "string, which is indistinguishable from the name not having been " &
+            "read at all")
+    return
+  if iContains(iLower(nm), iLower(toks[2])):
+    iAssPass(toks[1] & " is named \"" & nm & "\", which contains \"" &
+             toks[2] & "\"")
+  else:
+    iAssFail(toks[1] & " is named \"" & nm & "\", which does NOT contain \"" &
+             toks[2] & "\"")
+
+proc iCmdVerdict() =
+  ## The machine-readable line. Emitted automatically at the end of any batch
+  ## that ran an assertion, and available on demand mid-batch.
+  ##
+  ## The precedence is FAIL > INCONCLUSIVE > PASS, and INCONCLUSIVE is above
+  ## PASS on purpose: a batch where two checks passed and one could not look
+  ## has NOT demonstrated the property it was written to demonstrate.
+  if gAssPass + gAssFail + gAssInc == 0:
+    iOut("  ASSERTIONS: none ran in this batch. There is no verdict to give " &
+         "-- that is not a pass.")
+    return
+  iOut("  ASSERTIONS: " & $gAssPass & " pass, " & $gAssFail & " fail, " &
+       $gAssInc & " inconclusive")
+  if gAssFail > 0:
+    iOut("  BATCH VERDICT: FAIL")
+  elif gAssInc > 0:
+    iOut("  BATCH VERDICT: INCONCLUSIVE")
+  else:
+    iOut("  BATCH VERDICT: PASS")
+
+# ===========================================================================
+# NAVIGATION -- path, siblings
+# ===========================================================================
+const InspPathMax = 24
+
+proc iCmdPath(toks: seq[string]) =
+  ## `path EXPR` -- the full hierarchy path of a node, as one line.
+  ##
+  ## Three outcomes, because a path can be genuinely incomplete: the walk stops
+  ## at a null parent (COMPLETE -- that is the hierarchy root), at an
+  ## unreadable hop (INCOMPLETE, and it says which level), or at the depth cap
+  ## (TRUNCATED). A path printed without that distinction reads as absolute
+  ## when it may only be a suffix.
+  if toks.len < 2:
+    iErr("usage: path EXPR")
+    return
+  var v = 0'u64
+  var err = ""
+  if not iEval(toks[1], v, err):
+    iErr(err)
+    return
+  var cur = cast[Il2CppPtr](v)
+  if not duOk(cur, 0x20'i32):
+    iErr("not readable at " & iPtr(cur) & "; no path was walked.")
+    return
+  if not iUnityAlive(cur):
+    iErr("readable but Unity-FAKE-NULL at " & iPtr(cur) &
+         " -- walking a destroyed object's parent chain is a call into a " &
+         "dead object. No path was walked.")
+    return
+  var idx = 0
+  var hits = 0
+  var fnParent: Il2CppPtr = nil
+  if iFindTarget("Transform::get_parent", idx, hits): fnParent = iTargetFn(idx)
+  if fnParent == nil:
+    iErr("Transform::get_parent did not byte-verify on this build; no path " &
+         "could be walked. This is INCONCLUSIVE, not an empty path.")
+    return
+  cur = iToTransform(cur)
+  var names: seq[string] = @[]
+  var level = 0
+  var status = 2   # 0 complete, 1 incomplete, 2 truncated
+  while level < InspPathMax:
+    if not duOk(cur, 0x20'i32) or not iUnityAlive(cur):
+      status = 1
+      break
+    let nm = iObjName(cur)
+    names.add (if nm.len > 0: nm else: "<unnamed " & iPtr(cur) & ">")
+    iMark(("Transform::get_parent [path] on " & iPtr(cur)), cur)
+    let par = cast[Il2CppPtr](cInspUP(fnParent, cur, nil))
+    if par == nil:
+      status = 0
+      break
+    cur = par
+    inc level
+  var line = ""
+  var k = names.len - 1
+  while k >= 0:
+    line.add '/'
+    line.add names[k]
+    dec k
+  if status == 0:
+    iOut("  " & line)
+    iOut("  -- COMPLETE: the walk reached a null parent, so this path is " &
+         "absolute within its scene root.")
+  elif status == 1:
+    iOut("  ..." & line)
+    iOut("  -- INCOMPLETE: the chain stopped at an unreadable or fake-null " &
+         "ancestor after " & $names.len & " level(s). The leading `...` is " &
+         "NOT decoration: the part above this is unknown.")
+  else:
+    iOut("  ..." & line)
+    iOut("  -- TRUNCATED at the depth cap of " & $InspPathMax &
+         " levels. The part above this was never walked.")
+
+proc iCmdSiblings(toks: seq[string]) =
+  ## `siblings EXPR` -- the node's parent's children, with THIS one marked.
+  ## The point is sibling INDEX and neighbourhood, which is how nearly every
+  ## row/tab/list control in this UI is actually identified.
+  if toks.len < 2:
+    iErr("usage: siblings EXPR")
+    return
+  var v = 0'u64
+  var err = ""
+  if not iEval(toks[1], v, err):
+    iErr(err)
+    return
+  var me = cast[Il2CppPtr](v)
+  if not duOk(me, 0x20'i32) or not iUnityAlive(me):
+    iErr("not readable, or Unity-fake-null; no siblings were enumerated.")
+    return
+  me = iToTransform(me)
+  var idx = 0
+  var hits = 0
+  var fnParent: Il2CppPtr = nil
+  if iFindTarget("Transform::get_parent", idx, hits): fnParent = iTargetFn(idx)
+  if fnParent == nil:
+    iErr("Transform::get_parent did not byte-verify on this build; nothing " &
+         "was enumerated. INCONCLUSIVE, not 'no siblings'.")
+    return
+  iMark(("Transform::get_parent [siblings] on " & iPtr(me)), me)
+  let par = cast[Il2CppPtr](cInspUP(fnParent, me, nil))
+  if par == nil:
+    iOut("  this node has a NULL parent -- it is a hierarchy root, so it has " &
+         "no siblings. That is an ANSWER, not a failure to look. Use `roots` " &
+         "to see the other roots of its scene.")
+    return
+  if not duOk(par, 0x20'i32) or not iUnityAlive(par):
+    iErr("the parent at " & iPtr(par) & " is not readable or is fake-null; " &
+         "no siblings were enumerated.")
+    return
+  var n = 0
+  if not iChildCount(par, n):
+    iErr("the parent's childCount could not be read; no siblings were " &
+         "enumerated. INCONCLUSIVE.")
+    return
+  iOut("  parent " & iPtr(par) & " \"" & iObjName(par) & "\" has " & $n &
+       " child(ren)")
+  var shown = 0
+  var mine = -1
+  var k = 0
+  while k < n and k < InspMaxChildren:
+    let c = iChildAt(par, k)
+    if c != nil:
+      iSetVar("s" & $k, cast[uint64](c))
+      let isMe = (c == me)
+      if isMe: mine = k
+      let (okq, act) = iActiveInHierarchy(c)
+      iOut("    [" & $k & "] " & iPtr(c) & " \"" & iObjName(c) & "\"  " &
+           (if okq: (if act: "active" else: "INACTIVE")
+            else: "active=UNKNOWN") &
+           "   ($s" & $k & ")" & (if isMe: "   <<< THIS" else: ""))
+      inc shown
+    else:
+      iOut("    [" & $k & "] (null child slot)")
+    inc k
+  if n > InspMaxChildren:
+    iOut("  -- listed " & $InspMaxChildren & " of " & $n &
+         "; the rest were NOT examined.")
+  if mine < 0:
+    iOut("  !! the node you asked about was NOT among its own parent's " &
+         "children. That is a contradiction, not a result -- most likely the " &
+         "expression is a COMPONENT and `siblings` compared the Transform. " &
+         "Treat this listing as INCONCLUSIVE.")
+  else:
+    iOut("  -- sibling index of the node you asked about: " & $mine)
+
+# ===========================================================================
+# findcomp -- search by COMPONENT TYPE
+# ===========================================================================
+const InspFindCompDefBudget = 600
+  ## Deliberately far smaller than `find`'s budget. Each node here costs a
+  ## MANAGED CALL (`Component::GetComponent(String)`) rather than a field read,
+  ## so this walk is roughly two orders of magnitude more expensive per node
+  ## and runs on the Unity thread. A generous default here would stall the
+  ## client, which costs the session rather than the answer.
+const InspFindCompMaxHits = 32
+const InspFindCompMaxBudget = 4000
+  ## The ceiling, not the default. Raising it is a deliberate code change: the
+  ## real backstop is the 12ms frame slice, and a caller who asks for 200000
+  ## here gets told it was clamped rather than being quietly given 600.
+
+proc iCmdFindComp(toks: seq[string]) =
+  ## `findcomp TypeName [ROOT] [BUDGET]` -- every node under ROOT that HAS a
+  ## component of that type.
+  ##
+  ## "Find the object with a PostProcessLayer" is a question `find` (name) and
+  ## `findtext` (displayed text) both structurally cannot answer. The route is
+  ## the one `component` already proves: one `il2cpp_string_new` for the type
+  ## name, reused for every node, then the Component overload of GetComponent
+  ## on each Transform. Transforms come out of the child walk BY CONTRACT, so
+  ## the GameObject/Component overload confusion that faults inside Unity
+  ## cannot arise here.
+  ##
+  ## ATOMIC: one frame's slice, no cross-frame resume. A partial answer is
+  ## reported as STOPPED EARLY and is never described as exhaustive.
+  if toks.len < 2:
+    iErr("usage: findcomp TypeName [ROOT] [BUDGET]   (e.g. findcomp Button)")
+    return
+  if cNavIcallReady() == 0'i32:
+    iErr("the icall \"UnityEngine.Component::GetComponent(System.String)\" is " &
+         "NOT registered in this runtime, so every node would take the " &
+         "wrapper's failure branch and RAISE. NOTHING was searched -- this is " &
+         "INCONCLUSIVE, not an empty result.")
+    return
+  var fn: Il2CppPtr = nil
+  var rva = 0'u32
+  if not iNavFind("Component::GetComponent(String)", fn, rva):
+    return
+  var root: Il2CppPtr = nil
+  var rootExplicit = false
+  var budgetTok = 2
+  if not iFindResolveRoot(toks, 2, "findcomp", root, rootExplicit, budgetTok):
+    return
+  let budget = iFindParseBudgetNoted(toks, budgetTok, InspFindCompDefBudget,
+                                     InspFindCompMaxBudget, "findcomp")
+  var roots: seq[Il2CppPtr] = @[]
+  if rootExplicit:
+    if not iFindValidateRoot(root, true):
+      return
+    roots.add root
+  else:
+    let nroots = iSceneRoots(roots, false)
+    if nroots == 0 or roots.len == 0:
+      iErr("no scene roots were reachable, so NOTHING was searched. This is " &
+           "INCONCLUSIVE, not 'that component does not exist'.")
+      return
+  var typeName = toks[1]
+  let sp = cNavNewString(toCString(typeName))
+  if sp == nil:
+    iErr("il2cpp_string_new returned null for \"" & toks[1] &
+         "\"; nothing was searched.")
+    return
+  iOut("  via UnityEngine.Component::GetComponent(String) @0x" &
+       iHexPad(uint64(rva), 6) & " on each node, budget " & $budget &
+       " node(s), one frame slice")
+  var queue: seq[Il2CppPtr] = @[]
+  for r in roots:
+    if r != nil: queue.add r
+  var head = 0
+  var seen = 0
+  var visited = 0
+  var skips = 0
+  var found = 0
+  var stopped = 0   # 0 exhausted, 1 budget, 2 time, 3 hit cap
+  let started = cNowMs()
+  while head < queue.len:
+    if seen >= budget:
+      stopped = 1
+      break
+    if (seen and 15) == 0 and cNowMs() - started > InspFindSliceMs:
+      stopped = 2
+      break
+    if found >= InspFindCompMaxHits:
+      stopped = 3
+      break
+    let cur = queue[head]
+    inc head
+    inc seen
+    if not duOk(cur, 0x20'i32) or not iUnityAlive(cur):
+      inc skips
+      continue
+    inc visited
+    iMark("Component::GetComponent(String) [findcomp]", cur)
+    let comp = cast[Il2CppPtr](cInspUPP(fn, cur, sp, nil))
+    if comp != nil and duOk(comp, 0x20'i32):
+      inc found
+      iNoteKlass(comp)
+      iSetVar("k" & $found, cast[uint64](comp))
+      iSetVar("kn" & $found, cast[uint64](cur))
+      let (okq, act) = iActiveInHierarchy(cur)
+      iOut("    HIT node=" & iPtr(cur) & " \"" & iObjName(cur) & "\"  " &
+           toks[1] & "=" & iPtr(comp) & "  " &
+           (if okq: (if act: "active" else: "INACTIVE -- NOT pressable")
+            else: "active=UNKNOWN") &
+           "   ($k" & $found & " = component, $kn" & $found & " = node)")
+    var n = 0
+    if iChildCount(cur, n):
+      var k = 0
+      while k < n and k < InspMaxChildren:
+        let c = iChildAt(cur, k)
+        if c != nil: queue.add c
+        inc k
+  iOut("  visited " & $visited & " node(s), " & $found & " match(es), " &
+       "frontier " & $(queue.len - head) & " node(s)" &
+       (if skips > 0: ", " & $skips & " unreadable/fake-null node(s) skipped"
+        else: ""))
+  if visited == 0:
+    iOut("  -- NOTHING WAS EXAMINED (0 valid nodes visited). This is NOT " &
+         "evidence that no " & toks[1] & " exists -- the search never looked.")
+  elif stopped == 0:
+    iOut("  -- the subtree was searched EXHAUSTIVELY. " &
+         (if found == 0:
+            "No node under this root has a component Unity's SHORT-NAME match " &
+            "accepts as \"" & toks[1] & "\". If you suspect the NAME rather " &
+            "than the absence, retry fully qualified (e.g. " &
+            "UnityEngine.UI.Button)."
+          else: "Every match is listed above."))
+  elif stopped == 3:
+    iOut("  -- STOPPED at the match cap (" & $InspFindCompMaxHits &
+         "). There are probably more; narrow the root.")
+  elif stopped == 1:
+    iOut("  -- STOPPED EARLY on the NODE BUDGET (" & $budget & "). This is " &
+         "NOT proof of absence. Re-run with a bigger budget or a narrower root.")
+  else:
+    iOut("  -- STOPPED EARLY on the 12ms FRAME SLICE, which is why this verb " &
+         "has no `more`: each node costs a managed call. This is NOT proof of " &
+         "absence. Narrow the root and re-run.")
+
+# ===========================================================================
+# whyread -- why is this expression not giving me an answer
+#
+# NOTE ON NAMING: `why` is ALREADY an alias for `whydidntitdraw` and is left
+# exactly as it was. Rebinding a verb modders may already have in scripts, to
+# something that answers a different question, is precisely the class of silent
+# change this instrument is supposed to be incapable of.
+# ===========================================================================
+proc iCmdWhyRead(toks: seq[string]) =
+  if toks.len < 2:
+    iErr("usage: whyread EXPR   (explains WHY an expression is or is not usable)")
+    return
+  var v = 0'u64
+  var err = ""
+  if not iEval(toks[1], v, err):
+    iOut("  1. the EXPRESSION did not evaluate: " & err)
+    iOut("  -- nothing was read. Syntax is  $anchor | 0xhex  then any number " &
+         "of  +0xNN  (move) or  @0xNN  (move then DEREFERENCE). An unbound " &
+         "$name is a refusal, not a zero.")
+    return
+  let p = cast[Il2CppPtr](v)
+  iOut("  1. the expression evaluates to " & iPtr(p))
+  if v == 0'u64:
+    iOut("  -- it is NULL. Most often the anchor it started from is unbound " &
+         "(check `anchors`, and `state` for WHY an anchor is null), or a `@` " &
+         "hop dereferenced a slot that holds zero.")
+    return
+  if not duOk(p, 8'i32):
+    iOut("  2. VirtualQuery says this address is NOT committed/readable for " &
+         "even 8 bytes.")
+    let s = cInspIl2Start()
+    let e = cInspIl2End()
+    if s != 0'u64 and v >= s and v < e:
+      iOut("  -- it IS inside the `il2cpp` CODE section. That is a function " &
+           "address, not an object; reading fields off it is meaningless.")
+    else:
+      iOut("  -- and it is not inside the module's code section either. This " &
+           "is the signature of a value used as a pointer: a small integer " &
+           "(a budget typed where a root belonged), a field VALUE rather than " &
+           "a field ADDRESS, or a freed object.")
+    return
+  iOut("  2. it IS readable (VirtualQuery, 8 bytes minimum).")
+  var kraw = 0'u64
+  if not iAssRead(p, "ptr", kraw):
+    iOut("  3. but the klass slot at +0x00 could not be read. INCONCLUSIVE " &
+         "about whether this is a managed object.")
+    return
+  if kraw == 0'u64 or not duOk(cast[Il2CppPtr](kraw), 0x20'i32):
+    iOut("  3. the slot at +0x00 is " & iPtrU(kraw) & ", which is NOT a " &
+         "readable Il2CppClass*. Every live IL2CPP object carries one there, " &
+         "so this is readable memory that is probably NOT a managed object " &
+         "-- a struct, a buffer, or the middle of one.")
+    return
+  var verified = false
+  let kn = iKlassName(kraw, verified)
+  iOut("  3. klass = " & iPtrU(kraw) &
+       (if kn.len == 0: "  (name unreadable)"
+        elif verified: "  type \"" & kn & "\" (VERIFIED against this build's " &
+                       "metadata)"
+        else: "  raw name \"" & kn & "\" -- UNVERIFIED: no such type in this " &
+              "build's metadata, so do not trust it"))
+  if iIsTransform(p):
+    iOut("  4. its klass matches one learned from a source that returns a " &
+         "Transform BY CONTRACT, so tree walkers accept it.")
+  elif iIsGameObject(p):
+    iOut("  4. its klass matches one learned from a GameObject-by-contract " &
+         "source. Transform walkers REFUSE it on purpose: fed to `children` " &
+         "it once read a plausible childCount and invented a hierarchy of " &
+         "wrong children without faulting. Use `component`/`comp` or the " &
+         "$rN form rather than $rgoN.")
+  else:
+    iOut("  4. its klass is not one of the Transform/GameObject klasses this " &
+         "session has learned. That is not a verdict -- it only means no " &
+         "by-contract source has handed back this type yet.")
+  if not iUnityAlive(p):
+    iOut("  5. UNITY FAKE NULL: the native half at +0x10 (m_CachedPtr) is " &
+         "zero. In C# this object compares == null. It is readable and it is " &
+         "DEAD; readability is not liveness, and calling a Unity method on it " &
+         "faults inside Unity's C++, outside anything we can attribute.")
+    return
+  iOut("  5. native half at +0x10 is non-zero, so this is a LIVE Unity " &
+       "object, not a fake-null husk.")
+  let (okq, act) = iActiveInHierarchy(p)
+  if okq:
+    iOut("  6. activeInHierarchy = " & (if act: "true" else: "false") &
+         (if act: "" else: "  -- INACTIVE, therefore NOT pressable: a press " &
+          "returns success and does nothing (fact #72)."))
+  else:
+    iOut("  6. activeInHierarchy could not be determined on this build; that " &
+         "is INCONCLUSIVE, not 'active'.")
+
+# ===========================================================================
+# watch -- sample one value across frames and report what CHANGED
+# ===========================================================================
+const InspWatchCap = 240
+const InspWatchMaxReport = 16
+
+var gWatchIdx = -1
+var gWatchLeft = 0
+var gWatchSamples = 0
+var gWatchUnread = 0
+var gWatchChanges = 0
+var gWatchReported = 0
+var gWatchHave = false
+var gWatchLast = 0'u64
+var gWatchFirst = 0'u64
+
+proc iIsWatchCmd(line: string): bool =
+  let toks = iSplit(line)
+  if toks.len == 0: return false
+  result = (iLower(toks[0]) == "watch")
+
+proc iWatchStep(line: string; idx: int): bool =
+  ## One frame's sample of `watch EXPR TYPE [N]`. Returns true when the batch
+  ## may move on.
+  ##
+  ## This exists because a value that is WRONG ONE FRAME IN THIRTY is invisible
+  ## to `read`, and `read` run twice is indistinguishable from a value that
+  ## never moved. Sampling with a per-frame comparison is the only way this
+  ## instrument can say "it flickered" rather than "it looked fine when I
+  ## asked". The expression is RE-EVALUATED every frame on purpose: a pointer
+  ## chain whose middle hop is republished is exactly the lifecycle bug this
+  ## is for, and caching the final address would hide it.
+  let toks = iSplit(line)
+  let first = (gWatchIdx != idx)
+  if toks.len < 3:
+    if first:
+      iErr("usage: watch EXPR TYPE [FRAMES]. Nothing was watched.")
+    gWatchIdx = -1
+    return true
+  let t = iLower(toks[2])
+  if iTypeSize(t) < 0:
+    if first:
+      iErr("watch: \"" & t & "\" is not a type this REPL knows. Nothing was " &
+           "watched.")
+    gWatchIdx = -1
+    return true
+  if first:
+    gWatchIdx = idx
+    var frames = 60
+    if toks.len > 3:
+      var n = 0'u64
+      var e2 = ""
+      if iEval(toks[3], n, e2) and int(n) > 0: frames = int(n)
+    if frames > InspWatchCap: frames = InspWatchCap
+    gWatchLeft = frames
+    gWatchSamples = 0
+    gWatchUnread = 0
+    gWatchChanges = 0
+    gWatchReported = 0
+    gWatchHave = false
+    iOut("  watch: sampling " & toks[1] & " as " & t & " once per frame for " &
+         $frames & " frame(s)")
+  var v = 0'u64
+  var err = ""
+  var raw = 0'u64
+  if not iEval(toks[1], v, err):
+    inc gWatchUnread
+  elif not iAssRead(cast[Il2CppPtr](v), t, raw):
+    inc gWatchUnread
+  else:
+    inc gWatchSamples
+    if not gWatchHave:
+      gWatchHave = true
+      gWatchFirst = raw
+      gWatchLast = raw
+      var shown = ""
+      discard iReadTyped(cast[Il2CppPtr](v), t, shown)
+      iOut("    frame 0: " & shown)
+    elif raw != gWatchLast:
+      inc gWatchChanges
+      if gWatchReported < InspWatchMaxReport:
+        inc gWatchReported
+        var shown = ""
+        discard iReadTyped(cast[Il2CppPtr](v), t, shown)
+        iOut("    CHANGED at sample " & $gWatchSamples & ": " & iPtrU(gWatchLast) &
+             " -> " & shown)
+      gWatchLast = raw
+  dec gWatchLeft
+  if gWatchLeft > 0:
+    return false
+  gWatchIdx = -1
+  # THE HONEST SUMMARY. "Never changed" and "was never readable" are different
+  # facts and are reported as different facts.
+  iOut("  watch: " & $gWatchSamples & " readable sample(s), " & $gWatchUnread &
+       " unreadable frame(s), " & $gWatchChanges & " change(s)" &
+       (if gWatchChanges > gWatchReported:
+          " (" & $gWatchReported & " shown; the rest were counted only)"
+        else: ""))
+  if gWatchSamples == 0:
+    iOut("  -- NOTHING WAS SAMPLED. The expression never evaluated or never " &
+         "read in any frame. This says nothing about whether the value is " &
+         "stable; it says the instrument could not look. INCONCLUSIVE.")
+  elif gWatchUnread > 0:
+    iOut("  -- the value was UNREADABLE in " & $gWatchUnread & " of the " &
+         "frames sampled. That is itself a lifecycle result: something in " &
+         "the chain was being destroyed and recreated. Changes counted above " &
+         "cover only the frames that read.")
+  elif gWatchChanges == 0:
+    iOut("  -- the value was READ in every frame and NEVER changed. That is a " &
+         "real negative over this window only; a flicker rarer than " &
+         $gWatchSamples & " frames would not have been seen.")
+  else:
+    iOut("  -- the value CHANGED " & $gWatchChanges & " time(s) over " &
+         $gWatchSamples & " frames. It is not stable.")
+  result = true
+
 proc iCmdHelp() =
   iOut("  aowlspt live inspector -- commands (addresses are EXPR, see below)")
   iOut("    anchors                       list named anchors + variables")
@@ -5350,6 +6211,51 @@ proc iCmdHelp() =
   iOut("    image                         GameAssembly base + il2cpp section")
   iOut("    allow write                   arm writes/calls for this batch")
   iOut("    echo TEXT                     put a marker in the output")
+  iOut("  -- ASSERTIONS: a batch becomes a TEST. Three outcomes, always. --")
+  iOut("    assert EXPR TYPE OP VALUE     OP: == != < <= > >= ; str also")
+  iOut("                                  `contains`. f32/f64 use a relative")
+  iOut("                                  tolerance, not exact ==")
+  iOut("                                  e.g.  assert $verlabel+0xe0 str contains v1.0")
+  iOut("    assert-active EXPR            activeInHierarchy (NOT activeSelf)")
+  iOut("    assert-inactive EXPR          the negative form")
+  iOut("    assert-null EXPR              the PTR STORED at EXPR is 0")
+  iOut("    assert-nonnull EXPR           ...is non-0, readable AND not")
+  iOut("                                  Unity-fake-null. Fake-null is a FAIL")
+  iOut("    assert-readable EXPR          EXPR itself is committed memory")
+  iOut("                                  (readable is NOT alive)")
+  iOut("    assert-name EXPR SUBSTR       GameObject name contains SUBSTR")
+  iOut("    verdict                       print the running tally now")
+  iOut("       Every batch that ran an assertion ends with two grep-able lines:")
+  iOut("         ASSERTIONS: <n> pass, <n> fail, <n> inconclusive")
+  iOut("         BATCH VERDICT: PASS | FAIL | INCONCLUSIVE")
+  iOut("       Precedence is FAIL > INCONCLUSIVE > PASS. A batch with no")
+  iOut("       assertions prints NO verdict -- that is not a pass.")
+  iOut("  -- lifecycle + diagnosis --")
+  iOut("    watch EXPR TYPE [FRAMES]      sample once per FRAME (default 60,")
+  iOut("                                  cap 240) and report every CHANGE.")
+  iOut("                                  Re-evaluates the whole expression")
+  iOut("                                  each frame, so a republished middle")
+  iOut("                                  hop shows up. Separates 'never")
+  iOut("                                  changed' from 'never readable'.")
+  iOut("    whyread EXPR | explain EXPR   WHY an expression is unusable: bad")
+  iOut("                                  parse / not committed / a code")
+  iOut("                                  address / no klass / UNVERIFIED klass")
+  iOut("                                  name / Unity fake-null / inactive.")
+  iOut("                                  (`why` remains whydidntitdraw.)")
+  iOut("  -- more navigation --")
+  iOut("    path EXPR                     full /A/B/C hierarchy path. Says")
+  iOut("                                  COMPLETE / INCOMPLETE / TRUNCATED --")
+  iOut("                                  a leading `...` means the top is")
+  iOut("                                  unknown, not decoration")
+  iOut("    siblings EXPR | sibs EXPR     the parent's children -> $s0..$sN,")
+  iOut("                                  with THIS one marked and its index")
+  iOut("    findcomp TypeName [ROOT] [BUDGET]")
+  iOut("                                  find nodes that HAVE a component of")
+  iOut("                                  that type -> $k1.. (component) and")
+  iOut("                                  $kn1.. (node). One managed call PER")
+  iOut("                                  NODE, so budget defaults to 600 and")
+  iOut("                                  there is no `more`; a partial answer")
+  iOut("                                  says STOPPED EARLY, never exhaustive")
   iOut("  TYPE  i8 u8 i16 u16 i32 u32 i64 u64 f32 f64 ptr bool str klass")
   iOut("  EXPR  ATOM ( +0xNN | @0xNN )*   `+` moves, `@` DEREFERENCES")
   iOut("        ATOM is 0x<hex>, a decimal, or $name")
@@ -5544,6 +6450,30 @@ proc iExec(line: string) =
     iCmdCanvasOrder(toks)
   of "whydidntitdraw", "why":
     iCmdWhyDidntItDraw(toks)
+  of "whyread", "explain":
+    iCmdWhyRead(toks)
+  of "assert":
+    iCmdAssert(toks)
+  of "assert-active", "assert-inactive":
+    iCmdAssertActive(toks)
+  of "assert-null", "assert-nonnull", "assert-readable":
+    iCmdAssertPtr(toks)
+  of "assert-name":
+    iCmdAssertName(toks)
+  of "verdict":
+    iCmdVerdict()
+  of "path":
+    iCmdPath(toks)
+  of "siblings", "sibs":
+    iCmdSiblings(toks)
+  of "findcomp":
+    iCmdFindComp(toks)
+  of "watch":
+    # Same shape as `wait`/`until`: the batch runner parks and resumes it
+    # across frames, so reaching here means the runner did not intercept it.
+    # Say that plainly rather than pretending the verb does not exist.
+    iErr("watch was not intercepted by the batch runner; this is an internal " &
+         "inconsistency, not a bad command. Nothing was sampled.")
   of "canvas":
     if toks.len < 2:
       iErr("usage: canvas EXPR   (EXPR is a Graphic, e.g. a TextMeshProUGUI)")
@@ -5683,6 +6613,12 @@ proc inspRunBatch() =
     gInspOutBytes = 0
     gInspAllowWrite = false
     gInspResumeAt = 0
+    # Assertion counters are per BATCH and a resumed batch keeps them -- a
+    # batch that parked on `until` is ONE test, not two. Resetting them here
+    # (in the not-resuming arm only) is what makes that true.
+    gAssPass = 0
+    gAssFail = 0
+    gAssInc = 0
   gInspSuspended = false
   # THE ANCHOR REFRESH IS NOW GUARDED. It was not, and it sits between "the
   # rider observed a pending batch" and "the rider cleared the pending flag" --
@@ -5714,6 +6650,20 @@ proc inspRunBatch() =
     # A `wait`/`until` parks the batch HERE and returns. The rider re-enters
     # next frame and resumes at this same index, so the condition is retested
     # once per frame with a hard frame cap.
+    if iIsWatchCmd(gInspCmds[i]):
+      # `watch` parks exactly like `wait`, one sample per frame. It gets its
+      # own step proc rather than sharing `iWaitStep`, because a wait that
+      # finishes early and a watch that finishes early mean opposite things.
+      if gWatchIdx != i:
+        iOut("> " & gInspCmds[i])
+      if iWatchStep(gInspCmds[i], i):
+        inc i
+        gInspResumeAt = i
+        continue
+      gInspResumeAt = i
+      gInspSuspended = true
+      gInspPhase = 0
+      return
     if iIsWaitCmd(gInspCmds[i]):
       if iWaitStep(gInspCmds[i], i):
         inc i
@@ -5756,6 +6706,11 @@ proc inspRunBatch() =
     inc i
   gInspResumeAt = 0
   gInspWaitIdx = -1
+  # THE MACHINE-READABLE VERDICT. Emitted only when the batch actually ran an
+  # assertion, so an exploratory batch is not given a spurious PASS -- "no
+  # checks ran" and "every check passed" must never print the same line.
+  if gAssPass + gAssFail + gAssInc > 0:
+    iCmdVerdict()
   iOut("aowlspt live inspector -- batch " & $gInspRunningBatch & " complete, " &
        $gInspOut.len & " line(s)")
 

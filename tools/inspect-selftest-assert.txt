@@ -1,0 +1,72 @@
+#1
+# ===========================================================================
+# ASSERTION SELF-TEST -- proves the verb can produce all THREE outcomes.
+#
+# Copy to D:\Aowlspt\aowlspt\aowlspt-inspect.txt (NO BOM -- use printf from
+# bash, or `[IO.File]::WriteAllText` from PowerShell; `Set-Content -Encoding
+# utf8` emits a BOM). Bump the `#1` serial to re-run an identical batch.
+#
+# A verb that can only ever say PASS is the defect this whole instrument
+# exists to catch, so the test that matters is not "does assert pass" -- it is
+# "can assert FAIL, and can it say it could not look". Read the three groups
+# below and then the single BATCH VERDICT line at the end.
+#
+# EXPECTED, exactly:
+#   group 1 -> 4x PASS
+#   group 2 -> 4x FAIL
+#   group 3 -> 4x INCONCLUSIVE
+#   ASSERTIONS: 4 pass, 4 fail, 4 inconclusive
+#   BATCH VERDICT: FAIL            <- because FAIL > INCONCLUSIVE > PASS
+#
+# If every line says PASS, the assertion verb is broken, NOT the game.
+# ===========================================================================
+echo ===== group 1: must PASS =====
+
+# $preloader is the host's own verified live anchor. Its klass slot at +0x00 is
+# a readable Il2CppClass* on every live IL2CPP object, so this is the most
+# nearly tautological true statement available -- which is the point: it is the
+# control, not the test.
+assert-readable $preloader
+assert-nonnull $preloader
+assert-active $preloader
+assert $preloader ptr != 0
+
+echo ===== group 2: must FAIL =====
+
+# Same live object, claims that are simply untrue of it. Each of these is
+# READ successfully -- the state is in hand -- and contradicts the claim. That
+# is exactly what separates FAIL from INCONCLUSIVE.
+assert-null $preloader
+assert-inactive $preloader
+assert $preloader ptr == 0
+assert-name $preloader ThisNameDoesNotExistAnywhere
+
+echo ===== group 3: must be INCONCLUSIVE =====
+
+# 3a. An unbound variable: the expression does not evaluate at all.
+assert $nosuchanchorexists ptr == 0
+
+# 3b. An address that is deliberately not committed memory. 0x10 is in the
+# always-reserved low 64KB of the address space, so VirtualQuery refuses it on
+# every Windows process. Nothing is read, so nothing is established -- note
+# this is NOT reported as "the value is not 5".
+assert 0x10 i32 == 5
+
+# 3c. Same address, active-state form: the node is never asked for its
+# activeInHierarchy because it is not readable.
+assert-active 0x10
+
+# 3d. Same address, name form.
+assert-name 0x10 anything
+
+echo ===== group 4: REFUSALS -- these must NOT reach the tally =====
+
+# A bad TYPE and a bad OP are refusals ("nothing was asserted"), not failures.
+# They print a `!` line and must leave the counts at 4/4/4. If either of these
+# increments the tally, the verb is charging you for a typo.
+assert $preloader nosuchtype == 1
+assert $preloader ptr ?? 1
+
+verdict
+
+echo ===== end. Expect: 4 pass, 4 fail, 4 inconclusive / VERDICT FAIL =====
