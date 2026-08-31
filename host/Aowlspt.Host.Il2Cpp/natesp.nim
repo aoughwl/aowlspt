@@ -114,6 +114,11 @@ proc cNeMaxSeedSkips(): int32 {.importc: "aowl_ne_max_seed_skips", nodecl.}
 proc cNeSliceMs(): int32 {.importc: "aowl_ne_slice_ms", nodecl.}
 proc cNeScanEvery(): int32 {.importc: "aowl_ne_scan_every", nodecl.}
 proc cNeMinCanvasPx(): float32 {.importc: "aowl_ne_min_canvas_px", nodecl.}
+proc cNeCanvasSortOrder(): int32 {.
+  importc: "aowl_ne_canvas_sort_order", nodecl.}
+proc cNeCanvasSettleTicks(): int32 {.
+  importc: "aowl_ne_canvas_settle_ticks", nodecl.}
+proc cNeUiLayer(): int32 {.importc: "aowl_ne_ui_layer", nodecl.}
 proc cNeOnScreen(x, y, w, h, sw, sh: float32): int32 {.
   importc: "aowl_ne_on_screen", nodecl.}
 
@@ -133,6 +138,9 @@ const
   NeRNoString     = 12'i32
   NeRDiscFaulted  = 13'i32
   NeRSeedTries    = 14'i32
+  NeRCanvasDonor  = 15'i32
+  NeRCanvasCreate = 16'i32
+  NeRCanvasUnverified = 17'i32
 
 const
   NeVInconclusive = 0'i32
@@ -145,6 +153,25 @@ const
   NeBuild    = 2
   NeRun      = 3
   NeRefused  = 4
+  NeSettle   = 5   ## our canvas exists; waiting for it to READ BACK sane
+
+# THE CANVAS ORIGIN -- three outcomes, and the reason this const block exists.
+#
+# `gNeCanvasGo != nil` used to be the whole story, and it could not say WHERE
+# the canvas came from. Now that natesp can build one, "we are drawing" has two
+# very different causes and one failure, and the verdict line has to be able to
+# name which: parenting into the game's own HUD canvas and parenting into ours
+# fail in different ways and are fixed in different places.
+const
+  NeOriginNone    = 0'i32   ## nothing bound
+  NeOriginFound   = 1'i32   ## an EXISTING canvas, discovered
+  NeOriginCreated = 2'i32   ## OURS, built from scratch
+
+proc neOriginName(o: int32): string =
+  case int(o)
+  of 1: "FOUND(existing)"
+  of 2: "CREATED(ours)"
+  else: "NONE"
 
 const NeMaxPool = 32          ## must equal AOWL_NE_POOL; asserted at bind
 const NeMaxContacts = 64      ## players read per census pass
@@ -166,6 +193,20 @@ var gNeCanvasTr: Il2CppPtr = nil     ## its RectTransform -- our parent
 var gNeCanvasW = 0'f32
 var gNeCanvasH = 0'f32
 var gNeGraphicDonor: Il2CppPtr = nil ## a live Graphic, for nuRegisterReference
+
+# ---- OUR OWN CANVAS ------------------------------------------------------
+# `gNeOwnCanvasGo` is set ONLY when we created it, and it is what teardown
+# destroys. It is deliberately a SECOND variable rather than a flag on
+# gNeCanvasGo: destroying a canvas we merely FOUND would take the game's HUD
+# down with it, and the two must never be one pointer with a boolean beside it.
+var gNeCanvasOrigin = NeOriginNone
+var gNeOwnCanvasGo: Il2CppPtr = nil   ## GAMEOBJECT -- ours, and ours to destroy
+var gNeOwnCanvasComp: Il2CppPtr = nil ## the CANVAS COMPONENT on it
+var gNeOwnCanvasTr: Il2CppPtr = nil   ## its RECTTRANSFORM
+var gNeSettleFrom = 0'i64             ## tick the settle wait started
+var gNeSettleReads = 0                ## readback attempts made
+var gNeSettleLast = ""                ## what the last readback actually said
+var gNeCreateTried = false            ## creation attempted this discovery pass
 
 var gNeRootGo: Il2CppPtr = nil
 var gNeRootTr: Il2CppPtr = nil
@@ -309,6 +350,7 @@ var gNeAnchorSceneOk = false  ## did GameObject::get_scene_Injected answer?
 ## finder never ran". Run at most once per discovery attempt.
 var gNePhase0Done = false
 var gNePhase0Verdict = "not run"
+var gNePhase0Scope = "not run"
 var gNePhase0Ledger = ""
 
 proc neLooksUi(n: string): bool =
@@ -694,6 +736,193 @@ proc neSeedLedger(): string =
   " lastInternalCall=\"" & neCrumb() & "\" on 0x" &
   hexOf(cast[uint64](cInspCrumbPtr()))
 
+# ---------------------------------------------------------------------------
+# CREATING OUR OWN CANVAS -- the third outcome
+#
+# ORDERING IS FIND-THEN-CREATE, ALWAYS. This is reached only when phase 0 asked
+# EVERY live root and answered ABSENT, and the breadth-first fallback then
+# finished EXHAUSTIVELY over both phases with nothing. Creating a canvas while
+# a usable one exists would double-draw and fight it for z-order, so the
+# preconditions are checked in `neDiscoverStep`, not here, and this proc never
+# runs while `gNeCanvasGo` is bound.
+#
+# WHY IT IS PLAUSIBLE AT ALL. Proven live 2026-08-30 (IMAGEPROOF VERDICT =
+# PASS): il2cpp_object_new with a class pointer borrowed from a live GameObject
+# header, GameObject::.ctor(String), then AddComponent<T> through the game's own
+# .data MethodInfo slot, produced a real 240x120 Image with an auto-added
+# CanvasRenderer. What that proof did NOT include was a Canvas -- Stage C never
+# discovered one; it parented under a settings-menu control and Unity's OnEnable
+# filled `Graphic.m_Canvas` by ANCESTOR WALK. The lesson taken here is exactly
+# that: what a Graphic needs is a PARENT CHAIN ending at a Canvas, and a chain
+# we built ourselves is as good as one we found.
+#
+# TYPES, NAMED AT EVERY HOP, because a Transform passes both readability and
+# Unity liveness while being the wrong object and that cost four rounds:
+#   splAnchor()          -> a PreloaderUI COMPONENT (not a GameObject)
+#   neGameObjectOf(...)  -> GAMEOBJECT           (the class donor, read-only)
+#   nuCreate(...)        -> GAMEOBJECT           (ours)
+#   nuAdd(RectTransform) -> RECTTRANSFORM COMPONENT
+#   nuAdd(Canvas)        -> CANVAS COMPONENT     (what the setters take)
+#   nuTransformOf(go)    -> RECTTRANSFORM        (what boxes parent to)
+#
+# GUARD: no `aowl_p_p_seh` is opened here. Everything below runs inside the ONE
+# guarded region `cNeTickGuarded` already established for the whole tick; an
+# inner guard would DISARM it. Every hop is duOk + iUnityAlive (`neLive`) or
+# nuOk-checked by the nu* primitive it calls.
+#
+# ALLOCATION: strictly one-time. `gNeCreateTried` makes it once per discovery
+# pass, and a successful creation leaves the state machine in NeSettle/NeBuild,
+# neither of which comes back here.
+# ---------------------------------------------------------------------------
+proc neDestroyOwnCanvas(why: string) =
+  ## OWNERSHIP. Only ever destroys a canvas WE created -- `gNeOwnCanvasGo` is
+  ## nil for a discovered one, so a FOUND canvas can never be taken down by
+  ## this. Called on every refusal in the creation sequence, so no half-built
+  ## canvas is ever left behind, and on teardown so it cannot leak into the
+  ## next raid.
+  if gNeOwnCanvasGo != nil:
+    okLog "natesp: destroying OUR canvas 0x" &
+          hexOf(cast[uint64](gNeOwnCanvasGo)) & " -- " & why
+    discard nuDestroy(gNeOwnCanvasGo)
+  gNeOwnCanvasGo = nil
+  gNeOwnCanvasComp = nil
+  gNeOwnCanvasTr = nil
+  if gNeCanvasOrigin == NeOriginCreated:
+    gNeCanvasGo = nil
+    gNeCanvasTr = nil
+    gNeCanvasW = 0'f32
+    gNeCanvasH = 0'f32
+    gNeCanvasOrigin = NeOriginNone
+
+proc neCreateCanvas(): bool =
+  ## Build a screen-space overlay Canvas of our own. Returns true only when
+  ## every step succeeded; on ANY refusal it destroys what it made, names the
+  ## reason and returns false. It does NOT decide the canvas is usable -- that
+  ## is `neSettleStep`, which reads the finished state back off the live object.
+  gNeCreateTried = true
+  # HOP 1 -- the class donor. Read-only; we never touch it again.
+  let anchor = splAnchor()                   # PreloaderUI COMPONENT
+  if not neLive(anchor):
+    warn "natesp: cannot create a canvas -- splAnchor() gave no live " &
+         "DontDestroyOnLoad object to take a GameObject class pointer from. " &
+         "Nothing was allocated."
+    neRefuse(NeRCanvasDonor)
+    return false
+  let donorGo = neGameObjectOf(anchor)       # GAMEOBJECT
+  if donorGo == nil:
+    warn "natesp: cannot create a canvas -- the anchor is live but " &
+         "Component::get_gameObject did not yield a live GameObject, so there " &
+         "is no class pointer to borrow. Nothing was allocated."
+    neRefuse(NeRCanvasDonor)
+    return false
+  # HOP 2 -- the GameObject. nuCreate round-trips get_name through the game, so
+  # an allocation that was never constructed is refused here, not later.
+  let go = nuCreate("aowlspt-esp-canvas", donorGo)   # GAMEOBJECT (ours)
+  if go == nil:
+    warn "natesp: canvas creation refused at step 1 of 6 (allocate + " &
+         "GameObject::.ctor). Nothing survives."
+    neRefuse(NeRCanvasCreate)
+    return false
+  gNeOwnCanvasGo = go
+  # HOP 3 -- RectTransform BEFORE Canvas. Unity would add one implicitly, but
+  # an implicit component is one we never judged; adding it explicitly puts it
+  # through nuAdd's klass verdict like everything else.
+  if nuAdd(go, NuKindRectTransform) == nil:
+    neDestroyOwnCanvas("AddComponent<RectTransform> refused (step 2 of 6)")
+    neRefuse(NeRCanvasCreate)
+    return false
+  # HOP 4 -- the Canvas COMPONENT itself. With no canvas anywhere in the raid
+  # there is no live instance to register as a reference, so this comes back
+  # ATTESTED rather than VERIFIED -- on the strength of the offline proof that
+  # .data slot 0x6D586F8 is AddComponent<UnityEngine.Canvas>. That is why the
+  # readback in neSettleStep is the gate and this is not.
+  let canvas = nuAdd(go, NuKindCanvas)              # CANVAS COMPONENT
+  if canvas == nil:
+    neDestroyOwnCanvas("AddComponent<Canvas> refused (step 3 of 6) -- its " &
+                       ".data MethodInfo slot may still be COLD in this raid")
+    neRefuse(NeRCanvasCreate)
+    return false
+  gNeOwnCanvasComp = canvas
+  # HOP 5 -- render to the screen. Not optional and not cosmetic: the default
+  # for a fresh Canvas is ScreenSpaceOverlay, but relying on a default is an
+  # assumption, and the two other modes both put our boxes in the world.
+  if not nuCanvasSetRenderMode(canvas, NuRenderModeOverlay):
+    neDestroyOwnCanvas("set_renderMode refused (step 4 of 6)")
+    neRefuse(NeRCanvasCreate)
+    return false
+  discard nuCanvasSetSortingOrder(canvas, cNeCanvasSortOrder())
+  discard nuSetLayer(go, cNeUiLayer())
+  # HOP 6 -- activate. Everything above happened on an inactive object, so no
+  # Unity lifecycle callback has run against a half-built canvas.
+  if not nuSetActive(go, true):
+    neDestroyOwnCanvas("SetActive(true) refused (step 5 of 6)")
+    neRefuse(NeRCanvasCreate)
+    return false
+  let tr = nuTransformOf(go)                        # RECTTRANSFORM
+  if tr == nil or not neLive(tr):
+    neDestroyOwnCanvas("get_transform gave no live RectTransform (step 6 of 6)")
+    neRefuse(NeRCanvasCreate)
+    return false
+  gNeOwnCanvasTr = tr
+  gNeSettleFrom = gNeTicks
+  gNeSettleReads = 0
+  gNeSettleLast = "not read yet"
+  okLog "natesp: OUR canvas was CREATED at 0x" & hexOf(cast[uint64](go)) &
+        " (canvas component 0x" & hexOf(cast[uint64](canvas)) &
+        ", rectTransform 0x" & hexOf(cast[uint64](tr)) &
+        ", renderMode written = ScreenSpaceOverlay, sortingOrder " &
+        $int(cNeCanvasSortOrder()) & ", layer " & $int(cNeUiLayer()) &
+        ", active). NOTHING IS PARENTED TO IT YET: every call returning is " &
+        "not a finished state, so it now has up to " &
+        $int(cNeCanvasSettleTicks()) & " ticks to READ BACK as " &
+        "renderMode==0 + activeInHierarchy + a rect of at least " &
+        neF(cNeMinCanvasPx()) & "px on both axes, or it is destroyed."
+  true
+
+proc neSettleStep() =
+  ## THE READBACK, retried. Asserts a property of the FINISHED STATE -- what
+  ## the live Canvas says it is -- never of our own writes. Three outcomes:
+  ## sane -> CREATED and on to the pool; cap reached -> REFUSED and the canvas
+  ## is DESTROYED; anything faults -> the discovery fault ledger, as before.
+  if gNeOwnCanvasGo == nil or gNeOwnCanvasComp == nil or gNeOwnCanvasTr == nil:
+    neRefuse(NeRCanvasCreate)
+    return
+  inc gNeSettleReads
+  if not neLive(gNeOwnCanvasGo) or not neLive(gNeOwnCanvasComp) or
+     not neLive(gNeOwnCanvasTr):
+    neDestroyOwnCanvas("it stopped being Unity-alive while settling " &
+                       "(a scene change is the usual reason)")
+    neRefuse(NeRCanvasUnverified)
+    return
+  let mode = nuCanvasRenderMode(gNeOwnCanvasComp)
+  let act = neActiveInHier(gNeOwnCanvasGo)
+  let (okR, _, _, rw, rh) = nuGetRect(gNeOwnCanvasTr)
+  gNeSettleLast = "renderMode=" & $int(mode) & " activeInHierarchy=" &
+                  (if act: "yes" else: "NO") & " rectRead=" &
+                  (if okR: "yes" else: "NO") & " rect=" & neF(rw) & "x" & neF(rh)
+  if mode == NuRenderModeOverlay and act and okR and
+     rw >= cNeMinCanvasPx() and rh >= cNeMinCanvasPx():
+    gNeCanvasGo = gNeOwnCanvasGo
+    gNeCanvasTr = gNeOwnCanvasTr
+    gNeCanvasW = rw
+    gNeCanvasH = rh
+    gNeCanvasOrigin = NeOriginCreated
+    gNeBestArea = rw * rh
+    okLog "natesp: canvas CREATED and VERIFIED after " & $gNeSettleReads &
+          " readback(s) over " & $int(gNeTicks - gNeSettleFrom) & " tick(s) -- " &
+          gNeSettleLast & ". This is the live object's own answer, not a " &
+          "record of what we wrote. Building the pool under it."
+    gNeState = NeBuild
+    return
+  if (gNeTicks - gNeSettleFrom) >= int64(cNeCanvasSettleTicks()):
+    warn "natesp: our canvas NEVER read back sane within " &
+         $int(cNeCanvasSettleTicks()) & " ticks (" & $gNeSettleReads &
+         " readbacks; last: " & gNeSettleLast & "; required renderMode=0 + " &
+         "activeInHierarchy + rect >= " & neF(cNeMinCanvasPx()) &
+         "px on both axes). A timeout here is a REFUSAL, never a pass."
+    neDestroyOwnCanvas("it never read back sane")
+    neRefuse(NeRCanvasUnverified)
+
 proc neDiscoverStep() =
   ## One frame's slice. Returns by mutating the state machine; the walk is
   ## bounded twice -- by the node budget in total and by the millisecond slice
@@ -736,12 +965,14 @@ proc neDiscoverStep() =
     var pick = NuCanvasPick()
     let got = nuCanvasFind(splAnchor(), cNeMinCanvasPx(), pick)
     gNePhase0Verdict = pick.verdict
+    gNePhase0Scope = pick.scope
     gNePhase0Ledger = nuCanvasLedger(pick)
     okLog "natesp: phase0 (shared nuCanvasFind, the host's ONE canvas " &
           "acquisition) -- " & gNePhase0Ledger
     if got and pick.go != nil and pick.tr != nil:
       gNeCanvasGo = pick.go
       gNeCanvasTr = pick.tr
+      gNeCanvasOrigin = NeOriginFound   # FIND-THEN-CREATE: never create over one
       gNeCanvasW = pick.w
       gNeCanvasH = pick.h
       gNeBestArea = pick.w * pick.h
@@ -849,6 +1080,7 @@ proc neDiscoverStep() =
             gNeBestArea = area
             gNeCanvasGo = go
             gNeCanvasTr = tr
+            gNeCanvasOrigin = NeOriginFound
             gNeCanvasW = cw
             gNeCanvasH = ch
           else:
@@ -963,6 +1195,40 @@ proc neDiscoverStep() =
              "above -- so no canvas is present WHERE THE UI LIVES -- but " &
              "phase B was TRUNCATED, so the remaining scenes are " &
              "INCONCLUSIVE.")
+    # ------------------------------------------------------- CREATE OUR OWN
+    # ONLY on a REAL absence. Three independent things must all be answers,
+    # not truncations, and each is read from the ledger that produced it:
+    #   * phase 0 asked every live root and said ABSENT with scope EXHAUSTIVE
+    #   * phase A actually searched DontDestroyOnLoad and finished
+    #   * the walk that just ended finished without truncating
+    # If any one of them reads INCONCLUSIVE or TRUNCATED we refuse exactly as
+    # before, because creating a second canvas next to one we merely FAILED to
+    # find would double-draw and fight it for z-order. Find-then-create.
+    let realAbsence = gNePhase0Verdict == "ABSENT" and
+                      gNePhase0Scope == "EXHAUSTIVE" and
+                      gNePhaseARootCount > 0 and gNePhaseAExhaustive and
+                      exhaustive
+    if realAbsence and not gNeCreateTried and gNeOwnCanvasGo == nil:
+      okLog "natesp: this is a REAL ABSENCE, not a truncation -- phase0=" &
+            gNePhase0Verdict & "/" & gNePhase0Scope & ", phaseA=EXHAUSTIVE " &
+            "over " & $gNePhaseARootCount & " DontDestroyOnLoad root(s), the " &
+            "walk finished EXHAUSTIVELY. There is no canvas to parent to, so " &
+            "natesp will CREATE ITS OWN screen-space overlay canvas rather " &
+            "than refuse forever."
+      if neCreateCanvas():
+        gNeQueue = @[]
+        gNeDepth = @[]
+        gNeHead = 0
+        gNeState = NeSettle
+      return
+    if not realAbsence and not gNeCreateTried:
+      okLog "natesp: NOT creating a canvas -- the absence is not established. " &
+            "phase0=" & gNePhase0Verdict & "/" & gNePhase0Scope &
+            " phaseARoots=" & $gNePhaseARootCount & " phaseAExhaustive=" &
+            (if gNePhaseAExhaustive: "yes" else: "NO") & " walkExhaustive=" &
+            (if exhaustive: "yes" else: "NO") & ". Creating one beside a " &
+            "canvas we merely failed to FIND would double-draw and fight it " &
+            "for z-order, so this refuses instead."
     neRefuse(NeRNoCanvas)
     return
   if gNeGraphicDonor == nil:
@@ -1020,7 +1286,20 @@ proc neBuildPool(): bool =
   ## class donor is the DISCOVERED canvas's GameObject -- a live object we
   ## walked to and validated, which is the only reflection-free way to obtain
   ## the GameObject class pointer.
-  if not nuRegisterReference(NuKindImage, gNeGraphicDonor):
+  if gNeGraphicDonor == nil and gNeCanvasOrigin == NeOriginCreated:
+    # THE ONE CASE WITH NOTHING TO COMPARE AGAINST. We only get here because
+    # the raid provably contains no Canvas -- and a raid with no Canvas very
+    # plausibly contains no UI.Image either, so there is no live instance to
+    # register. `nuAdd` will therefore answer ATTESTED rather than VERIFIED,
+    # on the offline token proof that slot 0x6D50070 is AddComponent<UI.Image>.
+    # Said out loud, because a weaker check must never pass silently; the
+    # finished-state readback in `neVerdict` remains the real gate.
+    warn "natesp: no live UI.Image donor exists in this raid, so the box " &
+         "component's class cannot be checked against one. Proceeding on the " &
+         "OFFLINE attestation of the AddComponent<UI.Image> slot alone -- " &
+         "this is ATTESTED, not VERIFIED, and only the on-screen readback " &
+         "settles it."
+  elif not nuRegisterReference(NuKindImage, gNeGraphicDonor):
     warn "natesp: the Image reference instance was refused, so nuAdd could " &
          "only ever answer INCONCLUSIVE for the box component. Refusing to " &
          "build a pool of components whose class was never checked."
@@ -1207,24 +1486,57 @@ proc neVerdict(sw, sh: float64): int32 =
   if gNeCn > 0: return NeVFail
   NeVInconclusive
 
+proc neCanvasLine(): string =
+  ## WHICH OF THE THREE HAPPENED, in one clause, always present in the verdict.
+  ## FOUND / CREATED / REFUSED(named reason) -- and for CREATED the numbers are
+  ## the ones READ BACK off the live object in `neSettleStep`, not the ones we
+  ## wrote.
+  case int(gNeCanvasOrigin)
+  of 1:
+    "canvas FOUND(existing) at 0x" & hexOf(cast[uint64](gNeCanvasGo)) &
+      " rect=" & neF(gNeCanvasW) & "x" & neF(gNeCanvasH) &
+      " -- the game's own, discovered and left in its ownership"
+  of 2:
+    "canvas CREATED(ours) at 0x" & hexOf(cast[uint64](gNeCanvasGo)) &
+      " rect=" & neF(gNeCanvasW) & "x" & neF(gNeCanvasH) &
+      " sortingOrder=" & $int(cNeCanvasSortOrder()) &
+      " -- built by us because phase0 asked EVERY live root and answered " &
+      "ABSENT/EXHAUSTIVE and the walk finished exhaustively too. Verified by " &
+      "readback: " & gNeSettleLast & ". It is destroyed when the raid ends."
+  else:
+    "canvas REFUSED -- " & readCString(cNeRefusalText(gNeWhy)) &
+      (if gNeCreateTried:
+         "  (creating our own WAS attempted; last canvas readback: " &
+         gNeSettleLast & ")"
+       else:
+         "  (creating our own was NOT attempted -- phase0=" & gNePhase0Verdict &
+         "/" & gNePhase0Scope & ", so the absence is not established)")
+
 proc neVerdictLine(sw, sh: float64): string =
   case int(gNeVerdict)
   of 2:
-    "natesp VERDICT PASS -- canvas found, pool built, and " & $gNeOnScreen &
+    "natesp VERDICT PASS -- " & neCanvasLine() & ". Pool built, and " &
+      $gNeOnScreen &
       " box(es) read BACK from the game as activeInHierarchy with a " &
       "renderable on-screen rect this frame (of " & $gNeShown &
       " placed, " & $gNeCn & " contact(s), " & $gNeDropped &
       " over the per-faction pool). This is the finished state, not a record " &
-      "of our own writes -- but it is still not proof a human can SEE them."
+      "of our own writes -- but it is still not proof a human can SEE them. " &
+      "`activeInHierarchy` is TRANSITIVE, so a box reading back active is also " &
+      "a readback of the whole parent chain box -> aowlspt-esp-root -> " &
+      neOriginName(gNeCanvasOrigin) & " canvas being active."
   of 1:
-    "natesp VERDICT FAIL -- contacts exist but ZERO boxes read back active " &
+    "natesp VERDICT FAIL -- " & neCanvasLine() &
+      ". Contacts exist but ZERO boxes read back active " &
       "with a valid on-screen rect. contacts=" & $gNeCn & " placed=" &
       $gNeShown & " built=" & $gNeBuilt & " canvas=" & neF(gNeCanvasW) & "x" &
       neF(gNeCanvasH) & " screen=" & duFmt0(sw) & "x" & duFmt0(sh) &
       ". The pool exists and the placement ran; the finished state is empty."
   else:
-    "natesp VERDICT INCONCLUSIVE -- " & readCString(cNeRefusalText(gNeWhy)) &
-      "  (state=" & $gNeState & " built=" & $gNeBuilt & " contacts=" & $gNeCn &
+    "natesp VERDICT INCONCLUSIVE -- " & neCanvasLine() & ". " &
+      readCString(cNeRefusalText(gNeWhy)) &
+      "  (origin=" & neOriginName(gNeCanvasOrigin) &
+      " state=" & $gNeState & " built=" & $gNeBuilt & " contacts=" & $gNeCn &
       " faults=" & $int(cNeFaultCount()) & "). discovery: visited=" &
       $gNeVisited & " fakeNullsSkipped=" & $gNeFakeNull & " candidates=" &
       $gNeCandidates & " rejected=" & $gNeRejected & " deepest=" & $gNeDeepest &
@@ -1254,12 +1566,28 @@ proc neTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ne_tick_body", cdecl.}
     # NOT a refusal to remember: the menu and the loading screen are legitimate
     # states. Drop back to waiting and tear nothing down unless the canvas
     # itself died -- which is the one thing that must not be used again.
-    if gNeState == NeRun and not duOk(gNeCanvasTr, 0x20'i32):
+    # OWNERSHIP AND LEAKS. A canvas we FOUND belongs to the game and is left
+    # exactly alone. A canvas WE created is ours, and the raid is over: it must
+    # not survive into the next one, where it would sit above the HUD holding a
+    # pool of stale boxes. This is the whole reason DontDestroyOnLoad was NOT
+    # used -- a per-raid canvas that is destroyed at the gate is far easier to
+    # reason about than a process-lifetime one.
+    if gNeOwnCanvasGo != nil:
+      neDestroyPool()
+      neDestroyOwnCanvas("the raid ended (" &
+                         readCString(cNeRefusalText(gate)) & ")")
+      gNePhase0Done = false
+      gNeSeeded = false
+      gNeCreateTried = false
+      gNeState = NeIdle
+    elif gNeState == NeRun and not duOk(gNeCanvasTr, 0x20'i32):
       neDestroyPool()
       gNeCanvasGo = nil
       gNeCanvasTr = nil
+      gNeCanvasOrigin = NeOriginNone
       gNePhase0Done = false        # the canvas died: re-ask the shared finder
       gNeSeeded = false
+      gNeCreateTried = false
       gNeState = NeIdle
     gNeWhy = gate
     gNeVerdict = NeVInconclusive
@@ -1271,6 +1599,8 @@ proc neTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ne_tick_body", cdecl.}
     gNeState = NeDiscover
   of NeDiscover:
     neDiscoverStep()
+  of NeSettle:
+    neSettleStep()
   of NeBuild:
     if neBuildPool():
       okLog "natesp: pool BUILT -- " & $gNeBuilt & " box(es) in " &
@@ -1286,10 +1616,13 @@ proc neTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ne_tick_body", cdecl.}
     if not neLive(gNeCanvasTr) or not neActiveInHier(gNeCanvasGo):
       # the raid canvas went away (scene change): drop the pool and rediscover
       neDestroyPool()
+      neDestroyOwnCanvas("the canvas stopped being alive/active in NeRun")
       gNeCanvasGo = nil
       gNeCanvasTr = nil
+      gNeCanvasOrigin = NeOriginNone
       gNePhase0Done = false        # the canvas died: re-ask the shared finder
       gNeSeeded = false
+      gNeCreateTried = false
       gNeState = NeIdle
       return cast[Il2CppPtr](1)
     if (gNeTicks mod int64(cNeScanEvery())) == 0: neScan()

@@ -345,6 +345,48 @@ typedef struct AowlNuTarget {
 #define AOWL_NU_GR_SET_COLOR         26
 #define AOWL_NU_GR_GET_CANVASREND    27
 #define AOWL_NU_GR_SETALLDIRTY       28
+/* --- CANVAS CREATION (natesp's third outcome: CREATED) -------------------
+ *
+ * WHY THESE EXIST. natesp's phase-0 root ask can now say ABSENT over EVERY
+ * root, exhaustively -- which turns "there is no canvas" from a truncation
+ * artifact into an answer, and leaves the feature with nothing to parent to.
+ * Rather than refuse forever, natesp builds its own screen-space Canvas. That
+ * needs exactly three things beyond what this table already had: attach the
+ * component (a kind row, below), tell it to render to the screen, and put it
+ * above the game's own HUD.
+ *
+ * ALL THREE, MEASURED against THIS build's GameAssembly.dll (2026-08-30):
+ *   il2cpp_resolve.py type UnityEngine.Canvas   -> the RVAs below
+ *   il2cpp_resolve.py shared <RVA>              -> sharedness=UNIQUE owners=1
+ *                                                  for each (three-state; none
+ *                                                  came back `unknown`)
+ *   il2cpp_resolve.py bytes  <RVA>              -> the 16 bytes below, and NONE
+ *                                                  is 0xC2,0x00,0x00 (the
+ *                                                  6,438-method empty stub at
+ *                                                  0x628110)
+ *
+ * get_renderMode is here for the READBACK, not for symmetry: a canvas that
+ * exists in ScreenSpaceCamera or WorldSpace mode renders our boxes somewhere
+ * in the map, which is the invisible-success this project keeps producing.
+ * Asking the live object which mode it is in is the falsifiable check.
+ *
+ * DELIBERATELY ABSENT: CanvasScaler and GraphicRaycaster. Their AddComponent
+ * slots were resolved at the same time (0x6D586E8 and 0x6D58700, both
+ * offline-attested) and are NOT used. A raycaster only makes UI clickable and
+ * ESP boxes are non-interactive; a scaler only rescales, and WITHOUT one an
+ * overlay canvas's units are screen pixels 1:1, which is exactly what
+ * `nePlace` already computes from WorldToScreenPoint. Adding either would be
+ * two more ways to be wrong for no pixel gained. */
+#define AOWL_NU_CANVAS_SET_RENDERMODE 29
+#define AOWL_NU_CANVAS_GET_RENDERMODE 30
+#define AOWL_NU_CANVAS_SET_SORTORDER  31
+
+/* UnityEngine.RenderMode. Named, because `0` appearing bare in a refusal is
+ * indistinguishable from "we did not read anything". */
+#define AOWL_NU_RENDERMODE_OVERLAY   0
+#define AOWL_NU_RENDERMODE_CAMERA    1
+#define AOWL_NU_RENDERMODE_WORLD     2
+#define AOWL_NU_RENDERMODE_UNKNOWN (-1)
 
 /* Every prologue below was read out of THIS build's GameAssembly.dll with
  * `tools/il2cpp_resolve.py bytes <RVA> 16`, and every RVA with
@@ -456,6 +498,16 @@ static const AowlNuTarget aowl_nu_targets[] = {
     { "UnityEngine.UI.Graphic::SetAllDirty", 0x53ADA90u,
       { 0x40,0x53,0x48,0x83,0xEC,0x20,0x80,0x79,0x38,0x00,0x48,0x8B,0xD9,
         0x75,0x15,0x48 }, 16 },
+    /* --- canvas creation. (this, int32 value, MethodInfo*) --- */
+    { "UnityEngine.Canvas::set_renderMode", 0x55840D0u,
+      { 0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,
+        0x27,0x3E,0xB5 }, 16 },
+    { "UnityEngine.Canvas::get_renderMode", 0x5584080u,
+      { 0x40,0x53,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,0x73,0x3E,0xB5,0x01,
+        0x48,0x8B,0xD9 }, 16 },
+    { "UnityEngine.Canvas::set_sortingOrder", 0x5584590u,
+      { 0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,
+        0xD7,0x39,0xB5 }, 16 },
 };
 
 #define AOWL_NU_TARGET_COUNT \
@@ -609,6 +661,11 @@ typedef void  (*AowlNu_V_S2)  (void*, void*, void*);
 /* bool returns come back in AL. Declaring an int32 return would read the full
  * EAX, whose upper 24 bits the callee is not required to have set. */
 typedef unsigned char (*AowlNu_B_P) (void*, void*);
+/* (this, MethodInfo*) -> int32 in EAX. Distinct from AowlNu_B_P only in that
+ * the result is a VALUE, not a truth: `Canvas::get_renderMode` returns the
+ * RenderMode enum, and reading it through the bool thunk would collapse
+ * ScreenSpaceCamera(1) and WorldSpace(2) into the same "true". */
+typedef int32_t (*AowlNu_I_P) (void*, void*);
 typedef unsigned char (*AowlNu_B_S1)(void*, void*);
 
 static void aowl_nu_call_v_pp(void* fn, void* self, void* a0) {
@@ -654,6 +711,14 @@ static void aowl_nu_call_v_s2(void* fn, void* a0, void* a1) {
 static int32_t aowl_nu_call_b_p(void* fn, void* self) {
     if (!fn || !self) return 0;
     return ((AowlNu_B_P)fn)(self, NULL) ? 1 : 0;
+}
+/* `defVal` is returned when the call cannot be made at all, and callers pass a
+ * value that is NOT a legal answer (-1 for a RenderMode) so "could not ask" can
+ * never be mistaken for "the answer is 0" -- which for renderMode would be the
+ * exact value we are trying to prove. */
+static int32_t aowl_nu_call_i_p(void* fn, void* self, int32_t defVal) {
+    if (!fn || !self) return defVal;
+    return ((AowlNu_I_P)fn)(self, NULL);
 }
 static int32_t aowl_nu_call_b_s1(void* fn, void* a0) {
     if (!fn || !a0) return 0;
@@ -743,7 +808,8 @@ static int32_t aowl_nu_rect_renderable(float w, float h) {
 #define AOWL_NU_KIND_TMPTEXT       1
 #define AOWL_NU_KIND_IMAGE         2
 #define AOWL_NU_KIND_BUTTON        3
-#define AOWL_NU_MAX_KINDS          4
+#define AOWL_NU_KIND_CANVAS        4
+#define AOWL_NU_MAX_KINDS          5
 
 /* Per-kind verification state. Four outcomes, and "refused" is not a synonym
  * for "failed": UNKNOWN means we have not looked yet. */
@@ -795,6 +861,30 @@ static const AowlNuKind aowl_nu_kinds[AOWL_NU_MAX_KINDS] = {
       "3 sites: TMP_DefaultControls::CreateButton, TMP_Dropdown::CreateBlocker, "
       "UI.Dropdown::CreateBlocker. Static token 0xC0080391 -> "
       "AddComponent<UI.Button>." },
+    /* THE ONE KIND THAT MUST WORK WITH NO LIVE DONOR. Every other row is used
+     * in a scene that already contains an instance of its type, so
+     * `nuRegisterReference` can supply a reference klass and the verdict is
+     * VERIFIED. This row exists precisely for the case where the raid contains
+     * NO Canvas at all -- so there is nothing to register, `refKlass` is NULL,
+     * and `aowl_nu_verdict` returns ATTESTED on the strength of the offline
+     * token proof alone. That is why `attested` being genuinely PROVEN matters
+     * more here than anywhere else in this table, and why the readback in
+     * natesp (get_renderMode + activeInHierarchy + a rect >= the minimum) is
+     * the gate rather than the klass comparison.
+     *
+     * Reproduce:
+     *   python tools/addcompslots.py <GameAssembly.dll> <metadata.dec.dat> \
+     *       --slottype 0x6D586F8
+     *   -> slot 0x6D586F8  static-token=0xC0080397  kind=6  index=0x401CB
+     *      -> AddComponent<UnityEngine.Canvas>
+     * The neighbouring slots decode to DISTINCT types in the same run
+     * (0x6D586E8 -> UI.CanvasScaler, 0x6D58700 -> UI.GraphicRaycaster), which
+     * is the falsifiability: an off-by-one RVA names a different T. */
+    { "UnityEngine.Canvas", 0x6D586F8u, 1,
+      "11 sites incl. GPUGraphData::UpdateUI. Static token 0xC0080397 -> "
+      "AddComponent<UnityEngine.Canvas>. Its two neighbours decode to "
+      "CanvasScaler (0x6D586E8) and GraphicRaycaster (0x6D58700), neither of "
+      "which natesp attaches." },
 };
 
 /* Runtime state, one row per kind. */

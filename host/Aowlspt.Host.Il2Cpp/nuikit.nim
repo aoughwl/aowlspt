@@ -303,7 +303,29 @@ proc nuElemCapacity*(): int = int(cNkCapacity())
 # which only the live inspector's rider ever writes, so a mod that passed nil
 # would get "no roots" on every run the inspector was not also driving.
 # ---------------------------------------------------------------------------
-const NkMaxRoots = 64          ## capped: the inspector reliably reports ~16
+## THE ROOT-ASK CAP, and why it moved from 64 to 512.
+##
+## MEASURED (integ-beta6 + 59b5dd7, DEPLOYED raid, natesp phase 0):
+##   verdict=ABSENT rootsSeen=178 walked=64 asked=64 candidates=0 scope=TRUNCATED
+##
+## `asked=64` is the old cap, not a property of the scene. 114 of the 178 roots
+## were never asked, so `ABSENT` was a TRUNCATION ARTIFACT: a verdict that could
+## not have said anything else, which is CLAUDE.md 9b exactly. It is `scope`
+## that made that visible, and `scope` is what has to read EXHAUSTIVE before
+## `ABSENT` is allowed to mean anything -- in particular before natesp is
+## allowed to conclude there is no canvas and create its own.
+##
+## THE COST IS NOT THE REASON IT WAS 64. Asking a root for a component is ONE
+## `iVisComponent` call. 178 of them, once, in a seed that already enumerates
+## those same roots, is nothing next to the 20,000-node breadth-first walk it
+## replaces -- the walk this function exists to avoid.
+##
+## The loop still SIZES ITSELF from `roots.len`; 512 is only a ceiling, chosen
+## to match natesp's own `NeMaxRootUniverse`, so the two layers cannot disagree
+## about how many roots exist. Rule 4 (cap every iteration) is satisfied by the
+## ceiling; rule "a check that cannot fail is the bug" is satisfied by `scope`
+## still going TRUNCATED, loudly, if a scene ever exceeds it.
+const NkMaxRoots = 512
 
 var gNkCanvasGo: Il2CppPtr = nil     ## cached, but re-validated on every call
 
@@ -323,9 +345,19 @@ type
     rootsSeen*: int              ## roots handed to us
     walked*: int                 ## roots we actually examined
     asked*: int                  ## roots iVisComponent could ASK (could-look)
+    dead*: int                   ## roots skipped as destroyed/unreadable. A
+                                 ## dead root HAS no canvas, so this does NOT
+                                 ## make the answer incomplete.
+    unaskable*: int              ## roots that were ALIVE and whose component
+                                 ## ask still failed. THIS is what makes an
+                                 ## answer incomplete, and it is counted apart
+                                 ## from `dead` for exactly that reason.
     candidates*: int             ## roots that carried a Canvas at all
     rejected*: int               ## Canvases that failed the acceptance rule
     worldSpace*: int             ## Canvases skipped as WorldSpace(2)
+    askCap*: int                 ## the ceiling in force; reported so a reader
+                                 ## never has to guess whether `asked` is the
+                                 ## scene's size or ours
     scope*: string               ## "EXHAUSTIVE" | "TRUNCATED"
     verdict*: string
     why*: string
@@ -333,8 +365,10 @@ type
 proc nuCanvasLedger*(p: NuCanvasPick): string =
   "canvas: verdict=" & p.verdict & " rootsSeen=" & $p.rootsSeen &
   " walked=" & $p.walked & " asked=" & $p.asked &
+  " dead=" & $p.dead & " unaskable=" & $p.unaskable &
   " candidates=" & $p.candidates & " rejected=" & $p.rejected &
-  " worldSpace=" & $p.worldSpace & " scope=" & p.scope &
+  " worldSpace=" & $p.worldSpace & " askCap=" & $p.askCap &
+  " scope=" & p.scope &
   (if p.verdict == "FOUND":
      " w=" & formatFloat(float64(p.w), ffDecimal, 1) &
      " h=" & formatFloat(float64(p.h), ffDecimal, 1)
@@ -377,8 +411,10 @@ proc nuCanvasFind*(anchor: Il2CppPtr; minPx: float32;
   ## unrelated features. It requires only the `nativeUi` primitive layer, which
   ## every caller already needs to create anything at all.
   pick = NuCanvasPick(go: nil, tr: nil, comp: nil, w: 0'f32, h: 0'f32,
-                      rootsSeen: 0, walked: 0, asked: 0, candidates: 0,
-                      rejected: 0, worldSpace: 0, scope: "EXHAUSTIVE",
+                      rootsSeen: 0, walked: 0, asked: 0, dead: 0,
+                      unaskable: 0, candidates: 0,
+                      rejected: 0, worldSpace: 0, askCap: NkMaxRoots,
+                      scope: "EXHAUSTIVE",
                       verdict: "INCONCLUSIVE", why: "")
   if not gNuOn or cNuDisabled() != 0'i32:
     pick.why = "the nativeUi primitive layer is OFF or self-disabled; nothing " &
@@ -405,12 +441,15 @@ proc nuCanvasFind*(anchor: Il2CppPtr; minPx: float32;
   var bestArea = 0'f32
   for i in 0 ..< lim:
     let rootTr = roots[i]                       # TRANSFORM, by iSceneRoots' contract
-    if not nuOk(rootTr, 0x10'i32) or not nuAlive(rootTr): continue
+    if not nuOk(rootTr, 0x10'i32) or not nuAlive(rootTr):
+      inc pick.dead                             # a destroyed root has no canvas
+      continue
     inc pick.walked
     var comp: Il2CppPtr = nil                   # the CANVAS COMPONENT
     var why = ""
     if not iVisComponent(rootTr, "Canvas", comp, why):
-      continue                                  # could not look != absent
+      inc pick.unaskable                        # could not look != absent
+      continue
     inc pick.asked
     if comp == nil: continue
     if not nuOk(comp, 0x10'i32) or not nuAlive(comp): continue
@@ -451,13 +490,35 @@ proc nuCanvasFind*(anchor: Il2CppPtr; minPx: float32;
       pick.verdict = "INCONCLUSIVE"
       pick.why = "walked " & $pick.walked & " root(s) and could ask NONE of " &
                  "them for a Canvas component. Nothing was examined"
+    elif pick.scope != "EXHAUSTIVE" or pick.unaskable > 0:
+      # THE VERDICT THAT USED TO BE UNFALSIFIABLE. Before the cap moved to 512,
+      # a raid reported `rootsSeen=178 asked=64 scope=TRUNCATED` and STILL said
+      # ABSENT -- 114 roots never asked, and a verdict that could not have come
+      # out any other way. ABSENT now REQUIRES that every root the enumeration
+      # produced was actually asked.
+      pick.verdict = "INCONCLUSIVE"
+      pick.scope = "TRUNCATED"
+      pick.why = "the scene produced " & $pick.rootsSeen & " root(s); " &
+                 $pick.asked & " were asked, " & $pick.dead &
+                 " were destroyed (which IS an answer for those) and " &
+                 $pick.unaskable & " were alive but could NOT be asked" &
+                 (if pick.rootsSeen > pick.askCap:
+                    ", and the ask cap of " & $pick.askCap & " cut the list short"
+                  else: "") &
+                 ". A root that was never asked cannot be reported as having " &
+                 "no canvas, so this is NOT an absence"
     else:
       pick.verdict = "ABSENT"
-      pick.why = "asked " & $pick.asked & " root(s), " & $pick.candidates &
+      pick.why = "asked EVERY live root -- " & $pick.asked & " of " &
+                 $pick.rootsSeen & " (" & $pick.dead &
+                 " destroyed, 0 unaskable, ask cap " & $pick.askCap &
+                 " not reached). " & $pick.candidates &
                  " carried a Canvas, " & $pick.worldSpace & " were WorldSpace " &
                  "and " & $pick.rejected & " failed alive+active+>=" &
-                 formatFloat(float64(minPx), ffDecimal, 1) & "px. That IS an " &
-                 "answer for the roots reachable right now"
+                 formatFloat(float64(minPx), ffDecimal, 1) &
+                 "px. Nothing was truncated, so this is a REAL absence at " &
+                 "root level -- a canvas NESTED below a root is still possible " &
+                 "and is what the caller's fallback walk is for"
     return false
   pick.verdict = "FOUND"
   pick.why = "largest of " & $pick.candidates & " Canvas candidate(s) that " &

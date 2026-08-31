@@ -82,6 +82,8 @@ proc cNuCallPS1(fn, a0: Il2CppPtr): Il2CppPtr {.
 proc cNuCallVS1(fn, a0: Il2CppPtr) {.importc: "aowl_nu_call_v_s1", nodecl.}
 proc cNuCallVS2(fn, a0, a1: Il2CppPtr) {.importc: "aowl_nu_call_v_s2", nodecl.}
 proc cNuCallBP(fn, self: Il2CppPtr): int32 {.importc: "aowl_nu_call_b_p", nodecl.}
+proc cNuCallIP(fn, self: Il2CppPtr; defVal: int32): int32 {.
+  importc: "aowl_nu_call_i_p", nodecl.}
 proc cNuCallBS1(fn, a0: Il2CppPtr): int32 {.
   importc: "aowl_nu_call_b_s1", nodecl.}
 proc cNuCallGeneric0(fn, self, mi: Il2CppPtr): Il2CppPtr {.
@@ -184,6 +186,13 @@ const
   NuTGrSetColor      = 26'i32  ## UnityEngine.UI.Graphic::set_color
   NuTGrGetCanvasRend = 27'i32  ## UnityEngine.UI.Graphic::get_canvasRenderer
   NuTGrSetAllDirty   = 28'i32  ## UnityEngine.UI.Graphic::SetAllDirty
+  NuTCanvasSetMode   = 29'i32  ## UnityEngine.Canvas::set_renderMode
+  NuTCanvasGetMode   = 30'i32  ## UnityEngine.Canvas::get_renderMode
+  NuTCanvasSetSort   = 31'i32  ## UnityEngine.Canvas::set_sortingOrder
+
+const
+  NuRenderModeOverlay = 0'i32  ## ScreenSpaceOverlay -- the only one we accept
+  NuRenderModeUnknown = -1'i32 ## "we could not ask", never a legal answer
 
 # ---- field offsets for wiring a from-scratch TMP's dependencies ---------
 #
@@ -222,6 +231,7 @@ const
   NuKindTmpText       = 1'i32
   NuKindImage         = 2'i32
   NuKindButton        = 3'i32
+  NuKindCanvas        = 4'i32
 
 # ---- slot verdicts, mirroring the AOWL_NU_SLOT_* defines ----------------
 const
@@ -348,6 +358,40 @@ proc nuSetLayer(go: Il2CppPtr; layer: int32): bool =
   let fn = nuFn(NuTGoSetLayer)
   if fn == nil or not nuOk(go, 0x10'i32): return false
   cNuCallVPI(fn, go, layer)
+  true
+
+# ---------------------------------------------------------------------------
+# CANVAS -- the three calls that turn an attached `Canvas` COMPONENT into one
+# that actually puts pixels on the screen.
+#
+# TYPES. All three take the CANVAS COMPONENT, not its GameObject and not its
+# RectTransform. Passing the RectTransform would still be readable, still be
+# Unity-alive and still be the wrong object -- the confusion this whole file
+# names at every hop.
+# ---------------------------------------------------------------------------
+proc nuCanvasSetRenderMode(canvas: Il2CppPtr; mode: int32): bool =
+  ## `set_renderMode(this, RenderMode, MethodInfo*)`. Writing it is NOT proof;
+  ## `nuCanvasRenderMode` is the readback that decides.
+  let fn = nuFn(NuTCanvasSetMode)
+  if fn == nil or not nuOk(canvas, 0x10'i32): return false
+  cNuCallVPI(fn, canvas, mode)
+  true
+
+proc nuCanvasRenderMode(canvas: Il2CppPtr): int32 =
+  ## The live canvas's own answer, or `NuRenderModeUnknown` when it could not
+  ## be asked. Three-state on purpose: "could not ask" must not read back as
+  ## ScreenSpaceOverlay(0), which is the very value we are trying to prove.
+  let fn = nuFn(NuTCanvasGetMode)
+  if fn == nil or not nuOk(canvas, 0x10'i32): return NuRenderModeUnknown
+  cNuCallIP(fn, canvas, NuRenderModeUnknown)
+
+proc nuCanvasSetSortingOrder(canvas: Il2CppPtr; order: int32): bool =
+  ## Overlay canvases are composited in `sortingOrder`; a canvas at or below
+  ## the game's HUD is drawn UNDER it and is invisible while every call here
+  ## succeeds.
+  let fn = nuFn(NuTCanvasSetSort)
+  if fn == nil or not nuOk(canvas, 0x10'i32): return false
+  cNuCallVPI(fn, canvas, order)
   true
 
 # ---------------------------------------------------------------------------

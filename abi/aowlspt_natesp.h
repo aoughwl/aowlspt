@@ -59,6 +59,34 @@
  * cheaper than parenting to a 0x0 rect and reporting success forever. */
 #define AOWL_NE_MIN_CANVAS_PX 200.0f
 
+/* ---- CREATING OUR OWN CANVAS (the third outcome) ------------------------
+ *
+ * Sort order. An overlay canvas is composited by `sortingOrder`, so one at or
+ * below the game's HUD is drawn UNDER it and is invisible while every call in
+ * the creation sequence reports success -- this project's signature failure.
+ * 32000 is just below Unity's int16 sorting ceiling (32767), chosen to be
+ * unambiguously above anything the game itself uses without sitting exactly at
+ * the boundary. */
+#define AOWL_NE_CANVAS_SORT_ORDER 32000
+
+/* HOW LONG TO WAIT FOR THE CANVAS TO SETTLE, IN TICKS.
+ *
+ * A freshly created ScreenSpaceOverlay canvas does not have its screen-sized
+ * rect until Unity's canvas update has run; reading `get_rect_Injected` in the
+ * SAME frame can legitimately return 0x0. Refusing on that first read would
+ * throw away a perfectly good canvas, and ACCEPTING without reading at all is
+ * the "check that cannot fail" this project keeps producing.
+ *
+ * So the readback is RETRIED, and the timeout is a REFUSAL, never a pass. The
+ * three outcomes stay three: sane readback -> CREATED, cap reached with no sane
+ * readback -> REFUSED(canvas-unverified) and the object is DESTROYED, a fault
+ * -> the discovery fault ledger. ~2 seconds at 60fps. */
+#define AOWL_NE_CANVAS_SETTLE_TICKS 120
+
+/* Unity's built-in `UI` layer. A UI object on another layer can be culled and
+ * render nothing while every call succeeds. */
+#define AOWL_NE_UI_LAYER 5
+
 /* Rescan the world every N ticks. The world scan is the only part of the tick
  * that walks a game collection, so this is the throttle that keeps the steady
  * state cheap. Box rects are still updated EVERY tick from the last scan. */
@@ -163,6 +191,13 @@ static float aowl_ne_faction_rgba(int32_t f, int32_t chan) {
 #define AOWL_NE_R_NO_STRING     12
 #define AOWL_NE_R_DISC_FAULTED  13
 #define AOWL_NE_R_SEED_TRIES    14
+/* ---- the CREATED path's own refusals. Three, told apart on purpose: we
+ * never had a class donor / a step of the sequence refused / it was built and
+ * never read back sane. Collapsing them would make the log say the same thing
+ * for three different bugs. */
+#define AOWL_NE_R_CANVAS_DONOR  15
+#define AOWL_NE_R_CANVAS_CREATE 16
+#define AOWL_NE_R_CANVAS_UNVERIFIED 17
 
 static const char *aowl_ne_refusal_text(int32_t r) {
     switch (r) {
@@ -181,6 +216,9 @@ static const char *aowl_ne_refusal_text(int32_t r) {
     case AOWL_NE_R_NO_SCREEN:    return "the back-buffer size is not measured yet; projecting against a zero screen puts every box at the origin";
     case AOWL_NE_R_NO_ROOTS:     return "the scene-root enumeration returned nothing to walk";
     case AOWL_NE_R_NO_CANVAS:    return "the walk finished and found NO active Canvas with a renderable rect; refusing to parent to a guessed pointer";
+    case AOWL_NE_R_CANVAS_DONOR: return "there is no canvas AND no live GameObject to take a class pointer from, so our own canvas could not even be allocated. INCONCLUSIVE -- nothing was created";
+    case AOWL_NE_R_CANVAS_CREATE: return "a step of the canvas-creation sequence refused (allocate / RectTransform / AddComponent<Canvas> / set_renderMode / activate). Everything created up to that point was DESTROYED -- no half-built canvas is ever left behind";
+    case AOWL_NE_R_CANVAS_UNVERIFIED: return "our canvas was created and every call succeeded, but within AOWL_NE_CANVAS_SETTLE_TICKS it never read back as renderMode==ScreenSpaceOverlay AND activeInHierarchy AND a rect of at least AOWL_NE_MIN_CANVAS_PX on both axes. It was DESTROYED rather than parented to. Calls returning is not a finished state";
     case AOWL_NE_R_NO_GRAPHIC:   return "no live Graphic donor was found, so nuAdd could only ever answer INCONCLUSIVE for the box component";
     case AOWL_NE_R_BUILD_FAILED: return "the pool build refused partway; the partial pool was destroyed rather than left half-parented";
     case AOWL_NE_R_FAULTED:      return "self-disabled after AOWL_NE_MAX_FAULTS faults inside the guarded tick";
@@ -209,6 +247,9 @@ static int32_t aowl_ne_max_seed_skips(void)  { return AOWL_NE_MAX_SEED_SKIPS; }
 static int32_t aowl_ne_slice_ms(void)    { return AOWL_NE_SLICE_MS; }
 static int32_t aowl_ne_scan_every(void)  { return AOWL_NE_SCAN_EVERY; }
 static float   aowl_ne_min_canvas_px(void) { return AOWL_NE_MIN_CANVAS_PX; }
+static int32_t aowl_ne_canvas_sort_order(void) { return AOWL_NE_CANVAS_SORT_ORDER; }
+static int32_t aowl_ne_canvas_settle_ticks(void) { return AOWL_NE_CANVAS_SETTLE_TICKS; }
+static int32_t aowl_ne_ui_layer(void) { return AOWL_NE_UI_LAYER; }
 
 /* Is a projected screen point actually ON the screen this frame? A box whose
  * rect reads back off-screen is NOT evidence of rendering, so PASS must not
