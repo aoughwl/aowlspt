@@ -1295,6 +1295,31 @@ var gHandleIsObject: seq[bool] = @[]
 ## the three must stay in step.
 var gHandleGc: seq[uint32] = @[]
 
+## WHO OWNS EACH HANDLE. A fourth array parallel to the three above, holding the
+## mod index that took the slot, or `HandleHost` for one the host took for
+## itself.
+##
+## This is the structural blocker for client-side hot reload, and it is the one
+## hazard `dropModRegistrations` could not close. Everything else a mod leaves
+## behind is a function pointer INTO its library -- a detour, a subscriber, a
+## queued callback -- and the teardown drops all of those, so freeing the library
+## is safe. A strong GC handle is the opposite shape: it points from us INTO the
+## game, it does not become invalid when the library goes, and nothing crashes.
+## It PINS a game object for the life of the process. Unload a mod sixteen times
+## across a session and the collector is holding sixteen sets of corpses it may
+## not move or free.
+##
+## `sain` does the right thing by hand -- its `onUnload` calls `releaseAll()` --
+## and that keeps working and is now unnecessary, which is the point. Depending
+## on every mod author remembering is not a contract, it is a hope, and the
+## hazard is invisible until a raid is long enough to notice the memory.
+##
+## `HandleHost` is deliberately NOT `-1`-by-omission: `claimNewHandles` pads this
+## array explicitly so it is always exactly `gHandles.len` long. An array that
+## can be short is an array whose missing entries read as some mod's index.
+const HandleHost = -1
+var gHandleMod: seq[int] = @[]
+
 ## Released handle slots, waiting to be handed out again.
 ##
 ## The table used to be append-only: `handle_release` emptied a slot and
@@ -1415,6 +1440,13 @@ var gDrainStalled = false
 ## quietly become "did the other branch get here first".
 var gQuietLastFire = -1
 var gQuietRun = 0
+
+## The last reload ledger printed, so the line is written on change and not per
+## frame. Starts at a tuple no real reading can equal, so the FIRST reading is
+## always printed -- an all-zero start would make "nothing has been attempted"
+## silent, and a run with zero reloads must say so rather than look like a run
+## whose log line was lost. Zero attempts is INCONCLUSIVE and has to be visible.
+var gRlLast = (-1, -1, -1, -1, -1)
 
 ## The render-phase drain's slot, method and proof, mirroring the update drain's
 ## fields above. `-1` until a render-phase target binds. Kept entirely separate
@@ -2021,8 +2053,70 @@ proc trimHandles() =
     shrink(gHandles, n)
     shrink(gHandleIsObject, n)
     shrink(gHandleGc, n)
+    # The owner array is shrunk with them or it is no longer parallel, and a
+    # stale tail here would hand a reused slot its predecessor's owner.
+    if n < gHandleMod.len:
+      shrink(gHandleMod, n)
 
-proc newHandle(target: Il2CppPtr; isObject: bool; gc: uint32): uint64 =
+proc claimNewHandles(mark: int; owner: int) =
+  ## Tag every slot appended since `mark` as belonging to `owner`.
+  ##
+  ## `readField` and `describeResult` in `invoke.nim` **append** to the three
+  ## sequences directly -- they are handed the sequences, not this file's
+  ## bookkeeping -- so there is no single door to add an owner argument to.
+  ## Rather than thread one through the invoke path (which would also touch the
+  ## patch-firing sites, where handles are reclaimed by index on return and an
+  ## owner is meaningless), the caller records `gHandles.len` first and calls
+  ## this after: anything that appeared during a mod's call is that mod's.
+  ##
+  ## Called with the table lock ALREADY HELD. It does not take it: the appends
+  ## it is describing happen under the same lock and a second acquisition here
+  ## would either deadlock or, worse, open a window between the append and the
+  ## tag in which the slot has no owner.
+  ##
+  ## Padding is unconditional and runs to `gHandles.len`, so this array is never
+  ## shorter than the table it describes.
+  while gHandleMod.len < mark and gHandleMod.len < gHandles.len:
+    gHandleMod.add HandleHost
+  while gHandleMod.len < gHandles.len:
+    gHandleMod.add owner
+  var i = mark
+  while i < gHandles.len and i < gHandleMod.len:
+    if i >= 0:
+      gHandleMod[i] = owner
+    inc i
+
+proc releaseModHandles(index: int): int =
+  ## Free every GC handle the mod at `index` still holds, and say how many.
+  ##
+  ## Called from `dropModRegistrations`, so: after the mod's own `on_unload` has
+  ## had its chance to release them itself, and before `FreeLibrary`. A mod that
+  ## released its own handles costs nothing here and returns zero, which is the
+  ## number `sain` should produce and is worth logging for exactly that reason --
+  ## a non-zero count from a mod that believes it cleans up is a bug report.
+  ##
+  ## The slot is emptied but NOT pushed onto the free queue. The mod is going
+  ## away and its slot numbers are dead; re-issuing them to another mod while a
+  ## late call from the departing one could still name them is a class of bug
+  ## this unload path has already been bitten by once, and a handful of slots is
+  ## not worth it. `trimHandles` still reclaims the tail.
+  ##
+  ## Under the caller's lock, for the same reason as `claimNewHandles`.
+  result = 0
+  var i = 0
+  while i < gHandles.len and i < gHandleMod.len:
+    if gHandleMod[i] == index:
+      if gHandleIsObject[i] and gHandleGc[i] != 0'u32:
+        gcHandleFree(gRt, gHandleGc[i])
+        gHandleGc[i] = 0'u32
+        result = result + 1
+      gHandles[i] = cast[Il2CppPtr](0)
+      gHandleIsObject[i] = false
+      gHandleMod[i] = HandleHost
+    inc i
+
+proc newHandle(target: Il2CppPtr; isObject: bool; gc: uint32;
+               owner: int = HandleHost): uint64 =
   ## One handle, into a reclaimed slot where there is one. The number a mod
   ## sees is the index plus one, exactly as it always was.
   ##
@@ -2035,11 +2129,20 @@ proc newHandle(target: Il2CppPtr; isObject: bool; gc: uint32): uint64 =
     gHandles[slot] = target
     gHandleIsObject[slot] = isObject
     gHandleGc[slot] = gc
+    while gHandleMod.len <= slot:
+      gHandleMod.add HandleHost
+    gHandleMod[slot] = owner
     result = uint64(slot + 1)
   else:
     gHandles.add target
     gHandleIsObject.add isObject
     gHandleGc.add gc
+    # Pad first, then append, so a table that had grown behind this array's back
+    # (the invoke.nim append paths) does not shift this handle's owner onto an
+    # earlier slot.
+    while gHandleMod.len < gHandles.len - 1:
+      gHandleMod.add HandleHost
+    gHandleMod.add owner
     result = uint64(gHandles.len)
   tablesUnlock()
 
@@ -2087,6 +2190,8 @@ proc hostHandleRelease(ctx: Il2CppPtr; handle: uint64) {.
       gHandleGc[idx] = 0'u32
     gHandles[idx] = cast[Il2CppPtr](0)
     gHandleIsObject[idx] = false
+    if idx < gHandleMod.len:
+      gHandleMod[idx] = HandleHost
     # The slot goes back on the queue, so the table stays the size of what is
     # actually held rather than the number of handles ever taken. Only when it
     # held something: releasing the same handle twice must not queue it twice,
@@ -2218,7 +2323,10 @@ proc hostHandlePin(ctx: Il2CppPtr; handle: uint64;
     gLastError = "the runtime would not give a pinned handle for handle " &
                  $int(handle)
     return ErrGeneric
-  var v = newHandle(cast[Il2CppPtr](0), true, gc)
+  # THE PINNED HANDLE, and the one that matters most for an unload: this is the
+  # `hold` behind `sain`'s `bridge.attach`. Owned by the calling mod, so the
+  # teardown can give it back even if the mod does not.
+  var v = newHandle(cast[Il2CppPtr](0), true, gc, int(cast[uint](ctx)))
   copyMem(outHandle, cast[Il2CppPtr](addr v), 8)
   result = StatusOk
 
@@ -2238,7 +2346,11 @@ proc hostResolve(ctx: Il2CppPtr; typeName: Il2CppPtr; nameLen: int32;
   if c == nil:
     gLastError = "no such type: " & name
     return ErrNotFound
-  let h = newHandle(c, false, 0'u32)
+  # A TYPE handle: no GC handle behind it, so `releaseModHandles` frees nothing
+  # for it. Owned anyway, so the slot is cleared with the rest of the mod's when
+  # it goes -- a table where some of a departed mod's rows are cleared and others
+  # are not is one nobody can audit.
+  let h = newHandle(c, false, 0'u32, int(cast[uint](ctx)))
   # The out-parameter is a uint64*; write it as eight bytes.
   discard cOutCopy(cast[Il2CppPtr](0), cast[Il2CppPtr](0),
                    cast[Il2CppPtr](0), 0'i32)
@@ -2515,8 +2627,13 @@ proc hostCall(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
       # `readField` may register a handle for a reference field, so it appends
       # to the table and has to do it under the lock.
       tablesLock()
+      # The mark is taken INSIDE the lock and next to the append it describes.
+      # Read outside it, another thread's append lands between the two and this
+      # mod is credited with a handle that is not its.
+      let markF = gHandles.len
       let text = readField(gRt, cls, instance, fieldName, gHandles,
                            gHandleIsObject, gHandleGc, fieldError)
+      claimNewHandles(markF, int(cast[uint](ctx)))
       tablesUnlock()
       if fieldError.len > 0:
         gLastError = fieldError & " on " & typePart
@@ -2565,7 +2682,9 @@ proc hostCall(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
 
   # And the same for the return: a method that returns an object costs a handle.
   tablesLock()
+  let markR = gHandles.len
   let text = describeResult(gRt, m, res, gHandles, gHandleIsObject, gHandleGc)
+  claimNewHandles(markR, int(cast[uint](ctx)))
   tablesUnlock()
   if text.len == 0:
     return StatusOk
@@ -6644,7 +6763,20 @@ proc dropModRegistrations(index: int) =
     if sub1.modIndex != index:
       kept.add sub1
   gSubs = kept
+  # THE GC HANDLES, under the same lock. Not a function pointer into the mod --
+  # nothing here crashes when the library goes -- but every one still held is a
+  # game object the collector may not move or free for the rest of the session.
+  # This is the item that made client-side hot reload a leak rather than a
+  # capability, and it is closed here rather than in each mod's `on_unload`
+  # because a contract every author has to remember is not a contract.
+  let freed = releaseModHandles(index)
+  trimHandles()
   tablesUnlock()
+  # Said always, including the zero. A mod whose own `on_unload` releases its
+  # handles -- `sain` does -- should produce 0 here, so a non-zero count from one
+  # that believes it cleans up is the bug report, and a silent zero would be
+  # indistinguishable from never having looked.
+  okLog "released " & $freed & " GC handle(s) still held by mod slot " & $index
 
   # Under the lock, because the drain runs on the game thread and may be part
   # way through this same list while a mod is being unloaded.
@@ -9150,6 +9282,23 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
     # Live mod control, off the emitting stack -- the only place in this host a
     # mod is loaded or unloaded while the game is running.
     modcontrol.drain()
+    # THE RELOAD LEDGER, to the host log, and ONLY when a number moved. This is
+    # what makes the acceptance test runnable at all: without it the counters
+    # exist inside the process and no one outside can read them, so "it
+    # reloaded" and "nothing happened" produce the same evidence -- nothing.
+    #
+    # `epoch` is the falsifiable half. It goes up once per COMPLETED unload, so
+    # a mod that reports it on load reports a different number every reload; the
+    # same number twice means the library did not change over, however healthy
+    # the other counters look.
+    #
+    # A line only on change, for the reason every other counter in this loop is:
+    # a line per frame at 60 fps buries the one that mattered.
+    let rl = modcontrol.hotReloadCounters()
+    if rl != gRlLast:
+      gRlLast = rl
+      info "hot reload: attempted=" & $rl[0] & " completed=" & $rl[1] &
+           " refused=" & $rl[2] & " deferred=" & $rl[3] & " epoch=" & $rl[4]
     # And the answer, on the way back out. It rides the next poll of the same
     # route the desired set came in on -- see `publishReport`.
     publishReport(now)

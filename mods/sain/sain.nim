@@ -1838,7 +1838,24 @@ proc onSainSettingsReset(url, body, session: string): string =
     return declaredSchemaReply(st).text
   result = mergedPage()
 
+const ReloadProbe = 1
+  ## THE PROOF THAT A RELOAD RELOADED ANYTHING. Bump this by one, rebuild, press
+  ## reload, and the line below must show the new number.
+  ##
+  ## It exists because "it reloaded" and "nothing happened" otherwise produce
+  ## identical evidence: no crash, a mod still listed, and a host log that says
+  ## an unload and a load both succeeded -- all of which are equally true if the
+  ## old library was quietly left in place. A value that only changes when the
+  ## source changes is the one thing in the loop that cannot be faked by the
+  ## machinery under test.
+  ##
+  ## Deliberately a hand-edited const rather than a build timestamp: the step
+  ## being verified is "change code, press reload, see the change", and a stamp
+  ## that moves on every rebuild would also move when nothing was edited.
+
 proc onLoad(): Status =
+  info "sain: ReloadProbe=" & $ReloadProbe & " -- if this number did not change " &
+       "after you edited it and reloaded, the reload did NOT take"
   declareSettings(sainSchema())
   discard serve("/aowlspt/settings/aowl.sain", onSainSettings)
   discard serve("/aowlspt/settings/aowl.sain/reset", onSainSettingsReset)
@@ -1988,6 +2005,23 @@ proc onUnload(): Status =
     info "sain: " & stats()
   Ok
 
+## `mfHotReloadable` is claimed on the strength of the audit, not on optimism,
+## and the four things it asserts are each checkable:
+##
+##  * **Detours** -- registered through `patch`, so `dropModRegistrations`
+##    removes them and bumps the slot generation before `FreeLibrary`.
+##  * **Callbacks** -- subscriptions and queued main-thread work, dropped under
+##    the host's lock by the same teardown.
+##  * **Threads** -- none. `createThread` has no hits in this mod.
+##  * **GC handles** -- the one real hazard. `onUnload` calls `releaseAll()`,
+##    and as of the handle-ownership change the host frees any it missed and
+##    logs the count. That count should be 0 for this mod; a non-zero one is a
+##    bug in `releaseAll`, not in the host.
+##
+## What it does NOT assert is that state survives: no host calls
+## `stateSave`/`stateLoad` yet, so a reload restarts this mod's bot table from
+## empty and it re-attaches on its next scan.
 exportMod(guid = "aowl.sain", name = "Bot AI", author = "aowlspt", version = "0.1.0",
           sptRange = "*", sides = {sideClient, sideServer, sideSim},
+          flags = {mfHotReloadable},
           onLoad = onLoad, onUpdate = onUpdate, onUnload = onUnload)
