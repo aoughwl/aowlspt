@@ -238,6 +238,78 @@ proc parseRgb(s: string; dflt: uint32): uint32 =
   let b = v and 0xFF'u32
   result = r or (g shl 8) or (b shl 16) or (235'u32 shl 24)
 
+const
+  RendAuto*    = "auto"
+  RendLegacy*  = "legacy"
+  RendUnified* = "unified"
+
+proc rendererRaw*(): string =
+  ## The `mapsRenderer` key exactly as it is written in config.json, so a
+  ## MISSPELLING can be reported instead of silently becoming a default.
+  asText(setting("mapsRenderer"), "")
+
+proc rendererChoice*(): string =
+  ## WHICH KEY SET OWNS THE SPATIAL WIDGET. A pure read; no global is touched,
+  ## for the same reason readOpts touches none -- the apply path, the reconcile
+  ## and the diag must all resolve this the same way or the setting becomes a
+  ## control that stores and does nothing.
+  ##
+  ## Three values, and an unrecognised one falls back LOUDLY (the caller
+  ## reports it; see rendererDecision). An ABSENT key means an OLD config that
+  ## predates this setting, and for that config "auto" is the only answer that
+  ## does not change what the player already had.
+  let r = rendererRaw()
+  if r.len == 0: return RendAuto
+  case r
+  of RendAuto, RendLegacy, RendUnified: r
+  else: RendAuto
+
+proc rendererDecision*(): string =
+  ## THE DECISION, IN WORDS -- who won, what was suppressed, and why the loser
+  ## is still armed. Modelled on the host's `espProvider` line, and for the same
+  ## reason: a renderer that vanishes without a named reason is
+  ## indistinguishable from a renderer that is broken, and the player reported
+  ## exactly that.
+  let raw = rendererRaw()
+  let rend = rendererChoice()
+  let modeTxt = asText(setting("spatialMode"), "auto")
+  let spatialWritten = modeTxt.len > 0 and modeTxt != "auto"
+  var pre = ""
+  if raw.len > 0 and raw != rend:
+    pre = "mapsRenderer = \"" & raw & "\" is not one of unified / legacy / " &
+          "auto -- fell back to \"auto\". "
+  elif raw.len == 0:
+    pre = "mapsRenderer is ABSENT (a config written before this setting " &
+          "existed), so \"auto\" is in force and nothing about this widget " &
+          "changed on update. "
+  if rend == RendUnified:
+    pre & "renderer=UNIFIED: `spatialMode` (=" &
+    (if spatialWritten: "\"" & modeTxt & "\"" else: "unwritten -> radar") &
+    ") owns the widget. SUPPRESSED: hudRadar / hudMap / radarX / radarY / " &
+    "radarSize are NOT read, so no Legacy toggle can blank the map -- that " &
+    "was the reported bug. The Legacy keys stay STORED and the one draw path " &
+    "stays armed, so setting mapsRenderer=\"legacy\" hands them back live, " &
+    "with no relaunch. To hide the widget under this renderer, set " &
+    "spatialMode=\"off\" -- that is the control, not the Legacy toggle."
+  elif rend == RendLegacy:
+    pre & "renderer=LEGACY: hudRadar / hudMap (and radarX/Y/Size for the " &
+    "geometry) own the widget. SUPPRESSED: `spatialMode` (=\"" & modeTxt &
+    "\") is NOT read. Turning BOTH Legacy toggles off draws nothing, and that " &
+    "is this renderer's defined behaviour rather than a fault. The unified " &
+    "draw path is still armed and `spatialMode` is still stored, so " &
+    "mapsRenderer=\"unified\" swaps back live."
+  elif spatialWritten:
+    pre & "renderer=AUTO resolved to UNIFIED because `spatialMode` has been " &
+    "written (=\"" & modeTxt & "\"). SUPPRESSED: the Legacy pair is not read. " &
+    "Pin mapsRenderer to \"unified\" or \"legacy\" to stop this depending on " &
+    "whether one other key happens to have been written."
+  else:
+    pre & "renderer=AUTO resolved to LEGACY because `spatialMode` is " &
+    "unwritten, so hudRadar/hudMap still own the widget -- this is the " &
+    "MIGRATION path and it is the state in which turning the Legacy radar " &
+    "toggle off blanks the map. SUPPRESSED: `spatialMode`. Set " &
+    "mapsRenderer=\"unified\" to make that impossible."
+
 proc readOpts(o: var HudOpts) =
   ## READS config.json into a FRESH options object and touches no global.
   ##
@@ -292,9 +364,40 @@ proc readOpts(o: var HudOpts) =
   # which is the surface that was drawn on top anyway. The translation is only
   # consulted while the key is absent; the first edit through F12 writes
   # `spatialMode` and the legacy pair stops mattering.
+  # ---- THE RENDERER CHOICE (`mapsRenderer`) -------------------------------
+  #
+  # THE BUG THIS FIXES, in the player's words: "if i disable the legacy maps in
+  # settings i see no in game map/radar". There is only ONE renderer --
+  # `mhud_draw_pane_full` -- and the two Legacy-category booleans were never a
+  # second renderer; while `spatialMode` read "auto" they were the widget's
+  # de-facto master switch. Turning `hudRadar` off (hudMap already false)
+  # resolved the mode to OFF, so the unified widget drew nothing and there was
+  # nothing to "take over". `mapsRenderer` makes that ownership EXPLICIT and
+  # selectable instead of implicit in whether one other key happened to be
+  # written yet.
+  #
+  #   unified -- `spatialMode` owns the widget. The Legacy keys are NOT read
+  #              at all, so no Legacy toggle can blank the map. An unwritten
+  #              `spatialMode` resolves to the historic default surface
+  #              (radar), NEVER to OFF: resolving to OFF here is the bug.
+  #   legacy  -- the old hudMap/hudRadar pair (and radarX/Y/Size) own it, and
+  #              `spatialMode` is not read. The pre-unification semantics, kept
+  #              because "off by turning the radar toggle off" is what some
+  #              existing configs mean.
+  #   auto    -- the migration shim, and what an OLD config with no
+  #              `mapsRenderer` key gets: legacy is consulted only while
+  #              `spatialMode` is unwritten. Nobody's widget moves on update.
+  #
+  # Either way the loser is only DESELECTED, never unbound: the single draw
+  # path stays armed and both key sets stay readable, so flipping this back is
+  # one live apply and no relaunch.
+  let rend = rendererChoice()
   let modeTxt = asText(setting("spatialMode"), "auto")
-  if modeTxt.len > 0 and modeTxt != "auto":
-    o.mode = modeOf(modeTxt)
+  let spatialWritten = modeTxt.len > 0 and modeTxt != "auto"
+  let unifiedOwns =
+    rend == RendUnified or (rend == RendAuto and spatialWritten)
+  if unifiedOwns:
+    o.mode = if spatialWritten: modeOf(modeTxt) else: ModeRadar
   else:
     let legacyMap = asBool(setting("hudMap"), false)
     let legacyRad = asBool(setting("hudRadar"), true)
@@ -431,6 +534,34 @@ proc spatialSchema(): seq[Setting] =
     floatSetting("radiusM", "Radar radius (m)", 120.0, lo = 10.0, hi = 1000.0,
                  step = 5.0, category = "Feed",
                  description = "Specified from the pre-1.0 BepInEx map/radar mods (no upstream code carried; map art and calibration provenance in mods/maps/data/maps/README.md). Anything further away than this is not drawn"),
+
+    # ---- WHICH RENDERER DRAWS ---------------------------------------------
+    enumSetting("mapsRenderer", "Map renderer", "auto",
+                @["auto", "unified", "legacy"],
+                category = "Widget",
+                description = "WHICH KEY SET OWNS THE MAP WIDGET. There is " &
+                              "exactly ONE draw path (mhud_draw_pane_full -- " &
+                              "the minimap, the radar and the full-screen " &
+                              "overlay are all it); this chooses which " &
+                              "settings drive it, and the loser draws " &
+                              "NOTHING rather than doubling up. " &
+                              "unified = `Spatial widget` (spatialMode) " &
+                              "owns it and the LEGACY: toggles below are not " &
+                              "read at all, so none of them can blank your " &
+                              "map -- if you want it hidden, set the spatial " &
+                              "widget to `off`. " &
+                              "legacy = the LEGACY: in-game radar / in-game " &
+                              "map pair owns it (and radarX/Y/Size give the " &
+                              "geometry), and `Spatial widget` is not read. " &
+                              "auto = the migration shim: legacy owns it " &
+                              "only until `Spatial widget` is written. " &
+                              "The losing key set is only DESELECTED, never " &
+                              "unbound -- the draw path stays armed and " &
+                              "switching back applies live with no relaunch. " &
+                              "The maps diag's `renderer` line names the " &
+                              "winner, what was suppressed, and counts the " &
+                              "frames the winner actually submitted geometry " &
+                              "on, so `nothing drew` can never read as a pass"),
 
     # ---- THE ONE SPATIAL WIDGET -----------------------------------------
     enumSetting("spatialMode", "Spatial widget", "auto",
@@ -592,7 +723,14 @@ proc spatialSchema(): seq[Setting] =
                               "on the map at its true position"),
 
     boolSetting("hudRadar", "LEGACY: in-game radar", true, category = "Legacy",
-                description = "Specified from the pre-1.0 BepInEx map/radar mods (no upstream code carried; map art and calibration provenance in mods/maps/data/maps/README.md). Draw the radar over the game, via the shared region"),
+                description = "INERT unless `Map renderer` is `legacy` (or " &
+                              "`auto` with `Spatial widget` still unwritten). " &
+                              "Under the shipped `unified` renderer this key " &
+                              "is NOT read and turning it off changes " &
+                              "nothing -- it used to blank the map entirely, " &
+                              "which is the bug `Map renderer` fixes. Use " &
+                              "`Spatial widget` = off to hide the widget. " &
+                              "Specified from the pre-1.0 BepInEx map/radar mods (no upstream code carried; map art and calibration provenance in mods/maps/data/maps/README.md). Draw the radar over the game, via the shared region"),
     boolSetting("hudIndicators", "Direction indicators", false, category = "HUD",
                 description = "Specified from the pre-1.0 BepInEx map/radar mods (no upstream code carried; map art and calibration provenance in mods/maps/data/maps/README.md). A marker per contact, clamped to the screen " &
                               "edge in its direction. Camera-relative when the " &
@@ -612,7 +750,10 @@ proc spatialSchema(): seq[Setting] =
                  step = 4.0, category = "Legacy",
                  description = "Migration only -- see radarSize"),
     boolSetting("hudMap", "LEGACY: in-game map", false, category = "Legacy",
-                description = "Specified from the pre-1.0 BepInEx map/radar mods (no upstream code carried; map art and calibration provenance in mods/maps/data/maps/README.md). A large top-down map pane drawn over the game " &
+                description = "INERT unless `Map renderer` is `legacy` (or " &
+                              "`auto` with `Spatial widget` unwritten) -- see " &
+                              "`LEGACY: in-game radar`. " &
+                              "Specified from the pre-1.0 BepInEx map/radar mods (no upstream code carried; map art and calibration provenance in mods/maps/data/maps/README.md). A large top-down map pane drawn over the game " &
                               "by the shared region. Player-centred: anchoring " &
                               "it to the level needs the pocketmap pyramid's " &
                               "world origin, which nothing has measured"),
@@ -1691,6 +1832,48 @@ proc mapsDiagText(): string =
       "rendered more than one: the minimap, the radar and the full-screen " &
       "overlay are the same code path"
 
+  # ---- THE RENDERER CHOICE, and "NOTHING DREW" AS A FAIL ------------------
+  #
+  # Two independent assertions, kept apart because they fail independently:
+  #
+  #   * `paneCallsOver` (the unifiedPane line above) catches the DOUBLED draw.
+  #   * `selBlank` catches the opposite and much quieter failure -- a surface
+  #     was SELECTED and the renderer submitted zero primitives on every frame
+  #     it was asked to draw. That is the reported bug, and the old diag had no
+  #     counter that could express it: an all-zero renderer read as a PASS
+  #     everywhere, because every check compared our own config to itself.
+  #
+  # PASS requires selDrew > 0 -- the winning renderer put geometry on screen at
+  # least once. selFrames == 0 is INCONCLUSIVE ("no surface was ever selected,
+  # so nothing was observed"), never PASS.
+  let selF = hudSelFrames()
+  let selD = hudSelDrew()
+  let selB = hudSelBlank()
+  let lRend =
+    if selD + selB != selF:
+      "FAIL  the draw-site counters do not add up (selDrew " & $selD &
+      " + selBlank " & $selB & " != selFrames " & $selF & "), so no verdict " &
+      "about the renderer can be trusted. " & rendererDecision()
+    elif not gHudOn:
+      "INCONCLUSIVE  no draw participant is registered, so no dispatch has " &
+      "reached the renderer and nothing has been observed. " & rendererDecision()
+    elif selF == 0'i64:
+      "INCONCLUSIVE  a renderer is selected in config but ZERO dispatches " &
+      "reached the draw section with any surface switched on (the widget " &
+      "mode is " & modeName(gOpts.mode) & " and the overlay has not been " &
+      "opened). Nothing drew and nothing was asked to -- this is NOT a pass. " &
+      rendererDecision()
+    elif selD == 0'i64:
+      "FAIL  a surface was selected on all " & $selF & " dispatch(es) and " &
+      "the renderer submitted ZERO primitives on every one of them -- the " &
+      "map/radar is switched on and NOTHING IS BEING DRAWN. This is the " &
+      "reported defect, not a quiet widget. " & rendererDecision()
+    else:
+      "PASS  the selected renderer submitted geometry on " & $selD & " of " &
+      $selF & " dispatch(es) (" & $selB & " blank), and no dispatch ever " &
+      "rendered more than one pane (" & $hudPaneCallsOver() & " violation(s)). " &
+      rendererDecision()
+
   # ---- THE FULL-SCREEN OVERLAY -------------------------------------------
   #
   # THREE OUTCOMES, and the PASS is a falsifiable NEGATIVE: the overlay was open
@@ -1765,6 +1948,7 @@ proc mapsDiagText(): string =
            "  widget       : " & lWidget & "\n" &
            "  placement    : " & lPlace & "\n" &
            "  unifiedPane  : " & lUnified & "\n" &
+           "  renderer     : " & lRend    & "\n" &
            "  fullscreen   : " & lFs & "\n" &
            "  reconcile    : " & lRecon & "\n" &
            "  region       : " & lRegion & "\n" &
@@ -1946,6 +2130,11 @@ proc onMapsApply(key: string) =
   # `live`, so an off edit shows the surface at 0 here and the NEXT draw frame
   # honours it (0 tiles / 0 blips). This is the finished-state assertion the fix
   # is judged on: not "apply returned ok" but "the mirror now reads off".
+  # THE RENDERER DECISION, named on every apply. espProvider's rule: the winner
+  # and the loser are both stated, with the reason the loser is still armed --
+  # a renderer that disappears without a named reason is what produced "if i
+  # disable the legacy maps i see no in game map/radar".
+  info "maps: " & rendererDecision()
   info "maps: apply " & (if key.len > 0: key else: "(all)") &
        " -> config spatialMode=" & modeName(gOpts.mode) &
        " indicators=" & $gOpts.indicators & " enabled=" & $nowEnabled &
