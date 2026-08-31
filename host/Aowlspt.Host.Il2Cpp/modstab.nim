@@ -2786,6 +2786,19 @@ var gGfxBothActiveSaid = false
 var gGfxPanelT: Il2CppPtr = nil
 var gGfxPostT: Il2CppPtr = nil
 
+## FORWARD DECLARATIONS into `postfxrows.nim`, which is `include`d AFTER this
+## file because it needs `nuikit.nim`'s from-scratch constructors and nuikit is
+## itself included after modstab. Same device `settingspages.nim` uses for
+## `colorwidget.nim`: nimony forward-resolves PROCS across an include boundary
+## but not variables or types, which is why both signatures below are plain
+## (`bool` / nothing) and why no `NuElem` and no `gPfx*` global is named here.
+##
+## Two entry points, and nothing else crosses the boundary. The postfx SUBTAB
+## (this file) owns which stock panel is up; the postfx ROWS (that file) own
+## what is inside the PostFX one. Neither reaches into the other's state.
+proc pfxOnPanelUp(postUp: bool)
+proc pfxOnScreenClosed()
+
 proc gfxNoteFault(what: string) =
   inc gGfxFaults
   warn "postfx subtab: " & what & " (fault " & $gGfxFaults & " of " &
@@ -3377,6 +3390,7 @@ proc gfxTickBody() =
     gGfxTickDiagSaid = false          # settings screen closed; re-arm for next open
     gGfxVerdictSaid = false
     gGfxUpTicks = 0
+    pfxOnScreenClosed()
   if gGfxPanelGo == nil or gGfxPostGo == nil:
     return
   if not duOk(gGfxPanelGo, 0x20'i32) or not duOk(gGfxPostGo, 0x20'i32):
@@ -3392,6 +3406,14 @@ proc gfxTickBody() =
              "nothing touched, this is correct)"
            elif gfxUp and postUp: "BOTH-ACTIVE (forcing back to selection)"
            else: "NORMAL (watching the strip for a rising edge)")
+  # BUG 2 -- THE PANEL'S CONTENT. The subtab machinery above is finished and
+  # verified; what it switches TO was empty, because folding the stock POSTFX
+  # tab away leaves the stock PostFX Settings panel with nothing in it. Build
+  # our own rows into it the first time it is genuinely up, and judge them from
+  # then on. Lazily, so a player who never presses POSTFX pays nothing, and
+  # inside THIS guard -- `aowl_p_p_seh` is not re-entrant and none is opened
+  # over there.
+  pfxOnPanelUp(postUp)
   if not gfxUp and not postUp:
     # The player is on some other tab entirely. Do NOT touch anything -- the
     # game owns the screen here. Just remember that re-entering starts on

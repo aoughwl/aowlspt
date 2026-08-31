@@ -7188,6 +7188,17 @@ include "modsettingsrender.nim"
 ## nimony forward-resolves procs across an include boundary but NOT variables.
 include "colorwidget.nim"
 
+## THE POSTFX SUBTAB'S CONTENT. Fulfils `modstab.nim`'s two forward
+## declarations (`pfxOnPanelUp` / `pfxOnScreenClosed`).
+##
+## Position is load-bearing in both directions, exactly as for the colour
+## widget above: it needs `nuikit.nim` (6207) for `nuLabel`/`nuLive`/
+## `nuElemRect`/`nuElemText` and `modstab.nim` (6142) for `gGfxPostGo` /
+## `gGfxPostT` / `gGfxPanelT` / `modsFindTmp`, and it must come BEFORE `gPfxOn`
+## is read in the flag pass, because nimony forward-resolves procs across an
+## include boundary but NOT variables.
+include "postfxrows.nim"
+
 ## Client-side mods' settings pages, published to the backend over the event
 ## bus so the F12 nav can list them at all. Stands on `modsettingsrender.nim`
 ## for the shared POST slot discipline (`gSbYieldUntil`) and on `gSyncMs`.
@@ -8150,6 +8161,33 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
          "panels. Neither panel is cloned or written to; only their active " &
          "state is driven, because the game switches panels by ESettingsGroup " &
          "and a subtab of ours is not one."
+  # THE POSTFX SUBTAB'S CONTENT (`settingsPostFxRows`). Default OFF, and inert
+  # without BOTH of the two features it stands on, so it is resolved here rather
+  # than left to discover its own emptiness on the Unity thread.
+  gPfxOn = readBoolKey("settingsPostFxRows")
+  if gPfxOn and not gGfxOn:
+    gPfxOn = false
+    warn "settingsPostFxRows is set but settingsPostFxSubtab is NOT. The rows " &
+         "are built into the stock PostFX Settings panel, and without the " &
+         "subtab there is no way for the player to reach that panel at all -- " &
+         "the rows would exist and never be seen. NOT arming it; set " &
+         "settingsPostFxSubtab too."
+  if gPfxOn and not gNkOn:
+    gPfxOn = false
+    warn "settingsPostFxRows is set but nativeUiKit is NOT. Every row is a " &
+         "from-scratch TextMeshProUGUI built through nuikit, which refuses " &
+         "wholesale while that flag is off, so this would log 40 refusals and " &
+         "build nothing. NOT arming it; set nativeUiKit too."
+  if gPfxOn:
+    info "settingsPostFxRows is set: the stock PostFX Settings panel -- which " &
+         "is EMPTY once the stock POSTFX tab is folded into Graphics -- is " &
+         "filled with the 29 settings mods/graphics declares, built FROM " &
+         "SCRATCH through nuikit. NOTHING IS CLONED. They are NAMES ONLY: the " &
+         "live values need the mod schema fetch (modSettingsRender), which " &
+         "crashes the client at character-select and is not depended on here. " &
+         "The banner on the page says so, and rows the active Preset owns are " &
+         "marked, because a control that silently does nothing is worse than " &
+         "a label that admits what it is."
   gSeasonsOn = readBoolKey("uxHideSeasons")
   gBetaNoticeOn = readBoolKey("uxBetaNotice")
   # BOTH LOGGED AS ACTUALLY READ, not as defaulted, and then resolved here
