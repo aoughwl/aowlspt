@@ -207,6 +207,9 @@ var gNeSettleFrom = 0'i64             ## tick the settle wait started
 var gNeSettleReads = 0                ## readback attempts made
 var gNeSettleLast = ""                ## what the last readback actually said
 var gNeCreateTried = false            ## creation attempted this discovery pass
+var gNeParentLine = "parent readback not run yet"
+  ## The finished-tree ownership negative from `neBuildPool`, carried into the
+  ## verdict so a PASS can never be read as proof of ownership it did not test.
 
 var gNeRootGo: Il2CppPtr = nil
 var gNeRootTr: Il2CppPtr = nil
@@ -1196,25 +1199,41 @@ proc neDiscoverStep() =
              "phase B was TRUNCATED, so the remaining scenes are " &
              "INCONCLUSIVE.")
     # ------------------------------------------------------- CREATE OUR OWN
-    # ONLY on a REAL absence. Three independent things must all be answers,
-    # not truncations, and each is read from the ledger that produced it:
-    #   * phase 0 asked every live root and said ABSENT with scope EXHAUSTIVE
-    #   * phase A actually searched DontDestroyOnLoad and finished
-    #   * the walk that just ended finished without truncating
-    # If any one of them reads INCONCLUSIVE or TRUNCATED we refuse exactly as
-    # before, because creating a second canvas next to one we merely FAILED to
-    # find would double-draw and fight it for z-order. Find-then-create.
+    # THE GATE IS PHASE 0 ALONE, and that is a deliberate narrowing.
+    #
+    # It used to require THREE answers: phase0 ABSENT/EXHAUSTIVE, phase A
+    # exhaustive, and this walk exhaustive. MEASURED 2026-08-31, live raid:
+    # phase 0 said `rootsSeen=178 walked=178 asked=178 dead=0 unaskable=0
+    # askCap=512 scope=EXHAUSTIVE` -> ABSENT, a real, exhaustively-established
+    # absence at ROOT level -- and then the walk reported `visited=20000
+    # budgetLeft=0 queued=32879 deepest=3/8 scope=TRUNCATED` and the gate
+    # refused. The walk cannot establish nested absence at ANY sane budget, so
+    # requiring it made the gate UNSATISFIABLE: a condition that can never be
+    # true is not a safety check, it is a permanent refusal wearing one.
+    #
+    # And the requirement was self-imposed. We do not need the GAME's canvas --
+    # we need A canvas. `neCreateCanvas` allocates one we OWN (`gNeOwnCanvasGo`
+    # is set only for ours) and `neDestroyOwnCanvas` takes it down at raid end.
+    # The double-draw hazard the old comment named is a hazard of parenting to
+    # someone else's canvas twice, not of owning our own overlay.
+    #
+    # The nested walk is KEPT, but only as a PREFERENCE: if it finds a
+    # qualifying canvas it binds it above (origin=FOUND) and we never get here.
+    # Reaching here means it did not, and a TRUNCATED walk NO LONGER BLOCKS
+    # CREATION -- it is simply reported.
     let realAbsence = gNePhase0Verdict == "ABSENT" and
-                      gNePhase0Scope == "EXHAUSTIVE" and
-                      gNePhaseARootCount > 0 and gNePhaseAExhaustive and
-                      exhaustive
+                      gNePhase0Scope == "EXHAUSTIVE"
     if realAbsence and not gNeCreateTried and gNeOwnCanvasGo == nil:
-      okLog "natesp: this is a REAL ABSENCE, not a truncation -- phase0=" &
-            gNePhase0Verdict & "/" & gNePhase0Scope & ", phaseA=EXHAUSTIVE " &
-            "over " & $gNePhaseARootCount & " DontDestroyOnLoad root(s), the " &
-            "walk finished EXHAUSTIVELY. There is no canvas to parent to, so " &
-            "natesp will CREATE ITS OWN screen-space overlay canvas rather " &
-            "than refuse forever."
+      okLog "natesp: CREATING OUR OWN canvas -- phase0=" & gNePhase0Verdict &
+            "/" & gNePhase0Scope & " asked every live root and none carries a " &
+            "Canvas, which is a REAL absence at root level. The nested walk " &
+            "was a preference only and found none (walkExhaustive=" &
+            (if exhaustive: "yes" else: "NO") & ", phaseARoots=" &
+            $gNePhaseARootCount & ", phaseAExhaustive=" &
+            (if gNePhaseAExhaustive: "yes" else: "NO") &
+            "); it does NOT gate creation, because it cannot establish nested " &
+            "absence at any sane budget and requiring it made the gate " &
+            "unsatisfiable. We create, own and destroy this canvas ourselves."
       if neCreateCanvas():
         gNeQueue = @[]
         gNeDepth = @[]
@@ -1222,13 +1241,12 @@ proc neDiscoverStep() =
         gNeState = NeSettle
       return
     if not realAbsence and not gNeCreateTried:
-      okLog "natesp: NOT creating a canvas -- the absence is not established. " &
-            "phase0=" & gNePhase0Verdict & "/" & gNePhase0Scope &
-            " phaseARoots=" & $gNePhaseARootCount & " phaseAExhaustive=" &
-            (if gNePhaseAExhaustive: "yes" else: "NO") & " walkExhaustive=" &
-            (if exhaustive: "yes" else: "NO") & ". Creating one beside a " &
-            "canvas we merely failed to FIND would double-draw and fight it " &
-            "for z-order, so this refuses instead."
+      okLog "natesp: NOT creating a canvas -- the ROOT-LEVEL absence is not " &
+            "established. phase0=" & gNePhase0Verdict & "/" & gNePhase0Scope &
+            ". Only phase 0 gates creation now; it must read ABSENT with " &
+            "scope EXHAUSTIVE, meaning every live root was actually asked. " &
+            "Anything else is INCONCLUSIVE -- we did not look -- and " &
+            "INCONCLUSIVE is never a licence to create."
     neRefuse(NeRNoCanvas)
     return
   if gNeGraphicDonor == nil:
@@ -1335,6 +1353,49 @@ proc neBuildPool(): bool =
     gNeBoxActive[i] = false
     inc gNeBuilt
     inc i
+
+  # ------------------------------------------- THE FALSIFIABLE NEGATIVE (9b)
+  # NOT "we called SetParent and it returned true" -- that is a record of our
+  # own write and cannot fail. This READS THE FINISHED TREE BACK through
+  # Transform::get_parent and asserts a NEGATIVE that CAN come out false:
+  #
+  #   no ESP element is parented to anything other than the canvas we bound.
+  #
+  # Every box's parent must read back as the esp-root transform, and the
+  # esp-root's parent must read back as the canvas transform. A single stray
+  # -- a box that ended up on the game's canvas, or on nothing -- makes this
+  # FAIL and the pool is refused rather than half-drawn somewhere unowned.
+  # Capped by NeMaxPool, which is a compile-time constant.
+  var strays = 0
+  var unreadable = 0
+  let rootParent = iVisParentOf(gNeRootTr)
+  if rootParent == nil: inc unreadable
+  elif rootParent != gNeCanvasTr: inc strays
+  i = 0
+  while i < NeMaxPool:
+    if gNeBoxRt[i] != nil:
+      let p = iVisParentOf(gNeBoxRt[i])
+      if p == nil: inc unreadable
+      elif p != gNeRootTr: inc strays
+    inc i
+  gNeParentLine = "PARENT READBACK (Transform::get_parent over the finished " &
+                  "tree, not our own SetParent calls): strays=" & $strays &
+                  " unreadable=" & $unreadable & " of " & $(gNeBuilt + 1) &
+                  " element(s) -- the assertion is the NEGATIVE \"no ESP " &
+                  "element is parented to anything other than the canvas we " &
+                  "own\"; strays>0 falsifies it."
+  if strays > 0:
+    warn "natesp: " & gNeParentLine & " REFUSING the pool: " & $strays &
+         " element(s) read back parented somewhere we do not own, which would " &
+         "draw into a tree we cannot tear down at raid end."
+    return false
+  if unreadable > 0:
+    warn "natesp: " & gNeParentLine & " This is INCONCLUSIVE, not a pass -- " &
+         $unreadable & " element(s) could not be asked for their parent. The " &
+         "pool is built, but do not read the PASS verdict as proof of " &
+         "ownership for those."
+  else:
+    okLog "natesp: " & gNeParentLine
   true
 
 # ---------------------------------------------------------------------------
@@ -1501,8 +1562,11 @@ proc neCanvasLine(): string =
       " rect=" & neF(gNeCanvasW) & "x" & neF(gNeCanvasH) &
       " sortingOrder=" & $int(cNeCanvasSortOrder()) &
       " -- built by us because phase0 asked EVERY live root and answered " &
-      "ABSENT/EXHAUSTIVE and the walk finished exhaustively too. Verified by " &
-      "readback: " & gNeSettleLast & ". It is destroyed when the raid ends."
+      "ABSENT/EXHAUSTIVE. That root-level absence is the WHOLE gate; the " &
+      "nested walk is a preference and its scope did not enter into it. " &
+      "Verified by readback off the live object (renderMode via " &
+      "Canvas::get_renderMode, not remembered from the set): " & gNeSettleLast &
+      ". " & gNeParentLine & " It is destroyed when the raid ends."
   else:
     "canvas REFUSED -- " & readCString(cNeRefusalText(gNeWhy)) &
       (if gNeCreateTried:
@@ -1510,7 +1574,9 @@ proc neCanvasLine(): string =
          gNeSettleLast & ")"
        else:
          "  (creating our own was NOT attempted -- phase0=" & gNePhase0Verdict &
-         "/" & gNePhase0Scope & ", so the absence is not established)")
+         "/" & gNePhase0Scope & ", so the ROOT-LEVEL absence is not " &
+         "established. Phase 0 is the only gate; the nested walk's scope is " &
+         "not part of this decision)")
 
 proc neVerdictLine(sw, sh: float64): string =
   case int(gNeVerdict)
@@ -1579,6 +1645,7 @@ proc neTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ne_tick_body", cdecl.}
       gNePhase0Done = false
       gNeSeeded = false
       gNeCreateTried = false
+      gNeParentLine = "parent readback not run yet (torn down)"
       gNeState = NeIdle
     elif gNeState == NeRun and not duOk(gNeCanvasTr, 0x20'i32):
       neDestroyPool()
@@ -1588,6 +1655,7 @@ proc neTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ne_tick_body", cdecl.}
       gNePhase0Done = false        # the canvas died: re-ask the shared finder
       gNeSeeded = false
       gNeCreateTried = false
+      gNeParentLine = "parent readback not run yet (torn down)"
       gNeState = NeIdle
     gNeWhy = gate
     gNeVerdict = NeVInconclusive
@@ -1623,6 +1691,7 @@ proc neTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ne_tick_body", cdecl.}
       gNePhase0Done = false        # the canvas died: re-ask the shared finder
       gNeSeeded = false
       gNeCreateTried = false
+      gNeParentLine = "parent readback not run yet (torn down)"
       gNeState = NeIdle
       return cast[Il2CppPtr](1)
     if (gNeTicks mod int64(cNeScanEvery())) == 0: neScan()

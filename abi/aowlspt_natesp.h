@@ -40,7 +40,14 @@
 /* Discovery walk. Breadth-first over the scene roots, sliced across frames so
  * one frame can never spend the whole budget. Both bound the SAME walk: the
  * node budget bounds it in total, the millisecond slice bounds it per frame. */
-#define AOWL_NE_MAX_NODES     20000
+/* MEASURED 2026-08-31, live raid: with 20000 the walk reported
+ * `visited=20000 budgetLeft=0 queued=32879 deepest=3/8 scope=TRUNCATED` -- it
+ * burned the whole budget on map geometry three levels down and never reached
+ * any UI. It CANNOT establish nested absence at any sane budget, so it is no
+ * longer asked to: the creation gate now rests on phase 0's EXHAUSTIVE root
+ * ask alone, and this walk is a PREFERENCE (adopt a nested canvas if one turns
+ * up early) rather than a gate. A preference gets a small budget. */
+#define AOWL_NE_MAX_NODES     3000
 #define AOWL_NE_MAX_CHILDREN  512
 #define AOWL_NE_SLICE_MS      6
 
