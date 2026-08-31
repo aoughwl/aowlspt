@@ -446,10 +446,73 @@ def selftest(C):
         print("%sPASS%s INCONCLUSIVE: an unreadable artifact -- nothing was "
               "searched, so it is not a pass and not a failure" %
               (green, reset))
+    if not deploy_parity(C):
+        ok = False
     print("%s%s%s" % (green if ok else red,
                       "self-test OK -- all three outcomes demonstrated"
                       if ok else "SELF-TEST FAILED", reset))
     return 0 if ok else 1
+
+
+# `deploy.py check --contains` decides PRESENT/MISSING/INCONCLUSIVE by calling
+# classify() above. That delegation is the whole point -- the host-side tool
+# and the mod-side tool must not answer the same question differently -- so it
+# is worth exactly nothing unless something FAILS when it is undone. These
+# cases drive deploy.verify_literals() directly and assert all three verdicts
+# occur; deleting the delegation, or making --contains unable to FAIL again
+# (which is the gap this closes: agents fell back to `grep -a` because a
+# genuinely absent marker read as "we could not look"), breaks this list.
+DEPLOY_PARITY = [
+    ("deploy --contains PASS: a marker that IS in uihub.dll",
+     "uihub", "groupOf", ["groupOf"], litscan.OK),
+    ("deploy --contains FAIL: debug.dll's espColor asserted against "
+     "uihub.dll, with uihub's own marker as the positive control",
+     "uihub", "espColorEspColorNotHere", ["groupOf"], litscan.FAIL),
+    ("deploy --contains INCONCLUSIVE: a literal SPLIT across nimony rodata "
+     "fragments is NOT a removal",
+     "maps", "LATE ARMS the feed in place", ["LATE ARM"], INCONCLUSIVE),
+    ("deploy --contains INCONCLUSIVE: no positive control matched, so a miss "
+     "cannot be told apart from 'we could not look'",
+     "uihub", "zzzNotAMarkerAtAll", [], INCONCLUSIVE),
+]
+
+
+def deploy_parity(C):
+    red, green, yellow, dim, reset = C
+    try:
+        import deploy                       # noqa: E402 (cycle: deploy->markers)
+    except Exception as e:                  # pragma: no cover
+        print("%sINCONCLUSIVE%s could not import tools/deploy.py (%s) -- the "
+              "delegation was NOT checked. This is not a pass."
+              % (yellow, reset, e))
+        return False
+    ok = True
+    seen = set()
+    for (label, mod, lit, ctl, want) in DEPLOY_PARITY:
+        path = _dll(mod)
+        if not os.path.isfile(path):
+            print("%sINCONCLUSIVE%s missing fixture %s -- deploy parity was "
+                  "NOT checked. This is not a pass." % (yellow, reset, path))
+            return False
+        got, lines = deploy.verify_literals(
+            path, [lit], [], "any", ("", "", "", "", ""),
+            [("--control", c) for c in ctl])
+        seen.add(got)
+        good = (got == want)
+        print("%s%s%s %s" % (green if good else red,
+                             "PASS" if good else "FAIL", reset, label))
+        if not good:
+            ok = False
+            print("    wanted %s, got %s" % (want, got))
+            for ln in lines:
+                print("      " + ln)
+    need = {litscan.OK, litscan.FAIL, INCONCLUSIVE}
+    gone = sorted(need - seen)
+    if gone:
+        ok = False
+        print("%sFAIL%s deploy.py --contains never produced these verdicts, "
+              "so the delegation is not demonstrated: %s" % (red, reset, gone))
+    return ok
 
 
 def main(argv):

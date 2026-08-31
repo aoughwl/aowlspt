@@ -45,14 +45,19 @@ must never read as absent. Do NOT hand-roll this in PowerShell:
 `[Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes(p)).Contains(s)`
 gives SELECTIVE false negatives (facts #151/#152).
 
-A MATCH PROVES PRESENCE; A MISS PROVES NOTHING. nimony stores each
+A MATCH PROVES PRESENCE; A BARE MISS PROVES NOTHING. nimony stores each
 `&`-concatenated source fragment as a SEPARATE rodata string, so a sentence
 assembled from fragments (or from variables, or a C function name from
 `abi/*.h`, which is a symbol and not a runtime string) can NEVER appear
-contiguously. A `--contains` miss is therefore reported as NO-MATCH and is
-INCONCLUSIVE (exit 3), not FAIL -- with the longest word-run of the literal
-that IS present, which usually shows you where the split is. Pick a
-substring that lives inside ONE source fragment.
+contiguously. So `--contains` is THREE-way, and the decision is delegated to
+`tools/markers.py` (which shares `tools/litscan.py` with this file, so the
+mod-side and host-side tools cannot drift): PASS on a contiguous match; FAIL
+(exit 1) when a POSITIVE CONTROL matched and under 60% of the literal
+survives as word-runs -- the shape of a removal; NO-MATCH / INCONCLUSIVE
+(exit 3) otherwise, with the longest surviving word-run, which usually shows
+you where the split is. Pick a substring that lives inside ONE source
+fragment. Until FAIL was reachable, `--contains` could not assert a specific
+new marker string at all, and agents fell back to `grep -a`.
 
 `--absent` carries the same caveat and is likewise THREE-way. It FAILs on a
 contiguous hit (reported with the byte offset), is INCONCLUSIVE when MOST of
@@ -218,6 +223,7 @@ def select(cfg, only):
 # so that deploy.py (host DLL) and tools/markers.py (mod DLLs) cannot drift
 # apart. Re-exported under the names this file already used.
 import litscan                                       # noqa: E402
+import markers                                       # noqa: E402  (classify)
 from litscan import OK, FAIL, INCONCLUSIVE           # noqa: E402
 from litscan import FRAGMENT_NOTE                    # noqa: E402
 from litscan import fragment_cover as _fragment_cover           # noqa: E402
@@ -674,9 +680,12 @@ def verify_literals(src, contains, absent, mode, C, controls=None):
     encoding is reported. A literal present only as UTF-16 must never read as
     absent.
 
-    WHAT A MISS DOES NOT MEAN. `--contains` is SOUND as a positive signal and
-    UNSOUND as a negative one: a contiguous match proves the text is in the
-    file, a miss proves nothing. nimony stores each `&`-concatenated source
+    WHAT A MISS DOES NOT MEAN. `--contains` is SOUND as a positive signal; a
+    bare miss is unsound as a negative one. A contiguous match proves the text
+    is in the file. A miss is only a FAIL when a positive control matched and
+    the literal's word-runs cover under ABSENT_COVERAGE of it -- that call is
+    `markers.classify()`, shared with tools/markers.py via litscan, not
+    reimplemented here. nimony stores each `&`-concatenated source
     fragment as a SEPARATE rodata string, so a sentence assembled from
     fragments never appears contiguously and no substring search at any
     encoding can ever match it. Measured on mods/maps/bin/maps.dll (764,416
@@ -738,21 +747,47 @@ def verify_literals(src, contains, absent, mode, C, controls=None):
     bad = 0
     unknown = 0
     where = "    searched %s over %s (%d bytes)" % (searched, src, size)
+    # ONE control for both directions. `--absent` always needed it; `--contains`
+    # needs it too now that a miss is allowed to be called MISSING -- that is
+    # the entire licence for saying so (CLAUDE.md 9b).
+    control = _pick_control(blob, encs, controls) if (contains or absent) \
+        else None
     for lit in contains:
-        hits = [lbl for lbl, enc in encs if blob.find(enc(lit)) >= 0]
-        if hits:
+        # DELEGATED to tools/markers.py, which owns this three-way decision and
+        # shares tools/litscan.py with this file, so the mod-side tool and the
+        # host-side tool cannot answer the same question differently.
+        outcome, d = markers.classify(blob, encs, lit, control)
+        if outcome == markers.PRESENT:
             lines.append("%scontains%s PASS  %r  as %s"
-                         % (green, reset, lit, "+".join(hits)))
+                         % (green, reset, lit, "+".join(d["encodings"])))
             continue
-        # NOT a FAIL. A contiguous match PROVES presence; a miss does not
-        # prove absence, because the compiler is free to store the sentence
-        # in pieces. Reporting FAIL here reads as "the feature is missing,
-        # do not deploy" -- measured against mods/maps/bin/maps.dll, where
-        # three literals that are plainly in the source cannot ever match.
+        if outcome == markers.MISSING:
+            # A miss is a FINDING when, and only when, the search was shown
+            # capable of finding text in these bytes AND almost none of the
+            # literal survives as word-runs. Below that bar it stays
+            # INCONCLUSIVE, because a nimony `&` concatenation is stored as
+            # separate rodata fragments and can never match contiguously.
+            # Until this branch existed, `--contains` could not fail, so two
+            # agents in one night fell back to `grep -a` to assert a specific
+            # new marker string, which is the gap this closes.
+            bad += 1
+            lines.append("%scontains%s FAIL  %r  MISSING" % (red, reset, lit))
+            lines.append(where)
+            lines.append("    %s" % d["reason"])
+            lines.append("    positive control %r (%s) DOES match as %s at "
+                         "byte offset %d -- the search can find text in these "
+                         "bytes, so this miss is a finding."
+                         % (control[1], control[0], "+".join(control[2]),
+                            control[3]))
+            for frag, fhits in d.get("fragments", []):
+                lines.append("      still present: %r (%d bytes, as %s)"
+                             % (frag, len(frag), "+".join(fhits)))
+            continue
         unknown += 1
         lines.append("%scontains%s NO-MATCH  %r  (INCONCLUSIVE)"
                      % (yellow, reset, lit))
         lines.append(where)
+        lines.append("    %s" % d["reason"])
         frag, fhits = _longest_present_fragment(blob, encs, lit)
         if frag:
             lines.append("    no contiguous match; longest present fragment: "
@@ -765,7 +800,6 @@ def verify_literals(src, contains, absent, mode, C, controls=None):
                          "still not proven here.")
         lines.append("    NOTE: %s" % FRAGMENT_NOTE)
         lines.append("    This is NOT proof the feature is absent.")
-    control = _pick_control(blob, encs, controls) if absent else None
     for lit in absent:
         hits, off = _find_at(blob, encs, lit)
         if hits:
@@ -1395,12 +1429,15 @@ def main():
                         "artifact's RAW BYTES contain this literal. Searched "
                         "as UTF-8 and UTF-16LE by default; the matching "
                         "encoding is reported. ADDITIVE to the marker check, "
-                        "never a substitute for it. A MATCH proves presence; "
-                        "a MISS proves nothing and is reported NO-MATCH / "
-                        "INCONCLUSIVE (exit 3), because a literal spanning a "
-                        "Nim `&` concatenation is stored as separate rodata "
-                        "fragments and can never match contiguously -- pick a "
-                        "substring inside ONE source fragment.")
+                        "never a substitute for it. THREE outcomes, decided by "
+                        "tools/markers.py: PASS on a contiguous match; FAIL "
+                        "(exit 1) when a positive control DID match and almost "
+                        "none of the literal survives as word-runs -- a real "
+                        "removal; NO-MATCH / INCONCLUSIVE (exit 3) otherwise, "
+                        "because a literal spanning a Nim `&` concatenation is "
+                        "stored as separate rodata fragments and can never "
+                        "match contiguously -- pick a substring inside ONE "
+                        "source fragment.")
     p.add_argument("--absent", action="append", default=None,
                    metavar="LITERAL",
                    help="`check` only, repeatable: assert the literal is NOT "
@@ -1446,9 +1483,10 @@ def main():
             or args.control) and args.command != "check":
         sys.exit("--contains/--absent/--control are only meaningful with "
                  "`check`.")
-    if args.control and not args.absent:
-        sys.exit("--control is the positive control for --absent; it does "
-                 "nothing on its own. Use --contains to assert presence.")
+    if args.control and not (args.absent or args.contains):
+        sys.exit("--control is the positive control for --contains/--absent; "
+                 "it does nothing on its own. Use --contains to assert "
+                 "presence, --absent to assert removal.")
     if args.artifact and args.command != "check":
         sys.exit("--artifact is only meaningful with `check`: it verifies a "
                  "file in place and never copies anything.")
