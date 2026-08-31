@@ -53,6 +53,7 @@ import emu/quests
 import emu/hideout
 import emu/trading
 import emu/bots
+import emu/modrarity
 import emu/orbit
 import emu/mail
 import emu/mailcheck
@@ -1681,6 +1682,74 @@ proc onSelfCheck(url, body, session: string): string =
   var o = obj()
   put(o, "ok", gSelfCheckFailures.len == 0)
   put(o, "failures", fails)
+  result = text(done(o))
+
+proc onBotDigest(url, body, session: string): string =
+  ## `/aowlspt/tarkov/botdigest/<role>/<seed>/<n>` -- N loadouts for one role at
+  ## one stated seed, hashed.
+  ##
+  ## THE INSTRUMENT for "defaults reproduce current behaviour exactly". No
+  ## `aowl` verb generated bots at a seed and printed a hash, so that claim was
+  ## previously true by construction, which is an argument and not a
+  ## measurement. This makes it a number two builds can be compared on, and --
+  ## the half that matters -- a number that MOVES when one attachment knob is
+  ## moved. If it did not move, the check could not fail.
+  ##
+  ## Not in the client's envelope: nothing in the client asks for this. Same
+  ## reasoning as `/aowlspt/tarkov/selfcheck`.
+  ##
+  ## `items` is the INCONCLUSIVE detector. A digest over zero items is a stable
+  ## hash of the empty string and would agree with itself across any change; a
+  ## caller must refuse to read a verdict out of a zero.
+  inc gRequests
+  let rest = pathAfter(url, "/aowlspt/tarkov/botdigest/")
+  var parts: seq[string] = @[]
+  var cur = ""
+  for ch in rest:
+    if ch == '/':
+      parts.add cur
+      cur = ""
+    else:
+      cur = cur & ch
+  parts.add cur
+  let role = if parts.len > 0: parts[0] else: ""
+  let seed = if parts.len > 1: parts[1] else: "seed"
+  # Parsed here rather than with `digitsToInt`, which is declared further down
+  # the file and is not in scope yet. Total and non-raising: one non-digit byte
+  # falls back to 8 rather than to a partial number.
+  var n = 8
+  if parts.len > 2 and parts[2].len > 0:
+    var acc = 0
+    var good = true
+    for ch in parts[2]:
+      if ch < '0' or ch > '9':
+        good = false
+      else:
+        acc = acc * 10 + (ord(ch) - ord('0'))
+    if good and acc > 0 and acc <= 64:
+      n = acc
+  var o = obj()
+  put(o, "role", role)
+  put(o, "seed", seed)
+  put(o, "count", n)
+  if role.len == 0 or n <= 0:
+    put(o, "ok", false)
+    put(o, "reason", "usage: /aowlspt/tarkov/botdigest/<role>/<seed>/<n>")
+    return text(done(o))
+  let t = loadTables(role)
+  if not t.ok:
+    put(o, "ok", false)
+    put(o, "reason", "no bots.types entry for role " & role)
+    return text(done(o))
+  var items = 0
+  let d = loadoutDigest(t, seed, n, items)
+  put(o, "ok", items > 0)
+  put(o, "items", items)
+  put(o, "digest", d)
+  put(o, "priceIndex", priceIndexSize())
+  if items == 0:
+    put(o, "reason", "INCONCLUSIVE: generated 0 items; the digest is the " &
+                     "hash of the empty string and cannot distinguish builds")
   result = text(done(o))
 
 proc onAchievementStatistic(url, body, session: string): string =
@@ -4790,6 +4859,10 @@ proc onLoad(): Status =
   # did not when it refused. It is deliberately outside `/client/`, because it
   # is not part of the client's protocol and must never be mistaken for it.
   gSelfCheckFailures = selfFails
+  # The bot-loadout digest instrument. A prefix route because the role, the seed
+  # and the count are in the path; see `onBotDigest`.
+  if servePrefix("/aowlspt/tarkov/botdigest/", onBotDigest) != Ok:
+    warn "no bot digest route on this host: " & lastError()
   if serve("/aowlspt/tarkov/selfcheck", onSelfCheck) != Ok:
     warn "no self-check route on this host: " & lastError()
 

@@ -59,6 +59,7 @@ import bots
 import orbit
 import knobs
 import botgear
+import modrarity
 
 proc failedLines(report, label: string; into: var seq[string]) =
   ## `loot.selfCheck` and `questcond.selfCheck` report one line per check,
@@ -215,12 +216,23 @@ proc selfCheckFailures*(): seq[string] =
   # Three outcomes. Only FAIL is appended, because only FAIL is a defect in
   # this code: INCONCLUSIVE means the pass did not record, which is worth
   # printing but is not grounds to refuse the load.
+  modrarity.selfCheckModRarity(result)
   ledgerBegin()
   discard loot.lootConfig()
+  # Forced, and inside the armed window. The bot config is cached per process,
+  # so a pass that happened to have loaded it earlier would record ZERO bot
+  # reads and the gate would go red for a reason that is not a defect. This is
+  # the same call a batch makes.
+  bots.refreshBotGear()
   var botLedgerScratch: seq[string] = @[]
   discard bots.selfCheckBots(botLedgerScratch)
   var declared = loot.declaredLootKeys()
-  let botKeys = botgear.declaredBotKeys()
+  var botKeys = botgear.declaredBotKeys()
+  # Bound to a local first: nimony cannot iterate the temporary a proc call
+  # returns ("cannot borrow from '`x'").
+  let modKeys = modrarity.declaredModKeys()
+  for k in modKeys:
+    botKeys.add k
   for k in botKeys:
     var seen = false
     for d in declared:

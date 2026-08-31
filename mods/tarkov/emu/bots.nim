@@ -142,6 +142,7 @@ import templates
 import grid
 import knobs
 import botgear
+import modrarity
 
 type
   BotRequest* = object
@@ -255,19 +256,30 @@ proc chanceFor(chances: JsonRef; group, slot: string; fallback: int): int =
 
 var gGear = defaultBotGearConfig()
 var gGearLoaded = false
+var gModRar = defaultModRarityConfig()
 
 proc refreshBotGear*() =
   ## Re-read the Bot gear/loot page. Called once per BATCH -- not once per bot,
   ## which would be 30 config reads on the loading screen for one answer, and
   ## not once per process, which would make an edit take a restart when the
   ## whole point of the page is that it does not.
+  ##
+  ## The attachment page is re-read on the SAME tick and cached in the same
+  ## place, because it is 613 more reads and doing them per bot would put ~12k
+  ## config lookups on a 20-bot loading screen.
   gGear = botGearConfig()
+  gModRar = modRarityConfig()
   gGearLoaded = true
 
 proc botGear(): BotGearConfig =
   if not gGearLoaded:
     refreshBotGear()
   result = gGear
+
+proc modRar(): ModRarityConfig =
+  if not gGearLoaded:
+    refreshBotGear()
+  result = gModRar
 
 proc pickTemplate(pool: JsonRef; r: var Rng): string =
   ## One template id out of a weight map, in proportion to its weight.
@@ -754,6 +766,13 @@ proc addMods(t: BotTables; inv, chances: JsonRef; items: var List;
     return
   let group = if weapon: "weaponMods" else: "equipmentMods"
   let caliber = if weapon: weaponCaliber(rootTpl) else: ""
+  # Bots > Attachments. Read once for this whole mod tree: the config off the
+  # batch cache, and the weapon class off the ROOT template -- an optic bolted
+  # to a mount bolted to a rifle is still a rifle's optic, which is what makes
+  # the per-weapon-class rows mean the thing a player would expect. Equipment
+  # has no `weapClass` and resolves to `wcOtherClass`, its own row.
+  let mr = modRar()
+  let wclass = weaponClassOf(rootTpl)
 
   # A round in the chamber, once, before the mod tree is walked. Costs no mod
   # budget -- it is not a mod, it is the weapon being loaded -- and is skipped
@@ -807,15 +826,25 @@ proc addMods(t: BotTables; inv, chances: JsonRef; items: var List;
         # Bots > Attachments. A multiplier on the TABLE'S OWN chance, so a
         # slot the database never fills stays unfilled and a required slot is
         # untouched (this branch only runs when `required` is false).
+        #
+        # Two factors on one product now: the old global weapon/equipment
+        # slider, and the new slot-group x family x weapon-class number, which
+        # is 1.0 unless a row on the Attachments page was moved. `scalePercent`
+        # still returns its input UNCHANGED at exactly 1.0, so the product
+        # being 1.0 is the same no-arithmetic path it always was.
         let pct = scalePercent(chanceFor(chances, group, slotName, 100),
-                               modMultiplier(botGear(), weapon))
+                               modMultiplier(botGear(), weapon) *
+                               modChanceMultiplier(mr, gFam, slotName, wclass))
         if pct <= 0:
           continue
         if pct < 100 and not chance(r, float(pct) / 100.0):
           continue
       var tpl = ""
       if n > 0:
-        tpl = at(pool, nextInt(r, n)).asText("")
+        # Bots > Attachments > Rarity. With nothing turned on this IS
+        # `at(pool, nextInt(r, n)).asText("")`, by an early return rather than
+        # by arithmetic that happens to agree -- see `pickModTemplate`.
+        tpl = pickModTemplate(mr, pool, n, r, gFam, slotName, wclass)
       if tpl.len == 0 and required:
         # The bot table named no usable pool for a slot the weapon must have.
         # Fit a stock-compatible part from the item's own filter rather than
@@ -1785,6 +1814,82 @@ proc addLoadout(t: BotTables; items: var List; equipmentId: string;
     addContainerLoot(inv, generation, items, c, kind, r, share, richness,
                      fittingMags)
     lootBudget = lootBudget - (had - share)
+
+# ---------------------------------------------------------------------------
+# The instrument: a hash of the FINISHED loadout, at a stated seed
+# ---------------------------------------------------------------------------
+#
+# The claim this exists to settle is "defaults reproduce current behaviour
+# exactly". Before this, that claim was true BY CONSTRUCTION -- every new path
+# early-returns at its default -- and by-construction is an argument, not a
+# measurement. An argument cannot fail, and §9b says a check that cannot fail is
+# the bug.
+#
+# So: generate a loadout at a stated seed, canonicalise it, hash it. Same seed
+# and defaults across two builds must give the same number; moving ONE knob must
+# give a different one. The second half is what proves the first half could have
+# failed.
+#
+# **Ids are stripped, deliberately.** `newId()` counts from a run number that
+# comes out of the store, so the ids in two runs of the same build differ and a
+# digest over them would report a difference every single time -- a check that
+# always fails is as useless as one that always passes. What is hashed is the
+# SHAPE: for each item in emission order, its template, its slot, the ORDINAL of
+# its parent within the same payload, and its stack count. That is exactly the
+# thing the generator decides and the RNG stream governs.
+
+proc canonicalLoadout*(items: List): string =
+  ## The generated loadout as id-free text, one line per item, in emission
+  ## order. Same `text(items)`-once discipline as `auditInternalMags` --
+  ## `raw(items.at(i))` faults on this nimony.
+  let blob = text(items)
+  let doc = whole(blob)
+  let n = count(doc)
+  var ids: seq[string] = @[]
+  for i in 0 ..< n:
+    ids.add at(doc, i).field("_id").asText("")
+  result = ""
+  for i in 0 ..< n:
+    let one = at(doc, i)
+    let parent = one.field("parentId").asText("")
+    var pidx = -1
+    for k in 0 ..< ids.len:
+      if ids[k] == parent:
+        pidx = k
+        break
+    # -1 for the equipment root, whose parent is the bot's own inventory id and
+    # is not itself an item. Not an error and not skipped: it is a real line and
+    # it anchors the ordinals.
+    result = result & $i & "|" & one.field("_tpl").asText("") & "|" &
+             one.field("slotId").asText("") & "|" & $pidx & "|" &
+             $one.field("upd").field("StackObjectsCount").asInt(-1) & "\n"
+
+proc loadoutDigest*(t: BotTables; seed: string; n: int; into: var int): string =
+  ## `n` loadouts for one role at one seed, hashed together.
+  ##
+  ## The RNG is seeded from `seed & ":" & $i` -- an EXPLICIT string, not the
+  ## bot's id -- so the stream is a function of the caller's argument and
+  ## nothing else. `into` comes back with the number of items hashed, which is
+  ## the INCONCLUSIVE detector: a digest over zero items is a stable hash of the
+  ## empty string and would agree with itself forever.
+  into = 0
+  # Forced, not lazy. `botGear()` loads once per process and the caller of this
+  # is a tool flipping one knob between two calls -- a cached config would make
+  # the "one knob changes the hash" half of the proof silently unable to fail.
+  refreshBotGear()
+  var acc = ""
+  for i in 0 ..< n:
+    var r = seededRng(seed & ":" & $i)
+    var items = newList()
+    # A literal equipment root id rather than `newId()`, for the same reason the
+    # ids are stripped: the digest must not move because the store's run number
+    # advanced.
+    items.add botItem("digestequipmentroot0000", "root", "digestowner00000000000", "")
+    addLoadout(t, items, "digestequipmentroot0000", r)
+    let canon = canonicalLoadout(items)
+    into = into + items.len
+    acc = acc & canon
+  result = $hashText(acc)
 
 proc difficultyOf*(role, difficulty: string): string =
   ## `bots.types.<role>.difficulty.<difficulty>`, or `bots.core` when the role
