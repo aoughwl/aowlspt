@@ -2325,6 +2325,42 @@ proc iSceneRoots(into: var seq[Il2CppPtr]; report: bool;
   elif report:
     iOut("  (could not ask $preloader which scene it belongs to; either the " &
          "anchor is null or GameObject::get_scene_Injected did not verify)")
+proc iSceneNamePresent*(needle: string): int32 =
+  ## THREE OUTCOMES, never two (CLAUDE.md 9b):
+  ##    1  a scene SceneManager lists is named exactly `needle`
+  ##    0  SceneManager was successfully enumerated and NO scene matched
+  ##   -1  I COULD NOT LOOK -- a nav entry did not verify, or sceneCount came
+  ##       back at a value that is not credible. "-1" is a refusal and a caller
+  ##       must NOT read it as "absent".
+  ##
+  ## Names ONLY: no root enumeration, no GetRootGameObjects (which allocates).
+  ## This exists so the raid-phase gate can see `SessionEndUIScene` -- the
+  ## post-raid results screen, which is the single scene SceneManager lists at
+  ## that moment -- without paying for `iSceneRoots`.
+  var fnCount: Il2CppPtr = nil
+  var fnAt: Il2CppPtr = nil
+  var rva = 0'u32
+  if not iNavFindQuiet("SceneManager::get_sceneCount", fnCount):
+    return -1'i32
+  if not iNavFindQuiet("SceneManager::GetSceneAt", fnAt):
+    return -1'i32
+  var fnName: Il2CppPtr = nil
+  if not iNavFindQuiet("Scene::GetNameInternal", fnName):
+    return -1'i32
+  discard rva
+  iMark("SceneManager::get_sceneCount", cast[Il2CppPtr](0))
+  let n = int(int32(uint32(cInspUV(fnCount, nil) and 0xFFFFFFFF'u64)))
+  if n < 0 or n > InspMaxScenes:
+    return -1'i32
+  var si = 0
+  while si < n:
+    iMark("SceneManager::GetSceneAt", cast[Il2CppPtr](0))
+    let handle = int32(uint32(cInspUI(fnAt, int32(si), nil) and 0xFFFFFFFF'u64))
+    if iSceneNameOf(handle) == needle:
+      return 1'i32
+    inc si
+  0'i32
+
 proc iCmdRoots(toks: seq[string]) =
   ## `roots` -- every root GameObject of every loaded scene, bound to $r0..$rN.
   ##

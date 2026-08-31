@@ -878,6 +878,45 @@ proc mapsDiagText(): string =
   # from "I have actually spawned into the raid". It is the finished-state gate
   # the draw/publish/art paths all consult; naming it here makes visible WHICH
   # condition opened or closed it.
+  # 2a. THE THREE LIFECYCLE SITUATIONS, separately visible and separately
+  # falsifiable. The `raid` line below reports the mod's OWN gate; this line
+  # reports the host's phase latch, which is what now drives the draw. They are
+  # printed separately on purpose: on 2026-08-30 `raid` read CLOSED while the
+  # map was visibly on the results screen, and one merged line would have hidden
+  # exactly that disagreement.
+  let lPhaseV = hostPhase()
+  var lPhase = ""
+  case lPhaseV
+  of RpNoExport:
+    lPhase = "INCONCLUSIVE  the host does not export `aowl_host_raid_phase` -- " &
+             "it predates this gate, or this is the SERVER side of the mod. The " &
+             "draw falls back to the old world-existence behaviour, so a stale " &
+             "map on the results screen is EXPECTED against this host, not fixed."
+  of RpUnknown:
+    lPhase = "INCONCLUSIVE  the host looked and could not tell: either nothing " &
+             "is armed to populate the GameWorld cache (set host flag debugEsp " &
+             "or botDiag) or its guarded tick faulted. The draw is NOT blanked " &
+             "on this -- 'I could not look' must not black out a live raid."
+  of RpLoading:
+    lPhase = "PASS (a) SCENE LOADING -- a GameWorld exists because bots are " &
+             "registering, but the player is NOT deployed (Camera.main null, or " &
+             "MainPlayer absent from AllAlivePlayersList). The mirror is being " &
+             "committed EMPTY, so the widget and the overlay are dark."
+  of RpDeployed:
+    lPhase = "PASS (b) DEPLOYED -- the host latched on a positive deploy " &
+             "observation and holds through the MainPlayer null flicker. The " &
+             "mirror is being committed with a live centre; overlays draw."
+  of RpResults:
+    lPhase = "PASS (c) RESULTS SCREEN -- SceneManager lists SessionEndUIScene " &
+             "and/or Camera.main is null while the GameWorld cache is STILL " &
+             "non-null. The mirror is being committed EMPTY, so the held frame " &
+             "is dropped and nothing draws over the results."
+  of RpMenu:
+    lPhase = "PASS  MENU -- no GameWorld cached; the mirror is committed empty."
+  else:
+    lPhase = "FAIL  the host returned phase=" & $lPhaseV & ", which is not one " &
+             "of the values raidphase.nim defines. Do not trust the gate."
+
   var lRaid = ""
   if diagActive:
     lRaid = "PASS  gate OPEN -- the local player is in the live " &
@@ -1204,6 +1243,7 @@ proc mapsDiagText(): string =
            "  reconcile    : " & lRecon & "\n" &
            "  region       : " & lRegion & "\n" &
            "  world        : " & lWorld  & "\n" &
+           "  phase        : " & hostPhaseName(lPhaseV) & "  " & lPhase & "\n" &
            "  raid         : " & lRaid   & "\n" &
            "  positions    : " & lPos    & "\n" &
            "  toggle       : " & lToggle & "\n" &

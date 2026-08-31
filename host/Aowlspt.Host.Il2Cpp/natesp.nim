@@ -227,10 +227,16 @@ proc neCamera(): Il2CppPtr =
 
 proc neRaidGate(sw, sh: var float64): int32 =
   ## NeRNone when every readable precondition holds; otherwise the reason.
-  let gw = gDuGameWorld
-  if not duOk(gw, cBdOffMainPlayer() + 8'i32): return NeRNoGameWorld
-  let you = cReadPtrAt(gw, cBdOffMainPlayer())
-  if not duOk(you, 0x20'i32) or not bdSanePtr(you): return NeRNoGameWorld
+  # THE LIFECYCLE GATE. It used to be "GameWorld cached AND MainPlayer
+  # readable", and that is true from the moment the FIRST BOT registers during
+  # scene load -- about two minutes before the player deploys -- and stays true
+  # on the post-raid results screen, so the boxes armed on the loading screen
+  # and drew over the results. `rpDeployed` is the shared predicate: it adds
+  # Unity LIVENESS on MainPlayer (fake null is readable), membership of the
+  # live AllAlivePlayersList, and the `SessionEndUIScene` results-screen
+  # signal, and it answers UNKNOWN -- which is FALSE here -- rather than
+  # guessing. See raidphase.nim for what it does and does NOT prove.
+  if not rpDeployed(): return NeRNoGameWorld
   if neCamera() == nil: return NeRNoCamera
   if not duCanvasSize(sw, sh): return NeRNoScreen
   NeRNone
@@ -690,6 +696,12 @@ proc natEspDrainTick() =
     var sh = 0.0
     discard duCanvasSize(sw, sh)
     okLog neVerdictLine(sw, sh)
+    # The lifecycle gate, stated separately and never folded into the verdict:
+    # "no boxes" because the player has not deployed is a different fact from
+    # "no boxes" because the placement failed, and one line that says both is
+    # a line that cannot fail.
+    okLog "natesp: raid phase = " & rpPhaseName(rpPhase()) & " -- " & rpWhy() &
+          "  [" & rpSignals() & "]"
 
 proc bindNativeEsp*(verbose: bool) =
   ## Reports readiness once. Installs NO detour and resolves NO address of its
