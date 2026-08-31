@@ -106,6 +106,18 @@ PROCS = ["EscapeFromTarkov", "aowlspt-backend", "aowlspt-launch"]
 WANT_SUFFIXES = ("application_000.log", "output_000.log", "backend_000.log",
                  "errors_000.log")
 
+# `errors_000.log` is the client's OWN error channel. Anything the client itself
+# decided was an error is in there and nothing else is -- so the reporting rule
+# for this file is UNCONDITIONAL: every `|Error|` (or worse) header is reported
+# with its stack, and `classify` only supplies a LABEL. Classification must never
+# be the thing that decides whether to report; that inversion is exactly what let
+# two real 2026-08-31 errors pass a watcher that was provably running.
+ALWAYS_SUFFIXES = ("errors_000.log",)
+ALWAYS_LEVELS = ("Error", "Fatal", "Critical", "Exception")
+
+# How many floor-level records the BENIGN allowlist swallowed. Reported, always.
+_benign_suppressed = 0
+
 # Header line: "TS|version|Level|channel|source|message". Level is field [2].
 TS = re.compile(r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d+\|")
 EXTYPE = re.compile(r"([A-Za-z][\w.`+]*(?:Exception|Error))\b")
@@ -144,6 +156,10 @@ BENIGN = [
     re.compile(r"Non-convex MeshCollider with non-kinematic Rigidbody"),
     re.compile(r"The referenced script.*is missing"),
     re.compile(r"Failed prewarm shot delegate"),
+    # Stock rigging noise: the client logs a missing attachment bone at Error for
+    # every helmet/rig prefab it pools. 60+ per raid load on a healthy session
+    # (measured across log_2026.08.27_12-25-52), and the raid loads fine.
+    re.compile(r"bone \w+ not found in GameObject"),
 ]
 
 
@@ -175,7 +191,17 @@ def is_benign(text):
 
 # Unity's own logging helpers end in "Error"/"Exception" but are not the thrown
 # type; don't let them win the "what threw" label over a real *Exception.
-_NOISE_TYPES = ("LogError", "LogException", "LogWarning")
+# Bare "Error"/"Exception" match EXTYPE out of ordinary prose -- "Error while
+# starting matching: ..." yielded the label "Error", which names nothing. Drop
+# them so the fallback below uses the MESSAGE, which does.
+_NOISE_TYPES = ("LogError", "LogException", "LogWarning", "Error", "Exception")
+
+
+def _head_message(record):
+    """The message field of a record's header line, for use as a label."""
+    first = next((l for l in record.split("\n") if l.strip()), "")
+    parts = first.split("|")
+    return ("|".join(parts[4:]).strip() if len(parts) > 4 else first.strip())
 
 
 def best_type(record):
@@ -245,7 +271,8 @@ def classify(record, level):
     if level in ("Error", "Fatal", "Critical"):
         t = best_type(record)
         if t or STACKISH.search(record):
-            return ("unhandled-exception", t or (level or "error"))
+            return ("unhandled-exception",
+                    t or _head_message(record)[:160] or (level or "error"))
 
     return None
 
@@ -257,8 +284,11 @@ class Tailer:
     a small ring of recent raw lines for the report's context window.
     """
 
-    def __init__(self, path, from_start=False, ring=48):
+    def __init__(self, path, from_start=False, ring=48, always=False):
         self.path = path
+        # `always`: this file is the client's own error channel, so every
+        # Error-level record is reported regardless of what `classify` says.
+        self.always = always
         self.leftover = ""
         self.rec = []          # current record: header + continuations
         self.rec_level = ""
@@ -274,6 +304,21 @@ class Tailer:
         text = "\n".join(self.rec)
         level, out = self.rec_level, None
         sig = classify(text, level)
+        if (not sig and self.always and level in ALWAYS_LEVELS
+                and is_benign(text)):
+            # The ONE thing allowed to suppress a floor report: the explicit,
+            # reviewed BENIGN allowlist. It is counted, not silent -- the count
+            # is printed at the end of every replay and every watch, so a
+            # too-greedy allowlist is visible instead of being the new blind spot.
+            global _benign_suppressed
+            _benign_suppressed += 1
+        elif not sig and self.always and level in ALWAYS_LEVELS:
+            # The floor. `classify` declined -- benign-listed, no exception type,
+            # no recognised stack shape -- but the CLIENT logged it to its own
+            # error channel, so it is reported anyway, with a label that says the
+            # classifier had nothing to add. It is NOKILL precisely because the
+            # classifier could not vouch for it: report, never intervene.
+            sig = ("client-error", _head_message(text)[:200] or level)
         if sig:
             out = (sig, text)
         self.rec = []
@@ -383,7 +428,11 @@ def kill_game(dry_run):
 # dialog and the session survives; killing the game on one would destroy both
 # the player's session and the evidence on screen. The point of catching these
 # is to WRITE THEM DOWN, not to intervene.
-NOKILL = frozenset(["served-payload-shape"])
+# `client-error` joins it for a different reason: it is the FLOOR signature, the
+# one raised when the classifier had nothing to say about a line the client
+# nonetheless logged as an error. Reporting it is free; killing the game on a
+# record nothing vouched for is how a watcher earns being turned off.
+NOKILL = frozenset(["served-payload-shape", "client-error"])
 
 # Where a finding is written so it survives the session. Deliberately NOT the
 # host log: the backend holds `aowlspt-host.log` open and a second writer
@@ -430,7 +479,22 @@ def emit(s=""):
             pass
 
 
-def report(signature, detail, record, log_path, tail, action):
+# The client mirrors its error channel: the SAME exception lands in both
+# errors_000.log and output_000.log, so tailing both reported each of the
+# 2026-08-31 errors twice. Dedup on (signature, header message) -- NOT on the
+# whole record, whose stack depth differs between the two copies. Deliberately
+# per-run and unbounded-in-time: a repeat of the same error later in a session
+# is genuinely the same finding, and suppressing the echo is what makes the
+# report readable enough to keep reading.
+_seen = set()
+
+
+def report(signature, detail, record, log_path, tail, action, dedup=True):
+    if dedup:
+        key = (signature, _head_message(record)[:200])
+        if key in _seen:
+            return False
+        _seen.add(key)
     line = "=" * 68
     # The one line meant to be SEEN, first, at error level so nothing that
     # filters on change or on level can suppress it.
@@ -462,9 +526,13 @@ def report(signature, detail, record, log_path, tail, action):
         emit(" exception : %s" % msg.strip()[:400])
     stack = [l.strip() for l in reclines[1:] if l.strip()][:6]
     if stack:
-        print(" stack     :")
+        # To the SINK too. An error without its stack is a rumour: the frames are
+        # what say WHERE it came from (SingleOrDefault / IsLeaving named the
+        # duplicate-profile cause on 2026-08-31), and the sink is the only copy
+        # that outlives the terminal.
+        emit(" stack     :")
         for s in stack:
-            print("   %s" % s[:160])
+            emit("   %s" % s[:160])
 
     print(" last %2d   :" % len(tail))
     for l in tail:
@@ -473,14 +541,40 @@ def report(signature, detail, record, log_path, tail, action):
     print(" action    : %s" % action)
     print(line + "\n")
     sys.stdout.flush()
+    return True
 
 
 def build_tailers(logdir, from_start):
     files = resolve_files(logdir)
     if not files:
         return None, {}
-    tailers = {suf: Tailer(p, from_start=from_start) for suf, p in files.items()}
+    tailers = {suf: Tailer(p, from_start=from_start,
+                           always=suf in ALWAYS_SUFFIXES)
+               for suf, p in files.items()}
     return files, tailers
+
+
+def adopt_new_files(logdir, tailers):
+    """Pick up wanted logs that did not EXIST when the dir was first scanned.
+
+    THIS IS THE 2026-08-31 BUG. `errors_000.log` is not created with the session
+    dir -- MEASURED birth times in log_2026.08.31_17-17-05: output_000.log at
+    17:17:05.09 (with the dir), errors_000.log at 17:17:39.174, which is the
+    instant of the first error, 34s later. The old loop re-scanned only under
+    `elif not tailers:` -- and `tailers` was never empty, because the other three
+    files were already there -- so the error channel was never opened for the
+    whole life of the session and both of that day's errors were invisible.
+
+    A newly appeared file is tailed FROM THE START unconditionally: everything in
+    it was written after we began watching, so none of it is stale.
+    """
+    added = []
+    for suf, path in resolve_files(logdir).items():
+        if suf not in tailers:
+            tailers[suf] = Tailer(path, from_start=True,
+                                  always=suf in ALWAYS_SUFFIXES)
+            added.append(suf)
+    return added
 
 
 def replay(args):
@@ -511,10 +605,11 @@ def replay(args):
                 else:
                     break
             for sig, detail, text in got:
-                n += 1
-                report(sig, detail, text, t.path, t.tail_lines(6),
-                       "REPLAY: nothing was killed")
-    print("crashwatch: replay found %d finding(s)" % n)
+                if report(sig, detail, text, t.path, t.tail_lines(6),
+                          "REPLAY: nothing was killed"):
+                    n += 1
+    print("crashwatch: replay found %d finding(s); %d benign-allowlisted "
+          "error record(s) suppressed" % (n, _benign_suppressed))
     return 0 if n else 3
 
 
@@ -575,6 +670,10 @@ def run(args):
 
         if hit:
             sig, detail, text, t = hit
+            # Ask the deduper FIRST. A mirrored echo of an error we already acted
+            # on must not trigger a second kill.
+            if (sig, _head_message(text)[:200]) in _seen:
+                continue
             if sig in NOKILL:
                 action = ("left the game RUNNING on purpose: a payload-shape "
                           "error raises a dialog the session survives, and "
@@ -590,9 +689,20 @@ def run(args):
                 return 1
             # In --watch, keep going; a relaunch makes a new dir we pick up below.
 
-        # In --watch mode, notice a newer session dir (a relaunch) and switch.
-        if args.watch and now - last_dir_check > 5.0:
+        # Rescan the CURRENT dir every tick -- in one-shot mode too, because a
+        # log we care about may not exist yet (see adopt_new_files). This used to
+        # be gated on `not tailers` and therefore never ran.
+        tick = now - last_dir_check > 5.0
+        if tick:
             last_dir_check = now
+        if tick and cur_dir:
+            added = adopt_new_files(cur_dir, tailers)
+            for suf in added:
+                print("crashwatch: %s appeared, now tailing it from the start"
+                      % suf)
+
+        # In --watch mode, notice a newer session dir (a relaunch) and switch.
+        if args.watch and tick:
             nd = newest_log_dir(logs_root)
             if nd and nd != cur_dir:
                 print("crashwatch: newer session dir, switching -> %s" % nd)
@@ -640,6 +750,21 @@ SELFTEST = [
     ("an ordinary Error LOG MESSAGE is not a crash",
      "2026-08-31 12:00:00.000|1.1.0|Error|output|x|generate profile with "
      "same id", "Error", None),
+    # The two MISSED live errors of 2026-08-31, lifted verbatim. Both classify
+    # here and always did -- they were missed because errors_000.log was never
+    # opened, not because of the classifier. These cases guard the classifier
+    # half; the replay over the two run dirs guards the discovery half.
+    ("17:17:39 duplicate-profile crash (log_2026.08.31_17-17-05)",
+     "2026-08-31 17:17:39.174|1.1.0.1.46777|Error|errors|"
+     "InvalidOperationException: Sequence contains more than one matching "
+     "element\nSystem.Linq.Enumerable.SingleOrDefault[TSource] (...)\n"
+     "EFT.TarkovApplication.IsLeaving (...)", "Error", "unhandled-exception"),
+    ("17:21:21 matching NRE (log_2026.08.31_17-20-40)",
+     "2026-08-31 17:21:21.055|1.1.0.1.46777|Error|errors|Error while starting "
+     "matching: Object reference not set to an instance of an object.\n"
+     "UnityEngine.Debug:LogError(Object)\nEFT.<Ready>d__40:MoveNext()\n"
+     "EFT.MatchmakerOperation:OnReadyPressed()", "Error",
+     "unhandled-exception"),
 ]
 
 
