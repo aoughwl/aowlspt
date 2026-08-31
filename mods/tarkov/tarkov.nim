@@ -4283,6 +4283,74 @@ proc onTarkovSettings(url, body, session: string): string =
 proc onItemsCapability(request: string): CapReply =
   if not strictObject(request):
     return capFail("the aowl.items request is not a JSON object")
+
+  # `op: "inventory"` and `op: "count"` are answered BEFORE the query check,
+  # because neither takes a query. Putting them below it would make "show me my
+  # stash" fail with "aowl.items needs a query", which is a refusal that
+  # describes the wrong thing.
+  let op0 = field(request, "op").asText("")
+
+  if op0 == "inventory" or op0 == "count":
+    var pid0 = field(request, "profileId").asText("")
+    if pid0.len == 0:
+      pid0 = spawnProfileId(field(request, "session").asText(""))
+    if pid0.len == 0:
+      let all = allProfileIds()
+      if all.len == 0:
+        return capFail("there is no profile yet; log in first")
+      return capFail("there are " & $all.len & " profiles and the request " &
+                     "named none; pass \"profileId\", or log in")
+
+    if op0 == "count":
+      # THE MINT READBACK, exposed. It reports READABILITY separately from the
+      # number and this handler keeps them separate: a profile that could not
+      # be opened must not come back as "you have 0", which a caller comparing
+      # a before and an after would read as a failed spawn rather than as a
+      # check that could not run.
+      let tplWanted = field(request, "tpl").asText("")
+      if tplWanted.len == 0:
+        return capFail("aowl.items op=count needs a \"tpl\"")
+      let cr = templateCount(pid0, tplWanted)
+      var oc = obj()
+      put(oc, "spawned", 0)
+      put(oc, "tpl", tplWanted)
+      put(oc, "readable", cr.readable)
+      put(oc, "count", cr.count)
+      put(oc, "message", (if cr.readable:
+                            "the profile holds " & $cr.count & " x " & tplWanted
+                          else:
+                            "COULD NOT LOOK: " & cr.why))
+      return capOk(done(oc).text)
+
+    var limI = field(request, "limit").asInt(32)
+    if limI < 1: limI = 1
+    if limI > 64: limI = 64
+    var distinct0 = 0
+    let rowsInv = stashRows(pid0, limI, distinct0)
+    var rawRows = "["
+    for i in 0 ..< rowsInv.len:
+      if i > 0: rawRows.add ","
+      var r = obj()
+      put(r, "tpl", rowsInv[i].tpl)
+      put(r, "name", rowsInv[i].name)
+      put(r, "count", rowsInv[i].count)
+      rawRows.add done(r).text
+    rawRows.add "]"
+    var oi = obj()
+    put(oi, "spawned", 0)
+    put(oi, "profileId", pid0)
+    put(oi, "total", distinct0)         # distinct templates in the stash
+    put(oi, "returned", rowsInv.len)
+    put(oi, "rows", raw(rawRows))
+    # `total == 0` is an ANSWER (an empty stash) and is reported as one. It is
+    # NOT distinguishable here from a profile whose item list would not parse,
+    # which `stashRows` returns empty for -- so the message says "reads as",
+    # not "is". The `count` op above is the one that separates those.
+    put(oi, "message", $rowsInv.len & " of " & $distinct0 &
+                       " distinct template(s) read back from the stash of " &
+                       pid0)
+    return capOk(done(oi).text)
+
   let query = field(request, "query").asText("")
   if query.len == 0:
     return capFail("aowl.items needs a \"query\": part of an item name, or a " &
@@ -4315,6 +4383,47 @@ proc onItemsCapability(request: string): CapReply =
     # the database genuinely has no such item. Saying so plainly is the whole
     # point, so it is `capOk` with a message, not `capFail`.
     put(o, "message", searchSummary(query, 10))
+    return capOk(done(o).text)
+
+  # `op: "list"` -- the same search, as ROWS instead of a sentence.
+  #
+  # WHY BOTH EXIST. `op:"search"` renders one line because the F6 overlay has
+  # one line to show. The native inventory screen has a COLUMN, and formatting a
+  # sentence only to split it apart again would make the row boundaries depend
+  # on the separator characters inside an item name -- "5.45x39mm BS gs" has a
+  # semicolon nowhere but nothing stops the locale from carrying one. So the
+  # rows cross the wire as rows. `searchSummary` is untouched and still the only
+  # renderer of the one-line form; this is not a second formatter of the same
+  # thing, it is the unformatted thing.
+  #
+  # `limit` is the caller's page size, clamped: the shared region that carries
+  # these has a fixed 64-row table and asking for more than fits would produce a
+  # silent truncation on the far side instead of an honest `matched` count here.
+  if field(request, "op").asText("") == "list":
+    var lim = field(request, "limit").asInt(32)
+    if lim < 1: lim = 1
+    if lim > 64: lim = 64
+    var matched = 0
+    let hits = searchItemsCounted(query, lim, matched)
+    var rows = "["
+    for i in 0 ..< hits.len:
+      if i > 0: rows.add ","
+      var r = obj()
+      put(r, "tpl", hits[i].tpl)
+      put(r, "name", (if hits[i].name.len > 0: hits[i].name else: hits[i].tpl))
+      rows.add done(r).text
+    rows.add "]"
+    var o = obj()
+    put(o, "spawned", 0)
+    put(o, "query", query)
+    put(o, "matched", matched)          # how many REALLY matched
+    put(o, "returned", hits.len)        # how many are in `rows`
+    put(o, "rows", raw(rows))
+    put(o, "message", (if matched == 0:
+                         "no item matches \"" & query & "\""
+                       else:
+                         $hits.len & " of " & $matched & " match \"" &
+                         query & "\""))
     return capOk(done(o).text)
 
   # Mid-raid, refuse before doing any work -- but only a SPAWN, which is why
