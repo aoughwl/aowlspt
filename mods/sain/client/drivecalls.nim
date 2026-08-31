@@ -98,6 +98,30 @@ const
   BoMedecineOffset* = 0x2c8'i32
   BoMoverOffset* = 0x3d0'i32
 
+  # --- THE TEARDOWN GATE. Measured 2026-08-31 with `tools/fldoff.py` against
+  # the decrypted metadata, not inferred:
+  #
+  #   UnityEngine.Object.m_CachedPtr            IntPtr     @0x10
+  #   EFT.BotOwner._botState                    EBotState  @0x30
+  #   EFT.BotOwner.<IsDead>k__BackingField      bool       @0x431
+  #   EFT.EBotState: NonActive=0 PreActive=1 Active=2 ActiveFail=3 Disposed=4
+  #
+  # Why these four exist at all: `bridge.runDrives` claimed "a dead bot's handle
+  # answers null", and that is a CHECK THAT CANNOT FAIL (CLAUDE.md 9b). We hold
+  # a STRONG il2cpp GC handle on the Player, so the managed object cannot be
+  # collected and `gc_handle_get_target` answers non-null for the whole raid --
+  # including long after `BotOwner.Dispose(withNulls:true)` has run. Readability
+  # is not liveness; a strong handle guarantees readability forever.
+  #
+  # `m_CachedPtr == 0` IS Unity's own destroyed-object marker (the "fake null"
+  # every `== null` operator in C# tests), so it is the one signal that is not
+  # our invention. `_botState` is the game's own teardown state machine, and the
+  # aiErrors line the user hit reads `state:Disposed` verbatim.
+  UoCachedPtrOffset* = 0x10'i32
+  BoBotStateOffset* = 0x30'i32
+  BoIsDeadOffset* = 0x431'i32
+  EBotStateActive* = 2'i32
+
   NavMeshHitBytes* = 36'i32
     ## MEASURED, not inferred. `Il2CppMetadataRegistration.typeDefinitionsSizes`
     ## entry for `UnityEngine.AI.NavMeshHit` reads
@@ -330,6 +354,102 @@ proc componentAt(owner: Il2CppPtr; off: int32; what: string): Il2CppPtr =
                        target: "EFT.BotOwner." & what, offset: off,
                        kind: fkPtr, bindNs: 0'i64)
   result = readPtr(f, owner)
+
+# ---------------------------------------------------------------------------
+# The teardown gate -- re-validated at CALL time, never at enumeration time
+# ---------------------------------------------------------------------------
+
+var gRefusedDestroyed = 0
+var gRefusedDisposed = 0
+var gRefusedDead = 0
+var gDriveAdmitted = 0
+
+proc drivesRefusedDestroyed*(): int = gRefusedDestroyed
+proc drivesRefusedDisposed*(): int = gRefusedDisposed
+proc drivesRefusedDead*(): int = gRefusedDead
+proc drivesAdmitted*(): int = gDriveAdmitted
+
+proc resetDriveGateCounters*() =
+  gRefusedDestroyed = 0
+  gRefusedDisposed = 0
+  gRefusedDead = 0
+  gDriveAdmitted = 0
+
+proc unityAlive*(obj: Il2CppPtr): bool =
+  ## Unity's own destroyed test, done the way C#'s `== null` operator does it:
+  ## a managed `UnityEngine.Object` whose `m_CachedPtr` is zero has had its
+  ## native half destroyed. It stays perfectly readable -- that is the entire
+  ## trap -- and the next internal call through it throws
+  ## `NullReferenceException` inside the engine, which is the exception the
+  ## client's `errors_000.log` reported and which surfaced at
+  ## `BotBoss.Dispose`.
+  result = false
+  if obj == nil: return
+  var f = FieldBinding(ok: true, why: "UnityEngine.Object.m_CachedPtr@0x10",
+                       target: "UnityEngine.Object.m_CachedPtr",
+                       offset: UoCachedPtrOffset, kind: fkPtr, bindNs: 0'i64)
+  result = readPtr(f, obj) != nil
+
+proc botState*(owner: Il2CppPtr): int32 =
+  ## `EFT.BotOwner._botState` @0x30. -1 when it could not be read at all, which
+  ## is the THIRD outcome and must not be flattened into "not Active".
+  result = -1'i32
+  if owner == nil: return
+  var f = FieldBinding(ok: true, why: "EFT.BotOwner._botState@0x30",
+                       target: "EFT.BotOwner._botState",
+                       offset: BoBotStateOffset, kind: fkI32, bindNs: 0'i64)
+  result = readInt32(f, owner)
+
+proc botIsDead*(owner: Il2CppPtr): bool =
+  if owner == nil: return true
+  var f = FieldBinding(ok: true, why: "EFT.BotOwner.<IsDead>@0x431",
+                       target: "EFT.BotOwner.IsDead",
+                       offset: BoIsDeadOffset, kind: fkBool, bindNs: 0'i64)
+  result = readBool(f, owner)
+
+proc drivable*(player: Il2CppPtr; owner: Il2CppPtr; why: var string): bool =
+  ## THE one gate every driving call passes, evaluated on the thread and at the
+  ## moment of the call rather than when the bot was enumerated.
+  ##
+  ## It is written so that it CAN fail, and each way it can fail is counted
+  ## separately, because "drives refused" as one number cannot tell a raid that
+  ## is ending from a bot that never existed.
+  ##
+  ## Order matters: the Player's native half is checked before the BotOwner is
+  ## touched at all, so a destroyed Player never becomes a field read on a
+  ## component the game has already nulled.
+  result = false
+  why = ""
+  if player == nil:
+    why = "player null"
+    return
+  if not unityAlive(player):
+    why = "player DESTROYED (m_CachedPtr==0)"
+    inc gRefusedDestroyed
+    return
+  if owner == nil:
+    why = "owner null"
+    inc gRefusedDisposed
+    return
+  if not unityAlive(owner):
+    why = "BotOwner DESTROYED (m_CachedPtr==0)"
+    inc gRefusedDestroyed
+    return
+  let s = botState(owner)
+  if s != EBotStateActive:
+    # 4 is Disposed, 3 ActiveFail, 0 NonActive, 1 PreActive, -1 unreadable.
+    # Every one of them is a refusal: only Active is a bot the game is willing
+    # to be driven through.
+    why = "BotOwner._botState=" & $s & " (Active=2 required)"
+    inc gRefusedDisposed
+    return
+  if botIsDead(owner):
+    why = "BotOwner.IsDead"
+    inc gRefusedDead
+    return
+  inc gDriveAdmitted
+  why = "Active"
+  result = true
 
 proc moverOf*(owner: Il2CppPtr): Il2CppPtr =
   componentAt(owner, BoMoverOffset, "<Mover>k__BackingField@0x3d0")
