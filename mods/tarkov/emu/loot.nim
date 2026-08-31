@@ -195,6 +195,17 @@ proc parseKvList*(s: string): KvList =
     result.keys.add k
     result.vals.add v
 
+proc setKv(kv: var KvList; key: string; v: float) =
+  ## Set or replace one pair. Replace, not append: `lookup` returns the FIRST
+  ## match, so appending a second entry for the same id would silently keep the
+  ## old value -- an override that overrides nothing.
+  for i in 0 ..< kv.keys.len:
+    if kv.keys[i] == key:
+      kv.vals[i] = v
+      return
+  kv.keys.add key
+  kv.vals.add v
+
 proc lookup*(kv: KvList; key: string; dflt: float): float =
   for i in 0 ..< kv.keys.len:
     if kv.keys[i] == key:
@@ -259,6 +270,49 @@ proc defaultLootConfig*(): LootConfig =
 proc clampLow(v: float; lo: float): float =
   if v < lo: lo else: v
 
+const
+  ## THE NAMED CATEGORY SLIDERS -- the settings key on the Loot page paired with
+  ## the base-class template id it multiplies.
+  ##
+  ## These five ids are the SPT-community-known base classes; they were NOT
+  ## verified against this install's database here, which is exactly what they
+  ## were already documented as on the free-text row this replaces. Nothing was
+  ## invented: this table is the same five ids, moved out of a description and
+  ## into sliders, so nobody has to paste a 24-character id to make loot commoner.
+  ##
+  ## The check that this is not decorative is not a count of the sliders --
+  ## that would agree with itself. It is `lootConfigSummary`, which reports how
+  ## many pool entries the weights ACTUALLY touched, and the server log line it
+  ## already emits when the answer is zero.
+  CategoryWeightKeys*: array[5, string] = [
+    "lootWeightMoney", "lootWeightAmmo", "lootWeightMeds",
+    "lootWeightKeys", "lootWeightBarter"]
+  CategoryWeightIds*: array[5, string] = [
+    "543be5dd4bdc2deb348b4569",   # money
+    "5485a8684bdc2da71d8b4567",   # ammo
+    "543be5664bdc2dd4348b4569",   # meds
+    "543be5e94bdc2df1348b4568",   # keys
+    "5448eb774bdc2d0a728b4567"]   # barter
+
+proc categoryWeightsFromSettings(): KvList =
+  ## The five named sliders, then `lootCategoryWeights` ON TOP.
+  ##
+  ## Ordering is the whole design. A slider left at 1.0 contributes NOTHING --
+  ## not an entry worth 1.0 -- so `shapesPool`/`needsPrices` still skip the
+  ## shaping code entirely at defaults, and the RNG stream is unchanged for
+  ## anyone who never opens the page. The free-text row is applied last and
+  ## REPLACES rather than appends, so a hand-written `543be5dd...=0` beats the
+  ## Money slider instead of losing to it silently: two controls that disagree
+  ## must have a stated winner, and the advanced one wins.
+  result = newKvList()
+  for i in 0 ..< CategoryWeightKeys.len:
+    let w = setting(CategoryWeightKeys[i]).asFloat(1.0)
+    if w != 1.0:
+      setKv(result, CategoryWeightIds[i], (if w < 0.0: 0.0 else: w))
+  let extra = parseKvList(setting("lootCategoryWeights").asText(""))
+  for i in 0 ..< extra.keys.len:
+    setKv(result, extra.keys[i], extra.vals[i])
+
 proc lootConfig*(): LootConfig =
   ## Read from the mod's `config.json`. Every key is optional and every default
   ## is the pre-existing behaviour, so a config file that predates this module
@@ -290,7 +344,7 @@ proc lootConfig*(): LootConfig =
   result.rarityCommon = setting("lootRarityCommon").asFloat(1.0)
   result.rarityRare = setting("lootRarityRare").asFloat(1.0)
   result.raritySuperrare = setting("lootRaritySuperrare").asFloat(1.0)
-  result.categoryWeights = parseKvList(setting("lootCategoryWeights").asText(""))
+  result.categoryWeights = categoryWeightsFromSettings()
 
   result.stackRandomRange = setting("lootStackRandomRange").asBool(false)
   result.stackMultiplier = setting("lootStackMultiplier").asFloat(1.0)

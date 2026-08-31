@@ -93,6 +93,27 @@ type
     subcategory*: string  ## an optional second level INSIDE `category`
     optionLabels*: seq[string] ## display names parallel to `options`, or empty
     optionsUrl*: string   ## for stSelect: a route serving choices on demand
+    colorFormat*: string  ## for stColor ONLY: the ON-DISK TEXT SHAPE the owning
+                          ## mod's own parser reads back. `""`/`"rgb"` is the
+                          ## default `"r,g,b[,a]"` in 0..1; `"hex"` is bare
+                          ## `RRGGBB[AA]`; `"hex#"` is `#RRGGBB[AA]`.
+                          ##
+                          ## This exists because the picker is SHARED and the
+                          ## parsers are not. `mods/maps` reads its contact
+                          ## colours with `parseRgb`, which requires EXACTLY six
+                          ## hex digits and returns the DEFAULT on anything else
+                          ## -- so a picker that wrote `"0.9,0.27,0.24"` into
+                          ## `colorBot` would leave the dot on screen at its old
+                          ## colour while config.json held the new one. That is
+                          ## the "control that moves and changes nothing"
+                          ## failure, and it is unrepresentable now: the row
+                          ## declares the shape its own reader parses, and the
+                          ## widget writes that shape.
+                          ##
+                          ## A renderer that has never heard of this field falls
+                          ## back to `"rgb"`, which is what every existing colour
+                          ## row already uses, so nothing can regress by adding
+                          ## it.
     description*: string  ## one sentence of help
     implemented*: bool    ## false → drawn greyed with the reason in `description`
     appliesOn*: string    ## when an edit takes effect: `"live"` (default) or
@@ -184,7 +205,8 @@ proc keybindSetting*(key, label: string; default: string;
 
 proc colorSetting*(key, label: string; default: string;
                    category = ""; subcategory = ""; description = "";
-                   implemented = true; appliesOn = "live"): Setting =
+                   implemented = true; appliesOn = "live";
+                   format = "rgb"): Setting =
   ## A colour row. `default` is `"r,g,b"` or `"r,g,b,a"`, components in 0..1 --
   ## the exact text the host's `duParseRgb` already reads out of
   ## `aowlspt-debugui.json`, so switching an existing `stringSetting` colour key
@@ -196,11 +218,20 @@ proc colorSetting*(key, label: string; default: string;
   ## up drift -- `0.62` becoming `0.6200000000000001` on every save -- and drift
   ## in a value the user typed is indistinguishable, from the outside, from the
   ## setting not persisting.
+  ##
+  ## `format` names the TEXT SHAPE the owning mod's own reader parses -- see
+  ## `Setting.colorFormat`. Leave it alone unless the mod already parses hex;
+  ## `"hex"`/`"hex#"` exist so an EXISTING hex key can be upgraded from a bare
+  ## text box to this picker without touching a byte of what is on disk.
+  var fmt = format
+  if fmt != "hex" and fmt != "hex#":
+    fmt = "rgb"
   result = Setting(key: key, label: label, kind: stColor,
                    defaultJson: "\"" & server.escapeText(default) & "\"",
                    lo: 0.0, hi: 0.0, step: 0.0, hasRange: false,
                    options: @[], category: category, subcategory: subcategory,
-                   optionLabels: @[], optionsUrl: "", description: description,
+                   optionLabels: @[], optionsUrl: "", colorFormat: fmt,
+                   description: description,
                    implemented: implemented, appliesOn: appliesOn)
 
 proc selectSetting*(key, label: string; default: string; options: seq[string];
@@ -314,6 +345,12 @@ proc toJson*(s: Setting): JsonObject =
       la.add lb
     o.put("optionLabels", la)
   if s.optionsUrl.len > 0: o.put("optionsUrl", s.optionsUrl)
+  # Emitted for EVERY colour row, never conditionally on it being non-default:
+  # a renderer must be able to tell "this row wants r,g,b" from "this row said
+  # nothing", and once one colour row carries a format an absent field on the
+  # next one reads as an omission rather than as a choice.
+  if s.kind == stColor:
+    o.put("colorFormat", (if s.colorFormat.len > 0: s.colorFormat else: "rgb"))
   if s.subcategory.len > 0: o.put("subcategory", s.subcategory)
   if s.category.len > 0:  o.put("category", s.category)
   # The same grouping as an explicit, ordered path -- see `settingPath`. Always

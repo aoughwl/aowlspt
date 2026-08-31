@@ -194,6 +194,18 @@ proc debugSchema(): seq[Setting] =
       description = "aowlspt original (F3 debug overlay). Applies as you drag: " &
                     "the host re-reads aowlspt-debugui.json while the panel is " &
                     "on screen, so no F3 off/on cycle is needed."),
+    # The ESP marker colour. This is the ONE esp* key this mod administers; the
+    # rest are still passed through verbatim by `writeOverlayConfig` (see the
+    # docstring there for why). The default is the host's own fallback, read out
+    # of `debugui.nim` (er/eg/eb = 1.0/0.35/0.30) rather than picked, so
+    # declaring the row cannot change what the host draws for anyone who never
+    # touches it.
+    colorSetting("espColor", "ESP marker colour", "1,0.35,0.3",
+                 category = "Overlay",
+      description = "aowlspt original (F3 debug ESP). The colour of the " &
+                    "markers debugEsp draws over live bots. Applies as you " &
+                    "drag: the host re-reads aowlspt-debugui.json while the " &
+                    "markers are on screen."),
     intSetting("overlayToggleKey", "Toggle key (virtual-key code)", 114,
                lo = 0, hi = 255, category = "Overlay",
                description = "aowlspt original (F3 debug overlay). 114 is VK_F3, which is the Minecraft key and the shipped default. 0 disables the toggle."),
@@ -256,11 +268,19 @@ proc writeOverlayConfig() =
   try: existing = readFile(path)
   except: existing = ""
 
+  # `espColor` is EXCLUDED from the passthrough because this mod now owns it
+  # (there is a picker for it). Every other esp* key still rides through
+  # verbatim. Skipping it here is what makes the picker real: if the old line
+  # were copied the key would appear TWICE and the host's `duCfgStr` takes the
+  # first hit `duRawValue` finds -- so the row would move, save, and change
+  # nothing. One emission, from the setting, is the only unambiguous shape.
   var esp = ""
   for line in existing.split('\n'):
     let t = line.strip()
-    if t.startsWith("\"esp"):
+    if t.startsWith("\"esp") and not t.startsWith("\"espColor\""):
       esp.add "  " & (if t.endsWith(","): t else: t & ",") & "\n"
+  esp.add "  \"espColor\":        " &
+          jstr(setting("espColor").asText("1,0.35,0.3")) & ",\n"
 
   var doc = "{\n"
   doc.add "  \"_written_by\": \"" & ModGuid & " " & ModVersion &

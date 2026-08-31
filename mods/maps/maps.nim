@@ -382,15 +382,20 @@ proc spatialSchema(): seq[Setting] =
                  hi = 16.0, step = 0.5, category = "Widget",
                  description = "Half-extent of a contact's mark. 2.0 is the " &
                                "4x4 px dot this mod has always drawn"),
-    stringSetting("colorBot", "Bot colour (RRGGBB)", "E6463C",
-                  category = "Widget",
+    # A real picker, not a text box. `format = "hex"` is load-bearing: the
+    # reader below is `parseRgb`, which takes EXACTLY six hex digits and returns
+    # the DEFAULT on anything else -- so a picker writing "0.9,0.27,0.24" here
+    # would persist a value the map silently refuses. Nothing on disk changes:
+    # "E6463C" is still "E6463C".
+    colorSetting("colorBot", "Bot colour", "E6463C",
+                  category = "Widget", format = "hex",
                   description = "Hex, with or without a leading #. A " &
                                 "malformed value keeps the DEFAULT rather " &
                                 "than becoming black, because a black mark on " &
                                 "a dark map is indistinguishable from no mark " &
                                 "at all. The diag prints the colour in force"),
-    stringSetting("colorPlayer", "Player colour (RRGGBB)", "46BEFF",
-                  category = "Widget",
+    colorSetting("colorPlayer", "Player colour", "46BEFF",
+                  category = "Widget", format = "hex",
                   description = "Hex, as above. `Faction` here is bot vs " &
                                 "human-controlled player -- that is the only " &
                                 "classification sp/world.nim measures on this " &

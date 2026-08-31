@@ -139,8 +139,14 @@ function resetAll(guid) { return apiPost(S + encodeURIComponent(guid) + '/reset'
 
 function haystack(row) {
   if (row.__hay === undefined) {
+    /* `path` is included because it is now what the HEADINGS are drawn from
+     * (see `groupOf`): searching for a section name the user can see on screen
+     * and getting nothing back is the same defect as a control that does
+     * nothing. `category`/`subcategory` stay in as well -- they are still what
+     * an older server sends. */
     row.__hay = [row.key, row.label, row.description, row.category,
-                 row.subcategory].filter(Boolean).join(' ').toLowerCase();
+                 row.subcategory, (row.path || []).join(' ')]
+                .filter(Boolean).join(' ').toLowerCase();
   }
   return row.__hay;
 }
@@ -157,10 +163,31 @@ function matches(row, query) {
 /* [{name, subs:[{name, rows:[row...]}]}] in DECLARATION order -- a mod author
  * orders their schema deliberately and re-sorting it alphabetically throws
  * that away. Rows with no category land in one leading unnamed group. */
+/* `path` is the schema's ORDERED group path (aowl/src/aowlspt/settings.nim,
+ * `settingPath`). It was being emitted and ignored here: the grouping keyed on
+ * the raw `category` STRING, so a mod that declared "Loot/Global",
+ * "Loot/Containers", "Loot/Item mix" got EIGHT sibling top-level sections whose
+ * headers all read "Loot/<something>", instead of one Loot screen with eight
+ * sub-headers. That is the "28-row flat list" complaint one level up: the
+ * sections were declared and the renderer threw the structure away.
+ *
+ * The section model here is genuinely two-level, so depth beyond two is folded
+ * into the sub-header ("Item mix > Category weights") rather than silently
+ * dropped -- a third level that vanished would put rows under a heading that
+ * does not describe them.
+ *
+ * `path` absent -> the old category/subcategory reading, unchanged. An older
+ * server that emits no `path` renders exactly as it does today. */
+function groupOf(row) {
+  var p = row.path;
+  if (!p || !p.length) return {c: row.category || '', sc: row.subcategory || ''};
+  if (p.length === 1) return {c: p[0], sc: ''};
+  return {c: p[0], sc: p.slice(1).join(' > ')};
+}
 function groupRows(rows) {
   var cats = [], byCat = {};
   rows.forEach(function (row) {
-    var c = row.category || '', sc = row.subcategory || '';
+    var g0 = groupOf(row), c = g0.c, sc = g0.sc;
     var g = byCat[c];
     if (!g) { g = byCat[c] = {name: c, subs: [], bySub: {}}; cats.push(g); }
     var sg = g.bySub[sc];
@@ -403,6 +430,14 @@ function parseColor(text) {
    * as a legitimate choice. */
   var c = { r: 1, g: 1, b: 1, a: 1, hasA: false };
   var s = String(text === undefined || text === null ? '' : text).trim();
+  /* BARE hex, no '#'. `mods/maps` has stored `colorBot` as "E6463C" since long
+   * before this widget existed, and reading that down the comma path gives
+   * parseFloat("E6463C") = NaN -> the white fallback, i.e. the picker would
+   * open showing a colour the map is not drawing. Only an EXACT 6 or 8 hex
+   * digits is taken this way: "255,0,0" still has commas, and a 3-digit "abc"
+   * is left to the comma path where it reads as "fewer than three components"
+   * and falls back honestly rather than being guessed at. */
+  if (s.charAt(0) !== '#' && /^[0-9a-fA-F]{6}([0-9a-fA-F]{2})?$/.test(s)) s = '#' + s;
   if (s.charAt(0) === '#') {
     var h = s.slice(1);
     if (h.length === 3) h = h.charAt(0) + h.charAt(0) + h.charAt(1) + h.charAt(1) + h.charAt(2) + h.charAt(2);
@@ -437,7 +472,14 @@ function parseColor(text) {
   if (nums.length >= 4) { c.a = nums[3] / (scale === 255 ? 255 : 1); c.hasA = true; }
   return c;
 }
-function colorText(c) {
+function colorText(c, fmt) {
+  /* Writes the shape the OWNING MOD's own reader parses -- `row.colorFormat`,
+   * defaulted here rather than at the call sites so an older server that emits
+   * no such field still gets the "r,g,b" it has always got. */
+  if (fmt === 'hex' || fmt === 'hex#') {
+    return (fmt === 'hex#' ? '#' : '') +
+           chex2(c.r) + chex2(c.g) + chex2(c.b) + (c.hasA ? chex2(c.a) : '');
+  }
   var s = cfmt(c.r) + ',' + cfmt(c.g) + ',' + cfmt(c.b);
   if (c.hasA) s += ',' + cfmt(c.a);
   return s;
@@ -472,6 +514,12 @@ function hsv2rgb(h, s, v) {
 }
 function colorpicker(row, onSave) {
   var c = parseColor(row.value);
+  var cfg = row.colorFormat || 'rgb';
+  /* A hex row that carries no alpha byte must never GROW one: `maps.parseRgb`
+   * requires exactly six digits and returns its DEFAULT on seven or eight, so a
+   * spurious alpha would silently revert the colour on the next read. The alpha
+   * channel is therefore offered only where the declared value already had one,
+   * which `parseColor` has already decided (`hasA`). */
   var hsv = rgb2hsv(c);
   var wrap = el('span', 'cp');
   var sw = el('button', 'cp-sw');           /* the preview, and the opener */
@@ -485,7 +533,7 @@ function colorpicker(row, onSave) {
    * the screen and the disk disagreeing. */
   var timer = null, pending = null;
   function commit(now) {
-    pending = colorText(c);
+    pending = colorText(c, cfg);
     if (now) {
       if (timer) { clearTimeout(timer); timer = null; }
       onSave(pending);

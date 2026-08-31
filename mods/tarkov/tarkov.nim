@@ -3459,9 +3459,34 @@ proc tarkovSchema(): seq[Setting] =
     floatSetting("lootRaritySuperrare", "Superrare item weight", 1.0, lo = 0.0,
                  hi = 10.0, step = 0.1, category = "Loot/Item mix",
       description = "aowlspt original (server emulator); acts on the SPT-derived database. As above, for Superrare. 0 removes superrare items from every pool."),
-    stringSetting("lootCategoryWeights", "Category weights", "",
-                  category = "Loot/Item mix",
-      description = "aowlspt original (server emulator); acts on the SPT-derived database. `id=multiplier` pairs, comma separated, where `id` is any item template id OR any BASE CLASS id on its `_parent` chain -- so one entry covers a whole family. The chain is walked up to 12 hops and refuses to revisit a template. The community's usual base classes: money 543be5dd4bdc2deb348b4569, ammo 5485a8684bdc2da71d8b4567, meds 543be5664bdc2dd4348b4569, keys 543be5e94bdc2df1348b4568, barter 5448eb774bdc2d0a728b4567. Those five ids are SPT-community-known and were NOT verified against this install's database by the change that added this row -- check the log line the server prints, which reports how many pool entries the weights actually touched."),
+    # ---- Loot > Item mix > Category weights ---------------------------
+    #
+    # This subsection is the answer to "a 28-row flat list". The five families
+    # people actually reweight are named sliders now; the free-text row below
+    # them stays for everything else and is applied ON TOP, so the advanced
+    # escape hatch is not removed and the two cannot disagree without a stated
+    # winner (emu/loot.categoryWeightsFromSettings).
+    #
+    # A slider at 1.0 emits NO entry at all, which is what keeps the shaping
+    # pass skipped entirely at defaults rather than run with neutral numbers.
+    floatSetting("lootWeightMoney", "Money", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Loot/Item mix/Category weights",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies the pool weight of every item whose `_parent` chain reaches the money base class 543be5dd4bdc2deb348b4569. 1.0 emits no entry at all; 0 removes money from every pool. The summary line reports how many pool entries the weights actually touched -- if it says none, the id does not match this database and the slider is doing nothing."),
+    floatSetting("lootWeightAmmo", "Ammunition", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Loot/Item mix/Category weights",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. As Money, for base class 5485a8684bdc2da71d8b4567."),
+    floatSetting("lootWeightMeds", "Medical", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Loot/Item mix/Category weights",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. As Money, for base class 543be5664bdc2dd4348b4569."),
+    floatSetting("lootWeightKeys", "Keys", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Loot/Item mix/Category weights",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. As Money, for base class 543be5e94bdc2df1348b4568."),
+    floatSetting("lootWeightBarter", "Barter items", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Loot/Item mix/Category weights",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. As Money, for base class 5448eb774bdc2d0a728b4567."),
+    stringSetting("lootCategoryWeights", "Advanced: extra id=multiplier pairs", "",
+                  category = "Loot/Item mix/Category weights",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. APPLIED ON TOP OF THE FIVE SLIDERS ABOVE, and it wins where they overlap. `id=multiplier` pairs, comma separated, where `id` is any item template id OR any BASE CLASS id on its `_parent` chain -- so one entry covers a whole family. The chain is walked up to 12 hops and refuses to revisit a template. The community's usual base classes: money 543be5dd4bdc2deb348b4569, ammo 5485a8684bdc2da71d8b4567, meds 543be5664bdc2dd4348b4569, keys 543be5e94bdc2df1348b4568, barter 5448eb774bdc2d0a728b4567. Those five ids are SPT-community-known and were NOT verified against this install's database by the change that added this row -- check the log line the server prints, which reports how many pool entries the weights actually touched."),
 
     boolSetting("lootStackRandomRange", "Use the item's own stack range", false,
                 category = "Loot/Money & stacks",
@@ -3741,6 +3766,14 @@ proc applyLootPreset(name: string) =
   discard applySetting("lootRarityCommon", "1.0")
   discard applySetting("lootRarityRare", "1.0")
   discard applySetting("lootRaritySuperrare", "1.0")
+  # The five category-weight sliders. A preset that skipped them would leave a
+  # Money=0 from an earlier experiment in force under a "vanilla" label, which
+  # is the history-dependence the docstring above says a preset must not have.
+  discard applySetting("lootWeightMoney", "1.0")
+  discard applySetting("lootWeightAmmo", "1.0")
+  discard applySetting("lootWeightMeds", "1.0")
+  discard applySetting("lootWeightKeys", "1.0")
+  discard applySetting("lootWeightBarter", "1.0")
   discard applySetting("lootStackRandomRange", "false")
   discard applySetting("lootStackMultiplier", "1.0")
   discard applySetting("lootStackMaxFraction", "1.0")
@@ -3763,61 +3796,87 @@ proc applyLootPreset(name: string) =
   else:
     discard  # "vanilla": the block above IS vanilla
 
+proc onTarkovApply(key: string) =
+  ## THE HOT-APPLY HOOK, and the reason it exists.
+  ##
+  ## There are TWO transports into this mod's settings and they were not
+  ## symmetric -- the identical shape `mods/maps` was bitten by:
+  ##
+  ##   * the event bus -- `SettingsApplyQuery` -> the SDK's `onApplyQuery` ->
+  ##     `applySettingFromBody` AND THEN `gApplyHook(key)`. This mod registered
+  ##     no hook, so the bus path persisted the edit and stopped there.
+  ##   * the ROUTE below, which did all the hot-apply work inline.
+  ##
+  ## So an edit that arrived over the bus reached config.json and nothing else:
+  ## picking a loot PRESET wrote no knobs, and `lootSummary` was never
+  ## recomputed, so the page went on describing the previous configuration. A
+  ## sentence that says what the loot will do, computed from a stale read, is
+  ## worse than no sentence.
+  ##
+  ## Both transports now converge here. It is idempotent -- every branch re-reads
+  ## config.json rather than trusting the value that was posted -- and it reports
+  ## a verdict on every path, so the host log distinguishes "in force now" from
+  ## "stored, next start" instead of printing one "applied" for both.
+  ##
+  ## `spawnNow`/`spawnQuery` are deliberately NOT here: they need the `session`
+  ## the route is handed and the hook is not, so they stay in the route. That is
+  ## a KNOWN, STATED hole in the bus path, not an oversight.
+  applyMenuCornerLabel()
+  if key.len > 1 and key[0] == 'g' and key[1] == '_':
+    loadGlobalTunes()
+  if key == "mapsUnlockedByDefault" or key == "mapsLocked" or
+     key == "mapsUnlocked":
+    applyMapLockSettings()
+  if key.startsWith("progression"):
+    configureProgression(setting("progressionPlayerLevel").asInt(0),
+                         setting("progressionSkillLevel").asInt(0),
+                         setting("progressionSkillIds").asText(""),
+                         setting("progressionMasteryLevel").asInt(0),
+                         setting("progressionMasteryFamilies").asText(""))
+  elif key == "traderMaxLoyalty" or key == "traderUnlockAllOffers" or
+       key == "traderIgnoreStockLimits" or key == "traderPriceMultiplier":
+    configureTraders(setting("traderUnlockAllOffers").asBool(false),
+                     setting("traderPriceMultiplier").asFloat(1.0),
+                     setting("traderIgnoreStockLimits").asBool(false),
+                     setting("traderMaxLoyalty").asBool(false))
+  if isLootKey(key):
+    if key == "lootPreset":
+      applyLootPreset(setting("lootPreset").asText("custom"))
+    # Taken LAST and read out of `lootConfig()` -- the same object the generator
+    # reads -- not out of the value that was just posted. A summary derived from
+    # the incoming edit would be a check that cannot fail.
+    let summary = lootConfigSummary()
+    discard applySetting("lootSummary", jstr(summary).text)
+    settingApplied("the loot generator now reads: " & summary)
+    return
+  if key.startsWith("progression") or key.startsWith("trader") or
+     key.startsWith("maps") or key == "menuCornerLabel" or
+     (key.len > 1 and key[0] == 'g' and key[1] == '_'):
+    settingApplied("re-read from config.json and pushed into the live emulator")
+    return
+  # Everything else on this page is read once, when the emulator loads. Saying
+  # so is the honest answer; saying "applied" would be the lie this mechanism
+  # exists to stop.
+  settingAppliesOnRestart("stored in config.json; the emulator reads this key " &
+                          "at load, so it takes effect on the next start")
+
 proc onTarkovSettings(url, body, session: string): string =
   ## GET serves the emulator's schema; a POST body persists one edit into
   ## config.json. The emulator reads these at load, so the write is saved and
-  ## takes effect next start rather than live -- except for the three keys
-  ## handled below, which would be useless if they did not act immediately.
+  ## takes effect next start rather than live -- except for the keys
+  ## `onTarkovApply` handles, which would be useless if they did not act
+  ## immediately.
   var st = Ok
   if body.len > 0:
     st = applySettingFromBody(body)
     let key = field(body, "key").asText("")
-    # Hot-apply: `menuCornerLabel` must take effect the moment it is saved.
-    applyMenuCornerLabel()
-    # Hot-apply: the globals overrides. `/client/globals` is fetched once per
-    # session, so re-reading here means an edit lands on the next login rather
-    # than on the next server restart.
-    if key.len > 1 and key[0] == 'g' and key[1] == '_':
-      loadGlobalTunes()
-    # Hot-apply: the progression floors and the two trader unlock switches.
-    # These are read at load like everything else, but "takes effect next
-    # start" is the wrong contract for them -- a floor is applied on the next
-    # profile FETCH, and the client fetches the profile list without being
-    # restarted, so a saved value that did not reconfigure here would look like
-    # a row that does nothing. Re-read all of both groups rather than the one
-    # key: the configure procs take the whole set and a partial call would
-    # reset the others to their defaults.
-    # Hot-apply: the map locks. Same reason as the trader switches below --
-    # the client fetches /client/locations without being restarted, so a
-    # saved value that did not rewrite the bases here is a control that
-    # renders, saves, and leaves every map exactly as it was.
-    if key == "mapsUnlockedByDefault" or key == "mapsLocked" or
-       key == "mapsUnlocked":
-      applyMapLockSettings()
-    if key.startsWith("progression"):
-      configureProgression(setting("progressionPlayerLevel").asInt(0),
-                           setting("progressionSkillLevel").asInt(0),
-                           setting("progressionSkillIds").asText(""),
-                           setting("progressionMasteryLevel").asInt(0),
-                           setting("progressionMasteryFamilies").asText(""))
-    elif key == "traderMaxLoyalty" or key == "traderUnlockAllOffers" or
-         key == "traderIgnoreStockLimits" or key == "traderPriceMultiplier":
-      configureTraders(setting("traderUnlockAllOffers").asBool(false),
-                       setting("traderPriceMultiplier").asFloat(1.0),
-                       setting("traderIgnoreStockLimits").asBool(false),
-                       setting("traderMaxLoyalty").asBool(false))
+    # The SAME hook the event bus runs. Converging the two transports here is
+    # what stops one of them quietly doing less than the other.
+    onTarkovApply(key)
     # `spawnNow` is a button, not a value. Run it, record what happened, and
     # put the key back to false so the control is armed again -- a checkbox
-    # that stays on after its action is one nobody can press twice.
-    # The Loot page. `lootPreset` is a button that writes the rows below it,
-    # and `lootSummary` is recomputed after ANY loot edit -- including the
-    # preset's own writes, which is why the summary is taken last and read out
-    # of `lootConfig()` rather than out of the value that was just posted. A
-    # summary derived from the incoming edit would be a check that cannot fail.
-    if isLootKey(key):
-      if key == "lootPreset":
-        applyLootPreset(setting("lootPreset").asText("custom"))
-      discard applySetting("lootSummary", jstr(lootConfigSummary()).text)
+    # that stays on after its action is one nobody can press twice. It stays
+    # HERE and not in the hook because it needs `session`.
     if key == "spawnNow" and setting("spawnNow").asBool(false):
       let outcome = runSpawn(session)
       discard applySetting("spawnResult", jstr(outcome).text)
@@ -4033,6 +4092,13 @@ proc onLoad(): Status =
   # The emulator's own settings page, registered before the store gate below so
   # it answers even on a host where the emulator refuses to serve anything else.
   declareSettings(tarkovSchema())
+  # THE HOOK. Without this line every edit that arrives over the EVENT BUS (the
+  # in-game settings surface, as opposed to the F12 route below) is persisted to
+  # config.json and acted on by nothing: no loot preset written, no summary
+  # recomputed, no trader/progression/map-lock reconfigure, and the host log
+  # says "NO EFFECT ... this mod registered no onSettingsApplied hook". It is
+  # registered BEFORE the routes for the same reason mods/debug does.
+  onSettingsApplied(onTarkovApply)
   discard serve("/aowlspt/settings/" & ModGuid, onTarkovSettings)
   discard serve("/aowlspt/settings/" & ModGuid & "/reset", onTarkovSettingsReset)
   # The typeahead source for the item-spawn row. Registered beside the schema
