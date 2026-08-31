@@ -179,6 +179,8 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 CONFIG = os.path.join(HERE, "deploy.json")
+if HERE not in sys.path:                 # so `from litscan import ...` works
+    sys.path.insert(0, HERE)             # however this file was invoked
 
 RESET = "\033[0m"
 RED = "\033[31m"
@@ -212,9 +214,19 @@ def select(cfg, only):
     return [a for a in arts if a["name"] in want]
 
 
-OK = "ok"
-FAIL = "fail"
-INCONCLUSIVE = "inconclusive"
+# The three verdicts and the byte-scanning primitives live in tools/litscan.py
+# so that deploy.py (host DLL) and tools/markers.py (mod DLLs) cannot drift
+# apart. Re-exported under the names this file already used.
+import litscan                                       # noqa: E402
+from litscan import OK, FAIL, INCONCLUSIVE           # noqa: E402
+from litscan import FRAGMENT_NOTE                    # noqa: E402
+from litscan import fragment_cover as _fragment_cover           # noqa: E402
+from litscan import find_at as _find_at                         # noqa: E402
+from litscan import pick_control as _pick_control               # noqa: E402
+from litscan import coverage_ratio as _coverage_ratio           # noqa: E402
+from litscan import longest_present_fragment as _longest_present_fragment  # noqa: E402,E501
+from litscan import ABSENT_COVERAGE as _ABSENT_COVERAGE         # noqa: E402
+from litscan import MIN_FRAGMENT as _MIN_FRAGMENT               # noqa: E402,F401
 
 
 def missing_input(art):
@@ -630,132 +642,17 @@ def verify(art, src, C):
 
 
 def _encodings(mode):
-    """(label, bytes-encoder) pairs to search for, in order."""
-    utf8 = ("utf8", lambda s: s.encode("utf-8"))
-    utf16 = ("utf16le", lambda s: s.encode("utf-16-le"))
-    if mode == "utf8":
-        return [utf8]
-    if mode == "utf16":
-        return [utf16]
-    return [utf8, utf16]
+    """(label, encoder) pairs. Delegates to litscan; default set unchanged.
 
-
-FRAGMENT_NOTE = (
-    "a literal that spans a Nim `&` concatenation is stored as SEPARATE "
-    "rodata fragments and can NEVER appear contiguously, at any encoding. "
-    "Neither can text assembled from variables ($, %, formatIt), nor a C "
-    "function name from abi/*.h (a symbol, not a runtime string). Pick a "
-    "substring that lives inside ONE source fragment.")
-
-# Below this many characters a "longest present fragment" is noise ("the ").
-_MIN_FRAGMENT = 6
-
-# For `--absent`: what share of the literal has to still be present, as
-# word-aligned fragments, before a non-contiguous miss is read as "this was
-# merely SPLIT, not removed". Below it the leftovers are generic English
-# ("the walk finished") that any binary of this size carries, and treating
-# those as evidence made `--absent` unable to pass AT ALL -- a check with no
-# reachable PASS is the same defect class as one with no reachable FAIL.
-_ABSENT_COVERAGE = 0.60
-
-
-def _fragments(lit):
-    """Contiguous whitespace-delimited word runs of `lit`, longest first.
-
-    The whole literal is excluded (the caller already searched for it) and so
-    is anything shorter than _MIN_FRAGMENT. Bounded: a literal of n words
-    yields n*(n+1)/2 runs, and these literals are one sentence.
+    deploy.py historically searched utf8 + utf16le only, and its output is
+    quoted in docs, so "any" here keeps meaning that pair. tools/markers.py
+    additionally searches the explicit `ascii` form, which is what the broken
+    PowerShell idiom claimed to be doing.
     """
-    parts = re.split(r"(\s+)", lit)                 # words AND separators
-    runs = []
-    for a in range(0, len(parts), 2):
-        for b in range(a, len(parts), 2):
-            frag = "".join(parts[a:b + 1])
-            if frag and frag != lit and len(frag) >= _MIN_FRAGMENT:
-                runs.append(frag)
-    runs.sort(key=len, reverse=True)
-    return runs
+    if mode in ("utf8", "utf16"):
+        return litscan.encodings(mode)
+    return litscan.encodings("deploy")
 
-
-def _longest_present_fragment(blob, encs, lit):
-    """(fragment, encodings) for the longest word-run of `lit` in `blob`.
-
-    Returns (None, []) when nothing above _MIN_FRAGMENT is present -- which is
-    the shape of a literal that is genuinely not in the binary, as opposed to
-    one that is merely split across rodata fragments.
-    """
-    for frag in _fragments(lit):
-        hits = [lbl for lbl, enc in encs if blob.find(enc(frag)) >= 0]
-        if hits:
-            return frag, hits
-    return None, []
-
-
-def _fragment_cover(blob, encs, lit):
-    """Greedily decompose `lit` into the longest word-aligned runs present.
-
-    Returns (fragments, covered_chars), fragments as (text, encodings) in
-    source order. This models the ONE thing a non-contiguous miss has to be
-    distinguished from: a Nim `&` concatenation is stored as several separate
-    rodata strings, so the whole sentence is missing from the bytes while
-    every piece of it is present. Near-total coverage is that shape; a single
-    short generic run is not.
-
-    A miss with LOW coverage is what a genuine removal looks like, and the
-    number is reported either way so the reader can judge rather than trust.
-    """
-    parts = re.split(r"(\s+)", lit)                 # words AND separators
-    n = len(parts)
-    frags = []
-    covered = 0
-    a = 0
-    while a < n:
-        best = None
-        for b in range(n - 1, a - 1, -2):           # longest run at word `a`
-            frag = "".join(parts[a:b + 1])
-            if len(frag) < _MIN_FRAGMENT or frag == lit:
-                continue
-            hits = [lbl for lbl, enc in encs if blob.find(enc(frag)) >= 0]
-            if hits:
-                best = (frag, hits, b)
-                break
-        if best is None:
-            a += 2
-            continue
-        frags.append((best[0], best[1]))
-        covered += len(best[0])
-        a = best[2] + 2
-    return frags, covered
-
-
-def _find_at(blob, encs, lit):
-    """(encodings, first byte offset) of a contiguous hit, or ([], -1)."""
-    hits = []
-    off = -1
-    for lbl, enc in encs:
-        i = blob.find(enc(lit))
-        if i >= 0:
-            hits.append(lbl)
-            if off < 0 or i < off:
-                off = i
-    return hits, off
-
-
-def _pick_control(blob, encs, controls):
-    """The first positive control that DOES match, or None.
-
-    A positive control is a literal already known to be in this artifact --
-    by default the artifact's own declared markers from deploy.json, which is
-    data this tool is forbidden to edit. It is what makes an `--absent` PASS
-    mean something: it proves the encoding handling, the file and the needle
-    path can find text in these bytes, so "not found" is a finding and not
-    merely "we could not look" (CLAUDE.md 9b).
-    """
-    for label, lit in controls or []:
-        hits, off = _find_at(blob, encs, lit)
-        if hits:
-            return (label, lit, hits, off)
-    return None
 
 
 def verify_literals(src, contains, absent, mode, C, controls=None):
