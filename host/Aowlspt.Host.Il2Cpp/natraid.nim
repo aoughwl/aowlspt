@@ -168,6 +168,26 @@ const
   NrMoOfflineRs     = 0x48'i32
   NrMoReadyPressed  = 0x60'i32
   NrMoPlayersCtrl   = 0xa0'i32
+  NrMpcReadyDep     = 0x110'i32
+    ## MEASURED 2026-08-31 by disassembling `EFT.<Ready>d__40::MoveNext`
+    ## @0xA32E30 (capstone over the `il2cpp` section of GameAssembly.dll). The
+    ## SECOND-level hop the handler makes and the host never checked:
+    ##   00a33159  mov rax, [rdi+0xa0]      <- MatchmakerPlayersController
+    ##   00a33160  test rax,rax / je 0xa33cde   -> NullReferenceException
+    ##   00a33169  mov rax, [rax+0x110]
+    ##   00a33173  test rax,rax / je 0xa33cd9   -> NullReferenceException
+    ##   00a33179..00a33197  eight stores INTO that object
+    ## `rdi` is `<>4__this` (statemachine+0x20) and is provably the
+    ## MatchmakerOperation, because 0xa3300c/0xa33016 read and write
+    ## `[rdi+0x60]` == `_readyPressed`. The host already null-checks +0xa0; it
+    ## did NOT check +0x110, and 0xa33cd9 is inside the try whose catch logs
+    ## "Error while starting matching: Object reference not set to an instance
+    ## of an object." -- exactly the client error measured on the 17:20:40 run.
+    ## The field NAME is NOT stated: 0x110 is inherited, and neither
+    ## `fldoff.py fields` nor `Resolver.all_fields_ex` walks base types (both
+    ## return only MatchmakerPlayersController's own 8 fields, first at 0x148).
+    ## So this offset is used ONLY as a null/readability check, never
+    ## interpreted, never written.
   # The location route. Every one of these came from
   # `il2cpp_resolve.py ... fields <Type>` -- none is guessed.
   NrRsLocSettings   = 0xb0'i32   ## RaidSettings._locationSettings (INITONLY)
@@ -268,6 +288,11 @@ const
     ## never consumed, because attempt 5 gives up instead of re-arming. Worst
     ## case added menu time is 250 + 500 + 1000 + 1500 = 3.25 s before the loud
     ## give-up -- bounded and stated, not open-ended.
+  NrMaxDefers    = 40           ## capped: at most 40 x 250 ms = 10 s of waiting
+                                ## for the Ready() prerequisite chain to fill in
+                                ## before the drive gives up LOUDLY. A deferral
+                                ## presses NOTHING, so it cannot NRE the client.
+  NrDeferMs      = 250'u64
   NrMaxFaults    = 3
   NrMaxLocTries  = 12           ## capped: never retry the lookup forever.
 
@@ -297,6 +322,10 @@ var gNrSettleMs = NrDriveSettleMs  ## the CURRENT arm's delay; grows per retry.
 var gNrAttempts = 0                ## presses actually made this session, capped.
 var gNrLastRp = -1                 ## last `_readyPressed@0x60` read-back, or -1.
 var gNrPressed = false
+var gNrDefers = 0                  ## presses REFUSED because a prerequisite the
+                                   ## game's own handler dereferences was still
+                                   ## null. Capped by NrMaxDefers; a deferral
+                                   ## does NOT consume a press attempt.
 var gNrBoundLogged = false
 ## The location resolve. `gNrLoc` is set ONLY by a resolve that both returned a
 ## Location and read back Id == "Woods"; it is never set from a guess, and there
@@ -1097,7 +1126,8 @@ proc nrDrive() =
     okLog "nativeRaid DRIVE _selectedLocation@0xa8=" & nrHex(back) &
           " and LocationId@0x30=\"" & backId & "\" -- read back from the live " &
           "object, not from our own write"
-  if cNrReadPtr(mo, NrMoPlayersCtrl) == nil:
+  let mpc = cNrReadPtr(mo, NrMoPlayersCtrl)
+  if mpc == nil:
     nrFail("STAGE 2: MatchmakerPlayersController@0xa0 is null at the moment " &
            "of the write -- Ready() would NRE")
     return
@@ -1191,6 +1221,71 @@ proc nrDrive() =
   # ---- THE PRESS. At most one per attempt, at most NrMaxDriveAttempts per
   # session. Everything above this line has just been re-read and re-asserted
   # from the live objects, so a retry is a FULL re-validation, not a replay.
+  # -------------------------------------------------------------------------
+  # THE PREREQUISITE THE HANDLER ITSELF DEREFERENCES, checked on the OBJECT WE
+  # ARE ABOUT TO PRESS, in this frame, with nothing between this and the call.
+  #
+  # WHY THIS EXISTS. Measured on the live run whose client log is
+  # `log_2026.08.31_17-20-40`: press attempt 1 produced
+  #   17:21:21.055 Error|errors|Error while starting matching: Object reference
+  #                not set to an instance of an object.
+  #                EFT.<Ready>d__40:MoveNext() / MatchmakerOperation:Ready()
+  #                / MatchmakerOperation:OnReadyPressed()
+  # and the host then read `_readyPressed@0x60 == 0` and re-armed; attempt 2,
+  # 282 ms later, took LocalGameMatching. So the handler DID run and threw.
+  # Disassembly of `<Ready>d__40::MoveNext`@0xA32E30 gives four NRE sites in
+  # that caught region: 0xa33ce8 (`<>4__this` null -- excluded, we pressed a
+  # readable object), 0xa33ce3 (`+0xa0` null -- excluded, checked above), and
+  # 0xa33cde / 0xa33cd9, which are `[mo+0xa0]` and `[[mo+0xa0]+0x110]`. By
+  # elimination the throw was the +0x110 hop. That is a NARROWING, not a proof:
+  # the body continues past 0xa331b9 and may hold further NRE sites this host
+  # has not read. Stated as such rather than overclaimed.
+  var readyDep: Il2CppPtr = nil
+  if cIsReadable(mpc, NrMpcReadyDep + 8'i32) != 0'i32:
+    readyDep = cNrReadPtr(mpc, NrMpcReadyDep)
+  if readyDep == nil:
+    inc gNrDefers
+    if gNrDefers > NrMaxDefers:
+      nrFail("STAGE 2 REFUSED THE PRESS " & $NrMaxDefers & " times and gives " &
+             "up: MatchmakerPlayersController@0xa0=" & nrHex(mpc) &
+             " +0x110 is still null. `<Ready>d__40::MoveNext` dereferences " &
+             "that slot unconditionally at 0xa33169 and throws " &
+             "NullReferenceException at 0xa33cd9 if it is null -- which is " &
+             "exactly the client error measured at 17:21:21.055 on the " &
+             "2026-08-31 run. NOT pressing. A refusal is the correct outcome " &
+             "here; an NRE inside the client is not")
+      return
+    gNrSettleMs = NrDeferMs
+    gNrArmedMs = cNowMs()
+    gNrStep = NrArmed
+    warn "nativeRaid DRIVE REFUSING TO PRESS (deferral " & $gNrDefers & "/" &
+         $NrMaxDefers & ", no attempt consumed): the object " &
+         "MatchmakerOperation@0xa0 -> MatchmakerPlayersController=" &
+         nrHex(mpc) & " has +0x110 null or unreadable. `<Ready>d__40::" &
+         "MoveNext` loads it at 0xa33169 and throws NRE at 0xa33cd9 when it " &
+         "is null. Re-checking in " & $NrDeferMs & "ms; the whole drive " &
+         "re-validates from scratch"
+    return
+  # RE-READ THE MATCHMAKER ONE LAST TIME AND REFUSE IF IT MOVED. `nrMatchmaker`
+  # has TWO sources -- `_menuOperation@0x128 .Matchmaker@0x118` preferred,
+  # `_localMatchmakerOperation@0x100` as fallback -- and they were MEASURED to
+  # be different objects on the 2026-08-31 run (probe read 0x20edf56f840 from
+  # the fallback at 0:00:44.687; the drive read 0x20edf16da80 from the
+  # preferred source at 0:00:45.515). Everything above validated `mo`; if the
+  # graph swapped underneath us between the gate assert and here, START OVER
+  # rather than press an object we did not validate.
+  var moWhy2 = ""
+  let mo2 = nrMatchmaker(app, moWhy2)
+  if mo2 != mo:
+    gNrSettleMs = NrDeferMs
+    gNrArmedMs = cNowMs()
+    gNrStep = NrArmed
+    warn "nativeRaid DRIVE REFUSING TO PRESS (no attempt consumed): the " &
+         "MatchmakerOperation changed between the gate assert and the press " &
+         "-- validated " & nrHex(mo) & ", now reads " & nrHex(mo2) & " (" &
+         moWhy2 & "). Starting the whole drive over rather than pressing an " &
+         "object that was never validated"
+    return
   inc gNrAttempts
   okLog "nativeRaid DRIVE attempt " & $gNrAttempts & "/" & $NrMaxDriveAttempts &
         ": calling EFT.MatchmakerOperation::OnReadyPressed() @0xA312E0 on " &
@@ -1212,7 +1307,10 @@ proc nrDrive() =
       nrFail("STAGE 2 GAVE UP: all " & $NrMaxDriveAttempts & " attempts to " &
              "press READY were made and NONE took -- the last read-back of " &
              "MatchmakerOperation._readyPressed@0x60 was " & $gNrLastRp &
-             ", so the game's own OnReadyPressed handler never ran. Every " &
+             ". That read-back is INCONCLUSIVE about whether the handler ran " &
+             "(MoveNext sets +0x60=1 at 0xa33016 and the catch can roll it " &
+             "back), so read the client's errors_000.log to tell " &
+             "\"never started\" from \"ran and threw\". Every " &
              "prerequisite, both field write-backs and the offline-gate " &
              "finished-state assert PASSED before each press, so this is not " &
              "a bad predicate: the client is refusing the press at this point " &
@@ -1224,8 +1322,18 @@ proc nrDrive() =
     gNrArmedMs = cNowMs()
     gNrStep = NrArmed
     warn "nativeRaid DRIVE attempt " & $gNrAttempts & "/" &
-         $NrMaxDriveAttempts & ": _readyPressed=0 after press -- the handler " &
-         "did not run, re-arming in " & $int(waitMs) & "ms. The next attempt " &
+         $NrMaxDriveAttempts & ": _readyPressed=0 after press -- INCONCLUSIVE, " &
+         "and specifically NOT the same thing as \"the handler did not run\", " &
+         "which is what this line used to claim. MEASURED: " &
+         "`<Ready>d__40::MoveNext`@0xA32E30 writes `[this+0x60]=1` at " &
+         "0xa33016, BEFORE every NRE site in its caught region, so a 0 " &
+         "read-back means the handler ran and ROLLED BACK at least as often " &
+         "as it means the handler never started. On the 2026-08-31 run this " &
+         "exact read-back of 0 accompanied a client-side " &
+         "\"Error while starting matching: Object reference not set to an " &
+         "instance of an object\" at 17:21:21.055 -- i.e. the handler ran and " &
+         "threw. CHECK THE CLIENT'S OWN errors_000.log before believing any " &
+         "story about this. Re-arming in " & $int(waitMs) & "ms. The next attempt " &
          "re-reads the matchmaker operation, re-checks the RaidSettings " &
          "identities and re-asserts RaidMode@0x44=Local(1) on the gate object " &
          "from scratch; nothing from this attempt is assumed to survive."
