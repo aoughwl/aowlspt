@@ -78,6 +78,7 @@ import aowlspt
 import aowlspt/server
 import aowlspt/json
 import rand
+import knobs
 
 # ---------------------------------------------------------------------------
 # Reading the database
@@ -251,6 +252,7 @@ type
     stackRandomRange*: bool    ## roll StackMinRandom..StackMaxRandom when declared
     stackMultiplier*: float    ## scale the rolled stack count
     stackMaxFraction*: float   ## cap the roll at this fraction of StackMaxSize
+    money*: MoneyStackConfig   ## currency-only stack shaping, shared with bots
 
 proc defaultLootConfig*(): LootConfig =
   ## The shipped behaviour: the map's own numbers, unscaled.
@@ -265,7 +267,9 @@ proc defaultLootConfig*(): LootConfig =
              rarityCommon: 1.0, rarityRare: 1.0, raritySuperrare: 1.0,
              categoryWeights: newKvList(),
              stackRandomRange: false, stackMultiplier: 1.0,
-             stackMaxFraction: 1.0)
+             stackMaxFraction: 1.0,
+             money: MoneyStackConfig(multiplier: 1.0, floorCount: 0,
+                                     ceilCount: 0))
 
 proc clampLow(v: float; lo: float): float =
   if v < lo: lo else: v
@@ -284,15 +288,57 @@ const
   ## that would agree with itself. It is `lootConfigSummary`, which reports how
   ## many pool entries the weights ACTUALLY touched, and the server log line it
   ## already emits when the answer is zero.
-  CategoryWeightKeys*: array[5, string] = [
+  ## MEASURED, 2026-08-31, against this install's own `db.json` via
+  ## `tools/bigjson.py get --path templates.items.<id>._name`. Every id below
+  ## returned the `_name` in its comment; the one candidate that did NOT resolve
+  ## in this database (`57864ee62459775490116fbf`, "building material" in
+  ## community lists) was DROPPED rather than shipped as a row that reweights
+  ## nothing. That is the whole reason this table grew from five to twenty-two
+  ## instead of from five to thirty: the ids are checked, not collected.
+  CategoryWeightKeys*: array[22, string] = [
     "lootWeightMoney", "lootWeightAmmo", "lootWeightMeds",
-    "lootWeightKeys", "lootWeightBarter"]
-  CategoryWeightIds*: array[5, string] = [
-    "543be5dd4bdc2deb348b4569",   # money
-    "5485a8684bdc2da71d8b4567",   # ammo
-    "543be5664bdc2dd4348b4569",   # meds
-    "543be5e94bdc2df1348b4568",   # keys
-    "5448eb774bdc2d0a728b4567"]   # barter
+    "lootWeightKeys", "lootWeightBarter",
+    "lootWeightAmmoBoxes", "lootWeightFood", "lootWeightElectronics",
+    "lootWeightValuables", "lootWeightWeapons", "lootWeightKnives",
+    "lootWeightMods", "lootWeightMagazines", "lootWeightArmor",
+    "lootWeightHelmets", "lootWeightRigs", "lootWeightBackpacks",
+    "lootWeightGrenades", "lootWeightContainers", "lootWeightStims",
+    "lootWeightTools", "lootWeightSpecial"]
+  CategoryWeightIds*: array[22, string] = [
+    "543be5dd4bdc2deb348b4569",   # Money
+    "5485a8684bdc2da71d8b4567",   # Ammo
+    "543be5664bdc2dd4348b4569",   # Meds
+    "543be5e94bdc2df1348b4568",   # Key
+    "5448eb774bdc2d0a728b4567",   # BarterItem
+    "543be5cb4bdc2deb348b4568",   # AmmoBox
+    "543be6674bdc2df1348b4569",   # FoodDrink
+    "57864a66245977548f04a81f",   # Electronics
+    "57864a3d24597754843f8721",   # Jewelry
+    "5422acb9af1c889c16000029",   # Weapon
+    "5447e1d04bdc2dff2f8b4567",   # Knife
+    "5448fe124bdc2da5018b4567",   # Mod
+    "5448bc234bdc2d3c308b4569",   # Magazine
+    "5448e54d4bdc2dcc718b4568",   # Armor
+    "5a341c4086f77401f2541505",   # Headwear
+    "5448e5284bdc2dcb718b4567",   # Vest
+    "5448e53e4bdc2d60728b4567",   # Backpack
+    "543be6564bdc2df4348b4568",   # ThrowWeap
+    "5795f317245977243854e041",   # SimpleContainer
+    "5448f3a64bdc2d60728b456a",   # Stimulator
+    "57864bb7245977548b3b66c2",   # Tool
+    "5447e0e74bdc2d3c308b4567"]   # SpecItem
+
+  ## The three currencies, as their own rows, so "more roubles and fewer
+  ## dollars" is two sliders rather than a hand-written id list. They are
+  ## TEMPLATE ids, not base classes; `parseKvList`/`setKv` and the pool shaper
+  ## already accept either, and a template entry is strictly more specific than
+  ## the Money base class above -- both apply, and both multiply.
+  CurrencyWeightKeys*: array[3, string] = [
+    "lootCurrencyRoubles", "lootCurrencyDollars", "lootCurrencyEuros"]
+  CurrencyWeightIds*: array[3, string] = [
+    "5449016a4bdc2d6f028b456f",   # Rubles   (StackMinRandom 5500..13500)
+    "5696686a4bdc2da3298b456a",   # Dollars  (45..100)
+    "569668774bdc2da2298b4568"]   # Euro     (35..90)
 
 proc categoryWeightsFromSettings(): KvList =
   ## The five named sliders, then `lootCategoryWeights` ON TOP.
@@ -306,10 +352,17 @@ proc categoryWeightsFromSettings(): KvList =
   ## must have a stated winner, and the advanced one wins.
   result = newKvList()
   for i in 0 ..< CategoryWeightKeys.len:
-    let w = setting(CategoryWeightKeys[i]).asFloat(1.0)
+    let w = knob(CategoryWeightKeys[i]).asFloat(1.0)
     if w != 1.0:
       setKv(result, CategoryWeightIds[i], (if w < 0.0: 0.0 else: w))
-  let extra = parseKvList(setting("lootCategoryWeights").asText(""))
+  # The currency rows go in AFTER the families, so a specific currency beats
+  # the Money family where both are set -- the same "the more specific control
+  # wins, and it is stated" rule the free-text row below follows.
+  for i in 0 ..< CurrencyWeightKeys.len:
+    let w = knob(CurrencyWeightKeys[i]).asFloat(1.0)
+    if w != 1.0:
+      setKv(result, CurrencyWeightIds[i], (if w < 0.0: 0.0 else: w))
+  let extra = parseKvList(knob("lootCategoryWeights").asText(""))
   for i in 0 ..< extra.keys.len:
     setKv(result, extra.keys[i], extra.vals[i])
 
@@ -318,37 +371,38 @@ proc lootConfig*(): LootConfig =
   ## is the pre-existing behaviour, so a config file that predates this module
   ## still produces the same floor rather than a map with no loot on it.
   result = defaultLootConfig()
-  result.enabled = setting("lootEnabled").asBool(true)
-  result.staticMultiplier = setting("staticLootMultiplier").asFloat(1.0)
-  result.looseMultiplier = setting("looseLootMultiplier").asFloat(1.0)
-  result.maxItems = setting("maxLootItems").asInt(20000)
+  result.enabled = knob("lootEnabled").asBool(true)
+  result.staticMultiplier = knob("staticLootMultiplier").asFloat(1.0)
+  result.looseMultiplier = knob("looseLootMultiplier").asFloat(1.0)
+  result.maxItems = knob("maxLootItems").asInt(20000)
 
-  result.globalMultiplier = setting("lootGlobalMultiplier").asFloat(1.0)
-  result.staticEnabled = setting("staticLootEnabled").asBool(true)
-  result.looseEnabled = setting("looseLootEnabled").asBool(true)
-  result.forcedSpawns = setting("lootForcedSpawns").asBool(true)
-  result.staticBudgetShare = setting("lootStaticBudgetShare").asFloat(0.5)
-  result.perMap = parseKvList(setting("lootPerMapMultipliers").asText(""))
+  result.globalMultiplier = knob("lootGlobalMultiplier").asFloat(1.0)
+  result.staticEnabled = knob("staticLootEnabled").asBool(true)
+  result.looseEnabled = knob("looseLootEnabled").asBool(true)
+  result.forcedSpawns = knob("lootForcedSpawns").asBool(true)
+  result.staticBudgetShare = knob("lootStaticBudgetShare").asFloat(0.5)
+  result.perMap = parseKvList(knob("lootPerMapMultipliers").asText(""))
 
-  result.containerChanceMul = setting("containerSpawnChanceMultiplier").asFloat(1.0)
-  result.containerFillMul = setting("containerFillMultiplier").asFloat(1.0)
-  result.containerMaxItems = setting("containerMaxItems").asInt(64)
-  result.containerTypeChance = parseKvList(setting("containerTypeChances").asText(""))
+  result.containerChanceMul = knob("containerSpawnChanceMultiplier").asFloat(1.0)
+  result.containerFillMul = knob("containerFillMultiplier").asFloat(1.0)
+  result.containerMaxItems = knob("containerMaxItems").asInt(64)
+  result.containerTypeChance = parseKvList(knob("containerTypeChances").asText(""))
 
-  result.loosePointLimit = setting("looseLootPointLimit").asInt(0)
+  result.loosePointLimit = knob("looseLootPointLimit").asInt(0)
 
-  result.valueBias = setting("lootValueBias").asFloat(0.0)
-  result.valuePivot = setting("lootValuePivot").asFloat(20000.0)
-  result.minPrice = setting("lootMinHandbookPrice").asInt(0)
-  result.maxPrice = setting("lootMaxHandbookPrice").asInt(0)
-  result.rarityCommon = setting("lootRarityCommon").asFloat(1.0)
-  result.rarityRare = setting("lootRarityRare").asFloat(1.0)
-  result.raritySuperrare = setting("lootRaritySuperrare").asFloat(1.0)
+  result.valueBias = knob("lootValueBias").asFloat(0.0)
+  result.valuePivot = knob("lootValuePivot").asFloat(20000.0)
+  result.minPrice = knob("lootMinHandbookPrice").asInt(0)
+  result.maxPrice = knob("lootMaxHandbookPrice").asInt(0)
+  result.rarityCommon = knob("lootRarityCommon").asFloat(1.0)
+  result.rarityRare = knob("lootRarityRare").asFloat(1.0)
+  result.raritySuperrare = knob("lootRaritySuperrare").asFloat(1.0)
   result.categoryWeights = categoryWeightsFromSettings()
 
-  result.stackRandomRange = setting("lootStackRandomRange").asBool(false)
-  result.stackMultiplier = setting("lootStackMultiplier").asFloat(1.0)
-  result.stackMaxFraction = setting("lootStackMaxFraction").asFloat(1.0)
+  result.stackRandomRange = knob("lootStackRandomRange").asBool(false)
+  result.stackMultiplier = knob("lootStackMultiplier").asFloat(1.0)
+  result.stackMaxFraction = knob("lootStackMaxFraction").asFloat(1.0)
+  result.money = moneyStackConfig()
 
   # Clamping, not refusing: a negative multiplier is a slider dragged past its
   # own minimum, and "no loot from this source" is the honest reading of it.
@@ -374,6 +428,28 @@ proc lootConfig*(): LootConfig =
   if result.stackMaxFraction > 1.0: result.stackMaxFraction = 1.0
   if result.staticBudgetShare < 0.0: result.staticBudgetShare = 0.0
   if result.staticBudgetShare > 1.0: result.staticBudgetShare = 1.0
+
+proc declaredLootKeys*(): seq[string] =
+  ## Every settings key the loot generator reads, named once. Derived from the
+  ## same two arrays `categoryWeightsFromSettings` iterates, so the category
+  ## half cannot drift; the rest is written out because `lootConfig` reads them
+  ## as literals and a list that is generated from the reads would agree with
+  ## itself by construction.
+  result = @["lootEnabled", "staticLootMultiplier", "looseLootMultiplier",
+             "maxLootItems", "lootGlobalMultiplier", "staticLootEnabled",
+             "looseLootEnabled", "lootForcedSpawns", "lootStaticBudgetShare",
+             "lootPerMapMultipliers", "containerSpawnChanceMultiplier",
+             "containerFillMultiplier", "containerMaxItems",
+             "containerTypeChances", "looseLootPointLimit", "lootValueBias",
+             "lootValuePivot", "lootMinHandbookPrice", "lootMaxHandbookPrice",
+             "lootRarityCommon", "lootRarityRare", "lootRaritySuperrare",
+             "lootCategoryWeights", "lootStackRandomRange",
+             "lootStackMultiplier", "lootStackMaxFraction",
+             "moneyStackMultiplier", "moneyStackMin", "moneyStackMax"]
+  for i in 0 ..< CategoryWeightKeys.len:
+    result.add CategoryWeightKeys[i]
+  for i in 0 ..< CurrencyWeightKeys.len:
+    result.add CurrencyWeightKeys[i]
 
 proc shapesPool*(cfg: LootConfig): bool =
   ## Whether ANY pool-shaping knob is off its default. When this is false the
@@ -1236,6 +1312,16 @@ proc spawnItem(s: var ItemSink; d: LootDb; p: PresetIndex; a: AmmoTable;
     if ceiling < 1: ceiling = 1
     if n > ceiling: n = ceiling
     if n < 1: n = 1
+    # Loot > Money. The three money rows are applied LAST and only to the three
+    # currency templates, so the money floor/ceiling a player sets is the
+    # number that reaches the map -- it is not then re-capped by the generic
+    # stack fraction above, which is what would make a "minimum rouble stack"
+    # row silently do nothing on a map where the fraction is low. It is still
+    # bounded by the item's own StackMaxSize, which is the client's limit and
+    # not ours to exceed.
+    if isMoneyTpl(tpl):
+      n = applyMoneyStack(cfg.money, n)
+      if n > limit: n = limit
     var upd = newDoc()
     setNumber(upd, "StackObjectsCount", n)
     setRaw(doc, "upd", text(upd))
