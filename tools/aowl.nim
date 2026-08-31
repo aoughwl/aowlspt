@@ -2415,6 +2415,25 @@ proc cmdTest(e: Env): int =
     # fused into one frame and that was rejected, so `notFused` asserts on the
     # grid that neither screen carries the other's furniture -- structurally,
     # by counting the corners on the top border, so it cannot pass by accident.
+    # THE DIAG LOG FILTER. The maps diag block was 40.3% of one 761 s host log
+    # (10,192 of 25,289 lines) because its change-detection compared text that
+    # carried live counters and so was always unequal. The filter that replaced
+    # it is gated here on the OPPOSITE risk: that quieting the noise also
+    # quieted the signal. It replays 110 blocks captured verbatim from a real
+    # session -- containing a real `art: FAIL` -- and asserts every not-PASS
+    # verdict still surfaces, promptly, while the repeated PASS collapses.
+    # Mutating `diagNotPass` to return "" makes it fail with 17 named FAILs.
+    let mdExe = joinPath(e.repo, "installer\\build\\mapsdiag.exe")
+    var mdCmd = quoted(nimonyExe(e))
+    mdCmd.add " c"
+    mdCmd.add abiInclude(e)
+    mdCmd.add " -p:" & quoted(joinPath(e.repo, "mods\\maps"))
+    mdCmd.add " -o:" & quoted(mdExe)
+    mdCmd.add " " & quoted(joinPath(e.repo, "tests\\mapsdiag.nim"))
+    if run(e, "mapsdiag builds", mdCmd, e.repo):
+      discard run(e, "quieting the maps diag block did not also quiet any " &
+                     "FAIL or INCONCLUSIVE verdict in it", quoted(mdExe))
+
     let tuiExe = joinPath(e.repo, "installer\\build\\tuilayout.exe")
     var tlCmd = quoted(nimonyExe(e))
     tlCmd.add " c"
