@@ -1115,6 +1115,28 @@ proc applySelf(l: BotLive; which: SelfAction): int =
     return 0
 
 
+var gDriveRefusedDying = 0
+var gDriveRefusedLogged = 0
+
+proc drivesRefusedDying*(): int = gDriveRefusedDying
+
+proc noteDriveRefusedDying(why: string) =
+  ## A refusal is the SAFE outcome, so it is not a fault and does not spend the
+  ## `MaxDriveFaults` budget -- spending it here would turn a normal raid end
+  ## into a permanent self-disable. It is counted always and logged for the
+  ## first eight occurrences, which is enough to name the shape in a raid log
+  ## without a per-frame line once a whole squad is being torn down at once.
+  gDriveRefusedDying = gDriveRefusedDying + 1
+  if gDriveRefusedLogged < 8:
+    gDriveRefusedLogged = gDriveRefusedLogged + 1
+    warn "sain drive: order REFUSED, bot is not drivable -- " & why &
+         " (this is the teardown gate doing its job, not a fault)"
+
+proc resetDriveRefusals*() =
+  gDriveRefusedDying = 0
+  gDriveRefusedLogged = 0
+  resetDriveGateCounters()
+
 proc applyTo*(l: BotLive; a: Actuation): int =
   ## Push an actuation into the game. Returns how many calls were made, which is
   ## what the driver budgets against.
@@ -1147,6 +1169,36 @@ proc applyTo*(l: BotLive; a: Actuation): int =
   ## every pointer in it comes from its arguments.
   if not capable() or not l.ok:
     return 0
+
+  # --- THE TEARDOWN GATE, and it is the FIRST thing in this function on
+  # purpose.
+  #
+  # It used to be `l.ok`, which `liveOf` and `runDrives` both set to `true`
+  # unconditionally once a GC handle resolved. That could not fail: we hold a
+  # STRONG handle, so the target resolves for the whole raid, including after
+  # `BotOwner.Dispose(withNulls:true)` has nulled the components and after
+  # Unity destroyed the native halves. Driving through that is a
+  # NullReferenceException raised inside the engine -- which is what
+  # `errors_000.log` reported and what surfaced as `Problem bot dispose
+  # (group 1) ... state:Disposed` in `aiErrors_000.log`.
+  #
+  # `drivable` reads Unity's own `m_CachedPtr` and the game's own `_botState`,
+  # so a raid tearing down refuses here instead of calling. It is evaluated
+  # HERE rather than in the driver because this is the one function both the
+  # queued path (`runDrives`, next frame) and the host-thread fallback go
+  # through, and the whole failure was a gap between when the bot was looked at
+  # and when it was driven.
+  #
+  # `applySelf` is inside the gate too. `saReload` walks
+  # `BotWeaponManager -> Reload -> TryReload`, and
+  # `OnWeaponTaken fail ... _player._handsController != null && ReferenceEquals`
+  # in the same client log is that path meeting a player whose hands controller
+  # is being torn down.
+  var gateWhy = ""
+  if not drivable(l.player, l.owner, gateWhy):
+    noteDriveRefusedDying(gateWhy)
+    return 0
+
   var calls = 0
 
   if a.selfAct != saNone:
@@ -1332,6 +1384,7 @@ proc initDriveQueue*() =
   gDriveCalls = 0
   gDriveNs = 0'i64
   gDriveHostThread = 0
+  resetDriveRefusals()
 
 proc postDrive*(b: BotHandle; a: Actuation; nowSeconds: float): bool =
   ## Queue one order. The host's thread, and the only writer.
@@ -1376,8 +1429,13 @@ proc runDrives*(nowSeconds: float): int =
       continue
     let p = target(o.gcPlayer)
     if p == nil:
-      # The bot died between the post and this frame. Its handle answers null
-      # and there is nothing to drive.
+      # The handle itself was dropped (raid end, `releaseAll`, `detach`).
+      #
+      # THIS IS NOT THE DEATH CHECK, and it used to be described as one. The
+      # handle we take is STRONG, so while it is held the target resolves
+      # non-null no matter what happened to the bot -- it answers null only
+      # once WE let go. The bot-is-dying case is caught by `drivable` inside
+      # `applyTo`, on the game's own `m_CachedPtr` and `_botState`.
       gDriveGone = gDriveGone + 1
       continue
     var l = noBot()

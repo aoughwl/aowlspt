@@ -963,6 +963,16 @@ proc tickBot(index: int): bool =
   #
   # `thisPointer` answers it directly, so when the hook took, this goes away.
   # When it did not, the poll is still the only thing that cannot be wrong.
+  # UNITY-DESTROYED IS CHECKED UNCONDITIONALLY, and before the flag-gated
+  # health poll. It is one raw field read of `m_CachedPtr@0x10` -- no bound
+  # call, no export -- and it is the only signal here that does not depend on
+  # a hook having taken. With `gDeathHooked` on, the poll below is skipped
+  # entirely, which left NOTHING evicting a bot from this table once the raid
+  # started tearing it down: the strong GC handle kept the object readable, so
+  # the bot went on being decided about and driven straight through
+  # `BotOwner.Dispose`. Returning false here drops the handle on the spot.
+  if l.ok and not unityAlive(l.player):
+    return false
   if l.ok and not gDeathHooked and not isAlive(l.player):
     return false
 
@@ -1392,7 +1402,19 @@ proc driveVerdict*(): string =
   let c = "counters: " & $gWitnessOrders & " locomotion orders issued, " &
           $gWitnessMoved & " moved >0.5 m within " & $WitnessWindow &
           " s, " & $gWitnessStill & " did not, " & $gWitnessLost &
-          " lost (bot died or went unreadable inside the window)"
+          " lost (bot died or went unreadable inside the window)" &
+          "; TEARDOWN GATE: " & $drivesAdmitted() & " drives admitted, " &
+          $drivesRefusedDying() & " refused because dying (" &
+          $drivesRefusedDestroyed() & " Unity-destroyed, " &
+          $drivesRefusedDisposed() & " BotOwner not Active, " &
+          $drivesRefusedDead() & " IsDead)"
+  # THE GATE COUNTERS BELONG IN THIS LINE, not in a parallel verdict.
+  #
+  # `admitted` is the denominator the §9b assertion needs: a raid with zero
+  # `Problem bot dispose` NREs and zero admitted drives proves nothing, because
+  # nothing was driven. `refused` climbing at raid end is the gate working; it
+  # climbing during a live raid means bots are being enumerated after they stop
+  # being drivable and the census wants looking at.
   if gWitnessOrders == 0:
     var why = "Read the NOT DELIVERED and RVA-target lines above for why"
     if not clientLocomotion():
