@@ -97,7 +97,10 @@
  * ===========================================================================
  *
  * `aowl_cam_fn` is a byte-for-byte copy of `aowl_du_fn`'s discipline:
- * GameAssembly.dll must be mapped, the address must land in COMMITTED
+ * GameAssembly.dll must be mapped (through `aowl_cam_ga`, the single
+ * never-cached accessor -- and if it is absent the caller must RETRY rather
+ * than record a verdict; see the comment on that function), the address must
+ * land in COMMITTED
  * EXECUTABLE memory (checked before the memcmp, because a stale RVA on another
  * build can point at an uncommitted page and memcmp there faults), and the
  * prologue is compared against the STARTUP SNAPSHOT (`aowl_pro_verify`) rather
@@ -247,6 +250,33 @@ static unsigned char aowl_cam_state[AOWL_CAM_TARGET_COUNT];
  * 3 not committed, 4 not executable, 5 prologue mismatch, 6 bad index. A
  * feature that declines must say which of the six happened. */
 static int32_t       aowl_cam_last_reason = 0;
+/* Resolves that found no GameAssembly.dll at all. NOT rejections: see below. */
+static int32_t       aowl_cam_waits = 0;
+
+/* THE ONE ACQUISITION, and it is deliberately not cached.
+ *
+ * MEASURED 2026-08-31, from a live host log: `camBind` ran at host-config time
+ * and every one of the 15 targets came back with reason code 1 -- `!ga` -- while
+ * a few lines later `mods/fov` byte-verified 0x525DCE0 and 0x525DD30, the very
+ * same addresses, successfully. There was never a byte mismatch and never a
+ * wrong RVA: the host calls in at DLL-attach and IL2CPP does not map
+ * GameAssembly.dll until ~1s later, so `GetModuleHandleA` correctly returned
+ * NULL, and the bind then REPORTED that as a verdict about the build. FOV
+ * "worked" only because it binds later.
+ *
+ * The rule this encodes, and the reason there is a named function here rather
+ * than an inline call at each use site: a handle that is absent is a fact about
+ * WHEN we asked, never a fact about the build, so it is never latched and never
+ * remembered. `aowl_pro_capture` needs the module for exactly the same reason --
+ * the startup snapshot cannot be taken before the bytes are mapped -- so a
+ * caller that gets 0 from `aowl_cam_module_ready` must RETRY, not conclude.
+ * `aowl_cam_state` is likewise only ever latched on a genuine prologue
+ * mismatch, so a deferred bind cannot poison the verified/rejected counters. */
+static HMODULE aowl_cam_ga(void) {
+    return GetModuleHandleA("GameAssembly.dll");
+}
+static int32_t aowl_cam_module_ready(void) { return aowl_cam_ga() ? 1 : 0; }
+static int32_t aowl_cam_wait_count(void)   { return aowl_cam_waits; }
 
 static void* aowl_cam_fn(int32_t i) {
     HMODULE ga;
@@ -254,8 +284,8 @@ static void* aowl_cam_fn(int32_t i) {
     unsigned char* p;
     MEMORY_BASIC_INFORMATION mbi;
     if (i < 0 || i >= AOWL_CAM_TARGET_COUNT) { aowl_cam_last_reason = 6; return NULL; }
-    ga = GetModuleHandleA("GameAssembly.dll");
-    if (!ga) { aowl_cam_last_reason = 1; return NULL; }
+    ga = aowl_cam_ga();
+    if (!ga) { aowl_cam_waits++; aowl_cam_last_reason = 1; return NULL; }
     t = &aowl_cam_targets[i];
     p = (unsigned char*)ga + t->rva;
     if (VirtualQuery(p, &mbi, sizeof(mbi)) == 0) { aowl_cam_last_reason = 2; return NULL; }
@@ -288,6 +318,21 @@ static int32_t aowl_cam_target_count(void) { return AOWL_CAM_TARGET_COUNT; }
 static int32_t aowl_cam_ok_count(void)     { return aowl_cam_verified; }
 static int32_t aowl_cam_bad_count(void)    { return aowl_cam_rejected; }
 static int32_t aowl_cam_reason(void)       { return aowl_cam_last_reason; }
+/* Human-readable form of the last reason, so a refusal in the log names the
+ * cause instead of a bare integer the reader has to look up in this file. */
+static const char* aowl_cam_reason_text(void) {
+    switch (aowl_cam_last_reason) {
+        case 0: return "ok";
+        case 1: return "GameAssembly.dll is not mapped yet (RETRYABLE -- not a "
+                       "statement about the build)";
+        case 2: return "VirtualQuery failed on the target address";
+        case 3: return "the target page is not committed";
+        case 4: return "the target page is not executable";
+        case 5: return "the 16-byte prologue did not match the startup snapshot";
+        case 6: return "target index out of range";
+        default: return "unknown";
+    }
+}
 
 /* ------------------------------------------------------------------ *
  * The thunks.
