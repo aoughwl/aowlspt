@@ -147,9 +147,20 @@ guessed at.
         # --argc N filters by parameter count: a member that exists only at an
         # arity you never call is a member you can never bind.
   il2cpp_resolve.py <GameAssembly.dll> <global-metadata.dec.dat> methods <name>
-                                       [--shared] [--limit=N]
+                                       [--argc N] [--shared] [--limit=N] [--name]
         # the older, terser member search. Same walk; sharedness is OPT-IN via
-        # --shared and there is no --argc. Prefer `member`.
+        # --shared. Prefer `member` for a full report.
+        # A BARE NUMBER is REFUSED, not searched as a substring: `methods 16622`
+        # used to answer "no method name contains '16622'" for what was plainly
+        # a TYPE INDEX. Use `type 16622`, or `methods --name 16622` if you
+        # really did mean the digits.
+  il2cpp_resolve.py <GameAssembly.dll> <global-metadata.dec.dat> holdersof <Type>
+                                       [--limit=N] [--fields|--getters] [--exact]
+        # CAPABILITY-FIRST: who HOLDS a value of this type. Prints FIELD rows
+        # (owning type, field name, static offset -- `--` for a const, never a
+        # fabricated 0x0) and GETTER rows (zero-arg methods RETURNING it, with
+        # RVA, MethodAttributes and the three-state sharedness verdict).
+        # Matches the type name AS THE METADATA SPELLS IT (short name).
   il2cpp_resolve.py <GameAssembly.dll> <global-metadata.dec.dat> shared <RVA-or-VA>
         # the three-state detour-safety verdict for ONE address:
         # shared (n owners -- do not detour) / unique / unknown (a refusal:
@@ -359,6 +370,19 @@ class Resolver:
 
     def mtoken(self, mi):
         return struct.unpack_from("<I", self.m, self.M_OFF + mi*self.MS + 24)[0]
+
+    def mflags(self, mi):
+        """Raw MethodAttributes (`flags`@28 of Il2CppMethodDefinition, uint16).
+
+        Load-bearing, not decoration: VIRTUAL-vs-FINAL decides whether a BOUND
+        DIRECT (non-virtual) call at the RVA is what the game itself does.
+        0x09E6 = PUBLIC|FINAL|VIRTUAL|HIDEBYSIG|NEWSLOT|SPECIALNAME -- a sealed
+        override, so a direct call is exactly the dispatch the game performs.
+        A method that is VIRTUAL and NOT FINAL is genuinely overridable, and a
+        direct call to the base RVA will silently run the WRONG body for a
+        derived receiver -- a plausible answer, not a crash.
+        """
+        return struct.unpack_from("<H", self.m, self.M_OFF + mi*self.MS + 28)[0]
 
     def resolve_type(self, t):
         img = self.image_of_type(t)
@@ -1038,7 +1062,83 @@ def const_check(R):
 
 
 VERBS = ("find", "methods", "member", "type", "bytes", "shared", "verify-be",
-         "fields", "verify-fields", "enum", "verify-consts", "settings-table")
+         "fields", "verify-fields", "enum", "verify-consts", "settings-table",
+         "holdersof")
+
+# ---- MethodAttributes ------------------------------------------------------
+# ECMA-335 II.23.1.10. Only the bits that change a BIND DECISION are decoded;
+# the raw value is always printed alongside so nothing is hidden by omission.
+_MATTR_ACCESS = {0: "COMPILERCONTROLLED", 1: "PRIVATE", 2: "FAMANDASSEM",
+                 3: "ASSEM", 4: "FAMILY", 5: "FAMORASSEM", 6: "PUBLIC"}
+_MATTR_BITS = ((0x0010, "STATIC"), (0x0020, "FINAL"), (0x0040, "VIRTUAL"),
+               (0x0080, "HIDEBYSIG"), (0x0100, "NEWSLOT"),
+               (0x0400, "ABSTRACT"), (0x0800, "SPECIALNAME"))
+
+
+def decode_mattrs(flags):
+    """'0x09e6 PUBLIC|FINAL|VIRTUAL|... (sealed override: ...)'.
+
+    The trailing parenthetical is the only part that is an INTERPRETATION, and
+    it is worded so it cannot read as a blanket approval: a non-virtual method
+    is stated as such, a sealed override is stated as such, and an overridable
+    virtual is stated as a HAZARD. Nothing here says 'safe to detour' -- that
+    is `shared`'s question, and it is answered separately.
+    """
+    names = [_MATTR_ACCESS.get(flags & 0x7, "ACCESS?%d" % (flags & 0x7))]
+    names += [n for b, n in _MATTR_BITS if flags & b]
+    if flags & 0x0400:
+        verdict = "ABSTRACT: no body of its own; the RVA is not callable"
+    elif not (flags & 0x0040):
+        verdict = "non-virtual: a direct call at the RVA is the only dispatch"
+    elif flags & 0x0020:
+        verdict = ("sealed override: a direct call is exactly what the game "
+                   "itself makes")
+    else:
+        verdict = ("OVERRIDABLE VIRTUAL -- HAZARD: a direct call runs THIS "
+                   "body even for a derived receiver that overrides it")
+    return "0x%04x %s (%s)" % (flags, "|".join(names), verdict)
+
+
+def parse_argc(rest):
+    """`--argc N` / `--argc=N` -> int or None. Shared by `member` and `methods`
+    so the two flag parsers cannot drift apart."""
+    for i, a in enumerate(rest):
+        if a == "--argc":
+            if i + 1 >= len(rest):
+                sys.exit("usage error: --argc needs a parameter count, "
+                         "e.g. --argc 2")
+            return int(rest[i + 1], 0)
+        if a.startswith("--argc="):
+            return int(a.split("=", 1)[1], 0)
+    return None
+
+
+def refuse_numeric_needle(verb, needle):
+    """MEASURED DEFECT: `methods 16622` searched for the SUBSTRING '16622' in
+    method names, found none, and printed a confident
+    "no method name contains '16622' (searched all 31282 types EXHAUSTIVELY)".
+    The caller had a TYPE INDEX -- the exact form `type` accepts -- and the
+    tool answered a question nobody asked, plausibly.
+
+    A bare integer is genuinely ambiguous here and there is no safe guess, so
+    this REFUSES and names BOTH readings. It never silently picks one.
+    """
+    if not needle.strip():
+        return
+    try:
+        int(needle, 0)
+    except ValueError:
+        return
+    sys.exit(
+        "usage error: %r is a bare number and `%s` takes a NAME SUBSTRING, so "
+        "this is ambiguous.\n"
+        "  as a TYPE INDEX      -> you want:  ... type %s\n"
+        "                          (%s does NOT accept a type index)\n"
+        "  as a NAME SUBSTRING  -> say so:    ... %s --name %s\n"
+        "REFUSED rather than guessed: searching for the literal substring %r "
+        "would have printed a confident zero-hit EXHAUSTIVELY-searched verdict "
+        "-- a wrong answer to a question you did not ask."
+        % (needle, verb, needle, verb, verb, needle, needle))
 
 
 def cmd_member(R, argv):
@@ -1067,22 +1167,18 @@ def cmd_member(R, argv):
     many types; hitting the limit says so explicitly and is never reported as
     "no more matches".
     """
-    needle_raw = argv[0]
+    positional = [a for a in argv if not a.startswith("--")]
+    needle_raw = positional[0] if positional else argv[0]
+    if "--name" not in argv:
+        refuse_numeric_needle("member", needle_raw)
     needle = needle_raw.lower()
     exact = "--exact" in argv[1:]
     lim = 60
-    argc = None
     rest = argv[1:]
-    for i, a in enumerate(rest):
+    argc = parse_argc(rest)
+    for a in rest:
         if a.startswith("--limit="):
             lim = int(a.split("=", 1)[1])
-        elif a == "--argc":
-            if i + 1 >= len(rest):
-                sys.exit("usage error: --argc needs a parameter count, "
-                         "e.g. --argc 2")
-            argc = int(rest[i + 1], 0)
-        elif a.startswith("--argc="):
-            argc = int(a.split("=", 1)[1], 0)
 
     def matches(n):
         return (n.lower() == needle) if exact else (needle in n.lower())
@@ -1119,6 +1215,7 @@ def cmd_member(R, argv):
                   % (pc if pc >= 0 else "?",
                      hex(rva) if rva is not None else "None (no method pointer)",
                      img))
+            print("    attrs=%s" % decode_mattrs(R.mflags(mi)))
             if rva is None:
                 print("    UNBINDABLE: no entry in this image's "
                       "Il2CppCodeGenModule.methodPointers.")
@@ -1166,7 +1263,141 @@ def cmd_member(R, argv):
     return 0
 
 
+def cmd_holdersof(R, argv):
+    """`holdersof <TypeName> [--limit=N] [--fields|--getters] [--exact]`.
+
+    CAPABILITY-FIRST archaeology: "who HOLDS a PhysicalBase?" rather than
+    "does a symbol named X exist?". Two sessions wrote this loop by hand on
+    the same night; it found 7 of 12 otherwise-dead symbols.
+
+    Reports two DIFFERENT things and never conflates them, because they are
+    not interchangeable at a call site:
+      FIELD  -- a static offset. Read it directly; no call, no MethodInfo*.
+      GETTER -- a zero-arg method whose RETURN type matches. It must be
+                CALLED, so its sharedness and its MethodAttributes matter,
+                and both are printed.
+
+    Matching is on the type NAME as the metadata spells it (the short name
+    the field-type table yields), substring by default, `--exact` for equality.
+    It is deliberately NOT resolved through find_one: the field-type table
+    stores short/decorated names (`PhysicalBase`, `List`1<Foo>`) that a
+    typedef lookup would refuse, and refusing a query that CAN be answered is
+    its own failure.
+    """
+    positional = [a for a in argv if not a.startswith("--")]
+    if not positional:
+        sys.exit("usage error: `holdersof` needs a type name.\n"
+                 "  il2cpp_resolve.py GAMEASM METADEC holdersof <TypeName> "
+                 "[--limit=N] [--fields|--getters] [--exact]")
+    want_raw = positional[0]
+    refuse_numeric_needle("holdersof", want_raw)
+    want = want_raw.lower()
+    exact = "--exact" in argv
+    only_f = "--fields" in argv
+    only_g = "--getters" in argv
+    lim = 80
+    for a in argv:
+        if a.startswith("--limit="):
+            lim = int(a.split("=", 1)[1])
+
+    def hit(tn):
+        return (tn.lower() == want) if exact else (want in tn.lower())
+
+    nf = ng = 0
+    truncated = False
+    for t in range(R.NTYPES):
+        if truncated:
+            break
+        ns, nm = R.tname(t)
+        owner = (ns + "." + nm) if ns else nm
+        if not only_g:
+            try:
+                flds = R.declared_fields_ex(t)
+            except Exception:
+                flds = []
+            for r in flds:
+                if not hit(r["typename"]):
+                    continue
+                if nf + ng >= lim:
+                    truncated = True
+                    break
+                nf += 1
+                # A LITERAL has no storage; printing 0x0 for it is the
+                # fabricated-offset bug fields/ fldoff already refuse to make.
+                if not r["has_storage"]:
+                    off = "--  (const: NO STORAGE)"
+                elif r["off"] is None:
+                    off = "--  (%s: no offset table)" % (r["layout"] or "?")
+                else:
+                    off = "0x%X" % r["off"]
+                print("FIELD   %s.%s : %s  @%s%s"
+                      % (vis(owner), vis(r["name"]), vis(r["typename"]), off,
+                         "  [static]" if r["static"] else ""))
+        if truncated:
+            break
+        if only_f:
+            continue
+        ms = list(R.type_methods(t))
+        if not ms:
+            continue
+        _full, img, resolved = R.resolve_type(t)
+        for (mn, _rid, va), mi in zip(resolved, ms):
+            try:
+                ret, _ps, pc = R.method_sig(mi)
+            except Exception:
+                continue
+            if pc != 0 or not hit(ret):
+                continue
+            if nf + ng >= lim:
+                truncated = True
+                break
+            ng += 1
+            rva = (va - R.IB) if va else None
+            print("GETTER  %s::%s() -> %s  RVA=%s  image=%s"
+                  % (vis(owner), vis(mn), vis(ret),
+                     hex(rva) if rva is not None else "None", img))
+            print("        attrs=%s" % decode_mattrs(R.mflags(mi)))
+            if rva is not None:
+                state, n = R.sharedness(rva)
+                print("        sharedness=%s owners=%d" % (state.upper(), n))
+
+    if truncated:
+        print("... limit %d reached; re-run with --limit=N. This is NOT "
+              "'no more holders'." % lim)
+        return 0
+    if nf + ng == 0:
+        print("NO FIELD OR ZERO-ARG GETTER OF A TYPE %s %r ANYWHERE (searched "
+              "all %d types EXHAUSTIVELY). Genuine zero-hit, not an error."
+              % ("NAMED" if exact else "MATCHING", want_raw, R.NTYPES))
+        print("Note: this searches the type name AS THE METADATA SPELLS IT; "
+              "try the short name (`PhysicalBase`, not `EFT.PhysicalBase`).")
+        return 1
+    print("-- %d field(s) + %d zero-arg getter(s) of a type %s %r (all %d "
+          "types searched EXHAUSTIVELY)"
+          % (nf, ng, "named" if exact else "matching", want_raw, R.NTYPES))
+    return 0
+
+
+def usage_gaps():
+    """VERBS that the Usage: block does not document, and documented verbs that
+    do not exist. MEASURED: `methods`, `shared`, `enum`, `settings-table` and
+    the whole verify-* family were live and heavily used while absent from the
+    usage text; one agent was told to use a `member --argc` that the docs never
+    mentioned and hand-filtered arity against Resolver internals instead. Stale
+    usage text is a confidently wrong answer about the tool itself, so it is
+    now CHECKED rather than maintained by hope."""
+    usage = __doc__.split("Usage:", 1)[1] if "Usage:" in __doc__ else ""
+    undocumented = [v for v in VERBS
+                    if ("> " + v + " ") not in usage
+                    and ("> " + v + "\n") not in usage]
+    return undocumented
+
+
 def main():
+    gaps = usage_gaps()
+    if gaps:
+        sys.stderr.write("WARNING: these verbs exist but are NOT in the "
+                         "Usage: block: %s\n" % ", ".join(gaps))
     # The VERB-in-argv[1] check runs BEFORE the arity check. It used to run
     # after, so `il2cpp_resolve.py member get_Position` (3 args) fell through
     # to `sys.exit(__doc__)` and dumped ~200 lines of module docstring -- in
@@ -1233,13 +1464,26 @@ def main():
                      "  il2cpp_resolve.py GAMEASM METADEC member <name> "
                      "[--argc N] [--limit=N] [--exact]")
         sys.exit(cmd_member(R, sys.argv[4:]))
+    elif cmd == "holdersof":
+        sys.exit(cmd_holdersof(R, sys.argv[4:]))
     elif cmd == "methods":
         # `find` searches TYPE names only; this searches METHOD names, which is
         # what you want when you know a call site's name (LocalRaidEnded) but
         # not its declaring type, and it prints the full signature + RVA +
         # sharedness so the answer is directly actionable.
-        needle = sys.argv[4].lower()
+        raw_needle = sys.argv[4]
+        forced_name = "--name" in sys.argv[4:]
+        if forced_name:
+            rest_n = [a for a in sys.argv[4:] if not a.startswith("--")]
+            if not rest_n:
+                sys.exit("usage error: --name needs a member name after it.")
+            raw_needle = rest_n[0]
+        else:
+            refuse_numeric_needle("methods", raw_needle)
+        needle = raw_needle.lower()
         want_shared = "--shared" in sys.argv[5:]
+        argc = parse_argc(sys.argv[5:])
+        arity_rejected = 0
         lim = 200
         for a in sys.argv[5:]:
             if a.startswith("--limit="):
@@ -1254,6 +1498,16 @@ def main():
             for (nm, rid, va), mi in zip(resolved, ms):
                 if needle not in nm.lower():
                     continue
+                if argc is not None:
+                    try:
+                        _pc = R.method_sig(mi)[2]
+                    except Exception:
+                        _pc = -1
+                    if _pc != argc:
+                        # Counted, never hidden: "it exists, but only at an
+                        # arity you never call" is itself the answer.
+                        arity_rejected += 1
+                        continue
                 if hits >= lim:
                     print("... limit %d reached; re-run with --limit=N. This is "
                           "NOT 'no more matches'." % lim)
@@ -1267,6 +1521,7 @@ def main():
                 print("%s::%s  arity=%s RVA=%s  image=%s"
                       % (full, sig, pc if pc >= 0 else "?",
                          hex(rva) if rva is not None else "None", img))
+                print("      attrs=%s" % decode_mattrs(R.mflags(mi)))
                 if rva is None:
                     continue
                 note = R.annotate_rva(rva)
@@ -1277,8 +1532,17 @@ def main():
                 if note.strip():
                     print("      " + note.strip())
         if hits == 0:
-            print("no method name contains %r (searched all %d types "
-                  "EXHAUSTIVELY)" % (sys.argv[4], R.NTYPES))
+            if argc is not None and arity_rejected:
+                print("NO METHOD NAMED %r EXISTS AT ARITY %d (searched all %d "
+                      "types EXHAUSTIVELY)." % (raw_needle, argc, R.NTYPES))
+                print("It DOES exist at %d other aritie(s). Re-run without "
+                      "--argc to see them." % arity_rejected)
+            else:
+                print("no method name contains %r (searched all %d types "
+                      "EXHAUSTIVELY)" % (raw_needle, R.NTYPES))
+        elif argc is not None and arity_rejected:
+            print("-- %d hit(s) at arity %d; %d more rejected by --argc"
+                  % (hits, argc, arity_rejected))
     elif cmd == "type":
         args = [a for a in sys.argv[4:] if not a.startswith("--")]
         want_shared = "--shared" in sys.argv[4:]
