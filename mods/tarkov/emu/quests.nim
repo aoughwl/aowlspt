@@ -77,7 +77,14 @@ proc setState(list: var List; qid, state: string; nowSeconds: int) =
   setNumber(d, "startTime", nowSeconds)
   setNumber(d, "statusTimer", nowSeconds)
   setRaw(d, "completedConditions", "[]")
-  setBool(d, "availableAfter", false)
+  ## MEASURED, not assumed: `availableAfter` is a UNIX-second delay, an INTEGER.
+  ## A byte scan of the live db.json found 783 occurrences and every one is a
+  ## number -- 758 of them `0`, the rest 5 / 3600 / 7200 / 36000 / 43200 /
+  ## 75600 / 86400. Never a boolean. Writing `false` here made the client's
+  ## typed reader throw `error reading integer. unexpected token: Boolean.
+  ## Path '[0].Quests[N].availableAfter'` and take the quest list with it --
+  ## valid JSON, wrong TYPE, so any check that only parses would still pass.
+  setNumber(d, "availableAfter", 0)
   list.add d
 
 proc questTemplate*(qid: string): string =
