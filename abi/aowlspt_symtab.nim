@@ -658,3 +658,57 @@ const
   AOWL_SYMC_TF_GET_PARENT_NAME* = "UnityEngine.Transform::get_parent/0"
   AOWL_SYMC_TF_GET_PARENT_PROLOGUE* = [0x40'u8, 0x53'u8, 0x48'u8, 0x83'u8, 0xEC'u8, 0x20'u8, 0x48'u8, 0x8B'u8, 0x05'u8, 0xB3'u8, 0xC9'u8, 0xE1'u8, 0x01'u8, 0x48'u8, 0x8B'u8, 0xD9'u8]
 
+const
+  AOWL_SYM_SAIN_MOVER_SPRINT* = 0x01A2D700'u32
+    ## void Sprint(bool val, bool withDebugCallback)
+    ## BotMover::Sprint/2 -- section il2cpp, owners 1, arity 2
+  AOWL_SYM_SAIN_MOVER_SPRINT_ARITY* = 2
+  AOWL_SYM_SAIN_MOVER_SPRINT_OWNERS* = 1
+  AOWL_SYM_SAIN_MOVER_SPRINT_NAME* = "BotMover::Sprint/2"
+  AOWL_SYM_SAIN_MOVER_SPRINT_PROLOGUE* = [0x48'u8, 0x89'u8, 0x5C'u8, 0x24'u8, 0x08'u8, 0x57'u8, 0x48'u8, 0x83'u8, 0xEC'u8, 0x30'u8, 0x0F'u8, 0xB6'u8, 0xFA'u8, 0x48'u8, 0x8B'u8, 0xD9'u8]
+
+const
+  AOWL_SYM_SAIN_MOVER_STOP* = 0x01A2D600'u32
+    ## void Stop()
+    ## BotMover::Stop/0 -- section il2cpp, owners 1, arity 0
+  AOWL_SYM_SAIN_MOVER_STOP_ARITY* = 0
+  AOWL_SYM_SAIN_MOVER_STOP_OWNERS* = 1
+  AOWL_SYM_SAIN_MOVER_STOP_NAME* = "BotMover::Stop/0"
+  AOWL_SYM_SAIN_MOVER_STOP_PROLOGUE* = [0x48'u8, 0x83'u8, 0xEC'u8, 0x28'u8, 0x48'u8, 0x8B'u8, 0x81'u8, 0x80'u8, 0x00'u8, 0x00'u8, 0x00'u8, 0xC6'u8, 0x81'u8, 0x38'u8, 0x01'u8, 0x00'u8]
+
+const
+  AOWL_SYM_SAIN_STEERING_LOOKTO* = 0x01A3B690'u32
+    ## void LookToPoint(Vector3 point)
+    ## BotSteering::LookToPoint/1 -- section il2cpp, owners 1, arity 1
+  AOWL_SYM_SAIN_STEERING_LOOKTO_ARITY* = 1
+  AOWL_SYM_SAIN_STEERING_LOOKTO_OWNERS* = 1
+  AOWL_SYM_SAIN_STEERING_LOOKTO_NAME* = "BotSteering::LookToPoint/1"
+  AOWL_SYM_SAIN_STEERING_LOOKTO_PROLOGUE* = [0x48'u8, 0x83'u8, 0xEC'u8, 0x28'u8, 0x48'u8, 0x8B'u8, 0x41'u8, 0x10'u8, 0x48'u8, 0x85'u8, 0xC0'u8, 0x74'u8, 0x3C'u8, 0x48'u8, 0x8B'u8, 0x40'u8]
+
+const
+  AOWL_SYM_SAIN_SHOOTDATA_SHOOT* = 0x01AF7940'u32
+    ## bool Shoot()
+    ## ShootData::Shoot/0 -- section il2cpp, owners 1, arity 0
+  AOWL_SYM_SAIN_SHOOTDATA_SHOOT_ARITY* = 0
+  AOWL_SYM_SAIN_SHOOTDATA_SHOOT_OWNERS* = 1
+  AOWL_SYM_SAIN_SHOOTDATA_SHOOT_NAME* = "ShootData::Shoot/0"
+  AOWL_SYM_SAIN_SHOOTDATA_SHOOT_PROLOGUE* = [0x48'u8, 0x89'u8, 0x5C'u8, 0x24'u8, 0x20'u8, 0x57'u8, 0x48'u8, 0x83'u8, 0xEC'u8, 0x40'u8, 0x80'u8, 0x3D'u8, 0x0A'u8, 0x81'u8, 0x5C'u8, 0x05'u8]
+
+const
+  AOWL_SYM_SAIN_BOTOWNER_STOPMOVE* = 0x0081C970'u32
+    ## void StopMove()
+    ## EFT.BotOwner::StopMove/0 -- section il2cpp, owners 1, arity 0
+  AOWL_SYM_SAIN_BOTOWNER_STOPMOVE_ARITY* = 0
+  AOWL_SYM_SAIN_BOTOWNER_STOPMOVE_OWNERS* = 1
+  AOWL_SYM_SAIN_BOTOWNER_STOPMOVE_NAME* = "EFT.BotOwner::StopMove/0"
+  AOWL_SYM_SAIN_BOTOWNER_STOPMOVE_PROLOGUE* = [0x48'u8, 0x83'u8, 0xEC'u8, 0x28'u8, 0x48'u8, 0x8B'u8, 0x81'u8, 0xD0'u8, 0x03'u8, 0x00'u8, 0x00'u8, 0x48'u8, 0x85'u8, 0xC0'u8, 0x74'u8, 0x30'u8]
+
+const
+  AOWL_SYM_SAIN_NAVMESH_SAMPLE* = 0x05238930'u32
+    ## bool SamplePosition(Vector3 sourcePosition, NavMeshHit hit, float maxDistance, int areaMask)
+    ## UnityEngine.AI.NavMesh::SamplePosition/4 -- section il2cpp, owners 1, arity 4
+  AOWL_SYM_SAIN_NAVMESH_SAMPLE_ARITY* = 4
+  AOWL_SYM_SAIN_NAVMESH_SAMPLE_OWNERS* = 1
+  AOWL_SYM_SAIN_NAVMESH_SAMPLE_NAME* = "UnityEngine.AI.NavMesh::SamplePosition/4"
+  AOWL_SYM_SAIN_NAVMESH_SAMPLE_PROLOGUE* = [0x48'u8, 0x89'u8, 0x5C'u8, 0x24'u8, 0x08'u8, 0x48'u8, 0x89'u8, 0x74'u8, 0x24'u8, 0x10'u8, 0x57'u8, 0x48'u8, 0x83'u8, 0xEC'u8, 0x30'u8, 0x48'u8]
+

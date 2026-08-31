@@ -97,6 +97,7 @@ import ".." / core / enemy
 import ".." / core / hearing
 import live
 import coverprobe
+import drivecalls
 import mainthread
 
 # The type surface used for the *capability probe only*. Resolved on first use,
@@ -173,11 +174,23 @@ proc probe*(): Capability =
   crumb("step 3/7: bindAll -- resolving this mod's whole method table")
   bindAll()
   crumb("step 3/7 returned")
-  # The cover sensor, resolved on the same first tick every other binding is.
-  # It is two Unity statics rather than an EFT member, and it refuses the same
-  # way: by name, with the signature the runtime reported. See
-  # `client/coverprobe.nim` for why a matching arity is not enough.
-  crumb("step 4/7: bindProbe -- the two Unity statics the cover sampler needs")
+  # The cover sensor. This step USED to resolve two Unity statics by name and
+  # was measured as the last line the mod ever logged before the client died
+  # (fact #144 -- and that fact should be read knowing the host log loses about
+  # six statements of tail on a hard death, so it names the last line LOGGED,
+  # not necessarily the last EXECUTED).
+  #
+  # It no longer resolves anything. `bindProbe` now only BYTE-VERIFIES two
+  # offline-resolved RVAs against the startup prologue snapshot: it reads code
+  # pages, patches nothing, calls nothing into game code, and touches no export.
+  # That is why it is still safe on this thread, whichever thread this is.
+  #
+  # The CALLS are a separate question and are answered elsewhere: `runSample`
+  # is reached only from `onMainThread(coverJob)` (driver.nim) and `applyTo`
+  # only from `onMainThread(driveJob)` or the explicitly-flagged host-thread
+  # fallback. Verification here, execution on Unity's thread there.
+  crumb("step 4/7: bindProbe -- byte-verifying the cover sensor RVAs (no " &
+        "name resolved, no game code called)")
   bindProbe()
   crumb("step 4/7 returned")
   # STEP 5 NO LONGER CALLS ANYTHING. It used to call
@@ -1010,6 +1023,51 @@ func actuationFor*(d: Decision; b: BotView): Actuation =
   a.selfAct = d.self
   result = a
 
+var gMoveTargetsDropped = 0
+var gSelfActionsRefused = 0
+
+# ---------------------------------------------------------------------------
+# THE ONE-WRITER DECISION, and which actuator lost
+# ---------------------------------------------------------------------------
+#
+# There were two things writing a bot's locomotion and they were fighting on
+# last-writer-wins:
+#
+#   SERVER SIDE  `mods/sain/server/drive.nim` -> ORBIT dispatch -> the host's
+#                census, ending in `BotMover::SetTargetMoveSpeed` @0x1A2B4D0
+#                (`movss [rcx+0x15C], xmm1; ret`) and, through
+#                `abi/aowlspt_botnav.h`, the hand-written 8-argument thunk on
+#                `EFT.BotOwner::GoToPoint` @0x81CB40. Host flag `botNav`.
+#
+#   CLIENT SIDE  this file, per decide, via `BotMover::Sprint` @0x1A2D700.
+#
+# THE SERVER SIDE WINS, and the reason is not a preference. The client side
+# CANNOT ISSUE A DESTINATION at all: `GoToPoint` needs 8-9 register slots and
+# `AOWL_FAST_MAX_SLOTS` is 5, so `callrva` refuses rather than spilling to the
+# stack. An actuator that can set "sprint" but not "where to" is not a
+# locomotion actuator -- it can only make a bot run faster along a path
+# somebody else chose, which is precisely the incoherent behaviour that
+# last-writer-wins produces. The server side already owns a working
+# destination writer. So locomotion is ITS job, whole.
+#
+# What the client side keeps, because nothing else writes them: LOOK
+# (`BotSteering::LookToPoint`) and FIRE (`ShootData::Shoot`), plus reload.
+#
+# THE LOSER IS INERT, NOT SILENT. `clientDrivesLocomotion` defaults FALSE and
+# `gSprintWithheld` counts every sprint call this gate refused. A run where
+# the server side is driving therefore prints a NON-ZERO withheld count and a
+# ZERO sprint-call count, which is what "it wrote zero times" looks like when
+# it is proved rather than asserted. Turning the flag on restores the old
+# two-writer behaviour deliberately, and the state line says so.
+var gClientLocomotion = false
+var gSprintWithheld = 0
+var gSprintIssued = 0
+
+proc setClientLocomotion*(v: bool) = gClientLocomotion = v
+proc clientLocomotion*(): bool = gClientLocomotion
+proc sprintWithheld*(): int = gSprintWithheld
+proc sprintIssued*(): int = gSprintIssued
+
 proc applySelf(l: BotLive; which: SelfAction): int =
   ## The self actions, each one bound call on a component two bound calls away.
   ## All three are no-argument voids, which is the one shape the fast path is
@@ -1029,18 +1087,33 @@ proc applySelf(l: BotLive; which: SelfAction): int =
     if rl == nil: return
     if callVoidOn(gB.rlTryReload, rl): result = 1
     return
-  let med = callObj(gB.boMedecine, l.owner)
-  if med == nil:
-    return
-  if which == saFirstAid:
-    let fa = callObj(gB.medFirstAid, med)
-    if fa != nil and callVoidOn(gB.faApply, fa): result = 1
-  elif which == saStims:
-    let stim = callObj(gB.medStims, med)
-    if stim != nil and callVoidOn(gB.stimApply, stim): result = 1
-  elif which == saSurgery:
-    let surg = callObj(gB.medSurgery, med)
-    if surg != nil and callVoidOn(gB.surgApply, surg): result = 1
+  # THE THREE MEDICAL SELF-ACTIONS REFUSE, and the reason is measured rather
+  # than assumed. The old code bound them at arity ZERO by name. Offline, on
+  # this build, they do not exist at arity zero at all:
+  #
+  #   void BotFirstAid::TryApplyToCurrentPart(Nullable<int> varianAnim, Action callback)   @0x1A20740
+  #   void BotStimulators::TryApply(bool noCheckDelay, Nullable<int> animVarian, Action<bool> callback) @0x1A245E0
+  #   void BotSurgicalKit::ApplyToCurrentPart(Action callbackEndUse)                       @0x1A252F0
+  #
+  # Two things block them, and neither is worked around here:
+  #
+  # 1. `Nullable<int>` is an 8-BYTE by-value aggregate. Win64 passes a struct
+  #    of exactly 1/2/4/8 bytes IN the register rather than by pointer, and
+  #    that case has NOT been measured on this build -- `callrva.addAggregate`
+  #    refuses it by name for precisely this reason. The difference between the
+  #    two conventions is a call with its arguments in the wrong registers,
+  #    which returns plausibly and corrupts.
+  # 2. Every one of them takes a managed `Action` delegate. Passing null means
+  #    betting that the callee null-checks before invoking; nothing here has
+  #    measured that it does, and constructing a real delegate needs the
+  #    reflective surface this mod does not use.
+  #
+  # So: no call, one line saying which self-action was wanted, and the decision
+  # ladder carries on. `saReload` above is unaffected.
+  if which == saFirstAid or which == saStims or which == saSurgery:
+    inc gSelfActionsRefused
+    return 0
+
 
 proc applyTo*(l: BotLive; a: Actuation): int =
   ## Push an actuation into the game. Returns how many calls were made, which is
@@ -1082,25 +1155,46 @@ proc applyTo*(l: BotLive; a: Actuation): int =
   if l.owner == nil:
     return calls
 
+  # EVERY HOP AND EVERY CALL BELOW IS NOW OFFLINE-RESOLVED. `callObj(gB.boMover,
+  # ..)` and friends resolved a NAME through the runtime; `drivecalls` reads a
+  # MEASURED static field offset instead and calls a byte-verified static RVA.
+  # Nothing here asks the export ABI for anything.
+
   if a.hasMoveTarget:
-    let mover = callObj(gB.boMover, l.owner)
-    if mover != nil:
-      # `flag` is the first bool parameter of whichever `GoToPoint` overload
-      # resolved, which on every version of this method is "slow down at the
-      # end". A sprinting bot does not.
-      if callVec(gB.mvGoTo, mover, a.moveTo, not a.sprint):
-        inc calls
-      if callBoolArg(gB.mvSprint, mover, a.sprint):
-        inc calls
+    # THE DESTINATION IS THE ONE THING THAT STILL DOES NOT LAND, and it must
+    # say so rather than look like it worked. `BotMover::GoToPoint` @0x1A2EE00
+    # takes 8 register slots including `this` and `EFT.BotOwner::GoToPoint`
+    # @0x81CB40 takes 9; `AOWL_FAST_MAX_SLOTS` is 5, because Win64 puts
+    # everything past the fourth argument on the STACK and the shape dispatcher
+    # does not express a stack argument. `callrva` refuses rather than spills,
+    # which is right.
+    #
+    # What DOES land, and what this reduces to today: the bot is told to stop
+    # or to sprint, and it is steered. The route out is `aowlspt/botnav`, whose
+    # hand-written thunk in `abi/aowlspt_botnav.h` already calls the 8-argument
+    # GoToPoint correctly -- it needs the host census's bot ID, which this mod
+    # does not yet map to its own `Player*`. Named in README.md, not half-built
+    # here.
+    inc gMoveTargetsDropped
+    # The one-writer gate. Default OFF, so the server side owns locomotion and
+    # this counts what it did not do.
+    if not gClientLocomotion:
+      inc gSprintWithheld
+    else:
+      let mover = moverOf(l.owner)
+      if mover != nil:
+        if setSprint(mover, a.sprint):
+          inc gSprintIssued
+          inc calls
 
   if a.hasLookTarget:
-    let st = callObj(gB.boSteering, l.owner)
-    if st != nil and callVec(gB.stLookTo, st, a.lookAt, false):
+    let st = steeringOf(l.owner)
+    if st != nil and lookToPoint(st, a.lookAt):
       inc calls
 
   if a.shoot:
-    let sd = callObj(gB.boShoot, l.owner)
-    if sd != nil and callVoidOn(gB.sdShoot, sd):
+    let sd = shootDataOf(l.owner)
+    if sd != nil and fireOnce(sd):
       inc calls
 
   result = calls
@@ -1314,6 +1408,17 @@ proc driveStale*(): int = gDriveStale
 proc driveGone*(): int = gDriveGone
 proc driveRuns*(): int = gDriveRun
 proc driveCalls*(): int = gDriveCalls
+
+proc selfActionsRefused*(): int = gSelfActionsRefused
+  ## How many medical self-actions were wanted and not delivered. Same reason
+  ## as `moveTargetsDropped`: a refusal that is not counted is a silent one.
+
+proc moveTargetsDropped*(): int = gMoveTargetsDropped
+  ## How many times a decision produced a destination this mod could not
+  ## deliver. Reported in `report()` because a silently dropped order is
+  ## exactly the failure CLAUDE.md 6 forbids: a bot that steers and sprints
+  ## but never walks anywhere looks, on screen, like a bug in the decision
+  ## ladder rather than a missing call shape.
 proc driveHostThreadRuns*(): int = gDriveHostThread
 
 proc driveCostNs*(): int64 =

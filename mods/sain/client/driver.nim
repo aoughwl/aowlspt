@@ -59,6 +59,7 @@ import ".." / preset / preset
 import bridge
 import live
 import coverprobe
+import drivecalls
 import mainthread
 
 const
@@ -142,6 +143,19 @@ type
     coverAt: float
     coverFrom: Vec3
     alive: bool
+    ## THE BEHAVIOURAL ACCEPTANCE WITNESS (§9b), and it is deliberately not a
+    ## structural one. "The call returned true" is a property of our own write;
+    ## the only thing that settles whether this mod drives a bot is whether the
+    ## bot's position CHANGED after we told it to move, read back out of the
+    ## game on a later tick.
+    ##
+    ## `witnessAt` is when an order that asked for locomotion was issued, or
+    ## <= 0 when none is outstanding. `witnessFrom` is where the bot stood at
+    ## that instant. Both come from readings this tick already took, so the
+    ## witness costs no extra game call -- which matters, because an acceptance
+    ## test that perturbs the thing it measures is not one.
+    witnessAt: float
+    witnessFrom: Vec3
 
 var gBots: seq[BotState] = @[]
 var gPreset: Preset
@@ -453,6 +467,37 @@ var gDriveJobs = 0
 var gDriveGated = 0
 var gDrivePosted = 0
 
+# ---------------------------------------------------------------------------
+# The acceptance witness: did a bot MOVE because we told it to?
+# ---------------------------------------------------------------------------
+#
+# THREE OUTCOMES, NEVER TWO, and the third is the one this project keeps
+# paying for. `gWitnessOrders` counts locomotion orders that were actually
+# ISSUED to the game; `gWitnessMoved` counts the ones after which the bot's
+# position changed by more than `WitnessMoved` within `WitnessWindow`; and
+# `gWitnessStill` counts the ones whose window expired with the bot where it
+# started.
+#
+# So `gWitnessOrders == 0` reads INCONCLUSIVE -- "we never drove" -- and can
+# never read PASS. That distinction is the whole point: a raid where the flag
+# was off, the drain never fired or no bot ever spawned looks exactly like a
+# raid where every call was made and nothing moved, unless the two are counted
+# apart. They are counted apart here.
+#
+# The falsifier is stated so the check can fail: if the driving calls do
+# nothing -- a wrong calling convention, a stub, an order the game discards --
+# every window expires and `gWitnessStill` equals `gWitnessOrders`, which
+# prints FAIL. A bot that wanders on the game's own AI would have to move
+# within two seconds of OUR order to fool this, so the verdict is stated as a
+# rate rather than a bare yes, and a rate near the ambient one is not a pass.
+const WitnessWindow = 2.0       ## seconds an order has to produce motion
+const WitnessMoved = 0.25       ## squared metres; 0.5 m of travel
+
+var gWitnessOrders = 0
+var gWitnessMoved = 0
+var gWitnessStill = 0
+var gWitnessLost = 0            ## bot died or went unreadable inside the window
+
 proc driveJob(payload: string): string =
   ## Everything queued, on Unity's thread. Two statements and no state of its
   ## own: `runDrives` owns the ring and the counters.
@@ -519,7 +564,7 @@ proc spawnBot*(id: string; spawnType: string; difficulty: float) =
     lastDecisionAt: 0.0, lastAppliedCombat: cdNone,
     lastAppliedMove: zeroVec(), lastApplyAt: -999.0,
     lastPosition: zeroVec(), coverAt: -999.0, coverFrom: zeroVec(),
-    alive: true)
+    alive: true, witnessAt: -1.0, witnessFrom: zeroVec())
   if gPreset.logDecisions:
     debug "sain: " & id & " spawned as " & roleName(role) & "/" &
           personalityName(personality)
@@ -952,6 +997,18 @@ proc tickBot(index: int): bool =
   if damage > 0.0:
     st.lastDamagedAt = gTimeSeconds
 
+  # --- settle any outstanding acceptance witness, BEFORE this tick can arm a
+  # new one. `me.position` was read out of the live game a few lines up, so
+  # this is the finished state rather than a property of our own write.
+  if st.witnessAt > 0.0:
+    let age = gTimeSeconds - st.witnessAt
+    if sqrDistance(me.position, st.witnessFrom) > WitnessMoved:
+      gWitnessMoved = gWitnessMoved + 1
+      st.witnessAt = -1.0
+    elif age >= WitnessWindow:
+      gWitnessStill = gWitnessStill + 1
+      st.witnessAt = -1.0
+
   st.lastDecisionAt = gTimeSeconds
   st.lastPosition = me.position
   st.lastHealth = me.healthNormalized
@@ -1132,6 +1189,25 @@ proc tickBot(index: int): bool =
       st.lastAppliedCombat = d.combat
       st.lastAppliedMove = d.moveTo
       st.lastApplyAt = gTimeSeconds
+      # ARM THE WITNESS, and only for an order that asked for LOCOMOTION. An
+      # order that only steers the head or pulls a trigger must not be counted
+      # as a movement order it never was -- that inflation is exactly the
+      # "check that cannot fail" shape, because a bot walking on the game's own
+      # AI would then score every look order as a success.
+      #
+      # AND ONLY WHEN THIS ACTUATOR IS THE ONE THAT WRITES LOCOMOTION. With
+      # `clientDrivesLocomotion` off -- the default, because the server side
+      # won the one-writer decision -- no locomotion call leaves this mod, so
+      # arming here would count orders the game never heard and then score
+      # them against motion the SERVER side caused. That is a check that
+      # cannot fail, wearing the costume of one that can. The honest reading
+      # in that configuration is INCONCLUSIVE, and the verdict says so and
+      # names `server/drive.nim`'s own `driveCheck` as the instrument for the
+      # path that is actually driving.
+      if a.hasMoveTarget and clientLocomotion() and st.witnessAt <= 0.0:
+        st.witnessAt = gTimeSeconds
+        st.witnessFrom = me.position
+        gWitnessOrders = gWitnessOrders + 1
     if gPreset.logDecisions:
       debug "sain: " & st.handle.id & " -> " & decisionName(d.combat) &
             " / " & squadDecisionName(d.squad) & " / " &
@@ -1301,6 +1377,46 @@ proc releaseAll*() =
     drop(gHumanHandle)
     gHumanHandle = 0'u32
 
+proc driveVerdict*(): string =
+  ## The §9b acceptance verdict, in the only terms that settle it: PASS / FAIL /
+  ## INCONCLUSIVE, decided by whether bots MOVED, never by whether calls
+  ## returned.
+  ##
+  ## The order of the branches is the argument. `orders == 0` is checked FIRST
+  ## and is INCONCLUSIVE, because a run that never drove is not a run that
+  ## drove and failed, and flattening those two together has cost this project
+  ## whole sessions. Only once orders were genuinely issued does a settled
+  ## window get to decide anything, and a run whose windows are all still open
+  ## is inconclusive too -- "I could not look" is not a pass.
+  let settled = gWitnessMoved + gWitnessStill
+  let c = "counters: " & $gWitnessOrders & " locomotion orders issued, " &
+          $gWitnessMoved & " moved >0.5 m within " & $WitnessWindow &
+          " s, " & $gWitnessStill & " did not, " & $gWitnessLost &
+          " lost (bot died or went unreadable inside the window)"
+  if gWitnessOrders == 0:
+    var why = "Read the NOT DELIVERED and RVA-target lines above for why"
+    if not clientLocomotion():
+      why = "EXPECTED here: clientDrivesLocomotion is off, so the server " &
+            "side owns locomotion by the one-writer decision and this " &
+            "actuator withheld " & $sprintWithheld() & " sprint calls. The " &
+            "instrument for the path that IS driving is server/drive.nim's " &
+            "driveCheck, not this line"
+    return "DRIVE ACCEPTANCE: INCONCLUSIVE -- WE NEVER DROVE. No locomotion " &
+           "order left this actuator, so nothing about the driving calls " &
+           "was tested. " & why & ". Do NOT read this as a failure of the " &
+           "calls. " & c
+  if settled == 0:
+    return "DRIVE ACCEPTANCE: INCONCLUSIVE -- orders were issued but no " &
+           "witness window has settled yet (the raid ended inside " &
+           $WitnessWindow & " s of the first order). " & c
+  if gWitnessMoved == 0:
+    return "DRIVE ACCEPTANCE: FAIL -- every settled order left the bot where " &
+           "it stood. The calls returned; the bots did not move. " & c
+  result = "DRIVE ACCEPTANCE: PASS -- " & $gWitnessMoved & " of " & $settled &
+           " settled orders were followed by real motion. Judge the RATE, " &
+           "not the count: a rate near what idle bots do on the game's own " &
+           "AI is not evidence we drove them. " & c
+
 proc driveStats*(): string =
   ## Which thread drove, how much, and everything that did not get driven. The
   ## counters are separate on purpose: "queued" and "executed" differing by
@@ -1330,6 +1446,28 @@ proc driveStats*(): string =
     result = result & ", " & $ns & " ns a drain"
   else:
     result = result & ", nothing measured: no drain has run"
+  # WHAT WAS WANTED AND NOT DELIVERED, always, on every path. A total of game
+  # calls that goes up looks like success even when the one call that moves a
+  # bot is the one being dropped, so the two refusals are printed next to it
+  # rather than inferred from its absence.
+  result = result & " -- NOT DELIVERED: " & $moveTargetsDropped() &
+           " destinations (GoToPoint needs 8-9 register slots; the shape " &
+           "dispatcher tops out at 5 and refuses rather than spilling to the " &
+           "stack -- route is aowlspt/botnav), " & $selfActionsRefused() &
+           " medical self-actions (Nullable<int> is an 8-byte by-value " &
+           "aggregate whose register-vs-pointer convention is unmeasured on " &
+           "this build, and each takes a managed Action)"
+  # THE ONE-WRITER LINE. The loser is proved inert rather than assumed to be:
+  # a zero here next to a non-zero withheld count is the evidence.
+  result = result & " -- one writer: locomotion belongs to " &
+           (if clientLocomotion(): "THIS CLIENT ACTUATOR (clientDrivesLocomotion on)"
+            else: "the SERVER side (server/drive.nim -> SetTargetMoveSpeed/botnav)") &
+           "; client sprint calls issued " & $sprintIssued() & ", withheld " &
+           $sprintWithheld()
+  result = result & " -- RVA targets: " & driveWhy()
+  if driveDisabled():
+    result = result & " [SELF-DISABLED after " & $driveFaults() & " faults]"
+  result = result & " -- " & driveVerdict()
 
 proc stats*(): string =
   result = $gBots.len & " bots, " & $gDecisionsMade & " decisions, " &

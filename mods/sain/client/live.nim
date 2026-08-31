@@ -616,12 +616,28 @@ proc rvaLoad() =
   gRvaRefusals = sainRvaRefusals()
 
 const ReflectionRefusal* =
-  "IL2CPP by-name resolution is refused on this build: " &
-  "il2cpp_class_from_name and il2cpp_class_get_method_from_name return " &
-  "NON-NIL handles into unmapped memory (fact #35), so a nil check passes " &
-  "and the first dereference kills the client -- measured, this mod died " &
-  "inside exactly that call. Set allowIl2cppReflection in config.json to " &
-  "re-measure it on a future build."
+  # THIS SENTENCE WAS WRONG ABOUT THE MECHANISM AND USERS READ IT.
+  # "Handles into unmapped memory" was the SYMPTOM. Measured offline
+  # (docs/IL2CPP_EXPORTS.md): this is stock IL2CPP behind a TOKEN-GATED export
+  # ABI. 40 of the 241 exports take an undocumented trailing pointer to 32
+  # bytes and memcmp it; on a mismatch -- every call we make, since we never
+  # pass a token -- they return a UNIFORM RANDOM NON-ZERO uint64 from a
+  # per-thread MT19937-64. Nothing faults at the call. The distinction matters
+  # because "it is broken" invites hunting for a working variant, while "it
+  # answers a random number that passes every check you can write" says why no
+  # run-time check can save it -- and why the fix is to resolve OFFLINE
+  # (abi/aowlspt_symbols.txt -> client/drivecalls.nim) rather than check harder.
+  "IL2CPP by-name resolution is refused on this build. " &
+  "il2cpp_class_from_name and il2cpp_class_get_method_from_name are " &
+  "TOKEN-GATED: they take a trailing 32-byte token the stock signature does " &
+  "not have, and on a mismatch they do not fail -- they return a uniform " &
+  "random non-zero uint64 (measured offline, docs/IL2CPP_EXPORTS.md). So a " &
+  "nil check passes, every signature check runs happily on a random number, " &
+  "and the first real dereference kills the client with a log identical to a " &
+  "healthy run. There is no run-time check that can catch this, which is why " &
+  "the fix is to resolve OFFLINE (abi/aowlspt_symbols.txt -> " &
+  "client/drivecalls.nim) rather than to check harder. Set " &
+  "allowIl2cppReflection in config.json only to re-measure on a future build."
 
 proc reflectionRefused*(where: string = ""): bool =
   ## True when the caller must not resolve by name. Says so once per session:

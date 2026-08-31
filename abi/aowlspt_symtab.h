@@ -52,7 +52,7 @@
 #define AOWL_SYMTAB_UNIVERSAL_STUB_RVA 0x00628110u
 #define AOWL_SYMTAB_UNIVERSAL_STUB_OWNERS 9614
 
-/* 64 accepted, 7 shared-call escape hatch, 0 rejected. */
+/* 70 accepted, 7 shared-call escape hatch, 1 rejected. */
 
 /* ---- detour-safe and call-safe: exactly one owner ------------- */
 
@@ -760,6 +760,72 @@
 #define AOWL_SYM_ONRENDEROBJ_MANAGER_SECTION "il2cpp"
 #define AOWL_SYM_ONRENDEROBJ_MANAGER_PROLOGUE 0x40,0x55,0x48,0x83,0xEC,0x20,0x80,0x3D,0x83,0xA8,0x17,0x05,0x00,0x48,0x8B,0xE9
 
+/* void Sprint(bool val, bool withDebugCallback)
+ *   BotMover::Sprint/2
+ *   RVA 0x01A2D700  section il2cpp  owners 1  arity 2
+ */
+#define AOWL_SYM_SAIN_MOVER_SPRINT              0x01A2D700u
+#define AOWL_SYM_SAIN_MOVER_SPRINT_ARITY 2
+#define AOWL_SYM_SAIN_MOVER_SPRINT_OWNERS 1
+#define AOWL_SYM_SAIN_MOVER_SPRINT_NAME "BotMover::Sprint/2"
+#define AOWL_SYM_SAIN_MOVER_SPRINT_SECTION "il2cpp"
+#define AOWL_SYM_SAIN_MOVER_SPRINT_PROLOGUE 0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x30,0x0F,0xB6,0xFA,0x48,0x8B,0xD9
+
+/* void Stop()
+ *   BotMover::Stop/0
+ *   RVA 0x01A2D600  section il2cpp  owners 1  arity 0
+ */
+#define AOWL_SYM_SAIN_MOVER_STOP                0x01A2D600u
+#define AOWL_SYM_SAIN_MOVER_STOP_ARITY 0
+#define AOWL_SYM_SAIN_MOVER_STOP_OWNERS 1
+#define AOWL_SYM_SAIN_MOVER_STOP_NAME "BotMover::Stop/0"
+#define AOWL_SYM_SAIN_MOVER_STOP_SECTION "il2cpp"
+#define AOWL_SYM_SAIN_MOVER_STOP_PROLOGUE 0x48,0x83,0xEC,0x28,0x48,0x8B,0x81,0x80,0x00,0x00,0x00,0xC6,0x81,0x38,0x01,0x00
+
+/* void LookToPoint(Vector3 point)
+ *   BotSteering::LookToPoint/1
+ *   RVA 0x01A3B690  section il2cpp  owners 1  arity 1
+ */
+#define AOWL_SYM_SAIN_STEERING_LOOKTO           0x01A3B690u
+#define AOWL_SYM_SAIN_STEERING_LOOKTO_ARITY 1
+#define AOWL_SYM_SAIN_STEERING_LOOKTO_OWNERS 1
+#define AOWL_SYM_SAIN_STEERING_LOOKTO_NAME "BotSteering::LookToPoint/1"
+#define AOWL_SYM_SAIN_STEERING_LOOKTO_SECTION "il2cpp"
+#define AOWL_SYM_SAIN_STEERING_LOOKTO_PROLOGUE 0x48,0x83,0xEC,0x28,0x48,0x8B,0x41,0x10,0x48,0x85,0xC0,0x74,0x3C,0x48,0x8B,0x40
+
+/* bool Shoot()
+ *   ShootData::Shoot/0
+ *   RVA 0x01AF7940  section il2cpp  owners 1  arity 0
+ */
+#define AOWL_SYM_SAIN_SHOOTDATA_SHOOT           0x01AF7940u
+#define AOWL_SYM_SAIN_SHOOTDATA_SHOOT_ARITY 0
+#define AOWL_SYM_SAIN_SHOOTDATA_SHOOT_OWNERS 1
+#define AOWL_SYM_SAIN_SHOOTDATA_SHOOT_NAME "ShootData::Shoot/0"
+#define AOWL_SYM_SAIN_SHOOTDATA_SHOOT_SECTION "il2cpp"
+#define AOWL_SYM_SAIN_SHOOTDATA_SHOOT_PROLOGUE 0x48,0x89,0x5C,0x24,0x20,0x57,0x48,0x83,0xEC,0x40,0x80,0x3D,0x0A,0x81,0x5C,0x05
+
+/* void StopMove()
+ *   EFT.BotOwner::StopMove/0
+ *   RVA 0x0081C970  section il2cpp  owners 1  arity 0
+ */
+#define AOWL_SYM_SAIN_BOTOWNER_STOPMOVE         0x0081C970u
+#define AOWL_SYM_SAIN_BOTOWNER_STOPMOVE_ARITY 0
+#define AOWL_SYM_SAIN_BOTOWNER_STOPMOVE_OWNERS 1
+#define AOWL_SYM_SAIN_BOTOWNER_STOPMOVE_NAME "EFT.BotOwner::StopMove/0"
+#define AOWL_SYM_SAIN_BOTOWNER_STOPMOVE_SECTION "il2cpp"
+#define AOWL_SYM_SAIN_BOTOWNER_STOPMOVE_PROLOGUE 0x48,0x83,0xEC,0x28,0x48,0x8B,0x81,0xD0,0x03,0x00,0x00,0x48,0x85,0xC0,0x74,0x30
+
+/* bool SamplePosition(Vector3 sourcePosition, NavMeshHit hit, float maxDistance, int areaMask)
+ *   UnityEngine.AI.NavMesh::SamplePosition/4
+ *   RVA 0x05238930  section il2cpp  owners 1  arity 4
+ */
+#define AOWL_SYM_SAIN_NAVMESH_SAMPLE            0x05238930u
+#define AOWL_SYM_SAIN_NAVMESH_SAMPLE_ARITY 4
+#define AOWL_SYM_SAIN_NAVMESH_SAMPLE_OWNERS 1
+#define AOWL_SYM_SAIN_NAVMESH_SAMPLE_NAME "UnityEngine.AI.NavMesh::SamplePosition/4"
+#define AOWL_SYM_SAIN_NAVMESH_SAMPLE_SECTION "il2cpp"
+#define AOWL_SYM_SAIN_NAVMESH_SAMPLE_PROLOGUE 0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x74,0x24,0x10,0x57,0x48,0x83,0xEC,0x30,0x48
+
 /* ---- CALL ONLY. Deliberately spelled AOWL_SYMC_, not AOWL_SYM_.
  * There is no AOWL_SYM_ form of these, so a detour site cannot
  * reach one by accident -- it has to be typed on purpose, and
@@ -869,5 +935,13 @@
 #define AOWL_SYMC_TF_GET_PARENT_NAME "UnityEngine.Transform::get_parent/0"
 #define AOWL_SYMC_TF_GET_PARENT_SECTION "il2cpp"
 #define AOWL_SYMC_TF_GET_PARENT_PROLOGUE 0x40,0x53,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,0xB3,0xC9,0xE1,0x01,0x48,0x8B,0xD9
+
+/* ---- REJECTED. Each expands to an undefined identifier. ------- */
+
+/* SAIN_PHYSICS_RAYCAST -> ambiguous_arity_star_has_multiple_overloads
+ *   UnityEngine.Physics::Raycast/3 did not resolve to a unique code address
+ */
+#define AOWL_SYM_SAIN_PHYSICS_RAYCAST AOWL_SYMBOL_REJECTED__SAIN_PHYSICS_RAYCAST__ambiguous_arity_star_has_multiple_overloads
+#define AOWL_SYMC_SAIN_PHYSICS_RAYCAST AOWL_SYMBOL_REJECTED__SAIN_PHYSICS_RAYCAST__ambiguous_arity_star_has_multiple_overloads
 
 #endif /* AOWLSPT_SYMTAB_H */

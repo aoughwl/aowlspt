@@ -74,6 +74,16 @@ type
     ## every host that has not grown the drain. `driveStats()` says which path
     ## a session actually took, so a log distinguishes the two.
     driveFromHostThread*: bool
+    ## Whether the CLIENT-side actuator may write locomotion (BotMover::Sprint).
+    ##
+    ## Default FALSE, and that is the one-writer decision rather than caution.
+    ## The server side (server/drive.nim, host flag `botNav`) owns locomotion
+    ## because it is the only path that can issue a DESTINATION; this actuator
+    ## tops out at 5 register slots and GoToPoint needs 8-9. Turning this on
+    ## restores two writers on one bot and last-writer-wins between them, which
+    ## is the incoherent behaviour the decision exists to remove. Off, the
+    ## refusals are COUNTED (`sprintWithheld`) rather than silent.
+    clientDrivesLocomotion*: bool
     ## Whether this mod may use IL2CPP **by-name** resolution at all.
     ##
     ## Default **false**, and that default is a measured fact rather than
@@ -282,6 +292,8 @@ proc loadPreset*(): Preset =
     logDecisions: doc.field("logDecisions").asBool(false),
     driveFromHostThread:
       doc.field("driveFromHostThread").asBool(true),
+    clientDrivesLocomotion:
+      doc.field("clientDrivesLocomotion").asBool(false),
     allowIl2cppReflection:
       doc.field("allowIl2cppReflection").asBool(false),
     rvaTable:
