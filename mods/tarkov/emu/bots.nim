@@ -451,6 +451,21 @@ var gSlotUnknown = 0
   ## item list, or the parent template is absent from the database. INCONCLUSIVE
   ## is not a failure: these are KEPT, and counted separately so a database gap
   ## never reads as a clean run.
+var gStackAudited = 0
+  ## Items in a FINISHED, about-to-be-served bot inventory whose template
+  ## declares a random spawn range (`_props.StackMaxRandom`) -- currency and
+  ## loose ammunition on stock data. Counted by reading the serialised payload
+  ## back, not by trusting the generator's own locals: the "roll a real stack"
+  ## code path already existed once and still shipped $1 bills.
+var gStackFlat = 0
+  ## Of those, how many were served with `upd.StackObjectsCount` MISSING or <= 1
+  ## -- i.e. the single dollar the player pulls off a corpse. **This is the
+  ## number that must be zero.** It is a negative assertion on the finished
+  ## state, so it can actually fail; the previous check ("did I write an upd?")
+  ## could not.
+var gStackSum = 0
+  ## Total units across every audited stack, so the reported average says whether
+  ## the roll is plausible (dollars 45..100) rather than merely non-one.
 
 proc chamberRounds(inv: JsonRef; items: var List;
                    weaponId, weaponTpl, caliber: string; r: var Rng;
@@ -1162,11 +1177,67 @@ proc validateSlots*(items: List; report: var seq[string];
   gSlotDropped = gSlotDropped + removed
   result = removed
 
+proc auditStacks*(items: List; flat: var seq[string]): int =
+  ## Reads a FINISHED bot inventory back and returns how many stackable items
+  ## were served as a stack of one or fewer.
+  ##
+  ## This is the check the last money fix did not have. That fix asserted its own
+  ## write ("I called `setNumber(upd, ...)`"), which is a check that cannot fail
+  ## (CLAUDE.md 9b). This one asserts the finished state, as a negative: of the
+  ## items in the payload whose TEMPLATE declares `_props.StackMaxRandom`, none
+  ## may carry `upd.StackObjectsCount` missing or <= 1. A regression anywhere
+  ## between the roll and the wire -- a dropped `upd`, an `upd` overwritten by a
+  ## later `setRaw`, a template whose range vanished from the database -- shows
+  ## up here, because the only thing consulted is the serialised text.
+  ##
+  ## Ammunition inside a magazine is deliberately IN scope: a chambered round is
+  ## legitimately a stack of one, but it is written by `chamberRounds` with an
+  ## explicit count, and a magazine filled with one round is a bug of the same
+  ## family. `flat` names the offenders (`<tpl> in <slotId>`) so the counter line
+  ## can say which template, not just how many.
+  ##
+  ## Same `text(items)`-once discipline as `validateSlots`, and for the same
+  ## measured reason: `raw(items.at(i))` faults on this nimony.
+  let blob = text(items)
+  let doc = whole(blob)
+  let n = count(doc)
+  result = 0
+  for i in 0 ..< n:
+    let one = at(doc, i)
+    let tpl = one.field("_tpl").asText("")
+    if tpl.len == 0:
+      continue
+    # The template's own declaration is the discriminator, exactly as in
+    # `randomStackCount` -- never a hardcoded currency list, which would go stale
+    # the moment the database gains a currency.
+    # `itemMember`, not `itemProp`: it honours the test fixture, so this check
+    # also runs under `aowl selfcheck`, which has NO database loaded. A check
+    # that cannot run is not a check. `_props` is fetched whole and then
+    # traversed, because the fixture seam matches a member name literally and
+    # would read a dotted path as one key.
+    let hi = itemMember(tpl, "_props").field("StackMaxRandom")
+    if not hi.found:
+      continue
+    inc gStackAudited
+    let cnt = one.field("upd").field("StackObjectsCount").asInt(0)
+    if cnt <= 1:
+      inc gStackFlat
+      result = result + 1
+      if flat.len < 8:
+        flat.add tpl & " in " & one.field("slotId").asText("(grid)") &
+                 " count=" & $cnt
+    else:
+      gStackSum = gStackSum + cnt
+
 proc botGuardCounters*(): string =
   ## The one line a live raid gets to say what happened, instead of nothing.
   "bots: chambered " & $gChambered & ", chamber-skipped " & $gChamberSkipped &
   " (no accepted round), slot-dropped " & $gSlotDropped &
   ", slot-unjudged " & $gSlotUnknown &
+  ", stackable " & $gStackAudited & " (flat<=1: " & $gStackFlat &
+  ", avg " & (if gStackAudited > gStackFlat:
+                $(gStackSum div (gStackAudited - gStackFlat))
+              else: "n/a") & ")" &
   (if gSlotDropped > 0: ", top drops (count rule|parent|child|slot):" &
                         botDropHistogram(10)
    else: "")
@@ -1623,6 +1694,18 @@ proc generateProfile*(t: BotTables; base: string; req: BotRequest;
     else:
       aowlspt.warn("bots: dropped " & $removed &
                    " invalid placement(s) from a bot: " & violations[0])
+
+  # And the money check, on the list that is about to be serialised into the
+  # response -- after the validator, so it audits exactly what the client gets.
+  # Warn once per bot with the offending template named: "the scavs spawn with a
+  # single dollar" was reported live, and the counter line alone would have said
+  # nothing at all about it.
+  var flatStacks: seq[string] = @[]
+  let flatN = auditStacks(items, flatStacks)
+  if flatN > 0:
+    aowlspt.warn("bots: WARN " & $flatN & " stackable item(s) served with " &
+                 "StackObjectsCount <= 1 -- currency/ammo rolled flat: " &
+                 flatStacks[0])
 
   var inventory = parseObject(field(base, "Inventory"))
   setRaw(inventory, "items", text(items))
@@ -2107,6 +2190,55 @@ proc selfCheckBots*(into: var seq[string]): bool =
     if not named:
       into.add "bots: the validator's report does not name the offending " &
                "template and weapon, so a live failure says nothing"
+
+  block moneyStacks:
+    # The live report was "the scavs spawn with a single dollar". The generator
+    # already rolls a stack; what was missing is a check that could SAY it did
+    # not. This exercises the detector against a payload that contains the bug,
+    # so the detector itself cannot be a check that only says yes.
+    setSlotFixture("{" &
+      "\"dollars\": {\"_props\": {\"StackMinRandom\": 45, " &
+                                 "\"StackMaxRandom\": 100}}," &
+      "\"medkit\": {\"_props\": {\"Width\": 1}}}")
+    let savedAudited = gStackAudited
+    let savedFlat = gStackFlat
+    let savedSum = gStackSum
+    var money = newList()
+    money.add "{\"_id\":\"k1\",\"_tpl\":\"dollars\",\"slotId\":\"Pockets\"," &
+              "\"upd\":{\"StackObjectsCount\":73}}"
+    money.add "{\"_id\":\"k2\",\"_tpl\":\"dollars\",\"slotId\":\"Pockets\"}"
+    money.add "{\"_id\":\"k3\",\"_tpl\":\"dollars\",\"slotId\":\"Pockets\"," &
+              "\"upd\":{\"StackObjectsCount\":1}}"
+    money.add "{\"_id\":\"k4\",\"_tpl\":\"medkit\",\"slotId\":\"Pockets\"}"
+
+    # STRICT parse first: the backend selftest once asserted with substring
+    # `contains`, so a payload that was not JSON at all passed for months.
+    let moneyText = text(money)
+    let moneyDoc = parseArray(whole(moneyText))
+    if not moneyDoc.ok:
+      into.add "bots: the money fixture is not a JSON array"
+
+    var flat: seq[string] = @[]
+    let flatN = auditStacks(money, flat)
+    if flatN != 2:
+      into.add "bots: auditStacks found " & $flatN & " flat stack(s); the " &
+               "fixture plants exactly 2 (a currency item with NO upd, and " &
+               "one with StackObjectsCount 1) and one legitimate stack of 73"
+    if gStackAudited - savedAudited != 3:
+      into.add "bots: auditStacks audited " & $(gStackAudited - savedAudited) &
+               " item(s); it must audit the 3 that declare StackMaxRandom and " &
+               "NOT the medkit -- a detector that counts every item would " &
+               "report every bot as broken"
+    var namedTpl = false
+    for line in flat:
+      if find(line, "dollars") >= 0:
+        namedTpl = true
+    if not namedTpl:
+      into.add "bots: auditStacks does not name the offending template, so a " &
+               "live warning says nothing more than the counter already does"
+    gStackAudited = savedAudited
+    gStackFlat = savedFlat
+    gStackSum = savedSum
   setSlotFixture("")
 
   result = into.len == before
