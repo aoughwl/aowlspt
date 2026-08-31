@@ -352,6 +352,13 @@ static int aowl_rva_is_code(unsigned int rva) {
 ## Nothing in it dereferences a game pointer, so nothing in it can fault, and it
 ## arms no SEH guard on purpose. See `abi/aowlspt_frametime.h`.
 {.emit: """#include "aowlspt_frametime.h" """.}
+## THE DRAIN PROFILER's pure-C half -- a per-rider QPC bracket over every rider
+## on the two per-frame drains, plus the positive control. Same shape as the
+## frame meter and for the same reasons: pure C over its own statics, no il2cpp,
+## nothing in it can fault, and it arms NO SEH guard on purpose -- every bracket
+## it defines sits OUTSIDE the bracketed rider's own `aowl_p_p_seh`, which is
+## not re-entrant. See `abi/aowlspt_drainprof.h`.
+{.emit: """#include "aowlspt_drainprof.h" """.}
 ## THE ONE WildSpawnType numeric table, shared verbatim with mods/maps so the
 ## minimap and the ESP boxes cannot disagree about who is a Rogue. Pure integer
 ## classification over a value the caller already read -- it dereferences
@@ -2891,7 +2898,17 @@ proc runDue(due: var seq[Pending]; isRender: bool) =
       # the churn gate's timer arm rather than fail it.
       let guard = modGuarded(p.modIndex)
       if not guard or modhost.modEnter(p.modIndex):
+        # THE PER-MOD BREAKDOWN of `mainDrain`. `mainDrain` dispatches every mod
+        # callback -- the maps HUD included -- so if the frame is being spent in
+        # a MOD rather than in the host, row 1 of the profiler is where it shows
+        # up and this is the only place that can say which mod. Two QPC reads
+        # per DUE callback, not per frame: a frame with nothing due returns
+        # inside `cMqEnter` and never reaches here, and a frame that does reach
+        # here is already paying for a call into a mod. These rows are NESTED
+        # inside row 1 and the reporter never adds them to the top-level sum.
+        let dpCb = cDpNow()
         discard cInvokeCallback(p.cb, p.user, cast[Il2CppPtr](0), 0'i32)
+        cDpAdd(cDpModSlot(int32(p.modIndex)), dpCb)
         if guard:
           modhost.modLeave(p.modIndex)
 
@@ -3366,8 +3383,21 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
     # QueryPerformanceCounter, it dereferences no game pointer and allocates
     # nothing on the per-frame path. Flag `frameMeter`, default OFF; idle cost
     # is one boolean compare.
+    # THE DRAIN PROFILER's frame edge, taken BEFORE any rider so the interval it
+    # divides by is the same interval the riders below are charged against. One
+    # QPC read; no guard, no game pointer, no allocation. Flag `drainProfiler`,
+    # default OFF; idle cost is one boolean compare inside `aowl_dp_frame`.
+    cDpFrame()
+    var dpT = cDpNow()
     ftTick()
+    cDpAdd(DpFt, dpT)
+    # Every bracket below is OUTSIDE the bracketed rider, never inside it:
+    # several of these riders open their own single `aowl_p_p_seh`, and that
+    # guard is not re-entrant, so a bracket that reached inside would be a
+    # nested region rather than a measurement.
+    dpT = cDpNow()
     mainDrain()
+    cDpAdd(DpMain, dpT)
     # THE LIVE INSPECTOR'S IN-RAID TICK. `PreloaderUI::Update` only runs in the
     # menu, so an inspector anchored solely to it goes silent the moment a raid
     # starts -- which is precisely where the bot, nav and ESP questions are.
@@ -3382,14 +3412,18 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
     # pending), so being reachable from two anchors costs one interlocked load
     # per frame and never runs a batch twice.
     if i == gInspSlot2:
+      dpT = cDpNow()
       inspectDrainFired()
+      cDpAdd(DpInspect, dpT)
     # SKIP THE MODE SCREEN'S deferred Submit. It rides THIS drain, not
     # `PreloaderUI::Update`, for two reasons: `TarkovApplication::Update` ticks
     # for the whole session (the selection screen is up before the main menu
     # exists, where PreloaderUI's tick cannot be assumed), and riding an
     # existing drain means no second detour and no second trampoline. Idle cost
     # is two integer compares.
+    dpT = cDpNow()
     modeSkipDrainTick()
+    cDpAdd(DpModeSkip, dpT)
     # FREE THE MOUSE WHILE AN OVERLAY PANEL IS OPEN. It rides THIS drain, and
     # not `PreloaderUI::Update` like most of the UI features, for the reason the
     # inspector's `gInspSlot2` alias two branches up exists: PreloaderUI only
@@ -3400,24 +3434,34 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
     # and no saved state is held.
     # Publish the mod-facing UI overlay mask FIRST, so cursorFreeDrainTick's
     # host-mask publication this frame sees this frame's game-Settings state.
+    dpT = cDpNow()
     uiStateDrainTick()
+    cDpAdd(DpUiState, dpT)
+    dpT = cDpNow()
     cursorFreeDrainTick()
+    cDpAdd(DpCursor, dpT)
     # SINGLEPLAYER REBRAND of the Matchmaker Offline Raid Screen. Rides THIS
     # drain (TarkovApplication::Update ticks the whole session, including the
     # matchmaker screens which are up before the main menu's PreloaderUI can be
     # assumed), not a second detour. Idle cost is two integer compares.
+    dpT = cDpNow()
     splRebrandDrainTick()
+    cDpAdd(DpSplRebr, dpT)
     # HOST-NATIVE AUTO-RAID. Rides THIS drain (TarkovApplication::Update ticks
     # the whole session, including the matchmaker screens that are up before the
     # main menu's PreloaderUI can be assumed), not a second detour. Default OFF
     # (uxAutoRaid); idle cost is two integer compares and no call into the game.
+    dpT = cDpNow()
     autoRaidDrainTick()
+    cDpAdd(DpAutoRaid, dpT)
     # NATIVE RAID ENTRY. Rides THIS drain too, and takes `regs` because on this
     # anchor RCX IS the `TarkovApplication` -- the receiver its two getters
     # need. No GameObject is found and none is pressed. Both its flags default
     # OFF (`uxNativeRaid` probe, `uxNativeRaidDrive` write+press); idle cost is
     # two integer compares and no call into the game.
+    dpT = cDpNow()
     nativeRaidDrainTick(regs)
+    cDpAdd(DpNatRaid, dpT)
     # THE NATIVE uGUI ESP. Rides THIS drain as well -- it installs no detour of
     # its own, because a second detour on one function overwrites the first's
     # trampoline and silently kills it. Its whole body is inside ONE
@@ -3430,7 +3474,9 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
     # that silently reads a stale phase because a flag was off is the failure
     # mode this whole change exists to remove. Idle cost when no world is
     # cached is one guarded pointer test plus one scene-name query per second.
+    dpT = cDpNow()
     rpDrainTick()
+    cDpAdd(DpRaidPhase, dpT)
     # THE CAMERA API. Rides THIS drain; installs no detour of its own. Must run
     # AFTER `rpDrainTick`, because the free camera's end-of-raid exit reads the
     # phase that call just computed -- reading a one-frame-stale phase is
@@ -3438,8 +3484,12 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
     # inside ONE `aowl_p_p_seh` opened by `aowl_cam_tick_guarded`, so this call
     # site opens none. Flags `cameraApi` / `cameraFreeCam`, both default OFF;
     # idle cost with both off is one integer compare and no call into the game.
+    dpT = cDpNow()
     camDrainTick()
+    cDpAdd(DpCam, dpT)
+    dpT = cDpNow()
     natEspDrainTick()
+    cDpAdd(DpNatEsp, dpT)
     # THE NATIVE COLOUR WIDGET's pointer poll. Rides THIS drain for the same
     # reason everything above it does -- a second detour on
     # TarkovApplication::Update would overwrite the first's trampoline and
@@ -3454,12 +3504,30 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
     #
     # Flag `settingsColorWidget`, default OFF; idle cost is one boolean compare
     # and no call into the game.
+    dpT = cDpNow()
     cwDrainTick()
+    cDpAdd(DpCw, dpT)
+    # THE POSITIVE CONTROL and the throttled report, LAST, after every rider so
+    # the report reads this frame's accumulation rather than the previous
+    # frame's. The control is 512 integer adds through the same bracket on the
+    # same clock: without it "the meter is lying" cannot be ruled out, and one
+    # such control disproved a standing theory in the session that produced
+    # this file. `dpReport` allocates a string, but only once every 5s and off
+    # every frame in between -- the per-frame path here is two QPC reads.
+    dpControl()
+    dpReport()
     return 0'i32
   # The render-phase drain, likewise by identity: a second detour on a
   # render-phase method that drains the render queue where GL drawing lands.
   if i == gRenderDrainSlot:
+    # The render drain's three riders are bracketed on the SAME accumulators as
+    # the update drain's, so one line ranks all seventeen rows together. The
+    # frame edge is NOT taken here -- `aowl_dp_frame` is called only from the
+    # update drain, once per frame, so the denominator stays one interval per
+    # frame even though this branch fires on the same frame.
+    var dpR = cDpNow()
     renderDrain()
+    cDpAdd(DpRDrain, dpR)
     # RE-CLOBBER THE CURSOR at end of frame, AFTER the game's Update-time re-lock.
     # The update-drain branch above frees/holds at the PREFIX of
     # TarkovApplication::Update, which in a raid runs BEFORE the game re-locks --
@@ -3468,7 +3536,9 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
     # main-thread point in the frame, so a reassert here wins. It opens its own
     # single guard, exactly like cursorFreeDrainTick, and is inert unless a panel
     # is open and the update tick is already holding.
+    dpR = cDpNow()
     cursorFreeRenderReassert()
+    cDpAdd(DpRCursor, dpR)
     # RE-ASSERT THE FREE CAMERA POSE for the identical reason, and it is the
     # same race: the update drain is a PREFIX on TarkovApplication::Update, so
     # the game's own camera drive (a LateUpdate) runs after it and wins. This
@@ -3476,7 +3546,9 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
     # unless the free camera is actually active. Whether it is enough is NOT
     # assumed -- `camCheckHold` reads the position back next frame and reports
     # PASS/FAIL/INCONCLUSIVE in `camStatus`.
+    dpR = cDpNow()
     camRenderTick()
+    cDpAdd(DpRCam, dpR)
     return 0'i32
   # Experiment A: the read-only settings probe, likewise by identity.
   if i == gSettingsSlot:
@@ -6088,6 +6160,11 @@ include "natesp.nim"
 ## a valid instrument for bisecting those features.
 include "frametime.nim"
 
+## THE DRAIN PROFILER. Same placement rule as the frame meter above: it names
+## nothing from any feature module, so it stays a valid instrument for the
+## features it brackets.
+include "drainprof.nim"
+
 ## THE SHARED PER-FRAME REGION. Included AFTER `modstab.nim` because
 ## `bindRegion` names `gModsSlot` and `cDuPreloaderTarget`, and nimony
 ## forward-resolves procs across an include boundary but NOT variables.
@@ -7753,6 +7830,9 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   # nothing, on purpose: it is the instrument the others are measured with, and
   # an instrument that can be disabled by the subject is not an instrument.
   ftConfigure()
+  # THE DRAIN PROFILER, for the identical reason and on the identical terms: it
+  # is an instrument over the other features, so it is ANDed with none of them.
+  dpConfigure()
   gNeOn = readBoolKey("natEsp") and gNuOn
   gNeDiag = gNeOn and readBoolKey("natEspDiag")
   # THE PER-CLASS COLOURS, from `colorSetting(format="hex")`. Read ONCE here, at
