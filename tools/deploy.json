@@ -432,7 +432,13 @@
     "A test trader added by the Admin Trader example ",
     "the trader is now called \"",
     "could not rewrite the trader: ",
-    "is disabled in config.json; no trader was added"
+    "is disabled in config.json; no trader was added",
+    "storedBase",
+    "listedInTradersTable",
+    "offersUnpriced",
+    "templates.handbook.Items",
+    "locales.global.en",
+    "is not 24 hex characters"
    ]
   },
   {

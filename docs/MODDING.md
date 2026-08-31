@@ -274,6 +274,29 @@ them:
   which reads as a trader that exists and is blank.
 * **An unstartable quest.** `install(q)` refuses a quest with no start
   condition or no finish condition, and says which.
+* **A sibling's shape on the wrong field.** `traderBase` owns every
+  collection-shaped field; none is settable on `Trader`. This is the fix for a
+  real escape: `items_sell` was written in the `{category, id_list}` shape that
+  `items_buy` legitimately uses, and the client answered
+  `JSON parsing error in response to traderSettings at line 1 position 101170`
+  on a document that was perfectly valid JSON. Stock `items_sell` is a dict
+  keyed by loyalty level (8 of 12 traders) or a bare `[]` (the other 4).
+
+### Validate SHAPE, not just syntax
+
+That escape is worth generalising, because it will happen again to any mod that
+writes db documents. A `json.loads` that succeeds proves nothing: the client
+deserializes into typed objects, so a document can be flawless JSON and still be
+rejected on a field whose *shape* is wrong. A test that only asserts "the
+payload parses" cannot fail, which makes it the bug.
+
+`auditTrader` therefore also emits `storedBase` — the whole stored `base`, read
+back — so a test outside the mod can compare it, field by field and into nested
+collections, against **stock traders you did not write**. That is what
+`tools/acceptance_admintrader.py`'s `check_shape` does; it accepts a field if it
+matches *any* stock trader, because stock data is genuinely polymorphic in
+places, and fails if it matches none. Copy the pattern for any db document your
+mod writes.
 
 Two things it deliberately does not hide, because they are not shapes: getting
 a mod to load at all (`docs/MOD-ENABLE-PATH.md` — the DLL, `registry/mods.json`,

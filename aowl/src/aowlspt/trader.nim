@@ -314,9 +314,26 @@ proc traderBase*(t: Trader): Json =
   put(repair, "excluded_id_list", arr())
   put(repair, "quality", "1")
 
-  var itemsSell = obj()
-  put(itemsSell, "category", arr())
-  put(itemsSell, "id_list", arr())
+  # `items_sell` is NOT the `{category, id_list}` shape its siblings use. That
+  # is the BUY side's shape, and reusing it here shipped a trader that parsed
+  # as JSON and threw in the client's typed deserializer:
+  #
+  #     JSON parsing error in response to traderSettings at line 1 position 101170
+  #
+  # Measured across the 12 stock traders in db.json, `items_sell` has exactly
+  # two shapes and neither is that one:
+  #
+  #   8 traders  {"1": {category: [], id_list: [str]}, "2": …}  keyed by LOYALTY LEVEL
+  #   4 traders  []                                             a bare empty array
+  #
+  # We ship the empty array, because it is what four stock traders ship
+  # verbatim and it makes no claim about the inner object — the dict form is
+  # only ever seen with a NON-empty `id_list`, so writing it with an empty one
+  # would be inventing a shape no stock trader has.
+  #
+  # This field is owned by `traderBase` and is not settable on `Trader`: the
+  # bug was a wrong shape, so the fix is that a caller cannot supply one.
+  let itemsSell = emptyArray()
 
   var o = obj()
   put(o, "_id", t.id.text)
@@ -742,6 +759,16 @@ proc auditTrader*(t: Trader; into: var JsonObject) =
   if loc.ok:
     put(into, "traderNameLocalised",
         field(loc.raw, id & " Nickname").asText("").len > 0)
+
+  # The whole stored `base`, verbatim, so a caller can compare its SHAPE
+  # against a stock trader's field by field. A payload that parses as JSON can
+  # still be rejected by the client's typed deserializer -- `items_sell` in the
+  # buy side's `{category, id_list}` shape did exactly that -- so "it is valid
+  # JSON" is not a check. Emitting the document is what makes the real check
+  # possible from outside.
+  let whole = dbRead("traders." & id & ".base")
+  if whole.ok:
+    put(into, "storedBase", raw(whole.raw))
 
 proc auditQuest*(q: Quest; into: var JsonObject) =
   ## The same idea for a quest: read the stored template back and count the

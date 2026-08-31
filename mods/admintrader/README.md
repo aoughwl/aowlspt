@@ -132,6 +132,14 @@ Note that the two offer counters are **negative** — `offersNotFree`,
 and cannot fail. "No offer in the database costs anything" can. A check that
 cannot fail is the bug.
 
+The suite also compares our stored `base` against the 12 **stock** traders'
+field by field, and fails if any field matches none of them. That check exists
+because the ten content checks above all passed while the client was rejecting
+our trader outright: `json.loads` accepted the 102,095-byte document, and the
+client's *typed* deserializer did not. **"It is valid JSON" is not a check** —
+it is the §9b trap, a test that cannot fail. Compare against data you did not
+write.
+
 Note also that `listedInTradersTable` can read `"unknown: …"`. Enumerating the
 traders table needs a host that can list keys; `aowlspt-backend` can and
 `aowlspt-sim` cannot. Three outcomes, never two — "I could not look" is not a
@@ -158,8 +166,16 @@ documented — but knowing *why* is what lets you debug the next one.
   `templates.items` is 4,673 raw templates including hideout nodes and stashes,
   tens of megabytes, with the wrong contents for a shop. `stockWholeHandbook`
   takes no table argument.
-* **`insurance_price_coef` is a string** in the real data (`"0"`, not `0`).
-  `traderBase` matches the data rather than correcting it.
+* **`insurance_price_coef` is a string** in the real data (`"0"`, not `0`) for
+  5 of the 12 stock traders, and a number for the other 7. `traderBase`
+  matches the data rather than correcting it.
+* **`items_sell` is NOT `{category, id_list}`.** That is the *buy* side's
+  shape. Measured across the 12 stock traders, `items_sell` is either a dict
+  keyed by loyalty level (`"1".."4"`, 8 traders) or a bare `[]` (4 traders).
+  Writing the buy shape there produced
+  `JSON parsing error in response to traderSettings at line 1 position 101170`
+  in the live client — from a document that was **perfectly valid JSON**. This
+  is why `traderBase` owns `items_sell` and no caller can supply one.
 * **Shape completeness beats field values.** A response the client cannot parse
   hangs it rather than erroring, so fill in the whole shape even where the
   numbers are zeros. That is why `traderBase` writes all 33 fields whether you
