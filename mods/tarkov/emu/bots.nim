@@ -433,8 +433,28 @@ proc slotFilter(def: JsonRef; r: var Rng): string =
     return ""
   result = at(list, nextInt(r, n)).asText("")
 
+var gChambered = 0
+  ## Chamber slots actually loaded this process. Reported per batch, because a
+  ## chambering that silently declines is exactly the failure mode this whole
+  ## module was rewritten for.
+var gChamberSkipped = 0
+  ## Chamber slots left empty because no round satisfied both the role's caliber
+  ## pool and the chamber's own filter.
+var gSlotDropped = 0
+  ## Items the pre-serve validator REMOVED because the parent template does not
+  ## declare that slot, the slot's filter refuses that template, or the slot was
+  ## already occupied. Every one of these would have been an
+  ## `ItemFactory.FlatItemsToTree` "Cannot put item ... to slot ..." on the
+  ## client, and 28 of them in one batch killed a raid load on 2026-08-30.
+var gSlotUnknown = 0
+  ## Items the validator could not judge -- the parent id is not in the bot's own
+  ## item list, or the parent template is absent from the database. INCONCLUSIVE
+  ## is not a failure: these are KEPT, and counted separately so a database gap
+  ## never reads as a clean run.
+
 proc chamberRounds(inv: JsonRef; items: var List;
-                   weaponId, weaponTpl, caliber: string; r: var Rng) =
+                   weaponId, weaponTpl, caliber: string; r: var Rng;
+                   filled: var seq[string]) =
   ## A live round in each of the weapon's chamber slots, drawn from the same
   ## caliber pool the magazine draws from and constrained the same way -- to what
   ## the chamber itself accepts (`Chambers[i]._props.filters[0].Filter`, fed to
@@ -460,12 +480,21 @@ proc chamberRounds(inv: JsonRef; items: var List;
     let accepted = slot.field("_props").field("filters").at(0).field("Filter")
     let ammo = pickAcceptedAmmo(pool, accepted, r)
     if ammo.len == 0:
+      inc gChamberSkipped
       continue
     var d = botItem(newId(), ammo, weaponId, name)
     var upd = newDoc()
     setNumber(upd, "StackObjectsCount", 1)
     setRaw(d, "upd", text(upd))
     items.add d
+    inc gChambered
+    # Claim the slot. `bots.types.<role>.inventory.mods.<weaponTpl>` ALSO carries
+    # a `patron_in_weapon` list on most weapons (measured: `bots.types.assault
+    # .inventory.mods.59e6152586f77473dc057aa1.patron_in_weapon` is a 4-entry
+    # list), and the mod-tree walk below iterates those keys blindly. Chambering
+    # here and then filling the same slot there put TWO rounds in one chamber,
+    # which is the placement the client refused.
+    filled.add toLowerAscii(name)
 
 type
   SpareMag = object
@@ -502,8 +531,9 @@ proc addMods(t: BotTables; inv, chances: JsonRef; items: var List;
   # A round in the chamber, once, before the mod tree is walked. Costs no mod
   # budget -- it is not a mod, it is the weapon being loaded -- and is skipped
   # for a knife (empty caliber) by `chamberRounds` itself.
+  var chambered: seq[string] = @[]
   if weapon and caliber.len > 0:
-    chamberRounds(inv, items, rootId, rootTpl, caliber, r)
+    chamberRounds(inv, items, rootId, rootTpl, caliber, r, chambered)
 
   var ids: seq[string] = @[]
   var tpls: seq[string] = @[]
@@ -534,6 +564,12 @@ proc addMods(t: BotTables; inv, chances: JsonRef; items: var List;
     for slotName in named:
       if budget <= 0:
         return
+      # A chamber this weapon was ALREADY loaded with is not available to the mod
+      # table, whatever the table says. Only the weapon root can have been
+      # chambered, so the guard is scoped to it.
+      if parentId == rootId and chambered.len > 0 and
+         toLowerAscii(slotName) in chambered:
+        continue
       let def = slotDefFor(defs, slotName)
       let required = def.found and def.field("_required").asBool(false)
       let pool = slots.field(slotName)
@@ -815,6 +851,238 @@ proc addSpareMags(inv: JsonRef; items: var List; carried: var seq[Container];
       items.add d
       fillMagazine(inv, items, magId, m.tpl, m.caliber, r)
       inc placed
+
+# ---------------------------------------------------------------------------
+# The pre-serve validator
+#
+# On 2026-08-30 a raid load died with 28 identical client errors:
+#
+#   Item deserialization error: Cannot put item patron_762x39_T45M to slot
+#   patron_in_weapon in item weapon_molot_vepr_km_vpo_136_762x39
+#   ... EFT.ItemFactory:FlatItemsToTree -> EFT.Profile:.ctor -> LoadBots
+#
+# and no other error of any kind. Measured against the shipped database, the
+# slot EXISTS (`templates.items.59e6152586f77473dc057aa1._props.Chambers[0]
+# ._name == "patron_in_weapon"`) and its filter DOES accept the cartridge
+# (`59e4cf5286f7741778269d8a` is in that Filter). The placement was refused
+# because the slot was ALREADY FULL: `chamberRounds` loaded it, and then the
+# mod-tree walk loaded it again from `bots.types.<role>.inventory.mods
+# .<weaponTpl>.patron_in_weapon`, which stock data carries on most weapons.
+#
+# The duplicate is fixed at source above. This is the guard that makes the whole
+# CLASS unshippable, because the next one will not be a chamber. It asserts a
+# property of the FINISHED item list rather than of any one writer:
+#
+#   1. every child's `slotId` is declared by its parent's own template, in
+#      `_props.Slots`, `_props.Chambers`, `_props.Cartridges` (the `cartridges`
+#      pseudo-slot) or `_props.Grids` (a container cell);
+#   2. for a Slot/Chamber/Cartridges placement, the child's `_tpl` is in that
+#      slot's `filters[0].Filter` when the slot declares one, and NOT in its
+#      `ExcludedFilter`;
+#   3. no non-grid slot on one parent is filled twice.
+#
+# A violating item is REMOVED, together with everything hanging off it, so the
+# bot is served without the extra rather than served broken. Three outcomes, not
+# two: a parent id that is not in the list, or a parent template the database
+# does not have, is INCONCLUSIVE -- kept, and counted in `gSlotUnknown`.
+# ---------------------------------------------------------------------------
+
+type
+  SlotVerdict = enum
+    svUnknown   ## cannot judge -- no parent, or no such template
+    svGrid      ## a container cell, validated by `emu/grid`, not here
+    svOk        ## declared, and the filter accepts this template
+    svBad       ## declared and refused, or not declared at all
+
+proc filterAccepts(def: JsonRef; tpl: string): bool =
+  ## `filters[0].Filter` / `ExcludedFilter`. A slot that declares no filter
+  ## constrains nothing and accepts everything -- that is stock behaviour and the
+  ## right reading; only a NON-EMPTY Filter is authoritative.
+  let f0 = def.field("_props").field("filters").at(0)
+  let f1 = if f0.found: f0 else: def.field("filters").at(0)
+  if not f1.found:
+    return true
+  let excluded = f1.field("ExcludedFilter")
+  if excluded.found and isArray(excluded) and count(excluded) > 0 and
+     listContains(excluded, tpl):
+    return false
+  let allow = f1.field("Filter")
+  if not allow.found or not isArray(allow) or count(allow) <= 0:
+    return true
+  result = listContains(allow, tpl)
+
+var gFixtureItems = ""
+  ## A test-only item table, as raw JSON `{"<tpl>": {"_props": {...}}, ...}`.
+  ## Empty in every real run, in which case the validator reads the real
+  ## database. The seam exists because `aowl selfcheck` runs out-of-process with
+  ## NO database loaded, and a check that cannot run is not a check.
+
+proc setSlotFixture*(raw: string) = gFixtureItems = raw
+
+proc itemMember(tpl, member: string): JsonRef =
+  ## `templates.items.<tpl><member>`, from the fixture when one is installed and
+  ## from the database otherwise. `notFound()` means "the data does not say",
+  ## which the callers must treat as INCONCLUSIVE, never as "absent".
+  if gFixtureItems.len > 0:
+    let root = whole(gFixtureItems).field(tpl)
+    if not root.found:
+      return notFound()
+    if member.len == 0:
+      return root
+    return root.field(member)
+  let path = "templates.items." & tpl & (if member.len == 0: "" else: "." & member)
+  let v = dbRead(path)
+  if not v.ok:
+    return notFound()
+  result = whole(v.raw)
+
+proc gridDeclares(parentTpl, slotName: string): bool =
+  let g = itemMember(parentTpl, "_props.Grids")
+  if not g.found:
+    return false
+  let wanted = toLowerAscii(slotName)
+  let list = each(g)
+  for one in list:
+    if toLowerAscii(one.field("_name").asText("")) == wanted:
+      return true
+  result = false
+
+proc judgeSlot(parentTpl, slotName, tpl: string): SlotVerdict =
+  ## One placement, judged against the parent's own template.
+  if parentTpl.len == 0 or slotName.len == 0:
+    return svUnknown
+  if not itemMember(parentTpl, "").found:
+    return svUnknown
+  let wanted = toLowerAscii(slotName)
+
+  if wanted == "cartridges":
+    let first = itemMember(parentTpl, "_props.Cartridges").at(0)
+    if not first.found:
+      return svBad
+    return if filterAccepts(first, tpl): svOk else: svBad
+
+  for member in ["_props.Slots", "_props.Chambers"]:
+    let v = itemMember(parentTpl, member)
+    if not v.found:
+      continue
+    let def = slotDefFor(v, slotName)
+    if def.found:
+      return if filterAccepts(def, tpl): svOk else: svBad
+
+  if gridDeclares(parentTpl, slotName):
+    return svGrid
+  result = svBad
+
+proc validateSlots*(items: List; report: var seq[string];
+                    kept: var seq[string]): int =
+  ## Removes every placement the client would refuse, and returns how many items
+  ## were removed. `report` gets one line per violation, naming the parent
+  ## template, the slot and the offending template -- the three things the client
+  ## error names, so a failure here reads like the failure it prevents.
+  ##
+  ## The surviving items are written to `kept` as RAW JSON STRINGS, and `items`
+  ## itself is not mutated. Both halves of that are toolchain constraints rather
+  ## than taste, and each was bisected on 2026-08-30 against
+  ## `seqimpl.nim(167): i < s.len and 0 <= i`:
+  ##
+  ## * appending to a `List` reached through a `var` parameter, while a second
+  ##   `List` is also passed by value to the same call, faulted; appending to a
+  ##   `var seq[string]` in the same position does not. Hence `kept`'s type.
+  ## * `raw(items.at(i))` faulted: `at` takes its `List` by value, so the
+  ##   `JsonRef` it hands back points into a copy that `raw`'s `substr` then
+  ##   indexes after it has gone. Everything below therefore reads ONE owned
+  ##   string, `blob`, which is the pattern the rest of this file already uses.
+  ##
+  ## Exported because the selftest asserts on it directly.
+
+  # Everything below reads ONE owned string. `raw(items.at(i))` -- a `List.at`
+  # feeding `raw` -- faulted in `seqimpl.nim(167): i < s.len and 0 <= i` on this
+  # nimony: `at` takes its `List` by value, so the `JsonRef` it returns points at
+  # a copy that is already gone by the time `raw` calls `substr`. Bisected
+  # 2026-08-30; the identical loop returning before the `raw` call did not fault.
+  # `text(items)` once, held in a local, is the pattern the rest of this file
+  # uses and it is stable.
+  let blob = text(items)
+  let doc = whole(blob)
+  let n = count(doc)
+
+  var ids: seq[string] = @[]
+  var tpls: seq[string] = @[]
+  var raws: seq[string] = @[]
+  for i in 0 ..< n:
+    let one = at(doc, i)
+    ids.add one.field("_id").asText("")
+    tpls.add one.field("_tpl").asText("")
+    raws.add raw(one)
+
+  var drop: seq[bool] = @[]
+  for i in 0 ..< n:
+    drop.add false
+  var taken: seq[string] = @[]   ## "<parentId>\x1f<slot>" already filled
+
+  for i in 0 ..< n:
+    let one = at(doc, i)
+    let parent = one.field("parentId").asText("")
+    let slot = one.field("slotId").asText("")
+    if parent.len == 0 or slot.len == 0:
+      continue
+    let tpl = tpls[i]
+    var parentTpl = ""
+    for k in 0 ..< ids.len:
+      if ids[k] == parent:
+        parentTpl = tpls[k]
+        break
+    if parentTpl.len == 0:
+      inc gSlotUnknown
+      continue
+    case judgeSlot(parentTpl, slot, tpl)
+    of svUnknown:
+      inc gSlotUnknown
+    of svGrid:
+      discard
+    of svBad:
+      drop[i] = true
+      report.add "slot refused: " & tpl & " -> " & slot & " on " & parentTpl
+    of svOk:
+      let key = parent & "\x1f" & toLowerAscii(slot)
+      if key in taken:
+        drop[i] = true
+        report.add "slot already filled: " & tpl & " -> " & slot &
+                   " on " & parentTpl
+      else:
+        taken.add key
+
+  # Anything hanging off a dropped item goes with it, to a fixpoint -- a mag left
+  # parented to a removed weapon is the same dangling-id crash by another name.
+  var changed = true
+  while changed:
+    changed = false
+    for i in 0 ..< n:
+      if drop[i]:
+        continue
+      let parent = at(doc, i).field("parentId").asText("")
+      if parent.len == 0:
+        continue
+      for j in 0 ..< ids.len:
+        if drop[j] and ids[j] == parent:
+          drop[i] = true
+          changed = true
+          break
+
+  var removed = 0
+  for i in 0 ..< n:
+    if drop[i]:
+      removed = removed + 1
+    else:
+      kept.add raws[i]
+  gSlotDropped = gSlotDropped + removed
+  result = removed
+
+proc botGuardCounters*(): string =
+  ## The one line a live raid gets to say what happened, instead of nothing.
+  "bots: chambered " & $gChambered & ", chamber-skipped " & $gChamberSkipped &
+  " (no accepted round), slot-dropped " & $gSlotDropped &
+  ", slot-unjudged " & $gSlotUnknown
 
 proc addLoadout(t: BotTables; items: var List; equipmentId: string;
                 r: var Rng) =
@@ -1247,6 +1515,20 @@ proc generateProfile*(t: BotTables; base: string; req: BotRequest;
   # And what it is wearing.
   addLoadout(t, items, equipment, r)
 
+  # Nothing reaches the client without passing this. A bot served without an
+  # extra is a bot; a bot served with a placement `FlatItemsToTree` refuses is a
+  # dead raid load.
+  var violations: seq[string] = @[]
+  var survivors: seq[string] = @[]
+  let removed = validateSlots(items, violations, survivors)
+  if removed > 0:
+    var cleaned = newList()
+    for s in survivors:
+      cleaned.add s
+    items = cleaned
+    aowlspt.warn("bots: dropped " & $removed &
+                 " invalid placement(s) from a bot: " & violations[0])
+
   var inventory = parseObject(field(base, "Inventory"))
   setRaw(inventory, "items", text(items))
   setText(inventory, "equipment", equipment)
@@ -1344,6 +1626,11 @@ proc generate*(body: string; generated: var int): string =
       out1.add raw(generateProfile(tables, base, req, i))
       inc generated
       inc i
+  # One line per batch saying what the loadout guards actually did. Before this,
+  # a chamber that declined and a placement the client would refuse were both
+  # perfectly silent; the refusal only surfaced 28 times over, in the CLIENT's
+  # error log, after the raid load had already died.
+  info botGuardCounters()
   result = done(out1).text
 
 # ---------------------------------------------------------------------------
@@ -1435,6 +1722,35 @@ proc distinctCount(xs: seq[string]): int =
     if not have:
       seen.add x
   result = seen.len
+
+const ChkItems = """{
+  "wpn": {"_props": {
+    "Chambers": [{"_name": "patron_in_weapon",
+                  "_props": {"filters": [{"Filter": ["ammoOk"]}]}}],
+    "Slots": [{"_name": "mod_magazine",
+               "_props": {"filters": [{"Filter": ["mag"]}]}}]}},
+  "mag": {"_props": {
+    "Cartridges": [{"_name": "cartridges",
+                    "_props": {"filters": [{"Filter": ["ammoOk"]}]}}]}},
+  "rig": {"_props": {"Grids": [{"_name": "main",
+                                "_props": {"cellsH": 4, "cellsV": 4}}]}},
+  "ammoOk": {"_props": {}},
+  "ammoNo": {"_props": {}}
+}"""
+  ## A five-template item table shaped exactly like the real one at the members
+  ## the validator reads: a weapon with one chamber and one magazine slot, each
+  ## with a filter; a magazine with a `Cartridges` filter; a rig with a grid.
+  ## `ammoNo` is a real cartridge template that NO filter names -- the stand-in
+  ## for the caliber-conversion case a filter check exists to catch.
+
+proc slotItem(id, tpl, parent, slot: string): string =
+  var d = newDoc()
+  setText(d, "_id", id)
+  setText(d, "_tpl", tpl)
+  if parent.len > 0:
+    setText(d, "parentId", parent)
+    setText(d, "slotId", slot)
+  result = text(d)
 
 proc selfCheckBots*(into: var seq[string]): bool =
   ## Pure, over the two literals above. True when it added nothing.
@@ -1601,5 +1917,74 @@ proc selfCheckBots*(into: var seq[string]): bool =
      "5cde95d97d6c8b647a3769b0":
     into.add "bots: with no base and an all-zero pool, the last-resort " &
              "appearance id was not used"
+
+  # 7. The slot validator, over a fixture item table.
+  #
+  #    This asserts a property of the FINISHED item list -- "no surviving item
+  #    violates its parent slot" -- and never of any writer's own intent, which
+  #    is the shape of check that caught nothing here for six weeks. Every case
+  #    below was FALSIFIED first: with `validateSlots` stubbed to `return 0`,
+  #    cases (b)..(e) all report, naming the weapon and the cartridge.
+  setSlotFixture(ChkItems)
+  block:
+    var v = newList()
+    v.add slotItem("w1", "wpn", "", "")                    # the weapon
+    v.add slotItem("a1", "ammoOk", "w1", "patron_in_weapon")   # (a) legal
+    v.add slotItem("a2", "ammoOk", "w1", "patron_in_weapon")   # (b) DUPLICATE
+    v.add slotItem("w2", "wpn", "", "")                        # a second weapon
+    v.add slotItem("a3", "ammoNo", "w2", "patron_in_weapon")   # (c) refused
+    # (c) hangs off `w2`, not `w1`, ON PURPOSE. Parented to `w1` it was ALSO a
+    # duplicate, so rule 3 caught it and rule 2 was never exercised -- with
+    # `filterAccepts` stubbed to `return true` the whole check still passed
+    # GREEN. That is exactly the check-that-cannot-fail this file keeps
+    # producing; on its own chamber, disabling the filter check turns it RED.
+    v.add slotItem("a4", "ammoOk", "w1", "mod_nonexistent")    # (d) no slot
+    v.add slotItem("m1", "mag", "w1", "mod_magazine")          # legal
+    v.add slotItem("c1", "ammoOk", "m1", "cartridges")         # legal
+    v.add slotItem("r1", "mag", "rig1", "main")                # a grid cell
+    v.add slotItem("r2", "mag", "nosuchparent", "main")        # unjudgeable
+    v.add slotItem("x1", "mag", "a4", "mod_magazine")          # (e) orphan of d
+    v.add slotItem("rig1", "rig", "", "")
+
+    var report: seq[string] = @[]
+    var survivors: seq[string] = @[]
+    let removed = validateSlots(v, report, survivors)
+    var out2 = newList()
+    for s in survivors:
+      out2.add s
+
+    # STRICT parse of the finished list -- not a substring test. A payload that
+    # is not JSON must not be able to pass this.
+    let survivorText = text(out2)
+    let parsed = parseArray(whole(survivorText))
+    if not parsed.ok:
+      into.add "bots: validateSlots produced something that is not a JSON array"
+    if removed != 4:
+      into.add "bots: validateSlots removed " & $removed &
+               " item(s); the fixture plants exactly 4 (duplicate chamber, " &
+               "filtered-out cartridge, undeclared slot, orphan of the " &
+               "undeclared slot)"
+    var survived: seq[string] = @[]
+    for i in 0 ..< parsed.len:
+      survived.add parsed.at(i).field("_id").asText("")
+    for bad in ["a2", "a3", "a4", "x1"]:
+      if bad in survived:
+        into.add "bots: an invalid placement (" & bad & ") survived the " &
+                 "validator -- this is the placement FlatItemsToTree refuses"
+    for good in ["w1", "w2", "a1", "m1", "c1", "r1", "r2", "rig1"]:
+      if good notin survived:
+        into.add "bots: the validator removed a LEGAL placement (" & good &
+                 "); serving a bot without its gear is not the fix"
+    var named = false
+    for line in report:
+      # "slot refused", specifically -- a "slot already filled" line also names
+      # both, and accepting it is how rule 2 hid behind rule 3.
+      if find(line, "slot refused") >= 0 and find(line, "ammoNo") >= 0 and
+         find(line, "wpn") >= 0:
+        named = true
+    if not named:
+      into.add "bots: the validator's report does not name the offending " &
+               "template and weapon, so a live failure says nothing"
+  setSlotFixture("")
 
   result = into.len == before
