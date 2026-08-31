@@ -3404,6 +3404,14 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
     # mode this whole change exists to remove. Idle cost when no world is
     # cached is one guarded pointer test plus one scene-name query per second.
     rpDrainTick()
+    # THE CAMERA API. Rides THIS drain; installs no detour of its own. Must run
+    # AFTER `rpDrainTick`, because the free camera's end-of-raid exit reads the
+    # phase that call just computed -- reading a one-frame-stale phase is
+    # exactly how an overlay ends up on the results screen. Its whole body is
+    # inside ONE `aowl_p_p_seh` opened by `aowl_cam_tick_guarded`, so this call
+    # site opens none. Flags `cameraApi` / `cameraFreeCam`, both default OFF;
+    # idle cost with both off is one integer compare and no call into the game.
+    camDrainTick()
     natEspDrainTick()
     return 0'i32
   # The render-phase drain, likewise by identity: a second detour on a
@@ -3419,6 +3427,14 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
     # single guard, exactly like cursorFreeDrainTick, and is inert unless a panel
     # is open and the update tick is already holding.
     cursorFreeRenderReassert()
+    # RE-ASSERT THE FREE CAMERA POSE for the identical reason, and it is the
+    # same race: the update drain is a PREFIX on TarkovApplication::Update, so
+    # the game's own camera drive (a LateUpdate) runs after it and wins. This
+    # is the last main-thread point in the frame. Its own single guard; inert
+    # unless the free camera is actually active. Whether it is enough is NOT
+    # assumed -- `camCheckHold` reads the position back next frame and reports
+    # PASS/FAIL/INCONCLUSIVE in `camStatus`.
+    camRenderTick()
     return 0'i32
   # Experiment A: the read-only settings probe, likewise by identity.
   if i == gSettingsSlot:
@@ -6001,6 +6017,16 @@ include "natraid.nim"
 ## writes nothing; `rpDrainTick` rides the `TarkovApplication::Update` drain.
 include "raidphase.nim"
 
+## THE CAMERA API and the free camera built on it. `include`d AFTER
+## `raidphase.nim` (it gates on `rpPhase`, and exits+restores the moment the
+## phase stops reading DEPLOYED, which is what keeps it off the post-raid
+## results screen), after `debugui.nim` (it reuses that file's already-verified
+## `Camera::get_main` and `Component::get_transform` rather than adding a second
+## acquisition path) and after `inspect.nim` (`iUnityAlive`, `iKlassOf`). It
+## installs NO detour: `camDrainTick` rides the `TarkovApplication::Update`
+## drain and `camRenderTick` rides the render drain.
+include "camera.nim"
+
 ## THE NATIVE-UI TOOLKIT -- `nuPanel`/`nuLabel` plus a generation-checked handle
 ## table, the layer a mod actually calls. MOVED AHEAD OF `natesp.nim`: it now
 ## also holds `nuCanvasFind`, THE HOST'S ONE CANVAS-ACQUISITION FUNCTION, and
@@ -7342,6 +7368,10 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
     info "bridgeSettingsProbe is set: a read-only detour on SettingsScreen.Show " &
          "will log the thread it fires on when you open the settings screen " &
          "(Experiment A -- confirms a detour reaches the Unity thread)"
+  # THE CAMERA API. `camBind` reads `cameraApi` and `cameraFreeCam` itself
+  # (both default OFF) and byte-verifies its 15 targets against the startup
+  # prologue snapshot. It installs no detour and resolves no name at runtime.
+  camBind()
   gBotDiag = readBoolKey("botDiag")
   if gBotDiag:
     info "botDiag is set: a READ-ONLY detour on EFT.GameWorld.RegisterPlayer " &
