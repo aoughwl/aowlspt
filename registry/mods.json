@@ -642,6 +642,11 @@
           "id": "aowl.debug",
           "enabled": false,
           "note": "registered and present but NOT enabled: it has never run against the live client. Flip this to true (or select it in the manager) to load it; both of its features are still individually default-OFF after that, so loading it changes nothing on screen until a setting is turned on."
+        },
+        {
+          "id": "aowl.loadammoanim",
+          "enabled": true,
+          "note": "selected so the mod stays loaded long enough to reach its own arming ladder; before this it was resolved not-selected, served enabled:false, and unloaded by the client host seconds after loading -- long before its 12s armDelayMs -- which read as the mod being broken. Its animation detour is still default-OFF behind its own config, so selecting it installs no hook."
         }
       ]
     }

@@ -112,7 +112,11 @@
     "read straight from the two log files, so this works with the backend down",
     "/ search   O source   L level   M/N mod   G follow   ",
     "<press a key   Del=clear   Esc=cancel>",
-    "aowlspt_admin_shared_v5"
+    "aowlspt_admin_shared_v5",
+    "MOD REJECTED BY THE PLATFORM, not broken: ",
+    "TO ENABLE IT, ask the backend once: ",
+    "NOT SELECTED -- it is in the registry, but no active mod list ",
+    "the backend named no verdict (a manager older than this host). "
    ]
   },
   {

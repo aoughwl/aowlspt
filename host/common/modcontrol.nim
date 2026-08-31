@@ -182,13 +182,27 @@ type
 
   DesiredMod* = object
     ## One row of the backend's answer to "what should be running on this
-    ## side". Deliberately not a verdict, a reason or a conflict: the manager
-    ## resolves, this obeys, and a host that carried enough of the registry to
-    ## second-guess it would be a second resolver to keep in step.
+    ## side". The manager resolves, this obeys, and a host that carried enough
+    ## of the registry to second-guess it would be a second resolver to keep in
+    ## step -- so `verdict` and `reason` below are carried for the LOG ONLY and
+    ## are never consulted by `applyDesired` when it decides what to do. That
+    ## distinction is the whole of their contract: they explain the decision,
+    ## they do not participate in it.
+    ##
+    ## They exist because a mod that is unloaded a second after it loads, with
+    ## no reason given, is indistinguishable from a mod that is broken -- and
+    ## the mod's own honest diagnostics ("NOT ARMED, still waiting out
+    ## armDelayMs") then read as the mod's fault. It was the platform's.
     guid*: string
     enabled*: bool
     dir*: string   ## the artifact directory, relative to the host's mods root
     lib*: string   ## the library file inside it
+    verdict*: string  ## the manager's slug: not-selected, disabled, wrong-side,
+                      ## pipeline, missing-dependency, conflict, cycle. Empty
+                      ## from a manager older than this field -- absent, not
+                      ## "no verdict".
+    reason*: string   ## the manager's own sentence for that verdict. Empty from
+                      ## an older manager.
 
   PendKind = enum
     pkProbe
@@ -1020,7 +1034,15 @@ proc parseDesired*(doc: string; into: var seq[DesiredMod];
     var lib = ""
     discard pathGet(row, "dir", dir)
     discard pathGet(row, "lib", lib)
-    built.add DesiredMod(guid: guid, enabled: on1, dir: dir, lib: lib)
+    # Optional, and `discard`ed on purpose: a manager that predates these two
+    # keys is not a malformed body. Absence leaves them empty, and the log line
+    # below says "the backend did not say" rather than inventing a reason.
+    var verdict = ""
+    var reason = ""
+    discard pathGet(row, "verdict", verdict)
+    discard pathGet(row, "reason", reason)
+    built.add DesiredMod(guid: guid, enabled: on1, dir: dir, lib: lib,
+                         verdict: verdict, reason: reason)
   into = built
   result = true
 
@@ -1063,6 +1085,55 @@ proc knownStranger(guid: string): bool =
     if g == guid:
       return true
   result = false
+
+proc enableAdvice(guid: string): string =
+  ## The one action that actually changes the answer, named exactly.
+  ##
+  ## Not "edit the selection file": the mod manager OWNS
+  ## `mods\aowlspt-selection.json` and rewrites it, so a hand-edit there is
+  ## reverted and looks like the advice was wrong. The override route is the
+  ## supported path and it is the one that survives.
+  result = "TO ENABLE IT, ask the backend once: " &
+           "GET /aowlspt/mods/enable/" & guid &
+           " -- or add it to a list in registry/mods.json. Do NOT hand-edit " &
+           "mods\\aowlspt-selection.json; aowl.manager owns that file and " &
+           "overwrites it."
+
+proc unloadExplanation(d: DesiredMod): string =
+  ## Why the backend says this mod should not be running, in words.
+  ##
+  ## Never a guess. An empty verdict is reported as "the backend did not say",
+  ## because a confidently wrong diagnostic is worse than none -- and a slug
+  ## this host has not been taught is printed verbatim rather than mapped to
+  ## the nearest one it knows.
+  if d.verdict.len == 0:
+    return "the backend named no verdict (a manager older than this host). " &
+           "Ask it directly: GET /aowlspt/mods/describe/" & d.guid
+  var what = "verdict \"" & d.verdict & "\", which this host does not have " &
+             "wording for"
+  if d.verdict == "not-selected":
+    what = "NOT SELECTED -- it is in the registry, but no active mod list " &
+           "mentions it and there is no override for it, so nothing ever " &
+           "asked for it. This is the DEFAULT state of every newly added mod " &
+           "and it is not a fault in the mod. " & enableAdvice(d.guid)
+  elif d.verdict == "disabled":
+    what = "DISABLED -- a list or the user switched it off deliberately. " &
+           enableAdvice(d.guid)
+  elif d.verdict == "wrong-side":
+    what = "WRONG SIDE -- its registry entry does not declare the client " &
+           "side, so add \"client\" to its sides in registry/mods.json"
+  elif d.verdict == "pipeline":
+    what = "PIPELINE -- its registry pipeline range excludes this host version"
+  elif d.verdict == "missing-dependency":
+    what = "MISSING DEPENDENCY -- something it requires is absent, switched " &
+           "off, or the wrong version"
+  elif d.verdict == "conflict":
+    what = "CONFLICT -- it conflicts with another enabled mod"
+  elif d.verdict == "cycle":
+    what = "CYCLE -- it is part of a requires cycle"
+  result = what &
+           (if d.reason.len > 0: " [the manager's own words: " & d.reason & "]"
+            else: "")
 
 proc applyDesired*(want: seq[DesiredMod]; modsRoot: string) =
   ## Queue whatever it takes for the live set to become `want`.
@@ -1112,7 +1183,16 @@ proc applyDesired*(want: seq[DesiredMod]; modsRoot: string) =
       note "the backend wants " & d.guid & " loaded; queueing " & path
       gQueue.add Pending(kind: pkLoad, guid: d.guid, path: path)
     else:
-      note "the backend wants " & d.guid & " unloaded; queueing it"
+      # LOUD, and it names the reason and the fix. A mod that loads and is
+      # taken back out a second later, with nothing said but "the backend
+      # wants it unloaded", is indistinguishable from a mod that is broken --
+      # and the mod's own honest "NOT ARMED, still waiting out armDelayMs"
+      # then reads as the mod's fault. It is not: it never got the chance.
+      note "MOD REJECTED BY THE PLATFORM, not broken: " & d.guid &
+           " is being UNLOADED because the backend's mod set says " &
+           unloadExplanation(d) &
+           ". Anything " & d.guid & " says after this about not being armed " &
+           "is a CONSEQUENCE of this unload, not a cause."
       gQueue.add Pending(kind: pkUnload, guid: d.guid, path: "")
     rememberAct(d.guid, d.enabled)
 
