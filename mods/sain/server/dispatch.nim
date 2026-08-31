@@ -48,6 +48,8 @@ import aowlspt/server
 import aowlspt/botnav
 import aowlspt/json
 import ".." / core / types
+import ".." / core / vec
+import ".." / core / objective
 
 const
   MaxAnchors* = 24
@@ -319,6 +321,68 @@ proc onPlan(payload: string): string =
        "line, so a raid where nothing is dispatched now says WHY instead of " &
        "printing nothing at all"
 
+var gObjectivesOwn = false
+var gGateSaid = false
+var gSuppressed = 0
+
+proc setObjectivesOwnDestinations*(on: bool) =
+  ## Hand the destination channel to the client, or take it back.
+  ##
+  ## Called once from `sain.nim` with `objectives.enabled`. It is the ONLY
+  ## thing that decides which of the two GoToPoint actuators is live, and it
+  ## is one call in one place on purpose: the previous arrangement had no such
+  ## place, which is why both of them ran.
+  gObjectivesOwn = on
+
+proc objectivesOwnDestinations*(): bool = gObjectivesOwn
+proc suppressedCensuses*(): int = gSuppressed
+
+proc kindFromName(s: string): ObjectiveKind =
+  case s
+  of "questPoi": okQuestPoi
+  of "loot": okLoot
+  of "hold": okHold
+  of "hunt": okHunt
+  of "reposition", "pvp", "roam": okReposition
+  else: okNone
+
+proc onCatalog(payload: string): string =
+  ## `tarkov.objectives.catalog`, broadcast once per raid by
+  ## `mods/tarkov/emu/orbit`. Parsed HERE, in the same module that already
+  ## parses the plan, and pushed straight into `core/objective`'s table --
+  ## which the client assigner reads. The backend never sees a group.
+  result = ""
+  let j = whole(payload)
+  clearCatalog()
+  resetObjectives()
+  if not asBool(field(j, "ok"), false):
+    warn "sain/objectives: the catalog arrived with ok=false (" &
+         asText(field(j, "why"), "no reason given") &
+         "). No bot will be given an objective this raid, and that is the " &
+         "catalog being empty rather than the channel being down"
+    return
+  setCatalogMap(asText(field(j, "map"), "?"))
+  let entries = field(j, "objectives")
+  let n = count(entries)
+  var refused = 0
+  var i = 0
+  while i < n:
+    let e = at(entries, i)
+    inc i
+    let k = kindFromName(asText(field(e, "kind"), ""))
+    if k == okNone:
+      inc refused
+      continue
+    if addObjective(k, vec3(asFloat(field(e, "x"), 0.0),
+                            asFloat(field(e, "y"), 0.0),
+                            asFloat(field(e, "z"), 0.0)),
+                    asFloat(field(e, "priority"), 1.0)) < 0:
+      inc refused
+  info "sain/objectives: " & catalogCheck() &
+       (if refused > 0: ". " & $refused & " entry/entries were refused (an " &
+        "unknown kind, or a position at world zero, which is what a db.json " &
+        "staticContainer looks like)" else: "")
+
 proc startDispatch*(forcePersonality: types.Personality;
                     logDecisions: bool): bool =
   ## Subscribe to the plan. Returns whether the subscription took; the caller
@@ -337,6 +401,12 @@ proc startDispatch*(forcePersonality: types.Personality;
       warn "sain/dispatch: forcePersonality does not map onto a flanking " &
            "personality and is REFUSED; personalities will be drawn from " &
            "the plan's distribution instead"
+  if onEvent("tarkov.objectives.catalog", onCatalog) != Ok:
+    warn "sain/objectives: the subscription to `tarkov.objectives.catalog` " &
+         "did NOT take. No catalog will arrive, every bot's objective layer " &
+         "will decline, and with objectivesEnabled on that means bots decide " &
+         "and do not roam -- which is the safe direction and the visibly " &
+         "broken one"
   result = onEvent("tarkov.orbit.plan", onPlan) == Ok
 
 # ---------------------------------------------------------------------------
@@ -456,6 +526,28 @@ proc dispatchFor*(bots: seq[BotInfo]): seq[BotCommand] =
   ## Not sent from here. See the header: one send, or the MoveSpeed row is
   ## silently lost to last-writer-wins.
   result = @[]
+  # THE ONE-WRITER GATE, and it is the first thing in the function on purpose.
+  #
+  # With objectives on, `core/decide.nim` is the single chooser of a
+  # destination and this path issues NONE -- not a reduced set, not a
+  # lower-priority set: none. Two writers on one bot's Mover is
+  # last-writer-wins between two policies neither of which knows the other
+  # exists, and the leader this path cohered around was a fiction anyway (the
+  # lowest live bot id in the census, which is not a BSG group).
+  #
+  # Deleting these four lines is the falsifier for `oneWriterCheck`: do that
+  # and `dwServer` starts counting, and the check FAILS instead of passing.
+  if gObjectivesOwn:
+    inc gSuppressed
+    if not gGateSaid:
+      gGateSaid = true
+      info "sain/dispatch: objectives are ON, so this path issues NO " &
+           "destination this raid. The client decide ladder owns GoToPoint " &
+           "and `core/objective.oneWriterCheck` FAILS if this line is ever " &
+           "reached with an order attached. MoveSpeed and the per-role rows " &
+           "are unaffected -- they are a different command and a different " &
+           "writer"
+    return
   if not dispatchArmed():
     return
   inc gCensuses
@@ -579,6 +671,11 @@ proc dispatchFor*(bots: seq[BotInfo]): seq[BotCommand] =
 
     result.add goTo(b.id, tx, ty, tz, reach = gReach,
                     sprint = sprintFor(gSlots[s].pers), holdMs = gHoldMs)
+    # On the ledger BEFORE the counter, so there is no ordering in which this
+    # path emits a destination without the check being able to see it. The
+    # time argument is the census index rather than a clock: this side has no
+    # raid clock, and the check reads the COUNT, not the time.
+    noteDestination(dwServer, float(gCensuses))
     inc gOrdersSent
     if gLog:
       info "sain/dispatch: bot " & $b.id & " (" & persName(gSlots[s].pers) &

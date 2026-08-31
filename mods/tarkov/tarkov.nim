@@ -2209,6 +2209,17 @@ proc onOrbitPlan(url, body, session: string): string =
   put(o, "state", orbitState())
   result = done(o).text
 
+proc onObjectiveCatalog(url, body, session: string): string =
+  ## The objective catalog as it went on `tarkov.objectives.catalog`.
+  ##
+  ## Served for the same reason the plan is: "the catalog was never built" and
+  ## "the catalog was built and `mods/sain` never received it" are the same
+  ## symptom on the client, and only a route can tell them apart. The client's
+  ## own verdict on what it RECEIVED is at `/aowlspt/sain/status`, and the two
+  ## being different documents is the point.
+  inc gRequests
+  result = lastCatalogJson()
+
 
 # ---------------------------------------------------------------------------
 # Raids
@@ -3221,6 +3232,7 @@ proc registerRoutes() =
   # answers, so that namespace does not reach a mod on this host.
   discard serve("/aowlspt/tarkov/orbit/plan", onOrbitPlan)
   discard serve("/aowlspt/tarkov/orbit/containers", onOrbitContainers)
+  discard serve("/aowlspt/tarkov/objectives/catalog", onObjectiveCatalog)
 
   # The automation library's gear side. Same namespace as the launcher routes,
   # measured to be the one that reaches a mod on this host.

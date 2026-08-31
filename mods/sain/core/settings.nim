@@ -193,6 +193,35 @@ type
     # as one squad when the game's own group is not readable.
     squadCohesionRadius*: float
 
+    # -- Squad-shared objectives (docs/BOT_AI_OBJECTIVES.md) ---------------
+    # The "idle intent" layer: where a bot goes when it is NOT fighting. Off
+    # by default, like every new live path in this repo -- with it off the
+    # cascade is byte-for-byte what it was and no destination is chosen here.
+    objectivesEnabled*: bool
+    ## Whether members of one BSG group share ONE objective. False gives every
+    ## bot its own, which is legal and is not squad behaviour.
+    squadShareObjectives*: bool
+    seekLoot*: bool
+    seekQuestPoi*: bool
+    holdPositions*: bool
+    huntLastKnown*: bool
+    ## How far a member may be placed from its squad's objective. Doubles as
+    ## the bound the convergence check asserts against.
+    objectiveSplinterM*: float
+    ## Past this from its squad's objective a member is regrouping rather than
+    ## taking its own posture.
+    objectiveLeashM*: float
+    ## Within this, the objective is COMPLETE and the squad takes another.
+    objectiveReachM*: float
+    ## Give up on an objective that has not been reached in this long.
+    objectiveTimeoutS*: float
+    ## Multiplies an `okLoot` entry's score. 0 makes loot the least attractive
+    ## kind without disabling it; `seekLoot` disables it.
+    lootSeekAggressiveness*: float
+    ## Multiplies an `okQuestPoi` entry's score. Above 1 because those are the
+    ## only positions in the catalog a human authored on the navmesh.
+    questPoiBias*: float
+
     # -- Personality behaviour flags, baked in by `resolvedFor` -----------
     canShiftCoverPosition*: bool
     canRushEnemyReloadHeal*: bool
@@ -338,6 +367,19 @@ func defaultSettings*(): Settings =
     extractMinRaidSeconds: 300.0,
 
     squadCohesionRadius: 45.0,
+
+    objectivesEnabled: false,
+    squadShareObjectives: true,
+    seekLoot: true,
+    seekQuestPoi: true,
+    holdPositions: false,
+    huntLastKnown: true,
+    objectiveSplinterM: 25.0,
+    objectiveLeashM: 45.0,
+    objectiveReachM: 8.0,
+    objectiveTimeoutS: 120.0,
+    lootSeekAggressiveness: 0.5,
+    questPoiBias: 1.25,
 
     canShiftCoverPosition: true,
     canRushEnemyReloadHeal: true,

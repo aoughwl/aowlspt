@@ -32,6 +32,7 @@ import aowlspt
 import aowlspt/server
 import aowlspt/json
 import ".." / core / types
+import ".." / core / objective
 import ".." / preset / preset
 import "." / drive
 import "." / dispatch
@@ -320,6 +321,15 @@ proc onStatus(url, body, session: string): string =
   # them into one line would let a live speed channel mask a dead order channel.
   put(o, "dispatch", dispatchState())
   put(o, "dispatchCheck", dispatchCheck())
+  # The objectives half, and a THIRD verdict rather than a folding-in, for the
+  # same reason as above. `oneWriter` is the one that carries the claim this
+  # feature exists to make -- that exactly one thing issues destinations -- and
+  # it is stated as a negative over the OTHER writer's own counter, so it FAILS
+  # if the retired path fires even once.
+  put(o, "objectives", objectiveState())
+  put(o, "catalogCheck", catalogCheck())
+  put(o, "oneWriter", oneWriterCheck(objectivesOwnDestinations()))
+  put(o, "objectivesSuppressedCensuses", suppressedCensuses())
   var maps = arr()
   var i = 0
   while i < neutralisedCount():

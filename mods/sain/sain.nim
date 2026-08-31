@@ -74,6 +74,7 @@ import core/types
 import core/probe
 import core/sig
 import core/selftest
+import core/objective
 import preset/preset
 import core/settings
 import client/bridge
@@ -1899,6 +1900,20 @@ proc onLoad(): Status =
     # rather than at arming time, because arming is where the fault was.
     setAllowReflection(gPreset.allowIl2cppReflection)
     setClientLocomotion(gPreset.clientDrivesLocomotion)
+    # THE ONE-WRITER DECISION, made once, at load, in one place.
+    #
+    # `objectivesEnabled` does not merely add a behaviour: it MOVES the
+    # destination writer from `server/dispatch.nim` to the client decide
+    # ladder. Setting it here rather than at arming time means there is no
+    # window in which a census arrives and both paths believe they own the
+    # channel.
+    setObjectivesOwnDestinations(gPreset.base.objectivesEnabled)
+    if gPreset.base.objectivesEnabled:
+      info "sain: objectives are ON. server/dispatch will issue NO " &
+           "destination this session; core/decide.nim is the single writer. " &
+           "/aowlspt/sain/status carries `oneWriter`, which FAILS -- not " &
+           "merely stays quiet -- if the dispatch path is ever measured " &
+           "issuing one anyway"
     # Same reason, same moment: the RVA table decides what `ensure` does, so it
     # must be set before the first member is touched rather than at arming.
     setRvaTable(gPreset.rvaTable)

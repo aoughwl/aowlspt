@@ -127,6 +127,11 @@ func urgency*(d: CombatDecision): int =
   of cdMoveToEngage: 20
   of cdFreeze: 15
   of cdSearch: 10
+  # Below search, above nothing. An objective is what a bot does when it has
+  # run out of reasons to do anything else, and ANY other rung must be able to
+  # interrupt it -- a bot that walked to a crate through a firefight is the
+  # failure this ordering prevents.
+  of cdMoveToObjective: 5
   of cdNone: 0
 
 func holdTimeFor*(d: CombatDecision; s: Settings): float =
@@ -153,6 +158,12 @@ func holdTimeFor*(d: CombatDecision; s: Settings): float =
   of cdFreeze: 1.0
   of cdHoldInCover: 1.5
   of cdThrowGrenade: 1.0
+  # The longest hold in the table by a wide margin, and for the opposite
+  # reason to the flank's: an objective is tens or hundreds of metres away, and
+  # re-issuing a destination every 100 ms is how a bot ends up standing still
+  # while its navmesh agent restarts. The hold is a re-DECIDE interval, not a
+  # commitment -- urgency 5 means anything at all still interrupts it.
+  of cdMoveToObjective: 6.0
   else: 0.5
 
 func magazineRatio*(me: SelfView): float =
@@ -598,6 +609,33 @@ proc combatLayer*(ctx: var DecideContext; b: BotView; s: Settings;
 # Where the decision sends the bot
 # ---------------------------------------------------------------------------
 
+func fighting*(b: BotView): bool =
+  ## Whether this bot has anything at all to be busy with.
+  ##
+  ## Read ONLY by the objective rung, and stated as a broad negative on
+  ## purpose: nav commands are ignored by the game mid-fight anyway, so an
+  ## objective issued to a bot in contact is a call that does nothing and
+  ## still counts as a destination write. The rung declines instead.
+  b.enemy.valid or b.enemyCount > 0 or b.grenade.active or
+    b.hasSearchTarget or b.extractRequested
+
+func objectiveLayer*(b: BotView; s: Settings; combat: CombatDecision;
+                     selfAct: SelfAction): bool =
+  ## The lowest rung: "idle intent".
+  ##
+  ## It fires only when every other rung declined -- no self-care, no combat
+  ## decision at all -- and only when the driver actually handed this bot a
+  ## destination derived from its squad's ONE objective. Four independent
+  ## conditions, all of which must hold, so the failure mode of this layer is
+  ## that a bot stands still, never that it walks away from a fight.
+  if not s.objectivesEnabled:
+    return false
+  if selfAct != saNone or combat != cdNone:
+    return false
+  if fighting(b):
+    return false
+  result = b.hasObjective
+
 func engaging(d: CombatDecision): bool =
   ## Whether this decision is the bot *pressing a frontal engagement*. Read by
   ## the flank timer: the clock that decides a fight has stalled has to start
@@ -699,6 +737,13 @@ proc moveTargetFor*(ctx: var DecideContext; d: CombatDecision; b: BotView;
     if not b.hasSearchTarget: return false
     target = b.searchTarget
     return true
+  of cdMoveToObjective:
+    # Already resolved to THIS member's destination by `objectiveFor`, which
+    # ran in the driver where the group pointer is. Nothing is derived here:
+    # deriving it twice is how the two writers disagreed in the first place.
+    if not b.hasObjective: return false
+    target = b.objectiveTarget
+    return true
   of cdStandAndShoot, cdShootDistantEnemy, cdThrowGrenade, cdDogFight,
      cdFreeze, cdHoldInCover, cdNone:
     return false
@@ -732,6 +777,14 @@ proc decide*(ctx: var DecideContext; b: BotView; s: Settings): Decision =
       if squadCombat != cdNone and urgency(squadCombat) >= urgency(combat):
         combat = squadCombat
         reason = drSquadOrder
+
+    # The new lowest rung, BELOW squad. Reached only when everything above it
+    # declined, which is what makes `decide` the single chooser of a
+    # destination: there is now no path by which a bot is sent somewhere
+    # without this function having said so.
+    if objectiveLayer(b, s, combat, selfAct):
+      combat = cdMoveToObjective
+      reason = drSquadObjective
 
   # The hold rule. A held decision survives unless the new one is strictly more
   # urgent -- note `<=`, not `<`: an equal-urgency alternative is not a reason

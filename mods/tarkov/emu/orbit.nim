@@ -888,11 +888,94 @@ proc planJson*(p: OrbitPlan): string =
 
   result = done(o).text
 
+proc objectiveKindName(k: AnchorKind): string =
+  ## The catalog's vocabulary, which is `docs/BOT_AI_OBJECTIVES.md`'s and not
+  ## this file's. `akPvp` and `akRoam` are both "somewhere worth being" and
+  ## collapse onto one kind; the client has no use for the distinction and
+  ## carrying it would be inventing a difference the assigner cannot act on.
+  case k
+  of akLoot: "loot"
+  of akQuestPoi: "questPoi"
+  of akPvp, akRoam: "reposition"
+
+proc catalogJson*(p: OrbitPlan): string =
+  ## `tarkov.objectives.catalog` -- the OBJECTIVE CATALOG, and a strict
+  ## superset of the anchor list in `planJson`.
+  ##
+  ## Data only. This side sees `db.json` and the waypoints files and it never
+  ## sees a live bot, so it emits POSITIONS AND KINDS and assigns nothing. The
+  ## squad that shares an objective exists only in the client, because the
+  ## only readable squad identity on this build is the `BotOwner.BotsGroup`
+  ## pointer and the bot census carries no group id at all -- a "leader"
+  ## computed here would be the lowest live bot id, which is not a group.
+  ##
+  ## `okHold` and `okHunt` are NOT emitted here and their absence is
+  ## deliberate: a hold point depends on where a fight is and a hunt point on
+  ## where something was last seen, and neither is knowable from a database.
+  ## The client adds those at runtime (a corpse is an `okHunt`), which is the
+  ## same split one layer down.
+  var o = obj()
+  put(o, "ok", p.ok)
+  put(o, "schema", "aowlspt.objectives/1")
+  put(o, "map", p.map)
+  put(o, "questSource", p.questSource)
+  put(o, "questPointsSeen", p.questPointsSeen)
+  if p.why.len > 0:
+    put(o, "why", p.why)
+
+  var a = arr()
+  var i = 0
+  while i < p.anchors.len:
+    let an = p.anchors[i]
+    # The origin is dropped HERE as well as on the client, because a catalog
+    # that carries it has already lost the argument: every `staticContainers`
+    # position in db.json is (0,0,0) -- 7,092 of 7,092 rows on all 13 maps
+    # that have the table -- and one such entry sends a whole squad to world
+    # zero and looks exactly like convergence working.
+    if an.x != 0.0 or an.z != 0.0:
+      var e = obj()
+      put(e, "kind", objectiveKindName(an.kind))
+      put(e, "x", an.x)
+      put(e, "y", an.y)
+      put(e, "z", an.z)
+      # `priority` rather than `score`: the client compares it against a bot's
+      # own urgency, so the name says what it is FOR rather than where it came
+      # from. The number is the anchor score, unmodified -- biasing it twice,
+      # here and in `pickEntry`, is how a tuning knob stops being findable.
+      put(e, "priority", an.score)
+      a.add e
+    inc i
+  put(o, "objectives", a)
+
+  # The movement policy the client's assigner needs and must not invent. Same
+  # numbers `planJson` carries, under the names the objective code uses, so
+  # there is still exactly one place to change any of them.
+  var m = obj()
+  put(m, "leashM", orbitLeashM())
+  put(m, "splinterM", orbitSplinterM())
+  put(m, "reachM", orbitReachM())
+  put(m, "holdMs", orbitHoldMs())
+  put(o, "movement", m)
+
+  # The honest capability statement, ON THE WIRE, so a reader of the payload
+  # does not have to find this comment.
+  var loot = obj()
+  put(loot, "positionsFrom", "waypoints patrol points and live corpses")
+  put(loot, "canOpenContainers", false)
+  put(loot, "why", "opening a container needs LootableContainer.Interact and " &
+      "an inventory-move RVA. Neither is measured in docs/SAIN_RVA.md, and " &
+      "resolving them BY NAME kills the client on this build. An okLoot " &
+      "objective moves a bot and loiters; it does not loot")
+  put(o, "loot", loot)
+
+  result = done(o).text
+
 # ---------------------------------------------------------------------------
 # Emission and the check
 # ---------------------------------------------------------------------------
 
 var gLastPlan = ""
+var gLastCatalog = ""
 var gLastMap = ""
 var gPlans = 0
 
@@ -918,12 +1001,26 @@ proc emitPlan*(locationId: string) =
          $p.questPointsSeen & " patrol points at " &
          $int(p.cellSize) & "m cells"
   discard broadcast("tarkov.orbit.plan", gLastPlan)
+  # The objective catalog, on its own channel and from the same build. Two
+  # channels rather than one field added to the plan, because the plan carries
+  # ORBIT's personality/coverage/value policy and the catalog carries none of
+  # it -- a consumer of one has no business parsing the other, and a mod that
+  # subscribes to objectives should not have to know ORBIT exists.
+  gLastCatalog = catalogJson(p)
+  discard broadcast("tarkov.objectives.catalog", gLastCatalog)
 
 proc lastPlanJson*(): string =
   if gLastPlan.len == 0:
     return "{\"ok\":false,\"why\":\"no raid has been configured this session, " &
            "so no plan has been built. This is not a failure to build one\"}"
   result = gLastPlan
+
+proc lastCatalogJson*(): string =
+  if gLastCatalog.len == 0:
+    return "{\"ok\":false,\"why\":\"no raid has been configured this session, " &
+           "so no objective catalog has been built. This is not a failure to " &
+           "build one\"}"
+  result = gLastCatalog
 
 proc orbitCheck*(): string =
   ## PASS / FAIL / INCONCLUSIVE on the FINISHED PLAN, asserted as negatives.
