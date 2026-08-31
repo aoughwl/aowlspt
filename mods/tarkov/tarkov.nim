@@ -3780,6 +3780,114 @@ proc tarkovSchema(): seq[Setting] =
                  step = 0.1, category = "Bots/Loot/Per bot type",
       description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies how much loose loot unclassified bots carry, on top of the global row and the Bot AI mod published richness. 0 empties their pockets; the equipment they WEAR is the gear section and is unaffected."),
 
+    floatSetting("botLootVest", "Rig contents", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Bots/Loot/Per container",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies the `generation.items.vestLoot` count -- how many loose items go in the chest rig specifically -- under the global and per-family rows. The pool is untouched: this changes how much, never what."),
+    floatSetting("botLootPockets", "Pocket contents", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Bots/Loot/Per container",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies the `generation.items.pocketLoot` count. Pockets themselves are never removed whatever this says -- the client dereferences Equipment.Slots[8] unconditionally and a bot without them does not spawn -- so 0 empties them rather than deleting them."),
+    floatSetting("botLootBackpack", "Backpack contents", 1.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Bots/Loot/Per container",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Multiplies the `generation.items.backpackLoot` count. A plain scav's backpack pool has 1,851 entries in it, so this is the row with the most headroom. Nine other `generation.items` kinds (healing, grenades, stims, food, currency and the rest) have NO row and the reason is measured: they name a category no table resolves to templates, the generator does not produce them at all, and a slider wired to nothing is worse than an absent one."),
+
+    intSetting("botSparesPerWeapon", "Spare magazines per weapon", 2,
+               lo = 0, hi = 8, step = 1, category = "Bots/Loot",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. How many spares of ITS OWN magazine each armed weapon contributes, before the per-bot cap above applies. 2 is the number emu/bots used to hardcode -- and 2 is exactly how many circular magazines the player counted beside a single-fed shotgun, which is what identified this path as the cause of that bug."),
+    boolSetting("botSpareInternalMagazines",
+                "Carry spares of fixed tube/cylinder magazines", false,
+                category = "Bots/Loot",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. OFF (the default, and the fix) means a magazine the template marks `ReloadMagType: InternalMagazine` -- a pump shotgun's tube, a revolver's cylinder, a Mosin's box -- is never duplicated into a rig, as a spare or as loose loot. Those cannot be swapped in and hold no extra rounds; two of them beside a single-fed shotgun is the bug that was reported live. MEASURED on this install's database: 32 of the 502 (weapon, magazine) pairs the bot tables name are internal, and 12 of the 15 shotguns take one. Detachable magazines are entirely unaffected. ON restores the previous behaviour, bug included."),
+
+    # ---- Bots > Quality -------------------------------------------------
+    #
+    # Every row above scales how OFTEN a slot is filled. These scale WHAT goes
+    # in it, and they do it the one way that cannot invent an item: they
+    # re-weight the role's own pool by a number the template itself declares.
+    # A bot can never receive something its table does not already list.
+    #
+    # All three default to the no-op value, and the no-op is exact rather than
+    # arithmetic: at 0.0 the biased picker returns `pickTemplate(pool, r)`
+    # itself, one draw from the same vector, so the RNG stream and every bot in
+    # the raid are identical to a build without the feature.
+    floatSetting("botAmmoQuality", "Ammunition quality", 0.0, lo = -1.0,
+                 hi = 1.0, step = 0.05, category = "Bots/Quality",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Leans every bot's ammunition toward the harder- or softer-hitting rounds THAT ROLE ALREADY LISTS, by `_props.PenetrationPower`. +1 is as armour-piercing as its own table allows, -1 as soft, 0 is the table's own weighting untouched. It is applied after the magazine's accepted-cartridge filter, so it can never load a round the magazine refuses; a calibre whose pool is all one penetration value is unaffected, which is the honest answer for a pool the property cannot rank."),
+    floatSetting("botArmorTier", "Armour tier", 0.0, lo = -1.0, hi = 1.0,
+                 step = 0.05, category = "Bots/Quality",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Leans every equipment pick toward heavier or lighter protection by `_props.armorClass`. +1 gives bots the best armour their own pool contains, -1 the worst, 0 the pool's own weighting. Only helmets, rigs and body armour declare an armour class, so a weapon or armband pool normalises to a constant and is untouched -- one row covers every slot without a table saying which slots are armour."),
+    floatSetting("botMagazineFill", "Magazine fill", 1.0, lo = 0.0, hi = 1.0,
+                 step = 0.05, category = "Bots/Quality",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. The fraction of its own declared capacity each magazine is loaded to, so the same number means the same thing on a 6-round shotgun tube and a 60-round drum. 1.0, the default, is full, which is what the generator always did. It is floored at ONE round rather than zero: a magazine served empty is a bot that never fires."),
+
+    # ---- Bots > Quality > Per bot type ----------------------------------
+    #
+    # The same nine families as the gear and loot sections. These ADD to the
+    # global rows above rather than multiplying them -- a bias is a direction on
+    # a scale that already has a zero, and multiplying would make "global 0,
+    # scavs +1" come out at 0, the opposite of what the two rows say. The sum is
+    # clamped to -1..1, so a family row can cancel the global one and neither
+    # can run off the end.
+    floatSetting("botAmmoScav", "scav ammunition", 0.0, lo = -1.0, hi = 1.0,
+                 step = 0.05, category = "Bots/Quality/Ammunition per bot type",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Added to the global ammunition-quality row for scav bots (assault, cursedassault, crazyassaultevent, marksman, arenafighterevent, peacemaker, gifter). 0 leaves the global row alone."),
+    floatSetting("botAmmoUsec", "PMC USEC ammunition", 0.0, lo = -1.0, hi = 1.0,
+                 step = 0.05, category = "Bots/Quality/Ammunition per bot type",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Added to the global ammunition-quality row for PMC USEC bots (pmcusec, usec). 0 leaves the global row alone."),
+    floatSetting("botAmmoBear", "PMC BEAR ammunition", 0.0, lo = -1.0, hi = 1.0,
+                 step = 0.05, category = "Bots/Quality/Ammunition per bot type",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Added to the global ammunition-quality row for PMC BEAR bots (pmcbear, bear). 0 leaves the global row alone."),
+    floatSetting("botAmmoRaider", "raider ammunition", 0.0, lo = -1.0, hi = 1.0,
+                 step = 0.05, category = "Bots/Quality/Ammunition per bot type",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Added to the global ammunition-quality row for raider bots (pmcbot). 0 leaves the global row alone."),
+    floatSetting("botAmmoRogue", "rogue ammunition", 0.0, lo = -1.0, hi = 1.0,
+                 step = 0.05, category = "Bots/Quality/Ammunition per bot type",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Added to the global ammunition-quality row for rogue bots (exusec). 0 leaves the global row alone."),
+    floatSetting("botAmmoBoss", "boss ammunition", 0.0, lo = -1.0, hi = 1.0,
+                 step = 0.05, category = "Bots/Quality/Ammunition per bot type",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Added to the global ammunition-quality row for boss bots (every role whose key starts `boss` -- 14 of them in this database). 0 leaves the global row alone."),
+    floatSetting("botAmmoFollower", "boss follower ammunition", 0.0, lo = -1.0,
+                 hi = 1.0, step = 0.05,
+                 category = "Bots/Quality/Ammunition per bot type",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Added to the global ammunition-quality row for boss follower bots (every `follower*` role, plus tagillahelperagro and shooterbtr). 0 leaves the global row alone."),
+    floatSetting("botAmmoCultist", "cultist ammunition", 0.0, lo = -1.0,
+                 hi = 1.0, step = 0.05,
+                 category = "Bots/Quality/Ammunition per bot type",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Added to the global ammunition-quality row for cultist bots (every `sectant*` role). 0 leaves the global row alone."),
+    floatSetting("botAmmoOther", "unclassified ammunition", 0.0, lo = -1.0,
+                 hi = 1.0, step = 0.05,
+                 category = "Bots/Quality/Ammunition per bot type",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Added to the global ammunition-quality row for every role none of the eight rules above matches -- in this database the infected* and spirit* roles. It exists so no role is silently ungoverned."),
+
+    floatSetting("botArmorScav", "scav armour", 0.0, lo = -1.0, hi = 1.0,
+                 step = 0.05, category = "Bots/Quality/Armour per bot type",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Added to the global armour-tier row for scav bots. 0 leaves the global row alone; the pool is never widened, so a scav cannot receive armour its own table does not list."),
+    floatSetting("botArmorUsec", "PMC USEC armour", 0.0, lo = -1.0, hi = 1.0,
+                 step = 0.05, category = "Bots/Quality/Armour per bot type",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Added to the global armour-tier row for PMC USEC bots. 0 leaves the global row alone; the pool is never widened."),
+    floatSetting("botArmorBear", "PMC BEAR armour", 0.0, lo = -1.0, hi = 1.0,
+                 step = 0.05, category = "Bots/Quality/Armour per bot type",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Added to the global armour-tier row for PMC BEAR bots. 0 leaves the global row alone; the pool is never widened."),
+    floatSetting("botArmorRaider", "raider armour", 0.0, lo = -1.0, hi = 1.0,
+                 step = 0.05, category = "Bots/Quality/Armour per bot type",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Added to the global armour-tier row for raider bots. 0 leaves the global row alone; the pool is never widened."),
+    floatSetting("botArmorRogue", "rogue armour", 0.0, lo = -1.0, hi = 1.0,
+                 step = 0.05, category = "Bots/Quality/Armour per bot type",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Added to the global armour-tier row for rogue bots. 0 leaves the global row alone; the pool is never widened."),
+    floatSetting("botArmorBoss", "boss armour", 0.0, lo = -1.0, hi = 1.0,
+                 step = 0.05, category = "Bots/Quality/Armour per bot type",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Added to the global armour-tier row for boss bots. 0 leaves the global row alone; the pool is never widened."),
+    floatSetting("botArmorFollower", "boss follower armour", 0.0, lo = -1.0,
+                 hi = 1.0, step = 0.05,
+                 category = "Bots/Quality/Armour per bot type",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Added to the global armour-tier row for boss follower bots. 0 leaves the global row alone; the pool is never widened."),
+    floatSetting("botArmorCultist", "cultist armour", 0.0, lo = -1.0, hi = 1.0,
+                 step = 0.05, category = "Bots/Quality/Armour per bot type",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Added to the global armour-tier row for cultist bots. 0 leaves the global row alone; the pool is never widened."),
+    floatSetting("botArmorOther", "unclassified armour", 0.0, lo = -1.0,
+                 hi = 1.0, step = 0.05,
+                 category = "Bots/Quality/Armour per bot type",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database. Added to the global armour-tier row for every role none of the eight rules above matches. It exists so no role is silently ungoverned."),
+
     boolSetting("lootStackRandomRange", "Use the item's own stack range", false,
                 category = "Loot/Money & stacks",
       description = "aowlspt original (server emulator); acts on the SPT-derived database. OFF (the shipped behaviour) rolls a stack uniformly over 1..StackMaxSize, which for currency is a far larger number than the game itself ever spawns. ON uses the template's declared `_props.StackMinRandom`..`StackMaxRandom` where it has one -- the SAME discriminator emu/bots.randomStackCount already uses for scav money, read here rather than duplicated. On stock data that is currency and loose ammunition and nothing else; everything else is unaffected either way. Turn this on if world money stacks look absurd."),
@@ -4233,6 +4341,8 @@ proc onTarkovApply(key: string) =
   # "applied" for both cases.
   if key.startsWith("botGear") or key.startsWith("botLoot") or
      key.startsWith("botSlot") or key == "botSpareMagazines" or
+     key.startsWith("botAmmo") or key.startsWith("botArmor") or
+     key.startsWith("botSpare") or key == "botMagazineFill" or
      key == "botWeaponModChance" or key == "botEquipmentModChance":
     refreshBotGear()
     settingApplied("re-read from config.json; the next bot batch is generated " &

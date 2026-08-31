@@ -292,6 +292,100 @@ proc pickTemplate(pool: JsonRef; r: var Rng): string =
     return
   result = names[at1]
 
+var gInternalMagSuppressed = 0
+  ## Spare/loose copies of an INTERNAL magazine (a fixed tube or cylinder)
+  ## suppressed. The reported shotgun bug, counted at source. Zero on a batch
+  ## that generated no tube-fed weapon, which is why `auditInternalMags` is the
+  ## verdict and this is only the diagnosis.
+
+var gInternalMagServed = 0
+  ## Internal magazines found in a FINISHED, about-to-be-served bot inventory
+  ## sitting anywhere OTHER than a `mod_magazine` slot -- i.e. carried loose.
+  ## **This is the number that must be zero.** It is a negative assertion on the
+  ## serialised payload, so it can fail; "did I skip the spare?" could not.
+
+var gFam = famOther
+  ## The family of the bot currently being assembled, set once per bot by
+  ## `addLoadout`. A module var rather than a parameter threaded through eleven
+  ## procs: generation is one bot at a time on one thread, and the alternative
+  ## was touching every signature in this file to carry a number that is
+  ## constant for the whole call.
+
+proc numProp(tpl, name: string): float =
+  ## One numeric `_props` member, or NaN-as-"absent" expressed as `found`.
+  ## Returns 0.0 and `false` when the database does not say, which the caller
+  ## must read as "no opinion" and not as "zero" -- an item with no armour class
+  ## is not an item with armour class 0 for weighting purposes, it is an item
+  ## the bias has nothing to say about.
+  let v = dbRead("templates.items." & tpl & "._props." & name)
+  if not v.ok:
+    return -1.0
+  result = whole(v.raw).asFloat(-1.0)
+
+proc pickTemplateBiased(pool: JsonRef; r: var Rng; prop: string;
+                        bias: float): string =
+  ## `pickTemplate`, with the pool's own weights leaned toward high or low
+  ## values of one numeric template property.
+  ##
+  ## **At `bias == 0.0` this IS `pickTemplate`** -- the same call, one draw from
+  ## the same weight vector, so the RNG stream and therefore every bot in the
+  ## raid is byte-identical to a build without this feature. That equality is
+  ## the whole design: it is what makes "the defaults change nothing" a fact
+  ## about the code rather than a claim about the arithmetic.
+  ##
+  ## When it is not zero, each entry's weight is multiplied by
+  ## `1 + bias * (2n - 1)` where `n` is that entry's property value normalised
+  ## over the pool's own min..max. So the factor runs 0..2 and an entry can be
+  ## made rare but never impossible and never negative; a pool whose entries all
+  ## declare the same value (or none) normalises to a constant and the bias is a
+  ## no-op, which is the honest answer for a pool the property cannot rank.
+  ##
+  ## It re-weights and never rewrites: a template the role's pool does not name
+  ## cannot be produced here, whatever the slider says.
+  if bias == 0.0:
+    return pickTemplate(pool, r)
+  result = ""
+  if not pool.found or not isObject(pool):
+    return
+  let entries = members(pool)
+  var names: seq[string] = @[]
+  var weights: seq[float] = @[]
+  var vals: seq[float] = @[]
+  var lo = 0.0
+  var hi = 0.0
+  var seen = false
+  for m in entries:
+    let w = whole(m.value).asFloat(0.0)
+    if w <= 0.0:
+      continue
+    names.add m.name
+    weights.add w
+    let v = numProp(m.name, prop)
+    vals.add v
+    if v >= 0.0:
+      if not seen:
+        lo = v
+        hi = v
+        seen = true
+      else:
+        if v < lo: lo = v
+        if v > hi: hi = v
+  if seen and hi > lo:
+    for i in 0 ..< weights.len:
+      if vals[i] < 0.0:
+        continue
+      let n = (vals[i] - lo) / (hi - lo)
+      var f = 1.0 + bias * (2.0 * n - 1.0)
+      if f < 0.0: f = 0.0
+      weights[i] = weights[i] * f
+  let at1 = pickWeighted(r, weights)
+  if at1 < 0:
+    # Every weight was driven to zero by an extreme bias. Fall back to the
+    # unbiased draw rather than serving nothing: a slider must not be able to
+    # take a bot's rifle away by making it picky.
+    return pickTemplate(pool, r)
+  result = names[at1]
+
 proc botItem(id, tpl, parent, slot: string): Doc =
   result = newDoc()
   setText(result, "_id", id)
@@ -311,6 +405,44 @@ proc magazineCapacity(tpl: string): int =
   if not first.found:
     return 0
   result = first.field("_max_count").asInt(0)
+
+proc isInternalMagazine(tpl: string): bool =
+  ## `_props.ReloadMagType == "InternalMagazine"` -- a magazine that is PART OF
+  ## THE WEAPON: a pump shotgun's tube, a revolver's cylinder, a Mosin's box.
+  ##
+  ## THE MEASURED CAUSE OF THE REPORTED SHOTGUN BUG. A player pulled a single-fed
+  ## shotgun off a scav and found TWO circular magazines beside it in the rig
+  ## that held no extra rounds and fitted nothing. Two earlier hypotheses were
+  ## tested and killed -- it is not loose rig loot on its own (271 loose
+  ## magazines were refused live and the drums stayed), and it is not filter
+  ## generalisation by ancestry (0 of 2,897 weapon-mod filters name a base
+  ## class). Both were looking for an ILLEGAL placement. There is none: measured
+  ## over this install's own `db.json`, all 8 shotgun `mod_magazine` pools on
+  ## role `assault` are 100 per cent inside the weapon's own `Filter`.
+  ##
+  ## The illegitimate items are the COPIES. `addMods` records every
+  ## `mod_magazine` fitment as a `SpareMag` and `addSpareMags` then places
+  ## `SparesPerWeapon` -- **exactly 2**, which is exactly what the player counted
+  ## -- of that same template in a carried container. For an external magazine
+  ## that is correct and is the reason a bot survives a reload. For an internal
+  ## one it is a duplicate of a fixed part of the gun: it cannot be swapped in,
+  ## it holds nothing, and it is indistinguishable on screen from a drum.
+  ##
+  ## MEASURED over `bots.types` (all 57 roles, `db.json`, 2026-08-31): of the
+  ## 502 distinct (weapon, magazine) pairs any role's `mod_magazine` pool names,
+  ## **470 are `ExternalMagazine` and 32 are `InternalMagazine`** -- among them
+  ## `mag_mc255_ckib_mc255_cylinder_std_12g_5` and
+  ## `mag_rsh12_kbp_rsh12_cylinder_127x55_5`, both literally cylinders, and the
+  ## MR-133 / MR-153 / 870 / 590 / Benelli M3 tubes. 12 of the database's 15
+  ## shotguns take one.
+  ##
+  ## `dbRead` rather than `itemMember` because this is called from the generator,
+  ## which sits above `itemMember` in this file; the fixture-honouring twin used
+  ## by the finished-state audit is `internalMagAudit`.
+  let v = dbRead("templates.items." & tpl & "._props.ReloadMagType")
+  if not v.ok:
+    return false
+  result = toLowerAscii(v.asText()) == "internalmagazine"
 
 proc weaponCaliber(tpl: string): string =
   let v = dbRead("templates.items." & tpl & "._props.ammoCaliber")
@@ -372,6 +504,36 @@ proc pickAcceptedAmmo(pool, accepted: JsonRef; r: var Rng): string =
       continue
     names.add m.name
     weights.add w
+  # Bots > Quality > Ammunition. The role's own weighting still decides, leaned
+  # toward the harder- or softer-hitting of the rounds IT ALREADY LISTS and the
+  # magazine already accepts -- the intersection above is computed first and the
+  # bias never widens it. At the default 0.0 the loop below does not run and the
+  # draw is the one this proc always made.
+  let bias = ammoBiasFor(botGear(), gFam)
+  if bias != 0.0 and names.len > 1:
+    var lo = 0.0
+    var hi = 0.0
+    var seen = false
+    var vals: seq[float] = @[]
+    for nm2 in names:
+      let v = numProp(nm2, "PenetrationPower")
+      vals.add v
+      if v >= 0.0:
+        if not seen:
+          lo = v
+          hi = v
+          seen = true
+        else:
+          if v < lo: lo = v
+          if v > hi: hi = v
+    if seen and hi > lo:
+      for i in 0 ..< weights.len:
+        if vals[i] < 0.0:
+          continue
+        let n2 = (vals[i] - lo) / (hi - lo)
+        var f = 1.0 + bias * (2.0 * n2 - 1.0)
+        if f < 0.0: f = 0.0
+        weights[i] = weights[i] * f
   let at1 = pickWeighted(r, weights)
   if at1 < 0:
     return ""
@@ -401,10 +563,23 @@ proc fillMagazine(inv: JsonRef; items: var List; magId, magTpl, caliber: string;
   let ammo = pickAcceptedAmmo(pool, accepted, r)
   if ammo.len == 0:
     return
+  # Bots > Quality > Magazine fill. A fraction of the magazine's own declared
+  # capacity, never a number of rounds -- the same slider then means the same
+  # thing on a 6-round tube and a 60-round drum. Floored at ONE round rather
+  # than at zero: an empty magazine served to the client is a bot that never
+  # fires, and a row that can produce one is a row that can empty a raid. The
+  # default 1.0 short-circuits to `capacity` with no arithmetic, so a magazine
+  # is loaded exactly as it always was.
+  let fill = botGear().magFill
+  var rounds = capacity
+  if fill != 1.0:
+    rounds = int(float(capacity) * fill + 0.5)
+    if rounds < 1: rounds = 1
+    if rounds > capacity: rounds = capacity
   var d = botItem(newId(), ammo, magId, "cartridges")
   setNumber(d, "location", 0)
   var upd = newDoc()
-  setNumber(upd, "StackObjectsCount", capacity)
+  setNumber(upd, "StackObjectsCount", rounds)
   setRaw(d, "upd", text(upd))
   items.add d
 
@@ -656,8 +831,17 @@ proc addMods(t: BotTables; inv, chances: JsonRef; items: var List;
         dec budget
         # Remember the model so a spare of it can go in the rig. Same tpl, so it
         # is guaranteed to fit the weapon; same caliber, so it can be loaded.
+        #
+        # UNLESS it is an INTERNAL magazine -- a tube or a cylinder that is part
+        # of the gun. A spare of one of those cannot be swapped in, holds no
+        # extra rounds, and renders as a second circular magazine in the rig.
+        # That is the reported shotgun bug; see `isInternalMagazine` for the
+        # measurement. The row exists to put the old behaviour back.
         if caliber.len > 0:
-          spares.add SpareMag(tpl: tpl, caliber: caliber)
+          if isInternalMagazine(tpl) and not botGear().spareInternalMags:
+            inc gInternalMagSuppressed
+          else:
+            spares.add SpareMag(tpl: tpl, caliber: caliber)
       ids.add modId
       tpls.add tpl
       depths.add depth + 1
@@ -831,6 +1015,7 @@ var gLooseMagRefused = 0
   ## Loose magazines refused from container loot because no weapon the bot is
   ## carrying can take them. See `addContainerLoot`.
 
+
 proc declaresCartridges(tpl: string): bool =
   ## A MAGAZINE, discriminated by the template's own declaration rather than by
   ## a base-class id written out from memory. MEASURED: exactly 224 templates in
@@ -859,8 +1044,17 @@ proc magazinesFitting(weaponTpls: seq[string]): seq[string] =
       continue
     for i in 0 ..< count(list):
       let one = at(list, i).asText("")
-      if one.len > 0 and one notin result:
-        result.add one
+      if one.len == 0 or one in result:
+        continue
+      # The other half of the same fix. "Fits a gun I am carrying" was read as
+      # "is named by that gun's mod_magazine Filter", and for a pump shotgun
+      # that Filter names its own fixed TUBE. A loose tube in the rig is the
+      # bug by the container-loot route rather than the spare route, and it is
+      # why refusing 271 loose magazines live did not make the drums go away:
+      # these were never among the refused.
+      if isInternalMagazine(one) and not botGear().spareInternalMags:
+        continue
+      result.add one
 
 proc addContainerLoot(inv, generation: JsonRef; items: var List;
                       c: var Container; kind: string; r: var Rng;
@@ -891,8 +1085,13 @@ proc addContainerLoot(inv, generation: JsonRef; items: var List;
   # a real count rather than inventing one, so a table that said "nothing this
   # time" still yields nothing -- richness makes a stocked bot richer, it does
   # not conjure loot into an empty roll.
-  if richness != 1.0 and wanted > 0:
-    wanted = int(float(wanted) * richness + 0.5)
+  # Bots > Loot > Per container. Composed with the richness above rather than
+  # replacing it, and at the default 1.0 the multiplication is skipped outright
+  # so the count is the table's own integer with no rounding applied to it.
+  let perKind = containerLootMultiplier(botGear(), kind)
+  let scale = richness * perKind
+  if scale != 1.0 and wanted > 0:
+    wanted = int(float(wanted) * scale + 0.5)
   if wanted <= 0:
     return
   # The same bound the mod tree has, and for the same reason: `generation` is
@@ -956,7 +1155,10 @@ proc addSpareMags(inv: JsonRef; items: var List; carried: var seq[Container];
     if m.tpl.len == 0:
       continue
     var n = 0
-    while n < SparesPerWeapon and placed < maxSpares:
+    # Bots > Loot. `SparesPerWeapon` was a compiled-in 2 and is now the default
+    # of a row; the const stays as that default's single source.
+    let perWeapon = botGear().sparesPerWeapon
+    while n < perWeapon and placed < maxSpares:
       inc n
       var gridName = ""
       var location = ""
@@ -1386,6 +1588,47 @@ proc auditStacks*(items: List; flat: var seq[string]): int =
     else:
       gStackSum = gStackSum + cnt
 
+proc auditInternalMags*(items: List; flat: var seq[string]): int =
+  ## Reads a FINISHED bot inventory back and returns how many INTERNAL magazines
+  ## are sitting somewhere other than a `mod_magazine` slot.
+  ##
+  ## This is the falsifiable form of "the shotgun bug is fixed". It asserts a
+  ## property of the serialised payload, as a negative -- *no served item whose
+  ## template declares `ReloadMagType: InternalMagazine` has a `slotId` other
+  ## than `mod_magazine`* -- rather than re-reading the branch that skipped the
+  ## spare. It fails if the spare path regresses, if the loose-loot path
+  ## regresses, if a third path is added that neither knows about, or if the
+  ## user turns the row back on; the negative control in `selfCheckBots` plants
+  ## exactly one such item and requires this to come back 1.
+  ##
+  ## A tube fitted to its own weapon (`mod_magazine`) is legitimate and is NOT
+  ## counted -- that is the gun working. Only the copies are.
+  ##
+  ## `itemMember`, not `dbRead`, so it honours the fixture and therefore runs
+  ## under `aowl selfcheck`, which has no database. Same `text(items)`-once
+  ## discipline as `validateSlots`; `raw(items.at(i))` faults on this nimony.
+  let blob = text(items)
+  let doc = whole(blob)
+  let n = count(doc)
+  result = 0
+  for i in 0 ..< n:
+    let one = at(doc, i)
+    let tpl = one.field("_tpl").asText("")
+    if tpl.len == 0:
+      continue
+    let rmt = itemMember(tpl, "_props").field("ReloadMagType")
+    if not rmt.found:
+      continue
+    if toLowerAscii(rmt.asText("")) != "internalmagazine":
+      continue
+    let slot = toLowerAscii(one.field("slotId").asText(""))
+    if slot == "mod_magazine":
+      continue
+    inc gInternalMagServed
+    result = result + 1
+    if flat.len < 8:
+      flat.add tpl & " in " & (if slot.len == 0: "(grid)" else: slot)
+
 proc botGuardCounters*(): string =
   ## The one line a live raid gets to say what happened, instead of nothing.
   "bots: chambered " & $gChambered & ", chamber-skipped " & $gChamberSkipped &
@@ -1394,6 +1637,9 @@ proc botGuardCounters*(): string =
   ", weapons " & $gWeapons & " (shotguns: " & $gShotguns &
   (if gShotguns == 0: " -- INCONCLUSIVE for the shotgun check" else: "") & ")" &
   ", loose-mags-refused " & $gLooseMagRefused &
+  ", internal-mag copies suppressed " & $gInternalMagSuppressed &
+  " (served loose: " & $gInternalMagServed &
+  (if gInternalMagServed > 0: " -- FAIL, this must be zero" else: "") & ")" &
   ", slot-unjudged " & $gSlotUnknown &
   ", stackable " & $gStackAudited & " (flat<=1: " & $gStackFlat &
   ", avg " & (if gStackAudited > gStackFlat:
@@ -1416,6 +1662,9 @@ proc addLoadout(t: BotTables; items: var List; equipmentId: string;
   # belongs to decides which pair of family rows applies.
   let g = botGear()
   let fam = familyOf(t.role)
+  # Published for the picks further down the call chain (ammo inside a magazine,
+  # armour out of an equipment pool) that have no way to be handed a role.
+  gFam = fam
   let equipment = inv.field("equipment")
   if not equipment.found:
     return
@@ -1447,7 +1696,12 @@ proc addLoadout(t: BotTables; items: var List; equipmentId: string;
       continue
     if pct < 100 and not chance(r, float(pct) / 100.0):
       continue
-    let tpl = pickTemplate(pool, r)
+    # Bots > Quality > Armour tier. At the default 0.0 this is `pickTemplate`
+    # itself, one draw, same stream. `armorClass` is declared by helmets, rigs
+    # and body armour and by nothing else, so on a weapon or an armband pool it
+    # normalises to a constant and does nothing -- which is why one row can
+    # cover every slot without a table of which slots are armour.
+    let tpl = pickTemplateBiased(pool, r, "armorClass", armorBiasFor(g, fam))
     if tpl.len == 0:
       continue
     # The worn item itself is never refused for want of a mod budget. There are
@@ -1893,6 +2147,17 @@ proc generateProfile*(t: BotTables; base: string; req: BotRequest;
                  "StackObjectsCount <= 1 -- currency/ammo rolled flat: " &
                  flatStacks[0])
 
+  # The shotgun check, on the same about-to-be-serialised list and for the same
+  # reason: a fixed tube or cylinder carried as a spare is the reported bug, and
+  # the only place it can be seen for certain is the finished payload.
+  var looseTubes: seq[string] = @[]
+  let tubeN = auditInternalMags(items, looseTubes)
+  if tubeN > 0:
+    aowlspt.warn("bots: WARN " & $tubeN & " internal magazine(s) served " &
+                 "outside mod_magazine -- a fixed tube/cylinder carried as a " &
+                 "spare, which is the shotgun-with-two-drums report: " &
+                 looseTubes[0])
+
   var inventory = parseObject(field(base, "Inventory"))
   setRaw(inventory, "items", text(items))
   setText(inventory, "equipment", equipment)
@@ -2114,8 +2379,10 @@ const ChkItems = """{
   "nvg": {"_props": {}},
   "notHelmet": {"_props": {}},
   "magClass": {"_props": {}},
-  "tubemag": {"_parent": "magClass", "_props": {}},
-  "drummag": {"_parent": "magClass", "_props": {}},
+  "tubemag": {"_parent": "magClass",
+              "_props": {"ReloadMagType": "InternalMagazine"}},
+  "drummag": {"_parent": "magClass",
+              "_props": {"ReloadMagType": "ExternalMagazine"}},
   "shotgun": {"_props": {"weapClass": "shotgun", "Slots": [
     {"_name": "mod_magazine",
      "_props": {"filters": [{"Filter": ["tubemag", "magClass"]}]}}]}}
@@ -2415,6 +2682,57 @@ proc selfCheckBots*(into: var seq[string]): bool =
     if not named:
       into.add "bots: the validator's report does not name the offending " &
                "template and weapon, so a live failure says nothing"
+
+  block internalMags:
+    # 7b. The reported shotgun bug, as a finished-state assertion WITH ITS OWN
+    #     NEGATIVE CONTROL.
+    #
+    #     The measured cause is not an illegal placement -- every shotgun
+    #     `mod_magazine` pool in this install's database is 100 per cent inside
+    #     the weapon's own Filter, so the validator above has nothing to say
+    #     about it. The cause is DUPLICATION: `SparesPerWeapon` copies of a
+    #     FIXED tube or cylinder placed in a carried container, which is exactly
+    #     the two circular magazines the player counted.
+    #
+    #     So the check is on the payload, phrased as a negative: no served item
+    #     whose template says `InternalMagazine` may sit anywhere but
+    #     `mod_magazine`. `good` is the same tube fitted to its own gun and must
+    #     NOT be counted, or the check would "pass" by counting everything and
+    #     "fail" by counting nothing. `bad` is the deliberate injection.
+    var clean = newList()
+    clean.add slotItem("sg1", "shotgun", "", "")
+    clean.add slotItem("sm1", "tubemag", "sg1", "mod_magazine")   # legitimate
+    clean.add slotItem("rig1", "rig", "", "")
+    clean.add slotItem("d1", "drummag", "rig1", "main")           # legitimate
+    var cleanFlat: seq[string] = @[]
+    let cleanN = auditInternalMags(clean, cleanFlat)
+    if cleanN != 0:
+      into.add "bots: auditInternalMags counted " & $cleanN &
+               " on a CLEAN list -- a tube fitted to its own weapon and an " &
+               "external drum in a rig are both legal, and a check that " &
+               "flags them flags every bot in the game"
+
+    # The negative control. One tube, in a rig cell. If this comes back 0 the
+    # audit is a check that cannot fail, and the whole fix is unverified.
+    var dirty = newList()
+    dirty.add slotItem("sg1", "shotgun", "", "")
+    dirty.add slotItem("sm1", "tubemag", "sg1", "mod_magazine")
+    dirty.add slotItem("rig1", "rig", "", "")
+    dirty.add slotItem("bad1", "tubemag", "rig1", "main")   # INJECTED: the bug
+    var dirtyFlat: seq[string] = @[]
+    let dirtyN = auditInternalMags(dirty, dirtyFlat)
+    if dirtyN != 1:
+      into.add "bots: the negative control failed -- an internal magazine was " &
+               "planted loose in a rig and auditInternalMags returned " &
+               $dirtyN & " rather than 1, so the shotgun check cannot fail " &
+               "and proves nothing"
+    var namedTube = false
+    for line in dirtyFlat:
+      if find(line, "tubemag") >= 0:
+        namedTube = true
+    if not namedTube:
+      into.add "bots: auditInternalMags does not name the offending template, " &
+               "so a live failure says which count but not which item"
 
   block moneyStacks:
     # The live report was "the scavs spawn with a single dollar". The generator
