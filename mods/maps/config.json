@@ -33,6 +33,9 @@
   "indicatorHoldMs": 400,
   "indicatorFadeMs": 1600,
 
+  "_renderer": "mapsRenderer picks WHICH KEY SET owns the one map draw path (mhud_draw_pane_full). 'unified' -- the shipped value -- means spatialMode owns it and the LEGACY hudRadar/hudMap/radarX/radarY/radarSize keys are NOT read, so turning a Legacy toggle off can no longer leave nothing drawing (the reported bug). 'legacy' hands ownership back to the old pair and spatialMode is not read. 'auto' is what a config written before this key gets: legacy owns it only while spatialMode is unwritten, which is the migration behaviour and is exactly the state the bug lived in. The loser is deselected, never unbound -- switching applies live.",
+  "mapsRenderer": "unified",
+
   "_widget": "ONE spatial widget replaces the separate hudRadar/hudMap surfaces. spatialMode 'auto' means: derive the mode from the legacy hudRadar/hudMap/heading keys above, so an existing config keeps the surface it had (a migrated radar also carries radarX/radarY/radarSize into mapX/mapY/mapSize). Pick any other mode and the legacy keys stop being consulted.",
   "spatialMode": "auto",
   "zoom": 1.0,

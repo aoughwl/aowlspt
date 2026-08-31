@@ -327,6 +327,26 @@ static struct {
     int32_t  fsSmallPrims;        /* small-widget submissions, most recent frame */
     int32_t  fsLastPrims;         /* overlay submissions, most recent frame */
 
+    /* ---- "THE SELECTED RENDERER ACTUALLY DREW", as a falsifiable count ----
+     *
+     * `paneCallsOver` already catches the doubled draw (more than one renderer
+     * submitting). It CANNOT catch the opposite failure, which is the one the
+     * player reported: a surface was SELECTED in config and nothing appeared.
+     * "0 primitives on every frame" and "the widget is switched off" look
+     * identical from outside, and the old diag reported the first as a PASS.
+     *
+     * So: on every dispatch that reaches the draw section with a surface
+     * selected (the overlay open, or the widget mode not OFF), selFrames is
+     * bumped, and then EXACTLY ONE of selDrew / selBlank. A run in which
+     * selFrames > 0 and selDrew == 0 is a FAIL -- the selected renderer
+     * submitted nothing on every frame it was asked to draw. selFrames == 0 is
+     * INCONCLUSIVE, never PASS: it means nothing was ever selected, so nothing
+     * about the renderer has been observed. Counted at the draw site from the
+     * renderer's OWN return values, not from a belief about the config. */
+    int64_t  selFrames;
+    int64_t  selDrew;
+    int64_t  selBlank;
+
     /* THE PUBLISH COUNTER. Bumped once per mhud_begin, stamped into every track
      * mhud_touch refreshes. Its only job is to tell "in this frame's feed" from
      * "dropped out of it" in O(1) rather than by rescanning the entity array
@@ -1925,6 +1945,21 @@ static void mhud_draw(void* user, int64_t frame) {
      * else-if. */
     if (g_mhud.paneCalls > 1) g_mhud.paneCallsOver++;
 
+    /* THE OPPOSITE ASSERTION -- "NOTHING DREW" MUST NEVER READ AS A PASS.
+     *
+     * Selected means: the config asked for a surface on THIS dispatch. Drew
+     * means: the renderer's own return value was greater than zero. Both are
+     * read here, after the draw, so neither can be a claim about intent. The
+     * two branches are exclusive and total, so selDrew + selBlank == selFrames
+     * is an invariant the diag can also check. */
+    if (g_mhud.fsOn || g_mhud.mode != MHUD_MODE_OFF) {
+        g_mhud.selFrames++;
+        if ((int32_t)(g_mhud.fsLastPrims + g_mhud.fsSmallPrims) > 0)
+            g_mhud.selDrew++;
+        else
+            g_mhud.selBlank++;
+    }
+
     /* ---- the DIRECTIONAL indicators, which are TRANSIENTS ---------------- *
      *
      * Driven off the TRACK table, not off this frame's entity array, because
@@ -2191,6 +2226,9 @@ static int64_t mhud_live_fadems(void)    { return g_mhud.fadeMs; }
 /* THE THREE FALSIFIABLE LEDGERS. Each can be non-zero on the failing side. */
 static int64_t mhud_pane_calls_total(void) { return g_mhud.paneCallsTotal; }
 static int64_t mhud_pane_calls_over(void)  { return g_mhud.paneCallsOver; }
+static int64_t mhud_sel_frames(void)       { return g_mhud.selFrames; }
+static int64_t mhud_sel_drew(void)         { return g_mhud.selDrew; }
+static int64_t mhud_sel_blank(void)        { return g_mhud.selBlank; }
 static int64_t mhud_fs_rect_ok(void)       { return g_mhud.fsRectOk; }
 static int64_t mhud_fs_rect_bad(void)      { return g_mhud.fsRectBad; }
 
@@ -2466,6 +2504,9 @@ proc cHudLiveHoldMs(): int64 {.importc: "mhud_live_holdms", nodecl.}
 proc cHudLiveFadeMs(): int64 {.importc: "mhud_live_fadems", nodecl.}
 proc cHudPaneCallsTotal(): int64 {.importc: "mhud_pane_calls_total", nodecl.}
 proc cHudPaneCallsOver(): int64 {.importc: "mhud_pane_calls_over", nodecl.}
+proc cHudSelFrames(): int64 {.importc: "mhud_sel_frames", nodecl.}
+proc cHudSelDrew(): int64 {.importc: "mhud_sel_drew", nodecl.}
+proc cHudSelBlank(): int64 {.importc: "mhud_sel_blank", nodecl.}
 proc cHudFsRectOk(): int64 {.importc: "mhud_fs_rect_ok", nodecl.}
 proc cHudFsRectBad(): int64 {.importc: "mhud_fs_rect_bad", nodecl.}
 proc cHudFsFrames(): int64 {.importc: "mhud_fs_frames", nodecl.}
@@ -2565,6 +2606,13 @@ proc hudWidgetY*(): float = float(cHudLiveWy())
 # ---- the three falsifiable ledgers ---------------------------------------
 proc hudPaneCalls*(): int64 = cHudPaneCallsTotal()
 proc hudPaneCallsOver*(): int64 = cHudPaneCallsOver()
+proc hudSelFrames*(): int64 = cHudSelFrames()
+  ## Dispatches on which the config had SELECTED a surface to draw.
+proc hudSelDrew*(): int64 = cHudSelDrew()
+  ## ... of those, the ones where the renderer submitted MORE THAN ZERO
+  ## primitives. `hudSelFrames() > 0 and hudSelDrew() == 0` is the reported bug
+  ## ("a surface is selected and I see no map/radar") caught as a count.
+proc hudSelBlank*(): int64 = cHudSelBlank()
   ## Dispatches on which MORE THAN ONE pane was rendered. Must be 0: one
   ## renderer, one pane per frame. Non-zero means a second draw path exists.
 proc hudFsRectOk*(): int64 = cHudFsRectOk()
