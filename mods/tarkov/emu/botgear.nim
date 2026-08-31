@@ -62,6 +62,15 @@ const
     "botLootRogue", "botLootBoss", "botLootFollower", "botLootCultist",
     "botLootOther"]
 
+  FamilyAmmoKeys*: array[9, string] = [
+    "botAmmoScav", "botAmmoUsec", "botAmmoBear", "botAmmoRaider",
+    "botAmmoRogue", "botAmmoBoss", "botAmmoFollower", "botAmmoCultist",
+    "botAmmoOther"]
+  FamilyArmorKeys*: array[9, string] = [
+    "botArmorScav", "botArmorUsec", "botArmorBear", "botArmorRaider",
+    "botArmorRogue", "botArmorBoss", "botArmorFollower", "botArmorCultist",
+    "botArmorOther"]
+
   ## The twelve slots a multiplier is offered for, paired with their settings
   ## key. The order is `emu/bots.equipmentSlots`' order minus Pockets and
   ## SecuredContainer, so the two lists can be read side by side.
@@ -123,6 +132,60 @@ type
     maxLootPerBot*: int
     moneyStacks*: MoneyStackConfig
 
+    # --- The loadout-quality axis -------------------------------------------
+    #
+    # Everything above scales HOW OFTEN a slot is filled. Nothing above can
+    # change WHAT goes in it -- a scav with a gear multiplier of 10 wears more
+    # things, all drawn from the same pool with the same weights. The four
+    # fields below are the other axis, and they work the one way that cannot
+    # invent an item: they RE-WEIGHT the role's own pool by a number the
+    # template itself declares.
+    #
+    # At 0.0 -- every default -- the biased pick is not merely equivalent to
+    # the plain one, it IS the plain one: `pickTemplateBiased` returns
+    # `pickTemplate(pool, r)` unchanged, so the draw count and therefore the
+    # whole RNG stream is byte-identical to a build without this feature.
+    # That is what makes "turning nothing on changes nothing" checkable rather
+    # than asserted.
+    ammoBias*: float
+      ## -1..1 over `_props.PenetrationPower`. Above 0 the role's own ammo pool
+      ## leans toward its harder-hitting rounds; below 0 toward its softer ones.
+      ## Never adds a round the role does not already list, and never one the
+      ## magazine's own filter refuses.
+    ammoBiasFam*: array[9, float]
+    armorBias*: float
+      ## -1..1 over `_props.armorClass`, applied to the equipment pools. The
+      ## "armour tier" knob: same pool, leaned toward its heavier or lighter
+      ## entries.
+    armorBiasFam*: array[9, float]
+
+    # --- Magazines ----------------------------------------------------------
+    sparesPerWeapon*: int
+      ## Spares carried per weapon that took a magazine. Was the compiled-in
+      ## `SparesPerWeapon = 2` -- and 2 is exactly how many circular magazines
+      ## the player counted beside the single-fed shotgun, which is what named
+      ## this path as the cause.
+    spareInternalMags*: bool
+      ## OFF, the fix: a fixed tube or cylinder (`ReloadMagType:
+      ## InternalMagazine`) is never duplicated into a rig, as a spare or as
+      ## loose loot. ON restores the shipped behaviour, bug and all, because a
+      ## fix worth having is worth being able to turn off and see.
+    magFill*: float
+      ## 0..1, the fraction of a magazine's capacity that is loaded. 1.0 is
+      ## full, which is what the generator always did.
+
+    # --- Per-container loot ------------------------------------------------
+    lootVest*: float
+    lootPockets*: float
+    lootBackpack*: float
+      ## Multipliers on the count drawn for `vestLoot` / `pocketLoot` /
+      ## `backpackLoot` specifically, under the global and per-family rows. The
+      ## other nine `generation.items` kinds are NOT offered and the reason is
+      ## measured, not an oversight: they name a CATEGORY (`healing`,
+      ## `grenades`) that nothing in the database resolves to templates, so the
+      ## generator does not produce them at all and a row for them would be a
+      ## control wired to nothing. See the long comment in `emu/bots`.
+
 proc clamp01to*(v, lo, hi: float): float =
   if v < lo: lo
   elif v > hi: hi
@@ -134,10 +197,16 @@ proc defaultBotGearConfig*(): BotGearConfig =
                          spareMags: 4, maxLootPerBot: 24,
                          moneyStacks: MoneyStackConfig(multiplier: 1.0,
                                                        floorCount: 0,
-                                                       ceilCount: 0))
+                                                       ceilCount: 0),
+                         ammoBias: 0.0, armorBias: 0.0,
+                         sparesPerWeapon: 2, spareInternalMags: false,
+                         magFill: 1.0,
+                         lootVest: 1.0, lootPockets: 1.0, lootBackpack: 1.0)
   for i in 0 ..< 9:
     result.familyGear[i] = 1.0
     result.familyLoot[i] = 1.0
+    result.ammoBiasFam[i] = 0.0
+    result.armorBiasFam[i] = 0.0
   for i in 0 ..< 12:
     result.slotMul[i] = 1.0
 
@@ -164,6 +233,23 @@ proc botGearConfig*(): BotGearConfig =
   if result.maxLootPerBot < 0: result.maxLootPerBot = 0
   if result.maxLootPerBot > 200: result.maxLootPerBot = 200
   result.moneyStacks = moneyStackConfig()
+
+  result.ammoBias = clamp01to(knob("botAmmoQuality").asFloat(0.0), -1.0, 1.0)
+  result.armorBias = clamp01to(knob("botArmorTier").asFloat(0.0), -1.0, 1.0)
+  for i in 0 ..< 9:
+    result.ammoBiasFam[i] =
+      clamp01to(knob(FamilyAmmoKeys[i]).asFloat(0.0), -1.0, 1.0)
+    result.armorBiasFam[i] =
+      clamp01to(knob(FamilyArmorKeys[i]).asFloat(0.0), -1.0, 1.0)
+  result.sparesPerWeapon = knob("botSparesPerWeapon").asInt(2)
+  if result.sparesPerWeapon < 0: result.sparesPerWeapon = 0
+  if result.sparesPerWeapon > 8: result.sparesPerWeapon = 8
+  result.spareInternalMags = knob("botSpareInternalMagazines").asBool(false)
+  result.magFill = clamp01to(knob("botMagazineFill").asFloat(1.0), 0.0, 1.0)
+  result.lootVest = clamp01to(knob("botLootVest").asFloat(1.0), 0.0, 10.0)
+  result.lootPockets = clamp01to(knob("botLootPockets").asFloat(1.0), 0.0, 10.0)
+  result.lootBackpack =
+    clamp01to(knob("botLootBackpack").asFloat(1.0), 0.0, 10.0)
 
 proc slotIndex*(slot: string): int =
   ## -1 for a slot with no row -- Pockets and SecuredContainer, and anything a
@@ -211,6 +297,32 @@ proc modMultiplier*(cfg: BotGearConfig; weapon: bool): float =
     return 1.0
   result = if weapon: cfg.weaponModMul else: cfg.equipModMul
 
+proc ammoBiasFor*(cfg: BotGearConfig; fam: BotFamily): float =
+  ## Global + family, ADDED rather than multiplied, then clamped -- a bias is a
+  ## direction on a scale that already has a zero, and multiplying two of them
+  ## would make "global 0, scavs +1" come out at 0, which is the opposite of
+  ## what the two rows say. Clamped to -1..1 so the family row can cancel the
+  ## global one but neither can run off the end.
+  if not cfg.enabled:
+    return 0.0
+  clamp01to(cfg.ammoBias + cfg.ammoBiasFam[ord(fam)], -1.0, 1.0)
+
+proc armorBiasFor*(cfg: BotGearConfig; fam: BotFamily): float =
+  if not cfg.enabled:
+    return 0.0
+  clamp01to(cfg.armorBias + cfg.armorBiasFam[ord(fam)], -1.0, 1.0)
+
+proc containerLootMultiplier*(cfg: BotGearConfig; kind: string): float =
+  ## The per-container row for one `generation.items` kind. 1.0 for any kind
+  ## with no row, which is "the database's own count, untouched" -- never zero.
+  if not cfg.enabled:
+    return 1.0
+  case kind
+  of "vestLoot": cfg.lootVest
+  of "pocketLoot": cfg.lootPockets
+  of "backpackLoot": cfg.lootBackpack
+  else: 1.0
+
 proc declaredBotKeys*(): seq[string] =
   ## Every key this module reads, in one place, for the ledger to check
   ## against. It is derived from the SAME arrays `botGearConfig` reads, so the
@@ -220,9 +332,14 @@ proc declaredBotKeys*(): seq[string] =
   result = @["botGearEnabled", "botGearMultiplier", "botLootMultiplier",
              "botWeaponModChance", "botEquipmentModChance",
              "botSpareMagazines", "botLootMaxItems",
-             "moneyStackMultiplier", "moneyStackMin", "moneyStackMax"]
+             "moneyStackMultiplier", "moneyStackMin", "moneyStackMax",
+             "botAmmoQuality", "botArmorTier", "botSparesPerWeapon",
+             "botSpareInternalMagazines", "botMagazineFill",
+             "botLootVest", "botLootPockets", "botLootBackpack"]
   for i in 0 ..< 9:
     result.add FamilyGearKeys[i]
     result.add FamilyLootKeys[i]
+    result.add FamilyAmmoKeys[i]
+    result.add FamilyArmorKeys[i]
   for i in 0 ..< 12:
     result.add SlotKeys[i]
