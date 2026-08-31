@@ -6256,6 +6256,15 @@ proc iCmdHelp() =
   iOut("                                  NODE, so budget defaults to 600 and")
   iOut("                                  there is no `more`; a partial answer")
   iOut("                                  says STOPPED EARLY, never exhaustive")
+  iOut("  pact SUB [ARGS]                 IN-RAID ACTUATION of the local")
+  iOut("                                  player (flag playerActuation, and")
+  iOut("                                  `allow write`). SUB is status |")
+  iOut("                                  magcycle | wait N | move X Y FRAMES |")
+  iOut("                                  look DX DY | fire on|off | aim on|off")
+  iOut("                                  | sprint on|off | jump | prone |")
+  iOut("                                  pose D | lean D | command N | reload.")
+  iOut("                                  ASYNCHRONOUS: this queues, the ANSWER")
+  iOut("                                  is a host-log line `pact-rpc: ...`")
   iOut("  TYPE  i8 u8 i16 u16 i32 u32 i64 u64 f32 f64 ptr bool str klass")
   iOut("  EXPR  ATOM ( +0xNN | @0xNN )*   `+` moves, `@` DEREFERENCES")
   iOut("        ATOM is 0x<hex>, a decimal, or $name")
@@ -6264,6 +6273,69 @@ proc iCmdHelp() =
   iOut("  TARGET  name:<substring>  or  rva:0x<hex>[/<expected prologue hex>]")
   iOut("  SIG     <ret>_<args>, ret in v/b/i/l/p/f/s, args in p/i/b/f/l")
   iOut("        e.g.  s_p   String return, one pointer argument (get_name)")
+
+# ---------------------------------------------------------------------------
+# THE `pact` MAILBOX -- the one wire between an OUTSIDE PROCESS and in-raid
+# actuation.
+#
+# WHY A MAILBOX AND NOT A CALL. `pact.nim` is `include`d AFTER this file
+# (it stands on `iUnityAlive`/`iKlassOf` and on `raidphase.nim`, which itself
+# stands on `iSceneNamePresent`), and aowlhost.nim states at that include that
+# nimony forward-resolves procs across an include boundary "not reliably
+# enough". So `iExec` CANNOT call `pactMagCycle` directly. It deposits the
+# request here; `pactDrainTick`, later in the same module, drains it.
+#
+# WHY THIS CHANNEL AT ALL. A client-side mod cannot serve HTTP, and a host
+# config key is a LEVEL, not an EDGE -- it can express "actuation is on" but not
+# "do one magazine cycle NOW", and it has nowhere to put an answer. The
+# inspector file channel is already an external -> Unity-main-thread pipe with a
+# per-command SEH guard, a serial line to re-run, and an output file.
+#
+# THE ANSWER IS ASYNCHRONOUS AND THIS VERB SAYS SO. Accepting a request is NOT
+# evidence that it happened; the outcome is a HOST LOG line (`pact magcycle:
+# COMPLETE ...`, or the matching `warn`, or the `pact-rpc: status ...` line).
+# Anything that consumes this must read the log, not this verb's reply.
+# ---------------------------------------------------------------------------
+var gInspPactReq = ""     ## one pending request, verbatim; "" means none
+var gInspPactSeq = 0'i64  ## requests accepted
+var gInspPactAns = ""     ## the previous request's answer, set by pact.nim
+var gInspPactDrop = 0'i64 ## requests refused because one was still pending
+
+proc iCmdPact(toks: seq[string]) =
+  if not gInspAllowWrite:
+    iErr("`pact` is refused: it CALLS INTO GAME CODE and moves the local " &
+         "player. Set liveInspectorWrite in aowlspt-host.json and put " &
+         "`allow write` in this batch. Nothing was queued.")
+    return
+  if toks.len < 2:
+    iOut("  usage: pact status | magcycle | wait N | move X Y FRAMES |")
+    iOut("         look DX DY | fire on|off | aim on|off | sprint on|off |")
+    iOut("         jump | prone | pose D | lean D | command N | reload")
+    iOut("  accepted=" & $gInspPactSeq & " refused-busy=" & $gInspPactDrop)
+    if gInspPactAns.len > 0:
+      iOut("  last answer: " & gInspPactAns)
+    else:
+      iOut("  last answer: (none yet -- answers arrive on the next drain " &
+           "frame, in aowlspt-host.log, prefixed `pact-rpc:`)")
+    return
+  if gInspPactReq.len > 0:
+    gInspPactDrop = gInspPactDrop + 1
+    iErr("a pact request (" & gInspPactReq & ") is STILL PENDING -- the drain " &
+         "has not run since it was queued. Nothing was queued. This is a " &
+         "queue-depth refusal, not a failure of the request.")
+    return
+  var s = ""
+  for i in 1 ..< toks.len:
+    if i > 1: s.add ' '
+    s.add toks[i]
+  gInspPactReq = s
+  gInspPactSeq = gInspPactSeq + 1
+  iOut("  queued #" & $gInspPactSeq & ": pact " & s)
+  iOut("  ACCEPTED IS NOT DONE. The outcome is a host-log line prefixed " &
+       "`pact-rpc:` (and, for magcycle, `pact magcycle: COMPLETE` or a " &
+       "matching warn). Read the log; do not read this line as a result.")
+  if gInspPactAns.len > 0:
+    iOut("  previous answer: " & gInspPactAns)
 
 # ---------------------------------------------------------------------------
 # One command, executed. Called ONLY from inside the VEH guard.
@@ -6486,6 +6558,8 @@ proc iExec(line: string) =
         iCmdCanvas(cast[Il2CppPtr](v))
   of "call":
     iCmdCall(toks)
+  of "pact":
+    iCmdPact(toks)
   else:
     iErr("unknown command \"" & cmd & "\" -- try `help`")
 

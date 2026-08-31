@@ -213,6 +213,20 @@ type
       ## to distinguish "everything passed" from "nothing was attempted", and
       ## this is it.
     raidAttempted*: bool
+    actuation*: bool
+      ## Whether this script intends to ACTUATE the player in raid. Arming is
+      ## opt-in because it turns on three host flags (`playerActuation`,
+      ## `liveInspector`, `liveInspectorWrite`) that are default-OFF by rule, and
+      ## a script that only checks gear has no business turning them on.
+    ammoMode*: string
+      ## The rung to put `mods/ammoloading` on before the launch, or "" to leave
+      ## that mod exactly as the install has it.
+    inspSerial*: int
+      ## Bumped into every inspector batch. The channel triggers on a CONTENT
+      ## CHANGE, so two identical batches would run once; this is what makes the
+      ## second one run.
+    actuations*: int      ## pact requests this script sent
+    actuationsOk*: int    ## of those, ones whose outcome line was observed
       ## Whether `enterRaid` ran. The never-deployed rule in `finish` applies
       ## only when it did: a script that deliberately tests gear alone and never
       ## goes near a raid is not making a claim about deployment, and failing it
@@ -245,7 +259,9 @@ proc newScript*(name: string): Script =
          profileName: "", verdict: vPass,
          reason: "", lines: @[],
          gearRequested: 0, gearMinted: 0, gearPlaced: 0, phaseSeen: "",
-         entered: false, steps: 0, raidAttempted: false)
+         entered: false, steps: 0, raidAttempted: false,
+         actuation: false, ammoMode: "", inspSerial: 0,
+         actuations: 0, actuationsOk: 0)
 
 proc atRoot*(s: var Script; root: string) =
   ## The install to drive. Default `D:\Aowlspt`.
@@ -339,6 +355,24 @@ proc wear*(s: var Script; slot, tpl: string; condition: int) =
 # ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
+
+proc withActuation*(s: var Script) =
+  ## Declare that this script drives the PLAYER once the raid is DEPLOYED.
+  ##
+  ## Arms three host flags before the launch, because all three are read at
+  ## boot: `playerActuation` (pact itself), `liveInspector` and
+  ## `liveInspectorWrite` (the file channel the request travels on, and its
+  ## write gate). Without this, every actuation verb below refuses BY NAME
+  ## rather than sitting silent.
+  s.actuation = true
+
+proc withAmmoLoading*(s: var Script; mode: string) =
+  ## Put `mods/ammoloading` on a rung of its own ladder before the launch:
+  ## "off" / "probe" / "read" / "spawn" / "animate". `probe` is the rung that
+  ## proves the trigger fires with zero dereferences and no bundle; the two
+  ## rungs above it additionally need a bundle riding a vanilla key via
+  ## `mods/textures`, which this library does not set up and does not pretend to.
+  s.ammoMode = mode
 
 proc worse(a, b: Verdict): Verdict =
   if a == vInconclusive or b == vInconclusive: vInconclusive
@@ -500,6 +534,95 @@ proc armPhaseReporting*(s: var Script): bool =
          " (host flags are read at boot, so this is before the launch)")
   result = true
 
+proc setStrKey(text, key, value: string): string =
+  ## `"key": "old"` -> `"key": "value"`, leaving everything else byte-identical.
+  ## Same contract as `setBoolKey`: "" means THE KEY IS NOT THERE, which the
+  ## caller reports rather than papering over by inventing it.
+  let at = find(text, "\"" & key & "\"")
+  if at < 0: return ""
+  var i = at + key.len + 2
+  while i < text.len and (text[i] == ' ' or text[i] == ':' or text[i] == '\t'):
+    inc i
+  if i >= text.len or text[i] != '"': return ""
+  let vstart = i + 1
+  var j = vstart
+  while j < text.len and text[j] != '"':
+    if text[j] == '\\': inc j
+    inc j
+  if j >= text.len: return ""
+  result = text.substr(0, vstart - 1) & value & text.substr(j)
+
+proc writeWhole(path, text: string): bool =
+  var f: File
+  if not open(f, path, fmWrite): return false
+  write(f, text)
+  close(f)
+  true
+
+proc armActuation*(s: var Script): bool =
+  ## Turn on the three flags that make in-raid actuation REACHABLE from outside
+  ## the game process, before the client boots.
+  ##
+  ##   playerActuation      pact itself; without it every request is refused
+  ##   liveInspector        the file channel the request travels on
+  ##   liveInspectorWrite   the gate `allow write` needs; `pact` CALLS INTO GAME
+  ##                        CODE, so it is deliberately on the write side
+  ##
+  ## Returns false and SAYS WHY. A false here does not stop the run: the
+  ## actuation steps then refuse by name, which is a better outcome than a run
+  ## that silently never actuated and still passed.
+  if not s.actuation: return true
+  let path = hostConfig(s)
+  var text = ""
+  if not readTextFile(path, text):
+    say(s, "flags  could not read " & path & " -- actuation cannot be armed")
+    return false
+  var missing = ""
+  for key in ["playerActuation", "liveInspector", "liveInspectorWrite"]:
+    let next = setBoolKey(text, key)
+    if next.len == 0:
+      if missing.len > 0: missing.add ", "
+      missing.add key
+    else:
+      text = next
+  if missing.len > 0:
+    say(s, "flags  " & path & " declares no " & missing &
+           " -- actuation will be REFUSED, not silently skipped")
+    return false
+  if not writeWhole(path, text):
+    say(s, "flags  could not write " & path)
+    return false
+  say(s, "flags  playerActuation/liveInspector/liveInspectorWrite armed in " &
+         path)
+  result = true
+
+proc armAmmoLoading*(s: var Script): bool =
+  ## Put `mods/ammoloading` on the declared rung before the launch. Mod config
+  ## is read at mod load, so this must happen first, exactly like a host flag.
+  if s.ammoMode.len == 0: return true
+  let path = joinPath(s.root, "aowlspt\\mods\\ammoloading\\config.json")
+  var text = ""
+  if not readTextFile(path, text):
+    say(s, "ammo   could not read " & path &
+           " -- is the mod installed in this root? The mod cannot observe " &
+           "anything it is not loaded for.")
+    return false
+  let on = setBoolKey(text, "enabled")
+  if on.len == 0:
+    say(s, "ammo   " & path & " declares no `enabled` key")
+    return false
+  text = on
+  let m = setStrKey(text, "mode", s.ammoMode)
+  if m.len == 0:
+    say(s, "ammo   " & path & " declares no string `mode` key")
+    return false
+  text = m
+  if not writeWhole(path, text):
+    say(s, "ammo   could not write " & path)
+    return false
+  say(s, "ammo   mods/ammoloading enabled, mode=" & s.ammoMode & " in " & path)
+  result = true
+
 # ---------------------------------------------------------------------------
 # Step 1 -- the stack
 # ---------------------------------------------------------------------------
@@ -518,6 +641,16 @@ proc launchStack*(s: var Script): bool =
   var port = controlPort(s.root, why)
   if port > 0:
     s.port = port
+    if s.actuation or s.ammoMode.len > 0:
+      # NOT armed, and said so. Host flags and mod config are read at BOOT, so
+      # attaching to a client that is already up cannot arm them, and writing
+      # them now would produce a file that says "on" over a process that is off
+      # -- the exact shape of a check that cannot fail.
+      say(s, "STACK   attached to an ALREADY-RUNNING client, so " &
+             "playerActuation / the inspector / the ammoloading rung were NOT " &
+             "armed by this run: those are read at boot. Whatever that client " &
+             "booted with is what is in effect, and the actuation steps below " &
+             "report what they actually find.")
     return step(s, "STACK ", vPass, "attached to a running backend -- " & why)
 
   if not s.launch:
@@ -530,6 +663,8 @@ proc launchStack*(s: var Script): bool =
                 "there is no " & exe & ", so this install cannot be launched")
 
   discard armPhaseReporting(s)
+  discard armActuation(s)
+  discard armAmmoLoading(s)
 
   say(s, "STACK   launching " & exe)
   # `toCString` takes a `var string`, so every argument to `cSpawn` must be a
@@ -836,6 +971,221 @@ proc waitDeployed*(s: var Script; seconds: int): bool =
                 "which are read at boot; see armPhaseReporting.")
 
 # ---------------------------------------------------------------------------
+# Step 5 -- ACTUATION. Driving the player, from out here.
+#
+# THE CHANNEL, AND WHY THIS ONE.
+# ------------------------------
+# `autoscript` is a separate process; `pact` lives inside the game. Three
+# candidates existed and two are unsuitable, for reasons rather than taste:
+#
+#   an HTTP endpoint in the client   IMPOSSIBLE. A client-side mod's `serve()`
+#                                    registers into nothing -- the listener is
+#                                    the backend's, in another process.
+#   a host config key                A LEVEL, NOT AN EDGE. A key can say
+#                                    "actuation is on"; it cannot say "do one
+#                                    magazine cycle NOW", it cannot be said
+#                                    twice, and it has nowhere to put an answer.
+#   the inspector file channel       CHOSEN. It is already an outside-process ->
+#                                    Unity-main-thread pipe, content-change
+#                                    triggered, with a serial line to re-run the
+#                                    same request, a per-command SEH guard, and
+#                                    an existing write gate (`allow write`) that
+#                                    is exactly the right gate for a verb that
+#                                    calls into game code.
+#
+# THE ANSWER COMES BACK BY LOG, NOT BY FILE, and that is deliberate. The
+# inspector's own out-file is written per batch; pact executes on the NEXT drain
+# frame, after the batch has been answered. So the host log is the medium of
+# record for the outcome, the same log this runner already tails for the
+# raid-phase latch -- one instrument, not two.
+#
+# WHAT EACH OUTCOME MEANS. `pact-rpc: QUEUED` is the REQUEST ARRIVING, and is
+# never treated as the request succeeding. The outcome of a magazine cycle is a
+# separate later line the game's own count readback produces.
+# ---------------------------------------------------------------------------
+
+const
+  RpcQueued = "pact-rpc: QUEUED"
+  RpcRefused = "pact-rpc: REFUSED"
+  MagComplete = "pact magcycle: COMPLETE"
+  MagWarn = "pact magcycle: "
+  AmmoFired = "ammoloading  FIRST FIRING"
+  AmmoFiringHeartbeat = "ammoloading  ARMED and FIRING"
+  AmmoNeverFired = "ammoloading  ARMED but NEVER FIRED"
+  AmmoNotArmed = "ammoloading  NOT ARMED"
+
+proc inspectSend(s: var Script; request: string): bool =
+  ## Drop one `pact` request into the inspector command file. Returns false only
+  ## if the file could not be written; ARRIVAL is a separate question, answered
+  ## by `pactDo` reading the log.
+  let path = joinPath(s.root, "aowlspt\\aowlspt-inspect.txt")
+  s.inspSerial = s.inspSerial + 1
+  # The serial line is not decoration: the channel triggers on a CONTENT CHANGE,
+  # so `pact magcycle` twice in a row with no serial would run ONCE and the
+  # second call would wait out its whole budget on the first one's answer.
+  let body = "#" & $s.inspSerial & "\n" &
+             "allow write\n" &
+             "pact " & request & "\n"
+  writeWhole(path, body)
+
+proc waitForLine(s: var Script; fromByte: int64; marker: string;
+                 seconds: int): bool =
+  ## Poll the host log for a literal, from a byte offset taken BEFORE the thing
+  ## that should produce it. The offset matters: without it a marker left by an
+  ## earlier cycle in the same run reads as this cycle's answer, which is a check
+  ## that cannot fail.
+  let path = hostLogPath(s)
+  var waited = 0
+  while waited < seconds:
+    if find(readTail(path, fromByte), marker) >= 0:
+      return true
+    cSleepMs(1000'i32)
+    waited = waited + 1
+  false
+
+proc pactDo*(s: var Script; request: string; seconds: int = 20): bool =
+  ## Send one pact request and wait for the host to say it ARRIVED.
+  ##
+  ##   PASS          the host log carried `pact-rpc: QUEUED "<request>"`
+  ##   FAIL          it carried `pact-rpc: REFUSED` -- the host looked at the
+  ##                 request and declined it, and its own line says why
+  ##   INCONCLUSIVE  neither line appeared. The request never reached pact: the
+  ##                 inspector is off, the write gate is off, or the client is
+  ##                 not draining. That is an instrument that did not run.
+  ##
+  ## `request` is the pact sub-command verbatim -- "magcycle", "wait 60",
+  ## "move 0 1 90", "look 5 0", "fire on", "reload", "status".
+  let label = "PACT  "
+  if not exists(hostLogPath(s)):
+    return step(s, label, vInconclusive,
+                "there is no host log, so no pact answer could ever be read")
+  let mark = logSize(s)
+  s.actuations = s.actuations + 1
+  if not inspectSend(s, request):
+    return step(s, label, vInconclusive,
+                "could not write the inspector command file under " & s.root &
+                "\\aowlspt -- the request was never sent")
+  say(s, label & "  sent `pact " & request & "` (batch #" & $s.inspSerial & ")")
+  if waitForLine(s, mark, RpcQueued & " \"" & request & "\"", seconds):
+    s.actuationsOk = s.actuationsOk + 1
+    return step(s, label, vPass,
+                "the host accepted `pact " & request &
+                "`. ACCEPTED IS NOT DONE -- the effect is asserted separately.")
+  let tail = readTail(hostLogPath(s), mark)
+  let at = find(tail, RpcRefused)
+  if at >= 0:
+    var line = ""
+    var i = at
+    while i < tail.len and tail[i] != '\r' and tail[i] != '\n':
+      line.add tail[i]
+      inc i
+    return step(s, label, vFail, "the host REFUSED it -- " & line)
+  result = step(s, label, vInconclusive,
+                "the host log carried no `pact-rpc:` line for `" & request &
+                "` in " & $seconds & "s, so the request never reached pact. " &
+                "That is NOT 'the actuation failed'. It needs host flags " &
+                "playerActuation + liveInspector + liveInspectorWrite, which " &
+                "are read at BOOT; see withActuation / armActuation.")
+
+proc magCycle*(s: var Script; seconds: int = 60): bool =
+  ## THE USER'S OWN EXAMPLE, with nobody at the keyboard: unload the magazine in
+  ## the weapon and load the same ammunition back.
+  ##
+  ## Four outcomes, each naming its own stage:
+  ##
+  ##   INCONCLUSIVE  the request never reached pact (see `pactDo`)
+  ##   FAIL          pact REFUSED it -- no firearm in hands, not deployed, a hop
+  ##                 that did not validate. Nothing was issued.
+  ##   FAIL          the cycle was ISSUED and did not complete -- the game's own
+  ##                 `Magazine.Count` did not come back. A PARTIAL load counts
+  ##                 here, on purpose.
+  ##   PASS          `pact magcycle: COMPLETE`, which is that same count
+  ##                 readback -- a number the game maintains and we never write.
+  let mark = logSize(s)
+  if not pactDo(s, "magcycle", 20):
+    return false
+  if waitForLine(s, mark, MagComplete, seconds):
+    return step(s, "MAGCYC", vPass,
+                "the magazine was unloaded and reloaded, and the game's own " &
+                "Magazine.Count came back. Nobody touched the keyboard.")
+  let tail = readTail(hostLogPath(s), mark)
+  let at = find(tail, MagWarn)
+  if at >= 0:
+    var line = ""
+    var i = at
+    while i < tail.len and tail[i] != '\r' and tail[i] != '\n':
+      line.add tail[i]
+      inc i
+    return step(s, "MAGCYC", vFail,
+                "the cycle did not complete -- " & line)
+  result = step(s, "MAGCYC", vInconclusive,
+                "pact accepted the request but the host log carried neither `" &
+                MagComplete & "` nor a `" & MagWarn & "` line in " & $seconds &
+                "s. The cycle was queued and its state machine never reported. " &
+                "That is a run that could not look.")
+
+proc assertAmmoLoadingFired*(s: var Script; seconds: int = 40): bool =
+  ## Did `mods/ammoloading` OBSERVE the cycle?
+  ##
+  ## This is the negative-shaped end of the test and the only part that speaks
+  ## for the mod. It asserts on the MOD'S OWN announcement, not on ours:
+  ##
+  ##   PASS          `ammoloading  FIRST FIRING` (or a heartbeat reading ARMED
+  ##                 and FIRING) after the cycle
+  ##   FAIL          the mod says `ARMED but NEVER FIRED` -- it was installed,
+  ##                 it was watching, and the detour did not fire. THIS IS THE
+  ##                 VERDICT THE WHOLE SCRIPT EXISTS TO BE ABLE TO PRODUCE.
+  ##   INCONCLUSIVE  `NOT ARMED`, or nothing at all -- no hook is installed, so
+  ##                 a zero counter says nothing about whether loading happened
+  let mark = logSize(s)
+  if waitForLine(s, mark, AmmoFired, seconds):
+    return step(s, "AMMOLD", vPass,
+                "mods/ammoloading announced its FIRST FIRING of " &
+                "LoadMagazineProcess::Start after our cycle. The trigger " &
+                "fires, which is the thing that had never been demonstrated.")
+  let tail = readTail(hostLogPath(s), 0)
+  if find(tail, AmmoFired) >= 0 or find(tail, AmmoFiringHeartbeat) >= 0:
+    return step(s, "AMMOLD", vPass,
+                "mods/ammoloading is ARMED and FIRING (its announcement " &
+                "predates this cycle's window, so this is the mod's state, " &
+                "not this cycle's edge).")
+  if find(tail, AmmoNeverFired) >= 0:
+    return step(s, "AMMOLD", vFail,
+                "mods/ammoloading is ARMED but NEVER FIRED: the hook is " &
+                "installed and verified, a magazine cycle completed, and " &
+                "LoadMagazineProcess::Start did not fire. The mod did not " &
+                "see it.")
+  if find(tail, AmmoNotArmed) >= 0:
+    return step(s, "AMMOLD", vInconclusive,
+                "mods/ammoloading reports NOT ARMED -- no hook is installed, " &
+                "so its counters say nothing. Put it on the `probe` rung " &
+                "with withAmmoLoading(s, \"probe\") BEFORE the launch.")
+  result = step(s, "AMMOLD", vInconclusive,
+                "mods/ammoloading said nothing at all in " & $seconds &
+                "s -- neither a firing, nor a heartbeat, nor NOT ARMED. The " &
+                "mod may not be installed in " & s.root &
+                ". Nothing was observed, which is not the same as nothing " &
+                "having happened.")
+
+proc pactStatusNote*(s: var Script) =
+  ## Ask pact for its counter line and put it in the transcript. Diagnostic
+  ## only: it changes no verdict, because a counter line is what you READ when a
+  ## verdict has already been reached, not the verdict itself.
+  let mark = logSize(s)
+  discard inspectSend(s, "status")
+  if waitForLine(s, mark, "pact-rpc: status ", 15):
+    let tail = readTail(hostLogPath(s), mark)
+    let at = find(tail, "pact-rpc: status ")
+    var line = ""
+    var i = at
+    while i < tail.len and tail[i] != '\r' and tail[i] != '\n':
+      line.add tail[i]
+      inc i
+    say(s, "PACT    " & line)
+  else:
+    say(s, "PACT    pact never answered a status request; no counters to show")
+
+# ---------------------------------------------------------------------------
 # The verdict
 # ---------------------------------------------------------------------------
 
@@ -854,6 +1204,12 @@ proc finish*(s: var Script): int =
     s.reason = "every step passed but the raid-phase latch never said " &
                "DEPLOYED, so no raid was observed. A run that could not look " &
                "is not a pass."
+  if s.verdict == vPass and s.actuation and s.actuations == 0:
+    # A script that DECLARED it drives the player and then drove nothing has not
+    # tested actuation; reporting PASS for it would be a check that cannot fail.
+    s.verdict = vInconclusive
+    s.reason = "this script declared withActuation and then sent no pact " &
+               "request at all, so nothing about actuation was measured."
   if s.verdict == vPass:
     s.reason = "gear read back " & $s.gearPlaced & "/" & $s.gearRequested &
                (if s.entered: " and the raid-phase latch said DEPLOYED"
@@ -867,11 +1223,28 @@ proc finish*(s: var Script): int =
        " profile=" & (if s.profileName.len > 0: s.profileName else: "(none)") &
        " gear requested/minted/placed=" & $s.gearRequested & "/" &
        $s.gearMinted & "/" & $s.gearPlaced &
-       " phase=" & (if s.phaseSeen.len > 0: s.phaseSeen else: "(never reported)")
+       " phase=" & (if s.phaseSeen.len > 0: s.phaseSeen else: "(never reported)") &
+       (if s.actuation: " pact sent/accepted=" & $s.actuations & "/" &
+                        $s.actuationsOk
+        else: "")
   case s.verdict
   of vPass: 0
   of vFail: 1
   of vInconclusive: 2
+
+proc runToRaid*(s: var Script; deploySeconds: int = 420): bool =
+  ## Everything `run` does EXCEPT the verdict: stack, profile, gear, entry, and
+  ## the raid-phase latch. Returns true only when the latch actually said
+  ## DEPLOYED, so a script can put in-raid work after it without having to
+  ## re-derive what "we are in a raid" means.
+  ##
+  ## A script that uses this owns its own ending: call `finish(s)` and
+  ## `quitWith` it, or the run reports nothing.
+  if not launchStack(s): return false
+  if not pickProfile(s): return false
+  if not applyGear(s): return false
+  if not enterRaid(s): return false
+  result = waitDeployed(s, deploySeconds)
 
 proc run*(s: var Script): int =
   ## Every step in order, stopping at the first that does not PASS. Returns the

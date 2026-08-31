@@ -1092,9 +1092,154 @@ proc pactTickBody(a: Il2CppPtr): Il2CppPtr {.
       break
   cast[Il2CppPtr](1)
 
+proc pactStatus*(): string =
+  ## Every leg separately falsifiable. THE COUNTER LINE a scripted run prints.
+  ## Read it as: asked/took/noeffect/never are FOUR OUTCOMES, not two, and a run
+  ## with asked=0 is INCONCLUSIVE -- it is not a pass and it is not a failure.
+  if not gPactOn:
+    return "pact OFF (flag playerActuation)"
+  if pactDisabled():
+    return "pact SELF-DISABLED after " & $gPactFaults & " faults"
+  if gPactIndicesOk == 0'i32:
+    return "pact REFUSED: target index/name mismatch"
+  if gPactBindState != 2'i32:
+    return "pact INCONCLUSIVE: not bound yet (" & $gPactBindTries &
+           " drain frames, reason " & $cPactReasonText() & ")"
+  result = "pact armed=" & $cPactOkCount() & "/" & $cPactTargetCount() &
+    " rejected=" & $cPactBadCount() &
+    " raid=" & (if rpDeployed(): "DEPLOYED" else: "no") &
+    " player=" & (if gPactYou != nil: "ok" else: "none") &
+    " owner=" & (if gPactOwner == nil: "not captured"
+                 elif gPactOwnerAgrees == 1'i32: "corroborated"
+                 else: "captured but NOT corroborated") &
+    " | asked=" & $gPactAsked & " took=" & $gPactTook &
+    " noeffect=" & $gPactNoEffect & " never=" & $gPactNeverIssued &
+    " qdrop=" & $gPactQDropped &
+    " | magcycles=" & $gMagCycles & " magok=" & $gMagOk &
+    " magfail=" & $gMagFailed & " (" & gMagWhy & ")"
+  if gPactLastRefusal.len > 0:
+    result = result & " | last refusal: " & gPactLastRefusal
+
+proc pactRpcAnswer(s: string) =
+  ## THE ONE PLACE an answer is published, to BOTH readers at once: the host log
+  ## (which is what an outside process tails) and `gInspPactAns` (which is what a
+  ## human sees on the next inspector batch). One writer, so the two can never
+  ## disagree about what happened.
+  gInspPactAns = s
+  info "pact-rpc: " & s
+
+proc pactRpcDrain() =
+  ## Drain at most ONE queued inspector request per frame.
+  ##
+  ## Deliberately ABOVE every early return in `pactDrainTick`: a request must be
+  ## ANSWERED even when the feature is off, unbound or self-disabled. Silence is
+  ## the one reply an outside process cannot interpret -- it is indistinguishable
+  ## from "the host never received it", and those are different verdicts.
+  ##
+  ## Touches NO game memory. Every verb here either enqueues (`pactPost` is
+  ## documented as fault-free) or reads counters, so this needs no guard of its
+  ## own and CANNOT nest one inside `cPactTickGuarded`.
+  if gInspPactReq.len == 0: return
+  let req = gInspPactReq
+  gInspPactReq = ""
+  let toks = iSplit(req)
+  if toks.len == 0:
+    pactRpcAnswer("REFUSED: empty request")
+    return
+  let sub = iLower(toks[0])
+  if sub == "status":
+    pactRpcAnswer("status " & pactStatus())
+    return
+  if not gPactOn:
+    pactRpcAnswer("REFUSED \"" & req & "\": flag playerActuation is OFF. " &
+                  "Nothing was attempted. This is a CONFIGURATION refusal, " &
+                  "not a failed actuation.")
+    return
+  if pactDisabled():
+    pactRpcAnswer("REFUSED \"" & req & "\": pact SELF-DISABLED after " &
+                  $gPactFaults & " faults. Nothing was attempted.")
+    return
+  if gPactBindState != 2'i32:
+    pactRpcAnswer("REFUSED \"" & req & "\": pact is NOT BOUND yet (" &
+                  $gPactBindTries & " drain frames). INCONCLUSIVE -- nothing " &
+                  "has been verified and nothing was called.")
+    return
+  if not rpDeployed():
+    pactRpcAnswer("REFUSED \"" & req & "\": the raid-phase latch does not " &
+                  "read DEPLOYED. Actuation is refused outside a live raid.")
+    return
+
+  # One numeric argument, parsed once. A malformed number REFUSES; it never
+  # falls back to zero, because "move 0 0" is a legal request and a silent
+  # coercion would make a typo look like a command that worked.
+  var f1 = 0.0
+  var f2 = 0.0
+  var n1 = 0'u64
+  var okf1 = toks.len > 1 and iParseF(toks[1], f1)
+  var okf2 = toks.len > 2 and iParseF(toks[2], f2)
+  var okn1 = toks.len > 1 and iParseU(toks[1], n1)
+  var onOff = -1'i32
+  if toks.len > 1:
+    let w = iLower(toks[1])
+    if w == "on" or w == "1" or w == "true": onOff = 1'i32
+    elif w == "off" or w == "0" or w == "false": onOff = 0'i32
+
+  var posted = false
+  var bad = ""
+  case sub
+  of "magcycle":
+    posted = pactMagCycle()
+  of "wait":
+    if not okn1: bad = "usage: pact wait FRAMES"
+    else: posted = pactWait(int32(n1))
+  of "move":
+    var n3 = 0'u64
+    if not (okf1 and okf2 and toks.len > 3 and iParseU(toks[3], n3)):
+      bad = "usage: pact move STRAFE FORWARD FRAMES (floats, then a frame count)"
+    else: posted = pactMove(f1, f2, int32(n3))
+  of "look":
+    if not (okf1 and okf2): bad = "usage: pact look DX DY"
+    else: posted = pactRotate(f1, f2)
+  of "fire":
+    if onOff < 0'i32: bad = "usage: pact fire on|off"
+    else: posted = pactFire(onOff == 1'i32)
+  of "aim":
+    if onOff < 0'i32: bad = "usage: pact aim on|off"
+    else: posted = pactAim(onOff == 1'i32)
+  of "sprint":
+    if onOff < 0'i32: bad = "usage: pact sprint on|off"
+    else: posted = pactSprint(onOff == 1'i32)
+  of "jump":
+    posted = pactJump()
+  of "prone":
+    posted = pactProne()
+  of "pose":
+    if not okf1: bad = "usage: pact pose DELTA (negative lowers)"
+    else: posted = pactPose(f1)
+  of "lean":
+    if not okf1: bad = "usage: pact lean DIR (-1 left, 0 centre, +1 right)"
+    else: posted = pactLean(f1)
+  of "command":
+    if not okn1: bad = "usage: pact command ECOMMAND (16 = reload)"
+    else: posted = pactCommand(int32(n1))
+  of "reload":
+    posted = pactCommand(16'i32)
+  else:
+    bad = "unknown pact verb \"" & sub & "\""
+  if bad.len > 0:
+    pactRpcAnswer("REFUSED \"" & req & "\": " & bad)
+  elif not posted:
+    pactRpcAnswer("REFUSED \"" & req & "\": the actuation ring is FULL (" &
+                  $gPactQDropped & " dropped). Nothing was enqueued.")
+  else:
+    pactRpcAnswer("QUEUED \"" & req & "\". Enqueued is not executed: the " &
+                  "outcome is a later line -- for magcycle, `pact magcycle: " &
+                  "COMPLETE` or a `pact magcycle:` warn.")
+
 proc pactDrainTick*() =
   ## Rides the existing `TarkovApplication::Update` drain. Installs no detour of
   ## its own (the only detour this feature owns is the LateUpdate capture).
+  pactRpcDrain()
   if not gPactOn: return
   if pactDisabled(): return
   gPactTicks = gPactTicks + 1
@@ -1163,31 +1308,3 @@ proc pactBind*() =
        "(walk/look/fire/aim/pose/lean, the ECommand channel, and the " &
        "magazine unload+load cycle). It binds on the main-thread drain and " &
        "does nothing at all outside a DEPLOYED raid."
-
-proc pactStatus*(): string =
-  ## Every leg separately falsifiable. THE COUNTER LINE a scripted run prints.
-  ## Read it as: asked/took/noeffect/never are FOUR OUTCOMES, not two, and a run
-  ## with asked=0 is INCONCLUSIVE -- it is not a pass and it is not a failure.
-  if not gPactOn:
-    return "pact OFF (flag playerActuation)"
-  if pactDisabled():
-    return "pact SELF-DISABLED after " & $gPactFaults & " faults"
-  if gPactIndicesOk == 0'i32:
-    return "pact REFUSED: target index/name mismatch"
-  if gPactBindState != 2'i32:
-    return "pact INCONCLUSIVE: not bound yet (" & $gPactBindTries &
-           " drain frames, reason " & $cPactReasonText() & ")"
-  result = "pact armed=" & $cPactOkCount() & "/" & $cPactTargetCount() &
-    " rejected=" & $cPactBadCount() &
-    " raid=" & (if rpDeployed(): "DEPLOYED" else: "no") &
-    " player=" & (if gPactYou != nil: "ok" else: "none") &
-    " owner=" & (if gPactOwner == nil: "not captured"
-                 elif gPactOwnerAgrees == 1'i32: "corroborated"
-                 else: "captured but NOT corroborated") &
-    " | asked=" & $gPactAsked & " took=" & $gPactTook &
-    " noeffect=" & $gPactNoEffect & " never=" & $gPactNeverIssued &
-    " qdrop=" & $gPactQDropped &
-    " | magcycles=" & $gMagCycles & " magok=" & $gMagOk &
-    " magfail=" & $gMagFailed & " (" & gMagWhy & ")"
-  if gPactLastRefusal.len > 0:
-    result = result & " | last refusal: " & gPactLastRefusal
