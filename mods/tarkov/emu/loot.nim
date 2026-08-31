@@ -79,6 +79,8 @@ import aowlspt/server
 import aowlspt/json
 import rand
 import knobs
+import lootconfig
+import lootcats
 
 # ---------------------------------------------------------------------------
 # Reading the database
@@ -254,6 +256,12 @@ type
     stackMaxFraction*: float   ## cap the roll at this fraction of StackMaxSize
     money*: MoneyStackConfig   ## currency-only stack shaping, shared with bots
 
+    rules*: RuleSet            ## the shared resolver, see `emu/lootconfig`
+    explainTpl*: string        ## template id to trace at generation time
+    staticPerMap*: KvList      ## per-map multiplier, CONTAINER pass only
+    loosePerMap*: KvList       ## per-map multiplier, LOOSE pass only
+    containerTypeFill*: KvList ## per container TEMPLATE item-count multiplier
+
 proc defaultLootConfig*(): LootConfig =
   ## The shipped behaviour: the map's own numbers, unscaled.
   LootConfig(enabled: true, staticMultiplier: 1.0, looseMultiplier: 1.0,
@@ -269,7 +277,10 @@ proc defaultLootConfig*(): LootConfig =
              stackRandomRange: false, stackMultiplier: 1.0,
              stackMaxFraction: 1.0,
              money: MoneyStackConfig(multiplier: 1.0, floorCount: 0,
-                                     ceilCount: 0))
+                                     ceilCount: 0),
+             rules: newRuleSet(), explainTpl: "",
+             staticPerMap: newKvList(), loosePerMap: newKvList(),
+             containerTypeFill: newKvList())
 
 proc clampLow(v: float; lo: float): float =
   if v < lo: lo else: v
@@ -366,6 +377,41 @@ proc categoryWeightsFromSettings(): KvList =
   for i in 0 ..< extra.keys.len:
     setKv(result, extra.keys[i], extra.vals[i])
 
+proc lootRulesFromSettings*(): RuleSet =
+  ## Every named category slider, then the free-text rules ON TOP.
+  ##
+  ## Load ORDER is the tie-break, and it is stated here rather than left to
+  ## whatever iteration happened to produce: base classes, then handbook
+  ## categories, then the legacy `lootCategoryWeights` list, then `lootRules`.
+  ## `lootconfig.beats` gives the LAST declaration the win on an exact
+  ## specificity tie, so the free-text rule -- the advanced control, the one
+  ## somebody had to type an id into -- beats a slider it ties with, and never
+  ## loses to it silently.
+  ##
+  ## A slider at exactly 1.0 contributes NO RULE (see `addMul`), so an operator
+  ## who never opened the page leaves this empty, `active` is false, and the
+  ## resolver is skipped rather than run with neutral numbers.
+  result = newRuleSet()
+  for i in 0 ..< BaseClassRows.len:
+    let row = BaseClassRows[i]
+    addMul(result, selBase, row.id, knob(row.key).asFloat(1.0), row.key)
+  for i in 0 ..< HandbookRows.len:
+    let row = HandbookRows[i]
+    addMul(result, selHb, row.id, knob(row.key).asFloat(1.0), row.key)
+  addRuleText(result, knob("lootRules").asText(""))
+
+proc rulesNeedPrices(rs: RuleSet): bool =
+  for r in rs.rules:
+    if r.sel == selPriceAbove or r.sel == selPriceBelow:
+      return true
+  result = false
+
+proc rulesNeedHandbook(rs: RuleSet): bool =
+  for r in rs.rules:
+    if r.sel == selHb:
+      return true
+  result = false
+
 proc lootConfig*(): LootConfig =
   ## Read from the mod's `config.json`. Every key is optional and every default
   ## is the pre-existing behaviour, so a config file that predates this module
@@ -403,6 +449,12 @@ proc lootConfig*(): LootConfig =
   result.stackMultiplier = knob("lootStackMultiplier").asFloat(1.0)
   result.stackMaxFraction = knob("lootStackMaxFraction").asFloat(1.0)
   result.money = moneyStackConfig()
+
+  result.rules = lootRulesFromSettings()
+  result.explainTpl = strip(knob("lootRuleExplain").asText(""))
+  result.staticPerMap = parseKvList(knob("staticLootPerMap").asText(""))
+  result.loosePerMap = parseKvList(knob("looseLootPerMap").asText(""))
+  result.containerTypeFill = parseKvList(knob("containerTypeFill").asText(""))
 
   # Clamping, not refusing: a negative multiplier is a slider dragged past its
   # own minimum, and "no loot from this source" is the honest reading of it.
@@ -445,11 +497,17 @@ proc declaredLootKeys*(): seq[string] =
              "lootRarityCommon", "lootRarityRare", "lootRaritySuperrare",
              "lootCategoryWeights", "lootStackRandomRange",
              "lootStackMultiplier", "lootStackMaxFraction",
-             "moneyStackMultiplier", "moneyStackMin", "moneyStackMax"]
+             "moneyStackMultiplier", "moneyStackMin", "moneyStackMax",
+             "lootRules", "lootRuleExplain", "staticLootPerMap",
+             "looseLootPerMap", "containerTypeFill"]
   for i in 0 ..< CategoryWeightKeys.len:
     result.add CategoryWeightKeys[i]
   for i in 0 ..< CurrencyWeightKeys.len:
     result.add CurrencyWeightKeys[i]
+  for i in 0 ..< BaseClassRows.len:
+    result.add BaseClassRows[i].key
+  for i in 0 ..< HandbookRows.len:
+    result.add HandbookRows[i].key
 
 proc shapesPool*(cfg: LootConfig): bool =
   ## Whether ANY pool-shaping knob is off its default. When this is false the
@@ -458,11 +516,20 @@ proc shapesPool*(cfg: LootConfig): bool =
   ## rather than a claim about arithmetic.
   cfg.valueBias != 0.0 or cfg.minPrice > 0 or cfg.maxPrice > 0 or
     cfg.rarityCommon != 1.0 or cfg.rarityRare != 1.0 or
-    cfg.raritySuperrare != 1.0 or cfg.categoryWeights.len > 0
+    cfg.raritySuperrare != 1.0 or cfg.categoryWeights.len > 0 or
+    cfg.rules.active
 
 proc needsPrices*(cfg: LootConfig): bool =
   ## Whether the handbook price index has to be built at all.
-  cfg.valueBias != 0.0 or cfg.minPrice > 0 or cfg.maxPrice > 0
+  cfg.valueBias != 0.0 or cfg.minPrice > 0 or cfg.maxPrice > 0 or
+    rulesNeedPrices(cfg.rules)
+
+proc needsHandbookCats*(cfg: LootConfig): bool =
+  ## Whether the template -> handbook-category index has to be built. Separate
+  ## from `needsPrices` because a rule set full of `hb:` rules and no price
+  ## rules must still get the category index, and a price-only rule set must
+  ## not pay for one.
+  rulesNeedHandbook(cfg.rules)
 
 # ---------------------------------------------------------------------------
 # Item templates
@@ -612,11 +679,19 @@ type
     priceHits*: int
     priceMisses*: int
     dropped*: int           ## entries removed by the min/max price gates
+    hbcat: seq[string]      ## ... and the handbook category each one sits in
+    hbcats*: bool           ## the category index was built and is non-empty
+    catId: seq[string]      ## `templates.handbook.Categories[].Id`
+    catParent: seq[string]  ## ... and its ParentId, for the chain walk
+    ruleHits*: int          ## pool entries any rule matched
+    ruleDrops*: int         ## ... and entries a rule removed
+    explained*: string      ## the `lootRuleExplain` trace, once
 
 proc newPoolShaper(): PoolShaper =
   PoolShaper(active: false, prices: false, tpls: @[], price: @[],
              rarityHits: 0, rarityMisses: 0, priceHits: 0, priceMisses: 0,
-             dropped: 0)
+             dropped: 0, hbcat: @[], hbcats: false, catId: @[],
+             catParent: @[], ruleHits: 0, ruleDrops: 0, explained: "")
 
 proc buildShaper(d: LootDb; cfg: LootConfig): PoolShaper =
   ## Built once per raid, like `buildPresets`, and for the same reason: the
@@ -626,7 +701,9 @@ proc buildShaper(d: LootDb; cfg: LootConfig): PoolShaper =
   if not shapesPool(cfg):
     return
   result.active = true
-  if not needsPrices(cfg):
+  let wantPrices = needsPrices(cfg)
+  let wantCats = needsHandbookCats(cfg)
+  if not wantPrices and not wantCats:
     return
   let raw0 = sub(d, "templates.handbook.Items")
   if raw0.len == 0:
@@ -641,7 +718,23 @@ proc buildShaper(d: LootDb; cfg: LootConfig): PoolShaper =
       continue
     result.tpls.add id
     result.price.add e.field("Price").asFloat(0.0)
-  result.prices = result.tpls.len > 0
+    result.hbcat.add e.field("ParentId").asText("")
+  result.prices = wantPrices and result.tpls.len > 0
+  if not wantCats:
+    return
+  let rawc = sub(d, "templates.handbook.Categories")
+  if rawc.len == 0:
+    return
+  let jc = whole(rawc)
+  if not isArray(jc):
+    return
+  for c in each(jc):
+    let id = c.field("Id").asText("")
+    if id.len == 0:
+      continue
+    result.catId.add id
+    result.catParent.add c.field("ParentId").asText("")
+  result.hbcats = result.catId.len > 0
 
 proc priceOf(s: PoolShaper; tpl: string): float =
   ## The handbook base price, or -1 when the handbook does not list this item.
@@ -725,8 +818,74 @@ proc rarityFactor(cfg: LootConfig; band: string): float =
   of "superrare": cfg.raritySuperrare
   else: 1.0
 
+proc parentChain(d: LootDb; tpl: string): seq[string] =
+  ## The `_parent` chain, NEAREST FIRST, excluding `tpl` itself. Capped and
+  ## cycle-refusing for the same reason `categoryFactor` is: `_parent` comes
+  ## from data, and a cycle in data must not hang a raid's loading screen.
+  result = @[]
+  var cur = tpl
+  var hops = 0
+  while cur.len > 0 and hops < 24:
+    var parent = strip(sub(d, "templates.items." & cur & "._parent"))
+    if parent.len >= 2 and parent[0] == '"' and parent[parent.len - 1] == '"':
+      parent = parent.substr(1, parent.len - 2)
+    if parent.len == 0:
+      break
+    var loop = parent == tpl
+    for s in result:
+      if s == parent:
+        loop = true
+        break
+    if loop:
+      break
+    result.add parent
+    cur = parent
+    inc hops
+
+proc hbChain(s: PoolShaper; tpl: string): seq[string] =
+  ## The handbook category chain for a template, nearest first. Empty when the
+  ## index was not built or the handbook has no row for this template -- which
+  ## is NOT the same as "it is in no category", and is why an `hb:` rule simply
+  ## fails to match rather than matching a guessed root.
+  result = @[]
+  if not s.hbcats:
+    return
+  var cat = ""
+  for i in 0 ..< s.tpls.len:
+    if s.tpls[i] == tpl:
+      cat = s.hbcat[i]
+      break
+  var hops = 0
+  while cat.len > 0 and hops < 12:
+    var loop = false
+    for c in result:
+      if c == cat:
+        loop = true
+        break
+    if loop:
+      break
+    result.add cat
+    var nxt = ""
+    for i in 0 ..< s.catId.len:
+      if s.catId[i] == cat:
+        nxt = s.catParent[i]
+        break
+    cat = nxt
+    inc hops
+
+proc subjectFor*(d: LootDb; s: PoolShaper; tpl, map, ctx: string;
+                 ctxKind: CtxKind): Subject =
+  ## One candidate, in one situation, in the shape `emu/lootconfig` resolves.
+  ## `emu/bots` builds the same thing with `ckBot` and the bot's role as `ctx`;
+  ## that is the entire difference between world loot and carried loot as far
+  ## as the weighting system is concerned.
+  Subject(tpl: tpl, parents: parentChain(d, tpl), hb: hbChain(s, tpl),
+          rarity: rarityOf(d, tpl), price: priceOf(s, tpl),
+          map: map, ctx: ctx, ctxKind: ctxKind)
+
 proc shapePool(d: LootDb; cfg: LootConfig; s: var PoolShaper;
-               dist: Distribution): Distribution =
+               dist: Distribution; map = ""; ctx = "";
+               ctxKind = ckAny): Distribution =
   ## The pool a draw actually happens against. Entries whose weight falls to
   ## zero, and entries outside the price gates, are REMOVED rather than kept at
   ## weight zero -- `pick` would never return them either way, but a removed
@@ -763,6 +922,25 @@ proc shapePool(d: LootDb; cfg: LootConfig; s: var PoolShaper;
       w = w * rarityFactor(cfg, band)
 
     w = w * categoryFactor(d, cfg, tpl)
+
+    # The shared resolver, LAST. It runs after the legacy scalar knobs rather
+    # than instead of them, so an existing `config.json` keeps behaving as it
+    # did and a rule set is strictly additional. When no rule is declared the
+    # whole block is skipped -- not run with a neutral rule set -- which is
+    # what keeps the default RNG stream identical.
+    if cfg.rules.active:
+      let subj = subjectFor(d, s, tpl, map, ctx, ctxKind)
+      if cfg.explainTpl.len > 0 and cfg.explainTpl == tpl and
+         s.explained.len == 0:
+        s.explained = explain(cfg.rules, subj, w)
+      let o = resolve(cfg.rules, subj, w)
+      if o.matched > 0:
+        s.ruleHits = s.ruleHits + 1
+      if o.dropped:
+        s.ruleDrops = s.ruleDrops + 1
+        s.dropped = s.dropped + 1
+        continue
+      w = o.weight
 
     if w <= 0.0:
       s.dropped = s.dropped + 1
@@ -1485,13 +1663,17 @@ proc staticContainers(d: LootDb; p: PresetIndex; a: AmmoTable; r: var Rng;
       if pool.len > 0:
         let poolRef = whole(pool)
         let dist = shapePool(d, cfg, s,
-                     readDistribution(raw(child(poolRef, "itemDistribution"))))
+                     readDistribution(raw(child(poolRef, "itemDistribution"))),
+                     locationId, containerTpl, ckStatic)
         var n = readCount(raw(child(poolRef, "itemcountDistribution")), r)
         # The multiplier scales how full a crate is as well as whether it is
         # there, which is what "more loot" means to a player who asks for it.
         # `containerFillMultiplier` separates the two halves of that for anyone
         # who wants more crates but not fuller ones, or the reverse.
-        n = int(float(n) * cfg.staticMultiplier * cfg.containerFillMul + 0.5)
+        var fillMul = cfg.staticMultiplier * cfg.containerFillMul
+        if cfg.containerTypeFill.len > 0:
+          fillMul = fillMul * lookup(cfg.containerTypeFill, containerTpl, 1.0)
+        n = int(float(n) * fillMul + 0.5)
         if n > cfg.containerMaxItems: n = cfg.containerMaxItems
         var k = 0
         while k < n and dist.len > 0:
@@ -1585,7 +1767,8 @@ proc tplForKey(list: List; key: string): string =
   result = ""
 
 proc shapeLoosePool(d: LootDb; cfg: LootConfig; s: var PoolShaper;
-                    list: List; dist: Distribution): Distribution =
+                    list: List; dist: Distribution;
+                    map = ""): Distribution =
   ## `shapePool` over a loose point, with the id -> template mapping applied
   ## before shaping and undone after, so the returned keys are still the ids the
   ## caller has to resolve against the point.
@@ -1606,14 +1789,14 @@ proc shapeLoosePool(d: LootDb; cfg: LootConfig; s: var PoolShaper;
     var one = newDistribution()
     one.keys.add tpl
     one.weights.add dist.weights[i]
-    let shaped = shapePool(d, cfg, s, one)
+    let shaped = shapePool(d, cfg, s, one, map, "", ckLoose)
     if shaped.keys.len == 0:
       continue
     result.keys.add dist.keys[i]
     result.weights.add shaped.weights[0]
 
 proc passesGates(d: LootDb; cfg: LootConfig; s: var PoolShaper;
-                 tpl: string): bool =
+                 tpl: string; map = ""): bool =
   ## Whether one template survives the item-mix knobs on its own. Used for a
   ## loose point that has NO distribution -- one candidate, laid out by hand.
   ## Without this the whole item-mix section would silently apply to containers
@@ -1623,11 +1806,11 @@ proc passesGates(d: LootDb; cfg: LootConfig; s: var PoolShaper;
   var one = newDistribution()
   one.keys.add tpl
   one.weights.add 1.0
-  result = shapePool(d, cfg, s, one).keys.len > 0
+  result = shapePool(d, cfg, s, one, map, "", ckLoose).keys.len > 0
 
 proc looseSpawn(d: LootDb; p: PresetIndex; a: AmmoTable; r: var Rng;
                 cfg: LootConfig; s: var PoolShaper;
-                point: JsonRef; budget: var int): string =
+                point: JsonRef; budget: var int; map = ""): string =
   ## One loose spawn point, resolved to a loot entry.
   let tmpl = point.field("template")
   if not tmpl.found:
@@ -1647,7 +1830,7 @@ proc looseSpawn(d: LootDb; p: PresetIndex; a: AmmoTable; r: var Rng;
   # to. `shapeLoosePool` below does that mapping; with no shaping active it
   # returns the distribution untouched and nothing is looked up at all.
   let rawDist = readDistribution(raw(point.field("itemDistribution")))
-  let dist = shapeLoosePool(d, cfg, s, list, rawDist)
+  let dist = shapeLoosePool(d, cfg, s, list, rawDist, map)
   # EVERY candidate gated away is "this point spawns nothing", not "fall back to
   # the first candidate". The fallback below is for a point that never had a
   # distribution at all, and letting a gated-empty pool reach it was a MEASURED
@@ -1658,7 +1841,7 @@ proc looseSpawn(d: LootDb; p: PresetIndex; a: AmmoTable; r: var Rng;
     return ""
   if rawDist.len == 0 and s.active:
     # One candidate, laid out by hand: gate it directly.
-    if not passesGates(d, cfg, s, tplForKey(list, rootId)):
+    if not passesGates(d, cfg, s, tplForKey(list, rootId), map):
       return ""
   if dist.len > 0:
     let k = pick(dist, r)
@@ -1793,7 +1976,7 @@ proc looseLoot(d: LootDb; p: PresetIndex; a: AmmoTable; r: var Rng;
     for pt in pts:
       if budget <= 0:
         return
-      let e = looseSpawn(d, p, a, r, cfg, sh, pt, budget)
+      let e = looseSpawn(d, p, a, r, cfg, sh, pt, budget, locationId)
       if e.len > 0:
         result.add e
 
@@ -1811,7 +1994,7 @@ proc looseLoot(d: LootDb; p: PresetIndex; a: AmmoTable; r: var Rng;
                       cfg.looseMultiplier * chanceMul
     if not chance(r, probability):
       continue
-    let e = looseSpawn(d, p, a, r, cfg, sh, pt, budget)
+    let e = looseSpawn(d, p, a, r, cfg, sh, pt, budget, locationId)
     if e.len > 0:
       result.add e
       spawned = spawned + 1
@@ -1849,6 +2032,13 @@ proc generateLoot*(d: LootDb; cfg: LootConfig;
   let mapMul = lookup(cfg.perMap, locationId, 1.0)
   containerMul = containerMul * cfg.globalMultiplier * mapMul
   looseMul = looseMul * cfg.globalMultiplier * mapMul
+  # And the per-PASS per-map overrides, which are strictly more specific than
+  # `lootPerMapMultipliers` above and therefore MULTIPLY it rather than replace
+  # it: "half as much loot on Woods" and "and a third as much of it loose" are
+  # two statements, and an operator who wrote both meant both. A map absent
+  # from either list contributes 1.0, so a missing entry can never empty a map.
+  containerMul = containerMul * lookup(cfg.staticPerMap, locationId, 1.0)
+  looseMul = looseMul * lookup(cfg.loosePerMap, locationId, 1.0)
   if containerMul < 0.0: containerMul = 0.0
   if looseMul < 0.0: looseMul = 0.0
 
@@ -1911,6 +2101,25 @@ proc generateLoot*(d: LootDb; cfg: LootConfig;
        cfg.rarityRare != 1.0 or cfg.raritySuperrare != 1.0):
       warn "loot: a RARITY knob is set but no pool entry on " & locationId &
            " declares _props.RarityPvE or _props.Rarity, so it changed nothing"
+    if cfg.rules.active:
+      info "loot: " & locationId & " " & summary(cfg.rules) &
+           "; pool entries a rule touched " & $shaper.ruleHits &
+           ", removed " & $shaper.ruleDrops
+      # The falsifiable half. A rule set that matched NOTHING is the failure
+      # this whole system is most likely to produce -- a mistyped id reweights
+      # an empty set and everything reports success -- so it gets a warning of
+      # its own rather than a zero buried in the line above.
+      if shaper.ruleHits == 0:
+        warn "loot: " & $cfg.rules.len & " loot rule(s) are declared but NOT " &
+             "ONE pool entry on " & locationId & " matched any of them. " &
+             "Set lootRuleExplain to a template id to see why."
+    if shaper.explained.len > 0:
+      info "loot: lootRuleExplain " & cfg.explainTpl & " on " & locationId &
+           "\n" & shaper.explained
+    elif cfg.explainTpl.len > 0:
+      info "loot: lootRuleExplain " & cfg.explainTpl & " -- that template " &
+           "never appeared in any pool on " & locationId & ", so there is " &
+           "nothing to explain. That is INCONCLUSIVE, not 'no rule matched'."
   result = text(out1)
 
 proc fmt2(v: float): string =
@@ -2482,6 +2691,60 @@ proc check(report: var string; ok: bool; what: string) =
     report.add "ok    " & what & "\n"
   else:
     report.add "FAIL  " & what & "\n"
+
+proc hex16(v: uint64): string =
+  const Digits = "0123456789abcdef"
+  result = ""
+  var i = 60
+  while i >= 0:
+    result.add Digits[int((v shr uint64(i)) and 0xF'u64)]
+    i = i - 4
+
+proc lootBatchHash*(d: LootDb; cfg: LootConfig; locationId, seed: string;
+                    n: int; items: var int; bytes: var int): string =
+  ## Generate `n` consecutive raids from a fixed seed and hash every byte of
+  ## every payload into one number.
+  ##
+  ## This exists because "the defaults reproduce the previous behaviour" was
+  ## being asserted by construction -- "each new knob is skipped at its
+  ## default, therefore the stream is unchanged" -- and an argument about
+  ## control flow is not a measurement of output. A claim about generated loot
+  ## has to be checked against generated loot.
+  ##
+  ## The check it enables has BOTH halves, and the second is the one that
+  ## matters: same seed + defaults before and after must give the SAME digest,
+  ## and one knob moved must give a DIFFERENT one. Without the second half the
+  ## instrument could be returning a constant and the first half would still
+  ## pass, which is the check-that-cannot-fail this repository keeps shipping.
+  ##
+  ## The digest is order- and position-sensitive (the running hash is folded
+  ## with the raid index and the payload length as well as the text), so two
+  ## batches that contain the same items in a different order do NOT collide.
+  var h = hashText("aowl-loot-batch|" & locationId & "|" & seed)
+  items = 0
+  bytes = 0
+  for i in 0 ..< n:
+    let raidId = seed & "#" & $i
+    let payload = generateLoot(d, cfg, locationId, raidId)
+    bytes = bytes + payload.len
+    items = items + countOccurrences(payload, "\"_tpl\"")
+    h = h xor hashText(payload)
+    h = h * 0x100000001B3'u64
+    h = h xor uint64(i * 2654435761)
+    h = h xor uint64(payload.len)
+    h = h * 0x100000001B3'u64
+  result = hex16(h)
+
+proc lootBatchHashText*(document, locationId, seed, ruleText: string;
+                        n: int; items: var int; bytes: var int): string =
+  ## `lootBatchHash` over a JSON document, with an optional rule set applied on
+  ## top of the DEFAULT config. `ruleText` empty means "defaults, untouched" --
+  ## and `addRuleText("")` adds no rule at all, so the defaults path is
+  ## byte-identical to the one a stock install takes, not a neighbouring one.
+  var cfg = defaultLootConfig()
+  addRuleText(cfg.rules, ruleText)
+  result = lootBatchHash(textDb(document), cfg, locationId, seed, n,
+                         items, bytes)
 
 proc selfCheck*(document: string): string =
   ## Runs the generator over a fixture and reports. Callable from a scratch

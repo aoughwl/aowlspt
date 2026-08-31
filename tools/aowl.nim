@@ -1655,6 +1655,55 @@ proc cmdSelfCheck(e: Env; modPath: string): int =
     return 1
   result = 0
 
+proc cmdLootHash(e: Env; extra: seq[string]): int =
+  ## `aowl loothash` -- the deterministic generate-and-hash instrument for loot.
+  ##
+  ## It exists because there was no way to CHECK "defaults reproduce current
+  ## behaviour"; it was only ever argued from control flow, which is not a
+  ## measurement of output. Same seed, defaults on, before and after a change:
+  ## the digest must be identical. Then move one knob: the digest must MOVE. A
+  ## check whose failing input you cannot name is not a check, so the second
+  ## half is the one that makes the first half mean anything.
+  ##
+  ## Built with the same stub host `selfcheck` uses -- `config_get` refuses, so
+  ## every setting reads its default and the run cannot be perturbed by whatever
+  ## happens to be in someone's `config.json`. That is the point: this is a
+  ## measurement of the CODE at defaults, not of an installation.
+  let modDir = joinPath(e.repo, "mods\\tarkov")
+  if not isDirectory(modDir):
+    err "no mods\\tarkov in this checkout"
+    return 1
+  let outDir = joinPath(e.repo, "installer\\build")
+  discard ensureDir(outDir)
+  let exe = joinPath(outDir, "loothash.exe")
+  var cmd = quoted(nimonyExe(e))
+  cmd.add " c"
+  cmd.add abiInclude(e)
+  cmd.add " -p:" & quoted(modDir)
+  cmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
+  cmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
+  cmd.add " -p:" & quoted(joinPath(e.nimony, "src\\lib"))
+  cmd.add " -o:" & quoted(exe)
+  cmd.add " " & quoted(joinPath(e.repo, "tools\\loothash_main.nim"))
+  if not run(e, "the loot hash instrument", cmd, e.repo):
+    return 1
+  if not fileExists(exe):
+    err "the compile reported success but produced no loothash.exe"
+    return 1
+  var invocation = quoted(exe)
+  for a in extra:
+    invocation.add " " & quoted(a)
+  var code = -1
+  try:
+    let (o, c) = execCmdEx(invocation, workingDir = e.repo)
+    for l in splitLines(o):
+      echo l
+    code = c
+  except:
+    err "loothash.exe could not be run"
+    return 1
+  result = code
+
 proc cmdWorktreeInit(e: Env): int =
   ## Everything a FRESH `git worktree add` needs before it can build, in one
   ## command, because the worktree-per-agent rule (CLAUDE.md 3) makes this a
@@ -3527,7 +3576,8 @@ proc main(): int =
     # Forwarding everything after the verb verbatim keeps this parser from
     # having to learn a second command's flags, and keeps them from drifting.
     if command == "release" or command == "importdb" or
-       command == "ui" or command == "raid":
+       command == "ui" or command == "raid" or
+       command == "loothash":
       extra.add a
     elif a == "--debug":
       e.debugBuild = true
@@ -3576,6 +3626,7 @@ proc main(): int =
     if arg.len == 0:
       fatal "selfcheck needs a mod path, e.g. `aowl selfcheck mods\\tarkov`"
     result = cmdSelfCheck(e, arg)
+  of "loothash": result = cmdLootHash(e, extra)
   of "build-mod":
     if arg.len == 0:
       fatal "build-mod needs a path"
