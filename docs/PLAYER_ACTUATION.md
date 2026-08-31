@@ -15,6 +15,19 @@ Two files, and both are worth reading before calling anything:
 Flag: **`playerActuation`**, default **OFF**.
 `python tools/hostcfg.py set playerActuation on`.
 
+**This document is the HOST side.** For the automation library that drives these
+primitives from a script — the typed verbs, their arguments, their failure modes
+and what each one actually proves — see **`docs/AUTOMATION-API.md`**. In
+particular it records which verbs are *verified* (`walkAndSee`, `magCycle`) and
+which are **issue-only** (everything else): pact has no readback for rotation,
+trigger, aim, stance or the `ECommand` channel today, so a PASS on those means
+the host accepted the call and nothing more.
+
+A script writes `withActuation(s)` and gets the three flags armed *before boot*
+(`playerActuation`, `liveInspector`, `liveInspectorWrite` — all read at boot, so
+arming them against an already-running client is impossible and is announced
+rather than faked).
+
 ---
 
 ## 1. Can the local player ride the bot drive path? No. Measured.

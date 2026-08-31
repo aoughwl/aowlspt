@@ -17,7 +17,10 @@
 ##     var s = newScript("woods-pmc-m4")
 ##     onMap(s, "Woods")
 ##     asSide(s, "pmc")
-##     equip(s, "FirstPrimaryWeapon", "5447a9cd4bdc2dbd208b4567")   # M4A1
+##     equipWeapon(s, "FirstPrimaryWeapon",
+##                 "5447a9cd4bdc2dbd208b4567",   # M4A1
+##                 "55d4887d4bdc2d962f8b4570",   # a STANAG in its mod_magazine
+##                 "54527ac44bdc2d36668b4567")   # loaded with M855A1
 ##     equip(s, "Headwear",           "5aa7e276e5b5b000171d0647")   # Altyn
 ##     equip(s, "TacticalVest",       "5ab8dced86f774646209ec87")   # ANA M1
 ##     carryLoaded(s, "TacticalVest", "55d4887d4bdc2d962f8b4570", 3,
@@ -132,6 +135,27 @@
 ##
 ## Every step returns `bool` and every step that returns false has already
 ## written its reason into the script's log. None of them throw.
+##
+## ===========================================================================
+## ACTUATION -- AND WHICH VERBS ACTUALLY PROVE ANYTHING
+## ===========================================================================
+##
+## The verbs are NOT equally strong, and this library refuses to pretend they
+## are. Exactly two of them assert a FINISHED STATE:
+##
+##   walkAndSee   pact re-reads `EFT.Player::get_Position` -- the game's own
+##                number -- and reports metres actually travelled.
+##   magCycle     the completion line carries the game's own `Magazine.Count`.
+##
+## Every other verb (`look`, `fire`, `aim`, `sprint`, `jump`, `prone`, `pose`,
+## `lean`, `command`, `reload`) is ISSUE-ONLY: a PASS means THE HOST ACCEPTED
+## THE CALL. pact has no readback for rotation, trigger, aim, stance or the
+## ECommand channel today. An issue-only PASS that read like a verified one
+## would be precisely the check that cannot fail, so the distinction is in the
+## transcript, in the doc comments, and in `actuated`'s INCONCLUSIVE.
+##
+## The full reference -- every verb, its arguments, its refusals, the loadout
+## wire format and the report's field meanings -- is `docs/AUTOMATION-API.md`.
 
 import std/strutils
 import std/syncio
@@ -182,6 +206,7 @@ type
     inside: string    ## the container's equipment slot, for `carry`
     count: int
     ammo: string
+    magazine: string   ## mounted in the item's `mod_magazine` slot, for weapons
     condition: int
 
   Script* = object
@@ -301,15 +326,54 @@ proc equip*(s: var Script; slot, tpl: string) =
   ## Wear one item in one of the 14 equipment slots. A slot holds ONE thing;
   ## asking for more is refused by name rather than silently placing the first.
   addGear(s, Gear(tpl: tpl, query: tpl, slot: slot, inside: "", count: 1,
-                  ammo: "", condition: 100))
+                  ammo: "", magazine: "", condition: 100))
 
 proc equipLoaded*(s: var Script; slot, tpl, ammo: string) =
   ## Wear it, and fill its cartridges with `ammo` to the capacity the TEMPLATE
   ## declares. Refused, with a reason, when the template's cartridge filter does
   ## not accept that round -- a magazine "filled" with ammo the filter omits is
   ## a gun that spawns empty.
+  ##
+  ## FOR MAGAZINES AND OTHER CARTRIDGE-BEARING CONTAINERS, NOT WEAPONS. A weapon
+  ## declares `_props.Chambers`, not `_props.Cartridges` (measured), holds no
+  ## rounds directly, and needs a magazine mounted in `mod_magazine`. Pointing
+  ## this verb at one is REFUSED by the backend with a reason that says the
+  ## template is a chambered item and that no `magazine` was named -- which is
+  ## the right refusal, but `equipWeapon` is the verb you wanted.
   addGear(s, Gear(tpl: tpl, query: tpl, slot: slot, inside: "", count: 1,
-                  ammo: ammo, condition: 100))
+                  ammo: ammo, magazine: "", condition: 100))
+
+proc equipWeapon*(s: var Script; slot, weapon, magazine, ammo: string) =
+  ## Wear a WEAPON with a magazine mounted in it and a round in the chamber.
+  ##
+  ## This is what `equipLoaded` could never do, and the reason is a measured fact
+  ## about the database, not a preference:
+  ##
+  ##   `5447a9cd4bdc2dbd208b4567` (M4A1) declares `_props.Chambers[0]._name =
+  ##   "patron_in_weapon"` and NO `_props.Cartridges`.
+  ##   `55d4887d4bdc2d962f8b4570` (STANAG) declares `_props.Cartridges` and no
+  ##   slots of its own.
+  ##
+  ## So a weapon holds no rounds directly. `equipLoaded(s, slot, m4, ammo)` asked
+  ## the backend for a cartridge capacity the weapon does not have, was REFUSED
+  ## with "the database declares no _props.Cartridges[0]._max_count", and -- even
+  ## had it succeeded -- would still have mounted nothing in `mod_magazine`. That
+  ## is why `GetCurrentMagazine()` read null in raid and why `pactMagCycle` had
+  ## nothing to cycle. `equipWeapon` is the fix.
+  ##
+  ## The magazine is NAMED, never guessed. The M4A1's `mod_magazine` filter
+  ## admits 20 templates and "the first one" is an arbitrary document order --
+  ## the same guess this library refuses in `byName`. A magazine the filter
+  ## excludes is REFUSED BEFORE MINTING, because a magazine the client drops on
+  ## load saves to the profile, reads back, and still leaves the raid unarmed.
+  ##
+  ## The acceptance is a walk of the finished state, not a re-read of the write:
+  ## the server re-reads the saved profile, finds the item worn in `slot`, and
+  ## counts its `mod_magazine` children and THEIR cartridges. `magPlaced == 0`
+  ## and `roundsPlaced == 0` are separate FAILs, because "no magazine" and "an
+  ## empty magazine" break a raid differently.
+  addGear(s, Gear(tpl: weapon, query: weapon, slot: slot, inside: "", count: 1,
+                  ammo: ammo, magazine: magazine, condition: 100))
 
 proc carry*(s: var Script; container, tpl: string; count: int) =
   ## `count` of an item in real cells of the container worn in that equipment
@@ -323,20 +387,20 @@ proc carry*(s: var Script; container, tpl: string; count: int) =
   ## Requests are applied in declaration order, and "nothing is worn in
   ## TacticalVest" is the refusal you get otherwise -- it is named, not silent.
   addGear(s, Gear(tpl: tpl, query: tpl, slot: "", inside: container,
-                  count: count, ammo: "", condition: 100))
+                  count: count, ammo: "", magazine: "", condition: 100))
 
 proc carryLoaded*(s: var Script; container, tpl: string; count: int;
                   ammo: string) =
   ## `count` magazines in the container, each loaded with `ammo`. This is the
   ## "magazines = 3, ammo = m855a1" case.
   addGear(s, Gear(tpl: tpl, query: tpl, slot: "", inside: container,
-                  count: count, ammo: ammo, condition: 100))
+                  count: count, ammo: ammo, magazine: "", condition: 100))
 
 proc stock*(s: var Script; tpl: string; count: int) =
   ## `count` of an item loose in the stash, stack-limit aware and merged into
   ## stacks already there. For spares the raid does not start with.
   addGear(s, Gear(tpl: tpl, query: tpl, slot: "", inside: "", count: count,
-                  ammo: "", condition: 100))
+                  ammo: "", magazine: "", condition: 100))
 
 proc byName*(s: var Script; query: string; count: int) =
   ## Stash `count` of whatever the English item name `query` names. Convenient
@@ -344,13 +408,13 @@ proc byName*(s: var Script; query: string; count: int) =
   ## are listed, because "the first match" is an arbitrary document order and a
   ## test that equipped the wrong rifle proves nothing.
   addGear(s, Gear(tpl: "", query: query, slot: "", inside: "", count: count,
-                  ammo: "", condition: 100))
+                  ammo: "", magazine: "", condition: 100))
 
 proc wear*(s: var Script; slot, tpl: string; condition: int) =
   ## `equip` with a durability/resource percentage, applied only to the
   ## properties the template actually declares.
   addGear(s, Gear(tpl: tpl, query: tpl, slot: slot, inside: "", count: 1,
-                  ammo: "", condition: condition))
+                  ammo: "", magazine: "", condition: condition))
 
 # ---------------------------------------------------------------------------
 # Reporting
@@ -741,6 +805,7 @@ proc specJson(s: Script): string =
     if g.slot.len > 0: result.add ",\"slot\":" & jq(g.slot)
     if g.inside.len > 0: result.add ",\"inside\":" & jq(g.inside)
     if g.ammo.len > 0: result.add ",\"ammo\":" & jq(g.ammo)
+    if g.magazine.len > 0: result.add ",\"magazine\":" & jq(g.magazine)
     result.add ",\"count\":" & $g.count
     result.add ",\"condition\":" & $g.condition
     result.add "}"
@@ -814,10 +879,24 @@ proc reportGear(s: var Script; body: string; label: string): bool =
           let mint = jsonInt(one, "minted", 0)
           let base = jsonInt(one, "baseline", 0)
           let why = jsonStr(one, "why")
-          let mark = if got >= want and want > 0: "  ok " else: "  XX "
+          let mag = jsonStr(one, "magazine")
+          let magN = jsonInt(one, "magPlaced", 0)
+          let rds = jsonInt(one, "roundsPlaced", 0)
+          let chb = jsonInt(one, "chambered", 0)
+          # A weapon is only `ok` when its magazine came back WITH ROUNDS IN IT.
+          # Judging it on `placed` alone would report ok for a rifle that spawns
+          # with nothing to fire -- a check that cannot fail for the one property
+          # the raid actually needs.
+          var good = got >= want and want > 0
+          if mag.len > 0 and (magN == 0 or rds == 0):
+            good = false
+          let mark = if good: "  ok " else: "  XX "
           say(s, mark & jsonStr(one, "where") & "  " &
                  jsonStr(one, "name") & "  req=" & $want & " base=" & $base &
                  " minted=" & $mint & " placed=" & $got &
+                 (if mag.len > 0:
+                    "  mag=" & $magN & " rounds=" & $rds & " chambered=" & $chb
+                  else: "") &
                  (if why.len > 0: "  -- " & why else: ""))
           one = ""
       if c == ']' and depth == 0:
@@ -1086,6 +1165,229 @@ proc pactDo*(s: var Script; request: string; seconds: int = 20): bool =
                 "That is NOT 'the actuation failed'. It needs host flags " &
                 "playerActuation + liveInspector + liveInspectorWrite, which " &
                 "are read at BOOT; see withActuation / armActuation.")
+
+# ---------------------------------------------------------------------------
+# The actuation verbs
+# ---------------------------------------------------------------------------
+#
+# Every verb below is a thin, TYPED wrapper over `pactDo`, and every one of them
+# is honest about the same thing: `pactDo` proves the host ACCEPTED the request,
+# which is not proof the player moved. Accepting is a fact about the channel;
+# moving is a fact about the game.
+#
+# So there are two tiers, and they are deliberately not the same call:
+#
+#   walk / look / fire / ...     ISSUE the request. PASS means accepted.
+#   walkAndSee / actuated(...)   ISSUE it and then read pact's OWN readback
+#                                counters back, which are computed from the
+#                                game's `get_Position` and not from our write.
+#
+# A script that only ever calls the first tier has not demonstrated actuation,
+# and `finish` says so via `actuationsOk` rather than letting it read as a pass.
+
+proc fnum(v: float): string =
+  ## A float pact's own `iParseF` can read back. `$` on a float is not used
+  ## anywhere in this repo (`formatFloat` is the idiom in botnav/botdiag), and a
+  ## scientific-notation "1e-05" reaching pact would be REFUSED as a malformed
+  ## number rather than coerced to zero -- which is the right refusal, but a
+  ## confusing one to hit because of a formatter.
+  formatFloat(v, ffDecimal, 3)
+
+proc counterOf(line, key: string): int =
+  ## `asked=12` -> 12, from pact's own status line. Returns -1 when the key is
+  ## absent, which is NOT zero: "the counter says none" and "there is no
+  ## counter" are different observations and collapsing them would let a status
+  ## line pact never printed read as a clean run.
+  result = -1
+  let want = key & "="
+  let at = find(line, want)
+  if at < 0: return
+  var i = at + want.len
+  var n = 0
+  var any = false
+  while i < line.len and line[i] >= '0' and line[i] <= '9':
+    n = n * 10 + (int(line[i]) - int('0'))
+    any = true
+    inc i
+  if any: result = n
+
+proc pactStatusLine*(s: var Script; seconds: int = 15): string =
+  ## pact's counter line, or "" when it did not answer. Diagnostic AND the basis
+  ## of every effect assertion below.
+  let mark = logSize(s)
+  if not inspectSend(s, "status"): return ""
+  if not waitForLine(s, mark, "pact-rpc: status ", seconds): return ""
+  let tail = readTail(hostLogPath(s), mark)
+  let at = find(tail, "pact-rpc: status ")
+  var line = ""
+  var i = at
+  while i < tail.len and tail[i] != '\r' and tail[i] != '\n':
+    line.add tail[i]
+    inc i
+  result = line
+
+proc actuated*(s: var Script; request: string; settleSeconds: int = 6): bool =
+  ## Issue one pact request AND ASSERT IT TOOK EFFECT.
+  ##
+  ## The assertion is on pact's own readback counters, which it computes from
+  ## `EFT.Player::get_Position` -- the game's number, maintained by the game,
+  ## that this library never writes. `took` rising is metres actually travelled
+  ## past `PactMinMoveM`; `noeffect` rising is the call having been made and the
+  ## world not having moved.
+  ##
+  ##   PASS          `took` rose across the request
+  ##   FAIL          `noeffect` or `never` rose -- the call was made (or dropped
+  ##                 with a stated reason) and the finished state did not change
+  ##   INCONCLUSIVE  the request was never accepted, pact never answered a
+  ##                 status request, or neither counter moved. The last case is
+  ##                 the honest one for a verb pact does not readback-check at
+  ##                 all (look, fire, aim, lean): nothing was measured.
+  ##
+  ## NOTE, and it is the point of this proc existing: only MOVEMENT has a
+  ## readback in pact today. `actuated(s, "look 5 0")` will report INCONCLUSIVE
+  ## "no counter moved", which is correct and is not a pass. Do not read a
+  ## silent `look` as a look that happened.
+  let before = pactStatusLine(s)
+  if before.len == 0:
+    return step(s, "ACTUAT", vInconclusive,
+                "pact never answered a status request, so no BEFORE counters " &
+                "exist and no effect can be asserted for `" & request & "`")
+  let took0 = counterOf(before, "took")
+  let noeff0 = counterOf(before, "noeffect")
+  let never0 = counterOf(before, "never")
+  if took0 < 0 or noeff0 < 0:
+    return step(s, "ACTUAT", vInconclusive,
+                "pact's status line carries no took/noeffect counters -- it " &
+                "read `" & before & "`. pact is probably not bound or not " &
+                "deployed; nothing was measured.")
+  if not pactDo(s, request, 20):
+    return false
+  # Let the world settle. pact only compares positions after PactSettleFrames,
+  # so asking immediately would read the mark against itself -- a comparison of
+  # a value with itself is the check that cannot fail, in its purest form.
+  cSleepMs(int32(settleSeconds * 1000))
+  let after = pactStatusLine(s)
+  if after.len == 0:
+    return step(s, "ACTUAT", vInconclusive,
+                "pact accepted `" & request & "` and then never answered a " &
+                "status request, so the effect was never read back")
+  let took1 = counterOf(after, "took")
+  let noeff1 = counterOf(after, "noeffect")
+  let never1 = counterOf(after, "never")
+  if took1 > took0:
+    return step(s, "ACTUAT", vPass,
+                "`" & request & "` TOOK: pact's own get_Position readback " &
+                "counted real world movement (took " & $took0 & " -> " &
+                $took1 & "). Nobody touched the keyboard.")
+  if never1 > never0:
+    return step(s, "ACTUAT", vFail,
+                "`" & request & "` was NEVER ISSUED by pact (never " & $never0 &
+                " -> " & $never1 & "); its refusal is in the host log -- " &
+                after)
+  if noeff1 > noeff0:
+    return step(s, "ACTUAT", vFail,
+                "`" & request & "` was CALLED and the world did not move " &
+                "(noeffect " & $noeff0 & " -> " & $noeff1 & "). The call " &
+                "reached the game and the finished state is unchanged.")
+  result = step(s, "ACTUAT", vInconclusive,
+                "`" & request & "` was accepted and NO readback counter moved " &
+                "in " & $settleSeconds & "s. Either pact does not readback-" &
+                "check this verb (only movement is checked today: look, fire, " &
+                "aim, lean, pose and the ECommand channel are ISSUE-ONLY), or " &
+                "the readback could not run. Nothing was measured, which is " &
+                "not a pass.")
+
+proc walk*(s: var Script; strafe, forward: float; frames: int): bool =
+  ## `EFT.Player::Move(Vector2)`, held for `frames` frames.
+  ##
+  ## `strafe` is +right / -left, `forward` is +forward / -back; the game clamps
+  ## the magnitude, so 1.0 is a full-speed input and 0.5 is a walk. `frames` is
+  ## FRAMES, not seconds -- pact re-applies the held vector once per drain tick,
+  ## because `Move` is an input sample and one call is one frame of walking.
+  ##
+  ## ISSUE-ONLY. Use `walkAndSee` for the version that asserts metres travelled.
+  pactDo(s, "move " & fnum(strafe) & " " & fnum(forward) & " " & $frames, 20)
+
+proc walkAndSee*(s: var Script; strafe, forward: float; frames: int;
+                 settleSeconds: int = 6): bool =
+  ## `walk`, then assert the player really moved, via pact's `get_Position`
+  ## readback. THIS is the movement verb a test should use: `walk` alone can
+  ## report PASS with the player wedged against a wall.
+  actuated(s, "move " & fnum(strafe) & " " & fnum(forward) & " " & $frames, settleSeconds)
+
+proc look*(s: var Script; dx, dy: float): bool =
+  ## `EFT.Player::Rotate(Vector2, bool)` -- a DELTA in degrees, not an absolute
+  ## heading. +dx turns right, +dy looks down (the game's own sign convention at
+  ## its call sites).
+  ##
+  ## ISSUE-ONLY: pact has no rotation readback, so a PASS here means the host
+  ## accepted the call. It does NOT mean the camera turned, and this library
+  ## will not pretend otherwise.
+  pactDo(s, "look " & fnum(dx) & " " & fnum(dy), 20)
+
+proc fire*(s: var Script; on: bool): bool =
+  ## Hold or release the trigger -- `FirearmController::SetTriggerPressed`.
+  ##
+  ## REFUSED by pact, by name, unless `Player::HasFirearmInHands()` is true: on a
+  ## knife or empty hands the FirearmController pointer is the abstract base and
+  ## calling a FirearmController method on it is type confusion that no nil check
+  ## catches. ISSUE-ONLY; the readback for "did it shoot" is the ammo count, not
+  ## a pact counter.
+  pactDo(s, "fire " & (if on: "on" else: "off"), 20)
+
+proc aim*(s: var Script; on: bool): bool =
+  ## Aim down sights -- `FirearmController::SetAiming`. Same firearm-in-hands
+  ## refusal as `fire`. ISSUE-ONLY.
+  pactDo(s, "aim " & (if on: "on" else: "off"), 20)
+
+proc sprint*(s: var Script; on: bool): bool =
+  ## `EFT.Player::EnableSprint(bool)`. ISSUE-ONLY here, but note that the target
+  ## table DOES carry `get_IsSprintEnabled` as its readback -- if a future pact
+  ## uses it, this verb should become an `actuated`-style assertion rather than
+  ## keeping a PASS that only means "accepted".
+  pactDo(s, "sprint " & (if on: "on" else: "off"), 20)
+
+proc jump*(s: var Script): bool =
+  ## `EFT.Player::Jump()`. ISSUE-ONLY.
+  pactDo(s, "jump", 20)
+
+proc prone*(s: var Script): bool =
+  ## `EFT.Player::ToggleProne()`. A TOGGLE, not a set: calling it twice returns
+  ## the player to where they started, which is a real way to write a test that
+  ## proves nothing. ISSUE-ONLY.
+  pactDo(s, "prone", 20)
+
+proc pose*(s: var Script; delta: float): bool =
+  ## `EFT.Player::ChangePose(float)`. Negative crouches, positive stands; the
+  ## magnitude is a pose-level delta and NOT metres. ISSUE-ONLY.
+  pactDo(s, "pose " & fnum(delta), 20)
+
+proc lean*(s: var Script; dir: float): bool =
+  ## `EFT.Player::ToggleLean(float)` -- -1 left, 0 centre, +1 right, by the
+  ## game's own convention at its call sites. ISSUE-ONLY.
+  pactDo(s, "lean " & fnum(dir), 20)
+
+proc command*(s: var Script; code: int): bool =
+  ## Send a raw `ECommand` through the captured `GamePlayerOwner`. 16 is reload.
+  ##
+  ## This channel is the one that can be UNAVAILABLE on its own: it needs the
+  ## `GamePlayerOwner::LateUpdate` capture detour to have attached, and pact
+  ## warns after 600 drain frames if it never did. When that happens, movement,
+  ## look, fire, aim and the magazine cycle all still work -- so a FAIL here is
+  ## specifically about the ECommand channel and must not be read as pact being
+  ## broken.
+  pactDo(s, "command " & $code, 20)
+
+proc reload*(s: var Script): bool =
+  ## `command(16)` by name. ISSUE-ONLY: it presses the reload key, and whether a
+  ## magazine actually changed hands is `magCycle`'s question, not this one.
+  pactDo(s, "reload", 20)
+
+proc pactWait*(s: var Script; frames: int): bool =
+  ## Hold pact's queue for `frames` frames before the next request executes.
+  ## Frames, not seconds: it is a queue entry, so it composes with the held
+  ## movement vector rather than sleeping this process.
+  pactDo(s, "wait " & $frames, 20)
 
 proc magCycle*(s: var Script; seconds: int = 60): bool =
   ## THE USER'S OWN EXAMPLE, with nobody at the keyboard: unload the magazine in

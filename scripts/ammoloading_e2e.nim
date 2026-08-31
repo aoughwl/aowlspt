@@ -14,7 +14,15 @@
 ##
 ##   STACK  INCONCLUSIVE   the backend never came up; nothing was tested
 ##   GEAR   FAIL           the weapon or magazine did not read back after
-##                         minting -- there was nothing to cycle
+##                         minting -- there was nothing to cycle. Two distinct
+##                         sub-cases, and they are NOT collapsed:
+##                           magPlaced=0    no magazine is in the weapon's
+##                                          mod_magazine slot on the saved
+##                                          profile; GetCurrentMagazine() will
+##                                          read null in raid
+##                           roundsPlaced=0 the magazine IS mounted and holds
+##                                          nothing; a reload test against an
+##                                          empty magazine proves nothing
 ##   DEPLOY INCONCLUSIVE   the latch never reported (needs debugEsp + natEsp +
 ##                         natEspDiag, read at boot)
 ##   DEPLOY FAIL           the latch reported another phase and never DEPLOYED
@@ -71,14 +79,27 @@ proc main() =
   # a correct refusal that would nevertheless make this test fail for a gear
   # reason while looking like an actuation one.
   #
-  # UNVERIFIED, AND SAID SO RATHER THAN ASSUMED: whether minting a weapon
-  # template yields a weapon with a magazine already IN it depends on whether
-  # the mint builds the template's default preset, and this has not been
-  # measured on this install. If it does not, this run reports
-  # `MAGCYC FAIL ... no current magazine`, which is the correct, named,
-  # actionable answer -- not a silent pass.
-  equipLoaded(s, "FirstPrimaryWeapon", "5447a9cd4bdc2dbd208b4567",
-              "54527ac44bdc2d36668b4567")
+  # It is no longer unverified, and `equipLoaded` was the wrong verb. MEASURED
+  # against this install's db.json:
+  #
+  #   5447a9cd4bdc2dbd208b4567 (M4A1)   _props.Chambers[0]._name =
+  #                                     "patron_in_weapon"; NO _props.Cartridges
+  #   55d4887d4bdc2d962f8b4570 (STANAG) _props.Cartridges[0]._max_count = 30
+  #
+  # So `equipLoaded` on the WEAPON asked the backend for a cartridge capacity a
+  # weapon does not have. It was REFUSED -- "the database declares no
+  # _props.Cartridges[0]._max_count" -- and even if it had not been, nothing was
+  # ever mounted in the weapon's `mod_magazine` slot. That is exactly why
+  # `GetCurrentMagazine()` came back null and this test could never reach the
+  # thing it exists to measure.
+  #
+  # `equipWeapon` mounts a NAMED magazine (the M4A1's mod_magazine filter admits
+  # 20 templates; picking one by document order is the guess this library
+  # refuses), loads it, and chambers a round. The acceptance is a walk of the
+  # saved profile: `magPlaced` and `roundsPlaced` are separate FAILs, so an empty
+  # magazine cannot pass as a loaded one.
+  equipWeapon(s, "FirstPrimaryWeapon", "5447a9cd4bdc2dbd208b4567",
+              "55d4887d4bdc2d962f8b4570", "54527ac44bdc2d36668b4567")
 
   # Spares in the rig, so the unload has somewhere to put 30 rounds. The unload
   # moves ammunition into the inventory; a character with nowhere to put it is a
