@@ -5765,8 +5765,10 @@ static void aowl_ov_prefs_path(void) {
     if (g_ov.prefsPath[0]) return;
     n = GetEnvironmentVariableA("LOCALAPPDATA", base, (DWORD)sizeof(base));
     if (n == 0 || n >= sizeof(base)) { g_ov.prefsPath[0] = 0; return; }
-    /* `"\aowlspt"`, NOT `"\aowlspt"`. It was the latter for the whole life of
-     * this file, and `\a` is BEL (0x07) -- a control character Windows refuses
+    /* The separator must be an ESCAPED backslash -- two characters in the C
+     * source. It was a single one for the whole life of this file, and in C a
+     * lone backslash before `a` is BEL (0x07) -- a control character Windows
+     * refuses
      * in a path -- so `CreateDirectoryA` failed with ERROR_INVALID_NAME every
      * launch, the `aowlspt` directory was never created, and `fopen(.., "wb")`
      * in `aowl_ov_prefs_save` then failed and returned silently. MEASURED: the
@@ -5776,7 +5778,7 @@ static void aowl_ov_prefs_path(void) {
      * not the window geometry. The user reported it as "the theme is back to
      * normal every launch" and guessed "a general settings persistence bug";
      * they were right, and it was one character. */
-    _snprintf(g_ov.prefsPath, sizeof(g_ov.prefsPath) - 1, "%s\aowlspt", base);
+    _snprintf(g_ov.prefsPath, sizeof(g_ov.prefsPath) - 1, "%s\\aowlspt", base);
     g_ov.prefsPath[sizeof(g_ov.prefsPath) - 1] = 0;
     CreateDirectoryA(g_ov.prefsPath, NULL);   /* fine if it is already there */
     _snprintf(g_ov.prefsPath, sizeof(g_ov.prefsPath) - 1,
@@ -5810,6 +5812,13 @@ static void aowl_ov_prefs_default(void) {
  * key at a time rather than all-or-nothing: unlike the geometry, a bad
  * `navW` cannot strand the window, so one unusable key must not throw away the
  * fifteen good ones next to it. */
+/* What the `theme=` line on disk ACTUALLY said, kept separate from
+ * `g_ov.themeName` -- which by the time anything checks it may hold a default,
+ * a fallback, or a live user pick. Comparing the live value against itself is
+ * the check that cannot fail (CLAUDE.md 9b); this is the other operand. Empty
+ * means the file named no theme, which is INCONCLUSIVE, not PASS. */
+static char g_ovPrefsDiskTheme[32];
+
 static void aowl_ov_prefs_kv(const char* k, const char* v) {
     int32_t n = atoi(v);
     if (!strcmp(k, "showFooter")) { if (n == 0 || n == 1) g_ov.showFooter = n; }
@@ -5818,14 +5827,17 @@ static void aowl_ov_prefs_kv(const char* k, const char* v) {
     else if (!strcmp(k, "showUnimpl")) { if (n == 0 || n == 1) g_ov.showUnimpl = n; }
     else if (!strcmp(k, "navW")) { if (n >= 140 && n <= 640) g_ov.navW = n; }
     else if (!strcmp(k, "scalePref")) { if (n >= 0 && n <= 3) g_ov.scalePref = n; }
-    else if (!strcmp(k, "theme"))
+    else if (!strcmp(k, "theme")) {
         aowl_ov_copy(g_ov.themeName, (int32_t)sizeof(g_ov.themeName), v);
+        aowl_ov_copy(g_ovPrefsDiskTheme, (int32_t)sizeof(g_ovPrefsDiskTheme), v);
+    }
 }
 
 static void aowl_ov_prefs_load(void) {
     FILE* f;
     int x = 0, y = 0, w = 0, hh = 0, mx = 0, al = 0, hi = 1;
     aowl_ov_prefs_default();
+    g_ovPrefsDiskTheme[0] = 0;
     aowl_ov_prefs_path();
     if (!g_ov.prefsPath[0]) {
         aowl_ov_note("window prefs: no LOCALAPPDATA; using defaults, not persisting");
@@ -12125,6 +12137,28 @@ static int32_t aowl_ov_start(int32_t toggleVk, int32_t backendPort) {
                     "back to Dark", g_ov.themeName);
         aowl_ov_note(tw);
         aowl_ov_copy(g_ov.themeName, (int32_t)sizeof(g_ov.themeName), "Dark");
+    }
+    /* THE ROUND TRIP, said out loud every launch, naming the file, the value
+     * the file holds, and the value that is live AFTER every default, fallback
+     * and re-apply above has had its turn. Three outcomes, never two: an empty
+     * disk value is INCONCLUSIVE ("nothing has ever been saved"), which is what
+     * a broken write path looks like and is exactly what this line exists to
+     * stop being invisible for months. Prints the PATH too, because the whole
+     * defect was that the path named a directory that could not exist. */
+    {
+        char rt[300];
+        const char* verdict =
+            (!g_ovPrefsDiskTheme[0]) ? "INCONCLUSIVE (no theme saved yet)"
+            : (!strcmp(g_ovPrefsDiskTheme, g_ov.themeName)) ? "PASS"
+            : "FAIL";
+        aowl_ov_fmt(rt, (int32_t)sizeof(rt),
+                    "overlay prefs round-trip: key=theme onDisk=%s inEffect=%s "
+                    "file=%s -- %s",
+                    g_ovPrefsDiskTheme[0] ? g_ovPrefsDiskTheme : "(none)",
+                    g_ov.themeName,
+                    g_ov.prefsPath[0] ? g_ov.prefsPath : "(no path)",
+                    verdict);
+        aowl_ov_note(rt);
     }
     g_ov.viewLo = 0; g_ov.viewHi = 0;
     g_ov.capturing = 0;
