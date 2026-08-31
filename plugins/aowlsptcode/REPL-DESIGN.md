@@ -31,7 +31,39 @@ deliverable (the readline shell) to the same bar (tab completion over the
 verb list, persistent `$r`/`$f`/`$comp` anchors across commands entered
 interactively, etc.) without shortchanging it.
 
-## What the host-side REPL should be, concretely (for the next pass)
+## SHIPPED (next pass): `tools/irepl.py`
+
+Built as this file specified: a terminal REPL on `channel.py` directly, no MCP
+indirection, no new transport, no game-thread code. `tools/ichannel.py` is now
+a re-export of `channel.py` rather than a copy of it, and `tools/inspector.py`
+delegates to it, so the python side went from three transports to one. See
+`docs/INSPECTOR-VERBS.md` for the verbs and the self-test.
+
+### Recommendation on the `aowlinspect` MCP server: **give the MCP tools the new verbs. Do not wrap the REPL, and do not make the REPL a fourth front-end.**
+
+The three options and why one wins:
+
+1. *A new front-end.* This is what `irepl.py` is — but only because it adds no
+   transport and no parser. It is a ~40-line dispatch loop over `channel.py`
+   plus `modctl.py`. If it had duplicated either, it would be a regression.
+2. *An MCP wrapper around the REPL.* Rejected. The REPL's job is line editing,
+   history, a prompt and a session verdict — all of which are noise to an agent
+   that already gets one structured result per call. Wrapping it would put a
+   text-formatting layer between the MCP server and typed data it can have
+   directly, and re-introduce prose parsing on the agent side.
+3. **Add `mods` / `modinfo` / `modenable` / `moddisable` / `modreload` to the
+   MCP server** as `inspect_mods`, `inspect_mod_set`, `inspect_mod_reload`,
+   importing `tools/modctl.py`. Chosen. `modctl` already returns typed dicts
+   with `outcome` / `refusal` / `gate` — exactly the shape the server's other
+   tools return, and exactly what its structured-error contract wants. The
+   human at the REPL and the agent through MCP then call the same functions,
+   not two renderings of one HTTP reply.
+
+That work is deliberately NOT done in this pass: `server.py` is the plugin's
+tested surface and adding three tools to it is a change to the plugin's
+contract, which is the human's call, not a subagent's.
+
+## What the host-side REPL should be, concretely (as designed, now built)
 
 - `aowl inspect` (a new `aowl` driver subcommand, or a standalone
   `tools/inspect_repl.py`) built on `plugins/aowlsptcode/mcp/channel.py`'s

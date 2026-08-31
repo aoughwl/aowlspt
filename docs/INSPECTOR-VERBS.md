@@ -432,3 +432,81 @@ explain why it failed. Frame cap 300 (~5s) for `wait`/`until`, 240 for `watch`.
   it.
 - Long searches park and resume rather than stalling the frame. If a batch
   seems to hang, it is more often parked on an `until` than crashed.
+
+---
+
+## The REPL, and mod control (`python tools\irepl.py`)
+
+Interactive shell over the same file channel, with history and tab completion.
+`.help` lists the meta commands. **One line = one batch**, matching the file
+channel's real anchor semantics — `$f1`/`$comp`/`$r0` do *not* survive to the
+next line, and the shell does not pretend otherwise; `.batch` … `.end` composes
+several lines into ONE batch when anchors must carry.
+
+It is not a new transport. It imports `tools/ichannel.py`, which is now a
+re-export of `plugins/aowlsptcode/mcp/channel.py` — the sentinel-guarded
+transport and prose parsers the `aowlinspect` MCP server already uses.
+`tools/inspector.py` (under `ui.py` / `enterraid.py`) delegates to the same
+module now, so the python side is **one** implementation where it was three.
+The Nim side (`tools/aowlui.nim`'s `Ui`) was already shared by `aowl ui`,
+`aowl raid`, `aowllayout` and `autoscript`, and is untouched.
+
+The verdict model survives interactively: the host's own `BATCH VERDICT` line
+is adopted, `find`/`findtext` STOPPED-EARLY-with-no-hits is recorded as
+INCONCLUSIVE (absence is not proven), `.verdict` rolls the session up with
+FAIL > INCONCLUSIVE > PASS, and a session in which nothing asserted anything
+prints **no verdict at all** rather than PASS.
+
+Readiness: a batch that gets no answer flips the shell to NOT READY and every
+later line refuses by name (`CLIENT_NOT_READY`) until `.ready` gets an answer.
+This is the raid-load trap above — a REPL invites rapid-fire reads, and rapid-
+fire reads into a loading client is what produces the stuck load screen.
+
+### Mod control
+
+These are **HTTP against the backend**, not inspector batch commands, because
+that is where mod state lives (`docs/MOD-ENABLE-PATH.md`, `mods/manager`).
+Nothing here touches the Unity main thread. Implementation: `tools/modctl.py`.
+
+| verb | what it does |
+|---|---|
+| `mods [FILTER]` | every mod, with **which of the four gates is blocking it** |
+| `modinfo <id>` | one mod in full, with the manager's own reason |
+| `modenable <id>` | persistent user override ON — needs `.write on` |
+| `moddisable <id>` | persistent user override OFF — needs `.write on` |
+| `modreload <id>` | live restart — **refuses by name** (see below) |
+
+`mods` never answers "off". It names the gate, because "off" is what made
+`aowl.ammoloading` look broken for a day when the platform had simply never
+selected it. Per-row outcomes and their named refusals:
+
+| outcome | refusal | meaning |
+|---|---|---|
+| FAIL | `DLL_MISSING` | gate 1 — no `mods\<dir>\<lib>` in the install |
+| FAIL | `NOT_SELECTED` | gate 3 — no list and no override mentions it |
+| FAIL | `BLOCKED` | gate 4 — wrong-side / pipeline / dep / conflict / cycle |
+| FAIL | `SELECTED_BUT_NOT_LIVE` | selected, and the client host says it is not running |
+| INCONCLUSIVE | `NO_CLIENT_ANSWER` | `clientLive` is **absent** from the row. `manager.nim` is explicit that absence means *no answer yet*; rendering it as "not loaded" is the bug the field exists to prevent |
+| INCONCLUSIVE | `UNKNOWN_VERDICT` | a verdict this tool has no wording for, printed verbatim rather than guessed at |
+| INCONCLUSIVE | `BACKEND_UNREACHABLE` | we could not look. Names every URL tried and why each failed |
+| INCONCLUSIVE | `NOT_IN_REGISTRY` | gate 2 — not a mod the manager knows |
+| PASS | — | selected, and the client host reports it LIVE |
+
+**`modreload` refuses.** There *is* a `GET /aowlspt/mods/reload` route and it is
+not this: it re-reads `registry/mods.json` from disk. It does not quiesce the
+mod, detach its detours, `FreeLibrary` it or re-arm it — and a `FreeLibrary`
+landing during scene teardown with detours still armed is a live crash. So the
+verb looks up `tools/modreload.py:reload_mod` (the entry point being built
+separately) and, when it is absent, refuses as `RELOAD_UNSUPPORTED` with the
+manual workaround, rather than calling the registry route and reporting success
+for an operation that never ran.
+
+### Self-test
+
+    python tools\irepl.py --selftest      20 cases, offline, no client, no backend
+    python tools\irepl_mutation.py        proves the self-test can FAIL
+
+The self-test covers PASS, FAIL and INCONCLUSIVE for the mod verbs, including
+"not selected" and "cannot be reloaded" as **distinct named refusals**. The
+mutation run collapses the three-state `clientLive` into two and asserts the
+self-test goes red — a check whose failing input you cannot name is not a check.
