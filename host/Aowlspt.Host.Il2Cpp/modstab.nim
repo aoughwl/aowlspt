@@ -2855,6 +2855,20 @@ var gGfxStockStripGo: seq[Il2CppPtr] = @[]
 ## H and by nothing else" -- which is still falsifiable, and still fails on the
 ## 420px case. An entry with `false` here must not have moved at all.
 var gGfxStockExpectShift: seq[bool] = @[]
+## WHICH PANEL each baseline entry belongs to: 0 = Graphics Settings,
+## 1 = PostFX Settings.
+##
+## MEASURED DEFECT this exists for. The backstop used to judge all 7 entries as
+## one set, and reported FAIL because PostFX's `EnablePanel` had not moved by
+## the 46px we asked for -- while the PostFX panel was INACTIVE. Unity does not
+## rebuild an inactive hierarchy: `SetDirty` queues the rebuild and it runs when
+## the object is next enabled. So the reading was "the group has not run yet",
+## which is INCONCLUSIVE, and it was reported as FAIL -- and then hid the
+## GRAPHICS strip, whose own panel had just verified to the pixel. One panel's
+## unfinished layout must never condemn the other's finished one.
+var gGfxStockPanelIx: seq[int] = @[]
+## Per-panel strip, so a failure on one panel hides only that panel's strip.
+var gGfxStripPanelIx: seq[int] = @[]
 ## THE OWNED WRITE. `LayoutGroup.padding.top` on the Graphics content
 ## container, its ORIGINAL value captured before the first write, and the
 ## RectOffset + group we need to put it back. Restored on fault and on
@@ -2868,8 +2882,12 @@ var gGfxPadShifted = false
 ## and therefore the same height, so a second value would be the same number
 ## and one more thing to keep in step.
 var gGfxPadH = 0'i32
-var gGfxGeomSaid = false
-var gGfxGeomTicks = 0
+## PER PANEL, both of them: the verdict latch and the settle counter. A single
+## pair could only ever judge whichever panel happened to be up first, and the
+## other panel's assertion would then never run at all.
+var gGfxGeomSaid: seq[bool] = @[false, false]
+var gGfxGeomPendingSaid: seq[bool] = @[false, false]
+var gGfxGeomTicks: seq[int] = @[0, 0]
 const GfxGeomSettle = 20
 const GfxMaxStockWatch = 16
 
@@ -3064,6 +3082,9 @@ proc gfxBuildStrip(panelT, donorStripGo, donorStripT, donorButtonGo,
          "subtab strip that the stock layout group would lay out. Nothing " &
          "was added to that panel."
     return
+  # WHICH PANEL THIS IS. `gGfxPanelT` / `gGfxPostT` are assigned by `gfxBuild`
+  # before either strip is built, so this is settled by the time we run.
+  let pIx = (if panelT == gGfxPostT: 1 else: 0)
   let panelGo = iGameObjectOf(panelT)
   if panelGo == nil:
     warn "postfx subtab: the stock panel " & iObjName(panelT) & " has no " &
@@ -3090,6 +3111,7 @@ proc gfxBuildStrip(panelT, donorStripGo, donorStripT, donorButtonGo,
       gGfxStockT.add bc
       gGfxStockG.add bg
       gGfxStockExpectShift.add false     # panel-level: must not move at all
+      gGfxStockPanelIx.add pIx
       gGfxStockName.add (iObjName(panelT) & "/" & iObjName(bc))
   # The container-level entries are the ones our padding shift WILL move, so
   # remember where they start and mark them once the shift has actually
@@ -3109,6 +3131,7 @@ proc gfxBuildStrip(panelT, donorStripGo, donorStripT, donorButtonGo,
       gGfxStockT.add bc
       gGfxStockG.add bg
       gGfxStockExpectShift.add false     # flipped below IF the shift succeeds
+      gGfxStockPanelIx.add pIx
       gGfxStockName.add (iObjName(panelT) & "/" & iObjName(stackT) & "/" &
                          iObjName(bc))
   # THE STOCK STRIP'S OWN GEOMETRY, read BEFORE we clone it, off the real
@@ -3173,6 +3196,7 @@ proc gfxBuildStrip(panelT, donorStripGo, donorStripT, donorButtonGo,
   discard modsSetActive(strip, true)
   if gGfxStockStripGo.len < 4:
     gGfxStockStripGo.add strip
+    gGfxStripPanelIx.add pIx
   if made != 2:
     warn "postfx subtab: only " & $made & " of 2 buttons came out usable in " &
          iObjName(panelT) & "; REFUSING to hide the stock POSTFX tab, because " &
@@ -3755,42 +3779,75 @@ proc gfxBuild(): bool =
 var gGfxVerdictSaid = false
 var gGfxArmSaid = false
 
-proc gfxStockGeomVerdict() =
-  ## DID WE DISPLACE ANYTHING OF THE GAME'S? Read off the live objects, once
-  ## per settings-screen open, and it can fail.
+proc gfxHideStripsOf(pIx: int): int =
+  ## Hide only the strip(s) belonging to ONE panel. The old version hid every
+  ## strip we owned, which is how a PostFX reading took the working GRAPHICS
+  ## strip down with it.
+  result = 0
+  var h = 0
+  while h < gGfxStockStripGo.len and h < 4:
+    if h < gGfxStripPanelIx.len and gGfxStripPanelIx[h] == pIx and
+       gGfxStockStripGo[h] != nil and modsSetActive(gGfxStockStripGo[h], false):
+      result = result + 1
+    h = h + 1
+
+proc gfxStockGeomVerdictFor(pIx: int) =
+  ## DID WE DISPLACE ANYTHING OF THE GAME'S, ON THIS ONE PANEL? Read off the
+  ## live objects, once per settings-screen open PER PANEL, and it can fail.
   ##
-  ## THE ASSERTION IS A NEGATIVE, deliberately: "no stock sibling of our strip
-  ## has moved or resized since before we inserted it". A negative can be
-  ## falsified by one displaced object; the positive form ("our strip is the
-  ## right height") compares our own write against itself and is exactly the
-  ## check that let SettingsList=(0,-420.5)/(850,354.5) ship.
+  ## THREE STATES, NOT TWO -- and the missing third one was a measured defect.
   ##
-  ## WHY IT RUNS ON A LATER TICK AND NOT INLINE. A Unity LayoutGroup rebuilds
-  ## at the END of the frame. Re-reading a sibling immediately after parenting
-  ## compares against a layout that has not run yet, so it could only ever
-  ## report "unchanged" -- a check that cannot fail. `GfxGeomSettle` frames of
-  ## a genuinely-up panel are required first.
+  ##   LANDED          moved by exactly the H we asked for (or, for an object
+  ##                   outside the container, not at all). PASS.
+  ##   NOT-LANDED-YET  the panel is INACTIVE, so Unity has not rebuilt its
+  ##                   layout at all: `SetDirty` only QUEUES a rebuild for an
+  ##                   inactive hierarchy and it runs when the object is next
+  ##                   enabled. INCONCLUSIVE, and it must stay pending rather
+  ##                   than resolve either way.
+  ##   DISPLACED       moved by something other than H. FAIL.
   ##
-  ## AND IT REPAIRS: if anything stock moved, our strips are HIDDEN (never
-  ## destroyed), which removes them from the layout group and lets it put the
-  ## stock scroll view back where it was on the next rebuild. That is the same
-  ## discipline the stock POSTFX tab button already uses.
-  if gGfxGeomSaid: return
-  if gGfxStockT.len == 0:
-    gGfxGeomSaid = true
-    warn "postfx subtab STOCK-GEOMETRY INCONCLUSIVE: no pre-insertion " &
-         "baseline was captured, so whether our strip displaced anything of " &
-         "the game's was never observed. This is NOT a pass."
+  ## The live failure this fixes: PostFX's padding was raised 0 -> 46 while the
+  ## PostFX panel was inactive, so `EnablePanel` had not moved when the check
+  ## ran. That was read as DISPLACED, reported FAIL, and hid BOTH strips --
+  ## including the Graphics one, whose own panel had just verified to the pixel
+  ## (SettingsList (0,-20)/755 -> (0,-66)/709, exactly -46). One panel's
+  ## unfinished layout must never condemn another panel's finished one, so the
+  ## whole check is now per-panel and gated on that panel being active.
+  ##
+  ## WHY IT RUNS ON A LATER TICK. A LayoutGroup rebuilds at the END of the
+  ## frame, so an inline re-read compares against a layout that has not run and
+  ## could only ever say "unchanged" -- a check that cannot fail.
+  if pIx < 0 or pIx >= gGfxGeomSaid.len: return
+  if gGfxGeomSaid[pIx]: return
+  let panelT = (if pIx == 1: gGfxPostT else: gGfxPanelT)
+  let which = (if pIx == 1: "PostFX Settings" else: "Graphics Settings")
+  if panelT == nil or not duOk(panelT, 0x20'i32): return
+  # ONLY AN ACTIVE PANEL CAN BE JUDGED. Not a failure, not a pass: pending.
+  let (actOk, act) = iActiveInHierarchy(panelT)
+  if not actOk or not act:
+    if not gGfxGeomPendingSaid[pIx]:
+      gGfxGeomPendingSaid[pIx] = true
+      okLog "postfx subtab STOCK-GEOMETRY NOT-LANDED-YET (" & which & "): the " &
+            "panel is not activeInHierarchy, and Unity does not rebuild an " &
+            "inactive hierarchy -- our padding change is QUEUED and runs when " &
+            "the panel is next shown. This is INCONCLUSIVE, not a failure, " &
+            "and the assertion is deferred until the panel is actually up. " &
+            "Nothing has been hidden."
     return
+  # Active. Let its own layout settle before judging it.
+  if gGfxGeomTicks[pIx] < GfxGeomSettle:
+    gGfxGeomTicks[pIx] = gGfxGeomTicks[pIx] + 1
+    return
+  var watched = 0
   var moved = 0
   var unread = 0
-  # EVERY casualty, not just the first. Reporting only the first could not
-  # distinguish "the scroll view is the sole casualty" from "the whole panel
-  # moved", and that distinction is exactly what the next fix needs. Bounded by
-  # the baseline's own cap, so this cannot become a log flood.
   var report = ""
   var i = 0
   while i < gGfxStockT.len and i < GfxMaxStockWatch * 2:
+    if i >= gGfxStockPanelIx.len or gGfxStockPanelIx[i] != pIx:
+      i = i + 1
+      continue
+    watched = watched + 1
     let t = gGfxStockT[i]
     if t == nil or not duOk(t, 0x20'i32) or not iUnityAlive(t):
       unread = unread + 1
@@ -3801,14 +3858,13 @@ proc gfxStockGeomVerdict() =
       elif i < gGfxStockExpectShift.len and gGfxStockExpectShift[i]:
         # WE MOVED THIS ONE ON PURPOSE, so the assertion changes shape but does
         # NOT go away: it must have moved DOWN by exactly our padding shift.
-        # Anything else -- staying put, or moving by some other amount -- still
-        # fails, so the 420px displacement of attempts 1-3 would still be
-        # caught by this branch.
+        # Staying put or moving by any other amount still fails, so the 420px
+        # displacement of attempts 1-3 would still be caught here.
         #
-        # Height is allowed two answers because either is legitimate and we
-        # cannot tell offline which this group does: unchanged (the child's
-        # height is not driven) or reduced by exactly our shift (it is). A
-        # third answer is a failure.
+        # Height gets two legal answers because either is correct and we cannot
+        # tell offline which this group does: unchanged (the child's height is
+        # not driven) or reduced by exactly our shift (it is). A third answer
+        # is a failure.
         let want = gGfxStockG[i].posY - float32(gGfxPadH)
         let dy = now.posY - want
         let dh0 = now.rectH - gGfxStockG[i].rectH
@@ -3828,45 +3884,42 @@ proc gfxStockGeomVerdict() =
         report = report & " | " & gGfxStockName[i] & ": was " &
                  nuGeomNote(gGfxStockG[i]) & " -- now " & nuGeomNote(now)
     i = i + 1
-  let first = report
-  gGfxGeomSaid = true
+  if watched == 0:
+    gGfxGeomSaid[pIx] = true
+    warn "postfx subtab STOCK-GEOMETRY INCONCLUSIVE (" & which & "): no " &
+         "pre-insertion baseline was captured for this panel, so whether our " &
+         "strip displaced anything of the game's was never observed. NOT a pass."
+    return
+  gGfxGeomSaid[pIx] = true
   if moved > 0:
-    warn "postfx subtab STOCK-GEOMETRY FAIL: " & $moved & " of " &
-         $gGfxStockT.len & " stock object(s) MOVED OR RESIZED after our " &
-         "subtab strip was inserted. We never write a stock RectTransform, so " &
-         "this is the panel's own LayoutGroup giving our strip space and " &
-         "taking it from the game's scroll view. ALL " & $moved &
-         " casualty/casualties, before and after:" & first &
-         ". HIDING our strips so the layout group puts the stock view back on " &
-         "its next rebuild; the screen returns to stock and the stock POSTFX " &
-         "tab is restored by the fault path."
-    var h = 0
-    var hidden = 0
-    while h < gGfxStockStripGo.len and h < 4:
-      if gGfxStockStripGo[h] != nil and modsSetActive(gGfxStockStripGo[h], false):
-        hidden = hidden + 1
-      h = h + 1
-    warn "postfx subtab: " & $hidden & " strip(s) hidden. Nothing was " &
-         "destroyed and nothing stock was written, so the panel is exactly " &
-         "as the game built it."
-    gfxNoteFault("our subtab strip displaced the stock layout (see the " &
-                 "STOCK-GEOMETRY FAIL line above for the before/after numbers)")
-  elif unread > 0 and moved == 0:
-    warn "postfx subtab STOCK-GEOMETRY INCONCLUSIVE: nothing was seen to " &
-         "move, but " & $unread & " of " & $gGfxStockT.len & " baseline " &
+    warn "postfx subtab STOCK-GEOMETRY DISPLACED (" & which & "): " & $moved &
+         " of " & $watched & " stock object(s) on THIS panel are not where " &
+         "they should be. ALL casualties, before and after:" & report &
+         ". Hiding only THIS panel's strip -- the other panel is judged " &
+         "separately and is not affected by this reading."
+    let hidden = gfxHideStripsOf(pIx)
+    warn "postfx subtab: " & $hidden & " strip(s) hidden on " & which &
+         ". Nothing was destroyed; the padding shift is captured and is " &
+         "restored if this feature faults out."
+    gfxNoteFault("our subtab strip displaced the stock layout on " & which &
+                 " (see the STOCK-GEOMETRY DISPLACED line above for the " &
+                 "before/after numbers)")
+  elif unread > 0:
+    warn "postfx subtab STOCK-GEOMETRY INCONCLUSIVE (" & which & "): nothing " &
+         "was seen to move, but " & $unread & " of " & $watched & " baseline " &
          "object(s) could not be re-read, so the panel was not fully " &
          "observed. NOT a pass."
   else:
-    okLog "postfx subtab STOCK-GEOMETRY PASS: all " & $gGfxStockT.len &
-          " stock object(s) are where they should be" &
+    okLog "postfx subtab STOCK-GEOMETRY LANDED (" & which & "): all " &
+          $watched & " stock object(s) on this panel are where they should be" &
           " -- the ones outside the content container are UNCHANGED to within " &
           "1px, and the ones inside it moved down by exactly the " & $gGfxPadH &
-          "px of LayoutGroup padding we deliberately added and by nothing " &
+          "px of LayoutGroup padding we deliberately added, and by nothing " &
           "else. Read back off the live RectTransforms " & $GfxGeomSettle &
-          "+ frames after insertion. Note this is no longer an 'unchanged' " &
-          "assertion: we now make ONE owned, captured, restorable write to the " &
-          "group's padding, and this checks that it did exactly what it said."
-
+          "+ frames after the panel became active. This is no longer an " &
+          "'unchanged' assertion: we make ONE owned, captured, restorable " &
+          "write to the group's padding, and this checks it did exactly what " &
+          "it said."
 
 proc gfxVerdict() =
   ## Read-only. No writes, no calls into game state-changing code -- only the
@@ -3991,8 +4044,13 @@ proc gfxTickBody() =
     # panel looked like untouched. Re-capturing it now would capture the
     # DISPLACED layout as "normal", which is how a check stops being able to
     # fail.
-    gGfxGeomSaid = false
-    gGfxGeomTicks = 0
+    # Re-arm BOTH panels' verdicts for the next open. The BASELINE is still
+    # never recaptured -- it is the only record of the untouched panel, and
+    # recapturing it would teach the check to accept whatever state we had
+    # already put the panel into.
+    gGfxGeomSaid = @[false, false]
+    gGfxGeomPendingSaid = @[false, false]
+    gGfxGeomTicks = @[0, 0]
     pfxOnScreenClosed()
   if gGfxPanelGo == nil or gGfxPostGo == nil:
     return
@@ -4072,14 +4130,18 @@ proc gfxTickBody() =
     gGfxUpTicks = gGfxUpTicks + 1
   else:
     gfxVerdict()
-  # THE STOCK-GEOMETRY CHECK, on its own settle count. Separate from
-  # `gGfxUpTicks` on purpose: that one is reset every time the feature moves
-  # something, which for a check about the GAME's objects would mean it could
-  # be starved forever by our own activity.
-  if gGfxGeomTicks < GfxGeomSettle:
-    gGfxGeomTicks = gGfxGeomTicks + 1
-  else:
-    gfxStockGeomVerdict()
+  # THE STOCK-GEOMETRY CHECK, PER PANEL, each on its own settle count. Both are
+  # offered every tick and each one decides for itself whether it is ready:
+  # a panel that is not activeInHierarchy stays PENDING and its counter does
+  # not advance, so the assertion runs the first time that panel is actually
+  # shown -- which for PostFX is the first time the player presses it. The
+  # steady state after both have reported is two boolean tests.
+  #
+  # Separate counters from `gGfxUpTicks` on purpose: that one resets whenever
+  # the feature moves something, which for a check about the GAME's objects
+  # would let our own activity starve it forever.
+  gfxStockGeomVerdictFor(0)
+  gfxStockGeomVerdictFor(1)
 
 proc gfxTick() =
   ## Every frame while armed: the steady state is two `activeSelf` reads and a
