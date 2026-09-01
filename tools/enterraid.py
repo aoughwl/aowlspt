@@ -267,14 +267,18 @@ def main():
         # INCONCLUSIVE, not FAIL: the menu never appearing tells us nothing
         # about whether a raid can be entered. Name the likelier cause if the
         # host's own counters say the channel is wedged.
-        w = ui.wedge_verdict()
+        state, note = ui.channel_verdict()
         log("INCONCLUSIVE: menu never became ready in 180s -- nothing about "
             "raid entry was established.")
-        if w:
-            log("  " + w)
+        if state == "WEDGED":
+            log("  " + note)
+        elif state == "UNKNOWN":
+            log("  the inspector channel was NOT CHECKED for a wedge: %s"
+                % (note or "the host log has no watchdog line to read."))
         else:
-            log("  the inspector answered but no visible PlayButton appeared "
-                "under MenuScreen; the client may still be booting.")
+            log("  the channel is HEALTHY, so this is a UI state, not a "
+                "transport fault: no visible PlayButton appeared under "
+                "MenuScreen and the client may still be booting.")
         return INCONCLUSIVE
     cu, mu = roots_ptrs()
     ms = menuscreen_ptr(cu)

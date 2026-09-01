@@ -92,7 +92,7 @@ def selftest():
        host for a shell-side collision is how the last one was misdiagnosed.
     """
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from ui import wedge_verdict
+    from ui import channel_verdict
     bad = 0
 
     def case(label, ok, extra=""):
@@ -101,23 +101,59 @@ def selftest():
             bad += 1
         print("%-4s %s%s" % ("ok" if ok else "FAIL", label, extra))
 
-    WEDGED = ("2026-08-31 18:40:02 WARN live inspector: no batch queued for "
-              "130s while the rider IS dispatching (9 fires). polls=4210 "
-              "reads=4210 readFails=0 unchanged=4209 lastRead=1485B "
-              "lastKnown=1485B pending=0 batch=9 done=-1 suspended=false "
-              "inFlight=true  file=D:\\Aowlspt\\aowlspt\\aowlspt-inspect.txt")
-    HEALTHY = WEDGED.replace("batch=9 done=-1", "batch=9 done=9") \
-                    .replace("inFlight=true", "inFlight=false")
+    # The post-162d3b8 watchdog shape, which carries `delivered=` and `running=`.
+    def line(head, batch, delivered, running, done=-1):
+        return ("2026-08-31 20:19:49 WARN live inspector: %s -- the rider IS "
+                "dispatching (9 fires). polls=8916 reads=579 readFails=0 "
+                "unchanged=570 lastRead=1881B lastKnown=1881B pending=0 "
+                "batch=%d delivered=%d running=%d "
+                "done(handshake,cleared-on-delivery)=%d suspended=false "
+                "abandons=0 inFlight=true  file=D:\\Aowlspt\\aowlspt\\"
+                "aowlspt-inspect.txt" % (head, batch, delivered, running, done))
 
-    v = wedge_verdict(text=WEDGED)
-    case("the measured batch=9 done=-1 line reports WEDGED", bool(v))
-    case("  ...and it CONTRADICTS the host's own 'no batch queued' prose",
-         bool(v) and "FALSE" in v)
-    case("a healthy line (done caught up) reports nothing",
-         wedge_verdict(text=HEALTHY) is None,
-         "  <- this is what makes case 1 falsifiable")
-    case("a log with no watchdog line at all reports nothing (not WEDGED)",
-         wedge_verdict(text="nothing to see here") is None)
+    WEDGED = line("WEDGED -- batch 9 was claimed by Unity's thread 130s ago and "
+                  "has NOT completed; it is stuck at command 12 of 58: tree $r3",
+                  9, 8, 9)
+    # THE CASE THAT WOULD HAVE CAUGHT THE BUG, and whose absence is why it
+    # shipped. This is the REAL healthy state: everything delivered, the
+    # handshake cleared to -1 by the delivery path itself (inspect.nim:7014),
+    # nothing running. The first predicate (`done < batch`) called this WEDGED.
+    HEALTHY_IDLE = line("IDLE and HEALTHY -- batch 9 completed and its answers "
+                        "were delivered. No NEW batch has been queued for 130s "
+                        "because the command file's CONTENT has not changed.",
+                        9, 9, -1, done=-1)
+    QUEUED = line("batch 10 is QUEUED and has not been claimed for 12s",
+                  10, 9, -1)
+    # The pre-162d3b8 shape. Undecidable, and it must SAY so.
+    OLD = ("2026-08-31 18:40:02 WARN live inspector: no batch queued for 130s "
+           "while the rider IS dispatching (9 fires). polls=4210 reads=4210 "
+           "readFails=0 unchanged=4209 lastRead=1485B lastKnown=1485B "
+           "pending=0 batch=9 done=-1 suspended=false inFlight=true")
+
+    s, n = channel_verdict(text=WEDGED)
+    case("a genuinely wedged line reports WEDGED", s == "WEDGED")
+    case("  ...and it relays the host's own stuck-command detail",
+         s == "WEDGED" and "stuck at command 12 of 58" in (n or ""))
+
+    s, n = channel_verdict(text=HEALTHY_IDLE)
+    case("HEALTHY IDLE (done=-1, delivered==batch, running=-1) reports HEALTHY",
+         s == "HEALTHY",
+         "\n     <- THE REGRESSION CASE. `done=-1` is the NORMAL state of a "
+         "delivered\n        channel (inspect.nim:7014 clears it ON SUCCESS); "
+         "the first predicate\n        `done < batch` called this WEDGED, a "
+         "false positive on the happy path.")
+
+    s, _n = channel_verdict(text=QUEUED)
+    case("a queued-but-unclaimed batch is NOT wedged", s == "HEALTHY")
+
+    s, n = channel_verdict(text=OLD)
+    case("a pre-162d3b8 host reports UNKNOWN, not HEALTHY", s == "UNKNOWN")
+    case("  ...and says the wedge was NOT CHECKED",
+         s == "UNKNOWN" and "NOT CHECKED" in (n or ""),
+         "  <- 'I could not look' must never read as a pass")
+
+    s, _n = channel_verdict(text="nothing to see here")
+    case("a log with no watchdog line at all reports UNKNOWN", s == "UNKNOWN")
 
     # --- 2. a stale out-file must never be returned -------------------------
     stale = ("> roots\n[$r0] transform=0xdead go=0xbeef ($rgo0) name=\"Menu UI\"\n"
