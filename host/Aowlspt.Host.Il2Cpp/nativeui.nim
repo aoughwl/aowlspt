@@ -231,6 +231,7 @@ const
   NuTRtGetAnchorMin  = 46'i32  ## UnityEngine.RectTransform::get_anchorMin_Injected
   NuTRtGetAnchorMax  = 47'i32  ## UnityEngine.RectTransform::get_anchorMax_Injected
   NuTRtGetPivot      = 48'i32  ## UnityEngine.RectTransform::get_pivot_Injected
+  NuTLayoutElemIgnore= 49'i32  ## UnityEngine.UI.LayoutElement::set_ignoreLayout
 
 # ---- field offsets on the settings-row prefabs --------------------------
 #
@@ -806,6 +807,26 @@ type
     ## the CHECK needs rect.
     rectW*, rectH*: float32
 
+proc nuSetIgnoreLayout*(layoutElement: Il2CppPtr; on: bool): bool =
+  ## `LayoutElement.ignoreLayout = value` -- the PROPERTY, never the field.
+  ##
+  ## Setting `m_IgnoreLayout` @0x20 raw would compile, run, and change nothing
+  ## the player can see: the property also calls `LayoutElement::SetDirty`
+  ## @0x5598490, which is what makes the parent LayoutGroup re-run. A raw store
+  ## leaves the group holding its old arrangement -- the same class of mistake
+  ## as writing `Toggle.m_IsOn` and expecting the Animator to notice.
+  ##
+  ## This is how our subtab strip stops being something the group MEASURES.
+  ## Making the strip's preferred height small was tried first and failed live:
+  ## a layout child is allocated space no matter how small it claims to be, and
+  ## that space comes out of the stock scroll view.
+  result = false
+  if not gNuOn or not nuOk(layoutElement, 0x24'i32): return
+  let fn = nuFn(NuTLayoutElemIgnore)
+  if fn == nil: return
+  cNuCallVPB(fn, layoutElement, (if on: 1'i32 else: 0'i32))
+  true
+
 proc nuNoGeom*(): NuGeom =
   ## The "nothing was measured" value. Exists so a caller never has to declare
   ## an uninitialised NuGeom: `ok = false` is the only honest starting state,
@@ -1102,6 +1123,8 @@ proc nuTargetsBindOk(): bool =
   want.add "UnityEngine.RectTransform::get_anchorMin_Injected"
   idx.add NuTRtGetPivot
   want.add "UnityEngine.RectTransform::get_pivot_Injected"
+  idx.add NuTLayoutElemIgnore
+  want.add "UnityEngine.UI.LayoutElement::set_ignoreLayout"
   var i = 0
   while i < idx.len:                      # capped: idx is built right here
     let ix = idx[i]

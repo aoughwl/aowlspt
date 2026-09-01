@@ -1577,6 +1577,18 @@ var gModLoadStyled = false
 var gModLoadFailed = false
   ## The build reported FAILED. Changes the linger, not whether we dismiss.
 var gModLoadTries = 0
+var gModLoadParentTr: Il2CppPtr = nil
+  ## The container we reparented the lines into, if we did. Remembered so the
+  ## teardown sweep looks THERE too: a sweep rooted only where we originally
+  ## built would report ZERO survivors simply by not looking, which is a pass
+  ## that cannot fail.
+var gModLoadSweepAt = 0'u64
+  ## When the DEFERRED survivor sweep is due. `Object::Destroy` is deferred to
+  ## the end of the frame, so sweeping in the same frame as the teardown finds
+  ## every node still parented and reports a leak that is not one -- measured
+  ## live on 2026-09-01 as "teardown FAILED: 3 node(s) STILL under the canvas".
+var gModLoadSweepWhy = ""
+  ## Why we tore down, held across the sweep delay so the verdict can name it.
   ## Polls spent without reaching a finished state; the self-disable counter.
 var gErrDlgRow: array[3, int] = [-1, -1, -1]
   ## kind-20/21/22 slot  ->  the TARGET-TABLE ROW it actually bound, recorded at

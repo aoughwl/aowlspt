@@ -105,6 +105,17 @@ const
     ## Nodes the donor search may visit, total. Bounded like every other walk in
     ## this host: an unbounded descent on a scene full of geometry is how
     ## natesp's own walk burned 20,000 nodes and never reached any UI.
+  MlSweepDelayMs = 750'u64
+    ## How long AFTER teardown the survivor sweep waits before walking.
+    ##
+    ## `nuDestroy` calls `UnityEngine.Object::Destroy`, which is DEFERRED to
+    ## the end of the frame -- NOT `DestroyImmediate`. The first version swept
+    ## in the same frame as the destroy and therefore found every one of our
+    ## own nodes still parented, and reported "teardown FAILED: 3 node(s) ...
+    ## STILL under the canvas". That reading was measured and real, and its
+    ## conclusion ("a leak") did not follow: the check was simply looking
+    ## before Unity had done the work. A check that fires too early is as
+    ## useless as one that cannot fail -- it just fails the other way.
   MlSweepBudget = 2000
     ## Nodes the ONE-SHOT survivor sweep may visit after teardown. It calls
     ## `Object::get_name` per node, so it is far more expensive than the other
@@ -224,14 +235,23 @@ proc mlDestroy() =
   ## less: Unity destroys our labels with their parent, so by the time we get
   ## here the handles may already be dead. That is expected and must not be an
   ## error -- what matters is the survivor sweep afterwards, not these calls.
+  # DEACTIVATE BEFORE DESTROYING, always. `Object::Destroy` is deferred to
+  # the end of the frame, so on the frame we dismiss the text is still drawn;
+  # `SetActive(false)` takes effect immediately. The player's complaint was
+  # "it remains open when we load into the main menu", and a frame of extra
+  # text is exactly what that looks like if the destroy is ever delayed
+  # further or declines. Hiding costs one call and cannot leave the element in
+  # a worse state than destroying alone.
   for i in 0 ..< gModLoadRows.len:
     if uint32(gModLoadRows[i]) != 0'u32:
       if nuLive(gModLoadRows[i]):
+        discard nuSetActive(gModLoadRows[i], false)
         discard nuDestroy(gModLoadRows[i])
       gModLoadRows[i] = nuNone
   gModLoadRows.setLen(0)
   if uint32(gModLoadTitle) != 0'u32:
     if nuLive(gModLoadTitle):
+      discard nuSetActive(gModLoadTitle, false)
       discard nuDestroy(gModLoadTitle)
     gModLoadTitle = nuNone
   # There is no background any more (defect 3). This stays so that a handle
@@ -244,29 +264,57 @@ proc mlDestroy() =
   gModLoadBuilt = false
 
 proc mlDismiss(why: string) =
-  ## Destroy, then PROVE it, then stop for good. Three outcomes, never two.
-  if gModLoadDone and not gModLoadBuilt:
+  ## Hide, destroy, and SCHEDULE the proof. The verdict is not available yet
+  ## and this must not pretend otherwise -- see MlSweepDelayMs.
+  if gModLoadDone or gModLoadSweepAt != 0'u64:
     return
   mlDestroy()
+  gModLoadSweepWhy = why
+  gModLoadSweepAt = cNowMs() + MlSweepDelayMs
+  okLog "mod loading step: torn down (" & why & "). Every line was " &
+        "deactivated and passed to Object::Destroy, which Unity defers to the " &
+        "end of the frame -- so the survivor sweep that PROVES nothing is left " &
+        "runs in " & $int(MlSweepDelayMs) & "ms, not now. No verdict yet."
+
+proc mlSweepReport() =
+  ## The deferred half of the teardown check. Walks the LIVE TREE and states
+  ## one of three outcomes. "We called destroy" is not one of them.
+  gModLoadSweepAt = 0'u64
   gModLoadDone = true
+  # SWEEP BOTH ROOTS. Once the lines are reparented into the game caption's
+  # own container, a sweep rooted only at the canvas we originally built under
+  # may not reach them at all -- and "did not look there" would come back as
+  # ZERO survivors, i.e. a PASS that cannot fail. That is the same defect this
+  # check exists to catch, one level up. So the reparent target is remembered
+  # and swept too, and both verdicts are combined.
   var survivors = 0
-  let complete = mlSweepSurvivors(gModLoadCanvasTr, survivors)
+  var complete = mlSweepSurvivors(gModLoadCanvasTr, survivors)
+  var roots = "the canvas"
+  if gModLoadParentTr != nil and gModLoadParentTr != gModLoadCanvasTr:
+    var s2 = 0
+    let c2 = mlSweepSurvivors(gModLoadParentTr, s2)
+    survivors = survivors + s2
+    complete = complete and c2
+    roots = "the canvas AND the caption container we reparented into"
   if not complete:
-    warn "mod loading step: dismissed (" & why & ") -- teardown check " &
-         "INCONCLUSIVE: the survivor sweep hit its " & $MlSweepBudget &
-         "-node budget before finishing, so it did NOT establish that nothing " &
+    warn "mod loading step: dismissed (" & gModLoadSweepWhy & ") -- teardown " &
+         "check INCONCLUSIVE: the survivor sweep hit its " & $MlSweepBudget &
+         "-node budget before finishing over " & roots & ", so it did NOT " &
+         "establish that nothing " &
          "named \"" & MlNamePrefix & "*\" is left under the canvas. It found " &
          $survivors & " so far. This is not a pass."
   elif survivors != 0:
-    warn "mod loading step: dismissed (" & why & ") -- teardown FAILED: " &
-         $survivors & " node(s) named \"" & MlNamePrefix & "*\" are STILL " &
-         "under the canvas after every handle was destroyed. Something we " &
-         "created outlived its handle; that is a leak on the player's screen."
+    warn "mod loading step: dismissed (" & gModLoadSweepWhy & ") -- teardown " &
+         "FAILED: " & $survivors & " node(s) named \"" & MlNamePrefix &
+         "*\" are STILL under " & roots & ", " & $int(MlSweepDelayMs) & "ms after " &
+         "every one was deactivated and destroyed. Unity's deferred destroy " &
+         "has had whole frames to run, so this time it IS a leak on the " &
+         "player's screen, not an early read."
   else:
-    okLog "mod loading step: dismissed (" & why & ") -- teardown PASSED: a " &
-          "walk of the live canvas subtree found ZERO nodes named \"" &
-          MlNamePrefix & "*\". This is read back off the tree, not off our " &
-          "own handles."
+    okLog "mod loading step: dismissed (" & gModLoadSweepWhy & ") -- teardown " &
+          "PASSED: a walk of " & roots & " found ZERO nodes named " &
+          "\"" & MlNamePrefix & "*\". Read back off the tree " &
+          $int(MlSweepDelayMs) & "ms after the destroy, not off our own handles."
 
 proc mlFindDonorTmp(rootTr: Il2CppPtr): Il2CppPtr =
   ## A live TextMeshProUGUI to copy font + materials from.
@@ -406,7 +454,7 @@ proc mlBuild(lines: seq[string]): bool =
   #
   # nuikit's nuStyleFind, not a private copy: matching the game's look is a
   # TOOLKIT capability, so the mods tab and the settings rows get it too.
-  let style = nuStyleFind(canvasTr, MlNeedle)
+  let style = nuStyleFind(canvasTr, MlNeedle, MlNamePrefix)
   var donor = style.donor
   if donor == nil:
     donor = mlFindDonorTmp(canvasTr)
@@ -427,6 +475,13 @@ proc mlBuild(lines: seq[string]): bool =
   let rows = min(lines.len - 1, MlMaxRows)
   if rows < 0:
     return false
+  # NEVER BUILD OVER LIVE HANDLES. If anything is still standing from a
+  # previous attempt, tear it down first: overwriting `gModLoadTitle` with a
+  # new handle orphans the old GameObject, which is untracked, undestroyable
+  # and permanently on the player's screen. This is a leak class the survivor
+  # sweep would catch AFTERWARDS; not creating it is better than reporting it.
+  if gModLoadBuilt or uint32(gModLoadTitle) != 0'u32 or gModLoadRows.len > 0:
+    mlDestroy()
 
   # WHERE THE LINES GO, and under WHAT PARENT.
   #
@@ -457,6 +512,7 @@ proc mlBuild(lines: seq[string]): bool =
       let pgo = nuGameObjectOf(par)
       if pgo != nil and nuOk(pgo, 0x10'i32) and nuAlive(pgo):
         parentGo = pgo
+        gModLoadParentTr = par
         placed = "STEP-PARENTED into the game caption's own parent (it dies " &
                  "with the loading UI), " & placed
     if style.h > 1.0'f32 and style.h < 400.0'f32:
@@ -520,9 +576,39 @@ proc mlRetryStyle() =
   ## So: keep looking on later polls, and RE-APPLY when it finally shows up.
   if gModLoadStyled or not gModLoadBuilt: return
   if gModLoadCanvasTr == nil: return
-  let s = nuStyleFind(gModLoadCanvasTr, MlNeedle)
+  let s = nuStyleFind(gModLoadCanvasTr, MlNeedle, MlNamePrefix)
   if not mlStyleUsable(s): return
   if not mlApplyStyle(s): return
+  # NOW DO THE REPARENT (defect 2). Previously this path logged "position
+  # matched; NOT reparented", which was honest and was still a miss: the whole
+  # point of matching is to sit INSIDE the client's loading container so we
+  # live and die with it. The order matters -- SetParentAndAlign resets the
+  # local transform, so the layout is applied AFTER the move, never before.
+  var parented = false
+  let par = mlParentTransformOf(s.node)
+  if par != nil:
+    let pgo = nuGameObjectOf(par)
+    if pgo != nil and nuOk(pgo, 0x10'i32) and nuAlive(pgo):
+      var moved = 0
+      if nuReparent(gModLoadTitle, pgo): inc moved
+      for i in 0 ..< gModLoadRows.len:
+        if uint32(gModLoadRows[i]) != 0'u32 and nuReparent(gModLoadRows[i], pgo):
+          inc moved
+      parented = moved == gModLoadRows.len + 1
+      # Remembered ONLY so the teardown sweep knows where else to look.
+      if moved > 0: gModLoadParentTr = par
+      if not parented:
+        warn "mod loading step: reparent was PARTIAL -- " & $moved & " of " &
+             $(gModLoadRows.len + 1) & " lines moved into the caption's " &
+             "container. The lines are now split across two parents, which " &
+             "is worse than either; re-laying all of them out below."
+      # RE-LAY OUT AFTER THE MOVE, unconditionally, including after a partial
+      # move: aligned children sit at the parent's origin until this runs.
+      if not mlApplyStyle(s):
+        warn "mod loading step: the post-reparent layout REFUSED, so the " &
+             "lines are now at their new parent's origin rather than under " &
+             "the game's caption. This is visible and wrong; the style note " &
+             "above says what was matched."
   gModLoadStyled = true
   gModLoadDonor = s.donor      # see mlBuild: this is the dismissal signal
   # Reparenting an existing label would mean re-aligning it under a new parent
@@ -531,8 +617,13 @@ proc mlRetryStyle() =
   # a later reader assume this took the STEP-PARENTED path.
   okLog "mod loading step: RE-STYLED on a later frame -- the game's own " &
         "caption had not spawned when we built, and has now. " & nuStyleNote(s) &
-        " (position matched; NOT reparented, because the lines already exist " &
-        "under the canvas)"
+        (if parented:
+           " STEP-PARENTED into that caption's own parent, so these lines now " &
+           "die with the loading UI."
+         else:
+           " NOT reparented (no readable parent for the caption); the position " &
+           "matches but these lines still hang off the canvas and must be " &
+           "torn down explicitly.")
   mlVerifyStyle(s)
 
 proc mlRefresh(lines: seq[string]) =
@@ -592,9 +683,21 @@ proc modLoadTick() =
   ## not re-entrant and a nested one would disarm the outer. Cheap when idle:
   ## one clock compare, then one small file read, and it returns immediately
   ## when the contents have not changed.
-  if not gModLoad or gModLoadDone:
+  if not gModLoad:
     return
-  let now = cNowMs()
+  let nowFrame = cNowMs()
+  # THE PENDING TEARDOWN PROOF, before the done-gate. `mlDismiss` deliberately
+  # leaves the verdict unfinished, and `gModLoadDone` is only set when the
+  # sweep actually runs -- so an early return here would swallow the check
+  # entirely and we would be back to "we called destroy", which is not
+  # evidence of anything.
+  if gModLoadSweepAt != 0'u64:
+    if nowFrame >= gModLoadSweepAt:
+      mlSweepReport()
+    return
+  if gModLoadDone:
+    return
+  let now = nowFrame
   if now - gModLoadPolledAt < MlPollMs:
     return
   gModLoadPolledAt = now

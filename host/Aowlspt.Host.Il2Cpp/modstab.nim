@@ -3023,75 +3023,115 @@ proc gfxBuildStrip(panelT, donorStripGo, donorButtonGo, donorButtonT: Il2CppPtr;
            "than shipping it in the wrong place."
       discard modsSetActive(strip, false)
       return
-  # SIZE TO CONTENT, NOT TO THE DONOR. `donorStripGo` is `Control Settings/
-  # Toggles`, a VerticalLayoutGroup sized (via its own `LayoutElement`, if it
-  # carries one) to hold that panel's WHOLE checkbox list -- a size the clone
-  # inherits VERBATIM, because a `LayoutElement`'s min/preferred/flexible
-  # fields are ordinary serialized floats that Instantiate does not
-  # recompute. Left alone, that reserves the donor's full height inside a
-  # two-button strip and reads as "the settings start half way down the
-  # panel". MEASURED, not guessed: read first, and only reset a field that is
-  # actually a positive constraint (Unity's "unset" sentinel is negative).
+  # ==========================================================================
+  # LEAVE THE LAYOUT GROUP. Do not negotiate with it.
+  #
+  # THIS IS THE THIRD ATTEMPT AT ONE DEFECT, and the first two are recorded
+  # here because each was a reasonable idea that MEASURABLY did not work.
+  #
+  #   The defect. The strip is cloned into the panel's content container, whose
+  #   LayoutGroup then allocated it space and took that space out of the stock
+  #   scroll view. Caught by the host's own baseline, with numbers:
+  #     Graphics Settings/SettingsList
+  #       was  sizeDelta=(850,755)    anchoredPosition=(0,-20)
+  #       now  sizeDelta=(850,354.5)  anchoredPosition=(0,-420.5)
+  #
+  #   Attempt 1 -- reset the clone's LayoutElement min/preferred to -1. FAILED.
+  #   -1 is Unity's UNSET sentinel; it does not mean "small", it means "stop
+  #   overriding, ask the strip", and the strip is a clone of
+  #   `Control Settings/Toggles`, authored to stack that panel's ENTIRE
+  #   checkbox list. So it asked, and got a very tall answer.
+  #
+  #   Attempt 2 -- write an explicit small height measured off the donor
+  #   button. ALSO FAILED, live, same 420.5 displacement. A layout CHILD is
+  #   allocated space no matter how little it claims, and that space still
+  #   comes out of the scroll view. Both attempts were the wrong SHAPE: they
+  #   tried to win an argument with the layout system instead of leaving it.
+  #
+  #   Attempt 3, here. `LayoutElement.ignoreLayout = true`. The group then
+  #   SKIPS the element entirely when measuring and arranging -- it allocates
+  #   nothing, and the stock children keep the geometry they had. We position
+  #   the strip ourselves afterwards. This is Unity's own answer for "this
+  #   object must live inside this transform but outside its layout".
+  #
+  # THE SETTER, NOT THE FIELD. `m_IgnoreLayout` is at +0x20, but a raw store
+  # never calls `LayoutElement::SetDirty`, so the group would not re-run and
+  # nothing would change -- exactly the `m_IsOn` mistake that made the subtab
+  # highlight stick. `nuSetIgnoreLayout` calls the real property.
+  #
+  # WHERE THE STRIP THEN GOES. Above the container's top edge, not over the
+  # list: pivot and anchor at the container's TOP-LEFT, stretched horizontally
+  # so it is the container's own width at any resolution, with
+  # anchoredPosition.y = +H so the strip's BOTTOM sits exactly on the container
+  # top and its body occupies the header band above. Nothing overlaps the stock
+  # rows and nothing is taken from them.
+  #
+  # H IS MEASURED, NEVER HARDCODED. This user runs 3840x2160 at 1.5x Windows
+  # scaling against a 1920x1080 canvas, so any pixel constant measured on one
+  # machine is a different fraction of the panel on the next. H comes from the
+  # donor button we are actually cloning. If it cannot be measured there is no
+  # honest number to use, and this REFUSES the strip rather than inventing one.
+  # ==========================================================================
+  let dbGeom = nuReadGeom(donorButtonT)
+  if not dbGeom.ok or dbGeom.rectH <= 4.0'f32 or dbGeom.rectH >= 200.0'f32:
+    warn "postfx subtab: the donor button `ControlToggle` could not be " &
+         "measured (" & nuGeomNote(dbGeom) & "), so there is no honest height " &
+         "to give the strip and no honest place to put it. REFUSING to build " &
+         "the strip in " & iObjName(panelT) & " rather than guess a pixel " &
+         "constant -- a hardcoded one would be wrong at this user's 1.5x " &
+         "display scaling anyway."
+    discard modsSetActive(strip, false)
+    return
+  let stripH = dbGeom.rectH * 1.25'f32
+  # 1. STOP BEING A LAYOUT CHILD.
   let stripLe = modsComponent(stripT, "LayoutElement")
-  if stripLe != nil and duOk(stripLe, ModsOffLeFlexibleHeight + 4'i32):
-    var reset = 0
-    let minH = cReadF32At(duPtrAdd(stripLe, ModsOffLeMinHeight))
-    let prefH = cReadF32At(duPtrAdd(stripLe, ModsOffLePreferredHeight))
-    let flexH = cReadF32At(duPtrAdd(stripLe, ModsOffLeFlexibleHeight))
-    # AN EXPLICIT HEIGHT, NOT UNITY'S "UNSET" SENTINEL -- and this is a
-    # CORRECTION to what this block used to do.
-    #
-    # It used to write -1 (unset) to min and preferred, which does not mean
-    # "small": it means "stop overriding, ask the strip itself". The strip is a
-    # clone of `Control Settings/Toggles`, whose own layout group is authored
-    # to stack that panel's ENTIRE checkbox list, so asking it yields a very
-    # tall answer -- and the parent group then pushed the stock scroll view
-    # down and shrank it to fit, which is the measured
-    # SettingsList=(0,-420.5)/(850,354.5) defect above.
-    #
-    # The replacement height is MEASURED FROM THE DONOR BUTTON, never
-    # hardcoded: this user runs 3840x2160 at 1.5x Windows scaling and the
-    # canvas is 1920x1080 UI units, so any pixel constant measured on one
-    # machine is wrong on the next. Two buttons plus a little breathing room,
-    # derived from the button we are actually cloning.
-    let dbGeom = nuReadGeom(donorButtonT)
-    let wantH = (if dbGeom.ok and dbGeom.rectH > 4.0'f32 and
-                    dbGeom.rectH < 200.0'f32: dbGeom.rectH * 1.4'f32
-                 else: 0.0'f32)
-    if wantH > 0.0'f32:
-      if minH < 0.0 or minH > wantH + 1.0:
-        discard cDuWriteF32(stripLe, ModsOffLeMinHeight, wantH)
-        reset = reset + 1
-      if prefH < 0.0 or prefH > wantH + 1.0:
-        discard cDuWriteF32(stripLe, ModsOffLePreferredHeight, wantH)
-        reset = reset + 1
-    else:
-      # The donor could not be measured, so there is no honest number to put
-      # here. Fall back to the old sentinel and SAY that it is the fallback --
-      # it is the behaviour that produced the defect, and a silent fallback to
-      # a known-bad path is worse than a loud one.
-      warn "postfx subtab: the donor button's height could not be measured, " &
-           "so the strip's LayoutElement is being reset to Unity's UNSET " &
-           "sentinel instead of an explicit height. That is the configuration " &
-           "that pushed the stock scroll view down; the stock-geometry check " &
-           "below will catch it if it recurs."
-      if minH >= 0.0:
-        discard cDuWriteF32(stripLe, ModsOffLeMinHeight, -1.0)
-        reset = reset + 1
-      if prefH >= 0.0:
-        discard cDuWriteF32(stripLe, ModsOffLePreferredHeight, -1.0)
-        reset = reset + 1
-    if flexH > 0.0:
-      discard cDuWriteF32(stripLe, ModsOffLeFlexibleHeight, 0.0)
-      reset = reset + 1
-    if reset > 0:
-      okLog "postfx subtab: " & iObjName(panelT) & "'s strip inherited a " &
-            "LayoutElement sized for the donor's full checkbox list (min=" &
-            $minH & " preferred=" & $prefH & " flexible=" & $flexH &
-            "); rewrote " & $reset & " field(s) to an explicit height of " &
-            nuF(wantH) & " measured off the donor button, so the panel's " &
-            "layout group cannot give the strip the donor's whole-list " &
-            "height and push the stock scroll view down."
+  if stripLe == nil:
+    # No LayoutElement means we cannot opt out, and we cannot add one either --
+    # `AddComponent<LayoutElement>` needs a metadata-usage slot this host has
+    # not attested. Say so plainly: the strip will be laid out, the stock view
+    # will be displaced, and the stock-geometry backstop will catch it and hide
+    # us. That is a worse outcome than refusing, so refuse.
+    warn "postfx subtab: the cloned strip in " & iObjName(panelT) & " carries " &
+         "NO LayoutElement, so `ignoreLayout` cannot be set and it cannot " &
+         "leave the panel's layout group. Attempts 1 and 2 (see the comment " &
+         "above) both proved that a layout CHILD displaces the stock scroll " &
+         "view no matter how little height it claims. REFUSING to build the " &
+         "strip rather than ship the known displacement."
+    discard modsSetActive(strip, false)
+    return
+  if not nuSetIgnoreLayout(stripLe, true):
+    warn "postfx subtab: LayoutElement.ignoreLayout could not be set on the " &
+         "strip in " & iObjName(panelT) & " (nativeui logged the refusal). " &
+         "Without it the group allocates the strip space and takes it from " &
+         "the stock scroll view. REFUSING to build the strip."
+    discard modsSetActive(strip, false)
+    return
+  # 2. POSITION IT OURSELVES, since nothing else will now.
+  #    anchorMin=(0,1) anchorMax=(1,1) -> stretch across the container's width.
+  #    pivot=(0,1)                     -> measure from its own TOP-LEFT.
+  #    sizeDelta=(0,H)                 -> full parent width (stretched), H tall.
+  #    anchoredPosition=(0,H)          -> bottom edge on the container's top.
+  let posOk = nuSetV2(stripT, NuTRtSetAnchorMin, 0.0'f32, 1.0'f32) and
+              nuSetV2(stripT, NuTRtSetAnchorMax, 1.0'f32, 1.0'f32) and
+              nuSetV2(stripT, NuTRtSetPivot, 0.0'f32, 1.0'f32) and
+              nuSetV2(stripT, NuTRtSetSizeDelta, 0.0'f32, stripH) and
+              nuSetV2(stripT, NuTRtSetAnchoredPos, 0.0'f32, stripH)
+  if not posOk:
+    warn "postfx subtab: the strip in " & iObjName(panelT) & " is now ignored " &
+         "by the layout group but could NOT be positioned, so it would sit " &
+         "wherever the clone happened to land. REFUSING to build it."
+    discard modsSetActive(strip, false)
+    return
+  okLog "postfx subtab: the strip in " & iObjName(panelT) & " has left the " &
+        "layout group" &
+        " -- LayoutElement.ignoreLayout=true through the real setter (which " &
+        "also calls SetDirty, so the group re-runs), then positioned by hand: " &
+        "stretched to the container's width, " & nuF(stripH) & " tall " &
+        "(measured off the donor button's " & nuF(dbGeom.rectH) & ", not " &
+        "hardcoded), bottom edge on the container's top so it sits in the " &
+        "header band and overlaps no stock row. Two earlier attempts to make " &
+        "it merely SMALL both displaced the stock scroll view; a layout child " &
+        "is allocated space no matter how little it asks for."
   # THE GROUP QUESTION, MEASURED PER STRIP (the two buttons made just above),
   # exactly the check `modsBuildSubtabs` uses -- same donor, same question.
   # MEASURED (fact #117): both buttons came out with m_Group=0 -- unlike the
@@ -3468,7 +3508,11 @@ proc gfxStockGeomVerdict() =
     return
   var moved = 0
   var unread = 0
-  var first = ""
+  # EVERY casualty, not just the first. Reporting only the first could not
+  # distinguish "the scroll view is the sole casualty" from "the whole panel
+  # moved", and that distinction is exactly what the next fix needs. Bounded by
+  # the baseline's own cap, so this cannot become a log flood.
+  var report = ""
   var i = 0
   while i < gGfxStockT.len and i < GfxMaxStockWatch * 2:
     let t = gGfxStockT[i]
@@ -3480,18 +3524,18 @@ proc gfxStockGeomVerdict() =
         unread = unread + 1
       elif nuGeomMoved(gGfxStockG[i], now, 1.0'f32):
         moved = moved + 1
-        if first.len == 0:
-          first = gGfxStockName[i] & ": was " & nuGeomNote(gGfxStockG[i]) &
-                  " -- now " & nuGeomNote(now)
+        report = report & " | " & gGfxStockName[i] & ": was " &
+                 nuGeomNote(gGfxStockG[i]) & " -- now " & nuGeomNote(now)
     i = i + 1
+  let first = report
   gGfxGeomSaid = true
   if moved > 0:
     warn "postfx subtab STOCK-GEOMETRY FAIL: " & $moved & " of " &
          $gGfxStockT.len & " stock object(s) MOVED OR RESIZED after our " &
          "subtab strip was inserted. We never write a stock RectTransform, so " &
          "this is the panel's own LayoutGroup giving our strip space and " &
-         "taking it from the game's scroll view -- the measured " &
-         "SettingsList=(0,-420.5)/(850,354.5) defect. First: " & first &
+         "taking it from the game's scroll view. ALL " & $moved &
+         " casualty/casualties, before and after:" & first &
          ". HIDING our strips so the layout group puts the stock view back on " &
          "its next rebuild; the screen returns to stock and the stock POSTFX " &
          "tab is restored by the fault path."

@@ -481,6 +481,43 @@ typedef struct AowlNuTarget {
 #define AOWL_NU_RT_GET_ANCHORMIN      46
 #define AOWL_NU_RT_GET_ANCHORMAX      47
 #define AOWL_NU_RT_GET_PIVOT          48
+/* --- OPTING OUT OF A LAYOUT GROUP (index 49) ------------------------------
+ *
+ * MEASURED LIVE, twice, which is why this row replaces a fix rather than
+ * adding one.
+ *
+ * The subtab strip is cloned into the Graphics panel's content container,
+ * whose LayoutGroup then allocated it space and took that space from the stock
+ * scroll view. The host baseline caught it with numbers:
+ *
+ *   Graphics Settings/SettingsList
+ *     was  sizeDelta=(850,755)    anchoredPosition=(0,-20)
+ *     now  sizeDelta=(850,354.5)  anchoredPosition=(0,-420.5)
+ *
+ * The FIRST attempt tried to make the strip's preferred height small enough
+ * (an explicit LayoutElement height measured off the donor button). It did not
+ * work. That was the wrong shape of fix: as long as the strip is a layout
+ * CHILD, the group allocates it space, and we were negotiating with the layout
+ * system when what we want is to leave it.
+ *
+ * `LayoutElement.ignoreLayout = true` is Unity's own answer -- the group skips
+ * the element entirely when measuring and arranging, so it allocates nothing
+ * and the stock children keep their geometry. The element is then positioned
+ * absolutely by us.
+ *
+ * THE SETTER, NOT THE FIELD, and this is the same lesson as the m_IsOn store
+ * that never fired the Animator trigger. `m_IgnoreLayout` is at +0x20
+ * (tools/fldoff.py, System.String self-check passed), but a raw store does not
+ * call `LayoutElement::SetDirty` @0x5598490, so the group never re-runs and
+ * nothing changes. Unity's own property does both. So we call the property.
+ *
+ * PROVENANCE: il2cpp_resolve.py typemethods UnityEngine.UI.LayoutElement ->
+ * set_ignoreLayout RVA=0x5598100 sharedness=UNIQUE (note get_ignoreLayout is
+ * SHARED x66 and is deliberately NOT bound here -- calling a shared RVA is
+ * safe, but we have no need to read it back and every unneeded row is another
+ * positional index to get wrong). bytes <RVA> 16 -> the sig below; not the
+ * 0x628110 universal stub. */
+#define AOWL_NU_LAYOUTELEM_SET_IGNORE 49
 
 /* UnityEngine.RenderMode. Named, because `0` appearing bare in a refusal is
  * indistinguishable from "we did not read anything". */
@@ -699,6 +736,10 @@ static const AowlNuTarget aowl_nu_targets[] = {
     { "UnityEngine.RectTransform::get_pivot_Injected", 0x52B7020u,
       { 0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,
         0x47,0xDB,0xE1 }, 16 },
+    /* --- opting out of a layout group. See AOWL_NU_LAYOUTELEM_SET_IGNORE. --- */
+    { "UnityEngine.UI.LayoutElement::set_ignoreLayout", 0x5598100u,
+      { 0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20,0x80,0x3D,0x75,
+        0xFF,0xB3,0x01 }, 16 },
 };
 
 #define AOWL_NU_TARGET_COUNT \

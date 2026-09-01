@@ -1191,11 +1191,34 @@ proc nuStyleCapture*(donorTmp, node: Il2CppPtr): NuStyle =
       result.geom = true
   result.ok = true
 
-proc nuStyleFind*(rootTr: Il2CppPtr; needleLower: string): NuStyle =
+proc nuStyleFind*(rootTr: Il2CppPtr; needleLower: string;
+                  rejectNameSub: string = ""): NuStyle =
   ## Find a live TMP whose DISPLAYED TEXT contains `needleLower` (already
   ## lower-case) and capture its style. Breadth-first and bounded: the label we
   ## want is shallow under a menu canvas, and a depth-first walk would spend the
   ## whole budget in the first large subtree it entered.
+  ##
+  ## `rejectNameSub` IS NOT OPTIONAL POLISH. MEASURED, live, 2026-09-01: the
+  ## mod-loading step searched for the needle "loading", and the first TMP it
+  ## found displaying "loading" was ITS OWN first line, which reads
+  ## "Loading mods: graphics". It then adopted its own font and position and
+  ## logged `MATCHED the game's own label "Loading mods: graphics"` followed by
+  ## `style check PASSED`.
+  ##
+  ## Both statements were false and NEITHER could ever have been false: a
+  ## search that can return the caller's own node turns "does our text match
+  ## the game's" into "does our text match our text", which is precisely the
+  ## check-that-cannot-fail shape of CLAUDE.md 9b. The user's verdict on the
+  ## result -- "the text formatting/look still SUCKS" -- was the only honest
+  ## signal in the loop.
+  ##
+  ## So a caller that creates TMPs MUST pass the substring its own objects are
+  ## named with. A hit on such a node is not a weaker match, it is NOT A MATCH,
+  ## and `why` says so by name so the log cannot be misread as "the game has no
+  ## caption".
+  ##
+  ## The name is read ONLY on a needle hit, never per node, so this costs a
+  ## handful of `Object::get_name` calls rather than one per walked node.
   result = NuStyle(ok: false, why: "no TMP under this root displays \"" &
                    needleLower & "\"", donor: nil, node: nil, text: "",
                    fontSize: 0.0'f32, x: 0.0'f32, y: 0.0'f32)
@@ -1203,6 +1226,8 @@ proc nuStyleFind*(rootTr: Il2CppPtr; needleLower: string): NuStyle =
     result.why = "no root to search from"
     return
   var budget = NuStyleBudget
+  var mine = 0                 ## needle hits that turned out to be OUR OWN
+  var mineText = ""
   var frontier: seq[Il2CppPtr] = @[rootTr]
   while frontier.len > 0 and budget > 0:
     var nextRow: seq[Il2CppPtr] = @[]
@@ -1213,9 +1238,17 @@ proc nuStyleFind*(rootTr: Il2CppPtr; needleLower: string): NuStyle =
       if tmp != nil:
         let t = splTmpText(tmp)
         if t.len > 0 and find(toLowerAscii(t), needleLower) >= 0:
-          result = nuStyleCapture(tmp, node)
-          result.text = t
-          return result
+          var ours = false
+          if rejectNameSub.len > 0:
+            let nm = iObjName(node)
+            if nm.len > 0 and find(nm, rejectNameSub) >= 0:
+              ours = true
+          if not ours:
+            result = nuStyleCapture(tmp, node)
+            result.text = t
+            return result
+          inc mine
+          if mineText.len == 0: mineText = t
       var n = 0
       if iChildCount(node, n):
         for i in 0 ..< n:
@@ -1223,6 +1256,13 @@ proc nuStyleFind*(rootTr: Il2CppPtr; needleLower: string): NuStyle =
           let c = iChildAt(node, i)
           if c != nil: nextRow.add c
     frontier = nextRow
+  if mine > 0:
+    result.why = "the only TMP(s) displaying \"" & needleLower & "\" under " &
+                 "this root are OURS -- " & $mine & " node(s) named \"" &
+                 rejectNameSub & "*\", the first reading \"" & mineText &
+                 "\". Matching our own text against itself would be a check " &
+                 "that cannot fail, so this is NOT a match. It also means the " &
+                 "game's own caption is not present right now"
 
 proc nuStyleNote*(s: NuStyle): string =
   ## One line for the log, saying what was matched or why nothing was.
@@ -1305,3 +1345,32 @@ proc nuElemFontSize*(e: NuElem): (bool, float32) =
   if not nuOk(comp, NuStyleFontSizeOff + 4'i32): return (false, 0.0'f32)
   (true, float32(cReadF32(cast[Il2CppPtr](
      cast[uint64](comp) + uint64(NuStyleFontSizeOff)))))
+
+proc nuReparent*(e: NuElem; parentGo: Il2CppPtr): bool =
+  ## Move an EXISTING element under a new parent, aligned.
+  ##
+  ## This exists because the match that matters arrives LATE. The game's own
+  ## loading caption does not exist when the mod-loading step first builds, so
+  ## the step is created under the canvas and only later learns which container
+  ## it should have belonged to. Without this the log had to say "position
+  ## matched; NOT reparented", which is a real limitation reported honestly and
+  ## still a limitation.
+  ##
+  ## `SetParentAndAlign` resets the local transform, so the CALLER MUST re-lay
+  ## out afterwards -- `nuStyleLayout` in the donor's frame is the intended
+  ## follow-up. Reparenting without that leaves the element at the new parent's
+  ## origin, which is a visible move to the wrong place, not a no-op.
+  if not nkReady("reparent"): return false
+  if not nuOk(parentGo, 0x10'i32) or not nuAlive(parentGo):
+    nkRefuse("reparent", "the new parent is null, unreadable or a destroyed " &
+             "Unity object; leaving the element where it is")
+    return false
+  var go: Il2CppPtr = nil
+  var rt: Il2CppPtr = nil
+  var comp: Il2CppPtr = nil
+  var kind = 0'i32
+  if not nkResolve(e, "reparent", go, rt, comp, kind): return false
+  result = nuParentAligned(go, parentGo)
+  if not result:
+    nkRefuse("reparent", "SetParentAndAlign refused; the element is still " &
+             "under its original parent and its layout is untouched")

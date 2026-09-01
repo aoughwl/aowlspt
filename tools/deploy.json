@@ -65,7 +65,6 @@
     "mod loading: releasing deferred mods now -- ",
     "mod loading step: BUILT -- ",
     "the game's own loading caption was destroyed -- the load ",
-    "-- teardown PASSED: a ",
     "mod loading step: style check PASSED -- our line reads back font ",
     "modLoadScreen is on (default)",
     "errdlg ARMED: read-only postfix detours on all ",
