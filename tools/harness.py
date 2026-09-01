@@ -41,7 +41,13 @@ A fourth outcome is checked before any of them: if the client process exits,
 that is reported immediately rather than waited out.
 
 Exit codes: 0 sentinel reached, 1 the client died or a fault was logged,
-2 timed out, 3 went idle without reaching the sentinel.
+2 timed out, 3 went idle without reaching the sentinel, 4 the client raised an
+IN-GAME ERROR DIALOG.
+
+4 is deliberately distinct from 3. A dialog and an idle client look identical
+from outside -- alive process, quiet log -- and conflating them is what let an
+unattended run sit on a broken client for its whole timeout. The host reports
+the difference (`catchErrorDialogs`, on by default) and this believes it.
 """
 
 import argparse
@@ -114,6 +120,25 @@ def watch(root, until, timeout, stall, quiet, started_at):
                 for line in chunk.splitlines():
                     if not quiet:
                         print(line)
+                    # AN ERROR DIALOG IS NOT IDLE. Checked BEFORE the sentinel,
+                    # because a run that puts a modal error window on screen has
+                    # already failed even if some later line happens to contain
+                    # the literal being waited for.
+                    #
+                    # Without this the client raises a dialog, stops making
+                    # progress, and the stall clock reports IDLE -- which reads
+                    # as "the boot finished and the game is waiting for a
+                    # person", the normal and expected end state. That is how an
+                    # unattended run sits on a dead client for its whole
+                    # timeout. The two states are indistinguishable from the
+                    # outside, so the host says which it is (`errdlg`, on by
+                    # default) and this is where that gets believed.
+                    #
+                    # The host's own once-per-session suppression notice carries
+                    # header="<suppressed>" and is not itself a dialog.
+                    if ("ERRORDIALOG kind=" in line
+                            and 'header="<suppressed>"' not in line):
+                        return "ERRORDIALOG", line.strip()
                     if until and until in line:
                         return "REACHED", line
 
@@ -201,7 +226,7 @@ def cmd_run(args):
     hostlog.cmd_summary(ns, False)
 
     return {"REACHED": 0, "DIED": 1, "TIMEOUT": 2,
-            "IDLE": 3, "INTERRUPTED": 130}[state]
+            "IDLE": 3, "ERRORDIALOG": 4, "INTERRUPTED": 130}[state]
 
 
 def cmd_watch(args):
@@ -209,7 +234,8 @@ def cmd_watch(args):
     state, why = watch(args.root, args.until, args.timeout, args.stall,
                        args.quiet, started)
     print("\n==== %s: %s" % (state, why))
-    return {"REACHED": 0, "DIED": 1, "TIMEOUT": 2, "IDLE": 3}[state]
+    return {"REACHED": 0, "DIED": 1, "TIMEOUT": 2, "IDLE": 3,
+            "ERRORDIALOG": 4}[state]
 
 
 def main():
