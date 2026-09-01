@@ -20,14 +20,109 @@ deadline passes. Nothing is ever returned that is not provably the response
 to the batch just sent -- there is no code path that reads the out-file and
 hands its content back without checking for the current sentinel first.
 """
+import errno
+import hashlib
 import itertools
 import os
 import re
+import tempfile
 import time
 
 LIVE_DEFAULT = r"D:\Aowlspt\aowlspt"
 
 _counter = itertools.count()
+
+
+# ---------------------------------------------------------------------------
+# SINGLE-WRITER DISCIPLINE
+#
+# MEASURED 2026-08-31: `tools/enterraid.py` and the aowlspt MCP inspector wrote
+# the command file concurrently and dropped each other's batches -- the symptom
+# was `inspector dropped a 1-command batch` on one side and a timeout on the
+# other. The channel is ONE file with no protocol for two writers: B's write
+# replaces A's before the host has read it, and A then waits out its whole
+# timeout for an answer to a batch the host never saw.
+#
+# The sentinel already guarantees nobody READS a stale answer (see the module
+# docstring). This adds the other half: only one process writes at a time.
+#
+# The lock lives in the SYSTEM TEMP DIR keyed by a hash of the live path, not in
+# the live install -- a human may be mid-raid and this module has no business
+# creating files next to the game. It is advisory (a cooperating writer that
+# does not use channel.py is unaffected) and it self-heals: a lock older than
+# LOCK_STALE_S is broken, because a crashed holder must not wedge the channel
+# forever. Both facts are stated in the message when it gives up, so a lock
+# contention never reads as a host fault.
+# ---------------------------------------------------------------------------
+
+LOCK_STALE_S = 180.0
+
+
+def lock_path(live_dir=None):
+    live = live_dir or os.environ.get("AOWLSPT_LIVE", LIVE_DEFAULT)
+    h = hashlib.sha1(os.path.abspath(live).lower().encode("utf-8")).hexdigest()[:12]
+    return os.path.join(tempfile.gettempdir(), "aowlspt-inspect-%s.lock" % h)
+
+
+class _Lock(object):
+    """A cross-process advisory lock over the file channel."""
+
+    def __init__(self, path, timeout=60.0, now=time.time, sleep=time.sleep):
+        self.path = path
+        self.timeout = timeout
+        self.now = now
+        self.sleep = sleep
+        self.held = False
+
+    def __enter__(self):
+        deadline = self.now() + self.timeout
+        while True:
+            try:
+                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(fd, ("%d %f\n" % (os.getpid(), time.time())).encode())
+                os.close(fd)
+                self.held = True
+                return self
+            except OSError as e:
+                if e.errno != errno.EEXIST:
+                    # Cannot lock at all (no temp dir, permissions). Say so and
+                    # proceed unlocked rather than refusing to talk to the host;
+                    # an unlocked write is what we did before, not a regression.
+                    self.held = False
+                    return self
+            try:
+                age = time.time() - os.path.getmtime(self.path)
+            except OSError:
+                age = 0.0
+            if age > LOCK_STALE_S:
+                try:
+                    os.unlink(self.path)      # holder died; break it
+                except OSError:
+                    pass
+                continue
+            if self.now() >= deadline:
+                holder = ""
+                try:
+                    with open(self.path) as f:
+                        holder = f.read().strip()
+                except OSError:
+                    pass
+                raise ChannelBusy(
+                    "another process has held the inspector channel for %.0fs "
+                    "(lock %s, holder %r). This is NOT a host fault and NOT a "
+                    "timeout: two writers to one command file drop each "
+                    "other's batches, so this one refused to write rather than "
+                    "clobber theirs. A lock older than %.0fs is broken "
+                    "automatically." % (age, self.path, holder, LOCK_STALE_S))
+            self.sleep(0.1)
+
+    def __exit__(self, *exc):
+        if self.held:
+            try:
+                os.unlink(self.path)
+            except OSError:
+                pass
+        return False
 
 
 class InspectorError(Exception):
@@ -47,6 +142,15 @@ class ChannelMissing(InspectorError):
 
 class WriteNotAllowed(InspectorError):
     kind = "write_not_allowed"
+
+
+class ChannelBusy(InspectorError):
+    """Another process holds the single-writer lock over the file channel.
+
+    DISTINCT from TimeoutErr on purpose: a timeout means the HOST did not
+    answer; this means WE declined to write because someone else was mid-batch.
+    Collapsing the two would blame the host for a shell-side collision."""
+    kind = "channel_busy"
 
 
 def paths(live_dir=None):
@@ -93,7 +197,8 @@ def new_sentinel():
 
 
 def run_batch(lines, live_dir=None, timeout=25.0, write=False,
-              sleep=time.sleep, now=time.time, read_out=None, write_cmd=None):
+              sleep=time.sleep, now=time.time, read_out=None, write_cmd=None,
+              lock=True):
     """Send one batch through the file channel and return (sentinel, raw_text).
 
     raw_text has the sentinel echo line already stripped. Raises TimeoutErr,
@@ -110,17 +215,32 @@ def run_batch(lines, live_dir=None, timeout=25.0, write=False,
     body_lines = (["allow write"] if write else []) + list(lines)
     sentinel = new_sentinel()
     body = "#%s\n" % sentinel + "\n".join(body_lines) + "\necho %s\n" % sentinel
-    write_cmd(body)
 
-    deadline = now() + timeout
-    while now() < deadline:
-        out = read_out()
-        if sentinel in out:
-            text = "\n".join(l for l in out.splitlines() if sentinel not in l)
-            return sentinel, text
-        sleep(0.15)
+    # The lock spans the WHOLE write-then-poll window, not just the write: a
+    # second writer landing between our write and the host's read is exactly the
+    # dropped-batch case. `lock=False` is the escape hatch for tests.
+    lk = (_Lock(lock_path(live_dir), timeout=timeout) if lock
+          else _nolock())
+    with lk:
+        write_cmd(body)
+        deadline = now() + timeout
+        while now() < deadline:
+            out = read_out()
+            if sentinel in out:
+                text = "\n".join(l for l in out.splitlines()
+                                 if sentinel not in l)
+                return sentinel, text
+            sleep(0.15)
     raise TimeoutErr("no answer for %s within %gs. %s" %
                       (sentinel, timeout, diagnose(p["log"])))
+
+
+class _nolock(object):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
 
 
 # ---------------------------------------------------------------------------

@@ -13,7 +13,24 @@ Menu-ready is a FAST poll for a visible PlayButton -- enter the instant it
 exists, never a blind fixed sleep.
 
 Usage:  python tools/enterraid.py [MapName]   (default Woods)
-Exit 0 = in raid.
+
+EXIT CODES -- three outcomes, never two (CLAUDE.md 9b).
+
+    0   IN RAID.
+    1   FAIL   -- a step ran and did not do what it was supposed to.
+    2   INCONCLUSIVE -- we could not look. The menu never came up, or the
+        inspector channel is wedged/busy, so NOTHING about the raid was
+        established. "I could not look" is not a failure of the raid and it is
+        certainly not a pass.
+    3   FAIL   -- a specific navigation step refused (kept distinct from 1 for
+        callers that already branch on it).
+
+MEASURED 2026-08-31, and this is why the codes are spelled out: this script
+printed `[enterraid] FAIL: menu never became ready` and returned EXIT 0. Every
+caller read a failed raid entry as a success. Its stdout was also fully
+buffered, so when it was wrapped, the entire progress log vanished and there
+was no record of how far it got. Both are fixed here; `log()` flushes per line
+and `main()`'s return value is asserted by --selftest.
 """
 import os
 import re
@@ -23,7 +40,19 @@ import time
 
 import ui
 
-MAP = sys.argv[1] if len(sys.argv) > 1 else "Woods"
+OK, FAIL, INCONCLUSIVE = 0, 1, 2
+REFUSED = 3
+
+# Line-buffer stdout even when it is a pipe. Python fully buffers a redirected
+# stdout, so a wrapped run that is killed or times out loses EVERYTHING it
+# printed -- which is what happened, leaving no record of how far it got.
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
+
+_pos = [a for a in sys.argv[1:] if not a.startswith("-")]
+MAP = _pos[0] if _pos else "Woods"
 HIT = re.compile(r'HIT (0x[0-9a-fA-F]+)\s+name="([^"]+)"')
 
 # The host log is the ONLY safe way to watch the raid load: reading this file is
@@ -235,27 +264,42 @@ def main():
     # screen that no longer appears -- pure wasted time. Go straight to the menu.
     log("waiting for menu (fast poll for a visible PlayButton under MenuScreen)...")
     if not ui.wait_until(menu_ready, timeout=180.0, poll=1.0):
-        log("FAIL: menu never became ready"); return 2
+        # INCONCLUSIVE, not FAIL: the menu never appearing tells us nothing
+        # about whether a raid can be entered. Name the likelier cause if the
+        # host's own counters say the channel is wedged.
+        state, note = ui.channel_verdict()
+        log("INCONCLUSIVE: menu never became ready in 180s -- nothing about "
+            "raid entry was established.")
+        if state == "WEDGED":
+            log("  " + note)
+        elif state == "UNKNOWN":
+            log("  the inspector channel was NOT CHECKED for a wedge: %s"
+                % (note or "the host log has no watchdog line to read."))
+        else:
+            log("  the channel is HEALTHY, so this is a UI state, not a "
+                "transport fault: no visible PlayButton appeared under "
+                "MenuScreen and the client may still be booting.")
+        return INCONCLUSIVE
     cu, mu = roots_ptrs()
     ms = menuscreen_ptr(cu)
     log("menu ready. CommonUI=%s MenuUI=%s MenuScreen=%s" % (cu, mu, ms))
 
     if not press_named("PlayButton", ms or cu):
-        log("FAIL: PlayButton"); return 3
+        log("FAIL: PlayButton did not fire"); return REFUSED
     time.sleep(0.8)
     if not press_named("NextButton", mu):        # -> Matchmaker Location Selection
-        log("FAIL: NEXT after PLAY"); return 3
+        log("FAIL: NEXT after PLAY did not fire"); return REFUSED
     time.sleep(0.8)
     press_named("MapButton", mu, timeout=4.0)    # opens the map if this flow uses it
     time.sleep(0.5)
     if not select_map(mu, MAP):
-        log("FAIL: map select"); return 4
+        log("FAIL: map select"); return FAIL
     time.sleep(0.8)
 
     # location -> NEXT -> Matchmaker Offline Raid Screen. Do NOT press the
     # location screen's READY -- that starts ONLINE matchmaking (fact #246).
     if not press_named("NextButton", mu):
-        log("FAIL: NEXT to Offline Raid Screen"); return 4
+        log("FAIL: NEXT to Offline Raid Screen"); return FAIL
     time.sleep(0.8)
     enable_practice(mu)                          # CRUCIAL for an OFFLINE raid
     time.sleep(0.5)
@@ -268,7 +312,7 @@ def main():
     # Press it, then go INSPECTOR-SILENT and watch the host log off-thread.
     base = hostlog_size()
     if not press_named("NextButton", mu, timeout=10.0):
-        log("FAIL: no READY (NextButton) on the AcceptScreen"); return 5
+        log("FAIL: no READY (NextButton) on the AcceptScreen"); return FAIL
     log("READY pressed -- inspector-silent; watching host log for the raid...")
 
     deadline = time.time() + 300.0
@@ -280,10 +324,63 @@ def main():
             # load ~60s more to actually deploy the player before declaring success.
             log("raid marker seen (loading); settling 60s to actual deploy (inspector-silent)...")
             time.sleep(60.0)
-            log("IN RAID (loaded + settled). Do NOT issue inspector reads until a camera is confirmed."); return 0
+            log("IN RAID (loaded + settled). Do NOT issue inspector reads until a camera is confirmed."); return OK
         time.sleep(3.0)
-    log("FAIL: no raid marker in the host log within 300s"); return 6
+    log("FAIL: no raid marker in the host log within 300s"); return FAIL
+
+
+def selftest():
+    """Prove a FAILED run exits NON-ZERO -- by RUNNING main() and reading its
+    exit code, not by reading the source.
+
+    Falsifiable in the exact way the bug was not: the failure is simulated by
+    forcing `ui.wait_until` to return False (the menu never becomes ready),
+    which is precisely the path that printed `FAIL: menu never became ready`
+    and returned 0. If the return value ever goes back to 0, this fails.
+
+    A second case forces a mid-navigation refusal (PlayButton never fires) and
+    demands a DIFFERENT non-zero code, so "always return 1" cannot pass either.
+    """
+    bad = 0
+
+    def case(label, got, want):
+        nonlocal bad
+        ok = (got == want)
+        if not ok:
+            bad += 1
+        print("%-4s %-58s want=%-14s got=%s"
+              % ("ok" if ok else "FAIL", label[:58], want, got))
+
+    real_wait, real_roots, real_ms, real_press = (
+        ui.wait_until, roots_ptrs, menuscreen_ptr, press_named)
+    g = globals()
+    try:
+        # Case 1 -- the exact 2026-08-31 failure: menu never ready.
+        ui.wait_until = lambda *a, **k: False
+        case("menu never ready -> INCONCLUSIVE (2), NOT 0", main(), INCONCLUSIVE)
+
+        # Case 2 -- the menu comes up, but PlayButton never fires.
+        ui.wait_until = lambda *a, **k: True
+        g["roots_ptrs"] = lambda: ("0x1", "0x2")
+        g["menuscreen_ptr"] = lambda cu: "0x3"
+        g["press_named"] = lambda *a, **k: False
+        case("PlayButton refuses -> REFUSED (3), NOT 0", main(), REFUSED)
+    finally:
+        ui.wait_until = real_wait
+        g["roots_ptrs"], g["menuscreen_ptr"], g["press_named"] = (
+            real_roots, real_ms, real_press)
+
+    # And the negative that keeps the two above honest: OK really is 0, so
+    # "never return 0" is not what is being asserted.
+    case("the success constant is 0", OK, 0)
+    case("FAIL/INCONCLUSIVE/REFUSED are all non-zero",
+         all(c != 0 for c in (FAIL, INCONCLUSIVE, REFUSED)), True)
+
+    print("\n%s: %d case(s) failed" % ("FAIL" if bad else "PASS", bad))
+    return 1 if bad else 0
 
 
 if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        sys.exit(selftest())
     sys.exit(main())

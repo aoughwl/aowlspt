@@ -149,9 +149,137 @@ def _run(cmds, timeout=45, write=False, tries=3):
             return run_batch(cmds, timeout=timeout, write=write)
         except Timeout as e:
             last = e
+            # `tries - 1` here printed "retry 3/2" -- past the tool's own stated
+            # limit, so the message contradicted itself and made the retry bound
+            # look broken. The bound was right; the denominator was wrong.
             sys.stderr.write("  (inspector dropped a %d-command batch; "
-                             "retry %d/%d)\n" % (len(cmds), i + 1, tries - 1))
+                             "retry %d/%d)\n" % (len(cmds), i + 1, tries))
+            sys.stderr.flush()
+    # Before giving up, say WHICH failure this is. A wedged host (a batch whose
+    # `done` never advances) reports itself as "no batch queued", which is the
+    # OPPOSITE of the truth and sent a whole session down the wrong path on
+    # 2026-08-31. channel_wedged() reads the host's own counters instead.
+    w = wedge_verdict()
+    if w:
+        sys.stderr.write("  %s\n" % w)
+        sys.stderr.flush()
+        raise UiError("the inspector channel is WEDGED, not idle. " + w)
     raise last
+
+
+# --------------------------------------------------------------------------
+# wedge detection -- the host's watchdog line, read honestly
+# --------------------------------------------------------------------------
+
+# `done` IS NOT THE WEDGE PREDICATE. This is the correction that matters, and
+# the first version of this function got it exactly wrong.
+#
+# MEASURED, host/Aowlspt.Host.Il2Cpp/inspect.nim:7014 -- the DELIVERY path sets
+# `gInspBatchDone = -1` itself, immediately after `inspWriteOut()`:
+#
+#     if done >= 0 and cInspHave() == 0'i32 and gInspOut.len > 0:
+#       inspWriteOut()
+#       ...
+#       gInspBatchDone = -1          # <-- cleared ON SUCCESS
+#
+# So `done=-1` is the NORMAL, HEALTHY state of a channel that has delivered
+# everything it was asked for. `done` is a one-shot HANDSHAKE, not a high-water
+# mark, and the old predicate `done < batch` therefore reported WEDGED for every
+# healthy idle channel -- a false positive on the happy path, which is the same
+# confidently-wrong-answer class this whole task was about.
+#
+# The right signals are `delivered` (a HISTORY, monotonic) and `running` (the
+# batch Unity's thread has claimed). The host on `fix-inspector-wedge`
+# (162d3b8) prints both, and chooses its own three-state headline from them:
+#
+#   live inspector: WEDGED -- batch 9 was claimed by Unity's thread 130s ago
+#   and has NOT completed; it is stuck at command 12 of 58: tree $r3 -- the
+#   rider IS dispatching (N fires). polls=.. batch=9 delivered=8 running=9
+#   done(handshake,cleared-on-delivery)=-1 suspended=.. abandons=.. inFlight=..
+#
+# THREE OUTCOMES, and the third is the one that keeps this honest: a host that
+# predates 162d3b8 prints no `delivered=`/`running=` at all, and from the old
+# fields the wedge is genuinely UNDECIDABLE. That case reports UNKNOWN and says
+# the deployed host is too old to tell -- it must never read as healthy.
+_WATCHDOG = re.compile(r"live inspector: (?P<head>.*?) -- the rider IS "
+                       r"dispatching.*?batch=(?P<batch>-?\d+)"
+                       r"(?:\s+delivered=(?P<delivered>-?\d+))?"
+                       r"(?:\s+running=(?P<running>-?\d+))?")
+# The pre-162d3b8 shape, kept ONLY so it can be recognised and refused.
+_WATCHDOG_OLD = re.compile(r"live inspector: no batch queued for (\d+)s.*?"
+                           r"batch=(-?\d+)\s+done=(-?\d+)")
+
+
+def channel_verdict(log_path=None, text=None):
+    """('WEDGED'|'HEALTHY'|'UNKNOWN', sentence) from the host's own counters.
+
+    Never collapsed to a bool and never guessed. UNKNOWN covers both "there is
+    no watchdog line to read" and "the deployed host is too old to say", and
+    neither is a clean bill of health.
+    """
+    if text is None:
+        log_path = log_path or os.path.join(LIVE, "aowlspt-host.log")
+        try:
+            with open(log_path, "rb") as f:
+                # Tail only. The host log is written by the LIVE client and can
+                # be tens of MB; never read the whole thing (CLAUDE.md 8).
+                f.seek(0, os.SEEK_END)
+                f.seek(max(0, f.tell() - 262144))
+                text = f.read().decode("utf-8", "replace")
+        except OSError:
+            return ("UNKNOWN", None)
+
+    last = None
+    for m in _WATCHDOG.finditer(text):
+        last = m
+    if last is None:
+        if _WATCHDOG_OLD.search(text):
+            return ("UNKNOWN",
+                    "the deployed host predates fix-inspector-wedge (162d3b8): "
+                    "its watchdog prints no `delivered=`/`running=`, and from "
+                    "`done` alone the wedge is UNDECIDABLE -- `done=-1` is the "
+                    "NORMAL state of a healthy delivered channel, because the "
+                    "delivery path clears it (inspect.nim:7014). NOT CHECKED.")
+        return ("UNKNOWN", None)
+
+    head = last.group("head") or ""
+    delivered = last.group("delivered")
+    running = last.group("running")
+
+    if delivered is None or running is None:
+        return ("UNKNOWN",
+                "the host's watchdog line carries no `delivered=`/`running=` "
+                "(pre-162d3b8 build), so the wedge is UNDECIDABLE from it. "
+                "NOT CHECKED. The host said: %s" % head[:200])
+
+    delivered, running = int(delivered), int(running)
+    # The host already decided, from the same two fields, and says so in its
+    # headline. Prefer ITS words -- they name the stuck command, which no
+    # amount of counter-parsing here could recover.
+    if head.startswith("WEDGED"):
+        return ("WEDGED",
+                "WEDGED (the host says so itself): %s Nothing shell-side can "
+                "unwedge this." % head)
+    if running >= 0 and delivered < running:
+        return ("WEDGED",
+                "WEDGED: batch %d was claimed by Unity's thread and delivered "
+                "has not caught up (delivered=%d running=%d), so every later "
+                "batch is being ignored. Nothing shell-side can unwedge this: "
+                "the host must abandon the batch or be restarted."
+                % (running, delivered, running))
+    return ("HEALTHY", head[:300] or None)
+
+
+def wedge_verdict(log_path=None, text=None):
+    """The WEDGED sentence, or None. Thin wrapper over channel_verdict().
+
+    Deliberately returns None for BOTH 'healthy' and 'unknown': its callers use
+    it to enrich an error message, and asserting a wedge we did not measure
+    would be the same defect in the other direction. Anything that needs to
+    tell those two apart must call channel_verdict().
+    """
+    state, note = channel_verdict(log_path, text)
+    return note if state == "WEDGED" else None
 
 
 def roots(timeout=60):
