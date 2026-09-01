@@ -77,9 +77,15 @@ BOOT_MARKERS = (
     "live inspector: rider FIRST DISPATCHED",
 )
 
-# The phase line means the boot is OVER -- MENU is published once no GameWorld
-# is cached. Seeing it means the window has closed.
-AT_MENU = re.compile(r"raid phase = MENU")
+# NO phase-based "window closed" rule. The first version stopped on
+# `raid phase = MENU`, and that fired at 0:00:09 on a real boot -- before the
+# load window had even opened -- because MENU only means "no GameWorld is
+# cached", which is equally true during early boot. It reported INCONCLUSIVE
+# ("reached the MENU before any boot marker") on a boot that went on to render
+# the loading caption for another 60s. run.py's comments already warned that
+# MENU is not "the player is at the menu"; this file walked into it anyway.
+# The window is bounded by --wait alone; a marker either arrives or it does not.
+AT_MENU = None
 
 
 def hostlog(root):
@@ -158,8 +164,11 @@ def main():
     except OSError:
         start_pos = 0
 
+    # stderr, not stdout: with --json, stdout must be the JSON and nothing
+    # else. This line was on stdout and made `json.load` on a --json capture
+    # fail at line 1 -- the capture had happened; the reader could not read it.
     print("watching %s for the boot window (up to %.0fs)..." % (path, a.wait),
-          flush=True)
+          file=sys.stderr, flush=True)
     why, line = tail_for(path, BOOT_MARKERS, AT_MENU, a.wait, start_pos)
 
     if why == "TIMEOUT":

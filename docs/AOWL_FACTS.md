@@ -5628,3 +5628,43 @@ built, so the decline took a working game control with it. A refusal is only
 safe if it is free: do the destructive half (hiding stock UI) only AFTER the
 constructive half is verified, and make the restore path unfaultable -- it must
 not depend on a handle the fault path may already have dropped.
+
+## PostFX subtab: stock list PROVEN untouched; strip lands on row 3 (measured 2026-09-01)
+
+After a real tab switch driven through the game's own toggle
+(`Toggle::set_isOn @0x55BA430`, UNIQUE, tail-jump thunk: fine to CALL, never
+to detour), the backstop reported `STOCK-GEOMETRY PASS: all 7 stock objects
+... same anchoredPosition and rect ... within 1px, read 20+ frames after
+insertion`, and the direct readback of `Graphics Settings/SettingsList` was
+byte-for-byte stock: `anchoredPosition=(0,-20) sizeDelta=(850,755)`. The
+strip is parented to the PANEL (sibling of Content), so the layout group that
+crushed the list in attempts 1-3 is not involved. Fixed.
+
+Remaining: the strip is positioned at the donor's `anchoredPosition=(0,-128)`
+(copied from `Control Settings/Toggles`), which on the Graphics panel lands
+ON TOP of the third row -- Control Settings' content starts lower; Graphics'
+list starts at -20, so there is no free 46px band. Vertical room has to be
+made explicitly: a write we OWN and RESTORE (list y -= H, height -= H, strip
+at -20), with the backstop re-baselined to "stock minus our H".
+
+## Inspector hazards measured while driving the settings screen
+
+* **`tab EXPR` does not type-check its target.** Given an `AnimatedToggle`,
+  then a `CanvasRenderer`, it called `SettingsTab::set_IsSelected` on each and
+  wrote `+0x90` on objects that are not SettingsTabs. No fault, plausible
+  output, `escapes=1` afterwards, and the screen desynced (GRAPHICS highlighted,
+  Game panel showing). P0-shaped: a klass check before the call is required.
+* **`tab` on the CORRECT SettingsTab only moves the highlight.** The screen
+  switches panels on the tab TOGGLE's onValueChanged, not on set_IsSelected.
+  The working lever is `call rva:0x55BA430/4533C941B001E9 v_pb <AnimatedToggle> 1`.
+* **`open GROUPNAME` maps an unknown name to group 0 silently.** `open
+  Graphics` opened Game. `open 1` is Graphics.
+* **`open N` immediately after pressing BACK escaped its guard** (ShowScreen on
+  a screen mid-close). `$settings` survives a close (same pointer after
+  reopen), so it is not a dead-pointer case; a `wait`/`until` gate before
+  ShowScreen after a close avoids it.
+* **`raid phase = MENU` is published at 0:00:09 on a real boot**, long before
+  the load window. It means "no GameWorld cached", not "the player is at the
+  menu". catchcaption.py used it as a window-closed signal and reported
+  INCONCLUSIVE on a boot that went on to render the loading caption for 60s --
+  after run.py's own comments had already warned about exactly this.
