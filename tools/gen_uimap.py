@@ -57,18 +57,22 @@ GROUPS = [
     ("settings-controllers", "EFT.Settings."),
     ("settings-core",        "Bsg.GameSettings"),
     ("spawnable-prefabs",    "UISpawnable"),
+    # Added after docs/NATIVE-CONTROLS.md 7: the map was last generated with
+    # `--only EFT.Settings.`, so it contained NONE of the widget types a mod
+    # author actually instantiates (SettingControl, SettingToggle,
+    # SettingFloatSlider, SettingSelectSlider, SettingDropDown) and no
+    # spawner at all.
+    ("settings-widgets",     "EFT.UI.Settings."),
+    ("settings-toggles",     "EFT.UI.Toggle"),
+    ("ui-spawners",          "UISpawner"),
 ]
 
-INTERESTING = (
-    "spawn", "create", "instantiate", "init", "show", "hide", "close", "open",
-    "select", "apply", "refresh", "rebuild", "bind", "fill", "clear", "toggle",
-    "set_", "get_", "add", "updat",
-)
-
-
-def interesting(name):
-    low = name.lower()
-    return any(k in low for k in INTERESTING)
+# There used to be an INTERESTING name filter here. It was deleted, not
+# widened: it silently hid `BindTo` -- the one method the whole native-control
+# construction path needs -- and a method list filtered by NAME is exactly the
+# "inferred from the name" habit the rest of this tool refuses. Every declared
+# method is now listed, and TRUNCATION (--max-methods) is ANNOUNCED in the
+# Markdown rather than being an invisible `break`.
 
 
 def nim_ident(full):
@@ -84,20 +88,48 @@ def nim_ident(full):
     return s[0].upper() + s[1:] if s else "X"
 
 
-def method_rva(r, t, mi):
-    """The method's RVA, by the SAME per-image methodPointers walk the name
-    index and the sharedness histogram use -- so the three cannot disagree.
-    None when the token's RID is out of range for its image, which is a real
-    state (a method with no generated code) and not an error."""
-    mp = r.MOD.get(r.image_of_type(t))
-    if not mp or not mp[0]:
-        return None
-    base, cnt = mp
-    rid = r.mtoken(mi) & 0xFFFFFF
-    if not (1 <= rid <= cnt):
-        return None
-    va = r.rq(base + (rid - 1) * 8)
-    return (va - r.IB) if va else None
+# The per-image methodPointers walk now lives in ONE place, il2cpp_resolve, so
+# this file, the `typemethods` verb and the sharedness histogram cannot drift
+# apart. (Indexing one image's table with another image's token is a
+# documented past bug.)
+method_rva = ir.method_rva_of
+
+
+def resolve_nim_idents(nim):
+    """Turn ("CONST", ident, rva, sig) placeholders into `const` lines with
+    UNIQUE identifiers.
+
+    C# overloads share a method name, so `Type_Method` is not a key. A
+    collision is never resolved by dropping one or by letting the last write
+    win -- both mean an agent asks for `BindTo` and gets an address whose
+    frame shape is a DIFFERENT method's. Every member of an overload set is
+    renamed (arity suffix, then an index if arity does not separate them) and
+    the set is announced in a comment above it.
+    """
+    counts = {}
+    for e in nim:
+        if isinstance(e, tuple):
+            counts[e[1]] = counts.get(e[1], 0) + 1
+    seen, out = {}, []
+    for e in nim:
+        if not isinstance(e, tuple):
+            out.append(e)
+            continue
+        _, ident, rva, sig, pc = e
+        if counts[ident] > 1:
+            # arity is the METADATA parameterCount@34, not a comma count in a
+            # rendered signature string.
+            cand = "%sArity%d" % (ident, pc)
+            n = seen.get(cand, 0)
+            seen[cand] = n + 1
+            if n:
+                cand = "%s_%d" % (cand, n + 1)
+            out.append("# OVERLOAD SET: %d methods are named %s; each gets a "
+                       "distinct ident, none is 'the' one." % (counts[ident],
+                                                               ident))
+            ident = cand
+        out.append("const %s* = 0x%x'u32   ## %s" % (ident, rva, sig))
+    return out
 
 
 def main():
@@ -107,7 +139,7 @@ def main():
     p.add_argument("gameasm")
     p.add_argument("metadec")
     p.add_argument("--only", default=None)
-    p.add_argument("--max-methods", type=int, default=30)
+    p.add_argument("--max-methods", type=int, default=200)
     p.add_argument("--out-md", default=os.path.join(REPO, "docs", "UI-MAP.md"))
     p.add_argument("--out-nim", default=os.path.join(
         REPO, "aowl", "src", "aowlspt", "uimap.nim"))
@@ -131,6 +163,18 @@ def main():
         return 2
     print("self-check ok: System.String._stringLength@0x10 _firstChar@0x14")
 
+    # SECOND self-check: the base-class walk. It silently answered "no base
+    # class" for every type whose base is a generic instance (and for the
+    # 11,571 whose base is the 0x1c OBJECT intrinsic), which is what made
+    # `UIAnimatedToggleSpawner <- UISpawner`1<AnimatedToggle>` invisible.
+    pok, prows = ir.self_check_parents(r)
+    for tyname, anc, verdict in prows:
+        print("   parent-chain %s <- %s : %s" % (tyname, anc, verdict))
+    if not pok:
+        print("PARENT-CHAIN SELF-CHECK FAILED -- refusing to emit a map; every "
+              "inheritance claim below would be wrong the same way.")
+        return 2
+
     print("building the shared-RVA histogram over all methods...")
     r.shared_rva_counts()
 
@@ -148,7 +192,13 @@ def main():
           "this build land on an RVA with more than one owner, and detouring "
           "one of those fires for every method sharing it. `unknown` means the "
           "address is not in the methodPointers histogram at all -- that is a "
-          "refusal, not 'probably safe'.", ""]
+          "refusal, not 'probably safe'.", "",
+          "A method with RVA `-` and sharedness `no-code` is a GENERIC "
+          "DEFINITION: its bodies are one per INSTANTIATION, in "
+          "`genericMethodPointers`. `-` is not 'no such method' and it is "
+          "certainly not address 0 -- ask "
+          "`il2cpp_resolve.py GAMEASM METADEC genericmethods <Type>::<Name>`.",
+          ""]
 
     nim = ["## uimap.nim -- GENERATED by tools/gen_uimap.py. Do not hand-edit.",
            "##",
@@ -174,25 +224,26 @@ def main():
             except Exception:
                 flds = []
             rows = []
-            for mi in r.type_methods(t):
+            declared = r.type_methods(t)
+            truncated = 0
+            for mi in declared:
                 try:
                     nm = r.mname(mi)
                 except Exception:
                     continue
-                if not interesting(nm):
-                    continue
+                if len(rows) >= a.max_methods:
+                    truncated = len(declared) - len(rows)
+                    break
                 try:
                     sig, pc = r.sig_string(mi, nm)
                 except Exception:
-                    sig, pc = nm, 0
+                    sig, pc = nm, -1
                 rva = method_rva(r, t, mi)
                 if rva is None:
-                    rows.append((nm, sig, None, "no-code", 0))
+                    rows.append((nm, sig, pc, None, "no-code", 0))
                     continue
                 state, n = r.sharedness(rva)
-                rows.append((nm, sig, rva, state, n))
-                if len(rows) >= a.max_methods:
-                    break
+                rows.append((nm, sig, pc, rva, state, n))
             if not flds and not rows:
                 continue
             ntypes += 1
@@ -222,9 +273,11 @@ def main():
                                  " *(static)*" if f["static"] else ""))
                 md.append("")
             if rows:
+                md.append("%d method(s) declared." % len(declared))
+                md.append("")
                 md.append("| RVA | sharedness | signature |")
                 md.append("|---|---|---|")
-                for nm, sig, rva, state, n in rows:
+                for nm, sig, pc, rva, state, n in rows:
                     if state == "unique":
                         nuniq += 1
                     elif state == "shared":
@@ -236,16 +289,40 @@ def main():
                         state if state != "shared" else "**shared x%d**" % n,
                         sig))
                     if state == "unique" and rva is not None:
-                        nim.append("const %s* = 0x%x'u32   ## %s"
-                                   % (nim_ident(full + "_" + nm), rva, sig))
+                        # A PLACEHOLDER, not the final line: OVERLOADS collide
+                        # on this identifier (14 of them did on this build --
+                        # `SettingFloatSlider.BindTo` alone has two, at
+                        # 0x16fb4c0 and 0x16fb810). Emitting both as the same
+                        # `const` is a duplicate definition AND, if it were
+                        # ever accepted, a silent pick of one overload's
+                        # address for a call frame of the other. Names are
+                        # made unique in one pass at the end.
+                        nim.append(("CONST", nim_ident(full + "_" + nm),
+                                    rva, sig, pc))
+                if truncated:
+                    # An invisible `break` reads as "that is all there is".
+                    md.append("")
+                    md.append("**TRUNCATED: %d further declared method(s) are "
+                              "NOT listed** (--max-methods=%d). This is not a "
+                              "statement that they do not exist."
+                              % (truncated, a.max_methods))
                 md.append("")
         md.append("")
         nim.append("")
 
+    nim = resolve_nim_idents(nim)
+
+    # Line endings are pinned EXPLICITLY. Both generated files are tracked and
+    # `.gitattributes` says `* -text`, so whatever this writes is what is
+    # committed; leaving it to the platform default would make a regeneration
+    # on a non-Windows box a 700-line whole-file diff against the CRLF copy
+    # already in the tree.
     os.makedirs(os.path.dirname(a.out_md), exist_ok=True)
-    open(a.out_md, "w", encoding="utf-8").write("\n".join(md))
+    with open(a.out_md, "w", encoding="utf-8", newline="\r\n") as fh:
+        fh.write("\n".join(md))
     os.makedirs(os.path.dirname(a.out_nim), exist_ok=True)
-    open(a.out_nim, "w", encoding="utf-8").write("\n".join(nim) + "\n")
+    with open(a.out_nim, "w", encoding="utf-8", newline="\r\n") as fh:
+        fh.write("\n".join(nim) + "\n")
 
     print("wrote %s and %s" % (a.out_md, a.out_nim))
     print("  %d type(s);  methods: %d unique (emitted), %d SHARED (withheld), "

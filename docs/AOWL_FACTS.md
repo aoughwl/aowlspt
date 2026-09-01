@@ -5358,3 +5358,59 @@ GUTTED ones and never touches a branch. FALSIFIED, not assumed: a synthetic
 gutted worktree was created and the tool detected it (1,642 deletions, exit 1),
 pruned it, and returned to exit 0. Eight VOLATILE worktrees remain and are
 named by the tool.
+
+## P0 FIXED: `Resolver.parent_type` answered "no base class" for 13,088 of 29,835
+
+MEASURED 2026-09-01 over all 31,282 typedefs' `parentIndex`. The old code
+accepted only `Il2CppTypeEnum` 0x11/0x12 for `types[typedef.parentIndex].data`:
+
+| base type enum | count |
+|---|---|
+| 0x12 CLASS       | 16,747 |
+| **0x1c OBJECT**  | **11,571** |
+| **0x15 GENERICINST** | **1,517** |
+| no base (parentIndex < 0) | 1,447 |
+
+So it silently returned None for every type whose base is `System.Object` or a
+generic instance -- including `System.String <- System.Object`. "Does X derive
+from Y" therefore answered WRONGLY and CONFIDENTLY, which is the worst failure
+mode this project produces. It was found by an agent doing real work, not by
+reading the code.
+
+FIX: `typedef_of_type_va` accepts `TE_TYPEDEF = (0x11, 0x12, 0x0e, 0x1c)` and
+dereferences 0x15 through `Il2CppGenericClass.type` to the generic DEFINITION
+index; plus `parent_chain` / `derives_from`. Gated by a new `verify-parents`
+self-check that `gen_uimap.py` refuses to emit without -- and which correctly
+FAILED before the 0x1c fix. Types with an empty chain: 1,447, exactly the
+`parentIndex < 0` set.
+
+`EFT.UI.UIAnimatedToggleSpawner` is the ONLY subclass of `UISpawner`1` on this
+build (re-derived independently over all 31,282 typedefs).
+
+## Generic method instantiations ARE reachable offline
+
+`Il2CppCodeRegistration.genericMethodPointers`: count=206,077 @ VA
+0x185df3460, discovered BY PROPERTY (the array must point into the `il2cpp` PE
+section), not by a hardcoded offset. `genericMethodTable` stride is **16 bytes,
+not 12** -- 12 puts 3,718/5,000 rows out of range, 16 puts 0 of all 206,826.
+
+This unblocks what was previously reported as impossible: `SettingDropDown::
+BindTo<T>` has 7 instantiations (AspectRatio+EftResolution share 0x2b811a0;
+byte 0x2b81440; int 0x2b81640; Int32Enum 0x2b81840; object 0x2b81a50;
+fully-shared 0x2b81c60). 0x2b81640 disassembles as a real prologue
+(`48 89 5C 24 08 ...`), not the universal `C2 00 00` stub.
+
+CAVEAT, stated by the tool: `Resolver.sharedness` answers UNKNOWN for every
+genericMethodPointers RVA -- its histogram covers per-image methodPointers
+only. That is a REFUSAL, not "unshared". Duplication within
+genericMethodPointers is reported separately as `body-shared-with-N`.
+
+## Generated bindings: C# overloads collide as Nim identifiers
+
+14 identifiers collided in the first `uimap.nim`, because overloads share a
+name -- e.g. `SettingFloatSlider.BindTo` at 0x16fb4c0 (arity 3) and 0x16fb810
+(arity 4) both emitted as one const. That is a duplicate definition and, worse,
+one overload's address under the other's frame shape. Overload sets are now
+suffixed by metadata `parameterCount`. VERIFIED: 595 consts, 0 duplicates under
+Nim's own case/underscore-insensitive normalisation, 0 fabricated `0x0` RVAs,
+every const carries its derived signature. NOT YET COMPILED.

@@ -154,6 +154,27 @@ guessed at.
         # used to answer "no method name contains '16622'" for what was plainly
         # a TYPE INDEX. Use `type 16622`, or `methods --name 16622` if you
         # really did mean the digits.
+  il2cpp_resolve.py <GameAssembly.dll> <global-metadata.dec.dat> typemethods <Type>
+                                       [--inherited]
+        # every method DECLARED BY a type -- which `methods` cannot answer,
+        # because it matches METHOD NAMES only. Per method: DERIVED signature
+        # (returnType@8 / parameterStart@16 / parameterCount@34, never
+        # inferred from the name), arity, RVA from the PER-IMAGE
+        # methodPointers, MethodAttributes, thunk shape, and the three-state
+        # sharedness verdict. `NO-CODE` is printed for an uninstantiated
+        # generic method; it is not address 0.
+  il2cpp_resolve.py <GameAssembly.dll> <global-metadata.dec.dat> genericmethods <Type>[::<Name>]
+        # the INSTANTIATED generic methods -- the bodies `typemethods` reports
+        # as NO-CODE. One address PER INSTANTIATION, with its type arguments,
+        # from Il2CppCodeRegistration.genericMethodPointers via
+        # genericMethodTable -> methodSpecs. Gated on `verify-generics`; on a
+        # failed self-check it prints NO address at all.
+  il2cpp_resolve.py <GameAssembly.dll> <global-metadata.dec.dat> verify-generics
+        # the four-property self-check behind `genericmethods`, including a
+        # NEGATIVE control (a non-generic method must have zero rows).
+  il2cpp_resolve.py <GameAssembly.dll> <global-metadata.dec.dat> verify-parents
+        # the base-class walk self-check, including a type whose base is a
+        # GENERIC INSTANCE. An EMPTY parent chain FAILS loudly.
   il2cpp_resolve.py <GameAssembly.dll> <global-metadata.dec.dat> holdersof <Type>
                                        [--limit=N] [--fields|--getters] [--exact]
         # CAPABILITY-FIRST: who HOLDS a value of this type. Prints FIELD rows
@@ -884,20 +905,236 @@ class Resolver:
                         self.field_typename(ti)))
         return out
 
+    # Il2CppTypeEnums whose `data` field IS a typeDefinitionIndex. MEASURED on
+    # this build over all 31,282 typedefs' parentIndex: 16,747 bases are 0x12
+    # CLASS, 11,571 are 0x1c OBJECT (all 11,571 resolve to System.Object) and
+    # 1,517 are 0x15 GENERICINST; 1,447 types have no base at all. The old
+    # (0x11, 0x12) test therefore dropped 13,088 of 29,835 real base classes --
+    # not just the generic ones -- and answered None, i.e. "no base class".
+    TE_TYPEDEF = (0x11, 0x12, 0x0e, 0x1c)
+
+    # ---- instantiated GENERIC METHODS ------------------------------------
+    # A generic method definition (`SettingDropDown::BindTo<T>`) has NO entry
+    # in its image's methodPointers table -- `typemethods` correctly prints
+    # NO-CODE for it. The compiled bodies are one per INSTANTIATION and live
+    # in `Il2CppCodeRegistration.genericMethodPointers`, indexed through
+    # `Il2CppMetadataRegistration.genericMethodTable` -> `methodSpecs`.
+    #
+    #   Il2CppGenericMethodFunctionsDefinitions (16 bytes, MEASURED -- a
+    #     12-byte stride puts 3,718 of the first 5,000 rows out of range,
+    #     16 puts ZERO of all 206,826 out of range):
+    #       int32 genericMethodIndex   -> methodSpecs
+    #       int32 methodIndex          -> genericMethodPointers
+    #       int32 invokerIndex         -> invokerPointers
+    #       int32 adjustorThunk
+    #   Il2CppMethodSpec (12 bytes):
+    #       int32 methodDefinitionIndex   int32 classIndexIndex
+    #       int32 methodIndexIndex        (the last two index genericInsts)
+    #
+    # NOTHING here is trusted without `self_check_generics`, and the CODE
+    # REGISTRATION is DISCOVERED by a property (its array must point into the
+    # `il2cpp` section) rather than by a hardcoded struct offset.
+
+    def _find_generic_method_pointers(self):
+        """(count, va) of genericMethodPointers, or None -- never a guess.
+
+        Located from the codeGenModules array (the one pointer array in
+        .data/.rdata whose entries are structs beginning with a "*.dll"
+        string): Il2CppCodeRegistration ends with that array, so the
+        genericMethodPointers pair sits a short way back. Candidate pairs are
+        accepted ONLY if the count is within 4x of genericMethodTableCount AND
+        a 256-entry sample lands overwhelmingly in the `il2cpp` section, which
+        is where generated bodies live.
+        """
+        if hasattr(self, "_GMP"):
+            return self._GMP
+        self._ensure_fields()
+        self._GMP = None
+        gmt_cnt = struct.unpack_from("<I", self.b, self.v2f(self.MREG + 0x20))[0]
+
+        def looks_module(pv):
+            if not pv or self.v2f(pv) is None:
+                return False
+            nmp = self.rq(pv)
+            if nmp is None:
+                return False
+            nm = self.cstr_va(nmp)
+            return bool(nm and nm.endswith(".dll"))
+
+        sites = []
+        for name, vs, vz, raw, rz in self.SEC:
+            if name not in (".data", ".rdata"):
+                continue
+            for fo in range(raw, raw + (rz & ~7), 8):
+                pv = struct.unpack_from("<Q", self.b, fo)[0]
+                if looks_module(pv):
+                    sites.append(self.f2v(fo))
+        if not sites:
+            return None
+        arr = sites[0]                       # base of the codeGenModules array
+        refs = []
+        for name, vs, vz, raw, rz in self.SEC:
+            if name not in (".data", ".rdata"):
+                continue
+            for fo in range(raw, raw + (rz & ~7), 8):
+                if struct.unpack_from("<Q", self.b, fo)[0] == arr:
+                    refs.append(self.f2v(fo))
+        for ref in refs:
+            for delta in range(-0x100, 0, 8):
+                va = ref + delta
+                f = self.v2f(va)
+                if f is None:
+                    continue
+                cnt = struct.unpack_from("<I", self.b, f)[0]
+                ptr = self.rq(va + 8)
+                if not ptr or self.v2f(ptr) is None:
+                    continue
+                if not (gmt_cnt // 4 <= cnt <= gmt_cnt * 4):
+                    continue
+                good = tot = 0
+                for i in range(0, min(cnt, 4096), 16):
+                    q = self.rq(ptr + i * 8)
+                    if not q:
+                        continue
+                    tot += 1
+                    if self.section_of_rva(q - self.IB)[0] == "il2cpp":
+                        good += 1
+                if tot >= 32 and good >= tot * 0.95:
+                    self._GMP = (cnt, ptr)
+                    return self._GMP
+        return None
+
+    def _generic_index(self):
+        """{method_definition_index: [(rva_or_None, class_inst_idx,
+        method_inst_idx)]} for every instantiation in genericMethodTable."""
+        if hasattr(self, "_GIDX"):
+            return self._GIDX
+        found = self._find_generic_method_pointers()
+        self._GIDX = {}
+        if not found:
+            return self._GIDX
+        gmp_cnt, gmp = found
+        gmt_cnt = struct.unpack_from("<I", self.b, self.v2f(self.MREG + 0x20))[0]
+        gmt = self.rq(self.MREG + 0x28)
+        ms = self.rq(self.MREG + 0x48)
+        ms_cnt = struct.unpack_from("<I", self.b, self.v2f(self.MREG + 0x40))[0]
+        gfo, mfo = self.v2f(gmt), self.v2f(ms)
+        self._GMT_ROWS = gmt_cnt
+        self._GMT_BAD = 0
+        for i in range(gmt_cnt):
+            gmi, mi, _inv, _adj = struct.unpack_from("<iiii", self.b, gfo + i*16)
+            if not (0 <= gmi < ms_cnt and 0 <= mi < gmp_cnt):
+                self._GMT_BAD += 1
+                continue
+            md, ci, mii = struct.unpack_from("<iii", self.b, mfo + gmi*12)
+            va = self.rq(gmp + mi*8)
+            self._GIDX.setdefault(md, []).append(
+                ((va - self.IB) if va else None, ci, mii))
+        return self._GIDX
+
+    def generic_inst_args(self, idx):
+        """The type arguments of genericInsts[idx], or None for -1."""
+        if idx is None or idx < 0:
+            return None
+        gi = self.rq(self.MREG + 0x18)
+        p = self.rq(gi + idx*8)
+        if not p or self.v2f(p) is None:
+            return None
+        argc = struct.unpack_from("<Q", self.b, self.v2f(p))[0]
+        argv = self.rq(p + 8)
+        if not argv or argc > 32:
+            return None
+        return [self._typename_va(self.rq(argv + k*8)) for k in range(argc)]
+
+    def generic_instantiations(self, mi):
+        """[(rva, [class args] or None, [method args] or None)] for method
+        definition index mi. EMPTY for a non-generic method, which is a real
+        answer -- a non-generic method's code is in methodPointers."""
+        out = []
+        for rva, ci, mii in self._generic_index().get(mi, []):
+            out.append((rva, self.generic_inst_args(ci),
+                        self.generic_inst_args(mii)))
+        return out
+
+    def typedef_of_type_va(self, tva):
+        """typeDefinitionIndex behind an `Il2CppType*`, or None.
+
+        Handles THREE type enums, not two:
+          0x11 VALUETYPE / 0x12 CLASS -- `data` IS the typeDefinitionIndex.
+          0x15 GENERICINST            -- `data` is an `Il2CppGenericClass*`;
+                                         its `type` field points at the
+                                         Il2CppType of the GENERIC DEFINITION,
+                                         whose data is the index.
+
+        Dropping 0x15 is what made `parent_type` answer None -- i.e. "no base
+        class" -- for every type whose base is a generic instance, e.g.
+        ``EFT.UI.UIAnimatedToggleSpawner <- UISpawner`1<AnimatedToggle>``.
+        A "does X derive from Y" answer of False that is really "I did not
+        look" is the confidently-wrong-answer class of bug (CLAUDE.md 9b), so
+        this returns the generic DEFINITION index -- the only thing metadata
+        actually knows -- and never invents an instantiation.
+        """
+        if tva is None:
+            return None
+        fo = self.v2f(tva)
+        if fo is None:
+            return None
+        te = (struct.unpack_from("<I", self.b, fo + 8)[0] >> 16) & 0xFF
+        data = self.rq(tva)
+        if data is None:
+            return None
+        if te in self.TE_TYPEDEF:
+            return data if 0 <= data < self.NTYPES else None
+        if te == 0x15:
+            # Il2CppGenericClass { Il2CppType* type; GenericContext; ... }
+            gd = self.rq(data)
+            if gd is None:
+                return None
+            gfo = self.v2f(gd)
+            if gfo is None:
+                return None
+            gte = (struct.unpack_from("<I", self.b, gfo + 8)[0] >> 16) & 0xFF
+            if gte not in (0x11, 0x12):
+                return None
+            gdata = self.rq(gd)
+            return gdata if (gdata is not None
+                             and 0 <= gdata < self.NTYPES) else None
+        return None
+
     def parent_type(self, t):
-        """typeDefinitionIndex of t's base class, or None."""
+        """typeDefinitionIndex of t's base class, or None.
+
+        A GENERIC-INSTANCE base (`Foo : Bar`1<Baz>`) resolves to ``Bar`1``,
+        the generic DEFINITION -- see `typedef_of_type_va`. Its field layout
+        is `GENERIC` (no offsets exist offline); its METHOD list is real.
+        """
         self._ensure_fields()
         par = struct.unpack_from("<i", self.m, self.TD_OFF + t*self.TDS + 16)[0]
         if par < 0:
             return None
-        tva = self.rq(self.TYPES_PTR + par*8)
-        if tva is None:
-            return None
-        bits = struct.unpack_from("<I", self.b, self.v2f(tva) + 8)[0]
-        if ((bits >> 16) & 0xFF) not in (0x11, 0x12):
-            return None
-        data = self.rq(tva)
-        return data if (data is not None and 0 <= data < self.NTYPES) else None
+        return self.typedef_of_type_va(self.rq(self.TYPES_PTR + par*8))
+
+    def parent_chain(self, t):
+        """[t, base, base-of-base, ...] as typeDefinitionIndexes, cycle-safe."""
+        chain, cur, seen = [], t, set()
+        while cur is not None and cur not in seen:
+            seen.add(cur)
+            chain.append(cur)
+            cur = self.parent_type(cur)
+        return chain
+
+    def derives_from(self, t, ancestor_name):
+        """Does t derive from the named type? TWO outcomes only when the walk
+        actually completed: the chain always terminates at System.Object (or at
+        t itself for System.Object), so an EMPTY-but-for-t chain on a type that
+        is not System.Object means the walk failed and is reported by
+        `self_check_parents`, not silently as False."""
+        for ct in self.parent_chain(t)[1:]:
+            ns, nm = self.tname(ct)
+            full = (ns + "." + nm) if ns else nm
+            if full == ancestor_name or nm == ancestor_name:
+                return True
+        return False
 
     def all_fields(self, t):
         """Fields including inherited: [(declaring_full, name, off, static, ty)],
@@ -1061,9 +1298,10 @@ def const_check(R):
     return ok, rows
 
 
-VERBS = ("find", "methods", "member", "type", "bytes", "shared", "verify-be",
-         "fields", "verify-fields", "enum", "verify-consts", "settings-table",
-         "holdersof")
+VERBS = ("find", "methods", "member", "type", "typemethods", "bytes",
+         "shared", "verify-be", "fields", "verify-fields", "verify-parents",
+         "enum", "verify-consts", "settings-table", "holdersof",
+         "genericmethods", "verify-generics")
 
 # ---- MethodAttributes ------------------------------------------------------
 # ECMA-335 II.23.1.10. Only the bits that change a BIND DECISION are decoded;
@@ -1217,8 +1455,14 @@ def cmd_member(R, argv):
                      img))
             print("    attrs=%s" % decode_mattrs(R.mflags(mi)))
             if rva is None:
-                print("    UNBINDABLE: no entry in this image's "
-                      "Il2CppCodeGenModule.methodPointers.")
+                print("    UNBINDABLE at a single address: no entry in this "
+                      "image's Il2CppCodeGenModule.methodPointers.")
+                ninst = len(R.generic_instantiations(mi))
+                if ninst:
+                    print("    ...because it is GENERIC: %d instantiated "
+                          "bodie(s) exist, one per type argument. Use "
+                          "`genericmethods %s::%s`."
+                          % (ninst, full, nm))
                 continue
             sec, fo, _ = R.section_of_rva(rva)
             th = R.classify_thunk(R.code_bytes(rva, 32)) if fo is not None else None
@@ -1375,6 +1619,300 @@ def cmd_holdersof(R, argv):
     print("-- %d field(s) + %d zero-arg getter(s) of a type %s %r (all %d "
           "types searched EXHAUSTIVELY)"
           % (nf, ng, "named" if exact else "matching", want_raw, R.NTYPES))
+    return 0
+
+
+PARENT_SELF_CHECK = [
+    # (derived type, expected ancestor, why it is the oracle)
+    ("EFT.UI.UIAnimatedToggleSpawner", "UISpawner`1",
+     "base class is a GENERIC INSTANCE (UISpawner`1<AnimatedToggle>); this is "
+     "the case parent_type used to answer None for"),
+    ("System.String", "System.Object",
+     "the ordinary 0x12 CLASS path -- a control, so a pass here plus a fail "
+     "above means the generic path specifically is broken"),
+]
+
+
+def self_check_parents(R):
+    """PASS/FAIL/INCONCLUSIVE for the base-class walk.
+
+    An EMPTY parent chain is the failure this exists to catch: it reads as
+    "X does not derive from Y" and is really "I did not look". Every row is
+    checked BOTH ways -- the ancestor must be reached AND the chain must be
+    longer than one -- so a walk that silently stops cannot pass.
+    """
+    rows, ok = [], True
+    for tyname, anc, _why in PARENT_SELF_CHECK:
+        try:
+            t = R.find_one(tyname)
+        except SystemExit:
+            rows.append((tyname, anc,
+                         "INCONCLUSIVE: type not found on this build"))
+            ok = False
+            continue
+        chain = R.parent_chain(t)
+        if len(chain) < 2:
+            rows.append((tyname, anc,
+                         "FAIL: parent chain is EMPTY (len=%d) -- the walk "
+                         "did not look" % len(chain)))
+            ok = False
+            continue
+        names = []
+        for c in chain:
+            ns, nm = R.tname(c)
+            names.append((ns + "." + nm) if ns else nm)
+        hit = R.derives_from(t, anc)
+        rows.append((tyname, anc,
+                     ("PASS" if hit else "FAIL") + ": " + " <- ".join(names)))
+        ok = ok and hit
+    return ok, rows
+
+
+def method_rva_of(r, t, mi):
+    """The method's RVA via the PER-IMAGE Il2CppCodeGenModule.methodPointers,
+    indexed by (token & 0xFFFFFF) - 1. Using another image's table for a type
+    is a documented past bug, so there is exactly ONE implementation of this
+    walk and gen_uimap.py imports it. None means the RID is out of range for
+    its image -- a real state (no generated code), not an error."""
+    mp = r.MOD.get(r.image_of_type(t))
+    if not mp or not mp[0]:
+        return None
+    base, cnt = mp
+    rid = r.mtoken(mi) & 0xFFFFFF
+    if not (1 <= rid <= cnt):
+        return None
+    va = r.rq(base + (rid - 1) * 8)
+    return (va - r.IB) if va else None
+
+
+def self_check_generics(R):
+    """PASS/FAIL/INCONCLUSIVE for the generic-method-instantiation walk.
+
+    Four properties, each of which a wrong table would break. This refuses
+    rather than printing a plausible address: an address that is merely
+    well-formed is exactly the failure mode this repo treats as worst-case.
+    """
+    rows, ok = [], True
+
+    found = R._find_generic_method_pointers()
+    if not found:
+        return False, [("genericMethodPointers", "INCONCLUSIVE: not located on "
+                        "this build -- refusing to print any instantiation "
+                        "address")]
+    cnt, va = found
+    rows.append(("genericMethodPointers",
+                 "FOUND count=%d @ VA 0x%x" % (cnt, va)))
+
+    idx = R._generic_index()
+    bad = getattr(R, "_GMT_BAD", -1)
+    rows.append(("genericMethodTable rows in range",
+                 ("PASS" if bad == 0 else "FAIL") +
+                 ": %d of %d rows out of range" % (bad, getattr(R, "_GMT_ROWS", 0))))
+    ok = ok and bad == 0
+
+    # every method that HAS instantiations must itself be generic, or be
+    # declared by a generic type. A table read at the wrong stride sprays
+    # ordinary methods across this set.
+    nong = 0
+    for k in idx:
+        gc = struct.unpack_from("<i", R.m, R.M_OFF + k*R.MS + 20)[0]
+        dt = struct.unpack_from("<i", R.m, R.M_OFF + k*R.MS + 4)[0]
+        if gc < 0 and not R.is_generic_definition(dt):
+            nong += 1
+    rows.append(("every owner is generic",
+                 ("PASS" if nong == 0 else "FAIL") +
+                 ": %d of %d method definitions are neither a generic method "
+                 "nor declared by a generic type" % (nong, len(idx))))
+    ok = ok and nong == 0
+
+    # NEGATIVE control: an ordinary non-generic method must have ZERO rows.
+    t = R.find_one("System.String")
+    ctl = [m for m in R.type_methods(t) if R.mname(m) == "get_Length"]
+    n = sum(len(idx.get(m, [])) for m in ctl)
+    rows.append(("negative control System.String::get_Length",
+                 ("PASS" if n == 0 else "FAIL") + ": %d instantiation row(s)" % n))
+    ok = ok and n == 0
+
+    # every sampled body must live in the generated-code section.
+    tot = good = 0
+    for k in list(idx)[:400]:
+        for rva, _c, _m in idx[k]:
+            if rva is None:
+                continue
+            tot += 1
+            if R.section_of_rva(rva)[0] == "il2cpp":
+                good += 1
+    rows.append(("sampled bodies in the `il2cpp` section",
+                 ("PASS" if tot and good == tot else
+                  "FAIL" if tot else "INCONCLUSIVE: nothing sampled") +
+                 ": %d of %d" % (good, tot)))
+    ok = ok and tot and good == tot
+    return bool(ok), rows
+
+
+def cmd_genericmethods(R, argv):
+    """Instantiated generic METHODS: `<Type>` or `<Type>::<Name>`.
+
+    This is the table `typemethods` honestly reports as NO-CODE. There is one
+    compiled body per instantiation, so there is no single "the" address --
+    every instantiation is printed with its type arguments.
+
+    Sharedness is reported as it is measured, which is NOT the same instrument
+    as for ordinary methods: `Resolver.sharedness` is a histogram over the
+    per-image methodPointers tables, and a generic body is not in those, so it
+    answers `unknown` -- a REFUSAL, not "safe to detour". What CAN be measured
+    here is duplication WITHIN genericMethodPointers, and it is real: on this
+    build `SettingDropDown::BindTo<AspectRatio>` and `BindTo<EftResolution>`
+    are the SAME address (0x2b811a0), because IL2CPP shares one body between
+    instantiations of identical layout. That count is printed as
+    `body-shared-with-N-instantiations`.
+    """
+    ok, rows = self_check_generics(R)
+    for label, verdict in rows:
+        print("   selfcheck %-46s %s" % (label, verdict))
+    if not ok:
+        print("GENERIC-METHOD SELF-CHECK FAILED -- refusing to print any "
+              "instantiation address from this build.")
+        return 1
+    args = [a for a in argv if not a.startswith("--")]
+    if not args:
+        sys.exit("usage error: `genericmethods` needs <Type> or <Type>::<Name>")
+    spec = args[0]
+    tyname, _, want = spec.partition("::")
+    t = R.find_one(tyname)
+    idx = R._generic_index()
+    dup = {}
+    for k in idx:
+        for rva, _c, _m in idx[k]:
+            if rva is not None:
+                dup[rva] = dup.get(rva, 0) + 1
+    ns, nm = R.tname(t)
+    full = (ns + "." + nm) if ns else nm
+    print("GENERIC INSTANTIATIONS declared by %s%s"
+          % (full, ("::" + want) if want else ""))
+    total = 0
+    for mi in R.type_methods(t):
+        mn = R.mname(mi)
+        if want and mn != want:
+            continue
+        insts = R.generic_instantiations(mi)
+        if not insts:
+            continue
+        try:
+            sig, _pc = R.sig_string(mi, mn)
+        except Exception:
+            sig = mn
+        print("  %s  -- %d instantiation(s)" % (sig, len(insts)))
+        for rva, ca, ma in sorted(insts, key=lambda x: (x[0] or 0)):
+            total += 1
+            print("     RVA=%-11s class<%s> method<%s>  %s"
+                  % ("0x%x" % rva if rva is not None else "-",
+                     ",".join(ca) if ca else "",
+                     ",".join(ma) if ma else "",
+                     "body-shared-with-%d-instantiations" % dup.get(rva, 0)
+                     if rva is not None and dup.get(rva, 0) > 1
+                     else "body-unique-in-genericMethodPointers"
+                     if rva is not None else "NO BODY in the table"))
+    if total == 0:
+        print("  NO instantiated generic method on this type. That is a real "
+              "answer for a non-generic type; for a generic one it means the "
+              "compiler emitted no instantiation, NOT that a call site exists "
+              "at some other address.")
+    else:
+        print("-- %d instantiation(s). Sharedness by the ordinary instrument "
+              "(`shared <RVA>`) will say UNKNOWN for these: generic bodies are "
+              "not in the per-image methodPointers histogram. That is a "
+              "refusal, not 'unshared'." % total)
+    return 0
+
+
+def cmd_typemethods(R, argv):
+    """Every method DECLARED BY a type, with a DERIVED signature, its RVA and
+    a three-state sharedness verdict.
+
+    This exists because `methods <substr>` matches METHOD NAMES only, so
+    `methods EFT.UI.Settings.SettingToggle` printed a zero-hit "searched
+    EXHAUSTIVELY" that reads as "this type has no methods" -- a statement
+    about a TYPE that the search never made.
+
+    Signatures are DERIVED from metadata (returnType@8, parameterStart@16,
+    parameterCount@34), never inferred from the name. `--inherited` walks the
+    base chain as well (base classes first), which now includes generic-
+    instance bases.
+    """
+    args = [a for a in argv if not a.startswith("--")]
+    if not args:
+        sys.exit("usage error: `typemethods` needs a type name or index.\n"
+                 "  il2cpp_resolve.py GAMEASM METADEC typemethods <Type> "
+                 "[--inherited]")
+    want_inherited = "--inherited" in argv
+    try:
+        t = int(args[0], 0)
+    except ValueError:
+        t = R.find_one(args[0])
+    chain = R.parent_chain(t) if want_inherited else [t]
+    total = uniq = shared = unknown = nocode = 0
+    for ct in reversed(chain):
+        ns, nm = R.tname(ct)
+        full = (ns + "." + nm) if ns else nm
+        ms = R.type_methods(ct)
+        print("TYPE %d %s  image=%s  (%d declared method(s))"
+              % (ct, full, R.image_of_type(ct), len(ms)))
+        if ct != t:
+            print("   [inherited from this base class]")
+        for mi in ms:
+            try:
+                mname = R.mname(mi)
+            except Exception:
+                continue
+            try:
+                sig, pc = R.sig_string(mi, mname)
+            except Exception:
+                sig, pc = mname + "(?)", -1
+            rva = method_rva_of(R, ct, mi)
+            total += 1
+            if rva is None:
+                nocode += 1
+                print("   %-64s arity=%-3s RVA=-           sharedness=NO-CODE"
+                      % (sig, pc if pc >= 0 else "?"))
+                print("      no methodPointers entry: an uninstantiated "
+                      "generic method, or abstract/extern. NOT address 0.")
+                ninst = len(R.generic_instantiations(mi))
+                if ninst:
+                    print("      GENERIC: %d instantiated bodie(s) exist, one "
+                          "per type argument -- `genericmethods %s::%s`."
+                          % (ninst, full, mname))
+                continue
+            state, n = R.sharedness(rva)
+            if state == "unique":
+                uniq += 1
+            elif state == "shared":
+                shared += 1
+            else:
+                unknown += 1
+            print("   %-64s arity=%-3s RVA=0x%-9x sharedness=%s"
+                  % (sig, pc if pc >= 0 else "?", rva,
+                     state.upper() if state != "shared" else "SHARED x%d" % n))
+            print("      attrs=%s" % decode_mattrs(R.mflags(mi)))
+            note = R.annotate_rva(rva)
+            sn = R.sharedness_note(rva)
+            if sn:
+                note = (note + "  " + sn).strip()
+            if note.strip():
+                print("      " + note.strip())
+        print("")
+    print("-- %d method(s) DECLARED BY %s%s: %d unique, %d SHARED (correct to "
+          "CALL, never to detour by name), %d unknown (a refusal, not "
+          "'probably safe'), %d no-code"
+          % (total, args[0], " and its base chain" if want_inherited else "",
+             uniq, shared, unknown, nocode))
+    if not want_inherited:
+        par = R.parent_type(t)
+        if par is not None:
+            pns, pnm = R.tname(par)
+            print("   base class: %s -- its methods are NOT listed here; "
+                  "re-run with --inherited."
+                  % ((pns + "." + pnm) if pns else pnm))
     return 0
 
 
@@ -1538,11 +2076,40 @@ def main():
                 print("It DOES exist at %d other aritie(s). Re-run without "
                       "--argc to see them." % arity_rejected)
             else:
-                print("no method name contains %r (searched all %d types "
-                      "EXHAUSTIVELY)" % (raw_needle, R.NTYPES))
+                print("no METHOD NAME contains %r (searched the method "
+                      "names of all %d types EXHAUSTIVELY)"
+                      % (raw_needle, R.NTYPES))
+                print("NOTE: `methods` matches METHOD NAMES ONLY. This is NOT "
+                      "a statement about a TYPE -- if %r names a type, this "
+                      "zero-hit says nothing about whether it has methods."
+                      % raw_needle)
+                if "." in raw_needle:
+                    print("      For every method DECLARED BY a type, use:")
+                    print("        ... typemethods %s" % raw_needle)
         elif argc is not None and arity_rejected:
             print("-- %d hit(s) at arity %d; %d more rejected by --argc"
                   % (hits, argc, arity_rejected))
+    elif cmd == "typemethods":
+        sys.exit(cmd_typemethods(R, sys.argv[4:]))
+    elif cmd == "genericmethods":
+        sys.exit(cmd_genericmethods(R, sys.argv[4:]))
+    elif cmd == "verify-generics":
+        ok, rows = self_check_generics(R)
+        for label, verdict in rows:
+            print("   %-46s %s" % (label, verdict))
+        print("GENERIC-METHOD SELF-CHECK PASSED" if ok
+              else "GENERIC-METHOD SELF-CHECK FAILED")
+        if not ok:
+            sys.exit(1)
+    elif cmd == "verify-parents":
+        ok, rows = self_check_parents(R)
+        for tyname, anc, verdict in rows:
+            print("   %-34s derives from %-16s %s" % (tyname, anc, verdict))
+        print("PARENT-CHAIN SELF-CHECK PASSED" if ok
+              else "PARENT-CHAIN SELF-CHECK FAILED -- base-class answers from "
+                   "this build are NOT trustworthy")
+        if not ok:
+            sys.exit(1)
     elif cmd == "type":
         args = [a for a in sys.argv[4:] if not a.startswith("--")]
         want_shared = "--shared" in sys.argv[4:]

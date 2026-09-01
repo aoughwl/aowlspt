@@ -481,6 +481,9 @@ pointer, or a screen that never opened is INCONCLUSIVE, never PASS.
 
 ## 7. Tooling gaps hit while writing this (raising immediately, per CLAUDE.md §10)
 
+**STATUS 2026-09-01 (tooling agent): 1, 2, 3 and 5 are FIXED; 4 is not.** `il2cpp_resolve.py` gained `genericmethods <Type>[::<Name>]` (gated on a new `verify-generics` self-check with a negative control) and `typemethods <Type>[--inherited]`; `parent_type` now resolves 0x15 GENERICINST *and* 0x1c OBJECT bases (it was dropping 13,088 of 29,835 real base classes, not only the generic ones) and is gated by `verify-parents`; `gen_uimap.py` GROUPS now covers `EFT.UI.Settings.`, `EFT.UI.Toggle` and `UISpawner`, the INTERESTING name filter is gone, and the map is regenerated. `SettingDropDown::BindTo<T>` has 7 instantiated bodies; `SettingToggle::BindTo` is 0x16fd0d0 (unique). Item 4 (dict-vs-tuple field APIs) was left alone.
+
+
 1. **`il2cpp_resolve.py` has no verb for generic-method instantiations.** Every
    `CreateControl<T>` / `BindTo<T>` / `GameSetting<T>` member resolves to `no-code`, so the
    single most important method in the construction path (§3 step 5) has no address. IL2CPP
