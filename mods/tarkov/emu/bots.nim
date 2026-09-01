@@ -638,6 +638,281 @@ proc slotFilter(def: JsonRef; r: var Rng): string =
     return ""
   result = at(list, nextInt(r, n)).asText("")
 
+# ---------------------------------------------------------------------------
+# Required slots, as ONE implementation shared with the player loadout path
+# ---------------------------------------------------------------------------
+#
+# `addMods` above honours `_required` for every slot the BOT TABLE names. That
+# is the proven path and it is not changed. But two things it cannot do were
+# paid for on 2026-08-31 by a player who spawned holding the RECEIVER of a rifle
+# and nothing else:
+#
+#  1. `emu/loadout` -- the automation gear-minting path -- had no notion of
+#     `_required` at all. It wrote one item document per request and called
+#     `validateSlots`, which DROPS invalid children and never FILLS missing
+#     required ones. A minted M4A1 was therefore the bare base template.
+#  2. `addMods` iterates `keys(inv.mods.<tpl>)` -- the bot table's own slot
+#     names. A required slot the table does not mention is never visited, so
+#     `slotFilter`'s fallback never gets a chance at it.
+#
+# `fillRequiredSlots` below is the single implementation of "walk the template's
+# OWN `_props.Slots`, and every slot marked `_required` must end up with a
+# child". Both paths call it, so the two cannot drift into two different notions
+# of "required". For the bot path it is a POST-PASS over an already-built mod
+# tree: it only ever touches a required slot that is still EMPTY, so it cannot
+# change any weapon `addMods` already completed, and it descends THROUGH the
+# parts the bot table chose (a receiver the table fitted still gets its required
+# barrel, and that barrel its required gas block).
+#
+# MEASURED against the live 41 MB db.json on 2026-08-31 (4,673 templates):
+#
+#  * 1,011 of 3,765 `_props.Slots` entries are `_required`. The commonest are
+#    `mod_barrel` (94), `mod_pistol_grip` (86), `mod_handguard` (68),
+#    `mod_reciever` (58), `mod_stock` (58), `mod_gas_block` (56).
+#  * **0 of 148 `_props.Chambers` entries are `_required`.** So this walk reads
+#    `Slots` ONLY, and that is a measurement rather than an oversight: a chamber
+#    holds AMMUNITION, not a part, and both callers already load chambers
+#    deliberately (`chamberRounds` here, `chamberRound` in `emu/loadout`).
+#    Filling a chamber from its filter here would put a random cartridge in a
+#    gun the caller had already chambered, or had deliberately left empty.
+#  * Required slots NEST, which is why this is a walk and not a loop: the M4A1
+#    requires `mod_pistol_grip`, `mod_reciever`, `mod_stock` and `mod_charge`,
+#    and the receiver in turn requires `mod_barrel` and `mod_handguard`, and
+#    that barrel requires `mod_gas_block`. A one-level fill still ships a gun
+#    with no barrel.
+#  * 0 of those 1,011 required slots names an EMPTY filter -- so on stock data
+#    every required slot is fillable. "Required but unfillable" is still handled
+#    explicitly and LOUDLY (`unfillable`, one line naming parent template and
+#    slot) rather than silently producing a broken weapon, because the bot-table
+#    flavour of that state is real (2 of 2,878 required root slots name no pool
+#    in the bot table) and because a database change must announce itself.
+
+type
+  RequiredFill* = object
+    ## What one `fillRequiredSlots` walk did. Deliberately five numbers, not a
+    ## bool: "I minted 4 parts" is not "the weapon is complete", and neither is
+    ## "nothing was dropped".
+    found*: int
+      ## Required slots discovered anywhere in the tree, recursively.
+    already*: int
+      ## Of those, ones that already had an occupant when the walk started.
+    minted*: int
+      ## Items this walk added. `found == already + minted` is the clean case.
+    unfillable*: seq[string]
+      ## Required slots that could NOT be filled, one line each, naming the
+      ## parent template and the slot. A non-empty list is a weapon that is
+      ## still broken and the caller must surface it, not swallow it.
+
+const
+  MaxRequiredDepth* = 8
+    ## Deeper than any measured required chain (the M4A1's is 3) and a bound on
+    ## a database whose filters point back at their own parent.
+  MaxRequiredMints* = 64
+    ## A bound on one walk. A fully required-kitted weapon measured 7 parts.
+
+proc fillRequiredSlots*(items: var List; rootId, rootTpl: string; r: var Rng;
+                        stat: var RequiredFill) =
+  ## Fill every `_required` slot, recursively, under `rootId`.
+  ##
+  ## Slots that already have an occupant are LEFT ALONE and the walk descends
+  ## into the occupant, so this is safe to run over a tree another generator
+  ## already built. Nothing is ever replaced.
+  ##
+  ## `items` is appended to; nothing is removed. The caller still runs
+  ## `validateSlots` afterwards, which is what proves the parts fit -- every
+  ## template here comes out of the slot's OWN
+  ## `_props.filters[0].Filter`, so `validateSlots` accepting them is expected
+  ## and its REFUSING one is a real signal.
+  ##
+  ## One owned string is read at entry (`text(items)`), for the reason spelled
+  ## out on `validateSlots`: `raw(items.at(i))` faults on this nimony because
+  ## `at` takes its `List` by value.
+  if rootId.len == 0 or rootTpl.len == 0:
+    return
+
+  # Who already occupies what. Keyed "<parentId>\x1f<lowercased slot>", with the
+  # occupant's id and template alongside so the walk can descend into it.
+  var takenKey: seq[string] = @[]
+  var takenId: seq[string] = @[]
+  var takenTpl: seq[string] = @[]
+  let blob = text(items)
+  let doc = whole(blob)
+  let n0 = count(doc)
+  for i in 0 ..< n0:
+    let one = at(doc, i)
+    let par = one.field("parentId").asText("")
+    let sl = one.field("slotId").asText("")
+    if par.len == 0 or sl.len == 0:
+      continue
+    takenKey.add par & "\x1f" & toLowerAscii(sl)
+    takenId.add one.field("_id").asText("")
+    takenTpl.add one.field("_tpl").asText("")
+
+  var ids: seq[string] = @[]
+  var tpls: seq[string] = @[]
+  var depths: seq[int] = @[]
+  ids.add rootId
+  tpls.add rootTpl
+  depths.add 0
+  var head = 0
+  while head < ids.len:
+    let parentId = ids[head]
+    let parentTpl = tpls[head]
+    let depth = depths[head]
+    inc head
+    if depth >= MaxRequiredDepth:
+      continue
+    let defs = slotDefs(parentTpl)
+    if not defs.found:
+      continue
+    let ns = count(defs)
+    for i in 0 ..< ns:
+      let def = at(defs, i)
+      if not def.field("_required").asBool(false):
+        continue
+      let slotName = def.field("_name").asText("")
+      if slotName.len == 0:
+        continue
+      inc stat.found
+      let key = parentId & "\x1f" & toLowerAscii(slotName)
+      var occupied = -1
+      for k in 0 ..< takenKey.len:
+        if takenKey[k] == key:
+          occupied = k
+          break
+      if occupied >= 0:
+        # Already fitted -- by the bot table, by the caller, or by an earlier
+        # iteration of this walk. Descend into it; a fitted receiver still
+        # requires a barrel.
+        inc stat.already
+        if takenId[occupied].len > 0 and takenTpl[occupied].len > 0:
+          ids.add takenId[occupied]
+          tpls.add takenTpl[occupied]
+          depths.add depth + 1
+        continue
+      if stat.minted >= MaxRequiredMints:
+        stat.unfillable.add parentTpl & "." & slotName &
+          ": required, but the " & $MaxRequiredMints &
+          "-part budget for one item was already spent, so this slot is EMPTY"
+        continue
+      let tpl = slotFilter(def, r)
+      if tpl.len == 0:
+        stat.unfillable.add parentTpl & "." & slotName &
+          ": required, but its _props.Slots[]._props.filters[0].Filter names " &
+          "no template, so nothing can be fitted and the item is INCOMPLETE"
+        continue
+      let modId = newId()
+      items.add botItem(modId, tpl, parentId, slotName)
+      takenKey.add key
+      takenId.add modId
+      takenTpl.add tpl
+      inc stat.minted
+      ids.add modId
+      tpls.add tpl
+      depths.add depth + 1
+
+proc auditRequiredSlots*(itemsJson, rootId: string;
+                         empty: var seq[string]; found: var int): int =
+  ## THE FINISHED-STATE CHECK. Re-derives which slots are required straight from
+  ## the database and walks the parent/child tree of an item list as it actually
+  ## exists -- so it can be pointed at a profile RE-READ off the store, and it
+  ## shares not one variable with whatever minted the tree.
+  ##
+  ## This is the falsifiable negative: **no required slot under `rootId` is
+  ## empty**. `empty` gets one line per violation, naming the parent template
+  ## and the slot. The input that makes it FAIL is a tree with a required slot
+  ## unfilled, which is exactly the receiver-only rifle it exists to catch --
+  ## and `emu/loadout`'s self-check drives that input deliberately.
+  ##
+  ## Returns how many required slots are FILLED. `found` is the total. The two
+  ## being equal, with `empty` empty, is the pass.
+  ##
+  ## Counting what was minted would not do: `validateSlots` runs between the
+  ## mint and the save and can remove a part, and the save itself can be lost.
+  found = 0
+  result = 0
+  if rootId.len == 0 or itemsJson.len == 0:
+    return
+
+  let doc = whole(itemsJson)
+  let n = count(doc)
+  var ids: seq[string] = @[]
+  var tpls: seq[string] = @[]
+  var parents: seq[string] = @[]
+  var slots: seq[string] = @[]
+  for i in 0 ..< n:
+    let one = at(doc, i)
+    ids.add one.field("_id").asText("")
+    tpls.add one.field("_tpl").asText("")
+    parents.add one.field("parentId").asText("")
+    slots.add toLowerAscii(one.field("slotId").asText(""))
+
+  var rootTpl = ""
+  for i in 0 ..< ids.len:
+    if ids[i] == rootId:
+      rootTpl = tpls[i]
+      break
+  if rootTpl.len == 0:
+    # The root is not in this list. INCONCLUSIVE, and the caller can tell:
+    # `found` is 0 and so is the result, with no violations claimed.
+    return
+
+  var walkId: seq[string] = @[]
+  var walkTpl: seq[string] = @[]
+  var depths: seq[int] = @[]
+  walkId.add rootId
+  walkTpl.add rootTpl
+  depths.add 0
+  var head = 0
+  while head < walkId.len:
+    let parentId = walkId[head]
+    let parentTpl = walkTpl[head]
+    let depth = depths[head]
+    inc head
+    if depth >= MaxRequiredDepth:
+      continue
+    let defs = slotDefs(parentTpl)
+    if not defs.found:
+      continue
+    let ns = count(defs)
+    for i in 0 ..< ns:
+      let def = at(defs, i)
+      if not def.field("_required").asBool(false):
+        continue
+      let slotName = def.field("_name").asText("")
+      if slotName.len == 0:
+        continue
+      inc found
+      let want = toLowerAscii(slotName)
+      var childId = ""
+      var childTpl = ""
+      for k in 0 ..< ids.len:
+        if parents[k] == parentId and slots[k] == want:
+          childId = ids[k]
+          childTpl = tpls[k]
+          break
+      if childId.len == 0:
+        empty.add parentTpl & "." & slotName &
+                  " is REQUIRED and EMPTY on the saved item tree"
+        continue
+      result = result + 1
+      walkId.add childId
+      walkTpl.add childTpl
+      depths.add depth + 1
+
+var gRequiredFound = 0
+  ## Required slots seen by the template-driven backstop across every generated
+  ## weapon this process.
+var gRequiredBackfilled = 0
+  ## Of those, ones the backstop had to fill because the bot table left them
+  ## EMPTY -- the receiver-only-rifle counter. Non-zero is not a fault: it is
+  ## the measure of how much the bot table alone was missing.
+var gRequiredUnfillable: seq[string] = @[]
+  ## Required slots that could not be filled at all, capped at 16 lines. **This
+  ## must be empty.** A weapon named here went out with a hole in it, and the
+  ## line says which template and which slot, rather than the player finding out
+  ## in a raid.
+
 var gChambered = 0
   ## Chamber slots actually loaded this process. Reported per batch, because a
   ## chambering that silently declines is exactly the failure mode this whole
@@ -874,6 +1149,23 @@ proc addMods(t: BotTables; inv, chances: JsonRef; items: var List;
       ids.add modId
       tpls.add tpl
       depths.add depth + 1
+
+  # THE BACKSTOP. Everything above is driven by `keys(inv.mods.<tpl>)` -- the
+  # bot table's own slot names -- so a required slot the table does not mention
+  # is never visited at all, and `slotFilter`'s fallback above never gets a
+  # chance at it. This pass is driven by the TEMPLATE's `_props.Slots` instead,
+  # and it only ever fills a required slot that is still EMPTY, so it cannot
+  # change a weapon the table already completed. Same proc `emu/loadout` calls,
+  # so the player's minted gun and the bot's generated one cannot end up with
+  # two different ideas of what "required" means.
+  if weapon:
+    var rf = RequiredFill(found: 0, already: 0, minted: 0, unfillable: @[])
+    fillRequiredSlots(items, rootId, rootTpl, r, rf)
+    gRequiredFound = gRequiredFound + rf.found
+    gRequiredBackfilled = gRequiredBackfilled + rf.minted
+    for u in rf.unfillable:
+      if gRequiredUnfillable.len < 16:
+        gRequiredUnfillable.add u
 
 # ---------------------------------------------------------------------------
 # What the bot is carrying, as opposed to wearing
@@ -1669,6 +1961,11 @@ proc botGuardCounters*(): string =
   ", internal-mag copies suppressed " & $gInternalMagSuppressed &
   " (served loose: " & $gInternalMagServed &
   (if gInternalMagServed > 0: " -- FAIL, this must be zero" else: "") & ")" &
+  ", required slots " & $gRequiredFound & " (backfilled " &
+  $gRequiredBackfilled & ", UNFILLABLE " & $gRequiredUnfillable.len &
+  (if gRequiredUnfillable.len > 0:
+     " -- FAIL, this must be zero: " & gRequiredUnfillable[0]
+   else: "") & ")" &
   ", slot-unjudged " & $gSlotUnknown &
   ", stackable " & $gStackAudited & " (flat<=1: " & $gStackFlat &
   ", avg " & (if gStackAudited > gStackFlat:

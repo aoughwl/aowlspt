@@ -72,6 +72,7 @@ import profile
 import trading
 import spawn
 import bots
+import rand
 
 const
   EquipSlots* = ["Headwear", "Earpiece", "FaceCover", "ArmorVest", "Eyewear",
@@ -159,6 +160,22 @@ type
       ## arrived empty, which looks identical to "the feature never fired" from
       ## inside a raid and is why it is counted separately.
     chambered*: int     ## rounds read back in the chamber slot, 0 or 1
+    mintedId*: string
+      ## The `_id` of the item this request minted into a worn slot or a
+      ## container. Kept so the finished-state required-slot audit has a root to
+      ## walk from -- it is the ONE thing carried across from the mint, and it
+      ## is an identity, not a count.
+    reqFound*: int
+      ## Required slots (`_props.Slots[]._required`, recursively) discovered on
+      ## the RE-READ item tree under `mintedId`.
+    reqFilled*: int
+      ## Of those, ones that have a child on the re-read tree.
+    reqEmpty*: seq[string]
+      ## The ones that do NOT, one line each. **This is the list that must be
+      ## empty**, and it is the falsifiable negative behind the receiver-only
+      ## rifle: `reqFound - reqFilled` parts missing means the player spawns
+      ## holding a gun that does not work. Derived from the database and the
+      ## saved profile, sharing nothing with the code that minted the parts.
     why*: string        ## why this request did not fully land
 
   LoadoutReport* = object
@@ -183,6 +200,17 @@ type
     reqs*: seq[GearReq]
     flatStacks*: int
     slotDropped*: int
+    requiredFound*: int
+      ## Required slots found across every minted item, on the RE-READ profile.
+    requiredEmpty*: int
+      ## Of those, ones with no child. **Must be zero.** Non-zero is a FAIL and
+      ## every one is also in `rejected` by name, because "the rifle arrived"
+      ## and "the rifle works" are different questions and only the second one
+      ## is what the player experiences.
+    requiredUnfillable*: seq[string]
+      ## Required slots the minter could not fill at all -- the database names
+      ## no candidate. Reported separately from `requiredEmpty` because it is a
+      ## DATA gap, not a code gap, and the two want different fixes.
 
 # ---------------------------------------------------------------------------
 # Spec parsing
@@ -246,7 +274,8 @@ proc parseSpec*(body: string; profileId: var string; clear: var bool;
                     inside: "", count: 1, ammo: "", magazine: "", chamber: false,
                     condition: 100,
                     baseline: 0, minted: 0, placed: 0, magPlaced: 0,
-                    roundsPlaced: 0, chambered: 0, why: "")
+                    roundsPlaced: 0, chambered: 0, mintedId: "",
+                    reqFound: 0, reqFilled: 0, reqEmpty: @[], why: "")
     r.tpl = toLowerAscii(e.field("tpl").asText(""))
     r.query = e.field("query").asText("")
     if r.query.len == 0:
@@ -717,6 +746,15 @@ proc reportJson*(rep: LoadoutReport): string =
   put(o, "placed", rep.placed)
   put(o, "flatStacks", rep.flatStacks)
   put(o, "slotDropped", rep.slotDropped)
+  # Required slots, from the FINISHED profile. `requiredEmpty` is the number
+  # that must be zero; `requiredFound` is beside it so a zero that means "no
+  # required slot was ever looked at" cannot be read as a pass.
+  put(o, "requiredFound", rep.requiredFound)
+  put(o, "requiredEmpty", rep.requiredEmpty)
+  var unf = arr()
+  for u in rep.requiredUnfillable:
+    unf.add u
+  put(o, "requiredUnfillable", unf)
   var rej = arr()
   for r in rep.rejected:
     rej.add r
@@ -748,6 +786,12 @@ proc reportJson*(rep: LoadoutReport): string =
     put(e, "magPlaced", r.magPlaced)
     put(e, "roundsPlaced", r.roundsPlaced)
     put(e, "chambered", r.chambered)
+    put(e, "requiredFound", r.reqFound)
+    put(e, "requiredFilled", r.reqFilled)
+    var pe = arr()
+    for m in r.reqEmpty:
+      pe.add m
+    put(e, "requiredEmpty", pe)
     put(e, "why", r.why)
     per.add e
   put(o, "gear", per)
@@ -859,7 +903,8 @@ proc applyLoadout*(body: string): LoadoutReport =
   ## what really arrived.
   result = LoadoutReport(verdict: "INCONCLUSIVE", reason: "", profileId: "",
                          requested: 0, minted: 0, placed: 0, rejected: @[], observations: @[],
-                         reqs: @[], flatStacks: 0, slotDropped: 0)
+                         reqs: @[], flatStacks: 0, slotDropped: 0, requiredFound: 0,
+                         requiredEmpty: 0, requiredUnfillable: @[])
   var profileId = ""
   var clear = false
   var problems: seq[string] = @[]
@@ -932,6 +977,10 @@ proc applyLoadout*(body: string): LoadoutReport =
       reqs[i].baseline = countPlaced(beforeItems, reqs[i], equipmentId, stash)
 
   # ---- mint --------------------------------------------------------------
+  # Seeded from the profile id, not from entropy: the same spec against the same
+  # character fits the same parts, so a bug report naming a weapon can be
+  # regenerated. `emu/rand` explains why nothing here is allowed a global RNG.
+  var rng = seededRng(profileId)
   var ch = newChange()
   for i in 0 ..< reqs.len:
     if reqs[i].tpl.len == 0:
@@ -962,6 +1011,7 @@ proc applyLoadout*(body: string): LoadoutReport =
       inv.items.add d
       inv.dirty = true
       reqs[i].minted = 1
+      reqs[i].mintedId = nid
       if reqs[i].magazine.len > 0:
         # A weapon. The magazine goes IN it, and the ammo goes in the magazine;
         # `fillCartridges` on the weapon itself would refuse (measured: a weapon
@@ -999,6 +1049,30 @@ proc applyLoadout*(body: string): LoadoutReport =
                 "GetCurrentMagazine() will read null in raid."
         reqs[i].why = w
         result.rejected.add reqs[i].query & ": " & w
+      # THE FIX. A weapon template on its own is a RECEIVER: on this database
+      # the M4A1 declares `mod_pistol_grip`, `mod_reciever`, `mod_stock` and
+      # `mod_charge` as `_required`, its receiver requires `mod_barrel` and
+      # `mod_handguard`, and that barrel requires `mod_gas_block`. Minting the
+      # base template and running `validateSlots` -- which DROPS invalid
+      # children and never FILLS missing required ones -- is exactly the gun a
+      # player spawned holding on 2026-08-31.
+      #
+      # `emu/bots.fillRequiredSlots` is the same proc the bot generator uses, so
+      # the player's rifle and a scav's rifle cannot disagree about what a
+      # complete weapon is. It is a no-op on a template with no required slots,
+      # which is why it is called unconditionally rather than behind a
+      # "is this a weapon?" guess -- and it is NOT a no-op on body armour, which
+      # declares `Soft_armor_front`/`_back`/`Helmet_top` and friends as required
+      # (63, 63 and 59 templates respectively): a plate carrier minted without
+      # them is a vest that stops nothing.
+      var rf = RequiredFill(found: 0, already: 0, minted: 0, unfillable: @[])
+      fillRequiredSlots(inv.items, nid, tpl, rng, rf)
+      for u in rf.unfillable:
+        # LOUD, and a refusal rather than an observation: this request produced
+        # an item the player cannot use. Naming the slot is the correct outcome
+        # -- silently shipping the broken weapon is not.
+        result.requiredUnfillable.add u
+        result.rejected.add reqs[i].query & ": " & u
     of whInside:
       var containerTpl = ""
       let containerId = wornIn(inv.items, equipmentId, reqs[i].inside,
@@ -1027,6 +1101,16 @@ proc applyLoadout*(body: string): LoadoutReport =
         inv.dirty = true
         reqs[i].minted = reqs[i].minted + take
         remaining = remaining - take
+        # A weapon put IN a rig is the same receiver-only item as one worn; the
+        # audit below walks whichever copy this records, and `count > 1` on a
+        # slotted item is already impossible (`limit <= 1` forces take = 1).
+        if reqs[i].mintedId.len == 0:
+          reqs[i].mintedId = nid
+        var rfi = RequiredFill(found: 0, already: 0, minted: 0, unfillable: @[])
+        fillRequiredSlots(inv.items, nid, tpl, rng, rfi)
+        for u in rfi.unfillable:
+          result.requiredUnfillable.add u
+          result.rejected.add reqs[i].query & ": " & u
         if reqs[i].ammo.len > 0:
           var w2 = ""
           discard fillCartridges(inv.items, nid, tpl, reqs[i].ammo, w2)
@@ -1130,6 +1214,36 @@ proc applyLoadout*(body: string): LoadoutReport =
           $reqs[i].magPlaced & " x " & reqs[i].magazine & " in mod_magazine, " &
           $reqs[i].roundsPlaced & " round(s) inside, " & $reqs[i].chambered &
           " chambered"
+
+    # ---- THE FINISHED-STATE REQUIRED-SLOT CHECK (CLAUDE.md 9b) ------------
+    # Not "did I mint 7 parts". `validateSlots` runs between the mint and the
+    # save and can remove one; the save itself can be lost. So this re-derives
+    # which slots are required from the DATABASE, walks the tree as it exists in
+    # `backItems` -- the profile read fresh off the store -- and asserts the
+    # NEGATIVE: no required slot under the minted item is empty.
+    #
+    # The input that makes it FAIL: mint a weapon and skip filling one required
+    # slot. `selfCheckLoadout` drives exactly that as a negative control, and if
+    # it ever stops failing, this check has stopped being a check.
+    if reqs[i].mintedId.len > 0:
+      var missing: seq[string] = @[]
+      var rfound = 0
+      reqs[i].reqFilled = auditRequiredSlots(backItems, reqs[i].mintedId,
+                                             missing, rfound)
+      reqs[i].reqFound = rfound
+      reqs[i].reqEmpty = missing
+      result.requiredFound = result.requiredFound + rfound
+      result.requiredEmpty = result.requiredEmpty + missing.len
+      for m in missing:
+        let w = reqs[i].label & " was read back off the saved profile with " &
+                m & ". " & $rfound & " required slot(s), " &
+                $reqs[i].reqFilled & " filled -- this item is INCOMPLETE and " &
+                "will spawn as a bare receiver in raid."
+        if reqs[i].why.len == 0: reqs[i].why = w
+        result.rejected.add reqs[i].query & ": " & w
+      if rfound > 0 and missing.len == 0:
+        result.observations.add reqs[i].query & ": all " & $rfound &
+          " required slot(s) filled on the saved profile"
   result.reqs = reqs
   result.placed = 0
   for r in reqs:
@@ -1155,7 +1269,8 @@ proc verifyLoadout*(body: string): LoadoutReport =
   ## intact after a raid, or before one, without changing anything.
   result = LoadoutReport(verdict: "INCONCLUSIVE", reason: "", profileId: "",
                          requested: 0, minted: 0, placed: 0, rejected: @[], observations: @[],
-                         reqs: @[], flatStacks: 0, slotDropped: 0)
+                         reqs: @[], flatStacks: 0, slotDropped: 0, requiredFound: 0,
+                         requiredEmpty: 0, requiredUnfillable: @[])
   var profileId = ""
   var clear = false
   var problems: seq[string] = @[]
@@ -1191,6 +1306,27 @@ proc verifyLoadout*(body: string): LoadoutReport =
               "'s mod_magazine slot"
       if reqs[i].why.len == 0: reqs[i].why = w
       result.rejected.add reqs[i].query & ": " & w
+    # The same required-slot audit `applyLoadout` runs, so "is my loadout still
+    # intact?" also answers "is the rifle still a whole rifle?" -- a part
+    # stripped in raid, or a loadout minted by an older build that had no notion
+    # of `_required`, shows up here rather than in the player's hands.
+    if reqs[i].where == whEquip:
+      var wornTpl = ""
+      let wornId = wornIn(openInventory(itemsJson).items, equipmentId,
+                          reqs[i].slot, wornTpl)
+      if wornId.len > 0:
+        var missing: seq[string] = @[]
+        var rfound = 0
+        reqs[i].reqFilled = auditRequiredSlots(itemsJson, wornId, missing,
+                                               rfound)
+        reqs[i].reqFound = rfound
+        reqs[i].reqEmpty = missing
+        result.requiredFound = result.requiredFound + rfound
+        result.requiredEmpty = result.requiredEmpty + missing.len
+        for m in missing:
+          let w = reqs[i].label & ": " & m
+          if reqs[i].why.len == 0: reqs[i].why = w
+          result.rejected.add reqs[i].query & ": " & w
   result.reqs = reqs
   for r in reqs:
     result.placed = result.placed + r.placed
@@ -1281,7 +1417,8 @@ proc selfCheckLoadout*(into: var seq[string]): bool =
   # catch.
   var rep = LoadoutReport(verdict: "FAIL", reason: "r", profileId: "p",
                           requested: 3, minted: 3, placed: 0, rejected: @[], observations: @[],
-                          reqs: @[], flatStacks: 0, slotDropped: 0)
+                          reqs: @[], flatStacks: 0, slotDropped: 0, requiredFound: 0,
+                         requiredEmpty: 0, requiredUnfillable: @[])
   let js = reportJson(rep)
   if js.find("\"requested\":3") < 0 or js.find("\"minted\":3") < 0 or
      js.find("\"placed\":0") < 0:
@@ -1375,4 +1512,87 @@ proc selfCheckLoadout*(into: var seq[string]): bool =
                    "590c678286f77426c9660122", w5):
       into.add "loadout: the M4A1's chamber accepted an IFAK, so the chamber " &
                "filter is not being read"
+      result = false
+
+    # ---- required slots: the NEGATIVE CONTROL, then the fix ---------------
+    #
+    # CLAUDE.md 9b. `auditRequiredSlots` is the check that decides whether a
+    # minted weapon is complete, so the first thing proved about it is that it
+    # can say NO. A bare M4A1 -- one item document, no children, which is
+    # EXACTLY what this module minted before 2026-08-31 and exactly what the
+    # player spawned holding -- must be reported as INCOMPLETE. If this stops
+    # failing, the audit has stopped being an audit and everything below it is
+    # worthless.
+    const BareM4 =
+      "[{\"_id\":\"aaaaaaaaaaaaaaaaaaaa0001\"," &
+      "\"_tpl\":\"5447a9cd4bdc2dbd208b4567\"," &
+      "\"parentId\":\"aaaaaaaaaaaaaaaaaaaa0000\"," &
+      "\"slotId\":\"FirstPrimaryWeapon\"}]"
+    var bareMissing: seq[string] = @[]
+    var bareFound = 0
+    let bareFilled = auditRequiredSlots(BareM4, "aaaaaaaaaaaaaaaaaaaa0001",
+                                        bareMissing, bareFound)
+    if bareFound <= 0:
+      into.add "loadout: the M4A1 declares NO required slots, so the " &
+               "required-slot audit has nothing to assert and cannot fail. " &
+               "Either the database changed or _props.Slots[]._required is no " &
+               "longer being read -- INCONCLUSIVE, not a pass."
+      result = false
+    elif bareMissing.len == 0 or bareFilled != 0:
+      into.add "loadout: NEGATIVE CONTROL FAILED -- a bare M4A1 with no parts " &
+               "at all was reported as having " & $bareFilled & " of " &
+               $bareFound & " required slots filled and " & $bareMissing.len &
+               " empty. An audit that passes a receiver-only rifle is the bug."
+      result = false
+    elif bareMissing[0].find("_required") >= 0 and
+         bareMissing[0].find("REQUIRED") < 0:
+      into.add "loadout: the required-slot violation does not name the slot"
+      result = false
+
+    # Now the POSITIVE half, over the same input: `fillRequiredSlots` -- the
+    # proc `emu/bots` uses -- must turn that bare receiver into a weapon the
+    # SAME audit passes. Two independent things are asserted, not one: the
+    # audit's own verdict flipped, and it flipped because parts exist on the
+    # tree rather than because the audit was told to stop looking.
+    var fixInv = openInventory(BareM4)
+    var fixRng = seededRng("loadout-selfcheck")
+    var rf = RequiredFill(found: 0, already: 0, minted: 0, unfillable: @[])
+    fillRequiredSlots(fixInv.items, "aaaaaaaaaaaaaaaaaaaa0001",
+                      "5447a9cd4bdc2dbd208b4567", fixRng, rf)
+    if rf.minted <= 0:
+      into.add "loadout: fillRequiredSlots fitted NOTHING to a bare M4A1, so " &
+               "every minted weapon is still a receiver"
+      result = false
+    for u in rf.unfillable:
+      into.add "loadout: a required slot on a stock M4A1 could not be " &
+               "filled -- " & u
+      result = false
+    var fixedMissing: seq[string] = @[]
+    var fixedFound = 0
+    let fixedFilled = auditRequiredSlots(text(fixInv.items),
+                                         "aaaaaaaaaaaaaaaaaaaa0001",
+                                         fixedMissing, fixedFound)
+    if fixedMissing.len != 0:
+      into.add "loadout: after fillRequiredSlots, " & $fixedMissing.len &
+               " required slot(s) on the M4A1 are STILL empty (" &
+               fixedMissing[0] & ")"
+      result = false
+    if fixedFound <= bareFound or fixedFilled != fixedFound:
+      into.add "loadout: the filled M4A1 reports " & $fixedFilled & " of " &
+               $fixedFound & " required slots against " & $bareFound &
+               " on the bare one. Required slots NEST (the receiver requires " &
+               "a barrel, the barrel a gas block), so the filled tree must " &
+               "declare MORE of them than the bare one -- a count that did " &
+               "not grow means the walk is not recursing."
+      result = false
+    # And the parts that were fitted must survive the client's own rules. This
+    # is the cross-check that the filter-derived templates are not merely
+    # plausible: `validateSlots` is what the bot path and the mint path both run
+    # before saving, and it refusing one of these would be a real signal.
+    var vRep: seq[string] = @[]
+    var vKept: seq[string] = @[]
+    if validateSlots(fixInv.items, vRep, vKept) != 0:
+      into.add "loadout: validateSlots REFUSED a part that fillRequiredSlots " &
+               "took from the slot's own filter -- " &
+               (if vRep.len > 0: vRep[0] else: "(no reason given)")
       result = false
