@@ -2882,12 +2882,44 @@ var gGfxPadShifted = false
 ## and therefore the same height, so a second value would be the same number
 ## and one more thing to keep in step.
 var gGfxPadH = 0'i32
+## PER BASELINE ENTRY: how far we shifted THIS object, in px. It used to be the
+## single `gGfxPadH`, which was correct only while both panels got the same
+## shift -- they no longer do (see `gGfxInsetRef`), so a single value would
+## make the backstop assert the wrong number on one of the two panels and fail
+## a healthy object.
+var gGfxStockShiftPx: seq[int32] = @[]
+## THE TARGET INSET ABOVE THE STRIP, taken from the FIRST panel we shift.
+##
+## MEASURED COSMETIC DEFECT: Graphics' stock padding.top is 20 and PostFX's is
+## 0, so adding the same 46 to both gave the strip a native-looking 20px
+## breathing space on Graphics and sat it flush against the panel's top edge on
+## PostFX, visibly above the panel body. The fix is to bring the smaller base
+## up to the larger one rather than to hardcode 20 -- this is read live from
+## whichever panel is shifted first.
+var gGfxInsetRef = -1'i32
 ## PER PANEL, both of them: the verdict latch and the settle counter. A single
 ## pair could only ever judge whichever panel happened to be up first, and the
 ## other panel's assertion would then never run at all.
 var gGfxGeomSaid: seq[bool] = @[false, false]
 var gGfxGeomPendingSaid: seq[bool] = @[false, false]
 var gGfxGeomTicks: seq[int] = @[0, 0]
+## THE WATCHDOG, and the measured defect it exists for.
+##
+## After the per-panel split the geometry verdict stopped logging ANYTHING --
+## no LANDED, no NOT-LANDED-YET, no DISPLACED, on either panel, across a whole
+## session in which Graphics was active for minutes and PostFX was pressed and
+## shown. Every individual guard in `gfxStockGeomVerdictFor` looked correct
+## reading the source, which is exactly the point: a check that silently never
+## runs is indistinguishable from one that runs and passes, and it is the same
+## defect class as a check that cannot fail.
+##
+## So the verdict is now OFFERED-counted. If a panel is offered the check
+## GfxGeomWatchdog times and still produces no verdict, it says so ONCE and
+## DUMPS THE RAW STATE of every guard it would have passed through. The next
+## run therefore names the cause instead of being silent about it.
+var gGfxGeomOffered: seq[int] = @[0, 0]
+var gGfxGeomWatchSaid: seq[bool] = @[false, false]
+const GfxGeomWatchdog = 240
 const GfxGeomSettle = 20
 const GfxMaxStockWatch = 16
 
@@ -3111,6 +3143,7 @@ proc gfxBuildStrip(panelT, donorStripGo, donorStripT, donorButtonGo,
       gGfxStockT.add bc
       gGfxStockG.add bg
       gGfxStockExpectShift.add false     # panel-level: must not move at all
+      gGfxStockShiftPx.add 0'i32
       gGfxStockPanelIx.add pIx
       gGfxStockName.add (iObjName(panelT) & "/" & iObjName(bc))
   # The container-level entries are the ones our padding shift WILL move, so
@@ -3131,6 +3164,7 @@ proc gfxBuildStrip(panelT, donorStripGo, donorStripT, donorButtonGo,
       gGfxStockT.add bc
       gGfxStockG.add bg
       gGfxStockExpectShift.add false     # flipped below IF the shift succeeds
+      gGfxStockShiftPx.add 0'i32
       gGfxStockPanelIx.add pIx
       gGfxStockName.add (iObjName(panelT) & "/" & iObjName(stackT) & "/" &
                          iObjName(bc))
@@ -3333,7 +3367,17 @@ proc gfxBuildStrip(panelT, donorStripGo, donorStripT, donorButtonGo,
          "so REFUSING rather than shifting the stock layout by it."
     discard modsSetActive(strip, false)
     return
-  if not nuSetPaddingTop(ro, grp, origTop + addH):
+  # EQUALISE THE INSET ABOVE THE STRIP ACROSS PANELS. Graphics' stock
+  # padding.top is 20 and PostFX's is 0; adding the same 46 to both left the
+  # strip flush against PostFX's top edge while Graphics looked native. Bring
+  # the smaller base up to the first panel's base, measured live -- never a
+  # hardcoded 20.
+  if gGfxInsetRef < 0'i32:
+    gGfxInsetRef = origTop
+  let extraInset = (if gGfxInsetRef > origTop: gGfxInsetRef - origTop
+                    else: 0'i32)
+  let totalShift = addH + extraInset
+  if not nuSetPaddingTop(ro, grp, origTop + totalShift):
     warn "postfx subtab: padding.top could not be raised on " &
          iObjName(stackT) & ", so no room was made and the strip would " &
          "overlap the stock rows. REFUSING this strip. Nothing was written."
@@ -3346,11 +3390,14 @@ proc gfxBuildStrip(panelT, donorStripGo, donorStripT, donorButtonGo,
     gGfxPadGrp.add grp
     gGfxPadOrig.add origTop
   gGfxPadShifted = true
-  gGfxPadH = addH
-  # The backstop must now expect these to move, and by exactly this much.
+  gGfxPadH = totalShift
+  # The backstop must now expect these to move, and by exactly this much. The
+  # amount is recorded PER ENTRY because the two panels no longer share one.
   var mi = stackBaseStart
   while mi < gGfxStockExpectShift.len and mi < GfxMaxStockWatch * 2:
     gGfxStockExpectShift[mi] = true
+    if mi < gGfxStockShiftPx.len:
+      gGfxStockShiftPx[mi] = totalShift
     mi = mi + 1
   # THE STRIP GOES IN THE BAND WE JUST FREED.
   #
@@ -3377,7 +3424,7 @@ proc gfxBuildStrip(panelT, donorStripGo, donorStripT, donorButtonGo,
     return
   let panelTop = panelG.rectY + panelG.rectH
   let panelLeft = panelG.rectX
-  let stripY = (contTop - panelTop) - float32(origTop)
+  let stripY = (contTop - panelTop) - float32(origTop + extraInset)
   let stripX = contLeft - panelLeft
   if not nuSetV2(stripT, NuTRtSetAnchoredPos, stripX, stripY):
     warn "postfx subtab: room was made in " & iObjName(panelT) & " but the " &
@@ -3388,8 +3435,12 @@ proc gfxBuildStrip(panelT, donorStripGo, donorStripT, donorButtonGo,
   okLog "postfx subtab: made room in " & iObjName(panelT) & " the layout " &
         "group's own way" &
         " -- VerticalLayoutGroup padding.top raised from " & $origTop & " to " &
-        $(origTop + addH) & " (+" & $addH & "px, the stock strip's measured " &
-        "height) through RectOffset::set_top followed by LayoutGroup::" &
+        $(origTop + totalShift) & " (+" & $addH & "px for the strip's " &
+        "measured height, plus " & $extraInset & "px so the inset above it " &
+        "matches the " & $gGfxInsetRef & "px this build measured on the first " &
+        "panel -- Graphics is 20 and PostFX is 0, and adding the same amount " &
+        "to both sat the strip flush against PostFX's top edge) through " &
+        "RectOffset::set_top followed by LayoutGroup::" &
         "SetDirty, so the group moves and resizes the stock list ITSELF and " &
         "the change survives every rebuild. The original " & $origTop & " is " &
         "captured and restored on fault or self-disable. The strip sits in " &
@@ -3817,13 +3868,58 @@ proc gfxStockGeomVerdictFor(pIx: int) =
   ## WHY IT RUNS ON A LATER TICK. A LayoutGroup rebuilds at the END of the
   ## frame, so an inline re-read compares against a layout that has not run and
   ## could only ever say "unchanged" -- a check that cannot fail.
-  if pIx < 0 or pIx >= gGfxGeomSaid.len: return
+  if pIx < 0 or pIx > 1: return
+  # SELF-HEAL THE PER-PANEL ARRAYS BEFORE INDEXING THEM. Every early return
+  # below used to be able to fire on a length test, silently, and a bounds
+  # guard that returns without a word is precisely how this check went missing
+  # for a whole session. Growing them here means the only reasons left to
+  # return are real ones, and each of those now announces itself.
+  while gGfxGeomSaid.len < 2: gGfxGeomSaid.add false
+  while gGfxGeomPendingSaid.len < 2: gGfxGeomPendingSaid.add false
+  while gGfxGeomTicks.len < 2: gGfxGeomTicks.add 0
+  while gGfxGeomOffered.len < 2: gGfxGeomOffered.add 0
+  while gGfxGeomWatchSaid.len < 2: gGfxGeomWatchSaid.add false
   if gGfxGeomSaid[pIx]: return
   let panelT = (if pIx == 1: gGfxPostT else: gGfxPanelT)
   let which = (if pIx == 1: "PostFX Settings" else: "Graphics Settings")
-  if panelT == nil or not duOk(panelT, 0x20'i32): return
+  # OFFERED. Counted before any guard, so the watchdog measures "the tick
+  # reached this proc and nothing came out", which is the actual symptom.
+  gGfxGeomOffered[pIx] = gGfxGeomOffered[pIx] + 1
+  let panelOk = (panelT != nil and duOk(panelT, 0x20'i32))
+  var actOk = false
+  var act = false
+  if panelOk:
+    let (a, b) = iActiveInHierarchy(panelT)
+    actOk = a
+    act = b
+  # THE WATCHDOG. Absence is no longer possible: if this proc has been offered
+  # GfxGeomWatchdog times and still has no verdict, it reports INCONCLUSIVE
+  # once, with every input that decides the outcome, so the next run names the
+  # cause instead of being silent.
+  if gGfxGeomOffered[pIx] >= GfxGeomWatchdog and not gGfxGeomWatchSaid[pIx]:
+    gGfxGeomWatchSaid[pIx] = true
+    var mine = 0
+    var w = 0
+    while w < gGfxStockPanelIx.len and w < GfxMaxStockWatch * 2:
+      if gGfxStockPanelIx[w] == pIx: mine = mine + 1
+      w = w + 1
+    warn "postfx subtab STOCK-GEOMETRY INCONCLUSIVE (" & which & "): the " &
+         "check was offered " & $gGfxGeomOffered[pIx] & " tick(s) and never " &
+         "reached a verdict, so it has NOT been observed -- this is not a " &
+         "pass. Raw state, so the cause is named rather than guessed: " &
+         "panelT=" & iPtr(panelT) & " readable=" & $panelOk &
+         " activeReadOk=" & $actOk & " active=" & $act &
+         " settleTicks=" & $gGfxGeomTicks[pIx] & "/" & $GfxGeomSettle &
+         " baselineEntriesForThisPanel=" & $mine &
+         " totalBaseline=" & $gGfxStockT.len &
+         " panelIxLen=" & $gGfxStockPanelIx.len &
+         " padShifted=" & $gGfxPadShifted & " padH=" & $gGfxPadH &
+         ". If baselineEntriesForThisPanel is 0 the baseline was never " &
+         "captured for this panel; if active=false the panel was never shown; " &
+         "if settleTicks is stuck below the threshold something resets it " &
+         "every frame."
+  if not panelOk: return
   # ONLY AN ACTIVE PANEL CAN BE JUDGED. Not a failure, not a pass: pending.
-  let (actOk, act) = iActiveInHierarchy(panelT)
   if not actOk or not act:
     if not gGfxGeomPendingSaid[pIx]:
       gGfxGeomPendingSaid[pIx] = true
@@ -3865,17 +3961,19 @@ proc gfxStockGeomVerdictFor(pIx: int) =
         # tell offline which this group does: unchanged (the child's height is
         # not driven) or reduced by exactly our shift (it is). A third answer
         # is a failure.
-        let want = gGfxStockG[i].posY - float32(gGfxPadH)
+        let shiftPx = (if i < gGfxStockShiftPx.len: gGfxStockShiftPx[i]
+                       else: gGfxPadH)
+        let want = gGfxStockG[i].posY - float32(shiftPx)
         let dy = now.posY - want
         let dh0 = now.rectH - gGfxStockG[i].rectH
-        let dh1 = now.rectH - (gGfxStockG[i].rectH - float32(gGfxPadH))
+        let dh1 = now.rectH - (gGfxStockG[i].rectH - float32(shiftPx))
         let yOk = dy < 2.0'f32 and dy > -2.0'f32
         let hOk = (dh0 < 2.0'f32 and dh0 > -2.0'f32) or
                   (dh1 < 2.0'f32 and dh1 > -2.0'f32)
         if not yOk or not hOk:
           moved = moved + 1
           report = report & " | " & gGfxStockName[i] &
-                   " (we deliberately shifted this by " & $gGfxPadH &
+                   " (we deliberately shifted this by " & $shiftPx &
                    "px; it did NOT land there): was " &
                    nuGeomNote(gGfxStockG[i]) & " -- expected y=" & nuF(want) &
                    " -- now " & nuGeomNote(now)
@@ -4051,6 +4149,8 @@ proc gfxTickBody() =
     gGfxGeomSaid = @[false, false]
     gGfxGeomPendingSaid = @[false, false]
     gGfxGeomTicks = @[0, 0]
+    gGfxGeomOffered = @[0, 0]
+    gGfxGeomWatchSaid = @[false, false]
     pfxOnScreenClosed()
   if gGfxPanelGo == nil or gGfxPostGo == nil:
     return

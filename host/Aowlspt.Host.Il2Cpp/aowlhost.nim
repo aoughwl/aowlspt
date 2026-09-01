@@ -6591,6 +6591,12 @@ var gModLoadCaptionNode: Il2CppPtr = nil
   ## the signal that the phase ended.
 var gModLoadCaptionAt = 0'u64      ## last witness search, ms
 var gModLoadPhaseSaid = false      ## "we are in a load phase" said once
+var gModLoadCensusDone = false
+  ## The one-shot TMP census has run. It exists because two boots of the
+  ## external catchcaption tool could not identify the client's loading
+  ## caption -- the host is already walking those roots during the window, so
+  ## it is the instrument that can actually reach it.
+var gModLoadCapRoot = ""           ## scene root the caption was found under
 var gModLoadNeedle = "loading"
   ## Displayed-text needle for the caption; `modLoadCaption` overrides it. The
   ## match is LOCALIZED, so this is a config key rather than a constant.

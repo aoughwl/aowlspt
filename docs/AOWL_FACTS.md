@@ -5722,3 +5722,18 @@ Remaining: the per-panel geometry verdict (LANDED / NOT-LANDED-YET /
 DISPLACED) emitted NOTHING this boot for either panel -- a check that never
 runs. And PostFX's stock padding.top is 0 (Graphics: 20), so the strip sits
 flush at that panel's top edge; the base should be normalised.
+
+## The Bash tool's heredoc rewrites escapes -- verify written bytes, never trust the patch
+
+Measured repeatedly 2026-09-01, by two different agents and the coordinator.
+Inside a single-quoted heredoc (`<<'PY'`), a Python literal `'\n'` reached the
+interpreter as `'\n'`, so a REAL newline was written into the middle of a Nim
+string literal (build error: `closing " expected`). Earlier the same day,
+`s.replace(..., "elif x and \\n ...")` landed as a literal backslash-n in
+run.py (SyntaxError), twice. The quiet case -- `\\"` becoming `\"` -- would
+compile and silently change a literal.
+
+Rule: anything scripting a source edit through Bash must read the file back
+(`repr()` the changed bytes, or `ast.parse` / a compile) before claiming the
+edit landed. For multi-line or escape-bearing edits use the Edit tool, which
+does not pass through a shell.

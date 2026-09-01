@@ -156,6 +156,12 @@ const
     ## 250ms file poll and must not run at that rate. Once a caption is held,
     ## no search happens at all -- a liveness check on the held node answers
     ## the question for free.
+  MlCensusBudget = 6000
+    ## Nodes the ONE-SHOT census may visit. It runs at most once per session,
+    ## on the first poll where we could look and found no caption.
+  MlCensusMax = 14
+    ## TMPs the census reports. Enough to identify the loading UI, few enough
+    ## that it is one readable block in the log rather than a dump.
   MlCaptionRoots = 24
     ## Scene roots the witness search may enter, total. Bounded like every
     ## other walk here.
@@ -401,6 +407,75 @@ proc mlFindDonorTmp(rootTr: Il2CppPtr): Il2CppPtr =
     frontier = nextRow
   result = nil
 
+proc mlIdentity(node: Il2CppPtr): string =
+  ## name + parent name for a transform. Two `Object::get_name` calls, used
+  ## only on nodes we have already decided are interesting.
+  if node == nil: return "<nil>"
+  result = "name=\"" & iObjName(node) & "\""
+  let par = mlParentTransformOf(node)
+  if par != nil:
+    result = result & " parent=\"" & iObjName(par) & "\""
+  else:
+    result = result & " parent=<none/unreadable>"
+
+proc mlCensus() =
+  ## THE INSTRUMENT, run from inside the gate rather than from outside it.
+  ##
+  ## Two boots of the external `catchcaption.py` could not identify the
+  ## client's loading caption: rooted at $preloader it found only an INACTIVE
+  ## 6px `Text` under `LoadingSpinner`, and rooted at every scene root it
+  ## STOPPED EARLY on the inspector's 240-frame-per-round cap in all six
+  ## rounds. That is the right verdict from the wrong instrument -- a transient
+  ## object in a large scene cannot be caught by a tool that only gets a slice
+  ## of the window.
+  ##
+  ## This host code is already walking those roots DURING the window, so it is
+  ## the correct place to ask. It lists what TMPs actually exist and what they
+  ## say, so the next boot can replace the LOCALIZED text needle with a
+  ## structural name/parent match. It costs one bounded walk, ONCE per session.
+  if gModLoadCensusDone: return
+  gModLoadCensusDone = true
+  var roots: seq[Il2CppPtr] = @[]
+  if not splAnchorSceneRoots(roots):
+    return
+  var budget = MlCensusBudget
+  var shown = 0
+  var seen = 0
+  var report = ""
+  var frontier: seq[Il2CppPtr] = @[]
+  for go in roots:
+    let tr = nuTransformOf(go)
+    if tr != nil: frontier.add tr
+  while frontier.len > 0 and budget > 0 and shown < MlCensusMax:
+    var nextRow: seq[Il2CppPtr] = @[]
+    for node in frontier:
+      if budget <= 0 or shown >= MlCensusMax: break
+      dec budget
+      let tmp = splTmpOf(node)
+      if tmp != nil:
+        let t = splTmpText(tmp)
+        if t.len > 0:
+          inc seen
+          let nm = iObjName(node)
+          if find(nm, MlNamePrefix) < 0:
+            inc shown
+            report = report & "  |  [" & $shown & "] " & mlIdentity(node) &
+                     " text=\"" & (if t.len > 60: t[0 ..< 60] & "..." else: t) &
+                     "\""
+      var n = 0
+      if iChildCount(node, n):
+        for i in 0 ..< n:
+          if nextRow.len >= budget: break
+          let c = iChildAt(node, i)
+          if c != nil: nextRow.add c
+    frontier = nextRow
+  warn "mod loading step: CAPTION CENSUS (once per session, " &
+       $(MlCensusBudget - budget) & " of " & $MlCensusBudget & " nodes, " &
+       $seen & " TMP(s) with text seen, showing " & $shown &
+       "). No TMP matched the needle \"" & gModLoadNeedle & "\", so this " &
+       "lists what the load phase ACTUALLY has, to replace the localized " &
+       "needle with a structural name/parent match next boot:" & report
+
 proc mlFindCaption(lookOk: var bool): NuStyle =
   ## THE LOAD-PHASE WITNESS: the game's own loading caption, or an honest
   ## refusal. This one call answers three questions that used to be answered
@@ -448,6 +523,7 @@ proc mlFindCaption(lookOk: var bool): NuStyle =
     if tr == nil: continue
     let cand = nuStyleFind(tr, gModLoadNeedle, MlNamePrefix)
     if cand.ok:
+      gModLoadCapRoot = iObjName(go)
       return cand
     if find(cand.why, "are OURS") >= 0:
       lastWhy = cand.why
@@ -915,7 +991,15 @@ proc modLoadTick() =
           gModLoadPhaseSaid = true
           okLog "mod loading step: the client's own loading caption is up (" &
                 nuStyleNote(found) & "), so this IS a load phase and the step " &
-                "may draw. It will be torn down when that caption is."
+                "may draw. It will be torn down when that caption is. " &
+                "CAPTION IDENTITY, logged once so the LOCALIZED text needle " &
+                "can be replaced by a structural name/parent match: " &
+                mlIdentity(found.node) & " sceneRoot=\"" & gModLoadCapRoot &
+                "\" text=\"" & found.text & "\" font=" & nuF(found.fontSize) &
+                " frame=" & (if found.geom: "READ" else: "NOT read")
+      elif lookOk and not gModLoadCensusDone:
+        mlCensus()
+        gModLoadWhy = "nophase:true"
       elif gModLoadWhy != ("nophase:" & $lookOk):
         gModLoadWhy = "nophase:" & $lookOk
         warn "mod loading step: NOT DRAWING -- " &
