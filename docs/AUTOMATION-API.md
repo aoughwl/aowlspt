@@ -570,6 +570,7 @@ Notes that have cost time before:
 | `scripts\gear_must_fail.nim` | **a check that CAN fail** — a rifle into `Headwear` |
 | `scripts\ammoloading_e2e.nim` | the whole spine: gear → raid → magazine cycle → did the mod see it |
 | `scripts\actuation_tour.nim` | every actuation verb, with its strength labelled |
+| `scripts\weapon_swap_e2e.nim` | **weapon swap, proved by what is really in hands** — plus look, sprint and the magazine cycle |
 
 `gear_must_fail.nim` is not decoration. If it ever passes, the gear acceptance has
 stopped being able to fail and everything above it is worthless.
@@ -584,3 +585,88 @@ stopped being able to fail and everything above it is worthless.
 | `docs/INSPECTOR-VERBS.md` | the live inspector's own verb set, including `assert` |
 | `docs/HEADLESS.md` | driving the client with no human |
 | `CLAUDE.md` §9b | why every check here is shaped as a falsifiable negative |
+
+---
+
+## 10. THE VERSION HANDSHAKE
+
+A green run used to be able to mean nothing. Deploy a `tarkov.dll` built before
+`equipWeapon`'s `magazine` field existed and run `woods_pmc_m4.nim`: the old
+route is PRESENT so there is no 404, it parses the spec, never looks at
+`magazine`, mints the rifle alone and answers `requested=1 minted=1 placed=1
+verdict=PASS`. The raid starts with an unloaded rifle and the feature under test
+was never exercised. `applyGear`'s only staleness signal was HTTP 404, which
+tells "no route" from "a route" — not "a current route" from "an old one".
+
+So both halves of the install now say what they can do, and every declaration
+verb records what it needs.
+
+| Half | Asked | Answers |
+|---|---|---|
+| backend (`tarkov.dll`) | `GET /aowlspt/tarkov/autoscript/capabilities` | `{"api":2,"caps":[...]}` — `LoadoutApi` / `LoadoutCaps` in `mods/tarkov/emu/loadout.nim`, beside the code that implements every token |
+| host (`aowlspt-host-il2cpp.dll`) | `pact caps` over the inspector channel | `caps api=2 verbs=... readback=... issueonly=...` — `PactCapsLine` in `host/Aowlspt.Host.Il2Cpp/pact.nim` |
+
+Two halves, not one, because they are deployed separately and go stale
+separately; a half-stale install reported as wholly stale is a worse diagnosis
+than none. `pact caps` is answered ABOVE every gate — flag, bind, raid phase —
+so "this host is too old" stays distinguishable from "playerActuation is off".
+
+`checkVersion` and `checkPactVersion` run in `run`/`runToRaid` BEFORE the gear,
+so a refusal leaves the profile alone rather than half-minted. Membership is an
+exact TOKEN test, never `contains`: a substring test would let `magazine` be
+satisfied by a build declaring only `magazines`.
+
+Declare extra needs by hand with `needsBackend(s, tok)` / `needsPact(s, verb)`.
+
+**Three outcomes.** FAIL — the install answered and a needed token is absent
+(the 404 case is a FAIL, not INCONCLUSIVE: "this build has no autoscript routes
+at all" is a measured answer). INCONCLUSIVE — nothing answered; no control port,
+a transport error, or no `pact-rpc: caps` line in 25s, so nothing was learned
+about the install's age. PASS — every declared token present.
+
+---
+
+## 11. Verb strength, as of this build
+
+| Verified against a value the GAME maintains | Readback |
+|---|---|
+| `walkAndSee` | `EFT.Player::get_Position` — metres travelled |
+| `lookAndSee` | `EFT.MovementContext::get_Rotation` — degrees, yaw wrapped across 0 |
+| `sprintAndSee` | `EFT.Player::get_IsSprintEnabled` |
+| `aimAndSee` | `FirearmController::get_IsAiming` |
+| `swapWeaponAndSee` | `FirearmController::get_Item` — a DIFFERENT weapon object in hands |
+| `magCycle` | `EFT.InventoryLogic.Magazine::get_Count` |
+
+Issue-only, and labelled so everywhere: `fire`, `jump`, `prone`, `pose`, `lean`,
+`toggleInventory`, `examineWeapon`, `command`, `reload`. pact has no readback for
+the trigger or for stance. Saying so is better than upgrading an INCONCLUSIVE.
+
+### Weapon swap and inventory needed NO new RVA rows
+
+Measured, and worth stating because the opposite was assumed: weapon selection
+is not a method call, it is `EFT.InputSystem.ECommand` through the
+`GamePlayerOwner::TranslateCommand` row pact already carries. The ordinals come
+from `il2cpp_resolve.py ... fields ECommand` — `ExamineWeapon=36`,
+`ToggleInventory=37`, `SelectKnife=38`, `SelectFirstPrimaryWeapon=41`,
+`SelectSecondPrimaryWeapon=42`, `SelectSecondaryWeapon=43` — not from a name.
+
+The one row genuinely added is the rotation readback,
+`EFT.MovementContext::get_Rotation` @ `0x8947A0`, `UNIQUE owners=1`, prologue
+`40 53 48 83 EC 20 80 3D E6 41 82 06 00 48 8B D9` — a real body, not the
+`C2 00 00` universal empty stub. Vector2 is 8 bytes so it returns PACKED IN RAX,
+not by sret. Nothing new is DETOURED: the only detour pact owns is still the
+`GamePlayerOwner::LateUpdate` capture.
+
+---
+
+## 12. Running one mod's suite alone
+
+`aowl test --mod NAME` builds and runs that mod's `core/selftest` and nothing
+else — `aowl test --mod sain` is **~6s and prints `PASS -- 125 checks`**, where
+`aowl test` ran forty minutes with its output buffered and emitted nothing.
+(`modclient.exe` never had a `--mod` flag at all; it is the manager's report
+reader and has no notion of choosing a mod.)
+
+It works because `core/` is pure by construction, so a generated seventeen-line
+main is a complete harness. Exit **0** pass, **1** fail, **3 INCONCLUSIVE** — no
+such mod, or no `core/selftest.nim`. A missing suite must not exit 0.

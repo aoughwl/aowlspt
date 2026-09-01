@@ -1701,6 +1701,29 @@ proc onAutoscriptVerify(url, body, session: string): string =
   let rep = verifyLoadout(body)
   result = reportJson(rep)
 
+proc onAutoscriptCaps(url, body, session: string): string =
+  ## `/aowlspt/tarkov/autoscript/capabilities` -- THE VERSION HANDSHAKE.
+  ##
+  ## Answers what THIS DEPLOYED BUILD of tarkov.dll can be asked for, so a
+  ## script can refuse loudly against a stale install instead of minting the
+  ## wrong thing quietly. The whole reason it exists is that a 404 is the only
+  ## staleness `applyGear` could previously detect, and a stale-but-present
+  ## route does not 404: it answers 200 having ignored the field the script
+  ## cared about.
+  ##
+  ## Deliberately GET-shaped and side-effect free -- it must be answerable by an
+  ## install too old to do anything else the script wants, which is the one case
+  ## it is for.
+  inc gRequests
+  var caps = arr()
+  for c in split(LoadoutCaps, ','):
+    if c.len > 0: caps.add jstr(c)
+  var o = obj()
+  put(o, "api", LoadoutApi)
+  put(o, "caps", caps)
+  put(o, "mod", "aowl.tarkov")
+  result = text(done(o))
+
 proc onSelfCheck(url, body, session: string): string =
   ## `/aowlspt/tarkov/selfcheck` -- did this build's own arithmetic hold?
   ##
@@ -3238,6 +3261,7 @@ proc registerRoutes() =
   # measured to be the one that reaches a mod on this host.
   discard serve("/aowlspt/tarkov/autoscript/loadout", onAutoscriptLoadout)
   discard serve("/aowlspt/tarkov/autoscript/verify", onAutoscriptVerify)
+  discard serve("/aowlspt/tarkov/autoscript/capabilities", onAutoscriptCaps)
 
   discard serve("/client/profile/status", onProfileStatus)
   # `GetProfileSettings` answers a bare `true`; the client only checks that the
