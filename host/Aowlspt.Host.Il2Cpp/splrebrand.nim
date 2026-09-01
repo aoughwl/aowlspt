@@ -143,15 +143,35 @@ const
   SplHuntFrames   = 60         ## ~1 s at 60 fps while NOTHING is cached (the
                                ## `iSceneRoots` enumeration allocates; it may not
                                ## run per frame).
-  SplCheapHuntFrames = 1       ## EVERY FRAME once the UI ROOT ("Menu UI") is
-                               ## cached but the screen is not. This tier exists
-                               ## because the expensive part of a hunt was never
-                               ## the descent -- it was `iSceneRoots`. With the
-                               ## root cached the hunt is a depth-8, budgeted,
-                               ## 18ms-sliced name descent over a shallow tree
-                               ## and allocates nothing, so throttling it only
-                               ## bought latency the player pays for as vanilla
-                               ## text on screen.
+  SplCheapHuntFrames = 6       ## ~100 ms at 60 fps once the UI ROOT ("Menu UI")
+                               ## is cached but the screen is not.
+                               ##
+                               ## THIS WAS 1 -- every frame -- on the reasoning
+                               ## that "the expensive part of a hunt was never
+                               ## the descent, it was iSceneRoots", so the
+                               ## descent allocates nothing and can run freely.
+                               ## MEASURED 2026-09-01 with the host's own
+                               ## drainProfiler, that reasoning is WRONG: this
+                               ## tier cost 2,590,859us across 90 calls -- a
+                               ## MEAN OF 28.8 MILLISECONDS PER CALL, 47.4% of
+                               ## the whole feature -- and the feature's total
+                               ## was 5.46 SECONDS of Unity main-thread time
+                               ## with a single call peaking at 79ms.
+                               ##
+                               ## "Allocates nothing" is not the same as
+                               ## "cheap". Walking a live Unity tree by name is
+                               ## thousands of interop calls, and Tarkov is
+                               ## main-thread bound -- every millisecond here is
+                               ## taken from bot AI and rendering. A cosmetic
+                               ## relabel must not compete with the game for the
+                               ## one contended resource.
+                               ##
+                               ## 6 frames costs at most ~100ms of extra vanilla
+                               ## text on first open and cuts this tier's
+                               ## main-thread cost by 6x. Frequency is the only
+                               ## safe lever here: the walk keeps no resume
+                               ## cursor, so shortening its time slice could
+                               ## stop it reaching the screen at all.
   SplRescanFrames = 6          ## ~100 ms once the SCREEN transform is cached but
                                ## its TMPs are not: a depth-12 scan bounded by
                                ## SplWalkMs, no root enumeration.
@@ -169,6 +189,25 @@ const
                                ## allocation, no set_isOn (the checkbox is
                                ## already hidden, so that branch is skipped).
   SplWalkMs       = 18'u64     ## per-pass wall-clock slice, checked INSIDE the walk.
+                               ##
+                               ## LEFT AT 18ms DELIBERATELY, and the reason is
+                               ## worth stating because the obvious "fix" is
+                               ## wrong. A 60 fps frame is 16.7ms, so this slice
+                               ## exceeds a whole frame budget and the measured
+                               ## mean was 28.8ms -- so it is not even bounding
+                               ## the pass. Cutting it looks right.
+                               ##
+                               ## But `splFindByName` KEEPS NO RESUME CURSOR: it
+                               ## restarts from the root on every pass. A shorter
+                               ## slice therefore does not cost more passes to
+                               ## reach the same depth -- it may never reach the
+                               ## target at all, and the feature would silently
+                               ## stop finding the screen while looking faster.
+                               ## That is a worse bug than the cost.
+                               ##
+                               ## So the cost is cut by FREQUENCY instead (see
+                               ## SplCheapHuntFrames). Making the walk resumable
+                               ## is the real fix and is not done here.
   SplNodeBudget   = 24000      ## per-ROOT node cap (reset per root), threaded through the
                                ## recursion. The offline-raid screen sits deep in the large
                                ## "UI" root (the live inspector only reached it after ~thousands
