@@ -277,6 +277,119 @@ def place_library(mod_dir, stem, out_path):
     return True
 
 
+class Progress(object):
+    """Append-only JSON-lines progress, for the in-game mod-loading screen.
+
+    The host renders this while the client boots, so it has to be readable by
+    something that is NOT this process and may start reading half way through.
+    Hence JSON LINES, flushed per event: a reader that opens the file mid-write
+    sees a whole number of complete records plus at most one partial trailing
+    line, which it drops. A single JSON document would be unparseable for the
+    entire duration of the build -- exactly when the screen most wants to show
+    something.
+
+    Every record carries `i`/`n`, so the screen can show real progress rather
+    than a spinner that conveys nothing. `n` is known up front because the mod
+    list is enumerated before any compiling starts.
+    """
+
+    def __init__(self, path, total, screen=None):
+        self.path = path
+        self.screen = screen
+        self.total = total
+        self.i = 0
+        self.rows = {}
+        self.order = []
+        self.done_all = False
+        if path:
+            try:
+                os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+                # Truncate: this is THIS run's progress. A stale file left by a
+                # previous boot would otherwise be rendered as if it were live,
+                # which is the same class of bug as reading a stale log.
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(jsonmod.dumps({"event": "start", "n": total}) + "\n")
+            except OSError:
+                self.path = None
+
+    def emit(self, **kw):
+        if not self.path:
+            return
+        kw.setdefault("n", self.total)
+        kw.setdefault("i", self.i)
+        try:
+            with open(self.path, "a", encoding="utf-8") as f:
+                f.write(jsonmod.dumps(kw) + "\n")
+                f.flush()
+        except OSError:
+            pass
+
+    def starting(self, mod):
+        self.i += 1
+        if mod not in self.rows:
+            self.order.append(mod)
+        self.rows[mod] = ("building", "")
+        self.emit(event="mod", mod=mod, status="building", i=self.i)
+        self.render()
+
+    def done(self, res):
+        extra = ""
+        if res["status"] == "built" and res.get("seconds") is not None:
+            extra = "%.1fs" % res["seconds"]
+        elif res["status"] in ("failed", "skipped"):
+            extra = (res.get("why") or "")[:48]
+        self.rows[res["mod"]] = (res["status"], extra)
+        self.emit(event="mod", mod=res["mod"], status=res["status"],
+                  seconds=res.get("seconds"), why=res.get("why"), i=self.i)
+        self.render()
+
+    def finished(self, counts, failed):
+        self.emit(event="done", counts=counts, failed=failed, i=self.i)
+        self.done_all = True
+        self.render()
+
+    # ---- the in-game screen -------------------------------------------
+    #
+    # A SECOND file, plain text, rewritten in full on every event. The host
+    # renders it VERBATIM, one label per line.
+    #
+    # Why not have the host read the JSON above: it would then be parsing JSON
+    # on the Unity main thread, every frame, inside the guard, allocating as it
+    # goes -- against the host's own rule of no per-frame managed allocation.
+    # A whole-file rewrite of ~15 short lines costs nothing here and turns the
+    # in-game side into "read a small file when its size or mtime changed, and
+    # set N label texts". The host does no parsing at all.
+    #
+    # It is rewritten rather than appended so the file is always the COMPLETE
+    # current state: a reader that arrives late still sees every mod, and there
+    # is no replay to reconstruct.
+    STATUS_W = 9
+
+    def render(self):
+        if not self.screen:
+            return
+        lines = []
+        if getattr(self, "done_all", False):
+            bad = sum(1 for r in self.rows.values() if r[0] == "failed")
+            lines.append("MODS READY  %d of %d%s"
+                         % (len(self.rows), self.total,
+                            ("  -- %d FAILED" % bad) if bad else ""))
+        else:
+            lines.append("BUILDING MODS  %d of %d" % (self.i, self.total))
+        for name in self.order:
+            st, extra = self.rows[name]
+            lines.append("  %-14s %-*s %s" % (name, self.STATUS_W, st, extra))
+        try:
+            # Whole-file replace via a temp + os.replace so a reader never sees
+            # a half-written file -- the host reads this from another process.
+            tmp = self.screen + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+            os.replace(tmp, self.screen)
+        except OSError:
+            pass
+
+
 def build_one(mod_dir, abi_dir, aowl_src, nimony_exe, nimony_root,
               force, check, verbose, env):
     name = os.path.basename(mod_dir.rstrip("\\/"))
@@ -369,6 +482,12 @@ def main():
     p.add_argument("--check", action="store_true",
                    help="report what would build; build nothing")
     p.add_argument("--json", action="store_true")
+    p.add_argument("--progress", default=None,
+                   help="write JSON-lines build progress to this file, for "
+                        "the in-game mod-loading screen to render live")
+    p.add_argument("--screen", default=None,
+                   help="plain-text file the in-game loading screen renders "
+                        "VERBATIM, rewritten in full on every event")
     p.add_argument("--ucrt64", default=None,
                    help="override msys2's ucrt64 bin; must precede Git's "
                         "mingw64 on PATH")
@@ -423,9 +542,12 @@ def main():
         return 3
 
     results = []
+    prog = Progress(args.progress, len(dirs), args.screen)
     for d in dirs:
+        prog.starting(os.path.basename(d.rstrip("\\/")))
         res = build_one(d, args.abi, args.aowl_src, nimony_exe, args.nimony,
                         args.force, args.check, args.verbose, cenv)
+        prog.done(res)
         results.append(res)
         if not args.json:
             s = res["status"]
@@ -442,6 +564,7 @@ def main():
     for r in results:
         counts[r["status"]] = counts.get(r["status"], 0) + 1
     failed = counts.get("failed", 0)
+    prog.finished(counts, failed)
 
     if args.json:
         print(jsonmod.dumps({"counts": counts, "mods": results},

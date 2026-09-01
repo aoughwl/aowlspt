@@ -1549,6 +1549,20 @@ var gErrDlgCount = 0
 var gErrDlgFirst = ""
 var gErrDlgCritical = false
 var gErrDlgFiring = 0
+## THE IN-GAME MOD LOADING SCREEN. No detour of its own -- it rides the existing
+## per-frame drain and renders `aowlspt-modload.txt`, which `tools/modbuild.py
+## --screen` rewrites as it compiles the mods folder. The NuElem handles live
+## beside `modload.nim`'s include, because `NuElem` is not in scope up here.
+var gModLoad = false
+var gModLoadScreenPath = ""
+var gModLoadText = ""
+var gModLoadBuilt = false
+var gModLoadDone = false
+var gModLoadDonorWarned = false
+var gModLoadWhy = ""   ## the last refusal reason printed, so each prints once
+var gModLoadPolledAt = 0'u64
+var gModLoadReadyAt = 0'u64
+var gModLoadDonor: Il2CppPtr = nil
 var gErrDlgRow: array[3, int] = [-1, -1, -1]
   ## kind-20/21/22 slot  ->  the TARGET-TABLE ROW it actually bound, recorded at
   ## bind time by `bindErrDlg`. The dispatcher looks the row up here instead of
@@ -3721,6 +3735,14 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
     dpT = cDpNow()
     splRebrandDrainTick()
     cDpAdd(DpSplRebr, dpT)
+    # THE IN-GAME MOD LOADING SCREEN. Rides THIS drain too -- it installs no
+    # detour of its own, because a second detour on one function overwrites the
+    # first's trampoline. It must ride TarkovApplication::Update rather than
+    # PreloaderUI's, for the same reason splRebrand does: the compile is running
+    # while the matchmaker/profile screens are up, before the main menu's
+    # PreloaderUI can be assumed. Idle cost is one clock compare; when the file
+    # is unchanged it does not even allocate. Flag `modLoadScreen`, default ON.
+    modLoadTick()
     # HOST-NATIVE AUTO-RAID. Rides THIS drain (TarkovApplication::Update ticks
     # the whole session, including the matchmaker screens that are up before the
     # main menu's PreloaderUI can be assumed), not a second detour. Default OFF
@@ -6512,6 +6534,16 @@ include "pact.nim"
 include "nuikit.nim"
 
 include "natesp.nim"
+## THE IN-GAME MOD LOADING SCREEN. Included AFTER nuikit (nuPanel/nuLabel/
+## nuFindCanvas/nuSetText), inspect (iChildCount/iChildAt) and splrebrand
+## (splAnchor/splTmpOf) -- it consumes all three. Its handle globals are here
+## rather than with the plain ones above because `NuElem` only exists from
+## nuikit onwards.
+var gModLoadPanel = nuNone
+var gModLoadTitle = nuNone
+var gModLoadRows: seq[NuElem] = @[]
+include "modload.nim"
+
 
 ## THE FRAME METER. Included anywhere after the log helpers and `readBoolKey`;
 ## it names nothing from any feature module, which is the property that makes it
@@ -8050,6 +8082,17 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
     warn "catchErrorDialogs is explicitly false: in-game error dialogs will NOT " &
          "be caught. A run that hits one will look IDLE rather than failed, and " &
          "an unattended run will sit on it until it times out."
+  # THE IN-GAME MOD LOADING SCREEN. Default ON, like catchErrorDialogs and for
+  # the same reason: it exists to make a long silent wait legible, and a screen
+  # you have to remember to switch on does not do that. It writes nothing to the
+  # game, installs no detour, and builds NOTHING until the compile writes its
+  # file -- so on an install whose mods are already built it is inert.
+  gModLoad = readBoolKeyDef("modLoadScreen", true)
+  if gModLoad:
+    info "modLoadScreen is on (default): while the mods folder compiles, the " &
+         "client shows a native panel listing every mod and whether it was " &
+         "built, cached or FAILED. It renders aowlspt-modload.txt verbatim " &
+         "and builds nothing at all until that file exists."
   gBotAi = readBoolKey("botAiActivate")
   if gBotAi:
     info "botAiActivate is set: a kind=12 detour on EFT.BotOwner.PreActivate will " &
@@ -8989,6 +9032,10 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
       # reports per-target and warns loudly if NONE bound, because a silently
       # unarmed watcher is worse than no watcher: the run would look supervised
       # and would not be.
+      # THE IN-GAME MOD LOADING SCREEN (default ON). Nothing to detour; this
+      # only resolves the file it will render.
+      discard bindModLoad(true)
+
       if gErrDlg and not bindErrDlg(true):
         warn "errdlg did not arm; in-game error dialogs will NOT be caught on " &
              "this run. Treat any IDLE verdict from harness.py as INCONCLUSIVE " &
