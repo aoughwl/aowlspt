@@ -42,3 +42,5 @@ except ImportError as _e:  # pragma: no cover -- named, never silent
 _read = _channel._read
 _has_err_line = _channel._has_err_line
 _completeness = _channel._completeness
+_Lock = _channel._Lock
+_nolock = _channel._nolock

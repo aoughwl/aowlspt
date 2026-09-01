@@ -47,8 +47,29 @@ def _run(lines, args, parse, write=False):
     try:
         sentinel, raw = channel.run_batch(lines, live_dir=live_dir,
                                            timeout=timeout, write=write)
+    except channel.ChannelBusy as e:
+        # NOT a timeout. Another writer holds the single-writer lock, so this
+        # batch was never sent -- blaming the host for a shell-side collision
+        # is what happened on 2026-08-31 and cost the session.
+        return _err('channel_busy', str(e))
     except channel.TimeoutErr as e:
-        return _err('timeout', str(e))
+        # A timeout is silent about WHY. If the host's own counters say it is
+        # wedged mid-batch, say WEDGED -- the host's prose says the opposite.
+        msg = str(e)
+        try:
+            import sys as _sys, os as _os
+            _tools = _os.path.join(_os.path.dirname(_os.path.dirname(
+                _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))),
+                'tools')
+            if _tools not in _sys.path:
+                _sys.path.insert(0, _tools)
+            from ui import wedge_verdict           # noqa: E402
+            w = wedge_verdict(channel.paths(live_dir)['log'])
+            if w:
+                return _err('wedged', w)
+        except Exception:
+            pass
+        return _err('timeout', msg)
     except channel.ChannelMissing as e:
         return _err('channel_missing', str(e))
     except channel.WriteNotAllowed as e:

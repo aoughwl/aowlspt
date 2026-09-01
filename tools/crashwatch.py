@@ -1,19 +1,29 @@
 #!/usr/bin/env python3
-r"""crashwatch.py - kill the live EFT client the instant it crashes, then report.
+r"""crashwatch.py - watch the live EFT client's logs and report what went wrong.
 
-The goal is narrow and blunt: while you are iterating on the dev loop, whenever
-the running client hits a fatal error or a hang, the game should CLOSE
-IMMEDIATELY and the terminal should show an after-crash report -- so you are not
-left staring at a frozen window wondering whether it died or is merely idle.
+IT DOES NOT KILL ANYTHING UNLESS YOU ARM IT. That is a change, and it is the
+whole point of the 2026-08-31 rewrite: `--watch` used to force-kill the game on
+every signature, and the kill left NO trace -- aowlspt-clienterr.log held only
+`armed, watching the client's logs` lines. Four instances accumulated in one
+day, each killing a live client every few minutes, and an hour went into
+bisecting the user's code against a killer that was constant in every arm.
+Every bisect "reproduced" the failure, which felt like signal and was noise.
+
+So now: observe-only by default; `--kill-on SIG` / `--kill-any` to arm; a kill
+is the loudest line the tool ever writes (signature, matched text, PIDs, to the
+sink and to stdout); the `armed` line states whether THIS instance can kill; and
+a second `--watch` instance is refused unless you pass --allow-duplicates.
 
 This watcher tails the CLIENT's OWN logs under D:\Aowlspt\Logs (not the host
 log; that is harness.py's job -- see the note at the bottom of this docstring).
 It never reads a whole log: it seeks to the current end and reads only new bytes
 as they are written, so a 230 KB output_000.log costs nothing.
 
-    python tools/crashwatch.py               # one-shot: watch, kill+report, exit
-    python tools/crashwatch.py --watch       # keep watching across relaunches
-    python tools/crashwatch.py --dry-run     # detect + report, but DON'T kill
+    python tools/crashwatch.py               # one-shot: observe + report, exit
+    python tools/crashwatch.py --watch       # keep observing across relaunches
+    python tools/crashwatch.py --watch --kill-on matchmaking-timeout
+                                             # ARM the kill, for ONE signature
+    python tools/crashwatch.py --selftest    # prove both halves; needs no game
     python tools/crashwatch.py --scan-existing   # also scan text already in the
                                                  # newest dir (off by default so
                                                  # a stale crash can't kill a
@@ -410,18 +420,85 @@ class MatchWatch:
         return (t - self.armed_at) > self.timeout
 
 
-def kill_game(dry_run):
-    names = ",".join(PROCS)
-    if dry_run:
-        return "DRY-RUN: would kill " + names
+def list_pids(names=None):
+    """(pid, name) for every live game process. Read-only; kills nothing."""
+    names = names or PROCS
     cmd = ("Get-Process -Name %s -ErrorAction SilentlyContinue "
-           "| Stop-Process -Force" % names)
+           "| ForEach-Object { \"$($_.Id) $($_.ProcessName)\" }"
+           % ",".join(names))
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive",
+                            "-Command", cmd], capture_output=True, timeout=30,
+                           text=True)
+    except Exception:
+        return []
+    out = []
+    for line in (r.stdout or "").splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0].isdigit():
+            out.append((int(parts[0]), parts[1]))
+    return out
+
+
+def kill_game(signature, detail, procs=None, killer=None):
+    """Force-kill the game and LEAVE A LOUD, PERMANENT RECORD OF DOING SO.
+
+    THE 2026-08-31 P0. This function used to be called unconditionally on every
+    signature, and it wrote NOTHING to the sink -- the only lines in
+    aowlspt-clienterr.log were `armed, watching the client's logs`. So a client
+    this tool had force-killed was indistinguishable from a client that had
+    crashed: no exception, no dump, the log simply stopping. An hour of
+    bisecting the USER's code went into chasing a killer that was constant in
+    every arm, and every bisect "reproduced" the failure.
+
+    Two rules follow, and they are the whole fix:
+      1. Nothing calls this unless the operator armed the signature by name
+         (--kill-on / --kill-any). Observe-only is the default.
+      2. A kill is the LOUDEST line this tool ever writes: the signature, the
+         matched text, and the PIDs it actually killed, to the sink AND stdout.
+         `procs`/`killer` are injected so the selftest can prove both halves --
+         that observe-only leaves a fixture process alive, and that an armed
+         kill is recorded -- without touching a real client.
+    """
+    procs = procs if procs is not None else PROCS
+    victims = list_pids(procs) if killer is None else killer("list", procs)
+    names = ", ".join("%s(%d)" % (n, p) for p, n in victims) or "nothing running"
+    emit("%s|KILL|crashwatch|FORCE-KILLING THE GAME on signature %r (%s) -- "
+         "killed: %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), signature,
+                         (detail or "")[:200], names))
+    if killer is not None:
+        killer("kill", procs)
+        return "KILLED (armed on %r): %s" % (signature, names)
+    cmd = ("Get-Process -Name %s -ErrorAction SilentlyContinue "
+           "| Stop-Process -Force" % ",".join(procs))
     try:
         subprocess.run(["powershell", "-NoProfile", "-NonInteractive",
                         "-Command", cmd], capture_output=True, timeout=30)
     except Exception as e:
+        emit("%s|KILL|crashwatch|the kill FAILED: PowerShell errored: %s"
+             % (time.strftime("%Y-%m-%d %H:%M:%S"), e))
         return "kill attempted, but PowerShell errored: %s" % e
-    return "killed " + names
+    return "KILLED (armed on %r): %s" % (signature, names)
+
+
+def kill_decision(sig, args):
+    """(should_kill, action_text) -- the ONE place that decides.
+
+    Default: observe only. `--kill-any` arms every killable signature;
+    `--kill-on SIG` arms named ones. NOKILL signatures are never killable, no
+    matter what was armed, because the classifier did not vouch for them.
+    """
+    if sig in NOKILL:
+        return False, ("OBSERVED ONLY: %s is never killable -- the session "
+                       "survives it and killing would destroy the evidence "
+                       "on screen" % sig)
+    if args.kill_any or sig in set(args.kill_on or []):
+        if args.dry_run:
+            return False, ("DRY-RUN: armed on %r, would have force-killed %s"
+                           % (sig, ",".join(PROCS)))
+        return True, None
+    return False, ("OBSERVED ONLY: killing is not armed for %r "
+                   "(pass --kill-on %s, or --kill-any, to arm it)" % (sig, sig))
 
 
 # Signatures that must NOT kill the client. A shape mismatch raises a modal
@@ -443,7 +520,7 @@ DEFAULT_SINK = "D:/Aowlspt/aowlspt/aowlspt-clienterr.log"
 _sink = None
 
 
-def sink_open(path):
+def sink_open(path, armed_note="killing DISABLED (observe-only)"):
     """Open the sink and stamp it. The stamp is the ARMED PROOF.
 
     crashwatch was once reported as "armed" for a whole session while it was
@@ -464,10 +541,40 @@ def sink_open(path):
               "stdout ONLY, and stdout is not evidence" % (path, e))
         _sink = None
         return None
-    _sink.write("%s|INFO|crashwatch|armed, watching the client's logs\n"
-                % time.strftime("%Y-%m-%d %H:%M:%S"))
+    # The armed line STATES WHETHER THIS INSTANCE CAN KILL. Without that, the
+    # log cannot answer "could this have killed the client?" without reading
+    # the source -- and on 2026-08-31 it could not, so nobody asked.
+    _sink.write("%s|INFO|crashwatch|armed (pid %d), watching the client's "
+                "logs -- %s\n"
+                % (time.strftime("%Y-%m-%d %H:%M:%S"), os.getpid(), armed_note))
     _sink.flush()
     return _sink
+
+
+def other_watchers():
+    """Other live `crashwatch.py --watch` processes, excluding this one.
+
+    Four accumulated unnoticed on 2026-08-31, each one an independent killer.
+    A tool that is easy to leave running in the background must say when it
+    already is.
+    """
+    cmd = ("Get-CimInstance Win32_Process -Filter \"Name like 'python%'\" "
+           "| ForEach-Object { \"$($_.ProcessId)|$($_.CommandLine)\" }")
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive",
+                            "-Command", cmd], capture_output=True, timeout=30,
+                           text=True)
+    except Exception:
+        return None          # could not look -- NOT the same as "none"
+    me = os.getpid()
+    found = []
+    for line in (r.stdout or "").splitlines():
+        pid, _, cl = line.partition("|")
+        if not pid.strip().isdigit() or int(pid) == me:
+            continue
+        if "crashwatch" in cl and "--watch" in cl:
+            found.append((int(pid), cl.strip()[:120]))
+    return found
 
 
 def emit(s=""):
@@ -620,10 +727,36 @@ def run(args):
         print("no log_* directory under %s -- is the client installed there?"
               % logs_root)
         return 2
-    sink_open(args.out)
+    if args.kill_any:
+        armed_note = ("KILLING ARMED for EVERY killable signature (--kill-any)"
+                      + (" but --dry-run is set, so nothing will die"
+                         if args.dry_run else ""))
+    elif args.kill_on:
+        armed_note = ("KILLING ARMED for: %s" % ", ".join(args.kill_on)
+                      + (" (--dry-run: nothing will die)" if args.dry_run else ""))
+    else:
+        armed_note = ("killing DISABLED (observe-only) -- this instance CANNOT "
+                      "have killed the client")
+    sink_open(args.out, armed_note)
     print("crashwatch: watching %s" % cur_dir)
+    print("crashwatch: %s" % armed_note)
     if args.out:
         print("crashwatch: findings also appended to %s" % args.out)
+
+    others = other_watchers()
+    if others is None:
+        print("crashwatch: could NOT enumerate other watchers (WMI query "
+              "failed) -- this was not checked, which is not the same as none")
+    elif others:
+        print("crashwatch: %d OTHER crashwatch --watch instance(s) are already "
+              "running:" % len(others))
+        for pid, cl in others:
+            print("    pid %d  %s" % (pid, cl))
+        if not args.allow_duplicates:
+            print("crashwatch: REFUSING to start a second watcher. Stop those "
+                  "first, or pass --allow-duplicates.")
+            return 4
+        print("crashwatch: --allow-duplicates given; starting anyway.")
     files, tailers = build_tailers(cur_dir, args.scan_existing)
     if not tailers:
         print("no client logs (%s) in that dir yet; will keep looking"
@@ -659,10 +792,12 @@ def run(args):
             src = at or next(iter(tailers.values()), None)
             tail = src.tail_lines(15) if src else []
             path = files.get("application_000.log", cur_dir) if files else cur_dir
-            action = kill_game(args.dry_run)
-            report("matchmaking-timeout",
-                   "no load progress at all within %ds of a NetworkGameMatching "
-                   "trace" % args.match_timeout, "", path, tail, action)
+            det = ("no load progress at all within %ds of a "
+                   "NetworkGameMatching trace" % args.match_timeout)
+            do, action = kill_decision("matchmaking-timeout", args)
+            if do:
+                action = kill_game("matchmaking-timeout", det)
+            report("matchmaking-timeout", det, "", path, tail, action)
             match.armed_at = None
             if not args.watch:
                 return 1
@@ -674,12 +809,9 @@ def run(args):
             # on must not trigger a second kill.
             if (sig, _head_message(text)[:200]) in _seen:
                 continue
-            if sig in NOKILL:
-                action = ("left the game RUNNING on purpose: a payload-shape "
-                          "error raises a dialog the session survives, and "
-                          "killing it would destroy the evidence on screen")
-            else:
-                action = kill_game(args.dry_run)
+            do, action = kill_decision(sig, args)
+            if do:
+                action = kill_game(sig, detail)
             report(sig, detail, text, t.path, t.tail_lines(15), action)
             if match is not None:
                 match.armed_at = None
@@ -790,8 +922,105 @@ def selftest():
         bad += 1
     else:
         print("ok   detail carries the JSON path: %s" % got[1])
+    bad += kill_selftest()
     print("\n%s: %d case(s) failed" % ("FAIL" if bad else "PASS", bad))
     return 1 if bad else 0
+
+
+class _Args(object):
+    """A stand-in for the parsed argv, so kill_decision can be tested."""
+    def __init__(self, **kw):
+        self.kill_on = kw.get("kill_on")
+        self.kill_any = kw.get("kill_any", False)
+        self.dry_run = kw.get("dry_run", False)
+
+
+def kill_selftest():
+    """BOTH HALVES of the P0, each falsifiable.
+
+    Half 1 -- observe-only must NOT kill. Proved against a REAL child process:
+    a `python -c "time.sleep(30)"` fixture is started, the observe-only path is
+    driven over a crash signature, and the fixture must still be alive. If
+    observe-only ever regresses to killing, the fixture dies and this fails.
+
+    Half 2 -- an armed kill must be LOUD. The armed path is driven with an
+    injected killer, and the sink text must afterwards contain the signature,
+    the detail, and the PIDs. If the kill ever goes silent again -- which is
+    exactly what cost an hour on 2026-08-31 -- the sink is missing that line
+    and this fails.
+    """
+    global _sink
+    import io
+    bad = 0
+
+    def case(label, ok):
+        print("%-4s %s" % ("ok" if ok else "FAIL", label))
+        return 0 if ok else 1
+
+    # ---- half 1: a real process survives the observe-only path -------------
+    fix = subprocess.Popen([sys.executable, "-c",
+                            "import time; time.sleep(30)"])
+    try:
+        killed = []
+
+        def fake_killer(op, procs):
+            if op == "list":
+                return [(fix.pid, "fixture")]
+            killed.append(tuple(procs))
+            fix.kill()
+            return None
+
+        a = _Args()                       # DEFAULT: nothing armed
+        do, action = kill_decision("unhandled-exception", a)
+        if do:
+            kill_game("unhandled-exception", "x", ["fixture"], fake_killer)
+        time.sleep(0.4)
+        alive = (fix.poll() is None)
+        bad += case("observe-only (no flags): a real fixture process SURVIVES "
+                    "-- pid %d alive=%s, decision=%s"
+                    % (fix.pid, alive, "OBSERVE" if not do else "KILL"),
+                    alive and not do and not killed)
+        bad += case("observe-only names why it did not kill: %r"
+                    % (action or "")[:60],
+                    bool(action) and "not armed" in (action or ""))
+
+        # ---- half 2: the armed kill is loud AND actually kills -------------
+        old_sink, _sink = _sink, io.StringIO()
+        a = _Args(kill_on=["unhandled-exception"])
+        do, _ = kill_decision("unhandled-exception", a)
+        act = kill_game("unhandled-exception", "NullReferenceException at Foo",
+                        ["fixture"], fake_killer) if do else "(not armed)"
+        text = _sink.getvalue()
+        _sink = old_sink
+        time.sleep(0.4)
+        bad += case("--kill-on arms the kill (decision=%s) and it ran" % do,
+                    do and bool(killed))
+        bad += case("the kill is RECORDED in the sink at KILL level",
+                    "|KILL|crashwatch|FORCE-KILLING" in text)
+        bad += case("the record names the SIGNATURE",
+                    "'unhandled-exception'" in text)
+        bad += case("the record names the MATCHED TEXT",
+                    "NullReferenceException at Foo" in text)
+        bad += case("the record names the PID it killed (%d)" % fix.pid,
+                    ("(%d)" % fix.pid) in text)
+        bad += case("the fixture process is now GONE",
+                    fix.poll() is not None)
+        bad += case("the returned action says KILLED: %r" % act[:40],
+                    act.startswith("KILLED"))
+    finally:
+        if fix.poll() is None:
+            fix.kill()
+
+    # ---- a NOKILL signature stays unkillable even when --kill-any is on ----
+    do, action = kill_decision("served-payload-shape", _Args(kill_any=True))
+    bad += case("served-payload-shape is unkillable even with --kill-any",
+                not do and "never killable" in (action or ""))
+    # ---- and --dry-run does not kill even when armed ----------------------
+    do, action = kill_decision("unhandled-exception",
+                               _Args(kill_any=True, dry_run=True))
+    bad += case("--dry-run with --kill-any still does not kill",
+                not do and "DRY-RUN" in (action or ""))
+    return bad
 
 
 def main():
@@ -802,8 +1031,19 @@ def main():
                    help="client log root (default %s)" % DEFAULT_LOGS)
     p.add_argument("--watch", action="store_true",
                    help="keep monitoring across relaunches (default: one-shot)")
+    p.add_argument("--kill-on", action="append", metavar="SIGNATURE",
+                   help="ARM killing for this signature (repeatable). Without "
+                        "this (or --kill-any) the tool NEVER kills anything. "
+                        "Signatures: unhandled-exception, aggregate-exception, "
+                        "raid-load-abort, matchmaking-timeout")
+    p.add_argument("--kill-any", action="store_true",
+                   help="ARM killing for every killable signature (the old, "
+                        "and dangerous, default behaviour)")
+    p.add_argument("--allow-duplicates", action="store_true",
+                   help="start even if another crashwatch --watch is running")
     p.add_argument("--dry-run", action="store_true",
-                   help="detect and report, but do NOT kill the game")
+                   help="with --kill-on/--kill-any, report what WOULD be "
+                        "killed without killing it")
     p.add_argument("--scan-existing", action="store_true",
                    help="also scan text already in the newest dir at start "
                         "(off by default so a stale crash can't kill a "

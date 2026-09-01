@@ -149,9 +149,82 @@ def _run(cmds, timeout=45, write=False, tries=3):
             return run_batch(cmds, timeout=timeout, write=write)
         except Timeout as e:
             last = e
+            # `tries - 1` here printed "retry 3/2" -- past the tool's own stated
+            # limit, so the message contradicted itself and made the retry bound
+            # look broken. The bound was right; the denominator was wrong.
             sys.stderr.write("  (inspector dropped a %d-command batch; "
-                             "retry %d/%d)\n" % (len(cmds), i + 1, tries - 1))
+                             "retry %d/%d)\n" % (len(cmds), i + 1, tries))
+            sys.stderr.flush()
+    # Before giving up, say WHICH failure this is. A wedged host (a batch whose
+    # `done` never advances) reports itself as "no batch queued", which is the
+    # OPPOSITE of the truth and sent a whole session down the wrong path on
+    # 2026-08-31. channel_wedged() reads the host's own counters instead.
+    w = wedge_verdict()
+    if w:
+        sys.stderr.write("  %s\n" % w)
+        sys.stderr.flush()
+        raise UiError("the inspector channel is WEDGED, not idle. " + w)
     raise last
+
+
+# --------------------------------------------------------------------------
+# wedge detection -- the host's watchdog line, read honestly
+# --------------------------------------------------------------------------
+
+# The host's own watchdog (inspect.nim ~7151) prints, verbatim:
+#   live inspector: no batch queued for 130s while the rider IS dispatching
+#   (N fires). polls=.. reads=.. readFails=.. unchanged=.. lastRead=..B
+#   lastKnown=..B pending=.. batch=9 done=-1 suspended=.. inFlight=..
+#
+# MEASURED 2026-08-31: batches WERE queued. The prose is wrong; the COUNTERS in
+# the same line are right, and they say what really happened -- batch=9 was
+# accepted and `done` never advanced past it, so the dispatcher is stuck inside
+# batch 9 and every later batch is being ignored. Parse the counters, not the
+# prose, and report WEDGED as its own outcome. A tool that repeats the host's
+# wrong sentence is a tool that gives a confidently wrong answer.
+_WATCHDOG = re.compile(
+    r"no batch queued for (\d+)s.*?batch=(-?\d+)\s+done=(-?\d+)"
+    r"\s+suspended=(\w+)\s+inFlight=(\w+)")
+
+
+def wedge_verdict(log_path=None, text=None):
+    """WEDGED / None, from the host's own counters. Never guesses.
+
+    Returns a human sentence when the host log's most recent watchdog line
+    shows an accepted batch whose `done` never caught up -- i.e. the channel is
+    stuck mid-batch, NOT idle. Returns None when there is no evidence either
+    way; "I could not look" is not a verdict.
+    """
+    log_path = log_path or os.path.join(LIVE, "aowlspt-host.log")
+    if text is None:
+        try:
+            with open(log_path, "rb") as f:
+                # Tail only. The host log is written by the LIVE client and can
+                # be tens of MB; never read the whole thing (CLAUDE.md 8).
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                f.seek(max(0, size - 262144))
+                text = f.read().decode("utf-8", "replace")
+        except OSError:
+            return None
+    last = None
+    for m in _WATCHDOG.finditer(text):
+        last = m
+    if not last:
+        return None
+    quiet, batch, done, susp, inflight = (int(last.group(1)), int(last.group(2)),
+                                          int(last.group(3)), last.group(4),
+                                          last.group(5))
+    if done < batch:
+        return ("WEDGED: the host's last watchdog line says batch=%d done=%d "
+                "(suspended=%s inFlight=%s) after %ds. It accepted batch %d and "
+                "never finished it, so every later batch is being ignored. Its "
+                "own prose says 'no batch queued', which is FALSE -- the "
+                "counters in the same line contradict it. Nothing shell-side "
+                "can unwedge this: the host must be restarted, or its "
+                "dispatcher fixed."
+                % (batch, done, susp, inflight, quiet, batch))
+    return None
 
 
 def roots(timeout=60):
