@@ -305,6 +305,25 @@ const
     ## up on it and publishes a diagnosis. A batch normally runs on the very
     ## next frame; seconds means nothing is running it at all, and a silent
     ## wedge is the one failure this instrument must never have.
+  InspDeadlineMs   = 30000'u64
+    ## HOW LONG A CLAIMED BATCH MAY RUN BEFORE THE CHANNEL ABANDONS IT.
+    ##
+    ## Before this existed, one command that never returned to the dispatcher
+    ## cost the channel for the WHOLE SESSION: every later batch was ignored and
+    ## the out file served the stuck batch's answers forever. Losing one batch's
+    ## answers is vastly better than losing the instrument, so after this long
+    ## the batch is abandoned, loudly, and the poll is re-armed.
+    ##
+    ## Generous on purpose: a legitimate batch parks on `wait`/`until` for many
+    ## frames, and 30s is far beyond any honest one while still being a fraction
+    ## of the session the old behaviour destroyed.
+  InspDeadlineFires = 900
+    ## AND the rider must have been dispatched at least this many times since the
+    ## claim. This is the half of the deadline that keeps it safe during a raid
+    ## load: issuing commands while a raid loads stalls the Unity main thread
+    ## (facts #245/#261), so wall-clock alone would abandon a batch that was
+    ## simply waiting for a frame that had not come yet. At ~60fps this is ~15s
+    ## of REAL ticking, so both bounds must be satisfied and the slower one wins.
 
 var gInspOn = false          ## the `liveInspector` flag
 var gInspWriteOn = false     ## the `liveInspectorWrite` flag
@@ -463,6 +482,40 @@ var gInspBodyMode = 0
   ## goes in a global -- the same pattern the command index already uses.
 var gInspBatch = 0
 var gInspBatchDone = -1      ## last batch Unity finished; the tick thread's cue
+
+var gInspDelivered = -1
+  ## THE COUNTER THAT MAKES "WEDGED" DECIDABLE, and the reason the old watchdog
+  ## could not tell a wedge from an idle channel.
+  ##
+  ## `gInspBatchDone` is a HANDSHAKE, not a history: the poll sets it back to -1
+  ## the instant it has written the answers out. So `done=-1` is the state of a
+  ## perfectly healthy channel that has delivered everything, AND the state of a
+  ## batch that never finished -- one number, two opposite meanings. Anything
+  ## that reads `done < batch` as "wedged" (in the host or in a tool) will call
+  ## a healthy idle channel wedged, which is the same class of confidently wrong
+  ## answer this instrument exists to abolish.
+  ##
+  ## `gInspDelivered` is the history: the highest batch whose answers actually
+  ## reached the out file. It is only ever moved forward, never reset.
+var gInspClaimMs = 0'u64
+  ## Wall clock when the Unity thread CLAIMED the current batch (as opposed to
+  ## `gInspHandedMs`, which is when the host thread queued it). The deadline is
+  ## measured from the claim, because the interval before the claim already has
+  ## its own, different diagnosis.
+var gInspClaimFires = 0
+  ## `gInspFires` at claim time. The deadline needs BOTH a wall-clock bound and
+  ## a dispatch bound: during a raid load the Unity main thread legitimately
+  ## stops for a long time (facts #245/#261), and a purely wall-clock deadline
+  ## would abandon a batch that was merely waiting for a frame. Requiring the
+  ## rider to have been dispatched many times since the claim means we only ever
+  ## abandon a batch the Unity thread is demonstrably alive and NOT finishing.
+var gInspAbandons = 0
+  ## Batches abandoned by the deadline this session.
+var gInspInjectStall = false
+  ## FAULT INJECTION, armed only by the `stalltest` command. A deadline that has
+  ## never abandoned anything is not a deadline -- it is untested code on the
+  ## one path that only runs when everything else has already failed.
+var gInspStallBatch = -1     ## which batch `stalltest` armed, for the log
 
 var gInspCmds: seq[string] = @[]
 var gInspOut: seq[string] = @[]
@@ -6383,6 +6436,40 @@ proc iExec(line: string) =
         iOut("  writes and calls are armed FOR THIS BATCH ONLY")
     else:
       iErr("the only thing to allow is `write`")
+  of "stalltest":
+    # FAULT INJECTION FOR THE DEADLINE. A deadline that has never abandoned
+    # anything is not a deadline, it is untested code on the one path that runs
+    # only after everything else has already failed -- so there is a supported
+    # way to make it fire on purpose.
+    #
+    # This parks the batch permanently: the rider re-parks it every frame and it
+    # can never complete. It does NOT block the Unity thread and it does NOT
+    # loop, so an armed stall costs one branch per frame and the game keeps
+    # rendering. The ONLY way out is the deadline, which is exactly the property
+    # being proved.
+    if not gInspWriteOn or not gInspAllowWrite:
+      iErr("`stalltest` refused: it deliberately wedges a batch, so it needs " &
+           "liveInspectorWrite AND an `allow write` line earlier in this " &
+           "batch. Reads are unaffected.")
+    else:
+      gInspInjectStall = true
+      gInspStallBatch = gInspRunningBatch
+      # Park through the SAME mechanism a long `find` uses -- the command loop
+      # owns `gInspSuspended`/`gInspResumeAt` and setting them from inside a
+      # command body would not make the loop return, it would just fall through
+      # to the next command. This flag is checked immediately after the guarded
+      # body and parks the batch at this exact index.
+      gFindSuspend = true
+      iOut("  stalltest: batch " & $gInspRunningBatch & " is now WEDGED ON " &
+           "PURPOSE and will never complete. Commands after this one will " &
+           "NOT run.")
+      iOut("  EXPECT: the watchdog to report WEDGED naming this batch, then " &
+           "an ABANDONED line after " & $int(InspDeadlineMs div 1000'u64) &
+           "s and " & $InspDeadlineFires & " rider dispatches, then the " &
+           "channel to accept the NEXT batch normally. If the next batch is " &
+           "ignored, the deadline did not work and that is the bug.")
+      warn "live inspector: stalltest ARMED -- batch " & $gInspRunningBatch &
+           " has been wedged deliberately to exercise the deadline."
   of "targets":
     var pat = ""
     if toks.len > 1:
@@ -6847,13 +6934,28 @@ proc inspTick() =
   # first claimed, so this path is not gated on it -- the batch is already
   # ours and is simply not finished.
   if gInspSuspended:
-    gInspInFlight = gInspBatch
+    # THE INJECTED STALL RE-PARKS ITSELF. `stalltest` exists to prove the
+    # deadline abandons a batch that never finishes, so it must not be able to
+    # finish: it is re-parked every frame until the deadline takes it away.
+    if gInspInjectStall:
+      return
+    let ranBatch = gInspRunningBatch
+    gInspInFlight = ranBatch
     inspRunBatch()
     gInspInFlight = -1
+    # WAS THIS BATCH ABANDONED WHILE IT RAN? The deadline runs on the HOST tick
+    # thread precisely because the Unity thread may be the thing that is stuck,
+    # so a batch can be abandoned underneath the very frame that finally makes
+    # progress. Its output has already been published with an ABANDONED banner
+    # and a new batch may already be queued, so anything this late arrival has
+    # to say is dropped rather than mixed into the next batch's answers.
+    if gInspRunningBatch != ranBatch:
+      gInspSuspended = false
+      return
     if gInspSuspended:
       return
     cInspLock()
-    gInspBatchDone = gInspRunningBatch
+    gInspBatchDone = ranBatch
     cInspUnlock()
     return
   if cInspHave() == 0'i32:
@@ -6870,10 +6972,22 @@ proc inspTick() =
   cInspSetPending(0'i32)
   gInspRunningBatch = gInspBatch
   gInspInFlight = gInspBatch
+  # THE DEADLINE CLOCK STARTS AT THE CLAIM, not at the handover. The two are
+  # different questions with different answers: "nobody picked it up" is already
+  # diagnosed by `InspStuckMs` on the poll thread, and blaming a slow command
+  # for a dispatch that never happened is exactly the confidently wrong report
+  # this file keeps having to un-write.
+  gInspClaimMs = cNowMs()
+  gInspClaimFires = gInspFires
+  let ranBatch = gInspRunningBatch
   inspRunBatch()
   gInspPhase = 3
   gInspInFlight = -1
   gInspPhase = 0
+  if gInspRunningBatch != ranBatch:
+    # Abandoned mid-flight; see the note on the resume path above.
+    gInspSuspended = false
+    return
   # A SUSPENDED batch is not a finished batch. Publishing the handshake here
   # would hand a half-run batch's output to the tick thread as if it were the
   # answer, and the rest of the commands would then run against a channel that
@@ -7010,6 +7124,15 @@ proc inspectPoll(now: uint64) =
      gInspOut.len > 0:
     inspWriteOut()
     gInspHandedMs = 0'u64
+    # THE HISTORY, MOVED FORWARD EXACTLY HERE -- at the moment the answers
+    # reached the out file, which is the only event that means "delivered".
+    # `gInspBatchDone` is cleared on the next line and is therefore useless as
+    # a record of what completed; this is what the watchdog reads instead.
+    if done > gInspDelivered:
+      gInspDelivered = done
+    if gInspRunningBatch == done:
+      gInspRunningBatch = -1
+      gInspClaimMs = 0'u64
     cInspLock()
     gInspBatchDone = -1
     gInspOut = @[]
@@ -7017,6 +7140,78 @@ proc inspectPoll(now: uint64) =
   if now < gInspNextPollMs:
     return
   gInspNextPollMs = now + 250'u64
+  # ---------------------------------------------------------------------------
+  # THE DEADLINE ON AN IN-FLIGHT BATCH.
+  #
+  # This runs on the HOST TICK THREAD, and it has to: the thing it is watching
+  # is the Unity thread, and a check that lives on the stuck thread cannot run.
+  # It is also why this must never block -- it reads counters and returns.
+  #
+  # It fires only when BOTH bounds are exceeded (see `InspDeadlineFires`): long
+  # enough in wall clock AND the rider demonstrably dispatched hundreds of times
+  # since the claim without finishing. A raid load stalls the main thread for a
+  # long time legitimately, and that case fails the second bound.
+  # ---------------------------------------------------------------------------
+  if gInspRunningBatch >= 0 and gInspDelivered < gInspRunningBatch and
+     gInspClaimMs != 0'u64 and now - gInspClaimMs > InspDeadlineMs and
+     gInspFires - gInspClaimFires > InspDeadlineFires:
+    let stuck = gInspRunningBatch
+    let heldMs = now - gInspClaimMs
+    let phase = gInspPhase
+    let idx = gInspCurIdx
+    var cmdText = "(index out of range)"
+    if idx >= 0 and idx < gInspCmds.len:
+      cmdText = gInspCmds[idx]
+    inc gInspAbandons
+    # Tear the batch down BEFORE announcing it, so the announcement describes a
+    # channel that is already re-armed rather than one that is about to be.
+    gInspRunningBatch = -1
+    gInspInFlight = -1
+    gInspSuspended = false
+    gInspPhase = 0
+    gInspBodyMode = 0
+    gInspInjectStall = false
+    gInspStallBatch = -1
+    gInspClaimMs = 0'u64
+    gInspHandedMs = 0'u64
+    cInspSetPending(0'i32)
+    # RE-ARM THE CONTENT COMPARISON. The poll only queues when the command file
+    # DIFFERS from the last text it read, so after an abandon the obvious human
+    # response -- resend the same batch -- would be swallowed as "unchanged".
+    # Clearing this makes the very next read look new, whatever it contains.
+    gInspLastText = ""
+    warn "live inspector: batch " & $stuck & " ABANDONED after " &
+         $int(heldMs div 1000'u64) & "s held on Unity's thread (" &
+         $(gInspFires - gInspClaimFires) & " rider dispatches since it was " &
+         "claimed, so the thread is alive and this batch is not finishing). " &
+         "It was in " &
+         (if phase == 1: "the anchor refresh"
+          elif phase == 2: "command " & $(idx + 1) & " of " & $gInspCmds.len &
+                           ": " & cmdText
+          else: "the completion handshake") &
+         ". Abandons this session: " & $gInspAbandons
+    warn "live inspector: the channel is RE-ARMED and will accept new " &
+         "batches. One batch's answers were lost; the channel was not."
+    iOut("aowlspt live inspector -- batch " & $stuck & " was ABANDONED after " &
+         $int(heldMs div 1000'u64) & "s.")
+    iOut("  It did not return to the dispatcher. Whatever it had answered " &
+         "before that point is above; the rest of the batch DID NOT RUN.")
+    iOut("  stuck at: " &
+         (if phase == 1: "the anchor refresh"
+          elif phase == 2: "command " & $(idx + 1) & " of " & $gInspCmds.len &
+                           " -- " & cmdText
+          else: "the completion handshake"))
+    iOut("  The channel has been re-armed. Re-send your batch; it will be " &
+         "accepted even if the file content is byte-identical. Do NOT re-send " &
+         "the command named above until you know why it stalled.")
+    inspWriteOut()
+    cInspLock()
+    gInspOut = @[]
+    gInspOutBytes = 0
+    gInspBatchDone = -1
+    cInspUnlock()
+    gInspDelivered = stuck
+    return
   if cInspHave() != 0'i32:
     # THE EARLY-BATCH CASE, AND WHY IT IS NOT A TIMEOUT.
     #
@@ -7148,14 +7343,52 @@ proc inspectPoll(now: uint64) =
      now - gInspLastQueueMs > 10000'u64 and
      (gInspLastWatchMs == 0'u64 or now - gInspLastWatchMs > 15000'u64):
     gInspLastWatchMs = now
-    warn "live inspector: no batch queued for " &
-         $int((now - gInspLastQueueMs) div 1000'u64) & "s while the rider IS " &
+    # THE HEADLINE MUST AGREE WITH THE COUNTERS UNDERNEATH IT.
+    #
+    # This line used to say "no batch queued" unconditionally, and printed
+    # `batch=9 done=-1` on the same line -- a diagnostic stating the opposite of
+    # its own evidence, which is the worst thing this project produces. Worse,
+    # BOTH readings of it were available and it never chose: `done=-1` is the
+    # normal state of a healthy channel that has delivered everything, because
+    # the delivery path clears it. So the headline is now chosen from
+    # `gInspDelivered`, which is a history and not a handshake, and it names
+    # three distinguishable states rather than asserting one.
+    let secs = $int((now - gInspLastQueueMs) div 1000'u64)
+    var head = ""
+    if gInspRunningBatch >= 0 and gInspDelivered < gInspRunningBatch:
+      head = "WEDGED -- batch " & $gInspRunningBatch & " was claimed by " &
+             "Unity's thread " &
+             (if gInspClaimMs != 0'u64 and now > gInspClaimMs:
+                $int((now - gInspClaimMs) div 1000'u64)
+              else: "?") &
+             "s ago and has NOT completed" &
+             (if gInspCurIdx >= 0 and gInspCurIdx < gInspCmds.len:
+                "; it is stuck at command " & $(gInspCurIdx + 1) & " of " &
+                $gInspCmds.len & ": " & gInspCmds[gInspCurIdx]
+              else: "") &
+             ". It will be ABANDONED and the channel re-armed once it has " &
+             "held for " & $int(InspDeadlineMs div 1000'u64) & "s AND the " &
+             "rider has dispatched " & $InspDeadlineFires & " more times."
+    elif gInspDelivered >= gInspBatch:
+      head = "IDLE and HEALTHY -- batch " & $gInspBatch & " completed and its " &
+             "answers were delivered. No NEW batch has been queued for " &
+             secs & "s because the command file's CONTENT has not changed. " &
+             "That is a fact about the writer, not about the host: check that " &
+             "your edits are reaching the file named below (bump a #serial), " &
+             "and note that a channel with nothing to do looks exactly like " &
+             "this."
+    else:
+      head = "batch " & $gInspBatch & " is QUEUED and has not been claimed " &
+             "for " & secs & "s"
+    warn "live inspector: " & head & " -- the rider IS " &
          "dispatching (" & $gInspFires & " fires). polls=" & $gInspPolls &
          " reads=" & $gInspReads & " readFails=" & $gInspReadFails &
          " unchanged=" & $gInspUnchanged &
          " lastRead=" & $text.len & "B lastKnown=" & $gInspLastText.len & "B" &
          " pending=" & $int(cInspHave()) & " batch=" & $gInspBatch &
-         " done=" & $gInspBatchDone & " suspended=" & $gInspSuspended &
+         " delivered=" & $gInspDelivered & " running=" & $gInspRunningBatch &
+         " done(handshake,cleared-on-delivery)=" & $gInspBatchDone &
+         " suspended=" & $gInspSuspended & " abandons=" & $gInspAbandons &
          " inFlight=" & $gInspInFlight & "  file=" & gInspCmdPath
     if gInspReadFails > 0 and not readOk:
       warn "live inspector: the command file could NOT be opened on this " &
