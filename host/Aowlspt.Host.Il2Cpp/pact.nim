@@ -138,6 +138,10 @@ proc cPactV3z(): float64 {.importc: "aowl_pact_v3z", nodecl.}
 proc cPactLookAt(fn, self: Il2CppPtr;
                  tx, ty, tz, px, py, pz, h: float64): int32 {.
   importc: "aowl_pact_lookat", nodecl.}
+proc cPactGetV2(fn, self: Il2CppPtr): int32 {.
+  importc: "aowl_pact_get_v2", nodecl.}
+proc cPactRotX(): float64 {.importc: "aowl_pact_rot_x", nodecl.}
+proc cPactRotY(): float64 {.importc: "aowl_pact_rot_y", nodecl.}
 proc cPactLookX(): float64 {.importc: "aowl_pact_look_x", nodecl.}
 proc cPactLookY(): float64 {.importc: "aowl_pact_look_y", nodecl.}
 proc cPactLoadMag(fn, self, ammo, mag: Il2CppPtr;
@@ -204,6 +208,7 @@ const
   PactTMagCount    = 28'i32  ## EFT.InventoryLogic.Magazine::get_Count
   PactTFirstAmmo   = 29'i32  ## EFT.InventoryLogic.Magazine::FirstRealAmmo
   PactTLookAtDir   = 30'i32  ## EFT.MovementContext::CalculateLookAtDirection
+  PactTGetRot      = 31'i32  ## EFT.MovementContext::get_Rotation
 
   PactMaxFaults = 8
     ## Rule 6, whole-FILE budget rather than per-channel. A wrong calling
@@ -249,6 +254,46 @@ const
   PvCommand  = 12'i32
   PvMagCycle = 13'i32
   PvWait     = 14'i32
+  PactRotFrames = 12'i64
+    ## Drain frames between issuing a `Rotate` and reading the aim back. The
+    ## game smooths and clamps a rotation delta over a handful of frames rather
+    ## than applying it on the one it was asked on, so an immediate read would
+    ## compare a value with very nearly itself -- the check that cannot fail, in
+    ## its purest form. 12 frames is ~0.2s at 60fps.
+
+  PactMinRotDeg = 0.30
+    ## Degrees. Below this an aim change is indistinguishable from the idle sway
+    ## and recoil settle the game applies on its own, and is counted as NO
+    ## EFFECT. Same reasoning as `PactMinMoveM`, and the same reason it is not
+    ## zero: a threshold that counted noise would pass for every request.
+
+  PvSwap     = 15'i32
+    ## Put a DIFFERENT weapon in hands, over the ECommand channel, and then
+    ## assert the finished state by re-reading `FirearmController::get_Item`.
+    ## See `PactSwapFrames` and `pactCheckSwapped`.
+
+  PactSwapFrames = 45'i64
+    ## Drain frames to wait before reading the held weapon back after a swap
+    ## command. A weapon change is an ANIMATION: the item in hands does not
+    ## change on the frame the command is translated, so reading immediately
+    ## would compare the old pointer with itself and report NO EFFECT for every
+    ## swap that in fact worked. 45 frames is ~0.75s at 60fps, comfortably past
+    ## the fastest draw in the game and still inside one script step.
+
+  PactCapsLine = "caps api=2 " &
+    "verbs=status,caps,move,look,fire,aim,sprint,jump,prone,pose,lean," &
+    "command,reload,swap,inventory,examine,magcycle,wait " &
+    "readback=move,look,sprint,aim,firemode,command,swap,magcycle " &
+    "issueonly=fire,jump,prone,pose,lean"
+    ## THE HOST HALF OF THE VERSION HANDSHAKE. An outside script asks for this
+    ## and refuses to run against an install that cannot do what the script
+    ## needs, instead of issuing a verb an old host silently answers
+    ## `unknown pact verb` to at the one moment nobody is reading.
+    ##
+    ## `readback=` and `issueonly=` are listed SEPARATELY and that separation is
+    ## the point: a caller must be able to tell a verb whose effect this build
+    ## measures from a verb it merely issues, without reading this source.
+    ## Bump `api=` whenever a name moves between those two lists.
 
   # ECommand ordinals a script is most likely to want, mirrored from the C
   # header so a caller in this file does not have to reach across.
@@ -258,6 +303,12 @@ const
   PactCmdSelPrimary2 = 42'i32
   PactCmdSelSecond   = 43'i32
   PactCmdInventory   = 37'i32
+  PactCmdSelKnife    = 38'i32
+  PactCmdExamine     = 36'i32
+  # MEASURED, not guessed: `il2cpp_resolve.py ... fields ECommand` on this
+  # build's decrypted metadata lists ExamineWeapon=36, ToggleInventory=37,
+  # SelectKnife=38, SelectFirstPrimaryWeapon=41, SelectSecondPrimaryWeapon=42,
+  # SelectSecondaryWeapon=43, ReloadWeapon=16, QuickReloadWeapon=19.
 
 type
   PactCmd = object
@@ -316,6 +367,31 @@ var gPactTook = 0'i64         ## a readback confirmed the finished state
 var gPactNoEffect = 0'i64     ## the call was made and the readback did not move
 var gPactNeverIssued = 0'i64  ## dropped before the call, with a stated reason
 var gPactLastRefusal = ""
+
+## The weapon-swap readback. Same shape as the movement mark and for the same
+## reason: the finished state is read LATER, from the game's own
+## `FirearmController::get_Item`, and never from our own write.
+var gSwapMark = false
+var gSwapWas: Il2CppPtr = nil
+  ## The weapon Item in hands when the command went out. It is held across
+  ## frames and is NEVER DEREFERENCED -- only compared, by value, with a freshly
+  ## read pointer. That is what makes holding it safe: a stale managed pointer
+  ## cannot fault a `!=`, whereas re-reading a field off it could, and Unity
+  ## fake null means readability would not have told us it was still alive
+  ## anyway.
+var gSwapAt = 0'i64
+var gSwapCmd = 0'i32
+var gSwapDone = 0'i64           ## swaps whose readback showed a DIFFERENT item
+var gSwapSame = 0'i64           ## swaps that completed with the same item held
+
+## The ROTATION readback. `EFT.MovementContext::get_Rotation` -- the aim the
+## game itself holds, x = yaw, y = pitch, in degrees. Same mark-and-compare
+## shape as movement.
+var gRotMark = false
+var gRotWasX = 0.0
+var gRotWasY = 0.0
+var gRotAt = 0'i64
+var gRotLastDeg = 0.0
 
 ## The magazine state machine.
 var gMagStep = 0'i32
@@ -500,6 +576,48 @@ proc pactPos(px, py, pz: var float64): bool =
   px = cPactV3x(); py = cPactV3y(); pz = cPactV3z()
   true
 
+proc pactMoveCtx(): Il2CppPtr =
+  ## The player's `MovementContext`, validated at every hop. nil means it did not
+  ## validate, which is a REFUSAL to look and never a value.
+  if gPactYou == nil: return nil
+  if not pactOk(gPactYou, cPactOffMoveCtx() + 8'i32): return nil
+  let mc = cReadPtrAt(gPactYou, cPactOffMoveCtx())
+  if not pactOk(mc, 0x400'i32): return nil
+  mc
+
+proc pactRot(rx, ry: var float64): bool =
+  ## `MovementContext::get_Rotation`, a Vector2 packed in RAX. The C thunk
+  ## rejects NaN and absurd magnitudes, so a half-torn-down context cannot feed
+  ## a plausible-looking angle into a rotation verdict.
+  rx = 0.0; ry = 0.0
+  let fn = pactFn(PactTGetRot)
+  if fn == nil: return false
+  let mc = pactMoveCtx()
+  if mc == nil: return false
+  if cPactGetV2(fn, mc) != 1'i32: return false
+  rx = cPactRotX(); ry = cPactRotY()
+  true
+
+proc pactHeldWeapon(): Il2CppPtr =
+  ## The `EFT.InventoryLogic.Weapon` currently IN HANDS, or nil.
+  ##
+  ## nil is a REAL ANSWER here and not only an error: a player holding a knife,
+  ## a grenade or nothing has no weapon item, and that is exactly the state a
+  ## swap moves out of. So the swap readback compares this value before and
+  ## after and asks only whether it CHANGED -- nil -> rifle and rifle -> nil are
+  ## both changes, and rifle -> the same rifle is not.
+  ##
+  ## Every hop is guarded and `pactHands()` refuses unless the game's own
+  ## `HasFirearmInHands()` said true, so `get_Item` is never called on the
+  ## abstract base.
+  let hc = pactHands()
+  if hc == nil: return nil
+  let fn = pactFn(PactTGetItem)
+  if fn == nil: return nil
+  let it = cPactPP(fn, hc)
+  if not pactOk(it, 0x80'i32): return nil
+  it
+
 # ---------------------------------------------------------------------------
 # The GamePlayerOwner capture detour
 # ---------------------------------------------------------------------------
@@ -677,6 +795,12 @@ proc pactCommand*(cmd: int32): bool =
   ## that covers reload (16), quick reload (19), weapon select (41/42/43),
   ## inventory (37) and 84 others.
   pactPost(PvCommand, 0.0, 0.0, 0.0, cmd, 0'i32)
+proc pactSwap*(cmd: int32): bool =
+  ## Enqueue a weapon swap by ECommand ordinal. 41/42 are the primary slots, 43
+  ## the secondary (sidearm), 38 the knife -- the ordinals are read from
+  ## `EFT.InputSystem.ECommand` in the metadata, not guessed.
+  pactPost(PvSwap, 0.0, 0.0, 0.0, cmd, 0'i32)
+
 proc pactMagCycle*(): bool =
   ## THE USER'S OWN EXAMPLE. Unload the magazine in the weapon and load the same
   ## ammunition back into it, so a magazine-loading feature can be observed with
@@ -828,6 +952,119 @@ proc pactNever(why: string) =
   gPactNeverIssued = gPactNeverIssued + 1
   gPactLastRefusal = why
 
+proc pactCommandIssue(cmd: int32): int32 =
+  ## Put one ECommand through the captured `GamePlayerOwner`.
+  ##
+  ## THREE OUTCOMES, and the caller must keep them apart:
+  ##   -1  NEVER ISSUED. Nothing was called; `pactNever` has already recorded the
+  ##       reason, so the caller adds nothing.
+  ##    0  issued, and `ETranslateResult` was this build's "did nothing" ordinal.
+  ##    1  issued, and the game reported it translated the command.
+  ##
+  ## `gPactAsked` is incremented HERE, once, for exactly the calls that were
+  ## really made. `took`/`noeffect` are deliberately NOT touched: `command`
+  ## scores itself on the return value, `swap` scores itself on a later reading
+  ## of the item actually in hands, and folding those together would give the
+  ## weaker of the two evidence the stronger one's name.
+  if gPactOwner == nil:
+    pactNever("ECommand " & $cmd & ": the GamePlayerOwner has not been " &
+              "captured yet. This is INCONCLUSIVE, not a refusal about the " &
+              "build -- the capture detour on LateUpdate has fired " &
+              $gPactOwnerFires & " times.")
+    return -1'i32
+  if not pactOk(gPactOwner, 0x100'i32):
+    pactNever("ECommand " & $cmd & ": the captured owner no longer validates")
+    return -1'i32
+  if gPactOwnerAgrees != 1'i32:
+    pactNever("ECommand " & $cmd & ": the captured owner's get_MyPlayer " &
+              "does not name the player we validated; refusing rather than " &
+              "driving an unknown receiver.")
+    return -1'i32
+  let fnCan = pactFn(PactTCanTrans)
+  let fnT = pactFn(PactTTranslate)
+  if fnT == nil:
+    pactNever("TranslateCommand did not verify")
+    return -1'i32
+  if fnCan != nil:
+    let can = cPactIPI(fnCan, gPactOwner, cmd)
+    if can == 0'i32:
+      # The GAME said no. That is a real, falsifiable answer and it is
+      # reported as such rather than as our own failure.
+      pactNever("ECommand " & $cmd & ": the game's own " &
+                "CanTranslateCommand returned false -- it would not accept " &
+                "this command right now.")
+      return -1'i32
+  let r = cPactIPI(fnT, gPactOwner, cmd)
+  if r < 0'i32:
+    pactNever("ECommand " & $cmd & ": could not ask")
+    return -1'i32
+  gPactAsked = gPactAsked + 1
+  if r != 0'i32: 1'i32 else: 0'i32
+
+proc pactCheckRotated() =
+  ## THE ROTATION READBACK, and the reason `look` is no longer issue-only.
+  ##
+  ## `PactRotFrames` after a `Rotate`, the aim is read again from
+  ## `EFT.MovementContext::get_Rotation` -- degrees the game maintains, that this
+  ## file never writes -- and the change is compared with `PactMinRotDeg`.
+  ##
+  ##   moved      TOOK.
+  ##   unmoved    NO EFFECT. The call was made and the aim is where it was. That
+  ##              is reachable: ask for `look 0 90` while already pitched fully
+  ##              down, and the game's own clamp refuses the delta.
+  ##   unreadable NEITHER. The mark is dropped and nothing is counted, because a
+  ##              readback that could not run is not a result about the game.
+  if not gRotMark: return
+  if (gPactTicks - gRotAt) < PactRotFrames: return
+  gRotMark = false
+  var rx = 0.0
+  var ry = 0.0
+  if not pactRot(rx, ry):
+    gPactLastRefusal = "rotation readback INCONCLUSIVE: get_Rotation refused"
+    return
+  # Yaw wraps. A turn from 359 to 1 degree is two degrees of movement, not 358,
+  # and scoring it as 358 would make a wrap look like a large successful turn
+  # while scoring it naively near the seam could also hide a real one.
+  var dx = rx - gRotWasX
+  while dx > 180.0: dx = dx - 360.0
+  while dx < -180.0: dx = dx + 360.0
+  let dy = ry - gRotWasY
+  let d = dx * dx + dy * dy
+  gRotLastDeg = d
+  if d >= (PactMinRotDeg * PactMinRotDeg): gPactTook = gPactTook + 1
+  else: gPactNoEffect = gPactNoEffect + 1
+
+proc pactCheckSwapped() =
+  ## THE WEAPON-SWAP READBACK, and the reason `swap` is not an issue-only verb.
+  ##
+  ## `PactSwapFrames` after the command was translated, the item really in hands
+  ## is read again with `FirearmController::get_Item` -- a pointer the game
+  ## maintains and this file never writes -- and compared with the one held when
+  ## the command went out.
+  ##
+  ##   DIFFERENT  the swap TOOK. A different weapon object is in hands.
+  ##   IDENTICAL  NO EFFECT. The command was accepted, the animation had ample
+  ##              time, and the player is holding the same thing. That is the
+  ##              input that makes this check fail, and it is reachable: ask for
+  ##              `swap primary` while already holding the primary.
+  ##
+  ## There is no third counter here on purpose: a nil read is a legitimate
+  ## VALUE (empty hands / a knife), not a failure to look, so it participates in
+  ## the comparison rather than escaping it.
+  if not gSwapMark: return
+  if (gPactTicks - gSwapAt) < PactSwapFrames: return
+  gSwapMark = false
+  let now = pactHeldWeapon()
+  if now != gSwapWas:
+    gSwapDone = gSwapDone + 1
+    gPactTook = gPactTook + 1
+  else:
+    gSwapSame = gSwapSame + 1
+    gPactNoEffect = gPactNoEffect + 1
+    gPactLastRefusal = "swap (ECommand " & $gSwapCmd & "): the command was " &
+      "translated and " & $PactSwapFrames & " frames later the SAME weapon " &
+      "item is still in hands. Nothing changed."
+
 proc pactExec(c: PactCmd) =
   case c.verb
   of PvMove:
@@ -852,10 +1089,25 @@ proc pactExec(c: PactCmd) =
     let fn = pactFn(PactTRotate)
     if fn == nil or gPactYou == nil:
       pactNever("Rotate: no verified target or no player"); return
+    # Mark the CURRENT aim first, from the game's own MovementContext, so the
+    # readback measures degrees the game really turned. If the mark cannot be
+    # taken the call still goes -- a look that cannot be measured is still a
+    # look -- but no mark is set, so nothing later claims to have measured it.
+    var rx0 = 0.0
+    var ry0 = 0.0
+    let marked = pactRot(rx0, ry0)
     # `ignoreClamp = false`: the game's own pitch clamp stays in force, so a
     # script cannot drive the head through the floor.
     if cPactVPUB(fn, gPactYou, c.a, c.b, 0'i32) == 1'i32:
       gPactAsked = gPactAsked + 1
+      if marked:
+        gRotWasX = rx0; gRotWasY = ry0
+        gRotAt = gPactTicks
+        gRotMark = true
+      else:
+        gPactLastRefusal = "look: the call was made but MovementContext::" &
+          "get_Rotation would not read, so this rotation is UNMEASURED. That " &
+          "is INCONCLUSIVE, not a failure."
     else: pactNever("Rotate: the thunk rejected the arguments (NaN or absurd)")
   of PvLookAt:
     let fnL = pactFn(PactTLookAtDir)
@@ -946,42 +1198,31 @@ proc pactExec(c: PactCmd) =
       if r != 0'i32: gPactTook = gPactTook + 1
       else: gPactNoEffect = gPactNoEffect + 1
   of PvCommand:
-    if gPactOwner == nil:
-      pactNever("ECommand " & $c.i & ": the GamePlayerOwner has not been " &
-                "captured yet. This is INCONCLUSIVE, not a refusal about the " &
-                "build -- the capture detour on LateUpdate has fired " &
-                $gPactOwnerFires & " times.")
+    # ETranslateResult: 0 is this build's "did nothing" ordinal by position in
+    # the enum. It is treated as NO EFFECT rather than success, which is the
+    # conservative reading; a script that needs certainty about a reload should
+    # follow the command with a Magazine.Count readback.
+    let r = pactCommandIssue(c.i)
+    if r == 1'i32: gPactTook = gPactTook + 1
+    elif r == 0'i32: gPactNoEffect = gPactNoEffect + 1
+  of PvSwap:
+    # WEAPON SWAP. The command channel puts the weapon in hands; the VERDICT
+    # comes from reading which item is in hands afterwards, not from the
+    # translate result -- ETranslateResult says the input was consumed, which is
+    # a fact about the input system and not about the player's hands.
+    if gSwapMark:
+      pactNever("swap: a previous swap's readback has not resolved yet")
       return
-    if not pactOk(gPactOwner, 0x100'i32):
-      pactNever("ECommand " & $c.i & ": the captured owner no longer validates")
-      return
-    if gPactOwnerAgrees != 1'i32:
-      pactNever("ECommand " & $c.i & ": the captured owner's get_MyPlayer " &
-                "does not name the player we validated; refusing rather than " &
-                "driving an unknown receiver.")
-      return
-    let fnCan = pactFn(PactTCanTrans)
-    let fnT = pactFn(PactTTranslate)
-    if fnT == nil: pactNever("TranslateCommand did not verify"); return
-    if fnCan != nil:
-      let can = cPactIPI(fnCan, gPactOwner, c.i)
-      if can == 0'i32:
-        # The GAME said no. That is a real, falsifiable answer and it is
-        # reported as such rather than as our own failure.
-        pactNever("ECommand " & $c.i & ": the game's own " &
-                  "CanTranslateCommand returned false -- it would not accept " &
-                  "this command right now.")
-        return
-    let r = cPactIPI(fnT, gPactOwner, c.i)
-    if r < 0'i32: pactNever("ECommand " & $c.i & ": could not ask")
-    else:
-      gPactAsked = gPactAsked + 1
-      # ETranslateResult: 0 is this build's "did nothing" ordinal by position in
-      # the enum. It is treated as NO EFFECT rather than success, which is the
-      # conservative reading; a script that needs certainty about a reload
-      # should follow the command with a Magazine.Count readback.
-      if r != 0'i32: gPactTook = gPactTook + 1
-      else: gPactNoEffect = gPactNoEffect + 1
+    # Read the BEFORE state first. If the mark cannot be taken there is nothing
+    # to compare against later, so the swap is refused rather than issued blind:
+    # an unmeasurable actuation reported as a pass is the check that cannot fail.
+    let was = pactHeldWeapon()
+    let r = pactCommandIssue(c.i)
+    if r < 0'i32: return
+    gSwapWas = was
+    gSwapAt = gPactTicks
+    gSwapCmd = c.i
+    gSwapMark = true
   of PvMagCycle:
     if gMagStep != 0'i32:
       pactNever("magcycle: one is already running"); return
@@ -1044,6 +1285,12 @@ proc pactTickBody(a: Il2CppPtr): Il2CppPtr {.
     # against a world that no longer exists.
     gPactHoldFrames = 0'i32
     gPactMoveMark = false
+    # Abandon, do not resolve: a swap readback taken against a world that no
+    # longer exists would score itself on a pointer comparison whose meaning
+    # ended with the raid.
+    gSwapMark = false
+    gSwapWas = nil
+    gRotMark = false
     if gMagStep != 0'i32:
       magFail("the raid phase stopped reading DEPLOYED mid-cycle")
     return cast[Il2CppPtr](1)
@@ -1071,8 +1318,15 @@ proc pactTickBody(a: Il2CppPtr): Il2CppPtr {.
              "the corroboration failing, not the detour."
 
   pactCheckMoved()
+  pactCheckRotated()
+  pactCheckSwapped()
   pactApplyHeld()
   magTick()
+
+  # A swap's readback has not landed yet: block further dequeues exactly as the
+  # held-move and magazine machines do, so a script's `swap` and the step after
+  # it cannot overlap into a comparison against the wrong frame.
+  if gSwapMark or gRotMark: return cast[Il2CppPtr](1)
 
   if gPactWaitFrames > 0'i32:
     gPactWaitFrames = gPactWaitFrames - 1'i32
@@ -1115,6 +1369,8 @@ proc pactStatus*(): string =
     " | asked=" & $gPactAsked & " took=" & $gPactTook &
     " noeffect=" & $gPactNoEffect & " never=" & $gPactNeverIssued &
     " qdrop=" & $gPactQDropped &
+    " | swapok=" & $gSwapDone & " swapsame=" & $gSwapSame &
+    " rot2=" & $gRotLastDeg &
     " | magcycles=" & $gMagCycles & " magok=" & $gMagOk &
     " magfail=" & $gMagFailed & " (" & gMagWhy & ")"
   if gPactLastRefusal.len > 0:
@@ -1149,6 +1405,14 @@ proc pactRpcDrain() =
   let sub = iLower(toks[0])
   if sub == "status":
     pactRpcAnswer("status " & pactStatus())
+    return
+  if sub == "caps":
+    # ABOVE every gate, exactly like `status`. The whole point of a handshake is
+    # that it is answerable by an install whose feature flags are off: a script
+    # must be able to tell "this host is too old to do what I need" from "this
+    # host can, but playerActuation is off", and a caps request that were itself
+    # gated would collapse those two into one silence.
+    pactRpcAnswer(PactCapsLine)
     return
   if not gPactOn:
     pactRpcAnswer("REFUSED \"" & req & "\": flag playerActuation is OFF. " &
@@ -1223,7 +1487,28 @@ proc pactRpcDrain() =
     if not okn1: bad = "usage: pact command ECOMMAND (16 = reload)"
     else: posted = pactCommand(int32(n1))
   of "reload":
-    posted = pactCommand(16'i32)
+    posted = pactCommand(PactCmdReload)
+  of "swap":
+    # NAMED slots, not a bare ordinal. `pact command 41` still works and always
+    # did; this exists because a script that says `swap secondary` is readable
+    # and because only this path takes the get_Item readback -- an ordinal sent
+    # through `command` is scored on ETranslateResult, which says the INPUT was
+    # consumed and says nothing about what is in the player's hands.
+    let which = (if toks.len > 1: iLower(toks[1]) else: "")
+    if which == "primary" or which == "primary1":
+      posted = pactSwap(PactCmdSelPrimary1)
+    elif which == "primary2":
+      posted = pactSwap(PactCmdSelPrimary2)
+    elif which == "secondary" or which == "sidearm" or which == "pistol":
+      posted = pactSwap(PactCmdSelSecond)
+    elif which == "knife" or which == "melee":
+      posted = pactSwap(PactCmdSelKnife)
+    else:
+      bad = "usage: pact swap primary|primary2|secondary|knife"
+  of "inventory":
+    posted = pactCommand(PactCmdInventory)
+  of "examine":
+    posted = pactCommand(PactCmdExamine)
   else:
     bad = "unknown pact verb \"" & sub & "\""
   if bad.len > 0:

@@ -89,6 +89,31 @@ const
     ## honest loadout measured -- a fully kitted PMC with meds, ammo and food --
     ## is 18 requests.
 
+  LoadoutApi* = 2
+    ## THE BACKEND HALF OF THE VERSION HANDSHAKE. Bumped whenever a script can
+    ## ask for something an older `tarkov.dll` would have silently ignored.
+    ##
+    ## The measured failure this exists to stop: a script calls `equipWeapon`,
+    ## which sends a `magazine` field; a DEPLOYED tarkov.dll built before that
+    ## field existed parses the spec, does not see `magazine`, mints the rifle
+    ## alone and reports `placed=1` with no rejection. `applyGear` in the runner
+    ## only detects a MISSING ROUTE (HTTP 404) -- an OLD route answers 200 and
+    ## the run passes having tested nothing. That is precisely a check that
+    ## cannot fail, and version-blindness is what made it possible.
+
+  LoadoutCaps* = "loadout,verify,clear,slot,inside,stash,query,count," &
+                 "condition,ammo,magazine,chamber,perentry,baseline,rejections"
+    ## Capability TOKENS, one per thing a script may depend on, deliberately
+    ## finer-grained than the api integer. A caller declares the tokens it needs
+    ## and is refused BY NAME for the ones this build does not have -- "this
+    ## install's tarkov.dll has no `magazine`" is actionable where "api 1 < 2"
+    ## is not.
+    ##
+    ## This literal lives in THIS file, beside the code that implements every
+    ## token, and not in `tarkov.nim` where the route is registered: a
+    ## capability list kept next to the transport drifts from the feature, and a
+    ## handshake that lies is worse than none.
+
   MaxCountPerRequest = 5000
     ## Same cap `emu/spawn` uses, and for the same reason: a typo in a count is a
     ## stash to clean up by hand.

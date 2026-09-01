@@ -19,6 +19,15 @@ headless (see docs/HEADLESS.md); `aowlspt-launch --low-render` is the closest
 thing and it still renders. If you came here looking for a way to run a raid
 without a screen, this is not it.
 
+If what you actually want is a raid running while you use the machine for
+something else, that IS built, and it is not this file:
+
+    python tools\harness.py run --offscreen --profile <id>
+
+which parks the client's window off every monitor (tools/offscreen.py) and
+verifies it against the finished state. The renderer still runs -- it is out of
+your way, not headless -- and the tool says so every time.
+
 THE RULE THIS FILE EXISTS TO OBEY (CLAUDE.md 9b)
 -------------------------------------------------
 A run must be able to FAIL. A suite that cannot fail is not a test, and a CI

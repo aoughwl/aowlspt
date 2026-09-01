@@ -292,6 +292,7 @@ typedef struct AowlPactTarget {
 #define AOWL_PACT_MG_GET_COUNT         28
 #define AOWL_PACT_MG_FIRST_AMMO        29
 #define AOWL_PACT_MC_LOOKAT_DIR        30
+#define AOWL_PACT_MC_GET_ROTATION      31
 
 static const AowlPactTarget aowl_pact_targets[] = {
     /* ---------------- EFT.Player, INSTANCE, Assembly-CSharp.dll ---------- */
@@ -502,6 +503,27 @@ static const AowlPactTarget aowl_pact_targets[] = {
     { "EFT.MovementContext::CalculateLookAtDirection", 0x88C080u,
       { 0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x81,0xEC,0xA0,0x00,0x00,0x00,
         0x48,0x8B,0x41 }, 16 },
+
+    /* [31] Vector2 get_Rotation() rid resolved by name, arity=0, UNIQUE
+     * (owners=1, `il2cpp_resolve.py ... shared 0x8947A0`). THE ROTATION
+     * READBACK, and the reason `look` is no longer issue-only.
+     *
+     * The player's aim is x = yaw in degrees, y = pitch; `Player::Rotate` writes
+     * through to this same context. Reading it back after a Rotate is therefore
+     * the game's own number, not an echo of our write -- which is exactly what
+     * `look` had lacked and why every `actuated(s, "look ...")` was correctly
+     * reporting INCONCLUSIVE.
+     *
+     * Vector2 is 8 bytes, so Win64 returns it PACKED IN RAX -- the same measured
+     * ABI the inspector's `rect` verb uses, and the same shape as
+     * CalculateLookAtDirection's return above. It is NOT an sret.
+     *
+     * The prologue is a real body (`push rbx; sub rsp,0x20;` then the class-init
+     * check `cmp byte [rip+0x68241E6],0`), not the `C2 00 00` universal empty
+     * stub that 6,438 methods share. */
+    { "EFT.MovementContext::get_Rotation", 0x8947A0u,
+      { 0x40,0x53,0x48,0x83,0xEC,0x20,0x80,0x3D,0xE6,0x41,0x82,0x06,0x00,
+        0x48,0x8B,0xD9 }, 16 },
 };
 
 #define AOWL_PACT_TARGET_COUNT \
@@ -823,6 +845,35 @@ static int32_t aowl_pact_lookat(void* fn, void* self,
 }
 static double aowl_pact_look_x(void) { return aowl_pact_look[0]; }
 static double aowl_pact_look_y(void) { return aowl_pact_look[1]; }
+
+/* INSTANCE, 0 args -> PACKED Vector2 in RAX.
+ * MovementContext::get_Rotation -- the aim the game itself holds: x = yaw in
+ * degrees, y = pitch. NOT an sret: 8 bytes come back in RAX, the same measured
+ * Win64 shape as CalculateLookAtDirection's return above.
+ *
+ * REFUSES rather than reporting, on NaN and on a magnitude no angle can have.
+ * 1e5 is deliberately loose -- the game does not normalise yaw into [0,360) at
+ * every moment and a tight range would reject a legal reading -- but it is
+ * still far tighter than "any float", so a half-torn-down context cannot feed a
+ * plausible number into a rotation verdict. A refusal here makes the readback
+ * INCONCLUSIVE at the caller, which is the third outcome and not a failure. */
+static double aowl_pact_rot[2] = { 0.0, 0.0 };
+static int32_t aowl_pact_get_v2(void* fn, void* self) {
+    typedef unsigned long long (*AowlPact_U_P)(void*, void*);
+    float out[2];
+    unsigned long long u;
+    if (!fn || !self) return 0;
+    u = ((AowlPact_U_P)fn)(self, NULL);
+    memcpy(out, &u, sizeof(u));
+    if (out[0] != out[0] || out[1] != out[1]) return 0;
+    if (out[0] > 1.0e5f || out[0] < -1.0e5f) return 0;
+    if (out[1] > 1.0e5f || out[1] < -1.0e5f) return 0;
+    aowl_pact_rot[0] = (double)out[0];
+    aowl_pact_rot[1] = (double)out[1];
+    return 1;
+}
+static double aowl_pact_rot_x(void) { return aowl_pact_rot[0]; }
+static double aowl_pact_rot_y(void) { return aowl_pact_rot[1]; }
 
 /* INSTANCE, (Ammo, Magazine, int, bool) -> Task<IResult>, IGNORED.
  * PlayerInventoryController::LoadMagazine. The Task is a managed object the

@@ -141,18 +141,36 @@
 ## ===========================================================================
 ##
 ## The verbs are NOT equally strong, and this library refuses to pretend they
-## are. Exactly two of them assert a FINISHED STATE:
+## are. These assert a FINISHED STATE, each read back from a value the GAME
+## maintains and this library never writes:
 ##
-##   walkAndSee   pact re-reads `EFT.Player::get_Position` -- the game's own
-##                number -- and reports metres actually travelled.
-##   magCycle     the completion line carries the game's own `Magazine.Count`.
+##   walkAndSee        `EFT.Player::get_Position` -- metres actually travelled.
+##   magCycle          the completion line carries the game's `Magazine.Count`.
+##   sprintAndSee      `EFT.Player::get_IsSprintEnabled` after `EnableSprint`.
+##   aimAndSee         `FirearmController::get_IsAiming` after `set_IsAiming`.
+##   swapWeaponAndSee  `FirearmController::get_Item` 45 frames after the swap
+##                     command -- a DIFFERENT weapon object must be in hands.
+##   lookAndSee        `EFT.MovementContext::get_Rotation` -- degrees of yaw and
+##                     pitch the game itself holds, wrapped across 0.
 ##
-## Every other verb (`look`, `fire`, `aim`, `sprint`, `jump`, `prone`, `pose`,
-## `lean`, `command`, `reload`) is ISSUE-ONLY: a PASS means THE HOST ACCEPTED
-## THE CALL. pact has no readback for rotation, trigger, aim, stance or the
-## ECommand channel today. An issue-only PASS that read like a verified one
-## would be precisely the check that cannot fail, so the distinction is in the
-## transcript, in the doc comments, and in `actuated`'s INCONCLUSIVE.
+## `fire`, `jump`, `prone`, `pose`, `lean`, `toggleInventory`, `examineWeapon`,
+## `command` and `reload` are ISSUE-ONLY: a PASS means THE HOST ACCEPTED THE
+## CALL. pact has no readback for the trigger or for stance today, and saying so
+## is better than upgrading an INCONCLUSIVE to a PASS. An issue-only PASS that read
+## like a verified one would be precisely the check that cannot fail, so the
+## distinction is in the transcript, in the doc comments, and in `actuated`'s
+## INCONCLUSIVE.
+##
+## ===========================================================================
+## THE VERSION HANDSHAKE -- why a green run used to mean nothing
+## ===========================================================================
+##
+## `run` asks the DEPLOYED install what it can do before it mints anything, on
+## both halves: `/aowlspt/tarkov/autoscript/capabilities` for the backend and
+## `pact caps` for the host. Every declaration verb records the tokens it needs
+## (`equipWeapon` needs `magazine`; `swapWeaponAndSee` needs the `swap` verb),
+## so a script never has to remember to. See `checkVersion` for the exact input
+## that used to pass and now fails.
 ##
 ## The full reference -- every verb, its arguments, its refusals, the loadout
 ## wire format and the report's field meanings -- is `docs/AUTOMATION-API.md`.
@@ -252,6 +270,14 @@ type
       ## second one run.
     actuations*: int      ## pact requests this script sent
     actuationsOk*: int    ## of those, ones whose outcome line was observed
+    needBackend: seq[string]
+      ## Capability tokens this script needs from the DEPLOYED tarkov.dll. Every
+      ## declaration verb adds its own, so a script never has to remember to.
+    needPact: seq[string]
+      ## Verb names this script needs from the DEPLOYED host DLL's pact.
+    apiSeen*: int         ## the backend's `api` integer, -1 if never answered
+    capsSeen*: string     ## its capability list, verbatim
+    pactCapsSeen*: string ## the host's `caps` line, verbatim
       ## Whether `enterRaid` ran. The never-deployed rule in `finish` applies
       ## only when it did: a script that deliberately tests gear alone and never
       ## goes near a raid is not making a claim about deployment, and failing it
@@ -286,7 +312,9 @@ proc newScript*(name: string): Script =
          gearRequested: 0, gearMinted: 0, gearPlaced: 0, phaseSeen: "",
          entered: false, steps: 0, raidAttempted: false,
          actuation: false, ammoMode: "", inspSerial: 0,
-         actuations: 0, actuationsOk: 0)
+         actuations: 0, actuationsOk: 0,
+         needBackend: @["loadout"], needPact: @[],
+         apiSeen: -1, capsSeen: "", pactCapsSeen: "")
 
 proc atRoot*(s: var Script; root: string) =
   ## The install to drive. Default `D:\Aowlspt`.
@@ -319,6 +347,16 @@ proc attachOnly*(s: var Script) =
   ## already has the client up.
   s.launch = false
 
+proc needsBackend*(s: var Script; cap: string) =
+  ## Declare that this script cannot mean anything against a `tarkov.dll` that
+  ## lacks `cap`. Declaring twice is harmless; `checkVersion` de-duplicates by
+  ## reporting each missing token once.
+  s.needBackend.add cap
+
+proc needsPact*(s: var Script; verb: string) =
+  ## Declare that this script needs `verb` from the DEPLOYED host DLL's pact.
+  s.needPact.add verb
+
 proc addGear(s: var Script; g: Gear) =
   s.gear.add g
 
@@ -340,6 +378,7 @@ proc equipLoaded*(s: var Script; slot, tpl, ammo: string) =
   ## this verb at one is REFUSED by the backend with a reason that says the
   ## template is a chambered item and that no `magazine` was named -- which is
   ## the right refusal, but `equipWeapon` is the verb you wanted.
+  needsBackend(s, "ammo")
   addGear(s, Gear(tpl: tpl, query: tpl, slot: slot, inside: "", count: 1,
                   ammo: ammo, magazine: "", condition: 100))
 
@@ -372,6 +411,12 @@ proc equipWeapon*(s: var Script; slot, weapon, magazine, ammo: string) =
   ## counts its `mod_magazine` children and THEIR cartridges. `magPlaced == 0`
   ## and `roundsPlaced == 0` are separate FAILs, because "no magazine" and "an
   ## empty magazine" break a raid differently.
+  # THE HANDSHAKE'S REASON FOR EXISTING. A tarkov.dll built before `magazine`
+  # existed parses this spec, ignores the field, mints the rifle alone and
+  # answers 200 with placed=1. `checkVersion` is what turns that into a loud
+  # refusal instead of a green run that tested nothing.
+  needsBackend(s, "magazine")
+  needsBackend(s, "ammo")
   addGear(s, Gear(tpl: weapon, query: weapon, slot: slot, inside: "", count: 1,
                   ammo: ammo, magazine: magazine, condition: 100))
 
@@ -386,6 +431,7 @@ proc carry*(s: var Script; container, tpl: string; count: int) =
   ## Equip the container EARLIER IN THE SCRIPT than the things that go in it.
   ## Requests are applied in declaration order, and "nothing is worn in
   ## TacticalVest" is the refusal you get otherwise -- it is named, not silent.
+  needsBackend(s, "inside")
   addGear(s, Gear(tpl: tpl, query: tpl, slot: "", inside: container,
                   count: count, ammo: "", magazine: "", condition: 100))
 
@@ -393,6 +439,8 @@ proc carryLoaded*(s: var Script; container, tpl: string; count: int;
                   ammo: string) =
   ## `count` magazines in the container, each loaded with `ammo`. This is the
   ## "magazines = 3, ammo = m855a1" case.
+  needsBackend(s, "inside")
+  needsBackend(s, "ammo")
   addGear(s, Gear(tpl: tpl, query: tpl, slot: "", inside: container,
                   count: count, ammo: ammo, magazine: "", condition: 100))
 
@@ -407,12 +455,14 @@ proc byName*(s: var Script; query: string; count: int) =
   ## and deliberately strict: an AMBIGUOUS name is REFUSED and the candidates
   ## are listed, because "the first match" is an arbitrary document order and a
   ## test that equipped the wrong rifle proves nothing.
+  needsBackend(s, "query")
   addGear(s, Gear(tpl: "", query: query, slot: "", inside: "", count: count,
                   ammo: "", magazine: "", condition: 100))
 
 proc wear*(s: var Script; slot, tpl: string; condition: int) =
   ## `equip` with a durability/resource percentage, applied only to the
   ## properties the template actually declares.
+  needsBackend(s, "condition")
   addGear(s, Gear(tpl: tpl, query: tpl, slot: slot, inside: "", count: 1,
                   ammo: "", magazine: "", condition: condition))
 
@@ -758,6 +808,122 @@ proc launchStack*(s: var Script): bool =
       discard
   result = step(s, "STACK ", vInconclusive,
                 "the backend's control port never answered in 240s -- " & why)
+
+# ---------------------------------------------------------------------------
+# Step 1b -- THE VERSION HANDSHAKE
+#
+# THE BUG THIS CLOSES, stated as the input that used to pass and should not.
+# ------------------------------------------------------------------------
+# Deploy a `tarkov.dll` built before `equipWeapon`'s `magazine` field existed.
+# Run `scripts/woods_pmc_m4.nim` against it. The old route is PRESENT, so there
+# is no 404; it parses the spec, never looks at `magazine`, mints the rifle,
+# re-reads the profile, finds one rifle worn in FirstPrimaryWeapon and answers
+# `requested=1 minted=1 placed=1 verdict=PASS`. The runner reports PASS. The
+# raid starts with an unloaded rifle and the feature under test was never
+# exercised.
+#
+# `applyGear` could not catch it: its only staleness signal was HTTP 404, which
+# distinguishes "no route" from "a route", not "a current route" from "an old
+# one". So both halves of the install now SAY WHAT THEY CAN DO, and every
+# declaration verb records what it needs.
+#
+# WHY TWO HALVES. Gear is minted by the backend (`tarkov.dll`) and the player is
+# driven by the host (`aowlspt-host-il2cpp.dll`). They are deployed separately
+# and go stale separately -- a run has repeatedly had a current backend and a
+# host from a previous batch. One handshake covering both would report a
+# half-stale install as wholly stale, which is a worse diagnosis than none.
+# ---------------------------------------------------------------------------
+
+proc capsHave(caps, token: string): bool =
+  ## Exact TOKEN membership in a comma-separated list -- never `contains`.
+  ## `contains` would let `magazine` be satisfied by a build that only declared
+  ## `magazines`, or `ammo` by `ammobox`: a substring test on a capability list
+  ## is a check that can pass for the wrong reason, which is the shape of defect
+  ## this whole step exists to stop.
+  result = false
+  var cur = ""
+  var i = 0
+  while i <= caps.len:
+    if i == caps.len or caps[i] == ',' or caps[i] == ' ':
+      if cur == token: return true
+      cur = ""
+    else:
+      cur.add caps[i]
+    inc i
+
+proc checkVersion*(s: var Script): bool =
+  ## Ask the DEPLOYED install what it can do, and refuse loudly if it cannot do
+  ## what this script declared it needs.
+  ##
+  ##   PASS          every declared token is present in what the install
+  ##                 reported, on both halves this script actually uses
+  ##   FAIL          the install ANSWERED and a token this script needs is
+  ##                 absent -- including the 404 case, which is a measured
+  ##                 answer ("this build has no autoscript routes at all") and
+  ##                 not an inability to look
+  ##   INCONCLUSIVE  nothing answered: no control port, or a transport error.
+  ##                 Nothing was learned about the install's age.
+  if s.port <= 0:
+    return step(s, "VERSN ", vInconclusive,
+                "there is no control port, so the install's capabilities " &
+                "could not be asked for and its age is unknown")
+  let r = call(s.port, "GET", "/aowlspt/tarkov/autoscript/capabilities", "",
+               ScriptSession)
+  if not r.ok:
+    return step(s, "VERSN ", vInconclusive,
+                "the capabilities route could not be reached: " & r.error)
+  if r.status == 404:
+    return step(s, "VERSN ", vFail,
+                "the backend answers but has NO " &
+                "/aowlspt/tarkov/autoscript/capabilities route. This " &
+                "install's tarkov.dll PREDATES the version handshake, so " &
+                "nothing it mints can be trusted to match what this script " &
+                "asked for. Rebuild and redeploy the tarkov mod. Refusing " &
+                "rather than minting against an install of unknown age.")
+  if r.status != 200:
+    return step(s, "VERSN ", vInconclusive,
+                "the capabilities route answered HTTP " & $r.status)
+  s.apiSeen = jsonInt(r.body, "api", -1)
+  # The caps array, flattened to a comma list. `jsonStr` reads one string; this
+  # reads the whole array, because a partial read here would make a missing
+  # token indistinguishable from a token past wherever the read stopped.
+  var caps = ""
+  let at = find(r.body, "\"caps\":[")
+  if at >= 0:
+    var i = at + 8
+    while i < r.body.len and r.body[i] != ']':
+      if r.body[i] == '"':
+        inc i
+        while i < r.body.len and r.body[i] != '"':
+          caps.add r.body[i]
+          inc i
+        caps.add ','
+      inc i
+  s.capsSeen = caps
+  if caps.len == 0:
+    return step(s, "VERSN ", vFail,
+                "the capabilities route answered 200 and declared NO caps at " &
+                "all (api=" & $s.apiSeen & "). An install that cannot name " &
+                "one capability cannot be checked against, so this is refused " &
+                "rather than assumed current.")
+  var missing = ""
+  var nMissing = 0
+  for want in s.needBackend:
+    if not capsHave(caps, want) and find("," & missing, "," & want & ",") < 0:
+      if missing.len > 0: missing.add ","
+      missing.add want
+      nMissing = nMissing + 1
+  if nMissing > 0:
+    return step(s, "VERSN ", vFail,
+                "this install's tarkov.dll is STALE for this script: it " &
+                "declares api=" & $s.apiSeen & " caps=[" & caps &
+                "] and does NOT have [" & missing & "], which this script's " &
+                "declarations require. It would have answered 200 and minted " &
+                "something else. Rebuild and redeploy the tarkov mod.")
+  result = step(s, "VERSN ", vPass,
+                "the deployed tarkov.dll declares api=" & $s.apiSeen &
+                " and has every capability this script needs (" &
+                $s.needBackend.len & " asked)")
 
 # ---------------------------------------------------------------------------
 # Step 2 -- the profile
@@ -1226,6 +1392,69 @@ proc pactStatusLine*(s: var Script; seconds: int = 15): string =
     inc i
   result = line
 
+proc checkPactVersion*(s: var Script): bool =
+  ## THE HOST HALF OF THE HANDSHAKE. Ask the deployed host DLL's pact what verbs
+  ## it has, and refuse if this script needs one it does not.
+  ##
+  ## Only meaningful for a script that declared `withActuation`; a gear-only
+  ## script is not making a claim about the host and is not failed for one.
+  ##
+  ##   PASS          every verb this script needs is in the host's `caps` line
+  ##   FAIL          the line came back and a needed verb is absent -- a stale
+  ##                 host DLL, measured
+  ##   INCONCLUSIVE  no `caps` line at all. Either the host predates the
+  ##                 handshake or the inspector channel is not draining, and
+  ##                 those are not the same fact. `pact caps` is answered ABOVE
+  ##                 every gate in the host, so a silent channel is the only
+  ##                 reason a CURRENT host would not answer.
+  if not s.actuation: return true
+  let mark = logSize(s)
+  if not inspectSend(s, "caps"):
+    return step(s, "PVERSN", vInconclusive,
+                "could not write the inspector command file under " & s.root &
+                "\\aowlspt, so the host was never asked what it can do")
+  if not waitForLine(s, mark, "pact-rpc: caps ", 25):
+    return step(s, "PVERSN", vInconclusive,
+                "the host log carried no `pact-rpc: caps` line in 25s. Either " &
+                "this install's host DLL PREDATES the pact handshake, or the " &
+                "inspector channel is not draining at all (liveInspector / " &
+                "liveInspectorWrite are read at BOOT). Those are different " &
+                "facts and this step will not guess between them.")
+  let tail = readTail(hostLogPath(s), mark)
+  let at = find(tail, "pact-rpc: caps ")
+  var line = ""
+  var i = at
+  while i < tail.len and tail[i] != '\r' and tail[i] != '\n':
+    line.add tail[i]
+    inc i
+  s.pactCapsSeen = line
+  # Only the `verbs=` field. The line also carries `readback=` and `issueonly=`,
+  # which are SUBSETS naming how strong each verb's evidence is; matching a need
+  # against the whole line would let `readback=swap` satisfy a script that needs
+  # the `swap` verb even on a build where the verb had been withdrawn.
+  var verbs = ""
+  let vat = find(line, "verbs=")
+  if vat >= 0:
+    var j = vat + 6
+    while j < line.len and line[j] != ' ':
+      verbs.add line[j]
+      inc j
+  var missing = ""
+  var nMissing = 0
+  for want in s.needPact:
+    if not capsHave(verbs, want):
+      if missing.len > 0: missing.add ","
+      missing.add want
+      nMissing = nMissing + 1
+  if nMissing > 0:
+    return step(s, "PVERSN", vFail,
+                "this install's host DLL is STALE for this script: its pact " &
+                "does not have [" & missing & "]. It read `" & line &
+                "`. Rebuild and redeploy the host.")
+  result = step(s, "PVERSN", vPass,
+                "the deployed host's pact has every verb this script needs (" &
+                $s.needPact.len & " asked) -- " & line)
+
 proc actuated*(s: var Script; request: string; settleSeconds: int = 6): bool =
   ## Issue one pact request AND ASSERT IT TOOK EFFECT.
   ##
@@ -1320,10 +1549,24 @@ proc look*(s: var Script; dx, dy: float): bool =
   ## heading. +dx turns right, +dy looks down (the game's own sign convention at
   ## its call sites).
   ##
-  ## ISSUE-ONLY: pact has no rotation readback, so a PASS here means the host
-  ## accepted the call. It does NOT mean the camera turned, and this library
-  ## will not pretend otherwise.
+  ## Issues only; PASS means the host accepted the call. `lookAndSee` is the one
+  ## that asserts the aim really moved.
   pactDo(s, "look " & fnum(dx) & " " & fnum(dy), 20)
+
+proc lookAndSee*(s: var Script; dx, dy: float; settleSeconds: int = 5): bool =
+  ## `look`, and ASSERT the aim moved, from the game's own
+  ## `EFT.MovementContext::get_Rotation` -- degrees of yaw and pitch the game
+  ## maintains and this library never writes. The host marks the aim before the
+  ## `Rotate` and re-reads it 12 drain frames later, wrapping yaw so a turn
+  ## across 0 degrees is two degrees and not 358.
+  ##
+  ## THE INPUT THAT MAKES IT FAIL: `lookAndSee(s, 0.0, 90.0)` while already
+  ## pitched fully down. The call is made, the game's own clamp refuses the
+  ## delta, the aim does not move and this reports FAIL. A tiny delta below
+  ## `PactMinRotDeg` (0.3 degrees) also fails, deliberately -- at that size the
+  ## change is indistinguishable from idle sway.
+  needsPact(s, "look")
+  actuated(s, "look " & fnum(dx) & " " & fnum(dy), settleSeconds)
 
 proc fire*(s: var Script; on: bool): bool =
   ## Hold or release the trigger -- `FirearmController::SetTriggerPressed`.
@@ -1336,16 +1579,83 @@ proc fire*(s: var Script; on: bool): bool =
   pactDo(s, "fire " & (if on: "on" else: "off"), 20)
 
 proc aim*(s: var Script; on: bool): bool =
-  ## Aim down sights -- `FirearmController::SetAiming`. Same firearm-in-hands
-  ## refusal as `fire`. ISSUE-ONLY.
+  ## Aim down sights -- `FirearmController::set_IsAiming`. Same firearm-in-hands
+  ## refusal as `fire`. Issues only at this tier, but the host DOES read
+  ## `get_IsAiming` back after the call, so `aimAndSee` is a real assertion.
   pactDo(s, "aim " & (if on: "on" else: "off"), 20)
 
 proc sprint*(s: var Script; on: bool): bool =
-  ## `EFT.Player::EnableSprint(bool)`. ISSUE-ONLY here, but note that the target
-  ## table DOES carry `get_IsSprintEnabled` as its readback -- if a future pact
-  ## uses it, this verb should become an `actuated`-style assertion rather than
-  ## keeping a PASS that only means "accepted".
+  ## `EFT.Player::EnableSprint(bool)`. Issues only; PASS means the host accepted
+  ## the request.
+  ##
+  ## Unlike `look`, `fire` and the stance verbs, sprint IS readback-checked in
+  ## the host: `pactExec` calls `EFT.Player::get_IsSprintEnabled` immediately
+  ## after `EnableSprint` and scores `took` or `noeffect` from the game's own
+  ## answer. So `sprintAndSee` is a real assertion, not an aspiration -- use it.
   pactDo(s, "sprint " & (if on: "on" else: "off"), 20)
+
+proc sprintAndSee*(s: var Script; on: bool; settleSeconds: int = 4): bool =
+  ## `sprint`, and ASSERT the game agrees. The evidence is
+  ## `Player::get_IsSprintEnabled` read back by the host after the call -- a
+  ## boolean the game maintains and this library never writes.
+  ##
+  ## Its failing input is nameable: ask to sprint while prone, or while
+  ## overweight, and the game refuses the state change; `get_IsSprintEnabled`
+  ## still reads false and this reports FAIL.
+  needsPact(s, "sprint")
+  actuated(s, "sprint " & (if on: "on" else: "off"), settleSeconds)
+
+proc aimAndSee*(s: var Script; on: bool; settleSeconds: int = 4): bool =
+  ## `aim`, and ASSERT it. The host reads `FirearmController::get_IsAiming`
+  ## back after `set_IsAiming` and scores took/noeffect from it.
+  needsPact(s, "aim")
+  actuated(s, "aim " & (if on: "on" else: "off"), settleSeconds)
+
+proc swapWeapon*(s: var Script; which: string): bool =
+  ## PUT A DIFFERENT WEAPON IN HANDS. `which` is "primary", "primary2",
+  ## "secondary" (the sidearm) or "knife".
+  ##
+  ## This travels the ECommand channel -- `GamePlayerOwner::TranslateCommand`
+  ## with the ordinal the metadata declares (SelectFirstPrimaryWeapon=41,
+  ## SelectSecondPrimaryWeapon=42, SelectSecondaryWeapon=43, SelectKnife=38) --
+  ## and so it needs the LateUpdate capture detour to have attached. A refusal
+  ## here is specifically about that channel, not about pact.
+  ##
+  ## ISSUE-ONLY at this tier. `swapWeaponAndSee` is the one that asserts.
+  needsPact(s, "swap")
+  pactDo(s, "swap " & which, 20)
+
+proc swapWeaponAndSee*(s: var Script; which: string;
+                       settleSeconds: int = 6): bool =
+  ## `swapWeapon`, and ASSERT THE FINISHED STATE: a DIFFERENT weapon item is in
+  ## the player's hands.
+  ##
+  ## The evidence is `FirearmController::get_Item`, read by the host 45 drain
+  ## frames after the command was translated and compared, by pointer, with the
+  ## item held when it went out. It is not the translate result -- that says the
+  ## input system consumed a keypress, which is true even when the player ends
+  ## up holding exactly what they were holding before.
+  ##
+  ## THE INPUT THAT MAKES THIS FAIL, and it is one line away: ask for
+  ## `swapWeaponAndSee(s, "primary")` while the primary is already in hands. The
+  ## command translates, the animation does not run, the same item comes back,
+  ## and the host counts `noeffect`. That is why `scripts/weapon_swap_e2e.nim`
+  ## swaps AWAY first.
+  needsPact(s, "swap")
+  actuated(s, "swap " & which, settleSeconds)
+
+proc toggleInventory*(s: var Script): bool =
+  ## ECommand 37, ToggleInventory -- open or close the in-raid inventory screen.
+  ## A TOGGLE, so calling it twice returns the screen to where it started.
+  ## ISSUE-ONLY: pact has no readback for whether the screen is up.
+  needsPact(s, "inventory")
+  pactDo(s, "inventory", 20)
+
+proc examineWeapon*(s: var Script): bool =
+  ## ECommand 36, ExamineWeapon -- the ammo/chamber inspect animation.
+  ## ISSUE-ONLY.
+  needsPact(s, "examine")
+  pactDo(s, "examine", 20)
 
 proc jump*(s: var Script): bool =
   ## `EFT.Player::Jump()`. ISSUE-ONLY.
@@ -1543,6 +1853,8 @@ proc runToRaid*(s: var Script; deploySeconds: int = 420): bool =
   ## A script that uses this owns its own ending: call `finish(s)` and
   ## `quitWith` it, or the run reports nothing.
   if not launchStack(s): return false
+  if not checkVersion(s): return false
+  if not checkPactVersion(s): return false
   if not pickProfile(s): return false
   if not applyGear(s): return false
   if not enterRaid(s): return false
@@ -1551,11 +1863,17 @@ proc runToRaid*(s: var Script; deploySeconds: int = 420): bool =
 proc run*(s: var Script): int =
   ## Every step in order, stopping at the first that does not PASS. Returns the
   ## exit code -- `quit run(s)` is the whole of a script's main.
+  ##
+  ## THE HANDSHAKE IS BEFORE THE GEAR, deliberately. Minting against an install
+  ## of unknown age and then discovering it was stale leaves a profile full of
+  ## items the script did not mean to ask for; refusing first leaves it alone.
   if launchStack(s):
-    if pickProfile(s):
-      if applyGear(s):
-        if enterRaid(s):
-          discard waitDeployed(s, 420)
+    if checkVersion(s):
+      if checkPactVersion(s):
+        if pickProfile(s):
+          if applyGear(s):
+            if enterRaid(s):
+              discard waitDeployed(s, 420)
   result = finish(s)
 
 proc verdictOf*(s: Script): string =
