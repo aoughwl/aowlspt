@@ -4287,3 +4287,912 @@ Backend log line: "listening on http://127.0.0.1:6969". Port 80 is actively refu
 <sub>method: `measured` · scope: `aowlspt-ga:e0ea3ad3b76b-db:41313127` · status: live · recorded: 2026-08-31T17:11:05 · last seen: 2026-08-31T17:11:05</sub>
 
 - evidence: urlopen to 127.0.0.1:80 -> WinError 10061 actively refused, while the same POST to 127.0.0.1:6969 returned the 6-profile list.
+
+
+## Relayed measurements (subagent backlog)
+
+Appended 2026-09-01 00:05:12Z by `tools/relayexport.py` from `C:\Users\savant/.aowl/relay.jsonl`.
+
+These were measured by subagents, which cannot reach the fact store's MCP server and so relay to a file. The store has since been retired, so they are recorded here rather than drained into it. `method` is the subagent's own claim about how it established the fact -- `measured` means observed, anything else means it was not.
+
+**mods/admin (branch integ-beta-batch)** — fails to compile
+
+implicit declaration of aowl_ui_overlay_mask; shared.nim:11 emits only #include aowlspt_admin.h, but aowl_ui_overlay_mask is declared in abi/aowlspt_uistate.h which the mod never includes; importc nodecl at shared.nim:72 has no C prototype
+
+<sub>method: `measured`</sub>
+
+- evidence: aowl build mods on HEAD 21f7171: nimcache adm.../shayohjpb1.c:991 error implicit declaration of function aowl_ui_overlay_mask; failed on build and on retry with cleared cache
+
+**mods/admin build** — fails compiling because
+
+abi/aowlspt_uistate.h uses aowl_pro_verify, aowl_is_readable, aowl_p_p_seh with no C prototypes in scope (implicit-declaration + int->void* at 185)
+
+<sub>method: `measured`</sub>
+
+- evidence: aowl build mods on integ-beta-batch 656b76e after shared.nim added #include aowlspt_uistate.h; admin.dll still absent
+
+**tools/markers.py** — verifies markers in any DLL with three outcomes
+
+PRESENT/MISSING/INCONCLUSIVE, exit 0/1/3; shares tools/litscan.py with deploy.py
+
+<sub>method: `measured`</sub>
+
+- evidence: selftest passes on the 4 b6-settingsui mod DLLs; two mutants (flipped expectation, deleted MISSING case) both fail
+
+**PowerShell 5.1.19041.6456 [Text.Encoding]::ASCII.GetString** — maps every byte >= 0x80 to '?'
+
+false MISSING for any marker with a non-ASCII char; [Text.Encoding]::Latin1 is $null there, and PS returns $null for a missing static property instead of throwing
+
+<sub>method: `measured`</sub>
+
+- evidence: GetString([byte[]](0x41,0xE2,0x80,0xA6,0x42)) -> A???B; maps.dll marker with U+2026 reports False, markers.py finds it as utf8 at 0x7c0fe
+
+**EFT.Player::get_IsAI** — MethodAttributes
+
+0x09E6 PUBLIC|FINAL|VIRTUAL|HIDEBYSIG|NEWSLOT|SPECIALNAME (sealed override; RVA 0x726890)
+
+<sub>method: `measured`</sub>
+
+- evidence: il2cpp_resolve.py methods get_IsAI --argc 0; flags@28 of Il2CppMethodDefinition, MS=36
+
+**EFT.Player.Physical** — field offset
+
+0x9D8, type PhysicalBase
+
+<sub>method: `measured`</sub>
+
+- evidence: il2cpp_resolve.py holdersof PhysicalBase --fields
+
+**il2cpp_resolve.py methods <bare number>** — was a confidently-wrong answer
+
+silently searched the digits as a name substring and reported EXHAUSTIVE zero-hit; now refuses (fix 0989a53)
+
+<sub>method: `measured`</sub>
+
+- evidence: before: integ-beta6 methods 16622 -> 'no method name contains'
+
+**aowl_prof_begin/end (abi/aowlspt_profile.h)** — costs per scope pair
+
+~50 ns (49-51 ns across three runs)
+
+<sub>method: `measured`</sub>
+
+- evidence: aowl_prof_calibrate times 4096 empty scopes at startup; printed by mods/debug profileText under aowlspt-sim
+- note: Published, never subtracted. A slot within 3x of it is tagged as the instrument, not a measurement.
+
+**aowlspt profiler per-mod attribution** — falsified by a known in-mod spin
+
+5 ms spin -> aowl.debug 177.378 ms/20 calls 56.7%; 0 ms spin -> 0.013 ms/20 calls 0.0%
+
+<sub>method: `measured`</sub>
+
+- evidence: aowlspt-sim.exe mods\debug --ticks 500 --tick-ms 1, 20-tick window, selfTestSpinMs toggled
+- note: Single-mod run only: this does NOT establish the cost lands on this mod rather than a sibling. Cross-mod attribution is UNVERIFIED.
+
+**nimony mod toolchain** — does not support
+
+$ on cstring (host Nim build does)
+
+<sub>method: `measured`</sub>
+
+- evidence: dbg/prof.nim(69,38) Error: Type mismatch ... expected: string but got: cstring not nil
+- note: Cross a C string into a mod byte at a time via an index accessor instead. Bit this task once.
+
+**aowl run <modpath>** — rejects a documented pass-through flag
+
+--ticks -> 'error unknown option: --ticks'
+
+<sub>method: `measured`</sub>
+
+- evidence: aowl.nim:2786 comment claims --ticks/--db/--stubs/--route pass through to the simulator; aowl's own option parser rejects it first
+- note: TOOL DEFECT. Workaround used: invoke host/Aowlspt.Sim/bin/aowlspt-sim.exe directly.
+
+**registry/mods.json aowl.maps,aowl.debug,aowl.waypoints** — are absent from tools/deploy.json
+
+so aowl build deploy skips them and deploy.py check never verifies them, while aowl.maps is enabled=true in aowl.list.beta
+
+<sub>method: `measured`</sub>
+
+- evidence: grep deploy.json: no maps/debug/waypoints entry; aowl build deploy reports 16 artifacts, 11 mods; aowl build-mod mods/maps|debug|waypoints all succeed, so the gap is registration not compilation
+
+**git merge of agent branches on feat-settings-native** — whole-file conflicts were caused by line-ending flips, not content
+
+feat-debug-widgets converted aowlhost.nim CRLF->LF and fix-beta-blockers-3 converted tarkov.nim LF->CRLF; normalising all three sides then re-running git merge-file resolved both with ZERO conflicts
+
+<sub>method: `measured`</sub>
+
+- evidence: aowlhost.nim conflict spanned lines 1..15100; after normalising, merge-file RC=0 and the result is +90/-0 vs HEAD
+
+**tools/deploy.json** — gained artifacts
+
+maps(15 markers), debug(11), waypoints(12) -- 19 artifacts total, check exit 0
+
+<sub>method: `measured`</sub>
+
+- evidence: deploy.py check after 'aowl build deploy'; falsified by stubbing waypoints tunePatrol (4 markers FAIL) and deleting debug's Profiler settings group (3 markers FAIL), both restored+rebuilt
+
+**tools/deploy.py** — verifies install-side data files declared per artifact
+
+check FAILs exit 1 naming an absent or byte-differing data file; missing data src dir = INCONCLUSIVE exit 3
+
+<sub>method: `measured`</sub>
+
+- evidence: scratch install: deleted post1/serversettings.json -> FAIL; +1 byte to waypoints/bigmap.json -> DIFFERS; same-size byte flip in morebots/vanilla.json -> DIFFERS; hid mods/textures/data -> INCONCLUSIVE exit 3; waypoints cut to 1 file -> FAIL on minFiles floor
+
+**mods/tarkov/data/post1/globalsgaps.json** — is untracked in git
+
+no deploy tool can ship it from a fresh clone; it exists only in the main checkout working tree
+
+<sub>method: `measured`</sub>
+
+- evidence: git status --short mods/tarkov/data reports '?? mods/tarkov/data/post1/globalsgaps.json'; the file is absent from a worktree created at b38961d
+
+**tools/deploy.py** — verifies PE export table for artifacts declaring exports
+
+host declares 16 required exports; a missing __declspec(dllexport) makes check FAIL exit 1 while all 63 markers still pass
+
+<sub>method: `measured`</sub>
+
+- evidence: branch feat-export-check 9a627c9; removed dllexport on aowl_host_gameworld_armed, rebuilt, check reported '1 of 16 required PE export(s) ABSENT ... aowl_host_gameworld_armed'; restored -> ok 16 exports
+
+**D:/Aowlspt/aowlspt/aowlspt-host-il2cpp.dll (live install, 2026-08-27)** — PE export count
+
+16 exports, all aowl_region_*_x, zero aowl_host_* -- the deployed host still lacks the gameworld exports
+
+<sub>method: `measured`</sub>
+
+- evidence: deploy.py pe_exports() parse of the installed DLL, read-only
+
+**il2cpp_resolve.py Resolver.find_one** — used to substring-fallback: 'EFT.CharacterController' resolved to EFT.CharacterControllerFootprint and printed its offsets
+
+see evidence
+
+<sub>method: `measured`</sub>
+
+- evidence: reproduced on branch fix-tooling-lies before the fix; now refuses and lists candidates
+
+**il2cpp_resolve.py find verb** — exited 0 printing nothing for a zero-hit (e.g. 'EFT.SkillManager::.ctor')
+
+see evidence
+
+<sub>method: `measured`</sub>
+
+- evidence: reproduced: exit=0, empty stdout; now prints NO TYPE NAME CONTAINS and exits 1
+
+**betacheck.py lootparity FAIL** — the empty-Loot response ECHOES BACK Id/_Id/Name of the requested location, so an empty Loot does NOT imply the id failed to map
+
+see evidence
+
+<sub>method: `measured`</sub>
+
+- evidence: --spawn run with LOOT_MAP=Icebreaker returned _Id=69af492a4819ea4ba10a69c5, Id=Icebreaker, Name=Icebreaker with Loot==[]
+
+**grep -c $'\r' on Windows** — reports 0 CR lines for a file with 4118 CRLF (reference/spt-config-settings.json)
+
+see evidence
+
+<sub>method: `measured`</sub>
+
+- evidence: byte count via tools/repowrite.py check disagrees with MSYS grep
+
+**tests/overlayhost jsontest.c** — 2 assertions fail on a clean checkout at 28f54f4: 'subtabs: one tab per distinct category got 4 wanted 2' and 'each category is exactly its contiguous range got 3 wanted 0'
+
+see evidence
+
+<sub>method: `measured`</sub>
+
+- evidence: 155 pass, 2 fail; logstest 46/46 and uxtest 18/18 pass
+
+**aowlspt-backend tarkov mod** — refuses to serve ALL routes if mods/tarkov/data is absent, while still booting and listening -- every request answers 'no route'
+
+see evidence
+
+<sub>method: `measured`</sub>
+
+- evidence: staged root with only tarkov.dll: backend log 'this build fails its own arithmetic; refusing to serve'
+
+**Resolver.shared_rva_counts (tools/il2cpp_resolve.py)** — keys strictly by RVA; consumers using .get(rva,1) report unknown addresses as unique
+
+0x1852A8A80 (VA form of a shared-2 RVA) and bogus 0x999999 both returned 'not shared'
+
+<sub>method: `measured`</sub>
+
+- evidence: ran shared_rva_counts() on GameAssembly.dll + .cache/global-metadata.dec.dat: get(0x52a8a80)=2, get(0x1852a8a80,1)=1, get(0x999999,1)=1. Fixed on branch fix-resolver-shared via Resolver.sharedness() tri-state.
+
+**UnityEngine.GameObject::AddComponent(System.Type) RVA 0x52A8A80** — is SHARED by exactly 2 method definitions
+
+shared with Internal_AddComponentWithType(Type), same type; 0x52A8F40 (.ctor(string)) and 0x52B8380 (Transform::SetParent) are unique
+
+<sub>method: `measured`</sub>
+
+- evidence: il2cpp_resolve.py type UnityEngine.GameObject --shared and Resolver.sharedness(); build 1.1.0.1.46777
+
+**il2cpp fieldOffsets** — is all-zero for uninstantiated generic type definitions
+
+1569 types; genericContainerIndex@TypeDef+0x18 >= 0 identifies them exactly (0 exceptions vs 19930 non-generic)
+
+<sub>method: `measured`</sub>
+
+- evidence: GameAssembly.dll + global-metadata.dec.dat: List`1 fieldOffsets ptr 0x1857c8228 non-null, first 8 int32 all 0; whole-build correlation in tools/test_fldoff_generics.py check 6
+
+**instantiated generic field layouts (List<int>)** — are NOT reachable offline from GameAssembly.dll
+
+33464 Il2CppGenericClass entries present, every cached_class null in file; layout built at runtime
+
+<sub>method: `measured`</sub>
+
+- evidence: walked MetadataRegistration genericClasses[0..2000], cached_class@+0x18 non-null count = 0
+
+**Tarkov level files (level5xx)** — ship with Unity type trees STRIPPED
+
+every SerializedType reports nodes=None; UnityPy reads only the 4 MonoBehaviour base fields then raises 'Expected to read 68 bytes, but only read 32'
+
+<sub>method: `measured`</sub>
+
+- evidence: UnityPy 1.25.3 under Store Python on level525 (78 types, 0 with nodes, 65 class_id 114) and level526 (48/0/31)
+
+**Unity MonoScript in shipped Tarkov bundles** — carries NAME identity only, no GUID
+
+m_AssemblyName + m_Namespace + m_ClassName + m_PropertiesHash(16B); m_Script PPtr has m_FileID=0 so the MonoScript ships INSIDE the bundle
+
+<sub>method: `measured`</sub>
+
+- evidence: read maps/factory_day_preset.bundle and woods_preset.bundle with UnityPy: MonoScript asm=Assembly-CSharp ns=EFT cls=ScenesPreset
+
+**maps/*_preset.bundle** — are built WITH type trees, unlike the level files
+
+all 3 SerializedType entries carry nodes, including the class_id 114 typetree naming ActiveSceneGuid/ServerName/ScenesGuids; unity_version 2022.3.43f2
+
+<sub>method: `measured`</sub>
+
+- evidence: UnityPy withNodes=3 on factory_day_preset.bundle
+
+**IL2CPP metadata custom attributes** — are indexed PER IMAGE, not globally
+
+prop24=attributeData blob, prop25=attributeDataRange(u32 token,u32 start) 8B; ranges end at the next start in FILE order (tokens are NOT sorted); Il2CppImageDefinition.customAttributeStart@32/count@36 bounds them; blob = compressed count + N x u32 LE ctor method index
+
+<sub>method: `measured`</sub>
+
+- evidence: a global token index made Unity.AI.Navigation.NavMeshModifier decode as having zero serialised fields (consumed 0 of 32 bytes); per-image lookup fixed it and 306/306 then round-tripped
+
+**C# [Serializable]** — is TypeAttributes flag 0x2000, NOT a custom attribute
+
+searching the il2cpp attribute blob for System.SerializableAttribute finds nothing and wrongly rejects every serialisable class
+
+<sub>method: `measured`</sub>
+
+- evidence: it rejected EFT.Game.Spawning.SpawnPoint, which SpawnPointMarker payload bytes prove is written inline
+
+**Unity MonoBehaviour serialisation layout for stripped-typetree scenes** — is recoverable from il2cpp metadata but NOT from bytes alone
+
+declaration order, base class first; string=i32 len+bytes+align4; align4 after bool/i8/u8/i16/u16; PPtr=i32 fileID+i64 pathID; array/List=i32 count+elems+align4
+
+<sub>method: `measured`</sub>
+
+- evidence: treating non-public fields as unknown let >64 subsets round-trip all 126 SpawnPointMarkers in level534 identically -- equal-width fields are indistinguishable; reading [SerializeField] makes it unique
+
+**tools/monotree.py + tools/mapextract_mono.py** — decode 292316 of 296708 MonoBehaviours across Woods and Factory byte-exactly (98.5%)
+
+Factory 38770/41051 (94.4%), Woods 253546/255657 (99.2%); 4392 UNRESOLVED recorded with type name, payload length and reason
+
+<sub>method: `measured`</sub>
+
+- evidence: byte-exact round trip: layout must consume payload to last byte AND re-encode to identical bytes
+
+**resume_streets.sh (mapextract city_preset)** — had CR-corruption bug: mapfile strips only \n so Store-python \r\n leaves trailing \r on every scene label
+
+broke the manifest-skip check and wrote \r-suffixed .empty markers; produced a FALSE ALL-STREETS-DONE marking 82 real scenes as empty-helpers; fixed by piping label source through 'tr -d \r', clearing garbage markers, re-running
+
+<sub>method: `measured`</sub>
+
+- evidence: xxd of mapfile label showed trailing 0x0D; after fix newThisRun=56 recovered scenes, final 247/247 real manifests, verify PASS=240 INCONCLUSIVE=7 FAIL=0
+
+**aowl build host (1-line edit)** — phase breakdown
+
+gates ~39s (symtab 22s + nameindex 17s, re-parsing 124MB GameAssembly.dll each) + nimony ~210s (dceLive 133s, hexer 30s, nimsem 26s, dceEmit 14s, gcc 12s, lengc 7s)
+
+<sub>method: `measured`</sub>
+
+- evidence: nimony --profile; per-python-step PowerShell Stopwatch; 20-core box
+
+**aowl host build slowness** — root cause
+
+20 host files are include'd into aowlhost.nim => one ~30k-line module; any edit re-runs nimony whole-program passes over all of it. nimony IS incremental at module/.o level (no-op ~1.5s, 1 of 32 .o rebuilt), but include-merge defeats it
+
+<sub>method: `measured`</sub>
+
+- evidence: grep '^include' aowlhost.nim = 20; no-op nimony 1494ms vs 1-line-edit 210s
+
+**aowl --fast flag (gcc -O0)** — measured win
+
+1-line host edit 252s -> 243s (~4%); dceLive 133s unaffected. ccache/-j ineffective (only 1 TU rebuilds; bottleneck is nimony whole-program passes not gcc)
+
+<sub>method: `measured`</sub>
+
+- evidence: aowl build host vs aowl build host --fast, both 6 gate ok lines present
+
+**EFT client output_000.log** — logs benign NRE at
+
+Warn level: 'Failed prewarm shot delegate' (BallisticCalculatorPrewarmer.SimulateShot) every raid load; game recovers and reaches raid
+
+<sub>method: `measured`</sub>
+
+- evidence: healthy session log_2026.08.30_10-48-04 reached MatchingCompleted+LocationLoaded with this Warn NRE present
+
+**EFT healthy session** — has zero
+
+Error/Fatal/Critical-level log lines; MoveNext appears 5000+/session in routine async stacks
+
+<sub>method: `measured`</sub>
+
+- evidence: grep across 5 sessions 2026-08-30; healthy 10-48-04 = 0 Error lines
+
+**EFT Error-level output lines** — are not all crashes
+
+recoverable: 'generate profile with same id', 'Item deserialization error', aiData 'Wrong wave WildSpawnType', 'bot creation data with zero profiles' - Error level, no exception type, no stack
+
+<sub>method: `measured`</sub>
+
+- evidence: crash sessions 10-08-32/9-13-30 output_000.log
+
+**EFT healthy matchmaking timing** — measured
+
+NetworkGameMatching G/H/I once, then LocationLoaded ~19s later, MatchingCompleted ~47s; disarm a stall timer on LocationLoaded not MatchingCompleted
+
+<sub>method: `measured`</sub>
+
+- evidence: log_2026.08.30_10-48-04 application_000.log
+
+**EFT offline raid load** — emits NetworkGameMatching trace but
+
+it resolves offline and is NOT a hang; a healthy offline Woods load goes ~47s from the trace to the first geometry load with no other progress between; geometry loads live in output_000.log ([Geometry] Loading, Sucessfully loaded Geometry, MetaXRAcousticGeometry, StreamingAssets)
+
+<sub>method: `measured`</sub>
+
+- evidence: live: crashwatch killed healthy load_2026.08.30_11-27-01 at 45s; log replay confirms zero load progress 11:29:42->11:30:29
+
+**get_Stamina** — is absent from GameAssembly.dll at any arity
+
+no method definition named exactly get_Stamina exists in any of 31282 types
+
+<sub>method: `measured`</sub>
+
+- evidence: il2cpp_resolve.py member get_Stamina --exact, exhaustive walk of all 31282 types, zero hits; substring search returns 16 differently-named members (get_StaminaBurnRate etc)
+
+**RVA 0x628110 (universal empty-body stub)** — has owner count
+
+9614 method definitions, not 6438
+
+<sub>method: `measured`</sub>
+
+- evidence: Resolver.sharedness(0x628110) over the per-image methodPointers histogram. CLAUDE.md's 6438 counts name-index KEYS; this counts METHOD DEFINITIONS. Both walks are correct, they answer different questions. TOD_Sky::UpdateAmbient resolves here.
+
+**EFT IL2CPP field names** — contain Private-Use-Area characters
+
+Comfort.Common.AbstractOperation/Operation declare fields named U+E000..U+E002; distinct fields on different declaring types reuse the same PUA name
+
+<sub>method: `measured`</sub>
+
+- evidence: fldoff.py fields EFT.MatchmakerOperation; crashed cp1252 with UnicodeEncodeError before the vis() escape was added
+
+**feat-loot-config @f0b702a** — flipped line endings on
+
+mods/tarkov/emu/loot.nim CRLF->LF and tests/fixtures/emu-loot.json LF->CRLF
+
+<sub>method: `measured`</sub>
+
+- evidence: git diff --stat showed 4721 changed lines in loot.nim; byte count of b'\r\n' was 1914 at base 520d6fb and 0 after merge. Real content diff is 963 lines. Restored in integ-beta3 commit 4c2ac0e.
+
+**aowl_du_write_color / aowl_nr_prime_all** — are NOT string literals in
+
+the built host DLL
+
+<sub>method: `measured`</sub>
+
+- evidence: deploy.py check --contains 'aowl_du_write_color' FAILED on a host DLL that demonstrably contains the colour/live-reload feature; they are C function names from abi headers, not runtime strings. Use log-message literals for --contains evidence, never C symbol names.
+
+**tools/aowl.nim** — is compiled by
+
+nimony, not nim;  fails because it is Nimony source, and nimony builds it in a bare worktree with NO pre-existing aowl.exe
+
+<sub>method: `measured`</sub>
+
+- evidence: ran nimony.exe c --passC:-Iabi -p:installer/src -p:aowl/src -o:...aowl.exe tools/aowl.nim in a fresh git worktree; exit 0, exe produced
+
+**aowl driver staleness warning** — fired spuriously because
+
+installer/build/.aowlstamp is gitignored, so a copied-in aowl.exe has no stamp at all; the stamp itself was already content-hashed (djb2), never mtime
+
+<sub>method: `measured`</sub>
+
+- evidence: read warnStaleDriver/textStamp in tools/aowl.nim; deleting .aowlstamp reproduces the warning, bootstrap writing it silences it
+
+**mods/tarkov selfCheckFailures()** — reports 3 false failures without
+
+a bound host: modDir() returns "" so data/post1/*.json resolves to /data/post1/...; binding abi/aowlspt_shim.h aowl_hostapi_new with modDir fixes it, but the linker then needs all 18 aowlspt_nim_* callbacks stubbed
+
+<sub>method: `measured`</sub>
+
+- evidence: aowl selfcheck mods\tarkov: 3 FAIL '... is not installed' unbound; 0 failures with the stub host bound; 1 FAIL when itemsadd.json is moved aside
+
+**tools/factnote.py relay file** — location
+
+%USERPROFILE%\.aowl\relay.jsonl (was repo-relative .aowl-relay.jsonl)
+
+<sub>method: `measured`</sub>
+
+- evidence: 52 queued entries found across 4 repo-relative files under C:\Users\savant\Projects (aowlspt 45, integ-beta-batch 2, wt-markers 2, wt-tooling 3); migrated to the shared path, set-compared both directions with comm, 52 in / 52 out, 0 lost, 0 malformed
+- note: drain keeps a compat sweep of stray repo-relative files; migrate+drain both idempotent (52->52 on re-run)
+
+**abi/aowlspt_uistate.h** — compiles standalone
+
+NO before fix, YES after (needs aowlspt_shim.h + aowlspt_prologue.h)
+
+<sub>method: `measured`</sub>
+
+- evidence: gcc -c -Werror=implicit-function-declaration -Werror=int-conversion on a TU including only the header: HEAD version = 6 errors (LONG, InterlockedExchange, HMODULE, MEMORY_BASIC_INFORMATION, GetModuleHandleA) plus -Wint-to-pointer-cast at line 141; fixed version exit 0. aowl build host then OK, deploy.py check --only host = 67 markers 17 exports
+- note: implicitly-declared aowl_p_p_seh returns int on Win64, truncating the returned pointer to 32 bits -- the real bug behind the warning
+
+**abi/aowlspt_uistate.h** — compiled only by ACCIDENT OF INCLUDE ORDER -- it used aowl_is_readable, aowl_p_p_seh, aowl_pro_verify, LONG, InterlockedExchange, HMODULE, MEMORY_BASIC_INFORMATION, GetModuleHandleA while including only <stdint.h>
+
+it worked solely because aowlhost.nim emits the shim/prologue ABOVE it -- an ordering contract nothing enforced; fixed at e1acb01 by including aowlspt_shim.h + aowlspt_prologue.h (both guarded)
+
+<sub>method: `measured`</sub>
+
+- evidence: Measured 2026-08-31. A TU including ONLY the header, compiled with gcc -c -Werror=implicit-function-declaration -Werror=int-conversion: HEAD version exits 1 with 6 errors PLUS aowlspt_uistate.h:141 'cast to pointer from integer of different size' (a real Win64 int->void* truncation). Fixed version exits 0. No cast was used to silence it. NOTE the mods build does NOT exercise this: no mod includes aowlspt_uistate.h, so mods/admin would have compiled without the header change. The fix is justified by the standalone gcc test and validated by the host build, not by 'aowl build mods'. Separately: the relayed report that mods/admin fails on aowl_ui_overlay_mask is ALREADY SUPERSEDED on integ-beta6 -- adm/shared.nim binds that export at RUNTIME via GetModuleHandleA/GetProcAddress through a C thunk (hostUiOverlayMask, shared.nim:361), it does not include the header at all. That report may still be live on branch integ-beta-batch, which was not tested.
+
+**git 'whole-file conflict' in mods/maps/*.nim** — was a CRLF-vs-LF blob artifact, NOT a dual rewrite -- the real change is 137 lines with ZERO overlap
+
+maps-redesign-b6 was authored with core.autocrlf off and the repo has no .gitattributes normalising *.nim, so this WILL recur on every branch from that checkout
+
+<sub>method: `measured`</sub>
+
+- evidence: Measured 2026-08-31. Merging f13be8a into integ-beta6 produced ONE conflict hunk spanning lines 1..4017 of mods/maps/maps.nim, which reads as 'both sides rewrote the file' and is what I concluded. WRONG. f13be8a committed the blob with CRLF while base blobs are LF, so every line differs textually. Instruments that reveal it: git diff -w 7242ba8 f13be8a (shows 137 real lines in maps.nim, no overlap with the colorSetting region), git diff --stat --ignore-cr-at-eol, and git cat-file -p f13be8a:mods/maps/maps.nim | cat -A. Suggested fix, NOT implemented (deliberate -- renormalising while agents hold worktrees is risky): add * text=auto / *.nim text to .gitattributes and renormalise once, at a quiet point. GENERAL LESSON: a conflict whose hunk spans the entire file should be treated as a suspected line-ending or encoding artifact FIRST, before believing it is a semantic conflict.
+
+**natesp ESP canvas (the 8-round thread) -- CLOSED** — PASS: the host now CREATES and owns its canvas -- CREATED(ours) rect=2560.0x1440.0 sortingOrder=32000, renderMode=0 read back via Canvas::get_renderMode, activeInHierarchy=yes
+
+the fix was to stop requiring an EXISTING canvas: root-level ABSENT/EXHAUSTIVE is the WHOLE gate, the nested walk is only a preference
+
+<sub>method: `measured`</sub>
+
+- evidence: Live raid 2026-08-31, integ-beta6 with 8 branches merged (host 3342848 bytes, 67 markers/17 exports). Verdict line: 'natesp VERDICT PASS -- canvas CREATED(ours) at 0x1f59964b6a0'. Falsifiable negatives that HELD: PARENT READBACK via Transform::get_parent over the FINISHED tree (not our own SetParent calls) = strays=0 unreadable=0 of 33 elements, asserting 'no ESP element is parented to anything other than the canvas we own'. And 21 boxes read BACK from the game as activeInHierarchy with a renderable on-screen rect (of 21 placed, 45 contacts, 24 over the per-faction pool); activeInHierarchy is TRANSITIVE so that also reads back the chain box -> aowlspt-esp-root -> our canvas. Canvas is destroyed on raid end. STILL NOT PROVEN: that a human can SEE the boxes -- the tool says so itself rather than claiming a visual pass. Zero nonzero-fault lines, zero self-disables. SAME RUN, other PASSes: contacts by class local=1 pmc=6 scav=32 boss=7 unknown=0 -- PASS, distribution spans 4 classes over 46 contacts, explicitly NOT degenerate (a degenerate histogram is how a broken read looks and is reported INCONCLUSIVE). unifiedPane PASS: 645 pane renders and no dispatch ever rendered more than one, so minimap+radar+fullscreen are genuinely ONE code path. Native raid entry 953ms attempt 1 of 5. ZERO 'NO EFFECT ... registered no onSettingsApplied hook' lines for the first time.
+
+**maps fullscreen overlay + unified pane + widgetAnchor** — fullscreen PASS and unifiedPane PASS live; but widgetAnchor is STORED-BUT-INERT while hotkeys in the SAME config write applied fine
+
+one reconcile pass applied one key and silently ignored another -- the repo's most repeated defect, found again
+
+<sub>method: `measured`</sub>
+
+- evidence: Live raid 2026-08-31, deployed maps.dll 968704 bytes, integ-beta6 with 8 branches merged. fullscreen: PASS -- 'open on 25 frame(s), rect matched the screen square on all 25 of them, and the small widget submitted ZERO primitives on all 25 (toggles=2, key=M)'. That ZERO-primitives clause is the good half: it proves the overlay REPLACES the minimap rather than drawing over it. unifiedPane: PASS -- 5437 pane renders, no dispatch ever rendered more than one, so minimap+radar+fullscreen are one code path. Reaching the verdict required an actual keypress: the diag correctly sat at INCONCLUSIVE ('key M is armed and polled and has NEVER been pressed -- 0 toggles, so nothing about it is proven') until M was sent via SetForegroundWindow + WScript.Shell SendKeys, which WORKS as an automated input path for this client. THE BUG: a single edit to mods/maps/config.json changed hotkeys false->true AND widgetAnchor->topright. hotkeys took effect (diag flipped to 'key M (kc=109) is armed and polled', reconcile: reconciles=1 consecutiveNoEffect=0). widgetAnchor did NOT -- the file on disk holds topright yet placement still prints 'anchor=manual cfg=320.0,120.0 drawnAt=320.0,120.0' indefinitely. Note the diag itself admits manual makes drawnAt==cfg 'by construction', i.e. that line proves nothing about the anchor until a corner is chosen -- so the anchor path had never been exercised. The mod's own mirrorDrift ledger did not flag it, which if confirmed is a SECOND bug: a drift ledger that misses a drift is a check that cannot fail.
+
+**maps widgetAnchor stored-but-inert report (MINE) was WRONG -- I read a stale log line** — the anchor WAS read, parsed and pushed; all four candidate causes falsified against the same deployed DLL
+
+but the investigation found a REAL ledger hole: mirrorDrift returned empty unconditionally when gHudOn is false
+
+<sub>method: `measured`</sub>
+
+- evidence: 2026-08-31. I reported widgetAnchor as stored-but-never-applied after seeing "anchor=manual cfg=320.0,120.0 drawnAt=320.0,120.0" repeatedly. An agent re-read the CURRENT log against the SAME deployed maps.dll (968704 bytes) and the same config holding widgetAnchor=topright, and got: "placement : anchor=top-right cfg=320.0,120.0 drawnAt=0.0,0.0". So the setting DID apply and I had read a pre-reconcile line.
+
+LESSON: when a diag line repeats every tick, "I saw it N times" does NOT establish it is CURRENT. Take the LAST line, and prefer comparing its timestamp against the moment of the config write.
+
+drawnAt=0.0,0.0 was an UNINITIALISED value printed as if it were a position; now fixed to say so.
+
+THE REAL BUG FOUND ANYWAY (fix-maps-anchor-reconcile @ d2facfb, maps.dll 983552 bytes): mirrorDrift returned empty-string UNCONDITIONALLY when gHudOn is false, skipping every comparison. With every HUD surface off in config, no edit to any key could make the reconcile fire. A drift ledger that cannot report drift -- CLAUDE.md 9b exactly.
+
+Also: 10 declared settings (screenW, screenH, radarSize, radarX, radarY, showBots, showPlayers, indicatorInset, indicatorHoldMs, indicatorFadeMs) had NO comparison line at all and now do. And "markers" is declared in the schema but never consulted by readOpts or onLoad -- a live DEAD CONTROL, left untouched and flagged.
+
+Per-key audit: 52 schema keys. 3 are read but deliberately unledgered (hz and hudBudgetUs are registration-time / apply-on-restart; heading has no C mirror field).
+
+The 9b acceptance (drawnAt != cfg, origin in the top-right quadrant) is INCONCLUSIVE and could not be settled offline: hudPaneCalls()==0, no frame has ever drawn, and the region never published a back-buffer size (screen: INCONCLUSIVE, using the config fallback 1920x1080). It needs one in-raid frame.
+
+**camera API + free camera -- FULLY LIVE-VERIFIED (bind, hold, restore)** — 15 of 15 targets bound after deferring past GameAssembly's ~1s map time; hold=PASS and RESTORE PASS by readback off the live camera
+
+the original 0-of-15 was a TIMING fact about when we asked, not an RVA or prologue problem
+
+<sub>method: `measured`</sub>
+
+- evidence: Live raid 2026-08-31, deployed host 3492352 bytes, integ-beta6 with 15 branches merged.
+
+BIND (was 0 of 15, reason code 1): "camera: 15 of 15 targets verified by RVA + startup-snapshot prologue (0 rejected, last reason code 0)".
+CAUSE of the original failure was TIMING, not code: the host binds at DLL-attach 0:00:00.031 while IL2CPP does not map GameAssembly.dll until ~0:00:01.0. All 30+ ABI tables use the identical GetModuleHandleA("GameAssembly.dll") spelling, so there was no second helper and no misspelling. mods/fov worked only because it binds later, from its own mod DLL. aowl_pro_capture also returns NULL without the module, so the startup prologue snapshot could not have existed either -- deferring with retry fixes both. Fix: never latch a NULL handle; retry from camDrainTick.
+
+ENGAGE WITHOUT A KEYPRESS (new, camera-engage-cfg @ e7192f9): synthetic input via SetForegroundWindow + WScript.Shell SendKeys DOES reach this client for a plain letter -- sending "m" toggled the maps full-screen overlay and produced a real "fullscreen: PASS ... toggles=2". But {F7} produced NOTHING: no camera log line at all. Function keys do not arrive through that path on this client. So the free camera is now engaged by a one-line edit to aowlspt-host.json ("cameraFreeCamEngage": true, back to false to disengage), picked up by the live config reconcile at 0.5Hz. Verified: "cameraFreeCamEngage went ON (config reconcile)" then "... went OFF (config reconcile)". The latch is EDGE-triggered, so leaving it true across raids does not re-engage.
+
+HOLD -- the author's open question (a), now answered: "hold=PASS -- the camera reads back at the position" we commanded, i.e. the game's own camera drive does NOT re-clobber our write after the render-drain re-assert.
+
+RESTORE -- PASS, and asserted as a NEGATIVE across all five components: "RESTORE PASS -- no component of the camera pose still differs from what was saved on entry: position, rotation quaternion, fieldOfView, nearClipPlane and farClipPlane all READ BACK equal off the live camera."
+
+ABI, determined by DISASSEMBLY and not assumed: Vector3 (12 bytes) RETURNS via hidden sret (retbuf RCX, this RDX, MethodInfo* R8) and is PASSED BY ADDRESS in RDX; Quaternion (16 bytes) the same; a float argument is in XMM1. Evidence: Transform::get_position opens 33 C0 / 48 8B FA / 48 89 01 / 48 8B D9 / 89 41 08 -- exactly 12 bytes zeroed through RCX with this in RDX. Transform::set_eulerAngles opens F2 0F 10 02 (movsd xmm0,[rdx]).
+
+RVAs, all UNIQUE (owners=1), 16-byte prologues recorded: get/set_fieldOfView 0x525DCE0/0x525DD30, get/set_nearClipPlane 0x525DB80/0x525DBD0, get/set_farClipPlane 0x525DC30/0x525DC80, get/set_position 0x52B70E0/0x52B7150, get/set_rotation 0x52B7F60/0x52B7FD0, get/set_eulerAngles 0x52B7280/0x52B7320, get_forward/right/up 0x52B7BC0/0x52B75A0/0x52B7820, Camera::get_main 0x5260400. Component::get_transform 0x73B0F0 is SHARED (15 owners) -- CALLED only, never detoured. CameraManager::SetFov@0x1268D20 remains DEAD (its Camera@0x70 reads null).
+
+**in-raid frame rate ~11fps: what is ESTABLISHED, what I RETRACT, and why the bisect failed** — raid is 87-92ms/frame phase-confirmed; the ESP cost was REAL (~14.5ms, positive control proved it) and is now largely fixed; but the ESP is NOT the main cost
+
+and my claim that the 28 optional features cost ~74ms is RETRACTED -- those runs were menu-only
+
+<sub>method: `measured`</sub>
+
+- evidence: Measured 2026-08-31 with tools/frametime.nim (new, branch frame-meter @ b7ed8f6), which hooks ONLY the bridge-bound TarkovApplication::Update drain slot -- gDrainSlot is bound by the bridge, not by any feature flag -- so it survives every optional feature being off.
+
+CONFIRMED IN-RAID (raid phase = DEPLOYED verified in the same log):
+  everything on, before the nuFn fix : RECENT mean=92.2ms (10.8fps), lifetime 35.1ms
+  everything on, after  the nuFn fix : RECENT mean=87.4ms (11.3fps)
+MENU, everything on: mean=26.7ms (37.4fps).
+
+THE ESP COST WAS REAL, and my repeated "the meter is lying" theory was WRONG. The positive control settles it:
+  CONTROL (512 integer adds, same clock, same place in the tick): out-of-guard mean=0.1us max=1.3us n=6245, in-guard mean=0.1us max=17.9us n=6245 -- (B) THE COST IS REAL. The identical bracket prices trivial work in microseconds while the ESP body reports 14460.8us.
+
+CAUSE, found by phase decomposition: aowl_nu_fn / aowl_du_fn ran GetModuleHandleA("GameAssembly.dll") (loader lock + module-list walk BY NAME) + VirtualQuery + a 128-row linear snapshot scan + memcmp on EVERY setter/getter call -- roughly 45us of preamble PER CALL, ~250 calls/tick. sub[apply] and sub[verdict] do nothing but make those calls. This sits under EVERY native-UI and debug-UI call in the host, not just the ESP.
+
+FIX (perf-natesp-phases @ 458081c): verify-result cache, positive AND negative, 2s per target; the snapshot byte-compare and committed+exec checks are UNCHANGED and self-disable is deliberately NOT cached -- no safety was traded for speed. Verdict readback throttled 1-in-30 ticks rather than removed.
+RESULT: sub[apply] 4575us -> 0, sub[verdict] 6807us -> 0, over-budget ticks 934/934 -> 236/873, p95 50000us -> 20000us. But FRAME TIME only moved 92.2 -> 87.4ms. So ~11.4ms of ESP work bought ~5ms of frame: THE ESP IS NOT THE MAIN COST.
+
+RETRACTION -- IMPORTANT FOR THE NEXT SESSION. I claimed "the 28 optional host features cost ~74ms" based on runs measuring ~19ms with features off. THAT CLAIM IS NOT ESTABLISHED. Verified afterwards: those runs were MENU-ONLY. Run D showed raid phase = UNKNOWN over 43,597 frames; Run G had deployed-count = 0 and no alive-list line at all, despite natEsp being ON. Runs B and C printed a MENU-VISIBLE WINDOW raid-entry line but never a phase latch, so their state is unconfirmed too. A raid-ENTRY log line is NOT proof of raid STATE -- only the phase latch is. Menu with features off measures ~18-19ms vs ~27ms with everything on, which is a real but much smaller effect and is a MENU number.
+
+So the only trustworthy numbers are: raid ~87-92ms with everything on; menu ~27ms with everything on; menu ~18ms with features off.
+
+WHY THE BISECT KEPT FAILING: auto-raid did not fire in several feature-off runs, and the raid-phase latch itself lives behind natEsp, so the instrument that confirms raid state is entangled with a feature under test. The frame meter is now independent, but RAID-STATE CONFIRMATION still is not. That is the next thing to fix before any further bisect: make the deploy signal observable without natEsp.
+
+EVERY-FRAME INVENTORY (source reading, not measurement) of the Update drain: mainDrain (UNCONDITIONAL, cMqEnter early-out), uiStateDrainTick (UNCONDITIONAL publish), rpDrainTick (UNCONDITIONAL -- no flag at all, self-disables only after RpMaxFaults; guarded pointer test every frame + a scene-name query ~1/s), renderDrain (unconditional, cRqEnter early-out). Everything else is flag-gated. rpDrainTick is the only unconditional rider that touches the game and it has never been priced.
+
+**deploy.py check --contains** — outcome on a genuinely-absent literal
+
+FAIL (exit 1) as of tools-deploy-marker-assert@0fedaa8; was INCONCLUSIVE/exit 3 before, which is why agents used grep -a
+
+<sub>method: `measured`</sub>
+
+- evidence: uihub.dll --contains espColorEspColorNotHere: before exit 3 NO-MATCH, after exit 1 FAIL with control '/aowlspt/ui/page/settings' matching at 0x3a54a; 0 of 23 bytes survive as word-runs
+
+**tools/deploy.json mod coverage** — marker coverage of mod DLLs
+
+all 13 mods/ dirs are declared artifacts with 6-19 markers each; mods are NOT unverified. deploy.py verify() scans declared markers as UTF-8 ONLY (not litscan), so a UTF-16-only marker would false-MISSING
+
+<sub>method: `measured`</sub>
+
+- evidence: enumerated mods/*/ vs tools/deploy.json artifacts at integ-beta6@458081c; deploy.py:613 blob.find(m.encode('utf-8'))
+
+**tools/deploy.py verify()** — scanned declared markers as UTF-8 only until 01be0fb
+
+utf8+utf16le via litscan.encodings('deploy'); zero verdict changes over all 20 built declared artifacts
+
+<sub>method: `measured`</sub>
+
+- evidence: ran old and new deploy.verify() over the same 20 built artifacts in aowlspt-wt-b6; identical per-marker hits and identical verdicts (all ok)
+
+**tools/markers.py --selftest fixtures** — root chosen by file existence alone picks a STALE sibling build
+
+aowl-wt-descriptions/mods/uihub/bin/uihub.dll lacks the control literal 'groupOf'; 6 cases failed as if the tool were broken
+
+<sub>method: `measured`</sub>
+
+- evidence: selftest run before sentinel validation was added; fixed by requiring sentinel literals present in the candidate root
+
+**in-raid frame rate 10.8fps -> 30.6fps (2.8x), phase-confirmed both sides** — one root cause dominated: aowl_is_readable is a raw VirtualQuery SYSCALL per read (per CHARACTER for strings) under every guarded read
+
+a 64KB-region cache with asymmetric TTLs avoided ~1.6M syscalls/run; mainDrain 8552.8 -> 1248.2us/frame
+
+<sub>method: `measured`</sub>
+
+- evidence: Measured 2026-08-31/09-01 across ~24 build->deploy->raid cycles on integ-beta6, with tools/frametime.nim (hooks the bridge-bound TarkovApplication::Update drain slot, independent of every feature flag) and abi/aowlspt_drainprof.h. Every meter carried a POSITIVE CONTROL (512 integer adds, same clock, same place in tick) reading 0.1-0.3us/call; a control outside 0.1-1.0us voids the whole table.
+
+BEFORE (phase-confirmed DEPLOYED): RECENT mean=92.2ms (10.8fps). Menu 26.7ms (37fps).
+AFTER  (phase-confirmed DEPLOYED): RECENT mean=32.5ms (30.6fps), LIFETIME 32.9ms over 7220 frames.
+=> 2.8x. Same instrument, same verdict shape, raid state confirmed by the latch in both.
+
+ATTRIBUTION at the start: host riders 33% of frame, the game's own Update 67%. mainDrain (all mod callbacks) 8552.8us/frame was the largest, then natEspDrain 3292.7us, splRebrandDrain 1152.2us. rpDrainTick -- my prime suspect because it is UNCONDITIONAL -- measured 111.9us/frame (0.2%) and was EXONERATED. unlimitedBots cost ~2-3ms, also not the cause.
+
+THE ONE ROOT CAUSE behind most of it: `aowl_is_readable` is a raw VirtualQuery SYSCALL per read, and string readers called it PER CHARACTER. It sits under every guarded read in the codebase.
+  Maps entity loop  4394.3 -> 645.4us/tick  (-85%); WHOLE(onMainTick) 4568.6 -> 841.7us/tick
+  Admin (mod[8])    6579.2 -> 294.8us/frame (-96%) from the SAME cache applied
+  mainDrain total   8552.8 -> 1248.2us/frame (-85%)
+
+THE CACHE THAT DID IT (mods/maps/sp/rdcache.h, then reused in abi/aowlspt_admin.h): 1024 sets x 2 ways hashed on the address's 64KB chunk; epoch-based O(1) flush; ONE VirtualQuery per miss (v1 issued two and discarded one); asymmetric TTLs -- positives 250ms and only for regions >=64KB, negatives 2000ms, because A STALE POSITIVE IS A CRASH AND A STALE NEGATIVE IS A DECLINE.
+v1 FAILED for a measured reason worth keeping: a 32-slot ROUND-ROBIN table thrashed against ~35 entities x >=3 regions, so it hit WITHIN a call and missed ACROSS calls. The tell was h3(BT+0xA9)=54475ns/call vs h4(BT+0xA8)=51ns/call -- ADJACENT BYTES of the same object, ~1000x apart. Capacity, not the key: the pointer-key hypothesis was FALSIFIED FROM SOURCE (v1 already keyed on mbi.BaseAddress/RegionSize).
+Live after: maps hits=670100 misses=48902 (93%); admin hits=969121 misses=44698 (95%); ~1.6M syscalls avoided per run.
+SAFETY HELD, and this is the part that matters: a 1-in-256 live audit compares the cached predicate against the REAL shim and printed `pred-audit=agrees/191` -- the fast path never disagreed. The predicate is byte-for-byte unchanged; self-disable is deliberately NOT cached.
+
+OTHER FIXES: natesp's aowl_nu_fn/aowl_du_fn ran GetModuleHandleA("GameAssembly.dll") (loader lock + module-list walk BY NAME) + VirtualQuery + a 128-row linear snapshot scan + memcmp on EVERY setter/getter, ~45us x ~250 calls/tick; verify-result cache took sub[apply] 4575us and sub[verdict] 6807us to 0. splRebrand's tier-1 "cheap" hunt burned the full 24000-node/18ms budget every frame on a miss (the normal state); bounded to depth-4/2500-node/2ms took it 2346 -> 945us/frame, BELOW its 1152us baseline, while KEEPING frames-to-apply=1 PASS (the user's "vanilla screen shows for seconds" complaint, fixed).
+
+MOD INDEX -> NAME (needed to read any drainProf line): 0 Textures, 1 SAIN, 2 Bot-AI-Population, 3 Maps, 4 Graphics, 5 FOV, 6 Debug, 7 Call Proof, 8 Admin. Index is gMods.len at loadMod, assigned only after every gate passes, so a side-skipped mod consumes no slot.
+
+**this machine (display)** — has no Indirect Display Driver installed
+
+one adapter only: NVIDIA GeForce RTX 2060 SUPER 3840x2160 driver 32.0.15.8142; no Root-enumerated display device
+
+<sub>method: `measured`</sub>
+
+- evidence: Get-CimInstance Win32_VideoController; Get-PnpDevice -Class Display,Monitor; pnputil /enum-drivers (only nv_dispi.inf in display class), 2026-08-31
+
+**UnityPlayer.dll (D:\Aowlspt)** — supports player switches
+
+batchmode, nographics, screen-width, screen-height, screen-fullscreen, window-mode, popupwindow present; NO 'monitor' string, so Unity -monitor N is unavailable on this build
+
+<sub>method: `measured`</sub>
+
+- evidence: strings -a UnityPlayer.dll | grep -x; also '-nographics requires -batchmode' and PlayerInitEngineNoGraphics present
+
+**aowlspt-launch.exe** — has no --auto-raid flag
+
+auto-raid is the host JSON flag uxAutoRaid + autoRaidMap, not a launcher argument; the launcher fatals on unknown options
+
+<sub>method: `measured`</sub>
+
+- evidence: parseArgs in tools/aowllaunch.nim; git grep -- '--auto-raid' over all 400 recent commits returns nothing
+
+**tools/markers.py** — supports --string LITERAL FILE for ad-hoc binary literal checks
+
+exit 0/1/3, multi-encoding, auto PE-DOS-stub positive control, PE truncation guard
+
+<sub>method: `measured`</sub>
+
+- evidence: branch tool-markers-string 254592e; --selftest all PASS incl 3 new --string exit codes
+
+**PowerShell 5.1 ASCII.GetString marker idiom** — loses the U+2026 literal in maps.dll that litscan finds
+
+found as utf8 at 0x9e948 in aowlspt-wt-admintrader/mods/maps/bin/maps.dll
+
+<sub>method: `measured`</sub>
+
+- evidence: markers.py --selftest regression case, re-derives lossy ASCII decode in Python
+
+**aowlspt-backend.exe on integ-beta6 (db6dc6a)** — exits with code 1 mid-session after serving /client/location/getLocalloot
+
+dies immediately after the 'boss roll: seed=woods kept=bossKojaniy' line; every earlier map logged kept=(none). The 200 response is delivered first, then the process is gone. No game client involved.
+
+<sub>method: `measured`</sub>
+
+- evidence: betacheck.py --spawn against the real 41MB db.json; then isolated repro: backend started on the kept root, Shoreline/TarkovStreets/Woods all returned 200, backend poll()==1 one second later. Log tail ends at the boss roll.
+
+**host log aowlspt-botnav-on.log (761s session)** — line composition by emitter
+
+25289 lines total, 33.2 lines/s, 8.0 KB/s; botnav per-issue 9201 (36.4%), maps diag block 10192 (40.3%), remainder gated profilers
+
+<sub>method: `measured`</sub>
+
+- evidence: python line-count + regex classification over D:\Aowlspt\aowlspt\aowlspt-botnav-on.log; elapsed derived from first/last [h:mm:ss.mmm] stamps
+
+**backend log aowlspt-backend.log (182s session)** — REQ line share
+
+890 of 1577 lines (56.4%), 4.9 lines/s; 253 were POST /aowlspt/settings/client/sync alone
+
+<sub>method: `measured`</sub>
+
+- evidence: regex count of 'REQ ' over the live backend log
+
+**mods/maps onDiagTick (pre-fix)** — change-detection was a check that could not fail
+
+compared full block text containing live counters (ticks=/published=/frame counts/us means), so it was always unequal; 370 blocks emitted in 380 ticks (97%) despite documenting itself as change-driven
+
+<sub>method: `measured`</sub>
+
+- evidence: counted 'maps diag:' headers in a 761s log vs elapsed/2000ms; verdict-class signature changed only 6 times across those 370 blocks
+
+**maps diag verdict-signature filter (tests/mapsdiag.nim)** — measured line reduction with all verdicts preserved
+
+9990 -> 290 lines over the full 370-block session (34.4x); 2970 -> 281 over the committed 110-block fixture; all 19 distinct not-PASS verdicts including a real art:FAIL still surface within 30 cycles
+
+<sub>method: `measured`</sub>
+
+- evidence: installer/build/mapsdiag.exe replaying real captured blocks; mutation of diagNotPass to return "" makes it fail with 17 named FAILs
+
+**aowlspt repo** — has .gitattributes '* -text' on all 393 branches (blob fe2024a) which is the CRLF cause, not a missing .gitattributes
+
+537 of 2746 unique blobs carry CRLF; 261 distinct paths; all 393 branches affected
+
+<sub>method: `measured`</sub>
+
+- evidence: git ls-tree -r over all refs/heads, git cat-file --batch, counted b'\r\n'
+
+**core.autocrlf** — is true from SYSTEM git config in all 41 checkouts under C:\Users\savant\Projects
+
+true (system); global unset; local unset; no worktree overrides
+
+<sub>method: `measured`</sub>
+
+- evidence: git config --system/--global/--local/--worktree --get core.autocrlf per checkout
+
+**ConsistencyInfo landmine vs git renormalisation** — does not intersect any tracked repo file
+
+0 of 10599 ConsistencyInfo entries are under aowlspt\; Logging.config and ConsistencyInfo are untracked; deploy install root is D:\Aowlspt\aowlspt
+
+<sub>method: `measured`</sub>
+
+- evidence: parsed D:\Aowlspt\ConsistencyInfo Entries[].Path; git ls-tree -r over all branches for Logging.config/ConsistencyInfo
+
+**db.json templates.items.5447a9cd4bdc2dbd208b4567 (M4A1)** — declares _props.Chambers[0]._name=patron_in_weapon and NO _props.Cartridges; _props.Slots[1]._name=mod_magazine
+
+weapons carry ammo via a chambered slot plus a mounted magazine, not via Cartridges
+
+<sub>method: `measured`</sub>
+
+- evidence: tools\bigjson.py keys\get against D;\Aowlspt\aowlspt\db.json; magazine 55d4887d4bdc2d962f8b4570 DOES declare _props.Cartridges(1) and Slots(0)
+
+**loadout.nim cartridgeCapacity()** — returns 0 for any weapon template, so equipLoaded on a weapon is always REJECTED with 'declares no _props.Cartridges[0]._max_count'
+
+the measured cause of the ammoloading_e2e gap
+
+<sub>method: `measured`</sub>
+
+- evidence: reads _props.Cartridges only; M4A1 has Chambers instead. mods/tarkov/emu/loadout.nim:291
+
+**M4A1 _props.Slots[1] (mod_magazine) _props.filters[0].Filter** — is a 20-entry template whitelist containing 55d4887d4bdc2d962f8b4570 (STANAG)
+
+a named magazine can be validated offline before minting
+
+<sub>method: `measured`</sub>
+
+- evidence: bigjson.py get on db.json
+
+**emu/loadout slotAccepts()** — must search BOTH _props.Slots and _props.Chambers: patron_in_weapon is in Chambers, not Slots, with a byte-identical entry shape (11-template ammo whitelist)
+
+searching Slots only silently leaves every weapon unchambered with a confident wrong reason
+
+<sub>method: `measured`</sub>
+
+- evidence: python cross-check against D:/Aowlspt/aowlspt/db.json; M4A1 Chambers[0]._props.filters[0].Filter has 11 entries incl M855A1 54527ac44bdc2d36668b4567, excl IFAK
+
+**pact readback counters (asked/took/noeffect/never in pactStatus)** — only MOVEMENT has a readback; look/fire/aim/pose/lean/prone/jump/sprint/command are ISSUE-ONLY so a QUEUED answer is not evidence of effect
+
+autoscript.actuated() reports INCONCLUSIVE for those verbs by design
+
+<sub>method: `measured`</sub>
+
+- evidence: read host/Aowlspt.Host.Il2Cpp/pact.nim: only pactCheckMoved() increments took/noeffect, via EFT.Player::get_Position
+
+**tools/botaudit.py** — measures bot movement via GameWorld.RegisteredPlayers through the live inspector
+
+two samples N s apart; positive control is the local player through the same offsets; PASS/FAIL/INCONCLUSIVE; live path UNVERIFIED
+
+<sub>method: `inferred`</sub>
+
+- evidence: built on branch botaudit-tool (947093d) off integ-beta6 d2f725c; --selftest passes offline against fixtures; never run against a raid
+
+**tools/inspector.py on integ-beta6 (d2f725c)** — CLI main() is broken
+
+uses time.time() with no 'import time' -> NameError on any successful batch; main() also still carries the OLD hand-rolled sentinel loop the de-fork was supposed to remove
+
+<sub>method: `measured`</sub>
+
+- evidence: grep: 'import time' absent from tools/inspector.py; time.time() used twice in main(); the module-level run_batch() delegating to channel.py is unaffected
+
+**UnityEngine.Application::set_runInBackground** — presence in global-metadata
+
+ABSENT - stripped by the managed linker; get_runInBackground exists at RVA 0x525BE20 (UNIQUE), get_isFocused at 0x525BDD0 (UNIQUE)
+
+<sub>method: `measured`</sub>
+
+- evidence: tools/il2cpp_resolve.py GameAssembly.dll .cache/global-metadata.dec.dat methods set_runInBackground -> 'no method name contains' across all 31282 types EXHAUSTIVELY; get_* resolved with sharedness=UNIQUE and real bodies (48 83 EC 28 ...)
+
+**UnityPlayer.dll command-line parameter 'monitor'** — present in string table
+
+PRESENT - docs/HEADLESS.md previously claimed 'no monitor string at all', which is WRONG
+
+<sub>method: `measured`</sub>
+
+- evidence: strings -a D:/Aowlspt/UnityPlayer.dll | grep -Fx monitor => 1 hit; also the literal "The command-line parameter 'adapter' has been removed. Please use 'monitor' instead." Also present: force-device-index, force-driver-type-warp, displays. NOT tested by actually launching with -monitor N.
+
+**EscapeFromTarkov client window (live, 2026-08-31)** — top-level window rect
+
+title 'EscapeFromTarkov', rect (0,0)-(3840,2160) = full primary monitor, borderless/fullscreen; therefore NOT parkable without -screen-fullscreen 0
+
+<sub>method: `measured`</sub>
+
+- evidence: python tools/offscreen.py where against the running client; MonitorFromWindow=a monitor, 8294400 visible px, client did not have the foreground
+
+**minimised window rect on Windows** — false-positive risk for off-screen checks
+
+a minimised window reports (-32000,-32000) and MonitorFromWindow returns NULL, so a naive off-screen check reports PASS on the exact state Unity throttles
+
+<sub>method: `measured`</sub>
+
+- evidence: tools/offscreen.py --selftest step 'minimised' -> classify() returns MINIMISED/FAIL; the classifier special-cases IsIconic before the MonitorFromWindow test
+
+**aowlspt-host-il2cpp.dll (deployed 2026-08-31 19:04)** — contains the ASCII key literal
+
+uxNativeRaidDrive=yes, drainProfiler=yes, debugUi=yes, sainRvaTable=NO
+
+<sub>method: `measured`</sub>
+
+- evidence: python read the 4,015,104-byte deployed DLL and searched for each key as bytes; sainRvaTable is a mods/sain setting (mods/sain/config.json), not a host key
+
+**tools/hostcfg.py manifest** — is scraped from the CHECKOUT's host/*.nim and is therefore branch-dependent
+
+a key live in the deployed build but absent from the checkout used to read as 'silently ignored; typo?'
+
+<sub>method: `measured`</sub>
+
+- evidence: 2026-08-31: show printed typo? for uxNativeRaidDrive while it was driving raid entry; deployed DLL cross-check now yields verdict LIVE
+
+**host live-inspector watchdog line (inspect.nim ~7151)** — its PROSE contradicts its own COUNTERS when the channel wedges
+
+prints 'no batch queued for Ns' while the same line carries batch=9 done=-1; batches WERE queued
+
+<sub>method: `measured`</sub>
+
+- evidence: 2026-08-31 live session; done never advanced past batch 9 and every later batch was ignored. tools/ui.py wedge_verdict() now parses the counters, not the prose
+
+**tools/crashwatch.py --watch before 2026-08-31** — force-killed the live client by default and wrote no record of the kill
+
+aowlspt-clienterr.log held only 'armed, watching the client's logs'; a killed client was indistinguishable from a crash
+
+<sub>method: `measured`</sub>
+
+- evidence: kill_game() was called unconditionally from both signature paths and never wrote to the sink; four instances accumulated in one day. Killing is now opt-in via --kill-on/--kill-any and every kill logs signature+text+PIDs
+
+
+## Relayed measurements (subagent backlog)
+
+Appended 2026-09-01 00:23:18Z by `tools/relayexport.py` from `C:\Users\savant/.aowl/relay.jsonl`.
+
+These were measured by subagents, which cannot reach the fact store's MCP server and so relay to a file. The store has since been retired, so they are recorded here rather than drained into it. `method` is the subagent's own claim about how it established the fact -- `measured` means observed, anything else means it was not.
+
+**host gInspBatchDone (inspect.nim:7014)** — is cleared to -1 by the DELIVERY path itself, immediately after inspWriteOut()
+
+done=-1 is the NORMAL state of a healthy channel that has delivered everything; it is a one-shot handshake, not a high-water mark
+
+<sub>method: `measured`</sub>
+
+- evidence: read inspect.nim:7005-7016: 'if done >= 0 and cInspHave() == 0 and gInspOut.len > 0: inspWriteOut(); gInspBatchDone = -1'. A wedge predicate of 'done < batch' is therefore a false positive on every healthy idle channel
+
+**live inspector wedge detection** — requires gInspDelivered and gInspRunningBatch, which only exist post-162d3b8
+
+predicate is 'running >= 0 and delivered < running'; against a pre-162d3b8 host the wedge is UNDECIDABLE and must report UNKNOWN, not healthy
+
+<sub>method: `measured`</sub>
+
+- evidence: git show 162d3b8:host/.../inspect.nim lines 7348-7392 print 'delivered=' and 'running=' and a three-state headline; the currently deployed host prints neither, so tools/ui.py channel_verdict() returns UNKNOWN/NOT CHECKED against it
+
+---
+
+Appended 2026-09-01 by the coordinating session while building the in-game error-dialog catch. Everything below is `measured` unless the entry says otherwise.
+
+**EFT.UI.ErrorScreen exists and every error window is raised through EFT.UI.PreloaderUI** — four entry points, all UNIQUE RVAs, offline-resolved on build 1.1.0.1.46777
+
+The in-game error dialog is reachable for detouring. `ShowErrorScreen(string header, string message, Action)` @0x156B930; `ShowErrorScreen(string header, Exception, Action)` @0x156B7E0; `ShowCriticalErrorScreen(string,string,EButtonType,float)` @0x156BC20; `CloseErrorScreen()` @0x156BFD0. All four report `sharedness=UNIQUE owners=1`, so detouring them by RVA has no blast radius. On all three Show* overloads RCX=this and RDX=header; R8 is the message `System.String` on two of them and a `System.Exception` on the third.
+
+<sub>method: `measured`</sub>
+
+- command: `python tools/il2cpp_resolve.py <ga> <meta> methods ErrorScreen` / `shared <rva>` / `bytes <rva>` / `fields EFT.UI.ErrorScreen` / `fields System.Exception`
+- evidence: prologues 48 89 6C 24 10 ... (0x156B930), 48 89 5C 24 10 ... (0x156B7E0), 40 53 56 41 54 41 56 41 57 48 83 EC 40 80 3D A8 (0x156BC20); `shape` reported "no known thunk shape matched" for all three, so none is this build's universal empty-body stub. `EFT.UI.ErrorScreen` fields: `_errorDescription` TextMeshProUGUI @0xB8, `_exitButton` DefaultUIButton @0xC0, `_description` string @0xD0. `System.Exception`: `_className`@0x10, `_message`@0x18, `_stackTraceString`@0x40.
+- note: `_className` is filled lazily by this runtime and is usually NULL. Report it only when present; an invented type name in a crash report is worse than none.
+
+**the errdlg detours ARM on all three entry points, live** — but FIRING is NOT yet observed: INCONCLUSIVE
+
+The host logs `errdlg ARMED: read-only postfix detours on all 3 PreloaderUI error-screen entry points` at ~1.0s, reproducibly across five launches. That is proof the targets verify against the startup prologue snapshot and that the detours install. It is NOT proof the body runs, reads the strings correctly, or writes the ERRORDIALOG line -- no dialog was successfully provoked in this session, so the read path is UNVERIFIED.
+
+<sub>method: `measured` (the arm); the firing path is explicitly `unverified`</sub>
+
+- evidence: `[0:00:01.031] ok errdlg ARMED: ...` plus the three individual `errdlg-message/-exception/-critical bound to ...` lines, on 5 of 5 launches.
+- note: two independent attempts to provoke one failed for instructive reasons, recorded below.
+
+**the inspector REFUSES to `call` an RVA this host has already detoured** — correct behaviour, and it makes a feature untestable through its own target
+
+`call rva:0x156b930 ...` returned "the first bytes are a JUMP: something already detours this function, so what is here is a TRAMPOLINE and not the function. Refusing rather than calling it." That is the right call, but it means a detour-based feature can never be exercised by calling the function it detours -- the trigger has to come from the game's own code path.
+
+<sub>method: `measured`</sub>
+
+**calling `<InitPreloaderUI>g__Failed|114_1` @0x987EF0 as (string,string) FAULTS** — its frame shape was INFERRED FROM ITS NAME, which is the documented mistake
+
+`call rva:0x987ef0 v_pp $str0 $str1` faulted; the VEH guard caught it and the client survived. The method is a compiler-generated local function and almost certainly takes a closure display-class pointer, not two strings. CLAUDE.md section 5 already says a patch frame shape must be DERIVED from the signature metadata, never inferred from a method name; this is that rule being violated and immediately punished.
+
+<sub>method: `measured`</sub>
+
+- evidence: `!! FAULTED (caught; the game survived). LAST HOP: CALL rva 0x0987ef0 -> 0x00007ffb43137ef0 (unverified prologue)`. RVA is UNIQUE; the fault is the argument shape, not the address.
+
+**`aowlspt-launch.exe` drives the live inspector's file channel IN-PROCESS** — so an external batch and the launcher fight over one file, and the external one usually loses
+
+The launcher's auto-enter/profile-select flow calls `aowlui`/`aowluicmd` directly, writing `aowlspt-inspect.txt` and reading `aowlspt-inspect-out.txt` -- the same two files `tools/inspector.py` uses. There is NO arbitration. A batch staged before launch, or written while the launcher is navigating, is silently overwritten; the symptom is a batch that is simply never answered while the channel is visibly healthy and answering somebody else's `roots`.
+
+<sub>method: `measured`</sub>
+
+- evidence: batches staged as `#edproof1`/`#edproof2` were replaced on disk by `#<serial>\nroots\necho aowl-batch-<serial>` and by a 58-command `get_activeInHierarchy` sweep, with no external process running (`Get-CimInstance Win32_Process` showed only `aowlspt-launch.exe` and `aowlspt-backend.exe`). With no game running the file stayed untouched for 30s, so the writer is inside the launched run. `tools/aowllaunch.nim` documents the in-process channel use directly.
+- note: THIS IS A REAL DESIGN PROBLEM FOR A PUBLIC SDK -- two writers, one file, no lock and no ownership. Anyone driving the inspector while the launcher is doing its auto-enter will hit it and will have no idea why. A single-writer lock, or a second channel for the launcher, is the fix.
+
+**the client dies at ~21.8s in the mod-unload path, reproducibly (5/5)** — NOT a crash signature, NOT an error dialog, and NOT caused by the errdlg change
+
+Every launch this session reached the main menu (`MenuUIScene` present, 13 scene roots) and then exited at 0:00:21.8-21.9 immediately after the host processed a backend-driven mod unload. Last three host lines every time: `unloaded Textures` / `unloaded Call Proof` / `telling the backend what happened to its mods`. No client-log exception (`clientlog.py sweep` reports the session clean), no crash dump, no ERRORDIALOG.
+
+<sub>method: `measured` for the correlation; the CAUSE is `inferred` and unproven</sub>
+
+- evidence: 5 consecutive launches, all dying at 21.8-21.9s at the same three log lines. Restoring the pre-deploy `registry/mods.json` did NOT change it, so the registry content is ruled out. The errdlg detours are read-only, never fired in any of these runs, and the same shape occurred on the very first launch of the day.
+- note: leading hypothesis, NOT established: unloading a mod DLL whose detours are still installed leaves trampolines pointing into freed memory. The enabled set includes sain/fovfix/morebots, which facts #132/#143 already record as crashing this build -- but those crash at ~1.2s and ~8s, not 21.8s, so this is a DIFFERENT failure. Do not conflate them.
