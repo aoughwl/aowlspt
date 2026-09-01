@@ -214,6 +214,20 @@ those hooks is off, not that Settings was never opened.
   three agents. Say so if you do it.
 - **Concurrent builds in separate git worktrees are SAFE** (measured). Do NOT serialise
   agents. The corruption hazard is two builds in the **same checkout**.
+- **So route every build through `python tools/buildlock.py build <target>`** —
+  same arguments as `aowl`, one extra word, and it makes the hazard impossible
+  instead of merely forbidden. Separate worktrees still build in parallel at
+  full speed; only same-checkout builds contend.
+
+  This rule was written into this file and broken **one hour later** by the same
+  session, with the seductive reasoning *"I am only building a DIFFERENT
+  target"*. That is exactly the case it is about: the hazard is the shared
+  intermediate directory, not the final artifact. Two `aowl` and two `nimony`
+  processes ran at once, **neither** left an artifact, `deploy.py check`
+  reported the host DLL simply "not built", and ~20 minutes of subagent work had
+  to be redone. A rule in a document cannot fail closed; a lock can. It refuses
+  with exit 4 and builds nothing rather than colliding, breaks genuinely stale
+  locks itself, and `--status` says who holds it.
 
 ## 4. NEVER deploy without verifying markers in the BUILT artifact
 
