@@ -5769,3 +5769,16 @@ Two lessons independent of the fix:
 * Unity's crash handler writes the native stack to that Crashes folder; check
   it BEFORE reasoning about which feature died. `popups.py` and the client log
   both say nothing for a hard native kill.
+
+## Crash attribution, single-variable (2026-09-01, host 4,247,552)
+
+* Test A -- NO modload file, NO inspector batches: client ALIVE, ran to the 150s
+  supervisor timeout at the menu.
+* Test B -- modload file driven by `tools/modloadsim.py`, NO inspector: DIED at
+  ~15s. Second Unity crash folder (`Crash_2026-09-01_225335086`) matches.
+* Boot 1 -- file + one inspector batch: DIED at ~15s (`Crash_..._224922938`).
+
+So the inspector is exonerated and the build survives without a file: the
+killer is the modload path's first poll with `lookOk` true AND a file present
+(the new census / caption-identity / reparent code), faulting inside
+UnityPlayer from the PreloaderUI::Update rider chain, outside any guard.
