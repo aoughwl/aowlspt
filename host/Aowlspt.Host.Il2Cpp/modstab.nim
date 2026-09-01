@@ -2897,6 +2897,26 @@ var gGfxStockShiftPx: seq[int32] = @[]
 ## up to the larger one rather than to hardcode 20 -- this is read live from
 ## whichever panel is shifted first.
 var gGfxInsetRef = -1'i32
+## THE STOCK BUTTON ALPHAS, measured live from the top-row tab buttons.
+##
+## MEASURED DEFECT (coordinator, live): both spawned AnimatedToggles on our
+## strip report their own Image colour alpha as 0.0000. The label text still
+## renders -- that is a different Graphic -- but the BUTTON itself is fully
+## transparent, selected and unselected alike. On a stock tab button the
+## Animator drives that alpha per state; a clone made before the game has
+## initialised its Animator never gets a state applied, so `set_IsToggled`
+## fires a trigger that nothing is listening to.
+##
+## So the alpha is driven explicitly, and BOTH values are READ from the game's
+## own tab buttons rather than invented. `gfxBuild` runs while the player is
+## on the GAME tab (its own guard requires it), so at that moment the Game
+## button is the SELECTED one and every other top-row button is UNSELECTED --
+## exactly the pair of numbers needed, from real widgets in real states.
+##
+## -1 means NOT MEASURED; the driver then does nothing and says so, rather
+## than writing a number nobody measured.
+var gGfxAlphaOn = -1.0'f32
+var gGfxAlphaOff = -1.0'f32
 ## PER PANEL, both of them: the verdict latch and the settle counter. A single
 ## pair could only ever judge whichever panel happened to be up first, and the
 ## other panel's assertion would then never run at all.
@@ -3696,6 +3716,37 @@ proc gfxSubtabVisual(tog: Il2CppPtr; on: bool) =
   if tog == nil or not iUnityAlive(tog):
     return
   discard nuAnimToggleSetToggled(tog, on)
+  # THE ALPHA, because the Animator will not do it for us.
+  #
+  # MEASURED: a cloned tab button's own Image reads colour alpha 0.0000, both
+  # selected and unselected -- the label renders (different Graphic) but the
+  # button is invisible. On a stock button the Animator drives that alpha per
+  # state, and our clone was made before the game initialised its Animator, so
+  # `set_IsToggled` above fires a trigger nothing listens to. That is also why
+  # this is ADDITIVE rather than a replacement: if the Animator ever does come
+  # alive, it and this agree on what selected looks like, because the numbers
+  # here were read off the game's own buttons.
+  #
+  # Refuses silently when the pair was never measured -- `gfxBuild` already
+  # logged that loudly, once, and this runs on every switch.
+  if gGfxAlphaOn < 0.0'f32 or gGfxAlphaOff < 0.0'f32:
+    return
+  if not duOk(tog, ModsOffTargetGraphic + 8'i32):
+    return
+  let img = cReadPtrAt(tog, ModsOffTargetGraphic)
+  if img == nil or not iUnityAlive(img):
+    return
+  # READ, VALIDATE, THEN WRITE -- never a blind write. The RGB is the clone's
+  # own, so only the channel that is wrong gets changed; writing a whole
+  # colour we invented would recolour a button the game styled.
+  let (okc, r, g, b, a) = nuImgReadColor(img)
+  if not okc:
+    return
+  let want = (if on: gGfxAlphaOn else: gGfxAlphaOff)
+  let d = a - want
+  if d < 0.004'f32 and d > -0.004'f32:
+    return                    # already right; do not churn the Graphic dirty
+  discard nuImgSetColor(img, r, g, b, want)
 
 proc gfxApply(sel: int) =
   ## Switch the two STOCK panels and put both strips in agreement. Calls only
@@ -3787,6 +3838,40 @@ proc gfxBuild(): bool =
                  (if donorButton == nil: "ControlToggle" else: "") &
                  "). NOTHING was hidden: the stock POSTFX tab is untouched.")
     return
+  # MEASURE THE STOCK SELECTED/UNSELECTED BUTTON ALPHAS, once, before any
+  # object of ours exists. This proc only runs while the GAME tab is showing,
+  # so the Game button is SELECTED and the Graphics button is NOT: two real
+  # widgets in the two real states, which is where the numbers come from.
+  if gGfxAlphaOn < 0.0'f32:
+    let selT = modsChildNamed(toggles, "GameToggleSpawner")
+    let unselT = modsChildNamed(toggles, "GraphicsToggleSpawner")
+    let selTog = (if selT != nil: modsToggleOf(selT) else: nil)
+    let unselTog = (if unselT != nil: modsToggleOf(unselT) else: nil)
+    var aOn = -1.0'f32
+    var aOff = -1.0'f32
+    if selTog != nil and duOk(selTog, ModsOffTargetGraphic + 8'i32):
+      let g = cReadPtrAt(selTog, ModsOffTargetGraphic)
+      let (okc, _, _, _, av) = nuImgReadColor(g)
+      if okc: aOn = av
+    if unselTog != nil and duOk(unselTog, ModsOffTargetGraphic + 8'i32):
+      let g = cReadPtrAt(unselTog, ModsOffTargetGraphic)
+      let (okc, _, _, _, av) = nuImgReadColor(g)
+      if okc: aOff = av
+    if aOn >= 0.0'f32 and aOff >= 0.0'f32 and aOn > aOff:
+      gGfxAlphaOn = aOn
+      gGfxAlphaOff = aOff
+      okLog "postfx subtab: measured the stock tab-button alphas off the " &
+            "live top row -- SELECTED (Game, the tab showing right now) is " &
+            nuF(aOn) & " and UNSELECTED (Graphics) is " & nuF(aOff) & ". " &
+            "Our cloned buttons come out at alpha 0 because their Animator " &
+            "was never initialised, so these two MEASURED numbers are what " &
+            "the strip is driven with -- not a hardcoded pair."
+    else:
+      warn "postfx subtab: the stock tab-button alphas could NOT be " &
+           "measured (selected=" & nuF(aOn) & " unselected=" & nuF(aOff) &
+           "), so the strip's buttons keep whatever alpha the clone carries " &
+           "-- measured live as 0, i.e. INVISIBLE, though the labels still " &
+           "render. Reported rather than papered over with an invented alpha."
   let spawner = modsChildNamed(toggles, "PostFxToggleSpawner")
   if spawner == nil:
     gfxNoteFault("no PostFxToggleSpawner in the tab bar, so there is no stock " &

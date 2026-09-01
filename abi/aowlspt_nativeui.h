@@ -559,6 +559,30 @@ typedef struct AowlNuTarget {
 #define AOWL_NU_RECTOFFSET_GET_TOP    50
 #define AOWL_NU_RECTOFFSET_SET_TOP    51
 #define AOWL_NU_LAYOUTGROUP_SETDIRTY  52
+/* --- DRAW ORDER AND RAYCAST ORDER (indices 53..54) ------------------------
+ *
+ * MEASURED LIVE, by the user: the subtab strip renders BEHIND the panel's
+ * background and cannot be clicked. Not a disabled control -- the buttons were
+ * separately confirmed `m_Interactable=true` with `raycastTarget=true`, which
+ * is exactly what "behind" looks like as opposed to "off".
+ *
+ * In a Unity canvas, SIBLING ORDER IS BOTH DRAW ORDER AND RAYCAST ORDER. The
+ * strip is parented to the panel and was moved to sibling 0 -- deliberately,
+ * back when it was a layout child and sibling index decided WHERE it sat. It
+ * is no longer a layout child; it is absolutely positioned. So sibling 0 now
+ * only means "drawn first, under everything else", and the panel background's
+ * raycast target swallows every click.
+ *
+ * `SetAsLastSibling` is the whole fix. `GetSiblingIndex` is bound alongside it
+ * so the result can be ASSERTED rather than assumed -- the index is read back
+ * and compared against the panel's child count, which is a check that can
+ * fail.
+ *
+ * PROVENANCE, both: il2cpp_resolve.py typemethods UnityEngine.Transform ->
+ * RVA and sharedness=UNIQUE; bytes <RVA> 16 -> the sig below. Neither is the
+ * 0x628110 universal stub. Both are CALLED, never detoured. */
+#define AOWL_NU_TR_SETASLASTSIB       53
+#define AOWL_NU_TR_GETSIBLINGINDEX    54
 
 /* UnityEngine.RenderMode. Named, because `0` appearing bare in a refusal is
  * indistinguishable from "we did not read anything". */
@@ -790,6 +814,13 @@ static const AowlNuTarget aowl_nu_targets[] = {
         0xDF,0x7E,0xE6 }, 16 },
     { "UnityEngine.UI.LayoutGroup::SetDirty", 0x5599FD0u,
       { 0x40,0x53,0x48,0x83,0xEC,0x20,0x80,0x3D,0xBD,0xE0,0xB3,0x01,0x00,
+        0x48,0x8B,0xD9 }, 16 },
+    /* --- draw/raycast order. See AOWL_NU_TR_SETASLASTSIB. --- */
+    { "UnityEngine.Transform::SetAsLastSibling", 0x52B9D40u,
+      { 0x40,0x53,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,0x73,0xAE,0xE1,0x01,
+        0x48,0x8B,0xD9 }, 16 },
+    { "UnityEngine.Transform::GetSiblingIndex", 0x52B9DF0u,
+      { 0x40,0x53,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,0xD3,0xAD,0xE1,0x01,
         0x48,0x8B,0xD9 }, 16 },
 };
 

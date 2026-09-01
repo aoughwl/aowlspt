@@ -5830,3 +5830,20 @@ counted stack-drop that forces INCONCLUSIVE. Every hop `nuOk` + `nuAlive`
 before `GetComponent`. The separate census is DELETED; identities are
 collected by the walk already in progress, so no diagnostic can add a second
 walk to a frame.
+
+## The sliced-walk fix MISSED: identical crash, silent first slice (host 4,248,576)
+
+`modloadsim` at T+10s -> DIED, `Crash_2026-09-01_231843230`, modload log still
+exactly one line. The native stack is the same SHAPE as both earlier dumps --
+same host offset from base (`+0x...BAC1`), the four `aowl_region_screen_known_x`
+rider-chain frames, `il2cpp_alloc` beneath -- so the failing CALL is one the
+walk makes on its first nodes, not the amount of work per frame. Another
+feature's 6,000-node root descent completed 100ms earlier on the same roots,
+so the roots are readable. Leading hypothesis: receiver type confusion on the
+first hop (a `GameObject::` method with a Transform receiver, or vice versa --
+`splAnchorSceneRoots` yields Transforms). Next step is a BISECT BUILD with a
+config knob (walk off / roots only / first slice with per-call logging), not a
+third reasoned fix.
+
+The build boots fine with no modload file, so it stays deployed; nobody
+creates the file until the bisect build is in.
