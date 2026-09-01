@@ -63,6 +63,7 @@ HIT = re.compile(r'HIT (0x[0-9a-fA-F]+)\s+name="([^"]+)"')
 LIVE = os.environ.get("AOWLSPT_LIVE", r"D:\Aowlspt\aowlspt")
 HOSTLOG = os.path.join(LIVE, "aowlspt-host.log")
 RAID_MARKERS = ("RegisterPlayer", "botdiag", "GwMainPlayer", "draw stable")
+PHASE_RE = re.compile(r"raid phase = ([A-Z]+)")
 
 
 def hostlog_size():
@@ -82,6 +83,43 @@ def raid_marker_since(pos):
     except OSError:
         return False
     return any(m in data for m in RAID_MARKERS)
+
+
+def wait_phase(pos, want, timeout):
+    """Wait until the host PUBLISHES raid phase <want>. Three outcomes.
+
+    Returns "DEPLOYED" / "TIMEOUT" / "SILENT".
+
+    `raidphase.nim` has published the phase every 5s all along and nothing has
+    ever consumed it. The alternative in use here was `time.sleep(60.0)`, which
+    asserts a DURATION: it cannot tell a raid that deployed in 20s from one
+    that never deployed at all, and it reported success either way. That is the
+    exact shape CLAUDE.md 9b forbids -- a check that cannot fail.
+
+    This stays INSPECTOR-SILENT on purpose (fact #261: an inspector read during
+    the scene load stalls the still-loading main thread and errors the load).
+    Reading the host log is passive, off the game thread, and costs nothing.
+
+    "SILENT" is the third outcome and is NOT a pass: the host published no
+    phase line at all in the window, which means the feature is off or the host
+    is wedged -- either way we do not know where the client is, and saying so
+    is the whole point.
+    """
+    deadline = time.time() + timeout
+    seen_any = False
+    while time.time() < deadline:
+        try:
+            with open(HOSTLOG, "r", errors="replace") as f:
+                f.seek(pos)
+                data = f.read()
+        except OSError:
+            data = ""
+        for m in PHASE_RE.finditer(data):
+            seen_any = True
+            if m.group(1) == want:
+                return "DEPLOYED"
+        time.sleep(2.0)
+    return "TIMEOUT" if seen_any else "SILENT"
 
 
 def log(m):
@@ -322,9 +360,23 @@ def main():
             # Running any inspector command now stalls the still-loading main thread
             # and errors the load (fact #261). So STAY inspector-silent and give the
             # load ~60s more to actually deploy the player before declaring success.
-            log("raid marker seen (loading); settling 60s to actual deploy (inspector-silent)...")
-            time.sleep(60.0)
-            log("IN RAID (loaded + settled). Do NOT issue inspector reads until a camera is confirmed."); return OK
+            log("raid marker seen (loading); waiting for the host to publish "
+                "raid phase = DEPLOYED (inspector-silent)...")
+            got = wait_phase(base, "DEPLOYED", 180.0)
+            if got == "DEPLOYED":
+                log("IN RAID (host published DEPLOYED). Do NOT issue inspector "
+                    "reads until a camera is confirmed.")
+                return OK
+            if got == "TIMEOUT":
+                log("FAIL: the host kept publishing the raid phase for 180s "
+                    "and it never became DEPLOYED -- the load is wedged, not "
+                    "slow. This used to be a 60s sleep that returned OK here.")
+                return FAIL
+            log("INCONCLUSIVE: the raid marker fired but the host published NO "
+                "raid phase line in 180s, so where the client got to is "
+                "UNKNOWN -- not a pass. Check that raidphase is enabled in "
+                "aowlspt-host.json.")
+            return FAIL
         time.sleep(3.0)
     log("FAIL: no raid marker in the host log within 300s"); return FAIL
 

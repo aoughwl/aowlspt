@@ -35,6 +35,17 @@ every outcome that has actually happened on this project.
                   crashwatch's measured signatures. Exit 5.
     DIED          the process is gone. Exit 1.
     TIMEOUT       none of the above within --timeout. Exit 2.
+    STALLED       it got somewhere real and then stopped getting anywhere: one
+                  raid phase, unchanged, past --phase-max, while the host is
+                  still alive and talking. Exit 8.
+    BACKENDDOWN   the launcher gave up restarting the server. The client is
+                  usually still up and still looks fine. Exit 9.
+
+The last two are the ones that used to cost HOURS rather than minutes. The host
+re-publishes the raid phase every 5s forever; that heartbeat refreshed the
+progress clock, so IDLE could never fire once the host attached and a wedged
+raid was watched to its full timeout. And no supervisor had ever tailed the
+backend log at all, so a dead server was indistinguishable from a slow game.
 
 `IDLE` and `ERRORDIALOG` are the pair that matters. From outside they are
 byte-identical: the process is alive, the host log has gone quiet, nothing is
@@ -64,6 +75,7 @@ from __future__ import annotations
 import argparse
 import json as jsonmod
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -83,6 +95,35 @@ DEFAULT_ROOT = r"D:\Aowlspt"
 # and "wait 90s+ before declaring a crash" is the measured rule -- a shorter
 # window reports a healthy slow boot as a death.
 BOOT_GRACE_S = 95
+
+# PERIODIC lines the host prints whether or not anything is happening. They are
+# proof the host is ALIVE and proof of nothing else, so they must NOT refresh
+# the progress clock.
+#
+# This is the bug that cost the most wall-clock in this project, and it is a
+# check that could never fire rather than one that could never fail.
+# `raidphase.nim` re-states the current phase every 5.0s forever (measured: 40
+# consecutive `raid phase = MENU` lines at a 5.015s cadence). Since every host
+# line reset `last_progress`, the IDLE detector was structurally incapable of
+# triggering the moment the host attached -- so a run that was wedged in a raid,
+# or sitting at a screen nobody would ever click, was watched to its full
+# timeout with a supervisor that looked healthy the whole time. A heartbeat is
+# not progress. Treating it as progress makes a liveness check assert only that
+# the clock still ticks.
+HEARTBEAT_HOST_LINES = (
+    "natesp: raid phase = ",
+    "frameMeter:",
+)
+
+# The phase the host publishes. `raidphase.nim` has emitted this all along and
+# nothing consumed it -- the raid was bounded by `time.sleep(60.0)` in
+# enterraid.py, which asserts a DURATION and never a STATE.
+RAID_PHASE = re.compile(r"raid phase = ([A-Z]+)")
+
+# The launcher's own watchdog verdict. It prints this and gives up; until now
+# nothing read the backend log at all, so the supervisor kept waiting on a game
+# whose server was already declared dead.
+BACKEND_DOWN_LINE = "BACKEND DOWN"
 
 # Lines the HOST itself prints when the run is already over. Matching one ends
 # the supervision at once instead of waiting out a timeout that can only
@@ -108,6 +149,14 @@ EXIT = {
     "CRASH": 5,
     "INCONCLUSIVE": 6,
     "POPUP": 7,
+    # Bounded rather than inferred: the run got somewhere real and then
+    # stopped getting anywhere. Distinct from TIMEOUT (never got there) and
+    # from IDLE (the whole host went quiet) so a caller can tell "wedged in a
+    # raid" from "never reached the raid".
+    "STALLED": 8,
+    # The launcher declared the server dead. The client may still be sitting
+    # there looking perfectly alive.
+    "BACKENDDOWN": 9,
 }
 
 
@@ -127,11 +176,28 @@ class Supervisor:
     incidental exception logged beside it usually does not.
     """
 
-    def __init__(self, root, until, stall, quiet):
+    def __init__(self, root, until, stall, quiet, phase_max=900.0):
         self.host_path = harness.hostlog_path(root)
         self.until = until
         self.stall = stall
         self.quiet = quiet
+        # The RAID BOUND. `phase` is whatever raidphase.nim last published;
+        # `phase_since` is when it last CHANGED. A raid that has not changed
+        # phase in `phase_max` is wedged -- which is a state, not a duration,
+        # and is the thing `time.sleep(60.0)` could never express.
+        self.phase = None
+        self.phase_since = time.time()
+        self.phase_max = phase_max
+        # The BACKEND log, tailed exactly like the host log. The launcher has
+        # printed `BACKEND DOWN` all along and no supervisor has ever read it,
+        # so the server dying looked identical to the game being slow.
+        self.backend_path = os.path.join(install_dir(root),
+                                         "aowlspt-backend.log")
+        try:
+            self.backend_pos = os.path.getsize(self.backend_path)
+        except OSError:
+            self.backend_pos = 0
+        self.backend_leftover = ""
         # START AT THE END of whatever host log is already on disk. Two reasons,
         # and the first one bit immediately:
         #
@@ -186,6 +252,44 @@ class Supervisor:
         self.host_leftover = lines.pop()
         return [l.rstrip("\r") for l in lines]
 
+    # -- backend log ------------------------------------------------------
+    def poll_backend(self):
+        """Did the SERVER die? Nothing used to ask.
+
+        `aowllaunch.nim` restarts the backend on failure and, after N failures,
+        prints `BACKEND DOWN` and stops trying. The client keeps running and
+        keeps looking healthy from the outside -- it just cannot reach
+        127.0.0.1 any more. Every symptom of that arrives late and disguised
+        (a hang at a loading screen, an in-game error dialog minutes later),
+        which is precisely the "waiting on logs for something that already
+        failed" shape this whole tool exists to kill.
+
+        Read the same way as the host log: seek to the end at construction, and
+        only ever read what is appended. The backend log is 600KB and growing;
+        it is never read whole.
+        """
+        try:
+            size = os.path.getsize(self.backend_path)
+        except OSError:
+            return None                      # no backend log is not evidence
+        if size < self.backend_pos:          # rotated / fresh run
+            self.backend_pos = 0
+            self.backend_leftover = ""
+        if size == self.backend_pos:
+            return None
+        with open(self.backend_path, "r", encoding="utf-8",
+                  errors="replace") as f:
+            f.seek(self.backend_pos)
+            data = f.read()
+            self.backend_pos = f.tell()
+        data = self.backend_leftover + data
+        lines = data.split("\n")
+        self.backend_leftover = lines.pop()
+        for line in lines:
+            if BACKEND_DOWN_LINE in line:
+                return ("BACKENDDOWN", line.strip(), [line.strip()])
+        return None
+
     def mark(self, text):
         """A sparse, one-line progress note on a STATE TRANSITION.
 
@@ -209,7 +313,37 @@ class Supervisor:
             if not self.seen_any:
                 self.mark("host attached, log restarted")
             self.seen_any = True
-            self.last_progress = time.time()
+
+            # A HEARTBEAT proves the host is alive; it does not prove the RUN
+            # is going anywhere. Only a non-periodic line refreshes the
+            # progress clock -- see HEARTBEAT_HOST_LINES for what this cost.
+            beat = any(h in line for h in HEARTBEAT_HOST_LINES)
+            if not beat:
+                self.last_progress = time.time()
+
+            # RAID PHASE. The signal existed and nothing consumed it. A phase
+            # CHANGE is real progress even though the line carrying it is a
+            # heartbeat, so it refreshes the clock and re-arms the bound.
+            m = RAID_PHASE.search(line)
+            if m:
+                ph = m.group(1)
+                if ph != self.phase:
+                    self.mark("raid phase -> %s" % ph)
+                    self.phase = ph
+                    self.phase_since = time.time()
+                    self.last_progress = time.time()
+                elif (self.phase_max and
+                      time.time() - self.phase_since > self.phase_max):
+                    # Bounded on a STATE, not a duration: the host is still
+                    # talking, the process is fine, and the run has been in one
+                    # phase past the point where that can be normal.
+                    return ("STALLED",
+                            "stuck in raid phase %s for %ds (limit %ds) -- the "
+                            "host is alive and still publishing, so this is a "
+                            "wedged run, not a dead one"
+                            % (ph, int(time.time() - self.phase_since),
+                               int(self.phase_max)),
+                            [line.strip()])
             if self.quiet:
                 self.host_tail.append(line)
                 del self.host_tail[:-40]
@@ -292,6 +426,11 @@ def main():
     p.add_argument("--until", default=None,
                    help="host-log literal that counts as success")
     p.add_argument("--timeout", type=int, default=300)
+    p.add_argument("--phase-max", type=float, default=900.0,
+                   help="seconds allowed in ONE raid phase before the run is "
+                        "called STALLED. Bounds the raid on a published "
+                        "state rather than on a blind sleep; a phase change "
+                        "re-arms it. 0 disables the bound.")
     p.add_argument("--stall", type=int, default=45,
                    help="seconds of host-log silence that count as IDLE")
     p.add_argument("--attach", action="store_true",
@@ -357,7 +496,8 @@ def main():
             return EXIT["INCONCLUSIVE"]
         subprocess.Popen([launcher], cwd=install_dir(args.root))
 
-    sup = Supervisor(args.root, args.until, args.stall, quiet)
+    sup = Supervisor(args.root, args.until, args.stall, quiet,
+                     phase_max=args.phase_max)
     state["sup"] = sup   # the signal handler reports from the live object
     verdict = why = None
     evidence = []
@@ -367,7 +507,10 @@ def main():
 
     while verdict is None:
         now = time.time()
-        hit = sup.poll_host() or sup.poll_client()
+        # Host first (it names causes), then the BACKEND (a dead server is
+        # the cause of symptoms that surface minutes later in the client),
+        # then the client's own logs.
+        hit = sup.poll_host() or sup.poll_backend() or sup.poll_client()
         if hit:
             verdict, why, evidence = hit
             break

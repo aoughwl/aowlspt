@@ -5242,3 +5242,48 @@ AND: **15 per-frame riders were enabled simultaneously**, of which 8 were pure D
 - `/client/items` is served in 0.68s at 15.39 MB and is already minified (1.2% whitespace), but the CLIENT parses it in 3.4-5.1s and requests it TWICE -- ~10s, and not reducible by trimming the payload.
 - 65 bot profiles and 106 weapon presets were generated; PlayerSpawnEvent -> GameStarted is 41.9s.
 - note: the machine renders at **3840x2160 on an RTX 2060 SUPER**. That is roughly four times the pixels that GPU is comfortable with in this game and is the leading explanation for both the 10.8fps and a 43.9s scene load at full-resolution assets. NOT yet A/B tested at a lower resolution -- that is the experiment that would settle it, and it is a user decision, not a code change.
+
+**the settings screen opens on the GAME tab, not Graphics** — so our Graphics/PostFX subtab strip is not on screen until Graphics is clicked
+
+`inspect_open_settings` lands on the FIRST tab (Game). The `settingsPostFxSubtab` strip lives inside the Graphics panel, and `gfxBuild` only runs when the current tab is the game tab (it takes the container name from there) -- so a `findtext "GRAPHICS SETTINGS"` immediately after opening Settings returns EXHAUSTIVE / genuinely-absent and that is CORRECT, not a missing feature. Click Graphics first.
+
+<sub>method: `measured` (the absence); the navigation step stated by the repo owner</sub>
+
+- evidence: 2026-09-01, right after `inspect_open_settings` reported PASS: `findtext "GRAPHICS SETTINGS" $settings 60000 all` -> "visited 1853 node(s) ... the subtree was searched EXHAUSTIVELY. No TMP text containing that substring is genuinely NOT PRESENT under this root." The strip genuinely did not exist yet.
+
+## A HEARTBEAT IS NOT PROGRESS -- why a wedged run was watched for 25 minutes
+
+MEASURED 2026-09-01, `aowlspt-host.log`. `raidphase.nim` re-publishes the
+current phase every 5.0s unconditionally (40 consecutive `natesp: raid phase =
+MENU` lines at a 5.015s cadence, phase unchanged throughout).
+
+`run.py`'s stall detector refreshed `last_progress` on EVERY host-log line. So
+from the moment the host attached, the progress clock was refreshed every 5s
+forever and the IDLE verdict became structurally unreachable. A run wedged in a
+raid, or parked on a screen nobody would click, was supervised to its full
+timeout by a watchdog that looked healthy the entire time.
+
+This is CLAUDE.md 9b inverted: not a check that cannot FAIL, but one that
+cannot FIRE. Both are the same defect -- a check whose outcome does not depend
+on the thing it claims to measure.
+
+FIX: `HEARTBEAT_HOST_LINES` in `tools/run.py`. Periodic lines prove liveness
+and nothing else, so they no longer touch the progress clock; a phase CHANGE
+does, and re-arms the raid bound (`--phase-max`, default 900s, verdict
+`STALLED`, exit 8).
+
+Related, same session: nothing had ever tailed `aowlspt-backend.log`, though
+`aowllaunch.nim:1572` has always printed `BACKEND DOWN` when it gives up
+restarting the server. A dead backend was indistinguishable from a slow game
+until an error dialog surfaced minutes later. Now verdict `BACKENDDOWN`, exit 9.
+
+And `enterraid.py` bounded the raid with `time.sleep(60.0)` then returned OK
+unconditionally -- it asserted a DURATION and could not tell a raid that
+deployed from one that never did. Now it waits for the host to publish
+`raid phase = DEPLOYED`, with three outcomes (DEPLOYED / TIMEOUT / SILENT);
+SILENT is not a pass.
+
+All of it is falsifiable offline: `python tools/test_supervise.py` drives the
+real `Supervisor` against synthetic logs, 13 checks, including the negative
+controls (heartbeats must NOT move the clock; a changing phase must NOT trip
+the bound).
