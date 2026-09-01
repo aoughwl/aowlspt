@@ -26,6 +26,7 @@ _TOOLS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
 if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 import shot  # noqa: E402
+import health  # noqa: E402
 
 PROTOCOL_VERSION = '2024-11-05'
 SERVER_INFO = {'name': 'aowlinspect', 'version': '0.1.0'}
@@ -228,6 +229,12 @@ def h_assert(a):
         return _err(e.kind, str(e))
 
 
+def h_health(a):
+    """No channel round trip: this reads the install's own log files, so it
+    answers even when the client is gone or the channel is wedged -- which is
+    exactly when the question matters most."""
+    return health.check(live=a.get('_live_dir'))
+
 TOOLS = [
     {'name': 'inspect_state', 'description':
      'Session/host status prose from the live inspector (`state`). '
@@ -361,6 +368,20 @@ TOOLS = [
          'commands': {'type': 'array', 'items': {'type': 'string'}},
          'write': {'type': 'boolean'}, 'timeout_s': {'type': 'number'}}},
      'handler': h_batch},
+    {'name': 'inspect_health', 'description':
+     'Is the client ALIVE, showing an ERROR DIALOG, or GONE? Reads the '
+     "install's own host log -- no channel round trip -- so it answers even "
+     'when the inspector channel is wedged or the client has died, which is '
+     'when you most need it. USE THIS FIRST when a batch times out, when '
+     'the client goes quiet, or before concluding a run is merely idle: an '
+     'in-game error dialog leaves the process alive and the log silent, '
+     'which is indistinguishable from a healthy client waiting at '
+     'profile-select. Returns verdict ALIVE/ERRORDIALOG/GONE/UNKNOWN plus '
+     'the dialog text, and `can_trust_quiet`: when false the host was NOT '
+     'catching dialogs, so a quiet log proves nothing and an idle reading '
+     'must be treated as INCONCLUSIVE, not as a pass.',
+     'inputSchema': {'type': 'object', 'properties': {}},
+     'handler': h_health},
     {'name': 'inspect_assert', 'description':
      'Run ONE named acceptance assertion from tools/acceptance.py against '
      'an ALREADY-RUNNING client with Settings ALREADY OPEN (call '

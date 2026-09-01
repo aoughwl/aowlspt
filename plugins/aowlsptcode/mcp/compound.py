@@ -20,10 +20,40 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import channel  # noqa: E402
 
-REPO = os.path.dirname(os.path.dirname(os.path.dirname(
-    os.path.dirname(os.path.abspath(__file__)))))
-TOOLS = os.path.join(REPO, "tools")
-if TOOLS not in sys.path:
+# WHERE `tools/` COMES FROM, AND WHY IT MIGHT NOT BE THERE AT ALL.
+#
+# This plugin is PUBLIC and is meant to be installed on its own, next to an
+# aowlspt INSTALL. The aowlspt SOURCE REPO is private and most people who run
+# this will not have it. Everything in this file that talks to the live client
+# goes through the file channel and needs nothing but the install; only
+# `inspect_assert` reaches into the repo, for `tools/acceptance.py`.
+#
+# So the repo is treated as OPTIONAL and located rather than assumed. The old
+# code walked four directories up from this file and appended `tools`, which is
+# correct exactly when the plugin is sitting inside a checkout at
+# `plugins/aowlsptcode/mcp/` and is silently wrong everywhere else -- it would
+# put a nonexistent path on sys.path and the failure would surface much later
+# as a confusing ImportError inside one tool.
+#
+# `AOWLSPT_REPO` wins if set; otherwise the in-checkout layout is tried and
+# accepted only if it actually contains `acceptance.py`. If neither works,
+# `REPO`/`TOOLS` are None and `inspect_assert` says so plainly instead of
+# raising something that reads like a bug.
+def _find_tools():
+    env = os.environ.get("AOWLSPT_REPO")
+    cands = []
+    if env:
+        cands.append(os.path.join(env, "tools"))
+    cands.append(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__))))), "tools"))
+    for c in cands:
+        if os.path.isfile(os.path.join(c, "acceptance.py")):
+            return os.path.dirname(c), c
+    return None, None
+
+
+REPO, TOOLS = _find_tools()
+if TOOLS and TOOLS not in sys.path:
     sys.path.insert(0, TOOLS)
 
 
@@ -241,6 +271,17 @@ def run_assertion(name, live_dir=None, root=None, mods_built=False, guid=None):
 
     live_dir defaults to channel.LIVE_DEFAULT; root defaults to its parent.
     """
+    if TOOLS is None:
+        # The private source repo is not present. Say that, precisely, rather
+        # than letting an ImportError surface as if the tool were broken: this
+        # is the ONLY tool in the plugin that needs the repo, and on a normal
+        # public install its absence is expected, not a fault.
+        raise AssertionUnknown(
+            "inspect_assert needs `tools/acceptance.py` from the aowlspt "
+            "SOURCE repo, which is private and is not installed here. Every "
+            "other tool in this plugin talks to the live client through the "
+            "file channel and needs only the game install, so they are "
+            "unaffected. Set AOWLSPT_REPO to a checkout to enable this one.")
     import acceptance as acc  # tools/acceptance.py, imported lazily so a
     # missing/broken acceptance.py degrades this one tool, not the whole
     # server's import.
