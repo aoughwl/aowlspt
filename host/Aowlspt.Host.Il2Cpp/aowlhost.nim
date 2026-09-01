@@ -6597,6 +6597,12 @@ var gModLoadCensusDone = false
   ## caption -- the host is already walking those roots during the window, so
   ## it is the instrument that can actually reach it.
 var gModLoadCapIdent = ""          ## the caption's name/parent, for the log
+var gModLoadWalkLevel = 3
+  ## BISECT KNOB for the caption search: 0 = no walk at all, 1 = enumerate and
+  ## validate the scene roots then stop, 2 = five nodes with a line before each
+  ## managed call, 3 = normal. Key `modLoadWalkLevel`. It exists because two
+  ## reasoned fixes for a client-killing crash both missed; a ladder that makes
+  ## the client name the failing hop is worth more than a third guess.
 var gModLoadCapFrontier: seq[Il2CppPtr] = @[]
   ## The caption search is RESUMABLE and takes one bounded slice per poll.
   ## It replaced a version that walked every scene root at full budget in ONE
@@ -8163,6 +8169,7 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   # release them would be a wait with no end and no explanation.
   gModLoadDeferMods = gModLoad and readBoolKeyDef("deferModLoad", true)
   block:
+    gModLoadWalkLevel = readIntKey("modLoadWalkLevel", 3)
     let n = readStrKey("modLoadCaption")
     if n.len > 0:
       gModLoadNeedle = toLowerAscii(n)

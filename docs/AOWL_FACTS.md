@@ -5847,3 +5847,26 @@ third reasoned fix.
 
 The build boots fine with no modload file, so it stays deployed; nobody
 creates the file until the bisect build is in.
+
+## ROOT CAUSE of the 18:49 / 23:18 crashes: a Transform receiver on a GameObject method
+
+`inspect.nim` `iRootsOfHandle` converts each scene-root GameObject to its
+TRANSFORM at the boundary (so `$rN` is the same kind of handle as `$c0`), and
+`splAnchorSceneRoots` hands that seq out. The modload walk's seed then called
+`nuTransformOf(root)` = `GameObject::get_transform` WITH A TRANSFORM RECEIVER on
+the very first root, before any log line. IL2CPP does not check receivers;
+UnityPlayer read the native side of the wrong object and faulted -- the
+identical host offset in all three dumps, the death inside the first slice,
+and the total log silence. The "78,000 calls in one frame" theory was wrong:
+slicing changed the work per frame, not the faulting call.
+
+This is the exact hazard the inspector already refuses for its own verbs
+("Transform methods read off a GameObject land on unrelated memory and can
+invent a plausible hierarchy WITHOUT faulting") -- and here it did fault. Fixed
+by using the roots directly, plus an `iIsGameObject` refusal at the seam.
+`modLoadWalkLevel` (0 off / 1 roots only / 2 five nodes with a line before each
+managed call / 3 normal) is in as the instrument for the next one of these.
+
+Tool gap: `tools/hostcfg.py` scrapes its key manifest from `readBoolKey` call
+sites only, so int/str keys (`modLoadWalkLevel`, `modLoadCaption`) report as
+UNKNOWN -- a typo warning for a valid key.

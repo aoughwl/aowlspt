@@ -3992,6 +3992,101 @@ proc gfxBuild(): bool =
 var gGfxVerdictSaid = false
 var gGfxArmSaid = false
 
+proc gfxStandDown(why: string) =
+  ## GET COMPLETELY OUT OF THE WAY. Every stock control back, nothing of ours
+  ## left driving anything.
+  ##
+  ## THE DEFECT THIS EXISTS FOR, reported by the user: the backstop failed on
+  ## the PostFX panel, hid THAT panel's strip, and left them looking at the
+  ## PostFX page with no way back -- our strip gone, and the stock POSTFX
+  ## top-row button still hidden by the fold. Worse, the tick kept ENFORCING
+  ## `gGfxSel == 1`, so even pressing GRAPHICS in the top row was undone on
+  ## the next frame. "Refusing costs nothing" is only true if the refusal also
+  ## stops us steering.
+  ##
+  ## Partial degradation was the mistake. A feature that cannot keep its
+  ## promise on ONE panel cannot be trusted to keep it on the other while
+  ## sharing the same padding writes and the same enforcement loop, so this
+  ## stands the whole thing down in one step, in the order that never leaves a
+  ## gap: restore what we wrote, give back the stock control, stop steering,
+  ## and only then hide our own objects.
+  if not gGfxOn:
+    return                      # already stood down; never do it twice
+  warn "postfx subtab STANDING DOWN: " & why & ". Every stock control is " &
+       "being put back and this feature stops driving the screen for the " &
+       "rest of the session. The player keeps GAME/GRAPHICS/SOUND/CONTROLS " &
+       "and gets the stock POSTFX tab back; nothing of ours is left steering " &
+       "panel visibility."
+  # 1. THE PADDING, first -- it is the only thing we wrote that the game owns.
+  if gGfxPadShifted:
+    var restored = 0
+    var failed = 0
+    var ri = 0
+    while ri < gGfxPadRo.len and ri < 4:
+      if nuSetPaddingTop(gGfxPadRo[ri], gGfxPadGrp[ri], gGfxPadOrig[ri]):
+        restored = restored + 1
+      else:
+        failed = failed + 1
+      ri = ri + 1
+    gGfxPadShifted = (failed > 0)
+    if failed == 0:
+      okLog "postfx subtab: stand-down restored LayoutGroup padding.top on " &
+            $restored & " panel(s); the stock lists go back exactly where " &
+            "the game put them."
+    else:
+      warn "postfx subtab: stand-down could NOT restore padding on " &
+           $failed & " panel(s); those stock lists stay " & $gGfxPadH &
+           "px lower until the screen is rebuilt. Reported, not hidden."
+  # 2. THE STOCK POSTFX TAB, before our strips go -- so there is never a frame
+  #    in which the player has neither.
+  if gGfxSpawnerHidden:
+    var go = gGfxSpawnerGo
+    if go == nil or not duOk(go, 0x20'i32) or not iUnityAlive(go):
+      if gGfxTogglesT != nil and duOk(gGfxTogglesT, 0x20'i32):
+        let again = modsChildNamed(gGfxTogglesT, "PostFxToggleSpawner")
+        if again != nil:
+          go = iGameObjectOf(again)
+    if go != nil and modsSetActive(go, true):
+      gGfxSpawnerHidden = false
+      okLog "postfx subtab: stand-down put the STOCK POSTFX TAB back in the " &
+            "top row, so POSTFX is reachable again by the game's own route."
+    else:
+      warn "postfx subtab: stand-down could NOT restore the stock POSTFX " &
+           "tab. The player still has GAME/GRAPHICS/SOUND/CONTROLS, but " &
+           "POSTFX is unreachable until the screen is reopened."
+  # 3. STOP STEERING. This is the part whose absence stranded the player: with
+  #    the flag still on, the steady-state enforcement below kept forcing the
+  #    PostFX panel active every frame.
+  gGfxOn = false
+  # 4. LEAVE EXACTLY ONE PANEL UP. The user saw "two backgrounds"; releasing
+  #    control without settling this would leave whichever pair happened to be
+  #    active. Graphics is the panel the stock GRAPHICS tab names, so that is
+  #    the honest resting state.
+  if gGfxPanelGo != nil and gGfxPostGo != nil:
+    if modsGoActive(gGfxPostGo):
+      discard modsSetActive(gGfxPostGo, false)
+    if not modsGoActive(gGfxPanelGo):
+      discard modsSetActive(gGfxPanelGo, true)
+    let oneUp = modsGoActive(gGfxPanelGo) and not modsGoActive(gGfxPostGo)
+    if oneUp:
+      okLog "postfx subtab: stand-down left exactly ONE panel active " &
+            "(Graphics Settings), read back off the live GameObjects -- so " &
+            "there is one background, not two."
+    else:
+      warn "postfx subtab: stand-down could not settle the panels to exactly " &
+           "one active (graphics=" & $modsGoActive(gGfxPanelGo) &
+           " postfx=" & $modsGoActive(gGfxPostGo) & "). The player may see " &
+           "two backgrounds until they leave and re-enter Settings."
+  # 5. OUR OWN OBJECTS LAST.
+  var hidden = 0
+  var h = 0
+  while h < gGfxStockStripGo.len and h < 4:
+    if gGfxStockStripGo[h] != nil and modsSetActive(gGfxStockStripGo[h], false):
+      hidden = hidden + 1
+    h = h + 1
+  okLog "postfx subtab: stand-down hid " & $hidden & " strip(s) of ours. " &
+        "Nothing was destroyed and nothing stock was written; the screen is " &
+        "the screen the game builds."
 proc gfxHideStripsOf(pIx: int): int =
   ## Hide only the strip(s) belonging to ONE panel. The old version hid every
   ## strip we owned, which is how a PostFX reading took the working GRAPHICS
@@ -4099,6 +4194,9 @@ proc gfxStockGeomVerdictFor(pIx: int) =
   var watched = 0
   var moved = 0
   var unread = 0
+  var landed = 0        # moved down by exactly our H: the group drives it
+  var untouched = 0     # did not move: the group does not drive it
+  var expected = 0      # entries we asked to move at all
   var report = ""
   var i = 0
   while i < gGfxStockT.len and i < GfxMaxStockWatch * 2:
@@ -4114,6 +4212,7 @@ proc gfxStockGeomVerdictFor(pIx: int) =
       if not now.ok:
         unread = unread + 1
       elif i < gGfxStockExpectShift.len and gGfxStockExpectShift[i]:
+        expected = expected + 1
         # WE MOVED THIS ONE ON PURPOSE, so the assertion changes shape but does
         # NOT go away: it must have moved DOWN by exactly our padding shift.
         # Staying put or moving by any other amount still fails, so the 420px
@@ -4123,6 +4222,31 @@ proc gfxStockGeomVerdictFor(pIx: int) =
         # tell offline which this group does: unchanged (the child's height is
         # not driven) or reduced by exactly our shift (it is). A third answer
         # is a failure.
+        # WHICH OBJECTS THE GROUP ACTUALLY DRIVES CANNOT BE PREDICTED, so it
+        # is MEASURED. This is a correction to a false FAIL that stranded the
+        # player.
+        #
+        # The previous rule was structural: 'a direct child of the content
+        # container is expected to move by H'. `PostFX Settings/Panel/
+        # EnablePanel` IS such a child and correctly did NOT move -- a
+        # LayoutGroup only arranges the children it actually lays out, and it
+        # skips inactive ones and ones that ignore layout. So a healthy object
+        # failed the check, its panel's strip was hidden, and the user was
+        # left on the PostFX page with no way back. Same false-FAIL shape as
+        # the inactive-panel one, a level further in.
+        #
+        # `LayoutGroup.m_RectChildren` @0x58 is the real membership list, but
+        # it is a `List<RectTransform>` -- an instantiated generic whose
+        # layout is NOT reachable offline, so reading it would mean a
+        # fabricated offset into a live collection. Refused.
+        #
+        # So both legitimate outcomes are accepted and everything else still
+        # fails: an object the group drives moves down by exactly H, an object
+        # it does not drive does not move at all. A 420px displacement, or a
+        # partial drift, is neither -- which is the whole class this backstop
+        # exists for. Weaker than the old rule in exactly one way (it cannot
+        # tell that the group FAILED to move something it should have), and
+        # that gap is closed by the `landed >= 1` assertion below.
         let shiftPx = (if i < gGfxStockShiftPx.len: gGfxStockShiftPx[i]
                        else: gGfxPadH)
         let want = gGfxStockG[i].posY - float32(shiftPx)
@@ -4132,7 +4256,14 @@ proc gfxStockGeomVerdictFor(pIx: int) =
         let yOk = dy < 2.0'f32 and dy > -2.0'f32
         let hOk = (dh0 < 2.0'f32 and dh0 > -2.0'f32) or
                   (dh1 < 2.0'f32 and dh1 > -2.0'f32)
-        if not yOk or not hOk:
+        # NOT MOVED AT ALL is the other legal answer: this object is simply
+        # not one the group arranges.
+        let still = not nuGeomMoved(gGfxStockG[i], now, 1.0'f32)
+        if yOk and hOk:
+          landed = landed + 1
+        elif still:
+          untouched = untouched + 1
+        if not (yOk and hOk) and not still:
           moved = moved + 1
           report = report & " | " & gGfxStockName[i] &
                    " (we deliberately shifted this by " & $shiftPx &
@@ -4151,19 +4282,32 @@ proc gfxStockGeomVerdictFor(pIx: int) =
          "strip displaced anything of the game's was never observed. NOT a pass."
     return
   gGfxGeomSaid[pIx] = true
+  # THE SHIFT MUST HAVE TAKEN EFFECT SOMEWHERE. Accepting 'unchanged' as a
+  # legal answer above would, on its own, let a padding write that did nothing
+  # at all pass silently -- and then the strip overlaps the stock rows, which
+  # is the defect this whole mechanism exists to avoid. So: of the objects we
+  # asked to move, at least ONE must actually have moved by H.
+  if moved == 0 and expected > 0 and landed == 0:
+    warn "postfx subtab STOCK-GEOMETRY DISPLACED (" & which & "): the " &
+         "padding shift did NOTHING -- " & $expected & " object(s) were " &
+         "asked to move down by " & $gGfxPadH & "px and NONE did (" &
+         $untouched & " unmoved). No band was freed, so the strip overlaps " &
+         "the stock rows. This panel's LayoutGroup evidently does not " &
+         "arrange these children, so raising its padding cannot make room."
+    gfxStandDown("the padding shift made no room on " & which)
+    return
   if moved > 0:
     warn "postfx subtab STOCK-GEOMETRY DISPLACED (" & which & "): " & $moved &
          " of " & $watched & " stock object(s) on THIS panel are not where " &
          "they should be. ALL casualties, before and after:" & report &
          ". Hiding only THIS panel's strip -- the other panel is judged " &
          "separately and is not affected by this reading."
-    let hidden = gfxHideStripsOf(pIx)
-    warn "postfx subtab: " & $hidden & " strip(s) hidden on " & which &
-         ". Nothing was destroyed; the padding shift is captured and is " &
-         "restored if this feature faults out."
-    gfxNoteFault("our subtab strip displaced the stock layout on " & which &
-                 " (see the STOCK-GEOMETRY DISPLACED line above for the " &
-                 "before/after numbers)")
+    # STAND THE WHOLE FEATURE DOWN, not just this panel's strip. Hiding one
+    # strip and carrying on is what left the player stranded on the PostFX
+    # page with no way back and the tick still forcing that panel up.
+    gfxStandDown("the stock layout was displaced on " & which &
+                 " (see the STOCK-GEOMETRY DISPLACED line above for the" &
+                 " before/after numbers)")
   elif unread > 0:
     warn "postfx subtab STOCK-GEOMETRY INCONCLUSIVE (" & which & "): nothing " &
          "was seen to move, but " & $unread & " of " & $watched & " baseline " &

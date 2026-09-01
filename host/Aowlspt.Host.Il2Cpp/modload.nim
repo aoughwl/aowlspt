@@ -449,10 +449,43 @@ proc mlCapSeed(): bool =
   var roots: seq[Il2CppPtr] = @[]
   if not splAnchorSceneRoots(roots):
     return false
-  for go in roots:
+  # THE ROOTS ARE ALREADY TRANSFORMS. Do NOT call GameObject::get_transform
+  # on them.
+  #
+  # THIS LINE KILLED THE CLIENT, TWICE. `iRootsOfHandle` (inspect.nim) converts
+  # each root GameObject to its Transform AT THE BOUNDARY -- `into.add t`,
+  # deliberately, so that a $rN means the same kind of thing as $c0 and $f1 --
+  # and `splAnchorSceneRoots` hands that seq straight out. Calling
+  # `nuTransformOf` on one therefore invoked `GameObject::get_transform` with a
+  # TRANSFORM receiver. IL2CPP does not type-check a receiver: it read the
+  # native side of the wrong object and UnityPlayer faulted, on the FIRST root,
+  # before a single line could be logged. Both crash dumps had the identical
+  # host offset for exactly this reason.
+  #
+  # `iRefuseIfGameObject` exists in the inspector for the mirror-image mistake.
+  # The lesson is the same one CLAUDE.md 5 states: a receiver is part of a
+  # call's contract, and "it is a UI object" is not a type.
+  for tr in roots:
     if gModLoadCapFrontier.len >= MlCapStackMax: break
-    let tr = nuTransformOf(go)
-    if tr != nil: gModLoadCapFrontier.add tr
+    if tr != nil and nuOk(tr, 0x10'i32) and nuAlive(tr):
+      # BELT AND BRACES: refuse a GameObject here if the contract ever changes
+      # upstream. A walk that faults is worse than a walk that reports nothing.
+      if iIsGameObject(tr):
+        warn "mod loading step: a scene root read back as a GAMEOBJECT where " &
+             "splAnchorSceneRoots promises a TRANSFORM. Skipping it rather " &
+             "than calling Transform methods on it -- that confusion is what " &
+             "killed the client on 2026-09-01."
+        continue
+      if gModLoadWalkLevel == 1:
+        okLog "mod loading step: WALK LEVEL 1 -- scene root name=\"" &
+              iObjName(tr) & "\" reads as a TRANSFORM (not a GameObject), " &
+              "readable and Unity-alive. Enumeration only; no walk is run."
+      gModLoadCapFrontier.add tr
+  if gModLoadWalkLevel == 1:
+    okLog "mod loading step: WALK LEVEL 1 -- " & $gModLoadCapFrontier.len &
+          " root(s) enumerated and validated. STOPPING HERE by config " &
+          "(modLoadWalkLevel=1). Set it to 3 for normal behaviour."
+    gModLoadCapFrontier.setLen(0)
   true
 
 proc mlCapStep(found: var NuStyle): bool =
@@ -466,7 +499,11 @@ proc mlCapStep(found: var NuStyle): bool =
   ## beyond the search we were already doing.
   result = false
   var n = 0
-  while gModLoadCapFrontier.len > 0 and n < MlCaptionSlice:
+  let slice = (if gModLoadWalkLevel == 2: 5 else: MlCaptionSlice)
+    ## LEVEL 2 walks FIVE nodes and narrates every managed call it is about to
+    ## make, so a boot that dies still names the exact hop it died on. The
+    ## normal level narrates nothing: one line per node would be a log bomb.
+  while gModLoadCapFrontier.len > 0 and n < slice:
     inc n
     inc gModLoadCapNodes
     if gModLoadCapNodes > MlCaptionMaxNodes:
@@ -477,6 +514,13 @@ proc mlCapStep(found: var NuStyle): bool =
     # with m_CachedPtr zeroed, so the pointer check alone is not the question.
     if node == nil or not nuOk(node, 0x10'i32) or not nuAlive(node):
       continue
+    if gModLoadWalkLevel == 2:
+      okLog "mod loading step: WALK LEVEL 2 -- node " & $gModLoadCapNodes &
+            " ptr=0x" & hexOf(cast[uint64](node)) & " klass=0x" &
+            hexOf(cast[uint64](nuKlassOf(node))) & " isGameObject=" &
+            $iIsGameObject(node) & ". About to call Component::GetComponent " &
+            "for TMP_Text on it. If this is the last line, THAT call is the " &
+            "one that does not return."
     let tmp = splTmpOf(node)
     if tmp != nil and nuOk(tmp, 0x10'i32) and nuAlive(tmp):
       let t = splTmpText(tmp)
@@ -965,6 +1009,16 @@ proc modLoadTick() =
   # once a second, because it is the expensive call in this feature.
   # ===================================================================
   var cap = gModLoadCapStyle
+  if gModLoadWalkLevel == 0:
+    # LEVEL 0: the gate never opens and no scene walk ever runs. This exists to
+    # prove the REST of the tick innocent -- if the client still dies with this
+    # set, the cause is not this feature's walk.
+    if gModLoadWhy != "walkoff":
+      gModLoadWhy = "walkoff"
+      warn "mod loading step: WALK LEVEL 0 -- the caption search is DISABLED " &
+           "by config (modLoadWalkLevel=0), so the gate can never open and " &
+           "nothing is drawn. This is a bisect setting, not a normal one."
+    return
   if not mlPhaseLive():
     gModLoadCaptionNode = nil
     # ONE SLICE PER POLL, and a pass that continues across polls instead of
