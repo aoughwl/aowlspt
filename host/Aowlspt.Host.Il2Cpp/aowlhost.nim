@@ -1560,6 +1560,10 @@ var gModLoadBuilt = false
 var gModLoadDone = false
 var gModLoadDonorWarned = false
 var gModLoadWhy = ""   ## the last refusal reason printed, so each prints once
+var gModLoadDeferMods = false
+var gModsDirDeferred = ""
+var gModLoadDeferredAt = 0'u64
+var gModsReleased = false
 var gModLoadPolledAt = 0'u64
 var gModLoadReadyAt = 0'u64
 var gModLoadDonor: Il2CppPtr = nil
@@ -8088,6 +8092,11 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   # game, installs no detour, and builds NOTHING until the compile writes its
   # file -- so on an install whose mods are already built it is inert.
   gModLoad = readBoolKeyDef("modLoadScreen", true)
+  # NO MODS BY DEFAULT. The client comes up carrying nothing so the mods folder
+  # can be compiled from source behind our own loading screen. Gated on
+  # modLoadScreen as well as its own key: deferring the mods with no screen to
+  # release them would be a wait with no end and no explanation.
+  gModLoadDeferMods = gModLoad and readBoolKeyDef("deferModLoad", true)
   if gModLoad:
     info "modLoadScreen is on (default): while the mods folder compiles, the " &
          "client shows a native panel listing every mod and whether it was " &
@@ -9173,8 +9182,33 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   # perfectly well without IL2CPP, and a host injected into a process that has
   # none at all is exactly what `hostharness --inject` is. `resolve` and `call`
   # report it; loading does not gate on it.
-  if modhost.loadAll(modsDir, modhost.SideClient, HostName, HostVersion) == 0:
-    info "no mods loaded; the host will idle"
+  # NO MODS BY DEFAULT, then OUR loading step.
+  #
+  # The client is brought up carrying nothing, so the mods folder can be
+  # COMPILED FROM SOURCE while the player watches a panel that names each mod
+  # and whether it was built, cached or failed -- instead of a silent wait in
+  # which "compiling" and "hung" look identical. `modload.nim` renders that
+  # panel; `modLoadReleaseMods()` below is what ends the wait.
+  #
+  # THE SAFETY, and it is not optional: a deferral that never resolves leaves
+  # the player with NO MODS AT ALL and no way to know why. So this is a
+  # deferral with a DEADLINE, not a gate -- if the compile never reports, the
+  # mods are loaded anyway and the log says plainly that the screen never
+  # finished. Failing towards "your mods work" is the only acceptable
+  # direction here.
+  if gModLoadDeferMods and gModLoad:
+    gModsDirDeferred = modsDir
+    gModLoadDeferredAt = cNowMs()
+    info "deferModLoad is on (default): the client is starting with NO mods " &
+         "loaded. They are loaded once the mod build reports ready via " &
+         gModLoadScreenPath & ", so the loading screen can show each one being " &
+         "built or taken from cache. HARD DEADLINE " &
+         $int(ModLoadDeferMaxMs div 1000'u64) & "s: if that never reports, the " &
+         "mods are loaded anyway and this log says so -- a stuck screen must " &
+         "never cost the player their mods."
+  else:
+    if modhost.loadAll(modsDir, modhost.SideClient, HostName, HostVersion) == 0:
+      info "no mods loaded; the host will idle"
 
   # The overlay, on this thread and not a moment earlier.
   #

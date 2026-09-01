@@ -59,6 +59,8 @@
     "botcap (offline bot-cap lift)",
     "ERRORDIALOG kind=",
     "mod loading screen ARMED: renders ",
+    "deferModLoad is on (default): the client is starting with NO mods ",
+    "mod loading: releasing deferred mods now -- ",
     "mod loading screen: BUILT -- 1 panel + ",
     "modLoadScreen is on (default)",
     "errdlg ARMED: read-only postfix detours on all ",

@@ -51,6 +51,12 @@ const
   MlLingerMs = 1500'u64
     ## How long a clean "MODS READY" stays up, so the step is legible rather
     ## than a flicker.
+  ModLoadDeferMaxMs* = 240_000'u64
+    ## HARD DEADLINE on the deferral. A cold build of all 15 mods measured ~6
+    ## minutes here, but the common case is a fully cached start that reports in
+    ## under a second. Four minutes is generous for the usual case and still
+    ## bounded: past it the mods are loaded regardless, because a screen that
+    ## never finishes must not silently cost the player every mod they have.
   MlDonorBudget = 3000
     ## Nodes the donor search may visit, total. Bounded like every other walk in
     ## this host: an unbounded descent on a scene full of geometry is how
@@ -254,6 +260,25 @@ proc mlRefresh(lines: seq[string]) =
     discard nuSetText(gModLoadRows[i],
                       (if i + 1 < lines.len: lines[i + 1] else: ""))
 
+proc modLoadReleaseMods(why: string) =
+  ## Load the mods that boot deliberately skipped.
+  ##
+  ## Called on exactly two paths, and BOTH must exist:
+  ##   * the build reported ready -- the intended one;
+  ##   * the deadline expired -- the safety net.
+  ## `why` names which, in the log, because "my mods are missing" and "my mods
+  ## loaded four minutes late" have completely different causes and a single
+  ## message for both would hide that.
+  if gModsReleased or gModsDirDeferred.len == 0:
+    return
+  gModsReleased = true
+  okLog "mod loading: releasing deferred mods now -- " & why
+  if modhost.loadAll(gModsDirDeferred, modhost.SideClient,
+                     HostName, HostVersion) == 0:
+    warn "mod loading: the deferred load produced NO mods from " &
+         gModsDirDeferred & ". If mods were expected, this is the failure to " &
+         "chase -- the client started clean on purpose and nothing filled it."
+
 proc modLoadTick() =
   ## Runs from the shared per-frame drain, on the Unity main thread, inside the
   ## existing guard. Cheap when idle: one clock compare, then one small file
@@ -308,13 +333,32 @@ proc modLoadTick() =
       if find(lines[0], "FAILED") < 0:
         if gModLoadReadyAt == 0'u64:
           gModLoadReadyAt = now
+        # The build is done and clean: this is the intended release point.
+        modLoadReleaseMods("the mod build reported READY: " & lines[0])
       else:
         # A run with a failed mod keeps the panel up ON PURPOSE. Dismissing it
         # would hide the only evidence the player has that a mod is missing.
         warn "mod loading screen: the build finished with FAILURES, so the " &
              "panel is LEFT ON SCREEN deliberately -- that is the one outcome " &
              "worth reading. " & lines[0]
+        # Release anyway. Some mods failed; the ones that BUILT are still real
+        # and withholding them helps nobody. The panel stays up naming the
+        # failures, which is where that information belongs.
+        modLoadReleaseMods("the build finished WITH FAILURES; the mods that " &
+                           "did build are loaded and the panel keeps naming " &
+                           "the ones that did not")
         gModLoadDone = true
+
+  # THE DEADLINE. Checked every tick, before the dismiss logic, and
+  # deliberately independent of whether the panel ever built: the panel is
+  # cosmetic, the mods are not.
+  if gModLoadDeferMods and not gModsReleased and gModsDirDeferred.len > 0 and
+     gModLoadDeferredAt != 0'u64 and
+     now - gModLoadDeferredAt > ModLoadDeferMaxMs:
+    modLoadReleaseMods("the build never reported ready within " &
+                       $int(ModLoadDeferMaxMs div 1000'u64) & "s, so the " &
+                       "deadline fired. The loading screen did not finish; " &
+                       "the mods are loaded anyway rather than lost.")
 
   if gModLoadReadyAt != 0'u64 and now - gModLoadReadyAt > MlLingerMs:
     mlDestroy()
