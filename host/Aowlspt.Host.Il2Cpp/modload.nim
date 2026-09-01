@@ -51,6 +51,11 @@ const
   MlLingerMs = 1500'u64
     ## How long a clean "MODS READY" stays up, so the step is legible rather
     ## than a flicker.
+  ModLoadNoFileMs* = 3_000'u64
+    ## How long to wait for the build to write its FIRST line before concluding
+    ## that no build is running at all. Short on purpose: this is the normal
+    ## path for an install whose mods are already compiled, and it must not cost
+    ## the player a visible pause.
   ModLoadDeferMaxMs* = 240_000'u64
     ## HARD DEADLINE on the deferral. A cold build of all 15 mods measured ~6
     ## minutes here, but the common case is a fully cached start that reports in
@@ -322,10 +327,27 @@ proc modLoadTick() =
 
   var text = ""
   if not readTextFile(gModLoadScreenPath, text) or text.len == 0:
-    # No file: the compile has not started, or this install does not compile at
-    # startup at all. Build NOTHING. An empty panel is indistinguishable from a
-    # broken one, and this feature must not invent a screen it has no content
-    # for.
+    # NO FILE: nothing is compiling. Build NOTHING -- an empty panel is
+    # indistinguishable from a broken one, and this must not invent a screen it
+    # has no content for.
+    #
+    # But it must also RELEASE THE MODS, quickly, and that is a correctness fix
+    # rather than a nicety: `deferModLoad` skips loadAll at boot and waits for
+    # this file, so on an install whose mods are already built -- where no
+    # compile ever runs and the file never appears -- every single boot would
+    # sit modless until the 240s deadline. A feature that makes the normal case
+    # four minutes slower is worse than no feature.
+    #
+    # A short grace is still allowed, because the compile may not have written
+    # its first line yet; after that, absence is an answer.
+    if gModLoadDeferMods and not gModsReleased and
+       gModLoadDeferredAt != 0'u64 and
+       now - gModLoadDeferredAt > ModLoadNoFileMs:
+      modLoadReleaseMods("no build is running (" & gModLoadScreenPath &
+                         " never appeared within " &
+                         $int(ModLoadNoFileMs div 1000'u64) & "s), so there is " &
+                         "nothing to wait for. This is the NORMAL path on an " &
+                         "install whose mods are already built.")
     return
 
   let changed = text != gModLoadText

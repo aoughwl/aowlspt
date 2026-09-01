@@ -128,7 +128,18 @@ def h_find(a):
 
 
 def h_findtext(a):
+    # QUOTE THE TEXT. The inspector tokenises on whitespace, so a multi-word
+    # subject was split and the second word was parsed as the ROOT argument:
+    #
+    #     findtext GRAPHICS SETTINGS   ->   ! not an address: SETTINGS
+    #
+    # Measured 2026-09-01 hunting a settings-screen bug. `inspect_path` already
+    # auto-quotes its segments for exactly this reason; findtext did not, and
+    # the failure is worse here because a caller who does not read `raw` sees an
+    # empty hit list and can easily read it as "the text is not on screen".
     text = a['text']
+    if not (len(text) >= 2 and text[0] == '"' and text[-1] == '"'):
+        text = '"%s"' % text.replace('"', '')
     line = 'findtext %s' % text
     if a.get('root'):
         line += ' %s' % a['root']

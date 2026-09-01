@@ -1269,7 +1269,32 @@ static int32_t aowl_nu_slot_judge(int32_t k, void* got) {
  * into a clean refusal instead of unbounded growth.
  * ------------------------------------------------------------------ */
 
-#define AOWL_NU_MAX_INTERN     64
+/* RAISED FROM 64 on 2026-09-01, because 64 was measured to be too small and the
+ * failure it produced was a PARTIALLY BLANK SETTINGS PAGE:
+ *
+ *   nativeui: create("aowl-pfx-chroma"): no managed string (intern table
+ *             full=1, used 64)
+ *   nuikit: label("aowl-pfx-chroma") REFUSED
+ *   postfx rows VERDICT FAIL: 37 of 40 element(s) are drawable ... 3 read back
+ *             EMPTY text
+ *
+ * The PostFX page alone declares 43 settings, each needing at least a name and
+ * a caption; the mod-loading screen adds ~18 more; the mods tab will add one
+ * per mod. 64 was never going to hold them, and the exhaustion point moves with
+ * whatever happened to be built first -- so the same page renders differently
+ * depending on what the player opened before it. That is the worst kind of
+ * bug: reproducible only in order.
+ *
+ * The table still NEVER EVICTS, which is the property that matters: an eviction
+ * would hand a stale managed pointer to a caller still holding one. Raising a
+ * never-evicting cap is safe; the only cost is static memory, and 512 entries
+ * is 512 * (128 + 8) = ~70 KB. That is nothing against a 4 MB host, and it buys
+ * roughly eight times the headroom.
+ *
+ * The cap is still FINITE on purpose: a fixed ceiling turns "too many labels"
+ * into a clean, named refusal instead of unbounded growth on the Unity thread.
+ */
+#define AOWL_NU_MAX_INTERN     512
 #define AOWL_NU_MAX_INTERN_LEN 128
 
 typedef struct AowlNuIntern {
