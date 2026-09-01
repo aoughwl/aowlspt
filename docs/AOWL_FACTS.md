@@ -5212,3 +5212,33 @@ Every launch after 12:13 dies at ~1.1-1.7s. The host's message is an OBSERVATION
 - also verified intact: `global-metadata.dat` (27,776,072 bytes, identical to the reference install), `GameAssembly.dll` (123,891,024, identical), all 10,599 `ConsistencyInfo` entries size-match, 1.1 TB free, 21.4 GB physical RAM free and 31 GB commit free.
 - nothing binary in the install changed after the last healthy run: only four config files, all written by this session.
 - note: LEADING HYPOTHESIS, NOT PROVEN -- Windows Defender pushed a cloud config at **12:34:00**, inside the failure window, enabling `MpFC_EnableWdAiNisDrv` (an AI/network-inspection driver) plus `Features\Controls\271`. A newly enabled Defender driver interfering with a game process is consistent with every observation. Testing it needs ADMIN (`Add-MpPreference -ExclusionPath "D:\Aowlspt"`), which this session does not have. The last healthy run reached `GameStarted` at 12:13:42 and was killed MID-RAID, so leftover driver/anti-cheat state is the other candidate and a reboot is the cheap test.
+
+**THE PER-FRAME MAIN-THREAD TRAP — the single fundamental performance mistake a mod makes here** — measured 2026-09-01 with the host's own `drainProfiler`
+
+`splRebrandDrain` -- a COSMETIC feature that relabels one menu screen -- consumed **5,461,399 us (5.46 SECONDS)** of Unity main-thread time in one session, mean **1,322 us per call**, with a **single call peaking at 79,303 us (79 ms)**. A 79 ms call on the main thread is five dropped frames from one feature that changes two labels.
+
+<sub>method: `measured`</sub>
+
+- evidence: `drainProf: splRebrandDrain PHASE METER -- 4129 bracketed calls, TOTAL 5461399.2us, mean 1322.6us/call, MAX 79303.5us`, broken down as:
+  * `CHEAPHUNT` (splFindByName under the cached UI root, per frame): 2,590,859us, **47.4%**, mean **28,787us per call**
+  * `ROOTS` (scene-root enumeration, the ALLOCATING step): 816,099us, 14.9%, max 50,714us
+  * `MAINT.warn` (hide the co-op warning): 737,263us over **3,968 calls -- one per frame**
+  * `MAINT.tog` (re-assert the practice toggle): 654,377us over **3,968 calls -- one per frame**
+- alongside it, `frameMeter` reported `RECENT mean=91.8ms (10.8fps) p95<=100ms max=6652.9ms`.
+
+THE RULE, and it is the thing to carry to every other mod: **a scene search is not a per-frame operation.** `splFindByName`/`splScanNode`/scene-root enumeration walk live Unity objects and allocate; they cost tens of milliseconds each. Doing one per frame is not a small constant cost, it is the frame budget. The same applies to re-asserting a value every frame ("hide it again", "force the toggle again") -- that pattern exists because the screen can rebuild, but the fix is to re-assert ON THE REBUILD, not on a timer of every frame.
+
+What a mod should do instead, in order of preference: (1) do the work ONCE and cache the pointer, revalidating only when the thing it was cached from dies; (2) if it must poll, poll on a THROTTLE measured in frames (the host's own features use 120) and state the cadence in the log; (3) if it must search, bound it by node budget AND a per-frame time slice, the way `find`/`findtext` already do.
+
+RELATED, same session, same shape: `inspectorSliceMs` was set to **200 ms**. The host prints its own warning about this on every boot -- "Do NOT run a raid LOAD with a large slice -- it stalls the Unity main thread (fact #261)" -- and it was on during a raid load anyway. A per-frame budget of 200 ms IS the frame.
+
+AND: **15 per-frame riders were enabled simultaneously**, of which 8 were pure DIAGNOSTICS (`frameMeter`, `drainProfiler`, `botDiag`, `settingsUiProbe`, `settingsBindProbe`, `settingsRelabelProbe`, `unityPostProbe`, `uxNativeRaid` probe). Instruments are not free; leaving them all on is itself a performance decision, and `drainProfiler` in particular brackets every other rider with QueryPerformanceCounter.
+
+**vanilla raid entry is 160.7s, and 43.9s of it is ONE synchronous Unity scene load that logs NOTHING** — measured by wall-clock gap, `tools/raidprof.py`
+
+<sub>method: `measured`</sub>
+
+- evidence: session log_2026.09.01_13-56-55. Timeline from the first log line: consistency 4.5s, first `/client/items` 18.2s, matchmaking + UnloadHideout 40.6s, physics 57.0s, **scene ready 100.9s (+43.9s)**, GameCreated 108.2s, PlayerSpawnEvent 118.8s, GamePooled 139.0s, GameStarted 160.7s. Across ALL THIRTEEN log channels the 57.0-100.9s window contains exactly TWO lines, so it is one synchronous operation, not slow accumulation.
+- `/client/items` is served in 0.68s at 15.39 MB and is already minified (1.2% whitespace), but the CLIENT parses it in 3.4-5.1s and requests it TWICE -- ~10s, and not reducible by trimming the payload.
+- 65 bot profiles and 106 weapon presets were generated; PlayerSpawnEvent -> GameStarted is 41.9s.
+- note: the machine renders at **3840x2160 on an RTX 2060 SUPER**. That is roughly four times the pixels that GPU is comfortable with in this game and is the leading explanation for both the 10.8fps and a 43.9s scene load at full-resolution assets. NOT yet A/B tested at a lower resolution -- that is the experiment that would settle it, and it is a user decision, not a code change.
