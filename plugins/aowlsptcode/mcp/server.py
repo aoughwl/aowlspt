@@ -117,14 +117,107 @@ def h_roots(a):
     return _run(['roots'], a, channel.parse_roots)
 
 
+# WHY THESE NUMBERS.
+#
+# Measured 2026-09-01 with the Settings screen OPEN ON SCREEN:
+#
+#     > find GraphicsSettingsTab
+#       visited 20000 node(s) over 157 frame(s), 0 match(es),
+#       frontier 13696 node(s) -- STOPPED EARLY on the NODE BUDGET.
+#
+# The inspector's default 20,000-node budget is smaller than this scene, so a
+# search for a live, visible object costs 157 frames and returns nothing. The
+# tool was honest (STOPPED EARLY, not "absent") and that honesty stays -- but
+# the caller had to know to type `find more` by hand, and a caller who did not
+# read `completeness` would read the empty hit list as absence.
+#
+# 20000 visited + 13696 frontier means the reachable set is >33,696 nodes, so
+# one slice of 40,000 covers this scene with headroom. FIND_MAX_NODES is the
+# ceiling across ALL resume rounds, and it is caller-visible (`max_nodes`) so
+# an expensive search is a choice, not a surprise.
+FIND_BUDGET = 40000
+FIND_MAX_NODES = 400000
+FIND_MAX_ROUNDS = 20
+
+
+def _find_resume(first_line, more_verb, a, parse):
+    """Issue `find`/`findtext`, then `... more` until one of exactly three
+    things ends it, and SAY WHICH:
+
+        EXHAUSTIVE   -- the search finished; an empty hit list IS absence
+        HITS         -- at least one match, stopped there
+        CAP          -- our own max_nodes/rounds ran out; still STOPPED EARLY,
+                        and absence is still NOT proven
+
+    The three-state answer survives: `completeness` is whatever the LAST
+    response actually said, never rewritten, and `can_trust_absence` comes
+    from the parser. `end_reason` is added alongside, not instead.
+    """
+    budget = int(a.get('budget') or FIND_BUDGET)
+    max_nodes = int(a.get('max_nodes') or FIND_MAX_NODES)
+    auto = a.get('auto_resume', True)
+    # A 40,000-node slice takes hundreds of frames; the shared 25s default was
+    # sized for a one-shot verb and would time out on the slice itself.
+    if not a.get('timeout_s'):
+        a = dict(a)
+        a['timeout_s'] = 90.0
+
+    res = _run([first_line], a, parse)
+    if 'error' in res:
+        return res
+    res['rounds'] = 1
+    res['budget_per_round'] = budget
+    res['visited_total'] = res.get('visited') or 0
+    res['end_reason'] = ('HITS' if res['hits'] else
+                         'EXHAUSTIVE' if res['completeness'] == 'EXHAUSTIVE'
+                         else 'CAP')
+    if not auto:
+        res['auto_resume'] = False
+        return res
+
+    rounds = 1
+    while (not res['hits'] and res.get('resumable')
+           and rounds < FIND_MAX_ROUNDS
+           and res['visited_total'] < max_nodes):
+        nxt = _run(['%s more %d' % (more_verb, budget)], a, parse)
+        if 'error' in nxt:
+            # A failed resume must not read as a finished search.
+            nxt['end_reason'] = 'RESUME_FAILED'
+            nxt['rounds'] = rounds
+            nxt['visited_total'] = res['visited_total']
+            return nxt
+        rounds += 1
+        nxt['rounds'] = rounds
+        nxt['budget_per_round'] = budget
+        nxt['visited_total'] = res['visited_total'] + (nxt.get('visited') or 0)
+        # $fN handles are rebound PER BATCH by the host, so only the LAST
+        # round's vars are live. Merging hit lists across rounds without
+        # saying that would hand the caller stale anchors.
+        nxt['hits_from_earlier_rounds'] = res['hits'] + res.get(
+            'hits_from_earlier_rounds', [])
+        nxt['vars_valid_for'] = 'this round only ($fN is rebound per batch)'
+        res = nxt
+        res['end_reason'] = ('HITS' if res['hits'] else
+                             'EXHAUSTIVE' if res['completeness'] == 'EXHAUSTIVE'
+                             else 'CAP')
+
+    res['auto_resume'] = True
+    res['rounds'] = rounds
+    if res['end_reason'] == 'CAP':
+        res['cap_note'] = (
+            'stopped on OUR cap (max_nodes=%d, rounds=%d), not on the scene '
+            'ending -- this is STOPPED EARLY and absence is NOT proven; raise '
+            'max_nodes or budget' % (max_nodes, rounds))
+    return res
+
+
 def h_find(a):
     name = a['name']
-    parts = ['find %s' % name]
+    line = 'find %s' % name
     if a.get('root'):
-        parts = ['find %s %s' % (name, a['root'])]
-    if a.get('budget'):
-        parts[0] += ' %s' % a['budget']
-    return _run(parts, a, channel.parse_find)
+        line += ' %s' % a['root']
+    line += ' %d' % int(a.get('budget') or FIND_BUDGET)
+    return _find_resume(line, 'find', a, channel.parse_find)
 
 
 def h_findtext(a):
@@ -143,11 +236,10 @@ def h_findtext(a):
     line = 'findtext %s' % text
     if a.get('root'):
         line += ' %s' % a['root']
-    if a.get('budget'):
-        line += ' %s' % a['budget']
+    line += ' %d' % int(a.get('budget') or FIND_BUDGET)
     if a.get('include_inactive'):
         line += ' all'
-    return _run([line], a, channel.parse_findtext)
+    return _find_resume(line, 'findtext', a, channel.parse_findtext)
 
 
 def h_children(a):
@@ -245,7 +337,7 @@ def h_path(a):
 def h_open_settings(a):
     try:
         return compound.open_settings(live_dir=a.get('_live_dir'),
-                                       timeout=float(a.get('timeout_s', 90.0)))
+                                       timeout=float(a.get('timeout_s', 180.0)))
     except channel.InspectorError as e:
         return _err(e.kind, str(e))
 
@@ -294,24 +386,35 @@ TOOLS = [
      'handler': h_roots},
     {'name': 'inspect_find', 'description':
      'find NAME [ROOT] [BUDGET] -- case-insensitive GameObject-NAME substring '
-     'search. Result carries `completeness` (EXHAUSTIVE/STOPPED_EARLY/'
+     'search, AUTO-RESUMED (`find more`) until the search is EXHAUSTIVE, a hit '
+     'is found, or max_nodes is reached; `end_reason` says which of the three. '
+     'Default budget 40000/round (the menu scene is >33696 nodes; the '
+     'inspector default of 20000 returned zero hits for objects visibly on '
+     'screen). Result still carries `completeness` (EXHAUSTIVE/STOPPED_EARLY/'
      'HIT_CAP/NOTHING_EXAMINED) and `can_trust_absence`: an empty hit list is '
      'NOT proof of absence unless can_trust_absence is true.',
      'inputSchema': {'type': 'object', 'required': ['name'], 'properties': {
          'name': {'type': 'string'},
          'root': {'type': 'string', 'description': 'a $-anchor or 0x pointer'},
-         'budget': {'type': 'integer'},
+         'budget': {'type': 'integer', 'description': 'nodes per round (default 40000)'},
+         'max_nodes': {'type': 'integer', 'description':
+                       'ceiling across ALL resume rounds (default 400000)'},
+         'auto_resume': {'type': 'boolean', 'description':
+                         'default true; false for one single slice'},
          'timeout_s': {'type': 'number'}}},
      'handler': h_find},
     {'name': 'inspect_findtext', 'description':
      'findtext TEXT [ROOT] [BUDGET] -- search by DISPLAYED TMP text, not '
-     'object name. `include_inactive` controls whether inactive nodes are '
+     'object name. AUTO-RESUMES like inspect_find (same budget/max_nodes/'
+     'end_reason contract). `include_inactive` controls whether inactive nodes are '
      'included, and the actual scope used is echoed back in `scope` -- never '
      'assume the request flag was honoured without checking it.',
      'inputSchema': {'type': 'object', 'required': ['text'], 'properties': {
          'text': {'type': 'string'},
          'root': {'type': 'string'},
-         'budget': {'type': 'integer'},
+         'budget': {'type': 'integer', 'description': 'nodes per round (default 40000)'},
+         'max_nodes': {'type': 'integer'},
+         'auto_resume': {'type': 'boolean'},
          'include_inactive': {'type': 'boolean'},
          'timeout_s': {'type': 'number'}}},
      'handler': h_findtext},
@@ -393,7 +496,10 @@ TOOLS = [
      'SettingsButton -> component AnimatedToggle -> call rva:0x55ba430 '
      'v_pb $comp 1 -> confirm via `state` that $settings is now bound. '
      'Returns status PASS/FAIL/INCONCLUSIVE with the measured evidence at '
-     'whichever step it stopped, never just a bool. Does NOT launch the '
+     'whichever step it stopped, never just a bool. A step that times out is '
+     'reported as INCONCLUSIVE with may_have_run=true, NOT as an error: the '
+     'batch is drained on Unity main thread and a busy client has been '
+     'measured returning a timeout while the screen DID open. Does NOT launch the '
      'client or drive the mode selector -- the menu must already be up.',
      'inputSchema': {'type': 'object', 'properties': {
          'timeout_s': {'type': 'number'}}},

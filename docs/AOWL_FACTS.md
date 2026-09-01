@@ -5447,3 +5447,66 @@ case is "every press reported ok but we are still in the raid -> FAIL".
 STILL UNVERIFIED until run in a live raid: that `ShowInRaid()` actually opens
 the menu, that `_disconnectButton` is non-NULL mid-raid, and whether
 `ShowInRaid` also changes cursor lock or input state (undisassembled).
+
+## P0: `popups.py` called the game's own render window a POPUP
+
+MEASURED 2026-09-01 with the client healthy on the main menu:
+
+    verdict: POPUP
+      class=UnityWndClass  proc=EscapeFromTarkov.exe
+      caption='EscapeFromTarkov'  text=[]  buttons=[]
+
+`UnityWndClass` is the game's MAIN RENDER WINDOW. It was reported only because
+`EscapeFromTarkov.exe` is in `OF_INTEREST`, and the existing guard (`if not cap
+and not kids: skip`) did not fire because the window HAS a caption. `run.py`
+polls this on its supervision loop, so a healthy launch returned verdict POPUP
+(exit 7) as soon as the game window appeared -- an unattended autoraid would
+have aborted on every iteration.
+
+FIX, deliberately two changes: `UnityWndClass` added to `NOT_A_POPUP`, AND a
+structural rule that a window qualifies only if it carries a MESSAGE (child
+text, or buttons, or class `#32770`). A caption alone is a window, not a
+message box. The denylist alone would only suppress the one window we happened
+to see; the message rule generalises.
+
+The decision is now a PURE FUNCTION `classify(rec)` over the window record, so
+it is testable without a real fatal dialog on screen.
+`tools/test_popups_classify.py` proves BOTH directions, 6/6: the render window
+and a caption-only window are not popups; the BattlEye and version-check
+dialogs still are. It also asserts the split is NON-DEGENERATE (fails if 0 or
+all 6 classify as POPUP), so a suppress-everything regression cannot pass --
+which is the same bug pointed the other way.
+
+## The inspector's default `find` budget was smaller than the scene
+
+MEASURED with the Settings screen OPEN on screen: `find GraphicsSettingsTab`
+visited 20,000 nodes over 157 frames, 0 matches, frontier 13,696 -- STOPPED
+EARLY. Searching for something visibly on screen returned nothing. The tool was
+honest (STOPPED EARLY is not "absent"), but the default made the common case
+useless and cost 157 frames to fail.
+
+FIX: budget 20,000 -> 40,000 per round, plus AUTO-RESUME (`find more`) until
+one of exactly three outcomes, reported as `end_reason`: HITS / EXHAUSTIVE /
+CAP -- and RESUME_FAILED as a fourth, because a failed resume must never read
+as a finished search. `completeness`/`can_trust_absence` are taken verbatim
+from the host and never rewritten.
+
+## `inspect_open_settings` reported an ERROR for an action that SUCCEEDED
+
+MEASURED: it returned `{"error":{"kind":"timeout"}}` after 40s and the Settings
+screen was open on screen immediately afterwards. The channel is a file drop
+drained on Unity's main thread; a busy client can exceed the timeout with the
+batch still running. A timeout is now a VERDICT, not an error:
+`status: INCONCLUSIVE`, `may_have_run: true`, naming the step -- and for a
+mutating step, saying it may already have taken effect.
+
+## `hostlog.py grep` had no bound
+
+Two agents hit it in one session; one emitted 25KB for a single word. It is the
+one subcommand whose output size is chosen by the LOG rather than the caller,
+and on a session where the maps profiler appends a multi-thousand-character
+block every ~2s (975 `Maps` lines in a 10-minute run) a matching pattern
+returns megabytes. Now `--max 60` by default, keeping the NEWEST matches (a
+head-limit would return the oldest and hide the reason you ran it), `--max 0`
+for all, and the withheld count is always printed -- a truncated answer that
+does not say it was truncated is a wrong answer.

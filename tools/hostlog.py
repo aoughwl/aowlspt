@@ -278,10 +278,35 @@ def cmd_config(args, C):
 
 
 def cmd_grep(args, C):
+    """Matching lines, BOUNDED by default.
+
+    `summary` has always had sane bounds; `grep` had none, and this is the one
+    subcommand whose output size is chosen by the LOG rather than by the
+    caller. Measured 2026-09-01: one word emitted 25KB and had to be truncated
+    by the harness, and the maps profiler alone appends a multi-thousand-
+    character block every ~2s -- so a pattern matching it returns megabytes.
+    CLAUDE.md 8: a single unwindowed read of the wrong file ends a session, and
+    a tool that exists to protect against that must not itself be the bomb.
+
+    Default is the LAST --max matches, not the first: on a log the newest
+    entries are almost always the ones being asked about, and a head-limit
+    would return the oldest and silently hide the reason you ran the command.
+    The count of what was withheld is always printed -- a truncated answer that
+    does not say it was truncated is a wrong answer.
+    """
     _, lines = read(args)
     pat = re.compile(args.pattern, 0 if args.case else re.IGNORECASE)
     rows = [r for r in parse(lines) if pat.search(r[2])]
-    show(rows, C)
+    total = len(rows)
+    shown = rows
+    if args.max > 0 and total > args.max:
+        shown = rows[-args.max:] if not args.head else rows[:args.max]
+    show(shown, C)
+    if total > len(shown):
+        print("-- %d of %d match(es) shown (%s). %d withheld; raise with "
+              "--max N, or --max 0 for all."
+              % (len(shown), total, "oldest" if args.head else "newest",
+                 total - len(shown)))
     return 0 if rows else 1
 
 
@@ -373,6 +398,13 @@ def main():
     p.add_argument("--backend", action="store_true",
                    help="read aowlspt-backend.log instead")
     p.add_argument("--case", action="store_true", help="grep case-sensitively")
+    p.add_argument("--max", type=int, default=60,
+                   help="cap `grep` output at N matches (default 60, 0 = all). "
+                        "The host log is a measured token bomb; an unbounded "
+                        "grep on it has emitted 25KB for a single word.")
+    p.add_argument("--head", action="store_true",
+                   help="with --max, keep the OLDEST matches instead of the "
+                        "newest")
     p.add_argument("--top", type=int, default=25,
                    help="how many leading tokens `shape` lists (default 25)")
     p.add_argument("--no-color", action="store_true")

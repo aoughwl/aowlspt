@@ -90,9 +90,74 @@ SMTO_ABORTIFHUNG = 0x0002
 # process is. A console window belongs to our own launcher and matching it made
 # the tool report a POPUP on a perfectly healthy launch -- a false positive here
 # is worse than a miss, because it would train the reader to ignore the tool.
+#
+# `UnityWndClass` is the GAME'S OWN RENDER WINDOW. Measured 2026-09-01 with the
+# client sitting healthy on the main menu, this tool said:
+#
+#     verdict: POPUP
+#       class=UnityWndClass proc=EscapeFromTarkov.exe
+#       caption='EscapeFromTarkov' text=[] buttons=[]
+#
+# It qualified only because EscapeFromTarkov.exe is in OF_INTEREST, and the old
+# "no caption and no children -> skip" guard did not fire because the render
+# window DOES have a caption. `run.py` polls this on its supervision loop, so a
+# healthy launch returned verdict POPUP (exit 7) the moment the game window
+# existed -- an unattended overnight run would abort on every iteration.
 NOT_A_POPUP = ("ConsoleWindowClass", "PseudoConsoleWindow",
                "CASCADIA_HOSTING_WINDOW_CLASS", "Chrome_WidgetWin_1",
-               "Shell_TrayWnd", "AlwaysOnTop_Border", "Progman", "WorkerW")
+               "Shell_TrayWnd", "AlwaysOnTop_Border", "Progman", "WorkerW",
+               "UnityWndClass")
+
+BUTTON_WORDS = ("ok", "cancel", "yes", "no", "retry", "abort",
+                "ignore", "close", "quit")
+
+
+def buttons_in(texts):
+    return [t for t in texts if t.lower().strip("&") in BUTTON_WORDS]
+
+
+def is_interesting_process(pname):
+    return any(k in (pname or "").lower() for k in OF_INTEREST)
+
+
+def classify(rec, include_all=False):
+    """PURE decision over one window record -> (is_popup, reason).
+
+    Kept free of HWNDs deliberately: the enumeration was never the part that
+    was wrong, the RULE was, and a rule that cannot be exercised without a real
+    fatal dialog on screen cannot be falsified. `rec` needs only
+    `class` / `process` / `caption` / `text` (list) / `buttons` (list).
+
+    THE RULE, in order:
+
+      1. `--all` reports everything, unfiltered. That is its whole job.
+      2. A class in NOT_A_POPUP is never a popup, whatever its process.
+      3. Otherwise it must be a dialog class OR belong to a process we care
+         about -- unchanged.
+      4. AND it must actually CARRY A MESSAGE: some child text, or buttons, or
+         the `#32770` message-box class. **A caption alone is a window, not a
+         message box.** This is the clause that was missing.
+
+    Rule 4 is what keeps rule 2 from being the whole fix: adding one class name
+    to a denylist only suppresses the window we happened to see. Both real
+    detections this tool exists for -- the BattlEye "service is not running"
+    box and the Unity "Fatal error [EscapeFromTarkov.exe]" version-check box --
+    carry their sentence as `Static` CHILD TEXT, so both still pass rule 4.
+    """
+    if include_all:
+        return True, "--all: reporting every visible top-level window"
+    cls = rec.get("class") or ""
+    if cls in NOT_A_POPUP:
+        return False, "class %s is never an error popup" % cls
+    if cls != DIALOG_CLASS and not is_interesting_process(rec.get("process")):
+        return False, "not a dialog class and not a process of interest"
+    if not (rec.get("text") or rec.get("buttons") or cls == DIALOG_CLASS):
+        return False, ("carries no message: no child text, no buttons, and not "
+                       "class %s -- a caption alone is a window, not a message "
+                       "box" % DIALOG_CLASS)
+    if not (rec.get("caption") or rec.get("text")):
+        return False, "dialog frame with no caption and no text"
+    return True, "carries a message and comes from a dialog or a watched process"
 
 
 def _class_of(hwnd):
@@ -202,25 +267,25 @@ def scan(include_all=False):
             cls = _class_of(hwnd)
             pid = _pid_of(hwnd)
             pname = _proc_name(pid)
-            interesting = any(k in pname.lower() for k in OF_INTEREST)
-            if cls in NOT_A_POPUP and not include_all:
-                return True
-            if not include_all and cls != DIALOG_CLASS and not interesting:
+            # Cheap rejects BEFORE the expensive per-child WM_GETTEXT walk:
+            # classify with empty text/buttons, and only pay for the children
+            # if the record could still qualify once they are known.
+            cheap = {"class": cls, "process": pname, "caption": "",
+                     "text": ["?"], "buttons": []}
+            if not include_all and not classify(cheap, False)[0]:
                 return True
             cap = _caption_of(hwnd)
             kids = _children_text(hwnd)
-            # A dialog with no text anywhere is a frame, not a message.
-            if not include_all and not cap and not kids:
-                return True
-            found.append({
+            rec = {
                 "hwnd": hwnd, "class": cls, "pid": pid, "process": pname,
                 "caption": cap, "text": kids,
                 # The buttons are what make it a STOP rather than a notice.
-                "buttons": [t for t in kids
-                            if t.lower().strip("&") in
-                            ("ok", "cancel", "yes", "no", "retry", "abort",
-                             "ignore", "close", "quit")],
-            })
+                "buttons": buttons_in(kids),
+            }
+            ok, why = classify(rec, include_all)
+            rec["why"] = why
+            if ok:
+                found.append(rec)
         except Exception:
             pass
         return True

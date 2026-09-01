@@ -126,21 +126,91 @@ def resolve_path(path, live_dir=None, timeout=25.0, budget=20000):
 
 OPEN_SETTINGS_RVA = "rva:0x55ba430"  # AnimatedToggle::SetOn, v_pb -- fact #109
 
+# WHAT A TIMEOUT ON THIS CHANNEL ACTUALLY MEANS.
+#
+# Measured 2026-09-01: inspect_open_settings returned
+#   {"error":{"kind":"timeout","message":"no answer for aowl-batch-... within
+#    40s"}}
+# and the Settings screen WAS OPEN ON SCREEN immediately afterwards. The tool
+# reported failure for an action that worked -- the confidently-wrong-answer
+# class this repo treats as worst-case.
+#
+# The channel is a file drop drained on Unity's MAIN THREAD. When the client is
+# busy, the batch is still sitting in the queue when our deadline passes; the
+# write already happened and Unity will very likely run it. So "no answer in
+# Ns" is INCONCLUSIVE, never FAIL: the command MAY HAVE RUN, and for the two
+# steps that WRITE (`call ... SetOn`) it may have run AND taken effect.
+#
+# Timeouts are also raised across the board -- 40s was below the observed
+# latency of the very step that produced the false failure.
+STEP_TIMEOUT = 90.0
 
-def open_settings(live_dir=None, timeout=90.0):
+
+class _StepTimeout(Exception):
+    def __init__(self, step, seconds, message, mutating):
+        Exception.__init__(self, message)
+        self.step = step
+        self.seconds = seconds
+        self.message = message
+        self.mutating = mutating
+
+
+def _step(label, lines, live_dir, timeout, write=False, mutating=False):
+    """One channel round trip that turns a TimeoutErr into a _StepTimeout
+    carrying WHICH step and whether that step writes -- so the caller can say
+    "handed to Unity's thread, may have run" instead of "failed"."""
+    try:
+        return channel.run_batch(lines, live_dir=live_dir, timeout=timeout,
+                                 write=write)
+    except channel.TimeoutErr as e:
+        raise _StepTimeout(label, timeout, str(e), mutating)
+
+
+def _inconclusive_timeout(e):
+    return {
+        "status": "INCONCLUSIVE",
+        "reason": ("step %r was handed to Unity's main thread and no answer "
+                   "came back within %gs. It MAY HAVE RUN%s -- the file-channel "
+                   "batch was written and is drained on the main thread, so a "
+                   "busy client looks exactly like a lost command. This is NOT "
+                   "evidence the Settings screen failed to open; check "
+                   "inspect_state or the screen itself."
+                   % (e.step, e.seconds,
+                      " AND TAKEN EFFECT" if e.mutating else "")),
+        "timed_out_step": e.step,
+        "timeout_s": e.seconds,
+        "may_have_run": True,
+        "detail": e.message,
+    }
+
+
+def open_settings(live_dir=None, timeout=180.0):
     """Walk Preloader UI/.../Tabs -> child named 'Settings' (last child,
     bottom-right icon) -> SettingsButton -> component AnimatedToggle ->
     `call rva:0x55ba430 v_pb $comp 1` -> confirm `state` now reports a bound
     $settings anchor. Returns PASS/FAIL/INCONCLUSIVE with the measured
-    evidence at each step, never just a bool."""
-    r = resolve_path("Preloader UI", live_dir=live_dir, timeout=40)
+    evidence at each step, never just a bool. A step that TIMES OUT yields
+    INCONCLUSIVE with `may_have_run`, never FAIL -- see STEP_TIMEOUT above."""
+    try:
+        return _open_settings(live_dir, timeout)
+    except _StepTimeout as e:
+        return _inconclusive_timeout(e)
+    except channel.TimeoutErr as e:
+        # resolve_path's own round trips raise the untagged form. Same
+        # meaning, same verdict -- a read-only step that may still have run.
+        return _inconclusive_timeout(
+            _StepTimeout("resolve_path(Preloader UI)", STEP_TIMEOUT, str(e), False))
+
+
+def _open_settings(live_dir, timeout):
+    r = resolve_path("Preloader UI", live_dir=live_dir, timeout=STEP_TIMEOUT)
     if not r["ok"]:
         return {"status": "INCONCLUSIVE", "reason": "Preloader UI scene root not found",
                 "detail": r}
     preloader = r["final_ptr"]
 
-    sentinel, raw = channel.run_batch(
-        ["find TaskBar %s 40000" % preloader], live_dir=live_dir, timeout=60)
+    sentinel, raw = _step("find TaskBar",
+        ["find TaskBar %s 40000" % preloader], live_dir=live_dir, timeout=STEP_TIMEOUT)
     f = channel.parse_find(raw)
     if not f["hits"]:
         status = "INCONCLUSIVE" if not f["can_trust_absence"] else "FAIL"
@@ -148,8 +218,8 @@ def open_settings(live_dir=None, timeout=90.0):
                 "completeness": f["completeness"]}
     taskbar = f["hits"][0]["ptr"]
 
-    sentinel, raw = channel.run_batch(
-        ["find Tabs %s 40000" % taskbar], live_dir=live_dir, timeout=60)
+    sentinel, raw = _step("find Tabs",
+        ["find Tabs %s 40000" % taskbar], live_dir=live_dir, timeout=STEP_TIMEOUT)
     f = channel.parse_find(raw)
     if not f["hits"]:
         status = "INCONCLUSIVE" if not f["can_trust_absence"] else "FAIL"
@@ -157,8 +227,8 @@ def open_settings(live_dir=None, timeout=90.0):
                 "completeness": f["completeness"]}
     tabs = f["hits"][0]["ptr"]
 
-    sentinel, raw = channel.run_batch(
-        ["find Settings %s 40000" % tabs], live_dir=live_dir, timeout=60)
+    sentinel, raw = _step("find Settings",
+        ["find Settings %s 40000" % tabs], live_dir=live_dir, timeout=STEP_TIMEOUT)
     f = channel.parse_find(raw)
     if not f["hits"]:
         status = "INCONCLUSIVE" if not f["can_trust_absence"] else "FAIL"
@@ -167,8 +237,8 @@ def open_settings(live_dir=None, timeout=90.0):
                 "completeness": f["completeness"]}
     settings_tab = f["hits"][0]["ptr"]
 
-    sentinel, raw = channel.run_batch(
-        ["find SettingsButton %s 20000" % settings_tab], live_dir=live_dir, timeout=40)
+    sentinel, raw = _step("find SettingsButton",
+        ["find SettingsButton %s 20000" % settings_tab], live_dir=live_dir, timeout=STEP_TIMEOUT)
     f = channel.parse_find(raw)
     if not f["hits"]:
         status = "INCONCLUSIVE" if not f["can_trust_absence"] else "FAIL"
@@ -176,16 +246,17 @@ def open_settings(live_dir=None, timeout=90.0):
                 "completeness": f["completeness"]}
     settings_button = f["hits"][0]["ptr"]
 
-    sentinel, raw = channel.run_batch(
-        ["component %s AnimatedToggle" % settings_button], live_dir=live_dir, timeout=40)
+    sentinel, raw = _step("component AnimatedToggle",
+        ["component %s AnimatedToggle" % settings_button], live_dir=live_dir, timeout=STEP_TIMEOUT)
     comp = channel.parse_component(raw)
     if not comp["bound"]:
         return {"status": "FAIL", "reason": "AnimatedToggle component did not resolve",
                 "raw": raw}
 
-    sentinel, raw = channel.run_batch(
+    sentinel, raw = _step(
+        "call AnimatedToggle::SetOn(true)",
         ["call %s v_pb $comp 1" % OPEN_SETTINGS_RVA], live_dir=live_dir,
-        timeout=40, write=True)
+        timeout=timeout, write=True, mutating=True)
     call = channel.parse_call(raw)
     if not call["ok"]:
         return {"status": "FAIL", "reason": "AnimatedToggle::SetOn call did not go through",
@@ -195,7 +266,7 @@ def open_settings(live_dir=None, timeout=90.0):
     # docstring says exactly this). `state` is free-form prose (parse_ok
     # always False by design -- see parse_state), so this greps the one
     # literal it is documented to contain.
-    sentinel, raw = channel.run_batch(["state"], live_dir=live_dir, timeout=25)
+    sentinel, raw = _step("state", ["state"], live_dir=live_dir, timeout=STEP_TIMEOUT)
     settings_bound = "$settings=NOT KNOWN" not in raw.replace(" ", "") and \
         "settings: NOT KNOWN" not in raw
     if settings_bound:
