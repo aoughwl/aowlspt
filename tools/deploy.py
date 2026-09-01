@@ -576,6 +576,25 @@ def pe_exports(path):
     return sorted(out), None
 
 
+def build_in_progress():
+    """Describe the running build, or None.
+
+    Shares the lock file `tools/buildlock.py` writes, so the two cannot
+    disagree about whether a build is running. Deliberately read-only and
+    failure-tolerant: it only IMPROVES an error message, so it must never
+    raise, and must never block a deploy on its own.
+    """
+    try:
+        import json as _json
+        with open(os.path.join(REPO, ".aowl-build.lock"),
+                  "r", encoding="utf-8") as f:
+            held = _json.load(f)
+        return "pid %s running %r since %s" % (
+            held.get("pid"), held.get("cmd"), held.get("started_h"))
+    except Exception:
+        return None
+
+
 def verify(art, src, C):
     """Return (verdict, list-of-problem-strings). Reads the file once."""
     red, green, yellow, dim, reset = C
@@ -597,6 +616,20 @@ def verify(art, src, C):
         # real dropped feature gets waved through. Nothing was verified, so
         # the honest verdict is INCONCLUSIVE (CLAUDE.md 9b). A missing
         # MARKER in a file that IS built stays FAIL, loudly.
+        # A BUILD IN PROGRESS is a different fact from "never built", and
+        # saying the wrong one sends the reader to rebuild something that is
+        # already being rebuilt. `aowl` removes the output before writing it,
+        # so an artifact vanishes for the whole build -- measured: a deploy
+        # issued while a subagent's build was running reported "not built" for
+        # a DLL that had verified 87 markers a minute earlier.
+        building = build_in_progress()
+        if building:
+            return INCONCLUSIVE, [
+                "not built YET: %s" % src,
+                "a BUILD IS IN PROGRESS: %s" % building,
+                "the artifact is absent because it is being rebuilt right "
+                "now, not because it was never built. Wait for the build to "
+                "finish (python tools/buildlock.py --status) and re-run."]
         return INCONCLUSIVE, ["not built: %s" % src,
                               "nothing was verified -- this is NOT evidence "
                               "the markers or exports are missing. Build it, "
