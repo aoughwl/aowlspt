@@ -76,7 +76,7 @@ proc onLoad(): Status =
       warn "uimapcheck: FAIL -- the generated map contains a ZERO RVA, " &
            "which is a fabricated offset, not a real one. Regenerate with " &
            "tools/gen_uimap.py and read its self-check output."
-      return Err
+      return ErrGeneric
 
   success "uimapcheck: PASS -- aowlspt/uimap compiles and 5 constants " &
           "spanning all 6 groups resolve non-zero. This proves the GENERATOR " &
