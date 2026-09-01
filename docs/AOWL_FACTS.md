@@ -5668,3 +5668,32 @@ at -20), with the backstop re-baselined to "stock minus our H".
   menu". catchcaption.py used it as a window-closed signal and reported
   INCONCLUSIVE on a boot that went on to render the loading caption for 60s --
   after run.py's own comments had already warned about exactly this.
+
+## PostFX subtab: the padding shift is EXACT on the active panel (measured 2026-09-01)
+
+`VerticalLayoutGroup.padding.top` 20 -> 66 (+46, the stock strip's measured
+height) via `RectOffset::set_top` + `LayoutGroup::SetDirty`, then a real tab
+switch through `Toggle::set_isOn`. Readback of `Graphics Settings/SettingsList`:
+`anchoredPosition=(0,-66) sizeDelta=(850,709)` -- stock (0,-20)/755 minus 46 in
+both, to the pixel. The group moved AND resized the list itself; it survives
+rebuilds because it is the group's own input. The Content inside the scroll
+view is unchanged (`sizeDelta=(0,1490)`), so the shift lives on SettingsList
+alone.
+
+**A LayoutGroup on an INACTIVE hierarchy does not rebuild.** The same shift was
+applied to the PostFX panel while Graphics was displayed; `EnablePanel` stayed
+at y=-26 (expected -72) because the rebuild is queued until the object is next
+enabled. The backstop read that as DISPLACED, hid BOTH strips, and the player
+saw a correct empty band with no subtabs. A shift assertion on an inactive
+panel is INCONCLUSIVE ("the group has not run"), not FAIL, and must be deferred
+to the panel's first show; one panel's reading must never hide the other
+panel's strip.
+
+## The load-phase caption is NOT under `$preloader` (measured with catchcaption)
+
+`findtext loading $preloader 120000 all` inside the boot window returned ONE
+hit: an INACTIVE 6px-tall node named `Text` under `LoadingSpinner` -- a spinner
+sub-label, not the "Loading profile data..." caption. So the caption the mod
+loading step must match does not live under the preloader root, or is not a
+TMP displaying "loading" at that moment. The host's gate now searches all of
+the anchor's scene roots; catchcaption.py now does too (no root, `all`).

@@ -193,8 +193,12 @@ def main():
         # first version used the default 20,000-node budget with no resume and
         # reported STOPPED EARLY -> INCONCLUSIVE on a scene the host's own
         # frontier showed to be >33,000 nodes. That is honest and useless.
-        raw, err = run_inspector(['findtext %s $preloader 120000 all' % a.text],
-                                 90.0)
+        # NO ROOT: every scene root. The first capture was rooted at $preloader
+        # and its only hit was an INACTIVE 6px "Text" under "LoadingSpinner" --
+        # a spinner sub-label, not the caption. The caption the loading step
+        # must match is not guaranteed to live under $preloader at all; the
+        # host's own gate now searches all of the anchor's scene roots.
+        raw, err = run_inspector(['findtext %s 120000 all' % a.text], 90.0)
         rounds = 1
         while (not err and raw is not None and "STOPPED EARLY" in raw
                and "HIT " not in raw and rounds < 6):
