@@ -5196,3 +5196,19 @@ Every launch this session reached the main menu (`MenuUIScene` present, 13 scene
 
 - evidence: 5 consecutive launches, all dying at 21.8-21.9s at the same three log lines. Restoring the pre-deploy `registry/mods.json` did NOT change it, so the registry content is ruled out. The errdlg detours are read-only, never fired in any of these runs, and the same shape occurred on the very first launch of the day.
 - note: leading hypothesis, NOT established: unloading a mod DLL whose detours are still installed leaves trampolines pointing into freed memory. The enabled set includes sain/fovfix/morebots, which facts #132/#143 already record as crashing this build -- but those crash at ~1.2s and ~8s, not 21.8s, so this is a DIFFERENT failure. Do not conflate them.
+
+**the client stopped booting on 2026-09-01 and it is NOT aowlspt** — `il2cpp_init returned 0`, reproduced with NOTHING of ours injected
+
+Every launch after 12:13 dies at ~1.1-1.7s. The host's message is an OBSERVATION, not its own failure: it watches the game's own `il2cpp_init` through a counter/return-code pair (`cIl2Calls`/`cIl2Rc`, aowlhost.nim:7190), and the game's call returned 0. No client log directory is created at all, so the process dies before Unity's own logging starts.
+
+<sub>method: `measured`</sub>
+
+- evidence: RULED OUT, each a single-variable test with `tools/run.py` (which now reports a host-declared fatal in ~7s instead of waiting out a 95s boot grace):
+  * the modload/errdlg host changes -- the PRE-MODLOAD host that had previously run 20:57 (4,067,328 bytes, `.bak-20260901-114833`) fails identically;
+  * `catchErrorDialogs`, `nativeUi`, `nativeUiKit` -- fails with each off;
+  * the newly built `tarkov.dll` -- it was already deployed at 08:51 and the 12:10 run worked;
+  * crashing client mods (facts #132/#143) -- fails with the known-good core only (`manager,tarkov,settingshub,uihub`);
+  * **THE DECISIVE ONE**: `EscapeFromTarkov.exe` started DIRECTLY with the launcher's own argument line (`-token=... -config={'BackendUrl':'https://127.0.0.1',...}`), backend running, NO host injected -- exits inside 30s and writes no log dir.
+- also verified intact: `global-metadata.dat` (27,776,072 bytes, identical to the reference install), `GameAssembly.dll` (123,891,024, identical), all 10,599 `ConsistencyInfo` entries size-match, 1.1 TB free, 21.4 GB physical RAM free and 31 GB commit free.
+- nothing binary in the install changed after the last healthy run: only four config files, all written by this session.
+- note: LEADING HYPOTHESIS, NOT PROVEN -- Windows Defender pushed a cloud config at **12:34:00**, inside the failure window, enabling `MpFC_EnableWdAiNisDrv` (an AI/network-inspection driver) plus `Features\Controls\271`. A newly enabled Defender driver interfering with a game process is consistent with every observation. Testing it needs ADMIN (`Add-MpPreference -ExclusionPath "D:\Aowlspt"`), which this session does not have. The last healthy run reached `GameStarted` at 12:13:42 and was killed MID-RAID, so leftover driver/anti-cheat state is the other candidate and a reboot is the cheap test.
