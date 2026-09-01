@@ -5583,3 +5583,48 @@ re-read could only ever report "unchanged", which is a check that cannot fail).
 If any stock sibling moved >1px it logs before/after and HIDES our strips,
 returning the panel to stock. The baseline is deliberately NOT re-captured on
 screen close, or it would learn the displaced layout as normal.
+
+## `Object::Destroy` is DEFERRED -- a same-frame survivor sweep reports a false leak
+
+MEASURED 2026-09-01. The mod loading step's teardown check walked the canvas
+for nodes named `aowlspt-modload*` immediately after destroying every handle,
+and reported:
+
+    teardown FAILED: 3 node(s) named "aowlspt-modload*" are STILL under the
+    canvas after every handle was destroyed. Something we created outlived its
+    handle; that is a leak on the player's screen.
+
+That was a REAL READING with a WRONG CONCLUSION. Unity's `Object::Destroy`
+defers actual destruction to the end of the frame, so the sweep looked before
+Unity had done the work. Scheduling the same sweep 750ms later:
+
+    teardown PASSED: a walk of the canvas found ZERO nodes named
+    "aowlspt-modload*". Read back off the tree 750ms after the destroy, not off
+    our own handles.
+
+The lesson is not "the check was wrong" -- reading the live tree rather than our
+own handle table is exactly right, and it is why the question was answerable at
+all. The lesson is that a correct instrument read at the wrong TIME produces a
+confident false negative. Anything asserting the absence of a destroyed Unity
+object must wait at least one frame; use `Object::DestroyImmediate` only if you
+know you are not inside a physics/GUI callback.
+
+A second unfalsifiable check was found and closed in the same pass: the sweep
+rooted only at OUR canvas would have reported ZERO survivors after a reparent
+**by not looking where they went**. It now sweeps both roots and names which.
+
+## Refusing loudly can still cost the player a working feature
+
+The postfx subtab feature correctly REFUSED to build when it found the cloned
+strip carries no `LayoutElement` (so `ignoreLayout` could not be set and it
+could not leave the panel's layout group) -- better than shipping the measured
+420px displacement. But the same run also printed:
+
+    fault ceiling reached; the feature is OFF for this session. The stock POSTFX
+    tab could NOT be restored -- open another tab and back, or restart.
+
+We had hidden the stock POSTFX button BEFORE our replacement was confirmed
+built, so the decline took a working game control with it. A refusal is only
+safe if it is free: do the destructive half (hiding stock UI) only AFTER the
+constructive half is verified, and make the restore path unfaultable -- it must
+not depend on a handle the fault path may already have dropped.
