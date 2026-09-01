@@ -21,12 +21,37 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import channel  # noqa: E402
 import compound  # noqa: E402
 
-_TOOLS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
-    os.path.dirname(os.path.abspath(__file__))))), 'tools')
-if _TOOLS_DIR not in sys.path:
-    sys.path.insert(0, _TOOLS_DIR)
-import shot  # noqa: E402
 import health  # noqa: E402
+
+# `shot` (the screenshot capture) lives in the aowlspt SOURCE REPO's `tools/`,
+# not in this plugin. That is fine for us and fatal for everyone else: this
+# plugin is PUBLIC and installs on its own, so a top-level `import shot` makes
+# THE WHOLE SERVER FAIL TO START on any machine without the private repo --
+# every tool lost, for one optional capability.
+#
+# It is therefore optional and imported LAZILY. `compound` has already located
+# the repo (or established that there is none) and put its `tools/` on sys.path,
+# so this only has to try.
+_shot = None
+_shot_why = ""
+
+
+def _get_shot():
+    """The screenshot module, or None with a reason. Never raises."""
+    global _shot, _shot_why
+    if _shot is not None or _shot_why:
+        return _shot
+    try:
+        import shot as _s          # noqa: F401
+        _shot = _s
+    except Exception as e:
+        _shot_why = (
+            "screen capture needs `tools/shot.py` from the aowlspt SOURCE "
+            "repo, which is private and is not installed here (%s). Every "
+            "other tool works without it -- they talk to the live client "
+            "through the file channel and need only the game install. Set "
+            "AOWLSPT_REPO to a checkout to enable this one." % e)
+    return _shot
 
 PROTOCOL_VERSION = '2024-11-05'
 SERVER_INFO = {'name': 'aowlinspect', 'version': '0.1.0'}
@@ -184,8 +209,14 @@ def h_screenshot(a):
         if len(parts) != 4:
             return _err('bad_crop', 'crop must be "x,y,w,h"')
         crop = tuple(parts)
-    result = shot.capture(process_name=a.get('process', 'EscapeFromTarkov.exe'),
-                           crop=crop, max_width=int(a.get('max_width', 1200)))
+    mod = _get_shot()
+    if mod is None:
+        # A typed refusal naming the real reason, not an ImportError traceback
+        # that reads like this tool is broken. On a public install its absence
+        # is expected.
+        return _err('unavailable', _shot_why)
+    result = mod.capture(process_name=a.get('process', 'EscapeFromTarkov.exe'),
+                         crop=crop, max_width=int(a.get('max_width', 1200)))
     if not result.get('ok'):
         return _err('capture_failed', result.get('reason', 'unknown'), **result)
     return result
