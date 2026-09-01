@@ -379,7 +379,7 @@ def main():
     if install is None and args.mods:
         # `--mods <install>\mods` implies the install one level up. Convenient,
         # and it means the shipped startup path needs one argument, not three.
-        parent = os.path.dirname(os.path.abspath(args.mods.rstrip("\/")))
+        parent = os.path.dirname(os.path.abspath(args.mods.rstrip("\\/")))
         if os.path.isdir(os.path.join(parent, TOOLCHAIN_SUBDIR)):
             install = parent
     nimony_root, ucrt64, tc_source = find_toolchain(install, args.nimony,
