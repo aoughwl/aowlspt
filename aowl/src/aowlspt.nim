@@ -1459,8 +1459,50 @@ proc modName*(): string =
   ## This mod's own display name, as passed to `exportMod`.
   gName
 
-proc modOnLoad(self: pointer): Status {.cdecl.} = gOnLoad()
-proc modOnUpdate(self: pointer; elapsedMs: int64): Status {.cdecl.} = gOnUpdate(elapsedMs)
+var gLoadHooks: seq[proc()] = @[]
+
+proc addLoadHook*(h: proc()) =
+  ## Register something to run just BEFORE the mod's `onLoad`.
+  ##
+  ## `aowlspt/reactive` uses this to perform the FIRST read of every binding.
+  ## That read cannot happen in the binding constructor: the ergonomic the
+  ## module is for is declaring bindings at module scope (`let x =
+  ## reactiveFloat(...)`), and module init runs before the host API is wired --
+  ## calling `setting()` there is an ACCESS VIOLATION, measured, with the
+  ## backend dying on load.
+  ##
+  ## Running the fill here instead means a module-scope binding is safe AND its
+  ## `.value` is already correct by the time the mod's own `onLoad` body runs.
+  gLoadHooks.add h
+
+proc modOnLoad(self: pointer): Status {.cdecl.} =
+  for h in gLoadHooks:
+    h()
+  gOnLoad()
+var gUpdateHooks: seq[proc(elapsedMs: int64)] = @[]
+
+proc addUpdateHook*(h: proc(elapsedMs: int64)) =
+  ## Register something to run on every update tick, BEFORE the mod's own
+  ## `onUpdate`.
+  ##
+  ## This exists so a library layer can be automatic without the mod wiring it
+  ## up. `aowlspt/reactive` registers its settings pump here at module init, so
+  ## merely importing it makes bindings self-refreshing -- there is no "call the
+  ## tick" step to forget, which is the entire point of that module.
+  ##
+  ## The library cannot simply import `reactive` and call it directly:
+  ## `aowlspt/server` (where `setting` lives, and which `reactive` needs)
+  ## imports THIS module, so a direct call would be an import cycle. Inverting
+  ## it -- the dependent registers itself here -- is what breaks that.
+  ##
+  ## Hooks run FIRST, so a mod's `onUpdate` always sees values that are already
+  ## current for this tick rather than one tick stale.
+  gUpdateHooks.add h
+
+proc modOnUpdate(self: pointer; elapsedMs: int64): Status {.cdecl.} =
+  for h in gUpdateHooks:
+    h(elapsedMs)
+  gOnUpdate(elapsedMs)
 proc modOnUnload(self: pointer): Status {.cdecl.} = gOnUnload()
 
 proc modStateSave(self: pointer; outBuf: ptr AowlBuffer): Status {.cdecl.} =

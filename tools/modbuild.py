@@ -494,6 +494,16 @@ def main():
     p.add_argument("--verbose", action="store_true")
     args = p.parse_args()
 
+    # ABSOLUTISE the mods root before anything derives from it. Every compile
+    # runs with cwd=<mod dir>, so a RELATIVE --mods makes the source path
+    # relative to the wrong directory and nimony reports `cannot open file:
+    # examples/reactivedemo/reactivedemo.nim` -- which reads as a missing file
+    # rather than as a resolved-from-the-wrong-place one. It only ever worked
+    # because the DEFAULT is repo-absolute.
+    args.mods = os.path.abspath(args.mods)
+    args.abi = os.path.abspath(args.abi)
+    args.aowl_src = os.path.abspath(args.aowl_src)
+
     install = args.install
     if install is None and args.mods:
         # `--mods <install>\mods` implies the install one level up. Convenient,

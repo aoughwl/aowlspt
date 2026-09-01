@@ -83,6 +83,19 @@ DEFAULT_ROOT = r"D:\Aowlspt"
 # window reports a healthy slow boot as a death.
 BOOT_GRACE_S = 95
 
+# Lines the HOST itself prints when the run is already over. Matching one ends
+# the supervision at once instead of waiting out a timeout that can only
+# confirm what the line already said. Each is a literal the host emits; they are
+# deliberately few and specific, because a false positive here aborts a healthy
+# run.
+FATAL_HOST_LINES = (
+    # The game's own IL2CPP runtime never came up. Nothing resolves, no mod
+    # loads, and the process exits within ~2s. Measured three times in a row.
+    "il2cpp_init returned 0",
+    # The launcher refuses to leave a client running with no host in it.
+    "terminating the client rather than leaving it running without mods",
+)
+
 # Exit codes. Distinct per verdict on purpose: a caller should be able to branch
 # on "it showed a dialog" without parsing prose.
 EXIT = {
@@ -208,6 +221,20 @@ class Supervisor:
                  "errdlg did not arm" in line or \
                  "NONE of the" in line and "error-screen entry points bound" in line:
                 self.errdlg_armed = False
+            # A HOST-REPORTED FATAL. Return immediately, do not wait anything
+            # out.
+            #
+            # This is the gap that made a supervised run still burn its whole
+            # timeout: a client that dies in ~1.6s is never observed alive by
+            # the 5s process poll, so `ever_alive` stays false and the DIED
+            # branch waits the full BOOT_GRACE_S before concluding anything --
+            # 95 seconds spent watching a process that already printed the
+            # reason it was doomed. The host SAYS these; believing it is
+            # strictly better than inferring death from a process table.
+            for sig in FATAL_HOST_LINES:
+                if sig in line:
+                    return ("DIED", "the host reported a fatal: " + line.strip(),
+                            [line.strip()])
             # The suppression notice is the host saying it stopped printing; it
             # is not itself a dialog and must not be reported as one.
             if "ERRORDIALOG kind=" in line and 'header="<suppressed>"' not in line:
