@@ -73,6 +73,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import crashwatch  # noqa: E402  -- reuse the measured signatures, do not restate
+import popups     # noqa: E402  -- native dialogs, which reach NO log at all
 import harness     # noqa: E402  -- reuse the launcher + process check
 
 DEFAULT_ROOT = r"D:\Aowlspt"
@@ -106,6 +107,7 @@ EXIT = {
     "ERRORDIALOG": 4,
     "CRASH": 5,
     "INCONCLUSIVE": 6,
+    "POPUP": 7,
 }
 
 
@@ -360,6 +362,7 @@ def main():
     verdict = why = None
     evidence = []
     last_alive = 0.0
+    last_popup = 0.0
     ever_alive = False
 
     while verdict is None:
@@ -368,6 +371,31 @@ def main():
         if hit:
             verdict, why, evidence = hit
             break
+        # NATIVE POPUPS. Checked on the same cadence as the process, because a
+        # Win32 message box is the one failure that reaches NO log file: not the
+        # host log, not the client's Logs/, not Unity's Player.log (created and
+        # left EMPTY), not the event log. Measured 2026-09-01: "The BattlEye
+        # service is not running" and "Unable to check the client version" each
+        # stopped every launch dead while every log-reading tool reported
+        # nothing wrong. The process stays alive holding the dialog, which is
+        # indistinguishable from a healthy slow boot -- so without this the
+        # supervisor waits out its whole timeout on a run that is already over.
+        if now - last_popup > 5:
+            last_popup = now
+            try:
+                pops = popups.scan()
+            except Exception:
+                pops = []
+            if pops:
+                first = pops[0]
+                lines = [t for t in first["text"] if t not in first["buttons"]]
+                verdict = "POPUP"
+                why = ("a native dialog is up and waiting for a click: %s -- %s"
+                       % (first["caption"] or "(no caption)",
+                          " / ".join(lines) or "(no message text)"))
+                evidence = ["%s [%s]" % (first["caption"], first["process"])] + lines
+                break
+
         if now - last_alive > 5:
             last_alive = now
             if harness.client_alive():
