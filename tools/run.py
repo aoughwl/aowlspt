@@ -64,6 +64,7 @@ from __future__ import annotations
 import argparse
 import json as jsonmod
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -139,6 +140,7 @@ class Supervisor:
         self.seen_any = False
         self.last_progress = time.time()
         self.evidence = []
+        self.marks = []
         # The client's own logs, through crashwatch so the signature list stays
         # in exactly one place.
         self.logs_root = os.path.join(root, "Logs")
@@ -169,8 +171,28 @@ class Supervisor:
         self.host_leftover = lines.pop()
         return [l.rstrip("\r") for l in lines]
 
+    def mark(self, text):
+        """A sparse, one-line progress note on a STATE TRANSITION.
+
+        Not per-log-line streaming -- that is what `--verbose` is for, and it is
+        the token bomb this tool exists to avoid. This is a handful of lines per
+        run, and it exists because a verdict printed only at the very end is
+        lost entirely to a hard kill.
+
+        On Windows an external `TerminateProcess` (what a `timeout` wrapper or a
+        task reaper uses) CANNOT be caught -- the SIGINT/SIGTERM handler below
+        only covers Ctrl-C. Measured: a supervised launch wrapped in `timeout`
+        left a completely empty output file. So the trail has to already be on
+        stdout before the kill arrives, not assembled after it.
+        """
+        if not self.marks or self.marks[-1] != text:
+            self.marks.append(text)
+            print("  .. %s" % text, flush=True)
+
     def poll_host(self):
         for line in self._host_lines():
+            if not self.seen_any:
+                self.mark("host attached, log restarted")
             self.seen_any = True
             self.last_progress = time.time()
             if self.quiet:
@@ -178,6 +200,8 @@ class Supervisor:
                 del self.host_tail[:-40]
             else:
                 print(line)
+            if "errdlg ARMED" in line:
+                self.mark("error-dialog catch ARMED")
             if "errdlg ARMED" in line:
                 self.errdlg_armed = True
             elif "catchErrorDialogs is explicitly false" in line or \
@@ -255,6 +279,42 @@ def main():
     quiet = not args.verbose
     started = time.time()
 
+    # SAY SOMETHING WHEN KILLED FROM OUTSIDE.
+    #
+    # This printed its verdict only at the very end, so an external kill -- a
+    # `timeout` wrapper, a Ctrl-C, a harness reaping a background task -- lost
+    # EVERYTHING. Measured: a supervised launch wrapped in `timeout 260` left a
+    # completely empty output file, which is the exact "something went wrong and
+    # you cannot tell what" outcome this tool exists to end. A supervisor that
+    # goes silent when interrupted is worse than no supervisor, because the run
+    # looked supervised.
+    #
+    # On SIGTERM/SIGINT: print what is known SO FAR, clearly marked as
+    # interrupted rather than concluded, and exit 130. The state is deliberately
+    # read out of the live `sup` object, so this reports the real progress and
+    # never a placeholder.
+    state = {"sup": None}
+
+    def _on_signal(_signum, _frame):
+        sup_ = state.get("sup")
+        el = time.time() - started
+        armed = sup_.errdlg_armed if sup_ else None
+        tail = (sup_.host_tail[-4:] if sup_ else [])
+        verdict_block(
+            "INTERRUPTED",
+            ("killed after %.1fs before a verdict was reached -- this is what "
+             "was known at that moment, NOT a conclusion about the run" % el),
+            tail, el, armed, [], args.json)
+        sys.exit(130)
+
+    for _sig in ("SIGTERM", "SIGINT", "SIGBREAK"):
+        s = getattr(signal, _sig, None)
+        if s is not None:
+            try:
+                signal.signal(s, _on_signal)
+            except (ValueError, OSError):
+                pass    # not the main thread, or unsupported here: not fatal
+
     if not args.attach:
         # Stop whatever is up first: the host DLL is LOCKED while the game runs.
         subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
@@ -269,6 +329,7 @@ def main():
         subprocess.Popen([launcher], cwd=install_dir(args.root))
 
     sup = Supervisor(args.root, args.until, args.stall, quiet)
+    state["sup"] = sup   # the signal handler reports from the live object
     verdict = why = None
     evidence = []
     last_alive = 0.0
@@ -283,6 +344,8 @@ def main():
         if now - last_alive > 5:
             last_alive = now
             if harness.client_alive():
+                if not ever_alive:
+                    sup.mark("client process is up")
                 ever_alive = True
             elif ever_alive:
                 # It was up and now it is not. That is a real death.
