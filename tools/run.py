@@ -131,9 +131,24 @@ BACKEND_DOWN_LINE = "BACKEND DOWN"
 # deliberately few and specific, because a false positive here aborts a healthy
 # run.
 FATAL_HOST_LINES = (
-    # The game's own IL2CPP runtime never came up. Nothing resolves, no mod
-    # loads, and the process exits within ~2s. Measured three times in a row.
-    "il2cpp_init returned 0",
+    # The host's runtime wait GAVE UP. This is the terminal line of the loop in
+    # aowlhost.nim:7231 -- after it, nothing else is tried.
+    #
+    # It used to read `il2cpp_init returned 0`, and that was WRONG in the worst
+    # possible way. That line is logged at `fail` level from INSIDE the wait
+    # loop, which then keeps going ("still waiting for the runtime (10s)...")
+    # for up to 120s and routinely succeeds afterwards. Treating it as terminal
+    # made the supervisor abort three consecutive HEALTHY launches at ~7s and
+    # report DIED, which sent this session hunting a nonexistent regression
+    # through the host DLL, the deploy and the BattlEye service -- each of
+    # which it correctly exonerated, because none of them was the problem. The
+    # supervisor was.
+    #
+    # A false positive in this table is strictly worse than a missing entry: a
+    # miss costs a timeout, a false positive fabricates a cause and destroys
+    # trust in every verdict the tool prints. Match only on a line the host
+    # emits when it has actually stopped trying.
+    "the runtime did not come up:",
     # The launcher refuses to leave a client running with no host in it.
     "terminating the client rather than leaving it running without mods",
 )

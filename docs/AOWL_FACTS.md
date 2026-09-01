@@ -5287,3 +5287,49 @@ All of it is falsifiable offline: `python tools/test_supervise.py` drives the
 real `Supervisor` against synthetic logs, 13 checks, including the negative
 controls (heartbeats must NOT move the clock; a changing phase must NOT trip
 the bound).
+
+## FALSE POSITIVE: `il2cpp_init returned 0` is NOT fatal (cost: 3 aborted launches)
+
+MEASURED 2026-09-01, `aowlhost.nim:7194` inside the runtime wait loop.
+
+The host logs `il2cpp_init returned 0 after <N>ms, which is a failure: the
+runtime did not initialise` at **fail** level, and then KEEPS WAITING -- the
+loop continues to `still waiting for the runtime (10s / 20s / ... )` for up to
+120s and routinely succeeds afterwards. It is a per-attempt report, not a
+verdict.
+
+`run.py` had that literal in `FATAL_HOST_LINES`, so it aborted three
+consecutive HEALTHY launches at ~7s and reported DIED. That sent a session
+hunting a regression that did not exist: the host DLL was rolled back, the
+deploy was re-checked, and the BattlEye service was started -- each correctly
+exonerated, because none of them was the cause. The supervisor was.
+
+The TERMINAL line of that loop, and the only one safe to treat as fatal, is:
+
+    the runtime did not come up: the il2cpp_init lookup was <armed|NOT armed>,
+    init was handed out N time(s), called N time(s), and last returned N
+
+A false positive in a fatal-signature table is strictly worse than a missing
+entry. A miss costs one timeout; a false positive FABRICATES A CAUSE, and every
+minute spent chasing it is spent trusting the tool. Regression-tested:
+`tools/test_supervise.py::died/mid-wait-progress-is-not-fatal`.
+
+## The M4A1-receiver spawn bug and the "Unable to check the client version"
+## dialog are ONE bug
+
+MEASURED 2026-09-01. `mods/tarkov`'s boot self-check fails:
+`fillRequiredSlots fitted NOTHING to a bare M4A1, so every minted weapon is
+still a receiver`, with four required slots (mod_pistol_grip, mod_reciever,
+mod_stock, mod_charge) reporting `_props.Slots[]._props.filters[0].Filter names
+no template`. The mod then prints `this build fails its own arithmetic;
+refusing to serve` and registers ONLY `/aowlspt/tarkov/selfcheck`.
+
+With no `/client/*` routes the client cannot version-check and puts up the
+native `Fatal error -- Unable to check the client version` dialog, which
+reaches NO log file (that is why `tools/popups.py` exists). So a data bug in
+loadout minting presents as a boot failure with an unrelated-sounding message.
+
+The self-check was RIGHT and refusing to serve was the correct behaviour: it
+caught, at boot, precisely the defect the user reported from inside the game
+("just the receiver- no attachments at all- not even a barrel"). Do not relax
+it to get the client booting.

@@ -224,7 +224,19 @@ def t_existing_verdicts():
          ['[0:00:02] ERRORDIALOG kind=23 header="<suppressed>" text=""'],
          None)
     case("died/host-reported-fatal-fires",
-         ["[0:00:03] il2cpp_init returned 0"], "DIED")
+         ["[0:00:03] error  the runtime did not come up: the il2cpp_init "
+          "lookup was armed, init was handed out 1 time(s)"], "DIED")
+
+    # REGRESSION, and an expensive one. `il2cpp_init returned 0` is logged at
+    # fail level from INSIDE aowlhost's wait loop, which then keeps going for
+    # up to 120s and usually succeeds. It was in FATAL_HOST_LINES, so the
+    # supervisor killed three healthy launches at ~7s and blamed the host, the
+    # deploy and BattlEye in turn. A mid-progress line must NEVER be terminal.
+    case("died/mid-wait-progress-is-not-fatal",
+         ["[0:00:01.719] error  il2cpp_init returned 0 after 1500ms, which is "
+          "a failure: the runtime did not initialise",
+          "[0:00:11.328] info   still waiting for the runtime (10s)"],
+         None)
     case("reached/fires",
          ["[0:00:04] ok     host running"], "REACHED", until="host running")
 
