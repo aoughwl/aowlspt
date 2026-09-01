@@ -192,7 +192,10 @@ class Supervisor:
     """
 
     def __init__(self, root, until, stall, quiet, phase_max=900.0,
-                 until_phase=None):
+                 until_phase=None, menu_settle=20.0):
+        # MENU is only "reached" once it has held with no other host progress
+        # for this long -- see poll_host for why the first sighting lies.
+        self.menu_settle = menu_settle
         self.host_path = harness.hostlog_path(root)
         self.until = until
         self.stall = stall
@@ -356,10 +359,28 @@ class Supervisor:
                     # ARRIVED. The host publishing a phase is the client
                     # SAYING where it is, which beats waiting for a log
                     # sentinel to imply it.
-                    if self.until_phase and ph == self.until_phase:
+                    # MENU is special and this bit me: it is published at
+                    # ~0:00:09 on every boot, BEFORE the main thread is even
+                    # ticking, because it only means "no GameWorld is cached".
+                    # Returning REACHED on that first sighting reported a
+                    # healthy boot for a client that then died at 0:00:15.
+                    # So MENU is only "reached" once it has SETTLED: the phase
+                    # is MENU and the host has printed no real progress for a
+                    # while, which is what the finished boot looks like and
+                    # what an early boot never looks like.
+                    if (self.until_phase and ph == self.until_phase
+                            and ph != "MENU"):
                         return ("REACHED",
                                 "the host published raid phase = %s" % ph,
                                 [line.strip()])
+                elif (self.until_phase == "MENU" and ph == "MENU"
+                      and time.time() - self.last_progress >= self.menu_settle):
+                    return ("REACHED",
+                            "raid phase = MENU has held with no other host "
+                            "progress for %ds -- the boot is over and the "
+                            "client is parked at the menu"
+                            % int(time.time() - self.last_progress),
+                            [line.strip()])
 
                     # NOTE on a rule deliberately NOT implemented here: it is
                     # tempting to declare a load-phase `--until` FUTILE the
@@ -471,6 +492,11 @@ def main():
                         "The client saying where it is beats waiting for a log "
                         "line to imply it: MENU = the main menu is up, "
                         "DEPLOYED = standing in the raid.")
+    p.add_argument("--menu-settle", type=float, default=20.0,
+                   help="with --until-phase MENU: seconds of no other host "
+                        "progress before MENU counts as reached. MENU is "
+                        "published at ~9s on every boot, long before the menu "
+                        "exists; the first sighting is never the answer.")
     p.add_argument("--phase-max", type=float, default=900.0,
                    help="seconds allowed in ONE raid phase before the run is "
                         "called STALLED. Bounds the raid on a published "
@@ -543,7 +569,8 @@ def main():
 
     sup = Supervisor(args.root, args.until, args.stall, quiet,
                      phase_max=args.phase_max,
-                     until_phase=args.until_phase)
+                     until_phase=args.until_phase,
+                     menu_settle=args.menu_settle)
     state["sup"] = sup   # the signal handler reports from the live object
     verdict = why = None
     evidence = []

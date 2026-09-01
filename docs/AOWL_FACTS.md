@@ -5737,3 +5737,35 @@ Rule: anything scripting a source edit through Bash must read the file back
 (`repr()` the changed bytes, or `ast.parse` / a compile) before claiming the
 edit landed. For multi-line or escape-bearing edits use the Edit tool, which
 does not pass through a shell.
+
+## CLIENT CRASH: host 4,247,552 kills the client ~15s into boot when a modload file exists
+
+MEASURED 2026-09-01 18:49 (two boots). Symptoms: EscapeFromTarkov.exe gone, no
+native popup, host log ends at 0:00:15.094 with NO fault line (a guarded fault
+logs and self-disables -- this did not), the client's own application log ends
+cleanly at `Session mode: Regular`. Test B (no inspector batches, file driven
+by `tools/modloadsim.py`): reproduces. Unity crash dump:
+`%LOCALAPPDATA%\Temp\Battlestate Games\EscapeFromTarkov\Crashes\Crash_2026-09-01_224922938\`
+
+Native stack (innermost first):
+    UnityPlayer            0x00007FFB4D66DF14   <- fault
+    aowlspt-host-il2cpp    0x00007FFB4573BAC1   (no symbol)
+    aowlspt-host-il2cpp    aowl_ui_overlay_mask       (nearest EXPORT, not the function)
+    aowlspt-host-il2cpp    aowl_region_screen_known_x x4 (the PreloaderUI::Update rider chain)
+    aowlspt-host-il2cpp    0x00007FFB4573AE26
+    GameAssembly           il2cpp_alloc x2
+    UnityPlayer ... UnityMain
+
+A host participant on the shared main-thread rider chain called into
+UnityPlayer and faulted OUTSIDE any guard. The modload log shows exactly one
+poll (COULD NOT LOOK, no anchor yet, ~8s) and nothing after the anchor appears
+(~14s): the death is the first poll with `lookOk` true and a file present --
+the new census / identity / reparent path.
+
+Two lessons independent of the fix:
+* `run.py --until-phase MENU` reported REACHED at ~9s on the boot that died at
+  15s, because MENU is published during early boot. Now MENU counts only once
+  it has SETTLED (no other host progress for --menu-settle seconds).
+* Unity's crash handler writes the native stack to that Crashes folder; check
+  it BEFORE reasoning about which feature died. `popups.py` and the client log
+  both say nothing for a hard native kill.

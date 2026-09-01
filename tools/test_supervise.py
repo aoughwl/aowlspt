@@ -67,7 +67,8 @@ class Bed:
         kw.setdefault("stall", 45)
         kw.setdefault("quiet", True)
         s = runmod.Supervisor(self.root, kw["until"], kw["stall"], kw["quiet"],
-                              phase_max=kw.get("phase_max", 900.0))
+                              phase_max=kw.get("phase_max", 900.0),
+                              until_phase=kw.get("until_phase"))
         # The real host log path comes from harness; point it at the bed.
         s.host_path = self.host
         s.host_pos = 0
@@ -241,6 +242,40 @@ def t_existing_verdicts():
          ["[0:00:04] ok     host running"], "REACHED", until="host running")
 
 
+# -- 6b. MENU is not "reached" on first sight -----------------------------
+def t_menu_must_settle():
+    # THE TRAP, measured: `raid phase = MENU` is published at ~0:00:09 on
+    # every boot because it only means "no GameWorld is cached". run.py
+    # returned REACHED on that first line for a client that then died at
+    # 0:00:15. MENU must only count once it has HELD with no other progress.
+    b = Bed()
+    try:
+        s = b.sup(until_phase="MENU", phase_max=0.0)
+        s.menu_settle = 20.0
+        b.say(phase_line("MENU"))                 # first sighting, early boot
+        hit = s.poll_host()
+        check("menu/first-sighting-is-not-reached", hit is None, repr(hit)[:100])
+        b.say("[0:00:12] ok     mods tab: GetComponent bound")   # real progress
+        s.poll_host()
+        b.say(phase_line("MENU"))
+        hit = s.poll_host()
+        check("menu/heartbeat-right-after-progress-is-not-reached",
+              hit is None, repr(hit)[:100])
+        s.last_progress = time.time() - 25.0      # quiet for longer than settle
+        b.say(phase_line("MENU"))
+        hit = s.poll_host()
+        check("menu/settled-is-reached",
+              hit is not None and hit[0] == "REACHED", repr(hit)[:120])
+        # DEPLOYED must still arrive immediately -- only MENU needs settling.
+        s2 = b.sup(until_phase="DEPLOYED", phase_max=0.0)
+        b.say(phase_line("DEPLOYED"))
+        hit = s2.poll_host()
+        check("menu/deployed-arrives-immediately",
+              hit is not None and hit[0] == "REACHED", repr(hit)[:120])
+    finally:
+        b.close()
+
+
 # -- 7. every verdict has a DISTINCT exit code ---------------------------
 def t_exit_codes_distinct():
     codes = list(runmod.EXIT.values())
@@ -252,7 +287,8 @@ def t_exit_codes_distinct():
 def main():
     for fn in (t_stalled_fires, t_progress_never_stalls, t_bound_disable,
                t_heartbeat_is_not_progress, t_backend_down,
-               t_existing_verdicts, t_exit_codes_distinct):
+               t_existing_verdicts, t_menu_must_settle,
+               t_exit_codes_distinct):
         if VERBOSE:
             print("%s:" % fn.__name__)
         try:
