@@ -5697,3 +5697,28 @@ sub-label, not the "Loading profile data..." caption. So the caption the mod
 loading step must match does not live under the preloader root, or is not a
 TMP displaying "loading" at that moment. The host's gate now searches all of
 the anchor's scene roots; catchcaption.py now does too (no root, `all`).
+
+## PostFX subtab: VERIFIED END-TO-END on screen (2026-09-01)
+
+Fresh boot, Settings opened via the recipe, tabs switched through the game's own
+toggles (`Toggle::set_isOn`). Graphics: GRAPHICS SETTINGS | POSTFX renders in
+its own band above "Screen resolution", no overlap, `SettingsList` at
+(0,-66)/850x709 (stock minus the 46px strip) and unchanged after a further
+switch. Pressing OUR strip's POSTFX button (the spawned `AnimatedToggle` under
+`Graphics Settings/Toggles(Clone)/ControlToggle(Clone)[1]`) activates the stock
+PostFX panel with POSTFX highlighted and our prefab rows below the stock
+"Enable PostFX" row. The host's own state verdict: `VERDICT PASS: exactly one
+subtab is selected and its panel is the only one active`.
+
+Two things learned driving it:
+* `Toggles(Clone)`'s children `ControlToggle(Clone)` are UIAnimatedToggleSpawner
+  objects; the pressable `AnimatedToggle` is their spawned CHILD. Pressing the
+  spawner does nothing.
+* Calling set_isOn on the HIDDEN stock POSTFX tab toggle changes
+  `SettingsScreen._currentTab` to the PostFX tab but the fold keeps the Graphics
+  panel visible -- the stock toggle and our strip can disagree about "current".
+
+Remaining: the per-panel geometry verdict (LANDED / NOT-LANDED-YET /
+DISPLACED) emitted NOTHING this boot for either panel -- a check that never
+runs. And PostFX's stock padding.top is 0 (Graphics: 20), so the strip sits
+flush at that panel's top edge; the base should be normalised.
