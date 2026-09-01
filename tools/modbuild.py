@@ -348,10 +348,32 @@ class Progress(object):
         self.done_all = True
         self.render()
 
-    # ---- the in-game screen -------------------------------------------
+    # ---- the in-game loading step --------------------------------------
     #
     # A SECOND file, plain text, rewritten in full on every event. The host
-    # renders it VERBATIM, one label per line.
+    # renders it VERBATIM.
+    #
+    # THE FORMAT IS EXACTLY THREE LINES. Anything past the third is dropped by
+    # the host, which says so once. Keep this in step with the header comment
+    # of host/Aowlspt.Host.Il2Cpp/modload.nim -- this function is the ONLY
+    # writer, and the host deliberately parses nothing but the two control
+    # words on line 0.
+    #
+    #     line 0   WHAT IT IS DOING NOW -- and the control line.
+    #              starts with "MODS READY"  = the build is finished
+    #              contains  "FAILED"        = it finished badly
+    #     line 1   OVERALL progress
+    #     line 2   the CURRENT STEP's progress
+    #
+    #     Loading mods: maps
+    #     Mods 7 of 15
+    #     maps  building
+    #
+    # It used to be a title plus one row PER MOD, i.e. the whole history. Seen
+    # live that reads as a debug ledger, not as a loading caption: the game's
+    # own captions say one thing at a time. The per-mod history did not go
+    # anywhere -- it is still in the JSON-lines stream above, which is the
+    # right place for a record nobody is watching in real time.
     #
     # Why not have the host read the JSON above: it would then be parsing JSON
     # on the Unity main thread, every frame, inside the guard, allocating as it
@@ -368,17 +390,24 @@ class Progress(object):
     def render(self):
         if not self.screen:
             return
-        lines = []
+        cur = self.order[-1] if self.order else ""
         if getattr(self, "done_all", False):
-            bad = sum(1 for r in self.rows.values() if r[0] == "failed")
-            lines.append("MODS READY  %d of %d%s"
-                         % (len(self.rows), self.total,
-                            ("  -- %d FAILED" % bad) if bad else ""))
+            bad = sorted(n for n, r in self.rows.items() if r[0] == "failed")
+            if bad:
+                # "FAILED" MUST appear on line 0: that is the host's control
+                # word for "keep this up longer and shout it into the log".
+                lines = ["MODS READY -- %d FAILED" % len(bad),
+                         "Mods %d of %d" % (len(self.rows), self.total),
+                         "failed: %s" % ", ".join(bad)[:64]]
+            else:
+                lines = ["MODS READY",
+                         "Mods %d of %d" % (len(self.rows), self.total),
+                         ""]
         else:
-            lines.append("BUILDING MODS  %d of %d" % (self.i, self.total))
-        for name in self.order:
-            st, extra = self.rows[name]
-            lines.append("  %-14s %-*s %s" % (name, self.STATUS_W, st, extra))
+            st, extra = self.rows.get(cur, ("", ""))
+            lines = ["Loading mods: %s" % cur if cur else "Loading mods...",
+                     "Mods %d of %d" % (self.i, self.total),
+                     ("%-14s %-*s %s" % (cur, self.STATUS_W, st, extra)).strip()]
         try:
             # Whole-file replace via a temp + os.replace so a reader never sees
             # a half-written file -- the host reads this from another process.
