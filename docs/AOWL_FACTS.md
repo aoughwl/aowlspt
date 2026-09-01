@@ -5870,3 +5870,28 @@ managed call / 3 normal) is in as the instrument for the next one of these.
 Tool gap: `tools/hostcfg.py` scrapes its key manifest from `readBoolKey` call
 sites only, so int/str keys (`modLoadWalkLevel`, `modLoadCaption`) report as
 UNKNOWN -- a typo warning for a valid key.
+
+## MOD LOADING STEP: VERIFIED END-TO-END (2026-09-01, host 4,265,472)
+
+With `tools/modloadsim.py` driving the file from T+10s: client ALIVE (the
+receiver-type fix held); the gate found the game's REAL caption -- `"Loading..."`,
+font 26.0 at (75.0,-39.1), frame READ -- not our own text; BUILT 3 lines, no
+background, STEP-PARENTED into that caption's own container; after MODS READY,
+torn down and `teardown PASSED: an EXHAUSTIVE walk of 26 node(s) over 1 frame
+of the canvas AND the caption container we reparented into found ZERO nodes
+named "aowlspt-modload*"`, read 750ms after the deferred destroy. Every one of
+the user's five complaints is now closed by a readback, not by a write.
+
+Still locale-dependent: the match is by DISPLAYED TEXT ("loading"); the
+`modLoadCaption` key overrides the needle per language until a structural
+match replaces it.
+
+## PostFX stand-down VERIFIED (same boot)
+
+Pressing POSTFX -> `STOCK-GEOMETRY DISPLACED (PostFX Settings)` (EnablePanel
+did not move by the padding shift) -> `STANDING DOWN`: padding restored on 2
+panels, stock POSTFX tab put back in the top row, exactly ONE panel active read
+back off the live GameObjects, 2 strips hidden, nothing destroyed. The user saw
+precisely that ("postfx came back as a top tab, graphics no longer has the
+sub-tabs"). Honest failure with no stranding -- but the feature is OFF for the
+session, so the PostFX-panel room-making still needs a different mechanism.
