@@ -139,16 +139,41 @@ def _pid_of(hwnd):
     return int(pid.value)
 
 
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+kernel32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+kernel32.OpenProcess.restype = wt.HANDLE
+kernel32.QueryFullProcessImageNameW.argtypes = [
+    wt.HANDLE, wt.DWORD, wt.LPWSTR, ctypes.POINTER(wt.DWORD)]
+kernel32.CloseHandle.argtypes = [wt.HANDLE]
+
+_pid_names = {}
+
+
 def _proc_name(pid):
-    try:
-        import subprocess
-        out = subprocess.run(["tasklist", "/FI", "PID eq %d" % pid, "/NH", "/FO", "CSV"],
-                             capture_output=True, text=True, timeout=10).stdout
-        if out.strip().startswith('"'):
-            return out.split('","')[0].strip('"')
-    except Exception:
-        pass
-    return ""
+    """The image name for a pid, via ONE native call, cached.
+
+    This used to shell out to `tasklist` PER WINDOW. With 30-40 visible windows
+    that is 30-40 subprocesses per scan, several seconds each time -- and since
+    `run.py` polls this on its supervision loop, the loop stalled and a launch
+    that had already reached `host running` sat there instead of returning.
+    Measured: the user watched a run go all the way into a raid while the
+    supervisor was still blocked. A diagnostic tool that slows the thing it is
+    watching is a bug, not a tradeoff.
+    """
+    if pid in _pid_names:
+        return _pid_names[pid]
+    name = ""
+    h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if h:
+        try:
+            buf = ctypes.create_unicode_buffer(1024)
+            n = wt.DWORD(1024)
+            if kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(n)):
+                name = buf.value.rsplit("\\", 1)[-1]
+        finally:
+            kernel32.CloseHandle(h)
+    _pid_names[pid] = name
+    return name
 
 
 def _children_text(hwnd):
