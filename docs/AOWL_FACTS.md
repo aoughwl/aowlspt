@@ -5510,3 +5510,40 @@ returns megabytes. Now `--max 60` by default, keeping the NEWEST matches (a
 head-limit would return the oldest and hide the reason you ran it), `--max 0`
 for all, and the withheld count is always printed -- a truncated answer that
 does not say it was truncated is a wrong answer.
+
+## Generated code that nothing imports is never compiled -- `examples/uimapcheck`
+
+`aowl/src/aowlspt/uimap.nim` (595 constants, 92 types) was generated and NOTHING
+in the repo imported it, so it had never been compiled and nothing would ever
+have compiled it. A generator whose output is never built drifts silently, and
+the drift is invisible precisely because the file looks authoritative.
+
+Not hypothetical: the first generated map emitted 14 COLLIDING identifiers,
+because C# overloads share a name -- both `SettingFloatSlider.BindTo` overloads
+(arity 3 @0x16fb4c0, arity 4 @0x16fb810) became one const. Nim's identifier
+rules are case- and underscore-insensitive, so names C# is happy with collide
+here. Worse than a build error: it is one overload's ADDRESS under the other's
+FRAME SHAPE, which is the documented way to kill this client. It was caught by
+READING the file. Reading does not scale; compiling does.
+
+`examples/uimapcheck` imports the map and references a constant from each of
+its 6 groups, so `aowl build examples` fails if the generator ever emits
+something Nim will not accept. It proves the file COMPILES and nothing more --
+not that any RVA is correct or safe to call. It also cannot notice a constant
+that was DROPPED (an empty file would pass trivially); completeness is enforced
+by gen_uimap's own self-checks, which refuse to emit at all on failure.
+
+## I violated the build-slot rule within an hour of writing it
+
+Ran `aowl build examples` while a subagent was running `aowl build host` in the
+SAME checkout -- two `aowl` and two `nimony` processes at once. CLAUDE.md 3 says
+the corruption hazard is two builds in one checkout (separate worktrees are
+safe). Writing a rule does not enforce it, and "I am only building a different
+target" is exactly the reasoning the rule exists to reject: the hazard is the
+shared intermediate directory, not the final artifact.
+
+The recovery is verification, not hope: let both finish (killing one mid-write
+risks a partial artifact too), then `deploy.py check` every artifact's markers
+and rebuild anything that does not verify. A build slot needs a MECHANISM, not
+a paragraph -- a lockfile around the compiler invocation would make this
+impossible rather than merely forbidden.
