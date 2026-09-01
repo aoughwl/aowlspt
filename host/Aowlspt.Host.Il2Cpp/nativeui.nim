@@ -235,6 +235,8 @@ const
   NuTRectOffGetTop   = 50'i32  ## UnityEngine.RectOffset::get_top
   NuTRectOffSetTop   = 51'i32  ## UnityEngine.RectOffset::set_top
   NuTLayoutGrpDirty  = 52'i32  ## UnityEngine.UI.LayoutGroup::SetDirty
+  NuTTrSetAsLastSib  = 53'i32  ## UnityEngine.Transform::SetAsLastSibling
+  NuTTrGetSiblingIdx = 54'i32  ## UnityEngine.Transform::GetSiblingIndex
 
 ## `LayoutGroup.m_Padding` @0x20 : RectOffset. A plain reference field, so it
 ## is READ raw -- no call, and in particular not `get_padding`, which is
@@ -821,6 +823,36 @@ type
     ## at that arithmetic could only work for top-anchored parents.
     rectX*, rectY*: float32
 
+proc nuSetAsLastSibling*(rt: Il2CppPtr): bool =
+  ## `Transform::SetAsLastSibling()` -- LAST in the parent's child list.
+  ##
+  ## In a Unity canvas sibling order is BOTH draw order and raycast order, so
+  ## this is what puts an absolutely-positioned overlay in front of its
+  ## siblings AND makes it clickable. A child at sibling 0 renders under every
+  ## later sibling and the one on top swallows the click, which reads exactly
+  ## like a disabled control while `m_Interactable` is true.
+  result = false
+  if not gNuOn or not nuOk(rt, 0x10'i32): return
+  let fn = nuFn(NuTTrSetAsLastSib)
+  if fn == nil: return
+  # arity 0: the frame is (this, MethodInfo*). `p_p`, and the void return is
+  # discarded -- `v_pp` would shift the MethodInfo* into R8.
+  discard cNuCallPP(fn, rt)
+  true
+
+proc nuSiblingIndex*(rt: Il2CppPtr): (bool, int32) =
+  ## `Transform::GetSiblingIndex()`. The READBACK, so a reordering can be
+  ## asserted rather than assumed. The sentinel is negative because a real
+  ## sibling index never is.
+  const NuSibNoRead = -1'i32
+  result = (false, 0'i32)
+  if not gNuOn or not nuOk(rt, 0x10'i32): return
+  let fn = nuFn(NuTTrGetSiblingIdx)
+  if fn == nil: return
+  let v = cNuCallIP(fn, rt, NuSibNoRead)
+  if v < 0'i32 or v > 4096'i32: return
+  result = (true, v)
+
 proc nuGroupPadding*(layoutGroup: Il2CppPtr): Il2CppPtr =
   ## `LayoutGroup.m_Padding` @0x20 -> RectOffset. Read raw on purpose: the
   ## property getter is SHARED x479 and this is an ordinary reference field.
@@ -1231,6 +1263,14 @@ proc nuTargetsBindOk(): bool =
   want.add "UnityEngine.RectOffset::get_top"
   idx.add NuTRectOffSetTop
   want.add "UnityEngine.RectOffset::set_top"
+  # SetAsFirstSibling and SetAsLastSibling are the same shape and adjacent in
+  # the table; swapping them would put the strip back UNDER the panel
+  # background, which is the exact defect this pair was added to fix, and every
+  # call would still succeed.
+  idx.add NuTTrSetAsFirstSib
+  want.add "UnityEngine.Transform::SetAsFirstSibling"
+  idx.add NuTTrSetAsLastSib
+  want.add "UnityEngine.Transform::SetAsLastSibling"
   var i = 0
   while i < idx.len:                      # capped: idx is built right here
     let ix = idx[i]

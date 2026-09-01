@@ -5803,3 +5803,30 @@ Read-only, Graphics tab confirmed up (`_currentTab` klass = GraphicsSettingsTab)
 * Earlier "INACTIVE in the hierarchy" for the same node was the user having
   switched tabs at that moment. A visibility verdict is about THIS FRAME; read
   `state` in the same batch before trusting it.
+
+## The 18:49 crash was ARITHMETIC, not a bad pointer -- and a guard cannot help
+
+Root cause (modload agent, 2026-09-01): `mlFindCaption` gave EACH of up to 24
+scene roots the full 3,000-node budget IN ONE FRAME (up to 72,000 nodes, each
+a `GetComponent` for a TMP plus a managed string read), then `mlCensus` walked
+another 6,000 with an `Object::get_name` per hit on the same tick. ~78,000
+managed calls with their allocations in a single Unity tick. That matches the
+dump exactly: `il2cpp_alloc` under UnityPlayer, no host line after `COULD NOT
+LOOK` because the tick never returned, and reproduction only with a file
+present because the walk sits behind the file read.
+
+Two lessons worth more than the fix:
+* `modLoadTick` WAS inside the rider chain's single `aowl_p_p_seh`. An SEH
+  guard catches a fault; it does nothing about handing the allocator 78,000
+  calls in one frame. "It is guarded" is not "it is bounded".
+* The gate had shipped in two boots that SURVIVED -- both with the file
+  removed, so its expensive path had never once executed live. "It booted
+  before" was not evidence about this code. A path that has not run has not
+  been tested, whatever the boot count says.
+
+Fix: the search is resumable -- one 500-node slice per 250ms poll, a
+depth-first stack carried across polls, a 120,000-node pass ceiling, and a
+counted stack-drop that forces INCONCLUSIVE. Every hop `nuOk` + `nuAlive`
+before `GetComponent`. The separate census is DELETED; identities are
+collected by the walk already in progress, so no diagnostic can add a second
+walk to a frame.

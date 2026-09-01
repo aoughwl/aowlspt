@@ -6596,7 +6596,18 @@ var gModLoadCensusDone = false
   ## external catchcaption tool could not identify the client's loading
   ## caption -- the host is already walking those roots during the window, so
   ## it is the instrument that can actually reach it.
-var gModLoadCapRoot = ""           ## scene root the caption was found under
+var gModLoadCapIdent = ""          ## the caption's name/parent, for the log
+var gModLoadCapFrontier: seq[Il2CppPtr] = @[]
+  ## The caption search is RESUMABLE and takes one bounded slice per poll.
+  ## It replaced a version that walked every scene root at full budget in ONE
+  ## frame -- up to ~78,000 managed calls with their allocations -- which KILLED
+  ## THE CLIENT natively ~15s into boot, with il2cpp_alloc on the stack and
+  ## nothing in the log, because the tick never returned.
+var gModLoadCapNodes = 0
+var gModLoadCapDropped = 0
+var gModLoadCapCensus: seq[string] = @[]
+  ## Identities of TMPs the search passed over, collected BY that search rather
+  ## than by a second walk. This is what replaces the external caption tool.
 var gModLoadNeedle = "loading"
   ## Displayed-text needle for the caption; `modLoadCaption` overrides it. The
   ## match is LOCALIZED, so this is a config key rather than a constant.

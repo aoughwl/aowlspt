@@ -156,15 +156,34 @@ const
     ## 250ms file poll and must not run at that rate. Once a caption is held,
     ## no search happens at all -- a liveness check on the held node answers
     ## the question for free.
-  MlCensusBudget = 6000
-    ## Nodes the ONE-SHOT census may visit. It runs at most once per session,
-    ## on the first poll where we could look and found no caption.
+  MlCaptionSlice = 500
+    ## Nodes the caption search visits PER POLL. THIS CONSTANT IS THE FIX FOR A
+    ## CLIENT-KILLING BUG, so do not raise it casually.
+    ##
+    ## MEASURED, live, 2026-09-01: the previous version gave EACH of up to 24
+    ## scene roots the full 3,000-node NuStyleBudget, in ONE frame -- up to
+    ## 72,000 nodes, every one of them doing a `GetComponent` for a TMP and a
+    ## managed string read -- and then ran a 6,000-node census with an
+    ## `Object::get_name` per hit on the SAME frame. The client died ~15s into
+    ## boot, natively, with `il2cpp_alloc` on the stack under UnityPlayer, and
+    ## the mod-loading log stopped dead after "COULD NOT LOOK": the tick never
+    ## returned. Nothing was logged because nothing got the chance to be.
+    ##
+    ## The guard was not the problem and neither was any single hop. ~78,000
+    ## managed calls with their allocations inside one frame is the problem, and
+    ## an `aowl_p_p_seh` does not save you from that -- it catches a fault, not
+    ## an allocator brought down by the volume of work handed to it.
+  MlCaptionMaxNodes = 120_000
+    ## Ceiling on ONE search pass across all its slices. Far above any scene
+    ## measured here; hitting it means the scene is not the shape we assume,
+    ## and it ends the pass rather than running for ever.
+  MlCapStackMax = 20_000
+    ## Depth-first stack ceiling. A drop makes the pass non-exhaustive, so it is
+    ## COUNTED and reported, never silently tolerated.
   MlCensusMax = 14
-    ## TMPs the census reports. Enough to identify the loading UI, few enough
-    ## that it is one readable block in the log rather than a dump.
-  MlCaptionRoots = 24
-    ## Scene roots the witness search may enter, total. Bounded like every
-    ## other walk here.
+    ## Identities remembered while searching, for the log when no caption
+    ## matches. These now cost NOTHING extra: they are collected by the walk
+    ## that is already happening, instead of by a second 6,000-node walk.
   MlNeedleDefault = "loading"
     ## The DISPLAYED-TEXT needle for the game's own caption, and the DEFAULT
     ## only -- `modLoadCaption` in aowlspt-host.json overrides it, so a
@@ -418,118 +437,88 @@ proc mlIdentity(node: Il2CppPtr): string =
   else:
     result = result & " parent=<none/unreadable>"
 
-proc mlCensus() =
-  ## THE INSTRUMENT, run from inside the gate rather than from outside it.
-  ##
-  ## Two boots of the external `catchcaption.py` could not identify the
-  ## client's loading caption: rooted at $preloader it found only an INACTIVE
-  ## 6px `Text` under `LoadingSpinner`, and rooted at every scene root it
-  ## STOPPED EARLY on the inspector's 240-frame-per-round cap in all six
-  ## rounds. That is the right verdict from the wrong instrument -- a transient
-  ## object in a large scene cannot be caught by a tool that only gets a slice
-  ## of the window.
-  ##
-  ## This host code is already walking those roots DURING the window, so it is
-  ## the correct place to ask. It lists what TMPs actually exist and what they
-  ## say, so the next boot can replace the LOCALIZED text needle with a
-  ## structural name/parent match. It costs one bounded walk, ONCE per session.
-  if gModLoadCensusDone: return
-  gModLoadCensusDone = true
+proc mlCapSeed(): bool =
+  ## Start ONE caption-search pass: seed the frontier from the anchor's scene
+  ## roots. Returns false for COULD NOT LOOK -- no anchor yet, or Unity would
+  ## not say which scene it is in. That is not "there is no caption"; the two
+  ## want opposite responses (wait, versus tear down).
+  gModLoadCapFrontier.setLen(0)
+  gModLoadCapNodes = 0
+  gModLoadCapDropped = 0
+  gModLoadCapCensus.setLen(0)
   var roots: seq[Il2CppPtr] = @[]
   if not splAnchorSceneRoots(roots):
-    return
-  var budget = MlCensusBudget
-  var shown = 0
-  var seen = 0
-  var report = ""
-  var frontier: seq[Il2CppPtr] = @[]
+    return false
   for go in roots:
+    if gModLoadCapFrontier.len >= MlCapStackMax: break
     let tr = nuTransformOf(go)
-    if tr != nil: frontier.add tr
-  while frontier.len > 0 and budget > 0 and shown < MlCensusMax:
-    var nextRow: seq[Il2CppPtr] = @[]
-    for node in frontier:
-      if budget <= 0 or shown >= MlCensusMax: break
-      dec budget
-      let tmp = splTmpOf(node)
-      if tmp != nil:
-        let t = splTmpText(tmp)
-        if t.len > 0:
-          inc seen
-          let nm = iObjName(node)
-          if find(nm, MlNamePrefix) < 0:
-            inc shown
-            report = report & "  |  [" & $shown & "] " & mlIdentity(node) &
-                     " text=\"" & (if t.len > 60: t[0 ..< 60] & "..." else: t) &
-                     "\""
-      var n = 0
-      if iChildCount(node, n):
-        for i in 0 ..< n:
-          if nextRow.len >= budget: break
-          let c = iChildAt(node, i)
-          if c != nil: nextRow.add c
-    frontier = nextRow
-  warn "mod loading step: CAPTION CENSUS (once per session, " &
-       $(MlCensusBudget - budget) & " of " & $MlCensusBudget & " nodes, " &
-       $seen & " TMP(s) with text seen, showing " & $shown &
-       "). No TMP matched the needle \"" & gModLoadNeedle & "\", so this " &
-       "lists what the load phase ACTUALLY has, to replace the localized " &
-       "needle with a structural name/parent match next boot:" & report
+    if tr != nil: gModLoadCapFrontier.add tr
+  true
 
-proc mlFindCaption(lookOk: var bool): NuStyle =
-  ## THE LOAD-PHASE WITNESS: the game's own loading caption, or an honest
-  ## refusal. This one call answers three questions that used to be answered
-  ## separately and inconsistently -- may we draw at all, what should we look
-  ## like, and where do we belong.
+proc mlCapStep(found: var NuStyle): bool =
+  ## ONE SLICE of the caption search. Depth-first with an explicit stack, so
+  ## suspending between polls is free and needs no per-frame allocation.
   ##
-  ## WHY IT IS THE GATE. Measured live: the mod build was written to the file
-  ## while the user sat on the MAIN MENU, and the step cheerfully rendered
-  ## there, because the trigger was "the file changed". A loading step over the
-  ## main menu is not a loading step; it is an overlay, which is exactly the
-  ## thing the redesign was supposed to stop being. And separately measured:
-  ## `findtext "Loading" $preloader 60000 all` at the menu searched 4,095 nodes
-  ## EXHAUSTIVELY, with inactive nodes INCLUDED, and found nothing. So the
-  ## caption's absence at the menu is a measured fact, which is what makes its
-  ## PRESENCE a sound gate rather than a guess.
-  ##
-  ## `lookOk` is the third outcome and is not decoration. false means COULD NOT
-  ## LOOK -- no anchor yet, or Unity would not say which scene it is in. That
-  ## is normal for the first seconds of boot and must never be collapsed into
-  ## "there is no caption", because the two want opposite responses: wait, and
-  ## tear down.
-  ##
-  ## It searches THE ANCHOR'S WHOLE SCENE, not the single canvas we happened to
-  ## build under. The previous version searched only that canvas and reported
-  ## `no TMP under this root displays "loading"` -- true of that root, and no
-  ## evidence at all about the scene.
-  lookOk = false
-  result = NuStyle(ok: false, why: "the witness search never ran", donor: nil,
-                   node: nil, text: "", fontSize: 0.0'f32,
-                   x: 0.0'f32, y: 0.0'f32)
-  var roots: seq[Il2CppPtr] = @[]
-  if not splAnchorSceneRoots(roots):
-    result.why = "COULD NOT LOOK -- splAnchorSceneRoots refused (no " &
-                 "DontDestroyOnLoad anchor yet, or Unity would not say which " &
-                 "scene it is in). This is NOT \"no caption\"; nothing was " &
-                 "examined"
-    return
-  lookOk = true
-  var looked = 0
-  var lastWhy = "no scene root held a TMP displaying \"" & gModLoadNeedle & "\""
-  for go in roots:
-    if looked >= MlCaptionRoots: break
-    inc looked
-    let tr = nuTransformOf(go)
-    if tr == nil: continue
-    let cand = nuStyleFind(tr, gModLoadNeedle, MlNamePrefix)
-    if cand.ok:
-      gModLoadCapRoot = iObjName(go)
-      return cand
-    if find(cand.why, "are OURS") >= 0:
-      lastWhy = cand.why
-  result.why = "searched " & $looked & " scene root(s) of the anchor's own " &
-               "scene for the needle \"" & gModLoadNeedle & "\" (override it " &
-               "with modLoadCaption in aowlspt-host.json): " & lastWhy
+  ## It does two jobs in one walk, which is the whole point: it looks for the
+  ## caption, and it remembers the identity of every other TMP that has text.
+  ## The census used to be a SECOND full walk; folding it in here means the
+  ## diagnostic that tells us how to drop the localized needle costs nothing
+  ## beyond the search we were already doing.
+  result = false
+  var n = 0
+  while gModLoadCapFrontier.len > 0 and n < MlCaptionSlice:
+    inc n
+    inc gModLoadCapNodes
+    if gModLoadCapNodes > MlCaptionMaxNodes:
+      gModLoadCapFrontier.setLen(0)
+      return false
+    let node = gModLoadCapFrontier.pop()
+    # EVERY hop validated. A destroyed Unity object stays perfectly readable
+    # with m_CachedPtr zeroed, so the pointer check alone is not the question.
+    if node == nil or not nuOk(node, 0x10'i32) or not nuAlive(node):
+      continue
+    let tmp = splTmpOf(node)
+    if tmp != nil and nuOk(tmp, 0x10'i32) and nuAlive(tmp):
+      let t = splTmpText(tmp)
+      if t.len > 0:
+        let nm = iObjName(node)
+        if find(nm, MlNamePrefix) < 0:
+          if find(toLowerAscii(t), gModLoadNeedle) >= 0:
+            var cand = nuStyleCapture(tmp, node)
+            cand.text = t
+            if cand.ok:
+              gModLoadCapIdent = "name=\"" & nm & "\" parent=\"" &
+                                 (let par = mlParentTransformOf(node);
+                                  if par != nil: iObjName(par) else: "<none>") &
+                                 "\""
+              found = cand
+              return true
+          elif gModLoadCapCensus.len < MlCensusMax:
+            gModLoadCapCensus.add("[" & $(gModLoadCapCensus.len + 1) & "] " &
+                                  mlIdentity(node) & " text=\"" &
+                                  (if t.len > 48: t[0 ..< 48] & "..." else: t) &
+                                  "\"")
+    var c = 0
+    if iChildCount(node, c):
+      for i in 0 ..< c:
+        if gModLoadCapFrontier.len >= MlCapStackMax:
+          inc gModLoadCapDropped
+          break
+        let ch = iChildAt(node, i)
+        if ch != nil: gModLoadCapFrontier.add ch
+
+proc mlCapCensusLine(): string =
+  ## What the finished pass saw, for the log. This is the instrument that
+  ## replaces the external catchcaption tool: two boots of it could not reach
+  ## the caption (rooted at $preloader it found only an inactive 6px `Text`
+  ## under `LoadingSpinner`; rooted at every scene root it STOPPED EARLY on the
+  ## inspector's per-round frame cap in all six rounds). The host is already
+  ## walking these roots DURING the window, so it is the thing that can answer.
+  result = ""
+  for e in gModLoadCapCensus:
+    result = result & "  |  " & e
+  if result.len == 0:
+    result = "  |  (no TMP with any text was seen at all)"
 
 proc mlPhaseLive(): bool =
   ## Is the client in the load phase RIGHT NOW? Answered from the held caption
@@ -978,15 +967,27 @@ proc modLoadTick() =
   var cap = gModLoadCapStyle
   if not mlPhaseLive():
     gModLoadCaptionNode = nil
-    if now - gModLoadCaptionAt >= MlCaptionPollMs:
+    # ONE SLICE PER POLL, and a pass that continues across polls instead of
+    # restarting. The version this replaces re-walked every scene root, at full
+    # budget, in a single frame, every second -- see MlCaptionSlice for what
+    # that did to the client.
+    if gModLoadCapFrontier.len == 0 and now - gModLoadCaptionAt >= MlCaptionPollMs:
       gModLoadCaptionAt = now
-      var lookOk = false
-      let found = mlFindCaption(lookOk)
-      if lookOk and found.ok:
+      if not mlCapSeed():
+        if gModLoadWhy != "nophase:look":
+          gModLoadWhy = "nophase:look"
+          warn "mod loading step: NOT DRAWING -- COULD NOT LOOK: " &
+               "splAnchorSceneRoots refused (no DontDestroyOnLoad anchor yet, " &
+               "or Unity would not say which scene it is in). Nothing was " &
+               "examined, so this is WAITING, not a verdict."
+    if gModLoadCapFrontier.len > 0:
+      var found: NuStyle
+      if mlCapStep(found):
         cap = found
         gModLoadCapStyle = found
         gModLoadCaptionNode = found.node
         gModLoadDonor = found.donor
+        gModLoadCapFrontier.setLen(0)         # pass over: we have our answer
         if not gModLoadPhaseSaid:
           gModLoadPhaseSaid = true
           okLog "mod loading step: the client's own loading caption is up (" &
@@ -994,24 +995,25 @@ proc modLoadTick() =
                 "may draw. It will be torn down when that caption is. " &
                 "CAPTION IDENTITY, logged once so the LOCALIZED text needle " &
                 "can be replaced by a structural name/parent match: " &
-                mlIdentity(found.node) & " sceneRoot=\"" & gModLoadCapRoot &
-                "\" text=\"" & found.text & "\" font=" & nuF(found.fontSize) &
-                " frame=" & (if found.geom: "READ" else: "NOT read")
-      elif lookOk and not gModLoadCensusDone:
-        mlCensus()
-        gModLoadWhy = "nophase:true"
-      elif gModLoadWhy != ("nophase:" & $lookOk):
-        gModLoadWhy = "nophase:" & $lookOk
-        warn "mod loading step: NOT DRAWING -- " &
-             (if lookOk:
-                "the client is not in a load phase (" & found.why & "). " &
-                "Measured live: writing the build file while the user sat on " &
-                "the MAIN MENU used to make this render there, which is an " &
-                "overlay, not a step. The file's contents are kept and will " &
-                "be rendered on the next load phase if one begins."
-              else:
-                found.why & ". Nothing was examined, so this is WAITING, not " &
-                "a verdict.")
+                gModLoadCapIdent & " text=\"" & found.text & "\" font=" &
+                nuF(found.fontSize) &
+                " frame=" & (if found.geom: "READ" else: "NOT read") &
+                " (found after " & $gModLoadCapNodes & " node(s))"
+      elif gModLoadCapFrontier.len == 0 and not gModLoadCensusDone:
+        # THE PASS FINISHED WITH NO MATCH. Say so once, with everything the
+        # walk saw -- that is the evidence needed to drop the localized needle.
+        gModLoadCensusDone = true
+        warn "mod loading step: NOT DRAWING -- the client is not in a load " &
+             "phase: an EXHAUSTIVE walk of the anchor's scene (" &
+             $gModLoadCapNodes & " node(s), " & $gModLoadCapDropped &
+             " dropped) found no TMP displaying the needle \"" &
+             gModLoadNeedle & "\" (override it with modLoadCaption in " &
+             "aowlspt-host.json). Measured live: writing the build file while " &
+             "the user sat on the MAIN MENU used to make this render there, " &
+             "which is an overlay, not a step. The file's contents are kept " &
+             "and will be rendered on the next load phase if one begins. " &
+             "WHAT THE WALK DID SEE, so the localized needle can be replaced " &
+             "by a structural name/parent match:" & mlCapCensusLine()
   if not mlPhaseLive():
     # If we were up, the phase we belonged to has ended -- that is the
     # dismissal signal, and it is the same signal as the gate.

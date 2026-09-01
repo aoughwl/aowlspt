@@ -3236,21 +3236,44 @@ proc gfxBuildStrip(panelT, donorStripGo, donorStripT, donorButtonGo,
          iObjName(panelT) & "; REFUSING to hide the stock POSTFX tab, because " &
          "a half-built strip with no way back is worse than no feature."
     return
-  # DRAW ORDER ONLY, NOT LAYOUT ORDER -- and that is a DOWNGRADE from what this
-  # block used to be. The strip is now a child of the PANEL and is positioned
-  # absolutely from the stock strip's own geometry, so sibling index no longer
-  # decides where it sits; it only decides what draws over what. A failure here
-  # is therefore cosmetic, and refusing the whole strip over it (which is what
-  # this did while the strip was a layout child) would now be an own goal.
-  discard modsSetFirstSibling(stripT)
+  # LAST SIBLING, NOT FIRST -- and this is a REVERSAL of what this block did,
+  # for a measured reason.
+  #
+  # Sibling 0 was correct while the strip was a LAYOUT child: the group laid
+  # children out in sibling order, so index 0 meant "at the top of the column".
+  # The strip is not a layout child any more -- it is absolutely positioned in
+  # a band we made -- so sibling index no longer decides WHERE it sits. In a
+  # Unity canvas it decides what draws over what AND what receives the click,
+  # and index 0 means "under every later sibling". The user reported exactly
+  # that: the strip visible but BEHIND the panel background and unclickable,
+  # with the buttons separately confirmed m_Interactable=true and
+  # raycastTarget=true -- which is what "behind" looks like, not "disabled".
+  #
+  # This is now ASSERTED, not assumed: the index is read back off the live
+  # Transform and compared with the panel's child count. A failure here means
+  # the strip is genuinely unclickable, so unlike the old cosmetic warning it
+  # is worth refusing over.
+  if not nuSetAsLastSibling(stripT):
+    warn "postfx subtab: SetAsLastSibling refused for the strip in " &
+         iObjName(panelT) & " (nativeui logged why), so it would render " &
+         "behind the panel background and swallow no clicks. Hiding it."
+    discard modsSetActive(strip, false)
+    return
   var afterN = 0
-  if iChildCount(panelT, afterN) and afterN > 0:
-    let firstChild = iChildAt(panelT, 0)
-    if firstChild != stripT:
-      warn "postfx subtab: SetAsFirstSibling did not stick in " &
-           iObjName(panelT) & ". The strip is positioned absolutely, so this " &
-           "is DRAW ORDER only -- it may render behind a sibling. Continuing " &
-           "rather than refusing: the placement itself is unaffected."
+  let (sibOk, sibIx) = nuSiblingIndex(stripT)
+  if iChildCount(panelT, afterN) and afterN > 0 and sibOk:
+    if sibIx != int32(afterN - 1):
+      warn "postfx subtab: the strip in " & iObjName(panelT) & " is at " &
+           "sibling index " & $sibIx & " of " & $afterN & " children after " &
+           "SetAsLastSibling -- it is NOT last, so it draws under a later " &
+           "sibling and that sibling will swallow the click. Hiding it rather " &
+           "than shipping a strip the player cannot press."
+      discard modsSetActive(strip, false)
+      return
+    okLog "postfx subtab: the strip in " & iObjName(panelT) & " is sibling " &
+          $sibIx & " of " & $afterN & " -- LAST, so it draws above the panel " &
+          "background and receives the click. Read back off the live " &
+          "Transform, not assumed from the call."
   # ==========================================================================
   # WEAR THE STOCK STRIP'S GEOMETRY. Do not invent one, and do not argue with
   # a layout group we are no longer inside.
@@ -3283,10 +3306,25 @@ proc gfxBuildStrip(panelT, donorStripGo, donorStripT, donorButtonGo,
   # comes from the donor's RESOLVED rect rather than its sizeDelta -- sizeDelta
   # means different things under different anchoring, so copying it alongside a
   # different anchor would silently change the width.
-  let sizeOk = nuSetV2(stripT, NuTRtSetAnchorMin, 0.0'f32, 1.0'f32) and
-               nuSetV2(stripT, NuTRtSetAnchorMax, 0.0'f32, 1.0'f32) and
-               nuSetV2(stripT, NuTRtSetPivot, 0.0'f32, 1.0'f32) and
-               nuSetV2(stripT, NuTRtSetSizeDelta, donorG.rectW, donorG.rectH)
+  # HORIZONTAL FROM THE DONOR, VERTICAL FORCED TO TOP. This is a CORRECTION.
+  #
+  # The previous version forced BOTH axes to top-left and then wrote an
+  # absolute x. That lost the one thing that made the stock strip centred: the
+  # donor is stretch-anchored horizontally with a symmetric inset
+  # (anchorMin=(0,1) anchorMax=(1,1) pivot=(0.5,1) sizeDelta=(-1500,46)), so
+  # its width is "parent minus 1500" and its position is "centred" WITHOUT any
+  # x arithmetic. Re-anchoring it left-aligned it, which is exactly what the
+  # user reported.
+  #
+  # So the x half of every property is copied verbatim from the donor and only
+  # the y half is forced to top-anchored, which is what the band arithmetic
+  # below needs. Copying `sizeDelta.x` is correct precisely BECAUSE the anchors
+  # are copied with it -- the pair is what defines the width, and taking one
+  # without the other is what silently changed the width last time.
+  let sizeOk = nuSetV2(stripT, NuTRtSetAnchorMin, donorG.aMinX, 1.0'f32) and
+               nuSetV2(stripT, NuTRtSetAnchorMax, donorG.aMaxX, 1.0'f32) and
+               nuSetV2(stripT, NuTRtSetPivot, donorG.pivX, 1.0'f32) and
+               nuSetV2(stripT, NuTRtSetSizeDelta, donorG.sdX, donorG.rectH)
   if not sizeOk:
     warn "postfx subtab: the stock strip's SIZE could not be applied to our " &
          "clone in " & iObjName(panelT) & " (nativeui logged which setter " &
@@ -3424,14 +3462,53 @@ proc gfxBuildStrip(panelT, donorStripGo, donorStripT, donorButtonGo,
     return
   let panelTop = panelG.rectY + panelG.rectH
   let panelLeft = panelG.rectX
+  discard panelLeft
+  discard contLeft
   let stripY = (contTop - panelTop) - float32(origTop + extraInset)
-  let stripX = contLeft - panelLeft
+  # X COMES FROM THE DONOR, NOT FROM THE CONTAINER'S LEFT EDGE. With the
+  # donor's horizontal stretch anchors copied above, `anchoredPosition.x` is an
+  # offset from the CENTRE, and the donor's own value is what centres it on its
+  # panel. `contLeft`/`panelLeft` are still computed because the vertical
+  # arithmetic needs `contTop`, but the left edge is no longer used -- it was
+  # what left-aligned the strip.
+  let stripX = donorG.posX
   if not nuSetV2(stripT, NuTRtSetAnchoredPos, stripX, stripY):
     warn "postfx subtab: room was made in " & iObjName(panelT) & " but the " &
          "strip could not be positioned into it. The padding shift is " &
          "captured and will be undone if this feature faults out."
     discard modsSetActive(strip, false)
     return
+  # THE CENTRING ASSERTION, and it can fail. Read the strip's OWN rect back off
+  # the live Transform and put its centre in panel coordinates through the same
+  # general solver used for the container -- then compare with the panel's own
+  # centre. This is deliberately not "did the setters return true": they did
+  # last time, and the strip was still left-aligned at x=75 because the anchors
+  # it was given were the wrong ones.
+  let stripG = nuReadGeom(stripT)
+  let (sEdgeOk, _, sLeft) = nuChildEdgeInParent(panelG, stripG)
+  if sEdgeOk:
+    let stripMidX = sLeft + stripG.rectW * 0.5'f32
+    let panelMidX = panelG.rectX + panelG.rectW * 0.5'f32
+    let dx = stripMidX - panelMidX
+    if dx > 1.0'f32 or dx < -1.0'f32:
+      warn "postfx subtab: the strip in " & iObjName(panelT) & " is NOT " &
+           "centred -- its centre x is " & nuF(stripMidX) & " and the panel's " &
+           "is " & nuF(panelMidX) & " (" & nuF(dx) & "px off), width " &
+           nuF(stripG.rectW) & ". The stock strip it was copied from is " &
+           "stretch-anchored with a symmetric inset, so a correct copy centres " &
+           "itself with no x arithmetic; being off means the horizontal " &
+           "anchors did not transfer. Cosmetic, so the strip is LEFT UP -- but " &
+           "it is the defect the user reported and it is not being hidden."
+    else:
+      okLog "postfx subtab: the strip in " & iObjName(panelT) & " is CENTRED " &
+            "-- its centre x " & nuF(stripMidX) & " matches the panel's " &
+            nuF(panelMidX) & " to within 1px, width " & nuF(stripG.rectW) &
+            ", read back off the live RectTransform rather than from the " &
+            "values we wrote."
+  else:
+    warn "postfx subtab: the strip's centre could not be read back in " &
+         iObjName(panelT) & ", so whether it is centred was NOT observed. " &
+         "That is inconclusive, not a pass."
   okLog "postfx subtab: made room in " & iObjName(panelT) & " the layout " &
         "group's own way" &
         " -- VerticalLayoutGroup padding.top raised from " & $origTop & " to " &
