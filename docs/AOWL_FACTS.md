@@ -5333,3 +5333,28 @@ The self-check was RIGHT and refusing to serve was the correct behaviour: it
 caught, at boot, precisely the defect the user reported from inside the game
 ("just the receiver- no attachments at all- not even a barrel"). Do not relax
 it to get the client booting.
+
+## HOW CODE ACTUALLY GOT LOST IN WORKTREES (measured 2026-09-01)
+
+Not a merge problem. 22 of this repo's 102 registered worktrees lived under
+`%TEMP%`. Windows' temp cleanup deleted their FILES but left the directories,
+so git still trusted them as checkouts: 14 of them reported ~1,100 tracked
+files each as ` D` (deleted in the working tree, unstaged), with 15 entries
+left on disk out of ~1,150.
+
+A worktree in that state is a loaded gun. An agent that cd's in and runs
+`git commit -a` commits the deletion of the entire repository onto that branch,
+and the result looks like an ordinary commit.
+
+Removing a worktree NEVER loses a commit -- branches live in the shared object
+store, and a worktree is a checkout plus a registration. All 14 were
+deregistered and all 26 recorded branch tips still resolve unchanged
+(`docs/WORKTREE-TIPS.txt`).
+
+DURABLE FIX: `tools/wtcheck.py`. Three states, never two: OK / GUTTED /
+VOLATILE (a real checkout under a temp path -- the state GUTTED comes from),
+plus INCONCLUSIVE for anything it could not inspect. `--prune` deregisters only
+GUTTED ones and never touches a branch. FALSIFIED, not assumed: a synthetic
+gutted worktree was created and the tool detected it (1,642 deletions, exit 1),
+pruned it, and returned to exit 0. Eight VOLATILE worktrees remain and are
+named by the tool.
