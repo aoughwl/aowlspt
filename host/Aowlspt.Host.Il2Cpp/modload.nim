@@ -63,8 +63,17 @@ const
     ## natesp's own walk burned 20,000 nodes and never reached any UI.
   MlPanelW = 560.0'f32
   MlRowH = 26.0'f32
-  MlPanelX = 40.0'f32
-  MlPanelY = -40.0'f32
+  MlPanelFallbackX = 40.0'f32
+  MlPanelFallbackY = -40.0'f32
+    ## Used ONLY when the canvas rect cannot be read. Top-left is a poor place
+    ## for this panel -- it reads as a debug overlay pasted on the corner rather
+    ## than as a step in the game's own loading. It is kept solely so a rect
+    ## read that fails still produces a VISIBLE panel instead of nothing.
+  MlPanelVerticalFrac = 0.62'f32
+    ## Where the panel's TOP sits as a fraction of canvas height. Low enough to
+    ## sit under the splash art rather than over it, high enough that a 15-row
+    ## list still fits above the bottom edge. This is the Minecraft mod-loading
+    ## shape: centred, low, part of the load rather than an overlay on it.
   MlPadX = 28.0'f32
   MlPadY = 22.0'f32
 
@@ -207,14 +216,35 @@ proc mlBuild(lines: seq[string]): bool =
   if rows < 0:
     return false
   let h = MlPadY * 2.0'f32 + MlRowH * float32(rows + 2)
-  gModLoadPanel = nuPanel(canvasGo, MlPanelX, MlPanelY, MlPanelW, h,
+
+  # CENTRE IT ON THE CANVAS, rather than pinning it to the top-left corner.
+  #
+  # The first version used fixed (40, -40) and the result reads as a debug
+  # overlay stuck in the corner -- which is exactly what it looked like on
+  # screen. This is meant to be a STEP IN THE GAME'S OWN LOADING, so it is
+  # centred horizontally and sits low, under the splash art.
+  #
+  # The canvas rect is READ, never assumed: a canvas may be any size and this
+  # build renders at 3840x2160. If the read fails the fallback corner position
+  # is used, because a panel in the wrong place is still better than no panel --
+  # and the log says which happened rather than leaving it to be guessed.
+  var px = MlPanelFallbackX
+  var py = MlPanelFallbackY
+  var placed = "FALLBACK top-left (the canvas rect could not be read)"
+  let (rectOk, _, _, cw, ch) = nuGetRect(canvasTr)
+  if rectOk and cw > 1.0'f32 and ch > 1.0'f32:
+    px = (cw - MlPanelW) * 0.5'f32
+    py = -(ch * MlPanelVerticalFrac)
+    placed = "centred on a " & nuF(cw) & "x" & nuF(ch) & " canvas"
+
+  gModLoadPanel = nuPanel(canvasGo, px, py, MlPanelW, h,
                           0.05'f32, 0.05'f32, 0.06'f32, 0.92'f32,
                           "aowlspt-modload-panel")
   if uint32(gModLoadPanel) == 0'u32:
     return false
 
   gModLoadTitle = nuLabel(canvasGo, donor,
-                          MlPanelX + MlPadX, MlPanelY - MlPadY,
+                          px + MlPadX, py - MlPadY,
                           MlPanelW - MlPadX * 2.0'f32, MlRowH,
                           (if lines.len > 0: lines[0] else: "BUILDING MODS"),
                           24.0'f32, 1.0'f32, 0.85'f32, 0.35'f32, 1.0'f32,
@@ -227,9 +257,9 @@ proc mlBuild(lines: seq[string]): bool =
   for i in 0 ..< rows:
     gModLoadRows[i] = nuNone
   for i in 0 ..< rows:
-    let y = MlPanelY - (MlPadY + MlRowH * float32(i + 2))
+    let y = py - (MlPadY + MlRowH * float32(i + 2))
     gModLoadRows[i] = nuLabel(canvasGo, donor,
-                              MlPanelX + MlPadX + 8.0'f32, y,
+                              px + MlPadX + 8.0'f32, y,
                               MlPanelW - MlPadX * 2.0'f32 - 8.0'f32, MlRowH,
                               lines[i + 1], 18.0'f32,
                               0.85'f32, 0.85'f32, 0.85'f32, 1.0'f32,
@@ -240,7 +270,7 @@ proc mlBuild(lines: seq[string]): bool =
 
   gModLoadBuilt = true
   okLog "mod loading screen: BUILT -- 1 panel + " & $(rows + 1) &
-        " label(s) from " & gModLoadScreenPath &
+        " label(s), " & placed & ", from " & gModLoadScreenPath &
         ". This is what the player sees while the mods folder compiles."
   return true
 
