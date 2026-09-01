@@ -5895,3 +5895,23 @@ back off the live GameObjects, 2 strips hidden, nothing destroyed. The user saw
 precisely that ("postfx came back as a top tab, graphics no longer has the
 sub-tabs"). Honest failure with no stranding -- but the feature is OFF for the
 session, so the PostFX-panel room-making still needs a different mechanism.
+
+## PostFX panel: padding.top made its layout group RE-FLOW children it had never laid out
+
+Measured 2026-09-01 (host 4,265,472), pressing POSTFX: `EnablePanel` went from
+sizeDelta (850,51.9) @ y=-26.0 to (850,30.0) @ y=-81.0; `SettingsPanel` from
+(850,729.1) @ y=-420.5 to (850,1355.0) @ y=-777.5. The group did not shift
+them by the padding H -- it RESIZED them, i.e. ran a full re-flow. The "was"
+values are authored numbers the group had never produced, so on this panel the
+group was not driving those children until our SetDirty woke it. On Graphics
+the group was already live and padding shifted cleanly (LANDED, 66px).
+
+Two mechanisms, one per panel -- or the baseline was taken before the panel's
+first show and the "now" values are what the game itself produces on first
+activation. Which of those is true must be MEASURED (`LayoutGroup.enabled`,
+and a baseline captured after first activation), not argued.
+
+The caption for the mod loading step is `LoadingSpinner/Text` ("Loading...",
+font 26 during the load, inactive and 6px outside it) -- the exact object an
+earlier catchcaption run found and rejected as "an inactive spinner sub-label".
+Inactive-when-looked is not a reason to reject a transient object.
