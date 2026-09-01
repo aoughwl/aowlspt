@@ -1587,6 +1587,18 @@ var gModLoadSweepAt = 0'u64
   ## the end of the frame, so sweeping in the same frame as the teardown finds
   ## every node still parented and reports a leak that is not one -- measured
   ## live on 2026-09-01 as "teardown FAILED: 3 node(s) STILL under the canvas".
+var gModLoadSweeping = false
+  ## The survivor sweep is RESUMABLE and runs one slice per frame while this is
+  ## true. It replaced a single-frame budget that, measured live with the
+  ## Settings screen open, could not finish and so could only ever report
+  ## INCONCLUSIVE -- a check that cannot complete is not a check.
+var gModLoadSweepFrontier: seq[Il2CppPtr] = @[]
+var gModLoadSweepFound = 0
+var gModLoadSweepNodes = 0
+var gModLoadSweepSlices = 0
+var gModLoadSweepDropped = 0
+  ## Children discarded at the stack ceiling. Non-zero forces INCONCLUSIVE:
+  ## an unvisited subtree cannot be reported as "nothing left there".
 var gModLoadSweepWhy = ""
   ## Why we tore down, held across the sweep delay so the verdict can name it.
   ## Polls spent without reaching a finished state; the self-disable counter.
@@ -6569,6 +6581,19 @@ include "natesp.nim"
 var gModLoadPanel = nuNone
 var gModLoadTitle = nuNone
 var gModLoadRows: seq[NuElem] = @[]
+var gModLoadCapStyle: NuStyle
+  ## The game's own loading caption, captured. Declared here rather than beside
+  ## the other gModLoad* globals because `NuStyle` is nuikit's type and nuikit
+  ## is included further down.
+var gModLoadCaptionNode: Il2CppPtr = nil
+  ## The caption's transform. Holding it is what makes the load-phase question
+  ## a single liveness check instead of a scene walk -- and its destruction is
+  ## the signal that the phase ended.
+var gModLoadCaptionAt = 0'u64      ## last witness search, ms
+var gModLoadPhaseSaid = false      ## "we are in a load phase" said once
+var gModLoadNeedle = "loading"
+  ## Displayed-text needle for the caption; `modLoadCaption` overrides it. The
+  ## match is LOCALIZED, so this is a config key rather than a constant.
 include "modload.nim"
 
 
@@ -8120,11 +8145,19 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   # modLoadScreen as well as its own key: deferring the mods with no screen to
   # release them would be a wait with no end and no explanation.
   gModLoadDeferMods = gModLoad and readBoolKeyDef("deferModLoad", true)
+  block:
+    let n = readStrKey("modLoadCaption")
+    if n.len > 0:
+      gModLoadNeedle = toLowerAscii(n)
   if gModLoad:
-    info "modLoadScreen is on (default): while the mods folder compiles, the " &
-         "client shows a native panel listing every mod and whether it was " &
-         "built, cached or FAILED. It renders aowlspt-modload.txt verbatim " &
-         "and builds nothing at all until that file exists."
+    info "modLoadScreen is on (default): while the mods folder compiles, and " &
+         "ONLY while the client's own loading caption is on screen, it shows " &
+         "three lines of bare text -- what it is doing now, the overall " &
+         "progress, the current step's progress -- in that caption's font and " &
+         "frame. It renders aowlspt-modload.txt verbatim, builds nothing at " &
+         "all until that file exists, and draws NOTHING at the main menu. The " &
+         "caption is found by displayed text (LOCALIZED); modLoadCaption " &
+         "overrides the needle, currently \"" & gModLoadNeedle & "\"."
   gBotAi = readBoolKey("botAiActivate")
   if gBotAi:
     info "botAiActivate is set: a kind=12 detour on EFT.BotOwner.PreActivate will " &

@@ -518,6 +518,47 @@ typedef struct AowlNuTarget {
  * positional index to get wrong). bytes <RVA> 16 -> the sig below; not the
  * 0x628110 universal stub. */
 #define AOWL_NU_LAYOUTELEM_SET_IGNORE 49
+/* --- MAKING ROOM FOR THE STRIP, THE GROUP'S OWN WAY (indices 50..52) ------
+ *
+ * MEASURED LIVE. Attempt 4 (parent the strip to the panel, wear the stock
+ * strip's geometry) FIXED the displacement -- the backstop reported all 7
+ * stock objects unchanged and SettingsList read back byte-for-byte stock at
+ * anchoredPosition=(0,-20) sizeDelta=(850,755). But the copied position
+ * (0,-128) put the strip on top of the third row: Control Settings' content
+ * starts lower than Graphics', so there is no free band under the panel top.
+ *
+ * WHY NOT SIMPLY WRITE THE LIST'S anchoredPosition. Because a LayoutGroup
+ * DRIVES its children's positions on every rebuild, and we have direct
+ * evidence that one drives this list: attempts 1-3 moved it from -20 to
+ * -420.5 and resized it 755 -> 354.5 purely by adding a sibling. A direct
+ * write to a driven child is reverted at the next rebuild -- which may be
+ * seconds later, on a tab switch -- so it would look correct in a screenshot
+ * and snap back in play. That is a worse defect than the one being fixed.
+ *
+ * So we change the GROUP'S OWN INPUT instead: `LayoutGroup.padding.top`. The
+ * group then moves and resizes the list itself, correctly, and the change
+ * survives every rebuild because it IS what the group reads.
+ *
+ * `padding` is a `RectOffset` -- a managed wrapper over a NATIVE pointer
+ * (`m_Ptr` @0x10), so `top` is NOT a raw field and there is no offset to poke.
+ * It has to go through the property, and `LayoutGroup::SetDirty` has to be
+ * called afterwards or the group will not re-run. `get_padding` is
+ * deliberately NOT bound: it is SHARED x479, and we read `m_Padding` @0x20 as
+ * a plain reference field instead, which needs no call at all.
+ *
+ * PROVENANCE, all three: il2cpp_resolve.py typemethods -> RVA and
+ * sharedness=UNIQUE; bytes <RVA> 16 -> the sig below; none is the 0x628110
+ * universal stub.
+ *
+ * THIS IS AN OWNED WRITE, AND IT IS RESTORED. The original `top` is captured
+ * before the first write and put back on fault or self-disable. The
+ * stock-geometry backstop is told to expect exactly this shift and nothing
+ * more -- see `gGfxStockExpectShift` -- so a drift of any other size still
+ * fails it. That is the difference from attempts 1-3: those were an
+ * uncontrolled side-effect of unknown size with no restore. */
+#define AOWL_NU_RECTOFFSET_GET_TOP    50
+#define AOWL_NU_RECTOFFSET_SET_TOP    51
+#define AOWL_NU_LAYOUTGROUP_SETDIRTY  52
 
 /* UnityEngine.RenderMode. Named, because `0` appearing bare in a refusal is
  * indistinguishable from "we did not read anything". */
@@ -740,6 +781,16 @@ static const AowlNuTarget aowl_nu_targets[] = {
     { "UnityEngine.UI.LayoutElement::set_ignoreLayout", 0x5598100u,
       { 0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20,0x80,0x3D,0x75,
         0xFF,0xB3,0x01 }, 16 },
+    /* --- making room. See AOWL_NU_RECTOFFSET_GET_TOP. --- */
+    { "UnityEngine.RectOffset::get_top", 0x526AFF0u,
+      { 0x40,0x53,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,0x2B,0x7F,0xE6,0x01,
+        0x48,0x8B,0xD9 }, 16 },
+    { "UnityEngine.RectOffset::set_top", 0x526B040u,
+      { 0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,
+        0xDF,0x7E,0xE6 }, 16 },
+    { "UnityEngine.UI.LayoutGroup::SetDirty", 0x5599FD0u,
+      { 0x40,0x53,0x48,0x83,0xEC,0x20,0x80,0x3D,0xBD,0xE0,0xB3,0x01,0x00,
+        0x48,0x8B,0xD9 }, 16 },
 };
 
 #define AOWL_NU_TARGET_COUNT \

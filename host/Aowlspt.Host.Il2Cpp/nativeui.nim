@@ -232,6 +232,15 @@ const
   NuTRtGetAnchorMax  = 47'i32  ## UnityEngine.RectTransform::get_anchorMax_Injected
   NuTRtGetPivot      = 48'i32  ## UnityEngine.RectTransform::get_pivot_Injected
   NuTLayoutElemIgnore= 49'i32  ## UnityEngine.UI.LayoutElement::set_ignoreLayout
+  NuTRectOffGetTop   = 50'i32  ## UnityEngine.RectOffset::get_top
+  NuTRectOffSetTop   = 51'i32  ## UnityEngine.RectOffset::set_top
+  NuTLayoutGrpDirty  = 52'i32  ## UnityEngine.UI.LayoutGroup::SetDirty
+
+## `LayoutGroup.m_Padding` @0x20 : RectOffset. A plain reference field, so it
+## is READ raw -- no call, and in particular not `get_padding`, which is
+## SHARED x479. MEASURED via tools/fldoff.py, System.String self-check passed.
+## NULL-CAPABLE: a group with no padding assigned reads null here.
+const NuOffLayoutGroupPadding = 0x20'i32
 
 # ---- field offsets on the settings-row prefabs --------------------------
 #
@@ -806,6 +815,58 @@ type
     ## the panel width. Both are carried because the copy needs sizeDelta and
     ## the CHECK needs rect.
     rectW*, rectH*: float32
+    ## rect.x / rect.y -- the rect's ORIGIN in this object's own local space,
+    ## which for a centre-pivoted object is negative. Needed to place a child
+    ## edge in a parent's coordinates; discarding it was why the first attempt
+    ## at that arithmetic could only work for top-anchored parents.
+    rectX*, rectY*: float32
+
+proc nuGroupPadding*(layoutGroup: Il2CppPtr): Il2CppPtr =
+  ## `LayoutGroup.m_Padding` @0x20 -> RectOffset. Read raw on purpose: the
+  ## property getter is SHARED x479 and this is an ordinary reference field.
+  result = nil
+  if not nuOk(layoutGroup, NuOffLayoutGroupPadding + 8'i32): return
+  result = cNuGetRef(layoutGroup, NuOffLayoutGroupPadding)
+  if not nuOk(result, 0x18'i32): result = nil
+
+proc nuPaddingTop*(rectOffset: Il2CppPtr): (bool, int32) =
+  ## `RectOffset.top`. A RectOffset is a managed wrapper over a NATIVE pointer
+  ## (`m_Ptr` @0x10), so `top` is not a field anywhere -- it has to be the
+  ## property. The sentinel is a value no padding can hold, so "could not ask"
+  ## is never mistaken for 0, which IS a legal padding.
+  const NuPadNoRead = -999999'i32
+  result = (false, 0'i32)
+  if not gNuOn or not nuOk(rectOffset, 0x18'i32): return
+  let fn = nuFn(NuTRectOffGetTop)
+  if fn == nil: return
+  let v = cNuCallIP(fn, rectOffset, NuPadNoRead)
+  if v == NuPadNoRead: return
+  if v < -10000'i32 or v > 10000'i32: return
+  result = (true, v)
+
+proc nuSetPaddingTop*(rectOffset, layoutGroup: Il2CppPtr; v: int32): bool =
+  ## Write `RectOffset.top` and then mark the group dirty.
+  ##
+  ## THE SetDirty IS NOT OPTIONAL. `RectOffset` is a shared native object; the
+  ## group caches its arrangement and will not re-read padding until something
+  ## invalidates it. Writing the padding alone changes nothing on screen and
+  ## every call reports success -- the same shape as the `m_IsOn` store that
+  ## never fired the Animator and the raw `m_IgnoreLayout` store that never
+  ## re-ran the group. Third time this exact trap has appeared in this feature.
+  result = false
+  if not gNuOn or not nuOk(rectOffset, 0x18'i32): return
+  if v < -10000'i32 or v > 10000'i32: return
+  let fnSet = nuFn(NuTRectOffSetTop)
+  let fnDirty = nuFn(NuTLayoutGrpDirty)
+  if fnSet == nil or fnDirty == nil: return
+  cNuCallVPI(fnSet, rectOffset, v)
+  if nuOk(layoutGroup, 0x10'i32):
+    # arity 0, so the frame is (this, MethodInfo*) -- `p_p`, not `v_pp`. The
+    # void return is discarded; `v_pp` would shift the MethodInfo* into R8 and
+    # leave a stray value in RDX, which happens to be harmless here and would
+    # be a real bug on any callee that reads it.
+    discard cNuCallPP(fnDirty, layoutGroup)
+  true
 
 proc nuSetIgnoreLayout*(layoutElement: Il2CppPtr; on: bool): bool =
   ## `LayoutElement.ignoreLayout = value` -- the PROPERTY, never the field.
@@ -833,7 +894,8 @@ proc nuNoGeom*(): NuGeom =
   ## and a zeroed geometry that read as ok would be a fabricated rectangle.
   NuGeom(ok: false, aMinX: 0'f32, aMinY: 0'f32, aMaxX: 0'f32, aMaxY: 0'f32,
          pivX: 0'f32, pivY: 0'f32, sdX: 0'f32, sdY: 0'f32,
-         posX: 0'f32, posY: 0'f32, rectW: 0'f32, rectH: 0'f32)
+         posX: 0'f32, posY: 0'f32, rectW: 0'f32, rectH: 0'f32,
+         rectX: 0'f32, rectY: 0'f32)
 
 proc nuReadGeom*(rt: Il2CppPtr): NuGeom =
   ## Read a RectTransform's whole layout. Every getter is byte-verified through
@@ -850,7 +912,7 @@ proc nuReadGeom*(rt: Il2CppPtr): NuGeom =
   if not o4: return
   let (o6, a6, b6) = nuGetV2(rt, NuTRtGetAnchoredPos)
   if not o6: return
-  let (o5, _, _, rw, rh) = nuGetRect(rt)
+  let (o5, rxx, ryy, rw, rh) = nuGetRect(rt)
   if not o5: return
   # NaN-safe bounds. A getter that did not write leaves whatever was in the
   # buffer, and "a plausible number" is the failure mode this whole layer
@@ -859,7 +921,43 @@ proc nuReadGeom*(rt: Il2CppPtr): NuGeom =
   if not (rh > -1.0e6'f32) or not (rh < 1.0e6'f32): return
   result = NuGeom(ok: true, aMinX: a1, aMinY: b1, aMaxX: a2, aMaxY: b2,
                   pivX: a3, pivY: b3, sdX: a4, sdY: b4, posX: a6, posY: b6,
-                  rectW: rw, rectH: rh)
+                  rectW: rw, rectH: rh, rectX: rxx, rectY: ryy)
+
+proc nuChildEdgeInParent*(parentG, childG: NuGeom): (bool, float32, float32) =
+  ## Where are a child's TOP and LEFT edges, expressed in its PARENT's local
+  ## coordinates? Returns (ok, top, left).
+  ##
+  ## WHY THIS EXISTS. The first version of this arithmetic read the child's
+  ## `anchoredPosition` as if it were an offset from the parent's top edge.
+  ## That is only true for a top-anchored, top-pivoted child, and the real
+  ## container is centre-pivoted and vertically STRETCHED
+  ## (anchorMin=(0.5,0) anchorMax=(0.5,1) pivot=(0.5,0.5) sizeDelta=(850,0)),
+  ## whose `anchoredPosition` is (0,0) BY CONSTRUCTION and says nothing about
+  ## where any edge is. Refusing was correct; this is the general answer.
+  ##
+  ## Unity's own model, and it needs no special cases:
+  ##   the anchor rect is the parent's rect sampled at anchorMin..anchorMax;
+  ##   `anchoredPosition` positions the child's PIVOT relative to that rect
+  ##   sampled again at the pivot;
+  ##   the child's size is whatever `get_rect` says it resolved to.
+  ## So every term is read off the two live objects and nothing is assumed
+  ## about how either is anchored.
+  result = (false, 0'f32, 0'f32)
+  if not parentG.ok or not childG.ok: return
+  if parentG.rectH <= 0'f32 or parentG.rectW <= 0'f32: return
+  let aMinY = parentG.rectY + childG.aMinY * parentG.rectH
+  let aMaxY = parentG.rectY + childG.aMaxY * parentG.rectH
+  let refY  = aMinY + (aMaxY - aMinY) * childG.pivY
+  let top   = refY + childG.posY + (1.0'f32 - childG.pivY) * childG.rectH
+  let aMinX = parentG.rectX + childG.aMinX * parentG.rectW
+  let aMaxX = parentG.rectX + childG.aMaxX * parentG.rectW
+  let refX  = aMinX + (aMaxX - aMinX) * childG.pivX
+  let left  = refX + childG.posX - childG.pivX * childG.rectW
+  # NaN-safe bounds: a getter that did not write leaves whatever was in the
+  # buffer, and a plausible number is the failure mode this layer refuses.
+  if not (top > -100000'f32) or not (top < 100000'f32): return
+  if not (left > -100000'f32) or not (left < 100000'f32): return
+  result = (true, top, left)
 
 proc nuGeomMoved*(a, b: NuGeom; tol: float32): bool =
   ## Did this RectTransform MOVE or RESIZE between two readings? Both must be
@@ -1125,6 +1223,14 @@ proc nuTargetsBindOk(): bool =
   want.add "UnityEngine.RectTransform::get_pivot_Injected"
   idx.add NuTLayoutElemIgnore
   want.add "UnityEngine.UI.LayoutElement::set_ignoreLayout"
+  # get_top and set_top are adjacent rows on the same type with near-identical
+  # frames. Swapping them would READ where we meant to WRITE -- the padding
+  # would never change and the capture would record garbage as the original,
+  # so the restore would put back the wrong number. Both named.
+  idx.add NuTRectOffGetTop
+  want.add "UnityEngine.RectOffset::get_top"
+  idx.add NuTRectOffSetTop
+  want.add "UnityEngine.RectOffset::set_top"
   var i = 0
   while i < idx.len:                      # capped: idx is built right here
     let ix = idx[i]

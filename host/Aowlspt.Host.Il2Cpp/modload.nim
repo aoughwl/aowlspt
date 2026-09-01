@@ -116,11 +116,21 @@ const
     ## conclusion ("a leak") did not follow: the check was simply looking
     ## before Unity had done the work. A check that fires too early is as
     ## useless as one that cannot fail -- it just fails the other way.
-  MlSweepBudget = 2000
-    ## Nodes the ONE-SHOT survivor sweep may visit after teardown. It calls
-    ## `Object::get_name` per node, so it is far more expensive than the other
-    ## walks -- it runs exactly once, on the frame we dismiss, and it reports
-    ## INCONCLUSIVE rather than PASS if it runs out.
+  MlSweepSlice = 400
+    ## Nodes the survivor sweep visits PER FRAME. The sweep is resumable, so
+    ## this is a frame-cost knob, not a correctness one -- unlike the single
+    ## budget it replaces, running out of it ends the frame, never the check.
+  MlSweepMaxNodes = 250_000
+    ## Ceiling on the WHOLE walk, across all frames. A real ceiling still has
+    ## to exist -- an unbounded walk on the Unity thread is a hang -- but it is
+    ## set far above any canvas we have measured, so hitting it means the tree
+    ## is not what we think it is, and that is reported as INCONCLUSIVE.
+  MlSweepMaxSlices = 900
+    ## Frames the sweep may span. At ~1 frame per slice this is ~15s at 60fps.
+  MlSweepStackMax = 20_000
+    ## Depth-first stack ceiling. Dropping a child would make the walk
+    ## non-exhaustive, so a drop is COUNTED and forces INCONCLUSIVE rather than
+    ## being silently tolerated.
   MlMaxTries = 900
     ## SELF-DISABLE. Attempts at building or at re-matching the style before
     ## this gives up permanently. At a 250ms poll that is ~225s, which outlasts
@@ -140,13 +150,22 @@ const
     ## Where the first line sits as a fraction of canvas height, on the
     ## unmatched path only. Low enough to sit under the splash art.
   MlPadX = 28.0'f32
-  MlNeedle = "loading"
-    ## The DISPLAYED-TEXT needle for the game's own caption. This is LOCALIZED:
-    ## on a non-English client it will not match, `nuStyleNote` says so on every
-    ## line it prints, and the honest reading of a miss there is "wrong word",
-    ## not "no caption exists". Matching structurally -- the TMP the client's
-    ## own loading flow writes into -- is the real fix and needs that method
-    ## identified first.
+  MlCaptionPollMs = 1000'u64
+    ## How often the LOAD-PHASE WITNESS is searched for while we do not have
+    ## one. The search walks scene roots, so it is far more expensive than the
+    ## 250ms file poll and must not run at that rate. Once a caption is held,
+    ## no search happens at all -- a liveness check on the held node answers
+    ## the question for free.
+  MlCaptionRoots = 24
+    ## Scene roots the witness search may enter, total. Bounded like every
+    ## other walk here.
+  MlNeedleDefault = "loading"
+    ## The DISPLAYED-TEXT needle for the game's own caption, and the DEFAULT
+    ## only -- `modLoadCaption` in aowlspt-host.json overrides it, so a
+    ## non-English client is a config edit rather than a rebuild. It is still
+    ## LOCALIZED and `nuStyleNote` says so on every line it prints; matching
+    ## structurally, by the container the client's own loading flow owns, is
+    ## the real fix and needs those object names measured during a boot.
   MlNamePrefix = "aowlspt-modload"
     ## Every GameObject this feature creates is named with this prefix, and the
     ## teardown check is stated as a NEGATIVE over it: after dismissal, no node
@@ -191,39 +210,12 @@ proc mlParentTransformOf(node: Il2CppPtr): Il2CppPtr =
     return
   result = par
 
-proc mlSweepSurvivors(rootTr: Il2CppPtr; found: var int): bool =
-  ## THE NEGATIVE CHECK, and the deliverable of the teardown fix.
-  ##
-  ## "We called destroy" is not evidence of anything -- a destroyed Unity
-  ## object stays perfectly readable and a handle table can lie about it. This
-  ## walks the LIVE TREE and counts nodes still named with our prefix. The
-  ## property asserted is one that can FAIL: a leak, a reparent we forgot, or a
-  ## label whose handle went stale before we destroyed it all show up as a
-  ## non-zero count.
-  ##
-  ## Returns false when the budget ran out before the walk finished -- that is
-  ## INCONCLUSIVE, not PASS. "I could not look" is not a clean bill of health.
-  found = 0
-  if rootTr == nil or not nuOk(rootTr, 0x10'i32) or not nuAlive(rootTr):
-    return false
-  var budget = MlSweepBudget
-  var frontier: seq[Il2CppPtr] = @[rootTr]
-  while frontier.len > 0 and budget > 0:
-    var nextRow: seq[Il2CppPtr] = @[]
-    for node in frontier:
-      if budget <= 0: break
-      dec budget
-      let nm = iObjName(node)
-      if nm.len > 0 and find(nm, MlNamePrefix) >= 0:
-        inc found
-      var n = 0
-      if iChildCount(node, n):
-        for i in 0 ..< n:
-          if nextRow.len >= budget: break
-          let c = iChildAt(node, i)
-          if c != nil: nextRow.add c
-    frontier = nextRow
-  result = frontier.len == 0        # the walk finished on its own terms
+proc mlSweepPush(node: Il2CppPtr) =
+  if node == nil: return
+  if gModLoadSweepFrontier.len >= MlSweepStackMax:
+    inc gModLoadSweepDropped
+    return
+  gModLoadSweepFrontier.add node
 
 proc mlDestroy() =
   ## Tear the text down. Every handle goes through nuikit's generation-checked
@@ -276,45 +268,100 @@ proc mlDismiss(why: string) =
         "end of the frame -- so the survivor sweep that PROVES nothing is left " &
         "runs in " & $int(MlSweepDelayMs) & "ms, not now. No verdict yet."
 
-proc mlSweepReport() =
-  ## The deferred half of the teardown check. Walks the LIVE TREE and states
-  ## one of three outcomes. "We called destroy" is not one of them.
-  gModLoadSweepAt = 0'u64
+proc mlSweepVerdict(exhaustive: bool; whyNot: string) =
+  ## ONE place that ends the sweep, so the three outcomes cannot drift apart.
+  gModLoadSweeping = false
+  gModLoadSweepFrontier.setLen(0)
   gModLoadDone = true
-  # SWEEP BOTH ROOTS. Once the lines are reparented into the game caption's
-  # own container, a sweep rooted only at the canvas we originally built under
-  # may not reach them at all -- and "did not look there" would come back as
-  # ZERO survivors, i.e. a PASS that cannot fail. That is the same defect this
-  # check exists to catch, one level up. So the reparent target is remembered
-  # and swept too, and both verdicts are combined.
-  var survivors = 0
-  var complete = mlSweepSurvivors(gModLoadCanvasTr, survivors)
-  var roots = "the canvas"
-  if gModLoadParentTr != nil and gModLoadParentTr != gModLoadCanvasTr:
-    var s2 = 0
-    let c2 = mlSweepSurvivors(gModLoadParentTr, s2)
-    survivors = survivors + s2
-    complete = complete and c2
-    roots = "the canvas AND the caption container we reparented into"
-  if not complete:
+  let roots = (if gModLoadParentTr != nil and
+                  gModLoadParentTr != gModLoadCanvasTr:
+                 "the canvas AND the caption container we reparented into"
+               else: "the canvas")
+  let scope = $gModLoadSweepNodes & " node(s) over " & $gModLoadSweepSlices &
+              " frame(s) of " & roots
+  if not exhaustive or gModLoadSweepDropped > 0:
+    var extra = whyNot
+    if gModLoadSweepDropped > 0:
+      extra = extra & (if extra.len > 0: "; " else: "") & $gModLoadSweepDropped &
+              " child node(s) were DROPPED at the " & $MlSweepStackMax &
+              "-entry stack ceiling, so parts of the tree were never visited"
     warn "mod loading step: dismissed (" & gModLoadSweepWhy & ") -- teardown " &
-         "check INCONCLUSIVE: the survivor sweep hit its " & $MlSweepBudget &
-         "-node budget before finishing over " & roots & ", so it did NOT " &
-         "establish that nothing " &
-         "named \"" & MlNamePrefix & "*\" is left under the canvas. It found " &
-         $survivors & " so far. This is not a pass."
-  elif survivors != 0:
+         "check INCONCLUSIVE after " & scope & ": " & extra &
+         ". It found " & $gModLoadSweepFound & " so far. \"I could not " &
+         "finish looking\" is NOT a pass."
+  elif gModLoadSweepFound != 0:
     warn "mod loading step: dismissed (" & gModLoadSweepWhy & ") -- teardown " &
-         "FAILED: " & $survivors & " node(s) named \"" & MlNamePrefix &
-         "*\" are STILL under " & roots & ", " & $int(MlSweepDelayMs) & "ms after " &
-         "every one was deactivated and destroyed. Unity's deferred destroy " &
-         "has had whole frames to run, so this time it IS a leak on the " &
-         "player's screen, not an early read."
+         "FAILED: " & $gModLoadSweepFound & " node(s) named \"" & MlNamePrefix &
+         "*\" are STILL under " & roots & " " & $int(MlSweepDelayMs) &
+         "ms after every one was deactivated and destroyed, across an " &
+         "EXHAUSTIVE walk of " & scope & ". Unity's deferred destroy has had " &
+         "whole frames to run, so this IS a leak on the player's screen, not " &
+         "an early read."
   else:
     okLog "mod loading step: dismissed (" & gModLoadSweepWhy & ") -- teardown " &
-          "PASSED: a walk of " & roots & " found ZERO nodes named " &
-          "\"" & MlNamePrefix & "*\". Read back off the tree " &
+          "PASSED: an EXHAUSTIVE walk of " & scope & " found ZERO nodes named " &
+          "\"" & MlNamePrefix & "*\". Read back off the live tree " &
           $int(MlSweepDelayMs) & "ms after the destroy, not off our own handles."
+
+proc mlSweepBegin() =
+  ## Seed the resumable survivor sweep.
+  ##
+  ## WHY RESUMABLE. Measured live: with the Settings screen open the canvas was
+  ## bigger than the old 2,000-node single-frame budget, and the check reported
+  ## INCONCLUSIVE -- honestly, and uselessly. A check that structurally cannot
+  ## complete in a common state of the UI is not a check; the previous boot
+  ## PASSED only because the tree happened to be smaller. So the walk now keeps
+  ## its own frontier and continues across frames until it is EXHAUSTIVE, the
+  ## same way the inspector's `find` does, and the per-frame cost is the knob
+  ## instead of the verdict.
+  ##
+  ## BOTH ROOTS are seeded. Once the lines are reparented into the game
+  ## caption's container, a sweep rooted only at the canvas we originally built
+  ## under may not reach them at all -- and "did not look there" would come
+  ## back as ZERO survivors, a PASS that cannot fail.
+  gModLoadSweepFrontier.setLen(0)
+  gModLoadSweepFound = 0
+  gModLoadSweepNodes = 0
+  gModLoadSweepSlices = 0
+  gModLoadSweepDropped = 0
+  gModLoadSweeping = true
+  mlSweepPush(gModLoadCanvasTr)
+  if gModLoadParentTr != nil and gModLoadParentTr != gModLoadCanvasTr:
+    mlSweepPush(gModLoadParentTr)
+  if gModLoadSweepFrontier.len == 0:
+    mlSweepVerdict(false, "there was no readable root to sweep from (the " &
+                   "canvas transform was never recorded), so NOTHING was " &
+                   "examined")
+
+proc mlSweepStep() =
+  ## One frame's slice of the walk. Depth-first with an explicit stack, so
+  ## suspending and resuming is free and needs no per-frame allocation.
+  var n = 0
+  while gModLoadSweepFrontier.len > 0 and n < MlSweepSlice:
+    inc n
+    inc gModLoadSweepNodes
+    if gModLoadSweepNodes > MlSweepMaxNodes:
+      mlSweepVerdict(false, "the walk passed its " & $MlSweepMaxNodes &
+                     "-node ceiling, which is far above any canvas measured " &
+                     "here -- the tree is not the shape we assume")
+      return
+    let node = gModLoadSweepFrontier.pop()
+    if node == nil or not nuOk(node, 0x10'i32) or not nuAlive(node):
+      continue
+    let nm = iObjName(node)
+    if nm.len > 0 and find(nm, MlNamePrefix) >= 0:
+      inc gModLoadSweepFound
+    var c = 0
+    if iChildCount(node, c):
+      for i in 0 ..< c:
+        mlSweepPush(iChildAt(node, i))
+  inc gModLoadSweepSlices
+  if gModLoadSweepFrontier.len == 0:
+    mlSweepVerdict(true, "")
+  elif gModLoadSweepSlices > MlSweepMaxSlices:
+    mlSweepVerdict(false, "the walk was still going after " &
+                   $MlSweepMaxSlices & " frames and was stopped rather than " &
+                   "kept running on the Unity thread")
 
 proc mlFindDonorTmp(rootTr: Il2CppPtr): Il2CppPtr =
   ## A live TextMeshProUGUI to copy font + materials from.
@@ -353,6 +400,66 @@ proc mlFindDonorTmp(rootTr: Il2CppPtr): Il2CppPtr =
           if c != nil: nextRow.add c
     frontier = nextRow
   result = nil
+
+proc mlFindCaption(lookOk: var bool): NuStyle =
+  ## THE LOAD-PHASE WITNESS: the game's own loading caption, or an honest
+  ## refusal. This one call answers three questions that used to be answered
+  ## separately and inconsistently -- may we draw at all, what should we look
+  ## like, and where do we belong.
+  ##
+  ## WHY IT IS THE GATE. Measured live: the mod build was written to the file
+  ## while the user sat on the MAIN MENU, and the step cheerfully rendered
+  ## there, because the trigger was "the file changed". A loading step over the
+  ## main menu is not a loading step; it is an overlay, which is exactly the
+  ## thing the redesign was supposed to stop being. And separately measured:
+  ## `findtext "Loading" $preloader 60000 all` at the menu searched 4,095 nodes
+  ## EXHAUSTIVELY, with inactive nodes INCLUDED, and found nothing. So the
+  ## caption's absence at the menu is a measured fact, which is what makes its
+  ## PRESENCE a sound gate rather than a guess.
+  ##
+  ## `lookOk` is the third outcome and is not decoration. false means COULD NOT
+  ## LOOK -- no anchor yet, or Unity would not say which scene it is in. That
+  ## is normal for the first seconds of boot and must never be collapsed into
+  ## "there is no caption", because the two want opposite responses: wait, and
+  ## tear down.
+  ##
+  ## It searches THE ANCHOR'S WHOLE SCENE, not the single canvas we happened to
+  ## build under. The previous version searched only that canvas and reported
+  ## `no TMP under this root displays "loading"` -- true of that root, and no
+  ## evidence at all about the scene.
+  lookOk = false
+  result = NuStyle(ok: false, why: "the witness search never ran", donor: nil,
+                   node: nil, text: "", fontSize: 0.0'f32,
+                   x: 0.0'f32, y: 0.0'f32)
+  var roots: seq[Il2CppPtr] = @[]
+  if not splAnchorSceneRoots(roots):
+    result.why = "COULD NOT LOOK -- splAnchorSceneRoots refused (no " &
+                 "DontDestroyOnLoad anchor yet, or Unity would not say which " &
+                 "scene it is in). This is NOT \"no caption\"; nothing was " &
+                 "examined"
+    return
+  lookOk = true
+  var looked = 0
+  var lastWhy = "no scene root held a TMP displaying \"" & gModLoadNeedle & "\""
+  for go in roots:
+    if looked >= MlCaptionRoots: break
+    inc looked
+    let tr = nuTransformOf(go)
+    if tr == nil: continue
+    let cand = nuStyleFind(tr, gModLoadNeedle, MlNamePrefix)
+    if cand.ok:
+      return cand
+    if find(cand.why, "are OURS") >= 0:
+      lastWhy = cand.why
+  result.why = "searched " & $looked & " scene root(s) of the anchor's own " &
+               "scene for the needle \"" & gModLoadNeedle & "\" (override it " &
+               "with modLoadCaption in aowlspt-host.json): " & lastWhy
+
+proc mlPhaseLive(): bool =
+  ## Is the client in the load phase RIGHT NOW? Answered from the held caption
+  ## alone -- one liveness check, no walk. A caption we are holding that Unity
+  ## reports destroyed means the phase that owned it has ended.
+  gModLoadCaptionNode != nil and nuAlive(gModLoadCaptionNode)
 
 proc mlStyleUsable(s: NuStyle): bool =
   ## A style we can actually LAY OUT from -- matched AND with a complete frame.
@@ -404,7 +511,7 @@ proc mlVerifyStyle(s: NuStyle) =
           "\"" & s.text & "\" (font " & nuF(s.fontSize) & "), in that " &
           "caption's own anchors/pivot, one line below it."
 
-proc mlBuild(lines: seq[string]): bool =
+proc mlBuild(lines: seq[string]; style: NuStyle): bool =
   ## Build the three lines once. Returns false having destroyed anything
   ## partial: a half-built caption is never left on the display, and nuikit has
   ## already logged which hop refused.
@@ -447,29 +554,26 @@ proc mlBuild(lines: seq[string]): bool =
   let canvasTr = nuTransformOf(canvasGo)
   gModLoadCanvasTr = canvasTr        # remembered so the survivor sweep has a root
 
-  # PREFER THE GAME'S OWN LOADING CAPTION as the donor. It gives us its font
-  # and materials for free, and its frame tells us where the player is already
-  # looking. Falling back to "any TMP under the canvas" still renders -- it
-  # just will not match, and the log will say NOT matched rather than pretend.
+  # THE CAPTION IS THE DONOR, and it is not optional any more.
   #
-  # nuikit's nuStyleFind, not a private copy: matching the game's look is a
-  # TOOLKIT capability, so the mods tab and the settings rows get it too.
-  let style = nuStyleFind(canvasTr, MlNeedle, MlNamePrefix)
+  # There used to be a fallback here: "any TMP under the canvas" would do, and
+  # the log would say NOT matched. That fallback is what let this render over
+  # the main menu with our own defaults -- it made a caption-less client a
+  # cosmetic downgrade instead of a reason not to draw. The caller establishes
+  # the caption BEFORE calling; if it is somehow gone by now, refuse.
   var donor = style.donor
-  if donor == nil:
-    donor = mlFindDonorTmp(canvasTr)
-  if donor == nil:
+  if donor == nil or not mlStyleUsable(style):
     # Say this ONCE. Repeating it every 250ms for a six-minute compile would
     # bury the log this project reads to find out what happened.
     if not gModLoadDonorWarned:
       gModLoadDonorWarned = true
       gModLoadWhy = "donor"
-      warn "mod loading step: a canvas was found but no live " &
-           "TextMeshProUGUI donor exists under it yet, and nuLabel REFUSES " &
-           "without one (TMP's Awake faults reaching for the default font " &
-           "through TMP_Settings). It will build as soon as one appears. The " &
-           "compile itself is unaffected -- its progress is in " &
-           gModLoadScreenPath & "."
+      warn "mod loading step: REFUSING to build -- the game's own loading " &
+           "caption is not usable as a donor/frame (" & nuStyleNote(style) &
+           "). Nothing is drawn: a step with no loading sequence to be a step " &
+           "OF is an overlay, and drawing one over the menu is the defect " &
+           "this gate exists to prevent. The compile itself is unaffected -- " &
+           "its progress is in " & gModLoadScreenPath & "."
     return false
 
   let rows = min(lines.len - 1, MlMaxRows)
@@ -505,8 +609,8 @@ proc mlBuild(lines: seq[string]): bool =
     py = -(ch * MlPanelVerticalFrac)
     placed = "centred on a " & nuF(cw) & "x" & nuF(ch) & " canvas"
 
-  let usable = mlStyleUsable(style)
-  if usable:
+  let usable = true      # guaranteed by the refusal above; kept for clarity
+  block:
     let par = mlParentTransformOf(style.node)
     if par != nil:
       let pgo = nuGameObjectOf(par)
@@ -564,7 +668,7 @@ proc mlBuild(lines: seq[string]): bool =
     mlVerifyStyle(style)
   return true
 
-proc mlRetryStyle() =
+proc mlRetryStyle(s: NuStyle) =
   ## THE FIX FOR DEFECT (5). The game's "Loading profile data..." caption is
   ## TRANSIENT -- measured: `findtext "Loading" $preloader 60000 all` at the
   ## MENU searched 4,095 nodes EXHAUSTIVELY and found none, so at the menu it
@@ -575,8 +679,6 @@ proc mlRetryStyle() =
   ##
   ## So: keep looking on later polls, and RE-APPLY when it finally shows up.
   if gModLoadStyled or not gModLoadBuilt: return
-  if gModLoadCanvasTr == nil: return
-  let s = nuStyleFind(gModLoadCanvasTr, MlNeedle, MlNamePrefix)
   if not mlStyleUsable(s): return
   if not mlApplyStyle(s): return
   # NOW DO THE REPARENT (defect 2). Previously this path logged "position
@@ -633,7 +735,7 @@ proc mlRefresh(lines: seq[string]) =
   ## than silently truncating.
   if lines.len - 1 > gModLoadRows.len and lines.len - 1 <= MlMaxRows:
     mlDestroy()
-    discard mlBuild(lines)
+    discard mlBuild(lines, gModLoadCapStyle)
     return
   if uint32(gModLoadTitle) != 0'u32 and lines.len > 0:
     discard nuSetText(gModLoadTitle, lines[0])
@@ -673,9 +775,10 @@ proc mlLoadPhaseOver(): bool =
   ## says NO rather than guessing -- the linger timers below are what dismiss
   ## us on that path. Do not "improve" this into a heuristic that returns true
   ## on a timeout; a false positive here erases the screen mid-build.
-  if not gModLoadStyled: return false
-  if gModLoadDonor == nil: return false
-  result = not nuAlive(gModLoadDonor)
+  ## Since the load-phase gate landed, we cannot be built without holding a
+  ## caption, so this no longer depends on whether a re-style happened.
+  if gModLoadCaptionNode == nil: return false
+  result = not mlPhaseLive()
 
 proc modLoadTick() =
   ## Runs from the shared per-frame drain, on the Unity main thread, inside the
@@ -693,7 +796,14 @@ proc modLoadTick() =
   # evidence of anything.
   if gModLoadSweepAt != 0'u64:
     if nowFrame >= gModLoadSweepAt:
-      mlSweepReport()
+      gModLoadSweepAt = 0'u64
+      mlSweepBegin()
+    return
+  if gModLoadSweeping:
+    # One slice per frame until EXHAUSTIVE. This is the only path in this
+    # feature that runs every frame rather than every 250ms, and it runs only
+    # between a teardown and its verdict -- a second or two, once.
+    mlSweepStep()
     return
   if gModLoadDone:
     return
@@ -712,7 +822,19 @@ proc modLoadTick() =
          "are released by the deadline path, independently of this."
     modLoadReleaseMods("the loading step self-disabled after " &
                        $MlMaxTries & " polls")
-    mlDismiss("self-disabled after " & $MlMaxTries & " polls")
+    # NOTHING BUILT MEANS NOTHING TO TEAR DOWN. Running the teardown+sweep here
+    # was cheap but it LIED in the log: a "dismissed ... teardown INCONCLUSIVE"
+    # line reads as though something had been on screen and its removal could
+    # not be confirmed, when in fact nothing was ever drawn. A verdict about a
+    # thing that never existed is noise at best and misleading at worst.
+    if gModLoadBuilt or uint32(gModLoadTitle) != 0'u32 or
+       gModLoadRows.len > 0:
+      mlDismiss("self-disabled after " & $MlMaxTries & " polls")
+    else:
+      gModLoadDone = true
+      okLog "mod loading step: nothing was ever built this session, so there " &
+            "is nothing to tear down and NO survivor sweep is run. No " &
+            "teardown verdict is claimed either way."
     return
 
   # THE MENU CHECK, BEFORE ANYTHING ELSE. Defect (1): the old code had exactly
@@ -720,13 +842,6 @@ proc modLoadTick() =
   # reported READY, or reported FAILED, left the text on screen for ever,
   # including over the main menu. This is now checked every tick regardless of
   # what the file says.
-  if gModLoadBuilt and mlLoadPhaseOver():
-    modLoadReleaseMods("the client's own loading caption is gone, so the " &
-                       "load phase ended; the mods must not be withheld past it")
-    mlDismiss("the game's own loading caption was destroyed -- the load " &
-              "phase is over and the menu is up")
-    return
-
   var text = ""
   if not readTextFile(gModLoadScreenPath, text) or text.len == 0:
     # NO FILE: nothing is compiling. Build NOTHING -- an empty caption is
@@ -776,6 +891,53 @@ proc modLoadTick() =
          "progress). The writer -- Progress.render in tools/modbuild.py -- is " &
          "the thing to fix; the host renders verbatim on purpose."
 
+  # ===================================================================
+  # THE LOAD-PHASE GATE. Nothing below this draws unless the client's own
+  # loading caption is on screen right now.
+  #
+  # Cheap when we already hold one: `mlPhaseLive` is a single liveness check.
+  # The scene walk only runs when we do NOT hold a caption, and then at most
+  # once a second, because it is the expensive call in this feature.
+  # ===================================================================
+  var cap = gModLoadCapStyle
+  if not mlPhaseLive():
+    gModLoadCaptionNode = nil
+    if now - gModLoadCaptionAt >= MlCaptionPollMs:
+      gModLoadCaptionAt = now
+      var lookOk = false
+      let found = mlFindCaption(lookOk)
+      if lookOk and found.ok:
+        cap = found
+        gModLoadCapStyle = found
+        gModLoadCaptionNode = found.node
+        gModLoadDonor = found.donor
+        if not gModLoadPhaseSaid:
+          gModLoadPhaseSaid = true
+          okLog "mod loading step: the client's own loading caption is up (" &
+                nuStyleNote(found) & "), so this IS a load phase and the step " &
+                "may draw. It will be torn down when that caption is."
+      elif gModLoadWhy != ("nophase:" & $lookOk):
+        gModLoadWhy = "nophase:" & $lookOk
+        warn "mod loading step: NOT DRAWING -- " &
+             (if lookOk:
+                "the client is not in a load phase (" & found.why & "). " &
+                "Measured live: writing the build file while the user sat on " &
+                "the MAIN MENU used to make this render there, which is an " &
+                "overlay, not a step. The file's contents are kept and will " &
+                "be rendered on the next load phase if one begins."
+              else:
+                found.why & ". Nothing was examined, so this is WAITING, not " &
+                "a verdict.")
+  if not mlPhaseLive():
+    # If we were up, the phase we belonged to has ended -- that is the
+    # dismissal signal, and it is the same signal as the gate.
+    if gModLoadBuilt:
+      mlDismiss("the client's own loading caption is gone, so the load phase " &
+                "this step belonged to has ended")
+      modLoadReleaseMods("the load phase ended; the mods must not be " &
+                         "withheld past it")
+    return
+
   if not gModLoadBuilt:
     # RETRY EVERY POLL while unbuilt, not only when the file changes.
     #
@@ -790,11 +952,11 @@ proc modLoadTick() =
     #
     # Retrying is cheap: mlBuild returns at its first refusal, and mlWhyOnce
     # keeps the log to one line per distinct reason.
-    discard mlBuild(lines)
+    discard mlBuild(lines, cap)
   else:
     if changed:
       mlRefresh(lines)
-    mlRetryStyle()
+    mlRetryStyle(cap)
 
   # The done marker is only acted on ONCE THE TEXT IS ACTUALLY UP. A fully
   # cached build writes "MODS READY" as its very first (and only) render, so
