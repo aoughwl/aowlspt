@@ -188,7 +188,20 @@ def main():
                "evidence": line}
     else:
         time.sleep(a.settle)
-        raw, err = run_inspector(['findtext %s' % a.text], 60.0)
+        # A big budget AND `all` (the caption may be built inactive a frame
+        # before it shows), then RESUME until the host says EXHAUSTIVE. The
+        # first version used the default 20,000-node budget with no resume and
+        # reported STOPPED EARLY -> INCONCLUSIVE on a scene the host's own
+        # frontier showed to be >33,000 nodes. That is honest and useless.
+        raw, err = run_inspector(['findtext %s $preloader 120000 all' % a.text],
+                                 90.0)
+        rounds = 1
+        while (not err and raw is not None and "STOPPED EARLY" in raw
+               and "HIT " not in raw and rounds < 6):
+            more, err = run_inspector(['findtext more 120000'], 90.0)
+            rounds += 1
+            if more:
+                raw = raw + "\n" + more
         if err:
             out = {"verdict": "INCONCLUSIVE", "why": err, "evidence": line}
         elif raw is None:
