@@ -5782,3 +5782,24 @@ So the inspector is exonerated and the build survives without a file: the
 killer is the modload path's first poll with `lookOk` true AND a file present
 (the new census / caption-identity / reparent code), faulting inside
 UnityPlayer from the PreloaderUI::Update rider chain, outside any guard.
+
+## PostFX subtab strip: why it is left-aligned and "behind the background" (measured 2026-09-01)
+
+Read-only, Graphics tab confirmed up (`_currentTab` klass = GraphicsSettingsTab):
+
+* `Graphics Settings/Toggles(Clone)` is **sibling index 0** of the panel -- the
+  first child, so every later sibling (background, scroll view) paints over it
+  and takes raycasts first. `Transform::SetAsLastSibling` after build is the fix.
+* Its `anchorMin=(0,1)`, `anchoredPosition=(75,-20)`, `sizeDelta=(501.34,46)`:
+  left-anchored with an absolute x. The donor (`Control Settings/Toggles`) is
+  stretch-anchored `(0,1)-(1,1)` with a symmetric `sizeDelta.x`, which is what
+  centres it. Copy the donor's horizontal anchoring; compute only y.
+* Every node in the strip is `activeInHierarchy = true`, but BOTH spawned
+  `AnimatedToggle`s' own Image reads **colour alpha 0.0** (`whydidntitdraw`
+  VERDICT NOT VISIBLE, CAUSE alpha below 1/255). The text the user sees is the
+  label; the button graphic itself is transparent in both states. On the stock
+  tab strip the Animator drives that alpha per state -- the clone's Animator is
+  probably not running or has no controller bound.
+* Earlier "INACTIVE in the hierarchy" for the same node was the user having
+  switched tabs at that moment. A visibility verdict is about THIS FRAME; read
+  `state` in the same batch before trusting it.
