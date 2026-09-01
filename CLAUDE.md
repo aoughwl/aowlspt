@@ -430,3 +430,62 @@ So, concretely:
   gripe with no repro is not actionable.
 * **Propose the fix if it is obvious**, but do not go implement it mid-task
   without saying so first; the human decides what gets built next.
+
+---
+
+## 11. WORK AUTONOMOUSLY. DO NOT ASK WHICH THING TO DO NEXT.
+
+Standing instruction from the user, given 2026-09-01 and not to be re-litigated:
+
+> "idk do whatevers best, dont ever ask me again- be time efficient and token
+> efficient- get the most done, always, but always be smart- waste time building
+> great tooling and systems"
+
+So: **do not end a turn with a question about priority.** "Should I do A or B?"
+is the single most expensive sentence available here, because it costs a
+round trip and buys nothing the repo cannot answer. Pick the one that unblocks
+more work, do it, and say what you picked. Ask only when proceeding under any
+assumption would be unsafe or would destroy work -- that is a different thing
+from not knowing which task is more valuable.
+
+The three efficiencies, in priority order when they conflict:
+
+1. **Be smart.** A wrong answer delivered fast is the most expensive outcome in
+   this project. Section 9b outranks everything below.
+2. **Be time efficient.** Parallelise. Dispatch independent work to subagents in
+   ONE message so they run concurrently, and keep working while they run. The
+   coordinating session drives the game and serialises deploys; subagents build
+   and report artifacts (section 1). Never serialise two things that do not
+   depend on each other.
+3. **Be token efficient.** The logs here are measured token bombs (section 8).
+   Never read a whole log, a whole transcript, or `db.json`. Prefer a tool that
+   answers a question over a dump you then read.
+
+**"Waste time building great tooling and systems" is an explicit licence, and
+it is the highest-leverage instruction in this file.** A fix applies once; a
+tool applies every session afterwards. When you hit a rough edge, the right
+response is usually to build the thing that makes the whole class of problem
+visible, not to work around this instance. Measured examples from the session
+this rule came from:
+
+* the supervisor could not detect a stall by construction, because the host's
+  5-second heartbeat refreshed the progress clock. The fix was 20 lines; the
+  VALUE was `tools/test_supervise.py`, which drives the real supervisor against
+  synthetic logs and proves each verdict CAN fire -- including the negative
+  controls.
+* 14 worktrees had been gutted by Windows temp cleanup, leaving checkouts where
+  `git commit -a` would commit the deletion of the whole tree. Removing them
+  took a minute. `tools/wtcheck.py` means it can never silently return.
+* `Resolver.parent_type` had been answering "no base class" for 13,088 of
+  29,835 types. The fix was small; the value was the `verify-parents`
+  self-check that now gates map generation and that FAILED before the fix.
+
+The build slot is the one genuinely serial resource: **concurrent `aowl build
+host` in the SAME checkout corrupts** (separate worktrees are safe, but see
+section 0 and `wtcheck.py` before creating one). When several agents need to
+build, the coordinator hands out the slot; an agent that is ready to build says
+so and waits rather than building speculatively.
+
+Report what you did and what you did NOT verify. Finishing with "here is what
+is still unproven" is complete work; finishing with a question about what to do
+next is not.
