@@ -1132,11 +1132,27 @@ type
     text*: string        ## what it says right now (evidence, for the log)
     fontSize*: float32
     x*, y*: float32      ## its anchored position
+    w*, h*: float32      ## its sizeDelta
+    aMinX*, aMinY*: float32   ## its anchorMin
+    aMaxX*, aMaxY*: float32   ## its anchorMax
+    pivX*, pivY*: float32     ## its pivot
+    geom*: bool          ## true when the four geometry reads above ALL landed
+      ## WHY THE ANCHORS ARE PART OF THE STYLE. An `anchoredPosition` means
+      ## nothing on its own: it is interpreted relative to the anchors and the
+      ## pivot. Copying the donor's (x, y) onto an element anchored top-left,
+      ## as the first version did, puts our text somewhere the donor is not --
+      ## and it does it SILENTLY, producing a plausible number and a wrong
+      ## position. So a style either carries the whole frame or admits it does
+      ## not (`geom = false`), and a caller that reparents must check.
 
 proc nuStyleCapture*(donorTmp, node: Il2CppPtr): NuStyle =
   ## Read a live TMP's look. Every read is guarded; nothing is assumed.
   result = NuStyle(ok: false, why: "", donor: donorTmp, node: node,
-                   text: "", fontSize: 0.0'f32, x: 0.0'f32, y: 0.0'f32)
+                   text: "", fontSize: 0.0'f32, x: 0.0'f32, y: 0.0'f32,
+                   w: 0.0'f32, h: 0.0'f32,
+                   aMinX: 0.0'f32, aMinY: 1.0'f32,
+                   aMaxX: 0.0'f32, aMaxY: 1.0'f32,
+                   pivX: 0.0'f32, pivY: 1.0'f32, geom: false)
   if donorTmp == nil:
     result.why = "no donor TMP"
     return
@@ -1160,6 +1176,19 @@ proc nuStyleCapture*(donorTmp, node: Il2CppPtr): NuStyle =
     if pok:
       result.x = nx
       result.y = ny
+    # THE WHOLE FRAME, or none of it. Each of these is an Injected getter that
+    # can decline; `geom` is the AND of all four, so a caller cannot pick up a
+    # half-read frame and lay out from it.
+    let (sok, sw, sh) = nuGetSize(node)
+    let (nok, nax, nay) = nuGetV2(node, NuTRtGetAnchorMin)
+    let (xok, xax, xay) = nuGetV2(node, NuTRtGetAnchorMax)
+    let (vok, pvx, pvy) = nuGetV2(node, NuTRtGetPivot)
+    if pok and sok and nok and xok and vok:
+      result.w = sw; result.h = sh
+      result.aMinX = nax; result.aMinY = nay
+      result.aMaxX = xax; result.aMaxY = xay
+      result.pivX = pvx; result.pivY = pvy
+      result.geom = true
   result.ok = true
 
 proc nuStyleFind*(rootTr: Il2CppPtr; needleLower: string): NuStyle =
@@ -1199,6 +1228,80 @@ proc nuStyleNote*(s: NuStyle): string =
   ## One line for the log, saying what was matched or why nothing was.
   if s.ok:
     result = "MATCHED the game's own label \"" & s.text & "\" (font " &
-             nuF(s.fontSize) & " at " & nuF(s.x) & ", " & nuF(s.y) & ")"
+             nuF(s.fontSize) & " at " & nuF(s.x) & ", " & nuF(s.y) &
+             ", frame " & (if s.geom: "READ" else: "NOT read -- position " &
+             "cannot be copied") & ")"
   else:
     result = "NOT matched (" & s.why & "); using our own defaults"
+  # SAY THE LIMIT OUT LOUD, on both branches. The donor is found by DISPLAYED
+  # TEXT, and displayed text is LOCALIZED: an English needle finds nothing on
+  # a Russian client, and the honest reading of "NOT matched" there is "we
+  # looked for the wrong word", not "the game has no caption". Until the match
+  # is structural, the log must not let that be mistaken for a scene fact.
+  result = result & " [matched by DISPLAYED TEXT, which is LOCALIZED -- a " &
+           "non-English client will not match this needle]"
+
+# ---------------------------------------------------------------------------
+# APPLYING a captured style to an element we already built, and READING BACK
+# what actually landed.
+#
+# Both halves exist for the same reason. A style match is not available at the
+# moment a panel is built -- the game's own caption is TRANSIENT, it exists
+# only while the load runs -- so the match has to be retried on later frames
+# and applied to elements that are already on screen. And per CLAUDE.md 9b,
+# "we called the setter" is not evidence: `nuElemFontSize` reads the number
+# back off the live TMP so a caller can compare it against the DONOR's, which
+# is a comparison that can fail.
+# ---------------------------------------------------------------------------
+proc nuStyleLayout*(e: NuElem; s: NuStyle; dx, dy: float32;
+                    wScale: float32 = 1.0'f32): bool =
+  ## Lay `e` out in the donor's own frame -- its anchors, its pivot, its height
+  ## -- offset by (dx, dy) from the donor's anchoredPosition. That is what
+  ## "directly under the game's caption" has to mean once the two can sit under
+  ## different parents with different anchors.
+  ##
+  ## REFUSES unless `s.geom` -- see the note on NuStyle. Laying out from a
+  ## position whose anchors were never read is the silent-wrong-place bug this
+  ## whole field set was added to prevent.
+  if not nkReady("styleLayout"): return false
+  if not s.ok or not s.geom:
+    nkRefuse("styleLayout", "this NuStyle has no complete geometry (ok=" &
+             $s.ok & " geom=" & $s.geom & "), so there is no donor frame to " &
+             "lay out in. Refusing rather than inventing anchors")
+    return false
+  var go: Il2CppPtr = nil
+  var rt: Il2CppPtr = nil
+  var comp: Il2CppPtr = nil
+  var kind = 0'i32
+  if not nkResolve(e, "styleLayout", go, rt, comp, kind): return false
+  result = nuLayout(rt, s.aMinX, s.aMinY, s.aMaxX, s.aMaxY, s.pivX, s.pivY,
+                    s.w * wScale, s.h, s.x + dx, s.y + dy)
+
+proc nuStyleFont*(e: NuElem; s: NuStyle): bool =
+  ## Give an existing label the donor's font SIZE. The font ASSET and materials
+  ## came from the same donor at `nuLabel` time, so the two cannot disagree.
+  if not nkReady("styleFont"): return false
+  if not s.ok: return false
+  var go: Il2CppPtr = nil
+  var rt: Il2CppPtr = nil
+  var comp: Il2CppPtr = nil
+  var kind = 0'i32
+  if not nkResolve(e, "styleFont", go, rt, comp, kind): return false
+  if kind != NkLabel:
+    nkRefuse("styleFont", "this handle is a " & nkKindName(kind) &
+             ", which has no font size")
+    return false
+  result = nuSetFontSize(comp, s.fontSize)
+
+proc nuElemFontSize*(e: NuElem): (bool, float32) =
+  ## READBACK: what m_fontSize says on the live TMP right now. Not what we set.
+  var go: Il2CppPtr = nil
+  var rt: Il2CppPtr = nil
+  var comp: Il2CppPtr = nil
+  var kind = 0'i32
+  if not nkResolve(e, "elemFontSize", go, rt, comp, kind):
+    return (false, 0.0'f32)
+  if kind != NkLabel: return (false, 0.0'f32)
+  if not nuOk(comp, NuStyleFontSizeOff + 4'i32): return (false, 0.0'f32)
+  (true, float32(cReadF32(cast[Il2CppPtr](
+     cast[uint64](comp) + uint64(NuStyleFontSizeOff)))))

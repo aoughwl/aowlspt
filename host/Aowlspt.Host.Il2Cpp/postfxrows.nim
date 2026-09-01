@@ -130,6 +130,13 @@ var gPfxRowSlider: seq[Il2CppPtr] = @[]
 var gPfxRowWant: seq[float32] = @[]
 var gPfxRowName: seq[string] = @[]
 var gPfxDeclined: seq[string] = @[]
+## THE STOCK DONOR GEOMETRY, read live and captured once per build. See
+## `pfxDonorGeom`. `gPfxParentW` is the row parent's own rect width, and it is
+## what the finished-state check measures every row against -- a row wider than
+## its container is the reported defect, stated as a number.
+var gPfxGeom = nuNoGeom()
+var gPfxHaveGeom = false
+var gPfxParentW = 0.0'f32
 
 type
   PfxKind = enum
@@ -259,6 +266,121 @@ proc pfxTab(): Il2CppPtr =
   if result != nil and not nuOk(result, PfxOffToggleTemplate + 8'i32):
     result = nil
 
+## GraphicsSettingsTab._settingsContainer @0x98 : Transform. MEASURED
+## (`il2cpp_resolve.py ... fields EFT.UI.Settings.GraphicsSettingsTab`), and
+## NULL-CAPABLE like every serialized reference here.
+const PfxOffGfxContainer = 0x98'i32
+
+proc pfxDonorGeom(g: var NuGeom; parentW: var float32): bool =
+  ## MEASURE A STOCK ROW AND COPY IT. Do not invent a width.
+  ##
+  ## THE DEFECT THIS EXISTS FOR, observed live on the deployed build: the
+  ## prefab rows render, and the two kinds do not agree. The `SettingToggle`
+  ## rows sat near the horizontal centre; every `SettingFloatSlider` row put
+  ## its label far left and ran its control column off the RIGHT EDGE of the
+  ## panel, clipped. Nothing was writing the fresh row's geometry, so each kind
+  ## kept whatever its own prefab shipped with -- and the PostFX tab's two
+  ## templates were authored against different container widths.
+  ##
+  ## WHY A HARDCODED WIDTH IS NOT ACCEPTABLE, specifically: this user runs
+  ## Windows at 1.5x display scaling, so a pixel constant measured on one
+  ## machine is a different fraction of the panel on the next. The donor is
+  ## read LIVE, so it is resolution-independent by construction.
+  ##
+  ## WHERE THE DONOR COMES FROM: the GRAPHICS SETTINGS panel, whose stock rows
+  ## the game itself built and which lays out correctly on screen right now.
+  ## The PostFX panel has no stock rows to borrow from -- its tab was folded
+  ## away, so its `CreateControls` never ran, which is the whole reason this
+  ## feature exists at all.
+  ##
+  ## THE DONOR IS CHOSEN BY CONSENSUS, NOT BY POSITION, and that is the part
+  ## that can fail. Taking "child 0" would silently take a header, a spacer or
+  ## our own cloned subtab strip. Instead every candidate is measured and the
+  ## width that AT LEAST TWO stock rows agree on wins. If no two agree, this
+  ## refuses and says so rather than copying one arbitrary rectangle.
+  result = false
+  parentW = 0.0'f32
+  if gGfxPanelT == nil or not duOk(gGfxPanelT, 0x20'i32): return
+  if not iUnityAlive(gGfxPanelT): return
+  let gfxTab = modsComponent(gGfxPanelT, "GraphicsSettingsTab")
+  if not nuOk(gfxTab, PfxOffGfxContainer + 8'i32):
+    warn "postfx rows: the GraphicsSettingsTab component could not be reached " &
+         "from the live Graphics Settings panel, so there is no stock row to " &
+         "measure. Rows keep the PREFAB's own geometry -- which is the defect " &
+         "being fixed -- and the width check in the verdict will say so."
+    return
+  let cont = cNuGetRef(gfxTab, PfxOffGfxContainer)
+  if not nuOk(cont, 0x10'i32) or not nuAlive(cont):
+    warn "postfx rows: GraphicsSettingsTab._settingsContainer @0x98 read null " &
+         "or not a live object; there is no stock row to measure."
+    return
+  var n = 0
+  if not iChildCount(cont, n) or n <= 0:
+    warn "postfx rows: the stock Graphics row container reports " & $n &
+         " child(ren); nothing to measure."
+    return
+  const PfxMaxDonors = 24
+  var cw: seq[float32] = @[]
+  var crt: seq[Il2CppPtr] = @[]
+  var skippedClones = 0
+  var i = 0
+  while i < n and i < PfxMaxDonors:
+    let c = iChildAt(cont, i)
+    i = i + 1
+    if c == nil or not duOk(c, 0x20'i32): continue
+    if not iUnityAlive(c): continue
+    # OUR OWN CLONED SUBTAB STRIP LIVES IN THIS CONTAINER. Unity names every
+    # Instantiate result "<donor>(Clone)", and the game's own rows never carry
+    # that suffix, so this is an exact discriminator, not a heuristic.
+    if iObjName(c).contains("(Clone)"):
+      skippedClones = skippedClones + 1
+      continue
+    let gg = nuReadGeom(c)
+    if not gg.ok: continue
+    # A ROW, not a container and not a hairline. Bounded on BOTH sides so a
+    # full-height scroll viewport cannot be mistaken for a settings row.
+    if gg.rectH < 8.0'f32 or gg.rectH > 200.0'f32: continue
+    if gg.rectW < 100.0'f32: continue
+    cw.add gg.rectW
+    crt.add c
+  if cw.len < 2:
+    warn "postfx rows: only " & $cw.len & " stock Graphics row(s) could be " &
+         "measured (" & $skippedClones & " skipped as our own clones, out of " &
+         $n & " children). At least TWO must agree on a width before one is " &
+         "trusted, so NO geometry is copied. Rows keep the prefab's own width " &
+         "and the verdict below reports that as a number."
+    return
+  # CONSENSUS. The width the most rows share wins; ties go to the first.
+  var bestIdx = -1
+  var bestCount = 0
+  var ia = 0
+  while ia < cw.len and ia < PfxMaxDonors:
+    var cnt = 0
+    var ib = 0
+    while ib < cw.len and ib < PfxMaxDonors:
+      let d = cw[ia] - cw[ib]
+      if d < 1.0'f32 and d > -1.0'f32: cnt = cnt + 1
+      ib = ib + 1
+    if cnt > bestCount:
+      bestCount = cnt
+      bestIdx = ia
+    ia = ia + 1
+  if bestIdx < 0 or bestCount < 2:
+    warn "postfx rows: " & $cw.len & " stock row(s) were measured and NO TWO " &
+         "agree on a width to within 1px, so none is a trustworthy donor. No " &
+         "geometry is copied."
+    return
+  let donor = nuReadGeom(crt[bestIdx])
+  if not donor.ok: return
+  let pg = nuReadGeom(cont)
+  if pg.ok: parentW = pg.rectW
+  g = donor
+  okLog "postfx rows: stock donor row MEASURED LIVE -- " & $bestCount & " of " &
+        $cw.len & " Graphics Settings rows agree on this width, so it is the " &
+        "game's own row geometry and not one we invented: " &
+        nuGeomNote(donor) & ". Their container is " & nuF(parentW) & " wide."
+  result = true
+
 proc pfxMakeRow(prefab, parent: Il2CppPtr; r: PfxRow; idx: int32;
                 sliderOut: var Il2CppPtr): Il2CppPtr =
   ## ONE row, the game's own way: Instantiate the prefab under the row parent,
@@ -292,6 +414,18 @@ proc pfxMakeRow(prefab, parent: Il2CppPtr; r: PfxRow; idx: int32;
   # is how a later session tells our row from a stock one without guessing.
   discard nuRowSetName(row, "aowlspt-pfx-" & r.key)
   discard nuRowSetSiblingIndex(row, idx)
+  # THE GEOMETRY. Horizontal only -- the parent's LayoutGroup owns Y and
+  # height, and fighting it would lose on the next relayout. Applied to the
+  # ROW's own RectTransform, which for a UI object is what get_transform
+  # returns. A refusal here is not fatal: the row is still a real native
+  # control, merely at the prefab's own width, and the verdict measures that
+  # and reports it as a number rather than hiding it.
+  if gPfxHaveGeom:
+    let rt = nuTransformOf(go)
+    if rt == nil or not nuApplyGeomX(rt, gPfxGeom):
+      warn "postfx rows: the stock row geometry could not be applied to '" &
+           r.key & "'; that row keeps the PREFAB's own width and may not line " &
+           "up with the others."
   if r.kind == pkSlider:
     let sl = nuRowSlider(row)
     if sl == nil:
@@ -357,6 +491,14 @@ proc pfxBuild(): bool =
                  "fall back to building controls from scratch -- that is the " &
                  "workaround this change removed.")
     return
+  # THE STOCK DONOR, and the row parent's own width. Read BEFORE any row is
+  # built, once, so the loop below costs nothing extra.
+  var geom = nuNoGeom()
+  var parentW = 0.0'f32
+  gPfxHaveGeom = pfxDonorGeom(geom, parentW)
+  if gPfxHaveGeom: gPfxGeom = geom
+  let pgeom = nuReadGeom(parent)
+  gPfxParentW = (if pgeom.ok: pgeom.rectW else: parentW)
   let rows = pfxCatalogue()
   gPfxRowGo = @[]
   gPfxRowSlider = @[]
@@ -436,6 +578,57 @@ proc pfxBuild(): bool =
         "was called; the verdict below is the finished-state read."
   result = true
 
+proc pfxWidthOk(go: Il2CppPtr; i: int; firstWide: var string;
+                wrongWidth, overflow: var int): bool =
+  ## ONE row's width, read off the LIVE RectTransform through `get_rect` --
+  ## never from anything this file wrote.
+  ##
+  ## Two independent ways to fail, kept separate because they have different
+  ## causes: a row that does not match the stock donor (the copy did not take)
+  ## and a row wider than its own container (the clipped-slider defect the
+  ## player actually sees). A row can be the second without being the first if
+  ## the donor itself is wrong, which is exactly why both are asked.
+  result = true
+  let rt = nuTransformOf(go)
+  if rt == nil: return                # unreadable is handled by the caller's incon
+  let g = nuReadGeom(rt)
+  if not g.ok: return
+  if gPfxParentW > 1.0'f32 and g.rectW > gPfxParentW + 1.0'f32:
+    overflow = overflow + 1
+    result = false
+    if firstWide.len == 0:
+      firstWide = gPfxRowName[i] & " is " & nuF(g.rectW) & " wide inside a " &
+                  nuF(gPfxParentW) & " container -- it is CLIPPED"
+    return
+  if gPfxHaveGeom:
+    # WHAT WIDTH IS CORRECT depends on how the donor is anchored, and getting
+    # this wrong is how a check starts failing on healthy rows.
+    #
+    # The stock Graphics rows are STRETCH-anchored horizontally
+    # (anchorMin.x = 0, anchorMax.x = 1), so `nuApplyGeomX` copies "fill your
+    # parent" rather than a number. Our rows live in the PostFX tab's
+    # `_settingsRoot`, a DIFFERENT container from the Graphics one -- so the
+    # correct expectation is the PostFX parent's width, not the Graphics
+    # donor's absolute width. Comparing against the donor's number would fail
+    # every row whenever the two panels differ, which is a check that fails for
+    # the wrong reason.
+    #
+    # Only when the donor is NOT stretched does its absolute width mean
+    # anything transferable.
+    let stretched = (gPfxGeom.aMaxX - gPfxGeom.aMinX) > 0.99'f32
+    let expectW = (if stretched: gPfxParentW else: gPfxGeom.rectW)
+    if expectW > 1.0'f32:
+      let d = g.rectW - expectW
+      if d > 1.0'f32 or d < -1.0'f32:
+        wrongWidth = wrongWidth + 1
+        result = false
+        if firstWide.len == 0:
+          firstWide = gPfxRowName[i] & " reads " & nuF(g.rectW) &
+                      " wide; expected " & nuF(expectW) &
+                      (if stretched: " (the donor row stretches to fill its " &
+                         "parent, so a correct row is the width of ITS parent)"
+                       else: " (the stock donor row's own width)")
+
 proc pfxVerdict() =
   ## THE 9b ACCEPTANCE TEST, read back off the LIVE objects.
   ##
@@ -443,6 +636,14 @@ proc pfxVerdict() =
   ##   * every row we own reads back `activeInHierarchy` -- a row that is on
   ##     the page but not in the hierarchy is invisible and unpressable, which
   ##     is exactly the "blank panel" the player reported;
+  ##   * NO row is wider than the container it sits in, and every row reports
+  ##     the SAME width as the stock donor to within 1px. This is the check for
+  ##     the reported layout defect and it is stated as the NEGATIVE on
+  ##     purpose: "no row's right edge extends past the panel" can be
+  ##     falsified by one clipped slider, whereas "we wrote the donor width"
+  ##     compares our own write against itself and cannot fail. The width is
+  ##     read from `get_rect`, NOT from `sizeDelta` -- for a stretched anchor
+  ##     sizeDelta is an inset and would read 0 for a correctly full-width row.
   ##   * every FLOAT row's inner `NumberSlider::CurrentValue()` @0x16B5850
   ##     reads back the value we asked for. That is a read of the LIVE widget
   ##     through a different method than the one that wrote it -- not a
@@ -464,8 +665,11 @@ proc pfxVerdict() =
   var good = 0
   var notActive = 0
   var wrongValue = 0
+  var wrongWidth = 0
+  var overflow = 0
   var incon = 0
   var firstBad = ""
+  var firstWide = ""
   var i = 0
   while i < gPfxRowGo.len and i < PfxMaxHandles:
     let go = gPfxRowGo[i]
@@ -474,6 +678,11 @@ proc pfxVerdict() =
     elif not nuActiveInHierarchy(go):
       notActive = notActive + 1
       if firstBad.len == 0: firstBad = gPfxRowName[i] & " (not in hierarchy)"
+    elif not pfxWidthOk(go, i, firstWide, wrongWidth, overflow):
+      # Counted inside `pfxWidthOk` so the two width failures stay distinct:
+      # "does not match the stock donor" and "runs off the end of the panel"
+      # have different causes and only the second is visible to the player.
+      discard
     elif gPfxRowSlider[i] != nil:
       let (rOk, v) = nuSliderValue(gPfxRowSlider[i])
       if not rOk:
@@ -497,22 +706,30 @@ proc pfxVerdict() =
          (if firstBad.len > 0: firstBad else: "none named") &
          ". The panel is still blank to the player even though the build " &
          "reported success -- that gap is why this reads the live objects."
-  elif notActive > 0 or wrongValue > 0:
+  elif notActive > 0 or wrongValue > 0 or wrongWidth > 0 or overflow > 0:
     warn "postfx rows VERDICT FAIL: " & $good & " of " & $gPfxRowGo.len &
-         " row(s) are good, but " & $notActive & " are not activeInHierarchy " &
-         "and " & $wrongValue & " read back a value that is not the one they " &
-         "were given. First: " & firstBad & ". A partially wrong page is " &
-         "still the reported bug."
+         " row(s) are good, but " & $notActive & " are not activeInHierarchy, " &
+         $wrongValue & " read back a value that is not the one they were " &
+         "given, " & $wrongWidth & " do not match the stock donor's width and " &
+         $overflow & " are WIDER THAN THE PANEL and therefore clipped. " &
+         "First value problem: " &
+         (if firstBad.len > 0: firstBad else: "none") &
+         ". First width problem: " &
+         (if firstWide.len > 0: firstWide else: "none") &
+         ". A partially wrong page is still the reported bug."
   elif incon > 0:
     warn "postfx rows VERDICT INCONCLUSIVE: " & $good & " row(s) read back " &
          "correctly, but " & $incon & " of " & $gPfxRowGo.len & " could not " &
          "be read at all, so the page was not fully observed. NOT a pass."
   else:
     okLog "postfx rows VERDICT PASS: " & $good & " of " & $gPfxRowGo.len &
-          " native prefab row(s) read back activeInHierarchy, and every float " &
-          "row's inner NumberSlider reports the value it was given when asked " &
-          "through CurrentValue() -- a different method than the one that " &
-          "wrote it. " & $gPfxDeclined.len & " setting(s) have NO row at all " &
+          " native prefab row(s) read back activeInHierarchy; NONE is wider " &
+          "than the " & nuF(gPfxParentW) & " row container (so nothing is " &
+          "clipped) and every one matches the geometry copied from the stock " &
+          "donor row -- " & nuGeomNote(gPfxGeom) & " -- read from get_rect " &
+          "off the live RectTransform; and every float row's inner NumberSlider " &
+          "reports the value it was given when asked through CurrentValue() " &
+          "-- a different method than the one that wrote it. " & $gPfxDeclined.len & " setting(s) have NO row at all " &
           "and that is deliberate, not a failure: their kind is a dropdown, " &
           "whose binds are generic and have no offline address."
 

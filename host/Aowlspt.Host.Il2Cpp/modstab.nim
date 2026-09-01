@@ -2786,6 +2786,53 @@ var gGfxBothActiveSaid = false
 var gGfxPanelT: Il2CppPtr = nil
 var gGfxPostT: Il2CppPtr = nil
 
+## THE STOCK-GEOMETRY BASELINE, and the defect it exists for.
+##
+## MEASURED LIVE on the deployed build (coordinator, 2026-09-01), walking
+## `$settings -> _currentTab@0x118 -> _settingsContainer@0x98` and up:
+##
+##     _settingsContainer -> "Content" -> "Viewport" -> "SettingsList"
+##     SettingsList: anchoredPosition=(0,-420.5) sizeDelta=(850,354.5)
+##                   anchorMin=(0,1) anchorMax=(0,1) pivot=(0,1)
+##
+## Top-left anchored with pivot (0,1), so the scroll viewport begins 420.5px
+## below the top of its parent and is only 354.5px tall: a large empty band,
+## then the 33 stock rows crushed into a short strip. Everything BELOW
+## SettingsList is healthy -- `_settingsContainer` is (0,0)/(0,1490) with
+## exactly the 33 stock rows and none of ours -- so the corruption is confined
+## to `SettingsList`'s own RectTransform.
+##
+## WHAT IT IS NOT. Grepped, not assumed: this host writes `set_anchoredPosition`
+## / `set_sizeDelta` in exactly four places -- `nuikit`, `natesp`,
+## `colorwidget` and `postfxrows` -- and every one of them writes an object WE
+## created. NOTHING here ever writes a stock RectTransform. So SettingsList was
+## not assigned these numbers; it was LAID OUT into them, by a LayoutGroup on
+## its parent, after we inserted our cloned subtab strip as a sibling. The
+## strip's preferred height is what pushed it down and shrank it -- 420.5 is
+## far more than two buttons need, which points at the strip clone inheriting
+## the donor's whole-checkbox-list sizing.
+##
+## WHY A "RESTORE THE ORIGINAL VALUES" FIX WOULD BE WRONG HERE: we never wrote
+## them, so writing them back would fight the layout group every frame and lose
+## on the next relayout. The correct fix is to stop our strip from CLAIMING the
+## space, and the correct CHECK is to notice when a stock sibling has moved and
+## get out of the way.
+##
+## So: capture every pre-existing sibling's geometry BEFORE the strip is
+## inserted, and re-read it a few frames later (a layout group rebuilds at end
+## of frame, so an inline re-read would compare against a layout that has not
+## happened yet and could only ever say "unchanged"). If anything stock moved,
+## say so with the numbers and HIDE our strips, which returns the panel to
+## stock -- the same discipline the POSTFX top-row button already uses.
+var gGfxStockT: seq[Il2CppPtr] = @[]
+var gGfxStockG: seq[NuGeom] = @[]
+var gGfxStockName: seq[string] = @[]
+var gGfxStockStripGo: seq[Il2CppPtr] = @[]
+var gGfxGeomSaid = false
+var gGfxGeomTicks = 0
+const GfxGeomSettle = 20
+const GfxMaxStockWatch = 16
+
 ## FORWARD DECLARATIONS into `postfxrows.nim`, which is `include`d AFTER this
 ## file because it needs `nuikit.nim`'s from-scratch constructors and nuikit is
 ## itself included after modstab. Same device `settingspages.nim` uses for
@@ -2888,6 +2935,21 @@ proc gfxBuildStrip(panelT, donorStripGo, donorButtonGo, donorButtonT: Il2CppPtr;
   let stackGo = iGameObjectOf(stackT)
   if stackGo == nil:
     return
+  # BASELINE FIRST, BEFORE ANYTHING OF OURS IS IN THE TREE. Capped at
+  # GfxMaxStockWatch (rule 4) and done once per strip, never per frame.
+  var bn = 0
+  if iChildCount(stackT, bn):
+    var bi = 0
+    while bi < bn and bi < GfxMaxStockWatch and
+          gGfxStockT.len < GfxMaxStockWatch * 2:
+      let bc = iChildAt(stackT, bi)
+      bi = bi + 1
+      if bc == nil or not duOk(bc, 0x20'i32): continue
+      let bg = nuReadGeom(bc)
+      if not bg.ok: continue
+      gGfxStockT.add bc
+      gGfxStockG.add bg
+      gGfxStockName.add (iObjName(panelT) & "/" & iObjName(bc))
   let strip = modsClone(donorStripGo)
   if strip == nil or not modsSetParent(strip, stackGo):
     warn "postfx subtab: the subtab strip could not be cloned into " &
@@ -2936,6 +2998,8 @@ proc gfxBuildStrip(panelT, donorStripGo, donorButtonGo, donorButtonT: Il2CppPtr;
     made = made + 1
     i = i + 1
   discard modsSetActive(strip, true)
+  if gGfxStockStripGo.len < 4:
+    gGfxStockStripGo.add strip
   if made != 2:
     warn "postfx subtab: only " & $made & " of 2 buttons came out usable in " &
          iObjName(panelT) & "; REFUSING to hide the stock POSTFX tab, because " &
@@ -2974,12 +3038,49 @@ proc gfxBuildStrip(panelT, donorStripGo, donorButtonGo, donorButtonT: Il2CppPtr;
     let minH = cReadF32At(duPtrAdd(stripLe, ModsOffLeMinHeight))
     let prefH = cReadF32At(duPtrAdd(stripLe, ModsOffLePreferredHeight))
     let flexH = cReadF32At(duPtrAdd(stripLe, ModsOffLeFlexibleHeight))
-    if minH >= 0.0:
-      discard cDuWriteF32(stripLe, ModsOffLeMinHeight, -1.0)
-      reset = reset + 1
-    if prefH >= 0.0:
-      discard cDuWriteF32(stripLe, ModsOffLePreferredHeight, -1.0)
-      reset = reset + 1
+    # AN EXPLICIT HEIGHT, NOT UNITY'S "UNSET" SENTINEL -- and this is a
+    # CORRECTION to what this block used to do.
+    #
+    # It used to write -1 (unset) to min and preferred, which does not mean
+    # "small": it means "stop overriding, ask the strip itself". The strip is a
+    # clone of `Control Settings/Toggles`, whose own layout group is authored
+    # to stack that panel's ENTIRE checkbox list, so asking it yields a very
+    # tall answer -- and the parent group then pushed the stock scroll view
+    # down and shrank it to fit, which is the measured
+    # SettingsList=(0,-420.5)/(850,354.5) defect above.
+    #
+    # The replacement height is MEASURED FROM THE DONOR BUTTON, never
+    # hardcoded: this user runs 3840x2160 at 1.5x Windows scaling and the
+    # canvas is 1920x1080 UI units, so any pixel constant measured on one
+    # machine is wrong on the next. Two buttons plus a little breathing room,
+    # derived from the button we are actually cloning.
+    let dbGeom = nuReadGeom(donorButtonT)
+    let wantH = (if dbGeom.ok and dbGeom.rectH > 4.0'f32 and
+                    dbGeom.rectH < 200.0'f32: dbGeom.rectH * 1.4'f32
+                 else: 0.0'f32)
+    if wantH > 0.0'f32:
+      if minH < 0.0 or minH > wantH + 1.0:
+        discard cDuWriteF32(stripLe, ModsOffLeMinHeight, wantH)
+        reset = reset + 1
+      if prefH < 0.0 or prefH > wantH + 1.0:
+        discard cDuWriteF32(stripLe, ModsOffLePreferredHeight, wantH)
+        reset = reset + 1
+    else:
+      # The donor could not be measured, so there is no honest number to put
+      # here. Fall back to the old sentinel and SAY that it is the fallback --
+      # it is the behaviour that produced the defect, and a silent fallback to
+      # a known-bad path is worse than a loud one.
+      warn "postfx subtab: the donor button's height could not be measured, " &
+           "so the strip's LayoutElement is being reset to Unity's UNSET " &
+           "sentinel instead of an explicit height. That is the configuration " &
+           "that pushed the stock scroll view down; the stock-geometry check " &
+           "below will catch it if it recurs."
+      if minH >= 0.0:
+        discard cDuWriteF32(stripLe, ModsOffLeMinHeight, -1.0)
+        reset = reset + 1
+      if prefH >= 0.0:
+        discard cDuWriteF32(stripLe, ModsOffLePreferredHeight, -1.0)
+        reset = reset + 1
     if flexH > 0.0:
       discard cDuWriteF32(stripLe, ModsOffLeFlexibleHeight, 0.0)
       reset = reset + 1
@@ -2987,8 +3088,10 @@ proc gfxBuildStrip(panelT, donorStripGo, donorButtonGo, donorButtonT: Il2CppPtr;
       okLog "postfx subtab: " & iObjName(panelT) & "'s strip inherited a " &
             "LayoutElement sized for the donor's full checkbox list (min=" &
             $minH & " preferred=" & $prefH & " flexible=" & $flexH &
-            "); reset " & $reset & " field(s) to Unity's unset sentinel so " &
-            "the panel's layout group sizes it to its own two buttons."
+            "); rewrote " & $reset & " field(s) to an explicit height of " &
+            nuF(wantH) & " measured off the donor button, so the panel's " &
+            "layout group cannot give the strip the donor's whole-list " &
+            "height and push the stock scroll view down."
   # THE GROUP QUESTION, MEASURED PER STRIP (the two buttons made just above),
   # exactly the check `modsBuildSubtabs` uses -- same donor, same question.
   # MEASURED (fact #117): both buttons came out with m_Group=0 -- unlike the
@@ -3336,6 +3439,87 @@ proc gfxBuild(): bool =
 var gGfxVerdictSaid = false
 var gGfxArmSaid = false
 
+proc gfxStockGeomVerdict() =
+  ## DID WE DISPLACE ANYTHING OF THE GAME'S? Read off the live objects, once
+  ## per settings-screen open, and it can fail.
+  ##
+  ## THE ASSERTION IS A NEGATIVE, deliberately: "no stock sibling of our strip
+  ## has moved or resized since before we inserted it". A negative can be
+  ## falsified by one displaced object; the positive form ("our strip is the
+  ## right height") compares our own write against itself and is exactly the
+  ## check that let SettingsList=(0,-420.5)/(850,354.5) ship.
+  ##
+  ## WHY IT RUNS ON A LATER TICK AND NOT INLINE. A Unity LayoutGroup rebuilds
+  ## at the END of the frame. Re-reading a sibling immediately after parenting
+  ## compares against a layout that has not run yet, so it could only ever
+  ## report "unchanged" -- a check that cannot fail. `GfxGeomSettle` frames of
+  ## a genuinely-up panel are required first.
+  ##
+  ## AND IT REPAIRS: if anything stock moved, our strips are HIDDEN (never
+  ## destroyed), which removes them from the layout group and lets it put the
+  ## stock scroll view back where it was on the next rebuild. That is the same
+  ## discipline the stock POSTFX tab button already uses.
+  if gGfxGeomSaid: return
+  if gGfxStockT.len == 0:
+    gGfxGeomSaid = true
+    warn "postfx subtab STOCK-GEOMETRY INCONCLUSIVE: no pre-insertion " &
+         "baseline was captured, so whether our strip displaced anything of " &
+         "the game's was never observed. This is NOT a pass."
+    return
+  var moved = 0
+  var unread = 0
+  var first = ""
+  var i = 0
+  while i < gGfxStockT.len and i < GfxMaxStockWatch * 2:
+    let t = gGfxStockT[i]
+    if t == nil or not duOk(t, 0x20'i32) or not iUnityAlive(t):
+      unread = unread + 1
+    else:
+      let now = nuReadGeom(t)
+      if not now.ok:
+        unread = unread + 1
+      elif nuGeomMoved(gGfxStockG[i], now, 1.0'f32):
+        moved = moved + 1
+        if first.len == 0:
+          first = gGfxStockName[i] & ": was " & nuGeomNote(gGfxStockG[i]) &
+                  " -- now " & nuGeomNote(now)
+    i = i + 1
+  gGfxGeomSaid = true
+  if moved > 0:
+    warn "postfx subtab STOCK-GEOMETRY FAIL: " & $moved & " of " &
+         $gGfxStockT.len & " stock object(s) MOVED OR RESIZED after our " &
+         "subtab strip was inserted. We never write a stock RectTransform, so " &
+         "this is the panel's own LayoutGroup giving our strip space and " &
+         "taking it from the game's scroll view -- the measured " &
+         "SettingsList=(0,-420.5)/(850,354.5) defect. First: " & first &
+         ". HIDING our strips so the layout group puts the stock view back on " &
+         "its next rebuild; the screen returns to stock and the stock POSTFX " &
+         "tab is restored by the fault path."
+    var h = 0
+    var hidden = 0
+    while h < gGfxStockStripGo.len and h < 4:
+      if gGfxStockStripGo[h] != nil and modsSetActive(gGfxStockStripGo[h], false):
+        hidden = hidden + 1
+      h = h + 1
+    warn "postfx subtab: " & $hidden & " strip(s) hidden. Nothing was " &
+         "destroyed and nothing stock was written, so the panel is exactly " &
+         "as the game built it."
+    gfxNoteFault("our subtab strip displaced the stock layout (see the " &
+                 "STOCK-GEOMETRY FAIL line above for the before/after numbers)")
+  elif unread > 0 and moved == 0:
+    warn "postfx subtab STOCK-GEOMETRY INCONCLUSIVE: nothing was seen to " &
+         "move, but " & $unread & " of " & $gGfxStockT.len & " baseline " &
+         "object(s) could not be re-read, so the panel was not fully " &
+         "observed. NOT a pass."
+  else:
+    okLog "postfx subtab STOCK-GEOMETRY PASS: all " & $gGfxStockT.len &
+          " stock object(s) beside our strip report the same " &
+          "anchoredPosition and the same rect they had BEFORE the strip was " &
+          "inserted, to within 1px, read back off the live RectTransforms " &
+          $GfxGeomSettle & "+ frames after insertion. Our strip claimed no " &
+          "space from the game's scroll view."
+
+
 proc gfxVerdict() =
   ## Read-only. No writes, no calls into game state-changing code -- only the
   ## `activeInHierarchy` / `activeSelf` getters the rest of this file already
@@ -3454,6 +3638,13 @@ proc gfxTickBody() =
     gGfxTickDiagSaid = false          # settings screen closed; re-arm for next open
     gGfxVerdictSaid = false
     gGfxUpTicks = 0
+    # The stock-geometry verdict re-arms too, but the BASELINE does not: it was
+    # captured before our strip ever existed and is the only record of what the
+    # panel looked like untouched. Re-capturing it now would capture the
+    # DISPLACED layout as "normal", which is how a check stops being able to
+    # fail.
+    gGfxGeomSaid = false
+    gGfxGeomTicks = 0
     pfxOnScreenClosed()
   if gGfxPanelGo == nil or gGfxPostGo == nil:
     return
@@ -3533,6 +3724,14 @@ proc gfxTickBody() =
     gGfxUpTicks = gGfxUpTicks + 1
   else:
     gfxVerdict()
+  # THE STOCK-GEOMETRY CHECK, on its own settle count. Separate from
+  # `gGfxUpTicks` on purpose: that one is reset every time the feature moves
+  # something, which for a check about the GAME's objects would mean it could
+  # be starved forever by our own activity.
+  if gGfxGeomTicks < GfxGeomSettle:
+    gGfxGeomTicks = gGfxGeomTicks + 1
+  else:
+    gfxStockGeomVerdict()
 
 proc gfxTick() =
   ## Every frame while armed: the steady state is two `activeSelf` reads and a

@@ -450,6 +450,37 @@ typedef struct AowlNuTarget {
  * NOT live-verified -- the client is unbootable this pass. */
 #define AOWL_NU_ANIMTOGGLE_SETTOGGLED  44
 #define AOWL_NU_SPAWNTOG_SETTOGGLED    45
+/* --- THE ROW-GEOMETRY READ (indices 46..48) -------------------------------
+ *
+ * WHY THESE EXIST, measured live 2026-09-01 and not inferred: the prefab rows
+ * SHIP, RENDER and are real native controls -- and they do not agree with each
+ * other on width. The two SettingToggle rows sat near the horizontal centre
+ * while every SettingFloatSlider row put its label far left and pushed its
+ * control column off the RIGHT EDGE of the panel, clipped. Nothing was setting
+ * the fresh row's geometry at all, so each kind kept whatever its own prefab
+ * shipped with, and those two prefabs disagree.
+ *
+ * The fix is to COPY a stock row's geometry rather than invent one, which
+ * needs the three GETTERS this table was missing. It already carried
+ * `get_anchoredPosition_Injected`, `get_sizeDelta_Injected` and
+ * `get_rect_Injected`, and all five SETTERS -- but no way to READ anchorMin,
+ * anchorMax or pivot, so "copy the donor" was not expressible.
+ *
+ * A HARDCODED WIDTH WOULD BE WRONG HERE FOR A SPECIFIC REASON: this user runs
+ * Windows at 1.5x display scaling, so any pixel constant measured on one
+ * machine is a different fraction of the panel on the next. A donor row read
+ * live is resolution-independent by construction.
+ *
+ * PROVENANCE, all three, measured against THIS build:
+ *   python tools/il2cpp_resolve.py <asm> <metadec> typemethods
+ *          UnityEngine.RectTransform    -> the RVAs below, sharedness=UNIQUE
+ *   ... bytes <RVA> 16                  -> the 16 bytes below
+ * None is the 0x628110 `C2 00 00` universal stub. Shape is identical to the
+ * getters already here: (this, Vector2* ret, MethodInfo*), so `aowl_nu_call_v_pp`
+ * and `nuGetV2` serve them unchanged. */
+#define AOWL_NU_RT_GET_ANCHORMIN      46
+#define AOWL_NU_RT_GET_ANCHORMAX      47
+#define AOWL_NU_RT_GET_PIVOT          48
 
 /* UnityEngine.RenderMode. Named, because `0` appearing bare in a refusal is
  * indistinguishable from "we did not read anything". */
@@ -658,6 +689,16 @@ static const AowlNuTarget aowl_nu_targets[] = {
     { "EFT.UI.UISpawnableToggle::set_IsToggled", 0x1435A50u,
       { 0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20,0x48,0x8B,0x99,
         0xD0,0x00,0x00 }, 16 },
+    /* --- the row-geometry read. See AOWL_NU_RT_GET_ANCHORMIN. --- */
+    { "UnityEngine.RectTransform::get_anchorMin_Injected", 0x52B6D20u,
+      { 0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,
+        0x07,0xDE,0xE1 }, 16 },
+    { "UnityEngine.RectTransform::get_anchorMax_Injected", 0x52B6DE0u,
+      { 0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,
+        0x57,0xDD,0xE1 }, 16 },
+    { "UnityEngine.RectTransform::get_pivot_Injected", 0x52B7020u,
+      { 0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,
+        0x47,0xDB,0xE1 }, 16 },
 };
 
 #define AOWL_NU_TARGET_COUNT \

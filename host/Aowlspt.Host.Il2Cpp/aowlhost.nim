@@ -1567,6 +1567,17 @@ var gModsReleased = false
 var gModLoadPolledAt = 0'u64
 var gModLoadReadyAt = 0'u64
 var gModLoadDonor: Il2CppPtr = nil
+var gModLoadCanvasTr: Il2CppPtr = nil
+  ## The canvas transform the loading step built under, kept so the teardown
+  ## check has a root to sweep from AFTER every handle is gone.
+var gModLoadStyled = false
+  ## Did we match the game's own loading caption and lay out in its frame? The
+  ## match is RETRIED on later frames because that caption is transient, so
+  ## this can go true long after the text was built.
+var gModLoadFailed = false
+  ## The build reported FAILED. Changes the linger, not whether we dismiss.
+var gModLoadTries = 0
+  ## Polls spent without reaching a finished state; the self-disable counter.
 var gErrDlgRow: array[3, int] = [-1, -1, -1]
   ## kind-20/21/22 slot  ->  the TARGET-TABLE ROW it actually bound, recorded at
   ## bind time by `bindErrDlg`. The dispatcher looks the row up here instead of

@@ -225,6 +225,12 @@ const
   NuTNumSliderCurVal  = 43'i32  ## EFT.UI.NumberSlider::CurrentValue
   NuTAnimTogSetToggled= 44'i32  ## EFT.UI.AnimatedToggle::set_IsToggled
   NuTSpawnTogSetToggled=45'i32  ## EFT.UI.UISpawnableToggle::set_IsToggled
+  # The three geometry GETTERS this table was missing. Same
+  # (this, Vector2* ret, MethodInfo*) shape as the two it already had, so
+  # `nuGetV2` serves them unchanged. Added for `nuCopyGeometry`.
+  NuTRtGetAnchorMin  = 46'i32  ## UnityEngine.RectTransform::get_anchorMin_Injected
+  NuTRtGetAnchorMax  = 47'i32  ## UnityEngine.RectTransform::get_anchorMax_Injected
+  NuTRtGetPivot      = 48'i32  ## UnityEngine.RectTransform::get_pivot_Injected
 
 # ---- field offsets on the settings-row prefabs --------------------------
 #
@@ -781,6 +787,107 @@ proc nuLayout(rt: Il2CppPtr;
            nuSetV2(rt, NuTRtSetSizeDelta, width, height) and
            nuSetV2(rt, NuTRtSetAnchoredPos, posX, posY)
 
+type
+  NuGeom* = object
+    ## One RectTransform's layout, read off a LIVE object. `ok` is false when
+    ## any single getter refused -- a partially-read geometry is worse than
+    ## none, because it looks like a measurement.
+    ok*: bool
+    aMinX*, aMinY*, aMaxX*, aMaxY*: float32
+    pivX*, pivY*: float32
+    sdX*, sdY*: float32
+    ## anchoredPosition. Carried because the DISPLACEMENT check needs it: a
+    ## LayoutGroup that pushes a sibling down moves this, not sizeDelta.
+    posX*, posY*: float32
+    ## The RESOLVED width/height from `get_rect`, which is NOT `sizeDelta`:
+    ## for a stretched anchor sizeDelta is an INSET, and a row that stretches
+    ## edge-to-edge legitimately reports sizeDelta.x = 0 while rect.width is
+    ## the panel width. Both are carried because the copy needs sizeDelta and
+    ## the CHECK needs rect.
+    rectW*, rectH*: float32
+
+proc nuNoGeom*(): NuGeom =
+  ## The "nothing was measured" value. Exists so a caller never has to declare
+  ## an uninitialised NuGeom: `ok = false` is the only honest starting state,
+  ## and a zeroed geometry that read as ok would be a fabricated rectangle.
+  NuGeom(ok: false, aMinX: 0'f32, aMinY: 0'f32, aMaxX: 0'f32, aMaxY: 0'f32,
+         pivX: 0'f32, pivY: 0'f32, sdX: 0'f32, sdY: 0'f32,
+         posX: 0'f32, posY: 0'f32, rectW: 0'f32, rectH: 0'f32)
+
+proc nuReadGeom*(rt: Il2CppPtr): NuGeom =
+  ## Read a RectTransform's whole layout. Every getter is byte-verified through
+  ## `nuFn`; a refusal anywhere makes the whole result `ok = false`.
+  result = nuNoGeom()
+  if not gNuOn or not nuOk(rt, 0x10'i32): return
+  let (o1, a1, b1) = nuGetV2(rt, NuTRtGetAnchorMin)
+  if not o1: return
+  let (o2, a2, b2) = nuGetV2(rt, NuTRtGetAnchorMax)
+  if not o2: return
+  let (o3, a3, b3) = nuGetV2(rt, NuTRtGetPivot)
+  if not o3: return
+  let (o4, a4, b4) = nuGetV2(rt, NuTRtGetSizeDelta)
+  if not o4: return
+  let (o6, a6, b6) = nuGetV2(rt, NuTRtGetAnchoredPos)
+  if not o6: return
+  let (o5, _, _, rw, rh) = nuGetRect(rt)
+  if not o5: return
+  # NaN-safe bounds. A getter that did not write leaves whatever was in the
+  # buffer, and "a plausible number" is the failure mode this whole layer
+  # exists to refuse.
+  if not (rw > -1.0e6'f32) or not (rw < 1.0e6'f32): return
+  if not (rh > -1.0e6'f32) or not (rh < 1.0e6'f32): return
+  result = NuGeom(ok: true, aMinX: a1, aMinY: b1, aMaxX: a2, aMaxY: b2,
+                  pivX: a3, pivY: b3, sdX: a4, sdY: b4, posX: a6, posY: b6,
+                  rectW: rw, rectH: rh)
+
+proc nuGeomMoved*(a, b: NuGeom; tol: float32): bool =
+  ## Did this RectTransform MOVE or RESIZE between two readings? Both must be
+  ## readable: an unreadable second reading is not evidence of "no change", so
+  ## it answers TRUE (something is wrong and should be reported) rather than
+  ## quietly passing.
+  if not a.ok or not b.ok: return true
+  let dx = a.posX - b.posX
+  let dy = a.posY - b.posY
+  let dw = a.rectW - b.rectW
+  let dh = a.rectH - b.rectH
+  dx > tol or dx < -tol or dy > tol or dy < -tol or
+    dw > tol or dw < -tol or dh > tol or dh < -tol
+
+proc nuGeomNote*(g: NuGeom): string =
+  ## One line, for a log that has to be readable a week later.
+  if not g.ok: return "UNREADABLE"
+  "anchorMin=(" & nuF(g.aMinX) & "," & nuF(g.aMinY) & ") anchorMax=(" &
+    nuF(g.aMaxX) & "," & nuF(g.aMaxY) & ") pivot=(" & nuF(g.pivX) & "," &
+    nuF(g.pivY) & ") sizeDelta=(" & nuF(g.sdX) & "," & nuF(g.sdY) &
+    ") anchoredPosition=(" & nuF(g.posX) & "," & nuF(g.posY) &
+    ") rect=" & nuF(g.rectW) & "x" & nuF(g.rectH)
+
+proc nuApplyGeomX*(rt: Il2CppPtr; g: NuGeom): bool =
+  ## Copy a donor's HORIZONTAL geometry onto another RectTransform: anchorMin.x,
+  ## anchorMax.x, pivot.x and sizeDelta.x.
+  ##
+  ## HORIZONTAL ONLY, and that is the whole design decision. The row parent is
+  ## driven by the game's own vertical LayoutGroup, which owns each child's Y
+  ## and height; writing those would fight it every relayout and lose. Width and
+  ## horizontal anchoring are what the group does NOT drive and what the two
+  ## prefab kinds disagreed about, so they are exactly what is copied.
+  ##
+  ## The Y components are read back off the TARGET first and written back
+  ## unchanged, because `set_anchorMin` takes a whole Vector2 -- there is no
+  ## per-component setter, so preserving Y means reading it, not assuming it.
+  result = false
+  if not gNuOn or not g.ok: return
+  if not nuOk(rt, 0x10'i32): return
+  let (oMin, _, curMinY) = nuGetV2(rt, NuTRtGetAnchorMin)
+  let (oMax, _, curMaxY) = nuGetV2(rt, NuTRtGetAnchorMax)
+  let (oPiv, _, curPivY) = nuGetV2(rt, NuTRtGetPivot)
+  let (oSd,  _, curSdY)  = nuGetV2(rt, NuTRtGetSizeDelta)
+  if not oMin or not oMax or not oPiv or not oSd: return
+  result = nuSetV2(rt, NuTRtSetAnchorMin, g.aMinX, curMinY) and
+           nuSetV2(rt, NuTRtSetAnchorMax, g.aMaxX, curMaxY) and
+           nuSetV2(rt, NuTRtSetPivot, g.pivX, curPivY) and
+           nuSetV2(rt, NuTRtSetSizeDelta, g.sdX, curSdY)
+
 # ---------------------------------------------------------------------------
 # TEXT
 # ---------------------------------------------------------------------------
@@ -987,6 +1094,14 @@ proc nuTargetsBindOk(): bool =
   want.add "EFT.UI.NumberSlider::CurrentValue"
   idx.add NuTAnimTogSetToggled
   want.add "EFT.UI.AnimatedToggle::set_IsToggled"
+  # The geometry getters sit immediately after a block of same-shaped setters
+  # and take an identical frame. A mis-index between get_anchorMin and
+  # set_anchorMin would WRITE the donor's anchors from an uninitialised buffer
+  # while every call succeeded -- the exact silent class.
+  idx.add NuTRtGetAnchorMin
+  want.add "UnityEngine.RectTransform::get_anchorMin_Injected"
+  idx.add NuTRtGetPivot
+  want.add "UnityEngine.RectTransform::get_pivot_Injected"
   var i = 0
   while i < idx.len:                      # capped: idx is built right here
     let ix = idx[i]

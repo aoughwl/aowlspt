@@ -5547,3 +5547,39 @@ risks a partial artifact too), then `deploy.py check` every artifact's markers
 and rebuild anything that does not verify. A build slot needs a MECHANISM, not
 a paragraph -- a lockfile around the compiler invocation would make this
 impossible rather than merely forbidden.
+
+## The graphics rows did not start halfway down because anything WROTE that
+
+MEASURED 2026-09-01, then CORRECTED. Live reads showed the stock `SettingsList`
+at `anchoredPosition = (0, -420.5)`, `sizeDelta = (850, 354.5)`, top-left
+anchored, pivot (0,1) -- a 420px gap above and the rows crushed into a 354px
+strip. My inference was that our code had written those values, and the fix I
+proposed was "capture the originals before the first write and restore them".
+
+That was WRONG, and the correction matters more than the symptom. Every
+`set_anchoredPosition` / `set_sizeDelta` call site in the host was enumerated:
+they live in `nuikit`, `natesp`, `colorwidget` and `postfxrows`, and every one
+writes an object WE created. **Nothing in the host ever writes a stock
+RectTransform.** `SettingsList` was not assigned those numbers -- it was LAID
+OUT into them by its parent's LayoutGroup once our cloned strip became a
+sibling. "Capture and restore" would therefore have fought the layout group and
+lost on the next rebuild.
+
+Mechanism (inferred, with a backstop): `gfxBuildStrip` reset the strip clone's
+`LayoutElement` min/preferredHeight to **-1**, which is Unity's UNSET SENTINEL
+-- it means "stop overriding, ask the element" -- and the strip is a clone of
+`Control Settings/Toggles`, authored to stack that panel's ENTIRE checkbox
+list. So it asked for a list-sized height and the group gave it one.
+
+The lesson generalises: in a LayoutGroup, a value you never wrote can still be
+YOURS. Reading a bad number off a stock object is not evidence that you assigned
+it, and a fix aimed at the write path will do nothing when the cause is a
+sibling's preferred size.
+
+Because the mechanism is inferred, the fix ships with a falsifiable backstop: a
+pre-insertion baseline of every stock sibling, re-read `GfxGeomSettle` frames
+LATER (not inline -- a LayoutGroup rebuilds at end of frame, so an inline
+re-read could only ever report "unchanged", which is a check that cannot fail).
+If any stock sibling moved >1px it logs before/after and HIDES our strips,
+returning the panel to stock. The baseline is deliberately NOT re-captured on
+screen close, or it would learn the displaced layout as normal.
