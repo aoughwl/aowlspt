@@ -112,6 +112,12 @@ proc cNuV3OutPtr(): Il2CppPtr {.importc: "aowl_nu_v3out_ptr", nodecl.}
 proc cNuV3OutX(): float32 {.importc: "aowl_nu_v3out_x", nodecl.}
 proc cNuV3OutY(): float32 {.importc: "aowl_nu_v3out_y", nodecl.}
 proc cNuV3OutZ(): float32 {.importc: "aowl_nu_v3out_z", nodecl.}
+proc cNuCallPS3PPB(fn, a0, a1: Il2CppPtr; a2: int32): Il2CppPtr {.
+  importc: "aowl_nu_call_p_s3ppb", nodecl.}
+proc cNuCallVPFFP(fn, self: Il2CppPtr; a0, a1: float32; a2: Il2CppPtr) {.
+  importc: "aowl_nu_call_v_pffp", nodecl.}
+proc cNuCallFP(fn, self: Il2CppPtr; defVal: float32): float32 {.
+  importc: "aowl_nu_call_f_p", nodecl.}
 proc cNuCallBSi(fn: Il2CppPtr; a0: int32): int32 {.
   importc: "aowl_nu_call_b_si", nodecl.}
 proc cNuTargetName(i: int32): cstring {.importc: "aowl_nu_target_name", nodecl.}
@@ -206,6 +212,39 @@ const
   NuTInputMousePos   = 33'i32  ## UnityEngine.Input::get_mousePosition_Injected
   NuTTrGetPosition   = 34'i32  ## UnityEngine.Transform::get_position_Injected
   NuTTrGetLossyScale = 35'i32  ## UnityEngine.Transform::get_lossyScale_Injected
+  # --- the settings-row PREFAB path. Provenance, sharedness and the two
+  # cross-checked prologues are on the rows themselves in
+  # `abi/aowlspt_nativeui.h`; do not restate a number here, restate the index.
+  NuTSetCtrlSetText   = 36'i32  ## EFT.UI.Settings.SettingControl::SetText
+  NuTSetCtrlSetName   = 37'i32  ## EFT.UI.Settings.SettingControl::SetName
+  NuTSetCtrlSetSibIdx = 38'i32  ## EFT.UI.Settings.SettingControl::SetSiblingIndex
+  NuTSetCtrlSetChange = 39'i32  ## EFT.UI.Settings.SettingControl::SetChangeAction
+  NuTObjInstantiate3  = 40'i32  ## UnityEngine.Object::Instantiate(Object,Transform,bool)
+  NuTNumSliderShow    = 41'i32  ## EFT.UI.NumberSlider::Show
+  NuTNumSliderSetCur  = 42'i32  ## EFT.UI.NumberSlider::SetCurrentValue
+  NuTNumSliderCurVal  = 43'i32  ## EFT.UI.NumberSlider::CurrentValue
+  NuTAnimTogSetToggled= 44'i32  ## EFT.UI.AnimatedToggle::set_IsToggled
+  NuTSpawnTogSetToggled=45'i32  ## EFT.UI.UISpawnableToggle::set_IsToggled
+
+# ---- field offsets on the settings-row prefabs --------------------------
+#
+# MEASURED offline from Il2CppMetadataRegistration.fieldOffsets
+# (`tools/il2cpp_resolve.py ... fields <Type>`, System.String self-check
+# passed), 2026-09-01, and written up in `docs/NATIVE-CONTROLS.md`.
+#
+# `NuOffSettingCtrlText` is CROSS-CONFIRMED by disassembly and not only by the
+# field table: `SettingControl::SetText` @0x16FA890 opens
+# `mov rbx,rcx ; mov rcx,[rcx+0x80]`, which is this exact field. Two
+# independent sources agreeing is the only reason an offset is trusted here.
+#
+# Every one of these is NULL-CAPABLE -- they are serialized Unity references
+# populated when the prefab loads, so a read before the owning tab's Awake
+# gets null. Nothing below may be dereferenced without a readability check.
+const
+  NuOffSettingCtrlText   = 0x80'i32  ## SettingControl.Text : LocalizedText
+  NuOffSettingToggleTog  = 0xa8'i32  ## SettingToggle.Toggle : UpdatableToggle
+  NuOffFloatSliderSlider = 0xa8'i32  ## SettingFloatSlider.Slider : NumberSlider
+  NuOffSettingsTabMade   = 0x88'i32  ## SettingsTab._createdControls : List<SettingControl>
 
 const
   NuRenderModeOverlay = 0'i32  ## ScreenSpaceOverlay -- the only one we accept
@@ -927,6 +966,27 @@ proc nuTargetsBindOk(): bool =
   want.add "UnityEngine.Transform::get_position_Injected"
   idx.add NuTTrGetLossyScale
   want.add "UnityEngine.Transform::get_lossyScale_Injected"
+  # The prefab-path rows. `SetText` and `SetName` are adjacent, take the same
+  # (this, String*, MethodInfo*) frame and BOTH return `this` -- so a
+  # mis-index between them writes a caption into the GameObject name and every
+  # call still succeeds. That is exactly the silent kind, so both are named.
+  idx.add NuTSetCtrlSetText
+  want.add "EFT.UI.Settings.SettingControl::SetText"
+  idx.add NuTSetCtrlSetName
+  want.add "EFT.UI.Settings.SettingControl::SetName"
+  # The three-arg static. Reached through a thunk no other row uses, so a
+  # mis-index here calls a one-arg instance method with a 3-arg static frame.
+  idx.add NuTObjInstantiate3
+  want.add "UnityEngine.Object::Instantiate(Object,Transform,bool)"
+  # SetCurrentValue and CurrentValue are adjacent, differ only in direction,
+  # and both are float-shaped -- a swap silently writes the slider instead of
+  # reading it, which would make the finished-state readback self-fulfilling.
+  idx.add NuTNumSliderSetCur
+  want.add "EFT.UI.NumberSlider::SetCurrentValue"
+  idx.add NuTNumSliderCurVal
+  want.add "EFT.UI.NumberSlider::CurrentValue"
+  idx.add NuTAnimTogSetToggled
+  want.add "EFT.UI.AnimatedToggle::set_IsToggled"
   var i = 0
   while i < idx.len:                      # capped: idx is built right here
     let ix = idx[i]
@@ -947,6 +1007,169 @@ proc nuTargetsBindOk(): bool =
     warn "nativeui: the aowl_nu_targets POSITIONAL binding self-check FAILED " &
          "-- " & bad & ". Every NuT* call would be to the wrong method with " &
          "the wrong frame. Nothing that indexes this table may run."
+
+# ---------------------------------------------------------------------------
+# THE SETTINGS-ROW PREFAB PATH
+#
+# Everything here is a CALL at a byte-verified, sharedness-UNIQUE RVA. Nothing
+# here detours anything, and nothing here opens a guard: every one of these is
+# reached from inside `modsBody`'s single `aowl_p_p_seh`, which is NOT
+# re-entrant.
+#
+# WHAT THIS REPLACES. Rows used to be CLONED from a live donor row and
+# relabelled, which is what produced the whole family of relabel defects (a
+# clone inherits the donor's serialized wiring -- its ToggleGroup, its
+# LayoutElement sizing, its already-spawned children -- and every one of those
+# had to be found and undone by hand). A prefab instance inherits the PREFAB's
+# wiring, which is what the game's own rows inherit. That is the entire point.
+# ---------------------------------------------------------------------------
+
+proc nuInstantiateUnder*(prefab, parent: Il2CppPtr): Il2CppPtr =
+  ## `Object.Instantiate(prefab, parent, worldPositionStays: false)`.
+  ##
+  ## `worldPositionStays = false` is not a preference: it is what the game
+  ## itself passes from `CreateControl<T>`, and it is what makes the fresh row
+  ## adopt the parent's layout instead of keeping the prefab's world pose.
+  ##
+  ## Refuses on a null OR unreadable prefab and on a null OR unreadable
+  ## parent, separately and out loud, because "the template field was null"
+  ## and "the row container was null" are different bugs with different fixes
+  ## and an Instantiate with no parent SUCCEEDS while rendering nowhere.
+  result = nil
+  if not gNuOn: return
+  if not nuOk(prefab, 0x10'i32):
+    warn "nativeui: prefab-row REFUSED -- the tab's serialized template field " &
+         "read null or unreadable. That field is populated when the prefab " &
+         "loads, so this is 'asked too early', not 'wrong offset'. Nothing " &
+         "was instantiated."
+    return
+  if not nuOk(parent, 0x10'i32):
+    warn "nativeui: prefab-row REFUSED -- the row container (the tab's " &
+         "_settingsRoot / _settingsContainer) read null or unreadable. An " &
+         "Instantiate with no parent lands the row at the scene root, where " &
+         "it renders nothing and reports success. Nothing was instantiated."
+    return
+  let fn = nuFn(NuTObjInstantiate3)
+  if fn == nil: return
+  result = cNuCallPS3PPB(fn, prefab, parent, 0'i32)
+  if not nuOk(result, 0x10'i32):
+    warn "nativeui: prefab-row REFUSED -- Instantiate(Object,Transform,bool) " &
+         "returned null or an unreadable pointer. Nothing is on screen and " &
+         "nothing is owned."
+    result = nil
+
+proc nuRowSetText*(row: Il2CppPtr; s: string): bool =
+  ## `SettingControl.SetText(localizationKey)`. The game passes a LOCALIZATION
+  ## KEY, not a caption: the row's `LocalizedText` looks it up. A key with no
+  ## entry renders as the key itself, which is ugly but HONEST and is exactly
+  ## why a literal caption is passed here -- an aowlspt setting has no BSG
+  ## locale entry and never will, so there is nothing to look up.
+  ##
+  ## This is the reason raw `m_text` stores are not used: `LocalizedText`
+  ## clobbers them. Calling the game's own setter is the documented path.
+  result = false
+  if not gNuOn or not nuOk(row, 0x10'i32): return
+  let fn = nuFn(NuTSetCtrlSetText)
+  if fn == nil: return
+  let sp = nuStr(s)
+  if sp == nil: return
+  discard cNuCallPPP(fn, row, sp)
+  result = true
+
+proc nuRowSetName*(row: Il2CppPtr; s: string): bool =
+  ## `SettingControl.SetName(newName)` -- the GameObject name, which is what
+  ## the live inspector's `find` searches on. Distinct from SetText, and the
+  ## positional self-check names both because they are adjacent rows with an
+  ## identical frame.
+  result = false
+  if not gNuOn or not nuOk(row, 0x10'i32): return
+  let fn = nuFn(NuTSetCtrlSetName)
+  if fn == nil: return
+  let sp = nuStr(s)
+  if sp == nil: return
+  discard cNuCallPPP(fn, row, sp)
+  result = true
+
+proc nuRowSetSiblingIndex*(row: Il2CppPtr; idx: int32): bool =
+  ## `SettingControl.SetSiblingIndex(index)`. Order inside the row container is
+  ## the container's LayoutGroup's business; this is how the game orders its
+  ## own rows and therefore the only ordering that survives a relayout.
+  result = false
+  if not gNuOn or not nuOk(row, 0x10'i32): return
+  let fn = nuFn(NuTSetCtrlSetSibIdx)
+  if fn == nil: return
+  cNuCallVPI(fn, row, idx)
+  true
+
+proc nuRowSlider*(row: Il2CppPtr): Il2CppPtr =
+  ## `SettingFloatSlider.Slider` @0xA8 -> `NumberSlider`. NULL-CAPABLE by
+  ## construction (a serialized reference), so it is read through `nuOk` and a
+  ## null answer is returned as null rather than dereferenced.
+  result = nil
+  if not nuOk(row, NuOffFloatSliderSlider + 8'i32): return
+  result = cNuGetRef(row, NuOffFloatSliderSlider)
+  if not nuOk(result, 0x10'i32): result = nil
+
+proc nuSliderShow*(slider: Il2CppPtr; lo, hi: float32; format: string): bool =
+  ## `NumberSlider.Show(minValue, maxValue, format)` -- the range and the
+  ## display format, with NO `GameSetting<float>` involved. This is the whole
+  ## reason a mod-owned float row is possible at all: `SettingFloatSlider.
+  ## BindTo(GameSetting<float>,...)` has a real RVA but nothing to bind to,
+  ## while the inner widget takes plain floats.
+  ##
+  ## `lo >= hi` is refused: an inverted range gives a slider that cannot move
+  ## and looks identical to one that is merely disabled.
+  result = false
+  if not gNuOn or not nuOk(slider, 0x10'i32): return
+  if not (lo < hi): return
+  let fn = nuFn(NuTNumSliderShow)
+  if fn == nil: return
+  let fp = nuStr(format)
+  if fp == nil: return
+  cNuCallVPFFP(fn, slider, lo, hi, fp)
+  true
+
+proc nuSliderSetValue*(slider: Il2CppPtr; v: float32): bool =
+  result = false
+  if not gNuOn or not nuOk(slider, 0x10'i32): return
+  let fn = nuFn(NuTNumSliderSetCur)
+  if fn == nil: return
+  cNuCallVPF(fn, slider, v)
+  true
+
+proc nuSliderValue*(slider: Il2CppPtr): (bool, float32) =
+  ## THE FINISHED-STATE READ. The sentinel is a value no slider on this screen
+  ## can legally hold, so "could not ask" is never folded into "the answer is
+  ## 0" -- which for most of these settings IS a legal value and would make the
+  ## check unable to fail.
+  const NuSliderNoRead = -1.0e30'f32
+  result = (false, 0.0'f32)
+  if not gNuOn or not nuOk(slider, 0x10'i32): return
+  let fn = nuFn(NuTNumSliderCurVal)
+  if fn == nil: return
+  let v = cNuCallFP(fn, slider, NuSliderNoRead)
+  if not (v > NuSliderNoRead * 0.5'f32): return   # NaN-safe: NaN fails this
+  if not (v > -1.0e9'f32) or not (v < 1.0e9'f32): return
+  result = (true, v)
+
+proc nuAnimToggleSetToggled*(tog: Il2CppPtr; on: bool): bool =
+  ## `AnimatedToggle.set_IsToggled(bool)`.
+  ##
+  ## THE POINT, said plainly: writing `UnityEngine.UI.Toggle.m_IsOn` (+0x120)
+  ## sets the LOGICAL state and nothing else. On an `AnimatedToggle` the
+  ## VISIBLE selected state is an Animator trigger, fired from this setter. A
+  ## feature that writes m_IsOn and then reads m_IsOn back has written a check
+  ## that cannot fail while the player looks at the wrong highlight.
+  ##
+  ## STATUS: this is INFERRED from `docs/NATIVE-CONTROLS.md` plus the shape of
+  ## the reported defect. It has NOT been live-verified; the client is
+  ## unbootable this pass for an unrelated reason.
+  result = false
+  if not gNuOn or not nuOk(tog, 0x10'i32): return
+  let fn = nuFn(NuTAnimTogSetToggled)
+  if fn == nil: return
+  cNuCallVPB(fn, tog, (if on: 1'i32 else: 0'i32))
+  true
 
 proc nuMouseDown(button: int32): bool =
   ## `UnityEngine.Input::GetMouseButton(int)` -- the LEGACY STATIC API in

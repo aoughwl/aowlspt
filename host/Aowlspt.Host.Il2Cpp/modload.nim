@@ -199,7 +199,17 @@ proc mlBuild(lines: seq[string]): bool =
               "many roots were walked, asked and rejected. Nothing was created.")
     return false
   let canvasTr = nuTransformOf(canvasGo)
-  let donor = mlFindDonorTmp(canvasTr)
+
+  # PREFER THE GAME'S OWN LOADING CAPTION as the donor. It gives us its font
+  # and materials for free, and its rect and font size tell us where the player
+  # is already looking. Falling back to "any TMP under the canvas" still works
+  # and still renders -- it just will not match.
+  # nuikit's nuStyleFind, not a private copy: matching the game's look is a
+  # TOOLKIT capability, so the mods tab and the settings rows get it too.
+  let style = nuStyleFind(canvasTr, "loading")
+  var donor = style.donor
+  if donor == nil:
+    donor = mlFindDonorTmp(canvasTr)
   if donor == nil:
     # Say this ONCE. Repeating it every 250ms for a six-minute compile would
     # bury the log this project reads to find out what happened.
@@ -242,6 +252,18 @@ proc mlBuild(lines: seq[string]): bool =
     py = -(ch * MlPanelVerticalFrac)
     placed = "centred on a " & nuF(cw) & "x" & nuF(ch) & " canvas"
 
+  # MATCH THE GAME'S CAPTION when we found it: same font size, and sat directly
+  # under it in the same column, so this reads as the NEXT STEP of the load the
+  # player is already watching rather than as a panel beside it.
+  var fontSize = 18.0'f32
+  var titleSize = 24.0'f32
+  if style.ok:
+    fontSize = style.fontSize
+    titleSize = style.fontSize
+    px = style.x
+    py = style.y - MlRowH * 2.0'f32     # directly UNDER the game's own caption
+  placed = nuStyleNote(style) & "; " & placed
+
   gModLoadPanel = nuPanel(canvasGo, px, py, MlPanelW, h,
                           0.05'f32, 0.05'f32, 0.06'f32, 0.92'f32,
                           "aowlspt-modload-panel")
@@ -252,7 +274,7 @@ proc mlBuild(lines: seq[string]): bool =
                           px + MlPadX, py - MlPadY,
                           MlPanelW - MlPadX * 2.0'f32, MlRowH,
                           (if lines.len > 0: lines[0] else: "BUILDING MODS"),
-                          24.0'f32, 1.0'f32, 0.85'f32, 0.35'f32, 1.0'f32,
+                          titleSize, 1.0'f32, 0.85'f32, 0.35'f32, 1.0'f32,
                           "aowlspt-modload-title")
   if uint32(gModLoadTitle) == 0'u32:
     mlDestroy()
@@ -266,7 +288,7 @@ proc mlBuild(lines: seq[string]): bool =
     gModLoadRows[i] = nuLabel(canvasGo, donor,
                               px + MlPadX + 8.0'f32, y,
                               MlPanelW - MlPadX * 2.0'f32 - 8.0'f32, MlRowH,
-                              lines[i + 1], 18.0'f32,
+                              lines[i + 1], fontSize,
                               0.85'f32, 0.85'f32, 0.85'f32, 1.0'f32,
                               "aowlspt-modload-row" & $i)
     if uint32(gModLoadRows[i]) == 0'u32:

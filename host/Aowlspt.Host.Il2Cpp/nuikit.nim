@@ -1081,3 +1081,124 @@ proc bindNuiKit*(verbose: bool) =
     info "nuikit: handle layout is (generation << 16) | (index + 1); handle 0 " &
          "is never valid, and a freed slot keeps its generation so every " &
          "handle to it reads STALE rather than resolving to its successor."
+
+# ---------------------------------------------------------------------------
+# NuStyle -- MATCH THE GAME'S LOOK INSTEAD OF APPROXIMATING IT
+#
+# Every native panel this host builds has so far picked its own font size,
+# colour and position out of the air, and the result reads as an overlay bolted
+# onto the game rather than a part of it. The mod-loading screen was the first
+# to be judged that way by a human, and the note was exact: it should match the
+# position, font and size of the game's own "Loading profile data..." caption.
+#
+# That fix is worth having ONCE, here, rather than once per feature:
+#
+#   * the loading screen matches the loading caption,
+#   * a settings row can match a stock settings row,
+#   * the mods tab can match a stock tab,
+#
+# and none of them carries a hardcoded number that rots when BSG restyles.
+#
+# HOW IT MATCHES: the donor is found BY DISPLAYED TEXT, never by object name or
+# a hardcoded path. Names change between builds and the captions are localized,
+# but "the label that currently reads <something>" is what the player is
+# actually looking at, and it is the thing we want to sit beside. The donor is
+# then used for BOTH jobs -- `nuLabel` copies its font asset and materials, and
+# this reads its size and position -- so the two can never disagree.
+#
+# WHAT IT REFUSES: a font size outside a sane range is treated as a MISREAD
+# OFFSET, not as a font size. Laying a panel out from a garbage number is worse
+# than using our own default, so `ok` goes false and `why` says so.
+
+const
+  NuStyleFontSizeOff* = 0x1ec'i32
+    ## `TMPro.TMP_Text.m_fontSize`, float. Resolved offline against this build
+    ## with `il2cpp_resolve.py fields TMPro.TMP_Text`; `m_text` sits at 0xe0 and
+    ## `UnityEngine.UI.Graphic.m_Color` at 0x28 on the same object, which is how
+    ## the offset was cross-checked rather than taken on its own.
+  NuStyleMinFont* = 4.0'f32
+  NuStyleMaxFont* = 200.0'f32
+  NuStyleBudget* = 3000
+    ## Nodes a style search may visit. Bounded like every other walk here: an
+    ## unbounded descent on a scene full of geometry is how natesp's own walk
+    ## burned 20,000 nodes and never reached any UI.
+
+type
+  NuStyle* = object
+    ok*: bool            ## false means: use your own defaults, and say so
+    why*: string         ## why it is not ok -- never silent
+    donor*: Il2CppPtr    ## the live TMP: font + material donor for nuLabel
+    node*: Il2CppPtr     ## its transform, for position
+    text*: string        ## what it says right now (evidence, for the log)
+    fontSize*: float32
+    x*, y*: float32      ## its anchored position
+
+proc nuStyleCapture*(donorTmp, node: Il2CppPtr): NuStyle =
+  ## Read a live TMP's look. Every read is guarded; nothing is assumed.
+  result = NuStyle(ok: false, why: "", donor: donorTmp, node: node,
+                   text: "", fontSize: 0.0'f32, x: 0.0'f32, y: 0.0'f32)
+  if donorTmp == nil:
+    result.why = "no donor TMP"
+    return
+  if not nuOk(donorTmp, NuStyleFontSizeOff + 4'i32):
+    result.why = "the donor is not readable as far as m_fontSize@0x" &
+                 hexOf(uint64(NuStyleFontSizeOff))
+    return
+  let fs = float32(cReadF32(cast[Il2CppPtr](
+    cast[uint64](donorTmp) + uint64(NuStyleFontSizeOff))))
+  if not (fs > NuStyleMinFont and fs < NuStyleMaxFont):
+    # A number outside this range is not a font size. It is a misread offset,
+    # and a panel laid out from it would be silently wrong rather than visibly
+    # broken -- which is the harder bug to find.
+    result.why = "m_fontSize read back as " & nuF(fs) &
+                 ", which is not a plausible font size; treating the offset " &
+                 "as MISREAD rather than laying out from it"
+    return
+  result.fontSize = fs
+  if node != nil:
+    let (pok, nx, ny) = nuGetPos(node)
+    if pok:
+      result.x = nx
+      result.y = ny
+  result.ok = true
+
+proc nuStyleFind*(rootTr: Il2CppPtr; needleLower: string): NuStyle =
+  ## Find a live TMP whose DISPLAYED TEXT contains `needleLower` (already
+  ## lower-case) and capture its style. Breadth-first and bounded: the label we
+  ## want is shallow under a menu canvas, and a depth-first walk would spend the
+  ## whole budget in the first large subtree it entered.
+  result = NuStyle(ok: false, why: "no TMP under this root displays \"" &
+                   needleLower & "\"", donor: nil, node: nil, text: "",
+                   fontSize: 0.0'f32, x: 0.0'f32, y: 0.0'f32)
+  if rootTr == nil:
+    result.why = "no root to search from"
+    return
+  var budget = NuStyleBudget
+  var frontier: seq[Il2CppPtr] = @[rootTr]
+  while frontier.len > 0 and budget > 0:
+    var nextRow: seq[Il2CppPtr] = @[]
+    for node in frontier:
+      if budget <= 0: break
+      dec budget
+      let tmp = splTmpOf(node)
+      if tmp != nil:
+        let t = splTmpText(tmp)
+        if t.len > 0 and find(toLowerAscii(t), needleLower) >= 0:
+          result = nuStyleCapture(tmp, node)
+          result.text = t
+          return result
+      var n = 0
+      if iChildCount(node, n):
+        for i in 0 ..< n:
+          if nextRow.len >= budget: break
+          let c = iChildAt(node, i)
+          if c != nil: nextRow.add c
+    frontier = nextRow
+
+proc nuStyleNote*(s: NuStyle): string =
+  ## One line for the log, saying what was matched or why nothing was.
+  if s.ok:
+    result = "MATCHED the game's own label \"" & s.text & "\" (font " &
+             nuF(s.fontSize) & " at " & nuF(s.x) & ", " & nuF(s.y) & ")"
+  else:
+    result = "NOT matched (" & s.why & "); using our own defaults"

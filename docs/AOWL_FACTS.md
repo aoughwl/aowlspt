@@ -5414,3 +5414,36 @@ one overload's address under the other's frame shape. Overload sets are now
 suffixed by metadata `parameterCount`. VERIFIED: 595 consts, 0 duplicates under
 Nim's own case/underscore-insensitive normalisation, 0 fabricated `0x0` RVAs,
 every const carries its derived signature. NOT YET COMPILED.
+
+## The in-raid ESC menu IS `Common UI/MenuScreen`, opened by `MenuScreen::ShowInRaid()`
+
+OFFLINE-DERIVED 2026-09-01 (metadata + prologue bytes; NOT yet live-verified).
+
+There is no `EscapeMenu`, `IngameMenu` or `EscapeScreen` TYPE on this build --
+all genuine EXHAUSTIVE zero-hits. The in-raid menu is the same `MenuScreen`
+object with `RaidButtonsGroup` activated, which is exactly where the existing
+exit recipe already finds `DisconnectButton`.
+
+    EFT.UI.MenuScreen::ShowInRaid()   RVA 0x1539650  (VA 0x181539650)
+    void, arity 0 (derived: returnType@8, parameterCount@34 -- never from the name)
+    sharedness UNIQUE (owners=1); section il2cpp
+    prologue 48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 48
+    -- a real frame, NOT the universal stub at 0x628110
+    call rva:0x1539650/48895C240848897424105748 v_p <MenuScreen*>
+
+Fields, offline from fieldOffsets (String self-check passed):
+`_disconnectButton@+0xC0` (DefaultUIButton), `_inGameScreenStatus@+0x110` (bool).
+
+`EFT.TarkovApplication::ShowMenuScreen()@0x978a00` is the MAIN-MENU path, not
+this. `GamePlayerOwner`/`EftGamePlayerOwner` hold only input translators
+(`TranslateExitScreenInput`), no opener.
+
+This removes the last manual step in the autonomous raid loop -- previously
+"a human pressing ESC is currently the only way in". `tools/exitraid.py`
+implements it and asserts the FINISHED STATE (`Game Scene` inactive AND
+`Menu UI` active), never a press's return value; its selftest's load-bearing
+case is "every press reported ok but we are still in the raid -> FAIL".
+
+STILL UNVERIFIED until run in a live raid: that `ShowInRaid()` actually opens
+the menu, that `_disconnectButton` is non-NULL mid-raid, and whether
+`ShowInRaid` also changes cursor lock or input state (undisassembled).

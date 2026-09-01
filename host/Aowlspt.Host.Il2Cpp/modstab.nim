@@ -3078,6 +3078,59 @@ proc gfxBuildStrip(panelT, donorStripGo, donorButtonGo, donorButtonT: Il2CppPtr;
     i2 = i2 + 1
   result = true
 
+## THE SUBTAB HIGHLIGHT. Read this before changing either of the two call
+## sites below.
+##
+## THE DEFECT, as reported live: the strip shows GRAPHICS SETTINGS highlighted
+## while POSTFX is the panel that is open. The strip's own verdict reads PASS
+## at the same time.
+##
+## WHY BOTH CAN BE TRUE AT ONCE -- and this is the 9b shape, not a coincidence.
+## `modsSetToggleQuiet` writes `UnityEngine.UI.Toggle.m_IsOn` (+0x120) through
+## `SetIsOnWithoutNotify`, and `gfxVerdict` READS `m_IsOn` BACK. That check
+## cannot fail: it compares our own write against itself. What the PLAYER sees
+## is a different thing entirely.
+##
+## WHAT THE MAP SAYS THE PLAYER SEES (`docs/NATIVE-CONTROLS.md` 1, 2): these
+## strip buttons are `EFT.UI.AnimatedToggle`s living inside a
+## `UISpawnableToggle`. `AnimatedToggle` carries `_onTrigger` @0x128 and
+## `_offTrigger` @0x130 -- ANIMATOR TRIGGER NAMES -- and the visual switch is
+## fired from `AnimatedToggle::set_IsToggled(bool)` @0x16AD190 (unique). A raw
+## `m_IsOn` store never runs that setter, so the animator is never told and the
+## highlight stays wherever it was last animated to. `gfxSeedSelection` seeds
+## index 0, GRAPHICS SETTINGS -- which is exactly the stuck state reported.
+##
+## THE HYPOTHESIS THIS REPLACES, and it is DISPROVEN here, not merely
+## unfavoured: "a cloned toggle inherits the donor's serialized `m_Group`
+## @0x110, so the stock ToggleGroup still drives it". `gfxBuildStrip` already
+## MEASURED that (fact #117) and both buttons came out `m_Group=NULL` -- these
+## buttons are cloned SEPARATELY from the strip, so Unity had no cloned
+## hierarchy to remap a group reference onto. The strip's own group is written
+## by us afterwards. m_Group is therefore not the cause.
+##
+## STATUS, said plainly: INFERRED from the construction map plus the shape of
+## the defect. NOT live-verified -- the client is unbootable this pass for an
+## unrelated reason. The falsifiable prediction, for whoever runs it next:
+## with this in, `AnimatedToggle._onTrigger`/`_offTrigger` are still whatever
+## the donor serialized, and the HIGHLIGHT follows the open panel. If it does
+## not, the next thing to read live is those two trigger strings -- an
+## `_onTrigger` naming a state the donor's Animator has and this clone's does
+## not would explain it and this call would be harmless but insufficient.
+##
+## Additive, never a replacement: `modsSetToggleQuiet` still runs, so the
+## logical `m_IsOn` state and the verdict that reads it are unchanged. This
+## only makes the VISIBLE state follow it.
+proc gfxSubtabVisual(tog: Il2CppPtr; on: bool) =
+  ## Call the real setter on ONE strip button we cloned. Never on a stock one.
+  ## Silent on refusal by design -- `nuAnimToggleSetToggled` logs its own
+  ## reason through `nuFn`, and this runs on every switch, so a warn here would
+  ## be per-press noise. Gated by `nativeUiKit` inside `nuAnimToggleSetToggled`
+  ## (it checks `gNuOn`): with that flag off the highlight is left exactly as it
+  ## was before this change, which is the reported defect and not a new one.
+  if tog == nil or not iUnityAlive(tog):
+    return
+  discard nuAnimToggleSetToggled(tog, on)
+
 proc gfxApply(sel: int) =
   ## Switch the two STOCK panels and put both strips in agreement. Calls only
   ## where something differs: this runs while the player is on the Graphics
@@ -3096,6 +3149,15 @@ proc gfxApply(sel: int) =
       discard modsSetToggleQuiet(gGfxTogA[i], want)
     if i < gGfxTogB.len and modsToggleIsOn(gGfxTogB[i]) != want:
       discard modsSetToggleQuiet(gGfxTogB[i], want)
+    # THE HIGHLIGHT, unconditionally -- see `gfxSubtabVisual`. Deliberately NOT
+    # guarded by "did m_IsOn differ": m_IsOn and the animator are two separate
+    # states, and the whole defect is them disagreeing. Skipping the visual
+    # because the logical state already matched is precisely how they would
+    # stay out of step forever.
+    if i < gGfxTogA.len:
+      gfxSubtabVisual(gGfxTogA[i], want)
+    if i < gGfxTogB.len:
+      gfxSubtabVisual(gGfxTogB[i], want)
     if i < gGfxLast.len:
       gGfxLast[i] = want
     i = i + 1
@@ -3121,8 +3183,10 @@ proc gfxSeedSelection() =
     let want = (i == 0)
     if i < gGfxTogA.len:
       discard modsSetToggleQuiet(gGfxTogA[i], want)
+      gfxSubtabVisual(gGfxTogA[i], want)
     if i < gGfxTogB.len:
       discard modsSetToggleQuiet(gGfxTogB[i], want)
+      gfxSubtabVisual(gGfxTogB[i], want)
     if i < gGfxLast.len:
       gGfxLast[i] = want
     i = i + 1

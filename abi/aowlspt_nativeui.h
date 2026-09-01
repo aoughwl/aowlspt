@@ -386,6 +386,71 @@ typedef struct AowlNuTarget {
 #define AOWL_NU_TR_GET_POSITION       34
 #define AOWL_NU_TR_GET_LOSSYSCALE     35
 
+/* --- THE NATIVE SETTINGS-ROW PREFAB PATH (indices 36..45) ------------------
+ *
+ * WHY THESE EXIST. The PostFX rows were built from scratch (nuikit labels) and
+ * before that by CLONING a stock row. Both were workarounds for not knowing
+ * how the game itself builds a settings row. `docs/NATIVE-CONTROLS.md` maps
+ * that path: every `SettingsTab` holds SERIALIZED PREFAB references
+ * (`_toggleTemplate`, `_floatSliderTemplate`, `_dropDownTemplate`,
+ * `_selectSliderTemplate`) and instantiates them with
+ * `SettingsTab.CreateControl<T>` -- a GENERIC method with no entry in
+ * `methodPointers` and therefore NO RVA. The non-generic substitute is
+ * `Object.Instantiate(Object, Transform, bool)`, which is here.
+ *
+ * PROVENANCE, every row, measured 2026-09-01 against THIS build:
+ *   python tools/il2cpp_resolve.py D:/Aowlspt/GameAssembly.dll
+ *          .cache/global-metadata.dec.dat bytes  <RVA> 16   -> the sig below
+ *   ... shared <RVA>  -> sharedness=UNIQUE owners=1 for EVERY row (three-state;
+ *                        none came back `unknown`)
+ * None is 0x628110, the 6,438-method `C2 00 00` universal empty-body stub.
+ * Every one is in the `il2cpp` section, not `.text`.
+ *
+ * TWO OF THESE SIGS ARE ALSO ABI EVIDENCE, not merely an identity check:
+ *   SetText@0x16FA890 begins `48 8B D9  48 8B 89 80 00 00 00`
+ *     = mov rbx,rcx ; mov rcx,[rcx+0x80] -- it reads `SettingControl.Text`
+ *       at +0x80, INDEPENDENTLY confirming that field offset from fldoff.
+ *   NumberSlider::CurrentValue@0x16B5850 begins `48 8B 89 80 00 00 00`
+ *     = mov rcx,[rcx+0x80] -- `NumberSlider._slider` at +0x80, the same
+ *       confirmation.
+ * A prologue that is merely real code proves identity, not behaviour; these
+ * two additionally AGREE with the field table, which is a real cross-check.
+ *
+ * WHAT IS DELIBERATELY ABSENT, and it is the honest half of this change:
+ *   * `SettingToggle::BindTo(GameSetting<bool>)` @0x16FD0D0 and
+ *     `SettingFloatSlider::BindTo(GameSetting<float>,...)` @0x16FB810 both
+ *     have real unique RVAs -- but a `GameSetting<T>` is an INSTANTIATED
+ *     GENERIC whose layout is NOT reachable offline (all 33,464
+ *     Il2CppGenericClass entries have a null cached_class), and constructing
+ *     one is a GAP. A mod-owned row has nothing to bind TO. Not bound.
+ *   * `SetChangeAction(Action)` @0x16FAFC0 IS here and IS callable -- but it
+ *     needs a managed `Action` delegate, and building one requires type
+ *     injection, which is PLAUSIBLE and UNPROVEN on this build. It is in the
+ *     table so the gap is one object away rather than one investigation away;
+ *     it is called with a real delegate or not at all, never with NULL.
+ *   * Every DROPDOWN and SELECT-SLIDER bind is generic and has NO code entry.
+ *     Those row kinds are refused out loud by the caller rather than
+ *     counterfeited out of a toggle. */
+#define AOWL_NU_SETCTRL_SETTEXT       36
+#define AOWL_NU_SETCTRL_SETNAME       37
+#define AOWL_NU_SETCTRL_SETSIBIDX     38
+#define AOWL_NU_SETCTRL_SETCHANGEACT  39
+#define AOWL_NU_OBJ_INSTANTIATE3      40
+#define AOWL_NU_NUMSLIDER_SHOW        41
+#define AOWL_NU_NUMSLIDER_SETCUR      42
+#define AOWL_NU_NUMSLIDER_CURVAL      43
+/* The SUBTAB-HIGHLIGHT pair. `modsSetToggleQuiet` writes `Toggle.m_IsOn`
+ * (+0x120) and that is exactly what the strip verdict reads back -- so the
+ * verdict PASSes while the player sees GRAPHICS highlighted over an open
+ * POSTFX panel. These tab widgets are `AnimatedToggle`s, whose VISUAL state
+ * is driven by an Animator trigger fired from `set_IsToggled`; a raw m_IsOn
+ * store never runs it. Calling the setter is the only way the animation can
+ * happen.
+ * STATUS: INFERRED from the construction map plus the shape of the defect.
+ * NOT live-verified -- the client is unbootable this pass. */
+#define AOWL_NU_ANIMTOGGLE_SETTOGGLED  44
+#define AOWL_NU_SPAWNTOG_SETTOGGLED    45
+
 /* UnityEngine.RenderMode. Named, because `0` appearing bare in a refusal is
  * indistinguishable from "we did not read anything". */
 #define AOWL_NU_RENDERMODE_OVERLAY   0
@@ -548,6 +613,51 @@ static const AowlNuTarget aowl_nu_targets[] = {
     { "UnityEngine.Transform::get_lossyScale_Injected", 0x52BAA50u,
       { 0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,
         0x4F,0xA2,0xE1 }, 16 },
+    /* --- the settings-row prefab path. See AOWL_NU_SETCTRL_SETTEXT. --- */
+    { "EFT.UI.Settings.SettingControl::SetText", 0x16FA890u,
+      { 0x40,0x53,0x48,0x83,0xEC,0x20,0x48,0x8B,0xD9,0x48,0x8B,0x89,0x80,
+        0x00,0x00,0x00 }, 16 },
+    { "EFT.UI.Settings.SettingControl::SetName", 0x16FA9D0u,
+      { 0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,
+        0x07,0x9B,0x9D }, 16 },
+    { "EFT.UI.Settings.SettingControl::SetSiblingIndex", 0x16FA910u,
+      { 0x48,0x89,0x74,0x24,0x10,0x57,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,
+        0xBF,0x9B,0x9D }, 16 },
+    { "EFT.UI.Settings.SettingControl::SetChangeAction", 0x16FAFC0u,
+      { 0x48,0x89,0x5C,0x24,0x10,0x48,0x89,0x74,0x24,0x18,0x57,0x48,0x83,
+        0xEC,0x20,0x80 }, 16 },
+    /* STATIC, 3 args: (Object original, Transform parent, bool worldPosStays)
+     * -> Object. RCX/RDX/R8 then the MethodInfo* in R9. This is the whole
+     * substitute for the generic, no-code `SettingsTab.CreateControl<T>`. */
+    { "UnityEngine.Object::Instantiate(Object,Transform,bool)", 0x52ADDA0u,
+      { 0x48,0x89,0x5C,0x24,0x10,0x48,0x89,0x6C,0x24,0x18,0x57,0x48,0x83,
+        0xEC,0x20,0x80 }, 16 },
+    /* EFT.UI.NumberSlider -- the widget INSIDE a SettingFloatSlider row
+     * (`SettingFloatSlider.Slider` @0xA8). Driving it directly is how a row
+     * gets a range and a displayed value WITHOUT a GameSetting<float>, which
+     * is not constructible here. `Show` is (this, XMM1=min, XMM2=max,
+     * R9=format string, MethodInfo* on the stack): the two floats ride XMM by
+     * ARGUMENT POSITION, which is why the C thunk declares them as real float
+     * parameters instead of marshalling them by hand. */
+    { "EFT.UI.NumberSlider::Show", 0x16B4EA0u,
+      { 0x48,0x89,0x5C,0x24,0x10,0x48,0x89,0x74,0x24,0x18,0x57,0x48,0x83,
+        0xEC,0x60,0x80 }, 16 },
+    { "EFT.UI.NumberSlider::SetCurrentValue", 0x16B5300u,
+      { 0x48,0x89,0x5C,0x24,0x10,0x57,0x48,0x83,0xEC,0x60,0x80,0x3D,0x67,
+        0x8E,0xA0,0x05 }, 16 },
+    /* The READBACK. A row told to show 0.35 that reads back 0.35 off the LIVE
+     * slider is the only finished-state check available here; the value we
+     * passed in a moment ago proves nothing about what the widget holds. */
+    { "EFT.UI.NumberSlider::CurrentValue", 0x16B5850u,
+      { 0x48,0x83,0xEC,0x28,0x48,0x8B,0x89,0x80,0x00,0x00,0x00,0x48,0x85,
+        0xC9,0x74,0x18 }, 16 },
+    /* --- the subtab-highlight pair. See AOWL_NU_ANIMTOGGLE_SETTOGGLED. --- */
+    { "EFT.UI.AnimatedToggle::set_IsToggled", 0x16AD190u,
+      { 0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20,0x0F,0xB6,0xFA,
+        0x45,0x33,0xC9 }, 16 },
+    { "EFT.UI.UISpawnableToggle::set_IsToggled", 0x1435A50u,
+      { 0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20,0x48,0x8B,0x99,
+        0xD0,0x00,0x00 }, 16 },
 };
 
 #define AOWL_NU_TARGET_COUNT \
@@ -869,6 +979,35 @@ typedef unsigned char (*AowlNu_B_SI)(int32_t, void*);
 static int32_t aowl_nu_call_b_si(void* fn, int32_t a0) {
     if (!fn) return 0;
     return ((AowlNu_B_SI)fn)(a0, NULL) ? 1 : 0;
+}
+/* STATIC, (Object*, Transform*, bool) -> Object*. `worldPositionStays` is
+ * passed as the game itself passes it from CreateControl<T>: FALSE, so the
+ * fresh row takes the parent layout instead of keeping a prefab world pose.
+ * `a1` (the parent) is REFUSED when NULL -- an Instantiate with no parent
+ * lands the row at the scene root, which renders nowhere and reports success,
+ * and that is precisely this repository signature false positive. */
+typedef void* (*AowlNu_P_S3PPB)(void*, void*, unsigned char, void*);
+static void* aowl_nu_call_p_s3ppb(void* fn, void* a0, void* a1, int32_t a2) {
+    if (!fn || !a0 || !a1) return NULL;
+    return ((AowlNu_P_S3PPB)fn)(a0, a1, (unsigned char)(a2 ? 1 : 0), NULL);
+}
+/* INSTANCE, (float, float, void*) -> void. Declared with real float
+ * parameters so the compiler places them in XMM1/XMM2 BY POSITION, which is
+ * the ABI; pushing them through an integer register would compile, run, and
+ * silently give NumberSlider::Show two garbage bounds. */
+typedef void (*AowlNu_V_PFFP)(void*, float, float, void*, void*);
+static void aowl_nu_call_v_pffp(void* fn, void* self, float a0, float a1,
+                                void* a2) {
+    if (!fn || !self) return;
+    ((AowlNu_V_PFFP)fn)(self, a0, a1, a2, NULL);
+}
+/* INSTANCE, 0 args -> float (XMM0). `defVal` is returned when the call cannot
+ * be made at all, and callers pass a value no slider can legally hold, so
+ * "could not ask" is never mistaken for a reading. */
+typedef float (*AowlNu_F_P)(void*, void*);
+static float aowl_nu_call_f_p(void* fn, void* self, float defVal) {
+    if (!fn || !self) return defVal;
+    return ((AowlNu_F_P)fn)(self, NULL);
 }
 /* The generic shape. A NULL MethodInfo* is REFUSED rather than passed: the
  * shared body dereferences it at +0x38, so a NULL there is an immediate access

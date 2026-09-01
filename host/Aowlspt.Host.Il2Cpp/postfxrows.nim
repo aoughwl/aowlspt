@@ -1,157 +1,206 @@
 ## ===========================================================================
-## postfxrows.nim -- CONTENT for the PostFX subtab panel, built FROM SCRATCH.
+## postfxrows.nim -- CONTENT for the PostFX subtab panel, built by
+## INSTANTIATING THE GAME'S OWN SETTINGS-ROW PREFABS.
 ##
-## THE BUG THIS EXISTS FOR
-## -----------------------
-## `modstab.nim`'s postfx-subtab feature works: its own finished-state verdict
-## reads PASS off the live objects ("exactly one subtab is selected and its
-## panel is the only one active"). But all it drives is `activeInHierarchy` on
-## the two STOCK panels, and the stock `PostFX Settings` panel is EMPTY once the
-## game's own PostFX tab has been folded away. Pressing POSTFX therefore shows a
-## correctly-selected, correctly-exclusive, completely blank page. The machinery
-## was never the problem; there was simply nothing in the room.
+## WHAT CHANGED, AND WHY
+## ---------------------
+## This file used to build every row from scratch out of `nuikit` labels, and
+## before that the feature CLONED a live stock row and relabelled it. Both were
+## workarounds for one missing fact: how the game itself builds a settings row.
+## `docs/NATIVE-CONTROLS.md` now maps that path, so neither workaround is
+## justified any more.
 ##
-## `mods/graphics` declares 29 settings that have never been rendered anywhere
-## in the native screen. This file puts them there.
+##   Every `SettingsTab` holds SERIALIZED PREFAB references to the row widgets
+##   it uses. On `EFT.UI.Settings.PostFXSettingsTab` (offsets measured from
+##   Il2CppMetadataRegistration.fieldOffsets, System.String self-check passed):
 ##
-## NOTHING HERE IS CLONED
-## ----------------------
-## Explicitly asked for, and now possible. Every object is built by `nuikit`
-## from a bare `GameObject` -- `AddComponent<RectTransform>` ->
-## `SetParentAndAlign` -> layer 5 -> `SetActive(false)` ->
-## `AddComponent<TextMeshProUGUI>` -> wire the donor's font/material -> layout
-## -> `SetActive(true)` -> `set_text` (RE-APPLIED, because `LocalizedText`
-## clobbers a raw `m_text` store). That is the IMAGEPROOF-PASS sequence, used
-## through `nuLabel` rather than reimplemented. The one thing borrowed from a
-## live object is a DONOR TMP's font asset, which `nuLabel` requires: a
-## from-scratch `TextMeshProUGUI` with a null `m_fontAsset` faults in `Awake`.
+##       0x88  _createdControls            List<SettingControl>
+##       0xa0  _settingsRoot               RectTransform      <- THE ROW PARENT
+##       0xb0  _selectFloatSliderTemplate  SettingFloatSlider <- PREFAB
+##       0xb8  _dropDownTemplate           SettingDropDown    <- PREFAB
+##       0xc0  _toggleLeftTemplate         SettingToggle      <- PREFAB
 ##
-## WHY THESE ROWS ARE A CATALOGUE AND NOT YET CONTROLS -- SAID PLAINLY
-## ------------------------------------------------------------------
-## The live VALUE of each setting reaches this host over exactly one path: the
-## `/aowlspt/settings/<guid>` schema fetch in `modsettingsrender.nim`, and that
-## path is gated on `modSettingsRender`, WHICH CRASHES THE CLIENT at
-## character-select (bisected: with it on the host log stops dead at
-## `[0:00:30.828]` right after the profile Submit, with no managed exception in
-## the client's own log -- a native access violation; with it off the run passes
-## `[0:01:42]`). Another agent owns that crash. This file does NOT turn that
-## flag on and does NOT depend on it landing.
+## and the construction call is `SettingsTab.CreateControl<T>(prefab, parent)`
+## -- a GENERIC method with no entry in `methodPointers`, so it has NO RVA. The
+## non-generic substitute is `Object.Instantiate(Object, Transform, bool)`
+## @0x52ADDA0 (unique), followed by the game's own fluent chain
+## `SetText` @0x16FA890 -> `SetSiblingIndex` @0x16FA910. All of that is in
+## `abi/aowlspt_nativeui.h` with its provenance, byte-verified against the
+## STARTUP PROLOGUE SNAPSHOT (never live memory) on every call.
 ##
-## So rendering a SLIDER here would mean rendering a slider with no value behind
-## it and nowhere to write to -- a control that silently does nothing, which is
-## this repository's single most repeated defect and the thing 9b exists to
-## forbid. Compounding it, `mods/graphics` has its own trap: `loadConfig` calls
-## `applyPreset` and RETURNS whenever `preset != "custom"` (graphics.nim:189-191),
-## so with the deployed `preset` every look slider below that line is read,
-## stored and then discarded. A slider that cannot show that state is worse than
-## no slider.
+## WHY THIS IS BETTER THAN A CLONE, concretely and not as a slogan: a clone
+## inherits the DONOR's serialized wiring -- its `ToggleGroup`, its
+## `LayoutElement` sizing, the children its spawner had already spawned -- and
+## every one of those had to be found and undone by hand, once each, after it
+## shipped a visible defect. A prefab instance inherits the PREFAB's wiring,
+## which is exactly what the game's own rows inherit.
 ##
-## What is rendered instead is honest and useful: the full declared catalogue,
-## grouped by the mod's own categories, with a banner that states in the panel
-## itself that these are names, not live values, and why. `gPfxRows` carries a
-## `value` field that is empty today and is the single place a schema-fed build
-## would fill in -- the layout does not change when it does.
+## WHAT IS DECLINED, LOUDLY
+## ------------------------
+## `preset` and `tonemapper` are ENUM settings. Their row kind is
+## `SettingDropDown`, whose every bind -- `BindTo`, `BindToEnum`,
+## `BindDropDownToSetting`, `UpdateDropDownValue` -- is GENERIC and therefore
+## has no code entry offline. The same is true of all three
+## `SettingSelectSlider.BindIndexTo` overloads. There is no honest way to build
+## one today, so NO row is built for them: they are counted, named in the log,
+## and named in the on-screen banner. A dropdown faked out of a toggle would
+## render, look right, and do nothing, which is the single defect this
+## repository has produced most often.
+##
+## WHAT IS RENDERED, AND WHAT IT IS NOT
+## ------------------------------------
+## 4 boolean settings as real `SettingToggle` rows, 23 numeric settings as real
+## `SettingFloatSlider` rows whose inner `NumberSlider` is given the schema's
+## own range and the schema's own DEFAULT via `Show(min,max,format)`
+## @0x16B4EA0 and `SetCurrentValue(float)` @0x16B5300.
+##
+## They are NOT BOUND, and the banner says so on screen. Binding needs a
+## `Bsg.GameSettings.GameSetting<T>`: `SettingToggle.BindTo(GameSetting<bool>)`
+## @0x16FD0D0 and `SettingFloatSlider.BindTo(GameSetting<float>,...)`
+## @0x16FB810 both have real unique RVAs, but `GameSetting`1` is an
+## INSTANTIATED GENERIC whose layout is not reachable offline (every one of the
+## 33,464 `Il2CppGenericClass` entries has a null `cached_class`) and
+## constructing one is a GAP. `SetChangeAction(Action)` @0x16FAFC0 is the
+## no-GameSetting alternative and IS in the target table -- it needs a managed
+## `Action` delegate, which needs type injection, which is PLAUSIBLE and
+## UNPROVEN on this build. It is called with a real delegate or not at all,
+## never with NULL.
+##
+## The values shown are the DECLARED DEFAULTS from `mods/graphics`' own schema,
+## not the player's saved config. The live-value path is the
+## `/aowlspt/settings/<guid>` fetch in `modsettingsrender.nim`, gated on
+## `modSettingsRender`, which crashes the client at character-select. Another
+## agent owns that crash. The banner states which of the two the numbers are,
+## because printing a default and letting it read as "your setting" is a
+## confident wrong answer.
+##
+## OWNERSHIP -- CHOSEN DELIBERATELY, NOT BY DEFAULT
+## ------------------------------------------------
+## `SettingsTab._createdControls` @0x88 is the list `CleanupCreatedControls`
+## @0x171BE50 destroys on close, and the map is explicit that a row which is
+## not in it survives and duplicates. We do NOT append to it: it is a
+## `List<SettingControl>`, an instantiated generic whose layout is exactly the
+## thing that is not reachable offline, and a raw write to a guessed
+## `_items`/`_size` pair is a fabricated offset into a live collection the game
+## then iterates. Instead this file OWNS its rows and destroys them itself
+## through `Object::Destroy` (`nuDestroy`), on the same tear-down hook it
+## already had. Stated so the next reader does not "fix" it by writing the
+## list.
 ##
 ## SAFETY. Flag-gated `settingsPostFxRows`, default OFF, and additionally inert
-## unless `nativeUiKit` is on (nuikit refuses on its own if it is not). Built
-## ONCE, lazily, the first time the PostFX panel is actually up. No per-frame
-## work and no per-frame allocation: after the build the tick is one boolean.
-## Self-disables after `PfxMaxFaults`. Every iteration is capped. No guard is
-## opened here -- this is called from inside `modsBody`'s single
-## `aowl_p_p_seh`, and `aowl_p_p_seh` is NOT re-entrant.
+## unless `nativeUiKit` is on. Built ONCE, lazily, the first time the PostFX
+## panel is actually up. No per-frame work and no per-frame allocation: after
+## the build the tick is one boolean. Self-disables after `PfxMaxFaults`. Every
+## iteration is capped. No guard is opened here -- this is called from inside
+## `modsBody`'s single `aowl_p_p_seh`, and `aowl_p_p_seh` is NOT re-entrant.
+##
+## LIVE STATUS, stated because it is the deliverable: NOTHING in this file has
+## been observed in a running client. The client is unbootable this pass for an
+## unrelated reason. Every offset and every RVA here is METADATA-DERIVED and
+## byte-verified offline; none of it is behavioural proof.
 ## ===========================================================================
 
 const PfxMaxFaults = 4
-const PfxMaxRows = 64              ## rule 4; the catalogue is 29 + 11 headers
-const PfxMaxHandles = 48           ## nuikit's own table is 64 slots
+const PfxMaxRows = 64              ## rule 4; the catalogue is 29
+const PfxMaxHandles = 48
+
+## PostFXSettingsTab field offsets. MEASURED, never guessed --
+## `tools/il2cpp_resolve.py ... fields EFT.UI.Settings.PostFXSettingsTab`,
+## System.String self-check passed. Every one is a serialized Unity reference
+## and therefore NULL-CAPABLE: read through `nuOk`, never dereferenced blind.
+const PfxOffSettingsRoot   = 0xa0'i32   ## _settingsRoot : RectTransform
+const PfxOffSliderTemplate = 0xb0'i32   ## _selectFloatSliderTemplate
+const PfxOffDropTemplate   = 0xb8'i32   ## _dropDownTemplate  (declined; see above)
+const PfxOffToggleTemplate = 0xc0'i32   ## _toggleLeftTemplate
 
 var gPfxOn = false                 ## `settingsPostFxRows` -- read once at boot
 var gPfxOff = false                ## self-disabled
 var gPfxBuilt = false
 var gPfxTried = 0
 var gPfxFaults = 0
-var gPfxElems: seq[NuElem] = @[]
 var gPfxVerdictSaid = false
 
+## OUR ROWS. `gPfxRowGo` is the GameObject we destroy; `gPfxRowSlider` is the
+## inner `NumberSlider` for a float row (nil for a toggle row) and is what the
+## verdict READS BACK -- never the value we passed in.
+var gPfxBanner: NuElem
+var gPfxHaveBanner = false
+var gPfxRowGo: seq[Il2CppPtr] = @[]
+var gPfxRowSlider: seq[Il2CppPtr] = @[]
+var gPfxRowWant: seq[float32] = @[]
+var gPfxRowName: seq[string] = @[]
+var gPfxDeclined: seq[string] = @[]
+
 type
+  PfxKind = enum
+    pkToggle,      ## boolSetting   -> SettingToggle prefab
+    pkSlider,      ## floatSetting  -> SettingFloatSlider prefab
+    pkChoice       ## enumSetting   -> SettingDropDown: DECLINED, see header
+
   PfxRow = object
-    ## One line of the catalogue. `header` rows are the mod's own category
-    ## names; the rest are settings.
-    header*: bool
+    kind*: PfxKind
     label*: string
-    ## The mod's declared key. Kept even though nothing writes through it yet:
-    ## it is what a schema-fed build keys its value lookup on, and it is what
-    ## makes "this row corresponds to a real declared setting" checkable rather
-    ## than a claim about a string literal.
     key*: string
-    ## PRESET-OWNED. Derived from `mods/graphics`' own `presetOwns`, which is
-    ## itself derived from `loadConfig`'s early return, not guessed: with
-    ## `preset` set to anything but `custom`, every key except `enabled`,
-    ## `raidOnly`, `diag` and `preset` is read ONLY in the `custom` branch, so a
-    ## stored edit to it can never be observed. Marked on screen so a player
-    ## cannot conclude a knob is broken when it is in fact owned.
+    ## PRESET-OWNED. Derived from `mods/graphics`' `loadConfig`, which calls
+    ## `applyPreset` and RETURNS whenever `preset != "custom"`, so with the
+    ## deployed preset every look setting below that line is read and then
+    ## discarded. Marked on screen so a player cannot conclude a knob is broken
+    ## when it is in fact owned.
     presetOwned*: bool
-    ## Empty today. See the header comment: the live-value path is blocked on
-    ## `modSettingsRender`. NOT defaulted to the schema's declared default,
-    ## because printing a default next to a config that may say otherwise is a
-    ## confident wrong answer, which is worse than no answer.
-    value*: string
+    ## Range and DECLARED DEFAULT, transcribed from `mods/graphics/graphics.nim
+    ## :schema()`. Meaningless for `pkToggle` / `pkChoice`.
+    lo*, hi*, def*: float32
 
-proc pfxRow(label, key: string; owned: bool): PfxRow =
-  PfxRow(header: false, label: label, key: key, presetOwned: owned, value: "")
+proc pfxF(label, key: string; owned: bool; lo, hi, def: float32): PfxRow =
+  PfxRow(kind: pkSlider, label: label, key: key, presetOwned: owned,
+         lo: lo, hi: hi, def: def)
 
-proc pfxHead(label: string): PfxRow =
-  PfxRow(header: true, label: label, key: "", presetOwned: false, value: "")
+proc pfxB(label, key: string; owned: bool): PfxRow =
+  PfxRow(kind: pkToggle, label: label, key: key, presetOwned: owned,
+         lo: 0.0'f32, hi: 0.0'f32, def: 0.0'f32)
+
+proc pfxE(label, key: string): PfxRow =
+  PfxRow(kind: pkChoice, label: label, key: key, presetOwned: false,
+         lo: 0.0'f32, hi: 0.0'f32, def: 0.0'f32)
 
 proc pfxCatalogue(): seq[PfxRow] =
-  ## The 29 settings `mods/graphics/graphics.nim:schema()` declares, in its own
-  ## order, under its own category names. Transcribed rather than fetched --
-  ## see the header comment for why the fetch is not available -- so this is a
-  ## STATIC MIRROR and will drift if the mod's schema changes. `pfxAuditKeys`
-  ## below is what makes that drift visible instead of silent.
-  @[pfxHead("Preset"),
-    pfxRow("Preset", "preset", false),
-    pfxHead("Post-process"),
-    pfxRow("Enable post-process", "enabled", false),
-    pfxRow("Raid only (menu stays stock)", "raidOnly", false),
-    pfxHead("Tonemap"),
-    pfxRow("Tonemapper", "tonemapper", true),
-    pfxRow("Tonemap strength", "tonemapStrength", true),
-    pfxRow("Exposure (EV)", "exposure", true),
-    pfxHead("Grade"),
-    pfxRow("Contrast", "contrast", true),
-    pfxRow("Saturation", "saturation", true),
-    pfxRow("Vibrance", "vibrance", true),
-    pfxRow("Shadow detail (toe lift)", "shadowDetail", true),
-    pfxHead("White balance"),
-    pfxRow("Temperature", "temperature", true),
-    pfxRow("Tint", "tint", true),
-    pfxHead("Lift, Gamma, Gain"),
-    pfxRow("Lift (shadows)", "lift", true),
-    pfxRow("Gamma (midtones)", "gamma", true),
-    pfxRow("Gain (highlights)", "gain", true),
-    pfxHead("Legacy (AgX)"),
-    pfxRow("Shadow lift (additive)", "shadows", true),
-    pfxRow("Highlight roll-off", "highlights", true),
-    pfxHead("Sharpen"),
-    pfxRow("Sharpening (CAS)", "sharpness", true),
-    pfxHead("Bloom"),
-    pfxRow("Bloom", "bloom", true),
-    pfxRow("Bloom strength", "bloomStrength", true),
-    pfxRow("Bloom threshold", "bloomThreshold", true),
-    pfxHead("Vignette"),
-    pfxRow("Vignette", "vignette", true),
-    pfxRow("Vignette radius", "vignetteRadius", true),
-    pfxHead("Detail"),
-    pfxRow("Clarity (local contrast)", "clarity", true),
-    pfxHead("Film"),
-    pfxRow("Film grain", "grain", true),
-    pfxRow("Grain size (px)", "grainSize", true),
-    pfxRow("Output dither (LSB)", "dither", true),
-    pfxHead("Lens"),
-    pfxRow("Chromatic aberration", "chroma", true),
-    pfxHead("Debug"),
-    pfxRow("Red-tint diagnostic", "diag", false)]
+  ## The 29 settings `mods/graphics/graphics.nim:schema()` declares, with the
+  ## kind, range and default it declares for each. A STATIC MIRROR -- the
+  ## schema fetch that would make it live is blocked (see the header) -- so it
+  ## will drift if the mod's schema changes.
+  ##
+  ## Ordered by the schema's own category, and WITHOUT category headers: a
+  ## settings tab has no header prefab, and inventing one out of a label would
+  ## be exactly the from-scratch construction this change exists to remove.
+  @[pfxE("Preset", "preset"),
+    pfxB("Enable post-process", "enabled", false),
+    pfxB("Raid only (menu stays stock)", "raidOnly", false),
+    pfxE("Tonemapper", "tonemapper"),
+    pfxF("Tonemap strength", "tonemapStrength", true, 0.0'f32, 1.0'f32, 0.85'f32),
+    pfxF("Exposure (EV)", "exposure", true, -3.0'f32, 3.0'f32, 0.0'f32),
+    pfxF("Contrast", "contrast", true, 0.5'f32, 1.8'f32, 1.05'f32),
+    pfxF("Saturation", "saturation", true, 0.0'f32, 2.0'f32, 1.05'f32),
+    pfxF("Vibrance", "vibrance", true, 0.0'f32, 1.0'f32, 0.35'f32),
+    pfxF("Shadow detail (toe lift)", "shadowDetail", true, 0.0'f32, 1.0'f32, 0.35'f32),
+    pfxF("Temperature", "temperature", true, -1.0'f32, 1.0'f32, 0.0'f32),
+    pfxF("Tint", "tint", true, -1.0'f32, 1.0'f32, 0.0'f32),
+    pfxF("Lift (shadows)", "lift", true, -0.2'f32, 0.2'f32, 0.0'f32),
+    pfxF("Gamma (midtones)", "gamma", true, 0.5'f32, 1.8'f32, 1.0'f32),
+    pfxF("Gain (highlights)", "gain", true, 0.5'f32, 1.8'f32, 1.0'f32),
+    pfxF("Shadow lift (additive)", "shadows", true, -0.2'f32, 0.2'f32, 0.0'f32),
+    pfxF("Highlight roll-off", "highlights", true, 0.5'f32, 2.0'f32, 1.1'f32),
+    pfxF("Sharpening (CAS)", "sharpness", true, 0.0'f32, 1.0'f32, 0.35'f32),
+    pfxB("Bloom", "bloom", true),
+    pfxF("Bloom strength", "bloomStrength", true, 0.0'f32, 2.0'f32, 0.35'f32),
+    pfxF("Bloom threshold", "bloomThreshold", true, 0.0'f32, 1.0'f32, 0.70'f32),
+    pfxF("Vignette", "vignette", true, 0.0'f32, 1.0'f32, 0.18'f32),
+    pfxF("Vignette radius", "vignetteRadius", true, 0.5'f32, 1.5'f32, 1.0'f32),
+    pfxF("Clarity (local contrast)", "clarity", true, 0.0'f32, 1.0'f32, 0.30'f32),
+    pfxF("Film grain", "grain", true, 0.0'f32, 1.0'f32, 0.18'f32),
+    pfxF("Grain size (px)", "grainSize", true, 1.0'f32, 4.0'f32, 1.5'f32),
+    pfxF("Output dither (LSB)", "dither", true, 0.0'f32, 2.0'f32, 1.0'f32),
+    pfxF("Chromatic aberration", "chroma", true, 0.0'f32, 1.0'f32, 0.0'f32),
+    pfxB("Red-tint diagnostic", "diag", false)]
 
 proc pfxNoteFault(what: string) =
   inc gPfxFaults
@@ -160,29 +209,35 @@ proc pfxNoteFault(what: string) =
   if gPfxFaults >= PfxMaxFaults:
     gPfxOff = true
     warn "postfx rows: fault ceiling reached; this feature is OFF for the rest " &
-         "of the session. Nothing it built is left behind -- the elements it " &
-         "owns are destroyed on the next tear-down, and the PostFX panel goes " &
-         "back to exactly the empty stock panel it was."
+         "of the session. Nothing it built is left behind -- the rows it owns " &
+         "are destroyed on the next tear-down, and the PostFX panel goes back " &
+         "to exactly the empty stock panel it was."
 
 proc pfxDestroyAll(): int =
-  ## Tear our elements down. `nuDestroy` is generational, so a handle issued
-  ## before a release refuses as RELEASED rather than acting on a recycled
-  ## slot; that is why the list can be cleared without a second pass.
+  ## Tear our rows down. These are prefab INSTANCES we own (see the OWNERSHIP
+  ## note in the header: they are deliberately NOT registered in the tab's
+  ## `_createdControls`, so the game will not do it for us). `nuDestroy` asks
+  ## Unity's own `op_Implicit` liveness first, so a second call cannot
+  ## double-destroy.
   result = 0
   var i = 0
-  while i < gPfxElems.len and i < PfxMaxHandles:
-    if nuDestroy(gPfxElems[i]):
+  while i < gPfxRowGo.len and i < PfxMaxHandles:
+    if nuDestroy(gPfxRowGo[i]):
       result = result + 1
     i = i + 1
-  gPfxElems = @[]
+  if gPfxHaveBanner and nuDestroy(gPfxBanner):
+    result = result + 1
+  gPfxHaveBanner = false
+  gPfxRowGo = @[]
+  gPfxRowSlider = @[]
+  gPfxRowWant = @[]
+  gPfxRowName = @[]
   gPfxBuilt = false
 
 proc pfxDonorTmp(): Il2CppPtr =
   ## A LIVE `TextMeshProUGUI` whose font asset and materials `nuLabel` copies
-  ## in. Preference order is deliberate: the PostFX panel's own TMP first (same
-  ## panel, same styling), then the Graphics Settings panel's. Nothing is ever
-  ## written to the donor -- it is read for `m_fontAsset` and the materials and
-  ## then left alone.
+  ## in for the BANNER (the rows themselves need no donor -- a prefab instance
+  ## brings its own font). Nothing is ever written to the donor.
   result = nil
   if gGfxPostT != nil and duOk(gGfxPostT, 0x20'i32):
     result = modsFindTmp(gGfxPostT, 6)
@@ -191,113 +246,211 @@ proc pfxDonorTmp(): Il2CppPtr =
   if result != nil and not iUnityAlive(result):
     result = nil
 
+proc pfxTab(): Il2CppPtr =
+  ## The live `PostFXSettingsTab` COMPONENT, reached by WALKING from a verified
+  ## live object -- `gGfxPostT`, the "PostFX Settings" panel transform that the
+  ## subtab feature already located and validated -- and never by an offset
+  ## that can read null. `modsComponent` refuses a GameObject receiver up
+  ## front, which is the fault this walk would otherwise take.
+  result = nil
+  if gGfxPostT == nil or not duOk(gGfxPostT, 0x20'i32): return
+  if not iUnityAlive(gGfxPostT): return
+  result = modsComponent(gGfxPostT, "PostFXSettingsTab")
+  if result != nil and not nuOk(result, PfxOffToggleTemplate + 8'i32):
+    result = nil
+
+proc pfxMakeRow(prefab, parent: Il2CppPtr; r: PfxRow; idx: int32;
+                sliderOut: var Il2CppPtr): Il2CppPtr =
+  ## ONE row, the game's own way: Instantiate the prefab under the row parent,
+  ## then the fluent chain. Returns the row's GameObject (what we destroy), or
+  ## nil, and never leaves a half-built object parented in.
+  result = nil
+  sliderOut = nil
+  let row = nuInstantiateUnder(prefab, parent)
+  if row == nil: return
+  let go = nuGameObjectOf(row)
+  if go == nil:
+    # An instantiated component whose GameObject cannot be reached is not
+    # something to leave in the tree: we could neither activate nor destroy it.
+    warn "postfx rows: the instantiated row for '" & r.key & "' has no " &
+         "reachable GameObject, so it could be neither shown nor torn down. " &
+         "Refusing this row."
+    return
+  # The caption. `SetText` is the game's own setter and takes a LOCALIZATION
+  # KEY; an aowlspt setting has no BSG locale entry, so the literal is passed
+  # and renders as itself. A raw `m_text` store would be clobbered by
+  # `LocalizedText`, which is why the setter is called rather than the field
+  # written.
+  let cap = (if r.presetOwned: "* " else: "") & r.label
+  if not nuRowSetText(row, cap):
+    warn "postfx rows: SetText refused for '" & r.key & "'; the row would " &
+         "carry the PREFAB's own caption, which reads as a stock setting " &
+         "that is not there. Refusing this row."
+    discard nuDestroy(go)
+    return
+  # The GameObject name is what the live inspector's `find` searches on, and it
+  # is how a later session tells our row from a stock one without guessing.
+  discard nuRowSetName(row, "aowlspt-pfx-" & r.key)
+  discard nuRowSetSiblingIndex(row, idx)
+  if r.kind == pkSlider:
+    let sl = nuRowSlider(row)
+    if sl == nil:
+      warn "postfx rows: '" & r.key & "' instantiated but its inner " &
+           "NumberSlider (SettingFloatSlider.Slider @0xa8) read null, so the " &
+           "row would show a slider with no range and no value. Refusing it."
+      discard nuDestroy(go)
+      return
+    if not nuSliderShow(sl, r.lo, r.hi, "F2"):
+      warn "postfx rows: NumberSlider::Show refused for '" & r.key &
+           "' (range " & nuF(r.lo) & ".." & nuF(r.hi) & "). Refusing this row."
+      discard nuDestroy(go)
+      return
+    discard nuSliderSetValue(sl, r.def)
+    sliderOut = sl
+  discard nuSetActive(go, true)
+  result = go
+
 proc pfxBuild(): bool =
-  ## Build the catalogue into the live PostFX panel. Called ONCE, from the tick,
-  ## only after the panel has actually been observed up.
+  ## Build the catalogue into the live PostFX panel. Called ONCE, from the
+  ## tick, only after the panel has actually been observed up.
   result = false
   if gPfxBuilt or gPfxOff or not gPfxOn:
     return
   inc gPfxTried
-  if gGfxPostGo == nil or not duOk(gGfxPostGo, 0x20'i32) or
-     not iUnityAlive(gGfxPostGo):
-    pfxNoteFault("the stock PostFX Settings GameObject is not a live object " &
-                 "right now, so there is nowhere to build. Nothing was added.")
+  if not nuTargetsBindOk():
+    pfxNoteFault("the aowl_nu_targets POSITIONAL self-check FAILED, so every " &
+                 "call this file makes would go to the wrong method with the " &
+                 "wrong frame. Nothing was built.")
     return
-  let donor = pfxDonorTmp()
-  if donor == nil:
-    pfxNoteFault("no live donor TextMeshProUGUI could be found under either " &
-                 "stock panel. nuLabel REFUSES without one -- a from-scratch " &
-                 "TMP with a null m_fontAsset faults inside Awake -- so " &
-                 "nothing was built rather than something unsafe.")
+  let tab = pfxTab()
+  if tab == nil:
+    pfxNoteFault("the PostFXSettingsTab component could not be reached by " &
+                 "walking from the live 'PostFX Settings' panel transform. " &
+                 "Without it there is no row parent and no prefab, so nothing " &
+                 "was built. NOTE this is the tab COMPONENT, not the panel " &
+                 "GameObject the old from-scratch build parented onto.")
+    return
+  # THE ROW PARENT, and this is DEFECT 2's fix stated in one line: rows go into
+  # `_settingsRoot`, the container the game's own rows go into and the one its
+  # LayoutGroup drives. The previous build parented onto the PANEL ROOT with
+  # explicit offsets, deliberately, to escape that layout group -- which is why
+  # its rows started part-way down the page instead of at the top of the list.
+  let parent = (if nuOk(tab, PfxOffSettingsRoot + 8'i32):
+                  cNuGetRef(tab, PfxOffSettingsRoot) else: nil)
+  if not nuOk(parent, 0x10'i32) or not nuAlive(parent):
+    pfxNoteFault("PostFXSettingsTab._settingsRoot @0xa0 read null, unreadable " &
+                 "or not a live Unity object. That field is serialized and is " &
+                 "populated when the prefab loads, so this is 'asked too " &
+                 "early' rather than a wrong offset. Nothing was built and " &
+                 "nothing was parented anywhere.")
+    return
+  let togPrefab = (if nuOk(tab, PfxOffToggleTemplate + 8'i32):
+                     cNuGetRef(tab, PfxOffToggleTemplate) else: nil)
+  let sliPrefab = (if nuOk(tab, PfxOffSliderTemplate + 8'i32):
+                     cNuGetRef(tab, PfxOffSliderTemplate) else: nil)
+  let drpPrefab = (if nuOk(tab, PfxOffDropTemplate + 8'i32):
+                     cNuGetRef(tab, PfxOffDropTemplate) else: nil)
+  if not nuOk(togPrefab, 0x10'i32) and not nuOk(sliPrefab, 0x10'i32):
+    pfxNoteFault("NEITHER _toggleLeftTemplate @0xc0 nor " &
+                 "_selectFloatSliderTemplate @0xb0 read back as a live " &
+                 "object, so there is no prefab to instantiate. Refusing to " &
+                 "fall back to building controls from scratch -- that is the " &
+                 "workaround this change removed.")
     return
   let rows = pfxCatalogue()
-  # LAYOUT. Parented straight onto the stock panel GameObject rather than onto
-  # its content container: the container carries the game's own LayoutGroup,
-  # which DRIVES the RectTransform of every direct child and would overwrite
-  # the explicit offsets below. The panel itself does not.
-  #
-  # Top-left anchored, y NEGATIVE going down -- the convention nuikit's own
-  # proof used. Three columns so the 40 lines fit a panel-height page without
-  # a scroll view we have no way to build yet.
-  const colX = [60.0'f32, 640.0'f32, 1220.0'f32]
-  const colW = 540.0'f32
-  const rowH = 30.0'f32
-  const topY = -150.0'f32
-  const perCol = 14
-  gPfxElems = @[]
-  # THE BANNER. First, and it says what the page is -- including what it cannot
-  # do yet. A page that quietly shows names where a player expects controls is
-  # the same defect as a control that quietly does nothing.
-  let banner = nuLabel(gGfxPostGo, donor, 60.0'f32, -100.0'f32, 1700.0'f32,
-                       40.0'f32,
-                       "aowlspt post-process - the " & $(rows.len) &
-                       " settings mods/graphics declares. NAMES ONLY for now: " &
-                       "live values need the mod schema fetch, which is " &
-                       "disabled because it crashes the client. * = owned by " &
-                       "the active Preset and ignored until Preset = custom.",
-                       18.0'f32, 1.0'f32, 0.78'f32, 0.35'f32, 1.0'f32,
-                       "aowl-pfx-banner")
-  if not nuLive(banner):
-    pfxNoteFault("the banner label could not be built (nuikit logged the " &
-                 "refusal above). Building 40 more would only repeat it, so " &
-                 "nothing further was attempted and nothing is left on screen.")
-    discard pfxDestroyAll()
-    return
-  gPfxElems.add(banner)
+  gPfxRowGo = @[]
+  gPfxRowSlider = @[]
+  gPfxRowWant = @[]
+  gPfxRowName = @[]
+  gPfxDeclined = @[]
   var built = 0
-  var refusedRows = 0
+  var refused = 0
   var i = 0
-  var slot = 0
-  while i < rows.len and i < PfxMaxRows and gPfxElems.len < PfxMaxHandles:
-    let col = slot div perCol
-    if col > 2:
-      break                     # out of columns; capped rather than overflowing
-    let y = topY - rowH * float32(slot mod perCol)
-    let txt = (if rows[i].header: "-- " & rows[i].label & " --"
-               else: (if rows[i].presetOwned: "* " else: "   ") & rows[i].label)
-    let e = nuLabel(gGfxPostGo, donor, colX[col], y, colW, rowH - 4.0'f32, txt,
-                    (if rows[i].header: 19.0'f32 else: 17.0'f32),
-                    (if rows[i].header: 1.0'f32 else: 0.85'f32),
-                    (if rows[i].header: 0.78'f32 else: 0.85'f32),
-                    (if rows[i].header: 0.35'f32 else: 0.85'f32),
-                    1.0'f32,
-                    "aowl-pfx-" & (if rows[i].header: "head" else: rows[i].key))
-    if nuLive(e):
-      gPfxElems.add(e)
+  while i < rows.len and i < PfxMaxRows and gPfxRowGo.len < PfxMaxHandles:
+    let r = rows[i]
+    if r.kind == pkChoice:
+      # THE LOUD DECLINE. Named here, named in the summary, named on screen.
+      gPfxDeclined.add r.key
+      i = i + 1
+      continue
+    let prefab = (if r.kind == pkToggle: togPrefab else: sliPrefab)
+    if not nuOk(prefab, 0x10'i32):
+      gPfxDeclined.add r.key
+      refused = refused + 1
+      i = i + 1
+      continue
+    var sl: Il2CppPtr = nil
+    let go = pfxMakeRow(prefab, parent, r, int32(built), sl)
+    if go != nil:
+      gPfxRowGo.add go
+      gPfxRowSlider.add sl
+      gPfxRowWant.add r.def
+      gPfxRowName.add r.key
       built = built + 1
     else:
-      refusedRows = refusedRows + 1
-    slot = slot + 1
+      refused = refused + 1
     i = i + 1
   if built == 0:
-    pfxNoteFault("zero rows were built out of " & $rows.len & " declared; " &
-                 "tearing down the banner so the panel is left exactly stock")
+    pfxNoteFault("zero rows were built out of " & $rows.len & " declared (" &
+                 $refused & " refused, " & $gPfxDeclined.len & " declined as " &
+                 "an unreachable row kind). Nothing is left in the panel.")
     discard pfxDestroyAll()
     return
+  # THE BANNER, last, and only once there is something for it to caption. It is
+  # the one from-scratch element left in this file, and it exists to say on
+  # screen what the rows cannot do -- a page that quietly shows unbound knobs
+  # is the same defect as a control that quietly does nothing.
+  let donor = pfxDonorTmp()
+  if donor != nil and gGfxPostGo != nil:
+    var declinedTxt = ""
+    var d = 0
+    while d < gPfxDeclined.len and d < 8:
+      declinedTxt = declinedTxt & (if d > 0: ", " else: "") & gPfxDeclined[d]
+      d = d + 1
+    let b = nuLabel(gGfxPostGo, donor, 60.0'f32, -60.0'f32, 1700.0'f32,
+                    40.0'f32,
+                    "aowlspt post-process - " & $built & " row(s) built from " &
+                    "the game's own settings prefabs. The values are the mod's " &
+                    "DECLARED DEFAULTS, not your saved config, and the rows " &
+                    "are NOT BOUND yet - moving one changes nothing. " &
+                    "* = owned by the active Preset and ignored until " &
+                    "Preset = custom. No row for: " &
+                    (if declinedTxt.len > 0: declinedTxt else: "-") &
+                    " (dropdown binds are generic and have no address).",
+                    18.0'f32, 1.0'f32, 0.78'f32, 0.35'f32, 1.0'f32,
+                    "aowl-pfx-banner")
+    if nuLive(b):
+      gPfxBanner = b
+      gPfxHaveBanner = true
   gPfxBuilt = true
-  okLog "postfx rows: built " & $built & " native row(s) into the stock PostFX " &
-        "Settings panel from " & $rows.len & " declared setting(s) (" &
-        $refusedRows & " refused). NOTHING WAS CLONED -- every element is a " &
-        "from-scratch TextMeshProUGUI via nuikit, and the only thing borrowed " &
-        "from a live object is the donor's font asset."
+  okLog "postfx rows: built " & $built & " NATIVE PREFAB row(s) into " &
+        "PostFXSettingsTab._settingsRoot -- " &
+        "instantiated from the tab's own serialized templates" &
+        " (_toggleLeftTemplate @0xc0 / _selectFloatSliderTemplate @0xb0) via " &
+        "Object::Instantiate(Object,Transform,bool) @0x52ADDA0, captioned " &
+        "with SettingControl::SetText @0x16FA890. NOTHING WAS CLONED and " &
+        "nothing was built from scratch except the banner. " & $refused &
+        " row(s) refused, " & $gPfxDeclined.len & " DECLINED as a row kind " &
+        "we cannot honestly build (dropdown/select-slider binds are generic " &
+        "and have no offline address). This is a STRUCTURAL report of what " &
+        "was called; the verdict below is the finished-state read."
   result = true
 
 proc pfxVerdict() =
-  ## THE §9b ACCEPTANCE TEST FOR BUG 2, read back off the live tree.
+  ## THE 9b ACCEPTANCE TEST, read back off the LIVE objects.
   ##
-  ##     the PostFX panel contains N>0 rows we built, each reading back with a
-  ##     renderable rect and non-empty text
+  ## Two assertions, and both can fail:
+  ##   * every row we own reads back `activeInHierarchy` -- a row that is on
+  ##     the page but not in the hierarchy is invisible and unpressable, which
+  ##     is exactly the "blank panel" the player reported;
+  ##   * every FLOAT row's inner `NumberSlider::CurrentValue()` @0x16B5850
+  ##     reads back the value we asked for. That is a read of the LIVE widget
+  ##     through a different method than the one that wrote it -- not a
+  ##     re-read of our own variable -- so a `Show` that silently clamped, an
+  ##     inverted range or a slider that never took the value all break it.
   ##
-  ## Stated as a count, and every count comes from `nuElemRect` / `nuElemText` /
-  ## `nuElemActive`, which resolve the handle and then ask the LIVE
-  ## `RectTransform` and the LIVE `TMP_Text` -- not from the strings this file
-  ## passed to `nuLabel` a moment ago. A row that reads back with a zero-area
-  ## rect is on the page and invisible, which is exactly the "blank stuff" the
-  ## player reported, so it counts as a FAILURE here and not as a row.
-  ##
-  ## Three outcomes. INCONCLUSIVE covers "the handle did not resolve" and
-  ## "nothing was ever built because the screen was not opened", and it is never
-  ## folded into either of the other two.
+  ## The read is refusable: `nuSliderValue` returns `(false, _)` when it could
+  ## not ask, and that counts as INCONCLUSIVE, never as a pass. Three outcomes.
   if gPfxVerdictSaid:
     return
   if not gPfxBuilt:
@@ -309,54 +462,59 @@ proc pfxVerdict() =
            "fault line above for which hop refused."
     return
   var good = 0
-  var noText = 0
-  var noRect = 0
   var notActive = 0
+  var wrongValue = 0
   var incon = 0
+  var firstBad = ""
   var i = 0
-  while i < gPfxElems.len and i < PfxMaxHandles:
-    let e = gPfxElems[i]
-    if not nuLive(e):
+  while i < gPfxRowGo.len and i < PfxMaxHandles:
+    let go = gPfxRowGo[i]
+    if not nuOk(go, 0x10'i32) or not nuAlive(go):
       incon = incon + 1
-    else:
-      let (rOk, _, _, w, h) = nuElemRect(e)
-      let t = nuElemText(e)
-      let act = nuElemActive(e)
+    elif not nuActiveInHierarchy(go):
+      notActive = notActive + 1
+      if firstBad.len == 0: firstBad = gPfxRowName[i] & " (not in hierarchy)"
+    elif gPfxRowSlider[i] != nil:
+      let (rOk, v) = nuSliderValue(gPfxRowSlider[i])
       if not rOk:
         incon = incon + 1
-      elif w <= 1.0'f32 or h <= 1.0'f32:
-        noRect = noRect + 1
-      elif t.len == 0:
-        noText = noText + 1
-      elif not act:
-        notActive = notActive + 1
+      elif v - gPfxRowWant[i] > 0.01'f32 or gPfxRowWant[i] - v > 0.01'f32:
+        wrongValue = wrongValue + 1
+        if firstBad.len == 0:
+          firstBad = gPfxRowName[i] & " (asked " & nuF(gPfxRowWant[i]) &
+                     ", the live slider reads " & nuF(v) & ")"
       else:
         good = good + 1
+    else:
+      good = good + 1
     i = i + 1
   gPfxVerdictSaid = true
   if good == 0:
-    warn "postfx rows VERDICT FAIL: 0 of " & $gPfxElems.len & " element(s) " &
-         "read back as a drawable row (" & $noRect & " zero-area rect, " &
-         $noText & " empty text, " & $notActive & " not activeInHierarchy, " &
-         $incon & " unreadable). The PostFX panel is still blank to the player " &
-         "even though the build reported success -- that gap is the whole " &
-         "reason this check reads the live objects instead of the writes."
-  elif noRect > 0 or noText > 0 or notActive > 0:
-    warn "postfx rows VERDICT FAIL: " & $good & " of " & $gPfxElems.len &
-         " element(s) are drawable, but " & $noRect & " have a zero-area rect, " &
-         $noText & " read back EMPTY text and " & $notActive & " are not " &
-         "activeInHierarchy. A partially blank page is still the reported bug."
+    warn "postfx rows VERDICT FAIL: 0 of " & $gPfxRowGo.len & " prefab row(s) " &
+         "read back as a live, in-hierarchy row with the value it was given (" &
+         $notActive & " not activeInHierarchy, " & $wrongValue &
+         " value did not take, " & $incon & " unreadable). First: " &
+         (if firstBad.len > 0: firstBad else: "none named") &
+         ". The panel is still blank to the player even though the build " &
+         "reported success -- that gap is why this reads the live objects."
+  elif notActive > 0 or wrongValue > 0:
+    warn "postfx rows VERDICT FAIL: " & $good & " of " & $gPfxRowGo.len &
+         " row(s) are good, but " & $notActive & " are not activeInHierarchy " &
+         "and " & $wrongValue & " read back a value that is not the one they " &
+         "were given. First: " & firstBad & ". A partially wrong page is " &
+         "still the reported bug."
   elif incon > 0:
-    warn "postfx rows VERDICT INCONCLUSIVE: " & $good & " element(s) read back " &
-         "drawable with non-empty text, but " & $incon & " of " &
-         $gPfxElems.len & " could not be read at all, so the page was not " &
-         "fully observed. This is NOT a pass."
+    warn "postfx rows VERDICT INCONCLUSIVE: " & $good & " row(s) read back " &
+         "correctly, but " & $incon & " of " & $gPfxRowGo.len & " could not " &
+         "be read at all, so the page was not fully observed. NOT a pass."
   else:
-    okLog "postfx rows VERDICT PASS: " & $good & " of " & $gPfxElems.len &
-          " native element(s) in the stock PostFX Settings panel read back " &
-          "activeInHierarchy, with a non-zero rect AND non-empty text, off " &
-          "the live RectTransform and the live TMP_Text. The panel that used " &
-          "to be blank now renders " & $good & " row(s), none of them cloned."
+    okLog "postfx rows VERDICT PASS: " & $good & " of " & $gPfxRowGo.len &
+          " native prefab row(s) read back activeInHierarchy, and every float " &
+          "row's inner NumberSlider reports the value it was given when asked " &
+          "through CurrentValue() -- a different method than the one that " &
+          "wrote it. " & $gPfxDeclined.len & " setting(s) have NO row at all " &
+          "and that is deliberate, not a failure: their kind is a dropdown, " &
+          "whose binds are generic and have no offline address."
 
 proc pfxOnPanelUp(postUp: bool) =
   ## Called every tick from `gfxTickBody`, inside its existing guard. The
@@ -373,13 +531,13 @@ proc pfxOnPanelUp(postUp: bool) =
 
 proc pfxOnScreenClosed() =
   ## The settings screen went away. Re-arm the verdict so the NEXT visit prints
-  ## a fresh one, and drop our elements if the panel they were parented to has
-  ## been destroyed under us -- a stale handle here is exactly what nuikit's
-  ## generation counters refuse, but the list should not grow forever either.
+  ## a fresh one, and drop our rows if the container they were parented to has
+  ## been destroyed under us. We own these rows outright (they are NOT in the
+  ## tab's `_createdControls`), so nothing else will ever clean them up.
   gPfxVerdictSaid = false
   if gPfxBuilt and (gGfxPostGo == nil or not duOk(gGfxPostGo, 0x20'i32) or
                     not iUnityAlive(gGfxPostGo)):
     let n = pfxDestroyAll()
     okLog "postfx rows: the PostFX panel was destroyed under us; " & $n &
-          " element(s) of ours were torn down and will be rebuilt on the next " &
+          " row(s) of ours were torn down and will be rebuilt on the next " &
           "visit. Nothing stale is left parented into a dead object."

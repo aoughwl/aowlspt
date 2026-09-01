@@ -191,7 +191,8 @@ class Supervisor:
     incidental exception logged beside it usually does not.
     """
 
-    def __init__(self, root, until, stall, quiet, phase_max=900.0):
+    def __init__(self, root, until, stall, quiet, phase_max=900.0,
+                 until_phase=None):
         self.host_path = harness.hostlog_path(root)
         self.until = until
         self.stall = stall
@@ -201,6 +202,10 @@ class Supervisor:
         # phase in `phase_max` is wedged -- which is a state, not a duration,
         # and is the thing `time.sleep(60.0)` could never express.
         self.phase = None
+        # Arrive on a STATE the client publishes about itself, instead of
+        # waiting for a log line to imply it. "We are already on the main menu,
+        # why are we still waiting" -- because nothing consulted this.
+        self.until_phase = until_phase
         self.phase_since = time.time()
         self.phase_max = phase_max
         # The BACKEND log, tailed exactly like the host log. The launcher has
@@ -347,6 +352,25 @@ class Supervisor:
                     self.phase = ph
                     self.phase_since = time.time()
                     self.last_progress = time.time()
+
+                    # ARRIVED. The host publishing a phase is the client
+                    # SAYING where it is, which beats waiting for a log
+                    # sentinel to imply it.
+                    if self.until_phase and ph == self.until_phase:
+                        return ("REACHED",
+                                "the host published raid phase = %s" % ph,
+                                [line.strip()])
+
+                    # NOTE on a rule deliberately NOT implemented here: it is
+                    # tempting to declare a load-phase `--until` FUTILE the
+                    # moment MENU is published, since the mod loading screen
+                    # and profile load are over by then. But MENU only means
+                    # "no GameWorld is cached", which is equally true during
+                    # early boot -- so that rule would abort healthy runs
+                    # exactly the way the `il2cpp_init returned 0` entry in
+                    # FATAL_HOST_LINES did. The honest bound for "parked at a
+                    # screen" is the IDLE detector, which works now that
+                    # heartbeats no longer refresh the progress clock.
                 elif (self.phase_max and
                       time.time() - self.phase_since > self.phase_max):
                     # Bounded on a STATE, not a duration: the host is still
@@ -441,6 +465,12 @@ def main():
     p.add_argument("--until", default=None,
                    help="host-log literal that counts as success")
     p.add_argument("--timeout", type=int, default=300)
+    p.add_argument("--until-phase", default=None,
+                   metavar="MENU|LOADING|DEPLOYED",
+                   help="stop as soon as the host publishes this raid phase. "
+                        "The client saying where it is beats waiting for a log "
+                        "line to imply it: MENU = the main menu is up, "
+                        "DEPLOYED = standing in the raid.")
     p.add_argument("--phase-max", type=float, default=900.0,
                    help="seconds allowed in ONE raid phase before the run is "
                         "called STALLED. Bounds the raid on a published "
@@ -512,7 +542,8 @@ def main():
         subprocess.Popen([launcher], cwd=install_dir(args.root))
 
     sup = Supervisor(args.root, args.until, args.stall, quiet,
-                     phase_max=args.phase_max)
+                     phase_max=args.phase_max,
+                     until_phase=args.until_phase)
     state["sup"] = sup   # the signal handler reports from the live object
     verdict = why = None
     evidence = []

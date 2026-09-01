@@ -628,10 +628,23 @@ proc slotFilter(def: JsonRef; r: var Rng): string =
   ## slots in stock data, plus required child slots). A weapon missing a required
   ## part does not function on the client, so fitting a stock-compatible part is
   ## strictly better than serving the broken gun the player actually saw.
+  ##
+  ## MEASURED 2026-09-01, and this is the defect that shipped a bare receiver to
+  ## a player: the filter array is nested ONE level deeper than this proc used to
+  ## read. A stock slot definition is
+  ## `{_name, _parent, _props: {filters: [{Filter: [...]}]}}` -- there is no
+  ## top-level `filters` key at all, so `def.field("filters")` was `notFound`,
+  ## `count` was 0, and EVERY required slot came back "names no template". Every
+  ## other reader in this module and in `emu/loadout` already spelled it
+  ## `_props.filters`; this one proc did not. `slotFilterNestedProps` is the
+  ## marker for that fix.
   if not def.found:
     return ""
-  let filters = def.field("filters")
-  let f0 = at(filters, 0)
+  var f0 = at(def.field("_props").field("filters"), 0)
+  if not f0.found:
+    # A hand-written fixture or a future schema that omits the `_props` wrapper.
+    # Accepted, but never in place of the real nesting above.
+    f0 = at(def.field("filters"), 0)
   let list = f0.field("Filter")
   let n = count(list)
   if n <= 0:
@@ -799,7 +812,8 @@ proc fillRequiredSlots*(items: var List; rootId, rootTpl: string; r: var Rng;
       if tpl.len == 0:
         stat.unfillable.add parentTpl & "." & slotName &
           ": required, but its _props.Slots[]._props.filters[0].Filter names " &
-          "no template, so nothing can be fitted and the item is INCOMPLETE"
+          "no template, so nothing can be fitted and the item is INCOMPLETE " &
+          "[slotFilterNestedProps]"
         continue
       let modId = newId()
       items.add botItem(modId, tpl, parentId, slotName)
