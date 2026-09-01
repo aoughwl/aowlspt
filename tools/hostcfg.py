@@ -79,6 +79,12 @@ BOOL_CALL = re.compile(r'readBoolKey(?:Def)?\(\s*"([A-Za-z0-9_]+)"')
 # missing: `launchProfileId` (aowlhost.nim) and `uxBetaOverlayPos`
 # (betanotice.nim). A key this tool cannot see is a key `set` refuses to write.
 STR_CALL = re.compile(r'readStrKey\(\s*"([A-Za-z0-9_]+)"')
+# Integer keys read through `readIntKey` were ALSO invisible -- only the three
+# hand-named INT_KEYS were known. Measured 2026-09-01: `modLoadWalkLevel`, the
+# bisect instrument for a client-killing crash, reported as UNKNOWN ("not in
+# this tool's manifest... not near any known key"), which reads as a typo
+# warning for a valid key -- a confidently wrong answer at the worst moment.
+INT_CALL = re.compile(r'readIntKey(?:Def)?\(\s*"([A-Za-z0-9_]+)"')
 # `readStaticBridgeEnabled` does not go through `readBoolKey`; it builds its own
 # needle as the nim literal `"\"bridgeStaticRva\""`. Match that shape so a flag
 # read the hand-rolled way is still known here.
@@ -133,6 +139,9 @@ def scrape_keys(hostdir):
             hit = True
         for m in STR_CALL.finditer(text):
             keys.setdefault(m.group(1), ("str", os.path.basename(path)))
+            hit = True
+        for m in INT_CALL.finditer(text):
+            keys.setdefault(m.group(1), ("int", os.path.basename(path)))
             hit = True
         if hit:
             scanned += 1
