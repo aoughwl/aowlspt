@@ -261,6 +261,22 @@ TABLES = [
         "count": "cBotAiTargetCount",
         "users": ["host/Aowlspt.Host.Il2Cpp/botai.nim"],
     },
+    # The in-game error-dialog catcher. A sweep, and deliberately one whose row
+    # order carries NO meaning the body depends on: the argument shape (R8 is a
+    # System.String on two rows and a System.Exception on the third) and the
+    # reported kind are stored IN the row and read back through
+    # aowl_ed_target_shape/_kind, not computed from the index. Reading an
+    # Exception with the string shape would walk an object header as a UTF-16
+    # length, so this is fact #187 at its worst.
+    {
+        "mode": "sweep",
+        "header": "abi/aowlspt_errdlg.h",
+        "array": "aowl_ed_targets",
+        "at": "cEdTargetAt",
+        "name": "cEdTargetName",
+        "count": "cEdTargetCount",
+        "users": ["host/Aowlspt.Host.Il2Cpp/errdlg.nim"],
+    },
     {
         "mode": "sweep",
         "header": "abi/aowlspt_botcap.h",

@@ -57,6 +57,8 @@
     "IL2CPP runtime bound, all essential entry points present",
     "overlay ready (F12 opens settings)",
     "botcap (offline bot-cap lift)",
+    "ERRORDIALOG kind=",
+    "errdlg ARMED: read-only postfix detours on all ",
     "botdiag",
     "botai",
     "debugui: PreloaderUI::Update detour is live",

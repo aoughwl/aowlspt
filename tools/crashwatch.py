@@ -14,10 +14,11 @@ is the loudest line the tool ever writes (signature, matched text, PIDs, to the
 sink and to stdout); the `armed` line states whether THIS instance can kill; and
 a second `--watch` instance is refused unless you pass --allow-duplicates.
 
-This watcher tails the CLIENT's OWN logs under D:\Aowlspt\Logs (not the host
-log; that is harness.py's job -- see the note at the bottom of this docstring).
-It never reads a whole log: it seeks to the current end and reads only new bytes
-as they are written, so a 230 KB output_000.log costs nothing.
+This watcher tails the CLIENT's OWN logs under D:\Aowlspt\Logs, AND the host log
+for the one thing the client's logs can never show: the in-game error dialog
+(`--no-host` turns that half off). It never reads a whole log: it seeks to the
+current end and reads only new bytes as they are written, so a 230 KB
+output_000.log costs nothing.
 
     python tools/crashwatch.py               # one-shot: observe + report, exit
     python tools/crashwatch.py --watch       # keep observing across relaunches
@@ -50,6 +51,15 @@ session inside ordinary async stack dumps -- is NEVER matched on its own.
   * aggregate-exception    "One or more errors occurred" / AggregateException --
                            the raid-load NRE cascade shows up exactly this way.
   * raid-load-abort        "A task was canceled" / TaskCanceledException.
+  * in-game-error-dialog   an ERRORDIALOG line in the HOST log (not a client
+                           log -- the client does not consider a modal error
+                           window an error and logs nothing). This is the case
+                           that used to be invisible: the process stays alive,
+                           no Error record is written, and the game sits on the
+                           dialog forever waiting for a click that no unattended
+                           run will ever make. A dialog is a crash with a button
+                           on it, so it is treated as one. Needs the host's
+                           `catchErrorDialogs` feature, which is ON by default.
   * matchmaking-timeout    a NetworkGameMatching trace armed, then ZERO load
                            progress of ANY kind for --match-timeout seconds
                            (default 150). Load progress = the raid is loading,
@@ -98,6 +108,7 @@ except Exception:
 # Windows-style path on purpose: MSYS/.NET mangle /d/... inconsistently
 # (fact #152). Everything downstream stays absolute and uses forward slashes.
 DEFAULT_LOGS = "D:/Aowlspt/Logs"
+DEFAULT_HOST_LOG = "D:/Aowlspt/aowlspt/aowlspt-host.log"
 PROCS = ["EscapeFromTarkov", "aowlspt-backend", "aowlspt-launch"]
 
 # The three client logs worth tailing. Filenames on this build are prefixed with
@@ -651,6 +662,88 @@ def report(signature, detail, record, log_path, tail, action, dedup=True):
     return True
 
 
+class HostTailer:
+    """Tail `aowlspt-host.log` for events the CLIENT's own logs cannot show.
+
+    The client logs are BSG's; they say nothing about an in-game error dialog,
+    because the client does not consider one an error -- it puts a modal window
+    up and waits for a click. From outside that is indistinguishable from the
+    game sitting idle at profile-select, which is the normal end state of every
+    scripted launch. So the whole class of "it stopped and is showing you a box"
+    was invisible to this watcher: the process is alive, no Error record is
+    written, and the timeout runs to completion.
+
+    The host's `errdlg` feature (abi/aowlspt_errdlg.h) closes that by detouring
+    the three `EFT.UI.PreloaderUI` error-screen entry points read-only and
+    writing ONE line per dialog:
+
+        ERRORDIALOG kind=<message|exception|critical> header="..." text="..."
+
+    That marker is the contract, and it is asserted by a deploy marker in
+    tools/deploy.json so a rebuild cannot silently drop it.
+
+    This is a much simpler tailer than `Tailer`: the host log is one event per
+    line with no multi-line records to reassemble, so there is nothing to
+    accumulate. It never reads the whole file -- it seeks to the end on first
+    open and reads only what is appended after, so a long-running session costs
+    nothing (CLAUDE.md section 8).
+    """
+
+    # A dialog is a crash with a button on it. `critical` is the unrecoverable
+    # one ("quit to desktop" class); both are fatal for an unattended run.
+    ERRDLG = re.compile(r"ERRORDIALOG\s+kind=(\S+)")
+
+    def __init__(self, path, from_start=False):
+        self.path = path
+        self.pos = 0
+        self.leftover = ""
+        self.ring = deque(maxlen=200)
+        if not from_start:
+            try:
+                self.pos = os.path.getsize(path)
+            except OSError:
+                self.pos = 0
+
+    def poll(self):
+        """Yield (signature, detail, line) for each new host-log event."""
+        try:
+            size = os.path.getsize(self.path)
+        except OSError:
+            return
+        if size < self.pos:          # truncated: a relaunch rewrote it
+            self.pos = 0
+            self.leftover = ""
+        if size == self.pos:
+            return
+        with open(self.path, "r", encoding="utf-8", errors="replace") as f:
+            f.seek(self.pos)
+            data = f.read()
+            self.pos = f.tell()
+        data = self.leftover + data
+        lines = data.split("\n")
+        self.leftover = lines.pop()
+        for raw in lines:
+            line = raw.rstrip("\r")
+            self.ring.append(line)
+            m = self.ERRDLG.search(line)
+            if not m:
+                continue
+            kind = m.group(1)
+            # The host prints one suppression notice once it has logged its cap,
+            # so a client erroring in a loop cannot flood the log. That notice is
+            # NOT another dialog and must not be reported as one -- it would put
+            # a fabricated extra crash in the report.
+            if 'header="<suppressed>"' in line:
+                continue
+            yield ("in-game-error-dialog",
+                   "the client raised a %s error window and is waiting for a "
+                   "click; it is not idle" % kind,
+                   line)
+
+    def tail_lines(self, n=15):
+        return list(self.ring)[-n:]
+
+
 def build_tailers(logdir, from_start):
     files = resolve_files(logdir)
     if not files:
@@ -763,18 +856,45 @@ def run(args):
               % ", ".join(WANT_SUFFIXES))
     match = MatchWatch(args.match_timeout) if not args.no_matchmaking else None
 
+    # The host log, watched alongside the client's own. This is the only source
+    # for an in-game error dialog: see HostTailer. It is deliberately tailed from
+    # the END by default, exactly like the client logs, so a dialog from a
+    # PREVIOUS session cannot kill a freshly relaunched game.
+    host = None
+    if not args.no_host:
+        if os.path.isfile(args.host_log):
+            host = HostTailer(args.host_log, from_start=args.scan_existing)
+            print("crashwatch: also watching %s for ERRORDIALOG" % args.host_log)
+        else:
+            # Say so rather than watching nothing quietly. A watcher that is
+            # silently not watching is worse than no watcher, because the run
+            # looks supervised and is not.
+            print("crashwatch: WARNING -- %s does not exist, so in-game error "
+                  "dialogs will NOT be detected on this run. An error dialog "
+                  "will look like an idle client." % args.host_log)
+
     last_idle_flush = time.time()
     last_dir_check = time.time()
 
     while True:
         hit = None
+        # The HOST log first. An error dialog is the one failure that nothing
+        # else here can see, and it is checked before the client logs so that
+        # when a dialog and some incidental client noise land in the same tick,
+        # the report names the dialog -- which is the cause and the actionable
+        # thing -- rather than whatever exception happened to be logged near it.
+        if host is not None:
+            for sig, detail, text in host.poll():
+                hit = (sig, detail, text, host)
+                break
         feed = match.feed if match is not None else None
-        for suf, t in list(tailers.items()):
-            for sig, detail, text in t.poll(on_line=feed):
-                hit = (sig, detail, text, t)
-                break
-            if hit:
-                break
+        if hit is None:
+            for suf, t in list(tailers.items()):
+                for sig, detail, text in t.poll(on_line=feed):
+                    hit = (sig, detail, text, t)
+                    break
+                if hit:
+                    break
         now = time.time()
 
         # Close dangling trailing records if the log paused mid-record.
@@ -1055,6 +1175,15 @@ def main():
                         "between the trace and the first geometry load)")
     p.add_argument("--no-matchmaking", action="store_true",
                    help="disable the (softest) matchmaking-timeout signature")
+    p.add_argument("--host-log", default=DEFAULT_HOST_LOG,
+                   help="aowlspt-host.log, tailed for ERRORDIALOG lines -- the "
+                        "in-game error dialog, which the client's own logs "
+                        "never mention (default: %(default)s)")
+    p.add_argument("--no-host", action="store_true",
+                   help="do not watch the host log. An in-game error dialog "
+                        "will then be undetectable and will look like an idle "
+                        "client, which is the failure this watcher exists to "
+                        "end -- so only pass this if the host is not running.")
     p.add_argument("--interval", type=float, default=0.5,
                    help="poll interval in seconds (default 0.5)")
     p.add_argument("--out", default=DEFAULT_SINK,

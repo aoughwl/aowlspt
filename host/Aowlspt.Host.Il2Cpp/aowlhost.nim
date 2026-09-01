@@ -273,6 +273,16 @@ static int aowl_rva_is_code(unsigned int rva) {
 ## one field poke is in `botcap.nim` (included below). See `aowlspt_botcap.h`.
 {.emit: """#include "aowlspt_botcap.h" """.}
 
+## CATCH THE IN-GAME ERROR DIALOG: the three offline-verified (and offline
+## UNIQUE-checked) `EFT.UI.PreloaderUI` error-screen entry points, the
+## System.Exception field offsets, and the guarded System.String readers. The
+## read-only detour bodies are in `errdlg.nim` (included below). This closes the
+## one failure mode neither harness.py nor crashwatch.py could see: a modal error
+## window is a crash with a button on it, and from outside it is identical to a
+## healthy idle client. See `aowlspt_errdlg.h`. Must come AFTER
+## `aowlspt_prologue.h` (line ~112) -- it verifies against the snapshot.
+{.emit: """#include "aowlspt_errdlg.h" """.}
+
 ## BOT AI ACTIVATION RESCUE: the guarded static target + field offsets for the one
 ## bool poke that releases `BotWeaponManager.IsReady`, the gate `BotOwner::
 ## UpdateManual` checks before it will ever call `BotOwner::Activate`. The detour
@@ -1516,6 +1526,37 @@ var gBotDiagCensusDone = false
 var gBotCapSlot = -1
 var gBotCap = false
 var gBotCapDone = false
+const KindMaxFeature = 25
+  ## The highest `kind` that `attachDrain` treats as a FEATURE detour rather than
+  ## as the main-thread update drain. Bump this when a new kind is added, and
+  ## nothing else in `attachDrain` needs touching: the two places that used to
+  ## enumerate every feature kind by hand now test `2 .. KindMaxFeature`. A kind
+  ## added without updating both of those hand-written chains fell through to the
+  ## drain branch and silently overwrote `gDrainMethod` with a feature's name.
+## CATCH THE IN-GAME ERROR DIALOG (kind=20/21/22 read-only postfix detours on the
+## three `EFT.UI.PreloaderUI` error-screen entry points): one slot per overload,
+## the opt-in flag (`catchErrorDialogs`), a session count, the FIRST dialog's text
+## (kept rather than the latest -- a cascade's first error is the cause and the
+## rest are consequences), and the target identity the dispatcher sets just before
+## it calls the shared guarded body, since the regs block carries no identity of
+## its own. Declared here beside the other detour slots; the read-only bodies live
+## in `errdlg.nim` (included below).
+var gErrDlgMsgSlot = -1
+var gErrDlgExcSlot = -1
+var gErrDlgCritSlot = -1
+var gErrDlg = false
+var gErrDlgCount = 0
+var gErrDlgFirst = ""
+var gErrDlgCritical = false
+var gErrDlgFiring = 0
+var gErrDlgRow: array[3, int] = [-1, -1, -1]
+  ## kind-20/21/22 slot  ->  the TARGET-TABLE ROW it actually bound, recorded at
+  ## bind time by `bindErrDlg`. The dispatcher looks the row up here instead of
+  ## assuming `row == kind - 20`. That assumption holds today and would keep
+  ## holding right up until somebody inserts a row in `aowl_ed_targets`, at which
+  ## point the exception overload would be read with the string shape -- walking
+  ## an object header as if it were a UTF-16 length. This is fact #187 in its
+  ## most dangerous form, so the mapping is measured rather than assumed.
 ## BOT AI ACTIVATION RESCUE (kind=12 detour on `EFT.BotOwner::PreActivate`): its
 ## slot, opt-in flag (`botAiActivate`), a fire counter (how many bots reached
 ## PreActivate at all) and a poke counter (how many needed the gate released).
@@ -3832,6 +3873,19 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
   if i == gBotCapSlot:
     botCapAddPlayerFired(regs)
     return 0'i32
+  # IN-GAME ERROR DIALOG, by identity. Three overloads, one shared read-only
+  # body; the slot is what tells them apart. Each returns 0 and MUST never
+  # suppress the original -- the window still has to come up for the person at
+  # the keyboard. We are only adding an observer.
+  if i == gErrDlgMsgSlot:
+    errDlgFired(regs, gErrDlgRow[0])
+    return 0'i32
+  if i == gErrDlgExcSlot:
+    errDlgFired(regs, gErrDlgRow[1])
+    return 0'i32
+  if i == gErrDlgCritSlot:
+    errDlgFired(regs, gErrDlgRow[2])
+    return 0'i32
   # BOT AI ACTIVATION RESCUE: the per-bot WeaponManager.IsReady poke, by identity.
   # It writes one byte and must never suppress the original PreActivate.
   if i == gBotAiSlot:
@@ -5236,6 +5290,9 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
               elif kind == 19: "spl-preloader-anchor"
               elif kind == 20: "true-deploy-signal-a"
               elif kind == 21: "true-deploy-signal-b"
+              elif kind == 23: "errdlg-message"
+              elif kind == 24: "errdlg-exception"
+              elif kind == 25: "errdlg-critical"
               else: "main-thread")
   tablesLock()
   let claimed = cHookClaim()
@@ -5321,28 +5378,30 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
     gRpStartSlotB = int(claimed)
   elif kind == 22:
     gPactOwnerSlot = int(claimed)
+  elif kind == 23:
+    gErrDlgMsgSlot = int(claimed)
+  elif kind == 24:
+    gErrDlgExcSlot = int(claimed)
+  elif kind == 25:
+    gErrDlgCritSlot = int(claimed)
   else:
     gDrainSlot = int(claimed)
   tablesUnlock()
   if kind == 1:
     gRenderMethod = spec
-  elif kind == 2 or kind == 3 or kind == 4 or kind == 5 or kind == 6 or
-       kind == 7 or kind == 8 or kind == 9 or kind == 10 or
-       kind == 11 or kind == 12 or kind == 13 or kind == 14 or kind == 15 or
-       kind == 16 or kind == 17 or kind == 18 or kind == 19 or
-       kind == 20 or kind == 21 or kind == 22:
+  elif kind >= 2 and kind <= KindMaxFeature:
+    # Every FEATURE detour (2..KindMaxFeature). Only kind 0 -- the main-thread
+    # update drain -- owns gDrainMethod/gDrainPerFrame. This used to be written
+    # out as a hand-maintained `kind == 2 or kind == 3 or ...` chain, twice, and
+    # a kind added without touching both places fell through to the `else` and
+    # silently overwrote the drain's identity. A range test cannot be forgotten.
     discard
   else:
     gDrainMethod = spec
     gDrainPerFrame = perFrame
   okLog what & " bound to " & spec & " (" &
         $int(cHookStolen(hook)) & " bytes)" &
-        (if perFrame or kind == 2 or kind == 3 or kind == 4 or kind == 5 or
-            kind == 6 or kind == 7 or kind == 8 or kind == 9 or
-            kind == 10 or kind == 11 or kind == 12 or kind == 13 or
-            kind == 14 or kind == 15 or kind == 16 or kind == 17 or
-            kind == 18 or kind == 19 or kind == 20 or kind == 21 or
-            kind == 22: "" else:
+        (if perFrame or (kind >= 2 and kind <= KindMaxFeature): "" else:
            "; it runs more than once a frame, so its firing count is not a " &
            "frame count")
   return true
@@ -6214,6 +6273,12 @@ include "botdiag.nim"
 ## verified `EFT.BotSpawner::AddPlayer` target. Defines `botCapAddPlayerFired`
 ## (dispatched by slot identity in `patchFired`) and `bindBotCap`.
 include "botcap.nim"
+## CATCH THE IN-GAME ERROR DIALOG. Kept in its own file to avoid colliding with
+## concurrent host work; `include`d (not imported) so it shares this file's
+## guarded raw primitives, `cRegsInt`, logging, `attachDrain`, the VEH/SEH guard
+## and the three verified PreloaderUI error-screen targets. Defines `errDlgFired`
+## (dispatched by slot identity in `patchFired`) and `bindErrDlg`.
+include "errdlg.nim"
 ## BOT AI ACTIVATION RESCUE. Kept in its own file to avoid colliding with
 ## concurrent host work; `include`d (not imported) so it shares this file's
 ## guarded raw primitives, `cRegsInt`, logging, `attachDrain`, the VEH/SEH guard,
@@ -7960,6 +8025,31 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
          "the cap that defers the scav wave pool (bosses bypass it via " &
          "IgnoreMaxBots; scavs do not). One guarded int32 write on the Unity " &
          "thread; fail-safe -- no write if the build/pointer does not check out."
+  # CATCH THE IN-GAME ERROR DIALOG. This is one of the very few host features
+  # that DEFAULTS ON, and the deviation from the usual default-off rule is
+  # deliberate: the rule exists to keep a feature that WRITES from being live
+  # before anyone asked for it, and this one never writes. It installs three
+  # read-only postfix detours on prologue-verified, offline-UNIQUE targets, reads
+  # two strings through VirtualQuery-guarded hops under the VEH/SEH guard, logs
+  # one line, and always lets the original run so the window still appears.
+  #
+  # Defaulting it OFF would mean the default configuration is the one where an
+  # unattended run that hits an error dialog reports IDLE and burns its whole
+  # timeout -- which is precisely the failure this exists to end. A watcher you
+  # have to remember to switch on is not a watcher.
+  #
+  # `"catchErrorDialogs": false` in aowlspt-host.json still turns it off.
+  gErrDlg = readBoolKeyDef("catchErrorDialogs", true)
+  if gErrDlg:
+    info "catchErrorDialogs is on (default): read-only postfix detours on the " &
+         "three EFT.UI.PreloaderUI error-screen entry points. An in-game error " &
+         "dialog will write one ERRORDIALOG line to this log the moment it is " &
+         "raised, with its header and message. The dialog is NEVER suppressed. " &
+         "Nothing is written to the game."
+  else:
+    warn "catchErrorDialogs is explicitly false: in-game error dialogs will NOT " &
+         "be caught. A run that hits one will look IDLE rather than failed, and " &
+         "an unattended run will sit on it until it times out."
   gBotAi = readBoolKey("botAiActivate")
   if gBotAi:
     info "botAiActivate is set: a kind=12 detour on EFT.BotOwner.PreActivate will " &
@@ -8892,6 +8982,17 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
       if gBotCap and not bindBotCap(true):
         info "botcap did not arm (EFT.BotSpawner.AddPlayer unverified on this " &
              "build, or drain disabled)"
+
+      # CATCH THE IN-GAME ERROR DIALOG (default ON). The three PreloaderUI
+      # error-screen entry points are static code, so the detours install now and
+      # simply never fire until the client decides to raise a window. `bindErrDlg`
+      # reports per-target and warns loudly if NONE bound, because a silently
+      # unarmed watcher is worse than no watcher: the run would look supervised
+      # and would not be.
+      if gErrDlg and not bindErrDlg(true):
+        warn "errdlg did not arm; in-game error dialogs will NOT be caught on " &
+             "this run. Treat any IDLE verdict from harness.py as INCONCLUSIVE " &
+             "rather than as 'the client is fine and waiting'."
 
       # BOT AI ACTIVATION RESCUE (opt-in). BotOwner.PreActivate is static code, so
       # the detour installs now and never fires until an offline raid activates a

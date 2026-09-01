@@ -4009,6 +4009,88 @@ proc inspNewStringImpl(a: Il2CppPtr): Il2CppPtr {.
     exportc: "aowl_insp_newstring", cdecl.} =
   result = newString(gRt, gInspStrText)
 
+var gInspStrCount = 0
+
+proc iCmdStr(toks: seq[string]) =
+  ## `str TEXT...` -- allocate a managed `System.String` and BIND it, so it can
+  ## be passed to `call`.
+  ##
+  ## Why this verb exists: `call` evaluates every non-float argument through
+  ## `iEval`, which yields a pointer. There was no way to produce a String*
+  ## pointer inside a batch at all. `write EXPR str TEXT` allocates one, but
+  ## only as a side effect of storing it into a slot that already exists -- so
+  ## calling ANY game method that takes a string meant finding some live object
+  ## with a spare string field, clobbering it, and reading the pointer back.
+  ## That is a write to game state in order to perform a read, which is exactly
+  ## the trade this tool should never make the caller take.
+  ##
+  ## The text is the REST OF THE LINE from token 1 on, rejoined with single
+  ## spaces -- the tokenizer splits on whitespace, and a message worth passing
+  ## to a game method almost always has a space in it. Runs of whitespace are
+  ## therefore collapsed; that is a real limitation and it is stated here rather
+  ## than left to be discovered.
+  ##
+  ## Binds `$str0`, `$str1`, ... per batch, and `$_` to the most recent, so:
+  ##
+  ##     allow write
+  ##     str Hello from the inspector
+  ##     call rva:0x156b930 v_ppp $preloader $str0 0
+  ##
+  ## Needs `allow write` and `liveInspectorWrite`: `il2cpp_string_new` really
+  ## allocates in the managed heap. It is the ONE allocation primitive proven to
+  ## work on this build (CLAUDE.md section 5), and it is what the version brand
+  ## and the F3 overlay already use, so this adds no new capability -- only a
+  ## way to reach the existing one without collateral damage.
+  if toks.len < 2:
+    iErr("usage: str TEXT...   (the rest of the line becomes the string)")
+    return
+  if not gInspWriteOn:
+    iErr("`str` allocates a managed String via il2cpp_string_new, so it needs " &
+         "`liveInspectorWrite: true` in aowlspt-host.json")
+    return
+  if not gInspAllowWrite:
+    iErr("`str` allocates in the managed heap, so it needs an `allow write` " &
+         "line earlier in this batch")
+    return
+  var text = ""
+  for i in 1 ..< toks.len:
+    if text.len > 0:
+      text.add ' '
+    text.add toks[i]
+  gInspStrText = text
+  let s = inspNewStringImpl(cast[Il2CppPtr](0))
+  if s == nil or cIsReadable(s, 0x14'i32) == 0'i32:
+    # Never bind on failure. A stale `$str0` from an earlier batch silently
+    # standing in for a string that was never allocated is the exact shape of
+    # the `$comp` bug this inspector already had once.
+    iErr("il2cpp_string_new did not return a usable String for \"" & text &
+         "\"; nothing was allocated and no anchor was bound")
+    return
+  # Self-check, and deliberately one that CAN fail: decode the object we just
+  # made back through the ordinary String reader and compare it, character for
+  # character, with what was asked for. A pointer that does not read back as the
+  # requested text is not a String, and handing it to `call` would put an
+  # arbitrary pointer in an argument register of live game code.
+  #
+  # Note this is a check on the FINISHED STATE (what the object now contains),
+  # not on our own write (that il2cpp_string_new returned non-null) -- CLAUDE.md
+  # section 9b. Non-null was the check that could not fail.
+  let back = suiReadString(s)
+  if back != text:
+    iErr("il2cpp_string_new returned " & iPtrU(cast[uint64](s)) &
+         " but reading it back gives \"" & back & "\", not the \"" & text &
+         "\" that was requested. REFUSING to bind it -- that is not the " &
+         "String it claims to be, and passing it to `call` would hand game " &
+         "code an arbitrary pointer.")
+    return
+  let name = "str" & $gInspStrCount
+  inc gInspStrCount
+  iSetVarP(name, s)
+  iSetVar("_", cast[uint64](s))
+  iOut("  allocated String* " & iPtrU(cast[uint64](s)) & " len=" & $text.len &
+       " = \"" & back & "\"   (read back and verified; bound to $" & name &
+       " and $_)")
+
 proc iCmdWrite(toks: seq[string]) =
   ## Two switches, both required. The flag `liveInspectorWrite` is the
   ## session-level one the player sets; `allow write` is the per-batch one, so
@@ -6219,6 +6301,10 @@ proc iCmdHelp() =
   iOut("    whydidntitdraw EXPR           guided: visible + screenrect +")
   iOut("       canvasorder, then the first failing condition in a sentence.")
   iOut("    call TARGET SIG [ARG..]       direct RVA call (needs `allow write`)")
+  iOut("    str TEXT...                   allocate a managed String -> $str0..")
+  iOut("       and $_, so it can be passed to `call`. The REST OF THE LINE is")
+  iOut("       the text (runs of whitespace collapse to one space). Needs")
+  iOut("       `allow write` -- il2cpp_string_new really allocates.")
   iOut("    targets [SUBSTR]              list byte-verified call targets")
   iOut("  -- state + navigation (navigation needs `allow write`) --")
   iOut("    state | where                 what screen/tab is up RIGHT NOW")
@@ -6510,6 +6596,8 @@ proc iExec(line: string) =
           iErr(s)
   of "write":
     iCmdWrite(toks)
+  of "str":
+    iCmdStr(toks)
   of "dump", "fields":
     if toks.len < 2:
       iErr("usage: " & cmd & " EXPR [N]")
