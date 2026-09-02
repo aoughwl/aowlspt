@@ -106,7 +106,11 @@ Only ask the user for what genuinely requires human eyes or a human decision.
   `run.py` prints it on DIED and `python tools/crashwatch.py last` symbolises
   it (`il2cpp_resolve.py symbolize`). Read it BEFORE theorising: four "clean"
   deaths were a SAIN use-after-free and a mode-skip Submit race, both named
-  in the report the whole time.
+  in the report the whole time. And read the DUMP too: `python tools/dmpread.py
+  <Crash_*>/crash.dmp` prints the faulting instruction's registers -- on 2026-09-02
+  four flag bisects (one sample each) chased noise for an hour while the dump
+  said `Rax=1 Rcx=1 Rdx=0`: a Profile argument that was the integer 1. One
+  bisect sample is not a conclusion; a register is.
 - `--until-phase MENU` now needs a MenuScreen::Show proof line; natesp's
   `raid phase = MENU` only means "no GameWorld" and is true on the character
   screen too (`PARKED-BEFORE-MENU`, exit 10, is that case).
