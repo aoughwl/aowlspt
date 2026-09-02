@@ -69,6 +69,7 @@ sys.path.insert(0, HERE)
 import hostlog  # noqa: E402 -- reuse the FAULT regex and log parser, not a new one
 import ichannel as ch  # noqa: E402 -- vendored channel.py, sentinel + parsers
 import inspectfixtures as _fixtures  # noqa: E402 -- the shared measured corpus
+import run as _run  # noqa: E402 -- MENU_PROOF_LINES, one copy in the repo
 
 LIVE_DEFAULT = r"D:\Aowlspt\aowlspt"
 
@@ -149,33 +150,142 @@ def _parse_slot_titles(list_stdout):
     return out
 
 
-def enter_game(timeout):
+# ZERO slots on screen is AMBIGUOUS, and reading it as one thing is the whole
+# bug. MEASURED 2026-09-02 10:35: a client parked at the MAIN MENU -- host log
+# carrying `skip mode screen: MenuScreen::Show fired (uihooks site 2, epoch 1)`
+# -- produced `[INCONCLUSIVE] past mode selector -- ... no slot shows a real
+# title yet (placeholders only: [])` after a full 120s wait, and every screen
+# assertion was then marked NOT PERFORMED. No selector on screen was read as
+# "the selector has not appeared YET" when it in fact meant "the selector is
+# already GONE".
+#
+# The host itself distinguishes them, and `tools/run.py` already knows how:
+# four features log a line off the `EFT.UI.MenuScreen::Show` event (uihooks
+# site 2), and any one of them is proof the main menu was built. Those
+# substrings are IMPORTED from run.py rather than restated, so there is exactly
+# one copy of them in the repo and the two tools cannot drift apart.
+MENU_PROOF_LINES = _run.MENU_PROOF_LINES   # source: tools/run.py:306
+
+# The host truncates its log at every start (`modhost.openLog`, and
+# tools/hostlog.py's header says so), writing this banner as the first line.
+# The file is therefore normally exactly one boot -- but a proof line is only
+# allowed to certify THIS boot, so the scan restarts at the LAST banner and
+# anything before it is discarded. A menu proof from a previous boot certifying
+# this one is the exact failure run.py warns about at its `prescan_host`.
+HOST_BANNER_PREFIX = "aowlspt-host-il2cpp "
+
+
+def menu_proof_from_lines(lines):
+    """(proof_line_or_None, saw_banner) from host-log lines. Pure, so the
+    selftest drives it with literals; only lines AFTER the last banner count."""
+    proof, saw_banner = None, False
+    for raw in lines:
+        if raw.startswith(HOST_BANNER_PREFIX):
+            saw_banner, proof = True, None   # a restart invalidates old proof
+            continue
+        for sig in MENU_PROOF_LINES:
+            if sig in raw:
+                proof = raw.strip()
+                break
+    return proof, saw_banner
+
+
+def host_menu_proof(root, max_bytes=8 * 1024 * 1024):
+    """Did the host log say the MAIN MENU was shown, this boot?
+
+    Returns (proof_line_or_None, note). A None proof is THREE-STATE by way of
+    the note: the log was unreadable / the scan was cut short (could not look),
+    or the log was read whole and holds no proof (looked, found nothing). The
+    caller must not flatten those. Streams and caps its read -- the host log is
+    a measured token bomb (CLAUDE.md 8) and is never printed here.
+    """
+    p = os.path.join(root, "aowlspt", "aowlspt-host.log")
+    if not os.path.isfile(p):
+        return None, "no host log at %s" % p
+    truncated = False
+    try:
+        with open(p, "r", encoding="utf-8", errors="replace") as f:
+            read = 0
+            lines = []
+            for line in f:
+                read += len(line)
+                if read > max_bytes:
+                    truncated = True
+                    break
+                lines.append(line)
+    except OSError as e:
+        return None, "the host log could not be read: %s" % _oneline(e)
+    proof, saw_banner = menu_proof_from_lines(lines)
+    if proof:
+        return proof, ""
+    if truncated:
+        return None, ("the host log was only read to %d bytes, so the absence "
+                      "of a MenuScreen::Show proof line proves nothing"
+                      % max_bytes)
+    if not saw_banner:
+        return None, ("the host log carries no `%s` banner, so which boot it "
+                      "describes is unknown" % HOST_BANNER_PREFIX.strip())
+    return None, ("this boot's host log has no MenuScreen::Show proof line "
+                  "(none of %d signatures)" % len(MENU_PROOF_LINES))
+
+
+def enter_game(timeout, root, _list=None, _select=None, _proof=None):
     """Get past the mode selector, retrying because on a fresh client the
     pve/seasonal slots can read the localisation placeholder 'New Text'
     before locale lands. Selects whichever slot shows a REAL, non-placeholder
-    title -- never guesses by object name (see entergame.py's own header)."""
+    title -- never guesses by object name (see entergame.py's own header).
+
+    Three outcomes, in this order:
+      * slots with real titles      -> the press path, unchanged;
+      * NO slot at all + a menu proof line for this boot -> already past;
+      * NO slot and no proof        -> keep waiting, then INCONCLUSIVE.
+
+    The proof is only consulted when the selector shows NO slots. Placeholder
+    or unreadable slots mean a selector IS on screen and still has to be
+    pressed, whatever an older menu proof says.
+
+    `_list`/`_select`/`_proof` are injection points for the selftest; the
+    defaults are the real subprocesses and the real host log.
+    """
     entergame = os.path.join(HERE, "entergame.py")
+    if _list is None:
+        def _list():
+            return subprocess.run([sys.executable, entergame, "--list"],
+                                  capture_output=True, text=True).stdout
+    if _select is None:
+        def _select(mode):
+            r = subprocess.run([sys.executable, entergame, "--mode", mode],
+                               capture_output=True, text=True)
+            return r.returncode, (r.stdout + r.stderr).strip()[-400:]
+    if _proof is None:
+        def _proof():
+            return host_menu_proof(root)
     deadline = time.time() + timeout
     last_note = "no attempt made yet"
     while time.time() < deadline:
-        lst = subprocess.run([sys.executable, entergame, "--list"],
-                              capture_output=True, text=True)
-        if "already past the mode selector" in lst.stdout:
+        out = _list()
+        if "already past the mode selector" in out:
             return True, "already past the mode selector"
-        titles = [t for t in _parse_slot_titles(lst.stdout) if t]
-        real = [t for t in titles if t and t.strip() != "New Text"]
+        slots = _parse_slot_titles(out)          # None entries = <unreadable>
+        titles = [t for t in slots if t]
+        real = [t for t in titles if t.strip() != "New Text"]
         if not real:
-            last_note = ("no slot shows a real title yet (placeholders only: %r)"
-                         % titles)
+            if not slots:
+                proof, pnote = _proof()
+                if proof:
+                    return True, ("already past (host logged "
+                                  "MenuScreen::Show): %s" % _oneline(proof))
+                last_note = ("no slot is on screen at all, and %s" % pnote)
+            else:
+                last_note = ("no slot shows a real title yet (placeholders "
+                             "only: %r)" % titles)
             time.sleep(4)
             continue
         mode = real[0]
-        sel = subprocess.run([sys.executable, entergame, "--mode", mode],
-                              capture_output=True, text=True)
-        if sel.returncode == 0:
+        rc, text = _select(mode)
+        if rc == 0:
             return True, "selected %r" % mode
-        last_note = "pressed %r, entergame.py exited %d: %s" % (
-            mode, sel.returncode, (sel.stdout + sel.stderr).strip()[-400:])
+        last_note = "pressed %r, entergame.py exited %d: %s" % (mode, rc, text)
         time.sleep(4)
     return False, "could not get past the mode selector within %gs: %s" % (
         timeout, last_note)
@@ -554,11 +664,11 @@ def ensure_settings_ready(report, live, args):
                          "inactive" if act is False else "of unknown state"))
         return False, INACTIVE_REASON
 
-    ok, note = enter_game(args.menu_timeout)
+    ok, note = enter_game(args.menu_timeout, args.root)
     if not ok:
         report.record("past mode selector", INCONCLUSIVE, note)
         return False, "the mode selector was never passed: %s" % note
-    print("menu: %s" % note)
+    report.record("past mode selector", PASS, note)
 
     ok, detail = open_settings(live, args.settings_timeout)
     if not ok:
@@ -3117,6 +3227,99 @@ Component::get_gameObject, GameObject::get_activeSelf (calls, not field reads)
         print("  ** CASE FAILED: %s" % failures[-1])
     else:
         print("  case ok (8 of 8, and a non-settings line does not match)")
+
+    # --- 21. THE 10:35 SHAPE: parked at the MAIN MENU, so the selector is
+    #     GONE and `entergame.py --list` shows ZERO slots. That used to be read
+    #     as "not ready yet", waited out for the full 120s and reported
+    #     INCONCLUSIVE, which then marked every screen assertion NOT PERFORMED.
+    #     The host log settles it. All three cases drive the real enter_game
+    #     with its subprocesses and its log read injected -- no client, no log.
+    LIST_NO_SLOTS = "Menu UI: looked under the selector\n"
+    LIST_TWO_SLOTS = (
+        "  0x0000021c00120000  CharacterSlotView            title='PVE'\n"
+        "  0x0000021c00121000  CharacterSlotView            title='PVP'\n")
+    PROOF = ("[0:00:47.203] info   skip mode screen: MenuScreen::Show fired "
+             "(uihooks site 2, epoch 1) -- the main menu is up")
+
+    def _eg(list_out, proof, pnote="", rc=0):
+        calls = {"list": 0, "select": [], "proof": 0}
+
+        def L():
+            calls["list"] += 1
+            return list_out
+
+        def S(mode):
+            calls["select"].append(mode)
+            return rc, ""
+
+        def P():
+            calls["proof"] += 1
+            return proof, pnote
+        ok, note = enter_game(0.2, "X", _list=L, _select=S, _proof=P)
+        return ok, note, calls
+
+    print("\n---- mode selector: proof in the host log + ZERO slots -> PASS")
+    ok, note, calls = _eg(LIST_NO_SLOTS, PROOF)
+    if not ok:
+        failures.append("zero slots WITH a menu proof line still failed: %s"
+                        % note)
+        print("  ** CASE FAILED: %s" % failures[-1])
+    elif "already past (host logged MenuScreen::Show)" not in note:
+        failures.append("zero slots + proof returned an unexpected note: %r"
+                        % note)
+        print("  ** CASE FAILED: %s" % failures[-1])
+    elif calls["select"]:
+        failures.append("pressed a slot (%r) when there were none on screen"
+                        % calls["select"])
+        print("  ** CASE FAILED: %s" % failures[-1])
+    else:
+        print("  case ok (%r)" % _oneline(note, 80))
+
+    print("---- mode selector: NO proof + ZERO slots -> INCONCLUSIVE (unchanged)")
+    ok, note, calls = _eg(LIST_NO_SLOTS, None,
+                          "this boot's host log has no MenuScreen::Show proof "
+                          "line (none of 4 signatures)")
+    if ok:
+        failures.append("reported past the selector with neither a slot nor a "
+                        "menu proof line -- that is a check that cannot fail")
+        print("  ** CASE FAILED: %s" % failures[-1])
+    elif "could not get past the mode selector" not in note or (
+            "no MenuScreen::Show proof line" not in note):
+        failures.append("the no-proof refusal does not say what was looked "
+                        "at: %r" % note)
+        print("  ** CASE FAILED: %s" % failures[-1])
+    elif calls["proof"] < 1:
+        failures.append("never consulted the host log at all")
+        print("  ** CASE FAILED: %s" % failures[-1])
+    else:
+        print("  case ok (%r)" % _oneline(note, 90))
+
+    print("---- control: slots WITH titles -> the press path still runs")
+    ok, note, calls = _eg(LIST_TWO_SLOTS, PROOF)
+    if not ok or calls["select"] != ["PVE"]:
+        failures.append("the press path did not run for a visible selector: "
+                        "ok=%r note=%r select=%r" % (ok, note, calls["select"]))
+        print("  ** CASE FAILED: %s" % failures[-1])
+    elif calls["proof"]:
+        failures.append("consulted the menu proof while real slots were on "
+                        "screen; a stale proof must never skip a live selector")
+        print("  ** CASE FAILED: %s" % failures[-1])
+    else:
+        print("  case ok (%r)" % note)
+
+    print("---- mode selector: a proof from a PREVIOUS boot does not count")
+    pre, saw = menu_proof_from_lines(
+        [PROOF, HOST_BANNER_PREFIX + "0.1.0", "[0:00:03] info  IL2CPP is up"])
+    post, _ = menu_proof_from_lines([HOST_BANNER_PREFIX + "0.1.0", PROOF])
+    if pre is not None or not saw:
+        failures.append("a menu proof BEFORE the last host banner certified "
+                        "this boot: %r" % pre)
+        print("  ** CASE FAILED: %s" % failures[-1])
+    elif post is None:
+        failures.append("a menu proof after the banner was not seen")
+        print("  ** CASE FAILED: %s" % failures[-1])
+    else:
+        print("  case ok (old proof discarded, new proof kept)")
 
     ch.run_batch, time.sleep = real_run_batch, real_sleep
 
