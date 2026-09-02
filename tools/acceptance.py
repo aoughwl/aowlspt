@@ -337,6 +337,24 @@ def active_states(live, ptrs, timeout=40):
     return verdicts
 
 
+INACTIVE_REASON = ("SettingsScreen is bound but not active (another screen "
+                   "is up)")
+
+# Every assertion below that reads the SETTINGS SCREEN. When the screen is not
+# on display, each of these is reported INCONCLUSIVE by name rather than being
+# skipped silently or -- as happened at 03:55 -- run anyway and reported FAIL.
+SCREEN_ASSERTION_NAMES = (
+    "top-row stock tab count",
+    "top-row mod tab clones",
+    "no donor caption under MODS row clones",
+    "no placeholder text anywhere",
+    "cloned mods spawner: exactly one active toggle",
+    "postfx subtab strip under GRAPHICS",
+    "postfx toggles share a group, one is on",
+    "exactly one settings panel is active",
+)
+
+
 def settings_bound(live, timeout=25):
     """(ok, ptr_or_note) -- is `$settings` bound? Every settings-screen walk
     below is rooted at it, because MEASURED tonight (nativetabs_check.py,
@@ -351,6 +369,137 @@ def settings_bound(live, timeout=25):
     if int(m.group(1), 16) == 0:
         return False, "$settings is null -- the Settings screen has not been opened"
     return True, m.group(1)
+
+
+def settings_active(live, timeout=40):
+    """(True / False / None, note) -- is the SettingsScreen ON DISPLAY?
+
+    MEASURED 2026-09-02 03:55, live: `acceptance.py run --no-launch --keep`
+    was started while the client sat on the MatchMaker Side Selection screen
+    with Settings dismissed. `$settings` was STILL BOUND (inspect.nim ~4425
+    records why: the anchor does NOT go null across a close -- the same
+    pointer comes back on reopen), so the run skipped navigation entirely and
+    then reported `top-row stock tab count` as FAIL, `0 active, want 4 --
+    active: none | inactive: GameToggleSpawner, GraphicsToggleSpawner, ...`.
+    Every stock toggle read inactive because the WHOLE SettingsScreen was
+    inactive. That FAIL was about a screen that was not on display: a verdict
+    asserted about work that could not have succeeded.
+
+    So boundness is NOT readiness. This asks the state that actually differs,
+    with the inspector's own `assert-active` verb (activeInHierarchy, via
+    Component::get_gameObject -- `$settings` is a SettingsScreen COMPONENT,
+    not a Transform, and the verb makes that hop itself). `state` cannot
+    answer this: it is field reads only and prints no active flag.
+
+    None means the inspector said INCONCLUSIVE, which is not False.
+    """
+    acts = active_states(live, [SETTINGS_ROOT], timeout=timeout)
+    if not acts:
+        return None, ("`assert-active %s` did not print exactly one verdict "
+                      "line, so its active state was never established"
+                      % SETTINGS_ROOT)
+    a = acts[0]
+    if a is None:
+        return None, ("the inspector answered INCONCLUSIVE for `assert-active "
+                      "%s` (unreadable, Unity fake-null, or the getter did not "
+                      "verify on this build)" % SETTINGS_ROOT)
+    return a, ("activeInHierarchy=true" if a else INACTIVE_REASON)
+
+
+def wait_active(live, tries=10, delay=1.0):
+    """Poll for the FINISHED STATE -- an ACTIVE SettingsScreen -- not for our
+    own press. Returns (True/False/None, note) from the last look."""
+    act, note = None, "never looked"
+    for _ in range(tries):
+        time.sleep(delay)
+        act, note = settings_active(live)
+        if act is True:
+            return act, note
+    return act, note
+
+
+def ensure_settings_ready(report, live, args):
+    """Get to an OPEN, ACTIVE Settings screen, or say why not.
+
+    Returns (ready, reason). `reason` is the text every screen assertion is
+    reported INCONCLUSIVE with when ready is False -- never FAIL, because a
+    screen that is not on display falsifies nothing about the host.
+    """
+    bound, ptr = settings_bound(live)
+
+    if bound:
+        act, note = settings_active(live)
+        if act is True:
+            report.record("settings screen opened", PASS,
+                          "$settings already bound at %s and "
+                          "activeInHierarchy=true" % ptr)
+            return True, ""
+        if act is None:
+            report.record("settings screen opened", INCONCLUSIVE,
+                          "$settings bound at %s but %s" % (ptr, note))
+            return False, ("the SettingsScreen's active state could not be "
+                           "established: %s" % note)
+        # Bound but INACTIVE. One attempt down the EXISTING open path; the
+        # `open` verb itself would refuse here (inspect.nim ~4445: ShowScreen
+        # on a closed screen escaped its guard), so this is the AnimatedToggle
+        # press path, exactly as an unbound run uses.
+        print("$settings is bound at %s but the screen is NOT active (%s); "
+              "attempting the open path once" % (ptr, INACTIVE_REASON))
+        ok, detail = open_settings(live, args.settings_timeout)
+        if not ok:
+            report.record("settings screen opened", INCONCLUSIVE,
+                          "%s; the one re-open attempt did not go through: %s"
+                          % (INACTIVE_REASON, detail))
+            return False, INACTIVE_REASON
+        act, note = wait_active(live)
+        if act is True:
+            report.record("settings screen opened", PASS,
+                          "was bound but inactive; %s and the screen is now "
+                          "activeInHierarchy=true" % detail)
+            return True, ""
+        report.record("settings screen opened", INCONCLUSIVE,
+                      "%s; re-opened once (%s) and it is still %s"
+                      % (INACTIVE_REASON, detail,
+                         "inactive" if act is False else "of unknown state"))
+        return False, INACTIVE_REASON
+
+    ok, note = enter_game(args.menu_timeout)
+    if not ok:
+        report.record("past mode selector", INCONCLUSIVE, note)
+        return False, "the mode selector was never passed: %s" % note
+    print("menu: %s" % note)
+
+    ok, detail = open_settings(live, args.settings_timeout)
+    if not ok:
+        report.record("settings screen opened", INCONCLUSIVE, detail)
+        return False, "the Settings screen was never opened: %s" % detail
+
+    # Pressing is not opening, and BOUND is not ON DISPLAY. Assert the
+    # finished state: an anchor the host binds only once the screen exists,
+    # AND that screen being active in the hierarchy.
+    bound, ptr = False, "never bound"
+    for _ in range(10):
+        time.sleep(1.0)
+        bound, ptr = settings_bound(live)
+        if bound:
+            break
+    if not bound:
+        report.record("settings screen opened", INCONCLUSIVE,
+                      "pressed Settings (%s) but $settings never bound: %s"
+                      % (detail, ptr))
+        return False, "$settings never bound after the open path ran"
+    act, note = wait_active(live)
+    if act is not True:
+        report.record("settings screen opened", INCONCLUSIVE,
+                      "pressed Settings (%s), $settings bound at %s, but %s"
+                      % (detail, ptr, note))
+        return False, (INACTIVE_REASON if act is False else
+                       "the SettingsScreen's active state could not be "
+                       "established: %s" % note)
+    report.record("settings screen opened", PASS,
+                  "%s; $settings bound at %s and activeInHierarchy=true"
+                  % (detail, ptr))
+    return True, ""
 
 
 # ---------------------------------------------------------------------------
@@ -757,6 +906,25 @@ def assert_settings_json(report, root, guid=None):
 
 # ---------------------------------------------------------------------------
 
+def run_screen_assertions(report, live, args, ready, reason):
+    """Every assertion that READS THE SETTINGS SCREEN, or -- when the screen
+    could not be put on display -- one INCONCLUSIVE row per assertion naming
+    why. Never FAIL: a screen that is not rendered falsifies nothing about the
+    host. One function so the skip list and the run list cannot drift apart
+    (and `selftest` checks that they have not)."""
+    if not ready:
+        for nm in SCREEN_ASSERTION_NAMES:
+            report.record(nm, INCONCLUSIVE, "NOT PERFORMED: %s" % reason)
+        return
+    assert_tab_count(report, live, args.mods_built)
+    assert_no_donor_caption_on_clones(report, live, args.mods_built)
+    assert_no_text(report, live, "no placeholder text anywhere",
+                   PLACEHOLDER_TEXT)
+    assert_spawner_one_active_toggle(report, live, args.mods_built)
+    assert_postfx_subtab(report, live)
+    assert_one_panel_active(report, live)
+
+
 def cmd_run(args):
     report = Report()
     root = args.root
@@ -770,50 +938,16 @@ def cmd_run(args):
             report.summary()
             return 2
 
-    # If Settings is ALREADY open there is nothing to navigate: `$settings`
-    # being bound is the finished state the open path exists to reach, so
-    # asking for it first avoids re-pressing (and re-deriving) a screen that
-    # is already up. Only when it is NOT bound do we walk the open path.
-    bound, ptr = settings_bound(live)
-    if bound:
-        report.record("settings screen opened", PASS,
-                      "$settings already bound at %s" % ptr)
-    else:
-        ok, note = enter_game(args.menu_timeout)
-        if not ok:
-            report.record("past mode selector", INCONCLUSIVE, note)
-            report.summary()
-            return 2
-        print("menu: %s" % note)
+    # BOUND IS NOT ON DISPLAY. `$settings` survives a close, so "already
+    # bound" used to skip navigation and let every screen assertion run
+    # against an INACTIVE screen -- see settings_active()'s docstring for the
+    # measured false FAIL that came out of it.
+    ready, reason = ensure_settings_ready(report, live, args)
 
-        ok, detail = open_settings(live, args.settings_timeout)
-        if not ok:
-            report.record("settings screen opened", INCONCLUSIVE, detail)
-            report.summary()
-            return 2
-        # Pressing is not opening. Assert the FINISHED STATE -- the anchor the
-        # host binds only once the screen really exists -- never the press.
-        bound, ptr = False, "never bound"
-        for _ in range(10):
-            time.sleep(1.0)
-            bound, ptr = settings_bound(live)
-            if bound:
-                break
-        if not bound:
-            report.record("settings screen opened", INCONCLUSIVE,
-                          "pressed Settings (%s) but $settings never bound: %s"
-                          % (detail, ptr))
-            report.summary()
-            return 2
-        report.record("settings screen opened", PASS,
-                      "%s; $settings bound at %s" % (detail, ptr))
+    run_screen_assertions(report, live, args, ready, reason)
 
-    assert_tab_count(report, live, args.mods_built)
-    assert_no_donor_caption_on_clones(report, live, args.mods_built)
-    assert_no_text(report, live, "no placeholder text anywhere", PLACEHOLDER_TEXT)
-    assert_spawner_one_active_toggle(report, live, args.mods_built)
-    assert_postfx_subtab(report, live)
-    assert_one_panel_active(report, live)
+    # These two do not read the settings screen, so they still run and still
+    # decide something even when the screen could not be reached.
     assert_no_faults(report, root)
     assert_settings_json(report, root, guid=args.guid)
 
@@ -826,14 +960,298 @@ def cmd_run(args):
                        capture_output=True)
         print("stopped the client and the backend (use --keep to leave them up)")
 
-    return report.exit_code()
+    # 2 == "could not look at the screen at all", distinct from 1 == "looked
+    # and something did not hold".
+    return 2 if not ready else report.exit_code()
+
+
+# ---------------------------------------------------------------------------
+# selftest -- OFFLINE REPLAY of measured inspector prose
+# ---------------------------------------------------------------------------
+# There was no offline test for this file before today; the brief for this fix
+# assumed there was, so that assumption is corrected here rather than worked
+# around. The fixtures below are inspector prose in the EXACT emit format of
+# inspect.nim (`iOut` sites named per fixture); the numbers in them are
+# synthetic, the SHAPES are not. `run_batch` is replaced by a replay that
+# refuses any command it has no recording for, so a test can never pass by
+# talking to nothing.
+
+class _Replay(object):
+    """Offline stand-in for ch.run_batch. `script` is a list of
+    (command-prefix, [answer, ...]); answers are consumed in order and the
+    LAST one repeats (a poll loop asks the same question many times). An
+    unrecorded command is an AssertionError, never a silent empty answer --
+    an empty answer is exactly how a check that cannot fail gets built."""
+
+    def __init__(self, script):
+        self.script = [(p, list(a)) for p, a in script]
+        self.sent = []
+
+    def __call__(self, lines, live_dir=None, timeout=25.0, write=False, **kw):
+        first = lines[0] if lines else ""
+        self.sent.append(first)
+        for prefix, answers in self.script:
+            if first.startswith(prefix):
+                return "SENTINEL", (answers.pop(0) if len(answers) > 1
+                                    else answers[0])
+        raise AssertionError("replay has no recording for %r" % first)
+
+
+def _hdr(batch, n, body):
+    return ("aowlspt live inspector -- batch %d, %d command(s), on Unity "
+            "thread 1192\n%s\naowlspt live inspector -- batch %d complete, "
+            "%d line(s)" % (batch, n, body, batch, body.count("\n") + 3))
+
+
+# `state` (iCmdState): field reads only -- note it prints NO active flag, which
+# is the whole reason settings_active() exists.
+FX_STATE_BOUND = _hdr(91, 1, """> state
+  anchors: $preloader=0x000001e4a2b03040 $settings=0x000002b7c4180a80
+  channel: polls=902 reads=91 readFails=0 unchanged=811 batch=91 faults=0""")
+
+# `assert-active` (iCmdAssertActive -> iAssPass / iAssFail / iAssInc).
+FX_ACTIVE_TRUE = _hdr(92, 1, """> assert-active $settings
+  PASS: $settings activeInHierarchy = true, as claimed""")
+
+FX_ACTIVE_FALSE = _hdr(93, 1, """> assert-active $settings
+  FAIL: $settings activeInHierarchy = false, but assert-active claimed true.\
+  An INACTIVE node is NOT pressable: a press on one reports success and does \
+nothing (fact #72).""")
+
+FX_ACTIVE_INC = _hdr(94, 1, """> assert-active $settings
+  INCONCLUSIVE: assert-active $settings: activeInHierarchy could not be \
+determined (Component::get_gameObject or GameObject::get_activeInHierarchy \
+did not verify on this build, or a hop was unreadable)  -- nothing was \
+established; this is NOT a pass and NOT a failure.""")
+
+FX_ROOTS = _hdr(95, 1, """> roots
+    [$r0] transform=0x000001e4a2b03040  go=0x000001e4a2b03100 ($rgo0)  \
+name="Preloader UI"   (DontDestroyOnLoad)
+  11 root(s) bound to $r0..$r10""")
+
+
+def _fx_find(name, ptr, parent, batch=96):
+    return _hdr(batch, 1, """> find %s
+    HIT %s name="%s"  parent="%s"   ($f1)
+  visited 812 node(s) over 3 frame(s), 1 match(es), frontier 0 node(s)
+  -- the subtree was searched EXHAUSTIVELY. Every match is listed above."""
+                % (name, ptr, name, parent))
+
+
+FX_PRESS_OK = _hdr(97, 3, """> component 0x0000021c00113000 AnimatedToggle
+  $comp = 0x0000021c00114500  (EFT.UI.AnimatedToggle)
+> call rva:0x55ba430 v_pb $comp 1
+  -> returned without faulting (void)""")
+
+# The tab strip, as `children` really prints it (iCmdChildren, inspect.nim
+# ~2163-2182). Five spawners: the four stock tabs plus PostFxToggleSpawner.
+_TAB_NAMES = ["GameToggleSpawner", "GraphicsToggleSpawner", "SoundToggleSpawner",
+              "ControlsToggleSpawner", "PostFxToggleSpawner"]
+_TAB_PTRS = ["0x0000021c0022%04d" % (i * 16) for i in range(5)]
+
+FX_TOGGLES_CHILDREN = _hdr(98, 1, "> children 0x0000021c00220000\n"
+                            "  childCount = 5\n"
+                            "  via Transform::GetChild / get_childCount, "
+                            "Object::get_name (calls)\n" +
+                            "\n".join(
+    '    [%d] transform=%s ($c%d)  go=0x0000021c0033%04d ($g%d)  name="%s"'
+    % (i, _TAB_PTRS[i], i, i * 16, i, _TAB_NAMES[i]) for i in range(5)))
+
+
+def _fx_active_batch(flags, batch=99):
+    """One `assert-active` verdict line per pointer, in command order."""
+    body = "\n".join(
+        ("> assert-active %s\n  PASS: %s activeInHierarchy = true, as claimed"
+         % (p, p)) if a else
+        ("> assert-active %s\n  FAIL: %s activeInHierarchy = false, but "
+         "assert-active claimed true." % (p, p))
+        for p, a in zip(_TAB_PTRS, flags))
+    return _hdr(batch, len(flags), body)
+
+
+def _declared_screen_assertion_names():
+    """Every assertion name `run_screen_assertions` can print on the READY
+    path, read out of the source. Falsifiable on purpose: add an assertion to
+    that function and forget SCREEN_ASSERTION_NAMES, and this disagrees."""
+    import inspect as _pyinspect
+    names = set()
+    for fn in (assert_tab_count, assert_no_donor_caption_on_clones,
+               assert_spawner_one_active_toggle, assert_postfx_subtab,
+               assert_one_panel_active):
+        src = _pyinspect.getsource(fn)
+        names |= set(re.findall(r'report\.record\(\s*"([^"]+)"', src))
+        names |= set(re.findall(r'^\s*name\s*=\s*"([^"]+)"', src, re.M))
+    src = _pyinspect.getsource(run_screen_assertions)
+    names |= set(re.findall(r'assert_no_text\([^,]+,[^,]+,\s*"([^"]+)"', src))
+    return names
+
+
+class _Args(object):
+    root = LIVE_DEFAULT.rsplit("\\", 1)[0]
+    mods_built = False
+    menu_timeout = 5.0
+    settings_timeout = 5.0
+
+
+def _verdicts(report):
+    return {name: v for name, v, _m, _d in report.rows}
+
+
+def cmd_selftest(_args):
+    real_run_batch, real_sleep = ch.run_batch, time.sleep
+    time.sleep = lambda *_a, **_k: None       # the poll loops, offline
+    failures = []
+
+    def case(title, script, check):
+        rep = Report()
+        rp = _Replay(script)
+        ch.run_batch = rp
+        print("\n---- %s" % title)
+        try:
+            note = check(rep, rp)
+        except AssertionError as e:
+            note = "raised: %s" % e
+        if note:
+            failures.append("%s: %s" % (title, note))
+            print("  ** CASE FAILED: %s" % note)
+        else:
+            print("  case ok")
+
+    open_path = [("roots", [FX_ROOTS]),
+                 ("find TaskBar", [_fx_find("TaskBar", "0x0000021c00110000",
+                                            "Common UI")]),
+                 ("find Tabs", [_fx_find("Tabs", "0x0000021c00111000",
+                                         "TaskBar")]),
+                 ("find Settings", [_fx_find("Settings", "0x0000021c00112000",
+                                             "Tabs")]),
+                 ("find SettingsButton",
+                  [_fx_find("SettingsButton", "0x0000021c00113000",
+                            "Settings")]),
+                 ("component", [FX_PRESS_OK])]
+
+    # --- 1. bound AND active: the ordinary fast path, no navigation. --------
+    def c1(rep, rp):
+        ready, reason = ensure_settings_ready(rep, live="X", args=_Args())
+        if not ready:
+            return "expected ready, got reason %r" % reason
+        if _verdicts(rep).get("settings screen opened") != PASS:
+            return "expected a PASS for the opened assertion"
+        if any(s.startswith("find ") for s in rp.sent):
+            return "navigated even though the screen was already ON DISPLAY"
+        return ""
+    case("bound + ACTIVE -> ready, no navigation",
+         [("state", [FX_STATE_BOUND]),
+          ("assert-active", [FX_ACTIVE_TRUE])], c1)
+
+    # --- 2. THE 03:55 SHAPE: bound but INACTIVE, and it stays inactive. -----
+    #     Before this fix, this exact shape produced
+    #     `[FAIL] top-row stock tab count  0 active, want 4`.
+    def c2(rep, rp):
+        ready, reason = ensure_settings_ready(rep, live="X", args=_Args())
+        if ready:
+            return "reported ready for an INACTIVE SettingsScreen"
+        if reason != INACTIVE_REASON:
+            return "reason was %r, want %r" % (reason, INACTIVE_REASON)
+        run_screen_assertions(rep, "X", _Args(), ready, reason)
+        v = _verdicts(rep)
+        bad = [n for n, k in v.items() if k == FAIL]
+        if bad:
+            return "FAIL verdict(s) on a screen that was never displayed: %s" % bad
+        missing = [n for n in SCREEN_ASSERTION_NAMES
+                   if v.get(n) != INCONCLUSIVE]
+        if missing:
+            return "not reported INCONCLUSIVE: %s" % missing
+        if not any(INACTIVE_REASON in m for _n, _k, m, _d in rep.rows):
+            return "no row states the bound-but-not-active reason"
+        if not any(s.startswith("component ") for s in rp.sent):
+            return "did not attempt the open path even once"
+        return ""
+    case("bound + INACTIVE, stays inactive -> all screen checks INCONCLUSIVE",
+         [("state", [FX_STATE_BOUND]),
+          ("assert-active", [FX_ACTIVE_FALSE])] + open_path, c2)
+
+    # --- 3. bound but inactive, and the one re-open attempt WORKS. ----------
+    def c3(rep, rp):
+        ready, reason = ensure_settings_ready(rep, live="X", args=_Args())
+        if not ready:
+            return "re-open activated the screen but it reported %r" % reason
+        if _verdicts(rep).get("settings screen opened") != PASS:
+            return "expected PASS once the screen came up active"
+        return ""
+    case("bound + INACTIVE, re-open succeeds -> ready",
+         [("state", [FX_STATE_BOUND]),
+          ("assert-active", [FX_ACTIVE_FALSE, FX_ACTIVE_TRUE])] + open_path, c3)
+
+    # --- 4. the inspector itself could not tell. NOT False, NOT ready. ------
+    def c4(rep, rp):
+        ready, reason = ensure_settings_ready(rep, live="X", args=_Args())
+        if ready:
+            return "reported ready on an INCONCLUSIVE active state"
+        run_screen_assertions(rep, "X", _Args(), ready, reason)
+        if any(k == FAIL for k in _verdicts(rep).values()):
+            return "FAIL verdict on an unknown active state"
+        if "could not be established" not in reason:
+            return "reason does not say the state was unknown: %r" % reason
+        if any(s.startswith("component ") for s in rp.sent):
+            return "pressed the open path on an UNKNOWN state (should not)"
+        return ""
+    case("bound + active state UNKNOWN -> INCONCLUSIVE, nothing pressed",
+         [("state", [FX_STATE_BOUND]),
+          ("assert-active", [FX_ACTIVE_INC])], c4)
+
+    # --- 5/6. THE NEGATIVE CONTROLS. The gate must not have made the tab ----
+    #     count unable to fail: with the screen ACTIVE it still FAILs on a
+    #     dead strip and still PASSes on a live one.
+    def c5(rep, _rp):
+        assert_tab_count(rep, "X", False)
+        if _verdicts(rep).get("top-row stock tab count") != FAIL:
+            return "an ACTIVE screen with 0 active stock tabs did not FAIL"
+        return ""
+    case("control: screen ACTIVE, 0 active stock tabs -> still FAIL",
+         [("find Toggles", [_fx_find("Toggles", "0x0000021c00220000",
+                                     "SettingsScreen")]),
+          ("children", [FX_TOGGLES_CHILDREN]),
+          ("assert-active", [_fx_active_batch([False] * 5)])], c5)
+
+    def c6(rep, _rp):
+        if _verdicts(rep).get("top-row stock tab count") is not None:
+            return "unexpected"
+        assert_tab_count(rep, "X", False)
+        if _verdicts(rep).get("top-row stock tab count") != PASS:
+            return "4 active stock tabs did not PASS"
+        return ""
+    case("control: screen ACTIVE, 4 active stock tabs -> PASS",
+         [("find Toggles", [_fx_find("Toggles", "0x0000021c00220000",
+                                     "SettingsScreen")]),
+          ("children", [FX_TOGGLES_CHILDREN]),
+          ("assert-active",
+           [_fx_active_batch([True, True, True, True, False])])], c6)
+
+    ch.run_batch, time.sleep = real_run_batch, real_sleep
+
+    # --- 7. drift guard, source-level, no channel at all. -------------------
+    print("\n---- drift: SCREEN_ASSERTION_NAMES covers the ready path")
+    declared = _declared_screen_assertion_names()
+    listed = set(SCREEN_ASSERTION_NAMES)
+    if declared != listed:
+        failures.append("SCREEN_ASSERTION_NAMES drift: only in source %s; "
+                        "only in list %s"
+                        % (sorted(declared - listed), sorted(listed - declared)))
+        print("  ** CASE FAILED: %s" % failures[-1])
+    else:
+        print("  case ok (%d names)" % len(listed))
+
+    print("\n==== selftest: %d case(s) failed" % len(failures))
+    for f in failures:
+        print("  - %s" % f)
+    return 1 if failures else 0
 
 
 def main():
     ap = argparse.ArgumentParser(
         description="one-command acceptance run for the settings screen",
         formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
-    ap.add_argument("command", choices=["run"])
+    ap.add_argument("command", choices=["run", "selftest"])
     ap.add_argument("--root", default=LIVE_DEFAULT.rsplit("\\", 1)[0])
     ap.add_argument("--no-launch", action="store_true",
                     help="run against an already-running client")
@@ -847,6 +1265,8 @@ def main():
     ap.add_argument("--menu-timeout", type=float, default=120.0)
     ap.add_argument("--settings-timeout", type=float, default=90.0)
     args = ap.parse_args()
+    if args.command == "selftest":
+        return cmd_selftest(args)
     return cmd_run(args)
 
 
