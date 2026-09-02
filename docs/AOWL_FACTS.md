@@ -7655,3 +7655,18 @@ completed fast-path raid (08:13) happened in between, and two mod configs
 changed after it (SAIN drive level 2 at 08:15, Maps diagVerbose at 08:20).
 The inspector-off boot with those configs survived once. Bisecting SAIN
 back to 0 now; one sample each is not enough -- count samples.
+
+## 2026-09-02 10:10: bisect table -- SAIN drive level 2 is the leading suspect
+
+MEASURED samples, all builds 4,737,536 or 4,784,128, inspector ON unless
+stated:
+* SAIN level 0: every boot before 08:15 survived (many); 08:13 raid loaded
+  and deployed; 10:05 boot survived (menu at 48s, alive 300s).
+* SAIN level 2 (set 08:15): 08:50 raid load died (liveness walk); 09:0x raid
+  load died (liveness walk); 09:04 menu arrival died (MenuScreen::Show <-
+  SeasonWidgetData::From) on 4,784,128; 09:12 menu arrival died the same
+  way on the 4,737,536 build that had survived before. One boot with level
+  2 and the inspector OFF survived (menu at 40.9s, alive 300s).
+At level 2 SAIN arms its aim postfix at boot (~10-16s); at level 0 it
+refuses. Sample 2 (level 2, inspector on, 4,737,536) running; the SAIN
+detour is being audited offline (prologue, sharedness, register discipline).
