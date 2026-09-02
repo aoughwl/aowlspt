@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -276,6 +277,89 @@ def t_menu_must_settle():
         b.close()
 
 
+# -- 6c. the TEARDOWN announcement ---------------------------------------
+#
+# `run.py` without `--keep` force-stops the client, the backend and the
+# launcher the moment the verdict lands. Read afterwards that is
+# INDISTINGUISHABLE from a clean crash: the host log ends on a heartbeat, no
+# fault line, no crash folder. It cost twenty minutes once. The default is
+# deliberately unchanged; what must be true is that the teardown says so, in
+# the verdict block AND in a file a later reader of the install directory will
+# find.
+#
+# HOW THIS AVOIDS KILLING ANYTHING: `run.py --dry-teardown` means "this
+# invocation stops no processes" -- it covers both the pre-launch kill and the
+# post-verdict one, and it still prints the line and still writes the note, so
+# the code path under test is the real one. No mocking, no monkeypatching, and
+# nothing here calls Stop-Process.
+
+def _run_bed():
+    """A fake D:\\Aowlspt for a full `run.py main()` pass.
+
+    The launcher is a COPY of this interpreter, invoked as `python -c pass`, so
+    the spawn is real (Popen of a real .exe in a real cwd) and exits at once.
+    """
+    root = tempfile.mkdtemp(prefix="aowl-teardown-")
+    inst = os.path.join(root, "aowlspt")
+    os.makedirs(inst)
+    os.makedirs(os.path.join(root, "Logs"))
+    open(os.path.join(inst, "aowlspt-host.log"), "w").close()
+    shutil.copy(sys.executable, os.path.join(inst, "aowlspt-launch.exe"))
+    return root, inst
+
+
+def _run_py(root, extra, timeout=90):
+    cmd = [sys.executable, os.path.join(HERE, "run.py"), "--root", root,
+           "--timeout", "2", "--stall", "1", "--dry-teardown",
+           "--launcher-arg", "-c pass"] + list(extra)
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    return r.returncode, r.stdout + r.stderr
+
+
+def t_teardown_announced():
+    root, inst = _run_bed()
+    note = os.path.join(inst, runmod.TEARDOWN_LOG)
+    try:
+        rc, out = _run_py(root, [])
+        check("teardown/line-in-verdict-block", "TEARDOWN:" in out,
+              "a silent teardown reads as a crash afterwards; got %r"
+              % out[-300:])
+        check("teardown/line-names-the-escape-hatch", "--keep" in out)
+        check("teardown/note-written", os.path.isfile(note),
+              "expected %s" % note)
+        if os.path.isfile(note):
+            txt = open(note, encoding="utf-8").read()
+            check("teardown/note-has-the-same-sentence",
+                  runmod.TEARDOWN_LINE in txt, repr(txt)[:200])
+            # A note with no timestamp cannot answer "was the client stopped at
+            # THAT second", which is the only question it exists to answer.
+            check("teardown/note-is-timestamped",
+                  txt.lstrip().startswith("[") and ":" in txt.split("]")[0],
+                  repr(txt)[:120])
+            _run_py(root, [])
+            n = open(note, encoding="utf-8").read().count(runmod.TEARDOWN_LINE)
+            check("teardown/note-appends", n == 2,
+                  "a second run must ADD a line, not replace the file; "
+                  "found %d" % n)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def t_teardown_silent_with_keep():
+    # THE FALSIFYING HALF. If the line were printed unconditionally, the test
+    # above would pass while telling the reader something false.
+    root, inst = _run_bed()
+    note = os.path.join(inst, runmod.TEARDOWN_LOG)
+    try:
+        rc, out = _run_py(root, ["--keep"])
+        check("teardown/keep-prints-nothing", "TEARDOWN:" not in out,
+              "with --keep nothing is stopped, so the warning must not "
+              "appear; got %r" % out[-300:])
+        check("teardown/keep-writes-no-note", not os.path.isfile(note))
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 # -- 7. every verdict has a DISTINCT exit code ---------------------------
 def t_exit_codes_distinct():
     codes = list(runmod.EXIT.values())
@@ -288,6 +372,7 @@ def main():
     for fn in (t_stalled_fires, t_progress_never_stalls, t_bound_disable,
                t_heartbeat_is_not_progress, t_backend_down,
                t_existing_verdicts, t_menu_must_settle,
+               t_teardown_announced, t_teardown_silent_with_keep,
                t_exit_codes_distinct):
         if VERBOSE:
             print("%s:" % fn.__name__)

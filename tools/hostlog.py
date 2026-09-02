@@ -11,8 +11,17 @@ are always the same four, so they are subcommands here:
     python tools/hostlog.py config             # what config the host ACTUALLY read
     python tools/hostlog.py boot               # the boot milestone checklist
     python tools/hostlog.py grep <regex>
-    python tools/hostlog.py tail               # follow, with faults highlighted
+    python tools/hostlog.py tail               # last --max lines, then EXIT
+    python tools/hostlog.py tail --follow      # ...and keep watching (blocks)
     python tools/hostlog.py shape              # level histogram + top first tokens
+
+`tail` USED to follow unconditionally, and that made it unusable from any
+script: `hostlog.py tail --max 6` printed "following ... ctrl-c to stop" and
+never returned, so a scripted call sat there until the caller's timeout killed
+it (measured 2026-09-01: a full 2-minute tool timeout burned on what was meant
+to be a six-line read). A tool whose default never terminates cannot be called
+by anything except a human. So the default now prints the last `--max` lines
+and exits; `--follow`/`-f` is the blocking behaviour, and it is opt-in.
 
 `--root PATH` picks the install (default D:\\Aowlspt\\aowlspt); `--backend`
 reads aowlspt-backend.log instead.
@@ -311,10 +320,40 @@ def cmd_grep(args, C):
 
 
 def cmd_tail(args, C):
-    p = logpath(args)
-    print("following %s -- ctrl-c to stop" % p)
-    pos = 0
-    inode = None
+    """The last `--max` lines, and then RETURN. `--follow` to keep watching.
+
+    The blocking version was the default until 2026-09-01 and it is the reason
+    this docstring exists: a subcommand that never terminates is a subcommand no
+    script can call, and the failure mode is not an error -- it is a caller
+    hanging until its own timeout, with the output it asked for already sitting
+    unflushed on a pipe. Bounded by default, blocking only when asked.
+    """
+    p, lines = read(args)          # `read` refuses (exit 1) if there is no log
+    rows = list(parse(lines))
+    n = args.max
+    shown = rows if n <= 0 else rows[-n:]
+    show(shown, C)
+    if len(shown) < len(rows):
+        print("-- last %d of %d line(s). --max N for more, --max 0 for all."
+              % (len(shown), len(rows)))
+    if not args.follow:
+        return 0
+    return follow(p, C)
+
+
+def follow(p, C):
+    """`tail -f`: everything APPENDED from now on. Blocks until Ctrl-C.
+
+    Starts at the current end of file on purpose. The old code started at byte
+    0, so turning on following also dumped the entire log -- and the host log is
+    a measured token bomb (CLAUDE.md 8). The bounded last-N lines are printed by
+    the caller before this is entered, which is what `tail -f` actually does.
+    """
+    print("following %s -- ctrl-c to stop" % p, flush=True)
+    try:
+        pos = os.path.getsize(p)
+    except OSError:
+        pos = 0
     while True:
         try:
             st = os.stat(p)
@@ -398,8 +437,13 @@ def main():
     p.add_argument("--backend", action="store_true",
                    help="read aowlspt-backend.log instead")
     p.add_argument("--case", action="store_true", help="grep case-sensitively")
+    p.add_argument("--follow", "-f", action="store_true",
+                   help="with `tail`: keep watching for appended lines instead "
+                        "of returning. THIS BLOCKS until Ctrl-C -- never use it "
+                        "from a script.")
     p.add_argument("--max", type=int, default=60,
-                   help="cap `grep` output at N matches (default 60, 0 = all). "
+                   help="cap `grep` matches / `tail` lines at N (default 60, "
+                        "0 = all). "
                         "The host log is a measured token bomb; an unbounded "
                         "grep on it has emitted 25KB for a single word.")
     p.add_argument("--head", action="store_true",

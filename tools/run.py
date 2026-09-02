@@ -57,6 +57,20 @@ one `ERRORDIALOG` line per dialog) and this believes it.
 If the host did NOT arm the dialog catcher, this says so and downgrades an IDLE
 verdict to INCONCLUSIVE, because "I could not look" is not a pass (CLAUDE.md 9b).
 
+## It STOPS the client when it is done, and it says so
+
+Without `--keep` (and without `--attach`), the client, the backend and the
+launcher are force-stopped the moment the verdict lands. That default is
+right -- the host DLL is locked while the game runs -- but it was SILENT, and a
+silently stopped client is indistinguishable, after the fact, from one that
+crashed: the host log just ends, on a heartbeat, with no fault and no crash
+folder. That cost twenty minutes once.
+
+So the teardown announces itself twice: a `TEARDOWN:` line inside the verdict
+block, and a timestamped line appended to `aowlspt-run-teardown.log` beside the
+host log, written BEFORE anything is killed. `--dry-teardown` does both and
+kills nothing.
+
 ## Token discipline
 
 The default output is a verdict block of at most ~12 lines: the verdict, why,
@@ -177,6 +191,57 @@ EXIT = {
 
 def install_dir(root):
     return os.path.join(root, "aowlspt")
+
+
+# The single sentence a later reader needs. It is one literal so the console
+# block and the on-disk note cannot drift apart -- a warning that says two
+# slightly different things in two places is how you end up trusting neither.
+TEARDOWN_LINE = ("TEARDOWN: stopping the client, backend and launcher now "
+                 "(no --keep). If you meant to keep driving it, rerun with "
+                 "--keep.")
+
+# Written next to aowlspt-host.log, deliberately: whoever is reading the host
+# log after the fact is already in that directory.
+TEARDOWN_LOG = "aowlspt-run-teardown.log"
+
+STOP_PS = ("Get-Process -Name EscapeFromTarkov,aowlspt-backend,aowlspt-launch "
+           "-ErrorAction SilentlyContinue | Stop-Process -Force")
+
+
+def do_teardown(root, dry=False):
+    """Stop the client -- and LEAVE A TRACE THAT WE DID.
+
+    Measured cost, 2026-09-01: ~20 minutes. `run.py` without `--keep` kills the
+    client the instant its verdict lands. Read afterwards, that is
+    indistinguishable from a clean crash -- the host log simply ends, on a
+    heartbeat, with no fault line and no crash folder, which is exactly the
+    shape of a client that vanished on its own. The tool was the cause of the
+    evidence someone then spent twenty minutes explaining.
+
+    The default is NOT changed; a harness that leaves the game running by
+    default is worse. What changes is that the teardown now announces itself in
+    two places: the verdict block (for whoever ran it) and an appended,
+    timestamped line in the install directory (for whoever reads that directory
+    later, possibly in another session, and has no transcript at all).
+
+    The note is written BEFORE the kill, so it exists even if the kill hangs or
+    this process is itself reaped mid-teardown.
+    """
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    note = os.path.join(install_dir(root), TEARDOWN_LOG)
+    try:
+        with open(note, "a", encoding="utf-8", newline="\n") as f:
+            f.write("[%s] %s%s\n"
+                    % (stamp, TEARDOWN_LINE,
+                       "  (--dry-teardown: nothing was stopped)" if dry
+                       else ""))
+    except OSError as e:
+        # Never let bookkeeping stop the teardown; say so rather than hiding it.
+        print("  (could not write %s: %s)" % (note, e), flush=True)
+    if dry:
+        return
+    subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                    STOP_PS], capture_output=True, timeout=60)
 
 
 class Supervisor:
@@ -452,12 +517,19 @@ class Supervisor:
         return None
 
 
-def verdict_block(v, why, evidence, elapsed, armed, logs, as_json):
+def verdict_block(v, why, evidence, elapsed, armed, logs, as_json,
+                  teardown=False):
     if as_json:
         print(jsonmod.dumps({
             "verdict": v, "why": why, "elapsed_s": round(elapsed, 1),
             "errdlg_armed": armed, "evidence": evidence[-6:], "logs": logs,
+            "teardown": bool(teardown),
         }, separators=(",", ":")))
+        if teardown:
+            # --json is one machine-readable line and must stay one line, so
+            # the human sentence goes to stderr rather than being dropped.
+            sys.stderr.write(TEARDOWN_LINE + "\n")
+            sys.stderr.flush()
         return
     bar = "-" * 64
     print("\n" + bar)
@@ -475,7 +547,9 @@ def verdict_block(v, why, evidence, elapsed, armed, logs, as_json):
         print("   | " + line[:200])
     if logs:
         print(" %-12s  %s" % ("logs", "  ".join(logs)))
-    print(bar)
+    if teardown:
+        print(" " + TEARDOWN_LINE)
+    print(bar, flush=True)
 
 
 def main():
@@ -511,7 +585,14 @@ def main():
     p.add_argument("--attach", action="store_true",
                    help="do not launch; the client is already running")
     p.add_argument("--keep", action="store_true",
-                   help="leave the client running afterwards")
+                   help="leave the client running afterwards. Without it the "
+                        "client, backend and launcher are STOPPED once the "
+                        "verdict lands, and the verdict block says so.")
+    p.add_argument("--dry-teardown", action="store_true",
+                   help="announce the teardown and write the teardown note, "
+                        "but do not actually Stop-Process anything. Exists so "
+                        "tools/test_supervise.py can drive the real code path "
+                        "without killing a game a human may be playing.")
     p.add_argument("--inspect", nargs="*", default=None,
                    help="inspector commands to run once the run settles")
     p.add_argument("--json", action="store_true")
@@ -560,11 +641,18 @@ def main():
 
     if not args.attach:
         # Stop whatever is up first: the host DLL is LOCKED while the game runs.
-        subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
-                        "Get-Process -Name EscapeFromTarkov,aowlspt-backend,"
-                        "aowlspt-launch -ErrorAction SilentlyContinue "
-                        "| Stop-Process -Force"], capture_output=True, timeout=60)
-        time.sleep(3)
+        # `--dry-teardown` covers THIS kill too, not only the one at the end:
+        # the flag means "this invocation stops no processes", and a test that
+        # opted out of the teardown but still reaped a human's running client
+        # on the way in would be worse than no test.
+        if args.dry_teardown:
+            print("(--dry-teardown: not stopping any running client first)",
+                  flush=True)
+        else:
+            subprocess.run(["powershell", "-NoProfile", "-NonInteractive",
+                            "-Command", STOP_PS],
+                           capture_output=True, timeout=60)
+            time.sleep(3)
         launcher = os.path.join(install_dir(args.root), "aowlspt-launch.exe")
         if not os.path.isfile(launcher):
             print("no launcher at %s" % launcher)
@@ -684,14 +772,12 @@ def main():
     logs = [p for p in (harness.hostlog_path(args.root),) if os.path.isfile(p)]
     if sup.cur_dir:
         logs.append(sup.cur_dir)
+    tearing = not args.keep and not args.attach
     verdict_block(verdict, why, evidence, time.time() - started,
-                  sup.errdlg_armed, logs, args.json)
+                  sup.errdlg_armed, logs, args.json, teardown=tearing)
 
-    if not args.keep and not args.attach:
-        subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command",
-                        "Get-Process -Name EscapeFromTarkov,aowlspt-backend,"
-                        "aowlspt-launch -ErrorAction SilentlyContinue "
-                        "| Stop-Process -Force"], capture_output=True, timeout=60)
+    if tearing:
+        do_teardown(args.root, dry=args.dry_teardown)
     return EXIT.get(verdict, EXIT["INCONCLUSIVE"])
 
 
