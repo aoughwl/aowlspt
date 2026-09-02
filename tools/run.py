@@ -32,7 +32,14 @@ every outcome that has actually happened on this project.
                   click. Exit 4. THIS IS THE ONE THAT USED TO BE INVISIBLE --
                   see below.
     CRASH         the client's own logs show a thrown exception / abort, via
-                  crashwatch's measured signatures. Exit 5.
+                  crashwatch's measured signatures, AND THE PROCESS IS GONE.
+                  Exit 5. A managed exception logged by a client that is still
+                  running is a NOTE in the block, never a verdict: Tarkov logs
+                  and catches `NullReferenceException` from its own bot AI
+                  (`MalfunctionLayer.ShallUseNow` under
+                  `EFT.BotsController.UpdateByUnity`) in every raid, and that
+                  alone once produced `CRASH` at 0.5s for a client standing in
+                  a raid. See Supervisor.poll_client.
     DIED          the process is gone. Exit 1.
     TIMEOUT       none of the above within --timeout. Exit 2.
     STALLED       it got somewhere real and then stopped getting anywhere: one
@@ -212,6 +219,56 @@ def is_progress(line):
     impossible to express.
     """
     return not any(h in line for h in HEARTBEAT_HOST_LINES)
+
+
+# A RAID LOAD IS LEGITIMATELY QUIET, AND THE HOST IS NOT WHERE IT SHOWS.
+#
+# MEASURED 2026-09-02: `run.py --attach --until-phase DEPLOYED --phase-max 480`
+# exited 6 (INCONCLUSIVE, "the log went quiet") at 60.8s while the raid was
+# loading normally -- it reached DEPLOYED afterwards. Two separate things were
+# wrong, and only both together explain that exit:
+#
+#  * the HOST log during a load is heartbeats and nothing else. natesp
+#    re-publishes the phase every 5s and `is_progress` correctly refuses to
+#    count that, so `last_progress` froze and the 45s IDLE rule fired.
+#  * the phase at that moment was still **MENU**, not LOADING. The host log for
+#    that run shows `raid phase = MENU` up to 0:02:17 and the first
+#    `raid phase = LOADING` only at 0:02:32 -- natesp's S1 (`no GameWorld is
+#    cached`) is equally true on the loading screen. So a rule keyed on the
+#    LOADING phase alone would NOT have prevented this exact exit.
+#
+# Hence two rules, not one:
+#
+#  1. QUIET_EN_ROUTE: a phase in which quiet is EXPECTED given the phase that
+#     was asked for. LOADING on the way to DEPLOYED is the whole measured case.
+#     This is deliberately NOT symmetric with the destination exemption -- the
+#     phase bound (`--phase-max`) still applies here, so a load that really is
+#     wedged is still caught, as STALLED, with a stated limit.
+#  2. the CLIENT's own log, which is the only thing that moves during a load.
+#     `LocationLoaded`, `GameCreated` and `PlayerSpawnEvent` each occur EXACTLY
+#     ONCE per load (measured, log_2026.09.02_8-09-51: 1 occurrence each in
+#     application_000.log and in output_000.log), so they are one-shot progress
+#     and never a heartbeat -- but three one-shots cannot carry a 3-minute load
+#     past a 45s window on their own. crashwatch already owns the broad, measured
+#     "the raid IS loading" predicate (`LOAD_PROGRESS_RX`: geometry, bundles,
+#     scene loads, plus those three milestones), so that is reused rather than
+#     restated.
+#
+# Rule 2 is DELIBERATELY NARROW: it counts only while `--until-phase DEPLOYED`
+# was asked for and the client has not got there yet. `LOAD_PROGRESS_RX` matches
+# "Loading " and "bundle", which the client logs at the menu too -- letting that
+# refresh the progress clock unconditionally would re-create the heartbeat bug
+# (an IDLE detector that can never fire) in a new file. Outside a raid entry
+# nothing about IDLE changes.
+CLIENT_LOAD_PROGRESS_LINES = ("LocationLoaded", "GameCreated",
+                              "PlayerSpawnEvent")
+
+QUIET_EN_ROUTE = {"DEPLOYED": ("LOADING",)}
+
+# How long a cached "is the client alive" answer is trusted. Only bounds how
+# stale the answer used by poll_client's gone check may be; the main loop keeps
+# its own 5s poll.
+ALIVE_CACHE_S = 3.0
 
 # The phase the host publishes. `raidphase.nim` has emitted this all along and
 # nothing consumed it -- the raid was bounded by `time.sleep(60.0)` in
@@ -484,6 +541,20 @@ class Supervisor:
         self.last_line = None
         self.evidence = []
         self.marks = []
+        # CLIENT-LOG state. `client_exceptions` counts managed exceptions the
+        # client LOGGED AND SURVIVED -- a note, never a verdict (see
+        # poll_client). `client_milestones` keeps the load milestones we have
+        # already announced, so a raid load prints three marks and not three
+        # hundred.
+        self.client_exceptions = 0
+        self.last_exception = None
+        self.client_milestones = set()
+        self._said_alive_exception = False
+        # Liveness, cached and injectable (tests must be able to say "gone"
+        # without killing anything).
+        self.alive_probe = harness.client_alive
+        self._alive = True
+        self._alive_at = None
         # The client's own logs, through crashwatch so the signature list stays
         # in exactly one place.
         self.logs_root = os.path.join(root, "Logs")
@@ -516,6 +587,71 @@ class Supervisor:
         lines = data.split("\n")
         self.host_leftover = lines.pop()
         return [l.rstrip("\r") for l in lines]
+
+    def note_errdlg(self, line):
+        """Classify ONE host line for whether the dialog catcher is armed.
+
+        Factored out of poll_host so `--attach` can apply exactly the same
+        rules to the log that is ALREADY on disk. Two copies of this would be
+        two chances to disagree about what "armed" means.
+        """
+        if "errdlg ARMED" in line:
+            self.errdlg_armed = True
+            return True
+        if ("catchErrorDialogs is explicitly false" in line
+                or "errdlg did not arm" in line
+                or ("NONE of the" in line
+                    and "error-screen entry points bound" in line)):
+            self.errdlg_armed = False
+            return True
+        return False
+
+    def prescan_host(self, max_bytes=8 * 1024 * 1024):
+        """--attach: learn the arming state from the log THIS BOOT ALREADY WROTE.
+
+        MEASURED 2026-09-02: an `--attach` run printed `dialog catch UNKNOWN --
+        the host never said whether it armed` and downgraded IDLE to
+        INCONCLUSIVE (exit 6) for a client that was loading a raid perfectly
+        well. The host had said it, once, at [0:00:01] of that boot -- 2 minutes
+        before we attached. The supervisor starts tailing at END-OF-FILE (it has
+        to; see __init__), so a one-shot line from earlier in the SAME boot is
+        invisible, and "I could not look" then becomes the verdict.
+
+        In `--attach` the host is already running, so the log on disk IS this
+        boot's -- the host truncates on attach. If it truncates again under us,
+        `_host_lines` clears `errdlg_armed` back to None and the live tail
+        re-learns it, so a stale ARMED can never certify a later boot.
+
+        Only the errdlg lines are read out of the backlog. The menu proof and
+        the screen names are NOT, deliberately: those decide a verdict about
+        WHERE the client is now, and re-reading them from an arbitrarily old
+        part of the log is the "proof from the previous boot" failure. Arming
+        is a property of the host process, which is the same process either way.
+
+        Never reads the whole file into the transcript or into memory: it
+        streams, and reads at most the last `max_bytes` (the log is a measured
+        token bomb, CLAUDE.md 8). Returns True/False/None -- the value learned.
+        """
+        # ARMED is printed at ~[0:00:01], i.e. near the TOP of the log, so this
+        # reads from the top; a tail-only window would miss exactly the line it
+        # came for. `max_bytes` only bounds a pathological file.
+        found = None
+        try:
+            with open(self.host_path, "r", encoding="utf-8",
+                      errors="replace") as f:
+                read = 0
+                for line in f:
+                    read += len(line)
+                    if read > max_bytes:
+                        break
+                    if self.note_errdlg(line):
+                        found = self.errdlg_armed
+        except OSError:
+            return None
+        if found is not None:
+            self.mark("--attach: error-dialog catch read from the existing "
+                      "host log: %s" % ("ARMED" if found else "NOT ARMED"))
+        return found
 
     # -- backend log ------------------------------------------------------
     def poll_backend(self):
@@ -770,12 +906,7 @@ class Supervisor:
                 print(line)
             if "errdlg ARMED" in line:
                 self.mark("error-dialog catch ARMED")
-            if "errdlg ARMED" in line:
-                self.errdlg_armed = True
-            elif "catchErrorDialogs is explicitly false" in line or \
-                 "errdlg did not arm" in line or \
-                 "NONE of the" in line and "error-screen entry points bound" in line:
-                self.errdlg_armed = False
+            self.note_errdlg(line)
             # A HOST-REPORTED FATAL. Return immediately, do not wait anything
             # out.
             #
@@ -799,16 +930,140 @@ class Supervisor:
         return None
 
     # -- client logs ------------------------------------------------------
+    def loading_a_raid(self):
+        """Is a raid entry in flight RIGHT NOW, as far as the phases say?
+
+        True only while `--until-phase DEPLOYED` was asked for and the client
+        has not reached DEPLOYED. This is the gate on rule 2 above: outside it,
+        the client log does not touch the progress clock at all.
+        """
+        return bool(self.until_phase == "DEPLOYED"
+                    and self.phase != "DEPLOYED")
+
+    def _client_line(self, line):
+        """Every raw client-log line, once. The ONLY thing moving during a load.
+
+        Progress, not liveness: the client writes these because assets are
+        actually coming up. Gated by `loading_a_raid` so it cannot become a new
+        heartbeat -- see CLIENT_LOAD_PROGRESS_LINES.
+        """
+        if not self.loading_a_raid():
+            return
+        if not crashwatch.LOAD_PROGRESS_RX.search(line):
+            return
+        self.last_progress = time.time()
+        for sig in CLIENT_LOAD_PROGRESS_LINES:
+            if sig in line and sig not in self.client_milestones:
+                self.client_milestones.add(sig)
+                self.mark("client log: %s (the raid is loading)" % sig)
+                break
+
+    def process_gone(self, now=None):
+        """Is the client process gone? Rate-limited, and injectable for tests.
+
+        `alive_probe` shells out to `tasklist` (~100ms), and the main loop
+        already polls it every 5s; asking it again for every line the client
+        logs would spawn a process several times a second inside a raid. The
+        cached answer is at most `ALIVE_CACHE_S` old, which is far shorter than
+        anything that turns on it.
+        """
+        now = time.time() if now is None else now
+        if (self._alive_at is None
+                or now - self._alive_at >= ALIVE_CACHE_S):
+            try:
+                self._alive = bool(self.alive_probe())
+            except Exception:
+                self._alive = True       # cannot tell: never fabricate a death
+            self._alive_at = now
+        return not self._alive
+
+    def exception_note(self):
+        """The verdict-block NOTE for managed exceptions the client survived.
+
+        Not a verdict. See poll_client.
+        """
+        if not self.client_exceptions:
+            return None
+        return ("client logged %d managed exception(s) that it CAUGHT and "
+                "survived, last: %s" % (self.client_exceptions,
+                                        self.last_exception))
+
     def poll_client(self):
+        """The client's own logs. A logged exception is NOT a crash.
+
+        MEASURED 2026-09-02: `run.py --attach --until-phase MENU` exited 5
+        (`CRASH unhandled-exception -- NullReferenceException`) after 0.5s while
+        the client was ALIVE and standing in a raid. The match was Tarkov's own
+        bot AI -- `MalfunctionLayer.ShallUseNow` under
+        `EFT.BotsController.UpdateByUnity` -- which the game logs on EVERY raid
+        and CATCHES. The signature is real; the verdict was fabricated.
+
+        crashwatch's classifier answers "this record looks like a managed
+        exception", which is the right question for a killer watching for a
+        client that is dying. It is NOT evidence that the client DIED, and this
+        tool's job is a verdict about the run. So a crash signature is only ever
+        a CRASH verdict when the PROCESS IS GONE (or Unity's own crash handler
+        wrote a report after we started -- `crash_evidence` in main, printed for
+        every gone-process verdict). While the client is alive it is counted and
+        reported as a NOTE, which is the honest reading: N exceptions happened
+        and the client kept running.
+
+        The negative half matters as much: a client that logs an exception and
+        then dies must still be CRASH, not DIED-with-no-cause. That is what the
+        gone check preserves.
+        """
         # A relaunch makes a new session dir; pick it up.
         nd = crashwatch.newest_log_dir(self.logs_root)
         if nd and nd != self.cur_dir:
             self.cur_dir = nd
             _, self.tailers = crashwatch.build_tailers(nd, from_start=True)
+        hit = None
         for _suf, t in list(self.tailers.items()):
-            for sig, detail, text in t.poll():
-                return ("CRASH", "%s -- %s" % (sig, detail), t.tail_lines(8))
+            for sig, detail, _text in t.poll(on_line=self._client_line):
+                self.client_exceptions += 1
+                self.last_exception = "%s -- %s" % (sig, detail)
+                if hit is None:
+                    hit = ("CRASH", "%s -- %s" % (sig, detail),
+                           t.tail_lines(8))
+        if hit is None:
+            return None
+        if self.process_gone():
+            return hit
+        if not self._said_alive_exception:
+            self._said_alive_exception = True
+            self.mark("client logged an exception and is STILL RUNNING (%s) -- "
+                      "noted, not a verdict" % self.last_exception[:80])
         return None
+
+    # -- IDLE -------------------------------------------------------------
+    def idle_verdict(self, now, stall):
+        """Quiet-and-alive: is that IDLE, or is it a client doing its job?
+
+        Lived in `main()` as an inline `if`, which meant nothing could test it
+        and the two exemptions could not be stated in one place. Returns a
+        verdict tuple or None.
+
+        The exemptions, both narrow and both falsifiable:
+
+          * you asked to stop AT this phase -- quiet is then the SUCCESS
+            condition and check_clocks owns the answer (pre-existing);
+          * this phase is one where quiet is expected on the way to the phase
+            you asked for: LOADING en route to DEPLOYED. `--phase-max` still
+            bounds it, so a load that never finishes is still reported, as
+            STALLED with a stated limit, rather than as a quiet log.
+
+        Note what this does NOT cover, because the measured case needed it: at
+        60.8s of the failing run the phase was MENU, not LOADING, and no phase
+        exemption would have spared it. `_client_line` is what covers that.
+        """
+        if not self.seen_any or now - self.last_progress <= stall:
+            return None
+        if self.until_phase and self.phase == self.until_phase:
+            return None
+        if self.phase in QUIET_EN_ROUTE.get(self.until_phase or "", ()):
+            return None
+        return ("IDLE", "alive, but no host-log progress line for %ds"
+                % int(stall), self.host_tail[-3:])
 
 
 def crash_evidence(started, root=None):
@@ -846,12 +1101,13 @@ def crash_evidence(started, root=None):
 
 
 def verdict_block(v, why, evidence, elapsed, armed, logs, as_json,
-                  teardown=False, crash=None):
+                  teardown=False, crash=None, notes=()):
+    notes = [n for n in (notes or ()) if n]
     if as_json:
         print(jsonmod.dumps({
             "verdict": v, "why": why, "elapsed_s": round(elapsed, 1),
             "errdlg_armed": armed, "evidence": evidence[-6:], "logs": logs,
-            "teardown": bool(teardown),
+            "teardown": bool(teardown), "notes": notes,
             "crash": (None if crash is None
                       else {k: crash[k] for k in
                             ("folder", "module", "source", "age_s", "modules")}),
@@ -877,6 +1133,8 @@ def verdict_block(v, why, evidence, elapsed, armed, logs, as_json,
     elif armed is None:
         print(" %-12s  UNKNOWN -- the host never said whether it armed."
               % "dialog catch")
+    for n in notes:
+        print(" %-12s  %s" % ("note", n))
     for line in evidence[-6:]:
         print("   | " + line[:200])
     if logs:
@@ -1016,6 +1274,12 @@ def main():
                      until_phase=args.until_phase,
                      menu_settle=args.menu_settle)
     state["sup"] = sup   # the signal handler reports from the live object
+    if args.attach:
+        # The host has been running for minutes; its one-shot `errdlg ARMED`
+        # line is already on disk and will never be printed again. Without this
+        # an --attach run can only ever answer UNKNOWN and downgrade IDLE to
+        # INCONCLUSIVE -- measured 2026-09-02. See Supervisor.prescan_host.
+        sup.prescan_host()
     verdict = why = None
     evidence = []
     last_alive = 0.0
@@ -1085,19 +1349,13 @@ def main():
                        % BOOT_GRACE_S)
                 evidence = sup.host_tail[-6:]
                 break
-        if sup.seen_any and now - sup.last_progress > args.stall:
-            # ORDERING, stated rather than implied. If `--until-phase` was
-            # asked for and the client is sitting in that phase, quiet is the
-            # SUCCESS condition, not the idle condition -- check_clocks owns
-            # this state and will return REACHED once --menu-settle elapses.
-            # With the defaults settle (20s) < stall (45s) so REACHED already
-            # wins on time, but a run given `--menu-settle 60` would otherwise
-            # be reported IDLE at 45s for doing exactly what was asked.
-            if not (sup.until_phase and sup.phase == sup.until_phase):
-                verdict = "IDLE"
-                why = ("alive, but no host-log line for %ds" % args.stall)
-                evidence = sup.host_tail[-3:]
-                break
+        # QUIET-AND-ALIVE. The rule and its exemptions live in the Supervisor
+        # (`idle_verdict`) so that they are testable and stated once; inline
+        # here, they were neither.
+        idle = sup.idle_verdict(now, args.stall)
+        if idle:
+            verdict, why, evidence = idle
+            break
         if now - started > args.timeout:
             verdict, why = "TIMEOUT", "%ds elapsed" % args.timeout
             evidence = sup.host_tail[-3:]
@@ -1147,7 +1405,7 @@ def main():
     tearing = not args.keep and not args.attach
     verdict_block(verdict, why, evidence, time.time() - started,
                   sup.errdlg_armed, logs, args.json, teardown=tearing,
-                  crash=crash)
+                  crash=crash, notes=[sup.exception_note()])
 
     if tearing:
         do_teardown(args.root, dry=args.dry_teardown)

@@ -1120,6 +1120,7 @@ def assert_no_donor_caption_on_clones(report, live, mods_built):
 # (fldoff self-checks System.String._stringLength@0x10 before answering).
 TOGGLE_TYPE = "UnityEngine.UI.Toggle"
 TOGGLE_ISON_OFF = 0x120
+TOGGLE_GROUP_OFF = 0x110
 
 _COMP_FOUND_RE = re.compile(
     r'FOUND\s+(?P<type>[\w.]+)\s+component\s*=\s*(?P<ptr>0x[0-9a-fA-F]+)\s+'
@@ -1148,10 +1149,45 @@ def read_toggle_ison(live, node_ptr, timeout=40):
     GetComponent(String) (the host says so), while `UnityEngine.UI.Toggle`
     resolves offline to an Il2CppType and matches by KLASS IDENTITY -- which is
     what makes the 0x120 offset the right offset for whatever came back.
+
+    A THIN WRAPPER on read_toggle_fields, deliberately: the postfx subtab
+    assertion needs m_Group as well, and two copies of the address-echo rule
+    would be two chances for one of them to quietly stop checking.
     """
-    _s, raw = ch.run_batch(["component %s %s" % (node_ptr, TOGGLE_TYPE),
-                            "read $comp+0x%x bool" % TOGGLE_ISON_OFF],
-                           live_dir=live, timeout=timeout)
+    got, note = read_toggle_fields(live, node_ptr,
+                                   (("m_IsOn", TOGGLE_ISON_OFF, "bool"),),
+                                   timeout=timeout)
+    if got is None:
+        return None, note
+    return got["m_IsOn"], ""
+
+
+def read_toggle_fields(live, node_ptr, fields, timeout=40):
+    """({label: value}, "") or (None, note) -- Toggle fields on `node_ptr`.
+
+    `fields` is a tuple of (label, offset, type) read in ONE batch after a
+    single `component`. Every failure mode is an explicit refusal, never a
+    default value:
+
+    * no Toggle on the object -- `component` prints an `iErr` (`GetComponent
+      (Type) returned NULL -- an ANSWER`), fixture `component-toggle-absent`;
+    * `$comp` STALENESS -- a failed `component` has historically left `$comp`
+      holding the PREVIOUS batch's pointer, so a following `read $comp+0xNN`
+      answers about a different object. Defeated arithmetically: the inspector
+      prints the address it read, and it must equal comp + offset EXACTLY, for
+      every field, in order;
+    * a read that was refused (`! not readable ...`) prints no `as TYPE =` line
+      at all, so the count of answers stops matching the count of fields and
+      this returns None. An unreadable field is INCONCLUSIVE and is never
+      collapsed to false / 0.
+
+    `bool` comes back True/False; `ptr` comes back as an int (0 IS a value: it
+    means the reference is null, which for m_Group means "in no ToggleGroup" --
+    a fact, not a failure to read).
+    """
+    cmds = ["component %s %s" % (node_ptr, TOGGLE_TYPE)]
+    cmds += ["read $comp+0x%x %s" % (off, ty) for _lbl, off, ty in fields]
+    _s, raw = ch.run_batch(cmds, live_dir=live, timeout=timeout)
     h = host_text(raw)
     if not ch.parse_component(h)["found"]:
         return None, ("no %s component on %s (or the lookup was refused)"
@@ -1160,21 +1196,35 @@ def read_toggle_ison(live, node_ptr, timeout=40):
     if not fm:
         return None, "the FOUND line for %s could not be parsed" % node_ptr
     reads = [m for m in (_READ_AT_RE.match(l) for l in h.splitlines()) if m]
-    if len(reads) != 1:
-        return None, ("expected exactly one `read` answer for %s, got %d"
-                      % (node_ptr, len(reads)))
-    r = reads[0]
-    want_addr = int(fm.group("ptr"), 16) + TOGGLE_ISON_OFF
-    if int(r.group("addr"), 16) != want_addr:
-        return None, ("the read answered about 0x%x but the component found "
-                      "for %s is at %s, whose m_IsOn is 0x%x -- refusing to "
-                      "attribute one object's field to another"
-                      % (int(r.group("addr"), 16), node_ptr, fm.group("ptr"),
-                         want_addr))
-    if r.group("type") != "bool" or r.group("val") not in ("true", "false"):
-        return None, ("m_IsOn read back as %s %r, not a bool"
-                      % (r.group("type"), r.group("val")))
-    return r.group("val") == "true", ""
+    if len(reads) != len(fields):
+        return None, ("expected %d `read` answer(s) for %s, got %d -- a "
+                      "refused read prints no value line, so this is unknown, "
+                      "not a default" % (len(fields), node_ptr, len(reads)))
+    comp = int(fm.group("ptr"), 16)
+    out = {}
+    for r, (lbl, off, ty) in zip(reads, fields):
+        want_addr = comp + off
+        if int(r.group("addr"), 16) != want_addr:
+            return None, ("the read answered about 0x%x but the component "
+                          "found for %s is at %s, whose %s is 0x%x -- refusing "
+                          "to attribute one object's field to another"
+                          % (int(r.group("addr"), 16), node_ptr,
+                             fm.group("ptr"), lbl, want_addr))
+        if r.group("type") != ty:
+            return None, ("%s read back as type %r, not %r"
+                          % (lbl, r.group("type"), ty))
+        val = r.group("val")
+        if ty == "bool":
+            if val not in ("true", "false"):
+                return None, "%s read back as %r, not a bool" % (lbl, val)
+            out[lbl] = (val == "true")
+        elif ty == "ptr":
+            if not re.match(r"^0x[0-9a-fA-F]+$", val):
+                return None, "%s read back as %r, not a pointer" % (lbl, val)
+            out[lbl] = int(val, 16)
+        else:
+            out[lbl] = val
+    return out, ""
 
 
 def _toggle_hosts(live, strip, spawner_ptrs, spawner_names):
@@ -1278,20 +1328,16 @@ def assert_postfx_subtab(report, live):
     child of `Graphics Settings`. Falsifiable: it is absent, or it has fewer
     than two subtabs, and this FAILS.
 
-    The m_Group@0x110 / m_IsOn@0x120 half of the old assertion is still NOT
-    performed, but NOT for the reason this docstring used to give. It said the
-    `component` verb FAULTED 5/5 on this build and would burn the inspector's
-    8-fault session budget. RE-MEASURED 2026-09-02: `component <ptr>
-    UnityEngine.UI.Toggle` was issued ~30 times against this live screen with
-    ZERO faults -- the fully-qualified name takes the GetComponent(System.Type)
-    klass-identity route, not the GetComponent(String) one that verdict came
-    from. read_toggle_ison() below now depends on it working.
+    The m_Group@0x110 / m_IsOn@0x120 half is NO LONGER "NOT PERFORMED": it is
+    delegated to assert_postfx_group_one_on below. The excuse it used to carry
+    (that `component` FAULTED 5/5 on this build) had already been falsified --
+    RE-MEASURED 2026-09-02, `component <ptr> UnityEngine.UI.Toggle` was issued
+    ~30 times against this live screen with ZERO faults, because the
+    fully-qualified name takes the GetComponent(System.Type) klass-identity
+    route and not the GetComponent(String) one that verdict came from.
 
-    What is genuinely missing is the wiring: the strip's 4 children each carry
-    their Toggle on an `AnimatedToggle` child (measured), so this needs the
-    same tree-pairing + per-toggle read that assert_row_group_one_on does, plus
-    its own recorded fixtures and negative controls. Until that exists it stays
-    INCONCLUSIVE and says so; a stale excuse is not better than no excuse.
+    The one path that still records INCONCLUSIVE for the group is the one where
+    there is no strip to read: nothing was measured, so nothing is claimed.
     """
     _s, raw = ch.run_batch(["tree %s 2" % SETTINGS_ROOT], live_dir=live,
                             timeout=40)
@@ -1327,11 +1373,168 @@ def assert_postfx_subtab(report, live):
         report.record("postfx subtab strip under GRAPHICS", v,
                       "subtab strip present with %s child(ren)" % nsub,
                       strip[0]["ptr"])
-    report.record("postfx toggles share a group, one is on", INCONCLUSIVE,
-                  "NOT PERFORMED: this needs a per-subtab Toggle read that is "
-                  "not wired up yet (the strip's 4 children each hold their "
-                  "Toggle on one `AnimatedToggle` child, measured 2026-09-02) "
-                  "-- it is not a pass and nothing about the group was checked")
+        assert_postfx_group_one_on(report, live, strip[0]["ptr"])
+        return
+    report.record(POSTFX_GROUP_NAME, INCONCLUSIVE,
+                  "NOT PERFORMED: there is no subtab strip to read toggles "
+                  "from -- nothing about the group was checked")
+
+
+# The name of the second postfx assertion. One constant, because two functions
+# print it (the strip branch delegates, the no-strip branch refuses) and two
+# literals would be two chances to drift out of SCREEN_ASSERTION_NAMES.
+POSTFX_GROUP_NAME = "postfx toggles share a group, one is on"
+
+
+def _depth2_direct_children(nodes):
+    """(([direct_child_node, ...]), "") or (None, note) from a `tree X 2`.
+
+    parse_tree exposes no depth -- only the name, the pointer and the node's
+    own child count -- so "which of these lines are DIRECT children" cannot be
+    read off indentation. It CAN be recomputed exactly, because at a depth cap
+    of 2 the grandchildren print their counts but never expand: the flat
+    preorder list is root, then, for each direct child, that child followed by
+    exactly `child_count` grandchildren.
+
+    Every step of that arithmetic is checked and any mismatch is a REFUSAL, not
+    a guess -- the failure this avoids is pairing a toggle with the wrong node
+    and then reporting its m_IsOn with full confidence.
+    """
+    if not nodes:
+        return None, "the tree printed no nodes at all"
+    root = nodes[0]
+    kids = []
+    i = 1
+    while i < len(nodes):
+        kid = nodes[i]
+        gc = kid["child_count"] or 0
+        if i + 1 + gc > len(nodes):
+            return None, ("`%s` claims %d child(ren) but only %d node(s) "
+                          "follow it, so the depth-2 layout does not add up "
+                          "and the parent/child pairing cannot be trusted"
+                          % (kid["name"], gc, len(nodes) - i - 1))
+        kids.append(kid)
+        i += 1 + gc
+    want = root["child_count"]
+    if want is not None and len(kids) != want:
+        return None, ("`%s` reports %d child(ren) but the depth-2 arithmetic "
+                      "yields %d -- the two disagree, so nothing is read off "
+                      "this tree" % (root["name"], want, len(kids)))
+    return kids, ""
+
+
+def _postfx_toggle_hosts(live, strip_ptr, subtabs):
+    """[(subtab_name, animated_toggle_ptr)] for each subtab, or (None, note).
+
+    MEASURED 2026-09-02: the strip's children do NOT carry the Toggle
+    themselves -- each holds it on an `AnimatedToggle` child. One `tree
+    <child> 2` per subtab answers where that child is; the pairing is then
+    recomputed with _depth2_direct_children rather than assumed positionally.
+
+    Exactly ONE direct child whose name starts with `AnimatedToggle` is
+    required. Zero is a refusal (the layout changed and this assertion no
+    longer knows what it is reading); more than one is also a refusal, because
+    picking "the first" would be inventing an answer.
+    """
+    out = []
+    for sub in subtabs:
+        _s, raw = ch.run_batch(["tree %s 2" % sub["ptr"]], live_dir=live,
+                               timeout=40)
+        t = ch.parse_tree(host_text(raw))
+        if not t["parse_ok"] or not t["complete"]:
+            return None, ("`tree %s 2` did not print a complete tree for "
+                          "subtab `%s`" % (sub["ptr"], sub["name"]))
+        kids, note = _depth2_direct_children(t["nodes"])
+        if kids is None:
+            return None, "subtab `%s`: %s" % (sub["name"], note)
+        hosts = [k for k in kids if k["name"].startswith("AnimatedToggle")]
+        if len(hosts) != 1:
+            return None, ("subtab `%s` has %d direct child(ren) named "
+                          "AnimatedToggle*, expected exactly 1 (children: %s)"
+                          % (sub["name"], len(hosts),
+                             ", ".join(k["name"] for k in kids) or "none"))
+        out.append((sub["name"], hosts[0]["ptr"]))
+    return out, ""
+
+
+def assert_postfx_group_one_on(report, live, strip_ptr):
+    """The postfx subtab strip is ONE ToggleGroup with EXACTLY ONE tab selected.
+
+    This assertion was `NOT PERFORMED` until now and said so, which was honest
+    but bought nothing. It is the same discipline as
+    assert_row_group_one_on -- `component <ptr> UnityEngine.UI.Toggle`, then
+    m_Group@0x110 and m_IsOn@0x120 with the address echo checked against the
+    component pointer -- applied one level down.
+
+    Three outcomes, and the falsifying inputs are stated because a check whose
+    failing input cannot be described is not a check (CLAUDE.md 9b):
+
+      FAIL          two subtabs ON (or none), or the toggles do not all report
+                    the SAME m_Group, or that shared group is null -- a strip
+                    whose toggles are in no group is not a strip that can
+                    behave like tabs.
+      INCONCLUSIVE  any toggle could not be read: no Toggle component, an
+                    unreadable field, or an address echo that did not match.
+      PASS          one group, non-null, shared by all, exactly one ON.
+    """
+    _s, raw = ch.run_batch(["tree %s 2" % strip_ptr], live_dir=live, timeout=40)
+    t = ch.parse_tree(host_text(raw))
+    if not t["parse_ok"] or not t["complete"]:
+        report.record(POSTFX_GROUP_NAME, INCONCLUSIVE,
+                      "`tree %s 2` did not print a complete tree" % strip_ptr)
+        return
+    subtabs, note = _depth2_direct_children(t["nodes"])
+    if subtabs is None:
+        report.record(POSTFX_GROUP_NAME, INCONCLUSIVE, note)
+        return
+    if len(subtabs) < 2:
+        report.record(POSTFX_GROUP_NAME, FAIL,
+                      "the subtab strip has %d child(ren); a group of tabs "
+                      "needs at least 2" % len(subtabs))
+        return
+    members, note = _postfx_toggle_hosts(live, strip_ptr, subtabs)
+    if members is None:
+        report.record(POSTFX_GROUP_NAME, INCONCLUSIVE, note)
+        return
+
+    states = []
+    for nm, host_ptr in members:
+        got, why = read_toggle_fields(live, host_ptr,
+                                      (("m_Group", TOGGLE_GROUP_OFF, "ptr"),
+                                       ("m_IsOn", TOGGLE_ISON_OFF, "bool")))
+        states.append((nm, got, why))
+
+    unknown = [(nm, why) for nm, got, why in states if got is None]
+    if unknown:
+        report.record(POSTFX_GROUP_NAME, INCONCLUSIVE,
+                      "m_Group@0x%x / m_IsOn@0x%x could not be trusted for %d "
+                      "of %d subtab toggle(s), so neither the group nor the "
+                      "count of ON is known"
+                      % (TOGGLE_GROUP_OFF, TOGGLE_ISON_OFF, len(unknown),
+                         len(states)),
+                      "; ".join("%s: %s" % (nm, why) for nm, why in unknown[:3]))
+        return
+
+    groups = sorted({got["m_Group"] for _nm, got, _w in states})
+    on = [nm for nm, got, _w in states if got["m_IsOn"]]
+    measured = ("%d subtab(s): %d distinct m_Group, %d ON"
+                % (len(states), len(groups), len(on)))
+    detail = ("ON: %s | group(s): %s"
+              % (", ".join(on) or "none",
+                 ", ".join("0x%016x" % g for g in groups)))
+    if len(groups) != 1:
+        report.record(POSTFX_GROUP_NAME, FAIL, measured,
+                      "the subtabs are in %d different ToggleGroups, so they "
+                      "cannot deselect one another. %s" % (len(groups), detail))
+        return
+    if groups[0] == 0:
+        report.record(POSTFX_GROUP_NAME, FAIL, measured,
+                      "every subtab reports m_Group = null: they are in NO "
+                      "ToggleGroup at all, so nothing enforces one selection. "
+                      + detail)
+        return
+    v = PASS if len(on) == 1 else FAIL
+    report.record(POSTFX_GROUP_NAME, v, measured, detail)
 
 
 def assert_one_panel_active(report, live):
@@ -1624,6 +1827,116 @@ def _fx_strip(names, base=0x21c00440000, batch=100):
     return ptrs, _hdr(batch, 1, body)
 
 
+# ---- the POSTFX SUBTAB STRIP, SHAPED ------------------------------------
+# SHAPED, not measured. The SHAPES are the ones in the corpus and are not
+# invented here: `tree` is `fixtures/inspector/tree.txt`
+# (tree-toggle-strip-depth2) and the component/read pair is
+# `fixtures/inspector/component.txt` (toggle-ison-00-true, and
+# component-toggle-absent for the refusal) -- pointer VALUES and node names are
+# synthetic, because the live screen was in a raid when this was written and
+# nothing here may be harvested by hand.
+#
+# The one shape NOT present in the corpus is `read $comp+0x110 ptr`. Its emit
+# is inspect.nim iReadTyped's `ptr` branch -- `  <addr> as ptr = <value>` plus
+# `  readable` / `  NOT readable` / `  NULL` -- read out of the source, and it
+# is labelled INFERRED-FROM-SOURCE rather than measured for exactly that
+# reason. If it is wrong, `_READ_AT_RE` stops matching and the assertion goes
+# INCONCLUSIVE; it cannot turn into a false PASS.
+_PFX_STRIP = "0x000002024b100000"
+_PFX_SUBS = ["PostFxSubtab", "PostFxSubtab(Clone)", "PostFxSubtab(Clone)",
+             "PostFxSubtab(Clone)"]
+_PFX_SUB_PTRS = ["0x%016x" % (0x2024b101000 + i * 0x40) for i in range(4)]
+_PFX_AT_PTRS = ["0x%016x" % (0x2024b102000 + i * 0x40) for i in range(4)]
+_PFX_COMP_PTRS = ["0x%016x" % (0x2024b103000 + i * 0x400) for i in range(4)]
+_PFX_GROUP = 0x0000020244f84a80
+
+
+def _fx_tree(root_name, root_ptr, kids, batch=110):
+    """A `tree PTR 2` answer: root, then each child followed by its own
+    children. Shape from fixture `tree-toggle-strip-depth2`."""
+    body = ['> tree %s 2' % root_ptr,
+            '  tree from %s name="%s" (max depth 2, max 3000 nodes)'
+            % (root_ptr, root_name),
+            '    "%s"  %s  (%d child)' % (root_name, root_ptr, len(kids))]
+    n = 1
+    for name, ptr, gkids in kids:
+        body.append('      + "%s"  %s  (%d child)' % (name, ptr, len(gkids)))
+        n += 1
+        for gname, gptr, gcount in gkids:
+            body.append('        + "%s"  %s  (%d child)'
+                        % (gname, gptr, gcount))
+            n += 1
+    body.append("  %d node(s) printed  -- complete." % n)
+    return _hdr(batch, 2, "\n".join(body))
+
+
+def _fx_toggle_read(node_ptr, comp_ptr, group, ison, batch=120):
+    """`component <ptr> UnityEngine.UI.Toggle` + `read $comp+0x110 ptr` +
+    `read $comp+0x120 bool`. The address each read prints is comp+offset, which
+    is the arithmetic read_toggle_fields refuses to proceed without.
+
+    `group=None` records the REFUSAL shape instead: `component` answered NULL
+    and the reads printed `! not readable`, which must never be read as 0."""
+    c = int(comp_ptr, 16)
+    if group is None:
+        return _hdr(batch, 3, """> component %s UnityEngine.UI.Toggle
+  ! via GetComponent(Type) on %s: GetComponent(Type) returned NULL -- an \
+ANSWER: this object has no component of that type.
+> read $comp+0x110 ptr
+  ! not readable for 8 bytes at 0x0000000000000110
+> read $comp+0x120 bool
+  ! not readable for 1 bytes at 0x0000000000000120""" % (node_ptr, node_ptr))
+    return _hdr(batch, 3, """> component %s UnityEngine.UI.Toggle
+  FOUND UnityEngine.UI.Toggle component = %s  klass=0x000001ffe2f98030   \
+($comp)   via GetComponent(System.Type) -- klass identity, no string match
+  bound to $comp -- e.g.  allow write   then   click $comp
+> read $comp+0x110 ptr
+  0x%016x as ptr = 0x%016x  readable
+> read $comp+0x120 bool
+  0x%016x as bool = %s  (0x%02x)"""
+                % (node_ptr, comp_ptr, c + TOGGLE_GROUP_OFF, group,
+                   c + TOGGLE_ISON_OFF, "true" if ison else "false",
+                   1 if ison else 0))
+
+
+def _fx_settings_tree_with_strip(nsub=4, batch=111):
+    """`tree $settings 2` with a `Toggles(Clone)` subtab strip of `nsub`
+    children under `Graphics Settings`."""
+    return _fx_tree("SettingsScreen", "0x000002024b000000", [
+        ("Graphics Settings", "0x000002024b000100",
+         [("Toggles(Clone)", _PFX_STRIP, nsub)]),
+        ("Sound Settings", "0x000002024b000200", []),
+    ], batch=batch)
+
+
+def _fx_postfx_script(groups, ons, at_children=("AnimatedToggle",)):
+    """The WHOLE replay script for assert_postfx_subtab, parameterised by what
+    the four subtab toggles report. `groups[i] is None` records the refusal."""
+    script = [("tree %s 2" % SETTINGS_ROOT, [_fx_settings_tree_with_strip()]),
+              ("tree %s 2" % _PFX_STRIP,
+               [_fx_tree("Toggles(Clone)", _PFX_STRIP,
+                         [(_PFX_SUBS[i], _PFX_SUB_PTRS[i],
+                           [("AnimatedToggle", _PFX_AT_PTRS[i], 2)])
+                          for i in range(4)], batch=112)])]
+    for i in range(4):
+        # Each subtab: its AnimatedToggle child (which has grandchildren of its
+        # own, so the depth-2 arithmetic is actually exercised) plus a Label.
+        kids = [(nm, _PFX_AT_PTRS[i],
+                 [("Background", "0x%016x" % (0x2024b105000 + i * 8), 0),
+                  ("Checkmark", "0x%016x" % (0x2024b106000 + i * 8), 0)])
+                for nm in at_children]
+        kids.append(("Label", "0x%016x" % (0x2024b104000 + i), []))
+        script.append(("tree %s 2" % _PFX_SUB_PTRS[i],
+                       [_fx_tree(_PFX_SUBS[i], _PFX_SUB_PTRS[i], kids,
+                                 batch=113 + i)]))
+    for i in range(4):
+        script.append(
+            ("component %s UnityEngine.UI.Toggle" % _PFX_AT_PTRS[i],
+             [_fx_toggle_read(_PFX_AT_PTRS[i], _PFX_COMP_PTRS[i],
+                              groups[i], ons[i], batch=120 + i)]))
+    return script
+
+
 def _fx_active_ptrs(ptrs, flags, batch=101):
     """One `assert-active` verdict per pointer, in command order (shaped)."""
     body = "\n".join(
@@ -1643,10 +1956,18 @@ def _declared_screen_assertion_names():
     names = set()
     for fn in (assert_tab_count, assert_no_donor_caption_on_clones,
                assert_row_group_one_on, assert_postfx_subtab,
-               assert_one_panel_active):
+               assert_postfx_group_one_on, assert_one_panel_active):
         src = _pyinspect.getsource(fn)
         names |= set(re.findall(r'report\.record\(\s*"([^"]+)"', src))
         names |= set(re.findall(r'^\s*name\s*=\s*"([^"]+)"', src, re.M))
+        # A name held in a module CONSTANT is still a name this can print, and
+        # a scraper that only saw literals would silently stop covering an
+        # assertion the moment it was factored out.
+        for ident in re.findall(r'report\.record\(\s*([A-Z][A-Z_0-9]*)\s*,',
+                                src):
+            val = globals().get(ident)
+            if isinstance(val, str):
+                names.add(val)
     src = _pyinspect.getsource(run_screen_assertions)
     names |= set(re.findall(r'assert_no_text\([^,]+,[^,]+,\s*"([^"]+)"', src))
     return names
@@ -2109,6 +2430,73 @@ Component::get_gameObject, GameObject::get_activeSelf (calls, not field reads)
           ("children 0x000002024b079ee0", [_fixtures.fx("children-ok")]),
           ("tree 0x000002024b079ee0 2",
            [_fixtures.fx("tree-toggle-strip-depth2")])], c16)
+
+    # --- 16b. THE POSTFX SUBTAB GROUP. Was NOT PERFORMED; now it is. -------
+    #     Four cases, and three of them are the falsifying ones: this
+    #     assertion is worth having only if there is an input that makes it
+    #     say FAIL and an input that makes it say INCONCLUSIVE.
+    G = _PFX_GROUP
+
+    def c16a(rep, _rp):
+        assert_postfx_subtab(rep, "X")
+        v = _verdicts(rep)
+        if v.get("postfx subtab strip under GRAPHICS") != PASS:
+            return "the strip half regressed: %s" % v.get(
+                "postfx subtab strip under GRAPHICS")
+        if v.get(POSTFX_GROUP_NAME) != PASS:
+            row = [r for r in rep.rows if r[0] == POSTFX_GROUP_NAME][0]
+            return "one group, one ON did not PASS: %s %r" % (row[1], row[2])
+        row = [r for r in rep.rows if r[0] == POSTFX_GROUP_NAME][0]
+        if "1 distinct m_Group, 1 ON" not in row[2]:
+            return "the measurement was not stated: %r" % row[2]
+        return ""
+    case("postfx subtabs: one shared group, exactly one ON -> PASS",
+         _fx_postfx_script([G] * 4, [True, False, False, False]), c16a)
+
+    def c16b(rep, _rp):
+        assert_postfx_subtab(rep, "X")
+        if _verdicts(rep).get(POSTFX_GROUP_NAME) != FAIL:
+            return "two subtabs ON at once did not FAIL"
+        return ""
+    case("control: two postfx subtabs ON -> FAIL",
+         _fx_postfx_script([G] * 4, [True, True, False, False]), c16b)
+
+    def c16c(rep, _rp):
+        assert_postfx_subtab(rep, "X")
+        row = [r for r in rep.rows if r[0] == POSTFX_GROUP_NAME][0]
+        if row[1] != FAIL:
+            return "two different ToggleGroups did not FAIL: %s" % row[1]
+        if "2 distinct m_Group" not in row[2]:
+            return "the group split was not stated: %r" % row[2]
+        return ""
+    case("control: postfx subtabs in two different groups -> FAIL",
+         _fx_postfx_script([G, G, G + 0x40, G], [True, False, False, False]),
+         c16c)
+
+    def c16d(rep, _rp):
+        assert_postfx_subtab(rep, "X")
+        v = _verdicts(rep).get(POSTFX_GROUP_NAME)
+        if v == FAIL:
+            return ("an UNREADABLE toggle was counted as a failure -- 'I could "
+                    "not look' is not 'the condition does not hold'")
+        if v != INCONCLUSIVE:
+            return "expected INCONCLUSIVE, got %s" % v
+        return ""
+    case("control: one postfx subtab has no Toggle -> INCONCLUSIVE, not FAIL",
+         _fx_postfx_script([G, None, G, G], [True, False, False, False]), c16d)
+
+    def c16e(rep, _rp):
+        assert_postfx_subtab(rep, "X")
+        row = [r for r in rep.rows if r[0] == POSTFX_GROUP_NAME][0]
+        if row[1] != INCONCLUSIVE:
+            return ("a subtab with TWO AnimatedToggle children was resolved "
+                    "anyway (verdict %s) -- picking the first would be an "
+                    "invented answer" % row[1])
+        return ""
+    case("control: ambiguous AnimatedToggle child -> INCONCLUSIVE",
+         _fx_postfx_script([G] * 4, [True, False, False, False],
+                           at_children=("AnimatedToggle",
+                                        "AnimatedToggle(Clone)")), c16e)
 
     # --- 17-19. THE CLONE COUNT COMES FROM THE HOST'S `built the` LINES. ---
     #     It used to come from `published N of M client-side settings page(s)`,

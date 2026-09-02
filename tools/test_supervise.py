@@ -46,6 +46,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import run as runmod   # noqa: E402  -- the code under test, not a copy of it
+import crashwatch      # noqa: E402  -- the real tailers, not a stand-in
 
 VERBOSE = "-v" in sys.argv
 
@@ -62,6 +63,28 @@ class Bed:
                                     "aowlspt-backend.log")
         open(self.host, "w").close()
         open(self.backend, "w").close()
+        # The CLIENT's own session dir, created on demand. Named the way
+        # crashwatch's `newest_log_dir` globs for it (`log_*`), with the
+        # stamp-prefixed file names `resolve_files` matches by suffix -- so the
+        # real Tailer, the real classifier and the real suffix resolution run.
+        self.client_dir = None
+        self.client_files = {}
+
+    def client_log(self, *suffixes):
+        d = os.path.join(self.root, "Logs", "log_2026.09.02_8-09-51_1.1.0")
+        if not os.path.isdir(d):
+            os.makedirs(d)
+        self.client_dir = d
+        for suf in suffixes or ("output_000.log",):
+            p = os.path.join(d, "2026.09.02_8-09-51_1.1.0 " + suf)
+            open(p, "a").close()
+            self.client_files[suf] = p
+        return d
+
+    def client_say(self, text, suf=None):
+        suf = suf or sorted(self.client_files)[0]
+        with open(self.client_files[suf], "a", encoding="utf-8") as f:
+            f.write(text + "\n")
 
     def sup(self, **kw):
         kw.setdefault("until", None)
@@ -76,8 +99,18 @@ class Bed:
         s.host_pos = 0
         s.backend_path = self.backend
         s.backend_pos = 0
-        # No client log dir in the bed -- poll_client is exercised elsewhere.
-        s.tailers = {}
+        # By default no client log dir in the bed. When one was created, wire
+        # the REAL tailers to it -- from the start, since everything in it was
+        # written after this supervisor began watching.
+        if self.client_dir:
+            s.logs_root = os.path.join(self.root, "Logs")
+            s.cur_dir = self.client_dir
+            _, s.tailers = crashwatch.build_tailers(self.client_dir,
+                                                    from_start=True)
+        else:
+            s.tailers = {}
+        # Never shell out to tasklist from a test: liveness is injected.
+        s.alive_probe = lambda: kw.get("alive", True)
         return s
 
     def say(self, line):
@@ -566,9 +599,15 @@ LAST_REAL_PROGRESS_S = 64.0
 
 
 def replay(bed, sup, clock, horizon, periodics, progress, phase_from=8.0,
-           die_at=None):
+           die_at=None, phase="MENU", idle_stall=None, client_events=(),
+           poll_client=False):
     """Drive `sup` over a synthetic boot in virtual time. Returns the first
-    verdict and the virtual second it landed on, or (None, horizon)."""
+    verdict and the virtual second it landed on, or (None, horizon).
+
+    `idle_stall` and `poll_client` bring this driver up to the ORDER main()
+    actually uses (host -> clocks -> client -> idle). They are opt-in only so
+    the pre-existing cases keep driving exactly what they drove before.
+    """
     events = list(progress)
     for text, first, period in periodics:
         t = first
@@ -580,21 +619,30 @@ def replay(bed, sup, clock, horizon, periodics, progress, phase_from=8.0,
     # the 5s raid-phase heartbeat
     t = phase_from
     while t <= horizon:
-        events.append((t, phase_line("MENU")))
+        events.append((t, phase_line(phase)))
         t += 5.0
+    cevents = sorted(client_events)
     if die_at is not None:
         events = [e for e in events if e[0] < die_at]
     events.sort(key=lambda e: e[0])
 
     t0 = clock.t
     i = 0
+    j = 0
     vt = 0.0
     while vt <= horizon:
         clock.t = t0 + vt
         while i < len(events) and events[i][0] <= vt:
             bed.say(events[i][1])
             i += 1
+        while j < len(cevents) and cevents[j][0] <= vt:
+            bed.client_say(cevents[j][1])
+            j += 1
         hit = sup.poll_host() or sup.check_clocks(clock.time())
+        if not hit and poll_client:
+            hit = sup.poll_client()
+        if not hit and idle_stall is not None:
+            hit = sup.idle_verdict(clock.time(), idle_stall)
         if hit:
             return hit, vt
         vt += 1.0
@@ -783,6 +831,192 @@ def t_exit_codes_distinct():
           "caller: %r" % (runmod.EXIT,))
 
 
+# -- 8. --attach must read the arming state ALREADY on disk --------------
+def t_attach_reads_existing_arming():
+    """MEASURED 2026-09-02: `--attach --until-phase DEPLOYED` exited 6 with
+    `dialog catch UNKNOWN`, because the host printed `errdlg ARMED` once at
+    [0:00:01] and we attached two minutes later, tailing from end-of-file.
+
+    The falsifying half is the FIRST check: a supervisor that starts at the end
+    of the file must still read UNKNOWN, or the prescan below proves nothing.
+    """
+    for line, want, label in (
+            ("[0:00:01.500] ok     errdlg ARMED: read-only postfix detours on "
+             "all 3 PreloaderUI error-screen entry points.", True, "armed"),
+            ("[0:00:01.500] warn   errdlg did not arm: "
+             "catchErrorDialogs is explicitly false", False, "not-armed"),
+            ("[0:00:01.500] ok     something else entirely", None, "silent")):
+        b = Bed()
+        try:
+            b.say(line)
+            for _ in range(200):
+                b.say("[0:00:02.000] ok     natesp: raid phase = MENU -- S1")
+            s = b.sup()
+            s.host_pos = os.path.getsize(b.host)   # --attach: start at the END
+            check("attach/unknown-without-prescan (%s)" % label,
+                  s.poll_host() is None and s.errdlg_armed is None,
+                  "tailing from EOF cannot see a one-shot line from earlier in "
+                  "the same boot; got %r" % (s.errdlg_armed,))
+            got = s.prescan_host()
+            check("attach/prescan-%s" % label,
+                  got is want and s.errdlg_armed is want,
+                  "prescan returned %r, errdlg_armed %r, wanted %r"
+                  % (got, s.errdlg_armed, want))
+        finally:
+            b.close()
+
+
+# -- 9. a LOADING raid is legitimately quiet ------------------------------
+def t_loading_quiet_is_not_idle():
+    """The measured exit-6 run, in both of its halves.
+
+    (a) phase LOADING with `--until-phase DEPLOYED`: quiet is expected, so no
+        IDLE -- but `--phase-max` must still be able to bound it, or the
+        exemption is a check that cannot fail.
+    (b) the SAME quiet with `--until-phase MENU`: old behaviour, IDLE at 45s.
+        Without this control (a) would be indistinguishable from an IDLE rule
+        that was simply switched off.
+    """
+    def body(clock):
+        # (a) en route to DEPLOYED -- keeps waiting.
+        b = Bed()
+        try:
+            s = b.sup(until_phase="DEPLOYED", phase_max=480.0, stall=45.0)
+            s.phase_since = clock.t
+            s.last_progress = clock.t
+            hit, vt = replay(b, s, clock, 120.0, [], [], phase="LOADING",
+                             phase_from=1.0, idle_stall=45.0)
+            check("loading/quiet-en-route-is-not-idle", hit is None,
+                  "a raid loads quietly for 1-3 minutes; got %r at t=%ss"
+                  % (hit[0] if hit else None, vt))
+        finally:
+            b.close()
+
+        # (a2) ...and it is STILL BOUNDED. Same input, --phase-max 60.
+        b = Bed()
+        try:
+            s = b.sup(until_phase="DEPLOYED", phase_max=60.0, stall=45.0)
+            s.phase_since = clock.t
+            s.last_progress = clock.t
+            hit, vt = replay(b, s, clock, 120.0, [], [], phase="LOADING",
+                             phase_from=1.0, idle_stall=45.0)
+            check("loading/exemption-is-still-bounded",
+                  hit is not None and hit[0] == "STALLED",
+                  "--phase-max must still catch a load that never finishes; "
+                  "got %r" % (hit[0] if hit else None,))
+        finally:
+            b.close()
+
+        # (b) NEGATIVE CONTROL: the same quiet, MENU requested -> old verdict.
+        b = Bed()
+        try:
+            s = b.sup(until_phase="MENU", phase_max=480.0, stall=45.0)
+            s.phase_since = clock.t
+            s.last_progress = clock.t
+            hit, vt = replay(b, s, clock, 120.0, [], [], phase="LOADING",
+                             phase_from=1.0, idle_stall=45.0)
+            check("loading/control-menu-still-goes-idle",
+                  hit is not None and hit[0] == "IDLE",
+                  "with MENU requested, a quiet LOADING client is IDLE exactly "
+                  "as before; got %r at t=%ss"
+                  % (hit[0] if hit else None, vt))
+        finally:
+            b.close()
+    _with_clock(body)
+
+
+# -- 10. the phase was MENU, not LOADING: the client log is what covers it -
+def t_client_log_carries_a_load():
+    """At 60.8s of the failing run the phase was still MENU -- natesp's S1 is
+    true on the loading screen too. So the phase exemption above could NOT have
+    spared that run, and saying otherwise would be a fix that cannot fire.
+
+    Three cases, and the first is the one that fails without the fix.
+    """
+    def body(clock):
+        loading = [(t, "2026-09-02 08:1%d:00.100|1.1.0|Info|application|"
+                       "Loading bundle assets/scenes/factory_%d" % (t // 60, t))
+                   for t in range(5, 120, 10)]
+        cases = (
+            ("DEPLOYED", loading, None,
+             "client/load-lines-carry-a-menu-phased-load",
+             "the measured case: phase MENU, raid loading, client log moving"),
+            ("DEPLOYED", [], "IDLE",
+             "client/no-client-progress-still-goes-idle",
+             "with NOTHING moving anywhere, quiet must still be IDLE"),
+            (None, loading, "IDLE",
+             "client/load-lines-do-not-count-outside-a-raid-entry",
+             "LOAD_PROGRESS_RX matches 'Loading' and 'bundle', which the "
+             "client logs at the menu too -- outside a raid entry it must not "
+             "become a new heartbeat"),
+        )
+        for dest, cev, want, name, why in cases:
+            b = Bed()
+            try:
+                b.client_log("output_000.log")
+                s = b.sup(until_phase=dest, phase_max=480.0, stall=45.0)
+                s.phase_since = clock.t
+                s.last_progress = clock.t
+                hit, vt = replay(b, s, clock, 120.0, [], [], phase="MENU",
+                                 phase_from=1.0, idle_stall=45.0,
+                                 client_events=cev, poll_client=True)
+                got = hit[0] if hit else None
+                check(name, got == want, "%s; got %r at t=%ss" % (why, got, vt))
+            finally:
+                b.close()
+    _with_clock(body)
+
+
+# -- 11. a LOGGED exception is not a CRASH while the client is alive ------
+NRE_RECORD = [
+    "2026-09-02 08:12:00.123|1.1.0.1.46777|Error|application|"
+    "NullReferenceException: Object reference not set to an instance of an "
+    "object",
+    "  at MalfunctionLayer.ShallUseNow () [0x00000] in <filename unknown>:0",
+    "  at EFT.BotsController.UpdateByUnity () [0x00000] in "
+    "<filename unknown>:0",
+    # A following header is what CLOSES the record in crashwatch's Tailer.
+    "2026-09-02 08:12:00.456|1.1.0.1.46777|Info|application|GameUpdate",
+]
+
+
+def t_logged_exception_is_not_a_crash():
+    """MEASURED 2026-09-02: `--attach --until-phase MENU` exited 5 (CRASH,
+    `unhandled-exception -- NullReferenceException`) after 0.5s while the client
+    was ALIVE and standing in a raid. The record was Tarkov's own bot AI,
+    logged and CAUGHT in every raid.
+
+    Both directions, because only the pair is a check:
+      alive + the record  -> no verdict, and a NOTE that says what was seen;
+      gone  + the record  -> CRASH, unchanged.
+    The note itself is the guard against a vacuous pass: if the classifier had
+    not matched at all, `client_exceptions` would be 0 and the first case would
+    fail rather than silently proving nothing.
+    """
+    for alive, want in ((True, None), (False, "CRASH")):
+        b = Bed()
+        try:
+            b.client_log("output_000.log", "errors_000.log")
+            s = b.sup(alive=alive)
+            for line in NRE_RECORD:
+                b.client_say(line, "errors_000.log")
+            hit = s.poll_client()
+            got = hit[0] if hit else None
+            label = "alive" if alive else "gone"
+            check("crash/%s-%s" % (label, want or "no-verdict"), got == want,
+                  "client %s + a caught NullReferenceException must be %s; "
+                  "got %r" % (label, want or "a NOTE, not a verdict", got))
+            check("crash/%s-counted" % label, s.client_exceptions >= 1,
+                  "the record must actually have been classified, or this "
+                  "case passes vacuously; count=%d" % s.client_exceptions)
+            note = s.exception_note()
+            check("crash/%s-note-names-it" % label,
+                  bool(note) and "NullReferenceException" in note,
+                  "note=%r" % (note,))
+        finally:
+            b.close()
+
+
 def main():
     for fn in (t_stalled_fires, t_progress_never_stalls, t_bound_disable,
                t_heartbeat_is_not_progress, t_backend_down,
@@ -791,7 +1025,9 @@ def main():
                t_measured_control_run, t_measured_real_stall_stays_stalled,
                t_stall_at_destination_needs_total_silence,
                t_teardown_announced, t_teardown_silent_with_keep,
-               t_exit_codes_distinct):
+               t_exit_codes_distinct, t_attach_reads_existing_arming,
+               t_loading_quiet_is_not_idle, t_client_log_carries_a_load,
+               t_logged_exception_is_not_a_crash):
         if VERBOSE:
             print("%s:" % fn.__name__)
         try:
