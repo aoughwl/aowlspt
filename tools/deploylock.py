@@ -35,8 +35,14 @@ def main():
     repo = buildlock.REPO
     lock = buildlock.lock_path(repo)
     argv = sys.argv[1:] or ["check"]
+    # Detection ON, killing OFF. A deploy is the LAST thing that should be
+    # given a licence to kill somebody's build, but it is very often the
+    # process sitting behind a stopped one -- the 25-minute wait that produced
+    # the hang detector was exactly this shape. Without hopts this waiter goes
+    # through the same loop with the check disabled and says nothing at all.
     if not buildlock.acquire(lock, "deploy " + " ".join(argv), 1800.0,
-                             buildlock.DEFAULT_MAX_AGE, False):
+                             buildlock.DEFAULT_MAX_AGE, False,
+                             buildlock.hung_opts(repo=repo, break_hung=False)):
         return 4
     try:
         print("build lock ACQUIRED for deploy (builds wait)", flush=True)

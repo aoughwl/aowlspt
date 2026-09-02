@@ -104,6 +104,9 @@ tools/test_settings_display.exe
 
 # per-checkout build lock (tools/buildlock.py); never shared
 .aowl-build.lock
+.aowl-build.queue/
+# the hang detector's CPU-sample baseline; regenerated, machine-local
+.aowl-build.hung.json
 # agent worktrees: measured 58MB listing, never commit
 .claude/worktrees/
 # a SQLite backup of the fact store; it carried the private address into the tree once

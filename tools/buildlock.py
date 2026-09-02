@@ -8,6 +8,8 @@ r"""buildlock.py -- ONE build at a time per checkout. A mechanism, not a rule.
     python tools/buildlock.py --status --json  # machine-readable; see below
     python tools/buildlock.py --wait-free 600  # block until nobody is building
     python tools/buildlock.py --steal          # only when the holder is dead
+    python tools/buildlock.py --status --check-hung   # is the holder ALIVE-but-DEAD?
+    python tools/buildlock.py --break-hung build host # kill a hung holder, then build
 
 Anything after the options is passed to `aowl` verbatim, so this is a drop-in
 prefix for any build command.
@@ -58,6 +60,56 @@ treats a lock as stale only when the process is absent OR the lock is older
 than --max-age (default 2h, comfortably longer than the 18m cold build measured
 in this repo). Anything else requires an explicit `--steal`, which prints who
 is being evicted rather than doing it quietly.
+
+## A holder can be RUNNING and DEAD at the same time
+
+MEASURED TWICE on 2026-09-01 evening: `aowl build host` stopped inside
+`nimony.exe` after codegen -- the last thing written was
+`host\Aowlspt.Host.Il2Cpp\nimcache\*.final.build.nif` -- with nimony sitting at
+~0.27s of CPU and accumulating **zero** further CPU across repeated 60s
+samples, and no child compiler process at all. The third attempt of the exact
+same command finished in 41s.
+
+Every liveness answer this file had was "the pid exists", so `--status` printed
+`(running)` for fifteen minutes and the queue behind it waited about twenty-
+five. `pid_alive` was not wrong; it was answering a different question.
+
+So there is a second question now, and it is deliberately a WEAK one:
+
+    is the holder's process tree burning CPU, or writing to a nimcache?
+
+If neither is true across a window (default 20s), the verdict is **`hung?`**,
+with the question mark meant literally. It is evidence, not a diagnosis: pids,
+per-process CPU deltas, and the age of the newest nimcache file are printed so
+a human can disagree. Three outcomes, never two -- `working`, `hung?`, and
+**`unknown`** when the process table could not be read, when the nimcache walk
+was truncated, or when two samples a window apart do not yet exist. `unknown`
+is never treated as `hung?`, and it RESETS the strike count, because a check
+that cannot look must not be allowed to accumulate toward a kill.
+
+Signals that count as WORKING, i.e. all the ways this refuses to cry hung:
+
+* >= --hung-cpu (default 0.5s) of CPU accumulated across the whole tree;
+* any file under any `nimcache/` in the checkout modified during the window;
+* any process in the tree having EXITED during the window (a compiler
+  finishing is progress, and biasing toward "working" is the safe direction --
+  a false `hung?` can kill a healthy build, a false `working` only wastes the
+  time this feature was written to save).
+
+Nothing is ever killed by default. A waiter that observes `hung?` for
+--hung-strikes (default 3) CONSECUTIVE windows -- a full minute of a tree doing
+nothing at all -- prints what it saw and tells you to re-run with
+`--break-hung`. Only with that flag does it kill the holder's process tree
+(`taskkill /T /F`), log every pid and image name it killed, drop the lock file
+and take it. `--steal` remains the blunt instrument for when you already know.
+
+`--status` samples across CALLS via a small state file (`.aowl-build.hung.json`
+beside the lock) rather than blocking for a window, so it stays instant; the
+first call says "sampling started, no verdict yet" and the next call after the
+window returns one. `--status --check-hung` blocks and takes both samples
+itself when you want an answer now. Checking is skipped entirely for a holder
+younger than --hung-after (default 120s), because a two-minute build has not
+hung yet and the check is not free.
 
 ## Asking the lock a question from a script
 
@@ -354,7 +406,7 @@ def status(path, max_age):
         return {"state": "free", "pid": None, "running": None, "target": None,
                 "since": None, "since_epoch": None, "age_s": None,
                 "queued_since": None, "queued_arrival": None, "fifo": "n/a",
-                "queue": qout, "lock": path}
+                "hung": None, "queue": qout, "lock": path}
     pid = int(held.get("pid", -1))
     running = pid_alive(pid)
     started = float(held.get("started", 0))
@@ -365,6 +417,11 @@ def status(path, max_age):
             "queued_since": held.get("arrival_h"),
             "queued_arrival": held.get("arrival"),
             "fifo": fifo_verdict(held, q),
+            # Filled in by hung_check() when a caller asks for it. It is NOT
+            # computed here: status() is called in tight poll loops and a
+            # process-table query per poll would make the cheap question
+            # expensive. `null` means NOT CHECKED, never "not hung".
+            "hung": None,
             "queue": qout, "lock": path}
 
 
@@ -387,6 +444,497 @@ def fifo_verdict(held, q):
         if int(t.get("arrival", 0)) < int(mine):
             return "INVERTED"
     return "ok"
+
+
+# ---------------------------------------------------------------------------
+# Hang detection. See the module docstring for the measurement that produced it.
+# ---------------------------------------------------------------------------
+
+DEFAULT_HUNG_WINDOW = 20.0   # seconds between the two CPU samples
+DEFAULT_HUNG_CPU = 0.5       # seconds of tree CPU below which nothing happened
+DEFAULT_HUNG_STRIKES = 3     # consecutive hung? windows before a kill is offered
+DEFAULT_HUNG_AFTER = 120.0   # do not even look at a holder younger than this
+
+# Bound the nimcache walk. It runs once per window, not per poll, but this
+# checkout has ~6k files under nimcache/ and an unbounded walk in a tool that
+# is meant to diagnose a stall would be a poor joke.
+NIMCACHE_TIME_BUDGET = 3.0
+NIMCACHE_FILE_BUDGET = 60000
+NIMCACHE_MAX_DEPTH = 4
+NIMCACHE_SKIP = {".git", ".claude", "__pycache__", "node_modules", ".cache",
+                 "bin", "obj", "build", "dm"}
+
+
+def hung_state_path(lock):
+    return os.path.join(os.path.dirname(lock) or ".", ".aowl-build.hung.json")
+
+
+PS_PROC_TABLE = (
+    "Get-CimInstance Win32_Process | "
+    "Select-Object ProcessId,ParentProcessId,Name,KernelModeTime,UserModeTime "
+    "| ConvertTo-Json -Compress -Depth 2"
+)
+
+
+def proc_table():
+    """Every process as {pid: {"ppid", "name", "cpu_s"}}, or (None, why).
+
+    ONE query, not one per pid: the parent/child links and the CPU times have
+    to come from the same instant or a tree assembled from several calls can
+    contain a child of a parent that no longer exists.
+
+    Windows CPU times are `KernelModeTime` + `UserModeTime` in 100ns units.
+    A process we lack rights to inspect reports 0, which reads as "no CPU" --
+    that is a false HUNG source, so `unreadable` is counted and reported and
+    the caller downgrades to `unknown` when the ROOT itself is unreadable.
+    """
+    if os.name == "nt":
+        for shell in (["powershell", "-NoProfile", "-NonInteractive",
+                       "-Command", PS_PROC_TABLE],
+                      ["powershell", "-NoProfile", "-NonInteractive",
+                       "-Command", PS_PROC_TABLE.replace(
+                           "Get-CimInstance", "Get-WmiObject")]):
+            try:
+                r = subprocess.run(shell, capture_output=True, text=True,
+                                   timeout=60)
+            except Exception as e:
+                return None, "%s: %s" % (type(e).__name__, e)
+            if r.returncode != 0 or not (r.stdout or "").strip():
+                continue
+            try:
+                doc = json.loads(r.stdout)
+            except ValueError as e:
+                return None, "unparseable process table (%s)" % e
+            if isinstance(doc, dict):
+                doc = [doc]
+            out = {}
+            for row in doc:
+                try:
+                    pid = int(row["ProcessId"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                k = row.get("KernelModeTime") or 0
+                u = row.get("UserModeTime") or 0
+                try:
+                    ppid = int(row.get("ParentProcessId") or 0)
+                except (TypeError, ValueError):
+                    ppid = 0
+                out[pid] = {"ppid": ppid, "name": row.get("Name") or "?",
+                            "cpu_s": (int(k) + int(u)) / 1e7}
+            if out:
+                return out, None
+        return None, "no process table (powershell Win32_Process returned none)"
+    try:
+        r = subprocess.run(["ps", "-eo", "pid=,ppid=,time=,comm="],
+                           capture_output=True, text=True, timeout=60)
+    except Exception as e:
+        return None, "%s: %s" % (type(e).__name__, e)
+    if r.returncode != 0:
+        return None, "ps exit %d" % r.returncode
+    out = {}
+    for line in r.stdout.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) < 4:
+            continue
+        try:
+            pid, ppid = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        t, secs = parts[2], 0.0
+        if "-" in t:
+            d, t = t.split("-", 1)
+            secs += float(d) * 86400
+        bits = t.split(":")
+        try:
+            for b in bits:
+                secs = secs * 60 + float(b)
+        except ValueError:
+            continue
+        out[pid] = {"ppid": ppid, "name": parts[3].strip(), "cpu_s": secs}
+    return (out, None) if out else (None, "ps returned no rows")
+
+
+def proc_tree(table, root, max_nodes=400):
+    """`root` and every descendant, root first.
+
+    Depth and node count are capped: a pid table can contain a cycle after pid
+    reuse (a child whose ppid was recycled into one of its own descendants),
+    and an unbounded walk there never returns.
+    """
+    if table is None or root not in table:
+        return []
+    kids = {}
+    for pid, info in table.items():
+        kids.setdefault(info["ppid"], []).append(pid)
+    seen, order, stack = {root}, [root], list(kids.get(root, ()))
+    while stack and len(order) < max_nodes:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        order.append(pid)
+        stack.extend(kids.get(pid, ()))
+    return order
+
+
+def find_nimcache_dirs(repo, max_depth=NIMCACHE_MAX_DEPTH):
+    """Every `nimcache/` in THIS checkout, shallow-first.
+
+    All of them, not the one belonging to the target being built: mapping a
+    target string onto a directory is guesswork (`build mod maps` ->
+    mods/maps/nimcache, `build host` -> two directories, `build` -> twenty),
+    and a wrong mapping makes the check look at a directory nobody is writing
+    and report `hung?` for a perfectly healthy build. Watching all of them can
+    only ever produce a FALSE 'working', which is the safe direction.
+
+    `.claude/worktrees` is skipped on purpose -- those are other checkouts with
+    their own locks, and their build activity says nothing about ours.
+    """
+    found, stack = [], [(repo, 0)]
+    while stack:
+        d, depth = stack.pop()
+        try:
+            entries = list(os.scandir(d))
+        except OSError:
+            continue
+        for e in entries:
+            try:
+                if not e.is_dir(follow_symlinks=False):
+                    continue
+            except OSError:
+                continue
+            if e.name == "nimcache":
+                found.append(e.path)
+                continue
+            if e.name in NIMCACHE_SKIP or e.name.startswith("."):
+                continue
+            if depth + 1 < max_depth:
+                stack.append((e.path, depth + 1))
+    return sorted(found)
+
+
+def nimcache_newest(repo, dirs=None, time_budget=NIMCACHE_TIME_BUDGET,
+                    file_budget=NIMCACHE_FILE_BUDGET):
+    """The newest mtime under any nimcache in the checkout.
+
+    `truncated` is the honest part. If the walk ran out of budget we have seen
+    a SUBSET: a recent mtime in that subset still proves activity, but the
+    ABSENCE of one proves nothing, and the caller must degrade to `unknown`
+    rather than to `hung?`.
+    """
+    t0 = time.time()
+    res = {"newest": None, "path": None, "dirs": 0, "files": 0,
+           "truncated": False, "error": None}
+    try:
+        dirs = find_nimcache_dirs(repo) if dirs is None else list(dirs)
+    except Exception as e:
+        res["error"] = "%s: %s" % (type(e).__name__, e)
+        return res
+    res["dirs"] = len(dirs)
+    stack = list(dirs)
+    while stack:
+        if time.time() - t0 > time_budget or res["files"] > file_budget:
+            res["truncated"] = True
+            break
+        d = stack.pop()
+        try:
+            entries = list(os.scandir(d))
+        except OSError:
+            continue
+        for e in entries:
+            try:
+                if e.is_dir(follow_symlinks=False):
+                    stack.append(e.path)
+                    continue
+                mt = e.stat(follow_symlinks=False).st_mtime
+            except OSError:
+                continue
+            res["files"] += 1
+            if res["newest"] is None or mt > res["newest"]:
+                res["newest"] = mt
+                res["path"] = os.path.relpath(e.path, repo)
+    return res
+
+
+def take_sample(repo, pid, table=None, nimcache_dirs=None):
+    """One instant: the holder's tree with per-pid CPU, plus the nimcache tip."""
+    if table is None:
+        table, err = proc_table()
+    else:
+        err = None
+    tree = proc_tree(table, pid)
+    procs = {}
+    for p in tree:
+        procs[str(p)] = {"name": table[p]["name"], "cpu_s": table[p]["cpu_s"]}
+    return {"at": time.time(), "pid": pid, "procs": procs,
+            "proc_error": err,
+            "root_seen": bool(tree),
+            "nimcache": nimcache_newest(repo, dirs=nimcache_dirs)}
+
+
+def hung_verdict(prev, cur, window_s=DEFAULT_HUNG_WINDOW,
+                 cpu_floor=DEFAULT_HUNG_CPU):
+    """`working` / `hung?` / `unknown`, with the evidence that produced it.
+
+    The bar for `hung?` is deliberately high and the bar for `working` is
+    deliberately low: this verdict can lead to a build being KILLED, so every
+    ambiguity resolves away from that. In particular a truncated nimcache walk,
+    an unreadable process table, a root pid we cannot see and a window that is
+    simply too short are all `unknown` -- and `unknown` resets the strike
+    count in hung_check(), so no amount of not-looking can add up to a kill.
+    """
+    ev = {"verdict": "unknown", "why": "", "window_s": None,
+          "cpu_delta_s": None, "procs": [], "gone": [],
+          "nimcache_newest_age_s": None, "nimcache_path": None,
+          "nimcache_dirs": None, "nimcache_changed": None}
+    if not prev or not cur:
+        ev["why"] = "only one sample so far; a verdict needs two"
+        return ev
+    elapsed = cur["at"] - prev["at"]
+    ev["window_s"] = elapsed
+    nc = cur.get("nimcache") or {}
+    ev["nimcache_dirs"] = nc.get("dirs")
+    ev["nimcache_path"] = nc.get("path")
+    if nc.get("newest") is not None:
+        ev["nimcache_newest_age_s"] = cur["at"] - nc["newest"]
+        ev["nimcache_changed"] = nc["newest"] > prev["at"]
+
+    if cur.get("proc_error") or prev.get("proc_error"):
+        ev["why"] = ("the process table could not be read (%s) -- NOT PERFORMED"
+                     % (cur.get("proc_error") or prev.get("proc_error")))
+        return ev
+    if not prev.get("root_seen") or not cur.get("root_seen"):
+        ev["why"] = ("the holder pid %s was not in the process table at both "
+                     "ends of the window -- nothing was compared" % cur["pid"])
+        return ev
+    if elapsed < window_s:
+        ev["why"] = ("the samples are %.1fs apart; the window is %.0fs "
+                     "(%.0fs to go)" % (elapsed, window_s, window_s - elapsed))
+        return ev
+
+    p_prev, p_cur = prev["procs"], cur["procs"]
+    delta = 0.0
+    rows = []
+    for pid, info in sorted(p_cur.items(), key=lambda kv: int(kv[0])):
+        was = p_prev.get(pid)
+        # A pid that appeared during the window contributes its WHOLE cpu:
+        # a compiler that started and did work is work, and pretending its
+        # baseline was its current value would hide exactly that.
+        d = info["cpu_s"] - was["cpu_s"] if was else info["cpu_s"]
+        d = max(0.0, d)
+        delta += d
+        rows.append({"pid": int(pid), "name": info["name"],
+                     "cpu_s": info["cpu_s"], "cpu_delta_s": d,
+                     "new": was is None})
+    gone = [{"pid": int(p), "name": v["name"], "cpu_s": v["cpu_s"]}
+            for p, v in sorted(p_prev.items(), key=lambda kv: int(kv[0]))
+            if p not in p_cur]
+    ev["cpu_delta_s"] = delta
+    ev["procs"] = rows
+    ev["gone"] = gone
+
+    if delta >= cpu_floor:
+        ev["verdict"] = "working"
+        ev["why"] = ("the holder's tree burned %.2fs of CPU in %.0fs"
+                     % (delta, elapsed))
+        return ev
+    if gone:
+        ev["verdict"] = "working"
+        ev["why"] = ("%d process(es) in the holder's tree exited during the "
+                     "window (%s) -- a compiler finishing is progress"
+                     % (len(gone), ", ".join("%s/%d" % (g["name"], g["pid"])
+                                             for g in gone[:4])))
+        return ev
+    if ev["nimcache_changed"]:
+        ev["verdict"] = "working"
+        ev["why"] = ("no CPU, but %s was written %.0fs ago, inside the window"
+                     % (nc.get("path"), ev["nimcache_newest_age_s"]))
+        return ev
+    if nc.get("error"):
+        ev["why"] = ("no CPU, and the nimcache could not be scanned (%s) -- "
+                     "NOT PERFORMED, not 'nothing was written'" % nc["error"])
+        return ev
+    if nc.get("truncated"):
+        ev["why"] = ("no CPU, but the nimcache walk was TRUNCATED after %d "
+                     "files, so 'nothing was written' was not established"
+                     % nc.get("files", 0))
+        return ev
+    if nc.get("newest") is None:
+        ev["why"] = ("no CPU, and no nimcache file exists at all (%d dirs "
+                     "scanned) -- there is nothing here to show progress, so "
+                     "no claim is made" % nc.get("dirs", 0))
+        return ev
+    ev["verdict"] = "hung?"
+    ev["why"] = ("the holder's whole process tree accumulated %.2fs of CPU in "
+                 "%.0fs (floor %.2fs) and no nimcache file was touched; the "
+                 "newest is %.0fs old" % (delta, elapsed, cpu_floor,
+                                          ev["nimcache_newest_age_s"]))
+    return ev
+
+
+def _read_hung_state(p):
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _write_hung_state(p, doc):
+    tmp = p + ".tmp%d" % os.getpid()
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(doc, f)
+        os.replace(tmp, p)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def hung_check(lock, repo, st, window_s=DEFAULT_HUNG_WINDOW,
+               cpu_floor=DEFAULT_HUNG_CPU, blocking=False,
+               after_s=DEFAULT_HUNG_AFTER, strikes=DEFAULT_HUNG_STRIKES):
+    """Sample, compare with the previous sample, and count consecutive hung?s.
+
+    Non-blocking by default: the baseline lives in `.aowl-build.hung.json`
+    beside the lock, so the FIRST call arms the check and a later call, once a
+    window has passed, returns a verdict. `blocking=True` takes both samples
+    itself.
+
+    The state file can be written by several waiters at once. That is benign --
+    `os.replace` is atomic, so the worst case is a baseline being reset by
+    somebody else and one extra window elapsing before a verdict. Exclusion
+    never depends on this file; nothing here can let two builds run at once.
+    """
+    ev = {"verdict": "unknown", "why": "", "consecutive": 0,
+          "strikes_needed": strikes, "cached": False}
+    if st.get("state") != "held" or not st.get("pid"):
+        ev["why"] = "no live holder to check"
+        return ev
+    age = st.get("age_s") or 0.0
+    if not blocking and age < after_s:
+        ev["why"] = ("the holder is only %.0fs old; hang checking starts at "
+                     "%.0fs" % (age, after_s))
+        return ev
+
+    spath = hung_state_path(lock)
+    state = _read_hung_state(spath)
+    same = (state.get("holder_pid") == st["pid"]
+            and state.get("holder_started") == st.get("since_epoch"))
+    prev = state.get("sample") if same else None
+    consec = int(state.get("consecutive", 0)) if same else 0
+
+    if not blocking and same and state.get("verdict_at") \
+            and time.time() - state["verdict_at"] < window_s:
+        # A verdict younger than one window is REPLAYED rather than recomputed.
+        # Sampling costs a process-table query, and `--status` is polled in
+        # tight loops; more importantly, resampling faster than the window can
+        # never produce a new verdict anyway, so the query would buy nothing.
+        # It is flagged `cached` so nobody reads it as a fresh measurement.
+        ev = dict(state.get("verdict") or ev)
+        ev["cached"] = True
+        ev["consecutive"] = consec
+        ev["strikes_needed"] = strikes
+        ev["why"] = "%s   [replayed, measured %.0fs ago]" % (
+            ev.get("why", ""), time.time() - state["verdict_at"])
+        return ev
+
+    dirs = find_nimcache_dirs(repo)
+    if blocking:
+        prev = take_sample(repo, st["pid"], nimcache_dirs=dirs)
+        time.sleep(window_s)
+    cur = take_sample(repo, st["pid"], nimcache_dirs=dirs)
+
+    v = hung_verdict(prev, cur, window_s, cpu_floor)
+    v["strikes_needed"] = strikes
+    v["cached"] = False
+
+    if v["verdict"] == "hung?":
+        consec += 1
+        baseline = cur
+    elif v["verdict"] == "working":
+        consec = 0
+        baseline = cur
+    else:
+        # UNKNOWN. It must not accumulate toward a kill, and it must not
+        # discard a baseline that has simply not aged into a window yet --
+        # replacing it every poll is how a 1s poll loop would guarantee the
+        # window never closes.
+        consec = 0
+        baseline = prev if (prev and not blocking) else cur
+    v["consecutive"] = consec
+    doc = {"holder_pid": st["pid"],
+           "holder_started": st.get("since_epoch"),
+           "holder_cmd": st.get("target"),
+           "sample": baseline, "consecutive": consec,
+           "last_verdict": v["verdict"], "last_at": time.time()}
+    if v["verdict"] != "unknown" or v.get("window_s"):
+        # Only a verdict that came from a real comparison is worth replaying.
+        # "only one sample so far" must NOT be cached, or the very next call
+        # would replay it instead of taking the second sample.
+        doc["verdict"] = v
+        doc["verdict_at"] = time.time()
+    _write_hung_state(spath, doc)
+    return v
+
+
+def hung_lines(ev):
+    """The evidence block. Never a bare verdict: the pids, the CPU deltas and
+    the nimcache age are the whole point, because they are what lets a human
+    say 'no, that one is fine' without re-deriving anything."""
+    tag = {"hung?": "HUNG?", "working": "working",
+           "unknown": "hang check: unknown"}.get(ev["verdict"], ev["verdict"])
+    out = ["  %s -- %s" % (tag, ev["why"])]
+    if ev.get("window_s"):
+        out[0] += "  [window %.0fs]" % ev["window_s"]
+    for r in (ev.get("procs") or [])[:8]:
+        out.append("      pid %-6d %-22s cpu %8.2fs  delta %+.2fs%s"
+                   % (r["pid"], r["name"][:22], r["cpu_s"], r["cpu_delta_s"],
+                      "  (NEW)" if r.get("new") else ""))
+    if len(ev.get("procs") or []) > 8:
+        out.append("      ... and %d more" % (len(ev["procs"]) - 8))
+    for g in (ev.get("gone") or [])[:4]:
+        out.append("      pid %-6d %-22s EXITED during the window"
+                   % (g["pid"], g["name"][:22]))
+    if ev.get("nimcache_newest_age_s") is not None:
+        out.append("      newest nimcache file %.0fs old: %s   (%s dirs "
+                   "watched)" % (ev["nimcache_newest_age_s"],
+                                 ev.get("nimcache_path"),
+                                 ev.get("nimcache_dirs")))
+    if ev["verdict"] == "hung?":
+        out.append("      %d consecutive hung window(s); %d needed before "
+                   "--break-hung will act"
+                   % (ev.get("consecutive", 0), ev.get("strikes_needed",
+                                                       DEFAULT_HUNG_STRIKES)))
+    return out
+
+
+def kill_tree(pid, table=None):
+    """Kill the holder and everything under it. Returns what was killed.
+
+    The tree is enumerated BEFORE the kill, so the log names real processes
+    rather than whatever survived. `taskkill /T` walks the tree itself; the
+    enumeration is for the record, not for the killing.
+    """
+    if table is None:
+        table, _err = proc_table()
+    victims = [{"pid": p, "name": (table or {}).get(p, {}).get("name", "?")}
+               for p in proc_tree(table, pid)] or [{"pid": pid, "name": "?"}]
+    if os.name == "nt":
+        try:
+            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                           capture_output=True, text=True, timeout=60)
+        except Exception:
+            pass
+    else:
+        for v in reversed(victims):
+            try:
+                os.kill(v["pid"], 9)
+            except Exception:
+                pass
+    return victims
 
 
 def print_status_human(st):
@@ -420,9 +968,20 @@ def print_status_human(st):
         print("  FIFO INVERTED: the holder joined the queue AFTER a waiter "
               "that is still waiting. That is a real fairness bug, measured "
               "on comparable clocks -- report it with this output.")
+    if st.get("hung"):
+        for ln in hung_lines(st["hung"]):
+            print(ln)
+        if st["hung"]["verdict"] == "hung?":
+            print("      a pid that EXISTS is not a build that is PROGRESSING. "
+                  "If you agree with the evidence above, re-run your build "
+                  "with --break-hung (it kills this tree), or --steal.")
+    elif st["state"] == "held":
+        # An absent hang check must never read as a clean bill of health.
+        print("  (no hang check was performed -- pass --check-hung for one. "
+              "'running' here means only that the pid exists.)")
 
 
-def wait_free(path, max_age, timeout, poll=1.0, announce=True):
+def wait_free(path, max_age, timeout, poll=1.0, announce=True, hopts=None):
     """Block until nobody is building. Returns the final status, or None on
     timeout.
 
@@ -435,6 +994,8 @@ def wait_free(path, max_age, timeout, poll=1.0, announce=True):
     """
     deadline = time.time() + timeout
     announced = False
+    hung_every = (hopts["window"] + 1.0) if hopts else 0.0
+    last_hung_at = time.time()
     while True:
         st = status(path, max_age)
         if st["state"] != "held":
@@ -445,12 +1006,46 @@ def wait_free(path, max_age, timeout, poll=1.0, announce=True):
                   "%.0fs. Up to %.0fs."
                   % (st["pid"], st["target"], st["age_s"], timeout),
                   flush=True)
+        # This waiter runs NOTHING, so it never kills anything -- but it should
+        # still say when the thing it is waiting for has stopped moving,
+        # otherwise `--wait-free 1800` in front of a hung holder is a
+        # half-hour of silence indistinguishable from a slow build.
+        if announce and hopts and hopts.get("enabled") \
+                and (st["age_s"] or 0) >= hopts["after"] \
+                and time.time() - last_hung_at >= hung_every:
+            last_hung_at = time.time()
+            ev = hung_check(path, hopts["repo"], st, hopts["window"],
+                            hopts["cpu"], False, hopts["after"],
+                            hopts["strikes"])
+            if ev["verdict"] == "hung?":
+                print("")
+                print("THE HOLDER MAY BE HUNG (pid %s, %r):"
+                      % (st["pid"], st["target"]))
+                for ln in hung_lines(ev):
+                    print(ln)
+                print("  --wait-free runs nothing and kills nothing. To end "
+                      "that tree, run your build with --break-hung.",
+                      flush=True)
         if time.time() >= deadline:
             return None
         time.sleep(min(poll, max(0.0, deadline - time.time()) + 0.01))
 
 
-def acquire(path, cmd, wait_s, max_age, steal):
+def hung_opts(repo=None, enabled=True, break_hung=False,
+              window=DEFAULT_HUNG_WINDOW, cpu=DEFAULT_HUNG_CPU,
+              strikes=DEFAULT_HUNG_STRIKES, after=DEFAULT_HUNG_AFTER):
+    """The knobs a waiter uses to decide whether a holder is alive-but-dead.
+
+    `enabled` controls DETECTION; `break_hung` controls KILLING, and they are
+    separate on purpose. Detection defaults on because its whole value is being
+    there when nobody suspected a hang; killing defaults off because the
+    verdict is heuristic and a false positive destroys a running build.
+    """
+    return {"repo": repo or REPO, "enabled": enabled, "break_hung": break_hung,
+            "window": window, "cpu": cpu, "strikes": strikes, "after": after}
+
+
+def acquire(path, cmd, wait_s, max_age, steal, hopts=None):
     """Take the lock, or explain precisely why not. Returns True on success.
 
     FIFO: a ticket is taken first, and the `O_EXCL` create is only attempted
@@ -465,13 +1060,13 @@ def acquire(path, cmd, wait_s, max_age, steal):
     slot = [join_queue(qdir, cmd)]
     try:
         return _acquire_queued(path, qdir, slot[0], cmd, wait_s, max_age,
-                               steal, slot)
+                               steal, slot, hopts)
     except BaseException:
         leave_queue(slot[0])
         raise
 
 
-def race_acquire(path, cmd, wait_s, max_age, steal):
+def race_acquire(path, cmd, wait_s, max_age, steal, hopts=None):
     """The OLD, UNFAIR algorithm: no ticket, everyone races for `O_EXCL`.
 
     Kept for exactly one reason: `tools/test_buildlock.py` needs something that
@@ -481,15 +1076,22 @@ def race_acquire(path, cmd, wait_s, max_age, steal):
     finding (CLAUDE.md 9b). It is not used by `main` and must not be.
     """
     return _acquire_queued(path, None, None, cmd, wait_s, max_age, steal,
-                           None)
+                           None, hopts)
 
 
 def _acquire_queued(path, qdir, ticket, cmd, wait_s, max_age, steal,
-                    slot=None):
+                    slot=None, hopts=None):
     deadline = time.time() + wait_s
     announced = False
     yielded_to = None
     requeues = 0
+    # The hang check runs at most once per window, and the +1s matters: the
+    # verdict is only made when the two samples are at least a FULL window
+    # apart, so polling at exactly `window` would land just short of it about
+    # half the time and never produce a verdict at all.
+    hung_every = (hopts["window"] + 1.0) if hopts else 0.0
+    last_hung_at = time.time()
+    warned_at_strike = 0
     while True:
         # AM I NEXT? Checked before the create is attempted, so a later arrival
         # cannot win the race against an earlier one that happens to be asleep.
@@ -613,6 +1215,55 @@ def _acquire_queued(path, qdir, ticket, cmd, wait_s, max_age, steal,
                   flush=True)
             announced = True
 
+        # IS THE HOLDER ACTUALLY BUILDING? `alive` above only says the pid
+        # exists, and a nimony that stops dead keeps its pid for as long as you
+        # let it. Measured 2026-09-01: fifteen minutes of `(running)` and a
+        # queue waiting twenty-five behind a process at 0.27s of CPU.
+        if hopts and hopts.get("enabled") and not steal \
+                and age >= hopts["after"] \
+                and time.time() - last_hung_at >= hung_every:
+            last_hung_at = time.time()
+            ev = hung_check(path, hopts["repo"], status(path, max_age),
+                            hopts["window"], hopts["cpu"], False,
+                            hopts["after"], hopts["strikes"])
+            if ev["verdict"] == "hung?":
+                print("")
+                print("THE HOLDER MAY BE HUNG (pid %d, %r):" % (pid, held.get("cmd")))
+                for ln in hung_lines(ev):
+                    print(ln)
+                strikes = hopts["strikes"]
+                if ev["consecutive"] >= strikes:
+                    if hopts.get("break_hung"):
+                        victims = kill_tree(pid)
+                        print("--break-hung: KILLING the holder's process "
+                              "tree after %d consecutive hung window(s). "
+                              "Killed:" % ev["consecutive"])
+                        for v in victims:
+                            print("      pid %-6d %s" % (v["pid"], v["name"]))
+                        try:
+                            os.unlink(path)
+                        except OSError:
+                            pass
+                        try:
+                            os.unlink(hung_state_path(path))
+                        except OSError:
+                            pass
+                        print("      lock dropped; taking it now.", flush=True)
+                        announced = False
+                        continue
+                    if warned_at_strike != ev["consecutive"]:
+                        warned_at_strike = ev["consecutive"]
+                        print("  NOTHING WAS KILLED. Killing is opt-in: "
+                              "re-run this command with --break-hung to end "
+                              "that process tree and take the lock. Check the "
+                              "evidence above first -- this verdict is a "
+                              "heuristic, and a false positive destroys a "
+                              "running build.", flush=True)
+            else:
+                warned_at_strike = 0
+                if ev["verdict"] == "unknown" and ev["why"]:
+                    print("  (hang check: %s)" % ev["why"], flush=True)
+
         if time.time() >= deadline:
             print("REFUSED: the build lock is held by pid %d (%r, running "
                   "%.0fs) and did not free within %.0fs. NOTHING WAS BUILT. "
@@ -656,7 +1307,8 @@ WATCH_PREFIXES = ("host/", "mods/", "tools/")
 MAX_LINES = 40
 
 # The lock's own bookkeeping, which changes on every acquire and release.
-SELF_PATHS = (".aowl-build.lock", ".aowl-build.queue")
+SELF_PATHS = (".aowl-build.lock", ".aowl-build.queue",
+              ".aowl-build.hung.json")
 
 
 def _git(repo, args, timeout=10.0):
@@ -854,6 +1506,34 @@ def main():
                    default=None, dest="wait_free", metavar="SECONDS",
                    help="block until the lock is free, then exit 0; exit 1 on "
                         "timeout (default 1800s). Runs nothing.")
+    p.add_argument("--check-hung", action="store_true",
+                   help="with --status: take BOTH cpu samples now (blocks one "
+                        "--hung-window) instead of sampling across calls, and "
+                        "ignore --hung-after")
+    p.add_argument("--break-hung", action="store_true", dest="break_hung",
+                   help="if the holder looks HUNG for --hung-strikes "
+                        "consecutive windows, kill its process tree and take "
+                        "the lock. OFF by default; it logs what it killed.")
+    p.add_argument("--no-hung-check", action="store_true", dest="no_hung",
+                   help="do not look at whether the holder is progressing at "
+                        "all (detection only; nothing is ever killed without "
+                        "--break-hung)")
+    p.add_argument("--hung-window", type=float, default=DEFAULT_HUNG_WINDOW,
+                   metavar="SECONDS",
+                   help="seconds between the two cpu samples (default %d)"
+                        % DEFAULT_HUNG_WINDOW)
+    p.add_argument("--hung-cpu", type=float, default=DEFAULT_HUNG_CPU,
+                   metavar="SECONDS",
+                   help="tree cpu below this in one window counts as no "
+                        "progress (default %.1f)" % DEFAULT_HUNG_CPU)
+    p.add_argument("--hung-strikes", type=int, default=DEFAULT_HUNG_STRIKES,
+                   metavar="N",
+                   help="consecutive hung windows before --break-hung acts "
+                        "(default %d)" % DEFAULT_HUNG_STRIKES)
+    p.add_argument("--hung-after", type=float, default=DEFAULT_HUNG_AFTER,
+                   metavar="SECONDS",
+                   help="do not hang-check a holder younger than this "
+                        "(default %d)" % DEFAULT_HUNG_AFTER)
     p.add_argument("--no-snapshot", action="store_true",
                    help="skip the working-tree snapshot taken around the "
                         "build (it costs two `git status` calls and is only "
@@ -863,9 +1543,17 @@ def main():
     a = p.parse_args()
 
     path = lock_path(a.repo)
+    hopts = hung_opts(repo=a.repo, enabled=not a.no_hung,
+                      break_hung=a.break_hung, window=a.hung_window,
+                      cpu=a.hung_cpu, strikes=a.hung_strikes,
+                      after=a.hung_after)
 
     if a.status:
         st = status(path, a.max_age)
+        if hopts["enabled"] and st["state"] == "held":
+            st["hung"] = hung_check(path, a.repo, st, a.hung_window,
+                                    a.hung_cpu, a.check_hung, a.hung_after,
+                                    a.hung_strikes)
         if a.json:
             print(json.dumps(st))
         else:
@@ -883,7 +1571,8 @@ def main():
         # would sit in front of the object and make it unparseable, which is
         # the same class of bug as the prose-matching wait loop this exists to
         # replace. It cost two test failures here before it cost anyone else.
-        st = wait_free(path, a.max_age, a.wait_free, announce=not a.json)
+        st = wait_free(path, a.max_age, a.wait_free,
+                       announce=not a.json, hopts=hopts)
         if st is None:
             cur = status(path, a.max_age)
             msg = ("still HELD by pid %s (%r) after %.0fs"
@@ -909,7 +1598,8 @@ def main():
         return 2
 
     cmd = [aowl_exe(a.repo)] + rest
-    if not acquire(path, " ".join(rest), a.wait, a.max_age, a.steal):
+    if not acquire(path, " ".join(rest), a.wait, a.max_age, a.steal,
+                   hopts):
         return 4
 
     t0 = time.time()

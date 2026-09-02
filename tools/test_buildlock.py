@@ -954,6 +954,507 @@ def test_snapshot_speed():
           "%.3fs -- it runs twice per build" % dt)
 
 
+# ---------------------------------------------------------------------------
+# Hang detection.
+# ---------------------------------------------------------------------------
+
+# The measured shape of the real incident: the parent (buildlock's own python,
+# then aowl) sits in a blocking wait using no CPU whatsoever, and ALL the work
+# -- or all the absence of it -- is in a grandchild. A test that planted a
+# single process would pass without ever exercising proc_tree(), which is the
+# part that can actually be wrong.
+PARENT = ("import subprocess, sys, time\n"
+          "subprocess.Popen([sys.executable, '-c'] + sys.argv[1:])\n"
+          "time.sleep(300)\n")
+
+CHILD_SLEEP = "import time\ntime.sleep(300)\n"
+CHILD_BURN = ("import time\n"
+              "t = time.time()\n"
+              "while time.time() - t < 300:\n"
+              "    pass\n")
+CHILD_TOUCH = ("import os, sys, time\n"
+               "f = sys.argv[1]\n"
+               "for _ in range(3000):\n"
+               "    open(f, 'a').close()\n"
+               "    os.utime(f, None)\n"
+               "    time.sleep(0.4)\n")
+
+
+def make_hung_world(tmp, name, child_src, child_arg=None, nimcache=True,
+                    holder_age=600.0):
+    """A checkout-shaped directory with a lock held by a two-deep process tree.
+
+    `holder_age` backdates the acquire time because a holder younger than
+    --hung-after is deliberately not checked at all; without it the waiter
+    tests would be measuring the age gate rather than the verdict.
+    """
+    repo = os.path.join(tmp, name)
+    cache = os.path.join(repo, "host", "Aowlspt.Host.Il2Cpp", "nimcache")
+    os.makedirs(cache, exist_ok=True)
+    nif = os.path.join(cache, "aowlhost.final.build.nif")
+    if nimcache:
+        with open(nif, "w", encoding="utf-8", newline="\n") as f:
+            f.write("# codegen output, the last thing the hung build wrote\n")
+        old = time.time() - 600
+        os.utime(nif, (old, old))
+    else:
+        # No nimcache at all: the progress signal does not exist here, and the
+        # verdict must be `unknown` rather than `hung?`.
+        shutil.rmtree(os.path.join(repo, "host"), ignore_errors=True)
+
+    argv = [sys.executable, "-c", PARENT, child_src]
+    if child_arg is not None:
+        argv.append(child_arg)
+    parent = subprocess.Popen(argv, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL)
+    lp = buildlock.lock_path(repo)
+    started = time.time() - holder_age
+    with open(lp, "w", encoding="utf-8") as f:
+        json.dump({"pid": parent.pid, "cmd": "build host", "started": started,
+                   "started_h": time.strftime("%Y-%m-%d %H:%M:%S",
+                                              time.localtime(started))}, f)
+    return repo, parent, nif
+
+
+def kill_world(parent):
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/PID", str(parent.pid), "/T", "/F"],
+                       capture_output=True, text=True)
+    try:
+        parent.kill()
+    except Exception:
+        pass
+    try:
+        parent.wait(timeout=20)
+    except Exception:
+        pass
+
+
+def test_hung_verdicts(tmp):
+    """FOUR worlds, one command, and the verdicts must differ.
+
+    Every world has a live holder whose pid exists, so `pid_alive` -- the only
+    liveness this file used to have -- answers "running" in all four. That is
+    the point: the old check CANNOT tell them apart, so if the new one returns
+    the same verdict everywhere it has added nothing and this test says so.
+
+      sleeping  parent asleep, child asleep, nimcache untouched   -> hung?
+      burning   child in a busy loop                              -> working
+      writing   child asleep but rewriting a .nif every 0.4s      -> working
+      bare      sleeping, but the checkout has no nimcache at all -> unknown
+
+    The `writing` world is the one that keeps this from being a CPU meter: a
+    linker or a slow single-threaded step can use almost no CPU and still be
+    making progress, and killing it would be the confidently-wrong answer.
+    """
+    print("\nhang detection: sleeping / burning / writing / bare")
+    worlds, procs = {}, []
+    try:
+        specs = [("sleeping", CHILD_SLEEP, None, True),
+                 ("burning", CHILD_BURN, None, True),
+                 ("writing", CHILD_TOUCH, "ARG", True),
+                 ("bare", CHILD_SLEEP, None, False)]
+        made = {}
+        for name, src, arg, cache in specs:
+            repo = os.path.join(tmp, "hung-" + name)
+            os.makedirs(repo, exist_ok=True)
+            nif = os.path.join(repo, "host", "Aowlspt.Host.Il2Cpp", "nimcache",
+                               "aowlhost.final.build.nif")
+            r, p, nif = make_hung_world(tmp, "hung-" + name, src,
+                                        child_arg=(nif if arg else None),
+                                        nimcache=cache)
+            procs.append(p)
+            made[name] = (r, p, nif)
+
+        # Let the busy loop and the toucher get going before the first sample,
+        # or the baseline would be taken before either had done anything.
+        time.sleep(2.0)
+
+        for name, (repo, p, nif) in made.items():
+            t = time.time()
+            rc, out = cli(repo, "--status", "--json", "--check-hung",
+                          "--hung-window", "5")
+            try:
+                doc = json.loads(out)
+            except ValueError:
+                doc = {}
+            worlds[name] = doc.get("hung") or {}
+            print("    %-9s verdict=%-8s cpu_delta=%s  nimcache_age=%s "
+                  "(%.0fs)"
+                  % (name, worlds[name].get("verdict"),
+                     ("%.2f" % worlds[name]["cpu_delta_s"])
+                     if worlds[name].get("cpu_delta_s") is not None else "n/a",
+                     ("%.0f" % worlds[name]["nimcache_newest_age_s"])
+                     if worlds[name].get("nimcache_newest_age_s") is not None
+                     else "n/a", time.time() - t))
+            check("%s: --status still exits 1 (held) with a hang check"
+                  % name, rc == 1, "rc=%d" % rc)
+    finally:
+        for p in procs:
+            kill_world(p)
+
+    v = {k: worlds.get(k, {}).get("verdict") for k in
+         ("sleeping", "burning", "writing", "bare")}
+    check("a tree doing NOTHING reads hung?", v["sleeping"] == "hung?", str(v))
+    check("a tree burning CPU reads working", v["burning"] == "working",
+          str(v))
+    check("a tree with NO cpu but a live nimcache reads working (this is the "
+          "check that keeps it from being a cpu meter)",
+          v["writing"] == "working", str(v))
+    check("no nimcache to look at reads unknown, NOT hung?",
+          v["bare"] == "unknown", str(v))
+    # THE control. pid_alive() says "running" in all four worlds; if the new
+    # verdict also collapsed to one value it would have added nothing.
+    check("the four worlds are not all the same verdict",
+          len(set(v.values())) >= 3, str(v))
+
+    ev = worlds.get("sleeping", {})
+    check("the hung? evidence names the pids it sampled",
+          len(ev.get("procs") or []) >= 2,
+          "procs=%r" % (ev.get("procs"),))
+    check("the hung? evidence carries a cpu delta under the floor",
+          (ev.get("cpu_delta_s") is not None and ev["cpu_delta_s"] < 0.5),
+          "cpu_delta_s=%r" % ev.get("cpu_delta_s"))
+    check("the hung? evidence carries the newest nimcache age",
+          (ev.get("nimcache_newest_age_s") or 0) > 100,
+          "age=%r" % ev.get("nimcache_newest_age_s"))
+    burn = worlds.get("burning", {})
+    check("the working verdict measured REAL cpu (>= the 0.5s floor)",
+          (burn.get("cpu_delta_s") or 0) >= 0.5,
+          "cpu_delta_s=%r" % burn.get("cpu_delta_s"))
+
+
+def test_hung_human_text(tmp):
+    """The prose a person actually reads, and the silence that must not be
+    mistaken for a clean bill of health."""
+    print("\nhang detection: the human report")
+    repo, parent, _nif = make_hung_world(tmp, "hung-text", CHILD_SLEEP)
+    try:
+        rc, out = cli(repo, "--status", "--check-hung", "--hung-window", "5")
+        check("the human report says HUNG? for a stopped tree", "HUNG?" in out,
+              repr(out[:400]))
+        check("the human report prints per-pid cpu evidence",
+              "cpu" in out and "delta" in out, repr(out[:400]))
+        check("the human report names --break-hung as the (opt-in) way out",
+              "--break-hung" in out, repr(out[:600]))
+        check("the human report still exits 1 (held)", rc == 1, "rc=%d" % rc)
+
+        # And with the check switched OFF, the absence must announce itself.
+        rc2, out2 = cli(repo, "--status", "--no-hung-check")
+        check("with no hang check, --status SAYS no check was performed "
+              "rather than implying health",
+              "no hang check was performed" in out2, repr(out2[:400]))
+        check("with no hang check, --json reports hung=null (not checked)",
+              json.loads(cli(repo, "--status", "--json",
+                             "--no-hung-check")[1]).get("hung") is None,
+              "hung was not null")
+    finally:
+        kill_world(parent)
+
+
+def test_hung_across_calls(tmp):
+    """The DEFAULT `--status` mode: sample across calls, never block.
+
+    `--check-hung` blocks for a window and is what the other tests use because
+    it is deterministic. But the mode an agent will actually hit is this one,
+    and it has a failure this repo has seen before: a check that can never
+    complete. If the baseline were rewritten on every call, two samples a
+    window apart would never exist and the verdict would sit on 'need more
+    time' for ever -- indistinguishable, from the outside, from a build that
+    is fine.
+
+    So the assertion is that the strike count CLIMBS across calls, and the
+    control is the burning world, where the identical call sequence must leave
+    it pinned at zero.
+    """
+    print("\nhang detection: sampling across --status calls (no blocking)")
+
+    def poll(repo, window="4"):
+        rc, out = cli(repo, "--status", "--json", "--hung-window", window,
+                      "--hung-after", "0")
+        try:
+            return (json.loads(out).get("hung") or {})
+        except ValueError:
+            return {}
+
+    repo, parent, _ = make_hung_world(tmp, "hung-calls", CHILD_SLEEP)
+    burn_repo, burn_parent, _ = make_hung_world(tmp, "burn-calls", CHILD_BURN)
+    try:
+        time.sleep(1.5)
+        first = poll(repo)
+        check("call 1 ARMS the check and says so, rather than guessing",
+              first["verdict"] == "unknown" and "two" in first["why"],
+              str(first))
+        check("call 1 did not take a strike from a single sample",
+              first["consecutive"] == 0, str(first))
+        check("the baseline state file was written beside the lock",
+              os.path.exists(buildlock.hung_state_path(
+                  buildlock.lock_path(repo))), repo)
+
+        seen, burn_seen = [], []
+        for _ in range(3):
+            time.sleep(5.0)
+            seen.append(poll(repo))
+            burn_seen.append(poll(burn_repo))
+        strikes = [s.get("consecutive") for s in seen]
+        verdicts = [s.get("verdict") for s in seen]
+        print("    stopped tree: verdicts %s  strikes %s" % (verdicts, strikes))
+        print("    burning tree: verdicts %s  strikes %s"
+              % ([s.get("verdict") for s in burn_seen],
+                 [s.get("consecutive") for s in burn_seen]))
+        check("calls after the first produce real verdicts, not 'need more "
+              "time' for ever",
+              all(v == "hung?" for v in verdicts), str(verdicts))
+        check("consecutive hung windows CLIMB across calls (1,2,3)",
+              strikes == [1, 2, 3], str(strikes))
+
+        cached = poll(repo)
+        check("an immediate re-poll REPLAYS rather than resampling, and says "
+              "so instead of passing a stale number off as fresh",
+              cached.get("cached") is True and "replayed" in cached["why"],
+              str(cached))
+        check("a replayed verdict does not inflate the strike count",
+              cached.get("consecutive") == 3, str(cached))
+
+        # THE control. Same calls, same cadence, a tree that is working. Its
+        # FIRST poll is an arming call like everyone else's, so the property is
+        # not "always working" -- it is "never hung?, and never a strike".
+        bv = [s.get("verdict") for s in burn_seen]
+        check("the burning tree never reads hung? and never takes a strike",
+              all(s.get("consecutive") == 0 for s in burn_seen)
+              and "hung?" not in bv and bv.count("working") >= 2, str(bv))
+    finally:
+        kill_world(parent)
+        kill_world(burn_parent)
+
+
+def test_wait_free_reports_hung(tmp):
+    """`--wait-free` is the OTHER waiter, and it must not sit silent.
+
+    It runs nothing and so kills nothing, but `--wait-free 1800` parked in
+    front of a stopped holder is half an hour of silence that reads exactly
+    like a slow build. It has to say what it can see, and it has to say that
+    seeing is all it will do.
+    """
+    print("\n--wait-free: it reports a hung holder without touching it")
+    repo, parent, _ = make_hung_world(tmp, "wf-hung", CHILD_SLEEP)
+    try:
+        r = subprocess.run([sys.executable, BL, "--repo", repo,
+                            "--wait-free", "18", "--hung-window", "3",
+                            "--hung-after", "0"],
+                           capture_output=True, text=True, timeout=180)
+        check("--wait-free names the hang instead of waiting in silence",
+              "THE HOLDER MAY BE HUNG" in r.stdout, repr(r.stdout[-700:]))
+        check("--wait-free says plainly that it kills nothing",
+              "kills nothing" in r.stdout, repr(r.stdout[-700:]))
+        check("--wait-free still times out (exit 1); a hung holder is not a "
+              "free lock", r.returncode == 1,
+              "rc=%d out=%r" % (r.returncode, r.stdout[-300:]))
+        check("--wait-free left the holder alive", buildlock.pid_alive(parent.pid),
+              "it killed a process while claiming to run nothing")
+    finally:
+        kill_world(parent)
+
+
+def test_break_hung(tmp):
+    """A waiter may kill a hung holder -- but ONLY with --break-hung.
+
+    Both halves are the test. The default run is the control: same world, same
+    stopped tree, same number of windows, and the holder must still be alive at
+    the end with nothing built. If killing happened in both, the flag is
+    decorative; if it happened in neither, the feature does not exist.
+    """
+    print("\n--break-hung: opt-in killing of a stopped holder")
+
+    # -- control first: no flag, nothing may die -------------------------
+    repo, parent, _ = make_hung_world(tmp, "brk-off", CHILD_SLEEP)
+    if make_fake_driver(repo, sleep_s=0.2) is None:
+        check("INCONCLUSIVE: no runnable stand-in driver, nothing was tested",
+              False, "the copied python.exe would not start")
+        kill_world(parent)
+        return
+    try:
+        r = subprocess.run([sys.executable, BL, "--repo", repo,
+                            "--wait", "30", "--hung-window", "3",
+                            "--hung-strikes", "2", "--hung-after", "0",
+                            "build", "host"],
+                           capture_output=True, text=True, timeout=180)
+        alive = buildlock.pid_alive(parent.pid)
+        check("control: the waiter REFUSED rather than building (exit 4)",
+              r.returncode == 4, "rc=%d out=%r" % (r.returncode, r.stdout[-400:]))
+        check("control: it did notice the holder looked hung",
+              "THE HOLDER MAY BE HUNG" in r.stdout, repr(r.stdout[-800:]))
+        check("control: it said explicitly that NOTHING WAS KILLED",
+              "NOTHING WAS KILLED" in r.stdout, repr(r.stdout[-800:]))
+        # The threshold it PRINTS must be the threshold it ENFORCES. It was
+        # not: the loop honoured --hung-strikes while the evidence block
+        # stamped the module default, so a run with `--hung-strikes 2` said
+        # "3 needed" and then acted on the second. A number that contradicts
+        # the behaviour beside it is worse than no number.
+        check("control: the printed strike threshold is the one in force (2)",
+              "2 needed before" in r.stdout,
+              "it printed a different threshold than --hung-strikes 2; %r"
+              % r.stdout[-800:])
+        check("control: the holder is STILL ALIVE without --break-hung",
+              alive, "the holder was killed with no --break-hung flag")
+        check("control: the fake driver never ran",
+              not os.path.exists(os.path.join(repo, "called.json")),
+              "a build ran while the lock was still held")
+    finally:
+        kill_world(parent)
+
+    # -- and now with the flag -------------------------------------------
+    repo2, parent2, _ = make_hung_world(tmp, "brk-on", CHILD_SLEEP)
+    out2 = make_fake_driver(repo2, sleep_s=0.2)
+    if out2 is None:
+        check("INCONCLUSIVE: no stand-in driver for the --break-hung half",
+              False, "")
+        kill_world(parent2)
+        return
+    try:
+        r = subprocess.run([sys.executable, BL, "--repo", repo2,
+                            "--wait", "90", "--break-hung",
+                            "--hung-window", "3", "--hung-strikes", "2",
+                            "--hung-after", "0", "build", "host"],
+                           capture_output=True, text=True, timeout=240)
+        time.sleep(1.0)
+        alive = buildlock.pid_alive(parent2.pid)
+        check("--break-hung: the holder's tree was killed", not alive,
+              "the holder pid %d survived; out=%r"
+              % (parent2.pid, r.stdout[-600:]))
+        check("--break-hung: it logged the kill",
+              "KILLING the holder's process tree" in r.stdout,
+              repr(r.stdout[-800:]))
+        check("--break-hung: it logged WHICH pids it killed (the holder, and "
+              "the child that was the actual problem)",
+              str(parent2.pid) in r.stdout
+              and r.stdout.count("      pid ") >= 2, repr(r.stdout[-900:]))
+        check("--break-hung: the build then ran",
+              os.path.exists(out2),
+              "no build was started after taking the lock; out=%r"
+              % r.stdout[-600:])
+        check("--break-hung: the child's exit code came back (7)",
+              r.returncode == 7, "rc=%d" % r.returncode)
+        check("--break-hung: the lock is FREE afterwards",
+              cli(repo2, "--status", "--json", "--no-hung-check")[0] == 0,
+              cli(repo2, "--status", "--no-hung-check")[1][:200])
+    finally:
+        kill_world(parent2)
+
+
+def test_hung_units(tmp):
+    """The two halves that are hard to stage live: an unreadable process table
+    and a truncated nimcache walk. Both must degrade to `unknown`, because
+    `unknown` resets the strike count and `hung?` does not."""
+    print("\nhang detection: the NOT PERFORMED paths")
+    t0 = time.time()
+
+    def sample(at, procs, newest, **nc):
+        d = {"newest": newest, "path": "x.nif", "dirs": 1, "files": 3,
+             "truncated": False, "error": None}
+        d.update(nc)
+        return {"at": at, "pid": 1, "procs": procs, "proc_error": None,
+                "root_seen": True, "nimcache": d}
+
+    idle = {"1": {"name": "python.exe", "cpu_s": 0.27},
+            "2": {"name": "nimony.exe", "cpu_s": 0.27}}
+    prev = sample(t0, idle, t0 - 600)
+    cur = sample(t0 + 30, idle, t0 - 600)
+    v = buildlock.hung_verdict(prev, cur, 20, 0.5)
+    check("baseline: an idle tree over a full window is hung?",
+          v["verdict"] == "hung?", str(v))
+
+    busy = {"1": {"name": "python.exe", "cpu_s": 0.27},
+            "2": {"name": "nimony.exe", "cpu_s": 9.5}}
+    v = buildlock.hung_verdict(prev, sample(t0 + 30, busy, t0 - 600), 20, 0.5)
+    check("cpu on ONE child of the tree is enough to read working",
+          v["verdict"] == "working" and v["cpu_delta_s"] > 9, str(v))
+
+    v = buildlock.hung_verdict(prev, sample(t0 + 30, idle, t0 + 10), 20, 0.5)
+    check("a nimcache write INSIDE the window reads working",
+          v["verdict"] == "working" and v["nimcache_changed"] is True, str(v))
+
+    v = buildlock.hung_verdict(prev, sample(t0 + 5, idle, t0 - 600), 20, 0.5)
+    check("samples closer together than the window are unknown, not hung?",
+          v["verdict"] == "unknown" and "to go" in v["why"], str(v))
+
+    broken = sample(t0 + 30, idle, t0 - 600)
+    broken["proc_error"] = "powershell timed out"
+    v = buildlock.hung_verdict(prev, broken, 20, 0.5)
+    check("an unreadable process table is unknown and says NOT PERFORMED",
+          v["verdict"] == "unknown" and "NOT PERFORMED" in v["why"], str(v))
+
+    v = buildlock.hung_verdict(
+        prev, sample(t0 + 30, idle, t0 - 600, truncated=True), 20, 0.5)
+    check("a TRUNCATED nimcache walk is unknown, not hung?",
+          v["verdict"] == "unknown" and "TRUNCATED" in v["why"], str(v))
+
+    v = buildlock.hung_verdict(
+        prev, sample(t0 + 30, idle, t0 - 600, error="scandir blew up"),
+        20, 0.5)
+    check("a nimcache walk that ERRORED is unknown, not hung?",
+          v["verdict"] == "unknown", str(v))
+
+    # A child that finished during the window is progress, even with no cpu
+    # delta on the survivors -- a compiler exiting is the most normal thing a
+    # build does, and killing at that moment would be the worst false positive.
+    gone_cur = sample(t0 + 30, {"1": {"name": "python.exe", "cpu_s": 0.27}},
+                      t0 - 600)
+    v = buildlock.hung_verdict(prev, gone_cur, 20, 0.5)
+    check("a process EXITING during the window reads working",
+          v["verdict"] == "working" and len(v["gone"]) == 1, str(v))
+
+    check("hung_lines() prints the pids, the deltas and the nimcache age",
+          all(s in "\n".join(buildlock.hung_lines(
+              buildlock.hung_verdict(prev, cur, 20, 0.5)))
+              for s in ("nimony.exe", "delta", "newest nimcache")),
+          "\n".join(buildlock.hung_lines(
+              buildlock.hung_verdict(prev, cur, 20, 0.5))))
+
+
+def test_proc_table_real():
+    """The instrument itself, against this machine. If proc_table() cannot see
+    a process we just started, every verdict above is built on nothing."""
+    print("\nprocess table: can it see a tree we just made?")
+    t = time.time()
+    table, err = buildlock.proc_table()
+    dt = time.time() - t
+    if table is None:
+        check("INCONCLUSIVE: no process table on this machine, so NO hang "
+              "verdict here can be trusted", False, str(err))
+        return
+    print("    proc_table(): %d processes in %.2fs" % (len(table), dt))
+    check("proc_table sees this very process", os.getpid() in table,
+          "our pid %d is missing" % os.getpid())
+    check("proc_table reports cpu for this process",
+          table[os.getpid()]["cpu_s"] > 0,
+          "cpu_s=%r" % table[os.getpid()]["cpu_s"])
+
+    p = subprocess.Popen([sys.executable, "-c", PARENT, CHILD_SLEEP],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        time.sleep(2.0)
+        table, _ = buildlock.proc_table()
+        tree = buildlock.proc_tree(table, p.pid)
+        print("    tree of pid %d: %s" % (p.pid, tree))
+        check("proc_tree finds the parent AND the grandchild it spawned",
+              len(tree) >= 2 and tree[0] == p.pid,
+              "tree=%r -- without this, a hung nimony under a sleeping aowl "
+              "would never be sampled" % (tree,))
+    finally:
+        kill_world(p)
+
+    t = time.time()
+    nc = buildlock.nimcache_newest(buildlock.REPO)
+    dt = time.time() - t
+    print("    nimcache_newest(real checkout): %d dirs, %d files, %.2fs, "
+          "truncated=%s" % (nc["dirs"], nc["files"], dt, nc["truncated"]))
+    check("the real checkout's nimcache walk finds directories",
+          nc["dirs"] > 0, str(nc))
+    check("the nimcache walk completes inside its budget on the real checkout",
+          not nc["truncated"] and nc["error"] is None, str(nc))
+
+
 def main():
     print("buildlock: FIFO fairness")
     tmp = tempfile.mkdtemp(prefix="buildlock-test-")
@@ -1029,6 +1530,13 @@ def main():
         test_concurrent_edits(tmp)
         test_snapshot_unit(tmp)
         test_snapshot_speed()
+        test_proc_table_real()
+        test_hung_units(tmp)
+        test_hung_verdicts(tmp)
+        test_hung_human_text(tmp)
+        test_hung_across_calls(tmp)
+        test_wait_free_reports_hung(tmp)
+        test_break_hung(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
