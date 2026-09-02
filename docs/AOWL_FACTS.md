@@ -8340,3 +8340,51 @@ screen-to-canvas conversion fixed the 42/42 off-screen placement. Exit half:
 on this build -- stopping` although the same RVA is bound as uihooks site 7
 at boot (prologue verified, unique): the refusal is in the host's call-target
 table, not the game.
+
+## 2026-09-02: "did not resolve as callable code on this build" meant "not in OUR call table"
+
+MEASURED, one boot, two lines that were both true and read as contradictory:
+
+    [boot]  raidExit: the in-raid menu's show event is LIVE --
+            MenuScreen::ShowInRaid @0x1539650 (uihooks site 7) is bound
+    [arm]   raidExit: MenuScreen::ShowInRaid @0x1539650 did not resolve as
+            callable code on this build -- stopping. This is a REFUSAL
+
+Same RVA, same 16 bytes. The DETOUR side resolved it through `aowl_uih_sites`
+(site 7) and bound it; the CALL side went through the inspector's navigation
+table via `cInspCode`, **which has no row for that RVA**, and reported the
+absence as a fact about the game build.
+
+**A refusal that says "on this build" when it means "in our table" sends the
+next reader to the wrong place.** `MenuScreen::ShowInRaid` @`0x1539650` (UNIQUE,
+arity 0, `RCX=this, RDX=MethodInfo*`, prologue
+`48 89 5C 24 08 | 48 89 74 24 10 | 57 | 48 83 EC 20 | 48`) is now
+`aowl_pmn_targets` row [3], verified against the SAME bytes site 7 verifies, so
+the two tables cannot drift apart in what they think this function starts with.
+The refusal now names the table, prints that row's verified/rejected/
+snapshot-full counters, and says explicitly that if site 7 bound while this row
+refuses, the fault is ours and not the client's.
+
+General rule worth keeping: **hooking and calling go through different tables in
+this host.** A function being hooked is not evidence that it can be called, and
+every refusal should name the table it consulted.
+
+## 2026-09-02 13:30 (clock): the native subtab strip, as the user sees it
+
+USER-REPORTED on build 4,888,576 (nativeTabs + nativeTabsSubtabs on): on
+opening Settings the GRAPHICS SETTINGS + POSTFX strip flashes over the GAME
+tab, then disappears; on GRAPHICS there is no strip and the GAME panel
+overlays the GRAPHICS panel; inside the PROOF tab the strip AND the Graphics
+rows are shown, and POSTFX does not take a mouse click. Host log for the
+same session: strip built (`returned true`), INVENTORY 2 subtab toggles in a
+cloned group, the proof press did not take (selection -1), then a run of
+`toggle event -- our tab was pressed OFF` verdicts as the player clicked
+stock tabs. Diagnosis: the strip is wired to OUR proof tab instead of the
+stock GRAPHICS tab; the subtab machinery's SetActive on the stock Graphics
+panel collides with the stock group's own switching; the POSTFX toggle is
+not reached by the raycast (interactable/CanvasGroup/sort order unverified).
+MEASURED crash #4 (Crash_2026-09-02_161150163, 232s, after closing
+Settings): `READ of 0x100000117 faulted; Rdx=Rbx=0xffffffff` in
+SeasonWidgetData::From +0x11f <- MenuScreen::Show -- an index of -1 from
+the seasonal data, not a corrupted pointer; backend/profile season data
+under audit.
