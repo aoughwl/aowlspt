@@ -91,3 +91,47 @@ for the second, a live probe):**
 Until one of those lands, wiring would be a fabricated, unverifiable detour, so
 the three effects remain honestly **blocked** — not on a missing/shared/stub
 RVA, but on the patch-installation facility.
+
+
+---
+
+## CORRECTION, measured 2026-09-01: the blocker above had already expired
+
+The section titled "Wiring status: RESOLVED but NOT wired" is **wrong on this
+branch**, and it is worth saying how rather than deleting it, because it is what
+a later task was briefed from.
+
+Its claim was that "the mod ABI exposes only by-name patching ... there is no
+mod-facing patch-by-RVA". Measured against the source instead:
+`aowlhost.nim`'s `installPatch` decides `parseRvaSpec` **before** the name
+split, and a mod's `patchTyped` target may be
+`Type::Method@0xRVA/<shape>[!<hex prologue>]`. `mods/ammoloading` has been
+shipping four such specs, and `mods/fov` has been arming all three effects
+through them (`armScaleFix`, `armScopeSensitivity`, `armAimingSensitivity`,
+gated on `enableRvaDetours`). The JSON patch ABI *is* refused for an `@0x`
+target -- it needs a `MethodInfo` to describe the frame -- which is probably
+what the original note was remembering.
+
+What was genuinely missing, and is now in place, is not the address path but
+the **checks around it**. `resolveByRva` answers everything about the address
+(module, code page, `il2cpp` section, prologue-vs-snapshot) and nothing about
+the write, so until now a mod's by-RVA detour could:
+
+* declare **no** prologue at all -- `resolveByRva` warns and continues, which
+  is right for the host's own binder and wrong for a mod;
+* land on a **folded** address -- 28.3% of by-name keys do -- with sharedness
+  asserted only in a comment;
+* be the **second** detour on a function, overwriting the first's trampoline.
+
+`host/Aowlspt.Host.Il2Cpp/patchrva.nim` gates all three, refuses out loud
+naming the gate, and proves the gates can say no with a four-probe read-only
+self-check on first use. The mod side is `RvaPatchTarget` +
+`hookRva`/`hookReturnRva` (`aowl/src/aowlspt/abi.nim`, `game.nim`).
+
+One measured consequence for this document's own table: the aiming-sensitivity
+row's type name is right about the metadata and wrong as an **index key**. The
+host now looks the name up to cross-check the RVA and read the share count, and
+`il2cpp_nameindex.py lookup` says
+`EFT.Player.FirearmController::get_AimingSensitivity/0` -> NOT FOUND while
+`FirearmController::get_AimingSensitivity/0` -> `0x7773F0`, not shared. The mod
+carries the short form now.

@@ -116,6 +116,75 @@ type
     rkStatic = 0'i32
     rkDynamic = 1
 
+  RvaSharedness* = enum
+    ## What the caller asserts about how many methods live at an RVA, and the
+    ## only two answers a mod is allowed to give.
+    ##
+    ## There is no `rvaUnknown`. 28.3% of by-name lookups on this build land on
+    ## a folded address, and a detour on one fires for every method folded onto
+    ## it -- so "I did not check" and "it is unique" must not be spellable as
+    ## the same value. The host decides which it really is from the offline
+    ## name index's own share count; this field says what the caller MEANT, and
+    ## a disagreement is a refusal with both numbers in it.
+    rvaExpectUnique = 0'i32
+      ## The default and the only one to use without a reason. The host refuses
+      ## the patch unless the index says this address has exactly one owner.
+    rvaAllowShared = 1
+      ## "I know it is folded (or unknown) and I want every firing anyway."
+      ## Logged loudly at install, per target. It does NOT override the
+      ## prologue check, the already-detoured check, or a spec whose name and
+      ## RVA contradict each other.
+
+  RvaPatchTarget* = object
+    ## A patch target named by VERIFIED STATIC ADDRESS instead of by name.
+    ##
+    ## The DETOUR counterpart of `callrva.RvaTarget`, and separate from it on
+    ## purpose: that one is for CALLING an address, which is correct code for
+    ## the receiver passed even when the body is folded, so it carries `owners`
+    ## for the log line and gates nothing on it. This one is for WRITING over a
+    ## function's entry, where a folded body means the detour fires for every
+    ## method on the address -- so here sharedness is a gate, not a note.
+    ##
+    ## By-name binding is what this exists to avoid: `findClass`/`findMethod`
+    ## return non-nil handles into unmapped memory on this build, so the
+    ## `MethodInfo` a by-name patch needs to derive the frame shape cannot be
+    ## read, and using it is fatal rather than absent. Every field here is
+    ## something that lookup would have supplied and that must therefore be
+    ## derived OFFLINE, from `tools/il2cpp_resolve.py` and
+    ## `tools/il2cpp_nameindex.py`, and declared.
+    ##
+    ## It is a struct rather than a hand-built spec string because all four
+    ## parts are load-bearing and a string hides which one is missing: the
+    ## first version of this in the FOV mod carried the *wrong type name* for
+    ## the aiming-sensitivity getter for weeks, harmlessly, because nothing
+    ## ever looked it up.
+    name*: string
+      ## `Ns.Type::Method` **as the offline name index spells it**, which is
+      ## not always as the source spells it: a nested type carries no namespace
+      ## on this build (`FirearmController::get_AimingSensitivity`, not
+      ## `EFT.Player.FirearmController::...`). It is not decoration -- the host
+      ## looks it up at `arity` to cross-check `rva` and to read the share
+      ## count, so a name that resolves to nothing is a refusal.
+    rva*: uint32
+      ## Module-relative, against `GameAssembly.dll` (imagebase 0x180000000, so
+      ## `VA - 0x180000000`). Must be inside the `il2cpp` PE section; the host
+      ## checks that, `.text` holds no managed bodies.
+    shape*: string
+      ## The frame shape the host cannot derive without a `MethodInfo`:
+      ## `i`/`s` for instance/static, one letter per DECLARED argument
+      ## (`i` integer/bool/char, `f` float, `d` double, `o` object/string,
+      ## `v` small value type, `V` value type wider than a register), then `>`
+      ## and one return letter (the same set plus `x` for void).
+      ## `float get_AimingSensitivity()` is `i>f`;
+      ## `void CalculateScaleValueByFov(float)` is `if>x`.
+    prologue*: seq[uint8]
+      ## The method's first bytes, from `il2cpp_resolve.py bytes <RVA> 16`.
+      ## Compared against the host's STARTUP SNAPSHOT -- never live memory, so
+      ## another feature's trampoline cannot be what was read. Fewer than 8 is
+      ## refused: a one-byte "verify" matches thousands of functions and is a
+      ## check that cannot fail.
+    expect*: RvaSharedness
+
   ModFlag* = enum
     mfHotReloadable  ## bit 0 — implements stateSave/stateLoad
     mfThreadSafe     ## bit 1 — callbacks are safe off the main thread

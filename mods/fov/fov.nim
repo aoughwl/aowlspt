@@ -1466,8 +1466,9 @@ const
 # expressed as host patch-by-RVA specs.
 # ---------------------------------------------------------------------------
 #
-# Each is `Type::Method@0xRVA/<shape>!<hexprologue>` -- the grammar the host's
-# `installPatch` parses (`parseRvaSpec`/`resolveByRva` in the IL2CPP host). The
+# Each is an `RvaPatchTarget` (the mod ABI's patch-by-RVA description) handed to
+# `hookRva`/`hookReturnRva`, which build the host spec string and pass it to
+# `patchTyped`. The
 # host resolves the ADDRESS from the RVA, so no `il2cpp_*` name lookup happens
 # and the token-gated export ABI (fact #217) is never touched; it then
 # byte-verifies the declared prologue against the STARTUP SNAPSHOT (not live
@@ -1481,27 +1482,68 @@ const
 #   il2cpp_resolve.py <GA> <metadec> type 11841 -> float get_GetCurrentSensitivity()  i>f
 #   il2cpp_resolve.py <GA> <metadec> type 7013  -> void  CalculateScaleValueByFov(float) if>x
 #
-# and each RVA was checked `shared` == UNIQUE (owners=1), so a detour there fires
-# for exactly one method. Prologues are the verbatim `bytes <RVA> 16` output,
-# spaces stripped (the grammar wants an even run of hex digits).
-const
-  SpecAimSens =
-    "EFT.Player.FirearmController::get_AimingSensitivity" &
-    "@0x7773F0/i>f!40534883EC20488B11488BD9488B82C8"
-    ## rid 43152, arity 0, instance, returns float. POSTFIX (scale the result).
-  SpecScopeSens =
-    "EFT.InventoryLogic.SightComponent::get_GetCurrentSensitivity" &
-    "@0x104A140/i>f!40534883EC20803D4817070600488BD9"
-    ## rid 72574, arity 0, instance, returns float. PREFIX-replace with the
-    ## magnification-table value (a postfix would only scale the game's own
-    ## answer; upstream `ScopeSensitivityPatch` replaces it outright).
-  SpecScaleValue =
-    "EFT.Player::CalculateScaleValueByFov" &
-    "@0x6FC250/if>x!F30F5C0D40A6EB05F30F1005A09DEB05"
-    ## rid 42126, arity 1 (float), instance, returns VOID -- confirmed
-    ## `il2cpp_resolve.py type 7013`, which CONTRADICTS the old `armScaleFix`
-    ## that required a `System.Single` return. PREFIX that suppresses the
-    ## original, so the viewmodel stops being rescaled as the FOV changes.
+# `expect: rvaExpectUnique` is no longer a claim in a comment. The host looks
+# each name up in the offline index at the arity the shape declares and refuses
+# unless that entry maps to THIS RVA with exactly one owner -- and refuses again
+# if anything has already detoured the function, because the second detour on a
+# function overwrites the first's trampoline and kills it silently.
+# The prologue bytes are the verbatim `il2cpp_resolve.py bytes <RVA> 16` output
+# for each address, and the host compares them against its STARTUP SNAPSHOT
+# before it writes anything.
+#
+# Procs rather than `const`/`let` globals, and that is not style: in a nimony
+# `--app:lib` build a global initialised by anything the compiler cannot fold is
+# left ZEROED, so a target built by a call at module scope would arrive at the
+# host as an empty name and an RVA of 0. `gameType` in the mod API carries the
+# same warning for the same reason.
+
+proc tgtAimSens(): RvaPatchTarget =
+  ## `float get_AimingSensitivity()` -- instance, no arguments, returns float.
+  ##
+  ## THE NAME IS `FirearmController::...`, NOT `EFT.Player.FirearmController::...`,
+  ## and the difference is measured rather than stylistic: on this build the
+  ## nested type carries no namespace, so the longer spelling is not a key in
+  ## the offline name index at all (`il2cpp_nameindex.py lookup ... 0` ->
+  ## NOT FOUND, while the short one -> 0x7773F0, not shared). The mod carried
+  ## the long one for weeks with no consequence, because in a hand-built spec
+  ## string the name is only ever printed; it is looked up now, to cross-check
+  ## this RVA and to read the share count, so a wrong name is a refusal.
+  RvaPatchTarget(name: "FirearmController::get_AimingSensitivity",
+            rva: 0x7773F0'u32,
+            shape: "i>f",
+            prologue: @[
+                        0x40'u8, 0x53'u8, 0x48'u8, 0x83'u8, 0xEC'u8, 0x20'u8,
+                        0x48'u8, 0x8B'u8, 0x11'u8, 0x48'u8, 0x8B'u8, 0xD9'u8,
+                        0x48'u8, 0x8B'u8, 0x82'u8, 0xC8'u8],
+            expect: rvaExpectUnique)
+
+proc tgtScopeSens(): RvaPatchTarget =
+  ## `float get_GetCurrentSensitivity()` -- instance, no arguments, returns
+  ## float (rid 72574, `il2cpp_resolve.py type 11841`). Index key confirmed
+  ## present and UNIQUE at arity 0.
+  RvaPatchTarget(name: "EFT.InventoryLogic.SightComponent::get_GetCurrentSensitivity",
+            rva: 0x104A140'u32,
+            shape: "i>f",
+            prologue: @[
+                        0x40'u8, 0x53'u8, 0x48'u8, 0x83'u8, 0xEC'u8, 0x20'u8,
+                        0x80'u8, 0x3D'u8, 0x48'u8, 0x17'u8, 0x07'u8, 0x06'u8,
+                        0x00'u8, 0x48'u8, 0x8B'u8, 0xD9'u8],
+            expect: rvaExpectUnique)
+
+proc tgtScaleValue(): RvaPatchTarget =
+  ## `void CalculateScaleValueByFov(float)` -- instance, ONE float argument,
+  ## returns VOID (rid 42126, `il2cpp_resolve.py type 7013`). The void return
+  ## is why this effect is a prefix that SUPPRESSES rather than one that
+  ## returns a number: the old code returned a value a void method never
+  ## yields. Index key confirmed present and UNIQUE at arity 1.
+  RvaPatchTarget(name: "EFT.Player::CalculateScaleValueByFov",
+            rva: 0x6FC250'u32,
+            shape: "if>x",
+            prologue: @[
+                        0xF3'u8, 0x0F'u8, 0x5C'u8, 0x0D'u8, 0x40'u8, 0xA6'u8,
+                        0xEB'u8, 0x05'u8, 0xF3'u8, 0x0F'u8, 0x10'u8, 0x05'u8,
+                        0xA0'u8, 0x9D'u8, 0xEB'u8, 0x05'u8],
+            expect: rvaExpectUnique)
 
 var gRvaVerified = 0
 var gRvaRejected = 0
@@ -3413,13 +3455,15 @@ proc armScaleFix() =
     return
   # No `signatureOf` here, on purpose: it is the by-name IL2CPP lookup that is
   # fatal when USED on this build (fact #198). The shape and prologue are in
-  # SpecScaleValue, derived offline, and the host byte-verifies the prologue
+  # tgtScaleValue(), derived offline, and the host byte-verifies the prologue
   # against its startup snapshot before it writes a single byte.
-  if hookTyped(SpecScaleValue, onScaleValueTyped) == Ok:
+  var whyScale = ""
+  if hookRva(tgtScaleValue(), onScaleValueTyped, whyScale) == Ok:
     gScaleState = "armed by-RVA (typed prefix, suppresses the rescale) at " &
-                  "il2cpp+0x6FC250"
+                  "il2cpp+0x6FC250, prologue verified against the host's " &
+                  "startup snapshot and the address confirmed UNIQUE"
   else:
-    gScaleState = "refused: " & lastError()
+    gScaleState = "refused: " & whyScale
 
 # ---------------------------------------------------------------------------
 # Effect 3: SightComponent::get_GetCurrentSensitivity
@@ -3457,17 +3501,18 @@ proc armScopeSensitivity() =
                  "revision 4; a by-RVA detour is typed-only, so nothing armed."
     return
   # No `signatureOf` (the fatal by-name lookup); the shape and prologue live in
-  # SpecScopeSens and the host byte-verifies the prologue before writing.
+  # tgtScopeSens() and the host byte-verifies the prologue before writing.
   if not bindOpticCamera():
     gSensState = "refused: the optic camera is unreachable (" &
                  gOpticChainState & "), so the table has no field of view " &
                  "to read and would be answering from nothing"
     return
-  if hookTyped(SpecScopeSens, onScopeSensitivityTyped) == Ok:
+  var whyScope = ""
+  if hookRva(tgtScopeSens(), onScopeSensitivityTyped, whyScope) == Ok:
     gSensState = "armed by-RVA (typed prefix, replaces with the magnification " &
                  "table) at il2cpp+0x104A140, " & gOpticChainState
   else:
-    gSensState = "refused: " & lastError()
+    gSensState = "refused: " & whyScope
 
 # ---------------------------------------------------------------------------
 # Effect 4: FirearmController::get_AimingSensitivity
@@ -3589,7 +3634,7 @@ proc armAimingSensitivity() =
   # TYPED-ONLY, by RVA. The old code called `signatureOf` first (the by-name
   # IL2CPP lookup that is fatal when USED, fact #198) and fell back to a by-name
   # JSON postfix (fatal for the same reason). Both are gone. The shape
-  # (instance, no args, returns float) and prologue are in SpecAimSens, derived
+  # (instance, no args, returns float) and prologue are in tgtAimSens(), derived
   # offline from `il2cpp_resolve.py type 6835`, and the host byte-verifies the
   # prologue against its startup snapshot before writing.
   if not typedPatchesReady():
@@ -3599,7 +3644,8 @@ proc armAimingSensitivity() =
                     "armed. There is deliberately no by-name JSON fallback -- " &
                     "it is the fatal token-gated route this port exists to avoid."
     return
-  if hookReturnTyped(SpecAimSens, onAimingSensitivityTyped) == Ok:
+  var whyAim = ""
+  if hookReturnRva(tgtAimSens(), onAimingSensitivityTyped, whyAim) == Ok:
     gAimSensTyped = true
     gAimSensState = "armed by-RVA (typed postfix) at il2cpp+0x7773F0, scaling " &
                     "the original's result by " & $cfgNonOpticSensMulti
@@ -3607,7 +3653,7 @@ proc armAimingSensitivity() =
     # The host refuses a postfix on two shapes -- a value-type return wider than
     # a register, and a compiled call needing more than four register slots --
     # and says which; neither should apply to a no-arg float getter.
-    gAimSensState = "refused: " & lastError()
+    gAimSensState = "refused: " & whyAim
 
 # ---------------------------------------------------------------------------
 # Hook verification
@@ -4308,6 +4354,97 @@ proc guardOk(what: string) =
 proc guardBad(what: string) =
   error "  GUARD    " & what
 
+proc expectRefused(what, why: string): int =
+  ## One negative. `why` is what `rvaSpecOf` said; a non-empty `why` is the
+  ## refusal, so a PASS here is the description being rejected.
+  if why.len > 0:
+    guardOk what & " -- refused: " & why
+    result = 0
+  else:
+    guardBad what & " was ACCEPTED. The by-RVA description is being built " &
+             "from input that is wrong, so every spec this mod hands the " &
+             "host is unchecked on the way out."
+    result = 1
+
+proc checkRvaPatchTargets(): int =
+  ## The by-RVA descriptions, checked STRUCTURALLY, with no game and no host.
+  ##
+  ## Three negatives and one positive, and the split matters. What this CAN
+  ## establish is that `rvaSpecOf` refuses a malformed description and that the
+  ## three real targets serialise to exactly the spec strings that were derived
+  ## offline -- byte for byte, including the prologue, so a typo in a hex digit
+  ## is a failure here rather than a host refusal in a raid.
+  ##
+  ## What it CANNOT establish, and does not claim: that the addresses are
+  ## unique, that the prologues match the installed GameAssembly.dll, or that
+  ## nothing else has detoured them. Those are answered by the HOST's own
+  ## gates, against the real module and the real name index, and the host
+  ## proves its gates can say no with its own four-probe self-check (see
+  ## `patchrva.nim`) rather than being taken on trust from here.
+  result = 0
+  var why = ""
+
+  # NEGATIVE 1: a prologue too short to identify anything.
+  var shortPro = tgtAimSens()
+  shortPro.prologue = @[0x40'u8, 0x53'u8, 0x48'u8]
+  discard rvaSpecOf(shortPro, why)
+  result = result + expectRefused("a 3-byte prologue", why)
+
+  # NEGATIVE 2: a shape that declares no return.
+  var badShape = tgtAimSens()
+  badShape.shape = "if"
+  discard rvaSpecOf(badShape, why)
+  result = result + expectRefused("the shape \"if\" (no return letter)", why)
+
+  # NEGATIVE 3: the address the spec grammar reserves for "not code".
+  var zeroRva = tgtAimSens()
+  zeroRva.rva = 0'u32
+  discard rvaSpecOf(zeroRva, why)
+  result = result + expectRefused("an RVA of 0", why)
+
+  # POSITIVE: the three real ones, against the strings derived offline. Only
+  # meaningful because the three negatives above passed.
+  let wantAim = "FirearmController::get_AimingSensitivity" &
+                "@0x7773F0/i>f!40534883EC20488B11488BD9488B82C8"
+  let wantScope = "EFT.InventoryLogic.SightComponent::get_GetCurrentSensitivity" &
+                  "@0x104A140/i>f!40534883EC20803D4817070600488BD9"
+  let wantScale = "EFT.Player::CalculateScaleValueByFov" &
+                  "@0x6FC250/if>x!F30F5C0D40A6EB05F30F1005A09DEB05"
+  let gotAim = rvaSpecOf(tgtAimSens(), why)
+  if gotAim == wantAim:
+    guardOk "tgtAimSens serialises to the derived spec exactly"
+  else:
+    guardBad "tgtAimSens produced " & (if gotAim.len == 0: "a refusal (" & why &
+             ")" else: gotAim) & ", wanted " & wantAim
+    result = result + 1
+  let gotScope = rvaSpecOf(tgtScopeSens(), why)
+  if gotScope == wantScope:
+    guardOk "tgtScopeSens serialises to the derived spec exactly"
+  else:
+    guardBad "tgtScopeSens produced " & (if gotScope.len == 0: "a refusal (" &
+             why & ")" else: gotScope) & ", wanted " & wantScope
+    result = result + 1
+  let gotScale = rvaSpecOf(tgtScaleValue(), why)
+  if gotScale == wantScale:
+    guardOk "tgtScaleValue serialises to the derived spec exactly"
+  else:
+    guardBad "tgtScaleValue produced " & (if gotScale.len == 0: "a refusal (" &
+             why & ")" else: gotScale) & ", wanted " & wantScale
+    result = result + 1
+
+  # The arity the host will look each name up at, from the shape rather than
+  # from the name. Wrong here means the name/RVA cross-check asks the index a
+  # question about a different overload and the patch is refused as UNKNOWN.
+  if rvaArity(tgtAimSens()) == 0 and rvaArity(tgtScopeSens()) == 0 and
+     rvaArity(tgtScaleValue()) == 1:
+    guardOk "declared arities 0/0/1 match the index keys measured offline " &
+            "(get_AimingSensitivity/0, get_GetCurrentSensitivity/0, " &
+            "CalculateScaleValueByFov/1)"
+  else:
+    guardBad "a declared shape implies an arity the offline index does not " &
+             "have a key for; the host would refuse the patch as UNKNOWN"
+    result = result + 1
+
 proc checkGuards(): int =
   ## How many guards answered wrongly. Zero on a runtime that has the shapes;
   ## zero and a warning on one that does not.
@@ -4546,6 +4683,14 @@ proc simSelfTest(): Status =
          describeSig(params, ret)
   else:
     warn "  NO NAME  " & TySight & "::get_GetCurrentSensitivity"
+
+  info "  the by-RVA targets, serialised and checked against the offline " &
+       "derivation:"
+  let badTargets = checkRvaPatchTargets()
+  if badTargets > 0:
+    error "  " & $badTargets & " by-RVA target check(s) failed; the host " &
+          "would be handed a description that does not say what it means"
+    return ErrGeneric
 
   info "  the guards, exercised rather than described:"
   let badGuards = checkGuards()

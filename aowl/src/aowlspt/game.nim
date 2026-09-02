@@ -720,6 +720,207 @@ proc hookReturnTyped*(target: string; handler: TypedPatchHandler): Status =
   patchTyped(target, pkPostfix, handler)
 
 # ---------------------------------------------------------------------------
+# Typed hooks on a VERIFIED STATIC ADDRESS (`patchRva`)
+# ---------------------------------------------------------------------------
+#
+# `hookTyped(name)` asks the runtime to find the method. On the post-1.0 client
+# that lookup is not merely unreliable, it is fatal when USED: `findClass` and
+# `findMethod` hand back non-nil handles into unmapped memory, the nil check
+# passes, and the first dereference kills the game. Every effect that needs a
+# detour there has to name its target by an address derived OFFLINE instead.
+#
+# The host has accepted an `@0xRVA` spec string for a while, and mods have been
+# hand-concatenating one. This is the same path with the parts named, and the
+# reason to prefer it is not tidiness:
+#
+#   * a spec string is validated only by the host, in the client, at install
+#     time -- the one place where being wrong is expensive. `rvaSpecOf` refuses
+#     the same mistakes here, in the mod, with the same sentences, and the sim
+#     self-test can run it with no game at all.
+#   * `expect` makes sharedness a value the caller had to write down. The host
+#     checks the offline name index's share count either way; what this adds is
+#     that a mod which never thought about folded bodies cannot accidentally
+#     spell "unique".
+#   * the four parts stop hiding in one literal. The FOV mod carried
+#     `EFT.Player.FirearmController::get_AimingSensitivity` -- not a key on this
+#     build -- harmlessly for weeks, because in a spec string the name is only
+#     ever printed.
+#
+# What the HOST checks, and what a mod therefore cannot talk it out of: the
+# prologue against its startup snapshot, the il2cpp-section and code-page
+# checks, UNIQUE sharedness from the offline index (with the name/RVA
+# cross-check), and that no other detour already owns the function -- the second
+# detour on a function overwrites the first's trampoline and kills it silently.
+# Each refusal names the gate. `why` carries it back.
+
+const RvaMinPrologue* = 8
+  ## The shortest prologue the host accepts, repeated here so a mod refuses
+  ## before the call rather than after it. Declare all 16 that
+  ## `il2cpp_resolve.py bytes <RVA> 16` prints; this is the floor.
+
+proc rvaHexDigit(v: int): char =
+  const D = "0123456789ABCDEF"
+  result = D[v and 15]
+
+proc rvaHexNum(v: uint32): string =
+  ## Uppercase, no leading zeroes. Not `$`: the spec grammar is hex.
+  if v == 0'u32:
+    return "0"
+  var rev = ""
+  var x = v
+  while x > 0'u32:
+    rev.add rvaHexDigit(int(x and 15'u32))
+    x = x shr 4
+  result = ""
+  var i = rev.len - 1
+  while i >= 0:
+    result.add rev[i]
+    dec i
+
+proc rvaHexNibblePair(b: uint8): string =
+  result = ""
+  result.add rvaHexDigit(int(b) shr 4)
+  result.add rvaHexDigit(int(b) and 15)
+
+proc rvaArgLetterOk(c: char; allowVoid: bool): bool =
+  result = c == 'i' or c == 'f' or c == 'd' or c == 'o' or c == 'v' or c == 'V'
+  if not result and allowVoid:
+    result = c == 'x'
+
+proc rvaShapeWhy(shape: string): string =
+  ## "" if the shape is well formed. The host says the same things; saying them
+  ## here means a self-test can prove a shape wrong without a game.
+  if shape.len < 3:
+    return "the shape " & shape & " is too short: it needs at least i/s, > " &
+           "and a return letter (a no-argument instance float getter is i>f)"
+  if shape[0] != 'i' and shape[0] != 's':
+    var g = ""
+    g.add shape[0]
+    return "the shape must start with i (instance) or s (static), got " & g
+  if shape[shape.len - 2] != '>':
+    return "the shape must end with > and exactly ONE return letter, got " &
+           shape
+  var i = 1
+  while i < shape.len - 2:
+    if not rvaArgLetterOk(shape[i], false):
+      var g = ""
+      g.add shape[i]
+      return g & " is not an argument letter in " & shape & " (i f d o v V)"
+    inc i
+  if not rvaArgLetterOk(shape[shape.len - 1], true):
+    var g = ""
+    g.add shape[shape.len - 1]
+    return g & " is not a return letter in " & shape & " (i f d o v V x)"
+  result = ""
+
+proc rvaArity*(t: RvaPatchTarget): int =
+  ## How many arguments the shape DECLARES. This is the arity the host looks
+  ## the name up at, so a mod checking its own target offline must use the same
+  ## number -- `i>f` is arity 0, `if>x` is arity 1.
+  result = 0
+  if t.shape.len >= 3:
+    result = t.shape.len - 3
+
+proc rvaSpecOf*(t: RvaPatchTarget; why: var string): string =
+  ## The spec string this target becomes, or "" with `why` naming what is
+  ## wrong. Public because it is the thing to log and the thing a self-test
+  ## asserts on.
+  why = ""
+  result = ""
+  if t.name.len == 0:
+    why = "an RVA target needs the Type::Method name the offline index " &
+          "spells it with; it is what the host looks up to cross-check the " &
+          "address and read the share count, not a label"
+    return
+  var sep = -1
+  var k = 0
+  while k < t.name.len:
+    let c = t.name[k]
+    if c == '@' or c == '!' or c == '/' or c == '>':
+      var g = ""
+      g.add c
+      why = "the name " & t.name & " contains " & g &
+            ", which is spec-grammar punctuation: the name is a plain " &
+            "Ns.Type::Method, and the address, shape and prologue are " &
+            "separate fields here precisely so they are not concatenated by " &
+            "hand"
+      return
+    if c == ':' and k + 1 < t.name.len and t.name[k + 1] == ':' and sep < 0:
+      sep = k
+    inc k
+  if sep <= 0 or sep + 2 >= t.name.len:
+    why = "the name " & t.name & " is not Ns.Type::Method (a non-empty type, " &
+          "then ::, then a non-empty member)"
+    return
+  if t.rva == 0'u32:
+    why = "an RVA of 0 is the module header, not code"
+    return
+  let shapeWhy = rvaShapeWhy(t.shape)
+  if shapeWhy.len > 0:
+    why = shapeWhy & ". There is no MethodInfo behind an RVA on this build, " &
+          "so the host cannot derive the frame and a guessed one is a hook " &
+          "that is silently wrong rather than absent"
+    return
+  if t.prologue.len < RvaMinPrologue:
+    why = "the prologue is " & $t.prologue.len & " byte(s) and at least " &
+          $RvaMinPrologue & " are required: a shorter one matches thousands " &
+          "of functions, so it is a check that cannot fail. Paste what " &
+          "il2cpp_resolve.py bytes 0x" & rvaHexNum(t.rva) & " 16 printed"
+    return
+  if t.prologue.len > 16:
+    why = "the prologue is " & $t.prologue.len & " bytes; the host's startup " &
+          "snapshot holds 16, so more than that cannot be verified and is " &
+          "refused rather than silently truncated"
+    return
+  result = t.name & "@0x" & rvaHexNum(t.rva) & "/" & t.shape & "!"
+  var b = 0
+  while b < t.prologue.len:
+    result.add rvaHexNibblePair(t.prologue[b])
+    inc b
+  if t.expect == rvaAllowShared:
+    result.add "!shared"
+
+proc patchRva*(t: RvaPatchTarget; kind: PatchKind; handler: TypedPatchHandler;
+               why: var string): Status =
+  ## Detour a method named by verified static address, handing the handler the
+  ## registers (the typed frame `hookTyped` uses).
+  ##
+  ## `ErrBadArg` and a `why` means this mod's own description is malformed and
+  ## nothing was sent to the host. Any other non-`Ok` means the HOST refused,
+  ## and `why` is its refusal verbatim -- which gate declined and what to do --
+  ## rather than a status a caller has to interpret.
+  ##
+  ## Typed only, deliberately. The JSON patch path needs a `MethodInfo` to
+  ## describe the arguments and the return, an RVA has none, and the host
+  ## refuses it there rather than handing a handler an empty payload and
+  ## calling it a hook.
+  why = ""
+  let spec = rvaSpecOf(t, why)
+  if spec.len == 0:
+    return ErrBadArg
+  result = patchTyped(spec, kind, handler)
+  if result != Ok:
+    why = lastError()
+
+proc hookRva*(t: RvaPatchTarget; handler: TypedPatchHandler;
+              why: var string): Status =
+  ## A typed PREFIX on a verified static address: the handler runs instead of
+  ## the original when it returns `frameReplace()` after a `setResult*`.
+  patchRva(t, pkPrefix, handler, why)
+
+proc hookReturnRva*(t: RvaPatchTarget; handler: TypedPatchHandler;
+                    why: var string): Status =
+  ## A typed POSTFIX on a verified static address: the original has run and
+  ## `resultFloat` and friends read what it produced.
+  ##
+  ## The host refuses two shapes here, decided from the DECLARED shape rather
+  ## than from a `MethodInfo`: a return wider than a register (`V`), which
+  ## Win64 returns through a buffer whose layout the host cannot read, and a
+  ## call needing more than four register slots, whose arguments arrive on the
+  ## stack where a called original would look in the wrong frame.
+  patchRva(t, pkPostfix, handler, why)
+
+# ---------------------------------------------------------------------------
 # Reading a hook payload
 # ---------------------------------------------------------------------------
 #
