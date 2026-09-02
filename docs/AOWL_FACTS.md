@@ -7685,3 +7685,63 @@ flag bisects were chasing noise: the tick+1 Submit rule made the race rare,
 not impossible (4 deaths, ~5 survivals since 08:15). Fix in flight: answer
 the slot screen through its own control so the game's flow populates the
 Profile before Show.
+
+## 2026-09-02: SAIN at drive level 2 — the whole detour list, audited offline
+
+MEASURED offline against the shipped `GameAssembly.dll` (`tools/il2cpp_resolve.py`
++ capstone), after the menu crash above had already exonerated SAIN.
+
+**Level 2 installs exactly ONE detour, and it is the only one SAIN installs at
+all on this build.** `mods/sain/sain.nim installHooks` refuses the spawn and
+death detours unconditionally (they use the by-name JSON patch ABI), and
+`armDamageHook` is never attempted. What remains is
+`hookReturnTyped(AimIsReadySpec, onBotAimTyped)` — a POSTFIX on
+`Aiming::get_IsReady`.
+
+* **RVA 0x1AD48C0**, `il2cpp` section. `il2cpp_resolve.py shared 0x1AD48C0` =
+  **UNIQUE, owners=1**. `methods get_IsReady` confirms the owner is `Aiming`;
+  the other two owners of that name (`BotAimingData`,
+  `UnderbarrelLauncherBotAiming`) share a **different** body, 0x1AEFE30, which
+  this detour never touches.
+* **Stolen prologue, `40 53 48 83 EC 30 80 3D BB B0 5E 05 00 48 8B D9`** —
+  matches the image byte for byte. It decodes as four whole instructions:
+  `push rbx` (2), `sub rsp,0x30` (4), `cmp byte [rip+0x55eb0bb],0` (7),
+  `mov rbx,rcx` (3) = **exactly 16**, so the 14-byte jump is covered with **no
+  instruction split**.
+* **One relative operand, and it is not a branch:** the disp32 of the `cmp` at
+  +0x06 — an IL2CPP class-init guard whose companion store is
+  `mov byte [rip+0x55eb08d],1` at +0x34 (both resolve to VA 0x187089988).
+  `abi/aowlspt_detour.h aowl_copy_relocated` rewrites RIP-relative disp32s and
+  refuses relative branches with rc −6; the decoder sizes `80 /7 ib` with
+  mod=0/rm=5 correctly, so this relocates. **No relative branch is stolen** —
+  the first is `jne` at +0x10, one byte past the steal.
+* **No in-function branch target below +0x10.** Disassembly to the first `ret`
+  yields targets only at +0x3B and +0x62, so nothing jumps back into the bytes
+  the jump overwrites.
+* **Register/stack discipline.** `aowl_thunk_common`'s postfix path saves
+  RCX/RDX/R8/R9 and XMM0-3 at 0x40-0x78, `call`s the trampoline (so the body's
+  own `ret` returns into the thunk), and publishes RAX/XMM0. Stack alignment
+  holds: entry RSP≡8, `sub 0x98` → ≡0, `call` → ≡8 at the trampoline, which is
+  what the body expects. **The thunk does NOT forward stack arguments 5+** —
+  the body is entered with RSP shifted by 0xA0, so `[rsp+0x28]` is the thunk's
+  frame. That is a real structural limit and it **cannot apply here**:
+  `get_IsReady` is arity-0 instance, RCX=this and RDX=MethodInfo* only.
+* **The handler allocates nothing.** `onBotAimTyped` → `driver.noteAim` is
+  three array stores into fixed arrays plus two counters; `TypedResult` is one
+  `bool`, so `frameContinue()` is not an allocation.
+
+**Also measured, and separate:** all **27** call rows in
+`mods/sain/client/rvatable.nim` were re-verified against the image —
+**0 prologue mismatches**, so the table is not stale for build
+`GameAssembly.dll 1.1.0.1.46777`. **7 of the 27 rows sit on SHARED RVAs**
+(`pMovement`, `boMover`, `boSteering`, `boShoot`, `enPerson`, `wmReload`,
+`faHave`). That is fine — *calling* a folded body is correct code for the
+receiver passed; only *detouring* one has unbounded blast radius, and none of
+these is detoured.
+
+**Conclusion: no defect found in SAIN's level-2 detour.** The audit did not
+find a corrupted prologue steal, a split instruction, an unrelocatable operand,
+a shared detour target, a second detour on the same function, a clobbered
+register or a per-call allocation. This is an absence of evidence from a static
+audit, not proof of innocence — but it agrees with the minidump, which put the
+menu-arrival fault in modeskip's Submit race.

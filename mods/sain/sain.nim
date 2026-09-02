@@ -578,6 +578,31 @@ proc armAimHook() =
          AimIsReadySpec
     if hookReturnTyped(AimIsReadySpec, onBotAimTyped) == Ok:
       setAimHooked(true)
+      # The bind-time READBACK. It states what was AUDITED about this one
+      # detour rather than that the install call returned Ok -- "Ok" is the
+      # host agreeing with itself, which is the check that cannot fail
+      # (CLAUDE.md 9b). Every clause below was measured OFFLINE against the
+      # shipped image on 2026-09-02 and is recorded in docs/AOWL_FACTS.md:
+      # `il2cpp_resolve.py shared 0x1AD48C0` = UNIQUE owners=1; `bytes
+      # 0x1AD48C0` = the 16 bytes in AimIsReadySpec, byte for byte; the four
+      # instructions covering the host's 14-byte jump end exactly on 16, so
+      # nothing is split; the only relative operand is the disp32 of `cmp
+      # byte [rip+0x55eb0bb], 0` at +0x06, which is a class-init guard the
+      # host's `aowl_copy_relocated` rewrites (a relative BRANCH would be
+      # refused outright, and there is none); and disassembly to the first
+      # `ret` finds in-function branch targets only at +0x3B and +0x62, so
+      # nothing jumps back into the bytes the jump overwrites.
+      info "sain: aim postfix BOUND at 0x1AD48C0 Aiming::get_IsReady " &
+           "(UNIQUE owners=1, 16/16 prologue bytes verified, 4 whole " &
+           "instructions ending exactly on the 16-byte boundary so none is " &
+           "split, no relative branch, one RIP-relative disp32 at +0x06 " &
+           "which the host relocates, no in-function branch target below " &
+           "+0x10). ARITY 0 INSTANCE: RCX=this and RDX=MethodInfo* only, so " &
+           "the thunk's fifth-and-later STACK arguments -- which it does not " &
+           "forward -- cannot apply here. The handler allocates nothing and " &
+           "runs to three array stores. BOUND IS NOT FIRED: the driver " &
+           "status line's fired/matched/withheld triple is the only thing " &
+           "that settles that"
       gAimHookState = "armed by static RVA on Aiming::get_IsReady @0x1AD48C0 " &
                       "(UNIQUE, 16/16 prologue bytes verified by the host " &
                       "against its startup snapshot), withholding a shot " &
