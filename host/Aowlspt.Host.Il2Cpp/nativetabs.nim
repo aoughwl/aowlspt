@@ -603,47 +603,31 @@ proc ntBuildOne(screenT, donorSpawnerT, donorPanelT: Il2CppPtr;
   # it costs one guarded read to say so instead of leaving it inferred.
   let createdList = (if nuOk(tabComp, NuOffTabCreatedControls + 8'i32):
                        cNuGetRef(tabComp, NuOffTabCreatedControls) else: nil)
-  ntCrumb("panel: destroying the donor rows under _settingsRoot ourselves")
-  ntCallBegin("Object::Destroy on the cloned panel's donor rows")
-  var destroyed = 0
+  ntCrumb("panel: retiring the donor rows under _settingsRoot (no Destroy)")
+  ntCallBegin("SetActive(false) on the cloned panel's donor rows")
   var kids = 0
-  if iChildCount(rowRoot, kids):
-    # BACKWARDS, and capped. Unity defers the actual destruction to end of
-    # frame so the child list does not shift under us, but iterating down is
-    # correct either way and costs nothing.
-    var k = kids - 1
-    while k >= 0 and destroyed < NtMaxRowDestroy:
-      let c = iChildAt(rowRoot, k)
-      k = k - 1
-      if c == nil or not duOk(c, 0x20'i32): continue
-      let go = iGameObjectOf(c)
-      if go == nil: continue
-      if nuDestroy(go):
-        destroyed = destroyed + 1
+  discard iChildCount(rowRoot, kids)
+  let retired = ntRetireChildrenOf(rowRoot)
   ntCallEnd()
-  if destroyed >= NtMaxRowDestroy:
-    warn "native tabs: the panel-empty walk hit its " & $NtMaxRowDestroy &
-         "-row cap, so donor rows MAY REMAIN under our tab. Reported rather " &
-         "than left to be noticed on screen -- the previous cap was 32 and " &
-         "quietly left 8 of 40 behind."
-  let leftOver = kids - destroyed
-  if leftOver > 0:
-    warn "native tabs: " & $leftOver & " of " & $kids & " child(ren) under " &
-         "_settingsRoot were NOT destroyed. They are the ones whose " &
-         "Transform or GameObject could not be read, or that Object::Destroy " &
-         "refused -- not a cap. If they render, our tab shows that many of " &
-         "the donor's rows."
-  okLog "native tabs: '" & header & "' panel clone emptied WITHOUT calling " &
-        "any SettingsTab method -- " & $destroyed & " of " & $kids &
-        " donor row(s) destroyed under _settingsRoot via Object::Destroy. " &
-        "The clone's _createdControls@0x88 reads " &
-        (if createdList == nil: "NULL, which is consistent with the managed " &
-           "exception CleanupCreatedControls threw here"
-         else: "non-null (" & iPtr(createdList) & "), so the throw was " &
-           "something other than a null list") &
-        ". Neither set_enabled nor CleanupCreatedControls is called on the " &
-        "clone; both were measured to unwind a managed exception through " &
-        "our frame."
+  if retired >= NtMaxRowDestroy:
+    warn "native tabs: the panel-retire walk hit its " & $NtMaxRowDestroy &
+         "-row cap, so donor rows MAY REMAIN VISIBLE under our tab."
+  let stillOn = ntActiveChildCount(rowRoot)
+  if stillOn > 0:
+    warn "native tabs: " & $stillOn & " of " & $kids & " child(ren) under " &
+         "_settingsRoot are STILL ACTIVE after the retire pass, so our tab " &
+         "shows that many of the donor's rows."
+  okLog "native tabs: '" & header & "' panel clone emptied by SWITCHING THE " &
+        "DONOR ROWS OFF, not by destroying them -- " & $retired & " of " &
+        $kids & " row(s) retired, " & $stillOn & " still active. Destroy was " &
+        "used here until the client died in the raid LOAD right after a boot " &
+        "that destroyed 80 of them (top frame " &
+        "il2cpp_unity_liveness_calculation_from_root): a destroyed row is " &
+        "still referenced from stock managed lists we cannot audit, and the " &
+        "liveness walk dereferences it. An inactive row does not render, " &
+        "which is all we ever needed. The clone's _createdControls@0x88 " &
+        "reads " & (if createdList == nil: "NULL" else: iPtr(createdList)) & "."
+
   ntCrumb("panel: hiding our clone, then registering the tab")
   discard modsSetActive(panelGo, false)   # ours starts hidden; the game owns the screen
 
@@ -841,7 +825,7 @@ proc ntBuildControlsMods(screenT: Il2CppPtr): bool =
     discard modsSetActive(panelGo, false)
     discard modsSetActive(btnGo, false)
     return
-  discard ntDestroyChildrenOf(gNtKbRowRoot)
+  discard ntRetireChildrenOf(gNtKbRowRoot)
   gNtKbPanelGo = panelGo
   discard modsSetActive(panelGo, false)
   gNtKbBuilt = true
@@ -869,8 +853,10 @@ proc ntKeybindRow(idx: int): bool =
   let go = nuGameObjectOf(row)
   if go == nil: return
   let b = gKbBinds[idx]
-  let caption = (if b.modName.len > 0: b.modName & ": " & b.action
-                 else: b.action)
+  # THE MOD NAME IS ITS OWN ROW NOW, so a bind row shows only its action --
+  # prefixing every action with the mod would repeat the heading on every line
+  # and push the useful text off the column.
+  let caption = (if b.heading: "-- " & b.modName & " --" else: b.action)
   # ACTION NAME -- through its own LocalizedText, and re-applied.
   var okName = false
   if nuOk(row, NtOffKpCommandName + 8'i32):
@@ -882,6 +868,9 @@ proc ntKeybindRow(idx: int): bool =
   if nuOk(row, NtOffKpKeyName + 8'i32):
     let tmp = cNuGetRef(row, NtOffKpKeyName)
     if nuOk(tmp, 0x10'i32):
+      # A heading has no key. Writing "" is deliberate rather than skipping:
+      # the cloned row arrives carrying the DONOR's key text, and leaving it
+      # would put a real-looking bind next to a mod name.
       okKey = nuSetText(tmp, b.key)
   # SECONDARY KEY -- blanked, not left showing the donor's second bind.
   if nuOk(row, NtOffKpKey2Name + 8'i32):
@@ -901,7 +890,7 @@ proc ntBuildKeybindRows(): int =
   ## fetch already bounded.
   result = 0
   if gNtKbRowRoot == nil: return
-  discard ntDestroyChildrenOf(gNtKbRowRoot)
+  discard ntRetireChildrenOf(gNtKbRowRoot)
   var i = 0
   while i < kbCount() and i < NtMaxRowDestroy:
     if ntKeybindRow(i): result = result + 1
@@ -1020,10 +1009,22 @@ proc ntBuild(): bool =
   # STEP 2, flag-gated and default OFF: a failure here must not cost step 1.
   if gNtSubOn:
     ntCrumb("build: ntBuildSubtabs")
-    discard ntBuildSubtabs(screenT,
-                           @["GRAPHICS SETTINGS", "POSTFX"],
-                           NtSubPanels)
+    let subOk = ntBuildSubtabs(screenT,
+                               @["GRAPHICS SETTINGS", "POSTFX"],
+                               NtSubPanels)
+    okLog "native subtabs: build attempted (nativeTabsSubtabs is ON) and " &
+          "returned " & $subOk & ". NOTE FOR ACCEPTANCE: this strip is a " &
+          "SIBLING of the panels, parented to SettingsScreen -- it is NOT a " &
+          "Toggles(Clone) under Graphics Settings, and looking for one there " &
+          "will not find it. That relocation is the fix, not a regression: " &
+          "inside the panel is where it re-arranged the game's scroll view."
+  elif gGfxOn:
+    warn "native subtabs: settingsPostFxSubtab is ON but nativeTabsSubtabs " &
+         "is OFF, so the strip was NOT built and the stock POSTFX tab is " &
+         "hidden with nothing able to reach PostFX. The flag chain should " &
+         "have prevented this -- report it."
   gNtBuilt = true
+  ntInventory("build complete")
   result = true
 
 # ---------------------------------------------------------------------------
@@ -1040,9 +1041,24 @@ proc ntBuildSubtabs(screenT: Il2CppPtr; captions: seq[string];
   ## THAT group, never at the tab-bar group -- subtab exclusivity must not
   ## fight tab exclusivity.
   result = false
-  if gNtSubBuilt or not gNtSubOn: return
+  # NO SILENT RETURN HERE. This used to be one bare `if ... return`, and on the
+  # boot where the strip did not appear it was the only candidate that left
+  # nothing in the log at all -- indistinguishable from the build never being
+  # attempted.
+  if gNtSubBuilt:
+    return
+  if not gNtSubOn:
+    warn "native subtabs: NOT BUILDING -- nativeTabsSubtabs is OFF at the " &
+         "moment ntBuildSubtabs was called. The flag chain " &
+         "(settingsPostFxSubtab -> nativeTabsSubtabs -> nativeTabs) is what " &
+         "should have set it; if settingsPostFxSubtab is on in the config and " &
+         "this still prints, the chain ran after the build."
+    return
   let screenGo = iGameObjectOf(screenT)
-  if screenGo == nil: return
+  if screenGo == nil:
+    warn "native subtabs: NOT BUILDING -- the SettingsScreen GameObject could " &
+         "not be reached from " & iPtr(screenT) & "."
+    return
   ntCrumb("subtabs: locating the strip donor (and, for step 2, the stock panel)")
   # The stock Graphics panel is only needed by the PANEL-SWITCHING kind. For
   # the MODS kind there is no second panel: our own panel stays up and its rows
@@ -1141,7 +1157,12 @@ proc ntBuildSubtabs(screenT: Il2CppPtr; captions: seq[string];
   gNtSubSel = 0
   discard modsSetActive(stripGo, false)   # raised only while our tab is up
   ntCrumb("subtabs: COMPLETE")
-  okLog "native subtabs: built the GRAPHICS SETTINGS | POSTFX strip as a " &
+  var capList = ""
+  var ci = 0
+  while ci < captions.len and ci < NtMaxSubs:
+    capList = capList & (if ci > 0: " | " else: "") & captions[ci]
+    ci = ci + 1
+  okLog "native subtabs: built the " & capList & " strip as a " &
         "SIBLING of the panels it switches, not inside either one. That is " &
         "the whole difference from the five earlier attempts: the strip is " &
         "in no stock LayoutGroup, so no stock geometry can be re-arranged by " &
@@ -1149,11 +1170,30 @@ proc ntBuildSubtabs(screenT: Il2CppPtr; captions: seq[string];
         "switch. Exclusivity comes from the CLONED ToggleGroup, not from us."
   result = true
 
-proc ntDestroyChildrenOf(rt: Il2CppPtr): int =
-  ## Destroy every child of `rt`, bounded. Used to swap one mod's rows for
-  ## another's -- `Object::Destroy` on a valid object cannot throw, which is
-  ## why this is done by hand rather than through any SettingsTab method (both
-  ## of those were measured to unwind a managed exception through our frame).
+proc ntRetireChildrenOf(rt: Il2CppPtr): int =
+  ## Take the donor's rows OUT OF THE WAY -- by switching them off, NEVER by
+  ## destroying them.
+  ##
+  ## THIS REPLACES `Object::Destroy`, AND IT REPLACES IT BECAUSE THE CLIENT
+  ## DIED. The first boot that emptied TWO panel clones (80 rows destroyed)
+  ## crashed during the next raid LOAD, top frame
+  ## `il2cpp_unity_liveness_calculation_from_root` -- the managed liveness walk
+  ## at the scene transition. The boot before it emptied ONE clone (40 rows)
+  ## and loaded a raid fine.
+  ##
+  ## The mechanism that fits: a destroyed row is still REFERENCED from a stock
+  ## managed list -- the tab's `_createdControls`, the screen's tab list, a
+  ## ToggleGroup's toggle list -- and the liveness walk dereferences the dead
+  ## native object behind a live managed shell (fact #182 is the same hazard
+  ## seen from the other side). We cannot audit those lists: they are
+  ## `List<T>`, an instantiated generic whose layout is NOT reachable offline,
+  ## and reading one with a guessed offset to prove safety would be its own
+  ## defect.
+  ##
+  ## So the object stays ALIVE and merely stops rendering. An inactive child is
+  ## excluded from layout and from draw, which is everything we actually
+  ## needed; it was never necessary for it to cease to exist. This is strictly
+  ## less invasive than what it replaces and it removes the whole class.
   result = 0
   if not nuOk(rt, 0x10'i32): return
   var kids = 0
@@ -1165,8 +1205,24 @@ proc ntDestroyChildrenOf(rt: Il2CppPtr): int =
     if c == nil or not duOk(c, 0x20'i32): continue
     let go = iGameObjectOf(c)
     if go == nil: continue
-    if nuDestroy(go): result = result + 1
+    if modsGoActive(go) and modsSetActive(go, false):
+      result = result + 1
 
+proc ntActiveChildCount(rt: Il2CppPtr): int =
+  ## How many children of `rt` are ACTIVE. The verdict counts these rather
+  ## than all children, because the donor's rows are now retired-in-place
+  ## instead of destroyed, so the container legitimately still holds them.
+  result = 0
+  if not nuOk(rt, 0x10'i32): return
+  var kids = 0
+  if not iChildCount(rt, kids): return
+  var k = 0
+  while k < kids and k < NtMaxRowDestroy:
+    let c = iChildAt(rt, k)
+    k = k + 1
+    if c == nil or not duOk(c, 0x20'i32): continue
+    let go = iGameObjectOf(c)
+    if go != nil and modsGoActive(go): result = result + 1
 proc ntRenderModPage(sel: int): int =
   ## Render the selected mod's page into our MODS panel's row root, replacing
   ## whatever was there.
@@ -1184,7 +1240,7 @@ proc ntRenderModPage(sel: int): int =
   if pi < 0 or pi >= gSwPages.len: return
   let rootGo = iGameObjectOf(gNtModsRowRoot)
   if rootGo == nil: return
-  let cleared = ntDestroyChildrenOf(gNtModsRowRoot)
+  let cleared = ntRetireChildrenOf(gNtModsRowRoot)
   # `renderedFor` is `swRenderPage`'s own guard against drawing the same page
   # onto the same tab twice. We DO want it drawn again -- the rows it drew
   # last time have just been destroyed -- so the bookkeeping is reset rather
@@ -1362,9 +1418,20 @@ proc ntVerdict(why: string) =
           names & ". Read back off the live GameObjects, not from what we " &
           "wrote."
   elif active == 1 and gNtShown < 0 and not oursActive:
-    okLog "native tabs VERDICT PASS (" & why & "): a stock tab is selected " &
-          "and exactly one STOCK panel is active -- " & names & ". Ours is " &
-          "off. The stock screen is undisturbed."
+    # SAY WHETHER THAT WAS THE POINT. During the proof we have just pressed one
+    # of ours, so "a stock tab is selected" is a FAILURE of the press dressed
+    # as a pass. Outside the proof it is the correct resting state.
+    if gNtProofPhase == 2:
+      warn "native tabs VERDICT FAIL (" & why & "): we pressed our tab '" &
+           (if gNtId.len > 0: gNtId[0] else: "?") & "' and yet a STOCK panel " &
+           "is the one active -- " & names & " -- with our selection reading " &
+           $gNtShown & ". The press did not take: either the postfix never " &
+           "saw it, or the stock ToggleGroup cleared ours again."
+    else:
+      okLog "native tabs VERDICT PASS (" & why & "): a stock tab is selected " &
+            "and exactly one STOCK panel is active -- " & names & ". Ours is " &
+            "off, which is the correct resting state when the player has not " &
+            "chosen one of our " & $gNtPanelGo.len & " tab(s)."
   elif active == 0:
     warn "native tabs VERDICT FAIL (" & why & "): NO panel under " &
          "SettingsScreen is active, so the screen is blank. Our selection " &
@@ -1374,6 +1441,102 @@ proc ntVerdict(why: string) =
          "are active at once under SettingsScreen -- " & names &
          " (ours active=" & $oursActive & ", selection=" & $gNtShown &
          "). Exactly one is the only correct answer."
+proc ntInventory(when0: string) =
+  ## ONE LINE naming every object we created and where it is parented.
+  ##
+  ## Logged at build and at teardown so the next crash report can be matched
+  ## against what we actually put in the scene. The crash that prompted this
+  ## (`il2cpp_unity_liveness_calculation_from_root`, during the raid load,
+  ## only on boots where Settings was opened) could not be attributed because
+  ## nothing recorded WHAT we had left behind or WHERE.
+  var s2 = "native tabs INVENTORY (" & when0 & "): "
+  s2 = s2 & $gNtPanelGo.len & " tab panel(s)"
+  var i = 0
+  while i < gNtPanelGo.len and i < NtMaxTabs:
+    s2 = s2 & " [" & (if i < gNtId.len: gNtId[i] else: "?") & " panel=" &
+         iPtr(gNtPanelGo[i]) & " toggle=" &
+         (if i < gNtToggle.len: iPtr(gNtToggle[i]) else: "nil") & "]"
+    i = i + 1
+  s2 = s2 & "; " & $gNtToggle.len & " tab toggle(s) in the STOCK tab-bar " &
+       "ToggleGroup; " & $gNtSubToggle.len & " subtab toggle(s) in a CLONED " &
+       "group; strip=" & iPtr(gNtSubStripGo) & "; controls-MODS toggle=" &
+       iPtr(gNtKbToggle) & " panel=" & iPtr(gNtKbPanelGo) & "; " &
+       "donor rows are RETIRED (SetActive false), never destroyed."
+  okLog s2
+
+proc ntDetachFromStockGroups(): int =
+  ## Take every toggle of ours OUT of the game's ToggleGroups.
+  ##
+  ## THE CRASH HYPOTHESIS THIS ADDRESSES. The client died in the raid LOAD,
+  ## in `il2cpp_unity_liveness_calculation_from_root`, on every boot where
+  ## Settings had been opened and on none where it had not. A `ToggleGroup`
+  ## holds a managed list of its member Toggles; ours joined the STOCK group
+  ## (that is what makes tab exclusivity native) and then went away with the
+  ## SettingsScreen. A member that is destroyed while still listed is exactly
+  ## the kind of dangling reference a liveness walk trips over.
+  ##
+  ## We cannot READ that list to prove it -- `List<Toggle>` is an instantiated
+  ## generic with no offline layout, and a guessed offset into a live
+  ## collection would be a worse defect than the one being fixed. So instead
+  ## of auditing it we stop being in it: `set_group(null)` is the property the
+  ## game itself uses to leave a group, and it does the unregistering for us.
+  result = 0
+  var i = 0
+  while i < gNtToggle.len and i < NtMaxTabs:
+    if gNtToggle[i] != nil and iUnityAlive(gNtToggle[i]):
+      if nuToggleSetGroup(gNtToggle[i], nil): result = result + 1
+    i = i + 1
+  var j = 0
+  while j < gNtSubToggle.len and j < NtMaxSubs:
+    if gNtSubToggle[j] != nil and iUnityAlive(gNtSubToggle[j]):
+      if nuToggleSetGroup(gNtSubToggle[j], nil): result = result + 1
+    j = j + 1
+  if gNtKbToggle != nil and iUnityAlive(gNtKbToggle):
+    if nuToggleSetGroup(gNtKbToggle, nil): result = result + 1
+
+proc ntTeardown(why: string) =
+  ## The SettingsScreen is going away. Leave nothing of ours registered in
+  ## anything of the game's, and forget every pointer.
+  if not (gNtBuilt or gNtSubBuilt or gNtKbBuilt): return
+  ntInventory("teardown: " & why)
+  let detached = ntDetachFromStockGroups()
+  okLog "native tabs TEARDOWN (" & why & "): detached " & $detached &
+        " toggle(s) from the game's ToggleGroups via set_group(null), and " &
+        "dropped every cached pointer. Nothing of ours is left registered in " &
+        "a stock collection across the scene transition -- which is the " &
+        "shape the raid-load liveness crash had. Our objects are not " &
+        "destroyed here: they belong to the SettingsScreen and go with it."
+  gNtToggle = @[]
+  gNtPanelGo = @[]
+  gNtTabComp = @[]
+  gNtRowRoot = @[]
+  gNtId = @[]
+  gNtSpawnerGo = @[]
+  gNtStockPanels = @[]
+  gNtStockWasOn = @[]
+  gNtSubToggle = @[]
+  gNtSubPageIdx = @[]
+  gNtSubStripGo = nil
+  gNtGfxPanelGo = nil
+  gNtGameToggle = nil
+  gNtModsRowRoot = nil
+  gNtKbToggle = nil
+  gNtKbPanelGo = nil
+  gNtKbRowRoot = nil
+  gNtKbTemplate = nil
+  gNtShown = -1
+  gNtSubSel = 0
+  gNtSubN = 0
+  gNtKbRows = 0
+  gNtBuilt = false
+  gNtSubBuilt = false
+  gNtKbBuilt = false
+  gNtModsPanelIdx = -1
+  gNtProofPhase = 0
+  gNtVerdictSaid = false
+  gNtSubVerdictSaid = false
+  gNtKbVerdictSaid = false
+
 proc ntTickBody() =
   ## Every frame while armed. Steady state: two boolean tests and, once built,
   ## one integer compare -- the press arrives from the detour, not from a hunt.
@@ -1413,6 +1576,9 @@ proc ntTickBody() =
     gNtStep = "tick: ntBuild returned without faulting"
     return
   if gModsLastTabPtr == nil:
+    # THE SCREEN IS GONE. Detach and forget BEFORE the scene transition, not
+    # after: the crash happened during the raid load, which is after this.
+    ntTeardown("the settings screen closed")
     gNtVerdictSaid = false
     return
   # THE EVENT, drained. `gNtPressed` is set by the Toggle::Set postfix only
@@ -1512,8 +1678,13 @@ proc ntTickBody() =
       gNtProofPhase = 1
       gNtProofWait = 2
     elif gNtProofPhase == 1:
+      let proofId = (if gNtId.len > 0: gNtId[0] else: "?")
       if gNtToggle.len > 0 and nuTogglePress(gNtToggle[0], true):
-        okLog "native tabs PROOF: pressed OUR tab through " &
+        okLog "native tabs PROOF: pressed OUR tab '" & proofId & "' (index 0 " &
+              "of " & $gNtToggle.len & " native tab(s) -- naming it because " &
+              "with more than one of ours, 'our tab' is ambiguous and a " &
+              "verdict that says 'ours is off' cannot be read without it) " &
+              "through " &
               "Toggle::Set(true, sendCallback=true) -- the game's own " &
               "onValueChanged and the stock ToggleGroup run exactly as they " &
               "would for the player. Judging in " & $NtProofSettle & " frames."

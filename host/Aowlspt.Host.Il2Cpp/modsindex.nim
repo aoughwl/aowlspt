@@ -340,9 +340,13 @@ const cKbMaxBinds = 128           ## rule 4: bounds the parse and the rows
 
 type
   KbBind = object
+    ## One RENDERED ROW. Headings are rows too: the route groups binds under
+    ## mods, and a flat list would lose which mod owns which action.
     modName*: string
     action*: string
     key*: string
+    heading*: bool          ## a mod name, drawn as a row with no key
+    unbound*: bool          ## the route served no `value` for this bind
 
 var gKbPhase = miIdle
 var gKbArmedAt = 0'u64
@@ -360,36 +364,159 @@ proc kbFail(why: string) =
   warn "keybinds: " & why & ". The CONTROLS>MODS page lists nothing; the " &
        "stock Controls pages are untouched and nothing was written."
 
+proc kbIsSwitch(v: string): bool =
+  ## `true`/`false` are ENABLE SWITCHES, not binds. `aowl.maps hotkeys` and
+  ## `aowl.fovfix holdToZoom` both arrive in the keybind list with boolean
+  ## values; rendering them in a KEY column would put the word 'true' where a
+  ## player expects a key. They are skipped and named in the log rather than
+  ## shown, because a keybind page that lists a non-key is lying about what it
+  ## is a page of.
+  v == "true" or v == "false"
+
+proc kbAllDigits(v: string): bool =
+  if v.len == 0: return false
+  var i = 0
+  while i < v.len:
+    if v[i] < '0' or v[i] > '9': return false
+    i = i + 1
+  true
+
+proc kbKeyLabel(val: string): string =
+  ## Render a served value as something a player can read.
+  ##
+  ## A bare ORDINAL is a `UnityEngine.KeyCode` number (measured: `aowl.debug
+  ## overlayToggleKey value=114`, and 114 is KeyCode.R). It is resolved
+  ## through the table generated from the client's own metadata; an ordinal
+  ## this build does not declare shows as `KeyCode <n>` so an unknown number
+  ## reads as an unknown number rather than as a wrong key.
+  if not kbAllDigits(val):
+    return val
+  var n = 0
+  var i = 0
+  while i < val.len and i < 9:
+    n = n * 10 + (int(val[i]) - int('0'))
+    i = i + 1
+  let nm = ntKeyCodeName(int32(n))
+  if nm.len > 0: nm else: "KeyCode " & val
+
 proc kbParse(doc: string): bool =
-  ## `{"binds":[{mod,action,key}, ...]}` -- the documented shape of
-  ## `/aowlspt/keybinds`. Built against the documented shape, and it must fail
-  ## CLEANLY on a body that is not it rather than render half a page.
+  ## THE REAL SHAPE, measured off the wire rather than assumed:
+  ##
+  ##   {"mods":[{"guid":..,"name":..,"client":..,
+  ##             "keybinds":[{"key":..,"settingKey":..,"action":..,
+  ##                          "description":..,"value":..,"default":..}]}]}
+  ##
+  ## The first version of this parser was written against `{"binds":[...]}`,
+  ## which the route never served. It would have refused cleanly rather than
+  ## rendering nonsense -- but it would still have been wrong, and the honest
+  ## record is that the shape came from a measurement, not from my guess.
+  ##
+  ## `key` IS NOT THE BOUND KEY. It is the SETTING key (e.g. `zoomToggleKey`).
+  ## The bound KeyCode is `value`, which the backend is adding now -- so a
+  ## missing `value` is EXPECTED today and is rendered as unbound rather than
+  ## as a blank, and never as the setting key pretending to be a key.
   result = false
-  var items: seq[string] = @[]
-  if not pathItems(doc, "binds", items):
-    kbFail("the keybind index did not parse as a binds array (" & $doc.len &
-           " byte(s) received) -- either an older route or an error body")
+  var mods: seq[string] = @[]
+  if not pathItems(doc, "mods", mods):
+    kbFail("the keybind index has no `mods` array (" & $doc.len &
+           " byte(s) received). That is the field this parser needs and the " &
+           "one it could not find -- either an older route or an error body")
     return
   gKbBinds = @[]
-  var i = 0
-  while i < items.len and gKbBinds.len < cKbMaxBinds:
-    var m = ""
-    var a = ""
-    var k = ""
-    discard pathGet(items[i], "mod", m)
-    discard pathGet(items[i], "action", a)
-    discard pathGet(items[i], "key", k)
-    if a.len > 0:
-      gKbBinds.add KbBind(modName: m, action: a,
-                          key: (if k.len > 0: k else: "(unbound)"))
-    i = i + 1
-  if items.len > cKbMaxBinds:
-    gKbTruncated = items.len - cKbMaxBinds
-    warn "keybinds: the route served " & $items.len & " bind(s) and this " &
-         "host renders at most " & $cKbMaxBinds & "; " & $gKbTruncated &
-         " are NOT listed. Reported rather than silently dropped."
-  result = gKbBinds.len > 0
-
+  var missingValue = 0
+  var skipped = 0
+  var skippedNames = ""
+  var modsWithBinds = 0
+  var m = 0
+  while m < mods.len and m < cKbMaxBinds:
+    var name = ""
+    var guid = ""
+    discard pathGet(mods[m], "name", name)
+    discard pathGet(mods[m], "guid", guid)
+    var items: seq[string] = @[]
+    discard pathItems(mods[m], "keybinds", items)
+    # A MOD WITH NO BINDS IS NOT AN ERROR. Most mods have none; listing them
+    # as empty headings would bury the ones that do.
+    if items.len == 0:
+      m = m + 1
+      continue
+    modsWithBinds = modsWithBinds + 1
+    if gKbBinds.len < cKbMaxBinds:
+      gKbBinds.add KbBind(modName: (if name.len > 0: name else: guid),
+                          action: (if name.len > 0: name else: guid),
+                          key: "", heading: true, unbound: false)
+    var i = 0
+    while i < items.len and gKbBinds.len < cKbMaxBinds:
+      var act = ""
+      var setKey = ""
+      var val = ""
+      discard pathGet(items[i], "action", act)
+      discard pathGet(items[i], "settingKey", setKey)
+      if setKey.len == 0: discard pathGet(items[i], "key", setKey)
+      var err = ""
+      var dflt = ""
+      discard pathGet(items[i], "default", dflt)
+      discard pathGet(items[i], "error", err)
+      # `pathGet` RETURNS THE LITERAL TEXT `null` FOR A JSON NULL, so a bare
+      # `val.len > 0` is true for `"value":null` and the page would print the
+      # word "null" as the bound key. That is a confidently wrong answer in the
+      # one column the player actually reads, so it is guarded explicitly
+      # rather than left to the length test.
+      var haveVal = pathGet(items[i], "value", val)
+      if haveVal and (val.len == 0 or val == "null"):
+        haveVal = false
+      if not haveVal: missingValue = missingValue + 1
+      # SKIP ENABLE SWITCHES. Named in the log so 'my mod's toggle is missing'
+      # has an answer that is not a shrug.
+      if kbIsSwitch(val) or kbIsSwitch(dflt):
+        skipped = skipped + 1
+        if skippedNames.len < 200:
+          skippedNames = skippedNames & (if skippedNames.len > 0: ", " else: "") &
+                         (if name.len > 0: name else: guid) & "." & setKey
+        i = i + 1
+        continue
+      if act.len > 0 or setKey.len > 0:
+        gKbBinds.add KbBind(
+          modName: (if name.len > 0: name else: guid),
+          action: (if act.len > 0: act else: setKey),
+          # THREE DIFFERENT REASONS FOR NO KEY, and they are not the same
+          # thing to a player: the route could not resolve the setting at all
+          # (`error`), the mod declares a default but nothing is bound, or the
+          # bind is legitimately empty. Only the first is a fault.
+          key: (if haveVal: kbKeyLabel(val)
+                elif err.len > 0 and err != "null": setKey & " (" & err & ")"
+                elif dflt.len > 0 and dflt != "null":
+                  setKey & " (unbound, default " & kbKeyLabel(dflt) & ")"
+                else: setKey & " (unbound)"),
+          heading: false, unbound: not haveVal)
+      i = i + 1
+    m = m + 1
+  if gKbBinds.len >= cKbMaxBinds:
+    gKbTruncated = 1
+    warn "keybinds: the row cap of " & $cKbMaxBinds & " was reached, so some " &
+         "binds are NOT listed. Reported rather than silently dropped."
+  if missingValue > 0:
+    warn "keybinds: " & $missingValue & " bind(s) arrived with no `value` " &
+         "field, so their key column shows the SETTING key marked " &
+         "(unbound) rather than a KeyCode. `value` is the field that carries " &
+         "the actual bind; a JSON null there is reported as unbound rather " &
+         "than printed as the word null, which is what a bare length test " &
+         "would have done."
+  if gKbBinds.len == 0:
+    kbFail("the keybind index parsed and " & $mods.len & " mod(s) were " &
+           "listed, but NONE declared a non-empty `keybinds` array, so there " &
+           "is nothing to show")
+    return
+  if skipped > 0:
+    okLog "keybinds: skipped " & $skipped & " entry/entries whose value is " &
+          "true/false -- they are ENABLE SWITCHES, not binds, and a key " &
+          "column showing the word 'true' would misrepresent the page: " &
+          skippedNames
+  okLog "keybinds: parsed " & $modsWithBinds & " mod(s) with binds out of " &
+        $mods.len & " served, giving " & $gKbBinds.len & " row(s) " &
+        "(headings included). Mods with no keybinds are skipped rather than " &
+        "listed as empty headings."
+  result = true
 proc kbArm*(now: uint64) =
   ## Armed on the CONTROLS>MODS subtab's show edge, once per session.
   if gKbPhase != miIdle: return

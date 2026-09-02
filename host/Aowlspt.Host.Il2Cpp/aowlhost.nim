@@ -7986,6 +7986,10 @@ include "modsettingsrender.nim"
 ## THE MODS TAB'S DATA. AFTER `modsettingsrender.nim` because it reuses that
 ## file's `modSetParseF64`, and after `settingspages.nim` for `SwPage`/`SwRow`/
 ## `swPageRegister`. `modstab.nim` forward-declares `miArm`/`miTick`.
+## GENERATED (tools/gen_keycodes.py) from the same global-metadata the client
+## runs: UnityEngine.KeyCode ordinal -> name. Included BEFORE modsindex, which
+## uses it to render a bare ordinal keybind as a key name instead of a number.
+include "keycodes.nim"
 include "modsindex.nim"
 
 ## STEP 1 of docs/NATIVETABS.md. After `modstab.nim` for `modsClone` /
