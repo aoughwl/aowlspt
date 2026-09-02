@@ -38,6 +38,12 @@ aowl -- build, test and install aowlspt
                      verify probe mods examples deploy
                      `deploy` = every artifact tools\deploy.json ships,
                      read from that file so the two can never drift
+  build mod NAME     ONE mod under mods\, through the same buildMod path
+                     `build mods` uses -- same audits, one compile
+  build mods A,B     several by name; `build mods` with no list is all of them
+  build test NAME    ONE tests\NAME.nim -> installer\build\NAME.exe, with the
+                     flags `aowl test` compiles it with (same proc, so the
+                     two cannot drift). Compiles it; does not run it.
   bootstrap          rebuild aowl.exe ITSELF -- `build` never does, and a
                      worktree with no aowl.exe or a stale one runs old code
                      while reporting ok
@@ -74,6 +80,12 @@ aowl -- build, test and install aowlspt
 
 Options
   --debug            build with debug info and no optimisation
+  --allow-stale-driver
+                     build even though aowl.exe was not built from this
+                     worktree's tools\aowl.nim. Normally that REFUSES (exit
+                     4), because a build step defined on the current source
+                     then goes silently unexercised -- it has bitten three
+                     agents. The fix is `python tools\buildlock.py bootstrap`.
   --no-lock          allow `build` OUTSIDE tools\buildlock.py. Normally
                      `build` refuses unless AOWL_BUILDLOCK is set, because
                      two builds in ONE checkout corrupt each other and an
@@ -95,6 +107,10 @@ type
     oneMod: string
       ## `test --mod NAME`: run only that mod's `core/selftest`. Empty means the
       ## whole suite, which is the default and stays the default.
+    allowStaleDriver: bool
+      ## `--allow-stale-driver`: build with an aowl.exe that was not built from
+      ## this worktree's `tools/aowl.nim`. Default false, and the default is a
+      ## REFUSAL rather than a warning -- see `refuseIfStaleDriver`.
 
 var failures = 0
 
@@ -1459,7 +1475,7 @@ proc driverStampPath(e: Env): string =
 proc driverSource(e: Env): string =
   result = joinPath(e.repo, "tools\\aowl.nim")
 
-proc warnStaleDriver(e: Env) =
+proc staleDriverReason(e: Env): string =
   ## The trap this exists for, which has cost real time more than once:
   ##
   ## **`aowl build` does not build `aowl.exe`.** Nothing does -- there is no
@@ -1471,19 +1487,28 @@ proc warnStaleDriver(e: Env) =
   ## change you made did not run. The build is a success and the edit did not
   ## ship. Nothing anywhere says so.
   ##
-  ## `aowl bootstrap` is the fix; this is the detector.
+  ## `aowl bootstrap` is the fix; this is the detector. It returns the REASON,
+  ## empty when the driver beside this source is the driver that was built from
+  ## it. `refuseIfStaleDriver` turns a reason into an exit code -- this used to
+  ## only warn, and a warning printed above four minutes of `ok` lines is a
+  ## warning nobody reads.
+  ##
+  ## An empty stamp for the SOURCE (unreadable `tools/aowl.nim`) returns "" --
+  ## that is "I could not look", and it must not read as either verdict; it is
+  ## the one case where nothing is asserted, and the driver source is missing
+  ## only in a payload-shaped tree that is not building anyway.
+  result = ""
   let exe = joinPath(e.repo, "installer\\build\\aowl.exe")
   let now = textStamp(driverSource(e))
   if now.len == 0:
-    return
+    return ""
   var was = ""
   discard readTextFile(driverStampPath(e), was)
   if not fileExists(exe):
-    warn "there is no installer\\build\\aowl.exe in this worktree"
-    note "run `aowl bootstrap` -- `aowl build` never builds the driver itself"
-    return
+    return "there is no installer\\build\\aowl.exe in this worktree, so the " &
+           "driver running this build was not built from this source"
   if was == now:
-    return
+    return ""
   # Three states, not two. Collapsing the middle one is what made this warning
   # fire on EVERY invocation in a fresh worktree and trained people to ignore
   # it -- and a warning that always fires is worth less than no warning, since
@@ -1495,17 +1520,36 @@ proc warnStaleDriver(e: Env) =
   # checkout's aowl.nim), so it still warns -- but it is a different fault with
   # a different fix, and it now says which one it is.
   if was.len == 0:
-    warn "installer\\build\\aowl.exe has NO build stamp beside it"
-    note "it was not built from this worktree's tools\\aowl.nim -- most likely " &
-         "copied in from another checkout, in which case it runs THAT " &
-         "checkout's driver and any build step added on this branch goes " &
-         "silently unexercised"
-    note "run `aowl bootstrap` (or powershell tools\\bootstrap.ps1) to replace " &
-         "it with a local build; that writes the stamp and this stops"
-    return
-  warn "tools\\aowl.nim has changed since aowl.exe was last built"
-  note "this build is running the OLD driver; your change to it is not in it"
-  note "run `aowl bootstrap`, then build again"
+    return "installer\\build\\aowl.exe has NO build stamp beside it -- it was " &
+           "not built from this worktree's tools\\aowl.nim, most likely copied " &
+           "in from another checkout, in which case it runs THAT checkout's " &
+           "driver and any build step added on this branch goes silently " &
+           "unexercised"
+  result = "tools\\aowl.nim has changed since aowl.exe was last built -- this " &
+           "build would run the OLD driver, and your change to it is not in it"
+
+proc refuseIfStaleDriver(e: Env): int =
+  ## REFUSE, do not warn. CLAUDE.md section 3: "a build step defined on your
+  ## branch goes SILENTLY UNEXERCISED -- this has bitten three agents." The
+  ## detector was already correct and already printed; what it could not do was
+  ## stop the build, so the evidence scrolled past and the build reported ok.
+  ##
+  ## Exit 4, the same code `build` outside the lock uses, because it is the
+  ## same kind of fault: the command did nothing, and it must not be mistaken
+  ## for a compile failure (1) by anything reading the exit code.
+  let why = staleDriverReason(e)
+  if why.len == 0:
+    return 0
+  if e.allowStaleDriver:
+    warn why
+    note "continuing anyway: --allow-stale-driver was passed. Anything you " &
+         "changed in tools\\aowl.nim is NOT in this build."
+    return 0
+  err "REFUSED: " & why
+  note "run `python tools\\buildlock.py bootstrap` (it takes the same lock), " &
+       "then build again"
+  note "pass --allow-stale-driver to build with the driver you have anyway"
+  result = 4
 
 proc seedCache(e: Env): bool =
   ## `.cache\global-metadata.dec.dat` is gitignored, so it is NOT shared between
@@ -1789,7 +1833,159 @@ proc cmdWorktreeInit(e: Env): int =
   discard seedCache(e)
   result = cmdBootstrap(e)
 
-proc cmdBuildOne(e: Env; target: string): int =
+proc commaParts(spec: string): seq[string] =
+  ## `a,b , c` -> @["a", "b", "c"]. Hand-rolled: this file is nimony, and the
+  ## `split`/`sequtils` surface it would otherwise reach for is not in use
+  ## anywhere else here.
+  result = @[]
+  var cur = ""
+  var i = 0
+  while i < spec.len:
+    if spec[i] == ',':
+      let p = strip(cur)
+      if p.len > 0:
+        result.add p
+      cur = ""
+    else:
+      cur.add spec[i]
+    inc i
+  let last = strip(cur)
+  if last.len > 0:
+    result.add last
+
+proc modNameOf(raw: string): string =
+  ## Accept `maps`, `mods\maps` and `mods/maps` for the same mod. An agent that
+  ## has just typed `aowl build-mod mods\maps` will type the path here too, and
+  ## refusing it by name would be a refusal that is technically right and
+  ## useless.
+  var s = raw
+  if s.startsWith("mods\\") or s.startsWith("mods/"):
+    s = s.substr(5, s.len - 1)
+  while s.len > 0 and (s[s.len - 1] == '\\' or s[s.len - 1] == '/'):
+    s = s.substr(0, s.len - 2)
+  result = s
+
+proc buildNamedMods(e: Env; spec: string): int =
+  ## `aowl build mod maps` / `aowl build mods maps,tarkov`.
+  ##
+  ## MEASURED 2026-09-02: there was no way to rebuild ONE mod under the build
+  ## lock. `tools/buildlock.py` can only exec `aowl <target>`, `build-mod` is a
+  ## separate verb rather than a target, and so a one-mod change cost either a
+  ## full `build mods` (all of them) or a hand-run nimony/modbuild -- the
+  ## unserialised path CLAUDE.md section 3 exists to forbid. Agents took both.
+  ##
+  ## It goes through `buildMod`, the SAME proc `build mods` calls per mod, so
+  ## the escaping-import audit, the declared-setting-keys audit, the symbol
+  ## table and index gates, the cleared-cache retry and `placeLibrary` all still
+  ## run. A second compile path for "just one mod" would be two builds that
+  ## differ for reasons nobody can see.
+  ##
+  ## Every name is resolved BEFORE anything is compiled: a typo in the second
+  ## of two names must not cost the first one's build, and it must not be
+  ## discovered four minutes in.
+  let names = commaParts(spec)
+  if names.len == 0:
+    err "`build mod` needs a mod name, e.g. `aowl build mod maps`"
+    return 1
+  var dirs: seq[string] = @[]
+  var bad = 0
+  for raw in names:
+    let name = modNameOf(raw)
+    var found = ""
+    for m in modDirs(e):
+      if baseName(m) == name:
+        found = m
+    if found.len == 0:
+      err "no such mod: " & name & " (looked for " &
+          joinPath(joinPath(e.repo, "mods"), name) & ")"
+      inc bad
+    else:
+      dirs.add found
+  if bad > 0:
+    var known = ""
+    for m in modDirs(e):
+      if known.len > 0:
+        known.add " "
+      known.add baseName(m)
+    note "mods here: " & known
+    return 1
+  for d in dirs:
+    discard buildMod(e, d)
+  result = if failures > 0: 1 else: 0
+
+const TestTargets = "tickrace regrace mapsdiag natesplog tuilayout bsgwiretest"
+
+proc testExePath(e: Env; name: string): string =
+  result = joinPath(e.repo, "installer\\build\\" & name & ".exe")
+
+proc testBuildCmd(e: Env; name: string; outExe: string): string =
+  ## THE one place a `tests\<name>.nim` compile line is written.
+  ##
+  ## `aowl test` calls this and so does `aowl build test <name>`, which is the
+  ## whole point: the per-test flags used to be six near-identical inline
+  ## blocks, so the only way to build one test alone was the 18-minute `aowl
+  ## test` or hand-typing nimony's line from memory -- and an agent did exactly
+  ## that on 2026-09-02. A hand-copied line drifts from the gate's line, and a
+  ## test that passes under different flags than the gate uses has proved
+  ## nothing about the gate.
+  ##
+  ## Returns "" for a name that `aowl test` does not compile. That is a
+  ## REFUSAL, not a default: inventing a plausible `-p:` set here would build a
+  ## different binary from the one the suite runs.
+  var cmd = quoted(nimonyExe(e))
+  cmd.add " c"
+  cmd.add abiInclude(e)
+  case name
+  of "tickrace", "regrace":
+    cmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
+    cmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
+  of "mapsdiag":
+    cmd.add " -p:" & quoted(joinPath(e.repo, "mods\\maps"))
+  of "natesplog":
+    cmd.add " -p:" & quoted(joinPath(e.repo, "host\\Aowlspt.Host.Il2Cpp"))
+  of "tuilayout":
+    cmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
+    cmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
+    cmd.add " -p:" & quoted(joinPath(e.repo, "tools"))
+  of "bsgwiretest":
+    cmd.add " --passL:-lws2_32 --passL:-lz"
+    cmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
+    cmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
+    cmd.add " -p:" & quoted(joinPath(e.repo, "backend"))
+  else:
+    return ""
+  cmd.add " -o:" & quoted(outExe)
+  cmd.add " " & quoted(joinPath(e.repo, "tests\\" & name & ".nim"))
+  result = cmd
+
+proc cmdBuildTest(e: Env; name: string): int =
+  ## Build ONE test binary. Does not run it -- `aowl test` runs the suite, and
+  ## a build target that also ran things would make `build` mean two things.
+  let exe = testExePath(e, name)
+  let cmd = testBuildCmd(e, name, exe)
+  if cmd.len == 0:
+    err "no such test target: " & name
+    if fileExists(joinPath(e.repo, "tests\\" & name & ".nim")):
+      note "tests\\" & name & ".nim EXISTS, but `aowl test` does not compile " &
+           "it, so there are no flags to copy. Add it to testBuildCmd with " &
+           "the -p: paths it needs; guessing them here would build a " &
+           "different binary from any gate."
+    note "test targets: " & TestTargets
+    return 1
+  # Removed first, so that a compile which fails cannot leave the PREVIOUS
+  # binary sitting there looking like a fresh one -- the same trap `buildMod`
+  # documents for mod .dlls.
+  discard removeFileAt(exe)
+  if not run(e, "test " & name & " builds", cmd, e.repo):
+    return 1
+  if not fileExists(exe):
+    err "nimony reported success but " & exe & " is not there"
+    inc failures
+    return 1
+  ok "built " & exe
+  result = 0
+
+proc cmdBuildOne(e: Env; target: string; name: string): int =
   ## One named target, for the loop that dominates a working day: change one
   ## file, rebuild the one thing that contains it.
   ##
@@ -1799,8 +1995,13 @@ proc cmdBuildOne(e: Env; target: string): int =
   ## host DLL alone is a fraction of a full build, and a rebuild with nothing
   ## changed is a fraction of a second, because nimony's incremental cache is
   ## very good. What was missing was a way to *ask* for one target.
+  ##
+  ## `name` is the SECOND positional -- `build mod maps`, `build mods a,b`,
+  ## `build test mapsdiag`. Empty for every other target.
+  let stale = refuseIfStaleDriver(e)
+  if stale != 0:
+    return stale
   dropStaleCaches(e)
-  warnStaleDriver(e)
   case target
   of "host", "il2cpp":
     result = if buildIl2CppHost(e): 0 else: 1
@@ -1839,9 +2040,29 @@ proc cmdBuildOne(e: Env; target: string): int =
   of "maptiles", "tiles":
     result = if buildMapTiles(e): 0 else: 1
   of "mods":
-    for m in modDirs(e):
-      discard buildMod(e, m)
-    result = if failures > 0: 1 else: 0
+    # `build mods` with no list is still every mod -- unchanged. With a list it
+    # is exactly those.
+    if name.len > 0:
+      result = buildNamedMods(e, name)
+    else:
+      for m in modDirs(e):
+        discard buildMod(e, m)
+      result = if failures > 0: 1 else: 0
+  of "mod":
+    if name.len == 0:
+      err "`build mod` needs a name, e.g. `aowl build mod maps`"
+      note "`aowl build mods` (plural, no name) builds every mod"
+      result = 1
+    else:
+      result = buildNamedMods(e, name)
+  of "test", "tests":
+    if name.len == 0:
+      err "`build test` needs a name, e.g. `aowl build test mapsdiag`"
+      note "test targets: " & TestTargets
+      note "`aowl test` (no `build`) runs the whole suite"
+      result = 1
+    else:
+      result = cmdBuildTest(e, name)
   of "examples":
     for m in exampleDirs(e):
       discard buildMod(e, m)
@@ -1854,14 +2075,18 @@ proc cmdBuildOne(e: Env; target: string): int =
     err "unknown build target: " & target
     note "targets: host backend sim launch installer emutest verify probe " &
          "settings realtest maptiles mods examples deploy"
+    note "one mod: `aowl build mod maps`; several: `aowl build mods maps,tarkov`"
+    note "one test: `aowl build test NAME` -- " & TestTargets
     note "or a mod path, with `aowl build-mod mods\\tarkov`"
     result = 1
   if reportSkippedGates(e) != 0:
     result = 1
 
 proc cmdBuild(e: Env): int =
+  let stale = refuseIfStaleDriver(e)
+  if stale != 0:
+    return stale
   dropStaleCaches(e)
-  warnStaleDriver(e)
   heading "Simulator"
   discard buildHosts(e)
   discard buildDotnetTools(e)
@@ -2575,14 +2800,8 @@ proc cmdTest(e: Env): int =
     # The quiet failure is the one to keep in mind: two claims handed the same
     # slot means one mod callback runs twice and another never runs at all. A
     # timer that silently stopped, not a crash.
-    let tickRaceExe = joinPath(e.repo, "installer\\build\\tickrace.exe")
-    var trCmd = quoted(nimonyExe(e))
-    trCmd.add " c"
-    trCmd.add abiInclude(e)
-    trCmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
-    trCmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
-    trCmd.add " -o:" & quoted(tickRaceExe)
-    trCmd.add " " & quoted(joinPath(e.repo, "tests\\tickrace.nim"))
+    let tickRaceExe = testExePath(e, "tickrace")
+    let trCmd = testBuildCmd(e, "tickrace", tickRaceExe)
     if run(e, "tickrace builds", trCmd, e.repo):
       discard run(e, "the scheduler hands out no slot twice and loses no " &
                      "callback", quoted(tickRaceExe) &
@@ -2600,14 +2819,8 @@ proc cmdTest(e: Env): int =
     # yet cannot be hooked at load. So the tables are filled to capacity once
     # and never move -- a lock pair is 25-27 ns against a 21.8 ns typed prefix
     # and would more than double the path.
-    let regRaceExe = joinPath(e.repo, "installer\\build\\regrace.exe")
-    var rrCmd = quoted(nimonyExe(e))
-    rrCmd.add " c"
-    rrCmd.add abiInclude(e)
-    rrCmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
-    rrCmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
-    rrCmd.add " -o:" & quoted(regRaceExe)
-    rrCmd.add " " & quoted(joinPath(e.repo, "tests\\regrace.nim"))
+    let regRaceExe = testExePath(e, "regrace")
+    let rrCmd = testBuildCmd(e, "regrace", regRaceExe)
     if run(e, "regrace builds", rrCmd, e.repo):
       discard run(e, "every registration is reached by the handler it named",
                   quoted(regRaceExe))
@@ -2639,13 +2852,8 @@ proc cmdTest(e: Env): int =
     # session -- containing a real `art: FAIL` -- and asserts every not-PASS
     # verdict still surfaces, promptly, while the repeated PASS collapses.
     # Mutating `diagNotPass` to return "" makes it fail with 17 named FAILs.
-    let mdExe = joinPath(e.repo, "installer\\build\\mapsdiag.exe")
-    var mdCmd = quoted(nimonyExe(e))
-    mdCmd.add " c"
-    mdCmd.add abiInclude(e)
-    mdCmd.add " -p:" & quoted(joinPath(e.repo, "mods\\maps"))
-    mdCmd.add " -o:" & quoted(mdExe)
-    mdCmd.add " " & quoted(joinPath(e.repo, "tests\\mapsdiag.nim"))
+    let mdExe = testExePath(e, "mapsdiag")
+    let mdCmd = testBuildCmd(e, "mapsdiag", mdExe)
     if run(e, "mapsdiag builds", mdCmd, e.repo):
       discard run(e, "quieting the maps diag block did not also quiet any " &
                      "FAIL or INCONCLUSIVE verdict in it", quoted(mdExe))
@@ -2661,27 +2869,15 @@ proc cmdTest(e: Env): int =
     # still heartbeat, and `natespVerbose` must restore the firehose exactly.
     # Mutating the not-PASS branch to return `neQuiet` makes it fail with
     # "went 599 cycles (2995s) unannounced".
-    let nlExe = joinPath(e.repo, "installer\\build\\natesplog.exe")
-    var nlCmd = quoted(nimonyExe(e))
-    nlCmd.add " c"
-    nlCmd.add abiInclude(e)
-    nlCmd.add " -p:" & quoted(joinPath(e.repo, "host\\Aowlspt.Host.Il2Cpp"))
-    nlCmd.add " -o:" & quoted(nlExe)
-    nlCmd.add " " & quoted(joinPath(e.repo, "tests\\natesplog.nim"))
+    let nlExe = testExePath(e, "natesplog")
+    let nlCmd = testBuildCmd(e, "natesplog", nlExe)
     if run(e, "natesplog builds", nlCmd, e.repo):
       discard run(e, "quieting the natesp verdict block did not also quiet " &
                      "any not-PASS verdict, and natespVerbose still restores " &
                      "the firehose", quoted(nlExe))
 
-    let tuiExe = joinPath(e.repo, "installer\\build\\tuilayout.exe")
-    var tlCmd = quoted(nimonyExe(e))
-    tlCmd.add " c"
-    tlCmd.add abiInclude(e)
-    tlCmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
-    tlCmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
-    tlCmd.add " -p:" & quoted(joinPath(e.repo, "tools"))
-    tlCmd.add " -o:" & quoted(tuiExe)
-    tlCmd.add " " & quoted(joinPath(e.repo, "tests\\tuilayout.nim"))
+    let tuiExe = testExePath(e, "tuilayout")
+    let tlCmd = testBuildCmd(e, "tuilayout", tuiExe)
     if run(e, "tuilayout builds", tlCmd, e.repo):
       discard run(e, "both launcher screens fit every window they agree to " &
                      "draw in, and neither draws the other", quoted(tuiExe))
@@ -2703,16 +2899,8 @@ proc cmdTest(e: Env): int =
     # unwrap. One of those 149 is why: seq 458's shuffled form happens to open
     # with a valid zlib header, so a server that trusts the header reads it as
     # a plain stream, fails, and gives up.
-    let wireExe = joinPath(e.repo, "installer\\build\\bsgwiretest.exe")
-    var bwCmd = quoted(nimonyExe(e))
-    bwCmd.add " c"
-    bwCmd.add abiInclude(e)
-    bwCmd.add " --passL:-lws2_32 --passL:-lz"
-    bwCmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
-    bwCmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
-    bwCmd.add " -p:" & quoted(joinPath(e.repo, "backend"))
-    bwCmd.add " -o:" & quoted(wireExe)
-    bwCmd.add " " & quoted(joinPath(e.repo, "tests\\bsgwiretest.nim"))
+    let wireExe = testExePath(e, "bsgwiretest")
+    let bwCmd = testBuildCmd(e, "bsgwiretest", wireExe)
     if run(e, "bsgwiretest builds", bwCmd, e.repo):
       discard run(e, "every captured request body decodes the way the server " &
                      "decodes it", quoted(wireExe) & " " & quoted(e.repo))
@@ -3952,12 +4140,14 @@ proc cmdClean(e: Env): int =
 
 proc main(): int =
   var e = Env(repo: "", nimony: "", ucrt64: "C:\\msys64\\ucrt64\\bin",
-              debugBuild: false, verbose: false, oneMod: "")
+              debugBuild: false, verbose: false, oneMod: "",
+              allowStaleDriver: false)
   e.repo = repoRoot()
   e.nimony = joinPath(getEnv("USERPROFILE", "C:\\"), "nimony")
 
   var command = ""
   var arg = ""
+  var arg2 = ""
   var extra: seq[string] = @[]
   var i = 1
   let n = paramCount()
@@ -3980,6 +4170,8 @@ proc main(): int =
       e.debugBuild = true
     elif a == "--no-lock":
       noLock = true
+    elif a == "--allow-stale-driver":
+      e.allowStaleDriver = true
     elif a == "--nimony":
       inc i
       if i <= n: e.nimony = paramStr(i)
@@ -4004,8 +4196,16 @@ proc main(): int =
       return 1
     elif command.len == 0:
       command = a
-    else:
+    elif arg.len == 0:
       arg = a
+    else:
+      # The SECOND positional. It used to overwrite `arg` silently, so
+      # `aowl build mods maps` was read as `build maps` -- an unknown target,
+      # or worse a valid one. `build mod NAME` / `build test NAME` need it.
+      if arg2.len == 0:
+        arg2 = a
+      else:
+        extra.add a
     inc i
 
   if help or command.len == 0:
@@ -4045,7 +4245,10 @@ proc main(): int =
 
   case command
   of "build":
-    result = if arg.len == 0: cmdBuild(e) else: cmdBuildOne(e, arg)
+    if arg.len == 0:
+      result = cmdBuild(e)
+    else:
+      result = cmdBuildOne(e, arg, arg2)
   of "bootstrap": result = cmdBootstrap(e)
   of "worktree-init": result = cmdWorktreeInit(e)
   of "selfcheck":

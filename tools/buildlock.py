@@ -95,6 +95,16 @@ cannot fail.
   one (stale)**. Note that 1 and 2 used to both be 1; a script that only tested
   `rc == 0` is unaffected.
 
+  The report goes to **stdout in every state**, and stderr stays empty --
+  measured 2026-09-02 and pinned by `test_status_streams` in
+  `tools/test_buildlock.py`, after an agent reported it "prints to stderr".
+  It does not. What it does do is exit **non-zero while perfectly healthy**,
+  and that is the trap: `subprocess.run(..., check=True)` raises, and a
+  harness that renders a failed command as an error can fold the body away.
+  Either way the caller sees no text and may conclude the lock is free while
+  a build is running. Read stdout regardless of the exit code, or use
+  `--json` and the `state` field.
+
 The human text is deliberately unchanged, because things already read it.
 
 `--wait-free [SECONDS]` blocks until the lock is free (or stale, which the next

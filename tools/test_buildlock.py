@@ -562,6 +562,191 @@ def test_wait_free(tmp):
           rc == 2 and "runs NOTHING" in out, "rc=%d out=%r" % (rc, out[:160]))
 
 
+def test_status_streams(tmp):
+    """`--status` writes its report to STDOUT, in every state, and writes
+    NOTHING to stderr -- while still exiting 0 free / 1 held / 2 stale.
+
+    Reported 2026-09-02 as "--status prints to stderr and exits 1, so a poller
+    reading stdout sees nothing and concludes the lock is FREE". MEASURED here
+    against this code: the report is on stdout and stderr is empty in all
+    three states. The exit code is the only non-zero thing, and a caller that
+    treats non-zero as "no output" -- subprocess check=True, a harness that
+    renders a failed command as an error with the body folded away -- will
+    still see nothing while the lock is very much held.
+
+    So this test is not a fix; it is the pin. If anyone ever "helpfully" moves
+    the held report to stderr because it looks like an error, or drops the
+    exit codes to make pollers simpler, one of these fails and says which.
+    """
+    print("\n--status: which stream, and which exit code")
+
+    def streams(repo, *args):
+        r = subprocess.run([sys.executable, BL, "--repo", repo] + list(args),
+                           capture_output=True, text=True, timeout=60)
+        return r.returncode, r.stdout, r.stderr
+
+    procs = []
+    free_repo = os.path.join(tmp, "str-free")
+    os.makedirs(free_repo, exist_ok=True)
+    held_repo = os.path.join(tmp, "str-held")
+    os.makedirs(held_repo, exist_ok=True)
+    procs.append(plant_holder(buildlock.lock_path(held_repo)))
+    stale_repo = os.path.join(tmp, "str-stale")
+    os.makedirs(stale_repo, exist_ok=True)
+    plant_stale(buildlock.lock_path(stale_repo))
+
+    try:
+        cases = [("free", free_repo, 0, "FREE"),
+                 ("held", held_repo, 1, "HELD"),
+                 ("stale", stale_repo, 2, "NOT RUNNING")]
+        for state, repo, want_rc, want_text in cases:
+            rc, out, errout = streams(repo, "--status")
+            check("--status (%s): the report is on STDOUT" % state,
+                  want_text in out,
+                  "stdout=%r stderr=%r" % (out[:160], errout[:160]))
+            check("--status (%s): stderr is empty" % state,
+                  errout == "", "stderr=%r" % errout[:200])
+            check("--status (%s): exit %d as documented" % (state, want_rc),
+                  rc == want_rc, "rc=%d" % rc)
+
+            rc, out, errout = streams(repo, "--status", "--json")
+            parsed = None
+            try:
+                parsed = json.loads(out)
+            except ValueError:
+                pass
+            check("--status --json (%s): ONE parseable object on stdout"
+                  % state, parsed is not None and parsed.get("state") == state,
+                  "stdout=%r" % out[:200])
+            check("--status --json (%s): stderr is empty" % state,
+                  errout == "", "stderr=%r" % errout[:200])
+            check("--status --json (%s): same exit code as the prose form"
+                  % state, rc == want_rc, "rc=%d" % rc)
+    finally:
+        for p in procs:
+            p.kill()
+
+
+def make_fake_driver(repo, sleep_s=4.0):
+    """A repo whose `installer/build/aowl.exe` is a python interpreter, and a
+    script named `build` beside it that records how it was called.
+
+    The point is to test the REAL CLI path -- argparse REMAINDER -> the lock
+    record's `cmd` -> the child's argv -- rather than to call `acquire()` by
+    hand, because the bug this guards against lives in that plumbing: a target
+    of more than one word (`build mod maps`) must reach `aowl` verbatim AND
+    must appear whole in `--status`. A test that constructed the command
+    itself could not fail that way.
+
+    A copied python.exe was measured to run from an arbitrary directory on
+    this machine; if that ever stops being true this returns None and the
+    caller reports INCONCLUSIVE rather than a pass.
+    """
+    bin_dir = os.path.join(repo, "installer", "build")
+    os.makedirs(bin_dir, exist_ok=True)
+    exe = os.path.join(bin_dir, "aowl.exe")
+    shutil.copy(sys.executable, exe)
+    out = os.path.join(repo, "called.json")
+    script = os.path.join(repo, "build")
+    with open(script, "w", encoding="utf-8", newline="\n") as f:
+        f.write("import json, os, sys, time\n"
+                "json.dump({'argv': sys.argv,\n"
+                "           'lock': os.environ.get('AOWL_BUILDLOCK'),\n"
+                "           'cwd': os.getcwd()},\n"
+                "          open(%r, 'w'))\n"
+                "time.sleep(%r)\n"
+                "sys.exit(7)\n" % (out, sleep_s))
+    probe = subprocess.run([exe, "-c", "print('ok')"],
+                           capture_output=True, text=True)
+    if probe.returncode != 0 or "ok" not in probe.stdout:
+        return None
+    return out
+
+
+def test_forwarding(tmp):
+    """`build mod maps` reaches aowl verbatim and shows up whole in --status.
+
+    MEASURED 2026-09-02: there was no serialised way to rebuild ONE mod, so
+    agents either built all 22 (~10 min for a one-mod change) or ran
+    modbuild/nimony by hand -- the unserialised path that corrupted this
+    checkout's nimcache twice. `aowl build mod NAME` is the fix, and this is
+    the check that the lock carries it: a multi-word target must not be
+    truncated to `build`, and `--status` must name the whole thing, because
+    `--status` is how a waiting agent decides what is happening.
+    """
+    print("\nforwarding: `build mod maps` through the lock")
+    repo = os.path.join(tmp, "fwd")
+    os.makedirs(repo, exist_ok=True)
+    out = make_fake_driver(repo)
+    if out is None:
+        check("INCONCLUSIVE: no runnable stand-in driver, nothing was tested",
+              False, "the copied python.exe would not start")
+        return
+
+    proc = subprocess.Popen(
+        [sys.executable, BL, "--repo", repo, "build", "mod", "maps"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    held = None
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        rc, sout = cli(repo, "--status", "--json")
+        try:
+            st = json.loads(sout)
+        except ValueError:
+            st = {}
+        if st.get("state") == "held":
+            held = st
+            break
+        if proc.poll() is not None:
+            break
+        time.sleep(0.2)
+
+    stdout = proc.communicate(timeout=60)[0]
+
+    check("--status showed the lock HELD while `build mod maps` ran",
+          held is not None,
+          "never observed held; child said %r" % (stdout or "")[:200])
+    if held is not None:
+        check("--status names the WHOLE target, not just `build`",
+              held.get("target") == "build mod maps",
+              "target was %r" % held.get("target"))
+
+    called = {}
+    if os.path.exists(out):
+        with open(out, encoding="utf-8") as f:
+            called = json.load(f)
+    check("aowl was called with `build mod maps` verbatim",
+          called.get("argv", [])[:3] == ["build", "mod", "maps"],
+          "argv was %r" % called.get("argv"))
+    check("the child ran with AOWL_BUILDLOCK set (the proof-of-lock aowl "
+          "refuses to build without)",
+          str(called.get("lock") or "").isdigit(),
+          "AOWL_BUILDLOCK was %r" % called.get("lock"))
+    check("the child's exit code is passed back through the lock",
+          proc.returncode == 7, "rc=%d" % proc.returncode)
+    check("the lock is FREE again afterwards",
+          cli(repo, "--status", "--json")[0] == 0,
+          "status after the run was %r" % cli(repo, "--status")[1][:160])
+
+    # `build test mapsdiag` is the other new multi-word target; same plumbing,
+    # and cheap to assert, so a future change that special-cases `mod` cannot
+    # pass this file.
+    repo2 = os.path.join(tmp, "fwd2")
+    os.makedirs(repo2, exist_ok=True)
+    out2 = make_fake_driver(repo2, sleep_s=0.1)
+    if out2 is not None:
+        subprocess.run([sys.executable, BL, "--repo", repo2,
+                        "build", "test", "mapsdiag"],
+                       capture_output=True, text=True, timeout=60)
+        called2 = {}
+        if os.path.exists(out2):
+            with open(out2, encoding="utf-8") as f:
+                called2 = json.load(f)
+        check("`build test mapsdiag` forwards verbatim too",
+              called2.get("argv", [])[:3] == ["build", "test", "mapsdiag"],
+              "argv was %r" % called2.get("argv"))
+
+
 def main():
     print("buildlock: FIFO fairness")
     tmp = tempfile.mkdtemp(prefix="buildlock-test-")
@@ -632,6 +817,8 @@ def main():
         test_status(tmp)
         test_fifo_reporting(tmp)
         test_wait_free(tmp)
+        test_status_streams(tmp)
+        test_forwarding(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
