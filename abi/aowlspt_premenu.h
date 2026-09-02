@@ -62,6 +62,11 @@
 
 #define AOWL_PMN_SS_CLOSE_RVA    0x1720B10u
 #define AOWL_PMN_TOGGLE_SET_RVA  0x55BA450u
+#define AOWL_PMN_POINTER_CLICK_RVA 0x14359B0u
+/* DefaultUIButton._button -> TweenAnimatedButton, and that button's own
+ * interactable gate. Both from tools/fldoff.py, never guessed. */
+#define AOWL_PMN_DUB_BUTTON_OFF   0x108
+#define AOWL_PMN_TAB_INTERACT_OFF 0x68
 
 typedef struct AowlPmnTarget {
     const char*   name;
@@ -121,6 +126,53 @@ static const AowlPmnTarget aowl_pmn_targets[] = {
     { "UnityEngine.UI.Toggle::Set", AOWL_PMN_TOGGLE_SET_RVA,
       { 0x48,0x89,0x5C,0x24,0x08, 0x48,0x89,0x74,0x24,0x10,
         0x57, 0x48,0x83,0xEC,0x20, 0x80 }, 16 },
+
+    /* [2] EFT.UI.TweenAnimatedButton::OnPointerClick(PointerEventData)
+     * APPENDED AT THE END. Indices 0 and 1 keep their meaning.
+     *
+     * THIS IS WHAT A PLAYER CLICKING A CARD ACTUALLY RUNS, and it was DERIVED
+     * rather than guessed. The chain, all measured offline on 2026-09-02:
+     *
+     *   the card control `Apply`  carries  EFT.UI.DefaultUIButton
+     *   DefaultUIButton._button  @0x108 -> EFT.UI.TweenAnimatedButton
+     *   TweenAnimatedButton._interactable @0x68  (bool)
+     *   TweenAnimatedButton.OnClick       @0x70  (an ACTION, not a UnityEvent)
+     *   DefaultUIButton.OnClick           @0x120 (the UnityEvent we used to
+     *                                             fire DIRECTLY)
+     *
+     * NEITHER wrapper is a `UnityEngine.UI.Button`: DefaultUIButton derives
+     * from EFT.UI.ButtonFeedback and TweenAnimatedButton from
+     * Sirenix.OdinInspector.SerializedMonoBehaviour. So `Button::Press`
+     * @0x539A7A0 does NOT apply to either -- calling it on one would be the
+     * native type confusion this project keeps paying for.
+     *
+     * THE BODY, 16 bytes, which is why NULL is a safe argument:
+     *   80 79 68 00     cmp  byte [rcx+0x68], 0     ; _interactable
+     *   74 18           je   +0x18                  ; not interactable -> ret
+     *   48 8B 49 70     mov  rcx, [rcx+0x70]        ; the OnClick Action
+     *   48 85 C9        test rcx, rcx
+     *   74 0F           je   +0x0F                  ; null -> ret
+     *   48 ..           (then invokes the Action)
+     * The `eventData` argument in RDX is NEVER READ. That is not an assumption
+     * about Unity, it is the disassembly of this function: it checks a bool,
+     * loads a delegate and invokes it. So passing NULL runs exactly the code a
+     * real click runs.
+     *
+     *   RVA         0x14359B0   (VA 0x1814359B0)
+     *   sharedness  UNIQUE (owners=1)
+     *   section     il2cpp
+     *   attrs       arity 1: RCX=this(TweenAnimatedButton),
+     *               RDX=PointerEventData (unread), R8=MethodInfo*
+     *
+     * WHY IT MATTERS: firing `DefaultUIButton.OnClick` @0x120 directly reaches
+     * the same handler but skips this gate, and MEASURED 2026-09-02 that left
+     * the profile/mode screen HALF-TRANSITIONED with neither card clickable --
+     * a user-visible regression. Going through the button's own entry point
+     * also means an INTERACTABLE=false control is a no-op BY CONSTRUCTION
+     * rather than something this host has to model. */
+    { "EFT.UI.TweenAnimatedButton::OnPointerClick", AOWL_PMN_POINTER_CLICK_RVA,
+      { 0x80,0x79,0x68,0x00, 0x74,0x18, 0x48,0x8B,0x49,0x70,
+        0x48,0x85,0xC9, 0x74,0x0F, 0x48 }, 16 },
 };
 
 #define AOWL_PMN_TARGET_COUNT \
@@ -128,6 +180,7 @@ static const AowlPmnTarget aowl_pmn_targets[] = {
 
 #define AOWL_PMN_T_SS_CLOSE   0
 #define AOWL_PMN_T_TOGGLE_SET 1
+#define AOWL_PMN_T_POINTER_CLICK 2
 
 static int32_t aowl_pmn_verified = 0;
 static int32_t aowl_pmn_rejected = 0;
@@ -200,5 +253,18 @@ static void aowl_pmn_call_toggle_set(void* fn, void* toggle,
     ((AowlPmn_ToggleSet)fn)(toggle, (uint64_t)(value ? 1 : 0),
                             (uint64_t)(sendCallback ? 1 : 0), NULL);
 }
+
+/* Instance, arity 1: RCX = this, RDX = the PointerEventData the body never
+ * reads (see the row comment -- this is from its disassembly, not an
+ * assumption), R8 = the hidden trailing MethodInfo*. Not generic, so NULL is
+ * correct, and it is passed explicitly. */
+typedef void (*AowlPmn_PointerClick)(void*, void*, void*);
+static void aowl_pmn_call_pointer_click(void* fn, void* button) {
+    if (!fn || !button) return;
+    ((AowlPmn_PointerClick)fn)(button, NULL, NULL);
+}
+
+static int32_t aowl_pmn_off_dub_button(void)   { return AOWL_PMN_DUB_BUTTON_OFF; }
+static int32_t aowl_pmn_off_tab_interact(void) { return AOWL_PMN_TAB_INTERACT_OFF; }
 
 #endif /* AOWLSPT_PREMENU_H */

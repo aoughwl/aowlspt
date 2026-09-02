@@ -117,6 +117,21 @@ proc cMskProfileSide(pd: Il2CppPtr): int32 {.
   importc: "aowl_msk_profile_side", nodecl.}
 proc cMskCallSubmit(fn, controller: Il2CppPtr; gameMode: uint64;
                     pd: Il2CppPtr) {.importc: "aowl_msk_call_submit", nodecl.}
+## VirtualQuery-guarded field reads (they return NULL/0 rather than faulting on
+## an unreadable address). Used for the two values `Submit` needs, read off the
+## SLOT VIEW rather than taken from registers.
+proc cMskReadPtr(base: Il2CppPtr; off: int32): Il2CppPtr {.
+  importc: "aowl_msk_read_ptr", nodecl.}
+proc cMskReadI32(base: Il2CppPtr; off: int32): int32 {.
+  importc: "aowl_msk_read_i32", nodecl.}
+
+const
+  # `EFT.UI.CharacterSelectionSlotViewBase`, from the offline derivation
+  # (docs/AOWL_FACTS.md). These are the two arguments `Submit` takes, and they
+  # are read from the slot view the game handed us -- NOT from the argument
+  # registers, which is where the previous call got them and got them wrong.
+  MskSlotGameModeOff = 0x160'i32   ## _gameMode      EGameMode, int32
+  MskSlotProfileOff  = 0x178'i32   ## _profileData   CharacterSelectionProfileData
 
 const
   MskTShowSlot = 0'i32                 ## EFT.UI.CharacterSelectionScreen::ShowSlot
@@ -308,6 +323,8 @@ var gModeSkipPickName = ""                 ## what was pressed, name + klass
 var gModeSkipHasConfirm = false            ## the card has a second control
 var gModeSkipConfirmName = ""              ## and what that one is called
 var gModeSkipCardTitle = ""                ## the TITLE A PERSON READS on it
+var gModeSkipArgMode: int32 = 0            ## _gameMode @0x160, as passed
+var gModeSkipArgPd: Il2CppPtr = nil        ## _profileData @0x178, as passed
 var gModeSkipDeclinedLate = false      ## the "burst 2 never came" refusal, once
 var gModeSkipStaleLogged = false       ## the stale-controller refusal, once
 var gModeSkipMenuEpoch = 0             ## last seen uihooks MenuScreen::Show epoch
@@ -416,6 +433,14 @@ proc modeSkipSlotBody(a: Il2CppPtr): Il2CppPtr {.
     return                                   # already have one; first wins
   gModeSkipPendingPd = pd
   gModeSkipPendingView = gModeSkipSlotView
+  # THE TWO ARGUMENTS, READ OFF THE SLOT VIEW ITSELF. The click a player makes
+  # runs `CharacterSelectionSlotViewBase::OnActionButtonPressed` @0x13F61B0,
+  # which calls `Selected(_gameMode, _profileData)` -- i.e. it passes THESE
+  # FIELDS, not whatever happened to be in the argument registers at ShowSlot.
+  # Taking them from the registers is what put an EGameMode where a Profile
+  # belongs and produced `Profile == 1` in the crash dump.
+  gModeSkipArgMode = cMskReadI32(gModeSkipSlotView, MskSlotGameModeOff)
+  gModeSkipArgPd = cMskReadPtr(gModeSkipSlotView, MskSlotProfileOff)
   gModeSkipPendingScreen = gModeSkipScreen
   gModeSkipPendingMode = gModeSkipSlotMode
   gModeSkipPending = true
@@ -635,96 +660,58 @@ proc modeSkipSubmitBody(a: Il2CppPtr): Il2CppPtr {.
     gModeSkipPressWhy = "the slot view (0x" & hexOf(cast[uint64](view)) &
                         ") did not resolve to a readable Transform"
     return
-  # THE CARD IS THE CONTROL. MEASURED 2026-09-02: the press that hunted a node
-  # named `Apply` found none and refused, and its own census said why --
-  #   [BG_Main][Title][FooterGlow][CharactersContainer]
-  #   [CharacterSlotView_pve][BgGlow][BgImage][BgSide][View][InfoPart]
-  #   [CharacterSlotView_pvp][BgGlow][BgImage][BgSide][View][InfoPart]
-  # -- there is no `Apply` node on this screen at all. The screenshot agrees:
-  # "SELECT PROFILE AND MODE" shows two CARDS and no separate confirm button.
-  # So the pressable thing is the slot view itself, or something inside it.
+  # THE DERIVED CALL, AND NOTHING ELSE. No button is pressed and no tree is
+  # searched: the offline derivation settled what a click actually runs.
   #
-  # Nothing here is guessed: the candidates are ENUMERATED, each is probed for
-  # the three klasses this host knows how to press, and the whole list is
-  # LOGGED -- so if this press is wrong, the next run states exactly what else
-  # was on offer instead of leaving a node name to be invented.
-  var cands: seq[Il2CppPtr] = @[]
-  cands.add tr                                  # the CARD itself, first
-  var b = ArNodeBudget
-  arCollectBFS(tr, ModeSkipApplyDepth, b, cNowMs() + ArWalkMs, cands,
-               ModeSkipApplyCap, "")
-  var names = ""
-  var pick: Il2CppPtr = nil
-  var pickComp: Il2CppPtr = nil
-  var pickType = ""
-  var pickName = ""
-  var confirm: Il2CppPtr = nil
-  var confirmComp: Il2CppPtr = nil
-  var confirmType = ""
-  var confirmName = ""
-  var i = 0
-  while i < cands.len:
-    var comp: Il2CppPtr = nil
-    let ct = arButtonOn(cands[i], comp)
-    if ct.len > 0:
-      let nm = iObjName(cands[i])
-      let lnm = iLower(nm)
-      if names.len < 560:
-        names = names & "[" & nm & " " & ct & "]"
-      # A CONFIRM-shaped control, if this card has one. It is pressed SECOND,
-      # on a later tick, and only if the first press produced no readback.
-      if confirm == nil and cands[i] != tr and
-         (iContains(lnm, "apply") or iContains(lnm, "confirm") or
-          iContains(lnm, "ready") or iContains(lnm, "select")):
-        confirm = cands[i]
-        confirmComp = comp
-        confirmType = ct
-        confirmName = nm
-      elif pick == nil:
-        pick = cands[i]
-        pickComp = comp
-        pickType = ct
-        pickName = nm
-    i = i + 1
-  # Phase 1 presses the confirm-shaped control; phase 0 presses the card. A
-  # confirm pressed with no card press before it would be the second half of a
-  # two-step answer, on its own.
-  if gModeSkipPressPhase == 1:
-    if confirm == nil:
-      gModeSkipPressWhy = "no second, confirm-shaped control under the card " &
-                          "to press after the first press produced no " &
-                          "readback. Candidates: " &
-                          (if names.len > 0: names else: "<none>")
-      return
-    pick = confirm
-    pickComp = confirmComp
-    pickType = confirmType
-    pickName = confirmName
-  elif pick == nil and confirm != nil:
-    # Only a confirm-shaped control exists, so it IS the card's control.
-    pick = confirm
-    pickComp = confirmComp
-    pickType = confirmType
-    pickName = confirmName
-  if pick == nil:
-    gModeSkipPressWhy = "NO node under the matching slot card carries a " &
-                        "DefaultUIButton, a UnityEngine.UI.Button or an " &
-                        "AnimatedToggle -- BFS depth " & $ModeSkipApplyDepth &
-                        ", cap " & $ModeSkipApplyCap & ", " & $cands.len &
-                        " ACTIVE node(s) examined. Pressable candidates: " &
-                        (if names.len > 0: names else: "<none>")
+  #   CharacterSelectionSlotViewBase::OnActionButtonPressed @0x13F61B0
+  #     -> Selected(_gameMode, _profileData)
+  #       -> CharacterSelectionScreenController::Submit(EGameMode,
+  #            CharacterSelectionProfileData) @0x13F0BF0   UNIQUE
+  #
+  # FRAME: RCX = controller, EDX = EGameMode as int32 (Regular=0, Pve=1,
+  # PvpSeason=2), R8 = CharacterSelectionProfileData, R9 = MethodInfo* (the
+  # game itself passes 0).
+  #
+  # The arguments come from the SLOT VIEW's own fields -- `_gameMode` @0x160 and
+  # `_profileData` @0x178 -- because that is what `Selected` is handed. The
+  # previous call took them from the ShowSlot argument registers, which put an
+  # EGameMode where the Profile goes: the minidump's `Profile == 1` is
+  # `EGameMode.Pve == 1` sitting in the profile slot, and that is the crash.
+  #
+  # `Submit` is ASYNC (TaskCompletionSource -> RunCharacterSelectionFlow
+  # d__130 -> ExecuteCharacterSelection -> MainMenuShowOperation ->
+  # MenuScreen::Show), so returning proves nothing and the readback stays the
+  # site-2 show event.
+  if gModeSkipController == nil:
+    gModeSkipPressWhy = "the CharacterSelectionScreenController was never " &
+                        "captured (its .ctor postfix did not fire), so there " &
+                        "is no receiver for Submit"
     return
-  gModeSkipCandNames = names
-  gModeSkipPickName = pickName & " (" & pickType & ")"
-  gModeSkipHasConfirm = confirm != nil
-  gModeSkipConfirmName = (if confirm != nil: confirmName & " (" & confirmType & ")"
-                          else: "<none>")
-  if not arPressAny(pick, pickComp, pickType):
-    gModeSkipPressWhy = "the card control `" & pickName & "` (" & pickType &
-                        ") was found but could not be pressed: its OnClick " &
-                        "could not be resolved and validated"
+  if cIsReadable(gModeSkipController, 0x30'i32) == 0'i32:
+    gModeSkipPressWhy = "the controller (0x" &
+                        hexOf(cast[uint64](gModeSkipController)) &
+                        ") is not readable at the moment of use"
     return
-  gModeSkipPressedNode = pick
+  if gModeSkipArgPd == nil or cIsReadable(gModeSkipArgPd, 0x30'i32) == 0'i32:
+    gModeSkipPressWhy = "the slot view's `_profileData` @0x" &
+                        hexOf(uint64(MskSlotProfileOff)) & " read back as 0x" &
+                        hexOf(cast[uint64](gModeSkipArgPd)) & ", which is not " &
+                        "a readable object. NOTHING WAS CALLED"
+    return
+  if gModeSkipArgMode < 0 or gModeSkipArgMode > 8:
+    gModeSkipPressWhy = "the slot view's `_gameMode` @0x" &
+                        hexOf(uint64(MskSlotGameModeOff)) & " read back as " &
+                        $gModeSkipArgMode & ", which is not a plausible " &
+                        "EGameMode (Regular=0, Pve=1, PvpSeason=2). NOTHING " &
+                        "WAS CALLED"
+    return
+  let fn = cMskFn(MskTSubmit)
+  if fn == nil:
+    gModeSkipPressWhy = "Submit @0x13F0BF0 did not verify against the startup " &
+                        "prologue snapshot on this build; REFUSING to call it"
+    return
+  cMskCallSubmit(fn, gModeSkipController, uint64(gModeSkipArgMode),
+                 gModeSkipArgPd)
   gModeSkipPressedOk = true
   gModeSkipSubmittedAtMs = cNowMs()
   gModeSkipSubmittedAtLogMs = gModeSkipSubmittedAtMs
@@ -797,7 +784,22 @@ proc modeSkipPressReadback() =
     let scr = iToTransform(gModeSkipPendingScreen)
     if scr != nil and duOk(scr, 0x20'i32):
       arActiveCensus(scr, 3, count, names)
-    warn "skip mode screen: NO READBACK. The slot's `Apply` was pressed " &
+    # IS THE SCREEN STILL USABLE? This host writes NOTHING to the screen -- it
+    # invokes the control's own entry point and sets no state -- so there is
+    # nothing to undo. What it CAN do is say whether the card is still
+    # clickable, read off the button itself rather than asserted.
+    # THIS HOST PRESSES NOTHING AND WRITES NOTHING. The answer is one call --
+    # `Submit`, the method a click ends at -- so there is no half-applied UI
+    # state to undo and the stock screen remains exactly as the client built
+    # it. Said out loud, because the build before this one DID press a control
+    # and left the screen half-transitioned.
+    warn "skip mode screen: the values passed to Submit were controller=0x" &
+         hexOf(cast[uint64](gModeSkipController)) & ", EGameMode=" &
+         $gModeSkipArgMode & ", profileData=0x" &
+         hexOf(cast[uint64](gModeSkipArgPd)) & ", MethodInfo=0. Nothing was " &
+         "pressed and no screen state was written by this host, so the " &
+         "selection screen is exactly as the client left it."
+    warn "skip mode screen: NO READBACK. Submit was called " &
          $(gModeSkipTicks - gModeSkipPressAtTick) & " drain ticks ago and " &
          (if not gModeSkipMenuSiteOk:
             "uihooks site 2 (MenuScreen::Show) is not armed here, so this " &
@@ -1022,27 +1024,22 @@ proc modeSkipDrainTick() =
          "SeasonWidgetData::From faulting on a Profile argument of INTEGER 1 " &
          "with a NULL SeasonalRewardController."
     return
-  okLog "skip mode screen: pressed the matching slot CARD's own control `" &
-        gModeSkipPickName & "`" &
-        (if gModeSkipCardTitle.len > 0:
-           " on the card titled \"" & gModeSkipCardTitle & "\""
-         else: " (no readable card Title)") &
-        " for profile " & gModeSkipWantId &
-        " (gameMode=" & $gModeSkipPendingMode & ") -- answering showing " &
-        $gModeSkipPendingBurst & " on tick +" &
-        $(gModeSkipTicks - gModeSkipBurstLastTick) &
-        " after its ShowSlot burst ended. The receiver came from ShowSlot's " &
-        "own RDX, so nothing was searched for. THE GAME NOW RUNS ITS OWN " &
-        "SELECTION FLOW: this host no longer calls Submit at its RVA, because " &
-        "doing so skipped the work that populates Profile and " &
-        "SeasonalRewardController before MenuScreen::Show. PRESSED IS NOT " &
-        "ANSWERED -- the readback is MenuScreen::Show (uihooks site 2) firing, " &
-        "which is logged separately. Pressable candidates on this card: " &
-        gModeSkipCandNames & "; a second, confirm-shaped control " &
-        (if gModeSkipHasConfirm:
-           "IS present (" & gModeSkipConfirmName & ") and will be pressed " &
-           "only if this press produces no readback"
-         else: "is NOT present, so this one press is the whole answer") & "."
+  okLog "skip mode screen: called CharacterSelectionScreenController::Submit " &
+        "@0x13F0BF0 -- RCX=controller 0x" &
+        hexOf(cast[uint64](gModeSkipController)) & ", EDX=EGameMode " &
+        $gModeSkipArgMode & " (read from the slot view's `_gameMode`@0x160), " &
+        "R8=CharacterSelectionProfileData 0x" &
+        hexOf(cast[uint64](gModeSkipArgPd)) &
+        " (read from `_profileData`@0x178), R9=0 -- for profile " &
+        gModeSkipWantId & ", answering showing " & $gModeSkipPendingBurst &
+        " on tick +" & $(gModeSkipTicks - gModeSkipBurstLastTick) &
+        " after its ShowSlot burst ended. This is the frame a player's click " &
+        "produces (OnActionButtonPressed @0x13F61B0 -> Selected(_gameMode, " &
+        "_profileData) -> Submit), with BOTH arguments read off the slot view " &
+        "rather than taken from the argument registers -- taking them from " &
+        "the registers is what put an EGameMode where the Profile goes. " &
+        "Submit is ASYNC, so returning proves NOTHING: the readback is " &
+        "MenuScreen::Show (uihooks site 2), logged separately."
 
 # ---------------------------------------------------------------------------
 # BINDING

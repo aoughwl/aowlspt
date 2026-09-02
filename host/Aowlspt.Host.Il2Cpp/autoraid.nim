@@ -222,6 +222,10 @@ proc cPmnCallClose(fn, screen: Il2CppPtr) {.
   importc: "aowl_pmn_call_close", nodecl.}
 proc cPmnCallToggleSet(fn, toggle: Il2CppPtr; value, sendCallback: int32) {.
   importc: "aowl_pmn_call_toggle_set", nodecl.}
+proc cPmnCallPointerClick(fn, button: Il2CppPtr) {.
+  importc: "aowl_pmn_call_pointer_click", nodecl.}
+proc cPmnOffDubButton(): int32 {.importc: "aowl_pmn_off_dub_button", nodecl.}
+proc cPmnOffTabInteract(): int32 {.importc: "aowl_pmn_off_tab_interact", nodecl.}
 
 const
   # The row name is the WHOLE doc comment on purpose: tools/idxbind.py reads it
@@ -229,6 +233,7 @@ const
   # ever stops agreeing. RVAs, arities and prologues are in the header.
   PmnTSsClose = 0'i32   ## EFT.UI.Settings.SettingsScreen::Close
   PmnTToggleSet = 1'i32   ## UnityEngine.UI.Toggle::Set
+  PmnTPointerClick = 2'i32   ## EFT.UI.TweenAnimatedButton::OnPointerClick
 
 # ---- state (gArOn / gArMap are set in the flag-reading pass in aowlhost.nim) ----
 var gArOn = false                  ## the `uxAutoRaid` flag; DEFAULT OFF
@@ -697,6 +702,71 @@ proc arSetToggleComp(comp: Il2CppPtr): bool =
   cPmnCallToggleSet(fn, comp, 1'i32, 1'i32)
   result = true
 
+proc arDubButton(comp: Il2CppPtr): Il2CppPtr =
+  ## `EFT.UI.DefaultUIButton._button` @0x108 -- the `TweenAnimatedButton` that
+  ## actually receives the click. Offset from tools/fldoff.py, never guessed.
+  result = nil
+  if comp == nil: return
+  let off = cPmnOffDubButton()
+  if not duOk(comp, off + 8'i32): return
+  let b = cReadPtrAt(comp, off)
+  if b == nil or not duOk(b, 0x70'i32) or not iUnityAlive(b): return
+  result = b
+
+proc arTabInteractable(btn: Il2CppPtr; ok: var bool): bool =
+  ## `EFT.UI.TweenAnimatedButton._interactable` @0x68. `ok` says whether the
+  ## read happened; a caller that ignores it would be reading "not clickable"
+  ## out of a failure to look.
+  result = false
+  ok = false
+  if btn == nil or not duOk(btn, 0x70'i32): return
+  ok = true
+  let a = cast[Il2CppPtr](cast[uint64](btn) + uint64(cPmnOffTabInteract()))
+  result = (cReadI32At(a) and 0xFF'i32) != 0'i32
+
+proc arClickDefaultUIButton(comp: Il2CppPtr; why: var string): bool =
+  ## PRESS THE WAY A PLAYER DOES: `TweenAnimatedButton::OnPointerClick`
+  ## @0x14359B0, the button's OWN entry point, instead of firing
+  ## `DefaultUIButton.OnClick` @0x120 behind it.
+  ##
+  ## DERIVED, not guessed -- the 16 bytes of that function are
+  ##   cmp byte [rcx+0x68],0 / je / mov rcx,[rcx+0x70] / test / je / invoke
+  ## so it gates on `_interactable`, loads its `Action OnClick` and invokes it,
+  ## and NEVER READS the PointerEventData in RDX (hence NULL is safe). See
+  ## abi/aowlspt_premenu.h row [2] for the full chain and the disassembly.
+  ##
+  ## MEASURED 2026-09-02: firing the UnityEvent at +0x120 directly reaches the
+  ## same handler but skips this gate, and left the profile/mode screen
+  ## HALF-TRANSITIONED with neither card clickable.
+  result = false
+  why = ""
+  let btn = arDubButton(comp)
+  if btn == nil:
+    why = "the DefaultUIButton has no readable `_button` (TweenAnimatedButton) " &
+          "at +0x" & hexOf(uint64(cPmnOffDubButton())) & ", so the player's " &
+          "own click entry point cannot be reached"
+    return false
+  var ok = false
+  let inter = arTabInteractable(btn, ok)
+  if not ok:
+    why = "could not read `_interactable` on the TweenAnimatedButton, so " &
+          "whether the control is clickable at all is UNKNOWN -- which is not " &
+          "the same as false, and nothing was pressed"
+    return false
+  if not inter:
+    why = "the control's TweenAnimatedButton reads `_interactable` = FALSE. " &
+          "Its own OnPointerClick would return without invoking anything, so " &
+          "pressing it is provably a no-op and NOTHING WAS PRESSED"
+    return false
+  let fn = cPmnFn(PmnTPointerClick)
+  if fn == nil:
+    why = "TweenAnimatedButton::OnPointerClick @0x" &
+          hexOf(uint64(cPmnRva(PmnTPointerClick))) & " did NOT verify against " &
+          "the startup prologue snapshot on this build; REFUSING to call it"
+    return false
+  cPmnCallPointerClick(fn, btn)
+  return true
+
 proc arPress(node: Il2CppPtr; compType: string): bool =
   result = false
   if node == nil: return
@@ -712,6 +782,19 @@ proc arPress(node: Il2CppPtr; compType: string): bool =
   # map tiles -- go through here, so the fix lands in one place.
   if compType == "AnimatedToggle":
     return arSetToggleComp(comp)
+  # A DefaultUIButton is clicked THROUGH ITS OWN BUTTON, not by firing its
+  # UnityEvent behind it. The direct invoke stays below as an announced
+  # fallback for the case where `_button` is not reachable.
+  if compType == "DefaultUIButton":
+    var why = ""
+    if arClickDefaultUIButton(comp, why):
+      return true
+    if why.len > 0:
+      warn "autoRaid: the player's click path (TweenAnimatedButton::" &
+           "OnPointerClick) was not usable on this DefaultUIButton -- " & why &
+           ". Falling back to firing DefaultUIButton.OnClick@+0x120 directly, " &
+           "which is the WEAKER path: it reaches the same handler but skips " &
+           "the button's own interactable gate."
   let off = arOnClickOff(compType)            # 0x120 for DefaultUIButton, else 0x100
   if not duOk(comp, off + 8'i32) or not iUnityAlive(comp): return
   let ev = cReadPtrAt(comp, off)
