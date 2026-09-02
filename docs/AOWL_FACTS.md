@@ -8317,3 +8317,15 @@ UI to undo -- the failure mode of the build before this one. `Submit` is ASYNC
 `MainMenuShowOperation` -> `MenuScreen::Show`), so returning proves nothing: the
 readback stays uihooks site 2, and a NO-READBACK logs the exact three values
 that were passed.
+
+## 2026-09-02 12:50 (clock): AUTO-SELECT FIXED -- one Submit with the slot view's own values
+
+MEASURED (build 4,888,576, uxSkipModeScreen on): `[0:00:30.000] skip mode
+screen: called CharacterSelectionScreenController::Submit @0x13F0BF0 --
+RCX=controller 0x1e7f2a14b00, EDX=EGameMode 0 (read from the slot view's
+_gameMode@0x160), R8=CharacterSelectionProfileData 0x1e7f10f5a50 (read from
+_profileData@0x178), R9=0` then `[0:00:43.297] MenuScreen::Show fired
+(uihooks site 2, epoch 1)`; client parked at the menu. The whole chain of
+tonight's slot-screen trouble was VALUES: the old code passed a gameMode
+and profile it computed itself, the game's flow then met EGameMode.Pve==1
+where a Profile belongs (the dump's Rax=1). No button press, no search.
