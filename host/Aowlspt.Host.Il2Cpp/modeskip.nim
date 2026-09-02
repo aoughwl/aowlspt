@@ -242,6 +242,15 @@ const
     ## constant, and it is deliberately not dressed up as a readiness signal:
     ## "the showing has not come" is not the same claim as "the flow is
     ## ready", and answering anyway is the guess that killed the client.
+  ModeSkipApplyDepth = 6
+    ## Descent from the slot view to its `Apply` control. `tools/entergame.py`
+    ## finds it with a budget of 5000 from the slot, so it is shallow.
+  ModeSkipApplyCap = 64
+    ## ACTIVE nodes examined for that search. A count AT the cap is visible in
+    ## the refusal, so a truncation cannot read as an absence.
+  ModeSkipReadbackTicks = 900
+    ## Drain ticks (~15 s at 60 fps) to wait for `MenuScreen::Show` after the
+    ## press before saying, out loud, that there was NO readback.
   ModeSkipStarveTicks = 3600
     ## Roughly a minute of drain ticks. If the feature is armed and the screen
     ## has never been seen, it says so once rather than being a silent no-op.
@@ -279,6 +288,15 @@ var gModeSkipBurst1Tick = 0            ## drain tick on which burst 1 closed
 var gModeSkipBurstOpen = false         ## a showing is in progress right now
 var gModeSkipBurstSlots = 0            ## ShowSlot calls in the open showing
 var gModeSkipBurstLastTick = 0         ## last drain tick that saw a ShowSlot
+var gModeSkipSlotView: Il2CppPtr = nil     ## ShowSlot RDX: the slot view
+var gModeSkipScreen: Il2CppPtr = nil       ## ShowSlot RCX: the screen
+var gModeSkipPendingView: Il2CppPtr = nil  ## the MATCHING slot's view
+var gModeSkipPendingScreen: Il2CppPtr = nil
+var gModeSkipPressedOk = false             ## the Apply press went through
+var gModeSkipPressWhy = ""                 ## why it did not
+var gModeSkipPressAtTick = 0               ## drain tick of the press
+var gModeSkipMenuEpoch0 = 0                ## site-2 epoch BEFORE the press
+var gModeSkipReadbackDone = false          ## the readback has been reported
 var gModeSkipDeclinedLate = false      ## the "burst 2 never came" refusal, once
 var gModeSkipStaleLogged = false       ## the stale-controller refusal, once
 var gModeSkipMenuEpoch = 0             ## last seen uihooks MenuScreen::Show epoch
@@ -386,6 +404,8 @@ proc modeSkipSlotBody(a: Il2CppPtr): Il2CppPtr {.
   if gModeSkipPending:
     return                                   # already have one; first wins
   gModeSkipPendingPd = pd
+  gModeSkipPendingView = gModeSkipSlotView
+  gModeSkipPendingScreen = gModeSkipScreen
   gModeSkipPendingMode = gModeSkipSlotMode
   gModeSkipPending = true
   # WHICH SHOWING this match belongs to. The burst currently in progress is the
@@ -542,6 +562,11 @@ proc modeSkipShowSlotFired(regs: Il2CppPtr) =
           "the selection screen is up and is being answered"
   gModeSkipSlotPd = cast[Il2CppPtr](pdRaw)
   gModeSkipSlotMode = cRegsInt(regs, 2'i32)    # R8
+  # RDX is the SLOT VIEW and RCX is the SCREEN. Both are receivers the game
+  # handed us, and they are what makes it possible to answer this screen THE
+  # WAY A PLAYER DOES instead of calling `Submit` behind the flow's back.
+  gModeSkipSlotView = cast[Il2CppPtr](cRegsInt(regs, 1'i32))
+  gModeSkipScreen = cast[Il2CppPtr](cRegsInt(regs, 0'i32))
   if cMskSlotGuarded(cast[Il2CppPtr](0)) == nil:
     inc gModeSkipFaults
     warn "skip mode screen: the guarded capture body faulted (" &
@@ -557,34 +582,65 @@ proc modeSkipShowSlotFired(regs: Il2CppPtr) =
 
 proc modeSkipSubmitBody(a: Il2CppPtr): Il2CppPtr {.
     exportc: "aowl_msk_submit_body", cdecl.} =
-  ## Calls the game's own `Submit` at its byte-verified static RVA. This is the
-  ## method the slot's action button ends up calling, so this is what "the
-  ## player chose this slot" means to the rest of the game.
+  ## PRESS THE SLOT THE WAY A PLAYER DOES. This used to CALL
+  ## `CharacterSelectionScreenController::Submit` at its RVA, and that is the
+  ## thing that had to stop.
+  ##
+  ## MEASURED 2026-09-02, from the minidump of the menu-arrival crash
+  ## (`tools/dmpread.py` on Crash_2026-09-02_131229783):
+  ##   ACCESS_VIOLATION at 0x7FFB3EE80103, a READ of 0x21 faulted,
+  ##   Rax=1 Rcx=1 Rdx=0
+  ## The faulting instruction is `mov r8,[rax+0x20]` inside
+  ## `SeasonWidgetData::From(Profile, SeasonalRewardController)`: **the Profile
+  ## argument was the INTEGER 1 and the SeasonalRewardController was NULL.**
+  ## `MenuScreen::Show` was called by the game's own `MainMenuShowOperation`
+  ## with an unpopulated selection -- and that flow starts from our Submit.
+  ##
+  ## So calling `Submit` directly skips the work the game does between the
+  ## player's click and `Show`: it hands the menu flow a selection that has not
+  ## been built. The tick+1 deferral made that RARER, not impossible -- roughly
+  ## 4 deaths against 5 survivals with the rule in place. A timing rule cannot
+  ## fix a MISSING STEP, and "rarer" was mistaken for "fixed" twice tonight.
+  ##
+  ## The route now is the one `tools/entergame.py` has always used from the
+  ## inspector side, and it is verified live: the slot's own `Apply` control,
+  ## an `EFT.UI.DefaultUIButton`, pressed through exactly the same OnClick
+  ## path the raid-entry steps use. The game then runs ITS OWN selection flow
+  ## and populates Profile and SeasonalRewardController before `Show`.
+  ##
+  ## The receiver is not searched for: `ShowSlot` handed us the SLOT VIEW in
+  ## RDX and the screen in RCX. `Submit` @0x1720B10's table row is deliberately
+  ## LEFT in `aowl_msk_targets` (removing it would renumber the rows below it),
+  ## but nothing calls it any more.
   result = cast[Il2CppPtr](1)
-  let fn = cMskFn(MskTSubmit)
-  if fn == nil:
-    warn "skip mode screen: Submit did not verify against the startup " &
-         "prologue snapshot; REFUSING to call it. Nothing was pressed and " &
-         "the selection screen is left for the player to use."
-    gModeSkipOff = true
+  gModeSkipPressedOk = false
+  gModeSkipPressWhy = ""
+  let view = gModeSkipPendingView
+  if view == nil:
+    gModeSkipPressWhy = "ShowSlot never handed us a slot view in RDX"
     return
-  # RE-VALIDATE BOTH POINTERS AT THE POINT OF USE, not at the point of capture.
-  # A pointer that was good on the frame it was captured says nothing about the
-  # frame it is used on, and this call is the one that killed the client.
-  # Readability is not liveness -- a freed object can stay mapped -- so this is
-  # a floor, not a proof; the ONLY real guard is the freshness rule above.
-  if cIsReadable(gModeSkipController, 0x30'i32) == 0'i32 or
-     cIsReadable(gModeSkipPendingPd, 0x30'i32) == 0'i32:
-    warn "skip mode screen: REFUSING to call Submit -- the controller (0x" &
-         hexOf(cast[uint64](gModeSkipController)) & ") or the profile data (0x" &
-         hexOf(cast[uint64](gModeSkipPendingPd)) & ") is no longer readable at " &
-         "the moment of use. Nothing was called; the selection screen is left " &
-         "for the player."
-    gModeSkipController = nil
-    gModeSkipPendingPd = nil
+  let tr = iToTransform(view)
+  if tr == nil or not duOk(tr, 0x20'i32):
+    gModeSkipPressWhy = "the slot view (0x" & hexOf(cast[uint64](view)) &
+                        ") did not resolve to a readable Transform"
     return
-  cMskCallSubmit(fn, gModeSkipController, gModeSkipPendingMode,
-                 gModeSkipPendingPd)
+  var seen = 0
+  var names = ""
+  let apply = arFindActiveNamedBFS(tr, "Apply", ModeSkipApplyDepth,
+                                   ModeSkipApplyCap, seen, names)
+  if apply == nil:
+    gModeSkipPressWhy = "no ACTIVE node named `Apply` under the matching slot " &
+                        "view -- level-by-level BFS, depth " &
+                        $ModeSkipApplyDepth & ", cap " & $ModeSkipApplyCap &
+                        ", examined " & $seen & " ACTIVE node(s): " &
+                        (if names.len > 0: names else: "<none>")
+    return
+  if not arPress(apply, "DefaultUIButton"):
+    gModeSkipPressWhy = "the slot's ACTIVE `Apply` was found but its " &
+                        "DefaultUIButton OnClick could not be resolved and " &
+                        "validated, so it was NOT pressed"
+    return
+  gModeSkipPressedOk = true
   gModeSkipSubmittedAtMs = cNowMs()
   gModeSkipSubmittedAtLogMs = gModeSkipSubmittedAtMs
   gModeSkipCtorsAtSubmit = gModeSkipCtors
@@ -608,6 +664,41 @@ proc modeSkipWantShowHook(site: int) =
   gModeSkipMenuSite = site
   gModeSkipMenuSiteOk = true
   uihWant(site)
+
+proc modeSkipPressReadback() =
+  ## THE READBACK FOR THE PRESS, and it is an event, not a self-comparison:
+  ## `MenuScreen::Show` (uihooks site 2) firing is the game's own confirmation
+  ## that the selection flow ran to completion. A press that returned cleanly
+  ## is not evidence -- that is exactly what the old `Submit` call did, right
+  ## up to the crash.
+  if not gModeSkipPressedOk or gModeSkipReadbackDone: return
+  if gModeSkipMenuSiteOk and uihEpoch(gModeSkipMenuSite) > gModeSkipMenuEpoch0:
+    gModeSkipReadbackDone = true
+    okLog "skip mode screen: READBACK -- MenuScreen::Show fired (uihooks " &
+          "site " & $gModeSkipMenuSite & ", epoch " &
+          $uihEpoch(gModeSkipMenuSite) & ") after the slot press. The " &
+          "client's own selection flow completed and the menu is coming up; " &
+          "that is the thing this feature exists to achieve, and it is now " &
+          "OBSERVED rather than assumed."
+    return
+  if gModeSkipTicks - gModeSkipPressAtTick > ModeSkipReadbackTicks:
+    gModeSkipReadbackDone = true
+    var count = 0
+    var names = ""
+    let scr = iToTransform(gModeSkipPendingScreen)
+    if scr != nil and duOk(scr, 0x20'i32):
+      arActiveCensus(scr, 3, count, names)
+    warn "skip mode screen: NO READBACK. The slot's `Apply` was pressed " &
+         $(gModeSkipTicks - gModeSkipPressAtTick) & " drain ticks ago and " &
+         (if not gModeSkipMenuSiteOk:
+            "uihooks site 2 (MenuScreen::Show) is not armed here, so this " &
+            "host cannot see whether the menu came up at all"
+          else:
+            "MenuScreen::Show (uihooks site 2) has NOT fired") &
+         ". The press ran and the flow did not complete; that is a REFUSAL to " &
+         "claim success, not a failure to act. ACTIVE under the selection " &
+         "screen (depth<=3, " & $count & "): " &
+         (if names.len > 0: names else: "<none>")
 
 proc modeSkipMenuTick() =
   ## ONE integer compare per drain tick. When the main menu shows, everything
@@ -634,6 +725,7 @@ proc modeSkipDrainTick() =
   if gModeSkipOff or not gModeSkipOn:
     return
   modeSkipMenuTick()
+  modeSkipPressReadback()
   inc gModeSkipTicks
 
   # ---- SHOWING BOOKKEEPING, AND THE ONE-TICK DEFERRAL ---------------------
@@ -784,7 +876,13 @@ proc modeSkipDrainTick() =
     return                                   # once per controller, never twice
   gModeSkipSubmittedFor = gModeSkipController
   gModeSkipPending = false
+  # The epoch BEFORE the press, so the readback compares against the right
+  # baseline rather than against whatever the menu did earlier in the session.
+  gModeSkipMenuEpoch0 = (if gModeSkipMenuSiteOk: uihEpoch(gModeSkipMenuSite)
+                         else: 0)
+  gModeSkipReadbackDone = false
 
+  gModeSkipPressAtTick = gModeSkipTicks
   if cMskSubmitGuarded(cast[Il2CppPtr](0)) == nil:
     inc gModeSkipFaults
     warn "skip mode screen: the guarded Submit faulted (" & $gModeSkipFaults &
@@ -794,27 +892,28 @@ proc modeSkipDrainTick() =
       warn "skip mode screen: too many faults; switching itself off for this " &
            "session. The selection screen is left for the player to use."
     return
-  okLog "skip mode screen: Submit called for profile " & gModeSkipWantId &
+  if not gModeSkipPressedOk:
+    warn "skip mode screen: NOTHING WAS PRESSED -- " & gModeSkipPressWhy &
+         ". The stock character/mode screen is left exactly as the client " &
+         "built it and the player can use it. This host does NOT fall back to " &
+         "calling Submit at its RVA: that call is what handed the game's own " &
+         "MainMenuShowOperation an unpopulated selection, and the minidump of " &
+         "Crash_2026-09-02_131229783 shows the consequence -- " &
+         "SeasonWidgetData::From faulting on a Profile argument of INTEGER 1 " &
+         "with a NULL SeasonalRewardController."
+    return
+  okLog "skip mode screen: pressed the matching slot's own `Apply` " &
+        "(EFT.UI.DefaultUIButton) for profile " & gModeSkipWantId &
         " (gameMode=" & $gModeSkipPendingMode & ") -- answering showing " &
         $gModeSkipPendingBurst & " on tick +" &
         $(gModeSkipTicks - gModeSkipBurstLastTick) &
-        " after its ShowSlot burst ended (never on the burst's own tick: a " &
-        "same-tick Submit is what faulted SeasonWidgetData::From inside the " &
-        "first MenuScreen::Show on 2026-09-02). SHOWING " &
-        $gModeSkipPendingBurst & " of " & $gModeSkipBursts &
-        " seen so far; " & $int(cNowMs() - gModeSkipArmedAtMs) &
-        "ms after that showing's matching slot (a wall-clock READING, not the " &
-        "gate -- the gate is the tick count above). The " &
-        "character/mode selection screen has been answered without a human. " &
-        "This is ANSWER " & $gModeSkipSubmits & " of at most " &
-        $ModeSkipMaxAnswers & " this session (ShowSlot firings seen: " &
-        $gModeSkipShows & ", controllers constructed: " & $gModeSkipCtors &
-        "). The screen is answered EVERY time it is shown, not once -- the " &
-        "client shows it again after the main-menu PLAY button. THIS IS NOT PROOF " &
-        "THE MENU APPEARED -- assert that separately: MenuScreen (parent " &
-        "\"Common UI\") must be activeInHierarchy, and BOTH " &
-        "CharacterSelectionScreen copies (parents \"Login UI\" and \"UI\") " &
-        "must not be."
+        " after its ShowSlot burst ended. The receiver came from ShowSlot's " &
+        "own RDX, so nothing was searched for. THE GAME NOW RUNS ITS OWN " &
+        "SELECTION FLOW: this host no longer calls Submit at its RVA, because " &
+        "doing so skipped the work that populates Profile and " &
+        "SeasonalRewardController before MenuScreen::Show. PRESSED IS NOT " &
+        "ANSWERED -- the readback is MenuScreen::Show (uihooks site 2) firing, " &
+        "which is logged separately."
 
 # ---------------------------------------------------------------------------
 # BINDING

@@ -128,6 +128,25 @@ static const AowlUihSite aowl_uih_sites[] = {
      *   Byte-for-byte the same SHAPE as `SettingsScreen::Show`: 16-byte steal,
      *   one RIP-relative displacement, no relative branch.
      *
+     *   *** DO NOT WANT THIS SITE WITHOUT NEW EVIDENCE. MEASURED 2026-09-02. ***
+     *   A build that subscribed to it -- the first build in this project ever
+     *   to BIND it; every surviving build had it unbound -- died on three
+     *   consecutive boots, once at MENU ARRIVAL with no Settings and no raid,
+     *   in `SeasonWidgetData::From @0x141FFD0+0x133` called from
+     *   `MenuScreen::Show(5-arg) @0x15387A0+0x994`, with the host's last log
+     *   line being `uihooks: FIRST show event -- EFT.UI.MenuScreen::Awake`.
+     *   `Awake` runs immediately before `Show`, and `Show` then read a bad
+     *   Profile.
+     *
+     *   The row is left here, with its RVA and prologue intact, because the
+     *   NUMBERS are still correct and deleting it would renumber every site
+     *   below it (fact #187). What is NOT established is that the 16 stolen
+     *   bytes survive relocation in this function's real control flow: the
+     *   sharedness is UNIQUE and the shape looks benign, and it still killed
+     *   the client three times. Prologue arithmetic that "looks benign" is not
+     *   a measurement. Anyone who wants this site again owes a bisect that
+     *   shows a boot surviving WITH it bound, not a re-reading of these bytes.
+     *
      *   HONEST LIMIT, stated because the name invites the wrong assumption:
      *   `Awake` is a CONSTRUCTION event, not a show event. It fires once per
      *   MenuScreen instantiation, and at postfix time the screen's own children

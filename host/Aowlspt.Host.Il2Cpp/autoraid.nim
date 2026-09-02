@@ -2622,7 +2622,7 @@ proc xrMenuFromEvent(via: var string): Il2CppPtr =
   ## DontDestroyOnLoad and is not in scope there at all. No amount of waiting
   ## fixes a search that is looking in the wrong scene.
   ##
-  ## THREE SOURCES, in order of how directly each answers "the in-raid menu is
+  ## TWO SOURCES, in order of how directly each answers "the in-raid menu is
   ## up", and the caller LOGS WHICH ONE ANSWERED so a run can never quietly
   ## rest on the weakest:
   ##   site 7  MenuScreen::ShowInRaid  -- the in-raid menu was SHOWN, by us or
@@ -2633,7 +2633,8 @@ proc xrMenuFromEvent(via: var string): Il2CppPtr =
   ##                                      re-validates it and returns nil for a
   ##                                      destroyed screen rather than a corpse
   ##                                      (fact #182).
-  ##   site 1  MenuScreen::Awake       -- construction only. Weakest, last.
+  ##   (site 1, MenuScreen::Awake, is NOT in this ladder: binding it is measured
+  ##    to kill the client at menu arrival -- see `arWantShowHook`.)
   result = nil
   via = ""
   var self = uihSelf(UihSiteShowInRaid)
@@ -2645,11 +2646,11 @@ proc xrMenuFromEvent(via: var string): Il2CppPtr =
     via = "uihooks site 2 (MenuScreen::Show(5-arg) from before the raid; " &
           "MenuScreen is DontDestroyOnLoad and the pointer was re-validated)"
     return self
-  self = uihSelf(UihSiteMenuScreen)
-  if self != nil:
-    via = "uihooks site 1 (MenuScreen::Awake -- a CONSTRUCTION event, the " &
-          "weakest of the three)"
-    return self
+  # SITE 1 (MenuScreen::Awake) IS NOT CONSULTED. It is not merely the weakest
+  # source -- binding it is MEASURED to kill the client at menu arrival (see the
+  # comment in `arWantShowHook`), so this feature neither wants it nor reads it.
+  # Reading it would be harmless on its own, but a reader is an argument for a
+  # want, and that argument is what cost three boots.
 
 proc xrCensus(root: Il2CppPtr): string =
   ## What IS active under a receiver, in the entry half's census style, so that
@@ -2688,12 +2689,13 @@ proc xrTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_xr_tick_body", cdecl.}
         if now - gXrStepT0 > XrShowSayMs and not gXrSaidNoRecv:
           gXrSaidNoRecv = true
           warn "raidExit: no MenuScreen receiver from ANY show event (site 7 " &
-               "ShowInRaid, site 2 Show(5-arg), site 1 Awake all empty), and " &
+               "ShowInRaid empty, and site 2 Show(5-arg) empty or unbound -- " &
+               "site 1 Awake is deliberately never used), and " &
                "the scene-root search found nothing either -- which is " &
                "EXPECTED in a raid, where the enumerated roots are the " &
                "LOCATION scene and the menu lives in DontDestroyOnLoad. Check " &
-               "the `uihooks:` lines: if sites 1/2/7 did not BIND, the exit " &
-               "half has no way to reach the menu at all."
+               "the `uihooks:` lines: if site 7 did not BIND, the exit half " &
+               "has no way to reach the menu at all."
         return        # keep looking; the step timeout bounds this
       var w = ""
       if not iVisComponent(ms, "MenuScreen", comp, w) or comp == nil:
@@ -2891,8 +2893,21 @@ proc arWantShowHook() =
   # searching DontDestroyOnLoad from inside a raid, which cannot work.
   uihWant(UihSiteShowInRaid)
   uihWant(UihSiteSessionEnd)
-  uihWant(UihSiteMenuShow)
-  uihWant(UihSiteMenuScreen)
+  # SITES 1 AND 2 ARE DELIBERATELY NOT WANTED HERE, AND THIS IS A REGRESSION
+  # FIX, NOT A PREFERENCE. MEASURED 2026-09-02: wanting them from this feature
+  # (i.e. whenever `liveInspector` is on) bound `MenuScreen::Awake` for the
+  # FIRST TIME on any build this project has run, and the very next boot died
+  # at MENU ARRIVAL -- no Settings, no raid -- in
+  # `SeasonWidgetData::From @0x141FFD0+0x133` under
+  # `MenuScreen::Show(5-arg) @0x15387A0+0x994`, with the host's last line being
+  # `uihooks: FIRST show event -- EFT.UI.MenuScreen::Awake`. `Awake` runs
+  # immediately before `Show`, and `Show` then read a bad Profile. Three boots,
+  # three deaths; every surviving build tonight had site 1 UNBOUND.
+  #
+  # Site 2 is left to `modload`, which is who wanted it on every build that
+  # survived. This feature READS both through `uihSelf`, which returns nil for
+  # an unbound site -- so the ladder degrades to the sites it does want, and
+  # nothing here depends on a detour it did not ask for.
 
 proc arShowHookVerdict() =
   ## Read back whether it actually BOUND, after `uihArm`. Announced either way:
