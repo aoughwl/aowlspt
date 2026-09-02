@@ -492,6 +492,10 @@ def main():
                         "The client saying where it is beats waiting for a log "
                         "line to imply it: MENU = the main menu is up, "
                         "DEPLOYED = standing in the raid.")
+    p.add_argument("--launcher-arg", action="append", default=[],
+                   metavar="FLAG[ VALUE]",
+                   help="raw flag passed to aowlspt-launch.exe, repeatable "
+                        "(e.g. --launcher-arg \"--modbuild C:/x/modbuild.py\")")
     p.add_argument("--menu-settle", type=float, default=20.0,
                    help="with --until-phase MENU: seconds of no other host "
                         "progress before MENU counts as reached. MENU is "
@@ -565,7 +569,14 @@ def main():
         if not os.path.isfile(launcher):
             print("no launcher at %s" % launcher)
             return EXIT["INCONCLUSIVE"]
-        subprocess.Popen([launcher], cwd=install_dir(args.root))
+        cmd = [launcher]
+        # Raw pass-through for launcher flags (e.g. `--modbuild PATH`,
+        # `--no-mod-build`, `--rebuild-mods`). Printed so the run's own
+        # transcript shows exactly what was started.
+        for extra in (args.launcher_arg or []):
+            cmd += extra.split(" ", 1) if " " in extra else [extra]
+        print("$ %s" % " ".join(cmd), flush=True)
+        subprocess.Popen(cmd, cwd=install_dir(args.root))
 
     sup = Supervisor(args.root, args.until, args.stall, quiet,
                      phase_max=args.phase_max,

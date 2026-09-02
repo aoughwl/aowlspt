@@ -241,6 +241,12 @@ def cmd_run(args):
         cmd += ["--low-render", "--render-size", args.render_size]
     if args.args:
         cmd += ["--args", args.args]
+    # Raw pass-through for launcher flags this harness does not model yet
+    # (e.g. `--modbuild PATH`, `--no-mod-build`, `--rebuild-mods`, added to
+    # aowllaunch.nim 2026-09-01). Kept raw on purpose: modelling every
+    # launcher flag here is how a harness drifts behind the thing it drives.
+    for extra in (getattr(args, "launcher_arg", None) or []):
+        cmd += extra.split(" ", 1) if " " in extra else [extra]
 
     started = time.time()
     print("$ %s" % " ".join(cmd))
@@ -343,6 +349,10 @@ def main():
     p.add_argument("--profile", default=None,
                    help="play this profile instead of stopping at the picker")
     p.add_argument("--args", default=None, help="extra client arguments")
+    p.add_argument("--launcher-arg", action="append", default=[],
+                   metavar="FLAG[ VALUE]",
+                   help="raw flag passed to aowlspt-launch.exe, repeatable "
+                        "(e.g. --launcher-arg \"--modbuild C:/x/modbuild.py\")")
     p.add_argument("--out", default=os.path.join(REPO, "build", "runs"),
                    help="where captured logs are copied")
     p.add_argument("--keep", action="store_true",
