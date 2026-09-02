@@ -6608,3 +6608,19 @@ re-checked with `aowl_is_readable` at the point of use as a floor, and the
 cached pointers are DROPPED on the `MenuScreen::Show` show event (uihooks site
 2, index verified by reading the site's NAME back, because `uihooks.nim` is
 included after `modeskip.nim` and its constants are not in scope there).
+
+## 2026-09-02 01:55: after PLAY the screen is MatchMaker Side Selection, and two live PASSes
+
+MEASURED (autoraid refusal census): after pressing PLAY on the main menu the
+active screens are `[Common UI][ChatScreen]` and `[UI][MatchMaker Side
+Selection Screen][Operation Queue Indicator]`. The screen headed "SELECT YOUR
+CHARACTER / PVE ZONE" is EFT.UI.Matchmaker.MatchMakerSideSelectionScreen
+(PMC or SCAV, then NEXT), NOT CharacterSelectionScreen -- that one is the
+boot-time profile-slot screen modeskip answers at ~26s. ChatScreen is active
+at the menu in every census tonight; it is normal.
+
+MEASURED, live in the client: `sain: settings publish-once selftest PASS --
+the schema refused with a reason before it was published, published 55 rows,
+and refused a second declaration`; and the modeskip fix's falsifier line
+`MenuScreen::Show fired (uihooks site 2, epoch 1) ... every pointer this
+feature cached about it is DROPPED` printed on a boot that survived.
