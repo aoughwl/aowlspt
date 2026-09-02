@@ -74,6 +74,31 @@ LIVE_DEFAULT = r"D:\Aowlspt\aowlspt"
 
 PASS, FAIL, INCONCLUSIVE = "PASS", "FAIL", "INCONCLUSIVE"
 
+
+def _oneline(x, cap=140):
+    """Flatten anything to one short line -- exception text and host refusal
+    lines are both multi-line, and a newline inside a one-line report row
+    silently splits it into two rows that read as two findings."""
+    s = " ".join(str(x).split())
+    return s if len(s) <= cap else s[:cap - 3] + "..."
+
+
+class Refusal(object):
+    """WE COULD NOT LOOK. Deliberately not a string, and deliberately not
+    falsy-by-accident: `isinstance(x, Refusal)` is the only way to consume it,
+    so a caller cannot interpolate it into a sentence that reads like an
+    answer without having thought about it. `__str__` shouts."""
+
+    __slots__ = ("reason",)
+
+    def __init__(self, reason):
+        self.reason = _oneline(reason) or "no reason given"
+
+    def __str__(self):
+        return "UNRESOLVED (%s)" % self.reason
+
+    __repr__ = __str__
+
 # rva:0x55ba430 is `v_pb` (void, pointer-arg, bool-arg) AnimatedToggle::SetOn,
 # per fact #109 -- the proven path onto the Settings screen.
 OPEN_SETTINGS_RVA = "rva:0x55ba430"
@@ -904,18 +929,68 @@ def panel_of(live, ptrs):
     file, which is worse than no verdict at all.
 
     Deepest named ancestor wins: the panel is the outermost node of the walk.
-    Anything unresolvable is reported "unresolved", never guessed."""
+
+    THREE STATES, NEVER TWO (§9b). The value for a ptr is:
+
+      * a `str`     -- the outermost named ancestor the walk actually printed.
+      * `None`      -- the walk ran and answered, and there was no named
+                       ancestor in it at all. An honest "no panel", not a
+                       failure.
+      * `Refusal`   -- WE COULD NOT LOOK. The channel raised (offline replay
+                       with no recording, a timeout, an abandoned batch), or
+                       the host answered with an `!` refusal line -- e.g.
+                       `Transform::get_parent did not verify on this build`,
+                       or the pointer was not readable so the chain ended
+                       before any name was printed.
+
+    This used to be one flat `except Exception` that rendered EVERY one of
+    those as the string `"unresolved (AssertionError)"`, which the caller then
+    interpolated as `(panel: unresolved (AssertionError))` inside a FAIL. Live,
+    that reads as a panel attribution -- a plausible-looking answer produced by
+    a probe that never got a reply. "I could not look" is not an attribution.
+    """
     out = {}
     for ptr in ptrs or []:
         try:
             raw = ch.run_batch(["parent %s %d" % (ptr, PANEL_DEPTH)],
                                live_dir=live, timeout=40)[1]
         except Exception as e:                    # named, never silent
-            out[ptr] = "unresolved (%s)" % type(e).__name__
+            out[ptr] = Refusal("%s: %s" % (type(e).__name__, _oneline(e)))
             continue
-        names = _PARENT_LINE_RE.findall(host_text(raw))
-        out[ptr] = names[-1] if names else "unresolved"
+        text = host_text(raw)
+        names = _PARENT_LINE_RE.findall(text)
+        if names:
+            out[ptr] = names[-1]
+            continue
+        # No names. Distinguish "the walk answered and had none" from "the
+        # walk refused", because only the first is an answer.
+        refusals = [l.strip().lstrip("! ").strip()
+                    for l in text.splitlines() if l.strip().startswith("!")]
+        chain_end = [l.strip() for l in text.splitlines()
+                     if "not readable; chain ends" in l]
+        if refusals:
+            out[ptr] = Refusal(_oneline(refusals[0]))
+        elif chain_end:
+            out[ptr] = Refusal(_oneline(chain_end[0]))
+        else:
+            out[ptr] = None
     return out
+
+
+def panel_note(panels, ptr):
+    """The ` (panel: ...)` suffix for one hit -- or "" if we never probed it.
+
+    A Refusal prints as `panel: UNRESOLVED (<reason>)`, in capitals, because
+    the one thing this string must never do is sit in a FAIL message looking
+    like the name of a panel."""
+    if ptr not in panels:
+        return ""
+    p = panels[ptr]
+    if isinstance(p, Refusal):
+        return " (panel: UNRESOLVED (%s))" % p.reason
+    if p is None:
+        return " (panel: none -- the walk printed no named ancestor)"
+    return " (panel: %s)" % p
 
 
 def assert_no_donor_caption_on_clones(report, live, mods_built):
@@ -995,15 +1070,31 @@ def assert_no_donor_caption_on_clones(report, live, mods_built):
     panels = panel_of(live, [h["ptr"] for h in shown]) if ours else {}
     detail = "; ".join("%s under %s @%s%s"
                        % (h["name"], h["parent"], h["ptr"],
-                          "" if h["ptr"] not in panels
-                          else " (panel: %s)" % panels[h["ptr"]])
+                          panel_note(panels, h["ptr"]))
                        for h in shown)
-    owners = sorted(set(panels.values()))
+    # Only REAL names are owners. A Refusal and a None are not panel names and
+    # must not be sorted in among them (they would also raise TypeError on
+    # py3's mixed-type sort). The refusals are counted out loud instead, so a
+    # short owner list cannot read as "we checked and there was only one".
+    owners = sorted({p for p in panels.values() if isinstance(p, str)})
+    refused = sum(1 for p in panels.values() if isinstance(p, Refusal))
+    # THE VERDICT BELOW DOES NOT DEPEND ON THE PANEL. It is decided by `ours`
+    # -- hits whose PARENT carries the clone mark, which came from the findtext
+    # reply itself. The ancestry probe only says WHO to go blame, so a refused
+    # probe costs attribution, not the finding. If a future assertion ever
+    # decides PASS/FAIL from `panels`, it must go INCONCLUSIVE when
+    # `refused` > 0: a verdict read off a probe that never answered is exactly
+    # the check-that-cannot-fail this file exists to prevent.
     measured = ("%d hit(s) of %r, walk %s, scope=%s: %d on a `%s` row "
                 "(must be 0), %d stock (positive control, must be >0)%s"
                 % (len(hits), DONOR_CAPTION, comp, f["scope"], len(ours),
                    CLONE_MARK, len(stock),
-                   ("; owning panel(s): " + ", ".join(owners)) if owners else ""))
+                   (("; owning panel(s): " + ", ".join(owners)) if owners else "")
+                   + ("; %d of %d ancestry probe(s) UNRESOLVED (%s)"
+                      % (refused, len(panels),
+                         "; ".join(sorted({p.reason for p in panels.values()
+                                           if isinstance(p, Refusal)})[:2]))
+                      if refused else "")))
     if ours:
         report.record(name, FAIL, measured, detail)
     elif not stock:
@@ -1765,6 +1856,128 @@ def cmd_selftest(_args):
         return ""
     case("control: 0 under clones but the walk was CAPPED -> INCONCLUSIVE",
          [('findtext "Interface language"', [_no_clone_hits(FT_DONOR)])], c9)
+
+    # --- 9a-9c. THE ANCESTRY PROBE IS THREE-STATE. -------------------------
+    #     panel_of used to wrap its walk in one `except Exception` and render
+    #     every failure as the STRING "unresolved (AssertionError)", which the
+    #     caller interpolated as `(panel: unresolved (AssertionError))` inside
+    #     a FAIL. Offline that is the replay refusing; LIVE it is an inspector
+    #     refusal, an abandoned batch or an unreadable pointer -- and all four
+    #     printed as something that reads like a panel attribution. These three
+    #     cases pin the refusal, the answer, and the two apart.
+    #
+    #     BOTH `parent` replies below are SHAPED (tier 2), not captured: no
+    #     `parent` reply exists in tools/fixtures/inspector/. The SHAPE is the
+    #     emit site inspect.nim:1313 (`    [N] transform=P klass=K name="X"
+    #     go=G activeSelf=B`) and iErr's `  ! ` prefix at inspect.nim:798; the
+    #     NAMES are the walk quoted in panel_of's docstring, measured live on
+    #     2026-09-02. Harvest a real capture and delete these.
+    FX_PARENT_WALK = _hdr(101, 1, """> parent 0x00000203095d3e00 8
+  via Transform::get_parent, Component::get_transform, Object::get_name, \
+Component::get_gameObject, GameObject::get_activeSelf (calls, not field reads)
+    [0] transform=0x00000203095d3e00 klass=0x00007ffb1a2b0040 name="Text" \
+go=0x00000203095d3f00 activeSelf=true
+    [1] transform=0x00000203095d3a00 klass=0x00007ffb1a2b0040 \
+name="Settings Drop Down(Clone)(Clone)" go=0x00000203095d3b00 activeSelf=true
+    [2] transform=0x0000020244f7e840 klass=0x00007ffb1a2b0040 name="Settings" \
+go=0x0000020244f7e940 activeSelf=true
+    [3] transform=0x0000020244f7e440 klass=0x00007ffb1a2b0040 name="Viewport" \
+go=0x0000020244f7e540 activeSelf=true
+    [4] transform=0x0000020244f7e040 klass=0x00007ffb1a2b0040 \
+name="Scroll View" go=0x0000020244f7e140 activeSelf=true
+    [5] transform=0x0000020244f7dc40 klass=0x00007ffb1a2b0040 name="Container" \
+go=0x0000020244f7dd40 activeSelf=true
+    [6] transform=0x0000020244f7d840 klass=0x00007ffb1a2b0040 \
+name="Game Settings" go=0x0000020244f7d940 activeSelf=true""")
+
+    PARENT_REFUSAL = "Transform::get_parent did not verify on this build"
+    FX_PARENT_REFUSED = _hdr(102, 1, """> parent 0x00000203095d3e00 8
+  via Transform::get_parent, Component::get_transform, Object::get_name, \
+Component::get_gameObject, GameObject::get_activeSelf (calls, not field reads)
+  ! %s; cannot walk""" % PARENT_REFUSAL)
+
+    def _donor_row(rep):
+        return [r for r in rep.rows if r[0] == DONOR_NAME][0]
+
+    def c9a(rep, _rp):
+        assert_no_donor_caption_on_clones(rep, "X", True)
+        _n, v, m, d = _donor_row(rep)
+        if v != FAIL:
+            return "a refused ancestry probe changed the verdict to %s -- the "\
+                   "finding comes from the findtext parents, not the probe" % v
+        if "UNRESOLVED (" not in d:
+            return "the FAIL detail did not mark the probe UNRESOLVED: %r" % d
+        if PARENT_REFUSAL not in d:
+            return "UNRESOLVED did not carry the host's reason: %r" % d
+        if "panel: Game Settings" in d or "owning panel(s)" in m:
+            return ("a panel was attributed from a walk that refused: %r / %r"
+                    % (m, d))
+        if "ancestry probe(s) UNRESOLVED" not in m:
+            return "the refusals were not counted in the measured line: %r" % m
+        return ""
+    case("panel probe REFUSED by the host -> FAIL kept, panel UNRESOLVED(reason)",
+         [('findtext "Interface language"', [FT_DONOR]),
+          ("parent ", [FX_PARENT_REFUSED])], c9a)
+
+    def c9b(rep, _rp):
+        assert_no_donor_caption_on_clones(rep, "X", True)
+        _n, v, m, d = _donor_row(rep)
+        if v != FAIL:
+            return "22 donor captions under the row clones did not FAIL"
+        if "(panel: Game Settings)" not in d:
+            return "the successful walk did not attribute the panel: %r" % d
+        if "owning panel(s): Game Settings" not in m:
+            return "the owner was not named in the measured line: %r" % m
+        if "UNRESOLVED" in d or "UNRESOLVED" in m:
+            return "a walk that ANSWERED was reported unresolved: %r / %r" % (m, d)
+        return ""
+    case("control: panel probe ANSWERS -> panel named, nothing UNRESOLVED",
+         [('findtext "Interface language"', [FT_DONOR]),
+          ("parent ", [FX_PARENT_WALK])], c9b)
+
+    def c9c(rep, _rp):
+        # No `parent` recording at all: the replay RAISES. That is the exact
+        # offline shape of a live abandoned batch, and it must not become a
+        # panel name either.
+        assert_no_donor_caption_on_clones(rep, "X", True)
+        _n, v, m, d = _donor_row(rep)
+        if v != FAIL:
+            return "a raising ancestry probe changed the verdict to %s" % v
+        if "UNRESOLVED (AssertionError" not in d:
+            return ("a raised probe was not reported as UNRESOLVED with its "
+                    "exception named: %r" % d)
+        return ""
+    case("control: panel probe RAISES -> FAIL kept, UNRESOLVED(AssertionError)",
+         [('findtext "Interface language"', [FT_DONOR])], c9c)
+
+    print("\n---- unit: panel_of is three-state")
+    _saved = ch.run_batch
+    try:
+        ch.run_batch = _Replay([("parent ", [FX_PARENT_WALK])])
+        got = panel_of("X", ["0x1"])["0x1"]
+        if got != "Game Settings":
+            failures.append("panel_of on a real walk returned %r, want the "
+                            "outermost named ancestor" % (got,))
+        ch.run_batch = _Replay([("parent ", [FX_PARENT_REFUSED])])
+        got = panel_of("X", ["0x1"])["0x1"]
+        if not isinstance(got, Refusal) or PARENT_REFUSAL not in got.reason:
+            failures.append("panel_of on a host refusal returned %r, want a "
+                            "Refusal carrying the reason" % (got,))
+        # walked, answered, no NAMED ancestor -> None, which is an ANSWER and
+        # must not be confused with the refusal above.
+        ch.run_batch = _Replay([("parent ", [_hdr(103, 1, """> parent 0x1 8
+  via Transform::get_parent, Component::get_transform, Object::get_name, \
+Component::get_gameObject, GameObject::get_activeSelf (calls, not field reads)
+    [0] 0x0000000000000001  (not readable; chain ends)""")])])
+        got = panel_of("X", ["0x1"])["0x1"]
+        if not isinstance(got, Refusal) or "not readable" not in got.reason:
+            failures.append("panel_of on an unreadable pointer returned %r, "
+                            "want a Refusal" % (got,))
+        else:
+            print("  case ok (name / Refusal(host reason) / Refusal(unreadable)"
+                  " are three distinct results)")
+    finally:
+        ch.run_batch = _saved
 
     print("\n---- parser: findtext HIT lines (SHARED with channel.py)")
     hits = findtext_hits(FT_DONOR)
