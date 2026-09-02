@@ -464,6 +464,31 @@ proc schemaJson*(settings: seq[Setting]): Json =
 # a route handler can serve it without the mod threading the seq through itself.
 
 var gDeclared: seq[Setting] = @[]
+var gPublished = false
+  ## THE SCHEMA HAS BEEN PUBLISHED AND IS NOW IMMUTABLE. Set once, at the end
+  ## of `declareSettings`, and never cleared.
+  ##
+  ## It exists because `gDeclared` is read from a DIFFERENT THREAD than the one
+  ## that writes it. `SettingsPageQuery` arrives on the client host's tick
+  ## thread (measured: a crash stack of `toJson` <- `schemaJson` <-
+  ## `onPageQuery` <- `eventTrampoline` <- six host frames <-
+  ## `BaseThreadInitThunk`), while `declareSettings` runs on whichever thread
+  ## released the mod. `gDeclared = settings` DESTROYS the previous seq before
+  ## it stores the new one, so a second declaration frees, under a reader's
+  ## feet, the 12 KB buffer that reader is walking element by element.
+  ##
+  ## Measured, from the minidump of the 2026-09-02 03:00 crash
+  ## (`tools/dmpread.py`): the faulting read was
+  ## `gDeclared.data[20].optionsUrl.more_0` with the pointer equal to
+  ## `0xdfdfdfdfdfdfdfdf` -- mimalloc's `MI_DEBUG_FREED` fill. The seq header
+  ## on the stack said `len = 54, data = 0x21dd2053000`, and the faulting
+  ## address was exactly `data + 20 * sizeof(Setting)`, so the INDEX was in
+  ## range and the arithmetic was right: the buffer itself had been freed.
+  ##
+  ## So a schema is published ONCE and then never replaced. Nothing in this
+  ## repository loses anything by that -- `mods/admin` is the only mod with two
+  ## `declareSettings` call sites and they are on mutually exclusive paths, so
+  ## no mod declares twice on one run.
 var gAnnounceSubscribed = false
 var gInIndex = true
   ## Whether this mod gets its OWN entry in the F12 nav. False means the
@@ -525,6 +550,12 @@ const
     ## (fact #135: a chunked POST is answered 200 with the schema unchanged).
 
 proc onIndexQuery(payload: string): string =
+  # Same publish gate as `onPageQuery`, and for the same reason: this walks
+  # `gDeclared` on the emitting thread. Not logged here, deliberately -- the
+  # index query is broadcast every bridge cycle to every mod, so a mod with no
+  # settings would print a line every five seconds; the page query, which names
+  # ONE guid, is where the refusal is worth saying out loud.
+  if schemaPublishReason().len > 0: return ""
   if gDeclared.len > 0 and gInIndex:
     var o = obj()
     o.put("guid", modGuid())
@@ -557,6 +588,22 @@ proc onIndexQuery(payload: string): string =
 proc declaredSettings*(): seq[Setting] =
   ## What this mod declared, for a route handler that serves it.
   result = gDeclared
+
+proc schemaPublishReason*(): string =
+  ## `""` when the schema is published and safe to serialise; otherwise ONE
+  ## sentence saying why it is not, in the words the refusal will be logged in.
+  ##
+  ## THREE OUTCOMES, NOT TWO (CLAUDE.md 9b). "ready" and "this mod declared no
+  ## settings" are different answers and a caller must be able to tell them
+  ## apart: the first means serialise, the second means there is nothing to
+  ## serialise and never will be, and neither is "I could not look".
+  if gPublished and gDeclared.len > 0:
+    return ""
+  if gPublished:
+    return "settings schema publish-once: this mod published an EMPTY schema"
+  result = "settings schema publish-once: nothing has been published yet -- " &
+           "declareSettings has not returned, so there is no schema to " &
+           "serialise and reading one would read memory nobody owns"
 
 proc declaredSchemaJson*(): Json =
   ## This mod's declared schema, current values folded in — the body a
@@ -808,7 +855,17 @@ proc onSettingsApplied*(cb: SettingsApplyHook) =
   gApplyHook = cb
 
 proc onPageQuery(payload: string): string =
-  if payload == modGuid() and gDeclared.len > 0:
+  if payload == modGuid():
+    # THE REFUSAL IS LOGGED, NEVER SILENT (CLAUDE.md 6). This handler runs on
+    # whichever thread emitted the query -- on the client that is the host's
+    # tick thread, not the thread that loaded this mod -- so "the schema is not
+    # there yet" is a real state and answering nothing without saying so is the
+    # failure mode this whole file argues against.
+    let why = schemaPublishReason()
+    if why.len > 0:
+      warn "settings: SettingsPageQuery for " & modGuid() &
+           " REFUSED -- " & why
+      return ""
     var o = obj()
     o.put("guid", modGuid())
     o.put("rows", schemaJson(gDeclared))
@@ -819,6 +876,15 @@ proc onApplyQuery(payload: string): string =
   let g = field(payload, "guid")
   if not g.exists or g.asText("") != modGuid():
     return ""
+  block:
+    # An apply ENDS in `schemaJson(gDeclared)`, so it has the page query's
+    # exposure as well as a write. Refuse before the write, not after it: a
+    # value persisted whose readback cannot be served is worse than a refusal.
+    let why = schemaPublishReason()
+    if why.len > 0:
+      warn "settings: SettingsApplyQuery for " & modGuid() &
+           " REFUSED before any write -- " & why
+      return ""
   # A reset arrives on the same query, flagged, because it is the same
   # question -- "make this key be X" -- and splitting it into a second event
   # would give the client transport a second code path to rot in.
@@ -940,10 +1006,33 @@ proc backfillDeclaredDefaults*(settings: seq[Setting]): int =
   result = added.len
 
 proc declareSettings*(settings: seq[Setting]; inIndex = true) =
-  ## Register this mod's schema. Replaces any previous declaration — call it
-  ## once with the whole list, not once per row.
+  ## Register this mod's schema. Call it ONCE with the whole list, not once
+  ## per row -- and a second call is REFUSED, loudly, rather than replacing
+  ## the schema.
+  ##
+  ## It used to say "replaces any previous declaration", and replacing it is
+  ## the measured crash: see `gPublished`. `gDeclared = settings` destroys the
+  ## old seq first, and `onPageQuery` walks that same seq on the host's tick
+  ## thread, so the replacement hands a live reader a freed 12 KB buffer. A
+  ## refusal costs a mod nothing here (no mod in this repo declares twice on
+  ## one path) and it makes the use-after-free unrepresentable rather than
+  ## merely unlikely.
+  if gPublished:
+    warn "settings: declareSettings was called a SECOND time with " &
+         $settings.len & " row(s). REFUSED and IGNORED: the first schema (" &
+         $gDeclared.len & " row(s)) stays in force. Replacing it would free " &
+         "the seq that this process's SettingsPageQuery handler may be " &
+         "walking on another thread right now -- that is a measured crash, " &
+         "not a theoretical one. Declare the whole schema in one call."
+    gInIndex = inIndex
+    return
   gDeclared = settings
   gInIndex = inIndex
+  # PUBLISHED HERE, before the subscriptions below and before the backfill,
+  # because from this line on `gDeclared` is immutable and every reader on
+  # every thread may walk it. The subscriptions come after, so a query cannot
+  # arrive before this flag is true.
+  gPublished = true
   # Self-healing on load. See `backfillDeclaredDefaults`: the deploy seed rule
   # cannot carry a NEW key into an install that already has a config.json, so
   # without this every setting added after a player's first deploy is a control

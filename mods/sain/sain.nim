@@ -1952,10 +1952,81 @@ const ReloadProbe = 1
   ## being verified is "change code, press reload, see the change", and a stamp
   ## that moves on every rebuild would also move when nothing was edited.
 
+proc declareSainSettings(): int =
+  ## Declare the schema AND prove, on this machine on every load, the two
+  ## properties the 2026-09-02 03:00 client crash turned on. Returns the number
+  ## of FAILED checks; 0 is a pass.
+  ##
+  ## That crash died in `toJson` <- `schemaJson` <- `onPageQuery` <-
+  ## `eventTrampoline`, on a host thread, reading
+  ## `gDeclared.data[20].optionsUrl.more_0` == 0xdfdfdfdfdfdfdfdf -- mimalloc's
+  ## MI_DEBUG_FREED fill, so the published schema buffer had been FREED. The
+  ## index was in range and the pointer arithmetic was exact, which rules out
+  ## the two explanations that look right from the source: an out-of-range walk
+  ## and an uninitialised field.
+  ##
+  ## THIS RUNS BEFORE THE GAME EXISTS and needs nothing from it, which is the
+  ## point: the failure it guards is a race that only shows up one boot in
+  ## three, and a check that can only run in the failing window is not a check.
+  ## Both halves can genuinely fail -- comment out the `gPublished` guard in
+  ## `aowlspt/settings` and the second one reports FAIL on the next load.
+  result = 0
+
+  # 1. BEFORE ANYTHING IS PUBLISHED. The schema path must REFUSE with a reason
+  #    and must not fault. `declaredSchemaJson` is the same walk `onPageQuery`
+  #    does, so calling it here is the pre-publish path under test, not a proxy
+  #    for it.
+  let whyBefore = schemaPublishReason()
+  let rowsBefore = declaredSchemaJson().text
+  if whyBefore.len == 0:
+    error "sain: publish-once selftest FAIL -- schemaPublishReason() was " &
+          "EMPTY before declareSettings, i.e. it reported the schema ready " &
+          "when nothing had been published"
+    inc result
+  if rowsBefore != "[]":
+    error "sain: publish-once selftest FAIL -- the pre-publish schema walk " &
+          "returned " & $rowsBefore.len & " bytes instead of an empty array"
+    inc result
+
+  declareSettings(sainSchema())
+
+  # 2. AFTER. Ready, with rows.
+  let whyAfter = schemaPublishReason()
+  let n = declaredSettings().len
+  if whyAfter.len > 0:
+    error "sain: publish-once selftest FAIL -- after declareSettings the " &
+          "schema still refuses: " & whyAfter
+    inc result
+  if n == 0:
+    error "sain: publish-once selftest FAIL -- declareSettings published 0 rows"
+    inc result
+
+  # 3. THE REFUSAL, EXERCISED FOR REAL. A second declaration must not replace
+  #    the schema, because replacing it frees the seq a reader on another
+  #    thread may be walking. Asserted on the FINISHED STATE -- the row count
+  #    afterwards -- not on the call returning.
+  # The canary is an EMPTY schema, deliberately: a row would be a declared
+  # setting with no key in config.json, which is exactly the "control that
+  # renders and resolves to nothing" the mods build audit fails on -- it
+  # caught this on the first build.
+  var canary: seq[Setting] = @[]
+  declareSettings(canary)
+  if declaredSettings().len != n:
+    error "sain: publish-once selftest FAIL -- a second declareSettings " &
+          "REPLACED the schema (" & $n & " rows became " &
+          $declaredSettings().len & "). That is the use-after-free this " &
+          "guard exists to make unrepresentable. Re-declaring to recover."
+    inc result
+    declareSettings(sainSchema())
+  if result == 0:
+    info "sain: settings publish-once selftest PASS -- the schema refused " &
+         "with a reason before it was published, published " & $n & " rows, " &
+         "and refused a second declaration without dropping any of them"
+
 proc onLoad(): Status =
   info "sain: ReloadProbe=" & $ReloadProbe & " -- if this number did not change " &
        "after you edited it and reloaded, the reload did NOT take"
-  declareSettings(sainSchema())
+  discard declareSainSettings()
   discard serve("/aowlspt/settings/aowl.sain", onSainSettings)
   discard serve("/aowlspt/settings/aowl.sain/reset", onSainSettingsReset)
   gPreset = loadPreset()
