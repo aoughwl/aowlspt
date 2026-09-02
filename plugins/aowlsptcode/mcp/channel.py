@@ -25,6 +25,7 @@ import hashlib
 import itertools
 import os
 import re
+import sys
 import tempfile
 import time
 
@@ -189,11 +190,47 @@ def diagnose(log_path, read=_read):
     return "last of what the host said about the channel: " + " | ".join(hits[-3:])
 
 
+def writer_tag():
+    """A short, filesystem-derived name for THIS process, for the sentinel.
+
+    `tools/ichannel.py` re-exports this module, so acceptance.py,
+    nativetabs_check.py, inspector.py and the MCP server are all the same
+    transport -- a hardcoded "mcp" would put the wrong writer's name in the
+    host log, which is worse than no name. The tag is the running script's
+    basename (`server.py` -> `mcp`, the name the tool surface is known by),
+    sanitised to [a-z0-9] so it can never break the sentinel's tokenisation.
+    """
+    try:
+        base = os.path.basename(sys.argv[0] or "")
+    except Exception:
+        base = ""
+    base = os.path.splitext(base)[0].lower()
+    if base in ("server", ""):
+        base = "mcp"
+    clean = "".join(c for c in base if c.isalnum())[:12]
+    return clean or "py"
+
+
 def new_sentinel():
     """Unique per call within this process: monotonic counter + wallclock ms,
-    so two calls issued in the same millisecond still cannot collide."""
+    so two calls issued in the same millisecond still cannot collide.
+
+    WRITER ATTRIBUTION. The tag `mcp<pid>` is in the sentinel deliberately,
+    because the sentinel is the ONE part of a batch that reaches the host log:
+    the host echoes every command it runs (`> echo aowl-batch-...`) and SKIPS
+    `#`-prefixed serial lines without logging them (inspect.nim: "`#`-prefixed
+    serial lines are skipped by design"), so a writer tag put only on the
+    serial line would be invisible exactly where it is needed.
+
+    Measured 2026-09-02, and this is what the tag is for: 9 unattributed
+    batches ran in the first 23s of a client boot and had to be traced to a
+    writer by the SHAPE of their sentinel (`aowl-batch-<6 digits>`, i.e.
+    `tools/aowlui.nim`'s `nowMs() mod 1000000`) rather than by anything the
+    log said. An attributed sentinel makes that a grep instead of an
+    investigation."""
     n = next(_counter)
-    return "aowl-batch-%d-%d" % (int(time.time() * 1000), n)
+    return "aowl-batch-%s%d-%d-%d" % (writer_tag(), os.getpid(),
+                                      int(time.time() * 1000), n)
 
 
 def run_batch(lines, live_dir=None, timeout=25.0, write=False,
