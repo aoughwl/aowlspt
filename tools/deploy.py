@@ -19,8 +19,23 @@ feature and adding its fingerprint are one edit in one place.
     python tools/deploy.py deploy --only host,tarkov
     python tools/deploy.py deploy --dry-run      # print the plan, do nothing
     python tools/deploy.py status                # what is OFF / MISSING / stale
+    python tools/deploy.py where host,sain       # where do these live, exactly
     python tools/deploy.py rollback              # list restorable backups
     python tools/deploy.py rollback host         # restore host's newest backup
+
+WHERE IS THIS ARTIFACT, EXACTLY?
+--------------------------------
+`where` answers the question that was being guessed at: it prints, per named
+artifact, the SOURCE path both repo-relative and absolute, whether that file
+exists with its size and mtime, the install DESTINATION, the installed file's
+size and mtime, and whether the two are byte-identical (both are hashed --
+mtime is not evidence). Measured 2026-09-01: two agents guessed `build\\host\\...`
+for the host DLL and got INCONCLUSIVE out of `check`, which named the path it
+expected only on the ok line. `check` now names the expected source path on
+every verdict, and `where` exists so the path never has to be guessed at all.
+It is read-only: it copies nothing, verifies no markers, and never deploys.
+Three outcomes as everywhere else -- a source that is absent because a BUILD IS
+IN PROGRESS is INCONCLUSIVE and says so, never "not built".
 
 `--install PATH` overrides the destination from `deploy.json`.
 
@@ -1003,6 +1018,12 @@ def cmd_check(args, cfg, C, check_data=True):
                      override if override else art["src"], n,
                      "" if n == 1 else "s", extra, os.path.getsize(src)))
             continue
+        # NAME THE PATH ON EVERY VERDICT, not only on the ok line. Measured
+        # 2026-09-01: two agents guessed the host DLL's source path
+        # (`build\host\...`), got INCONCLUSIVE, and had no way to see which
+        # path this tool had actually looked at -- so they guessed again. The
+        # absolute path is the one that settles it, and `where` prints the
+        # same pair without running a check at all.
         if verdict == INCONCLUSIVE:
             unknown += 1
             print("%sINCONCLUSIVE%s %-8s %s"
@@ -1010,6 +1031,7 @@ def cmd_check(args, cfg, C, check_data=True):
         else:
             bad += 1
             print("%sFAIL%s %-8s %s" % (red, reset, art["name"], art["src"]))
+        print("       expected source: %s" % src)
         for p in problems:
             print("       %s" % p)
     if bad:
@@ -1407,6 +1429,136 @@ def cmd_status(args, cfg, C):
     return 0
 
 
+def _stamp(path):
+    return time.strftime("%Y-%m-%d %H:%M:%S",
+                         time.localtime(os.path.getmtime(path)))
+
+
+IDENTICAL = "IDENTICAL"
+DIFFERS = "DIFFERS"
+
+
+def where_one(art, install, repo=None):
+    """Everything locatable about ONE artifact. Returns (verdict, lines).
+
+    Read-only and deliberately dumb: it states paths and bytes, it does not
+    verify markers and it does not deploy. The verdict is only about the
+    byte comparison of source vs installed file:
+
+        IDENTICAL     both exist and hash the same
+        DIFFERS       both exist and hash differently -- the install is not
+                      running these bytes
+        INCONCLUSIVE  one of them is not there, or could not be read, so the
+                      comparison was never made. A source that is absent
+                      while a BUILD IS IN PROGRESS says so, because "not
+                      built" and "being rebuilt right now" send the reader to
+                      do different things (and one of them is redundant).
+    """
+    repo = repo or REPO
+    rel = art["src"]
+    src = os.path.join(repo, rel.replace("/", os.sep))
+    dst = os.path.join(install, art["dst"].replace("/", os.sep))
+    state, live = live_state(dst)
+
+    lines = ["  source      %s" % rel,
+             "              %s" % src]
+    src_ok = os.path.isfile(src)
+    if src_ok:
+        lines.append("              PRESENT  %d bytes  %s"
+                     % (os.path.getsize(src), _stamp(src)))
+    else:
+        building = build_in_progress()
+        if building:
+            lines.append("              ABSENT -- a BUILD IS IN PROGRESS: %s"
+                         % building)
+            lines.append("              it is absent because it is being "
+                         "rebuilt right now, not because it was never built.")
+        else:
+            lines.append("              ABSENT -- not built in this checkout")
+
+    lines.append("  destination %s" % dst)
+    if state == ENABLED:
+        lines.append("              PRESENT  %d bytes  %s"
+                     % (os.path.getsize(live), _stamp(live)))
+    elif state == SWITCHED_OFF:
+        lines.append("              the enabled path does NOT exist; the "
+                     "install has this SWITCHED OFF as:")
+        lines.append("              %s" % live)
+        lines.append("              PRESENT  %d bytes  %s  -- a .off file "
+                     "does not load" % (os.path.getsize(live), _stamp(live)))
+    elif state == AMBIGUOUS:
+        lines.append("              PRESENT  %d bytes  %s"
+                     % (os.path.getsize(live), _stamp(live)))
+        lines.append("              AMBIGUOUS: %s also exists (%d bytes, %s). "
+                     "The enabled one is what loads."
+                     % (off_path(dst), os.path.getsize(off_path(dst)),
+                        _stamp(off_path(dst))))
+    else:
+        lines.append("              ABSENT -- neither %s nor %s.off is in "
+                     "the install" % (art["dst"], art["dst"]))
+
+    if not src_ok or live is None:
+        lines.append("  identical   INCONCLUSIVE -- %s, so the two were never "
+                     "compared. This is NOT evidence they differ."
+                     % ("the source is absent" if not src_ok
+                        else "there is nothing installed to compare against"))
+        return INCONCLUSIVE, lines
+    try:
+        hs, hd = _sha(src), _sha(live)
+    except OSError as e:
+        lines.append("  identical   INCONCLUSIVE -- could not read one of "
+                     "them: %s" % e)
+        return INCONCLUSIVE, lines
+    if hs == hd:
+        lines.append("  identical   YES  sha256 %s (both)" % hs[:16])
+        lines.append("              %s" % (
+            "the installed file is switched OFF, so these bytes are current "
+            "but NOT loading." if state == SWITCHED_OFF
+            else "the install is running exactly these bytes."))
+        return (INCONCLUSIVE if state == SWITCHED_OFF else OK), lines
+    lines.append("  identical   NO   source  sha256 %s" % hs[:16])
+    lines.append("                   install sha256 %s" % hd[:16])
+    lines.append("              the install is NOT running the built bytes. "
+                 "`deploy` is what fixes that (it verifies markers first).")
+    return FAIL, lines
+
+
+def cmd_where(args, cfg, C):
+    """Print, per artifact, where it comes from and where it goes.
+
+    This verb exists because the path was being GUESSED. `check` printed the
+    source path only on its ok line, so an agent who guessed wrong got
+    INCONCLUSIVE and no correction (measured twice, 2026-09-01). Nothing here
+    writes, so it is safe to run against a live install at any time.
+    """
+    red, green, yellow, dim, reset = C
+    install = args.install or cfg["install"]
+    repo = os.path.abspath(args.repo) if args.repo else REPO
+    arts = select(cfg, args.only)
+    print("repo:    %s" % repo)
+    print("install: %s%s" % (install,
+                             "" if os.path.isdir(install)
+                             else "   (this directory DOES NOT EXIST)"))
+    bad = unknown = 0
+    for art in arts:
+        verdict, lines = where_one(art, install, repo)
+        col, tag = ((green, IDENTICAL) if verdict == OK else
+                    (red, DIFFERS) if verdict == FAIL else
+                    (yellow, INCONCLUSIVE))
+        if verdict == FAIL:
+            bad += 1
+        elif verdict != OK:
+            unknown += 1
+        print("\n%s%s%s  %s" % (col, tag, reset, art["name"]))
+        for ln in lines:
+            print(ln)
+    print("\n%d artifact(s): %d differ, %d inconclusive."
+          % (len(arts), bad, unknown))
+    if bad:
+        return 1
+    return 3 if unknown else 0
+
+
 def find_backups(install, art):
     dst = os.path.join(install, art["dst"].replace("/", os.sep))
     d = os.path.dirname(dst)
@@ -1453,7 +1605,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__)
     p.add_argument("command", choices=["check", "deploy", "rollback",
-                                     "status"])
+                                     "status", "where"])
     p.add_argument("target", nargs="?", default=None,
                    help="artifact name(s), comma separated; same as --only")
     p.add_argument("--only", default=None,
@@ -1507,8 +1659,9 @@ def main():
                    help="which encoding(s) --contains/--absent search "
                         "(default: any = UTF-8 and UTF-16LE)")
     p.add_argument("--repo", default=None, metavar="PATH",
-                   help="`status` only: the checkout whose build outputs the "
-                        "live files are compared against (default: this one)")
+                   help="`status`/`where` only: the checkout whose build "
+                        "outputs the live files are compared against "
+                        "(default: this one)")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--re-enable", action="store_true",
                    help="switch a mod back ON that the install had switched "
@@ -1534,6 +1687,8 @@ def main():
                  "file in place and never copies anything.")
     if args.command == "status":
         return cmd_status(args, cfg, C)
+    if args.command == "where":
+        return cmd_where(args, cfg, C)
     if args.command == "check":
         return cmd_check(args, cfg, C)
     if args.command == "deploy":
