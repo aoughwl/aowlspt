@@ -7441,3 +7441,17 @@ offline-raid screen, every transition an event with a readback. The step
 after it (NEXT->insurance) still waits for the following screen's control
 instead of pressing this screen's own NEXT; being generalised into a
 (site, screen, action) table.
+
+## 2026-09-02 07:32: singleplayer rebrand LIVE and event-driven
+
+MEASURED on the offline-raid screen reached by the host-native raid entry:
+`singleplayer rebrand: resolved on "Matchmaker Offline Raid Screen" --
+heading TMP found, description TMP found, checkbox GameObject found,
+UpdatableToggle component found, co-op/progress warning found`; `frames-to-
+apply=1 verdict PASS` (no visible flash); `FINISHED-STATE readback --
+heading: PASS (the rendered TMP no longer reads "PRACTICE GAME MODE");
+description: PASS; forced isOn: PASS; hide: PASS; coop-warning: PASS`;
+`SHOW WINDOW CLOSED ... held for 90 consecutive frames`; `IDLE PROOF PASS --
+60 s after the window closed this feature has visited 0 live-tree nodes`.
+The user's two asks -- the rebrand working, and no polling for UI elements
+-- are both met by the uihooks show-event design.
