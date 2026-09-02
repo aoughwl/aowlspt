@@ -55,6 +55,10 @@ aowl -- build, test and install aowlspt
   doctor             check the toolchain before it wastes your afternoon
   run PATH           build a mod and run it in the simulator
   payload            assemble installer/payload from what is built
+  payload-public     the same payload, but the mods folder holds SOURCE and
+                     carries modbuild.py, abi/ and aowl/src so an install can
+                     compile it at startup. Add the toolchain with
+                     `python tools	oolchain.py`.
   release            a versioned, verifiable artifact; --mod NAME for one mod
   importdb           build the emulator's db.json from an SPT install
                      (--from D:\SPT; --help for the rest)
@@ -70,6 +74,11 @@ aowl -- build, test and install aowlspt
 
 Options
   --debug            build with debug info and no optimisation
+  --no-lock          allow `build` OUTSIDE tools\buildlock.py. Normally
+                     `build` refuses unless AOWL_BUILDLOCK is set, because
+                     two builds in ONE checkout corrupt each other and an
+                     unlocked build is invisible to the lock. For bootstrap
+                     and CI.
   --nimony PATH      nimony checkout (default: %USERPROFILE%\nimony)
   --ucrt64 PATH      msys2 ucrt64 bin (default: C:\msys64\ucrt64\bin)
   -v, --verbose      show every command
@@ -464,6 +473,21 @@ proc buildMod(e: Env; modPathIn: string): bool =
   if e.debugBuild:
     cmd.add " -d:debug"
   cmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
+  # `abi/` as a NIM path, not only as a C include path.
+  #
+  # `abi/aowlspt_symtab.nim` is generated beside its own header and is the Nim
+  # view of the same table. `mods/sain` needs it, and the only way to reach it
+  # was a checkout-relative import -- `import ".." / ".." / ".." / abi /
+  # aowlspt_symtab` -- which resolves inside the repo and NOWHERE ELSE.
+  # Measured 2026-09-01, building a mods folder in a fresh install:
+  # `client/drivecalls.nim(88, 1) Error: file not found: <install>\toolchain\abi`.
+  # Since aowlspt ships mods as SOURCE, a mod that only compiles inside our
+  # checkout is not a mod anybody else can build.
+  #
+  # Kept in step with `compile_cmd` in `tools/modbuild.py`, which is the same
+  # command line for the same reason: two compile paths that drift produce
+  # binaries differing for reasons nobody can see.
+  cmd.add " -p:" & quoted(joinPath(e.repo, "abi"))
   cmd.add " -p:" & quoted(joinPath(e.nimony, "src\\lib"))
   cmd.add " -o:" & quoted(outPath)
   cmd.add " " & quoted(source)
@@ -3378,6 +3402,41 @@ proc cmdRun(e: Env; modPath: string; simArgs: string = ""): int =
     ok "sim"
   result = if failures > 0: 1 else: 0
 
+proc stageTree(src, dst: string; exts: seq[string]; skipDirs: seq[string];
+               copied: var int): int =
+  ## Copy `src` into `dst`, keeping only files whose extension is in `exts`
+  ## (empty = every file) and never descending into a directory whose FIRST
+  ## path component is in `skipDirs`. Returns how many files were staged.
+  ##
+  ## The skip list is matched on the leading component, not by substring: a mod
+  ## with a source directory called `binding` must not be dropped because the
+  ## rule was really about `bin`.
+  result = 0
+  if not isDirectory(src): return
+  var files: seq[string] = @[]
+  var dirs: seq[string] = @[]
+  collectEntries(src, files, dirs)
+  for f in files:
+    let rel = normSep(f)
+    var head = rel
+    let slash = find(rel, "\\")
+    if slash > 0: head = rel.substr(0, slash - 1)
+    var skip = false
+    for s in skipDirs:
+      # Any component, not just the first: `mgr\nimcache\x.nif` must go too.
+      if head == s or find(rel, s & "\\") >= 0:
+        skip = true
+    if skip: continue
+    if exts.len > 0:
+      var wanted = false
+      let low = toLowerAscii(rel)
+      for x in exts:
+        if endsWith(low, x): wanted = true
+      if not wanted: continue
+    if copyFileAt(joinPath(src, f), joinPath(dst, f)).ok:
+      inc result
+      inc copied
+
 proc cmdPayload(e: Env): int =
   ## Assembles `installer/payload/aowlspt` out of what has been built, so that
   ## `aowlspt-install` has something to install. Only the `aowlspt/` part: a
@@ -3593,6 +3652,175 @@ proc cmdPayload(e: Env): int =
     return 1
   result = 0
 
+proc cmdPayloadPublic(e: Env; extra: seq[string]): int =
+  ## `aowl payload-public` -- a payload whose mods folder holds SOURCE.
+  ##
+  ## ## What this is for, and why `payload` could not be it
+  ##
+  ## The stated requirement is: *"always package with aowlspt our nimony build
+  ## so that the users mods folder is always uncompiled, on startup its
+  ## compiled (we cache if same file)"*. Two thirds of that existed and were
+  ## never joined up:
+  ##
+  ##   * `tools/modbuild.py` compiles a mods folder from source, with a content
+  ##     cache, and writes the in-game loading step;
+  ##   * `tools/toolchain.py` packs gcc, lld, nimony and (since 2026-09-01) a
+  ##     Python interpreter into `<install>/toolchain/`;
+  ##   * and `aowl payload` staged **prebuilt `.dll` files** -- measured, no
+  ##     `.nim` sources, no `tools/`, no `abi/`, no `aowl/src`, no toolchain.
+  ##
+  ## So an installed aowlspt was a bag of binaries: a player who edited a mod
+  ## had no path from the edit to the game loading it. This is the payload that
+  ## ships the other shape.
+  ##
+  ## ## It runs `payload` FIRST, on purpose
+  ##
+  ## Everything that is genuinely a binary -- the client host, the backend, the
+  ## registry, each mod's `data/` and `config.json` -- is staged by the normal
+  ## `payload`, and this adds to that rather than restating it. Two staging
+  ## routines that drift is how a payload comes to be missing a piece nobody
+  ## notices until an install is already broken.
+  ##
+  ## It also means the ordinary payload's gate still applies: it FAILS if a mod
+  ## has no library. That gate is worth keeping here even though the libraries
+  ## are then replaced by sources, because it means we only ever ship source we
+  ## have just watched compile.
+  ##
+  ## ## What it adds
+  ##
+  ##   aowlspt\mods\<mod>\**        the SOURCE (.nim/.h/.c/.json/.cfg)
+  ##   aowlspt\tools\modbuild.py    the compiler driver
+  ##   aowlspt\tools\modloadfmt.py  the loading-step renderer it imports
+  ##   aowlspt\abi\                 headers AND aowlspt_symtab.nim (-I and -p)
+  ##   aowlspt\aowl\src\            the aowlspt Nim library every mod imports
+  ##
+  ## and it REMOVES each mod's staged `.dll`, because shipping both would let a
+  ## stale binary load while the source beside it says something else -- the
+  ## exact "a failure that looks like a success" shape this repo keeps hitting.
+  ##
+  ## The toolchain itself is NOT staged here. It is 842 MB, it is built by a
+  ## different tool with its own manifest and hash verification, and copying it
+  ## through a second, unverified path would throw away the guarantee that
+  ## `toolchain.py install` exists to give. Install it into the payload (or the
+  ## finished install) with:
+  ##
+  ##     python tools\toolchain.py pack    --out build\toolchain
+  ##     python tools\toolchain.py install --from build\toolchain --install <install>\aowlspt
+  ##
+  ## `payload-public` says so at the end rather than leaving it implied.
+  ## ## `--sources-only`
+  ##
+  ## Stages the SOURCE side and skips the ordinary payload entirely. The result
+  ## is NOT installable and must never be shipped: it has no client host, no
+  ## backend, no registry and no mod data. It exists because the source staging
+  ## has to be verifiable on a checkout where the binaries are not built --
+  ## which, in a repo where several agents are editing `host/` at once, is most
+  ## of the time. A `NOT-INSTALLABLE.txt` is written into the payload so the
+  ## directory itself says what it is, rather than relying on whoever produced
+  ## it to remember.
+  var sourcesOnly = false
+  for a in extra:
+    if a == "--sources-only":
+      sourcesOnly = true
+    elif startsWith(a, "-"):
+      err "unknown option for payload-public: " & a
+      return 1
+
+  let failuresAtEntry = failures
+  if not sourcesOnly:
+    let rc = cmdPayload(e)
+    if rc != 0:
+      err "the ordinary payload failed, so there is nothing to add sources to"
+      note "to verify the SOURCE staging alone on a checkout whose binaries " &
+           "are not built, use `aowl payload-public --sources-only`. What it " &
+           "produces is deliberately not installable and says so."
+      return rc
+
+  let dest = joinPath(e.repo, "installer\\payload\\aowlspt")
+  heading "Payload (public: mods as SOURCE)"
+  var copied = 0
+
+  let srcExts = @[".nim", ".h", ".c", ".cpp", ".json", ".cfg"]
+  let skipDirs = @["nimcache", "bin", ".git", "__pycache__"]
+
+  let realMods = modDirs(e)
+  for m in realMods:
+    let name = baseName(m)
+    let modDst = joinPath(joinPath(dest, "mods"), name)
+    let n = stageTree(m, modDst, srcExts, skipDirs, copied)
+    # The staged library goes. A mods folder that holds BOTH a source tree and
+    # yesterday's binary is a folder where the game can load code nobody can
+    # see, and modbuild would rebuild it anyway on the first launch.
+    var files: seq[string] = @[]
+    var dirs: seq[string] = @[]
+    collectEntries(modDst, files, dirs)
+    var dropped = 0
+    for f in files:
+      if endsWith(toLowerAscii(f), ".dll"):
+        if removeFileAt(joinPath(modDst, f)).ok: inc dropped
+    say "mod " & name & " -> " & $n & " source file(s) staged, " &
+        $dropped & " prebuilt library(ies) removed"
+
+  # The compiler driver. Only these two: `modbuild.py` imports `modloadfmt`
+  # and nothing else of ours, which is checked by `tools/test_modloadfmt.py`.
+  let toolsDst = joinPath(dest, "tools")
+  discard ensureDir(toolsDst)
+  var toolsN = 0
+  for t in ["modbuild.py", "modloadfmt.py"]:
+    let s = joinPath(e.repo, "tools\\" & t)
+    if fileExists(s):
+      if copyFileAt(s, joinPath(toolsDst, t)).ok:
+        inc toolsN
+        inc copied
+    else:
+      err "tools\\" & t & " is missing; the install would have sources and " &
+          "nothing to compile them with"
+      inc failures
+  say "tools -> " & $toolsN & " file(s) (" & toolsDst & ")"
+
+  # The two search paths every mod compile needs. `abi` is BOTH a C include
+  # directory and a nim path (`abi/aowlspt_symtab.nim`); `aowl/src` is the
+  # library every mod imports.
+  let abiN = stageTree(joinPath(e.repo, "abi"), joinPath(dest, "abi"),
+                       @[".h", ".nim", ".c"], @[], copied)
+  say "abi -> " & $abiN & " file(s)"
+  let libN = stageTree(joinPath(e.repo, "aowl\\src"),
+                       joinPath(dest, "aowl\\src"), @[".nim"], @[], copied)
+  say "aowl\\src -> " & $libN & " file(s)"
+
+  if abiN == 0 or libN == 0:
+    err "abi/ or aowl/src staged NOTHING. Every mod compiles against both, so " &
+        "this payload would install a mods folder that cannot be built."
+    inc failures
+
+  line ""
+  line "  The TOOLCHAIN is not in this payload. Add it with:"
+  line "    python tools\\toolchain.py pack    --out build\\toolchain"
+  line "    python tools\\toolchain.py install --from build\\toolchain " &
+       "--install <install>\\aowlspt"
+  line "  It is 842 MB with its own manifest and per-file SHA-256 check, and " &
+       "copying it through a second unverified path would throw that away."
+
+  let mine = failures - failuresAtEntry
+  if mine > 0:
+    err $mine & " problem(s) staging the public payload"
+    return 1
+  if sourcesOnly:
+    # The directory says what it is. A half payload that looks like a whole
+    # one is exactly the artifact somebody installs by accident.
+    let nl = "\n"
+    discard writeTextFile(joinPath(dest, "NOT-INSTALLABLE.txt"),
+      "This payload was staged with: aowl payload-public --sources-only" & nl &
+      "It contains the mod SOURCES, tools, abi and aowl/src ONLY." & nl &
+      "There is NO client host, NO backend, NO registry and NO mod data." & nl &
+      "DO NOT INSTALL IT. Run `aowl payload-public` (no flag) for a real one." &
+      nl)
+    warn "--sources-only: this payload is NOT installable. It has no " &
+         "client host, no backend, no registry and no mod data. " &
+         "NOT-INSTALLABLE.txt in the payload says the same."
+  ok "public payload staged: " & $copied & " file(s) added as SOURCE"
+  result = 0
+
 proc cmdRelease(e: Env; extra: seq[string]): int =
   ## `aowl release` -- builds `tools/release.nim` and hands it this repo plus
   ## whatever else was typed. Every gate, every refusal and the archive format
@@ -3697,6 +3925,7 @@ proc main(): int =
   var i = 1
   let n = paramCount()
   var help = false
+  var noLock = false
   while i <= n:
     let a = paramStr(i)
     # `release` parses its own options -- `--mod`, `--out`, `--check-only`.
@@ -3704,7 +3933,7 @@ proc main(): int =
     # having to learn a second command's flags, and keeps them from drifting.
     if command == "release" or command == "importdb" or
        command == "ui" or command == "raid" or command == "script" or
-       command == "loothash":
+       command == "loothash" or command == "payload-public":
       # `script` joins this list because an automation script takes its OWN
       # arguments, and `aowl` must not eat them. `--build-only` is read out of
       # `extra` by the `script` branch below. `loothash` likewise parses its
@@ -3712,6 +3941,8 @@ proc main(): int =
       extra.add a
     elif a == "--debug":
       e.debugBuild = true
+    elif a == "--no-lock":
+      noLock = true
     elif a == "--nimony":
       inc i
       if i <= n: e.nimony = paramStr(i)
@@ -3743,6 +3974,25 @@ proc main(): int =
   if help or command.len == 0:
     echo Usage
     return (if help: 0 else: 1)
+
+  # Two builds in ONE checkout corrupt each other -- CLAUDE.md section 3, and
+  # measured twice. `tools/buildlock.py` makes that impossible for anything
+  # that goes through it, but an unlocked build leaves no trace at all: the
+  # lock reads FREE while a hand-typed `aowl.exe build host` is halfway through
+  # the same nimcache. That happened on 2026-09-01 and corrupted it twice.
+  #
+  # So the child, not the lock, is where this has to fail closed. buildlock.py
+  # exports AOWL_BUILDLOCK=<its pid>; its absence means nobody is serialising
+  # this build. `--no-lock` is the deliberate way out (bootstrap, CI), and
+  # `bootstrap` itself is exempt because it is how a worktree gets an aowl.exe
+  # in the first place -- run it through the lock anyway when one exists:
+  # `python tools\buildlock.py bootstrap`.
+  if command == "build" and not noLock and getEnv("AOWL_BUILDLOCK", "").len == 0:
+    err "REFUSED: build outside tools/buildlock.py -- run `python tools/buildlock.py build <target>`"
+    note "two builds in ONE checkout corrupt each other; separate git " &
+         "worktrees are safe and do not contend"
+    note "pass --no-lock if you really mean to build unserialised"
+    return 4
 
   # `ui` and `raid` drive a RUNNING game through the inspector's text channel.
   # They compile nothing, so demanding a toolchain checkout -- and printing
@@ -3834,6 +4084,7 @@ proc main(): int =
     else:
       result = cmdScript(e, path, sArgs)
   of "payload": result = cmdPayload(e)
+  of "payload-public": result = cmdPayloadPublic(e, extra)
   of "release": result = cmdRelease(e, extra)
   of "importdb": result = cmdImportDb(e, extra)
   of "clean": result = cmdClean(e)
