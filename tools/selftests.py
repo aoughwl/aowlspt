@@ -239,6 +239,10 @@ VERIFIERS = [
     V("uihooks_check.py", "test_uihooks_falsifier.py",
       "feeds a per-frame action trail and asserts FAIL, so PASS is not the "
       "only reachable verdict"),
+    V("dlss.py", "dlss.py selftest",
+      "synthetic install tree; the wrong (unsigned) checksum formula, an "
+      "off-by-one checksum, a same-size DLL tamper and a truncated backup "
+      "must each make install/rollback FAIL, so PASS is not the only answer"),
     V("nativetabs_check.py", "nativetabs_check.py selftest",
       "self-test case 4 is the negative control: changed geometry must make "
       "the comparison FAIL. This is the check that once accepted a FAIL "
