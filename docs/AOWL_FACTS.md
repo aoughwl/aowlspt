@@ -6624,3 +6624,46 @@ the schema refused with a reason before it was published, published 55 rows,
 and refused a second declaration`; and the modeskip fix's falsifier line
 `MenuScreen::Show fired (uihooks site 2, epoch 1) ... every pointer this
 feature cached about it is DROPPED` printed on a boot that survived.
+
+## 2026-09-02: the screen after the main-menu PLAY is the SIDE selector, not any character screen
+
+MEASURED live (coordinator's run on the 4,705,280-byte build): PLAY pressed at
+1:24, `step CHARACTER -- no ACTIVE CharacterSelectionScreen appeared within
+12 s`, NEXT never visible, and the refusal census named what was really up:
+
+    Common UI active(depth<=2)=2: [Common UI][ChatScreen]
+    Menu UI   active(depth<=2)=3: [UI][MatchMaker Side Selection Screen]
+                                  [Operation Queue Indicator]
+
+**`EFT.UI.Matchmaker.MatchMakerSideSelectionScreen`** -- PMC or SCAV, then NEXT.
+Two earlier readings in this file were WRONG and are corrected here: the "SELECT
+YOUR CHARACTER / PVE ZONE" screenshot was THIS screen, and
+`CharacterSelectionScreen` is the boot-time slot screen only -- it does not come
+back after PLAY, which is also why modeskip's `ShowSlot` postfix never fired for
+it. The event was not missed; the screen was never shown. A poll looking for the
+wrong screen cannot tell "not yet" from "not this screen at all".
+
+**`MatchMakerSideSelectionScreen::Show(RaidSideSelectionScreenController)` --
+RVA `0x1790180`, arity 1, `sharedness=UNIQUE owners=1`, section `il2cpp`,
+PUBLIC|VIRTUAL.** Prologue (measured):
+`48 89 5C 24 08 | 57 | 48 83 EC 30 | 80 3D 79 E5 92 05 00` --
+`mov [rsp+8],rbx ; push rdi ; sub rsp,0x30 ; cmp byte [rip+0x0592E579],0`. First
+instruction boundary at or past `AOWL_JMP_SIZE`=14 is **17**, and the only
+relative operand in the stolen bytes is the RIP-relative `cmp`, which
+`aowl_copy_relocated` fixes up -- byte-for-byte the same shape as
+`MatchmakerOfflineRaidScreen::Show`, so `relocatable=1` for the same reason. It
+is now **uihooks site 3** (appended at the END of the table; every index there
+is positional). The same type also declares a PRIVATE 4-arg `Show` @`0x1790210`
+-- not the one to hook.
+
+The side captions are `DefaultUIButton._text`, **not TMP text**, so the
+displayed-text match the map tiles use is unavailable without a field offset
+this host has not measured. autoraid therefore matches the control's GameObject
+NAME (`autoRaidSide`, default "pmc") and logs every ACTIVE control name under
+the live screen once, so the names become a measured fact in the next run's log
+rather than a guess in the code.
+
+**ChatScreen is ACTIVE at the menu normally** -- measured in BOTH menu censuses
+of 2026-09-02, one with Settings overlaying the menu and one with PLAY
+pressable. It is not an overlay; PRE-MENU ignores it and only ever closes
+SettingsScreen.

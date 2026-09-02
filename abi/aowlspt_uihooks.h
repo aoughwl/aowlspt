@@ -58,6 +58,7 @@
 #define AOWL_UIH_SITE_OFFLINE_RAID 0
 #define AOWL_UIH_SITE_MENU_SCREEN  1
 #define AOWL_UIH_SITE_MENU_SHOW    2
+#define AOWL_UIH_SITE_SIDE_SELECT  3
 
 /* Why the last `aowl_uih_site_at` returned NULL. A refusal must name itself;
  * "returned NULL" is not a diagnosis (CLAUDE.md 6). */
@@ -186,6 +187,52 @@ static const AowlUihSite aowl_uih_sites[] = {
     { "EFT.UI.MenuScreen::Show(5-arg)", 0x15387A0u,
       { 0x48,0x89,0x5C,0x24,0x10, 0x48,0x89,0x74,0x24,0x18,
         0x48,0x89,0x4C,0x24,0x08, 0x57 }, 16, 1 },
+
+    /* [3] EFT.UI.Matchmaker.MatchMakerSideSelectionScreen::Show(
+     *         RaidSideSelectionScreenController controller)
+     *
+     * APPENDED AT THE END ON PURPOSE. Every index in this table is positional
+     * and is named by a constant in uihooks.nim; inserting a row anywhere but
+     * the end would silently re-point every site below it (fact #187, and the
+     * reason tools/idxbind.py exists).
+     *
+     * WHY THIS SITE EXISTS -- MEASURED 2026-09-02, live. autoraid pressed PLAY
+     * and then refused, and its census said what was really on screen:
+     *
+     *   Common UI active(depth<=2)=2: [Common UI][ChatScreen]
+     *   Menu UI   active(depth<=2)=3: [UI][MatchMaker Side Selection Screen]
+     *                                 [Operation Queue Indicator]
+     *
+     * So the screen after PLAY is the SIDE selector (PMC or SCAV), NOT the
+     * boot-time character/slot screen -- the "SELECT YOUR CHARACTER" screenshot
+     * was this screen. There is no CharacterSelectionScreen after PLAY at all,
+     * which is also why modeskip's ShowSlot postfix never fired for it.
+     *
+     *   RVA         0x1790180   (VA 0x181790180)
+     *   sharedness  UNIQUE (owners=1)  -- safe to DETOUR, not merely to call
+     *   section     il2cpp
+     *   attrs       PUBLIC|VIRTUAL|HIDEBYSIG -- the base-declared entry point
+     *               the screen's controller calls to show it. (The type also
+     *               declares a PRIVATE 4-arg Show @0x1790210; this is the
+     *               1-arg controller overload, the same shape as site [0].)
+     *   arity 1     RCX=this(MatchMakerSideSelectionScreen)
+     *               RDX=RaidSideSelectionScreenController
+     *               R8 =MethodInfo* (NULL ok -- not generic)
+     *
+     *   48 89 5C 24 08     mov  [rsp+0x08], rbx        (5)
+     *   57                 push rdi                    (1) -> 6
+     *   48 83 EC 30        sub  rsp, 0x30              (4) -> 10
+     *   80 3D 79 E5 92 05 00  cmp byte [rip+0x0592E579], 0 (7) -> 17
+     *
+     *   BYTE-FOR-BYTE THE SAME SHAPE AS SITE [0]: AOWL_JMP_SIZE is 14, the
+     *   first instruction boundary at or past 14 is 17, so the steal is 17
+     *   bytes, and the only relative operand in them is the RIP-relative
+     *   displacement of the `cmp`, which `aowl_copy_relocated` fixes up. NO
+     *   relative BRANCH is cut, so this is relocatable=1 for exactly the
+     *   reason site [0] is. */
+    { "EFT.UI.Matchmaker.MatchMakerSideSelectionScreen::Show", 0x1790180u,
+      { 0x48,0x89,0x5C,0x24,0x08, 0x57, 0x48,0x83,0xEC,0x30,
+        0x80,0x3D,0x79,0xE5,0x92,0x05 }, 16, 1 },
 };
 
 #define AOWL_UIH_SITE_COUNT \

@@ -8789,13 +8789,16 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
     if m.len > 0:
       gArMap = m
   block:
-    # The character/mode slot to answer with, by the TEXT A PERSON READS on it
-    # ("PvE Zone"), never by the object name -- `CharacterSlotView_pvp` is
-    # labelled "PvE" on this build, so a name-keyed match picks confidently
-    # wrong. MEASURED 2026-09-01: the screen after PLAY is this selector.
-    let c = readStrKey("autoRaidCharacter")
+    # Which side to take on the PMC/SCAV selector that PLAY leads to, matched
+    # against the CONTROL'S OBJECT NAME (case-insensitive substring). MEASURED
+    # 2026-09-02: the screen after PLAY is `MatchMaker Side Selection Screen`,
+    # and its captions are `DefaultUIButton._text` rather than TMP text, so the
+    # displayed-text match the map tiles use is not available here. autoraid
+    # logs every active control name it saw, once, so the names are a MEASURED
+    # fact in the log rather than a guess in the code.
+    let c = readStrKey("autoRaidSide")
     if c.len > 0:
-      gArChar = c
+      gArSide = c
   if gArOn:
     info "uxAutoRaid is set: on launch the host will drive the main menu into " &
          "an OFFLINE raid on map \"" & gArMap & "\" natively (PLAY -> NEXT -> " &
@@ -9123,6 +9126,10 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   # a version label is how the human was told once that this worked when it did
   # not. Nothing is deleted; the old path simply cannot write while this is on.
   gVerOn = readBoolKey("uxVersionBrand")
+  # EVENT, NOT POLLING. The brand is applied and RE-applied on uihooks site 2
+  # (MenuScreen::Show), because a clobber happens on a menu rebuild and that is
+  # exactly this event. Subscribing is what causes the site to be bound at all.
+  if gVerOn: uihWant(UihSiteMenuShow)
   if gVerOn and gVersionWrite:
     gVersionWrite = false
     info "uxVersionBrandWrite has been turned OFF: the polling brand in " &
@@ -9210,6 +9217,10 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
          "a label that admits what it is."
   gSeasonsOn = readBoolKey("uxHideSeasons")
   gBetaNoticeOn = readBoolKey("uxBetaNotice")
+  # Same event for the seasons banner, the mode button and the beta notice --
+  # all three hang off the one MenuScreen the Show postfix hands us, so none of
+  # them walks the scene any more.
+  if gSeasonsOn or gBetaNoticeOn: uihWant(UihSiteMenuShow)
   # BOTH LOGGED AS ACTUALLY READ, not as defaulted, and then resolved here
   # rather than left to fight on the Unity thread. They target the SAME
   # GameObject -- `Common UI/MenuScreen/SeasonsButton` -- from opposite

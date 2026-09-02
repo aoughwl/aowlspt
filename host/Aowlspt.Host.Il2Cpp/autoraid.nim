@@ -99,21 +99,21 @@ const
                                 ## "seen once then hidden" is a transient popup, not a
                                 ## refusal -- extend the wait rather than self-disable.
                                 ## 6 * ArMenuWaitMs is a generous but BOUNDED cap.
-  ArCharGraceMs   = 12000'u64   ## CHARACTER: how long to wait for the character/
-                                ## mode screen to become ACTIVE after PLAY before
-                                ## concluding this flow does not show one and
-                                ## continuing. MEASURED 2026-09-01: pressing PLAY
-                                ## puts "SELECT YOUR CHARACTER / PVE ZONE"
-                                ## (GameObject `CharacterSelectionScreen`, under
-                                ## the `Menu UI` root) on screen, and nothing
-                                ## answered it -- the step after PLAY is NOT the
-                                ## location list.
-  ArCharSettleMs  = 6000'u64    ## after pressing a slot's Apply, how long the
-                                ## screen may stay active before we try again.
-  ArMaxCharPresses = 2          ## presses of the character slot, EVER. Then the
+  ArSideGraceMs   = 12000'u64   ## SIDE: how long to wait for the side selector's
+                                ## SHOW EVENT after PLAY before concluding this
+                                ## flow does not show one and continuing.
+                                ## MEASURED 2026-09-02: pressing PLAY puts
+                                ## `MatchMaker Side Selection Screen` (PMC or
+                                ## SCAV) up, under the `Menu UI` root -- the step
+                                ## after PLAY is NOT the location list, and it is
+                                ## NOT the character/slot screen either.
+  ArSideSettleMs  = 6000'u64    ## after pressing a side control, how long before
+                                ## another press is allowed.
+  ArMaxSidePresses = 2          ## presses of the side control, EVER. Then the
                                 ## step refuses by name rather than mashing.
-  ArMaxSlots      = 8           ## CharacterSlotView* collected per screen.
-  ArCharDepth     = 8           ## descent under the screen for slots/Title/Apply.
+  ArMaxSideBtns   = 24          ## side controls collected per screen (for the
+                                ## name census as much as for the match).
+  ArSideDepth     = 6           ## descent under the side screen.
   ArCensusCap     = 24          ## names printed by the stuck-step screen census.
   ArPreMaxTries   = 2           ## PRE-MENU dismissal attempts, EVER. Then the
                                 ## step refuses by name, loudly, naming the
@@ -137,7 +137,7 @@ const
   ArReady     = 7   ## -> Final Countdown (the READY is itself a NextButton)
   ArDone      = 8
   ArFailed    = 9
-  ArCharacter = 10  ## after PLAY: answer the character/mode selection screen
+  ArSide      = 10  ## after PLAY: the PMC/SCAV side selector
   ArPreMenu   = 11  ## before the menu: dismiss a screen overlaying MenuScreen
 
 # ---- the guarded-body thunk (ONE aowl_p_p_seh, never nested) ----
@@ -189,11 +189,16 @@ var gArStarted = false
 var gArPlaySeen = false            ## the MenuScreen PlayButton has been visible >=1x
 var gArPlayExtends = 0             ## popup-wait extensions granted on the PLAY step
 var gArWaitLogMs = 0'u64          ## rate limiter for the WAIT-MENU candidate line
-var gArChar = "PvE Zone"           ## `autoRaidCharacter`: the slot TITLE to press
-var gArCharPresses = 0             ## slot Apply presses this session
-var gArCharPressedMs = 0'u64       ## when the slot was pressed (readback clock)
-var gArCharLogMs = 0'u64           ## rate limiter for the CHARACTER census line
-var gArCharAnswered = 0            ## character screens dismissed by THIS feature
+var gArSide = "pmc"                ## `autoRaidSide`: which side control to press
+var gArSidePresses = 0             ## side presses this session
+var gArSidePressedMs = 0'u64       ## when the side was pressed (readback clock)
+var gArSideLogMs = 0'u64           ## rate limiter for the SIDE census line
+var gArSideAnswered = 0            ## side screens this feature got past
+var gArSideEpoch = 0               ## last seen uihooks site-3 epoch
+var gArSideFires = 0               ## side-screen show events observed while armed
+var gArSideTr: Il2CppPtr = nil     ## the live side screen's Transform, from the
+                                   ## receiver the GAME handed us in RCX
+var gArSideNamesLogged = false     ## the control-name census, once per session
 var gArOffEpoch = 0                ## last seen uihooks site-0 epoch (offline raid)
 var gArOffFires = 0                ## site-0 show events observed while armed
 var gArOffAwaitMs = 0'u64          ## when NEXT->offline-raid was pressed
@@ -216,7 +221,7 @@ proc arStepName(s: int): string =
   of ArNext4:     "NEXT->accept"
   of ArReady:     "READY"
   of ArDone:      "DONE"
-  of ArCharacter: "CHARACTER"
+  of ArSide:      "SIDE"
   of ArPreMenu:   "PRE-MENU"
   else:           "FAILED"
 
@@ -606,52 +611,58 @@ proc arSelectMap(): bool =
     i = i + 1
 
 # ---------------------------------------------------------------------------
-# THE CHARACTER/MODE SELECTION SCREEN, answered by the TEXT A PERSON READS.
+# THE SIDE SELECTOR (PMC / SCAV) -- the screen the main-menu PLAY leads to.
 #
-# MEASURED 2026-09-01 (aowlspt-host.log + one screenshot + the live inspector):
-# pressing PLAY does NOT go to the location list. It puts the character/mode
-# screen up again -- "SELECT YOUR CHARACTER / PVE ZONE", GameObject
-# `CharacterSelectionScreen` (the inspector read `BackButton` parent =
-# CharacterSelectionScreen) -- and NOTHING answered it, so the old machine sat
-# on NEXT->location for its whole 45 s bound and refused.
+# MEASURED 2026-09-02, live, on the previous build of this file. autoraid
+# pressed PLAY at 1:24, then refused, and the census it prints on a refusal said
+# what was really on screen:
 #
-# WHY THIS IS HERE AND NOT ONLY IN modeskip.nim: modeskip is driven by a POSTFIX
-# on `CharacterSelectionScreen::ShowSlot`, and in that run the event did NOT
-# fire for the second showing. The host log has the boot slots (slot 1 and slot
-# 2 at 0:00:28, Submit at 0:00:28.313) and NOTHING after PLAY at 0:04:30 --
-# neither further slot lines (the per-slot log resets per controller and prints
-# the first 8) nor the "ShowSlot fired AGAIN" warning, in a session where the
-# feature was armed and had not self-disabled. A feature cannot answer an event
-# it never hears. modeskip is still made RE-ANSWERABLE (it is the cheaper and
-# genuinely event-driven path when the event does fire, and its log now says so
-# either way); this step is the one that does not depend on that.
+#   Common UI active(depth<=2)=2: [Common UI][ChatScreen]
+#   Menu UI   active(depth<=2)=3: [UI][MatchMaker Side Selection Screen]
+#                                 [Operation Queue Indicator]
 #
-# The route is the one tools/entergame.py verified live from the inspector side:
-#   the ACTIVE `CharacterSelectionScreen`  (two copies exist; the Login UI one
-#     is INACTIVE and pressing it silently does nothing -- fact #72 -- so the
-#     screen is found with `arWalkActive`, which returns only ACTIVE nodes)
-#     -> `CharacterSlotView*`   (matched by name PREFIX: the suffix names the
-#        slot, and object NAMES ARE NOT TITLES -- `CharacterSlotView_pvp` is
-#        labelled "PvE", so keying on the name would confidently pick wrong)
-#        -> descendant `Title` TMP == the wanted title (`autoRaidCharacter`,
-#           default "PvE Zone")
-#        -> descendant `Apply` -> DefaultUIButton OnClick(+0x120)
+# So the step after PLAY is `EFT.UI.Matchmaker.MatchMakerSideSelectionScreen`
+# -- choose PMC or SCAV, then NEXT. Two earlier readings were WRONG and are
+# recorded here so nobody re-derives them:
+#
+#   * the "SELECT YOUR CHARACTER / PVE ZONE" screenshot was THIS screen, not
+#     `CharacterSelectionScreen`. `CharacterSelectionScreen` is the BOOT-time
+#     slot screen that modeskip answers, and it does not come back after PLAY.
+#   * which is also why modeskip's `ShowSlot` postfix never fired for it. The
+#     event was not missed; the screen was never shown.
+#
+# The previous cut of this step hunted an ACTIVE `CharacterSelectionScreen` and
+# grace-skipped after 12 s having found nothing, which is exactly what a poll
+# looking for the wrong thing does: it cannot tell "not there yet" from "not
+# this screen at all".
+#
+# SO THIS STEP IS EVENT-DRIVEN, and gets the screen from the game itself:
+#   `MatchMakerSideSelectionScreen::Show(controller)` @0x1790180 -- UNIQUE,
+#   16-byte prologue-verified, 17-byte steal whose only relative operand is a
+#   RIP-relative `cmp` (byte-for-byte the same shape as the offline-raid site
+#   already in that table) -- is uihooks SITE 3. Its POSTFIX hands us RCX, the
+#   live screen, so the screen is never searched for by name; `uihSelf`
+#   re-validates it and `iToTransform` gets onto its Transform.
+#
+# The side CONTROL is then matched by GameObject NAME (`autoRaidSide`, default
+# "pmc"), and this is stated rather than hidden: the captions on this screen are
+# `DefaultUIButton._text`, NOT TMP text, so the displayed-text match the map
+# tiles use is not available without a field offset this host has not measured.
+# Every ACTIVE control name under the screen is logged once, so the next run
+# turns the names into a measured fact instead of a guess in the code.
+#
+# The screen's own NEXT is NOT pressed here: that is the existing NEXT->location
+# step, unchanged. The finished state is asserted in two halves, both logged --
+# the press, and then the side screen going INACTIVE, checked on entry to
+# SELECT-MAP -- and the raid path's later readback is site 0,
+# `MatchmakerOfflineRaidScreen::Show`.
 # ---------------------------------------------------------------------------
-proc arStartsWith(s, pre: string): bool =
-  if pre.len > s.len: return false
-  var i = 0
-  while i < pre.len:
-    if s[i] != pre[i]: return false
-    i = i + 1
-  return true
-
-proc arCollectPrefixChildren(t: Il2CppPtr; pre: string; depth: int;
-                             budget: var int; deadline: uint64;
-                             into: var seq[Il2CppPtr]; cap: int) =
-  ## Breadth-before-depth collect by name PREFIX. Same shape and the same bounds
-  ## as `arCollectChildren`; only the predicate differs, so the two cannot drift
-  ## apart in their budget or deadline handling.
-  if depth <= 0 or budget <= 0 or into.len >= cap: return
+proc arCollectAllActive(t: Il2CppPtr; depth: int; budget: var int;
+                        deadline: uint64; into: var seq[Il2CppPtr]; cap: int) =
+  ## Every ACTIVE node under `t`, capped and time-sliced like every other walk
+  ## here. Used by the SIDE step, which must report the names it saw -- a
+  ## refusal that cannot list the candidates is not evidence.
+  if t == nil or depth < 0 or budget <= 0 or into.len >= cap: return
   var n = 0
   if not iChildCount(t, n): return
   var i = 0
@@ -662,87 +673,79 @@ proc arCollectPrefixChildren(t: Il2CppPtr; pre: string; depth: int;
       if (budget and 31) == 0 and cNowMs() > deadline:
         budget = 0
         return
-      if arStartsWith(iObjName(c), pre):
+      let a = iActiveInHierarchy(c)
+      if a[0] and a[1]:
         into.add c
         if into.len >= cap: return
+        arCollectAllActive(c, depth - 1, budget, deadline, into, cap)
+    i = i + 1
+
+proc arSideScreen(): Il2CppPtr =
+  ## The live side selector, as a TRANSFORM -- obtained from the RECEIVER THE
+  ## GAME HANDED US in RCX at `MatchMakerSideSelectionScreen::Show`, never by a
+  ## name search. `uihSelf` re-validates the pointer on the way out (a destroyed
+  ## screen stays readable with `m_CachedPtr` zeroed, fact #182), and
+  ## `iToTransform` is safe on a component or a transform alike.
+  result = nil
+  let self = uihSelf(UihSiteSideSelect)
+  if self == nil: return
+  let tr = iToTransform(self)
+  if tr == nil or not duOk(tr, 0x20'i32): return
+  result = tr
+
+proc arSideActive(): bool =
+  ## Is that screen still on screen? The FINISHED STATE for this step is the
+  ## NEGATIVE of this, which is the only form that can fail.
+  let tr = arSideScreen()
+  if tr == nil: return false
+  let a = iActiveInHierarchy(tr)
+  result = a[0] and a[1]
+
+proc arPressSideUnder(scr: Il2CppPtr; want: string; nSeen: var int;
+                      names: var string; why: var string): bool =
+  ## Press the side control whose GameObject NAME contains `want` (default
+  ## "pmc", from `autoRaidSide`), searched under the live side screen only.
+  ##
+  ## BY NAME, AND SAYING SO. The captions on this screen are NOT TMP text --
+  ## they are `DefaultUIButton._text` -- so the displayed-text match that the
+  ## map tiles use is not available here without reading a field this host has
+  ## not measured. Rather than guess an offset, this matches the object name and
+  ## LOGS EVERY NAME IT SAW, so the next run's log settles what the controls are
+  ## really called instead of a guess being written into the code.
+  result = false
+  nSeen = 0
+  names = ""
+  why = ""
+  if scr == nil:
+    why = "no live side screen"
+    return false
+  var btns: seq[Il2CppPtr] = @[]
+  var b = ArNodeBudget
+  arCollectAllActive(scr, ArSideDepth, b, cNowMs() + ArWalkMs, btns,
+                     ArMaxSideBtns)
+  nSeen = btns.len
+  var i = 0
+  while i < btns.len:
+    let nm = iObjName(btns[i])
+    if nm.len > 0 and names.len < 600:
+      names = names & "[" & nm & "]"
     i = i + 1
   i = 0
-  while i < n and i < ArFanout and budget > 0 and into.len < cap:
-    let c = iChildAt(t, i)
-    if c != nil:
-      arCollectPrefixChildren(c, pre, depth - 1, budget, deadline, into, cap)
+  while i < btns.len:
+    let nm = iObjName(btns[i])
+    if nm.len > 0 and iContains(iLower(nm), want):
+      if arPress(btns[i], "DefaultUIButton"):
+        return true
+      if arPress(btns[i], "AnimatedToggle"):
+        return true
+      why = "the node named `" & nm & "` matched \"" & want & "\" but neither " &
+            "a DefaultUIButton nor an AnimatedToggle OnClick could be resolved " &
+            "and validated on it, so it was NOT pressed"
+      return false
     i = i + 1
-
-proc arCollectPrefix(t: Il2CppPtr; pre: string; depth: int; budget: var int;
-                     deadline: uint64; into: var seq[Il2CppPtr]; cap: int) =
-  if t == nil or budget <= 0 or into.len >= cap or not duOk(t, 0x20'i32): return
-  budget = budget - 1
-  if arStartsWith(iObjName(t), pre):
-    into.add t
-    if into.len >= cap: return
-  arCollectPrefixChildren(t, pre, depth, budget, deadline, into, cap)
-
-proc arCharScreen(): Il2CppPtr =
-  ## The ACTIVE `CharacterSelectionScreen`: `Menu UI` first, then any root.
-  result = arFindActiveAcross("Menu UI", "CharacterSelectionScreen", nil)
-
-proc arLabelUnder(node: Il2CppPtr; name: string; depth: int): string =
-  ## TMP text of the first descendant named `name`. "" means NOT FOUND or
-  ## UNREADABLE -- the caller must never treat that as a match (an empty string
-  ## comparing equal to an empty wanted title would be a check that cannot fail).
-  result = ""
-  var hits: seq[Il2CppPtr] = @[]
-  var b = ArNodeBudget
-  arCollect(node, name, depth, b, cNowMs() + ArWalkMs, hits, 4)
-  var i = 0
-  while i < hits.len:
-    let tmp = splTmpOf(hits[i])
-    if tmp != nil:
-      let t = arTrim(splTmpText(tmp))
-      if t.len > 0: return t
-    i = i + 1
-
-proc arAnswerCharacterUnder(scr: Il2CppPtr; nSlots, nTitled: var int;
-                            titles: var string): bool =
-  ## Press the `Apply` of the slot whose displayed Title == `gArChar`. True ONLY
-  ## when a real match was pressed; an unmatched title keeps the step (a
-  ## REFUSAL), never a silent advance. `titles` collects what was actually
-  ## readable so that a refusal is evidence rather than a shrug.
-  result = false
-  nSlots = 0
-  nTitled = 0
-  titles = ""
-  if scr == nil: return
-  var slots: seq[Il2CppPtr] = @[]
-  var b = ArNodeBudget
-  arCollectPrefix(scr, "CharacterSlotView", ArCharDepth, b,
-                  cNowMs() + ArWalkMs, slots, ArMaxSlots)
-  nSlots = slots.len
-  let want = iLower(arTrim(gArChar))
-  var i = 0
-  while i < slots.len:
-    let slot = slots[i]
-    let title = arLabelUnder(slot, "Title", ArCharDepth)
-    if title.len > 0:
-      nTitled = nTitled + 1
-      if titles.len < 240:
-        titles = titles & "[" & iObjName(slot) & "=" & title & "]"
-      if iLower(title) == want and want.len > 0:
-        var b2 = ArNodeBudget
-        let apply = arWalkActive(slot, "Apply", ArCharDepth, b2,
-                                 cNowMs() + ArWalkMs, nil)
-        if apply == nil:
-          warn "autoRaid: step CHARACTER -- the slot titled " & title &
-               " was found but has no ACTIVE descendant named `Apply`, so " &
-               "there is nothing pressable on it. NOTHING WAS PRESSED."
-          return false
-        if arPress(apply, "DefaultUIButton"):
-          return true
-        warn "autoRaid: step CHARACTER -- the slot titled " & title &
-             " has an active `Apply`, but its DefaultUIButton OnClick could " &
-             "not be resolved and validated, so it was NOT pressed."
-        return false
-    i = i + 1
+  why = "no ACTIVE node under the live side screen has a name containing \"" &
+        want & "\" (`autoRaidSide`). The " & $nSeen & " active node name(s) " &
+        "seen are listed above; match one of those"
 
 proc arActiveCensus(root: Il2CppPtr; depth: int; count: var int;
                     into: var string) =
@@ -816,11 +819,12 @@ proc arScreenCensus(): string =
 # no ACTIVE SettingsScreen anywhere. If two attempts leave it up, the step
 # refuses and NAMES the screen it could not dismiss.
 #
-# CHATSCREEN IS NEVER TOUCHED. It was active in that census and the menu was
-# perfectly usable behind it, so it is not an overlay this feature has any
-# business closing. Whether it is ALWAYS active is not yet measured, so it is
-# COUNTED here (`chat active on N of M checks`) and acted on never -- the log
-# will answer it across runs instead of a guess being written into the code.
+# CHATSCREEN IS NEVER TOUCHED, and that is now MEASURED rather than assumed:
+# it read ACTIVE in BOTH menu censuses taken on 2026-09-02 (once with Settings
+# over the menu, once with the menu working normally and PLAY pressable). It is
+# a normal part of the menu, not an overlay, so PRE-MENU ignores it by name and
+# never closes it. The counter (`ChatScreen was ACTIVE on N of M checks`) stays,
+# because a count that keeps agreeing is what makes the claim checkable.
 # ---------------------------------------------------------------------------
 proc arOverlayScreen(): Il2CppPtr =
   ## The ACTIVE `SettingsScreen`, `Common UI` first then any root. Only ACTIVE
@@ -912,11 +916,33 @@ proc arTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ar_tick_body", cdecl.}
   # It also RESYNCHRONISES the machine: if the offline raid screen is up, then
   # whatever we believed about PLAY/CHARACTER/location/map is settled by
   # observation and the correct next action is the NEXT on THIS screen.
+  # THE SIDE SELECTOR'S OWN SHOW EVENT. Same shape, same cost: one integer
+  # compare per tick. This is what makes the step after PLAY event-driven
+  # instead of a visibility poll -- and the receiver comes with it, so the
+  # screen never has to be found by name at all.
+  let sep = uihEpoch(UihSiteSideSelect)
+  if sep != gArSideEpoch:
+    gArSideEpoch = sep
+    gArSideFires = gArSideFires + 1
+    gArSideTr = arSideScreen()
+    if gArStep == ArSide or gArStep == ArPressPlay or gArStep == ArWaitMenu or
+       gArStep == ArNext1:
+      okLog "autoRaid: READBACK -- MatchMakerSideSelectionScreen::Show fired " &
+            "(uihooks site 3, epoch " & $sep & "). The PMC/SCAV side selector " &
+            "is UP, which is an observation, not a guess, and its receiver " &
+            "came with the event (screen transform 0x" &
+            hexOf(cast[uint64](gArSideTr)) & "). Step SIDE."
+      gArLastPressed = nil
+      arGoto(ArSide)
+    else:
+      info "autoRaid: MatchMakerSideSelectionScreen::Show fired (uihooks " &
+           "site 3, epoch " & $sep & ") while at step " & arStepName(gArStep) &
+           "; noted, no resynchronisation (that step is already past it)."
   let ep = uihEpoch(UihSiteOfflineRaid)
   if ep != gArOffEpoch:
     gArOffEpoch = ep
     gArOffFires = gArOffFires + 1
-    if gArStep == ArCharacter or gArStep == ArNext1 or
+    if gArStep == ArSide or gArStep == ArNext1 or
        gArStep == ArSelectMap or gArStep == ArNext2:
       okLog "autoRaid: READBACK -- MatchmakerOfflineRaidScreen::Show fired " &
             "(uihooks site 0, epoch " & $ep & "). The offline raid screen is " &
@@ -959,12 +985,13 @@ proc arTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ar_tick_body", cdecl.}
     arFail("step " & arStepName(gArStep) & " never completed within " &
            $(int(stepTimeout div 1000'u64)) & " s (control never became " &
            "visible)." &
-           (if gArStep == ArCharacter:
-              " Wanted the character slot titled \"" & gArChar &
-              "\" (`autoRaidCharacter`)."
+           (if gArStep == ArSide:
+              " Wanted the side control whose name contains \"" & gArSide &
+              "\" (`autoRaidSide`)."
             else: "") &
-           " Offline-raid show events seen while armed: " & $gArOffFires &
-           ". Character screens answered: " & $gArCharAnswered & "." &
+           " Show events seen while armed: side=" & $gArSideFires &
+           " offline-raid=" & $gArOffFires &
+           ". Side screens got past: " & $gArSideAnswered & "." &
            (if census.len > 0: " ACTIVE:" & census else: ""))
     return
 
@@ -994,10 +1021,11 @@ proc arTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ar_tick_body", cdecl.}
               gArMap & "\"."
         gArLastPressed = nil
         gArLastActionMs = now
-        # MEASURED: the screen after PLAY is the character/mode selector, not
-        # the location list. CHARACTER grace-skips itself if no such screen
-        # becomes active, so this ordering costs nothing on a flow without one.
-        arGoto(ArCharacter)
+        # MEASURED 2026-09-02: the screen after PLAY is the PMC/SCAV SIDE
+        # selector, not the location list. SIDE grace-skips itself if its show
+        # event never arrives, so this ordering costs nothing on a flow that
+        # does not have one.
+        arGoto(ArSide)
     else:
       # No pressable PlayButton this tick -- log the candidate census (§9b), so a
       # failure is EVIDENCE (roots enumerated? MenuScreen found? a PlayButton
@@ -1161,75 +1189,79 @@ proc arTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ar_tick_body", cdecl.}
         arGoto(ArDone)
     return
 
-  if gArStep == ArCharacter:
-    let scr = arCharScreen()
-    # (a) ALREADY PRESSED: assert the FINISHED STATE, which is a NEGATIVE --
-    # no ACTIVE CharacterSelectionScreen anywhere. Never "the press returned
-    # cleanly": a handler that returns normally is not proof it did anything.
-    if gArCharPresses > 0:
-      if scr == nil:
-        gArCharAnswered = gArCharAnswered + 1
-        okLog "autoRaid: READBACK -- no ACTIVE CharacterSelectionScreen " &
-              "remains after pressing the slot titled \"" & gArChar &
-              "\" (press " & $gArCharPresses & "). The character/mode screen " &
-              "is answered; continuing to NEXT->location. Answered this " &
-              "session: " & $gArCharAnswered & "."
-        gArCharPresses = 0
-        gArLastPressed = nil
-        gArLastActionMs = now
-        arGoto(ArNext1)
-        return
-      if now - gArCharPressedMs < ArCharSettleMs:
-        return                                # still settling; do not re-press
-      if gArCharPresses >= ArMaxCharPresses:
-        var census = ""
-        if not gArCensused:
-          gArCensused = true
-          census = arScreenCensus()
-        arFail("step CHARACTER -- the slot titled \"" & gArChar &
-               "\" was pressed " & $gArCharPresses & " times and an ACTIVE " &
-               "CharacterSelectionScreen is STILL up after " &
-               $int(now - gArCharPressedMs) & "ms, so the press ran and did " &
-               "not advance the screen" &
-               (if census.len > 0: ". ACTIVE:" & census else: ""))
-        return
-      # settled, still up, and presses remain: fall through and press again.
-    if scr == nil:
-      # (b) NO SCREEN. Not an error -- some flows may not show one. Wait the
-      # grace window, then continue and SAY SO, rather than failing on a screen
-      # that was never going to appear.
-      if now - gArStepT0 > ArCharGraceMs:
-        okLog "autoRaid: step CHARACTER -- no ACTIVE CharacterSelectionScreen " &
-              "appeared within " & $(int(ArCharGraceMs div 1000'u64)) &
-              " s of pressing PLAY. Nothing was pressed and nothing is " &
-              "claimed; continuing to NEXT->location. If the selector IS on " &
-              "screen, then it is not named `CharacterSelectionScreen` on " &
-              "this build, and that is the thing to check."
+  if gArStep == ArSide:
+    # (a) ALREADY PRESSED: the finished state for the PRESS is that the side
+    # screen has gone. It does not go away on the side press itself (that only
+    # selects a side) -- it goes when its NEXT is pressed, which is the existing
+    # NEXT->location step. So the readback here is two-part and BOTH parts are
+    # logged: the press, then the screen's disappearance, asserted on entry to
+    # SELECT-MAP below.
+    if gArSidePresses > 0:
+      okLog "autoRaid: step SIDE -- side chosen (\"" & gArSide &
+            "\"); handing over to NEXT->location, which presses this screen's " &
+            "own NextButton. PRESSED IS NOT ADVANCED: the readback is the " &
+            "side screen going INACTIVE, asserted at SELECT-MAP, and then " &
+            "MatchmakerOfflineRaidScreen::Show (uihooks site 0) later."
+      gArSideAnswered = gArSideAnswered + 1
+      gArSidePresses = 0
+      gArLastPressed = nil
+      gArLastActionMs = now
+      arGoto(ArNext1)
+      return
+    if not arSideActive():
+      # (b) NO SCREEN. Either its show event never came, or a human answered it.
+      # Not an error -- but never claimed as a success either.
+      if now - gArStepT0 > ArSideGraceMs:
+        okLog "autoRaid: step SIDE -- no live MatchMakerSideSelectionScreen " &
+              "is active within " & $(int(ArSideGraceMs div 1000'u64)) &
+              " s of pressing PLAY (site-3 show events seen while armed: " &
+              $gArSideFires & "). Nothing was pressed and nothing is claimed; " &
+              "continuing to NEXT->location. If a side selector IS on screen, " &
+              "then its ::Show did not fire or did not bind -- check the " &
+              "`uihooks:` lines, not this step."
         gArLastPressed = nil
         arGoto(ArNext1)
       return
-    var nSlots = 0
-    var nTitled = 0
-    var titles = ""
-    if arAnswerCharacterUnder(scr, nSlots, nTitled, titles):
-      gArCharPresses = gArCharPresses + 1
-      gArCharPressedMs = now
+    var nSeen = 0
+    var names = ""
+    var why = ""
+    let want = iLower(arTrim(gArSide))
+    let pressed = arPressSideUnder(gArSideTr, want, nSeen, names, why)
+    if not gArSideNamesLogged and nSeen > 0:
+      # THE NAME CENSUS, once. The captions on this screen are
+      # DefaultUIButton._text and not TMP, so this host cannot read them without
+      # an offset it has not measured; the object names it CAN read are printed
+      # here so the next run settles what these controls are called.
+      gArSideNamesLogged = true
+      info "autoRaid SIDE: " & $nSeen & " ACTIVE node(s) under the live side " &
+           "screen: " & names & " -- wanted a name containing \"" & want &
+           "\" (`autoRaidSide`). These are OBJECT NAMES, not captions: the " &
+           "captions here are DefaultUIButton._text, not TMP text."
+    if pressed:
+      gArSidePresses = gArSidePresses + 1
+      gArSidePressedMs = now
       gArLastActionMs = now
-      okLog "autoRaid: step CHARACTER -- pressed the `Apply` of the slot " &
-            "titled \"" & gArChar & "\" (" & $nSlots & " CharacterSlotView* " &
-            "under the ACTIVE screen, " & $nTitled & " with a readable " &
-            "Title). PRESSED IS NOT ANSWERED: the readback is the next tick " &
-            "finding NO active CharacterSelectionScreen."
-    elif now - gArCharLogMs > 5000'u64:
-      gArCharLogMs = now
-      info "autoRaid CHARACTER: an ACTIVE CharacterSelectionScreen is up, " &
-           "slots=" & $nSlots & ", titled=" & $nTitled & ", titles=" &
-           (if titles.len > 0: titles else: "<none readable>") & ", wanted=\"" &
-           gArChar & "\" (`autoRaidCharacter`). Object NAMES are not titles " &
-           "on this build, so the match is on the DISPLAYED text only."
+      okLog "autoRaid: step SIDE -- pressed the side control matching \"" &
+            want & "\" under the live MatchMakerSideSelectionScreen (" &
+            $nSeen & " active node(s) examined)."
+    elif now - gArSideLogMs > 5000'u64:
+      gArSideLogMs = now
+      warn "autoRaid SIDE: the side selector is up and NOTHING was pressed -- " &
+           why & "."
     return
 
   if gArStep == ArSelectMap:
+    # THE OTHER HALF OF THE SIDE READBACK, asserted once and as a NEGATIVE.
+    if gArSideTr != nil:
+      if arSideActive():
+        warn "autoRaid: READBACK FAILED -- the side selector is STILL ACTIVE " &
+             "after its NextButton was pressed. The map list may not be what " &
+             "is on screen, so anything SELECT-MAP does next is against an " &
+             "unknown screen. Continuing, but this is not a success."
+      else:
+        okLog "autoRaid: READBACK -- the MatchMakerSideSelectionScreen is no " &
+              "longer active after NEXT; the side step is complete."
+      gArSideTr = nil
     if arSelectMap():
       okLog "autoRaid: selected map \"" & gArMap & "\""
       gArLastActionMs = now
@@ -1267,10 +1299,14 @@ proc arArmOnDemand() =
   gArPlaySeen = false
   gArPlayExtends = 0
   gArWaitLogMs = 0'u64
-  gArCharPresses = 0
-  gArCharPressedMs = 0'u64
-  gArCharLogMs = 0'u64
   gArCensused = false
+  gArSidePresses = 0
+  gArSidePressedMs = 0'u64
+  gArSideLogMs = 0'u64
+  gArSideTr = nil
+  # Snapshot the side screen's epoch too: an event from BEFORE this arming is
+  # not evidence about this run.
+  gArSideEpoch = uihEpoch(UihSiteSideSelect)
   gArPreTries = 0
   gArPreActMs = 0'u64
   gArPreVia = "nothing"
@@ -1565,6 +1601,11 @@ proc arWantShowHook() =
   ## sessions where the launch flag is off.
   if not gArOn and not gInspOn: return
   uihWant(UihSiteOfflineRaid)
+  # The PMC/SCAV side selector. MEASURED 2026-09-02: this is the screen the
+  # main-menu PLAY button leads to, so without this site the step after PLAY is
+  # a poll, and the poll had nothing to look for -- it hunted a
+  # `CharacterSelectionScreen` that is not there after PLAY at all.
+  uihWant(UihSiteSideSelect)
 
 proc arShowHookVerdict() =
   ## Read back whether it actually BOUND, after `uihArm`. Announced either way:
@@ -1572,6 +1613,17 @@ proc arShowHookVerdict() =
   ## falls back to its per-step timeout, which is exactly the failure mode this
   ## change exists to remove.
   if not gArOn and not gInspOn: return
+  if uihBound(UihSiteSideSelect):
+    okLog "autoRaid: the SIDE selector's show event is LIVE -- " &
+          "MatchMakerSideSelectionScreen::Show @0x1790180 (uihooks site 3) is " &
+          "bound, so the step after PLAY is driven by the screen's own show " &
+          "event and gets the screen's pointer from the game, with no name " &
+          "search at all."
+  else:
+    warn "autoRaid: uihooks site 3 (MatchMakerSideSelectionScreen::Show) did " &
+         "NOT bind, so the step after PLAY has no show event and will " &
+         "grace-skip after " & $(int(ArSideGraceMs div 1000'u64)) & " s. The " &
+         "reason is in the `uihooks:` lines above."
   if uihBound(UihSiteOfflineRaid):
     okLog "autoRaid: the screen-arrival oracle is LIVE -- " &
           "MatchmakerOfflineRaidScreen::Show @0x1788590 (uihooks site 0) is " &
