@@ -7670,3 +7670,18 @@ stated:
 At level 2 SAIN arms its aim postfix at boot (~10-16s); at level 0 it
 refuses. Sample 2 (level 2, inspector on, 4,737,536) running; the SAIN
 detour is being audited offline (prologue, sharedness, register discipline).
+
+## 2026-09-02 10:25: the menu-arrival crash, by the registers
+
+MEASURED (`tools/dmpread.py`, Crash_2026-09-02_131229783, build 4,737,536):
+`ACCESS_VIOLATION at 0x7ffb3ee80103 -- a READ of 0x21 faulted; Rax=1 Rcx=1
+Rdx=0`. The faulting instruction is `mov r8,[rax+0x20]` in
+`EFT.UI.SeasonWidgetData::From(Profile, SeasonalRewardController)`: the
+Profile argument is the integer 1 and the controller is null. MenuScreen::
+Show was called by the game's own MainMenuShowOperation with an unpopulated
+selection, which starts from modeskip's Submit. SAIN level 2 and the
+inspector were each cleared by a second sample (both survived), so the
+flag bisects were chasing noise: the tick+1 Submit rule made the race rare,
+not impossible (4 deaths, ~5 survivals since 08:15). Fix in flight: answer
+the slot screen through its own control so the game's flow populates the
+Profile before Show.
