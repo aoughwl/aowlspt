@@ -1,0 +1,34 @@
+# MEASURED live-inspector output. Every OUTPUT block below is VERBATIM host
+# text captured from a real run on this machine on 2026-09-01/02 -- pointers,
+# counts, frame numbers and all. Nothing here is hand-written prose.
+#
+# WHY THIS EXISTS: three tools parse this prose (acceptance.py,
+# nativetabs_check.py, uihooks_check.py) and each had grown its own private
+# replay. Two of them passed VACUOUSLY on their own command echo or on a
+# fragment of the batch header before being fixed. One corpus, loaded by
+# tools/inspectfixtures.py, is how that stays fixed: every parser test runs
+# against text the host really emitted, including its refusals.
+#
+# DO NOT EDIT AN OUTPUT BLOCK BY HAND. If the host's wording changes, re-harvest
+# from a real capture and say where it came from in SOURCE. A fixture someone
+# tidied is no longer evidence.
+#
+# Entry format:  === ENTRY <id> / --- SOURCE / --- SHAPE / --- COMMAND /
+#                --- OUTPUT <verbatim ...> / --- END
+
+=== ENTRY state-settings-bound
+--- SOURCE scratchpad boot3.out, batch 18
+--- SHAPE anchors line with a NON-null $settings, channel counters, and the settings/current-tab field reads
+--- COMMAND state
+--- OUTPUT
+aowlspt live inspector -- batch 18, 2 command(s), on Unity thread 17484
+> state
+  anchors: $preloader=0x000001b05f556170 $settings=0x000001b0ea23de70
+  inspector: menu anchor slot=14, in-raid anchor slot=0, dispatches=2033 (of those in-raid=1144)
+  channel: polls=2566 reads=153 readFails=0 unchanged=135 batch=18 ticks=18 faults=0 escapes=0
+  settings: _currentTab(+0x118)=0x000001b0ea246dc0  _initializedTabs(+0x138)=0x000001b0ea2040a0
+  current tab: klass=0x000001ae209734f0 _createdControls(+0x88)=0x000001b088a7bf90 latch(+0x90)=0x0000000000000001
+> echo aowl-batch-1788297646575-29
+  aowl-batch-1788297646575-29
+aowlspt live inspector -- batch 18 complete, 9 line(s)
+--- END

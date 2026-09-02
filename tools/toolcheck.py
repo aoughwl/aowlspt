@@ -445,6 +445,14 @@ def main():
         p.add_argument("--case", nargs="*", default=[])
         p.add_argument("--timeout", type=float, default=40.0)
     sub.add_parser("list")
+    # `selftest` sends NOTHING to the client either. It is the OFFLINE half of
+    # this tool: `run` catches the inspector lying, `selftest` catches the
+    # PARSERS of the inspector lying, by replaying the measured corpus in
+    # tools/fixtures/inspector/ through acceptance.py, nativetabs_check.py and
+    # uihooks_check.py. Two of those three passed vacuously on their own
+    # command echo before it existed, and neither needed a running client to
+    # do so.
+    sub.add_parser("selftest")
     # `preflight` sends NOTHING to the client. It answers "would a run mean
     # anything right now" -- scope, host build, fault budget, write gate --
     # which is the question you want answered before spending a launch.
@@ -455,6 +463,10 @@ def main():
     a = ap.parse_args()
     if a.cmd == "list":
         return cmd_list(a)
+    if a.cmd == "selftest":
+        return subprocess.call(
+            [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                          "inspectfixtures.py"), "selftest"])
     if a.cmd == "show":
         return cmd_show(a)
     if a.cmd == "preflight":

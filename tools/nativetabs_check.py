@@ -20,6 +20,8 @@ writes. The four assertions are section 6 of the doc:
 Usage:
     python tools/nativetabs_check.py baseline   # feature OFF, records stock geometry
     python tools/nativetabs_check.py verify     # feature ON, asserts 1-4
+    python tools/nativetabs_check.py selftest   # OFFLINE, no client: replays
+                                                # tools/fixtures/inspector/
 """
 import json
 import os
@@ -229,10 +231,165 @@ def cmd_verify():
     return PASS
 
 
+# ---------------------------------------------------------------------------
+# selftest -- OFFLINE, against tools/fixtures/inspector/ (MEASURED prose)
+# ---------------------------------------------------------------------------
+# This file had NO offline test at all, which is how it shipped a baseline that
+# recorded the string `> rect $_` -- its own command echo -- as the stock
+# geometry, so `verify` compared the echo to itself and printed PASS. The fix
+# was made once, by hand, with nothing to stop it coming back. These cases are
+# that stop, and every input below is host text really captured on this machine
+# (tools/inspectfixtures.py `list` says where each came from).
+#
+# THE CASES ARE CHOSEN SO EACH ONE CAN FAIL:
+#   1 echo trap        -- the echoes alone must yield NO geometry (the old bug)
+#   2 rect refusal     -- a refusal is INCONCLUSIVE, never a recorded baseline
+#   3 real geometry    -- the six measured lines DO record a baseline
+#   4 changed geometry -- the comparison can actually fail (negative control)
+#   5 fault ceiling    -- unchanged geometry after a self-disable is VACUOUS
+#   6 no VERDICT line  -- "the tab was never observed being built" is not a pass
+
+def cmd_selftest():
+    import tempfile
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import inspectfixtures as fx
+
+    g = globals()
+    real = {k: g[k] for k in ("run", "ensure_settings_open",
+                              "host_native_tabs_lines", "BASELINE")}
+    failures = []
+    tmp = tempfile.mkdtemp(prefix="nativetabs-selftest-")
+    seq = [0]
+
+    def case(title, fn):
+        seq[0] += 1
+        g["BASELINE"] = os.path.join(tmp, "baseline-%d.json" % seq[0])
+        print("\n---- %s" % title)
+        try:
+            note = fn()
+        except AssertionError as e:
+            note = "raised: %s" % e
+        if note:
+            failures.append("%s: %s" % (title, note))
+            print("  ** CASE FAILED: %s" % note)
+        else:
+            print("  case ok")
+
+    def use(script, trail=None, open_ok=True):
+        """Wire run/ensure_settings_open/host_native_tabs_lines to fixtures."""
+        rp = fx.Replay(script)
+        g["run"] = rp.text_only
+        g["ensure_settings_open"] = lambda: (open_ok, "replay")
+        g["host_native_tabs_lines"] = lambda: trail
+        return rp
+
+    SIX = fx.fx("rect-six-line-geometry")
+    REFUSAL = fx.fx("rect-refused-unreadable")
+    STATE = fx.fx("state-settings-bound")
+    FAULTS = fx.fx("hostlog-nativetabs-fault-ceiling").splitlines()
+    NEVER = fx.fx("hostlog-nativetabs-never-built").splitlines()
+
+    # 1 -- THE ECHO TRAP. `echo_only` keeps ONLY the `>` lines of a reply that
+    #      really did contain geometry, so the input is measured and the only
+    #      thing removed is the host's actual answer.
+    def c1():
+        echoes = fx.echo_only(SIX)
+        if "> rect" not in echoes:
+            return "the trap input does not even contain a rect echo (%r)" % echoes
+        if geom_of(echoes, "rect") is not None:
+            return ("geom_of accepted the COMMAND ECHOES as geometry -- this is "
+                    "the exact bug that made verify compare `> rect $_` to "
+                    "itself and PASS")
+        if geom_of(fx.header_only(SIX), "rect") is not None:
+            return "geom_of accepted the batch header/trailer as geometry"
+        return ""
+    case("echo trap: command echoes are NOT geometry", c1)
+
+    # 2 -- a REFUSAL must not become a baseline.
+    def c2():
+        use([("state\nfind SettingsList", [REFUSAL])])
+        rc = cmd_baseline()
+        if rc != INCONCLUSIVE:
+            return "rect refused to read the pointer and this returned %d, " \
+                   "want INCONCLUSIVE(%d)" % (rc, INCONCLUSIVE)
+        if os.path.exists(BASELINE):
+            return "a baseline file was written from a refusal"
+        return ""
+    case("`rect` refusal (not readable) -> INCONCLUSIVE, nothing recorded", c2)
+
+    # 3 -- the six measured lines DO record, and record all six.
+    def c3():
+        use([("state\nfind SettingsList", [SIX])])
+        rc = cmd_baseline()
+        if rc != PASS:
+            return "six-line geometry returned %d, want PASS(%d)" % (rc, PASS)
+        rec = json.load(open(BASELINE, encoding="utf-8"))["settingslist"]
+        for key in ("anchoredPosition", "sizeDelta", "anchorMin", "anchorMax",
+                    "pivot", "rect (x,y,w,h)"):
+            if key not in rec:
+                return "baseline is missing %r: %r" % (key, rec)
+        if "0.0000,-755.0000,850.0000,755.0000" not in rec.replace(" ", ""):
+            return "baseline did not capture the measured rect numbers: %r" % rec
+        return ""
+    case("six-line measured geometry -> baseline recorded, all six lines", c3)
+
+    # 4 -- NEGATIVE CONTROL: verify must be able to say the geometry moved.
+    def c4():
+        use([("state\nfind SettingsList", [SIX])])
+        if cmd_baseline() != PASS:
+            return "setup: baseline did not record"
+        moved = SIX.replace("(850.0000, 755.0000)", "(851.0000, 755.0000)")
+        use([("state\nfind Toggles", [STATE]),
+             ("find SettingsList", [moved])], trail=NEVER + [
+                 "client  [0:01:20.000]ok  native tabs VERDICT: synthetic, "
+                 "case 4 only -- see the note in cmd_selftest"])
+        if cmd_verify() != FAIL:
+            return "a CHANGED sizeDelta did not FAIL -- the comparison cannot fail"
+        return ""
+    case("control: changed stock geometry -> FAIL", c4)
+
+    # 5 -- the vacuous pass: identical geometry, but the tick faulted itself off.
+    def c5():
+        use([("state\nfind SettingsList", [SIX])])
+        if cmd_baseline() != PASS:
+            return "setup: baseline did not record"
+        use([("state\nfind Toggles", [STATE]),
+             ("find SettingsList", [SIX])], trail=FAULTS)
+        if cmd_verify() != FAIL:
+            return ("identical geometry after a 4-of-4 fault ceiling was not "
+                    "FAIL -- nothing was ever added, so nothing could move")
+        return ""
+    case("fault ceiling in the host log -> FAIL, not a vacuous PASS", c5)
+
+    # 6 -- no VERDICT line anywhere: "I could not look" is not a pass. MEASURED:
+    #      no capture on this machine contains `native tabs VERDICT` at all.
+    def c6():
+        use([("state\nfind SettingsList", [SIX])])
+        if cmd_baseline() != PASS:
+            return "setup: baseline did not record"
+        use([("state\nfind Toggles", [STATE]),
+             ("find SettingsList", [SIX])], trail=NEVER)
+        rc = cmd_verify()
+        if rc != INCONCLUSIVE:
+            return "no `native tabs VERDICT` line returned %d, want " \
+                   "INCONCLUSIVE(%d)" % (rc, INCONCLUSIVE)
+        return ""
+    case("no `native tabs VERDICT` line -> INCONCLUSIVE", c6)
+
+    g.update(real)
+    print("\n==== nativetabs selftest: %d case(s) failed" % len(failures))
+    for f in failures:
+        print("  - %s" % f)
+    return 1 if failures else 0
+
+
 def main():
-    if len(sys.argv) < 2 or sys.argv[1] not in ("baseline", "verify"):
+    if len(sys.argv) < 2 or sys.argv[1] not in ("baseline", "verify",
+                                                "selftest"):
         print(__doc__)
         return INCONCLUSIVE
+    if sys.argv[1] == "selftest":
+        return cmd_selftest()
     return cmd_baseline() if sys.argv[1] == "baseline" else cmd_verify()
 
 

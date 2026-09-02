@@ -68,6 +68,7 @@ sys.path.insert(0, HERE)
 
 import hostlog  # noqa: E402 -- reuse the FAULT regex and log parser, not a new one
 import ichannel as ch  # noqa: E402 -- vendored channel.py, sentinel + parsers
+import inspectfixtures as _fixtures  # noqa: E402 -- the shared measured corpus
 
 LIVE_DEFAULT = r"D:\Aowlspt\aowlspt"
 
@@ -970,31 +971,28 @@ def cmd_run(args):
 # ---------------------------------------------------------------------------
 # There was no offline test for this file before today; the brief for this fix
 # assumed there was, so that assumption is corrected here rather than worked
-# around. The fixtures below are inspector prose in the EXACT emit format of
-# inspect.nim (`iOut` sites named per fixture); the numbers in them are
-# synthetic, the SHAPES are not. `run_batch` is replaced by a replay that
-# refuses any command it has no recording for, so a test can never pass by
-# talking to nothing.
+# around. `run_batch` is replaced by a replay that refuses any command it has
+# no recording for, so a test can never pass by talking to nothing.
+#
+# TWO TIERS OF FIXTURE, and the difference matters:
+#
+#   * `_fixtures.fx("...")` -- VERBATIM host output recorded from a real run,
+#     in tools/fixtures/inspector/. Prefer these. They are evidence.
+#   * the FX_* / _fx_* strings below -- SHAPED prose in inspect.nim's emit
+#     format with synthetic numbers, kept only where a case needs a tree that
+#     no capture on this machine happens to contain (the five-spawner strip and
+#     its per-toggle active flags). The numbers are synthetic; the SHAPES came
+#     from the emit sites. When a real capture of one of these turns up,
+#     harvest it into the corpus and delete the synthetic one.
 
-class _Replay(object):
-    """Offline stand-in for ch.run_batch. `script` is a list of
-    (command-prefix, [answer, ...]); answers are consumed in order and the
-    LAST one repeats (a poll loop asks the same question many times). An
-    unrecorded command is an AssertionError, never a silent empty answer --
-    an empty answer is exactly how a check that cannot fail gets built."""
-
-    def __init__(self, script):
-        self.script = [(p, list(a)) for p, a in script]
-        self.sent = []
-
-    def __call__(self, lines, live_dir=None, timeout=25.0, write=False, **kw):
-        first = lines[0] if lines else ""
-        self.sent.append(first)
-        for prefix, answers in self.script:
-            if first.startswith(prefix):
-                return "SENTINEL", (answers.pop(0) if len(answers) > 1
-                                    else answers[0])
-        raise AssertionError("replay has no recording for %r" % first)
+# `_Replay` USED TO LIVE HERE. It is now `inspectfixtures.Replay`, shared with
+# nativetabs_check.py, because a private replay per tool is the same failure as
+# a private parser per tool: nativetabs_check had none at all and shipped a
+# baseline that matched its own `> rect $_` echo, and this file's classifier
+# matched the batch header. One replay, one corpus of MEASURED prose under
+# tools/fixtures/inspector/, and an unrecorded command still RAISES rather than
+# returning an empty answer.
+_Replay = _fixtures.Replay
 
 
 def _hdr(batch, n, body):
@@ -1003,11 +1001,10 @@ def _hdr(batch, n, body):
             "%d line(s)" % (batch, n, body, batch, body.count("\n") + 3))
 
 
-# `state` (iCmdState): field reads only -- note it prints NO active flag, which
-# is the whole reason settings_active() exists.
-FX_STATE_BOUND = _hdr(91, 1, """> state
-  anchors: $preloader=0x000001e4a2b03040 $settings=0x000002b7c4180a80
-  channel: polls=902 reads=91 readFails=0 unchanged=811 batch=91 faults=0""")
+# `state` (iCmdState): MEASURED -- boot3.out batch 18, a real reply with a
+# non-null $settings. Note it prints NO active flag anywhere, which is the
+# whole reason settings_active() exists.
+FX_STATE_BOUND = _fixtures.fx("state-settings-bound")
 
 # `assert-active` (iCmdAssertActive -> iAssPass / iAssFail / iAssInc).
 FX_ACTIVE_TRUE = _hdr(92, 1, """> assert-active $settings

@@ -22,6 +22,9 @@ grows.
 
 Usage:
     python tools/uihooks_check.py
+    python tools/uihooks_check.py selftest   # OFFLINE, no client and no log:
+                                             # replays measured host-log lines
+                                             # from tools/fixtures/inspector/
 """
 import re
 import subprocess
@@ -124,5 +127,108 @@ def main():
     return PASS
 
 
+# ---------------------------------------------------------------------------
+# selftest -- OFFLINE, against tools/fixtures/inspector/_hostlog.txt
+# ---------------------------------------------------------------------------
+# The BANNED list here once matched the very lines that PROVE the migration
+# worked, because those lines describe what the migration removed. That was
+# found by running it; nothing stopped it coming back. This runs the real
+# `main()` against MEASURED host-log lines with only `grep` replaced -- the
+# regexes under test are the shipped ones, applied by re.search exactly as
+# hostlog.py would apply them.
+
+def cmd_selftest():
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import inspectfixtures as fx
+
+    g = globals()
+    real_grep = g["grep"]
+    failures = []
+
+    def use(lines):
+        """A grep over a fixed corpus of measured lines. `None` lines means the
+        log could not be read, which every caller must treat as INCONCLUSIVE."""
+        def fake(pattern):
+            if lines is None:
+                return None
+            rx = re.compile(pattern)
+            return [l for l in lines if rx.search(l)]
+        g["grep"] = fake
+
+    def case(title, fn):
+        print("\n---- %s" % title)
+        note = fn()
+        if note:
+            failures.append("%s: %s" % (title, note))
+            print("  ** CASE FAILED: %s" % note)
+        else:
+            print("  case ok")
+
+    ACTIONS = fx.fx("hostlog-menu-epoch-actions").splitlines()
+
+    # 1 -- the success case, on the exact prose that used to fail it.
+    def c1():
+        use(ACTIONS)
+        rc = main()
+        if rc != PASS:
+            return ("measured epoch-1 action lines returned %d, want PASS(%d). "
+                    "If this is a banned-idiom hit, the regex is matching the "
+                    "action line's own description of what it replaced." % (rc, PASS))
+        return ""
+    case("measured menu-epoch action lines -> PASS", c1)
+
+    # 1b -- the SAME check against the EARLIER, dangerous wording of those
+    #       lines ("No walk, no throttle", "The 120-frame clobber re-check is
+    #       gone"). This is the shape that once made the tool FAIL on success.
+    def c1b():
+        use(fx.fx("hostlog-menu-epoch-risky-prose").splitlines())
+        rc = main()
+        if rc != PASS:
+            return ("the pre-softening action wording returned %d, want "
+                    "PASS(%d) -- a banned-idiom regex is matching an action "
+                    "line's own description of what it replaced" % (rc, PASS))
+        return ""
+    case("action lines that NAME the removed idiom -> still PASS", c1b)
+
+    # 2 -- NEGATIVE CONTROL: more actions than epochs is per-frame behaviour.
+    def c2():
+        dup = [l for l in ACTIONS if "hide seasons" in l]
+        use(ACTIONS + dup + dup)   # 4 'hide seasons' actions, still epoch 1
+        if main() != FAIL:
+            return "more actions than menu epochs did not FAIL -- the count " \
+                   "comparison cannot fail"
+        return ""
+    case("control: actions outnumber epochs -> FAIL", c2)
+
+    # 3 -- NEGATIVE CONTROL: a genuine banned idiom must still be caught, and
+    #      it must be caught on a line that is NOT an action line.
+    def c3():
+        use(ACTIONS + ["client  [0:00:41.000]ok  hide seasons: re-checked the "
+                       "banner again this frame (throttle 30)"])
+        if main() != FAIL:
+            return "a real per-frame idiom on a non-action line was not caught"
+        return ""
+    case("control: a real throttle line -> FAIL", c3)
+
+    # 4 -- nothing observed is not a pass.
+    def c4():
+        use([])
+        if main() != INCONCLUSIVE:
+            return "an empty log was not INCONCLUSIVE"
+        use(None)
+        if main() != INCONCLUSIVE:
+            return "an unreadable log was not INCONCLUSIVE"
+        return ""
+    case("no lines / unreadable log -> INCONCLUSIVE", c4)
+
+    g["grep"] = real_grep
+    print("\n==== uihooks selftest: %d case(s) failed" % len(failures))
+    for f in failures:
+        print("  - %s" % f)
+    return 1 if failures else 0
+
+
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "selftest":
+        sys.exit(cmd_selftest())
     sys.exit(main())
