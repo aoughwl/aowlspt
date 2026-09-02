@@ -65,6 +65,15 @@ import sys
 import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+# Compiler resolution is SHELL-DEPENDENT on this machine unless it goes through
+# cctool: Git Bash prepends Git's mingw64\bin, cc1.exe then binds Git's DLLs and
+# dies in the loader with 0xC0000139, printing nothing. This file reported
+# INCONCLUSIVE from Bash and 11 PASS from PowerShell, same second, same command.
+# See tools/cctool.py for the measurement.
+from cctool import SHELL_CAUSE, cc_run, find_cc           # noqa: E402
+
 REPO = os.path.dirname(HERE)
 ABI = os.path.join(REPO, "abi")
 HEADER = os.path.join(ABI, "aowlspt_mqpolicy.h")
@@ -163,21 +172,14 @@ def note(state, name, detail=""):
     print("%-14s %s%s" % (state, name, ("  -- " + detail) if detail else ""))
 
 
-def find_cc():
-    for name in ("gcc", "cc", "clang"):
-        p = shutil.which(name)
-        if p:
-            return p
-    for p in (r"C:\msys64\ucrt64\bin\gcc.exe",
-              r"C:\msys64\mingw64\bin\gcc.exe"):
-        if os.path.isfile(p):
-            return p
-    return None
-
-
 def build_and_run(cc, tmp, falsify):
     """Compile the real header with a driver and run it. Returns a dict of
-    name -> int, or None with a printed reason."""
+    name -> int, or (None, why) with a printed reason.
+
+    Returns a 2-tuple so a caller can put the MEASURED cause into its
+    INCONCLUSIVE line. "the header did not compile clean" is not a cause; it
+    reads as a defect in the header when the real answer was the shell's PATH.
+    """
     src = os.path.join(tmp, "mqmain%d.c" % (1 if falsify else 0))
     exe = os.path.join(tmp, "mqmain%d.exe" % (1 if falsify else 0))
     with open(src, "w", newline="\n") as f:
@@ -185,41 +187,46 @@ def build_and_run(cc, tmp, falsify):
     cmd = [cc, "-std=c99", "-Wall", "-Werror", "-I", ABI, src, "-o", exe]
     if falsify:
         cmd.insert(1, "-DAOWL_MQ_FALSIFY")
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    r = cc_run(cmd)
     if r.returncode != 0:
-        print(r.stdout)
-        print(r.stderr)
-        return None
+        msg = ((r.stdout or "") + (r.stderr or "")).strip()
+        print(msg)
+        if not msg:
+            return None, ("the compiler exited %d with NO output at all, so "
+                          "this is an ENVIRONMENT failure, not a header "
+                          "defect. %s" % (r.returncode, SHELL_CAUSE))
+        return None, ("the header did not compile clean with -Wall -Werror: %s"
+                      % msg.splitlines()[0][:200])
     r = subprocess.run([exe], capture_output=True, text=True)
     if r.returncode != 0:
         print(r.stdout)
         print(r.stderr)
-        return None
+        return None, ("the compiled driver exited %d instead of running the "
+                      "cases" % r.returncode)
     out = {}
     for line in r.stdout.splitlines():
         parts = line.split()
         if len(parts) == 2:
             out[parts[0]] = int(parts[1])
-    return out
+    return out, ""
 
 
 def main():
     if not os.path.isfile(HEADER):
         note("INCONCLUSIVE", "header", "%s is absent" % HEADER)
         return 3
-    cc = find_cc()
+    cc, ccnote = find_cc()
     if cc is None:
         note("INCONCLUSIVE", "compiler",
-             "no gcc/cc/clang on PATH, so the policy could not be EXECUTED. "
-             "This is not a pass.")
+             "%s The policy could not be EXECUTED; this is not a pass."
+             % ccnote)
         return 3
 
     tmp = tempfile.mkdtemp(prefix="aowl-mqpolicy-")
     try:
-        real = build_and_run(cc, tmp, falsify=False)
+        real, why = build_and_run(cc, tmp, falsify=False)
         if real is None:
-            note("INCONCLUSIVE", "compile",
-                 "the header did not compile clean with -Wall -Werror")
+            note("INCONCLUSIVE", "compile", why)
             return 3
         for name, want in EXPECTED.items():
             got = real.get(name)
@@ -233,11 +240,11 @@ def main():
         # THE NEGATIVE CONTROL. The same header, the pre-fix policy, and the
         # one case that must go red. If it does not, every PASS above is
         # meaningless and this run is INCONCLUSIVE rather than green.
-        bad = build_and_run(cc, tmp, falsify=True)
+        bad, whybad = build_and_run(cc, tmp, falsify=True)
         if bad is None:
             note("INCONCLUSIVE", "falsifier-compile",
                  "the negative control did not build, so the PASSes above are "
-                 "unattributable")
+                 "unattributable: %s" % whybad)
         elif bad.get("stalled_on_host") == 1:
             note("PASS", "falsifier",
                  "the pre-2026-09-02 policy DOES run stalled work on the "

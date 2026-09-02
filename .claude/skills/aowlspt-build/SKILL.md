@@ -51,10 +51,30 @@ The build then reports a failure that has nothing to do with your change. The
 Bash tool in this session is Git Bash. Use the PowerShell tool for anything that
 compiles. Bash is fine for reading files and grepping.
 
-Related: `C:\msys64\ucrt64\bin` must come **before** Git-for-Windows'
-`/mingw64/bin` on PATH, or gcc loads the wrong `cc1` and dies with no diagnostic.
-`aowl doctor` checks exactly this — run it first when the *build* is behaving
-strangely rather than the code.
+**The cause is not the shell, it is PATH order — measured 2026-09-02.** Git Bash
+prepends `C:\Program Files\Git\mingw64\bin`, which precedes
+`C:\msys64\ucrt64\bin`. `gcc.exe` itself loads fine (an exe's own directory is
+searched first), but it execs
+`C:\msys64\ucrt64\lib\gcc\x86_64-w64-mingw32\15.2.0\cc1.exe`, whose directory
+holds only `liblto_plugin.dll` — so **cc1's** imports fall through to PATH and
+bind Git's `libgmp-10`/`libiconv-2`/`libwinpthread-1`/`libintl-8`/`libzstd`/
+`zlib1`/`libgcc_s_seh-1`. 17 DLL names collide and every one differs in size.
+Measured cc1 exit status under that PATH: **`0xC0000139`
+(STATUS_ENTRYPOINT_NOT_FOUND)** — a loader failure before `main`, which is
+exactly why nothing is printed. MSYSTEM, TMPDIR and MSYS path conversion were
+each ruled out independently.
+
+So `C:\msys64\ucrt64\bin` must come **before** Git-for-Windows' `/mingw64/bin`.
+`aowl doctor` checks this — run it first when the *build* is behaving strangely
+rather than the code.
+
+**Any Python tool that shells out to a compiler must use `tools/cctool.py`**
+(`find_cc()` / `cc_run()`), never a bare `shutil.which("gcc")` +
+`subprocess.run`. `cc_run` prepends the compiler's own bin directory to PATH, so
+the result is identical from both shells, and `find_cc` verifies by *actually
+compiling a TU* — a gcc that is PRESENT is not a gcc that WORKS (`gcc --version`
+succeeds while cc1 dies). `python tools/cctool.py` diagnoses the current shell:
+exit 0 working, exit 3 INCONCLUSIVE with the measured cause.
 
 ### 2. Never hand-invoke nimony to "just build one thing".
 

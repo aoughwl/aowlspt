@@ -239,7 +239,28 @@ those hooks is off, not that Settings was never opened.
   turns a one-line edit into a whole-file diff and a phantom conflict. Edit with
   the Edit tool or a Python script that preserves newlines; check `git diff
   --stat` before committing.
-- **PowerShell only.** `gcc` silently fails in Git Bash (exit 1, no output).
+- **PowerShell only, and the cause is PATH ORDER — measured 2026-09-02.** Git
+  Bash prepends `C:\Program Files\Git\mingw64\bin`, which precedes
+  `C:\msys64\ucrt64\bin`. `gcc.exe` itself still loads (Windows searches an
+  exe's own directory first), but gcc execs
+  `C:\msys64\ucrt64\lib\gcc\x86_64-w64-mingw32\15.2.0\cc1.exe`, whose directory
+  holds only `liblto_plugin.dll` — so **cc1's** imports fall through to PATH and
+  bind Git's `libgmp-10` / `libiconv-2` / `libwinpthread-1` / `libintl-8` /
+  `libzstd` / `zlib1` / `libgcc_s_seh-1` (17 DLL names collide; every one differs
+  in size). Measured cc1 exit status: **`0xC0000139`
+  (STATUS_ENTRYPOINT_NOT_FOUND)** — a *loader* failure before `main`, so cc1
+  writes nothing at all and gcc exits 1 with no diagnostic. It is **not** MSYSTEM,
+  not TMPDIR, not MSYS path conversion, not argv quoting: each was removed
+  independently and the failure persisted; only the PATH order matters.
+  **The fix is a directory, not a shell** — prepend the compiler's OWN bin dir to
+  PATH. `tools/modbuild.py:build_env` already does this; everything else must go
+  through **`tools/cctool.py`** (`find_cc()` / `cc_run()`), which verifies the
+  compiler by actually compiling a TU (a gcc that is PRESENT is not a gcc that
+  WORKS — `gcc --version` succeeds while cc1 dies). `python tools/cctool.py`
+  diagnoses the current shell. Consequence when this was unknown: `test_mqpolicy.py`
+  printed `INCONCLUSIVE compile` from Bash and `11 PASS` from PowerShell in the same
+  second, `selftests.py --fast` therefore exited non-zero, and `deploylock.py deploy`
+  refused — after which the launch ran the OLD host DLL.
 - Hand-invoking `nimony` outside `aowl` silently exits 0 producing **nothing**.
 - **Name the target**: `aowl build host` ≈ 2m on a quiet machine, but MEASURED 740-840s
   (12-14 min) on 2026-09-02 with several agents and builds contending for the CPU; `aowl build` ≈ 4m27s warm / 18m cold.

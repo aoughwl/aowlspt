@@ -105,6 +105,11 @@ REPO = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 
 from il2cpp_resolve import Resolver              # noqa: E402  (path set above)
+# Shell-independent compiler resolution -- see tools/cctool.py. Aliased so the
+# names cannot be confused with this module's own helpers.
+from cctool import (SHELL_CAUSE as _CCTOOL_SHELL_CAUSE,   # noqa: E402
+                    cc_run as _cctool_cc_run,
+                    find_cc as _cctool_find_cc)
 
 PROLOGUE_LEN = 16
 CODE_SECTION = "il2cpp"
@@ -768,27 +773,41 @@ def do_selftest(gameasm, metadec):
             if not bad else "wrong verdicts: %r" % bad)
 
         # -- PROOF 2: does the C COMPILER actually fail? ---------------------
-        cc = shutil.which("gcc") or shutil.which("cc") or shutil.which("clang")
+        # cctool, not shutil.which: a gcc that is PRESENT is not a gcc that
+        # WORKS. Under Git Bash, Git's mingw64\bin precedes msys2's ucrt64 on
+        # PATH, cc1.exe dies in the loader with 0xC0000139 and prints nothing,
+        # and gcc exits 1. That made the CONTROL TU fail too -- so this proof
+        # reported a confident FAIL ("clean rc=1, want 0") for an environment
+        # problem that has nothing to do with the header. See tools/cctool.py.
+        cc, ccnote = _cctool_find_cc()
         if not cc:
             rec("compile", "INCONCLUSIVE",
-                "no gcc/clang on PATH, so the poisoned-identifier proof was "
-                "NOT PERFORMED (this is not a pass)")
+                "%s The poisoned-identifier proof was NOT PERFORMED (this is "
+                "not a pass)." % ccnote)
         else:
             def compile_using(macro):
                 src = os.path.join(d, "tu.c")
                 write_lf(src, '#include "aowlspt_symtab.h"\n'
                               "unsigned t(void){ return %s; }\n" % macro)
-                p = subprocess.run([cc, "-c", "-I", d, src, "-o",
-                                    os.path.join(d, "tu.o")],
-                                   capture_output=True, text=True)
-                return p.returncode, (p.stdout + p.stderr)
+                p = _cctool_cc_run([cc, "-c", "-I", d, src, "-o",
+                                    os.path.join(d, "tu.o")])
+                return p.returncode, ((p.stdout or "") + (p.stderr or ""))
 
-            rc_ok, _ = compile_using("AOWL_SYM_CLEAN_ONE")
+            rc_ok, out_ok = compile_using("AOWL_SYM_CLEAN_ONE")
             rc_bad, out_bad = compile_using("AOWL_SYM_SHARED_BAD")
             rc_hatch, _ = compile_using("AOWL_SYMC_SHARED_OK")
             named = ("SHARED_BAD" in out_bad
                      and R_SHARED.split("_")[0] in out_bad)
-            if rc_ok == 0 and rc_bad != 0 and rc_hatch == 0 and named:
+            if rc_ok != 0 and not out_ok.strip():
+                # The CONTROL failed with no diagnostic. That is never a
+                # statement about the header -- it is the toolchain. Three
+                # outcomes, not two.
+                rec("compile", "INCONCLUSIVE",
+                    "the CONTROL translation unit (AOWL_SYM_CLEAN_ONE, which "
+                    "must compile) exited %d with no output, so the "
+                    "poisoned-identifier proof was NOT PERFORMED. %s"
+                    % (rc_ok, _CCTOOL_SHELL_CAUSE))
+            elif rc_ok == 0 and rc_bad != 0 and rc_hatch == 0 and named:
                 rec("compile", "PASS",
                     "control TU using AOWL_SYM_CLEAN_ONE compiled (rc=0); the "
                     "SAME shared RVA referenced as AOWL_SYM_SHARED_BAD FAILED "

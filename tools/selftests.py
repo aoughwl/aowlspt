@@ -139,6 +139,10 @@ ITEMS = [
     # that no main-thread work runs off the drain thread is tested rather
     # than asserted. INCONCLUSIVE, never PASS, without a C compiler.
     T("test_mqpolicy.py", "fast"),                     # 1.5s, needs gcc
+    # Resolves the compiler for the two items above. Its own falsifier builds
+    # a real gcc.exe that exits 1 with no output -- the measured Git Bash
+    # shape -- and asserts find_cc REFUSES it.
+    T("test_cctool.py", "fast"),                       # 2s, needs gcc
 
     # ---- fast self-tests --------------------------------------------------
     S("botaudit.py", "fast"),                          # 0.1s
@@ -223,6 +227,13 @@ def V(tool, falsifier=None, proof="", gap="", reason=""):
 
 VERIFIERS = [
     # ---- audited: a registered negative control exists ---------------------
+    V("cctool.py", "test_cctool.py",
+      "case 2 builds a REAL gcc.exe that exits 1 with no output -- the exact "
+      "observable shape of the measured 0xC0000139 loader death -- and asserts "
+      "find_cc refuses it rather than returning it; case 4 poisons PATH with "
+      "Git's mingw64\\bin, asserts the plain compile FAILS with zero bytes of "
+      "diagnostic, and only then credits cc_env with rescuing it (if the "
+      "unfixed compile also passes, the case reports INCONCLUSIVE, not PASS)"),
     V("irepl.py", "irepl_mutation.py",
       "injects the 3-state->2-state collapse into modctl.classify and asserts "
       "irepl.selftest() goes red"),
