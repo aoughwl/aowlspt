@@ -133,3 +133,90 @@ aowlspt live inspector -- batch 7, 2 command(s), on Unity thread 16676
   aowl-batch-1788300430504-7
 aowlspt live inspector -- batch 7 complete, 7 line(s)
 --- END
+
+=== ENTRY findtext-inactive-ancestor-skipped
+--- SOURCE synthetic-from-spec, NOT measured -- composed from inspect.nim's own
+--- SOURCE format strings for the fix to the measured 2026-09-02 defect where
+--- SOURCE `findtext Savant 200000` (default ACTIVE-only scope) returned a HIT on a
+--- SOURCE CharacterSlotView_pvp under an INACTIVE CharacterSelectionScreen while
+--- SOURCE `assert-active` on the same card said activeInHierarchy=false. Re-harvest
+--- SOURCE and re-mark as measured the next time this shape is captured live.
+--- SHAPE default ACTIVE scope: the inactive-ancestor hit is SKIPPED and the skip is counted and named, so 0 matches here is NOT absence
+--- COMMAND findtext Savant 200000
+--- OUTPUT
+aowlspt live inspector -- batch 7, 2 command(s), on Unity thread 13076
+> findtext Savant 200000
+  NOTE: "200000" does not read back as a live pointer, so it is being treated as BUDGET, not ROOT. Searching every scene root (as if no root were given). If you meant a root, pass a pointer that is actually live.
+  NOTE: requested budget 200000 exceeds `findtext`'s ceiling of 60000 nodes; clamped to 60000. The real backstop is the 12ms per-frame time slice, not the node count -- raising this ceiling is a deliberate code change, not a per-call override.
+  searching ALL 16 scene root(s) for TMP text containing "Savant" (case-insensitive; budget 60000 nodes, 12ms per frame, continuing across frames automatically; scope: ACTIVE nodes only -- pass `all` to include inactive)
+  visited 5211 node(s) over 29 frame(s), 0 match(es), frontier 0 node(s)
+  -- the subtree was searched EXHAUSTIVELY. Every match is listed above.
+  predicate control: 388 node(s) carried a TextMeshProUGUI (of 5211 visited) -- the predicate demonstrably CAN answer yes on this subtree.
+  scope: ACTIVE nodes only (activeInHierarchy, cross-checked against the parent chain -- the same predicate `assert-active` uses); 1 inactive hit(s) skipped -- re-run as `findtext ... all` to include them
+> echo aowl-batch-1788300430504-0
+  aowl-batch-1788300430504-0
+aowlspt live inspector -- batch 7 complete, 10 line(s)
+--- END
+
+=== ENTRY findtext-active-unknown-disagreement
+--- SOURCE synthetic-from-spec, NOT measured -- see findtext-inactive-ancestor-skipped.
+--- SOURCE This is the CROSS-CHECK branch: GameObject::get_activeInHierarchy and the
+--- SOURCE independent parent-chain derivation disagreed, which is what a shared
+--- SOURCE empty-body stub at that RVA looks like from the outside.
+--- SHAPE a HIT tagged activeInHierarchy=UNKNOWN plus the INCONCLUSIVE line -- must NOT be parsed as pressable, and must NOT be parsed as a clean hit
+--- COMMAND findtext Savant 200000
+--- OUTPUT
+aowlspt live inspector -- batch 8, 2 command(s), on Unity thread 13076
+> findtext Savant 200000
+  NOTE: "200000" does not read back as a live pointer, so it is being treated as BUDGET, not ROOT. Searching every scene root (as if no root were given). If you meant a root, pass a pointer that is actually live.
+  searching ALL 16 scene root(s) for TMP text containing "Savant" (case-insensitive; budget 60000 nodes, 12ms per frame, continuing across frames automatically; scope: ACTIVE nodes only -- pass `all` to include inactive)
+    HIT 0x0000013be6206440  name="Nickname"  parent="CharacterSlotView_pvp"  text="Savant"  activeInHierarchy=UNKNOWN (NOT verified pressable)   ($f1)
+  visited 5211 node(s) over 29 frame(s), 1 match(es), frontier 0 node(s)
+  -- the subtree was searched EXHAUSTIVELY. Every match is listed above.
+  matches are bound to $f1..$f1 for the rest of this batch
+  predicate control: 388 node(s) carried a TextMeshProUGUI (of 5211 visited) -- the predicate demonstrably CAN answer yes on this subtree.
+  scope: ACTIVE nodes only (activeInHierarchy, cross-checked against the parent chain -- the same predicate `assert-active` uses)
+  ! INCONCLUSIVE for 1 hit(s): their activeInHierarchy could not be established, so they are listed but NOT claimed pressable. Confirm each with `assert-active $fN` before pressing it.
+  ! active predicate: activeInHierarchy CROSS-CHECK DISAGREEMENT on 0x0000013be6206440: GameObject::get_activeInHierarchy said true, but the parent chain (get_activeSelf at every level) said false -- inactive ancestor "CharacterSelectionScreen". One of the two is wrong, so this node's pressability is INCONCLUSIVE and it is NOT reported as pressable.
+> echo aowl-batch-1788300430504-0
+  aowl-batch-1788300430504-0
+aowlspt live inspector -- batch 8 complete, 13 line(s)
+--- END
+
+=== ENTRY findtext-in-root-substring-refused
+--- SOURCE synthetic-from-spec, NOT measured -- composed from inspect.nim's format
+--- SOURCE strings for the measured 2026-09-02 defect where `find X in Menu UI` read
+--- SOURCE ONE token as the root name, resolved "Menu" by SUBSTRING to "Context Menu
+--- SOURCE Area", searched that, and answered "genuinely NOT PRESENT under this root".
+--- SHAPE THE NEGATIVE CONTROL: a substring-only root match is REFUSED and NOTHING WAS EXAMINED -- a parser must classify this as inconclusive, never as absence
+--- COMMAND findtext Savant in Menu
+--- OUTPUT
+aowlspt live inspector -- batch 9, 2 command(s), on Unity thread 13076
+> findtext Savant in Menu
+  ! findtext REFUSED: no object is named exactly "Menu". The closest match by substring is "Context Menu Area" at 0x0000013b7c114a80, and searching THAT and calling the result an absence is the confidently-wrong answer this refusal exists to prevent. If you meant it, pass its pointer, or spell the name in full (quote it: findtext NAME in "Context Menu Area"). Nothing was searched.
+  visited 0 node(s) over 0 frame(s), 0 match(es), frontier 0 node(s)
+  -- NOTHING WAS EXAMINED (0 valid nodes visited). This is NOT evidence the search subject is absent -- it means `findtext` refused before it looked. Nothing was searched.
+> echo aowl-batch-1788300430504-0
+  aowl-batch-1788300430504-0
+aowlspt live inspector -- batch 9 complete, 7 line(s)
+--- END
+
+=== ENTRY findtext-in-root-exact-scene-root
+--- SOURCE synthetic-from-spec, NOT measured -- see findtext-in-root-substring-refused.
+--- SOURCE The quoted form used to find no root at all, because "Login UI" is a SCENE
+--- SOURCE ROOT and the old resolver only walked the tree $preloader belongs to.
+--- SHAPE a quoted multi-word root resolved by EXACT name among the scene roots, then searched normally
+--- COMMAND findtext Savant in "Login UI"
+--- OUTPUT
+aowlspt live inspector -- batch 10, 2 command(s), on Unity thread 13076
+> findtext Savant in "Login UI"
+  root "Login UI" resolved by EXACT name among the 16 scene root(s) to 0x0000013b7b6f21c0.
+  searching from 0x0000013b7b6f21c0 name="Login UI" for TMP text containing "Savant" (case-insensitive; budget 20000 nodes, 12ms per frame, continuing across frames automatically; scope: ACTIVE nodes only -- pass `all` to include inactive)
+  visited 812 node(s) over 4 frame(s), 0 match(es), frontier 0 node(s)
+  -- the subtree was searched EXHAUSTIVELY. Every match is listed above.
+  predicate control: 96 node(s) carried a TextMeshProUGUI (of 812 visited) -- the predicate demonstrably CAN answer yes on this subtree.
+  scope: ACTIVE nodes only (activeInHierarchy, cross-checked against the parent chain -- the same predicate `assert-active` uses); 1 inactive hit(s) skipped -- re-run as `findtext ... all` to include them
+> echo aowl-batch-1788300430504-0
+  aowl-batch-1788300430504-0
+aowlspt live inspector -- batch 10 complete, 9 line(s)
+--- END

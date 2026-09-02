@@ -8234,3 +8234,86 @@ UNVERIFIED offline: that `_completion` is the TCS `SubmitAsync` actually
 completes (the state machine was not walked), and that no other awaiter sits
 between the TCS and `ExecuteCharacterSelection`. Everything else above is
 disassembly or metadata.
+
+---
+
+## Inspector: one activeInHierarchy predicate, and an EXACT `in ROOT` (2026-09-02)
+
+**Observed (live inspector, coordinating session).** `findtext Savant 200000`
+-- default scope, which the report calls "ACTIVE nodes only" -- returned a HIT
+whose parent chain, walked with `parent`, was
+`CharacterSlotView_pvp (activeSelf=true) -> CharactersContainer ->
+CharacterSelectionScreen (activeSelf=FALSE) -> Login UI`, and `assert-active`
+on that card answered `activeInHierarchy=false`. The same instrument therefore
+gave two different answers about the same node, and the one a caller would act
+on said "pressable".
+
+**Conclusion.** A lone call to `GameObject::get_activeInHierarchy` is a check
+that cannot fail. If that RVA resolves to this build's universal empty-body
+stub (`C2 00 00`, shared by 6,438 methods -- see the `ForceMeshUpdate` entry)
+the call returns whatever was left in RAX, and an odd leftover reads back as
+`active = true`. Nothing in a single-call predicate can notice that. The exact
+cause on this build is UNVERIFIED -- it was not measured against a live client
+by the session that made this change -- but every branch is now announced.
+
+**What the inspector does now.** `iActiveInHierarchyChecked` is the single
+predicate behind `findtext`'s ACTIVE scope, each HIT line's
+`activeInHierarchy=` tag, `assert-active`, `open`, `verify`, `siblings`,
+`findcomp` and `why`. It cross-checks the runtime call against an INDEPENDENT
+derivation -- climb the Transform parent chain, capped at 64 hops, AND together
+`GameObject::get_activeSelf` at every level -- and has three outcomes:
+
+* agree -> that value;
+* DISAGREE -> INCONCLUSIVE, naming both answers and the inactive ancestor. It
+  does not pick a winner, because one of the two is lying;
+* only one available -> that one, said out loud as derived.
+
+A hit whose active state is not established is tagged
+`activeInHierarchy=UNKNOWN (NOT verified pressable)`, counted, and reported on
+its own `! INCONCLUSIVE for N hit(s)` line. Hitting the climb cap is NOT a
+verdict.
+
+**`find` / `findtext` `X in ROOT` resolves by EXACT name.** Measured the same
+night: `find X in Menu UI` took ONE token, resolved `Menu` by SUBSTRING to
+`Context Menu Area`, searched that, and reported X "genuinely NOT PRESENT under
+this root". Quoted -- `in "Menu UI"` -- it found no root at all, because
+`Menu UI` is a SCENE ROOT and the old resolver only walked the tree
+`$preloader` belongs to. Order now: EXACT name among the scene roots; then
+EXACT name anywhere; then REFUSE with `NOTHING WAS EXAMINED`, naming the
+substring match it would have picked. Ambiguity (two exact matches) also
+refuses. An unquoted run of bare words after `in` is JOINED into one name and
+said so. `findtext` accepts `in` at all for the first time; before this the
+keyword fell through to the pointer parser as "not an address: in".
+
+Guarded by `tools/test_inspect_silence.py` invariants
+`active_predicate_is_shared` and `in_root_exact_only` (both FAIL on the pre-fix
+source, which is what makes them checks), and by four entries in
+`tools/fixtures/inspector/findtext.txt` marked
+`SOURCE synthetic-from-spec, NOT measured` -- including the substring-refusal
+negative control, which a parser must classify as inconclusive and never as
+absence.
+
+## 2026-09-02: modeskip calls Submit with the SLOT VIEW's own fields -- the register values were the bug
+
+Implemented from the offline derivation. The click a player makes runs
+`CharacterSelectionSlotViewBase::OnActionButtonPressed` @`0x13F61B0` ->
+`Selected(_gameMode, _profileData)` ->
+`CharacterSelectionScreenController::Submit(EGameMode, CharacterSelectionProfileData)`
+@`0x13F0BF0` (UNIQUE), frame `RCX=controller, EDX=EGameMode int32
+(Regular=0, Pve=1, PvpSeason=2), R8=CharacterSelectionProfileData, R9=MethodInfo*`
+which the game itself passes as 0.
+
+**The frame was always right; the VALUES were wrong.** modeskip took them from
+the `ShowSlot` argument registers. It now reads them off the slot view the game
+handed us -- `_gameMode` @`0x160` (int32) and `_profileData` @`0x178` (pointer) --
+which is what `Selected` is actually given. That is the whole defect behind
+`Profile == 1` in the minidump: `EGameMode.Pve == 1` sitting in the profile slot.
+
+Guards before the call: controller non-null and readable, `_profileData`
+non-null and readable, `_gameMode` within 0..8 or the call is refused by name.
+Nothing is pressed and no screen state is written, so there is no half-applied
+UI to undo -- the failure mode of the build before this one. `Submit` is ASYNC
+(TCS -> `RunCharacterSelectionFlow` d__130 -> `ExecuteCharacterSelection` ->
+`MainMenuShowOperation` -> `MenuScreen::Show`), so returning proves nothing: the
+readback stays uihooks site 2, and a NO-READBACK logs the exact three values
+that were passed.

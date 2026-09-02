@@ -193,6 +193,72 @@ def inv_wordy_root_refused(t):
             "grammar_exempt=%s" % (msg, shared, verdict, grammar))
 
 
+def inv_active_predicate_is_shared(t):
+    """`findtext`'s ACTIVE scope, its HIT tag and `assert-active` must be ONE
+    predicate, and it must be cross-checkable.
+
+    MEASURED live: `findtext Savant 200000` (default scope = ACTIVE only)
+    returned a HIT on a CharacterSlotView_pvp whose ancestor
+    CharacterSelectionScreen had activeSelf=FALSE, while `assert-active` on
+    that same card answered activeInHierarchy=false. A single call to
+    GameObject::get_activeInHierarchy is a check that cannot fail -- if that
+    RVA is this build's shared empty-body stub it returns leftover RAX, and an
+    odd leftover reads as `true`. So:
+      * one proc (`iActiveInHierarchyChecked`) is what both callers use;
+      * it cross-checks against an INDEPENDENT parent-chain derivation and
+        reports a disagreement as INCONCLUSIVE rather than picking a winner;
+      * the climb is capped, and hitting the cap is NOT a verdict;
+      * a hit whose active state is unknown is tagged UNKNOWN, never printed
+        as pressable.
+    """
+    one = ("proc iActiveInHierarchyChecked(" in t
+           and "iActiveInHierarchyChecked(cur, actNote)" in t
+           and "iActiveInHierarchyChecked(p, actNote)" in t
+           and "iActiveInHierarchy(p)" not in t)
+    derived = ("proc iActiveChainDerived(" in t
+               and "GameObject::get_activeSelf [active chain]" in t
+               and "Transform::get_parent [active chain]" in t)
+    disagree = "CROSS-CHECK DISAGREEMENT" in t
+    capped = ("InspActiveClimbMax" in t
+              and "THE CAP IS NOT A VERDICT" in t)
+    unknown = ("activeInHierarchy=UNKNOWN (NOT verified " in t
+               and "gTxtActiveUnknown" in t)
+    return (one and derived and disagree and capped and unknown,
+            "shared_proc=%s derived_chain=%s disagreement=%s capped=%s "
+            "unknown_tagged=%s" % (one, derived, disagree, capped, unknown))
+
+
+def inv_in_root_exact_only(t):
+    """`find/findtext X in ROOT` must resolve the root by EXACT name, look at
+    the SCENE ROOTS first, accept a quoted multi-word name, and REFUSE on a
+    substring-only match.
+
+    MEASURED live: `find X in Menu UI` took ONE token ("Menu"), resolved it by
+    SUBSTRING to "Context Menu Area", searched that, and reported X "genuinely
+    NOT PRESENT under this root" -- a confidently wrong absence about a root
+    nobody asked for. `in "Menu UI"` (quoted) found no root at all, because
+    the real "Menu UI" is a scene root and the old scan only walked the tree
+    $preloader belongs to.
+    """
+    exact = ("proc iFindRootByName(" in t
+             and "proc iNameSame(" in t
+             and "iFindFirstByName(" not in t)          # substring resolver gone
+    roots_first = ("iSceneRoots(roots, false)" in t
+                   and "resolved by EXACT name among the" in t)
+    refuses = ("closest match by substring" in t
+               and t.count("iFindNothingExamined(cmdName)") >= 5)
+    multiword = ("proc iFindInRootName(" in t
+                 and "were joined into" in t)
+    both_verbs = ('iFindRootByName(rootName, "find", root)' in t
+                  and 'iFindRootByName(rootName, "findtext", root)' in t)
+    stopped = "root-name scan STOPPED EARLY" in t
+    return (exact and roots_first and refuses and multiword and both_verbs
+            and stopped,
+            "exact_resolver=%s scene_roots_first=%s substring_refused=%s "
+            "multiword=%s both_verbs=%s stopped_early=%s"
+            % (exact, roots_first, refuses, multiword, both_verbs, stopped))
+
+
 INVARIANTS = [
     ("no_combined_off_guard", inv_no_combined_off_guard),
     ("flight_report_exists", inv_flight_report_exists),
@@ -204,6 +270,8 @@ INVARIANTS = [
     ("watchdog_survives_off", inv_watchdog_survives_off),
     ("stale_file_not_run", inv_stale_file_not_run),
     ("wordy_root_refused", inv_wordy_root_refused),
+    ("active_predicate_is_shared", inv_active_predicate_is_shared),
+    ("in_root_exact_only", inv_in_root_exact_only),
 ]
 
 

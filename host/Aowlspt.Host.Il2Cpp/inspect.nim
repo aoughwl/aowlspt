@@ -415,6 +415,14 @@ var gTxtActiveOnly = true
   ## opts into including inactive nodes, same spelling family as `aowl ui`'s
   ## `--all`.
 var gTxtInactiveSkipped = 0
+var gTxtActiveUnknown = 0
+  ## Hits whose activeInHierarchy could NOT be established (the runtime call
+  ## did not answer, or it DISAGREED with the parent chain). These are neither
+  ## skipped nor presented as pressable: "I could not look" is not a pass.
+var gTxtActiveNote = ""
+  ## First activeInHierarchy disagreement/derivation note of this search, so
+  ## the report can say WHY a hit is tagged UNKNOWN instead of leaving the
+  ## reader to guess.
 var gTxtFound = 0
 var gTxtActive = false
 var gTxtBudgetLeft = 0
@@ -2210,6 +2218,8 @@ proc iParentName(p: Il2CppPtr): string =
 
 var gFnGoOfComponent: Il2CppPtr = nil
 var gFnActiveInHierarchy: Il2CppPtr = nil
+var gFnActiveSelfOfGo: Il2CppPtr = nil
+var gFnParentOfTransform: Il2CppPtr = nil
 var gActiveFnsResolved = false
 
 proc iEnsureActiveFns(): bool =
@@ -2226,6 +2236,14 @@ proc iEnsureActiveFns(): bool =
     gFnGoOfComponent = iTargetFn(idx)
   if iFindTarget("GameObject::get_activeInHierarchy", idx, hits):
     gFnActiveInHierarchy = iTargetFn(idx)
+  # The SECOND, INDEPENDENT derivation's two functions. Cached here rather
+  # than in their own resolver so there is exactly one place that can fail
+  # and exactly one cached answer about whether the active predicate is
+  # cross-checkable on this build.
+  if iFindTarget("GameObject::get_activeSelf", idx, hits):
+    gFnActiveSelfOfGo = iTargetFn(idx)
+  if iFindTarget("Transform::get_parent", idx, hits):
+    gFnParentOfTransform = iTargetFn(idx)
   result = gFnGoOfComponent != nil and gFnActiveInHierarchy != nil
 
 proc iActiveInHierarchy(cur: Il2CppPtr): (bool, bool) =
@@ -2248,6 +2266,103 @@ proc iActiveInHierarchy(cur: Il2CppPtr): (bool, bool) =
   iMark("GameObject::get_activeInHierarchy", go)
   let act = cInspUP(gFnActiveInHierarchy, go, nil)
   result = (true, (act and 1'u64) != 0'u64)
+
+const InspActiveClimbMax = 64
+  ## Cap on the parent climb of the derived active check. A hierarchy 64 deep
+  ## is already absurd; a corrupt parent pointer that cycles is not, and an
+  ## uncapped climb inside a frame is the rule-4 failure.
+
+proc iActiveChainDerived(cur: Il2CppPtr; blocker: var string): (bool, bool) =
+  ## SECOND, INDEPENDENT derivation of activeInHierarchy: climb the Transform
+  ## parent chain and AND together `GameObject::get_activeSelf` at every
+  ## level, exactly as `parent`'s ladder prints it.
+  ##
+  ## WHY A SECOND ONE EXISTS. A single call to
+  ## `GameObject::get_activeInHierarchy` is a check that cannot fail: if that
+  ## RVA resolves to this build's universal empty-body stub (`ret 0`, shared
+  ## by 6,438 methods) the call returns whatever was left in RAX, and an odd
+  ## leftover reads back as `active=true` for a node sitting under an
+  ## INACTIVE ancestor. That is exactly the shape measured on
+  ## `CharacterSlotView_pvp` under an inactive `CharacterSelectionScreen`.
+  ## The climb cannot be fooled the same way, because it reads a different
+  ## function at every one of several levels and disagrees loudly.
+  ##
+  ## (ok, active). ok=false means NO verdict -- a function was unresolved, a
+  ## hop was unreadable, or the climb hit its cap. `blocker` names the first
+  ## level found inactive, which is the thing a caller actually wants to know.
+  result = (false, false)
+  blocker = ""
+  if not iEnsureActiveFns():
+    return
+  if gFnActiveSelfOfGo == nil or gFnParentOfTransform == nil:
+    return
+  var node = cur
+  var hops = 0
+  while hops < InspActiveClimbMax:
+    if not duOk(node, 0x20'i32) or not iUnityAlive(node):
+      return
+    iMark("Component::get_gameObject [active chain]", node)
+    let go = cast[Il2CppPtr](cInspUP(gFnGoOfComponent, node, nil))
+    if not duOk(go, 0x20'i32) or not iUnityAlive(go):
+      return
+    iMark("GameObject::get_activeSelf [active chain]", go)
+    let a = cInspUP(gFnActiveSelfOfGo, go, nil)
+    if (a and 1'u64) == 0'u64:
+      blocker = iObjName(node)
+      result = (true, false)
+      return
+    iMark("Transform::get_parent [active chain]", node)
+    let par = cast[Il2CppPtr](cInspUP(gFnParentOfTransform, node, nil))
+    if par == nil:
+      # Reached the top of the hierarchy with every level active.
+      result = (true, true)
+      return
+    if not duOk(par, 0x20'i32) or not iUnityAlive(par):
+      return
+    node = par
+    inc hops
+  # THE CAP IS NOT A VERDICT. Falling out of the loop means the chain was
+  # longer than the cap (or cycles), so nothing is known -- do not return
+  # "active" for a chain that was never finished.
+
+proc iActiveInHierarchyChecked(cur: Il2CppPtr; note: var string): (bool, bool) =
+  ## THE predicate. `assert-active`, `findtext`'s ACTIVE scope and every HIT
+  ## line's `activeInHierarchy=` tag all go through this one proc, so the
+  ## filter and the label can never disagree with each other, and neither can
+  ## disagree with what `assert-active` reports about the same pointer.
+  ##
+  ## Three outcomes, never two: agree -> that value; DISAGREE -> INCONCLUSIVE
+  ## (ok=false) with a note naming both answers, because one of the two
+  ## instruments is lying and picking a winner would just pick a lie; only one
+  ## available -> that one, noted.
+  note = ""
+  let (callOk, callAct) = iActiveInHierarchy(cur)
+  var blocker = ""
+  let (chainOk, chainAct) = iActiveChainDerived(cur, blocker)
+  if callOk and chainOk:
+    if callAct == chainAct:
+      result = (true, callAct)
+    else:
+      note = "activeInHierarchy CROSS-CHECK DISAGREEMENT on " & iPtr(cur) &
+             ": GameObject::get_activeInHierarchy said " &
+             (if callAct: "true" else: "false") &
+             ", but the parent chain (get_activeSelf at every level) said " &
+             (if chainAct: "true" else: "false") &
+             (if blocker.len > 0: " -- inactive ancestor \"" & blocker & "\""
+              else: "") &
+             ". One of the two is wrong, so this node's pressability is " &
+             "INCONCLUSIVE and it is NOT reported as pressable."
+      result = (false, false)
+  elif callOk:
+    result = (true, callAct)
+  elif chainOk:
+    note = "activeInHierarchy was DERIVED from the parent chain for " &
+           iPtr(cur) & " (GameObject::get_activeInHierarchy did not answer)" &
+           (if (not chainAct) and blocker.len > 0:
+              "; inactive ancestor \"" & blocker & "\"" else: "") & "."
+    result = (true, chainAct)
+  else:
+    result = (false, false)
 
 proc iHierRoot(p: Il2CppPtr): Il2CppPtr =
   ## Climb to the top of the hierarchy. ONLY called when the caller did not
@@ -2430,37 +2545,6 @@ proc iFindReport(status: int) =
   # it has no separate instrument that can go blind -- so it passes no blind
   # note. That is a statement about this predicate, not a default.
 
-proc iFindFirstByName(want: string; root: Il2CppPtr; budget: int): Il2CppPtr =
-  ## Resolve a root BY NAME, so `find X in Y` does not require already knowing
-  ## Y's pointer -- which is the position everybody is in before the first
-  ## search succeeds.
-  result = nil
-  var queue: seq[Il2CppPtr] = @[]
-  queue.add root
-  var head = 0
-  var seen = 0
-  let started = cNowMs()
-  let w = iLower(want)
-  while head < queue.len and seen < budget:
-    if (seen and 255) == 0 and cNowMs() - started > InspFindSliceMs:
-      return nil
-    let cur = queue[head]
-    inc head
-    inc seen
-    if not duOk(cur, 0x20'i32) or not iUnityAlive(cur):
-      continue
-    let nm = iObjName(cur)
-    if nm.len > 0 and iContains(iLower(nm), w):
-      return cur
-    var n = 0
-    if iChildCount(cur, n):
-      var k = 0
-      while k < n and k < InspMaxChildren:
-        let c = iChildAt(cur, k)
-        if c != nil:
-          queue.add c
-        inc k
-
 proc iCollectByName(want: string; roots: seq[Il2CppPtr]; budget: int;
                     maxHits: int; into: var seq[Il2CppPtr];
                     exhaustive: var bool): int =
@@ -2602,15 +2686,28 @@ proc iFindTextStep(): int =
       if sp != nil and not iIsKnownKlass(cast[uint64](sp)) and duOk(sp, 0x18'i32):
         let txt = suiReadString(sp)
         if txt.len > 0 and iContains(iLower(txt), gTxtWant):
-          let (activeOk, active) = iActiveInHierarchy(cur)
+          # THE SAME PREDICATE `assert-active` USES, and the same one the
+          # tag below prints -- one evaluation, one truth. Evaluated per HIT,
+          # not per node, so the parent climb costs at most InspFindMaxHits
+          # ladders per search.
+          var actNote = ""
+          let (activeOk, active) = iActiveInHierarchyChecked(cur, actNote)
+          if actNote.len > 0 and gTxtActiveNote.len == 0:
+            gTxtActiveNote = actNote
           if gTxtActiveOnly and activeOk and not active:
             inc gTxtInactiveSkipped
           else:
+            if not activeOk:
+              # NOT a silent inclusion: an unestablished active state is
+              # counted and tagged, because "I could not look" is not "yes".
+              inc gTxtActiveUnknown
             inc gTxtFound
             iSetVar("f" & $gTxtFound, cast[uint64](cur))
             let nm = iObjName(cur)
             let pn = iParentName(cur)
-            let activeTag = (if not activeOk: "  activeInHierarchy=unknown"
+            let activeTag = (if not activeOk:
+                               "  activeInHierarchy=UNKNOWN (NOT verified " &
+                               "pressable)"
                               elif active: "  activeInHierarchy=true"
                               else: "  activeInHierarchy=FALSE (unpressable)")
             iOut("    HIT " & iPtr(cur) &
@@ -2667,11 +2764,20 @@ proc iFindTextReport(status: int) =
   if gTxtKlassNote.len > 0:
     iErr("klass identity: " & gTxtKlassNote)
   if gTxtActiveOnly:
-    iOut("  scope: ACTIVE nodes only (activeInHierarchy)" &
+    iOut("  scope: ACTIVE nodes only (activeInHierarchy, cross-checked " &
+         "against the parent chain -- the same predicate `assert-active` " &
+         "uses)" &
          (if gTxtInactiveSkipped > 0:
             "; " & $gTxtInactiveSkipped & " inactive hit(s) skipped -- " &
             "re-run as `findtext ... all` to include them"
           else: ""))
+  if gTxtActiveUnknown > 0:
+    iErr("INCONCLUSIVE for " & $gTxtActiveUnknown & " hit(s): their " &
+         "activeInHierarchy could not be established, so they are listed but " &
+         "NOT claimed pressable. Confirm each with `assert-active $fN` " &
+         "before pressing it.")
+  if gTxtActiveNote.len > 0:
+    iErr("active predicate: " & gTxtActiveNote)
   else:
     iOut("  scope: ALL nodes, active and inactive -- `all` was passed, so " &
          "some hits above may be unpressable; check activeInHierarchy on " &
@@ -3042,6 +3148,207 @@ proc iFindNothingExamined(cmdName: string) =
        "evidence the search subject is absent -- it means `" & cmdName &
        "` refused before it looked. Nothing was searched.")
 
+proc iNameSame(a, b: string): bool =
+  ## Case-insensitive EQUALITY, not containment. The distinction is the whole
+  ## point of `iFindRootByName`.
+  iLower(a) == iLower(b)
+
+proc iFindRootScan(want: string; roots: seq[Il2CppPtr]; budget: int;
+                   exact: var Il2CppPtr; exactCount: var int;
+                   loose: var Il2CppPtr; looseName: var string;
+                   exhaustive: var bool) =
+  ## ONE breadth-first walk that answers BOTH questions a root-by-name lookup
+  ## has: is there an EXACT name match (and is it unique), and -- only so the
+  ## refusal can name it -- is there a substring-only near-miss.
+  ##
+  ## `exhaustive` reports whether the frontier was actually drained. A scan
+  ## that ran out of budget or out of frame time has NOT established that no
+  ## root by that name exists, and the caller must not turn it into an
+  ## absence verdict.
+  exact = nil
+  exactCount = 0
+  loose = nil
+  looseName = ""
+  exhaustive = false
+  var queue: seq[Il2CppPtr] = @[]
+  var i = 0
+  while i < roots.len:
+    queue.add roots[i]
+    inc i
+  var head = 0
+  var seen = 0
+  let started = cNowMs()
+  let w = iLower(want)
+  while head < queue.len:
+    if seen >= budget:
+      return
+    if (seen and 255) == 0 and cNowMs() - started > InspFindSliceMs:
+      return
+    let cur = queue[head]
+    inc head
+    inc seen
+    if not duOk(cur, 0x20'i32) or not iUnityAlive(cur):
+      continue
+    let nm = iObjName(cur)
+    if nm.len > 0:
+      if iNameSame(nm, want):
+        inc exactCount
+        if exact == nil:
+          exact = cur
+      elif loose == nil and iContains(iLower(nm), w):
+        loose = cur
+        looseName = nm
+    var n = 0
+    if iChildCount(cur, n):
+      var k = 0
+      while k < n and k < InspMaxChildren:
+        let c = iChildAt(cur, k)
+        if c != nil:
+          queue.add c
+        inc k
+  exhaustive = true
+
+proc iFindRootByName(want: string; cmdName: string;
+                     root: var Il2CppPtr): bool =
+  ## `find X in ROOT` / `findtext X in ROOT` -- resolve ROOT BY NAME.
+  ##
+  ## MEASURED DEFECT THIS REPLACES: the old resolver took ONE token, matched
+  ## by SUBSTRING, and searched only the tree `$preloader` happens to belong
+  ## to. `find X in Menu UI` therefore read the root name as "Menu", matched
+  ## "Context Menu Area" by substring, searched that, and reported X
+  ## "genuinely NOT PRESENT under this root" -- a confidently wrong absence
+  ## about a root nobody asked for. Quoting it (`in "Menu UI"`) found no root
+  ## at all, because the real "Menu UI" is a SCENE ROOT and the old scan
+  ## never looked at the scene roots.
+  ##
+  ## So, in order: EXACT name among the scene roots; then EXACT name anywhere
+  ## in the hierarchy; then REFUSE, naming the substring match it would have
+  ## silently picked. A substring-only match is never used.
+  root = nil
+  var roots: seq[Il2CppPtr] = @[]
+  let nRoots = iSceneRoots(roots, false)
+  if nRoots == 0 or roots.len == 0:
+    if gInspPreloader == nil:
+      iErr(cmdName & ": scene-root enumeration is unavailable and " &
+           "$preloader is null, so a root could not be resolved by name at " &
+           "all. Nothing was searched.")
+      iFindNothingExamined(cmdName)
+      return false
+    roots = @[]
+    roots.add iHierRoot(iToTransform(gInspPreloader))
+    iOut("  NOTE: scene-root enumeration did not work, so the root name is " &
+         "resolved only within the tree $preloader belongs to.")
+
+  # PASS 1 -- EXACT, among the scene roots THEMSELVES. This is the pass that
+  # makes `in "Menu UI"` work: a scene root is not a child of anything, so a
+  # hierarchy walk seeded elsewhere structurally cannot reach it.
+  var topHit: Il2CppPtr = nil
+  var topCount = 0
+  var i = 0
+  while i < roots.len:
+    let r = roots[i]
+    inc i
+    if not duOk(r, 0x20'i32) or not iUnityAlive(r):
+      continue
+    if iNameSame(iObjName(r), want):
+      inc topCount
+      if topHit == nil:
+        topHit = r
+  if topCount == 1:
+    root = topHit
+    iOut("  root \"" & want & "\" resolved by EXACT name among the " &
+         $roots.len & " scene root(s) to " & iPtr(root) & ".")
+    return true
+  if topCount > 1:
+    iErr(cmdName & " REFUSED: " & $topCount & " scene roots are named " &
+         "exactly \"" & want & "\", so `in " & want & "` is ambiguous. " &
+         "Pass a pointer (`roots` prints $r0..$rN). Nothing was searched.")
+    iFindNothingExamined(cmdName)
+    return false
+
+  # PASS 2 -- EXACT, anywhere reachable from every scene root.
+  var exact: Il2CppPtr = nil
+  var exactCount = 0
+  var loose: Il2CppPtr = nil
+  var looseName = ""
+  var exhaustive = false
+  iFindRootScan(want, roots, InspFindDefBudget, exact, exactCount,
+                loose, looseName, exhaustive)
+  if exactCount == 1:
+    root = exact
+    iOut("  root \"" & want & "\" resolved by EXACT name to " & iPtr(root) &
+         ".")
+    return true
+  if exactCount > 1:
+    iErr(cmdName & " REFUSED: " & $exactCount & " objects are named exactly " &
+         "\"" & want & "\", so the root is ambiguous and picking the first " &
+         "would be a guess. Pass a pointer instead. Nothing was searched.")
+    iFindNothingExamined(cmdName)
+    return false
+
+  # PASS 3 -- NOTHING EXACT. A substring near-miss is REFUSED, not used, and
+  # is named so the caller can see what the old resolver would have searched.
+  if loose != nil:
+    iErr(cmdName & " REFUSED: no object is named exactly \"" & want &
+         "\". The closest match by substring is \"" & looseName & "\" at " &
+         iPtr(loose) & ", and searching THAT and calling the result an " &
+         "absence is the confidently-wrong answer this refusal exists to " &
+         "prevent. If you meant it, pass its pointer, or spell the name in " &
+         "full (quote it: " & cmdName & " NAME in \"" & looseName &
+         "\"). Nothing was searched.")
+    iFindNothingExamined(cmdName)
+    return false
+  if not exhaustive:
+    iErr(cmdName & " REFUSED: the root-name scan STOPPED EARLY (budget " &
+         $InspFindDefBudget & " nodes / one " & $int(InspFindSliceMs) &
+         "ms slice) without finding \"" & want & "\", so it is NOT known " &
+         "whether that root exists. Nothing was searched.")
+    iFindNothingExamined(cmdName)
+    return false
+  iErr(cmdName & " REFUSED: no object named exactly \"" & want & "\" exists " &
+       "under any of the " & $roots.len & " scene root(s) (the scan drained " &
+       "its frontier). `roots` lists the top-level names. Nothing was " &
+       "searched.")
+  iFindNothingExamined(cmdName)
+  result = false
+
+proc iFindInRootName(toks: seq[string]; inTok: int; cmdName: string;
+                     name: var string; nextTok: var int): bool =
+  ## Collect the ROOT NAME that follows the `in` keyword.
+  ##
+  ## A quoted token (`in "Menu UI"`) arrives from `iSplit` as ONE token and is
+  ## taken whole. An UNQUOTED run of bare words (`in Menu UI`) is JOINED into
+  ## one name and said so -- the old code took `toks[inTok+1]` alone, so
+  ## `in Menu UI` silently meant `in Menu`, which is the measured defect.
+  ## The first token that is not a bare word ends the name and is the BUDGET.
+  name = ""
+  nextTok = inTok + 1
+  if toks.len <= inTok + 1:
+    iErr(cmdName & ": `in` must be followed by a root NAME (quote it if it " &
+         "has spaces: " & cmdName & " NAME in \"Menu UI\"). Nothing was " &
+         "searched.")
+    iFindNothingExamined(cmdName)
+    return false
+  var i = inTok + 1
+  # The first token is taken WHATEVER it looks like -- a quoted run may
+  # legitimately contain digits or punctuation ("Tab 1").
+  name = toks[i]
+  inc i
+  var joined = 1
+  while i < toks.len and iTokIsWordy(toks[i]) and
+        not iFindIsGrammarWord(toks[i]):
+    name.add ' '
+    name.add toks[i]
+    inc i
+    inc joined
+  nextTok = i
+  if joined > 1:
+    iOut("  NOTE: the " & $joined & " bare words after `in` were joined into " &
+         "one root name \"" & name & "\". Quote it (`in \"" & name &
+         "\"`) to say so explicitly; the unquoted form used to be read as " &
+         "just \"" & toks[inTok + 1] & "\".")
+  result = true
+
 proc iFindRefuseWordyRoot(toks: seq[string]; startTok: int;
                           cmdName: string): bool =
   ## MEASURED TWICE, by two different agents, on the same night:
@@ -3204,7 +3511,8 @@ proc iCmdFindText(toks: seq[string]) =
     return
 
   if toks.len < 2:
-    iErr("usage: findtext SUBSTR [ROOT] [BUDGET] [all] | findtext more [BUDGET]")
+    iErr("usage: findtext SUBSTR [ROOT] [BUDGET] [all] | findtext SUBSTR " &
+         "in ROOTNAME [BUDGET] [all] | findtext more [BUDGET]")
     return
 
   if iLower(toks[1]) == "more":
@@ -3272,7 +3580,21 @@ proc iCmdFindText(toks: seq[string]) =
   var root: Il2CppPtr = nil
   var rootExplicit = false
   var budgetTok = 3
-  if not iFindResolveRoot(ftoks, 2, "findtext", root, rootExplicit, budgetTok):
+  if ftoks.len > 2 and iLower(ftoks[2]) == "in":
+    # `findtext SUBSTR in ROOTNAME [BUDGET] [all]`. `findtext` did NOT accept
+    # `in` at all before: the keyword fell through to the pointer parser and
+    # came back "not an address: in", so the one spelling that works for
+    # `find` was a parse error here.
+    var rootName = ""
+    var afterName = 0
+    if not iFindInRootName(ftoks, 2, "findtext", rootName, afterName):
+      return
+    if not iFindRootByName(rootName, "findtext", root):
+      return
+    rootExplicit = true
+    budgetTok = afterName
+  elif not iFindResolveRoot(ftoks, 2, "findtext", root, rootExplicit,
+                            budgetTok):
     return
   if not iFindValidateRoot(root, rootExplicit):
     return
@@ -3300,6 +3622,8 @@ proc iCmdFindText(toks: seq[string]) =
   gTxtInvalidSkips = 0
   gTxtActiveOnly = not includeInactive
   gTxtInactiveSkipped = 0
+  gTxtActiveUnknown = 0
+  gTxtActiveNote = ""
   # The positive control is per SEARCH, not per frame -- a resumed search
   # keeps counting, so `findtext more` cannot inherit a stale "the predicate
   # works" from a previous needle.
@@ -3395,24 +3719,17 @@ proc iCmdFind(toks: seq[string]) =
   var rootExplicit = false
   var budgetTok = 3
 
-  if toks.len > 3 and iLower(toks[2]) == "in":
-    # `find X in Y` -- Y is a NAME, resolved against the whole hierarchy first.
-    var base = iToTransform(gInspPreloader)
-    if base == nil:
-      iErr("cannot resolve a root by name: $preloader is null, so there is " &
-           "nothing to search from. Pass an explicit pointer instead.")
+  if toks.len > 2 and iLower(toks[2]) == "in":
+    # `find X in Y` -- Y is a NAME. EXACT match, scene roots first, and a
+    # substring-only match REFUSES (see iFindRootByName).
+    var rootName = ""
+    var afterName = 0
+    if not iFindInRootName(toks, 2, "find", rootName, afterName):
       return
-    base = iHierRoot(base)
-    let found = iFindFirstByName(toks[3], base, InspFindDefBudget)
-    if found == nil:
-      iErr("no object named like \"" & toks[3] & "\" was found to use as a " &
-           "root. Nothing was searched.")
+    if not iFindRootByName(rootName, "find", root):
       return
-    root = found
     rootExplicit = true
-    budgetTok = 4
-    iOut("  root \"" & toks[3] & "\" resolved to " & iPtr(root) &
-         " name=\"" & iObjName(root) & "\"")
+    budgetTok = afterName
   else:
     # `find NAME [ROOT] [BUDGET]` -- shared with `findtext`'s identical
     # grammar (see `iFindResolveRoot`/`iFindValidateRoot`).
@@ -4512,12 +4829,15 @@ proc iCmdOpen(toks: seq[string]) =
          "gone). ShowScreen would fault inside Unity where no guard of ours " &
          "reaches. Nothing was called.")
     return
-  let (actOk, act) = iActiveInHierarchy(screen)
+  var actNote = ""
+  let (actOk, act) = iActiveInHierarchyChecked(screen, actNote)
   if not actOk:
     iErr("open REFUSED: activeInHierarchy could not be read for the " &
          "SettingsScreen (Component::get_gameObject / " &
-         "GameObject::get_activeInHierarchy did not answer), so whether it is " &
-         "in a callable state is UNKNOWN. Nothing was called -- 'I could not " &
+         "GameObject::get_activeInHierarchy did not answer, or the two " &
+         "derivations disagreed" &
+         (if actNote.len > 0: ": " & actNote else: "") &
+         "), so whether it is in a callable state is UNKNOWN. Nothing was called -- 'I could not " &
          "look' is not 'it is fine'.")
     return
   if not act:
@@ -5861,9 +6181,11 @@ proc iVisEval(p: Il2CppPtr; verbose: bool): int =
   vo("  node = " & iPtr(p) & "  '" & iObjName(p) & "'")
 
   # 1. activeInHierarchy.
-  let (actOk, active) = iActiveInHierarchy(p)
+  var actNote = ""
+  let (actOk, active) = iActiveInHierarchyChecked(p, actNote)
   if not actOk:
-    unknowns.add ("activeInHierarchy could not be read (Component::" &
+    unknowns.add ((if actNote.len > 0: actNote & "  " else: "") &
+                 "activeInHierarchy could not be read (Component::" &
                  "get_gameObject / GameObject::get_activeInHierarchy did not " &
                  "resolve, or a hop was unreadable)")
     vo("  activeInHierarchy : UNKNOWN")
@@ -6788,12 +7110,18 @@ proc iCmdAssertActive(toks: seq[string]) =
             " is readable but Unity-FAKE-NULL (native half destroyed), so " &
             "asking it for activeInHierarchy would be a call into a dead object")
     return
-  let (okq, act) = iActiveInHierarchy(p)
+  # LITERALLY the same proc `findtext`'s ACTIVE scope and HIT tag call, so the
+  # two instruments cannot answer differently about the same pointer -- which
+  # is the defect this replaced: a findtext HIT presented as pressable while
+  # `assert-active` on the same card said activeInHierarchy=false.
+  var actNote = ""
+  let (okq, act) = iActiveInHierarchyChecked(p, actNote)
   if not okq:
     iAssInc(iLower(toks[0]) & " " & toks[1] & ": activeInHierarchy could not " &
             "be determined (Component::get_gameObject or " &
             "GameObject::get_activeInHierarchy did not verify on this build, " &
-            "or a hop was unreadable)")
+            "a hop was unreadable, or the two derivations disagreed)" &
+            (if actNote.len > 0: ".  " & actNote else: ""))
     return
   if act == want:
     iAssPass(toks[1] & " activeInHierarchy = " &
@@ -7041,10 +7369,12 @@ proc iCmdSiblings(toks: seq[string]) =
       iSetVar("s" & $k, cast[uint64](c))
       let isMe = (c == me)
       if isMe: mine = k
-      let (okq, act) = iActiveInHierarchy(c)
+      var actNote = ""
+      let (okq, act) = iActiveInHierarchyChecked(c, actNote)
       iOut("    [" & $k & "] " & iPtr(c) & " \"" & iObjName(c) & "\"  " &
            (if okq: (if act: "active" else: "INACTIVE")
             else: "active=UNKNOWN") &
+           (if actNote.len > 0: "  [" & actNote & "]" else: "") &
            "   ($s" & $k & ")" & (if isMe: "   <<< THIS" else: ""))
       inc shown
     else:
@@ -7164,11 +7494,13 @@ proc iCmdFindComp(toks: seq[string]) =
       iNoteKlass(comp)
       iSetVar("k" & $found, cast[uint64](comp))
       iSetVar("kn" & $found, cast[uint64](cur))
-      let (okq, act) = iActiveInHierarchy(cur)
+      var actNote = ""
+      let (okq, act) = iActiveInHierarchyChecked(cur, actNote)
       iOut("    HIT node=" & iPtr(cur) & " \"" & iObjName(cur) & "\"  " &
            toks[1] & "=" & iPtr(comp) & "  " &
            (if okq: (if act: "active" else: "INACTIVE -- NOT pressable")
             else: "active=UNKNOWN") &
+           (if actNote.len > 0: "  [" & actNote & "]" else: "") &
            "   ($k" & $found & " = component, $kn" & $found & " = node)")
     var n = 0
     if iChildCount(cur, n):
@@ -7285,14 +7617,16 @@ proc iCmdWhyRead(toks: seq[string]) =
     return
   iOut("  5. native half at +0x10 is non-zero, so this is a LIVE Unity " &
        "object, not a fake-null husk.")
-  let (okq, act) = iActiveInHierarchy(p)
+  var actNote = ""
+  let (okq, act) = iActiveInHierarchyChecked(p, actNote)
   if okq:
     iOut("  6. activeInHierarchy = " & (if act: "true" else: "false") &
          (if act: "" else: "  -- INACTIVE, therefore NOT pressable: a press " &
           "returns success and does nothing (fact #72)."))
   else:
     iOut("  6. activeInHierarchy could not be determined on this build; that " &
-         "is INCONCLUSIVE, not 'active'.")
+         "is INCONCLUSIVE, not 'active'." &
+         (if actNote.len > 0: "  " & actNote else: ""))
 
 # ===========================================================================
 # watch -- sample one value across frames and report what CHANGED
@@ -7476,11 +7810,13 @@ proc iCmdHelp() =
   iOut("    roots                         every scene root -> $r0..$rN")
   iOut("                                  e.g.  roots")
   iOut("    find NAME [ROOT] [BUDGET]     name search; NO ROOT = ALL scenes")
-  iOut("    find NAME in ROOTNAME         narrow by a root named, not pointed")
+  iOut("    find NAME in ROOTNAME         narrow by a root named, not " &
+       "pointed; EXACT name, quote if it has spaces (in \"Menu UI\")")
   iOut("    find more [BUDGET]            RESUME a search that hit its cap")
   iOut("       A cap message NAMES which cap: FRAME CAP vs NODE BUDGET. The")
   iOut("       frontier is kept either way, so `more` never re-walks.")
   iOut("    findtext SUBSTR [ROOT] [BUDGET] [all]  TEXT A CONTROL DISPLAYS")
+  iOut("    findtext SUBSTR in ROOTNAME   same, root resolved by EXACT name")
   iOut("                                  (TMP_Text only), not GameObject name")
   iOut("                                  ACTIVE nodes only by default; `all`")
   iOut("                                  includes inactive (unpressable) hits")
