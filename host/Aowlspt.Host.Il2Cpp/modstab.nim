@@ -152,9 +152,26 @@ const ModsMaxTmp = 8
 ## (the tab button), and written only at build time.
 var gModsLabelTmp: seq[Il2CppPtr] = @[]
 var gModsLabelText: seq[string] = @[]
+## The CONTROL each of those TMPs belongs to, kept in step with the two above.
+## `swRelabelControl`'s first argument is what lets it reach
+## `LocalizedText::SetLabelText` -- the level the game itself writes at. The
+## re-assert poll used to pass nil here, so it could only take the
+## `TMP_Text::set_text` route: it put our string back on the TMP and left the
+## LocalizedText source still holding the donor's key, which is the very thing
+## that clobbers it again. Re-applying through the route that is doing the
+## clobbering is how the fight ends instead of oscillating.
+var gModsLabelCtrl: seq[Il2CppPtr] = @[]
 ## The cap on that list: up to three TMPs per caption on this build, times the
-## tab button plus ModsMaxSubtabs.
-const ModsMaxLabels = 24
+## tab button plus ModsMaxSubtabs -- AND every cloned ROW, which is what 24
+## did not account for. The rows now register here too (they are the ones
+## LocalizedText was measured re-clobbering back to 'Interface language'), and
+## at up to cSwMaxRows rows a page a cap of 24 would silently stop registering
+## after the first handful of rows -- a cap that quietly drops work looks
+## exactly like a feature that worked. The poll this bounds runs once every
+## ModsLabelEveryFrames frames and does one guarded string read per entry, so
+## the cost of the larger cap is a few hundred microseconds a second, not a
+## per-frame one; it allocates only on the entries it finds clobbered.
+const ModsMaxLabels = 192
 
 ## Every cloned button, its donor and its caption, so the extra toggle a live
 ## spawner spawns AFTER we built can still be reaped. The spawn happens on the
@@ -882,6 +899,7 @@ proc modsRelabelLike(cloneT, donorT: Il2CppPtr; text: string;
           if gModsLabelTmp.len < ModsMaxLabels:
             gModsLabelTmp.add cTmps[i]
             gModsLabelText.add text
+            gModsLabelCtrl.add cloneCtrl
     i = i + 1
   # THE OUTCOME CHECK: re-read the whole clone, not the pointers we just wrote.
   let reads = modsCountReading(cloneT, text)
@@ -941,17 +959,60 @@ proc modsRelabelRow(cloneT, donorT: Il2CppPtr; text: string;
   # count how many STILL show the donor's ORIGINAL caption -- not how many
   # show ours, and not a count borrowed from the donor.
   var stale = 0
+  var mine = 0
   i = 0
   while i < cTmps.len:
-    if donorCaption.len > 0 and modsTmpText(cTmps[i]) == donorCaption:
+    let cur = modsTmpText(cTmps[i])
+    if donorCaption.len > 0 and cur == donorCaption:
       stale = stale + 1
+    if cur == text:
+      mine = mine + 1
+      # REGISTER FOR RE-ASSERT. This is the defect the live `findtext` caught
+      # on 2026-09-02: three `Text` nodes under `Settings Drop Down(Clone)
+      # (Clone)` still read 'Interface language' while this function had
+      # logged success for every row. Both claims were TRUE AT DIFFERENT
+      # TIMES. The stale count above is read microseconds after the write, so
+      # it is honest -- and then the row's inherited `LocalizedText`
+      # re-applies its key on the next refresh (a subtab `SetActive(true)` on
+      # re-select reliably triggers one) and puts the donor's caption back.
+      #
+      # `modsRelabelLike` has always registered its writes here so
+      # `modsReassertLabels` can put them back; this row path NEVER DID, so
+      # the poll only ever guarded the tab/subtab BUTTON captions and the rows
+      # reverted unwatched. A one-shot write against a system that re-applies
+      # on its own schedule is not a write, and a check taken before the
+      # clobber cannot see it. row caption re-assert registered.
+      if gModsLabelTmp.len < ModsMaxLabels:
+        gModsLabelTmp.add cTmps[i]
+        gModsLabelText.add text
+        gModsLabelCtrl.add cloneCtrl
     i = i + 1
-  result = stale == 0
+  # Newly registered labels must be watched again even if the poll had already
+  # declared itself stable and switched off for the session.
+  gModsLabelStable = 0
+  if donorCaption.len == 0:
+    # THREE OUTCOMES, NEVER TWO. With no donor caption the stale count above
+    # can never increment, so `stale == 0` would be a verdict about a test
+    # that was not run. Say INCONCLUSIVE and do not claim the row.
+    warn "mods tab: row caption '" & text & "' CANNOT BE CONFIRMED -- the " &
+         "row donor shows no caption of its own, so 'no TMP still reads the " &
+         "donor's caption' is a check that cannot fail. " & $wrote &
+         " write(s) went out and " & $mine & " of the clone's " & $cTmps.len &
+         " TextMeshProUGUI read the new text; that is reported, not passed."
+    return false
+  result = stale == 0 and mine > 0
   if result:
     okLog "mods tab: row caption '" & text & "' written to all " &
           $cTmps.len & " of the clone's TextMeshProUGUI (" & $wrote &
-          " write(s) succeeded); none still read the donor's '" &
-          donorCaption & "'."
+          " write(s) succeeded); " & $mine & " now read it and none still " &
+          "read the donor's '" & donorCaption & "'. All " & $mine &
+          " are registered for re-assert against LocalizedText."
+  elif mine == 0:
+    warn "mods tab: row caption '" & text & "' DID NOT LAND AT ALL -- none " &
+         "of the clone's " & $cTmps.len & " TextMeshProUGUI read it after " &
+         $wrote & " write(s), so an empty row is not being reported as a " &
+         "clean one just because nothing reads the donor's '" &
+         donorCaption & "'."
   else:
     warn "mods tab: row caption '" & text & "' DID NOT FULLY TAKE -- " &
          $stale & " of the clone's " & $cTmps.len & " TextMeshProUGUI " &
@@ -1590,6 +1651,7 @@ proc modsTabBuild(): bool =
   var r = 0
   var rowsFixed = 0
   var rowsBad = 0
+  var rowsSeen = 0
   while r < gModsSubs.len and r < gModsPages.len:
     if gModsSubs[r].pageGo != nil:
       discard swRenderPage(tabPtr, gModsSubs[r].pageGo, gModsPages[r])
@@ -1611,18 +1673,35 @@ proc modsTabBuild(): bool =
               text = text & cSwNotDone
             let rowT = iToTransform(ctrl)
             if rowT != nil:
+              rowsSeen = rowsSeen + 1
               if modsRelabelRow(rowT, rowDonorT, text, ctrl):
                 rowsFixed = rowsFixed + 1
               else:
                 rowsBad = rowsBad + 1
           q = q + 1
     r = r + 1
-  okLog "mods tab: re-asserted " & $rowsFixed & " row caption(s) across " &
-        "every TextMeshProUGUI they carry (" & $rowsBad & " did not take), " &
-        "using the row donor chosen by " & rowDonorKind &
-        ". Without this the rows keep the donor's caption -- which is why " &
-        "every row on every page read 'Interface language' while the write " &
-        "reported success."
+  # "0 fixed, 0 failed" and "0 fixed, 0 EXAMINED" are different facts, and the
+  # previous version printed the same cheerful line for both -- including the
+  # case below, where a null row donor skips the whole loop and nothing is
+  # looked at at all.
+  if rowDonorT == nil:
+    warn "mods tab: NO ROW CAPTION WAS RE-ASSERTED and none was checked -- " &
+         "the row donor is null (swAnyDonor chose by " & rowDonorKind &
+         "), so the loop below never ran. Every cloned row is left reading " &
+         "whatever swCloneRow left on it, which is the donor's caption. " &
+         "This is a REFUSAL, not a clean build."
+  elif rowsSeen == 0:
+    warn "mods tab: the row caption re-assert examined ZERO rows -- the " &
+         "donor was fine but no page reported a readable row clone. " &
+         "Nothing was written and nothing was proved."
+  else:
+    okLog "mods tab: re-asserted " & $rowsFixed & " row caption(s) across " &
+          "every TextMeshProUGUI they carry, of " & $rowsSeen &
+          " row(s) examined (" & $rowsBad & " did not take), " &
+          "using the row donor chosen by " & rowDonorKind &
+          ". Without this the rows keep the donor's caption -- which is why " &
+          "every row on every page read 'Interface language' while the write " &
+          "reported success."
 
   # THE OUTCOME CHECK ON THE CONTAINER, in the same spirit as the caption one:
   # what the player sees in the body must be exactly what we put there -- one
@@ -1711,8 +1790,14 @@ proc modsReassertLabels() =
     if duOk(gModsLabelTmp[i], cSuiOffTmpMText() + 8'i32):
       if modsTmpText(gModsLabelTmp[i]) != gModsLabelText[i]:
         clobbered = clobbered + 1
-        discard swRelabelControl(cast[Il2CppPtr](0), gModsLabelTmp[i],
-                                 gModsLabelText[i])
+        # The CONTROL, not nil. Passing nil here skipped
+        # `LocalizedText::SetLabelText` entirely, so the poll rewrote the TMP
+        # while leaving the LocalizedText source holding the donor's key --
+        # re-applying everything except the thing doing the clobbering.
+        var ctl: Il2CppPtr = nil
+        if i < gModsLabelCtrl.len and duOk(gModsLabelCtrl[i], 0x20'i32):
+          ctl = gModsLabelCtrl[i]
+        discard swRelabelControl(ctl, gModsLabelTmp[i], gModsLabelText[i])
     i = i + 1
   # THE STABILITY GATE MUST NOT TRUST "reaped == 0 this poll" ON ITS OWN: that
   # is also what a poll BEFORE the late spawn looks like, since there is

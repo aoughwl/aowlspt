@@ -479,6 +479,86 @@ def assert_no_text(report, live, name, needle):
                   "; ".join("%s@%s" % (h["name"], h["ptr"]) for h in hits[:5]))
 
 
+CLONE_MARK = "(Clone)(Clone)"
+
+
+def assert_no_donor_caption_on_clones(report, live, mods_built):
+    """The rows we CLONED must not still read the row donor's caption.
+
+    Why this is not `assert_no_text(..., DONOR_CAPTION)`, which is what it
+    replaced: "Interface language" is a REAL caption on this screen. The stock
+    Game-tab row shows it legitimately, so a blanket "zero occurrences under
+    $settings" assertion is false by construction and would FAIL forever no
+    matter what the host does. The claim that is actually worth making is
+    SCOPED: zero occurrences on a node whose parent is one of OUR row clones,
+    which the inspector names `Settings Drop Down(Clone)(Clone)` -- a clone of
+    a clone, because we clone the stock dropdown row.
+
+    MEASURED 2026-09-02, live, build 4,717,056, Settings open:
+    `findtext Interface language $settings 40000` returned FOUR hits -- one
+    genuine `Text` under `Settings Drop Down(Clone)` (the stock row) and THREE
+    `Text` nodes under `Settings Drop Down(Clone)(Clone)`, all
+    activeInHierarchy=true. Those three are the defect: the row relabel wrote
+    them, verified them microseconds later, and `LocalizedText` put the
+    donor's key back afterwards with nothing watching. That is the state this
+    assertion exists to catch, and it is exactly the shape it FAILS on.
+
+    THE CONTROL THAT MAKES THIS FALSIFIABLE IS THE STOCK HIT ITSELF. If the
+    walk finds ZERO occurrences of the caption anywhere, findtext is not
+    reading this string on this build and a count of zero under the clones
+    proves nothing -- so that is INCONCLUSIVE, never PASS. A check whose
+    needle is known to be present somewhere carries its own positive control.
+    """
+    name = "no donor caption under MODS row clones"
+    if not mods_built:
+        report.record(name, INCONCLUSIVE,
+                      "mods_built=False -- there are no row clones in this "
+                      "deploy, so nothing was looked at")
+        return
+
+    raw = _findtext(live, DONOR_CAPTION, timeout=90)
+    ok, comp = trusted_walk(raw)
+    if not ok:
+        report.record(name, INCONCLUSIVE,
+                      "walk was %s, not EXHAUSTIVE -- an absence under the "
+                      "clones is not provable from it" % comp)
+        return
+    hits = find_hits(raw)
+    f = ch.parse_findtext(host_text(raw))
+
+    if not hits:
+        report.record(name, INCONCLUSIVE,
+                      "POSITIVE CONTROL FAILED: an EXHAUSTIVE walk of an open "
+                      "Settings screen found 0 occurrences of %r, but the "
+                      "STOCK Game-tab row shows it. findtext is not reading "
+                      "this caption, so zero under the clones means nothing"
+                      % DONOR_CAPTION)
+        return
+
+    unclassifiable = [h for h in hits if not h.get("parent")]
+    if unclassifiable:
+        report.record(name, INCONCLUSIVE,
+                      "%d of %d hit(s) printed no parent= field, so they "
+                      "cannot be attributed to a clone or to stock; guessing "
+                      "would put a stock hit in our column"
+                      % (len(unclassifiable), len(hits)),
+                      "; ".join(h["name"] + "@" + h["ptr"]
+                                for h in unclassifiable[:5]))
+        return
+
+    ours = [h for h in hits if CLONE_MARK in h["parent"]]
+    stock = [h for h in hits if CLONE_MARK not in h["parent"]]
+    detail = "; ".join("%s under %s @%s" % (h["name"], h["parent"], h["ptr"])
+                       for h in ours[:5])
+    verdict = FAIL if ours else PASS
+    report.record(name, verdict,
+                  "%d hit(s) of %r, scope=%s: %d under %s (must be 0), %d "
+                  "stock (positive control, must be >0)"
+                  % (len(hits), DONOR_CAPTION, f["scope"], len(ours),
+                     CLONE_MARK, len(stock)),
+                  detail)
+
+
 def assert_spawner_one_active_toggle(report, live, mods_built):
     """The cloned MODS spawner. There is nothing to assert about it when the
     mods tab was not built into the deploy, and saying PASS in that case would
@@ -729,7 +809,7 @@ def cmd_run(args):
                       "%s; $settings bound at %s" % (detail, ptr))
 
     assert_tab_count(report, live, args.mods_built)
-    assert_no_text(report, live, "no donor caption under MODS", DONOR_CAPTION)
+    assert_no_donor_caption_on_clones(report, live, args.mods_built)
     assert_no_text(report, live, "no placeholder text anywhere", PLACEHOLDER_TEXT)
     assert_spawner_one_active_toggle(report, live, args.mods_built)
     assert_postfx_subtab(report, live)
