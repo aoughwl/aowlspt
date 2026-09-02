@@ -7257,3 +7257,18 @@ Two other durable lessons from the same run:
   node was found on an earlier line, and a screen torn down in between stays
   readable with `m_CachedPtr` zeroed (fact #182), which is the likeliest shape
   of the once-then-works PRE-MENU fault.
+
+## 2026-09-02 06:35: native subtabs (step 2) proven live
+
+MEASURED (build 4,805,120, `nativeTabsSubtabs on`, Settings open): `native
+subtabs VERDICT PASS (subtab selection): exactly one subtab reads m_IsOn=1
+(POSTFX) and its panel is the ONLY active one of the two -- read back off
+the live toggles and GameObjects` and the same for GRAPHICS SETTINGS, ten
+verdicts in 160ms as the proof switched back and forth; acceptance saw the
+strip present with 4 children; stock geometry unchanged. The design that
+made it work after five failed attempts: the strip is a SIBLING of the two
+panels under SettingsScreen (in no stock LayoutGroup), it uses the cloned
+ToggleGroup that arrives with the Control Settings/Toggles clone, highlight
+via AnimatedToggle::set_IsToggled, and selection rides the one existing
+Toggle::Set postfix. Remaining step-1 defect: after pressing GAME back, our
+panel stays active alongside Game Settings (no hide on a foreign toggle).
