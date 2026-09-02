@@ -82,7 +82,7 @@ import aowlspt/sync
 import registry
 import selection
 import httpfetch
-import "../../../registry/validate"
+import aowlspt/regvalidate
 
 const
   AdoptedName = "mods.json"

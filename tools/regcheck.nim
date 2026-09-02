@@ -75,7 +75,7 @@
 import std/[strutils, syncio, cmdline]
 import aowlsptinstall/[winfs, log]
 import aowlspt/json
-import "../registry/validate"
+import aowlspt/regvalidate
 
 const
   Usage = """

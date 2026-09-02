@@ -5,6 +5,11 @@ r"""modbuild.py -- compile a mods folder from SOURCE, with a content cache.
     python tools/modbuild.py --mods ... --check      say what WOULD build, build nothing
     python tools/modbuild.py --mods ... --force      ignore the cache
     python tools/modbuild.py --mods ... --json       one line, machine-readable
+    python tools/modbuild.py --audit-imports         scan only: which mods
+                                                     import a file OUTSIDE
+                                                     themselves (exit 1 if any)
+    python tools/modbuild.py --clean-verify          --force + delete every
+                                                     selected mod's nimcache
 
 ## What this is for
 
@@ -90,6 +95,7 @@ import argparse
 import hashlib
 import json as jsonmod
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -267,6 +273,92 @@ def compile_cmd(nimony_exe, nimony_root, abi_dir, aowl_src, mod_dir, source, out
         "-o:" + out,
         source,
     ]
+
+
+# ---------------------------------------------------------------------------
+# THE ESCAPING-IMPORT AUDIT, and why a clean rebuild is NOT the check that
+# catches this class.
+#
+# MEASURED 2026-09-02. `mods/manager` failed to compile from a public payload
+# with `nifcursors.nim(149, 3) c.p != nil and c.rem > 0 [AssertionDefect]` --
+# nimony crashing inside its own error renderer, so the actual semantic error
+# was never printed. The cause was ONE line, `mgr/refresh.nim`'s
+# `import "../../../registry/validate"`: a path that resolves in this checkout
+# and nowhere else. `aowl payload` stages only `mods/`, `tools/`, `abi/` and
+# `aowl/src`, so in an install that file is simply absent.
+#
+# The obvious guard -- "rebuild every mod from a clean nimcache" -- CANNOT
+# catch it, and this was measured, not assumed: with `mods/manager/nimcache`
+# deleted, both `aowl build-mod mods\manager` and `modbuild.py --only manager
+# --force` built the broken source successfully in 30s, because the escaping
+# import resolves fine when the compile happens inside the repo. A check whose
+# input never varies in the dimension that breaks is a check that cannot fail.
+#
+# What CAN fail is the payload-shape property, stated as a negative: **no file
+# a mod ships may resolve outside that mod's own folder.** That is what this
+# scans for, and it is cheap enough (a regex over the mod's .nim files) to run
+# on every build, cached or not -- so a `cached` verdict can no longer hide it
+# either.
+#
+# Intra-mod `..` is legitimate and common (`mods/sain/client/driver.nim` says
+# `import ".." / core / vec`), so the test is not "contains ..": it resolves
+# the literal against the importing file and asks whether the result is still
+# under the mod root.
+IMPORT_RE = re.compile(
+    r"^\s*(?:from\s+(?P<from>\S.*?)\s+import\b|(?P<kw>import|include)\b"
+    r"(?P<rest>.*)$)")
+
+
+def _import_specs(line):
+    """The module path literals on one import/include line, un-quoted and with
+    nimony's `".." / core / vec` spelling folded back to `../core/vec`."""
+    line = line.split("#")[0]
+    m = IMPORT_RE.match(line)
+    if not m:
+        return []
+    body = m.group("from") if m.group("from") else (m.group("rest") or "")
+    out = []
+    for part in body.split(","):
+        part = part.strip()
+        if not part or "[" in part:      # `std/[syncio, dirs]` never escapes
+            continue
+        # Fold `".." / core / vec` and `"../a/b"` into one plain path.
+        part = part.replace('"', "").replace("'", "")
+        part = re.sub(r"\s*/\s*", "/", part).strip()
+        if part:
+            out.append(part)
+    return out
+
+
+def escaping_imports(mod_dir):
+    """Every (file, spec) in `mod_dir` whose import resolves OUTSIDE it.
+
+    Returns a list of `(relative source path, line number, spec, resolved)`.
+    An empty list is the property holding; it is deliberately the NEGATIVE
+    ("nothing escapes"), because a positive self-comparison here could not
+    fail."""
+    root = os.path.abspath(mod_dir)
+    bad = []
+    for dirpath, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        for fn in files:
+            if not fn.endswith(".nim"):
+                continue
+            path = os.path.join(dirpath, fn)
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                    lines = fh.readlines()
+            except OSError:
+                continue
+            for i, line in enumerate(lines, 1):
+                for spec in _import_specs(line):
+                    if ".." not in spec.split("/"):
+                        continue        # a search-path import; not a file path
+                    resolved = os.path.normpath(os.path.join(dirpath, spec))
+                    if os.path.commonpath([root, resolved]) != root:
+                        bad.append((os.path.relpath(path, root), i, spec,
+                                    resolved))
+    return bad
 
 
 def cache_key(mod_dir, abi_dir, aowl_src, nimony_exe, cmd):
@@ -545,6 +637,20 @@ def build_one(mod_dir, abi_dir, aowl_src, nimony_exe, nimony_root,
         return {"mod": name, "status": "skipped",
                 "why": "no single top-level .nim source"}
 
+    # BEFORE the cache is consulted, so a `cached` verdict cannot hide it, and
+    # before the compiler runs, because nimony crashes in its own error
+    # renderer on this input and never names the file (see IMPORT_RE above).
+    escapes = escaping_imports(mod_dir)
+    if escapes:
+        why = ("%d import(s) resolve OUTSIDE the mod folder, so this mod "
+               "compiles only inside the aowlspt checkout and not in any "
+               "install" % len(escapes))
+        return {"mod": name, "status": "failed", "why": why,
+                "escapes": [{"file": f, "line": ln, "spec": s,
+                             "resolves_to": r} for f, ln, s, r in escapes],
+                "output": ["%s(%d) import %s -> %s" % (f, ln, s, r)
+                           for f, ln, s, r in escapes]}
+
     stem = os.path.splitext(os.path.basename(source))[0]
     bin_dir = os.path.join(mod_dir, "bin")
     out = os.path.join(bin_dir, stem + ".dll")
@@ -686,6 +792,17 @@ def main():
     p.add_argument("--only", nargs="*", default=None,
                    help="build only these mod directory names")
     p.add_argument("--force", action="store_true", help="ignore the cache")
+    p.add_argument("--clean-verify", action="store_true",
+                   help="implies --force AND deletes each selected mod's "
+                        "nimcache first, so no incremental state can carry a "
+                        "verdict. This is what the nightly/payload path runs. "
+                        "NOTE: on its own it does NOT catch a checkout-only "
+                        "import -- that is what the escaping-import audit is "
+                        "for, and the audit runs on every build.")
+    p.add_argument("--audit-imports", action="store_true",
+                   help="scan only: list every import in the selected mods "
+                        "that resolves outside its own mod folder, compile "
+                        "nothing. Exit 1 if any is found.")
     p.add_argument("--check", action="store_true",
                    help="report what would build; build nothing")
     p.add_argument("--json", action="store_true")
@@ -747,6 +864,33 @@ def main():
     if args.only:
         want = set(args.only)
         dirs = [d for d in dirs if os.path.basename(d) in want]
+
+    if args.audit_imports:
+        findings = []
+        for d in dirs:
+            for f, ln, s, r in escaping_imports(d):
+                findings.append({"mod": os.path.basename(d.rstrip("\\/")),
+                                 "file": f, "line": ln, "spec": s,
+                                 "resolves_to": r})
+        if args.json:
+            print(jsonmod.dumps({"escaping_imports": findings},
+                                separators=(",", ":")))
+        elif not findings:
+            print("no import in %d mod(s) resolves outside its own mod folder"
+                  % len(dirs))
+        else:
+            for f in findings:
+                print("  %s: %s(%d) import %s -> %s"
+                      % (f["mod"], f["file"], f["line"], f["spec"],
+                         f["resolves_to"]))
+            print("\n%d escaping import(s). These compile in this checkout "
+                  "and in NO install." % len(findings))
+        return 1 if findings else 0
+
+    if args.clean_verify:
+        args.force = True
+        for d in dirs:
+            shutil.rmtree(os.path.join(d, "nimcache"), ignore_errors=True)
 
     cenv, missing_ucrt = build_env(args.ucrt64, args.nimony)
     if missing_ucrt:

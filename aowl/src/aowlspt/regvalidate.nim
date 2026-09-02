@@ -39,7 +39,7 @@
 ## a validator that accepted `1.2.3 || 2.0.0` because it had its own looser
 ## parser would pass a file the resolver then excludes every mod in.
 
-import "../mods/manager/mgr/semver"
+import aowlspt/semver
 import aowlspt/json
 
 const

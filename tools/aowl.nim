@@ -422,6 +422,41 @@ proc settingsBacked(e: Env): bool =
              "config.json",
              "python " & quoted(tool), e.repo)
 
+var gNoEscapesRan = false
+
+proc noEscapingImports(e: Env): bool =
+  ## Build gate for the "compiles here and in no install" class.
+  ##
+  ## MEASURED 2026-09-02: `mods/manager` could not be compiled from a public
+  ## payload. nimony died inside its own error renderer --
+  ## `nifcursors.nim(149, 3) c.p != nil and c.rem > 0 [AssertionDefect]` --
+  ## so the real error was never printed, and six builds agreed on the crash
+  ## and on nothing else. The cause was one line, `mgr/refresh.nim`'s
+  ## `import "../../../registry/validate"`: `aowl payload` stages `mods/`,
+  ## `tools/`, `abi/` and `aowl/src`, and nothing else, so that file exists
+  ## only in this checkout.
+  ##
+  ## A clean-nimcache rebuild does NOT catch this and that was measured too:
+  ## with the cache deleted, `aowl build-mod mods\manager` built the broken
+  ## source in 30s, because the import resolves fine when the compile happens
+  ## inside the repo. So the gate asserts the payload-shape property directly,
+  ## as a negative -- no file a mod ships resolves outside its own folder --
+  ## which is falsifiable, unlike a rebuild whose input never varies in the
+  ## dimension that breaks. Intra-mod `..` stays legal: the check resolves the
+  ## literal and asks whether the result is still under the mod root.
+  if gNoEscapesRan:
+    return true
+  let tool = joinPath(e.repo, "tools\\modbuild.py")
+  if not fileExists(tool):
+    note "tools\\modbuild.py is not present on this branch, so no mod was " &
+         "checked for an import that escapes its own folder. That is " &
+         "inconclusive, not a pass."
+    gNoEscapesRan = true
+    return true
+  gNoEscapesRan = true
+  return run(e, "no mod imports a file outside its own folder",
+             "python " & quoted(tool) & " --audit-imports", e.repo)
+
 proc buildMod(e: Env; modPathIn: string): bool =
   let modPath = absolutePathOf(modPathIn)
   let source = sourceOf(modPath)
@@ -435,6 +470,8 @@ proc buildMod(e: Env; modPathIn: string): bool =
   if not idxBind(e):
     return false
   if not settingsBacked(e):
+    return false
+  if not noEscapingImports(e):
     return false
 
   let dir = parentOf(source)

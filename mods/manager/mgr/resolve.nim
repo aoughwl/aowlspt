@@ -20,7 +20,7 @@
 ## it.
 
 import registry
-import semver
+import aowlspt/semver
 
 type
   Verdict* = enum

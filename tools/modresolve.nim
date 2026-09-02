@@ -49,7 +49,7 @@ import std/[strutils, syncio, cmdline]
 import aowlsptinstall/log
 import registry
 import resolve
-import semver
+import aowlspt/semver
 import selection
 
 var gFailures = 0
