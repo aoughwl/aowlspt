@@ -352,6 +352,15 @@ the real click path before pressing anything. Metadata strings are encrypted (`t
   it is a refusal. Never re-derive this from `shared_rva_counts()` with a
   `.get(rva, 1)` default: that default made every unknown address read back as
   "1 owner, safe to detour".
+- **A POSTFIX detour on a method with more than 4 argument slots is a crash by
+  construction.** The 5th+ arguments live on the CALLER's stack; the postfix
+  thunk opens its own frame before calling the trampoline, so the original
+  reads those arguments out of OUR frame. MEASURED 2026-09-02: three Escape
+  crashes were `MenuScreen::Show(5-arg)` (7 slots) reading `profile` from the
+  thunk's unwritten RAX park slot (value 1). `postfixRefusal` forbade the shape
+  but only in `hostPatch`; uihooks now binds such sites as a PREFIX. Count the
+  slots from the signature before choosing postfix, and read stack arguments
+  at `[entry_rsp+0x28+8*(n-4)]`, never from the thunk frame.
 - **Two detours on one function**: the second overwrites the first's trampoline. Ride an
   existing detour as a drain. Verify prologues against the **startup snapshot**
   (`abi/aowlspt_prologue.h`), never against live memory — verifying after another feature
