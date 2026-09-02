@@ -209,6 +209,7 @@ var gArPreDismissed = 0            ## overlays this feature actually cleared
 var gArPreChatSeen = 0             ## ticks on which ChatScreen read ACTIVE
 var gArPreChecks = 0               ## PRE-MENU overlay checks made (the divisor)
 var gArPreVia = "nothing"          ## which route the last attempt used
+var gArPreAttempted = false        ## PRE-MENU has acted at least once
 
 proc arStepName(s: int): string =
   case s
@@ -807,17 +808,35 @@ proc arScreenCensus(): string =
 # searches all 16 roots and refuses (fact #243).
 #
 # THE LADDER, in this order, bounded at `ArPreMaxTries` attempts TOTAL:
-#   1. the screen's OWN close path -- `EFT.UI.Settings.SettingsScreen::Close()`
-#      @0x1720B10, resolved OFFLINE, UNIQUE, arity 0, 16-byte prologue-verified
-#      against the STARTUP SNAPSHOT, CALLED and never detoured
-#      (abi/aowlspt_premenu.h has the disassembly and the virtual-call hazard).
-#   2. that screen's OWN Back button, scoped to ITS subtree, pressed through the
-#      same validated DefaultUIButton OnClick(+0x120) path every other step
-#      uses. Scoped, so this is not the all-roots name hunt that fails.
+#   1. THE GAME'S OWN BACK PATH -- that screen's OWN Back control, scoped to ITS
+#      subtree, fired through the same validated DefaultUIButton OnClick(+0x120)
+#      -> UnityEvent::Invoke every other press here uses. That is what a human
+#      click runs, and it is the handler that RESTORES THE MENU. Scoped, so this
+#      is not the all-roots name hunt that refuses (fact #243).
+#   2. `EFT.UI.Settings.SettingsScreen::Close()` @0x1720B10 (UNIQUE, arity 0,
+#      prologue-verified against the STARTUP SNAPSHOT, CALLED and never
+#      detoured; abi/aowlspt_premenu.h has the disassembly and the virtual-call
+#      hazard) -- FALLBACK ONLY.
 #
-# NEITHER attempt is believed. The step advances only on the FINISHED STATE:
-# no ACTIVE SettingsScreen anywhere. If two attempts leave it up, the step
-# refuses and NAMES the screen it could not dismiss.
+# THE ORDER WAS SWAPPED BY MEASUREMENT, 2026-09-02. `Close()` was attempt 1 and
+# it HID the settings screen: its own readback passed --
+# `no ACTIVE SettingsScreen remains`, `Overlays cleared this session: 1` -- and
+# then WAIT-MENU sat for its whole 180 s bound, because the census showed NO
+# MenuScreen active at all. Close hides the screen WITHOUT restoring the menu.
+# That is the exact shape of a check that cannot fail: the step asserted the
+# thing it had just done rather than the thing it was for.
+#
+# So the FINISHED STATE is now THE MENU BEING USABLE -- an ACTIVE, PRESSABLE
+# MenuScreen PlayButton, obtained from the SAME `arFindPlay` WAIT-MENU uses, so
+# the two cannot disagree -- and neither attempt is believed without it. If the
+# attempts run out, the step refuses and names what is really active.
+#
+# There is no third route to reach for, and that is CHECKED, not assumed:
+# `EFT.UI.Settings.SettingsScreen` declares no Back and no Hide (all 23 declared
+# methods listed offline), its base `EFT.UI.Screens.EftScreen` is an
+# UNINSTANTIATED GENERIC whose methods have RVA `None` (shared generic code
+# needs a real MethodInfo, which this host does not have), and
+# `SettingsScreenController` has no Back either.
 #
 # CHATSCREEN IS NEVER TOUCHED, and that is now MEASURED rather than assumed:
 # it read ACTIVE in BOTH menu censuses taken on 2026-09-02 (once with Settings
@@ -869,24 +888,56 @@ proc arCloseSettings(ss: Il2CppPtr; why: var string): bool =
   cPmnCallClose(fn, comp)
   return true
 
-proc arPressBackUnder(ss: Il2CppPtr; why: var string): bool =
-  ## Attempt 2: the screen's OWN Back button, scoped to ITS subtree.
+proc arPressBackUnder(ss: Il2CppPtr; names: var string; nSeen: var int;
+                      why: var string): bool =
+  ## Attempt 1: the screen's OWN Back control, scoped to ITS subtree.
+  ##
+  ## `BackButton` by exact name first, because that is the name the inspector
+  ## reported live on this screen. If that is not there, ANY active descendant
+  ## whose name contains "back" -- and either way the active names seen are
+  ## reported, so a refusal here lists the candidates instead of shrugging.
   result = false
   why = ""
+  names = ""
+  nSeen = 0
+  if ss == nil:
+    why = "no live SettingsScreen to search"
+    return false
   var b = ArNodeBudget
   let back = arWalkActive(ss, "BackButton", ArFindDepth, b,
                           cNowMs() + ArWalkMs, nil)
-  if back == nil:
-    why = "no ACTIVE node named `BackButton` under the ACTIVE SettingsScreen " &
-          "subtree (searched that subtree only, NOT every scene root -- the " &
-          "all-roots hunt is the one that refuses, fact #243)"
+  if back != nil:
+    if arPress(back, "DefaultUIButton"):
+      return true
+    why = "the SettingsScreen's own ACTIVE `BackButton` was found, but its " &
+          "DefaultUIButton OnClick could not be resolved and validated, so it " &
+          "was NOT pressed"
     return false
-  if not arPress(back, "DefaultUIButton"):
-    why = "the SettingsScreen's own `BackButton` was found and ACTIVE, but " &
-          "its DefaultUIButton OnClick could not be resolved and validated, " &
-          "so it was NOT pressed"
-    return false
-  return true
+  # No node called exactly `BackButton`. Census the active names and try any
+  # that reads like a back control, so the refusal carries evidence.
+  var nodes: seq[Il2CppPtr] = @[]
+  var b2 = ArNodeBudget
+  arCollectAllActive(ss, ArSideDepth, b2, cNowMs() + ArWalkMs, nodes,
+                     ArMaxSideBtns)
+  nSeen = nodes.len
+  var i = 0
+  while i < nodes.len:
+    let nm = iObjName(nodes[i])
+    if nm.len > 0 and names.len < 600:
+      names = names & "[" & nm & "]"
+    i = i + 1
+  i = 0
+  while i < nodes.len:
+    let nm = iObjName(nodes[i])
+    if nm.len > 0 and iContains(iLower(nm), "back"):
+      if arPress(nodes[i], "DefaultUIButton"):
+        return true
+    i = i + 1
+  why = "no ACTIVE node named `BackButton`, and none of the " & $nSeen &
+        " active node name(s) under the screen containing \"back\" could be " &
+        "pressed (searched THAT SUBTREE only, never all 16 scene roots -- the " &
+        "all-roots hunt is the one that refuses, fact #243). Names seen: " &
+        (if names.len > 0: names else: "<none>")
 
 # ---------------------------------------------------------------------------
 # The tick body -- everything that touches managed memory, under ONE guard.
@@ -1044,6 +1095,27 @@ proc arTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ar_tick_body", cdecl.}
         gArPreChecks = gArPreChecks + 1
         if arChatActive(): gArPreChatSeen = gArPreChatSeen + 1
         let ov = arOverlayScreen()
+        if ov == nil and gArPreAttempted:
+          # PRE-MENU has already acted and the menu is STILL not usable, with
+          # nothing left on screen to dismiss. Waiting out the remaining
+          # ArMenuWaitMs would spend three minutes reaching the same verdict,
+          # so refuse NOW, with the census that says what is really up.
+          var census = ""
+          if not gArCensused:
+            gArCensused = true
+            census = arScreenCensus()
+          arFail("WAIT-MENU refusing IMMEDIATELY rather than waiting out its " &
+                 $(int(ArMenuWaitMs div 1000'u64)) & " s bound: PRE-MENU has " &
+                 "already dismissed an overlay (via " & gArPreVia & ") and " &
+                 "there is now NO ACTIVE SettingsScreen and still no ACTIVE, " &
+                 "pressable MenuScreen PlayButton (MenuScreens seen=" & $nMs &
+                 ", PlayButtons under them=" & $nPb & ", active=" & $nActive &
+                 "). The settings screen was HIDDEN WITHOUT THE MENU BEING " &
+                 "RESTORED, which is what SettingsScreen::Close alone does " &
+                 "(MEASURED 2026-09-02). Nothing further here will make the " &
+                 "menu appear" &
+                 (if census.len > 0: ". ACTIVE:" & census else: ""))
+          return
         if ov != nil and gArPreTries < ArPreMaxTries:
           gArWaitLogMs = now
           okLog "autoRaid WAIT-MENU: MenuScreen and its PlayButton were FOUND " &
@@ -1063,66 +1135,121 @@ proc arTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ar_tick_body", cdecl.}
     return
 
   if gArStep == ArPreMenu:
-    let ov = arOverlayScreen()
-    # (a) THE FINISHED STATE, and it is a NEGATIVE: no ACTIVE SettingsScreen.
-    if ov == nil:
+    # (a) THE FINISHED STATE. It is NOT "no ACTIVE SettingsScreen" -- that check
+    # PASSED on 2026-09-02 while the menu never came back, which makes it a
+    # check that cannot fail for the thing this step exists to achieve. The
+    # finished state is THE MENU BEING USABLE: an ACTIVE, PRESSABLE MenuScreen
+    # PlayButton, asked for with the very same function WAIT-MENU uses, so the
+    # two can never disagree.
+    var nMs = 0
+    var nPb = 0
+    var nAct = 0
+    let pb = arFindPlay(nMs, nPb, nAct)
+    if pb != nil:
       if gArPreTries > 0:
         gArPreDismissed = gArPreDismissed + 1
-        okLog "autoRaid PRE-MENU: dismissed SettingsScreen via " &
-              gArPreVia & " -- READBACK: no ACTIVE `SettingsScreen` remains " &
-              "anywhere. Returning to WAIT-MENU. Overlays cleared this " &
+        okLog "autoRaid PRE-MENU: dismissed SettingsScreen via " & gArPreVia &
+              " -- READBACK: the MenuScreen PlayButton is ACTIVE and PRESSABLE " &
+              "again (MenuScreens=" & $nMs & ", PlayButtons=" & $nPb &
+              ", active=" & $nAct & "). That is the menu being usable, not " &
+              "merely the settings screen being hidden. Overlays cleared this " &
               "session: " & $gArPreDismissed & "."
       else:
-        info "autoRaid PRE-MENU: the ACTIVE SettingsScreen went away before " &
-             "anything was attempted (the player closed it, most likely). " &
-             "Nothing was called and nothing is claimed; back to WAIT-MENU."
+        info "autoRaid PRE-MENU: the menu became usable before anything was " &
+             "attempted (the player closed the overlay, most likely). Nothing " &
+             "was called and nothing is claimed; back to WAIT-MENU."
       gArPreTries = 0
       gArStepT0 = 0'u64
       arGoto(ArWaitMenu)
       return
+    let ov = arOverlayScreen()
     # (b) settle after an attempt before judging it or trying again.
     if gArPreTries > 0 and now - gArPreActMs < ArPreSettleMs:
       return
-    if gArPreTries >= ArPreMaxTries:
+    # (c) nothing left to try, or nothing left to dismiss: REFUSE, naming what
+    # is actually up.
+    if gArPreTries >= ArPreMaxTries or (ov == nil and gArPreTries > 0):
       var census = ""
       if not gArCensused:
         gArCensused = true
         census = arScreenCensus()
-      arFail("step PRE-MENU -- `SettingsScreen` is STILL ACTIVE over the main " &
-             "menu after " & $gArPreTries & " dismissal attempts (" &
-             gArPreVia & "), so the MenuScreen PlayButton stays unpressable " &
-             "and this feature will not reach the menu. The screen it could " &
-             "NOT dismiss is SettingsScreen; ChatScreen was never touched " &
+      arFail("step PRE-MENU -- the MAIN MENU DID NOT COME BACK. After " &
+             $gArPreTries & " dismissal attempt(s) (last via " & gArPreVia &
+             ") there is still no ACTIVE, pressable MenuScreen PlayButton " &
+             "(MenuScreens seen=" & $nMs & ", PlayButtons under them=" & $nPb &
+             ", active=" & $nAct & "), and SettingsScreen is " &
+             (if ov == nil:
+                "no longer active -- so the settings screen was HIDDEN " &
+                "WITHOUT THE MENU BEING RESTORED, which is exactly what " &
+                "SettingsScreen::Close alone does (MEASURED 2026-09-02)"
+              else: "STILL ACTIVE") &
+             ". ChatScreen is a normal part of the menu and was never touched " &
              "(ACTIVE on " & $gArPreChatSeen & " of " & $gArPreChecks &
              " checks)" & (if census.len > 0: ". ACTIVE:" & census else: ""))
       return
-    # (c) the ladder: the screen's own Close() first, its own Back button next.
+    if ov == nil:
+      # No overlay and no menu, with nothing attempted yet: there is nothing
+      # here for this step to dismiss. Say so and let WAIT-MENU judge.
+      info "autoRaid PRE-MENU: no ACTIVE SettingsScreen and no pressable " &
+           "PlayButton either, with nothing attempted yet. There is nothing " &
+           "here to dismiss; back to WAIT-MENU."
+      gArStepT0 = 0'u64
+      arGoto(ArWaitMenu)
+      return
+    # (d) THE LADDER. Attempt 1 is the GAME'S OWN BACK PATH -- the settings
+    # screen's own BackButton, scoped to its subtree, fired through the same
+    # validated DefaultUIButton OnClick(+0x120) -> UnityEvent::Invoke that every
+    # other press in this file uses. That is what a human click runs, and it is
+    # the handler that RESTORES THE MENU.
+    #
+    # Attempt 2 is `SettingsScreen::Close()` @0x1720B10, kept only as a
+    # FALLBACK and demoted for a MEASURED reason: on 2026-09-02 it hid the
+    # settings screen -- its own readback passed, `no ACTIVE SettingsScreen
+    # remains` -- and the main menu never came back; the census afterwards had
+    # no MenuScreen active at all. It is still worth trying second, because a
+    # hidden settings screen with a dead menu is a state the refusal above can
+    # NAME, but it is not the back path.
+    #
+    # There is no third thing to reach for, and that is checked rather than
+    # assumed: `EFT.UI.Settings.SettingsScreen` declares no Back and no Hide of
+    # its own (all 23 declared methods listed offline), and its base
+    # `EFT.UI.Screens.EftScreen` is an UNINSTANTIATED GENERIC whose methods have
+    # RVA `None` -- shared generic code needs a real MethodInfo, which this host
+    # does not have. `SettingsScreenController` has no Back either. So the
+    # button's own handler IS the game's back path here.
     var why = ""
     if gArPreTries == 0:
       gArPreTries = 1
+      gArPreAttempted = true
       gArPreActMs = now
       gArLastActionMs = now
-      gArPreVia = "SettingsScreen::Close @0x" &
-                  hexOf(uint64(cPmnRva(PmnTSsClose)))
-      if arCloseSettings(ov, why):
-        okLog "autoRaid PRE-MENU: called " & gArPreVia &
-              " on the ACTIVE SettingsScreen. CALLED IS NOT DISMISSED -- the " &
-              "readback is the next tick finding NO active SettingsScreen."
+      gArPreVia = "the screen's own BackButton (DefaultUIButton OnClick -> " &
+                  "UnityEvent::Invoke), scoped to the ACTIVE SettingsScreen"
+      var backNames = ""
+      var backSeen = 0
+      if arPressBackUnder(ov, backNames, backSeen, why):
+        okLog "autoRaid PRE-MENU: pressed " & gArPreVia &
+              ". PRESSED IS NOT RESTORED -- the readback is the next tick " &
+              "finding an ACTIVE, PRESSABLE MenuScreen PlayButton, not merely " &
+              "the settings screen going away."
       else:
-        warn "autoRaid PRE-MENU: could not call SettingsScreen::Close -- " &
-             why & ". Falling back to the screen's own BackButton on the " &
-             "next attempt."
+        warn "autoRaid PRE-MENU: the BackButton press did not go through -- " &
+             why & ". Falling back to SettingsScreen::Close on the next " &
+             "attempt, which is MEASURED to hide the screen WITHOUT restoring " &
+             "the menu, so expect the refusal below rather than a success."
       return
     gArPreTries = gArPreTries + 1
+    gArPreAttempted = true
     gArPreActMs = now
     gArLastActionMs = now
-    gArPreVia = "the screen's own BackButton (DefaultUIButton OnClick)"
-    if arPressBackUnder(ov, why):
-      okLog "autoRaid PRE-MENU: pressed " & gArPreVia & ", scoped to the " &
-            "ACTIVE SettingsScreen subtree. PRESSED IS NOT DISMISSED -- the " &
-            "readback is the next tick finding NO active SettingsScreen."
+    gArPreVia = "SettingsScreen::Close @0x" & hexOf(uint64(cPmnRva(PmnTSsClose)))
+    if arCloseSettings(ov, why):
+      okLog "autoRaid PRE-MENU: called " & gArPreVia &
+            " on the ACTIVE SettingsScreen (FALLBACK -- this hides the screen " &
+            "and is MEASURED not to restore the menu). CALLED IS NOT " &
+            "RESTORED: the readback is an ACTIVE, PRESSABLE PlayButton."
     else:
-      warn "autoRaid PRE-MENU: the BackButton fallback did not press -- " &
+      warn "autoRaid PRE-MENU: could not call SettingsScreen::Close either -- " &
            why & "."
     return
 
@@ -1308,6 +1435,7 @@ proc arArmOnDemand() =
   # not evidence about this run.
   gArSideEpoch = uihEpoch(UihSiteSideSelect)
   gArPreTries = 0
+  gArPreAttempted = false
   gArPreActMs = 0'u64
   gArPreVia = "nothing"
   gArOffAwaitMs = 0'u64

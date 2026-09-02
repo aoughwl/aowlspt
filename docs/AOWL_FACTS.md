@@ -6667,3 +6667,41 @@ rather than a guess in the code.
 of 2026-09-02, one with Settings overlaying the menu and one with PLAY
 pressable. It is not an overlay; PRE-MENU ignores it and only ever closes
 SettingsScreen.
+
+## 2026-09-02: `SettingsScreen::Close()` hides the settings screen WITHOUT restoring the menu
+
+MEASURED live on the 4,717,056-byte build: PRE-MENU ran exactly as written --
+`called SettingsScreen::Close @0x1720b10`, readback `no ACTIVE SettingsScreen
+remains`, `Overlays cleared this session: 1` -- and then WAIT-MENU never saw an
+active PlayButton for its full 180 s, with the census showing
+
+    Common UI active(depth<=2)=2: [Common UI][ChatScreen]
+    Menu UI   active(depth<=2)=2: [UI][Operation Queue Indicator]
+
+i.e. **no MenuScreen active at all**. So `Close()` @`0x1720B10` is a HIDE, not
+the back path: it takes the settings screen down and nothing brings the menu
+back up.
+
+This is the §9b failure shape again, and worth naming precisely: the step
+asserted **the thing it had just done** ("no ACTIVE SettingsScreen") rather than
+**the thing it was for** ("the menu is usable"). That check passed on a run that
+achieved nothing. The finished state is now an ACTIVE, PRESSABLE MenuScreen
+PlayButton, obtained from the same `arFindPlay` WAIT-MENU itself uses so the two
+cannot disagree, and the ladder is Back-first with `Close()` demoted to a
+fallback whose own log line says it is measured not to restore the menu.
+
+**There is no non-generic Back/Hide to call, and this was checked offline rather
+than assumed:** `EFT.UI.Settings.SettingsScreen` declares 23 methods and none is
+Back or Hide (`Close` @0x1720B10, `CloseAll` @0x17207A0, `Show` @0x171FA00,
+`ShowScreen` @0x1720DE0, `OpenGroup` @0x1720C80, `SaveButtonAction` @0x1721450 …);
+its base `EFT.UI.Screens.EftScreen`2` is an **UNINSTANTIATED GENERIC** whose
+methods report `RVA=-  sharedness=NO-CODE` (shared generic code needs a real
+MethodInfo, which this host does not have); and `SettingsScreenController` has no
+Back either (`CloseScreenInterruption` @0x1721C90 returns a `Task<bool>` and is
+not it). **So the game's back path here is the Back button's own click
+handler**, which is what the step now fires first.
+
+Also fixed by the same measurement: WAIT-MENU no longer spends its 180 s bound
+after PRE-MENU has acted and left no overlay and no usable menu -- it refuses
+immediately with the census, because three more minutes cannot change that
+verdict.
