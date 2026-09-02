@@ -6894,3 +6894,16 @@ of the session's fault budget for no information. autoraid now carries an
 integer CRUMB (an int, not a string -- a string literal assignment on the live
 path allocates) set immediately before every operation that touches live managed
 memory, and the fault line reads `... at step X, in: <operation>`.
+
+## 2026-09-02 04:30: MatchMaker Side Selection Screen structure (live tree)
+
+MEASURED (`tree <screen> 3` on the live screen, build 1.1.0.1.46777):
+`MatchMaker Side Selection Screen` (9 children) -> `PMCs` (6 children):
+`PMCPlayerMV`, `AnimatedToggleSpawner` -> `AnimatedToggle`, `Button`,
+`ScavPlayerMV` -> `AnimatedToggleSpawner`, `Button`, `RandomToggleSpawner` ->
+`RandomToggle`; and `ScreenDefaultButtons` -> `NextButton`, `BackButton`.
+Both sides live under `PMCs`; each side is an AnimatedToggle spawned by a
+UIAnimatedToggleSpawner (the settings-tab family) plus a `Button`. A walk
+probing only DefaultUIButton/AnimatedToggle klasses under the pmc/scav
+containers found nothing here (04:20), so those klass names are wrong for
+this screen; `components` on the live nodes is the way to learn them.
