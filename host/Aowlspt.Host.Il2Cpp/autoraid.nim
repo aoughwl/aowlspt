@@ -115,6 +115,12 @@ const
   ArMaxSlots      = 8           ## CharacterSlotView* collected per screen.
   ArCharDepth     = 8           ## descent under the screen for slots/Title/Apply.
   ArCensusCap     = 24          ## names printed by the stuck-step screen census.
+  ArPreMaxTries   = 2           ## PRE-MENU dismissal attempts, EVER. Then the
+                                ## step refuses by name, loudly, naming the
+                                ## screen it could not dismiss.
+  ArPreSettleMs   = 4000'u64    ## after a dismissal attempt, how long the
+                                ## overlay may still read active before the
+                                ## next attempt is allowed.
   ArOffWaitMs     = 20000'u64   ## after NEXT->offline-raid, how long we wait for
                                 ## the MatchmakerOfflineRaidScreen::Show event
                                 ## before saying the readback never arrived.
@@ -132,6 +138,7 @@ const
   ArDone      = 8
   ArFailed    = 9
   ArCharacter = 10  ## after PLAY: answer the character/mode selection screen
+  ArPreMenu   = 11  ## before the menu: dismiss a screen overlaying MenuScreen
 
 # ---- the guarded-body thunk (ONE aowl_p_p_seh, never nested) ----
 {.emit: """
@@ -148,6 +155,24 @@ static void* aowl_xr_tick_guarded(void* a) {
 }
 """.}
 proc cArTickGuarded(a: Il2CppPtr): Il2CppPtr {.importc: "aowl_ar_tick_guarded", nodecl.}
+
+# ---- PRE-MENU: the screen's OWN close path (abi/aowlspt_premenu.h) ----------
+# ONE row, so the positional index cannot drift silently -- and it is registered
+# in tools/idxbind.py all the same, because a table that is not registered there
+# fails the build by design.
+proc cPmnFn(i: int32): Il2CppPtr {.importc: "aowl_pmn_fn", nodecl.}
+proc cPmnRva(i: int32): uint32 {.importc: "aowl_pmn_rva", nodecl.}
+proc cPmnOkCount(): int32 {.importc: "aowl_pmn_ok_count", nodecl.}
+proc cPmnBadCount(): int32 {.importc: "aowl_pmn_bad_count", nodecl.}
+proc cPmnProfullCount(): int32 {.importc: "aowl_pmn_profull_count", nodecl.}
+proc cPmnCallClose(fn, screen: Il2CppPtr) {.
+  importc: "aowl_pmn_call_close", nodecl.}
+
+const
+  # The row name is the WHOLE doc comment on purpose: tools/idxbind.py reads it
+  # as the row this index claims to address and fails the build if the C table
+  # ever stops agreeing. RVA 0x1720B10, arity 0, UNIQUE -- in the header.
+  PmnTSsClose = 0'i32   ## EFT.UI.Settings.SettingsScreen::Close
 
 # ---- state (gArOn / gArMap are set in the flag-reading pass in aowlhost.nim) ----
 var gArOn = false                  ## the `uxAutoRaid` flag; DEFAULT OFF
@@ -173,6 +198,12 @@ var gArOffEpoch = 0                ## last seen uihooks site-0 epoch (offline ra
 var gArOffFires = 0                ## site-0 show events observed while armed
 var gArOffAwaitMs = 0'u64          ## when NEXT->offline-raid was pressed
 var gArCensused = false            ## the stuck-step census has been printed once
+var gArPreTries = 0                ## PRE-MENU dismissal attempts made
+var gArPreActMs = 0'u64            ## when the last dismissal attempt was made
+var gArPreDismissed = 0            ## overlays this feature actually cleared
+var gArPreChatSeen = 0             ## ticks on which ChatScreen read ACTIVE
+var gArPreChecks = 0               ## PRE-MENU overlay checks made (the divisor)
+var gArPreVia = "nothing"          ## which route the last attempt used
 
 proc arStepName(s: int): string =
   case s
@@ -186,6 +217,7 @@ proc arStepName(s: int): string =
   of ArReady:     "READY"
   of ArDone:      "DONE"
   of ArCharacter: "CHARACTER"
+  of ArPreMenu:   "PRE-MENU"
   else:           "FAILED"
 
 proc arGoto(s: int) =
@@ -756,6 +788,103 @@ proc arScreenCensus(): string =
     result = " (neither `Menu UI` nor `Common UI` is an enumerated root now)"
 
 # ---------------------------------------------------------------------------
+# PRE-MENU: clear a screen that is OVER the main menu.
+#
+# MEASURED 2026-09-02, live, on the previous build of this file: `raid Woods`
+# issued with Settings open sat in WAIT-MENU for the whole 180 s bound and
+# refused with this census --
+#
+#   Common UI active(depth<=2)=3: [Common UI][SettingsScreen][ChatScreen]
+#   Menu UI   active(depth<=2)=2: [UI][Operation Queue Indicator]
+#
+# -- i.e. `MenuScreen found=1, PlayButton under it=1, active=0`. The button was
+# found and INACTIVE because SettingsScreen was over it, and an inactive control
+# is not pressable (fact #72). The refusal was correct; the machine simply had
+# no way to clear the overlay. `pressname BackButton` does not do it either: it
+# searches all 16 roots and refuses (fact #243).
+#
+# THE LADDER, in this order, bounded at `ArPreMaxTries` attempts TOTAL:
+#   1. the screen's OWN close path -- `EFT.UI.Settings.SettingsScreen::Close()`
+#      @0x1720B10, resolved OFFLINE, UNIQUE, arity 0, 16-byte prologue-verified
+#      against the STARTUP SNAPSHOT, CALLED and never detoured
+#      (abi/aowlspt_premenu.h has the disassembly and the virtual-call hazard).
+#   2. that screen's OWN Back button, scoped to ITS subtree, pressed through the
+#      same validated DefaultUIButton OnClick(+0x120) path every other step
+#      uses. Scoped, so this is not the all-roots name hunt that fails.
+#
+# NEITHER attempt is believed. The step advances only on the FINISHED STATE:
+# no ACTIVE SettingsScreen anywhere. If two attempts leave it up, the step
+# refuses and NAMES the screen it could not dismiss.
+#
+# CHATSCREEN IS NEVER TOUCHED. It was active in that census and the menu was
+# perfectly usable behind it, so it is not an overlay this feature has any
+# business closing. Whether it is ALWAYS active is not yet measured, so it is
+# COUNTED here (`chat active on N of M checks`) and acted on never -- the log
+# will answer it across runs instead of a guess being written into the code.
+# ---------------------------------------------------------------------------
+proc arOverlayScreen(): Il2CppPtr =
+  ## The ACTIVE `SettingsScreen`, `Common UI` first then any root. Only ACTIVE
+  ## nodes are ever returned (`arWalkActive`), so a screen that merely EXISTS in
+  ## the hierarchy -- which SettingsScreen always does -- is not an overlay.
+  result = arFindActiveAcross("Common UI", "SettingsScreen", nil)
+
+proc arChatActive(): bool =
+  ## OBSERVED, NEVER ACTED ON. See the banner.
+  result = arFindActiveAcross("Common UI", "ChatScreen", nil) != nil
+
+proc arCloseSettings(ss: Il2CppPtr; why: var string): bool =
+  ## Call the screen's own `Close()`. Returns whether the CALL was made -- NOT
+  ## whether the screen went away; that is the caller's finished-state readback,
+  ## because a handler that returns normally is not evidence of anything.
+  result = false
+  why = ""
+  var comp: Il2CppPtr = nil
+  var w = ""
+  if not iVisComponent(ss, "SettingsScreen", comp, w):
+    why = "could not ask the live object for its SettingsScreen component (" &
+          w & "), so nothing was called"
+    return false
+  if comp == nil:
+    why = "the ACTIVE object named `SettingsScreen` carries no component of " &
+          "that short type name on this build, so there is no receiver for " &
+          "Close() and nothing was called"
+    return false
+  if not iUnityAlive(comp):
+    why = "the SettingsScreen component's native half (m_CachedPtr) is null " &
+          "-- a destroyed object stays readable (fact #182), so nothing was " &
+          "called"
+    return false
+  let fn = cPmnFn(PmnTSsClose)
+  if fn == nil:
+    why = "SettingsScreen::Close @0x" & hexOf(uint64(cPmnRva(PmnTSsClose))) &
+          " did NOT verify against the startup prologue snapshot on this " &
+          "build (verified=" & $int(cPmnOkCount()) & " rejected=" &
+          $int(cPmnBadCount()) & " snapshot-table-full=" &
+          $int(cPmnProfullCount()) & "); REFUSING to call it"
+    return false
+  cPmnCallClose(fn, comp)
+  return true
+
+proc arPressBackUnder(ss: Il2CppPtr; why: var string): bool =
+  ## Attempt 2: the screen's OWN Back button, scoped to ITS subtree.
+  result = false
+  why = ""
+  var b = ArNodeBudget
+  let back = arWalkActive(ss, "BackButton", ArFindDepth, b,
+                          cNowMs() + ArWalkMs, nil)
+  if back == nil:
+    why = "no ACTIVE node named `BackButton` under the ACTIVE SettingsScreen " &
+          "subtree (searched that subtree only, NOT every scene root -- the " &
+          "all-roots hunt is the one that refuses, fact #243)"
+    return false
+  if not arPress(back, "DefaultUIButton"):
+    why = "the SettingsScreen's own `BackButton` was found and ACTIVE, but " &
+          "its DefaultUIButton OnClick could not be resolved and validated, " &
+          "so it was NOT pressed"
+    return false
+  return true
+
+# ---------------------------------------------------------------------------
 # The tick body -- everything that touches managed memory, under ONE guard.
 # ---------------------------------------------------------------------------
 proc arFail(why: string) =
@@ -876,11 +1005,97 @@ proc arTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ar_tick_body", cdecl.}
       # activeInHierarchy PlayButtons; a non-zero `active` with no press means the
       # active one was not pressable (a same-named wrapper without a button).
       # Rate-limited to ~10 s.
+      # FOUND BUT INACTIVE IS A DIFFERENT FACT FROM NOT FOUND. A PlayButton
+      # that exists under a found MenuScreen and reads inactive means something
+      # is OVER the menu -- MEASURED: Settings. That is not a reason to wait
+      # 180 s; it is a reason to clear the overlay. Checked at most once every
+      # 5 s, and ONLY in this already-stuck case, so the common path pays
+      # nothing for it.
+      if nMs > 0 and nPb > 0 and nActive == 0 and
+         now - gArWaitLogMs > 5000'u64:
+        gArPreChecks = gArPreChecks + 1
+        if arChatActive(): gArPreChatSeen = gArPreChatSeen + 1
+        let ov = arOverlayScreen()
+        if ov != nil and gArPreTries < ArPreMaxTries:
+          gArWaitLogMs = now
+          okLog "autoRaid WAIT-MENU: MenuScreen and its PlayButton were FOUND " &
+                "but the button is INACTIVE, and an ACTIVE `SettingsScreen` " &
+                "is over the menu. That is an overlay, not a slow menu. " &
+                "Going to PRE-MENU to dismiss it (attempt " &
+                $(gArPreTries + 1) & " of " & $ArPreMaxTries & "). " &
+                "ChatScreen was ACTIVE on " & $gArPreChatSeen & " of " &
+                $gArPreChecks & " checks and is NEVER touched."
+          arGoto(ArPreMenu)
+          return
       if now - gArWaitLogMs > 10000'u64:
         gArWaitLogMs = now
         info "autoRaid WAIT-MENU: roots=" & $gArRootCount &
              ", MenuScreen found=" & $nMs & ", PlayButton under it=" & $nPb &
              ", active=" & $nActive & " (nothing pressable this tick)"
+    return
+
+  if gArStep == ArPreMenu:
+    let ov = arOverlayScreen()
+    # (a) THE FINISHED STATE, and it is a NEGATIVE: no ACTIVE SettingsScreen.
+    if ov == nil:
+      if gArPreTries > 0:
+        gArPreDismissed = gArPreDismissed + 1
+        okLog "autoRaid PRE-MENU: dismissed SettingsScreen via " &
+              gArPreVia & " -- READBACK: no ACTIVE `SettingsScreen` remains " &
+              "anywhere. Returning to WAIT-MENU. Overlays cleared this " &
+              "session: " & $gArPreDismissed & "."
+      else:
+        info "autoRaid PRE-MENU: the ACTIVE SettingsScreen went away before " &
+             "anything was attempted (the player closed it, most likely). " &
+             "Nothing was called and nothing is claimed; back to WAIT-MENU."
+      gArPreTries = 0
+      gArStepT0 = 0'u64
+      arGoto(ArWaitMenu)
+      return
+    # (b) settle after an attempt before judging it or trying again.
+    if gArPreTries > 0 and now - gArPreActMs < ArPreSettleMs:
+      return
+    if gArPreTries >= ArPreMaxTries:
+      var census = ""
+      if not gArCensused:
+        gArCensused = true
+        census = arScreenCensus()
+      arFail("step PRE-MENU -- `SettingsScreen` is STILL ACTIVE over the main " &
+             "menu after " & $gArPreTries & " dismissal attempts (" &
+             gArPreVia & "), so the MenuScreen PlayButton stays unpressable " &
+             "and this feature will not reach the menu. The screen it could " &
+             "NOT dismiss is SettingsScreen; ChatScreen was never touched " &
+             "(ACTIVE on " & $gArPreChatSeen & " of " & $gArPreChecks &
+             " checks)" & (if census.len > 0: ". ACTIVE:" & census else: ""))
+      return
+    # (c) the ladder: the screen's own Close() first, its own Back button next.
+    var why = ""
+    if gArPreTries == 0:
+      gArPreTries = 1
+      gArPreActMs = now
+      gArLastActionMs = now
+      gArPreVia = "SettingsScreen::Close @0x" &
+                  hexOf(uint64(cPmnRva(PmnTSsClose)))
+      if arCloseSettings(ov, why):
+        okLog "autoRaid PRE-MENU: called " & gArPreVia &
+              " on the ACTIVE SettingsScreen. CALLED IS NOT DISMISSED -- the " &
+              "readback is the next tick finding NO active SettingsScreen."
+      else:
+        warn "autoRaid PRE-MENU: could not call SettingsScreen::Close -- " &
+             why & ". Falling back to the screen's own BackButton on the " &
+             "next attempt."
+      return
+    gArPreTries = gArPreTries + 1
+    gArPreActMs = now
+    gArLastActionMs = now
+    gArPreVia = "the screen's own BackButton (DefaultUIButton OnClick)"
+    if arPressBackUnder(ov, why):
+      okLog "autoRaid PRE-MENU: pressed " & gArPreVia & ", scoped to the " &
+            "ACTIVE SettingsScreen subtree. PRESSED IS NOT DISMISSED -- the " &
+            "readback is the next tick finding NO active SettingsScreen."
+    else:
+      warn "autoRaid PRE-MENU: the BackButton fallback did not press -- " &
+           why & "."
     return
 
   if gArStep == ArNext2 and gArOffAwaitMs != 0'u64:
@@ -1056,6 +1271,9 @@ proc arArmOnDemand() =
   gArCharPressedMs = 0'u64
   gArCharLogMs = 0'u64
   gArCensused = false
+  gArPreTries = 0
+  gArPreActMs = 0'u64
+  gArPreVia = "nothing"
   gArOffAwaitMs = 0'u64
   # Snapshot the show-event epoch NOW: an event from BEFORE this arming is not
   # evidence about this run, and consuming a stale one would resynchronise the

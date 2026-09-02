@@ -44,8 +44,10 @@ const NtMaxFaults = 4
 const NtMaxTabs = 4              ## how many tabs this file will own at once
 const NtMaxReap = 32             ## rule 4 on the fact-#93 reap walk
 
-var gNtOn = false                ## `nativeTabs` -- read once at boot
-var gNtOff = false               ## self-disabled
+## `gNtOn` / `gNtOff` are declared in `aowlhost.nim` beside the other feature
+## flags, NOT here. `modstab.nim`'s rider gate must test `gNtOn`, and modstab is
+## included BEFORE this file -- nimony forward-resolves PROCS across an include
+## boundary but not VARIABLES, so a flag declared here is invisible there.
 var gNtBuilt = false
 var gNtTried = 0
 var gNtFaults = 0
@@ -60,6 +62,29 @@ var gNtVerdictSaid = false
 ## step and no expression, so the next move would have been to guess. Same
 ## device as `gModSetStep` in modsettingsrender.nim, and for the same reason.
 var gNtStep = "not started"
+
+## A TICK THAT DECLINES SILENTLY IS A CHECK THAT CANNOT FAIL.
+##
+## MEASURED: on the second live pass the bind line printed and then NOTHING
+## -- no crumb, no fault, no verdict. `ntTick` running and returning quietly
+## was indistinguishable from `ntTick` never being called, and the two have
+## completely different fixes (one is a gate in modstab, the other is an
+## anchor that never arrived). The breadcrumb did not help because it is a
+## VARIABLE, only printed by the fault path -- and there was no fault.
+##
+## So: one line the first time the tick is entered, and one line naming the
+## reason each time it declines to build. Throttled by CHANGE, not by a
+## counter -- the same reason repeating every frame prints once, but a
+## DIFFERENT reason always prints, so a state transition is never swallowed.
+var gNtEnteredSaid = false
+var gNtWhySaid = ""
+
+proc ntWhy(reason: string) =
+  ## Log a decline reason, once per distinct reason.
+  if reason == gNtWhySaid:
+    return
+  gNtWhySaid = reason
+  okLog "native tabs: not building yet -- " & reason
 
 ## OUR TABS. Parallel seqs rather than a seq-of-object so the toggle table the
 ## detour postfix scans is a flat pointer list -- that scan is O(n) with n<=4
@@ -335,8 +360,24 @@ proc ntCollectStockPanels(screenT: Il2CppPtr) =
 proc ntBuild(): bool =
   result = false
   if gNtBuilt or gNtOff or not gNtOn: return
-  if gModsLastTabPtr == nil or not duOk(gModsLastTabPtr, 0x20'i32): return
+  # THE SILENT RETRY THAT ATE A LIVE PASS. This used to be one combined
+  # `return` with no message AND no `gNtTried` increment, so a tab pointer
+  # that was non-nil but not readable made this retry every frame, forever,
+  # printing nothing -- indistinguishable from the tick never running.
+  if gModsLastTabPtr == nil:
+    ntWhy("the settings tab pointer went nil between the tick check and " &
+          "here (the screen closed mid-frame)")
+    return
+  if not duOk(gModsLastTabPtr, 0x20'i32):
+    ntWhy("the settings tab pointer " & iPtr(gModsLastTabPtr) & " is NOT " &
+          "READABLE, so nothing can be walked from it. This is not a nil " &
+          "anchor -- it is a stale or wrong one, and it does NOT count as a " &
+          "build attempt, so the feature keeps waiting for a good one " &
+          "rather than burning its 8 tries on it.")
+    return
   gNtTried = gNtTried + 1
+  ntWhy("build attempt " & $gNtTried & " is running from tab " &
+        iPtr(gModsLastTabPtr))
   if not nuTargetsBindOk():
     ntNoteFault("the aowl_nu_targets POSITIONAL self-check FAILED, so every " &
                 "call here would go to the wrong method. Nothing was built")
@@ -435,11 +476,30 @@ proc ntTickBody() =
   ## one integer compare -- the press arrives from the detour, not from a hunt.
   if not gNtOn or gNtOff: return
   gNtStep = "tick: entry"
+  if not gNtEnteredSaid:
+    # PROOF OF LIFE. Its ABSENCE from the log now means the tick is not being
+    # called at all -- which is a gate problem in modstab, not a problem in
+    # this file. That distinction cost a whole live pass.
+    gNtEnteredSaid = true
+    okLog "native tabs: the tick is LIVE and entered for the first time " &
+          "(flag on, detour bound). From here every frame either builds, or " &
+          "says why it is not building. If you never see this line again " &
+          "and never see a 'not building yet' line, the tick stopped being " &
+          "called."
   if not gNtBuilt:
-    if gModsLastTabPtr != nil and gNtTried < 8:
-      gNtStep = "tick: ntBuild (attempt " & $(gNtTried + 1) & ")"
-      discard ntBuild()
-      gNtStep = "tick: ntBuild returned without faulting"
+    if gModsLastTabPtr == nil:
+      ntWhy("no settings tab is known yet (gModsLastTabPtr is nil). The " &
+            "settingsUiProbe ShowScreen postfix is what learns it, so this " &
+            "clears the moment a settings tab is actually shown.")
+      return
+    if gNtTried >= 8:
+      ntWhy("the build was attempted 8 time(s) and never completed, so it " &
+            "has stopped trying. The last step reached was: " & gNtStep)
+      return
+    gNtStep = "tick: ntBuild (attempt " & $(gNtTried + 1) & ")"
+    ntWhy("attempting the build now (attempt " & $(gNtTried + 1) & " of 8)")
+    discard ntBuild()
+    gNtStep = "tick: ntBuild returned without faulting"
     return
   if gModsLastTabPtr == nil:
     gNtVerdictSaid = false

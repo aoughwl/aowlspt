@@ -72,6 +72,12 @@ import aowlgraphics
 import invoke
 
 {.emit: """#include "aowlspt_shim.h" """.}
+## THE EVENT-DISPATCH GUARD. Straight after the shim because it takes exactly
+## ONE `aowl_p_p_seh` and reads that guard's own thread-local to decide whether
+## it may. A mod's event handler faulting used to take the process down from
+## `deliverEvent` -- measured, Crash_2026-09-02_030042716. See
+## `abi/aowlspt_evguard.h`.
+{.emit: """#include "aowlspt_evguard.h" """.}
 ## THE READABILITY CACHE, in front of the shim's VirtualQuery syscall, for the
 ## per-frame GAME-DATA read paths ONLY. It must come straight after the shim,
 ## because it replicates the shim's predicate and audits itself against it.
@@ -332,6 +338,12 @@ static int aowl_rva_is_code(unsigned int rva) {
 ## SKIP THE MODE SCREEN. The three byte-verified selection-screen targets and
 ## the profile-data field offsets. See `aowlspt_modeskip.h`.
 {.emit: """#include "aowlspt_modeskip.h" """.}
+## AUTORAID'S PRE-MENU DISMISSAL. One byte-verified target,
+## `EFT.UI.Settings.SettingsScreen::Close` @0x1720B10 (UNIQUE, arity 0), CALLED
+## and never detoured, so that an overlaying Settings screen can be cleared by
+## the screen's OWN close path instead of by hunting a Back button across every
+## scene root. MUST follow `aowlspt_prologue.h`. See `aowlspt_premenu.h`.
+{.emit: """#include "aowlspt_premenu.h" """.}
 ## FREE THE MOUSE WHILE AN OVERLAY PANEL IS OPEN. The four byte-verified
 ## `UnityEngine.Cursor` targets, the pure ref-count/save-restore decision (which
 ## `tests/overlayhost/cursortest.c` compiles standalone and asserts against
@@ -478,6 +490,10 @@ static void aowl_pro_prime_all(void) {
      * ever depends on "nothing else patches that". */
     aowl_nr_prime_all();
     aowl_lp_prime_all();
+    /* autoraid's PRE-MENU close target. Uncontended by anything in this host
+     * today -- primed anyway, because the eager pass exists precisely so that
+     * no verify ever depends on "nothing else patches that". */
+    aowl_pmn_prime_all();
 }
 """.}
 {.emit: """#include "aowlspt_detour.h" """.}
@@ -1234,6 +1250,11 @@ type
     cb: Il2CppPtr
     user: Il2CppPtr
     modIndex: int
+    faults: int
+      ## How many times THIS handler has faulted and been caught by
+      ## `aowl_ev_invoke`. At `EvFaultLimit` the row is dropped: a handler that
+      ## has been longjmp'd out of twice has left its own mod's state
+      ## unknowable, and catching for ever would keep pretending otherwise.
 
   Pending = object
     ## A callback a mod asked to have run on the game's main thread, or after a
@@ -1561,6 +1582,11 @@ var gBotCapDone = false
 ## tail-jump thunk -- see the block comment in `abi/aowlspt_nativeui.h`.
 var gNtToggleSlot = -1
 var gNtFlagOn = false
+## Declared HERE, not in `nativetabs.nim`: `modstab.nim`'s rider gate tests
+## `gNtOn`, and modstab is included first. Procs forward-resolve across an
+## include boundary; variables do not.
+var gNtOn = false                ## `nativeTabs`, after the bind succeeded
+var gNtOff = false               ## self-disabled after the fault ceiling
 const KindMaxFeature = 29
   ## The highest `kind` that `attachDrain` treats as a FEATURE detour rather than
   ## as the main-thread update drain. Bump this when a new kind is added, and
@@ -2867,6 +2893,95 @@ proc modGuarded(index: int): bool =
   ## for good. `ModSlotLimit` cannot change, so the two ends always agree.
   result = index >= 0 and index < modhost.ModSlotLimit
 
+## ---------------------------------------------------------------------------
+## A MOD'S EVENT HANDLER FAULTING MUST NOT KILL THE CLIENT
+## ---------------------------------------------------------------------------
+##
+## MEASURED, not inferred: Unity crash report `Crash_2026-09-02_030042716`,
+## stack section only -- sain.dll `toJson <- schemaJson <- onPageQuery <-
+## eventTrampoline`, under `aowlspt-host-il2cpp` frames and
+## `KERNEL32!BaseThreadInitThunk`. That is the HOST'S OWN TICK THREAD inside an
+## `aowlspt.settings.pageQuery` broadcast. The handler faulted and the process
+## died, because this loop called it through the bare `aowl_invoke_callback`
+## trampoline with no guard anywhere above it.
+##
+## The rationale for the guard, the nesting rule and the self-test live in
+## `abi/aowlspt_evguard.h`; only the bookkeeping is here.
+proc cEvInvoke(cb, user, payload: Il2CppPtr; len: int32;
+               statusOut: Il2CppPtr): int32 {.
+  importc: "aowl_ev_invoke", nodecl.}
+proc cEvSelfTestCb(): Il2CppPtr {.importc: "aowl_ev_selftest_cb", nodecl.}
+proc cEvInGuard(): int32 {.importc: "aowl_ev_in_guard", nodecl.}
+
+const
+  EvOk = 0'i32
+  EvFaulted = 1'i32
+  EvNested = 2'i32
+  EvRefused = 3'i32
+  EvFaultLimit = 2
+    ## N. The first fault is caught and the handler kept -- a one-off bad
+    ## payload is a real thing. The second says the handler is broken, not the
+    ## input, and it is dropped: `aowl_p_p_seh` recovers by `longjmp`, so every
+    ## catch abandons that mod's frames where they stood.
+
+proc subscriberName(index: int): string =
+  ## Who to name in the log. A subscription's index is a mod index for a mod and
+  ## a sentinel for everything else (`hostharness` uses 0x7FFF, the self-test
+  ## below uses its own), so a name that came back empty is reported as what it
+  ## is rather than printed as a blank.
+  if index < 0 or index >= modhost.ModSlotLimit:
+    return "<host, index " & $index & ">"
+  let nm = modhost.modNameOf(index)
+  if nm.len > 0:
+    return nm
+  let g = modhost.modGuidOf(index)
+  if g.len > 0:
+    return g
+  result = "<unnamed mod, index " & $index & ">"
+
+proc noteEventFault(n: string; cb, user: Il2CppPtr; owner: int) =
+  ## Count this handler's fault and, at `EvFaultLimit`, unsubscribe it.
+  ##
+  ## The row is found by (name, cb, user, owner) rather than by an index into
+  ## the snapshot, because the snapshot was taken without the lock held for the
+  ## duration of the call and `gSubs` may have moved underneath it. A row that
+  ## is no longer there -- the mod unloaded mid-delivery -- is not an error:
+  ## the fault is still reported, and the unsubscribe it would have done has
+  ## already happened.
+  var count = 0
+  var dropped = false
+  var found = false
+  tablesLock()
+  var kept: seq[Sub] = @[]
+  for s in gSubs:
+    if not found and s.name == n and s.cb == cb and s.user == user and
+       s.modIndex == owner:
+      found = true
+      count = s.faults + 1
+      if count >= EvFaultLimit:
+        dropped = true
+        continue
+      var updated = s
+      updated.faults = count
+      kept.add updated
+      continue
+    kept.add s
+  if found:
+    gSubs = kept
+  tablesUnlock()
+  let who = subscriberName(owner)
+  if not found:
+    warn "mod event: " & who & " handler for " & n & " FAULTED (caught), and " &
+         "its subscription was already gone from the table -- it unloaded " &
+         "mid-delivery. Nothing to unsubscribe."
+    return
+  if dropped:
+    warn "mod event: " & who & " handler for " & n & " FAULTED (" & $count &
+         " of " & $EvFaultLimit & ") -- caught, unsubscribed"
+  else:
+    warn "mod event: " & who & " handler for " & n & " FAULTED (" & $count &
+         " of " & $EvFaultLimit & ") -- caught, kept"
+
 proc deliverEvent(n, body: string; fromIndex: int): int =
   ## One event to every subscriber but `fromIndex`. Factored out because the
   ## **host** emits as well now: the mod-control replies come from here and
@@ -2909,11 +3024,32 @@ proc deliverEvent(n, body: string; fromIndex: int): int =
     if guard and not modhost.modEnter(owners[i]):
       continue
     var b = body
-    let st = cInvokeCallback(cbs[i], users[i],
-                             cast[Il2CppPtr](toCString(b)), int32(body.len))
+    var st = 0'i32
+    # ONE `aowl_p_p_seh` per handler, opened inside `aowl_ev_invoke` and
+    # nowhere else on this path -- `deliverEvent` itself opens none, and the
+    # C side declines to open one when this thread is already guarded rather
+    # than nesting (which would DISARM the outer). Three outcomes.
+    let verdict = cEvInvoke(cbs[i], users[i],
+                            cast[Il2CppPtr](toCString(b)), int32(body.len),
+                            cast[Il2CppPtr](addr st))
     if guard:
       modhost.modLeave(owners[i])
-    if st != StatusOk:
+    if verdict == EvFaulted:
+      noteEventFault(n, cbs[i], users[i], owners[i])
+    elif verdict == EvNested:
+      # Delivered, but from inside somebody else's guard, so a fault here would
+      # have unwound to THEIR catch and this loop would never have seen it. Say
+      # so rather than counting it as a clean delivery.
+      warn "mod event: " & subscriberName(owners[i]) & " handler for " & n &
+           " ran UNATTRIBUTED -- this thread was already inside an " &
+           "aowl_p_p_seh, and nesting a second guard would disarm the outer " &
+           "one. A fault in it cannot be blamed on this handler."
+      if st != StatusOk:
+        warn "a subscriber to " & n & " returned " & $int(st)
+    elif verdict == EvRefused:
+      warn "mod event: " & subscriberName(owners[i]) & " handler for " & n &
+           " NOT called -- the subscription holds a null callback."
+    elif st != StatusOk:
       warn "a subscriber to " & n & " returned " & $int(st)
     inc result
 
@@ -8182,6 +8318,45 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
          "unarmed it will NEVER be installed and every consumer will keep " &
          "drawing bearing rings. Turn on sharedRegion (python tools/" &
          "hostcfg.py set sharedRegion on) or turn regionProjector back off."
+  # THE EVENT-GUARD FALSIFICATION. Default OFF. A guard that has never caught
+  # anything is indistinguishable from a guard that cannot catch anything, so
+  # this subscribes a handler that faults ON PURPOSE (a store to 0x10, see
+  # `abi/aowlspt_evguard.h`) and emits to it twice. PASS is: two FAULTED lines,
+  # the second saying `unsubscribed`, a third emit reaching nobody, and the
+  # process still alive to log the verdict. If the client dies here the guard
+  # does not work on this build, which is also a result.
+  #
+  # It runs on the host's own boot thread, touches no game memory and resolves
+  # no il2cpp name, so it is safe to run before the runtime is up.
+  if readBoolKey("eventGuardSelfTest"):
+    let evSelfTestEvent = "aowlspt.host.eventGuardSelfTest"
+    let evSelfTestIndex = 0x7FFD
+    info "eventGuardSelfTest is ON: about to dispatch to a DELIBERATELY " &
+         "faulting event handler. Two FAULTED lines and a live client after " &
+         "them is the PASS; a dead client here is the FAIL."
+    tablesLock()
+    gSubs.add Sub(name: evSelfTestEvent, cb: cEvSelfTestCb(),
+                  user: cast[Il2CppPtr](0), modIndex: evSelfTestIndex,
+                  faults: 0)
+    tablesUnlock()
+    if cEvInGuard() != 0'i32:
+      warn "eventGuardSelfTest: this thread is ALREADY inside an " &
+           "aowl_p_p_seh, so the dispatch would take the nested path and " &
+           "prove nothing. INCONCLUSIVE -- not run."
+    else:
+      let first = deliverEvent(evSelfTestEvent, "{}", -1)
+      let second = deliverEvent(evSelfTestEvent, "{}", -1)
+      let third = deliverEvent(evSelfTestEvent, "{}", -1)
+      if first == 1 and second == 1 and third == 0:
+        okLog "eventGuardSelfTest PASS: the faulting handler was called " &
+              "twice, both faults were caught, the process is alive to say " &
+              "so, and the third dispatch reached 0 subscribers -- it was " &
+              "unsubscribed at the limit."
+      else:
+        warn "eventGuardSelfTest: the process SURVIVED (the guard held), but " &
+             "the delivery counts were " & $first & "/" & $second & "/" &
+             $third & " where 1/1/0 was expected. The catch is proven; the " &
+             "unsubscribe bookkeeping is NOT."
   betaNoticeReadFlags()
   # The breadcrumb file: a second, independent witness for the log's tail.
   #
@@ -9346,6 +9521,22 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
       splWantShowHook()
       modLoadWantShowHook()
       arWantShowHook()
+      # The MenuScreen::Show site index is verified BY NAME here and only then
+      # handed to modeskip, which cannot see `UihSiteMenuShow` at all (it is
+      # included before uihooks.nim, so that constant and that header's C
+      # accessors are both out of scope there). A row inserted above it makes
+      # this REFUSE and say so, rather than subscribing to another function.
+      block:
+        let mshowName = readCString(cUihSiteName(int32(UihSiteMenuShow)))
+        if iContains(mshowName, "MenuScreen::Show"):
+          modeSkipWantShowHook(UihSiteMenuShow)
+        elif gModeSkipOn:
+          warn "skip mode screen: uihooks site " & $UihSiteMenuShow &
+               " reads \"" & mshowName & "\", which is not a " &
+               "MenuScreen::Show site, so the cached-controller DROP is NOT " &
+               "armed. The freshness rule (a new controller .ctor before any " &
+               "re-answer) still applies, so this is a lost safety net, not " &
+               "an unsafe path."
       uihArm(true)
       splShowHookVerdict()
       modLoadShowHookVerdict()

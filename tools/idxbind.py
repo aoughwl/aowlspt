@@ -80,6 +80,21 @@ TABLES = [
     # three more tables with real positional constants and no binding check at
     # all. That report is the tool working: an unchecked table looks exactly
     # like a checked one, which is why the coverage sweep at the bottom exists.
+    # autoraid's PRE-MENU dismissal: ONE row today. Registered anyway, and
+    # deliberately: a one-row table is exactly the table someone appends a
+    # second row to later, and the coverage sweep at the bottom of this file
+    # FAILS the build for an unregistered array precisely so that the second
+    # row cannot arrive unguarded.
+    {
+        "mode": "positional",
+        "header": "abi/aowlspt_premenu.h",
+        "array": "aowl_pmn_targets",
+        "const_prefix": "PmnT",
+        "const_file": "host/Aowlspt.Host.Il2Cpp/autoraid.nim",
+        "expect_file": None,
+        "users": ["host/Aowlspt.Host.Il2Cpp/autoraid.nim"],
+        "accessors": ["cPmnFn", "cPmnName", "cPmnRva"],
+    },
     {
         "mode": "positional",
         "header": "abi/aowlspt_modeskip.h",

@@ -223,6 +223,12 @@ var gModeSkipStarved = false
 var gModeSkipCtorLogged = false
 var gModeSkipBoundLogged = false        ## the answer-bound message, once
 var gModeSkipCtors = 0                 ## controller constructions observed
+var gModeSkipCtorsAtSubmit = 0         ## `gModeSkipCtors` when Submit was sent
+var gModeSkipStaleLogged = false       ## the stale-controller refusal, once
+var gModeSkipMenuEpoch = 0             ## last seen uihooks MenuScreen::Show epoch
+var gModeSkipMenuSiteOk = false        ## the site was verified BY NAME
+var gModeSkipMenuSite = -1             ## its index, handed over by the caller
+var gModeSkipCleared = 0               ## caches dropped on a menu-show event
 var gModeSkipShows = 0                 ## ShowSlot firings observed
 var gModeSkipSubmittedAtLogMs = 0'u64  ## last Submit time, kept for the log
                                        ## after the re-arm clears the gate
@@ -412,6 +418,35 @@ proc modeSkipShowSlotFired(regs: Il2CppPtr) =
              "loop against a screen that keeps returning is not something " &
              "this host will run. The stock screen is left for the player."
       return
+    # THE CONTROLLER MUST BE FRESH. MEASURED 2026-09-02: a build that re-armed
+    # on ANY re-showing died 2 of 2 boots at ~36 s, on the drain line for menu
+    # arrival, with `mono_class_has_parent` inside GameAssembly. That is the
+    # signature of a class read on a FREED managed object: the controller was
+    # captured from its .ctor at ~26 s, the first screen was answered and torn
+    # down, and a second showing ten seconds later made this feature call
+    # `Submit` on the DEAD pointer it still had. The pd is fresh (the game just
+    # handed it to us in R9); the CONTROLLER is not, and nothing in a pointer's
+    # bits says it has been collected.
+    #
+    # So a re-showing is only answerable if the client built a NEW controller
+    # for it -- an event this feature OBSERVES, from the .ctor postfix. If it
+    # did not, we decline and say exactly that. Declining is what the previous
+    # build did (it switched itself off); this keeps the feature alive for a
+    # later, genuinely new screen, and never presses on a stale pointer.
+    if gModeSkipCtors <= gModeSkipCtorsAtSubmit:
+      if not gModeSkipStaleLogged:
+        gModeSkipStaleLogged = true
+        warn "skip mode screen: ShowSlot fired again after Submit, but NO new " &
+             "CharacterSelectionScreenController has been constructed since " &
+             "(constructions=" & $gModeSkipCtors & ", at last Submit=" &
+             $gModeSkipCtorsAtSubmit & "). The controller this feature holds " &
+             "is the one it already answered and the client may have destroyed " &
+             "it. NOT ANSWERING: calling Submit on a freed object is a " &
+             "`mono_class_has_parent` crash inside GameAssembly, MEASURED " &
+             "2026-09-02 at ~36s on 2 of 2 boots. The screen is left for the " &
+             "player, or for autoraid's CHARACTER step, which presses live UI " &
+             "and holds no cached pointer."
+      return
     gModeSkipSubmittedAtMs = 0'u64
     gModeSkipSubmittedFor = nil
     gModeSkipPending = false
@@ -460,17 +495,72 @@ proc modeSkipSubmitBody(a: Il2CppPtr): Il2CppPtr {.
          "the selection screen is left for the player to use."
     gModeSkipOff = true
     return
+  # RE-VALIDATE BOTH POINTERS AT THE POINT OF USE, not at the point of capture.
+  # A pointer that was good on the frame it was captured says nothing about the
+  # frame it is used on, and this call is the one that killed the client.
+  # Readability is not liveness -- a freed object can stay mapped -- so this is
+  # a floor, not a proof; the ONLY real guard is the freshness rule above.
+  if cIsReadable(gModeSkipController, 0x30'i32) == 0'i32 or
+     cIsReadable(gModeSkipPendingPd, 0x30'i32) == 0'i32:
+    warn "skip mode screen: REFUSING to call Submit -- the controller (0x" &
+         hexOf(cast[uint64](gModeSkipController)) & ") or the profile data (0x" &
+         hexOf(cast[uint64](gModeSkipPendingPd)) & ") is no longer readable at " &
+         "the moment of use. Nothing was called; the selection screen is left " &
+         "for the player."
+    gModeSkipController = nil
+    gModeSkipPendingPd = nil
+    return
   cMskCallSubmit(fn, gModeSkipController, gModeSkipPendingMode,
                  gModeSkipPendingPd)
   gModeSkipSubmittedAtMs = cNowMs()
   gModeSkipSubmittedAtLogMs = gModeSkipSubmittedAtMs
+  gModeSkipCtorsAtSubmit = gModeSkipCtors
   inc gModeSkipSubmits
+
+proc modeSkipWantShowHook(site: int) =
+  ## Subscribe to `EFT.UI.MenuScreen::Show` (5-arg) so that the cached
+  ## controller can be DROPPED the moment the main menu is up: the selection
+  ## screen is gone by then, and a pointer to a screen the client has torn down
+  ## is exactly what killed the client on 2026-09-02.
+  ##
+  ## THE SITE INDEX IS PASSED IN, AND VERIFIED BY NAME BY THE CALLER. It cannot
+  ## be resolved here: `uihooks.nim` is included AFTER this file, so neither its
+  ## `UihSite*` constants nor the C accessors from its header are in scope at
+  ## this point in the translation unit (procs resolve module-wide; constants,
+  ## module-level vars and `{.emit.}`ed C declarations do not). Writing a bare
+  ## `2` here and hoping would be exactly the positional-index bug the build's
+  ## idxbind gate exists to prevent -- so the caller reads the site's own NAME
+  ## back and only then hands the index over.
+  if not gModeSkipOn: return
+  gModeSkipMenuSite = site
+  gModeSkipMenuSiteOk = true
+  uihWant(site)
+
+proc modeSkipMenuTick() =
+  ## ONE integer compare per drain tick. When the main menu shows, everything
+  ## this feature cached about the selection screen is presumed DEAD.
+  if not gModeSkipMenuSiteOk: return
+  let ep = uihEpoch(gModeSkipMenuSite)
+  if ep == gModeSkipMenuEpoch: return
+  gModeSkipMenuEpoch = ep
+  if gModeSkipController == nil and not gModeSkipPending: return
+  gModeSkipCleared = gModeSkipCleared + 1
+  gModeSkipController = nil
+  gModeSkipPendingPd = nil
+  gModeSkipPending = false
+  gModeSkipSubmittedFor = nil
+  okLog "skip mode screen: MenuScreen::Show fired (uihooks site 2, epoch " &
+        $ep & ") -- the main menu is up, so the character/mode screen is gone " &
+        "and every pointer this feature cached about it is DROPPED (drop " &
+        $gModeSkipCleared & "). Nothing stale can be Submitted to. A later " &
+        "showing is answered only after a NEW controller .ctor."
 
 proc modeSkipDrainTick() =
   ## Rides the `EFT.TarkovApplication::Update` drain (slot alias, no second
   ## detour). Cheap when idle: two integer compares.
   if gModeSkipOff or not gModeSkipOn:
     return
+  modeSkipMenuTick()
   inc gModeSkipTicks
 
   if not gModeSkipPending:

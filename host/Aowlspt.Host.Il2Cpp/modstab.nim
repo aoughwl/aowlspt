@@ -4949,7 +4949,12 @@ proc bindModsTab(verbose: bool): bool =
   result = false
   if gModsSlot >= 0:
     return true
-  if not (gModsOn or gVerOn or gSeasonsOn or gGfxOn or gBetaNoticeOn):
+  # `gNtOn` BELONGS IN THIS LIST. Without it, a session with ONLY nativeTabs
+  # on never binds the rider at all, so `ntTick` is never called and native
+  # tabs does nothing while every one of its own logs says it armed fine. It
+  # was masked in testing because settingsPostFxSubtab happened to be on too,
+  # which is exactly the kind of accident that ships a dead feature.
+  if not (gModsOn or gVerOn or gSeasonsOn or gGfxOn or gBetaNoticeOn or gNtOn):
     return false
   if gDebugUiSlot >= 0:
     gModsSlot = gDebugUiSlot
