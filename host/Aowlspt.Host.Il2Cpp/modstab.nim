@@ -201,6 +201,12 @@ var gModsReapCaption: seq[string] = @[]
 ## fighting over does not need a poll for the rest of the session.
 var gModsLabelFrames = 0
 var gModsLabelStable = 0
+## How many times the re-assert poll has SAID it put a caption back.
+## Capped, because the point is evidence that the mechanism runs at
+## all -- its only other log line fires at stability, so silence from
+## it was indistinguishable from success and hid two dead gates.
+var gModsReassertSaid = 0
+const ModsReassertSayMax = 6
 const ModsLabelEveryFrames = 60
 const ModsStableEnough = 10
 
@@ -1896,6 +1902,14 @@ proc modsReassertLabels() =
     if wantS > 0 and haveS > wantS:
       strayRemaining = strayRemaining + 1
     s = s + 1
+  if clobbered > 0 and gModsReassertSaid < ModsReassertSayMax:
+    inc gModsReassertSaid
+    okLog "mods label re-assert: PUT BACK " & $clobbered & " caption(s) of " &
+          "the " & $gModsLabelTmp.len & " registered -- something had " &
+          "rewritten them since they were set. THE POLL RAN AND DID WORK; " &
+          "this line is the proof it is reachable, which is exactly what was " &
+          "missing while it sat behind two gates (report " &
+          $gModsReassertSaid & " of " & $ModsReassertSayMax & ")."
   if clobbered == 0 and reaped == 0 and strayRemaining == 0:
     inc gModsLabelStable
     if gModsLabelStable == ModsStableEnough:
@@ -4993,9 +5007,40 @@ proc modsBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_mods_body", cdecl.} =
 
 proc modsTabTick() =
   ## The rider's entry, called every frame from the shared
-  ## `EFT.UI.PreloaderUI::Update` detour. When the feature is off this does not
-  ## enter the guard at all.
-  if not gModsOn or gModsFaults >= ModsMaxFaults:
+  ## `EFT.UI.PreloaderUI::Update` detour. When the feature is off AND there is
+  ## nothing registered to re-assert, this does not enter the guard at all.
+  ##
+  ## THE SECOND GATE. A previous change ungated the re-assert poll inside
+  ## `modsTabTickBody` and it still never ran, because THIS line returns first
+  ## and the guarded body is never entered at all. Measured 2026-09-02:
+  ## `hostcfg.py show` reports `settingsModsTab off` / `settingsPages on`; the
+  ## host log shows 14 `settings pages: row caption ... written` lines and
+  ## acceptance then found 14 rows reading the donor's caption again, with no
+  ## re-assert line anywhere in between. Removing the inner gate while leaving
+  ## this one is why "the poll is now ungated" was still a poll that could not
+  ## run -- a fix that reads as complete and changes nothing.
+  ##
+  ## MEASURED, on one of those failing rows (inspector `tree`):
+  ##   Settings Drop Down(Clone)(Clone)
+  ##     Text        <- the ROW LABEL; reverted to 'Interface language'
+  ##     Dropdown/Text and Dropdown/Element/Text  <- KEPT our caption
+  ## All three were written and all three read back correct at write time, so
+  ## the row label alone is being rewritten afterwards -- it is the one bound
+  ## to the control's LocalizedText `_labels[0]`. `localizationKey`@0x70
+  ## (fldoff, self-check passed) reads EMPTY on that component AND on the
+  ## stock row's, so the key is not the source and rewriting it would be
+  ## writing a field nothing reads. The registry-driven poll is the mechanism
+  ## that actually covers this, which is why it is made reachable rather than
+  ## replaced.
+  ##
+  ## Entering the guard costs one `aowl_p_p_seh` per frame in a session that
+  ## has rows registered; `modsReassertLabels` is throttled to one pass every
+  ## ModsLabelEveryFrames frames and switches itself off after
+  ## ModsStableEnough clean passes, so a settled screen stops paying almost at
+  ## once. With nothing registered the behaviour is exactly as before.
+  if gModsFaults >= ModsMaxFaults:
+    return
+  if not gModsOn and gModsLabelTmp.len == 0:
     return
   gModsBranch = 1
   if cModsGuarded(cast[Il2CppPtr](0)) == nil:
