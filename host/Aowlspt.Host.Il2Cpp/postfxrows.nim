@@ -403,7 +403,12 @@ proc pfxMakeRow(prefab, parent: Il2CppPtr; r: PfxRow; idx: int32;
   # and renders as itself. A raw `m_text` store would be clobbered by
   # `LocalizedText`, which is why the setter is called rather than the field
   # written.
-  let cap = (if r.presetOwned: "* " else: "") & r.label
+  # VANILLA CAPTION, NO MARKER. The `"* "` prefix that used to go here marked
+  # a row as owned by the active Preset -- a real fact, encoded in a way that
+  # makes our page look unlike every other page in this screen. No stock
+  # settings row carries a sigil, and the user asked for vanilla. The fact is
+  # not lost: it goes to the log below, where it costs the player nothing.
+  let cap = r.label
   if not nuRowSetText(row, cap):
     warn "postfx rows: SetText refused for '" & r.key & "'; the row would " &
          "carry the PREFAB's own caption, which reads as a stock setting " &
@@ -538,32 +543,99 @@ proc pfxBuild(): bool =
                  "an unreachable row kind). Nothing is left in the panel.")
     discard pfxDestroyAll()
     return
-  # THE BANNER, last, and only once there is something for it to caption. It is
-  # the one from-scratch element left in this file, and it exists to say on
-  # screen what the rows cannot do -- a page that quietly shows unbound knobs
-  # is the same defect as a control that quietly does nothing.
-  let donor = pfxDonorTmp()
-  if donor != nil and gGfxPostGo != nil:
-    var declinedTxt = ""
-    var d = 0
-    while d < gPfxDeclined.len and d < 8:
-      declinedTxt = declinedTxt & (if d > 0: ", " else: "") & gPfxDeclined[d]
-      d = d + 1
-    let b = nuLabel(gGfxPostGo, donor, 60.0'f32, -60.0'f32, 1700.0'f32,
-                    40.0'f32,
-                    "aowlspt post-process - " & $built & " row(s) built from " &
-                    "the game's own settings prefabs. The values are the mod's " &
-                    "DECLARED DEFAULTS, not your saved config, and the rows " &
-                    "are NOT BOUND yet - moving one changes nothing. " &
-                    "* = owned by the active Preset and ignored until " &
-                    "Preset = custom. No row for: " &
-                    (if declinedTxt.len > 0: declinedTxt else: "-") &
-                    " (dropdown binds are generic and have no address).",
-                    18.0'f32, 1.0'f32, 0.78'f32, 0.35'f32, 1.0'f32,
-                    "aowl-pfx-banner")
-    if nuLive(b):
-      gPfxBanner = b
-      gPfxHaveBanner = true
+  # THE BANNER IS GONE, AND ITS SENTENCE IS HERE INSTEAD.
+  #
+  # MEASURED on the deployed build (user report + live rect): the from-scratch
+  # `nuLabel` at y=-60 h=40 named "aowl-pfx-banner" DID NOT RENDER, and its
+  # slot left an empty ~60px band above the first row. So it cost a visible
+  # defect and delivered nothing. It was also the ONE from-scratch element in
+  # a file whose whole thesis is "instantiate the game's own prefabs"; a label
+  # built out of nothing is exactly the thing that does not inherit the
+  # wiring that makes stock text appear.
+  #
+  # Everything it was trying to say is a fact about OUR build, not about the
+  # player's screen, so it belongs in the log. Nothing is suppressed: the
+  # preset-owned rows and the declined row kinds are both named below.
+  var declinedTxt = ""
+  var d = 0
+  while d < gPfxDeclined.len and d < 8:
+    declinedTxt = declinedTxt & (if d > 0: ", " else: "") & gPfxDeclined[d]
+    d = d + 1
+  var presetOwnedTxt = ""
+  var po = 0
+  var pi2 = 0
+  while pi2 < rows.len and pi2 < 64:
+    if rows[pi2].presetOwned:
+      po = po + 1
+      if po <= 8:
+        presetOwnedTxt = presetOwnedTxt & (if po > 1: ", " else: "") &
+                         rows[pi2].key
+    pi2 = pi2 + 1
+  okLog "postfx rows: NO BANNER and NO CAPTION PREFIX -- the page is vanilla. " &
+        "The from-scratch 'aowl-pfx-banner' label did not render and its " &
+        "40px slot at y=-60 was the empty band above the first row, so it " &
+        "cost a visible defect and said nothing; the '* ' prefix marked " &
+        "preset-owned rows in a way no stock row does. Both facts live here " &
+        "now: " & $built & " row(s) built, values are the mod's DECLARED " &
+        "DEFAULTS rather than the saved config, and the rows are NOT BOUND " &
+        "-- moving one changes nothing yet. Owned by the active Preset and " &
+        "ignored until Preset=custom (" & $po & "): " &
+        (if presetOwnedTxt.len > 0: presetOwnedTxt else: "-") &
+        ". No row for: " & (if declinedTxt.len > 0: declinedTxt else: "-") &
+        " (dropdown and select-slider binds are generic and have no offline " &
+        "address)."
+  # THE SCROLL VERDICT, and it can FAIL.
+  #
+  # MEASURED USER REPORT: the Graphics body scrolls and the PostFX body does
+  # not. The falsifiable question is NOT "does it look scrollable" -- it is
+  # "is the container our rows went into the SAME RectTransform the panel's
+  # ScrollRect is told to scroll", i.e. `ScrollRect.m_Content@0x20`
+  # (MEASURED `fldoff.py fields UnityEngine.UI.ScrollRect`). If our rows are
+  # in a sibling of the content, no amount of height makes them scroll, and
+  # nothing about the RECT would have told us so -- §3's warning that
+  # Graphics' and PostFX's geometry agree only by arithmetic coincidence at
+  # this window height is exactly why a rect-derived answer here is worthless.
+  #
+  # INTENDED FINISHED PAGE, stated so the verdict has something to judge:
+  # ShowScreen(PostFX) makes the game build its OWN stock PostFX rows into
+  # `_settingsRoot@0xa0` first; ours are instantiated into the SAME root and
+  # therefore land after them; all of it is inside the ScrollRect's content,
+  # whose height is driven by the content's own layout, and no row is outside
+  # the viewport's clipping parent. In the build this replaces the stock rows
+  # NEVER EXISTED, because the panel was only ever `SetActive`d and
+  # `PostFXSettingsTab::Show`/`OnFirstSelect` never ran.
+  #
+  # FAIL looks like: `m_Content` naming something other than `_settingsRoot`.
+  # INCONCLUSIVE looks like: no ScrollRect found, or the field unreadable --
+  # which is NOT a pass.
+  let sr = (if gGfxPostT != nil and duOk(gGfxPostT, 0x20'i32):
+              modsComponent(gGfxPostT, "ScrollRect") else: nil)
+  if sr == nil:
+    warn "postfx rows SCROLL VERDICT INCONCLUSIVE: no ScrollRect component " &
+         "was found on the 'PostFX Settings' panel, so whether our row " &
+         "parent is the thing that scrolls could not be asked. The Graphics " &
+         "body scrolls and this one does not; that difference is unexplained " &
+         "and this line is the reason it is not being guessed at."
+  elif not nuOk(sr, NuOffScrollContent + 8'i32):
+    warn "postfx rows SCROLL VERDICT INCONCLUSIVE: the panel's ScrollRect " &
+         "was found but m_Content@0x20 could not be read. 'I could not look' " &
+         "is not a pass."
+  else:
+    let content = cNuGetRef(sr, NuOffScrollContent)
+    if content == parent:
+      okLog "postfx rows SCROLL VERDICT PASS: the panel's " &
+            "ScrollRect.m_Content@0x20 IS _settingsRoot@0xa0, the container " &
+            "our rows were instantiated into, so every row is inside the " &
+            "thing that scrolls. Read off the live component, not off a rect."
+    else:
+      warn "postfx rows SCROLL VERDICT FAIL: the panel's " &
+           "ScrollRect.m_Content@0x20 is " & iPtr(content) & " ('" &
+           iObjName(content) & "') but our rows went into _settingsRoot@0xa0 " &
+           "at " & iPtr(parent) & " ('" & iObjName(parent) & "'). Our rows " &
+           "are NOT in the scrolled content, which is why this page does not " &
+           "scroll while Graphics does -- and no change to heights, fitters " &
+           "or layout groups can fix that. The row parent has to become the " &
+           "content the ScrollRect names."
   gPfxBuilt = true
   okLog "postfx rows: built " & $built & " NATIVE PREFAB row(s) into " &
         "PostFXSettingsTab._settingsRoot -- " &

@@ -639,6 +639,63 @@ typedef struct AowlNuTarget {
 #define AOWL_NU_CG_SET_INTERACTABLE   65
 #define AOWL_NU_CG_SET_BLOCKSRAYCASTS 66
 
+/* --- THE PANEL SWITCH AND THE SILENT SELECT (indices 67..70) --------------
+ *
+ * docs/SETTINGS-UI-MAP.md §7.9 named exactly this gap: this table carried
+ * `Toggle::Set` and `Toggle::set_group` but NOT the panel-switch API, so the
+ * host had no way to switch a stock tab except by pressing a toggle -- which
+ * is how the phantom "subtab pressed by the player" line was produced.
+ *
+ * ShowScreen (§2.4, `R disasm 0x1720de0`) does OLD-OFF -> EnsureTabInitialized
+ * -> `_currentTab@0x118 = _tabs[group].Tab` -> NEW-ON, and keeps
+ * `ScreenController[+0x60]` consistent. `<Awake>b__1` passes exactly
+ * (rcx=screen, edx=group, r8=NULL), so a NULL MethodInfo* is what the game
+ * itself passes.
+ *
+ * ToggleSilently (§1.6) is the ONE correct way to move a subtab highlight:
+ * MEASURED `R disasm 0x16bcba0` -- get_SpawnedObject, then
+ * `Toggle::Set(tog, value, sendCallback=0)` (`xor r8d,r8d`), then, iff
+ * `m_Transition@0x50 == 3`, `AnimatedToggle::TriggerAnimation`. It is
+ * byte-for-byte `AnimatedToggle::set_IsToggled` @0x16AD190 with the callback
+ * flag flipped -- and set_IsToggled's `mov r8b,1` is MEASURED to be why every
+ * highlight we applied re-entered our own drain as a fresh player press.
+ * NOTE: it THROWS (call 0x5D2530, the null-ref helper) when the spawner has no
+ * spawned object, and a managed throw does not trip aowl_p_p_seh (§5 T9), so
+ * the caller must establish the spawned toggle exists first.
+ *
+ * SetToggleGroup (§6.2.1) is the REGISTERING join -- unregister-from-old,
+ * store m_Group, register-into-new. `set_group` @0x55B9D30 writes the field
+ * only, which is precisely the §5 T3 throw on the next Set().
+ *
+ * All four MEASURED UNIQUE (`R shared`), bytes from `R bytes <RVA> 16`. */
+#define AOWL_NU_SCREEN_SHOWSCREEN     67
+#define AOWL_NU_TAB_SET_ISSELECTED    68
+#define AOWL_NU_SPAWNER_TOGGLESILENT  69
+#define AOWL_NU_TOGGLE_SETTOGGLEGROUP 70
+
+/* --- THE CLOSE PATH (indices 71..72) --------------------------------------
+ *
+ * Three client deaths on 2026-09-02 (12:11, 12:42, 14:52) each followed
+ * CLOSING the settings screen with objects of ours in it, and at 14:51 the
+ * inspector's press of BackButton reported a fault inside `UnityEvent::Invoke`
+ * with NO managed exception in the client's own log. `CloseAll` (§2.8,
+ * `R disasm 0x17207a0`) calls each initialized tab's `Close()` -> vtable
+ * `klass+0x288` -> `CleanupCreatedControls` -> `Object::Destroy` on every entry
+ * of `_createdControls@0x88`, then clears `_initializedTabs` and nulls
+ * `_currentTab@0x118`. It never calls `set_IsSelected(false)`.
+ *
+ * MEASURED `R disasm 0x1720b10`: `SettingsScreen::Close()` calls
+ * `CloseAll()` at +0x2F and then nulls `_session@0x120` and
+ * `_profileInfo@0x128`. Both UNIQUE (`R shared`).
+ *
+ * SO THE PAIR IS TWO DETOURS ON TWO DIFFERENT FUNCTIONS, never two on one:
+ * a PREFIX on `Close` ("entered", and the moment to unregister our toggles
+ * while everything is still alive) and a POSTFIX on `CloseAll` ("the cleanup
+ * returned"). "Entered" without "returned" is a throw or fault unwound
+ * through the close, which is exactly the shape that was invisible before. */
+#define AOWL_NU_SCREEN_CLOSE          71
+#define AOWL_NU_SCREEN_CLOSEALL       72
+
 /* UnityEngine.RenderMode. Named, because `0` appearing bare in a refusal is
  * indistinguishable from "we did not read anything". */
 #define AOWL_NU_RENDERMODE_OVERLAY   0
@@ -916,6 +973,26 @@ static const AowlNuTarget aowl_nu_targets[] = {
     { "UnityEngine.CanvasGroup::set_blocksRaycasts", 0x5580BD0u,
       { 0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,
         0xEF,0x71,0xB5 }, 16 },
+    /* --- the panel switch. See AOWL_NU_SCREEN_SHOWSCREEN. --- */
+    { "EFT.UI.Settings.SettingsScreen::ShowScreen", 0x1720DE0u,
+      { 0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x74,0x24,0x10,0x57,0x48,0x83,
+        0xEC,0x30,0x80 }, 16 },
+    { "EFT.UI.Settings.SettingsTab::set_IsSelected", 0x171BCA0u,
+      { 0x48,0x89,0x5C,0x24,0x10,0x56,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,
+        0x37,0x88,0x9B }, 16 },
+    { "EFT.UI.UIAnimatedToggleSpawner::ToggleSilently", 0x16BCBA0u,
+      { 0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20,0x80,0x3D,0xFD,
+        0x15,0xA0,0x05 }, 16 },
+    { "UnityEngine.UI.Toggle::SetToggleGroup", 0x55BA150u,
+      { 0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x6C,0x24,0x10,0x48,0x89,0x74,
+        0x24,0x18,0x57 }, 16 },
+    /* --- the close path. See AOWL_NU_SCREEN_CLOSE. --- */
+    { "EFT.UI.Settings.SettingsScreen::Close", 0x1720B10u,
+      { 0x40,0x53,0x48,0x83,0xEC,0x20,0x80,0x3D,0x02,0xD9,0x99,0x05,0x00,
+        0x48,0x8B,0xD9 }, 16 },
+    { "EFT.UI.Settings.SettingsScreen::CloseAll", 0x17207A0u,
+      { 0x40,0x53,0x48,0x83,0xEC,0x20,0x80,0x3D,0x70,0xDC,0x99,0x05,0x00,
+        0x48,0x8B,0xD9 }, 16 },
 };
 
 #define AOWL_NU_TARGET_COUNT \

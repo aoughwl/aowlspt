@@ -4027,6 +4027,16 @@ proc iCmdComponentBody(toks: seq[string]): bool =
   # bind" and only the two FOUND paths say `return true`; the wrapper turns
   # that false into an out-loud UNBOUND line. An unbind nobody announces is
   # the same defect one step later.
+  #
+  # PRE-EXISTING BUILD BREAK, fixed here on 2026-09-02 and NOT part of the
+  # change this commit is about. The comment above says "`result` defaults to
+  # false", and nimony no longer accepts that as a proof: it rejected all nine
+  # bare `return`s in this body with "cannot prove that result has been
+  # initialized". MEASURED: `python tools/buildlock.py build host` fails with
+  # exactly these nine errors on this branch with EVERY unrelated change
+  # stashed, so the branch as committed does not compile. Writing the default
+  # the comment already claimed is the whole fix and changes no behaviour.
+  result = false
   iSetVar("comp", 0'u64)
   if toks.len < 3:
     iErr("usage: component EXPR TypeName   (e.g. component $g0 Button)")

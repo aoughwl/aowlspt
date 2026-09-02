@@ -346,6 +346,21 @@ proc suiTabInitBody(a: Il2CppPtr): Il2CppPtr {.
   # work below so a fault in that work can never suppress the hide.
   swCrumb("STAGE: modsNativeOnShowScreen group=" & $int(group))
   modsNativeOnShowScreen(group)
+  # NATIVE TABS' GRAPHICS SUBTAB STRIP rides this SAME postfix -- it installs
+  # NOTHING of its own on ShowScreen. §7.9 / the double-detour rule: a second
+  # physical detour here would overwrite this one's trampoline and silently
+  # kill Phase 1/2/3. Already inside this body's ONE `aowl_p_p_seh`; it must
+  # not open another, and it does not (the guard is not re-entrant, and a
+  # nested one DISARMS the outer).
+  #
+  # This is the ONE place strip visibility and highlight are decided, because
+  # it is the only event that fires for all three routes into a group: the
+  # player's tab click, our own ShowScreen call, and `OpenGroup` when the
+  # screen first opens (§2.7). The toggle edge this replaced could see only
+  # the first, which is why the strip never appeared when Settings opened
+  # straight onto GRAPHICS.
+  swCrumb("STAGE: ntOnShowScreen group=" & $int(group))
+  ntOnShowScreen(cast[Il2CppPtr](selfPtr), group)
 
   let gname = readCString(cSuiGroupName(group))
   let off = cSuiGroupTabOffset(group)

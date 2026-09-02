@@ -1590,7 +1590,15 @@ var gNtFlagOn = false
 ## include boundary; variables do not.
 var gNtOn = false                ## `nativeTabs`, after the bind succeeded
 var gNtOff = false               ## self-disabled after the fault ceiling
-const KindMaxFeature = 29
+## THE CLOSE PAIR (kinds 30 and 31). A PREFIX on `SettingsScreen::Close`
+## @0x1720B10 and a POSTFIX on `SettingsScreen::CloseAll` @0x17207A0 -- two
+## detours on two DIFFERENT functions. Both MEASURED UNIQUE, and nothing else
+## in this host patches either. "Close entered" without "CloseAll returned" is
+## a throw or fault unwound through the close, which is the shape all three of
+## 2026-09-02's deaths had and which nothing could see.
+var gNtCloseSlot = -1
+var gNtCloseAllSlot = -1
+const KindMaxFeature = 31
   ## The highest `kind` that `attachDrain` treats as a FEATURE detour rather than
   ## as the main-thread update drain. Bump this when a new kind is added, and
   ## nothing else in `attachDrain` needs touching: the two places that used to
@@ -4180,6 +4188,15 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
   if i == gNtToggleSlot:
     ntToggleSetFired(regs)
     return 0'i32
+  # THE SETTINGS CLOSE, PREFIX half, by identity. This is the LAST moment every
+  # object of ours and every stock list that references one are both still
+  # alive: `CloseAll` runs a few instructions later and Destroys the rows in
+  # each tab's `_createdControls`. Read-only with respect to the game's own
+  # state except for the unregister, which is the game's own
+  # `Toggle::SetToggleGroup(null)`. Never suppresses the original.
+  if i == gNtCloseSlot:
+    ntSettingsCloseEntered(regs)
+    return 0'i32
   if i == gBotAiSlot:
     botAiPreActivateFired(regs)
     return 0'i32
@@ -4385,6 +4402,12 @@ proc patchReturned(slot: int32; regs: Il2CppPtr): int32 {.
   # 0 always -- a postfix drain that never changes what the caller gets. With
   # `natespDeployProbe` off, `gNdpBound` is 0 and this costs one compare.
   if ndpSlotFired(int32(i)):
+    return 0'i32
+  # THE SETTINGS CLOSE, POSTFIX half, on the OTHER function: `CloseAll`
+  # returned. Its handler reads no register and touches no game memory -- one
+  # counter and one flag -- so it needs no guard, and it returns 0 always.
+  if i == gNtCloseAllSlot:
+    ntSettingsCloseAllReturned()
     return 0'i32
   if i == gModeSkipCtorSlot:
     modeSkipCtorFired(regs)
@@ -5728,6 +5751,10 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
     lpNoteSlot(claimed)
   elif kind == 28:
     gNtToggleSlot = int(claimed)
+  elif kind == 30:
+    gNtCloseSlot = int(claimed)
+  elif kind == 31:
+    gNtCloseAllSlot = int(claimed)
   elif kind == 29:
     # THE DEPLOY-ORDER BREADCRUMB (nedeploy.nim). One kind for ALL four rows,
     # the same shape as uihooks and loadperf above: the row being bound is
@@ -9576,6 +9603,12 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
                "OFF for this session. Nothing was patched and nothing was " &
                "changed; the settings screen is exactly the screen the game " &
                "builds."
+        else:
+          # THE CLOSE PAIR, immediately after and only if the feature is live.
+          # A partial bind is reported by `ntBindCloseProbe` itself and is not
+          # fatal: without it the close is merely as invisible as it has
+          # always been, which is a lost instrument, not a broken feature.
+          discard ntBindCloseProbe(false)
       if gAuOn:
         bindAowlUi(true)
       # The native-UI toolkit's readiness report, in the same region and for the

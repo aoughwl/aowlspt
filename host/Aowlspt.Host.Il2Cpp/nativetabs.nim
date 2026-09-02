@@ -360,6 +360,88 @@ var gNtKbVerdictSaid = false
 var gNtKbPressed = -1               ## 1 = shown, 0 = hidden, -1 = nothing
 var gNtToggleSlotFaults = 0
 
+## ===========================================================================
+## STEP 5 -- THE GRAPHICS SUBTABS, REBUILT ON THE GAME'S OWN MECHANISM.
+##
+## THE VERDICTS ARE WRITTEN HERE, BEFORE THE CODE, and every one of them names
+## the input that makes it FAIL. A check whose failing input cannot be stated
+## is not a check (CLAUDE.md 9b). All are judged AT LEAST ONE FRAME after the
+## change (`NtVerdictDelay`), because a LayoutGroup rebuild is deferred to
+## `willRenderCanvases` and `Object.Destroy` to end of frame -- a same-frame
+## read is INCONCLUSIVE, never PASS.
+##
+##  P1  Exactly one of the SettingsScreen children named `* Settings` reports
+##      activeInHierarchy, plus our own panel if one of our tabs is up.
+##      FAILS ON: two active (the GAME-over-GRAPHICS overlay), or zero (blank).
+##  P2  `_currentTab@0x118` is non-null and its GameObject is that panel.
+##      FAILS ON: we SetActive'd a panel without telling the game, so
+##      `_currentTab` names a different one -- exactly what the old
+##      hide-all-then-show-one did.
+##  P3  Exactly one toggle in the STOCK tab-bar ToggleGroup reads
+##      `m_IsOn@0x120 != 0`, and while the PostFX panel is up it is GRAPHICS.
+##      FAILS ON: ShowScreen(PostFX) leaving the hidden stock POSTFX toggle on
+##      and GRAPHICS off, so the top row lights nothing.
+##  P4  Exactly one toggle in OUR cloned subtab group reads m_IsOn, and the
+##      panel that is up is the one that subtab names.
+##      FAILS ON: zero (a press never reached m_IsOn) or two (nothing is
+##      enforcing exclusivity), or the strip saying POSTFX while Graphics is up.
+##  P5  No TMP under a page of ours still reads the donor's caption.
+##      FAILS ON: a relabel that "landed" without changing the glyphs -- this
+##      repo's signature defect. Enforced for the keybind page by comparing
+##      each row's `_keyName` against the template's captured text.
+##  P6  The strip's `childCount == 2`. FAILS ON: cloning two more
+##      ControlToggles beside the two the clone already carried (§5 T12 -- it
+##      is 4 today, and 2 of those 4 are toggles we never reparented).
+##  P7  The strip's parent carries no LayoutGroup, OR the strip's
+##      LayoutElement has ignoreLayout set. FAILS ON: reading it back off the
+##      resulting rect instead of off the component, which is measuring a
+##      coincidence (§3: Graphics and PostFX agree on height only because
+##      1010-225 == 785 at this window size).
+##  P8  CLOSE: after Back, judged one frame later, the close drain logged
+##      ENTERED and CloseAll logged RETURNED, and every ToggleGroup we joined
+##      has stopped naming a toggle of ours.
+##      FAILS ON: "entered, never returned" -- a throw or fault unwound
+##      through the close, which is what all three of 2026-09-02's deaths
+##      looked like and what nothing in this host could see.
+## ===========================================================================
+
+## ESettingsGroup, MEASURED `R fields ESettingsGroup` 2026-09-02: exactly five
+## values and no spare. The GRAPHICS tab is `Screen == 0`; there is no
+## "Graphics" member. A sixth value is not merely unsupported -- it makes
+## `EnsureTabInitialized`'s default case throw, and a managed throw is
+## invisible to `aowl_p_p_seh` (§5 T1 / T9).
+const NtGroupScreen = 0'i32       ## the tab the UI calls GRAPHICS
+const NtGroupPostFx = 4'i32
+## How long to ignore ON edges on our own subtab toggles after WE asked for a
+## selection. Nothing we issue carries a callback any more, so in principle
+## this window should never catch anything -- and that is exactly why it is
+## kept and LOGGED: if it ever fires, something we did is still producing a
+## synthetic press and the log says so instead of the screen flickering.
+const NtSettleFrames = 12
+const NtVerdictDelay = 2          ## frames between a change and judging it
+
+var gNtScreen: Il2CppPtr = nil        ## the live SettingsScreen, from the rider
+var gNtSubGroup: Il2CppPtr = nil      ## OUR cloned subtab ToggleGroup
+var gNtSubSpawner: seq[Il2CppPtr] = @[]  ## UIAnimatedToggleSpawner per subtab
+var gNtTabGroup: Il2CppPtr = nil      ## the STOCK tab-bar ToggleGroup
+var gNtGfxTabSpawner: Il2CppPtr = nil ## stock GraphicsToggleSpawner component
+var gNtPostFxTabSpawner: Il2CppPtr = nil
+var gNtPostFxTabToggle: Il2CppPtr = nil
+var gNtLastGroup = -1'i32             ## the last group ShowScreen reported
+var gNtSettleFrames = 0
+var gNtVerdictDue = 0
+var gNtSettleAteSaid = false
+var gNtStripParentLayout = "not examined"
+var gNtStripIgnoreLayout = false
+## THE CLOSE PAIR's bookkeeping. Two counters and two flags; the postfix
+## handler touches nothing else, which is why it needs no guard.
+var gNtCloseEnters = 0
+var gNtCloseAllReturns = 0
+var gNtCloseInFlight = false
+var gNtCloseUnreturnedSaid = false
+var gNtKbDonorKey = ""                ## the row template's own key caption
+var gNtGfxEdgeSaid = false
+
 proc ntNoteFault(what: string) =
   gNtFaults = gNtFaults + 1
   warn "native tabs: " & what & " (fault " & $gNtFaults & " of " &
@@ -426,7 +508,17 @@ proc ntToggleSetFired(regs: Il2CppPtr) =
   var i = 0
   while i < gNtToggle.len and i < NtMaxTabs:
     if gNtToggle[i] == selfPtr:
-      gNtPressed = i
+      # ONLY THE ON EDGE, and this is the measured order, not a preference.
+      # §2.3: pressing B while A is on runs `A.Set(false, sendCallback)` from
+      # INSIDE `B.Set`, with the flag propagated VERBATIM -- so every OFF edge
+      # of ours arrives with sendCallback=true and arrives BEFORE the ON edge.
+      # Recording both meant the last write won by accident rather than by
+      # rule. The OFF direction is not lost: the stock group clears our toggle
+      # SILENTLY when a stock tab is chosen (no callback for the one it turns
+      # off), so `gNtForeignOn` -- not this -- is the edge that hides our panel,
+      # and it always was.
+      if turnedOn:
+        gNtPressed = i
       return
     i = i + 1
   # SUBTABS RIDE THE SAME POSTFIX. No second detour: two detours on one
@@ -444,6 +536,34 @@ proc ntToggleSetFired(regs: Il2CppPtr) =
       # GRAPHICS SETTINGS lit up, the PostFX panel stayed, both looked
       # selected. The OFF edge carries no information the ON edge does not.
       if turnedOn:
+        # THE SETTLE WINDOW, and the measurement it exists for.
+        #
+        # MEASURED (deployed build a1fa38, host log 2026-09-02 6:59.469 and
+        # 7:25.532): every GRAPHICS SETTINGS press was followed 0.4-1.0s later
+        # by a POSTFX ON edge the player never made, so GRAPHICS lit while the
+        # page flipped back to PostFX and both looked selected. MEASURED CAUSE
+        # (`R disasm 0x16ad190`): `AnimatedToggle::set_IsToggled` -- which
+        # `ntSubShow` used for the highlight -- calls
+        # `Toggle::Set(value, sendCallback)` with `mov r8b,1`. Every highlight
+        # we applied WAS a real press.
+        #
+        # The fix is that nothing this file issues carries a callback any more
+        # (`nuSpawnerToggleSilently` / `nuToggleSetQuiet`). This window is the
+        # BACKSTOP, and it is deliberately loud: if it ever swallows an edge,
+        # something we do is still synthesising presses, and the log says so
+        # rather than the screen flickering.
+        if gNtSettleFrames > 0:
+          if not gNtSettleAteSaid:
+            gNtSettleAteSaid = true
+            warn "native subtabs: IGNORED an ON edge on subtab " & $j &
+                 " that arrived inside our own " & $NtSettleFrames &
+                 "-frame settle window. Nothing this host issues is supposed " &
+                 "to be able to produce one any more -- every selection we " &
+                 "apply goes through ToggleSilently, which is MEASURED to " &
+                 "call Toggle::Set with sendCallback=0. So this line means a " &
+                 "synthetic press is still being generated somewhere and the " &
+                 "0.4-1.0s phantom POSTFX press is not fully gone."
+          return
         gNtSubPressed = j
         gNtSubPressedByPlayer = true
       return
@@ -861,6 +981,20 @@ proc ntBuildControlsMods(screenT: Il2CppPtr): bool =
                 "this is 'asked too early' rather than a wrong offset. " &
                 "Nothing was cloned.")
     return
+  # CAPTURE THE TEMPLATE'S OWN KEY CAPTION, for P5's negative.
+  #
+  # A count of rows cannot see a relabel that did not take -- that is this
+  # repo's signature defect and the reason 9b exists. The falsifiable question
+  # is "does any row still read what the PREFAB read", and it can only be
+  # asked if the prefab's own text was recorded before we wrote anything.
+  # MEASURED offsets: `_keyName@0x80` is a plain `TMP_Text` on
+  # `EFT.UI.Settings.CommandKeyPair` (fldoff.py, 2026-09-02), NOT a
+  # LocalizedText -- unlike `_commandName@0x70`, which is.
+  gNtKbDonorKey = ""
+  if nuOk(gNtKbTemplate, NtOffKpKeyName + 8'i32):
+    let dtmp = cNuGetRef(gNtKbTemplate, NtOffKpKeyName)
+    if nuOk(dtmp, 0x10'i32):
+      gNtKbDonorKey = nuGetText(dtmp)
   # THE BUTTON: clone the stock spawner into the same parent, join its group.
   let stockBtnGo = nuGameObjectOf(stockBtn)
   let stripT = (if stockBtnGo != nil:
@@ -1013,6 +1147,64 @@ proc ntKbVerdict() =
   gNtKbVerdictSaid = true
   var kids = 0
   discard iChildCount(gNtKbRowRoot, kids)
+  # ---- P5, THE NEGATIVE: no row still reads the TEMPLATE's key caption ----
+  #
+  # This is the check that CAN fail. The counts below compare our own
+  # bookkeeping against a container we filled -- useful, but a self-comparison,
+  # and a self-comparison passed while sixteen rows were visibly wrong on
+  # screen (9b). Reading each finished row's `_keyName@0x80` back through
+  # `TMP_Text::get_text` and asking whether ANY of them still reads what the
+  # prefab read is a property of the finished tree, and it fails the moment a
+  # relabel lands in the model without reaching the glyphs.
+  #
+  # THE ONE HONEST AMBIGUITY, stated rather than hidden: if a served bind's
+  # key text legitimately EQUALS the template's, this cannot tell a stale row
+  # from a correct one. That is INCONCLUSIVE, not PASS.
+  var stale = 0
+  var firstStale = ""
+  var unread = 0
+  var legit = 0
+  if gNtKbDonorKey.len > 0:
+    var r = 0
+    while r < kids and r < NtMaxRowDestroy:
+      let c = iChildAt(gNtKbRowRoot, r)
+      r = r + 1
+      if c == nil or not duOk(c, 0x20'i32): continue
+      let rowComp = modsComponent(c, "CommandKeyPair")
+      if rowComp == nil or not nuOk(rowComp, NtOffKpKeyName + 8'i32):
+        unread = unread + 1
+        continue
+      let tmp = cNuGetRef(rowComp, NtOffKpKeyName)
+      if not nuOk(tmp, 0x10'i32):
+        unread = unread + 1
+        continue
+      if nuGetText(tmp) == gNtKbDonorKey:
+        stale = stale + 1
+        if firstStale.len == 0: firstStale = iObjName(c)
+    var q = 0
+    while q < kbCount() and q < NtMaxRowDestroy:
+      if gKbBinds[q].key == gNtKbDonorKey: legit = legit + 1
+      q = q + 1
+  if gNtKbDonorKey.len == 0:
+    warn "keybinds VERDICT INCONCLUSIVE: the CommandKeyPair template's own " &
+         "key caption could not be read, so 'no row still reads the donor's " &
+         "caption' -- the only predicate here that CAN fail -- was never " &
+         "asked. The counts below are a self-comparison and cannot detect a " &
+         "relabel that landed in the model without reaching the glyphs."
+  elif stale > legit:
+    warn "keybinds VERDICT FAIL: " & $stale & " row(s) still read the " &
+         "TEMPLATE's key caption '" & gNtKbDonorKey & "' (first: " &
+         firstStale & ") while only " & $legit & " served bind(s) " &
+         "legitimately carry that text. The relabel did not take on the " &
+         "difference. `_keyName@0x80` is a plain TMP_Text and goes through " &
+         "TMP_Text::set_text @0x51BC1E0; `_commandName@0x70` is a " &
+         "LocalizedText and goes through SetLabelText @0x140FE70 and must be " &
+         "RE-APPLIED, because UpdateLocale clobbers a raw store."
+  elif unread > 0:
+    warn "keybinds VERDICT INCONCLUSIVE: " & $unread & " of " & $kids &
+         " row(s) could not be read back, so the donor-caption negative was " &
+         "asked of only " & $(kids - unread) & " of them. 'I could not look' " &
+         "is not a pass."
   if gNtKbRows != kbCount():
     warn "keybinds VERDICT FAIL: " & $gNtKbRows & " row(s) rendered but " &
          $kbCount() & " bind(s) were served. Every served bind must have a " &
@@ -1121,9 +1313,7 @@ proc ntBuild(): bool =
   # STEP 2, flag-gated and default OFF: a failure here must not cost step 1.
   if gNtSubOn:
     ntCrumb("build: ntBuildSubtabs")
-    let subOk = ntBuildSubtabs(screenT,
-                               @["GRAPHICS SETTINGS", "POSTFX"],
-                               NtSubPanels)
+    let subOk = ntBuildGfxStrip(screenT)
     okLog "native subtabs: build attempted (nativeTabsSubtabs is ON) and " &
           "returned " & $subOk & ". NOTE FOR ACCEPTANCE: this strip is a " &
           "SIBLING of the panels, parented to SettingsScreen -- it is NOT a " &
@@ -1142,6 +1332,250 @@ proc ntBuild(): bool =
 # ---------------------------------------------------------------------------
 # ACTIVATION -- the one piece of steering we own (doc 4)
 # ---------------------------------------------------------------------------
+proc ntBuildGfxStrip(screenT: Il2CppPtr): bool =
+  ## STEP 5: the GRAPHICS SETTINGS | POSTFX strip, built the way the map says
+  ## and switched by the game's own `ShowScreen`.
+  ##
+  ## WHAT CHANGED FROM THE VERSION THIS REPLACES, and each line is a measured
+  ## defect, not a preference:
+  ##
+  ##  * IT CLONES `Control Settings/Toggles` ONCE AND REUSES THE TWO TOGGLES
+  ##    THAT CAME WITH IT. The old build cloned the container (which brought
+  ##    ControlToggle and GesturesToggle along) and then cloned TWO MORE
+  ##    ControlToggles into it -- §5 T12, MEASURED LIVE: `childCount = 4`, of
+  ##    which two were the donor's own toggles that we never reparented and
+  ##    never took out of whatever group they name. Switching them off did not
+  ##    make them ours. P6 is `childCount == 2` and it FAILS on exactly that.
+  ##
+  ##  * NOTHING IS WIRED TO THEM AND NOTHING NEEDS UNWIRING. §2.10a, MEASURED
+  ##    LIVE by the coordinator: on both the stock GesturesToggle and the
+  ##    clone's, `onValueChanged@0x118 -> m_PersistentCalls@0x18 ->
+  ##    m_Calls@0x10 -> _size@0x18` is 0, and `m_Calls@0x10 ->
+  ##    m_RuntimeCalls@0x18 -> _size` is 0. The prefab-serialized-handler
+  ##    inference in §2.10 is REFUTED; a cloned strip is inert until our drain
+  ##    rides it.
+  ##
+  ##  * THE GROUP IS JOINED BY READING, NOT BY ASSUMING. Instantiating a
+  ##    subtree remaps an internal reference to the clone -- so the cloned
+  ##    toggles' `m_Group@0x110` SHOULD already name the cloned ToggleGroup.
+  ##    "Should" is not a measurement, and if it named the STOCK Controls group
+  ##    instead, our two subtabs would be fighting KEYBOARD AND MOUSE for
+  ##    exclusivity. So `m_Group` is READ and only corrected when it disagrees,
+  ##    and only through `SetToggleGroup` @0x55BA150 -- the REGISTERING join
+  ##    (§6.2.1). `set_group` @0x55B9D30 writes the field alone, which is
+  ##    precisely the §5 T3 throw on the next `Set(true, ...)`.
+  ##
+  ##  * `m_AllowSwitchOff@0x20` IS LEFT FALSE. §2.3 step 3a then refuses to
+  ##    turn the last-on toggle off, so the strip can never end up with zero
+  ##    selected. We enforce nothing.
+  result = false
+  if gNtSubBuilt:
+    return
+  if not gNtSubOn:
+    warn "native subtabs: NOT BUILDING -- nativeTabsSubtabs is OFF at the " &
+         "moment ntBuildGfxStrip was called. The flag chain " &
+         "(settingsPostFxSubtab -> nativeTabsSubtabs -> nativeTabs) is what " &
+         "should have set it."
+    return
+  let screenGo = iGameObjectOf(screenT)
+  if screenGo == nil:
+    warn "native subtabs: NOT BUILDING -- the SettingsScreen GameObject could " &
+         "not be reached from " & iPtr(screenT) & "."
+    return
+  gNtScreen = modsComponent(screenT, "SettingsScreen")
+  ntCrumb("gfx strip: locating the two stock panels and the tab-bar toggles")
+  # THE TWO STOCK PANELS ARE RECORDED FOR THE VERDICT ONLY. Nothing in this
+  # file SetActives either of them any more: `ShowScreen` does that, and doing
+  # it ourselves as well is what left GAME and GRAPHICS both drawn.
+  gNtSubPanelA = iGameObjectOf(modsChildNamed(screenT, "Graphics Settings"))
+  gNtSubPanelB = iGameObjectOf(modsChildNamed(screenT, "PostFX Settings"))
+  gNtGfxPanelGo = gNtSubPanelA
+  let tg = modsChildNamed(screenT, "Toggles")
+  let gfxSpawnT = (if tg != nil:
+                     modsChildNamed(tg, "GraphicsToggleSpawner") else: nil)
+  let pfxSpawnT = (if tg != nil:
+                     modsChildNamed(tg, "PostFxToggleSpawner") else: nil)
+  gNtGfxTabToggle = (if gfxSpawnT != nil: modsToggleOf(gfxSpawnT) else: nil)
+  gNtPostFxTabToggle = (if pfxSpawnT != nil: modsToggleOf(pfxSpawnT) else: nil)
+  gNtGfxTabSpawner = (if gfxSpawnT != nil:
+                        modsComponent(gfxSpawnT, "UIAnimatedToggleSpawner")
+                      else: nil)
+  gNtPostFxTabSpawner = (if pfxSpawnT != nil:
+                           modsComponent(pfxSpawnT, "UIAnimatedToggleSpawner")
+                         else: nil)
+  gNtTabGroup = nuToggleGroupOf(gNtGfxTabToggle)
+  if gNtSubPanelA == nil or gNtSubPanelB == nil or gNtGfxTabToggle == nil or
+     gNtScreen == nil:
+    ntNoteFault("gfx strip: the pieces were not all found (" &
+                (if gNtSubPanelA == nil: "Graphics-Settings " else: "") &
+                (if gNtSubPanelB == nil: "PostFX-Settings " else: "") &
+                (if gNtGfxTabToggle == nil: "GraphicsToggle " else: "") &
+                (if gNtScreen == nil: "SettingsScreen-component" else: "") &
+                "). Nothing was added and no stock object was touched.")
+    return
+  ntCrumb("gfx strip: cloning Control Settings/Toggles ONCE")
+  let ctrlPanel = modsChildNamed(screenT, "Control Settings")
+  let donorStrip = (if ctrlPanel != nil: modsChildNamed(ctrlPanel, "Toggles")
+                    else: nil)
+  let donorStripGo = (if donorStrip != nil: iGameObjectOf(donorStrip) else: nil)
+  if donorStripGo == nil:
+    ntNoteFault("gfx strip: Control Settings/Toggles -- the donor that brings " &
+                "its own ToggleGroup along in the clone -- was not found. We " &
+                "cannot construct a ToggleGroup, so there is no way to make " &
+                "two subtabs exclusive without it. Refusing.")
+    return
+  ntCallBegin("Object::Instantiate of Control Settings/Toggles")
+  let stripGo = modsClone(donorStripGo)
+  ntCallEnd()
+  if stripGo == nil or not modsSetParent(stripGo, screenGo):
+    ntNoteFault("gfx strip: the strip container could not be cloned onto the " &
+                "SettingsScreen. Nothing was changed.")
+    return
+  let stripT = modsTransformOf(stripGo)
+  let subGroup = modsComponent(stripT, "ToggleGroup")
+  if subGroup == nil:
+    ntNoteFault("gfx strip: the cloned strip carries no ToggleGroup, so the " &
+                "two subtabs could not be made exclusive and both could read " &
+                "selected at once. Refusing -- enforcing it ourselves is the " &
+                "design this file exists to avoid.")
+    discard modsSetActive(stripGo, false)
+    return
+  gNtSubGroup = subGroup
+  # P6, READ BEFORE ANYTHING IS ADDED. The clone must arrive with exactly the
+  # donor's two toggles. If it does not, this is not the tree the map
+  # describes and reusing children by index would be guessing.
+  var kids = 0
+  var donorKids = 0
+  if not iChildCount(stripT, kids) or not iChildCount(donorStrip, donorKids):
+    ntNoteFault("gfx strip: the cloned strip's childCount could not be read, " &
+                "so which objects are ours is UNKNOWN. Refusing.")
+    discard modsSetActive(stripGo, false)
+    return
+  if kids != 2 or donorKids != 2:
+    ntNoteFault("gfx strip: the clone has " & $kids & " child(ren) and the " &
+                "donor has " & $donorKids & "; this path reuses the donor's " &
+                "TWO cloned toggles (ControlToggle, GesturesToggle) as " &
+                "GRAPHICS SETTINGS and POSTFX and expects exactly two. " &
+                "Refusing rather than reusing children by index in a tree " &
+                "that is not the one the map describes.")
+    discard modsSetActive(stripGo, false)
+    return
+  gNtSubToggle = @[]
+  gNtSubSpawner = @[]
+  var made = 0
+  var joined = 0
+  var alreadyOurs = 0
+  var b = 0
+  while b < 2 and b < NtMaxSubs:
+    let caption = (if b == 0: "GRAPHICS SETTINGS" else: "POSTFX")
+    let c = iChildAt(stripT, b)
+    let donorC = iChildAt(donorStrip, b)
+    if c == nil or not duOk(c, 0x20'i32):
+      b = b + 1
+      continue
+    let cgo = iGameObjectOf(c)
+    if cgo == nil:
+      b = b + 1
+      continue
+    ntCrumb("gfx strip: enabling and relabelling '" & caption & "'")
+    # ENABLE FIRST. `Toggle::OnEnable` @0x55B9F50 calls
+    # `SetToggleGroup(this, m_Group@0x110)` unconditionally (§2.10), so a
+    # toggle whose serialized group is already the cloned one registers itself
+    # here without us writing anything.
+    discard modsSetActive(cgo, true)
+    let sp = modsComponent(c, "UIAnimatedToggleSpawner")
+    let tog = modsToggleOf(c)
+    if tog == nil:
+      warn "gfx strip: '" & caption & "' has no Toggle component, so its " &
+           "m_IsOn can never change and the subtab would be dead. Switching " &
+           "it off rather than shipping a button that does nothing."
+      discard modsSetActive(cgo, false)
+      b = b + 1
+      continue
+    # THE GROUP, from what the field SAYS. See the header.
+    let grp = nuToggleGroupOf(tog)
+    if grp == subGroup:
+      alreadyOurs = alreadyOurs + 1
+    else:
+      ntCallBegin("UnityEngine.UI.Toggle::SetToggleGroup (subtab)")
+      if nuToggleJoinGroup(tog, subGroup):
+        joined = joined + 1
+      ntCallEnd()
+    discard nuSpawnerHeader(sp, caption, 24'i32)
+    discard modsRelabelLike(c, donorC, caption)
+    gNtSubToggle.add tog
+    gNtSubSpawner.add sp
+    made = made + 1
+    b = b + 1
+  if made != 2:
+    ntNoteFault("gfx strip: only " & $made & " of 2 subtabs came out usable; " &
+                "hiding the strip rather than shipping a half-built one with " &
+                "no way back to PostFX.")
+    discard modsSetActive(stripGo, false)
+    gNtSubToggle = @[]
+    gNtSubSpawner = @[]
+    return
+  okLog "gfx strip: reused the CLONE'S OWN two toggles as GRAPHICS SETTINGS " &
+        "and POSTFX -- " & $alreadyOurs & " already named the cloned " &
+        "ToggleGroup (Instantiate remapped the reference, as expected) and " &
+        $joined & " were joined with Toggle::SetToggleGroup @0x55BA150, the " &
+        "REGISTERING call. No ControlToggle was cloned a second time, so the " &
+        "strip holds 2 children and not the 4 that trap T12 measured live. " &
+        "m_AllowSwitchOff is left FALSE, so Toggle::Set step 3a refuses to " &
+        "turn the last-on subtab off and the strip can never read zero."
+  # THE CLONE INHERITED THE DONOR'S CANVASGROUP STATE, and the donor
+  # (`Control Settings/Toggles`) was HIDDEN when we cloned it. alpha 0 or
+  # blocksRaycasts false makes every Selectable under it inert while our own
+  # calls still succeed -- the "renders but will not click" shape.
+  let stripCg = modsComponent(stripT, "CanvasGroup")
+  if stripCg == nil:
+    okLog "gfx strip: the cloned strip carries NO CanvasGroup, so that is not " &
+          "why a subtab would refuse a click. Nothing was forced."
+  else:
+    let (cgOk, cgA, cgI) = nuCgRead(stripCg)
+    if cgOk:
+      okLog "gfx strip: the cloned strip's CanvasGroup arrived alpha=" &
+            nuF(cgA) & " interactable=" & $cgI & ", inherited from a donor " &
+            "panel that was HIDDEN at clone time. Forcing alpha 1 / " &
+            "interactable / blocksRaycasts."
+    else:
+      warn "gfx strip: the strip HAS a CanvasGroup that could not be read, so " &
+           "whether it is why a subtab refuses a click is UNKNOWN. Forcing it."
+    discard nuCgMakeUsable(stripCg)
+  # P7, READ OFF THE COMPONENTS -- never inferred from the resulting rect (§3:
+  # the two panels' heights agree only by arithmetic coincidence at this
+  # window size, so any geometry-derived conclusion here measures nothing).
+  gNtStripParentLayout = "none"
+  if modsComponent(screenT, "VerticalLayoutGroup") != nil:
+    gNtStripParentLayout = "VerticalLayoutGroup"
+  elif modsComponent(screenT, "HorizontalLayoutGroup") != nil:
+    gNtStripParentLayout = "HorizontalLayoutGroup"
+  elif modsComponent(screenT, "GridLayoutGroup") != nil:
+    gNtStripParentLayout = "GridLayoutGroup"
+  if gNtStripParentLayout != "none":
+    let le = modsComponent(stripT, "LayoutElement")
+    if le != nil and nuSetIgnoreLayout(le, true):
+      gNtStripIgnoreLayout = true
+  discard nuSetAsLastSibling(stripT)      # sibling order IS raycast order
+  gNtSubStripGo = stripGo
+  gNtSubBuilt = true
+  gNtSubN = made
+  gNtSubKind = NtSubPanels
+  gNtSubSel = 0
+  discard modsSetActive(stripGo, false)   # raised by the ShowScreen rider
+  ntCrumb("gfx strip: COMPLETE")
+  okLog "gfx strip: built GRAPHICS SETTINGS | POSTFX as a SIBLING of the " &
+        "panels, parented to SettingsScreen. Selection is now the GAME's: a " &
+        "press calls SettingsScreen::ShowScreen(screen, group, NULL) " &
+        "@0x1720DE0 and NOTHING else is SetActive'd by us -- ShowScreen does " &
+        "OLD-OFF -> EnsureTabInitialized -> NEW-ON and keeps _currentTab@0x118 " &
+        "consistent, which no amount of our own SetActive can. Strip " &
+        "visibility and the highlight come back through the SAME ShowScreen " &
+        "postfix, so our own switch and the player's are indistinguishable. " &
+        "Parent LayoutGroup: " & gNtStripParentLayout & "; ignoreLayout " &
+        "forced: " & $gNtStripIgnoreLayout & "."
+  result = true
+
 proc ntBuildSubtabs(screenT: Il2CppPtr; captions: seq[string];
                     kind: int): bool =
   ## STEP 2: the GRAPHICS SETTINGS | POSTFX strip, as a SIBLING of the panels.
@@ -1158,6 +1592,18 @@ proc ntBuildSubtabs(screenT: Il2CppPtr; captions: seq[string];
   # nothing in the log at all -- indistinguishable from the build never being
   # attempted.
   if gNtSubBuilt:
+    return
+  # THE PANEL-SWITCHING KIND HAS ITS OWN BUILDER NOW. `ntBuildGfxStrip` reuses
+  # the clone's two toggles instead of cloning two more (§5 T12) and switches
+  # through `ShowScreen` instead of `SetActive`. Routing the panel kind here
+  # would silently rebuild the old shape, so it is refused rather than aliased.
+  if kind == NtSubPanels:
+    warn "native subtabs: ntBuildSubtabs was asked for the PANEL-SWITCHING " &
+         "kind, which now belongs to ntBuildGfxStrip. Refusing -- building it " &
+         "here would clone two extra ControlToggles into the strip (trap T12: " &
+         "childCount 4 where it must be 2) and switch panels with SetActive " &
+         "instead of ShowScreen, leaving _currentTab@0x118 disagreeing with " &
+         "the pixels."
     return
   if not gNtSubOn:
     warn "native subtabs: NOT BUILDING -- nativeTabsSubtabs is OFF at the " &
@@ -1243,6 +1689,7 @@ proc ntBuildSubtabs(screenT: Il2CppPtr; captions: seq[string];
     discard modsSetActive(stripGo, false)
     return
   gNtSubToggle = @[]
+  gNtSubSpawner = @[]
   var made = 0
   var b = 0
   while b < captions.len and b < NtMaxSubs:
@@ -1264,10 +1711,16 @@ proc ntBuildSubtabs(screenT: Il2CppPtr; captions: seq[string];
       continue
     # POINT IT AT THE CLONED GROUP, never the tab bar's: subtab exclusivity
     # must not fight tab exclusivity.
-    ntCallBegin("UnityEngine.UI.Toggle::set_group (subtab)")
-    discard nuToggleSetGroup(tog, subGroup)
+    # THE REGISTERING JOIN, not `set_group`. MEASURED (map §7.10): the setter
+    # writes `m_Group@0x110` alone, so the group's `m_Toggles@0x28` never
+    # learns about us -- and `NotifyToggleOn` calls `ValidateToggleIsInGroup`,
+    # which THROWS a managed exception on the first press (§5 T3). That throw
+    # unwinds through our frame without tripping `aowl_p_p_seh`.
+    ntCallBegin("UnityEngine.UI.Toggle::SetToggleGroup (subtab)")
+    discard nuToggleJoinGroup(tog, subGroup)
     ntCallEnd()
     discard modsSetActive(btn, true)
+    gNtSubSpawner.add modsComponent(btnT, "UIAnimatedToggleSpawner")
     gNtSubToggle.add tog
     made = made + 1
     b = b + 1
@@ -1277,6 +1730,7 @@ proc ntBuildSubtabs(screenT: Il2CppPtr; captions: seq[string];
                 "half-built one with no way back.")
     discard modsSetActive(stripGo, false)
     gNtSubToggle = @[]
+    gNtSubSpawner = @[]
     return
   # THE CLONE INHERITED THE DONOR'S CANVASGROUP STATE, and the donor
   # (`Control Settings/Toggles`) was HIDDEN when we cloned it. A CanvasGroup
@@ -1415,102 +1869,309 @@ proc ntRenderModPage(sel: int): int =
         "write and its re-assert registration rather than a second copy that " &
         "could drift."
 
-proc ntSubShow(sel: int) =
-  ## Apply the subtab selection: exactly one of the two panels is active.
+proc ntSubGroupOf(sel: int): int32 =
+  ## Which `ESettingsGroup` a subtab names. MEASURED `R fields ESettingsGroup`:
+  ## the tab the UI calls GRAPHICS is `Screen == 0`, and PostFX is 4. There is
+  ## no "Graphics" member and there is no sixth value to invent (§5 T1).
+  (if sel == 1: NtGroupPostFx else: NtGroupScreen)
+
+proc ntSubHighlight(sel: int) =
+  ## Move the strip's highlight WITHOUT sending a callback.
   ##
-  ## sel 0 -> the STOCK Graphics Settings panel (only ever SetActive'd, never
-  ##          re-parented and never written to);
-  ## sel 1 -> OUR panel, which is where PostFX rows will go.
-  ## The strip itself is untouched by this -- it is a sibling of both, so it
-  ## cannot be hidden by the thing it switches.
-  if not gNtSubBuilt: return
-  if gNtSubKind == NtSubPanels and not gNtGfxTabOn:
-    # NOT OUR TURN. The stock group owns panel visibility unless GRAPHICS is
-    # the selected tab; driving it anyway is what left GAME and GRAPHICS both
-    # active and produced the reported overlay.
-    gNtSubSel = sel
-    return
-  if gNtSubKind == NtSubRows:
-    # OUR PANEL STAYS UP; only its rows change. Nothing stock is touched at
-    # all here, which is why this kind needs no panel bookkeeping.
-    gNtApplying = true
-    var m = 0
-    while m < gNtSubToggle.len and m < NtMaxSubs:
-      discard nuAnimToggleSetToggled(gNtSubToggle[m], m == sel)
-      m = m + 1
-    gNtApplying = false
-    gNtSubSel = sel
-    discard ntRenderModPage(sel)
-    return
-  # THE TWO PANELS ARE BOTH THE GAME'S: Graphics Settings and PostFX Settings.
-  # They used to be "stock Graphics" vs "OUR panel", which is why the strip and
-  # the graphics rows appeared as the PROOF tab's content. The Game panel is
-  # never touched here, in either branch.
-  let wantB = (sel == 1)
-  if gNtSubPanelA != nil and modsGoActive(gNtSubPanelA) == wantB:
-    discard modsSetActive(gNtSubPanelA, not wantB)
-  if gNtSubPanelB != nil and modsGoActive(gNtSubPanelB) != wantB:
-    discard modsSetActive(gNtSubPanelB, wantB)
-  # THE HIGHLIGHT, through the real setter. A raw `m_IsOn` store leaves the
-  # Animator untold and the wrong button looks selected -- live-confirmed on
-  # the old strip, and the reason `set_IsToggled` exists in the target table.
-  gNtApplying = true
+  ## `UIAnimatedToggleSpawner::ToggleSilently` @0x16BCBA0, MEASURED
+  ## `R disasm`: `get_SpawnedObject()` -> `Toggle::Set(tog, value, 0)` ->
+  ## `TriggerAnimation` iff `m_Transition@0x50 == 3`. It is
+  ## `AnimatedToggle::set_IsToggled` @0x16AD190 with the callback flag flipped,
+  ## and set_IsToggled's `mov r8b,1` is the MEASURED cause of the phantom
+  ## "subtab pressed by the player: POSTFX" that followed every GRAPHICS press
+  ## by 0.4-1.0s in the deployed build.
+  ##
+  ## READ `m_IsOn@0x120` FIRST (§5 T2): `Toggle::Set` returns immediately when
+  ## the value already matches, which looks exactly like success. The read is
+  ## what makes "we changed it" and "it was already that" distinguishable, and
+  ## it also keeps this from calling into the game at all in the common case.
+  ##
+  ## ToggleSilently THROWS when the spawner has no spawned object (`call
+  ## 0x5D2530`), and a managed throw is invisible to `aowl_p_p_seh` (§5 T9).
+  ## The precondition is that `modsToggleOf` found a live toggle under that
+  ## spawner at build time -- which is exactly what `gNtSubToggle[i]` being
+  ## non-nil records. Where it is nil we fall back to a plain silent
+  ## `Toggle::Set`, which loses the animation and says so.
   var i = 0
   while i < gNtSubToggle.len and i < NtMaxSubs:
-    discard nuAnimToggleSetToggled(gNtSubToggle[i], i == sel)
+    let want = (i == sel)
+    let (ok, isOn) = nuToggleIsOn(gNtSubToggle[i])
+    if ok and isOn != want:
+      if i < gNtSubSpawner.len and gNtSubSpawner[i] != nil:
+        discard nuSpawnerToggleSilently(gNtSubSpawner[i], want)
+      else:
+        discard nuToggleSetQuiet(gNtSubToggle[i], want)
     i = i + 1
-  gNtApplying = false
   gNtSubSel = sel
-  # READ BACK, with the SAME predicate the tab verdict uses. Exactly one
-  # `* Settings` panel must be active; two is the overlay the user saw.
-  var oursAct = false
-  let (nAct, actNames) = ntActivePanelNames(oursAct)
-  if nAct != 1:
-    warn "native subtabs PANEL FAIL: after selecting " &
-         (if sel == 1: "POSTFX" else: "GRAPHICS SETTINGS") & ", " & $nAct &
-         " `* Settings` panel(s) are active -- " & actNames & ". Exactly one " &
-         "is the only correct answer; two is the GAME-over-GRAPHICS overlay."
+
+proc ntTabBarSync(group: int32) =
+  ## Keep the STOCK top row honest while the PostFX panel is up.
+  ##
+  ## `ShowScreen` does not touch toggles (§2.4/§6.1), which is what lets the
+  ## GRAPHICS tab stay lit while we show PostFX -- requirement A.3. But
+  ## `ScreenController[+0x60]` now remembers 4, so the NEXT time the screen
+  ## opens, `OpenGroup(4)` presses `_tabs[4].Toggle` -- the stock POSTFX
+  ## spawner, which the modstab fold has HIDDEN. The tab-bar group would then
+  ## hold a hidden toggle on and GRAPHICS off, and the top row would light
+  ## nothing at all.
+  ##
+  ## So on every PostFX switch the top row is corrected SILENTLY: GRAPHICS on,
+  ## the hidden POSTFX off. Both edges are sendCallback=false, so neither can
+  ## re-enter `ShowScreen` and neither is a press. The result is exactly one
+  ## toggle on in the tab group (P3), and it is the one the player can see.
+  if group != NtGroupPostFx:
+    return
+  if gNtPostFxTabToggle != nil:
+    let (okP, onP) = nuToggleIsOn(gNtPostFxTabToggle)
+    if okP and onP and gNtPostFxTabSpawner != nil:
+      discard nuSpawnerToggleSilently(gNtPostFxTabSpawner, false)
+  if gNtGfxTabToggle != nil:
+    let (okG, onG) = nuToggleIsOn(gNtGfxTabToggle)
+    if okG and not onG and gNtGfxTabSpawner != nil:
+      discard nuSpawnerToggleSilently(gNtGfxTabSpawner, true)
+
+proc ntSubApply(sel: int) =
+  ## A subtab press, applied the way the game applies a tab press: ONE call.
+  ##
+  ## `SettingsScreen::ShowScreen(screen, group, NULL)` @0x1720DE0 (UNIQUE,
+  ## prologue byte-verified through `nuFn` against the STARTUP SNAPSHOT).
+  ## MEASURED §2.4: OLD-OFF via `_currentTab.set_IsSelected(false)` ->
+  ## `EnsureTabInitialized(group)` -> `_currentTab = _tabs[group].Tab` ->
+  ## NEW-ON. We `SetActive` NOTHING. That is the entire change: the old path
+  ## drove two stock panels by hand and `_currentTab` disagreed with the
+  ## pixels, which is P2's failing input.
+  if not gNtSubBuilt or gNtSubKind != NtSubPanels:
+    return
+  if gNtScreen == nil:
+    warn "native subtabs: a subtab was pressed but the live SettingsScreen " &
+         "pointer is nil, so ShowScreen cannot be called and NOTHING was " &
+         "done. The pointer is learned by the ShowScreen postfix rider; if " &
+         "this prints, that rider has not fired, which means settingsUiProbe " &
+         "is off or its detour did not bind."
+    return
+  let g = ntSubGroupOf(sel)
+  # The window in which an ON edge on one of our subtabs is not a press.
+  gNtSettleFrames = NtSettleFrames
+  ntCallBegin("EFT.UI.Settings.SettingsScreen::ShowScreen")
+  let ok = nuShowScreen(gNtScreen, g)
+  ntCallEnd()
+  if not ok:
+    ntNoteFault("subtabs: ShowScreen(group=" & $g & ") was REFUSED, so the " &
+                "page did not change. Nothing was SetActive'd as a " &
+                "consolation -- doing that by hand is what left _currentTab " &
+                "naming a different panel than the one on screen.")
+    return
+  okLog "native subtabs: " & (if sel == 1: "POSTFX" else: "GRAPHICS SETTINGS") &
+        " -> SettingsScreen::ShowScreen(group=" & $g & ", MethodInfo*=NULL). " &
+        "The strip's visibility and highlight now come back through the " &
+        "ShowScreen POSTFIX, the same path a stock tab click takes, so our " &
+        "own switch and the player's are handled by one piece of code."
+
+proc ntOnShowScreen(screen: Il2CppPtr; group: int32) =
+  ## THE ONE PLACE STRIP VISIBILITY AND HIGHLIGHT ARE DECIDED.
+  ##
+  ## Called from `settingsui.nim`'s ShowScreen-POSTFIX body -- the detour
+  ## `settingsUiProbe` already installs -- so this installs NOTHING of its own.
+  ## §7.9/the double-detour rule: a second physical detour on ShowScreen would
+  ## overwrite the first's trampoline and silently kill Phase 1/2/3. It runs
+  ## INSIDE that body's single `aowl_p_p_seh` and must not open another; the
+  ## guard is not re-entrant and a nested one DISARMS the outer.
+  ##
+  ## A POSTFIX and not a prefix, deliberately: after ShowScreen returns,
+  ## `_currentTab@0x118` and the panel `SetActive`s have already happened, so
+  ## everything read or set here is read against the finished state rather
+  ## than the one being left.
+  ##
+  ## It fires for EVERY route into a group -- the player's tab click, our own
+  ## `ntSubApply`, and `OpenGroup` when the screen first opens on GRAPHICS --
+  ## which is why the strip raises itself on open with no extra code.
+  if not gNtOn or gNtOff:
+    return
+  if screen != nil:
+    gNtScreen = screen
+  gNtLastGroup = group
+  if not gNtSubBuilt or gNtSubKind != NtSubPanels:
+    return
+  let wanted = (group == NtGroupScreen or group == NtGroupPostFx)
+  gNtGfxTabOn = wanted
+  if gNtSubStripGo != nil:
+    discard modsSetActive(gNtSubStripGo, wanted)
+  if wanted:
+    ntSubHighlight(if group == NtGroupPostFx: 1 else: 0)
+    ntTabBarSync(group)
+  # JUDGE ONE FRAME LATER, NEVER THIS ONE. A LayoutGroup rebuild is deferred
+  # to `willRenderCanvases` and `Object.Destroy` to end of frame, so a
+  # same-frame read is INCONCLUSIVE (§6.5 predicate 9).
+  gNtVerdictDue = NtVerdictDelay
+  gNtSubVerdictSaid = false
+  gNtWhyNext = "ShowScreen(group=" & $group & ")"
+
+proc ntSubShow(sel: int) =
+  ## The ROW-SWAPPING kind only (step 3's MODS subtabs). The panel-switching
+  ## kind is `ntSubApply` and goes through `ShowScreen`; it is not reachable
+  ## from here any more, and this refuses rather than falling through to code
+  ## that would `SetActive` two stock panels by hand.
+  if not gNtSubBuilt: return
+  if gNtSubKind == NtSubPanels:
+    ntSubApply(sel)
+    return
+  # OUR PANEL STAYS UP; only its rows change. Nothing stock is touched at all
+  # here, which is why this kind needs no panel bookkeeping.
+  #
+  # THE HIGHLIGHT IS SILENT, exactly as on the panel kind. It used to go
+  # through `AnimatedToggle::set_IsToggled`, which MEASURED
+  # (`R disasm 0x16ad190`) calls `Toggle::Set` with `mov r8b,1` -- a real
+  # press, re-entering our own drain. `gNtApplying` was the plaster over that;
+  # it only covered the synchronous window, and the phantom edge arrived
+  # 0.4-1.0s later, outside it. Not sending a callback at all removes the
+  # class instead of narrowing the window.
+  ntSubHighlight(sel)
+  discard ntRenderModPage(sel)
+
+proc ntPanelOfTab(tab: Il2CppPtr): Il2CppPtr =
+  ## The GameObject a `SettingsTab` IS. MEASURED §2.5: `set_IsSelected` does
+  ## `GameObject::SetActive(get_gameObject(this), value)` -- a "panel" is
+  ## literally the tab component's own GameObject, nothing more.
+  result = nil
+  if tab == nil or not duOk(tab, 0x20'i32): return
+  result = nuGameObjectOf(tab)
 
 proc ntSubVerdict(why: string) =
-  ## STEP 2's finished state: exactly one subtab reads m_IsOn, its panel is
-  ## the only active one of the TWO, and the stock screen is undisturbed.
+  ## THE FINISHED-STATE VERDICT for the GRAPHICS strip: P1, P2, P3, P4, P6, P7
+  ## from the contract at the head of this file, each read off the LIVE tree
+  ## one frame after the change, and each with three outcomes.
+  ##
+  ## NOTHING HERE COMPARES ANYTHING WE WROTE AGAINST ITSELF. That is the whole
+  ## point: the version this replaces asked "is the panel I SetActive'd
+  ## active", which cannot fail, and it passed while the wrong page was on
+  ## screen. Every predicate below is a property of the finished tree and
+  ## every one names the input that makes it FAIL.
   if gNtSubVerdictSaid or not gNtSubBuilt: return
   gNtSubVerdictSaid = true
+  var fails = ""
+  var incon = ""
+
+  # ---- P4: exactly one subtab on, in OUR cloned group -------------------
   var on = 0
   var onIdx = -1
+  var readable = 0
   var i = 0
   while i < gNtSubToggle.len and i < NtMaxSubs:
     let (ok, isOn) = nuToggleIsOn(gNtSubToggle[i])
-    if ok and isOn:
-      on = on + 1
-      onIdx = i
+    if ok:
+      readable = readable + 1
+      if isOn:
+        on = on + 1
+        onIdx = i
     i = i + 1
-  let gfxUp = (gNtGfxPanelGo != nil and modsGoActive(gNtGfxPanelGo))
-  let oursUp = (gNtPanelGo.len > 0 and modsGoActive(gNtPanelGo[0]))
   let which = (if onIdx == 1: "POSTFX" elif onIdx == 0: "GRAPHICS SETTINGS"
                else: "none")
-  if on != 1:
-    warn "native subtabs VERDICT FAIL (" & why & "): " & $on & " of " &
-         $gNtSubN & " subtabs read m_IsOn=1. Exactly one is the only " &
-         "correct answer; 0 means a press never reached m_IsOn and 2 means " &
-         "nothing is enforcing exclusivity."
-  elif gfxUp and oursUp:
-    warn "native subtabs VERDICT FAIL (" & why & "): BOTH the stock Graphics " &
-         "panel and ours are active at once, so the visible page is whichever " &
-         "draws last rather than the one the strip names (" & which & ")."
-  elif not gfxUp and not oursUp:
-    warn "native subtabs VERDICT FAIL (" & why & "): NEITHER panel is " &
-         "active, so the page is blank while the strip says " & which & "."
-  elif (onIdx == 1) != oursUp:
-    warn "native subtabs VERDICT FAIL (" & why & "): the strip says " &
-         which & " but the panel that is up is the other one. The switch " &
-         "ran and did not take."
+  if readable != gNtSubN:
+    incon = incon & "[P4 only " & $readable & " of " & $gNtSubN &
+            " subtab toggles could be read] "
+  elif on != 1:
+    fails = fails & "[P4 " & $on & " of " & $gNtSubN &
+            " subtabs read m_IsOn=1; 0 means a press never reached m_IsOn " &
+            "and 2 means nothing is enforcing exclusivity] "
+
+  # ---- P1: exactly one `* Settings` panel active -------------------------
+  var oursAct = false
+  let (nAct, actNames) = ntActivePanelNames(oursAct)
+  if nAct != 1:
+    fails = fails & "[P1 " & $nAct & " panel(s) active: " & actNames &
+            "; two is the GAME-over-GRAPHICS overlay and zero is a blank " &
+            "page] "
+
+  # ---- P2: `_currentTab@0x118` names the panel that is up ----------------
+  let cur = nuCurrentTabOf(gNtScreen)
+  let curGo = ntPanelOfTab(cur)
+  var curName = "(unreadable)"
+  if curGo != nil: curName = iObjName(curGo)
+  if gNtScreen == nil or cur == nil:
+    incon = incon & "[P2 _currentTab could not be read from the screen] "
+  elif curGo == nil or not modsGoActive(curGo):
+    fails = fails & "[P2 _currentTab names '" & curName & "' but that " &
+            "GameObject is NOT active, so the game and the pixels disagree " &
+            "-- the signature of a switch done with SetActive instead of " &
+            "ShowScreen] "
+
+  # ---- P2b: the panel that is up is the one the strip names --------------
+  let wantB = (onIdx == 1)
+  let upB = (gNtSubPanelB != nil and modsGoActive(gNtSubPanelB))
+  let upA = (gNtSubPanelA != nil and modsGoActive(gNtSubPanelA))
+  if gNtSubPanelA == nil or gNtSubPanelB == nil:
+    incon = incon & "[P2b a stock panel handle is nil] "
+  elif on == 1 and (upB != wantB or upA == wantB):
+    fails = fails & "[P2b the strip says " & which & " but the panel up is " &
+            "the other one (Graphics active=" & $upA & ", PostFX active=" &
+            $upB & "); the switch ran and did not take] "
+
+  # ---- P3: exactly one toggle on in the STOCK tab-bar group --------------
+  var tabOnPtr: Il2CppPtr = nil
+  var tabTotal = 0
+  let tabOn = nuGroupTogglesOn(gNtTabGroup, tabOnPtr, tabTotal)
+  if tabOn < 0:
+    incon = incon & "[P3 the tab-bar ToggleGroup's m_Toggles could not be " &
+            "walked] "
+  elif tabOn != 1:
+    fails = fails & "[P3 " & $tabOn & " of " & $tabTotal & " tab-bar toggles " &
+            "read m_IsOn=1; with the PostFX panel up this is how the top row " &
+            "ends up lighting nothing, because ShowScreen(4) leaves the " &
+            "HIDDEN stock POSTFX toggle on and GRAPHICS off] "
+  elif gNtLastGroup == NtGroupPostFx and tabOnPtr != gNtGfxTabToggle:
+    fails = fails & "[P3 the PostFX page is up but the tab-bar toggle that " &
+            "is on is not GRAPHICS, so the lit tab is one the modstab fold " &
+            "has hidden] "
+
+  # ---- P6: the strip holds exactly the subtabs we made -------------------
+  var stripKids = 0
+  let stripT = modsTransformOf(gNtSubStripGo)
+  if stripT == nil or not iChildCount(stripT, stripKids):
+    incon = incon & "[P6 the strip's childCount could not be read] "
+  elif stripKids != gNtSubN:
+    fails = fails & "[P6 the strip holds " & $stripKids & " child(ren) for " &
+            $gNtSubN & " subtab(s); trap T12 measured 4 where it must be 2, " &
+            "and the two extras were the donor's own toggles, never " &
+            "reparented and still naming whatever group they came with] "
+
+  # ---- P7: no layout to fight, or explicitly opted out -------------------
+  if gNtStripParentLayout == "not examined":
+    incon = incon & "[P7 the strip's parent was never examined for a " &
+            "LayoutGroup] "
+  elif gNtStripParentLayout != "none" and not gNtStripIgnoreLayout:
+    fails = fails & "[P7 the strip's parent carries a " &
+            gNtStripParentLayout & " and the strip has no LayoutElement with " &
+            "ignoreLayout, so the strip's presence re-arranges the game's " &
+            "own children] "
+
+  if fails.len > 0:
+    warn "native subtabs VERDICT FAIL (" & why & "): " & fails &
+         (if incon.len > 0: "ALSO INCONCLUSIVE: " & incon else: "") &
+         " Strip says " & which & "; _currentTab names '" & curName & "'."
+  elif incon.len > 0:
+    warn "native subtabs VERDICT INCONCLUSIVE (" & why & "): " & incon &
+         "-- 'I could not look' is not a pass. Everything that COULD be read " &
+         "agreed: strip says " & which & ", _currentTab names '" & curName &
+         "'."
   else:
     okLog "native subtabs VERDICT PASS (" & why & "): exactly one subtab " &
-          "reads m_IsOn=1 (" & which & ") and its panel is the ONLY active " &
-          "one of the two -- read back off the live toggles and GameObjects, " &
-          "not from what we wrote. The strip is a SIBLING of both panels, so " &
-          "it is in no stock layout group and no stock geometry was touched."
+          "reads m_IsOn=1 (" & which & "); exactly one `* Settings` panel is " &
+          "active and it is the one the strip names; _currentTab@0x118 names " &
+          "'" & curName & "' and that GameObject IS the active one; exactly " &
+          "one of " & $tabTotal & " tab-bar toggles is on" &
+          (if gNtLastGroup == NtGroupPostFx: " and it is GRAPHICS, with the " &
+             "PostFX page up -- ShowScreen does not touch toggles, so the " &
+             "stock GRAPHICS tab stays lit exactly as required" else: "") &
+          "; the strip holds " & $stripKids & " child(ren) for " & $gNtSubN &
+          " subtab(s); parent LayoutGroup = " & gNtStripParentLayout &
+          ". Every one of these was read back off the live tree " &
+          $NtVerdictDelay & " frame(s) after the change, not from what we " &
+          "wrote."
 
 proc ntShow(idx: int) =
   ## Show ours, switch off whichever stock panel was up. The game switches
@@ -1523,16 +2184,26 @@ proc ntShow(idx: int) =
     if i < gNtStockWasOn.len: gNtStockWasOn[i] = on
     if on: discard modsSetActive(gNtStockPanels[i], false)
     i = i + 1
-  if gNtSubBuilt and idx == 0:
-    # WITH SUBTABS, OUR TAB DOES NOT SIMPLY SHOW OUR PANEL. It shows whichever
-    # of the two the strip names -- and one of those is the game's own Graphics
-    # panel, which the loop above just switched off. So the strip is raised and
-    # its selection re-applied, which may switch a stock panel back ON. That is
-    # the one case where "hide every stock panel" is the wrong instinct.
-    if gNtSubStripGo != nil: discard modsSetActive(gNtSubStripGo, true)
-    ntSubShow(gNtSubSel)
-  else:
-    discard modsSetActive(gNtPanelGo[idx], true)
+  # FOLD THE STOCK PANEL WITH THE GAME'S OWN CALL, not only with SetActive.
+  #
+  # §6.3: `ESettingsGroup` cannot be extended (§5 T1), so a MODS tab is ours
+  # end to end and `ShowScreen` will never hear about it. But `_currentTab`
+  # still names a stock tab, and leaving that tab thinking it is selected
+  # while its GameObject is off is precisely P2's failing input. So the stock
+  # tab is told: `SettingsTab::set_IsSelected(false)` @0x171BCA0 (UNIQUE),
+  # MEASURED §2.5 to be `SetActive(gameObject, false)` and nothing else on the
+  # false edge -- no OnSelect, no first-select gate, no allocation.
+  #
+  # The sweep above stays as a backstop: `_currentTab` names ONE tab, and the
+  # screen can have more than one panel active if something else left it that
+  # way. Two mechanisms for the same end is not duplication here, it is the
+  # difference between "the game agrees" and "the pixels are right".
+  let cur = nuCurrentTabOf(gNtScreen)
+  if cur != nil:
+    ntCallBegin("EFT.UI.Settings.SettingsTab::set_IsSelected(false)")
+    discard nuTabSetSelected(cur, false)
+    ntCallEnd()
+  discard modsSetActive(gNtPanelGo[idx], true)
   gNtShown = idx
 
 proc ntHide() =
@@ -1655,24 +2326,126 @@ proc ntDetachFromStockGroups(): int =
   ## SettingsScreen. A member that is destroyed while still listed is exactly
   ## the kind of dangling reference a liveness walk trips over.
   ##
-  ## We cannot READ that list to prove it -- `List<Toggle>` is an instantiated
-  ## generic with no offline layout, and a guessed offset into a live
-  ## collection would be a worse defect than the one being fixed. So instead
-  ## of auditing it we stop being in it: `set_group(null)` is the property the
-  ## game itself uses to leave a group, and it does the unregistering for us.
+  ## THE VERSION THIS REPLACES DID NOT ACTUALLY LEAVE THE GROUP, and that is
+  ## the whole point of this change. It called `nuToggleSetGroup`, i.e.
+  ## `Toggle::set_group` @0x55B9D30 -- and MEASURED (map §7.10, and
+  ## `SpawnObject` @0x16BC7F0 makes the OTHER call for exactly this reason)
+  ## that setter writes `m_Group@0x110` and NOTHING ELSE. It does not
+  ## unregister. So every "detached N toggle(s)" line this feature ever
+  ## printed was true about a field and false about the list: our toggles
+  ## stayed in the stock group's `m_Toggles@0x28` with `m_Group` nulled, which
+  ## is a strictly WORSE dangling shape than before the call.
+  ##
+  ## `Toggle::SetToggleGroup(null, false)` @0x55BA150 is the real thing:
+  ## MEASURED `R disasm 0x55ba150` -- `UnregisterToggle` from the old group
+  ## @0x55BADD0, store `m_Group`, `RegisterToggle` into the new (skipped for
+  ## null). That is how the game itself leaves a group.
+  ##
+  ## docs/WRITE-AUDIT-2026-09-02.md establishes that none of the host's 12
+  ## store sites writes -1 at any width, so the 0x00000000FFFFFFFF reference
+  ## the raid-load liveness walk met was written by GAME code operating on a
+  ## state we left inconsistent. A stock `List<Toggle>` still naming a toggle
+  ## whose GameObject went away with the SettingsScreen is exactly such a
+  ## state, and this is the call that prevents it.
   result = 0
   var i = 0
   while i < gNtToggle.len and i < NtMaxTabs:
     if gNtToggle[i] != nil and iUnityAlive(gNtToggle[i]):
-      if nuToggleSetGroup(gNtToggle[i], nil): result = result + 1
+      if nuToggleJoinGroup(gNtToggle[i], nil): result = result + 1
     i = i + 1
   var j = 0
   while j < gNtSubToggle.len and j < NtMaxSubs:
     if gNtSubToggle[j] != nil and iUnityAlive(gNtSubToggle[j]):
-      if nuToggleSetGroup(gNtSubToggle[j], nil): result = result + 1
+      if nuToggleJoinGroup(gNtSubToggle[j], nil): result = result + 1
     j = j + 1
   if gNtKbToggle != nil and iUnityAlive(gNtKbToggle):
-    if nuToggleSetGroup(gNtKbToggle, nil): result = result + 1
+    if nuToggleJoinGroup(gNtKbToggle, nil): result = result + 1
+
+proc ntSettingsCloseEntered(regs: Il2CppPtr) =
+  ## PREFIX on `SettingsScreen::Close()` @0x1720B10 (UNIQUE), dispatched by
+  ## slot identity from `patchFired`. It NEVER suppresses the original.
+  ##
+  ## WHY HERE AND NOWHERE ELSE. MEASURED `R disasm 0x1720b10`: this method
+  ## calls `CloseAll()` @0x17207A0 at +0x2F, which (§2.8) walks each
+  ## initialized tab's `Close()` -> `CleanupCreatedControls` ->
+  ## `Object::Destroy` on every entry of `_createdControls@0x88`, then clears
+  ## `_initializedTabs` and nulls `_currentTab@0x118`. This prefix is the LAST
+  ## instant at which every object of ours AND every stock list that might
+  ## name one are both still alive. Doing the unregister on the next tick is
+  ## too late by a whole cleanup.
+  ##
+  ## THE THREE DEATHS THIS IS AIMED AT (2026-09-02 12:11, 12:42, 14:52) each
+  ## followed closing the settings screen with objects of ours in it, and at
+  ## 14:51 the inspector's BackButton press faulted inside `UnityEvent::Invoke`
+  ## with NO managed exception in the client's own log. Pairing this with the
+  ## `CloseAll` POSTFIX makes "entered, never returned" a LOG LINE instead of a
+  ## silence.
+  ##
+  ## WHAT OF OURS THE CLEANUP CAN AND CANNOT SEE, stated so the next reader
+  ## does not have to re-derive it:
+  ##   * Rows we instantiate into a stock tab's row container are NOT in that
+  ##     tab's `_createdControls`, because we never add them. So
+  ##     `CleanupCreatedControls` will not Destroy them -- which is the SAFE
+  ##     side of that choice, and the cost is that they persist until the
+  ##     SettingsScreen itself goes away. We do not add them, precisely
+  ##     because we cannot audit `List<SettingControl>` (an instantiated
+  ##     generic with no offline layout) to know the cleanup could dispose them.
+  ##   * Our strip's toggles live in a CLONED ToggleGroup, so no stock list
+  ##     names them. The MODS tab toggle and the CONTROLS>MODS toggle DO join
+  ##     stock groups, and those are what the unregister below is for.
+  ##   * We Destroy nothing at close. `ntRetireChildrenOf` switches objects
+  ##     off; it never destroys. Nothing of ours can be dead behind a live
+  ##     managed shell.
+  discard regs
+  if not gNtOn or gNtOff:
+    return
+  gNtCloseEnters = gNtCloseEnters + 1
+  gNtCloseInFlight = true
+  gNtStep = "close: SettingsScreen::Close entered"
+  let detached = ntDetachFromStockGroups()
+  okLog "settings CLOSE ENTERED (#" & $gNtCloseEnters & "): unregistered " &
+        $detached & " toggle(s) of ours from the game's ToggleGroups with " &
+        "Toggle::SetToggleGroup(null) @0x55BA150 -- the REGISTERING call, " &
+        "which really does UnregisterToggle. The previous build used " &
+        "set_group @0x55B9D30, which writes m_Group and leaves us in " &
+        "m_Toggles. If the matching 'settings CLOSE: CloseAll RETURNED' line " &
+        "does not appear, a throw or fault unwound through the close."
+
+proc ntSettingsCloseAllReturned() =
+  ## POSTFIX on `SettingsScreen::CloseAll()` @0x17207A0 (UNIQUE), a DIFFERENT
+  ## function from the prefix above -- two detours on ONE function is what
+  ## kills the first one silently; two on two is fine. Reads no register and
+  ## touches no game memory, so it needs no guard, and it returns 0 always.
+  if not gNtOn or gNtOff:
+    return
+  gNtCloseAllReturns = gNtCloseAllReturns + 1
+  gNtCloseInFlight = false
+  okLog "settings CLOSE: CloseAll RETURNED (#" & $gNtCloseAllReturns &
+        " for " & $gNtCloseEnters & " Close entries). The cleanup walked " &
+        "every initialized tab's _createdControls and came back, so nothing " &
+        "threw through it this time."
+
+proc ntCloseVerdict() =
+  ## P8, judged from the tick on the frame AFTER a close was seen.
+  ##
+  ## FAIL looks like: `settings CLOSE ENTERED` with no matching
+  ## `CloseAll RETURNED`. That is a throw or a fault unwound through the close
+  ## -- the exact shape of 2026-09-02's three deaths, which produced no
+  ## managed exception in the client log and nothing at all in ours.
+  if not gNtCloseInFlight:
+    return
+  if gNtCloseUnreturnedSaid:
+    return
+  gNtCloseUnreturnedSaid = true
+  warn "settings CLOSE VERDICT FAIL: SettingsScreen::Close was ENTERED (" &
+       $gNtCloseEnters & " time(s)) and CloseAll has RETURNED only " &
+       $gNtCloseAllReturns & " time(s), yet a later frame is running. A call " &
+       "that neither reaches its own return nor trips aowl_p_p_seh, while " &
+       "the game survives, is a MANAGED exception thrown inside the callee " &
+       "and unwound through our frame (IL2CPP C++ EH) -- our " &
+       "access-violation guard cannot see it. Treat the settings screen as " &
+       "having been left half-closed: _initializedTabs may still hold " &
+       "groups whose tabs were already cleaned up."
 
 proc ntTeardown(why: string) =
   ## The SettingsScreen is going away. Leave nothing of ours registered in
@@ -1722,6 +2495,11 @@ proc ntTickBody() =
   ## one integer compare -- the press arrives from the detour, not from a hunt.
   if not gNtOn or gNtOff: return
   gNtStep = "tick: entry"
+  # THE TWO FRAME COUNTERS, first, so nothing below can skip them.
+  if gNtSettleFrames > 0: gNtSettleFrames = gNtSettleFrames - 1
+  # P8: a close that was entered and never came back is only visible from a
+  # LATER frame, which is what this is.
+  ntCloseVerdict()
   if not gNtEnteredSaid:
     # PROOF OF LIFE. Its ABSENCE from the log now means the tick is not being
     # called at all -- which is a gate problem in modstab, not a problem in
@@ -1832,21 +2610,34 @@ proc ntTickBody() =
       ntHide()
       gNtVerdictSaid = false
       gNtWhyNext = "a stock tab was selected -- ours must be off"
-  # THE STOCK GRAPHICS TAB EDGE: raise or hide the strip.
+  # THE STOCK GRAPHICS TAB EDGE IS NO LONGER ACTED ON HERE.
+  #
+  # It used to raise and hide the strip and re-apply the selection. That is
+  # now the ShowScreen POSTFIX rider's job, and for a reason that is not
+  # tidiness: a toggle edge is not the same event as a panel switch. The edge
+  # fires for GRAPHICS only, so nothing raised the strip when the screen
+  # OPENED on Graphics through `OpenGroup` (§2.7, no toggle press of ours to
+  # observe), and nothing lowered it when the game switched groups by any
+  # route other than a click. `ShowScreen` fires for ALL of them -- the
+  # player's click, our own `ntSubApply`, and `OpenGroup` -- so one drain
+  # covers every case and there is no second copy to drift.
+  #
+  # The edge is still DRAINED, because leaving a flag set forever is its own
+  # bug, and it is logged once so the classification the postfix made stays
+  # visible.
   if gNtSubPressedGfx >= 0:
     let gfxOn = (gNtSubPressedGfx == 1)
     gNtSubPressedGfx = -1
-    gNtGfxTabOn = gfxOn
-    gNtStep = "tick: stock GRAPHICS tab " & (if gfxOn: "selected" else: "left")
-    if gNtSubBuilt and gNtSubStripGo != nil:
-      discard modsSetActive(gNtSubStripGo, gfxOn)
-      if gfxOn:
-        # Re-apply the selection now that it is our turn; until this moment
-        # ntSubShow deliberately did nothing to the stock panels.
-        ntSubShow(gNtSubSel)
-        okLog "native subtabs: the stock GRAPHICS tab was selected, so the " &
-              "strip is now VISIBLE and the selection has been applied. It " &
-              "is hidden for every other tab and is never shown under GAME."
+    gNtStep = "tick: stock GRAPHICS tab edge (informational)"
+    if not gNtGfxEdgeSaid:
+      gNtGfxEdgeSaid = true
+      okLog "native subtabs: saw the stock GRAPHICS tab toggle go " &
+            (if gfxOn: "ON" else: "OFF") & ". This is INFORMATIONAL only -- " &
+            "strip visibility is decided by the ShowScreen postfix rider, " &
+            "which fires for the player's click, for our own ShowScreen call " &
+            "and for OpenGroup when the screen first opens. A toggle edge " &
+            "cannot see that last one, which is why the strip used to fail " &
+            "to appear when Settings opened straight onto GRAPHICS."
   # THE SUBTAB EVENT, drained from the same postfix as the tab event.
   if gNtSubPressed >= 0:
     let sidx = gNtSubPressed
@@ -1860,13 +2651,25 @@ proc ntTickBody() =
             "not through our code. That is the half that was in doubt."
     ntSubShow(sidx)
     gNtSubVerdictSaid = false
-  # THE VERDICT MUST RUN WHERE THE STRIP LIVES. It was gated on `gNtShown`,
-  # which is only ever set for a tab of OURS -- and the panel-switching strip
-  # belongs to the STOCK Graphics tab, so under it the verdict never ran and a
-  # boot with both subtabs lit printed no FAIL at all.
-  if gNtSubBuilt and (gNtShown >= 0 or
-                      (gNtSubKind == NtSubPanels and gNtGfxTabOn)):
-    ntSubVerdict("subtab selection")
+  # THE VERDICT RUNS WHENEVER THE GRAPHICS TAB IS UP, not only when a tab of
+  # ours is shown -- and it runs `NtVerdictDelay` frames AFTER the change that
+  # prompted it, never on the frame of the change (§6.5 predicate 9: a layout
+  # rebuild is deferred to `willRenderCanvases`, so a same-frame read is
+  # INCONCLUSIVE, not PASS).
+  #
+  # It used to be gated on `gNtShown`, which is only ever set for a tab of
+  # OURS -- so under the stock GRAPHICS tab, which is where this strip
+  # actually lives, it never ran at all and a boot with BOTH subtabs lit
+  # printed no FAIL whatsoever.
+  if gNtVerdictDue > 0:
+    gNtVerdictDue = gNtVerdictDue - 1
+    if gNtVerdictDue == 0 and gNtSubBuilt and gNtSubKind == NtSubPanels:
+      ntSubVerdict(gNtWhyNext)
+      gNtWhyNext = "steady state"
+  elif gNtSubBuilt and gNtSubKind == NtSubRows and gNtShown >= 0:
+    ntSubVerdict("mod subtab selection")
+  elif gNtSubBuilt and gNtSubKind == NtSubPanels and gNtGfxTabOn:
+    ntSubVerdict("steady state with the GRAPHICS tab up")
   gNtStep = "tick: proof / verdict"
   # THE PROOF, one bounded step per frame. Each phase waits `NtProofSettle`
   # frames before judging, because a panel switched this frame is not laid out
@@ -1969,6 +2772,52 @@ proc ntBindToggleEvent(verbose: bool): bool =
   else:
     warn "native tabs: the Toggle::Set detour did NOT bind; tab presses will " &
          "not be seen and this feature does nothing. Nothing was changed."
+
+proc ntBindCloseProbe(verbose: bool): bool =
+  ## THE CLOSE PAIR: a PREFIX on `SettingsScreen::Close` @0x1720B10 and a
+  ## POSTFIX on `SettingsScreen::CloseAll` @0x17207A0.
+  ##
+  ## TWO DETOURS ON TWO DIFFERENT FUNCTIONS, never two on one. Both are
+  ## MEASURED sharedness=UNIQUE (`R shared`), both prologue byte-verified
+  ## through `nuFn` against the STARTUP SNAPSHOT (never live memory -- a
+  ## verify run after another feature patched a function reads its trampoline
+  ## and self-rejects), and nothing else in this host patches either.
+  ##
+  ## Neither handler suppresses its original and neither writes a field. The
+  ## prefix's only effect on game state is `Toggle::SetToggleGroup(null)` on
+  ## toggles WE put into stock groups -- the game's own way to leave one.
+  result = false
+  let fnClose = nuFn(NuTScreenClose)
+  let fnAll = nuFn(NuTScreenCloseAll)
+  if fnClose == nil or fnAll == nil:
+    warn "native tabs: the settings CLOSE pair could not be bound -- Close: " &
+         nuWhyName(cNuWhyOf(NuTScreenClose)) & "; CloseAll: " &
+         nuWhyName(cNuWhyOf(NuTScreenCloseAll)) & ". Only a PROLOGUE " &
+         "MISMATCH would mean this game build changed; every other reason is " &
+         "a fault in our own host, most likely ORDER (this must run after " &
+         "cProPrimeAll and after GameAssembly.dll is loaded). NOTHING was " &
+         "patched, and the consequence is that a throw unwinding through the " &
+         "settings close stays invisible exactly as it was."
+    return
+  let a = attachDrain("EFT.UI.Settings.SettingsScreen::Close", fnClose,
+                      cast[Il2CppMethod](0), false, verbose, 30'i32)
+  let b = attachDrain("EFT.UI.Settings.SettingsScreen::CloseAll", fnAll,
+                      cast[Il2CppMethod](0), false, verbose, 31'i32, true)
+  if a and b:
+    okLog "native tabs: bound the settings CLOSE pair -- a PREFIX on " &
+          "SettingsScreen::Close @0x1720B10 and a POSTFIX on " &
+          "SettingsScreen::CloseAll @0x17207A0, both UNIQUE. Close calls " &
+          "CloseAll at +0x2F (MEASURED), so 'CLOSE ENTERED' with no " &
+          "'CloseAll RETURNED' is a throw or fault unwound through the " &
+          "close. All three of 2026-09-02's deaths followed closing this " &
+          "screen and produced no managed exception in the client's own log; " &
+          "this is the instrument that would have named it."
+    result = true
+  else:
+    warn "native tabs: the settings CLOSE pair bound only partially (Close=" &
+         $a & " CloseAll=" & $b & "). A half-bound pair cannot distinguish " &
+         "'never entered' from 'entered and never returned', which is the " &
+         "one question it exists to answer."
 
 proc ntTick() =
   ## Every frame while armed, through the SAME single guard the other modstab

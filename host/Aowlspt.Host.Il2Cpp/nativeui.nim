@@ -253,6 +253,23 @@ const
   NuTCgSetInteract   = 65'i32  ## UnityEngine.CanvasGroup::set_interactable
   NuTCgSetBlocksRay  = 66'i32  ## UnityEngine.CanvasGroup::set_blocksRaycasts
 
+  ## THE PANEL SWITCH AND THE SILENT SELECT. docs/SETTINGS-UI-MAP.md §7.9
+  ## records that this table carried `Toggle::Set` and `Toggle::set_group` but
+  ## NOT `ShowScreen`, `set_IsSelected` or `SetToggleGroup` -- "the whole
+  ## panel-switch and group-join API". These four close that gap; provenance,
+  ## bytes and sharedness are on the rows in `abi/aowlspt_nativeui.h`.
+  NuTScreenShowScreen= 67'i32  ## EFT.UI.Settings.SettingsScreen::ShowScreen
+  NuTTabSetSelected  = 68'i32  ## EFT.UI.Settings.SettingsTab::set_IsSelected
+  NuTSpawnerSilent   = 69'i32  ## EFT.UI.UIAnimatedToggleSpawner::ToggleSilently
+  NuTToggleJoinGroup = 70'i32  ## UnityEngine.UI.Toggle::SetToggleGroup
+  ## THE CLOSE PATH. A PREFIX on `Close` and a POSTFIX on `CloseAll` -- two
+  ## detours on two DIFFERENT functions, which is legal; two on one is what
+  ## silently kills the first feature. MEASURED `R disasm 0x1720b10`: Close
+  ## calls CloseAll at +0x2F, so "entered Close" without "CloseAll returned"
+  ## is a throw or fault unwound through the close.
+  NuTScreenClose     = 71'i32  ## EFT.UI.Settings.SettingsScreen::Close
+  NuTScreenCloseAll  = 72'i32  ## EFT.UI.Settings.SettingsScreen::CloseAll
+
 ## Field offsets for the tab machinery. MEASURED (tools/fldoff.py, String
 ## self-check passing) and written up in docs/NATIVETABS.md. All NULL-CAPABLE.
 const
@@ -263,6 +280,28 @@ const
   NuOffToggleIsOn         = 0x120'i32 ## UnityEngine.UI.Toggle.m_IsOn
   NuOffTabCreatedControls = 0x88'i32  ## SettingsTab._createdControls
   NuOffGameTabSettingsRoot = 0x98'i32 ## GameSettingsTab._settingsRoot
+  ## THE PANEL-SWITCH OFFSETS. All MEASURED with `tools/fldoff.py fields`
+  ## (System.String._stringLength@0x10 self-check passing) on 2026-09-02, and
+  ## all four agree with docs/SETTINGS-UI-MAP.md §1.1/§1.6. None is guessed.
+  NuOffScreenCurrentTab   = 0x118'i32 ## SettingsScreen._currentTab : SettingsTab
+  NuOffTgAllowSwitchOff   = 0x20'i32  ## UnityEngine.UI.ToggleGroup.m_AllowSwitchOff
+  NuOffTgToggles          = 0x28'i32  ## ...m_Toggles : List<Toggle>
+  ## The instantiated `List<Toggle>` layout is NOT reachable offline (every
+  ## `Il2CppGenericClass.cached_class` in the file is null). These three are
+  ## BORROWED from a verified body: `R disasm 0x55babc0`
+  ## (`ToggleGroup::NotifyToggleOn`) reads `_items@0x10`, `_size@0x18`, and
+  ## indexes the T[] from `+0x20` with stride 8 for a reference T. Cited as
+  ## borrowed wherever they are used.
+  NuOffListItems          = 0x10'i32
+  NuOffListSize           = 0x18'i32
+  NuOffArrayFirst         = 0x20'i32
+  ## `UnityEngine.UI.ScrollRect.m_Content` / `.m_Viewport`, MEASURED
+  ## `tools/fldoff.py fields UnityEngine.UI.ScrollRect` 2026-09-02. A page
+  ## that will not scroll is the question "is the container my rows went into
+  ## the one the ScrollRect actually scrolls", and that question is only
+  ## answerable by reading this field -- never by looking at the rect.
+  NuOffScrollContent      = 0x20'i32
+  NuOffScrollViewport     = 0x40'i32
 
 ## `LayoutGroup.m_Padding` @0x20 : RectOffset. A plain reference field, so it
 ## is READ raw -- no call, and in particular not `get_padding`, which is
@@ -971,6 +1010,163 @@ proc nuToggleIsOn*(toggle: Il2CppPtr): (bool, bool) =
   let addr2 = cast[Il2CppPtr](cast[uint64](toggle) + uint64(NuOffToggleIsOn))
   result = (true, (cReadI32At(addr2) and 0xFF'i32) != 0'i32)
 
+proc nuToggleGroupOf*(toggle: Il2CppPtr): Il2CppPtr =
+  ## `Toggle.m_Group @0x110`, read raw. READ BEFORE ANY JOIN: §5 T3 is that a
+  ## toggle whose `m_Group` names a group it is not registered in makes the
+  ## next `Set(true, …)` throw a managed exception through our frame, which
+  ## `aowl_p_p_seh` cannot see. So the join decision is made from what the
+  ## field actually says, never from what a clone is assumed to have inherited.
+  result = nil
+  if not nuOk(toggle, NuOffToggleGroup + 8'i32): return
+  result = cNuGetRef(toggle, NuOffToggleGroup)
+
+proc nuToggleJoinGroup*(toggle, group: Il2CppPtr): bool =
+  ## `Toggle::SetToggleGroup(group, setMemberValue: false)` @0x55BA150 --
+  ## the REGISTERING join, and the one `UIAnimatedToggleSpawner::SpawnObject`
+  ## itself makes (`R disasm 0x16bc7f0`).
+  ##
+  ## NOT `set_group` @0x55B9D30. MEASURED (map §7.10): that setter writes
+  ## `m_Group@0x110` and nothing else, so the toggle is named by a group whose
+  ## `m_Toggles` never learns about it -- exactly the §5 T3 throw.
+  result = false
+  if not gNuOn or not nuOk(toggle, NuOffToggleIsOn + 4'i32): return
+  let fn = nuFn(NuTToggleJoinGroup)
+  if fn == nil: return
+  cNuCallVPPB(fn, toggle, group, 0'i32)
+  true
+
+proc nuToggleSetQuiet*(toggle: Il2CppPtr; on: bool): bool =
+  ## `Toggle::Set(value, sendCallback: FALSE)`.
+  ##
+  ## THE RULE THIS ENFORCES, and it cost a live session: `set_IsToggled`
+  ## @0x16AD190 is MEASURED (`R disasm`) to call `Toggle::Set` with
+  ## `mov r8b,1` -- sendCallback TRUE. Every highlight the host applied with it
+  ## was therefore a real press, re-entered our own drain, and read on screen
+  ## as "the player pressed POSTFX" 0.4-1.0s after they pressed GRAPHICS.
+  ## Nothing this host issues may carry a callback. Prefer
+  ## `nuSpawnerToggleSilently`, which is this plus the animation.
+  result = false
+  if not gNuOn or not nuOk(toggle, NuOffToggleIsOn + 4'i32): return
+  let fn = nuFn(NuTToggleSet)
+  if fn == nil: return
+  cNuCallVPBB(fn, toggle, (if on: 1'i32 else: 0'i32), 0'i32)
+  true
+
+proc nuSpawnerToggleSilently*(spawner: Il2CppPtr; on: bool): bool =
+  ## `UIAnimatedToggleSpawner::ToggleSilently(bool)` @0x16BCBA0, UNIQUE.
+  ##
+  ## MEASURED `R disasm 0x16bcba0`: `get_SpawnedObject()` (a shared generic
+  ## called with the game's own MethodInfo*, which is why this must be the
+  ## game's function and not a reimplementation), then
+  ## `Toggle::Set(tog, value, sendCallback = 0)` (`xor r8d,r8d`), then, iff
+  ## `m_Transition@0x50 == 3`, `AnimatedToggle::TriggerAnimation`. So it moves
+  ## BOTH the state and the animated highlight without firing a callback.
+  ##
+  ## IT THROWS IF THERE IS NO SPAWNED OBJECT (`call 0x5D2530`, the null-ref
+  ## helper), and a managed throw does not trip `aowl_p_p_seh` (§5 T9). The
+  ## caller must have a live spawned toggle in hand first; this checks the
+  ## spawner is readable through `_spawnableToggle@0xc0` and no further, so the
+  ## precondition is the CALLER's, and it is stated at each call site.
+  result = false
+  if not gNuOn or not nuOk(spawner, NuOffSpawnerPrefab + 8'i32): return
+  let fn = nuFn(NuTSpawnerSilent)
+  if fn == nil: return
+  cNuCallVPB(fn, spawner, (if on: 1'i32 else: 0'i32))
+  true
+
+proc nuTabSetSelected*(tab: Il2CppPtr; on: bool): bool =
+  ## `SettingsTab::set_IsSelected(bool)` @0x171BCA0, UNIQUE -- the game's OWN
+  ## panel switch. MEASURED (map §2.5): `SetActive(gameObject, value)`, then on
+  ## the true edge the first-select gate and `OnSelect()` through the vtable.
+  ## Used to FOLD the stock panel when a tab of ours takes the screen, so
+  ## `_currentTab`'s own idea of itself matches the pixels.
+  result = false
+  if not gNuOn or not nuOk(tab, 0x98'i32): return
+  let fn = nuFn(NuTTabSetSelected)
+  if fn == nil: return
+  cNuCallVPB(fn, tab, (if on: 1'i32 else: 0'i32))
+  true
+
+proc nuShowScreen*(screen: Il2CppPtr; group: int32): bool =
+  ## `SettingsScreen::ShowScreen(ESettingsGroup)` @0x1720DE0, UNIQUE.
+  ##
+  ## THE ONE CALL THAT SWITCHES A STOCK TAB. MEASURED (map §2.4): OLD-OFF
+  ## (`_currentTab.set_IsSelected(false)`) -> remember the group on the
+  ## controller -> `EnsureTabInitialized(group)` -> `_currentTab = _tabs[group]`
+  ## -> NEW-ON. Nothing else needs to be `SetActive`d by us, and `_currentTab`
+  ## stays consistent, which no amount of our own `SetActive` can achieve.
+  ##
+  ## The frame is `rcx = screen, edx = group, r8 = NULL`, read off
+  ## `<Awake>b__1` @0x17240A0 (`mov edx,[rax+0x10]; xor r8d,r8d; jmp`), so the
+  ## NULL MethodInfo* is what the game itself passes.
+  ##
+  ## GROUP IS VALIDATED HERE. `ESettingsGroup` has exactly five values
+  ## (MEASURED `R fields ESettingsGroup`: Screen 0, Game 1, Sound 2, Control 3,
+  ## PostFX 4) and `EnsureTabInitialized`'s default case throws
+  ## `ArgumentOutOfRangeException` (§5 T1) -- a managed throw our guard cannot
+  ## catch. A sixth value must be refused here, not discovered there.
+  result = false
+  if group < 0'i32 or group > 4'i32:
+    warn "nativeui: REFUSING ShowScreen(group=" & $group & "). ESettingsGroup " &
+         "has exactly five values (0..4) and EnsureTabInitialized's default " &
+         "case throws ArgumentOutOfRangeException, which is a MANAGED " &
+         "exception -- aowl_p_p_seh cannot catch it and the client would die."
+    return
+  if not gNuOn or not nuOk(screen, NuOffScreenCurrentTab + 8'i32): return
+  let fn = nuFn(NuTScreenShowScreen)
+  if fn == nil: return
+  cNuCallVPI(fn, screen, group)
+  true
+
+proc nuCurrentTabOf*(screen: Il2CppPtr): Il2CppPtr =
+  ## `SettingsScreen._currentTab @0x118` (MEASURED, `fldoff.py field`). The
+  ## authority on which panel the GAME thinks is up -- the verdict compares it
+  ## against which panel is actually active, and those two disagreeing is
+  ## precisely the defect a `SetActive`-only switch produces.
+  result = nil
+  if not nuOk(screen, NuOffScreenCurrentTab + 8'i32): return
+  result = cNuGetRef(screen, NuOffScreenCurrentTab)
+
+proc nuGroupTogglesOn*(group: Il2CppPtr; onPtr: var Il2CppPtr;
+                       total: var int): int =
+  ## How many toggles in `group.m_Toggles@0x28` read `m_IsOn@0x120 != 0`, and
+  ## which. Returns -1 for INCONCLUSIVE (a hop would not read) so the caller
+  ## can keep three outcomes instead of flattening "I could not look" into a
+  ## pass.
+  ##
+  ## The `List<Toggle>` layout is BORROWED from `R disasm 0x55babc0`
+  ## (`NotifyToggleOn` itself walks it): `_items@0x10`, `_size@0x18`, element 0
+  ## of the T[] at `+0x20`, stride 8. It is not reachable offline and this says
+  ## so rather than presenting it as a metadata offset. Capped at 64.
+  const NuMaxGroupToggles = 64
+  result = -1
+  onPtr = nil
+  total = 0
+  if not nuOk(group, NuOffTgToggles + 8'i32): return
+  let list = cNuGetRef(group, NuOffTgToggles)
+  if not nuOk(list, NuOffArrayFirst): return
+  let items = cNuGetRef(list, NuOffListItems)
+  let sizeAddr = cast[Il2CppPtr](cast[uint64](list) + uint64(NuOffListSize))
+  let n = cReadI32At(sizeAddr)
+  if n < 0'i32 or n > 4096'i32: return
+  if not nuOk(items, NuOffArrayFirst + 8'i32): return
+  var on = 0
+  var i = 0
+  while i < int(n) and i < NuMaxGroupToggles:
+    let slot = cast[Il2CppPtr](cast[uint64](items) +
+                               uint64(NuOffArrayFirst) + uint64(i) * 8'u64)
+    if not nuOk(slot, 8'i32): return
+    let tog = cReadPtrAt(slot, 0'i32)
+    if tog != nil:
+      let (ok, isOn) = nuToggleIsOn(tog)
+      if not ok: return
+      if isOn:
+        on = on + 1
+        onPtr = tog
+    total = total + 1
+    i = i + 1
+  result = on
+
 proc nuSetAsLastSibling*(rt: Il2CppPtr): bool =
   ## `Transform::SetAsLastSibling()` -- LAST in the parent's child list.
   ##
@@ -1429,6 +1625,27 @@ proc nuTargetsBindOk(): bool =
   # the single most expensive mistake available in this file.
   idx.add NuTToggleSet
   want.add "UnityEngine.UI.Toggle::Set"
+  # THE PANEL-SWITCH BLOCK. Every one of these six is the silent kind.
+  # `ShowScreen` and `set_IsSelected` are adjacent and BOTH take
+  # (this, <one small int>, MethodInfo*) -- a swap would call set_IsSelected on
+  # the SCREEN with a group number for a bool, which SetActive's the screen
+  # itself and every call still "succeeds". `ToggleSilently` and
+  # `SetToggleGroup` differ only in their second argument's KIND (bool vs
+  # reference), so a swap passes a ToggleGroup pointer where a bool belongs.
+  # `Close` and `CloseAll` are the two DETOUR targets here, and a mis-index
+  # there patches the wrong function -- the most expensive mistake available.
+  idx.add NuTScreenShowScreen
+  want.add "EFT.UI.Settings.SettingsScreen::ShowScreen"
+  idx.add NuTTabSetSelected
+  want.add "EFT.UI.Settings.SettingsTab::set_IsSelected"
+  idx.add NuTSpawnerSilent
+  want.add "EFT.UI.UIAnimatedToggleSpawner::ToggleSilently"
+  idx.add NuTToggleJoinGroup
+  want.add "UnityEngine.UI.Toggle::SetToggleGroup"
+  idx.add NuTScreenClose
+  want.add "EFT.UI.Settings.SettingsScreen::Close"
+  idx.add NuTScreenCloseAll
+  want.add "EFT.UI.Settings.SettingsScreen::CloseAll"
   var i = 0
   while i < idx.len:                      # capped: idx is built right here
     let ix = idx[i]
