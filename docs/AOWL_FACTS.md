@@ -7410,3 +7410,22 @@ picks the tile by displayed Label, logs every map on offer, presses this
 screen's own `ScreenDefaultButtons -> NextButton`, and reads back the screen
 going INACTIVE before waiting on site 0. The legacy all-roots toggle scan
 remains as a fallback and announces itself as the weaker path.
+
+## 2026-09-02 07:20: nativetabs steps 1 and 2 fully proven; cloned-row captions fixed
+
+MEASURED (build 4,831,232, Settings open, nativeTabsSubtabs on): all four
+verdicts PASS off the live objects -- `before we press anything: a stock tab
+is selected and exactly one STOCK panel is active -- Game Settings. Ours is
+off`; `subtabs (subtab selection): exactly one subtab reads m_IsOn=1
+(POSTFX)` (ONE verdict: the ten-in-160ms loop was our own set_IsToggled
+re-entering our postfix, now guarded); `after pressing OUR tab: OUR panel is
+the only active panel`; `after pressing GAME back: exactly one STOCK panel
+is active. Ours is off` (the stock ToggleGroup clears our toggle silently;
+the foreign-toggle-ON edge now hides ours). Stock SettingsList geometry
+byte-identical throughout.
+MEASURED: `mods label re-assert: PUT BACK 14 caption(s) of the 54 registered
+-- something had rewritten them since they were set. THE POLL RAN`, and
+acceptance `no donor caption on any aowlspt-cloned settings row: 0 on a
+(Clone)(Clone) row, 1 stock` PASS. Two dead gates in a row had kept that
+poll from ever running; a poll that cannot announce itself is
+indistinguishable from success.
