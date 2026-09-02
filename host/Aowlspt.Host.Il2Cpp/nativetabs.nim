@@ -51,6 +51,16 @@ var gNtTried = 0
 var gNtFaults = 0
 var gNtVerdictSaid = false
 
+## THE BREADCRUMB. Set before EVERY read of game memory and every call into
+## game code, and printed by the fault line.
+##
+## MEASURED NEED: on the first live run the tick faulted on the very first
+## frame Settings was known, four frames running, and the only thing the log
+## could say was 'the native-tabs tick FAULTED and was caught'. That named no
+## step and no expression, so the next move would have been to guess. Same
+## device as `gModSetStep` in modsettingsrender.nim, and for the same reason.
+var gNtStep = "not started"
+
 ## OUR TABS. Parallel seqs rather than a seq-of-object so the toggle table the
 ## detour postfix scans is a flat pointer list -- that scan is O(n) with n<=4
 ## on the game's own click path and must not chase a field offset per entry.
@@ -164,6 +174,7 @@ proc ntBuildOne(screenT, donorSpawnerT, donorPanelT: Il2CppPtr;
   if screenGo == nil: return
 
   # ---- 1. THE BUTTON -------------------------------------------------------
+  gNtStep = "button: donor GameObject + tab bar"
   let donorSpawnerGo = iGameObjectOf(donorSpawnerT)
   let togglesT = modsParentOf(donorSpawnerT)
   let togglesGo = (if togglesT != nil: iGameObjectOf(togglesT) else: nil)
@@ -171,39 +182,63 @@ proc ntBuildOne(screenT, donorSpawnerT, donorPanelT: Il2CppPtr;
     ntNoteFault("the donor tab spawner or the tab bar could not be reached; " &
                 "no button was made and nothing was changed")
     return
-  # THE STOCK GROUP, read from the DONOR before anything of ours exists. This
-  # is what makes exclusivity native: our toggle joins the group the stock tabs
-  # are in, and the game turns the others off for us.
-  let stockGroup = (if nuOk(donorSpawnerT, NuOffSpawnerToggleGroup + 8'i32):
-                      cNuGetRef(donorSpawnerT, NuOffSpawnerToggleGroup)
+  # THE STOCK GROUP, read from the DONOR's COMPONENT -- and that word is the
+  # whole fix.
+  #
+  # THE BUG THIS REPLACES: `_toggleGroup@0xb0` is a field on the
+  # `UIAnimatedToggleSpawner` COMPONENT, and this read it off
+  # `donorSpawnerT`, which is the TRANSFORM. A Transform is large enough that
+  # `nuOk` cleared the bounds check, so the read succeeded and returned an
+  # unrelated qword -- a plausible pointer from the wrong object. Exactly the
+  # receiver-type confusion that has bitten this repo before (a GameObject
+  # handed to a Transform walker), and it is silent by construction.
+  #
+  # `modsComponent` REFUSES a GameObject receiver up front, so the component
+  # is resolved through it rather than by assuming the Transform will do.
+  gNtStep = "button: resolving the donor UIAnimatedToggleSpawner component"
+  let donorSpawner = modsComponent(donorSpawnerT, "UIAnimatedToggleSpawner")
+  if donorSpawner == nil:
+    ntNoteFault("the donor tab button carries no UIAnimatedToggleSpawner " &
+                "component, so the stock ToggleGroup cannot be read from it. " &
+                "Nothing was changed")
+    return
+  gNtStep = "button: reading _toggleGroup@0xb0 off the donor COMPONENT"
+  let stockGroup = (if nuOk(donorSpawner, NuOffSpawnerToggleGroup + 8'i32):
+                      cNuGetRef(donorSpawner, NuOffSpawnerToggleGroup)
                     else: nil)
   if not nuOk(stockGroup, 0x10'i32):
     ntNoteFault("the stock tab bar's ToggleGroup could not be read from " &
-                "_toggleGroup@0xb0, so a new tab could not join it and " &
-                "exclusivity would have to be enforced by us. Refusing: that " &
-                "is the design this file exists to avoid")
+                "_toggleGroup@0xb0 on the donor COMPONENT, so a new tab " &
+                "could not join it and exclusivity would have to be enforced " &
+                "by us. Refusing: that is the design this file exists to avoid")
     return
+  gNtStep = "button: Instantiate of the donor tab spawner GameObject"
   let spawnerGo = modsClone(donorSpawnerGo)
   if spawnerGo == nil or not modsSetParent(spawnerGo, togglesGo):
     ntNoteFault("the tab spawner could not be cloned into the tab bar")
     return
   let spawnerT = modsTransformOf(spawnerGo)
+  gNtStep = "button: fact-93 reap of the spawner clone"
   discard ntReapSpawnerClone(spawnerT, donorSpawnerT, header)
+  gNtStep = "button: resolving the CLONE's UIAnimatedToggleSpawner component"
   let spawner = modsComponent(spawnerT, "UIAnimatedToggleSpawner")
   if spawner == nil:
     ntNoteFault("the cloned tab spawner has no UIAnimatedToggleSpawner " &
                 "component, so SpawnObject cannot be called on it")
     discard modsSetActive(spawnerGo, false)
     return
+  gNtStep = "button: SpawnObject() on the cloned spawner -- a call into game code"
   let toggle = nuSpawnerSpawn(spawner)
   if toggle == nil:
     ntNoteFault("SpawnObject returned nothing for the '" & header & "' tab")
     discard modsSetActive(spawnerGo, false)
     return
+  gNtStep = "button: SetHeaderText / SetActive on the cloned spawner"
   discard nuSpawnerHeader(spawner, header, 24'i32)
   discard nuSpawnerActive(spawner, true)
   # JOIN THE STOCK GROUP. The single most important call in this file: with it,
   # pressing our tab turns the stock ones off natively and vice versa.
+  gNtStep = "button: Toggle::set_group -- joining the stock ToggleGroup"
   if not nuToggleSetGroup(toggle, stockGroup):
     ntNoteFault("the new tab's toggle could not join the stock ToggleGroup, " &
                 "so two tabs could read selected at once")
@@ -216,12 +251,14 @@ proc ntBuildOne(screenT, donorSpawnerT, donorPanelT: Il2CppPtr;
     ntNoteFault("the donor panel has no GameObject")
     discard modsSetActive(spawnerGo, false)
     return
+  gNtStep = "panel: Instantiate of the Game Settings panel"
   let panelGo = modsClone(donorPanelGo)
   if panelGo == nil or not modsSetParent(panelGo, screenGo):
     ntNoteFault("the settings panel could not be cloned")
     discard modsSetActive(spawnerGo, false)
     return
   let panelT = modsTransformOf(panelGo)
+  gNtStep = "panel: resolving the cloned GameSettingsTab component"
   let tabComp = modsComponent(panelT, "GameSettingsTab")
   if tabComp == nil:
     ntNoteFault("the cloned panel carries no GameSettingsTab component, so " &
@@ -235,6 +272,7 @@ proc ntBuildOne(screenT, donorSpawnerT, donorPanelT: Il2CppPtr;
   #       re-create the stock rows;
   #   (b) CleanupCreatedControls once, to destroy the rows it was cloned WITH.
   # (a) first: cleaning first and then letting Show run would simply refill it.
+  gNtStep = "panel: Behaviour::set_enabled(false) on the cloned GameSettingsTab"
   let disabled = nuBehaviourEnable(tabComp, false)
   let cleaned = nuTabCleanupControls(tabComp)
   okLog "native tabs: '" & header & "' panel clone -- GameSettingsTab " &
@@ -242,6 +280,7 @@ proc ntBuildOne(screenT, donorSpawnerT, donorPanelT: Il2CppPtr;
         "called=" & $cleaned & ". (a) before (b) on purpose: cleaning a live " &
         "component and then letting its Show run would refill the panel with " &
         "the donor's rows."
+  gNtStep = "panel: reading _settingsRoot@0x98 off the cloned tab component"
   let rowRoot = (if nuOk(tabComp, NuOffGameTabSettingsRoot + 8'i32):
                    cNuGetRef(tabComp, NuOffGameTabSettingsRoot) else: nil)
   if not nuOk(rowRoot, 0x10'i32):
@@ -302,11 +341,13 @@ proc ntBuild(): bool =
     ntNoteFault("the aowl_nu_targets POSITIONAL self-check FAILED, so every " &
                 "call here would go to the wrong method. Nothing was built")
     return
+  gNtStep = "build: iToTransform(gModsLastTabPtr) -- the live settings tab"
   let tabT = iToTransform(gModsLastTabPtr)
   let screenT = (if tabT != nil: modsParentOf(tabT) else: nil)
   if screenT == nil:
     ntNoteFault("could not reach the SettingsScreen from the live tab")
     return
+  gNtStep = "build: walking SettingsScreen children (Toggles / GameToggleSpawner / Game Settings)"
   let toggles = modsChildNamed(screenT, "Toggles")
   let donorSpawner = (if toggles != nil:
                         modsChildNamed(toggles, "GameToggleSpawner") else: nil)
@@ -318,8 +359,10 @@ proc ntBuild(): bool =
                 (if donorPanel == nil: "Game-Settings" else: "") &
                 "). Nothing was changed")
     return
+  gNtStep = "build: ntBuildOne"
   if not ntBuildOne(screenT, donorSpawner, donorPanel, "nt-proof", "PROOF"):
     return
+  gNtStep = "build: collecting the stock panels under SettingsScreen"
   ntCollectStockPanels(screenT)
   gNtBuilt = true
   result = true
@@ -391,9 +434,12 @@ proc ntTickBody() =
   ## Every frame while armed. Steady state: two boolean tests and, once built,
   ## one integer compare -- the press arrives from the detour, not from a hunt.
   if not gNtOn or gNtOff: return
+  gNtStep = "tick: entry"
   if not gNtBuilt:
     if gModsLastTabPtr != nil and gNtTried < 8:
+      gNtStep = "tick: ntBuild (attempt " & $(gNtTried + 1) & ")"
       discard ntBuild()
+      gNtStep = "tick: ntBuild returned without faulting"
     return
   if gModsLastTabPtr == nil:
     gNtVerdictSaid = false
@@ -403,12 +449,15 @@ proc ntTickBody() =
   if gNtPressed >= 0:
     let idx = gNtPressed
     gNtPressed = -1
+    gNtStep = "tick: reading m_IsOn off the toggle that was pressed"
     let (ok, isOn) = nuToggleIsOn(gNtToggle[idx])
     if ok:
       if isOn: ntShow(idx)
       else: ntHide()
       gNtVerdictSaid = false
+  gNtStep = "tick: verdict (reading panel activeSelf off the live tree)"
   ntVerdict()
+  gNtStep = "tick: idle"
 
 proc ntBindToggleEvent(verbose: bool): bool =
   ## Bind the ONE detour this feature needs. Prologue-verified through `nuFn`
@@ -461,4 +510,7 @@ proc ntTick() =
   gModsBranch = 5
   if cModsGuarded(cast[Il2CppPtr](0)) == nil:
     ntNoteFault("the native-tabs tick FAULTED and was caught; the game " &
-                "survived. Nothing stock was left changed")
+                "survived and nothing stock was left changed. THE STEP THAT " &
+                "FAULTED WAS: " & gNtStep & " -- that breadcrumb is set " &
+                "immediately before each read of game memory and each call " &
+                "into game code, so it names where, not merely that.")
