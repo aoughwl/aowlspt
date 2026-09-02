@@ -6108,3 +6108,15 @@ Uncovered underneath, once the crash was out of the way:
 `aowl/src/aowlspt/` left `host/common/jsonpath.nim` as `import
 aowlspt/jsonpath; export jsonpath`, and the host's `import jsonpath` does not
 see the symbols through it. A plain `include` of the moved file is being tested.
+
+## ROOT CAUSE of the tree-wide crash: `export jsonpath` (a module re-export) kills nimony's hexer
+
+Falsified the include-bisect's "uihooks" verdict: in the SAME worktree, with
+uihooks.nim still included, replacing `host/common/jsonpath.nim`'s
+`import aowlspt/jsonpath; export jsonpath` with a plain
+`include "../../aowl/src/aowlspt/jsonpath.nim"` made the host build PASS
+(artifact 4,571,648). So the trigger was the module re-export, and removing
+uihooks had merely changed which failure surfaced first. Lesson for bisects:
+"removing X changes the error" is not "X is the cause" unless the tree then
+BUILDS; classify OK separately from ORDINARY-errors and prefer the experiment
+that produces an artifact. Rule: never `export <module>` in this codebase.
