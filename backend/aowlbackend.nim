@@ -1176,6 +1176,110 @@ var gWarmHits = 0
 var gWarmRefused = 0
 var gWarmSession = ""         ## the second input the self-check uses
 
+# ------------------------------------------------- readiness and the warm gate
+#
+# STARTUP RACE, measured 2026-09-01. The client draws the native dialog
+# `Unable to check the client version` and dies when its first request --
+# `/client/game/version/validate` -- does not get an answer quickly enough.
+# Two separate things could produce that, and both are removed here rather than
+# made less likely:
+#
+# 1. THE LISTENER WAS NOT UP YET. `cNetServe` used to be called *after*
+#    `loadAll`, so between the bind (`reservePort`, ~0.05 s) and the listen
+#    nobody answered `connect` at all: MEASURED 4.656 s to `listening` on a boot
+#    where `aowl.waypoints` built 8,556 patrol points, against 3.55 s the build
+#    before. The listen now happens BEFORE the mods load, and a request that
+#    arrives while they are still loading WAITS in `waitForMods` below instead
+#    of meeting a route table that does not have its routes in it yet. A
+#    request held for two seconds and then answered correctly is a slow boot; a
+#    404, or a connection nothing accepts, is a fatal dialog.
+#
+# 2. THE WARM BUILD WAS RUNNING. Warm is one route per serve-loop tick and it
+#    runs on the serve loop's OWN thread, never on an accept worker -- so it
+#    does not block a request by occupying its thread, and any claim that it
+#    does is refuted by `main`'s loop and `cNetServe(gPort, 16)`. What it DOES
+#    do is put a 15 MB-body handler and an 859 ms deflate in flight against the
+#    one process-wide `aowl_lock` that the compressed-body cache, the warm
+#    table, the timer list and `modstore`'s profile I/O all share. Measured
+#    window on the failing boot: warm ran 5.1 s -> 9.0 s and the dialog appeared
+#    at ~8 s. So warm is now GATED: it does not begin until either the client's
+#    own first handshake has been answered, or `WarmGateGraceMs` has passed with
+#    no client at all. Nothing else about the warm cache changes.
+#
+# Both flags are only ever written false -> true, and a reader that sees a stale
+# `false` waits, or defers one more tick -- the harmless direction in both.
+
+const
+  ModsReadyWaitMs = 30_000'i64
+    ## How long a request that arrived before the mods finished loading waits
+    ## for them. Longer than any mod load measured here (worst 4.6 s), and
+    ## bounded so a wedged `on_load` produces a well-formed 503 rather than a
+    ## connection that is never answered at all.
+  ModsReadyPollMs = 5'i32
+  WarmGateGraceMs = 20_000'i64
+    ## With no client, warm still has to happen: `aowl test`, `soak`, `fuzzwire`
+    ## and any headless run never send a handshake. After this long since the
+    ## listener came up the gate opens on its own, and says so.
+  HandshakeUrl = "/client/game/version/validate"
+    ## The client's FIRST request, and the one whose failure draws the dialog.
+    ## Named here rather than in `mods/tarkov` because what this file does with
+    ## it -- open the warm gate -- is the pipeline's business, not the game's.
+
+var gModsReady = false
+  ## False from process start until `loadAll` has returned. Read by every accept
+  ## worker, written once by the main thread.
+var gModsReadyMs = 0'i64
+var gHeldRequests = 0
+  ## How many requests had to wait for the mods. Reported once, because a boot
+  ## where this is 0 and a boot where it is 40 are the same boot from the
+  ## outside and only one of them was a race.
+var gWarmGateOpen = false
+var gWarmGateReason = ""
+var gServeStartMs = 0'i64
+  ## `elapsedMs()` when the listener came up. 0 until then, which is what
+  ## `warmStep`'s grace is measured from.
+
+proc warmGateOpen(reason: string) =
+  ## Idempotent, and it records WHY, because "warm started late" and "warm never
+  ## started at all" are indistinguishable in a log that only carries what warm
+  ## managed to do.
+  ##
+  ## Under `cLock` because the two callers are on different threads -- an accept
+  ## worker on the handshake, the serve loop on the grace -- and the loser of
+  ## that race must not also write the string the winner is writing.
+  if gWarmGateOpen:
+    return
+  cLock()
+  let first = not gWarmGateOpen
+  if first:
+    gWarmGateReason = reason
+    gWarmGateOpen = true
+  cUnlock()
+  if first:
+    modhost.info "warm gate open (" & reason & ")"
+
+proc waitForMods(): bool =
+  ## True if the mods are loaded and this request may proceed; false if it
+  ## waited `ModsReadyWaitMs` and they still are not.
+  ##
+  ## This is the whole of the listen-before-mods fix on the serving side. The
+  ## alternative -- dispatch anyway -- would 404 a route whose mod has not
+  ## registered it yet, and the client's answer to a 404 on the handshake is the
+  ## fatal dialog. The alternative *below* -- 503 immediately -- is the same
+  ## thing with a nicer status line. So the request waits, and only a genuinely
+  ## wedged load turns into the 503 the caller sees.
+  if gModsReady:
+    return true
+  inc gHeldRequests
+  let t0 = elapsedMs()
+  while not gModsReady:
+    if elapsedMs() - t0 >= ModsReadyWaitMs:
+      return false
+    cSysSleep(ModsReadyPollMs)
+  modhost.info "held a request " & $(elapsedMs() - t0) &
+               " ms while the mods finished loading"
+  result = true
+
 # ------------------------------------------------------- conditional GET
 #
 # MEASURED, from the BSG capture manifest (`mods/tarkov/data/capture/raid1/
@@ -1285,6 +1389,18 @@ proc warmStep() =
   ## twenty tables back to back would hold it for a second and a half.
   if not gWarmOn or gWarmExpired or gWarmNext >= WarmRoutes.len:
     return
+  if not gModsReady:
+    # The listener is up before the mods are (see `waitForMods`), so this loop
+    # now runs during the load. Warming a half-registered route table would
+    # measure whichever mods happened to be in already.
+    return
+  if not gWarmGateOpen:
+    # THE GATE. See `warmGateOpen`. The client's handshake opens it; with no
+    # client, the grace does.
+    if gServeStartMs > 0'i64 and elapsedMs() - gServeStartMs >= WarmGateGraceMs:
+      warmGateOpen("no client after " & $(WarmGateGraceMs div 1000) & " s")
+    else:
+      return
   if not gWarmStarted:
     gWarmStarted = true
     gWarmBornMs = elapsedMs()
@@ -1501,6 +1617,24 @@ proc handleRequest(sock: uint64; buf: HostPtr; len: int32;
   # row; after `parseHead`, because there is no URL to name until it has run.
   perfBegin(req.url)
 
+  # THE READINESS GATE. The listener is up before the mods are loaded, so a
+  # request can genuinely arrive at an empty route table -- and this is the only
+  # place that difference is visible. See `waitForMods` for why it waits rather
+  # than answering at once.
+  if not gModsReady:
+    if not waitForMods():
+      # Well-formed, JSON, and it names the state rather than the symptom: a
+      # reset or a 404 here is what the client turns into `Unable to check the
+      # client version`, and neither of those says which of the twenty possible
+      # causes it was.
+      sendResponse(sock, "503 Service Unavailable",
+                   "{\"err\":\"the server is still loading its mods\"," &
+                   "\"retryAfterMs\":500,\"url\":" & jsonQuoted(req.url) &
+                   "}", false, false)
+      modhost.warn "still loading mods after " & $(ModsReadyWaitMs div 1000) &
+                   " s; answered 503 for " & req.url
+      return 0'i32
+
   # Refused rather than served, and the poller never waited for the body: the
   # allocation *is* the attack. See `MaxBodyBytes`.
   if contentLength > MaxBodyBytes:
@@ -1589,6 +1723,14 @@ proc handleRequest(sock: uint64; buf: HostPtr; len: int32;
     if websocket.handshake(sock, head, req.session, ticket):
       return 2'i32
     return 0'i32
+
+  # The client's first request has reached a route. Everything expensive the
+  # server does to itself is allowed to begin AFTER this, not during it.
+  # `startsWith`, not `==`: the client appends query strings, and a gate that
+  # only ever matched the bare path would have stayed shut for the whole run
+  # with nothing saying so.
+  if not gWarmGateOpen and startsWith(req.url, HandshakeUrl):
+    warmGateOpen("the client handshaked")
 
   let tMatch = perfNow()
   var route = Route(url: "", kind: RouteStatic, cb: cast[HostPtr](0),
@@ -3147,11 +3289,14 @@ proc main(): int =
   # to write its answer.
   websocket.wsBind(wsRawSend, wsFrameSend, wsAdopt)
 
-  let modsDir = joinPath(gRoot, "mods")
-  let count = loadAll(modsDir, SideServer, HostName, HostVersion)
-  console.line "  mods  " & $count
-  console.line "  routes " & $gRoutes.len
-
+  # THE MOD LOAD USED TO BE HERE, above the listener, and that is the startup
+  # race: nothing answered `connect` on 443 until every server mod had finished
+  # its `on_load` -- 4.656 s on the boot that produced `Unable to check the
+  # client version`, because `aowl.waypoints` builds 8,556 patrol points first.
+  # It now happens after `cNetServe` below, and `waitForMods` holds any request
+  # that arrives in between. Nothing about the ORDER OF SETUP changed: the
+  # database, the store lock, `modcontrol.controlInit` and `websocket.wsBind`
+  # are all still done before a single mod exists, which is what they required.
   # Sixteen *request* workers, which is a different thing from what this
   # number used to be.
   #
@@ -3213,6 +3358,7 @@ proc main(): int =
   # `wstest` and `aowlspt-verify` all wait for exactly that string to decide the
   # server is up.
   let scheme = if tlsMode: "https" else: "http"
+  gServeStartMs = elapsedMs()
   modhost.okLog "listening on " & scheme & "://127.0.0.1:" & $gPort
   console.line "  port  " & $gPort & (if tlsMode: " (TLS)" else: "")
 
@@ -3294,6 +3440,23 @@ proc main(): int =
     modhost.warn "no plain-HTTP control listener: mod management, settings " &
                  "and profile creation are unreachable from the launcher, " &
                  "which speaks plain HTTP only"
+
+  # NOW the mods. The socket is listening, the control port is published, and
+  # any request that arrives during this waits in `waitForMods` rather than
+  # meeting a route table that is still being filled.
+  let modsDir = joinPath(gRoot, "mods")
+  let count = loadAll(modsDir, SideServer, HostName, HostVersion)
+  gModsReadyMs = elapsedMs()
+  gModsReady = true
+  console.line "  mods  " & $count
+  console.line "  routes " & $gRoutes.len
+  # The readback for the whole fix, in one line, with the number that says
+  # whether the race was live on THIS boot: `held 0` means the client had not
+  # asked yet, `held 3` means it had and the old build would have failed.
+  modhost.okLog "mods loaded (" & $count & " mods, " & $gRoutes.len &
+                " routes) at " & $gModsReadyMs & " ms; listening since " &
+                $gServeStartMs & " ms; held " & $gHeldRequests &
+                " request(s) meanwhile"
 
   console.line ""
   console.line "  serving. Ctrl-C to stop."

@@ -180,10 +180,61 @@ static int32_t aowl_http_call(int32_t port, const char* req, int32_t reqLen,
   aowl_sp_closesocket(s);
   return (int32_t)have;
 }
+
+/* Connect, and close. Nothing is sent and nothing is read.
+ *
+ * This exists because the launcher cannot speak TLS and therefore could not
+ * ask a TLS backend anything -- it fell back to reading the backend's own log
+ * for `listening on`, which on a back-to-back restart is the PREVIOUS run's
+ * file. A TCP connect is the one readiness signal that is true for a TLS
+ * listener, cannot be stale, and costs nothing:
+ *
+ *   -1  winsock could not be loaded, so the question cannot be asked
+ *    0  the connect was refused -- nobody is listening on that port
+ *    1  something accepted a connection there
+ *
+ * `aowl_http_call` cannot stand in for this against a TLS port: it sends a
+ * plain HTTP request, the TLS server waits for a ClientHello that never comes,
+ * and the probe pays the 15 s receive timeout. Sending nothing is the point.
+ *
+ * A bind WITHOUT a listen -- which is exactly what the backend's `reservePort`
+ * holds for the first several seconds of its startup -- refuses connect with
+ * RST. So a 1 from here means `listen(2)` has been called, which is the event
+ * the client needs and the event the log line only claims.
+ */
+static int32_t aowl_tcp_connects(int32_t port) {
+  SOCKET s;
+  struct sockaddr_in a;
+  if (!aowl_sws_ready()) return -1;
+  s = aowl_sp_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  if (s == INVALID_SOCKET) return -1;
+  memset(&a, 0, sizeof(a));
+  a.sin_family = AF_INET;
+  a.sin_port = aowl_sp_htons((unsigned short)port);
+  a.sin_addr.s_addr = aowl_sp_htonl(INADDR_LOOPBACK);
+  if (aowl_sp_connect(s, (struct sockaddr*)&a, (int)sizeof(a)) == SOCKET_ERROR) {
+    aowl_sp_closesocket(s);
+    return 0;
+  }
+  aowl_sp_closesocket(s);
+  return 1;
+}
 """.}
 
 proc cHttpCall(port: int32; req: cstring; reqLen: int32; outBuf: pointer;
                outCap: int32): int32 {.importc: "aowl_http_call", nodecl.}
+proc cTcpConnects(port: int32): int32 {.importc: "aowl_tcp_connects", nodecl.}
+
+proc connects*(port: int): int =
+  ## 1 something is accepting TCP connections on 127.0.0.1:`port`, 0 nothing is,
+  ## -1 the question cannot be asked. See `aowl_tcp_connects` above.
+  ##
+  ## This is the ONLY readiness check in this codebase that works against the
+  ## TLS port, and it is deliberately weaker than `answers`: it establishes that
+  ## a listener exists, not that it routes. The launcher wants both, in that
+  ## order -- a log line that says the backend listened, and a socket that
+  ## proves it is still true now.
+  result = int(cTcpConnects(int32(port)))
 
 const
   ProbeSession* = "000000000000000000000001"

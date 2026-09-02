@@ -300,6 +300,12 @@ type
       ## the resolution order in `resolveModBuilder`.
     noModBuild: bool
     modBuildForce: bool
+    readyProbe: bool
+      ## `--ready-probe`: answer "is the backend ready on this port, right now"
+      ## and exit, starting nothing. It exists so that the readiness RULE can be
+      ## falsified from outside this process -- see `tools/test_startup_race.py`,
+      ## whose negative control is a `aowlspt-backend.log` containing
+      ## `listening on` with nothing at all on the port. That case must exit 3.
     help: bool
 
 proc parseArgs(): Options =
@@ -314,7 +320,7 @@ proc parseArgs(): Options =
                    lowRender: false, renderW: 1280, renderH: 720,
                    noGraphics: false,
                    modBuild: "", noModBuild: false, modBuildForce: false,
-                   help: false)
+                   readyProbe: false, help: false)
   var i = 1
   let n = paramCount()
   while i <= n:
@@ -426,6 +432,8 @@ proc parseArgs(): Options =
             v = v * 10 + (ord(ch) - ord('0'))
             any = true
         if any: result.backendWait = v
+    elif a == "--ready-probe":
+      result.readyProbe = true
     elif a == "--dry-run" or a == "-n":
       setDryRun true
     elif a == "--force":
@@ -604,11 +612,59 @@ type
       ## pane is showing the PREVIOUS session's file, and the pane title says
       ## so -- an old log presented as a live one is the kind of confidently
       ## wrong answer this launcher exists to avoid.
+    serverFresh: bool
+      ## True once `rotateServerLog` has proved the backend log on disk is not
+      ## the previous run's. While it is FALSE, nothing in the server log may be
+      ## treated as evidence about this run -- see `rotateServerLog` for the
+      ## measured failure that rule comes from.
 
 proc newLogs(root: string): Logs =
   result = Logs(server: newTail(joinPath(root, "aowlspt\\aowlspt-backend.log")),
                 client: newTail(joinPath(root, "aowlspt\\aowlspt-host.log")),
-                clientStarted: false)
+                clientStarted: false, serverFresh: false)
+
+proc rotateServerLog(root: string; l: var Logs): bool =
+  ## Move the previous run's backend log out of the way, BEFORE the backend is
+  ## spawned, and start following an empty path.
+  ##
+  ## THIS IS THE STARTUP RACE, and it is a defect in this file, not in the
+  ## backend. `waitForBackend` in TLS mode decides the server is up by finding
+  ## `listening on` in `aowlspt-backend.log`. That file is the PREVIOUS run's
+  ## until the new backend truncates it, roughly 40 ms after spawn -- and
+  ## `logs` is created ~300 lines earlier, during preflight, so the first
+  ## `pumpBoth` inside `waitForBackend` reads the whole stale file from offset
+  ## zero. `aowl_tail_read` cannot save this: it detects a truncation by
+  ## `size < offset` or by a change in `creationTime ^ fileIndex`, and on the
+  ## FIRST read the offset is 0 (so the size test cannot fire) while
+  ## `CREATE_ALWAYS` over an existing file KEEPS both the creation time and the
+  ## MFT index (so the stamp test cannot fire either). The stale `listening on`
+  ## is therefore ingested as this run's.
+  ##
+  ## MEASURED 2026-09-01: backend spawned 22:48:25, client spawned 22:48:27,
+  ## the real `listening on` written at 0:00:05.9 -- the client was started
+  ## nearly four seconds before anything was listening, its NATIVE pre-
+  ## `il2cpp_init` version check found no server, and it drew
+  ## `Unable to check the client version`. No client log folder is ever created
+  ## on that path, which is why it looked like a crash with no evidence.
+  ##
+  ## Returns true when the log path is now genuinely absent. False is not fatal
+  ## -- `waitForBackend` still has the TCP probe, which cannot be stale -- but
+  ## it IS reported, because a rotation that quietly did nothing would put the
+  ## bug straight back.
+  let path = joinPath(root, "aowlspt\\aowlspt-backend.log")
+  if not fileExists(path):
+    l.server = newTail(path)
+    l.serverFresh = true
+    return true
+  # Kept rather than deleted: it is the evidence for whatever went wrong last
+  # time, and this is the only moment anything is in a position to save it.
+  discard copyFileAt(path, path & ".prev", overwrite = true)
+  discard removeFileAt(path)
+  result = not fileExists(path)
+  # A fresh `Tail`, unconditionally. Even when the remove failed, the offset
+  # must not carry over from a file this launcher has not read.
+  l.server = newTail(path)
+  l.serverFresh = result
 
 proc pumpBoth(l: var Logs) =
   discard l.server.pump()
@@ -1065,16 +1121,32 @@ proc paintPhase(panel: var Panel; logs: var Logs; s: Screen;
 
 proc waitForBackend(port: int; tls: bool; backendProc: uint64;
                     limitSecs: int; logs: var Logs;
-                    died, answered, probeBroken: var bool) =
+                    died, answered, probeBroken: var bool;
+                    waitedMs: var int64) =
   ## Poll until the backend is ready, showing its own progress -- and both logs
   ## -- while it does.
   ##
-  ## "Ready" is observed two different ways, because the launcher speaks plain
-  ## HTTP and cannot open a TLS request. In plain mode readiness is a request
-  ## coming back -- an answer beats a corpse, a dead process is not waited for.
-  ## In TLS mode it is the backend's own `listening on ...` line in the log,
-  ## which it writes only after `aowl_net_serve_tls` binds -- the same event,
-  ## reported by the process that owns it rather than probed from outside.
+  ## READINESS IS A SOCKET, NOT A SENTENCE. In plain mode it is a request coming
+  ## back -- an answer beats a corpse, a dead process is not waited for. In TLS
+  ## mode the launcher cannot open a TLS request, so it used to accept the
+  ## backend's own `listening on ...` line in the log INSTEAD. That is the bug
+  ## in `rotateServerLog`: the log on disk is the previous run's until the new
+  ## backend truncates it, and this loop's first pump reads it whole. The
+  ## launcher then declared the server ready ~2 s in and started the client
+  ## nearly four seconds before anything was listening.
+  ##
+  ## So TLS readiness is now BOTH, and the socket is the one that can refuse:
+  ##
+  ##   * `aowlsession.connects(port)` -- a real TCP connect, closed at once. A
+  ##     bind without a listen (which is what the backend holds for the first
+  ##     seconds of startup) refuses it, so a success means `listen(2)` has
+  ##     happened. Nothing about it can be stale.
+  ##   * the `listening on` line, but ONLY when `logs.serverFresh` says the file
+  ##     is this run's. When the rotation failed the line is ignored entirely
+  ##     and the connect stands alone.
+  ##
+  ## `waitedMs` comes back with how long that took, so the launcher can say the
+  ## measured number rather than "the backend is ready".
   died = false
   answered = false
   probeBroken = false
@@ -1103,15 +1175,23 @@ proc waitForBackend(port: int; tls: bool; backendProc: uint64;
     # the pane empties and refills with this run.
     pumpBoth(logs)
     if tls:
-      # Cannot probe HTTPS, so the log is the signal. The `listening` line is
-      # written after the TLS bind, so it means exactly what an answered request
-      # would in plain mode -- with the process-alive check still underneath, so
-      # a backend that died before it logged anything is not waited for.
-      let b = scanBoot(logs.server)
-      if b.listening:
-        answered = true
-      elif backendProc != 0'u64 and cSpawnAlive(backendProc) == 0'i32:
-        died = true
+      # The socket first, and on its own terms. `connects` sends nothing, so it
+      # costs a loopback SYN against a TLS listener rather than the 15 s
+      # receive timeout `answers` would pay there.
+      let c = connects(port)
+      if c < 0:
+        probeBroken = true
+      else:
+        # The log line is a CORROBORATION, never the whole verdict, and only
+        # when the file is known to be this run's. `serverFresh` false means the
+        # previous log could not be moved aside, in which case anything in it
+        # may predate this process by a whole session.
+        let b = scanBoot(logs.server)
+        let said = logs.serverFresh and b.listening
+        if c == 1 and (said or not logs.serverFresh):
+          answered = true
+        elif backendProc != 0'u64 and cSpawnAlive(backendProc) == 0'i32:
+          died = true
     else:
       # Asked before the liveness check on purpose. If the backend this launcher
       # started lost a race for the port to one somebody else had already
@@ -1162,6 +1242,8 @@ proc waitForBackend(port: int; tls: bool; backendProc: uint64;
     if interrupted():
       break
     sleepMs 120
+
+  waitedMs = cNowMs() - began
 
   if painting:
     # One last paint so the finished state is what is left in the scrollback,
@@ -2183,6 +2265,43 @@ proc main(): int =
   # reason there used to be two screens.
   var logs = newLogs(root)
 
+  # `--ready-probe`: answer "is a backend ready on this port, right now" and
+  # exit. BEFORE the install preflight on purpose -- the probe reads a log and
+  # opens a socket, and refusing it because the scratch tree has no
+  # EscapeFromTarkov.exe in it would make the readiness rule untestable
+  # anywhere except a full install.
+  #
+  # It answers with the same two facts `waitForBackend` decides on, and gives
+  # the SOCKET the casting vote, so the case this whole change is about -- a
+  # stale `aowlspt-backend.log` from the previous run saying `listening on`
+  # while nothing is listening -- comes back NOT READY.
+  # `tools/test_startup_race.py` drives exactly that, and drives the positive
+  # control too: the same stale log WITH a real listener must come back READY,
+  # or the check would be one that cannot fail.
+  if o.readyProbe:
+    let probePort = if o.portGiven: o.port else: 443
+    heading "Readiness probe"
+    discard logs.server.pump()
+    let b = scanBoot(logs.server)
+    let tcp = connects(probePort)
+    line "  log says listening   " & (if b.listening: "yes" else: "no")
+    line "  tcp accepts          " &
+         (if tcp == 1: "yes" elif tcp == 0: "no" else: "cannot ask")
+    if tcp < 0:
+      warn "INCONCLUSIVE: winsock could not be loaded, so nothing was " &
+           "probed. That is not a pass."
+      return 4
+    if tcp == 1:
+      ok "READY: 127.0.0.1:" & $probePort & " accepted a connection"
+      return 0
+    err "NOT READY: nothing accepted a connection on 127.0.0.1:" &
+        $probePort &
+        (if b.listening:
+           ", and the `listening on` line in the backend log is therefore " &
+           "from an EARLIER run"
+         else: "")
+    return 3
+
   let exePath = joinPath(root, o.exeName)
   let hostDll = joinPath(root, "aowlspt\\aowlspt-host-il2cpp.dll")
 
@@ -2507,6 +2626,15 @@ proc main(): int =
       # badly, the pane it now has in the log view -- and closing that window
       # killed the server. Its log file is the same text and outlives the run.
       if https: bc.add " --tls"
+      # BEFORE the spawn, not after. See `rotateServerLog`: after the spawn
+      # there is a window in which the file on disk is still the last run's and
+      # this launcher is already reading it for the word `listening`.
+      let rotated = rotateServerLog(root, logs)
+      if not rotated:
+        warn "could not move the previous " &
+             joinPath(root, "aowlspt\\aowlspt-backend.log") &
+             " aside, so nothing in it can be trusted to be from this run. " &
+             "Readiness will be decided by a TCP connect alone."
       backendProc = cSpawnQuiet(toCString(be), toCString(bd), toCString(bc))
       if backendProc == 0'u64:
         err "could not start the backend"
@@ -2538,8 +2666,9 @@ proc main(): int =
         var died = false
         var answered = false
         var probeBroken = false
+        var waitedMs = 0'i64
         waitForBackend(port, https, backendProc, o.backendWait, logs,
-                       died, answered, probeBroken)
+                       died, answered, probeBroken, waitedMs)
         if died:
           err "the backend exited while starting; see " &
               joinPath(root, "aowlspt\\aowlspt-backend.log")
@@ -2549,10 +2678,18 @@ proc main(): int =
                "whether it is ready could not be checked. Starting the " &
                "client anyway."
         elif answered:
+          # The MEASURED wait, in the line, every launch. A launcher that says
+          # "ready" without it cannot be told apart from one that believed a
+          # stale log -- which is exactly what it was doing.
           if https:
-            ok "the backend is listening on 127.0.0.1:" & $port & " over TLS"
+            ok "the backend accepted a TCP connection on 127.0.0.1:" & $port &
+               " after " & $waitedMs & " ms" &
+               (if logs.serverFresh: " (and this run's log says listening)"
+                else: " (its log could not be rotated, so only the socket was " &
+                      "trusted)")
           else:
-            ok "the backend is answering on 127.0.0.1:" & $port
+            ok "the backend is answering on 127.0.0.1:" & $port & " after " &
+               $waitedMs & " ms"
         else:
           warn "the backend has not answered after " & $o.backendWait &
                "s and is still running. Starting the client anyway -- it may " &
