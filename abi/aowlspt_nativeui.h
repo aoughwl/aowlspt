@@ -617,6 +617,27 @@ typedef struct AowlNuTarget {
 #define AOWL_NU_TAB_CLEANUPCONTROLS   59
 #define AOWL_NU_TOGGLE_SET_GROUP      60
 #define AOWL_NU_TOGGLE_SET            61
+/* --- CANVASGROUP (indices 62..66) -----------------------------------------
+ *
+ * WHY. The subtab strip is cloned from `Control Settings/Toggles` while that
+ * panel is HIDDEN, so the clone inherits whatever CanvasGroup state the donor
+ * had at clone time -- plausibly alpha 0 and blocksRaycasts false. That is a
+ * precise fit for the reported defect: the strip renders (its children have
+ * their own graphics) but POSTFX "does not take a mouse click", because a
+ * CanvasGroup with blocksRaycasts=false swallows nothing and interactable=
+ * false makes every Selectable under it inert -- while `Toggle::Set` called
+ * from our own code still works, which is exactly what was observed.
+ *
+ * CanvasGroup has NO managed fields (all native), so these have to be calls.
+ * `get_blocksRaycasts` is SHARED x2 -- safe to CALL, never to detour.
+ *
+ * PROVENANCE: il2cpp_resolve.py typemethods UnityEngine.CanvasGroup -> RVA and
+ * sharedness; bytes <RVA> 16 -> the sigs below. */
+#define AOWL_NU_CG_GET_ALPHA          62
+#define AOWL_NU_CG_SET_ALPHA          63
+#define AOWL_NU_CG_GET_INTERACTABLE   64
+#define AOWL_NU_CG_SET_INTERACTABLE   65
+#define AOWL_NU_CG_SET_BLOCKSRAYCASTS 66
 
 /* UnityEngine.RenderMode. Named, because `0` appearing bare in a refusal is
  * indistinguishable from "we did not read anything". */
@@ -879,6 +900,22 @@ static const AowlNuTarget aowl_nu_targets[] = {
     { "UnityEngine.UI.Toggle::Set", 0x55BA450u,
       { 0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x74,0x24,0x10,0x57,0x48,0x83,
         0xEC,0x20,0x80 }, 16 },
+    /* --- CanvasGroup. See AOWL_NU_CG_GET_ALPHA. --- */
+    { "UnityEngine.CanvasGroup::get_alpha", 0x5580A20u,
+      { 0x40,0x53,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,0x7B,0x73,0xB5,0x01,
+        0x48,0x8B,0xD9 }, 16 },
+    { "UnityEngine.CanvasGroup::set_alpha", 0x5580A70u,
+      { 0x40,0x53,0x48,0x83,0xEC,0x30,0x48,0x8B,0x05,0x33,0x73,0xB5,0x01,
+        0x48,0x8B,0xD9 }, 16 },
+    { "UnityEngine.CanvasGroup::get_interactable", 0x5580AD0u,
+      { 0x40,0x53,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,0xDB,0x72,0xB5,0x01,
+        0x48,0x8B,0xD9 }, 16 },
+    { "UnityEngine.CanvasGroup::set_interactable", 0x5580B20u,
+      { 0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,
+        0x8F,0x72,0xB5 }, 16 },
+    { "UnityEngine.CanvasGroup::set_blocksRaycasts", 0x5580BD0u,
+      { 0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,
+        0xEF,0x71,0xB5 }, 16 },
 };
 
 #define AOWL_NU_TARGET_COUNT \

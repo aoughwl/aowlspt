@@ -205,7 +205,8 @@ var gNtPressed = -1
 ## Frame-separated on purpose: a panel switched this frame is not laid out
 ## until the next, and judging on the switching frame is what produced the
 ## meaningless '6 panels active'.
-var gNtProofOn = false            ## `nativeTabsProofSelect`, default ON
+var gNtProofOn = false            ## `nativeTabsProofSelect`, now default OFF
+var gNtProofTabOn = false         ## `nativeTabsProofTab`, default OFF
 var gNtGameToggle: Il2CppPtr = nil ## the stock GAME tab's toggle, for the way back
 var gNtProofPhase = 0             ## 0 idle .. 6 done
 var gNtProofWait = 0
@@ -242,6 +243,36 @@ var gNtSubToggle: seq[Il2CppPtr] = @[]  ## [0]=GRAPHICS SETTINGS, [1]=POSTFX
 var gNtSubSel = 0
 var gNtGfxPanelGo: Il2CppPtr = nil ## the STOCK Graphics Settings panel
 var gNtSubPressed = -1
+## THE STRIP BELONGS TO THE STOCK GRAPHICS TAB, NOT TO ONE OF OURS.
+##
+## USER-VISIBLE DEFECT this corrects, reported verbatim: "when I clicked
+## Settings I saw the GRAPHICS+POSTFX subtabs flash then get deleted under the
+## default main GAME tab; when I clicked into GRAPHICS I don't see the subtabs
+## and it overlays the GAME tab onto the GRAPHICS tab".
+##
+## Three mistakes, all mine, all from one wrong assumption -- that the strip
+## was OUR tab's furniture:
+##   * it was built ACTIVE, while GAME was the selected tab (the flash);
+##   * it was then hidden by the foreign-toggle edge and never raised again,
+##     because nothing tied it to GRAPHICS;
+##   * `ntSubShow` drove the stock Graphics panel regardless of which tab was
+##     selected, so it fought the stock group's own panel switching and left
+##     two `* Settings` panels active -- the GAME-over-GRAPHICS overlay.
+##
+## The strip is furniture of the STOCK GRAPHICS TAB. It is visible if and only
+## if the stock GRAPHICS toggle is on, and it switches the two STOCK panels
+## (Graphics Settings and PostFX Settings) -- not one of ours. Nothing here
+## touches the Game panel, ever.
+var gNtGfxTabToggle: Il2CppPtr = nil  ## the STOCK GRAPHICS tab toggle
+var gNtGfxTabOn = false               ## is GRAPHICS the selected tab?
+var gNtSubPanelA: Il2CppPtr = nil     ## stock Graphics Settings
+var gNtSubPanelB: Il2CppPtr = nil     ## stock PostFX Settings
+var gNtSubPressedGfx = -1             ## 1 = GRAPHICS on, 0 = off, -1 = nothing
+## True when the LAST subtab press came through the postfix rather than from
+## our own apply -- i.e. a real mouse click. Logged, because 'our code can
+## press it' and 'the player can press it' are different claims and only the
+## second was in doubt.
+var gNtSubPressedByPlayer = false
 ## OUR OWN SELECTION WRITES MUST NOT RE-ENTER OUR OWN POSTFIX.
 ##
 ## MEASURED: ten `native subtabs VERDICT PASS` lines inside 160ms, alternating
@@ -390,11 +421,19 @@ proc ntToggleSetFired(regs: Il2CppPtr) =
   while j < gNtSubToggle.len and j < NtMaxSubs:
     if gNtSubToggle[j] == selfPtr:
       gNtSubPressed = j
+      gNtSubPressedByPlayer = true
       return
     j = j + 1
   # THE CONTROLS>MODS SUBTAB, on the same postfix as everything else.
   if gNtKbToggle != nil and gNtKbToggle == selfPtr:
     gNtKbPressed = (if turnedOn: 1 else: 0)
+    return
+  # THE STOCK GRAPHICS TAB. The strip is its furniture, so its edges -- ON and
+  # OFF -- are what raise and hide it. This is checked BEFORE the generic
+  # foreign-toggle branch so that selecting GRAPHICS does not read as "some
+  # stock tab was selected, hide everything of ours".
+  if gNtGfxTabToggle != nil and gNtGfxTabToggle == selfPtr:
+    gNtSubPressedGfx = (if turnedOn: 1 else: 0)
     return
   # A FOREIGN TOGGLE WENT ON -- a stock tab was selected.
   #
@@ -984,8 +1023,18 @@ proc ntBuild(): bool =
                 "). Nothing was changed")
     return
   ntCrumb("build: ntBuildOne")
-  if not ntBuildOne(screenT, donorSpawner, donorPanel, "nt-proof", "PROOF"):
-    return
+  # THE PROOF TAB IS OFF BY DEFAULT NOW. Step 1 is proven and the player does
+  # not want a PROOF tab in their settings row. Everything below is
+  # deliberately NOT gated on it: the subtab strip belongs to the STOCK
+  # GRAPHICS tab and must build whether or not any tab of ours exists.
+  if gNtProofTabOn:
+    if not ntBuildOne(screenT, donorSpawner, donorPanel, "nt-proof", "PROOF"):
+      warn "native tabs: the PROOF tab did not build; the subtab strip is " &
+           "independent of it and still will."
+  else:
+    okLog "native tabs: the PROOF tab is OFF (nativeTabsProofTab), so no tab " &
+          "of ours is added to the row. The GRAPHICS|POSTFX subtab strip is " &
+          "unaffected -- it belongs to the STOCK Graphics tab, not to ours."
   # STEP 3'S TAB, built through the SAME `defineTab` path as the proof tab --
   # that is the point of a foundation: a second tab is one more call, not one
   # more implementation.
@@ -1065,18 +1114,34 @@ proc ntBuildSubtabs(screenT: Il2CppPtr; captions: seq[string];
   # are swapped, so requiring Graphics here would refuse a build that does not
   # need it.
   if kind == NtSubPanels:
-    gNtGfxPanelGo = iGameObjectOf(modsChildNamed(screenT, "Graphics Settings"))
+    gNtSubPanelA = iGameObjectOf(modsChildNamed(screenT, "Graphics Settings"))
+    gNtSubPanelB = iGameObjectOf(modsChildNamed(screenT, "PostFX Settings"))
+    gNtGfxPanelGo = gNtSubPanelA
+    # THE STOCK GRAPHICS TOGGLE. The strip is ITS furniture: visible iff this
+    # is on. Without this the strip had nothing to belong to, so it flashed at
+    # build time under GAME and was never raised again.
+    let tg = modsChildNamed(screenT, "Toggles")
+    let gfxSpawnT = (if tg != nil:
+                       modsChildNamed(tg, "GraphicsToggleSpawner") else: nil)
+    gNtGfxTabToggle = (if gfxSpawnT != nil: modsToggleOf(gfxSpawnT) else: nil)
+    if gNtGfxTabToggle == nil:
+      warn "native subtabs: the STOCK GraphicsToggle could not be found, so " &
+           "the strip cannot be tied to the GRAPHICS tab and would flash " &
+           "under whatever tab happens to be up. REFUSING to build it."
+      return
   let ctrlPanel = modsChildNamed(screenT, "Control Settings")
   let donorStrip = (if ctrlPanel != nil: modsChildNamed(ctrlPanel, "Toggles")
                     else: nil)
   let donorBtn = (if donorStrip != nil:
                     modsChildNamed(donorStrip, "ControlToggle") else: nil)
-  if (kind == NtSubPanels and gNtGfxPanelGo == nil) or
+  if (kind == NtSubPanels and (gNtSubPanelA == nil or gNtSubPanelB == nil)) or
      donorStrip == nil or donorBtn == nil:
     ntNoteFault("subtabs: the stock Graphics panel or the strip donor was " &
                 "not found (" &
-                (if kind == NtSubPanels and gNtGfxPanelGo == nil:
+                (if kind == NtSubPanels and gNtSubPanelA == nil:
                    "Graphics-Settings " else: "") &
+                (if kind == NtSubPanels and gNtSubPanelB == nil:
+                   "PostFX-Settings " else: "") &
                 (if donorStrip == nil: "Control-Settings/Toggles " else: "") &
                 (if donorBtn == nil: "ControlToggle" else: "") &
                 "). Nothing was added.")
@@ -1150,12 +1215,32 @@ proc ntBuildSubtabs(screenT: Il2CppPtr; captions: seq[string];
     discard modsSetActive(stripGo, false)
     gNtSubToggle = @[]
     return
+  # THE CLONE INHERITED THE DONOR'S CANVASGROUP STATE, and the donor
+  # (`Control Settings/Toggles`) was HIDDEN when we cloned it. A CanvasGroup
+  # carrying alpha 0 / interactable false / blocksRaycasts false makes every
+  # Selectable under it inert -- which is EXACTLY the reported defect: POSTFX
+  # visible but unclickable, while our own `Toggle::Set` call still worked.
+  # Read it, say what it was, and only then make it usable.
+  let stripCg = modsComponent(stripT, "CanvasGroup")
+  if stripCg != nil:
+    let (cgOk, cgA, cgI) = nuCgRead(stripCg)
+    if cgOk:
+      okLog "native subtabs: the cloned strip's CanvasGroup arrived alpha=" &
+            nuF(cgA) & " interactable=" & $cgI & " (inherited from the HIDDEN " &
+            "donor panel). Forcing alpha 1 / interactable / blocksRaycasts -- " &
+            "this is the most likely reason a subtab rendered but would not " &
+            "take a mouse click."
+    discard nuCgMakeUsable(stripCg)
+  # DRAW ON TOP AND RECEIVE THE CLICK. Sibling order is raycast order.
+  discard nuSetAsLastSibling(stripT)
   gNtSubStripGo = stripGo
   gNtSubBuilt = true
   gNtSubN = made
   gNtSubKind = kind
   gNtSubSel = 0
-  discard modsSetActive(stripGo, false)   # raised only while our tab is up
+  # HIDDEN UNTIL THE STOCK GRAPHICS TAB IS SELECTED. Building it active is
+  # what the user saw as "subtabs flash then get deleted under GAME".
+  discard modsSetActive(stripGo, false)
   ntCrumb("subtabs: COMPLETE")
   var capList = ""
   var ci = 0
@@ -1263,6 +1348,12 @@ proc ntSubShow(sel: int) =
   ## The strip itself is untouched by this -- it is a sibling of both, so it
   ## cannot be hidden by the thing it switches.
   if not gNtSubBuilt: return
+  if gNtSubKind == NtSubPanels and not gNtGfxTabOn:
+    # NOT OUR TURN. The stock group owns panel visibility unless GRAPHICS is
+    # the selected tab; driving it anyway is what left GAME and GRAPHICS both
+    # active and produced the reported overlay.
+    gNtSubSel = sel
+    return
   if gNtSubKind == NtSubRows:
     # OUR PANEL STAYS UP; only its rows change. Nothing stock is touched at
     # all here, which is why this kind needs no panel bookkeeping.
@@ -1275,11 +1366,15 @@ proc ntSubShow(sel: int) =
     gNtSubSel = sel
     discard ntRenderModPage(sel)
     return
-  let wantOurs = (sel == 1)
-  if gNtGfxPanelGo != nil and modsGoActive(gNtGfxPanelGo) == wantOurs:
-    discard modsSetActive(gNtGfxPanelGo, not wantOurs)
-  if gNtPanelGo.len > 0 and modsGoActive(gNtPanelGo[0]) != wantOurs:
-    discard modsSetActive(gNtPanelGo[0], wantOurs)
+  # THE TWO PANELS ARE BOTH THE GAME'S: Graphics Settings and PostFX Settings.
+  # They used to be "stock Graphics" vs "OUR panel", which is why the strip and
+  # the graphics rows appeared as the PROOF tab's content. The Game panel is
+  # never touched here, in either branch.
+  let wantB = (sel == 1)
+  if gNtSubPanelA != nil and modsGoActive(gNtSubPanelA) == wantB:
+    discard modsSetActive(gNtSubPanelA, not wantB)
+  if gNtSubPanelB != nil and modsGoActive(gNtSubPanelB) != wantB:
+    discard modsSetActive(gNtSubPanelB, wantB)
   # THE HIGHLIGHT, through the real setter. A raw `m_IsOn` store leaves the
   # Animator untold and the wrong button looks selected -- live-confirmed on
   # the old strip, and the reason `set_IsToggled` exists in the target table.
@@ -1290,6 +1385,15 @@ proc ntSubShow(sel: int) =
     i = i + 1
   gNtApplying = false
   gNtSubSel = sel
+  # READ BACK, with the SAME predicate the tab verdict uses. Exactly one
+  # `* Settings` panel must be active; two is the overlay the user saw.
+  var oursAct = false
+  let (nAct, actNames) = ntActivePanelNames(oursAct)
+  if nAct != 1:
+    warn "native subtabs PANEL FAIL: after selecting " &
+         (if sel == 1: "POSTFX" else: "GRAPHICS SETTINGS") & ", " & $nAct &
+         " `* Settings` panel(s) are active -- " & actNames & ". Exactly one " &
+         "is the only correct answer; two is the GAME-over-GRAPHICS overlay."
 
 proc ntSubVerdict(why: string) =
   ## STEP 2's finished state: exactly one subtab reads m_IsOn, its panel is
@@ -1652,11 +1756,32 @@ proc ntTickBody() =
       ntHide()
       gNtVerdictSaid = false
       gNtWhyNext = "a stock tab was selected -- ours must be off"
+  # THE STOCK GRAPHICS TAB EDGE: raise or hide the strip.
+  if gNtSubPressedGfx >= 0:
+    let gfxOn = (gNtSubPressedGfx == 1)
+    gNtSubPressedGfx = -1
+    gNtGfxTabOn = gfxOn
+    gNtStep = "tick: stock GRAPHICS tab " & (if gfxOn: "selected" else: "left")
+    if gNtSubBuilt and gNtSubStripGo != nil:
+      discard modsSetActive(gNtSubStripGo, gfxOn)
+      if gfxOn:
+        # Re-apply the selection now that it is our turn; until this moment
+        # ntSubShow deliberately did nothing to the stock panels.
+        ntSubShow(gNtSubSel)
+        okLog "native subtabs: the stock GRAPHICS tab was selected, so the " &
+              "strip is now VISIBLE and the selection has been applied. It " &
+              "is hidden for every other tab and is never shown under GAME."
   # THE SUBTAB EVENT, drained from the same postfix as the tab event.
   if gNtSubPressed >= 0:
     let sidx = gNtSubPressed
     gNtSubPressed = -1
     gNtStep = "tick: applying a subtab selection"
+    if gNtSubPressedByPlayer:
+      gNtSubPressedByPlayer = false
+      okLog "native subtabs: subtab pressed by the player: " &
+            (if sidx == 1: "POSTFX" else: "GRAPHICS SETTINGS") &
+            " -- the click reached the toggle through the game's own raycast, " &
+            "not through our code. That is the half that was in doubt."
     ntSubShow(sidx)
     gNtSubVerdictSaid = false
   if gNtSubBuilt and gNtShown >= 0:
@@ -1666,7 +1791,8 @@ proc ntTickBody() =
   # frames before judging, because a panel switched this frame is not laid out
   # until the next -- judging on the switching frame is exactly what produced
   # the meaningless '6 panels active' reading.
-  if gNtProofOn and gNtProofPhase < 6:
+  if gNtProofOn and gNtProofTabOn and gNtToggle.len > 0 and
+     gNtProofPhase < 6:
     if gNtProofWait > 0:
       gNtProofWait = gNtProofWait - 1
     elif gNtProofPhase == 0:

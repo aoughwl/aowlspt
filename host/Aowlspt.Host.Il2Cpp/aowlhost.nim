@@ -9164,7 +9164,12 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   # builds it presses its own toggle, judges, presses GAME back and judges
   # again. "The tab exists" is not the claim doc 4 makes; "selecting it shows
   # our panel and only ours" is.
-  gNtProofOn = readBoolKeyDef("nativeTabsProofSelect", true)
+  # BOTH DEFAULT OFF NOW. Step 1 has a live PASS, and a PROOF tab in the
+  # player's settings row is not something anyone asked for -- it was
+  # scaffolding. The subtab strip does NOT depend on either: it belongs to the
+  # stock GRAPHICS tab.
+  gNtProofTabOn = readBoolKey("nativeTabsProofTab")
+  gNtProofOn = readBoolKeyDef("nativeTabsProofSelect", false) and gNtProofTabOn
   # STEP 2 (docs/NATIVETABS.md 5). Default OFF until it has a live PASS of its
   # own: `settingsPostFxSubtab`'s old cloned-strip path stays the shipping one
   # until then, so a failure here costs nothing that works today.

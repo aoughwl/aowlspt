@@ -247,6 +247,11 @@ const
   NuTTabCleanupCtrls = 59'i32  ## EFT.UI.Settings.SettingsTab::CleanupCreatedControls
   NuTToggleSetGroup  = 60'i32  ## UnityEngine.UI.Toggle::set_group
   NuTToggleSet       = 61'i32  ## UnityEngine.UI.Toggle::Set
+  NuTCgGetAlpha      = 62'i32  ## UnityEngine.CanvasGroup::get_alpha
+  NuTCgSetAlpha      = 63'i32  ## UnityEngine.CanvasGroup::set_alpha
+  NuTCgGetInteract   = 64'i32  ## UnityEngine.CanvasGroup::get_interactable
+  NuTCgSetInteract   = 65'i32  ## UnityEngine.CanvasGroup::set_interactable
+  NuTCgSetBlocksRay  = 66'i32  ## UnityEngine.CanvasGroup::set_blocksRaycasts
 
 ## Field offsets for the tab machinery. MEASURED (tools/fldoff.py, String
 ## self-check passing) and written up in docs/NATIVETABS.md. All NULL-CAPABLE.
@@ -904,6 +909,33 @@ proc nuToggleSetGroup*(toggle, group: Il2CppPtr): bool =
   let fn = nuFn(NuTToggleSetGroup)
   if fn == nil: return
   cNuCallVPP(fn, toggle, group)
+  true
+
+proc nuCgRead*(cg: Il2CppPtr): (bool, float32, bool) =
+  ## (ok, alpha, interactable) off a live CanvasGroup. READ FIRST: a clone that
+  ## inherited alpha 0 / interactable false from a hidden donor is invisible
+  ## and inert while every call we make on it still succeeds.
+  result = (false, 0.0'f32, false)
+  if not gNuOn or not nuOk(cg, 0x18'i32): return
+  let fa = nuFn(NuTCgGetAlpha)
+  let fi = nuFn(NuTCgGetInteract)
+  if fa == nil or fi == nil: return
+  let a = cNuCallFP(fa, cg, -1.0'f32)
+  if not (a > -0.5'f32): return
+  result = (true, a, cNuCallBP(fi, cg) != 0'i32)
+
+proc nuCgMakeUsable*(cg: Il2CppPtr): bool =
+  ## alpha 1, interactable, blocksRaycasts -- on a CanvasGroup WE cloned.
+  ## Read-validate-write: only written when it is not already usable.
+  result = false
+  if not gNuOn or not nuOk(cg, 0x18'i32): return
+  let fA = nuFn(NuTCgSetAlpha)
+  let fI = nuFn(NuTCgSetInteract)
+  let fB = nuFn(NuTCgSetBlocksRay)
+  if fA == nil or fI == nil or fB == nil: return
+  cNuCallVPF(fA, cg, 1.0'f32)
+  cNuCallVPB(fI, cg, 1'i32)
+  cNuCallVPB(fB, cg, 1'i32)
   true
 
 proc nuTogglePress*(toggle: Il2CppPtr; on: bool): bool =
