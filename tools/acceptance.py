@@ -411,8 +411,8 @@ INACTIVE_REASON = ("SettingsScreen is bound but not active (another screen "
 # skipped silently or -- as happened at 03:55 -- run anyway and reported FAIL.
 SCREEN_ASSERTION_NAMES = (
     "top-row stock tab count",
-    "top-row mod tab clones",
-    "no donor caption under MODS row clones",
+    "top-row native tab clones",
+    "no donor caption on any aowlspt-cloned settings row",
     "no placeholder text on any RENDERED node",
     "settings tab row group: exactly one toggle is ON",
     "postfx subtab strip under GRAPHICS",
@@ -655,13 +655,75 @@ def published_pages(root):
     return n, total, ""
 
 
-def assert_tab_count(report, live, mods_built, published=None, pub_note=""):
+# `native tabs: built the 'PROOF' tab -- a real UIAnimatedToggleSpawner in the
+# STOCK ToggleGroup and a real cloned SettingsTab panel, ...`
+# (nativetabs.nim ~612, the ONLY emit site of this phrase).
+_NT_BUILT_RE = re.compile(r"native tabs: built the '(?P<name>[^']*)' tab")
+# `nativeTabs is set: the host adds ONE proof tab ...` / `nativeTabs is set, so
+# settingsUiProbe has been turned on with it ...` (aowlhost.nim ~9177, ~9181).
+_NT_FLAG_RE = re.compile(r"nativeTabs is set")
+
+
+def native_tabs_built(root):
+    """(names, on, note) -- which top-row tabs the HOST says it built.
+
+    Supersedes `published_pages` as the source of the expected top-row clone
+    count. Until 2026-09-01 every mod got its own top-row tab, so the number
+    of published client-side settings pages WAS the number of clones. The
+    native-tabs foundation (`host/.../nativetabs.nim`, docs/NATIVETABS.md)
+    replaced that: `defineTab` adds EXACTLY ONE clone per tab -- one PROOF tab
+    today, a MODS tab next, with the mods themselves becoming SUBTABS inside
+    its panel. Comparing 8 published pages against the clone count therefore
+    asserted a design that no longer exists, and it FAILED live tonight with
+    `1 active clone(s), want 8`.
+
+    `on` is True when the host printed either a `nativeTabs is set` line or at
+    least one `built the` line -- a build is direct evidence the feature ran,
+    whatever the flag pass logged. `on` False means nativeTabs was OFF this
+    session, and the caller must report INCONCLUSIVE with that reason: there
+    is NO expected clone count then, and "0 built, 0 clones" must never be
+    reported as a pass by default. `names` is None only when the log could not
+    be read at all.
+
+    Every matching line this session is counted, NOT deduplicated by name: two
+    `built the 'MODS' tab` lines mean two clones went into the strip, and
+    folding them together would hide exactly that. Duplicates are named in the
+    caller's detail line.
+    """
+    ns = argparse.Namespace(root=os.path.join(root, "aowlspt"), backend=False)
+    try:
+        _p, lines = hostlog.read(ns)
+    except SystemExit:
+        return None, None, "the host log could not be read"
+    names, flagged = [], False
+    for row in hostlog.parse(lines):
+        if _NT_FLAG_RE.search(row[2]):
+            flagged = True
+        m = _NT_BUILT_RE.search(row[2])
+        if m:
+            names.append(m.group("name"))
+    if not flagged and not names:
+        return names, False, (
+            "the host log has neither a `nativeTabs is set` line nor any "
+            "`native tabs: built the '<NAME>' tab` line, so nativeTabs was OFF "
+            "this session and there is no expected top-row clone count")
+    return names, True, ""
+
+
+def assert_tab_count(report, live, nt_names=None, nt_on=None, nt_note=""):
     """Stock top-row tabs, counted by NAME and by activeInHierarchy, with the
-    names printed so the number can be checked rather than believed."""
+    names printed so the number can be checked rather than believed; then the
+    clones, against what the host says it built (`native_tabs_built`).
+
+    `mods_built` used to gate the clone half of this. It no longer does: the
+    native tabs are built by the host from a stock spawner and exist whether
+    or not any mod DLL was compiled, so a mods_built=False run must still be
+    able to FAIL on a missing tab.
+    """
     _strip, ptrs, names, note = _toggle_strip_children(live)
     if ptrs is None:
         report.record("top-row stock tab count", INCONCLUSIVE, note)
-        report.record("top-row mod tab clones", INCONCLUSIVE, note)
+        report.record("top-row native tab clones", INCONCLUSIVE, note)
         return
     acts = active_states(live, ptrs)
     if acts is None or None in (acts or []):
@@ -669,7 +731,7 @@ def assert_tab_count(report, live, mods_built, published=None, pub_note=""):
                       "activeInHierarchy could not be established for every "
                       "one of the %d tab-strip children" % len(ptrs),
                       ", ".join(names))
-        report.record("top-row mod tab clones", INCONCLUSIVE,
+        report.record("top-row native tab clones", INCONCLUSIVE,
                       "same: active state unknown for at least one child")
         return
 
@@ -687,26 +749,40 @@ def assert_tab_count(report, live, mods_built, published=None, pub_note=""):
                   % (", ".join(stock_on) or "none",
                      ", ".join(stock_off) or "none"))
 
-    if not mods_built:
-        report.record("top-row mod tab clones", INCONCLUSIVE,
-                      "mods_built=False, so there is no expected clone count "
-                      "to compare against; %d active clone(s) observed"
-                      % len(clones_on),
-                      ", ".join(clones_on) or "none")
-    elif published is None:
-        # NOT a fallback to `>= 1`, which is what this used to assert: with a
-        # hardcoded floor of one, seven missing tabs pass.
-        report.record("top-row mod tab clones", INCONCLUSIVE,
-                      "%d active clone(s), but the expected count is not known: "
-                      "%s" % (len(clones_on), pub_note),
-                      ", ".join(clones_on) or "none")
+    # The clone half. Expected count = the number of tabs the HOST says it
+    # built this session, one `native tabs: built the '<NAME>' tab` line per
+    # `defineTab`. NOT the published page count: mods are becoming SUBTABS.
+    CLONES = "top-row native tab clones"
+    detail = ("host built: %s | active clones: %s"
+              % (", ".join(nt_names) if nt_names else "none",
+                 ", ".join(clones_on) or "none"))
+    if nt_names is None:
+        # Could not look. Not a pass and not a failure.
+        report.record(CLONES, INCONCLUSIVE,
+                      "%d active clone(s), but the expected count is not "
+                      "known: %s" % (len(clones_on), nt_note), detail)
+    elif not nt_on:
+        # NOT a fallback to `== 0`: with nativeTabs off, zero clones and zero
+        # built lines would agree vacuously and print a green light for a
+        # feature that never ran.
+        report.record(CLONES, INCONCLUSIVE,
+                      "%d active clone(s); nativeTabs was OFF this session so "
+                      "there is nothing to compare against: %s"
+                      % (len(clones_on), nt_note), detail)
+    elif not nt_names:
+        report.record(CLONES, FAIL,
+                      "nativeTabs is ON but the host never printed a "
+                      "`native tabs: built the '<NAME>' tab` line this "
+                      "session, so no tab was built; %d active clone(s) "
+                      "observed" % len(clones_on), detail)
     else:
-        v = PASS if len(clones_on) == published else FAIL
-        report.record("top-row mod tab clones", v,
-                      "%d active clone(s), want %d (host log: published %d "
-                      "client-side settings page(s))"
-                      % (len(clones_on), published, published),
-                      ", ".join(clones_on) or "none")
+        want = len(nt_names)
+        v = PASS if len(clones_on) == want else FAIL
+        report.record(CLONES, v,
+                      "%d active clone(s), want %d (host log: built the %s "
+                      "tab(s))" % (len(clones_on), want,
+                                   ", ".join("'%s'" % n for n in nt_names)),
+                      detail)
 
 
 def _findtext(live, needle, timeout=60):
@@ -1290,7 +1366,8 @@ def run_screen_assertions(report, live, args, ready, reason):
             report.record(nm, INCONCLUSIVE, "NOT PERFORMED: %s" % reason)
         return
     published, _total, pub_note = published_pages(args.root)
-    assert_tab_count(report, live, args.mods_built, published, pub_note)
+    nt_names, nt_on, nt_note = native_tabs_built(args.root)
+    assert_tab_count(report, live, nt_names, nt_on, nt_note)
     assert_no_donor_caption_on_clones(report, live, args.mods_built)
     assert_no_text(report, live, "no placeholder text on any RENDERED node",
                    PLACEHOLDER_TEXT)
@@ -1439,6 +1516,34 @@ def _fx_active_batch(flags, batch=99):
     return _hdr(batch, len(flags), body)
 
 
+def _fx_strip(names, base=0x21c00440000, batch=100):
+    """SHAPED, not measured: a `children` answer for a tab strip of arbitrary
+    composition, so the clone check can be shown to fail on a count the
+    measured 13-child corpus does not happen to contain (5 stock + 2 clones).
+    The SHAPE is inspect.nim's iCmdChildren emit; the pointers are synthetic.
+    Returns (ptrs, output)."""
+    ptrs = ["0x%016x" % (base + i * 0x40) for i in range(len(names))]
+    body = ("> children 0x%016x\n  childCount = %d\n"
+            "  via Transform::GetChild / get_childCount, Object::get_name "
+            "(calls)\n" % (base - 0x40, len(names)))
+    body += "\n".join(
+        '    [%d] transform=%s ($c%d)  go=0x%016x ($g%d)  name="%s"'
+        % (i, ptrs[i], i, base + 0x10000 + i * 0x40, i, names[i])
+        for i in range(len(names)))
+    return ptrs, _hdr(batch, 1, body)
+
+
+def _fx_active_ptrs(ptrs, flags, batch=101):
+    """One `assert-active` verdict per pointer, in command order (shaped)."""
+    body = "\n".join(
+        ("> assert-active %s\n  PASS: %s activeInHierarchy = true, as claimed"
+         % (p, p)) if a else
+        ("> assert-active %s\n  FAIL: %s activeInHierarchy = false, but "
+         "assert-active claimed true." % (p, p))
+        for p, a in zip(ptrs, flags))
+    return _hdr(batch, len(ptrs), body)
+
+
 def _declared_screen_assertion_names():
     """Every assertion name `run_screen_assertions` can print on the READY
     path, read out of the source. Falsifiable on purpose: add an assertion to
@@ -1573,7 +1678,7 @@ def cmd_selftest(_args):
     #     count unable to fail: with the screen ACTIVE it still FAILs on a
     #     dead strip and still PASSes on a live one.
     def c5(rep, _rp):
-        assert_tab_count(rep, "X", False)
+        assert_tab_count(rep, "X")
         if _verdicts(rep).get("top-row stock tab count") != FAIL:
             return "an ACTIVE screen with 0 active stock tabs did not FAIL"
         return ""
@@ -1586,7 +1691,7 @@ def cmd_selftest(_args):
     def c6(rep, _rp):
         if _verdicts(rep).get("top-row stock tab count") is not None:
             return "unexpected"
-        assert_tab_count(rep, "X", False)
+        assert_tab_count(rep, "X")
         if _verdicts(rep).get("top-row stock tab count") != PASS:
             return "4 active stock tabs did not PASS"
         return ""
@@ -1607,7 +1712,7 @@ def cmd_selftest(_args):
     #     `walk was UNKNOWN, not EXHAUSTIVE`.
     FT_DONOR = _fixtures.fx("findtext-clones-donor-caption")
     FT_PLACEHOLDER = _fixtures.fx("findtext-placeholder-inactive-only")
-    DONOR_NAME = "no donor caption under MODS row clones"
+    DONOR_NAME = "no donor caption on any aowlspt-cloned settings row"
     PLACEHOLDER_NAME = "no placeholder text on any RENDERED node"
 
     CAP_TRAILER = ("  -- stopped at the match cap (24). There may be more; "
@@ -1632,7 +1737,7 @@ def cmd_selftest(_args):
         if _verdicts(rep).get(DONOR_NAME) != FAIL:
             return "22 donor captions under the row clones did not FAIL"
         m = [r for r in rep.rows if r[0] == DONOR_NAME][0][2]
-        if "22 under (Clone)(Clone)" not in m or "2 stock" not in m:
+        if "22 on a `(Clone)(Clone)` row" not in m or "2 stock" not in m:
             return "hits were not counted by parent: %r" % m
         return ""
     case("donor caption: 22 under (Clone)(Clone), 2 stock, HIT_CAP -> FAIL",
@@ -1792,39 +1897,124 @@ def cmd_selftest(_args):
           ("tree 0x000002024b079ee0 2",
            [_fixtures.fx("tree-toggle-strip-depth2")])], c16)
 
-    # --- 17-19. THE CLONE COUNT COMES FROM THE HOST LOG, not from a want. --
+    # --- 17-19. THE CLONE COUNT COMES FROM THE HOST'S `built the` LINES. ---
+    #     It used to come from `published N of M client-side settings page(s)`,
+    #     which encoded the SUPERSEDED design of one top-row tab per mod. The
+    #     native-tabs foundation adds exactly one clone per `defineTab`, so
+    #     that assertion FAILED live tonight with `1 active clone(s), want 8`
+    #     against a client that was behaving correctly. `published_pages` is
+    #     kept -- the row-group check still uses it, and the future SUBTAB
+    #     count is what it will measure.
     TABS = [("find Toggles", [_fixtures.fx("find-toggles-strip-with-clones")]),
             ("children 0x000002024b079ee0",
              [_fixtures.fx("children-toggle-strip")]),
             ("assert-active", [_fixtures.fx("assert-active-toggle-strip")])]
-    CLONES_NAME = "top-row mod tab clones"
+    CLONES_NAME = "top-row native tab clones"
+    EIGHT = ["MOD%d" % i for i in range(8)]
 
     def c17(rep, _rp):
-        assert_tab_count(rep, "X", True, 8, "")
+        assert_tab_count(rep, "X", EIGHT, True, "")
         if _verdicts(rep).get("top-row stock tab count") != PASS:
             return "4 active stock tabs (PostFx inactive by design) did not PASS"
         if _verdicts(rep).get(CLONES_NAME) != PASS:
-            return "8 active clones against 8 published pages did not PASS"
+            return "8 active clones against 8 `built the` lines did not PASS"
+        row = [r for r in rep.rows if r[0] == CLONES_NAME][0]
+        if "MOD0" not in row[3] or "GameToggleSpawner(Clone)" not in row[3]:
+            return ("the detail names neither the host's tabs nor the clones "
+                    "counted: %r" % row[3])
         return ""
-    case("tab clones: 8 active, host log published 8 -> PASS", TABS, c17)
+    case("tab clones: 8 active, host built 8 tabs -> PASS", TABS, c17)
 
     def c18(rep, _rp):
-        assert_tab_count(rep, "X", True, 9, "")
-        if _verdicts(rep).get(CLONES_NAME) != FAIL:
-            return ("8 clones against 9 published pages did not FAIL -- the "
-                    "published number is not actually driving the verdict")
+        assert_tab_count(rep, "X", ["PROOF"], True, "")
+        row = [r for r in rep.rows if r[0] == CLONES_NAME][0]
+        if row[1] != FAIL:
+            return ("8 clones against ONE `built the` line did not FAIL -- the "
+                    "host's tab count is not driving the verdict")
+        if "want 1" not in row[2] or "'PROOF'" not in row[2]:
+            return "the expected count and its source are not stated: %r" % row[2]
         return ""
-    case("control: 8 active clones, host log published 9 -> FAIL", TABS, c18)
+    case("control: host built 1 tab, 8 clones active -> FAIL", TABS, c18)
+
+    # The measured corpus has no 2-clone strip, so this one is SHAPED.
+    _p2, _ch2 = _fx_strip(_TAB_NAMES + ["GameToggleSpawner(Clone)"] * 2)
+    TWO_CLONES = [("find Toggles", [_fx_find("Toggles", "0x0000021c00220000",
+                                             "SettingsScreen")]),
+                  ("children", [_ch2]),
+                  ("assert-active",
+                   [_fx_active_ptrs(_p2, [True, True, True, True, False,
+                                          True, True])])]
+
+    def c18b(rep, _rp):
+        assert_tab_count(rep, "X", ["PROOF"], True, "")
+        row = [r for r in rep.rows if r[0] == CLONES_NAME][0]
+        if row[1] != FAIL:
+            return "2 active clones against 1 built tab did not FAIL"
+        if "2 active clone(s), want 1" not in row[2]:
+            return "the counts were not both stated: %r" % row[2]
+        return ""
+    case("control: host built 1 tab, 2 clones active -> FAIL", TWO_CLONES, c18b)
 
     def c19(rep, _rp):
-        assert_tab_count(rep, "X", True, None, "the host log has no such line")
+        assert_tab_count(rep, "X", [], True, "")
+        row = [r for r in rep.rows if r[0] == CLONES_NAME][0]
+        if row[1] != FAIL:
+            return ("nativeTabs ON with ZERO `built the` lines reported %s; a "
+                    "feature that is on and built nothing is a failure, and "
+                    "0 == 0 must not pass vacuously" % row[1])
+        if "built the" not in row[2]:
+            return "the FAIL does not name the missing log line: %r" % row[2]
+        return ""
+    case("control: nativeTabs ON, 0 `built the` lines -> FAIL naming the line",
+         TABS, c19)
+
+    def c19b(rep, _rp):
+        note = "the host log has no `nativeTabs is set` line"
+        assert_tab_count(rep, "X", [], False, note)
+        row = [r for r in rep.rows if r[0] == CLONES_NAME][0]
+        if row[1] != INCONCLUSIVE:
+            return ("nativeTabs OFF reported %s; with the feature off there is "
+                    "no expected count and this must not be a pass" % row[1])
+        if note not in row[2]:
+            return "the INCONCLUSIVE does not carry the reason: %r" % row[2]
+        return ""
+    case("control: nativeTabs OFF -> INCONCLUSIVE with the reason", TABS, c19b)
+
+    def c19c(rep, _rp):
+        assert_tab_count(rep, "X", None, None, "the host log could not be read")
         v = _verdicts(rep).get(CLONES_NAME)
         if v != INCONCLUSIVE:
-            return ("with no published-count line the clone check reported %s; "
-                    "it must not fall back to a hardcoded want" % v)
+            return ("with no readable host log the clone check reported %s; it "
+                    "must not fall back to a hardcoded want" % v)
         return ""
-    case("control: no published-count line -> INCONCLUSIVE, no fallback want",
-         TABS, c19)
+    case("control: host log unreadable -> INCONCLUSIVE, no fallback want",
+         TABS, c19c)
+
+    # --- 19d. the `built the` / flag regexes, against the host's own text. --
+    print("\n---- native_tabs_built: the host's own lines")
+    BUILT = ("native tabs: built the 'PROOF' tab -- a real "
+             "UIAnimatedToggleSpawner in the STOCK ToggleGroup and a real "
+             "cloned SettingsTab panel, emptied of its stock rows.")
+    NOT_BUILT = ("native tabs: reaped 2 extra child(ren) from the 'PROOF' "
+                 "panel clone")
+    FLAG = ("nativeTabs is set: the host adds ONE proof tab to the settings "
+            "screen, built from a real UIAnimatedToggleSpawner")
+    m = _NT_BUILT_RE.search(BUILT)
+    if not m or m.group("name") != "PROOF":
+        failures.append("_NT_BUILT_RE does not read the host's emitted line %r"
+                        % BUILT)
+        print("  ** CASE FAILED: %s" % failures[-1])
+    elif _NT_BUILT_RE.search(NOT_BUILT):
+        failures.append("_NT_BUILT_RE matches `%s`, so another native-tabs log "
+                        "line would inflate the expected clone count"
+                        % NOT_BUILT)
+        print("  ** CASE FAILED: %s" % failures[-1])
+    elif not _NT_FLAG_RE.search(FLAG):
+        failures.append("_NT_FLAG_RE does not read the flag line %r" % FLAG)
+        print("  ** CASE FAILED: %s" % failures[-1])
+    else:
+        print("  case ok ('PROOF' read; the reaped line does not match; the "
+              "flag line does)")
 
     # --- 20. the published-count regex, against the measured log line. ------
     print("\n---- published_pages: the host's own line")
