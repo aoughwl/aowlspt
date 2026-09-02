@@ -799,6 +799,48 @@ def assert_no_text(report, live, name, needle):
 
 CLONE_MARK = "(Clone)(Clone)"
 
+# How many offending hits get an ancestry probe. Each is one `parent EXPR N`
+# round trip, so this is a cost cap, not an expectation.
+PANEL_PROBE_CAP = 6
+PANEL_DEPTH = 8
+
+_PARENT_LINE_RE = re.compile(
+    r'\[\d+\]\s+transform=\S+\s+klass=\S+\s+name="([^"]*)"')
+
+
+def panel_of(live, ptrs):
+    """{ptr: owning panel name} via `parent EXPR N`, for hits that FAILED.
+
+    THIS EXISTS BECAUSE THE ASSERTION BLAMED THE WRONG FEATURE. Its first
+    version called every `(Clone)(Clone)` hit a "MODS row clone" purely
+    because of the name. MEASURED 2026-09-02 on the live client,
+    `parent 0x00000203095d3e00 7` walked:
+
+        Text -> Settings Drop Down(Clone)(Clone) -> Settings -> Viewport
+             -> Scroll View -> Container -> Game Settings
+
+    All three probed rows shared ONE container (0x0000020244f7e840) under
+    `Game Settings` -- the STOCK Game tab -- and `hostlog.py grep` over that
+    same run returned ZERO mods-tab row lines, so the MODS row path had not
+    run at all. Those rows come from `settingspages.nim`'s
+    `swRenderPage`/`swCloneRow`, a different feature in a different file. A
+    verdict that names the wrong owner sends the next session to the wrong
+    file, which is worse than no verdict at all.
+
+    Deepest named ancestor wins: the panel is the outermost node of the walk.
+    Anything unresolvable is reported "unresolved", never guessed."""
+    out = {}
+    for ptr in ptrs or []:
+        try:
+            raw = ch.run_batch(["parent %s %d" % (ptr, PANEL_DEPTH)],
+                               live_dir=live, timeout=40)[1]
+        except Exception as e:                    # named, never silent
+            out[ptr] = "unresolved (%s)" % type(e).__name__
+            continue
+        names = _PARENT_LINE_RE.findall(host_text(raw))
+        out[ptr] = names[-1] if names else "unresolved"
+    return out
+
 
 def assert_no_donor_caption_on_clones(report, live, mods_built):
     """The rows we CLONED must not still read the row donor's caption.
@@ -827,7 +869,7 @@ def assert_no_donor_caption_on_clones(report, live, mods_built):
     proves nothing -- so that is INCONCLUSIVE, never PASS. A check whose
     needle is known to be present somewhere carries its own positive control.
     """
-    name = "no donor caption under MODS row clones"
+    name = "no donor caption on any aowlspt-cloned settings row"
     if not mods_built:
         report.record(name, INCONCLUSIVE,
                       "mods_built=False -- there are no row clones in this "
@@ -873,12 +915,19 @@ def assert_no_donor_caption_on_clones(report, live, mods_built):
 
     ours = [h for h in hits if CLONE_MARK in h["parent"]]
     stock = [h for h in hits if CLONE_MARK not in h["parent"]]
-    detail = "; ".join("%s under %s @%s" % (h["name"], h["parent"], h["ptr"])
-                       for h in (ours or stock)[:5])
-    measured = ("%d hit(s) of %r, walk %s, scope=%s: %d under %s (must be 0), "
-                "%d stock (positive control, must be >0)"
+    shown = (ours or stock)[:PANEL_PROBE_CAP]
+    panels = panel_of(live, [h["ptr"] for h in shown]) if ours else {}
+    detail = "; ".join("%s under %s @%s%s"
+                       % (h["name"], h["parent"], h["ptr"],
+                          "" if h["ptr"] not in panels
+                          else " (panel: %s)" % panels[h["ptr"]])
+                       for h in shown)
+    owners = sorted(set(panels.values()))
+    measured = ("%d hit(s) of %r, walk %s, scope=%s: %d on a `%s` row "
+                "(must be 0), %d stock (positive control, must be >0)%s"
                 % (len(hits), DONOR_CAPTION, comp, f["scope"], len(ours),
-                   CLONE_MARK, len(stock)))
+                   CLONE_MARK, len(stock),
+                   ("; owning panel(s): " + ", ".join(owners)) if owners else ""))
     if ours:
         report.record(name, FAIL, measured, detail)
     elif not stock:

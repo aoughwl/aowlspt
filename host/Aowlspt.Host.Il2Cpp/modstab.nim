@@ -161,6 +161,22 @@ var gModsLabelText: seq[string] = @[]
 ## that clobbers it again. Re-applying through the route that is doing the
 ## clobbering is how the fight ends instead of oscillating.
 var gModsLabelCtrl: seq[Il2CppPtr] = @[]
+## The LocalizedText that sits ON THE TMP'S OWN NODE, which is a DIFFERENT
+## component from the one `swRelabelControl` can reach.
+##
+## MEASURED live 2026-09-02 (inspector, build 4,758,016, Settings open), on the
+## rows the acceptance check caught still reading 'Interface language':
+##   component 0x...095d3e00 LocalizedText -> FOUND 0x00000203091c2210
+##       (the `Text` child that actually renders)
+##   component 0x...095d3f40 LocalizedText -> GetComponent returned NULL
+##       (`Settings Drop Down(Clone)(Clone)`, the row itself)
+## `swSetLocalizedText` derives its LocalizedText as `control + 0x80`, so it
+## writes the ROW CONTROL's LocalizedText -- never the child's. The child's own
+## component is the one that re-applies the donor's key, so every write that
+## went only through the control was fighting a component it never touched.
+## This is the pointer that ends that fight instead of re-running it every 60
+## frames.
+var gModsLabelLoc: seq[Il2CppPtr] = @[]
 ## The cap on that list: up to three TMPs per caption on this build, times the
 ## tab button plus ModsMaxSubtabs -- AND every cloned ROW, which is what 24
 ## did not account for. The rows now register here too (they are the ones
@@ -714,6 +730,42 @@ proc modsTmpText(tmp: Il2CppPtr): string =
     return
   result = suiReadString(cReadPtrAt(tmp, cSuiOffTmpMText()))
 
+proc modsApplyLabel(ctrl, loc, tmp: Il2CppPtr; text: string): bool =
+  ## Write ONE caption at the level that actually owns it.
+  ##
+  ## `swRelabelControl` reaches LocalizedText only as `control + 0x80`. When
+  ## the TMP that renders hangs on a CHILD with its own LocalizedText -- which
+  ## is the measured shape of a cloned settings row -- that route writes a
+  ## component nobody reads and the child re-localises itself straight back.
+  ## So when the caller has resolved the TMP's OWN LocalizedText, SetLabelText
+  ## is called directly on it, exactly as modetext.nim already does.
+  ##
+  ## One managed String feeds both routes. No SEH guard is opened here: every
+  ## caller is already inside the settings postfix's `aowl_p_p_seh`, which is
+  ## not re-entrant.
+  result = false
+  if tmp == nil or text.len == 0:
+    return
+  if loc == nil:
+    # No component of its own -- the control route is all there is, and it is
+    # still the right thing for a plain label.
+    return swRelabelControl(ctrl, tmp, text)
+  gSwStrText = text
+  let s = swNewStringImpl(cast[Il2CppPtr](0))
+  if s == nil or cIsReadable(s, 0x14'i32) == 0'i32:
+    warn "mods tab: il2cpp_string_new returned nothing usable for the " &
+         "caption; falling back to the control route rather than writing " &
+         "a pointer we did not verify"
+    return swRelabelControl(ctrl, tmp, text)
+  let fn = cSwFn2(SwLocSetLabelText)
+  if fn != nil and duOk(loc, 0x20'i32):
+    cSwCallVPP(fn, loc, s)
+    result = true
+  if swSetTmpTextByCall(tmp, s):
+    result = true
+  if not result:
+    result = swRelabelControl(ctrl, tmp, text)
+
 proc modsFindTmp(t: Il2CppPtr; depth: int): Il2CppPtr =
   ## Is there ANY reachable TMP under `t`? Used only as a donor-shape assertion
   ## before cloning; the relabel itself uses `modsCollectTmp` and tries them all.
@@ -900,6 +952,10 @@ proc modsRelabelLike(cloneT, donorT: Il2CppPtr; text: string;
             gModsLabelTmp.add cTmps[i]
             gModsLabelText.add text
             gModsLabelCtrl.add cloneCtrl
+            # The button path keeps the control route it has always used; nil
+            # here keeps the four registries index-aligned, which the
+            # re-assert poll depends on.
+            gModsLabelLoc.add cast[Il2CppPtr](0)
     i = i + 1
   # THE OUTCOME CHECK: re-read the whole clone, not the pointers we just wrote.
   let reads = modsCountReading(cloneT, text)
@@ -950,9 +1006,21 @@ proc modsRelabelRow(cloneT, donorT: Il2CppPtr; text: string;
          "levels). Nothing was written."
     return
   var wrote = 0
+  var locHits = 0
+  var cLocs: seq[Il2CppPtr] = @[]
   var i = 0
   while i < cTmps.len:
-    if swRelabelControl(cloneCtrl, cTmps[i], text):
+    # THE COMPONENT THAT CLOBBERS, resolved per TMP rather than assumed to be
+    # the row's. `cNodes[i]` is the Transform `cTmps[i]` was found on --
+    # modsCollectTmp fills the two in lockstep -- so this asks that exact node
+    # for its own LocalizedText.
+    var loc: Il2CppPtr = nil
+    if i < cNodes.len:
+      loc = modsComponent(cNodes[i], "LocalizedText")
+    cLocs.add loc
+    if loc != nil:
+      locHits = locHits + 1
+    if modsApplyLabel(cloneCtrl, loc, cTmps[i], text):
       wrote = wrote + 1
     i = i + 1
   # THE CHECK THAT CAN FAIL: re-read every TMP under the clone afterwards and
@@ -986,6 +1054,7 @@ proc modsRelabelRow(cloneT, donorT: Il2CppPtr; text: string;
         gModsLabelTmp.add cTmps[i]
         gModsLabelText.add text
         gModsLabelCtrl.add cloneCtrl
+        gModsLabelLoc.add (if i < cLocs.len: cLocs[i] else: nil)
     i = i + 1
   # Newly registered labels must be watched again even if the poll had already
   # declared itself stable and switched off for the session.
@@ -1005,8 +1074,10 @@ proc modsRelabelRow(cloneT, donorT: Il2CppPtr; text: string;
     okLog "mods tab: row caption '" & text & "' written to all " &
           $cTmps.len & " of the clone's TextMeshProUGUI (" & $wrote &
           " write(s) succeeded); " & $mine & " now read it and none still " &
-          "read the donor's '" & donorCaption & "'. All " & $mine &
-          " are registered for re-assert against LocalizedText."
+          "read the donor's '" & donorCaption & "'. " & $locHits & " of " &
+          $cTmps.len & " carried their OWN LocalizedText and were written " &
+          "through it, not through the row control. All " & $mine &
+          " are registered for re-assert."
   elif mine == 0:
     warn "mods tab: row caption '" & text & "' DID NOT LAND AT ALL -- none " &
          "of the clone's " & $cTmps.len & " TextMeshProUGUI read it after " &
@@ -1797,7 +1868,10 @@ proc modsReassertLabels() =
         var ctl: Il2CppPtr = nil
         if i < gModsLabelCtrl.len and duOk(gModsLabelCtrl[i], 0x20'i32):
           ctl = gModsLabelCtrl[i]
-        discard swRelabelControl(ctl, gModsLabelTmp[i], gModsLabelText[i])
+        var loc: Il2CppPtr = nil
+        if i < gModsLabelLoc.len and duOk(gModsLabelLoc[i], 0x20'i32):
+          loc = gModsLabelLoc[i]
+        discard modsApplyLabel(ctl, loc, gModsLabelTmp[i], gModsLabelText[i])
     i = i + 1
   # THE STABILITY GATE MUST NOT TRUST "reaped == 0 this poll" ON ITS OWN: that
   # is also what a poll BEFORE the late spawn looks like, since there is
