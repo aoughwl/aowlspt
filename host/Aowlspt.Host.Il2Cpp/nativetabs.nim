@@ -424,9 +424,20 @@ proc ntBindToggleEvent(verbose: bool): bool =
   result = false
   let fn = nuFn(NuTToggleSet)
   if fn == nil:
-    warn "native tabs: UnityEngine.UI.Toggle::Set did not verify against the " &
-         "startup prologue snapshot, so the toggle event cannot be bound and " &
-         "this feature declines. Nothing was patched."
+    # REPORT THE REASON WE WERE GIVEN, NOT A GUESS AT IT. The first version of
+    # this line asserted "did not verify against the startup prologue
+    # snapshot", which is only ONE of six reasons `nuFn` can refuse -- and it
+    # was the wrong one: live, the real reason was that the bind ran before
+    # `cProPrimeAll()` and before GameAssembly.dll was loaded, so the snapshot
+    # capture failed and the verify failed closed. A refusal that names a cause
+    # it did not measure sent the next reader hunting for a byte mismatch that
+    # was never there.
+    warn "native tabs: UnityEngine.UI.Toggle::Set could not be bound -- " &
+         nuWhyName(cNuWhyOf(NuTToggleSet)) &
+         ". Only a PROLOGUE MISMATCH would mean this game build changed; " &
+         "every other reason is a fault in our own host, most likely order " &
+         "(this must run after cProPrimeAll and after GameAssembly.dll is " &
+         "loaded). The feature declines and NOTHING was patched."
     return
   result = attachDrain("UnityEngine.UI.Toggle::Set", fn,
                        cast[Il2CppMethod](0), false, verbose, 28'i32)

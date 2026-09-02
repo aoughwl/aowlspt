@@ -1601,6 +1601,28 @@ var gModLoadDeferredAt = 0'u64
 var gModsReleased = false
 var gModLoadPolledAt = 0'u64
 var gModLoadReadyAt = 0'u64
+## ---- THE RELEASE GATE (modload.nim). See `modLoadGateDrain` for the whole
+## argument; these are its only state, and every one of them is a plain
+## integer or string, so the gate costs one compare per frame when idle.
+var gModLoadGateOn = false
+  ## Is the release actually gated on the menu-show event? False means the old
+  ## behaviour -- release the instant READY is on disk -- and something in the
+  ## log SAYS SO, loudly, whenever it is false while `deferModLoad` is on.
+var gModLoadGateHold = false
+  ## FALSIFICATION SWITCH (`modLoadGateHold`, default OFF). When on, the show
+  ## event is ignored and the gate can never open, so a run can demonstrate the
+  ## gate HOLDING (READY present, mods NOT released) instead of only ever
+  ## demonstrating it opening. A gate that has never been seen to hold has not
+  ## been shown to be a gate at all -- CLAUDE.md 9b.
+var gModLoadGateSaid = false
+var gModLoadMenuShownAt = 0'u64
+  ## When the tick FIRST OBSERVED `uihEpoch(UihSiteMenuShow)` go non-zero. This
+  ## is the frame after the detour fired, not the detour's own instant -- said
+  ## here rather than letting the log's number be read as exact.
+var gModLoadPendingWhy = ""
+  ## A release that was WANTED while the gate was shut. Non-empty means "the
+  ## moment the gate opens, release, and say what asked for it".
+var gModLoadPendingAt = 0'u64
 var gModLoadDonor: Il2CppPtr = nil
 var gModLoadCanvasTr: Il2CppPtr = nil
   ## The canvas transform the loading step built under, kept so the teardown
@@ -8329,6 +8351,12 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   # modLoadScreen as well as its own key: deferring the mods with no screen to
   # release them would be a wait with no end and no explanation.
   gModLoadDeferMods = gModLoad and readBoolKeyDef("deferModLoad", true)
+  # FALSIFICATION SWITCH for the release gate, default OFF. On, the main-menu
+  # show event is IGNORED, so the gate can never open and only the 240s
+  # deadline releases -- which is how a run demonstrates the gate HOLDING
+  # (READY on disk, mods NOT released) rather than only ever demonstrating it
+  # opening. A gate nobody has watched hold has not been shown to be a gate.
+  gModLoadGateHold = readBoolKeyDef("modLoadGateHold", false)
   block:
     gModLoadWalkLevel = readIntKey("modLoadWalkLevel", 3)
     let n = readStrKey("modLoadCaption")
@@ -8946,10 +8974,15 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
          "STOCK ToggleGroup and a real cloned SettingsTab panel emptied of " &
          "its rows. This is step 1 of docs/NATIVETABS.md and it deliberately " &
          "renders no rows yet."
-    if not ntBindToggleEvent(false):
-      gNtOn = false
-      warn "nativeTabs: the toggle event did not bind, so the feature is OFF " &
-           "for this session. Nothing was patched and nothing was changed."
+    # THE BIND IS NOT DONE HERE. It moved into the `gReady` region below,
+    # after `cProPrimeAll()` and after GameAssembly.dll is loaded -- both are
+    # preconditions for a verify to mean anything. Binding in this flag pass
+    # produced, live, "Toggle::Set did not verify against the startup prologue
+    # snapshot" at [0:00:00.000] on a build where the bytes are in fact
+    # correct: the snapshot had not been primed and the module was not loaded,
+    # so the capture failed and the verify failed closed. That is the SAME
+    # mistake the native-UI census made ("0 of 25 verified (25 REJECTED)"),
+    # and its comment below is why this one is not repeated.
   gGfxOn = readBoolKey("settingsPostFxSubtab")
   if gGfxOn and not gSettingsUiProbe:
     gSettingsUiProbe = true
@@ -9248,6 +9281,17 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
       # invoke2's postfix below.
       if gNuOn:
         bindNativeUi(true)
+      # NATIVE TABS' one detour, HERE for the same reason as the census above:
+      # the prologue snapshot is primed and GameAssembly.dll is loaded, so a
+      # verify means something. Bound after `bindNativeUi` so the target table
+      # has already been censused and any refusal is attributable.
+      if gNtOn:
+        if not ntBindToggleEvent(false):
+          gNtOn = false
+          warn "nativeTabs: the toggle event did not bind, so the feature is " &
+               "OFF for this session. Nothing was patched and nothing was " &
+               "changed; the settings screen is exactly the screen the game " &
+               "builds."
       if gAuOn:
         bindAowlUi(true)
       # The native-UI toolkit's readiness report, in the same region and for the
@@ -9292,8 +9336,10 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
       # Arming per-subscriber instead would install a second detour on a site two
       # features share, and the second would overwrite the first's trampoline.
       splWantShowHook()
+      modLoadWantShowHook()
       uihArm(true)
       splShowHookVerdict()
+      modLoadShowHookVerdict()
 
       # Version-label brand (opt-in). Static code, so it installs now and fires
       # when PreloaderUI.Awake runs on its way to the menu. Fail-safe if the
