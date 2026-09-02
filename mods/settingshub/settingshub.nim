@@ -829,8 +829,42 @@ proc keybindsOf(guid, rowsText: string): JsonArray =
     # at least something the player can look up.
     o.put("action", (if label.len > 0: label else: key))
     o.put("description", jr.asText(jr.child(row, "description"), ""))
-    o.put("currentBinding", textOf(jr.child(row, "value")))
-    o.put("defaultBinding", textOf(jr.child(row, "default")))
+    # THE BOUND VALUE, under BOTH names.
+    #
+    # `currentBinding`/`defaultBinding` are the names this route has always
+    # used; `value`/`default` are what the native Controls -> MODS page reads,
+    # and are the names every OTHER settings surface in this repo uses for the
+    # same two things (`toJson` in aowl/src/aowlspt/settings.nim emits exactly
+    # `default` and `value`). Both pairs are emitted from the SAME row, so they
+    # cannot disagree; the old names stay for compatibility with the F12
+    # overlay, exactly as `key`/`settingKey` are kept as a pair.
+    #
+    # NO SEPARATE CONFIG READ HAPPENS HERE, deliberately. The row already came
+    # through `fullModsArray()` -> `SettingsPageQuery` -> the owning mod's
+    # `toJson`, whose `value` is `currentValueJson` -- the mod's own
+    # `config.json` read, in the process that owns the file. A second reader
+    # here would be a second answer to "what is bound", and the two would
+    # diverge the moment a write landed between them.
+    let vRow = jr.child(row, "value")
+    let dRow = jr.child(row, "default")
+    let vKnown = vRow.exists and not jr.isNull(vRow)
+    let dKnown = dRow.exists and not jr.isNull(dRow)
+    o.put("currentBinding", textOf(vRow))
+    o.put("defaultBinding", textOf(dRow))
+    if vKnown:
+      o.put("value", textOf(vRow))
+    else:
+      # THREE OUTCOMES, NOT TWO. The row declared itself a keybind but the
+      # settings store carries no value for its key -- so the page must show
+      # "unknown", not a blank that reads as "unbound". Omitting the field
+      # instead would make a consumer's `entry.value` undefined, which is
+      # indistinguishable from this route being too old to serve it.
+      o.put("value", sv.jnull())
+      o.put("error", "unknown setting key")
+    if dKnown:
+      o.put("default", textOf(dRow))
+    else:
+      o.put("default", sv.jnull())
     o.put("valueType", ty)
     o.put("role", role)
     # A gate is not rebindable (it is a switch, not a key), and neither is a
@@ -848,9 +882,19 @@ proc onKeybinds(url, body, session: string): string =
   ##
   ##   {"mods":[{"guid","name","version","client",
   ##             "keybinds":[{"key","settingKey","action","description",
+  ##                          "value","default",
   ##                          "currentBinding","defaultBinding","valueType",
   ##                          "role","rebindable","implemented","category",
-  ##                          "applyRoute"}...]}...]}
+  ##                          "applyRoute","error"}...]}...]}
+  ##
+  ## `value` is THE KEY THE PLAYER HAS BOUND RIGHT NOW, as display text, and
+  ## `default` the one the mod declared; `currentBinding`/`defaultBinding` are
+  ## the older names for the same two values and are kept for the F12 overlay,
+  ## the same way `key`/`settingKey` are kept as a pair. `value` is a JSON
+  ## STRING whenever the store knows the key and `null` -- with
+  ## `"error":"unknown setting key"` beside it -- when it does not. It is never
+  ## absent: an omitted field reads to a consumer as "this backend is too old
+  ## to answer", which is a different fact.
   ##
   ## EVERY loaded mod appears, including one with no keys at all: its
   ## `keybinds` is `[]`. An absent entry would be indistinguishable from a mod

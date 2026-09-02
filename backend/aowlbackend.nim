@@ -2723,6 +2723,95 @@ proc jHasArray(n: JsonNode; want: string): bool =
     if k == want:
       return kind(v) == JArray
 
+proc keybindValueFault(b: JsonNode): string =
+  ## WHAT IS WRONG with one `/aowlspt/keybinds` entry's bound value, or "" when
+  ## nothing is. Stated as a fault rather than a bool so the failure message
+  ## names the input that produced it.
+  ##
+  ## The contract, which the native Controls -> MODS page reads:
+  ##   * `value` and `default` are ALWAYS PRESENT. An omission is the one shape
+  ##     a consumer cannot interpret -- `entry.value === undefined` reads
+  ##     identically to "this backend predates the field".
+  ##   * a key the store knows -> a JSON string: the KeyCode name, or `""` for
+  ##     a key the mod declares UNBOUND. `""` is legitimate and MEASURED --
+  ##     `aowl.admin.hotkeyEsp` declares `keybindSetting(..., "")` and its
+  ##     config.json holds `""` -- so an empty value is only a fault when the
+  ##     mod declared a real `default` and the store answered blank anyway,
+  ##     which is the shape of a value that was lost rather than never set.
+  ##   * a key the store does NOT know -> JSON `null`, WITH
+  ##     `"error":"unknown setting key"` beside it.
+  ## Every one of those is falsifiable, and `keybindCheckerProvesItself` below
+  ## feeds this proc an input for each so the check cannot pass vacuously.
+  result = ""
+  if kind(b) != JObject:
+    return "the entry is not a JSON object"
+  var sawValue = false
+  var sawDefault = false
+  var valueIsNull = false
+  var valueWrongKind = false
+  var valueText = ""
+  var defaultText = ""
+  for bk, bv in pairs(b):
+    if bk == "default":
+      sawDefault = true
+      if kind(bv) == JString:
+        defaultText = getStr(bv)
+    elif bk == "value":
+      sawValue = true
+      if kind(bv) == JString:
+        valueText = getStr(bv)
+      elif kind(bv) == JNull:
+        valueIsNull = true
+      else:
+        valueWrongKind = true
+  if not sawValue:
+    return "carries NO `value` at all; an unknown key must be `null` with " &
+           "`\"error\":\"unknown setting key\"`, never an omission"
+  if not sawDefault:
+    return "carries no `default`"
+  if valueWrongKind:
+    return "`value` is neither a JSON string nor null"
+  if valueIsNull:
+    if jStrField(b, "error") != "unknown setting key":
+      return "`value` is null but no `\"error\":\"unknown setting key\"` " &
+             "stands beside it, so a reader cannot tell WHY it is null"
+    return ""
+  if valueText.len == 0 and defaultText.len > 0:
+    return "`value` is EMPTY while the mod declares a `default` of `" &
+           defaultText & "`; the store lost the binding, and a blank reads " &
+           "as `unbound` rather than as the fault it is"
+
+proc keybindFaultOfLiteral(text: string): string =
+  var t = parseJson(text)
+  if hasError(t):
+    return "the fixture itself did not parse"
+  result = keybindValueFault(root(t))
+
+proc keybindCheckerProvesItself(): string =
+  ## THE NEGATIVE CONTROL, run every time. `keybindValueFault` is fed one
+  ## literal per branch, including the two that MUST be rejected -- an entry
+  ## with no `value`, and a null `value` with no `error`. If it accepts either,
+  ## the live check below could not have failed and its PASS means nothing;
+  ## that is reported as a failure of the TEST, not of the route.
+  ##
+  ## This exists because the live mod population may legitimately contain zero
+  ## unknown keys, in which case the null branch is never exercised by real
+  ## data and "every live entry passed" would be a check that cannot fail.
+  result = ""
+  if keybindFaultOfLiteral("{\"value\":\"F7\",\"default\":\"F6\"}").len != 0:
+    return "it rejects a well-formed entry"
+  if keybindFaultOfLiteral("{\"default\":\"F6\"}").len == 0:
+    return "it ACCEPTS an entry that omits `value`"
+  if keybindFaultOfLiteral("{\"value\":null,\"default\":null}").len == 0:
+    return "it ACCEPTS a null `value` with no `error` beside it"
+  if keybindFaultOfLiteral("{\"value\":\"\",\"default\":\"F6\"}").len == 0:
+    return "it ACCEPTS an empty `value` under a declared `default`"
+  if keybindFaultOfLiteral("{\"value\":\"\",\"default\":\"\"}").len != 0:
+    return "it rejects a legitimately UNBOUND key (both empty)"
+  if keybindFaultOfLiteral(
+       "{\"value\":null,\"default\":null,\"error\":\"unknown setting key\"}").len != 0:
+    return "it rejects the declared unknown-key shape"
+
 proc isSettingTypeName(t: string): bool =
   ## THE CLOSED SET, spelled out. It mirrors `kindName` in
   ## `aowl/src/aowlspt/settings.nim`; a ninth kind added there and not here
@@ -3790,12 +3879,18 @@ proc main(): int =
             var emptyLists = 0
             var noAction = ""
             var notAnArray = ""
+            var valueFault = ""
+            var faultAt = ""
+            var unknownKeys = 0
+            var clientBinds = 0
+            let checkerFault = keybindCheckerProvesItself()
             for topKey, topVal in pairs(root(kt)):
               if topKey != "mods" or kind(topVal) != JArray:
                 continue
               for m in items(topVal):
                 inc kmods
                 let guid = jStrField(m, "guid")
+                let isClient = jBoolField(m, "client", false)
                 if not jHasArray(m, "keybinds"):
                   notAnArray = guid
                   continue
@@ -3806,9 +3901,30 @@ proc main(): int =
                     inc emptyLists
                   for b in items(mv):
                     inc binds
+                    if isClient:
+                      inc clientBinds
                     if jStrField(b, "action").len == 0:
                       noAction = guid & "." & jStrField(b, "settingKey")
-            if notAnArray.len > 0:
+                    # THE BOUND VALUE. Asserted over every entry of every mod,
+                    # client-side or not: the native Controls -> MODS page
+                    # cannot draw a bind whose value it has no field for, and
+                    # a client mod's rows travel a different transport but
+                    # carry the same contract.
+                    let f = keybindValueFault(b)
+                    if f.len > 0 and valueFault.len == 0:
+                      valueFault = f
+                      faultAt = guid & "." & jStrField(b, "settingKey")
+                    if jStrField(b, "error") == "unknown setting key":
+                      inc unknownKeys
+            if checkerFault.len > 0:
+              console.err "keybinds route: THE VALUE CHECK ITSELF IS BROKEN -- " &
+                          checkerFault & "; its verdict on the live payload " &
+                          "below means nothing"
+              inc gSelfFailures
+            if valueFault.len > 0:
+              console.err "keybinds route: " & faultAt & " " & valueFault
+              inc gSelfFailures
+            elif notAnArray.len > 0:
               console.err "keybinds route: `" & notAnArray &
                           "` has no `keybinds` ARRAY; a mod with no keys must " &
                           "carry [], not null and not a missing entry"
@@ -3825,8 +3941,11 @@ proc main(): int =
               inc gSelfFailures
             else:
               console.ok "keybinds route is strict JSON: " & $kmods &
-                         " mod(s), " & $binds & " binding(s), " &
-                         $emptyLists & " mod(s) with an EMPTY list (not null)"
+                         " mod(s), " & $binds & " binding(s) (" & $clientBinds &
+                         " on client mods), " & $emptyLists &
+                         " mod(s) with an EMPTY list (not null); every one " &
+                         "carries `value` and `default`, " & $unknownKeys &
+                         " of them null with `unknown setting key`"
 
     # ---- the round trip: set -> index -> reset -> index ----
     #
