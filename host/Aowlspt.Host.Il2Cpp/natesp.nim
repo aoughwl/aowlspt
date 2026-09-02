@@ -2791,6 +2791,7 @@ proc neTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ne_tick_body", cdecl.}
       gNeGateOpenMs = 0'u64
       gNeFirstDrawMs = 0'u64
       gNeLedgerSaid = false
+      ndpReset()
       cNeCostPhase(NePhGate)
       return cast[Il2CppPtr](1)
     # From here on this tick IS the steady state: the only phase under budget.
@@ -2839,6 +2840,11 @@ proc natEspDrainTick() =
   ## detour; a second detour on one function overwrites the first's trampoline
   ## and silently kills it). Idle cost when the flag is off is one compare and
   ## no call into the game.
+  # THE DEPLOY PROBE's first-fire lines, BEFORE the `natEsp` early-out and
+  # deliberately not gated on it: `natespDeployProbe` is a measurement about
+  # `raidphase`, which the maps HUD reads too, so it must report whether or not
+  # the ESP itself is armed. It is inert (one bool test) when the probe is off.
+  ndpDrainAnnounce()
   if not gNeOn: return
   if cNeDisabled() != 0'i32:
     if gNeWhy != NeRFaulted: neRefuse(NeRFaulted)
@@ -2965,20 +2971,52 @@ proc natEspDrainTick() =
   # BEGINS, whereas "actually deployed" is the countdown ENDING and the player
   # being released. natesp has no signal for that end, so it says so in its own
   # line rather than implying the gate is correct.
-  if gNeFirstDrawMs != 0'u64 and not gNeLedgerSaid:
+  #
+  # WHEN IT PRINTS. Not "when we first drew" alone -- a raid in which natesp
+  # never draws is exactly the raid whose ordering we most want, and a ledger
+  # that waits for a draw would go silent in it. It prints as soon as the first
+  # box is placed, or 30 s after the earliest anchor we have (the gate opening,
+  # or `EFT.LocalGame::Spawn` firing) if no box ever was -- whichever comes
+  # first. So a raid that draws nothing still yields the ordering, and it is
+  # reported with `firstDraw=never`, not as a blank.
+  let ledgerAnchor =
+    if gNeGateOpenMs != 0'u64: gNeGateOpenMs
+    elif ndpRowFirstMs(3) != 0'u64: ndpRowFirstMs(3)
+    else: 0'u64
+  if not gNeLedgerSaid and ledgerAnchor != 0'u64 and
+     (gNeFirstDrawMs != 0'u64 or (cNowMs() - ledgerAnchor) >= 30000'u64):
     gNeLedgerSaid = true
-    okLog "natesp DEPLOY LEDGER (once per raid): raid gate first OPENED at " &
-          $gNeGateOpenMs & "ms, first box actually PLACED at " &
-          $gNeFirstDrawMs & "ms, delta=" & $(gNeFirstDrawMs - gNeGateOpenMs) &
-          "ms. The gate stage that admitted it: " & gNeGateStage &
+    okLog "natesp DEPLOY LEDGER (once per raid): S6 OnGameStarted latched at " &
+          (if gRpTrueAtMs != 0'u64: $gRpTrueAtMs & "ms"
+           else: "NEVER (the latch fell back to the readable proxies)") &
+          ", raid gate first OPENED at " &
+          (if gNeGateOpenMs != 0'u64: $gNeGateOpenMs & "ms"
+           else: "NEVER (the gate never fully passed)") &
+          ", first box actually PLACED at " &
+          (if gNeFirstDrawMs != 0'u64: $gNeFirstDrawMs & "ms"
+           else: "NEVER (no box was placed in this raid)") &
+          (if gNeFirstDrawMs != 0'u64 and gNeGateOpenMs != 0'u64:
+             ", gate->draw delta=" & $(gNeFirstDrawMs - gNeGateOpenMs) & "ms"
+           else: "") &
+          ". " & ndpOrderLine() &
+          ". THE COMPARISON THAT SETTLES IT: put the four probe timestamps " &
+          "beside the S6 latch above. If EFT.LocalGame::Spawn -- or the LAST " &
+          "<ShowCountdown>d__16::MoveNext -- is LATER than the S6 latch, the " &
+          "current gate fires early and that row is the later signal to move " &
+          "to. If both are EARLIER, the hypothesis is wrong and OnGameStarted " &
+          "is already late. A row that NEVER FIRED settles nothing either way." &
+          " The gate stage that admitted it: " & gNeGateStage &
           ". CAVEAT, stated because the delta looks like a proof and is not: " &
           "firstDraw >= gateOpen is guaranteed by the gate itself and " &
           "establishes NOTHING about the countdown. raidphase latches " &
           "DEPLOYED on EFT.GameWorld::OnGameStarted, which fires when the " &
           "deploy countdown STARTS; the player is released when it ENDS. " &
           "natesp is gated on the START, so boxes CAN be drawn over the " &
-          "countdown. That is a known, unfixed defect -- it needs a later " &
-          "signal than OnGameStarted, and no such signal is bound yet."
+          "countdown. That is a known, unfixed defect: this pass MEASURES it " &
+          "and deliberately does NOT change the gate. NOTE: this ledger line " &
+          "needs `natEsp` on. With natEsp OFF the four DEPLOY PROBE lines and " &
+          "raidphase's own DELTA line still carry the same timestamps, so the " &
+          "ordering is recoverable from the log either way."
   if gNeDiag and (cNowMs() - gNeDiagAt) > 5000'u64:
     gNeDiagAt = cNowMs()
     var sw = 0.0
