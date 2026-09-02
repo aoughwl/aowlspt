@@ -248,6 +248,10 @@ const
   ModeSkipApplyCap = 64
     ## ACTIVE nodes examined for that search. A count AT the cap is visible in
     ## the refusal, so a truncation cannot read as an absence.
+  ModeSkipConfirmTicks = 120
+    ## Drain ticks (~2 s at 60 fps) to wait for `MenuScreen::Show` after the
+    ## CARD press before pressing a confirm-shaped control, if the card has
+    ## one. Short, because this is the second half of one answer, not a retry.
   ModeSkipReadbackTicks = 900
     ## Drain ticks (~15 s at 60 fps) to wait for `MenuScreen::Show` after the
     ## press before saying, out loud, that there was NO readback.
@@ -297,6 +301,13 @@ var gModeSkipPressWhy = ""                 ## why it did not
 var gModeSkipPressAtTick = 0               ## drain tick of the press
 var gModeSkipMenuEpoch0 = 0                ## site-2 epoch BEFORE the press
 var gModeSkipReadbackDone = false          ## the readback has been reported
+var gModeSkipPressPhase = 0                ## 0 = the card, 1 = its confirm
+var gModeSkipPressedNode: Il2CppPtr = nil  ## what phase 0 pressed
+var gModeSkipCandNames = ""                ## every pressable candidate seen
+var gModeSkipPickName = ""                 ## what was pressed, name + klass
+var gModeSkipHasConfirm = false            ## the card has a second control
+var gModeSkipConfirmName = ""              ## and what that one is called
+var gModeSkipCardTitle = ""                ## the TITLE A PERSON READS on it
 var gModeSkipDeclinedLate = false      ## the "burst 2 never came" refusal, once
 var gModeSkipStaleLogged = false       ## the stale-controller refusal, once
 var gModeSkipMenuEpoch = 0             ## last seen uihooks MenuScreen::Show epoch
@@ -624,22 +635,96 @@ proc modeSkipSubmitBody(a: Il2CppPtr): Il2CppPtr {.
     gModeSkipPressWhy = "the slot view (0x" & hexOf(cast[uint64](view)) &
                         ") did not resolve to a readable Transform"
     return
-  var seen = 0
+  # THE CARD IS THE CONTROL. MEASURED 2026-09-02: the press that hunted a node
+  # named `Apply` found none and refused, and its own census said why --
+  #   [BG_Main][Title][FooterGlow][CharactersContainer]
+  #   [CharacterSlotView_pve][BgGlow][BgImage][BgSide][View][InfoPart]
+  #   [CharacterSlotView_pvp][BgGlow][BgImage][BgSide][View][InfoPart]
+  # -- there is no `Apply` node on this screen at all. The screenshot agrees:
+  # "SELECT PROFILE AND MODE" shows two CARDS and no separate confirm button.
+  # So the pressable thing is the slot view itself, or something inside it.
+  #
+  # Nothing here is guessed: the candidates are ENUMERATED, each is probed for
+  # the three klasses this host knows how to press, and the whole list is
+  # LOGGED -- so if this press is wrong, the next run states exactly what else
+  # was on offer instead of leaving a node name to be invented.
+  var cands: seq[Il2CppPtr] = @[]
+  cands.add tr                                  # the CARD itself, first
+  var b = ArNodeBudget
+  arCollectBFS(tr, ModeSkipApplyDepth, b, cNowMs() + ArWalkMs, cands,
+               ModeSkipApplyCap, "")
   var names = ""
-  let apply = arFindActiveNamedBFS(tr, "Apply", ModeSkipApplyDepth,
-                                   ModeSkipApplyCap, seen, names)
-  if apply == nil:
-    gModeSkipPressWhy = "no ACTIVE node named `Apply` under the matching slot " &
-                        "view -- level-by-level BFS, depth " &
-                        $ModeSkipApplyDepth & ", cap " & $ModeSkipApplyCap &
-                        ", examined " & $seen & " ACTIVE node(s): " &
+  var pick: Il2CppPtr = nil
+  var pickComp: Il2CppPtr = nil
+  var pickType = ""
+  var pickName = ""
+  var confirm: Il2CppPtr = nil
+  var confirmComp: Il2CppPtr = nil
+  var confirmType = ""
+  var confirmName = ""
+  var i = 0
+  while i < cands.len:
+    var comp: Il2CppPtr = nil
+    let ct = arButtonOn(cands[i], comp)
+    if ct.len > 0:
+      let nm = iObjName(cands[i])
+      let lnm = iLower(nm)
+      if names.len < 560:
+        names = names & "[" & nm & " " & ct & "]"
+      # A CONFIRM-shaped control, if this card has one. It is pressed SECOND,
+      # on a later tick, and only if the first press produced no readback.
+      if confirm == nil and cands[i] != tr and
+         (iContains(lnm, "apply") or iContains(lnm, "confirm") or
+          iContains(lnm, "ready") or iContains(lnm, "select")):
+        confirm = cands[i]
+        confirmComp = comp
+        confirmType = ct
+        confirmName = nm
+      elif pick == nil:
+        pick = cands[i]
+        pickComp = comp
+        pickType = ct
+        pickName = nm
+    i = i + 1
+  # Phase 1 presses the confirm-shaped control; phase 0 presses the card. A
+  # confirm pressed with no card press before it would be the second half of a
+  # two-step answer, on its own.
+  if gModeSkipPressPhase == 1:
+    if confirm == nil:
+      gModeSkipPressWhy = "no second, confirm-shaped control under the card " &
+                          "to press after the first press produced no " &
+                          "readback. Candidates: " &
+                          (if names.len > 0: names else: "<none>")
+      return
+    pick = confirm
+    pickComp = confirmComp
+    pickType = confirmType
+    pickName = confirmName
+  elif pick == nil and confirm != nil:
+    # Only a confirm-shaped control exists, so it IS the card's control.
+    pick = confirm
+    pickComp = confirmComp
+    pickType = confirmType
+    pickName = confirmName
+  if pick == nil:
+    gModeSkipPressWhy = "NO node under the matching slot card carries a " &
+                        "DefaultUIButton, a UnityEngine.UI.Button or an " &
+                        "AnimatedToggle -- BFS depth " & $ModeSkipApplyDepth &
+                        ", cap " & $ModeSkipApplyCap & ", " & $cands.len &
+                        " ACTIVE node(s) examined. Pressable candidates: " &
                         (if names.len > 0: names else: "<none>")
     return
-  if not arPress(apply, "DefaultUIButton"):
-    gModeSkipPressWhy = "the slot's ACTIVE `Apply` was found but its " &
-                        "DefaultUIButton OnClick could not be resolved and " &
-                        "validated, so it was NOT pressed"
+  gModeSkipCandNames = names
+  gModeSkipPickName = pickName & " (" & pickType & ")"
+  gModeSkipHasConfirm = confirm != nil
+  gModeSkipConfirmName = (if confirm != nil: confirmName & " (" & confirmType & ")"
+                          else: "<none>")
+  if not arPressAny(pick, pickComp, pickType):
+    gModeSkipPressWhy = "the card control `" & pickName & "` (" & pickType &
+                        ") was found but could not be pressed: its OnClick " &
+                        "could not be resolved and validated"
     return
+  gModeSkipPressedNode = pick
   gModeSkipPressedOk = true
   gModeSkipSubmittedAtMs = cNowMs()
   gModeSkipSubmittedAtLogMs = gModeSkipSubmittedAtMs
@@ -680,6 +765,30 @@ proc modeSkipPressReadback() =
           "client's own selection flow completed and the menu is coming up; " &
           "that is the thing this feature exists to achieve, and it is now " &
           "OBSERVED rather than assumed."
+    return
+  # A SECOND STEP, ONLY ON EVIDENCE. If the card has a confirm-shaped control
+  # and the first press produced no readback within the confirm window, press
+  # that one too -- in order, with this readback between them, never both at
+  # once.
+  if gModeSkipHasConfirm and gModeSkipPressPhase == 0 and
+     gModeSkipTicks - gModeSkipPressAtTick > ModeSkipConfirmTicks:
+    gModeSkipPressPhase = 1
+    gModeSkipPressAtTick = gModeSkipTicks
+    okLog "skip mode screen: the card press produced no MenuScreen::Show " &
+          "within " & $ModeSkipConfirmTicks & " drain ticks, and this card " &
+          "HAS a second, confirm-shaped control (" & gModeSkipConfirmName &
+          "). Pressing that now, in order, with the readback between -- never " &
+          "both at once."
+    if cMskSubmitGuarded(cast[Il2CppPtr](0)) == nil:
+      inc gModeSkipFaults
+      warn "skip mode screen: the guarded confirm press faulted (" &
+           $gModeSkipFaults & " of " & $ModeSkipMaxFaults & ")"
+    elif not gModeSkipPressedOk:
+      warn "skip mode screen: the confirm press did NOT go through -- " &
+           gModeSkipPressWhy & "."
+    else:
+      okLog "skip mode screen: pressed the confirm control `" &
+            gModeSkipPickName & "`. The readback is still MenuScreen::Show."
     return
   if gModeSkipTicks - gModeSkipPressAtTick > ModeSkipReadbackTicks:
     gModeSkipReadbackDone = true
@@ -881,6 +990,17 @@ proc modeSkipDrainTick() =
   gModeSkipMenuEpoch0 = (if gModeSkipMenuSiteOk: uihEpoch(gModeSkipMenuSite)
                          else: 0)
   gModeSkipReadbackDone = false
+  gModeSkipPressPhase = 0
+  gModeSkipPressedNode = nil
+  # THE TITLE A PERSON READS on the card, so the log names WHICH card was
+  # pressed in the words on screen ("PvE Zone" / "PvE") and not only an object
+  # name -- on this build the two DISAGREE: `CharacterSlotView_pvp` is the card
+  # labelled "PvE".
+  block:
+    let ctr = iToTransform(gModeSkipPendingView)
+    gModeSkipCardTitle = (if ctr != nil and duOk(ctr, 0x20'i32):
+                            arLabelUnderName(ctr, "Title", ModeSkipApplyDepth)
+                          else: "")
 
   gModeSkipPressAtTick = gModeSkipTicks
   if cMskSubmitGuarded(cast[Il2CppPtr](0)) == nil:
@@ -902,8 +1022,12 @@ proc modeSkipDrainTick() =
          "SeasonWidgetData::From faulting on a Profile argument of INTEGER 1 " &
          "with a NULL SeasonalRewardController."
     return
-  okLog "skip mode screen: pressed the matching slot's own `Apply` " &
-        "(EFT.UI.DefaultUIButton) for profile " & gModeSkipWantId &
+  okLog "skip mode screen: pressed the matching slot CARD's own control `" &
+        gModeSkipPickName & "`" &
+        (if gModeSkipCardTitle.len > 0:
+           " on the card titled \"" & gModeSkipCardTitle & "\""
+         else: " (no readable card Title)") &
+        " for profile " & gModeSkipWantId &
         " (gameMode=" & $gModeSkipPendingMode & ") -- answering showing " &
         $gModeSkipPendingBurst & " on tick +" &
         $(gModeSkipTicks - gModeSkipBurstLastTick) &
@@ -913,7 +1037,12 @@ proc modeSkipDrainTick() =
         "doing so skipped the work that populates Profile and " &
         "SeasonalRewardController before MenuScreen::Show. PRESSED IS NOT " &
         "ANSWERED -- the readback is MenuScreen::Show (uihooks site 2) firing, " &
-        "which is logged separately."
+        "which is logged separately. Pressable candidates on this card: " &
+        gModeSkipCandNames & "; a second, confirm-shaped control " &
+        (if gModeSkipHasConfirm:
+           "IS present (" & gModeSkipConfirmName & ") and will be pressed " &
+           "only if this press produces no readback"
+         else: "is NOT present, so this one press is the whole answer") & "."
 
 # ---------------------------------------------------------------------------
 # BINDING
