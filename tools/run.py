@@ -43,6 +43,14 @@ every outcome that has actually happened on this project.
                   entirely, heartbeat included. See Supervisor.check_clocks.
     BACKENDDOWN   the launcher gave up restarting the server. The client is
                   usually still up and still looks fine. Exit 9.
+    PARKED-BEFORE-MENU
+                  `--until-phase MENU` was asked for, the phase is MENU and
+                  the log has gone quiet -- but the host NEVER logged the
+                  MenuScreen::Show event, so the main menu was never shown.
+                  The client is parked at some earlier screen (usually
+                  character/mode select) with no GameWorld cached, which is
+                  all `raid phase = MENU` has ever meant. Exit 10. See
+                  MENU_PROOF_LINES.
 
 The last two are the ones that used to cost HOURS rather than minutes. The host
 re-publishes the raid phase every 5s forever; that heartbeat refreshed the
@@ -210,6 +218,72 @@ def is_progress(line):
 # enterraid.py, which asserts a DURATION and never a STATE.
 RAID_PHASE = re.compile(r"raid phase = ([A-Z]+)")
 
+# HOST-SIDE PROOF THAT THE MAIN MENU WAS ACTUALLY SHOWN.
+#
+# MEASURED 2026-09-02 03:20: `run.py --keep --until-phase MENU` printed
+# `REACHED ... the boot is over and the client is parked at the menu` while the
+# client was sitting on the CHARACTER/MODE SELECT screen. The host log for that
+# run ends with `skip mode screen: SHOWING 1 ... closed` and then says nothing
+# further -- no menu-show line of any kind. Nothing was wrong with the settle
+# window; the phase it keys on is the wrong signal. natesp's own text says what
+# `raid phase = MENU` means: "no GameWorld is cached, which is what the menu
+# looks like". That is equally true on the loading screen, on the profile/slot
+# screen and on the main menu, so the phase cannot distinguish them and must
+# not be asked to.
+#
+# What CAN distinguish them is the `EFT.UI.MenuScreen::Show` event -- uihooks
+# site 2, the thing that fires when the main menu is built. Four features log a
+# line off that event, and any ONE of them is proof it fired:
+#
+#   modeskip.nim:609   "skip mode screen: MenuScreen::Show fired (uihooks site
+#                       2, epoch N) -- the main menu is up ..."
+#   modload.nim:968    "mod loading: release gated -- READY at ...,
+#                       MenuScreen::Show at ..., releasing now"  (printed ONLY
+#                       on the gated release, i.e. the show event arrived; the
+#                       deadline-forced release does not print it)
+#   modstab.nim:4937   "hide seasons: menu epoch N -- one bounded ..."
+#   modstab.nim:4900   "version brand: menu epoch N -- one bounded ..."
+#
+# Substrings, not whole lines, and each is the fixed prefix of its emitter --
+# the variable part (epoch, timestamp) is always after the last character here.
+MENU_PROOF_LINES = (
+    "MenuScreen::Show fired (uihooks site 2, epoch ",  # modeskip.nim
+    "mod loading: release gated -- READY at ",          # modload.nim
+    "hide seasons: menu epoch ",                        # modstab.nim
+    "version brand: menu epoch ",                       # modstab.nim
+)
+
+# CAN this host build even produce one of the above? `uihStatusLines` in
+# uihooks.nim prints one line per site at bind time --
+# `  site 2 EFT.UI.MenuScreen::Show @0x...: BOUND (slot N), fired 0x, ...`.
+# A build that predates uihooks site 2 prints no such line at all, and on that
+# build the absence of a proof line proves NOTHING. So the absence of this
+# capability line downgrades the verdict's WORDING to unproven rather than
+# turning a healthy run into a failure -- "I could not look" is not a FAIL any
+# more than it is a PASS (CLAUDE.md 9b).
+#
+# Matched as two independent substrings so it also catches `NOT BOUND`: a build
+# where the site exists but did not bind is likewise a build that can never
+# emit proof, and reporting PARKED-BEFORE-MENU there would be a fabricated
+# failure.
+MENU_PROOF_SITE = ("site 2 ", "BOUND")
+
+# WHICH SCREEN did the host last NAME? Only used to make the
+# PARKED-BEFORE-MENU verdict actionable -- "it never reached the menu" is much
+# less useful than "it is sitting on the slot screen". These are one-shot host
+# lines, not a state machine, so the last one seen is the last screen the host
+# had anything to say about, and the verdict says exactly that much and no more.
+SCREEN_NAME_LINES = (
+    ("skip mode screen: CharacterSelectionScreen.ShowSlot first fired",
+     "the character/profile SLOT screen (CharacterSelectionScreen.ShowSlot "
+     "fired)"),
+    ("skip mode screen: SHOWING",
+     "the character/mode SELECT screen (a showing of it opened and closed)"),
+    ("mod loading: release HELD",
+     "the character-select / profile-Submit transition (mod loading is still "
+     "holding its release, waiting for MenuScreen::Show)"),
+)
+
 # The host's raid-phase cadence, MEASURED: 40 consecutive `raid phase = MENU`
 # lines at 5.015s apart. It is the proof-of-life the silence test leans on -- a
 # host that has printed nothing for several multiples of this has stopped.
@@ -267,6 +341,11 @@ EXIT = {
     # The launcher declared the server dead. The client may still be sitting
     # there looking perfectly alive.
     "BACKENDDOWN": 9,
+    # `--until-phase MENU` settled, but no host line ever proved the main menu
+    # was shown. Distinct from REACHED (it is not success) and from STALLED
+    # (nothing is wedged and the host is alive and heartbeating) so a caller
+    # can branch on "it parked one screen short" without parsing prose.
+    "PARKED-BEFORE-MENU": 10,
 }
 
 
@@ -387,6 +466,15 @@ class Supervisor:
         self.host_leftover = ""
         self.host_tail = []
         self.errdlg_armed = None      # None = not stated yet in this run's log
+        # MENU PROOF. `menu_proof` is the host line that showed
+        # EFT.UI.MenuScreen::Show fired; `site2_seen` is whether this build can
+        # produce such a line at all; `last_screen` is the last screen the host
+        # named. All three are per-RUN and are cleared when the host truncates
+        # the log, exactly like errdlg_armed -- a proof line from the PREVIOUS
+        # boot certifying THIS boot's menu would be the worst kind of pass.
+        self.menu_proof = None
+        self.site2_seen = False
+        self.last_screen = None
         self.seen_any = False
         self.last_progress = time.time()
         # ANY host line, heartbeats included. Distinct from `last_progress` on
@@ -415,6 +503,9 @@ class Supervisor:
             self.host_pos = 0
             self.host_leftover = ""
             self.errdlg_armed = None
+            self.menu_proof = None
+            self.site2_seen = False
+            self.last_screen = None
         if size == self.host_pos:
             return []
         with open(self.host_path, "r", encoding="utf-8", errors="replace") as f:
@@ -540,14 +631,47 @@ class Supervisor:
                     "this is a host that stopped, not a client parked at a "
                     "screen" % (self.phase, HOST_HEARTBEAT_S, int(silent)), ev)
 
-        # 1. ARRIVAL.
+        # 1. ARRIVAL -- and arrival needs PROOF, not a phase name.
+        #
+        # The settle window establishes only that the boot stopped moving. It
+        # cannot establish WHERE it stopped, because `raid phase = MENU` means
+        # "no GameWorld is cached" and nothing more. Measured 2026-09-02 03:20:
+        # this branch returned REACHED for a client sitting on the character/
+        # mode select screen. So the phase decides WHEN to answer and the
+        # MenuScreen::Show event decides WHAT the answer is.
         if (at_destination and self.phase == "MENU"
                 and quiet >= self.menu_settle
                 and silent <= HOST_HEARTBEAT_S * 3):
-            return ("REACHED",
-                    "raid phase = MENU has held with no other host progress "
-                    "for %ds -- the boot is over and the client is parked at "
-                    "the menu" % int(quiet), ev)
+            if self.menu_proof:
+                return ("REACHED",
+                        "raid phase = MENU has held with no other host "
+                        "progress for %ds AND the host logged the "
+                        "EFT.UI.MenuScreen::Show event -- the main menu really "
+                        "was shown and the client is parked on it"
+                        % int(quiet), ev + [self.menu_proof])
+            if not self.site2_seen:
+                # Old host build: no site-2 status line, so no feature could
+                # ever have logged the proof. Absence of proof is not proof of
+                # absence -- keep the old verdict and SAY it is unverified.
+                return ("REACHED",
+                        "raid phase = MENU has held with no other host "
+                        "progress for %ds -- but UNPROVEN: this host build "
+                        "never printed a uihooks `site 2 ... BOUND` line, so "
+                        "no MenuScreen::Show proof exists to check and this "
+                        "cannot tell the main menu from the character-select "
+                        "screen. Treat as the pre-2026-09-02 verdict"
+                        % int(quiet), ev)
+            return ("PARKED-BEFORE-MENU",
+                    "raid phase = MENU has held quiet for %ds, but the host "
+                    "NEVER logged the EFT.UI.MenuScreen::Show event -- and "
+                    "uihooks site 2 IS bound in this build, so that line would "
+                    "have appeared if the main menu had been built. The phase "
+                    "only means no GameWorld is cached, which is equally true "
+                    "on the loading screen and the character/mode select "
+                    "screen. Last screen the host named: %s"
+                    % (int(quiet),
+                       self.last_screen or "none -- the host named no screen "
+                       "at all, so WHERE it is parked is unknown"), ev)
 
         # 2. THE PHASE BOUND.
         if (self.phase_max and not at_destination
@@ -572,6 +696,24 @@ class Supervisor:
             # progress clock -- see HEARTBEAT_HOST_LINES for what this cost.
             if is_progress(line):
                 self.last_progress = time.time()
+
+            # MENU PROOF, gathered as the lines go past. Deliberately NOT a
+            # verdict of its own: the proof line arrives long before the boot
+            # settles, and returning on it would re-create the first-sighting
+            # bug in a new place. It only decides which answer the settle
+            # window gives.
+            if self.menu_proof is None:
+                for sig in MENU_PROOF_LINES:
+                    if sig in line:
+                        self.menu_proof = line.strip()
+                        self.mark("main menu PROVED shown (MenuScreen::Show)")
+                        break
+            if not self.site2_seen and all(s in line for s in MENU_PROOF_SITE):
+                self.site2_seen = True
+            for sig, name in SCREEN_NAME_LINES:
+                if sig in line:
+                    self.last_screen = name
+                    break
 
             # RAID PHASE. The signal existed and nothing consumed it. A phase
             # CHANGE is real progress even though the line carrying it is a
@@ -770,7 +912,10 @@ def main():
                    help="with --until-phase MENU: seconds of no other host "
                         "progress before MENU counts as reached. MENU is "
                         "published at ~9s on every boot, long before the menu "
-                        "exists; the first sighting is never the answer.")
+                        "exists; the first sighting is never the answer. The "
+                        "window decides WHEN to answer; a host-side "
+                        "MenuScreen::Show line decides whether the answer is "
+                        "REACHED or PARKED-BEFORE-MENU.")
     p.add_argument("--phase-max", type=float, default=900.0,
                    help="seconds allowed in ONE raid phase before the run is "
                         "called STALLED. Bounds the raid on a published "
@@ -970,7 +1115,11 @@ def main():
                "distinguished from the client sitting on an error window")
 
     # Only run inspector commands when the client is actually up and healthy.
-    if args.inspect and verdict in ("REACHED", "IDLE"):
+    # PARKED-BEFORE-MENU is included on purpose: the client is alive, quiet and
+    # sitting on a real screen -- it is simply not the screen that was asked
+    # for. That is exactly the case where an inspector batch is worth running,
+    # because it can say which screen it IS.
+    if args.inspect and verdict in ("REACHED", "IDLE", "PARKED-BEFORE-MENU"):
         cmd = [sys.executable, os.path.join(HERE, "inspector.py"),
                "--timeout", "60"] + list(args.inspect)
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)

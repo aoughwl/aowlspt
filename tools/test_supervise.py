@@ -278,6 +278,137 @@ def t_menu_must_settle():
         b.close()
 
 
+# -- 6b-ii. MENU needs a host-side PROOF that the menu was shown ----------
+#
+# MEASURED 2026-09-02 03:20: `run.py --keep --until-phase MENU` printed REACHED
+# ("the boot is over and the client is parked at the menu") for a client that
+# was sitting on the CHARACTER/MODE SELECT screen. The host log for that run
+# ends with `skip mode screen: SHOWING 1 ... closed` and then nothing -- no
+# `MenuScreen::Show fired (uihooks site 2, epoch N)`, no `mod loading: release
+# gated -- READY at`, no `hide seasons: menu epoch`. The settle window was not
+# wrong about the boot having stopped; the PHASE was wrong about where. All
+# `raid phase = MENU` has ever meant is "no GameWorld is cached", which the
+# loading screen and the slot screen satisfy too.
+#
+# Three cases, and the third is what stops this being a check that can only say
+# no: an old host build cannot emit the proof line, so on that build the
+# ABSENCE of proof must not be reported as a failure.
+
+# The uihooks boot-summary line, shape from uihooks.nim's uihStatusLines.
+SITE2_BOUND = ("[0:00:06.100] ok     site 2 EFT.UI.MenuScreen::Show "
+               "@0x15387a0: BOUND (slot 3), fired 0x, 0 with a live receiver, "
+               "0 rejected, 0 faulted dispatch(es)")
+
+# The 03:20 boot, in order and with nothing after it.
+BOOT_0320 = [
+    "[0:00:25.703] ok     skip mode screen: "
+    "CharacterSelectionScreen.ShowSlot first fired; the selection screen is "
+    "up and is being answered",
+    "[0:00:26.075] ok     skip mode screen: SHOWING 1 of the character/mode "
+    "screen closed on this frame -- 1 ShowSlot call(s), the first showing.",
+]
+
+
+def _settled_menu(b, extra_lines):
+    """Feed a boot, then let MENU settle. Returns the verdict tuple or None."""
+    s = b.sup(until_phase="MENU", phase_max=0.0, menu_settle=20.0)
+    s.menu_settle = 20.0
+    b.say(phase_line("MENU"))                  # the ~9s first sighting
+    s.poll_host()
+    for line in extra_lines:
+        b.say(line)
+    s.poll_host()
+    s.last_progress = time.time() - 25.0       # quiet for longer than settle
+    b.say(phase_line("MENU"))
+    return s.poll_host()
+
+
+def t_menu_proof_required():
+    # (a) THE MEASURED 03:20 SHAPE. Site 2 is bound, so a menu show WOULD have
+    # been logged; it was not, and the host last named the slot screen.
+    b = Bed()
+    try:
+        hit = _settled_menu(b, [SITE2_BOUND] + BOOT_0320)
+        check("menuproof/0320-is-parked-before-menu",
+              hit is not None and hit[0] == "PARKED-BEFORE-MENU",
+              repr(hit)[:160])
+        # The LAST screen the host named, which on this boot is the `SHOWING
+        # ... closed` line, not the earlier ShowSlot one.
+        check("menuproof/0320-names-the-character-screen",
+              hit is not None and "character/mode SELECT screen" in hit[1],
+              "the verdict must say WHICH screen the host last named: %s"
+              % (hit[1][:200] if hit else None))
+    finally:
+        b.close()
+
+    # ShowSlot ALONE (no `SHOWING ... closed` after it) names the slot screen.
+    b = Bed()
+    try:
+        hit = _settled_menu(b, [SITE2_BOUND, BOOT_0320[0]])
+        check("menuproof/showslot-alone-names-the-slot-screen",
+              hit is not None and hit[0] == "PARKED-BEFORE-MENU"
+              and "SLOT screen" in hit[1], repr(hit)[:200])
+    finally:
+        b.close()
+
+    # And with NO screen line at all the verdict must say the location is
+    # unknown rather than inventing one.
+    b = Bed()
+    try:
+        hit = _settled_menu(b, [SITE2_BOUND])
+        check("menuproof/no-screen-line-says-unknown",
+              hit is not None and hit[0] == "PARKED-BEFORE-MENU"
+              and "unknown" in hit[1], repr(hit)[:200])
+    finally:
+        b.close()
+
+    # (b) A REAL MENU BOOT. Same shape plus the one line that proves the show
+    # event fired. This is the falsifying half: without it the check above
+    # would pass for every input and prove nothing.
+    b = Bed()
+    try:
+        hit = _settled_menu(b, [SITE2_BOUND] + BOOT_0320 + [
+            "[0:00:31.500] ok     mod loading: release gated -- READY at "
+            "0:00:22.100, MenuScreen::Show at 0:00:31.480, releasing now"])
+        check("menuproof/real-menu-boot-reaches",
+              hit is not None and hit[0] == "REACHED", repr(hit)[:160])
+        check("menuproof/reached-says-it-was-proved",
+              hit is not None and "MenuScreen::Show" in hit[1],
+              hit[1][:160] if hit else None)
+    finally:
+        b.close()
+
+    # Every literal in the table must be able to carry the proof on its own --
+    # a table entry that never matches is a silent gap, and this suite exists
+    # to stop exactly that.
+    for sig in runmod.MENU_PROOF_LINES:
+        b = Bed()
+        try:
+            hit = _settled_menu(b, [SITE2_BOUND] + BOOT_0320 +
+                                ["[0:00:31.500] ok     " + sig + "3 -- rest"])
+            check("menuproof/literal proves: %s" % sig[:34].strip(),
+                  hit is not None and hit[0] == "REACHED", repr(hit)[:120])
+        finally:
+            b.close()
+
+    # (c) AN OLD HOST BUILD: no `site 2 ... BOUND` line anywhere, so no feature
+    # could ever have printed the proof. "I could not look" is not a FAIL any
+    # more than it is a PASS -- keep the old verdict and say it is unproven.
+    b = Bed()
+    try:
+        hit = _settled_menu(b, [
+            "[0:00:12.000] ok     mods tab: GetComponent bound",
+        ])
+        check("menuproof/old-build-still-reaches",
+              hit is not None and hit[0] == "REACHED", repr(hit)[:160])
+        check("menuproof/old-build-says-unproven",
+              hit is not None and "UNPROVEN" in hit[1],
+              "a REACHED with no proof available must SAY so: %s"
+              % (hit[1][:160] if hit else None))
+    finally:
+        b.close()
+
+
 # -- 6c. the TEARDOWN announcement ---------------------------------------
 #
 # `run.py` without `--keep` force-stops the client, the backend and the
@@ -655,7 +786,7 @@ def t_exit_codes_distinct():
 def main():
     for fn in (t_stalled_fires, t_progress_never_stalls, t_bound_disable,
                t_heartbeat_is_not_progress, t_backend_down,
-               t_existing_verdicts, t_menu_must_settle,
+               t_existing_verdicts, t_menu_must_settle, t_menu_proof_required,
                t_periodic_table_is_honest, t_measured_false_stalled,
                t_measured_control_run, t_measured_real_stall_stays_stalled,
                t_stall_at_destination_needs_total_silence,
