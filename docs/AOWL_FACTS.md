@@ -5915,3 +5915,22 @@ The caption for the mod loading step is `LoadingSpinner/Text` ("Loading...",
 font 26 during the load, inactive and 6px outside it) -- the exact object an
 earlier catchcaption run found and rejected as "an inactive spinner sub-label".
 Inactive-when-looked is not a reason to reject a transient object.
+
+## Beta branches folded into integ-beta9 (2026-09-01 night)
+
+Merge-readiness audit (read-only, all commits authored+committed by the
+correct identity, zero OTHER ADDRESS): 8 of the 17 remembered branches were
+already ancestors (folded, refs pruned); 4 are content-absorbed and BEHIND
+(`integ-tooling`, `feat-tex-bundle-redirect`, `feat-splrebrand-coopwarn`,
+`feat-resolver-harden` -- merging would regress hot files; delete when
+convenient); `feat-npc-voice-ai` has 13 real conflicts incl. modify/delete on
+the deliberately deleted `mods/resourcepacks` tree -- needs its own session.
+
+Merged tonight: `feat-voice-rva` (docs/VOICE_RVA.md), `feat-beta-distribution`
+(betagate), `feat-mapextract-all` (tools), `feat-voice-port` (mods/voice,
+default OFF; registry conflict resolved STRUCTURALLY -- parse both sides, add
+the missing `aowl.voice` entry, re-serialize, validate -- never by hand-editing
+four interleaved hunks). Voice runtime needs whisper/piper tools, a mic
+(currently NO_DEVICES), and an LLM (builtin template by default; OPENAI_API_KEY
+env only). Upstream EscapeFromMyBasement shipped a hardcoded OpenAI key in its
+DLL -- treat as leaked; nothing here carries a key.
