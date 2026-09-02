@@ -20,6 +20,22 @@
 ##   GET /aowlspt/settings/spt/index      -> {"pages":[{id,label,count,done}...]}
 ##   GET /aowlspt/settings/spt/page/<id>  -> that page, {settings:[...],nested:[...]}
 ##
+## It has since grown the CROSS-MOD half of the same surface, which is what a
+## native settings tab consumes:
+##
+##   GET  /aowlspt/settings/index         -> {"mods":[{guid,name,count,done}...]}
+##   GET  /aowlspt/settings/index/full    -> the same list, each mod carrying its
+##                                           whole schema with current values
+##                                           (also `/index?full=1`)
+##   GET  /aowlspt/keybinds               -> every keybind of every loaded mod
+##   POST /aowlspt/settings/<guid>/set    -> {key,value}; answers with the value
+##                                           AS STORED, read back, not echoed
+##
+## READ THE LAZY-FETCH WARNING above `onIndexFull` before calling either of the
+## two big ones from inside the game process: fetching a schema before the
+## character/mode screen has been answered has taken the client down twice, and
+## the reason is the shared sync slot, not the payload.
+##
 ## It runs **server-side**, because the backend the overlay talks to
 ## (127.0.0.1:443) is where server-side routes register; a client-only mod's
 ## routes never reach it. The mod does nothing else — no runtime, no patches — so
@@ -40,6 +56,11 @@ const
   IndexRoute = "/aowlspt/settings/spt/index"
   PagePrefix = "/aowlspt/settings/spt/page/"
   ModsIndexRoute = "/aowlspt/settings/index"
+  ModsIndexFullRoute = "/aowlspt/settings/index/full"
+    ## Every mod AND every row, in one document. Exact, so it beats the
+    ## `ClientPagePrefix` fallback below (which would otherwise read `index` as
+    ## a guid).
+  KeybindsRoute = "/aowlspt/keybinds"
   ClientPublishPeriodMs = 5000
     ## How long a client-side page may legitimately be missing for. This
     ## MIRRORS `cSbPeriodMs` in the host bridge (host/Aowlspt.Host.Il2Cpp/
@@ -142,6 +163,8 @@ proc onAnnounce(payload: string): string =
 type
   ClientPage = object
     guid, name: string
+    version: string     ## as the game process reported it, or "" if it did not
+
     count, done: int
     rows: string        ## the schema array, verbatim as the mod emitted it
     stamp: int          ## sync number this page last arrived on
@@ -192,6 +215,7 @@ proc onClientSync(url, body, session: string): string =
   inc gClientSyncs
   var pg = ClientPage(guid: jr.asText(g, ""),
                       name: jr.asText(jr.field(body, "name"), ""),
+                      version: jr.asText(jr.field(body, "version"), ""),
                       count: jr.asInt(jr.field(body, "count"), 0),
                       done: jr.asInt(jr.field(body, "done"), 0),
                       rows: jr.raw(jr.field(body, "rows")),
@@ -205,7 +229,8 @@ proc onClientSync(url, body, session: string): string =
     # heartbeat -- must not, or the cache would rebuild every 5s for nothing.
     let prev = gClientPages[i]
     if prev.name != pg.name or prev.count != pg.count or
-       prev.done != pg.done or prev.rows != pg.rows:
+       prev.done != pg.done or prev.rows != pg.rows or
+       prev.version != pg.version:
       gIndexCacheValid = false
     pg.pushes = prev.pushes + 1
     gClientPages[i] = pg
@@ -220,6 +245,149 @@ proc onClientSync(url, body, session: string): string =
   gClientPending = @[]
   root.put("pending", pend)
   result = done(root).text
+
+# ---------------------------------------------------------------------------
+# THE WRITE, for any mod, over ONE route
+# ---------------------------------------------------------------------------
+#
+#   POST /aowlspt/settings/<guid>/set   {"key":"...","value":<json literal>}
+#
+#     -> {"ok":bool, "guid":str, "key":str,
+#         "value":<literal AS STORED>,      -- omitted when nothing could be read
+#         "stored":bool,                    -- the write reached config.json
+#         "pending":bool,                   -- queued for the game process
+#         "effect":"applied|restart|ignored|nohook|unreported",
+#         "err":str}                        -- only when something went wrong
+#
+# WHY A NEW ROUTE AND NOT THE EXISTING `POST /aowlspt/settings/<guid>`. That
+# one answers with the WHOLE schema array, and on failure with
+# `{"err":..,"rows":[..]}` -- two shapes, both large, neither of which names
+# the value that is now in force. A caller wanting "did my write take?" had to
+# re-fetch the page and diff it. `/set` answers that question directly, and the
+# `value` it answers with is READ BACK OUT OF THE STORE after the write (and
+# after the owning mod's apply hook has run), never echoed from the request:
+# fact #135 is a POST answered 200 with the value unchanged, and an echo cannot
+# tell those apart.
+#
+# It works for EVERY mod, including the ones that register their own settings
+# routes by hand and the client-side ones that have no HTTP surface at all,
+# because it does not call a route: it emits `SettingsApplyQuery` on the
+# in-process bus and reads the owning mod's `SettingsApplyAnnounce` reply. That
+# broadcast is synchronous (`deliverEvent` calls every subscriber before `emit`
+# returns), so the reply is in hand by the time this handler builds its answer.
+#
+# The `<guid>/reset` route each mod already registers is untouched.
+var gApplyAnnounced: seq[string] = @[]
+
+proc onApplyAnnounce(payload: string): string =
+  # Bounded. This collector is armed for the whole process lifetime but is only
+  # ever DRAINED by `settingsSet` immediately after its own broadcast; an
+  # announce raised by anything else would otherwise accumulate forever. 32 is
+  # far more than the one reply a single broadcast produces.
+  if gApplyAnnounced.len > 32:
+    gApplyAnnounced = @[]
+  gApplyAnnounced.add payload
+  result = ""
+
+proc setReplyErr(guid, key, msg: string): string =
+  var o = obj()
+  o.put("ok", false)
+  o.put("guid", guid)
+  o.put("key", key)
+  o.put("stored", false)
+  o.put("pending", false)
+  o.put("err", msg)
+  result = done(o).text
+
+proc settingsSet(guid, body: string): string =
+  ## The `<guid>/set` write. `guid` has already been split off the url.
+  let k = jr.field(body, "key")
+  let key = jr.asText(k, "")
+  if not k.exists or key.len == 0:
+    return setReplyErr(guid, "",
+      "a settings write must be {\"key\":\"<configKey>\",\"value\":<literal>}")
+  let v = jr.field(body, "value")
+  if not v.exists:
+    return setReplyErr(guid, key,
+      "the body carried no \"value\"; a write with no value is not a reset -- " &
+      "POST /aowlspt/settings/" & guid & "/reset for that")
+  let valueRaw = jr.raw(v)
+  # A CLIENT-SIDE mod is not in this process. The edit is queued for the game
+  # process exactly as `onClientPage` queues it, and the reply says `pending`
+  # with `stored:false` -- it has NOT been stored yet and saying otherwise is
+  # the half-working control this whole mechanism exists to prevent. Poll
+  # `/aowlspt/settings/client/status/<guid>?key=<key>` for where it is.
+  let ci = clientIndexOf(guid)
+  if ci >= 0:
+    var q = obj()
+    q.put("guid", guid)
+    q.put("key", key)
+    q.put("value", sv.raw(valueRaw))
+    if gClientPending.len >= 64:
+      return setReplyErr(guid, key,
+        "the client settings edit queue is full (64); this edit was DROPPED " &
+        "rather than growing the queue without bound")
+    gClientPending.add done(q).text
+    var o = obj()
+    o.put("ok", true)
+    o.put("guid", guid)
+    o.put("key", key)
+    o.put("stored", false)
+    o.put("pending", true)
+    o.put("client", true)
+    o.put("statusRoute", "/aowlspt/settings/client/status/" & guid & "?key=" & key)
+    o.put("waitMs", ClientPublishPeriodMs)
+    # The value AS IT STANDS NOW, out of the rows the game process last pushed
+    # -- which is necessarily the OLD one, because the write has not left this
+    # process yet. Carried so the panel has something true to draw;
+    # `pending:true` and `stored:false` are what say it is not the value that
+    # was just asked for.
+    for row in jr.each(jr.whole(gClientPages[ci].rows)):
+      if jr.asText(jr.child(row, "key"), "") == key:
+        let cv = jr.child(row, "value")
+        if cv.exists:
+          o.put("value", sv.raw(jr.raw(cv)))
+    o.put("note", "queued for the game process, which owns this mod; `value` " &
+                  "is the one still in force, not the one just written")
+    return done(o).text
+  gApplyAnnounced = @[]
+  var q = obj()
+  q.put("guid", guid)
+  q.put("key", key)
+  q.put("value", sv.raw(valueRaw))
+  discard emit(settings.SettingsApplyQuery, done(q).text)
+  for a in gApplyAnnounced:
+    if jr.asText(jr.field(a, "guid"), "") != guid:
+      continue
+    let okStored = jr.asBool(jr.field(a, "ok"), false)
+    var o = obj()
+    o.put("ok", okStored)
+    o.put("guid", guid)
+    o.put("key", key)
+    o.put("stored", okStored)
+    o.put("pending", false)
+    let rv = jr.field(a, "value")
+    if rv.exists:
+      o.put("value", sv.raw(jr.raw(rv)))
+    let ef = jr.field(a, "effect")
+    if ef.exists:
+      o.put("effect", jr.asText(ef, ""))
+    let ed = jr.field(a, "effectDetail")
+    if ed.exists:
+      o.put("effectDetail", jr.asText(ed, ""))
+    let er = jr.field(a, "err")
+    if er.exists:
+      o.put("err", jr.asText(er, ""))
+    return done(o).text
+  # NOBODY ANSWERED. Not "the write failed": no mod with this guid is loaded in
+  # this process and none has ever pushed a client page either, so the write
+  # was never attempted. Said plainly, because "ok:false" alone would send a
+  # reader hunting for a store fault that did not happen.
+  result = setReplyErr(guid, key,
+    "no mod with guid '" & guid & "' answered the settings apply broadcast " &
+    "and no client-side page has ever been pushed for it, so NOTHING WAS " &
+    "WRITTEN. Either the guid is wrong or that mod is not loaded (check " &
+    "/aowlspt/mods/list and mods\\aowlspt-selection.json)")
 
 proc onClientPage(url, body, session: string): string =
   ## `GET /aowlspt/settings/client/page/<guid>` -- the rows the host last
@@ -238,6 +406,12 @@ proc onClientPage(url, body, session: string): string =
       cut = ci
       break
   if cut >= 0: want = want.substr(0, cut - 1)
+  # `<guid>/set` is handled for EVERY mod, client-side or not, and so is caught
+  # before the client-page lookup below: a server-side mod registers its own
+  # exact `/aowlspt/settings/<guid>` route, but nobody registers `<guid>/set`,
+  # so this fallback prefix is the only thing that sees it.
+  if want.len > 4 and want.substr(want.len - 4, want.len - 1) == "/set":
+    return settingsSet(want.substr(0, want.len - 5), body)
   var isReset = false
   if want.len > 6 and want.substr(want.len - 6, want.len - 1) == "/reset":
     isReset = true
@@ -416,6 +590,7 @@ proc onModsIndex(url, body, session: string): string =
     var o = obj()
     o.put("guid", p.guid)
     o.put("name", p.name)
+    o.put("version", p.version)
     o.put("count", p.count)
     o.put("done", p.done)
     o.put("client", true)
@@ -448,6 +623,290 @@ proc onModsIndex(url, body, session: string): string =
     gIndexCache = result
     gIndexCacheValid = true
 
+# ---------------------------------------------------------------------------
+# THE WHOLE SURFACE IN ONE DOCUMENT -- and the keybinds cut of it
+# ---------------------------------------------------------------------------
+#
+#   GET /aowlspt/settings/index/full     (also: /aowlspt/settings/index?full=1)
+#   GET /aowlspt/keybinds
+#
+# WHY. `/aowlspt/settings/index` answers with a LIST OF MODS and nothing else,
+# so a consumer that wants to draw the rows must then fetch
+# `/aowlspt/settings/<guid>` once per mod. The F12 overlay does exactly that --
+# `modsettingsrender.nim` walks `gModSetMods` fetching one page per tick -- and
+# a native MODS tab would have had to reimplement the same N+1 walk. One
+# document, one fetch, one parse.
+#
+# ============================ READ THIS BEFORE FETCHING =====================
+# WHEN a consumer fetches this MATTERS, and getting it wrong has taken the
+# client down. This is not about the payload size.
+#
+# The overlay's HTTP worker has ONE sync slot, shared. `mods/manager`'s live
+# mod control (load/unload/toggle) borrows it, and so does any settings fetch.
+# MEASURED, in the host's own log (`modsettingsrender.nim`, the msIdle branch):
+# fetching the mod schema BEFORE the character/mode screen has been answered
+# "starves live mod control and pushes its mod load/unload work into the menu
+# transition, which took the client down twice". The host now DEFERS its index
+# arm until the first tick after Submit, and says so in the log rather than
+# declining silently.
+#
+# So: fetch this LAZILY -- on the tab actually being opened, after the profile
+# screen has been answered -- and never on a poll. Nothing on this side can
+# enforce that; the route has no way to know what screen the client is on. It
+# is stated here because the constraint lives in the CALLER and the reason for
+# it lives in a different repo directory.
+# ============================================================================
+#
+# NOT CACHED, deliberately, unlike the compact index above. Every `value` in
+# here is read out of the owning mod's `config.json` at request time, so a
+# cache would serve a value that a write through `/set` (or through any of the
+# mod's own routes, or by the mod itself) has already replaced -- a settings
+# page showing a stale value is indistinguishable, to a player, from a write
+# that did not persist. The compact index can be cached because it carries no
+# values at all, only counts.
+var gPageAnnounced: seq[string] = @[]
+
+proc onPageAnnounce(payload: string): string =
+  if gPageAnnounced.len > 32:   # bounded, for the same reason as gApplyAnnounced
+    gPageAnnounced = @[]
+  gPageAnnounced.add payload
+  result = ""
+
+proc rowsForGuid(guid: string): string =
+  ## The full schema array of ONE server-side mod, as JSON text, over the same
+  ## in-process broadcast the index uses (`SettingsPageQuery` ->
+  ## `SettingsPageAnnounce`). Empty string when nobody answered -- which is a
+  ## distinct outcome from `"[]"` ("answered, and declares nothing"), and the
+  ## caller keeps them apart.
+  gPageAnnounced = @[]
+  discard emit(settings.SettingsPageQuery, guid)
+  for a in gPageAnnounced:
+    if jr.asText(jr.field(a, "guid"), "") == guid:
+      let r = jr.field(a, "rows")
+      if r.exists:
+        return jr.raw(r)
+  result = ""
+
+proc fullModsArray(): JsonArray =
+  ## One entry per DISTINCT guid, each carrying its full schema. Same identity
+  ## rule as `onModsIndex` -- guid, not name, and the server transport wins a
+  ## mod that is loaded on both sides -- so the two routes can never disagree
+  ## about how many mods there are.
+  ##
+  ## `gAnnounced` is shared with `onModsIndex`; both reset it immediately
+  ## before their own broadcast and read it immediately after, which is the
+  ## same single-request-at-a-time assumption the index has always made.
+  gAnnounced = @[]
+  discard emit(settings.SettingsIndexQuery, "")
+  var guids: seq[string] = @[]
+  var a = arr()
+  # By index, not by iterator: `rowsForGuid` below emits a second broadcast
+  # from inside this loop, and while nothing subscribed to it appends to
+  # `gAnnounced`, iterating a seq that a callback could touch is a hazard not
+  # worth taking for the sake of one line.
+  for mi in 0 ..< gAnnounced.len:
+    let m = gAnnounced[mi]
+    let g = jr.asText(jr.field(m, "guid"), "")
+    if g.len == 0 or guids.contains(g):
+      continue
+    guids.add g
+    var o = obj()
+    o.put("guid", g)
+    o.put("name", jr.asText(jr.field(m, "name"), g))
+    o.put("version", jr.asText(jr.field(m, "version"), ""))
+    o.put("enabled", true)
+    o.put("client", false)
+    o.put("count", jr.asInt(jr.field(m, "count"), 0))
+    o.put("done", jr.asInt(jr.field(m, "done"), 0))
+    o.put("pageRoute", "/aowlspt/settings/" & g)
+    o.put("applyRoute", "/aowlspt/settings/" & g & "/set")
+    o.put("resetRoute", "/aowlspt/settings/" & g & "/reset")
+    let rows = rowsForGuid(g)
+    if rows.len > 0:
+      o.put("settings", sv.raw(rows))
+    else:
+      # It announced a count but did not answer the page query. An EMPTY
+      # ARRAY, never a null and never an absent field: a consumer iterating
+      # `settings` must not have to null-check, and `rowsMissing` says that
+      # this emptiness is a failure to look rather than a mod with nothing to
+      # declare -- three outcomes, not two.
+      o.put("settings", sv.raw("[]"))
+      o.put("rowsMissing", true)
+    a.add o
+  for p in gClientPages:
+    if guids.contains(p.guid):
+      continue
+    guids.add p.guid
+    var o = obj()
+    o.put("guid", p.guid)
+    o.put("name", p.name)
+    # Whatever the game process sent, which today is nothing --
+    # `host/settingsbridge.nim` does not yet forward a version. Empty means
+    # "the push did not say", never a number borrowed from somewhere else.
+    o.put("version", p.version)
+    o.put("enabled", true)
+    o.put("client", true)
+    o.put("count", p.count)
+    o.put("done", p.done)
+    o.put("pageRoute", "/aowlspt/settings/" & p.guid)
+    o.put("applyRoute", "/aowlspt/settings/" & p.guid & "/set")
+    o.put("resetRoute", "/aowlspt/settings/" & p.guid & "/reset")
+    o.put("settings", sv.raw(p.rows))
+    a.add o
+  result = a
+
+proc onIndexFull(url, body, session: string): string =
+  ## `{"mods":[{guid,name,version,enabled,client,count,done,
+  ##            pageRoute,applyRoute,resetRoute,settings:[row...]}...],
+  ##   "enabledMeaning":"loaded"}`
+  ##
+  ## A row is exactly what `aowl/src/aowlspt/settings.nim`'s `toJson` emits:
+  ##   key, label, type, default, value            -- always
+  ##   min, max, step                              -- numeric rows with a range
+  ##   options, optionLabels, optionsUrl           -- enum/select rows
+  ##   colorFormat                                 -- colour rows, always
+  ##   category, subcategory, path                 -- the GROUP, when grouped;
+  ##                                                  `path` is the ordered
+  ##                                                  segments to any depth
+  ##   description                                 -- the help text, when given
+  ##   implemented, appliesOn, keybind             -- always
+  ## `type` is one of exactly: bool int float enum string keybind select color.
+  ##
+  ## `enabled` is `true` for every mod listed, and `enabledMeaning:"loaded"`
+  ## says why that is not a tautology dressed as information: a mod that is
+  ## installed and NOT selected is not loaded, so it never hears the broadcast
+  ## and cannot appear here at all. This route can therefore only ever describe
+  ## running mods. `/aowlspt/mods/list` (mods/manager) is the route that knows
+  ## about the disabled ones.
+  var root = obj()
+  root.put("mods", fullModsArray())
+  root.put("enabledMeaning", "loaded")
+  result = done(root).text
+
+proc textOf(j: JsonRef): string =
+  ## A row value as DISPLAY TEXT, whatever JSON shape it has: a quoted string
+  ## comes back unquoted, a number or a bool comes back as its literal. A
+  ## keybind surface has to show one line of text per binding and the three
+  ## shapes below all really occur (`"M"`, `114`, `true`).
+  if not j.exists: return ""
+  if jr.isText(j): return jr.asText(j, "")
+  result = jr.raw(j)
+
+proc keybindsOf(guid, rowsText: string): JsonArray =
+  ## The keybind rows of one mod. THE PREDICATE IS THE DECLARED `keybind`
+  ## FIELD and nothing else -- never a name match on "key", which gets this
+  ## repo's real data wrong in both directions (it would miss `hotkeys` and
+  ## `overlayToggleKey`, and it would wrongly include `mods/ammoloading`'s
+  ## `hijackKey`, which is a BUNDLE NAME). See `Setting.keybind` and
+  ## `isKeybind` in aowl/src/aowlspt/settings.nim.
+  var a = arr()
+  for row in jr.each(jr.whole(rowsText)):
+    if not jr.asBool(jr.child(row, "keybind"), false):
+      continue
+    let key = jr.asText(jr.child(row, "key"), "")
+    if key.len == 0:
+      continue
+    let ty = jr.asText(jr.child(row, "type"), "")
+    let label = jr.asText(jr.child(row, "label"), "")
+    let implemented = jr.asBool(jr.child(row, "implemented"), true)
+    # THE THREE ROLES a keybind row really has. `stKeybind` is the only one
+    # whose value IS a key name; the other two are a key that is stored as a
+    # virtual-key CODE (`mods/debug`'s `overlayToggleKey` = 114) and the BOOL
+    # GATE that has to be on before a key is polled at all (`hotkeys`). All
+    # three belong on a keybinds page -- hiding the gate would show a key that
+    # provably does nothing and no way to find out why -- but they are not
+    # interchangeable, so the role is named rather than left to be guessed
+    # from `type`.
+    var role = "other"
+    if ty == "keybind": role = "bind"
+    elif ty == "int":   role = "vkcode"
+    elif ty == "bool":  role = "gate"
+    var o = obj()
+    o.put("key", key)
+    o.put("settingKey", key)
+    # NEVER EMPTY: a row with no label falls back to its config key, because a
+    # keybind list drawn with a blank action column is unusable and the key is
+    # at least something the player can look up.
+    o.put("action", (if label.len > 0: label else: key))
+    o.put("description", jr.asText(jr.child(row, "description"), ""))
+    o.put("currentBinding", textOf(jr.child(row, "value")))
+    o.put("defaultBinding", textOf(jr.child(row, "default")))
+    o.put("valueType", ty)
+    o.put("role", role)
+    # A gate is not rebindable (it is a switch, not a key), and neither is a
+    # row the owning mod declared unimplemented -- rebinding a key that is not
+    # wired to anything is the control-that-changes-nothing failure.
+    o.put("rebindable", implemented and (role == "bind" or role == "vkcode"))
+    o.put("implemented", implemented)
+    o.put("category", jr.asText(jr.child(row, "category"), ""))
+    o.put("applyRoute", "/aowlspt/settings/" & guid & "/set")
+    a.add o
+  result = a
+
+proc onKeybinds(url, body, session: string): string =
+  ## `GET /aowlspt/keybinds` -> every keybind of every loaded mod.
+  ##
+  ##   {"mods":[{"guid","name","version","client",
+  ##             "keybinds":[{"key","settingKey","action","description",
+  ##                          "currentBinding","defaultBinding","valueType",
+  ##                          "role","rebindable","implemented","category",
+  ##                          "applyRoute"}...]}...]}
+  ##
+  ## EVERY loaded mod appears, including one with no keys at all: its
+  ## `keybinds` is `[]`. An absent entry would be indistinguishable from a mod
+  ## that failed to answer, and this route is meant to be the answer to "what
+  ## can I bind", which includes "this mod, nothing".
+  ##
+  ## Writing a binding is `POST <applyRoute> {"key":<settingKey>,"value":...}`,
+  ## where the value literal must match `valueType`: a JSON STRING for `bind`
+  ## (`"M"`), a JSON NUMBER for `vkcode` (`114`), a bool for `gate`. That is
+  ## why `valueType` is carried per row -- writing the wrong shape persists it
+  ## verbatim into the mod's config.json, where the mod's own parser will read
+  ## its default instead and the key will silently do nothing.
+  ##
+  ## Same lazy-fetch rule as `/aowlspt/settings/index/full`; see the warning
+  ## above it.
+  ## Built from the SAME `fullModsArray()` the full index serves, and filtered
+  ## afterwards, so the two routes cannot drift into disagreeing about which
+  ## mods exist or what a row's current value is.
+  let full = sv.text(done(fullModsArray()))
+  var a = arr()
+  for m in jr.each(jr.whole(full)):
+    let g = jr.asText(jr.child(m, "guid"), "")
+    var o = obj()
+    o.put("guid", g)
+    o.put("name", jr.asText(jr.child(m, "name"), g))
+    o.put("version", jr.asText(jr.child(m, "version"), ""))
+    o.put("client", jr.asBool(jr.child(m, "client"), false))
+    o.put("keybinds", keybindsOf(g, jr.raw(jr.child(m, "settings"))))
+    a.add o
+  var root = obj()
+  root.put("mods", a)
+  result = done(root).text
+
+proc urlHasFull(url: string): bool =
+  ## Is `full=1` anywhere in this url's query string? Hand-rolled rather than
+  ## parsed: the only parameter this route has ever taken is this one, and a
+  ## half-written query parser is a thing to maintain for no gain.
+  result = false
+  if url.len < 6:
+    return
+  for i in 0 .. url.len - 6:
+    if url.substr(i, i + 5) == "full=1":
+      return true
+
+proc onIndexRoute(url, body, session: string): string =
+  ## `/aowlspt/settings/index`. COMPACT by default -- byte-for-byte the reply
+  ## it has always given, because the F12 overlay POLLS this route at an idle
+  ## main menu and fattening it with every row of every mod would put the whole
+  ## schema on the wire several times a second for nothing. `?full=1` is the
+  ## same document `/aowlspt/settings/index/full` serves, for a caller that
+  ## wants one fetch instead of N+1 -- and that caller must read the lazy-fetch
+  ## warning above `onIndexFull` first.
+  if urlHasFull(url):
+    return onIndexFull(url, body, session)
+  result = onModsIndex(url, body, session)
+
 proc onLoad(): Status =
   if side() != sideServer:
     info "the SPT settings surface is a server mod; nothing to do on this side"
@@ -457,8 +916,15 @@ proc onLoad(): Status =
     warn "could not register the SPT settings index route"
   if servePrefix(PagePrefix, onPage) != Ok:
     warn "could not register the SPT settings page route"
-  if serve(ModsIndexRoute, onModsIndex) != Ok:
+  if serve(ModsIndexRoute, onIndexRoute) != Ok:
     warn "could not register " & ModsIndexRoute
+  if serve(ModsIndexFullRoute, onIndexFull) != Ok:
+    warn "could not register " & ModsIndexFullRoute &
+         " -- a native settings tab will have to fall back to N+1 per-mod " &
+         "fetches"
+  if serve(KeybindsRoute, onKeybinds) != Ok:
+    warn "could not register " & KeybindsRoute &
+         " -- a keybinds page will have nothing to list"
   if serve(ClientSyncRoute, onClientSync) != Ok:
     warn "could not register " & ClientSyncRoute &
          " -- client-side mods will stay invisible in the F12 settings nav"
@@ -471,6 +937,14 @@ proc onLoad(): Status =
   if on(settings.SettingsIndexAnnounce, onAnnounce) != Ok:
     warn "could not subscribe to " & settings.SettingsIndexAnnounce &
          " -- " & ModsIndexRoute & " will always report an empty mod list"
+  if on(settings.SettingsPageAnnounce, onPageAnnounce) != Ok:
+    warn "could not subscribe to " & settings.SettingsPageAnnounce &
+         " -- " & ModsIndexFullRoute & " will list every mod with an EMPTY " &
+         "settings array and rowsMissing:true"
+  if on(settings.SettingsApplyAnnounce, onApplyAnnounce) != Ok:
+    warn "could not subscribe to " & settings.SettingsApplyAnnounce &
+         " -- every POST to /aowlspt/settings/<guid>/set will report that " &
+         "nobody answered, even when the write went through"
   let pages = jr.field(sptSurface, "pages")
   success ModName & " " & ModVersion & " serving " & $jr.count(pages) &
           " SPT config pages (all not implemented yet)"

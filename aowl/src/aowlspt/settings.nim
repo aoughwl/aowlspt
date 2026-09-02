@@ -362,6 +362,32 @@ proc settingPath*(s: Setting): seq[string] =
         cur.add ch
     if cur.len > 0: result.add cur
 
+proc currentValueJson*(s: Setting): Json =
+  ## The CURRENT value of one declared row, as the JSON literal the wire
+  ## carries, read back out of `config.json` -- or the declared default when
+  ## the file has no such key.
+  ##
+  ## Split out of `toJson` (which is all it used to be) so that a WRITE can
+  ## answer with a READBACK rather than an echo. `POST .../set` returns what
+  ## this proc reads AFTER the write, so a caller that compares it against what
+  ## it sent is comparing against the store, not against its own request --
+  ## fact #135 is exactly the case where those two differ and the echo lies.
+  var cur = setting(s.key)
+  # `cur.raw` is the on-disk text for the key, but hosts disagree on whether a
+  # string-shaped value comes back with its JSON quotes still on (see
+  # `asText`'s docstring) -- so for the text-shaped kinds the only safe thing
+  # is to strip via `asText` and re-quote/escape through `jstr`, the same
+  # helper the `key`/`label` string fields go through. For the numeric/bool
+  # kinds the on-disk text is already a bare JSON literal either way, so it is
+  # used verbatim.
+  if not cur.ok:
+    return Json(text: s.defaultJson)
+  case s.kind
+  of stEnum, stString, stKeybind, stSelect, stColor:
+    result = jstr(asText(cur, ""))
+  of stBool, stInt, stFloat:
+    result = Json(text: cur.raw)
+
 proc toJson*(s: Setting): JsonObject =
   ## One row, as the UI receives it. `value` is the *current* value read out of
   ## `config.json` (falling back to `defaultJson` when the file has no such
@@ -371,22 +397,7 @@ proc toJson*(s: Setting): JsonObject =
   o.put("label", s.label)
   o.put("type", kindName(s.kind))
   o.put("default", Json(text: s.defaultJson))
-  var cur = setting(s.key)
-  # `cur.raw` is the on-disk text for the key, but hosts disagree on whether a
-  # string-shaped value comes back with its JSON quotes still on (see
-  # `asText`'s docstring) -- so for the three text-shaped kinds the only safe
-  # thing is to strip via `asText` and re-quote/escape through `jstr`, the same
-  # helper the `key`/`label` string fields above already go through. For the
-  # numeric/bool kinds the on-disk text is already a bare JSON literal either
-  # way, so it is used verbatim.
-  if cur.ok:
-    case s.kind
-    of stEnum, stString, stKeybind, stSelect, stColor:
-      o.put("value", jstr(asText(cur, "")))
-    of stBool, stInt, stFloat:
-      o.put("value", Json(text: cur.raw))
-  else:
-    o.put("value", Json(text: s.defaultJson))
+  o.put("value", currentValueJson(s))
   if s.hasRange:
     o.put("min", s.lo)
     o.put("max", s.hi)
@@ -518,6 +529,12 @@ proc onIndexQuery(payload: string): string =
     var o = obj()
     o.put("guid", modGuid())
     o.put("name", modName())
+    # The version this page belongs to. Always emitted (empty string when a mod
+    # declared none), because an ABSENT field would mean "this backend is too
+    # old to say" and an empty one means "this mod named no version" -- a
+    # consumer that cannot tell those apart will print a stale number from
+    # somewhere else rather than admit it does not know.
+    o.put("version", modVersion())
     o.put("count", gDeclared.len)
     # How many of them are actually BACKED. The index has always carried
     # `count`; without a companion `done` a consumer cannot tell a mod with six
@@ -840,6 +857,21 @@ proc onApplyQuery(payload: string): string =
   o.put("guid", modGuid())
   o.put("ok", st == Ok)
   o.put("key", key)
+  # THE READBACK. Not an echo of what the request carried: this is
+  # `config.json` re-read through `currentValueJson` after the write and after
+  # the apply hook ran, so a caller that compares it with what it sent learns
+  # whether the store took the value -- which is the one thing a 200 cannot
+  # tell it (fact #135: a POST answered 200 with the schema unchanged).
+  #
+  # Emitted on FAILURE too, and that is the useful case: it is then the value
+  # that is still in force, which is what the panel must go on drawing. A
+  # `reset` (no `key` in the payload) resets everything and names no single
+  # row, so there is nothing to read back and the field is omitted rather than
+  # filled with a guess.
+  block:
+    let vi = findDeclared(key)
+    if vi >= 0:
+      o.put("value", currentValueJson(gDeclared[vi]))
   if st == Ok:
     o.put("effect", gApplyEffect)
     if gApplyDetail.len > 0:

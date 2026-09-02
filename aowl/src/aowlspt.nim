@@ -1459,6 +1459,17 @@ proc modName*(): string =
   ## This mod's own display name, as passed to `exportMod`.
   gName
 
+proc modVersion*(): string =
+  ## This mod's own version string, as passed to `exportMod`. Same lifetime
+  ## rule as `modGuid`/`modName`: filled in by `registerMod` before `onLoad`,
+  ## empty before that.
+  ##
+  ## Added for the settings index (`aowlspt/settings`'s `SettingsIndexAnnounce`
+  ## carries it), which had no way to say WHICH version of a mod a page belongs
+  ## to -- `mods/manager` knows, but a settings consumer would have had to
+  ## correlate two unrelated routes by guid to find out.
+  gVersion
+
 var gLoadHooks: seq[proc()] = @[]
 
 proc addLoadHook*(h: proc()) =

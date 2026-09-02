@@ -33,6 +33,7 @@ Usage
     python tools/settingsdump.py --page aowl.graphics
     python tools/settingsdump.py --set aowl.graphics sharpness 0.5
     python tools/settingsdump.py --json           # machine-readable
+    python tools/settingsdump.py --full           # audit the AGGREGATED routes
 """
 
 import argparse
@@ -179,6 +180,157 @@ def load_page(port, guid):
     return rows_of(doc), bad, None
 
 
+SETTING_TYPES = {"bool", "int", "float", "enum", "string",
+                 "keybind", "select", "color"}
+
+
+def audit_full(port):
+    """`--full`: does the AGGREGATED surface agree with the N+1 walk it replaces?
+
+    `GET /aowlspt/settings/index/full` and `GET /aowlspt/keybinds` (both from
+    mods/settingshub) exist so a native settings tab can fetch one document
+    instead of the index plus one page per mod. The thing that can go wrong is
+    DRIFT: the aggregate saying something the per-mod pages do not. So this
+    checks the aggregate against the routes it is derived from, key by key,
+    and every assertion below is falsifiable by a real defect:
+
+      * a mod in the compact index and missing from the full one (or twice in
+        it) -- the shape that put two "Bot AI" rows in the F12 nav;
+      * a row whose `value` in the full document differs from the same row on
+        `/aowlspt/settings/<guid>` -- an aggregate serving a stale value, which
+        to a player is indistinguishable from a write that did not persist;
+      * a `type` outside the closed set of eight;
+      * `settings`/`keybinds` that are null rather than [];
+      * a keybind listed that no row declares `keybind:true`, or a declared
+        keybind row missing from /aowlspt/keybinds -- the filter inventing or
+        dropping bindings.
+
+    PASS / FAIL / INCONCLUSIVE, exit 0 / 1 / 2.
+    """
+    status, text, err = fetch(port, "/aowlspt/settings/index/full")
+    if text is None:
+        print("INCONCLUSIVE: GET /aowlspt/settings/index/full failed: %s"
+              % (err or status))
+        return 2
+    try:
+        full = json.loads(text)
+    except Exception as exc:                          # noqa: BLE001
+        print("FAIL: /aowlspt/settings/index/full is not strict JSON: %s" % exc)
+        return 1
+    if isinstance(full, dict) and full.get("err") == "no route":
+        print("INCONCLUSIVE: this backend has no /aowlspt/settings/index/full "
+              "route, so mods/settingshub is not loaded (or predates it).")
+        return 2
+    fmods = full.get("mods") if isinstance(full, dict) else None
+    if not isinstance(fmods, list):
+        print("FAIL: index/full did not answer with {\"mods\":[...]}")
+        return 1
+
+    problems = []
+    guids = []
+    rows_checked = 0
+    kb_expected = {}
+    for m in fmods:
+        guid = m.get("guid", "")
+        if not guid:
+            problems.append("a mod entry carries no guid")
+            continue
+        if guid in guids:
+            problems.append("%s appears more than once" % guid)
+        guids.append(guid)
+        rows = m.get("settings")
+        if not isinstance(rows, list):
+            problems.append("%s: `settings` is %r, not an array (a mod with "
+                            "none must carry [])" % (guid, rows))
+            continue
+        for r in rows:
+            if r.get("type") not in SETTING_TYPES:
+                problems.append("%s.%s: type %r is not one of %s"
+                                % (guid, r.get("key"), r.get("type"),
+                                   sorted(SETTING_TYPES)))
+        kb_expected[guid] = sorted(r.get("key") for r in rows if r.get("keybind"))
+        # ...and against the per-mod page it is meant to replace.
+        page, _bad, why = load_page(port, guid)
+        if page is None:
+            problems.append("%s: its own page could not be read (%s), so the "
+                            "aggregate could not be cross-checked" % (guid, why))
+            continue
+        pv = {r.get("key"): r.get("value") for r in page if isinstance(r, dict)}
+        for r in rows:
+            k = r.get("key")
+            rows_checked += 1
+            if k in pv and pv[k] != r.get("value"):
+                problems.append("%s.%s: index/full says %r, the mod's own page "
+                                "says %r" % (guid, k, r.get("value"), pv[k]))
+
+    cmods, _bad = load_index(port)
+    if cmods is None:
+        problems.append("the compact index could not be read, so the "
+                        "exactly-once check did not run")
+    else:
+        for m in cmods:
+            g = m.get("guid", "")
+            if g and g not in guids:
+                problems.append("%s is in /aowlspt/settings/index and MISSING "
+                                "from index/full" % g)
+
+    status, text, err = fetch(port, "/aowlspt/keybinds")
+    if text is None:
+        problems.append("GET /aowlspt/keybinds failed: %s" % (err or status))
+        kmods = []
+    else:
+        try:
+            kdoc = json.loads(text)
+        except Exception as exc:                      # noqa: BLE001
+            problems.append("/aowlspt/keybinds is not strict JSON: %s" % exc)
+            kdoc = {}
+        kmods = kdoc.get("mods") if isinstance(kdoc, dict) else []
+        if not isinstance(kmods, list):
+            problems.append("/aowlspt/keybinds did not answer {\"mods\":[...]}")
+            kmods = []
+    binds = 0
+    empties = 0
+    for m in kmods:
+        guid = m.get("guid", "")
+        ks = m.get("keybinds")
+        if not isinstance(ks, list):
+            problems.append("%s: `keybinds` is %r, not an array" % (guid, ks))
+            continue
+        if not ks:
+            empties += 1
+        binds += len(ks)
+        for b in ks:
+            if not b.get("action"):
+                problems.append("%s.%s: empty action" % (guid, b.get("settingKey")))
+        got = sorted(b.get("settingKey") for b in ks)
+        want = kb_expected.get(guid)
+        if want is None:
+            problems.append("%s is in /aowlspt/keybinds and not in index/full" % guid)
+        elif got != want:
+            problems.append("%s: /aowlspt/keybinds lists %s but the schema "
+                            "declares keybind:true on %s" % (guid, got, want))
+    for guid in kb_expected:
+        if not any(m.get("guid") == guid for m in kmods):
+            problems.append("%s is in index/full and MISSING from "
+                            "/aowlspt/keybinds (a mod with no keys must still "
+                            "appear, with [])" % guid)
+
+    print("index/full: %d mod(s), %d row(s) cross-checked against their own "
+          "pages" % (len(guids), rows_checked))
+    print("keybinds:   %d mod(s), %d binding(s), %d mod(s) with an empty list"
+          % (len(kmods), binds, empties))
+    if problems:
+        for p in problems:
+            print("  FAIL: %s" % p)
+        return 1
+    if not guids:
+        print("INCONCLUSIVE: the document is well formed and lists zero mods, "
+              "so nothing was actually examined.")
+        return 2
+    print("PASS")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -194,6 +346,10 @@ def main():
                     help="refuse the fact-#122 repair; report invalid pages as "
                          "unreadable, which is what a strict consumer sees")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
+    ap.add_argument("--full", action="store_true",
+                    help="audit the AGGREGATED routes (/aowlspt/settings/"
+                         "index/full and /aowlspt/keybinds) against the per-mod "
+                         "pages they are derived from; PASS/FAIL/INCONCLUSIVE")
     args = ap.parse_args()
 
     port = backend_port(args.port)
@@ -210,6 +366,9 @@ def main():
 
     if args.set:
         return do_set(port, args.set[0], args.set[1], args.set[2], args.wait)
+
+    if args.full:
+        return audit_full(port)
 
     mods, index_bad = load_index(port)
     if mods is None:

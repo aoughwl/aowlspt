@@ -652,7 +652,16 @@ proc deflateBody(text {.byref.}: string; into: var seq[byte];
 
 const
   ZCacheMinBody = 8192   ## below this, the compare costs more than the deflate
-  ZCacheMax = 12         ## entries; the emulator has seven bodies this large
+  ZCacheMax = 32
+    ## entries.
+    ##
+    ## It was 12, on the note that "the emulator has seven bodies this large".
+    ## MEASURED with `tools/loadpathbench.py` over the real load path, that is
+    ## no longer true, and the shortfall was visible: 15 distinct bodies over
+    ## 8 KB go out before the client's SECOND `/client/items`, so the items
+    ## entry -- the 15 MB one, the most expensive deflate in the process -- had
+    ## already been evicted when that duplicate arrived. It cost 246 ms against
+    ## the 75 ms a hit costs.
 
 type
   ZEntry = object
@@ -749,6 +758,8 @@ type
     ## rather than a compressed one. Sending `Accept-Encoding: identity` opts
     ## out. The game never sends that header, so its path is byte-identical.
     identity: bool
+    ## `If-None-Match`, verbatim. See `gEtagOn`.
+    ifNoneMatch: string
 
 proc jsonQuoted(s: string): string =
   ## `s` as a JSON string literal, escapes and all.
@@ -873,6 +884,8 @@ proc parseHead(head: string; r: var Request; contentLength: var int): bool =
       let want = toLowerAscii(value)
       if find(want, "identity") >= 0 and find(want, "deflate") < 0:
         r.identity = true
+    elif name == "if-none-match":
+      r.ifNoneMatch = value
     elif name == "cookie":
       # PHPSESSID is what the client carries its session in.
       let at = find(value, "PHPSESSID=")
@@ -950,6 +963,43 @@ proc sendResponse(sock: uint64; status: string; body {.byref.}: string;
       else:
         discard cNetSend(sock, cast[HostPtr](readRawData(body)),
                          int32(payloadLen))
+  perfAdd(PhaseSend, tSend)
+
+proc sendNotModified(sock: uint64; etag: string; keepAlive: bool) =
+  ## `304 Not Modified`, no body. See `gEtagOn`.
+  var head = "HTTP/1.1 304 Not Modified\r\n"
+  head.add "ETag: " & etag & "\r\n"
+  head.add(if keepAlive: "Connection: keep-alive\r\n"
+           else: "Connection: close\r\n")
+  head.add "\r\n"
+  discard cNetSend(sock, cast[HostPtr](toCString(head)), int32(head.len))
+
+proc sendPacked(sock: uint64; packed {.byref.}: seq[byte]; packedLen: int;
+                keepAlive: bool; etag = "") =
+  ## A response whose deflated bytes already exist -- the warm cache below.
+  ##
+  ## Split out of `sendResponse` rather than threaded through it as another
+  ## flag, because the whole point of the warm path is that the uncompressed
+  ## body is never materialised: a `sendResponse` overload taking the text
+  ## would put the 15 MB string back on the request path that this exists to
+  ## take it off.
+  var head = "HTTP/1.1 200 OK\r\n"
+  head.add "Content-Type: application/json\r\n"
+  head.add "Content-Length: " & $packedLen & "\r\n"
+  if etag.len > 0:
+    head.add "ETag: " & etag & "\r\n"
+  head.add(if keepAlive: "Connection: keep-alive\r\n"
+           else: "Connection: close\r\n")
+  head.add "\r\n"
+  let tSend = perfNow()
+  if packedLen > 0 and packedLen <= 65536:
+    var whole = head
+    whole.add fromBytes(packed, packedLen)
+    discard cNetSend(sock, cast[HostPtr](toCString(whole)), int32(whole.len))
+  else:
+    discard cNetSend(sock, cast[HostPtr](toCString(head)), int32(head.len))
+    if packedLen > 0:
+      discard cNetSend(sock, cast[HostPtr](addr packed[0]), int32(packedLen))
   perfAdd(PhaseSend, tSend)
 
 # --------------------------------------------------------------- routing
@@ -1030,6 +1080,296 @@ proc runRoute(route: Route; r: Request; into: var string): bool =
   if outPtr != nil:
     cFreeBuf(outPtr)
   result = st == StatusOk
+
+# ------------------------------------------------------------ the warm cache
+#
+# The compressed-body cache above removes the *second* deflate of a table. It
+# cannot remove the first, and the first is what the player waits for: MEASURED
+# with `tools/loadpathbench.py` against the real emulator and the real 41 MB
+# database, `/client/items` costs 1295 ms on its first request and 75 ms on its
+# second, `/client/locations` 1323 ms then 5 ms. Every one of those first-hit
+# milliseconds is on the client's login path, once, and the client is doing
+# nothing else while it waits.
+#
+# So the static tables are built and deflated BEFORE the client asks, on the
+# serve loop's tick thread -- one route per 50 ms tick, never on an accept
+# worker -- and the request that eventually arrives is a `send` of bytes that
+# already exist.
+#
+# **What makes this safe is not the URL list; it is the self-check.** A
+# URL-keyed cache can go stale, which is exactly why `cachedDeflate` above is
+# keyed on the response text instead. Two things bound it here:
+#
+#   1. Every candidate is produced TWICE, with two different inputs (no
+#      session, and a real session id), and the two must be byte-identical.
+#      A route whose answer depends on the caller, on the clock, or on a
+#      random draw FAILS that and is never warmed -- it is logged as a refusal
+#      and served live for the life of the process. This check can fail and
+#      has a named falsifying input; see `warmVerify`.
+#   2. Entries EXPIRE. After `gWarmTtlMs` (default 120 s -- the login burst is
+#      over in ten) the whole cache is dropped and the server behaves exactly
+#      as it did before this existed. Nothing that changes an answer later in
+#      a session -- a settings knob, a mod rebuilding a table -- can be served
+#      a stale body, because by then there is nothing warm left to serve.
+#
+# The list is deliberately short and deliberately hand-written: it is the
+# static load-path tables and nothing else. Adding a route here is a claim that
+# its answer is a pure function of the database, and the self-check is what
+# audits the claim rather than trusting it.
+
+const WarmRoutes = [
+  "/client/items",
+  "/client/globals",
+  "/client/customization",
+  "/client/account/customization",
+  "/client/handbook/templates",
+  "/client/settings",
+  "/client/languages",
+  "/client/locale/en",
+  "/client/menu/locale/en",
+  "/client/locations",
+  "/client/seasonal-perks/list",
+  "/client/ending/list",
+  "/client/prestige/list",
+  "/client/trading/api/traderSettings",
+  "/client/achievement/list",
+  "/client/hideout/areas",
+  "/client/hideout/settings",
+  "/client/hideout/qte/list",
+  "/client/hideout/production/recipes",
+  "/client/quest/chains",
+  "/client/tape/list",
+  "/client/subtitle-track/list",
+  "/client/getMetricsConfig",
+  "/client/libraries",
+  "/client/repeatalbeQuests/activityPeriods",
+  # NEGATIVE CONTROL, and it is here on purpose.
+  #
+  # `/client/quest/list` restates every quest's status from the caller's
+  # profile, so its answer is NOT a pure function of the database and it must
+  # never be warmed. It is in this list so that every boot exercises the
+  # refusal path: if this route is ever silently accepted, the self-check has
+  # stopped being able to say no, and §9b of CLAUDE.md is about exactly that.
+  # The log line it produces is the readback -- one `warm REFUSED` per boot,
+  # naming the two byte counts that differed.
+  "/client/quest/list"
+]
+
+const WarmControl = "/client/quest/list"
+  ## The one entry above that MUST be refused. See `warmStep`.
+
+type
+  WarmEntry = object
+    url: string
+    packed: seq[byte]
+    packedLen: int
+    bodyLen: int
+
+var gWarm: seq[WarmEntry] = @[]
+var gWarmOn = true            ## `--no-warm` turns it off
+var gWarmTtlMs = 120_000'i64  ## `--warm-ttl SECONDS`
+var gWarmNext = 0
+var gWarmStarted = false
+var gWarmBornMs = 0'i64
+var gWarmExpired = false
+var gWarmHits = 0
+var gWarmRefused = 0
+var gWarmSession = ""         ## the second input the self-check uses
+
+# ------------------------------------------------------- conditional GET
+#
+# MEASURED, from the BSG capture manifest (`mods/tarkov/data/capture/raid1/
+# manifest.json`), which is what the REAL server did with the repeat requests
+# this client makes:
+#
+#   seq 045  GET /client/items    200  1,036,593 B
+#   seq 069  GET /client/items    304  0 B
+#   seq 224  GET /client/items    304  0 B
+#   seq 426  GET /client/items    304  0 B
+#   seq 084  GET /client/globals  200  179,073 B
+#   seq 229  GET /client/globals  304  0 B
+#   seq 424  GET /client/globals  304  0 B
+#
+# So "unchanged" is not a thing that has to be invented: it is ordinary HTTP
+# conditional GET, the client's own stack already accepted a 304 for these two
+# routes from BSG, and it carried on and drew the items.
+#
+# What the capture does NOT contain is the REQUEST headers -- `reqlen` is 0 and
+# no request head was recorded -- so which validator the client sends is
+# **unknown**, and `nettrace.log` records request lines without headers, so it
+# cannot answer it either. Guessing would be exactly the confidently wrong
+# diagnostic the house rules forbid.
+#
+# Therefore this is implemented as real conditional GET and NOTHING ELSE: a
+# warm 200 carries an `ETag`, and a 304 goes out only for a request that
+# actually carries a matching `If-None-Match`. If the client sends no
+# validator, the flag is inert and the body goes out in full -- it cannot
+# withhold a body the client did not say it already had.
+#
+# Default OFF. It is also self-answering: with it on, the first request for
+# each warm route logs whether it carried a validator, so ONE launch settles
+# the question this capture could not.
+var gEtagOn = false
+var gEtagAsked: seq[string] = @[]
+
+proc etagFor(bodyLen, packedLen: int): string =
+  ## Weak-ish but sufficient: the answer is a pure function of the database,
+  ## and an entry only exists while the warm cache holds it, so a tag can only
+  ## be handed out for bytes this process still has.
+  "\"aowl-" & $bodyLen & "-" & $packedLen & "\""
+
+proc etagNote(url: string; sent: string) =
+  ## Once per url. The readback that decides whether a 304 can ever fire on
+  ## this client -- and it states the negative case as loudly as the positive
+  ## one, because "no validator" is the answer that means this flag is inert.
+  for u in gEtagAsked:
+    if u == url:
+      return
+  gEtagAsked.add url
+  if sent.len == 0:
+    modhost.info "conditional: " & url & " carried NO If-None-Match -- the " &
+      "304 path cannot fire for it on this client"
+  else:
+    modhost.info "conditional: " & url & " carried If-None-Match " & sent
+
+proc warmSecondSession(): string =
+  ## The self-check needs a session that is not the empty one, and a REAL id
+  ## beats a made-up one: a handler that looks a profile up will take its
+  ## found-a-profile branch, which is the branch a session-varying route
+  ## varies in. `launcher-last-profile.txt` is what the launcher writes; when
+  ## there is none, a syntactically valid id is used and the check is weaker,
+  ## which is stated in the log rather than glossed over.
+  if gWarmSession.len > 0:
+    return gWarmSession
+  var text = ""
+  if readTextFile(joinPath(gRoot, "launcher-last-profile.txt"), text):
+    var id = ""
+    for ch in text:
+      if (ch >= '0' and ch <= '9') or (ch >= 'a' and ch <= 'f') or
+         (ch >= 'A' and ch <= 'F'):
+        id.add ch
+      elif id.len > 0:
+        break
+    if id.len >= 8:
+      gWarmSession = id
+  if gWarmSession.len == 0:
+    gWarmSession = "0123456789abcdef01234567"
+  result = gWarmSession
+
+proc warmFind(path {.byref.}: string; into: var int): bool =
+  ## Caller holds the lock.
+  result = false
+  for i in 0 ..< gWarm.len:
+    if gWarm[i].url == path:
+      into = i
+      return true
+
+proc warmRun(url: string; session: string; into: var string): bool =
+  ## One synthetic request, straight at the route table. No socket, no session
+  ## lock: nothing else is running yet when this is used at warm time, and the
+  ## verify pass is the only other caller.
+  var route = Route(url: "", kind: RouteStatic, cb: cast[HostPtr](0),
+                    user: cast[HostPtr](0), modIndex: -1)
+  if not matchRoute(url, route):
+    return false
+  if not modhost.modEnter(route.modIndex):
+    return false
+  let r = Request(verb: "POST", url: url, session: session, body: "",
+                  ok: true, keepAlive: false, identity: false)
+  result = runRoute(route, r, into)
+  modhost.modLeave(route.modIndex)
+
+proc warmStep() =
+  ## One route per call, from the serve loop's tick. Deliberately not a burst:
+  ## the tick thread also drains timers and live mod control, and warming
+  ## twenty tables back to back would hold it for a second and a half.
+  if not gWarmOn or gWarmExpired or gWarmNext >= WarmRoutes.len:
+    return
+  if not gWarmStarted:
+    gWarmStarted = true
+    gWarmBornMs = elapsedMs()
+  let url = WarmRoutes[gWarmNext]
+  inc gWarmNext
+
+  let t0 = elapsedMs()
+  var a = ""
+  if not warmRun(url, "", a):
+    # Not registered by any loaded mod, or it refused. Neither is an error:
+    # the list spans routes several different emulators may or may not serve.
+    modhost.debug "warm: " & url & " is not served here"
+    return
+  if a.len < ZCacheMinBody:
+    # Below the compressed-body cache's own floor there is nothing to win: the
+    # deflate is microseconds. Warming it would only add a URL-keyed entry --
+    # i.e. all of the staleness risk and none of the benefit.
+    modhost.debug "warm: " & url & " is " & $a.len & " B, below the floor"
+    return
+
+  # The self-check. Two different inputs, one required answer.
+  var b = ""
+  let sess = warmSecondSession()
+  if not warmRun(url, sess, b) or b != a:
+    inc gWarmRefused
+    modhost.warn "warm REFUSED " & url &
+      " -- its answer is not a pure function of the database (" & $a.len &
+      " B with no session, " & $b.len & " B with session " & sess &
+      "). It will be served live."
+    return
+
+  if url == WarmControl:
+    # It passed. That is not good news: this route restates every quest's
+    # status from the caller's profile, so two different sessions cannot
+    # legitimately produce the same bytes. The realistic cause is that the
+    # second input was not a real session -- no `launcher-last-profile.txt`,
+    # or a store with no profile in it -- in which case the check ran with two
+    # inputs that were effectively the same one, and its verdict on every
+    # OTHER route this boot is worth less than it looks.
+    #
+    # Refused anyway, and said at error level, because a self-check reporting
+    # a pass it cannot have earned is the failure mode this control exists to
+    # make visible.
+    inc gWarmRefused
+    modhost.fail "warm SELF-CHECK IS WEAK this boot: the control route " &
+      url & " produced identical bytes for session '' and session " & sess &
+      " (" & $a.len & " B). That means the second input is not a real " &
+      "profile, so every other warm verdict this boot was taken with one " &
+      "input, not two. Nothing was warmed from it."
+    return
+
+  var packed: seq[byte] = @[]
+  var packedLen = 0
+  if not deflateBody(a, packed, packedLen):
+    inc gWarmRefused
+    modhost.warn "warm REFUSED " & url & " -- it would not deflate"
+    return
+
+  cLock()
+  var at = 0
+  if not warmFind(url, at):
+    gWarm.add WarmEntry(url: url, packed: packed, packedLen: packedLen,
+                        bodyLen: a.len)
+  cUnlock()
+  # One line per warmed route, with the two byte counts and the wall time, so
+  # the readback is in the log rather than in somebody's memory of a run.
+  modhost.info "warm " & url & " " & $a.len & " B -> " & $packedLen &
+               " B in " & $(elapsedMs() - t0) & " ms"
+
+proc warmSweep() =
+  ## Drop the whole cache once it is older than the TTL. This is the second
+  ## half of what makes a URL-keyed cache defensible: it is not a cache with a
+  ## clever invalidation rule, it is a cache that stops existing.
+  if gWarmExpired or not gWarmStarted or gWarm.len == 0:
+    return
+  if elapsedMs() - gWarmBornMs < gWarmTtlMs:
+    return
+  cLock()
+  let n = gWarm.len
+  gWarm = @[]
+  gWarmExpired = true
+  cUnlock()
+  modhost.info "warm cache expired after " & $(gWarmTtlMs div 1000) &
+               " s: " & $n & " entr(ies) dropped, " & $gWarmHits &
+               " request(s) had been served from it"
 
 # --------------------------------------------------------------- serving
 
@@ -1269,6 +1609,43 @@ proc handleRequest(sock: uint64; buf: HostPtr; len: int32;
                  jsonQuoted(req.url) & "}", not req.identity, req.keepAlive)
     return (if req.keepAlive: 1'i32 else: 0'i32)
 
+  # Warm? Then this request is a `send` and nothing else -- no handler, no
+  # database read, no deflate.
+  #
+  # After `matchRoute` on purpose: a warm hit for a url no mod serves would be
+  # a 200 for a route that does not exist. Before the session lock, because
+  # nothing here touches a profile. `identity` requests fall through to the
+  # live handler: they want the body uncompressed and the warm entry only
+  # holds it deflated, and they are the overlay and the browser, never the
+  # game.
+  if gWarmOn and not req.identity and gWarm.len > 0:
+    var wpath = req.url
+    let wq = find(wpath, "?")
+    if wq >= 0: wpath = wpath.substr(0, wq - 1)
+    cLock()
+    var wat = 0
+    let whit = warmFind(wpath, wat)
+    var wpacked: seq[byte] = @[]
+    var wlen = 0
+    var wbody = 0
+    if whit:
+      wlen = gWarm[wat].packedLen
+      wbody = gWarm[wat].bodyLen
+      wpacked = gWarm[wat].packed
+      inc gWarmHits
+    cUnlock()
+    if whit:
+      modhost.debug("REQ " & req.verb & " " & req.url & " (warm)")
+      var tag = ""
+      if gEtagOn:
+        tag = etagFor(wbody, wlen)
+        etagNote(wpath, req.ifNoneMatch)
+        if req.ifNoneMatch == tag:
+          sendNotModified(sock, tag, req.keepAlive)
+          return (if req.keepAlive: 1'i32 else: 0'i32)
+      sendPacked(sock, wpacked, wlen, req.keepAlive, tag)
+      return (if req.keepAlive: 1'i32 else: 0'i32)
+
   # One session at a time through a route handler.
   #
   # A handler for this client is a read-modify-write of a whole profile
@@ -1479,6 +1856,66 @@ proc hostLastError(ctx: HostPtr; outPtr, outLen: HostPtr) {.
   discard cOutCopy(outPtr, outLen, cast[HostPtr](toCString(gLastError)),
                    int32(gLastError.len))
 
+# One config document per mod, held for a moment rather than re-read per key.
+#
+# `modhost.configRead` opens `config.json`, reads it, and runs `jsonFault` over
+# the whole document -- every time a mod asks for ONE setting. That is correct
+# and it is the only sane contract, but the emulator's generators read settings
+# in unconditional blocks: `botGearConfig` + `modRarityConfig` are ~700 reads
+# per bot batch and `lootConfig` is several hundred per raid. Against
+# `mods/tarkov/config.json`, which is 41 KB, that is 700 file opens and 700
+# whole-document validations on the loading screen.
+#
+# MEASURED with `tools/loadpathbench.py` and the mod's own log: the emulator
+# prints `bot/generate request:` as the first statement inside `generate()`,
+# and 469 ms elapsed between the backend dispatching the request and that line
+# -- with `refreshBotGear()` the only thing in between.
+#
+# The cache is per mod index, and it is held for `ConfigCacheMs`. It is NOT a
+# permanent memo: the settings page writes `config.json` and the whole point of
+# reading it per batch is that an edit takes effect without a restart. A write
+# through this process drops it immediately (`hostConfigSet` below); the TTL is
+# what covers a write from outside this process, and half a second of it.
+const ConfigCacheMs = 500'i64
+const ConfigCacheMods = 64
+
+type
+  ConfigCacheEntry = object
+    text: string
+    status: int32
+    err: string
+    stampMs: int64
+    live: bool
+
+var gConfigCache: array[ConfigCacheMods, ConfigCacheEntry]
+
+proc configDrop*(idx: int) =
+  ## Invalidate one mod's cached document. Called from the write path.
+  if idx < 0 or idx >= ConfigCacheMods:
+    return
+  cLock()
+  gConfigCache[idx].live = false
+  cUnlock()
+
+proc configReadCached(idx: int; text: var string; err: var string): int32 =
+  if idx < 0 or idx >= ConfigCacheMods:
+    return configRead(idx, text, err)
+  let now = elapsedMs()
+  cLock()
+  if gConfigCache[idx].live and now - gConfigCache[idx].stampMs < ConfigCacheMs:
+    text = gConfigCache[idx].text
+    err = gConfigCache[idx].err
+    let st = gConfigCache[idx].status
+    cUnlock()
+    return st
+  cUnlock()
+  let st = configRead(idx, text, err)
+  cLock()
+  gConfigCache[idx] = ConfigCacheEntry(text: text, status: st, err: err,
+                                       stampMs: now, live: true)
+  cUnlock()
+  result = st
+
 proc hostConfigGet(ctx: HostPtr; key: HostPtr; keyLen: int32;
                    outPtr, outLen: HostPtr): int32 {.
     exportc: "aowlspt_nim_config_get", cdecl.} =
@@ -1494,7 +1931,7 @@ proc hostConfigGet(ctx: HostPtr; key: HostPtr; keyLen: int32;
   # ran a whole session on defaults with nothing anywhere saying so.
   var text = ""
   var err = ""
-  let st = configRead(idx, text, err)
+  let st = configReadCached(idx, text, err)
   if st != StatusOk:
     gLastError = err
     # A whole-document read gets the bytes even when they do not parse. It
@@ -1603,6 +2040,11 @@ proc hostConfigSet(ctx: HostPtr; key: HostPtr; keyLen: int32;
   if not wr.ok:
     gLastError = "could not write " & cfgPath
     return ErrGeneric
+  # The document on disk is not the one `configReadCached` is holding any more.
+  # Dropped here rather than left to the TTL, so a settings edit made through
+  # this server is in force for the very next read, exactly as it was before
+  # the cache existed.
+  configDrop(idx)
   result = StatusOk
 
 proc hostDbGet(ctx: HostPtr; path: HostPtr; pathLen: int32;
@@ -1980,6 +2422,21 @@ proc settingsRowsUsable(n: JsonNode; what, route, body: string): bool =
   ## not look" is not a pass and is not a failure.
   if kind(n) == JArray:
     return true
+  if body.contains("\"waiting\":true"):
+    # MEASURED 2026-09-01, with mods/settingshub staged and mods/tarkov not:
+    # this route answered `{"waiting":true,...,"err":"waiting for aowl.tarkov
+    # to publish (client-side, up to 5s)","rows":[]}` and this check called it
+    # a FAIL -- "the settings wire is an array of rows" -- about a mod that is
+    # simply not loaded. settingshub's fallback prefix answers for any guid
+    # nobody registered, so "no route" is no longer the only way an absent mod
+    # shows up here. A confidently wrong diagnosis is worse than none.
+    console.warn what & ": INCONCLUSIVE -- route " & route &
+      " answered the settingshub `waiting` shape, which means NO MOD OWNS " &
+      "that guid in this process (mods/tarkov is not staged) and the page is " &
+      "expected to arrive over the client sync instead. The settings wire " &
+      "was never examined."
+    inc gSelfInconclusive
+    return false
   if body.contains("no route"):
     console.warn what & ": INCONCLUSIVE -- route " & route &
       " answered `no route`, so the mod that owns it (aowl.tarkov, i.e." &
@@ -1993,6 +2450,102 @@ proc settingsRowsUsable(n: JsonNode; what, route, body: string): bool =
     " array of {key,value} rows."
   inc gSelfFailures
   return false
+
+# --------------------------------------------------------------------------
+# The aggregated settings surface: `/aowlspt/settings/index/full`,
+# `/aowlspt/keybinds`, `POST /aowlspt/settings/<guid>/set`
+# --------------------------------------------------------------------------
+#
+# These checks assert properties of the FINISHED DOCUMENT, never of a write
+# this test just made (CLAUDE.md 9b). Concretely, each one names the input that
+# would falsify it:
+#
+#   * strict `parseJson` + `hasError`, never `contains` -- fact #122 was 22 rows
+#     of unquoted `"value":standard` that a substring test passed for months.
+#   * every mod the COMPACT index lists appears in the FULL one exactly once --
+#     falsified by a missing mod and by a duplicated one, which is the shape
+#     that put two "Bot AI" entries in the nav.
+#   * every row's `type` is in the closed set of eight -- falsified by a new
+#     kind reaching the wire before a renderer knows how to draw it.
+#   * `settings` and `keybinds` are ARRAYS even when empty -- falsified by the
+#     `null` a "leave it out when there is nothing" implementation produces,
+#     which is the difference between a consumer drawing an empty page and a
+#     consumer throwing.
+#   * the round trip reads the value back out of the INDEX after the write, and
+#     the reset check refuses to run unless the write demonstrably moved the
+#     value first.
+
+proc jStrField(n: JsonNode; want: string): string =
+  ## `n[want]` when it is a JSON string, else "". No `var JsonNode` anywhere in
+  ## this file: nimony refuses one ("cannot prove that f has been initialized")
+  ## because JsonNode is a cursor with no zero value, so every member access
+  ## here reads the value inline while iterating rather than holding a node.
+  ## `pairs` also ASSERTS on a non-object -- an assert aborts the whole
+  ## process -- so the kind is checked first, every time.
+  result = ""
+  if kind(n) != JObject:
+    return
+  for k, v in pairs(n):
+    if k == want and kind(v) == JString:
+      return getStr(v)
+
+proc jBoolField(n: JsonNode; want: string; default: bool): bool =
+  result = default
+  if kind(n) != JObject:
+    return
+  for k, v in pairs(n):
+    if k == want and kind(v) == JBool:
+      return getBool(v)
+
+proc jHasArray(n: JsonNode; want: string): bool =
+  ## Does `n` have a member `want` that is an ARRAY? The distinction this is
+  ## for is `[]` (a mod with nothing to declare) versus `null`/absent (a
+  ## producer that leaves the field out), which a consumer cannot iterate.
+  result = false
+  if kind(n) != JObject:
+    return
+  for k, v in pairs(n):
+    if k == want:
+      return kind(v) == JArray
+
+proc isSettingTypeName(t: string): bool =
+  ## THE CLOSED SET, spelled out. It mirrors `kindName` in
+  ## `aowl/src/aowlspt/settings.nim`; a ninth kind added there and not here
+  ## FAILS this check, which is the intended direction -- a renderer has to be
+  ## taught the new kind before it may appear on the wire.
+  t == "bool" or t == "int" or t == "float" or t == "enum" or
+  t == "string" or t == "keybind" or t == "select" or t == "color"
+
+proc fullIndexValueOf(port: int; guid, key: string; found: var bool): string =
+  ## The current value of one row, as `/aowlspt/settings/index/full` reports
+  ## it. `found` distinguishes "the row says empty string" from "there is no
+  ## such row" -- two answers a bare `""` cannot carry apart.
+  found = false
+  result = ""
+  let r = request(port, "/aowlspt/settings/index/full", "",
+                  "000000000000000000000001")
+  if not r.ok:
+    return
+  var t = parseJson(r.body)
+  if hasError(t) or kind(root(t)) != JObject:
+    return
+  for topKey, topVal in pairs(root(t)):
+    if topKey != "mods" or kind(topVal) != JArray:
+      continue
+    for m in items(topVal):
+      if jStrField(m, "guid") != guid or kind(m) != JObject:
+        continue
+      for mk, mv in pairs(m):
+        if mk != "settings" or kind(mv) != JArray:
+          continue
+        for row in items(mv):
+          if jStrField(row, "key") != key or kind(row) != JObject:
+            continue
+          for rk, rv in pairs(row):
+            if rk == "value" and kind(rv) == JString:
+              found = true
+              result = getStr(rv)
+              return
 
 proc expect(what, path, body, want: string) =
   ## A free proc with a module-level counter rather than a nested one closing
@@ -2052,6 +2605,21 @@ aowlspt-backend -- the game backend
   --perf        accumulate per-phase timings and print them at exit
   --selftest    serve, drive every route from inside this process, then exit
                 with the result. One command, no orchestration.
+  --no-warm     do NOT pre-build and pre-deflate the static load-path tables
+                at startup. They are warmed by default, one route per serve-loop
+                tick, off the accept path -- see `warmStep`. Each candidate is
+                produced twice with different inputs and refused unless the two
+                are byte-identical, and the whole cache is dropped after the
+                TTL below.
+  --warm-ttl N  seconds a warm entry lives (default 120). After it, the server
+                answers exactly as it did before the cache existed.
+  --etag        conditional GET on the warm routes: a 200 carries an `ETag`,
+                and a request carrying a matching `If-None-Match` is answered
+                `304` with no body -- which is what BSG's own server does for
+                the repeat `/client/items` and `/client/globals` (capture seq
+                069/224/426 and 229/424). Default OFF, and inert unless the
+                client actually sends a validator; whether it does is logged
+                on the first request for each route.
   --store-flush force every store write to the medium before it is committed.
                 Costs about 6 ms a write and protects against a power cut, not
                 against a crash -- see docs/BACKEND.md.
@@ -2248,6 +2816,27 @@ proc main(): int =
       # error is gated on it in either direction, so a quiet log and a verbose
       # log agree on every conclusion and differ only in bookkeeping.
       verbose = true
+    elif a == "--no-warm":
+      # The warm cache (see `warmStep`). ON by default: it is the difference
+      # between a 1295 ms first `/client/items` and a 30 ms one, and it refuses
+      # any route that fails its own two-input self-check. Off is the control
+      # for a before/after measurement, and the escape hatch if it is ever
+      # implicated in a wrong answer.
+      gWarmOn = false
+    elif a == "--warm-ttl":
+      inc i
+      if i <= n:
+        var secs = 0
+        var okNum = paramStr(i).len > 0
+        for ch in paramStr(i):
+          if ch >= '0' and ch <= '9': secs = secs * 10 + (ord(ch) - ord('0'))
+          else: okNum = false
+        if okNum: gWarmTtlMs = int64(secs) * 1000'i64
+    elif a == "--etag":
+      # Conditional GET on the warm routes. Default OFF: see `gEtagOn` for
+      # what is measured and what is not. It can only ever withhold a body the
+      # request itself said it already had.
+      gEtagOn = true
     elif a == "--selftest":
       selftest = true
     elif a == "--store-flush":
@@ -2791,6 +3380,285 @@ proc main(): int =
                    "(confirmed it was \"PVE ZONE\", not \"Profile Name\", " &
                    "immediately before the reset)"
 
+    # ---- the aggregated settings surface (mods/settingshub) ----
+    #
+    # INCONCLUSIVE, not FAIL, when settingshub is not staged: the wire was not
+    # examined, and "I could not look" is not a pass.
+    var fullGuids: seq[string] = @[]
+    var fullModCount = 0
+    var fullRowCount = 0
+    var rtGuid = ""
+    var rtKey = ""
+    var rtDefault = ""
+    let fullResp = request(gPort, "/aowlspt/settings/index/full", "",
+                           "000000000000000000000001")
+    if not fullResp.ok:
+      console.err "settings index/full: " & fullResp.error
+      inc gSelfFailures
+    elif fullResp.contains("no route"):
+      console.warn "settings index/full: INCONCLUSIVE -- route " &
+        "/aowlspt/settings/index/full answered `no route`, so " &
+        "mods/settingshub is NOT LOADED on this backend and the aggregated " &
+        "settings surface was never examined."
+      inc gSelfInconclusive
+    else:
+      var ft = parseJson(fullResp.body)
+      if hasError(ft):
+        console.err "settings index/full did not parse as strict JSON: " &
+                    errorMsg(ft)
+        inc gSelfFailures
+      elif not jHasArray(root(ft), "mods"):
+        console.err "settings index/full: no `mods` ARRAY in the reply (" &
+                    fullResp.body & ")"
+        inc gSelfFailures
+      else:
+        var badType = ""
+        var badRow = ""
+        var notAnArray = ""
+        var duplicated = ""
+        for topKey, topVal in pairs(root(ft)):
+          if topKey != "mods" or kind(topVal) != JArray:
+            continue
+          for m in items(topVal):
+            inc fullModCount
+            let guid = jStrField(m, "guid")
+            if guid.len == 0:
+              badRow = "a mod entry carried no guid"
+            elif fullGuids.contains(guid):
+              duplicated = guid
+            else:
+              fullGuids.add guid
+            if not jHasArray(m, "settings"):
+              # THE NEGATIVE CONTROL. A mod with nothing to declare must carry
+              # `[]`; a `null` or an absent field is the failure.
+              notAnArray = guid
+              continue
+            let isClient = jBoolField(m, "client", false)
+            for mk, mv in pairs(m):
+              if mk != "settings" or kind(mv) != JArray:
+                continue
+              for row in items(mv):
+                inc fullRowCount
+                let ty = jStrField(row, "type")
+                if not isSettingTypeName(ty):
+                  badType = guid & "." & jStrField(row, "key") & " type=\"" &
+                            ty & "\""
+                if jStrField(row, "key").len == 0:
+                  badRow = guid & " has a row with no key"
+                # A ROW SAFE TO ROUND-TRIP. Text-shaped (so an arbitrary
+                # marker is a legal value), server-side (so the write is
+                # applied here and not queued for a game process that is not
+                # running), and sitting AT ITS DECLARED DEFAULT right now --
+                # which is what makes the reset at the end of the trip restore
+                # exactly what was there before. Without that precondition
+                # this test would overwrite a value a player chose and put the
+                # schema default in its place, on any install it is aimed at.
+                if rtKey.len == 0 and ty == "string" and not isClient and
+                   jStrField(row, "value") == jStrField(row, "default") and
+                   jStrField(row, "default").len > 0:
+                  rtGuid = guid
+                  rtKey = jStrField(row, "key")
+                  rtDefault = jStrField(row, "default")
+        if notAnArray.len > 0:
+          console.err "settings index/full: `" & notAnArray &
+                      "` has no `settings` ARRAY (null or absent); a mod " &
+                      "with no settings must carry [], which is what a " &
+                      "consumer iterates without a null check"
+          inc gSelfFailures
+        elif duplicated.len > 0:
+          console.err "settings index/full: guid `" & duplicated &
+                      "` appears more than once; the guid is the identity " &
+                      "and a duplicate draws the same mod twice in the nav"
+          inc gSelfFailures
+        elif badRow.len > 0:
+          console.err "settings index/full: " & badRow
+          inc gSelfFailures
+        elif badType.len > 0:
+          console.err "settings index/full: " & badType &
+                      " is not one of the eight declared setting types " &
+                      "(bool int float enum string keybind select color)"
+          inc gSelfFailures
+        elif fullModCount == 0:
+          console.warn "settings index/full: INCONCLUSIVE -- the document " &
+            "parsed and is well formed but lists ZERO mods, so no row was " &
+            "examined. Stage a mod that calls declareSettings."
+          inc gSelfInconclusive
+        else:
+          console.ok "settings index/full is strict JSON: " &
+                     $fullModCount & " mod(s), " & $fullRowCount &
+                     " row(s), every type in the closed set, every " &
+                     "`settings` an array"
+
+    # Every mod the COMPACT index lists must appear in the FULL one exactly
+    # once. Checked in that direction because the compact index is what the
+    # existing F12 nav is built from: a mod present there and missing here is a
+    # page a native tab could never draw.
+    if fullModCount > 0:
+      let idxResp = request(gPort, "/aowlspt/settings/index", "",
+                            "000000000000000000000001")
+      var it = parseJson(idxResp.body)
+      if not idxResp.ok or hasError(it):
+        console.err "settings index: could not be parsed alongside index/full"
+        inc gSelfFailures
+      elif not jHasArray(root(it), "mods"):
+        console.err "settings index: no `mods` array"
+        inc gSelfFailures
+      else:
+        block:
+          var missing = ""
+          var compactCount = 0
+          for topKey, topVal in pairs(root(it)):
+            if topKey != "mods" or kind(topVal) != JArray:
+              continue
+            for m in items(topVal):
+              inc compactCount
+              let g = jStrField(m, "guid")
+              if g.len > 0 and not fullGuids.contains(g):
+                missing = g
+          if missing.len > 0:
+            console.err "settings index/full: `" & missing &
+                        "` is in the compact index and MISSING from the full " &
+                        "one"
+            inc gSelfFailures
+          elif compactCount != fullModCount:
+            console.err "settings index/full lists " & $fullModCount &
+                        " mod(s) but the compact index lists " &
+                        $compactCount & "; the two routes disagree about how " &
+                        "many mods exist"
+            inc gSelfFailures
+          else:
+            console.ok "every mod in /aowlspt/settings/index appears in " &
+                       "/aowlspt/settings/index/full exactly once (" &
+                       $compactCount & ")"
+
+    # ---- /aowlspt/keybinds ----
+    if fullModCount > 0:
+      let kbResp = request(gPort, "/aowlspt/keybinds", "",
+                           "000000000000000000000001")
+      if not kbResp.ok:
+        console.err "keybinds route: " & kbResp.error
+        inc gSelfFailures
+      else:
+        var kt = parseJson(kbResp.body)
+        if hasError(kt):
+          console.err "keybinds route did not parse as strict JSON: " &
+                      errorMsg(kt)
+          inc gSelfFailures
+        elif not jHasArray(root(kt), "mods"):
+          console.err "keybinds route: no `mods` array (" & kbResp.body & ")"
+          inc gSelfFailures
+        else:
+          block:
+            var kmods = 0
+            var binds = 0
+            var emptyLists = 0
+            var noAction = ""
+            var notAnArray = ""
+            for topKey, topVal in pairs(root(kt)):
+              if topKey != "mods" or kind(topVal) != JArray:
+                continue
+              for m in items(topVal):
+                inc kmods
+                let guid = jStrField(m, "guid")
+                if not jHasArray(m, "keybinds"):
+                  notAnArray = guid
+                  continue
+                for mk, mv in pairs(m):
+                  if mk != "keybinds" or kind(mv) != JArray:
+                    continue
+                  if len(mv) == 0:
+                    inc emptyLists
+                  for b in items(mv):
+                    inc binds
+                    if jStrField(b, "action").len == 0:
+                      noAction = guid & "." & jStrField(b, "settingKey")
+            if notAnArray.len > 0:
+              console.err "keybinds route: `" & notAnArray &
+                          "` has no `keybinds` ARRAY; a mod with no keys must " &
+                          "carry [], not null and not a missing entry"
+              inc gSelfFailures
+            elif noAction.len > 0:
+              console.err "keybinds route: " & noAction &
+                          " has an EMPTY action; a keybind row with no action " &
+                          "cannot be drawn"
+              inc gSelfFailures
+            elif kmods != fullModCount:
+              console.err "keybinds route lists " & $kmods &
+                          " mod(s) but index/full lists " & $fullModCount &
+                          "; a mod with no keys must still appear, with []"
+              inc gSelfFailures
+            else:
+              console.ok "keybinds route is strict JSON: " & $kmods &
+                         " mod(s), " & $binds & " binding(s), " &
+                         $emptyLists & " mod(s) with an EMPTY list (not null)"
+
+    # ---- the round trip: set -> index -> reset -> index ----
+    #
+    # Through `/set`, whose whole claim is that it answers with the value AS
+    # STORED rather than an echo; the value is then re-read from
+    # `/aowlspt/settings/index/full`, a DIFFERENT route reading the same store,
+    # so a `/set` that merely echoed could not make both agree.
+    #
+    # The row is chosen, not hardcoded, and only a row already sitting at its
+    # declared default qualifies -- see where `rtKey` is picked. That is what
+    # makes the reset at the end restore exactly the value that was there
+    # before this test ran, on any install this is pointed at.
+    if fullModCount > 0 and rtKey.len == 0:
+      console.warn "settings /set: INCONCLUSIVE -- no server-side string row " &
+        "is currently sitting at its declared default, so there is no row " &
+        "this test can write to and put back exactly as it found it. The " &
+        "route was NOT examined."
+      inc gSelfInconclusive
+    elif rtKey.len > 0:
+      let marker = "AOWL SELFTEST"
+      var seen = false
+      let sr = request(gPort, "/aowlspt/settings/" & rtGuid & "/set",
+                       "{\"key\":\"" & rtKey & "\",\"value\":\"" & marker & "\"}",
+                       "000000000000000000000001")
+      var srt = parseJson(sr.body)
+      var readback = ""
+      if sr.ok and not hasError(srt):
+        readback = jStrField(root(srt), "value")
+      let afterSet = fullIndexValueOf(gPort, rtGuid, rtKey, seen)
+      if not sr.ok:
+        console.err "settings /set: POST failed: " & sr.error
+        inc gSelfFailures
+      elif hasError(srt):
+        console.err "settings /set: the reply did not parse as strict JSON"
+        inc gSelfFailures
+      elif readback != marker:
+        console.err "settings /set on " & rtGuid & "." & rtKey &
+                    ": the reply's `value` read back \"" & readback &
+                    "\", not the value that was written; /set's whole " &
+                    "contract is that this field comes from the store"
+        inc gSelfFailures
+      elif not seen or afterSet != marker:
+        console.err "settings /set on " & rtGuid & "." & rtKey &
+                    ": the reply claimed the write took, but index/full " &
+                    "still reads \"" & afterSet & "\" -- the readback and " &
+                    "the index disagree"
+        inc gSelfFailures
+      else:
+        console.ok "settings /set: the write to " & rtGuid & "." & rtKey &
+                   " is visible in /aowlspt/settings/index/full (was \"" &
+                   rtDefault & "\", now \"" & marker & "\")"
+        let rr = request(gPort, "/aowlspt/settings/" & rtGuid & "/reset",
+                         "{\"key\":\"" & rtKey & "\"}",
+                         "000000000000000000000001")
+        let afterReset = fullIndexValueOf(gPort, rtGuid, rtKey, seen)
+        if not rr.ok:
+          console.err "settings reset: POST failed: " & rr.error
+          inc gSelfFailures
+        elif afterReset != rtDefault:
+          console.err "settings reset on " & rtGuid & "." & rtKey &
+                      ": index/full reads \"" & afterReset &
+                      "\", wanted the declared default \"" & rtDefault &
+                      "\" (it was \"" & marker & "\" immediately before)"
+          inc gSelfFailures
+        else:
+          console.ok "settings reset: index/full shows the declared default " &
+                     "again (confirmed it read \"" & marker & "\" first)"
+
     # And a malformed session id must be refused before any route sees it.
     let badSession = request(gPort, "/aowlspt/status", "", "not-a-mongo-id")
     if badSession.ok and badSession.contains("bad session id"):
@@ -2841,6 +3709,10 @@ proc main(): int =
     let now = elapsedMs()
     tickMods(now - lastTick)
     runTimers()
+    # Off the accept path, by construction: this is the serve loop's own
+    # thread, and the accept workers are elsewhere. One route per tick.
+    warmStep()
+    warmSweep()
     # Live mod control, off the emitting stack. This is the only place a mod is
     # loaded or unloaded while the server is running.
     modcontrol.drain()
