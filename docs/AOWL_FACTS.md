@@ -6753,3 +6753,18 @@ returns early while a match is pending, so a burst-1 capture would block burst 2
 from ever capturing and turn the gate into one that can never open. If showing 2
 never arrives within 900 drain ticks the feature DECLINES and presses nothing --
 "the second showing has not come" is not the same claim as "the flow is ready".
+
+## 2026-09-02 03:20: there is no "showing 2" of the character screen, and natesp MENU is not the menu
+
+MEASURED (build 4,736,512, modeskip answering showing 2 only): `SHOWING 1 ...
+closed on this frame -- 3 ShowSlot call(s)`, then nothing for 3+ minutes.
+The client does NOT re-show the slot screen on its own; the "~372ms re-show"
+belief was wrong. Surviving boots answered showing 1 one to two drain ticks
+after the burst (15-31ms); the death was a same-tick Submit (0ms). Rule now:
+answer showing 1 on the next drain tick after its burst closes.
+
+MEASURED: run.py printed `REACHED raid phase = MENU` on that parked
+character screen. natesp's MENU means "no GameWorld cached" and is true on
+the loading screen, the slot screen and the menu alike. The main-menu proof
+is the MenuScreen::Show epoch line (uihooks site 2); run.py is being taught
+to require it.
