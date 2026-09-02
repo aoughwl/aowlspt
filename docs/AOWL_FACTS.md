@@ -7044,3 +7044,35 @@ it was would have been registering into a mechanism that cannot run: a silent
 no-op wearing the shape of a fix. It is still under `gModsOn`, so with the mods
 tab flag OFF those rows get the corrected WRITE but no poll behind it -- stated
 rather than implied.
+
+## 2026-09-02: "breadth-first" per node is still depth-first one level down
+
+MEASURED on the 4,766,208-byte build: the SIDE step reported
+`1 node(s) carrying a control in the wanted side's scope: [Button Button]` --
+the `AnimatedToggle` under `PMCs/AnimatedToggleSpawner` was never collected,
+though it is one level deeper than a node that WAS collected.
+
+Cause: `arCollectActiveBF` takes a whole level and then RECURSES into the first
+child, which is depth-first from level 2 onward. Under `PMCs` the first child is
+`PMCPlayerMV`, the character model, so the 40-node cap was spent in its mesh
+before the walk ever descended into `AnimatedToggleSpawner`. The fix is a TRUE
+level-by-level BFS (`arCollectBFS`, an explicit queue), where every level-2 node
+is visited before any level-3 node. **A per-node breadth pass followed by
+recursion is not BFS, and under a wide-shallow-controls / deep-model tree the
+difference decides whether the control is found at all.**
+
+Second measurement from the same run: after the side press, autoraid handed
+straight to NEXT->location, which searches the `Menu UI` root for an active
+`NextButton` -- and 45 s later refused with the census still showing
+`[MatchMaker Side Selection Screen]`. **The side screen's own NEXT is a sibling
+subtree of the side controls (`ScreenDefaultButtons -> NextButton`, carrying
+`EFT.UI.DefaultUIButton`), and it must be pressed by the SIDE step itself,
+resolved from the site-3 receiver's subtree.** Only then does the screen change,
+and only then is handing to NEXT->location meaningful. The readback is this
+screen going INACTIVE, then site 0.
+
+Still UNKNOWN and logged rather than assumed: whether the bare
+`UnityEngine.UI.Button` press alone commits the PMC side, or whether the
+`AnimatedToggle` is the control that does. With the real BFS the toggle is now
+reachable and is PREFERRED; the log names which klass was pressed, and the
+offline raid screen's own side display is the thing that settles it.

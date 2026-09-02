@@ -216,6 +216,8 @@ var gArSideFires = 0               ## side-screen show events observed while arm
 var gArSideTr: Il2CppPtr = nil     ## the live side screen's Transform, from the
                                    ## receiver the GAME handed us in RCX
 var gArSideNamesLogged = false     ## the control-name census, once per session
+var gArSideNextDone = false        ## this screen's own NextButton was pressed
+var gArSideNextMs = 0'u64          ## when it was pressed (readback clock)
 var gArOffEpoch = 0                ## last seen uihooks site-0 epoch (offline raid)
 var gArOffFires = 0                ## site-0 show events observed while armed
 var gArOffAwaitMs = 0'u64          ## when NEXT->offline-raid was pressed
@@ -263,6 +265,7 @@ proc arCrumbName(c: int): string =
   of 17: "NEXT: arFindNext (looking for an active NextButton)"
   of 18: "NEXT: pressing the NextButton"
   of 19: "the step timeout census"
+  of 20: "SIDE: pressing this screen's own NextButton"
   else:  "unknown (" & $c & ")"
 
 proc arStepName(s: int): string =
@@ -712,6 +715,55 @@ proc arSelectMap(): bool =
 # SELECT-MAP -- and the raid path's later readback is site 0,
 # `MatchmakerOfflineRaidScreen::Show`.
 # ---------------------------------------------------------------------------
+proc arCollectBFS(root: Il2CppPtr; depth: int; budget: var int;
+                  deadline: uint64; into: var seq[Il2CppPtr]; cap: int;
+                  skip: string) =
+  ## TRUE level-by-level breadth-first: EVERY node of level N is visited before
+  ## ANY node of level N+1, using `into` itself as the queue.
+  ##
+  ## WHY THIS EXISTS ALONGSIDE `arCollectActiveBF`, WHICH IS ALSO "BREADTH
+  ## FIRST". MEASURED 2026-09-02: the other one is breadth-per-node -- it takes
+  ## a whole level, then RECURSES into the first child, which is depth-first one
+  ## level down. Under `PMCs` that is fatal in exactly the same way the fully
+  ## depth-first version was: level 1 gives [PMCPlayerMV][AnimatedToggleSpawner]
+  ## [Button][ScavPlayerMV][RandomToggleSpawner], and then the recursion dives
+  ## into `PMCPlayerMV` -- the character MODEL -- and spends the 40-node cap in
+  ## its mesh before ever descending into `AnimatedToggleSpawner`. The live run
+  ## reported exactly that: `1 node(s) carrying a control ... [Button Button]`,
+  ## with the `AnimatedToggle` one level down never collected.
+  ##
+  ## A real BFS cannot do that: `AnimatedToggle` is at level 2 and every level-2
+  ## node is visited before any level-3 mesh node.
+  if root == nil or depth <= 0 or budget <= 0 or cap <= 0: return
+  let start = into.len
+  var q: seq[Il2CppPtr] = @[]
+  q.add root
+  var head = 0
+  var levelEnd = 1
+  var lvl = 0
+  while head < q.len and lvl < depth and into.len - start < cap and budget > 0:
+    let node = q[head]
+    head = head + 1
+    var n = 0
+    if duOk(node, 0x20'i32) and iChildCount(node, n):
+      var j = 0
+      while j < n and j < ArFanout and into.len - start < cap and budget > 0:
+        let c = iChildAt(node, j)
+        if c != nil and duOk(c, 0x20'i32):
+          budget = budget - 1
+          if (budget and 31) == 0 and cNowMs() > deadline:
+            budget = 0
+            return
+          let a = iActiveInHierarchy(c)
+          if a[0] and a[1] and
+             (skip.len == 0 or not iContains(iLower(iObjName(c)), skip)):
+            into.add c
+            q.add c
+        j = j + 1
+    if head >= levelEnd:
+      levelEnd = q.len
+      lvl = lvl + 1
+
 proc arCollectActiveBF(t: Il2CppPtr; depth: int; budget: var int;
                        deadline: uint64; into: var seq[Il2CppPtr]; cap: int;
                        skip: string) =
@@ -952,8 +1004,8 @@ proc arPressSideUnder(scr: Il2CppPtr; want: string; nSeen: var int;
   var nodes: seq[Il2CppPtr] = @[]
   var b2 = ArNodeBudget
   nodes.add scope                             # the scope itself may carry it
-  arCollectActiveBF(scope, ArSideDeepDepth, b2, cNowMs() + ArWalkMs, nodes,
-                    ArMaxSideProbe, skip)
+  arCollectBFS(scope, ArSideDeepDepth, b2, cNowMs() + ArWalkMs, nodes,
+               ArMaxSideProbe, skip)
   var hit: Il2CppPtr = nil
   var hitComp: Il2CppPtr = nil
   var hitType = ""
@@ -1235,6 +1287,8 @@ proc arTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ar_tick_body", cdecl.}
     gArSideFires = gArSideFires + 1
     gArCrumb = 13
     gArSideTr = arSideScreen()
+    gArSideNextDone = false
+    gArSidePresses = 0
     if gArStep == ArSide or gArStep == ArPressPlay or gArStep == ArWaitMenu or
        gArStep == ArNext1:
       okLog "autoRaid: READBACK -- MatchMakerSideSelectionScreen::Show fired " &
@@ -1590,23 +1644,75 @@ proc arTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ar_tick_body", cdecl.}
     return
 
   if gArStep == ArSide:
-    # (a) ALREADY PRESSED: the finished state for the PRESS is that the side
-    # screen has gone. It does not go away on the side press itself (that only
-    # selects a side) -- it goes when its NEXT is pressed, which is the existing
-    # NEXT->location step. So the readback here is two-part and BOTH parts are
-    # logged: the press, then the screen's disappearance, asserted on entry to
-    # SELECT-MAP below.
-    if gArSidePresses > 0:
-      okLog "autoRaid: step SIDE -- side chosen (\"" & gArSide &
-            "\"); handing over to NEXT->location, which presses this screen's " &
-            "own NextButton. PRESSED IS NOT ADVANCED: the readback is the " &
-            "side screen going INACTIVE, asserted at SELECT-MAP, and then " &
-            "MatchmakerOfflineRaidScreen::Show (uihooks site 0) later."
-      gArSideAnswered = gArSideAnswered + 1
-      gArSidePresses = 0
-      gArLastPressed = nil
-      gArLastActionMs = now
-      arGoto(ArNext1)
+    # (a) THE SIDE IS CHOSEN: press THIS SCREEN'S OWN NextButton, then read
+    # back that the screen has gone. Handing straight to NEXT->location was
+    # measured wrong -- see the block below.
+    if gArSidePresses > 0 and not gArSideNextDone:
+      # THIS SCREEN'S OWN NEXT. Handing straight to NEXT->location was wrong and
+      # MEASURED wrong: that step searches the `Menu UI` root for an active
+      # `NextButton` for the NEXT screen and never pressed this one, so the side
+      # screen stayed up until the step timed out 45 s later with the census
+      # still showing `[MatchMaker Side Selection Screen]`. The button is a
+      # sibling subtree of the side controls -- `ScreenDefaultButtons ->
+      # NextButton` -- and it carries `EFT.UI.DefaultUIButton` (measured live
+      # with the inspector's `components`), so the ordinary +0x120 press path
+      # fits it. It is resolved from the SITE-3 RECEIVER's own subtree, never by
+      # an all-roots name hunt.
+      gArCrumb = 20
+      var b = ArNodeBudget
+      let nb = arWalkActive(gArSideTr, "NextButton", ArSideDeepDepth, b,
+                            cNowMs() + ArWalkMs, nil)
+      if nb == nil:
+        if now - gArSideLogMs > 5000'u64:
+          gArSideLogMs = now
+          warn "autoRaid SIDE: the side was chosen but this screen has NO " &
+               "ACTIVE node named `NextButton` under it, so nothing can " &
+               "advance it. NOTHING WAS PRESSED."
+        return
+      if arPress(nb, "DefaultUIButton"):
+        gArSideNextDone = true
+        gArSideNextMs = now
+        gArLastPressed = nb
+        gArLastActionMs = now
+        okLog "autoRaid: step SIDE -- pressed THIS screen's own NextButton " &
+              "(EFT.UI.DefaultUIButton, resolved from the site-3 receiver's " &
+              "subtree). PRESSED IS NOT ADVANCED: the readback is this screen " &
+              "going INACTIVE, and then MatchmakerOfflineRaidScreen::Show " &
+              "(uihooks site 0) firing."
+      elif now - gArSideLogMs > 5000'u64:
+        gArSideLogMs = now
+        warn "autoRaid SIDE: found this screen's ACTIVE `NextButton` but its " &
+             "DefaultUIButton OnClick could not be resolved and validated, so " &
+             "it was NOT pressed."
+      return
+    if gArSideNextDone:
+      # THE READBACK, and it is a NEGATIVE: this screen is no longer active.
+      gArCrumb = 13
+      if not arSideActive():
+        gArSideAnswered = gArSideAnswered + 1
+        okLog "autoRaid: READBACK -- the MatchMakerSideSelectionScreen is no " &
+              "longer active after its own NextButton. Side \"" & gArSide &
+              "\" is committed as far as this host can observe; site 0 " &
+              "(MatchmakerOfflineRaidScreen::Show) is the next readback and " &
+              "will resynchronise the machine if it fires. Handing to " &
+              "NEXT->location. Side screens got past this session: " &
+              $gArSideAnswered & "."
+        gArSidePresses = 0
+        gArSideNextDone = false
+        gArLastPressed = nil
+        gArLastActionMs = now
+        arGoto(ArNext1)
+        return
+      if now - gArSideNextMs > ArSideSettleMs and
+         gArSidePresses < ArMaxSidePresses:
+        # Still up after the settle window: allow ONE more attempt at the pair,
+        # then let the step timeout refuse with its census.
+        warn "autoRaid SIDE: the side screen is STILL ACTIVE " &
+             $int(now - gArSideNextMs) & "ms after its own NextButton was " &
+             "pressed. Retrying the side control and NEXT once more (attempt " &
+             $(gArSidePresses + 1) & " of " & $ArMaxSidePresses & ")."
+        gArSideNextDone = false
+        gArSidePresses = 0
       return
     gArCrumb = 13
     if not arSideActive():
@@ -1710,6 +1816,8 @@ proc arArmOnDemand() =
   gArSidePresses = 0
   gArSidePressedMs = 0'u64
   gArSideLogMs = 0'u64
+  gArSideNextDone = false
+  gArSideNextMs = 0'u64
   gArSideTr = nil
   # Snapshot the side screen's epoch too: an event from BEFORE this arming is
   # not evidence about this run.
