@@ -112,14 +112,26 @@ const
   UihSiteAccept      = 6
     ## `EFT.UI.Matchmaker.MatchMakerAcceptScreen::Show(controller)` @0x1773EF0,
     ## UNIQUE. RCX = the live screen. Its READY control is itself a NextButton.
-  UihSiteCount = 7
+  UihSiteShowInRaid  = 7
+    ## `EFT.UI.MenuScreen::ShowInRaid()` @0x1539650, UNIQUE. RCX = the live
+    ## MenuScreen. THE EXIT HALF'S RECEIVER: in a raid the scene-root
+    ## enumeration sees the LOCATION scene, not DontDestroyOnLoad where the
+    ## menu lives, so `raidexit` could not find MenuScreen by name at all
+    ## (MEASURED 2026-09-02: `step SHOW-IN-RAID found nothing within 20s`).
+    ## This fires for OUR call and for the player's own ESC.
+  UihSiteSessionEnd  = 8
+    ## `EFT.UI.SessionEnd.SessionEndUI::Awake()` @0x1726850, UNIQUE. RCX = the
+    ## live SessionEndUI. A CONSTRUCTION event -- that type declares no Show --
+    ## so it yields the RECEIVER for the results pages and is never proof that
+    ## they are populated.
+  UihSiteCount = 9
     ## Must equal `aowl_uih_site_count()`. Checked at arm time and logged as a
     ## REFUSAL if it ever drifts, rather than silently indexing past the table.
   UihMaxDispatchFaults = 3
     ## After this many faulted dispatches into one site, stop dispatching to it.
 
 ## Per-site state. All plain integers; nothing here is a managed object.
-var gUihSlot:   array[UihSiteCount, int] = [-1, -1, -1, -1, -1, -1, -1]  ## detour slot, -1 = unbound
+var gUihSlot:   array[UihSiteCount, int] = [-1, -1, -1, -1, -1, -1, -1, -1, -1]  ## detour slot, -1 = unbound
 var gUihWant:   array[UihSiteCount, bool]            ## a feature subscribed
 var gUihFires:  array[UihSiteCount, int]             ## postfix firings
 var gUihEpoch:  array[UihSiteCount, int]             ## firings with a GOOD receiver

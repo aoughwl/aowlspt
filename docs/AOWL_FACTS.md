@@ -7553,3 +7553,41 @@ after 0.5s with the client alive: the match was the client's errors log
 EFT.BotsController.UpdateByUnity ()`, Tarkov's own bot-AI exception, logged
 and caught by the game in every raid. A CRASH verdict must require the
 process gone or a Crash_* report; being fixed.
+
+## 2026-09-02: in a raid the scene-root enumeration is the LOCATION scene, so the exit half could never find MenuScreen
+
+MEASURED: with the client DEPLOYED in Woods (the entry half having worked end to
+end -- side, WOODS, offline raid with the practice toggle correctly reported as
+deactivated by the rebrand, insurance, accept READY, `raid phase = LOADING` then
+`DEPLOYED -- LATCHED on the TRUE deploy signal`, no faults), `raidexit` armed and
+then refused 20 s later: `step SHOW-IN-RAID found nothing within 20s`.
+
+`xrFindAny` walks the enumerated scene roots, and **in a raid that enumeration is
+the LOCATION scene**; `MenuScreen` lives in DontDestroyOnLoad and is not in scope
+there at all. This is the known DDOL blind spot, and it means the step could
+never have succeeded no matter how long it waited -- a search looking in the
+wrong scene does not become right with time.
+
+The fix is the one that made the entry half work: **take the receiver from an
+event.** Two more uihooks sites, both resolved offline, both UNIQUE, both a
+15-byte steal with **no relative operand at all** (strictly easier to relocate
+than sites 0/3/4):
+
+* **`EFT.UI.MenuScreen::ShowInRaid()` @`0x1539650`** (site 7) --
+  `48 89 5C 24 08 | 48 89 74 24 10 | 57 | 48 83 EC 20 | 48`. It fires for our
+  own call AND for the player's ESC, so the in-raid menu's arrival is an event
+  and its receiver is given rather than hunted.
+* **`EFT.UI.SessionEnd.SessionEndUI::Awake()` @`0x1726850`** (site 8) --
+  `48 89 5C 24 08 | 48 89 74 24 10 | 57 | 48 83 EC 30 | 80`. That type declares
+  only Awake, OnDestroy and .ctor (checked offline), so there is no ::Show to
+  prefer; it is a CONSTRUCTION event, named as one, and used ONLY to obtain the
+  receiver for the results pages -- never as proof they are populated.
+
+`raidexit` now takes the MenuScreen from a three-source ladder and LOGS WHICH
+ONE ANSWERED: site 7 (shown in raid) > site 2 (`MenuScreen::Show(5-arg)` from
+before the raid -- MenuScreen is DontDestroyOnLoad, so the pointer survives and
+`uihSelf` re-validates it) > site 1 (Awake) > the legacy scene-root search,
+which is kept only as an announced fallback. A step that has sat silent for 5 s
+now EXPLAINS itself, and the disconnect-button wait prints a census of what IS
+active under the receiver -- the last refusal was unactionable precisely because
+it said nothing for 20 s and then only said "nothing".

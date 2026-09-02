@@ -2548,6 +2548,10 @@ const
   XrDiscBtnOff = 0xC0'i32   ## MenuScreen._disconnectButton (offline fields)
   XrInGameOff  = 0x110'i32  ## MenuScreen._inGameScreenStatus (bool)
   XrStepMs     = 20000'u64  ## per-step ceiling
+  XrShowSayMs  = 5000'u64   ## how long a step may sit SILENT before it explains
+                            ## itself. A step that refuses at 20s having said
+                            ## nothing for 20s is what made the last refusal
+                            ## unactionable.
   XrLeaveMs    = 6000'u64   ## how long a LeaveButton is waited for before SKIP
   XrTotalMs    = 180000'u64 ## whole-run ceiling
   XrTickFrames = 12         ## ~0.2s between attempts
@@ -2562,6 +2566,8 @@ var gXrFaults = 0
 var gXrMenu: Il2CppPtr = nil        ## the MenuScreen we called ShowInRaid on
 var gXrLastPressed: Il2CppPtr = nil ## the NextButton just pressed (dedup)
 var gXrResults = 0
+var gXrSaidNoRecv = false           ## the "no receiver" explanation, once
+var gXrSaidNoDisc = false           ## the "disconnect still closed" line, once
 
 proc xrStepName(s: int): string =
   case s
@@ -2605,6 +2611,58 @@ proc xrFindAny(name: string): Il2CppPtr =
   if found.len > 0:
     result = found[0]
 
+proc xrMenuFromEvent(via: var string): Il2CppPtr =
+  ## The live MenuScreen COMPONENT, from a show event rather than from a search.
+  ##
+  ## THIS IS THE ENTRY HALF'S FIX APPLIED TO THE EXIT HALF: take the receiver
+  ## the game handed us. MEASURED 2026-09-02, with the client DEPLOYED in
+  ## Woods, `raidexit` refused after 20 s with `step SHOW-IN-RAID found
+  ## nothing` -- because `xrFindAny` walks the ENUMERATED SCENE ROOTS, and in a
+  ## raid that enumeration is the LOCATION scene. The menu lives in
+  ## DontDestroyOnLoad and is not in scope there at all. No amount of waiting
+  ## fixes a search that is looking in the wrong scene.
+  ##
+  ## THREE SOURCES, in order of how directly each answers "the in-raid menu is
+  ## up", and the caller LOGS WHICH ONE ANSWERED so a run can never quietly
+  ## rest on the weakest:
+  ##   site 7  MenuScreen::ShowInRaid  -- the in-raid menu was SHOWN, by us or
+  ##                                      by the player's own ESC. Strongest.
+  ##   site 2  MenuScreen::Show(5-arg) -- the menu from BEFORE the raid.
+  ##                                      MenuScreen is DontDestroyOnLoad so
+  ##                                      the pointer survives; `uihSelf`
+  ##                                      re-validates it and returns nil for a
+  ##                                      destroyed screen rather than a corpse
+  ##                                      (fact #182).
+  ##   site 1  MenuScreen::Awake       -- construction only. Weakest, last.
+  result = nil
+  via = ""
+  var self = uihSelf(UihSiteShowInRaid)
+  if self != nil:
+    via = "uihooks site 7 (MenuScreen::ShowInRaid -- the in-raid menu was shown)"
+    return self
+  self = uihSelf(UihSiteMenuShow)
+  if self != nil:
+    via = "uihooks site 2 (MenuScreen::Show(5-arg) from before the raid; " &
+          "MenuScreen is DontDestroyOnLoad and the pointer was re-validated)"
+    return self
+  self = uihSelf(UihSiteMenuScreen)
+  if self != nil:
+    via = "uihooks site 1 (MenuScreen::Awake -- a CONSTRUCTION event, the " &
+          "weakest of the three)"
+    return self
+
+proc xrCensus(root: Il2CppPtr): string =
+  ## What IS active under a receiver, in the entry half's census style, so that
+  ## a stall here is evidence rather than a shrug.
+  result = ""
+  if root == nil:
+    return " (no receiver to look under)"
+  var count = 0
+  var names = ""
+  arActiveCensus(root, 3, count, names)
+  result = " ACTIVE under the receiver (depth<=3, " & $count & "): " &
+           (if names.len > 0: names else: "<none>")
+
 proc xrTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_xr_tick_body", cdecl.} =
   ## At most ONE discovery + ONE press per call, so the machine self-paces.
   result = cast[Il2CppPtr](1)
@@ -2620,16 +2678,32 @@ proc xrTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_xr_tick_body", cdecl.}
     return
 
   if gXrStep == XrShow:
-    let ms = xrFindAny("MenuScreen")
-    if ms == nil: return          # keep looking; the step timeout bounds this
-    var comp: Il2CppPtr = nil
-    var w = ""
-    if not iVisComponent(ms, "MenuScreen", comp, w) or comp == nil:
-      # The GameObject named MenuScreen exists but carries no MenuScreen
-      # component -- say that rather than calling ShowInRaid on a Transform.
-      xrFail("a GameObject named MenuScreen was found but it has no " &
-             "EFT.UI.MenuScreen component (" & w & ")")
-      return
+    # THE RECEIVER, FROM AN EVENT. The scene-root search is kept only as an
+    # announced fallback: in a raid it cannot see DontDestroyOnLoad at all.
+    var via = ""
+    var comp = xrMenuFromEvent(via)
+    if comp == nil:
+      let ms = xrFindAny("MenuScreen")
+      if ms == nil:
+        if now - gXrStepT0 > XrShowSayMs and not gXrSaidNoRecv:
+          gXrSaidNoRecv = true
+          warn "raidExit: no MenuScreen receiver from ANY show event (site 7 " &
+               "ShowInRaid, site 2 Show(5-arg), site 1 Awake all empty), and " &
+               "the scene-root search found nothing either -- which is " &
+               "EXPECTED in a raid, where the enumerated roots are the " &
+               "LOCATION scene and the menu lives in DontDestroyOnLoad. Check " &
+               "the `uihooks:` lines: if sites 1/2/7 did not BIND, the exit " &
+               "half has no way to reach the menu at all."
+        return        # keep looking; the step timeout bounds this
+      var w = ""
+      if not iVisComponent(ms, "MenuScreen", comp, w) or comp == nil:
+        # The GameObject named MenuScreen exists but carries no MenuScreen
+        # component -- say that rather than calling ShowInRaid on a Transform.
+        xrFail("a GameObject named MenuScreen was found but it has no " &
+               "EFT.UI.MenuScreen component (" & w & ")")
+        return
+      via = "the LEGACY scene-root search (no show-event receiver this " &
+            "session -- the weaker path, and announced as such)"
     if not duOk(comp, XrDiscBtnOff + 8'i32):
       xrFail("the MenuScreen component is not readable to +0x" &
              iHexPad(uint64(XrDiscBtnOff), 3))
@@ -2647,7 +2721,8 @@ proc xrTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_xr_tick_body", cdecl.}
     iMark("raidExit: MenuScreen::ShowInRaid", comp)
     discard cInspUP(fn, comp, nil)
     okLog "raidExit: called MenuScreen::ShowInRaid on " & iPtr(comp) &
-          " -- waiting for _disconnectButton to become activeInHierarchy " &
+          ", receiver via " & via & " -- waiting for _disconnectButton@+0x" &
+          iHexPad(uint64(XrDiscBtnOff), 3) & " to become activeInHierarchy " &
           "(a READBACK, not an assumption)"
     xrGoto(XrDisconnect)
     return
@@ -2663,8 +2738,14 @@ proc xrTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_xr_tick_body", cdecl.}
     if not ok:
       return
     if not act:
-      return                      # STILL CLOSED. Pressing it now would report
-                                  # success and do nothing (fact #72).
+      # STILL CLOSED. Pressing it now would report success and do nothing
+      # (fact #72). Say so ONCE, with a census, so a stall here is evidence.
+      if now - gXrStepT0 > XrShowSayMs and not gXrSaidNoDisc:
+        gXrSaidNoDisc = true
+        info "raidExit: the MenuScreen _disconnectButton exists but is NOT " &
+             "activeInHierarchy yet, so nothing was pressed." &
+             xrCensus(iToTransform(gXrMenu))
+      return
     if not arIsPressable(btn, "DefaultUIButton"):
       return
     if not arPress(btn, "DefaultUIButton"):
@@ -2694,7 +2775,23 @@ proc xrTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_xr_tick_body", cdecl.}
   if gXrStep == XrResults:
     # The results NextButton is REBUILT per page, so `exclude` is what stops
     # this pressing one dead pointer forever and calling it progress.
-    let nb = arFindActiveAcross("Session End UI", "NextButton", gXrLastPressed)
+    # THE RECEIVER FIRST, the root NAME second. `SessionEndUI::Awake` (site 8)
+    # hands us the results UI itself; `Session End UI` is a scene-root name and
+    # is only a fallback, for the same reason the entry half stopped hunting
+    # screens by name.
+    var nb: Il2CppPtr = nil
+    let seSelf = uihSelf(UihSiteSessionEnd)
+    if seSelf != nil:
+      let seTr = iToTransform(seSelf)
+      if seTr != nil and duOk(seTr, 0x20'i32):
+        var seSeen = 0
+        var seNames = ""
+        nb = arFindActiveNamedBFS(seTr, "NextButton", ArSideNextDepth,
+                                  ArMaxSideNext, seSeen, seNames)
+        if nb != nil and nb == gXrLastPressed:
+          nb = nil                # the same object as last time: not progress
+    if nb == nil:
+      nb = arFindActiveAcross("Session End UI", "NextButton", gXrLastPressed)
     if nb == nil:
       # No further page. Whether that means "finished" is decided by VERIFY,
       # which reads the tree, not by this absence.
@@ -2740,6 +2837,8 @@ proc xrArmOnDemand() =
   gXrMenu = nil
   gXrLastPressed = nil
   gXrResults = 0
+  gXrSaidNoRecv = false
+  gXrSaidNoDisc = false
   xrGoto(XrShow)
   gInspExitAns = "ARMED, step SHOW-IN-RAID"
   okLog "raidExit: ARMED ON DEMAND (inspector `raidexit`) -- SHOW-IN-RAID -> " &
@@ -2786,6 +2885,14 @@ proc arWantShowHook() =
     let ws = arScrSite(wrow)
     if ws >= 0: uihWant(ws)
     wrow = wrow + 1
+  # THE EXIT HALF. `raidexit` is an on-demand verb, so these are wanted
+  # whenever the inspector is on as well as when autoraid is: a site nobody
+  # wanted is never patched, and an unpatched site puts the exit half back to
+  # searching DontDestroyOnLoad from inside a raid, which cannot work.
+  uihWant(UihSiteShowInRaid)
+  uihWant(UihSiteSessionEnd)
+  uihWant(UihSiteMenuShow)
+  uihWant(UihSiteMenuScreen)
 
 proc arShowHookVerdict() =
   ## Read back whether it actually BOUND, after `uihArm`. Announced either way:
@@ -2807,6 +2914,25 @@ proc arShowHookVerdict() =
              "machine and the flow will stall there. The reason is in the " &
              "`uihooks:` lines above."
     vrow = vrow + 1
+  if uihBound(UihSiteShowInRaid):
+    okLog "raidExit: the in-raid menu's show event is LIVE -- " &
+          "MenuScreen::ShowInRaid @0x1539650 (uihooks site 7) is bound, so " &
+          "the exit half takes the MenuScreen from the event instead of " &
+          "searching scene roots that, during a raid, do not include " &
+          "DontDestroyOnLoad."
+  else:
+    warn "raidExit: uihooks site 7 (MenuScreen::ShowInRaid) did NOT bind, so " &
+         "the exit half falls back to the scene-root search -- which MEASURED " &
+         "2026-09-02 finds nothing at all in a raid. Expect SHOW-IN-RAID to " &
+         "refuse. The reason is in the `uihooks:` lines above."
+  if uihBound(UihSiteSessionEnd):
+    okLog "raidExit: the session-end UI's arrival is LIVE (uihooks site 8, " &
+          "SessionEndUI::Awake @0x1726850) -- a CONSTRUCTION event, used only " &
+          "to obtain the receiver for the results pages, never as proof that " &
+          "they are populated."
+  else:
+    warn "raidExit: uihooks site 8 (SessionEndUI::Awake) did NOT bind; the " &
+         "results pages fall back to the `Session End UI` scene-root name."
   if uihBound(UihSiteLocation):
     okLog "autoRaid: the LOCATION list's show event is LIVE -- " &
           "MatchMakerSelectionLocationScreen::Show @0x178ACB0 (uihooks site " &

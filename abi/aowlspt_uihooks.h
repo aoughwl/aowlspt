@@ -62,6 +62,8 @@
 #define AOWL_UIH_SITE_LOCATION     4
 #define AOWL_UIH_SITE_INSURANCE    5
 #define AOWL_UIH_SITE_ACCEPT       6
+#define AOWL_UIH_SITE_SHOW_IN_RAID 7
+#define AOWL_UIH_SITE_SESSION_END  8
 
 /* Why the last `aowl_uih_site_at` returned NULL. A refusal must name itself;
  * "returned NULL" is not a diagnosis (CLAUDE.md 6). */
@@ -304,6 +306,48 @@ static const AowlUihSite aowl_uih_sites[] = {
     { "EFT.UI.Matchmaker.MatchMakerAcceptScreen::Show", 0x1773EF0u,
       { 0x48,0x89,0x5C,0x24,0x08, 0x57, 0x48,0x83,0xEC,0x30,
         0x80,0x3D,0x51,0xA7,0x94,0x05 }, 16, 1 },
+
+    /* ---- THE EXIT HALF. Appended, like everything above. ----
+     *
+     * [7] EFT.UI.MenuScreen::ShowInRaid()
+     *   RVA 0x1539650, UNIQUE (owners=1), section il2cpp, arity 0,
+     *   RCX=this(MenuScreen), RDX=MethodInfo*.
+     *   48 89 5C 24 08 | 48 89 74 24 10 | 57 | 48 83 EC 20 | 48
+     *   mov [rsp+8],rbx ; mov [rsp+0x10],rsi ; push rdi ; sub rsp,0x20
+     *   The first instruction boundary at or past AOWL_JMP_SIZE (14) is 15, and
+     *   those 15 bytes contain NO relative operand at all -- not even a
+     *   RIP-relative displacement -- so this is a STRICTLY easier relocation
+     *   than sites [0]/[3]/[4], the same class as [2].
+     *
+     *   WHY IT IS A SITE AT ALL, given that raidexit CALLS this method itself:
+     *   because the receiver is the thing that is hard to get. MEASURED
+     *   2026-09-02: with the client DEPLOYED in Woods, `raidexit` refused after
+     *   20 s -- `step SHOW-IN-RAID found nothing` -- because it looks for a
+     *   GameObject named `MenuScreen` by walking the enumerated scene roots,
+     *   and IN A RAID that enumeration sees the LOCATION scene, not
+     *   DontDestroyOnLoad, where the menu lives. A POSTFIX here hands us the
+     *   MenuScreen in RCX whenever the menu is shown in raid -- including when
+     *   the PLAYER opens it with ESC -- so the receiver is given, not hunted.
+     *
+     * [8] EFT.UI.SessionEnd.SessionEndUI::Awake()
+     *   RVA 0x1726850, UNIQUE (owners=1), section il2cpp, arity 0.
+     *   48 89 5C 24 08 | 48 89 74 24 10 | 57 | 48 83 EC 30 | 80
+     *   Same 15-byte steal with no relative operand.
+     *
+     *   THIS ONE IS A CONSTRUCTION EVENT AND IS NAMED AS ONE. `SessionEndUI`
+     *   declares only Awake, OnDestroy and .ctor (checked offline), so there is
+     *   no ::Show to prefer -- but the object is created per session end, so
+     *   its Awake IS its arrival in practice. The honest limit is the same as
+     *   site [1]'s: a postfix here proves the body ran, NOT that the results
+     *   pages are populated. It is used to OBTAIN THE RECEIVER, never as proof
+     *   that anything is ready. */
+    { "EFT.UI.MenuScreen::ShowInRaid", 0x1539650u,
+      { 0x48,0x89,0x5C,0x24,0x08, 0x48,0x89,0x74,0x24,0x10,
+        0x57, 0x48,0x83,0xEC,0x20, 0x48 }, 16, 1 },
+
+    { "EFT.UI.SessionEnd.SessionEndUI::Awake", 0x1726850u,
+      { 0x48,0x89,0x5C,0x24,0x08, 0x48,0x89,0x74,0x24,0x10,
+        0x57, 0x48,0x83,0xEC,0x30, 0x80 }, 16, 1 },
 };
 
 #define AOWL_UIH_SITE_COUNT \
