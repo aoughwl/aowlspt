@@ -94,14 +94,20 @@ const
     ## `modload.nim` uses it as the ORDERING fact that gates the deferred mod
     ## release -- see the header entry for the honest limit (a postfix on it
     ## means the body ran, NOT that the menu is fully populated).
-  UihSiteCount = 3
+  UihSiteSideSelect  = 3
+    ## `EFT.UI.Matchmaker.MatchMakerSideSelectionScreen::Show(controller)`
+    ## @0x1790180, UNIQUE. RCX = the live screen -- the PMC/SCAV chooser that
+    ## the main-menu PLAY button leads to (MEASURED 2026-09-02; the screen
+    ## after PLAY is this one, NOT CharacterSelectionScreen). A SHOW event, not
+    ## a construction event. `autoraid.nim` reads its epoch and its receiver.
+  UihSiteCount = 4
     ## Must equal `aowl_uih_site_count()`. Checked at arm time and logged as a
     ## REFUSAL if it ever drifts, rather than silently indexing past the table.
   UihMaxDispatchFaults = 3
     ## After this many faulted dispatches into one site, stop dispatching to it.
 
 ## Per-site state. All plain integers; nothing here is a managed object.
-var gUihSlot:   array[UihSiteCount, int] = [-1, -1, -1]  ## detour slot, -1 = unbound
+var gUihSlot:   array[UihSiteCount, int] = [-1, -1, -1, -1]  ## detour slot, -1 = unbound
 var gUihWant:   array[UihSiteCount, bool]            ## a feature subscribed
 var gUihFires:  array[UihSiteCount, int]             ## postfix firings
 var gUihEpoch:  array[UihSiteCount, int]             ## firings with a GOOD receiver
@@ -114,6 +120,17 @@ var gUihArming = -1        ## which site `attachDrain` is currently binding
 var gUihArmed = false      ## `uihArm` has run
 var gUihThread = 0         ## thread id of the FIRST firing, for the log
 var gUihFirstLogged = false
+
+proc uihSiteMenuShowIdx(): int =
+  ## `UihSiteMenuShow` as a PROC, for callers included BEFORE this file.
+  ##
+  ## `modstab.nim` is included at 6757 and this file at 6765, and nimony
+  ## forward-resolves PROCS across an include boundary but not consts or
+  ## variables -- so the bare constant is invisible there while this call is
+  ## not. Duplicating the number in modstab would work today and drift the
+  ## first time a site is inserted above it, which is fact #187 in a different
+  ## costume.
+  UihSiteMenuShow
 
 proc uihValidSite(site: int): bool =
   site >= 0 and site < UihSiteCount

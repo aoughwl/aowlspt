@@ -4799,14 +4799,76 @@ proc modsTabTick() =
                   "survived. Nothing is left half-built: the panel and the " &
                   "subtabs are only recorded once every clone exists")
 
+## THE POLLING MIGRATION (docs/UIHOOKS.md site 2).
+##
+## USER DIRECTIVE, verbatim: the singleplayer rebrand, the version rebrand and
+## the rest must NOT constantly poll for a UI element to hide it.
+##
+## WHAT THEY USED TO DO, measured tonight:
+##   hide seasons      -- re-checked on a throttle whose steady cadence was
+##                        EVERY FRAME once the button was known;
+##   hide mode button  -- 'GIVING UP after 30 post-warm-up walks and 303
+##                        bounded walks';
+##   version brand     -- a 120-frame clobber re-check, forever.
+##
+## All three wanted the same event: the menu was (re)built. That event now
+## exists -- `EFT.UI.MenuScreen::Show` (5-arg) @0x15387A0, uihooks site 2 --
+## and its postfix hands us the live MenuScreen as the receiver. So there is
+## nothing to hunt FOR and nothing to poll: on each epoch we do ONE bounded
+## pass from a receiver we were given.
+##
+## THE PER-FRAME COST IS NOW ONE INTEGER COMPARE. `uihEpoch` is a monotonic
+## counter of good show events; a rider that finds it unchanged returns
+## immediately. The scene enumeration (`seasonsFindMenuScreen`) is not called
+## at all any more -- that walk is what cost 1.08 s/frame when it went wrong.
+var gSeasonsEpochSeen = -1
+var gVerEpochSeen = -1
+var gUihMissingSaid = false
+
+proc modsUihMenuReady(feature: string; epoch: var int; self: var Il2CppPtr): bool =
+  ## True EXACTLY ONCE per menu epoch, with `self` set to the live MenuScreen.
+  ##
+  ## Declines loudly and permanently if site 2 never bound: a feature that
+  ## silently falls back to polling would defeat the whole point of this
+  ## change, and one that silently does nothing is worse.
+  result = false
+  self = nil
+  if not uihBound(uihSiteMenuShowIdx()):
+    if not gUihMissingSaid:
+      gUihMissingSaid = true
+      warn "uihooks site 2 (MenuScreen::Show) is NOT BOUND, so the " &
+           "event-driven menu features have no event. hide-seasons, " &
+           "hide-mode-button and the version brand DECLINE rather than fall " &
+           "back to per-frame walking -- polling for a UI element is exactly " &
+           "what this replaced. Nothing is hidden and nothing is rebranded."
+    return
+  let ep = uihEpoch(uihSiteMenuShowIdx())
+  if ep == epoch:
+    return                      # the whole steady-state cost: one compare
+  epoch = ep
+  if ep <= 0:
+    return                      # no menu has been shown yet
+  let m = uihSelf(uihSiteMenuShowIdx())
+  if m == nil:
+    warn feature & ": menu epoch " & $ep & " fired but its receiver did not " &
+         "survive revalidation (the screen was destroyed between the postfix " &
+         "and this frame). Nothing was done for this epoch."
+    return
+  self = m
+  result = true
 proc verBrandTick() =
-  ## Throttled entry for the version brand. The throttle lives HERE and nowhere
-  ## else -- see `verBrandTickBody`.
+  ## EVENT-DRIVEN entry for the version brand.
+  ##
+  ## THE 120-FRAME CLOBBER RE-CHECK IS GONE. It ran forever, and its own log
+  ## said what it was doing: 'the label was CLOBBERED back ... re-applied
+  ## (2 of at most 7)'. The clobber does not happen at a random moment -- it
+  ## happens when the menu is rebuilt, which is precisely uihooks site 2. So
+  ## the apply and the re-apply are both driven by the epoch, and the apply
+  ## CEILING is kept exactly as it was: it now counts menu rebuilds instead of
+  ## 120-frame windows, which is the thing it was always trying to count.
   if not gVerOn or gVerGaveUp:
     return
   if gVerWalkFaults >= VerBrandMaxWalkFaults:
-    # A CEILING REACHED SILENTLY IS THE WORST THING THIS FILE CAN DO. This used
-    # to just `return` forever with nothing in the log after the third fault.
     gVerGaveUp = true
     warn "version brand: REFUSING further attempts -- the label walk faulted " &
          $gVerWalkFaults & " times (the ceiling). LAST REASON: " & gVerWhy &
@@ -4815,86 +4877,68 @@ proc verBrandTick() =
   if gVerApplies >= VerBrandMaxApplies:
     gVerGaveUp = true
     warn "version brand: STOPPING -- the label was written " & $gVerApplies &
-         " times (the apply ceiling) and kept being overwritten. Something " &
-         "else owns this label's text; it is left as the game made it."
+         " times (the apply ceiling) across " & $gVerEpochSeen & " menu " &
+         "epoch(s) and kept being overwritten. Something else owns this " &
+         "label's text; it is left as the game made it."
+    return
+  var menu: Il2CppPtr = nil
+  if not modsUihMenuReady("version brand", gVerEpochSeen, menu):
     return
   if gVerT0 == 0:
-    # THE FIRST FRAME THE RIDER CHAIN GAVE US. Recorded, and logged, because
-    # every other timestamp is relative to it and because this moment is
-    # itself a candidate cause: nothing here can run before
-    # `EFT.UI.PreloaderUI::Update` first fires.
     gVerT0 = cNowMs()
-    okLog "version brand: TIMING -- first tick; the rider chain on " &
-          "EFT.UI.PreloaderUI::Update has started dispatching. The label " &
-          "hunt begins on THIS frame, not 120 frames from now."
-  # ADAPTIVE, and every branch is bounded:
-  #   * not resolved yet -> every `VerBrandHuntFrames` frames, the closing of
-  #     the "stock version string visible for seconds" window;
-  #   * resolved         -> every `VerBrandEveryFrames` frames, a clobber
-  #     re-check that is one guarded pointer check and one string read;
-  #   * pass overran the slice -> the steady cadence, and it said so.
-  let hunting = (gVerTmp == nil) and not gVerSlow
-  let every = (if hunting: VerBrandHuntFrames else: VerBrandEveryFrames)
-  inc gVerFrames
-  if gVerFrames < every:
-    return
-  gVerFrames = 0
-  if gVerTmp == nil and gVerT0 != 0 and cNowMs() - gVerT0 > VerBrandHuntMs:
-    # THE GIVE-UP, in wall clock. It says how long it hunted and why it
-    # stopped, so "the label is stock" is never a silent outcome.
-    gVerGaveUp = true
-    warn "version brand: GIVING UP after " & $int(VerBrandHuntMs div 1000) &
-         " s and " & $gVerNotReady & " walk attempts -- " & gVerWhy &
-         ". The label is left stock. This is a REFUSAL, not a success."
-    return
   gModsBranch = 2
   if cModsGuarded(cast[Il2CppPtr](0)) == nil:
     inc gVerWalkFaults
-    # A REAL FAULT ENDS THE FAST HUNT. Otherwise a walk that faults every pass
-    # would spend the whole 40-fault budget in ~80 frames -- the same
-    # "gave up before its target existed" failure the budget split was made to
-    # prevent, just moved.
     gVerSlow = true
-    # NAME THE HOP. A caught fault with no location is precisely what costs
-    # cycles here, and the breadcrumb is already being written for us.
     if gVerWalkFaults <= 3:
-      warn "version brand: the label walk FAULTED and was caught; the game " &
+      warn "version brand: the label pass FAULTED and was caught; the game " &
            "survived. LAST HOP: " & readCString(cInspCrumb()) & "  at " &
-           iPtr(cInspCrumbPtr()) & ". Expected before the menu exists; it " &
-           "retries (" & $gVerWalkFaults & " of " & $VerBrandMaxWalkFaults & ")"
-
+           iPtr(cInspCrumbPtr()) & " (" & $gVerWalkFaults & " of " &
+           $VerBrandMaxWalkFaults & ")"
+    return
+  # ONE ACTION LINE PER EPOCH.
+  okLog "version brand: menu epoch " & $gVerEpochSeen & " -- one bounded " &
+        "pass. label=" & (if gVerTmp != nil: "RESOLVED" else: "not found") &
+        ", applies so far=" & $gVerApplies & " of at most " &
+        $VerBrandMaxApplies & ". The 120-frame clobber re-check is gone: a " &
+        "clobber happens on a menu rebuild, and that is this event."
 proc seasonsTick() =
-  ## Throttled entry for the seasons-banner hider AND the beta notice, which
-  ## share the MenuScreen resolve and therefore share this throttle.
+  ## EVENT-DRIVEN entry for the seasons-banner hider, the mode-button hider
+  ## and the beta notice -- all three share the MenuScreen and therefore share
+  ## this one epoch.
+  ##
+  ## THE THROTTLE IS GONE. It used to run EVERY FRAME once the button was
+  ## known, every 10 frames once the menu was, and a full scene enumeration
+  ## otherwise. Now: one integer compare per frame, and one bounded pass per
+  ## menu (re)build, from a receiver the postfix handed us. Nothing hunts.
   if not (gSeasonsOn or gBetaNoticeOn) or gSeasonsFaults >= SeasonsMaxFaults:
     return
-  # THE THROTTLE IS ADAPTIVE, and it lives here because every throttle in this
-  # file lives on the side that decides whether to enter the guard.
-  #   * button known  -> EVERY FRAME. The body's fast path is one guarded
-  #     pointer check and one `activeSelf` ICALL, with no allocation, and it is
-  #     what closes the "banner visible for a second" window.
-  #   * menu known    -> every 10 frames: a name walk over MenuScreen's
-  #     children, which allocates a string per child.
-  #   * nothing known -> the full throttle: the root enumeration allocates.
-  inc gSeasonsFrames
-  let every = (if gSeasonsBtnGo != nil: 1
-               elif gSeasonsMenu != nil: 10
-               else: SeasonsEveryFrames)
-  if gSeasonsFrames < every:
+  var menu: Il2CppPtr = nil
+  if not modsUihMenuReady("hide seasons", gSeasonsEpochSeen, menu):
     return
-  gSeasonsFrames = 0
+  # THE RECEIVER REPLACES THE WALK. `seasonsFindMenuScreen` is no longer
+  # called: site 2's RCX IS the MenuScreen, already revalidated by `uihSelf`.
+  gSeasonsMenu = menu
+  gSeasonsBtnGo = nil        # a rebuild invalidates the cached button
   gModsBranch = 3
   if cModsGuarded(cast[Il2CppPtr](0)) == nil:
     inc gSeasonsFaults
-    warn "hide seasons: the MenuScreen walk FAULTED and was caught; the game " &
+    warn "hide seasons: the MenuScreen pass FAULTED and was caught; the game " &
          "survived. LAST HOP: " & readCString(cInspCrumb()) & "  at " &
          iPtr(cInspCrumbPtr()) & " (fault " & $gSeasonsFaults & " of " &
-         $SeasonsMaxFaults & "). Nothing was hidden on this pass."
+         $SeasonsMaxFaults & "). Nothing was hidden on this epoch."
     if gSeasonsFaults >= SeasonsMaxFaults:
       gSeasonsOn = false
       warn "hide seasons: fault ceiling reached; the feature is OFF for this " &
            "session and the banner is left exactly as the game made it."
-
+    return
+  # ONE ACTION LINE PER EPOCH. Names what was hidden and what was not found,
+  # so a run can be checked as 'actions <= epochs' -- see tools/uihooks_check.py.
+  okLog "hide seasons: menu epoch " & $gSeasonsEpochSeen & " -- one bounded " &
+        "pass from the MenuScreen the Show postfix handed us. seasons " &
+        "banner hides so far=" & $gSeasonsHidden & ", mode-button hides so " &
+        "far=" & $gModeBtnHidden &
+        ". No walk, no throttle, no per-frame polling."
 proc modsRidersTick(regs: Il2CppPtr) =
   ## Everything in this file that wants a frame, behind ONE call the rider
   ## chain in `aowlhost.nim` makes. Each entry re-arms the guard separately --
