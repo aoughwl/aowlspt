@@ -6120,3 +6120,20 @@ uihooks had merely changed which failure surfaced first. Lesson for bisects:
 "removing X changes the error" is not "X is the cause" unless the tree then
 BUILDS; classify OK separately from ORDINARY-errors and prefer the experiment
 that produces an artifact. Rule: never `export <module>` in this codebase.
+
+## 2026-09-01 late: the launcher's real mod build re-exposed the character-select crash
+
+MEASURED, single-variable: same green host build (cb9a816 tree), config with
+`modSettingsRender on`. Boot A with the launcher's `--modbuild` step: the
+mods folder was READY at ~10s, mods released at ~18s, and the client died
+cleanly at ~35s host time (client log ends at `Session mode: Regular`, no
+crash folder, no popup) with the host log's last lines being
+`mod settings render: schema step ('aowl.sain')` and then "the whole fetch
+cycle has held the shared sync slot for 6016ms, over the 6000ms ceiling".
+Boot B, identical except no `--modbuild` (mods released ~25s, after the
+profile Submit): settled at MENU for 3+ minutes. The simulator's late READY
+had been hiding the crash; the real build's early READY lands the per-mod
+schema fetch exactly in the character-select window that modsindex.nim
+already documents as the crasher. Fix applied: `modSettingsRender off` in
+the deployed config (it is default OFF in code; the deployed file had it ON).
+The MODS tab's data comes from the lazy single-request `modsindex` path.
