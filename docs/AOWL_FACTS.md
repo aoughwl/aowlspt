@@ -5960,3 +5960,26 @@ DLL -- treat as leaked; nothing here carries a key.
   that cannot fire. Route: `BotOwner::get_AimingManager @0x80E9B0` ->
   `AimingManager::get_CurrentAiming @0x23D5B60` -> `Aiming::get_IsReady
   @0x1AD48C0`. Blocker #24 (ToESain) is retired-by-rewrite, not fixed.
+
+## In a raid, `roots` returns the LOCATION scene, and there is no "Game Scene" root
+
+MEASURED 2026-09-01 inside a Woods raid (`raid phase = DEPLOYED` latched):
+`roots` listed `---Woods_levelsettings---`, `AICorePointHolder`, `AICoversData`,
+`Location Scene`, `woods_terrain`, ... -- the location scene -- and NOT the
+DontDestroyOnLoad scene that holds `Common UI` / `Menu UI` / `Preloader UI`
+(which is what it lists at the main menu). `tools/ui.py in_raid()` looked for a
+root named `Game Scene`; none exists here, so it returned None twice for a
+client demonstrably standing in the raid, and `exitraid.py` refused to act.
+
+`in_raid()` now consults the host's published phase FIRST (`host_phase()`
+reads the newest `raid phase = X` from the last 256KB of the host log):
+DEPLOYED/LOADING -> True, MENU -> False. Verified live: `host_phase ->
+DEPLOYED`, `in_raid -> True`. The roots-based check remains as the fallback.
+`exitraid` then fails one layer down -- "no `Common UI` scene root" -- because
+`roots` is scene-scoped by the anchor it consults; the inspector needs to
+enumerate every loaded scene plus DDOL (reported to the inspector agent).
+
+`raid phase = DEPLOYED` is latched on `SpatialAudioSystem::AfterGameStarted`
+inside `EFT.GameWorld::OnGameStarted` -- the START of the deploy countdown.
+The ESP's first draw shares that timestamp, which is why it is visible before
+the player is released; "standing in the raid" is a later signal.

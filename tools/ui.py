@@ -1018,6 +1018,30 @@ def raid_started(baseline, timeout=180.0, poll=2.0):
                       timeout=timeout, poll=poll)
 
 
+def host_phase(path=None, tail_bytes=262144):
+    """The newest `raid phase = X` the host published, or None.
+
+    Reads only the last `tail_bytes` of the host log (it is multi-MB and a
+    measured token bomb; the phase line repeats every 5s so the tail always
+    holds one when the host is alive). None means the host has not published
+    a phase in that window -- an honest "not known", never "menu".
+    """
+    import os as _os
+    p = path or _os.path.join(
+        _os.environ.get("AOWLSPT_LIVE", r"D:\Aowlspt\aowlspt"), "aowlspt-host.log")
+    try:
+        size = _os.path.getsize(p)
+        with open(p, "rb") as f:
+            f.seek(max(0, size - tail_bytes))
+            data = f.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    last = None
+    for m in re.finditer(r"raid phase = ([A-Z]+)", data):
+        last = m.group(1)
+    return last
+
+
 def in_raid(root="Menu UI"):
     """True / False / None -- and None is a REAL, reportable answer.
 
@@ -1046,6 +1070,20 @@ def in_raid(root="Menu UI"):
     populates it never bound -- so callers must print "unknown", never
     "false".
     """
+    # FIRST: the host's own published phase. `raidphase.nim` latches
+    # `raid phase = DEPLOYED` on the TRUE deploy signal
+    # (SpatialAudioSystem::AfterGameStarted inside GameWorld::OnGameStarted)
+    # and re-publishes every 5s, off the game thread, in the host log. That is
+    # positive evidence of a raid that costs no inspector round trip and
+    # cannot stall a loading main thread. Measured 2026-09-01: the roots-based
+    # check below returned None TWICE for a client demonstrably standing in a
+    # Woods raid, so exitraid refused to act -- "I could not look" for an
+    # answer the host was printing every 5 seconds.
+    ph = host_phase()
+    if ph in ("DEPLOYED", "LOADING"):
+        return True
+    if ph == "MENU":
+        return False
     try:
         rs = roots()
     except (UiError, Timeout):
