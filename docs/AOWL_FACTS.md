@@ -7505,3 +7505,18 @@ readable. Recorded honestly in the code: this is a FLOOR, not proof that the
 value is a UnityEvent. `iIsKnownKlass` cannot be used as the positive test,
 because it only knows klasses this session has already seen and would refuse
 every first press.
+
+## 2026-09-02 08:13: THE AUTONOMOUS RAID ENTRY WORKS END TO END
+
+MEASURED (host build 4,737,536): inspector `raid Woods` at [0:01:14] ->
+PRE-MENU/PLAY -> site 3 SIDE (PMC toggle, own NEXT) -> site 4 SELECT-MAP
+(WOODS tile, own NEXT) -> site 0 offline-raid screen (own NEXT; the practice
+toggle is deactivated by the rebrand, reported as such) -> site 5 insurance
+(own NEXT) -> site 6 accept (READY is its NextButton) -> hands-off at
+[0:01:24.9] -> `raid phase = LOADING` -> client `LocationLoaded 47s,
+GameCreated 49s, PlayerSpawnEvent 52s, GameStarted 88s` -> `natesp: raid
+phase = DEPLOYED -- LATCHED on the TRUE deploy signal
+(SpatialAudioSystem::AfterGameStarted)` at [0:03:19]. Ten seconds of UI
+driving, every transition an event with a readback, then the game's own
+load. run.py `--attach --until-phase DEPLOYED` REACHED. SAIN ran at drive
+level 0 (observer, by config) this raid; set to 2 for the next.
