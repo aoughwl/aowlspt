@@ -256,5 +256,105 @@ class ParseChildrenReal(unittest.TestCase):
         self.assertTrue(r['parse_ok'])
 
 
+_TOOLS = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                      '..', '..', '..', 'tools')
+sys.path.insert(0, _TOOLS)
+import inspectfixtures  # noqa: E402 -- the ONE measured corpus
+
+
+_MATCHES_RE = __import__('re').compile(r'(\d+) match\(es\)')
+
+
+class HitLinesAgainstTheMeasuredCorpus(unittest.TestCase):
+    """Replay every recorded `find` / `findtext` answer through the SHARED
+    parser and check the hit count against the host's OWN `K match(es)` line.
+
+    This is the check that could have caught the bug it was written for: the
+    old `_HIT_RE` returned [] for every findtext answer, and nothing compared
+    that [] to anything the host said. Comparing to the host's own count means
+    a parser that finds FEWER hits than were printed fails, rather than
+    quietly reporting a shorter list.
+    """
+
+    def _entries(self, verb):
+        es = [e for e in inspectfixtures.load().entries if e.verb == verb]
+        self.assertTrue(es, 'no %s fixtures loaded -- this test would pass '
+                             'vacuously on an empty corpus' % verb)
+        return es
+
+    def _check(self, verb):
+        checked_hits = 0
+        for e in self._entries(verb):
+            printed = [l for l in e.output.splitlines()
+                       if l.strip().startswith('HIT ')]
+            parsed = channel.parse_find(e.output)['hits']
+            self.assertEqual(
+                len(parsed), len(printed),
+                '%s: parsed %d of %d HIT lines the host printed'
+                % (e.eid, len(parsed), len(printed)))
+            m = _MATCHES_RE.search(e.output)
+            if m:
+                self.assertEqual(
+                    len(parsed), int(m.group(1)),
+                    '%s: host said %s match(es), parser produced %d'
+                    % (e.eid, m.group(1), len(parsed)))
+            for h in parsed:
+                self.assertTrue(h['ptr'].startswith('0x'))
+                self.assertTrue(h['name'])
+                self.assertTrue(h['var'].startswith('$f'))
+            checked_hits += len(parsed)
+        return checked_hits
+
+    def test_every_find_hit_line_parses(self):
+        # The corpus really does carry find hits; a corpus with none would
+        # make this whole class unfalsifiable.
+        self.assertGreater(self._check('find'), 0)
+
+    def test_every_findtext_hit_line_parses(self):
+        self.assertGreater(self._check('findtext'), 0)
+
+    def test_findtext_active_flag_survives_both_spellings(self):
+        act = channel.parse_find(
+            inspectfixtures.fx('findtext-clones-donor-caption'))['hits']
+        self.assertEqual(len(act), 24)
+        self.assertTrue(all(h['active'] is True for h in act))
+        self.assertEqual(act[0]['text'], 'Interface language')
+        self.assertEqual(act[0]['parent'], 'Settings Drop Down(Clone)')
+
+        inact = channel.parse_find(
+            inspectfixtures.fx('findtext-placeholder-inactive-only'))['hits']
+        self.assertEqual(len(inact), 12)
+        self.assertTrue(all(h['active'] is False for h in inact))
+
+    def test_find_hits_have_active_none_not_false(self):
+        """`find` prints no flag. None means UNKNOWN; reporting False would be
+        a fabricated measurement (and would make every find hit look
+        unpressable)."""
+        hits = channel.parse_find(
+            inspectfixtures.fx('find-toggles-strip-with-clones'))['hits']
+        self.assertEqual(len(hits), 18)
+        self.assertTrue(all(h['active'] is None for h in hits))
+        self.assertTrue(all(h['text'] is None for h in hits))
+
+    def test_echo_and_summary_lines_are_not_hits(self):
+        """NEGATIVE CONTROL. The command echo and the `visited` summary are the
+        two lines a sloppy pattern eats; a parser that scores them would report
+        hits for a walk that found none."""
+        for eid in ('findtext-clones-donor-caption', 'find-toggles-strip-with-clones'):
+            noise = "\n".join(l for l in inspectfixtures.fx(eid).splitlines()
+                              if not l.strip().startswith('HIT '))
+            self.assertIn('>', noise)
+            self.assertIn('visited', noise)
+            self.assertEqual(channel.parse_find(noise)['hits'], [], eid)
+
+    def test_a_hit_never_reaches_into_the_next_line(self):
+        """A HIT line with its `($fN)` binding stripped must not borrow the
+        NEXT line's binding -- that would invent a hit and mislabel a var."""
+        raw = ('    HIT 0x1000  name="A"  parent="P"  text="t"  activeInHierarchy=true\n'
+               '    HIT 0x2000  name="B"  parent="P"  text="t"  activeInHierarchy=true   ($f2)\n')
+        hits = channel.parse_find(raw)['hits']
+        self.assertEqual([h['ptr'] for h in hits], ['0x2000'])
+
+
 if __name__ == '__main__':
     unittest.main()

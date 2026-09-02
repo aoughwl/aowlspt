@@ -287,12 +287,42 @@ class _nolock(object):
 # typed fields are what a tool result actually returns as its PRIMARY shape.
 # ---------------------------------------------------------------------------
 
+# ONE regex for BOTH verbs' HIT lines. Measured shapes on this build
+# (tools/fixtures/inspector/find.txt, findtext.txt -- verbatim host text):
+#
+#   find:      HIT 0x000001b0e84eb060 name="Preloader UI"   ($f1)
+#   find:      HIT 0x000001b0e84e4200 name="TaskBar"  parent="Content"   ($f1)
+#   findtext:  HIT 0x00000203094ddf60  name="Text"  parent="Settings Drop
+#              Down(Clone)"  text="Interface language"  activeInHierarchy=true   ($f1)
+#   findtext:  HIT 0x0000013be6206440  name="Text"  parent="LoadingSpinner"
+#              text="Loading..."  activeInHierarchy=FALSE (unpressable)   ($f1)
+#
+# The previous pattern spelled the flag `active=` and then required `($fN)`
+# immediately after `text="..."`. The host emits `activeInHierarchy=`, so the
+# optional flag group never matched, the literal flag text sat between `text=`
+# and `($fN)`, and the WHOLE line failed -- `parse_find`/`parse_findtext` (and
+# so the MCP `inspect_findtext` tool) returned ZERO hits for every findtext
+# answer, which is a search that cannot find. Fixed 2026-09-02 against the
+# corpus; `tests/test_channel.py` now replays every recorded HIT line and
+# asserts the count against the host's own `K match(es)` line.
+#
+# Notes on the shape, each load-bearing:
+#  * `activeInHierarchy` is matched BEFORE the legacy `active` alternative and
+#    the alternation is anchored with `=`, so `active=` cannot swallow the
+#    prefix of `activeInHierarchy=`. The legacy spelling is kept because it
+#    costs nothing and older recordings use it.
+#  * the tail is `[^\n]*?` and not `\s*`: an INACTIVE hit prints
+#    `activeInHierarchy=FALSE (unpressable)   ($f1)`, so the run-up to the
+#    binding legitimately contains parentheses. `[^\n]` (not `.` under any
+#    flag) makes it impossible for one HIT to reach across a line into the
+#    NEXT line's `($fN)`.
+#  * `\bHIT` so a word ending in HIT cannot start a match.
 _HIT_RE = re.compile(
-    r'HIT\s+(?P<ptr>0x[0-9a-fA-F]+)\s+name="(?P<name>[^"]*)"'
+    r'\bHIT\s+(?P<ptr>0x[0-9a-fA-F]+)\s+name="(?P<name>[^"]*)"'
     r'(?:\s+parent="(?P<parent>[^"]*)")?'
     r'(?:\s+text="(?P<text>[^"]*)")?'
-    r'(?:\s+active=(?P<active>true|false))?'
-    r'\s*\(\$(?P<var>f\d+)\)'
+    r'(?:\s+(?:activeInHierarchy|active)=(?P<active>[Tt][Rr][Uu][Ee]|[Ff][Aa][Ll][Ss][Ee]))?'
+    r'[^\n]*?\(\$(?P<var>f\d+)\)'
 )
 
 _INACTIVE_SKIPPED_RE = re.compile(r'(?P<n>\d+)\s+inactive.*skipped', re.I)
@@ -321,10 +351,17 @@ def parse_find(raw):
     visited, resumable, parse_ok, raw}"""
     hits = []
     for m in _HIT_RE.finditer(raw):
+        a = m.group("active")
         hits.append({
             "ptr": m.group("ptr"),
             "name": m.group("name"),
             "parent": m.group("parent"),
+            "text": m.group("text"),
+            # THREE-state on purpose: True / False / None. `find` prints no
+            # flag at all, and None means "not known whether anything renders
+            # this", which is not the same as inactive. Fact #72: pressing an
+            # inactive node returns success and does nothing.
+            "active": None if a is None else a.lower() == "true",
             "var": "$" + m.group("var"),
         })
     completeness, can_trust_absence = _completeness(raw)

@@ -306,41 +306,29 @@ def trusted_walk(raw):
 
 
 # ---------------------------------------------------------------------------
-# findtext HIT lines -- parsed HERE, because channel.py's shared _HIT_RE
-# CANNOT MATCH THEM. Measured 2026-09-02.
-# ---------------------------------------------------------------------------
-# `plugins/aowlsptcode/mcp/channel.py:290` reads, after the name and optional
-# parent:  (?:\s+text="(?P<text>[^"]*)")? (?:\s+active=(true|false))?
-# \s*\(\$(?P<var>f\d+)\)
+# findtext HIT lines. Parsed by the SHARED parser in
+# `plugins/aowlsptcode/mcp/channel.py` (re-exported as `ichannel`), not by a
+# second regex here. History, because it is the reason this comment exists:
 #
-# A real findtext hit on this build is:
+# That shared `_HIT_RE` spelled the flag `active=` and required `($fN)`
+# immediately after `text="..."`, while a real findtext hit on this build is
 #
 #   HIT 0x00000203094ddf60  name="Text"  parent="Settings Drop Down(Clone)"  \
 #   text="Interface language"  activeInHierarchy=true   ($f1)
 #
-# The field is `activeInHierarchy=`, not `active=`, so that optional group does
-# not match; the regex then requires `($fN)` immediately after `text="..."`,
-# finds `activeInHierarchy=true` in the way, and the WHOLE HIT FAILS TO MATCH.
-# `parse_find`/`parse_findtext` therefore return ZERO HITS for every findtext
-# answer that carries an active flag -- i.e. every one of them. Verified:
-# ch.parse_find(<the verbatim line above>)["hits"] == [].
+# so `ch.parse_find(<that line>)["hits"] == []` -- every findtext answer, and
+# the MCP `inspect_findtext` tool with it, returned zero hits. A search that
+# cannot find. This file worked around it with a private `_FT_HIT_RE`, which
+# is the OTHER half of the bug: two parsers of one prose, free to drift.
 #
-# That is a confidently-wrong answer in a SHARED parser (the MCP
-# `inspect_findtext` tool reads the same function), and it is reported as a P0
-# rather than patched from here: channel.py is not this task's to change. This
-# local parser is deliberately narrow -- findtext hits only -- and additionally
-# keeps the field channel.py drops entirely, `activeInHierarchy`, which several
-# assertions below must have (fact #72: an inactive node is not pressable, and
-# placeholder text nothing renders is not a defect).
-_FT_HIT_RE = re.compile(
-    r'HIT\s+(?P<ptr>0x[0-9a-fA-F]+)\s+name="(?P<name>[^"]*)"'
-    r'(?:\s+parent="(?P<parent>[^"]*)")?'
-    r'(?:\s+text="(?P<text>[^"]*)")?'
-    r'(?:\s+activeInHierarchy=(?P<active>[Tt]rue|[Ff]alse|TRUE|FALSE))?'
-    # `.*?` and not `[^()]*`: an INACTIVE hit prints
-    # `activeInHierarchy=FALSE (unpressable)   ($f1)`, so the tail legitimately
-    # contains parentheses. No DOTALL, so this still cannot span lines.
-    r'.*?\(\$(?P<var>f\d+)\)')
+# Fixed 2026-09-02 in channel.py (one regex, both verbs, `activeInHierarchy`
+# kept as a three-state `active` field: True / False / None), replayed against
+# every HIT line in tools/fixtures/inspector/{find,findtext}.txt with the
+# counts asserted against the host's own `K match(es)` line. The private copy
+# is gone; the test below stays and now exercises the shared parser.
+def _ft_hit_re():
+    """The shared pattern, for tests that want to look at it directly."""
+    return ch._HIT_RE
 
 # The host's OWN positive control, printed in-band on every findtext report:
 #   predicate control: 225 node(s) carried a TextMeshProUGUI (of 1297 visited)
@@ -351,15 +339,12 @@ _FT_CONTROL_RE = re.compile(
 
 
 def findtext_hits(raw):
-    """findtext hits off HOST-PRINTED lines only, with text and active state."""
-    out = []
-    for m in _FT_HIT_RE.finditer(host_text(raw)):
-        a = m.group("active")
-        out.append({"ptr": m.group("ptr"), "name": m.group("name"),
-                    "parent": m.group("parent"), "text": m.group("text"),
-                    "active": None if a is None else a.lower() == "true",
-                    "var": "$" + m.group("var")})
-    return out
+    """findtext hits off HOST-PRINTED lines only, with text and active state.
+
+    DELEGATES to the shared parser. `host_text` still runs here: it is this
+    file's own job to strip anything that is not host-printed answer text
+    before a parser ever sees it."""
+    return ch.parse_findtext(host_text(raw))["hits"]
 
 
 def findtext_control(raw):
@@ -1627,18 +1612,29 @@ def cmd_selftest(_args):
     case("control: 0 under clones but the walk was CAPPED -> INCONCLUSIVE",
          [('findtext "Interface language"', [_no_clone_hits(FT_DONOR)])], c9)
 
-    print("\n---- parser: findtext HIT lines (channel.py's _HIT_RE cannot)")
+    print("\n---- parser: findtext HIT lines (SHARED with channel.py)")
     hits = findtext_hits(FT_DONOR)
     chan = ch.parse_find(host_text(FT_DONOR))["hits"]
+    printed = len([l for l in FT_DONOR.splitlines()
+                   if l.strip().startswith("HIT ")])
     if len(hits) != 24:
         failures.append("findtext_hits parsed %d of 24 measured HIT lines"
                         % len(hits))
+    elif len(chan) != printed:
+        # The two must AGREE, and both must agree with what the host printed.
+        # This is the assertion that failed before 2026-09-02 (chan was 0) and
+        # the reason there is one parser again rather than two.
+        failures.append("the shared channel.py parser found %d of the %d HIT "
+                        "lines the host printed -- findtext_hits delegates to "
+                        "it, so these cannot be allowed to differ"
+                        % (len(chan), printed))
     elif any(h["parent"] is None or h["active"] is None or not h["text"]
              for h in hits):
         failures.append("a parsed hit is missing parent/text/activeInHierarchy")
     else:
         print("  case ok (24 hits, all with parent + text + active; the shared "
-              "channel.py parser returns %d on the same text)" % len(chan))
+              "channel.py parser returns %d on the same %d printed HIT lines)"
+              % (len(chan), printed))
 
     # --- 11-12. PLACEHOLDER TEXT, decided on RENDERED nodes only. ----------
     def c11(rep, _rp):
