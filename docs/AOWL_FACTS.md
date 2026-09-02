@@ -6485,3 +6485,17 @@ the menu GC; every one had a report.
 
 Rule: before calling any death "clean", read the newest Crash_* report.
 run.py is being taught to print it on DIED.
+
+## 2026-09-02 01:05: the mono_class_has_parent death is build-bisected
+
+MEASURED, same config, same launcher, same mods: host build 5cff328
+(4,604,928 B: modload gate + nativetabs bind fix + inspector silence fix)
+survived 3 of 3 boots to a settled menu. Host build 8115849/1180fe4
+(4,643,328 B: + autoraid CHARACTER step, site-0 uihEpoch oracle, modeskip
+re-arm with counters, nativetabs step naming) died 2 of 2 at ~36s, both with
+the host log's last line `the main-thread drain is firing again on
+EFT.TarkovApplication::Update` and a Unity crash report of two frames
+`(GameAssembly) mono_class_has_parent` (Crash_2026-09-02_045033156,
+_045551684). The suspect is a cached game pointer from the character screen
+(answered at ~27s) dereferenced for its klass on the first drain frame after
+the menu replaced that screen. Install rolled back to 5cff328's DLL.
