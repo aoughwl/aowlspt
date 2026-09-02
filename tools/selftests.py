@@ -199,6 +199,12 @@ NOT_ITEMS = {
     "bc1.py": "mentions maptiles.py --selftest in a comment; defines none",
     "headless.py": "documents `aowlspt-backend --selftest`, a Nim binary; the "
                    "python wrapper defines no such flag (argparse rejects it)",
+    "deploylock.py": "names `--selftest` only in the list of markers.py "
+                     "options that read no artifact (so `deploylock markers "
+                     "--selftest` takes no build lock); it defines no flag of "
+                     "its own. Its `markers` mode is covered by "
+                     "test_markers_under_lock in tools/test_buildlock.py, "
+                     "which is slow and therefore not in the fast gate.",
 }
 
 
