@@ -7014,3 +7014,33 @@ screen and therefore never pressed this screen's `ScreenDefaultButtons/
 NextButton`; refusal census after 45s: `[UI][MatchMaker Side Selection
 Screen][Operation Queue Indicator]`. Three screens of the chain are now
 event-driven and proven; the side screen's own NEXT is the next step.
+
+## 2026-09-02: the fix, and a reusable nimony fact
+
+`swCloneRow` (settingspages.nim) now calls `modsRelabelRow(cloneT, donorT,
+text, clone, "settings pages")` after its existing single-TMP label. That is
+REUSE, not a copy: one implementation walks every TMP under the clone,
+resolves the LocalizedText **on each TMP's own node**, calls `SetLabelText`
+there, registers each write for the re-assert poll, and decides success with a
+check that can fail. `modsRelabelRow` gained a `who` parameter so the log names
+the feature that is speaking instead of always saying "mods tab".
+
+**MEASURED (build, exit 0, artifact 4,768,768 bytes): nimony resolves top-level
+procs across the whole module REGARDLESS OF INCLUDE ORDER.** `settingspages.nim`
+is included at `aowlhost.nim:6696`; `modsRelabelRow`/`iToTransform` are in
+`modstab.nim` (6757) and `inspect.nim` (6742) -- 46 and 61 includes later -- and
+it compiles. This was already true and load-bearing before this change:
+`swCloneRow` has always called `iUnityAlive`, also from `inspect.nim`. So a
+helper does NOT need moving and includes do NOT need reordering to be shared
+backwards. Top-level `var` initialisers still run textually, but they all run at
+module init, long before any UI callback, so a registry declared later is safe
+to append to from earlier code.
+
+**`modsReassertLabels()` was moved ABOVE the `if not gModsBuilt: return` gate**
+in `modsTabTickBody`. Below it, the poll could not fire unless the MODS tab had
+been built -- and the run that produced the 22 bad rows never built it. The
+settings-pages rows register into the same registry, so leaving the call where
+it was would have been registering into a mechanism that cannot run: a silent
+no-op wearing the shape of a fix. It is still under `gModsOn`, so with the mods
+tab flag OFF those rows get the corrected WRITE but no poll behind it -- stated
+rather than implied.

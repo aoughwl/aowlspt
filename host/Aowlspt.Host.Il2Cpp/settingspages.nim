@@ -720,6 +720,53 @@ proc swCloneRow(donor, parentGo: Il2CppPtr; text: string): Il2CppPtr =
   else:
     warn "settings pages: the clone for row '" & text & "' has no reachable " &
          "TMP label; it is left showing the donor's text"
+  # ------------------------------------------------------------------
+  # AND NOW EVERY OTHER TMP THE ROW CARRIES -- which is where the caption
+  # the player actually reads lives.
+  #
+  # The block above writes exactly ONE TextMeshProUGUI: `swControlTmp` is
+  # `control.Text(+0x80) -> LocalizedText -> _labels[0]`. It then logs
+  # success, and it is telling the truth about the write it made. It is the
+  # wrong TMP.
+  #
+  # MEASURED LIVE 2026-09-02 (inspector, build 4,758,016, Settings open), on
+  # rows this very function produced and acceptance caught still reading
+  # 'Interface language':
+  #
+  #   parent 0x00000203095d3e00 7
+  #     Text -> Settings Drop Down(Clone)(Clone) -> Settings -> Viewport
+  #          -> Scroll View -> Container -> Game Settings
+  #   component 0x00000203095d3e00 LocalizedText -> FOUND 0x00000203091c2210
+  #   component 0x00000203095d3f40 LocalizedText -> returned NULL
+  #
+  # So the TMP that RENDERS is a `Text` CHILD carrying its OWN LocalizedText,
+  # while the row control itself has none. `swSetLocalizedText` resolves its
+  # target as `control + 0x80`, so every write above went to a component
+  # nothing on screen reads, and the child re-localised itself back to the
+  # donor's key. That is the whole defect, and no amount of re-applying at
+  # the control level can reach it.
+  #
+  # `modsRelabelRow` is the implementation that does this correctly: it walks
+  # every TMP under the clone, resolves the LocalizedText ON EACH TMP'S OWN
+  # NODE and calls SetLabelText there, registers each write for the re-assert
+  # poll, and then decides success with a check THAT CAN FAIL -- does any TMP
+  # under this clone still read the donor's caption. It is reused rather than
+  # copied so the two callers cannot drift; `who` keeps the log honest about
+  # which feature is speaking. It lives in `modstab.nim`, which is included
+  # AFTER this file, and that is fine: this module already forward-calls
+  # `iUnityAlive` (inspect.nim, 46 includes later) and nimony resolves
+  # top-level procs across the whole module regardless of include order.
+  # Nothing is reordered.
+  let cloneT = iToTransform(clone)
+  let donorT = iToTransform(donor)
+  if cloneT == nil or donorT == nil:
+    warn "settings pages: row '" & text & "' could not be re-labelled " &
+         "across every TMP it carries -- Component::get_transform gave " &
+         "clone=0x" & hexOf(cast[uint64](cloneT)) & " donor=0x" &
+         hexOf(cast[uint64](donorT)) & ". The single-TMP label above stands, " &
+         "and on this build that is the one the player CANNOT see."
+  else:
+    discard modsRelabelRow(cloneT, donorT, text, clone, "settings pages")
   result = clone
 
 ## One-shot: the toggle-seed refusal explains itself once, not once per row

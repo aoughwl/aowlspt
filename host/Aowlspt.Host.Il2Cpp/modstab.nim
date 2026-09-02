@@ -976,7 +976,8 @@ proc modsRelabelLike(cloneT, donorT: Il2CppPtr; text: string;
          "back perfectly and changes nothing the player sees.)"
 
 proc modsRelabelRow(cloneT, donorT: Il2CppPtr; text: string;
-                    cloneCtrl: Il2CppPtr = nil): bool =
+                    cloneCtrl: Il2CppPtr = nil;
+                    who: string = "mods tab"): bool =
   ## Relabel a ROW clone. Unlike `modsRelabelLike` (used for the tab/subtab
   ## BUTTONS, where "N of N matching the donor" holds up), a row clone is a
   ## clone-of-a-clone ("Settings Drop Down(Clone)(Clone)") and was measured
@@ -1001,7 +1002,7 @@ proc modsRelabelRow(cloneT, donorT: Il2CppPtr; text: string;
   var cTmps: seq[Il2CppPtr] = @[]
   modsCollectTmp(cloneT, 4, cNodes, cTmps, isRoot = true)
   if cTmps.len == 0:
-    warn "mods tab: REFUSING to claim the row label '" & text & "' -- there " &
+    warn who & ": REFUSING to claim the row label '" & text & "' -- there " &
          "is no TextMeshProUGUI anywhere under this clone (searched 4 " &
          "levels). Nothing was written."
     return
@@ -1063,7 +1064,7 @@ proc modsRelabelRow(cloneT, donorT: Il2CppPtr; text: string;
     # THREE OUTCOMES, NEVER TWO. With no donor caption the stale count above
     # can never increment, so `stale == 0` would be a verdict about a test
     # that was not run. Say INCONCLUSIVE and do not claim the row.
-    warn "mods tab: row caption '" & text & "' CANNOT BE CONFIRMED -- the " &
+    warn who & ": row caption '" & text & "' CANNOT BE CONFIRMED -- the " &
          "row donor shows no caption of its own, so 'no TMP still reads the " &
          "donor's caption' is a check that cannot fail. " & $wrote &
          " write(s) went out and " & $mine & " of the clone's " & $cTmps.len &
@@ -1071,7 +1072,7 @@ proc modsRelabelRow(cloneT, donorT: Il2CppPtr; text: string;
     return false
   result = stale == 0 and mine > 0
   if result:
-    okLog "mods tab: row caption '" & text & "' written to all " &
+    okLog who & ": row caption '" & text & "' written to all " &
           $cTmps.len & " of the clone's TextMeshProUGUI (" & $wrote &
           " write(s) succeeded); " & $mine & " now read it and none still " &
           "read the donor's '" & donorCaption & "'. " & $locHits & " of " &
@@ -1079,13 +1080,13 @@ proc modsRelabelRow(cloneT, donorT: Il2CppPtr; text: string;
           "through it, not through the row control. All " & $mine &
           " are registered for re-assert."
   elif mine == 0:
-    warn "mods tab: row caption '" & text & "' DID NOT LAND AT ALL -- none " &
+    warn who & ": row caption '" & text & "' DID NOT LAND AT ALL -- none " &
          "of the clone's " & $cTmps.len & " TextMeshProUGUI read it after " &
          $wrote & " write(s), so an empty row is not being reported as a " &
          "clean one just because nothing reads the donor's '" &
          donorCaption & "'."
   else:
-    warn "mods tab: row caption '" & text & "' DID NOT FULLY TAKE -- " &
+    warn who & ": row caption '" & text & "' DID NOT FULLY TAKE -- " &
          $stale & " of the clone's " & $cTmps.len & " TextMeshProUGUI " &
          "STILL read the donor's original '" & donorCaption & "' after " &
          $wrote & " write(s). That TMP is the one rendering, and it did " &
@@ -1960,6 +1961,23 @@ proc modsTabTickBody() =
   # is not re-entrant and `modsindex.nim` opens none of its own. Before the tab
   # has ever been opened, and after the fetch finishes, this is one enum test.
   miTick(cNowMs())
+  # THE RE-ASSERT POLL RUNS BEFORE THE `gModsBuilt` GATE, and that placement is
+  # the point. `settingspages.nim`'s `swCloneRow` registers the rows it clones
+  # into the SAME registry, and those rows exist on the STOCK Game tab whether
+  # or not the MODS tab was ever opened -- MEASURED 2026-09-02, the run whose
+  # 22 rows read 'Interface language' had no mods-tab build in its host log at
+  # all. Left below the gate (where it was), the poll could not fire in exactly
+  # the session that needed it: registering into a mechanism that cannot run is
+  # a silent no-op wearing the shape of a fix.
+  #
+  # Safe to hoist: it returns immediately on an empty registry, it is throttled
+  # to one pass every ModsLabelEveryFrames frames, and it switches itself off
+  # after ModsStableEnough clean passes. It still sits under `gModsOn` above --
+  # so with the mods tab flag OFF the settings-pages rows get the corrected
+  # WRITE but no poll behind it. Saying that plainly rather than implying cover
+  # this does not give.
+  modsCrumb("STAGE: modsReassertLabels (pre-build, covers settings pages)")
+  modsReassertLabels()
   if not gModsBuilt:
     # Build lazily, once the settings screen has been opened onto the tab whose
     # rows we clone. GATE ON THE SAME POINTER THE BUILD USES: a guard naming a
@@ -2015,8 +2033,6 @@ proc modsTabTickBody() =
         swReadBackPage(gModsPages[q])
         q = q + 1
     return                              # one edge's worth of work per frame
-  modsCrumb("STAGE: modsReassertLabels")
-  modsReassertLabels()                  # throttled, and it stops when stable
   if not gModsShown:
     return
   modsCrumb("STAGE: modsTickSubtabs")
