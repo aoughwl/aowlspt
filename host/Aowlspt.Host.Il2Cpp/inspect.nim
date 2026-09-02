@@ -1205,6 +1205,20 @@ proc iCmdParent(start: Il2CppPtr; depth: int) =
   ## `Transform::get_parent` repeatedly, with `Object::get_name` and
   ## `GameObject::get_activeSelf` at each level. Every function is one of the
   ## byte-verified targets; an unverified build simply gets fewer columns.
+  ##
+  ## THE LEVEL NUMBERING, STATED ONCE AND ENFORCED HERE.
+  ## `[0]` is ALWAYS THE NODE YOU PASSED (normalised to its Transform, so a
+  ## component and its Transform give the same `[0]`); `[1]` is its parent, and
+  ## so on. DEPTH counts levels PRINTED, so `parent X 1` prints X alone and
+  ## says so rather than looking like a broken walk.
+  ##
+  ## It was reported as inconsistent -- the node itself as `[0]` in one call
+  ## and the parent as `[0]` in another. The reachable cause is a GAMEOBJECT
+  ## argument: `Component::get_transform` on a GameObject is a native type
+  ## confusion that can return a plausible OTHER transform, and `[0]` is then
+  ## a different object with a different name for a reason nothing prints.
+  ## That is refused at the dispatch site now, and the contract is printed
+  ## below on every call, so the two can never again be told apart by guessing.
   var idx = 0
   var hits = 0
   var fnTransform: Il2CppPtr = nil
@@ -1223,6 +1237,8 @@ proc iCmdParent(start: Il2CppPtr; depth: int) =
   iOut("  via Transform::get_parent, Component::get_transform, " &
        "Object::get_name, Component::get_gameObject, " &
        "GameObject::get_activeSelf (calls, not field reads)")
+  iOut("  [0] is THE NODE YOU PASSED; [1] is its parent, upward. DEPTH counts " &
+       "levels PRINTED, so `parent EXPR 1` prints only the node itself.")
   if fnParent == nil:
     iErr("Transform::get_parent did not verify on this build; cannot walk")
     return
@@ -1903,6 +1919,17 @@ const
   FindOutOfTime = 1  ## this FRAME is up, but the search may continue
   FindOutOfBudget = 2 ## the whole search's node budget is spent
   FindEnoughHits = 3  ## the match cap was reached
+  FindOutOfFrames = 4
+    ## THE SEARCH HELD THE CHANNEL FOR `InspFindMaxFrames` FRAMES AND WAS CUT
+    ## OFF. Never returned by `iFindStep` -- the step function cannot know how
+    ## many frames it has had; it is substituted by the caller when a
+    ## `FindOutOfTime` is not allowed to park again.
+    ##
+    ## It exists because the report had no way to say this. MEASURED: a search
+    ## that visited 30,720 of an 80,000 node budget printed "STOPPED EARLY on
+    ## the NODE BUDGET", which sent the reader to raise a budget that was not
+    ## the limiter and had 49,280 nodes left in it. Naming the wrong cause is
+    ## worse than naming none: it is actionable and the action does nothing.
 
 proc iFindStep(): int =
   ## One FRAME's slice of the breadth-first walk.
@@ -1992,6 +2019,19 @@ proc iFindReportGeneric(status: int; visited, frames, found, invalidSkips,
     active = true
     iOut("  -- stopped at the match cap (" & $InspFindMaxHits & "). There may " &
          "be more; `" & verb & " more` continues from the frontier above.")
+  elif status == FindOutOfFrames:
+    # NAME THE ACTUAL LIMITER. This branch used to fall into the one below and
+    # blame the node budget, which was measurably not what stopped it.
+    active = true
+    iOut("  -- STOPPED EARLY on the FRAME CAP (" & $InspFindMaxFrames &
+         " frames), NOT on the node budget: " & $visited & " node(s) were " &
+         "visited and the budget still has room. A parked batch holds the " &
+         "channel, so one search may not hold it forever. This is NOT proof " &
+         "the subject is absent. Continue with `" & verb & " more` -- the " &
+         "frontier above is KEPT, so it resumes rather than re-walking -- or " &
+         "search from a narrower root, or raise `inspectorSliceMs` so each " &
+         "frame covers more ground (menu only; a large slice during a raid " &
+         "LOAD stalls the Unity thread).")
   else:
     active = true
     # THE HONEST CAP MESSAGE, unchanged in substance: "not found within budget"
@@ -2003,6 +2043,23 @@ proc iFindReportGeneric(status: int; visited, frames, found, invalidSkips,
          "narrower root.")
   if found > 0:
     iOut("  matches are bound to $f1..$f" & $found & " for the rest of this batch")
+
+proc iFindStopReason(st: int; budgetLeft, frames: int): int =
+  ## WHY DID THIS SEARCH STOP -- asked only of a step result the caller has
+  ## decided NOT to park.
+  ##
+  ## `iFindStep` returns `FindOutOfTime` for the end of a FRAME SLICE, which is
+  ## normally a park-and-resume and not a stop at all. When the caller stops on
+  ## it anyway, the slice is not the limiter: the FRAME CAP is (or the node
+  ## budget, if that ran out in the same step -- then the budget is the honest
+  ## answer and it wins). Reporting a stop with the step's own status is how
+  ## "STOPPED EARLY on the NODE BUDGET" came to be printed for a search with
+  ## 49,280 unspent nodes.
+  if st != FindOutOfTime:
+    return st
+  if budgetLeft <= 0:
+    return FindOutOfBudget
+  result = FindOutOfFrames
 
 proc iFindReport(status: int) =
   iFindReportGeneric(status, gFindVisited, gFindFrames, gFindFound,
@@ -2302,6 +2359,32 @@ proc iAnchorSceneHandle(ok: var bool; anchor: Il2CppPtr = nil): int32 =
   result = cReadI32At(cNavSceneHandlePtr())
   ok = true
 
+var gInspDdolHandle = 0'i32
+var gInspDdolKnown = false
+  ## THE DontDestroyOnLoad SCENE HANDLE, REMEMBERED FOR THE SESSION.
+  ##
+  ## MEASURED, from inside a live Woods raid: `roots` returned only the
+  ## LOCATION scene's roots (`woods_terrain`, `AICoversData`, `Location
+  ## Scene`, ...) and NOT `Common UI` / `Menu UI` / `Preloader UI`. Rootless
+  ## `find MenuScreen 80000` + two `find more` then ended "searched
+  ## EXHAUSTIVELY ... genuinely NOT PRESENT" for a screen that was alive. That
+  ## verdict was false, and it is the reason `tools/exitraid.py` refused every
+  ## attempt with "no `Common UI` scene root".
+  ##
+  ## THE CAUSE: DontDestroyOnLoad is reached by asking a LIVE ANCHOR which
+  ## scene it belongs to, and the only anchor here is `gInspPreloader`, written
+  ## solely by `EFT.UI.PreloaderUI::Update` -- which does not tick in a raid.
+  ## In-raid that anchor is stale or its native half is gone, so
+  ## `iAnchorSceneHandle` answers "could not look", and the union silently
+  ## collapsed to the scenes SceneManager lists.
+  ##
+  ## THE FIX: a scene HANDLE is all `Scene::GetRootGameObjects` needs -- no
+  ## anchor, no hierarchy climb. DontDestroyOnLoad is created once per process,
+  ## so the handle learned at the menu is still the right handle in a raid. It
+  ## is cached here and REVALIDATED BY NAME on every use: if the handle no
+  ## longer names DontDestroyOnLoad it is dropped and said so, never
+  ## enumerated on faith.
+
 proc iSceneRoots(into: var seq[Il2CppPtr]; report: bool;
                  anchor: Il2CppPtr = nil): int =
   ## Every root GameObject we can legitimately reach, from two sources:
@@ -2359,7 +2442,19 @@ proc iSceneRoots(into: var seq[Il2CppPtr]; report: bool;
 
   # THE SCENE SCENEMANAGER DOES NOT LIST.
   var haveAnchor = false
-  let ah = iAnchorSceneHandle(haveAnchor, anchor)
+  var ah = iAnchorSceneHandle(haveAnchor, anchor)
+  if not haveAnchor and anchor == nil and gSettingsLiveSelf != nil:
+    # SECOND ANCHOR, NOT A SECOND GUESS. The SettingsScreen also lives in
+    # DontDestroyOnLoad and, unlike PreloaderUI, it is not tied to a screen
+    # that stops ticking in a raid -- so when the primary anchor is dead this
+    # can still get a REAL answer from the runtime (`get_scene_Injected`),
+    # which is the only kind of scene answer this file accepts. If it too
+    # fails, nothing is assumed: the remembered-handle path below is the
+    # remaining route and it revalidates by name.
+    ah = iAnchorSceneHandle(haveAnchor, gSettingsLiveSelf)
+    if haveAnchor and report:
+      iOut("  ($preloader could not be asked; used the live SettingsScreen " &
+           "as the scene anchor instead)")
   if haveAnchor:
     var already = false
     for i in 0 ..< seen.len:
@@ -2367,6 +2462,10 @@ proc iSceneRoots(into: var seq[Il2CppPtr]; report: bool;
         already = true
     if not already:
       let an = iSceneNameOf(ah)
+      if an == "DontDestroyOnLoad":
+        gInspDdolHandle = ah
+        gInspDdolKnown = true
+      seen.add ah
       if report:
         iOut("  scene[anchor] handle=" & $int(ah) & " name=\"" & an &
              "\"  <- the scene $preloader actually belongs to. SceneManager " &
@@ -2377,7 +2476,42 @@ proc iSceneRoots(into: var seq[Il2CppPtr]; report: bool;
            ", is already listed above)")
   elif report:
     iOut("  (could not ask $preloader which scene it belongs to; either the " &
-         "anchor is null or GameObject::get_scene_Injected did not verify)")
+         "anchor is null or GameObject::get_scene_Injected did not verify -- " &
+         "in a RAID that is expected, because PreloaderUI::Update does not " &
+         "tick there. The remembered DontDestroyOnLoad handle below is what " &
+         "covers that case.)")
+
+  # THE SCENE NEITHER SCENEMANAGER NOR THE ANCHOR CAN REACH RIGHT NOW.
+  #
+  # In a raid the anchor is dead and SceneManager lists only the location
+  # scene, so without this the union is missing exactly the scene the menu
+  # lives in -- and both `roots` and rootless `find` then report a confident
+  # absence for objects that are alive. The handle is revalidated by NAME
+  # before it is used, so a stale or recycled handle is dropped rather than
+  # enumerated.
+  if gInspDdolKnown:
+    var already = false
+    for i in 0 ..< seen.len:
+      if seen[i] == gInspDdolHandle:
+        already = true
+    if not already:
+      let dn = iSceneNameOf(gInspDdolHandle)
+      if dn == "DontDestroyOnLoad":
+        if report:
+          iOut("  scene[ddol] handle=" & $int(gInspDdolHandle) &
+               " name=\"" & dn & "\"  <- REMEMBERED from when an anchor could " &
+               "still be asked. This is what makes Common UI / Menu UI / " &
+               "Preloader UI reachable IN A RAID, where PreloaderUI does not " &
+               "tick and the anchor is gone.")
+        seen.add gInspDdolHandle
+        iRootsOfHandle(gInspDdolHandle, dn, into, report, result)
+      else:
+        gInspDdolKnown = false
+        if report:
+          iOut("  (the remembered DontDestroyOnLoad handle " &
+               $int(gInspDdolHandle) & " now names \"" & dn & "\", so it is " &
+               "NOT that scene any more and was DROPPED rather than " &
+               "enumerated on faith.)")
 proc iSceneNamePresent*(needle: string): int32 =
   ## THREE OUTCOMES, never two (CLAUDE.md 9b):
   ##    1  a scene SceneManager lists is named exactly `needle`
@@ -2555,7 +2689,7 @@ proc iCmdFindText(toks: seq[string]) =
        gTxtFrames < InspFindMaxFrames:
       gFindSuspend = true
       return
-    iFindTextReport(st)
+    iFindTextReport(iFindStopReason(st, gTxtBudgetLeft, gTxtFrames))
     return
 
   if toks.len < 2:
@@ -2590,7 +2724,7 @@ proc iCmdFindText(toks: seq[string]) =
        gTxtFrames < InspFindMaxFrames:
       gFindSuspend = true
       return
-    iFindTextReport(st)
+    iFindTextReport(iFindStopReason(st, gTxtBudgetLeft, gTxtFrames))
     return
 
   if cNavIcallReady() == 0'i32:
@@ -2665,7 +2799,7 @@ proc iCmdFindText(toks: seq[string]) =
     gTxtActive = true
     gFindSuspend = true
     return
-  iFindTextReport(st)
+  iFindTextReport(iFindStopReason(st, gTxtBudgetLeft, gTxtFrames))
 
 proc iCmdFind(toks: seq[string]) =
   ## `find NAME [ROOT] [BUDGET]`
@@ -2693,7 +2827,7 @@ proc iCmdFind(toks: seq[string]) =
        gFindFrames < InspFindMaxFrames:
       gFindSuspend = true
       return
-    iFindReport(st)
+    iFindReport(iFindStopReason(st, gFindBudgetLeft, gFindFrames))
     return
 
   if toks.len < 2:
@@ -2724,7 +2858,7 @@ proc iCmdFind(toks: seq[string]) =
        gFindFrames < InspFindMaxFrames:
       gFindSuspend = true
       return
-    iFindReport(st)
+    iFindReport(iFindStopReason(st, gFindBudgetLeft, gFindFrames))
     return
 
   # ---- new search ----
@@ -2816,7 +2950,7 @@ proc iCmdFind(toks: seq[string]) =
     gFindActive = true
     gFindSuspend = true
     return
-  iFindReport(st)
+  iFindReport(iFindStopReason(st, gFindBudgetLeft, gFindFrames))
 
 proc iCmdTree(toks: seq[string]) =
   ## `tree EXPR [DEPTH]` -- the subtree, indented, capped.
@@ -3044,6 +3178,169 @@ proc iKlassName(k: uint64; verified: var bool): string =
     return
   var nm = result
   verified = cCompIsKnownType(toCString(nm)) != 0'i32
+
+# ---------------------------------------------------------------------------
+# THE RECEIVER TYPE CHECK, and why every verb that calls a typed method needs it
+#
+# MEASURED, live, today: `tab` was handed an `EFT.UI.AnimatedToggle` and then a
+# `UnityEngine.CanvasRenderer`. It called `EFT.UI.Settings.SettingsTab::
+# set_IsSelected` on both, wrote +0x90 on objects that have no such field, and
+# printed a perfectly plausible "first-select latch ... -> ..." line each time.
+# Nothing faulted in a way the batch survived (`escapes=1` on the channel
+# counters) and the Settings screen ended up desynced -- GRAPHICS highlighted
+# with the Game panel showing.
+#
+# That is the worst failure this instrument can produce, and it is not
+# preventable by a readability check: `duOk(tab, 0xA0)` passes on ANY object
+# that is at least 0xA0 bytes, which is nearly all of them. The only question
+# that separates "this call is correct" from "this call is a blind write into a
+# stranger's fields" is WHAT TYPE THE RECEIVER IS.
+#
+# So: read the klass name out of the object and walk `Il2CppClass.parent` until
+# the wanted type appears or the chain ends at System.Object. Three outcomes,
+# never two -- YES / NO / INCONCLUSIVE -- because "I could not read the chain"
+# is not "it is the right type", and flattening those two is the same mistake
+# in a different place.
+# ---------------------------------------------------------------------------
+
+const
+  InspKlassParentOff = 0x58'i32
+    ## `Il2CppClass.parent`. MEASURED out of the shipped GameAssembly.dll, from
+    ## `il2cpp_class_get_parent`'s OWN BODY -- the same method
+    ## `abi/aowlspt_components.h` used for `namespaze`, not a guess:
+    ##
+    ##   il2cpp_class_get_parent         40 53 48 83 ec 20 48 8b c2 48 8b d9
+    ##                                   48 85 d2 74 23 41 b8 20 00 00 00 ...
+    ##                                   85 c0 75 0a 48 8b 43 58  <- [rbx+0x58]
+    ##   il2cpp_class_get_declaring_type  ... same body ... 48 8b 43 50
+    ##   il2cpp_class_get_element_class   48 8b 41 40 c3   (folded accessor)
+    ##
+    ## 0x40 / 0x50 / 0x58 are consecutive slots of the canonical Il2CppClass
+    ## head, and `element_class` at 0x40 is independently a one-instruction
+    ## accessor, so the three corroborate each other.
+    ##
+    ## The FIELD IS READ, NEVER THE EXPORT CALLED. `il2cpp_class_get_parent` is
+    ## one of the TOKEN-GATED exports (`48 85 d2` tests a second argument we do
+    ## not pass, then `41 b8 20` -> a 32-byte memcmp); on mismatch those return
+    ## a uniform random non-zero uint64, which passes a nil check and kills the
+    ## client on first dereference.
+  InspKlassChainMax = 24
+    ## Cap on the walk. The deepest real chain measured offline is 10
+    ## (EFT.UI.Settings.SettingsScreen -> System.Object); 24 is slack with a
+    ## hard stop, because an unbounded loop on the Unity thread is a hang.
+
+  KlassNo = 0
+  KlassYes = 1
+  KlassUnknown = -1
+
+proc iKlassIs(p: Il2CppPtr; wanted: string; chain: var string): int =
+  ## Does `p`'s type derive from (or equal) `wanted`? `chain` always comes back
+  ## holding whatever WAS read, so a refusal can name the actual type.
+  ##
+  ## Every name is validated against the offline type table before it is
+  ## believed (`iKlassName`'s `verified` out-parameter). An unverified name
+  ## stops the walk with INCONCLUSIVE rather than being compared: if the name
+  ## offset were wrong for this object, comparing garbage to `wanted` would
+  ## answer NO with total confidence, and a confident NO is as bad as a
+  ## confident YES.
+  chain = ""
+  var k = iKlassOf(p)
+  if k == 0'u64:
+    return KlassUnknown
+  var hop = 0
+  while hop < InspKlassChainMax:
+    let kp = cast[Il2CppPtr](k)
+    if not duOk(kp, InspKlassParentOff + 8'i32):
+      if chain.len > 0: chain.add " <- "
+      chain.add "<klass " & iPtrU(k) & " unreadable>"
+      return KlassUnknown
+    var verified = false
+    let nm = iKlassName(k, verified)
+    if nm.len == 0:
+      if chain.len > 0: chain.add " <- "
+      chain.add "<klass " & iPtrU(k) & " has no readable name>"
+      return KlassUnknown
+    if chain.len > 0: chain.add " <- "
+    chain.add nm
+    if not verified:
+      chain.add " (UNVERIFIED -- not a type on this build)"
+      return KlassUnknown
+    if nm == wanted:
+      return KlassYes
+    let par = cast[uint64](cReadPtrAt(kp, InspKlassParentOff))
+    if par == 0'u64:
+      # The chain terminated at System.Object with every name verified. This
+      # is the ONLY way to answer NO, and it is a complete answer.
+      return KlassNo
+    if par == k:
+      chain.add " <- (self-referential parent; chain is not walkable)"
+      return KlassUnknown
+    k = par
+    inc hop
+  chain.add " <- ... (chain longer than " & $InspKlassChainMax & " hops)"
+  result = KlassUnknown
+
+proc iRequireKlass(p: Il2CppPtr; wanted, verb: string): bool =
+  ## THE GATE. True only on a POSITIVE, COMPLETE answer.
+  var chain = ""
+  let r = iKlassIs(p, wanted, chain)
+  if r == KlassYes:
+    iOut("  receiver type: " & chain & "   -- IS a " & wanted)
+    return true
+  if r == KlassNo:
+    iErr(verb & " REFUSED -- WRONG RECEIVER TYPE. This object is " & chain &
+         ", which does not derive from " & wanted & ". Nothing was called. " &
+         "A " & wanted & " method run on it would impose " & wanted & "'s " &
+         "field layout on unrelated memory, RETURN NORMALLY, and print a " &
+         "plausible line: that is measured, not hypothetical -- `tab` on an " &
+         "EFT.UI.AnimatedToggle and on a UnityEngine.CanvasRenderer wrote " &
+         "+0x90 on both and desynced the Settings screen without faulting.")
+    return false
+  iErr(verb & " REFUSED -- TYPE INCONCLUSIVE. The klass chain could not be " &
+       "read to the end: " &
+       (if chain.len > 0: chain else: "no klass pointer at all") &
+       ". 'I could not look' is not 'it is the right type', so nothing was " &
+       "called. Try `components " & (if verb == "open": "$settings" else: "EXPR") &
+       "` to see what this object actually is.")
+  result = false
+
+proc iGetComponentQuiet(target: Il2CppPtr; typeName: string;
+                        why: var string): Il2CppPtr =
+  ## `GetComponent(String)` with no narration -- the same overload choice and
+  ## the same pre-flight as `iCmdComponent`, for verbs that need a component
+  ## as a STEP rather than as an answer. `why` is set on every failure path,
+  ## because a silent nil here would be indistinguishable from "the object has
+  ## no such component", and those are different facts.
+  result = nil
+  why = ""
+  if not duOk(target, 0x20'i32) or not iUnityAlive(target):
+    why = "the object is not readable, or its native half is null"
+    return
+  let isGo = iIsGameObject(target)
+  let overload = (if isGo: "GameObject::GetComponent(String)"
+                  else: "Component::GetComponent(String)")
+  var fn: Il2CppPtr = nil
+  var rva = 0'u32
+  if not iNavFind(overload, fn, rva):
+    why = overload & " did not byte-verify on this build"
+    return
+  if cNavIcallReady() == 0'i32:
+    why = "the GetComponent(System.String) icall is not registered in this " &
+          "runtime, so the wrapper would take its raise branch"
+    return
+  var tn = typeName
+  let sp = cNavNewString(toCString(tn))
+  if sp == nil:
+    why = "il2cpp_string_new returned null for \"" & typeName & "\""
+    return
+  iMark(overload, target)
+  let comp = cast[Il2CppPtr](cInspUPP(fn, target, sp, nil))
+  if comp == nil:
+    why = "GetComponent(\"" & typeName & "\") returned NULL -- an ANSWER: " &
+          "this object has no such component"
+    return
+  iNoteKlass(comp)
+  result = comp
 
 proc iCmdComponents(toks: seq[string]) =
   ## `components EXPR [BaseType]` -- LIST what an object actually has, instead
@@ -3478,11 +3775,13 @@ proc iCmdPress(toks: seq[string]) =
          "component " & toks[1] & " DefaultUIButton")
     return
   var off = 0x120'i32
+  var offGiven = false
   if toks.len > 2:
     var o = 0'u64
     var e = ""
     if iEval(toks[2], o, e) and int(o) > 0 and int(o) < 0x400:
       off = int32(o)
+      offGiven = true
     else:
       iErr("that offset is not a small positive number; refusing to read a " &
            "wild slot. Nothing was called.")
@@ -3491,6 +3790,24 @@ proc iCmdPress(toks: seq[string]) =
     iErr("not readable to +0x" & iHexPad(uint64(off), 3) &
          ", or its native half is null. Nothing was called.")
     return
+  # THE RECEIVER TYPE CHECK -- but only for the DEFAULT offset.
+  #
+  # +0x120 is `EFT.UI.DefaultUIButton.OnClick` and means nothing on any other
+  # type, so a bare `press` must prove it has a DefaultUIButton. An EXPLICIT
+  # offset is the documented escape hatch for a control that keeps its event
+  # somewhere else, so requiring DefaultUIButton there would refuse exactly the
+  # case the parameter exists for -- the klass chain is PRINTED instead, so the
+  # caller can see what they are pressing rather than being asked to trust it.
+  if not offGiven:
+    if not iRequireKlass(p, "EFT.UI.DefaultUIButton", "press"):
+      return
+  else:
+    var chain = ""
+    discard iKlassIs(p, "EFT.UI.DefaultUIButton", chain)
+    iOut("  receiver type: " &
+         (if chain.len > 0: chain else: "UNREADABLE") &
+         "   (explicit offset given, so the DefaultUIButton requirement is " &
+         "waived -- the UnityEvent shape checks below still apply)")
   # Name the button before pressing it. `_text` at +0xB8 is what the label
   # reads, so the output says WHICH button was pressed rather than only that
   # something was -- the difference between evidence and a claim.
@@ -3573,6 +3890,15 @@ proc iCmdClick(toks: seq[string]; useInvoke: bool) =
   if not iUnityAlive(btn):
     iErr("that Button's native half is NULL (destroyed object). Nothing was " &
          "called.")
+    return
+  # THE RECEIVER TYPE CHECK, BEFORE any Button-shaped field is read.
+  #
+  # The two checks further down (a GameObject or a klass pointer in the
+  # m_OnClick slot) are inferences ABOUT the layout from values found at
+  # Button's offsets. This asks the question directly, and it is strictly
+  # stronger: `UnityEngine.CanvasRenderer` has neither a GameObject nor a klass
+  # pointer at +0x100, so it would have passed both of them.
+  if not iRequireKlass(btn, "UnityEngine.UI.Button", verb):
     return
   # Field reads, corroborated by the getters' own inlined bodies -- no calls,
   # so this pre-flight can never itself be what breaks.
@@ -3679,8 +4005,41 @@ proc iInspSettingsSelf(): Il2CppPtr =
   ## rather than asserting a specific probe ran.
   if gSettingsLiveSelf != nil: gSettingsLiveSelf else: gMi2Self
 
+const
+  InspGroupMax = 4
+    ## `ESettingsGroup`, MEASURED offline out of this build's metadata
+    ## (`il2cpp_resolve.py fields ESettingsGroup`, HASDEFAULT column):
+    ##   Screen=0  Game=1  Sound=2  Control=3  PostFX=4
+    ## Note `Screen` is the GRAPHICS tab. There is no member above 4, so a
+    ## larger number is not a group at all.
+
+proc iGroupByName(tok: string; group: var uint64): bool =
+  ## Names -> the enum, case-insensitively, plus the common aliases a person
+  ## actually types. The bug this replaces: `open Graphics` evaluated
+  ## "Graphics" as an EXPRESSION, got 0 out of a failed parse whose return
+  ## value was DISCARDED, and opened Game -- an unknown name silently became
+  ## group 0, which is a check that cannot fail.
+  let t = iLower(tok)
+  if t == "screen" or t == "graphics" or t == "display" or t == "video":
+    group = 0'u64
+  elif t == "game" or t == "gameplay":
+    group = 1'u64
+  elif t == "sound" or t == "audio":
+    group = 2'u64
+  elif t == "control" or t == "controls" or t == "keybinds":
+    group = 3'u64
+  elif t == "postfx" or t == "post-fx" or t == "post" or t == "postprocessing":
+    group = 4'u64
+  else:
+    return false
+  result = true
+
 proc iCmdOpen(toks: seq[string]) =
   ## `open [GROUP]` -- EFT.UI.SettingsScreen::ShowScreen(screen, group).
+  ##
+  ## GROUP is a NAME (Screen/Graphics, Game, Sound, Control, PostFX) or the
+  ## enum number 0..4. An unknown name is REFUSED with the list; it is never
+  ## quietly read as 0.
   if not iNavGate("open"):
     return
   var fn: Il2CppPtr = nil
@@ -3695,10 +4054,56 @@ proc iCmdOpen(toks: seq[string]) =
          "relevant flag on -- see `state` for which hooks are armed) and " &
          "this will work from then on.")
     return
+  # ---- WHAT GROUP, EXACTLY. A name that is not a group is a REFUSAL. ----
   var group = 0'u64
   if toks.len > 1:
-    var err = ""
-    discard iEval(toks[1], group, err)
+    if not iGroupByName(toks[1], group):
+      var err = ""
+      if not iEval(toks[1], group, err) or group > uint64(InspGroupMax):
+        iErr("\"" & toks[1] & "\" is not a settings group. Nothing was " &
+             "called. ESettingsGroup on this build has exactly five members " &
+             "(measured from metadata): 0 Screen (the GRAPHICS tab; aliases " &
+             "graphics/display/video), 1 Game, 2 Sound (audio), 3 Control " &
+             "(controls), 4 PostFX. Names are case-insensitive. This used to " &
+             "evaluate an unknown name to 0 and open Screen, which is why " &
+             "`open Graphics` appeared to open the wrong tab -- it was not " &
+             "wrong about Graphics, it was ignoring the word entirely.")
+        return
+  else:
+    iOut("  NOTE: no group named, so this uses 0 (Screen -- the GRAPHICS " &
+         "tab), which is what a bare `open` has always done.")
+  # ---- IS THE SCREEN IN A CALLABLE STATE? ----
+  #
+  # MEASURED: `open N` issued immediately after pressing BACK escaped the SEH
+  # guard -- ShowScreen ran on a screen that was mid-close. `$settings` does
+  # NOT go null across a close (the same pointer comes back on reopen), so the
+  # pointer being non-nil proves nothing at all about whether calling into it
+  # is safe. `activeInHierarchy` is the state that actually differs, and it is
+  # a call we already make everywhere else.
+  if not iUnityAlive(screen):
+    iErr("open REFUSED: the SettingsScreen's native half is NULL (Unity's " &
+         "fake null -- the managed object is readable and the C++ object is " &
+         "gone). ShowScreen would fault inside Unity where no guard of ours " &
+         "reaches. Nothing was called.")
+    return
+  let (actOk, act) = iActiveInHierarchy(screen)
+  if not actOk:
+    iErr("open REFUSED: activeInHierarchy could not be read for the " &
+         "SettingsScreen (Component::get_gameObject / " &
+         "GameObject::get_activeInHierarchy did not answer), so whether it is " &
+         "in a callable state is UNKNOWN. Nothing was called -- 'I could not " &
+         "look' is not 'it is fine'.")
+    return
+  if not act:
+    iErr("open REFUSED: the SettingsScreen is NOT active in the hierarchy -- " &
+         "it is closed or mid-close. ShowScreen on a closing screen is what " &
+         "made an earlier batch ESCAPE its guard (channel counter escapes=1). " &
+         "Nothing was called. Reopen Settings, or if you have just pressed " &
+         "BACK, wait for it: put `until $settings+0x" &
+         iHexPad(uint64(cNavOffInitTabs()), 3) & " 120` before this line.")
+    return
+  if not iRequireKlass(screen, "EFT.UI.Settings.SettingsScreen", "open"):
+    return
   iOut("  via EFT.UI.SettingsScreen::ShowScreen @0x" &
        iHexPad(uint64(rva), 6) & " (call) on " & iPtr(screen) &
        ", group=" & $int(group))
@@ -3708,44 +4113,190 @@ proc iCmdOpen(toks: seq[string]) =
        "does not exist yet. Follow with `until $settings+0x118` before " &
        "reading the tab.")
 
+const
+  InspToggleIsOnOff = 0x120'i32
+    ## `UnityEngine.UI.Toggle.m_IsOn`, from `il2cpp_resolve.py fields
+    ## UnityEngine.UI.Toggle` -- and it is the SAME offset EFT.UI.AnimatedToggle
+    ## inherits, so the before/after read below is valid for both.
+  InspToggleSetIsOnRva = 0x55ba430'u64
+  InspToggleSetIsOnSig = "4533c941b001e9"
+    ## `UnityEngine.UI.Toggle::set_isOn(bool)` -- a tail-jump thunk:
+    ##   xor r9d,r9d ; mov r8b,1 ; jmp Toggle::Set(bool value, bool send)
+    ## so the trailing MethodInfo* we pass in R8 is overwritten by the thunk
+    ## itself and NULL-MethodInfo is not merely tolerated here, it is
+    ## irrelevant. UNIQUE (not a shared RVA), and this is a CALL, not a detour.
+
 proc iCmdTab(toks: seq[string]) =
-  ## `tab PTR [0|1]` -- EFT.UI.SettingsTab::set_IsSelected(tab, value).
+  ## `tab EXPR [0|1]` -- SELECT A SETTINGS TAB THE WAY THE PLAYER DOES.
+  ##
+  ## It used to call `EFT.UI.Settings.SettingsTab::set_IsSelected`, and that is
+  ## two separate bugs measured live in one session:
+  ##
+  ##  1. IT DID NOT TYPE-CHECK. Handed an `EFT.UI.AnimatedToggle` and then a
+  ##     `UnityEngine.CanvasRenderer`, it called SettingsTab's setter on both,
+  ##     wrote +0x90 on objects with no such field, printed a plausible
+  ##     "first-select latch" line, and left the screen desynced.
+  ##  2. EVEN ON A REAL SettingsTab IT MOVED THE HIGHLIGHT AND NOT THE PANEL.
+  ##     The screen switches on the tab TOGGLE's `onValueChanged`, not on
+  ##     `set_IsSelected` -- so the observable outcome was GRAPHICS highlighted
+  ##     with the Game panel still showing. A verb that changes the appearance
+  ##     of the thing you asked for while not doing it is the worst shape of
+  ##     answer this instrument produces.
+  ##
+  ## So it now drives `Toggle::set_isOn`, which is what a real click reaches,
+  ## and it verifies against the FINISHED STATE -- the SettingsScreen's own
+  ## `_currentTab` before and after -- rather than against its own write.
   if toks.len < 2:
-    iErr("usage: tab PTR [0|1]")
+    iErr("usage: tab EXPR [0|1]   -- EXPR is an EFT.UI.Settings.SettingsTab " &
+         "or the tab's own Toggle/AnimatedToggle")
     return
   if not iNavGate("tab"):
-    return
-  var fn: Il2CppPtr = nil
-  var rva = 0'u32
-  if not iNavFind("set_IsSelected", fn, rva):
     return
   var v = 0'u64
   var err = ""
   if not iEval(toks[1], v, err):
     iErr(err)
     return
-  let tab = cast[Il2CppPtr](v)
-  if not duOk(tab, 0xA0'i32):
-    iErr("that tab pointer is not readable to +0xA0; refusing to call.")
+  if v == 0'u64:
+    iErr("tab was given a NULL pointer" &
+         (if toks[1].len > 1 and toks[1][0] == '$':
+            " -- the anchor " & toks[1] & " is NOT BOUND"
+          else: "") & ". Nothing was called.")
     return
+  let given = cast[Il2CppPtr](v)
+  if iRefuseIfGameObject(given, "tab"):
+    return
+  if not duOk(given, InspToggleIsOnOff + 8'i32) or not iUnityAlive(given):
+    iErr("that pointer is not readable to +0x" &
+         iHexPad(uint64(InspToggleIsOnOff), 3) & ", or its native half is " &
+         "null. Nothing was called.")
+    return
+
+  # ---- WHAT DID WE ACTUALLY GET? Exactly two answers are accepted. ----
+  var chainTab = ""
+  let isTab = iKlassIs(given, "EFT.UI.Settings.SettingsTab", chainTab)
+  var chainTog = ""
+  let isTog = iKlassIs(given, "UnityEngine.UI.Toggle", chainTog)
+  var toggle: Il2CppPtr = nil
+  if isTog == KlassYes:
+    iOut("  receiver type: " & chainTog & "   -- IS a UnityEngine.UI.Toggle, " &
+         "using it directly")
+    toggle = given
+  elif isTab == KlassYes:
+    iOut("  receiver type: " & chainTab &
+         "   -- IS an EFT.UI.Settings.SettingsTab; looking for its Toggle")
+    # The Toggle is a COMPONENT, not a field: SettingsTab's field table
+    # (offline) has no toggle slot at all -- 0x80 OnLoadingInProgress,
+    # 0x88 _createdControls, 0x90 <IsInitialized>. So it is fetched by
+    # GetComponent on the tab's own GameObject, which is where a real click
+    # lands. Unity's string overload matches BASE type names, so "Toggle"
+    # catches EFT.UI.AnimatedToggle too.
+    var why = ""
+    let go = iGameObjectOf(given)
+    if go != nil:
+      toggle = iGetComponentQuiet(go, "Toggle", why)
+    if toggle == nil:
+      iErr("tab REFUSED: this IS a SettingsTab, but no Toggle component was " &
+           "found on its GameObject (" & why & "). Nothing was called. The " &
+           "screen switches on the tab toggle's onValueChanged, so without " &
+           "the Toggle there is nothing to drive -- `set_IsSelected` alone " &
+           "moves the HIGHLIGHT and leaves the panel behind, which is the " &
+           "bug this verb was rewritten to stop. Find it with `components " &
+           toks[1] & "` and pass it here directly.")
+      return
+  else:
+    iErr("tab REFUSED -- WRONG RECEIVER TYPE. As a SettingsTab this reads " &
+         (if chainTab.len > 0: chainTab else: "nothing readable") &
+         "; as a Toggle it reads " &
+         (if chainTog.len > 0: chainTog else: "nothing readable") &
+         ". It is neither, so nothing was called. Measured: this verb " &
+         "previously accepted an EFT.UI.AnimatedToggle and a " &
+         "UnityEngine.CanvasRenderer, called SettingsTab::set_IsSelected on " &
+         "each, wrote +0x90 on both and desynced the Settings screen without " &
+         "faulting.")
+    return
+
+  # The component we ended up with must itself be a Toggle. On the
+  # GetComponent path Unity's short-name match is a CONTRACT, not a proof --
+  # so it is checked, not assumed.
+  if not iRequireKlass(toggle, "UnityEngine.UI.Toggle", "tab"):
+    return
+  if not duOk(toggle, InspToggleIsOnOff + 8'i32) or not iUnityAlive(toggle):
+    iErr("the Toggle is not readable to +0x" &
+         iHexPad(uint64(InspToggleIsOnOff), 3) & ", or its native half is " &
+         "null. Nothing was called.")
+    return
+
   var val = 1'u64
   if toks.len > 2:
     var e2 = ""
-    discard iEval(toks[2], val, e2)
-  let latchBefore = cReadPtrAt(tab, cNavOffFirstSel())
-  iOut("  via EFT.UI.SettingsTab::set_IsSelected @0x" &
-       iHexPad(uint64(rva), 6) & " (call) on " & iPtr(tab) &
-       ", value=" & $int(val))
-  iMark("SettingsTab::set_IsSelected", tab)
-  discard cInspUPI(fn, tab, int32(val), nil)
-  let latchAfter = cReadPtrAt(tab, cNavOffFirstSel())
-  iOut("  first-select latch (+0x" & iHexPad(uint64(cNavOffFirstSel()), 2) &
-       ") " & iPtrU(cast[uint64](latchBefore)) & " -> " &
-       iPtrU(cast[uint64](latchAfter)) &
-       (if latchBefore != latchAfter:
-          "   <- FIRST select: OnFirstSelect/CreateControls ran, so " &
-          "_createdControls will populate over the next frames"
-        else: "   (already selected before, no control creation)"))
+    if not iEval(toks[2], val, e2) or val > 1'u64:
+      iErr("the value must be 0 or 1. Nothing was called.")
+      return
+
+  # ---- THE CALL, BYTE-VERIFIED AT ITS RVA ----
+  let fn = cInspCode(InspToggleSetIsOnRva)
+  if fn == nil:
+    let why = case int(cInspReason())
+              of 1: "GameAssembly.dll is not loaded"
+              of 2: "that RVA is outside the image"
+              of 3: "not committed or not executable"
+              of 4: "outside the `il2cpp` section"
+              of 5: "the first bytes are a JUMP -- something already detours " &
+                    "this, so what is here is a TRAMPOLINE and not the function"
+              else: "refused"
+    iErr("Toggle::set_isOn @0x" & iHexPad(InspToggleSetIsOnRva, 7) &
+         " did not resolve: " & why & ". Nothing was called.")
+    return
+  if not iPrologueOk(fn, InspToggleSetIsOnSig):
+    iErr("Toggle::set_isOn @0x" & iHexPad(InspToggleSetIsOnRva, 7) &
+         " does not start with " & InspToggleSetIsOnSig & " on this build. " &
+         "Nothing was called -- an RVA that no longer verifies is a wrong " &
+         "address, not a reason to call it anyway.")
+    return
+
+  # ---- READ THE FINISHED STATE, NOT OUR OWN WRITE ----
+  #
+  # `m_IsOn` is what we set, so re-reading it proves only that the store
+  # happened. `_currentTab` on the SettingsScreen is what the PANEL follows,
+  # and it is a different object we do not touch -- that is the assertion
+  # worth making, and the one that would have caught the highlight-without-
+  # panel bug the first time.
+  let ss = iInspSettingsSelf()
+  var curBefore: Il2CppPtr = nil
+  var haveScreen = false
+  if ss != nil and duOk(ss, cNavOffCurrentTab() + 8'i32):
+    curBefore = cReadPtrAt(ss, cNavOffCurrentTab())
+    haveScreen = true
+  let onBefore = cReadI32At(cast[Il2CppPtr](cast[uint64](toggle) +
+                            uint64(InspToggleIsOnOff))) and 0xFF'i32
+  iOut("  via UnityEngine.UI.Toggle::set_isOn @0x" &
+       iHexPad(InspToggleSetIsOnRva, 7) & " (call, prologue verified) on " &
+       iPtr(toggle) & ", value=" & $int(val) &
+       "   m_IsOn(+0x" & iHexPad(uint64(InspToggleIsOnOff), 3) & ") was " &
+       (if onBefore != 0'i32: "true" else: "false"))
+  iMark("Toggle::set_isOn", toggle)
+  discard cInspUPI(fn, toggle, int32(val), nil)
+  let onAfter = cReadI32At(cast[Il2CppPtr](cast[uint64](toggle) +
+                           uint64(InspToggleIsOnOff))) and 0xFF'i32
+  iOut("  returned without faulting. m_IsOn now " &
+       (if onAfter != 0'i32: "true" else: "false") &
+       (if onAfter != onBefore: "  (CHANGED)" else: "  (unchanged)"))
+  if not haveScreen:
+    iOut("  _currentTab: NOT CHECKED -- no live SettingsScreen is known " &
+         "($settings is null), so whether the PANEL followed is UNKNOWN. " &
+         "That is inconclusive, not success.")
+  else:
+    let curAfter = cReadPtrAt(ss, cNavOffCurrentTab())
+    iOut("  SettingsScreen._currentTab(+0x" &
+         iHexPad(uint64(cNavOffCurrentTab()), 3) & ") " &
+         iPtrU(cast[uint64](curBefore)) & " -> " & iPtrU(cast[uint64](curAfter)) &
+         (if curAfter != curBefore:
+            "   <- the PANEL followed"
+          else:
+            "   <- UNCHANGED. The panel did NOT switch. Either this tab was " &
+            "already current, or onValueChanged has not run yet -- it can be " &
+            "a frame late, so re-read with `state` before concluding."))
 
 proc iCmdState(toks: seq[string]) =
   ## `state` -- what is on screen right now, as FIELD READS only.
@@ -5115,27 +5666,112 @@ const
   PressNameMaxHits = 48
     ## Cap on name matches collected. A name that matches this many nodes is
     ## too ambiguous to be a press target anyway; the verdict will refuse.
+  PressNameBudget = 200000
+    ## NODE BUDGET FOR THE WHOLE (now multi-frame) SEARCH.
+    ##
+    ## It used to be `InspFindDefBudget` (20,000) spent in ONE 12ms slice, and
+    ## that is smaller than the live scene: MEASURED, `pressname BackButton`
+    ## with no root searched all 16 scene roots, STOPPED EARLY at 20,000
+    ## visited with a frontier of ~13k-15k, and reported "0 name match(es) ...
+    ## INCONCLUSIVE" for a button that was on screen at the time. The verdict
+    ## was honest; the search was simply too small to reach the answer, and
+    ## there was no way to continue it.
+    ## Now the walk resumes across frames until it is EXHAUSTIVE, so the budget
+    ## only has to be bigger than the scene, not bigger than one frame.
 
-proc iPressComponentAndFire(node: Il2CppPtr): bool =
+# ---- the cross-frame walk state, exactly the shape `find` uses ----
+var gPnQueue: seq[Il2CppPtr] = @[]
+var gPnHead = 0
+var gPnWant = ""
+var gPnHits: seq[Il2CppPtr] = @[]
+var gPnVisited = 0
+var gPnSkips = 0
+var gPnBudgetLeft = 0
+var gPnFrames = 0
+var gPnActive = false
+var gPnOwnerIdx = -1
+var gPnOwnerBatch = -1
+var gPnRootDesc = ""
+  ## `pressname` is ONE command that must park and re-enter, so its frontier
+  ## has to outlive the frame exactly as `find`'s does. Deliberately its OWN
+  ## state and not `find`'s: sharing would let a `find` in the same batch eat
+  ## the press target's frontier, which is the class of bug that made the
+  ## `find`/`findtext` split necessary in the first place.
+  ##
+  ## The ATOMICITY the old one-slice walk was defending is preserved where it
+  ## matters: the visible-filter and the press still happen in ONE frame, on
+  ## the finished hit list. Only the NAME SEARCH spans frames, and a node that
+  ## died mid-search fails `duOk`/`iUnityAlive` at the visible check anyway.
+
+proc iPressNameStep(): int =
+  ## One FRAME's slice. Same two-budget contract as `iFindStep`: the time slice
+  ## bounds the frame, the node budget bounds the whole search.
+  let started = cNowMs()
+  var spent = 0
+  let w = gPnWant
+  while gPnHead < gPnQueue.len:
+    if gPnBudgetLeft <= 0:
+      return FindOutOfBudget
+    if gPnHits.len >= PressNameMaxHits:
+      return FindEnoughHits
+    if (spent and 127) == 0 and cNowMs() - started > InspFindSliceMs:
+      return FindOutOfTime
+    let cur = gPnQueue[gPnHead]
+    inc gPnHead
+    inc spent
+    dec gPnBudgetLeft
+    if not duOk(cur, 0x20'i32) or not iUnityAlive(cur):
+      inc gPnSkips
+      continue
+    inc gPnVisited
+    let nm = iObjName(cur)
+    if nm.len > 0 and iContains(iLower(nm), w):
+      gPnHits.add cur
+    var n = 0
+    if iChildCount(cur, n):
+      var k = 0
+      while k < n and k < InspMaxChildren:
+        let c = iChildAt(cur, k)
+        if c != nil:
+          gPnQueue.add c
+        inc k
+  result = FindDone
+
+proc iPressComponentAndFire(node: Il2CppPtr; why: var string): bool =
   ## Resolve `DefaultUIButton` on `node` (a Transform or component) and fire its
   ## OnClick at +0x120, exactly as `press` does -- read/validate the UnityEvent
   ## slot, then call UnityEvent::Invoke. Returns true iff it actually fired.
   ## Every failure names itself and returns false; nothing is ever blind-called.
+  ##
+  ## `why` IS NOT OPTIONAL, and that is the fix. MEASURED: `pressname` printed
+  ## "the single VISIBLE candidate could not be pressed (see the line above)"
+  ## and the line above could not be found in the out-file -- a FAIL verdict
+  ## pointing at a reason that was not there. The caller now gets the reason as
+  ## a VALUE and prints it ON THE SAME LINE as the verdict, so the two cannot be
+  ## separated by buffering, truncation, or an intervening line.
+  why = ""
   var comp: Il2CppPtr = nil
   var w = ""
   if not iVisComponent(node, "DefaultUIButton", comp, w):
-    iErr("could not ask for a DefaultUIButton on the chosen node (" & w &
-         "). Nothing was pressed.")
+    why = "GetComponent(DefaultUIButton) could not even be asked (" & w & ")"
+    iErr(why & ". Nothing was pressed.")
     return false
   if comp == nil:
-    iErr("the chosen VISIBLE node has NO DefaultUIButton component. It is the " &
-         "right node by name and it is on screen, but it is not an EFT button. " &
-         "Nothing was pressed.")
+    # The node named right and is on screen, but the button component is not
+    # on THIS node. Measured on SettingsScreen/BackButton: the caller then
+    # succeeded by hand with `children` -> `component $cN DefaultUIButton`, so
+    # "no DefaultUIButton here" must name the one thing that fixes it.
+    why = "this node has NO DefaultUIButton component of its own (the button " &
+          "may be on a CHILD -- `children` then `component $cN " &
+          "DefaultUIButton` then `press $comp` is the manual route, and it " &
+          "has worked on a node pressname refused)"
+    iErr(why & ". Nothing was pressed.")
     return false
   let off = cNavOffOnClick()   ## 0x120 on this build (DefaultUIButton.OnClick)
   if not duOk(comp, off + 8'i32) or not iUnityAlive(comp):
-    iErr("the DefaultUIButton is not readable to +0x" & iHexPad(uint64(off), 3) &
-         ", or its native half is null. Nothing was pressed.")
+    why = "the DefaultUIButton is not readable to +0x" &
+          iHexPad(uint64(off), 3) & ", or its native half is null"
+    iErr(why & ". Nothing was pressed.")
     return false
   let ev = cReadPtrAt(comp, off)
   var what = ""
@@ -5147,16 +5783,19 @@ proc iPressComponentAndFire(node: Il2CppPtr): bool =
        (if what.len > 0: "   _text(+0xB8) = \"" & what & "\"" else: "") &
        "   OnClick(+0x" & iHexPad(uint64(off), 3) & ") = " & iPtr(ev))
   if ev == nil:
-    iErr("the OnClick slot is NULL -- no handler is wired to this button. " &
-         "Nothing was pressed.")
+    why = "OnClick(+0x" & iHexPad(uint64(off), 3) & ") is NULL -- no handler " &
+          "is wired to this button"
+    iErr(why & ". Nothing was pressed.")
     return false
   if iIsGameObject(ev) or iIsKnownKlass(cast[uint64](ev)):
-    iErr("the OnClick slot does not hold a per-instance UnityEvent (it is a " &
-         "GameObject or a known klass pointer). Refusing to call it.")
+    why = "the OnClick slot holds a GameObject or a known klass pointer, not " &
+          "a per-instance UnityEvent"
+    iErr(why & ". Refusing to call it.")
     return false
   var fn: Il2CppPtr = nil
   var rva = 0'u32
   if not iNavFind("UnityEvent::Invoke", fn, rva):
+    why = "UnityEvent::Invoke did not byte-verify on this build"
     return false
   iMark("pressname: UnityEvent::Invoke", ev)
   discard cInspUP(fn, ev, nil)
@@ -5178,42 +5817,93 @@ proc iCmdPressName(toks: seq[string]) =
     return
   if not iNavGate("pressname"):
     return
-  let want = toks[1]
-  var roots: seq[Il2CppPtr] = @[]
-  var rootDesc = ""
-  if toks.len > 2:
-    var rv = 0'u64
-    var e = ""
-    if not iEval(toks[2], rv, e):
-      iErr(e)
-      return
-    let rp = iToTransform(cast[Il2CppPtr](rv))
-    if rp == nil or not duOk(rp, 0x20'i32) or not iUnityAlive(rp):
-      iErr("the ROOT \"" & toks[2] & "\" does not read back as a live " &
-           "Transform; nothing was searched. (An unreadable ROOT is exactly " &
-           "how a search reports a false 'not present'.)")
-      return
-    roots.add rp
-    rootDesc = "from " & iPtr(rp) & " name=\"" & iObjName(rp) & "\""
-  else:
-    let n = iSceneRoots(roots, false)
-    if n == 0:
-      iErr("scene-root enumeration did not work on this build, so pressname " &
-           "has nothing to search from. Pass an explicit ROOT. (INCONCLUSIVE)")
-      return
-    rootDesc = "ALL " & $n & " scene root(s)"
-  var hits: seq[Il2CppPtr] = @[]
-  var exhaustive = false
-  let nHits = iCollectByName(want, roots, InspFindDefBudget, PressNameMaxHits,
-                             hits, exhaustive)
-  iOut("  pressname \"" & want & "\": searched " & rootDesc & " and found " &
-       $nHits & " name match(es)" &
+
+  # ---- AUTOMATIC CONTINUATION, exactly as `find` does it ----
+  # The name search now spans frames. Re-entering this command at the same
+  # index RESUMES the frontier; restarting it would re-walk everything already
+  # rejected and could never get past one frame's slice -- which is why the
+  # old one-slice walk could report "0 name match(es) ... INCONCLUSIVE" for a
+  # button that was on screen, with no way to continue.
+  var resuming = false
+  if gPnActive and gPnOwnerIdx == gInspCurIdx and gPnOwnerBatch == gInspBatch:
+    resuming = true
+    inc gPnFrames
+  if not resuming:
+    let want = toks[1]
+    var roots: seq[Il2CppPtr] = @[]
+    var rootDesc = ""
+    if toks.len > 2:
+      var rv = 0'u64
+      var e = ""
+      if not iEval(toks[2], rv, e):
+        iErr(e)
+        return
+      let rp = iToTransform(cast[Il2CppPtr](rv))
+      if rp == nil or not duOk(rp, 0x20'i32) or not iUnityAlive(rp):
+        iErr("the ROOT \"" & toks[2] & "\" does not read back as a live " &
+             "Transform; nothing was searched. (An unreadable ROOT is exactly " &
+             "how a search reports a false 'not present'.)")
+        return
+      roots.add rp
+      rootDesc = "from " & iPtr(rp) & " name=\"" & iObjName(rp) & "\""
+    else:
+      let n = iSceneRoots(roots, false)
+      if n == 0:
+        iErr("scene-root enumeration did not work on this build, so pressname " &
+             "has nothing to search from. Pass an explicit ROOT. (INCONCLUSIVE)")
+        return
+      rootDesc = "ALL " & $n & " scene root(s)"
+    gPnQueue = @[]
+    for r in roots:
+      if r != nil:
+        gPnQueue.add r
+    gPnHead = 0
+    gPnWant = iLower(want)
+    gPnHits = @[]
+    gPnVisited = 0
+    gPnSkips = 0
+    gPnBudgetLeft = PressNameBudget
+    gPnFrames = 1
+    gPnActive = true
+    gPnOwnerIdx = gInspCurIdx
+    gPnOwnerBatch = gInspBatch
+    gPnRootDesc = rootDesc
+    iOut("  pressname \"" & want & "\": searching " & rootDesc &
+         " (budget " & $PressNameBudget & " nodes, " &
+         $int(InspFindSliceMs) & "ms per frame, continuing across frames " &
+         "automatically until EXHAUSTIVE)")
+
+  let st = iPressNameStep()
+  if st == FindOutOfTime and gPnBudgetLeft > 0 and
+     gPnFrames < InspFindMaxFrames:
+    # Out of frame TIME, not out of permission: park and carry on next frame.
+    # Silent by design -- a progress line every frame would bury the verdict.
+    gFindSuspend = true
+    return
+  gPnActive = false
+  gPnOwnerIdx = -1
+  gPnOwnerBatch = -1
+  let stopped = iFindStopReason(st, gPnBudgetLeft, gPnFrames)
+  let exhaustive = (stopped == FindDone)
+  var hits = gPnHits
+  let nHits = hits.len
+  iOut("  pressname \"" & gPnWant & "\": searched " & gPnRootDesc & ", " &
+       $gPnVisited & " node(s) over " & $gPnFrames & " frame(s), frontier " &
+       $(gPnQueue.len - gPnHead) & " node(s), found " & $nHits &
+       " name match(es)" &
        (if exhaustive: " (search EXHAUSTIVE)"
-        else: " (search STOPPED EARLY -- budget/time/hit cap)"))
+        elif stopped == FindOutOfFrames:
+          " (STOPPED EARLY on the FRAME CAP of " & $InspFindMaxFrames &
+          " frames -- NOT the node budget, which still has " &
+          $gPnBudgetLeft & " left)"
+        elif stopped == FindEnoughHits:
+          " (STOPPED EARLY at the match cap of " & $PressNameMaxHits & ")"
+        else: " (STOPPED EARLY on the NODE BUDGET of " &
+              $PressNameBudget & ")"))
   if nHits == 0:
     if exhaustive:
-      iErr("FAIL: no GameObject named like \"" & want & "\" exists under the " &
-           "searched roots. Nothing was pressed.")
+      iErr("FAIL: no GameObject named like \"" & gPnWant & "\" exists under " &
+           "the searched roots. Nothing was pressed.")
     else:
       iErr("INCONCLUSIVE: no match found, but the search did not finish, so " &
            "absence is not proven. Narrow with a ROOT and retry. Nothing was " &
@@ -5236,11 +5926,18 @@ proc iCmdPressName(toks: seq[string]) =
     let node = visible[0]
     iOut("  pressing the single VISIBLE candidate " & iPtr(node) &
          " name=\"" & iObjName(node) & "\"")
-    if iPressComponentAndFire(node):
+    var why = ""
+    if iPressComponentAndFire(node, why):
       iOut("  pressname: PASS -- exactly one VISIBLE candidate, pressed.")
     else:
+      # THE REASON GOES ON THIS LINE. "see the line above" was a verdict
+      # pointing at evidence that could not be found in the out-file at all.
       iOut("  pressname: FAIL -- the single VISIBLE candidate could not be " &
-           "pressed (see the line above). Nothing else was tried.")
+           "pressed: " &
+           (if why.len > 0: why
+            else: "NO REASON WAS RECORDED, which is itself a bug in this " &
+                  "verb -- treat this as INCONCLUSIVE, not as 'unpressable'") &
+           ". Nothing else was tried.")
     return
   if visible.len == 0:
     if inconclusive > 0:
@@ -6314,9 +7011,28 @@ proc iCmdHelp() =
   iOut("    until EXPR [FRAMES]           park until the ptr at EXPR is non-0")
   iOut("                                  e.g.  until $settings+0x118 120")
   iOut("    open [GROUP]                  SettingsScreen::ShowScreen (async!)")
-  iOut("                                  e.g.  allow write | open 0")
-  iOut("    tab EXPR [0|1]                SettingsTab::set_IsSelected")
+  iOut("       GROUP is a NAME or 0..4: 0 Screen (aka Graphics/display),")
+  iOut("       1 Game, 2 Sound (audio), 3 Control(s), 4 PostFX. An unknown")
+  iOut("       name is REFUSED, never read as 0. Refuses too if the screen is")
+  iOut("       not activeInHierarchy (closing/closed) -- wait, do not retry.")
+  iOut("                                  e.g.  allow write | open graphics")
+  iOut("    tab EXPR [0|1]                SELECT A TAB THE WAY A CLICK DOES:")
+  iOut("       Toggle::set_isOn on the tab's own toggle. EXPR is a")
+  iOut("       EFT.UI.Settings.SettingsTab (its Toggle is looked up) or the")
+  iOut("       Toggle itself; ANY OTHER TYPE IS REFUSED by klass, and the")
+  iOut("       screen's _currentTab is read back to show the PANEL followed.")
+  iOut("    raidexit | raidexit status    LEAVE THE RAID, host-native:")
+  iOut("       ShowInRaid -> DISCONNECT -> LEAVE -> results NextButton, each")
+  iOut("       step asserting the target is ACTIVE before pressing. Verdict is")
+  iOut("       an ACTIVE PlayButton under `Menu UI`, read off the live tree.")
+  iOut("    raid [MAP] | raid status      ARM THE HOST-NATIVE RAID ENTRY NOW")
+  iOut("       (~1s menu-to-READY, in-process -- not a UI tree walk). MAP")
+  iOut("       defaults to autoRaidMap. Refuses if a live GameWorld says we")
+  iOut("       are in a raid. ASYNCHRONOUS: the outcome is the host log.")
   iOut("  -- hierarchy (children/find are READ-ONLY; click/invoke need write) --")
+  iOut("    parent EXPR [DEPTH]           the parent chain upward. [0] IS THE")
+  iOut("       NODE YOU PASSED, [1] its parent; DEPTH counts levels PRINTED.")
+  iOut("       A GameObject is REFUSED (pass its Transform).")
   iOut("    children EXPR [N]             list child transforms, bind $c0..$cN")
   iOut("                                  e.g.  children $preloader")
   iOut("    tree EXPR [DEPTH]             the subtree, indented (learn names)")
@@ -6326,6 +7042,8 @@ proc iCmdHelp() =
   iOut("    find NAME [ROOT] [BUDGET]     name search; NO ROOT = ALL scenes")
   iOut("    find NAME in ROOTNAME         narrow by a root named, not pointed")
   iOut("    find more [BUDGET]            RESUME a search that hit its cap")
+  iOut("       A cap message NAMES which cap: FRAME CAP vs NODE BUDGET. The")
+  iOut("       frontier is kept either way, so `more` never re-walks.")
   iOut("    findtext SUBSTR [ROOT] [BUDGET] [all]  TEXT A CONTROL DISPLAYS")
   iOut("                                  (TMP_Text only), not GameObject name")
   iOut("                                  ACTIVE nodes only by default; `all`")
@@ -6341,6 +7059,8 @@ proc iCmdHelp() =
   iOut("    press EXPR [OFF]              EFT DefaultUIButton.OnClick (+0x120)")
   iOut("    pressname NAME [ROOT]         find -> keep the ONE VISIBLE -> press")
   iOut("                                  it. Refuses on 0 or >1 visible (write)")
+  iOut("       The name search now RESUMES ACROSS FRAMES until EXHAUSTIVE, and")
+  iOut("       a FAIL prints the failing check ON THE VERDICT LINE.")
   iOut("    record on | record off        log every UI click as `clickrec:`")
   iOut("                                  to the host log (read-only)")
   iOut("    click EXPR                    Button::Press (checks interactable)")
@@ -6412,6 +7132,140 @@ proc iCmdHelp() =
   iOut("  TARGET  name:<substring>  or  rva:0x<hex>[/<expected prologue hex>]")
   iOut("  SIG     <ret>_<args>, ret in v/b/i/l/p/f/s, args in p/i/b/f/l")
   iOut("        e.g.  s_p   String return, one pointer argument (get_name)")
+
+# ---------------------------------------------------------------------------
+# THE `raid` MAILBOX -- trigger the HOST-NATIVE fast raid entry ON DEMAND.
+#
+# WHY. Driving the menu with `findtext`/`pressname` from outside is SLOW: every
+# step is a file round-trip plus a multi-frame tree walk, and the user's verdict
+# on it tonight was blunt. `autoraid.nim` already does the whole menu->READY
+# sequence INSIDE the client, riding the TarkovApplication::Update drain, at a
+# measured ~970ms menu-to-READY -- but it only ever armed itself at LAUNCH, from
+# the `uxAutoRaid` flag, so there was no way to say "go NOW".
+#
+# WHY A MAILBOX AND NOT A CALL, again. `autoraid.nim` is `include`d AFTER this
+# file (aowlhost.nim:6516 vs :6486) and nimony does not forward-resolve procs
+# across an include boundary reliably. This is the same wire `pact` uses, for
+# the same reason -- and it deliberately does NOT reimplement any of autoraid's
+# discovery: it arms autoraid's own state machine and autoraid does the work.
+#
+# WHAT THIS VERB CAN AND CANNOT PROVE. It can prove a request was ACCEPTED and
+# it can refuse on the one precondition it can positively establish -- a live
+# GameWorld means we are in a raid. It CANNOT prove the main menu is up: that
+# is autoraid's WAIT-MENU step, which already discovers a visible MenuScreen
+# PlayButton and refuses/times out on its own. So the answer here is
+# ASYNCHRONOUS and this verb says so: the outcome is host-log lines
+# (`autoRaid: ...`, `raid phase = LOADING/DEPLOYED`), never this reply.
+# ---------------------------------------------------------------------------
+var gInspRaidReq = ""     ## pending map name; "-" means "autoRaidMap default"
+var gInspRaidSeq = 0'i64  ## requests accepted
+var gInspRaidAns = ""     ## set by autoraid.nim's drain (armed / refused / failed)
+var gInspRaidStage = ""   ## set by autoraid.nim's arGoto on every step change
+
+var gInspExitReq = ""     ## non-empty means "leave the raid"; drained by autoraid.nim
+var gInspExitAns = ""     ## set by raidExitDrainTick
+var gInspExitStage = ""   ## set by xrGoto on every step change
+  ## THE `raidexit` MAILBOX. Same wire, same reason as `raid` and `pact`:
+  ## the state machine lives in autoraid.nim, which is `include`d after this
+  ## file, so this deposits a request and that drains it.
+
+proc iCmdRaidExit(toks: seq[string]) =
+  ## `raidexit` -- LEAVE THE RAID, host-native, and verify against the tree.
+  ## `raidexit status` -- what the leave sequence is doing.
+  if toks.len > 1 and iLower(toks[1]) == "status":
+    iOut("  raidexit: pending=" &
+         (if gInspExitReq.len > 0: "yes" else: "no") &
+         "  stage: " & (if gInspExitStage.len > 0: gInspExitStage
+                        else: "(never armed this session)"))
+    iOut("  last answer: " & (if gInspExitAns.len > 0: gInspExitAns
+                              else: "(none yet)"))
+    iOut("  NOTE: this reports what the drain last PUBLISHED, not a fresh " &
+         "measurement. The full trail is the host log (`raidExit:` lines).")
+    return
+  if not iNavGate("raidexit"):
+    return
+  # REFUSE WHEN NOT IN A RAID -- and prove it positively rather than inferring
+  # it from scene roots, which is exactly what was measured to be wrong in a
+  # raid tonight (the location scene was all `roots` could see).
+  if gDuGameWorld == nil or not duOk(gDuGameWorld, 0x20'i32):
+    iErr("raidexit REFUSED: no live GameWorld is readable, so this session " &
+         "is not in a raid as far as anything measurable here is concerned. " &
+         "Nothing was armed. (This is a positive test for BEING in a raid; it " &
+         "does not claim to know what screen you are on instead.)")
+    return
+  if gInspExitReq.len > 0:
+    iErr("a raidexit request is STILL PENDING -- the drain has not run since " &
+         "it was queued. Nothing was armed.")
+    return
+  gInspExitReq = "go"
+  iOut("  queued: leave the raid, host-native.")
+  iOut("  SEQUENCE: MenuScreen::ShowInRaid -> wait for _disconnectButton to " &
+       "become activeInHierarchy -> press DISCONNECT -> LeaveButton (skipped " &
+       "if it never appears) -> the Session End UI NextButton per results " &
+       "page -> VERIFY.")
+  iOut("  THE VERDICT IS READ OFF THE LIVE TREE: an ACTIVE, pressable " &
+       "PlayButton under `Menu UI`. Queued is NOT out -- watch " &
+       "`raidexit status` or the host log's `raidExit:` lines.")
+
+proc iCmdRaid(toks: seq[string]) =
+  ## `raid [MAP]`  -- arm the host-native raid entry NOW
+  ## `raid status` -- what autoraid is doing, as autoraid itself reports it
+  if toks.len > 1 and iLower(toks[1]) == "status":
+    iOut("  raid: accepted=" & $gInspRaidSeq &
+         "  pending=" & (if gInspRaidReq.len > 0: "\"" & gInspRaidReq & "\""
+                         else: "(none)"))
+    iOut("  stage: " & (if gInspRaidStage.len > 0: gInspRaidStage
+                        else: "(autoraid has not reported a stage this " &
+                              "session -- it has never been armed, or the " &
+                              "drain has not run since)"))
+    iOut("  last answer: " & (if gInspRaidAns.len > 0: gInspRaidAns
+                              else: "(none yet)"))
+    iOut("  NOTE: `status` reports what the drain last PUBLISHED. It is not a " &
+         "fresh measurement of the menu; the authoritative trail is the host " &
+         "log (`autoRaid:` and `raid phase =` lines).")
+    return
+  if not iNavGate("raid"):
+    return
+  # THE ONE PRECONDITION THIS SIDE CAN POSITIVELY ESTABLISH.
+  #
+  # A live, readable GameWorld means a raid is running -- driving the menu
+  # state machine then would walk a hierarchy that is not the menu, during a
+  # raid, which is exactly the case fact #261 says must never happen.
+  #
+  # The converse is NOT asserted: a null GameWorld is not proof we are at the
+  # menu, and this refuses to pretend otherwise (the same mistake `state` was
+  # corrected for -- claiming not-in-raid from an anchor slot). Whether the
+  # MENU is actually up is autoraid's WAIT-MENU step, which looks for a
+  # VISIBLE MenuScreen PlayButton and times out saying so.
+  if gDuGameWorld != nil and duOk(gDuGameWorld, 0x20'i32):
+    iErr("raid REFUSED: a live GameWorld is present (" & iPtr(gDuGameWorld) &
+         "), so this session is IN A RAID. The raid-entry state machine walks " &
+         "the MENU hierarchy and must never run during a raid load (fact " &
+         "#261). Nothing was armed. Leave the raid first.")
+    return
+  if gInspRaidReq.len > 0:
+    iErr("a raid request (map \"" & gInspRaidReq & "\") is STILL PENDING -- " &
+         "the drain has not run since it was queued. Nothing was armed. This " &
+         "is a queue-depth refusal, not a failure of the request.")
+    return
+  var map = "-"
+  if toks.len > 1:
+    map = toks[1]
+    if map.len > 32:
+      iErr("that map name is " & $map.len & " characters; refusing to queue " &
+           "it. Nothing was armed.")
+      return
+  gInspRaidReq = map
+  gInspRaidSeq = gInspRaidSeq + 1
+  iOut("  queued #" & $gInspRaidSeq & ": arm the HOST-NATIVE raid entry" &
+       (if map == "-": " with the configured autoRaidMap"
+        else: " with map \"" & map & "\""))
+  iOut("  ACCEPTED IS NOT ENTERED. The next drain frame arms autoraid's state " &
+       "machine (WAIT-MENU -> PLAY -> NEXT.. -> SELECT-MAP -> READY); the " &
+       "outcome is host-log lines `autoRaid: ...` and `raid phase = " &
+       "LOADING/DEPLOYED`. Read the log, or `raid status`, not this line.")
+  if gInspRaidAns.len > 0:
+    iOut("  previous answer: " & gInspRaidAns)
 
 # ---------------------------------------------------------------------------
 # THE `pact` MAILBOX -- the one wire between an OUTSIDE PROCESS and in-raid
@@ -6645,7 +7499,12 @@ proc iExec(line: string) =
       var d = 8'u64
       if toks.len > 2:
         discard iParseU(toks[2], d)
-      iCmdParent(cast[Il2CppPtr](v), int(d))
+      # A GameObject here makes `[0]` a DIFFERENT object than the one asked
+      # about (Component::get_transform on a GameObject is the documented
+      # native type confusion), which is the reachable cause of `parent`
+      # having appeared to number its levels two different ways.
+      if not iRefuseIfGameObject(cast[Il2CppPtr](v), "parent"):
+        iCmdParent(cast[Il2CppPtr](v), int(d))
   of "children":
     iCmdChildren(toks)
   of "find":
@@ -6678,6 +7537,10 @@ proc iExec(line: string) =
     iCmdOpen(toks)
   of "tab":
     iCmdTab(toks)
+  of "raid":
+    iCmdRaid(toks)
+  of "raidexit":
+    iCmdRaidExit(toks)
   of "state", "where":
     iCmdState(toks)
   of "record", "rec":

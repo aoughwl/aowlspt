@@ -182,6 +182,29 @@ proc checkEq(what, got, want: string) =
   check(what & " (got '" & got & "', wanted '" & want & "')", got == want)
 
 proc selfTest*(): int =
+  # ---- THE CHANNEL LOCK'S IDENTITY, against known answers ----
+  #
+  # The lock is only worth anything if it names the SAME FILE `channel.py`
+  # names. That is a pure function of a string, so it is checkable here with no
+  # client and no filesystem -- and it is exactly the part that can silently
+  # drift into a lock nobody else can see, which READS AS PROTECTION and is
+  # not. "a9993e364706" is SHA-1("abc") truncated, the standard known answer;
+  # "ad4ef68aa8f3" is hashlib.sha1(os.path.abspath(LIVE).lower().encode())
+  # .hexdigest()[:12] as computed by the Python on this machine, whose
+  # os.path.abspath returns forward slashes -- which is exactly why both
+  # spellings are locked (see normLive).
+  checkEq("sha1 hex is lowercase and truncated to 12", sha1Hex12("abc"),
+          "a9993e364706")
+  checkEq("live path normalises (backslash spelling)",
+          normLive("D:\\Aowlspt\\aowlspt\\", '\\'), "d:\\aowlspt\\aowlspt")
+  checkEq("live path normalises (forward spelling)",
+          normLive("D:\\Aowlspt\\aowlspt", '/'), "d:/aowlspt/aowlspt")
+  checkEq("lock name matches channel.py, forward spelling",
+          sha1Hex12(normLive("D:\\Aowlspt\\aowlspt", '/')), "ad4ef68aa8f3")
+  check("the two lock spellings really are different files",
+        lockPathFor("D:\\Aowlspt\\aowlspt", '\\') !=
+        lockPathFor("D:\\Aowlspt\\aowlspt", '/'))
+
   # A `roots` line.
   let rootLine = "  [$r3] transform=0x1f2a3b4c50 go=0x1f2a3b4c60 ($rgo3) " &
                  "name=\"Menu UI\""

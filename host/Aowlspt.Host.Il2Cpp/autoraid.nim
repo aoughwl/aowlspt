@@ -119,6 +119,13 @@ extern void* aowl_ar_tick_body(void* a);
 static void* aowl_ar_tick_guarded(void* a) {
     return aowl_p_p_seh((void*)aowl_ar_tick_body, a);
 }
+/* raidexit's own guard. A SEPARATE thunk, called from a SEPARATE tick, so the
+ * two are sequential and never nested -- aowl_p_p_seh is not re-entrant and a
+ * nested guard disarms the outer one. */
+extern void* aowl_xr_tick_body(void* a);
+static void* aowl_xr_tick_guarded(void* a) {
+    return aowl_p_p_seh((void*)aowl_xr_tick_body, a);
+}
 """.}
 proc cArTickGuarded(a: Il2CppPtr): Il2CppPtr {.importc: "aowl_ar_tick_guarded", nodecl.}
 
@@ -154,6 +161,11 @@ proc arStepName(s: int): string =
 proc arGoto(s: int) =
   gArStep = s
   gArStepT0 = cNowMs()
+  # Publish the stage so the inspector's `raid status` reports what THIS state
+  # machine believes, rather than a second opinion computed somewhere else.
+  # One string assignment on a step CHANGE -- not per frame, and there are at
+  # most ten steps in a whole run, so this is not a per-frame allocation.
+  gInspRaidStage = arStepName(s)
 
 # ---------------------------------------------------------------------------
 # Discovery: bounded, time-sliced. BREADTH-BEFORE-DEPTH, exactly like
@@ -537,6 +549,8 @@ proc arSelectMap(): bool =
 proc arFail(why: string) =
   gArOff = true
   gArStep = ArFailed
+  gInspRaidStage = "FAILED"
+  gInspRaidAns = "FAILED: " & why
   warn "autoRaid: " & why & " -- switching itself off for this session and " &
        "leaving the menu alone. This is a REFUSAL, not a success."
 
@@ -645,10 +659,329 @@ proc arTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ar_tick_body", cdecl.}
       arGoto(ArNext2)
     return
 
+proc arArmOnDemand() =
+  ## Drain ONE `raid [MAP]` request from the inspector's mailbox and arm this
+  ## state machine exactly as a launch with `uxAutoRaid` on would have.
+  ##
+  ## THIS IS WHY IT IS HERE AND NOT IN inspect.nim: none of autoraid's discovery
+  ## is duplicated. The verb deposits a map name; this resets the same variables
+  ## the launch path uses and lets the SAME machine run. If the menu is not
+  ## actually up, WAIT-MENU says so and times out -- there is no second, weaker
+  ## copy of that check anywhere.
+  ##
+  ## The warm-up is SKIPPED on purpose. `ArWarmupMs` exists because at LAUNCH
+  ## the menu cannot be up yet; an on-demand request comes from a human or an
+  ## agent who is looking at the menu, so waiting 5s again would only be slow.
+  ## WAIT-MENU remains the thing that decides whether the menu is really there.
+  if gInspRaidReq.len == 0: return
+  let req = gInspRaidReq
+  gInspRaidReq = ""
+  if req != "-":
+    gArMap = req
+  let now = cNowMs()
+  gArOn = true
+  gArOff = false
+  gArFaults = 0
+  gArStarted = true
+  gArT0 = (if now > ArWarmupMs: now - ArWarmupMs else: now)
+  gArFrames = ArTickFrames          ## act on THIS tick, not in half a second
+  gArLastPressed = nil
+  gArLastActionMs = 0'u64
+  gArPlaySeen = false
+  gArPlayExtends = 0
+  gArWaitLogMs = 0'u64
+  arGoto(ArWaitMenu)
+  gInspRaidAns = "ARMED on demand, map \"" & gArMap & "\", step WAIT-MENU"
+  okLog "autoRaid: ARMED ON DEMAND (inspector `raid`), map \"" & gArMap &
+        "\" -- the state machine starts at WAIT-MENU on this tick. If the " &
+        "main menu is not up, WAIT-MENU will time out and say so; being " &
+        "armed is not being in a raid."
+
+
+# ---------------------------------------------------------------------------
+# raidexit -- LEAVE A RAID, HOST-NATIVE. The mirror of the `raid` verb.
+#
+# WHY IT IS HERE AND NOT IN A TOOL. MEASURED tonight from inside a live Woods
+# raid: rootless `find MenuScreen 80000` plus two `find more` reported
+# "searched EXHAUSTIVELY ... genuinely NOT PRESENT" for a screen that was
+# alive, because in a raid neither `roots` nor `find` could reach
+# DontDestroyOnLoad. `tools/exitraid.py` therefore refused every attempt with
+# "no `Common UI` scene root". That reachability bug is fixed separately (the
+# remembered DDOL handle in inspect.nim) -- but even with it fixed, driving
+# five presses from outside costs five file round-trips and five tree walks.
+# The host is already standing next to these objects.
+#
+# THE SEQUENCE, and what each step ASSERTS rather than assumes:
+#   SHOW      EFT.UI.MenuScreen::ShowInRaid() @0x1539650 -- arity 0, UNIQUE,
+#             prologue 48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 48 (all
+#             three re-measured out of the shipped GameAssembly.dll here, not
+#             taken on trust). It is what puts the in-raid menu up.
+#   DISCONNECT_disconnectButton@+0xC0 (DefaultUIButton, offline field table).
+#             WAITS for its GameObject to be activeInHierarchy -- a READBACK,
+#             because pressing an inactive object returns success and does
+#             nothing (fact #72) -- then fires OnClick(+0x120).
+#   LEAVE     ReconnectionScreen/LeaveButton, if one appears. Its ABSENCE is
+#             not a failure: it is not always shown, so this step SKIPS after a
+#             bounded wait instead of self-disabling.
+#   RESULTS   the Session End UI NextButton, pressed repeatedly -- it is
+#             REBUILT per results page, so each press excludes the previous
+#             pointer and the next one must be a DIFFERENT object.
+#   VERIFY    the verdict is read off the LIVE TREE: an ACTIVE PlayButton under
+#             `Menu UI`. Not "the calls returned", not a step counter -- the
+#             thing a player would look at.
+#
+# SAFETY: default INERT (it does nothing until the inspector's `raidexit` verb
+# arms it, which itself needs liveInspectorWrite + `allow write`); ONE
+# aowl_p_p_seh around the whole body, never nested; every step time-boxed and
+# the whole run capped; every walk bounded by ArNodeBudget and ArWalkMs; it
+# self-disables after XrMaxFaults.
+# ---------------------------------------------------------------------------
+const
+  XrIdle       = 0
+  XrShow       = 1
+  XrDisconnect = 2
+  XrLeave      = 3
+  XrResults    = 4
+  XrVerify     = 5
+  XrDone       = 6
+  XrFailed     = 7
+
+  XrShowInRaidRva = 0x1539650'u64
+  XrShowInRaidSig = "48895C240848897424105748"
+    ## `EFT.UI.MenuScreen::ShowInRaid`. The literal is the first 12 bytes as
+    ## hex; `iPrologueOk` compares the bytes it is given, so a SHORTER prefix
+    ## is a weaker check, never a false one. Full 16 measured:
+    ## 48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 48
+  XrDiscBtnOff = 0xC0'i32   ## MenuScreen._disconnectButton (offline fields)
+  XrInGameOff  = 0x110'i32  ## MenuScreen._inGameScreenStatus (bool)
+  XrStepMs     = 20000'u64  ## per-step ceiling
+  XrLeaveMs    = 6000'u64   ## how long a LeaveButton is waited for before SKIP
+  XrTotalMs    = 180000'u64 ## whole-run ceiling
+  XrTickFrames = 12         ## ~0.2s between attempts
+  XrMaxFaults  = 3
+  XrMaxResults = 12         ## results pages pressed before refusing
+
+var gXrStep = XrIdle
+var gXrT0 = 0'u64
+var gXrStepT0 = 0'u64
+var gXrFrames = 0
+var gXrFaults = 0
+var gXrMenu: Il2CppPtr = nil        ## the MenuScreen we called ShowInRaid on
+var gXrLastPressed: Il2CppPtr = nil ## the NextButton just pressed (dedup)
+var gXrResults = 0
+
+proc xrStepName(s: int): string =
+  case s
+  of XrIdle:       "IDLE"
+  of XrShow:       "SHOW-IN-RAID"
+  of XrDisconnect: "DISCONNECT"
+  of XrLeave:      "LEAVE"
+  of XrResults:    "RESULTS"
+  of XrVerify:     "VERIFY"
+  of XrDone:       "DONE"
+  else:            "FAILED"
+
+proc xrGoto(s: int) =
+  gXrStep = s
+  gXrStepT0 = cNowMs()
+  gInspExitStage = xrStepName(s)
+
+proc xrFail(why: string) =
+  gXrStep = XrFailed
+  gInspExitStage = "FAILED"
+  gInspExitAns = "FAILED: " & why
+  warn "raidExit: " & why & " -- stopping. This is a REFUSAL, not a success."
+
+proc xrFindAny(name: string): Il2CppPtr =
+  ## The node named `name` anywhere in the enumerated roots, ACTIVE OR NOT --
+  ## MenuScreen is INACTIVE in a raid, which is the entire reason ShowInRaid
+  ## exists, so the active-only walk cannot be used to find it.
+  result = nil
+  var roots: seq[Il2CppPtr] = @[]
+  arEnumRoots(roots)
+  if roots.len == 0: return
+  let deadline = cNowMs() + ArWalkMs
+  var found: seq[Il2CppPtr] = @[]
+  var i = 0
+  while i < roots.len and cNowMs() <= deadline and found.len == 0:
+    let r = iToTransform(roots[i])
+    if r != nil and duOk(r, 0x20'i32):
+      var b = ArNodeBudget
+      arCollect(r, name, ArFindDepth, b, deadline, found, 1)
+    i = i + 1
+  if found.len > 0:
+    result = found[0]
+
+proc xrTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_xr_tick_body", cdecl.} =
+  ## At most ONE discovery + ONE press per call, so the machine self-paces.
+  result = cast[Il2CppPtr](1)
+  discard a
+  let now = cNowMs()
+  if now - gXrT0 > XrTotalMs:
+    xrFail("the whole leave sequence exceeded " & $int(XrTotalMs div 1000'u64) &
+           "s at step " & xrStepName(gXrStep))
+    return
+  if gXrStep != XrLeave and now - gXrStepT0 > XrStepMs:
+    xrFail("step " & xrStepName(gXrStep) & " found nothing within " &
+           $int(XrStepMs div 1000'u64) & "s")
+    return
+
+  if gXrStep == XrShow:
+    let ms = xrFindAny("MenuScreen")
+    if ms == nil: return          # keep looking; the step timeout bounds this
+    var comp: Il2CppPtr = nil
+    var w = ""
+    if not iVisComponent(ms, "MenuScreen", comp, w) or comp == nil:
+      # The GameObject named MenuScreen exists but carries no MenuScreen
+      # component -- say that rather than calling ShowInRaid on a Transform.
+      xrFail("a GameObject named MenuScreen was found but it has no " &
+             "EFT.UI.MenuScreen component (" & w & ")")
+      return
+    if not duOk(comp, XrDiscBtnOff + 8'i32):
+      xrFail("the MenuScreen component is not readable to +0x" &
+             iHexPad(uint64(XrDiscBtnOff), 3))
+      return
+    let fn = cInspCode(XrShowInRaidRva)
+    if fn == nil:
+      xrFail("MenuScreen::ShowInRaid @0x" & iHexPad(XrShowInRaidRva, 7) &
+             " did not resolve as callable code on this build")
+      return
+    if not iPrologueOk(fn, XrShowInRaidSig):
+      xrFail("MenuScreen::ShowInRaid @0x" & iHexPad(XrShowInRaidRva, 7) &
+             " does not match its recorded prologue on this build")
+      return
+    gXrMenu = comp
+    iMark("raidExit: MenuScreen::ShowInRaid", comp)
+    discard cInspUP(fn, comp, nil)
+    okLog "raidExit: called MenuScreen::ShowInRaid on " & iPtr(comp) &
+          " -- waiting for _disconnectButton to become activeInHierarchy " &
+          "(a READBACK, not an assumption)"
+    xrGoto(XrDisconnect)
+    return
+
+  if gXrStep == XrDisconnect:
+    if gXrMenu == nil or not duOk(gXrMenu, XrDiscBtnOff + 8'i32):
+      xrFail("the MenuScreen pointer went unreadable before DISCONNECT")
+      return
+    let btn = cReadPtrAt(gXrMenu, XrDiscBtnOff)
+    if btn == nil or not duOk(btn, 0x20'i32) or not iUnityAlive(btn):
+      return                      # not wired yet; the step timeout bounds it
+    let (ok, act) = iActiveInHierarchy(btn)
+    if not ok:
+      return
+    if not act:
+      return                      # STILL CLOSED. Pressing it now would report
+                                  # success and do nothing (fact #72).
+    if not arIsPressable(btn, "DefaultUIButton"):
+      return
+    if not arPress(btn, "DefaultUIButton"):
+      xrFail("the DISCONNECT button was active and pressable a moment ago and " &
+             "the press did not fire")
+      return
+    okLog "raidExit: pressed DISCONNECT (" & iPtr(btn) & ")"
+    gXrLastPressed = nil
+    gXrResults = 0
+    xrGoto(XrLeave)
+    return
+
+  if gXrStep == XrLeave:
+    let lb = arFindActiveAcross("Common UI", "LeaveButton", nil)
+    if lb == nil:
+      if now - gXrStepT0 > XrLeaveMs:
+        okLog "raidExit: no ACTIVE LeaveButton appeared within " &
+              $int(XrLeaveMs div 1000'u64) & "s -- this screen is not always " &
+              "shown, so this is a SKIP, not a failure"
+        xrGoto(XrResults)
+      return
+    if arPress(lb, "DefaultUIButton"):
+      okLog "raidExit: pressed LEAVE (" & iPtr(lb) & ")"
+      xrGoto(XrResults)
+    return
+
+  if gXrStep == XrResults:
+    # The results NextButton is REBUILT per page, so `exclude` is what stops
+    # this pressing one dead pointer forever and calling it progress.
+    let nb = arFindActiveAcross("Session End UI", "NextButton", gXrLastPressed)
+    if nb == nil:
+      # No further page. Whether that means "finished" is decided by VERIFY,
+      # which reads the tree, not by this absence.
+      xrGoto(XrVerify)
+      return
+    if gXrResults >= XrMaxResults:
+      xrFail("pressed " & $gXrResults & " results pages without reaching the " &
+             "menu; refusing to keep pressing")
+      return
+    if arPress(nb, "DefaultUIButton"):
+      gXrResults = gXrResults + 1
+      gXrLastPressed = nb
+      gXrStepT0 = now
+      okLog "raidExit: pressed results NextButton #" & $gXrResults &
+            " (" & iPtr(nb) & ")"
+    return
+
+  if gXrStep == XrVerify:
+    # THE VERDICT, READ OFF THE LIVE TREE. An ACTIVE PlayButton under `Menu UI`
+    # is the thing a player would see; "every call returned" is not evidence.
+    let pb = arFindActiveAcross("Menu UI", "PlayButton", nil)
+    if pb != nil and arIsPressable(pb, "DefaultUIButton"):
+      gXrStep = XrDone
+      gInspExitStage = "DONE"
+      gInspExitAns = "DONE: an ACTIVE, pressable PlayButton is under `Menu " &
+                     "UI` -- we are back at the main menu"
+      okLog "raidExit: DONE -- verified by an ACTIVE, pressable PlayButton " &
+            "under `Menu UI` (" & iPtr(pb) & "), not by the calls returning"
+      return
+    # Not there yet: the results chain may have another page.
+    if arFindActiveAcross("Session End UI", "NextButton", gXrLastPressed) != nil:
+      xrGoto(XrResults)
+    return
+
+proc cXrTickGuarded(a: Il2CppPtr): Il2CppPtr {.importc: "aowl_xr_tick_guarded", nodecl.}
+
+proc xrArmOnDemand() =
+  if gInspExitReq.len == 0: return
+  gInspExitReq = ""
+  gXrT0 = cNowMs()
+  gXrFaults = 0
+  gXrFrames = XrTickFrames
+  gXrMenu = nil
+  gXrLastPressed = nil
+  gXrResults = 0
+  xrGoto(XrShow)
+  gInspExitAns = "ARMED, step SHOW-IN-RAID"
+  okLog "raidExit: ARMED ON DEMAND (inspector `raidexit`) -- SHOW-IN-RAID -> " &
+        "DISCONNECT -> LEAVE -> RESULTS -> VERIFY. Armed is not out."
+
+proc raidExitDrainTick() =
+  ## Rides the same TarkovApplication::Update drain autoraid does. INERT until
+  ## armed: when idle this is one integer compare and one string-length check,
+  ## and makes no call into the game.
+  xrArmOnDemand()
+  if gXrStep == XrIdle or gXrStep == XrDone or gXrStep == XrFailed: return
+  gXrFrames = gXrFrames + 1
+  if gXrFrames < XrTickFrames: return
+  gXrFrames = 0
+  if cXrTickGuarded(nil) == nil:
+    gXrFaults = gXrFaults + 1
+    warn "raidExit: the guarded tick body faulted (" & $gXrFaults & " of " &
+         $XrMaxFaults & ")"
+    if gXrFaults >= XrMaxFaults:
+      xrFail("too many faults")
+
 proc autoRaidDrainTick() =
   ## Rides the `EFT.TarkovApplication::Update` drain (slot alias, no second
   ## detour). Cheap when idle: off, self-disabled, done, or inside the warm-up it
   ## is a handful of integer compares and makes NO call into the game.
+  #
+  # The mailbox is drained BEFORE the flag early-out, and that ordering is the
+  # whole point: `uxAutoRaid` is default OFF, so a check of `gArOn` first would
+  # make the on-demand verb work only in sessions that did not need it.
+  arArmOnDemand()
+  # raidexit rides here too rather than taking a detour of its own, and it is
+  # driven BEFORE the autoraid flag early-out for the same reason arArmOnDemand
+  # is: gating an on-demand verb behind a default-OFF launch flag would make it
+  # work only where it is not needed.
+  raidExitDrainTick()
   if not gArOn or gArOff: return
   if gArStep == ArDone: return
   if gArT0 == 0'u64: gArT0 = cNowMs()

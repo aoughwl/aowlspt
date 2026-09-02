@@ -33,7 +33,7 @@
 ## The differences are the four bugs that port was asked to fix, each marked
 ## `PORT FIX` below.
 
-import std/[strutils, syncio]
+import std/[strutils, syncio, sha1, envvars, widestrs]
 import std/windows/winlean
 import aowlsptinstall/winfs
 
@@ -256,6 +256,205 @@ proc diagnose(u: Ui): string =
   result = "last of what the host said about the channel:\n" &
            joinStr(tail, "\n")
 
+# ---------------------------------------------------------------------------
+# THE CHANNEL LOCK -- the same one `plugins/aowlsptcode/mcp/channel.py` takes,
+# and interoperable with it BY CONSTRUCTION.
+#
+# The command file is ONE file with no two-writer protocol: B's write replaces
+# A's before the host has read it, and A then waits out its whole timeout for an
+# answer to a batch the host never saw. That reads as a host fault or a hang; it
+# is neither. `channel.py` has guarded its side since it was written -- and
+# `docs/HARNESS-AUDIT.md` names THIS file as the non-cooperating fourth writer,
+# which matters more than the others because it is the side `aowlspt-launch.exe`
+# uses in-process, next to a human who may be playing.
+#
+# INTEROPERABILITY IS THE WHOLE POINT, so every detail below mirrors
+# `channel.py` deliberately and is asserted by `aowl ui selftest`:
+#   * same directory: the system temp dir, NOT the live install (a human may be
+#     mid-raid and this has no business creating files next to the game);
+#   * same name: "aowlspt-inspect-" & the first 12 hex digits, LOWERCASE, of the
+#     SHA-1 of the lowercased absolute live path, & ".lock";
+#   * same acquire: create-EXCLUSIVE, so a lock file left on disk by the Python
+#     side (which closes its handle and leaves the file) blocks us, which a
+#     CREATE_ALWAYS open would not;
+#   * same self-heal: a lock older than LOCK_STALE_S is broken, because a
+#     crashed holder must not wedge the channel forever;
+#   * same failure semantics: if the lock cannot be taken AT ALL (no temp dir,
+#     permissions) we proceed UNLOCKED and say so -- that is what this file did
+#     before, so it is not a regression -- but a lock held by someone else is a
+#     REFUSAL with its own message, never a timeout.
+# ---------------------------------------------------------------------------
+const LockStaleMs* = 180_000'i64   ## == channel.py's LOCK_STALE_S = 180.0
+const LockWaitMs*  = 60_000'i64    ## == channel.py's default timeout = 60.0
+
+proc lockTempDir*(): string =
+  ## Python's `tempfile.gettempdir()` consults TMPDIR, TEMP, TMP in THAT order
+  ## on every platform. Matching the order matters more than matching the
+  ## Windows API: if the two disagree about the directory they compute
+  ## different paths and neither ever sees the other's lock -- a lock that
+  ## silently does not interoperate is worse than no lock, because it reads as
+  ## protection.
+  var d = getEnv("TMPDIR")
+  if d.len == 0: d = getEnv("TEMP")
+  if d.len == 0: d = getEnv("TMP")
+  if d.len == 0: d = "C:\\Temp"
+  result = d
+
+proc normLive*(live: string; sep: char): string =
+  ## `os.path.abspath(live).lower()` for an already-absolute path, with `sep`
+  ## as the separator every component is joined by.
+  ##
+  ## THE SEPARATOR IS A PARAMETER BECAUSE PYTHON'S ANSWER IS NOT FIXED, and
+  ## that is a measured hazard, not a hypothetical one. `channel.py` hashes
+  ## `os.path.abspath(live).lower()`; run under the Python on this machine
+  ## that returns `d:/aowlspt/aowlspt` (sha1[:12] `ad4ef68aa8f3`), while a
+  ## native-Windows Python returns `d:\aowlspt\aowlspt`, a DIFFERENT hash and
+  ## therefore a DIFFERENT lock file. A lock whose name depends on which
+  ## interpreter computed it does not interoperate, and a lock that does not
+  ## interoperate is worse than none because it reads as protection.
+  ##
+  ## So this side does not guess which one the peer used: it takes BOTH (see
+  ## `lockAcquire`). The real fix belongs on the Python side -- normalise the
+  ## separators before hashing -- and is reported, not silently worked around.
+  var t = ""
+  for i in 0 ..< live.len:
+    if live[i] == '/' or live[i] == '\\': t.add sep
+    else: t.add live[i]
+  while t.len > 3 and t[t.len - 1] == sep:
+    t = t.substr(0, t.len - 2)
+  result = toLowerAscii(t)
+
+proc sha1Hex12*(s: string): string =
+  ## The first 12 characters of a LOWERCASE hex SHA-1 -- `hexdigest()[:12]`.
+  ## `$SecureHash` in the stdlib emits UPPERCASE, which would produce a
+  ## different filename and therefore a lock nobody else can see.
+  var st = newSha1State()
+  update(st, s)
+  let d = finalize(st)
+  const HexLower = "0123456789abcdef"
+  result = ""
+  var i = 0
+  while i < 6:
+    result.add HexLower[int(d[i] shr 4)]
+    result.add HexLower[int(d[i] and 0x0F'u8)]
+    i = i + 1
+
+proc lockPathFor*(live: string; sep: char = '\\'): string =
+  ## The path `channel.py`'s `lock_path()` computes for the same live dir, for
+  ## one choice of separator. The temp directory itself is used EXACTLY as the
+  ## environment gives it -- Python does the same, and Windows treats `/` and
+  ## `\` identically when opening, so a differing spelling still names the
+  ## same file.
+  result = joinPath(lockTempDir(),
+                    "aowlspt-inspect-" & sha1Hex12(normLive(live, sep)) &
+                    ".lock")
+
+proc lockFileAgeMs(p: string): int64 =
+  ## Age of the lock file in ms, or 0 when it cannot be read (which is treated
+  ## as "young", i.e. NOT breakable -- guessing old would break a live lock).
+  var blob = ""
+  if not readShared(p, blob): return 0
+  # The holder writes "<pid> <unix-seconds>\n"; parse the timestamp rather than
+  # asking the filesystem, so the two sides agree even across a clock/FS quirk.
+  var i = 0
+  while i < blob.len and blob[i] != ' ': inc i
+  inc i
+  var secs = ""
+  while i < blob.len and blob[i] != '\n' and blob[i] != '\r':
+    secs.add blob[i]
+    inc i
+  var whole = ""
+  for c in secs:
+    if c == '.': break
+    whole.add c
+  if whole.len == 0: return 0
+  var v = 0'i64
+  for c in whole:
+    if c < '0' or c > '9': return 0
+    v = v * 10'i64 + int64(int(c) - int('0'))
+  # nowMs() is FILETIME-based ms; convert to unix seconds the same way.
+  let nowUnix = (nowMs() div 1000'i64) - 11644473600'i64
+  if nowUnix <= v: return 0
+  result = (nowUnix - v) * 1000'i64
+
+proc lockTryCreate(p: string): bool =
+  ## CREATE_NEW: succeeds only if the file does not exist. This is the whole
+  ## interop: `channel.py` uses O_CREAT|O_EXCL and CLOSES its handle, leaving
+  ## the FILE as the lock, so anything that opens with CREATE_ALWAYS would sail
+  ## straight through it.
+  var wp = p
+  let w = newWideCString(wp)
+  let h = createFileW(w.toWideCString, GENERIC_WRITE, DWORD(0), nil,
+                      CREATE_NEW, FILE_ATTRIBUTE_NORMAL, Handle(0))
+  if not heldValid(h):
+    return false
+  var body = $processId() & " " & $((nowMs() div 1000'i64) - 11644473600'i64) &
+             ".0\n"
+  discard heldWrite(h, body)
+  heldClose(h)
+  result = true
+
+type
+  LockState* = enum
+    lsHeld,        ## we own it and must release it
+    lsUnlockable,  ## no lock could be created at all; we proceed unlocked
+    lsBusy         ## someone else holds it; the caller must NOT write
+
+proc lockOne(path: string; unlockable: var bool): int =
+  ## 1 = taken, 0 = someone holds it, -1 = cannot lock here at all.
+  unlockable = false
+  if lockTryCreate(path):
+    return 1
+  if not exists(path):
+    # Creation failed and yet nothing is there: we cannot lock in this
+    # environment (no temp dir, permissions). Proceed unlocked and SAY SO --
+    # refusing to talk to the host would be worse, and an unlocked write is
+    # exactly what this file did before the lock existed.
+    unlockable = true
+    return -1
+  if lockFileAgeMs(path) > LockStaleMs:
+    discard removeFileAt(path)
+    if lockTryCreate(path): return 1
+  result = 0
+
+proc lockAcquire*(u: var Ui; pathA, pathB: var string): LockState =
+  ## Take BOTH spellings of the lock, ALWAYS IN THE SAME ORDER (A then B), so
+  ## two cooperating writers can never take them in opposite orders and wedge.
+  ## Holding a superset of the peer's lock is still correct exclusion; holding
+  ## a name the peer never looks at is not, which is why both are taken.
+  pathA = lockPathFor(u.live, '\\')
+  pathB = lockPathFor(u.live, '/')
+  if pathB == pathA: pathB = ""
+  let deadline = nowMs() + LockWaitMs
+  var unl = false
+  while true:
+    let a = lockOne(pathA, unl)
+    if a < 0:
+      return lsUnlockable
+    if a == 1:
+      if pathB.len == 0:
+        return lsHeld
+      let b = lockOne(pathB, unl)
+      if b == 1:
+        return lsHeld
+      if b < 0:
+        # The first was takeable and the second is not lockable at all; keep
+        # the one we have rather than dropping to unlocked.
+        pathB = ""
+        return lsHeld
+      # B is held by someone else: drop A so we cannot deadlock against a
+      # writer coming the other way, and retry the pair.
+      discard removeFileAt(pathA)
+    if nowMs() >= deadline:
+      return lsBusy
+    sleep(DWORD(100))
+
+proc lockRelease*(state: LockState; pathA, pathB: string) =
+  if state == lsHeld:
+    discard removeFileAt(pathA)
+    if pathB.len > 0:
+      discard removeFileAt(pathB)
+
 proc runBatchOnce(u: var Ui; cmds: seq[string]; timeoutMs: int; wr: bool;
                   answer: var string): bool =
   ## One batch, keyed to ITS OWN sentinel. The wait is on the sentinel, never
@@ -274,8 +473,28 @@ proc runBatchOnce(u: var Ui; cmds: seq[string]; timeoutMs: int; wr: bool;
   var body = "#" & $ser & "\n"
   for l in lines: body.add l & "\n"
   body.add "echo " & sentinel & "\n"
+  # THE LOCK SPANS WRITE **AND** POLL, exactly as `channel.py` does. Releasing
+  # after the write would not help: the hazard is a second writer replacing our
+  # batch while we are waiting for its answer.
+  var lockFile = ""
+  var lockFileB = ""
+  let lock = lockAcquire(u, lockFile, lockFileB)
+  if lock == lsBusy:
+    u.lastErr = "another process holds the inspector channel lock (" &
+                lockFile & ") -- it was NOT taken, so nothing was written. " &
+                "This is a CONTENTION refusal, not a host fault and not a " &
+                "timeout: two writers to one command file drop each other's " &
+                "batches. A lock older than " & $int(LockStaleMs div 1000'i64) &
+                "s is broken automatically."
+    answer = u.lastErr
+    return false
+  if lock == lsUnlockable:
+    warnLine("  (the channel lock could not be created at all; proceeding " &
+             "UNLOCKED, which is what this tool did before the lock existed. " &
+             "A concurrent writer can still clobber this batch.)")
   let w = writeTextFile(cmdPath(u), body)
   if not w.ok:
+    lockRelease(lock, lockFile, lockFileB)
     answer = "could not write " & cmdPath(u) & " (error " & $w.err & ")"
     return false
   let deadline = nowMs() + int64(timeoutMs)
@@ -286,8 +505,10 @@ proc runBatchOnce(u: var Ui; cmds: seq[string]; timeoutMs: int; wr: bool;
       for line in blob.splitLines():
         if not line.contains(sentinel): keep.add line
       answer = joinStr(keep, "\n")
+      lockRelease(lock, lockFile, lockFileB)
       return true
     sleep(DWORD(150))
+  lockRelease(lock, lockFile, lockFileB)
   answer = "no answer for batch " & $ser & " within " & $(timeoutMs div 1000) &
            "s. " & diagnose(u)
   result = false
