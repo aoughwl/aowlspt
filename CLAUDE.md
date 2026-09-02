@@ -394,42 +394,28 @@ manifest entry (Size + Checksum = byte-sum mod 2^32).
 `tools/wirelog.py`, `tools/hostlog.py` — never `cat`/`Read` those files. Never read agent
 transcript files. Do not paste long briefings into subagents: use `.claude/agents/*`.
 
-## 9. The fact store: RECALL BEFORE YOU RE-DERIVE
+## 9. Facts live in the repo. The fact store is GONE.
 
-This repo has a fact store (the `aowlfacts` MCP server in the `aowlcode` plugin,
-SQLite at `%USERPROFILE%\.aowl\facts.db`). It holds two things: **facts** —
-measured assertions with provenance — and **recipes**, replayable procedures
-known to work.
+The `aowlfacts` MCP server / `aowlcode` plugin was removed on 2026-09-02 (the
+user: "it was awful, that plugin is entirely gone"). Do not call `fact_recall`,
+`fact_record`, `recipe_*`, and do not describe them as missing or unreachable.
 
-**Before deriving anything about the live client, call `fact_recall`.** Before
-navigating the UI, call `recipe_list` / `recipe_get`. This is not optional
-politeness; it is the cheapest call in the session and the alternative has a
-measured cost. In the session this rule comes from, the whole `open-settings`
-procedure was re-derived by hand — through three wrong turns — while a recipe
-holding the exact same five steps sat in the store, unread.
+What replaces it, and it is better because it is read with the code:
 
-**Record what you measure, as you measure it**, with `fact_record`: a field
-offset, an RVA, what a name really points at, and above all a FALSE POSITIVE —
-a thing that looks like it worked and did not. `ButtonFeedback::OnPointerClick`
-plays the click sound and presses nothing; that fact is worth more than most
-working code.
+* **`docs/AOWL_FACTS.md`** -- dated sections of MEASURED assertions with the
+  command that produced each one. Record what you measure, as you measure it:
+  an offset, an RVA, what a name really points at, and above all a FALSE
+  POSITIVE (a thing that looked like it worked and did not).
+* **the maps** -- `docs/SETTINGS-UI-MAP.md`, `docs/BOOT-FLOW-MAP.md`: the whole
+  flow of one subsystem from the metadata, with evidence per claim, from which
+  a feature is built in ONE attempt. Extend the map before touching the code.
+* **`tools/factnote.py`** -- the relay a SUBAGENT appends to (it cannot edit
+  docs safely while others do). The coordinator runs `--drain`, moves the rows
+  into `docs/AOWL_FACTS.md` or the relevant map, then `--drain --clear`.
 
-Nothing forces either call. A hook can inject context and can deny a tool, but
-**no hook can make a model call a tool** — so recall is a discipline, not a
-mechanism, and it is on you.
-
-What goes where:
-
-* **the store** — high-cardinality measurements that expire when the game build
-  changes (offsets, RVAs, klass identities, which node holds a label), plus
-  procedures. Every fact carries a scope key hashed from `GameAssembly.dll` and
-  `db.json`, so a Tarkov update marks them `[STALE: scope changed]` rather than
-  letting them quietly lie.
-* **this file** — prose rules, workflow, and the lessons above. Do not migrate
-  them into the store; they are read once and cost nothing more.
-
-A fact recorded as `measured` that was not measured poisons the store, and a
-poisoned store is worse than an empty one. Say `inferred` when you inferred it.
+Before deriving anything about the live client, grep those three places first.
+Say `inferred` when you inferred it; a MEASURED label on an inference poisons
+the document the same way it poisoned the store.
 
 ## 9b. A VERIFICATION THAT CANNOT FAIL IS THE BUG
 
