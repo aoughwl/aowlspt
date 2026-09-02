@@ -305,6 +305,16 @@ const
     ## up on it and publishes a diagnosis. A batch normally runs on the very
     ## next frame; seconds means nothing is running it at all, and a silent
     ## wedge is the one failure this instrument must never have.
+  InspFlightRepMs  = 10000'u64
+    ## How long a batch may be handed over and undelivered before the host says
+    ## so, unconditionally. Deliberately SHORTER than every other bound here and
+    ## deliberately without preconditions: the other reports each describe one
+    ## specific cause and each has a gate that can be false, which is how a
+    ## batch handed at 3.3s produced not one line in the following three
+    ## minutes. This one only knows that a batch went in and nothing came out.
+  InspFlightRepEvery = 15000'u64
+    ## And how often it repeats while that stays true, so a genuinely long
+    ## `until` costs a line every 15s rather than four a second.
   InspDeadlineMs   = 30000'u64
     ## HOW LONG A CLAIMED BATCH MAY RUN BEFORE THE CHANNEL ABANDONS IT.
     ##
@@ -537,6 +547,25 @@ var gInspNextPollMs = 0'u64
 var gInspHandedMs = 0'u64
   ## When the current batch was handed to Unity's thread, so a batch nobody
   ## drains times out with an explanation instead of wedging the channel.
+var gInspOffReported = false
+  ## Whether the self-disable has been published from the POLL side. The
+  ## announcement itself is made on the thread that decided (`inspGoOff`); this
+  ## is the one that flushes the dead batch's answers to the out file, and it
+  ## must happen exactly once rather than every 250ms forever.
+var gInspFlightRepMs = 0'u64
+  ## Last time the "handed but not delivered" heartbeat spoke. That report is
+  ## the answer to the failure this whole block of state exists for: a batch
+  ## that is handed over and then delivers NOTHING, while satisfying neither
+  ## the QUEUED explanation (which needs `gInspFires == 0`) nor the deadline
+  ## (which needs a claim, 30s AND 900 dispatches). Every one of those has a
+  ## precondition that can be false; this one has none beyond "a batch was
+  ## handed over and has not been delivered".
+var gInspBlockedText = ""
+  ## The last command-file content that was READ but REFUSED because a batch
+  ## was still in flight. Kept so the refusal is reported once per distinct
+  ## edit instead of four times a second -- and, more importantly, so that the
+  ## edit is NOT recorded in `gInspLastText`, which is what makes it queue by
+  ## itself as soon as the channel frees.
 var gInspCmdPath = ""
 var gInspOutPath = ""
 var gInspGreeted = false
@@ -7715,6 +7744,31 @@ proc iWaitStep(line: string; idx: int): bool =
     return true
   result = false
 
+proc inspGoOff(why: string) =
+  ## THE SELF-DISABLE, AND WHY IT NOW HAS TO SAY SO IN THE HOST LOG.
+  ##
+  ## Both announcements of a self-disable used to be `iOut` lines -- i.e. lines
+  ## in the BATCH OUTPUT BUFFER. That buffer only ever reaches the out file and
+  ## the log through `inspWriteOut`, which is called from `inspectPoll`, which
+  ## returned at its very FIRST line once `gInspOff` was set. So the instant the
+  ## inspector switched itself off it destroyed the only copy of the reason,
+  ## stopped delivering answers, stopped watchdogging and stopped reading the
+  ## command file: an entire session of perfect silence, produced by the one
+  ## event that most needed announcing. That is a check that cannot fail.
+  ##
+  ## Announced HERE, before the flag is set, on the thread that decided it, so
+  ## the reason exists in the log whatever happens to the buffer afterwards.
+  if gInspOff:
+    return
+  warn "live inspector: SELF-DISABLED for this session -- " & why &
+       ". faults=" & $gInspFaults & " escapes=" & $gInspEscapes &
+       " batch=" & $gInspBatch & " running=" & $gInspRunningBatch &
+       " delivered=" & $gInspDelivered & " phase=" & $gInspPhase &
+       ". The command file will NOT be read again until the client is " &
+       "restarted; whatever answers the last batch produced are published " &
+       "on the next poll and then the channel stays quiet BY DESIGN."
+  gInspOff = true
+
 proc inspRunBatch() =
   # A RESUMED batch keeps everything: its output so far, its variables, and its
   # write permission. Only a genuinely new batch starts clean. Getting this
@@ -7799,7 +7853,9 @@ proc inspRunBatch() =
       iOut("  !! fault " & $gInspFaults & " of " & $InspMaxFaults &
            " before the inspector switches itself off for this session")
       if gInspFaults >= InspMaxFaults:
-        gInspOff = true
+        inspGoOff("too many caught faults in one session (" & $gInspFaults &
+                  " of a budget of " & $InspMaxFaults & "); the last was in " &
+                  "command " & $(i + 1) & " of " & $gInspCmds.len)
         iOut("  !! too many faults; the live inspector is now OFF for this " &
              "session. Restart the client to re-arm it.")
         i = gInspCmds.len
@@ -7831,10 +7887,15 @@ proc inspTick() =
   ## lock-free `aowl_insp_have` is the whole per-frame cost when there is
   ## nothing queued -- one interlocked load and a not-taken branch, the same
   ## discipline `mainDrain` follows.
+  # Watch the HOST thread from here, because a stuck poll cannot watch itself.
+  # BEFORE the self-disable check, not after: a channel that has switched
+  # itself off still has a host tick thread, and "the poll thread died" must
+  # stay reportable in exactly the session where the other half of the
+  # instrument has already given up. It used to sit below the early-out, so
+  # `gInspOff` silenced BOTH watchdogs at once.
+  inspPollWatchdog()
   if gInspOff:
     return
-  # Watch the HOST thread from here, because a stuck poll cannot watch itself.
-  inspPollWatchdog()
   # THE CLICK RECORDER. Its own guarded pass, BEFORE any batch handling and
   # never nested inside one. Gated on `record on`, so an unarmed session pays
   # only this branch. A caught fault counts toward a self-disable rather than
@@ -7877,7 +7938,9 @@ proc inspTick() =
     gInspBatchDone = escaped
     cInspUnlock()
     if gInspEscapes >= InspMaxFaults:
-      gInspOff = true
+      inspGoOff("too many guard escapes (" & $gInspEscapes & " of a budget " &
+                "of " & $InspMaxFaults & "); the last escaped batch was " &
+                $escaped)
       iOut("  !! too many escapes; the live inspector is now OFF for this " &
            "session. Restart the client to re-arm it.")
     return
@@ -8052,7 +8115,36 @@ proc inspectPoll(now: uint64) =
   ## it. To run the same commands twice, change a comment line -- which is what
   ## the shell driver does with a serial number.
   inc gInspPolls
-  if not gInspOn or gInspOff:
+  if not gInspOn:
+    return
+  if gInspOff:
+    # A DEAD CHANNEL STILL OWES ONE EXPLANATION AND ONE FILE.
+    #
+    # `gInspOff` used to be part of the line above, which made this proc return
+    # before the delivery block, before the deadline, before the watchdog and
+    # before the command file was ever read again. The answers of the batch
+    # that self-disabled -- including the line saying WHY -- sat in `gInspOut`
+    # forever, the out file kept a previous boot's mtime, and every later edit
+    # to the command file was swallowed without a word. Silence is the one
+    # failure this instrument may not have, so the OFF state publishes what it
+    # has, says so once, and only THEN goes quiet.
+    if not gInspOffReported:
+      gInspOffReported = true
+      if gInspOut.len > 0:
+        iOut("aowlspt live inspector -- the channel is OFF; the lines above " &
+             "are the last batch's answers, published late.")
+        inspWriteOut()
+        cInspLock()
+        gInspOut = @[]
+        gInspOutBytes = 0
+        gInspBatchDone = -1
+        cInspUnlock()
+      warn "live inspector: polling has STOPPED because the channel is OFF " &
+           "(self-disabled). faults=" & $gInspFaults & " escapes=" &
+           $gInspEscapes & " batch=" & $gInspBatch & " delivered=" &
+           $gInspDelivered & " running=" & $gInspRunningBatch &
+           ". Edits to " & gInspCmdPath & " will be IGNORED for the rest of " &
+           "this session; restart the client to re-arm it."
     return
   # LATE ARMING OF THE IN-RAID ANCHOR. `bindInspect` runs ONCE, early. If the
   # bridge had not yet bound its main drain at that moment, `gInspSlot2` stayed
@@ -8091,6 +8183,93 @@ proc inspectPoll(now: uint64) =
   if now < gInspNextPollMs:
     return
   gInspNextPollMs = now + 250'u64
+  # ---------------------------------------------------------------------------
+  # THE COMMAND FILE IS READ ON EVERY POLL, INCLUDING WHILE A BATCH IS PENDING.
+  #
+  # It used to be read only after the pending branch had returned, so while a
+  # batch was in flight the host could not even SEE that the human had written
+  # a new one -- the edit was swallowed with no line anywhere. Reading first
+  # costs one shared open per 250ms in a state that is supposed to be brief,
+  # and buys the refusal message below.
+  # ---------------------------------------------------------------------------
+  var text = ""
+  let readOk = readShared(gInspCmdPath, text)
+  # STRIP A LEADING UTF-8 BOM.
+  #
+  # `Set-Content -Encoding utf8` on Windows PowerShell 5.1 -- the obvious way a
+  # Windows user writes this file -- prepends EF BB BF. Those three bytes then
+  # ride on the front of the FIRST line, so command one of every batch arrives
+  # as "﻿#1" or "﻿state" and is rejected as an unknown command while
+  # every other line works. A batch that silently loses exactly its first
+  # instruction is a nasty thing to debug from the outside.
+  #
+  # Stripped here, BEFORE the change-comparison, so the cached text and the
+  # parsed text are the same bytes and a BOM cannot cause a phantom "changed".
+  if readOk and text.len >= 3 and
+     text[0] == '\xEF' and text[1] == '\xBB' and text[2] == '\xBF':
+    var stripped = ""
+    for i in 3 ..< text.len:
+      stripped.add text[i]
+    text = stripped
+  if readOk:
+    inc gInspReads
+  else:
+    inc gInspReadFails
+  let unchanged = readOk and text == gInspLastText
+  if unchanged:
+    inc gInspUnchanged
+  # ---------------------------------------------------------------------------
+  # THE HEARTBEAT ON A BATCH THAT WAS HANDED OVER AND DELIVERED NOTHING.
+  #
+  # THIS IS THE LINE THE INSTRUMENT WAS MISSING, and its absence cost a whole
+  # session: batch 1 was handed at 3.3s, the rider first dispatched at 17.2s,
+  # and then NOTHING was ever said again. Every existing report had a
+  # precondition that happened to be false --
+  #   the QUEUED explanation      needs `gInspFires == 0`
+  #   the "never picked up" stall needs the pending flag STILL set
+  #   the deadline                needs a claim, 30s AND 900 dispatches
+  #   the idle/wedged watchdog    sits BELOW the pending early-out
+  #   everything                  sits below the `gInspOff` early-out
+  # -- so five reports covering five states left the sixth state mute.
+  #
+  # This one has no precondition beyond the fact that defines the fault: a
+  # batch was handed to Unity's thread and its answers have not reached the
+  # out file. It NAMES the state rather than diagnosing it, because naming a
+  # measured state cannot be confidently wrong and a diagnosis can.
+  # ---------------------------------------------------------------------------
+  if gInspHandedMs != 0'u64 and gInspDelivered < gInspBatch and
+     now > gInspHandedMs and now - gInspHandedMs > InspFlightRepMs and
+     (gInspFlightRepMs == 0'u64 or now - gInspFlightRepMs > InspFlightRepEvery):
+    gInspFlightRepMs = now
+    var cmdText = "(none)"
+    if gInspCurIdx >= 0 and gInspCurIdx < gInspCmds.len:
+      cmdText = gInspCmds[gInspCurIdx]
+    warn "live inspector: batch " & $gInspBatch & " HANDED but NOT DELIVERED " &
+         "after " & $int((now - gInspHandedMs) div 1000'u64) & "s. state: " &
+         (if gInspRunningBatch >= 0:
+            "CLAIMED (running=" & $gInspRunningBatch & ", held " &
+            (if gInspClaimMs != 0'u64 and now > gInspClaimMs:
+               $int((now - gInspClaimMs) div 1000'u64)
+             else: "?") & "s, " &
+            $(gInspFires - gInspClaimFires) & " dispatches since the claim)"
+          else: "NOT CLAIMED by Unity's thread") &
+         " phase=" & $gInspPhase & " cmd=" & $(gInspCurIdx + 1) & "/" &
+         $gInspCmds.len & " (" & cmdText & ") resumeAt=" & $gInspResumeAt &
+         " suspended=" & $gInspSuspended & " pending=" & $int(cInspHave()) &
+         " fires=" & $gInspFires & " ticks=" & $gInspTicks &
+         " faults=" & $gInspFaults & " escapes=" & $gInspEscapes &
+         " off=" & $gInspOff & " delivered=" & $gInspDelivered &
+         " outLines=" & $gInspOut.len & " done=" & $gInspBatchDone &
+         " claimMs=" & $gInspClaimMs
+    if gInspClaimMs == 0'u64 and gInspRunningBatch >= 0:
+      warn "live inspector: ...and `claimMs` is 0 while a batch is marked " &
+           "running, so the DEADLINE CAN NEVER FIRE for it. That is a host " &
+           "bug, not a client stall; the batch is being released now."
+      gInspRunningBatch = -1
+      gInspSuspended = false
+      gInspInFlight = -1
+      cInspSetPending(0'i32)
+      gInspLastText = ""
   # ---------------------------------------------------------------------------
   # THE DEADLINE ON AN IN-FLIGHT BATCH.
   #
@@ -8164,6 +8343,21 @@ proc inspectPoll(now: uint64) =
     gInspDelivered = stuck
     return
   if cInspHave() != 0'i32:
+    # A SECOND EDIT WHILE THE FIRST BATCH IS STILL PENDING IS REFUSED OUT LOUD.
+    #
+    # This branch returns, so before the fix a human who saw nothing happen and
+    # did the obvious thing -- rewrite the file with a smaller batch -- got
+    # exactly the same nothing, twice, with no line to say the second write had
+    # even been noticed. `gInspLastText` is deliberately NOT updated, so the
+    # refused edit queues by itself the moment the channel frees.
+    if readOk and not unchanged and text != gInspBlockedText:
+      gInspBlockedText = text
+      warn "live inspector: the command file CHANGED while batch " &
+           $gInspBatch & " is still in flight; your new batch is NOT queued " &
+           "yet (pending=" & $int(cInspHave()) & ", running=" &
+           $gInspRunningBatch & ", fires=" & $gInspFires & "). It has been " &
+           "kept, not dropped: it will be queued as soon as batch " &
+           $gInspBatch & " is delivered or abandoned."
     # THE EARLY-BATCH CASE, AND WHY IT IS NOT A TIMEOUT.
     #
     # `EFT.UI.PreloaderUI::Update` does not tick until the client is off the
@@ -8247,32 +8441,6 @@ proc inspectPoll(now: uint64) =
       gInspOut = @[]
       cInspUnlock()
     return
-  var text = ""
-  let readOk = readShared(gInspCmdPath, text)
-  # STRIP A LEADING UTF-8 BOM.
-  #
-  # `Set-Content -Encoding utf8` on Windows PowerShell 5.1 -- the obvious way a
-  # Windows user writes this file -- prepends EF BB BF. Those three bytes then
-  # ride on the front of the FIRST line, so command one of every batch arrives
-  # as "﻿#1" or "﻿state" and is rejected as an unknown command while
-  # every other line works. A batch that silently loses exactly its first
-  # instruction is a nasty thing to debug from the outside.
-  #
-  # Stripped here, BEFORE the change-comparison, so the cached text and the
-  # parsed text are the same bytes and a BOM cannot cause a phantom "changed".
-  if readOk and text.len >= 3 and
-     text[0] == '\xEF' and text[1] == '\xBB' and text[2] == '\xBF':
-    var stripped = ""
-    for i in 3 ..< text.len:
-      stripped.add text[i]
-    text = stripped
-  if readOk:
-    inc gInspReads
-  else:
-    inc gInspReadFails
-  let unchanged = readOk and text == gInspLastText
-  if unchanged:
-    inc gInspUnchanged
 
   # THE WATCHDOG. A channel that stops accepting commands and says nothing is
   # the exact failure class this instrument exists to abolish, and it has now
@@ -8351,6 +8519,26 @@ proc inspectPoll(now: uint64) =
     return
   if unchanged:
     return
+  # A BATCH THAT HAS BEEN CLAIMED BUT NOT DELIVERED STILL OWNS `gInspCmds`.
+  #
+  # The pending flag is consumed at the claim, so a batch parked on `wait` /
+  # `until` / a long `find` leaves this path wide open: the poll would queue a
+  # new batch straight over the command list the Unity thread is iterating,
+  # renumber it, and resume the parked batch at the OLD index into the NEW
+  # commands. Refusing here -- loudly, and without consuming the edit -- makes
+  # that impossible, and the deadline above bounds how long the refusal can
+  # last.
+  if gInspRunningBatch >= 0 and gInspDelivered < gInspRunningBatch:
+    if text != gInspBlockedText:
+      gInspBlockedText = text
+      warn "live inspector: batch " & $gInspRunningBatch & " is still in " &
+           "flight on Unity's thread; your new batch is NOT queued (it was " &
+           "kept, not dropped, and goes in as soon as that batch is " &
+           "delivered or abandoned). It is at phase " & $gInspPhase &
+           ", command " & $(gInspCurIdx + 1) & " of " & $gInspCmds.len &
+           ", suspended=" & $gInspSuspended & "."
+    return
+  gInspBlockedText = ""
   gInspLastText = text
   var cmds: seq[string] = @[]
   let lines = iLines(text)
@@ -8392,13 +8580,44 @@ proc inspectInit(dir: string) =
     return
   var existing = ""
   if not readShared(gInspCmdPath, existing):
-    discard writeTextFile(gInspCmdPath,
-      "# aowlspt live inspector -- edit this file while the game runs.\n" &
+    existing = "# aowlspt live inspector -- edit this file while the game runs.\n" &
       "# Every SAVE with changed content runs the whole file on Unity's main\n" &
       "# thread; answers appear in aowlspt-inspect-out.txt and in the host log.\n" &
       "# To re-run unchanged commands, bump this serial:  serial 1\n" &
       "help\n" &
-      "anchors\n")
+      "anchors\n"
+    discard writeTextFile(gInspCmdPath, existing)
+  # WHATEVER IS ALREADY ON DISK AT BOOT IS NOT RUN, AND THAT IS SAID.
+  #
+  # The trigger is documented as a CONTENT CHANGE, but `gInspLastText` started
+  # empty, so the first poll of every boot found the previous session's file
+  # "changed" and ran it. That is how a 58-command batch left over from an
+  # earlier session was handed to Unity's thread 3.3 seconds into a boot,
+  # against anchors from a client that was still on the loading screen --
+  # commands nobody asked for, at the worst possible moment, and with the
+  # host log giving no hint where they came from. Seeding the comparison with
+  # what is on disk makes the documented rule true.
+  if existing.len >= 3 and existing[0] == '\xEF' and existing[1] == '\xBB' and
+     existing[2] == '\xBF':
+    var stripped = ""
+    for i in 3 ..< existing.len:
+      stripped.add existing[i]
+    existing = stripped
+  gInspLastText = existing
+  var staleCmds = 0
+  let staleLines = iLines(existing)
+  for i in 0 ..< staleLines.len:
+    let toks = iSplit(staleLines[i])
+    if toks.len == 0:
+      continue
+    if toks[0].len > 0 and toks[0][0] == '#':
+      continue
+    inc staleCmds
+  if staleCmds > 0:
+    info "live inspector: a stale command file was already on disk at " &
+         "startup (" & $staleCmds & " command(s)); it was NOT run. Only a " &
+         "CHANGE to the file's content queues a batch -- bump the #serial " &
+         "line to run what is there. file=" & gInspCmdPath
   # Seed the namespace so `anchors` says something before the first frame.
   iSetVar("_", 0'u64)
 

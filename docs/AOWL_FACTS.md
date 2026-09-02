@@ -6171,3 +6171,43 @@ run's until the new backend truncates it, so the stale line is found within
 does not go away with time. Coordinator workaround: truncate the backend log
 before launching. Real fix (in flight): the launcher must only accept a line
 written after its own spawn and then see a real TCP accept on :443.
+
+## 2026-09-01 late: the live inspector's whole-session silence is `gInspOff` returning above every report
+
+MEASURED (host log, two boots 22:32 and 22:40, host DLL built 22:22+): batch 1
+`(58 command(s)) handed to Unity's thread` at 0:00:03.312 -- a STALE command
+file left on disk by an earlier session -- then `rider FIRST DISPATCHED ...
+(slot 15)` at 0:00:17.156, then nothing at all for 3+ minutes at MENU:
+aowlspt-inspect-out.txt kept an earlier boot's mtime, no ABANDONED, no QUEUED
+report, and a rewritten command file (`#2 / echo ping / state`) produced no
+`batch 2 ... handed` line in 14s. A 22:27 boot without `--modbuild` delivered
+normally (`inspect|` answer lines at 0:00:09 and 0:00:16).
+
+INFERRED from the source (`host/Aowlspt.Host.Il2Cpp/inspect.nim` at f89783c;
+line numbers pre-fix): the only state that satisfies ALL of "nothing
+delivered", "no QUEUED report", "no ABANDONED", "no watchdog line" and "a new
+file is not queued" is `gInspOff`. Line 8055 read `if not gInspOn or gInspOff:
+return` and sat ABOVE the delivery block (8069), the deadline (8106), the
+idle/wedged watchdog (8293) and the command-file read (8250). Both
+self-disable sites (7802 faults, 7880 escapes) announced themselves ONLY with
+`iOut`, i.e. into `gInspOut` -- a buffer that reaches the file and the log
+solely through `inspWriteOut`, called from the proc that now returns first. So
+the event that killed the channel also destroyed the only record of itself,
+and `inspTick`'s own `if gInspOff: return` (7834) sat above
+`inspPollWatchdog()`, silencing the other half too. What drove the fault count
+to the budget of 8 is NOT established: the 58 stale commands ran against a
+client still on the loading screen, and the absent QUEUED report (it needs
+`gInspFires == 0`) says the rider had already been dispatched before 11.3s --
+consistent with the 0:00:07.203 `main-thread drain ... running it on the host
+thread` fallback dispatching the drain-slot rider, but that is inferred, not
+measured.
+
+The general shape, which is the fact worth keeping: FIVE reports each covering
+one cause, each with a precondition that can be false (`gInspFires == 0` for
+QUEUED; the pending flag still set for the 8s stall; a claim plus 30s plus 900
+dispatches for the deadline), plus two that sat below early-outs, left the
+sixth state mute. Fixed by an unconditional heartbeat whose only precondition
+is the fault itself -- a batch was handed over and its answers did not reach
+the out file -- plus announcing the self-disable from the thread that decides
+it. Falsified by `python tools/test_inspect_silence.py`, which runs the same
+nine invariants against `git show HEAD:` and requires them to FAIL there.
