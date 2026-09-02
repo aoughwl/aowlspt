@@ -8,6 +8,23 @@
     python tools/hostcfg.py set debugUi off botDiag on   # several at once
     python tools/hostcfg.py set waitForRuntimeMs 240000
     python tools/hostcfg.py diff                 # non-default values only
+    python tools/hostcfg.py show --effective     # what the HOST boots with
+    python tools/hostcfg.py get settingsUiProbe --effective
+
+`show`/`diff`/`get` report THE FILE. `--effective` reports the value the host
+BOOTS with, which is not the same thing: measured 2026-09-02, `show` printed
+`settingsUiProbe off` while the running host had it on, because `settingsPages`
+was set and the host turns the probe on with it (aowlhost.nim:8624, and it says
+so in the log). With `--effective` that line reads
+
+    settingsUiProbe   off (file) / ON (implied by settingsPages (aowlhost.nim))
+
+and the reverse case reads `on (file) / OFF (forced OFF: needs uxNativeRaid...)`
+for a flag that is armed in the file and ANDed to nothing at boot. The rules are
+data (RULES, below), each carrying the source file, line and the exact text it
+was read from; `verify_rules()` re-finds that text and refuses to apply a rule
+it can no longer see. `--effective` describes CONFIG LOAD only -- not a later
+self-disable, and not a bind that never succeeded.
 
 Why this exists rather than "just edit the JSON". The host does not parse this
 file with a JSON parser. Every flag is read by
@@ -74,6 +91,16 @@ INT_KEYS = {
 }
 
 BOOL_CALL = re.compile(r'readBoolKey(?:Def)?\(\s*"([A-Za-z0-9_]+)"')
+# `readBoolKeyDef(key, true)` defaults ON when the key is ABSENT. This tool
+# printed `off` for every absent bool, so four keys that the host runs with ON
+# out of the box -- catchErrorDialogs, modLoadScreen, deferModLoad,
+# forceOfflinePractice -- read as off here. That is the confidently-wrong shape
+# CLAUDE.md 9b is about: the number was not a guess, it was a wrong measurement
+# of the wrong thing.
+BOOL_DEF = re.compile(
+    r'readBoolKeyDef\(\s*"([A-Za-z0-9_]+)"\s*,\s*(true|false)\s*\)')
+# Populated by scrape_keys() from the source, never hand-maintained.
+BOOL_DEFAULT_TRUE = set()
 # String-valued flags go through `readStrKey`, a shape `scrape_keys` did not
 # know about at all, so every string key was invisible to this tool -- measured
 # missing: `launchProfileId` (aowlhost.nim) and `uxBetaOverlayPos`
@@ -134,6 +161,12 @@ def scrape_keys(hostdir):
         for m in BOOL_CALL.finditer(text):
             keys.setdefault(m.group(1), ("bool", os.path.basename(path)))
             hit = True
+        for m in BOOL_DEF.finditer(text):
+            # A default of `true` overrides the assumed-off entry above. Last
+            # writer does not win here: an explicit default is always better
+            # evidence than the absence of one.
+            if m.group(2) == "true":
+                BOOL_DEFAULT_TRUE.add(m.group(1))
         for m in NEEDLE_LIT.finditer(text):
             keys.setdefault(m.group(1), ("bool", os.path.basename(path)))
             hit = True
@@ -303,6 +336,207 @@ def provenance(args, keys):
     return lines
 
 
+# ---------------------------------------------------------------------------
+# THE FILE IS NOT THE RUNTIME.
+#
+# MEASURED 2026-09-02: `hostcfg.py show` printed `settingsUiProbe off` while
+# the running host had it ON. Nothing was wrong with the read -- the file
+# really did say off. The host turns it on for itself at boot because
+# `settingsPages` was set (aowlhost.nim:8624), and says so in the log:
+# "settingsPages is set, so settingsUiProbe has been turned on with it".
+# `show` reported the FILE and was read as reporting the HOST.
+#
+# So the host applies two kinds of rule to the file's values at boot, and they
+# pull in opposite directions:
+#
+#   implies    a flag turns ANOTHER one on with itself, because the second is
+#              the machinery the first runs from. `off` in the file, ON at
+#              runtime.
+#   requires   a flag is ANDed with a prerequisite at the point it is read
+#              (`gAuOn = readBoolKey("aowlUi") and gNuOn`), so it is armed in
+#              the file and dead at runtime. `on` in the file, OFF at runtime.
+#
+# Both were derived by grepping the host for the two shapes -- the implication
+# log lines ("X is set, so Y has been turned on") and the `and gPrereq`
+# conjunctions on a readBoolKey assignment -- and each rule below carries the
+# file, the line, and the exact source text it was read from. `verify_rules()`
+# re-finds that text in the source, so a rule that no longer matches the host
+# is reported STALE and NOT APPLIED, rather than quietly describing a host that
+# no longer exists. A rule table that cannot go stale-visibly would be worse
+# than no table: it would be this tool's original bug with more confidence.
+#
+# WHAT IS NOT MODELLED, deliberately, and said out loud by `--effective`:
+#   * `natEsp` (aowlhost.nim:8893) is ANDed with nativeUi AND compared against
+#     the STRING key `espProvider`; and debugEsp's DRAWING is suppressed at
+#     aowlhost.nim:8990 when natEsp is also on and espProvider != "both", while
+#     the flag itself stays true. A boolean column cannot express "armed but
+#     not drawing", so these are carried as NOTE rules that print and never
+#     flip a value.
+#   * anything the host decides LATER than config load -- a self-disable after
+#     N faults, a bind that never succeeded (`gNtOn = false` at aowlhost.nim:
+#     9476). `--effective` describes the value the host STARTS with. That is
+#     strictly more than the file says and strictly less than the host log.
+# ---------------------------------------------------------------------------
+
+# (kind, [causes], target, file, line, source-anchor)
+RULES = [
+    ("implies", ["settingsRelabelProbe", "settingsBindProbe"],
+     "settingsUiProbe", "aowlhost.nim", 8589,
+     "if (gSwRelabel or gSwBind) and not gSettingsUiProbe:"),
+    ("implies", ["modSettingsRender"], "settingsPages", "aowlhost.nim", 8619,
+     "if gModSetOn and not gSwPagesOn:"),
+    ("implies", ["settingsPages"], "settingsUiProbe", "aowlhost.nim", 8624,
+     "if gSwPagesOn and not gSettingsUiProbe:"),
+    ("implies", ["settingsModsTab"], "settingsUiProbe", "aowlhost.nim", 8648,
+     "if gModsOn and not gSettingsUiProbe:"),
+    ("implies", ["nativeUiProof", "nativeUiImageProof", "nativeUiKitProof"],
+     "managedInvokeProbe", "aowlhost.nim", 8960,
+     "if (gNuProof or gNuImgProof or gNkProof) and not gMi2Probe:"),
+    # Found by the LOG-LINE grep, not by the assignment grep: `nativeTabs` is
+    # read into gNtFlagOn and aliased (`gNtOn = gNtFlagOn`) before the guard,
+    # so a pass that only follows `gX = readBoolKey("x")` misses it. Recorded
+    # here because the mechanical derivation was incomplete, and saying which
+    # rules the machine found is the point.
+    ("implies", ["nativeTabs"], "settingsUiProbe", "aowlhost.nim", 9152,
+     "if gNtOn and not gSettingsUiProbe:"),
+    ("implies", ["settingsPostFxSubtab"], "settingsUiProbe",
+     "aowlhost.nim", 9173, "if gGfxOn and not gSettingsUiProbe:"),
+    ("implies", ["cameraFreeCam"], "cameraApi", "camera.nim", 909,
+     "if gCamFree and not gCamApi:"),
+
+    ("requires", ["nativeUi"], "aowlUi", "aowlhost.nim", 8854,
+     'gAuOn = readBoolKey("aowlUi") and gNuOn'),
+    ("requires", ["aowlUi"], "aowlUiProof", "aowlhost.nim", 8855,
+     'gAuProof = gAuOn and readBoolKey("aowlUiProof")'),
+    ("requires", ["nativeUi"], "nativeUiProof", "aowlhost.nim", 8844,
+     'gNuProof = gNuOn and readBoolKey("nativeUiProof")'),
+    ("requires", ["nativeUi"], "nativeUiImageProof", "aowlhost.nim", 8850,
+     'gNuImgProof = gNuOn and readBoolKey("nativeUiImageProof")'),
+    ("requires", ["nativeUi"], "nativeUiKit", "aowlhost.nim", 8861,
+     'gNkOn = readBoolKey("nativeUiKit") and gNuOn'),
+    ("requires", ["nativeUiKit"], "nativeUiKitProof", "aowlhost.nim", 8862,
+     'gNkProof = gNkOn and readBoolKey("nativeUiKitProof")'),
+    ("requires", ["nativeUi"], "settingsColorWidget", "aowlhost.nim", 8941,
+     'gCwOn = readBoolKey("settingsColorWidget") and gNuOn'),
+    ("requires", ["nativeUi"], "nativeInvUi", "aowlhost.nim", 8948,
+     'gIuOn = readBoolKey("nativeInvUi") and gNuOn'),
+    ("requires", ["uxNativeRaid"], "uxNativeRaidDrive", "aowlhost.nim", 8818,
+     'gNrDrive = gNrOn and readBoolKey("uxNativeRaidDrive")'),
+    ("requires", ["modLoadScreen"], "deferModLoad", "aowlhost.nim", 8528,
+     'gModLoadDeferMods = gModLoad and readBoolKeyDef("deferModLoad", true)'),
+
+    ("note", ["nativeUi"], "natEsp", "aowlhost.nim", 8893,
+     'gNeOn = natEspAsked and gNuOn and gEspProvider != "overlay"'),
+    ("note", ["natEsp"], "debugEsp", "aowlhost.nim", 8990,
+     'if gDebugEsp and gNeOn and gEspProvider != "both":'),
+]
+
+NOTE_TEXT = {
+    "natEsp": "also ANDed with nativeUi AND with the string key espProvider "
+              '(dead when espProvider == "overlay") -- not modelled here',
+    "debugEsp": "when natEsp is on and espProvider != \"both\" the host keeps "
+                "this flag TRUE but SUPPRESSES its drawing -- a boolean cannot "
+                "say that, so it is not folded into the value",
+}
+
+
+def verify_rules(hostdir):
+    """(applicable, stale) -- can each rule still be found in the source?
+
+    Line numbers drift, so the anchor is searched for anywhere in the file and
+    the line it was FOUND at is reported next to the line recorded here. A rule
+    whose anchor has vanished is STALE: it is dropped from the computation and
+    named in the output. Silently applying it would make `--effective` assert a
+    runtime behaviour that no longer exists, which is the same class of wrong
+    answer as reporting the file and calling it the runtime.
+    """
+    applicable, stale = [], []
+    cache = {}
+    for rule in RULES:
+        _kind, _causes, _target, fname, line, anchor = rule
+        if fname not in cache:
+            hits = [p for p in host_sources(hostdir)
+                    if os.path.basename(p) == fname]
+            if hits:
+                with open(hits[0], "r", encoding="utf-8",
+                          errors="replace") as f:
+                    cache[fname] = f.read().splitlines()
+            else:
+                cache[fname] = None
+        lines = cache[fname]
+        if lines is None:
+            stale.append((rule, "no %s under the scraped host sources" % fname))
+            continue
+        found = [i + 1 for i, l in enumerate(lines) if anchor in l]
+        if not found:
+            stale.append((rule, "the source line %r is no longer in %s"
+                          % (anchor, fname)))
+        else:
+            applicable.append((rule, found[0], found[0] != line))
+    return applicable, stale
+
+
+def file_bools(text, keys):
+    """{key: bool} exactly as the host's own reader would see the FILE."""
+    out = {}
+    for k, v in keys.items():
+        if v[0] != "bool":
+            continue
+        present, _raw, truthy = value_of(text, k)
+        out[k] = truthy if present else (k in BOOL_DEFAULT_TRUE)
+    return out
+
+
+def effective_bools(base, applicable):
+    """Apply the host's boot-time rules to the file's values.
+
+    Returns {key: (value, reason-or-None)}. `requires` first, to a fixpoint,
+    then `implies`, to a fixpoint -- gating is applied at the point of read in
+    the host, implications afterwards. If a `requires` would still fire after
+    the implication pass the two orders disagree, and this returns that key as
+    INCONCLUSIVE rather than picking one; nothing in the current table does
+    that, and the check is here so that a future rule cannot make it lie.
+    """
+    val = dict(base)
+    why = {k: None for k in val}
+
+    def reqs_pass():
+        changed = False
+        for rule, _at, _moved in applicable:
+            kind, causes, target, fname, _line, _anchor = rule
+            if kind != "requires" or target not in val:
+                continue
+            missing = [c for c in causes if not val.get(c, False)]
+            if val[target] and missing:
+                val[target] = False
+                why[target] = ("forced OFF: needs %s, which is off (%s)"
+                               % (", ".join(missing), fname))
+                changed = True
+        return changed
+
+    while reqs_pass():
+        pass
+    changed = True
+    while changed:
+        changed = False
+        for rule, _at, _moved in applicable:
+            kind, causes, target, fname, _line, _anchor = rule
+            if kind != "implies" or target not in val:
+                continue
+            on = [c for c in causes if val.get(c, False)]
+            if on and not val[target]:
+                val[target] = True
+                why[target] = "implied by %s (%s)" % (", ".join(on), fname)
+                changed = True
+
+    inconclusive = set()
+    if reqs_pass():
+        for k, w in why.items():
+            if w and w.startswith("forced OFF"):
+                inconclusive.add(k)
+    return {k: (val[k], why[k], k in inconclusive) for k in val}
+
+
 def cfgpath(root):
     return os.path.join(root, "aowlspt-host.json")
 
@@ -376,6 +610,25 @@ def cmd_keys(args, keys, C):
 def cmd_show(args, keys, C, only_diff=False):
     p, text = read_cfg(args.root)
     print("%s%s%s\n" % (BOLD if C else "", p, RESET if C else ""))
+    eff = {}
+    if args.effective:
+        applicable, stale = verify_rules(args.host)
+        eff = effective_bools(file_bools(text, keys), applicable)
+        moved = [(r, at) for r, at, m in applicable if m]
+        print("  %s%d of %d boot rules verified against %s"
+              % (DIM if C else "", len(applicable), len(RULES), args.host))
+        if moved:
+            print("  %d rule(s) matched at a DIFFERENT line than recorded "
+                  "(the source moved; the rule still holds): %s"
+                  % (len(moved), ", ".join("%s->%s@%d" % (r[1][0], r[2], at)
+                                           for r, at in moved)))
+        for rule, why in stale:
+            print("  %sSTALE RULE, NOT APPLIED%s: %s -> %s (%s:%d) -- %s"
+                  % (RED if C else "", RESET if C else "",
+                     "/".join(rule[1]), rule[2], rule[3], rule[4], why))
+        print("  values below are the host's BOOT values: file + these rules. "
+              "Not the live value after a self-disable.%s\n"
+              % (RESET if C else ""))
     unknown = []
     for m in re.finditer(r'"([A-Za-z0-9_]+)"\s*:', text):
         k = m.group(1)
@@ -385,10 +638,20 @@ def cmd_show(args, keys, C, only_diff=False):
     for k in sorted(keys):
         kind, _where = keys[k]
         present, raw, truthy = value_of(text, k)
-        default = INT_KEYS.get(k, False)
+        default = INT_KEYS.get(k, k in BOOL_DEFAULT_TRUE)
         if kind == "bool":
-            effective = truthy
-            is_default = (effective is False)
+            # An ABSENT bool is not automatically off: four keys are read with
+            # readBoolKeyDef(..., true) and default ON.
+            effective = truthy if present else (k in BOOL_DEFAULT_TRUE)
+            is_default = (effective == (k in BOOL_DEFAULT_TRUE))
+        elif kind == "str":
+            # This branch did not exist: string keys fell into the integer one,
+            # where `int(re.sub(...))` threw and the value printed as the
+            # boolean default -- `audioRayDllPath False` for a path key. A
+            # wrong value in the value column is the same failure as reporting
+            # the file and calling it the runtime, just quieter.
+            effective = raw if present else '""'
+            is_default = (not present) or effective in ('""', "''", "")
         else:
             try:
                 effective = int(re.sub(r"[^0-9]", "", raw or "")) if present else default
@@ -404,6 +667,20 @@ def cmd_show(args, keys, C, only_diff=False):
             mark = str(effective)
         note = "" if present else ("%s(absent -> default)%s"
                                    % (DIM if C else "", RESET if C else ""))
+        if eff and kind == "bool":
+            ev, why, incon = eff.get(k, (effective, None, False))
+            if incon:
+                note = ("INCONCLUSIVE: the boot rules disagree about this key "
+                        "-- read the host log, not this column")
+                mark = "%s???%s" % (YELLOW if C else "", RESET if C else "")
+            elif why:
+                mark = ("%s (file) / %s%s%s (%s)"
+                        % ("on" if effective else "off",
+                           (GREEN if ev else DIM) if C else "",
+                           "ON" if ev else "OFF", RESET if C else "", why))
+                note = ""
+            if k in NOTE_TEXT:
+                note = (note + "  " if note else "") + "NOTE: " + NOTE_TEXT[k]
         print("  %-24s %-16s %s" % (k, mark, note))
 
     if unknown:
@@ -430,10 +707,27 @@ def cmd_get(args, keys, C):
     present, raw, truthy = value_of(text, k)
     kind = keys[k][0]
     if not present:
-        print("%s: absent -> default %s" % (k, INT_KEYS.get(k, "off")))
-        return 0
-    print("%s: %s   (host reads this as %s)"
-          % (k, raw, ("on" if truthy else "off") if kind == "bool" else raw))
+        print("%s: absent -> default %s"
+              % (k, INT_KEYS.get(k, "on" if k in BOOL_DEFAULT_TRUE else "off")))
+    else:
+        print("%s: %s   (host reads this as %s)"
+              % (k, raw, ("on" if truthy else "off") if kind == "bool" else raw))
+    if args.effective and kind == "bool":
+        applicable, stale = verify_rules(args.host)
+        ev, why, incon = effective_bools(file_bools(text, keys),
+                                         applicable).get(k, (None, None, False))
+        if incon:
+            print("  effective: INCONCLUSIVE -- the boot rules disagree")
+        elif why:
+            print("  effective at boot: %s -- %s" % ("ON" if ev else "OFF", why))
+        else:
+            print("  effective at boot: same as the file (no boot rule "
+                  "touches %s)" % k)
+        if k in NOTE_TEXT:
+            print("  NOTE: %s" % NOTE_TEXT[k])
+        for rule, w in stale:
+            if rule[2] == k or k in rule[1]:
+                print("  STALE RULE, NOT APPLIED: %s" % w)
     return 0
 
 
@@ -570,6 +864,133 @@ def selftest(args):
     case("in_deployed() on an absent root returns None (not False)",
          in_deployed(os.path.join(args.root, "no-such-dir"), "debugUi"), None)
 
+    # ---- the effective-value rules, against a SYNTHETIC config -------------
+    # The bug: `show` printed `settingsUiProbe off` while the host had turned
+    # it on at boot because settingsPages was set. Every case below is paired
+    # with the world in which it must NOT fire, because "always say ON" and
+    # "always say OFF" would each pass half of this on its own.
+    applicable, stale_rules = verify_rules(args.host)
+    print("\n  boot rules: %d of %d verified against %s"
+          % (len(applicable), len(RULES), args.host))
+    for rule, why in stale_rules:
+        print("  STALE: %s -> %s (%s:%d) -- %s"
+              % ("/".join(rule[1]), rule[2], rule[3], rule[4], why))
+    case("every rule in the table is still findable in the host source",
+         len(stale_rules), 0)
+
+    syn_on = {"settingsPages": True, "settingsUiProbe": False,
+              "aowlUi": True, "nativeUi": False, "modSettingsRender": False,
+              "cameraFreeCam": True, "cameraApi": False}
+    syn_off = dict(syn_on, settingsPages=False, aowlUi=True, cameraFreeCam=False)
+    e_on = effective_bools(syn_on, applicable)
+    e_off = effective_bools(syn_off, applicable)
+
+    # THE REGRESSION, both ways round.
+    case("settingsPages on  -> settingsUiProbe reads ON",
+         e_on["settingsUiProbe"][0], True)
+    case("settingsPages off -> settingsUiProbe stays OFF (control)",
+         e_off["settingsUiProbe"][0], False)
+    case("the ON verdict names WHY", "implied by settingsPages"
+         in (e_on["settingsUiProbe"][1] or ""), True)
+    case("the OFF verdict claims no reason",
+         e_off["settingsUiProbe"][1], None)
+
+    # Gating pulls the other way: armed in the file, dead at runtime.
+    case("aowlUi on with nativeUi off reads OFF", e_on["aowlUi"][0], False)
+    case("that OFF verdict says what is missing",
+         "needs nativeUi" in (e_on["aowlUi"][1] or ""), True)
+    syn_both = dict(syn_on, nativeUi=True)
+    case("aowlUi on with nativeUi ON reads on (control)",
+         effective_bools(syn_both, applicable)["aowlUi"][0], True)
+
+    # A second, independent implication in a different source file.
+    case("cameraFreeCam on  -> cameraApi reads ON", e_on["cameraApi"][0], True)
+    case("cameraFreeCam off -> cameraApi stays OFF (control)",
+         e_off["cameraApi"][0], False)
+
+    # Transitivity: modSettingsRender -> settingsPages -> settingsUiProbe.
+    chain = effective_bools({"modSettingsRender": True, "settingsPages": False,
+                             "settingsUiProbe": False}, applicable)
+    case("modSettingsRender reaches settingsUiProbe through settingsPages",
+         (chain["settingsPages"][0], chain["settingsUiProbe"][0]), (True, True))
+
+    # A STALE rule must be dropped, not applied. Constructed by handing the
+    # computation only the rules that verified, minus one -- the same thing
+    # verify_rules() does when an anchor vanishes.
+    starved_rules = [r for r in applicable
+                     if not (r[0][0] == "implies"
+                             and r[0][2] == "settingsUiProbe"
+                             and "settingsPages" in r[0][1])]
+    case("a dropped implication no longer turns settingsUiProbe on",
+         effective_bools(syn_on, starved_rules)["settingsUiProbe"][0], False)
+
+    # readBoolKeyDef(..., true): an ABSENT key that defaults ON.
+    case("modLoadScreen is known to default ON when absent",
+         "modLoadScreen" in BOOL_DEFAULT_TRUE, True)
+    case("debugUi is NOT in the default-on set (control)",
+         "debugUi" in BOOL_DEFAULT_TRUE, False)
+
+    # ---- END TO END over a SYNTHETIC config --------------------------------
+    # The pure-function cases above cannot see the rendering, and the rendering
+    # is where this went wrong twice: string keys printed the boolean default
+    # (`audioRayDllPath False`), and while fixing that an `else:` was lost so
+    # integer keys printed `effective` left over from the PREVIOUS key of the
+    # loop -- `waitForRuntimeMs True`. A plausible value carried in from
+    # somewhere else is the exact failure this repo keeps paying for, so the
+    # column is asserted here, per kind, against a file whose contents are
+    # known.
+    import contextlib
+    import io as _io
+    import tempfile
+
+    tmp = tempfile.mkdtemp(prefix="hostcfg-selftest-")
+    with open(os.path.join(tmp, "aowlspt-host.json"), "w",
+              encoding="utf-8", newline="\n") as f:
+        f.write('{\n'
+                '  "settingsPages": true,\n'
+                '  "settingsUiProbe": false,\n'
+                '  "aowlUi": true,\n'
+                '  "nativeUi": false,\n'
+                '  "waitForRuntimeMs": 240000,\n'
+                '  "launchProfileId": "abc123",\n'
+                '  "zzNotAKeyAtAll": true\n'
+                '}\n')
+
+    class _A:
+        root = tmp
+        host = args.host
+        effective = True
+    buf = _io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        cmd_show(_A(), keys, False)
+    lines = {l.split()[0]: l.strip() for l in buf.getvalue().splitlines()
+             if l.startswith("  ") and l.split()}
+    shutil.rmtree(tmp, ignore_errors=True)
+
+    def line(k):
+        return lines.get(k, "<NO LINE FOR %s>" % k)
+
+    case("synthetic show: an int key renders as its number",
+         line("waitForRuntimeMs").split()[1], "240000")
+    case("synthetic show: a str key renders as its string",
+         line("launchProfileId").split()[1], '"abc123"')
+    case("synthetic show: an absent int key falls back to its default",
+         line("modSyncMs").split()[1], "3000")
+    case("synthetic show: no value column reads True/False",
+         any(x in line(k).split()[1:2] for k in ("waitForRuntimeMs",
+                                                 "launchProfileId",
+                                                 "modSyncMs", "espProvider")
+             for x in (["True"], ["False"])), False)
+    case("synthetic show: the file value AND the implied value are both shown",
+         "off (file) / ON (implied by settingsPages" in line("settingsUiProbe"),
+         True)
+    case("synthetic show: a gated key says it is forced OFF",
+         "on (file) / OFF (forced OFF: needs nativeUi" in line("aowlUi"), True)
+    case("synthetic show: a key no rule touches shows a bare value (control)",
+         line("debugUi").split()[1], "off")
+    case("synthetic show: the unknown key in the file is still reported",
+         "zzNotAKeyAtAll" in buf.getvalue(), True)
+
     verdict = "FAIL" if bad else ("INCONCLUSIVE" if inconclusive else "PASS")
     print("\n%s: %d case(s) failed, %d inconclusive" % (verdict, bad, inconclusive))
     return 1 if bad else (0 if not inconclusive else 3)
@@ -585,6 +1006,11 @@ def main():
     p.add_argument("--root", default=DEFAULT_ROOT)
     p.add_argument("--host", default=os.path.join(REPO, "host"))
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--effective", action="store_true",
+                   help="with show/diff/get: apply the host's boot-time "
+                        "implication and gating rules, so a flag the host "
+                        "turns on for itself reads 'off (file) / ON (implied "
+                        "by settingsPages)' instead of just 'off'")
     p.add_argument("--no-color", action="store_true")
     p.add_argument("--force", action="store_true",
                    help="write a key this tool's manifest does not know, "

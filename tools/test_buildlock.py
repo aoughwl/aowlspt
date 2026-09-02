@@ -161,6 +161,100 @@ def run_scenario(mode, tmp):
     return rows
 
 
+GATED_CHILD = r'''
+import json, os, sys, time
+sys.path.insert(0, r"%(here)s")
+import buildlock
+path, out, label, mode, gate = sys.argv[1:6]
+# Already imported, already warm: from here the only thing between us and the
+# O_EXCL create is the queue check. That is the point -- an arrival timed by
+# process startup would be measuring python, not the lock.
+while not os.path.exists(gate):
+    time.sleep(0.002)
+if mode == "fair":
+    ok = buildlock.acquire(path, label, 60, 7200, False)
+else:
+    ok = buildlock.race_acquire(path, label, 60, 7200, False)
+rec = {"label": label, "ok": bool(ok), "at": time.time(), "pid": os.getpid()}
+with open(out, "a", encoding="utf-8") as f:
+    f.write(json.dumps(rec) + "\n")
+if ok:
+    time.sleep(1.5)
+    buildlock.release(path)
+'''
+
+
+def run_release_window(mode, tmp, tag):
+    """THE sharp case: A is queued and asleep; B arrives in the millisecond
+    the holder releases.
+
+    `run_scenario` above has B arrive ~1s BEFORE the release, so B is already
+    parked in the queue-check loop when the lock frees and never even attempts
+    a create. That scenario cannot catch a FIFO break that lives in the gap
+    between "the lock became free" and "the earliest waiter noticed". This one
+    aims straight at that gap: B's interpreter is already warm and parked on a
+    gate file, and the gate is touched immediately after the lock is removed,
+    while A is mid-`time.sleep(1.0)`.
+
+    Fair mode must still hand it to A. The unfair control must be ABLE to hand
+    it to B -- if it never does, this scenario is not reaching the race and the
+    fair-mode result is not evidence (CLAUDE.md 9b).
+    """
+    repo = os.path.join(tmp, tag)
+    os.makedirs(repo, exist_ok=True)
+    path = buildlock.lock_path(repo)
+    out = os.path.join(repo, "order.jsonl")
+    gate = os.path.join(repo, "GO")
+    holder = plant_holder(path)
+    child = os.path.join(repo, "child.py")
+    with open(child, "w", encoding="utf-8") as f:
+        f.write(CHILD % {"here": HERE})
+    gchild = os.path.join(repo, "gchild.py")
+    with open(gchild, "w", encoding="utf-8") as f:
+        f.write(GATED_CHILD % {"here": HERE})
+
+    a = subprocess.Popen([sys.executable, child, path, out, "A", mode],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    b = subprocess.Popen([sys.executable, gchild, path, out, "B", mode, gate],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # A must be an ESTABLISHED waiter before the release, or there is nothing
+    # to be unfair to. In fair mode that is observable: its ticket is on disk.
+    qd = buildlock.queue_dir(path)
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        if mode == "fair":
+            if any(n.endswith(".json") for n in
+                   (os.listdir(qd) if os.path.isdir(qd) else [])):
+                break
+        else:
+            time.sleep(2.0)
+            break
+        time.sleep(0.05)
+    time.sleep(2.0)
+
+    holder.kill()
+    holder.wait()
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+    with open(gate, "w") as f:      # B "arrives" now, microseconds later
+        f.write("go")
+
+    for p in (a, b):
+        p.wait(timeout=90)
+
+    rows = []
+    if os.path.exists(out):
+        with open(out, encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    rows.append(json.loads(line))
+    rows.sort(key=lambda r: r["at"])
+    return rows
+
+
 BL = os.path.join(HERE, "buildlock.py")
 
 
@@ -268,6 +362,120 @@ def test_status(tmp):
     # is --json, not English that happens to match one agent's guess.
     check("the substring an agent wrongly matched is still absent",
           "build lock is FREE" not in free_human[1], repr(free_human[1][:80]))
+
+
+def plant_ticket(qdir, arrival_ns, cmd):
+    """A LIVE waiter's queue ticket. Returns (proc, path)."""
+    os.makedirs(qdir, exist_ok=True)
+    p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    path = os.path.join(qdir, buildlock._ticket_name(arrival_ns, p.pid))
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"pid": p.pid, "cmd": cmd, "arrival": arrival_ns,
+                   "arrival_h": time.strftime(
+                       "%Y-%m-%d %H:%M:%S",
+                       time.localtime(arrival_ns / 1e9))}, f)
+    return p, path
+
+
+def plant_holder_arrived(path, arrival_ns, acquired_at):
+    """A holder whose QUEUE ARRIVAL is recorded, i.e. a post-fix lock file."""
+    p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"pid": p.pid, "cmd": "build host", "started": acquired_at,
+                   "started_h": time.strftime("%Y-%m-%d %H:%M:%S",
+                                              time.localtime(acquired_at)),
+                   "arrival": arrival_ns,
+                   "arrival_h": time.strftime("%Y-%m-%d %H:%M:%S",
+                                              time.localtime(arrival_ns / 1e9))},
+                  f)
+    return p
+
+
+def test_fifo_reporting(tmp):
+    """The thing that was actually wrong on 2026-09-02 at 01:35.
+
+    `--status` printed a holder 'since 01:22:41' above a waiter 'since
+    01:19:27' and it read as a queue-jump. It was not one: the holder's
+    timestamp was when it ACQUIRED and the waiter's was when it ARRIVED -- two
+    different clocks in adjacent columns with no label. The ordering tests
+    could not reproduce a fairness bug because there was none to reproduce.
+
+    So the property under test is that the tool can now tell those two worlds
+    apart. THREE worlds, three verdicts, and the `unknown` one matters most:
+    a lock file with no arrival recorded must NOT be reported as `ok`, or the
+    verdict is a check that cannot fail.
+    """
+    print("\nFIFO reporting: ok / INVERTED / unknown")
+    procs = []
+    now = time.time()
+
+    # World 1 -- the real 01:35 shape. Holder queued at T-16m, won at T-12m;
+    # a waiter arrived at T-15m and is still waiting. FAIR, and must say so.
+    r1 = os.path.join(tmp, "fifo-ok")
+    os.makedirs(r1, exist_ok=True)
+    lp1 = buildlock.lock_path(r1)
+    procs.append(plant_holder_arrived(lp1, int((now - 960) * 1e9), now - 720))
+    w1, _ = plant_ticket(buildlock.queue_dir(lp1), int((now - 900) * 1e9),
+                         "build host")
+    procs.append(w1)
+    rc1, out1 = cli(r1, "--status", "--json")
+    _rc, human1 = cli(r1, "--status")
+
+    # World 2 -- a GENUINE inversion: the holder queued AFTER the waiter.
+    r2 = os.path.join(tmp, "fifo-bad")
+    os.makedirs(r2, exist_ok=True)
+    lp2 = buildlock.lock_path(r2)
+    procs.append(plant_holder_arrived(lp2, int((now - 600) * 1e9), now - 300))
+    w2, _ = plant_ticket(buildlock.queue_dir(lp2), int((now - 900) * 1e9),
+                         "build host")
+    procs.append(w2)
+    _rc, out2 = cli(r2, "--status", "--json")
+    _rc, human2 = cli(r2, "--status")
+
+    # World 3 -- a lock file written before `arrival` existed, or via --steal.
+    r3 = os.path.join(tmp, "fifo-unknown")
+    os.makedirs(r3, exist_ok=True)
+    lp3 = buildlock.lock_path(r3)
+    procs.append(plant_holder(lp3))          # legacy record: no arrival field
+    w3, _ = plant_ticket(buildlock.queue_dir(lp3), int((now - 900) * 1e9),
+                         "build host")
+    procs.append(w3)
+    _rc, out3 = cli(r3, "--status", "--json")
+    _rc, human3 = cli(r3, "--status")
+
+    for p in procs:
+        p.kill()
+        p.wait()
+
+    verdicts = []
+    for out in (out1, out2, out3):
+        try:
+            verdicts.append(json.loads(out).get("fifo"))
+        except Exception:
+            verdicts.append("<unparseable>")
+    print("    fifo verdicts %s" % verdicts)
+    check("three worlds give three DIFFERENT fifo verdicts",
+          len(set(verdicts)) == 3, str(verdicts))
+    check("fair handoff (acquired later, queued earlier) reads ok",
+          verdicts[0] == "ok", str(verdicts))
+    check("a real inversion reads INVERTED",
+          verdicts[1] == "INVERTED", str(verdicts))
+    check("a lock with no arrival recorded reads unknown, NOT ok",
+          verdicts[2] == "unknown", str(verdicts))
+
+    check("the fair world's text names the holder's QUEUE time too",
+          "it joined the queue at" in human1, repr(human1))
+    check("the fair world's text does NOT cry inversion",
+          "FIFO INVERTED" not in human1, repr(human1))
+    check("the inverted world's text says FIFO INVERTED",
+          "FIFO INVERTED" in human2, repr(human2))
+    check("the unknown world says it CANNOT be compared, not that it is fine",
+          "CANNOT be compared" in human3 and "FIFO INVERTED" not in human3,
+          repr(human3))
+    check("queue lines label their timestamps as arrivals",
+          "(arrived)" in human1, repr(human1))
+    check("the held exit code is still 1 with a queue present",
+          rc1 == 1, "rc=%d" % rc1)
 
 
 def test_wait_free(tmp):
@@ -392,7 +600,37 @@ def main():
               "code raced on a 2s sleep; if the scenario cannot produce an "
               "inversion, lengthen the gap between A and B." % rounds)
 
+        print("\nrelease window: B arrives the instant the holder lets go")
+        rw = run_release_window("fair", tmp, "rw-fair")
+        order = [r["label"] for r in rw if r["ok"]]
+        print("    acquisition order: %s" % (order or "NOBODY ACQUIRED"))
+        check("release window: both waiters eventually acquired",
+              sorted(order) == ["A", "B"], str(order))
+        check("release window: A (queued FIRST) still acquired FIRST",
+              order[:1] == ["A"],
+              "order was %s -- a waiter that arrived during the release "
+              "window jumped an established queue entry" % order)
+        if len(rw) == 2:
+            gap = abs(rw[1]["at"] - rw[0]["at"])
+            check("release window: the two acquisitions did not overlap",
+                  gap >= 1.4, "gap was %.2fs -- BOTH RAN AT ONCE" % gap)
+
+        print("\n    negative control for the release window")
+        rw_b = 0
+        rw_rounds = 3
+        for i in range(rw_rounds):
+            r = run_release_window("race%d" % i, tmp, "rw-race%d" % i)
+            o = [x["label"] for x in r if x["ok"]]
+            print("    round %d order: %s" % (i + 1, o or "NOBODY"))
+            if o[:1] == ["B"]:
+                rw_b += 1
+        check("the old algorithm CAN lose the release-window race "
+              "(%d/%d rounds)" % (rw_b, rw_rounds), rw_b > 0,
+              "B never won in %d rounds -- the gate is not landing inside the "
+              "window, so the fair-mode pass above is NOT evidence" % rw_rounds)
+
         test_status(tmp)
+        test_fifo_reporting(tmp)
         test_wait_free(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

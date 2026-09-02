@@ -70,7 +70,27 @@ succeed reads exactly like a check that has not succeeded YET.
 So there are now two contracts that do not depend on reading English:
 
 * `--status --json` prints ONE json object: `state` (`free`/`held`/`stale`),
-  `pid`, `running`, `target`, `since`, `since_epoch`, `age_s`, `queue`, `lock`.
+  `pid`, `running`, `target`, `since`, `since_epoch`, `age_s`, `queue`, `lock`,
+  plus `queued_since` / `queued_arrival` (when the HOLDER joined the queue) and
+  `fifo` (`ok` / `INVERTED` / `unknown`).
+
+## `since` is not `arrived`, and that cost a session
+
+MEASURED 2026-09-02 01:35: `--status` printed a holder `since 01:22:41` above
+`queued 1: pid 13160 ... since 01:19:27 <- next`, and it read as a waiter being
+passed over by a later arrival. It was not. The holder's `since` is when it
+ACQUIRED; a queue line's `since` is when that waiter ARRIVED. A process that
+joined the queue at 01:18 and won the lock at 01:22:41 is perfectly FIFO and
+looked exactly like a bug. The ordering tests could not reproduce it because
+there was nothing to reproduce -- `tools/test_buildlock.py` now also races a
+warm waiter into the millisecond of the release (`run_release_window`) and the
+queue still wins, with an unfair control that loses 3/3.
+
+So the lock record now carries the holder's queue ARRIVAL, `--status` prints it
+next to the acquire time, and `fifo` states the comparison outright. `unknown`
+is a real outcome: a lock file predating this field, or one taken via `--steal`
+(no ticket), CANNOT be compared, and saying `ok` there would be a check that
+cannot fail.
 * `--status` EXIT CODE: **0 free, 1 held by a live process, 2 held by a dead
   one (stale)**. Note that 1 and 2 used to both be 1; a script that only tested
   `rc == 0` is unaffected.
@@ -162,6 +182,20 @@ def join_queue(qdir, cmd):
                    "arrival_h": time.strftime("%Y-%m-%d %H:%M:%S")}, f)
     os.replace(tmp, p)
     return p
+
+
+def ticket_arrival(ticket):
+    """The arrival_ns encoded in a ticket filename, or None.
+
+    The lock record carries this forward so that `--status` can compare the
+    HOLDER and the WAITERS on one clock. See print_status_human().
+    """
+    if not ticket:
+        return None
+    try:
+        return int(os.path.basename(ticket).split("-", 1)[0])
+    except (ValueError, IndexError):
+        return None
 
 
 def leave_queue(ticket):
@@ -281,6 +315,7 @@ def status(path, max_age):
     if not held:
         return {"state": "free", "pid": None, "running": None, "target": None,
                 "since": None, "since_epoch": None, "age_s": None,
+                "queued_since": None, "queued_arrival": None, "fifo": "n/a",
                 "queue": qout, "lock": path}
     pid = int(held.get("pid", -1))
     running = pid_alive(pid)
@@ -288,7 +323,32 @@ def status(path, max_age):
     return {"state": "held" if running else "stale",
             "pid": pid, "running": running, "target": held.get("cmd"),
             "since": held.get("started_h"), "since_epoch": started,
-            "age_s": time.time() - started, "queue": qout, "lock": path}
+            "age_s": time.time() - started,
+            "queued_since": held.get("arrival_h"),
+            "queued_arrival": held.get("arrival"),
+            "fifo": fifo_verdict(held, q),
+            "queue": qout, "lock": path}
+
+
+def fifo_verdict(held, q):
+    """`ok` / `INVERTED` / `unknown` -- three outcomes, never two.
+
+    An inversion is only a claim worth making when both sides are on the SAME
+    clock: the holder's QUEUE ARRIVAL against the waiters' queue arrivals. A
+    lock file written before this field existed, or one taken via --steal (no
+    ticket), carries no arrival -- that is `unknown`, an honest "I could not
+    compare", and it must never be reported as `ok`. Reporting an
+    uncomparable pair as ok is the check-that-cannot-fail (CLAUDE.md 9b);
+    reporting it as INVERTED would be the confidently wrong answer that sent a
+    session hunting a bug the ordering tests could not reproduce.
+    """
+    mine = held.get("arrival")
+    if not mine:
+        return "unknown"
+    for t in q:
+        if int(t.get("arrival", 0)) < int(mine):
+            return "INVERTED"
+    return "ok"
 
 
 def print_status_human(st):
@@ -303,10 +363,25 @@ def print_status_human(st):
     print("build lock HELD by pid %d (%s) %r since %s -- %.0fs ago"
           % (st["pid"], "running" if st["running"] else "NOT RUNNING (stale)",
              st["target"], st["since"], st["age_s"]))
+    # `since` above is when the holder WON the lock; the queue lines below are
+    # when each waiter ARRIVED. Print the holder's arrival too, or the two
+    # columns are on different clocks and a fair handoff reads as a queue-jump.
+    if st.get("queued_since"):
+        print("  (that is when it ACQUIRED; it joined the queue at %s -- "
+              "the queue times below are arrivals, so compare against this "
+              "one)" % st["queued_since"])
+    elif st["queue"]:
+        print("  (that is when it ACQUIRED, not when it queued -- this lock "
+              "records no arrival time, so it CANNOT be compared with the "
+              "arrival times below. Not an inversion; not checked.)")
     for i, t in enumerate(st["queue"]):
-        print("  queued %d: pid %s %r since %s%s"
+        print("  queued %d: pid %s %r since %s (arrived)%s"
               % (i + 1, t["pid"], t["target"], t["since"],
                  "   <- next" if i == 0 else ""))
+    if st.get("fifo") == "INVERTED":
+        print("  FIFO INVERTED: the holder joined the queue AFTER a waiter "
+              "that is still waiting. That is a real fairness bug, measured "
+              "on comparable clocks -- report it with this output.")
 
 
 def wait_free(path, max_age, timeout, poll=1.0, announce=True):
@@ -345,11 +420,16 @@ def acquire(path, cmd, wait_s, max_age, steal):
     already means "I know what I am doing to the current holder".
     """
     qdir = queue_dir(path)
-    ticket = join_queue(qdir, cmd)
+    # A one-element cell, because the ticket can be REPLACED mid-wait (see the
+    # requeue path). Cleaning up the ticket we started with would leave the
+    # replacement behind, and an abandoned ticket at the head of the queue
+    # stalls everyone until its pid is noticed to be gone.
+    slot = [join_queue(qdir, cmd)]
     try:
-        return _acquire_queued(path, qdir, ticket, cmd, wait_s, max_age, steal)
+        return _acquire_queued(path, qdir, slot[0], cmd, wait_s, max_age,
+                               steal, slot)
     except BaseException:
-        leave_queue(ticket)
+        leave_queue(slot[0])
         raise
 
 
@@ -362,24 +442,61 @@ def race_acquire(path, cmd, wait_s, max_age, steal):
     with no losing counterpart is the check-that-cannot-fail this repo keeps
     finding (CLAUDE.md 9b). It is not used by `main` and must not be.
     """
-    return _acquire_queued(path, None, None, cmd, wait_s, max_age, steal)
+    return _acquire_queued(path, None, None, cmd, wait_s, max_age, steal,
+                           None)
 
 
-def _acquire_queued(path, qdir, ticket, cmd, wait_s, max_age, steal):
+def _acquire_queued(path, qdir, ticket, cmd, wait_s, max_age, steal,
+                    slot=None):
     deadline = time.time() + wait_s
     announced = False
     yielded_to = None
+    requeues = 0
     while True:
         # AM I NEXT? Checked before the create is attempted, so a later arrival
         # cannot win the race against an earlier one that happens to be asleep.
         if not steal and ticket is not None:
             q = read_queue(qdir, max_age)
-            if q and q[0].get("_path") != ticket:
+            # Position is recomputed EVERY pass, not only when the head
+            # changes. It used to be computed inside the "the head changed"
+            # branch and then reused by the refusal message many polls later,
+            # so a refusal could name a position we had long since left.
+            pos = next((i for i, t in enumerate(q)
+                        if t.get("_path") == ticket), -1)
+            if pos < 0:
+                # OUR OWN TICKET IS GONE. read_queue prunes on a liveness
+                # probe, and that probe (`tasklist`) can answer "not running"
+                # for a running process -- an empty stdout from a transient
+                # failure is indistinguishable from a real absence. Whatever
+                # the cause, we are no longer IN the queue, and the old code
+                # then fell through to the O_EXCL create with q[0] belonging
+                # to somebody else -- i.e. it jumped the queue, silently.
+                # Re-join instead: that costs us our place, which is honest,
+                # and never takes anyone else's.
+                requeues += 1
+                if requeues > 3:
+                    print("GIVING UP ON THE QUEUE after %d lost tickets; "
+                          "falling back to racing for the lock. Exclusion is "
+                          "unaffected -- ORDER IS NOT GUARANTEED from here."
+                          % requeues, flush=True)
+                    ticket = None
+                    if slot is not None:
+                        slot[0] = None
+                    continue
+                ticket = join_queue(qdir, cmd)
+                if slot is not None:
+                    slot[0] = ticket
+                yielded_to = None
+                print("REQUEUED: our queue ticket disappeared (a liveness "
+                      "probe pruned it, or it was cleaned up) -- taking a new "
+                      "one at the BACK rather than jumping the queue.",
+                      flush=True)
+                time.sleep(0.2)
+                continue
+            if q[0].get("_path") != ticket:
                 head = q[0]
                 if yielded_to != head.get("_path"):
                     yielded_to = head.get("_path")
-                    pos = next((i for i, t in enumerate(q)
-                                if t.get("_path") == ticket), -1)
                     print("QUEUED at position %d of %d: pid %s (%r) arrived "
                           "first and is next for the lock."
                           % (pos + 1, len(q), head.get("pid"),
@@ -393,8 +510,21 @@ def _acquire_queued(path, qdir, ticket, cmd, wait_s, max_age, steal):
                 time.sleep(1.0)
                 continue
 
+        arrival_ns = ticket_arrival(ticket)
         me = {"pid": os.getpid(), "cmd": cmd, "started": time.time(),
-              "started_h": time.strftime("%Y-%m-%d %H:%M:%S")}
+              "started_h": time.strftime("%Y-%m-%d %H:%M:%S"),
+              # WHEN WE JOINED THE QUEUE, not when we won it. Without this the
+              # holder's only timestamp is its acquire time, and `--status`
+              # then prints the holder's acquire time next to the waiters'
+              # ARRIVAL times -- two different clocks, side by side, with no
+              # label. A holder that queued at 01:18 and acquired at 01:22:41
+              # while a waiter arrived at 01:19:27 is perfectly FIFO and reads
+              # as a queue-jump. That misreading is what sent a session hunting
+              # a fairness bug that the ordering tests could not reproduce.
+              "arrival": arrival_ns,
+              "arrival_h": (time.strftime(
+                  "%Y-%m-%d %H:%M:%S", time.localtime(arrival_ns / 1e9))
+                  if arrival_ns else None)}
         try:
             fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             with os.fdopen(fd, "w", encoding="utf-8") as f:
