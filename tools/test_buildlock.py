@@ -747,6 +747,213 @@ def test_forwarding(tmp):
               "argv was %r" % called2.get("argv"))
 
 
+def make_git_repo(tmp, name):
+    """A throwaway git repo with one committed file under host/.
+
+    Returns the path, or None if git would not cooperate -- in which case the
+    caller reports INCONCLUSIVE. `core.hooksPath` is pointed at a directory
+    that does not exist so this never runs the real checkout's pre-commit
+    guard, and identity is set locally so it never depends on global config.
+    """
+    repo = os.path.join(tmp, name)
+    # host/Aowlspt.Host.Il2Cpp/ must be a TRACKED directory, or `git status`
+    # (which is run with the default -unormal) would collapse the new file
+    # into a single untracked-DIRECTORY entry and the test would be asserting
+    # against a shape the real checkout never has.
+    sub = os.path.join(repo, "host", "Aowlspt.Host.Il2Cpp")
+    os.makedirs(sub, exist_ok=True)
+    for p in (os.path.join(repo, "host", "pre.nim"),
+              os.path.join(sub, "modsindex.nim")):
+        with open(p, "w", encoding="utf-8", newline="\n") as f:
+            f.write("# committed content\n")
+
+    def g(*args):
+        return subprocess.run(["git"] + list(args), cwd=repo,
+                              capture_output=True, text=True, timeout=60)
+    if g("init", "-q").returncode != 0:
+        return None
+    g("config", "core.hooksPath", os.path.join(repo, "no-such-hooks"))
+    g("config", "user.email", "t@example.invalid")
+    g("config", "user.name", "buildlock test")
+    g("config", "commit.gpgsign", "false")
+    g("add", "-A")
+    if g("commit", "-q", "-m", "base").returncode != 0:
+        return None
+    if not g("rev-parse", "HEAD").stdout.strip():
+        return None
+    return repo
+
+
+def make_effect_driver(repo, creates=None, rc=0, sleep_s=0.6):
+    """A stand-in `aowl` that optionally CREATES a file mid-build and exits
+    with a chosen code -- i.e. it reproduces the measured incident (an
+    untracked source file appearing in the checkout while somebody else's
+    build is running) without building anything.
+
+    Returns the path it will create, or None if the copied interpreter will
+    not run (INCONCLUSIVE, not a pass).
+    """
+    bin_dir = os.path.join(repo, "installer", "build")
+    os.makedirs(bin_dir, exist_ok=True)
+    exe = os.path.join(bin_dir, "aowl.exe")
+    shutil.copy(sys.executable, exe)
+    target = os.path.join(repo, creates) if creates else None
+    script = os.path.join(repo, "build")
+    with open(script, "w", encoding="utf-8", newline="\n") as f:
+        f.write("import os, sys, time\n"
+                "time.sleep(%r)\n"
+                "t = %r\n"
+                "if t:\n"
+                "    os.makedirs(os.path.dirname(t), exist_ok=True)\n"
+                "    open(t, 'w').write('# written mid-build\\n')\n"
+                "time.sleep(%r)\n"
+                "sys.exit(%d)\n" % (sleep_s / 2.0, target, sleep_s / 2.0, rc))
+    probe = subprocess.run([exe, "-c", "print('ok')"],
+                           capture_output=True, text=True)
+    if probe.returncode != 0 or "ok" not in probe.stdout:
+        return None
+    return target
+
+
+def run_build(repo):
+    r = subprocess.run([sys.executable, BL, "--repo", repo, "build", "host"],
+                       capture_output=True, text=True, timeout=180)
+    return r.returncode, r.stdout
+
+
+FOOTER = ("a failure in a file you did not edit is likely another agent's "
+          "half-written change; re-run after the queue drains")
+HEADER = "CONCURRENT EDITS DURING THIS BUILD:"
+
+
+def test_concurrent_edits(tmp):
+    """The measured incident, reproduced: a file appears mid-build.
+
+    MEASURED 2026-09-01: `buildlock build host` failed on
+    `modsindex.nim(399): undeclared identifier: 'ntKeyCodeName'` in a file the
+    builder had never touched, because another agent had just created
+    host/Aowlspt.Host.Il2Cpp/keycodes.nim in the shared checkout. The failure
+    read as the builder's own bug.
+
+    The pass condition is NOT 'the block was printed' on its own -- a block
+    printed unconditionally would satisfy that. The SUCCESS run below is the
+    control: identical scenario, identical mid-build file creation, exit 0, and
+    the block must be entirely absent. If the file did not actually get
+    created, both halves are vacuous, so that is asserted first.
+    """
+    print("\nconcurrent-edit reporting: a file appears mid-build")
+    new_rel = "host/Aowlspt.Host.Il2Cpp/keycodes.nim"
+
+    repo = make_git_repo(tmp, "ce-fail")
+    if repo is None:
+        check("INCONCLUSIVE: could not create a git repo, nothing was tested",
+              False, "git init/commit failed")
+        return
+    created = make_effect_driver(repo, creates=new_rel, rc=3)
+    if created is None:
+        check("INCONCLUSIVE: no runnable stand-in driver, nothing was tested",
+              False, "the copied python.exe would not start")
+        return
+    # A file dirty BEFORE the build starts, to exercise the second section.
+    with open(os.path.join(repo, "host", "pre.nim"), "a",
+              encoding="utf-8", newline="\n") as f:
+        f.write("# edited before the lock was taken\n")
+
+    rc, out = run_build(repo)
+    check("the mid-build file was really created (else both halves are "
+          "vacuous)", os.path.exists(created), created)
+    check("the failing build's exit code still comes back", rc == 3,
+          "rc=%d" % rc)
+    check("a FAILED build prints the CONCURRENT EDITS block", HEADER in out,
+          "stdout tail: %r" % out[-300:])
+    check("the block NAMES the file that appeared mid-build",
+          "keycodes.nim" in out, "stdout tail: %r" % out[-500:])
+    check("the appearing file is reported as APPEARED, not as pre-existing",
+          "APPEARED" in out and "keycodes.nim" in out.split("APPEARED", 1)[-1]
+          .splitlines()[0], "stdout tail: %r" % out[-500:])
+    check("the block reports the file dirty at ACQUIRE time too",
+          "already modified" in out and "host/pre.nim" in out,
+          "stdout tail: %r" % out[-600:])
+    check("the block ends with the re-run line", FOOTER in out,
+          "stdout tail: %r" % out[-300:])
+    # The lock file and the queue directory change on every single acquire and
+    # release. If they showed up here the block would be noise on every
+    # failure, and a noisy block is an unread one.
+    check("the lock's OWN files are not reported as concurrent edits",
+          ".aowl-build" not in out, "stdout tail: %r" % out[-500:])
+
+    print("\n  negative control: the SAME edit, but the build SUCCEEDS")
+    repo2 = make_git_repo(tmp, "ce-ok")
+    if repo2 is None:
+        check("INCONCLUSIVE: could not create the control repo", False, "")
+        return
+    created2 = make_effect_driver(repo2, creates=new_rel, rc=0)
+    if created2 is None:
+        check("INCONCLUSIVE: no runnable stand-in driver for the control",
+              False, "")
+        return
+    rc2, out2 = run_build(repo2)
+    check("control: the mid-build file was really created here as well",
+          os.path.exists(created2), created2)
+    check("control: the build succeeded", rc2 == 0, "rc=%d" % rc2)
+    check("a SUCCESSFUL build prints NO block, despite the same edit",
+          HEADER not in out2 and FOOTER not in out2 and
+          "keycodes.nim" not in out2,
+          "stdout tail: %r" % out2[-400:])
+
+
+def test_snapshot_unit(tmp):
+    """The two answers that are hard to stage: HEAD moved, and 'I could not
+    look'. Both are asserted directly on concurrent_edit_lines(), because a
+    snapshot that failed MUST NOT read as 'nothing changed'."""
+    print("\nsnapshot reporting: HEAD moved, and the NOT PERFORMED case")
+    t0 = time.time()
+    base = {"at": t0, "head": "a" * 40, "status": {}, "mtime": {},
+            "error": None}
+    moved = {"at": t0 + 5, "head": "b" * 40, "status": {}, "mtime": {},
+             "error": None}
+    lines = "\n".join(buildlock.concurrent_edit_lines(base, moved))
+    check("a HEAD move during the build is reported", "HEAD MOVED" in lines,
+          lines)
+
+    broken = {"at": t0 + 5, "head": None, "status": {}, "mtime": {},
+              "error": "git status --porcelain failed (not a git repository)"}
+    lines = "\n".join(buildlock.concurrent_edit_lines(base, broken))
+    check("a snapshot that failed says NOT PERFORMED, not 'no changes'",
+          "NOT PERFORMED" in lines and "nothing changed" in lines, lines)
+
+    quiet = "\n".join(buildlock.concurrent_edit_lines(base, dict(base, at=t0)))
+    check("a genuinely quiet build says so explicitly rather than printing "
+          "an empty block",
+          "no working-tree change was observed" in quiet, quiet)
+
+    # mtime-only change: same status code, rewritten file. This is the case a
+    # naive `git status` diff misses entirely -- an agent rewriting a file that
+    # was ALREADY modified changes nothing about the porcelain output.
+    b = {"at": t0, "head": "a" * 40, "status": {"host/x.nim": " M"},
+         "mtime": {"host/x.nim": t0 - 60}, "error": None}
+    a2 = {"at": t0 + 5, "head": "a" * 40, "status": {"host/x.nim": " M"},
+          "mtime": {"host/x.nim": t0 + 3}, "error": None}
+    lines = "\n".join(buildlock.concurrent_edit_lines(b, a2))
+    check("a file REWRITTEN mid-build (identical status code) is caught",
+          "REWRITTEN" in lines and "host/x.nim" in lines, lines)
+
+
+def test_snapshot_speed():
+    """It runs on every build, so it has to be cheap. Measured against the
+    REAL checkout, which is the biggest tree it will ever see here."""
+    print("\nsnapshot cost on the real checkout")
+    t = time.time()
+    snap = buildlock.tree_snapshot(buildlock.REPO)
+    dt = time.time() - t
+    print("    tree_snapshot(%s) took %.3fs, %d paths, error=%r"
+          % (buildlock.REPO, dt, len(snap["status"]), snap["error"]))
+    check("the snapshot reads the real repo without error",
+          snap["error"] is None and snap["head"], repr(snap["error"]))
+    check("the snapshot takes under 1s (%.3fs)" % dt, dt < 1.0,
+          "%.3fs -- it runs twice per build" % dt)
+
+
 def main():
     print("buildlock: FIFO fairness")
     tmp = tempfile.mkdtemp(prefix="buildlock-test-")
@@ -819,6 +1026,9 @@ def main():
         test_wait_free(tmp)
         test_status_streams(tmp)
         test_forwarding(tmp)
+        test_concurrent_edits(tmp)
+        test_snapshot_unit(tmp)
+        test_snapshot_speed()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

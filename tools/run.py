@@ -325,6 +325,14 @@ MENU_PROOF_LINES = (
 # failure.
 MENU_PROOF_SITE = ("site 2 ", "BOUND")
 
+# The host's first line of a boot, written before any timestamped line
+# (`aowlspt-host-il2cpp 0.1.0`). Same literal as tools/acceptance.py's
+# HOST_BANNER_PREFIX. Used ONLY by the --attach prescan, to restart the
+# capability scan at the LAST boot in the file: a `site 2 ... BOUND` line from
+# an earlier boot describes an earlier BUILD, and letting it certify this one
+# is the same "proof from the previous boot" failure the menu proof avoids.
+HOST_BANNER_PREFIX = "aowlspt-host-il2cpp "
+
 # WHICH SCREEN did the host last NAME? Only used to make the
 # PARKED-BEFORE-MENU verdict actionable -- "it never reached the menu" is much
 # less useful than "it is sitting on the slot screen". These are one-shot host
@@ -606,6 +614,22 @@ class Supervisor:
             return True
         return False
 
+    def note_site2(self, line):
+        """Classify ONE host line for the uihooks site-2 CAPABILITY.
+
+        Factored out for the same reason as `note_errdlg`: the --attach
+        prescan and the live tail must agree, to the character, about what
+        "this build can emit a MenuScreen::Show proof" means. Two copies of
+        `all(s in line for s in MENU_PROOF_SITE)` would be two chances to
+        drift, and the thing they decide is the WORDING of the REACHED verdict.
+
+        Returns True on the line that first sets it, so a caller can mark it.
+        """
+        if not self.site2_seen and all(s in line for s in MENU_PROOF_SITE):
+            self.site2_seen = True
+            return True
+        return False
+
     def prescan_host(self, max_bytes=8 * 1024 * 1024):
         """--attach: learn the arming state from the log THIS BOOT ALREADY WROTE.
 
@@ -622,11 +646,30 @@ class Supervisor:
         `_host_lines` clears `errdlg_armed` back to None and the live tail
         re-learns it, so a stale ARMED can never certify a later boot.
 
-        Only the errdlg lines are read out of the backlog. The menu proof and
-        the screen names are NOT, deliberately: those decide a verdict about
-        WHERE the client is now, and re-reading them from an arbitrarily old
-        part of the log is the "proof from the previous boot" failure. Arming
-        is a property of the host process, which is the same process either way.
+        MEASURED AGAIN 2026-09-02, the same bug in a second place: an
+        `--attach --until-phase MENU` run printed `REACHED ... but UNPROVEN:
+        this host build never printed a uihooks 'site 2 ... BOUND' line` for a
+        client whose host log carries, at [0:00:01.032], `uihooks:  site 2
+        EFT.UI.MenuScreen::Show(5-arg) @0x15387a0: BOUND (slot 7)`. That
+        capability line is emitted once at bind time, so from an attach point
+        minutes later it is invisible, and the verdict then downgrades itself
+        by describing this build as one that predates site 2. So the site-2
+        CAPABILITY is prescanned too, through `note_site2` -- the same one
+        definition the live tail uses.
+
+        Capability, unlike location, is a property of the BUILD, so reading it
+        from the backlog is sound -- but only from THIS boot's backlog. The
+        scan therefore restarts at the LAST `aowlspt-host-il2cpp` banner in the
+        file: if an older boot's lines are still ahead of it (the host normally
+        truncates, but a copied or concatenated log does not), its site-2 line
+        describes a build that is not the one running now.
+
+        Only the errdlg and site-2 lines are read out of the backlog. The menu
+        PROOF itself and the screen names are NOT, deliberately: those decide a
+        verdict about WHERE the client is now, and re-reading them from an
+        arbitrarily old part of the log is the "proof from the previous boot"
+        failure. Arming is a property of the host process, which is the same
+        process either way.
 
         Never reads the whole file into the transcript or into memory: it
         streams, and reads at most the last `max_bytes` (the log is a measured
@@ -636,6 +679,7 @@ class Supervisor:
         # reads from the top; a tail-only window would miss exactly the line it
         # came for. `max_bytes` only bounds a pathological file.
         found = None
+        site2 = False
         try:
             with open(self.host_path, "r", encoding="utf-8",
                       errors="replace") as f:
@@ -644,13 +688,26 @@ class Supervisor:
                     read += len(line)
                     if read > max_bytes:
                         break
+                    # A NEW BOOT starts here: everything learned above it
+                    # describes a process and a build that are gone.
+                    if line.startswith(HOST_BANNER_PREFIX):
+                        found = None
+                        self.errdlg_armed = None
+                        site2 = False
+                        self.site2_seen = False
+                        continue
                     if self.note_errdlg(line):
                         found = self.errdlg_armed
+                    if self.note_site2(line):
+                        site2 = True
         except OSError:
             return None
         if found is not None:
             self.mark("--attach: error-dialog catch read from the existing "
                       "host log: %s" % ("ARMED" if found else "NOT ARMED"))
+        if site2:
+            self.mark("--attach: uihooks site 2 (MenuScreen::Show) is BOUND in "
+                      "this build, read from the existing host log")
         return found
 
     # -- backend log ------------------------------------------------------
@@ -844,8 +901,7 @@ class Supervisor:
                         self.menu_proof = line.strip()
                         self.mark("main menu PROVED shown (MenuScreen::Show)")
                         break
-            if not self.site2_seen and all(s in line for s in MENU_PROOF_SITE):
-                self.site2_seen = True
+            self.note_site2(line)
             for sig, name in SCREEN_NAME_LINES:
                 if sig in line:
                     self.last_screen = name

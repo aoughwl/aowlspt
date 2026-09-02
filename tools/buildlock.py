@@ -121,6 +121,34 @@ corrupted this checkout's nimcache twice on 2026-09-01 while `--status` read
 FREE, because an unlocked build is invisible to the lock by construction -- now
 stops instead of colliding. `aowl build --no-lock` is the deliberate escape,
 for bootstrap and CI.
+
+## Whose bug is it? The working-tree snapshot
+
+MEASURED 2026-09-01: `python tools/buildlock.py build host` failed with
+`modsindex.nim(399): undeclared identifier: 'ntKeyCodeName'` in a file the
+building agent had never touched. Another agent had created an untracked
+`host/Aowlspt.Host.Il2Cpp/keycodes.nim` in the shared checkout *while the build
+ran*, so a half-written change compiled into someone else's build. The error
+read as the builder's own bug and cost a round trip to disprove.
+
+The lock serialises BUILDS. It cannot serialise EDITS -- agents write source
+into the same checkout at any time, and nothing here should stop them. What it
+can do is stop the resulting failure from being anonymous. So the working tree
+is snapshotted (`git status --porcelain` paths + statuses + mtimes, and
+`git rev-parse HEAD`) at ACQUIRE and again at EXIT, and on a NON-ZERO exit the
+difference is printed.
+
+Two rules it follows, both from CLAUDE.md 9b:
+
+* **Only on failure, and never a verdict.** A successful build prints nothing
+  extra; a failed one prints evidence, not a diagnosis. Ownership is genuinely
+  unknowable from here -- this process cannot tell which agent wrote a file --
+  so the block lists what moved and says the failure is *likely* somebody
+  else's, rather than asserting it.
+* **A snapshot that could not be taken says so.** If `git` is missing, slow or
+  errors, the block prints that the comparison was NOT PERFORMED. Silence
+  would read exactly like "nothing changed", which is the confidently-wrong
+  answer this whole file exists to avoid.
 """
 
 from __future__ import annotations
@@ -619,6 +647,186 @@ def release(path):
         pass
 
 
+# Source trees an agent edits. A change under one of these can plausibly break
+# somebody else's compile; a change under `.cache/` or `installer/build/`
+# cannot, and listing it would just dilute the block.
+WATCH_PREFIXES = ("host/", "mods/", "tools/")
+
+# Enough to name the culprit, not enough to become a log dump.
+MAX_LINES = 40
+
+# The lock's own bookkeeping, which changes on every acquire and release.
+SELF_PATHS = (".aowl-build.lock", ".aowl-build.queue")
+
+
+def _git(repo, args, timeout=10.0):
+    """(stdout, None) or (None, why). Never raises, never blocks for long."""
+    try:
+        r = subprocess.run(["git"] + list(args), cwd=repo,
+                           capture_output=True, text=True, timeout=timeout)
+    except Exception as e:  # git missing, timeout, anything
+        return None, "%s: %s" % (type(e).__name__, e)
+    if r.returncode != 0:
+        why = (r.stderr or "").strip().splitlines()
+        return None, (why[0][:160] if why else "git exit %d" % r.returncode)
+    return r.stdout, None
+
+
+def _porcelain_path(line):
+    """The path from one `git status --porcelain` line.
+
+    For a rename (`R  old -> new`) this is the DESTINATION, because that is
+    the file that now exists and can break a compile. Quoted paths (non-ASCII
+    or spaces) are unquoted; a path we cannot decode is returned as-is rather
+    than dropped, since a mangled name in the block is still a lead and a
+    missing one is not.
+    """
+    rest = line[3:]
+    if " -> " in rest:
+        rest = rest.split(" -> ", 1)[1]
+    rest = rest.strip()
+    if len(rest) >= 2 and rest.startswith('"') and rest.endswith('"'):
+        try:
+            rest = rest[1:-1].encode("utf-8").decode("unicode_escape")
+        except Exception:
+            rest = rest[1:-1]
+    return rest
+
+
+def tree_snapshot(repo):
+    """What the working tree looks like right now: HEAD, status codes, mtimes.
+
+    `--porcelain` (v1, default `-unormal`) is used rather than `-uall` on
+    purpose: `-uall` walks INTO untracked directories, and this checkout has
+    untracked `build/` and `dm/` trees that would make the call slow enough to
+    notice on every acquire. An untracked directory still appears as one entry,
+    and its MTIME changes when a file is created inside it, so a file appearing
+    in an untracked dir is still detected -- just named by its directory.
+
+    `error` is a string, never silently empty: a snapshot that failed must be
+    reportable as "not performed".
+    """
+    snap = {"at": time.time(), "head": None, "status": {}, "mtime": {},
+            "error": None}
+    out, err = _git(repo, ["rev-parse", "HEAD"])
+    if err is not None:
+        snap["error"] = "git rev-parse HEAD failed (%s)" % err
+    else:
+        snap["head"] = out.strip()
+    out, err = _git(repo, ["status", "--porcelain"])
+    if err is not None:
+        snap["error"] = ((snap["error"] + "; ") if snap["error"] else "") + \
+            "git status --porcelain failed (%s)" % err
+        return snap
+    for line in out.splitlines():
+        if len(line) < 4:
+            continue
+        p = _porcelain_path(line)
+        # NOT `lstrip("./")` here: lstrip strips CHARACTERS, so it would eat
+        # the leading dot of `.aowl-build.lock` and the match would silently
+        # never fire.
+        if not p or p.replace("\\", "/").startswith(SELF_PATHS):
+            # Our OWN lock and queue files move on every acquire and release.
+            # Reporting them as "changed during this build" would be true and
+            # useless, and a block that always has noise in it stops being
+            # read.
+            continue
+        snap["status"][p] = line[:2]
+        try:
+            snap["mtime"][p] = os.path.getmtime(os.path.join(repo, p))
+        except OSError:
+            snap["mtime"][p] = None
+    return snap
+
+
+def _rel_mtime(mt, t0):
+    """An mtime as an offset from the acquire time: `+12s` is DURING the
+    build, `-90s` is before it started. Absolute clock times would force the
+    reader to do this subtraction in their head, which is where a coincidence
+    starts looking like a cause."""
+    if mt is None:
+        return "mtime unreadable"
+    d = mt - t0
+    # One decimal: a build that fails in three seconds would otherwise report
+    # every mtime as `+0s`, which reads as "no information".
+    return "mtime %+.1fs vs lock acquire" % d
+
+
+def concurrent_edit_lines(before, after, watch=WATCH_PREFIXES,
+                          max_lines=MAX_LINES):
+    """The body of the block: what moved in the tree while the build ran.
+
+    Returns a list of lines. It is deliberately EVIDENCE, not a verdict --
+    this process cannot know who wrote any of these files, and saying it could
+    would be the confidently wrong answer. An unusable snapshot produces a
+    NOT PERFORMED line, never an empty list that reads as "all clear".
+    """
+    lines = []
+    if before.get("error") or after.get("error"):
+        lines.append("  NOT PERFORMED: the working-tree comparison could not "
+                     "be made (%s). This is NOT 'nothing changed'."
+                     % (before.get("error") or after.get("error")))
+        return lines
+
+    if before.get("head") != after.get("head"):
+        lines.append("  HEAD MOVED during this build: %s -> %s   (a checkout, "
+                     "commit or rebase under a running build)"
+                     % ((before.get("head") or "?")[:12],
+                        (after.get("head") or "?")[:12]))
+
+    t0 = before["at"]
+    b, a = before["status"], after["status"]
+    changed = []
+    for p in sorted(set(b) | set(a)):
+        if p not in b:
+            changed.append(("APPEARED", p, a[p], after["mtime"].get(p)))
+        elif p not in a:
+            changed.append(("GONE    ", p, b[p], before["mtime"].get(p)))
+        elif b[p] != a[p]:
+            changed.append(("STATUS  %s->%s" % (b[p], a[p]), p, a[p],
+                            after["mtime"].get(p)))
+        elif before["mtime"].get(p) != after["mtime"].get(p):
+            changed.append(("REWRITTEN", p, a[p], after["mtime"].get(p)))
+
+    if changed:
+        lines.append("  changed in the working tree WHILE this build ran:")
+        for kind, p, st, mt in changed[:max_lines]:
+            lines.append("    %-9s %-6s %s   (%s)"
+                         % (kind.strip(), "[%s]" % st, p, _rel_mtime(mt, t0)))
+        if len(changed) > max_lines:
+            lines.append("    ... and %d more" % (len(changed) - max_lines))
+
+    seen = {p for _, p, _, _ in changed}
+    pre = [p for p in sorted(b)
+           if p not in seen and p.replace("\\", "/").startswith(watch)]
+    if pre:
+        lines.append("  already modified/untracked when the lock was taken "
+                     "(ownership is UNKNOWABLE from here -- some of these are "
+                     "probably yours):")
+        for p in pre[:max_lines]:
+            lines.append("    %-6s %s   (%s)"
+                         % ("[%s]" % b[p], p,
+                            _rel_mtime(before["mtime"].get(p), t0)))
+        if len(pre) > max_lines:
+            lines.append("    ... and %d more" % (len(pre) - max_lines))
+
+    if not changed and not pre:
+        lines.append("  no working-tree change was observed during this build, "
+                     "and no host/ mods/ tools/ file was dirty when it started.")
+    return lines
+
+
+def print_concurrent_edits(before, after):
+    """The block printed after a FAILED build. Nothing is printed on success;
+    see main()."""
+    print("")
+    print("CONCURRENT EDITS DURING THIS BUILD:")
+    for ln in concurrent_edit_lines(before, after):
+        print(ln)
+    print("  a failure in a file you did not edit is likely another agent's "
+          "half-written change; re-run after the queue drains")
+
+
 def aowl_exe(repo):
     p = os.path.join(repo, "installer", "build", "aowl.exe")
     return p if os.path.exists(p) else "aowl"
@@ -646,6 +854,10 @@ def main():
                    default=None, dest="wait_free", metavar="SECONDS",
                    help="block until the lock is free, then exit 0; exit 1 on "
                         "timeout (default 1800s). Runs nothing.")
+    p.add_argument("--no-snapshot", action="store_true",
+                   help="skip the working-tree snapshot taken around the "
+                        "build (it costs two `git status` calls and is only "
+                        "printed when the build FAILS)")
     p.add_argument("rest", nargs=argparse.REMAINDER,
                    help="the aowl arguments, e.g. `build host`")
     a = p.parse_args()
@@ -712,11 +924,20 @@ def main():
         # taking a lock leaves no trace anywhere.
         env = dict(os.environ)
         env["AOWL_BUILDLOCK"] = str(os.getpid())
+        # Taken AFTER the "ACQUIRED" line so the two snapshots bracket exactly
+        # the interval the child runs in, and before the child starts so the
+        # child's own outputs are not mistaken for someone's edit.
+        before = tree_snapshot(a.repo) if not a.no_snapshot else None
         rc = subprocess.run(cmd, cwd=a.repo, env=env).returncode
     finally:
         release(path)
     print("%r finished in %.0fs with exit %d (lock released)"
           % (" ".join(rest), time.time() - t0, rc))
+    # Only on FAILURE. A green build printing a list of other agents' edits
+    # would train everyone to ignore the block, and the block is only worth
+    # anything if seeing it means something.
+    if rc != 0 and before is not None:
+        print_concurrent_edits(before, tree_snapshot(a.repo))
     return rc
 
 

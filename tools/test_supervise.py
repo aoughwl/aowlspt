@@ -327,6 +327,10 @@ def t_menu_must_settle():
 # no: an old host build cannot emit the proof line, so on that build the
 # ABSENCE of proof must not be reported as a failure.
 
+# The host's first line of a boot, and the uihooks boot-summary line -- the
+# latter's shape from uihooks.nim's uihStatusLines.
+BANNER = "aowlspt-host-il2cpp 0.1.0"
+
 # The uihooks boot-summary line, shape from uihooks.nim's uihStatusLines.
 SITE2_BOUND = ("[0:00:06.100] ok     site 2 EFT.UI.MenuScreen::Show "
                "@0x15387a0: BOUND (slot 3), fired 0x, 0 with a live receiver, "
@@ -866,6 +870,130 @@ def t_attach_reads_existing_arming():
             b.close()
 
 
+# -- 8b. --attach must read the SITE-2 CAPABILITY already on disk ---------
+def t_attach_reads_site2_capability():
+    """MEASURED 2026-09-02: `run.py --attach --until-phase MENU` on a client
+    that had booted minutes earlier printed `REACHED ... but UNPROVEN: this
+    host build never printed a uihooks 'site 2 ... BOUND' line`, while that
+    boot's log carries the BOUND line at [0:00:01.032]. Same shape as the
+    errdlg bug: a one-shot capability line, an attach point after it.
+
+    Four cases. (a) is the bug, (b) is its falsifying control -- without the
+    prescan the SAME log must still read UNPROVEN, or (a) proves nothing --
+    (c) is a genuinely old build, which must keep saying UNPROVEN, and (d) is
+    the banner restart: a BOUND line belonging to an EARLIER boot must not
+    certify this one.
+    """
+    def attached(b, boot_lines, prescan=True, **kw):
+        """Write a boot, attach at EOF like --attach does, then settle MENU."""
+        for line in boot_lines:
+            b.say(line)
+        s = b.sup(until_phase="MENU", phase_max=0.0, menu_settle=20.0)
+        s.host_pos = os.path.getsize(b.host)      # --attach: start at the END
+        if prescan:
+            s.prescan_host()
+        b.say(phase_line("MENU"))
+        s.poll_host()
+        for line in kw.get("after", ()):
+            b.say(line)
+        s.poll_host()
+        s.last_progress = time.time() - 25.0
+        b.say(phase_line("MENU"))
+        return s, s.poll_host()
+
+    PROOF = ("[0:04:31.500] ok     mod loading: release gated -- READY at "
+             "0:00:22.100, MenuScreen::Show at 0:04:31.480, releasing now")
+
+    # (a) THE BUG: BOUND at boot, before the attach point; the proof arrives
+    # after it. REACHED, and NOT hedged.
+    b = Bed()
+    try:
+        s, hit = attached(b, [BANNER, SITE2_BOUND], after=[PROOF])
+        check("attach/site2-prescanned", s.site2_seen,
+              "the BOUND line was at boot, before the attach point; prescan "
+              "must read it")
+        check("attach/site2-reached-and-proved",
+              hit is not None and hit[0] == "REACHED"
+              and "UNPROVEN" not in hit[1], repr(hit)[:200])
+    finally:
+        b.close()
+
+    # (b) FALSIFYING CONTROL: the identical log with the prescan skipped must
+    # still produce the wrong-but-honest UNPROVEN wording. If this passed too,
+    # (a) would not be evidence that the prescan did anything.
+    b = Bed()
+    try:
+        s, hit = attached(b, [BANNER, SITE2_BOUND], prescan=False,
+                          after=[PROOF])
+        check("attach/site2-unseen-without-prescan", not s.site2_seen,
+              "tailing from EOF cannot see a one-shot line from earlier in "
+              "the same boot")
+    finally:
+        b.close()
+
+    # The same control at the VERDICT level: no proof line either, so the
+    # settle window has to choose its wording with no capability known.
+    b = Bed()
+    try:
+        s, hit = attached(b, [BANNER, SITE2_BOUND], prescan=False)
+        check("attach/site2-unproven-without-prescan",
+              hit is not None and hit[0] == "REACHED" and "UNPROVEN" in hit[1],
+              "without the prescan this log must still read UNPROVEN, or the "
+              "case above proves nothing: %r" % (hit,))
+    finally:
+        b.close()
+
+    # (c) A GENUINELY OLD BUILD: no BOUND line anywhere in the file. The
+    # prescan must not invent the capability, and the wording stays UNPROVEN.
+    b = Bed()
+    try:
+        s, hit = attached(b, [BANNER,
+                              "[0:00:06.100] ok     mods tab: GetComponent "
+                              "bound"])
+        check("attach/old-build-site2-still-unseen", not s.site2_seen)
+        check("attach/old-build-still-unproven",
+              hit is not None and hit[0] == "REACHED" and "UNPROVEN" in hit[1],
+              repr(hit)[:200])
+    finally:
+        b.close()
+
+    # (d) BANNER RESTART: an EARLIER boot bound site 2; this boot's banner
+    # follows it and this boot never did. Capability belongs to the build that
+    # is running now, so the earlier line must be discarded.
+    b = Bed()
+    try:
+        s, hit = attached(b, [BANNER, SITE2_BOUND, BANNER,
+                              "[0:00:06.100] ok     mods tab: GetComponent "
+                              "bound"])
+        check("attach/site2-restarts-at-the-last-banner", not s.site2_seen,
+              "a `site 2 ... BOUND` line above the last host banner describes "
+              "a build that is no longer running")
+        check("attach/site2-restart-keeps-unproven-wording",
+              hit is not None and hit[0] == "REACHED" and "UNPROVEN" in hit[1],
+              repr(hit)[:200])
+    finally:
+        b.close()
+
+    # And the errdlg prescan must survive the same restart rule: ARMED in THIS
+    # boot is still read, with an earlier boot ahead of it in the file.
+    b = Bed()
+    try:
+        b.say(BANNER)
+        b.say("[0:00:01.500] warn   errdlg did not arm: catchErrorDialogs is "
+              "explicitly false")
+        b.say(BANNER)
+        b.say("[0:00:01.500] ok     errdlg ARMED: read-only postfix detours "
+              "on all 3 PreloaderUI error-screen entry points.")
+        s = b.sup()
+        s.host_pos = os.path.getsize(b.host)
+        check("attach/errdlg-takes-the-last-boot",
+              s.prescan_host() is True and s.errdlg_armed is True,
+              "the arming state of the boot BELOW the last banner is the one "
+              "that describes the running host; got %r" % (s.errdlg_armed,))
+    finally:
+        b.close()
+
+
 # -- 9. a LOADING raid is legitimately quiet ------------------------------
 def t_loading_quiet_is_not_idle():
     """The measured exit-6 run, in both of its halves.
@@ -1026,6 +1154,7 @@ def main():
                t_stall_at_destination_needs_total_silence,
                t_teardown_announced, t_teardown_silent_with_keep,
                t_exit_codes_distinct, t_attach_reads_existing_arming,
+               t_attach_reads_site2_capability,
                t_loading_quiet_is_not_idle, t_client_log_carries_a_load,
                t_logged_exception_is_not_a_crash):
         if VERBOSE:
