@@ -1074,11 +1074,17 @@ proc modsRelabelRow(cloneT, donorT: Il2CppPtr; text: string;
   if result:
     okLog who & ": row caption '" & text & "' written to all " &
           $cTmps.len & " of the clone's TextMeshProUGUI (" & $wrote &
-          " write(s) succeeded); " & $mine & " now read it and none still " &
-          "read the donor's '" & donorCaption & "'. " & $locHits & " of " &
-          $cTmps.len & " carried their OWN LocalizedText and were written " &
-          "through it, not through the row control. All " & $mine &
-          " are registered for re-assert."
+          " write(s) succeeded); " & $mine & " read it AS OF THIS INSTANT " &
+          "and none still read the donor's '" & donorCaption & "'. " &
+          $locHits & " of " & $cTmps.len & " carried their OWN " &
+          "LocalizedText and were written through it, not through the row " &
+          "control. " & $mine & " registered for re-assert. THIS IS NOT THE " &
+          "FINISHED STATE: SetLabelText sets the label, NOT the key, so " &
+          "LocalizedText re-resolves the donor's string on its next refresh " &
+          "-- measured 2026-09-02, 14 rows logged exactly this line and all " &
+          "14 read the donor's caption again by the time acceptance looked. " &
+          "The re-assert poll is what decides this, not the line you are " &
+          "reading."
   elif mine == 0:
     warn who & ": row caption '" & text & "' DID NOT LAND AT ALL -- none " &
          "of the clone's " & $cTmps.len & " TextMeshProUGUI read it after " &
@@ -1955,6 +1961,31 @@ proc modsTickSubtabs() =
 
 proc modsTabTickBody() =
   modsCrumb("STAGE: entered modsTabTickBody")
+  # THE RE-ASSERT POLL RUNS BEFORE THE `gModsOn` FLAG GATE.
+  #
+  # MEASURED 2026-09-02 on the 4,785,152 deploy: `hostcfg.py show` reports
+  # `settingsModsTab off` / `settingsPages on`, and acceptance reported 14 rows
+  # still reading 'Interface language' while the host log showed all 14 of my
+  # own relabels reporting complete success. Both were true: the write landed,
+  # then LocalizedText re-resolved from its KEY (SetLabelText sets the label,
+  # not the key) and put the donor's string back -- and the poll that exists to
+  # undo exactly that returned on this line, because it was gated on the MODS
+  # TAB's flag while the rows belong to `settingsPages`, a different feature
+  # with a different flag that was ON.
+  #
+  # The registry is shared by both features, so the poll must be gated on the
+  # REGISTRY, not on one feature's flag. `modsReassertLabels` already returns
+  # immediately when the registry is empty, is throttled to one pass every
+  # ModsLabelEveryFrames frames, and switches itself off after
+  # ModsStableEnough clean passes -- so a session with the mods tab off and no
+  # settings-pages rows pays one comparison per frame.
+  #
+  # The FAULT budget still gates it: a feature that has trapped its way to
+  # ModsMaxFaults stops touching the screen. A flag is a preference; a fault
+  # count is evidence.
+  if gModsFaults < ModsMaxFaults:
+    modsCrumb("STAGE: modsReassertLabels (pre-flag, covers settings pages)")
+    modsReassertLabels()
   if not gModsOn or gModsFaults >= ModsMaxFaults:
     return
   # THE MODS INDEX FETCH, one bounded step, inside THIS guard -- `aowl_p_p_seh`
@@ -1976,8 +2007,6 @@ proc modsTabTickBody() =
   # so with the mods tab flag OFF the settings-pages rows get the corrected
   # WRITE but no poll behind it. Saying that plainly rather than implying cover
   # this does not give.
-  modsCrumb("STAGE: modsReassertLabels (pre-build, covers settings pages)")
-  modsReassertLabels()
   if not gModsBuilt:
     # Build lazily, once the settings screen has been opened onto the tab whose
     # rows we clone. GATE ON THE SAME POINTER THE BUILD USES: a guard naming a
