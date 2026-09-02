@@ -61,6 +61,7 @@ import knobs
 import botgear
 import shapes
 import modrarity
+import seasoncheck
 
 proc failedLines(report, label: string; into: var seq[string]) =
   ## `loot.selfCheck` and `questcond.selfCheck` report one line per check,
@@ -83,6 +84,13 @@ proc selfCheckFailures*(): seq[string] =
   # whether it added none. The return is discarded because the list is the
   # answer and a second way of saying the same thing can disagree with it.
   discard skills.selfCheckSkills(result)
+  # The seasonal event data. Two dangling-reference invariants over
+  # `data/post1/seasonactive.json` and a profile's `SeasonalRewards` dictionary,
+  # each guarded by a positive control -- the profile-side one is vacuous on
+  # today's `{}` and would otherwise be a check that cannot fail. Explicitly NOT
+  # a fix for the `SeasonWidgetData::From` access violation; see the module
+  # header for the disassembly that rules the data out as its cause.
+  discard seasoncheck.selfCheckSeason(result)
   # Profile type-shape repair. Pure over literals; asserts the FINISHED document,
   # and three of its five assertions are negative (see `emu/shapes`).
   shapes.selfCheckShapes(result)
