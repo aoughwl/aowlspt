@@ -7520,3 +7520,21 @@ phase = DEPLOYED -- LATCHED on the TRUE deploy signal
 driving, every transition an event with a readback, then the game's own
 load. run.py `--attach --until-phase DEPLOYED` REACHED. SAIN ran at drive
 level 0 (observer, by config) this raid; set to 2 for the next.
+
+## 2026-09-02 08:20: first fast-path raid -- in-raid readbacks
+
+MEASURED (Woods, night, DEPLOYED via `raid Woods`):
+* natesp (native uGUI ESP): canvas created and verified (2560x1600,
+  sortingOrder 32000, 65 elements parented correctly), contacts=42, but
+  `offScreen=42 of 42`, shown=0 -- every projected point lands outside the
+  canvas rect. The screen is 3840x2160 and the canvas 2560x1600: a
+  canvas-vs-screen coordinate-space mismatch in the placement. The
+  accounting is BALANCED, so the verdict names the defect exactly.
+* The D3D debug ESP (the other of the "TWO ESPs armed") DOES draw: one
+  screenshot shows orange/red name+distance labels along the horizon.
+* Maps: `placement topright x=2496 y=120 w=1024 h=1024 on 3840x2160
+  inside=yes`; the pane's border is visible at the right edge of the
+  screenshot; diag `heading:FAIL, art:FAIL` (details need diagVerbose,
+  now on for the next raid).
+* ammoloading: ARMED but NEVER FIRED (probe mode; no magazine was loaded).
+* SAIN: drive level 0 (observer) this raid -- nothing bound by config.
