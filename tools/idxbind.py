@@ -94,6 +94,8 @@ TABLES = [
         "expect_file": None,
         "users": ["host/Aowlspt.Host.Il2Cpp/autoraid.nim"],
         "accessors": ["cPmnFn", "cPmnName", "cPmnRva"],
+        # 4 rows now: SettingsScreen::Close, Toggle::Set,
+        # TweenAnimatedButton::OnPointerClick, MenuScreen::ShowInRaid.
     },
     {
         "mode": "positional",

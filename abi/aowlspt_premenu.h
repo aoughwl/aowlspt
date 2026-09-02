@@ -63,6 +63,7 @@
 #define AOWL_PMN_SS_CLOSE_RVA    0x1720B10u
 #define AOWL_PMN_TOGGLE_SET_RVA  0x55BA450u
 #define AOWL_PMN_POINTER_CLICK_RVA 0x14359B0u
+#define AOWL_PMN_SHOW_IN_RAID_RVA  0x1539650u
 /* DefaultUIButton._button -> TweenAnimatedButton, and that button's own
  * interactable gate. Both from tools/fldoff.py, never guessed. */
 #define AOWL_PMN_DUB_BUTTON_OFF   0x108
@@ -173,6 +174,34 @@ static const AowlPmnTarget aowl_pmn_targets[] = {
     { "EFT.UI.TweenAnimatedButton::OnPointerClick", AOWL_PMN_POINTER_CLICK_RVA,
       { 0x80,0x79,0x68,0x00, 0x74,0x18, 0x48,0x8B,0x49,0x70,
         0x48,0x85,0xC9, 0x74,0x0F, 0x48 }, 16 },
+
+    /* [3] EFT.UI.MenuScreen::ShowInRaid()
+     * APPENDED AT THE END. Indices 0..2 keep their meaning.
+     *
+     * WHY A CALL ROW FOR A FUNCTION WE ALREADY HOOK. MEASURED 2026-09-02: the
+     * host logged, at boot, `the in-raid menu show event is LIVE --
+     * MenuScreen::ShowInRaid @0x1539650 (uihooks site 7) is bound` -- the
+     * DETOUR side verified this exact RVA against this exact prologue -- and
+     * then, on arming, `raidExit: MenuScreen::ShowInRaid @0x1539650 did not
+     * resolve as callable code on this build -- stopping`.
+     *
+     * Both statements were true, because they are about DIFFERENT TABLES.
+     * `raidexit` resolved the call through the inspector's navigation table
+     * (`cInspCode`), which has no row for this RVA; the hook resolved it
+     * through `aowl_uih_sites`. A refusal that says "on this build" when it
+     * means "in OUR table" points the next reader at the game instead of at
+     * us, so this row exists and the refusal now names the table.
+     *
+     *   RVA         0x1539650   (VA 0x181539650)
+     *   sharedness  UNIQUE (owners=1)
+     *   section     il2cpp
+     *   arity 0     RCX=this(MenuScreen), RDX=MethodInfo*
+     *   48 89 5C 24 08 | 48 89 74 24 10 | 57 | 48 83 EC 20 | 48
+     *   -- the SAME 16 bytes site [7] of aowlspt_uihooks.h verifies, so the
+     *   two tables cannot disagree about what this function starts with. */
+    { "EFT.UI.MenuScreen::ShowInRaid", AOWL_PMN_SHOW_IN_RAID_RVA,
+      { 0x48,0x89,0x5C,0x24,0x08, 0x48,0x89,0x74,0x24,0x10,
+        0x57, 0x48,0x83,0xEC,0x20, 0x48 }, 16 },
 };
 
 #define AOWL_PMN_TARGET_COUNT \
@@ -181,6 +210,7 @@ static const AowlPmnTarget aowl_pmn_targets[] = {
 #define AOWL_PMN_T_SS_CLOSE   0
 #define AOWL_PMN_T_TOGGLE_SET 1
 #define AOWL_PMN_T_POINTER_CLICK 2
+#define AOWL_PMN_T_SHOW_IN_RAID  3
 
 static int32_t aowl_pmn_verified = 0;
 static int32_t aowl_pmn_rejected = 0;
@@ -262,6 +292,14 @@ typedef void (*AowlPmn_PointerClick)(void*, void*, void*);
 static void aowl_pmn_call_pointer_click(void* fn, void* button) {
     if (!fn || !button) return;
     ((AowlPmn_PointerClick)fn)(button, NULL, NULL);
+}
+
+/* Instance, arity 0: RCX = this(MenuScreen), RDX = the hidden trailing
+ * MethodInfo*. Not generic, so NULL is correct and it is passed explicitly. */
+typedef void (*AowlPmn_ShowInRaid)(void*, void*);
+static void aowl_pmn_call_show_in_raid(void* fn, void* menu) {
+    if (!fn || !menu) return;
+    ((AowlPmn_ShowInRaid)fn)(menu, NULL);
 }
 
 static int32_t aowl_pmn_off_dub_button(void)   { return AOWL_PMN_DUB_BUTTON_OFF; }

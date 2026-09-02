@@ -8388,3 +8388,93 @@ Settings): `READ of 0x100000117 faulted; Rdx=Rbx=0xffffffff` in
 SeasonWidgetData::From +0x11f <- MenuScreen::Show -- an index of -1 from
 the seasonal data, not a corrupted pointer; backend/profile season data
 under audit.
+
+## 2026-09-02 (offline): crash #4 is NOT a -1 index. It is a wild `Profile` pointer.
+
+The entry above says crash `Crash_2026-09-02_161150163` was "an index of -1 from
+the seasonal data, not a corrupted pointer". **That is exactly backwards, and
+this entry supersedes it.** The correction was made offline, from
+`GameAssembly.dll` alone; the game was not run.
+
+### MEASURED -- disassembly (capstone over the `il2cpp` section, imagebase 0x180000000)
+
+`EFT.UI.SeasonWidgetData` is a 12-byte **ValueType** (3 ints:
+`BattlePassCompleted`@0x10, `BattlePassTotal`@0x14,
+`AvailableSeasonalRewards`@0x18), so `From` returns via a **hidden sret buffer in
+RCX**. The frame of the static `SeasonWidgetData From(Profile,
+SeasonalRewardController)` @`0x141FFD0` (`sharedness=UNIQUE`) is therefore:
+
+    RCX = retbuf   RDX = profile   R8 = seasonalRewardController   R9 = MethodInfo*
+
+and the body opens `mov rbx, rdx` (+0x1f) / `mov r13, r8` (+0x1c). So **`rbx` is
+the `profile` ARGUMENT, not an index**:
+
+    +0x116  test rbx, rbx                     ; profile null-guard
+    +0x119  je   +0x33a                       ; -> safe path, counters stay 0
+    +0x11f  cmp  qword [rbx + 0x118], r12(0)  ; <-- THE FAULTING READ
+    +0x126  je   +0x33a                       ; BattlePass null-guard -> safe path
+    +0x12c  mov  rax, qword [rbx + 0x118]
+    +0x133  mov  r8,  qword [rax + 0x20]      ; <-- the EARLIER crash's site
+
+`Profile+0x118` is `EFT.Profile.BattlePass` (`BattlePassController`), from
+`tools/fldoff.py fields EFT.Profile`. The arithmetic closes the case: the dump's
+`Rbx = 0xffffffff`, and `0xffffffff + 0x118 = 0x100000117`, which is **exactly**
+the reported faulting read address. `Rcx = 0x54a87deae0` is a stack address --
+the sret buffer -- which independently confirms the ABI reading above.
+
+`0xffffffff` is not a managed heap pointer. The profile REFERENCE itself was
+garbage.
+
+### MEASURED -- where that pointer comes from
+
+`MenuScreen::Show(5-arg)` @`0x15387A0` has exactly ONE caller, the 1-arg
+`MenuScreen::Show(MainMenuBaseScreenController)` @`0x1538760`, which loads every
+argument out of the controller (offsets confirmed against
+`fldoff.py fields MainMenuBaseScreenController`):
+
+    [rdx+0x48] Matchmaker   [rdx+0x50] ModeDescriptor   [rdx+0x58] Profile
+    [rdx+0x60] ExpansionsPlayerInfo                     [rdx+0x68] SeasonalRewardController
+
+The 5-arg body stashes those into a closure (`[r14+0x18]` = profile,
+`[r14+0x20]` = controller) and at +0x986/+0x98F calls `From` with
+`lea rcx,[rsp+0x60]` as the retbuf and `r9 = 0` (NULL MethodInfo, legal here --
+not a shared generic). So the corrupt value was already sitting in
+**`MainMenuBaseScreenController.Profile` @0x58**, an `INITONLY` reference field.
+
+### MEASURED -- the data cannot cause this
+
+`From` is defensively written against precisely the holes an emulated backend
+creates. Both of its inputs are null-guarded before use: `profile` at +0x116,
+`profile.BattlePass` at +0x11f, `seasonalRewardController` at +0x342 and its
+`SeasonalRewards` book (`SeasonalRewardControllerClient`@0x60) at +0x34b. A null
+on any of them jumps to +0x33a and yields a zeroed widget. The **only** indexing
+in the whole 0x520-byte body is at +0x3E6/+0x435 -- an il2cpp interface-vtable
+bucket walk (`cmp [r8+rax*8], r9`, `movsxd rdx,[r8+rcx*8+8]; shl rdx,4`), driven
+by the klass layout, not by any value the server sends. There is **no
+`FindIndex`/`IndexOf` over `seasonalRewards`, and no season-id comparison**, in
+this method. The reward loop counts `dword [rax+0x50] == 3` (a status), nothing
+more.
+
+Our served profile carries no `BattlePass` key at all (`emu/profile.nim`), i.e.
+the field deserialises to null -- which is the case the +0x11f guard handles.
+
+### INFERRED -- what it probably is
+
+Both of tonight's crashes put a **small integer into a reference slot**: the
+earlier one had `Profile.BattlePass`@0x118 == `1`, this one has
+`MainMenuBaseScreenController.Profile`@0x58 == `0xffffffff` (= -1 as int32,
+zero-extended). That is the signature of a **wrong-target native write**, not of
+deserialised JSON -- Newtonsoft cannot put `1` or `-1` into a managed reference.
+The earlier crash was attributed to "our own bad Submit values, since fixed";
+the identical value-shape here is evidence that bug was **relocated, not
+fixed**. Confidence: inferred, from the value shape and the two crashes agreeing
+-- not measured. The write site has not been identified.
+
+### Consequence
+
+**No backend/profile data change can prevent this crash**, and one presented as
+a fix would be a check that cannot fail. `mods/tarkov/emu/seasoncheck.nim` was
+added anyway as a *defensive* dangling-reference gate over
+`data/post1/seasonactive.json` and a profile's `SeasonalRewards` dictionary,
+with positive controls, and its module header says plainly that it is not a fix
+for this.

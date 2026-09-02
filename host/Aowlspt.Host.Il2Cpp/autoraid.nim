@@ -224,6 +224,8 @@ proc cPmnCallToggleSet(fn, toggle: Il2CppPtr; value, sendCallback: int32) {.
   importc: "aowl_pmn_call_toggle_set", nodecl.}
 proc cPmnCallPointerClick(fn, button: Il2CppPtr) {.
   importc: "aowl_pmn_call_pointer_click", nodecl.}
+proc cPmnCallShowInRaid(fn, menu: Il2CppPtr) {.
+  importc: "aowl_pmn_call_show_in_raid", nodecl.}
 proc cPmnOffDubButton(): int32 {.importc: "aowl_pmn_off_dub_button", nodecl.}
 proc cPmnOffTabInteract(): int32 {.importc: "aowl_pmn_off_tab_interact", nodecl.}
 
@@ -234,6 +236,7 @@ const
   PmnTSsClose = 0'i32   ## EFT.UI.Settings.SettingsScreen::Close
   PmnTToggleSet = 1'i32   ## UnityEngine.UI.Toggle::Set
   PmnTPointerClick = 2'i32   ## EFT.UI.TweenAnimatedButton::OnPointerClick
+  PmnTShowInRaid = 3'i32   ## EFT.UI.MenuScreen::ShowInRaid
 
 # ---- state (gArOn / gArMap are set in the flag-reading pass in aowlhost.nim) ----
 var gArOn = false                  ## the `uxAutoRaid` flag; DEFAULT OFF
@@ -2793,18 +2796,31 @@ proc xrTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_xr_tick_body", cdecl.}
       xrFail("the MenuScreen component is not readable to +0x" &
              iHexPad(uint64(XrDiscBtnOff), 3))
       return
-    let fn = cInspCode(XrShowInRaidRva)
+    # THE CALL TARGET COMES FROM THIS FEATURE'S OWN TABLE, and the refusal
+    # names WHICH TABLE. MEASURED 2026-09-02: at boot the host said `the
+    # in-raid menu show event is LIVE -- MenuScreen::ShowInRaid @0x1539650
+    # (uihooks site 7) is bound`, and on arming it said the same RVA `did not
+    # resolve as callable code on this build`. BOTH were true, because they
+    # were about different tables: the hook resolved through `aowl_uih_sites`,
+    # while the call went through the INSPECTOR's navigation table, which has
+    # no row for this RVA. "on this build" pointed at the game when the gap was
+    # ours. `aowl_pmn_targets` row [3] now carries it, verified against the
+    # SAME 16 bytes site 7 verifies, so the two cannot disagree.
+    let fn = cPmnFn(PmnTShowInRaid)
     if fn == nil:
       xrFail("MenuScreen::ShowInRaid @0x" & iHexPad(XrShowInRaidRva, 7) &
-             " did not resolve as callable code on this build")
-      return
-    if not iPrologueOk(fn, XrShowInRaidSig):
-      xrFail("MenuScreen::ShowInRaid @0x" & iHexPad(XrShowInRaidRva, 7) &
-             " does not match its recorded prologue on this build")
+             " did not verify against the STARTUP PROLOGUE SNAPSHOT via " &
+             "`aowl_pmn_targets` row " & $PmnTShowInRaid & " (verified=" &
+             $int(cPmnOkCount()) & " rejected=" & $int(cPmnBadCount()) &
+             " snapshot-table-full=" & $int(cPmnProfullCount()) & "). This " &
+             "names OUR table, not the game: uihooks site 7 verifies the same " &
+             "RVA and the same 16 bytes for its detour, so if that one bound " &
+             "and this refuses, the fault is in this row or in the snapshot, " &
+             "not in the client")
       return
     gXrMenu = comp
     iMark("raidExit: MenuScreen::ShowInRaid", comp)
-    discard cInspUP(fn, comp, nil)
+    cPmnCallShowInRaid(fn, comp)
     okLog "raidExit: called MenuScreen::ShowInRaid on " & iPtr(comp) &
           ", receiver via " & via & " -- waiting for _disconnectButton@+0x" &
           iHexPad(uint64(XrDiscBtnOff), 3) & " to become activeInHierarchy " &
