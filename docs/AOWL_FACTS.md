@@ -7860,3 +7860,14 @@ the mod serves is byte-identical across it. So sain's own guard held; the
 defect was entirely the loader's. The harness now asserts this as `on_load#2`,
 and `--selftest` drives `judge_on_load2` to all three verdicts, because no mod
 in the tree takes its FAIL branch.
+
+## 2026-09-02 10:25 (clock): the slot screen is "SELECT PROFILE AND MODE"; the CARD is the control
+
+MEASURED (build 4,851,200): modeskip pressed the matching slot's `Apply`
+DefaultUIButton; `NO READBACK ... MenuScreen::Show has NOT fired` after 901
+ticks; run.py: PARKED-BEFORE-MENU. Census under the screen (depth<=3):
+CharactersContainer -> CharacterSlotView_pve / CharacterSlotView_pvp, each
+BgGlow/BgImage/BgSide/View/InfoPart; no Apply active. Screenshot: two cards,
+"PvE Zone" (empty, _pve) and "PvE / Savant | 3" (this profile, _pvp); the
+card itself is what a player clicks (tools/entergame.py's proven path
+presses the card by displayed title). So Apply is not the flow trigger.
