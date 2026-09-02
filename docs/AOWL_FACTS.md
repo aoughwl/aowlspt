@@ -8490,3 +8490,109 @@ Escape in Settings (menu re-show) crashes the client -- the corrupted
 Profile reference (-1) read by SeasonWidgetData::From. The corrupting
 native write therefore happens during the Settings session or at its
 close; a host-wide write audit with a write trace is in flight.
+
+## 2026-09-02: the host-wide managed-write audit — the guard that cannot fail
+
+### The instrument
+
+`grep` over `host/Aowlspt.Host.Il2Cpp/*.nim` (74 files, ~2.9 MB) and `abi/*.h`
+(74 headers, ~2.5 MB), in this worktree only. Two crash dumps read earlier with
+`tools/dmpread.py` + capstone supplied the target shape.
+
+### MEASURED: the host almost never stores into managed memory directly
+
+`cast[ptr T](...)[] = ` on a game pointer: **zero** occurrences in host nim
+(`grep -c '\[\] ='` returns 1 in `nedeploy.nim` and 1 in `loadperf.nim`, both
+host-local). Store-through-cast in `abi/*.h`: **16** total, all into host-owned
+state, and exactly **one** applies an offset to a game object
+(`aowlspt_overlay.h:1855`).
+
+So the raw-store surface the audit was asked to enumerate is **essentially
+empty**, and an audit that only enumerated raw stores would have found nothing
+and reported the host clean. The real surface is different: the host writes
+managed memory by **calling game setters at byte-verified RVAs** —
+`TMP_Text::set_text`, `LocalizedText::SetLabelText`, `CanvasGroup::set_alpha`,
+`Toggle::Set`, `GameObject::SetActive` — and letting the game's own code do the
+storing. The offset is then chosen by the callee, so **the receiver's type is
+the entire protection**.
+
+### MEASURED: the receiver's type was never checked, anywhere
+
+Every write guard in the host is a readability test — `aowl_is_readable`,
+`nuOk` (`nativeui.nim:399`: `p != nil and cIsReadable(p, n) != 0`), `duOk`.
+None reads `*(void**)recv`. `nuKlassOf` existed and was used at exactly **two**
+sites (`nativeui.nim:516,523`), neither on a write path.
+
+**On the IL2CPP GC heap a readability test cannot fail.** The pages stay
+committed after an object dies, so a stale pointer into recycled memory answers
+"readable" every time. This is CLAUDE.md 9b exactly: there is no input that
+makes the check say no.
+
+### MEASURED: the prime candidate — `modstab.nim` caption re-assert registry
+
+Three defects compounding, all confirmed by reading this worktree:
+
+1. **The registry is never cleared.** `gModsLabelTmp` / `Text` / `Ctrl` / `Loc`
+   have `.add` at two sites (`modstab.nim` ~957 and ~1060) and **no**
+   `setLen`/`delete`/`= @[]` anywhere before this change.
+2. **The poll is deliberately un-gated on the screen being open.** At the call
+   site (~1991-2002) it runs *pre-flag* — "gated on the REGISTRY, not on one
+   feature's flag" — and the tick's own guard is
+   `if not gModsOn and gModsLabelTmp.len == 0: return`. A non-empty registry
+   therefore keeps it firing every 60 frames for the rest of the process.
+3. **The only guard before writing was `duOk`** (readability), per (2) above.
+
+Chain: Settings closes → rows are Destroyed → those managed objects become
+garbage and their memory is recycled → `duOk` still passes → `modsTmpText`
+reads garbage, compares unequal, declares "clobbered" → `modsApplyLabel` calls
+`SetLabelText` / `set_text` on **recycled memory now holding a different type**,
+which stores at TMP's field offsets (including bool `true` = 1) into that
+type's slots.
+
+This predicts every observed fact: a small integer in a managed **reference**
+slot; on the **menu re-show right after Settings closes**; a **different slot
+each run** (GC recycling is not deterministic); and unaffected by the modeskip
+Submit-values fix, which "changed which slot is hit, not whether".
+
+**Confidence: the mechanism is MEASURED (never-cleared registry, un-gated poll,
+readability-only guard all read directly from source). That this specific site
+produced these two dumps is INFERRED — it is consistent with every observation
+but the write has not been caught in the act.** The trace below exists to
+settle it.
+
+### Candidate table
+
+| rank | site | receiver | guard before | stale? | writes |
+|---|---|---|---|---|---|
+| 1 | `modstab.nim:modsReassertLabels` | registered TMP / control / LocalizedText | `duOk` only | **yes — registry never cleared, poll never gated on screen open** | `set_text` / `SetLabelText`, which store bools=1 and int sentinels at TMP offsets |
+| 2 | `nativetabs.nim:1876,1897` `nuTogglePress(gNtToggle[0], true)` | registry entry | `nuOk` only | yes — `gNtToggle` cleared at one site only | `Toggle::Set(value=1)` → **`m_IsOn = true` (1)** at Toggle `+0x120` |
+| 3 | `nativetabs.nim:1659-1667` `nuToggleSetGroup(entry, nil)` at teardown | registry entry | `nuOk` only | yes — runs *at screen close*, on pointers captured at build | `Toggle.group = nil` plus ToggleGroup bookkeeping |
+| — | `nativetabs.nim:279` `gNtSeenToggles` | — | — | never cleared | **identity comparison only, never dereferenced — benign**, but a recycled pointer can compare equal and be wrongly treated as "already seen" |
+
+Ranks 2 and 3 are in `nativetabs.nim`, which another agent held during this
+audit; they were **reported, not edited**.
+
+### The fix that shipped
+
+`abi/aowlspt_hostwrite.h` + `host/Aowlspt.Host.Il2Cpp/hostwrite.nim`: one gate,
+`hostRecvOk(site, recv, wantKlass)`, which compares `*(void**)recv` against the
+klass **recorded when the pointer was captured** and asks Unity's own
+`Object::op_Implicit`. Bounded raw stores (`hostWriteI32/U8/F32/Ptr`) are there
+for the few raw sites and refuse unless klass matches *and* the offset is inside
+an instance size the **caller supplies**.
+
+**The instance size is an argument, not a struct read**, because this repo has
+no measured byte offset for `Il2CppClass::instance_size` — it exists only as a
+token-gated export (RVA `0x5B2690`). Reading it at a guessed offset would give a
+plausible number and a bound check that passes for the wrong reason. `0` means
+unknown and **refuses**.
+
+Liveness is **three outcomes**: `hwLiveVerdict` returns live / dead /
+**unknown**, because `nuAlive` collapses "destroyed" and "the op_Implicit target
+did not bind" into the same `false` — and treating unbound as dead would drop
+every receiver and silently disable the caller.
+
+`hostWriteTrace` (default **off**) logs the first 8 allowed writes per site with
+receiver, klass wanted vs got, offset and value, so the **next** dump's Rax/Rbx
+can be matched to a logged write. **Refusals log whether or not the flag is on**
+— a refusal is the evidence that a corrupting write was stopped.

@@ -152,6 +152,49 @@ const ModsMaxTmp = 8
 ## (the tab button), and written only at build time.
 var gModsLabelTmp: seq[Il2CppPtr] = @[]
 var gModsLabelText: seq[string] = @[]
+## THE KLASS EACH REGISTERED TMP HAD WHEN IT WAS CAPTURED, index-aligned with
+## the four registries above.
+##
+## MEASURED 2026-09-02 (tools/dmpread.py + capstone, two dumps): a managed
+## REFERENCE slot held the integer 1, and then -1, inside
+## `EFT.UI.SeasonWidgetData::From` on the menu re-show immediately after the
+## player closed Settings -- the second via
+## `MainMenuBaseScreenController.Profile@0x58`. Only a native store into the
+## wrong object can put a small integer in a reference slot.
+##
+## THIS REGISTRY IS THE MECHANISM THAT MAKES THAT POSSIBLE, and it had three
+## compounding defects:
+##
+##   1. IT IS NEVER CLEARED. There is no `setLen 0` anywhere -- pointers
+##      captured during one Settings session survive the screen closing, the
+##      rows being Destroyed, and every later session.
+##   2. THE POLL IS DELIBERATELY UN-GATED on the screen being open (see the
+##      long note at the `modsReassertLabels` call site: it is gated on the
+##      REGISTRY, not on a feature flag). So it keeps firing on those pointers
+##      after the rows are gone.
+##   3. THE ONLY GUARD BEFORE WRITING WAS `duOk` -- non-null plus VirtualQuery.
+##      On the IL2CPP GC heap that CANNOT FAIL: the pages stay committed after
+##      an object dies, so a stale pointer into recycled memory passes every
+##      time. A check that cannot fail IS the bug (CLAUDE.md 9b).
+##
+## The write then goes out through `TMP_Text::set_text` / `SetLabelText`, which
+## store at TMP's field offsets into whatever type now occupies the address --
+## including the bool `true` (1) and the int sentinels those setters set. That
+## is exactly the 1 and the -1 in the dumps, and it explains why a different
+## slot is hit each run: GC recycling is not deterministic.
+##
+## Recording the klass at capture gives the poll something that CAN be
+## falsified. `hostRecvOk` compares it, and additionally asks Unity's own
+## `Object::op_Implicit` (`nuAlive`) -- a Destroyed object keeps a managed
+## shell that reads back perfectly and answers false there, which is the one
+## test that tells "screen closed" from "screen open".
+var gModsLabelKlass: seq[Il2CppPtr] = @[]
+## How many entries the poll has DROPPED because the receiver stopped being
+## the object we captured. Non-zero is not a warning: it is the count of
+## writes that would have corrupted the managed heap.
+var gModsLabelDropped = 0
+var gModsLabelDropSaid = 0
+const ModsLabelDropSayMax = 6
 ## The CONTROL each of those TMPs belongs to, kept in step with the two above.
 ## `swRelabelControl`'s first argument is what lets it reach
 ## `LocalizedText::SetLabelText` -- the level the game itself writes at. The
@@ -959,9 +1002,12 @@ proc modsRelabelLike(cloneT, donorT: Il2CppPtr; text: string;
             gModsLabelText.add text
             gModsLabelCtrl.add cloneCtrl
             # The button path keeps the control route it has always used; nil
-            # here keeps the four registries index-aligned, which the
+            # here keeps the five registries index-aligned, which the
             # re-assert poll depends on.
             gModsLabelLoc.add cast[Il2CppPtr](0)
+            # THE KLASS AT CAPTURE. Recorded here and nowhere else: this is
+            # the only moment the pointer is known to be the object we mean.
+            gModsLabelKlass.add nuKlassOf(cTmps[i])
     i = i + 1
   # THE OUTCOME CHECK: re-read the whole clone, not the pointers we just wrote.
   let reads = modsCountReading(cloneT, text)
@@ -1062,6 +1108,8 @@ proc modsRelabelRow(cloneT, donorT: Il2CppPtr; text: string;
         gModsLabelText.add text
         gModsLabelCtrl.add cloneCtrl
         gModsLabelLoc.add (if i < cLocs.len: cLocs[i] else: nil)
+        # THE KLASS AT CAPTURE -- see the declaration of gModsLabelKlass.
+        gModsLabelKlass.add nuKlassOf(cTmps[i])
     i = i + 1
   # Newly registered labels must be watched again even if the poll had already
   # declared itself stable and switched off for the session.
@@ -1871,6 +1919,38 @@ proc modsReassertLabels() =
   var clobbered = 0
   var i = 0
   while i < gModsLabelTmp.len and i < ModsMaxLabels:
+    # THE STALE-RECEIVER GATE, BEFORE ANY READ OR WRITE THROUGH THIS POINTER.
+    #
+    # `duOk` below is a readability test and on the GC heap it cannot fail, so
+    # it was never able to notice that these rows were Destroyed when the
+    # player closed Settings. `hostRecvOk` asks the two questions that CAN be
+    # answered no: is the Il2CppClass* still the one recorded at capture, and
+    # does Unity's own Object::op_Implicit still say this object is alive.
+    #
+    # A failure DROPS the entry rather than skipping it: the object is gone
+    # for good, so re-testing it every poll forever is just a slower way of
+    # keeping a dangling pointer. All five registries are truncated together
+    # so they stay index-aligned.
+    let klassAtCapture = (if i < gModsLabelKlass.len: gModsLabelKlass[i]
+                          else: cast[Il2CppPtr](0))
+    if not hostRecvOk("modstab.nim:modsReassertLabels", gModsLabelTmp[i],
+                      klassAtCapture):
+      gModsLabelTmp.delete(i)
+      gModsLabelText.delete(i)
+      if i < gModsLabelCtrl.len: gModsLabelCtrl.delete(i)
+      if i < gModsLabelLoc.len: gModsLabelLoc.delete(i)
+      if i < gModsLabelKlass.len: gModsLabelKlass.delete(i)
+      gModsLabelDropped = gModsLabelDropped + 1
+      if gModsLabelDropSaid < ModsLabelDropSayMax:
+        inc gModsLabelDropSaid
+        warn "mods label re-assert: DROPPED a registered caption whose TMP is " &
+             "no longer the object it was when captured (destroyed with the " &
+             "Settings row, or its memory recycled). THIS IS THE WRITE THAT " &
+             "WOULD HAVE CORRUPTED THE MANAGED HEAP -- readability alone " &
+             "could never have caught it. dropped=" & $gModsLabelDropped &
+             " still registered=" & $gModsLabelTmp.len & " (report " &
+             $gModsLabelDropSaid & " of " & $ModsLabelDropSayMax & ")"
+      continue      # do NOT advance i: the delete already shifted the tail in
     if duOk(gModsLabelTmp[i], cSuiOffTmpMText() + 8'i32):
       if modsTmpText(gModsLabelTmp[i]) != gModsLabelText[i]:
         clobbered = clobbered + 1
@@ -1878,11 +1958,21 @@ proc modsReassertLabels() =
         # `LocalizedText::SetLabelText` entirely, so the poll rewrote the TMP
         # while leaving the LocalizedText source holding the donor's key --
         # re-applying everything except the thing doing the clobbering.
+        # THE CONTROL AND THE LocalizedText ARE WRITTEN THROUGH TOO, so they
+        # get the same liveness question as the TMP. No klass was recorded for
+        # them at capture, so the strongest test available here is Unity's own
+        # destroyed-object test -- which is still strictly more than `duOk`,
+        # and is exactly the test that fails once the row is gone. A dead one
+        # is dropped to nil rather than dropping the whole entry: the TMP has
+        # already passed its klass check, so the remaining route is still a
+        # legitimate write to a live object.
         var ctl: Il2CppPtr = nil
-        if i < gModsLabelCtrl.len and duOk(gModsLabelCtrl[i], 0x20'i32):
+        if i < gModsLabelCtrl.len and duOk(gModsLabelCtrl[i], 0x20'i32) and
+           hwLiveVerdict(gModsLabelCtrl[i]) != HwLiveDead:
           ctl = gModsLabelCtrl[i]
         var loc: Il2CppPtr = nil
-        if i < gModsLabelLoc.len and duOk(gModsLabelLoc[i], 0x20'i32):
+        if i < gModsLabelLoc.len and duOk(gModsLabelLoc[i], 0x20'i32) and
+           hwLiveVerdict(gModsLabelLoc[i]) != HwLiveDead:
           loc = gModsLabelLoc[i]
         discard modsApplyLabel(ctl, loc, gModsLabelTmp[i], gModsLabelText[i])
     i = i + 1

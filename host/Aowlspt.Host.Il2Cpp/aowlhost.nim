@@ -355,6 +355,9 @@ static int aowl_rva_is_code(unsigned int rva) {
 ## bit. MUST follow `aowlspt_prologue.h` and `aowlspt_cursor.h`. See
 ## `aowlspt_uistate.h`.
 {.emit: """#include "aowlspt_uistate.h" """.}
+## The managed-write gate: klass verification, bounded stores, and the
+## per-site trace. See `aowlspt_hostwrite.h`.
+{.emit: """#include "aowlspt_hostwrite.h" """.}
 ## The in-game, Unity-native debug overlay: the F3 info panel and the
 ## in-world AI markers. Target table, call thunks, guarded scalar stores,
 ## the toggle key and the frame-rate estimate. See `aowlspt_debugui.h`.
@@ -6662,6 +6665,14 @@ include "invoke2.nim"
 ## `nuCreate`/`nuAdd`/`nuLayout`/`nuSetText`/`nuClone`/`nuDestroyAll`,
 ## `bindNativeUi`, and the visual self-proof `nuProofRun`.
 include "nativeui.nim"
+
+## THE MANAGED-WRITE GATE. `include`d immediately after `nativeui.nim` because
+## it needs `nuKlassOf`, `nuAlive` and `nuActiveInHierarchy` from it, and
+## BEFORE every feature that writes into the game's heap so they can all route
+## through it. Readability was the only guard those features had, and on the
+## IL2CPP GC heap a readability test cannot fail -- see `hostwrite.nim` for the
+## two crash dumps that measured the consequence.
+include "hostwrite.nim"
 
 ## The UNIFIED WIDGET FRAMEWORK, `include`d after `nativeui.nim` so it can use
 ## the `nu*` primitives directly. Composable widgets (uiPanel/uiLabel/uiToggle/
