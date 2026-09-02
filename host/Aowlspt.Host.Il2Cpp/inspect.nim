@@ -830,6 +830,37 @@ proc iGetVar(name: string; v: var uint64): bool =
 
 proc iSetVarP(name: string; p: Il2CppPtr) = iSetVar(name, cast[uint64](p))
 
+proc iUnboundWhy(name: string): string =
+  ## Why a `$name` that EXISTS in the namespace but holds 0 is a REFUSAL and
+  ## not an address.
+  ##
+  ## MEASURED live 2026-09-02 14:42, in one batch:
+  ##
+  ##     component $g2 AnimatedToggle   -> "! GetComponent returned NULL --
+  ##                                        this is an ANSWER, not a crash."
+  ##     call rva:0x55ba430 v_pb $comp 1
+  ##                                    -> "!! FAULTED (caught) ... fault 1 of 8"
+  ##
+  ## The lookup had already said NO, and the very next line called into game
+  ## code with a null receiver anyway -- three times in that batch, three of
+  ## the session's eight faults, on an anchor that was not bound. A zero anchor
+  ## is not an address; it is the ABSENCE of one, and the only correct thing to
+  ## do with it is refuse BEFORE any game code runs.
+  result = "$" & name & " is UNBOUND (it holds 0), so nothing was read and " &
+           "nothing was called. "
+  case name
+  of "comp":
+    result = result & "The last `component` lookup returned NULL and unbound " &
+      "$comp rather than leaving it holding the previous batch's pointer -- " &
+      "which used to press a control nobody asked for and print a plausible, " &
+      "entirely fictional field map. Run `component` again and check that it " &
+      "actually says FOUND before calling or pressing anything."
+  else:
+    result = result & "`anchors` lists what is bound this batch and `state` " &
+      "says WHY one is not. An anchor reading 0 is an ANSWER (the object has " &
+      "not spawned yet, or the host has not learned it), not an address to " &
+      "walk from."
+
 proc iRefreshAnchors() =
   ## Rebound every batch from the pointers this host ALREADY holds, so a
   ## session never has to start from a raw address somebody copied out of a
@@ -911,6 +942,16 @@ proc iEval(ex: string; v: var uint64; err: var string): bool =
       inc i
     if not iGetVar(atom, v):
       err = "no such anchor or variable: $" & atom
+      return false
+    # THE UNBOUND-ANCHOR REFUSAL, and it lives HERE, in the one evaluator every
+    # verb already calls, rather than in each consumer. `call`, `click`,
+    # `invoke`, `press`, `label`, `rect`, `scan`, `write`, `component` itself
+    # and `find`'s root slot all inherit it, and they cannot drift apart the
+    # way per-verb copies would. A LITERAL 0 is still accepted -- someone who
+    # types 0 means it -- but a NAME whose lookup just failed is never an
+    # address, and never reaches a call.
+    if v == 0'u64:
+      err = iUnboundWhy(atom)
       return false
   else:
     while i < ex.len and ex[i] != '+' and ex[i] != '@':
@@ -3960,7 +4001,19 @@ proc iCmdTree(toks: seq[string]) =
           "the depth here."
         else: "  -- complete."))
 
-proc iCmdComponent(toks: seq[string]) =
+proc iCompChildHint(typeName: string): string =
+  ## The measured "it is on a CHILD" note, shared by both NULL branches of
+  ## `component` so the two cannot say different things.
+  result = " The control is very often on a CHILD of the node asked about: " &
+    "`children EXPR 3`, then `component $gN " & typeName & "` on the child " &
+    "that carries it."
+  if iContains(iLower(typeName), "animatedtoggle"):
+    result = result & " MEASURED 2026-09-02: a ControlToggle(Clone) carries " &
+      "NO AnimatedToggle itself -- it is on its CHILD named " &
+      "\"AnimatedToggle\", which is exactly what `children $cN 3` binds as " &
+      "$gN."
+
+proc iCmdComponentBody(toks: seq[string]): bool =
   ## `component EXPR TypeName [more...]` -- resolve a component on a
   ## GameObject or Transform.
   ##
@@ -3969,10 +4022,16 @@ proc iCmdComponent(toks: seq[string]) =
   ## klass pointer that was reported as `m_OnClick`. Everything that acts on a
   ## control needs the COMPONENT, and this is the only way to get from one to
   ## the other.
+  # CLEAR `$comp` FIRST -- above the usage check, above everything that can
+  # fail. `result` defaults to false, so every bare `return` below is "did NOT
+  # bind" and only the two FOUND paths say `return true`; the wrapper turns
+  # that false into an out-loud UNBOUND line. An unbind nobody announces is
+  # the same defect one step later.
+  iSetVar("comp", 0'u64)
   if toks.len < 3:
     iErr("usage: component EXPR TypeName   (e.g. component $g0 Button)")
     return
-  # CLEAR `$comp` FIRST, before anything can fail.
+  # WHY IT IS CLEARED FIRST.
   #
   # It used to keep its previous value when a lookup failed, and that is the
   # single most dangerous thing this instrument has done. A batch reading
@@ -3990,7 +4049,6 @@ proc iCmdComponent(toks: seq[string]) =
   # So a failed lookup now leaves `$comp` UNBOUND, and every consumer of an
   # unbound anchor refuses. The rule is that a stale answer must never be
   # reachable through a name whose lookup just failed.
-  iSetVar("comp", 0'u64)
   var v = 0'u64
   var err = ""
   if not iEval(toks[1], v, err):
@@ -4043,14 +4101,15 @@ proc iCmdComponent(toks: seq[string]) =
       iErr("via GetComponent(Type) on " & iPtr(target) & ": " & why &
            ". (This is the klass-identity route: the offline index resolved " &
            toks[2] & " to a real Il2CppType, so a NULL here is an ANSWER " &
-           "about this object, not a name-matching failure.)")
+           "about this object, not a name-matching failure.)" &
+           iCompChildHint(toks[2]))
       return
     iSetVar("comp", cast[uint64](c))
     iOut("  FOUND " & toks[2] & " component = " & iPtr(c) &
          "  klass=" & iPtrU(iKlassOf(c)) & "   ($comp)   " &
          "via GetComponent(System.Type) -- klass identity, no string match")
     iOut("  bound to $comp -- e.g.  allow write   then   click $comp")
-    return
+    return true
   iOut("  \"" & toks[2] & "\" did not resolve as a fully-qualified type in " &
        "the offline index (" & typeWhy & "), so the STRING overload is used " &
        "instead. Prefer the fully-qualified name (e.g. " &
@@ -4098,17 +4157,30 @@ proc iCmdComponent(toks: seq[string]) =
   if comp == nil:
     iErr("GetComponent returned NULL -- this is an ANSWER, not a crash. " &
          "Either this object genuinely has no " & toks[2] & " (it may be a " &
-         "container, with the control on a child -- try `children` then " &
-         "`component $cN " & toks[2] & "`), or Unity's SHORT-NAME match did " &
+         "container, with the control on a child), or Unity's SHORT-NAME " &
+         "match did " &
          "not accept \"" & toks[2] & "\". Unity matches this overload by " &
          "short type name; if you suspect the latter, try the fully-qualified " &
-         "name, e.g. UnityEngine.UI.Button.")
+         "name, e.g. UnityEngine.UI.Button." & iCompChildHint(toks[2]))
     return
   iNoteKlass(comp)
   iSetVar("comp", cast[uint64](comp))
   iOut("  FOUND " & toks[2] & " component = " & iPtr(comp) &
        "  klass=" & iPtrU(iKlassOf(comp)) & "   ($comp)")
   iOut("  bound to $comp -- e.g.  allow write   then   click $comp")
+  return true
+
+proc iCmdComponent(toks: seq[string]) =
+  ## THE UNBIND IS ANNOUNCED. `iCmdComponentBody` unbinds `$comp` before it can
+  ## fail and reports whether it re-bound it; a failure that only clears the
+  ## anchor silently is indistinguishable, in the out-file, from one that left
+  ## the previous batch's pointer in place -- and the next line in a batch is
+  ## usually the one that calls into game code.
+  if not iCmdComponentBody(toks):
+    iOut("  $comp is UNBOUND -- this lookup did not produce a component, so " &
+         "the previous binding (if any) was DISCARDED rather than left to be " &
+         "clicked or called. Any call/click/invoke/press on $comp below this " &
+         "line will REFUSE, not fault.")
 
 
 proc iGetComponentQuiet(target: Il2CppPtr; typeName: string;

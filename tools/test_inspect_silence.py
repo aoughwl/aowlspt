@@ -358,6 +358,60 @@ def inv_active_receiver_classified(t):
             % (classifier, both_use, hop_gated, go_to_tf, nothing, reported))
 
 
+def inv_unbound_anchor_refused(t):
+    r"""A `$anchor` that holds 0 must REFUSE, and a failed `component` lookup
+    must say out loud that it unbound `$comp`.
+
+    MEASURED live 2026-09-02 14:42, one batch, the inspector's own out-file:
+
+        component $g2 AnimatedToggle
+          ! GetComponent returned NULL -- this is an ANSWER, not a crash.
+        call rva:0x55ba430 v_pb $comp 1
+          !! FAULTED (caught; the game survived) ... fault 1 of 8
+
+    `$comp` was cleared to 0 by the failed lookup, SILENTLY, and `call` then
+    handed that 0 to game code as a receiver -- three times in that batch,
+    three of the session's eight faults. Two things must hold:
+
+      * the refusal is in `iEval`, the ONE evaluator every verb calls, so
+        `call`/`click`/`invoke`/`press`/`label`/`rect` and every future verb
+        inherit it instead of each keeping its own copy (which is how
+        `click` came to have the guard and `call` not to);
+      * it fires on the `$name` ATOM, before the deref chain and before any
+        consumer, and a LITERAL 0 is still accepted -- a typed 0 is a
+        decision, an unbound name is not;
+      * the unbind is ANNOUNCED by `component` itself, because a silent clear
+        and a stale binding look identical in the out-file.
+
+    Negative control: on the pre-fix source `iEval` accepts a zero anchor and
+    there is no announcement, so both halves fail.
+    """
+    refuses = ("proc iUnboundWhy(" in t
+               and "err = iUnboundWhy(atom)" in t)
+    in_eval = (0 < first(t, 'err = "no such anchor or variable: $" & atom')
+               < first(t, "err = iUnboundWhy(atom)")
+               < first(t, "# ---- the chain ----"))
+    # Exactly one clear of $comp, and it is ABOVE the usage check -- so no
+    # early return can leave the previous batch's pointer bound.
+    one_clear = t.count('iSetVar("comp", 0\'u64)') == 1
+    clear_first = (0 < first(t, 'iSetVar("comp", 0\'u64)')
+                   < first(t, "usage: component EXPR TypeName"))
+    announced = ("proc iCmdComponentBody(" in t
+                 and "if not iCmdComponentBody(toks):" in t
+                 and "$comp is UNBOUND -- this lookup did not produce a "
+                     "component" in t)
+    # The container/child note is ONE proc used by BOTH null branches, and it
+    # carries the measured ControlToggle(Clone) case the user actually hit.
+    hint = ("proc iCompChildHint(" in t
+            and t.count("iCompChildHint(toks[2])") >= 2
+            and "a ControlToggle(Clone) carries " in t)
+    return (refuses and in_eval and one_clear and clear_first and announced
+            and hint,
+            "refusal=%s in_eval=%s one_clear=%s clear_above_usage=%s "
+            "announced=%s child_hint=%s"
+            % (refuses, in_eval, one_clear, clear_first, announced, hint))
+
+
 INVARIANTS = [
     ("no_combined_off_guard", inv_no_combined_off_guard),
     ("flight_report_exists", inv_flight_report_exists),
@@ -372,6 +426,7 @@ INVARIANTS = [
     ("active_predicate_is_shared", inv_active_predicate_is_shared),
     ("active_receiver_classified", inv_active_receiver_classified),
     ("in_root_exact_only", inv_in_root_exact_only),
+    ("unbound_anchor_refused", inv_unbound_anchor_refused),
 ]
 
 
