@@ -44,37 +44,47 @@ of on a stranger's.
 
 ## MEASURED, 2026-09-01, on this machine
 
-End to end, from an empty output directory to a built mods folder, with msys2
-and `~/nimony` REMOVED from PATH for every compile (the same strip `verify`
-uses, so the bundle cannot borrow a DLL from the machine that packed it):
+End to end, from an empty output directory to a built mods folder. msys2 and
+`~/nimony` are REMOVED from PATH for every compile, `PYTHONHOME`/`PYTHONPATH`
+are cleared, and the interpreter is the one INSIDE the install -- so nothing
+can be borrowed from the machine that packed the bundle.
 
-    pack                6038 files, 806.3 MB          92 s
-    install             copytree + full sha verify    17 s
-    COLD build          16 un-built mods             503 s   13 built, 3 failed
-    WARM build          the same folder again         60 s   13 cached, 3 failed
-    WARM, cache only    the 13 that build            0.45 s  13 cached
+    pack                6709 files, 842.0 MB          78 s
+    install             copytree + full sha verify    13 s
+    COLD build          16 un-built mods             524 s   15 built, 1 failed
+    WARM build          the same folder again        0.9 s   15 cached, 1 failed
 
-Read those last two together, because the difference between them is a fact
-about the design and not noise. `60 s` is what an unchanged mods folder costs
-when three of its mods do not compile: a failed mod has NO cache entry (the
-output and its key are deleted on failure, deliberately, so a stale DLL can
-never masquerade as a fresh one), so it is retried in full on every single
-startup -- and modbuild retries once more with `nimcache` cleared, so a broken
-mod costs roughly two full compiles per launch, for ever. `0.45 s` is the real
-cache-hit cost. A player with three permanently broken mods pays a minute on
-every boot and nothing ever says why.
+The interpreter is 671 of those files and 35.7 MB of that size: `modbuild.py`
+is what compiles the mods folder and it is Python, so a bundle without one
+installs a compiler nothing can drive. It was simply missing from `ROOT_EXES`
+until 2026-09-01.
 
-The 3 failures are NOT toolchain defects. They are mods whose SOURCE only
-compiles inside the repo checkout: `mods/manager/mgr/cfgscan.nim` imports
-`"../../../host/common/jsonpath"`, and `mods/sain/client/drivecalls.nim`
-reaches for `abi` by a repo-relative path. In an install those resolve to
-`<install>/host/common/...` and `<install>/abi`, which do not exist. So
-"a fresh install builds every mod" is FALSE today, and the reason is packaging,
-not the compiler: 13 of 16.
+**`0.9 s`, not the 60 s it used to be.** A failed mod has no `.dll` and no
+`.cachekey` -- deliberately, so a stale binary can never masquerade as a fresh
+one -- and the consequence was that it was recompiled in full on every launch,
+plus modbuild's retry with `nimcache` cleared, i.e. about two whole compiles
+per boot for ever. Three broken mods cost a silent minute on every single
+start. `modbuild.py` now caches the FAILURE under the same key, so an unchanged
+broken mod is reported FAILED from disk in about a millisecond and is retried
+the moment any of its inputs change.
 
-The measurement was taken against FROZEN copies of `abi/` and `aowl/src`.
+The one remaining failure is `mods/manager`, and it is NOT a packaging or
+toolchain defect. Five variants were built to find out -- new import and old,
+with `-p:abi` and without, including the true pre-change world -- and all five
+crash identically inside nimony's own error renderer
+(`nifcursors.nim(149) c.p != nil and c.rem > 0`, reached through
+`resolveOverloads -> asNimCode`). There is a real semantic error in that mod
+and the compiler aborts while formatting the message for it. The bundled
+nimony.exe is byte-identical to `~/nimony`'s, so it is not a pack fidelity
+problem either.
+
+The other two former failures were real packaging bugs and are fixed: both were
+checkout-relative imports that resolved only inside the repo. See the commit
+"jsonpath moves to the aowlspt lib".
+
+The measurement is taken against FROZEN copies of `abi/` and `aowl/src`.
 Against the live checkout every mod correctly rebuilt on the second pass,
-because four agents were editing both shared trees while it ran -- the cache
+because several agents were editing both shared trees while it ran -- the cache
 was right and the experiment was wrong.
 
 ## `bootstrap` and the network
@@ -120,6 +130,16 @@ ROOT_EXES = [
     "bin/ar.exe",
     "bin/as.exe",
     "bin/ld.exe",
+    # THE INTERPRETER. `tools/modbuild.py` is what compiles the user's mods
+    # folder at startup, and it is Python -- so a bundle without an interpreter
+    # ships a compiler that nothing can drive. Measured 2026-09-01: the
+    # launcher's builder resolution fell through every path on a machine with
+    # no Python and the install compiled nothing, correctly and uselessly.
+    #
+    # msys2 already has one at ucrt64/bin/python.exe; it was simply never in
+    # this list. The PE walk picks up python3.14.dll and its dependencies from
+    # here; the stdlib is a DATA directory and is handled by PY_LIB below.
+    "bin/python.exe",
 ]
 
 # Directories gcc reads as DATA, not as imports -- a PE walk can never find
@@ -138,6 +158,71 @@ DATA_DIRS = ["lib/gcc", "x86_64-w64-mingw32", "include", "lib/clang"]
 # "the compiler ran".
 LIB_FLAT_DIR = "lib"
 LIB_FLAT_EXTS = (".a", ".o", ".spec")
+
+# The Python standard library, which a PE walk cannot see: it is read as data
+# at runtime, by path.
+#
+# WHY THE WHOLE (PRUNED) STDLIB AND NOT A MEASURED SUBSET. Everywhere else this
+# file starts from what is actually invoked and walks the closure, because
+# hand-picking is how you get a bundle that works on the machine that built it.
+# The same reasoning argues AGAINST a subset here: a Python import closure is
+# measured by running the program, so it only covers the paths that particular
+# run took. `argparse` pulls in `gettext` only when it formats an error;
+# `shutil` reaches for `zlib` only on an archive; an exception traceback wants
+# `linecache`. Shipping "what modbuild imported on a good run" would produce an
+# install that compiles mods fine and dies the first time one FAILS.
+#
+# Measured: the whole stdlib is 222 MB, but 203 MB of that is `test/`,
+# `tkinter/`, `idlelib/` and stale `__pycache__`. Pruned it is 19.3 MB in 672
+# files -- 2.4% of an 806 MB bundle. At that price there is no argument for
+# guessing.
+PY_LIB_PARENT = "lib"                    # <ucrt64>/lib/python3.X
+PY_LIB_PREFIX = "python3."
+PY_LIB_SKIP_TOP = ("test", "tests", "idlelib", "tkinter", "turtledemo",
+                   "lib2to3", "site-packages", "ensurepip", "venv",
+                   "distutils")
+PY_LIB_SKIP_EXTS = (".pyc", ".pyo")
+
+
+def python_lib_dir(ucrt):
+    """`<ucrt64>/lib/python3.X`, discovered rather than hardcoded.
+
+    The version moves with msys2; a hardcoded `python3.14` would silently ship
+    nothing after an update, and "nothing" here means an install whose mods
+    never compile -- with no error at pack time to say so. `pack` reports the
+    directory it found, and reports finding none.
+    """
+    parent = os.path.join(ucrt, PY_LIB_PARENT)
+    if not os.path.isdir(parent):
+        return None
+    cands = sorted(n for n in os.listdir(parent)
+                   if n.lower().startswith(PY_LIB_PREFIX)
+                   and os.path.isdir(os.path.join(parent, n)))
+    return os.path.join(parent, cands[-1]) if cands else None
+
+
+def python_lib_files(libdir):
+    """Every stdlib file worth shipping, and the .pyd extension modules split
+    out so their own PE imports can be walked as closure roots (a `.pyd` is a
+    DLL: `_hashlib.pyd` pulls in libcrypto, `_lzma.pyd` pulls in liblzma, and
+    without those the module fails to import at runtime rather than at pack)."""
+    keep, pyds = set(), []
+    for dp, dn, fn in os.walk(libdir):
+        rel = os.path.relpath(dp, libdir).replace("\\", "/")
+        top = rel.split("/")[0]
+        if top in PY_LIB_SKIP_TOP or "__pycache__" in rel:
+            dn[:] = []
+            continue
+        dn[:] = [d for d in dn
+                 if d not in PY_LIB_SKIP_TOP and d != "__pycache__"]
+        for f in fn:
+            if f.lower().endswith(PY_LIB_SKIP_EXTS):
+                continue
+            p = os.path.normcase(os.path.abspath(os.path.join(dp, f)))
+            keep.add(p)
+            if f.lower().endswith(".pyd"):
+                pyds.append(p)
+    return keep, pyds
 
 
 # ---------------------------------------------------------------------------
@@ -307,6 +392,25 @@ def cmd_pack(args):
     kept |= k2
     unresolved |= u2
 
+    # -- the Python stdlib, plus the PE closure of its extension modules -----
+    pylib = python_lib_dir(ucrt)
+    py_files = set()
+    if pylib:
+        py_files, pyds = python_lib_files(pylib)
+        k3, u3 = closure(ucrt, pyds)
+        kept |= k3
+        unresolved |= u3
+        print("  python stdlib: %s (%d file(s), %d extension module(s))"
+              % (os.path.basename(pylib), len(py_files), len(pyds)))
+    else:
+        # A refusal, not a shrug. Without this the bundle has a compiler and
+        # nothing that can drive it, and the install compiles no mods at all --
+        # a failure that would otherwise surface on a stranger's machine.
+        print("  NO PYTHON STDLIB FOUND under %s. tools/modbuild.py is what "
+              "compiles the user's mods folder and it is Python, so a bundle "
+              "without an interpreter installs a compiler nothing can drive."
+              % os.path.join(ucrt, PY_LIB_PARENT))
+
     manifest = []
     ucrt_dst = os.path.join(out, "ucrt64")
     n = copy_into(ucrt, kept, ucrt_dst, manifest, out)
@@ -332,6 +436,12 @@ def cmd_pack(args):
         kept |= files
         print("  ucrt64 %-22s %d file(s)  (link set: import libs + CRT objects)"
               % (LIB_FLAT_DIR + "/*", n))
+
+    if py_files:
+        n = copy_into(ucrt, py_files - kept, ucrt_dst, manifest, out)
+        kept |= py_files
+        print("  ucrt64 %-22s %d file(s)  (the interpreter modbuild runs on)"
+              % (os.path.relpath(pylib, ucrt).replace("\\", "/"), n))
 
     # -- nimony: bin + the library sources a mod compiles against -----------
     nim_dst = os.path.join(out, "nimony")
@@ -451,13 +561,65 @@ def cmd_verify(args):
     print("  -> %s %s" % (res["status"], res.get("why", "")))
     for line in res.get("output", []):
         print("     | " + line[:160])
-    if res["status"] == "built":
-        print("\nPASS -- the bundle compiled a real mod with the host toolchain "
-              "off PATH. It is self-contained.")
-        return 0
-    print("\nFAIL -- the bundle is missing something. The error above names it; "
-          "add it and re-pack. Do NOT ship this.")
-    return 1
+    if res["status"] != "built":
+        print("\nFAIL -- the bundle is missing something. The error above names "
+              "it; add it and re-pack. Do NOT ship this.")
+        return 1
+    print("  the mod compiled.")
+
+    # STAGE 2: the BUNDLED interpreter must run modbuild.py.
+    #
+    # Stage 1 above compiles a mod, but it does so by importing modbuild into
+    # THIS python -- the host's. That proves the C/Nim toolchain travels; it
+    # says nothing about whether the interpreter does, and the interpreter is
+    # what actually drives the compile on a player's machine. A bundle that
+    # passed stage 1 and shipped without a working python would install a
+    # compiler nothing can drive, and would look completely healthy here.
+    #
+    # So: run the bundled python.exe, on the real modbuild.py, with `--check`
+    # (it builds nothing and touches no output), with msys2 and ~/nimony off
+    # PATH and PYTHONHOME/PYTHONPATH cleared so it cannot borrow the host
+    # installation's stdlib.
+    pyexe = os.path.join(base, "ucrt64", "bin", "python.exe")
+    if not os.path.isfile(pyexe):
+        print("\nFAIL -- no python.exe in the bundle at %s. `modbuild.py` is "
+              "what compiles the user's mods folder at startup and it is "
+              "Python, so this bundle installs a compiler nothing can drive."
+              % pyexe)
+        return 1
+    penv = dict(env)
+    for k in ("PYTHONHOME", "PYTHONPATH", "PYTHONSTARTUP"):
+        penv.pop(k, None)
+    penv["PATH"] = os.pathsep.join(
+        [os.path.join(base, "ucrt64", "bin")] + clean)
+    print("verifying the BUNDLED interpreter can run tools/modbuild.py")
+    print("  %s" % pyexe)
+    try:
+        pr = subprocess.run(
+            [pyexe, os.path.join(HERE, "modbuild.py"), "--check", "--json",
+             "--mods", os.path.dirname(mod),
+             "--abi", os.path.join(REPO, "abi"),
+             "--aowl-src", os.path.join(REPO, "aowl", "src"),
+             "--nimony", nim, "--ucrt64", ucrt],
+            capture_output=True, text=True, env=penv, timeout=300)
+    except OSError as e:
+        print("\nFAIL -- the bundled python.exe could not be started: %s" % e)
+        return 1
+    if pr.returncode != 0:
+        print("\nFAIL -- the bundled interpreter could not run modbuild.py "
+              "(exit %d). This is what a missing stdlib module looks like:"
+              % pr.returncode)
+        for line in ((pr.stderr or pr.stdout or "").strip().splitlines())[-12:]:
+            print("     | " + line[:200])
+        print("  Add what it names to PY_LIB_SKIP_TOP's exceptions and re-pack. "
+              "Do NOT ship this.")
+        return 1
+    print("  the bundled interpreter ran it.")
+
+    print("\nPASS -- the bundle compiled a real mod AND ran modbuild.py on its "
+          "own interpreter, both with the host toolchain off PATH. It is "
+          "self-contained.")
+    return 0
 
 
 def cmd_bootstrap(args):

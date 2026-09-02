@@ -81,6 +81,102 @@ def lock_path(repo):
     return os.path.join(repo, ".aowl-build.lock")
 
 
+def queue_dir(repo_or_lock):
+    """The FIFO queue lives beside the lock, one small file per waiter.
+
+    ## Why fairness had to be added
+
+    The lock was correct and unfair. It was pure retry: every waiter slept two
+    seconds and raced for `O_EXCL`, so whoever happened to call at the right
+    moment won, and a waiter could be passed over indefinitely by a stream of
+    later arrivals. Measured on 2026-09-01: an agent's `build launch` waited
+    roughly FORTY MINUTES while other agents in the same checkout took the lock
+    repeatedly. It was never blocked -- it just kept losing the coin toss.
+
+    ## The layering, which matters more than the queue
+
+    `O_EXCL` is still the ONLY thing providing mutual exclusion. The queue only
+    decides who is allowed to *attempt* the create. So a bug in the fairness
+    logic can make the lock unfair again -- it cannot make it unsafe, and it
+    cannot let two builds run at once. Fairness is advisory; exclusion is not.
+    That is deliberate: the expensive failure here is two concurrent builds,
+    and no ordering scheme should be able to reintroduce it.
+
+    A ticket is `<arrival_ns>-<pid>.json`. Ordering is by (arrival, pid), which
+    is a total order, so every waiter independently computes the same winner
+    without needing to agree with anyone.
+    """
+    base = repo_or_lock
+    if base.endswith(".lock"):
+        base = os.path.dirname(base)
+    return os.path.join(base, ".aowl-build.queue")
+
+
+def _ticket_name(arrival_ns, pid):
+    return "%020d-%d.json" % (arrival_ns, pid)
+
+
+def join_queue(qdir, cmd):
+    """Take a ticket. Returns its path."""
+    os.makedirs(qdir, exist_ok=True)
+    arrival = time.time_ns()
+    p = os.path.join(qdir, _ticket_name(arrival, os.getpid()))
+    tmp = p + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"pid": os.getpid(), "cmd": cmd, "arrival": arrival,
+                   "arrival_h": time.strftime("%Y-%m-%d %H:%M:%S")}, f)
+    os.replace(tmp, p)
+    return p
+
+
+def leave_queue(ticket):
+    if not ticket:
+        return
+    try:
+        os.unlink(ticket)
+    except OSError:
+        pass
+
+
+def read_queue(qdir, max_age):
+    """Every LIVE waiter, oldest first. Dead and ancient tickets are pruned.
+
+    Pruning is not housekeeping, it is correctness: a waiter that was killed
+    would otherwise sit at the head of the queue for ever and nobody would ever
+    build again -- a fairness mechanism that can deadlock the thing it is
+    ordering is worse than the unfairness it replaced.
+    """
+    out = []
+    try:
+        names = sorted(os.listdir(qdir))
+    except OSError:
+        return out
+    now = time.time_ns()
+    for n in names:
+        if not n.endswith(".json"):
+            continue
+        p = os.path.join(qdir, n)
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                t = json.load(f)
+        except Exception:
+            # Unreadable or half-written. Skip it this pass rather than
+            # deleting it; a ticket being written right now is not stale.
+            continue
+        pid = int(t.get("pid", -1))
+        age_s = (now - int(t.get("arrival", 0))) / 1e9
+        if age_s > max_age or not pid_alive(pid):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+            continue
+        t["_path"] = p
+        out.append(t)
+    out.sort(key=lambda t: (int(t.get("arrival", 0)), int(t.get("pid", 0))))
+    return out
+
+
 def pid_alive(pid):
     """True if the pid is running. Windows has no kill(0), so ask the OS.
 
@@ -131,16 +227,71 @@ def read_lock(path):
 
 
 def acquire(path, cmd, wait_s, max_age, steal):
-    """Take the lock, or explain precisely why not. Returns True on success."""
+    """Take the lock, or explain precisely why not. Returns True on success.
+
+    FIFO: a ticket is taken first, and the `O_EXCL` create is only attempted
+    when we are the oldest LIVE waiter. `--steal` skips the queue, because it
+    already means "I know what I am doing to the current holder".
+    """
+    qdir = queue_dir(path)
+    ticket = join_queue(qdir, cmd)
+    try:
+        return _acquire_queued(path, qdir, ticket, cmd, wait_s, max_age, steal)
+    except BaseException:
+        leave_queue(ticket)
+        raise
+
+
+def race_acquire(path, cmd, wait_s, max_age, steal):
+    """The OLD, UNFAIR algorithm: no ticket, everyone races for `O_EXCL`.
+
+    Kept for exactly one reason: `tools/test_buildlock.py` needs something that
+    CAN let the later arrival win. Without it the FIFO test asserts an ordering
+    that a coin-toss would also produce most of the time, and an ordering test
+    with no losing counterpart is the check-that-cannot-fail this repo keeps
+    finding (CLAUDE.md 9b). It is not used by `main` and must not be.
+    """
+    return _acquire_queued(path, None, None, cmd, wait_s, max_age, steal)
+
+
+def _acquire_queued(path, qdir, ticket, cmd, wait_s, max_age, steal):
     deadline = time.time() + wait_s
     announced = False
+    yielded_to = None
     while True:
+        # AM I NEXT? Checked before the create is attempted, so a later arrival
+        # cannot win the race against an earlier one that happens to be asleep.
+        if not steal and ticket is not None:
+            q = read_queue(qdir, max_age)
+            if q and q[0].get("_path") != ticket:
+                head = q[0]
+                if yielded_to != head.get("_path"):
+                    yielded_to = head.get("_path")
+                    pos = next((i for i, t in enumerate(q)
+                                if t.get("_path") == ticket), -1)
+                    print("QUEUED at position %d of %d: pid %s (%r) arrived "
+                          "first and is next for the lock."
+                          % (pos + 1, len(q), head.get("pid"),
+                             head.get("cmd")), flush=True)
+                if time.time() >= deadline:
+                    print("REFUSED: still position %d in the build queue after "
+                          "%.0fs. NOTHING WAS BUILT."
+                          % (pos + 1, wait_s))
+                    leave_queue(ticket)
+                    return False
+                time.sleep(1.0)
+                continue
+
         me = {"pid": os.getpid(), "cmd": cmd, "started": time.time(),
               "started_h": time.strftime("%Y-%m-%d %H:%M:%S")}
         try:
             fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(me, f)
+            # Out of the queue the moment the lock is HELD, not before: leaving
+            # earlier would let the next waiter believe it was head while we
+            # were still between the check and the create.
+            leave_queue(ticket)
             return True
         except OSError as e:
             if e.errno != errno.EEXIST:
@@ -154,6 +305,7 @@ def acquire(path, cmd, wait_s, max_age, steal):
             if time.time() >= deadline:
                 print("BLOCKED: %s exists but could not be read. If no build "
                       "is running, delete it." % path)
+                leave_queue(ticket)
                 return False
             continue
 
@@ -188,8 +340,13 @@ def acquire(path, cmd, wait_s, max_age, steal):
                   "This is the guard working: running anyway is what wipes "
                   "both artifacts."
                   % (pid, held.get("cmd"), age, wait_s))
+            leave_queue(ticket)
             return False
-        time.sleep(2.0)
+        # One second, not two: this is now a HANDOFF, not a race. The head of
+        # the queue is the only process attempting the create, so a shorter
+        # poll costs nothing in contention and shortens the gap between one
+        # build releasing and the next starting.
+        time.sleep(1.0)
 
 
 def release(path):
@@ -237,15 +394,23 @@ def main():
     path = lock_path(a.repo)
 
     if a.status:
+        q = read_queue(queue_dir(path), a.max_age)
         held = read_lock(path)
         if not held:
             print("build lock FREE (%s)" % path)
+            for i, t in enumerate(q):
+                print("  queued %d: pid %s %r since %s"
+                      % (i + 1, t.get("pid"), t.get("cmd"), t.get("arrival_h")))
             return 0
         pid = int(held.get("pid", -1))
         print("build lock HELD by pid %d (%s) %r since %s -- %.0fs ago"
               % (pid, "running" if pid_alive(pid) else "NOT RUNNING (stale)",
                  held.get("cmd"), held.get("started_h"),
                  time.time() - float(held.get("started", 0))))
+        for i, t in enumerate(q):
+            print("  queued %d: pid %s %r since %s%s"
+                  % (i + 1, t.get("pid"), t.get("cmd"), t.get("arrival_h"),
+                     "   <- next" if i == 0 else ""))
         return 1
 
     rest = [x for x in a.rest if x != "--"]

@@ -817,6 +817,13 @@ STRING_SELFTEST = [
       os.path.join(REPO, "mods", "uihub", "bin", "nope-not-built.dll")], 3),
     ("--for usage error: a PATH given where a LOGICAL NAME belongs",
      ["--for", ("uihub",)], 2),
+    # The `--` sentinel: a literal that starts with a dash. Without
+    # `absorb_sentinels` argparse reads `--groupOf-not-a-flag` as an unknown
+    # OPTION and exits 2, so a plain MISSING (1) here is the whole proof.
+    ("--string -- <dash-leading literal>: parsed as a LITERAL, not an option",
+     ["--string", "--", "--zzzNotAMarkerAtAll", ("uihub",)], 1),
+    ("--string -- <dash-leading literal> that IS present",
+     ["--string", "--", "--" + "app:lib", ("uihub",)], 1),
 ]
 
 
@@ -988,7 +995,52 @@ def _is_declared_artifact(name):
         return False
 
 
+# Options that take a LITERAL as their value -- i.e. ones whose value may
+# legitimately start with a dash, because the thing being searched for is a
+# command-line flag inside the binary.
+SENTINEL_OPTS = ("-s", "--string", "--absent", "--control")
+
+
+def absorb_sentinels(argv):
+    r"""Rewrite `OPT -- VALUE` as `OPT=VALUE` for the literal-taking options.
+
+    argparse cannot express "the next token is a value even though it starts
+    with a dash". `-s --no-mod-build` is parsed as the option `--no-mod-build`
+    and fails with `expected one argument`, and `--` is argparse's own
+    end-of-options marker, so it does not help either.
+
+    That bit for real: verifying the launcher's new flags meant asking whether
+    the string `--no-mod-build` was in the built exe, and there was no way to
+    say it. `-s=--no-mod-build` does work, but it is not what anyone types and
+    it is not what the error message suggests.
+
+    So `--string -- --no-mod-build` now means what it looks like it means. Only
+    the options in SENTINEL_OPTS are touched, and only when the very next token
+    is exactly `--`; anything else is passed through untouched, so argparse's
+    ordinary end-of-options behaviour elsewhere on the line is unchanged.
+    """
+    out = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in SENTINEL_OPTS and i + 2 < len(argv) and argv[i + 1] == "--":
+            out.append("%s=%s" % (a, argv[i + 2]))
+            i += 3
+            continue
+        if a in SENTINEL_OPTS and i + 2 == len(argv) and argv[i + 1] == "--":
+            # `--string --` with nothing after it. Left alone so argparse
+            # produces its own "expected one argument" rather than this
+            # silently swallowing the option.
+            out.append(a)
+            i += 1
+            continue
+        out.append(a)
+        i += 1
+    return out
+
+
 def main(argv):
+    argv = absorb_sentinels(argv)
     ap = argparse.ArgumentParser(
         prog="markers.py", add_help=True,
         description="Verify feature markers in a built DLL. Three outcomes: "

@@ -55,6 +55,33 @@ The summary states counts for each and the exit code is non-zero if anything
 failed. A mod that failed to compile is NEVER left with its previous `.dll` in
 place pretending to be the new one -- the output and its cache key are removed
 first, so a failure cannot masquerade as a success on the next run.
+
+## Failures are cached too, and why that is not hiding them
+
+A failed mod has no `.dll` and no `.cachekey` (by the rule just above), so
+until 2026-09-01 it was recompiled in full on EVERY run -- plus the retry with
+`nimcache` cleared, i.e. roughly two whole compiles per launch, for ever.
+Measured: three broken mods turned a 0.45s all-cached startup into 60.5s, every
+boot, silently.
+
+So a diagnosed failure is recorded in `bin/<stem>.failkey` under the SAME cache
+key as a success. Change the mod's sources, `abi/`, `aowl/src`, a compile flag
+or the compiler, and it is retried; change nothing and the same verdict is
+reported in about a millisecond.
+
+Two rules keep this from becoming a lie:
+
+  * it still reports **`failed`**, never a quieter fourth state. `FAILED` is
+    the control word the in-game loading step keys on and the player must see
+    it -- a mod that does not build is exactly as broken on the tenth boot as
+    on the first. The report says the verdict came from cache so that a 0.0s
+    failure cannot be misread as a tool that did not try.
+  * **only a DIAGNOSED failure is cached.** If the compiler said nothing this
+    tool recognises, the cause is probably environmental (wrong gcc on PATH, no
+    ucrt64, a full disk, antivirus on the output) -- the kind of failure that
+    fixes itself. Caching one would freeze a transient into a permanent verdict
+    clearable only with `--force`. A slow retry is the right answer to a
+    failure we cannot explain.
 """
 
 from __future__ import annotations
@@ -230,6 +257,12 @@ def compile_cmd(nimony_exe, nimony_root, abi_dir, aowl_src, mod_dir, source, out
         "--passC:-I" + abi_dir,
         "--passC:-I" + mod_dir,
         "-p:" + aowl_src,
+        # `abi/` as a NIM path too: `abi/aowlspt_symtab.nim` is the Nim view of
+        # the generated symbol table and `mods/sain` imports it. Without this
+        # the only way to reach it was a checkout-relative path that resolves
+        # in the repo and nowhere else -- see the matching comment in
+        # `tools/aowl.nim`'s buildMod, which must stay identical to this.
+        "-p:" + abi_dir,
         "-p:" + os.path.join(nimony_root, "src", "lib"),
         "-o:" + out,
         source,
@@ -413,6 +446,97 @@ class Progress(object):
             pass
 
 
+ERROR_MARKS = ("error:", "warning: ", "cannot open", "undeclared identifier",
+               "ambiguous identifier", "file not found")
+DIAG_AFTER = 3
+DIAG_MAX = 12
+
+
+def diagnostics(stderr, stdout):
+    """The lines that say WHY, not the last lines printed.
+
+    This used to be `splitlines()[-6:]` -- the TAIL. nimony ends a failed build
+    with a `FAILURE: <the entire nifmake command line>` banner that is itself
+    several hundred characters, and the caller then truncates each line to 160
+    characters. The result was that three mods reported nothing but
+    `nimony exited 1` and half a path, and every real diagnostic -- a missing
+    import, an unresolved include, an ambiguous identifier -- had been pushed
+    off the top by the banner announcing that a failure had occurred. Finding
+    the actual cause meant re-running each compile by hand.
+
+    So: keep the lines that carry a diagnostic marker, plus the `DIAG_AFTER`
+    lines after each (nimony puts the offending expression and the type
+    mismatch detail underneath its `Error:` line), de-duplicated and in source
+    order. The FAILURE banner is dropped unless nothing else matched.
+
+    Falls back to the tail when no line carries a marker -- a build that failed
+    with no recognisable diagnostic still has to show SOMETHING, and silently
+    returning an empty list would read as "it failed and said nothing", which
+    is a different and much rarer fact than "we did not recognise its output".
+    """
+    text = ((stderr or "") + "\n" + (stdout or "")).strip()
+    lines = [l.rstrip() for l in text.splitlines() if l.strip()]
+    if not lines:
+        return []
+    keep = set()
+    for i, l in enumerate(lines):
+        low = l.lower()
+        if low.startswith("failure:"):
+            # The banner. It names the command, never the cause.
+            continue
+        if any(m in low for m in ERROR_MARKS):
+            for j in range(i, min(i + 1 + DIAG_AFTER, len(lines))):
+                if not lines[j].lower().startswith("failure:"):
+                    keep.add(j)
+    if not keep:
+        return lines[-6:]
+    return [lines[i] for i in sorted(keep)][:DIAG_MAX]
+
+
+def write_failure(failfile, key, why, diag, stderr, stdout):
+    """Record a failure so an unchanged broken mod is not recompiled every boot.
+
+    ONLY A DIAGNOSED FAILURE IS CACHED. If `diagnostics` recognised nothing --
+    no `Error:`, no `cannot open`, no `file not found` -- the compile failed for
+    a reason the compiler did not articulate, and the overwhelmingly likely
+    causes are environmental: the wrong gcc on PATH, a missing ucrt64, a full
+    disk, an antivirus holding the output. Those are exactly the failures that
+    fix themselves, and caching one would turn a transient into a permanent
+    verdict that only `--force` could clear. A slow retry is the right answer
+    for a failure we cannot explain; an instant wrong answer is not.
+    """
+    if not diag:
+        return False
+    raw = ((stderr or "") + "\n" + (stdout or "")).strip()
+    try:
+        os.makedirs(os.path.dirname(failfile), exist_ok=True)
+        with open(failfile, "w", encoding="utf-8", newline="\n") as f:
+            jsonmod.dump({"key": key, "why": why, "output": diag,
+                          "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                          # The full text, so a cached verdict can still be
+                          # investigated without reproducing the build.
+                          "raw": raw[-8000:]}, f, indent=1)
+    except OSError:
+        return False
+    return True
+
+
+def read_failure(failfile, key):
+    """The recorded failure IF it was recorded for this exact key, else None.
+
+    A key mismatch is not an error and not a stale-file warning: it means the
+    inputs changed, which is precisely when the mod must be retried.
+    """
+    try:
+        with open(failfile, "r", encoding="utf-8") as f:
+            rec = jsonmod.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(rec, dict) or rec.get("key") != key:
+        return None
+    return rec
+
+
 def build_one(mod_dir, abi_dir, aowl_src, nimony_exe, nimony_root,
               force, check, verbose, env):
     name = os.path.basename(mod_dir.rstrip("\\/"))
@@ -425,6 +549,7 @@ def build_one(mod_dir, abi_dir, aowl_src, nimony_exe, nimony_root,
     bin_dir = os.path.join(mod_dir, "bin")
     out = os.path.join(bin_dir, stem + ".dll")
     keyfile = os.path.join(bin_dir, stem + ".cachekey")
+    failfile = os.path.join(bin_dir, stem + ".failkey")
 
     cmd = compile_cmd(nimony_exe, nimony_root, abi_dir, aowl_src,
                       mod_dir, source, out)
@@ -441,14 +566,43 @@ def build_one(mod_dir, abi_dir, aowl_src, nimony_exe, nimony_root,
         if have == key and os.path.isfile(out):
             return {"mod": name, "status": "cached", "out": out}
 
+        # THE FAILURE IS CACHED TOO, under the same key.
+        #
+        # Measured 2026-09-01: three mods that cannot compile turned a 0.45s
+        # all-cached startup into 60.5s, on EVERY launch, for ever. A failed
+        # mod deliberately has no `.dll` and no `.cachekey` (so a stale binary
+        # can never masquerade as a fresh one), and the consequence was that it
+        # was rebuilt in full every single time -- plus modbuild's own retry
+        # with `nimcache` cleared, so roughly two full compiles per boot. The
+        # player pays a silent minute per launch and nothing says why.
+        #
+        # The key is the SAME cache key as a success, so it already covers the
+        # mod's sources, `abi/`, `aowl/src`, the compile flags and the compiler
+        # binary. Change any of those and the mod is retried; change none and
+        # the verdict is reported instantly from disk.
+        #
+        # It still reports `failed`, NOT a third state. `FAILED` is the host's
+        # control word for the loading step and the player must see it: a mod
+        # that does not build is exactly as broken on the tenth boot as on the
+        # first, and hiding that because we already knew would be the worst
+        # kind of caching.
+        fail = read_failure(failfile, key)
+        if fail is not None:
+            return {"mod": name, "status": "failed",
+                    "why": fail.get("why", "the previous build failed"),
+                    "output": fail.get("output", []),
+                    "from_cache": True}
+
     if check:
         return {"mod": name, "status": "would-build"}
 
     # Remove the previous output AND its key BEFORE compiling. If the compile
     # fails we must not be left holding a stale dll that the next run would
     # accept as current -- a failure that looks like a success is the single
-    # worst outcome this repo produces.
-    for p in (out, keyfile):
+    # worst outcome this repo produces. The failure record goes too: we are
+    # about to find out afresh, and a leftover one could otherwise outlive the
+    # compile that disproved it.
+    for p in (out, keyfile, failfile):
         try:
             os.remove(p)
         except OSError:
@@ -456,8 +610,34 @@ def build_one(mod_dir, abi_dir, aowl_src, nimony_exe, nimony_root,
     os.makedirs(bin_dir, exist_ok=True)
 
     t0 = time.time()
-    r = subprocess.run(cmd, cwd=mod_dir, capture_output=True, text=True,
-                       env=env)
+
+    def run_compile():
+        """The compile, with the compiler failing to START treated as a mod
+        failure rather than as an exception.
+
+        `subprocess.run` RAISES if the executable cannot be launched at all --
+        it is missing, it is not a valid PE, it is the wrong architecture, or a
+        virus scanner has it locked. Unhandled, that traceback aborts the whole
+        run: every mod after this one is silently never attempted, and the
+        summary the caller prints never appears. One unusable compiler must
+        cost one mod, not the batch.
+
+        These are also precisely the failures that must NOT be cached, and they
+        are not: the returned diagnostic list is empty, and `write_failure`
+        refuses an empty list.
+        """
+        try:
+            return subprocess.run(cmd, cwd=mod_dir, capture_output=True,
+                                  text=True, env=env), None
+        except OSError as e:
+            return None, ("the compiler could not be started: %s. This is an "
+                          "environment problem, not a problem with the mod -- "
+                          "%s" % (e, cmd[0]))
+
+    r, launch_err = run_compile()
+    if launch_err:
+        return {"mod": name, "status": "failed", "why": launch_err,
+                "output": []}
     if r.returncode != 0:
         # One retry with the cache cleared. nimony's incremental cache does not
         # always survive a source file being ADDED to a mod: it fails at link
@@ -466,12 +646,16 @@ def build_one(mod_dir, abi_dir, aowl_src, nimony_exe, nimony_root,
         cache = os.path.join(mod_dir, "nimcache")
         if os.path.isdir(cache):
             shutil.rmtree(cache, ignore_errors=True)
-            r = subprocess.run(cmd, cwd=mod_dir, capture_output=True,
-                               text=True, env=env)
+            r2, launch_err = run_compile()
+            if launch_err:
+                return {"mod": name, "status": "failed", "why": launch_err,
+                        "output": []}
+            r = r2
     if r.returncode != 0:
-        tail = (r.stderr or r.stdout or "").strip().splitlines()[-6:]
-        return {"mod": name, "status": "failed",
-                "why": "nimony exited %d" % r.returncode, "output": tail}
+        why = "nimony exited %d" % r.returncode
+        diag = diagnostics(r.stderr, r.stdout)
+        write_failure(failfile, key, why, diag, r.stderr, r.stdout)
+        return {"mod": name, "status": "failed", "why": why, "output": diag}
 
     if not place_library(mod_dir, stem, out):
         return {"mod": name, "status": "failed",
@@ -589,9 +773,15 @@ def main():
                 line += "  (%.1fs)" % res.get("seconds", 0)
             elif s in ("failed", "skipped"):
                 line += "  -- " + res.get("why", "")
+                if res.get("from_cache"):
+                    # Said out loud. A failure reported in 0.0s looks like a
+                    # tool that did not try, and the difference between "it
+                    # failed again" and "it has not changed since it failed"
+                    # is the whole point of caching it.
+                    line += "  (unchanged since it last failed; not recompiled)"
             print(line)
             for extra in res.get("output", []):
-                print("      | " + extra[:160])
+                print("      | " + extra[:240])
 
     counts = {}
     for r in results:
