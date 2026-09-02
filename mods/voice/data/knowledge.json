@@ -1,0 +1,18 @@
+{
+  "_comment": "The knowledge base. Retrieval is keyword overlap between the utterance (plus the agent's own tags) and each fact's tags -- deliberately dumb and deliberately visible: every response reports which fact indices it injected, so you can watch retrieval work or fail to. It is NOT embeddings and NOT a graph. Upgrading it means replacing one proc (agents.retrieve).",
+
+  "_history": "EscapeFromMyBasement called this an 'aoughwl ontology / belief-graph service'. In the code it was one 3.1 KB Python file with a 9-entry hardcoded persona dict, a substring match, and an in-RAM event list wiped on process exit. There was no graph and no ontology to port. What is ported is the pattern: retrieve, inject, remember.",
+
+  "facts": [
+    { "tags": "exit extract extraction leave raid", "text": "Extracts open and close on a timer; some need a green flare, a car battery, or a squad mate to hold them." },
+    { "tags": "factory exit extract", "text": "Factory has gate 0, gate 3, the cellars and the med tent camera; gate 3 wants no armoured rig." },
+    { "tags": "loot valuable money sell", "text": "Bitcoin, LEDX, graphics cards and Tetriz keep their value; most of what you find does not." },
+    { "tags": "scav player pmc hostile", "text": "Scavs will not open on another scav unless you point a weapon or run at them." },
+    { "tags": "boss factory tagilla hammer", "text": "Tagilla walks Factory with a sledgehammer and a welding mask and does not use cover." },
+    { "tags": "boss reshala customs dorms", "text": "Reshala holds Dorms on Customs with four guards and does not push alone." },
+    { "tags": "radio channel comms frequency", "text": "Radio traffic carries as far as the set does; past that there is only hiss." },
+    { "tags": "assistant help commands aowl", "text": "Ask me for status, for what is on a channel, or to remember something for you." },
+    { "tags": "status system engines", "text": "Engine status is at /aowlspt/voice/status; it lists every path each engine resolved and whether the file is there." },
+    { "tags": "medical heal injury bleed", "text": "A heavy bleed kills faster than the pain does; the tourniquet goes on before the painkiller." }
+  ]
+}

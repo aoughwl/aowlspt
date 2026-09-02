@@ -1,0 +1,59 @@
+{
+  "_comment": "aowl.voice -- conversational agents with voice. OFF by default, because turning it on lets this mod spawn subprocesses (whisper-server, piper, the mic recorder) and load hundreds of megabytes of model. Nothing here is read off disk by the mod: the host serves these through setting(). GET /aowlspt/voice/status to see exactly which files each engine resolved and whether they are there.",
+
+  "enabled": false,
+
+  "_defaultAgent": "Which agent answers when a request names none. Agents are rows in data/agents.json; 'assistant' has no game involvement at all.",
+  "defaultAgent": "assistant",
+
+  "_engines": "Each stage dispatches on these strings. sttEngine: whisper-server | none. llmEngine: builtin | llamacpp | openai | none. ttsEngine: piper | sapi | none.",
+  "sttEngine": "whisper-server",
+  "llmEngine": "builtin",
+  "ttsEngine": "piper",
+
+  "_llmEngineNote": "'builtin' is a TEMPLATE RESPONDER, NOT A LANGUAGE MODEL. It exists so the whole spine can be proved on a machine with no model on it, which is this machine -- a full-disk sweep found no .gguf anywhere. For real reasoning set llmEngine to 'llamacpp' and fill in llamaExe + llamaModel. Docker Desktop ships llama.cpp binaries at C:/Users/savant/.docker/bin/inference/ but its model store is empty.",
+
+  "_toolsDir": "Holds whisper/, piper/ and recorder/. These are EscapeFromMyBasement's, already downloaded by its tools/Setup-EFMyBasement.ps1 -- this mod reuses them rather than fetching 230 MB again. Change it to point somewhere else and the four paths below default from it.",
+  "toolsDir": "D:/SPT/BepInEx/plugins/EscapeFromMyBasement/tools",
+
+  "_overrides": "Empty means 'derive it from toolsDir'. Set one to point an engine somewhere else.",
+  "whisperExe": "",
+  "whisperModel": "",
+  "whisperPort": 9000,
+  "piperExe": "",
+  "piperVoice": "",
+  "recorderExe": "",
+  "llamaExe": "",
+  "llamaModel": "",
+
+  "_curlExe": "The only HTTP client available to a nimony mod. Windows ships one in System32.",
+  "curlExe": "curl.exe",
+
+  "_openAi": "Opt-in and cloud. The key is read from the OPENAI_API_KEY environment variable and NEVER from this file or from source -- EscapeFromMyBasement hardcoded a live key into client/Plugin.cs:52 and shipped it inside the DLL; that key should be treated as leaked and rotated.",
+  "openAiModel": "gpt-4o-mini",
+
+  "_workDir": "Where recorded and spoken .wav files land. Empty = %TEMP%.",
+  "workDir": "",
+
+  "_maxTurns": "How many lines of the conversation are fed back into the prompt. EFMB sent none, so its NPCs had no memory at all.",
+  "maxTurns": 12,
+  "maxTokens": 160,
+
+  "_cache": "A response + TTS-line cache for low-latency fluency. A HIT for a (agent, normalized utterance, llmEngine, tts+voice) it has seen returns the stored reply and wav WITHOUT re-running the LLM or piper. It is keyed WITHOUT conversation memory, so it matches repeated stateless lines (greetings, taunts, common phrases) rather than context-dependent turns; /aowlspt/voice/status says so. Persisted under cacheDir as index.json plus one wav per entry, so it survives a restart.",
+  "cacheEnabled": true,
+  "cacheMaxEntries": 256,
+  "_cacheDir": "Empty = mods/voice/data/cache beside the mod.",
+  "cacheDir": "",
+  "_cacheTtlSeconds": "0 = entries never expire.",
+  "cacheTtlSeconds": 0,
+  "_precacheCommonLines": "On load, generate each agent's greeting line into the cache so its first request is an instant hit. Off by default because it spawns the TTS subprocess at load.",
+  "precacheCommonLines": false,
+
+  "_clientStubs": "These three render on the F12 page but their client-side effect is not built yet (they are declared implemented=false). Backed here anyway so the control resolves to a real value and an accepted edit persists instead of being discarded by the host.",
+  "pushToTalk": false,
+  "spatialPlayback": false,
+  "objectiveHud": false,
+
+  "_assumeBotsPresent": "The radio needs a live bot census (who exists, alive, how far) to decide whether an NPC can answer. That surface is a separate agent's host-side work and is NOT built here. Until it exists, true means world agents are treated as alive and in range so the system is testable; false means they are unreachable.",
+  "assumeBotsPresent": true
+}
