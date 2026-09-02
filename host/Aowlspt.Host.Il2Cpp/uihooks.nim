@@ -311,8 +311,13 @@ proc uihArm(verbose: bool) =
           continue
         let post = slots <= UihPostfixMaxSlots
         gUihArming = s
+        # `slots` is handed DOWN as well as decided here. This file's own
+        # choice of prefix-vs-postfix and `attachDrain`'s gate are then the
+        # same number from the same column, so they cannot drift apart -- and
+        # if this file's arithmetic were ever wrong in the unsafe direction,
+        # the gate refuses the bind instead of trusting it.
         let ok = attachDrain(spec, fn, cast[Il2CppMethod](0), false, verbose,
-                             26'i32, post)
+                             26'i32, post, int32(slots))
         gUihArming = -1
         if ok:
           gUihPostfix[s] = post

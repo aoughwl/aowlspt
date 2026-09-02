@@ -107,6 +107,27 @@ typedef struct AowlBridgeTarget {
     const unsigned char sig[16];
     int32_t             siglen;
     int32_t             perFrame;   /* runs once per frame (1) or more (0) */
+    /* HOW MANY REGISTER SLOTS THE COMPILED CALL USES: `this` (0 for a
+     * static), the declared arguments, and IL2CPP's trailing `MethodInfo*`.
+     * Past FOUR they arrive ON THE STACK and a POSTFIX detour cannot serve
+     * them -- the postfix thunk `sub`s its own frame before `call`ing the
+     * original, so the original reads them out of the thunk's frame. See the
+     * banner in `abi/aowlspt_uihooks.h` for the measured crash (three dead
+     * boots, `EFT.UI.MenuScreen::Show(5-arg)`, 7 slots) and `attachDrain` in
+     * `aowlhost.nim` for the gate that now refuses it.
+     *
+     * ZERO MEANS UNDECLARED, NOT ZERO SLOTS. A real method always uses at
+     * least one (the `MethodInfo*` alone), so a row that a future edit adds
+     * without filling this in reads as UNDECLARED and `attachDrain` REFUSES
+     * a postfix on it rather than binding one on an unknown shape. That is
+     * the fail-closed direction; a plain `int32_t` zero-fill could not fail
+     * any other way.
+     *
+     * Every value below was resolved OFFLINE from
+     * `Il2CppMethodDefinition.parameterCount@34` + `flags@28 & STATIC`, and
+     * `tools/drainaudit.py` re-derives all of them from the metadata on every
+     * build and fails the build if this column and the metadata disagree. */
+    int32_t             slots;
 } AowlBridgeTarget;
 
 /* Diagnostics, read by the host after it asks for a target. */
@@ -124,7 +145,7 @@ static const AowlBridgeTarget aowl_bridge_targets[] = {
      * 48 85 DB       test rbx, rbx                                          */
     { "EFT.TarkovApplication::Update", 0x977B10u,
       { 0x40,0x53, 0x48,0x83,0xEC,0x20, 0x48,0x8B,0x99,0x10,0x01,0x00,0x00,
-        0x48,0x85,0xDB }, 16, 1 },
+        0x48,0x85,0xDB }, 16, 1, 2 },
 
     /* EFT.GameWorldUnityTickListener::Update @ 0x251C6C0 (raid only)
      * 40 57          push rdi
@@ -132,7 +153,7 @@ static const AowlBridgeTarget aowl_bridge_targets[] = {
      * 80 3D D0 68 BA 04 00   cmp byte [rip+0x4BA68D0], 0                    */
     { "EFT.GameWorldUnityTickListener::Update", 0x251C6C0u,
       { 0x40,0x57, 0x48,0x83,0xEC,0x20, 0x80,0x3D,0xD0,0x68,0xBA,0x04,0x00 },
-      13, 1 },
+      13, 1, 2 },
 };
 
 #define AOWL_BRIDGE_TARGET_COUNT \
@@ -181,7 +202,7 @@ static const AowlBridgeTarget aowl_bridge_render_targets[] = {
      * 48 8B E9       mov  rbp, rcx                                          */
     { "OnRenderObjectManager::OnRenderObject", 0x1F46910u,
       { 0x40,0x55, 0x48,0x83,0xEC,0x20, 0x80,0x3D,0x83,0xA8,0x17,0x05,0x00,
-        0x48,0x8B,0xE9 }, 16, 1 },
+        0x48,0x8B,0xE9 }, 16, 1, 2 },
 
     /* EFT.CameraControl.CameraLodBiasController::OnPostRender @ 0x1263B10
      * 48 83 EC 38    sub  rsp, 0x38
@@ -189,7 +210,7 @@ static const AowlBridgeTarget aowl_bridge_render_targets[] = {
      * 0F 29 74 24 20 movaps [rsp+0x20], xmm6                               */
     { "EFT.CameraControl.CameraLodBiasController::OnPostRender", 0x1263B10u,
       { 0x48,0x83,0xEC,0x38, 0x48,0x8B,0x05,0x4D,0xF7,0xE6,0x05,
-        0x0F,0x29,0x74,0x24,0x20 }, 16, 1 },
+        0x0F,0x29,0x74,0x24,0x20 }, 16, 1, 2 },
 };
 
 #define AOWL_BRIDGE_RENDER_TARGET_COUNT \
@@ -252,7 +273,7 @@ static int32_t aowl_bridge_render_target_count(void) {
 static const AowlBridgeTarget aowl_bridge_settings_targets[] = {
     { "EFT.UI.Settings.SettingsScreen::Show", 0x171FA00u,
       { 0x40,0x53, 0x48,0x83,0xEC,0x20, 0x80,0x3D,0x0C,0xEA,0x99,0x05,0x00,
-        0x48,0x8B,0xD9 }, 16, 0 },
+        0x48,0x8B,0xD9 }, 16, 0, 2 },
 };
 #define AOWL_BRIDGE_SETTINGS_TARGET_COUNT \
     ((int32_t)(sizeof(aowl_bridge_settings_targets) / \
@@ -347,7 +368,7 @@ static int32_t aowl_bridge_settings_target_count(void) {
 static const AowlBridgeTarget aowl_bridge_settingstab_targets[] = {
     { "EFT.UI.Settings.SettingsScreen::ShowScreen", 0x1720DE0u,
       { 0x48,0x89,0x5C,0x24,0x08, 0x48,0x89,0x74,0x24,0x10, 0x57,
-        0x48,0x83,0xEC,0x30, 0x80 }, 16, 0 },
+        0x48,0x83,0xEC,0x30, 0x80 }, 16, 0, 3 },
 };
 #define AOWL_BRIDGE_SETTINGSTAB_TARGET_COUNT \
     ((int32_t)(sizeof(aowl_bridge_settingstab_targets) / \
@@ -380,6 +401,14 @@ static const char* aowl_bridge_settingstab_target_name(int32_t i) {
 }
 static int32_t aowl_bridge_settingstab_target_count(void) {
     return AOWL_BRIDGE_SETTINGSTAB_TARGET_COUNT;
+}
+/* The i'th settings-tab target's REGISTER-SLOT count -- what `attachDrain`'s
+ * postfix gate needs. 0 for an out-of-range index, which reads as UNDECLARED
+ * and is refused, rather than a plausible small number. Both postfix riders on
+ * this table (settingsui kind 7, invoke2 kind 9) pass it. */
+static int32_t aowl_bridge_settingstab_target_slots(int32_t i) {
+    if (i < 0 || i >= AOWL_BRIDGE_SETTINGSTAB_TARGET_COUNT) return 0;
+    return aowl_bridge_settingstab_targets[i].slots;
 }
 
 /* ------------------------------------------------------------------ *
@@ -420,7 +449,7 @@ static int32_t aowl_bridge_settingstab_target_count(void) {
 static const AowlBridgeTarget aowl_bridge_settingstick_targets[] = {
     { "EFT.UI.Settings.GameSettingsTab::Update", 0x1703680u,
       { 0x40,0x57, 0x48,0x83,0xEC,0x40,
-        0x80,0x3D,0xE2,0xAC,0x9B,0x05,0x00, 0x48,0x8B,0xF9 }, 16, 0 },
+        0x80,0x3D,0xE2,0xAC,0x9B,0x05,0x00, 0x48,0x8B,0xF9 }, 16, 0, 2 },
 };
 #define AOWL_BRIDGE_SETTINGSTICK_TARGET_COUNT \
     ((int32_t)(sizeof(aowl_bridge_settingstick_targets) / \

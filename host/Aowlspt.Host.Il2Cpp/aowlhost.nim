@@ -708,6 +708,7 @@ var gImageCdnRedirect = false
 # nothing else, so this host can share it and still import nothing but
 # kernel32.
 {.emit: """#include "aowlspt_lock.h" """.}
+{.emit: """#include "aowlspt_mqpolicy.h" """.}
 {.emit: """
 /* `aowl_lock` guards `gPending`. A mod calls `invoke_main` from a worker
  * thread; the drain runs on the game thread. That is a real handoff between two
@@ -891,6 +892,33 @@ proc cMqThread(): uint32 {.importc: "aowl_mq_thread", nodecl.}
 proc cMqAlienFires(): int32 {.importc: "aowl_mq_alien_fires", nodecl.}
 proc cMqFireCount(): int32 {.importc: "aowl_mq_fire_count", nodecl.}
 proc cMqEnter(): int32 {.importc: "aowl_mq_enter", nodecl.}
+
+# THE ONE RULE about which thread may run queued main-thread work, and the
+# four-state health of the drain. Both live in `abi/aowlspt_mqpolicy.h` rather
+# than here so that `tools/test_mqpolicy.py` can COMPILE and RUN them offline
+# against a fake stalled drain -- see the header for the two boot crashes of
+# 2026-09-02 that the old "run it on the host thread" fallback caused.
+proc cMqMayRunHere(callerTid, ownerTid: uint32; hostSafe: int32): int32 {.
+  importc: "aowl_mq_may_run_here", nodecl.}
+proc cMqHealth(slot, fires: int32; sinceMs, stallMs: uint64): int32 {.
+  importc: "aowl_mq_health", nodecl.}
+proc cMqHealthText(h: int32): cstring {.
+  importc: "aowl_mq_health_text", nodecl.}
+
+const
+  DrainUnbound = 0
+  DrainNeverFired = 1
+  DrainStalled = 2
+  DrainLive = 3
+  DrainStallMs = 2000'u64
+    ## How long a drain that HAS fired may go quiet before the host calls it
+    ## stalled. It applies only from the first firing onwards: before that the
+    ## state is `DrainNeverFired` and no clock is consulted at all. The old code
+    ## started this clock at host boot, which meant it always expired -- the
+    ## first `TarkovApplication::Update` of a boot is ~15 s after the detour
+    ## binds, because the behaviour the player loop ticks does not exist until
+    ## the preloader has built it. That is the game's schedule, not ours; there
+    ## is nothing to fix on our side except the wrong expectation.
 proc cBenchCb(): Il2CppPtr {.importc: "aowl_bench_cb_ptr", nodecl.}
 proc cBenchHits(): int32 {.importc: "aowl_bench_hit_count", nodecl.}
 
@@ -1272,6 +1300,13 @@ type
     ## only effect is that the drain records which thread ran it, which is the
     ## one fact this whole path exists to establish.
     selfTest: bool
+    ## THE ONLY ENTRY THAT MAY RUN OFF THE DRAIN'S THREAD, and it is the host's
+    ## own, never a mod's. Set exclusively by `enqueueHostSafe`; `invoke_main`
+    ## and `schedule` cannot reach it. An entry with this set carries no mod
+    ## function pointer and makes no managed call, so the thread it lands on
+    ## does not change what it does -- which is the only reason it is allowed
+    ## to land anywhere. See `abi/aowlspt_mqpolicy.h`.
+    hostSafe: bool
 
 proc deadPatch(): Patch =
   ## An empty row. Used for two things and they are the same thing: filling the
@@ -1292,6 +1327,25 @@ var gRt = Il2Cpp(handle: cast[Il2CppPtr](0), loaded: false, lastError: 0'i32,
 var gDomain: Il2CppPtr = cast[Il2CppPtr](0)
 var gReady = false
 var gPending: seq[Pending] = @[]
+
+const MqQueueCap = 4096
+  ## The most entries `gPending` may hold. It exists because deferring is now
+  ## the answer when the drain is not firing: before 2026-09-02 the host's own
+  ## thread emptied the queue whatever state the drain was in, so the queue
+  ## could not grow without bound and no cap was needed. Now it can, so there is
+  ## one, and `gMqRefused` counts what it cost rather than letting a refusal be
+  ## invisible.
+var gMqDeferred = 0
+  ## How many times `runDue` refused an entry because the thread it was reached
+  ## on is not the drain's and the entry is not host-safe, and put it back. In a
+  ## healthy session this is 0 for the whole run; a number that climbs is the
+  ## host declining to do the thing that used to crash the client, and it is
+  ## reported rather than counted quietly.
+var gMqRefused = 0
+var gMqRefusedSaid = 0
+  ## Callbacks refused for want of room, and how many of those the log has
+  ## already reported. Two numbers because the tick loop reports on CHANGE: a
+  ## line per refused callback at 60 fps would bury the first one.
 
 ## The drain's own snapshot buffer, reused frame after frame.
 ##
@@ -1470,23 +1524,31 @@ var gDrainMethod = ""
 ## guessing at it from a name list is a mod that has to be edited every time
 ## this list is.
 var gDrainPerFrame = false
-## The host's own thread, recorded at boot. `invoke_main` runs here when no
-## candidate bound, and the difference between this and the drain thread is the
-## proof that the drain is somewhere else.
+## The host's own thread, recorded at boot. NOTHING a mod queued through
+## `invoke_main` ever runs here -- see `runPending` and `abi/aowlspt_mqpolicy.h`
+## -- and the difference between this and the drain thread is the proof that the
+## drain is somewhere else.
 var gHostThreadId = 0'u32
 ## Whether the host has already written the "this is the main thread" line. The
 ## drain never logs -- it runs inside the game's update path -- so the host
 ## thread notices and reports it instead.
 var gDrainProven = false
 var gAlienReported = false
-var gStallReported = false
 ## The drain's liveness, watched from the tick loop. `gLastFire` is the fire
-## count last seen and `gLastFireMs` when it last changed; if the count stops
-## moving while work is queued, the hook has gone quiet -- the method it bound
-## may only exist inside a raid -- and the host thread takes the queue back.
+## count last seen and `gLastFireMs` when it last changed.
+##
+## `gLastFireMs` means "when the fire count last moved" only once the count has
+## moved at all. Before the first firing it is the host's boot time, and reading
+## it as a stall clock then is the bug of 2026-09-02: it made every boot report
+## a stall at 2 s against a first firing that arrives at ~15 s. `cMqHealth`
+## consults it only when `fires > 0`, which is why the state before that is
+## `DrainNeverFired` and not `DrainStalled`.
 var gLastFire = 0
 var gLastFireMs = 0'u64
 var gDrainStalled = false
+## The last health the tick loop reported, so the report is on CHANGE. -1 is
+## "nothing said yet", which no `AowlDrainHealth` value is.
+var gLastHealth = -1
 
 ## `opsQuiesce`'s own view of the same counter, kept apart from `gLastFire`
 ## above on purpose. `gLastFire` is the stall detector's and is written from the
@@ -2583,7 +2645,28 @@ proc mainThreadReport(): string =
            ",\"frames\":" & $int(cMqFireCount()) &
            ",\"perFrame\":" & (if gDrainPerFrame: "true" else: "false") &
            ",\"otherThreadFires\":" & $int(cMqAlienFires()) &
-           ",\"stalled\":" & (if gDrainStalled: "true" else: "false") & "}"
+           ",\"stalled\":" & (if gDrainStalled: "true" else: "false") &
+           # ADDITIVE, 2026-09-02. Existing readers (`mods/fov/fov.nim` reads
+           # `bound`, `method`, `frames`, `mainThreadId`, `stalled`) are
+           # untouched -- this is a JSON object, so a field a reader does not
+           # know about costs it nothing and no version needed bumping.
+           #
+           # `health` is the field that says what `stalled` cannot: `stalled` is
+           # a bool and therefore folds "bound but the game has not called it
+           # yet" -- the ordinary first ~15 s of a boot -- into the same answer
+           # as "the game stopped calling it". A mod deciding whether to wait or
+           # to give up needs those apart. `queued` and `deferred` are the two
+           # numbers a mod cannot see from its side at all: how much of its own
+           # work is waiting, and how much the host has declined to run on the
+           # wrong thread.
+           ",\"health\":\"" &
+             (if gDrainSlot < 0: "unbound"
+              elif cMqFireCount() <= 0'i32: "never-fired"
+              elif gDrainStalled: "stalled"
+              else: "live") & "\"" &
+           ",\"queued\":" & $int(cMqCount()) &
+           ",\"deferred\":" & $gMqDeferred &
+           ",\"refused\":" & $gMqRefused & "}"
 
 proc renderThreadReport(): string =
   ## What `call("aowlspt.host::render_thread")` answers -- the render-phase
@@ -2715,7 +2798,7 @@ proc hostCall(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
   if spec == "aowlspt.host::frame_bench_arm":
     if gDrainSlot < 0:
       gLastError = "no per-frame method is bound, so there is no frame to " &
-                   "measure; the drain is on the host's own thread"
+                   "measure; nothing drains the queue at all"
       return ErrUnsupported
     var iters = 20000
     if argText.len > 0:
@@ -3172,10 +3255,44 @@ proc enqueue(cb, user: Il2CppPtr; dueMs: uint64; modIndex: int;
   ## thread is rebuilding is a corrupted list, not a lost callback. The count
   ## is republished inside the lock so the drain's lock-free empty check can
   ## never see a queue that has entries.
+  ##
+  ## Everything queued here is MAIN-THREAD work by definition, so nothing here
+  ## is `hostSafe`. The host's own thread-proof entries go through
+  ## `enqueueHostSafe` below, which is a different, explicitly-named door for
+  ## exactly the reason the 2026-09-02 crash exists: the old code downgraded the
+  ## whole queue when the drain looked stalled, and a mod's `Input::GetKey` tick
+  ## ran on the host thread. There is no way to reach `hostSafe` from
+  ## `invoke_main` or `schedule`.
   cMqLock()
+  if gPending.len >= MqQueueCap:
+    # CAPPED, because a queue nobody can drain is a queue that grows for the
+    # whole session. Refuse the newest rather than dropping the oldest: a
+    # dropped head is a callback a mod already believes is scheduled, while a
+    # refused tail is one it is about to re-queue anyway on its next tick.
+    gMqRefused = gMqRefused + 1
+    cMqUnlock()
+    return
   gPending.add Pending(cb: cb, user: user, dueMs: dueMs, modIndex: modIndex,
-                       selfTest: selfTest)
+                       selfTest: selfTest, hostSafe: false)
   cMqSetCount(int32(gPending.len))
+  cMqUnlock()
+
+proc enqueueHostSafe(dueMs: uint64) =
+  ## THE NAMED PATH for host-internal work that is genuinely correct on any
+  ## thread. Today that is exactly one thing: the thread-proof entry, which
+  ## carries no callback pointer and whose only effect is that whatever runs it
+  ## reports which thread it was on. `runDue` already refuses to make the
+  ## managed half of that proof anywhere but the drain's own thread.
+  ##
+  ## It exists as its own proc, taking no callback, so that "may run on the host
+  ## thread" cannot be passed in as an argument by a future caller who has not
+  ## read this comment.
+  cMqLock()
+  if gPending.len < MqQueueCap:
+    gPending.add Pending(cb: cast[Il2CppPtr](0), user: cast[Il2CppPtr](0),
+                         dueMs: dueMs, modIndex: -1, selfTest: true,
+                         hostSafe: true)
+    cMqSetCount(int32(gPending.len))
   cMqUnlock()
 
 proc enqueueRender(cb, user: Il2CppPtr; modIndex: int; selfTest: bool) =
@@ -3184,12 +3301,21 @@ proc enqueueRender(cb, user: Il2CppPtr; modIndex: int; selfTest: bool) =
   ## for the next render, not a wall-clock deadline, so it is queued due-now.
   cMqLock()
   gRenderPending.add Pending(cb: cb, user: user, dueMs: 0'u64,
-                             modIndex: modIndex, selfTest: selfTest)
+                             modIndex: modIndex, selfTest: selfTest,
+                             hostSafe: false)
   cRqSetCount(int32(gRenderPending.len))
   cMqUnlock()
 
-proc takeDue(due: var seq[Pending]) =
+proc takeDue(due: var seq[Pending]; hostSafeOnly: bool) =
   ## Moves everything due out of `gPending` into `due`, under the lock.
+  ##
+  ## `hostSafeOnly` is what the host's own tick thread passes. It lifts ONLY the
+  ## entries queued through `enqueueHostSafe` and leaves every mod callback in
+  ## the queue, however long it has been there. That is the fix for the two
+  ## 2026-09-02 boot crashes: the host thread used to take the whole queue when
+  ## the drain looked stalled, so a mod's `Input::GetKey` tick ran where Unity's
+  ## input manager slot is null. Leaving work queued is a delay; running it here
+  ## is an access violation.
   ##
   ## What is *not* due is compacted down in place rather than copied into a
   ## second seq that replaces `gPending`. The old shape allocated twice a frame
@@ -3208,7 +3334,7 @@ proc takeDue(due: var seq[Pending]) =
     var w = 0
     for r in 0 ..< gPending.len:
       let p = gPending[r]
-      if p.dueMs <= now:
+      if p.dueMs <= now and ((not hostSafeOnly) or p.hostSafe):
         due.add p
       else:
         if w != r:
@@ -3390,7 +3516,31 @@ proc runDue(due: var seq[Pending]; isRender: bool) =
   ## `isRender` selects which queue's self-test proof this is: the render drain
   ## proves the GL path, the update drain proves the managed-call path. Only the
   ## proof differs; a mod's callback is dispatched identically either way.
+  ##
+  ## THE LAST GATE, and the one that actually holds. `takeDue(hostSafeOnly)`
+  ## decides what to LIFT; this decides what to RUN, per entry, from the thread
+  ## it is actually on. Both exist because a filter at the queue is a promise
+  ## about callers and this is a property of the finished state -- a caller that
+  ## lifts the wrong thing still cannot invoke it here.
+  let tidNow = cThreadId()
+  let ownerNow = (if isRender: cRqThread() else: cMqThread())
   for p in due:
+    if cMqMayRunHere(tidNow, ownerNow, (if p.hostSafe: 1'i32 else: 0'i32)) == 0'i32:
+      # Not this thread's work. Put it back rather than dropping it: a mod that
+      # asked for a main-thread callback is entitled to get one late, and a
+      # silently discarded callback is indistinguishable from one that ran.
+      cMqLock()
+      if isRender:
+        if gRenderPending.len < MqQueueCap:
+          gRenderPending.add p
+          cRqSetCount(int32(gRenderPending.len))
+      else:
+        if gPending.len < MqQueueCap:
+          gPending.add p
+          cMqSetCount(int32(gPending.len))
+      cMqUnlock()
+      gMqDeferred = gMqDeferred + 1
+      continue
     if p.selfTest:
       # The proof, and the reason it is an entry in the queue rather than a
       # log line at bind time: it went in from the host thread and comes out
@@ -3464,17 +3614,18 @@ proc runDue(due: var seq[Pending]; isRender: bool) =
         if guard:
           modhost.modLeave(p.modIndex)
 
-proc drainDue() =
+proc drainDue(hostSafeOnly: bool) =
   ## The drain with a buffer of its own.
   ##
   ## Two callers, and neither is the drain thread in its ordinary frame:
-  ## `runPending`, which is the host's tick thread taking the queue back when
-  ## no per-frame method bound or the one that did went quiet; and `mainDrain`
-  ## re-entered from inside a callback, where `gDue` is already being walked a
-  ## frame down the stack. Both are rare and neither is per-frame, so both pay
-  ## for their own seq rather than sharing one that would need a lock.
+  ## `runPending`, which is the host's tick thread and which passes
+  ## `hostSafeOnly = true` -- it may run the host's own thread-proof entries and
+  ## NOTHING else, ever; and `mainDrain` re-entered from inside a callback,
+  ## which is on the drain's own thread and passes false. Both are rare and
+  ## neither is per-frame, so both pay for their own seq rather than sharing one
+  ## that would need a lock.
   var due: seq[Pending] = @[]
-  takeDue(due)
+  takeDue(due, hostSafeOnly)
   runDue(due, false)
 
 proc renderTakeDue(due: var seq[Pending]) =
@@ -3540,10 +3691,10 @@ proc mainDrain() =
     # Re-entered from inside a callback: `gDue` is live further down this
     # stack, so this nesting takes its own. Without this the inner drain would
     # shrink the buffer the outer one is walking.
-    drainDue()
+    drainDue(false)
     return
   gDraining = true
-  takeDue(gDue)
+  takeDue(gDue, false)
   runDue(gDue, false)
   gDraining = false
 
@@ -3620,7 +3771,7 @@ proc runFrameBench() =
   let c0 = perfCounter()
   for i in 0 ..< slow:
     enqueue(cb, nothing, 0'u64, BenchModIndex, false)
-    takeDue(scratch)
+    takeDue(scratch, false)
   let c1 = perfCounter()
 
   # D: one frame of an armed `everyMain` chain -- the mod re-queues itself and
@@ -4215,6 +4366,50 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
   if i == gNtCloseSlot:
     ntSettingsCloseEntered(regs)
     return 0'i32
+  # THE RAID-LOAD TIMELINE, PREFIX half. Mirrored from `patchReturned` because
+  # loadperf's table is MIXED: three of its 33 rows use more than four register
+  # slots (ProfileDataLoader::Apply 6, TarkovApplication::LoadMapAndData 7,
+  # InGameMemoryManagement::Collect 6) and are therefore bound PREFIX -- a
+  # postfix there would make the ORIGINAL read its stack arguments out of the
+  # thunk's frame. `lpSlotFired` matches by SLOT identity and a slot is only
+  # ever one edge or the other, so no row is stamped twice for one call. The
+  # handler reads no register and touches no game memory, and returns 0 always.
+  if lpSlotFired(int32(i)):
+    return 0'i32
+  # SKIP THE MODE SCREEN: the two READ-ONLY captures, by identity, both host
+  # drains (meth == nil). Both return 0: neither ever changes what the caller
+  # gets and neither suppresses its original. The selection screen is allowed
+  # to build itself completely and is dismissed from a LATER frame by the drain
+  # tick.
+  #
+  # THEY ARE PREFIXES, AND THAT IS NOT A PREFERENCE. MEASURED 2026-09-02 from
+  # the metadata: `CharacterSelectionScreen::ShowSlot` @0x13EFAE0 takes 4
+  # declared arguments, so its compiled call uses SIX register slots, and
+  # `CharacterSelectionScreenController::.ctor` @0x13F0530 takes 6, so it uses
+  # EIGHT. Past four, arguments arrive ON THE STACK, and the postfix thunk
+  # `sub`s its own frame before `call`ing the original -- the original would
+  # then read those arguments out of the thunk's frame. That is exactly the
+  # crash that killed three boots through `EFT.UI.MenuScreen::Show(5-arg)`.
+  # These two were bound POSTFIX for as long as this feature has existed;
+  # `attachDrain`'s gate now refuses that shape outright, so they could not be
+  # bound that way again even by accident.
+  #
+  # NOTHING EITHER HANDLER READS IS LOST BY FIRING AT ENTRY. The .ctor handler
+  # compares `this` (RCX) by pointer identity and dereferences nothing, so it
+  # does not care whether the fields are initialised yet -- it uses the pointer
+  # as an identity token for "a NEW screen exists", which is true from the
+  # first instruction. The ShowSlot handler takes RCX (screen), RDX (slot
+  # view), R8 (gameMode) and R9 (profileData) -- all four are in registers on
+  # both paths -- and the fields it then reads, `_gameMode`@0x160 and
+  # `_profileData`@0x178, are read off the SLOT VIEW THE CALLER HANDED IN,
+  # which the caller populated BEFORE the call. `ShowSlot` is that view's
+  # consumer, not its producer.
+  if i == gModeSkipCtorSlot:
+    modeSkipCtorFired(regs)
+    return 0'i32
+  if i == gModeSkipShowSlot:
+    modeSkipShowSlotFired(regs)
+    return 0'i32
   if i == gBotAiSlot:
     botAiPreActivateFired(regs)
     return 0'i32
@@ -4402,12 +4597,9 @@ proc patchReturned(slot: int32; regs: Il2CppPtr): int32 {.
   if i == gVersionSlot:
     versionBrandFired(regs)
     return 0'i32
-  # SKIP THE MODE SCREEN: the two READ-ONLY postfix captures, by identity and
-  # before the generic postfix path -- both are host drains (meth == nil), so
-  # they must be handled here rather than falling through to the meth-driven
-  # code below. Both return 0: neither ever changes what the caller gets, and
-  # neither suppresses its original. The selection screen is allowed to build
-  # itself completely and is dismissed from a LATER frame by the drain tick.
+  # SKIP THE MODE SCREEN's two captures USED TO BE DISPATCHED HERE, as
+  # POSTFIXES. They are PREFIXES now and live in `patchFired`; see the banner
+  # there and `attachDrain`'s postfix gate for why (6 and 8 register slots).
   # THE RAID-LOAD TIMELINE, by slot identity and before anything else that
   # could allocate. Its handler reads NO register and touches NO game memory --
   # one timestamp and one interlocked counter -- so it needs no guard, and it
@@ -4426,12 +4618,6 @@ proc patchReturned(slot: int32; regs: Il2CppPtr): int32 {.
   # counter and one flag -- so it needs no guard, and it returns 0 always.
   if i == gNtCloseAllSlot:
     ntSettingsCloseAllReturned()
-    return 0'i32
-  if i == gModeSkipCtorSlot:
-    modeSkipCtorFired(regs)
-    return 0'i32
-  if i == gModeSkipShowSlot:
-    modeSkipShowSlotFired(regs)
     return 0'i32
   # The menu mode-text postfix, by identity and for the same reason: a host
   # drain (meth == nil) on `PreloaderUI::Update`. Returns 0 -- it never changes
@@ -5629,13 +5815,48 @@ proc hostPatchTyped(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
 
 proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
                  perFrame: bool; verbose: bool; kind: int32;
-                 postfix: bool = false): bool =
+                 postfix: bool = false; slots: int32 = -1'i32): bool =
   ## Installs one of the host's own detours on the code pointer `fn`, through the
   ## same slot table and detour engine a mod's `patch` uses. Shared by the update
   ## drain, the render drain and the settings probe: the verified static targets
   ## from `aowlspt_bridge.h` (where `meth` is nil, since the firing path indexes
   ## by slot and never reads it) and the by-name candidates (where `meth` is the
   ## resolved `MethodInfo`).
+  ##
+  ## `slots` IS THE POSTFIX SAFETY ARGUMENT, and it is what makes a whole class
+  ## of crash impossible here rather than by convention. It is how many REGISTER
+  ## SLOTS the compiled call uses: `this` (none for a static), the declared
+  ## arguments, and IL2CPP's trailing `MethodInfo*`. Past `PostfixMaxSlots` the
+  ## remaining arguments arrive ON THE STACK, and the postfix thunk in
+  ## `aowlspt_detour.h` `sub`s its own frame before `call`ing the original --
+  ## so the original reads those arguments out of the THUNK'S frame.
+  ##
+  ## MEASURED 2026-09-02: a postfix on `EFT.UI.MenuScreen::Show(5-arg)` (7
+  ## slots) made the original read its fifth argument, `profile`, from
+  ## `[entry_rsp+0x28]`, which under the thunk's `sub rsp,0x98` is the slot the
+  ## thunk parks RAX in -- value 1. Three consecutive boots died in
+  ## `SeasonWidgetData::From` with `Rcx=1`, a Profile that was the integer 1.
+  ##
+  ## `invoke.nim`'s `postfixRefusal` has encoded this rule for a MOD's patch
+  ## since it was written, but it was applied only in `hostPatch`; `attachDrain`
+  ## trusted each caller's `postfix` flag, so the host bound the one detour its
+  ## own engine documents as impossible. It is applied HERE now, at the single
+  ## chokepoint every host detour passes through, which is the only place a
+  ## caller cannot forget it.
+  ##
+  ## Three states, never two:
+  ##   * `slots >= 1` and `<= PostfixMaxSlots` -- a postfix is bound.
+  ##   * `slots > PostfixMaxSlots`             -- REFUSED, loudly.
+  ##   * `slots < 1` with `postfix = true`     -- UNDECLARED, also REFUSED.
+  ## "I could not look" is not a pass: a caller that does not know its target's
+  ## shape has not established that a postfix is safe there, and silently
+  ## downgrading it to a prefix would hand the feature an earlier firing than it
+  ## asked for without saying so. A caller that wants a postfix and gets a
+  ## refusal declines LOUDLY and stays declined.
+  ##
+  ## `slots` is ignored entirely when `postfix` is false: a PREFIX restores rsp
+  ## exactly (`add rsp,0x98 ; jmp *tramp`), so every stack argument is where the
+  ## original expects it, whatever the arity.
   ##
   ## `kind` chooses which detour this is -- 0 update drain, 1 render drain,
   ## 2 settings probe -- i.e. which slot/method globals it sets and which route
@@ -5668,6 +5889,43 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
               elif kind == 27: "loadperf"
               elif kind == 28: "native-tabs"
               else: "main-thread")
+  # THE POSTFIX SLOT GATE. Before the lock, before the slot claim, before any
+  # byte of the target is touched: a postfix whose target uses more register
+  # slots than Win64 has is refused outright. See the doc comment above for the
+  # measured crash this makes impossible.
+  if postfix:
+    var eff = slots
+    if eff < 1'i32 and meth != cast[Il2CppMethod](0):
+      # The by-name path has the `MethodInfo`, so it can derive the count the
+      # same way `postfixRefusal` does rather than make the caller state it.
+      eff = int32(postfixSlots(gRt, meth))
+    if eff < 1'i32:
+      warn "REFUSING the " & what & " POSTFIX detour on " & spec &
+           ": its register-slot count was NOT DECLARED (no `slots` argument " &
+           "and no MethodInfo to derive one from), so nothing here has " &
+           "established that its arguments all arrive in registers. A " &
+           "postfix on a call with stack arguments makes the ORIGINAL read " &
+           "the thunk's own frame where those arguments belong -- measured " &
+           "2026-09-02 on EFT.UI.MenuScreen::Show(5-arg), three dead boots " &
+           "in SeasonWidgetData::From. NOTHING WAS PATCHED, and this feature " &
+           "is declining rather than being silently downgraded to a prefix. " &
+           "Fix: pass `slots` from the target table's own column."
+      return false
+    if eff > int32(PostfixMaxSlots):
+      warn "REFUSING the " & what & " POSTFIX detour on " & spec &
+           ": its compiled call uses " & $eff & " register slots (`this` " &
+           "where there is one, the declared arguments, and IL2CPP's " &
+           "trailing MethodInfo*), and past " & $PostfixMaxSlots & " they " &
+           "arrive ON THE STACK. The postfix thunk subtracts its own frame " &
+           "and CALLS the original, so the original would read " &
+           $(eff - int32(PostfixMaxSlots)) & " of its argument(s) out of " &
+           "that thunk frame -- a plausible integer where a managed object " &
+           "belongs. MEASURED 2026-09-02: exactly this killed three boots on " &
+           "EFT.UI.MenuScreen::Show(5-arg). NOTHING WAS PATCHED. A PREFIX on " &
+           "this method is unaffected and is the fix if entry-time is " &
+           "acceptable; otherwise read the stack arguments at " &
+           "[entry_rsp+0x28+8*(n-4)]."
+      return false
   tablesLock()
   let claimed = cHookClaim()
   if claimed < 0'i32:
@@ -6648,8 +6906,13 @@ proc bindVersionBrand(verbose: bool): bool =
     if verbose:
       info "version brand: PreloaderUI.Awake did not verify on this build"
     return false
+  # 2 register slots: `this` + IL2CPP's trailing MethodInfo*. `Awake` declares
+  # no parameters (metadata parameterCount@34 = 0, not static), so every
+  # argument is in a register and a POSTFIX is safe here. `attachDrain` refuses
+  # the postfix rather than trusting this comment; `tools/drainaudit.py`
+  # re-derives the 2 from the metadata offline.
   if attachDrain("EFT.UI.PreloaderUI::Awake", fn, cast[Il2CppMethod](0),
-                 false, verbose, 3'i32, true):
+                 false, verbose, 3'i32, true, 2'i32):
     okLog "version brand armed on EFT.UI.PreloaderUI::Awake (postfix); the " &
           "bottom-left version label will read \"aowlspt â€” <version>\""
     return true
@@ -8273,20 +8536,42 @@ proc takeModSet() =
         bnSetWanted(cmds)
 
 proc runPending() =
-  ## The host thread's half.
+  ## The host thread's half, and it is now a much smaller half than it was.
   ##
-  ## Silent while the drain hook is bound and firing -- those callbacks belong
-  ## to the game thread now. It stays as the fallback for two cases, and both
-  ## are real: no candidate bound at all, and a hook that bound and then stopped
-  ## firing, which is what happens if the method it bound only exists during a
-  ## raid. A mod whose callbacks stop arriving because a hook went quiet is a
-  ## worse failure than one whose callbacks arrive on the wrong thread, so the
-  ## host takes them back and says so.
+  ## IT RUNS THE HOST'S OWN THREAD-PROOF ENTRIES AND NOTHING ELSE. Not when the
+  ## drain has stalled, not when nothing bound, not ever. There is no thread
+  ## other than the one the drain claimed on which a mod's main-thread callback
+  ## is correct, so "the drain is not firing" cannot be a reason to run it
+  ## somewhere else -- it can only be a reason to WAIT and to say so loudly.
+  ##
+  ## What this used to do, and what it cost (MEASURED 2026-09-02, Unity crash
+  ## reports Crash_2026-09-02_204346544 and _211541986): it called `drainDue()`
+  ## on the host's tick thread whenever `gDrainStalled` was set, and the tick
+  ## loop set that 2 s into every boot because `TarkovApplication::Update` is
+  ## not called until ~15 s. A mod's queued tick then reached
+  ## `UnityEngine.Input::GetKey`, whose native body dereferences Unity's
+  ## per-thread input manager with no null test, and the client died at 8.7 s.
+  ## `main_thread`.`bound` said nothing was wrong the whole time.
+  ##
+  ## A mod that never gets its callback is a feature that does not work; a mod
+  ## that gets it on the wrong thread is a client that dies. The host now
+  ## chooses the first, counts it (`gMqDeferred`), and reports the depth and the
+  ## reason from `mainTick`.
   if cMqCount() == 0'i32:
     return
   if gDrainSlot >= 0 and not gDrainStalled:
+    # The drain still might carry them, so let it. This matters for exactly one
+    # entry -- the thread proof -- and it is the whole value of that entry: if
+    # this thread took it at 0:00:00 it would print "ran on the host's own
+    # thread" and the real Unity-thread proof, which arrives ~15 s later when
+    # `TarkovApplication::Update` is first called, would never be written at
+    # all. `gDrainStalled` is now false during that wait (the state is
+    # `DrainNeverFired`), which is what makes this test say "wait" instead of
+    # "give up". A drain that never fires for the whole session leaves the
+    # proof queued and silent HERE -- the tick loop's health report is what
+    # says so, every 15 s, with the queue depth.
     return
-  drainDue()
+  drainDue(true)
 
 proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   modhost.startClock()
@@ -8356,8 +8641,10 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
          "bridgeSettingsProbe first to confirm the detour engine on this client"
   gDisableDrain = readDrainDisabled()
   if gDisableDrain:
-    warn "bridgeDisableDrain is set: no per-frame detour will be installed; " &
-         "invoke_main runs on the host thread and invoke_render is unavailable"
+    warn "bridgeDisableDrain is set: no per-frame detour will be installed, " &
+         "so NOTHING queued through invoke_main will ever run -- it is not " &
+         "downgraded to the host thread, it is HELD (see runPending) -- and " &
+         "invoke_render is unavailable"
   gUiProbe = readBoolKey("bridgeUiProbe")
   if gUiProbe:
     info "bridgeUiProbe is set: the drain self-test will also instantiate and " &
@@ -9562,11 +9849,14 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
       # running on this thread, which is what it did before any of this existed.
       if not gBridgeEnabled:
         info "main-thread bridge disabled (unstable detour, see gBridgeEnabled);" &
-             " invoke_main runs on the host's own thread"
+             " invoke_main work is QUEUED AND HELD, never run on the " &
+             "host's own thread"
       elif not bindMainDrain(true):
-        warn "no per-frame method could be detoured, so invoke_main runs on " &
-             "the host's own thread (" & $int(gHostThreadId) & ") and not " &
-             "Unity's; a callback that touches a Unity object is unsafe"
+        warn "no per-frame method could be detoured, so there is no thread " &
+             "on which a queued invoke_main callback is safe; the host HOLDS " &
+             "them rather than running them on its own thread (" &
+             $int(gHostThreadId) & "). A mod that gates on " &
+             "aowlspt.host::main_thread.bound simply will not tick"
       # The render-phase drain, tried once here and retried in the tick loop.
       # Its primary target rides a render callback that may only be alive in a
       # raid, so a boot failure is expected in the menu and is not warned about;
@@ -10014,11 +10304,17 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   # Queued from *this* thread, drained by whoever drains. When the two are
   # different threads, the line it writes is the proof -- not the claim -- that
   # `invoke_main` leaves this thread and arrives on Unity's.
-  enqueue(cast[Il2CppPtr](0), cast[Il2CppPtr](0), cNowMs(), -1, true)
+  enqueueHostSafe(cNowMs())
 
   var lastTick = cNowMs()
   gLastFireMs = lastTick
   var nextBindTry = lastTick + 5000'u64
+  # How often the host may repeat the "the drain is not carrying work"
+  # report while the state has not changed. Fifteen seconds, not two: the
+  # first ~15 s of every boot is legitimately `DrainNeverFired`, and a line
+  # a second about a wait the game imposes on us is noise that hides the
+  # line that matters.
+  var nextDrainSay = lastTick
   var nextRenderTry = lastTick + 5000'u64
   # OS-close subclass retry clock (see the tick-loop block below).
   var nextCloseTry = lastTick
@@ -10109,7 +10405,7 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
         # fires on Unity's thread now that there is a drain to carry it. This is
         # the only path that reaches the raid-only fallback target, so without it
         # that target would bind without ever proving itself.
-        enqueue(cast[Il2CppPtr](0), cast[Il2CppPtr](0), now, -1, true)
+        enqueueHostSafe(now)
 
     # The render-phase drain, retried on the same cadence: its render callback is
     # typically raid-time, so it usually binds here rather than at boot. When it
@@ -10126,6 +10422,7 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
     if fires != gLastFire:
       gLastFire = fires
       gLastFireMs = now
+      gLastHealth = DrainLive
       if gDrainStalled:
         gDrainStalled = false
         okLog "the main-thread drain is firing again on " & gDrainMethod
@@ -10141,21 +10438,74 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
           # Only possible if the hooked method were somehow called from this
           # very thread, which would mean it is not the player loop's.
           warn "the drain fires on the host's own thread, so it is not " &
-               "Unity's; invoke_main is no better placed than it was"
+               "Unity's; a callback that touches a Unity object is unsafe " &
+               "even though it is being dispatched"
         else:
           okLog "invoke_main now runs on Unity's main thread (" &
                 gDrainMethod & ")"
-    elif gDrainSlot >= 0 and not gDrainStalled and cMqCount() != 0'i32 and
-         now - gLastFireMs > 2000'u64:
-      # The hook is installed and the game has stopped calling it -- which is
-      # exactly what happens if it bound to something that only exists during a
-      # raid. Callbacks that never arrive are a worse failure than callbacks on
-      # the wrong thread, so this thread takes the queue back and says so.
-      gDrainStalled = true
-      if not gStallReported:
-        gStallReported = true
-        warn "the main-thread drain has not fired for 2s with work queued; " &
-             "running it on the host thread until it comes back"
+    else:
+      # WHY THE DRAIN IS NOT FIRING, in four states rather than one sentence.
+      #
+      # The old code had a single test -- "bound, and the fire count has not
+      # moved for 2 s" -- and one response: take the queue back onto this
+      # thread. Both halves were wrong.
+      #
+      # The clock was wrong because `gLastFireMs` was seeded at host boot, so
+      # before the FIRST firing it measured how long ago the host started, not
+      # how long ago the game stopped. `EFT.TarkovApplication::Update` is
+      # detoured at ~0:00:01, as soon as the runtime can resolve the method, and
+      # is first CALLED at ~15 s, because the behaviour the player loop ticks
+      # does not exist until the preloader has built it. Nothing on our side can
+      # make that happen sooner -- there is no earlier per-frame call on Unity's
+      # thread to bind, which is the whole reason the candidate list exists. So
+      # a 2 s patience against a 15 s wait was wrong BY DESIGN, and the state it
+      # produced was not a stall: nothing had stopped, nothing had started.
+      # `DrainNeverFired` says exactly that and nothing follows from it.
+      #
+      # The response was wrong for the reason in `runPending`. It is gone.
+      let health = int(cMqHealth(int32(gDrainSlot), int32(fires),
+                                 now - gLastFireMs, DrainStallMs))
+      let stalledNow = (health == DrainStalled)
+      if stalledNow != gDrainStalled:
+        gDrainStalled = stalledNow
+      if health != gLastHealth or (cMqCount() != 0'i32 and
+                                   now >= nextDrainSay):
+        # On CHANGE, or every 15 s while work is actually waiting. Silent when
+        # the queue is empty, however unhealthy the drain is: a drain that is
+        # not firing and has nothing to carry is not costing anybody anything,
+        # and a line a second about it would bury the run.
+        let depth = int(cMqCount())
+        if health != DrainLive and depth != 0:
+          nextDrainSay = now + 15000'u64
+          gLastHealth = health
+          warn "the main-thread drain is not carrying work: " &
+               $cMqHealthText(int32(health)) & " (" & gDrainMethod &
+               ", slot " & $gDrainSlot & ", fires " & $fires & ", " &
+               $int((now - gLastFireMs) div 1000'u64) & "s since the count " &
+               "last moved). " & $depth & " callback(s) are QUEUED and are " &
+               "STAYING queued -- " & $gMqDeferred & " dispatch(es) deferred " &
+               "so far. They will run on Unity's thread when it comes back " &
+               "and on no other thread; running them here is the crash of " &
+               "2026-09-02 (Input::GetKey off the main thread)." &
+               (if health == DrainNeverFired:
+                  " This is the ORDINARY state of the first ~15s of a boot " &
+                  "and is not a fault."
+                else: "")
+        else:
+          gLastHealth = health
+
+    # THE COST OF DEFERRING, said out loud. `gMqRefused` only moves when the
+    # queue is at `MqQueueCap` and a mod asked for another callback, which can
+    # only happen if the drain has been silent for a long time -- so this line
+    # is the difference between "work is waiting" and "work has been thrown
+    # away", and those must never look the same in a log.
+    if gMqRefused != gMqRefusedSaid:
+      gMqRefusedSaid = gMqRefused
+      warn "invoke_main REFUSED " & $gMqRefused & " callback(s): the queue is " &
+           "at its cap of " & $MqQueueCap & " because the main-thread drain " &
+           "is not firing (" & $cMqHealthText(int32(gLastHealth)) &
+           "). These callbacks were NOT run anywhere and will not be; the " &
+           "ones already queued still will, on Unity's thread."
 
     if not gAlienReported and cMqAlienFires() > 0'i32:
       gAlienReported = true

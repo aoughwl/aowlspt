@@ -1148,6 +1148,71 @@ moment you need it, either by calling a spawner method that does it for you
 can SPAWN, which is a managed allocation and a vtable storm on whatever path
 asked, and a verdict must not be able to change what it is judging.
 
+**T13a -- `_spawnedObject@0xa0` IS the `AnimatedToggle`. The `+0xd0` hop is
+real but belongs to a DIFFERENT field.** This was contested after the live
+17:38 boot and is now settled by disassembly, because getting it wrong reads
+`AnimatedToggle._offTrigger`-adjacent memory and hands back a plausible
+pointer nothing would catch.
+
+MEASURED `R disasm 0x16bc7f0` (`UIAnimatedToggleSpawner::SpawnObject`):
+
+```
+rdi = base UISpawner`1::SpawnObject()     ; 0x37EA210 -- fills _spawnedObject@0xa0
+rax = this.get_SpawnableToggle()          ; 0x16BC670 -- reads _spawnableToggle@0xc0
+if (rax == null) return
+rcx = [rax+0xa8]                          ; UISpawnableToggle._headerLabel
+rsi = [rax+0xd0]                          ; UISpawnableToggle.Toggle : AnimatedToggle
+[rax+0xd8] = [rcx+0x260]                  ; _originalFontStyle = the label's style
+Toggle::SetToggleGroup(rsi, this._toggleGroup@0xb0, true)   ; 0x55BA150
+Toggle::PlayEffect(rsi, true)                               ; 0x55BA690
+Selectable::set_interactable(rdi, !this._unavailable@0xb8)  ; 0x55AFB40  <-- rdi
+```
+
+`Selectable::set_interactable` takes a `Selectable`, and it is called on
+**`rdi`**, the base `SpawnObject` return -- the value stored in
+`_spawnedObject@0xa0`. `UISpawnableToggle` is **not** a `Selectable`: MEASURED
+`fldoff.py fields EFT.UI.UISpawnableToggle` puts `_sizeLabel@0xb0` exactly
+where `Selectable.m_SpriteState@0xb0` lives, so one type cannot be both.
+Therefore `_spawnedObject@0xa0` is the `AnimatedToggle`.
+
+Two independent confirmations: `ToggleSilently` @`0x16BCBA0` passes
+`get_SpawnedObject`'s return **straight** into `Toggle::Set` and then reads
+`m_Transition@0x50` and `_onTrigger@0x128` off it, with no `+0xd0` anywhere;
+and `get_SpawnableToggle` @`0x16BC670` is MEASURED to load
+`mov rdi, [rbx+0xc0]` -- the serialized PREFAB reference `_spawnableToggle`,
+which is what owns `Toggle@0xd0`. **`+0xd0` applies to `@0xc0`, never to
+`@0xa0`.**
+
+**T13b -- a freshly `Instantiate`d spawner has NOT spawned, and verifying
+before asking hides the whole feature.** MEASURED live (host log 17:38, lines
+873-875): both cloned subtab spawners read `_spawnedObject@0xa0` null-or-dead
+**at build**, a build that refused them both and hid the strip -- "only 0 of 2
+subtabs came out usable". The field is null until somebody asks the lazy
+factory, and a clone has never been asked, so that check was testing for a
+thing whose absence the checker itself caused.
+
+The build step must **ask once, then verify**. Ask with
+`UIAnimatedToggleSpawner::SpawnObject` @`0x16BC7F0` -- UNIQUE and
+**non-generic**, so there is no `MethodInfo*` to supply, unlike
+`get_SpawnedObject` @`0x37EA0C0`, whose shared-generic body needs a real one
+(§5 T5) that a host has no way to obtain. Per the disassembly above, that call
+also performs the `SetToggleGroup` join to the spawner's own
+`_toggleGroup@0xb0`, which is the durable membership. Read the field back
+afterwards rather than trusting the return. Do **not** call it when the field
+already holds a live toggle -- fact #93: a spawner that already has one
+produces a SECOND.
+
+The raw-read-only rule is unchanged everywhere else: identity matching on the
+click path and every verdict read must never call the getter, because the
+getter can CREATE the thing being judged.
+
+**OPEN: is the stock `Control Settings/Toggles` donor itself unspawned** until
+`ControlSettingsTab::Show` runs? If the player never opens Controls, a clone
+of that strip may inherit null fields -- which would make T13b's null the
+*normal* case rather than an accident. Not established offline; the host now
+logs both the clone's and the donor's `_spawnedObject@0xa0` at clone time, so
+the next boot answers it.
+
 **OPEN: what destroys the spawned toggle here.** Not established. Candidates
 are ``UISpawner`1::Cleanup`` (generic body `0x37EA880`) and the settings
 close/tab-init path. The fix above does not depend on the answer -- it is

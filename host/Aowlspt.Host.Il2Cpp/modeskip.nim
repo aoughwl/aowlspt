@@ -22,8 +22,17 @@
 # from `ShowSlot`: `ShowSlot` has arity 4, so `controller` is a STACK argument,
 # and the host's detour thunk saves only RCX..R9.
 #
-#   [0] CharacterSelectionScreen::ShowSlot   @0x13efae0  POSTFIX detour, READ ONLY
-#   [1] ...ScreenController::.ctor           @0x13f0530  POSTFIX detour, READ ONLY
+#   [0] CharacterSelectionScreen::ShowSlot   @0x13efae0  PREFIX detour, READ ONLY
+#   [1] ...ScreenController::.ctor           @0x13f0530  PREFIX detour, READ ONLY
+#
+# BOTH WERE POSTFIXES UNTIL 2026-09-02 AND BOTH WERE UNSAFE AS SUCH. ShowSlot
+# uses 6 register slots and the .ctor 8 (`this` + declared arguments + IL2CPP's
+# trailing MethodInfo*); past FOUR they arrive on the stack, and the postfix
+# thunk `sub`s its own frame before `call`ing the original, so the original
+# reads them from the thunk's frame. Measured on a different site the same day:
+# `EFT.UI.MenuScreen::Show(5-arg)` did exactly this and killed three boots in
+# `SeasonWidgetData::From`. Nothing either handler reads is later than entry --
+# see the dispatch banner in `patchFired`.
 #   [2] ...ScreenController::Submit          @0x13f0bf0  CALLED, never detoured
 #
 # Neither detour ever suppresses its original. The screen is allowed to build
@@ -457,7 +466,7 @@ proc modeSkipSlotBody(a: Il2CppPtr): Il2CppPtr {.
         "Panel.ShowPerks and strands the player on a blank background"
 
 proc modeSkipCtorFired(regs: Il2CppPtr) =
-  ## POSTFIX on `CharacterSelectionScreenController::.ctor`. Captures `this`.
+  ## PREFIX on `CharacterSelectionScreenController::.ctor`. Captures `this`.
   ## This is a single register read and a pointer compare; it dereferences
   ## nothing, so it needs no guarded body of its own.
   if gModeSkipOff or not gModeSkipOn:
@@ -511,7 +520,7 @@ proc modeSkipCtorFired(regs: Il2CppPtr) =
            else: " (Unity's main thread)")
 
 proc modeSkipShowSlotFired(regs: Il2CppPtr) =
-  ## POSTFIX on `EFT.UI.CharacterSelectionScreen::ShowSlot`.
+  ## PREFIX on `EFT.UI.CharacterSelectionScreen::ShowSlot`.
   ##   RCX = this (the screen)   RDX = slotView
   ##   R8  = gameMode (EGameMode) R9 = profileData
   ## The fourth argument, `controller`, is on the STACK and is therefore NOT
@@ -1099,14 +1108,24 @@ proc bindModeSkip(verbose: bool): bool =
 
   # The .ctor first: the controller must be capturable before the first slot is
   # shown, or a matching slot would have nothing to Submit to.
+  # PREFIX, and `postfix = false` here is load-bearing. The .ctor takes SIX
+  # declared arguments, so its compiled call uses EIGHT register slots (`this`
+  # + 6 + MethodInfo*) and four of them arrive on the STACK -- a postfix would
+  # make the original read them out of the thunk's own frame. The handler only
+  # compares `this` by pointer identity, so entry-time is as good as
+  # return-time for it. See `attachDrain`'s postfix gate.
   if not attachDrain("CharacterSelectionScreenController::.ctor", ctorFn,
-                     cast[Il2CppMethod](0), false, verbose, 17'i32, true):
+                     cast[Il2CppMethod](0), false, verbose, 17'i32, false):
     warn "skip mode screen: could not bind the controller .ctor detour; " &
          "nothing else is bound either, because a captured slot with no " &
          "controller cannot be submitted."
     return false
+  # PREFIX, same rule: `ShowSlot` takes FOUR declared arguments, so its call
+  # uses SIX register slots and two arrive on the stack. Everything this
+  # handler reads (RCX/RDX/R8/R9, and the slot view's own fields, which the
+  # CALLER populated) is already valid at entry.
   if not attachDrain("EFT.UI.CharacterSelectionScreen::ShowSlot", slotFn,
-                     cast[Il2CppMethod](0), false, verbose, 18'i32, true):
+                     cast[Il2CppMethod](0), false, verbose, 18'i32, false):
     warn "skip mode screen: the controller .ctor detour bound but ShowSlot " &
          "did not; no slot will ever be captured, so nothing will be skipped."
     return false

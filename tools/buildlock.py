@@ -2135,6 +2135,12 @@ def cmd_verify_artifact(repo, rest):
 # than it already was -- but it does not make it better either.
 
 LINT_EXIT = 7
+DRAIN_EXIT = 9
+    # DISTINCT from LINT_EXIT on purpose. The two pre-flights refuse for
+    # completely different reasons -- nimlint refuses a shape that kills the
+    # COMPILER, drainaudit refuses a shape that kills the CLIENT -- and a
+    # caller (or a script, or the next session) that cannot tell them apart
+    # will fix the wrong thing. 8 is already the internal-crash code.
 INTERNAL_CRASH_EXIT = 8
 LOG_RING = 4000
 
@@ -2271,6 +2277,63 @@ def lint_preflight(repo, strict=False, out=None):
     return LINT_EXIT
 
 
+def drain_preflight(repo, out=None):
+    """0 = go, DRAIN_EXIT = refuse. Prints its reasoning either way.
+
+    `tools/drainaudit.py` refuses a POSTFIX host detour on a call that uses
+    more than four register slots. That shape does not fail the build and does
+    not fail a marker check: it builds cleanly, deploys cleanly, and then kills
+    the client -- measured 2026-09-02, three consecutive boots dead in
+    `SeasonWidgetData::From` because the postfix thunk fed
+    `EFT.UI.MenuScreen::Show(5-arg)` its own frame where argument five belongs.
+
+    So the refusal is here, BEFORE the lock, next to nimlint and for the same
+    reason: a build that must not be deployed should not first spend forty
+    minutes in a queue and then occupy the one serial resource in the checkout.
+
+    INCONCLUSIVE (exit 3, the metadata inputs absent) does NOT refuse the
+    build. It says so instead. Refusing every build on a machine without
+    GameAssembly.dll would make `--no-drain-audit` the default incantation,
+    which is the outcome this whole pre-flight exists to prevent -- but an
+    unchecked build is never reported as a checked one.
+    """
+    w = out.write if out is not None else (lambda s: sys.stdout.write(s))
+    import io as _io
+    try:
+        sys.path.insert(0, os.path.join(repo, "tools"))
+        import drainaudit                                   # noqa: E402
+    except Exception as e:
+        w("drainaudit PRE-FLIGHT NOT PERFORMED: tools/drainaudit.py "
+          "unimportable (%s). The build is NOT being vouched for; it is only "
+          "not being blocked.\n" % e)
+        return 0
+    buf = _io.StringIO()
+    try:
+        rc = drainaudit.audit(repo, drainaudit.GAMEASM_DEFAULT,
+                              drainaudit.METADEC_DEFAULT, quiet=False)
+    except Exception as e:
+        w("drainaudit PRE-FLIGHT NOT PERFORMED: it raised %s: %s. Not a "
+          "pass; building anyway.\n" % (type(e).__name__, e))
+        return 0
+    finally:
+        buf.close()
+    if rc == drainaudit.INCONCLUSIVE:
+        w("drainaudit PRE-FLIGHT INCONCLUSIVE: the metadata inputs are "
+          "absent, so declared register-slot counts were not cross-checked. "
+          "Not a pass; building anyway.\n")
+        return 0
+    if rc != 0:
+        w("\nBUILD REFUSED BEFORE THE LOCK: tools/drainaudit.py found a "
+          "POSTFIX detour on a call with STACK arguments (or a slot count it "
+          "could not check). That shape builds and deploys cleanly and then "
+          "kills the client.\n"
+          "Nothing was built and no lock was taken. Fix the site, or "
+          "`--no-drain-audit` if you are certain this is not it (and then say "
+          "so).\n")
+        return DRAIN_EXIT
+    return 0
+
+
 def run_teed(cmd, cwd, env, ring=LOG_RING):
     """Run the build, pass its output straight through, and keep the tail.
 
@@ -2361,6 +2424,13 @@ def main():
                         "refuses (exit %d) BEFORE taking the lock when the "
                         "tree holds a shape measured to kill nimony without "
                         "naming a file." % LINT_EXIT)
+    p.add_argument("--no-drain-audit", action="store_true",
+                   dest="no_drain_audit",
+                   help="skip the tools/drainaudit.py pre-flight. It refuses "
+                        "(exit %d -- NOT %d, they are different faults) "
+                        "BEFORE taking the lock when a host detour would "
+                        "POSTFIX a call whose arguments do not all fit in "
+                        "registers." % (DRAIN_EXIT, LINT_EXIT))
     p.add_argument("--lint-strict", action="store_true", dest="lint_strict",
                    help="the pre-flight refuses on nimlint WARNINGS too "
                         "(three exist in this tree today, in code that "
@@ -2441,6 +2511,13 @@ def main():
         lrc = lint_preflight(a.repo, strict=a.lint_strict)
         if lrc:
             return lrc
+    # Same place, same reason, different fault: nimlint refuses a shape that
+    # kills the COMPILER, drainaudit refuses one that kills the CLIENT. The
+    # second cannot be caught by building, so it has to be caught here.
+    if not a.no_drain_audit:
+        drc = drain_preflight(a.repo)
+        if drc:
+            return drc
 
     cmd = [aowl_exe(a.repo)] + rest
     if not acquire(path, " ".join(rest), a.wait, a.max_age, a.steal,

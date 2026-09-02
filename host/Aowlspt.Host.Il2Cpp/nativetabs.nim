@@ -467,13 +467,73 @@ var gNtCloseInFlight = false
 var gNtCloseUnreturnedSaid = false
 var gNtKbDonorKey = ""                ## the row template's own key caption
 var gNtGfxEdgeSaid = false
+var gNtSpawnerMissSaid = false
 
 proc ntSpawnerToggleNow(spawner: Il2CppPtr): Il2CppPtr =
-  ## The CURRENT toggle of one spawner, or nil. One guarded raw read of
-  ## `_spawnedObject@0xa0` plus the Unity-alive test -- never the property
-  ## getter, which would SPAWN (T13). Everything below funnels through this so
-  ## there is exactly one place that knows the offset.
+  ## The CURRENT LIVE toggle of one spawner, or nil -- for STATE reads.
+  ## Raw `_spawnedObject@0xa0` plus the game's own `m_CachedPtr@0x10` test,
+  ## never the property getter, which would SPAWN (T13).
   nuSpawnerCurrentToggle(spawner)
+
+proc ntSpawnerEnsureToggle(spawner: Il2CppPtr; who: string): Il2CppPtr =
+  ## BUILD-TIME ONLY: return the spawner's toggle, CREATING it if there is
+  ## none yet. Never called from a drain, a tick or a verdict.
+  ##
+  ## THE MEASURED DEFECT THIS FIXES (host log 17:38, lines 873-875): both
+  ## cloned subtab spawners read `_spawnedObject@0xa0` as null-or-dead AT
+  ## BUILD, so the build refused both and hid the strip -- "only 0 of 2
+  ## subtabs came out usable". The strip never appeared at all.
+  ##
+  ## The refusal was right about the fact and wrong about the moment. T13 says
+  ## the spawner is a LAZY factory: the field stays null until somebody asks,
+  ## and a freshly `Instantiate`d spawner has never been asked. Verifying
+  ## before asking is checking for a thing whose absence we ourselves caused.
+  ##
+  ## So the build ASKS ONCE. `UIAnimatedToggleSpawner::SpawnObject` @0x16BC7F0
+  ## is UNIQUE, non-generic and already in the target table, so there is no
+  ## shared-generic `MethodInfo*` hazard -- unlike `get_SpawnedObject`
+  ## @0x37EA0C0, whose generic body needs a real `MethodInfo*` we have no way
+  ## to supply. MEASURED (`R disasm 0x16bc7f0`) it does exactly what is
+  ## wanted: base `SpawnObject` (which fills `_spawnedObject@0xa0`), then
+  ## `SetToggleGroup(tog, this._toggleGroup@0xb0, true)` and
+  ## `set_interactable`. The header caption is applied by the caller
+  ## afterwards, as it already was.
+  ##
+  ## THE READ COMES FIRST AND IS OBEYED. If a toggle is already there we do
+  ## NOT spawn -- fact #93: calling `SpawnObject` on a spawner that already
+  ## has one produces a SECOND toggle, which is the extra unlabelled
+  ## rectangle this file has reaped before.
+  result = ntSpawnerToggleNow(spawner)
+  if result != nil:
+    return
+  if spawner == nil:
+    return
+  ntCallBegin("UIAnimatedToggleSpawner::SpawnObject (" & who & ")")
+  discard nuSpawnerSpawn(spawner)
+  ntCallEnd()
+  # VERIFY BY RE-READING THE FIELD, not by trusting the return. The whole
+  # point of T13 is that the field is the authority and a returned pointer is
+  # a snapshot; and `SpawnObject`'s own return is a different local from the
+  # thing it stored, so reading back is the only way to know the field took.
+  result = ntSpawnerToggleNow(spawner)
+  if result == nil:
+    warn "gfx strip: asked '" & who & "' spawner " & iPtr(spawner) &
+         " to SpawnObject and _spawnedObject@0xa0 STILL reads null or " &
+         "Unity-dead afterwards. That is not the lazy-factory case -- the " &
+         "spawn itself did not take -- so this subtab has no toggle and " &
+         "cannot be made to work."
+
+proc ntSpawnerToggleId(spawner: Il2CppPtr): Il2CppPtr =
+  ## The spawner's toggle for POINTER IDENTITY ONLY, on the game's click path.
+  ##
+  ## Deliberately does NOT test liveness: a pointer that equals the `this` of
+  ## a `Toggle::Set` currently executing is alive by construction, and the
+  ## liveness test used to be `Object::op_Implicit` -- a managed call issued
+  ## from inside a prefix drain for EVERY toggle in the game. That call is the
+  ## prime suspect for the live 17:38 miss, where the stock GraphicsToggle
+  ## press fell through to the by-name branch with
+  ## "the spawner read did not match".
+  nuSpawnerSpawnedRaw(spawner)
 
 proc ntTabToggleNow(i: int): Il2CppPtr =
   ## Our i-th TOP-ROW tab's live toggle.
@@ -563,7 +623,7 @@ proc ntToggleSetFired(regs: Il2CppPtr) =
   # classified `matched-as=other`.
   var i = 0
   while i < gNtSpawnerComp.len and i < NtMaxTabs:
-    if ntTabToggleNow(i) == selfPtr:
+    if ntSpawnerToggleId(gNtSpawnerComp[i]) == selfPtr:
       # ONLY THE ON EDGE, and this is the measured order, not a preference.
       # §2.3: pressing B while A is on runs `A.Set(false, sendCallback)` from
       # INSIDE `B.Set`, with the flag propagated VERBATIM -- so every OFF edge
@@ -583,7 +643,7 @@ proc ntToggleSetFired(regs: Il2CppPtr) =
   # silent for every foreign toggle.
   var j = 0
   while j < gNtSubSpawner.len and j < NtMaxSubs:
-    if ntSubToggleNow(j) == selfPtr:
+    if ntSpawnerToggleId(gNtSubSpawner[j]) == selfPtr:
       # ONLY THE ON EDGE IS A PRESS. This drain is a PREFIX, and a press on
       # one subtab makes the cloned ToggleGroup call Set(false, true) on the
       # OTHER one from inside the first call -- so the nested OFF arrives
@@ -625,7 +685,7 @@ proc ntToggleSetFired(regs: Il2CppPtr) =
       return
     j = j + 1
   # THE CONTROLS>MODS SUBTAB, on the same postfix as everything else.
-  if gNtKbSpawner != nil and ntSpawnerToggleNow(gNtKbSpawner) == selfPtr:
+  if gNtKbSpawner != nil and ntSpawnerToggleId(gNtKbSpawner) == selfPtr:
     gNtKbPressed = (if turnedOn: 1 else: 0)
     return
   # NAME THE EVENT, ONCE PER DISTINCT TOGGLE. Every toggle in the game funnels
@@ -634,8 +694,8 @@ proc ntToggleSetFired(regs: Il2CppPtr) =
   # actually arrived and how each one was classified.
   var matchedAs = "other"
   if gNtGfxTabSpawner != nil and
-     ntSpawnerToggleNow(gNtGfxTabSpawner) == selfPtr:
-    matchedAs = "graphics(live spawned toggle)"
+     ntSpawnerToggleId(gNtGfxTabSpawner) == selfPtr:
+    matchedAs = "graphics(spawned-object identity)"
   # MATCH BY NAME TOO, not only by the pointer captured at build. A spawner
   # respawns its toggle, so a cached pointer can go stale while the button on
   # screen is the same button -- and a stale pointer fails silently, which is
@@ -655,6 +715,33 @@ proc ntToggleSetFired(regs: Il2CppPtr) =
     # it an orphan again. The spawner is what gets remembered, and it is
     # remembered at build time and never revised.
     matchedAs = "graphics(by name -- the spawner read did not match)"
+    # AND IT MUST SAY WHY, ONCE. Live at 17:38 this branch fired for the stock
+    # GraphicsToggle and the log could only report that the read "did not
+    # match" -- a symptom, not a cause, and it cost a round trip. These four
+    # numbers separate every candidate cause from every other. Printed once
+    # per session, and never on a matching event.
+    if not gNtSpawnerMissSaid:
+      gNtSpawnerMissSaid = true
+      let raw = nuSpawnerSpawnedRaw(gNtGfxTabSpawner)
+      let alt = (if nuOk(raw, 0xd8'i32): cNuGetRef(raw, 0xd0'i32) else: nil)
+      warn "native subtabs SPAWNER-IDENTITY MISS on the stock GraphicsToggle:" &
+           " spawner=" & iPtr(gNtGfxTabSpawner) &
+           " _spawnedObject@0xa0=" & iPtr(raw) &
+           " [that+0xd0]=" & iPtr(alt) &
+           " event this=" & iPtr(selfPtr) &
+           ". _spawnedObject@0xa0 IS the AnimatedToggle -- PROVEN from " &
+           "R disasm 0x16bc7f0, where the base SpawnObject return is handed " &
+           "to Selectable::set_interactable, and UISpawnableToggle is NOT a " &
+           "Selectable (its _sizeLabel@0xb0 collides with " &
+           "Selectable.m_SpriteState@0xb0, so one type cannot be both). The " &
+           "+0xd0 hop printed here for comparison belongs to " &
+           "_spawnableToggle@0xc0, the serialized PREFAB that " &
+           "get_SpawnableToggle @0x16BC670 reads (mov rdi,[rbx+0xc0]) -- NOT " &
+           "to @0xa0. READ IT THIS WAY: if `this` equals the @0xa0 value, our " &
+           "gate is at fault; if it equals the +0xd0 value, this build's " &
+           "layout is not what the disassembly says and nothing here should " &
+           "be trusted until that is settled; if it equals neither, this " &
+           "spawner does not own the toggle that fired."
   var known = false
   var si = 0
   while si < gNtSeenToggles.len and si < NtMaxSeenToggles:
@@ -1558,22 +1645,42 @@ proc ntBuildGfxStrip(screenT: Il2CppPtr): bool =
     # here without us writing anything.
     discard modsSetActive(cgo, true)
     let sp = modsComponent(c, "UIAnimatedToggleSpawner")
-    let tog = (if sp != nil: ntSpawnerToggleNow(sp) else: modsToggleOf(c))
+    # SAY WHAT THE CLONE ARRIVED HOLDING, before we touch it. The 17:38 boot
+    # could not distinguish "the clone came out empty" from "the donor strip
+    # was itself never spawned" (the stock Controls strip is plausibly
+    # unspawned until `ControlSettingsTab::Show` runs, and the player may
+    # never have opened Controls). One raw read each answers it for good.
+    let donorSp = (if donorC != nil:
+                     modsComponent(donorC, "UIAnimatedToggleSpawner") else: nil)
+    okLog "gfx strip: at clone time '" & caption & "' spawner=" & iPtr(sp) &
+          " _spawnedObject@0xa0=" & iPtr(nuSpawnerSpawnedRaw(sp)) &
+          "; its DONOR spawner=" & iPtr(donorSp) & " _spawnedObject@0xa0=" &
+          iPtr(nuSpawnerSpawnedRaw(donorSp)) & ". A null on the donor means " &
+          "the stock Controls strip has not been shown this session and had " &
+          "nothing to clone; a null on ours alone means Instantiate did not " &
+          "carry the reference. Either way the next line spawns it."
+    # ASK ONCE, THEN VERIFY (T13's lazy factory). Refusing before asking is
+    # what hid the whole strip at 17:38.
+    let tog = (if sp != nil: ntSpawnerEnsureToggle(sp, caption)
+               else: nil)
     # NO SPAWNER MEANS NO STABLE IDENTITY (T13). A subtab whose toggle can
     # only ever be named by a pointer we captured is a subtab that will stop
     # responding the first time that toggle is replaced -- which is exactly
-    # what the 15:42 boot measured. Refusing is the honest answer; shipping it
-    # would be shipping the defect back.
+    # what the 15:42 boot measured. Refusing is still the honest answer HERE,
+    # but only after the spawn has actually been attempted.
     if sp == nil or tog == nil:
       warn "gfx strip: '" & caption & "' has " &
            (if sp == nil: "no UIAnimatedToggleSpawner component"
-            else: "a spawner whose _spawnedObject@0xa0 is null or Unity-dead") &
-           ", so its live toggle cannot be re-resolved at press time and the " &
-           "subtab would go dead the moment the spawner replaced it. " &
-           "Switching it off rather than shipping a button that stops working."
+            else: "a spawner that produced no toggle even after SpawnObject") &
+           ", so its live toggle cannot be resolved at press time and the " &
+           "subtab would be dead. Switching it off rather than shipping a " &
+           "button that does nothing."
       discard modsSetActive(cgo, false)
       b = b + 1
       continue
+    # FACT #93: a cloned spawner can arrive already carrying the donor's
+    # toggle AND then spawn a second. Reap back to the donor's child count.
+    discard ntReapSpawnerClone(c, donorC, caption)
     # THE SPAWNER'S OWN GROUP FIELD IS THE DURABLE ONE, and under T13 that
     # distinction decides whether this survives a respawn.
     #
@@ -2950,8 +3057,11 @@ proc ntBindCloseProbe(verbose: bool): bool =
     return
   let a = attachDrain("EFT.UI.Settings.SettingsScreen::Close", fnClose,
                       cast[Il2CppMethod](0), false, verbose, 30'i32)
+  # 2 register slots (`this` + MethodInfo*); `CloseAll()` declares no
+  # parameters, so the postfix thunk moves nothing.
   let b = attachDrain("EFT.UI.Settings.SettingsScreen::CloseAll", fnAll,
-                      cast[Il2CppMethod](0), false, verbose, 31'i32, true)
+                      cast[Il2CppMethod](0), false, verbose, 31'i32, true,
+                      2'i32)
   if a and b:
     okLog "native tabs: bound the settings CLOSE pair -- a PREFIX on " &
           "SettingsScreen::Close @0x1720B10 and a POSTFIX on " &

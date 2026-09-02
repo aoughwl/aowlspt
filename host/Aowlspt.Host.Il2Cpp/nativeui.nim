@@ -1065,29 +1065,63 @@ proc nuToggleSetQuiet*(toggle: Il2CppPtr; on: bool): bool =
   cNuCallVPBB(fn, toggle, (if on: 1'i32 else: 0'i32), 0'i32)
   true
 
-proc nuSpawnerCurrentToggle*(spawner: Il2CppPtr): Il2CppPtr =
-  ## THE CURRENT spawned `AnimatedToggle` of a `UIAnimatedToggleSpawner`, read
-  ## fresh. Trap T13: there is no such thing as a stable spawned-toggle
-  ## pointer, so there is no legitimate place to cache one.
+proc nuSpawnerSpawnedRaw*(spawner: Il2CppPtr): Il2CppPtr =
+  ## `_spawnedObject@0xa0`, RAW, with NO liveness call and NO managed call of
+  ## any kind. This is the one used for POINTER IDENTITY on the game's click
+  ## path, and both properties matter.
   ##
-  ## A RAW READ OF `_spawnedObject@0xa0`, NOT a call to `get_SpawnedObject`,
-  ## and the difference is the whole design. MEASURED `R disasm 0x37ea0c0`:
-  ## the property getter is a LAZY FACTORY -- when the field is null or the
-  ## object behind it is Unity-dead it calls `SpawnObject` through the vtable,
-  ## re-runs `SetHeaderText`/`SetMinWidth`/`SetEllipsis`, and rewrites the
-  ## field. That is a managed allocation and a vtable storm on whatever path
-  ## asked, and a verdict that can CREATE the object it is judging is the
-  ## purest form of a check that cannot fail. The raw read observes; it never
-  ## changes anything.
+  ## `_spawnedObject@0xa0` IS THE `AnimatedToggle`, not a wrapper. PROVEN from
+  ## `R disasm 0x16bc7f0` (`UIAnimatedToggleSpawner::SpawnObject`):
   ##
-  ## The Unity-alive test is the same one the getter uses (`m_CachedPtr@0x10`),
-  ## so a dead toggle comes back as nil here rather than as a plausible pointer
-  ## whose `m_IsOn` reads 0 forever.
+  ##     rdi = base UISpawner`1::SpawnObject()      ; the spawned object
+  ##     rax = get_SpawnableToggle()                ; reads _spawnableToggle@0xc0
+  ##     rcx = [rax+0xa8]                           ; UISpawnableToggle._headerLabel
+  ##     rsi = [rax+0xd0]                           ; UISpawnableToggle.Toggle
+  ##     ...
+  ##     Selectable::set_interactable(rdi, ...)     ; <-- on the BASE RETURN
+  ##
+  ## `set_interactable` takes a `Selectable`, and `UISpawnableToggle` is not
+  ## one -- its own `_sizeLabel@0xb0` collides with `Selectable.m_SpriteState`
+  ## @0xb0, so the two layouts cannot both be that type. Therefore the base's
+  ## return -- the thing stored in `_spawnedObject@0xa0` -- is Selectable-
+  ## shaped, i.e. the `AnimatedToggle`. `ToggleSilently` @0x16BCBA0 agrees
+  ## independently: it hands `get_SpawnedObject`'s return straight to
+  ## `Toggle::Set` and then reads `m_Transition@0x50` and `_onTrigger@0x128`
+  ## off it.
+  ##
+  ## THE `+0xd0` HOP IS REAL BUT BELONGS TO A DIFFERENT FIELD. `Toggle@0xd0`
+  ## is a field of `UISpawnableToggle` (MEASURED, `fldoff.py fields
+  ## EFT.UI.UISpawnableToggle`), and `SpawnObject` reaches it from
+  ## `_spawnableToggle@0xc0` -- the serialized PREFAB reference read by
+  ## `get_SpawnableToggle` @0x16BC670 (`mov rdi, [rbx+0xc0]`) -- NOT from
+  ## `_spawnedObject@0xa0`. Applying `+0xd0` to `@0xa0` would read
+  ## `AnimatedToggle._offTrigger`-adjacent memory and hand back a string-ish
+  ## pointer that no check here would catch.
+  ##
+  ## NO MANAGED CALL, and that is a fix, not an optimisation. This used to end
+  ## in `nuAlive`, i.e. `Object::op_Implicit` -- an il2cpp call issued from
+  ## inside the `Toggle::Set` PREFIX drain, for every toggle in the game, on
+  ## the click path. If `nuFn(NuTObjAlive)` ever refuses, that returns false
+  ## and the match silently fails; and for a pure identity comparison the
+  ## question is meaningless anyway, because a pointer that EQUALS the `this`
+  ## of a `Set` currently executing is alive by construction.
   result = nil
   if not nuOk(spawner, NuOffSpawnerSpawnedObj + 8'i32): return
-  let tog = cNuGetRef(spawner, NuOffSpawnerSpawnedObj)
+  result = cNuGetRef(spawner, NuOffSpawnerSpawnedObj)
+
+proc nuSpawnerCurrentToggle*(spawner: Il2CppPtr): Il2CppPtr =
+  ## The current spawned `AnimatedToggle`, or nil if there is none yet or the
+  ## one there is has been destroyed. For STATE reads (`m_IsOn`), where a dead
+  ## object must not be mistaken for a live one that happens to read 0.
+  ##
+  ## The liveness test is `m_CachedPtr@0x10 != 0`, read RAW -- which is
+  ## exactly and only what `get_SpawnedObject` itself tests
+  ## (`cmp qword ptr [rdi+0x10], 0` at 0x37EA17B) before deciding to respawn.
+  ## Using the same test as the game costs no call and cannot disagree with it.
+  result = nil
+  let tog = nuSpawnerSpawnedRaw(spawner)
   if not nuOk(tog, NuOffToggleIsOn + 4'i32): return
-  if not nuAlive(tog): return
+  if cNuGetRef(tog, 0x10'i32) == nil: return    # m_CachedPtr: Unity-destroyed
   result = tog
 
 proc nuSpawnerToggleSilently*(spawner: Il2CppPtr; on: bool): bool =

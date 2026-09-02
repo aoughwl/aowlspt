@@ -8815,3 +8815,92 @@ use, so a handler that allocates and frees entirely within one foreign-thread
 call may well be safe; a handler that FREES memory allocated on the init
 thread, or that hands a pointer back across the boundary, is the case that
 would not be. Not measured, and deliberately left unchanged.
+
+## 2026-09-02: every POSTFIX host detour, its register-slot count, and the three that were hazards
+
+**Hand-maintained** (like the sections above; `tools/factexport.py` will drop
+it on a regeneration).
+
+### The rule
+
+A method's compiled IL2CPP call uses `this` (none for a static) + its declared
+arguments + the trailing `MethodInfo*` register slots. Win64 passes four in
+registers; the rest go on the STACK. The host's POSTFIX thunk in
+`abi/aowlspt_detour.h` cannot tail-jump into the original — it must regain
+control afterwards — so it does `sub rsp,0x98` and then `call *tramp`. The
+original therefore runs at a **different rsp** and reads its stack arguments
+out of the thunk's own frame.
+
+`invoke.nim`'s `postfixRefusal` (`PostfixMaxSlots = 4`) encoded this from the
+start, but was applied only in `hostPatch`. `attachDrain` trusted each caller's
+`postfix` flag, so the host bound the one detour shape its own engine documents
+as impossible. It is enforced in `attachDrain` now, and offline by
+`tools/drainaudit.py`, which refuses the build.
+
+### The census — every `attachDrain(..., postfix=true)` site in `host/` and `mods/`
+
+Slot counts derived offline from `Il2CppMethodDefinition.parameterCount@34` and
+`flags@28 & STATIC` on build 1.1.0.1.46777 (`tools/il2cpp_resolve.py` over the
+per-image `methodPointers` map, matched by RVA). The derivation independently
+reproduces the measured 7 for `MenuScreen::Show(5-arg)`.
+
+| site | target | RVA | slots | verdict |
+|---|---|---|---:|---|
+| `aowlhost.nim` version brand (kind 3) | `EFT.UI.PreloaderUI::Awake` | `0x1569A20` | 2 | ok, postfix |
+| `modetext.nim` (kind 13) | `EFT.UI.PreloaderUI::Update` | `0x1569F20` | 2 | ok, postfix |
+| `nativetabs.nim` (kind 31) | `SettingsScreen::CloseAll` | `0x17207A0` | 2 | ok, postfix |
+| `settingsui.nim` (kind 7) | `SettingsScreen::ShowScreen` | `0x1720DE0` | 3 | ok, postfix |
+| `invoke2.nim` (kind 9) | `SettingsScreen::ShowScreen` | `0x1720DE0` | 3 | ok, postfix |
+| `uihooks.nim` site 0 | `MatchmakerOfflineRaidScreen::Show` | `0x1788590` | 3 | ok, postfix |
+| `uihooks.nim` site 1 | `MenuScreen::Awake` | `0x1538360` | 2 | ok, postfix (site not wanted for other reasons) |
+| `uihooks.nim` site 2 | `MenuScreen::Show` (5-arg) | `0x15387A0` | **7** | **HAZARD — fixed to PREFIX earlier today, commit 3e30117** |
+| `uihooks.nim` sites 3–6 | the four Matchmaker `Show`s | — | 3 | ok, postfix |
+| `uihooks.nim` site 7 | `MenuScreen::ShowInRaid` | `0x1539650` | 2 | ok, postfix |
+| `uihooks.nim` site 8 | `SessionEndUI::Awake` | `0x1726850` | 2 | ok, postfix |
+| `modeskip.nim` (kind 18) | `CharacterSelectionScreen::ShowSlot` | `0x13EFAE0` | **6** | **HAZARD — now PREFIX** |
+| `modeskip.nim` (kind 17) | `CharacterSelectionScreenController::.ctor` | `0x13F0530` | **8** | **HAZARD — now PREFIX** |
+| `loadperf.nim` row 5 | `ProfileDataLoader::Apply` | `0x9A75D0` | **6** | **HAZARD — now PREFIX** |
+| `loadperf.nim` row 12 | `TarkovApplication::LoadMapAndData` | `0x984620` | **7** | **HAZARD — now PREFIX** |
+| `loadperf.nim` row 29 | `InGameMemoryManagement::Collect` | `0x55E7C30` | **6** | **HAZARD — now PREFIX** |
+| `loadperf.nim` — the other 30 rows | — | — | 1–4 | ok, postfix |
+
+**`mods/` has no unsafe postfix.** The two mod-side postfixes go through
+`installPatch`, which already applied `postfixRefusal`:
+`FirearmController::get_AimingSensitivity` @`0x7773F0` and `Aiming::get_IsReady`
+@`0x1AD48C0`, both 2 slots.
+
+### What changed with each fix
+
+* **modeskip** — both handlers read only RCX/RDX/R8/R9 and the `.ctor` one
+  dereferences nothing, so entry-time is as informative as return-time. The
+  ShowSlot handler's field reads (`_gameMode@0x160`, `_profileData@0x178`) are
+  off the **slot view the caller handed in**, which the caller populated before
+  the call — `ShowSlot` is that view's consumer, not its producer. Dispatch
+  moved from `patchReturned` to `patchFired`.
+* **loadperf** — the table now carries a `slots` column, rows over four bind
+  PREFIX, and `gLpAtEntry` records which edge each row was stamped on. Every
+  timeline line prints `(ENTRY)` or `(return)`. A timeline that silently mixed
+  the two would be a measurement that cannot be wrong.
+* `lpSlotFired` is dispatched from **both** `patchFired` and `patchReturned`;
+  a slot is only ever one edge, so no row is stamped twice.
+
+### The check that fails closed
+
+`tools/drainaudit.py` (falsifier `tools/test_drainaudit.py`, registered in
+`tools/selftests.py`) parses the `slots` columns and every `attachDrain` call
+site, re-derives each count from the metadata, and exits 1 on any postfix over
+four. `tools/buildlock.py` runs it before taking the lock; refusal is **exit 9**,
+deliberately distinct from nimlint's 7, because nimlint refuses a shape that
+kills the *compiler* and this refuses one that kills the *client*.
+
+Two things it found about itself while being written, both the
+check-that-cannot-fail shape:
+
+* the table parser required a struct **tag**, so `aowl_uih_sites` — an
+  anonymous `typedef struct { … } AowlUihSite;`, and the one table that already
+  had a slots column — contributed **zero** of its nine rows while the summary
+  printed PASS. There is now a cross-check: a C accessor returning `.slots` with
+  no parsed rows in its file is a FAIL.
+* the Nim scanner treated `'` as a string delimiter. Nim spells a typed literal
+  `8'i32`, so the scanner desynchronised and reported a hundred lines of
+  unrelated source as five sites' `slots` argument.

@@ -54,6 +54,12 @@ proc cBridgeSettingsTabTargetAt(i: int32): Il2CppPtr {.
   importc: "aowl_bridge_settingstab_target_at", nodecl.}
 proc cBridgeSettingsTabTargetName(i: int32): Il2CppPtr {.
   importc: "aowl_bridge_settingstab_target_name", nodecl.}
+## The row's REGISTER-SLOT count. `attachDrain`'s postfix gate needs it, and it
+## comes from the target table's own column rather than from a literal here, so
+## the number a postfix is bound on is the number the table declares and
+## `tools/drainaudit.py` re-derives from the metadata. 0 = undeclared, refused.
+proc cBridgeSettingsTabTargetSlots(i: int32): int32 {.
+  importc: "aowl_bridge_settingstab_target_slots", nodecl.}
 
 # The slot/flag/guard globals (gSettingsUiSlot / gSettingsUiProbe /
 # gSettingsUiDone) are declared in aowlhost.nim beside the other detour slots.
@@ -527,7 +533,8 @@ proc bindSettingsTabProbe(verbose: bool): bool =
         info "settings tab-init target " & $i & " did not verify on this build"
       continue
     let spec = readCString(cBridgeSettingsTabTargetName(int32(i)))
-    if attachDrain(spec, fn, cast[Il2CppMethod](0), false, verbose, 7'i32, true):
+    if attachDrain(spec, fn, cast[Il2CppMethod](0), false, verbose, 7'i32,
+                   true, cBridgeSettingsTabTargetSlots(int32(i))):
       okLog "settings-UI control probe (Phase 1.8) armed POSTFIX on " & spec &
             "; open Settings and click each tab -- every control's label, klass " &
             "and value-widget pointer is logged as the tab is built"

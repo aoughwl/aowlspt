@@ -134,6 +134,11 @@ ITEMS = [
     T("test_startup_race.py", "fast"),                 # 4.2s
     T("test_supervise.py", "fast"),                    # 5.7s
     T("test_deploy.py", "fast"),                       # the gate's own tests
+    T("test_drainaudit.py", "fast"),                   # 3.9s with metadata
+    # Compiles abi/aowlspt_mqpolicy.h with gcc and EXECUTES it, so the rule
+    # that no main-thread work runs off the drain thread is tested rather
+    # than asserted. INCONCLUSIVE, never PASS, without a C compiler.
+    T("test_mqpolicy.py", "fast"),                     # 1.5s, needs gcc
 
     # ---- fast self-tests --------------------------------------------------
     S("botaudit.py", "fast"),                          # 0.1s
@@ -236,6 +241,19 @@ VERIFIERS = [
       "read, so PRESENT is not the only reachable answer"),
     V("hostcfg.py", "test_hostcfg_falsifier.py",
       "breaks the key table and asserts hostcfg's own --selftest goes red"),
+    V("test_mqpolicy.py", "test_mqpolicy.py",
+      "case F recompiles the SAME header with -DAOWL_MQ_FALSIFY, restoring the "
+      "pre-2026-09-02 'a stalled drain may run its work here' policy, and "
+      "asserts the stalled-on-host case then answers 1. A green run whose "
+      "negative control is also green reports INCONCLUSIVE, not PASS"),
+    V("drainaudit.py", "test_drainaudit.py",
+      "a fixture tree whose POSTFIX site declares SEVEN register slots -- the "
+      "measured EFT.UI.MenuScreen::Show(5-arg) crash shape -- must come back "
+      "FAIL, and a 4-slot one must not, so the limit is shown to bite at "
+      "exactly one stack argument rather than always. It also asserts a "
+      "declared column that DISAGREES with the metadata fails, and that an "
+      "accessor whose table the parser cannot see fails instead of passing "
+      "vacuously -- which is the hole that really existed"),
     V("uihooks_check.py", "test_uihooks_falsifier.py",
       "feeds a per-frame action trail and asserts FAIL, so PASS is not the "
       "only reachable verdict"),

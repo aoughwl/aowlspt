@@ -1048,8 +1048,10 @@ proc bindModeText(verbose: bool): bool =
           "EFT.UI.PreloaderUI::Update detour (slot " & $gModeTextSlot &
           ") -- one detour, one trampoline, both features live"
     return true
+  # 2 register slots (`this` + MethodInfo*); `Update` declares no parameters.
+  # See `attachDrain`'s postfix gate -- it refuses rather than trusts.
   if attachDrain("EFT.UI.PreloaderUI::Update", fn, cast[Il2CppMethod](0),
-                 false, verbose, 13'i32, true):
+                 false, verbose, 13'i32, true, 2'i32):
     okLog "menu mode text CLAIMED the shared EFT.UI.PreloaderUI::Update " &
           "detour (slot " & $gModeTextSlot & ", postfix); the debug overlay " &
           "will ride on this same detour if it is turned on later. The " &

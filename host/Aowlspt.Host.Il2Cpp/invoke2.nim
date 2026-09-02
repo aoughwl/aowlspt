@@ -615,7 +615,8 @@ proc bindManagedInvoke(verbose: bool): bool =
         info "invoke2: tab-init target " & $i & " did not verify on this build"
       continue
     let spec = readCString(cBridgeSettingsTabTargetName(int32(i)))
-    if attachDrain(spec, fn, cast[Il2CppMethod](0), false, verbose, 9'i32, true):
+    if attachDrain(spec, fn, cast[Il2CppMethod](0), false, verbose, 9'i32,
+                   true, cBridgeSettingsTabTargetSlots(int32(i))):
       okLog "managed-invoke probe armed POSTFIX on " & spec &
             "; open Settings and click a tab to run the five-step " &
             "direct-RVA invocation ladder (every step guarded; a fault is " &
