@@ -60,7 +60,8 @@
 #include <windows.h>
 #include <stdint.h>
 
-#define AOWL_PMN_SS_CLOSE_RVA 0x1720B10u
+#define AOWL_PMN_SS_CLOSE_RVA    0x1720B10u
+#define AOWL_PMN_TOGGLE_SET_RVA  0x55BA450u
 
 typedef struct AowlPmnTarget {
     const char*   name;
@@ -75,12 +76,58 @@ static const AowlPmnTarget aowl_pmn_targets[] = {
       { 0x40,0x53, 0x48,0x83,0xEC,0x20,
         0x80,0x3D,0x02,0xD9,0x99,0x05,0x00,
         0x48,0x8B,0xD9 }, 16 },
+
+    /* [1] UnityEngine.UI.Toggle::Set(bool value, bool sendCallback)
+     * APPENDED AT THE END. Index 0 keeps its meaning; tools/idxbind.py checks
+     * that the Nim constant naming each row still resolves to the row it names.
+     *
+     * WHY THIS IS HERE, MEASURED 2026-09-02. autoraid pressed an
+     * `EFT.UI.AnimatedToggle` by reading a UnityEvent at component+0x100 and
+     * calling `UnityEvent::Invoke` on it, which is what `arOnClickOff` returns
+     * for every klass that is not a DefaultUIButton. That offset is WRONG for
+     * this klass and the client died of it, twice, deterministically, on the
+     * first frame the toggle was found (the SEH guard caught it; the host log
+     * says `faulted ... at step SIDE, in: walking the pmc/scav containers and
+     * pressing`).
+     *
+     * `EFT.UI.AnimatedToggle` derives from `UnityEngine.UI.Toggle`, whose
+     * layout (tools/fldoff.py, offline) is
+     *      0x100  toggleTransition   ToggleTransition   <- AN ENUM, not an event
+     *      0x108  graphic            Graphic
+     *      0x110  m_Group            ToggleGroup
+     *      0x118  onValueChanged     ToggleEvent        <- the real event
+     *      0x120  m_IsOn             bool
+     * so +0x100 reads a small integer (0/1/2), which passes a null check, is
+     * not a GameObject and is not a known klass -- every guard `arPress` has --
+     * and is then CALLED as a UnityEvent. A plausible non-null value that is
+     * not a pointer is the worst input those guards can get.
+     *
+     * So a toggle is now SET through the game's own method instead of having
+     * an event fired at a guessed offset:
+     *   RVA         0x55BA450   (VA 0x1855BA450)
+     *   sharedness  UNIQUE (owners=1)
+     *   section     il2cpp
+     *   attrs       PRIVATE|HIDEBYSIG -- non-virtual, so a direct call at the
+     *               RVA is the only dispatch and there is no override hazard.
+     *   arity 2     RCX=this(Toggle), DL=value, R8B=sendCallback, R9=MethodInfo*
+     *   bytes  48 89 5C 24 08 | 48 89 74 24 10 | 57 | 48 83 EC 20 | 80
+     *          mov [rsp+8],rbx ; mov [rsp+0x10],rsi ; push rdi ; sub rsp,0x20
+     *
+     * `sendCallback = true` on purpose: the point of pressing the control is to
+     * run the handler the screen attached to it. Calling `set_isOn` @0x55BA430
+     * instead was considered and rejected -- it is an 11-byte tail-jump thunk
+     * into this same body (docs/AOWL_FACTS.md), so it buys nothing and is worse
+     * to reason about. */
+    { "UnityEngine.UI.Toggle::Set", AOWL_PMN_TOGGLE_SET_RVA,
+      { 0x48,0x89,0x5C,0x24,0x08, 0x48,0x89,0x74,0x24,0x10,
+        0x57, 0x48,0x83,0xEC,0x20, 0x80 }, 16 },
 };
 
 #define AOWL_PMN_TARGET_COUNT \
     ((int32_t)(sizeof(aowl_pmn_targets) / sizeof(aowl_pmn_targets[0])))
 
-#define AOWL_PMN_T_SS_CLOSE 0
+#define AOWL_PMN_T_SS_CLOSE   0
+#define AOWL_PMN_T_TOGGLE_SET 1
 
 static int32_t aowl_pmn_verified = 0;
 static int32_t aowl_pmn_rejected = 0;
@@ -139,6 +186,19 @@ typedef void (*AowlPmn_Close)(void*, void*);
 static void aowl_pmn_call_close(void* fn, void* screen) {
     if (!fn || !screen) return;
     ((AowlPmn_Close)fn)(screen, NULL);
+}
+
+/* Instance, arity 2: RCX = this, DL = value, R8B = sendCallback, R9 = the
+ * hidden trailing MethodInfo*. `Set` is not generic, so a NULL MethodInfo is
+ * correct; it is passed EXPLICITLY rather than left to whatever is in R9.
+ * The bools are widened to uint64 -- the callee reads the low byte of each
+ * register, which is exactly what the Win64 convention delivers. */
+typedef void (*AowlPmn_ToggleSet)(void*, uint64_t, uint64_t, void*);
+static void aowl_pmn_call_toggle_set(void* fn, void* toggle,
+                                     int32_t value, int32_t sendCallback) {
+    if (!fn || !toggle) return;
+    ((AowlPmn_ToggleSet)fn)(toggle, (uint64_t)(value ? 1 : 0),
+                            (uint64_t)(sendCallback ? 1 : 0), NULL);
 }
 
 #endif /* AOWLSPT_PREMENU_H */

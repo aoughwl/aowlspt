@@ -7105,3 +7105,155 @@ pressing` -> autoraid switched itself off. The crumb instrumentation added
 this pass named both sites on the first run; without it these would have
 been three anonymous "guarded tick body faulted" lines. The fault budget is
 shared across steps, so one PRE-MENU fault reduced SIDE's budget to two.
+
+## 2026-09-02: SetLabelText sets the LABEL, not the KEY -- and the poll was flag-gated
+
+Two separate measurements on the 4,785,152 deploy, from `acceptance.py` and
+`hostlog.py` on the same boot:
+
+* the host log shows **14** `settings pages: row caption '...' written to all 3
+  of the clone's TextMeshProUGUI ... none still read the donor's 'Interface
+  language'` -- every one a success, each noting `1 of 3 carried their OWN
+  LocalizedText and were written through it`.
+* acceptance on that same screen: **14** hits of 'Interface language' on
+  `(Clone)(Clone)` rows.
+
+Exact match. Writing the child's own LocalizedText through
+`LocalizedText::SetLabelText @0x140FE70` **is not durable**: it sets the
+displayed label, not the localisation KEY, so the component re-resolves the
+donor's string on its next refresh. The relabel's negative check is honest and
+still useless on its own, because it runs microseconds after the write and the
+clobber comes later. **A read taken before the only event that can falsify it
+is not a check** -- this is the same defect as the first entry above, one level
+down, and it will keep recurring at every level until the check is the poll or
+acceptance rather than the writer.
+
+`hostcfg.py show`: **`settingsModsTab off`, `settingsPages on`.** The re-assert
+poll -- the one mechanism that undoes the clobber -- sat inside
+`modsTabTickBody` behind `if not gModsOn`, the MODS TAB's flag, while the rows
+that needed it belong to `settingsPages`. It returned on the first line of the
+tick for the whole session. Registering into it was a no-op.
+
+The registry is shared by two features, so the poll is now gated on the
+REGISTRY (it already returns immediately when empty) and on the FAULT budget,
+never on one feature's flag. A flag is a preference; a fault count is evidence.
+
+### The 8 -> 1 tab clones is NOT the relabel work
+
+`acceptance.py` also reported `top-row mod tab clones -- 1 active clone(s),
+want 8`. Measured, three ways: `hostlog.py grep "switched off"` returns **zero**
+lines, so nothing was deactivated; `native tabs` logged `built the 'PROOF' tab
+-- a real UIAnimatedToggleSpawner in the STOCK ToggleGroup ... which is the
+entire difference from the cloned-strip approach this replaces`; and
+`git diff --stat` shows **123 uncommitted lines** in `nativetabs.nim` from
+another agent's in-flight rework, compiled into this artifact. The old design
+made 8 strip clones; the new one deliberately makes ONE. The assertion is
+measuring a superseded design and was left ALONE rather than edited to match --
+relaxing a check to fit the build is how a real regression gets hidden.
+
+## 2026-09-02: maps `draw: FAIL` at the MAIN MENU was a check whose negative meant "no raid"
+
+MEASURED on every boot tonight, ~41 s in, at the main menu with no raid:
+
+    warn Maps: diag NOT-PASS: placement:INCONCLUSIVE, unifiedPane:INCONCLUSIVE,
+    renderer:INCONCLUSIVE, ... draw:FAIL, drawCost:INCONCLUSIVE, ...
+
+Every other line in the block read INCONCLUSIVE, correctly. Only `draw` said
+FAIL, and it added "This is the reason the radar is not on screen".
+
+**What it actually measured.** The old ladder in `mapsDiagText` was: HUD
+registered? callback invoked at least once? `hudDrawn() == 0` -> **FAIL**. At the
+menu all three hold: the shared region dispatches the draw callback every frame
+regardless of lifecycle, and the callback correctly submits nothing because
+there is no raid. So the branch fired on a state that is not a defect, and there
+was **no input at the menu for which it could have said anything else** -- the
+exact shape of CLAUDE.md 9b. It then also drove the `STILL NOT-PASS` warn every
+60 s for the whole menu session, because that line only re-announces while some
+verdict is not-PASS.
+
+**The gate.** `activeRaid(gSnap)` -- state==3 AND a validated local pose AND
+`localAlive` -- was already computed three lines above for the `raid` line and
+was simply not consulted by `draw`. The ladder now lives in
+`mods/maps/diagfilter.nim` as the pure `drawVerdict()`, and is gated so that:
+
+* `drawn > 0` -> PASS **regardless of the gate**, so a raid that drew and then
+  ended keeps its earned PASS instead of decaying back to "I could not look";
+* `drawn == 0` and the gate CLOSED -> INCONCLUSIVE naming `activeRaidWhy`;
+* `drawn == 0` and the gate OPEN -> **FAIL, unchanged text**. That branch is
+  still reachable and the suite feeds it.
+* region not armed (`sharedRegion` off) is now its own INCONCLUSIVE instead of
+  being folded into the FAIL, which used to blame the mod for a host flag.
+
+**The repeat schedule** is now `diagStep()`, also pure and also in
+`diagfilter.nim`: in a raid a standing not-PASS still warns every 30 cycles
+(60 s) forever; **outside a raid it is announced once per host phase**. The
+phase name is part of `diagSignature`, so a phase change re-prints the whole
+block anyway -- the menu case costs one warn per phase instead of one per
+minute. An all-PASS block still heartbeats every 150 cycles in both cases,
+because silence must never be the same thing as health.
+
+**The drift hazard that was also closed.** `tests/mapsdiag.nim` replayed its
+110-block corpus through a *copy* of the `mod 30` / `mod 150` ladder written
+inside the test. The shipped schedule could have changed without the corpus
+noticing. The replay now calls the shipped `diagStep` with the gate OPEN (the
+corpus is a raid session), and the menu schedule is asserted separately.
+
+**Verified offline**, `installer\build\mapsdiag.exe`: 62 checks pass, and both
+mutation controls fire --
+* forcing the raid branch to the INCONCLUSIVE arm (`elif not raidLive` ->
+  `elif true`) fails with *"read INCONCLUSIVE in a live raid with 0 draws -- the
+  FAIL is no longer reachable"*;
+* applying the menu schedule to raids too (`if raidLive` -> `if false`) fails
+  with *"600 raid cycles with a standing FAIL warn 20 times (every 60s) --
+  warned 0 time(s)"*.
+
+A fix that merely deleted the FAIL branch passes the first new check and fails
+the second. That pairing is the point.
+
+## 2026-09-02: firing a UnityEvent at +0x100 on an AnimatedToggle is an access violation -- Toggle::Set is the way
+
+MEASURED live on the 4,785,152-byte build: two deterministic faults at step SIDE,
+in the crumb `walking the pmc/scav containers and pressing`, on the first frame
+the toggle was reachable (the true-BFS build is the first that reached it), plus
+one recovered fault at PRE-MENU in `pressing the SettingsScreen BackButton`. The
+three together tripped the SESSION-wide budget of 3 and disabled autoraid.
+
+**Cause, found offline with `tools/fldoff.py fields EFT.UI.AnimatedToggle`:** it
+derives from `UnityEngine.UI.Toggle`, whose layout is
+
+    0x100  toggleTransition   ToggleTransition   <- AN ENUM, not an event
+    0x108  graphic            Graphic
+    0x110  m_Group            ToggleGroup
+    0x118  onValueChanged     ToggleEvent        <- the real event
+    0x120  m_IsOn             bool
+
+`arOnClickOff` returns the generic **0x100** for every klass that is not a
+`DefaultUIButton`, so the press read a small integer (0/1/2) and called
+`UnityEvent::Invoke` on it. That value is not null, is not a GameObject and is
+not a known klass -- it passes **every** guard `arPress` has. A plausible
+non-pointer is the worst input a pointer guard can be given, and the comment in
+`arOnClickOff` asserting that AnimatedToggle "keeps the generic 0x100" was
+reasoning, never a measurement.
+
+**The route now is `UnityEngine.UI.Toggle::Set(bool value, bool sendCallback)`
+@`0x55BA450`** -- UNIQUE (owners=1), section `il2cpp`, PRIVATE|HIDEBYSIG so
+non-virtual and free of the override hazard, arity 2 (`RCX=this, DL=value,
+R8B=sendCallback, R9=MethodInfo*`), prologue
+`48 89 5C 24 08 | 48 89 74 24 10 | 57 | 48 83 EC 20 | 80`. Called with
+`sendCallback = true`, because running the screen's handler is the entire point.
+`set_isOn` @`0x55BA430` was rejected: it is an 11-byte tail-jump into this same
+body. The fix lives in `arPress`, so **both** call sites -- the side selector and
+the map tiles in SELECT-MAP -- stop invoking the enum; SELECT-MAP had the same
+latent crash and had simply never reached a tile.
+
+Two other durable lessons from the same run:
+
+* **A fault budget must be PER STEP.** One PRE-MENU fault that the retry
+  recovered from spent a third of the machine's whole session budget, so two
+  unrelated SIDE faults then disabled everything. Budgets are now
+  `array[step, int]`, three each, and the refusal names the step and the crumb.
+* **Re-validate the node at the point of the press.** `arPress` now re-checks
+  `duOk` AND `iUnityAlive` on the node itself, not only on the component: the
+  node was found on an earlier line, and a screen torn down in between stays
+  readable with `m_CachedPtr` zeroed (fact #182), which is the likeliest shape
+  of the once-then-works PRE-MENU fault.

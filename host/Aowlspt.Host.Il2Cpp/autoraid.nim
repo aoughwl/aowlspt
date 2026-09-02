@@ -184,17 +184,26 @@ proc cPmnBadCount(): int32 {.importc: "aowl_pmn_bad_count", nodecl.}
 proc cPmnProfullCount(): int32 {.importc: "aowl_pmn_profull_count", nodecl.}
 proc cPmnCallClose(fn, screen: Il2CppPtr) {.
   importc: "aowl_pmn_call_close", nodecl.}
+proc cPmnCallToggleSet(fn, toggle: Il2CppPtr; value, sendCallback: int32) {.
+  importc: "aowl_pmn_call_toggle_set", nodecl.}
 
 const
   # The row name is the WHOLE doc comment on purpose: tools/idxbind.py reads it
   # as the row this index claims to address and fails the build if the C table
-  # ever stops agreeing. RVA 0x1720B10, arity 0, UNIQUE -- in the header.
+  # ever stops agreeing. RVAs, arities and prologues are in the header.
   PmnTSsClose = 0'i32   ## EFT.UI.Settings.SettingsScreen::Close
+  PmnTToggleSet = 1'i32   ## UnityEngine.UI.Toggle::Set
 
 # ---- state (gArOn / gArMap are set in the flag-reading pass in aowlhost.nim) ----
 var gArOn = false                  ## the `uxAutoRaid` flag; DEFAULT OFF
 var gArOff = false                 ## self-disabled after faults / a timed-out step
 var gArFaults = 0
+## A FAULT BUDGET PER STEP, not one budget for the whole machine. MEASURED
+## 2026-09-02: one PRE-MENU fault (which the retry then recovered from) plus two
+## SIDE faults tripped the session-wide budget of three and switched the whole
+## feature off, so a recovered fault in one step spent another step's budget.
+## Sized ArFailed+1 so every step id indexes it.
+var gArStepFaults: array[ArFailed + 2, int]
 var gArMap = "Woods"               ## `autoRaidMap`
 var gArStep = ArWaitMenu
 var gArT0 = 0'u64                  ## first-tick time (for warm-up)
@@ -266,6 +275,14 @@ proc arCrumbName(c: int): string =
   of 18: "NEXT: pressing the NextButton"
   of 19: "the step timeout census"
   of 20: "SIDE: pressing this screen's own NextButton"
+  of 21: "SIDE: breadth-first walk for the pmc/scav containers"
+  of 22: "SIDE: breadth-first walk INSIDE the wanted side's scope"
+  of 23: "SIDE: GetComponent probe on a candidate node"
+  of 24: "SIDE: reading DefaultUIButton._text @0xB8"
+  of 25: "SIDE: pressing the side control"
+  of 26: "PRE-MENU: walking the SettingsScreen subtree for BackButton"
+  of 27: "PRE-MENU: GetComponent probe on a back-control candidate"
+  of 28: "PRE-MENU: firing the BackButton OnClick"
   else:  "unknown (" & $c & ")"
 
 proc arStepName(s: int): string =
@@ -586,12 +603,45 @@ proc arFindNext(exclude: Il2CppPtr): Il2CppPtr =
 # log, not the inspector output channel). Nothing is blind-called: the component
 # is resolved, the UnityEvent slot read and validated, then Invoke.
 # ---------------------------------------------------------------------------
+proc arSetToggleComp(comp: Il2CppPtr): bool =
+  ## `UnityEngine.UI.Toggle::Set(true, true)` @0x55BA450 -- the game's own way
+  ## to turn a toggle on, byte-verified against the startup prologue snapshot.
+  ##
+  ## THIS REPLACES FIRING A UNITYEVENT AT +0x100 ON A TOGGLE, WHICH KILLED THE
+  ## CLIENT. MEASURED 2026-09-02: `EFT.UI.AnimatedToggle` derives from
+  ## `UnityEngine.UI.Toggle`, whose 0x100 is `toggleTransition`, an ENUM --
+  ## `onValueChanged` is at 0x118 and `m_IsOn` at 0x120 (tools/fldoff.py). So
+  ## the generic `arOnClickOff` slot read a small integer, which is not null,
+  ## not a GameObject and not a known klass -- it passes every guard `arPress`
+  ## has -- and called it as a UnityEvent. Two deterministic access violations
+  ## at step SIDE, on the first frame the toggle was found.
+  result = false
+  if comp == nil or not iUnityAlive(comp): return
+  let fn = cPmnFn(PmnTToggleSet)
+  if fn == nil:
+    warn "autoRaid: Toggle::Set @0x" & hexOf(uint64(cPmnRva(PmnTToggleSet))) &
+         " did NOT verify against the startup prologue snapshot on this " &
+         "build; REFUSING to call it. The toggle was NOT pressed, and the " &
+         "old +0x100 UnityEvent route is not a fallback -- it is the bug."
+    return false
+  cPmnCallToggleSet(fn, comp, 1'i32, 1'i32)
+  result = true
+
 proc arPress(node: Il2CppPtr; compType: string): bool =
   result = false
   if node == nil: return
+  # RE-VALIDATE AT THE POINT OF USE. The node was found on an earlier line, and
+  # between the walk and here the screen may have been torn down: a destroyed
+  # object stays READABLE with `m_CachedPtr` zeroed (fact #182), so `duOk`
+  # alone hands back a corpse and the GetComponent below faults inside Unity.
+  if not duOk(node, 0x20'i32) or not iUnityAlive(node): return
   var comp: Il2CppPtr = nil
   var w = ""
   if not iVisComponent(node, compType, comp, w) or comp == nil: return
+  # A TOGGLE IS SET, NEVER INVOKED. Both call sites -- the side selector and the
+  # map tiles -- go through here, so the fix lands in one place.
+  if compType == "AnimatedToggle":
+    return arSetToggleComp(comp)
   let off = arOnClickOff(compType)            # 0x120 for DefaultUIButton, else 0x100
   if not duOk(comp, off + 8'i32) or not iUnityAlive(comp): return
   let ev = cReadPtrAt(comp, off)
@@ -850,6 +900,7 @@ proc arBtnCaption(comp: Il2CppPtr): string =
   ## not be read as one. "" means NOT READABLE, and the caller must never treat
   ## that as a caption.
   result = ""
+  gArCrumb = 24
   if comp == nil or not duOk(comp, 0xC0'i32): return
   let sp = cReadPtrAt(comp, 0xB8'i32)
   if sp != nil and not iIsKnownKlass(cast[uint64](sp)) and duOk(sp, 0x18'i32):
@@ -915,7 +966,12 @@ proc arPressUnityButton(comp: Il2CppPtr): bool =
   result = true
 
 proc arPressAny(node, comp: Il2CppPtr; compType: string): bool =
-  ## Press `node`, by whichever route its klass calls for.
+  ## Press `node` by whichever route its klass calls for. Three klasses, three
+  ## routes, each measured:
+  ##   EFT.UI.DefaultUIButton    OnClick UnityEvent @+0x120  (arPress)
+  ##   EFT.UI.AnimatedToggle     Toggle::Set(true,true)      (arPress -> Set)
+  ##   UnityEngine.UI.Button     Button::Press @0x539A7A0    (the game's path)
+  ## There is no generic route, because the generic route is what faulted.
   if compType == "Button":
     return arPressUnityButton(comp)
   result = arPress(node, compType)
@@ -956,6 +1012,7 @@ proc arPressSideUnder(scr: Il2CppPtr; want: string; nSeen: var int;
   # Phase 1 -- the container(s), breadth-first from the screen.
   var all: seq[Il2CppPtr] = @[]
   var b0 = ArNodeBudget
+  gArCrumb = 21
   arCollectAllActive(scr, ArSideDepth, b0, cNowMs() + ArWalkMs, all,
                      ArMaxSideBtns)
   var cont: Il2CppPtr = nil
@@ -1004,6 +1061,7 @@ proc arPressSideUnder(scr: Il2CppPtr; want: string; nSeen: var int;
   var nodes: seq[Il2CppPtr] = @[]
   var b2 = ArNodeBudget
   nodes.add scope                             # the scope itself may carry it
+  gArCrumb = 22
   arCollectBFS(scope, ArSideDeepDepth, b2, cNowMs() + ArWalkMs, nodes,
                ArMaxSideProbe, skip)
   var hit: Il2CppPtr = nil
@@ -1012,6 +1070,7 @@ proc arPressSideUnder(scr: Il2CppPtr; want: string; nSeen: var int;
   var ni = 0
   while ni < nodes.len:
     var comp: Il2CppPtr = nil
+    gArCrumb = 23
     let ct = arButtonOn(nodes[ni], comp)
     if ct.len > 0:
       nSeen = nSeen + 1
@@ -1041,6 +1100,7 @@ proc arPressSideUnder(scr: Il2CppPtr; want: string; nSeen: var int;
           "UnityEngine.UI.Button (" & $nodes.len & " active node(s) probed, " &
           "cap " & $ArMaxSideProbe & "). NOTHING WAS PRESSED"
     return false
+  gArCrumb = 25
   if arPressAny(hit, hitComp, hitType):
     okLog "autoRaid SIDE: pressed the " & hitType & " on `" &
           iObjName(hit) & "` for side \"" & want & "\", chosen STRUCTURALLY " &
@@ -1212,9 +1272,11 @@ proc arPressBackUnder(ss: Il2CppPtr; names: var string; nSeen: var int;
     why = "no live SettingsScreen to search"
     return false
   var b = ArNodeBudget
+  gArCrumb = 26
   let back = arWalkActive(ss, "BackButton", ArFindDepth, b,
                           cNowMs() + ArWalkMs, nil)
   if back != nil:
+    gArCrumb = 28
     if arPress(back, "DefaultUIButton"):
       return true
     why = "the SettingsScreen's own ACTIVE `BackButton` was found, but its " &
@@ -1225,6 +1287,7 @@ proc arPressBackUnder(ss: Il2CppPtr; names: var string; nSeen: var int;
   # that reads like a back control, so the refusal carries evidence.
   var nodes: seq[Il2CppPtr] = @[]
   var b2 = ArNodeBudget
+  gArCrumb = 27
   arCollectAllActive(ss, ArSideDepth, b2, cNowMs() + ArWalkMs, nodes,
                      ArMaxSideBtns)
   nSeen = nodes.len
@@ -2179,10 +2242,16 @@ proc autoRaidDrainTick() =
   gArFrames = 0
   if cArTickGuarded(nil) == nil:
     inc gArFaults
-    warn "autoRaid: the guarded tick body faulted (" & $gArFaults & " of " &
-         $ArMaxFaults & ") at step " & arStepName(gArStep) & ", in: " &
+    let st = (if gArStep >= 0 and gArStep < gArStepFaults.len: gArStep
+              else: ArFailed + 1)
+    gArStepFaults[st] = gArStepFaults[st] + 1
+    warn "autoRaid: the guarded tick body faulted (" & $gArStepFaults[st] &
+         " of " & $ArMaxFaults & " for step " & arStepName(gArStep) &
+         "; " & $gArFaults & " in the session across all steps), in: " &
          arCrumbName(gArCrumb) & ". The crumb is set immediately before each " &
          "operation that touches live managed memory, so this names WHERE it " &
-         "died rather than only THAT it died."
-    if gArFaults >= ArMaxFaults:
-      arFail("too many faults")
+         "died rather than only THAT it died. THE BUDGET IS PER STEP: a fault " &
+         "one step recovered from must not spend another step's budget."
+    if gArStepFaults[st] >= ArMaxFaults:
+      arFail("step " & arStepName(gArStep) & " faulted " & $gArStepFaults[st] &
+             " times, in: " & arCrumbName(gArCrumb))
