@@ -7076,3 +7076,21 @@ Still UNKNOWN and logged rather than assumed: whether the bare
 `AnimatedToggle` is the control that does. With the real BFS the toggle is now
 reachable and is PREFERRED; the log names which klass was pressed, and the
 offline raid screen's own side display is the thing that settles it.
+
+## 2026-09-02 05:45: the native proof tab is selectable and exclusive -- step 1 of nativetabs is proven
+
+MEASURED (build 4,785,152, Settings open): `40 of 40 donor row(s) destroyed`
+under the cloned panel; `PROOF: pressed OUR tab through Toggle::Set(true,
+sendCallback=true)`; 20 frames later `VERDICT PASS (after pressing OUR tab):
+our tab is selected and OUR panel is the only active panel under
+SettingsScreen -- nt-proof (OURS). Read back off the live GameObjects`; then
+GAME pressed back. Stock SettingsList geometry byte-identical to the
+feature-off baseline throughout. The two FAIL verdicts (before pressing,
+after GAME back) count Caption/SaveButton/BackButton/RevertButton/
+BindContainer as "panels"; only `Game Settings` is one, so the stock state is
+one active panel and the predicate, not the screen, is wrong.
+Lessons that made it build: never call SettingsTab::CleanupCreatedControls
+or Behaviour::set_enabled on a fresh clone (both throw managed exceptions
+that unwind through our frame with no SEH fault); read component fields off
+the COMPONENT, not the Transform; a reap cap that can be hit silently is how
+8 donor rows survived.
