@@ -54,6 +54,7 @@ import tempfile
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 
 import buildlock  # noqa: E402
@@ -1455,6 +1456,650 @@ def test_proc_table_real():
           not nc["truncated"] and nc["error"] is None, str(nc))
 
 
+ART_REL = "host/Aowlspt.Host.Il2Cpp/bin/aowlspt-host-il2cpp.dll"
+
+
+def make_artifact_repo(tmp, name, writes=True, rc=0, payload="one",
+                       remove=True, extra=None):
+    """A repo with its OWN tools/deploy.json and a stand-in `aowl` that
+    reproduces the measured behaviour: it REMOVES the declared artifact before
+    (maybe) writing it, then exits with a chosen code.
+
+    That removal is the whole incident. A driver that merely failed to write
+    would not reproduce it, because the previous build's file would still be
+    sitting there and the check would pass for the wrong reason.
+
+    Returns `(repo, artifact_path)`, or `(None, None)` if the copied
+    interpreter will not run -- INCONCLUSIVE, not a pass.
+    """
+    repo = os.path.join(tmp, name)
+    os.makedirs(os.path.join(repo, "tools"), exist_ok=True)
+    arts = [{"name": "host", "src": ART_REL, "dst": "aowlspt-host-il2cpp.dll",
+             "markers": []}]
+    arts.extend(extra or [])
+    with open(os.path.join(repo, "tools", "deploy.json"), "w",
+              encoding="utf-8", newline="\n") as f:
+        json.dump({"install": "D:\\nowhere", "artifacts": arts}, f)
+    bin_dir = os.path.join(repo, "installer", "build")
+    os.makedirs(bin_dir, exist_ok=True)
+    exe = os.path.join(bin_dir, "aowl.exe")
+    shutil.copy(sys.executable, exe)
+    art = os.path.join(repo, ART_REL.replace("/", os.sep))
+    with open(os.path.join(repo, "build"), "w", encoding="utf-8",
+              newline="\n") as f:
+        f.write("import os, sys\n"
+                "art = %r\n"
+                "os.makedirs(os.path.dirname(art), exist_ok=True)\n"
+                "if %r and os.path.exists(art):\n"
+                "    os.unlink(art)\n"
+                "if %r:\n"
+                "    open(art, 'w').write(%r)\n"
+                "sys.exit(%d)\n" % (art, remove, writes, payload, rc))
+    probe = subprocess.run([exe, "-c", "print('ok')"],
+                           capture_output=True, text=True)
+    if probe.returncode != 0 or "ok" not in probe.stdout:
+        return None, None
+    return repo, art
+
+
+def build_in(repo, *args):
+    r = subprocess.run([sys.executable, BL, "--repo", repo] + list(args),
+                       capture_output=True, text=True, timeout=180)
+    return r.returncode, r.stdout + r.stderr
+
+
+def test_artifact_check(tmp):
+    """Exit 0 is a claim about a PROCESS. The artifact is a different question.
+
+    MEASURED five times on 2026-09-02: a queued build removed the previous
+    build's DLL and then failed, and this script had already reported `ok` to
+    the agent now reading an absent file.
+
+    Every verdict below is paired with a control that makes the opposite
+    verdict fire from the same code path, because a refusal that cannot be
+    turned off is indistinguishable from a refusal that always fires.
+    """
+    print("\nartifact check: a build's exit 0 is not the artifact's existence")
+    repo, art = make_artifact_repo(tmp, "art-ok")
+    if repo is None:
+        check("INCONCLUSIVE: no runnable stand-in driver, nothing was tested",
+              False, "the copied python.exe would not start")
+        return
+
+    rc, out = build_in(repo, "build", "host")
+    check("a build that WRITES its artifact still exits 0", rc == 0,
+          "rc=%d\n%s" % (rc, out[-600:]))
+    check("success prints the artifact path, size and sha256",
+          ART_REL in out and "sha256" in out and " bytes" in out,
+          out[-600:])
+    side = os.path.join(art + ".built.json")
+    check("a sidecar was written beside the artifact", os.path.exists(side),
+          side)
+    if os.path.exists(side):
+        with open(side, encoding="utf-8") as f:
+            doc = json.load(f)
+        real = buildlock.sha256_file(art)
+        check("the sidecar's sha256 is the file's real sha256",
+              doc.get("sha256") == real,
+              "%r vs %r" % (doc.get("sha256"), real))
+        check("the sidecar records target/pid/size/started/finished/git_head",
+              doc.get("target") == "build host"
+              and isinstance(doc.get("pid"), int)
+              and doc.get("size") == os.path.getsize(art)
+              and doc.get("finished", 0) >= doc.get("started", 1)
+              and "git_head" in doc,
+              json.dumps(doc)[:300])
+
+    # THE INCIDENT. Same command, same repo shape, a driver that removes the
+    # artifact and produces nothing while still exiting 0.
+    repo2, art2 = make_artifact_repo(tmp, "art-absent", writes=False)
+    rc2, out2 = build_in(repo2, "build", "host")
+    check("a build that exits 0 with NO artifact is REFUSED",
+          rc2 == buildlock.ARTIFACT_ABSENT_EXIT,
+          "rc=%d (wanted %d)\n%s" % (rc2, buildlock.ARTIFACT_ABSENT_EXIT,
+                                     out2[-600:]))
+    check("it says BUILT BUT ARTIFACT ABSENT", "BUILT BUT ARTIFACT ABSENT"
+          in out2, out2[-600:])
+    check("and it writes no sidecar for a file that is not there",
+          not os.path.exists(art2 + ".built.json"), art2)
+
+    # STALE: the artifact exists, but it is the PREVIOUS build's. The driver
+    # neither removes nor writes, so the only thing distinguishing this from
+    # the passing case above is the mtime.
+    repo3, art3 = make_artifact_repo(tmp, "art-stale", writes=False,
+                                     remove=False)
+    os.makedirs(os.path.dirname(art3), exist_ok=True)
+    with open(art3, "w", encoding="utf-8", newline="\n") as f:
+        f.write("an earlier build's output\n")
+    old = time.time() - 3600
+    os.utime(art3, (old, old))
+    rc3, out3 = build_in(repo3, "build", "host")
+    check("an artifact older than the build that 'produced' it is REFUSED",
+          rc3 == buildlock.ARTIFACT_STALE_EXIT,
+          "rc=%d (wanted %d)\n%s" % (rc3, buildlock.ARTIFACT_STALE_EXIT,
+                                     out3[-600:]))
+    check("it says ARTIFACT STALE (mtime before build start)",
+          "ARTIFACT STALE (mtime before build start)" in out3, out3[-600:])
+
+    # CONTROL for the staleness rule: the identical pre-existing file, but this
+    # time the build rewrites it. If this failed, the rule would be firing on
+    # existence rather than on mtime.
+    repo4, art4 = make_artifact_repo(tmp, "art-fresh", writes=True,
+                                     remove=False)
+    os.makedirs(os.path.dirname(art4), exist_ok=True)
+    with open(art4, "w", encoding="utf-8", newline="\n") as f:
+        f.write("an earlier build's output\n")
+    os.utime(art4, (old, old))
+    rc4, out4 = build_in(repo4, "build", "host")
+    check("CONTROL: the same stale file REWRITTEN by the build passes",
+          rc4 == 0 and "ARTIFACT STALE" not in out4,
+          "rc=%d\n%s" % (rc4, out4[-600:]))
+
+    # A failing build keeps its own exit code: the artifact check must not
+    # rewrite a compiler error into an artifact error.
+    repo5, _ = make_artifact_repo(tmp, "art-rc7", writes=False, rc=7)
+    rc5, out5 = build_in(repo5, "build", "host")
+    check("a FAILED build still returns the compiler's exit code, not 5",
+          rc5 == 7, "rc=%d\n%s" % (rc5, out5[-600:]))
+
+    # A target deploy.json says nothing about must not read as a pass.
+    rc6, out6 = build_in(repo, "build", "sim")
+    check("a target with no declared artifact says NOT PERFORMED",
+          rc6 == 0 and "ARTIFACT CHECK NOT PERFORMED" in out6,
+          "rc=%d\n%s" % (rc6, out6[-600:]))
+
+    # The escape hatch exists and does what it says.
+    repo7, _ = make_artifact_repo(tmp, "art-off", writes=False)
+    rc7, out7 = build_in(repo7, "--no-artifact-check", "build", "host")
+    check("--no-artifact-check turns the refusal off (and only that)",
+          rc7 == 0 and "BUILT BUT ARTIFACT ABSENT" not in out7,
+          "rc=%d\n%s" % (rc7, out7[-600:]))
+
+
+def test_verify_artifact(tmp):
+    """`verify-artifact` can say all four things about the same repo.
+
+    A verifier is only worth having if MATCH is falsifiable, so the same
+    artifact is walked through MATCH -> REPLACED -> ABSENT -> NO SIDECAR by
+    changing the WORLD, never by changing the question.
+    """
+    print("\nverify-artifact: is the file I am reading the build I think?")
+    repo, art = make_artifact_repo(tmp, "verify", payload="build-A")
+    if repo is None:
+        check("INCONCLUSIVE: no runnable stand-in driver, nothing was tested",
+              False, "the copied python.exe would not start")
+        return
+    rc, out = build_in(repo, "build", "host")
+    if rc != 0:
+        check("INCONCLUSIVE: the stand-in build did not succeed", False,
+              out[-400:])
+        return
+    rc, out = build_in(repo, "verify-artifact", "host")
+    check("MATCH right after the build that wrote it",
+          rc == buildlock.VERIFY_MATCH_EXIT and "MATCH" in out,
+          "rc=%d\n%s" % (rc, out[-400:]))
+
+    # Somebody overwrites the bytes without going through the lock.
+    with open(art, "w", encoding="utf-8", newline="\n") as f:
+        f.write("written by nobody\n")
+    rc, out = build_in(repo, "verify-artifact", "host")
+    check("REPLACED when the bytes changed under the sidecar",
+          rc == buildlock.VERIFY_REPLACED_EXIT and "REPLACED" in out,
+          "rc=%d\n%s" % (rc, out[-400:]))
+
+    os.unlink(art)
+    rc, out = build_in(repo, "verify-artifact", "host")
+    check("ABSENT when the file is gone",
+          rc == buildlock.VERIFY_ABSENT_EXIT and "ABSENT" in out,
+          "rc=%d\n%s" % (rc, out[-400:]))
+    check("ABSENT names the build that HAD produced it, from the sidecar",
+          "It existed when pid" in out, out[-400:])
+
+    # NO SIDECAR: a file that exists but was never built through this lock.
+    os.unlink(art + ".built.json")
+    with open(art, "w", encoding="utf-8", newline="\n") as f:
+        f.write("hand-copied from another checkout\n")
+    rc, out = build_in(repo, "verify-artifact", "host")
+    check("NO SIDECAR is its own verdict, not a MATCH",
+          rc == buildlock.VERIFY_NO_SIDECAR_EXIT and "NO SIDECAR" in out,
+          "rc=%d\n%s" % (rc, out[-400:]))
+
+    # THE MEASURED INCIDENT, end to end: A builds, B builds something else
+    # over the top, and A asks whether the file is still A's. Sidecar-vs-file
+    # alone cannot answer that -- B rewrote the sidecar too -- so --expect is
+    # the sharper question and this is the case that proves it is needed.
+    repo2, art2 = make_artifact_repo(tmp, "verify2", payload="build-A")
+    rc, _ = build_in(repo2, "build", "host")
+    sha_a2 = buildlock.sha256_file(art2)
+    repo2b, _ = make_artifact_repo(tmp, "verify2", payload="build-B")
+    rc, _ = build_in(repo2, "build", "host")
+    sha_b2 = buildlock.sha256_file(art2)
+    check("the second build really did change the bytes (control)",
+          sha_a2 != sha_b2, "%s vs %s" % (sha_a2[:12], sha_b2[:12]))
+    rc, out = build_in(repo2, "verify-artifact", "host")
+    check("plain verify-artifact MATCHes B's build -- consistent, and NOT "
+          "proof it is yours",
+          rc == buildlock.VERIFY_MATCH_EXIT, "rc=%d\n%s" % (rc, out[-400:]))
+    rc, out = build_in(repo2, "verify-artifact", "host", "--expect", sha_a2)
+    check("--expect <A's sha> reports REPLACED",
+          rc == buildlock.VERIFY_REPLACED_EXIT, "rc=%d\n%s" % (rc, out[-400:]))
+    check("...and names the pid and finish time of the build that overwrote it",
+          "written by pid" in out and "finished" in out.lower(), out[-400:])
+    rc, out = build_in(repo2, "verify-artifact", "host", "--expect", sha_b2)
+    check("CONTROL: --expect <B's sha> reports MATCH",
+          rc == buildlock.VERIFY_MATCH_EXIT, "rc=%d\n%s" % (rc, out[-400:]))
+
+    rc, out = build_in(repo2, "verify-artifact", "sim")
+    check("verify-artifact on a target with no declared artifact is NOT "
+          "PERFORMED, not a MATCH",
+          rc != buildlock.VERIFY_MATCH_EXIT and "NOT PERFORMED" in out,
+          "rc=%d\n%s" % (rc, out[-400:]))
+
+
+def test_artifact_units(tmp):
+    """The pieces, without spawning anything: the mapping, the three-state
+    status, and the exit codes being distinct from the ones already in use."""
+    print("\nartifact units: the mapping and the states")
+    repo = os.path.dirname(HERE)
+
+    sel, why = buildlock.target_artifacts(repo, ["build", "host"])
+    check("`build host` maps to the host DLL from the REAL deploy.json",
+          sel is not None and any(a["src"].replace("\\", "/") == ART_REL
+                                  for a in sel),
+          "why=%r" % why)
+    sel_sim, why_sim = buildlock.target_artifacts(repo, ["build", "sim"])
+    check("`build sim` declares nothing and SAYS so (not an empty pass)",
+          sel_sim is None and "no artifact" in (why_sim or ""),
+          "%r / %r" % (sel_sim, why_sim))
+    sel_mod, _ = buildlock.target_artifacts(repo, ["build", "mod", "maps"])
+    check("`build mod maps` maps to exactly the maps DLL",
+          sel_mod is not None and [a["name"] for a in sel_mod] == ["maps"],
+          str([a["name"] for a in (sel_mod or [])]))
+    sel_bad, why_bad = buildlock.target_artifacts(repo, ["build", "mod",
+                                                         "nosuchmod"])
+    check("an unknown mod name is NOT PERFORMED, not a pass",
+          sel_bad is None and bool(why_bad), "%r" % (why_bad,))
+
+    # A --repo with no tools/deploy.json declares nothing, and must not be
+    # answered from THIS checkout's declarations -- that would check the wrong
+    # tree and report ABSENT for an artifact that tree never claimed to build.
+    bare = os.path.join(tmp, "bare-repo")
+    os.makedirs(bare, exist_ok=True)
+    sel_bare, why_bare = buildlock.target_artifacts(bare, ["build", "host"])
+    check("a repo with no tools/deploy.json is NOT PERFORMED, never answered "
+          "from this checkout's deploy.json",
+          sel_bare is None and "deploy.json" in (why_bare or ""),
+          "%r / %r" % (sel_bare, why_bare))
+
+    check("the artifact exit codes do not collide with the ones already used "
+          "(0 ok, 2 usage, 4 lock refused)",
+          buildlock.ARTIFACT_ABSENT_EXIT not in (0, 2, 4)
+          and buildlock.ARTIFACT_STALE_EXIT not in (0, 2, 4)
+          and buildlock.ARTIFACT_ABSENT_EXIT
+          != buildlock.ARTIFACT_STALE_EXIT,
+          "%d / %d" % (buildlock.ARTIFACT_ABSENT_EXIT,
+                       buildlock.ARTIFACT_STALE_EXIT))
+
+    # requiresInput: an artifact whose input is absent must NOT be reported as
+    # ABSENT. `.cache/global-metadata.dec.dat` is not shared between worktrees,
+    # and a false refusal there would be the confidently-wrong answer.
+    d = os.path.join(tmp, "units")
+    os.makedirs(d, exist_ok=True)
+    art = {"name": "nameidx", "src": "host/x/bin/names.idx",
+           "requiresInput": {"path": ".cache/global-metadata.dec.dat",
+                             "why": "not shared between worktrees"}}
+    rec = buildlock.artifact_status(d, art, started=time.time())
+    check("an absent artifact with an absent declared INPUT is "
+          "input-missing, not absent",
+          rec["state"] == "input-missing", str(rec))
+    art2 = {"name": "host", "src": "host/x/bin/host.dll"}
+    rec2 = buildlock.artifact_status(d, art2, started=time.time())
+    check("CONTROL: the same absence with no declared input IS absent",
+          rec2["state"] == "absent", str(rec2))
+    check("input-missing does not make the build fail",
+          buildlock.artifact_exit([rec]) == 0
+          and buildlock.artifact_exit([rec2])
+          == buildlock.ARTIFACT_ABSENT_EXIT,
+          "%d / %d" % (buildlock.artifact_exit([rec]),
+                       buildlock.artifact_exit([rec2])))
+    check("input-missing PRINTS that it was NOT CHECKED",
+          "NOT PERFORMED" in buildlock.artifact_lines([rec])[0]
+          or "NOT CHECKED" in buildlock.artifact_lines([rec])[0],
+          buildlock.artifact_lines([rec])[0])
+
+    # Checked-in data (registry/mods.json) is shipped, not built: applying the
+    # mtime rule to it would refuse every `build deploy`.
+    data = os.path.join(d, "registry")
+    os.makedirs(data, exist_ok=True)
+    p = os.path.join(data, "mods.json")
+    with open(p, "w", encoding="utf-8", newline="\n") as f:
+        f.write("{}\n")
+    old = time.time() - 7200
+    os.utime(p, (old, old))
+    rec3 = buildlock.artifact_status(d, {"name": "registry",
+                                         "src": "registry/mods.json"},
+                                     started=time.time())
+    check("checked-in data is existence-checked only, never mtime-checked",
+          rec3["state"] == "ok" and rec3["mtime_checked"] is False,
+          str(rec3))
+    bindir = os.path.join(d, "mods", "z", "bin")
+    os.makedirs(bindir, exist_ok=True)
+    q = os.path.join(bindir, "z.dll")
+    with open(q, "w", encoding="utf-8", newline="\n") as f:
+        f.write("x\n")
+    os.utime(q, (old, old))
+    rec4 = buildlock.artifact_status(d, {"name": "z", "src": "mods/z/bin/z.dll"},
+                                     started=time.time())
+    check("CONTROL: an old file UNDER bin/ is stale",
+          rec4["state"] == "stale", str(rec4))
+
+
+# ---------------------------------------------------------------------------
+# the nimlint pre-flight, and reading a compiler-internal crash
+# ---------------------------------------------------------------------------
+
+BAD_SHIM = ('import aowlspt/jsonpath\n'
+            'export jsonpath\n')
+
+GETORQUIT = "getOrQuit: missing key"
+CRASH_TAG = "COMPILER-INTERNAL CRASH (no file named)"
+
+
+def make_lint_repo(tmp, name, bad=False):
+    """A throwaway checkout with all five nimlint roots present.
+
+    All five, deliberately: a repo missing four of them scans INCONCLUSIVE,
+    and a pre-flight test run against an inconclusive scan would pass without
+    the linter ever having had an opinion.
+    """
+    repo = os.path.join(tmp, name)
+    for r in ("host/common", "aowl/src", "mods/x", "backend", "tools"):
+        os.makedirs(os.path.join(repo, *r.split("/")), exist_ok=True)
+    with open(os.path.join(repo, "aowl", "src", "ok.nim"), "w",
+              encoding="utf-8", newline="\n") as f:
+        f.write("import aowlspt/abi\nexport rawRead, rawWrite\n")
+    p = os.path.join(repo, "host", "common", "jsonpath.nim")
+    with open(p, "w", encoding="utf-8", newline="\n") as f:
+        f.write(BAD_SHIM if bad else "proc pathGet*(s: string): string = s\n")
+    return repo, p
+
+
+def make_output_driver(repo, text, rc=1):
+    """A stand-in `aowl` that prints chosen text and exits with a chosen code.
+
+    This is how the crash signature is tested without a compiler: the thing
+    under test is buildlock READING build output, so the output is the input.
+    """
+    bin_dir = os.path.join(repo, "installer", "build")
+    os.makedirs(bin_dir, exist_ok=True)
+    exe = os.path.join(bin_dir, "aowl.exe")
+    shutil.copy(sys.executable, exe)
+    script = os.path.join(repo, "build")
+    with open(script, "w", encoding="utf-8", newline="\n") as f:
+        f.write("import sys\n"
+                "sys.stdout.write(%r)\n"
+                "sys.exit(%d)\n" % (text, rc))
+    probe = subprocess.run([exe, "-c", "print('ok')"],
+                           capture_output=True, text=True)
+    if probe.returncode != 0 or "ok" not in probe.stdout:
+        return None
+    return exe
+
+
+def bl(repo, *args, timeout=180):
+    r = subprocess.run([sys.executable, BL, "--repo", repo] + list(args),
+                       capture_output=True, text=True, timeout=timeout)
+    return r.returncode, r.stdout + r.stderr
+
+
+def test_nimlint_units(tmp):
+    """nimlint's own controls, plus the three-state verdict.
+
+    The selftest is run as a SUBPROCESS on purpose: `--selftest` is what a
+    human or a hook will actually run, and an in-process call would not catch
+    a broken CLI.
+    """
+    print("\nnimlint: controls and verdict")
+    import nimlint
+
+    rc = subprocess.run([sys.executable,
+                         os.path.join(HERE, "nimlint.py"), "--selftest"],
+                        capture_output=True, text=True, timeout=120)
+    check("nimlint --selftest passes (positive controls FIRE, negatives do "
+          "not)", rc.returncode == 0, rc.stdout[-800:] + rc.stderr[-400:])
+
+    fx = nimlint.fixture_dir(REPO)
+    pos = nimlint.scan([os.path.join(fx, "bad_reexport")], repo=REPO,
+                       skip_fixtures=False)
+    check("the positive control is exactly ONE error, at the export line",
+          len(pos.errors) == 1 and pos.errors[0].line == 10,
+          str([(f.rel, f.line) for f in pos.findings]))
+    check("and its refusal text names the incident, not just the rule",
+          "2.5h" in pos.errors[0].human() and
+          "getOrQuit: missing key" in pos.errors[0].human(),
+          pos.errors[0].human()[:200])
+
+    neg = nimlint.scan([os.path.join(fx, "good")], repo=REPO,
+                       skip_fixtures=False)
+    check("the negative control is silent at EVERY severity",
+          neg.files >= 4 and not neg.findings,
+          "%d files, %s" % (neg.files,
+                            [(f.rel, f.line) for f in neg.findings]))
+
+    # The real checkout: this must be clean of ERRORS, or the linter is
+    # asserting that a tree which builds today cannot be built.
+    real = nimlint.scan(list(nimlint.DEFAULT_ROOTS), repo=REPO)
+    check("the REAL checkout has 0 errors (it builds, so it must)",
+          not real.errors,
+          str([(f.rel, f.line, f.pattern["id"]) for f in real.errors]))
+    check("...and >200 files were actually examined (a scan of nothing is "
+          "not a clean scan)", real.files > 200, "%d files" % real.files)
+    check("the three known whole-module re-exports are reported as WARNINGS, "
+          "not errors", len(real.warnings) == 3,
+          str([(f.rel, f.line) for f in real.warnings]))
+    check("--strict would make those warnings fail, plain would not",
+          nimlint.verdict(real) == 0 and nimlint.verdict(real, True) == 1,
+          "%d / %d" % (nimlint.verdict(real),
+                       nimlint.verdict(real, True)))
+
+    gone = nimlint.scan(["no-such-root-here"], repo=REPO)
+    check("a root that does not exist is INCONCLUSIVE (exit 3), not clean",
+          nimlint.verdict(gone) == 3 and gone.could_not_scan,
+          str(gone.missing_roots))
+
+    # A finding must outrank an incomplete scan, or a real finding could be
+    # waved through as "could not look".
+    mixed = nimlint.scan([os.path.join(fx, "bad_reexport"), "no-such-root"],
+                         repo=REPO, skip_fixtures=False)
+    check("a finding OUTRANKS an incomplete scan (1, not 3)",
+          nimlint.verdict(mixed) == 1,
+          "verdict %d" % nimlint.verdict(mixed))
+
+    # The strongest check available without a compiler: the REAL file, both
+    # sides of the real fix. A reduced fixture can be reduced until it matches
+    # whatever the linter happens to do; these two blobs cannot.
+    hist = os.path.join(tmp, "hist", "host", "common")
+    os.makedirs(hist, exist_ok=True)
+    got = {}
+    for sha, tag in (("531498a", "broken"), ("cb9a816", "fixed")):
+        r = subprocess.run(["git", "show",
+                            "%s:host/common/jsonpath.nim" % sha],
+                           cwd=REPO, capture_output=True, text=True,
+                           timeout=60)
+        if r.returncode != 0:
+            got[tag] = None
+            continue
+        with open(os.path.join(hist, "jsonpath.nim"), "w",
+                  encoding="utf-8", newline="\n") as f:
+            f.write(r.stdout)
+        got[tag] = nimlint.scan(["host"], repo=os.path.join(tmp, "hist"))
+    if got.get("broken") is None or got.get("fixed") is None:
+        check("INCONCLUSIVE: git would not produce the historical blobs, so "
+              "the real-file regression was NOT CHECKED", False, str(got))
+    else:
+        check("the REAL broken file (531498a, the 2.5h one) is caught -- "
+              "through 45 lines of prose that mention import and export",
+              len(got["broken"].errors) == 1
+              and got["broken"].errors[0].line == 46,
+              str([(f.line, f.pattern["id"])
+                   for f in got["broken"].findings]))
+        check("the REAL fixed file (cb9a816, which built) is SILENT",
+              not got["fixed"].findings,
+              str([(f.line, f.pattern["id"]) for f in got["fixed"].findings]))
+
+    # The stripper. These are the false positives that would get the tool
+    # switched off within a day.
+    code, nocode, starts = nimlint.strip_noncode(
+        ['import a/b', '# export b', 'export b  # trailing', 's = "export b"'])
+    check("strip_noncode keeps code and drops comments/strings",
+          "export" not in code[1] and code[2].strip() == "export b"
+          and "export" not in code[3],
+          repr(code))
+    check("...and the strings-kept variant still has the literal (imports "
+          "need it)", 'export b' in nocode[3], repr(nocode))
+
+
+def test_lint_preflight(tmp):
+    """A tree holding the measured fatal shape refuses BEFORE the lock.
+
+    The properties, and each is separately falsifiable:
+      * exit 7, and the finding is printed
+      * NO lock file was created and NO build ran -- refusing after taking the
+        slot would still cost the queue four minutes
+      * the CONTROL (same repo, shape removed) does build
+      * --no-lint really is an escape
+    """
+    print("\nlint pre-flight: refuse before the lock")
+    repo, badfile = make_lint_repo(tmp, "lint-bad", bad=True)
+    exe = make_output_driver(repo, "should never run\n", rc=0)
+    if exe is None:
+        check("INCONCLUSIVE: no runnable stand-in driver, nothing was tested",
+              False, "the copied python.exe would not start")
+        return
+
+    rc, out = bl(repo, "build", "host")
+    check("a tree with the fatal shape REFUSES with exit 7",
+          rc == buildlock.LINT_EXIT, "exit %d\n%s" % (rc, out[-600:]))
+    check("...and the refusal names file, line and the fix",
+          "host/common/jsonpath.nim:2" in out.replace("\\", "/")
+          and "module-reexport-samename" in out and "fix:" in out,
+          out[-800:])
+    check("...and it says nothing was built and no lock was taken",
+          "no lock was taken" in out, out[-300:])
+    check("NO LOCK FILE was created (it refused before acquiring)",
+          not os.path.exists(buildlock.lock_path(repo)),
+          buildlock.lock_path(repo))
+    check("the build command never ran", "should never run" not in out,
+          out[-300:])
+
+    rc2, out2 = bl(repo, "--no-lint", "build", "host")
+    check("--no-lint is a real escape (the build runs)",
+          "should never run" in out2, "exit %d\n%s" % (rc2, out2[-400:]))
+
+    # CONTROL. Same repo, same driver, shape removed -- if this also refused,
+    # the test above would be proving nothing about the shape.
+    with open(badfile, "w", encoding="utf-8", newline="\n") as f:
+        f.write("proc pathGet*(s: string): string = s\n")
+    rc3, out3 = bl(repo, "build", "host")
+    check("CONTROL: with the two lines removed the SAME repo builds",
+          rc3 != buildlock.LINT_EXIT and "should never run" in out3,
+          "exit %d\n%s" % (rc3, out3[-400:]))
+
+    # And the warning severity must not block, or the real checkout (which has
+    # three of them) could never be built through the lock.
+    with open(os.path.join(repo, "mods", "x", "reex.nim"), "w",
+              encoding="utf-8", newline="\n") as f:
+        f.write("import aowlspt/abi\nexport abi\n")
+    rc4, out4 = bl(repo, "build", "host")
+    check("a WARNING does not refuse by default",
+          rc4 != buildlock.LINT_EXIT and "should never run" in out4,
+          "exit %d\n%s" % (rc4, out4[-400:]))
+    rc5, out5 = bl(repo, "--lint-strict", "build", "host")
+    check("--lint-strict makes that same warning refuse",
+          rc5 == buildlock.LINT_EXIT, "exit %d\n%s" % (rc5, out5[-400:]))
+
+
+def test_internal_crash_units(tmp):
+    """`internal_crash_verdict` on the four shapes that matter."""
+    print("\ncompiler-internal crash: the verdict function")
+    known = {"aowlhost.nim", "uihooks.nim"}
+
+    ev = buildlock.internal_crash_verdict(
+        "building host\n" + GETORQUIT + "\n", known=known)
+    check("`getOrQuit: missing key` IS an internal crash",
+          ev["crash"] and GETORQUIT in ev["markers"], str(ev))
+
+    ev2 = buildlock.internal_crash_verdict(
+        "aowlhost.nim(2051, 5) Error: undeclared identifier: 'pathGet'\n",
+        known=known)
+    check("an ordinary error that NAMES a file is NOT an internal crash",
+          not ev2["crash"] and ev2["located"], str(ev2))
+
+    ev3 = buildlock.internal_crash_verdict(
+        "unhandled exception: nifcursors.nim(149) `c.p != nil and c.rem > 0`\n",
+        known=known)
+    check("a fatal whose only location is INSIDE THE COMPILER is an internal "
+          "crash", ev3["crash"] and ev3["foreign"] and not ev3["located"],
+          str(ev3))
+
+    ev4 = buildlock.internal_crash_verdict(
+        "link failed: LNK1120 unresolved externals\n", known=known)
+    check("an ordinary failure with no location and no fatal marker is NOT "
+          "one (this is the check that stops it firing on everything)",
+          not ev4["crash"], str(ev4))
+
+    # Even alongside a real located error, getOrQuit still wins: it is the
+    # measured signature and it never carries a location of its own.
+    ev5 = buildlock.internal_crash_verdict(
+        "aowlhost.nim(1, 1) Error: x\n" + GETORQUIT + "\n", known=known)
+    check("getOrQuit outranks a co-printed located error", ev5["crash"],
+          str(ev5))
+
+
+def test_internal_crash_report(tmp):
+    """End to end, through the CLI, with a driver that emits the signature."""
+    print("\ncompiler-internal crash: the report, end to end")
+    repo, _ = make_lint_repo(tmp, "crash-repo", bad=False)
+    exe = make_output_driver(repo, "compiling...\n" + GETORQUIT + "\n", rc=1)
+    if exe is None:
+        check("INCONCLUSIVE: no runnable stand-in driver, nothing was tested",
+              False, "the copied python.exe would not start")
+        return
+
+    rc, out = bl(repo, "build", "host")
+    check("the signature produces the DISTINCT line, not a plain failure",
+          CRASH_TAG in out, "exit %d\n%s" % (rc, out[-800:]))
+    check("...and the exact wording tells the reader what to run and what it "
+          "cost", buildlock.CRASH_LINE in out, out[-800:])
+    check("...and exit 8, distinct from the child's own code",
+          rc == buildlock.INTERNAL_CRASH_EXIT, "exit %d" % rc)
+    check("the build's own output still reached stdout (the tee did not eat "
+          "it)", "compiling..." in out, out[-400:])
+    check("nimlint's verdict on the tree is reported alongside",
+          "nimlint" in out, out[-600:])
+    check("...and because this repo is lint-clean it SAYS the shape is new "
+          "rather than staying quiet",
+          "does not know yet" in out, out[-600:])
+
+    # CONTROL: an ordinary compile error must NOT be dressed up as this.
+    make_output_driver(repo,
+                       "host/x.nim(12, 3) Error: undeclared identifier: 'q'\n",
+                       rc=1)
+    rc2, out2 = bl(repo, "build", "host")
+    check("CONTROL: an ordinary error that names a file gets NO crash line",
+          CRASH_TAG not in out2, out2[-500:])
+    check("...and forwards the child's exit code (1), not 8",
+          rc2 == 1, "exit %d" % rc2)
+
+    # CONTROL: a SUCCESSFUL build that happens to print the words is not a
+    # crash -- the scan only runs on failure, and a passing build must not be
+    # turned into one.
+    make_output_driver(repo, "note: %s appeared once\n" % GETORQUIT, rc=0)
+    rc3, out3 = bl(repo, "--no-artifact-check", "build", "host")
+    check("CONTROL: a build that exits 0 is never called a crash",
+          CRASH_TAG not in out3 and rc3 == 0, "exit %d\n%s" % (rc3, out3[-400:]))
+
+
 def main():
     print("buildlock: FIFO fairness")
     tmp = tempfile.mkdtemp(prefix="buildlock-test-")
@@ -1537,6 +2182,13 @@ def main():
         test_hung_across_calls(tmp)
         test_wait_free_reports_hung(tmp)
         test_break_hung(tmp)
+        test_artifact_units(tmp)
+        test_artifact_check(tmp)
+        test_verify_artifact(tmp)
+        test_nimlint_units(tmp)
+        test_lint_preflight(tmp)
+        test_internal_crash_units(tmp)
+        test_internal_crash_report(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

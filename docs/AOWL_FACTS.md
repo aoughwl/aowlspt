@@ -8596,3 +8596,154 @@ every receiver and silently disable the caller.
 receiver, klass wanted vs got, offset and value, so the **next** dump's Rax/Rbx
 can be matched to a logged write. **Refusals log whether or not the flag is on**
 — a refusal is the evidence that a corrupting write was stopped.
+
+## 2026-09-02: a build's exit 0 is not the artifact's existence
+
+**Measured five times in one evening**, in this checkout, with several agents
+building through `python tools/buildlock.py build host`.
+
+`aowl build host` **REMOVES**
+`host/Aowlspt.Host.Il2Cpp/bin/aowlspt-host-il2cpp.dll` before it writes it. So
+the file's absence is a normal, expected state in the middle of any build, and
+the sequence that bit us is entirely ordinary:
+
+1. agent A's build finishes — exit 0, artifact present — and A starts verifying
+   it (markers, `deploy.py check`, a marker scan);
+2. queued agent B's build acquires the lock, **removes the artifact**, then
+   fails on a compile error and produces nothing;
+3. A's verification now reads an **ABSENT** DLL — while `buildlock` had already
+   printed `ok` for A, about a file that no longer exists.
+
+Separately and independently: a build that exits 0 with its declared artifact
+**never written at all** was reported as success. Exit 0 is a claim about a
+*process*; whether a file exists is a different question, and it is the one the
+caller was actually asking.
+
+The lock cannot fix this by locking harder. The deletion happens *after* A's
+lock is released, and serialising VERIFICATION would mean holding the one
+serial build slot while somebody reads a DLL.
+
+**What `tools/buildlock.py` does about it now:**
+
+* After a successful build it resolves the target's declared artifact(s) from
+  `tools/deploy.json` — the same `src` fields `aowl`'s `buildDeploySet` maps
+  onto build steps, so there is no second list of paths to rot — and refuses to
+  report success if one is missing or predates the build:
+  **`BUILT BUT ARTIFACT ABSENT` exits 5**, **`ARTIFACT STALE (mtime before
+  build start)` exits 6**. The mtime rule applies only to build *outputs*;
+  `registry/mods.json` is checked-in data no build rewrites, and applying it
+  there would be a check that always fires.
+* Three outcomes, never two. A target for which deploy.json declares no
+  artifact (`build sim`, `build test X`) prints **ARTIFACT CHECK NOT
+  PERFORMED**, and so does an artifact whose `requiresInput` is absent — `.cache/global-metadata.dec.dat`
+  is not shared between worktrees, so a missing name index there is explained,
+  not a dropped feature.
+* On success it prints each artifact's path, size and sha256, and writes
+  `<artifact>.built.json` (`target, sha256, size, mtime, started, finished,
+  pid, git_head`) so a verifier minutes later can PROVE the bytes it reads are
+  the build it thinks they are.
+* `python tools/buildlock.py verify-artifact <target>` answers
+  **MATCH 0 / REPLACED 2 / ABSENT 3 / NO SIDECAR 5**, naming the pid and finish
+  time recorded for whatever bytes are there now. Pass `--expect <sha256>` (the
+  sha your own build printed) for the sharper question — *is this still MY
+  build* — because a later build overwrites the sidecar too, so file-vs-sidecar
+  agreement proves only that they are consistent, not that they are yours.
+
+Method: **measured** (the five occurrences and the remove-before-write
+behaviour); the refusals are pinned by `tools/test_buildlock.py`
+(`test_artifact_check`, `test_verify_artifact`, `test_artifact_units`), each
+verdict paired with a control that makes the opposite verdict fire.
+
+## 2026-09-02 13:18: a mod initialised on one thread and ticked on another aborts in mimalloc
+
+The client died with **0xc0000409 FAST_FAIL_FATAL_APP_EXIT** at 13:18:05 on
+host build 4,921,344. There is **no Unity `Crash_*` report**: a fail-fast
+bypasses Unity's crash handler entirely, so the only artifact is the WER dump
+`C:\Users\savant\AppData\Local\CrashDumps\EscapeFromTarkov.exe.16972.dmp`.
+
+Forensic method, in order:
+
+1. The Windows **Application** event log carries the 0xc0000409 entry; that is
+   the signal that a crash happened at all when `D:\Aowlspt\Logs\` holds no
+   exception and there is no `Crash_*` folder to read.
+2. WER writes the dump to `%LOCALAPPDATA%\CrashDumps\<exe>.<pid>.dmp`. That is
+   NOT the Unity folder and `tools/crashwatch.py` does not look in it.
+3. `"C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe" -z <dmp> -c ".ecxr; k; q"`
+   prints the faulting context and the stack.
+
+**MEASURED -- the stack:**
+
+```
+ucrtbase!abort
+admin!mi_assert_fail
+admin!mi_malloc
+admin!alloc_0
+newWideCString
+toWide
+openIl2Cpp          aowl/src/aowlspt/il2cpp.nim:235
+dataOpen            mods/admin/adm/data.nim:303
+admin onUpdate      mods/admin/admin.nim ~1097
+modOnUpdate
+aowlspt_host_il2cpp
+kernel32!BaseThreadInitThunk        <- a HOST-CREATED thread (the ops loop)
+```
+
+**MEASURED -- the assertion text, read out of the dump:**
+`heap->thread_id == 0 || heap->thread_id == tid`, in
+`mi_heap_malloc_small_zero`, `nimony\vendor\mimalloc\src\alloc.c:135`.
+`_mi_heap_default` lives in **admin.dll's emulated TLS**
+(`_emutls_v._mi_heap_default`) -- each mod DLL carries its own mimalloc, and
+its default heap is bound to a thread.
+
+**MEASURED -- the two thread contexts:**
+
+* `aowlspt-host.log`: Admin Menu (`aowl.admin`) and the other deferred mods
+  (manager, tarkov, settingshub, uihub, textures, callproof, maps) were `~-n`
+  at 4.9s and were brought up by `modLoadReleaseMods` at **0:00:44.4**, which
+  ran from `modLoadTick()` on the **UNITY MAIN THREAD** (`modload.nim`
+  lines 1029-1054, the per-frame drain).
+* The tick that aborted ran on the **ops thread** (`aowlhost.nim` `hostMain`,
+  which calls `modhost.tickMods`).
+* The dump's unloaded-module list shows admintrader/manager/tarkov/
+  settingshub/uihub/waypoints DLLs were loaded, unloaded and reloaded during
+  this same boot.
+* The previous **surviving** boot (`aowlspt-host.prev3.log`) loaded Admin Menu
+  at 0:00:01.391 **on the ops thread** and ran fine. Every mod that both
+  initialised and ticked on the ops thread never asserted.
+
+**INFERRED, not measured:** that the heap binds to the thread that ran the
+mod's `init`/`on_load` specifically. Whether the binding instead came from an
+emutls slot reused after this boot's unload/reload of six mod DLLs was NOT
+determined -- the dump does not distinguish the two.
+
+**The invariant enforced either way: A MOD IS INITIALISED ON THE SAME THREAD
+THAT TICKS IT.** Implemented in two places:
+
+* `host/Aowlspt.Host.Il2Cpp/modload.nim` -- the release gate still evaluates on
+  the Unity thread (that is where the `MenuScreen::Show` event is) but now only
+  sets an approval flag with its reason; `modLoadReleaseDrain()`, called from
+  the ops loop in `hostMain` immediately before `modhost.tickMods`, performs
+  the load. It logs `mod loading: release performed on thread <tid> (ops
+  thread), gate opened on thread <tid> (Unity)` -- and WARNS if the two ids are
+  equal, because then the split is not doing anything and this crash is still
+  reachable.
+* `host/common/modhost.nim` -- `LoadedMod.initTid` is recorded when the mod
+  goes live, and `tickMods` REFUSES to call `on_update` on any other thread,
+  once per mod: `REFUSING to tick on thread X, initialised on thread Y`. The
+  refusal is a THIRD state (`tickWrongThread`, read back through
+  `modTickRefusedThread`), not `tickFaulted`: the mod never ran and never
+  failed, so reporting a fault would report something that did not happen.
+  `unloadOne` warns on the same mismatch but proceeds, because refusing an
+  unload leaks the library and its arena for the life of the process.
+
+Why it must be REFUSED rather than guarded: `abort` is a fail-fast. It raises
+no SEH exception, so `aowl_p_p_seh` cannot catch it, and no amount of guarding
+around `cModApiOnUpdate` would have saved that boot.
+
+**UNVERIFIED:** whether the event-bus path (`deliverEvent` -> a mod's handler,
+dispatched from Unity-thread detours as well as from the ops thread) carries
+the same hazard. mimalloc hands each thread a *fresh* default heap on first
+use, so a handler that allocates and frees entirely within one foreign-thread
+call may well be safe; a handler that FREES memory allocated on the init
+thread, or that hands a pointer back across the boundary, is the case that
+would not be. Not measured, and deliberately left unchanged.

@@ -10,6 +10,8 @@ r"""buildlock.py -- ONE build at a time per checkout. A mechanism, not a rule.
     python tools/buildlock.py --steal          # only when the holder is dead
     python tools/buildlock.py --status --check-hung   # is the holder ALIVE-but-DEAD?
     python tools/buildlock.py --break-hung build host # kill a hung holder, then build
+    python tools/buildlock.py verify-artifact host    # is the dll still MY build?
+    python tools/buildlock.py --no-lint build host    # skip the nimlint pre-flight
 
 Anything after the options is passed to `aowl` verbatim, so this is a drop-in
 prefix for any build command.
@@ -201,14 +203,78 @@ Two rules it follows, both from CLAUDE.md 9b:
   errors, the block prints that the comparison was NOT PERFORMED. Silence
   would read exactly like "nothing changed", which is the confidently-wrong
   answer this whole file exists to avoid.
+
+## A build's exit 0 is not the artifact's existence -- measured 2026-09-02
+
+FIVE times in one evening. `aowl build host` REMOVES
+`host/Aowlspt.Host.Il2Cpp/bin/aowlspt-host-il2cpp.dll` before it writes it.
+Agent A's build finished (exit 0, artifact present) and A began verifying;
+queued agent B's build then took the lock, removed the artifact, hit a compile
+error and produced nothing. A's verification read an ABSENT dll -- and this
+script had already told A `ok`, about a file that no longer existed. Separately,
+a build that exits 0 with its declared artifact never written has been reported
+as success outright.
+
+The lock cannot fix that: the deletion happens after the first build's lock is
+released, and serialising VERIFICATION would mean holding the build slot while
+somebody reads a DLL. What it can do is refuse to lie:
+
+* After a successful build the target's declared artifact(s) are resolved from
+  `tools/deploy.json` -- the same `src` fields `aowl`'s `buildDeploySet` maps
+  onto build steps, so there is no second list of paths here to rot -- and each
+  one is checked. **`BUILT BUT ARTIFACT ABSENT` exits 5**; **`ARTIFACT STALE
+  (mtime before build start)` exits 6**, which is the earlier build's leftover
+  file. The staleness rule applies only to build OUTPUTS: `registry/mods.json`
+  is checked-in data that no build rewrites, and failing on its mtime would be
+  a check that always fires. A target that declares no artifact in deploy.json
+  (`build sim`, `build test X`) prints **ARTIFACT CHECK NOT PERFORMED** and does
+  not pass silently; so does an artifact whose `requiresInput` is absent.
+* On success each artifact's path, size and sha256 are printed, and the same
+  is written to `<artifact>.built.json` (target, sha256, size, mtime, started,
+  finished, pid, git_head). It exists so a verifier minutes later can PROVE the
+  bytes it is reading are the build it thinks it is.
+* `python tools/buildlock.py verify-artifact <target>` compares the file
+  against that sidecar: **MATCH 0 / REPLACED 2 / ABSENT 3 / NO SIDECAR 5**.
+  REPLACED names the pid and finish time recorded for the bytes that are there
+  now. Pass `--expect <sha256>` (the sha printed by your own build) to ask the
+  sharper question -- *is this still MY build* -- because a later build
+  overwrites the sidecar too, so sidecar-vs-file agreeing only proves the file
+  and the record are consistent, not that they are yours.
+
+## A failure that names no file is not an ordinary failure -- 2026-09-01
+
+From 19:49 to 22:26 every host and backend build died inside nimony's hexer
+with `getOrQuit: missing key` and no file, no line, no symbol. The session read
+"build failed", assumed its own edits, and spent 2.5 hours bisecting. The cause
+was two lines (`import aowlspt/jsonpath` + `export jsonpath`) that a 200ms grep
+finds. So:
+
+* **Pre-flight.** `tools/nimlint.py` scans the tree BEFORE the lock is taken.
+  A finding refuses with **exit 7**, prints the finding, builds nothing and
+  queues for nothing. `--no-lint` is the escape; `--lint-strict` also refuses
+  on warnings. If nimlint cannot be imported or cannot scan, the pre-flight
+  says **NOT PERFORMED / INCONCLUSIVE** and builds anyway -- a missing linter
+  must not block work, and must never read as a clean lint.
+* **Post-mortem.** The build's output is tee'd (every byte still reaches
+  stdout) and, on failure, scanned. `getOrQuit: missing key`, or any compiler
+  fatal whose only printed locations are inside the compiler's own sources,
+  prints `COMPILER-INTERNAL CRASH (no file named)` and **exit 8** instead of
+  the child's code -- and runs nimlint, saying plainly when nimlint is CLEAN,
+  because a clean lint after that signature means the shape is a NEW one.
+
+Exit codes now: 0 ok, 2 usage, 4 lock not acquired, 5 artifact absent, 6
+artifact stale, 7 lint refusal, 8 compiler-internal crash, otherwise the
+child's own code.
 """
 
 from __future__ import annotations
 
 import argparse
 import errno
+import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -1479,6 +1545,616 @@ def print_concurrent_edits(before, after):
           "half-written change; re-run after the queue drains")
 
 
+# ---------------------------------------------------------------------------
+# EXIT 0 IS NOT AN ARTIFACT. See the module docstring for the measurement.
+# ---------------------------------------------------------------------------
+
+ARTIFACT_ABSENT_EXIT = 5
+ARTIFACT_STALE_EXIT = 6
+
+VERIFY_MATCH_EXIT = 0
+VERIFY_REPLACED_EXIT = 2
+VERIFY_ABSENT_EXIT = 3
+VERIFY_NO_SIDECAR_EXIT = 5
+
+# A build that writes its artifact within a second of starting is not the case
+# this guards against -- the stale artifact it catches is MINUTES old, left by
+# an earlier build whose successor removed nothing because it failed before it
+# got that far. Two seconds of slack absorbs clock/filesystem granularity
+# without being able to mask that.
+ARTIFACT_MTIME_SLACK = 2.0
+
+SIDECAR_SUFFIX = ".built.json"
+
+
+def _norm(p):
+    return p.replace("\\", "/")
+
+
+def deploy_artifacts(repo):
+    """Every declared artifact, from `tools/deploy.json`. `(arts, None)` or
+    `(None, why)`.
+
+    deploy.json is the ONE place this repo declares where an artifact is built,
+    and `aowl`'s own `buildDeploySet` reads the same `src` fields. Nothing here
+    keeps a second list of paths: a hardcoded copy would rot the day someone
+    adds an artifact, and would then report a PASS for a target whose real
+    output it had never heard of.
+
+    It is read from `<repo>/tools/deploy.json` -- the checkout being BUILT --
+    and there is deliberately no fallback to the copy beside this file. A
+    `--repo` pointing somewhere without one is not a repo whose artifacts this
+    file can name, and answering from another checkout's declarations would be
+    a check performed against the wrong tree.
+    """
+    p = os.path.join(repo, "tools", "deploy.json")
+    if not os.path.exists(p):
+        return None, ("%s does not exist, so nothing declares what `%s` is "
+                      "supposed to produce" % (p, repo))
+    try:
+        with open(p, "r", encoding="utf-8-sig") as f:
+            cfg = json.load(f)
+    except Exception as e:
+        return None, "%s could not be read (%s: %s)" % (p, type(e).__name__, e)
+    arts = [a for a in cfg.get("artifacts", [])
+            if isinstance(a, dict) and a.get("name") and a.get("src")
+            and not str(a["name"]).startswith("//")]
+    if not arts:
+        return None, "%s declares no artifacts" % p
+    return arts, None
+
+
+def target_artifacts(repo, rest):
+    """Which declared artifacts `aowl <rest>` is supposed to produce.
+
+    Returns `(artifacts, None)` or `(None, why)`. The mapping is the INVERSE of
+    `buildDeploySet` in tools/aowl.nim, which maps a deploy.json `src` onto a
+    build step; here a build target selects the `src` values that step writes.
+
+    `(None, why)` is a real outcome and must never be reported as a pass:
+    `build sim`, `build test X`, `build settings` and friends declare no
+    artifact in deploy.json at all, so nothing about them can be checked, and
+    the caller prints NOT PERFORMED.
+    """
+    arts, err = deploy_artifacts(repo)
+    if arts is None:
+        return None, err
+    words = [w for w in rest if not w.startswith("-")]
+    if not words or words[0] != "build":
+        return None, ("%r is not a `build` command, so it declares no artifact"
+                      % " ".join(rest))
+    target = words[1].lower() if len(words) > 1 else ""
+    name = words[2] if len(words) > 2 else ""
+
+    def pick(pred):
+        return [a for a in arts if pred(_norm(a["src"]))]
+
+    if target in ("host", "il2cpp"):
+        sel = pick(lambda s: s.startswith("host/Aowlspt.Host.Il2Cpp/bin/"))
+    elif target == "backend":
+        sel = pick(lambda s: s.startswith("backend/bin/"))
+    elif target in ("launch", "launcher"):
+        sel = pick(lambda s: s == "installer/build/aowlspt-launch.exe")
+    elif target in ("mod", "mods"):
+        if name:
+            want = [n.strip() for n in name.split(",") if n.strip()]
+            sel = pick(lambda s: any(s.startswith("mods/%s/bin/" % n)
+                                     for n in want))
+        elif target == "mods":
+            sel = pick(lambda s: s.startswith("mods/") and "/bin/" in s)
+        else:
+            return None, "`build mod` with no name builds nothing"
+    elif target == "examples":
+        sel = pick(lambda s: s.startswith("examples/") and "/bin/" in s)
+    elif target == "deploy":
+        sel = list(arts)
+    else:
+        return None, ("`build %s` names no artifact in tools/deploy.json "
+                      "(it knows: host, backend, launch, mod NAME, mods, "
+                      "examples, deploy)" % (target or "<nothing>"))
+    if not sel:
+        return None, ("tools/deploy.json declares no artifact built by `%s`"
+                      % " ".join(words[:3]))
+    return sel, None
+
+
+def is_build_output(rel):
+    """Is this path WRITTEN by a build, or is it checked-in data that a build
+    only ships? `registry/mods.json` is the second kind: it exists before any
+    build and its mtime says nothing, so the staleness rule must not be applied
+    to it or every `build deploy` would refuse."""
+    s = _norm(rel)
+    return "/bin/" in s or s.startswith("installer/build/")
+
+
+def missing_declared_input(repo, art):
+    """`(path, why)` when the artifact declares an input that is ABSENT.
+
+    Same `requiresInput` field `deploy.py` reads, resolved against `repo` so a
+    worktree (or a test) answers about itself. `.cache/global-metadata.dec.dat`
+    is not shared between worktrees, and without it `aowl build host` produces
+    the host DLL but no name index -- an absence that is explained, not a
+    dropped feature, and reporting it as ABSENT would be a false refusal.
+    """
+    req = art.get("requiresInput") or {}
+    rel = req.get("path") or ""
+    if not rel:
+        return None
+    full = os.path.join(repo, _norm(rel).replace("/", os.sep))
+    if os.path.exists(full):
+        return None
+    return rel, req.get("why", "")
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def artifact_status(repo, art, started=None, want_sha=True):
+    """One artifact, measured. States: ok / absent / stale / input-missing /
+    unreadable.
+
+    `started` is the moment the build began. An artifact older than that was
+    written by an EARLIER build: exactly the case measured five times on
+    2026-09-02, where a queued build removed the file, failed, and left the
+    previous one's verifier reading either nothing or something it did not
+    build.
+    """
+    rel = _norm(art["src"])
+    full = os.path.join(repo, rel.replace("/", os.sep))
+    rec = {"name": art.get("name"), "src": rel, "path": full,
+           "state": "unreadable", "why": "", "size": None, "sha256": None,
+           "mtime": None, "built": is_build_output(rel),
+           "mtime_checked": False}
+    if not os.path.exists(full):
+        mi = missing_declared_input(repo, art)
+        if mi:
+            rec["state"] = "input-missing"
+            rec["why"] = ("its declared input %s is absent (%s) -- the build "
+                          "could not produce it, so this was NOT CHECKED"
+                          % (mi[0], mi[1]))
+        else:
+            rec["state"] = "absent"
+            rec["why"] = "nothing at %s" % full
+        return rec
+    try:
+        stt = os.stat(full)
+    except OSError as e:
+        rec["why"] = "stat failed (%s: %s) -- NOT CHECKED" % (
+            type(e).__name__, e)
+        return rec
+    rec["size"], rec["mtime"] = stt.st_size, stt.st_mtime
+    if started is not None and rec["built"]:
+        rec["mtime_checked"] = True
+        if stt.st_mtime < started - ARTIFACT_MTIME_SLACK:
+            rec["state"] = "stale"
+            rec["why"] = ("its mtime is %.0fs BEFORE this build started (%s) "
+                          "-- this file is an EARLIER build's output"
+                          % (started - stt.st_mtime,
+                             time.strftime("%H:%M:%S",
+                                           time.localtime(stt.st_mtime))))
+            return rec
+    if want_sha:
+        try:
+            rec["sha256"] = sha256_file(full)
+        except OSError as e:
+            rec["why"] = "could not be hashed (%s: %s) -- NOT CHECKED" % (
+                type(e).__name__, e)
+            return rec
+    rec["state"] = "ok"
+    return rec
+
+
+def artifact_exit(recs):
+    """The exit code for a set of artifact records. ABSENT outranks STALE
+    because it is the stronger statement; both refuse."""
+    if any(r["state"] == "absent" for r in recs):
+        return ARTIFACT_ABSENT_EXIT
+    if any(r["state"] == "stale" for r in recs):
+        return ARTIFACT_STALE_EXIT
+    return 0
+
+
+def artifact_lines(recs):
+    """What the build prints about its own outputs. Every state says which it
+    is; `input-missing` and `unreadable` say NOT CHECKED in as many words,
+    because 'I could not look' must never be readable as 'it is there'."""
+    out = []
+    for r in recs:
+        if r["state"] == "ok":
+            out.append("  %-14s %s   %d bytes   sha256 %s"
+                       % (r["name"], r["src"], r["size"], r["sha256"]))
+        elif r["state"] == "absent":
+            out.append("  BUILT BUT ARTIFACT ABSENT: %s (%s) -- %s"
+                       % (r["name"], r["src"], r["why"]))
+        elif r["state"] == "stale":
+            out.append("  ARTIFACT STALE (mtime before build start): %s (%s) "
+                       "-- %s" % (r["name"], r["src"], r["why"]))
+        else:
+            out.append("  artifact check NOT PERFORMED for %s (%s) -- %s"
+                       % (r["name"], r["src"], r["why"]))
+    return out
+
+
+def sidecar_path(artifact_path):
+    return artifact_path + SIDECAR_SUFFIX
+
+
+def read_sidecar(artifact_path):
+    try:
+        with open(sidecar_path(artifact_path), "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def write_sidecar(rec, target, started, finished, git_head):
+    """Record WHICH bytes this build produced, beside the artifact.
+
+    The point is not bookkeeping. A verifier that opens the DLL minutes later
+    has no way to tell whether it is reading the build it thinks it is; with
+    this it can. Written only for build OUTPUTS (all of which live in
+    gitignored `bin/` or `installer/build/`), never beside checked-in data.
+    """
+    doc = {"target": target, "artifact": rec["src"], "sha256": rec["sha256"],
+           "size": rec["size"], "mtime": rec["mtime"],
+           "started": started, "finished": finished,
+           "started_h": time.strftime("%Y-%m-%d %H:%M:%S",
+                                      time.localtime(started)),
+           "finished_h": time.strftime("%Y-%m-%d %H:%M:%S",
+                                       time.localtime(finished)),
+           "pid": os.getpid(), "git_head": git_head}
+    p = sidecar_path(rec["path"])
+    tmp = p + ".tmp%d" % os.getpid()
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(doc, f, indent=1, sort_keys=True)
+        os.replace(tmp, p)
+    except OSError as e:
+        print("  (could not write %s: %s -- a later verifier will report NO "
+              "SIDECAR, not a pass)" % (p, e))
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return None
+    return doc
+
+
+def check_and_record(repo, rest, started, finished, no_sidecar=False):
+    """Post-build: did the thing we asked for actually appear? Returns an exit
+    code -- 0, ARTIFACT_ABSENT_EXIT or ARTIFACT_STALE_EXIT."""
+    arts, why = target_artifacts(repo, rest)
+    if arts is None:
+        print("ARTIFACT CHECK NOT PERFORMED: %s. Exit 0 above means the build "
+              "command succeeded; it is NOT evidence that a file exists."
+              % why)
+        return 0
+    recs = [artifact_status(repo, a, started) for a in arts]
+    rc = artifact_exit(recs)
+    if rc:
+        print("")
+        print("REFUSING TO REPORT SUCCESS -- the build exited 0 but its "
+              "declared artifact(s) are not there:")
+    for ln in artifact_lines(recs):
+        print(ln)
+    if rc:
+        print("  a build's exit 0 is not the artifact's existence. `aowl` "
+              "REMOVES its output before writing it, so a later build that "
+              "fails leaves the previous one's file deleted.")
+        print("  exit %d (%s)" % (rc, "artifact absent"
+                                  if rc == ARTIFACT_ABSENT_EXIT else
+                                  "artifact stale"))
+        return rc
+    if no_sidecar:
+        return 0
+    head, _err = _git(repo, ["rev-parse", "HEAD"])
+    head = head.strip() if head else None
+    for r in recs:
+        if r["state"] == "ok" and r["built"]:
+            write_sidecar(r, " ".join(rest), started, finished, head)
+    return 0
+
+
+VERIFY_TAG = {VERIFY_MATCH_EXIT: "MATCH",
+              VERIFY_REPLACED_EXIT: "REPLACED",
+              VERIFY_ABSENT_EXIT: "ABSENT",
+              VERIFY_NO_SIDECAR_EXIT: "NO SIDECAR"}
+
+
+def verify_one(repo, art, expect=None):
+    """`(code, lines)` for one artifact against its sidecar."""
+    rec = artifact_status(repo, art, started=None)
+    side = read_sidecar(rec["path"])
+    if rec["state"] == "absent":
+        return VERIFY_ABSENT_EXIT, [
+            "  ABSENT      %s (%s) -- nothing is there now.%s"
+            % (rec["name"], rec["src"],
+               ("  It existed when pid %s finished %r at %s (sha %s)."
+                % (side.get("pid"), side.get("target"), side.get("finished_h"),
+                   str(side.get("sha256"))[:12])) if side else
+               "  No sidecar either, so it was never built through this lock.")]
+    if rec["state"] in ("input-missing", "unreadable"):
+        return VERIFY_NO_SIDECAR_EXIT, [
+            "  NOT PERFORMED %s (%s) -- %s" % (rec["name"], rec["src"],
+                                               rec["why"])]
+    if expect:
+        if rec["sha256"] == expect:
+            return VERIFY_MATCH_EXIT, [
+                "  MATCH       %s (%s) is the build you named (sha %s, %d "
+                "bytes)" % (rec["name"], rec["src"], rec["sha256"][:12],
+                            rec["size"])]
+        lines = ["  REPLACED    %s (%s): the file on disk is sha %s, you "
+                 "expected %s" % (rec["name"], rec["src"], rec["sha256"][:12],
+                                  expect[:12])]
+        if side and side.get("sha256") == rec["sha256"]:
+            lines.append("              the bytes there now were written by "
+                         "pid %s building %r, finished %s"
+                         % (side.get("pid"), side.get("target"),
+                            side.get("finished_h")))
+        elif side:
+            lines.append("              the sidecar records sha %s from pid "
+                         "%s at %s, which matches NEITHER -- something wrote "
+                         "the file without going through this lock"
+                         % (str(side.get("sha256"))[:12], side.get("pid"),
+                            side.get("finished_h")))
+        else:
+            lines.append("              there is no sidecar, so who wrote "
+                         "these bytes is UNKNOWN")
+        return VERIFY_REPLACED_EXIT, lines
+    if not side:
+        return VERIFY_NO_SIDECAR_EXIT, [
+            "  NO SIDECAR  %s (%s) exists (sha %s) but was not built through "
+            "this lock, so there is nothing to compare it with. Not a pass."
+            % (rec["name"], rec["src"], rec["sha256"][:12])]
+    if side.get("sha256") == rec["sha256"]:
+        return VERIFY_MATCH_EXIT, [
+            "  MATCH       %s (%s) is byte-identical to the build pid %s "
+            "finished at %s (sha %s, %d bytes)"
+            % (rec["name"], rec["src"], side.get("pid"),
+               side.get("finished_h"), rec["sha256"][:12], rec["size"])]
+    return VERIFY_REPLACED_EXIT, [
+        "  REPLACED    %s (%s): sha %s now, but the sidecar recorded %s from "
+        "pid %s building %r at %s -- something overwrote it without going "
+        "through this lock"
+        % (rec["name"], rec["src"], rec["sha256"][:12],
+           str(side.get("sha256"))[:12], side.get("pid"), side.get("target"),
+           side.get("finished_h"))]
+
+
+def cmd_verify_artifact(repo, rest):
+    """`verify-artifact <target> [--expect SHA256]`.
+
+    Answers ONE question: is the file I am about to verify the build I think
+    it is? MATCH 0 / REPLACED 2 / ABSENT 3 / NO SIDECAR 5.
+    """
+    words, expect = [], None
+    it = iter(rest[1:])
+    for w in it:
+        if w in ("--expect", "--expect-sha"):
+            expect = next(it, None)
+        elif w.startswith("--expect="):
+            expect = w.split("=", 1)[1]
+        else:
+            words.append(w)
+    if not words:
+        print("verify-artifact needs a target, e.g. "
+              "`python tools/buildlock.py verify-artifact host`")
+        return 2
+    if expect:
+        expect = expect.strip().lower()
+    arts, why = target_artifacts(repo, ["build"] + words)
+    if arts is None:
+        print("NOT PERFORMED: %s" % why)
+        return VERIFY_NO_SIDECAR_EXIT
+    print("verify-artifact %s (%d declared artifact(s))"
+          % (" ".join(words), len(arts)))
+    worst, seen = VERIFY_MATCH_EXIT, []
+    for a in arts:
+        code, lines = verify_one(repo, a, expect)
+        seen.append(code)
+        for ln in lines:
+            print(ln)
+    for code in (VERIFY_ABSENT_EXIT, VERIFY_REPLACED_EXIT,
+                 VERIFY_NO_SIDECAR_EXIT):
+        if code in seen:
+            worst = code
+            break
+    print("verdict: %s (exit %d)" % (VERIFY_TAG.get(worst, "?"), worst))
+    return worst
+
+
+# ---------------------------------------------------------------------------
+# PRE-FLIGHT LINT, and reading a compiler-internal crash for what it is
+# ---------------------------------------------------------------------------
+#
+# MEASURED 2026-09-01, 19:49 -> 22:26: every host and backend build in this
+# checkout died inside nimony's hexer with `getOrQuit: missing key` and NOTHING
+# else -- no file, no line, no symbol. Two and a half hours went into bisecting
+# it. The cause was two lines in host/common/jsonpath.nim (`import
+# aowlspt/jsonpath` + `export jsonpath`), which a 200ms grep can see.
+#
+# So two things happen here, and they are different:
+#
+#   * BEFORE the lock is taken, `tools/nimlint.py` scans the tree. A build that
+#     is going to die this way should not first wait forty minutes in a queue
+#     and then occupy the build slot for four. Refusal is exit 7, and
+#     `--no-lint` is the escape.
+#   * AFTER a build fails, the OUTPUT is read. A failure that names no file is
+#     a categorically different event from a failure that names one, and
+#     reporting it as an ordinary nonzero exit is how the 2.5 hours started --
+#     the session read "build failed" and went looking for its own mistake.
+#
+# The build's output has to be captured to do the second, so it is TEE'd: every
+# byte still reaches stdout, and the last LOG_RING lines are kept for the scan.
+# Note that `aowl` writes nothing to a redirected stream until it exits
+# (CLAUDE.md records this), so piping does not make progress reporting worse
+# than it already was -- but it does not make it better either.
+
+LINT_EXIT = 7
+INTERNAL_CRASH_EXIT = 8
+LOG_RING = 4000
+
+CRASH_LINE = ("COMPILER-INTERNAL CRASH (no file named): run "
+              "tools/nimlint.py; last time this was a whole-module re-export "
+              "and cost 2.5 hours")
+
+# `getOrQuit: missing key` is the measured signature and never carries a
+# location. The others are shapes that MAY name a file, so they only count as
+# an internal crash when nothing in the output names a file that exists.
+CRASH_HARD = ("getOrQuit: missing key",)
+CRASH_SOFT = ("unhandled exception", "Traceback (most recent call last)",
+              "internal error:", "SIGSEGV", "fatal error: cannot open",
+              "Error: internal error")
+
+# `foo.nim(2051, 5)` / `foo.nim(149)` -- nim's own location syntax.
+NIM_LOC_RE = re.compile(r"([A-Za-z0-9_.\-]+\.nim)\((\d+)")
+
+
+def repo_nim_basenames(repo, limit=20000):
+    """Every .nim basename in the checkout, for deciding whether an error
+    location names OUR code or the COMPILER's own source.
+
+    `nifcursors.nim(149)` is a location, and a naive "did it name a file?"
+    test reads it as one -- but it is a file inside nimony, and a crash inside
+    the compiler's error renderer is exactly the event this is trying to
+    distinguish. Measured 2026-09-01 (commit 531498a's message): five build
+    variants all died at `nifcursors.nim(149)` while formatting a message for
+    a real error they never printed.
+    """
+    names = set()
+    skip = {"build", "bin", "nimcache", ".git", "__pycache__", ".cache",
+            "node_modules", ".aowl"}
+    for dirpath, dirnames, filenames in os.walk(repo):
+        dirnames[:] = [d for d in dirnames if d not in skip]
+        for fn in filenames:
+            if fn.endswith(".nim"):
+                names.add(fn.lower())
+                if len(names) >= limit:
+                    return names
+    return names
+
+
+def internal_crash_verdict(text, repo=None, known=None):
+    """Did the compiler die WITHOUT naming a file of ours?
+
+    Returns a dict: crash (bool), markers (which signatures matched),
+    located (locations that name a file in this checkout), foreign (locations
+    that name something else -- i.e. compiler internals).
+    """
+    low = text.lower()
+    hard = [m for m in CRASH_HARD if m.lower() in low]
+    soft = [m for m in CRASH_SOFT if m.lower() in low]
+    if known is None:
+        known = repo_nim_basenames(repo) if repo else set()
+    located, foreign = [], []
+    for m in NIM_LOC_RE.finditer(text):
+        (located if m.group(1).lower() in known else foreign).append(
+            "%s(%s)" % (m.group(1), m.group(2)))
+    return {"crash": bool(hard) or (bool(soft) and not located),
+            "markers": hard + soft,
+            "located": located[:8], "foreign": foreign[:8]}
+
+
+def print_internal_crash(ev, repo, out=None):
+    """The distinct report. It says what to run next, and it also says when
+    nimlint has NOTHING -- because a clean lint after this signature means the
+    shape is NEW, and a silent lint would read as reassurance."""
+    w = (out.write if out is not None
+         else (lambda s: sys.stdout.write(s)))
+    w(CRASH_LINE + "\n")
+    w("    signature: %s\n" % ", ".join(ev["markers"]))
+    if ev["foreign"]:
+        w("    the only locations printed are INSIDE THE COMPILER (%s) -- "
+          "not your source\n" % ", ".join(ev["foreign"]))
+    else:
+        w("    no source location was printed at all\n")
+    res, err = lint_scan(repo)
+    if res is None:
+        w("    nimlint: NOT PERFORMED (%s) -- this is not a clean result\n"
+          % err)
+        return
+    if res.errors:
+        w("    nimlint found %d error(s):\n" % len(res.errors))
+        for f in res.errors:
+            w("      %s:%d  %s\n" % (f.rel, f.line, f.pattern["id"]))
+    else:
+        w("    nimlint is CLEAN (%d files, %d warning(s)) -- so this is a "
+          "shape it does not know yet. Minimise it and add a PATTERNS entry; "
+          "do not spend 2.5 hours the way the last one did.\n"
+          % (res.files, len(res.warnings)))
+
+
+def lint_scan(repo):
+    """(ScanResult, None) or (None, why-not). Importing nimlint is allowed to
+    fail: a missing linter must NOT block builds, but it must also never be
+    reported as a clean lint."""
+    try:
+        if HERE not in sys.path:
+            sys.path.insert(0, HERE)
+        import nimlint  # noqa: E402
+    except Exception as e:                      # pragma: no cover
+        return None, "tools/nimlint.py unimportable: %s" % e
+    try:
+        return nimlint.scan(list(nimlint.DEFAULT_ROOTS), repo=repo), None
+    except Exception as e:                      # pragma: no cover
+        return None, "nimlint raised %s: %s" % (type(e).__name__, e)
+
+
+def lint_preflight(repo, strict=False, out=None):
+    """0 = go, LINT_EXIT = refuse. Prints its reasoning either way."""
+    w = out.write if out is not None else (lambda s: sys.stdout.write(s))
+    res, err = lint_scan(repo)
+    if res is None:
+        w("nimlint PRE-FLIGHT NOT PERFORMED: %s. The build is NOT being "
+          "vouched for; it is only not being blocked.\n" % err)
+        return 0
+    bad = list(res.errors) + (list(res.warnings) if strict else [])
+    # A finding is checked FIRST. An incomplete scan that also found a fatal
+    # shape must refuse, not shrug -- "inconclusive" is for a scan that found
+    # nothing while being unable to look everywhere.
+    if not bad:
+        if res.could_not_scan:
+            w("nimlint PRE-FLIGHT INCONCLUSIVE: %s. Not a pass; building "
+              "anyway.\n"
+              % ("; ".join(res.missing_roots + [u[0] for u in res.unreadable])))
+        return 0
+    w("BUILD REFUSED BEFORE THE LOCK: tools/nimlint.py found %d finding(s) "
+      "that make nimony die without naming a file.\n\n" % len(bad))
+    for f in bad:
+        w(f.human() + "\n\n")
+    w("Nothing was built and no lock was taken. Fix the finding, or "
+      "`--no-lint` if you are certain this is not it (and then say so).\n")
+    return LINT_EXIT
+
+
+def run_teed(cmd, cwd, env, ring=LOG_RING):
+    """Run the build, pass its output straight through, and keep the tail.
+
+    Returns (returncode, text). Decoding is errors='replace' -- a compiler that
+    emits one bad byte must not turn into a python traceback here, which would
+    be this script losing the build instead of the build failing.
+    """
+    from collections import deque
+    p = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE,
+                         stderr=subprocess.STDOUT)
+    tail = deque(maxlen=ring)
+    while True:
+        raw = p.stdout.readline()
+        if not raw:
+            break
+        line = raw.decode("utf-8", "replace")
+        sys.stdout.write(line)
+        sys.stdout.flush()
+        tail.append(line)
+    p.stdout.close()
+    return p.wait(), "".join(tail)
+
+
 def aowl_exe(repo):
     p = os.path.join(repo, "installer", "build", "aowl.exe")
     return p if os.path.exists(p) else "aowl"
@@ -1534,6 +2210,22 @@ def main():
                    metavar="SECONDS",
                    help="do not hang-check a holder younger than this "
                         "(default %d)" % DEFAULT_HUNG_AFTER)
+    p.add_argument("--no-artifact-check", action="store_true",
+                   dest="no_artifact_check",
+                   help="do not check that the target's declared artifact(s) "
+                        "exist after a successful build, and write no "
+                        "sidecar. The check is what turns exit 0 into "
+                        "evidence; turning it off means the exit code is a "
+                        "claim about the build PROCESS only.")
+    p.add_argument("--no-lint", action="store_true", dest="no_lint",
+                   help="skip the tools/nimlint.py pre-flight. The pre-flight "
+                        "refuses (exit %d) BEFORE taking the lock when the "
+                        "tree holds a shape measured to kill nimony without "
+                        "naming a file." % LINT_EXIT)
+    p.add_argument("--lint-strict", action="store_true", dest="lint_strict",
+                   help="the pre-flight refuses on nimlint WARNINGS too "
+                        "(three exist in this tree today, in code that "
+                        "builds)")
     p.add_argument("--no-snapshot", action="store_true",
                    help="skip the working-tree snapshot taken around the "
                         "build (it costs two `git status` calls and is only "
@@ -1597,6 +2289,20 @@ def main():
         print("nothing to run. Example: python tools/buildlock.py build host")
         return 2
 
+    if rest[0] == "verify-artifact":
+        # A QUESTION, not a build: it takes no lock and runs nothing, so it is
+        # safe to ask while somebody else is building (and answering it while
+        # a build runs is exactly when it is worth asking).
+        return cmd_verify_artifact(a.repo, rest)
+
+    # BEFORE the lock, deliberately. A build that cannot succeed should not
+    # first spend forty minutes in the queue -- and it should not hold the one
+    # serial resource in the checkout while it fails.
+    if not a.no_lint:
+        lrc = lint_preflight(a.repo, strict=a.lint_strict)
+        if lrc:
+            return lrc
+
     cmd = [aowl_exe(a.repo)] + rest
     if not acquire(path, " ".join(rest), a.wait, a.max_age, a.steal,
                    hopts):
@@ -1618,16 +2324,35 @@ def main():
         # the interval the child runs in, and before the child starts so the
         # child's own outputs are not mistaken for someone's edit.
         before = tree_snapshot(a.repo) if not a.no_snapshot else None
-        rc = subprocess.run(cmd, cwd=a.repo, env=env).returncode
+        rc, build_text = run_teed(cmd, a.repo, env)
     finally:
         release(path)
+    finished = time.time()
     print("%r finished in %.0fs with exit %d (lock released)"
-          % (" ".join(rest), time.time() - t0, rc))
+          % (" ".join(rest), finished - t0, rc))
+    # "the build failed" and "the COMPILER died and could not say where" are
+    # different events, and reporting the second as the first is what turned a
+    # two-line source bug into 2.5 hours on 2026-09-01.
+    if rc != 0:
+        ev = internal_crash_verdict(build_text, repo=a.repo)
+        if ev["crash"]:
+            print_internal_crash(ev, a.repo)
+            if before is not None:
+                print_concurrent_edits(before, tree_snapshot(a.repo))
+            return INTERNAL_CRASH_EXIT
     # Only on FAILURE. A green build printing a list of other agents' edits
     # would train everyone to ignore the block, and the block is only worth
     # anything if seeing it means something.
     if rc != 0 and before is not None:
         print_concurrent_edits(before, tree_snapshot(a.repo))
+    if rc == 0 and not a.no_artifact_check:
+        # The build said it worked. That is a claim about a PROCESS. Whether a
+        # file exists is a different question, and it is the one the caller
+        # actually asked -- measured five times on 2026-09-02 answering `ok`
+        # for an artifact a queued build had already deleted.
+        arc = check_and_record(a.repo, rest, t0, finished)
+        if arc:
+            return arc
     return rc
 
 
