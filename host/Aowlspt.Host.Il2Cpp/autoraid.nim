@@ -123,6 +123,13 @@ const
                                 ## was spent on the character mesh. The
                                 ## CONTAINER is the thing to walk, not the
                                 ## screen.
+  ArSideNextDepth = 6           ## descent from the side screen to its own
+                                ## `ScreenDefaultButtons -> NextButton`, which
+                                ## is at depth 2 (measured live).
+  ArMaxSideNext   = 96          ## ACTIVE nodes examined for that search. Large
+                                ## enough that a truncation is visibly AT the
+                                ## cap in the refusal, rather than looking like
+                                ## an absence.
   ArMaxSideConts  = 8           ## pmc/scav containers examined.
   ArMaxSideProbe  = 40          ## nodes GetComponent-probed INSIDE one
                                 ## container. Bounded because each probe
@@ -813,6 +820,43 @@ proc arCollectBFS(root: Il2CppPtr; depth: int; budget: var int;
     if head >= levelEnd:
       levelEnd = q.len
       lvl = lvl + 1
+
+proc arFindActiveNamedBFS(root: Il2CppPtr; name: string; depth, cap: int;
+                          visited: var int; names: var string): Il2CppPtr =
+  ## The ACTIVE node named `name` under `root`, found LEVEL BY LEVEL, reporting
+  ## how many nodes it examined and what it saw.
+  ##
+  ## WHY NOT `arWalkActive`. MEASURED 2026-09-02: the side selector's own
+  ## `NextButton` is at DEPTH 2 under the site-3 receiver
+  ## (`ScreenDefaultButtons -> NextButton`, confirmed live with
+  ## `find NextButton <receiver> 4000` -> HIT, 558 nodes, EXHAUSTIVE, and
+  ## `assert-active` -> PASS), and `arWalkActive` still returned nil eight times
+  ## in a row. It takes each level breadth-first but then RECURSES into child 0,
+  ## which under this screen is `PMCs` -- the character MODEL -- so it spends
+  ## its 120 ms in-frame slice down there and poisons its own budget before it
+  ## ever reaches the sibling `ScreenDefaultButtons`. The inspector's `find`
+  ## does not hit this because it auto-resumes across FRAMES; a host walk gets
+  ## one slice, so total node count says nothing about whether it fits.
+  ##
+  ## A real BFS cannot fail that way: level 2 is fully examined before any
+  ## level-3 mesh node is touched. This is the same lesson as `arCollectBFS`,
+  ## and it is now applied to the by-NAME search as well as the collect.
+  result = nil
+  visited = 0
+  names = ""
+  if root == nil or name.len == 0: return
+  var nodes: seq[Il2CppPtr] = @[]
+  var b = ArNodeBudget
+  arCollectBFS(root, depth, b, cNowMs() + ArWalkMs, nodes, cap, "")
+  visited = nodes.len
+  var i = 0
+  while i < nodes.len:
+    let nm = iObjName(nodes[i])
+    if nm.len > 0 and names.len < 500:
+      names = names & "[" & nm & "]"
+    if result == nil and nm == name:
+      result = nodes[i]
+    i = i + 1
 
 proc arCollectActiveBF(t: Il2CppPtr; depth: int; budget: var int;
                        deadline: uint64; into: var seq[Il2CppPtr]; cap: int;
@@ -1722,15 +1766,23 @@ proc arTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ar_tick_body", cdecl.}
       # fits it. It is resolved from the SITE-3 RECEIVER's own subtree, never by
       # an all-roots name hunt.
       gArCrumb = 20
-      var b = ArNodeBudget
-      let nb = arWalkActive(gArSideTr, "NextButton", ArSideDeepDepth, b,
-                            cNowMs() + ArWalkMs, nil)
+      var seen = 0
+      var seenNames = ""
+      let nb = arFindActiveNamedBFS(gArSideTr, "NextButton", ArSideNextDepth,
+                                    ArMaxSideNext, seen, seenNames)
       if nb == nil:
         if now - gArSideLogMs > 5000'u64:
           gArSideLogMs = now
-          warn "autoRaid SIDE: the side was chosen but this screen has NO " &
-               "ACTIVE node named `NextButton` under it, so nothing can " &
-               "advance it. NOTHING WAS PRESSED."
+          warn "autoRaid SIDE: the side was chosen but NO ACTIVE node named " &
+               "`NextButton` was found under the site-3 receiver (0x" &
+               hexOf(cast[uint64](gArSideTr)) & ") -- level-by-level BFS, " &
+               "depth " & $ArSideNextDepth & ", cap " & $ArMaxSideNext &
+               ", examined " & $seen & " ACTIVE node(s): " &
+               (if seenNames.len > 0: seenNames else: "<none>") &
+               ". NOTHING WAS PRESSED. The names above are the evidence: if " &
+               "`NextButton` is among them the comparison is wrong, if the " &
+               "count is at the cap the search was truncated, and if the " &
+               "count is tiny the receiver is not the screen."
         return
       if arPress(nb, "DefaultUIButton"):
         gArSideNextDone = true

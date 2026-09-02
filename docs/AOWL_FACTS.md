@@ -7272,3 +7272,82 @@ ToggleGroup that arrives with the Control Settings/Toggles clone, highlight
 via AnimatedToggle::set_IsToggled, and selection rides the one existing
 Toggle::Set postfix. Remaining step-1 defect: after pressing GAME back, our
 panel stays active alongside Game Settings (no hide on a foreign toggle).
+
+## 2026-09-02: the key is NOT the clobber source, and the poll had a SECOND gate
+
+Measured on the 4,805,120 deploy, Settings open, all via the live inspector.
+
+**`findtext` mis-parses a multi-word needle.** `findtext Interface language
+$settings 40000 all` answers `! not an address: language` -- it takes ONE token
+as the needle (`inspect.nim iCmdFindText`, `let want = ftoks[1]`) and hands the
+second word to the root resolver. The needle must be QUOTED. Unquoted it
+returns 0 hits with completeness UNKNOWN, which reads as "nothing is wrong".
+`acceptance.py` already quotes it; anything else calling `findtext` by hand
+must too.
+
+**`localizationKey`@0x70** (`fldoff fields LocalizedText`, self-check passed;
+`_labels`@0x78 matches the offset the host already uses) reads **EMPTY on the
+failing cloned row AND on the stock row**. So the donor caption is not being
+re-resolved from a key, and rewriting the key would be writing a field nothing
+reads. That rules out the "rewrite the key" fix on this build.
+
+**Only the ROW LABEL reverts.** `tree` on a failing row:
+
+    Settings Drop Down(Clone)(Clone)
+      Text                          <- reverted to 'Interface language'
+      Dropdown/Text                 <- KEPT our caption
+      Dropdown/Element/Text         <- KEPT our caption
+
+`findtext "aowlspt - host"` finds our caption on the `Dropdown` and `Element`
+TMPs and nowhere else. All three were written in one pass and all three read
+back correct at write time -- so two of three stuck permanently and the third,
+the one bound to the control's LocalizedText `_labels[0]`, is rewritten
+afterwards by something else. That is precisely the case the re-assert poll
+exists for.
+
+**The poll had TWO gates and the earlier fix removed only the inner one.**
+`modsTabTick` -- the rider's entry -- returns on `if not gModsOn` before the
+guarded body is ever entered, so ungating the poll *inside* `modsTabTickBody`
+changed nothing at all. With `settingsModsTab off` the poll had never run in
+any of these sessions. It is now gated on the FAULT budget plus "the registry
+is non-empty", so the feature that owns the rows no longer depends on a
+different feature's flag being on.
+
+**The lesson, again and one level up:** a fix that removes *a* gate is not a
+fix that removes *the* gate. The check that would have caught it is the one
+that asks whether the mechanism ran at all -- the poll's only log line fires at
+stability, so silence from it was indistinguishable from success.
+
+## 2026-09-02: a host walk gets ONE frame slice, so "558 nodes, EXHAUSTIVE" from the inspector proves nothing about it
+
+MEASURED on the 4,805,120-byte build: `Toggle::Set` fixed the SIDE crash (no
+faults, `SIDE: pressed the AnimatedToggle on AnimatedToggle for side "pmc"`,
+candidates `[Button Button][AnimatedToggle AnimatedToggle]`), and then the step
+reported eight times that the screen had **no ACTIVE node named `NextButton`**.
+Checked live on the same screen: `find NextButton <site-3 receiver> 4000` ->
+HIT `name="NextButton" parent="ScreenDefaultButtons"`, 558 nodes, EXHAUSTIVE;
+`assert-active` -> PASS, `activeInHierarchy=true`. Depth 2 under the receiver.
+
+So the button was there, active and shallow, and `arWalkActive` still returned
+nil -- for the third time in this file's history, because it takes a level
+breadth-first and then **recurses into child 0**, which on this screen is `PMCs`,
+the character MODEL. It spends its 120 ms in-frame slice down there and poisons
+its own budget before ever reaching the sibling `ScreenDefaultButtons`.
+
+**The generalisable fact: the inspector's `find` auto-resumes across FRAMES
+(12 ms slices, node budget bounding the whole search), while a host-side walk
+gets ONE slice inside one frame.** An `EXHAUSTIVE / 558 nodes` verdict from the
+inspector therefore says nothing about whether the same search fits in a host
+walk, and "the inspector found it, so the host should" is not an inference that
+holds. Two of the three fixes this session were the same shape: use a TRUE
+level-by-level BFS (`arCollectBFS`, and now `arFindActiveNamedBFS` for the
+by-name search), where level 2 is fully examined before any level-3 mesh node.
+
+The refusal now carries its own evidence -- receiver pointer, depth, cap, the
+number of ACTIVE nodes examined and their NAMES -- so the three failure modes
+are distinguishable next run: the name present in the list means the comparison
+is wrong, a count AT the cap means truncation, and a tiny count means the
+receiver is not the screen. `arWalkActive` is deliberately left alone elsewhere
+(PRE-MENU's BackButton and the WAIT-MENU searches use it successfully, on
+screens with no model subtree); only the search that demonstrably failed was
+changed.
