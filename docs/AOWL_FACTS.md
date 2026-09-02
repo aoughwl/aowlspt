@@ -7429,3 +7429,15 @@ acceptance `no donor caption on any aowlspt-cloned settings row: 0 on a
 (Clone)(Clone) row, 1 stock` PASS. Two dead gates in a row had kept that
 poll from ever running; a poll that cannot announce itself is
 indistinguishable from success.
+
+## 2026-09-02 07:30: raid entry reaches the offline-raid screen on events alone
+
+MEASURED (build 4,831,232): menu -> PLAY -> site 3 -> PMC toggle + own NEXT
+-> site 4 (MatchMakerSelectionLocationScreen::Show) -> `pressed the tile
+whose Label reads "WOODS"` (tiles offered: RESERVE, LIGHTHOUSE, INTERCHANGE,
+CUSTOMS, GROUND ZERO, ICEBREAKER, WOODS) -> own NEXT -> site 0
+(MatchmakerOfflineRaidScreen::Show) -- 6.7s of host time from arm to the
+offline-raid screen, every transition an event with a readback. The step
+after it (NEXT->insurance) still waits for the following screen's control
+instead of pressing this screen's own NEXT; being generalised into a
+(site, screen, action) table.
