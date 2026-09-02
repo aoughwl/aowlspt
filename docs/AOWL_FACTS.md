@@ -369,7 +369,7 @@ Then, on the next tab visit: entry #2 ... renderedFor=0x178462d2dc0 (matching ta
 
 **structure:tabs-are-closed**
 
-5 hardcoded field pairs + a static Dictionary&lt;ESettingsGroup,..&gt; â€” no list to append to
+5 hardcoded field pairs + a static Dictionary<ESettingsGroup,..> â€” no list to append to
 
 > A SIXTH NATIVE TAB IS NOT POSSIBLE: tab identity is an ESettingsGroup enum value and the game's selection logic switches on it, so a new tab could never be routed to. The viable route is VIEW-LEVEL: clone a ToggleSpawner into SettingsScreen/Toggles and a tab panel beside the stock five, then drive activation ourselves (our own onValueChanged handler + SetActive), and hide our panel whenever _currentTab (+0x118) changes to a stock tab. The game never needs to know. Sub-tabs INSIDE our panel are entirely ours, so the enum problem does not recur there â€” copy the Control Settings pattern: a `Toggles` bar of AnimatedToggles plus one panel each under `Content`.</note>
 </invoke>
@@ -379,7 +379,7 @@ Then, on the next tab visit: entry #2 ... renderedFor=0x178462d2dc0 (matching ta
 - command: `il2cpp_resolve.py fields EFT.UI.Settings.SettingsScreen`
 - evidence: 0xc8.._gameButton 0xd0.._graphicsButton 0xd8.._postFXButton 0xe0.._soundButton 0xe8.._controlsButton  (all UIAnimatedToggleSpawner)
 0xf0.._gameSettingsScreen 0xf8.._graphicsSettingsScreen 0x100.._postFXSettingsScreen 0x108.._soundSettingsScreen 0x110.._controlsSettingsTabScreen
-0x118 _currentTab SettingsTab ; 0x138 _initializedTabs HashSet&lt;ESettingsGroup&gt; ; STATIC _tabs Dictionary&lt;ESettingsGroup,SettingsGroupObjects&gt;
+0x118 _currentTab SettingsTab ; 0x138 _initializedTabs HashSet<ESettingsGroup> ; STATIC _tabs Dictionary<ESettingsGroup,SettingsGroupObjects>
 
 ### #22 — EFT.UI.Settings.SettingsScreen
 
@@ -397,7 +397,7 @@ CORRECTION â€” a native 6th tab is plausible via the static _tabs Dictionar
 SettingsGroupObjects: Tab(SettingsTab)@0x10, Toggle(UIAnimatedToggleSpawner)@0x18, .ctor RVA=0x663770.
 SettingsScreen methods: Awake 0x171e940, EnsureTabInitialized 0x171ff10, OpenGroup 0x1720c80, ShowScreen 0x1720de0, .cctor 0x1721820.
 GetComponent("SettingsTab") succeeds on the 'Control Settings' GameObject.</evidence>
-<parameter name="note">SUPERSEDES the claim that a 6th native tab is impossible â€” that was inferred from the five hardcoded field pairs and stated too strongly. What IS certain: you cannot add a FIELD (IL2CPP type layout is baked at build time). What is NOT blocked: `_tabs` is a static Dictionary&lt;ESettingsGroup,SettingsGroupObjects&gt;, i.e. a data-driven registry, and an enum key is just an int32 at runtime. THE ONE RISKY STEP is calling Add on that Dictionary instantiation: the key is a value type so it is NOT a shared generic and concrete code exists, but locating its RVA offline is unproven. Spike that before building anything else. Structure to clone: SettingsScreen has children Toggles (the tab bar, 5 *ToggleSpawner entries) plus one panel per tab; Control Settings repeats the same pattern one level down (Toggles + Content) and is the donor for sub-tabs.</note>
+<parameter name="note">SUPERSEDES the claim that a 6th native tab is impossible â€” that was inferred from the five hardcoded field pairs and stated too strongly. What IS certain: you cannot add a FIELD (IL2CPP type layout is baked at build time). What is NOT blocked: `_tabs` is a static Dictionary<ESettingsGroup,SettingsGroupObjects>, i.e. a data-driven registry, and an enum key is just an int32 at runtime. THE ONE RISKY STEP is calling Add on that Dictionary instantiation: the key is a value type so it is NOT a shared generic and concrete code exists, but locating its RVA offline is unproven. Spike that before building anything else. Structure to clone: SettingsScreen has children Toggles (the tab bar, 5 *ToggleSpawner entries) plus one panel per tab; Control Settings repeats the same pattern one level down (Toggles + Content) and is the donor for sub-tabs.</note>
 
 ### #23 — aowl.textures mod
 
@@ -416,7 +416,7 @@ hard crash at armDelayMs, during hook install, with nothing logged
 
 **bug:kills-sain-for-prepatch-added-wildspawntypes**
 
-ToESain() throws ArgumentOutOfRangeException for any WildSpawnType not in the ESainWildSpawnType mirror -> BotComponent.CreateClasses() aborts and disposes the whole SAIN component -> the bot spawns with NO combat brain and never engages the player. Fix: reflectively add the custom int values to the private static HashSet&lt;int&gt; _esainWildSpawnValues before bots spawn (done in MoreBotsAPI SAINInterop.RegisterEnumMirrorValues, called from Init/TarkovInitPatch).
+ToESain() throws ArgumentOutOfRangeException for any WildSpawnType not in the ESainWildSpawnType mirror -> BotComponent.CreateClasses() aborts and disposes the whole SAIN component -> the bot spawns with NO combat brain and never engages the player. Fix: reflectively add the custom int values to the private static HashSet<int> _esainWildSpawnValues before bots spawn (done in MoreBotsAPI SAINInterop.RegisterEnumMirrorValues, called from Init/TarkovInitPatch).
 
 <sub>method: `measured` · scope: `aowlspt-ga:e0ea3ad3b76b-db:41313127` · status: live · recorded: 2026-08-22T20:34:00 · last seen: 2026-08-22T20:34:00</sub>
 
@@ -621,7 +621,7 @@ set_WalkEffectorEnabled(false) -> clears Mask bit 2 and calls WalkEffector.OnSto
 
 public void PlaySound(EFT.Ballistics.Shot shot, Vector3 forward, Vector3 normal) - the bullet whizz/crack player, on a MonoBehaviour under the LOCAL player camera. normal.magnitude IS the perpendicular miss distance in metres from the local camera, already computed by BSG in FlyingBulletSoundPlayer.TryShot. Early-returns beyond _minMaxRadius.y (default 10m), so you get a free proximity filter. Inherently camera-local (only the local player has a PlayerCameraController) so no aggressor filtering needed. shot.Player / shot.Damage / shot.Speed / shot.Ammo available. Skips shots that hit a BodyPartCollider (those are real damage instead). THIS IS THE SUPPRESSION INPUT - there is no suppression state on the local Player at all.
 
-> Companion hooks for a stress model, all event-driven and all verified on this build: Player.BeingHitAction (Action&lt;DamageInfo,EBodyPart,float&gt; - but the float 'absorbed' is HARD-CODED 0f at the call site, use DidBodyDamage vs Damage); GlobalEventDispatcher.OnKill(IPlayer killer, IPlayer target); GlobalEventDispatcher.OnGrenadeExplosive(position,...); Player.TryStartContusion(float). GameWorld.NetworkWorldOnGrenadeHit is an EMPTY virtual body on this build - patching it never fires. EnemyInfo has NO namespace (EFT.EnemyInfo does not resolve).
+> Companion hooks for a stress model, all event-driven and all verified on this build: Player.BeingHitAction (Action<DamageInfo,EBodyPart,float> - but the float 'absorbed' is HARD-CODED 0f at the call site, use DidBodyDamage vs Damage); GlobalEventDispatcher.OnKill(IPlayer killer, IPlayer target); GlobalEventDispatcher.OnGrenadeExplosive(position,...); Player.TryStartContusion(float). GameWorld.NetworkWorldOnGrenadeHit is an EMPTY virtual body on this build - patching it never fires. EnemyInfo has NO namespace (EFT.EnemyInfo does not resolve).
 
 <sub>method: `measured` · scope: `aowlspt-ga:e0ea3ad3b76b-db:41313127` · status: live · recorded: 2026-08-23T11:50:59 · last seen: 2026-08-23T11:50:59</sub>
 
@@ -648,9 +648,9 @@ SPT's deobfuscator gave several PWA properties names that do not match what they
 
 **hook:complete-public-pose-blend-system-with-ZERO-callers**
 
-AnimatorPose is a ScriptableObject {Vector3 Position, Rotation, CameraRotation, CameraPosition; AnimationCurve Blend}. PWA exposes public void AssignAnimatorPose(AnimatorPose) and public List&lt;(AnimatorPose,float,bool)&gt; ActiveBlends. BlendAnimatorPose(dt) runs every frame and does HandsPosition.Zero += pose.Position*w and HandsRotation.Zero += pose.Rotation*w. It has NO CALLERS anywhere in Assembly-CSharp - an unused hook. A plugin can ScriptableObject.CreateInstance&lt;AnimatorPose&gt;(), fill it, and call AssignAnimatorPose(p) to blend in / (null) to blend out. THIS IS THE LOW-READY / PORT-ARMS / CARRY-POSE PRIMITIVE: it goes through the spring's Zero so it is spring-smoothed AND the weapon-collision raycast follows it for free.
+AnimatorPose is a ScriptableObject {Vector3 Position, Rotation, CameraRotation, CameraPosition; AnimationCurve Blend}. PWA exposes public void AssignAnimatorPose(AnimatorPose) and public List<(AnimatorPose,float,bool)> ActiveBlends. BlendAnimatorPose(dt) runs every frame and does HandsPosition.Zero += pose.Position*w and HandsRotation.Zero += pose.Rotation*w. It has NO CALLERS anywhere in Assembly-CSharp - an unused hook. A plugin can ScriptableObject.CreateInstance<AnimatorPose>(), fill it, and call AssignAnimatorPose(p) to blend in / (null) to blend out. THIS IS THE LOW-READY / PORT-ARMS / CARRY-POSE PRIMITIVE: it goes through the spring's Zero so it is spring-smoothed AND the weapon-collision raycast follows it for free.
 
-> CAVEATS: (1) AssignAnimatorPose sets CustomEffector.Aim=false and UpdateCustomEffector forces Aim = IsAiming &amp;&amp; ActiveBlends.Count &lt; 1, so an active pose suppresses the aim micro-pose. (2) The CAMERA half is DEAD: CalculateCameraPosition gates it on private float _animatorPoseBlend, which is declared and read but NEVER ASSIGNED anywhere - needs reflection to use. Position+Rotation work regardless. (3) Zero callers is suggestive but not proof; a Unity animation event off-assembly could contend.
+> CAVEATS: (1) AssignAnimatorPose sets CustomEffector.Aim=false and UpdateCustomEffector forces Aim = IsAiming &amp;&amp; ActiveBlends.Count < 1, so an active pose suppresses the aim micro-pose. (2) The CAMERA half is DEAD: CalculateCameraPosition gates it on private float _animatorPoseBlend, which is declared and read but NEVER ASSIGNED anywhere - needs reflection to use. Position+Rotation work regardless. (3) Zero callers is suggestive but not proof; a Unity animation event off-assembly could contend.
 Related: PositionZeroSum.x/.z are NEVER written by the game (ZeroAdjustments writes only .y), so they persist forever - free base offset. .y needs a ZeroAdjustments postfix.
 
 <sub>method: `measured` · scope: `aowlspt-ga:e0ea3ad3b76b-db:41313127` · status: live · recorded: 2026-08-23T11:52:58 · last seen: 2026-08-23T11:52:58</sub>
@@ -688,7 +688,7 @@ parameterCount lives at byte 34 of the 36-byte Il2CppMethodDefinition (metadata 
 
 **gotcha:bootstrap-and-named-build-targets-exist-only-on-feat-dev-tooling**
 
-`aowl bootstrap` and `aowl build &lt;target&gt;` are NOT on main â€” CLAUDE.md documents them as universal, and following it from main or an older branch costs a ~18-minute full build
+`aowl bootstrap` and `aowl build <target>` are NOT on main â€” CLAUDE.md documents them as universal, and following it from main or an older branch costs a ~18-minute full build
 
 > CLAUDE.md section 3 states "aowl build host ~48s vs aowl build ~4m27s warm / 18m cold" and "use aowl bootstrap" as if they apply everywhere. They only apply on feat-dev-tooling and descendants. TRAP FOR AGENTS: copying aowl.exe from another checkout makes builds fast but runs MAIN's aowl.nim, so any build step added on the working branch is silently unexercised - one agent's new nameIndex build step was never run for exactly this reason. Either rebase feature branches onto the driver, or state the caveat in CLAUDE.md.
 
@@ -742,7 +742,7 @@ ARMED live â€” patch-by-RVA installs a typed postfix on AssetBundle::LoadAs
 
 <sub>method: `measured` · scope: `aowlspt-ga:e0ea3ad3b76b-db:41313127` · status: live · recorded: 2026-08-23T12:20:54 · last seen: 2026-08-23T12:20:54</sub>
 
-- evidence: Live run 2026-08-23, host build 04f0311 (branch feat-patch-by-rva, contains the name index at 9f3d12e), textures.dll 616448 bytes, swapMode=probe. Host log: [0:00:46.140] "textures verified GameAssembly+0x5250100 prologue [48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 80] - installing typed postfix"; [0:00:46.156] "textures hooked UnityEngine.AssetBundle::LoadAsset@0x5250100/io&gt;o!48895C24084889742410574883EC2080"; [0:00:46.156] "textures ARMED post-boot in mode probe (count only); VRAM budget 1024 MB". Client survived the install. Stats at arm: mode=1 armed=true canUpload=false nameSource=false fires=0. The spec form that works is Type::Method@0xRVA/&lt;shape&gt;!&lt;hexprologue&gt;, where shape is i|s + one letter per declared arg + '&gt;' + return letter; a postfix with NO declared shape is refused rather than installed on a guess (there is no readable MethodInfo to derive frameKinds/retKind from).
+- evidence: Live run 2026-08-23, host build 04f0311 (branch feat-patch-by-rva, contains the name index at 9f3d12e), textures.dll 616448 bytes, swapMode=probe. Host log: [0:00:46.140] "textures verified GameAssembly+0x5250100 prologue [48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 80] - installing typed postfix"; [0:00:46.156] "textures hooked UnityEngine.AssetBundle::LoadAsset@0x5250100/io>o!48895C24084889742410574883EC2080"; [0:00:46.156] "textures ARMED post-boot in mode probe (count only); VRAM budget 1024 MB". Client survived the install. Stats at arm: mode=1 armed=true canUpload=false nameSource=false fires=0. The spec form that works is Type::Method@0xRVA/<shape>!<hexprologue>, where shape is i|s + one letter per declared arg + '>' + return letter; a postfix with NO declared shape is refused rather than installed on a guess (there is no readable MethodInfo to derive frameKinds/retKind from).
 
 ### #48 — live-inspector
 
@@ -760,7 +760,7 @@ the two highest-value missing verbs â€” requested 5+ times across agents in
 
 **asset:high-res-in-game-map-art-lives-in-a-tiled-pyramid**
 
-StreamingAssets/Windows/assets/content/pocketmap/ holds 731 MB of the in-game pocket-map screen as a zoom-tiled image pyramid: tiles named map_tile_&lt;col&gt;x&lt;row&gt;_&lt;scale&gt;, scale 8/4/2/1 (1 = full res), plain UnityFS, Unity 2022.3.43f1, UNENCRYPTED. Config_scale&lt;N&gt; MonoBehaviours carry an explicit Tiles[]{Tile,X,Y,Scale} placement list - use it instead of parsing names. Full res: Customs 30322x13681 (usable, full-bleed no border), Woods 9600x9600 and Shoreline 11000x7563 (usable after cropping a drawn paper margin), Interchange 6000x4905 (site-plan panel only), Sanatorium and Factory are building floor plans and NOT terrain. Only these 6 maps exist - no Streets/Reserve/Lighthouse/GroundZero/Labs.
+StreamingAssets/Windows/assets/content/pocketmap/ holds 731 MB of the in-game pocket-map screen as a zoom-tiled image pyramid: tiles named map_tile_<col>x<row>_<scale>, scale 8/4/2/1 (1 = full res), plain UnityFS, Unity 2022.3.43f1, UNENCRYPTED. Config_scale<N> MonoBehaviours carry an explicit Tiles[]{Tile,X,Y,Scale} placement list - use it instead of parsing names. Full res: Customs 30322x13681 (usable, full-bleed no border), Woods 9600x9600 and Shoreline 11000x7563 (usable after cropping a drawn paper margin), Interchange 6000x4905 (site-plan panel only), Sanatorium and Factory are building floor plans and NOT terrain. Only these 6 maps exist - no Streets/Reserve/Lighthouse/GroundZero/Labs.
 
 > Unity's Texture2D max dimension is 16384, so Customs scale 1 (30322 wide) CANNOT be a single texture - scale 2 (15161x6841) is the usable tier. Licensing: BSG art, not redistributable, but already on every user's disk - extract client-side at install time rather than shipping PNGs. TOOLING TRAPS: UnityPy returns an EMPTY environment for a nonexistent path with no exception (assert the path exists); env.objects is a ONE-SHOT generator and iterating twice silently yields nothing; MSYS mangles /d/SPT paths inconsistently - pass Windows-style D:/ paths. No usable CPython on this box (PATH python is MSYS2 UCRT 3.14, no wheels) - `uv venv --python 3.12` is the fix.
 
@@ -780,7 +780,7 @@ Tarkov does not call the public sync LoadAsset â€” a full raid load produce
 
 <sub>method: `measured` · scope: `aowlspt-ga:e0ea3ad3b76b-db:41313127` · status: live · recorded: 2026-08-23T12:28:44 · last seen: 2026-08-23T12:28:44</sub>
 
-- evidence: Live run 2026-08-23, host 04f0311, textures.dll 616448 B, swapMode=probe. The hook installed and byte-verified: "textures verified GameAssembly+0x5250100 prologue [48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 80] - installing typed postfix" / "textures hooked UnityEngine.AssetBundle::LoadAsset@0x5250100/io&gt;o!48895C..." / "ARMED post-boot in mode probe". A human then entered an offline raid manually. In-raid confirmed independently by botdiag: 18 "RegisterPlayer #N incoming" events (that detour binds by verified STATIC RVA, so it works where by-name does not). Across menu plus a full raid load, stats logged every 10s stayed "fires":0 - through 0:08:26 and beyond. Zero calls.
+- evidence: Live run 2026-08-23, host 04f0311, textures.dll 616448 B, swapMode=probe. The hook installed and byte-verified: "textures verified GameAssembly+0x5250100 prologue [48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 80] - installing typed postfix" / "textures hooked UnityEngine.AssetBundle::LoadAsset@0x5250100/io>o!48895C..." / "ARMED post-boot in mode probe". A human then entered an offline raid manually. In-raid confirmed independently by botdiag: 18 "RegisterPlayer #N incoming" events (that detour binds by verified STATIC RVA, so it works where by-name does not). Across menu plus a full raid load, stats logged every 10s stayed "fires":0 - through 0:08:26 and beyond. Zero calls.
 
 ### #51 — live-inspector `state` in-raid anchor
 
@@ -873,7 +873,7 @@ INFERRED â€” AssetsManager â†’ BundlesManager â†’ Diz.Resources.E
 <sub>method: `inferred` · scope: `aowlspt-ga:e0ea3ad3b76b-db:41313127` · status: live · recorded: 2026-08-23T13:35:09 · last seen: 2026-08-23T13:35:09</sub>
 
 - evidence: Offline only, 2026-08-23, two independent instruments agreeing on every RVA (tools/il2cpp_resolve.py find/type on decrypted metadata, cross-checked by tools/il2cpp_nameindex.py lookup). BSG ship their own asset layer in its own image Diz.Resources.dll, matching the "Easy Assets" DontDestroyOnLoad root. Key candidates: Diz.Resources.EasyBundle::Load rid=42 @0x2772CC0, LoadingCoroutine 43@0x2773020, Unload 44@0x27731E0; EFT.AssetsManager.AssetsManager::GetAsset 100582@0x19117E0, FindAsset 100578@0x19114C0, LoadAssetAsync 100584@0x1911A60, LoadBundlesAsync 100588@0x1911CD0; TextureCache::TryGet 56889@0xBDE7E0 and Cache 56890@0xBDE910; EFT.AssetsManager.AssetBundleExtension::FixAssetName 100570@0x1910C40. Consistent with fact #55 (Unity's AssetBundle API sees ~1 call per raid).</evidence>
-<parameter name="note">INFERRED, NOT MEASURED - no candidate has fired yet; which one is the real chokepoint is a prediction the next raid decides. TextureCache::TryGet/Cache were chosen on NAME ALONE with no signature evidence they carry a Texture, because il2cpp_resolve.py reports no parameter types. Generic GetAsset&lt;T&gt; overloads resolve to RVA=None (generic definitions) and are unhookable. Probe built: branch probe-easyassets, commit b985d7f, 37 targets, set probeTargets='bsg' (BSG targets + the ab6 control), requires swapMode off. Separately MEASURED and correcting an earlier caution: AssetBundle rids 11-14 ARE safe to hook - abi/aowlspt_detour.h's aowl_insn decodes 80 /7 with a RIP displacement and aowl_copy_relocated rewrites it, refusing if it no longer fits int32; they were unmeasured, not unsafe.
+<parameter name="note">INFERRED, NOT MEASURED - no candidate has fired yet; which one is the real chokepoint is a prediction the next raid decides. TextureCache::TryGet/Cache were chosen on NAME ALONE with no signature evidence they carry a Texture, because il2cpp_resolve.py reports no parameter types. Generic GetAsset<T> overloads resolve to RVA=None (generic definitions) and are unhookable. Probe built: branch probe-easyassets, commit b985d7f, 37 targets, set probeTargets='bsg' (BSG targets + the ab6 control), requires swapMode off. Separately MEASURED and correcting an earlier caution: AssetBundle rids 11-14 ARE safe to hook - abi/aowlspt_detour.h's aowl_insn decodes 80 /7 with a RIP displacement and aowl_copy_relocated rewrites it, refusing if it no longer fits int32; they were unmeasured, not unsafe.
 
 ### #59 — branch integ-tooling (9c5ec40)
 
@@ -910,7 +910,7 @@ Generalises fact #50, which measured the same zero-firing on the post-1.0 build.
 <sub>method: `measured` · scope: `aowlspt-ga:e0ea3ad3b76b-db:41313127` · status: live · recorded: 2026-08-23T14:01:38 · last seen: 2026-08-23T14:01:38</sub>
 
 - evidence: Measured 2026-08-23 by `il2cpp_nameindex.py shared` over all 208,632 methods: 124,575 distinct RVAs, 6,261 (5.0%) reached by more than one key; 46,608 of 164,922 exact keys (28.3%) land on a shared RVA. Histogram keys:RVAs = 2:3587 3:1062 4:382 5:217 6:231 7:95 8:75 9:91 10:55 11:40. Worst offenders: 0x628110 -> 6438 keys, 0x6898F0 -> 1637, 0x6B6630 -> 760, 0x66C210 -> 677, 0x629540 -> 675, 0x6898E0 -> 650. Fact #57 reproduced exactly: EasyAssets::get_System and EFT.AssetsManager.BundlesManager::get_DownloadingUrl both 0x692A50 (338 keys share it); their set_* both 0x692A60 (146 keys).</evidence>
-<parameter name="note">CORRECTION TO CLAUDE.md SECTION 5. That file states "ForceMeshUpdate @0x628110 is a bare ret: a stub that passes a signature check is the worst case." Two things are wrong: the bytes are C2 00 00 (ret 0), not a bare C3; and 0x628110 is not ForceMeshUpdate's own address at all - it is this build's UNIVERSAL EMPTY-BODY STUB, shared by 6,438 methods. The underlying lesson is right and in fact much stronger than written: resolving a name to 0x628110 tells you only that the method has no body. SCALE OF THE HAZARD: more than a quarter of all by-name lookups return an address shared with at least one other method, so a detour installed there fires for every one of them. Calling a shared RVA is fine (correct code for the receiver you pass); DETOURING one is a write with unbounded blast radius. The generator now emits a sidecar &lt;idx&gt;.shared and `lookup --refuse-shared` exits 2; host-side refusal is NOT yet implemented (it needs index format v2 and an abi/aowlspt_nameindex.h change).
+<parameter name="note">CORRECTION TO CLAUDE.md SECTION 5. That file states "ForceMeshUpdate @0x628110 is a bare ret: a stub that passes a signature check is the worst case." Two things are wrong: the bytes are C2 00 00 (ret 0), not a bare C3; and 0x628110 is not ForceMeshUpdate's own address at all - it is this build's UNIVERSAL EMPTY-BODY STUB, shared by 6,438 methods. The underlying lesson is right and in fact much stronger than written: resolving a name to 0x628110 tells you only that the method has no body. SCALE OF THE HAZARD: more than a quarter of all by-name lookups return an address shared with at least one other method, so a detour installed there fires for every one of them. Calling a shared RVA is fine (correct code for the receiver you pass); DETOURING one is a write with unbounded blast radius. The generator now emits a sidecar <idx>.shared and `lookup --refuse-shared` exits 2; host-side refusal is NOT yet implemented (it needs index format v2 and an abi/aowlspt_nameindex.h change).
 
 ### #62 — Il2CppMethodDefinition / Il2CppParameterDefinition (metadata v31)
 
@@ -921,7 +921,7 @@ returnType@8, parameterStart@16, parameterCount@34; parameters are metadata prop
 <sub>method: `measured` · scope: `aowlspt-ga:e0ea3ad3b76b-db:41313127` · status: live · recorded: 2026-08-23T14:01:47 · last seen: 2026-08-23T14:01:47</sub>
 
 - evidence: Measured 2026-08-23 extending tools/il2cpp_resolve.py. Proof case, both AssetBundle::LoadAsset overloads recovered in full: rid 6 = "Object LoadAsset(string name)" @0x5250100, rid 7 = "Object LoadAsset(string name, Type type)" @0x5250340 - matching the arity 1 and 2 previously read from parameterCount@34 (fact #41). Verified alongside the resolver's existing ground truths: verify-be ALL REPRODUCED, verify-fields PASSED, nameindex verify all 9 cross-checks OK including BEClient::Update 0x669390 cross-image.</evidence>
-<parameter name="note">THIS REMOVES THE LARGEST SOURCE OF GUESSWORK IN PATCHING. Until now every by-RVA patch frame shape was INFERRED from a method's name - 25 of them in the EasyAssets probe alone, and 12 in the earlier load probe, each written down as inferred because nothing better existed (fact #54). Frame shapes can now be DERIVED from metadata instead. Also new in the resolver: a `bytes &lt;RVA&gt; [N]` verb printing section name plus hex (three separate agents had each hand-written a throwaway PE section-mapper for this), and thunk classification TAILJUMP / VDISPATCH / STUB / JMPTABLE / TRIVIAL. VDISPATCH needs 32 bytes to classify - 16 was not enough for AssetBundleRequest::get_asset @0xB196C0. The classifier prints "no known thunk shape matched (this is NOT proof of a real body)" because its false-negative rate is unmeasured.
+<parameter name="note">THIS REMOVES THE LARGEST SOURCE OF GUESSWORK IN PATCHING. Until now every by-RVA patch frame shape was INFERRED from a method's name - 25 of them in the EasyAssets probe alone, and 12 in the earlier load probe, each written down as inferred because nothing better existed (fact #54). Frame shapes can now be DERIVED from metadata instead. Also new in the resolver: a `bytes <RVA> [N]` verb printing section name plus hex (three separate agents had each hand-written a throwaway PE section-mapper for this), and thunk classification TAILJUMP / VDISPATCH / STUB / JMPTABLE / TRIVIAL. VDISPATCH needs 32 bytes to classify - 16 was not enough for AssetBundleRequest::get_asset @0xB196C0. The classifier prints "no known thunk shape matched (this is NOT proof of a real body)" because its false-negative rate is unmeasured.
 
 ### #63 — settingsModsTab (the sixth settings tab)
 
@@ -940,7 +940,7 @@ the flag is true in aowlspt-host.json and silently ignored â€” the feature 
 
 AssetBundle.LoadAsset DOES NOT EXIST anywhere in Assembly-CSharp (string heap has LoadAllAssets/LoadAllAssetsAsync/LoadAssetAsync/get_asset/get_allAssets but no LoadAsset). Chain: ObjectsFactory.LoadBundlesAndCreatePools -> EasyAssets.RetainSeparateTask -> Diz.Resources.EasyBundle.Load() -> LoadingCoroutine() -> AssetBundle.LoadFromFileAsync + _bundle.LoadAllAssetsAsync() -> Assets = op.allAssets. NOTHING ever asks for a texture BY NAME, so a name-keyed asset-substitution design cannot work at any hook. THE SANCTIONED ROUTE: SPT's own spt-custom.dll patches the EasyBundle CONSTRUCTOR and rewrites __instance._path to redirect a vanilla bundle key to a mod's file; EasyAssetsPatch unions BundleManager.Bundles.Keys into the manifest so a mod bundle can OVERRIDE a vanilla key. Ship as a server mod with bundles.json + bundles/. Windows.json has 10810 keys, 388 of them under textures/ paths, so overrides can be texture-granular.
 
-> Also kills the in-place idea: Texture2D.LoadImage returns false on a non-readable texture and re-creates rather than mutating; Graphics.CopyTexture is the ONLY true in-place path and demands identical format+size+mips (and Unity runtime Compress() makes only DXT1/DXT5, no BC7/BC5, so it needs an offline encoder). Separately, RGBA32 replacements are ~4-8x the VRAM of the BC originals: 512 textures at 2K RGBA32 is ~5.6 GB, so the 3 GB budget would have tripped before the pack ever applied. Building bundles with baked GPU compression solves interception, readability and VRAM at once. Fallback if bundle authoring is refused: material sweep over Resources.FindObjectsOfTypeAll&lt;Material&gt;() on a postfix of ObjectsFactory.LoadBundlesAndCreatePools, rebinding by texture name - misses Terrain terrainLayers, GPUInstancer, AmplifyImpostors arrays and shader globals.
+> Also kills the in-place idea: Texture2D.LoadImage returns false on a non-readable texture and re-creates rather than mutating; Graphics.CopyTexture is the ONLY true in-place path and demands identical format+size+mips (and Unity runtime Compress() makes only DXT1/DXT5, no BC7/BC5, so it needs an offline encoder). Separately, RGBA32 replacements are ~4-8x the VRAM of the BC originals: 512 textures at 2K RGBA32 is ~5.6 GB, so the 3 GB budget would have tripped before the pack ever applied. Building bundles with baked GPU compression solves interception, readability and VRAM at once. Fallback if bundle authoring is refused: material sweep over Resources.FindObjectsOfTypeAll<Material>() on a postfix of ObjectsFactory.LoadBundlesAndCreatePools, rebinding by texture name - misses Terrain terrainLayers, GPUInstancer, AmplifyImpostors arrays and shader globals.
 
 <sub>method: `measured` · scope: `aowlspt-ga:e0ea3ad3b76b-db:41313127` · status: live · recorded: 2026-08-23T14:05:12 · last seen: 2026-08-23T14:05:12</sub>
 
@@ -1008,7 +1008,7 @@ ROOT CAUSE FOUND (hypothesis, untested live) â€” `component` always called 
 
 Derived from 636 real environment texture names. Albedo = _D/_d/_dif/_diffuse/_Albedo/_A/_A2/_c OR a bare name with no suffix. Normal = _N/_nrm/_NM/_nm/_normal, ALWAYS DXT5. Gloss = _G/_gloss/_r, ALWAYS DXT1 grayscale. Height = _Displacement/_h. AO = _ao. Masks are never replaced. Casing is inconsistent (_N/_n/_NM) so always match lowercased, and strip the season tail BEFORE classifying the suffix. THREE OLD-PIPELINE ASSUMPTIONS ARE FALSE: _SPM does not exist at all; _M metalness does not exist (BSG is gloss/spec, not metal/rough); and because _G is GLOSS, an ambientCG Roughness map must be INVERTED before use.
 
-> SCOPE CORRECTION: a '/textures/' path filter matches 2,096 textures but 1,460 of those are assets/content/weapons/&lt;gun&gt;/textures/client_assets.bundle. TRUE environment scope is 636 textures across 285 bundles. Anyone sizing this work off the 2,096 figure is counting weapons.
+> SCOPE CORRECTION: a '/textures/' path filter matches 2,096 textures but 1,460 of those are assets/content/weapons/<gun>/textures/client_assets.bundle. TRUE environment scope is 636 textures across 285 bundles. Anyone sizing this work off the 2,096 figure is counting weapons.
 
 <sub>method: `measured` · scope: `aowlspt-ga:e0ea3ad3b76b-db:41313127` · status: live · recorded: 2026-08-23T14:23:29 · last seen: 2026-08-23T14:23:29</sub>
 
@@ -1036,7 +1036,7 @@ the control is EFT.UI.UpdatableToggle â€” a FIFTH type none of the usual fo
 
 <sub>method: `measured` · scope: `aowlspt-ga:e0ea3ad3b76b-db:41313127` · status: live · recorded: 2026-08-23T14:39:15 · last seen: 2026-08-23T14:39:15</sub>
 
-- evidence: Measured 2026-08-23 live. The label sits at Content/NonLayoutContainer/SoloModeCheckmarkBlocker/Label; the control is on the SoloModeCheckmarkBlocker GameObject. `components &lt;go&gt;` enumerated 6: [0] UnityEngine.RectTransform, [1] UnityEngine.CanvasGroup, [2] UnityEngine.UI.HorizontalLayoutGroup, [3] EFT.UI.UiElementBlocker, [4] EFT.UI.UpdatableToggle, [5] UnityEngine.UI.ContentSizeFitter. Pressing it: `allow write` then `call rva:0x55ba430 v_pb $k4 1` -> "returned without faulting (void)"; the human watching the screen confirmed the checkbox was ticked. 0x55ba430 is Toggle::set_isOn, which FIRES LISTENERS (fact #10) - SetIsOnWithoutNotify @0x55ba440 does not, and would have selected without telling the game.</evidence>
+- evidence: Measured 2026-08-23 live. The label sits at Content/NonLayoutContainer/SoloModeCheckmarkBlocker/Label; the control is on the SoloModeCheckmarkBlocker GameObject. `components <go>` enumerated 6: [0] UnityEngine.RectTransform, [1] UnityEngine.CanvasGroup, [2] UnityEngine.UI.HorizontalLayoutGroup, [3] EFT.UI.UiElementBlocker, [4] EFT.UI.UpdatableToggle, [5] UnityEngine.UI.ContentSizeFitter. Pressing it: `allow write` then `call rva:0x55ba430 v_pb $k4 1` -> "returned without faulting (void)"; the human watching the screen confirmed the checkbox was ticked. 0x55ba430 is Toggle::set_isOn, which FIRES LISTENERS (fact #10) - SetIsOnWithoutNotify @0x55ba440 does not, and would have selected without telling the game.</evidence>
 <parameter name="note">THIS IS THE PAYOFF FROM THE components VERB. tools/ui.py tries DefaultUIButton, SimpleStateButton, AnimatedToggle and Button across five ancestors and honestly reported none present; discovering the real type by trial cost a FAULT per guess on an object that faults, against a session budget of 8 (fact #68). Enumeration answered it in ONE call, zero faults. ui.py's four-type candidate list should gain EFT.UI.UpdatableToggle - and better, should consult `components` instead of guessing. Inspector expression syntax gotcha found the same session: the offset form is `$k4+0x120` with NO SPACE; `read $k4 +0x120 bool` parses "+0x120" as the TYPE and errors, and `$k4@0x120` DEREFERENCES rather than offsetting.
 
 ### #72 — pressing a control on an INACTIVE GameObject
@@ -1047,7 +1047,7 @@ ui.press/actuate returns ok=True on a control whose GameObject is inactive â€
 
 <sub>method: `measured` · scope: `aowlspt-ga:e0ea3ad3b76b-db:41313127` · status: live · recorded: 2026-08-23T14:45:42 · last seen: 2026-08-23T14:45:42</sub>
 
-- evidence: Measured 2026-08-23 in a live Factory raid. Common UI/MenuScreen persists into a raid and still carries RaidButtonsGroup -> DisconnectButton (go=0x00000178962f8740), whose components enumerate as RectTransform, EFT.UI.DefaultUIButton, DefaultUIButtonAnimation, TweenAnimatedButton, HorizontalLayoutGroup, ContentSizeFitter, LayoutElement - i.e. the same DefaultUIButton type that PlayButton/NEXT/READY are pressed through successfully. ui.press(&lt;transform&gt;, ctype='DefaultUIButton') returned ok=True twice; the client stayed IN RAID both times. Checking activeInHierarchy afterwards: RaidButtonsGroup = False and Warning Panel = False. The button was never on screen.</evidence>
+- evidence: Measured 2026-08-23 in a live Factory raid. Common UI/MenuScreen persists into a raid and still carries RaidButtonsGroup -> DisconnectButton (go=0x00000178962f8740), whose components enumerate as RectTransform, EFT.UI.DefaultUIButton, DefaultUIButtonAnimation, TweenAnimatedButton, HorizontalLayoutGroup, ContentSizeFitter, LayoutElement - i.e. the same DefaultUIButton type that PlayButton/NEXT/READY are pressed through successfully. ui.press(<transform>, ctype='DefaultUIButton') returned ok=True twice; the client stayed IN RAID both times. Checking activeInHierarchy afterwards: RaidButtonsGroup = False and Warning Panel = False. The button was never on screen.</evidence>
 <parameter name="note">THE MISSING PRECONDITION: actuation should check activeInHierarchy on the target BEFORE pressing, and report "the control exists but its GameObject is INACTIVE - nothing was pressed" rather than a bare success. tools/ui.py already has is_active()/actives() and simply does not consult them in the press path; adding that check turns a silent false positive into a named refusal. Corollary for automation: finding a correctly-named, correctly-typed control is NOT evidence it is the one on screen - the main menu's own DisconnectButton survives into a raid, inactive, and looks exactly like the right answer.
 
 ### #73 — EFT AssetBundle replacement pipeline (SPT 4.1.2)
@@ -1093,29 +1093,29 @@ u16 shareCount per entry, stride 18; the host refuses to patch a shared RVA, and
 
 <sub>method: `measured` · scope: `aowlspt-ga:e0ea3ad3b76b-db:41313127` · status: live · recorded: 2026-08-23T15:59:32 · last seen: 2026-08-23T15:59:32</sub>
 
-- evidence: Signatures recovered offline 2026-08-23 from metadata (type 30933 Diz.Resources.EasyBundle, image Diz.Resources.dll): "void Load() rid=42 arity=0 RVA=0x2772cc0", "Object[] get_Assets() rid=33 arity=0 RVA=0x6864d0", "void set_Assets(Object[] value) rid=34 RVA=0x6864e0", "BindableState&lt;ELoadState&gt; get_LoadState() rid=39 RVA=0x690d20", "Task LoadingCoroutine() rid=43 RVA=0x2773020". Sharedness from il2cpp_nameindex.py shared: 0x6864D0 is reached by 200 method keys (e.g. AICoreAgentBase::get_PrevNode/0, AIExfiltrationPoint::get_ExfiltrationPoint/0); 0x690D20 by 134. 0x2772CC0 does not appear in the shared set. Load fires 99 times at the menu alone (fact #74) while every Unity AssetBundle target stays at 0.</evidence>
-<parameter name="note">THE SHARED-RVA GUARD (fact #75) EARNED ITSELF HERE. get_Assets is the intuitive swap point - it is literally the accessor that returns the loaded assets - and detouring it would have fired for 200 unrelated properties across the codebase. The correct design: postfix the UNIQUE Load (instance, arity 0, void -> frame shape i&gt;x), take `this` from RCX, and reach the assets through the BACKING FIELD rather than the shared accessor; calling a shared accessor is fine, detouring it is not. Load being void also means a postfix gets no return value to replace - the swap must be in-place on the Texture2D objects, which is what the existing buildAndSwap already does via ImageConversion::LoadImage. OPEN: the Assets backing-field offset is not yet measured, and whether Assets is populated by the time Load returns (LoadingCoroutine returns Task, so Load may be asynchronous) is UNKNOWN and must be measured, not assumed.
+- evidence: Signatures recovered offline 2026-08-23 from metadata (type 30933 Diz.Resources.EasyBundle, image Diz.Resources.dll): "void Load() rid=42 arity=0 RVA=0x2772cc0", "Object[] get_Assets() rid=33 arity=0 RVA=0x6864d0", "void set_Assets(Object[] value) rid=34 RVA=0x6864e0", "BindableState<ELoadState> get_LoadState() rid=39 RVA=0x690d20", "Task LoadingCoroutine() rid=43 RVA=0x2773020". Sharedness from il2cpp_nameindex.py shared: 0x6864D0 is reached by 200 method keys (e.g. AICoreAgentBase::get_PrevNode/0, AIExfiltrationPoint::get_ExfiltrationPoint/0); 0x690D20 by 134. 0x2772CC0 does not appear in the shared set. Load fires 99 times at the menu alone (fact #74) while every Unity AssetBundle target stays at 0.</evidence>
+<parameter name="note">THE SHARED-RVA GUARD (fact #75) EARNED ITSELF HERE. get_Assets is the intuitive swap point - it is literally the accessor that returns the loaded assets - and detouring it would have fired for 200 unrelated properties across the codebase. The correct design: postfix the UNIQUE Load (instance, arity 0, void -> frame shape i>x), take `this` from RCX, and reach the assets through the BACKING FIELD rather than the shared accessor; calling a shared accessor is fine, detouring it is not. Load being void also means a postfix gets no return value to replace - the swap must be in-place on the Texture2D objects, which is what the existing buildAndSwap already does via ImageConversion::LoadImage. OPEN: the Assets backing-field offset is not yet measured, and whether Assets is populated by the time Load returns (LoadingCoroutine returns Task, so Load may be asynchronous) is UNKNOWN and must be measured, not assumed.
 
 ### #77 — Diz.Resources.EasyBundle::Load @0x2772CC0
 
 **false-positive:fires-a-lot-but-does-NOT-populate-Assets-it-is-async**
 
-a postfix on Load sees &lt;Assets&gt; exactly as it was before the call â€” NULL on a first load; the real write is in &lt;LoadingCoroutine&gt;d__34::MoveNext @0x27734A0
+a postfix on Load sees <Assets> exactly as it was before the call â€” NULL on a first load; the real write is in <LoadingCoroutine>d__34::MoveNext @0x27734A0
 
 <sub>method: `measured` · scope: `aowlspt-ga:e0ea3ad3b76b-db:41313127` · status: live · recorded: 2026-08-23T16:19:44 · last seen: 2026-08-23T16:19:44</sub>
 
-- evidence: Capstone disassembly of GameAssembly.dll over the WHOLE body of Load, 0x2772CC0..0x2772F4B to the single ret. Load touches +0x60 (LoadState), +0x70 (_shouldBeLoaded=1), +0x58 (Progress=0) and stores the Task from the async builder into _loadingJob at +0x68 (mov [rbx+0x68],rax @0x2772EF8), then returns. It NEVER reads or writes +0x48, the &lt;Assets&gt; backing field. It also early-exits at 0x2772D50 when _loadingJob is already non-null. The real write is set_Assets called at 0x277426F inside Diz.Resources.&lt;LoadingCoroutine&gt;d__34::MoveNext @0x27734A0 (type 30932), whose RVA is UNIQUE - il2cpp_nameindex.py shared does not list it. MoveNext then walks the array synchronously in the SAME invocation, calling Object::get_name @0x52AD4B0 per element to find SameNameAsset.</evidence>
-<parameter name="note">CAVEAT THAT MAKES A POSTFIX ON MoveNext ALSO WRONG: at 0x27745FF the completion path does `mov [r9+0x30], 0` - it NULLS &lt;&gt;4__this on the state machine - so a postfix there reads a null EasyBundle. Reaching the assets requires capturing &lt;&gt;4__this (state machine +0x30) on ENTRY, i.e. a prefix, or a postfix that captured self before the body ran. QUALIFIES fact #74: Load firing 99 times is real and it is still the right SIGNAL, but it is the wrong place to READ from. This was settled by static disassembly, NOT a live measurement - the shipped build carries assetsNull/assetsEmpty/assetsPopulated counters to confirm it in-process rather than a retry loop papering over it.
+- evidence: Capstone disassembly of GameAssembly.dll over the WHOLE body of Load, 0x2772CC0..0x2772F4B to the single ret. Load touches +0x60 (LoadState), +0x70 (_shouldBeLoaded=1), +0x58 (Progress=0) and stores the Task from the async builder into _loadingJob at +0x68 (mov [rbx+0x68],rax @0x2772EF8), then returns. It NEVER reads or writes +0x48, the <Assets> backing field. It also early-exits at 0x2772D50 when _loadingJob is already non-null. The real write is set_Assets called at 0x277426F inside Diz.Resources.<LoadingCoroutine>d__34::MoveNext @0x27734A0 (type 30932), whose RVA is UNIQUE - il2cpp_nameindex.py shared does not list it. MoveNext then walks the array synchronously in the SAME invocation, calling Object::get_name @0x52AD4B0 per element to find SameNameAsset.</evidence>
+<parameter name="note">CAVEAT THAT MAKES A POSTFIX ON MoveNext ALSO WRONG: at 0x27745FF the completion path does `mov [r9+0x30], 0` - it NULLS <>4__this on the state machine - so a postfix there reads a null EasyBundle. Reaching the assets requires capturing <>4__this (state machine +0x30) on ENTRY, i.e. a prefix, or a postfix that captured self before the body ran. QUALIFIES fact #74: Load firing 99 times is real and it is still the right SIGNAL, but it is the wrong place to READ from. This was settled by static disassembly, NOT a live measurement - the shipped build carries assetsNull/assetsEmpty/assetsPopulated counters to confirm it in-process rather than a retry loop papering over it.
 
 ### #78 — Diz.Resources.EasyBundle field offsets + Il2CppArray layout
 
 **offset:Assets-backing-field-at-0x48-array-len-0x18-data-0x20**
 
-&lt;Assets&gt;k__BackingField @0x48; Il2CppArray max_length @+0x18 and element data from +0x20
+<Assets>k__BackingField @0x48; Il2CppArray max_length @+0x18 and element data from +0x20
 
 <sub>method: `measured` · scope: `aowlspt-ga:e0ea3ad3b76b-db:41313127` · status: live · recorded: 2026-08-23T16:19:50 · last seen: 2026-08-23T16:19:50</sub>
 
-- evidence: Field offsets from tools/il2cpp_resolve.py fields Diz.Resources.EasyBundle, read out of Il2CppMetadataRegistration.fieldOffsets @0x186b61e70 - resolved, not guessed. Full instance layout: _keyWithoutExtension 0x10, &lt;Key&gt; 0x30, _bundle 0x38, &lt;Assets&gt;k__BackingField 0x48, &lt;SameNameAsset&gt; 0x50, &lt;Progress&gt; 0x58, &lt;LoadState&gt; 0x60, _loadingJob 0x68, _shouldBeLoaded 0x70. The array layout was confirmed against BSG'S OWN COMPILED WALK over that same array: GameAssembly.dll @0x27742A7 `cmp r8d, dword ptr [rcx+0x18]` and @0x27742BD `mov rcx, qword ptr [rcx+rax*8+0x20]` - a measurement from the game's own iteration rather than an assumption from a header.</evidence>
+- evidence: Field offsets from tools/il2cpp_resolve.py fields Diz.Resources.EasyBundle, read out of Il2CppMetadataRegistration.fieldOffsets @0x186b61e70 - resolved, not guessed. Full instance layout: _keyWithoutExtension 0x10, <Key> 0x30, _bundle 0x38, <Assets>k__BackingField 0x48, <SameNameAsset> 0x50, <Progress> 0x58, <LoadState> 0x60, _loadingJob 0x68, _shouldBeLoaded 0x70. The array layout was confirmed against BSG'S OWN COMPILED WALK over that same array: GameAssembly.dll @0x27742A7 `cmp r8d, dword ptr [rcx+0x18]` and @0x27742BD `mov rcx, qword ptr [rcx+rax*8+0x20]` - a measurement from the game's own iteration rather than an assumption from a header.</evidence>
 <parameter name="note">This is how to reach the assets WITHOUT touching a shared accessor: read the backing field at +0x48 by raw static offset. get_Assets @0x6864D0 is folded with 199 other one-instruction getters (fact #76), so calling it is fine but detouring it is not - and reading the field sidesteps the question entirely.
 
 ### #79 — mods/textures upload path (ImageConversion.LoadImage)
@@ -1159,8 +1159,8 @@ EasyBundle._path is at 0x20 on this build â€” the same handle SPT's spt-cus
 
 <sub>method: `measured` · scope: `aowlspt-ga:e0ea3ad3b76b-db:41313127` · status: live · recorded: 2026-08-23T17:45:30 · last seen: 2026-08-23T17:45:30</sub>
 
-- evidence: tools/il2cpp_resolve.py fields Diz.Resources.EasyBundle (type 30933, image Diz.Resources.dll, fieldOffsets @0x186b61e70) on build 1.1.0.1.46777: _keyWithoutExtension@0x10 string, _bundleLock@0x18 IBundleLock, _path@0x20 STRING, &lt;DependencyKeys&gt;@0x28, &lt;Key&gt;@0x30 string, _bundle@0x38 AssetBundle, _loadingAssetOperation@0x40 AssetBundleRequest, &lt;Assets&gt;@0x48 Object[], &lt;SameNameAsset&gt;@0x50, &lt;Progress&gt;@0x58, &lt;LoadState&gt;@0x60. The .ctor is rid=41 @0x2772940. This is the same class and the same _path field that fact #64 records SPT 4.1.2's spt-custom.dll patching in the EasyBundle CONSTRUCTOR to redirect a vanilla bundle key to a mod's file.</evidence>
-<parameter name="note">SUPERSEDES THE ASSET-SUBSTITUTION DESIGN in facts #74/#76/#77. Three independent measurements from the 4.1.2 side kill it, and they apply here unchanged: (1) fact #64 - NOTHING ever asks for a texture BY NAME; the chain is ObjectsFactory.LoadBundlesAndCreatePools -&gt; EasyAssets.RetainSeparateTask -&gt; EasyBundle.Load -&gt; LoadingCoroutine -&gt; LoadFromFileAsync + LoadAllAssetsAsync -&gt; Assets = op.allAssets, so a name-keyed substitution cannot work at ANY hook. (2) fact #64 note - Texture2D.LoadImage returns FALSE on a non-readable texture and RE-CREATES rather than mutating, so the "decode in place so every material updates" premise is false; Graphics.CopyTexture is the only true in-place path and needs identical format+size+mips. RGBA32 replacements are 4-8x the VRAM of the BC originals. (3) fact #65 - 460 of 512 manifest names do not exist in the game at all. Fact #74 (Load fires 99x) stays TRUE and useful as a signal; it is simply the wrong lever. THE WORK: hook EasyBundle::.ctor @0x2772940 and rewrite _path@0x20 to a mod-supplied bundle, and build replacement bundles by patching the ORIGINAL archive in place with UnityPy (fact #73) - never Unity extract-and-repack.
+- evidence: tools/il2cpp_resolve.py fields Diz.Resources.EasyBundle (type 30933, image Diz.Resources.dll, fieldOffsets @0x186b61e70) on build 1.1.0.1.46777: _keyWithoutExtension@0x10 string, _bundleLock@0x18 IBundleLock, _path@0x20 STRING, <DependencyKeys>@0x28, <Key>@0x30 string, _bundle@0x38 AssetBundle, _loadingAssetOperation@0x40 AssetBundleRequest, <Assets>@0x48 Object[], <SameNameAsset>@0x50, <Progress>@0x58, <LoadState>@0x60. The .ctor is rid=41 @0x2772940. This is the same class and the same _path field that fact #64 records SPT 4.1.2's spt-custom.dll patching in the EasyBundle CONSTRUCTOR to redirect a vanilla bundle key to a mod's file.</evidence>
+<parameter name="note">SUPERSEDES THE ASSET-SUBSTITUTION DESIGN in facts #74/#76/#77. Three independent measurements from the 4.1.2 side kill it, and they apply here unchanged: (1) fact #64 - NOTHING ever asks for a texture BY NAME; the chain is ObjectsFactory.LoadBundlesAndCreatePools -> EasyAssets.RetainSeparateTask -> EasyBundle.Load -> LoadingCoroutine -> LoadFromFileAsync + LoadAllAssetsAsync -> Assets = op.allAssets, so a name-keyed substitution cannot work at ANY hook. (2) fact #64 note - Texture2D.LoadImage returns FALSE on a non-readable texture and RE-CREATES rather than mutating, so the "decode in place so every material updates" premise is false; Graphics.CopyTexture is the only true in-place path and needs identical format+size+mips. RGBA32 replacements are 4-8x the VRAM of the BC originals. (3) fact #65 - 460 of 512 manifest names do not exist in the game at all. Fact #74 (Load fires 99x) stays TRUE and useful as a signal; it is simply the wrong lever. THE WORK: hook EasyBundle::.ctor @0x2772940 and rewrite _path@0x20 to a mod-supplied bundle, and build replacement bundles by patching the ORIGINAL archive in place with UnityPy (fact #73) - never Unity extract-and-repack.
 
 ### #83 — SettingsScreen panel switching
 
@@ -1210,12 +1210,12 @@ every in-scope card is DXT5 alpha-cut; pasting an opaque ambientCG _Color map tu
 
 **gotcha:the-clone-spawns-AnimatedToggle-NOT-ControlsToggle-so-name-based-relabel-misses**
 
-the MODS tab renders as a BLANK RECTANGLE because the relabel walks &lt;clone&gt;/ControlsToggle/... and the clone's child is named AnimatedToggle
+the MODS tab renders as a BLANK RECTANGLE because the relabel walks <clone>/ControlsToggle/... and the clone's child is named AnimatedToggle
 
 <sub>method: `measured` · scope: `aowlspt-ga:e0ea3ad3b76b-db:41313127` · status: live · recorded: 2026-08-23T18:35:53 · last seen: 2026-08-23T18:35:53</sub>
 
-- evidence: Measured live 2026-08-23, Settings open, human reporting "some weird rectangular thing that comes after the last tab CONTROLS". SettingsScreen/Toggles children: GameToggleSpawner, GraphicsToggleSpawner, PostFxToggleSpawner, SoundToggleSpawner, ControlsToggleSpawner, ControlsToggleSpawner(Clone) - all active=True, so the sixth tab IS there. Subtree comparison: STOCK ControlsToggleSpawner -&gt; ControlsToggle -&gt; {Background/Background_inside, SizeLabel -&gt; {"TMP UI SubObject [Jovanny Lemonad - Bender Shadowed Material]", Label}}. CLONE ControlsToggleSpawner(Clone) -&gt; AnimatedToggle -&gt; {Background/Background_inside, SizeLabel -&gt; {Label}}. Two differences: the child is named AnimatedToggle, not ControlsToggle; and the clone's SizeLabel has NO "TMP UI SubObject" child. Independently, ui.py find_text("MODS", root="Common UI") returns 0 hits on a COMPLETE walk while the button is visibly on screen.</evidence>
-<parameter name="note">The TMP UI SubObject is created by TextMeshPro when it actually renders text, so its ABSENCE is a reliable fingerprint for "this label was never given any text" - a cheap post-condition to assert after relabelling. The recipe `sixth-settings-tab` says the label TMP is at &lt;clone&gt;/ControlsToggle/SizeLabel/Label, which is TRUE OF THE DONOR and false of the clone: the spawner spawns its toggle under a default name. SAME LESSON AS THE DONOR BUGS - find the child by SHAPE (the Toggle-family component under the spawner, whatever it is called), never by the donor's name, and assert the post-condition rather than assuming the write landed. Version brand on the same build DOES work, via LocalizedText::SetLabelText, so the text-setting primitive is not at fault.
+- evidence: Measured live 2026-08-23, Settings open, human reporting "some weird rectangular thing that comes after the last tab CONTROLS". SettingsScreen/Toggles children: GameToggleSpawner, GraphicsToggleSpawner, PostFxToggleSpawner, SoundToggleSpawner, ControlsToggleSpawner, ControlsToggleSpawner(Clone) - all active=True, so the sixth tab IS there. Subtree comparison: STOCK ControlsToggleSpawner -> ControlsToggle -> {Background/Background_inside, SizeLabel -> {"TMP UI SubObject [Jovanny Lemonad - Bender Shadowed Material]", Label}}. CLONE ControlsToggleSpawner(Clone) -> AnimatedToggle -> {Background/Background_inside, SizeLabel -> {Label}}. Two differences: the child is named AnimatedToggle, not ControlsToggle; and the clone's SizeLabel has NO "TMP UI SubObject" child. Independently, ui.py find_text("MODS", root="Common UI") returns 0 hits on a COMPLETE walk while the button is visibly on screen.</evidence>
+<parameter name="note">The TMP UI SubObject is created by TextMeshPro when it actually renders text, so its ABSENCE is a reliable fingerprint for "this label was never given any text" - a cheap post-condition to assert after relabelling. The recipe `sixth-settings-tab` says the label TMP is at <clone>/ControlsToggle/SizeLabel/Label, which is TRUE OF THE DONOR and false of the clone: the spawner spawns its toggle under a default name. SAME LESSON AS THE DONOR BUGS - find the child by SHAPE (the Toggle-family component under the spawner, whatever it is called), never by the donor's name, and assert the post-condition rather than assuming the write landed. Version brand on the same build DOES work, via LocalizedText::SetLabelText, so the text-setting primitive is not at fault.
 
 ### #88 — EFT settings tab button caption
 
@@ -1256,11 +1256,11 @@ CORRECTED â€” the checksum is SIGNED; about half of real entries are negati
 
 **is:MicroSplat-Texture2DArray-in-sharedassets17.assets.resS-NOT-TerrainLayer-and-NOT-SplatAlpha**
 
-MicroSplatConfig_&lt;season&gt;_diff*_tarray bound as _Diffuse; patching the 12 named TerrainLayer albedos would verify perfectly and change nothing on screen
+MicroSplatConfig_<season>_diff*_tarray bound as _Diffuse; patching the 12 named TerrainLayer albedos would verify perfectly and change nothing on screen
 
 <sub>method: `measured` · scope: `aowlspt-ga:e0ea3ad3b76b-db:41313127` · status: live · recorded: 2026-08-23T18:59:40 · last seen: 2026-08-23T18:59:40</sub>
 
-- evidence: texpipe/terrain_probe.py + microsplat_probe.py + slice_control.py, 2026-08-23. Chain: 19 Slice_R_C TerrainData -&gt; 12 microsplat_layer_* TerrainLayers; but every Material m_SavedProperties.m_TexEnvs _Diffuse PPtr on all 18 MicroSplat_HQ/NQ/LQ_&lt;season&gt; materials resolves to a Texture2DArray, not to TerrainLayer.m_DiffuseTexture. Census of sharedassets17.assets: 36 MicroSplatConfig_* arrays - HQ 1024x1024 depth12 DXT5 mips11 (_diff_tarray), NQ 512x512 (_diff_NormalTex_tarray), LQ 256x256 (_diff_LowTex_tarray), 6 seasons x 3 tiers = 18 diffuse + 18 normSAO. Slice mapping CONFIRMED BY DECODE CONTROL rather than by the _0.._11 naming: per-slice stride 1,398,128 bytes (1024x1024 DXT5, 11 mips, 16-byte block floor) x12 = m_DataSize 16,777,536; decoding slice N matches TerrainLayer N's standalone albedo at mean-abs-RGB 0.1 while every off-diagonal pair scores 10-68 - diagonal best 12/12. Layer order: 0 Grass, 1 Ground, 2 Gravel_Road_A, 3 Forest_Ground, 4 Stone_Ground, 5 Rock_Ground, 6 Gravel_Road_B, 7 Gravel, 8 Grassy_Ground, 9 Sand, 10 Pebbles_Ground, 11 Soil_Grass.</evidence>
+- evidence: texpipe/terrain_probe.py + microsplat_probe.py + slice_control.py, 2026-08-23. Chain: 19 Slice_R_C TerrainData -> 12 microsplat_layer_* TerrainLayers; but every Material m_SavedProperties.m_TexEnvs _Diffuse PPtr on all 18 MicroSplat_HQ/NQ/LQ_<season> materials resolves to a Texture2DArray, not to TerrainLayer.m_DiffuseTexture. Census of sharedassets17.assets: 36 MicroSplatConfig_* arrays - HQ 1024x1024 depth12 DXT5 mips11 (_diff_tarray), NQ 512x512 (_diff_NormalTex_tarray), LQ 256x256 (_diff_LowTex_tarray), 6 seasons x 3 tiers = 18 diffuse + 18 normSAO. Slice mapping CONFIRMED BY DECODE CONTROL rather than by the _0.._11 naming: per-slice stride 1,398,128 bytes (1024x1024 DXT5, 11 mips, 16-byte block floor) x12 = m_DataSize 16,777,536; decoding slice N matches TerrainLayer N's standalone albedo at mean-abs-RGB 0.1 while every off-diagonal pair scores 10-68 - diagonal best 12/12. Layer order: 0 Grass, 1 Ground, 2 Gravel_Road_A, 3 Forest_Ground, 4 Stone_Ground, 5 Rock_Ground, 6 Gravel_Road_B, 7 Gravel, 8 Grassy_Ground, 9 Sand, 10 Pebbles_Ground, 11 Soil_Grass.</evidence>
 <parameter name="note">TWO NEAR-MISSES WORTH REMEMBERING, both would have been "successful" changes that altered nothing visible: SplatAlpha 0/1/2 are blend-weight masks (fact #84 was right to name them but they are not albedo), and the 12 named TerrainLayer albedos (Grass_summer_D, Gravel_Road_A_summer_D...) are ALSO not what renders, because MicroSplat bakes layers into the array. HOW TO PATCH IT: the tarray pixels live in sharedassets17.assets.resS at fixed non-overlapping offsets with exact fixed sizes (HQ 16,777,536 e.g. @244154752 for summer_diff), image data inline = 0 bytes. So terrain is a seek-and-write into .resS ONLY - the .assets file stays byte-identical and the .resS SIZE is unchanged, so only that one Checksum needs re-syncing. SCOPE LIMIT: only ONE map's terrain is in these files (19 Slice_R_C tiles, one 12-layer palette); the other 15 TerrainData (AI_Terrain_Customs, _Shoreline, Woods, Reserv) have ZERO layers and are AI/collision proxies. Where the other maps' terrain lives is NOT established.
 
 ### #92 — tools/deploy.json markers
@@ -1282,7 +1282,7 @@ stock has 1 child (ControlsToggle); the clone has 2 (ControlsToggle + AnimatedTo
 
 <sub>method: `measured` · scope: `aowlspt-ga:e0ea3ad3b76b-db:41313127` · status: live · recorded: 2026-08-23T19:08:33 · last seen: 2026-08-23T19:08:33</sub>
 
-- evidence: Measured live 2026-08-23 with Settings open and the MODS caption working. SettingsScreen/Toggles has exactly 6 children (5 stock spawners + ControlsToggleSpawner(Clone)), so the extra button is NOT a duplicate tab. Child comparison: ControlsToggleSpawner -&gt; [ControlsToggle] active=True. ControlsToggleSpawner(Clone) -&gt; [ControlsToggle active=True, AnimatedToggle active=True]. The human reports "now we have a MODS item - but after the MODS item is the same rectangular weird thing that has no name". The captioning is correct and verified: "caption 'MODS' is now on 2 of the clone's 4 TextMeshProUGUI, matching the donor, which shows 'CONTROLS' on 2" - 4 TMPs because there are two toggles, only one of which was captioned.</evidence>
+- evidence: Measured live 2026-08-23 with Settings open and the MODS caption working. SettingsScreen/Toggles has exactly 6 children (5 stock spawners + ControlsToggleSpawner(Clone)), so the extra button is NOT a duplicate tab. Child comparison: ControlsToggleSpawner -> [ControlsToggle] active=True. ControlsToggleSpawner(Clone) -> [ControlsToggle active=True, AnimatedToggle active=True]. The human reports "now we have a MODS item - but after the MODS item is the same rectangular weird thing that has no name". The captioning is correct and verified: "caption 'MODS' is now on 2 of the clone's 4 TextMeshProUGUI, matching the donor, which shows 'CONTROLS' on 2" - 4 TMPs because there are two toggles, only one of which was captioned.</evidence>
 <parameter name="note">EXPLAINS THE EARLIER NAMING CONFUSION (fact #87): the clone's toggle was seen as AnimatedToggle once and ControlsToggle later. BOTH exist - a walk that takes child 0, or the first Toggle-family component it finds, gets whichever the enumeration order happens to yield. Cloning a *Spawner* clones the already-spawned child AND leaves the spawner live, so it spawns a second toggle under its own default name. FIX: after cloning the spawner, either deactivate/destroy the spawner's freshly spawned toggle and keep the cloned one, or keep the spawned one and drop the clone - but pick deliberately and assert the child COUNT against the donor (1), the same donor-as-ground-truth rule that fixed the caption. Asserting the caption count alone passed while a second uncaptioned button sat beside it.
 
 ### #94 — tools/entergame.py verify step
@@ -1305,7 +1305,7 @@ its onLoad returns early unless side() == sideServer, so it cannot call a host t
 <sub>method: `measured` · scope: `aowlspt-ga:e0ea3ad3b76b-db:41313127` · status: live · recorded: 2026-08-23T19:46:53 · last seen: 2026-08-23T19:46:53</sub>
 
 - evidence: Read of mods/tarkov 2026-08-23 while wiring the SINGLEPLAYER settings tab: onLoad returns early unless side() == sideServer. It is loaded by aowlspt-backend, not by the in-process client host, so host code cannot call into it and it cannot call a host-side registry. It DOES already declare its settings schema via declareSettings and serve it from onTarkovSettings, so the data exists - it just lives on the other side of the process boundary. abi/aowlspt_overlay.h has a WinHttp client already driving the modSyncMs poll, but no Nim-callable GET is exposed to mods or to host features.</evidence>
-<parameter name="note">CORRECTS AN INSTRUCTION I GAVE. I told an agent that mods/tarkov owns the SINGLEPLAYER tab and should register it with a host-side mechanism "the same way mods/textures supplies its MODS subtab content". That is wrong: mods/textures is a CLIENT-side mod running in-process, mods/tarkov is not. Ownership stands - tarkov is still where SPT settings belong - but the delivery is host fetches over backendPort, not an in-process call. LIKELY CONVERGENCE worth checking: the corner-label feature uxMenuModeText is broken for a related reason - the host hook fires (3600 times measured) and the backend never sends `menuModeText` on the mod-sync poll. Both are the same missing plumbing: a real host&lt;-&gt;backend settings channel. Fixing one may fix the other.
+<parameter name="note">CORRECTS AN INSTRUCTION I GAVE. I told an agent that mods/tarkov owns the SINGLEPLAYER tab and should register it with a host-side mechanism "the same way mods/textures supplies its MODS subtab content". That is wrong: mods/textures is a CLIENT-side mod running in-process, mods/tarkov is not. Ownership stands - tarkov is still where SPT settings belong - but the delivery is host fetches over backendPort, not an in-process call. LIKELY CONVERGENCE worth checking: the corner-label feature uxMenuModeText is broken for a related reason - the host hook fires (3600 times measured) and the backend never sends `menuModeText` on the mod-sync poll. Both are the same missing plumbing: a real host<->backend settings channel. Fixing one may fix the other.
 
 ### #96 — texpipe texture-to-ambientCG matching
 
@@ -1315,7 +1315,7 @@ the two gravel-road terrain layers are served by ASPHALT sets, and their LOW dis
 
 <sub>method: `measured` · scope: `aowlspt-ga:e0ea3ad3b76b-db:41313127` · status: live · recorded: 2026-08-23T20:00:36 · last seen: 2026-08-23T20:00:36</sub>
 
-- evidence: Measured 2026-08-23 after extracting the full ambientCG drop (878 zips, 287 catalogued sets, 28 families). Terrain layer 2 Gravel_Road_A picks Asphalt016/033 at mean-RGB distance 6.9, and layer 6 Gravel_Road_B picks Asphalt023S at 15.9 - both LOWER (apparently better) than genuinely good matches like layer 4 Stone_Ground -&gt; Rock062/020/028 at 2.7 or layer 5 Rock_Ground -&gt; Rock060/062/051 at 5.2. The Gravel family has only 2 sets, so asphalt wins on colour while being the wrong material. Layer 9 "Sand" is served by Ground106/109 at distance 4.9 because NO Sand family exists at all. Carpet: 15 game textures, 1 ambientCG set - every carpet in the game would become the same carpet.</evidence>
+- evidence: Measured 2026-08-23 after extracting the full ambientCG drop (878 zips, 287 catalogued sets, 28 families). Terrain layer 2 Gravel_Road_A picks Asphalt016/033 at mean-RGB distance 6.9, and layer 6 Gravel_Road_B picks Asphalt023S at 15.9 - both LOWER (apparently better) than genuinely good matches like layer 4 Stone_Ground -> Rock062/020/028 at 2.7 or layer 5 Rock_Ground -> Rock060/062/051 at 5.2. The Gravel family has only 2 sets, so asphalt wins on colour while being the wrong material. Layer 9 "Sand" is served by Ground106/109 at distance 4.9 because NO Sand family exists at all. Carpet: 15 game textures, 1 ambientCG set - every carpet in the game would become the same carpet.</evidence>
 <parameter name="note">THE METRIC IS THE BUG, NOT THE PICKS. Mean RGB measures colour agreement and is being read as material agreement; a low distance is therefore NOT evidence of a good match and in these cases is evidence of a confident wrong one. The missing piece is a structural metric - a per-slice gradient/frequency signature compared against candidates - which would separate gravel from asphalt. NOT BUILT; flagged for a human decision before spending on it. WHAT IS genuinely well served: the human's actual ask, "concrete walls with our 4K concrete" - 36 Concrete sets against 91 concrete-keyword textures, all 4K available. Bricks went 1 set serving all 57 brick textures to 8 sets.
 
 ### #97 — post-1.0 winter terrain slices
@@ -1326,8 +1326,8 @@ winter is now servable (22 Snow sets arrived), but layers 2, 5, 9 and 11 are NOT
 
 <sub>method: `measured` · scope: `aowlspt-ga:e0ea3ad3b76b-db:41313127` · status: live · recorded: 2026-08-23T20:00:44 · last seen: 2026-08-23T20:00:44</sub>
 
-- evidence: Measured 2026-08-23 by reading the mean RGB of all 12 winter HQ slices off the read-only sharedassets17.assets.resS BEFORE writing any mapping. Close to snow: layer 6 Gravel_Road_B (140,137,137) -&gt; Snow012 d=2.0; layer 10 Pebbles_Ground (140,138,135) d=3.0; layer 4 Stone_Ground (143,142,140) d=6.3; layers 0 Grass and 8 Grassy_Ground (159,166,175) -&gt; Snow013 d=9.2; layer 1 Ground (183,186,193) -&gt; Snow014 d=11.2; layer 7 Gravel (166,166,168) d=15.6. NOT snow: layer 3 Forest_Ground d=19.0, layer 2 Gravel_Road_A d=26.2, layer 11 Soil_Grass (119,118,111) d=39.2, layer 5 Rock_Ground (116,115,114) d=41.1, layer 9 Sand (135,117,99) d=43.6. So 7 of 12 are genuinely snow-covered and 4-5 are bare ground showing through.</evidence>
-<parameter name="note">RETIRES the earlier blanket refusal of winter, which was refused for having ZERO snow sets in the library - there are now 22 (Snow001-Snow015 with A/B/C variants). WINTER_FAMILIES in terrain_build.py follows this measurement rather than the assumption that winter means snow everywhere. Winter remains OPT-IN (--seasons winter) and NO winter pack has been built or verified - the mapping is an unbuilt prediction. Library coverage overall went 745 -&gt; 894 matched textures; the library gap fell from 212 to 86, and ALL 86 remaining are GLASS, for which ambientCG has no family at any confidence.
+- evidence: Measured 2026-08-23 by reading the mean RGB of all 12 winter HQ slices off the read-only sharedassets17.assets.resS BEFORE writing any mapping. Close to snow: layer 6 Gravel_Road_B (140,137,137) -> Snow012 d=2.0; layer 10 Pebbles_Ground (140,138,135) d=3.0; layer 4 Stone_Ground (143,142,140) d=6.3; layers 0 Grass and 8 Grassy_Ground (159,166,175) -> Snow013 d=9.2; layer 1 Ground (183,186,193) -> Snow014 d=11.2; layer 7 Gravel (166,166,168) d=15.6. NOT snow: layer 3 Forest_Ground d=19.0, layer 2 Gravel_Road_A d=26.2, layer 11 Soil_Grass (119,118,111) d=39.2, layer 5 Rock_Ground (116,115,114) d=41.1, layer 9 Sand (135,117,99) d=43.6. So 7 of 12 are genuinely snow-covered and 4-5 are bare ground showing through.</evidence>
+<parameter name="note">RETIRES the earlier blanket refusal of winter, which was refused for having ZERO snow sets in the library - there are now 22 (Snow001-Snow015 with A/B/C variants). WINTER_FAMILIES in terrain_build.py follows this measurement rather than the assumption that winter means snow everywhere. Winter remains OPT-IN (--seasons winter) and NO winter pack has been built or verified - the mapping is an unbuilt prediction. Library coverage overall went 745 -> 894 matched textures; the library gap fell from 212 to 86, and ALL 86 remaining are GLASS, for which ambientCG has no family at any confidence.
 
 ### #98 — SettingsScreen::ShowScreen @RVA 0x1720DE0 POSTFIX detour (settings probe Phase 1.8)
 
@@ -1595,7 +1595,7 @@ THREE-gates-dll-on-disk-AND-registry-mods-json-AND-the-manager-owned-selection-a
 - evidence: 2026-08-24, chasing a 404 on /aowlspt/settings/index. (1) Copying settingshub.dll + config.json into D:\Aowlspt\aowlspt\mods\settingshub\ was not enough. (2) Hand-appending "aowl.settingshub" to mods\aowlspt-selection.json worked until the next restart, then the file came back as ["aowl.manager","aowl.tarkov","aowl.classicmovement"] -- it carries "writtenBy":"aowl.manager" and the manager rewrites it. Backend then logged: "aowl.settingshub is installed and not selected, so it is not loaded". (3) POST /aowlspt/mods/enable/aowl.settingshub refused: {"ok":false,"error":"no mod called aowl.settingshub in D:\\Aowlspt\\aowlspt/registry/mods.json. This manager can only change mods its registry knows."}. After adding a proper entry to registry\mods.json (shape copied from aowl.tarkov: id/name/author/version/description/pipeline/sides/source{kind,path,url}/artifact{dir,library}/requires/conflicts/provides/loadAfter/tags), the same POST returned {"ok":true,...,"verdict":"loaded"} and, AFTER A RESTART, the route answered 200 with {"mods":[{"guid":"aowl.tarkov","name":"Tarkov Emulator","count":22}]}.</evidence>
 <parameter name="note">ORDER THAT WORKS: dll+config into mods/<dir>/ -> add an entry to registry/mods.json -> POST /aowlspt/mods/enable/<guid> -> RESTART (routes register at boot, so enabling alone does not make a route appear). Never hand-edit aowlspt-selection.json; the manager owns it and will silently revert you. Combine with fact #115 (deploy.py ships only tarkov and textures, so every other mod rots on disk) and fact #112: a host feature that consumes a mod-served route can fail with NOTHING anywhere pointing at deployment. Cheapest first check when such a feature times out: curl the route directly. A 404 body here is exactly 50 bytes ({"err":"no route","url":...}), which is a useful fingerprint -- the host reported "pending=50" and "did not parse as {\"mods\":[...]}", which was correct behaviour on an error body. SEPARATE LATENT TRAP found the same way: request the backend WITH an Accept-Encoding header and it returns zlib-compressed bytes (0x78 0x9c) and NO Content-Encoding header, so any future HTTP consumer that negotiates compression will silently receive garbage.
 
-### #122 — GET /aowlspt/settings/&lt;guid&gt; schema payload (the mod settings wire format)
+### #122 — GET /aowlspt/settings/<guid> schema payload (the mod settings wire format)
 
 **bug**
 
@@ -1666,7 +1666,7 @@ it-starts-loads-all-16-mods-creates-profiles-and-answers-200-everywhere-while-cl
 
 <sub>method: `measured` · scope: `aowlspt-ga:e0ea3ad3b76b-db:41313127` · status: live · recorded: 2026-08-25T14:08:36 · last seen: 2026-08-25T14:08:36</sub>
 
-- command: `staged a scratch root with mods/ + registry/ + backend.json but no db.json; aowlspt-backend.exe --root &lt;scratch&gt; --port 6970; then POSTed /client/items /client/globals /client/customization /client/handbook/templates`
+- command: `staged a scratch root with mods/ + registry/ + backend.json but no db.json; aowlspt-backend.exe --root <scratch> --port 6970; then POSTed /client/items /client/globals /client/customization /client/handbook/templates`
 - evidence: /aowlspt/mods -> 200, "mods":16, "loaded":5, "problems":[]. profile create -> 200 ok, profile persisted on re-list. /client/locations -> 200, 1,949,009 bytes of REAL data (it comes from mods/tarkov/data, not the database). /client/items, /client/globals, /client/customization -> 200, 33 bytes, {"err":0,"errmsg":null,"data":{}}. /client/handbook/templates -> 200, {"data":{"Categories":[],"Items":[]}}. Backend log carried exactly ONE line about it, at info level: "no database at ...; db_get will find nothing".
 
 ### #128 — the seven client mods disabled by rename (.dll.off) in the only known-working D:\Aowlspt install
@@ -1716,7 +1716,7 @@ isolated-by-bisection-sway-ALONE-is-sufficient-to-kill-it-and-it-is-enabled-by-d
 
 <sub>method: `measured` · scope: `aowlspt-ga:e0ea3ad3b76b-db:41313127` · status: live · recorded: 2026-08-25T15:00:35 · last seen: 2026-08-25T15:00:35</sub>
 
-- command: `enable/disable by renaming mods/&lt;m&gt;/&lt;m&gt;.dll &lt;-&gt; .dll.off in D:\Aowlspt\aowlspt\mods, relaunch aowlspt-launch.exe, then check for a NEW dir under D:\Aowlspt\Logs and the host run length via tools/hostlog.py summary`
+- command: `enable/disable by renaming mods/<m>/<m>.dll <-> .dll.off in D:\Aowlspt\aowlspt\mods, relaunch aowlspt-launch.exe, then check for a NEW dir under D:\Aowlspt\Logs and the host run length via tools/hostlog.py summary`
 - evidence: all 7 previously-.off mods enabled -> crash (run 2.328s). {classicmovement,fov,perf,sway} -> crash (1.234s). {fov,sway} -> crash (1.203s). {sway} alone -> crash (1.281s), 0 client processes, 0 new client log dirs. Control: none of the 7 enabled -> client reached 35s+, character-selection screen came up, entergame.py selected the PvE slot. Signature every time: host log reaches HOST RUNNING then stops, no client log dir, no crash dump, no Windows event-log entry.</evidence>
 <parameter name="note">This is the 1.0 giveaway blocker. aowl.list.vanillaplus is the installer's DEFAULT list and enables com.savannt.sptsway, so a tester taking the default gets a client that dies on startup. In the very first crashing run the LAST host line was "sway bound the IL2CPP runtime directly (the host is not on the per-frame path)" -- consistent with the fault being in sway's own direct IL2CPP binding rather than in a host detour. NOT yet established: whether fov is ALSO a culprit (being tested), and the actual faulting instruction inside sway.</parameter>
 </invoke>
@@ -1729,7 +1729,7 @@ ALL-FOUR-vanillaplus-client-mods-sway-fov-classicmovement-perf-crash-the-client-
 
 <sub>method: `measured` · scope: `aowlspt-ga:e0ea3ad3b76b-db:41313127` · status: live · recorded: 2026-08-25T15:03:59 · last seen: 2026-08-25T15:03:59</sub>
 
-- command: `six launch cycles toggling mods/&lt;m&gt;/&lt;m&gt;.dll vs .dll.off in D:\Aowlspt\aowlspt\mods; verdict per run = did a NEW dir appear under D:\Aowlspt\Logs, plus host run length from tools/hostlog.py summary`
+- command: `six launch cycles toggling mods/<m>/<m>.dll vs .dll.off in D:\Aowlspt\aowlspt\mods; verdict per run = did a NEW dir appear under D:\Aowlspt\Logs, plus host run length from tools/hostlog.py summary`
 - evidence: all 7 -> crash 2.328s. {classicmovement,fov,perf,sway} -> crash 1.234s. {fov,sway} -> crash 1.203s. {sway} -> crash 1.281s. {fov} -> crash 1.219s. {classicmovement,perf} -> crash 1.171s. ORIGINAL Aug-24 sway.dll.off (855552 bytes, vs today's rebuild 856064) -> crash 1.203s. CONTROL, none of the 7 enabled -> SURVIVED, client reached 35s+, character-selection screen up, entergame.py selected the PvE slot. Every crash: host log reaches HOST RUNNING then stops, 0 client processes, 0 new client log dirs, no crash dump, no Windows event-log entry.</evidence>
 <parameter name="note">Supersedes the sway-specific reading in #131 and rules out "today's build broke them": the pre-existing binary fails the same way. These mods are simply broken on this game build, which is WHY someone renamed all seven to .dll.off -- that rename is a deliberate workaround, recorded nowhere in the repo. The 1.0 blocker stands and is bigger: aowl.list.vanillaplus, the installer's DEFAULT list, names fovfix + sptsway + classicmovement + perf. Known-good enabled set on the working install is exactly: graphics, manager, pathtotarkov, settingshub, tarkov, textures, uihub. morebots/sain/blackdivision were NOT tested individually -- only as part of the all-7 crash.</parameter>
 </invoke>
@@ -1770,7 +1770,7 @@ indistinguishable-from-a-successful-write-by-status-code-or-Array-isArray-so-a-s
 
 <sub>method: `measured` · scope: `aowlspt-ga:e0ea3ad3b76b-db:41313127` · status: live · recorded: 2026-08-25T16:49:59 · last seen: 2026-08-25T16:49:59</sub>
 
-- command: `standalone backend on a scratch root, port 18443, no client and no TLS; POST /aowlspt/settings/&lt;guid&gt; with chunked transfer encoding vs with Content-Length`
+- command: `standalone backend on a scratch root, port 18443, no client and no TLS; POST /aowlspt/settings/<guid> with chunked transfer encoding vs with Content-Length`
 - evidence: Measured by the settings-UI subagent while building tests/uihubscale. A chunked POST returns HTTP 200 and a body that is the schema with the value unchanged -- the same shape a successful write returns. Only reading the value back distinguishes them.
 
 ### #136 — why the .dll.off client mods kill the post-1.0 client (fov proven; sway/classicmovement/perf likely)
@@ -1795,7 +1795,7 @@ CameraPosition-k-BackingField-at-0x3b8-is-a-Transform-NOT-a-Vector3-real-path-is
 <sub>method: `measured` · scope: `aowlspt-ga:e0ea3ad3b76b-db:41313127` · status: live · recorded: 2026-08-25T16:53:19 · last seen: 2026-08-25T16:53:19</sub>
 
 - command: `tools/fldoff.py and tools/il2cpp_resolve.py, cross-checked against each other`
-- evidence: Measured by the admin subagent. (1) `objectClass()` was `il2cpp_object_get_class`, which FAULTS on this build (reflection is dead) and it sat on every offset lookup. (2) `&lt;CameraPosition&gt;k__BackingField`@0x3b8 is a Transform reference; reading it as a Vector3 meant every ESP position was actually an object header. Correct chain: Player+0x60 -> MovementContext+0x370. (3) `Stamina.TotalCapacity`@0x18 is a `Compute&lt;float&gt;`, not a float; it was being read AND written back as a float. Real max lives at PhysicalBase+0x8C. God mode target RVA 0x731480 corroborated: prologue matches, returns void, UNIQUE across 31,282 types, and EFT.LocalPlayer does not override it.</evidence>
+- evidence: Measured by the admin subagent. (1) `objectClass()` was `il2cpp_object_get_class`, which FAULTS on this build (reflection is dead) and it sat on every offset lookup. (2) `<CameraPosition>k__BackingField`@0x3b8 is a Transform reference; reading it as a Vector3 meant every ESP position was actually an object header. Correct chain: Player+0x60 -> MovementContext+0x370. (3) `Stamina.TotalCapacity`@0x18 is a `Compute<float>`, not a float; it was being read AND written back as a float. Real max lives at PhysicalBase+0x8C. God mode target RVA 0x731480 corroborated: prologue matches, returns void, UNIQUE across 31,282 types, and EFT.LocalPlayer does not override it.</evidence>
 <parameter name="note">Textbook CLAUDE.md 9b: all three produce plausible numbers rather than faulting, so nothing announced a problem. A Transform read as a Vector3 yields coordinates that look like coordinates. Recorded on the subagent's behalf -- aowlfacts MCP tools are NOT exposed to subagents, which is why several agents today could neither recall nor record. ESP still does NOT render: world-to-screen is unbound; the fix is Camera::WorldToScreenPoint@0x525F940, already byte-verified in abi/aowlspt_debugui.h.</parameter>
 </invoke>
 
@@ -1850,7 +1850,7 @@ it-reported-SAIN-SURVIVED-for-a-run-that-died-at-8s-and-sent-a-whole-session-cha
 
 <sub>method: `measured` · scope: `aowlspt-ga:e0ea3ad3b76b-db:41313127` · status: live · recorded: 2026-08-25T17:39:26 · last seen: 2026-08-25T17:39:26</sub>
 
-- command: `compare: `ls -d /d/Aowlspt/Logs/log_&lt;today&gt;*` vs `tasklist | grep -c EscapeFromTarkov` plus `tools/hostlog.py summary` run length, 95s after launch`
+- command: `compare: `ls -d /d/Aowlspt/Logs/log_<today>*` vs `tasklist | grep -c EscapeFromTarkov` plus `tools/hostlog.py summary` run length, 95s after launch`
 - evidence: Run log_2026.08.25_17-18-18 created its client log dir AND died at 8s. The dir is created between ~1.4s and ~8s, so it only distinguishes the ~1.2s whenReady crashes, not later ones. STRONG predicate results, same install: no client mods -> alive, 78s. fov alone -> alive 87s then 99.8s, `ok Unity thread live` present. Anything with sain -> dead by ~8s across six runs. A known-good run's client output_000.log is byte-identical (1960 bytes) to a crashing run's, so the CLIENT log is also useless as a survival signal at this logging level.</evidence>
 <parameter name="note">CLAUDE.md 9b at my own expense. Use: process alive AND `tools/hostlog.py summary` run length still advancing AND `ok ... Unity thread live` present. Consequence to un-believe: the earlier "SAIN SURVIVED" verdict was this false positive -- mods/sain still kills the client at ~8s even with the mainThread().bound gate that fixed mods/fov, so SAIN has a SECOND defect the gate does not address. mods/fov is genuinely verified by the strong predicate, twice.</parameter>
 </invoke>
@@ -1891,7 +1891,7 @@ resolving-about-70-names-is-harmless-but-CALLING-get_Instance-BINDING-Physics-Ra
 
 - command: `five instrumented launches of mods/sain with step N/7 breadcrumbs logged BEFORE each hop, host log archived to D:\Aowlspt\hostlogs\ before every launch`
 - evidence: Each fix moved the death exactly one step: (1) died at `bindProbe 1/2 -- UnityEngine.Physics::Raycast`; refused it -> (2) died at `step 5/7: CALLING EFT.GameWorld::get_Instance`; routed via the host export -> (3) died at `installHooks -- attempting the bot-activation detour on EFT.BotsController::AddActivePLayer` (host patch BY NAME); refused it -> (4) SURVIVES: clientAlive=1, run length 1:55.828, `ok Unity thread live`, `installHooks returned; arming complete`. Death signature every time: no dump, no Windows event-log entry, client output_000.log byte-identical to a healthy run.</evidence>
-<parameter name="note">Extends fact #35 with the crucial distinction that hid this for a whole session: RESOLVING by name returns a non-nil handle into unmapped memory and looks like success; the process dies when that handle is USED, and use includes a host DETOUR INSTALL, not just a call. Consequences measured on the way: EFT.GameWorld has NO get_Instance and NO get_AllAlivePlayersList (409 members) but DOES have field AllAlivePlayersList inst@0x1c8; the host's aowl_host_gameworld export is the working route; EVERY one of sain's ~70 members is a LazyCall whose ensure calls il2cpp_object_get_class, which faults, so sain's whole read path is blocked BY CONSTRUCTION; aowlhost.nim ~4040 refuses the JSON patch ABI for any @0x spec by design, so hookArgs cannot take an RVA while hookTyped/hookReturnTyped can; List&lt;Player&gt;._size reads offset 0 offline because generic instantiations allocate offsets at RUNTIME; and AddActivePLayer's prologue holds relative branches (74 0C at byte 5, E9 at byte 14) inside the relocation window, so it may be undetourable regardless. Zero-reflection identity route: EFT.Player.&lt;Profile&gt;k__BackingField inst@0x9c0 -&gt; EFT.Profile.Id inst@0x10 -&gt; System.String.</parameter>
+<parameter name="note">Extends fact #35 with the crucial distinction that hid this for a whole session: RESOLVING by name returns a non-nil handle into unmapped memory and looks like success; the process dies when that handle is USED, and use includes a host DETOUR INSTALL, not just a call. Consequences measured on the way: EFT.GameWorld has NO get_Instance and NO get_AllAlivePlayersList (409 members) but DOES have field AllAlivePlayersList inst@0x1c8; the host's aowl_host_gameworld export is the working route; EVERY one of sain's ~70 members is a LazyCall whose ensure calls il2cpp_object_get_class, which faults, so sain's whole read path is blocked BY CONSTRUCTION; aowlhost.nim ~4040 refuses the JSON patch ABI for any @0x spec by design, so hookArgs cannot take an RVA while hookTyped/hookReturnTyped can; List<Player>._size reads offset 0 offline because generic instantiations allocate offsets at RUNTIME; and AddActivePLayer's prologue holds relative branches (74 0C at byte 5, E9 at byte 14) inside the relocation window, so it may be undetourable regardless. Zero-reflection identity route: EFT.Player.<Profile>k__BackingField inst@0x9c0 -> EFT.Profile.Id inst@0x10 -> System.String.</parameter>
 </invoke>
 
 ### #146 — mods/sain reaching a live bot
@@ -2000,7 +2000,7 @@ Three consecutive runs failed to connect before the agent read aowlspt-control.j
 
 <sub>method: `measured` · scope: `aowlspt-ga:e0ea3ad3b76b-db:41313127` · status: live · recorded: 2026-08-27T11:17:21 · last seen: 2026-08-27T11:17:21</sub>
 
-- command: `aowlspt-backend.exe --port &lt;n&gt; then read aowlspt-control.json`
+- command: `aowlspt-backend.exe --port <n> then read aowlspt-control.json`
 
 ### #155 — db.json staticContainers[*].template.Position on this build (server-side loot placement)
 
@@ -2080,7 +2080,7 @@ sharedassets2.assets holds 292 Texture2D, ALL streamed to .resS with explicit of
 
 **IS-POSSIBLE-the-client-has-a-first-class-server-steered-load-scene-from-bundle-path-and-we-need-no-Harmony**
 
-EFT.AssetsManager.AssetsManager::LoadScene(bundleName, sceneName, LoadSceneMode, allowSceneActivation, Action&lt;float&gt;) @RVA 0x1911f60 returns a LoadSceneOperation wrapping Unity's SceneManager.LoadSceneAsync -- loading a scene from a bundle is stock Unity and needs NO BuildSettings entry. The entry point is SERVER DATA: locations.json Scene = {path: "maps/customs_preset.bundle", rcid: "bigmap.scenespreset.asset"} feeds EFT.ModernLoadScenesFromPreset::Load(ResourceKey) @0x959290 -> LoadScenesFromPresetOperation::Execute @0x9548e0 -> ScenesLoadCoroutine(IList&lt;ResourceKey&gt;) @0x954f50. The bundle holds an EFT.ScenesPreset with BOTH ScenesGuids (built-in) AND _scenesResourceKeys: List&lt;SceneResourceKey&gt; -- so a preset can name scenes that live in BUNDLES.
+EFT.AssetsManager.AssetsManager::LoadScene(bundleName, sceneName, LoadSceneMode, allowSceneActivation, Action<float>) @RVA 0x1911f60 returns a LoadSceneOperation wrapping Unity's SceneManager.LoadSceneAsync -- loading a scene from a bundle is stock Unity and needs NO BuildSettings entry. The entry point is SERVER DATA: locations.json Scene = {path: "maps/customs_preset.bundle", rcid: "bigmap.scenespreset.asset"} feeds EFT.ModernLoadScenesFromPreset::Load(ResourceKey) @0x959290 -> LoadScenesFromPresetOperation::Execute @0x9548e0 -> ScenesLoadCoroutine(IList<ResourceKey>) @0x954f50. The bundle holds an EFT.ScenesPreset with BOTH ScenesGuids (built-in) AND _scenesResourceKeys: List<SceneResourceKey> -- so a preset can name scenes that live in BUNDLES.
 
 > Pre-1.0 precedent (SamSWAT CustomLocation, Construction, Parkside) used this exact path but needed a BepInEx/Harmony prefix on LoadBundleAsync to rewrite the bundle name, because they could not add manifest entries. WE DO NOT NEED THAT: we own the backend and the install, so we add the key to StreamingAssets/Windows/Windows.json (7560 keys, plain JSON) and the file directly. The one thing IL2CPP took away is the one thing we do not need. Windows.json IS in ConsistencyInfo so it needs a size+checksum resync, but ADDING a new maps/*.bundle file is untouched by the check. The blocker is AUTHORING, not loading: EFT-typed MonoBehaviours (SpawnPointMarker, AIExfiltrationPoint, LocationScene) need byte-matching editor stub classes, a baked NavMesh, and a CompatibilityBuildPipeline build in Unity 2022.3.43f2. Shaders and IL2CPP script logic do NOT round-trip -- and custom maps do not need them.
 
@@ -2218,7 +2218,7 @@ Sandbox_start -> Loot 0 entries; "sandbox" -> 261; "bigmap" -> 270. BSG's captur
 
 Measured against BSG's own capture (seq 045, resp_xenc: aes): BSG served all 4,673 ids we serve, plus 261 distinct _props keys we omitted entirely -- RagfairLevelToTrade and IsNotDeletableFromQuestStashAfterQuestComplete on EVERY item, AudioSettings/WeaponAimSettings (REF) on 177 weapons, FaceCoverMask on 120, and 95 category Nodes shipped with empty _props. Backfilled from BSG-sent values only via mods/tarkov/data/post1/itemsgaps.json (2,026,888 B); db.json always wins and absent ids are never conjured. After: 0 missing. Payload 12.74 -> 14.63 MB, first request 224 -> 840 ms (then cached).
 
-> This route reported NO-DTO / INCONCLUSIVE for the whole session because dtogap has no top-level DTO for a keyed dict of templates -- so the biggest thing we serve was never measured while ten smaller routes were repeatedly confirmed clean. \"No number\" was hiding a real hole. Also: dtogap's OWN hint is wrong -- it says --path data.&lt;id&gt;, which prints 107 FICTIONAL missing rows because members bind from _props; the correct path is data.&lt;id&gt;._props, diffed against the union of outer+_props keys.
+> This route reported NO-DTO / INCONCLUSIVE for the whole session because dtogap has no top-level DTO for a keyed dict of templates -- so the biggest thing we serve was never measured while ten smaller routes were repeatedly confirmed clean. \"No number\" was hiding a real hole. Also: dtogap's OWN hint is wrong -- it says --path data.<id>, which prints 107 FICTIONAL missing rows because members bind from _props; the correct path is data.<id>._props, diffed against the union of outer+_props keys.
 
 <sub>method: `measured` · scope: `aowlspt-ga:e0ea3ad3b76b-db:41313127` · status: live · recorded: 2026-08-27T13:51:37 · last seen: 2026-08-27T13:51:37</sub>
 
@@ -2266,9 +2266,9 @@ Parsed the PE export table of the shipped host DLL: 16 exports, ALL aowl_region_
 
 **measured-RVAs-and-offsets-inventory-screen-is-PORTABLE-loading-screen-is-NOT**
 
-EFT.Utilities.XCoordRotation::SetRotation(float) RVA 0xE09E20, NOT shared -- callable. XCoordRotation.&lt;CurrentYaw&gt;k__BackingField @0x30, a plain field, so the shared 39-owner getter is unnecessary. EFT.UI.InventoryPlayerModelWithStatsWindow::DragHandler(PointerEventData) RVA 0x16D2CE0, NOT shared; its first bytes are 48 8B 89 98 00 00 00 = mov rcx,[rcx+0x98], independently confirming _rotator@0x98 from the field table -- one detour yields both the `this` pointer and the drag event. _dragTrigger@0xF0; DragTrigger.onDrag/onBeginDrag/onEndDrag @0x20/0x28/0x30. Three more unshared DragHandlers exist if the effect is wanted elsewhere: AppearanceSelector, InspectClothingWindow, EquipmentBuildsScreen.
+EFT.Utilities.XCoordRotation::SetRotation(float) RVA 0xE09E20, NOT shared -- callable. XCoordRotation.<CurrentYaw>k__BackingField @0x30, a plain field, so the shared 39-owner getter is unnecessary. EFT.UI.InventoryPlayerModelWithStatsWindow::DragHandler(PointerEventData) RVA 0x16D2CE0, NOT shared; its first bytes are 48 8B 89 98 00 00 00 = mov rcx,[rcx+0x98], independently confirming _rotator@0x98 from the field table -- one detour yields both the `this` pointer and the drag event. _dragTrigger@0xF0; DragTrigger.onDrag/onBeginDrag/onEndDrag @0x20/0x28/0x30. Three more unshared DragHandlers exist if the effect is wanted elsewhere: AppearanceSelector, InspectClothingWindow, EquipmentBuildsScreen.
 
-> TWO things kill a literal port, both avoidable: DragTrigger::OnDrag/OnBeginDrag/OnEndDrag are SHARED (14/12/10 owners) so undetourable, and subscribing to the Action&lt;PointerEventData&gt; events as upstream does needs a constructed managed delegate (type injection, unproven here). Route that works: detour DragHandler for begin/drag, infer end-of-drag and integrate decay from the host tick by differencing CurrentYaw. The LOADING-screen half is dead: upstream anchors on MatchmakerTimeHasCome.Class3326::method_1, and on this build MatchmakerTimeHasCome has no method_1/method_5 and NO drag method at all (_dragTrigger@0xB0 is wired by an unnamed closure) -- obfuscated method_N names have drifted since the SPT build upstream targets. Upstream is MIT (Copyright 2026 Theodore), 282 lines, 4 files, ZERO assets -- no item, no bundle, no server half.
+> TWO things kill a literal port, both avoidable: DragTrigger::OnDrag/OnBeginDrag/OnEndDrag are SHARED (14/12/10 owners) so undetourable, and subscribing to the Action<PointerEventData> events as upstream does needs a constructed managed delegate (type injection, unproven here). Route that works: detour DragHandler for begin/drag, infer end-of-drag and integrate decay from the host tick by differencing CurrentYaw. The LOADING-screen half is dead: upstream anchors on MatchmakerTimeHasCome.Class3326::method_1, and on this build MatchmakerTimeHasCome has no method_1/method_5 and NO drag method at all (_dragTrigger@0xB0 is wired by an unnamed closure) -- obfuscated method_N names have drifted since the SPT build upstream targets. Upstream is MIT (Copyright 2026 Theodore), 282 lines, 4 files, ZERO assets -- no item, no bundle, no server half.
 
 <sub>method: `measured` · scope: `aowlspt-ga:e0ea3ad3b76b-db:41313127` · status: live · recorded: 2026-08-27T14:54:36 · last seen: 2026-08-27T14:54:36</sub>
 
@@ -2278,7 +2278,7 @@ EFT.Utilities.XCoordRotation::SetRotation(float) RVA 0xE09E20, NOT shared -- cal
 
 **silently-disabled-FOUR-mods-and-produced-a-log-line-that-was-FALSE-not-merely-unhelpful**
 
-admin (ESP/world features), sain (bot object-graph walk), morebots (worldState gate) and fov all depend on it. fov is the instructive one: applyFov opened with `let w = gwWorld(); if w == nil: return`, so with gwState()==0 it returned on frame 1 forever and CameraManager::get_Instance @0x1263bd0 was NEVER CALLED ONCE -- yet the mod logged "waiting for a live CameraManager", which is a false statement about a call it never made. The camera needs no world and no export: static get_Instance @0x1263bd0 -> &lt;Camera&gt;k__BackingField@0x70.
+admin (ESP/world features), sain (bot object-graph walk), morebots (worldState gate) and fov all depend on it. fov is the instructive one: applyFov opened with `let w = gwWorld(); if w == nil: return`, so with gwState()==0 it returned on frame 1 forever and CameraManager::get_Instance @0x1263bd0 was NEVER CALLED ONCE -- yet the mod logged "waiting for a live CameraManager", which is a false statement about a call it never made. The camera needs no world and no export: static get_Instance @0x1263bd0 -> <Camera>k__BackingField@0x70.
 
 > Two lessons. (1) A dependency check placed at the TOP of a function makes every later step report as \"waiting\", so the log names the last thing you would have done rather than the thing that stopped you -- order the acquisition before the gate, or the diagnostic lies. (2) \"host too old, or not in the client\" sent three separate investigations hunting a stale deployment when the deployment was correct and the export table was not. See fact #175 for the mechanism ({.exportc.} emits a C symbol, not a PE export).
 
@@ -2298,7 +2298,7 @@ tools/fldoff.py enum EFT.ESkillId decodes cleanly to 67 members, and ALL 17 ids 
 
 - command: `tools/fldoff.py enum EFT.ESkillId; client log log_2026.08.27_12-* x22`
 
-### #179 — tools/fldoff.py fields &lt;Type&gt; with a name that does not exist
+### #179 — tools/fldoff.py fields <Type> with a name that does not exist
 
 **SUBSTRING-MATCHES-and-prints-the-WRONG-TYPE-s-fields-as-if-they-were-the-requested-one**
 
@@ -2398,9 +2398,9 @@ SERVER side: fact #135 does NOT reproduce. The overlay calls WinHttpSendRequest 
 
 **was-an-OFF-BY-ONE-in-a-POSITIONAL-INDEX-TABLE-not-a-pointer-liveness-problem-at-all**
 
-aowl_du_targets in abi/aowlspt_debugui.h has 28 rows; the positional index list in debugui.nim named 27. Commit 7eb60cb (2026-08-24, the inspector `rect` verb) inserted RectTransform::get_anchorMax at row 14 and never added a name, so every index &gt;= 13 was one too small. DuGetParent = 18 actually resolved to UnityEngine.Transform::set_localPosition @0x52B7220 -- a byte-verified, non-shared, perfectly valid function of the WRONG SHAPE. Win64 passes a 12-byte Vector3 BY REFERENCE in RDX; aowl_du_call_p_p puts NULL there, so the setter dereferenced null: a fault INSIDE the call, at depth 0, on a receiver that had just passed both liveness gates. Transform::get_parent @0x52B81D0 was correct all along (3 owners, declared shared-call, prologue matches).
+aowl_du_targets in abi/aowlspt_debugui.h has 28 rows; the positional index list in debugui.nim named 27. Commit 7eb60cb (2026-08-24, the inspector `rect` verb) inserted RectTransform::get_anchorMax at row 14 and never added a name, so every index >= 13 was one too small. DuGetParent = 18 actually resolved to UnityEngine.Transform::set_localPosition @0x52B7220 -- a byte-verified, non-shared, perfectly valid function of the WRONG SHAPE. Win64 passes a 12-byte Vector3 BY REFERENCE in RDX; aowl_du_call_p_p puts NULL there, so the setter dereferenced null: a fault INSIDE the call, at depth 0, on a receiver that had just passed both liveness gates. Transform::get_parent @0x52B81D0 was correct all along (3 owners, declared shared-call, prologue matches).
 
-> COLLATERAL, which explains why the panel never drew even when it did not fault: DuSetLocalScale and DuSetLocalPos resolved to the GETTERS, so duPlace never moved anything; DuSetRaycast -&gt; Canvas::get_scaleFactor; DuSetEnabled -&gt; set_raycastTarget. Five rounds of liveness fixes could not have found this, and each one moved the fault, which read as progress. The lesson: a positional index into a C table shared with Nim has NOTHING checking that the two agree -- il2cpp_symtab.py verifies RVAs and sharedness but not this binding. duIndicesOk now compares the name the C table holds at each index against the name the module calls it by, at bind, and refuses to arm on mismatch.
+> COLLATERAL, which explains why the panel never drew even when it did not fault: DuSetLocalScale and DuSetLocalPos resolved to the GETTERS, so duPlace never moved anything; DuSetRaycast -> Canvas::get_scaleFactor; DuSetEnabled -> set_raycastTarget. Five rounds of liveness fixes could not have found this, and each one moved the fault, which read as progress. The lesson: a positional index into a C table shared with Nim has NOTHING checking that the two agree -- il2cpp_symtab.py verifies RVAs and sharedness but not this binding. duIndicesOk now compares the name the C table holds at each index against the name the module calls it by, at bind, and refuses to arm on mismatch.
 
 <sub>method: `measured` · scope: `aowlspt-ga:e0ea3ad3b76b-db:41313127` · status: live · recorded: 2026-08-27T16:57:35 · last seen: 2026-08-27T16:57:35</sub>
 
@@ -2416,27 +2416,27 @@ The client's own backend_000.log shows ~60 distinct routes. tools/oursample.py m
 
 <sub>method: `measured` · scope: `aowlspt-ga:e0ea3ad3b76b-db:41313127` · status: superseded · recorded: 2026-08-27T17:20:43 · last seen: 2026-08-27T17:20:43</sub>
 
-- command: `census of D:\Aowlspt\Logs\&lt;ts&gt;\...backend_000.log vs dtogap.ROUTES`
+- command: `census of D:\Aowlspt\Logs\<ts>\...backend_000.log vs dtogap.ROUTES`
 
 ### #189 — the 16 declared-but-absent members of /client/globals
 
 **are-PROVEN-SAFE-by-consumer-disassembly-and-filling-any-of-them-would-be-INERT-OR-ACTIVELY-WRONG**
 
-Two independent mechanisms, both measured offline. (1) EFT.GlobalConfiguration::.ctor @0x251db10 ALLOCATES every reference field (il2cpp_codegen_object_new + ctor) BEFORE Json.NET populates, and Newtonsoft never nulls an absent member -- so absence yields an empty default object, never a null, at all ~82 read sites. (2) GlobalsDataLoader.&lt;Apply&gt;d__14::MoveNext @0x9a3f50 OVERWRITES eight of them immediately after deserialization via UpdateSettings(_traderSettings@0x20, _prestigeSettings@0x28, _mainQuestSettings@0x30, _questNoteTemplate@0x38, _profileVariables@0x40, _seasonalPerks@0x90, _seasonalRewards@0x98) and UpdateBattlePassSettings(_battlePassData@0xa0) -- those JSON values are discarded unread. Two more, OverDamageFactor and Associations, have LAZY getters that BUILD themselves from LegsOverdamage/Hands/Stomach and Mastering[]@0x140, so sending them would OVERRIDE the client's own derivation. AllowSelectEntryPoint has exactly one reader (MatchmakerOperation::ShowMatchmakerMapPointsScreen @0xa30b6c) which null-checks the config first; absent =&gt; false =&gt; entry-point selection off, cannot fault.
+Two independent mechanisms, both measured offline. (1) EFT.GlobalConfiguration::.ctor @0x251db10 ALLOCATES every reference field (il2cpp_codegen_object_new + ctor) BEFORE Json.NET populates, and Newtonsoft never nulls an absent member -- so absence yields an empty default object, never a null, at all ~82 read sites. (2) GlobalsDataLoader.<Apply>d__14::MoveNext @0x9a3f50 OVERWRITES eight of them immediately after deserialization via UpdateSettings(_traderSettings@0x20, _prestigeSettings@0x28, _mainQuestSettings@0x30, _questNoteTemplate@0x38, _profileVariables@0x40, _seasonalPerks@0x90, _seasonalRewards@0x98) and UpdateBattlePassSettings(_battlePassData@0xa0) -- those JSON values are discarded unread. Two more, OverDamageFactor and Associations, have LAZY getters that BUILD themselves from LegsOverdamage/Hands/Stomach and Mastering[]@0x140, so sending them would OVERRIDE the client's own derivation. AllowSelectEntryPoint has exactly one reader (MatchmakerOperation::ShowMatchmakerMapPointsScreen @0xa30b6c) which null-checks the config first; absent => false => entry-point selection off, cannot fault.
 
 > This replaces INFERENCE (\"BSG omits them too, so presumably fine\") with PROOF from the shipped code, and reverses the instinct to fill them: ship NOTHING new for /client/globals. Method worth reusing: 0x5640 is the inlined GlobalConfiguration singleton accessor with 757 call sites, and decoding the [rax+disp] load after each one enumerates every direct read of every globals field. NEAR-MISS worth heeding: a naive linear sweep of the il2cpp section DESYNCS and reported ZERO readers of AllowSelectEntryPoint -- a confident wrong \"never read\"; per-method re-sync found the real one. Any future scanner must disassemble from known method starts.
 
 <sub>method: `measured` · scope: `aowlspt-ga:e0ea3ad3b76b-db:41313127` · status: live · recorded: 2026-08-27T17:23:32 · last seen: 2026-08-27T17:23:32</sub>
 
-- command: `RVA-&gt;method map (185,066 methods), call-xref scan, per-method displacement scan`
+- command: `RVA->method map (185,066 methods), call-xref scan, per-method displacement scan`
 
 ### #190 — positional index tables binding C target arrays to Nim constants (aowl_*_targets)
 
 **TEN-MORE-TABLES-HAVE-NO-BINDING-CHECK-AT-ALL-the-same-class-that-cost-six-rounds-on-F3**
 
-tools/idxbind.py surveys the repo and reports 10 target tables with no verification that the C row order matches the Nim constant list: aowl_botai_targets, aowl_botcap_targets, aowl_botdiag_targets, aowl_botnav_targets, five aowl_bridge_*_targets, and aowl_nav_targets. Exit 2, INCONCLUSIVE, listed by name; their Nim consumers were not surveyed. The checked ones are now aowl_du_targets (28 -&gt; 36 rows) plus three others, gated by duTargetsBindOk, which also fails on a raw literal index like cDuFn(17).
+tools/idxbind.py surveys the repo and reports 10 target tables with no verification that the C row order matches the Nim constant list: aowl_botai_targets, aowl_botcap_targets, aowl_botdiag_targets, aowl_botnav_targets, five aowl_bridge_*_targets, and aowl_nav_targets. Exit 2, INCONCLUSIVE, listed by name; their Nim consumers were not surveyed. The checked ones are now aowl_du_targets (28 -> 36 rows) plus three others, gated by duTargetsBindOk, which also fails on a raw literal index like cDuFn(17).
 
-> This is fact #187's class, unfixed elsewhere. There, a row inserted into aowl_du_targets without a matching name shifted every index &gt;= 13, so DuGetParent resolved to Transform::set_localPosition -- a byte-verified, non-shared, perfectly valid function of the WRONG SHAPE that faulted inside the call on a receiver that had passed every liveness gate. It cost six rounds and was invisible to il2cpp_symtab.py, which verifies RVAs and sharedness but not this binding. botnav in particular drives live bots, so the same silent mis-resolution there would be far worse than a blank overlay.
+> This is fact #187's class, unfixed elsewhere. There, a row inserted into aowl_du_targets without a matching name shifted every index >= 13, so DuGetParent resolved to Transform::set_localPosition -- a byte-verified, non-shared, perfectly valid function of the WRONG SHAPE that faulted inside the call on a receiver that had passed every liveness gate. It cost six rounds and was invisible to il2cpp_symtab.py, which verifies RVAs and sharedness but not this binding. botnav in particular drives live bots, so the same silent mis-resolution there would be far worse than a blank overlay.
 
 <sub>method: `measured` · scope: `aowlspt-ga:e0ea3ad3b76b-db:41313127` · status: superseded · recorded: 2026-08-27T17:35:12 · last seen: 2026-08-27T17:35:12</sub>
 
@@ -2446,7 +2446,7 @@ tools/idxbind.py surveys the repo and reports 10 target tables with no verificat
 
 **walks-only-the-TOP-LEVEL-of-a-payload-so-NESTED-members-are-unaudited-across-all-70-routes**
 
-Coverage went 13 -&gt; 35 of 70 routes type-checked (30 PASS, 5 with UNKNOWN members which are NOT a pass; 35 INCONCLUSIVE -- 18 single-key payloads whichdto correctly refuses to rank, 13 EMPTY/ERROR, 4 keyed dicts with no top-level DTO). ZERO new FATAL mismatches were found by the metadata sweep. But the sweep structurally CANNOT see nested members: MainQuestSettings sits at globals.config.MainQuest and was only ever found by reading the CLIENT'S OWN ERROR LOG. Three more crash-class defects came from that same source and not from the sweep: TraderDialogsDTO, AvailableCustomizationsResponse, SeasonalPerksData.
+Coverage went 13 -> 35 of 70 routes type-checked (30 PASS, 5 with UNKNOWN members which are NOT a pass; 35 INCONCLUSIVE -- 18 single-key payloads whichdto correctly refuses to rank, 13 EMPTY/ERROR, 4 keyed dicts with no top-level DTO). ZERO new FATAL mismatches were found by the metadata sweep. But the sweep structurally CANNOT see nested members: MainQuestSettings sits at globals.config.MainQuest and was only ever found by reading the CLIENT'S OWN ERROR LOG. Three more crash-class defects came from that same source and not from the sweep: TraderDialogsDTO, AvailableCustomizationsResponse, SeasonalPerksData.
 
 > The client's error log is a BETTER oracle than our metadata sweep for this bug class, because it reports what actually threw. Two tool traps found in the same pass: (1) --provenance ours is a LIE for the ~20 routes that serve BSG capture bytes verbatim -- it attributes BSG's shape to us and manufactures FATALs, and nearly caused a \"fix\" to correct data; oursample should mark capture-derived payloads automatically. (2) --whichdto has no confidence floor, and an arbitrary 0.6 admitted a WRONG mapping at 0.75 (QuestNoteTemplate on getMainQuestNotesList), which presented as a textbook fatal on a payload that is verbatim BSG traffic the client has never thrown on.
 
@@ -2460,7 +2460,7 @@ Coverage went 13 -&gt; 35 of 70 routes type-checked (30 PASS, 5 with UNKNOWN mem
 
 **throws-in-EFT.MongoID-ctor-and-KILLS-THE-ENTIRE-mail-dialog-list-RESPONSE-not-one-row**
 
-Chain: DialogueChatMessageSerializer.Deserialize -&gt; UpdatableChatMember.FindOrCreate -&gt; EFT.MongoID..ctor, which REJECTS a non-24-char id. Two producers in our server: deliver(p.id, \"\", ...) at tarkov.nim:2382 (the BTR hand-over) sends an EMPTY sender, and three flea notices send the literal \"ragfair\". Measured across 283 client sessions: 39 hits in 11 sessions, present in the last 12 sessions, i.e. LIVE. Fixed with senderId/withHealedSender applied both on write and on read, so inboxes already on disk heal.
+Chain: DialogueChatMessageSerializer.Deserialize -> UpdatableChatMember.FindOrCreate -> EFT.MongoID..ctor, which REJECTS a non-24-char id. Two producers in our server: deliver(p.id, \"\", ...) at tarkov.nim:2382 (the BTR hand-over) sends an EMPTY sender, and three flea notices send the literal \"ragfair\". Measured across 283 client sessions: 39 hits in 11 sessions, present in the last 12 sessions, i.e. LIVE. Fixed with senderId/withHealedSender applied both on write and on read, so inboxes already on disk heal.
 
 > Found by sweeping the CLIENT'S OWN LOGS, not by any audit of ours -- the capture cannot settle it either (raid1 seq 136 mail/dialog/list is 81 bytes, an empty inbox), so the proof is the client's constructor throwing. This is the second crash-class defect on the same route in two days, after systemData: false. Coverage note from the same sweep: 97 distinct routes appear across 283 sessions but 130 are served, and mail/dialog/{view,read,pin,unpin,remove,getAllAttachments}, quest/complete, builds/*/save|delete, profile/view, match/exit, location/getLocalloot and others have NEVER been exercised in any logged session -- nothing says they are correct.
 
@@ -2472,7 +2472,7 @@ Chain: DialogueChatMessageSerializer.Deserialize -&gt; UpdatableChatMember.FindO
 
 **NONE-is-addressed-by-a-positional-constant-so-none-could-shift-and-botnav-does-not-use-the-table-at-all**
 
-Nine of the ten are SWEEP-addressed (for i in 0 ..&lt; count, row and name read at the SAME i), which is structurally immune to an inserted row: botnav (1 row, EFT.BotOwner::UpdateManual), botai, botcap, botdiag, and five bridge_* tables. The tenth, aowl_nav_targets, is BY-NAME -- iNavFind substring-matches cNavName(i) before taking cNavFn(i). Critically, botnav's GoToPoint and SetTargetMoveSpeed do NOT go through the table: they are separate named C helpers with their own RVA and signature (aowl_bn_sig_gotopoint etc.), so the feared \"a shifted index writes to live bots every frame\" cannot happen.
+Nine of the ten are SWEEP-addressed (for i in 0 ..< count, row and name read at the SAME i), which is structurally immune to an inserted row: botnav (1 row, EFT.BotOwner::UpdateManual), botai, botcap, botdiag, and five bridge_* tables. The tenth, aowl_nav_targets, is BY-NAME -- iNavFind substring-matches cNavName(i) before taking cNavFn(i). Critically, botnav's GoToPoint and SetTargetMoveSpeed do NOT go through the table: they are separate named C helpers with their own RVA and signature (aowl_bn_sig_gotopoint etc.), so the feared \"a shifted index writes to live bots every frame\" cannot happen.
 
 > RESOLVES #190 -- the survey correctly flagged them as unverified, and verification found them safe. But it also found a REAL residual hole of the exact #187 shape: settingswrite.nim's SwLocSetLabelText=6 / SwTmpSetText=7 / SwTmpSetDirty=8 sit ABOVE SIX UNNAMED ROWS of aowl_sw_targets with no expect array, where range-checking alone could never fail. Now bound to row names offline. idxbind.py is now a BUILD GATE (wired beside symTab in buildMod and buildIl2CppHost) failing four ways, each demonstrated by mutation then reverted: a raw literal index, an at(i)/name(j) mismatch, a new unregistered table in abi/, and a duplicate constant. Its `unused` classification also caught its own author: a grep missed a call site, the check FAILED the build and named settingsui.nim:711, a live kind=8 drain.
 
@@ -2486,7 +2486,7 @@ Nine of the ten are SWEEP-addressed (for i in 0 ..&lt; count, row and name read 
 
 **8365-of-8749-nested-members-type-checked-across-37-routes-and-found-ZERO-fatals-every-candidate-was-OUR-AUDIT-being-wrong**
 
-tools/dtodeep.py resolves nested members by Il2CppType INDEX rather than name, caps depth 8 and 6 elements plus every shape-divergent one, and carries a BSG-capture falsifier at the same path. 384 members are UNKNOWN (explicitly not passes) and 34 routes still have no DTO and were not checked at all. Every FATAL candidate was falsified against capture/raid1: .Inventory.equipment|stash|questRaidItems|questStashItems|sortingTable (seq 208 sends strings), .barter_scheme.&lt;id&gt; (320 sends [[...]]), .stages.N.requirements|bonuses|constructionTime|improvements (110), and 18 ragfair DateTime/EMemberCategory rows (enum-from-int is legal). 152 rows now report as BSG-EXCUSED rather than as defects, and the totals print that number so \"0 FATAL\" cannot be read as more than it is.
+tools/dtodeep.py resolves nested members by Il2CppType INDEX rather than name, caps depth 8 and 6 elements plus every shape-divergent one, and carries a BSG-capture falsifier at the same path. 384 members are UNKNOWN (explicitly not passes) and 34 routes still have no DTO and were not checked at all. Every FATAL candidate was falsified against capture/raid1: .Inventory.equipment|stash|questRaidItems|questStashItems|sortingTable (seq 208 sends strings), .barter_scheme.<id> (320 sends [[...]]), .stages.N.requirements|bonuses|constructionTime|improvements (110), and 18 ragfair DateTime/EMemberCategory rows (enum-from-int is legal). 152 rows now report as BSG-EXCUSED rather than as defects, and the totals print that number so \"0 FATAL\" cannot be read as more than it is.
 
 > This is the fourth time an audit of ours would have \"fixed\" correct data -- after container positions, /client/weather and getMainQuestNotesList. The rule holds: when our audit disagrees with BSG's captured traffic, our audit is usually wrong. Selftest plants 3 defects BELOW the top level and catches 3/3, so the walker can fail. Also fixed a check-that-cannot-fail in our own harness: a TYPO in --mutate silently ran the UNMUTATED check and printed PASS; `--mutate lootpo` now exits 1 and lists the 25 valid names. STILL UNAUDITED: routes with no DTO mapping -- including /client/mail/dialog/list, where BOTH of this week's live crash-class bugs actually lived.
 
@@ -2506,7 +2506,7 @@ Of the 34 previously unmapped: 11 MAPPED (mail/dialog/list, dialogue, quest/getM
 
 - supersedes → #191
 
-- command: `python tools/dtotype.py --manifest &lt;ours&gt;; betacheck check_dto_map`
+- command: `python tools/dtotype.py --manifest <ours>; betacheck check_dto_map`
 
 ### #196 — the F3 debug overlay, after six rounds of failure
 
@@ -2588,7 +2588,7 @@ tools/deploy.py `status` (branch feat-deploy-status) classifies this as AMBIGUOU
 <parameter name="note">SUPERSEDES the widely-repeated claim (mine, and in fact #197's evidence) that "the only live .dll.off files are sain and textures, so those two are OFF". Checking for the PRESENCE of a .dll.off is NOT a test of whether a mod is disabled -- both files can coexist, and then the mod LOADS. The correct test is whether the enabled .dll is absent. This is a check-that-cannot-fail (CLAUDE.md 9b) that I personally got wrong in a subagent brief, and the subagent was right to refuse to bend its tool to match the brief. Operational consequence: a deploy silently re-enables a deliberately-disabled mod, and deploy.py's marker check cannot notice because the copied DLL is correct. Open design question for the human: `deploy` should probably REFUSE on AMBIGUOUS rather than merely reporting it -- today it sees os.path.isfile(dst) is True, takes the ordinary path, and the stale .off stays forever with nobody told.</note>
 </invoke>
 
-### #201 — the Bash tool's heredoc (python - &lt;&lt;'EOF', quoted delimiter) when the body contains backslashes
+### #201 — the Bash tool's heredoc (python - <<'EOF', quoted delimiter) when the body contains backslashes
 
 **SILENTLY-HALVES-them-corrupting-written-file-content-THREE-independent-agents-hit-this-in-one-day**
 
@@ -2596,9 +2596,9 @@ a quoted delimiter does NOT protect backslashes: doubled backslashes collapse to
 
 <sub>method: `measured` · scope: `aowlspt-ga:e0ea3ad3b76b-db:41313127` · status: live · recorded: 2026-08-28T10:57:20 · last seen: 2026-08-28T10:57:20</sub>
 
-- command: `python - &lt;&lt;'PYEOF' with a body containing doubled backslashes; observed in three separate subagent sessions 2026-08-28`
-- evidence: Instance 1 (settings-descriptions agent): "The Bash tool ATE BACKSLASHES inside a quoted &lt;&lt;'EOF' heredoc, turning c=='\\\\' into c=='\'. That is a silent corruption of file content written through Bash. I had to use the Write tool."
-Instance 2 (TUI merge agent): "python - &lt;&lt;'PYEOF' with a quoted delimiter still halved \\\\ -&gt; \ in the emitted Nim, producing \"installer\build\tuilayout.exe\" and Error: invalid character constant. Two separate attempts failed the same way; the Edit tool fixed it in one call."
+- command: `python - <<'PYEOF' with a body containing doubled backslashes; observed in three separate subagent sessions 2026-08-28`
+- evidence: Instance 1 (settings-descriptions agent): "The Bash tool ATE BACKSLASHES inside a quoted <<'EOF' heredoc, turning c=='\\\\' into c=='\'. That is a silent corruption of file content written through Bash. I had to use the Write tool."
+Instance 2 (TUI merge agent): "python - <<'PYEOF' with a quoted delimiter still halved \\\\ -> \ in the emitted Nim, producing \"installer\build\tuilayout.exe\" and Error: invalid character constant. Two separate attempts failed the same way; the Edit tool fixed it in one call."
 Instance 3 (this coordinating session): writing a Python block containing the literal path C:\Users\savant\... raised SyntaxError: (unicode error) 'unicodeescape' codec can't decode bytes ... truncated \UXXXXXXXX escape -- the \U in C:\Users was interpreted as an escape.
 The failure is SILENT in the first two cases (wrong content written, no error) and only loud in the third by luck (\U happened to be an invalid escape).</evidence>
 <parameter name="note">Actionable rule, wider than what CLAUDE.md currently says: the "use Write/Edit for prose-bearing files" guidance should be widened to ANY content containing backslashes -- Windows paths, regex, escape sequences, Nim/C character constants. On this platform that is most generated code. Mitigations that DO work: use the Write or Edit tool; or in Python use raw strings (r'...') for every literal Windows path. A quoted heredoc delimiter is NOT sufficient protection and reading it as such is what makes this silent.</note>
@@ -2760,7 +2760,7 @@ Both directions proven: PUMPED -> edit applied=1, faults=0, 2 pushes during the 
 
 **IS-A-LOADED-GUN-installPatch-calls-findClass-findMethod-FIRST-and-only-falls-back-to-aowlspt-names.idx-for-the-code-POINTER-so-it-goes-through-the-GATED-exports**
 
-the safe form is @0xRVA/&lt;shape&gt;; findClass("System.Int32") against the real GameAssembly.dll KILLED aowlspt-sim with 0xC0000005 and no diagnostic -- fact #198 reproduced OUTSIDE the game
+the safe form is @0xRVA/<shape>; findClass("System.Int32") against the real GameAssembly.dll KILLED aowlspt-sim with 0xC0000005 and no diagnostic -- fact #198 reproduced OUTSIDE the game
 
 <sub>method: `measured` · scope: `aowlspt-ga:e0ea3ad3b76b-db:41313127` · status: live · recorded: 2026-08-28T11:57:21 · last seen: 2026-08-28T11:57:21</sub>
 
@@ -3025,7 +3025,7 @@ The cold-slot problem was solved by decoding the metadata-usage token (0xC00804F
 <parameter name="note">DEFINITIVELY RETIRES fact #35 ("by-name resolution is genuinely dead") and the project-long assumption that native UI is clone-only (recipe sixth-settings-tab). BOTH paths now proven live: A=clone, B=from-scratch. There is no remaining IL2CPP barrier to constructing arbitrary native Unity UI in this client. What is NOT yet proven for a full interactive screen: managed callbacks / onClick delegates (the offline spike's one open item -- a hand-built UnityAction needs invoke_impl + MethodInfo*; polled hit-testing is the v1 workaround), an Image/panel background drawn from scratch (Image kind is registered, path A/B proved text not image), and TMP set_font may want the real setter that rebuilds material/mesh vs a raw m_fontAsset store (the donor-copy worked here, so raw store sufficed for a donor's already-built material). Chain: object_new@ + GameObject::.ctor@0x52A8F40 + AddComponent<T>@0x2a9ae90 via .data MethodInfo slots + il2cpp_codegen_initialize_runtime_metadata@0x5251C0 for cold slots + Instantiate@0x52adbe0 + SetParentAndAlign@0x51903a0 + the RectTransform _Injected setters + TMP m_fontAsset@0x100 m_sharedMaterial@0x118.</note>
 </invoke>
 
-### #226 — GameWorld AllAlivePlayersList (List&lt;Player&gt;) layout for SAIN's bot enumeration -- MEASURED LIVE in a raid
+### #226 — GameWorld AllAlivePlayersList (List<Player>) layout for SAIN's bot enumeration -- MEASURED LIVE in a raid
 
 **is-STANDARD-il2cpp-List-T-_items@0x10-_size@0x18-then-Il2CppArray-max_length@0x18-vector@0x20-8-bytes-per-Player-ptr**
 
@@ -3035,7 +3035,7 @@ GameWorld+0x1c8 -> List; List+0x10 -> array, List+0x18 (i32) -> _size=40; array+
 
 - command: `live read-only inspector during an offline raid with bots: read $gameworld+0x1c8@... chains`
 - evidence: $gameworld object 0x18581244550 live (world PASS). read $gameworld+0x1c8@ -> List object 0x1890a6d0450 (its +0 klass = 0x188d7bce780). read +0x10 -> _items array 0x18bca7bbb40. read +0x18 i32 -> _size = 40 (matches the maps diag '39 contacts tracked' = 39 bots + player). Array: +0x18 i32 -> max_length = 64 (backing capacity >= 40, correct for a grown List); +0x20 ptr -> element[0] = 0x18ba09db000 readable; +0x28 ptr -> element[1] = 0x18bc7e83000 readable.
-So iteration is: n = *(i32*)(list+0x18); arr = *(void**)(list+0x10); for i in 0..&lt;n: player = *(void**)(arr+0x20+i*8). All offsets are the STANDARD System.Collections.Generic.List&lt;T&gt; + Il2CppArray layout (consistent with fact #78: Il2CppArray max_length @+0x18, data from +0x20), so they are stable across T and low-risk.</evidence>
+So iteration is: n = *(i32*)(list+0x18); arr = *(void**)(list+0x10); for i in 0..<n: player = *(void**)(arr+0x20+i*8). All offsets are the STANDARD System.Collections.Generic.List<T> + Il2CppArray layout (consistent with fact #78: Il2CppArray max_length @+0x18, data from +0x20), so they are stable across T and low-risk.</evidence>
 <parameter name="note">This is the single live measurement fact #224 said the SAIN driver was blocked on -- a subagent could resolve every drive-path RVA but not take this read. listLen (live.nim:2034) returning 0 unconditionally can now be replaced with this walk. UNBLOCKS the SAIN RVA driver (branch feat-sain-rva-driver, doc docs/SAIN_RVA.md) and therefore the 28 dead settings AND ORBIT per-bot tuning. Guard each hop with VirtualQuery (the inspector confirmed every hop readable, but a between-raid or dying-bot list can have a stale entry) and cap iteration at max_length. Player object at +0x20+i*8 is a real EFT.Player; the drive setters (SetTargetMoveSpeed@0x1A2B4D0 etc, from docs/SAIN_RVA.md) take that pointer as RCX=this.</note>
 </invoke>
 
@@ -3666,7 +3666,7 @@ so a saved setting looked "unsaved" because nothing on screen changed until rela
 
 - evidence: PREMISE CORRECTION measured in the DEPLOYED config D:\Aowlspt\aowlspt\aowlspt-host.json: settingsPages=False and modSettingsRender=False, i.e. the swkToggle/swkStub settings-screen layer that fact #255 describes IS NOT RUNNING and therefore cannot cause either complaint. The shipping surface the user actually sees is the UIHUB BROWSER PAGE. Matrix on that surface BEFORE: bool/int/float/enum/select/string/keybind all had write+persist wired; `color` DID NOT EXIST (overlayColor was a plain text box); NO row was a stub. AFTER: adds a real `color` kind. ROOT CAUSE of "changing x/y offset, font size, colour does nothing in realtime to F3": duLoadLayout had only THREE call sites -- arm (aowlhost.nim:7537) and the F3 toggle-ON edge (debugui.nim:2120, 2133) -- so a change made while the panel was ALREADY VISIBLE was never re-read. FIX: duHotReloadTick in debugui.nim, called from duRegionDraw, throttled every 30 frames, text-compare before reparse, self-disables after 5 read faults, off-switch `panelLiveReload`; touches no managed memory so it claims no il2cpp guard it lacks. PERSIST FILE: aowlspt-debugui.json; stColor is a HINT over stString's existing "r,g,b[,a]" shape, so nothing on disk changed format (backward compatible). VERIFY: node harness over the extracted colour-picker conversion functions, 40,007 assertions, 0 drift, "1,1,0.62" byte-exact round-trip. Artifacts on branch fix-settings-widgets @b475f5a: host 2,931,712 (67 markers/17 exports), uihub.dll 545,280 (6), debug.dll 584,192 (11); deploy.py check dropped no marker. UNVERIFIED: nothing run in-game -- the picker was never rendered, the live re-read never observed changing pixels. CONVERGENCE WORTH NOTING: this is the SAME SHAPE as fact #280 (maps off-toggle) -- the value was STORED correctly but the APPLY step never ran. Two independent user complaints, one underlying pattern: store != apply. When a setting appears not to save, check whether it merely fails to APPLY.
 
-### #282 — mods/&lt;name&gt;/&lt;name&gt;.dll sitting at the MOD ROOT (beside bin/)
+### #282 — mods/<name>/<name>.dll sitting at the MOD ROOT (beside bin/)
 
 **SHADOWS-bin-name.dll-and-a-stale-one-made-every-emu-selfcheck-report-ok-true-for-SIX-build-cycles**
 
@@ -8012,3 +8012,225 @@ ContentSizeFitter, LayoutElement, UnityEngine.CanvasGroup, HoverTooltipArea.
 The card body has CharacterSelectionSlotViewBase + ButtonFeedback (sound
 only) and no DefaultUIButton: "click the card" is a pointer handler or a
 screen-side selection call, not a UnityEvent. Header/InfoButton is inactive.
+
+## 2026-09-02: the profile-card click path, offline-derived (MEASURED)
+
+Instruments, all offline against `D:/Games/Tarkov/GameAssembly.dll` +
+`.cache/global-metadata.dec.dat`:
+
+```
+python tools/fldoff.py <GAMEASM> <METADEC> field System.String _stringLength   -> 0x10  (exit 0)
+python tools/fldoff.py <GAMEASM> <METADEC> field System.String _firstChar      -> 0x14  (exit 0)
+python tools/fldoff.py       <GAMEASM> <METADEC> fields <Type>
+python tools/il2cpp_resolve.py <GAMEASM> <METADEC> find|type|typemethods|methods|symbolize|bytes ...
+```
+
+SELF-CHECK LINE (mandatory, passed): `System.String._stringLength@0x10,
+_firstChar@0x14` -- every offset below comes from the same resolver run.
+Independent cross-check: `CharacterSelectionScreenController::get_Data` is
+literally `mov rax,[rcx+0x68]; ret` and the field table says
+`<Data>k__BackingField@0x68` -- disassembly and metadata agree.
+
+### 1. There is no `CharacterSlotView` type
+
+`find CharacterSlotView` -> zero hits, searched all 31282 types EXHAUSTIVELY.
+`CharacterSlotView_pve/_pvp/_seasonal` are GameObject names. The component is
+**`EFT.UI.CharacterSelectionSlotViewBase`** (type 14129, Assembly-CSharp.dll),
+derived: `EFT.UI.CharacterSelectionSlotViewSeason`.
+
+`fields EFT.UI.CharacterSelectionSlotViewBase`:
+
+| off | field | type |
+|---|---|---|
+| 0x70 | `_modeTitle` | TextMeshProUGUI (the Title TMP) |
+| 0x78 | `_modeInfo` | TextMeshProUGUI |
+| 0x80 | `_modeDescription` | TextMeshProUGUI (the InfoPart body TMP) |
+| 0x88 | `_profileInfo` | ChatSpecialIcon |
+| 0xf8 | **`_actionButton`** | **EFT.UI.DefaultUIButton** -- the "Apply" button; the ONLY button on the card |
+| 0x100 | `_emptyStateRoot` | GameObject |
+| 0x130 | `_viewModel` | CharacterSelectionSlotViewModel (a 0x30-byte STRUCT, inlined) |
+| 0x148 | `_viewModel.ActionAvailable` | bool (0x130 + 0x28) |
+| 0x160 | `_gameMode` | EGameMode |
+| 0x165 | `_isHovered` | bool |
+| 0x178 | `_profileData` | EFT.CharacterSelectionProfileData |
+| 0x180 | **`Selected`** | **Action<EGameMode,CharacterSelectionProfileData>** |
+| 0x1c8 | `SeasonInfoRequested` | Action (SlotViewSeason only) |
+
+`EGameMode` (enum consts, measured): **Regular=0, Pve=1, PvpSeason=2**.
+`EFT.CharacterSelectionProfileData`: `Status@0x20`, `Level@0x48`,
+`Nickname@0x60`, `Side@0x74`, `ProfileId@0x78`.
+
+### 2. The click path (disassembled, not inferred)
+
+`EFT.UI.CharacterSelectionScreen` fields: `_title@0xa0`, `_pveSlotView@0xa8`,
+`_pvpSlotView@0xb0`, `_seasonSlotView@0xb8`, `_backButton@0xc0`.
+
+`CharacterSelectionScreen::ShowSlot(CharacterSelectionSlotViewBase slotView,
+EGameMode gameMode, CharacterSelectionProfileData profileData,
+CharacterSelectionScreenController controller)` @**RVA 0x13EFAE0**, UNIQUE,
+PRIVATE. Its body, measured:
+
+* builds the view-model: `CharacterSelectionSlotViewModel::Create(gameMode,
+  profileData, isCurrent)` @0x13F6900;
+* allocates a delegate whose **target (rdx) is the controller** and combines it
+  into `[slotView+0x180]` at `0x13EFEEE` (`lock cmpxchg [r14+0x180]`) --
+  i.e. `add_Selected` (@0x13F3A60) was INLINED; that is the subscription;
+* also subscribes `SeasonInfoRequested` into `[+0x1c8]` at 0x13F0122;
+* registers both unsubscribes via `CompositeDisposable::AddDisposable`
+  (@0x1D24DB0) using `<>c__DisplayClass11_0::<ShowSlot>b__0` @0x13F1910 and
+  `b__1` @0x13F1A90;
+* finally calls `SlotViewBase::Show` @0x13F3CA0 with rcx=slotView,
+  edx=gameMode, r8=profileData, **r9 = POINTER to the 0x30-byte view-model
+  struct** (Win64: >16-byte struct passed by reference), `[rsp+0x20]=NULL`
+  MethodInfo*.
+
+`SlotViewBase::Show(EGameMode, CharacterSelectionProfileData,
+CharacterSelectionSlotViewModel)` @**0x13F3CA0** wires the button with
+`CompositeDisposable::SubscribeEvent(UnityEvent, UnityAction)` @0x1D25010 --
+which is why `OnActionButtonPressed` has **zero direct callers** in the image.
+
+`SlotViewBase::OnActionButtonPressed()` @**0x13F61B0**, UNIQUE, 0x3B bytes.
+Full body:
+
+```
+cmp [rcx+0x178],0  je ret       ; no _profileData -> nothing
+cmp byte [rcx+0x148],0 je ret   ; _viewModel.ActionAvailable == false -> nothing
+mov r10,[rcx+0x180] test je ret ; Selected == null -> nothing
+mov r8,[rcx+0x178]              ; arg2 = profileData
+mov edx,[rcx+0x160]             ; arg1 = _gameMode
+mov rcx,[r10+0x40] / rax=[r10+0x18] / r9=[r10+0x28] / jmp rax
+```
+
+So the click is `Selected(_gameMode, _profileData)` and it SILENTLY does
+nothing on any of three conditions. Pressing the CARD does not submit: the card
+carries only `ButtonFeedback` (sound) + `OnPointerEnter/Exit`
+(@0x13F4AB0 / @0x13F4B80 SHARED x2). The pressable thing is `_actionButton`
+(the `Apply` DefaultUIButton under InfoPart/ButtonContainer). This CORRECTS the
+2026-09-02 12:00 note above that guessed "a pointer handler or a screen-side
+selection call".
+
+### 3. `CharacterSelectionScreenController` -- every Submit/Select/Apply-like method
+
+Only ONE. There is no `Select`, no `Apply`.
+
+| method | arity | RVA | sharedness |
+|---|---|---|---|
+| `void Submit(EGameMode gameMode, CharacterSelectionProfileData profileData)` | 2 | **0x13F0BF0** | UNIQUE, PUBLIC |
+| `Task SubmitAsync(EGameMode, CharacterSelectionProfileData)` | 2 | 0x13F0CC0 | UNIQUE, PRIVATE |
+| `void Back()` / `Task BackAsync()` | 0 | 0x13F0800 / 0x13F0A40 | UNIQUE |
+| `void OpenSeasonIntro()` | 0 | 0x13F0EE0 | UNIQUE |
+| `Task<CharacterSelectionResult> get_CompletionTask()` | 0 | 0x13F04E0 | UNIQUE |
+
+**Submit's frame: `RCX=controller, EDX=EGameMode (a 32-bit enum!), R8=ProfileData*,
+R9=MethodInfo* (NULL is fine -- the game itself passes `xor r9d,r9d`).**
+Measured at 0x13F0C28: `xor r9d,r9d; mov r8,rbx; mov edx,edi; mov rcx,rsi;
+call 0x13F0CC0`. Submit then observes the returned Task and **returns
+immediately** -- Submit is NOT the thing that shows the menu.
+
+Controller fields: `<StartupFlow>@0x48`, `<CanGoBack>@0x49`,
+`<ProfileId>@0x50`, `<CurrentGameMode>@0x58` (Nullable<EGameMode>),
+`_completion@0x60` (TaskCompletionSource<CharacterSelectionResult>),
+`<Data>@0x68`, `<SeasonalPerks>@0x70`.
+`CharacterSelectionResult`: `GameMode@0x10`, `ProfileData@0x18`, `Cancelled@0x20`.
+
+Beware: 15 of the controller's 22 methods sit on SHARED RVAs (`get_ProfileId`
+@0x690C40 x185, `get_CurrentGameMode`@0x690CB0 x147, `get_Data`@0x690D90 x137,
+`get_KeyScreen`@0x6B65D0 x584). Call them, never detour them by name.
+
+### 4. `MenuScreen::Show` -- where "Profile == 1" comes from
+
+`EFT.UI.MenuScreen` has two Shows:
+
+* `void Show(MainMenuBaseScreenController controller)` @**0x1538760**, PUBLIC
+  VIRTUAL, UNIQUE -- **no direct callers in the image**; it is reached through
+  the vtable from the ScreenController machinery.
+* `void Show(MatchmakerPlayersController, ExpansionsPlayerInfo,
+  GameModeDescriptor, Profile, SeasonalRewardController)` @**0x15387A0**,
+  PRIVATE, UNIQUE -- **exactly ONE caller in the whole image: RVA 0x1538790**,
+  i.e. the 1-arg overload.
+
+The 1-arg overload's whole body (measured):
+
+```
+1538769 rax = [ctrl+0x68]   ; SeasonalRewardController
+153876D r9  = [ctrl+0x50]   ; arg3 GameModeDescriptor
+1538771 r8  = [ctrl+0x60]   ; arg2 ExpansionsPlayerInfo
+1538775 [rsp+0x30] = 0      ; arg6 = MethodInfo* NULL
+153877E [rsp+0x28] = rax    ; arg5 SeasonalRewardController
+1538783 rax = [ctrl+0x58]   ; Profile
+1538787 rdx = [ctrl+0x48]   ; arg1 MatchmakerPlayersController
+153878B [rsp+0x20] = rax    ; arg4 PROFILE
+1538790 call 0x15387A0
+```
+
+confirmed by `fields MainMenuBaseScreenController`: `Matchmaker@0x48`,
+`ModeDescriptor@0x50`, **`Profile@0x58`**, `ExpansionsPlayerInfo@0x60`,
+`SeasonalRewardController@0x68`.
+
+**ARGUMENT POSITIONS (this is what tonight's crash dump is about):** in the
+5-arg overload the **Profile is argument 4 -- the FIRST STACK SLOT,
+`[rsp+0x20]`**, not a register. `[rsp+0x28]` is the SeasonalRewardController
+and `[rsp+0x30]` is the trailing `MethodInfo*`. No argument of that method is a
+bool or an enum, so **`Profile == 1` cannot be a mis-typed argument of this
+method -- it is an argument SHIFT.** The two candidates that produce a literal
+1 there: `EGameMode.Pve == 1` (the value our Submit path carries in EDX), or a
+`bool true`. A caller that lays out only 4 register args and then writes
+`MethodInfo*` at `[rsp+0x20]` (the common "5th slot" mistake) puts garbage in
+Profile; a caller that reuses a Submit-shaped frame puts EGameMode there.
+
+### 5. Submit -> MenuScreen::Show is ASYNCHRONOUS. Not synchronous, not one frame.
+
+Chain, each hop measured by call-site scan + `symbolize`:
+
+```
+Apply button UnityEvent
+  -> SlotViewBase::OnActionButtonPressed         0x13F61B0
+  -> Selected(EGameMode, ProfileData)            delegate, target = the controller
+  -> CharacterSelectionScreenController::Submit  0x13F0BF0   (returns at once)
+  -> SubmitAsync 0x13F0CC0 -> sets _completion@0x60 (TaskCompletionSource)
+  -> awaited by EFT.TarkovApplication::ShowCharacterSelectionScreen 0x97C0E0
+       (async; state machine <ShowCharacterSelectionScreen>d__129)
+  -> called ONLY from <RunCharacterSelectionFlow>d__130::MoveNext
+       @0x9D6BD0+0x42A   (TarkovApplication::RunCharacterSelectionFlow 0x97C350)
+  -> same MoveNext @+0x5DE calls ExecuteCharacterSelection 0x97C5E0
+       (state machine <ExecuteCharacterSelection>d__131::MoveNext @0x9B6E60)
+  -> EFT.MainMenuShowOperation::ShowCharacterSelectionScreen 0x9F8DE0 /
+     ShowMenuScreenSync 0x9FC190  (callers: <Hide>d__14 @0x997A70+0x45D,
+     <Init>d__74 @0xA24C00+0x2307)
+  -> MenuScreen::Show(controller) 0x1538760 via VTABLE -> Show(5) 0x15387A0
+```
+
+`RunCharacterSelectionFlow` is also entered from
+`<OpenCharacterSelectionFromMenu>d__118::MoveNext` @0x9CD070+0xA7E and
+`<RunInitialLobbyFlow>d__121::MoveNext` @0x9D7FB0+0x7AF.
+
+TarkovApplication signatures (derived from returnType@8/parameterStart@16/
+parameterCount@34, not from the names):
+
+```
+Task  RunCharacterSelectionFlow(CharacterSelectionDataResponse data, bool startupFlow,
+        SeasonalPerksData seasonalPerks, Nullable<EGameMode> returnGameMode,
+        bool canGoBackToLanguage)                                   @0x97C350
+Task<CharacterSelectionResult> ShowCharacterSelectionScreen(CharacterSelectionDataResponse,
+        bool startupFlow, string profileId, Nullable<EGameMode> currentGameMode,
+        SeasonalPerksData, bool canGoBack)                          @0x97C0E0
+Task<bool> ExecuteCharacterSelection(CharacterSelectionResult result, bool startupFlow) @0x97C5E0
+Task  OpenCharacterSelectionFromMenu()                              @0x97B010
+void  ShowMenuScreen()                                              @0x978A00
+```
+
+**Consequence for mode-skip:** calling `Submit(controller, gameMode,
+profileData, NULL)` is the correct and complete injection point -- it is UNIQUE,
+non-virtual, takes a NULL MethodInfo* exactly as the game does, and everything
+after it is the game's own async flow. Calling `MenuScreen::Show` at either RVA
+ourselves is BOTH unnecessary and the likely source of the `Profile == 1`
+crash, and the 1-arg overload is virtual so a direct call is the wrong dispatch
+anyway. What must be verified before calling Submit is only what
+`OnActionButtonPressed` verifies: `_profileData != NULL`,
+`_viewModel.ActionAvailable != 0` -- and, for us, that the receiver is the
+ACTIVE `CharacterSelectionScreen`'s slot view, not the Login-UI twin.
+
+UNVERIFIED offline: that `_completion` is the TCS `SubmitAsync` actually
+completes (the state machine was not walked), and that no other awaiter sits
+between the TCS and `ExecuteCharacterSelection`. Everything else above is
+disassembly or metadata.
