@@ -6339,3 +6339,149 @@ location, SELECT-MAP or NEXT->offline-raid moves it straight to NEXT->
 insurance, because where we are is then an observation rather than a count of
 presses. If the site did not bind, or fires nowhere within `ArOffWaitMs`
 (20 s), the machine continues and the log says the advance is UNVERIFIED.
+
+## 2026-09-02: `findtext` was blind — `GetComponent(String)` never matches on this build
+
+MEASURED (live inspector, build 1.1.0.1.46777, Settings screen OPEN):
+`findtext e $settings 40000 all` visited **all 1263 nodes** of a screen made of
+captions and reported `0 match(es) ... genuinely NOT PRESENT`. Same for a/o/s/i,
+and same under a stock `GameToggleSpawner` whose `SizeLabel -> TMP UI SubObject
+-> Label` is visible on screen. `label EXPR` reads TMP text off those same nodes,
+so the text path was never the problem: the **per-node predicate** was.
+
+The predicate was `UnityEngine.Component::GetComponent(System.String)` @`0x52A48E0`
+with the literal `"TextMeshProUGUI"`. It never faulted and never answered — Unity
+matches that overload through a runtime type-name lookup that does not resolve on
+this IL2CPP build. **Every absence verdict `findtext` ever gave was vacuous**
+(CLAUDE.md 9b: a check that cannot fail IS the bug).
+
+MEASURED offline (`tools/il2cpp_resolve.py <GameAssembly.dll> <metadata.dec.dat>
+typemethods ...`, this build's own metadata):
+
+| method | RVA | sharedness |
+|---|---|---|
+| `UnityEngine.Component::GetComponent(string type)` | `0x52A48E0` | UNIQUE |
+| `UnityEngine.Component::GetComponent(Type type)` | `0x52A45E0` | UNIQUE |
+| `UnityEngine.GameObject::GetComponent(Type type)` | `0x52A8510` | UNIQUE |
+| `UnityEngine.GameObject::GetComponent(string)` | **DOES NOT EXIST** | — |
+
+### That last row is why `component <GameObject> TextMeshProUGUI` faulted 5/5
+
+`abi/aowlspt_navui.h` carried `0x52A8510` under the name
+`"UnityEngine.GameObject::GetComponent(String)"`. It is `GetComponent(**Type**)`.
+Every caller that saw a GameObject receiver, picked "the GameObject overload",
+and passed an `Il2CppString*` was calling `GetComponent(Type)` with a String in
+RDX — a managed type confusion inside Unity's own code. That, not a bad RVA and
+not a receiver-liveness problem, is the measured cause of the five faults. The
+entry is renamed, and no caller passes a string to it any more.
+
+### The fix: klass identity, no strings, no allocation
+
+`TMPro.TextMeshProUGUI::@type/0` -> static `Il2CppType` RVA `0x6F91860`
+(offline name index) -> `System.Type::GetTypeFromHandle` @`0x458B020` -> a live
+`System.Type` -> `Component::GetComponent(Type)` @`0x52A45E0` per node. No
+reflection at any hop, and `GetComponent(Type)` **allocates nothing**, unlike
+`GetComponents(Type)` @`0x52A8760` which returns an array and stays banned from
+per-node paths. The `System.Type` is re-derived once per 12 ms frame slice, never
+per node. Each distinct returned klass is confirmed once by walking
+`Il2CppClass.parent` (+0x58) to `TMPro.TextMeshProUGUI`, validating every name
+against the offline table; a NO or an unreadable chain is reported, never
+silently accepted.
+
+### The positive control, in the verb itself
+
+`findtext` now counts the nodes on which a TMP component was **returned** —
+which is a different question from how many matched the substring. Above
+`InspTextBlindMinNodes = 200` nodes visited with **zero** components seen, the
+report refuses the miss verdict and says `INCONCLUSIVE: no TMP component was
+seen on any node, the predicate is blind` instead of NOT PRESENT. Under the old
+predicate that condition was permanently true, which is exactly the point: the
+control would have caught this on day one. `find` passes an empty blind-note,
+because its predicate is a raw name compare on a node it already walked and has
+no separate instrument that can go blind — a statement about that predicate, not
+a default.
+
+### Two smaller lies fixed in the same pass
+
+* `children $settings` refused with "probably not a Transform" while
+  `tree $settings 2` walked it. Both were right about what they did — `$settings`
+  is a SettingsScreen **Component** — but `tree` converted with `iToTransform`
+  and `children` did not. One predicate now; `children` makes the same
+  conversion and says so.
+* `findtext "" $settings 40000` silently dropped the empty token in `iSplit`
+  and **shifted every argument one left**: `$settings` became the needle and
+  `40000` the root, and the report then described a search nobody asked for.
+  `iSplit` now keeps an explicitly quoted empty token, and `findtext` refuses an
+  empty needle by name.
+
+### Collateral, stated as a prediction and NOT verified
+
+`splrebrand.nim`'s `splTmpOf` used the same blind string route (it shared
+`findtext`'s seeded string). If that is right it never found a TMP either. It has
+been moved onto the Type route; **this has not been re-checked live.**
+
+## 2026-09-02: an open SettingsScreen makes the MenuScreen PlayButton unpressable
+
+MEASURED live (coordinator's run on the 4,643,328-byte host build, client
+1.1.0.1.46777): `raid Woods` issued with Settings still open sat in autoraid's
+WAIT-MENU for the full 180 s bound, logging
+`MenuScreen found=1, PlayButton under it=1, active=0`, and refused with the
+screen census this file's previous entry added:
+
+    Common UI active(depth<=2)=3: [Common UI][SettingsScreen][ChatScreen]
+    Menu UI   active(depth<=2)=2: [UI][Operation Queue Indicator]
+
+So **found-but-inactive is a different fact from not-found**: the button existed
+and was unpressable because SettingsScreen was over it (fact #72). The census
+paid for itself on its first run -- without it this is indistinguishable from a
+menu that never loaded.
+
+`pressname BackButton` from the inspector does NOT clear it (it searches all 16
+roots and refuses, fact #243).
+
+**`EFT.UI.Settings.SettingsScreen::Close()` -- RVA `0x1720B10`, arity 0,
+`sharedness=UNIQUE owners=1`, section `il2cpp`, attrs PUBLIC|VIRTUAL|HIDEBYSIG.**
+Prologue (measured, `il2cpp_resolve.py bytes 0x1720b10`):
+`40 53 | 48 83 EC 20 | 80 3D 02 D9 99 05 00 | 48 8B D9` --
+`push rbx ; sub rsp,0x20 ; cmp byte [rip+0x0599D902],0 ; mov rbx,rcx`. The
+window carries a RIP-relative operand, which is irrelevant to a CALL and would
+matter a great deal to anyone stealing those bytes for a detour. It is VIRTUAL,
+so a direct call runs this body even for a derived receiver -- recorded, not
+glossed, and the caller therefore asserts the finished state instead of
+believing its own call.
+
+Same type, also UNIQUE and possibly relevant later: `CloseAll()` @`0x17207A0`
+(arity 0, PRIVATE, non-virtual), `Show()` @`0x171FA00`, `OpenGroup(ESettingsGroup)`
+@`0x1720C80`. `ShouldLockCursor()` @`0x906050` is **SHARED x202** and
+`TranslateAxes` @`0x13AF770` **SHARED x14** -- neither may ever be detoured.
+
+**ChatScreen was ACTIVE in that census and the menu was usable behind it**, so it
+is NOT an overlay to close. Whether it is ALWAYS active is still UNMEASURED:
+autoraid now counts it (`ChatScreen was ACTIVE on N of M checks`) and acts on it
+never, so the log will answer that across runs rather than a guess being written
+into the code.
+
+## 2026-09-02 00:55: the "clean" menu-arrival deaths have crash reports, and they name the killer
+
+MEASURED. Unity's crash handler writes `%LOCALAPPDATA%\Temp\Battlestate Games\
+EscapeFromTarkov\Crashes\Crash_<UTC stamp>\Player.log` for every native death;
+the folder stamp is UTC (04:50:33 = 00:50:33 local). Four deaths tonight were
+called "clean" because the host log ended on a heartbeat and the client log on
+the menu GC; every one had a report.
+
+* 23:00:42 local (Crash_2026-09-02_030042716), client at character-select,
+  ~19s after boot: `sain.dll toJson <- schemaJson <- onPageQuery <-
+  eventTrampoline`, called from the HOST's tick thread (host frames, then
+  KERNEL32 BaseThreadInitThunk) during an `aowlspt.settings.pageQuery`
+  dispatch. A mod's settings-schema serialiser faulted in an event handler and
+  there was no guard around the dispatch. This is the same path that killed
+  the client with `modSettingsRender` on ("schema step ('aowl.sain')"). The
+  "early mod release" timing was a correlate, not the cause: the handler runs
+  right after load, whenever that is.
+* 00:50:33 local (Crash_2026-09-02_045033156), ~36s after boot, mods mapped,
+  main menu arriving: two frames only, both `GameAssembly mono_class_has_parent`
+  (IL2CPP's class-hierarchy walk). Unattributed; suspects are class lookups on
+  a non-Unity thread at menu arrival.
+
+Rule: before calling any death "clean", read the newest Crash_* report.
+run.py is being taught to print it on DIED.
