@@ -7871,3 +7871,47 @@ BgGlow/BgImage/BgSide/View/InfoPart; no Apply active. Screenshot: two cards,
 "PvE Zone" (empty, _pve) and "PvE / Savant | 3" (this profile, _pvp); the
 card itself is what a player clicks (tools/entergame.py's proven path
 presses the card by displayed title). So Apply is not the flow trigger.
+
+## 2026-09-02: on the profile/mode screen the CARD is the control -- there is no Apply node
+
+MEASURED on the 4,851,200 build: the slot press refused with
+`no ACTIVE node named Apply under the matching slot view`, and its own census
+named the whole screen:
+
+    [BG_Main][Title][FooterGlow][CharactersContainer]
+    [CharacterSlotView_pve][BgGlow][BgImage][BgSide][View][InfoPart]
+    [CharacterSlotView_pvp][BgGlow][BgImage][BgSide][View][InfoPart]
+
+A screenshot of the same moment shows "SELECT PROFILE AND MODE" with two CARDS
+and **no separate confirm button**: the empty "PvE Zone" card on the left is
+`CharacterSlotView_pve`, and "PvE / Savant | 3" on the right -- this profile --
+is `CharacterSlotView_pvp`. **The object names and the titles DISAGREE**, which
+is the same trap as the side selector: `CharacterSlotView_pvp` is the card
+labelled "PvE".
+
+`tools/entergame.py`'s `find Apply <slot>` is therefore a path that this build
+does not have (or has only inactive), and hunting that name could only ever
+refuse. modeskip now presses the CARD: candidates are the slot view itself plus
+its ACTIVE descendants, each probed for `DefaultUIButton` / `UnityEngine.UI.Button`
+/ `AnimatedToggle`, the whole candidate list is LOGGED with its klasses, and the
+card's own `Title` TMP is read so the log says which card was pressed **in the
+words on screen**, not only by object name.
+
+If a card carries a second, confirm-shaped control (`apply`/`confirm`/`ready`/
+`select` in its name), it is logged and pressed SECOND -- on a later tick, with
+the `MenuScreen::Show` readback between the two, never both at once. A card with
+no such control is answered by the single press, and the log says which of those
+two shapes it found.
+
+## 2026-09-02 10:40 (clock): two tool defects found by the parked slot screen
+
+MEASURED: tools/entergame.py chose the card by MODE TITLE (`selecting 'PvE
+Zone' (CharacterSlotView_pve)`) -- the empty slot; the profile sits on the
+"PvE" card (CharacterSlotView_pvp, InfoPart `Savant | 3`); it exited 4 with
+the screen unchanged. Slot list this build: _pve 'PvE Zone', _pvp 'PvE',
+_seasonal 'New Text'. The card must be chosen by the profile it shows.
+MEASURED: run.py `--attach` said `REACHED ... UNPROVEN: this host build
+never printed a uihooks 'site 2 ... BOUND' line` while the log has `site 2
+EFT.UI.MenuScreen::Show(5-arg) @0x15387a0: BOUND (slot 7)` at [0:00:01] --
+the capability line is only observed from the attach point forward. Both
+being fixed.
