@@ -213,6 +213,37 @@ var gNtProofWait = 0
 ## verdict line names its occasion rather than all of them saying the same word.
 var gNtWhyNext = "steady state"
 const NtProofSettle = 20          ## frames to let a switch settle before judging
+
+## STEP 2 -- `defineSubtabs`. Flag `nativeTabsSubtabs`, default OFF so it
+## cannot disturb step 1's proof until it has a live PASS of its own.
+##
+## THE ONE DESIGN DECISION, and it is what makes this different from the five
+## failed attempts in `modstab.nim`:
+##
+##   THE STRIP IS NOT INSIDE EITHER PANEL IT SWITCHES.
+##
+## The old feature put a strip inside the panel it switched, which forced it
+## to exist TWICE (its own comment: 'THE STRIP HAS TO EXIST TWICE, and that
+## is a consequence, not a choice') and put it inside a stock LayoutGroup that
+## then re-arranged the game's scroll view -- the entire padding saga.
+##
+## Here the strip is its own container parented to SettingsScreen, a sibling
+## of the panels rather than a child of one. It survives every switch because
+## nothing it switches owns it, and it is in NO stock layout group, so there
+## is no geometry to negotiate and nothing for a backstop to protect.
+##
+## It is also deliberately NOT named '<x> Settings', so the panel predicate
+## does not count it: a strip is not a panel, and the verdict must keep
+## meaning 'exactly one PANEL is active'.
+var gNtSubOn = false               ## `nativeTabsSubtabs`
+var gNtSubBuilt = false
+var gNtSubStripGo: Il2CppPtr = nil ## the strip container (ours, a sibling)
+var gNtSubToggle: seq[Il2CppPtr] = @[]  ## [0]=GRAPHICS SETTINGS, [1]=POSTFX
+var gNtSubSel = 0
+var gNtGfxPanelGo: Il2CppPtr = nil ## the STOCK Graphics Settings panel
+var gNtSubPressed = -1
+var gNtSubVerdictSaid = false
+const NtSubCount = 2
 var gNtToggleSlotFaults = 0
 
 proc ntNoteFault(what: string) =
@@ -266,6 +297,16 @@ proc ntToggleSetFired(regs: Il2CppPtr) =
       gNtPressed = i
       return
     i = i + 1
+  # SUBTABS RIDE THE SAME POSTFIX. No second detour: two detours on one
+  # function have the second overwrite the first's trampoline and silently kill
+  # the first feature. Still O(1)-ish -- two more pointer compares -- and still
+  # silent for every foreign toggle.
+  var j = 0
+  while j < gNtSubToggle.len and j < NtSubCount:
+    if gNtSubToggle[j] == selfPtr:
+      gNtSubPressed = j
+      return
+    j = j + 1
 
 # ---------------------------------------------------------------------------
 # BUILD
@@ -541,7 +582,20 @@ proc ntCollectStockPanels(screenT: Il2CppPtr) =
       k = k + 1
     if ours: continue
     let nm = iObjName(c)
-    if nm == "Toggles" or nm == "Overlay Layer": continue
+    # A PANEL IS A CHILD NAMED "<something> Settings" -- NOT every child.
+    #
+    # MEASURED: the old predicate skipped two names and counted the rest, so it
+    # reported "6 panels are active at once" while listing `Caption`,
+    # `SaveButton`, `BackButton`, `RevertButton` and `BindContainer`. Exactly
+    # ONE of those six was a panel. The verdict was not detecting a defect, it
+    # was measuring the wrong thing -- and it would have gone on failing on a
+    # perfectly healthy screen forever.
+    #
+    # This is the predicate `tools/acceptance.py` already uses ("children named
+    # `* Settings`"), which on the same live screen reported `1 of 5 panel(s)
+    # active`. Two checks that disagree about what they are counting cannot
+    # both be right, and the one that matches the screen wins.
+    if not nm.endsWith("Settings"): continue
     gNtStockPanels.add go
     gNtStockWasOn.add false
 
@@ -607,12 +661,190 @@ proc ntBuild(): bool =
     return
   ntCrumb("build: collecting the stock panels under SettingsScreen")
   ntCollectStockPanels(screenT)
+  # STEP 2, flag-gated and default OFF: a failure here must not cost step 1.
+  if gNtSubOn:
+    ntCrumb("build: ntBuildSubtabs")
+    discard ntBuildSubtabs(screenT)
   gNtBuilt = true
   result = true
 
 # ---------------------------------------------------------------------------
 # ACTIVATION -- the one piece of steering we own (doc 4)
 # ---------------------------------------------------------------------------
+proc ntBuildSubtabs(screenT: Il2CppPtr): bool =
+  ## STEP 2: the GRAPHICS SETTINGS | POSTFX strip, as a SIBLING of the panels.
+  ##
+  ## The donor is `Control Settings/Toggles` -- the game's own subtab strip,
+  ## which brings its `ToggleGroup` along in the clone. That matters: we cannot
+  ## construct a `ToggleGroup` (AddComponent for it is not attested), so the
+  ## exclusivity has to come from a cloned one. The buttons are then pointed at
+  ## THAT group, never at the tab-bar group -- subtab exclusivity must not
+  ## fight tab exclusivity.
+  result = false
+  if gNtSubBuilt or not gNtSubOn: return
+  let screenGo = iGameObjectOf(screenT)
+  if screenGo == nil: return
+  ntCrumb("subtabs: locating the stock Graphics panel and the strip donor")
+  gNtGfxPanelGo = iGameObjectOf(modsChildNamed(screenT, "Graphics Settings"))
+  let ctrlPanel = modsChildNamed(screenT, "Control Settings")
+  let donorStrip = (if ctrlPanel != nil: modsChildNamed(ctrlPanel, "Toggles")
+                    else: nil)
+  let donorBtn = (if donorStrip != nil:
+                    modsChildNamed(donorStrip, "ControlToggle") else: nil)
+  if gNtGfxPanelGo == nil or donorStrip == nil or donorBtn == nil:
+    ntNoteFault("subtabs: the stock Graphics panel or the strip donor was " &
+                "not found (" &
+                (if gNtGfxPanelGo == nil: "Graphics-Settings " else: "") &
+                (if donorStrip == nil: "Control-Settings/Toggles " else: "") &
+                (if donorBtn == nil: "ControlToggle" else: "") &
+                "). Nothing was added.")
+    return
+  let donorStripGo = iGameObjectOf(donorStrip)
+  let donorBtnGo = iGameObjectOf(donorBtn)
+  if donorStripGo == nil or donorBtnGo == nil: return
+  ntCrumb("subtabs: Instantiate of the strip container (brings its ToggleGroup)")
+  ntCallBegin("Object::Instantiate of Control Settings/Toggles")
+  let stripGo = modsClone(donorStripGo)
+  ntCallEnd()
+  if stripGo == nil or not modsSetParent(stripGo, screenGo):
+    ntNoteFault("subtabs: the strip container could not be cloned onto the " &
+                "SettingsScreen. Nothing was changed.")
+    return
+  let stripT = modsTransformOf(stripGo)
+  # The donor's own buttons came with the clone: switch them off, so what is
+  # left is exactly ours. Capped.
+  ntCrumb("subtabs: switching off the donor buttons that came with the clone")
+  var inherited = 0
+  if iChildCount(stripT, inherited):
+    var h = 0
+    while h < inherited and h < NtMaxReap:
+      let c = iChildAt(stripT, h)
+      h = h + 1
+      if c == nil or not duOk(c, 0x20'i32): continue
+      let go = iGameObjectOf(c)
+      if go != nil: discard modsSetActive(go, false)
+  ntCrumb("subtabs: resolving the CLONED ToggleGroup")
+  let subGroup = modsComponent(stripT, "ToggleGroup")
+  if subGroup == nil:
+    ntNoteFault("subtabs: the cloned strip carries no ToggleGroup, so the two " &
+                "subtabs could not be made exclusive and both could read " &
+                "selected at once. Refusing -- enforcing it ourselves is the " &
+                "design this file exists to avoid.")
+    discard modsSetActive(stripGo, false)
+    return
+  gNtSubToggle = @[]
+  var made = 0
+  var b = 0
+  while b < NtSubCount:
+    let caption = (if b == 0: "GRAPHICS SETTINGS" else: "POSTFX")
+    ntCrumb("subtabs: cloning the '" & caption & "' button")
+    ntCallBegin("Object::Instantiate of ControlToggle")
+    let btn = modsClone(donorBtnGo)
+    ntCallEnd()
+    if btn == nil or not modsSetParent(btn, stripGo):
+      b = b + 1
+      continue
+    let btnT = modsTransformOf(btn)
+    discard modsRelabelLike(btnT, donorBtn, caption)
+    discard modsReapExtraToggles(btnT, donorBtn, caption)
+    let tog = modsToggleOf(btnT)
+    if tog == nil:
+      discard modsSetActive(btn, false)
+      b = b + 1
+      continue
+    # POINT IT AT THE CLONED GROUP, never the tab bar's: subtab exclusivity
+    # must not fight tab exclusivity.
+    ntCallBegin("UnityEngine.UI.Toggle::set_group (subtab)")
+    discard nuToggleSetGroup(tog, subGroup)
+    ntCallEnd()
+    discard modsSetActive(btn, true)
+    gNtSubToggle.add tog
+    made = made + 1
+    b = b + 1
+  if made != NtSubCount:
+    ntNoteFault("subtabs: only " & $made & " of " & $NtSubCount & " buttons " &
+                "came out usable; hiding the strip rather than shipping a " &
+                "half-built one with no way back.")
+    discard modsSetActive(stripGo, false)
+    gNtSubToggle = @[]
+    return
+  gNtSubStripGo = stripGo
+  gNtSubBuilt = true
+  gNtSubSel = 0
+  discard modsSetActive(stripGo, false)   # raised only while our tab is up
+  ntCrumb("subtabs: COMPLETE")
+  okLog "native subtabs: built the GRAPHICS SETTINGS | POSTFX strip as a " &
+        "SIBLING of the panels it switches, not inside either one. That is " &
+        "the whole difference from the five earlier attempts: the strip is " &
+        "in no stock LayoutGroup, so no stock geometry can be re-arranged by " &
+        "its presence, and it does not have to exist twice to survive a " &
+        "switch. Exclusivity comes from the CLONED ToggleGroup, not from us."
+  result = true
+
+proc ntSubShow(sel: int) =
+  ## Apply the subtab selection: exactly one of the two panels is active.
+  ##
+  ## sel 0 -> the STOCK Graphics Settings panel (only ever SetActive'd, never
+  ##          re-parented and never written to);
+  ## sel 1 -> OUR panel, which is where PostFX rows will go.
+  ## The strip itself is untouched by this -- it is a sibling of both, so it
+  ## cannot be hidden by the thing it switches.
+  if not gNtSubBuilt: return
+  let wantOurs = (sel == 1)
+  if gNtGfxPanelGo != nil and modsGoActive(gNtGfxPanelGo) == wantOurs:
+    discard modsSetActive(gNtGfxPanelGo, not wantOurs)
+  if gNtPanelGo.len > 0 and modsGoActive(gNtPanelGo[0]) != wantOurs:
+    discard modsSetActive(gNtPanelGo[0], wantOurs)
+  # THE HIGHLIGHT, through the real setter. A raw `m_IsOn` store leaves the
+  # Animator untold and the wrong button looks selected -- live-confirmed on
+  # the old strip, and the reason `set_IsToggled` exists in the target table.
+  var i = 0
+  while i < gNtSubToggle.len and i < NtSubCount:
+    discard nuAnimToggleSetToggled(gNtSubToggle[i], i == sel)
+    i = i + 1
+  gNtSubSel = sel
+
+proc ntSubVerdict(why: string) =
+  ## STEP 2's finished state: exactly one subtab reads m_IsOn, its panel is
+  ## the only active one of the TWO, and the stock screen is undisturbed.
+  if gNtSubVerdictSaid or not gNtSubBuilt: return
+  gNtSubVerdictSaid = true
+  var on = 0
+  var onIdx = -1
+  var i = 0
+  while i < gNtSubToggle.len and i < NtSubCount:
+    let (ok, isOn) = nuToggleIsOn(gNtSubToggle[i])
+    if ok and isOn:
+      on = on + 1
+      onIdx = i
+    i = i + 1
+  let gfxUp = (gNtGfxPanelGo != nil and modsGoActive(gNtGfxPanelGo))
+  let oursUp = (gNtPanelGo.len > 0 and modsGoActive(gNtPanelGo[0]))
+  let which = (if onIdx == 1: "POSTFX" elif onIdx == 0: "GRAPHICS SETTINGS"
+               else: "none")
+  if on != 1:
+    warn "native subtabs VERDICT FAIL (" & why & "): " & $on & " of " &
+         $NtSubCount & " subtabs read m_IsOn=1. Exactly one is the only " &
+         "correct answer; 0 means a press never reached m_IsOn and 2 means " &
+         "nothing is enforcing exclusivity."
+  elif gfxUp and oursUp:
+    warn "native subtabs VERDICT FAIL (" & why & "): BOTH the stock Graphics " &
+         "panel and ours are active at once, so the visible page is whichever " &
+         "draws last rather than the one the strip names (" & which & ")."
+  elif not gfxUp and not oursUp:
+    warn "native subtabs VERDICT FAIL (" & why & "): NEITHER panel is " &
+         "active, so the page is blank while the strip says " & which & "."
+  elif (onIdx == 1) != oursUp:
+    warn "native subtabs VERDICT FAIL (" & why & "): the strip says " &
+         which & " but the panel that is up is the other one. The switch " &
+         "ran and did not take."
+  else:
+    okLog "native subtabs VERDICT PASS (" & why & "): exactly one subtab " &
+          "reads m_IsOn=1 (" & which & ") and its panel is the ONLY active " &
+          "one of the two -- read back off the live toggles and GameObjects, " &
+          "not from what we wrote. The strip is a SIBLING of both panels, so " &
+          "it is in no stock layout group and no stock geometry was touched."
+
 proc ntShow(idx: int) =
   ## Show ours, switch off whichever stock panel was up. The game switches
   ## panels by `ESettingsGroup` and our tab is not one, so this is the only
@@ -624,7 +856,16 @@ proc ntShow(idx: int) =
     if i < gNtStockWasOn.len: gNtStockWasOn[i] = on
     if on: discard modsSetActive(gNtStockPanels[i], false)
     i = i + 1
-  discard modsSetActive(gNtPanelGo[idx], true)
+  if gNtSubBuilt and idx == 0:
+    # WITH SUBTABS, OUR TAB DOES NOT SIMPLY SHOW OUR PANEL. It shows whichever
+    # of the two the strip names -- and one of those is the game's own Graphics
+    # panel, which the loop above just switched off. So the strip is raised and
+    # its selection re-applied, which may switch a stock panel back ON. That is
+    # the one case where "hide every stock panel" is the wrong instinct.
+    if gNtSubStripGo != nil: discard modsSetActive(gNtSubStripGo, true)
+    ntSubShow(gNtSubSel)
+  else:
+    discard modsSetActive(gNtPanelGo[idx], true)
   gNtShown = idx
 
 proc ntHide() =
@@ -633,6 +874,8 @@ proc ntHide() =
   ## mods tab shipped once.
   if gNtShown >= 0 and gNtShown < gNtPanelGo.len:
     discard modsSetActive(gNtPanelGo[gNtShown], false)
+  # The strip is ours and is a sibling, so nothing else will hide it.
+  if gNtSubStripGo != nil: discard modsSetActive(gNtSubStripGo, false)
   gNtShown = -1
   var i = 0
   while i < gNtStockPanels.len and i < 24:
@@ -756,6 +999,15 @@ proc ntTickBody() =
       gNtVerdictSaid = false
       gNtWhyNext = "toggle event -- our tab was pressed " &
                    (if isOn: "ON" else: "OFF")
+  # THE SUBTAB EVENT, drained from the same postfix as the tab event.
+  if gNtSubPressed >= 0:
+    let sidx = gNtSubPressed
+    gNtSubPressed = -1
+    gNtStep = "tick: applying a subtab selection"
+    ntSubShow(sidx)
+    gNtSubVerdictSaid = false
+  if gNtSubBuilt and gNtShown >= 0:
+    ntSubVerdict("subtab selection")
   gNtStep = "tick: proof / verdict"
   # THE PROOF, one bounded step per frame. Each phase waits `NtProofSettle`
   # frames before judging, because a panel switched this frame is not laid out

@@ -9161,6 +9161,10 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   # again. "The tab exists" is not the claim doc 4 makes; "selecting it shows
   # our panel and only ours" is.
   gNtProofOn = readBoolKeyDef("nativeTabsProofSelect", true)
+  # STEP 2 (docs/NATIVETABS.md 5). Default OFF until it has a live PASS of its
+  # own: `settingsPostFxSubtab`'s old cloned-strip path stays the shipping one
+  # until then, so a failure here costs nothing that works today.
+  gNtSubOn = readBoolKey("nativeTabsSubtabs")
   gNtOn = gNtFlagOn
   if gNtOn and not gSettingsUiProbe:
     gSettingsUiProbe = true
