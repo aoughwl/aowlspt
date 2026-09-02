@@ -7643,3 +7643,15 @@ MenuScreen::Awake postfix fired). Every surviving build tonight never bound
 site 1. Rule: a postfix on MenuScreen::Awake is not safe on this build as
 stolen; do not want it. Install rolled back to the 4,737,536 build
 (bak-20260902-084933) until the exit-half build drops site 1.
+
+## 2026-09-02 09:55: CORRECTION -- the site-1 conclusion is doubtful
+
+MEASURED: the "known-good" 4,737,536 build (which never binds MenuScreen::
+Awake) ALSO died at menu arrival 49s after launch with the inspector on
+(Crash_2026-09-02_131229783, same SeasonWidgetData::From <- MenuScreen::Show
+site). So site 1 is not sufficient as the cause. What is common to every
+death since 08:50 and absent from every survival before 08:15: the first
+completed fast-path raid (08:13) happened in between, and two mod configs
+changed after it (SAIN drive level 2 at 08:15, Maps diagVerbose at 08:20).
+The inspector-off boot with those configs survived once. Bisecting SAIN
+back to 0 now; one sample each is not enough -- count samples.
