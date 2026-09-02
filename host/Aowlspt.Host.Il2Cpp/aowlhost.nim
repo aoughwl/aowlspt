@@ -380,6 +380,13 @@ static int aowl_rva_is_code(unsigned int rva) {
 ## it defines sits OUTSIDE the bracketed rider's own `aowl_p_p_seh`, which is
 ## not re-entrant. See `abi/aowlspt_drainprof.h`.
 {.emit: """#include "aowlspt_drainprof.h" """.}
+## RAYTRACED AUDIO's pure-C half -- the Vercidium Audio FFI, the bounded pump
+## and the occlusion export. Emitted after `aowlspt_shim.h` because it uses
+## `aowl_is_readable` and `aowl_p_p_seh`, and it takes exactly ONE of that guard,
+## at its own two entry points; nothing inside it opens a second. It resolves no
+## il2cpp name, installs no detour and dereferences no game pointer -- vaudio is
+## an ordinary KERNEL32-only native DLL. See `abi/aowlspt_audioray.h`.
+{.emit: """#include "aowlspt_audioray.h" """.}
 ## THE PHASE METER for the ONE rider the drain profiler priced at
 ## `splRebrandDrain = 1152.2us/frame, max 194373.3us` -- a disjoint, exhaustive
 ## decomposition of that single row, with its own positive control and an
@@ -428,6 +435,18 @@ static int aowl_rva_is_code(unsigned int rva) {
  * patches by another route breaks it, so a contended target must be primed
  * here whether or not the contention is obvious. */
 static void aowl_pro_prime_navui(void);
+/* The raid-load timeline's 33 targets (loadperf.nim). Defined further down
+ * for the same reason `aowl_pro_prime_navui` is: that table cannot be NAMED
+ * from here, but it CAN be called from here, and one forward declaration
+ * inside one translation unit is all that takes. Primed eagerly and
+ * unconditionally -- 33 rows of a 512-row table -- so no verify ever has to
+ * depend on "nothing else patches that". */
+static void aowl_lp_prime_all(void);
+/* natesp's deploy-order breadcrumb (nedeploy.nim): four EFT.LocalGame rows,
+ * same shape and same reason as the loadperf table above. Primed eagerly and
+ * unconditionally even though nothing else patches them today -- the eager
+ * pass exists precisely so that no verify has to depend on that. */
+static void aowl_ndp_prime_all(void);
 
 static void aowl_pro_prime_all(void) {
     int32_t i;
@@ -437,6 +456,7 @@ static void aowl_pro_prime_all(void) {
      * is therefore in neither loop above, and it is the exact target the live
      * bug fired on. */
     aowl_pro_prime(aowl_du_preloader_update_rva());
+    aowl_ndp_prime_all();
     /* The bot-nav API's detour target and its three call targets. Uncontended
      * as of today, primed anyway: this table is cheap and the whole point of
      * the eager pass is not to depend on "nothing else patches that". */
@@ -457,6 +477,7 @@ static void aowl_pro_prime_all(void) {
      * -- primed anyway, because the eager pass exists precisely so no verify
      * ever depends on "nothing else patches that". */
     aowl_nr_prime_all();
+    aowl_lp_prime_all();
 }
 """.}
 {.emit: """#include "aowlspt_detour.h" """.}
@@ -1505,6 +1526,14 @@ var gRpStartSlotA = -1
 var gRpStartSlotB = -1
 var gBotDiag = false
 var gBotDiagFires = 0
+## THE VANILLA RAID-LOAD TIMELINE (`loadperf.nim`, kind=27). One kind for
+## ALL 33 rows, exactly as uihooks does with kind 26: which row a bind is
+## for is parked in loadperf's own `gLpArming` around the call, because
+## `attachDrain` knows the kind but not the row. Read-only postfix drains
+## that touch NO game memory; flag `loadPerf`, default OFF. Declared here
+## because `attachDrain` and the config reader both name it and the include
+## comes later.
+var gLpOn = false
 ## PLAYER ACTUATION (`pact.nim`): the slot of its ONE detour, a READ-ONLY
 ## capture on `EFT.GamePlayerOwner::LateUpdate` @0xB29130 (UNIQUE, owners=1)
 ## that records the `this` register and does nothing else. Declared here beside
@@ -1526,7 +1555,13 @@ var gBotDiagCensusDone = false
 var gBotCapSlot = -1
 var gBotCap = false
 var gBotCapDone = false
-const KindMaxFeature = 25
+## NATIVE TABS (kind=28 read-only postfix on `UnityEngine.UI.Toggle::Set`):
+## its slot and opt-in flag. The body lives in `nativetabs.nim` (included
+## below). `Set` and not `set_isOn`, because that one is an eleven-byte
+## tail-jump thunk -- see the block comment in `abi/aowlspt_nativeui.h`.
+var gNtToggleSlot = -1
+var gNtFlagOn = false
+const KindMaxFeature = 29
   ## The highest `kind` that `attachDrain` treats as a FEATURE detour rather than
   ## as the main-thread update drain. Bump this when a new kind is added, and
   ## nothing else in `attachDrain` needs touching: the two places that used to
@@ -3718,6 +3753,7 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
     var dpT = cDpNow()
     ftTick()
     cDpAdd(DpFt, dpT)
+    arTick()
     # Every bracket below is OUTSIDE the bracketed rider, never inside it:
     # several of these riders open their own single `aowl_p_p_seh`, and that
     # guard is not re-entrant, so a bracket that reached inside would be a
@@ -3812,6 +3848,12 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
     dpT = cDpNow()
     rpDrainTick()
     cDpAdd(DpRaidPhase, dpT)
+    # THE RAID-LOAD TIMELINE. Rides THIS drain; installs no detour of its own
+    # here (its 33 detours are on the load path, not on Update) and opens no
+    # guard, because it reads no game memory. It exists on this drain only so
+    # that every string it prints is built OUTSIDE a detour handler. Flag
+    # `loadPerf`, default OFF; idle cost with the flag off is one bool test.
+    lpDrainTick()
     # THE CAMERA API. Rides THIS drain; installs no detour of its own. Must run
     # AFTER `rpDrainTick`, because the free camera's end-of-raid exit reads the
     # phase that call just computed -- reading a one-frame-stale phase is
@@ -3949,6 +3991,13 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
     return 0'i32
   # BOT AI ACTIVATION RESCUE: the per-bot WeaponManager.IsReady poke, by identity.
   # It writes one byte and must never suppress the original PreActivate.
+  # NATIVE TABS: which of OUR tab toggles was pressed, by identity. Read-only,
+  # O(<=4) pointer compares, silent for every foreign toggle -- and every
+  # toggle in the game funnels through here, so that matters. Must never
+  # suppress the original: the game's own toggle logic has to run.
+  if i == gNtToggleSlot:
+    ntToggleSetFired(regs)
+    return 0'i32
   if i == gBotAiSlot:
     botAiPreActivateFired(regs)
     return 0'i32
@@ -4142,6 +4191,19 @@ proc patchReturned(slot: int32; regs: Il2CppPtr): int32 {.
   # code below. Both return 0: neither ever changes what the caller gets, and
   # neither suppresses its original. The selection screen is allowed to build
   # itself completely and is dismissed from a LATER frame by the drain tick.
+  # THE RAID-LOAD TIMELINE, by slot identity and before anything else that
+  # could allocate. Its handler reads NO register and touches NO game memory --
+  # one timestamp and one interlocked counter -- so it needs no guard, and it
+  # returns 0 always: a postfix drain that never changes what the caller gets.
+  if lpSlotFired(int32(i)):
+    return 0'i32
+  # THE DEPLOY-ORDER BREADCRUMB, by slot identity and for the identical reason:
+  # its handler reads NO register and touches NO game memory (one array
+  # compare, one timestamp, two counters), so it needs no guard, and it returns
+  # 0 always -- a postfix drain that never changes what the caller gets. With
+  # `natespDeployProbe` off, `gNdpBound` is 0 and this costs one compare.
+  if ndpSlotFired(int32(i)):
+    return 0'i32
   if i == gModeSkipCtorSlot:
     modeSkipCtorFired(regs)
     return 0'i32
@@ -4214,6 +4276,14 @@ proc patchReturned(slot: int32; regs: Il2CppPtr): int32 {.
   # the caller gets exactly what the game produced -- this never changes a result.
   if i == gSettingsTabSlot:
     settingsTabInitFired(regs)
+    return 0'i32
+  # SHOW-EVENT hooks (uihooks.nim), by slot identity and on the same terms: a
+  # host drain (meth == nil) that must run AFTER the original, because the
+  # original is what shows the screen. Returns 0 -- it never changes what the
+  # game produced. `uihIsSlot` is a two-entry scan, not a table lookup, so an
+  # unbound site cannot alias another feature's slot.
+  if uihIsSlot(i):
+    uihShowFired(i, regs)
     return 0'i32
   # Phase 1.6 control census, same reasoning: a host drain (meth == nil) that
   # must read AFTER the original ran, because the original is what creates the
@@ -4992,6 +5062,15 @@ proc nameIndexResolve(spec: string; arity: int32; forPatch: bool;
          "address is NOT being turned into a patch. This is a REFUSAL, not a " &
          "resolution failure: the index answered."
 
+# The three gates a mod's patch-by-RVA passes after `resolveByRva` has answered
+# everything about the ADDRESS and before anything is written: a declared
+# prologue (so something was actually byte-compared), UNIQUE sharedness from the
+# offline name index (shared and unknown are both refusals), and nobody already
+# owning the function. Included HERE, not with the other feature modules at the
+# bottom of this file, because `installPatch` below is its only caller and
+# Nim resolves in order.
+include "patchrva.nim"
+
 proc installPatch(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
                   kind: int32; cb: Il2CppPtr; user: Il2CppPtr;
                   typed: bool): int32 =
@@ -5112,6 +5191,15 @@ proc installPatch(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
         warn refusal
         gLastError = refusal
         return ErrUnsupported
+    # THE THREE GATES -- see patchrva.nim. After `resolveByRva`, because gate 3
+    # relies on the snapshot row that the declared-prologue verify has just
+    # captured and matched; before the slot claim, because a refusal must not
+    # have consumed anything.
+    let gate = rvaGateRefusal(rs, allowShared)
+    if gate.len > 0:
+      warn gate
+      gLastError = gate
+      return ErrUnsupported
     kinds = rs.kinds
     retKind = rs.retKind
     frameFlags = (if rs.isStatic: FrameFlagStatic else: 0'u32)
@@ -5354,6 +5442,8 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
               elif kind == 23: "errdlg-message"
               elif kind == 24: "errdlg-exception"
               elif kind == 25: "errdlg-critical"
+              elif kind == 27: "loadperf"
+              elif kind == 28: "native-tabs"
               else: "main-thread")
   tablesLock()
   let claimed = cHookClaim()
@@ -5445,6 +5535,22 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
     gErrDlgExcSlot = int(claimed)
   elif kind == 25:
     gErrDlgCritSlot = int(claimed)
+  elif kind == 26:
+    # SHOW-EVENT hooks (uihooks.nim). One kind for ALL screen sites: which site
+    # this bind is for is parked in uihooks' own `gUihArming` around the call,
+    # because `attachDrain` knows the kind but not the site.
+    uihNoteSlot(claimed)
+  elif kind == 27:
+    # THE RAID-LOAD TIMELINE (loadperf.nim). One kind for ALL 33 rows, same
+    # shape as uihooks above: the row is parked in loadperf's `gLpArming`.
+    lpNoteSlot(claimed)
+  elif kind == 28:
+    gNtToggleSlot = int(claimed)
+  elif kind == 29:
+    # THE DEPLOY-ORDER BREADCRUMB (nedeploy.nim). One kind for ALL four rows,
+    # the same shape as uihooks and loadperf above: the row being bound is
+    # parked in nedeploy's `gNdpArming` around the call.
+    ndpNoteSlot(claimed)
   else:
     gDrainSlot = int(claimed)
   tablesUnlock()
@@ -6492,6 +6598,14 @@ include "inspoverlay.nim"
 ## renderer. Default OFF (`settingsModsTab`).
 include "modstab.nim"
 
+## SHOW-EVENT HOOKS. A small registry that lets a UI feature subscribe to "this
+## screen was just shown" instead of hunting for its control on a per-frame
+## cadence. ONE byte-verified POSTFIX detour per SUBSCRIBED screen; nothing is
+## patched for a screen nobody subscribed to. Included AFTER `inspect.nim`
+## (`iUnityAlive`) and `debugui.nim` (`duOk`), and BEFORE every subscriber.
+## See `docs/UIHOOKS.md` for the API and the migration recipe.
+include "uihooks.nim"
+
 ## SINGLEPLAYER REBRAND of the Matchmaker Offline Raid Screen. Included AFTER
 ## `inspect.nim` (it stands on the transform walkers and `gTxtTypeStr`) and
 ## `nativeui.nim` (the byte-verified setters + SetActive). It adds NO detour:
@@ -6535,6 +6649,17 @@ include "natraid.nim"
 ## writes nothing; `rpDrainTick` rides the `TarkovApplication::Update` drain.
 include "raidphase.nim"
 
+## THE VANILLA RAID-LOAD TIMELINE. 33 read-only POSTFIX detours on the markers
+## the game already has for its own metrics (`ClientMetricsEvents::SetGame*`),
+## plus the methods that bracket the three stretches in which the client logs
+## nothing at all. It reads NO game memory -- one timestamp and one interlocked
+## counter per hit -- so it opens no SEH guard and cannot fault into the client;
+## every string it prints is built in `lpDrainTick`, on the Update drain, never
+## in a handler. `include`d here because it needs `attachDrain`, `hexOf`,
+## `readCString` and the log helpers and nothing else in this host. Flag
+## `loadPerf`, DEFAULT OFF. Read it with `tools/hostlog.py feature loadperf`.
+include "loadperf.nim"
+
 ## THE CAMERA API and the free camera built on it. `include`d AFTER
 ## `raidphase.nim` (it gates on `rpPhase`, and exits+restores the moment the
 ## phase stops reading DEPLOYED, which is what keeps it off the post-raid
@@ -6571,6 +6696,14 @@ include "pact.nim"
 ## `inspect.nim`. natesp's own breadth-first canvas search is now a FALLBACK
 ## behind it rather than a second implementation.
 include "nuikit.nim"
+
+## THE DEPLOY-ORDER BREADCRUMB. `include`d immediately BEFORE `natesp.nim`,
+## which prints its ordering line in the per-raid deploy ledger. Four read-only
+## POSTFIX drains on EFT.LocalGame, all UNIQUE, all verified against the
+## STARTUP PROLOGUE SNAPSHOT. It MEASURES whether OnGameStarted is the early
+## signal or the late one and changes NO gate. Default OFF
+## (`natespDeployProbe`).
+include "nedeploy.nim"
 
 include "natesp.nim"
 ## THE IN-GAME MOD LOADING SCREEN. Included AFTER nuikit (nuPanel/nuLabel/
@@ -6636,6 +6769,10 @@ include "frametime.nim"
 ## nothing from any feature module, so it stays a valid instrument for the
 ## features it brackets.
 include "drainprof.nim"
+
+## RAYTRACED AUDIO. Same placement rule as the two instruments above: it names
+## nothing from any feature module, so it can be armed or disarmed on its own.
+include "audioray.nim"
 
 ## THE SHARED PER-FRAME REGION. Included AFTER `modstab.nim` because
 ## `bindRegion` names `gModsSlot` and `cDuPreloaderTarget`, and nimony
@@ -7688,6 +7825,16 @@ var gReportNextMs = 0'u64
 ## `hostMain`'s tick loop, and `modSetQueueWrite`, which fulfils
 ## `settingspages.nim`'s forward declaration.
 include "modsettingsrender.nim"
+## THE MODS TAB'S DATA. AFTER `modsettingsrender.nim` because it reuses that
+## file's `modSetParseF64`, and after `settingspages.nim` for `SwPage`/`SwRow`/
+## `swPageRegister`. `modstab.nim` forward-declares `miArm`/`miTick`.
+when false:
+  include "modsindex.nim"
+
+## STEP 1 of docs/NATIVETABS.md. After `modstab.nim` for `modsClone` /
+## `modsComponent` / `modsSetParent` / `modsGoActive`, and after `nativeui.nim`
+## for the byte-verified call wrappers.
+include "nativetabs.nim"
 
 ## THE NATIVE COLOUR WIDGET. Fulfils `settingspages.nim`'s three forward
 ## declarations (`cwBuildForRow` / `cwRowColor` / `cwDestroySlot`) and defines
@@ -8126,6 +8273,14 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   # "something took a reference and never gave it back" and a way to unmap a
   # library out from under a legitimate holder for every other cause.
   modhost.setForceRelease(readBoolKey("modForceRelease"))
+  gLpOn = readBoolKey("loadPerf")
+  if gLpOn:
+    info "loadPerf is set: 33 READ-ONLY POSTFIX detours will time the vanilla " &
+         "raid load (menu network batch, matching, LoadMapAndData, bundle " &
+         "loading, and the twelve ClientMetricsEvents phase markers the client " &
+         "log already prints). It reads NO game memory and suppresses NO " &
+         "original; it changes load behaviour in no way. NOTHING IS SKIPPED -- " &
+         "this measures, it does not optimise."
   gBotDiag = readBoolKey("botDiag")
   if gBotDiag:
     info "botDiag is set: a READ-ONLY detour on EFT.GameWorld.RegisterPlayer " &
@@ -8504,6 +8659,10 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   # THE DRAIN PROFILER, for the identical reason and on the identical terms: it
   # is an instrument over the other features, so it is ANDed with none of them.
   dpConfigure()
+  # RAYTRACED AUDIO, ANDed with nothing for the same reason: it depends on no
+  # other feature. Default OFF, and it refuses BY NAME when its DLL path is
+  # unset -- the licence forbids us shipping the library.
+  arConfigure()
   # THE ESP PROVIDER, read BEFORE natEsp is armed so the "overlay" choice can
   # veto arming rather than arm a feature and then hide it. An absent or
   # unrecognised value falls back to "auto" LOUDLY -- a typo that silently
@@ -8526,6 +8685,17 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
          "swap them, or \"both\" to draw both (which is what produced the " &
          "doubled boxes)."
   gNeDiag = gNeOn and readBoolKey("natEspDiag")
+  # THE FIREHOSE SWITCH, default OFF. `natEspDiag` decides WHETHER the verdict
+  # is reported; `natespVerbose` decides only how often an UNCHANGED one is
+  # REPEATED. ON restores the pre-throttle behaviour byte for byte (the full
+  # ~3,000-character block every 5s and the full flicker meter every 1s). OFF
+  # suppresses no measurement and can silence no not-PASS verdict.
+  gNeVerbose = readBoolKey("natespVerbose")
+  # THE DEPLOY-ORDER BREADCRUMB. Independent of `natEsp` on purpose: the
+  # question it answers -- is OnGameStarted the early signal or the late one --
+  # is about `raidphase`, which the maps HUD reads too, so the measurement must
+  # be available whether or not the ESP itself is armed.
+  gNdpOn = readBoolKey("natespDeployProbe")
   # THE PER-CLASS COLOURS, from `colorSetting(format="hex")`. Read ONCE here, at
   # config load, never per frame. A key that is absent or that does not parse
   # leaves the compiled default in place AND leaves `aowl_ne_col_source` saying
@@ -8760,6 +8930,27 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
          "object. It rides the shared PreloaderUI::Update detour on a " &
          "120-frame throttle and gives up after 8 applies."
   # THE MAIN-MENU SEASONS BANNER (`uxHideSeasons`). Default OFF.
+  # NATIVE TABS (docs/NATIVETABS.md step 1). Default OFF. Needs the live
+  # SettingsScreen the settingsUiProbe ShowScreen postfix learns, exactly like
+  # the postfx subtab below, and binds ONE read-only detour on
+  # UnityEngine.UI.Toggle::Set for the tab-press event.
+  gNtFlagOn = readBoolKey("nativeTabs")
+  gNtOn = gNtFlagOn
+  if gNtOn and not gSettingsUiProbe:
+    gSettingsUiProbe = true
+    info "nativeTabs is set, so settingsUiProbe has been turned on with it -- " &
+         "it needs the live SettingsScreen that probe's ShowScreen postfix " &
+         "is what learns."
+  if gNtOn:
+    info "nativeTabs is set: the host adds ONE proof tab to the settings " &
+         "screen, built from a real UIAnimatedToggleSpawner joined to the " &
+         "STOCK ToggleGroup and a real cloned SettingsTab panel emptied of " &
+         "its rows. This is step 1 of docs/NATIVETABS.md and it deliberately " &
+         "renders no rows yet."
+    if not ntBindToggleEvent(false):
+      gNtOn = false
+      warn "nativeTabs: the toggle event did not bind, so the feature is OFF " &
+           "for this session. Nothing was patched and nothing was changed."
   gGfxOn = readBoolKey("settingsPostFxSubtab")
   if gGfxOn and not gSettingsUiProbe:
     gSettingsUiProbe = true
@@ -9095,6 +9286,16 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
         info "the settings control probe did not verify " &
              "SettingsScreen.EnsureTabInitialized on this build"
 
+      # SHOW-EVENT HOOKS (uihooks.nim). STRICT ORDER, and a new subscriber MUST
+      # keep it: every `*WantShowHook` runs FIRST so the arm pass knows which
+      # sites anyone actually wants, then ONE `uihArm` installs exactly those
+      # detours, then each subscriber reads back whether its site really bound.
+      # Arming per-subscriber instead would install a second detour on a site two
+      # features share, and the second would overwrite the first's trampoline.
+      splWantShowHook()
+      uihArm(true)
+      splShowHookVerdict()
+
       # Version-label brand (opt-in). Static code, so it installs now and fires
       # when PreloaderUI.Awake runs on its way to the menu. Fail-safe if the
       # prologue does not match or if Awake already ran before this armed.
@@ -9112,6 +9313,24 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
       # arm the user reported three times. Read-only, fires at most once per
       # raid, and `bindRaidStart` announces loudly if neither target verifies.
       discard bindRaidStart(true)
+
+      # THE DEPLOY-ORDER BREADCRUMB (opt-in, `natespDeployProbe`). Four
+      # read-only POSTFIX drains on EFT.LocalGame, bound here for the same
+      # reason as the row above: static code, installs now, fires only when the
+      # client walks the deploy path. It MEASURES whether `OnGameStarted` --
+      # the signal `raidphase` currently latches on -- runs before or after the
+      # countdown actually ends, and it changes NO gate. `bindNeDeployProbe`
+      # reads the flag itself and names every row that did not verify.
+      discard bindNeDeployProbe(true)
+
+      # THE VANILLA RAID-LOAD TIMELINE (opt-in, `loadPerf`). All 33 targets are
+      # static code, so the detours install now and simply never fire until the
+      # client walks the load path. `lpBind` reads the flag itself, names every
+      # row that did not bind together with its RVA and the snapshot's own
+      # reason, and refuses the whole feature outright if the C table and the
+      # Nim row names ever disagree in count -- binding row i's timestamp to
+      # row j's name would be a timeline that cannot be falsified.
+      discard lpBind(true)
 
       if gBotDiag and not bindBotDiag(true):
         info "botdiag did not arm (EFT.GameWorld.RegisterPlayer unverified on " &

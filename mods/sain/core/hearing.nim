@@ -185,15 +185,40 @@ func motionSound*(prev, now1: Vec3; dt: float; sprintFlag: bool;
 # Listening
 # ---------------------------------------------------------------------------
 
-func hearingRange*(e: SoundEvent; s: Settings; occluded: bool): float =
+func hearingRange*(e: SoundEvent; s: Settings; occluded: bool;
+                   occGain: float = -1.0): float =
   ## The radius at which this listener would hear this sound.
+  ##
+  ## `occGain` is a MEASURED acoustic transmission gain in [0, 1] -- the fraction
+  ## of the sound that actually reaches the listener through whatever geometry
+  ## is between them -- as produced by the host's raytraced-audio feature
+  ## (`aowl_audio_occlusion`, `host/Aowlspt.Host.Il2Cpp/audioray.nim`). A
+  ## NEGATIVE value means "not measured", which is the default and is the only
+  ## thing every existing caller passes, so their behaviour is unchanged to the
+  ## bit.
+  ##
+  ## The two paths are deliberately not blended. When a real gain is available
+  ## it REPLACES `s.hearingOcclusionFactor` rather than multiplying it: the
+  ## scalar is a stand-in FOR this measurement, and applying both would attenuate
+  ## twice and make a raytraced bot deafer than a scalar one -- a regression that
+  ## would look like the feature working.
+  ##
+  ## Note the model this preserves: occlusion scales the RADIUS, so a gain of 0.5
+  ## halves the distance at which the sound is noticed. It is not a loudness
+  ## multiplier. `listen` derives loudness from `d / r` afterwards, so the two
+  ## stay consistent by construction.
   var r = baseRange(e.kind) * e.intensity * s.hearingAcuity
-  if occluded:
+  if occGain >= 0.0:
+    # A measured gain applies whether or not the caller also thought the pair was
+    # occluded: the raytracer's answer is the better evidence, and 1.0 (nothing
+    # in the way) correctly leaves the radius alone.
+    r = r * clampf(occGain, 0.0, 1.0)
+  elif occluded:
     r = r * s.hearingOcclusionFactor
   result = r
 
 proc listen*(e: SoundEvent; listener: Vec3; s: Settings; occluded: bool;
-             now: float; r1: var Rng): Heard =
+             now: float; r1: var Rng; occGain: float = -1.0): Heard =
   ## Did this bot hear it, and where does it think it came from?
   ##
   ## `r1` is the bot's own deterministic stream, so two bots hearing the same
@@ -207,7 +232,7 @@ proc listen*(e: SoundEvent; listener: Vec3; s: Settings; occluded: bool;
     return
   let d = distance(listener, e.position)
   result.distance = d
-  let r = hearingRange(e, s, occluded)
+  let r = hearingRange(e, s, occluded, occGain)
   if r <= 0.0 or d > r:
     return
   result.audible = true
