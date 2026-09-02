@@ -7656,7 +7656,7 @@ changed after it (SAIN drive level 2 at 08:15, Maps diagVerbose at 08:20).
 The inspector-off boot with those configs survived once. Bisecting SAIN
 back to 0 now; one sample each is not enough -- count samples.
 
-## 2026-09-02 10:10: bisect table -- SAIN drive level 2 is the leading suspect
+## 2026-09-02 ~09:20 (labelled 10:10): bisect table -- SAIN drive level 2 is the leading suspect
 
 MEASURED samples, all builds 4,737,536 or 4,784,128, inspector ON unless
 stated:
@@ -7671,7 +7671,7 @@ At level 2 SAIN arms its aim postfix at boot (~10-16s); at level 0 it
 refuses. Sample 2 (level 2, inspector on, 4,737,536) running; the SAIN
 detour is being audited offline (prologue, sharedness, register discipline).
 
-## 2026-09-02 10:25: the menu-arrival crash, by the registers
+## 2026-09-02 ~09:30 (labelled 10:25): the menu-arrival crash, by the registers
 
 MEASURED (`tools/dmpread.py`, Crash_2026-09-02_131229783, build 4,737,536):
 `ACCESS_VIOLATION at 0x7ffb3ee80103 -- a READ of 0x21 faulted; Rax=1 Rcx=1
@@ -7791,7 +7791,7 @@ it died 3/3, and an inspector-off boot of the same build survived -- but the
 So dropping it is right on the evidence available (nothing needs it, no survivor
 ever had it) and it is NOT established as a cause.
 
-## 2026-09-02 11:00: acceptance 12/12 PASS live on the 4,737,536 build
+## 2026-09-02 ~09:45 (labelled 11:00): acceptance 12/12 PASS live on the 4,737,536 build
 
 MEASURED: `acceptance.py run --no-launch --keep --mods-built`: past mode
 selector, Settings opened (active), 4 stock tabs, 1 native tab clone (=
@@ -7802,7 +7802,7 @@ group one ON, exactly one panel active, 0 fault-caught lines, strict JSON
 index. So native subtabs work on this build; the 09:05 "no strip" was
 specific to the 4,784,128 build.
 
-## 2026-09-02 11:10: SAIN's client-side selftest catches the mod double-init
+## 2026-09-02 ~09:50 (labelled 11:10): SAIN's client-side selftest catches the mod double-init
 
 MEASURED (host 4,737,536, sain.dll rebuilt): server half at [0:00:04.563]
 `publish-once selftest PASS`; client half at the gated release [0:00:40.688]
