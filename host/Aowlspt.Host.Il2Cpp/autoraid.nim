@@ -111,9 +111,26 @@ const
                                 ## another press is allowed.
   ArMaxSidePresses = 2          ## presses of the side control, EVER. Then the
                                 ## step refuses by name rather than mashing.
-  ArMaxSideBtns   = 24          ## side controls collected per screen (for the
-                                ## name census as much as for the match).
-  ArSideDepth     = 6           ## descent under the side screen.
+  ArMaxSideBtns   = 24          ## nodes collected per walk, for the name census
+                                ## as much as for the match.
+  ArSideDepth     = 6           ## descent under the side screen for containers.
+  ArSideDeepDepth = 8           ## descent INSIDE a container (PMCs/Scavs).
+                                ## MEASURED 2026-09-02: a depth-6 census from
+                                ## the SCREEN listed [PMCs] and then 23 MODEL
+                                ## nodes ([MenuPlayer][Mesh][USEC_head_Hugh] ..
+                                ## [pistol_holster]), so the pressable control
+                                ## is deeper than the walk reached and the cap
+                                ## was spent on the character mesh. The
+                                ## CONTAINER is the thing to walk, not the
+                                ## screen.
+  ArMaxSideConts  = 8           ## pmc/scav containers examined.
+  ArMaxSideProbe  = 24          ## nodes GetComponent-probed INSIDE one
+                                ## container. Bounded because each probe
+                                ## allocates a managed string inside
+                                ## GetComponent(String); this runs only while
+                                ## the SIDE step is live -- a handful of ticks,
+                                ## one per ArTickFrames frames -- and never in
+                                ## a steady state.
   ArCensusCap     = 24          ## names printed by the stuck-step screen census.
   ArPreMaxTries   = 2           ## PRE-MENU dismissal attempts, EVER. Then the
                                 ## step refuses by name, loudly, naming the
@@ -210,6 +227,43 @@ var gArPreChatSeen = 0             ## ticks on which ChatScreen read ACTIVE
 var gArPreChecks = 0               ## PRE-MENU overlay checks made (the divisor)
 var gArPreVia = "nothing"          ## which route the last attempt used
 var gArPreAttempted = false        ## PRE-MENU has acted at least once
+
+## WHERE THE GUARDED BODY WAS WHEN IT FAULTED.
+##
+## MEASURED 2026-09-02: `autoRaid: the guarded tick body faulted (1 of 3)` fired
+## during PRE-MENU, moments before the BackButton press succeeded -- and the
+## line named neither the step nor the operation, so it cost a third of the
+## session's fault budget and told nobody anything. A fault that cannot say
+## where it was is a fault that will be paid for again.
+##
+## An INT, deliberately: assigning a string literal to a module-level var
+## allocates, and this is set several times per tick on the live path. The text
+## is produced only when a fault is actually being reported.
+var gArCrumb = 0
+
+proc arCrumbName(c: int): string =
+  case c
+  of 0:  "tick entry"
+  of 1:  "reading the offline-raid show epoch (uihooks site 0)"
+  of 2:  "reading the side-selector show epoch (uihooks site 3)"
+  of 3:  "WAIT-MENU: arFindPlay (walking roots for MenuScreen/PlayButton)"
+  of 4:  "WAIT-MENU: arOverlayScreen (looking for an ACTIVE SettingsScreen)"
+  of 5:  "WAIT-MENU: arChatActive (ChatScreen census, never pressed)"
+  of 6:  "WAIT-MENU: arScreenCensus (the refusal census)"
+  of 7:  "WAIT-MENU: pressing the MenuScreen PlayButton"
+  of 8:  "PRE-MENU: arFindPlay (the finished-state readback)"
+  of 9:  "PRE-MENU: arOverlayScreen"
+  of 10: "PRE-MENU: arScreenCensus"
+  of 11: "PRE-MENU: pressing the SettingsScreen BackButton"
+  of 12: "PRE-MENU: calling SettingsScreen::Close"
+  of 13: "SIDE: arSideActive (is the side screen still up)"
+  of 14: "SIDE: walking the pmc/scav containers and pressing"
+  of 15: "SELECT-MAP: the side-screen INACTIVE readback"
+  of 16: "SELECT-MAP: arSelectMap (map tiles)"
+  of 17: "NEXT: arFindNext (looking for an active NextButton)"
+  of 18: "NEXT: pressing the NextButton"
+  of 19: "the step timeout census"
+  else:  "unknown (" & $c & ")"
 
 proc arStepName(s: int): string =
   case s
@@ -702,17 +756,52 @@ proc arSideActive(): bool =
   let a = iActiveInHierarchy(tr)
   result = a[0] and a[1]
 
+proc arBtnCaption(comp: Il2CppPtr): string =
+  ## `DefaultUIButton._text` @0xB8 -- THE TEXT A PERSON READS on this control.
+  ## The offset is from `tools/fldoff.py field DefaultUIButton _text` -> 0xb8,
+  ## never guessed. Guarded exactly as `splTmpText` guards `m_text`: a
+  ## KNOWN-KLASS value in that slot is type confusion, not a String, and must
+  ## not be read as one. "" means NOT READABLE, and the caller must never treat
+  ## that as a caption.
+  result = ""
+  if comp == nil or not duOk(comp, 0xC0'i32): return
+  let sp = cReadPtrAt(comp, 0xB8'i32)
+  if sp != nil and not iIsKnownKlass(cast[uint64](sp)) and duOk(sp, 0x18'i32):
+    result = suiReadString(sp)
+
+proc arButtonOn(node: Il2CppPtr; comp: var Il2CppPtr): string =
+  ## Which pressable component this node carries, "" for none. DefaultUIButton
+  ## first (what this file presses everywhere), AnimatedToggle second (the map
+  ## tiles' type). Returns the TYPE NAME so the caller hands the same string
+  ## back to `arPress` and the two cannot disagree about what was found.
+  result = ""
+  comp = nil
+  var w = ""
+  if iVisComponent(node, "DefaultUIButton", comp, w) and comp != nil:
+    return "DefaultUIButton"
+  comp = nil
+  if iVisComponent(node, "AnimatedToggle", comp, w) and comp != nil:
+    return "AnimatedToggle"
+  comp = nil
+
 proc arPressSideUnder(scr: Il2CppPtr; want: string; nSeen: var int;
                       names: var string; why: var string): bool =
-  ## Press the side control whose GameObject NAME contains `want` (default
-  ## "pmc", from `autoRaidSide`), searched under the live side screen only.
+  ## Press the side control whose CAPTION reads `want` (default "pmc", from
+  ## `autoRaidSide`); the object NAME is only a fallback, used when no caption
+  ## could be read at all.
   ##
-  ## BY NAME, AND SAYING SO. The captions on this screen are NOT TMP text --
-  ## they are `DefaultUIButton._text` -- so the displayed-text match that the
-  ## map tiles use is not available here without reading a field this host has
-  ## not measured. Rather than guess an offset, this matches the object name and
-  ## LOGS EVERY NAME IT SAW, so the next run's log settles what the controls are
-  ## really called instead of a guess being written into the code.
+  ## WHY IT WALKS THE CONTAINERS AND NOT THE SCREEN. MEASURED 2026-09-02: a
+  ## depth-6 census of ACTIVE nodes from the screen returned
+  ##   [Logo][CaptionsHolder][MainCaption][SubCation][PMCs][PMCPlayerMV]
+  ##   [PlayerMVObject][Lights][Fill Light][Main Light][Down Light][Hair Light]
+  ##   [Camera_matchmaker][MenuPlayer][Mesh][USEC_head_Hugh] .. [pistol_holster]
+  ##   [Pants_Usec_AC_Combat_Crye_lod0]
+  ## -- `PMCs` is a CONTAINER holding the character MODEL as well as the
+  ## control, so a flat walk spends its whole cap on mesh nodes and never
+  ## reaches anything pressable. The SIDE step failed nine times in a row on
+  ## exactly that. So: find the containers by name, walk INSIDE each one for a
+  ## node that actually CARRIES a button, and report every one found WITH ITS
+  ## CAPTION -- a refusal that cannot list its candidates is not evidence.
   result = false
   nSeen = 0
   names = ""
@@ -720,33 +809,92 @@ proc arPressSideUnder(scr: Il2CppPtr; want: string; nSeen: var int;
   if scr == nil:
     why = "no live side screen"
     return false
-  var btns: seq[Il2CppPtr] = @[]
-  var b = ArNodeBudget
-  arCollectAllActive(scr, ArSideDepth, b, cNowMs() + ArWalkMs, btns,
+
+  # Phase 1 -- the containers: anything ACTIVE under the screen whose name
+  # mentions a side. `PMCs` and a `Scavs`/`SCAVs` sibling are what this build
+  # showed; the match is a lowercased substring, so `PMC` or `ScavsHolder`
+  # still lands.
+  var all: seq[Il2CppPtr] = @[]
+  var b0 = ArNodeBudget
+  arCollectAllActive(scr, ArSideDepth, b0, cNowMs() + ArWalkMs, all,
                      ArMaxSideBtns)
-  nSeen = btns.len
+  var conts: seq[Il2CppPtr] = @[]
   var i = 0
-  while i < btns.len:
-    let nm = iObjName(btns[i])
-    if nm.len > 0 and names.len < 600:
-      names = names & "[" & nm & "]"
+  while i < all.len and conts.len < ArMaxSideConts:
+    let nm = iLower(iObjName(all[i]))
+    if nm.len > 0 and (iContains(nm, "pmc") or iContains(nm, "scav")):
+      conts.add all[i]
     i = i + 1
-  i = 0
-  while i < btns.len:
-    let nm = iObjName(btns[i])
-    if nm.len > 0 and iContains(iLower(nm), want):
-      if arPress(btns[i], "DefaultUIButton"):
-        return true
-      if arPress(btns[i], "AnimatedToggle"):
-        return true
-      why = "the node named `" & nm & "` matched \"" & want & "\" but neither " &
-            "a DefaultUIButton nor an AnimatedToggle OnClick could be resolved " &
-            "and validated on it, so it was NOT pressed"
-      return false
-    i = i + 1
-  why = "no ACTIVE node under the live side screen has a name containing \"" &
-        want & "\" (`autoRaidSide`). The " & $nSeen & " active node name(s) " &
-        "seen are listed above; match one of those"
+  if conts.len == 0:
+    why = "no ACTIVE node under the live side screen has a name mentioning " &
+          "`pmc` or `scav`, so there is no container to walk into. NOTHING " &
+          "WAS PRESSED -- this is a refusal, not a miss"
+    return false
+
+  # Phase 2 -- inside each container, every node that CARRIES a pressable
+  # component, with the caption a person reads on it.
+  var best: Il2CppPtr = nil
+  var bestType = ""
+  var bestCap = ""
+  var byName: Il2CppPtr = nil
+  var byNameType = ""
+  var ci = 0
+  while ci < conts.len:
+    var nodes: seq[Il2CppPtr] = @[]
+    var b = ArNodeBudget
+    nodes.add conts[ci]                     # the container itself may BE it
+    arCollectAllActive(conts[ci], ArSideDeepDepth, b, cNowMs() + ArWalkMs,
+                       nodes, ArMaxSideProbe)
+    var ni = 0
+    while ni < nodes.len:
+      var comp: Il2CppPtr = nil
+      let ct = arButtonOn(nodes[ni], comp)
+      if ct.len > 0:
+        nSeen = nSeen + 1
+        let nm = iObjName(nodes[ni])
+        let cap = (if ct == "DefaultUIButton": arBtnCaption(comp) else: "")
+        if names.len < 620:
+          names = names & "[" & nm & " " & ct & " caption=" &
+                  (if cap.len > 0: cap else: "<unreadable>") & "]"
+        if best == nil and cap.len > 0 and iContains(iLower(cap), want):
+          best = nodes[ni]
+          bestType = ct
+          bestCap = cap
+        if byName == nil and nm.len > 0 and iContains(iLower(nm), want):
+          byName = nodes[ni]
+          byNameType = ct
+      ni = ni + 1
+    ci = ci + 1
+
+  # THE CAPTION WINS; the name is the fallback and says so when it is used. On
+  # the boot slot screen the object names were measured to lie outright
+  # (`CharacterSlotView_pvp` is labelled "PvE"), so preferring a name match
+  # while a caption was readable would be choosing the worse evidence.
+  if best != nil:
+    if arPress(best, bestType):
+      okLog "autoRaid SIDE: matched by CAPTION \"" & bestCap & "\" on a " &
+            bestType & " inside a `pmc`/`scav` container."
+      return true
+    why = "the control captioned \"" & bestCap & "\" matched \"" & want &
+          "\" but could not be pressed: its " & bestType & " OnClick could " &
+          "not be resolved and validated"
+    return false
+  if byName != nil:
+    if arPress(byName, byNameType):
+      okLog "autoRaid SIDE: matched by object NAME, not by caption -- no " &
+            "caption under the containers could be read. Names can lie on " &
+            "this build, so this is the WEAKER match, and it is announced " &
+            "rather than silently preferred."
+      return true
+    why = "the control whose NAME matched \"" & want & "\" could not be " &
+          "pressed: its " & byNameType & " OnClick could not be resolved and " &
+          "validated"
+    return false
+  why = "walked " & $conts.len & " `pmc`/`scav` container(s) and found " &
+        $nSeen & " node(s) carrying a DefaultUIButton or AnimatedToggle, " &
+        "none with a caption or a name containing \"" & want &
+        "\" (`autoRaidSide`). The candidates are listed above; match one of " &
+        "those. NOTHING WAS PRESSED"
 
 proc arActiveCensus(root: Il2CppPtr; depth: int; count: var int;
                     into: var string) =
@@ -956,6 +1104,7 @@ proc arTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ar_tick_body", cdecl.}
   ## frame instead of racing the menu.
   result = cast[Il2CppPtr](1)
   discard a
+  gArCrumb = 0
   if gArStep == ArDone or gArStep == ArFailed: return
 
   let now = cNowMs()
@@ -971,10 +1120,12 @@ proc arTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ar_tick_body", cdecl.}
   # compare per tick. This is what makes the step after PLAY event-driven
   # instead of a visibility poll -- and the receiver comes with it, so the
   # screen never has to be found by name at all.
+  gArCrumb = 2
   let sep = uihEpoch(UihSiteSideSelect)
   if sep != gArSideEpoch:
     gArSideEpoch = sep
     gArSideFires = gArSideFires + 1
+    gArCrumb = 13
     gArSideTr = arSideScreen()
     if gArStep == ArSide or gArStep == ArPressPlay or gArStep == ArWaitMenu or
        gArStep == ArNext1:
@@ -989,6 +1140,7 @@ proc arTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ar_tick_body", cdecl.}
       info "autoRaid: MatchMakerSideSelectionScreen::Show fired (uihooks " &
            "site 3, epoch " & $sep & ") while at step " & arStepName(gArStep) &
            "; noted, no resynchronisation (that step is already past it)."
+  gArCrumb = 1
   let ep = uihEpoch(UihSiteOfflineRaid)
   if ep != gArOffEpoch:
     gArOffEpoch = ep
@@ -1032,6 +1184,7 @@ proc arTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ar_tick_body", cdecl.}
     var census = ""
     if not gArCensused:
       gArCensused = true
+      gArCrumb = 19
       census = arScreenCensus()
     arFail("step " & arStepName(gArStep) & " never completed within " &
            $(int(stepTimeout div 1000'u64)) & " s (control never became " &
@@ -1063,9 +1216,11 @@ proc arTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ar_tick_body", cdecl.}
     # log then a press on a later tick, and no re-find between finding and
     # pressing (a re-find could return a transient/wrong node). The found node is
     # the pressed node, atomically.
+    gArCrumb = 3
     let pb = arFindPlay(nMs, nPb, nActive)
     if pb != nil:
       gArPlaySeen = true
+      gArCrumb = 7
       if arPress(pb, "DefaultUIButton"):
         okLog "autoRaid: menu ready -- pressed PLAY (MenuScreen PlayButton, " &
               "atomic find-and-press); driving into an OFFLINE raid on map \"" &
@@ -1093,7 +1248,9 @@ proc arTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ar_tick_body", cdecl.}
       if nMs > 0 and nPb > 0 and nActive == 0 and
          now - gArWaitLogMs > 5000'u64:
         gArPreChecks = gArPreChecks + 1
+        gArCrumb = 5
         if arChatActive(): gArPreChatSeen = gArPreChatSeen + 1
+        gArCrumb = 4
         let ov = arOverlayScreen()
         if ov == nil and gArPreAttempted:
           # PRE-MENU has already acted and the menu is STILL not usable, with
@@ -1103,6 +1260,7 @@ proc arTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ar_tick_body", cdecl.}
           var census = ""
           if not gArCensused:
             gArCensused = true
+            gArCrumb = 6
             census = arScreenCensus()
           arFail("WAIT-MENU refusing IMMEDIATELY rather than waiting out its " &
                  $(int(ArMenuWaitMs div 1000'u64)) & " s bound: PRE-MENU has " &
@@ -1144,6 +1302,7 @@ proc arTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ar_tick_body", cdecl.}
     var nMs = 0
     var nPb = 0
     var nAct = 0
+    gArCrumb = 8
     let pb = arFindPlay(nMs, nPb, nAct)
     if pb != nil:
       if gArPreTries > 0:
@@ -1162,6 +1321,7 @@ proc arTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ar_tick_body", cdecl.}
       gArStepT0 = 0'u64
       arGoto(ArWaitMenu)
       return
+    gArCrumb = 9
     let ov = arOverlayScreen()
     # (b) settle after an attempt before judging it or trying again.
     if gArPreTries > 0 and now - gArPreActMs < ArPreSettleMs:
@@ -1172,6 +1332,7 @@ proc arTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ar_tick_body", cdecl.}
       var census = ""
       if not gArCensused:
         gArCensused = true
+        gArCrumb = 10
         census = arScreenCensus()
       arFail("step PRE-MENU -- the MAIN MENU DID NOT COME BACK. After " &
              $gArPreTries & " dismissal attempt(s) (last via " & gArPreVia &
@@ -1227,6 +1388,7 @@ proc arTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ar_tick_body", cdecl.}
                   "UnityEvent::Invoke), scoped to the ACTIVE SettingsScreen"
       var backNames = ""
       var backSeen = 0
+      gArCrumb = 11
       if arPressBackUnder(ov, backNames, backSeen, why):
         okLog "autoRaid PRE-MENU: pressed " & gArPreVia &
               ". PRESSED IS NOT RESTORED -- the readback is the next tick " &
@@ -1243,6 +1405,7 @@ proc arTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ar_tick_body", cdecl.}
     gArPreActMs = now
     gArLastActionMs = now
     gArPreVia = "SettingsScreen::Close @0x" & hexOf(uint64(cPmnRva(PmnTSsClose)))
+    gArCrumb = 12
     if arCloseSettings(ov, why):
       okLog "autoRaid PRE-MENU: called " & gArPreVia &
             " on the ACTIVE SettingsScreen (FALLBACK -- this hides the screen " &
@@ -1281,10 +1444,12 @@ proc arTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ar_tick_body", cdecl.}
     # pressed; if the ONLY active NextButton is that same object and it has
     # persisted past ArReuseMs, the flow reuses one object across screens, so
     # press it rather than stall.
+    gArCrumb = 17
     var nb = arFindNext(gArLastPressed)
     if nb == nil and gArLastPressed != nil and
        now - gArLastActionMs > ArReuseMs:
       nb = arFindNext(nil)                     # allow the reused object
+    gArCrumb = 18
     if nb != nil and arPress(nb, "DefaultUIButton"):
       okLog "autoRaid: pressed " & arStepName(gArStep)
       gArLastPressed = nb
@@ -1335,6 +1500,7 @@ proc arTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ar_tick_body", cdecl.}
       gArLastActionMs = now
       arGoto(ArNext1)
       return
+    gArCrumb = 13
     if not arSideActive():
       # (b) NO SCREEN. Either its show event never came, or a human answered it.
       # Not an error -- but never claimed as a success either.
@@ -1353,24 +1519,27 @@ proc arTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ar_tick_body", cdecl.}
     var names = ""
     var why = ""
     let want = iLower(arTrim(gArSide))
+    gArCrumb = 14
     let pressed = arPressSideUnder(gArSideTr, want, nSeen, names, why)
     if not gArSideNamesLogged and nSeen > 0:
-      # THE NAME CENSUS, once. The captions on this screen are
-      # DefaultUIButton._text and not TMP, so this host cannot read them without
-      # an offset it has not measured; the object names it CAN read are printed
-      # here so the next run settles what these controls are called.
+      # THE CANDIDATE CENSUS, once: every node INSIDE a `pmc`/`scav` container
+      # that carries a pressable component, with the caption a person actually
+      # reads on it (`DefaultUIButton._text` @0xB8, offset from fldoff.py).
+      # This is what turns the next refusal into evidence instead of a shrug.
       gArSideNamesLogged = true
-      info "autoRaid SIDE: " & $nSeen & " ACTIVE node(s) under the live side " &
-           "screen: " & names & " -- wanted a name containing \"" & want &
-           "\" (`autoRaidSide`). These are OBJECT NAMES, not captions: the " &
-           "captions here are DefaultUIButton._text, not TMP text."
+      info "autoRaid SIDE: " & $nSeen & " pressable node(s) inside the " &
+           "`pmc`/`scav` container(s): " & names & " -- wanted a CAPTION " &
+           "containing \"" & want & "\" (`autoRaidSide`), with the object " &
+           "name as fallback only."
     if pressed:
       gArSidePresses = gArSidePresses + 1
       gArSidePressedMs = now
       gArLastActionMs = now
       okLog "autoRaid: step SIDE -- pressed the side control matching \"" &
             want & "\" under the live MatchMakerSideSelectionScreen (" &
-            $nSeen & " active node(s) examined)."
+            $nSeen & " pressable candidate(s) examined). PRESSED IS NOT " &
+            "ADVANCED: the readback is this screen going INACTIVE after its " &
+            "NEXT, and then MatchmakerOfflineRaidScreen::Show (uihooks site 0)."
     elif now - gArSideLogMs > 5000'u64:
       gArSideLogMs = now
       warn "autoRaid SIDE: the side selector is up and NOTHING was pressed -- " &
@@ -1380,6 +1549,7 @@ proc arTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ar_tick_body", cdecl.}
   if gArStep == ArSelectMap:
     # THE OTHER HALF OF THE SIDE READBACK, asserted once and as a NEGATIVE.
     if gArSideTr != nil:
+      gArCrumb = 15
       if arSideActive():
         warn "autoRaid: READBACK FAILED -- the side selector is STILL ACTIVE " &
              "after its NextButton was pressed. The map list may not be what " &
@@ -1389,6 +1559,7 @@ proc arTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ar_tick_body", cdecl.}
         okLog "autoRaid: READBACK -- the MatchMakerSideSelectionScreen is no " &
               "longer active after NEXT; the side step is complete."
       gArSideTr = nil
+    gArCrumb = 16
     if arSelectMap():
       okLog "autoRaid: selected map \"" & gArMap & "\""
       gArLastActionMs = now
@@ -1792,6 +1963,9 @@ proc autoRaidDrainTick() =
   if cArTickGuarded(nil) == nil:
     inc gArFaults
     warn "autoRaid: the guarded tick body faulted (" & $gArFaults & " of " &
-         $ArMaxFaults & ")"
+         $ArMaxFaults & ") at step " & arStepName(gArStep) & ", in: " &
+         arCrumbName(gArCrumb) & ". The crumb is set immediately before each " &
+         "operation that touches live managed memory, so this names WHERE it " &
+         "died rather than only THAT it died."
     if gArFaults >= ArMaxFaults:
       arFail("too many faults")

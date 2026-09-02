@@ -6857,3 +6857,40 @@ Also worth keeping: the "false settle" in the same run -- run.py reported
 REACHED MENU off natesp's no-GameWorld phase while the client was still on the
 character screen. A readiness signal borrowed from an unrelated feature is not a
 readiness signal.
+
+## 2026-09-02: the side selector's `PMCs` is a CONTAINER, and the control is deeper than a flat walk reaches
+
+MEASURED live on the 4,743,680-byte build (which otherwise went further than any
+run so far: modeskip's one-tick rule survived boot with
+`answering showing 1 on tick +1 after its ShowSlot burst ended`; PRE-MENU's
+BackButton path produced `READBACK: the MenuScreen PlayButton is ACTIVE and
+PRESSABLE again`; PLAY pressed; uihooks site 3 fired). The SIDE step then failed
+nine times, and its own census says why -- 24 ACTIVE nodes at depth 6 from the
+screen:
+
+    [Logo][CaptionsHolder][MainCaption][SubCation][PMCs][PMCPlayerMV]
+    [PlayerMVObject][Lights][Fill Light][Main Light][Down Light][Hair Light]
+    [Camera_matchmaker][MenuPlayer][Mesh][USEC_head_Hugh] .. [pistol_holster]
+    [Pants_Usec_AC_Combat_Crye_lod0]
+
+`PMCs` is a **container holding the character MODEL as well as the control**, so
+a flat active-node walk spends its entire cap on mesh nodes and never reaches
+anything pressable. Generalisable: on this screen family, a name census of the
+screen finds the CONTAINERS; the pressable node is inside one, and the walk has
+to be scoped to the container or it drowns in the model.
+
+**`DefaultUIButton._text` @`0xB8`** (from `tools/fldoff.py field DefaultUIButton
+_text`) is the caption a person reads on these controls -- they are NOT TMP
+text. autoraid now walks each `pmc`/`scav` container, probes each node for a
+`DefaultUIButton` or `AnimatedToggle`, logs every hit as
+`[name Type caption=...]`, and matches on the CAPTION; the object NAME is a
+fallback used only when no caption could be read, and saying so out loud,
+because names on this build have been measured to lie
+(`CharacterSlotView_pvp` is labelled "PvE").
+
+Also from that run: `autoRaid: the guarded tick body faulted (1 of 3)` fired
+during PRE-MENU and named neither the step nor the operation, spending a third
+of the session's fault budget for no information. autoraid now carries an
+integer CRUMB (an int, not a string -- a string literal assignment on the live
+path allocates) set immediately before every operation that touches live managed
+memory, and the fault line reads `... at step X, in: <operation>`.
