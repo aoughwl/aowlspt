@@ -130,6 +130,12 @@ const
                                 ## enough that a truncation is visibly AT the
                                 ## cap in the refusal, rather than looking like
                                 ## an absence.
+  ArLocDepth      = 8           ## descent from the location screen to a tile's
+                                ## `Button Panel -> AnimatedToggle` (depth 5
+                                ## measured live).
+  ArMaxTiles      = 96          ## ACTIVE nodes collected on that screen. There
+                                ## is one tile per map plus the templates, so a
+                                ## count at the cap is visible in the refusal.
   ArMaxSideConts  = 8           ## pmc/scav containers examined.
   ArMaxSideProbe  = 40          ## nodes GetComponent-probed INSIDE one
                                 ## container. Bounded because each probe
@@ -232,6 +238,15 @@ var gArSideFires = 0               ## side-screen show events observed while arm
 var gArSideTr: Il2CppPtr = nil     ## the live side screen's Transform, from the
                                    ## receiver the GAME handed us in RCX
 var gArSideNamesLogged = false     ## the control-name census, once per session
+var gArLocEpoch = 0                ## last seen uihooks site-4 epoch
+var gArLocFires = 0                ## location-screen show events while armed
+var gArLocTr: Il2CppPtr = nil      ## the live location screen's Transform
+var gArLocPressed = false          ## the wanted map tile was pressed
+var gArLocPressedMs = 0'u64        ## when (readback clock)
+var gArLocNextDone = false         ## this screen's own NextButton was pressed
+var gArLocNextMs = 0'u64
+var gArLocLogMs = 0'u64            ## rate limiter for the tile census
+var gArLocNamesLogged = false      ## the tile-name census, once per session
 var gArSideNextDone = false        ## this screen's own NextButton was pressed
 var gArSideNextMs = 0'u64          ## when it was pressed (readback clock)
 var gArOffEpoch = 0                ## last seen uihooks site-0 epoch (offline raid)
@@ -290,6 +305,12 @@ proc arCrumbName(c: int): string =
   of 26: "PRE-MENU: walking the SettingsScreen subtree for BackButton"
   of 27: "PRE-MENU: GetComponent probe on a back-control candidate"
   of 28: "PRE-MENU: firing the BackButton OnClick"
+  of 29: "SELECT-MAP: breadth-first walk of the location screen for tiles"
+  of 30: "SELECT-MAP: reading a tile's Label TMP text"
+  of 31: "SELECT-MAP: setting the map tile's AnimatedToggle"
+  of 32: "SELECT-MAP: pressing this screen's own NextButton"
+  of 33: "SELECT-MAP: the location-screen INACTIVE readback"
+  of 34: "reading the location-screen show epoch (uihooks site 4)"
   else:  "unknown (" & $c & ")"
 
 proc arStepName(s: int): string =
@@ -1160,6 +1181,106 @@ proc arPressSideUnder(scr: Il2CppPtr; want: string; nSeen: var int;
            "prologue snapshot, or the component's native half is null)"
          else: " (its OnClick UnityEvent could not be resolved and validated)")
 
+proc arLabelUnderName(node: Il2CppPtr; name: string; depth: int): string =
+  ## The TMP text of the first descendant named `name`, found LEVEL BY LEVEL.
+  ## "" is NOT FOUND or NOT READABLE and must never be treated as a match -- an
+  ## empty string compares equal to nothing useful, which is how a check that
+  ## cannot fail gets written.
+  result = ""
+  var hits: seq[Il2CppPtr] = @[]
+  var b = ArNodeBudget
+  arCollectBFS(node, depth, b, cNowMs() + ArWalkMs, hits, 24, "")
+  var i = 0
+  while i < hits.len:
+    if iObjName(hits[i]) == name:
+      let tmp = splTmpOf(hits[i])
+      if tmp != nil:
+        let t = arTrim(splTmpText(tmp))
+        if t.len > 0: return t
+    i = i + 1
+
+proc arLocScreen(): Il2CppPtr =
+  ## The live LOCATION LIST, as a Transform, from the RECEIVER THE GAME HANDED
+  ## US at `MatchMakerSelectionLocationScreen::Show` (uihooks site 4). Never a
+  ## name search: the screen's GameObject is called "Matchmaker Location
+  ## Selection", with SPACES, which no single-token name search can express.
+  result = nil
+  let self = uihSelf(UihSiteLocation)
+  if self == nil: return
+  let tr = iToTransform(self)
+  if tr == nil or not duOk(tr, 0x20'i32): return
+  result = tr
+
+proc arLocActive(): bool =
+  let tr = arLocScreen()
+  if tr == nil: return false
+  let a = iActiveInHierarchy(tr)
+  result = a[0] and a[1]
+
+proc arPressMapTileUnder(scr: Il2CppPtr; want: string; nTiles: var int;
+                         names: var string; why: var string): bool =
+  ## Press the location tile whose DISPLAYED NAME is `want` (`autoRaidMap`).
+  ##
+  ## THE STRUCTURE, read off the live screen with the inspector (2026-09-02),
+  ## not guessed:
+  ##
+  ##   Matchmaker Location Selection
+  ##     +- Content -> Map -> Image
+  ##     |    +- "Location Template(Clone)"   <- ONE PER MAP, all identically
+  ##     |         |                             named, so the OBJECT NAME
+  ##     |         |                             cannot select a map
+  ##     |         +- Info -> Text            <- reads "NOT AVAILABLE" etc,
+  ##     |         |                             a STATUS, not the map name
+  ##     |         +- Button Panel
+  ##     |              +- AnimatedToggle     <- EFT.UI.AnimatedToggle, the
+  ##     |                   +- SizeLabel        control
+  ##     |                        +- Label    <- TMP, reads "WOODS"
+  ##     +- ScreenDefaultButtons -> NextButton, BackButton
+  ##
+  ## So the map is chosen by the TEXT A PERSON READS on the toggle's Label, the
+  ## tile's own `Info -> Text` is a red herring (it is the availability status),
+  ## and the press is a TOGGLE -- which is why it must go through `Toggle::Set`
+  ## and not through a UnityEvent at a guessed offset.
+  ##
+  ## Every tile name seen is reported, so a refusal names the maps that WERE on
+  ## offer instead of only the one that was wanted.
+  result = false
+  nTiles = 0
+  names = ""
+  why = ""
+  if scr == nil:
+    why = "no live location screen"
+    return false
+  var toggles: seq[Il2CppPtr] = @[]
+  var b = ArNodeBudget
+  gArCrumb = 29
+  arCollectBFS(scr, ArLocDepth, b, cNowMs() + ArWalkMs, toggles, ArMaxTiles, "")
+  var i = 0
+  while i < toggles.len:
+    if iObjName(toggles[i]) == "AnimatedToggle":
+      nTiles = nTiles + 1
+      gArCrumb = 30
+      let lbl = arLabelUnderName(toggles[i], "Label", ArMapDepth)
+      if names.len < 620:
+        names = names & "[" & (if lbl.len > 0: lbl else: "<unreadable>") & "]"
+      if lbl.len > 0 and iLower(arTrim(lbl)) == want:
+        gArCrumb = 31
+        if arPress(toggles[i], "AnimatedToggle"):
+          okLog "autoRaid SELECT-MAP: pressed the tile whose Label reads \"" &
+                lbl & "\" (EFT.UI.AnimatedToggle, via Toggle::Set). Tiles " &
+                "offered: " & names
+          return true
+        why = "the tile whose Label reads \"" & lbl & "\" matched, but its " &
+              "AnimatedToggle could not be set (Toggle::Set unverified, or " &
+              "the component's native half is null)"
+        return false
+    i = i + 1
+  why = "no location tile under the live screen has a Label reading \"" &
+        want & "\" (`autoRaidMap`). " & $nTiles & " tile toggle(s) examined; " &
+        "the maps ON OFFER are " &
+        (if names.len > 0: names else: "<none readable>") &
+        ". NOTHING WAS PRESSED -- match one of those"
+
 proc arActiveCensus(root: Il2CppPtr; depth: int; count: var int;
                     into: var string) =
   ## Names of the ACTIVE nodes at depth <= `depth` under `root`. The honest
@@ -1409,6 +1530,34 @@ proc arTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ar_tick_body", cdecl.}
       info "autoRaid: MatchMakerSideSelectionScreen::Show fired (uihooks " &
            "site 3, epoch " & $sep & ") while at step " & arStepName(gArStep) &
            "; noted, no resynchronisation (that step is already past it)."
+  # THE LOCATION LIST'S OWN SHOW EVENT. MEASURED 2026-09-02: the side selector's
+  # NextButton lands DIRECTLY on this screen -- there is no NEXT to press to
+  # reach it, which is why the old NEXT->location step timed out against a
+  # census that already read `[Matchmaker Location Selection]`. So its arrival
+  # is an event, the receiver comes with it, and the machine goes straight to
+  # SELECT-MAP.
+  gArCrumb = 34
+  let lep = uihEpoch(UihSiteLocation)
+  if lep != gArLocEpoch:
+    gArLocEpoch = lep
+    gArLocFires = gArLocFires + 1
+    gArLocTr = arLocScreen()
+    gArLocPressed = false
+    gArLocNextDone = false
+    if gArStep == ArSide or gArStep == ArNext1 or gArStep == ArSelectMap:
+      okLog "autoRaid: READBACK -- MatchMakerSelectionLocationScreen::Show " &
+            "fired (uihooks site 4, epoch " & $lep & "). The location list is " &
+            "UP, which is an observation, not a guess, and its receiver came " &
+            "with the event (screen transform 0x" &
+            hexOf(cast[uint64](gArLocTr)) & "). Going straight to SELECT-MAP; " &
+            "NEXT->location is SKIPPED because there is nothing to press to " &
+            "reach a screen that is already here."
+      gArLastPressed = nil
+      arGoto(ArSelectMap)
+    else:
+      info "autoRaid: MatchMakerSelectionLocationScreen::Show fired (uihooks " &
+           "site 4, epoch " & $lep & ") while at step " & arStepName(gArStep) &
+           "; noted, no resynchronisation."
   gArCrumb = 1
   let ep = uihEpoch(UihSiteOfflineRaid)
   if ep != gArOffEpoch:
@@ -1889,9 +2038,96 @@ proc arTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ar_tick_body", cdecl.}
         okLog "autoRaid: READBACK -- the MatchMakerSideSelectionScreen is no " &
               "longer active after NEXT; the side step is complete."
       gArSideTr = nil
+
+    if gArLocTr != nil:
+      # THE EVENT-DRIVEN PATH: the screen came from site 4, so everything here
+      # is scoped to the receiver the game handed us. No root hunt, no
+      # name search for a GameObject whose name contains spaces.
+      if gArLocPressed and not gArLocNextDone:
+        gArCrumb = 32
+        var seen = 0
+        var seenNames = ""
+        let nb = arFindActiveNamedBFS(gArLocTr, "NextButton", ArSideNextDepth,
+                                      ArMaxSideNext, seen, seenNames)
+        if nb == nil:
+          if now - gArLocLogMs > 5000'u64:
+            gArLocLogMs = now
+            warn "autoRaid SELECT-MAP: the map was chosen but NO ACTIVE node " &
+                 "named `NextButton` was found under the site-4 receiver " &
+                 "(0x" & hexOf(cast[uint64](gArLocTr)) & ") -- BFS, depth " &
+                 $ArSideNextDepth & ", cap " & $ArMaxSideNext & ", examined " &
+                 $seen & " ACTIVE node(s): " &
+                 (if seenNames.len > 0: seenNames else: "<none>") &
+                 ". NOTHING WAS PRESSED."
+          return
+        if arPress(nb, "DefaultUIButton"):
+          gArLocNextDone = true
+          gArLocNextMs = now
+          gArLastPressed = nb
+          gArLastActionMs = now
+          okLog "autoRaid: step SELECT-MAP -- pressed THIS screen's own " &
+                "NextButton (EFT.UI.DefaultUIButton, resolved from the site-4 " &
+                "receiver's subtree). PRESSED IS NOT ADVANCED: the readback " &
+                "is this screen going INACTIVE and then " &
+                "MatchmakerOfflineRaidScreen::Show (uihooks site 0)."
+        elif now - gArLocLogMs > 5000'u64:
+          gArLocLogMs = now
+          warn "autoRaid SELECT-MAP: found this screen's ACTIVE `NextButton` " &
+               "but its DefaultUIButton OnClick could not be resolved and " &
+               "validated, so it was NOT pressed."
+        return
+      if gArLocNextDone:
+        gArCrumb = 33
+        if not arLocActive():
+          okLog "autoRaid: READBACK -- the location list is no longer active " &
+                "after its own NextButton; map \"" & gArMap & "\" is " &
+                "committed as far as this host can observe. Waiting for " &
+                "MatchmakerOfflineRaidScreen::Show (uihooks site 0), which " &
+                "resynchronises the machine when it fires."
+          gArOffAwaitMs = now
+          gArLastPressed = nil
+          gArLastActionMs = now
+          arGoto(ArNext2)
+          return
+        if now - gArLocNextMs > ArSideSettleMs:
+          warn "autoRaid SELECT-MAP: the location list is STILL ACTIVE " &
+               $int(now - gArLocNextMs) & "ms after its own NextButton was " &
+               "pressed. The press ran and did not advance the screen; the " &
+               "step timeout will refuse with a census."
+          gArLocNextMs = now
+        return
+      # Not pressed yet: choose the tile by the TEXT A PERSON READS.
+      var nTiles = 0
+      var tileNames = ""
+      var why = ""
+      let want = iLower(arTrim(gArMap))
+      if arPressMapTileUnder(gArLocTr, want, nTiles, tileNames, why):
+        gArLocPressed = true
+        gArLocPressedMs = now
+        gArLastActionMs = now
+      else:
+        if not gArLocNamesLogged and nTiles > 0:
+          gArLocNamesLogged = true
+          info "autoRaid SELECT-MAP: " & $nTiles & " location tile(s) on " &
+               "offer, by the Label a person reads: " & tileNames &
+               " -- wanted \"" & want & "\" (`autoRaidMap`). Tile object names " &
+               "are ALL `Location Template(Clone)` on this build, so the " &
+               "displayed text is the only thing that identifies a map."
+        if now - gArLocLogMs > 5000'u64:
+          gArLocLogMs = now
+          warn "autoRaid SELECT-MAP: " & why & "."
+      return
+
+    # THE FALLBACK PATH: no site-4 receiver (the hook did not bind, or the
+    # screen was reached without its show event). The legacy scan hunts the
+    # AnimatedToggles across the scene roots. It is announced as the fallback
+    # so a run can never quietly be the weaker one.
     gArCrumb = 16
     if arSelectMap():
-      okLog "autoRaid: selected map \"" & gArMap & "\""
+      okLog "autoRaid: selected map \"" & gArMap & "\" via the LEGACY " &
+            "all-roots scan (no site-4 receiver this session -- see the " &
+            "`uihooks:` lines). This is the weaker path: it is not scoped to " &
+            "a screen the game handed us."
       gArLastActionMs = now
       arGoto(ArNext2)
     return
@@ -1937,6 +2173,11 @@ proc arArmOnDemand() =
   # Snapshot the side screen's epoch too: an event from BEFORE this arming is
   # not evidence about this run.
   gArSideEpoch = uihEpoch(UihSiteSideSelect)
+  gArLocEpoch = uihEpoch(UihSiteLocation)
+  gArLocTr = nil
+  gArLocPressed = false
+  gArLocNextDone = false
+  gArLocLogMs = 0'u64
   gArPreTries = 0
   gArPreAttempted = false
   gArPreActMs = 0'u64
@@ -2237,6 +2478,11 @@ proc arWantShowHook() =
   # a poll, and the poll had nothing to look for -- it hunted a
   # `CharacterSelectionScreen` that is not there after PLAY at all.
   uihWant(UihSiteSideSelect)
+  # The LOCATION LIST. Without this the machine has to hunt a screen whose
+  # GameObject name contains spaces, from the scene roots, while a character
+  # model sits in the same subtree -- which is the search that has failed three
+  # times this session.
+  uihWant(UihSiteLocation)
 
 proc arShowHookVerdict() =
   ## Read back whether it actually BOUND, after `uihArm`. Announced either way:
@@ -2244,6 +2490,15 @@ proc arShowHookVerdict() =
   ## falls back to its per-step timeout, which is exactly the failure mode this
   ## change exists to remove.
   if not gArOn and not gInspOn: return
+  if uihBound(UihSiteLocation):
+    okLog "autoRaid: the LOCATION list's show event is LIVE -- " &
+          "MatchMakerSelectionLocationScreen::Show @0x178ACB0 (uihooks site " &
+          "4) is bound, so SELECT-MAP is entered on the screen's own arrival " &
+          "and works from the receiver the game handed us."
+  else:
+    warn "autoRaid: uihooks site 4 (MatchMakerSelectionLocationScreen::Show) " &
+         "did NOT bind, so SELECT-MAP falls back to the LEGACY all-roots " &
+         "toggle scan. The reason is in the `uihooks:` lines above."
   if uihBound(UihSiteSideSelect):
     okLog "autoRaid: the SIDE selector's show event is LIVE -- " &
           "MatchMakerSideSelectionScreen::Show @0x1790180 (uihooks site 3) is " &

@@ -100,14 +100,20 @@ const
     ## the main-menu PLAY button leads to (MEASURED 2026-09-02; the screen
     ## after PLAY is this one, NOT CharacterSelectionScreen). A SHOW event, not
     ## a construction event. `autoraid.nim` reads its epoch and its receiver.
-  UihSiteCount = 4
+  UihSiteLocation    = 4
+    ## `EFT.UI.Matchmaker.MatchMakerSelectionLocationScreen::Show(controller)`
+    ## @0x178ACB0, UNIQUE. RCX = the live screen -- the LOCATION LIST, which the
+    ## side selector's own NextButton lands on DIRECTLY (MEASURED 2026-09-02:
+    ## there is no NEXT to press to reach it). Note the word order of the type
+    ## name; "LocationSelection" matches only a coroutine class.
+  UihSiteCount = 5
     ## Must equal `aowl_uih_site_count()`. Checked at arm time and logged as a
     ## REFUSAL if it ever drifts, rather than silently indexing past the table.
   UihMaxDispatchFaults = 3
     ## After this many faulted dispatches into one site, stop dispatching to it.
 
 ## Per-site state. All plain integers; nothing here is a managed object.
-var gUihSlot:   array[UihSiteCount, int] = [-1, -1, -1, -1]  ## detour slot, -1 = unbound
+var gUihSlot:   array[UihSiteCount, int] = [-1, -1, -1, -1, -1]  ## detour slot, -1 = unbound
 var gUihWant:   array[UihSiteCount, bool]            ## a feature subscribed
 var gUihFires:  array[UihSiteCount, int]             ## postfix firings
 var gUihEpoch:  array[UihSiteCount, int]             ## firings with a GOOD receiver

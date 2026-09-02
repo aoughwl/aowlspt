@@ -59,6 +59,7 @@
 #define AOWL_UIH_SITE_MENU_SCREEN  1
 #define AOWL_UIH_SITE_MENU_SHOW    2
 #define AOWL_UIH_SITE_SIDE_SELECT  3
+#define AOWL_UIH_SITE_LOCATION     4
 
 /* Why the last `aowl_uih_site_at` returned NULL. A refusal must name itself;
  * "returned NULL" is not a diagnosis (CLAUDE.md 6). */
@@ -233,6 +234,46 @@ static const AowlUihSite aowl_uih_sites[] = {
     { "EFT.UI.Matchmaker.MatchMakerSideSelectionScreen::Show", 0x1790180u,
       { 0x48,0x89,0x5C,0x24,0x08, 0x57, 0x48,0x83,0xEC,0x30,
         0x80,0x3D,0x79,0xE5,0x92,0x05 }, 16, 1 },
+
+    /* [4] EFT.UI.Matchmaker.MatchMakerSelectionLocationScreen::Show(
+     *         SelectionLocationScreenController controller)
+     *
+     * APPENDED AT THE END, like [3]: every index here is positional.
+     *
+     * MEASURED 2026-09-02: the side selector's own NextButton lands DIRECTLY on
+     * the location list -- autoraid pressed it, read back
+     * `the MatchMakerSideSelectionScreen is no longer active`, and then its
+     * NEXT->location step timed out with the census showing
+     * `Menu UI active(depth<=2)=3: [UI][Matchmaker Location Selection]
+     *  [Operation Queue Indicator]`. There is no NEXT to press to REACH that
+     * screen; it is already up. So its arrival is an event, and this is it.
+     *
+     * NOTE THE TYPE NAME'S WORD ORDER: `MatchMakerSelectionLocationScreen`,
+     * not `...LocationSelectionScreen`. Searching the metadata for
+     * "LocationSelection" finds only a compiler-generated coroutine class
+     * (`<ShowMatchmakerLocationSelection>d__58`) and would read as absent.
+     *
+     *   RVA         0x178ACB0   (VA 0x18178ACB0)
+     *   sharedness  UNIQUE (owners=1)  -- safe to DETOUR, not merely to call
+     *   section     il2cpp
+     *   attrs       the 1-arg controller overload, the same shape as [0]/[3];
+     *               the type also declares a 3-arg Show @0x178AD40.
+     *   arity 1     RCX=this(MatchMakerSelectionLocationScreen)
+     *               RDX=SelectionLocationScreenController
+     *               R8 =MethodInfo* (NULL ok -- not generic)
+     *
+     *   48 89 5C 24 08     mov  [rsp+0x08], rbx        (5)
+     *   57                 push rdi                    (1) -> 6
+     *   48 83 EC 30        sub  rsp, 0x30              (4) -> 10
+     *   80 3D 22 3A 93 05 00  cmp byte [rip+0x05933A22], 0 (7) -> 17
+     *
+     *   BYTE-FOR-BYTE THE SAME SHAPE AS [0] AND [3]: 17-byte steal, and the
+     *   only relative operand is the RIP-relative displacement of the `cmp`,
+     *   which `aowl_copy_relocated` fixes up. No relative BRANCH is cut, so
+     *   relocatable=1 for exactly the same reason. */
+    { "EFT.UI.Matchmaker.MatchMakerSelectionLocationScreen::Show", 0x178ACB0u,
+      { 0x48,0x89,0x5C,0x24,0x08, 0x57, 0x48,0x83,0xEC,0x30,
+        0x80,0x3D,0x22,0x3A,0x93,0x05 }, 16, 1 },
 };
 
 #define AOWL_UIH_SITE_COUNT \

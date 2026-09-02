@@ -7363,3 +7363,50 @@ receiver) -> readback: side screen inactive -> the active Menu UI screen is
 sites 2/3, Toggle::Set postfix) with a finished-state readback; the whole
 chain from the menu to the location screen takes ~2.7s of host time. Maps
 diag now reads `draw:INCONCLUSIVE` at the menu (was FAIL).
+
+## 2026-09-02: the location list arrives on its own, and its tiles are identified ONLY by displayed text
+
+MEASURED live on the 4,809,728-byte build: SIDE worked end to end
+(`pressed the AnimatedToggle ... for side "pmc"`, `pressed THIS screen's own
+NextButton`, `READBACK -- the MatchMakerSideSelectionScreen is no longer
+active`), and then NEXT->location timed out with the census reading
+`Menu UI active(depth<=2)=3: [UI][Matchmaker Location Selection][Operation Queue
+Indicator]`. **The side screen's NEXT lands directly on the location list**, so
+there is no NEXT to press to reach it and the old step could only ever refuse.
+
+**`EFT.UI.Matchmaker.MatchMakerSelectionLocationScreen::Show(SelectionLocationScreenController)`
+-- RVA `0x178ACB0`, arity 1, `sharedness=UNIQUE owners=1`, section `il2cpp`.**
+Prologue `48 89 5C 24 08 | 57 | 48 83 EC 30 | 80 3D 22 3A 93 05 00`: byte-for-byte
+the shape of sites 0 and 3, 17-byte steal, only a RIP-relative `cmp` to relocate.
+It is now **uihooks site 4**. NOTE THE WORD ORDER -- `MatchMakerSelectionLocationScreen`,
+not `...LocationSelectionScreen`; searching the metadata for "LocationSelection"
+finds only the coroutine class `<ShowMatchmakerLocationSelection>d__58` and reads
+as absent.
+
+**The tile structure, read live with `tree` / `components` / `label`:**
+
+    Matchmaker Location Selection            (GameObject name HAS SPACES --
+      +- Content -> Map -> Image              no single-token name search
+      |    +- "Location Template(Clone)"      can express it)
+      |         +- (EFT.UI.LocationButton on the tile itself)
+      |         +- Info -> Text        = "NOT AVAILABLE"   <- a STATUS, not the
+      |         |                                             map name
+      |         +- Button Panel
+      |              +- AnimatedToggle  (EFT.UI.AnimatedToggle,
+      |                   +- SizeLabel   EFT.UI.UISpawnableToggle, Image,
+      |                        +- Label  Animator, layout components)
+      |                                  Label TMP reads "WOODS"
+      +- ScreenDefaultButtons -> NextButton, BackButton
+
+**Every tile is named `Location Template(Clone)`**, so the object name cannot
+select a map; the only identifier is the toggle's `SizeLabel -> Label` TMP text
+(uppercase, e.g. "WOODS"). The tile's own `Info -> Text` is a red herring -- it
+is the availability status. The control is another `EFT.UI.AnimatedToggle`, so
+it must be pressed through `Toggle::Set`, not through a UnityEvent at a guessed
+offset (the crash fixed earlier the same night).
+
+autoraid now enters SELECT-MAP on the site-4 event with the receiver in hand,
+picks the tile by displayed Label, logs every map on offer, presses this
+screen's own `ScreenDefaultButtons -> NextButton`, and reads back the screen
+going INACTIVE before waiting on site 0. The legacy all-roots toggle scan
+remains as a fallback and announces itself as the weaker path.
