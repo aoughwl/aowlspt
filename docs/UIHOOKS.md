@@ -60,6 +60,7 @@ The game was never run to obtain them.
 |---|---|---|---|---|---|
 | 0 | `EFT.UI.Matchmaker.MatchmakerOfflineRaidScreen::Show(OfflineRaidScreenController)` | `0x1788590` | **UNIQUE** | `48 89 5C 24 08 57 48 83 EC 30 80 3D 2F 61 93 05` | `splrebrand.nim` |
 | 1 | `EFT.UI.MenuScreen::Awake()` | `0x1538360` | **UNIQUE** | `40 53 48 83 EC 20 80 3D 2D 55 B8 05 00 48 8B D9` | *(nobody yet)* |
+| 2 | `EFT.UI.MenuScreen::Show(MatchmakerPlayersController, ExpansionsPlayerInfo, GameModeDescriptor, Profile, SeasonalRewardController)` | `0x15387A0` | **UNIQUE** | `48 89 5C 24 10 48 89 74 24 18 48 89 4C 24 08 57` | `modload.nim` (the deferred mod release gate) |
 
 Both steal 17 / 16 bytes respectively; the only relative operand cut is a
 RIP-relative `cmp byte [rip+…],0` displacement, which `aowl_copy_relocated`
@@ -232,6 +233,14 @@ Both act on children of `EFT.UI.MenuScreen`.
 
 **Do not** promote `MenuScreen::Show` @`0x1538760` into the table to get a truer
 event without first solving the `jcc rel8` steal — see §2.
+
+**Site 2 is the way round that**, added 2026-09-01: the PRIVATE 5-arg
+`MenuScreen::Show` overload @`0x15387A0` that the public one calls. Its 15-byte
+steal is three `mov [rsp+disp8],reg` plus `push rdi` — **no relative operand at
+all** — and it takes the `Profile`, so it cannot run before a profile has been
+chosen. `modload.nim` subscribes by POLLING `uihEpoch(UihSiteMenuShow)` from its
+existing per-frame tick rather than by being dispatched, deliberately: releasing
+the mods means `modhost.loadAll`, which must not run inside a detour postfix.
 
 ### 5c. Verify, do not assume
 

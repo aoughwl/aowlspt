@@ -57,6 +57,7 @@
 /* Site ids. These are the ONLY values a feature passes to `uihWant`. */
 #define AOWL_UIH_SITE_OFFLINE_RAID 0
 #define AOWL_UIH_SITE_MENU_SCREEN  1
+#define AOWL_UIH_SITE_MENU_SHOW    2
 
 /* Why the last `aowl_uih_site_at` returned NULL. A refusal must name itself;
  * "returned NULL" is not a diagnosis (CLAUDE.md 6). */
@@ -144,6 +145,47 @@ static const AowlUihSite aowl_uih_sites[] = {
     { "EFT.UI.MenuScreen::Awake", 0x1538360u,
       { 0x40,0x53, 0x48,0x83,0xEC,0x20,
         0x80,0x3D,0x2D,0x55,0xB8,0x05,0x00, 0x48,0x8B,0xD9 }, 16, 1 },
+
+    /* [2] EFT.UI.MenuScreen::Show(MatchmakerPlayersController matchmaker,
+     *         ExpansionsPlayerInfo expansionsInfo,
+     *         GameModeDescriptor modeDescriptor, Profile profile,
+     *         SeasonalRewardController seasonalRewardController)
+     *
+     *   RVA         0x15387A0   (VA 0x1815387A0)
+     *   sharedness  UNIQUE (owners=1)  -- safe to DETOUR, not merely to call
+     *   section     il2cpp
+     *   attrs       PRIVATE|HIDEBYSIG (non-virtual)
+     *   arity 5     RCX=this(MenuScreen) ... R9=Profile, 5th on the stack,
+     *               then MethodInfo*. We read RCX only.
+     *
+     *   48 89 5C 24 10     mov  [rsp+0x10], rbx        (5)
+     *   48 89 74 24 18     mov  [rsp+0x18], rsi        (5) -> 10
+     *   48 89 4C 24 08     mov  [rsp+0x08], rcx        (5) -> 15
+     *   57                 push rdi                    (1) -> 16
+     *   41 54 41 55 41 56 41 57  push r12..r15         (8) -> 24
+     *
+     *   AOWL_JMP_SIZE is 14 and the first instruction boundary at or past 14
+     *   is 15, so the steal is 15 bytes. Those bytes contain NO relative
+     *   operand of any kind -- not even a RIP-relative displacement -- so
+     *   `aowl_copy_relocated` has nothing to fix up. This is a STRICTLY
+     *   easier relocation than sites [0] and [1].
+     *
+     *   WHY THIS ONE AND NOT `Show(MainMenuBaseScreenController)` @0x1538760,
+     *   which is the public virtual entry point: that one's 14-byte steal cuts
+     *   across a `jcc rel8` and cannot be relocated (see [1]'s note). This
+     *   PRIVATE 5-arg overload is what the public one calls to actually show
+     *   the menu, and it takes the `Profile` -- so it CANNOT run before a
+     *   profile has been chosen. That property is why `modload.nim` gates the
+     *   deferred mod release on it: it is a real "the main menu is coming up
+     *   with a profile" event, not a construction event like [1].
+     *
+     *   HONEST LIMIT: "the 5-arg Show was entered" is not the same claim as
+     *   "the menu is fully laid out and interactive". It is a POSTFIX, so the
+     *   body has run, but children the menu populates asynchronously may not
+     *   exist yet. It is used here only as an ORDERING fact. */
+    { "EFT.UI.MenuScreen::Show(5-arg)", 0x15387A0u,
+      { 0x48,0x89,0x5C,0x24,0x10, 0x48,0x89,0x74,0x24,0x18,
+        0x48,0x89,0x4C,0x24,0x08, 0x57 }, 16, 1 },
 };
 
 #define AOWL_UIH_SITE_COUNT \

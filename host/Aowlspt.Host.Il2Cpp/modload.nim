@@ -899,18 +899,75 @@ proc mlRefresh(lines: seq[string]) =
     discard nuSetText(gModLoadRows[i],
                       (if i + 1 < lines.len: lines[i + 1] else: ""))
 
-proc modLoadReleaseMods(why: string) =
+proc mlSinceBoot(t: uint64): string =
+  ## `t` as seconds since the deferral started, to one decimal. Returns "?" when
+  ## there is no origin to measure from, rather than printing a raw epoch that
+  ## reads like a duration.
+  if t == 0'u64 or gModLoadDeferredAt == 0'u64 or t < gModLoadDeferredAt:
+    return "?"
+  let ms = t - gModLoadDeferredAt
+  result = $(ms div 1000'u64) & "." & $((ms mod 1000'u64) div 100'u64) & "s"
+
+proc mlGateOpen(): bool =
+  ## HAS THE MAIN MENU BEEN SHOWN AT LEAST ONCE?
+  ##
+  ## The gate is open when either
+  ##   * it was never armed (`gModLoadGateOn` false -- the hook did not bind, or
+  ##     deferral is off), in which case this is the OLD behaviour and the boot
+  ##     log has already said so loudly; or
+  ##   * `EFT.UI.MenuScreen::Show(5-arg)` has fired at least once with a live
+  ##     receiver.
+  ##
+  ## It is NOT a timer and it does NOT poll the scene for a UI element: the only
+  ## thing read here is an integer the postfix detour increments.
+  if not gModLoadGateOn: return true
+  if gModLoadGateHold: return false
+  result = gModLoadMenuShownAt != 0'u64
+
+proc modLoadReleaseMods(why: string; force: bool = false) =
   ## Load the mods that boot deliberately skipped.
   ##
-  ## Called on exactly two paths, and BOTH must exist:
-  ##   * the build reported ready -- the intended one;
-  ##   * the deadline expired -- the safety net.
-  ## `why` names which, in the log, because "my mods are missing" and "my mods
-  ## loaded four minutes late" have completely different causes and a single
-  ## message for both would hide that.
+  ## Called on four paths now, and all of them must exist:
+  ##   * the build reported ready              -- the intended one   (GATED)
+  ##   * no build is running at all            -- the cached install (GATED)
+  ##   * the client's load phase ended         -- the screen died    (GATED)
+  ##   * the 240s deadline / the self-disable  -- the safety nets    (FORCED)
+  ##
+  ## THE GATE, and why it is not a timer. MEASURED 2026-09-01: with the mod
+  ## build cached (0.7s) the file reads "MODS READY" before the client is even
+  ## up, so the release landed at 16-22s -- inside the client's own
+  ## character-select / profile-Submit transition -- and the client DIED there
+  ## twice with no crash folder and no dialog (client log ends at "Session
+  ## mode: Regular"). Every run that survived released after the main menu was
+  ## up. A timer tuned to "after 25s" would encode that measurement as a
+  ## constant and break on a slower machine; so the release is gated on the
+  ## EVENT instead, and the deadline below remains the only clock involved.
+  ##
+  ## `force` is for the safety nets ONLY. Failing towards "your mods work"
+  ## outranks this gate: a gate that can withhold every mod for ever is worse
+  ## than the crash it prevents.
   if gModsReleased or gModsDirDeferred.len == 0:
     return
+  if not force and not mlGateOpen():
+    # HOLD. Remember the FIRST reason -- it is the one that is true; a later
+    # tick's reason is just the same condition observed again.
+    if gModLoadPendingWhy.len == 0:
+      gModLoadPendingWhy = why
+      gModLoadPendingAt = cNowMs()
+      okLog "mod loading: release HELD -- everything the mod build has to say " &
+            "is in (" & why & "), but EFT.UI.MenuScreen::Show has not fired " &
+            "yet, so the client is still in its character-select / " &
+            "profile-Submit transition. Releasing there killed the client " &
+            "twice on 2026-09-01 with no crash folder and no dialog. The " &
+            "mods are released the moment that show event arrives, or by the " &
+            $int(ModLoadDeferMaxMs div 1000'u64) & "s deadline, whichever is " &
+            "first. Nothing is lost either way."
+    return
   gModsReleased = true
+  if gModLoadPendingWhy.len > 0 and not force:
+    okLog "mod loading: release gated -- READY at " &
+          mlSinceBoot(gModLoadPendingAt) & ", MenuScreen::Show at " &
+          mlSinceBoot(gModLoadMenuShownAt) & ", releasing now"
   okLog "mod loading: releasing deferred mods now -- " & why
   if modhost.loadAll(gModsDirDeferred, modhost.SideClient,
                      HostName, HostVersion) == 0:
@@ -944,6 +1001,23 @@ proc modLoadTick() =
   if not gModLoad:
     return
   let nowFrame = cNowMs()
+  # THE RELEASE GATE, before every early return below. Two integer compares
+  # when there is nothing to do, and it must run even while the survivor sweep
+  # or the done-gate is short-circuiting the rest of the tick -- a held release
+  # that only drains on the paths that happen to reach the bottom of this proc
+  # is a gate that can stick shut, which is the failure this must not have.
+  if gModLoadGateOn and gModLoadMenuShownAt == 0'u64 and
+     uihEpoch(UihSiteMenuShow) > 0:
+    gModLoadMenuShownAt = nowFrame
+    okLog "mod loading: the main menu SHOW EVENT fired (" &
+          "EFT.UI.MenuScreen::Show 5-arg @0x15387A0, " &
+          $uihEpoch(UihSiteMenuShow) & " good firing(s)) at " &
+          mlSinceBoot(nowFrame) & " after the deferral started. Observed on " &
+          "the frame AFTER the detour, so this time is within one frame, not " &
+          "exact. The release gate is now OPEN."
+  if gModLoadPendingWhy.len > 0 and not gModsReleased and mlGateOpen():
+    let why = gModLoadPendingWhy
+    modLoadReleaseMods(why)
   # THE PENDING TEARDOWN PROOF, before the done-gate. `mlDismiss` deliberately
   # leaves the verdict unfinished, and `gModLoadDone` is only set when the
   # sweep actually runs -- so an early return here would swallow the check
@@ -976,7 +1050,7 @@ proc modLoadTick() =
          "torn down now rather than left over the menu. The mods themselves " &
          "are released by the deadline path, independently of this."
     modLoadReleaseMods("the loading step self-disabled after " &
-                       $MlMaxTries & " polls")
+                       $MlMaxTries & " polls", true)
     # NOTHING BUILT MEANS NOTHING TO TEAR DOWN. Running the teardown+sweep here
     # was cheap but it LIED in the log: a "dismissed ... teardown INCONCLUSIVE"
     # line reads as though something had been on screen and its removal could
@@ -1191,8 +1265,9 @@ proc modLoadTick() =
      now - gModLoadDeferredAt > ModLoadDeferMaxMs:
     modLoadReleaseMods("the build never reported ready within " &
                        $int(ModLoadDeferMaxMs div 1000'u64) & "s, so the " &
-                       "deadline fired. The loading step did not finish; " &
-                       "the mods are loaded anyway rather than lost.")
+                       "deadline fired. The loading step did not finish, or " &
+                       "the main-menu show event never arrived; the mods are " &
+                       "loaded anyway rather than lost.", true)
 
   if gModLoadReadyAt != 0'u64:
     let linger = (if gModLoadFailed: MlFailLingerMs else: MlLingerMs)
@@ -1200,6 +1275,51 @@ proc modLoadTick() =
       mlDismiss((if gModLoadFailed:
                    "the build finished WITH FAILURES and its linger expired"
                  else: "a clean build, after its linger"))
+
+proc modLoadWantShowHook() =
+  ## Subscribe to the main-menu show event. MUST run before the single
+  ## `uihArm`, like every other subscriber -- arming per-feature would install
+  ## a second detour on a shared site and the second would overwrite the
+  ## first's trampoline (CLAUDE.md sec.5).
+  ##
+  ## Only wanted when the release is actually deferred: an unwanted site is
+  ## never patched at all, so a client with `deferModLoad` off carries no extra
+  ## detour for this.
+  if gModLoad and gModLoadDeferMods:
+    uihWant(UihSiteMenuShow)
+
+proc modLoadShowHookVerdict() =
+  ## Read back whether the site REALLY bound, after `uihArm`. This decides
+  ## whether the gate exists at all, and it must be read back rather than
+  ## assumed: `uihWant` is a request, not an outcome.
+  if not (gModLoad and gModLoadDeferMods):
+    return
+  if uihBound(UihSiteMenuShow):
+    gModLoadGateOn = true
+    okLog "mod loading: the deferred mod release is GATED ON AN EVENT -- " &
+          "EFT.UI.MenuScreen::Show(5-arg) @0x15387A0 (UNIQUE, 16-byte " &
+          "prologue matched, POSTFIX). The mods are released when READY is on " &
+          "disk AND that show event has fired at least once, never on a timer " &
+          "and never by polling the scene for a UI element. HARD DEADLINE " &
+          $int(ModLoadDeferMaxMs div 1000'u64) & "s regardless." &
+          (if gModLoadGateHold:
+             " modLoadGateHold IS ON: the show event is IGNORED, so the gate " &
+             "can never open and only the deadline will release. That is the " &
+             "falsification path -- it is NOT a normal setting."
+           else: "")
+  else:
+    gModLoadGateOn = false
+    warn "mod loading: REFUSING TO GATE the deferred mod release -- the " &
+         "show-event hook on EFT.UI.MenuScreen::Show(5-arg) @0x15387A0 did " &
+         "NOT bind (see the uihooks line above for the engine's own reason: " &
+         "prologue mismatch, a different game build, or the drain disabled). " &
+         "FALLING BACK to the OLD behaviour: the mods are released as soon as " &
+         "the build reports READY, WHICH IS THE BEHAVIOUR THAT KILLED THE " &
+         "CLIENT TWICE ON 2026-09-01 when READY was already on disk at boot " &
+         "(release at 16-22s, inside the character-select / profile-Submit " &
+         "transition, no crash folder, no dialog). This is a loud refusal, " &
+         "not a silent degradation. Set deferModLoad: false to avoid it " &
+         "entirely."
 
 proc bindModLoad(verbose: bool): bool =
   ## Nothing is detoured: this rides the existing per-frame drain. It resolves

@@ -48,7 +48,7 @@
 #      `cSplTickGuarded`), exactly as `settingsTabInitFired` does for the
 #      settings probe. Opening one here would NEST inside the subscriber's and
 #      DISARM it.
-#   4. capped iteration -- the only loops here are over `UihSiteCount` (2).
+#   4. capped iteration -- the only loops here are over `UihSiteCount` (3).
 #   5. flag-gated default OFF -- nothing is wanted, and therefore nothing is
 #      bound, unless a feature's own default-OFF flag asked for it.
 #   6. self-disable after N faults -- delegated: the subscriber's guard counts
@@ -83,14 +83,25 @@ const
     ## `EFT.UI.MenuScreen::Awake()` @0x1538360, UNIQUE. RCX = the live
     ## MenuScreen. A CONSTRUCTION event, not a show event -- see the header and
     ## docs/UIHOOKS.md before subscribing to it.
-  UihSiteCount = 2
+  UihSiteMenuShow    = 2
+    ## `EFT.UI.MenuScreen::Show(MatchmakerPlayersController, ExpansionsPlayerInfo,
+    ## GameModeDescriptor, Profile, SeasonalRewardController)` @0x15387A0,
+    ## UNIQUE. RCX = the live MenuScreen.
+    ##
+    ## This IS a show event, not a construction event: it is the private 5-arg
+    ## overload the public `Show(MainMenuBaseScreenController)` calls, and it
+    ## takes the `Profile`, so it cannot run before a profile has been chosen.
+    ## `modload.nim` uses it as the ORDERING fact that gates the deferred mod
+    ## release -- see the header entry for the honest limit (a postfix on it
+    ## means the body ran, NOT that the menu is fully populated).
+  UihSiteCount = 3
     ## Must equal `aowl_uih_site_count()`. Checked at arm time and logged as a
     ## REFUSAL if it ever drifts, rather than silently indexing past the table.
   UihMaxDispatchFaults = 3
     ## After this many faulted dispatches into one site, stop dispatching to it.
 
 ## Per-site state. All plain integers; nothing here is a managed object.
-var gUihSlot:   array[UihSiteCount, int] = [-1, -1]  ## detour slot, -1 = unbound
+var gUihSlot:   array[UihSiteCount, int] = [-1, -1, -1]  ## detour slot, -1 = unbound
 var gUihWant:   array[UihSiteCount, bool]            ## a feature subscribed
 var gUihFires:  array[UihSiteCount, int]             ## postfix firings
 var gUihEpoch:  array[UihSiteCount, int]             ## firings with a GOOD receiver

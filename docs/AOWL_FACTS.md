@@ -6211,3 +6211,59 @@ is the fault itself -- a batch was handed over and its answers did not reach
 the out file -- plus announcing the self-disable from the thread that decides
 it. Falsified by `python tools/test_inspect_silence.py`, which runs the same
 nine invariants against `git show HEAD:` and requires them to FAIL there.
+
+## 2026-09-01 night: the deferred mod release is now gated on `MenuScreen::Show`, not on READY alone
+
+MEASURED (two boots, `python tools/hostlog.py` + the client's own log under
+`D:\Aowlspt\Logs\`; scratch captures `bootR.out` survived / `bootS.out` died):
+with `deferModLoad` on and the launcher's mod build now CACHED (0.7s), the
+`MODS READY` line is on disk before the client is up, so `modLoadReleaseMods`
+fired at **16-22s** -- inside the client's character-select / profile-Submit
+transition. Two clean client deaths there (client log ends at `Session mode:
+Regular`, no crash folder, no dialog): boot 22:32 released at 22.9s with
+`modSettingsRender` ON and died ~35s; boot 23:00 released at ~16s with
+`modSettingsRender` **OFF** and died by ~19s, the host log's last lines being
+mods' own load-time self-tests (`call-proof:` at 17.078s, `maps diag` at
+18.594s). Every surviving run tonight released either after a ~60s uncached
+build or via the simulator at ~25s, i.e. after the main menu was up.
+
+CONCLUSION (inferred from that correlation, NOT isolated to a single mod):
+the release itself is the hazard when it lands in that window; the second
+death rules out `modSettingsRender` as the sole cause, since it was off.
+
+THE EVENT USED AS THE GATE, resolved OFFLINE (`tools/il2cpp_resolve.py
+D:/Games/Tarkov/GameAssembly.dll .cache/global-metadata.dec.dat`, build
+1.1.0.1.46777; the game was never run):
+
+  `EFT.UI.MenuScreen::Show(MatchmakerPlayersController, ExpansionsPlayerInfo,
+   GameModeDescriptor, Profile, SeasonalRewardController)`
+  RVA `0x15387A0`, `sharedness=UNIQUE owners=1`, section `il2cpp`,
+  attrs PRIVATE|HIDEBYSIG, arity 5. Prologue (measured with `bytes`):
+  `48 89 5C 24 10 | 48 89 74 24 18 | 48 89 4C 24 08 | 57 | 41 54 41 55 ...`
+  -- three `mov [rsp+disp8],reg` then `push rdi`. `AOWL_JMP_SIZE` is 14, so
+  the steal is **15 bytes**, and those bytes contain **no relative operand at
+  all**, not even a RIP-relative displacement. That is a strictly easier
+  relocation than the two sites already in `abi/aowlspt_uihooks.h`.
+
+WHY THIS OVERLOAD and not the obvious ones (all MEASURED offline):
+* `MenuScreen::Show(MainMenuBaseScreenController)` @`0x1538760` is the public
+  virtual entry point but its 14-byte steal cuts a `jcc rel8`, which
+  `aowl_copy_relocated` refuses -- already documented in `docs/UIHOOKS.md` §2
+  and still true. It calls this private 5-arg overload.
+* `MenuScreen::Awake()` @`0x1538360` (site 1) binds fine but is a
+  CONSTRUCTION event, so it says nothing about profile selection.
+* The 5-arg overload takes the `Profile`, so it **cannot** run before a
+  profile has been chosen. That ordering property is the whole point.
+
+HONEST LIMIT: a POSTFIX on it proves the body ran, NOT that the menu is fully
+populated or interactive. It is used only as an ordering fact. And the claim
+"gating here prevents the crash" is **UNVERIFIED** -- the code is built but
+has not been run against the client in this session.
+
+FALSIFICATION, so the gate is not a check that cannot fail: host key
+`modLoadGateHold` (default OFF) makes the tick ignore the show event, so the
+gate can never open and only the 240s deadline releases -- a run with it ON
+must show `release HELD` with `MODS READY` on disk and no mods loaded. With it
+OFF a normal run must show `the main menu SHOW EVENT fired` followed by
+`mod loading: release gated -- READY at Ns, MenuScreen::Show at Ms, releasing
+now`. Both lines carry times, so both can be wrong out loud.
