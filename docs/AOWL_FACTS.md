@@ -8329,3 +8329,14 @@ _profileData@0x178), R9=0` then `[0:00:43.297] MenuScreen::Show fired
 tonight's slot-screen trouble was VALUES: the old code passed a gameMode
 and profile it computed itself, the game's flow then met EGameMode.Pve==1
 where a Profile belongs (the dump's Rax=1). No button press, no search.
+
+## 2026-09-02 13:05 (clock): second fast-path raid; native ESP PASS; exit half refused at the call table
+
+MEASURED (build 4,888,576): `raid Woods` -> `raid phase = DEPLOYED -- LATCHED
+on the TRUE deploy signal` (second time tonight); `natesp VERDICT PASS --
+canvas CREATED(ours) rect=3840.0x2160.0 sortingOrder=32000` -- the
+screen-to-canvas conversion fixed the 42/42 off-screen placement. Exit half:
+`raidExit: MenuScreen::ShowInRaid @0x1539650 did not resolve as callable code
+on this build -- stopping` although the same RVA is bound as uihooks site 7
+at boot (prologue verified, unique): the refusal is in the host's call-target
+table, not the game.
