@@ -7351,3 +7351,15 @@ receiver is not the screen. `arWalkActive` is deliberately left alone elsewhere
 (PRE-MENU's BackButton and the WAIT-MENU searches use it successfully, on
 screens with no model subtree); only the search that demonstrably failed was
 changed.
+
+## 2026-09-02 06:55: host-native raid entry -- four screens proven, location selection next
+
+MEASURED (build 4,809,728): `raid Woods` -> WAIT-MENU -> PLAY pressed ->
+site 3 (MatchMakerSideSelectionScreen::Show) -> SIDE pressed the PMC
+AnimatedToggle via Toggle::Set(true,true) -> pressed the screen's own
+NextButton (EFT.UI.DefaultUIButton, found by level-by-level BFS from the
+receiver) -> readback: side screen inactive -> the active Menu UI screen is
+`Matchmaker Location Selection`. Every step so far is event-driven (uihooks
+sites 2/3, Toggle::Set postfix) with a finished-state readback; the whole
+chain from the menu to the location screen takes ~2.7s of host time. Maps
+diag now reads `draw:INCONCLUSIVE` at the menu (was FAIL).
