@@ -6705,3 +6705,18 @@ Also fixed by the same measurement: WAIT-MENU no longer spends its 180 s bound
 after PRE-MENU has acted and left no overlay and no usable menu -- it refuses
 immediately with the census, because three more minutes cannot change that
 verdict.
+
+## 2026-09-02 02:52: the MenuScreen::Show crash correlates with modeskip's Submit wait
+
+MEASURED across tonight's boots. Surviving boots: `skip mode screen: Submit
+called ... after 15ms / 16ms / 31ms of waiting`. The 02:52 death (host build
+4,728,320, Crash_2026-09-02_065209929, symbolised by run.py as
+`SeasonWidgetData::From @0x141ffd0+0x133 <- MenuScreen::Show @0x15387a0+0x994`):
+`Submit called ... after 0ms of waiting, the last 0ms of it with no further
+ShowSlot`, then MenuScreen::Show never completed (no epoch line, no gated
+release). modeskip's own queue line records that the client's
+RunCharacterSelectionFlow re-shows the screen ~372ms later. Inference, not
+yet proven: submitting on the first showing hands the flow a Profile that is
+still being built; the earlier stale-controller crash (8115849) is the same
+family. A millisecond timer cannot be the gate; the second showing or a
+readiness field is.
