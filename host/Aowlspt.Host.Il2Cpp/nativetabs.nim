@@ -89,6 +89,47 @@ var gNtWhySaid = ""
 ## prints the snapshot.
 var gNtLastAttemptStep = "no attempt has returned yet"
 
+## A GAME CALL WE ENTERED AND HAVE NOT RETURNED FROM.
+##
+## MEASURED FAILURE CLASS, and it is worth naming because nothing else in this
+## host detects it: `CleanupCreatedControls` was entered on all 8 attempts and
+## the crumb after it NEVER ran -- yet there was no SEH fault, and the next
+## tick ran normally with the attempt counter advanced. A call that neither
+## returns to the next line nor trips the guard, while the tick survives, is a
+## MANAGED EXCEPTION (IL2CPP C++ EH) thrown inside the callee and unwound
+## THROUGH our frame back to the game's own Update. Our SEH guard never sees
+## it because it is not an access violation.
+##
+## So the next occurrence must cost one log line, not a round trip: the name is
+## parked before the call and cleared after it, and the next attempt notices a
+## name still parked and says exactly what happened.
+var gNtCallInFlight = ""
+var gNtUnwindSaid = false
+
+proc ntCallBegin(name: string) =
+  gNtCallInFlight = name
+
+proc ntCallEnd() =
+  gNtCallInFlight = ""
+
+proc ntCheckUnwind() =
+  ## Called at the start of each build attempt. A name still parked from the
+  ## PREVIOUS attempt means that call never came back.
+  if gNtCallInFlight.len == 0:
+    return
+  let name = gNtCallInFlight
+  gNtCallInFlight = ""
+  if gNtUnwindSaid:
+    return
+  gNtUnwindSaid = true
+  warn "native tabs: the game call " & name & " DID NOT RETURN -- it was " &
+       "entered on the previous attempt and the statement after it never " &
+       "ran, yet the SEH guard caught nothing and this tick is running " &
+       "normally. That combination is a MANAGED EXCEPTION thrown inside the " &
+       "callee and unwound through our frame (IL2CPP C++ EH), which our " &
+       "access-violation guard cannot see. Treat the call as unsafe on this " &
+       "receiver rather than retrying it."
+
 proc ntCrumb(s: string) =
   ## Set the live crumb AND the durable one, in one call.
   ##
@@ -297,18 +338,25 @@ proc ntBuildOne(screenT, donorSpawnerT, donorPanelT: Il2CppPtr;
     discard modsSetActive(spawnerGo, false)
     return
   ntCrumb("button: SpawnObject() on the cloned spawner -- a call into game code")
+  ntCallBegin("UIAnimatedToggleSpawner::SpawnObject")
   let toggle = nuSpawnerSpawn(spawner)
+  ntCallEnd()
   if toggle == nil:
     ntNoteFault("SpawnObject returned nothing for the '" & header & "' tab")
     discard modsSetActive(spawnerGo, false)
     return
   ntCrumb("button: SetHeaderText / SetActive on the cloned spawner")
+  ntCallBegin("UIAnimatedToggleSpawner::SetHeaderText")
   discard nuSpawnerHeader(spawner, header, 24'i32)
+  ntCallEnd()
   discard nuSpawnerActive(spawner, true)
   # JOIN THE STOCK GROUP. The single most important call in this file: with it,
   # pressing our tab turns the stock ones off natively and vice versa.
   ntCrumb("button: Toggle::set_group -- joining the stock ToggleGroup")
-  if not nuToggleSetGroup(toggle, stockGroup):
+  ntCallBegin("UnityEngine.UI.Toggle::set_group")
+  let joined = nuToggleSetGroup(toggle, stockGroup)
+  ntCallEnd()
+  if not joined:
     ntNoteFault("the new tab's toggle could not join the stock ToggleGroup, " &
                 "so two tabs could read selected at once")
     discard modsSetActive(spawnerGo, false)
@@ -336,55 +384,70 @@ proc ntBuildOne(screenT, donorSpawnerT, donorPanelT: Il2CppPtr;
     discard modsSetActive(panelGo, false)
     discard modsSetActive(spawnerGo, false)
     return
-  # MITIGATION (a) IS NOW OFF, ON LIVE EVIDENCE. This is the fallback the doc
-  # named as the risk, and the measurement picked it.
+  # NEITHER GAME METHOD IS CALLED ON THE CLONE ANY MORE. Both were tried and
+  # both failed the same way, and the second failure is what identified the
+  # class:
   #
-  # WHAT WAS MEASURED: with (a) on, the durable crumb ended at exactly
-  # "panel: Behaviour::set_enabled(false) on the cloned GameSettingsTab" on
-  # all 8 attempts, the `panel clone` line never printed, and there was NO
-  # fault line -- so the guard caught nothing and the two calls between that
-  # crumb and the next simply never both returned. Disabling a live
-  # `GameSettingsTab` before its first show is the one thing there that is
-  # not a plain read.
+  #   (a) `Behaviour::set_enabled(false)` -- crumb stopped there, 8 of 8.
+  #   (b) `SettingsTab::CleanupCreatedControls` -- crumb stopped at ENTERING,
+  #       `RETURNED` never ran, 8 of 8, NO SEH fault, and the next tick ran
+  #       normally with the attempt counter advanced.
   #
-  # WHY (b) IS KEPT: the clone still carries the donor's rows and they must
-  # go, or our tab shows Game Settings under our name. `CleanupCreatedControls`
-  # destroys exactly what the tab itself created, which is exactly them.
+  # A call that neither reaches the next statement nor trips the guard, while
+  # the tick survives, is a MANAGED EXCEPTION thrown inside the callee and
+  # unwound through our frame (IL2CPP C++ EH). Our guard only catches access
+  # violations, so it sees nothing. The likely throw is a NullReference: the
+  # clone's `GameSettingsTab` never ran its own Awake/Start (it is inactive),
+  # so `_createdControls@0x88` is null and cleanup dereferences it.
   #
-  # THE COST OF DROPPING (a), STATED: the component stays enabled, so its own
-  # Show may re-create the stock rows after we clean them. If that happens the
-  # panel will show the donor's settings and the acceptance check will say so
-  # -- that is a visible, checkable failure, unlike the current stall.
-  const NtDisableTabComponent = false
-  var disabled = false
-  if NtDisableTabComponent:
-    ntCrumb("panel: (a) ENTERING Behaviour::set_enabled(false) on the clone")
-    disabled = nuBehaviourEnable(tabComp, false)
-    ntCrumb("panel: (a) RETURNED from Behaviour::set_enabled(false)")
-  else:
-    ntCrumb("panel: (a) SKIPPED -- the cloned GameSettingsTab is left ENABLED")
-  # CRUMBS EITHER SIDE OF THE CALL, so 'died inside it' and 'died in the step
-  # after it' are different sentences. With one crumb they were the same one,
-  # and that ambiguity is what made the last pass need another round trip.
-  ntCrumb("panel: (b) ENTERING CleanupCreatedControls on the clone")
-  let cleaned = nuTabCleanupControls(tabComp)
-  ntCrumb("panel: (b) RETURNED from CleanupCreatedControls")
-  okLog "native tabs: '" & header & "' panel clone -- variant=" &
-        (if NtDisableTabComponent: "(a)+(b) disable-then-clean"
-         else: "(b) ONLY, clean without disabling") &
-        ", GameSettingsTab component disabled=" & $disabled &
-        ", CleanupCreatedControls called=" & $cleaned & ". (a) is off " &
-        "because with it on the build stalled inside set_enabled on every " &
-        "attempt, with no fault raised."
+  # SO WE DO THE WORK OURSELVES. The donor rows are children of the clone's
+  # `_settingsRoot`, and `Object::Destroy` on each is a call that cannot
+  # throw for a valid object. No game method with its own state assumptions is
+  # involved, which is the whole point.
   ntCrumb("panel: reading _settingsRoot@0x98 off the cloned tab component")
   let rowRoot = (if nuOk(tabComp, NuOffGameTabSettingsRoot + 8'i32):
                    cNuGetRef(tabComp, NuOffGameTabSettingsRoot) else: nil)
   if not nuOk(rowRoot, 0x10'i32):
     ntNoteFault("_settingsRoot@0x98 on the cloned tab read null, so there is " &
-                "nowhere to put rows. The panel is hidden again")
+                "nowhere to put rows and nothing to empty. The panel is hidden " &
+                "again and nothing stock was touched")
     discard modsSetActive(panelGo, false)
     discard modsSetActive(spawnerGo, false)
     return
+  # READ THE LIST FIRST, PURELY TO REPORT IT. If `_createdControls` really is
+  # null on the clone, that is the evidence for the NullReference theory, and
+  # it costs one guarded read to say so instead of leaving it inferred.
+  let createdList = (if nuOk(tabComp, NuOffTabCreatedControls + 8'i32):
+                       cNuGetRef(tabComp, NuOffTabCreatedControls) else: nil)
+  ntCrumb("panel: destroying the donor rows under _settingsRoot ourselves")
+  ntCallBegin("Object::Destroy on the cloned panel's donor rows")
+  var destroyed = 0
+  var kids = 0
+  if iChildCount(rowRoot, kids):
+    # BACKWARDS, and capped. Unity defers the actual destruction to end of
+    # frame so the child list does not shift under us, but iterating down is
+    # correct either way and costs nothing.
+    var k = kids - 1
+    while k >= 0 and destroyed < NtMaxReap:
+      let c = iChildAt(rowRoot, k)
+      k = k - 1
+      if c == nil or not duOk(c, 0x20'i32): continue
+      let go = iGameObjectOf(c)
+      if go == nil: continue
+      if nuDestroy(go):
+        destroyed = destroyed + 1
+  ntCallEnd()
+  okLog "native tabs: '" & header & "' panel clone emptied WITHOUT calling " &
+        "any SettingsTab method -- " & $destroyed & " of " & $kids &
+        " donor row(s) destroyed under _settingsRoot via Object::Destroy. " &
+        "The clone's _createdControls@0x88 reads " &
+        (if createdList == nil: "NULL, which is consistent with the managed " &
+           "exception CleanupCreatedControls threw here"
+         else: "non-null (" & iPtr(createdList) & "), so the throw was " &
+           "something other than a null list") &
+        ". Neither set_enabled nor CleanupCreatedControls is called on the " &
+        "clone; both were measured to unwind a managed exception through " &
+        "our frame."
   ntCrumb("panel: hiding our clone, then registering the tab")
   discard modsSetActive(panelGo, false)   # ours starts hidden; the game owns the screen
 
@@ -448,6 +511,9 @@ proc ntBuild(): bool =
           "build attempt, so the feature keeps waiting for a good one " &
           "rather than burning its 8 tries on it.")
     return
+  # DID THE PREVIOUS ATTEMPT COME BACK? A name still parked here means a
+  # game call unwound a managed exception through our frame.
+  ntCheckUnwind()
   gNtTried = gNtTried + 1
   ntWhy("build attempt " & $gNtTried & " is running from tab " &
         iPtr(gModsLastTabPtr))
