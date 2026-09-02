@@ -23,8 +23,11 @@ Usage:
 """
 import json
 import os
+import re
 import sys
 import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 INSTALL = r"D:\Aowlspt\aowlspt"
 CMD = os.path.join(INSTALL, "aowlspt-inspect.txt")
@@ -66,20 +69,66 @@ def say(verdict, msg):
     print("%s: %s" % (verdict, msg))
 
 
+GEOM_RE = re.compile(r"^(anchoredPosition|sizeDelta|anchorMin|anchorMax|pivot|"
+                     r"rect \(x,y,w,h\))\s*=\s*\((-?[\d.]+),\s*(-?[\d.]+)"
+                     r"(?:,\s*(-?[\d.]+),\s*(-?[\d.]+))?\)")
+
+
 def geom_of(text, needle):
-    """Pull the rect line for `needle` out of an inspector answer."""
+    """The FULL geometry the host printed for `rect`: all six lines, numbers
+    only, joined -- so a shift in anchoredPosition with an unchanged rect is
+    still a change.
+
+    MEASURED 2026-09-01: the first version matched any line containing
+    `rect`, and the inspector ECHOES every command as `> rect $_`; the
+    baseline was recorded as the string "> rect $_" and reported PASS -- a
+    check that passed on its own input. Lines beginning with `>` are echoes
+    and are never geometry. Fewer than six lines is "not observed".
+    """
     if not text:
         return None
+    got = []
     for line in text.splitlines():
-        if needle in line and ("anchoredPosition" in line or "rect" in line):
-            return line.strip()
-    return None
+        t = line.strip()
+        if t.startswith(">"):
+            continue
+        m = GEOM_RE.match(t)
+        if m:
+            got.append("%s=(%s)" % (m.group(1), ",".join(
+                g for g in m.groups()[1:] if g is not None)))
+    if len(got) < 6:
+        return None
+    return " ".join(got)
+
+
+def ensure_settings_open():
+    """The SettingsScreen only exists once opened; `find SettingsList` from
+    the roots stops early with 0 hits otherwise (measured). Walk the proven
+    open path from acceptance.py, then wait for `$settings` to bind."""
+    import acceptance
+    ans = run(["state"])
+    if ans and "$settings=0x0000000000000000" not in ans:
+        return True, "already open"
+    ok, detail = acceptance.open_settings(INSTALL, 90)
+    if not ok:
+        return False, detail
+    for _ in range(10):
+        time.sleep(1.0)
+        ans = run(["state"])
+        if ans and "$settings=0x" in ans and            "$settings=0x0000000000000000" not in ans:
+            return True, detail
+    return False, "pressed Settings but $settings never bound: " + detail
 
 
 def cmd_baseline():
+    ok, detail = ensure_settings_open()
+    if not ok:
+        say("INCONCLUSIVE", "Settings could not be opened, so the stock "
+                            "geometry was not observed: " + detail)
+        return INCONCLUSIVE
     ans = run(["state",
-               "find SettingsList",
-               "rect $_"])
+               "find SettingsList $settings 40000",
+               "rect $f1"])
     if ans is None:
         say("INCONCLUSIVE", "the inspector never answered; is the client up "
                             "with liveInspector on? Nothing was recorded.")
@@ -115,7 +164,11 @@ def cmd_verify():
 
     problems = []
     # 4 -- the negative, first, because it is the one that has always broken.
-    ans4 = run(["find SettingsList", "rect $_"])
+    ok, detail = ensure_settings_open()
+    if not ok:
+        say("INCONCLUSIVE", "Settings could not be opened: " + detail)
+        return INCONCLUSIVE
+    ans4 = run(["find SettingsList $settings 40000", "rect $f1"])
     g4 = geom_of(ans4, "rect")
     if not g4:
         say("INCONCLUSIVE", "SettingsList could not be re-read, so the stock "
