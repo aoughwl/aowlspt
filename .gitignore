@@ -83,7 +83,9 @@ __pycache__/
 # Texture mod: the assembled image pack (rebuilt by pipeline/build_pack.py --copy)
 mods/textures/data/pack/
 
-# Decrypted IL2CPP metadata cache (large, derived, never committed)
+# Decrypted IL2CPP metadata cache (large, derived, never committed). Also
+# `.cache/dlss/`: NVIDIA nvngx_dlss.dll builds, their backups and the state
+# file written by tools/dlss.py -- NVIDIA binaries are never committed.
 .cache/
 
 # The UI path cache is a LEARNED artifact, stamped with the game build it

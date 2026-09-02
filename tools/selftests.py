@@ -149,6 +149,7 @@ ITEMS = [
     S("shapeaudit.py", "fast"),                        # 0.1s
     S("nimlint.py", "fast"),                           # 0.1s
     S("acceptance.py", "fast", args=("selftest",)),    # 0.2s -- positional
+    S("dlss.py", "fast", args=("selftest",)),          # fake install + manifest falsifiers
     S("nativetabs_check.py", "fast", args=("selftest",)),
     S("uihooks_check.py", "fast", args=("selftest",)),
 
