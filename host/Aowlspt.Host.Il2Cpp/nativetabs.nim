@@ -78,6 +78,16 @@ var gNtStep = "not started"
 ## DIFFERENT reason always prints, so a state transition is never swallowed.
 var gNtEnteredSaid = false
 var gNtWhySaid = ""
+## THE CRUMB AS IT WAS WHEN THE LAST BUILD ATTEMPT GAVE UP.
+##
+## MEASURED REPORTING BUG: the give-up line printed `gNtStep`, but `gNtStep`
+## is reset to "tick: entry" at the top of EVERY tick -- so by the time the
+## eighth-attempt message ran, on a later frame, the crumb from the failing
+## build had already been overwritten. It printed "tick: entry", which sent
+## the reader hunting for an early return that was not the one firing. The
+## crumb is SNAPSHOTTED the moment each attempt returns, and the give-up line
+## prints the snapshot.
+var gNtLastAttemptStep = "no attempt has returned yet"
 
 proc ntWhy(reason: string) =
   ## Log a decline reason, once per distinct reason.
@@ -195,8 +205,22 @@ proc ntBuildOne(screenT, donorSpawnerT, donorPanelT: Il2CppPtr;
   ## One tab: a spawner clone joined to the stock group, and a panel clone
   ## emptied of its stock rows.
   result = false
+  # THE RETURN THAT ATE THE THIRD LIVE PASS. This was a bare `return` with no
+  # message and no fault count -- the ONLY failure path in the whole build
+  # that did neither. So eight attempts ran, none logged, the fault ceiling
+  # was never reached (which is what a logged failure would have done at 4),
+  # and the give-up line then printed an overwritten crumb. Everything about
+  # the run said 'the tick is not working' and nothing said where.
+  gNtStep = "buildOne: iGameObjectOf(SettingsScreen transform)"
   let screenGo = iGameObjectOf(screenT)
-  if screenGo == nil: return
+  if screenGo == nil:
+    ntWhy("the SettingsScreen's GameObject could not be reached from its " &
+          "transform " & iPtr(screenT) & " (name '" & iObjName(screenT) &
+          "'). Component::get_gameObject returned null, which for a live " &
+          "Transform should not happen -- so either that pointer is not a " &
+          "Transform, or the walk up from the settings tab landed somewhere " &
+          "other than the screen. Nothing was cloned and nothing changed.")
+    return
 
   # ---- 1. THE BUTTON -------------------------------------------------------
   gNtStep = "button: donor GameObject + tab bar"
@@ -386,8 +410,19 @@ proc ntBuild(): bool =
   let tabT = iToTransform(gModsLastTabPtr)
   let screenT = (if tabT != nil: modsParentOf(tabT) else: nil)
   if screenT == nil:
-    ntNoteFault("could not reach the SettingsScreen from the live tab")
+    ntNoteFault("could not reach the SettingsScreen from the live tab " &
+                iPtr(gModsLastTabPtr) & " (iToTransform gave " & iPtr(tabT) &
+                ", its parent gave null)")
     return
+  # NAME WHAT THE WALK LANDED ON, once. `tab -> transform -> parent` is
+  # ASSUMED to be the SettingsScreen and has never been checked; if it is not,
+  # every child lookup below searches the wrong node and the failures read as
+  # 'the pieces were not found' rather than 'we are in the wrong place'.
+  ntWhy("walk: tab " & iPtr(gModsLastTabPtr) & " -> transform " & iPtr(tabT) &
+        " ('" & iObjName(tabT) & "') -> parent " & iPtr(screenT) & " ('" &
+        iObjName(screenT) & "'). That parent is what this treats as the " &
+        "SettingsScreen; if the name is not a settings screen, the walk is " &
+        "wrong and everything below it is searching the wrong subtree.")
   gNtStep = "build: walking SettingsScreen children (Toggles / GameToggleSpawner / Game Settings)"
   let toggles = modsChildNamed(screenT, "Toggles")
   let donorSpawner = (if toggles != nil:
@@ -494,11 +529,17 @@ proc ntTickBody() =
       return
     if gNtTried >= 8:
       ntWhy("the build was attempted 8 time(s) and never completed, so it " &
-            "has stopped trying. The last step reached was: " & gNtStep)
+            "has stopped trying. THE LAST STEP THE FINAL ATTEMPT REACHED " &
+            "WAS: " & gNtLastAttemptStep & " -- snapshotted when that " &
+            "attempt returned, because gNtStep itself is reset every tick " &
+            "and printing it here reported 'tick: entry' and hid the real " &
+            "return.")
       return
     gNtStep = "tick: ntBuild (attempt " & $(gNtTried + 1) & ")"
     ntWhy("attempting the build now (attempt " & $(gNtTried + 1) & " of 8)")
     discard ntBuild()
+    # SNAPSHOT BEFORE THE NEXT TICK CAN OVERWRITE IT.
+    gNtLastAttemptStep = gNtStep
     gNtStep = "tick: ntBuild returned without faulting"
     return
   if gModsLastTabPtr == nil:
