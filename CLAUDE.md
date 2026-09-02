@@ -2,7 +2,7 @@
 
 ## 0. NEVER expose the personal address. Non-negotiable.
 
-There is a personal `@mumfordandmiller.com` address on this machine — it is the
+There is a personal address (domain deliberately withheld) address on this machine — it is the
 one Claude Code reports as the user's email, and it is NOT spelled out here on
 purpose, because this file is tracked and this repo is public. Writing it down
 to warn about it is itself the leak.
@@ -235,6 +235,11 @@ Rebuilds from a wrong base have silently dropped features many times (the scav-s
 the exit patch, the version brand, image serving). Use `python tools/deploy.py check|deploy|rollback`
 — it refuses on any missing marker, backs up with a timestamp, and prints the rollback
 line. Marker list is data in `tools/deploy.json`; **never edit it to make a check pass.**
+
+When agents are building, deploy through `python tools/deploylock.py deploy <artifacts>`:
+it holds the same build lock while it copies, because `aowl` removes its output
+before writing it and a deploy issued in the second between two queued builds
+reads an absent DLL (measured twice, 2026-09-01).
 
 `deploy.py` covers only the **host** DLL. For a **mod** DLL use `tools/markers.py <dll>
 <marker>...`, which shares `tools/litscan.py` with it and reports three outcomes

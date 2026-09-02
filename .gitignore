@@ -106,3 +106,6 @@ tools/test_settings_display.exe
 .aowl-build.lock
 # agent worktrees: measured 58MB listing, never commit
 .claude/worktrees/
+# a SQLite backup of the fact store; it carried the private address into the tree once
+docs/aowl-facts.db.backup
+*.db.backup

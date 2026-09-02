@@ -42,7 +42,11 @@ esac
 #
 # Matched on the DOMAIN, which subsumes the full address -- so this one test
 # catches both, and catches the bare-domain case that got through before.
-if git diff --cached -U0 | grep -q "$D"; then
+# ADDED lines only. The whole -U0 diff also carries the REMOVED lines, so a
+# commit whose entire purpose was to delete the domain from CLAUDE.md was
+# refused by this guard on 2026-09-01 -- a guard that forbids removing the
+# secret keeps it in the tree for ever. `+++ b/file` headers are excluded.
+if git diff --cached -U0 | grep '^+' | grep -v '^+++' | grep -q "$D"; then
   echo "pre-commit: REFUSED -- the personal domain appears in staged content:" >&2
   git diff --cached --name-only | while read -r f; do
     if git show ":$f" 2>/dev/null | grep -q "$D"; then echo "    $f" >&2; fi
