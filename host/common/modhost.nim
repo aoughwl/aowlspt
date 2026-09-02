@@ -483,6 +483,32 @@ type
       ## supposed to avoid wearing a disguise. `tests/tickfault`'s flaky
       ## fixture is what found it.
     tickFaulted*: bool
+    initTid*: uint32
+      ## The OS thread id that ran this mod's `init` and `on_load`, recorded
+      ## in `loadMod` at the moment the mod went live. Zero only for a row
+      ## that never went through `loadMod`.
+      ##
+      ## MEASURED 2026-09-02 13:18 (WER dump, 0xc0000409
+      ## FAST_FAIL_FATAL_APP_EXIT from `ucrtbase!abort` under
+      ## `admin!mi_assert_fail`): a mod initialised on one thread and ticked
+      ## on another aborts the whole PROCESS inside mimalloc, on the assertion
+      ## `heap->thread_id == 0 || heap->thread_id == tid` in
+      ## `mi_heap_malloc_small_zero` (vendor/mimalloc/src/alloc.c:135). Each
+      ## mod DLL carries its own mimalloc whose default heap lives in that
+      ## DLL's emulated TLS (`_emutls_v._mi_heap_default`), and a foreign
+      ## thread allocating on it is a FAIL-FAST: it bypasses Unity's handler,
+      ## so there is not even a Crash_* report to read afterwards.
+      ##
+      ## INFERRED, not measured: that the binding is established by the init
+      ## thread specifically, rather than by emutls slot reuse after the
+      ## unload/reload the same boot performed. Either way the invariant that
+      ## holds is the one `tickMods` enforces: A MOD IS TICKED ONLY ON THE
+      ## THREAD THAT INITIALISED IT.
+    tickWrongThread*: bool
+      ## `tickMods` reached this mod on a thread that is not `initTid` and
+      ## REFUSED to tick it. A third state, distinct from `tickFaulted`: the
+      ## mod never ran and never failed, so reporting it as faulted would
+      ## report a fault that did not happen. Said once per mod.
     profSlot*: int32
       ## This mod's slot in the profiler's shared region, or -1 for "not
       ## registered yet". Registered lazily on the first tick AFTER the
@@ -1074,7 +1100,8 @@ proc loadMod*(path: string; side: int32; hostName, hostVersion: string;
                     guid: "", name: "", author: "", version: "",
                     hasUpdate: false, live: false, loadedAt: 0'i64,
                     tickFails: 0,
-                    tickWarned: false, tickFaulted: false, flags: 0'u32,
+                    tickWarned: false, tickFaulted: false,
+                    initTid: 0'u32, tickWrongThread: false, flags: 0'u32,
                     profSlot: -1'i32)
 
   # Before the first `LoadLibrary` of the process and harmless on every one
@@ -1221,6 +1248,10 @@ proc loadMod*(path: string; side: int32; hostName, hostVersion: string;
   m.hasUpdate = cModApiHasUpdate(m.api) != 0'i32
   m.live = true
   m.loadedAt = elapsedMs()
+  # THE THREAD THIS MOD IS NOW BOUND TO. `init` ran on it and `on_load` is
+  # about to; both allocate through the mod's own mimalloc, whose default heap
+  # is thread-bound. See `initTid` and the refusal in `tickMods`.
+  m.initTid = cSysThreadId()
   gMods.add m
 
   if cModApiOnLoad(m.api) != StatusOk:
@@ -1389,8 +1420,44 @@ proc tickMods*(elapsed: int64) =
   # frame rider boundary also fires and owns the frame-time histogram. It does
   # NOT write that histogram -- see `aowl_prof_boundary`.
   if profOn: cProfTickBoundary()
+  # THE THREAD THIS PASS IS ON, read once. Every mod below is checked against
+  # the thread that initialised it -- see the refusal inside the loop.
+  let tickTid = cSysThreadId()
   for i in 0 ..< gMods.len:
-    if not gMods[i].live or not gMods[i].hasUpdate or gMods[i].tickFaulted:
+    if not gMods[i].live or not gMods[i].hasUpdate or gMods[i].tickFaulted or
+       gMods[i].tickWrongThread:
+      continue
+    # A MOD IS TICKED ONLY ON THE THREAD THAT INITIALISED IT.
+    #
+    # MEASURED 2026-09-02 13:18, WER dump
+    # `EscapeFromTarkov.exe.16972.dmp`, 0xc0000409 FAST_FAIL_FATAL_APP_EXIT:
+    # `ucrtbase!abort <- admin!mi_assert_fail <- admin!mi_malloc <-
+    # admin!alloc_0 <- newWideCString <- toWide <- openIl2Cpp <- dataOpen <-
+    # admin onUpdate <- modOnUpdate <- aowlspt_host_il2cpp`, on the assertion
+    # `heap->thread_id == 0 || heap->thread_id == tid` in
+    # `mi_heap_malloc_small_zero`. That boot had brought the deferred mods up
+    # from the UNITY MAIN THREAD (the mod-loading screen's release) and then
+    # ticked them from the ops thread. The previous surviving boot loaded the
+    # same mod on the ops thread and ran fine.
+    #
+    # This is a FAIL-FAST, not a fault: `abort` takes the process down and
+    # bypasses Unity's handler, so there is no Crash_* report and no SEH guard
+    # anywhere can catch it. It therefore has to be refused BEFORE the call,
+    # which is what this is. Skipping the tick loses that mod's update; its
+    # routes, events, timers and detours are untouched.
+    #
+    # `initTid == 0` means the row was built by something that never went
+    # through `loadMod`; that is not evidence of a wrong thread, so it is not
+    # refused on.
+    if gMods[i].initTid != 0'u32 and gMods[i].initTid != tickTid:
+      if not gMods[i].tickWrongThread:
+        gMods[i].tickWrongThread = true
+        fail "mod " & gMods[i].guid & ": REFUSING to tick on thread " &
+             $int(tickTid) & ", initialised on thread " &
+             $int(gMods[i].initTid) & " -- the mimalloc heap is thread-bound " &
+             "(measured 2026-09-02 13:18 abort in admin.dll). The mod stays " &
+             "loaded and its routes, events and hooks still work; only its " &
+             "tick is refused. This is said once."
       continue
     # THE PROFILER SCOPE. Registration is lazy and idempotent: it happens on
     # the first tick after the profiler is enabled, never at load, so a run
@@ -1435,6 +1502,22 @@ proc modTickFaulted*(index: int): bool =
   if index < 0 or index >= gMods.len:
     return false
   result = gMods[index].tickFaulted
+
+proc modTickRefusedThread*(index: int): bool =
+  ## Whether this mod's tick was REFUSED because the ticking thread is not the
+  ## thread that initialised it. A THIRD outcome: any diagnostic that reports
+  ## mod tick state must distinguish ticking / refused-wrong-thread /
+  ## not-live, because folding this into "faulted" reports a fault that never
+  ## happened and folding it into "ticking" hides a mod that is not running.
+  if index < 0 or index >= gMods.len:
+    return false
+  result = gMods[index].tickWrongThread
+
+proc modInitThread*(index: int): uint32 =
+  ## The thread id that initialised this mod, or 0 when unknown.
+  if index < 0 or index >= gMods.len:
+    return 0'u32
+  result = gMods[index].initTid
 
 proc modTickFailures*(index: int): int =
   ## The current run of consecutive `on_update` failures. Zero for a healthy
@@ -1608,6 +1691,21 @@ proc unloadOne*(index: int; error: var string): bool =
 
   # The mod's own `on_unload` first, so it can save state; then everything it
   # registered; then the library.
+  #
+  # SAID, NOT REFUSED. `on_unload` allocates and frees through the mod's own
+  # thread-bound mimalloc exactly as `on_update` does, so calling it from a
+  # thread other than the one that initialised the mod is the same hazard the
+  # tick refuses (see `initTid`). It is not refused here because refusing an
+  # unload leaks the library and its arena for the life of the process, which
+  # is worse; but if the process fail-fasts inside `mi_*` on an unload, THIS
+  # line is the one that names why. Unverified live: no unload has been
+  # observed crossing threads.
+  if gMods[index].initTid != 0'u32 and gMods[index].initTid != cSysThreadId():
+    warn "mod " & gMods[index].guid & ": unloading on thread " &
+         $int(cSysThreadId()) & " but it was initialised on thread " &
+         $int(gMods[index].initTid) & " -- on_unload allocates through a " &
+         "thread-bound mimalloc heap. Proceeding anyway: refusing an unload " &
+         "leaks the library."
   discard cModApiOnUnload(gMods[index].api)
   gTeardown(index)
   cModApiFree(gMods[index].api)

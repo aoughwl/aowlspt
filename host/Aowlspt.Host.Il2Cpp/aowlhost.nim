@@ -1652,6 +1652,27 @@ var gModLoadPendingWhy = ""
   ## A release that was WANTED while the gate was shut. Non-empty means "the
   ## moment the gate opens, release, and say what asked for it".
 var gModLoadPendingAt = 0'u64
+var gModLoadReleaseApproved = false
+  ## THE RELEASE IS APPROVED AND HAS NOT BEEN PERFORMED YET.
+  ##
+  ## The gate is evaluated on the UNITY MAIN THREAD (`modLoadTick` rides the
+  ## `TarkovApplication::Update` drain), but the LOAD must not happen there.
+  ## MEASURED 2026-09-02 13:18: a boot that released the deferred mods from
+  ## the Unity thread at 0:00:44.4 and then ticked them from the ops thread
+  ## died with 0xc0000409 FAST_FAIL_FATAL_APP_EXIT inside admin.dll's mimalloc
+  ## (`heap->thread_id == 0 || heap->thread_id == tid`); the previous boot,
+  ## which loaded the same mods on the ops thread, survived. So the Unity
+  ## thread only ever sets this flag, and `modLoadReleaseDrain` -- called from
+  ## the ops loop immediately before `modhost.tickMods` -- does the work, on
+  ## the same thread that will tick them.
+var gModLoadReleaseWhy = ""
+  ## The reason the approved release carries, so the line the ops thread
+  ## writes says what asked for it rather than merely that something did.
+var gModLoadReleaseTid = 0'u32
+  ## The thread that OPENED the gate (Unity). Printed beside the thread that
+  ## performed the release, because the whole point of this split is that the
+  ## two are different and the difference is what killed a boot.
+var gModLoadReleaseDone = false
 var gModLoadDonor: Il2CppPtr = nil
 var gModLoadCanvasTr: Il2CppPtr = nil
   ## The canvas transform the loading step built under, kept so the teardown
@@ -10152,4 +10173,15 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
     # And the answer, on the way back out. It rides the next poll of the same
     # route the desired set came in on -- see `publishReport`.
     publishReport(now)
+    # THE DEFERRED MOD RELEASE, PERFORMED HERE AND NOWHERE ELSE.
+    #
+    # The gate that decides WHEN is on the Unity main thread (`modLoadTick`,
+    # riding the `TarkovApplication::Update` drain); the LOAD is here, on the
+    # same thread as the `modhost.tickMods` below it, because a mod's mimalloc
+    # default heap is bound to the thread that first allocated on it and a
+    # foreign thread allocating on it is a FAIL-FAST no guard can catch
+    # (measured 2026-09-02 13:18, 0xc0000409 in admin.dll). Immediately before
+    # tickMods on the same pass, so a mod loaded here is ticked on this pass.
+    # Idle cost is one boolean compare.
+    modLoadReleaseDrain()
     modhost.tickMods(elapsed)

@@ -968,6 +968,42 @@ proc modLoadReleaseMods(why: string; force: bool = false) =
     okLog "mod loading: release gated -- READY at " &
           mlSinceBoot(gModLoadPendingAt) & ", MenuScreen::Show at " &
           mlSinceBoot(gModLoadMenuShownAt) & ", releasing now"
+  # APPROVED HERE, PERFORMED ON THE OPS THREAD.
+  #
+  # This proc runs on the UNITY MAIN THREAD -- `modLoadTick` rides the
+  # `TarkovApplication::Update` drain. The load itself must NOT run here.
+  #
+  # MEASURED 2026-09-02 13:18 (WER dump `EscapeFromTarkov.exe.16972.dmp`,
+  # 0xc0000409 FAST_FAIL_FATAL_APP_EXIT, no Unity Crash_* report because a
+  # fail-fast bypasses Unity's handler): the boot that released the deferred
+  # mods from HERE at 0:00:44.4 died in `ucrtbase!abort <- admin!mi_assert_fail
+  # <- admin!mi_malloc <- ... <- admin onUpdate <- modOnUpdate`, on
+  # `heap->thread_id == 0 || heap->thread_id == tid` in
+  # `mi_heap_malloc_small_zero`. The mod had been INITIALISED on this thread
+  # and was being TICKED on the ops thread. The previous surviving boot loaded
+  # the same mod on the ops thread at 0:00:01.4 and ran fine.
+  #
+  # INFERRED, not measured: that the heap binds to the init thread (rather
+  # than, say, an emutls slot reused after this boot's unload/reload of six mod
+  # DLLs). What is enforced is the invariant either explanation implies -- a
+  # mod is initialised on the same thread that ticks it -- so the gate stays
+  # here, where the event is, and the WORK moves to `modLoadReleaseDrain`,
+  # which the ops loop calls immediately before `modhost.tickMods`.
+  #
+  # `gModsReleased` was set above, so nothing asks again while this is pending.
+  gModLoadReleaseWhy = why
+  gModLoadReleaseTid = modhost.cSysThreadId()
+  gModLoadReleaseApproved = true
+  okLog "mod loading: release APPROVED on thread " &
+        $int(gModLoadReleaseTid) & " (Unity main thread) -- " & why &
+        ". The load itself is NOT done here; the ops thread performs it on " &
+        "its next pass, so the mods are initialised on the same thread that " &
+        "ticks them."
+
+proc modLoadPerformRelease(why: string) =
+  ## THE ACTUAL LOAD. Called only by `modLoadReleaseDrain`, only from the ops
+  ## thread. Every log line below is the one this used to write inline from
+  ## `modLoadReleaseMods`; only the thread it runs on has changed.
   okLog "mod loading: releasing deferred mods now -- " & why
 
   # THE READBACK, and it is a DELTA rather than a total on purpose.
@@ -1008,6 +1044,33 @@ proc modLoadReleaseMods(why: string; force: bool = false) =
           "SKIPPED rather than initialised a second time (each names " &
           "itself above with 'init #2 SKIPPED'). Every mod in this " &
           "session has had exactly one init and one on_load."
+
+proc modLoadReleaseDrain*() =
+  ## Perform an approved deferred-mod release, ON THE OPS THREAD.
+  ##
+  ## Called from the ops loop immediately before `modhost.tickMods`, which is
+  ## the whole point: `loadMod` runs `init` and `on_load` here, and `tickMods`
+  ## runs `on_update` here, so a mod's thread-bound mimalloc heap is only ever
+  ## touched by one thread. See `gModLoadReleaseApproved`.
+  ##
+  ## Idle cost is one boolean compare. It is deliberately NOT guarded by an
+  ## `aowl_p_p_seh` of its own -- `loadMod` is the same call the boot path and
+  ## `modcontrol.drain()` already make from this thread unguarded, and the
+  ## abort this fixes is a fail-fast that no SEH guard can catch anyway.
+  if gModLoadReleaseDone or not gModLoadReleaseApproved:
+    return
+  gModLoadReleaseApproved = false
+  gModLoadReleaseDone = true
+  let tid = modhost.cSysThreadId()
+  okLog "mod loading: release performed on thread " & $int(tid) &
+        " (ops thread), gate opened on thread " & $int(gModLoadReleaseTid) &
+        " (Unity)"
+  if tid == gModLoadReleaseTid:
+    warn "mod loading: the ops thread and the Unity thread report the SAME " &
+         "id (" & $int(tid) & "). That is not expected; the split that moved " &
+         "this work off the Unity thread is then not doing anything, and the " &
+         "mimalloc abort of 2026-09-02 13:18 is still reachable."
+  modLoadPerformRelease(gModLoadReleaseWhy)
 
 proc mlLoadPhaseOver(): bool =
   ## HAS THE MAIN MENU ARRIVED? Answered only when we can answer it honestly.
