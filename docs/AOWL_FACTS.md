@@ -7801,3 +7801,15 @@ PostFX strip a direct child of SettingsScreen with 4 children, 2 subtabs one
 group one ON, exactly one panel active, 0 fault-caught lines, strict JSON
 index. So native subtabs work on this build; the 09:05 "no strip" was
 specific to the 4,784,128 build.
+
+## 2026-09-02 11:10: SAIN's client-side selftest catches the mod double-init
+
+MEASURED (host 4,737,536, sain.dll rebuilt): server half at [0:00:04.563]
+`publish-once selftest PASS`; client half at the gated release [0:00:40.688]
+`publish-once selftest FAIL -- schemaPublishReason() was EMPTY before
+declareSettings ... the pre-publish schema walk returned 45949 bytes instead
+of an empty array` -- a full schema existed before the mod's on_load
+declared it, i.e. the client mod initialised twice (MOD-PERF's "modload
+double-inits every mod at 18s"). The publish-once guard (8a5d83d) is what
+turned tonight's use-after-free into a refusal; the double-init itself is
+being fixed in modload. The keybinds route now serves value/default live.
