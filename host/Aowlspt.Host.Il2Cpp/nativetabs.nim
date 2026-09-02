@@ -176,6 +176,29 @@ var gNtTabComp: seq[Il2CppPtr] = @[]  ## its SettingsTab component
 var gNtRowRoot: seq[Il2CppPtr] = @[]  ## _settingsRoot, where rows go
 var gNtId: seq[string] = @[]
 var gNtSpawnerGo: seq[Il2CppPtr] = @[]
+## THE SPAWNER COMPONENTS -- the ONLY stable identity a spawned toggle has.
+##
+## TRAP T13, MEASURED `R disasm 0x37ea0c0` and confirmed live on the 15:42
+## boot: ``UISpawner`1::get_SpawnedObject`` is a LAZY FACTORY, not an
+## accessor. It reads `_spawnedObject@0xa0`, and if that is null OR the object
+## behind it is Unity-dead (`m_CachedPtr@0x10 == 0`) it calls `SpawnObject`
+## through the vtable, re-applies the header/width/ellipsis and REWRITES the
+## field. Nothing announces it. Every pointer this file used to cache from
+## `SpawnObject()` therefore became an orphan the moment its toggle was
+## destroyed -- still readable, still reporting `m_IsOn = 0` forever, and no
+## longer the object the player clicks.
+##
+## There is no `OnEnable` involved: MEASURED, neither ``UISpawner`1`` (9
+## declared methods) nor `UIAnimatedToggleSpawner` (9) declares one. The
+## trigger is "the old one is dead when someone asks", which no amount of
+## being careful about SetActive would have avoided.
+##
+## So: hold the SPAWNER, resolve the toggle at the instant of use. These seqs
+## are index-parallel with `gNtToggle`/`gNtSubToggle`, which survive only as a
+## build-time record for the inventory line and are never read for state.
+var gNtSpawnerComp: seq[Il2CppPtr] = @[]
+var gNtGameSpawner: Il2CppPtr = nil   ## the stock GAME tab spawner component
+var gNtKbSpawner: Il2CppPtr = nil     ## our CONTROLS>MODS spawner component
 
 ## The stock panels we switch off while ours is up, so they can be switched
 ## back on exactly as they were. Never written to otherwise.
@@ -426,6 +449,9 @@ var gNtSubSpawner: seq[Il2CppPtr] = @[]  ## UIAnimatedToggleSpawner per subtab
 var gNtTabGroup: Il2CppPtr = nil      ## the STOCK tab-bar ToggleGroup
 var gNtGfxTabSpawner: Il2CppPtr = nil ## stock GraphicsToggleSpawner component
 var gNtPostFxTabSpawner: Il2CppPtr = nil
+## RETIRED BY T13: there is no stable pointer to a spawned toggle, so the
+## stock PostFX toggle is resolved through `gNtPostFxTabSpawner` at every
+## point of use instead of being remembered here.
 var gNtPostFxTabToggle: Il2CppPtr = nil
 var gNtLastGroup = -1'i32             ## the last group ShowScreen reported
 var gNtSettleFrames = 0
@@ -441,6 +467,30 @@ var gNtCloseInFlight = false
 var gNtCloseUnreturnedSaid = false
 var gNtKbDonorKey = ""                ## the row template's own key caption
 var gNtGfxEdgeSaid = false
+
+proc ntSpawnerToggleNow(spawner: Il2CppPtr): Il2CppPtr =
+  ## The CURRENT toggle of one spawner, or nil. One guarded raw read of
+  ## `_spawnedObject@0xa0` plus the Unity-alive test -- never the property
+  ## getter, which would SPAWN (T13). Everything below funnels through this so
+  ## there is exactly one place that knows the offset.
+  nuSpawnerCurrentToggle(spawner)
+
+proc ntTabToggleNow(i: int): Il2CppPtr =
+  ## Our i-th TOP-ROW tab's live toggle.
+  if i < 0 or i >= gNtSpawnerComp.len: return nil
+  ntSpawnerToggleNow(gNtSpawnerComp[i])
+
+proc ntSubToggleNow(i: int): Il2CppPtr =
+  ## Our i-th SUBTAB's live toggle. This is the read that was wrong: the
+  ## verdict used to ask a build-time pointer for `m_IsOn` and got 0 from a
+  ## dead object while a live one sat on screen unselected.
+  if i < 0 or i >= gNtSubSpawner.len: return nil
+  ntSpawnerToggleNow(gNtSubSpawner[i])
+
+proc ntSubCount(): int =
+  ## How many subtabs exist, counted from the STABLE handles.
+  result = gNtSubSpawner.len
+  if result > NtMaxSubs: result = NtMaxSubs
 
 proc ntNoteFault(what: string) =
   gNtFaults = gNtFaults + 1
@@ -505,9 +555,15 @@ proc ntToggleSetFired(regs: Il2CppPtr) =
     return
   # `value` is RDX (index 1): did this toggle just go ON?
   let turnedOn = (cast[uint64](cRegsInt(regs, 1'i32)) and 0xFF'u64) != 0'u64
+  # MATCH AGAINST THE CURRENT SPAWNED TOGGLE, NEVER A CACHED ONE (T13).
+  # This is <=4 guarded 8-byte reads on the game's click path, which is a real
+  # cost and is accepted deliberately: the alternative -- comparing against a
+  # pointer captured at build time -- is what made the strip stop responding
+  # after the player cycled the top-row tabs, silently, with every press
+  # classified `matched-as=other`.
   var i = 0
-  while i < gNtToggle.len and i < NtMaxTabs:
-    if gNtToggle[i] == selfPtr:
+  while i < gNtSpawnerComp.len and i < NtMaxTabs:
+    if ntTabToggleNow(i) == selfPtr:
       # ONLY THE ON EDGE, and this is the measured order, not a preference.
       # §2.3: pressing B while A is on runs `A.Set(false, sendCallback)` from
       # INSIDE `B.Set`, with the flag propagated VERBATIM -- so every OFF edge
@@ -526,8 +582,8 @@ proc ntToggleSetFired(regs: Il2CppPtr) =
   # the first feature. Still O(1)-ish -- two more pointer compares -- and still
   # silent for every foreign toggle.
   var j = 0
-  while j < gNtSubToggle.len and j < NtMaxSubs:
-    if gNtSubToggle[j] == selfPtr:
+  while j < gNtSubSpawner.len and j < NtMaxSubs:
+    if ntSubToggleNow(j) == selfPtr:
       # ONLY THE ON EDGE IS A PRESS. This drain is a PREFIX, and a press on
       # one subtab makes the cloned ToggleGroup call Set(false, true) on the
       # OTHER one from inside the first call -- so the nested OFF arrives
@@ -569,7 +625,7 @@ proc ntToggleSetFired(regs: Il2CppPtr) =
       return
     j = j + 1
   # THE CONTROLS>MODS SUBTAB, on the same postfix as everything else.
-  if gNtKbToggle != nil and gNtKbToggle == selfPtr:
+  if gNtKbSpawner != nil and ntSpawnerToggleNow(gNtKbSpawner) == selfPtr:
     gNtKbPressed = (if turnedOn: 1 else: 0)
     return
   # NAME THE EVENT, ONCE PER DISTINCT TOGGLE. Every toggle in the game funnels
@@ -577,8 +633,9 @@ proc ntToggleSetFired(regs: Il2CppPtr) =
   # capped, and it is what turns "nothing happened" into a list of what
   # actually arrived and how each one was classified.
   var matchedAs = "other"
-  if gNtGfxTabToggle != nil and gNtGfxTabToggle == selfPtr:
-    matchedAs = "graphics(cached)"
+  if gNtGfxTabSpawner != nil and
+     ntSpawnerToggleNow(gNtGfxTabSpawner) == selfPtr:
+    matchedAs = "graphics(live spawned toggle)"
   # MATCH BY NAME TOO, not only by the pointer captured at build. A spawner
   # respawns its toggle, so a cached pointer can go stale while the button on
   # screen is the same button -- and a stale pointer fails silently, which is
@@ -593,8 +650,11 @@ proc ntToggleSetFired(regs: Il2CppPtr) =
   if matchedAs == "other" and
      (parentName.contains("GraphicsToggleSpawner") or
       goName.contains("GraphicsToggle")):
-    matchedAs = "graphics(by name)"
-    gNtGfxTabToggle = selfPtr      # re-cache: the pointer we had was stale
+    # NO RE-CACHING. The by-name branch used to store the pointer it had just
+    # seen, which is the T13 mistake written down: the very next respawn made
+    # it an orphan again. The spawner is what gets remembered, and it is
+    # remembered at build time and never revised.
+    matchedAs = "graphics(by name -- the spawner read did not match)"
   var known = false
   var si = 0
   while si < gNtSeenToggles.len and si < NtMaxSeenToggles:
@@ -710,7 +770,11 @@ proc ntBuildOne(screenT, donorSpawnerT, donorPanelT: Il2CppPtr;
   # THE STOCK GAME TOGGLE, for the proof's way back. Captured from the DONOR
   # spawner (the one we cloned), because after our tab joins the stock group
   # pressing GAME is the only way to hand the screen back.
+  # THE STOCK GAME TAB, held as its SPAWNER (T13): the toggle it spawned is
+  # replaced without notice, so a pointer to it is a pointer to an orphan by
+  # the time the proof wants to press GAME back.
   gNtGameToggle = modsToggleOf(donorSpawnerT)
+  gNtGameSpawner = modsComponent(donorSpawnerT, "UIAnimatedToggleSpawner")
   ntCrumb("button: resolving the donor UIAnimatedToggleSpawner component")
   let donorSpawner = modsComponent(donorSpawnerT, "UIAnimatedToggleSpawner")
   if donorSpawner == nil:
@@ -854,6 +918,10 @@ proc ntBuildOne(screenT, donorSpawnerT, donorPanelT: Il2CppPtr;
   discard modsSetActive(panelGo, false)   # ours starts hidden; the game owns the screen
 
   if gNtToggle.len < NtMaxTabs:
+    # `gNtToggle` survives ONLY as a build-time record for the inventory line.
+    # Nothing reads it for state: `gNtSpawnerComp` is the stable handle and
+    # `ntTabToggleNow` is the only way the live toggle is obtained (T13).
+    gNtSpawnerComp.add spawner
     gNtToggle.add toggle
     gNtPanelGo.add panelGo
     gNtTabComp.add tabComp
@@ -1027,6 +1095,7 @@ proc ntBuildControlsMods(screenT: Il2CppPtr): bool =
     discard modsSetActive(btnGo, false)
     return
   ntCallBegin("UIAnimatedToggleSpawner::SpawnObject (controls MODS)")
+  gNtKbSpawner = spawner
   gNtKbToggle = nuSpawnerSpawn(spawner)
   ntCallEnd()
   if gNtKbToggle == nil:
@@ -1036,7 +1105,7 @@ proc ntBuildControlsMods(screenT: Il2CppPtr): bool =
   discard nuSpawnerHeader(spawner, "MODS", 24'i32)
   discard nuSpawnerActive(spawner, true)
   ntCallBegin("UnityEngine.UI.Toggle::set_group (controls MODS)")
-  discard nuToggleSetGroup(gNtKbToggle, stockGroup)
+  discard nuToggleJoinGroup(gNtKbToggle, stockGroup)
   ntCallEnd()
   # THE PANEL: clone the stock Controls panel and empty it, the same way the
   # MODS tab's panel is made -- and by the same route, because both
@@ -1395,14 +1464,19 @@ proc ntBuildGfxStrip(screenT: Il2CppPtr): bool =
                      modsChildNamed(tg, "GraphicsToggleSpawner") else: nil)
   let pfxSpawnT = (if tg != nil:
                      modsChildNamed(tg, "PostFxToggleSpawner") else: nil)
-  gNtGfxTabToggle = (if gfxSpawnT != nil: modsToggleOf(gfxSpawnT) else: nil)
-  gNtPostFxTabToggle = (if pfxSpawnT != nil: modsToggleOf(pfxSpawnT) else: nil)
+  # THE SPAWNERS ARE WHAT IS KEPT (T13). `gNtGfxTabToggle` is read ONCE here,
+  # only to find the tab-bar ToggleGroup, and is never used as an identity
+  # afterwards -- every later question about the stock GRAPHICS toggle goes
+  # through `gNtGfxTabSpawner` and a fresh `_spawnedObject@0xa0` read.
   gNtGfxTabSpawner = (if gfxSpawnT != nil:
                         modsComponent(gfxSpawnT, "UIAnimatedToggleSpawner")
                       else: nil)
   gNtPostFxTabSpawner = (if pfxSpawnT != nil:
                            modsComponent(pfxSpawnT, "UIAnimatedToggleSpawner")
                          else: nil)
+  gNtGfxTabToggle = (if gNtGfxTabSpawner != nil:
+                       ntSpawnerToggleNow(gNtGfxTabSpawner)
+                     elif gfxSpawnT != nil: modsToggleOf(gfxSpawnT) else: nil)
   gNtTabGroup = nuToggleGroupOf(gNtGfxTabToggle)
   if gNtSubPanelA == nil or gNtSubPanelB == nil or gNtGfxTabToggle == nil or
      gNtScreen == nil:
@@ -1484,15 +1558,54 @@ proc ntBuildGfxStrip(screenT: Il2CppPtr): bool =
     # here without us writing anything.
     discard modsSetActive(cgo, true)
     let sp = modsComponent(c, "UIAnimatedToggleSpawner")
-    let tog = modsToggleOf(c)
-    if tog == nil:
-      warn "gfx strip: '" & caption & "' has no Toggle component, so its " &
-           "m_IsOn can never change and the subtab would be dead. Switching " &
-           "it off rather than shipping a button that does nothing."
+    let tog = (if sp != nil: ntSpawnerToggleNow(sp) else: modsToggleOf(c))
+    # NO SPAWNER MEANS NO STABLE IDENTITY (T13). A subtab whose toggle can
+    # only ever be named by a pointer we captured is a subtab that will stop
+    # responding the first time that toggle is replaced -- which is exactly
+    # what the 15:42 boot measured. Refusing is the honest answer; shipping it
+    # would be shipping the defect back.
+    if sp == nil or tog == nil:
+      warn "gfx strip: '" & caption & "' has " &
+           (if sp == nil: "no UIAnimatedToggleSpawner component"
+            else: "a spawner whose _spawnedObject@0xa0 is null or Unity-dead") &
+           ", so its live toggle cannot be re-resolved at press time and the " &
+           "subtab would go dead the moment the spawner replaced it. " &
+           "Switching it off rather than shipping a button that stops working."
       discard modsSetActive(cgo, false)
       b = b + 1
       continue
-    # THE GROUP, from what the field SAYS. See the header.
+    # THE SPAWNER'S OWN GROUP FIELD IS THE DURABLE ONE, and under T13 that
+    # distinction decides whether this survives a respawn.
+    #
+    # MEASURED (map 2.10, `R disasm 0x16bc7f0`): `SpawnObject` joins the new
+    # toggle to `this._toggleGroup@0xb0` -- the SPAWNER's field, not the old
+    # toggle's. So joining the toggle we can see fixes only the toggle we can
+    # see; the next respawn re-reads `_toggleGroup@0xb0` and puts the
+    # replacement wherever THAT points. If it pointed at the stock Controls
+    # group, our two subtabs would silently start fighting KEYBOARD AND MOUSE
+    # for exclusivity.
+    #
+    # Instantiating a subtree remaps an internal reference to the clone, and
+    # the ToggleGroup lives on the strip root we cloned, so this SHOULD
+    # already be our cloned group. "Should" is not a measurement. It is READ,
+    # and a disagreement REFUSES the subtab rather than being written over:
+    # `_toggleGroup@0xb0` is an 8-byte managed reference slot, and this whole
+    # change adds no raw store to any such slot anywhere.
+    let spGrp = (if nuOk(sp, NuOffSpawnerToggleGroup + 8'i32):
+                   cNuGetRef(sp, NuOffSpawnerToggleGroup) else: nil)
+    if spGrp != subGroup:
+      warn "gfx strip: '" & caption & "' spawner's _toggleGroup@0xb0 is " &
+           iPtr(spGrp) & " but our cloned ToggleGroup is " & iPtr(subGroup) &
+           ". SpawnObject joins a RESPAWNED toggle to the spawner's field, " &
+           "not to whatever we joined the old toggle to (T13), so this " &
+           "subtab would leave our group the first time its toggle is " &
+           "replaced -- and land in whatever group that pointer names, " &
+           "plausibly the stock Controls strip's. REFUSING this subtab " &
+           "rather than writing an 8-byte reference slot to paper over it."
+      discard modsSetActive(cgo, false)
+      b = b + 1
+      continue
+    # THE GROUP THE LIVE TOGGLE IS IN, from what the field SAYS.
     let grp = nuToggleGroupOf(tog)
     if grp == subGroup:
       alreadyOurs = alreadyOurs + 1
@@ -1507,7 +1620,7 @@ proc ntBuildGfxStrip(screenT: Il2CppPtr): bool =
     gNtSubSpawner.add sp
     made = made + 1
     b = b + 1
-  if made != 2:
+  if made != 2 or gNtSubSpawner.len != 2:
     ntNoteFault("gfx strip: only " & $made & " of 2 subtabs came out usable; " &
                 "hiding the strip rather than shipping a half-built one with " &
                 "no way back to PostFX.")
@@ -1893,19 +2006,23 @@ proc ntSubHighlight(sel: int) =
   ##
   ## ToggleSilently THROWS when the spawner has no spawned object (`call
   ## 0x5D2530`), and a managed throw is invisible to `aowl_p_p_seh` (§5 T9).
-  ## The precondition is that `modsToggleOf` found a live toggle under that
-  ## spawner at build time -- which is exactly what `gNtSubToggle[i]` being
-  ## non-nil records. Where it is nil we fall back to a plain silent
-  ## `Toggle::Set`, which loses the animation and says so.
+  ## The precondition is checked FRESH, every time: `ntSubToggleNow` reads
+  ## `_spawnedObject@0xa0` and returns nil if it is null or Unity-dead, which
+  ## is the same test the getter itself makes. A build-time pointer was not a
+  ## precondition at all -- it was an orphan (T13).
+  ##
+  ## Note the division of labour: the READ goes through the raw field, because
+  ## it must not be able to spawn; the WRITE goes through `ToggleSilently` on
+  ## the SPAWNER, which re-resolves through `get_SpawnedObject` internally and
+  ## so is correct even in the frame where a respawn happens.
   var i = 0
-  while i < gNtSubToggle.len and i < NtMaxSubs:
+  while i < ntSubCount():
     let want = (i == sel)
-    let (ok, isOn) = nuToggleIsOn(gNtSubToggle[i])
-    if ok and isOn != want:
-      if i < gNtSubSpawner.len and gNtSubSpawner[i] != nil:
+    let tog = ntSubToggleNow(i)
+    if tog != nil:
+      let (ok, isOn) = nuToggleIsOn(tog)
+      if ok and isOn != want:
         discard nuSpawnerToggleSilently(gNtSubSpawner[i], want)
-      else:
-        discard nuToggleSetQuiet(gNtSubToggle[i], want)
     i = i + 1
   gNtSubSel = sel
 
@@ -1926,13 +2043,18 @@ proc ntTabBarSync(group: int32) =
   ## toggle on in the tab group (P3), and it is the one the player can see.
   if group != NtGroupPostFx:
     return
-  if gNtPostFxTabToggle != nil:
-    let (okP, onP) = nuToggleIsOn(gNtPostFxTabToggle)
-    if okP and onP and gNtPostFxTabSpawner != nil:
+  # BOTH READS ARE FRESH (T13). The STOCK spawners replace their toggles
+  # too -- they are the same class of object as ours -- so a cached stock
+  # pointer is exactly as much of an orphan as a cached one of ours.
+  let pfxTog = ntSpawnerToggleNow(gNtPostFxTabSpawner)
+  if pfxTog != nil:
+    let (okP, onP) = nuToggleIsOn(pfxTog)
+    if okP and onP:
       discard nuSpawnerToggleSilently(gNtPostFxTabSpawner, false)
-  if gNtGfxTabToggle != nil:
-    let (okG, onG) = nuToggleIsOn(gNtGfxTabToggle)
-    if okG and not onG and gNtGfxTabSpawner != nil:
+  let gfxTog = ntSpawnerToggleNow(gNtGfxTabSpawner)
+  if gfxTog != nil:
+    let (okG, onG) = nuToggleIsOn(gfxTog)
+    if okG and not onG:
       discard nuSpawnerToggleSilently(gNtGfxTabSpawner, true)
 
 proc ntSubApply(sel: int) =
@@ -2061,21 +2183,30 @@ proc ntSubVerdict(why: string) =
   var onIdx = -1
   var readable = 0
   var i = 0
-  while i < gNtSubToggle.len and i < NtMaxSubs:
-    let (ok, isOn) = nuToggleIsOn(gNtSubToggle[i])
-    if ok:
-      readable = readable + 1
-      if isOn:
-        on = on + 1
-        onIdx = i
+  while i < ntSubCount():
+    # THE READ THAT WAS WRONG, LIVE, AT 15:45. It used to ask a build-time
+    # pointer for `m_IsOn` and got 0 from a destroyed object while a live,
+    # unselected toggle sat on screen -- so the verdict reported `0 of 2`
+    # accurately about an object nobody was looking at, which is worse than
+    # reporting nothing. `ntSubToggleNow` re-resolves through the spawner
+    # every time (T13).
+    let tog = ntSubToggleNow(i)
+    if tog != nil:
+      let (ok, isOn) = nuToggleIsOn(tog)
+      if ok:
+        readable = readable + 1
+        if isOn:
+          on = on + 1
+          onIdx = i
     i = i + 1
   let which = (if onIdx == 1: "POSTFX" elif onIdx == 0: "GRAPHICS SETTINGS"
                else: "none")
-  if readable != gNtSubN:
-    incon = incon & "[P4 only " & $readable & " of " & $gNtSubN &
-            " subtab toggles could be read] "
+  if readable != ntSubCount():
+    incon = incon & "[P4 only " & $readable & " of " & $ntSubCount() &
+            " subtab toggles could be re-resolved through their spawners " &
+            "(_spawnedObject@0xa0 read null or Unity-dead)] "
   elif on != 1:
-    fails = fails & "[P4 " & $on & " of " & $gNtSubN &
+    fails = fails & "[P4 " & $on & " of " & $ntSubCount() &
             " subtabs read m_IsOn=1; 0 means a press never reached m_IsOn " &
             "and 2 means nothing is enforcing exclusivity] "
 
@@ -2123,7 +2254,8 @@ proc ntSubVerdict(why: string) =
             "read m_IsOn=1; with the PostFX panel up this is how the top row " &
             "ends up lighting nothing, because ShowScreen(4) leaves the " &
             "HIDDEN stock POSTFX toggle on and GRAPHICS off] "
-  elif gNtLastGroup == NtGroupPostFx and tabOnPtr != gNtGfxTabToggle:
+  elif gNtLastGroup == NtGroupPostFx and
+       tabOnPtr != ntSpawnerToggleNow(gNtGfxTabSpawner):
     fails = fails & "[P3 the PostFX page is up but the tab-bar toggle that " &
             "is on is not GRAPHICS, so the lit tab is one the modstab fold " &
             "has hidden] "
@@ -2133,9 +2265,10 @@ proc ntSubVerdict(why: string) =
   let stripT = modsTransformOf(gNtSubStripGo)
   if stripT == nil or not iChildCount(stripT, stripKids):
     incon = incon & "[P6 the strip's childCount could not be read] "
-  elif stripKids != gNtSubN:
+  elif stripKids != ntSubCount():
     fails = fails & "[P6 the strip holds " & $stripKids & " child(ren) for " &
-            $gNtSubN & " subtab(s); trap T12 measured 4 where it must be 2, " &
+            $ntSubCount() & " subtab(s); trap T12 measured 4 where it must be " &
+            "2, " &
             "and the two extras were the donor's own toggles, never " &
             "reparented and still naming whatever group they came with] "
 
@@ -2167,7 +2300,7 @@ proc ntSubVerdict(why: string) =
           (if gNtLastGroup == NtGroupPostFx: " and it is GRAPHICS, with the " &
              "PostFX page up -- ShowScreen does not touch toggles, so the " &
              "stock GRAPHICS tab stays lit exactly as required" else: "") &
-          "; the strip holds " & $stripKids & " child(ren) for " & $gNtSubN &
+          "; the strip holds " & $stripKids & " child(ren) for " & $ntSubCount() &
           " subtab(s); parent LayoutGroup = " & gNtStripParentLayout &
           ". Every one of these was read back off the live tree " &
           $NtVerdictDelay & " frame(s) after the change, not from what we " &
@@ -2309,7 +2442,7 @@ proc ntInventory(when0: string) =
          (if i < gNtToggle.len: iPtr(gNtToggle[i]) else: "nil") & "]"
     i = i + 1
   s2 = s2 & "; " & $gNtToggle.len & " tab toggle(s) in the STOCK tab-bar " &
-       "ToggleGroup; " & $gNtSubToggle.len & " subtab toggle(s) in a CLONED " &
+       "ToggleGroup; " & $ntSubCount() & " subtab spawner(s) in a CLONED " &
        "group; strip=" & iPtr(gNtSubStripGo) & "; controls-MODS toggle=" &
        iPtr(gNtKbToggle) & " panel=" & iPtr(gNtKbPanelGo) & "; " &
        "donor rows are RETIRED (SetActive false), never destroyed."
@@ -2347,19 +2480,25 @@ proc ntDetachFromStockGroups(): int =
   ## state we left inconsistent. A stock `List<Toggle>` still naming a toggle
   ## whose GameObject went away with the SettingsScreen is exactly such a
   ## state, and this is the call that prevents it.
+  ## AND IT MUST UNREGISTER THE CURRENT TOGGLE, NOT THE ONE WE REMEMBER.
+  ## Under T13 a cached pointer names an object that is already destroyed, so
+  ## unregistering THAT achieves nothing while the live toggle stays in the
+  ## stock group -- which is the dangling shape this proc exists to prevent.
+  ## Resolving through the spawner is the difference between a detach that
+  ## works and a log line that says it did.
   result = 0
   var i = 0
-  while i < gNtToggle.len and i < NtMaxTabs:
-    if gNtToggle[i] != nil and iUnityAlive(gNtToggle[i]):
-      if nuToggleJoinGroup(gNtToggle[i], nil): result = result + 1
+  while i < gNtSpawnerComp.len and i < NtMaxTabs:
+    let t = ntTabToggleNow(i)
+    if t != nil and nuToggleJoinGroup(t, nil): result = result + 1
     i = i + 1
   var j = 0
-  while j < gNtSubToggle.len and j < NtMaxSubs:
-    if gNtSubToggle[j] != nil and iUnityAlive(gNtSubToggle[j]):
-      if nuToggleJoinGroup(gNtSubToggle[j], nil): result = result + 1
+  while j < ntSubCount():
+    let t2 = ntSubToggleNow(j)
+    if t2 != nil and nuToggleJoinGroup(t2, nil): result = result + 1
     j = j + 1
-  if gNtKbToggle != nil and iUnityAlive(gNtKbToggle):
-    if nuToggleJoinGroup(gNtKbToggle, nil): result = result + 1
+  let kt = ntSpawnerToggleNow(gNtKbSpawner)
+  if kt != nil and nuToggleJoinGroup(kt, nil): result = result + 1
 
 proc ntSettingsCloseEntered(regs: Il2CppPtr) =
   ## PREFIX on `SettingsScreen::Close()` @0x1720B10 (UNIQUE), dispatched by
@@ -2465,6 +2604,12 @@ proc ntTeardown(why: string) =
   gNtRowRoot = @[]
   gNtId = @[]
   gNtSpawnerGo = @[]
+  gNtSpawnerComp = @[]
+  gNtSubSpawner = @[]
+  gNtGameSpawner = nil
+  gNtKbSpawner = nil
+  gNtGfxTabSpawner = nil
+  gNtPostFxTabSpawner = nil
   gNtStockPanels = @[]
   gNtStockWasOn = @[]
   gNtSubToggle = @[]
@@ -2545,7 +2690,9 @@ proc ntTickBody() =
     let idx = gNtPressed
     gNtPressed = -1
     gNtStep = "tick: reading m_IsOn off the toggle that was pressed"
-    let (ok, isOn) = nuToggleIsOn(gNtToggle[idx])
+    let pressedTog = ntTabToggleNow(idx)
+    let (ok, isOn) = (if pressedTog != nil: nuToggleIsOn(pressedTog)
+                      else: (false, false))
     if ok:
       if isOn: ntShow(idx)
       else: ntHide()
@@ -2689,7 +2836,8 @@ proc ntTickBody() =
       gNtProofWait = 2
     elif gNtProofPhase == 1:
       let proofId = (if gNtId.len > 0: gNtId[0] else: "?")
-      if gNtToggle.len > 0 and nuTogglePress(gNtToggle[0], true):
+      let proofTog = ntTabToggleNow(0)
+      if proofTog != nil and nuTogglePress(proofTog, true):
         okLog "native tabs PROOF: pressed OUR tab '" & proofId & "' (index 0 " &
               "of " & $gNtToggle.len & " native tab(s) -- naming it because " &
               "with more than one of ours, 'our tab' is ambiguous and a " &
@@ -2710,7 +2858,8 @@ proc ntTickBody() =
       gNtProofPhase = 3
       gNtProofWait = 2
     elif gNtProofPhase == 3:
-      if gNtGameToggle != nil and nuTogglePress(gNtGameToggle, true):
+      let gameTog = ntSpawnerToggleNow(gNtGameSpawner)
+      if gameTog != nil and nuTogglePress(gameTog, true):
         okLog "native tabs PROOF: pressed the stock GAME tab back. A tab " &
               "that takes the screen and never returns it is a worse defect " &
               "than one that never takes it, so both directions are judged."

@@ -1085,6 +1085,75 @@ width is `501.34`, i.e. it is sized by its parent, not by us. Two of its four
 children are toggles we do not own and never reparented, and they are still in
 whatever `ToggleGroup` their `m_Group` names. Predicate 7 in §6.5 fails today.
 
+**T13 -- A SPAWNED TOGGLE POINTER IS NOT STABLE, AND THE SPAWNER SILENTLY
+REPLACES IT.** MEASURED `R disasm 0x37ea0c0`
+(``UISpawner`1::get_SpawnedObject``, generic body, 1 instantiation):
+
+```
+get_SpawnedObject(this):
+    rdi = this._spawnedObject@0xa0
+    if (rdi == null || rdi.m_CachedPtr@0x10 == 0) {        ; null OR Unity-DEAD
+        virtual klass+0x268   SpawnObject()                ; <-- RESPAWNS
+        virtual klass+0x278   SetHeaderText(this@0x78, this@0x80)
+        if (this@0x90 >= 0f) virtual klass+0x288  SetMinWidth(this@0x90)
+        virtual klass+0x298   SetEllipsis(this@0x94)
+    }
+    return this._spawnedObject@0xa0
+```
+
+So the getter is a **lazy factory, not an accessor**: the instant the toggle it
+made is destroyed, the next read of the property builds a NEW one and rewrites
+`_spawnedObject@0xa0`. Nothing announces this. A pointer captured from
+`SpawnObject()` at build time therefore becomes an orphan -- still readable,
+still reporting `m_IsOn = 0` forever, never again the object the player clicks.
+
+Corroborating MEASURED facts:
+
+* `R callers 0x16BC7F0` (`UIAnimatedToggleSpawner::SpawnObject`) reports **0
+  direct callers** -- it is reached ONLY through the vtable slot `klass+0x268`
+  from inside `get_SpawnedObject`. Nothing else in the build calls it.
+* **There is no `OnEnable` anywhere in the spawner chain.** `R typemethods
+  EFT.UI.UISpawner`1` declares 9 methods and `EFT.UI.UIAnimatedToggleSpawner`
+  declares 9; neither list contains `OnEnable`, `Awake` or `Start`. The trigger
+  is *"the old one is dead when someone asks"*, **not** *"the GameObject was
+  enabled"*.
+* `ToggleSilently` @`0x16BCBA0` and every stock driver reach the toggle through
+  `get_SpawnedObject` on **every single call** (`R disasm 0x16bcba0`), which is
+  why the game itself never suffers from this.
+
+**Runtime offsets on `UIAnimatedToggleSpawner` for this instantiation**, BORROWED
+from that body (the ``UISpawner`1`` fields are `GENERIC` and have no offline
+row -- §1.6): `_headerCaption@0x78`, `_headerFontSize@0x80`, `_minWidth@0x90`
+(float), `_useEllipsis@0x94` (bool), **`_spawnedObject@0xa0`**. `T` is
+`AnimatedToggle`, cross-confirmed because `ToggleSilently` passes the getter's
+return straight to `Toggle::Set` and then reads `m_Transition@0x50` and
+`_onTrigger@0x128` off it.
+
+**LIVE CONFIRMATION, host log 2026-09-02 15:42 boot, lines 930-1129.** The
+subtab strip built at 2:49.5 and one press worked at 2:50.8 (VERDICT PASS).
+The user then cycled the top-row tabs; from 2:52 the `Toggle::Set` drain
+printed *new* first-time pointers for objects under our own strip
+(`0x1d0277a2000` / `0x1d0277a22a0`, then `0x1cfcf79dd20` / `0x1cfcf79da80` at
+3:15), every one classified `matched-as=other`. From 3:12 every verdict read
+`P4 0 of 2 subtabs read m_IsOn=1` while `_currentTab` was correctly
+`Graphics Settings`, and on screen neither subtab was selected and neither did
+anything. That is this trap exactly: the cached pointers were orphans, so
+presses did not match and `ToggleSilently` aimed at the dead objects.
+
+**THE ONLY CORRECT SHAPE: never hold a spawned-toggle pointer.** Hold the
+**spawner component** -- which is not replaced -- and resolve the toggle at the
+moment you need it, either by calling a spawner method that does it for you
+(`ToggleSilently`, `SetHeaderText`, `SetActive`) or by a guarded raw read of
+`_spawnedObject@0xa0`. Prefer the raw read for *reading*: the property getter
+can SPAWN, which is a managed allocation and a vtable storm on whatever path
+asked, and a verdict must not be able to change what it is judging.
+
+**OPEN: what destroys the spawned toggle here.** Not established. Candidates
+are ``UISpawner`1::Cleanup`` (generic body `0x37EA880`) and the settings
+close/tab-init path. The fix above does not depend on the answer -- it is
+correct for any destroyer -- but the answer is worth having, because whatever
+it is is also touching objects of ours.
+
 ---
 
 ## 6. What a correct implementation must do

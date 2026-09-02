@@ -276,6 +276,19 @@ const
   NuOffSpawnerToggleGroup = 0xb0'i32  ## UIAnimatedToggleSpawner._toggleGroup
   NuOffSpawnerSiblingIdx  = 0xbc'i32  ## ._siblingIndex : int
   NuOffSpawnerPrefab      = 0xc0'i32  ## ._spawnableToggle : UISpawnableToggle
+  ## `UISpawner`1._spawnedObject` -- THE CURRENT TOGGLE, and the single most
+  ## important offset in this file.
+  ##
+  ## BORROWED from a verified body, and it has to be: the ``UISpawner`1``
+  ## fields are `GENERIC` (map §1.6) and IL2CPP writes an all-zero fieldOffsets
+  ## row for an uninstantiated generic, so there is no offline row to read.
+  ## MEASURED `R disasm 0x37ea0c0` -- `get_SpawnedObject` loads
+  ## `rdi = [rbx+0xa0]`, tests it for null AND for `m_CachedPtr@0x10 == 0`
+  ## (Unity-dead), RESPAWNS through the vtable if either holds, and returns
+  ## `[rbx+0xa0]`. `T` is `AnimatedToggle`, cross-confirmed because
+  ## `ToggleSilently` @0x16BCBA0 hands that return straight to `Toggle::Set`
+  ## and then reads `m_Transition@0x50` and `_onTrigger@0x128` off it.
+  NuOffSpawnerSpawnedObj  = 0xa0'i32
   NuOffToggleGroup        = 0x110'i32 ## UnityEngine.UI.Toggle.m_Group
   NuOffToggleIsOn         = 0x120'i32 ## UnityEngine.UI.Toggle.m_IsOn
   NuOffTabCreatedControls = 0x88'i32  ## SettingsTab._createdControls
@@ -1051,6 +1064,31 @@ proc nuToggleSetQuiet*(toggle: Il2CppPtr; on: bool): bool =
   if fn == nil: return
   cNuCallVPBB(fn, toggle, (if on: 1'i32 else: 0'i32), 0'i32)
   true
+
+proc nuSpawnerCurrentToggle*(spawner: Il2CppPtr): Il2CppPtr =
+  ## THE CURRENT spawned `AnimatedToggle` of a `UIAnimatedToggleSpawner`, read
+  ## fresh. Trap T13: there is no such thing as a stable spawned-toggle
+  ## pointer, so there is no legitimate place to cache one.
+  ##
+  ## A RAW READ OF `_spawnedObject@0xa0`, NOT a call to `get_SpawnedObject`,
+  ## and the difference is the whole design. MEASURED `R disasm 0x37ea0c0`:
+  ## the property getter is a LAZY FACTORY -- when the field is null or the
+  ## object behind it is Unity-dead it calls `SpawnObject` through the vtable,
+  ## re-runs `SetHeaderText`/`SetMinWidth`/`SetEllipsis`, and rewrites the
+  ## field. That is a managed allocation and a vtable storm on whatever path
+  ## asked, and a verdict that can CREATE the object it is judging is the
+  ## purest form of a check that cannot fail. The raw read observes; it never
+  ## changes anything.
+  ##
+  ## The Unity-alive test is the same one the getter uses (`m_CachedPtr@0x10`),
+  ## so a dead toggle comes back as nil here rather than as a plausible pointer
+  ## whose `m_IsOn` reads 0 forever.
+  result = nil
+  if not nuOk(spawner, NuOffSpawnerSpawnedObj + 8'i32): return
+  let tog = cNuGetRef(spawner, NuOffSpawnerSpawnedObj)
+  if not nuOk(tog, NuOffToggleIsOn + 4'i32): return
+  if not nuAlive(tog): return
+  result = tog
 
 proc nuSpawnerToggleSilently*(spawner: Il2CppPtr; on: bool): bool =
   ## `UIAnimatedToggleSpawner::ToggleSilently(bool)` @0x16BCBA0, UNIQUE.
