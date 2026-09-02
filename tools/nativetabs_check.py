@@ -203,6 +203,13 @@ def cmd_verify():
     # could have moved. Unchanged geometry is only evidence once the host says
     # the tab was built. Read the host's own trail: a fault ceiling is a FAIL,
     # and no VERDICT line at all is "I could not look", never a pass.
+    if problems:
+        # A changed stock geometry is a FAIL whatever the host says about
+        # itself -- it is the one assertion that has always broken.
+        for p in problems:
+            say("FAIL", p)
+        return FAIL
+
     trail = host_native_tabs_lines()
     if trail is None:
         say("INCONCLUSIVE", "the host log could not be read, so whether the "
