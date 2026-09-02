@@ -64,6 +64,11 @@ def logpath(args, which):
     p = args.file or os.path.join(args.root, name)
     if not os.path.isfile(p):
         die("no such log: %s\n(pass --root or --file)" % p)
+    # Always name the FULL path being read. Two agents were answered about a
+    # different file than they asked for, and the output showed only the
+    # basename -- identical for the default and the requested log -- so nothing
+    # on screen could reveal it.
+    print("reading %s" % os.path.abspath(p))
     return p
 
 
@@ -339,13 +344,26 @@ def main(argv=None):
     #     wirelog.py route profile/list --full 4000
     # died with "unrecognized arguments: --full 4000". Nothing about that
     # error says "move the flag left".
+    # These are accepted BEFORE or AFTER the subcommand. The trap, measured
+    # twice on 2026-09-01 by two different agents: with ordinary defaults, a
+    # flag given BEFORE the subcommand was parsed by `ap`, and then the
+    # subparser (which inherits the same options via `parents`) ran and its
+    # own default `None` OVERWROTE the value. `--file X grep P` silently read
+    # the DEFAULT log and printed the same basename, so nothing revealed it
+    # had answered about another file -- a confidently wrong answer that once
+    # nearly made an agent conclude its fix had not taken. `SUPPRESS` makes a
+    # parser set the attribute only when the flag was actually given; the real
+    # defaults are applied once, after parsing.
+    GL_DEFAULTS = {"root": DEFAULT_ROOT, "file": None, "width": 200,
+                   "max_lines": 60, "preview": 200, "full": 0}
+    S = argparse.SUPPRESS
     gl = argparse.ArgumentParser(add_help=False)
-    gl.add_argument("--root", default=DEFAULT_ROOT)
-    gl.add_argument("--file", help="read this log file instead of --root/<name>")
-    gl.add_argument("--width", type=int, default=200, help="hard cap per printed line")
-    gl.add_argument("--max-lines", type=int, default=60, help="hard cap on rows printed")
-    gl.add_argument("--preview", type=int, default=200, help="default body preview chars")
-    gl.add_argument("--full", type=int, default=0, help="raise the BODY cap to N chars")
+    gl.add_argument("--root", default=S)
+    gl.add_argument("--file", default=S, help="read this log file instead of --root/<name>")
+    gl.add_argument("--width", type=int, default=S, help="hard cap per printed line")
+    gl.add_argument("--max-lines", type=int, default=S, help="hard cap on rows printed")
+    gl.add_argument("--preview", type=int, default=S, help="default body preview chars")
+    gl.add_argument("--full", type=int, default=S, help="raise the BODY cap to N chars")
     for _a in gl._actions:
         ap._add_action(_a)
     sub = ap.add_subparsers(dest="cmd", required=True, parser_class=(
@@ -374,6 +392,9 @@ def main(argv=None):
     p.set_defaults(fn=cmd_nettrace)
 
     args = ap.parse_args(argv)
+    for _k, _v in GL_DEFAULTS.items():
+        if not hasattr(args, _k):
+            setattr(args, _k, _v)
     if getattr(args, "pattern", None):
         args.pattern, note = unmangle(args.pattern)
         if note:
