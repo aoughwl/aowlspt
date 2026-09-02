@@ -2589,6 +2589,29 @@ proc cmdTest(e: Env): int =
       discard run(e, "quieting the maps diag block did not also quiet any " &
                      "FAIL or INCONCLUSIVE verdict in it", quoted(mdExe))
 
+    # THE SAME GATE FOR natesp'S VERDICT BLOCK. MEASURED at the main menu: the
+    # ~3,000-character `natesp VERDICT INCONCLUSIVE` block was written every 5 s
+    # forever -- hundreds of kilobytes of "I could not look" in the one file
+    # every tool in this repo reads. `host/Aowlspt.Host.Il2Cpp/nelogpol.nim` is
+    # the pure half of the replacement, and this drives the SHIPPED `neGateStep`
+    # over synthetic tick sequences: a standing not-PASS must still be named
+    # within 60 s forever and can never be reported as a heartbeat, every change
+    # of verdict/reason/phase/canvas must re-print in full, an all-PASS must
+    # still heartbeat, and `natespVerbose` must restore the firehose exactly.
+    # Mutating the not-PASS branch to return `neQuiet` makes it fail with
+    # "went 599 cycles (2995s) unannounced".
+    let nlExe = joinPath(e.repo, "installer\\build\\natesplog.exe")
+    var nlCmd = quoted(nimonyExe(e))
+    nlCmd.add " c"
+    nlCmd.add abiInclude(e)
+    nlCmd.add " -p:" & quoted(joinPath(e.repo, "host\\Aowlspt.Host.Il2Cpp"))
+    nlCmd.add " -o:" & quoted(nlExe)
+    nlCmd.add " " & quoted(joinPath(e.repo, "tests\\natesplog.nim"))
+    if run(e, "natesplog builds", nlCmd, e.repo):
+      discard run(e, "quieting the natesp verdict block did not also quiet " &
+                     "any not-PASS verdict, and natespVerbose still restores " &
+                     "the firehose", quoted(nlExe))
+
     let tuiExe = joinPath(e.repo, "installer\\build\\tuilayout.exe")
     var tlCmd = quoted(nimonyExe(e))
     tlCmd.add " c"

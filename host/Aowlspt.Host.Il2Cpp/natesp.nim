@@ -209,6 +209,11 @@ const
   NeRCanvasCreate = 16'i32
   NeRCanvasUnverified = 17'i32
 
+## THE LOG-EMISSION POLICY, in its own PURE file so it can be driven with
+## synthetic ticks offline (`tests/natesplog.nim`). It decides only WHEN TO
+## REPEAT a line; it suppresses no measurement and it can silence no not-PASS.
+include "nelogpol.nim"
+
 const
   NeVInconclusive = 0'i32
   NeVFail         = 1'i32
@@ -244,9 +249,34 @@ const NeMaxPool = 64          ## must equal AOWL_NE_POOL; asserted at bind
 const NeMaxContacts = 64      ## players read per census pass
 const NeOffGraphicColor  = 0x28'i32
 
-# ---- flags. Both default OFF. -------------------------------------------
+# ---- flags. All default OFF. --------------------------------------------
 var gNeOn = false
 var gNeDiag = false
+var gNeVerbose* = false
+  ## The `natespVerbose` setting. DEFAULT FALSE. Same convention, and the same
+  ## reason, as the maps mod's `profileVerbose`: ON restores the OLD behaviour
+  ## byte for byte -- the whole ~3,000-character verdict block every 5 s and the
+  ## whole flicker line every 1 s, forever. OFF suppresses no MEASUREMENT: every
+  ## string below is still produced by the same functions, verbatim, including
+  ## "I could not look; that is NOT a pass". It only decides when to REPEAT one.
+
+var gNeGateStage = "the raid gate has not run yet"
+  ## WHICH stage of the raid gate blocked this tick, in words. Set on every
+  ## branch of `neRaidGate`, pass included, so it can never describe an older
+  ## tick. The refusal CODE cannot carry this: `NeRNoGameWorld` reads as "there
+  ## is no GameWorld" and was being used for "the deploy latch has not fired",
+  ## which are different facts with different fixes.
+var gNeGateOpenMs = 0'u64     ## cNowMs() the FIRST tick the gate fully passed
+var gNeFirstDrawMs = 0'u64    ## cNowMs() the FIRST tick a box was actually placed
+var gNeLedgerSaid = false     ## the deploy ledger has been printed for this raid
+
+var gNeVerdictGate = newNeGate()
+  ## Change-detection for the 5 s verdict block. Keyed on the VERDICT STATE, not
+  ## on the rendered text -- the text carries tick counts and microsecond means
+  ## and so is always unequal, which is how a change-detector becomes an
+  ## unconditional timer (measured, and recorded in `mods/maps/diagfilter.nim`).
+var gNeFlkGate = newNeGate()
+  ## The same, for the 1 s flicker meter, keyed on the SHAPE of the flicker.
 
 # ---- state ---------------------------------------------------------------
 var gNeState = NeIdle
@@ -653,9 +683,34 @@ proc neRaidGate(sw, sh: var float64): int32 =
   # live AllAlivePlayersList, and the `SessionEndUIScene` results-screen
   # signal, and it answers UNKNOWN -- which is FALSE here -- rather than
   # guessing. See raidphase.nim for what it does and does NOT prove.
-  if not rpDeployed(): return NeRNoGameWorld
-  if neCamera() == nil: return NeRNoCamera
-  if not duCanvasSize(sw, sh): return NeRNoScreen
+  #
+  # WHICH STAGE BLOCKED IT IS NAMED, EVERY TIME. The refusal CODE cannot say
+  # this: `NeRNoGameWorld` reads as "there is no GameWorld", which is a
+  # different fact from "a GameWorld exists and the deploy latch has not
+  # fired". Those two were reported as one thing, and a user reading the log
+  # cannot tell a pre-deploy loading screen from a broken world read. The stage
+  # string is therefore set on EVERY branch, including the passing one, so it
+  # can never be a stale description of an earlier tick.
+  if not rpDeployed():
+    gNeGateStage = "S6 TRUE-DEPLOY: raidphase reports " &
+      rpPhaseName(rpPhase()) & " and rpDeployed() is FALSE. This is the " &
+      "DEPLOY LATCH, not a missing world -- a GameWorld is cached from scene " &
+      "load onward and its existence is NOT deployment."
+    return NeRNoGameWorld
+  if neCamera() == nil:
+    gNeGateStage = "S5 CAMERA: raidphase has LATCHED DEPLOYED, but " &
+      "Camera.main reads NULL. The deploy stage passed; the camera stage did " &
+      "not, and these are different failures with different fixes."
+    return NeRNoCamera
+  if not duCanvasSize(sw, sh):
+    gNeGateStage = "SCREEN: deploy and camera both passed, but the screen " &
+      "size did not read back, so nothing can be projected this tick."
+    return NeRNoScreen
+  gNeGateStage = "every stage passed (S6 true-deploy LATCHED, Camera.main " &
+    "non-null, screen readable)"
+  # THE FIRST TICK AT WHICH DRAWING BECAME PERMISSIBLE, timestamped once per
+  # raid. Read the ledger's caveat before drawing a conclusion from it.
+  if gNeGateOpenMs == 0'u64: gNeGateOpenMs = cNowMs()
   NeRNone
 
 # ---------------------------------------------------------------------------
@@ -2452,7 +2507,8 @@ proc neVerdictBody(sw, sh: float64): string =
          "budget was spent, no node was visited. Whatever went wrong is in " &
          "SEEDING (see the `seed:` fields above), not in the walk."
        else: "") &
-      " I could not look; that is NOT a pass."
+      " GATE STAGE: " & gNeGateStage &
+      ". I could not look; that is NOT a pass."
 
 proc neFlickerPending(): bool =
   ## Did ANYTHING transition in this window? A steady raid answers false and
@@ -2491,6 +2547,33 @@ proc neFlickerLine(ms: uint64): string =
     "gateEdges=" & $gNeFlkGateEdgesEver & " teardowns=" &
     $gNeFlkTeardownsEver & " boxOff=" & $gNeFlkBoxOffEver & "."
 
+proc neFlickerSigNow(): string =
+  ## The SHAPE of the flicker this window, for the change detector. The counts
+  ## themselves are deliberately NOT in it: eleven box-offs and twelve box-offs
+  ## are the same news, and keying on them would make the detector fire every
+  ## window -- which is the exact defect `mods/maps/diagfilter.nim` records.
+  var mask = ""
+  var i = 0
+  while i < NeFlkReasons:
+    if gNeFlkGateReason[i] > 0'i32:
+      mask = mask & $i & ","
+    inc i
+  neFlickerSig(gNeFlkGateEdges, gNeFlkTeardowns, gNeFlkCensusDrop,
+               gNeFlkBoxOff, gNeFlkBoxOn, mask, int(gNeState),
+               int(gNeCanvasOrigin), gNeFlkCanvasActive)
+
+proc neFlickerShort(ms: uint64): string =
+  ## ONE line for a flicker whose SHAPE has not changed. It still names every
+  ## count, so nothing is hidden -- it is the same facts without the reason
+  ## breakdown, the ancestor readback and the session totals.
+  "natesp: FLICKER STILL PRESENT and unchanged in shape for " &
+  $gNeFlkGate.quiet & " window(s) (" & $ms & "ms): gateEdges=" &
+  $gNeFlkGateEdges & " teardowns=" & $gNeFlkTeardowns &
+  " censusCarryForward=" & $gNeFlkCensusDrop & " boxSetActive(false)=" &
+  $gNeFlkBoxOff & " boxSetActive(true)=" & $gNeFlkBoxOn &
+  ". The full meter prints again the moment the shape changes; " &
+  "`natespVerbose` restores it every window."
+
 proc neFlickerReset() =
   gNeFlkGateEdges = 0
   gNeFlkTeardowns = 0
@@ -2509,6 +2592,50 @@ proc neVerdictLine(sw, sh: float64): string =
   ## the other is the branch that costs a session.
   neVerdictBody(sw, sh) & "  [" & neClsHistText() & " -- " & neClsVerdict() &
     "]  [" & neColourLine() & "]  [" & neCostLine() & "]"
+
+proc neVerdictClassName(): string =
+  case int(gNeVerdict)
+  of 2: "PASS"
+  of 1: "FAIL"
+  else: "INCONCLUSIVE"
+
+proc neVerdictSigNow(): string =
+  ## Built from the STATE, never from `neVerdictLine`'s text. The text carries
+  ## `ticks=`, microsecond means and a cumulative histogram, all of which move
+  ## every cycle, so a text comparison is always unequal and suppresses nothing.
+  neVerdictSig(int(gNeVerdict), int(gNeWhy), gNeState, int(gNeCanvasOrigin),
+               int(rpPhase()), gNeCn, gNeShown, gNeOnScreen, gNeBuilt,
+               gNeSeeded, gNeVerdictAt > 0'i64)
+
+proc neVerdictShort(): string =
+  ## The one line that a STANDING not-PASS verdict gets every 60 s, forever.
+  ## It names the class and the reason -- so a grep for INCONCLUSIVE or FAIL
+  ## still finds it in a quiet run -- and it says explicitly that the full block
+  ## is being withheld only because NOTHING HAS MOVED, which is a different
+  ## claim from "everything is fine".
+  result = "natesp: VERDICT STILL " & neVerdictClassName() & " after " &
+    $gNeVerdictGate.quiet & " unchanged cycle(s) (" &
+    $(gNeVerdictGate.quiet * 5'i64) & "s): " &
+    readCString(cNeRefusalText(gNeWhy)) &
+    " (state=" & $gNeState & " origin=" & neOriginName(gNeCanvasOrigin) &
+    " contacts=" & $gNeCn & " placed=" & $gNeShown & " built=" & $gNeBuilt &
+    " phase=" & rpPhaseName(rpPhase()) & ")."
+  if gNeVerdict != NeVPass:
+    result = result & " I could not look; that is NOT a pass."
+  result = result &
+    " The full block prints again the moment the verdict, the reason, the " &
+    "phase, the canvas or any count crosses zero; `natespVerbose` restores it " &
+    "every 5s."
+
+proc neVerdictBeat(): string =
+  ## All-PASS and unchanged. A HEARTBEAT, not a verdict: it says the instrument
+  ## is still running and how long the PASS has stood. Pure silence here would
+  ## be indistinguishable from a dead timer, which is the same "I could not look
+  ## reads as a pass" failure the verdict exists to prevent.
+  "natesp: VERDICT all-PASS, unchanged for " & $gNeVerdictGate.quiet &
+  " cycle(s) (" & $(gNeVerdictGate.quiet * 5'i64) & "s); last readback " &
+  $(gNeTicks - gNeVerdictAt) & " tick(s) ago. The full block is re-printed " &
+  "the moment anything changes."
 
 # ---------------------------------------------------------------------------
 # THE TICK -- one body, one guard, ridden on the existing Update drain
@@ -2658,6 +2785,12 @@ proc neTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ne_tick_body", cdecl.}
       gNeState = NeIdle
       gNeVerdict = NeVInconclusive
       gNeVerdictAt = 0          # the pool is gone; the cached verdict is void
+      # THE LEDGER IS PER RAID, so the teardown that ends one raid must reset
+      # it. Leaving it latched would make the next raid report the PREVIOUS
+      # raid's timestamps -- a number that looks measured and is not.
+      gNeGateOpenMs = 0'u64
+      gNeFirstDrawMs = 0'u64
+      gNeLedgerSaid = false
       cNeCostPhase(NePhGate)
       return cast[Il2CppPtr](1)
     # From here on this tick IS the steady state: the only phase under budget.
@@ -2674,6 +2807,10 @@ proc neTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ne_tick_body", cdecl.}
     let flkBefore = gNeFlkBoxOff + gNeFlkBoxOn + gNeFlkTeardowns +
                     gNeFlkCensusDrop
     nePlace(sw, sh)
+    # THE FIRST TICK THAT ACTUALLY PLACED A BOX, timestamped once per raid.
+    # Recorded here, INSIDE the guard where the placement happened, and printed
+    # outside it -- nothing in the ledger calls into the game.
+    if gNeFirstDrawMs == 0'u64 and gNeShown > 0: gNeFirstDrawMs = cNowMs()
     if (gNeFlkBoxOff + gNeFlkBoxOn + gNeFlkTeardowns + gNeFlkCensusDrop) ==
        flkBefore:
       gNeFlkStableTicks = gNeFlkStableTicks + 1
@@ -2784,17 +2921,87 @@ proc natEspDrainTick() =
   # nothing, so the presence of this line is the finding.
   if gNeFlkSince == 0'u64: gNeFlkSince = cNowMs()
   if (cNowMs() - gNeFlkAt) >= 1000'u64:
-    if neFlickerPending():
-      warn neFlickerLine(cNowMs() - gNeFlkSince)
     gNeFlkAt = cNowMs()
-    gNeFlkSince = cNowMs()
-    neFlickerReset()
+    if neFlickerPending():
+      # THE WINDOW IS NOT RESET WHEN NOTHING IS PRINTED. If a continuing
+      # flicker is only reported once a minute, the counts it reports must
+      # cover that whole minute -- resetting a window we did not report would
+      # throw away transitions that really happened and make the printed line
+      # an understatement. So the accumulator and `gNeFlkSince` are cleared on
+      # EMIT, and the line always states the window length it covers.
+      let fsig = neFlickerSigNow()
+      case neGateStep(gNeFlkGate, gNeVerbose, fsig, true,
+                      NeFlickerEvery, NeFlickerEvery)
+      of neFull:
+        warn neFlickerLine(cNowMs() - gNeFlkSince)
+        gNeFlkSince = cNowMs()
+        neFlickerReset()
+      of neNotPass, neHeartbeat:
+        warn neFlickerShort(cNowMs() - gNeFlkSince)
+        gNeFlkSince = cNowMs()
+        neFlickerReset()
+      of neQuiet:
+        discard
+    else:
+      # A STEADY window: nothing transitioned, so there is nothing to report
+      # and never was -- this is the case that always printed nothing. Clearing
+      # the gate here means the NEXT flicker, after any period of calm, prints
+      # in FULL rather than being counted as a continuation of an older one.
+      gNeFlkGate.seen = false
+      gNeFlkGate.quiet = 0'i64
+      gNeFlkSince = cNowMs()
+      neFlickerReset()
+  # THE DEPLOY LEDGER, ONCE PER RAID, and NOT gated on `natEspDiag`: the user
+  # report it answers ("the ESP is on before we actually deploy") is
+  # user-visible, so the log must carry the timestamps without anyone having
+  # turned an extra flag on first.
+  #
+  # WHAT IT PROVES, AND -- MORE IMPORTANTLY -- WHAT IT DOES NOT. It reports the
+  # first tick the gate opened, the first tick a box was really placed, and the
+  # delta. `firstDraw >= gateOpen` is GUARANTEED BY THE GATE, so that ordering
+  # is a check that cannot fail and is NOT offered as evidence of anything. The
+  # open question is the one this cannot answer: raidphase latches DEPLOYED on
+  # `EFT.GameWorld::OnGameStarted`, which fires when the deploy countdown
+  # BEGINS, whereas "actually deployed" is the countdown ENDING and the player
+  # being released. natesp has no signal for that end, so it says so in its own
+  # line rather than implying the gate is correct.
+  if gNeFirstDrawMs != 0'u64 and not gNeLedgerSaid:
+    gNeLedgerSaid = true
+    okLog "natesp DEPLOY LEDGER (once per raid): raid gate first OPENED at " &
+          $gNeGateOpenMs & "ms, first box actually PLACED at " &
+          $gNeFirstDrawMs & "ms, delta=" & $(gNeFirstDrawMs - gNeGateOpenMs) &
+          "ms. The gate stage that admitted it: " & gNeGateStage &
+          ". CAVEAT, stated because the delta looks like a proof and is not: " &
+          "firstDraw >= gateOpen is guaranteed by the gate itself and " &
+          "establishes NOTHING about the countdown. raidphase latches " &
+          "DEPLOYED on EFT.GameWorld::OnGameStarted, which fires when the " &
+          "deploy countdown STARTS; the player is released when it ENDS. " &
+          "natesp is gated on the START, so boxes CAN be drawn over the " &
+          "countdown. That is a known, unfixed defect -- it needs a later " &
+          "signal than OnGameStarted, and no such signal is bound yet."
   if gNeDiag and (cNowMs() - gNeDiagAt) > 5000'u64:
     gNeDiagAt = cNowMs()
     var sw = 0.0
     var sh = 0.0
     discard duCanvasSize(sw, sh)
-    okLog neVerdictLine(sw, sh)
+    # THE VERDICT, ON A CHANGE-DETECTOR (see `nelogpol.nim`). MEASURED at the
+    # main menu: this block is ~3,000 characters and it said the same thing
+    # every 5 s forever -- hundreds of kilobytes of "I could not look" in the
+    # one file every tool in the repo reads. The MEASUREMENT is unchanged: the
+    # readback still runs on its own schedule, `neVerdictLine` still builds the
+    # same string verbatim, and a not-PASS is re-announced on its own line at
+    # `warn` every 60 s for as long as it stands. Only the REPEAT is throttled.
+    let vsig = neVerdictSigNow()
+    case neGateStep(gNeVerdictGate, gNeVerbose, vsig, gNeVerdict != NeVPass,
+                    NeVerdictBadEvery, NeVerdictBeatEvery)
+    of neFull:
+      okLog neVerdictLine(sw, sh)
+    of neNotPass:
+      warn neVerdictShort()
+    of neHeartbeat:
+      okLog neVerdictBeat()
+    of neQuiet:
+      discard
     # The lifecycle gate, stated separately and never folded into the verdict:
     # "no boxes" because the player has not deployed is a different fact from
     # "no boxes" because the placement failed, and one line that says both is
@@ -2866,4 +3073,8 @@ proc bindNativeEsp*(verbose: bool) =
         "parents to a guessed pointer. FLAT pool of " & $NeMaxPool &
         " Image boxes, built once, shown by toggling active, coloured per " &
         "placement by class with a distance fade. " & neColourLine() &
-        ". Verdict every 5s with natEspDiag."
+        ". Verdict with natEspDiag: in FULL on the first cycle and on every " &
+        "change of verdict, reason, phase or canvas; a not-PASS is " &
+        "re-announced as one line every 60s for as long as it stands; " &
+        "all-PASS heartbeats every 5min. `natespVerbose` restores the full " &
+        "block every 5s. The `raid phase =` line keeps its 5s cadence."
