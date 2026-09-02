@@ -200,6 +200,35 @@ var gAnchorRefused = ""
   ## (readOpts is on the reconcile's tick). Empty means the configured spelling
   ## is one we accept.
 
+var gActRefused = ""
+var gDetailRefused = ""
+var gEnemyRefused = ""
+  ## Same contract as `gAnchorRefused` above, one per new enum: the LAST text
+  ## this build did not accept, so a refusal is logged once per distinct bad
+  ## value instead of once a second forever. Empty = the configured spelling is
+  ## one we accept. `gEnemyRefused` additionally latches an accepted-but-
+  ## UNAVAILABLE value (`shootOnly`), because "we understood you and cannot do
+  ## it" has to be said exactly as loudly as "we did not understand you".
+
+var gDetailOverrode = ""
+  ## The last detail preset -> layer resolution that CHANGED one of the three
+  ## layer switches, so the override is announced on change rather than every
+  ## reconcile. A preset quietly winning over a switch the player set by hand is
+  ## precisely the silent-no-op failure this mod keeps paying for.
+
+var gMasterState = -1
+  ## The last `enabled` state the master-gate line reported: -1 never reported,
+  ## 0 off, 1 on. Drives one log line per STATE CHANGE, never per frame.
+var gMasterGatedAt = 0'i64
+  ## `hudGated()` at the moment the feature was switched off, so the OFF line
+  ## can quote the number of dispatches that have since submitted zero
+  ## primitives. A count taken from the moment of the edit is falsifiable: if
+  ## the gate were not doing its job the delta would stay at 0 while frames ran.
+
+var gPlaceLast = ""
+  ## The last placement line emitted, so the resolved widget rect is logged once
+  ## per change rather than once a frame.
+
 var gHeadingOn = false
   ## The `heading` setting. Flag-gated and default OFF, like everything else
   ## here. When off, the measured heading is DISCARDED at publish time rather
@@ -621,6 +650,83 @@ proc readOpts(o: var HudOpts) =
   o.fsZoom    = asFloat(setting("fullscreenZoom"), 1.0)
   o.fsOpacity = asFloat(setting("fullscreenOpacity"), 0.92)
   o.fsNorthUp = asBool(setting("fullscreenNorthUp"), true)
+
+  # ---- PRESS vs HOLD --------------------------------------------------
+  # Loud on a spelling this build does not know, for the same reason
+  # `widgetAnchor` is: `activationOfName` answers ActPress for a typo AND for
+  # the word "press", so the int alone cannot tell them apart. Once per distinct
+  # bad value -- readOpts is on the once-a-second reconcile path.
+  let actText = asText(setting("fullscreenActivation"), "press")
+  if not activationRecognisedName(actText):
+    if actText != gActRefused:
+      gActRefused = actText
+      warn ModName & ": REFUSED fullscreenActivation=\"" & actText & "\" -- " &
+           "not a spelling this build accepts, so the full-screen map key is " &
+           "behaving as PRESS (a toggle) and your choice was NOT applied. " &
+           "Accepted: press (also `toggle`), hold (also `held`). The " &
+           "full-screen line in the maps diag names the activation in force."
+  else:
+    gActRefused = ""
+  o.fsMode = activationOfName(actText)
+
+  # ---- LEVEL OF DETAIL ------------------------------------------------
+  # A PRESET over drawArt/mapGrid/northPip, applied here rather than in the C
+  # renderer so that exactly one place decides what a preset means and the
+  # offline suite can drive it. `custom` -- the default -- passes the three
+  # switches through untouched, so taking this build changes nobody's map.
+  let detailText = asText(setting("detail"), "custom")
+  if not detailRecognisedName(detailText):
+    if detailText != gDetailRefused:
+      gDetailRefused = detailText
+      warn ModName & ": REFUSED detail=\"" & detailText & "\" -- not a " &
+           "spelling this build accepts, so the level of detail is CUSTOM " &
+           "(your drawArt / mapGrid / northPip switches decide) and your " &
+           "choice was NOT applied. Accepted: custom, low, medium, high."
+  else:
+    gDetailRefused = ""
+  o.detail = detailOfName(detailText)
+  let layers = resolveDetail(o.detail, o.drawArt, o.mapGrid > 0, o.northPip)
+  # A preset can override a switch the player set by hand. That is by design --
+  # it is what makes `high` distinguishable from `custom` -- but it must never
+  # be silent, so the override is announced once per distinct resolution.
+  if layers.overrode:
+    let note = detailNameOf(o.detail) & " art=" & $layers.art &
+               " grid=" & $layers.grid & " pip=" & $layers.pip
+    if note != gDetailOverrode:
+      gDetailOverrode = note
+      info ModName & ": detail=" & detailNameOf(o.detail) & " OVERRODE your " &
+           "layer switches -- drawArt=" & $o.drawArt & "->" & $layers.art &
+           " mapGrid>0=" & $(o.mapGrid > 0) & "->" & $layers.grid &
+           " northPip=" & $o.northPip & "->" & $layers.pip &
+           ". Set detail=\"custom\" if you want the switches to decide."
+  elif gDetailOverrode.len > 0:
+    gDetailOverrode = ""
+  o.drawArt  = layers.art
+  o.northPip = layers.pip
+  if not layers.grid:
+    o.mapGrid = 0
+  elif o.mapGrid <= 0:
+    o.mapGrid = 8   # the preset asked for a grid; give it the shipped default
+
+  # ---- ENEMY VISIBILITY POLICY ----------------------------------------
+  # Declared so the request is NAMED, refused at read time so it is never a
+  # silent no-op. See place.EnemyShootOnlyWhy for the measurement that is
+  # missing; the refusal quotes it in full rather than saying "unsupported".
+  let polText = asText(setting("enemyVisibility"), "always")
+  if not enemyPolicyRecognisedName(polText):
+    if polText != gEnemyRefused:
+      gEnemyRefused = polText
+      warn ModName & ": REFUSED enemyVisibility=\"" & polText & "\" -- not a " &
+           "spelling this build accepts. Accepted: always, shootOnly. The " &
+           "policy in force is ALWAYS."
+  elif not enemyPolicyAvailable(enemyPolicyOfName(polText)):
+    if polText != gEnemyRefused:
+      gEnemyRefused = polText
+      warn ModName & ": enemyVisibility=\"" & polText & "\" -- " &
+           EnemyShootOnlyWhy
+  else:
+    gEnemyRefused = ""
+  o.enemyPolicy = resolveEnemyPolicy(enemyPolicyOfName(polText))
   
   
   
@@ -752,9 +858,63 @@ proc spatialSchema(): seq[Setting] =
                                 "build, so a per-side (USEC/BEAR/Scav) colour " &
                                 "is not offered rather than offered and wrong"),
 
+    enumSetting("detail", "Level of detail", "custom", detailOptions(),
+                category = "Widget",
+                description = "A PRESET over the three layer switches " &
+                              "(`Draw the map artwork`, `Grid divisions`, " &
+                              "`Draw the north pip`). " &
+                              "custom -- the default -- means those three " &
+                              "switches decide and this row changes nothing, " &
+                              "so taking this build leaves your map exactly as " &
+                              "it was. " &
+                              "low draws NO artwork, NO grid and NO pip: the " &
+                              "cheapest pane this renderer can submit -- " &
+                              "backdrop, border, your arrow and the contacts. " &
+                              "medium adds the grid and the pip but still no " &
+                              "artwork (the artwork is the tile-binding path " &
+                              "and the first suspect for a frame spike). " &
+                              "high forces all three ON. " &
+                              "NOTE THAT low/medium/high are PRESETS, not " &
+                              "filters: they OVERRIDE the three switches rather " &
+                              "than ANDing with them, which is what makes them " &
+                              "four distinguishable outcomes instead of `high` " &
+                              "being a second name for `custom`. When a preset " &
+                              "overrides a switch you set by hand the host log " &
+                              "says so by name, once, rather than leaving you " &
+                              "to wonder why your artwork went away. " &
+                              "WHAT THIS DELIBERATELY DOES NOT DO: cap the " &
+                              "number of contacts drawn. The contact array has " &
+                              "no distance ordering, so a cap would drop an " &
+                              "ARBITRARY subset -- possibly the nearest enemy " &
+                              "-- and a map that hides a contact it could have " &
+                              "drawn is worse than a slower one. Use `Radar " &
+                              "radius` to cut contacts by distance, which is a " &
+                              "decision you can reason about"),
+    enumSetting("enemyVisibility", "Show enemies", "always",
+                enemyPolicyOptions(), category = "Contacts",
+                implemented = false,
+                description = "WHEN a hostile contact is drawn. " &
+                              "always -- the default and the ONLY policy this " &
+                              "build can carry out. " &
+                              "shootOnly (draw a hostile only once it has " &
+                              "FIRED) is NOT AVAILABLE and is REFUSED at read " &
+                              "time with a named reason in the host log, not " &
+                              "applied as a silent no-op: there is no shot " &
+                              "signal to gate on. This mod does not consume " &
+                              "mods/admin's feed at all -- it does its own " &
+                              "IL2CPP walk in sp/world.nim -- and nothing in " &
+                              "the repo publishes a PER-CONTACT last-fired " &
+                              "time. mods/admin measures " &
+                              "NewRecoilShotEffect+0x11, which is the LOCAL " &
+                              "player's own weapon and cannot say whether a bot " &
+                              "40 m away just fired. Implementing this needs a " &
+                              "measured field offset for a bot's last-shot time " &
+                              "on build 1.1.0.1.46777, and none has been taken. " &
+                              "The row is declared rather than hidden so the " &
+                              "request is visible and its cost is stated"),
+
     # ---- PLACEMENT AND CHROME -------------------------------------------
-    enumSetting("widgetAnchor", "Widget corner", "manual",
-                @["manual", "topleft", "topright", "bottomleft", "bottomright"],
+    enumSetting("widgetAnchor", "Widget corner", "manual", anchorOptions(),
                 category = "Widget",
                 description = "Where the widget sits. `manual` is the " &
                               "historical behaviour and the default, so " &
@@ -812,6 +972,34 @@ proc spatialSchema(): seq[Setting] =
                               "tick. This never CAPTURES input -- it installs " &
                               "no window hook and swallows no key -- so there " &
                               "is nothing that can stay captured if it faults"),
+    enumSetting("fullscreenActivation", "Full-screen map key behaviour",
+                "press", activationOptions(),
+                category = "Full-screen map",
+                description = "HOW the key opens the map. " &
+                              "press = a TOGGLE. One press opens it, the next " &
+                              "one (or Escape) closes it. This is the " &
+                              "historical behaviour and the default, so taking " &
+                              "this build does not change how your key feels. " &
+                              "It reads UnityEngine.Input::GetKeyDown, an EDGE. " &
+                              "hold = the map is open exactly while the key is " &
+                              "HELD and closes the frame you let go. It reads " &
+                              "UnityEngine.Input::GetKey @0x531EAE0 instead -- " &
+                              "a separately byte-verified RVA, and if that " &
+                              "prologue does not match this build HOLD refuses " &
+                              "and says so while PRESS keeps working. " &
+                              "WHY HOLD IS A LEVEL READ AND NOT A DOWN/UP EDGE " &
+                              "PAIR: an edge pair can miss the release and " &
+                              "strand a full-screen panel over your raid. A " &
+                              "level read assigns the overlay bit from the key " &
+                              "every poll, so there is no state that can stick. " &
+                              "Escape is not consulted in hold mode -- letting " &
+                              "go already closes it. Changing this setting " &
+                              "while the map is open CLOSES it, in both " &
+                              "directions, so the toggle state can never be " &
+                              "out of step with what you last did. The diag " &
+                              "reports held frames and the open/close edge " &
+                              "counts: opens > 0 with closes = 0 is an overlay " &
+                              "that never came back, reported as a number"),
     keybindSetting("fullscreenKey", "Full-screen map key", "M",
                    category = "Full-screen map",
                    description = "A UnityEngine.KeyCode NAME. Press it to " &
@@ -859,6 +1047,30 @@ proc spatialSchema(): seq[Setting] =
                               "of repeated PASS. ON restores the old behaviour " &
                               "exactly -- the whole block every 2 seconds, " &
                               "which measured 40% of the entire host log."),
+
+    boolSetting("profile", "Phase profiler", false, category = "Feed",
+                description = "DEFAULT OFF, deliberately: a developer turns " &
+                              "this on. It installs no detour and resolves no " &
+                              "name -- two QueryPerformanceCounter reads per " &
+                              "bracket -- but its OUTPUT is the expensive " &
+                              "part, so see `profileVerbose` for how often it " &
+                              "speaks."),
+    boolSetting("profileVerbose", "Verbose phase profiler (the prof firehose)",
+                false, category = "Feed",
+                description = "Only read when `profile` is ON. OFF -- the " &
+                              "default -- prints the full multi-kilobyte " &
+                              "`maps prof:` decomposition on the first cycle, " &
+                              "then every 5 minutes WHILE THE METER IS " &
+                              "ADVANCING, and one line every 60s naming the " &
+                              "meter as NOT ADVANCED while nothing is running " &
+                              "to profile (which is the menu). The rdcache / " &
+                              "entcache / entcache verdict lines print on " &
+                              "CHANGE, with any FAIL or INCONCLUSIVE " &
+                              "re-announced every 60s on its own line. No " &
+                              "measurement is altered or softened: an " &
+                              "unmeasured thing still reads NEVER RAN and a " &
+                              "verdict still reads INCONCLUSIVE. ON restores " &
+                              "the old ~2KB every 2 seconds, forever."),
     boolSetting("hudRadar", "LEGACY: in-game radar", true, category = "Legacy",
                 description = "INERT unless `Map renderer` is `legacy` (or " &
                               "`auto` with `Spatial widget` still unwritten). " &
@@ -1374,6 +1586,28 @@ var gDiagQuiet = 0'i64
 var gDiagVerbose = false
   ## The `diagVerbose` setting. DEFAULT FALSE. True restores the old behaviour
   ## exactly: the whole block, every tick, unconditionally.
+
+var gProfVerbose = false
+  ## The `profileVerbose` setting. DEFAULT FALSE. Same convention, and the same
+  ## reason, as `diagVerbose`: ON restores the old behaviour byte-for-byte (the
+  ## multi-kilobyte `maps prof:` block plus the three cache lines, every 2s
+  ## forever). OFF does not suppress a single MEASUREMENT -- every string below
+  ## is still produced by the same functions, verbatim -- it only decides when
+  ## to REPEAT one.
+var gProfCycles = 0'i64
+  ## Diag cycles seen while the profiler was enabled. Cycle 1 always prints.
+var gProfLastTicks = -1'i64
+  ## `mpTicks()` at the previous cycle. Unchanged means the meter recorded
+  ## NOTHING new -- which at the menu is the whole of the problem: kilobytes to
+  ## report that nothing ran.
+var gProfIdle = 0'i64
+  ## Consecutive cycles on which `mpTicks()` did not advance.
+var gCacheLast = ""
+  ## Verdict signature of the three cache lines (rdcache / entcache / entcache
+  ## verdict), via the SAME `diagSignature` the diag block uses, so the counters
+  ## inside a steady verdict cannot make change-detection a check that always
+  ## fires.
+var gCacheQuiet = 0'i64
 
 proc mapsDiagText(): string =
   ## Assembled from the FINISHED state -- the counters the collector and the
@@ -2065,6 +2299,45 @@ proc mapsDiagText(): string =
   # return value, so a small-widget submission added later outside the guard
   # would make the two numbers differ and this would read FAIL. A single
   # "overlay drew" counter could not be falsified and would not be a check.
+  # THE ACTIVATION MODE, stated on its own line and BEFORE the verdict, because
+  # every number the verdict below quotes means something different under HOLD:
+  # `toggles` counts open/close EDGES rather than presses, and a "the key was
+  # pressed N times and the overlay never opened" complaint about a hold key
+  # would be reading a press-mode instrument.
+  var lAct = "activation=" & activationNameOf(hudLiveFsMode())
+  if hudLiveFsMode() == ActHold:
+    lAct = lAct & " (level read) opens=" & $hudFsHoldOpens() &
+           " closes=" & $hudFsHoldCloses() &
+           " heldFrames=" & $hudFsHeldFrames() & "  " & hudHeldBindText()
+    if hudFsHoldOpens() > hudFsHoldCloses() + 1'i64:
+      lAct = lAct & "  FAIL  the overlay opened " & $hudFsHoldOpens() &
+             " time(s) and closed " & $hudFsHoldCloses() &
+             " -- a level read must close on the poll after release, so this " &
+             "is a stuck overlay, not a player still holding the key."
+  else:
+    lAct = lAct & " (edge read, a toggle)"
+  if hudLiveFsMode() != gOpts.fsMode:
+    lAct = lAct & "  FAIL  config asks for " & activationNameOf(gOpts.fsMode) &
+           " and the live mirror holds " & activationNameOf(hudLiveFsMode()) &
+           " -- the setting is stored and NOT in force."
+
+  # THE LEVEL OF DETAIL and THE ENEMY POLICY, both stated as what is IN FORCE
+  # rather than what is on disk.
+  var lDetail = "detail=" & detailNameOf(gOpts.detail) &
+                " -> art=" & $gOpts.drawArt & " grid=" & $(gOpts.mapGrid > 0) &
+                " pip=" & $gOpts.northPip
+  if gOpts.detail == DetailCustom:
+    lDetail = lDetail & " (custom: your three switches decide; this row " &
+              "overrode nothing)"
+  else:
+    lDetail = lDetail & " (a PRESET: it overrides the three switches, and the " &
+              "override is logged by name when it changes one)"
+  var lEnemy = "enemyVisibility -> " & enemyPolicyNameOf(gOpts.enemyPolicy) &
+               " IN FORCE"
+  if not enemyPolicyAvailable(enemyPolicyOfName(
+       asText(setting("enemyVisibility"), "always"))):
+    lEnemy = "INCONCLUSIVE  " & EnemyShootOnlyWhy
+
   var lFs = ""
   if not gFsHotkeysOn:
     lFs = "INCONCLUSIVE  the `hotkeys` setting is OFF (the shipped default), " &
@@ -2132,6 +2405,9 @@ proc mapsDiagText(): string =
            "  placement    : " & lPlace & "\n" &
            "  unifiedPane  : " & lUnified & "\n" &
            "  renderer     : " & lRend    & "\n" &
+           "  detail       : " & lDetail & "\n" &
+           "  enemyPolicy  : " & lEnemy & "\n" &
+           "  fsActivation : " & lAct & "\n" &
            "  fullscreen   : " & lFs & "\n" &
            "  reconcile    : " & lRecon & "\n" &
            "  region       : " & lRegion & "\n" &
@@ -2215,14 +2491,57 @@ proc onDiagTick(payload: string): string =
   # means moved). It reports INCONCLUSIVE below its tick threshold rather than a
   # number, so "I could not look yet" cannot read as a pass.
   if mpEnabled() != 0'i32:
-    info ModName & ": " & mapsProfLine()
+    inc gProfCycles
+    let pt = mpTicks()
+    if pt == gProfLastTicks: inc gProfIdle else: gProfIdle = 0'i64
+    gProfLastTicks = pt
+    if gProfVerbose:
+      # THE FIREHOSE, opt-in. Byte-for-byte the old behaviour.
+      info ModName & ": " & mapsProfLine()
+    elif gProfIdle > 0'i64:
+      # THE METER DID NOT ADVANCE. Nothing was profiled since the last cycle,
+      # so re-printing the decomposition would be kilobytes restating one fact.
+      # That one fact is still stated, on its own line, every 60s -- and it is
+      # stated as NOT-MEASURED, never as an all-clear.
+      if (gProfIdle mod 30'i64) == 1'i64:
+        info ModName & ": prof: profiler ON but the meter has NOT ADVANCED " &
+             "for " & $gProfIdle & " cycle(s) (" & $(gProfIdle * 2'i64) &
+             "s) -- " & $pt & " bracketed tick(s) total. Nothing ran to " &
+             "profile; this is NOT 'free' and NOT measured. The full block " &
+             "prints again the moment the meter moves; " &
+             "`profileVerbose` restores it every tick."
+    elif gProfCycles == 1'i64 or (gProfCycles mod 150'i64) == 0'i64:
+      # THE FULL DECOMPOSITION. First cycle always, then every 5 minutes while
+      # the meter is actually advancing. The line is CUMULATIVE, so a 5-minute
+      # sample is strictly better evidence than the same means re-derived 150
+      # times, and `mapsProfLine` still reports INCONCLUSIVE below its own tick
+      # threshold rather than a number.
+      info ModName & ": " & mapsProfLine()
     # THE TWO CACHES, on the same timer as the profile they exist to move.
     # `ecVerdict` is the falsifiable negative -- "no per-entity constant is
     # recomputed on a tick where the entity list did not change" -- and it can
-    # say FAIL and INCONCLUSIVE, not only PASS.
-    info ModName & ": " & rdCacheText()
-    info ModName & ": " & ecText()
-    info ModName & ": " & ecVerdict()
+    # say FAIL and INCONCLUSIVE, not only PASS. Emitted ON CHANGE, by the same
+    # signature the diag block uses, with a not-PASS re-announcement no
+    # signature can silence.
+    let cText = rdCacheText() & "\n" & ecText() & "\n" & ecVerdict()
+    let cSig = diagSignature(cText)
+    let cBad = diagNotPass(cText)
+    if gProfVerbose or gCacheLast.len == 0 or cSig != gCacheLast:
+      gCacheLast = cSig
+      gCacheQuiet = 0'i64
+      info ModName & ": " & rdCacheText()
+      info ModName & ": " & ecText()
+      info ModName & ": " & ecVerdict()
+    else:
+      inc gCacheQuiet
+      if cBad.len > 0:
+        if (gCacheQuiet mod 30'i64) == 0'i64:
+          warn ModName & ": cache STILL NOT-PASS after " & $gCacheQuiet &
+               " unchanged cycle(s) (" & $(gCacheQuiet * 2'i64) & "s): " &
+               cBad & ". Turn on `profileVerbose` for the full lines."
+      elif (gCacheQuiet mod 150'i64) == 0'i64:
+        info ModName & ": cache all-PASS, unchanged for " & $gCacheQuiet &
+             " cycle(s) (" & $(gCacheQuiet * 2'i64) & "s)."
   result = ""
 
 proc armFeed(): bool =
@@ -2590,10 +2909,122 @@ proc mirrorDrift(): string =
     return "fullscreenKey config=" & (if w.fsEnabled: w.fsKey else: "(hotkeys off)") &
            " kc=" & $wantKc & " but this instance polls kc=" & $gFsKeyKc &
            " hotkeys=" & $gFsHotkeysOn
+  # THE ACTIVATION MODE, against the C mirror -- the value `mhud_fs_poll`
+  # branches on. By the rule stated at the top of this ledger, a schema row with
+  # no line here is a row that can be stored and never applied.
+  if w.fsMode != hudLiveFsMode():
+    return "fullscreenActivation config=" & activationNameOf(w.fsMode) &
+           " mirror=" & activationNameOf(hudLiveFsMode())
+  # `detail` and `enemyVisibility` are NOT compared here, and that is deliberate
+  # rather than an omission:
+  #   * `detail` is a PRESET that is fully resolved inside readOpts into
+  #     drawArt / mapGrid / northPip. Those three ARE compared above, against the
+  #     mirror, so a detail edit that failed to reach the renderer shows up as a
+  #     drift on the layer it should have changed. Comparing the preset name as
+  #     well would compare this process with its own arithmetic.
+  #   * `enemyVisibility` has exactly one reachable resolved value on this build
+  #     (`always`), so a comparison could not fail. The refusal in readOpts is
+  #     what reports it, and the diag states the policy in force.
   result = ""
+
+proc reportMasterGate() =
+  ## ONE LINE PER STATE CHANGE, and the OFF line carries a number that can be
+  ## wrong.
+  ##
+  ## The reported regression was "the maps OFF-toggle does not stop drawing".
+  ## The gate itself is `mhud_draw`'s first branch, which returns before any
+  ## `aowl_region_*` call -- but "I read the code and it returns early" is not
+  ## evidence, and a claim in a log line ("maps: OFF") is not evidence either.
+  ##
+  ## So the OFF line quotes `hudGated()` minus its value at the moment of the
+  ## edit: dispatches that ARRIVED at the draw callback and submitted ZERO
+  ## primitives. That delta is falsifiable in the direction that matters. If the
+  ## gate were not doing its job the callback would fall through instead of
+  ## counting, and the delta would sit at 0 while frames ran -- which is exactly
+  ## what this line then says, in as many words, rather than reporting silence
+  ## as success.
+  ##
+  ## `hudPaneCalls`/`hudSelDrew` are the other half and are NOT restated here:
+  ## they are the positive ledger the `renderer` diag line already carries.
+  let on = gEnabled
+  let nowState = (if on: 1 else: 0)
+  if nowState == gMasterState: return
+  let prev = gMasterState
+  gMasterState = nowState
+  if not on:
+    gMasterGatedAt = hudGated()
+    info ModName & ": master OFF (enabled=false) -- the draw callback's first " &
+         "branch now returns before any region command. Gated dispatches so " &
+         "far: " & $gMasterGatedAt & ". The next state change reports how many " &
+         "arrived while off and drew nothing."
+  else:
+    let delta = hudGated() - gMasterGatedAt
+    if prev == 0:
+      if delta > 0'i64:
+        info ModName & ": master OFF -> 0 draws/frame over " & $delta &
+             " frame(s); master is ON again. Every one of those " & $delta &
+             " dispatches reached the callback and submitted zero primitives."
+      else:
+        info ModName & ": master ON. NOTE: 0 dispatches were gated while it " &
+             "was off -- so this says NOTHING about whether the off-gate " &
+             "works. Either no frame was dispatched in that window (the menu, " &
+             "or the region had no participant) or the gate was bypassed. " &
+             "INCONCLUSIVE, not a pass."
+    else:
+      info ModName & ": master ON (enabled=true)."
+
+proc reportPlacement() =
+  ## The resolved widget rect, ONCE PER CHANGE, checked against the back buffer.
+  ##
+  ## `hudWidgetX/Y` is what the C renderer RESOLVED on the last drawn frame --
+  ## not the configured inset, and not a number this process computed. The
+  ## assertion is `rectInside`, the same negative the offline suite drives
+  ## across both resolutions, applied here to the live value. An off-screen
+  ## widget and a widget that never armed are indistinguishable on screen, and
+  ## this line is what tells them apart.
+  ##
+  ## NOT a duplicate of the diag's `placement` line, which asks a DIFFERENT
+  ## question: whether the resolved origin lands in the named corner's QUADRANT
+  ## and differs from the configured inset. A rect can pass that and still hang
+  ## off the bottom of the buffer (a mapSize larger than the screen does exactly
+  ## that), and it can fail that while being entirely on-screen. Two properties,
+  ## two checks; neither implies the other, and neither restates the other.
+  if not gHudOn: return
+  let measured = hudScreenMeasured() != 0'i32
+  var scrW = float(gOpts.screenW)
+  var scrH = float(gOpts.screenH)
+  if measured:
+    scrW = float(hudScreenW())
+    scrH = float(hudScreenH())
+  let rc = Rect(x: hudWidgetX(), y: hudWidgetY(),
+                w: gOpts.mapSize, h: gOpts.mapSize)
+  let inside = rectInside(rc, scrW, scrH)
+  let line = anchorName(hudLiveAnchor()) & " " & rectText(rc) &
+             " on " & $int(scrW) & "x" & $int(scrH) &
+             (if measured: " (measured)" else: " (FALLBACK screenW/H -- the " &
+              "region has not published a back-buffer size, so this verdict " &
+              "is INCONCLUSIVE)") &
+             (if inside: "  inside=yes" else: "  inside=NO")
+  if line == gPlaceLast: return
+  gPlaceLast = line
+  if inside and measured:
+    info ModName & ": placement " & line
+  elif not measured:
+    info ModName & ": placement " & line
+  else:
+    warn ModName & ": placement " & line & " -- the widget rect is NOT wholly " &
+         "inside the back buffer, so part of it (or all of it) is off-screen. " &
+         "In a corner mode this should be impossible; in `manual` it means " &
+         "mapX/mapY/mapSize put it there. Pick a corner, or reduce mapSize."
 
 proc onReconcileTick(payload: string): string =
   result = ""
+  # Both of these run BEFORE the `gReconcileOff` early return and regardless of
+  # `enabled`, deliberately: the master-gate line's whole job is to speak while
+  # the feature is OFF, and a reconcile that has self-disabled is exactly when a
+  # reader most needs the placement line.
+  reportMasterGate()
+  reportPlacement()
   if gReconcileOff: return
   let drift = mirrorDrift()
   if drift.len == 0:
@@ -2632,6 +3063,7 @@ proc onLoad(): Status =
   # instrument whose cost gets attributed to the thing it is measuring.
   gDiagVerbose = asBool(setting("diagVerbose"), false)
   let profOn = asBool(setting("profile"), false)
+  gProfVerbose = asBool(setting("profileVerbose"), false)
   mpSetEnabled(if profOn: 1'i32 else: 0'i32)
   if profOn:
     info ModName & ": phase profiler ON. onMainTick is bracketed with " &
@@ -2641,7 +3073,10 @@ proc onLoad(): Status =
          "rather than attributed. Every number is MICROSECONDS. It carries a " &
          "positive control of 512 integer adds through the same bracket -- " &
          "expected order 0.1-1.0us; 0.0us or milliseconds means the meter is " &
-         "lying and the line is VOID. One line every 2s on the diag timer."
+         "lying and the line is VOID. Emission is THROTTLED: the first " &
+         "cycle, then every 5 minutes while the meter ADVANCES, and one " &
+         "NOT-ADVANCED line every 60s while nothing runs to profile. Set " &
+         "`profileVerbose` for one line every 2s."
   loadHudOpts()
 
   # Declared on BOTH sides, before the split -- see the block above `loadHudOpts`

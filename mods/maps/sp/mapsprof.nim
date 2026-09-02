@@ -32,7 +32,7 @@ proc mpEnabled*(): int32 {.importc: "aowl_mp_enabled", nodecl.}
 proc mpNs(i: int32): int64 {.importc: "aowl_mp_ns", nodecl.}
 proc mpCalls(i: int32): int64 {.importc: "aowl_mp_calls", nodecl.}
 proc mpMax(i: int32): int64 {.importc: "aowl_mp_max", nodecl.}
-proc mpTicks(): int64 {.importc: "aowl_mp_ticks", nodecl.}
+proc mpTicks*(): int64 {.importc: "aowl_mp_ticks", nodecl.}
 proc mpDropped(): int64 {.importc: "aowl_mp_dropped", nodecl.}
 proc mpOverhead(): int64 {.importc: "aowl_mp_overhead", nodecl.}
 proc mpCal(): int32 {.importc: "aowl_mp_cal", nodecl.}

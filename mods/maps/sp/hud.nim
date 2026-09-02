@@ -53,6 +53,17 @@
 
 import aowlspt
 import world  # the Snapshot this file mirrors; no game memory is read here
+import ../core/place
+export place
+# THE PURE DECISIONS LIVE IN core/place.nim, and this file re-exports them so
+# that maps.nim keeps importing exactly one module and no call site changed.
+#
+# They used to be defined HERE, which meant the anchor table and the placement
+# arithmetic could only be exercised by building a mod DLL and getting into a
+# raid. Moving them into `core/` -- which is pure by construction and imports
+# nothing from `sp/` -- is what makes `aowl test --mod maps` able to run them at
+# all. Nothing here may import `place` and then re-derive one of its answers
+# locally: two definitions of the anchor table is the drift this move removes.
 
 {.emit: """
 #include <stdint.h>
@@ -105,6 +116,20 @@ import world  # the Snapshot this file mirrors; no game memory is read here
 #define MHUD_ANCHOR_TR     2
 #define MHUD_ANCHOR_BL     3
 #define MHUD_ANCHOR_BR     4
+
+/* THE FULL-SCREEN MAP'S ACTIVATION. Must agree with mods/maps/core/place.nim's
+ * ActPress / ActHold, which is where the behaviour is SPECIFIED and where it is
+ * tested offline over a sequence of frames (`aowl test --mod maps`).
+ *
+ * PRESS is an EDGE read (Input::GetKeyDown) and carries state: the overlay bit
+ * survives between polls. HOLD is a LEVEL read (Input::GetKey) and carries
+ * none: the overlay bit is simply assigned the held bit every poll, so there is
+ * no sequence of missed edges that can leave a full-screen panel stuck over the
+ * player's raid. That is the reason HOLD is not implemented as a down/up edge
+ * pair, which would have been the obvious thing and would have had exactly that
+ * failure mode. */
+#define MHUD_FSACT_PRESS   0
+#define MHUD_FSACT_HOLD    1
 
 /* No <math.h> in this translation unit on purpose (it drags libm into a DLL
  * that must load in the client's loader lock); this is the only absolute value
@@ -333,6 +358,10 @@ static struct {
      * small widget actually submitted, not with a comment (see fsSmallPrims). */
     int32_t  fsOn;
     int32_t  fsNorthUp;        /* 1 = the overlay ignores heading (a wall map) */
+    int32_t  fsMode;           /* MHUD_FSACT_PRESS | MHUD_FSACT_HOLD           */
+    int64_t  fsHeldFrames;     /* polls on which HOLD read the key down        */
+    int64_t  fsHoldOpens;      /* HOLD open EDGES -- closed -> open            */
+    int64_t  fsHoldCloses;     /* HOLD close EDGES -- open -> closed (release) */
     float    fsMargin, fsSpanM, fsZoom, fsOpacity;
     int64_t  fsFrames;            /* dispatches drawn with the overlay OPEN */
     int64_t  fsSmallSuppressed;   /* ... of those, ones where the small widget
@@ -655,6 +684,9 @@ static void mhud_reset(void) {
     g_mhud.backdropA      = 1.0f;
     g_mhud.fsOn           = 0;
     g_mhud.fsNorthUp      = 1;
+    /* PRESS is the historical activation and stays the default: taking this
+     * build does not change how anyone's map key behaves. */
+    g_mhud.fsMode         = MHUD_FSACT_PRESS;
     g_mhud.fsMargin       = 48.0f;
     g_mhud.fsSpanM        = 1200.0f;
     g_mhud.fsZoom         = 1.0f;
@@ -945,7 +977,19 @@ static void mhud_widget_origin(float scrW, float scrH, float size,
 }
 
 static void mhud_configure_fs(float margin, float spanM, float zoom,
-                              float opacity, int32_t northUp) {
+                              float opacity, int32_t northUp, int32_t mode) {
+    /* SWITCHING ACTIVATION WHILE THE OVERLAY IS OPEN. Force it closed on the
+     * edit. Going PRESS -> HOLD with it open would leave a panel that only
+     * closes when the player presses and releases the key (HOLD assigns, so the
+     * first poll would close it anyway) -- but going HOLD -> PRESS would leave
+     * it open with the toggle state out of step with what the player last did.
+     * Closing on the change is the one behaviour that is the same in both
+     * directions and cannot strand a full-screen panel over a raid. */
+    int32_t m = (mode == MHUD_FSACT_HOLD) ? MHUD_FSACT_HOLD : MHUD_FSACT_PRESS;
+    if (m != g_mhud.fsMode) {
+        g_mhud.fsMode = m;
+        g_mhud.fsOn = 0;
+    }
     g_mhud.fsNorthUp = northUp ? 1 : 0;
     g_mhud.fsMargin  = margin < 0.0f ? 0.0f : (margin > 512.0f ? 512.0f : margin);
     g_mhud.fsSpanM   = spanM < 50.0f ? 50.0f : (spanM > 8000.0f ? 8000.0f : spanM);
@@ -1524,6 +1568,34 @@ static uint32_t mhud_overlay_mask(void) {
 #define MHUD_RVA_GETKEYDOWN 0x531EB80u
 static const unsigned char MHUD_SIG_GETKEYDOWN[16] = {
     0x40,0x53,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,0x9B,0x71,0xDB,0x01,0x8B,0xD9,0x48 };
+
+/* THE LEVEL READ, for HOLD activation.
+ *
+ *   UnityEngine.Input::GetKey(KeyCode) -> bool, STATIC, arity 1,
+ *   RVA 0x531EAE0, section `il2cpp`, prologue
+ *   40 53 48 83 EC 20 48 8B 05 2B 72 DB 01 8B D9 48
+ *   -- build 1.1.0.1.46777.
+ *
+ * MEASURED, not assumed, on 2026-09-01:
+ *   python tools/il2cpp_resolve.py D:\Aowlspt\GameAssembly.dll \
+ *          .cache/global-metadata.dec.dat typemethods UnityEngine.Input
+ *   python tools/il2cpp_resolve.py ... bytes 0x531eae0
+ * The same run re-derived GetKeyDown at 0x531EB80, which matches the constant
+ * above that was measured independently on 2026-08-31 -- that agreement is the
+ * self-check, and it is why this RVA is trusted rather than guessed.
+ *
+ * SHARED x2, with `GetKeyInt(KeyCode)` -- the identical body under its internal
+ * name, exactly as GetKeyDown/GetKeyDownInt are. Sharedness is a hazard for a
+ * DETOUR (unbounded blast radius); this is a CALL, made with the argument the
+ * body is correct for, so it is not one. Nothing here is detoured.
+ *
+ * The prologue is the same shape as GetKeyDown's -- a tail JMP into Unity's
+ * native icall -- so the return-type discipline is identical and load-bearing:
+ * the C++ callee returns `bool` in AL with EAX bits 8..31 UNDEFINED. Declaring
+ * this `int32_t` is what made the map open on ANY keypress last time. */
+#define MHUD_RVA_GETKEY 0x531EAE0u
+static const unsigned char MHUD_SIG_GETKEY[16] = {
+    0x40,0x53,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,0x2B,0x72,0xDB,0x01,0x8B,0xD9,0x48 };
 #define MHUD_HK_MAXFAIL 240
 
 /* THE RETURN TYPE IS ONE BYTE, NOT FOUR. MEASURED, from the body at
@@ -1581,7 +1653,37 @@ static int32_t mhud_key_state(void) {
     return 3;
 }
 
+/* The LEVEL read's own binding. Deliberately a SECOND pointer and a SECOND
+ * bind state rather than a parameterised one: a prologue mismatch on GetKey
+ * must not disarm GetKeyDown (PRESS would stop working because HOLD could not
+ * bind), and the diag has to be able to say which of the two refused. */
+static MHudGetKeyDownFn g_mhud_heldFn = 0;
+static int32_t g_mhud_heldBind = 0;   /* 0 not attempted | 1 transient | 2 refused | 3 bound */
+
+static int32_t mhud_held_state(void) {
+    HMODULE ga;
+    unsigned char* p;
+    if (g_mhud_heldBind == 1) g_mhud_heldBind = 0;   /* transient, retry */
+    if (g_mhud_heldBind != 0) return g_mhud_heldBind;
+    ga = GetModuleHandleA("GameAssembly.dll");
+    if (!ga) { g_mhud_heldBind = 1; return 1; }
+    p = (unsigned char*)ga + MHUD_RVA_GETKEY;
+    if (!mhud_readable(p, 16) || memcmp(p, MHUD_SIG_GETKEY, 16) != 0) {
+        g_mhud_heldFn = 0;
+        g_mhud_heldBind = 2;                          /* refuse; call nothing */
+        return 2;
+    }
+    g_mhud_heldFn = (MHudGetKeyDownFn)(void*)p;
+    g_mhud_heldBind = 3;
+    return 3;
+}
+
+static int32_t mhud_key_held_raw(int32_t kc) {
+    return (int32_t)(g_mhud_heldFn(kc, 0) & 1u);   /* AL only -- see the typedef */
+}
+
 static int32_t mhud_key_bind_state(void) { return g_mhud_keyBind; }
+static int32_t mhud_held_bind_state(void) { return g_mhud_heldBind; }
 static int32_t mhud_key_disabled(void) {
     return g_mhud_keyFail >= MHUD_HK_MAXFAIL ? 1 : 0;
 }
@@ -1618,9 +1720,45 @@ static int32_t mhud_key_down(int32_t kc) {
     return (int32_t)(g_mhud_keyFn(kc, 0) & 1u);
 }
 
+/* HOLD. A LEVEL read, and the overlay bit is ASSIGNED -- never toggled -- so
+ * the state is a pure function of the key, exactly as core/place.nim's
+ * `holdState(ActHold, ...)` specifies and as the offline suite drives it over a
+ * frame sequence. There is no accumulated state to get stuck.
+ *
+ * The indiscriminate-read CONTROL from the PRESS path applies here too and for
+ * the same reason: an `int32_t` return type once made every key read as down,
+ * and a level read with that defect would pin the overlay OPEN for the whole
+ * raid, which is worse than the toggle spam it caused before. If the control
+ * key -- one the player cannot be holding -- also reads down, the answer is
+ * REFUSED (the overlay is forced closed, not left open) and counted.
+ *
+ * Escape is deliberately NOT consulted in HOLD: releasing the key already
+ * closes it, and a second close path could only ever disagree with the first. */
+static int32_t mhud_fs_poll_hold(int32_t kc) {
+    int32_t held, was;
+    if (mhud_held_state() != 3) { g_mhud_keyFail++; return g_mhud.fsOn; }
+    g_mhud_keyFail = 0;
+    held = mhud_key_held_raw(kc);
+    if (held) {
+        g_mhud.fsHeldFrames++;
+        if (kc != MHUD_KC_CONTROL && mhud_key_held_raw(MHUD_KC_CONTROL)) {
+            g_mhud_fsCtlDown++;
+            held = 0;            /* an indiscriminate read closes, never opens */
+        }
+    }
+    was = g_mhud.fsOn;
+    g_mhud.fsOn = held ? 1 : 0;
+    if (g_mhud.fsOn != was) {
+        g_mhud.fsToggles++;
+        if (g_mhud.fsOn) g_mhud.fsHoldOpens++; else g_mhud.fsHoldCloses++;
+    }
+    return g_mhud.fsOn;
+}
+
 static int32_t mhud_fs_poll(int32_t kc, int32_t enabled) {
     if (!enabled || kc == AOWL_KC_UNBOUND) return g_mhud.fsOn;
     if (g_mhud_keyFail >= MHUD_HK_MAXFAIL) return g_mhud.fsOn;  /* self-disabled */
+    if (g_mhud.fsMode == MHUD_FSACT_HOLD) return mhud_fs_poll_hold(kc);
     if (mhud_key_state() != 3) { g_mhud_keyFail++; return g_mhud.fsOn; }
     g_mhud_keyFail = 0;
     if (mhud_key_down(kc)) {
@@ -1644,6 +1782,10 @@ static int32_t mhud_fs_poll(int32_t kc, int32_t enabled) {
 
 static int64_t mhud_fs_keydowns(void)  { return g_mhud_fsKeyDown; }
 static int64_t mhud_fs_rejected(void)  { return g_mhud_fsCtlDown; }
+static int32_t mhud_live_fsmode(void)  { return g_mhud.fsMode; }
+static int64_t mhud_fs_held_frames(void) { return g_mhud.fsHeldFrames; }
+static int64_t mhud_fs_hold_opens(void)  { return g_mhud.fsHoldOpens; }
+static int64_t mhud_fs_hold_closes(void) { return g_mhud.fsHoldCloses; }
 
 /* ==================== THE ONE PANE RENDERER ============================
  *
@@ -2642,7 +2784,8 @@ proc cHudConfigurePane(mode: int32; zoom, opacity: cfloat; drawArt: int32;
                        contactPx: cfloat;
                        colBot, colPlayer, colSelf: uint32) {.
   importc: "mhud_configure_pane", nodecl.}
-proc cHudConfigureFs(margin, spanM, zoom, opacity: cfloat; northUp: int32) {.
+proc cHudConfigureFs(margin, spanM, zoom, opacity: cfloat;
+                     northUp, mode: int32) {.
   importc: "mhud_configure_fs", nodecl.}
 proc cHudFsSet(on: int32) {.importc: "mhud_fs_set", nodecl.}
 proc cHudFsOpen(): int32 {.importc: "mhud_fs_open", nodecl.}
@@ -2675,6 +2818,11 @@ proc cHudLiveAnchor(): int32 {.importc: "mhud_live_anchor", nodecl.}
 proc cHudLiveBorder(): int32 {.importc: "mhud_live_border", nodecl.}
 proc cHudLiveNorthPip(): int32 {.importc: "mhud_live_northpip", nodecl.}
 proc cHudFsKeyDowns(): int64 {.importc: "mhud_fs_keydowns", nodecl.}
+proc cHudLiveFsMode(): int32 {.importc: "mhud_live_fsmode", nodecl.}
+proc cHudHeldBindState(): int32 {.importc: "mhud_held_bind_state", nodecl.}
+proc cHudFsHeldFrames(): int64 {.importc: "mhud_fs_held_frames", nodecl.}
+proc cHudFsHoldOpens(): int64 {.importc: "mhud_fs_hold_opens", nodecl.}
+proc cHudFsHoldCloses(): int64 {.importc: "mhud_fs_hold_closes", nodecl.}
 proc cHudFsRejected(): int64 {.importc: "mhud_fs_rejected", nodecl.}
 proc cHudLiveBorderPx(): cfloat {.importc: "mhud_live_borderpx", nodecl.}
 proc cHudLiveBackdropA(): cfloat {.importc: "mhud_live_backdropa", nodecl.}
@@ -2789,6 +2937,28 @@ proc hudRecreatedLate*(): int64 = cHudRecreatedLate()
 proc hudLiveBorder*(): bool = cHudLiveBorder() != 0'i32
 proc hudLiveNorthPip*(): bool = cHudLiveNorthPip() != 0'i32
 proc hudFsKeyDowns*(): int64 = cHudFsKeyDowns()
+proc hudLiveFsMode*(): int = int(cHudLiveFsMode())
+  ## The activation mode the DRAW MIRROR is holding -- the value the poll will
+  ## actually use, not the one config.json says. The drift check compares the
+  ## two, which is the only way a setting that is stored and never applied shows
+  ## up as anything other than "it does not work".
+proc hudFsHeldFrames*(): int64 = cHudFsHeldFrames()
+proc hudFsHoldOpens*(): int64 = cHudFsHoldOpens()
+proc hudFsHoldCloses*(): int64 = cHudFsHoldCloses()
+  ## HOLD's falsifiable pair. `opens > 0 and closes == 0` after a raid is an
+  ## overlay that opened and never came back -- the exact failure a level read
+  ## is supposed to make impossible, reported as a number rather than trusted.
+proc hudHeldBindText*(): string =
+  ## Which of the two key reads bound, separately. A GetKey prologue mismatch
+  ## must not read as "hotkeys are broken" when PRESS still works fine.
+  case int(cHudHeldBindState())
+  of 0: "not attempted (PRESS activation never calls GetKey)"
+  of 1: "GameAssembly.dll not mapped yet (transient; retried)"
+  of 2: "REFUSED -- the 16-byte prologue at RVA 0x531EAE0 did not match " &
+        "UnityEngine.Input::GetKey for this build. Nothing was called, and " &
+        "HOLD cannot open the overlay. PRESS activation is unaffected."
+  of 3: "bound to UnityEngine.Input::GetKey @0x531EAE0 (prologue verified)"
+  else: "unknown"
 proc hudFsRejected*(): int64 = cHudFsRejected()
   ## Ticks on which the bound key read DOWN, and of those, how many were
   ## REFUSED because a key the player cannot be holding read down in the same
@@ -3009,6 +3179,19 @@ type
     fsZoom*: float
     fsOpacity*: float
     fsNorthUp*: bool
+    detail*: int
+      ## place.DetailCustom/Low/Medium/High. Carried here only so the diag and
+      ## the drift check can NAME the preset in force; the preset is RESOLVED in
+      ## readOpts and the renderer only ever sees the resulting drawArt /
+      ## mapGrid / northPip. One place decides what a preset means.
+    enemyPolicy*: int
+      ## place.EnemyAlways / EnemyShootOnly, AFTER `resolveEnemyPolicy` -- so on
+      ## this build it is always EnemyAlways. Carried so the diag can state the
+      ## policy actually governing the draw rather than the one on disk.
+    fsMode*: int
+      ## place.ActPress (0) or place.ActHold (1). PRESS is the default and the
+      ## historical behaviour; see MHUD_FSACT_* in the C above for why HOLD is a
+      ## level read rather than an edge pair.
 
 const
   ModeOff*     = 0
@@ -3033,51 +3216,19 @@ proc modeOf*(s: string): int =
   of "headingup", "heading-up", "rotating": ModeHeadUp
   else:                   ModeOff
 
-const
-  AnchorManual* = 0
-  AnchorTL*     = 1
-  AnchorTR*     = 2
-  AnchorBL*     = 3
-  AnchorBR*     = 4
+# THE ANCHOR TABLE MOVED to mods/maps/core/place.nim -- AnchorManual/TL/TR/BL/BR,
+# `anchorOfName` and `anchorRecognisedName` are re-exported above. These three
+# thin aliases keep every existing call site in maps.nim compiling unchanged.
+#
+# `anchorRecognised` is still a SEPARATE predicate from `anchorOf`, for the
+# reason it always was: `anchorOf` returns AnchorManual for a typo AND for the
+# literal word "manual", so its return value alone cannot tell the two apart --
+# a caller that only looks at the int has written a check that cannot fail. That
+# distinction is now asserted offline (`the anchor recogniser CAN say no`).
 
-proc anchorName*(a: int): string =
-  case a
-  of AnchorTL: "top-left"
-  of AnchorTR: "top-right"
-  of AnchorBL: "bottom-left"
-  of AnchorBR: "bottom-right"
-  else:        "manual"
-
-proc anchorOf*(s: string): int =
-  ## An UNRECOGNISED name resolves to `manual`, which is the historical
-  ## placement -- not to a corner the player did not ask for. The diag prints
-  ## `anchorName(hudLiveAnchor())`, so a typo is visible as "manual" rather
-  ## than silently becoming a corner.
-  case s
-  of "topleft", "top-left", "tl":         AnchorTL
-  of "topright", "top-right", "tr":       AnchorTR
-  of "bottomleft", "bottom-left", "bl":   AnchorBL
-  of "bottomright", "bottom-right", "br": AnchorBR
-  of "manual", "":                        AnchorManual
-  else:                                   AnchorManual
-
-proc anchorRecognised*(s: string): bool =
-  ## Whether `s` is a spelling `anchorOf` actually knows.
-  ##
-  ## Separate from `anchorOf` ON PURPOSE. `anchorOf` returns AnchorManual for a
-  ## typo AND for the literal word "manual", so its return value cannot tell the
-  ## two apart -- a caller that only looks at the int has written a check that
-  ## cannot fail. This is the predicate that CAN fail, and it is what the loud
-  ## refusal in readOpts is driven by: an unrecognised `widgetAnchor` must name
-  ## itself in the host log, never quietly become the default corner-less
-  ## placement and leave the player believing they picked a corner.
-  case s
-  of "topleft", "top-left", "tl",
-     "topright", "top-right", "tr",
-     "bottomleft", "bottom-left", "bl",
-     "bottomright", "bottom-right", "br",
-     "manual", "": true
-  else: false
+proc anchorName*(a: int): string = anchorNameOf(a)
+proc anchorOf*(s: string): int = anchorOfName(s)
+proc anchorRecognised*(s: string): bool = anchorRecognisedName(s)
 
 proc keycodeOf*(name: string): int =
   ## The KeyCode ordinal for a name, or -1 (AOWL_KC_UNBOUND). "" is unbound and
@@ -3180,7 +3331,8 @@ proc hudInit*(o: HudOpts) =
                       cfloat(o.borderPx), cfloat(o.backdropOpacity),
                       (if o.northPip: 1'i32 else: 0'i32))
   cHudConfigureFs(cfloat(o.fsMargin), cfloat(o.fsSpanM), cfloat(o.fsZoom),
-                  cfloat(o.fsOpacity), (if o.fsNorthUp: 1'i32 else: 0'i32))
+                  cfloat(o.fsOpacity), (if o.fsNorthUp: 1'i32 else: 0'i32),
+                  int32(o.fsMode))
   # The overlay always starts CLOSED. Arming (or re-arming) a feature must never
   # leave a full-screen panel over the player's raid because it happened to be
   # open when they last toggled the feed off.
@@ -3231,7 +3383,8 @@ proc hudReconfigure*(o: HudOpts; live: bool) =
                       cfloat(o.borderPx), cfloat(o.backdropOpacity),
                       (if o.northPip: 1'i32 else: 0'i32))
   cHudConfigureFs(cfloat(o.fsMargin), cfloat(o.fsSpanM), cfloat(o.fsZoom),
-                  cfloat(o.fsOpacity), (if o.fsNorthUp: 1'i32 else: 0'i32))
+                  cfloat(o.fsOpacity), (if o.fsNorthUp: 1'i32 else: 0'i32),
+                  int32(o.fsMode))
   # Turning the feature OFF closes the overlay. Otherwise an off edit made with
   # the map open would blank the draw and leave `fsOn` set, so re-enabling would
   # snap a full-screen panel back over the raid with no key press.
