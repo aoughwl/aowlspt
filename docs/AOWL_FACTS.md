@@ -8904,3 +8904,92 @@ check-that-cannot-fail shape:
 * the Nim scanner treated `'` as a string delimiter. Nim spells a typed literal
   `8'i32`, so the scanner desynchronised and reported a hundred lines of
   unrelated source as five sites' `slots` argument.
+
+## 2026-09-02 22:49: the 10-second crash was NOT the prefix conversion. It was a token-gated `il2cpp_class_from_name`.
+
+The section above records five hook sites moved POSTFIX -> PREFIX in `eb39963`
+to dodge the postfix stack shift, and the next crash was read as "a prefix on a
+`.ctor` reads fields that are not written yet". **That is refuted.** Measured
+from `Crash_2026-09-02_224920325` and from the host DLL itself
+(sha256 `350dba69`, `objdump` + the DLL's own `.pdata` function bounds; the
+build carries no pdb, so cdb's "nearest export + delta" was resolved by hand):
+
+| what cdb printed | what it actually is |
+|---|---|
+| `host+0x1ae26` | `aowl_thunk_common+0x66` — the instruction **after** `call aowl_patch_dispatch` on the **PREFIX** path |
+| `aowl_audio_occlusion_ready+0x45df` | `bridgeProof+0x105` — after `call valueBox_0_il26218kw` |
+| `aowl_region_screen_known_x+0x16ce9c` | `valueBox_0_il26218kw+0x1b` — after `call *%rax`, i.e. `il2cpp_value_box` |
+
+The other four host addresses in that `k` are **stale stack residue, not
+frames**: each is preceded by a `call` to a Nim string helper
+(`newStringOfCap`, `dollarQ`, `add`), not by a call to the next function in the
+chain. Only the three above are real call edges, and each was confirmed by
+disassembling the bytes immediately before the return address. **Do not read an
+unsymbolised `k` over this host as a call graph** — check the preceding `call`.
+
+The identification is byte-exact: the boxing call site reads
+`movl $0x67932,(%rax)` — 424242 decimal — which is `cCellSetI32(cell, 424242)`
+in `bridgeProof`, and nothing else in the host writes that constant.
+
+Registers at the fault: `RCX=0x6e11f7fc349b3101` (the `Il2CppClass*` argument to
+`il2cpp_value_box`), `RDX=0x000001ed62c8c1f0` (a real, readable cell). So the
+cell was fine and the **class handle** was the wrong thing.
+`il2cpp_class_from_name` is `AOWL_GATE_KIND_NONCE` in
+`abi/aowlspt_il2cpp_gates_data.h`: called with the stock signature it returns
+MT19937-64 output — uniform random and **never zero**, so `c != nil` passed.
+The `il2cppGates` flag ships OFF, so this is what every boot did.
+
+`readCString` had already been hardened against exactly this trap for the
+**string**-returning gated exports. The **handle**-returning ones —
+`findClass`, `findMethod`, `findField`, `findProperty`, `nextField`,
+`classType`, `classParent`, `fieldType`, `methodReturnType`, `methodParam`,
+`methodClass` — had no such filter, and that was the whole gap.
+
+### What was done
+
+`gatedHandle` in `aowl/src/aowlspt/il2cpp.nim` now filters every handle out of a
+gated export through three independent tests: canonical address (bits 47..63
+clear), pointer alignment, and a VirtualQuery over 0x10 bytes. The first two are
+`aowl_handle_shape_ok` in `abi/aowlspt_handle.h` — a header with no
+`<windows.h>` and no host types, so `tools/test_handleshape.py` compiles and
+**runs** them, with a positive control (four real handles, including the live
+`RDX` from this very dump) and the negative control that matters: 200,000
+uniform random 64-bit values, of which **0** were accepted.
+
+It is a **refusal, not a guarantee**, in the same sense `readCString` states:
+it narrows a certain crash to an improbable one (~2^-20 before the VirtualQuery).
+The only thing that makes a gated export safe is `aowl_host_gate_call` with a
+real token.
+
+`bridgeProof` also gained a proof that needs nothing gated: `il2cpp_string_new`
+is **not** in the 40-row gate table, and it is a managed-heap allocation — the
+exact operation that faults off Unity's thread. It allocates, then asserts
+`System.String._stringLength@0x10` equals the length it asked for. A non-nil
+pointer is not the check; the length readback is, and it can fail.
+
+### The five PREFIX sites were left as they are
+
+Nothing was restored to postfix. The measurement says the conversion did not
+cause this crash, and each of those handlers is documented as reading only
+state that is valid at entry. `attachDrain`'s refusal of a postfix over four
+slots stands, and `tools/drainaudit.py` still verifies it at build time
+(this build: 49 rows checked, 3 literal postfix sites, all within four).
+
+### What was NOT built, and why
+
+A return-stub postfix (prefix stub saves the caller's return address in
+per-thread storage, swaps `[rsp]` for a return stub, lets the original run on
+the caller's exact frame) was considered and **refused**, on two grounds:
+
+1. The crash it was proposed to fix is not the crash that happened.
+2. As specified it has an unhandled fatal case that bounding the table does not
+   touch. A managed throw unwinds with `RtlUnwindEx`, which calls
+   `RtlLookupFunctionEntry` on each return address. The return stub lives in the
+   trampoline pool — `VirtualAlloc`'d RX memory with **no** entry in any
+   function table — so the unwinder treats it as a leaf, takes the next return
+   address from `[rsp]`, and the real one is not there: it is in TLS. The
+   unwind then continues into a bogus frame or terminates the process. Making
+   it sound needs `RtlInstallFunctionTableCallback` plus a handler that
+   restores the saved return address, and that case cannot be proven by an
+   offline test that only checks RAX and the stack arguments — which is
+   precisely the shape of a check that cannot fail.

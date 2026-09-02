@@ -71,6 +71,11 @@ proc isNull*(p: Il2CppPtr): bool {.inline.} =
 # ---------------------------------------------------------------------------
 
 {.emit: """#include "aowlspt_shim.h" """.}
+## The SHAPE half of `gatedHandle` below. In a header of its own, with no
+## <windows.h> and no host types, so `tools/test_handleshape.py` can compile
+## and RUN it -- an untested safety rule is a comment. The shipped code and
+## the tested code are the same function; that is the point of the split.
+{.emit: """#include "aowlspt_handle.h" """.}
 
 proc tpV(f: Il2CppPtr): Il2CppPtr {.importc: "aowl_p_v", nodecl.}
 proc tpP(f, a: Il2CppPtr): Il2CppPtr {.importc: "aowl_p_p", nodecl.}
@@ -100,6 +105,8 @@ proc isCodePtr(p: Il2CppPtr): int32 {.
   importc: "aowl_is_code_pointer", nodecl.}
 proc isReadable(p: Il2CppPtr; size: int32): int32 {.
   importc: "aowl_is_readable", nodecl.}
+proc handleShapeOk(v: uint64): int32 {.
+  importc: "aowl_handle_shape_ok", nodecl.}
 proc wordAt(p: Il2CppPtr; i: uint64): uint16 {.importc: "aowl_word_at", nodecl.}
 
 # ---------------------------------------------------------------------------
@@ -275,6 +282,77 @@ proc missingEssential*(rt: Il2Cpp): seq[string] =
       result.add EntryNames[ord(e)]
 
 # ---------------------------------------------------------------------------
+# Handles that came out of a TOKEN-GATED export
+# ---------------------------------------------------------------------------
+
+var gGatedHandleRefusals* = 0
+  ## How many handles `gatedHandle` REFUSED. Counted rather than assumed: "the
+  ## filter is working" and "the trap never fired" answer identically from
+  ## outside, and only this counter tells them apart.
+
+proc gatedHandle(p: Il2CppPtr): Il2CppPtr =
+  ## The HANDLE half of the defence `readCString` (below) already applies to
+  ## strings, and the half that was missing.
+  ##
+  ## MEASURED 2026-09-02, Unity crash report `Crash_2026-09-02_224920325`,
+  ## host build sha256 350dba69, ~10 s after boot, on the Unity drain thread:
+  ##
+  ##   aowl_thunk_common+0x66      the PREFIX dispatch return address
+  ##     -> ... -> bridgeProof+0x105 -> valueBox+0x1b -> GameAssembly, 0xC0000005
+  ##   RCX = 0x6e11f7fc349b3101    the Il2CppClass* argument to il2cpp_value_box
+  ##   RDX = 0x000001ed62c8c1f0    a real, readable cell
+  ##
+  ## `bridgeProof` had done `findClass(gRt, "System.Int32")`, and the byte at
+  ## that boxing call site is `movl $0x67932,(%rax)` -- 424242 decimal, which
+  ## is `cCellSetI32(cell, 424242)` exactly, so the class handle was the one
+  ## thing wrong. `il2cpp_class_from_name` is `AOWL_GATE_KIND_NONCE` in
+  ## `abi/aowlspt_il2cpp_gates_data.h`: called with the stock signature it
+  ## returns MT19937-64 output, always NON-ZERO, so `c != nil` passed.
+  ##
+  ## THREE INDEPENDENT FILTERS, each of which CAN fail on real input:
+  ##
+  ##   1. Canonical address. Every Win64 user-mode pointer has bits 47..63
+  ##      clear. A uniform random 64-bit value does not, with probability
+  ##      1 - 2^-17. The observed 0x6e11f7fc349b3101 fails here.
+  ##   2. Alignment. Every IL2CPP metadata record is at least pointer-aligned.
+  ##      A random value is not, seven times in eight. The observed value ends
+  ##      in 0x01 and fails here too.
+  ##
+  ##      1 and 2 are `aowl_handle_shape_ok` in `abi/aowlspt_handle.h`, which
+  ##      is where they are so that `tools/test_handleshape.py` can compile and
+  ##      run them offline against both controls.
+  ##   3. Committed and readable, by VirtualQuery -- the same call
+  ##      `readCString` makes -- over 0x10 bytes. 0x10 and not more: the
+  ##      SMALLEST record reached through here is `Il2CppType` (8 bytes of
+  ##      `data` plus a 4-byte bitfield, padded to 16), and demanding 0x20
+  ##      would REFUSE a real one that legitimately sits in the last 24 bytes
+  ##      of its region -- a silent decline, which is the outcome this repo
+  ##      treats as worse than a loud failure.
+  ##
+  ## This is a REFUSAL, NOT A GUARANTEE, in exactly the sense `readCString`
+  ## states below: it narrows a certain crash to an improbable one. It does not
+  ## make a gated export safe to call. The only thing that does is
+  ## `aowl_host_gate_call` with a real token.
+  ##
+  ## Returning nil is the safe direction because every caller here, and every
+  ## caller of those callers, already branches on nil -- that is the "the
+  ## runtime did not answer" path they take when the export is simply absent.
+  result = nullPtr()
+  if p == nil:
+    return
+  # Filters 1 and 2 live in `abi/aowlspt_handle.h` and are exercised offline by
+  # `tools/test_handleshape.py` -- including the negative control that matters,
+  # 200,000 uniform random 64-bit values, of which it accepted 0.
+  if handleShapeOk(cast[uint64](p)) == 0'i32:
+    gGatedHandleRefusals = gGatedHandleRefusals + 1
+    return
+  # Filter 3 needs the OS, which is why it is here and not in that header.
+  if isReadable(p, 0x10'i32) == 0'i32:
+    gGatedHandleRefusals = gGatedHandleRefusals + 1
+    return
+  result = p
+
+# ---------------------------------------------------------------------------
 # Strings
 # ---------------------------------------------------------------------------
 
@@ -423,7 +501,7 @@ proc methodClass*(rt: Il2Cpp; m: Il2CppMethod): Il2CppClass =
   ## `MethodInfo.klass` at an assumed offset.
   if not rt.has(eMethodGetClass): return nullPtr()
   if m == nil: return nullPtr()
-  result = tpP(rt.fns[ord(eMethodGetClass)], m)
+  result = gatedHandle(tpP(rt.fns[ord(eMethodGetClass)], m))
 
 proc classGetImage*(rt: Il2Cpp; c: Il2CppClass): Il2CppImage =
   ## The assembly image a class was defined in. Exported by the runtime, so this
@@ -451,8 +529,9 @@ proc classFromName*(rt: Il2Cpp; image: Il2CppImage;
   if not rt.has(eClassFromName): return nullPtr()
   var n1 = ns
   var n2 = name
-  result = tpPPP(rt.fns[ord(eClassFromName)], image,
-                 cast[Il2CppPtr](toCString(n1)), cast[Il2CppPtr](toCString(n2)))
+  result = gatedHandle(tpPPP(rt.fns[ord(eClassFromName)], image,
+                             cast[Il2CppPtr](toCString(n1)),
+                             cast[Il2CppPtr](toCString(n2))))
 
 proc className*(rt: Il2Cpp; c: Il2CppClass): string =
   if not rt.has(eClassGetName): return ""
@@ -474,7 +553,7 @@ proc classNamespace*(rt: Il2Cpp; c: Il2CppClass): string =
 
 proc classParent*(rt: Il2Cpp; c: Il2CppClass): Il2CppClass =
   if not rt.has(eClassGetParent): return nullPtr()
-  result = tpP(rt.fns[ord(eClassGetParent)], c)
+  result = gatedHandle(tpP(rt.fns[ord(eClassGetParent)], c))
 
 proc nextMethod*(rt: Il2Cpp; c: Il2CppClass; iter: var Il2CppIter): Il2CppMethod =
   if not rt.has(eClassGetMethods): return nullPtr()
@@ -482,7 +561,8 @@ proc nextMethod*(rt: Il2Cpp; c: Il2CppClass; iter: var Il2CppIter): Il2CppMethod
 
 proc nextField*(rt: Il2Cpp; c: Il2CppClass; iter: var Il2CppIter): Il2CppField =
   if not rt.has(eClassGetFields): return nullPtr()
-  result = tpPP(rt.fns[ord(eClassGetFields)], c, cast[Il2CppPtr](addr iter))
+  result = gatedHandle(tpPP(rt.fns[ord(eClassGetFields)], c,
+                            cast[Il2CppPtr](addr iter)))
 
 proc nextProperty*(rt: Il2Cpp; c: Il2CppClass;
                    iter: var Il2CppIter): Il2CppProperty =
@@ -493,24 +573,24 @@ proc findMethod*(rt: Il2Cpp; c: Il2CppClass; name: string;
                  argc: int): Il2CppMethod =
   if not rt.has(eClassGetMethodFromName): return nullPtr()
   var n = name
-  result = tpPPI(rt.fns[ord(eClassGetMethodFromName)], c,
-                 cast[Il2CppPtr](toCString(n)), int32(argc))
+  result = gatedHandle(tpPPI(rt.fns[ord(eClassGetMethodFromName)], c,
+                             cast[Il2CppPtr](toCString(n)), int32(argc)))
 
 proc findField*(rt: Il2Cpp; c: Il2CppClass; name: string): Il2CppField =
   if not rt.has(eClassGetFieldFromName): return nullPtr()
   var n = name
-  result = tpPP(rt.fns[ord(eClassGetFieldFromName)], c,
-                cast[Il2CppPtr](toCString(n)))
+  result = gatedHandle(tpPP(rt.fns[ord(eClassGetFieldFromName)], c,
+                            cast[Il2CppPtr](toCString(n))))
 
 proc findProperty*(rt: Il2Cpp; c: Il2CppClass; name: string): Il2CppProperty =
   if not rt.has(eClassGetPropertyFromName): return nullPtr()
   var n = name
-  result = tpPP(rt.fns[ord(eClassGetPropertyFromName)], c,
-                cast[Il2CppPtr](toCString(n)))
+  result = gatedHandle(tpPP(rt.fns[ord(eClassGetPropertyFromName)], c,
+                            cast[Il2CppPtr](toCString(n))))
 
 proc classType*(rt: Il2Cpp; c: Il2CppClass): Il2CppType =
   if not rt.has(eClassGetType): return nullPtr()
-  result = tpP(rt.fns[ord(eClassGetType)], c)
+  result = gatedHandle(tpP(rt.fns[ord(eClassGetType)], c))
 
 proc classIsValueType*(rt: Il2Cpp; c: Il2CppClass): bool =
   if not rt.has(eClassIsValuetype): return false
@@ -534,11 +614,11 @@ proc methodParamCount*(rt: Il2Cpp; m: Il2CppMethod): int =
 
 proc methodReturnType*(rt: Il2Cpp; m: Il2CppMethod): Il2CppType =
   if not rt.has(eMethodGetReturnType): return nullPtr()
-  result = tpP(rt.fns[ord(eMethodGetReturnType)], m)
+  result = gatedHandle(tpP(rt.fns[ord(eMethodGetReturnType)], m))
 
 proc methodParam*(rt: Il2Cpp; m: Il2CppMethod; index: int): Il2CppType =
   if not rt.has(eMethodGetParam): return nullPtr()
-  result = tpPZ(rt.fns[ord(eMethodGetParam)], m, uint64(index))
+  result = gatedHandle(tpPZ(rt.fns[ord(eMethodGetParam)], m, uint64(index)))
 
 proc fieldName*(rt: Il2Cpp; f: Il2CppField): string =
   if not rt.has(eFieldGetName): return ""
@@ -546,7 +626,7 @@ proc fieldName*(rt: Il2Cpp; f: Il2CppField): string =
 
 proc fieldType*(rt: Il2Cpp; f: Il2CppField): Il2CppType =
   if not rt.has(eFieldGetType): return nullPtr()
-  result = tpP(rt.fns[ord(eFieldGetType)], f)
+  result = gatedHandle(tpP(rt.fns[ord(eFieldGetType)], f))
 
 proc fieldOffset*(rt: Il2Cpp; f: Il2CppField): int =
   if not rt.has(eFieldGetOffset): return -1

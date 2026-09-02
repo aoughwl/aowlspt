@@ -3443,6 +3443,50 @@ proc bridgeProof(tid: int) =
   ##      operation that faults from a foreign thread, and one that needs no
   ##      method pointer at all. A successful round-trip is itself the proof.
   var reported = false
+
+  # PROOF 0, and the only one that does not depend on a TOKEN-GATED export.
+  #
+  # `il2cpp_string_new` is NOT in the 40-row gate table
+  # (`abi/aowlspt_il2cpp_gates_data.h`), so it is called with its real
+  # signature and answers truthfully. It is also a MANAGED-HEAP ALLOCATION,
+  # which is precisely the operation that faults from any thread but Unity's --
+  # so a string that comes back and reads back correctly is the same proof the
+  # boxing round-trip was reaching for, with nothing gated in the path.
+  #
+  # The readback is the check, not the non-nil: `System.String._stringLength`
+  # is at 0x10 (the mandatory `tools/fldoff.py` self-check offset), and it must
+  # equal the length we asked for. A pointer that is merely non-nil proves
+  # nothing here; a pointer whose _stringLength is our own length cannot be a
+  # coincidence, and this check FAILS if the allocation did not happen.
+  const BridgeProbe = "aowlspt-bridge-probe"
+  let probeStr = newString(gRt, BridgeProbe)
+  if probeStr != nil and
+     cIsReadable(cast[Il2CppPtr](probeStr), 0x18'i32) != 0'i32:
+    let n = cReadI32At(cast[Il2CppPtr](cast[uint](probeStr) + 0x10'u))
+    if n == int32(BridgeProbe.len):
+      okLog "il2cpp bridge: allocated a managed System.String on Unity " &
+            "thread " & $tid & " and read _stringLength back as " & $n &
+            " -- the managed heap is reachable from this thread (this call " &
+            "is ungated; it is the proof, and the by-name probes below are not)"
+      reported = true
+    else:
+      warn "il2cpp bridge: il2cpp_string_new returned a readable pointer on " &
+           "thread " & $tid & " whose _stringLength@0x10 reads " & $n &
+           ", not " & $(BridgeProbe.len) & " -- NOT a proof; treating the " &
+           "managed-heap probe as INCONCLUSIVE"
+  else:
+    warn "il2cpp bridge: il2cpp_string_new returned nothing readable on " &
+         "thread " & $tid & " -- the managed-heap probe is INCONCLUSIVE, " &
+         "not a failure of the drain"
+
+  # The by-name probes below go through TOKEN-GATED exports
+  # (`il2cpp_class_from_name`, `il2cpp_class_get_method_from_name`). With the
+  # `il2cppGates` flag off -- the default -- those return MT19937-64 output,
+  # and `findClass`/`findMethod` now REFUSE such a handle rather than hand it
+  # on (see `gatedHandle` in `aowl/src/aowlspt/il2cpp.nim`). That refusal is
+  # what makes the two blocks below take their "did not resolve" paths on this
+  # build instead of boxing against a random Il2CppClass*, which is what
+  # crashed the client at 0:00:09 on 2026-09-02.
   let timeCls = findClass(gRt, "UnityEngine.Time")
   if timeCls != nil:
     let m = findMethod(gRt, timeCls, "get_frameCount", 0)

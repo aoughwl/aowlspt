@@ -139,6 +139,11 @@ ITEMS = [
     # that no main-thread work runs off the drain thread is tested rather
     # than asserted. INCONCLUSIVE, never PASS, without a C compiler.
     T("test_mqpolicy.py", "fast"),                     # 1.5s, needs gcc
+    # Same shape, for abi/aowlspt_handle.h: compiles and EXECUTES the filter
+    # that stops a TOKEN-GATED il2cpp export's MT19937-64 return being used as
+    # a handle -- the measured Crash_2026-09-02_224920325. Its own negative
+    # control is 200,000 uniform random 64-bit values.
+    T("test_handleshape.py", "fast"),                  # 1.5s, needs gcc
     # Resolves the compiler for the two items above. Its own falsifier builds
     # a real gcc.exe that exits 1 with no output -- the measured Git Bash
     # shape -- and asserts find_cc REFUSES it.
@@ -263,6 +268,14 @@ VERIFIERS = [
       "pre-2026-09-02 'a stalled drain may run its work here' policy, and "
       "asserts the stalled-on-host case then answers 1. A green run whose "
       "negative control is also green reports INCONCLUSIVE, not PASS"),
+    V("test_handleshape.py", "test_handleshape.py",
+      "case 0 is a POSITIVE control -- four real handles, one of them the live "
+      "RDX out of the crash dump itself -- so a predicate that rejected "
+      "everything could not pass; case 5 is the negative control that decides "
+      "whether the filter is worth anything, 200,000 uniform random 64-bit "
+      "values of which essentially none may be accepted; and cases 3 and 4 "
+      "show the two filters are INDEPENDENT, by feeding a value that satisfies "
+      "each one alone"),
     V("drainaudit.py", "test_drainaudit.py",
       "a fixture tree whose POSTFIX site declares SEVEN register slots -- the "
       "measured EFT.UI.MenuScreen::Show(5-arg) crash shape -- must come back "
