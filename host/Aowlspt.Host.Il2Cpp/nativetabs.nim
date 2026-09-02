@@ -436,8 +436,16 @@ proc ntToggleSetFired(regs: Il2CppPtr) =
   var j = 0
   while j < gNtSubToggle.len and j < NtMaxSubs:
     if gNtSubToggle[j] == selfPtr:
-      gNtSubPressed = j
-      gNtSubPressedByPlayer = true
+      # ONLY THE ON EDGE IS A PRESS. This drain is a PREFIX, and a press on
+      # one subtab makes the cloned ToggleGroup call Set(false, true) on the
+      # OTHER one from inside the first call -- so the nested OFF arrives
+      # LAST and, before this test, overwrote the press with the index of the
+      # toggle that was switched OFF. Live, every press then read as POSTFX:
+      # GRAPHICS SETTINGS lit up, the PostFX panel stayed, both looked
+      # selected. The OFF edge carries no information the ON edge does not.
+      if turnedOn:
+        gNtSubPressed = j
+        gNtSubPressedByPlayer = true
       return
     j = j + 1
   # THE CONTROLS>MODS SUBTAB, on the same postfix as everything else.
@@ -1852,7 +1860,12 @@ proc ntTickBody() =
             "not through our code. That is the half that was in doubt."
     ntSubShow(sidx)
     gNtSubVerdictSaid = false
-  if gNtSubBuilt and gNtShown >= 0:
+  # THE VERDICT MUST RUN WHERE THE STRIP LIVES. It was gated on `gNtShown`,
+  # which is only ever set for a tab of OURS -- and the panel-switching strip
+  # belongs to the STOCK Graphics tab, so under it the verdict never ran and a
+  # boot with both subtabs lit printed no FAIL at all.
+  if gNtSubBuilt and (gNtShown >= 0 or
+                      (gNtSubKind == NtSubPanels and gNtGfxTabOn)):
     ntSubVerdict("subtab selection")
   gNtStep = "tick: proof / verdict"
   # THE PROOF, one bounded step per frame. Each phase waits `NtProofSettle`
