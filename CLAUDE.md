@@ -117,6 +117,15 @@ deploy to `D:\Aowlspt\aowlspt` and never start or stop the game: a human may be 
 several agents build concurrently, and every deploy must be serialised through one place
 that verifies markers first. Subagents build, verify, and report an artifact path.
 
+**Entering and leaving a raid, PROVEN 2026-09-02 (use this, never tree-walking
+automation):** boot with `python tools/run.py --keep --until-phase MENU ...`, then
+write `allow write` + `raid Woods` to `aowlspt-inspect.txt` and
+`python tools/run.py --attach --until-phase DEPLOYED`. The host drives menu ->
+side -> map -> offline screen -> insurance -> accept -> READY on uihooks
+show-events (~10s), then the game loads; DEPLOYED latches on the true deploy
+signal. `raidexit` is the exit half (in progress). Every step logs `autoRaid:`
+with a readback and a census on refusal; read those, not the screen.
+
 Do not sleep for a fixed duration and hope. Drive off `state` / `until` — ask the client
 where it is instead of guessing at timings.
 
