@@ -1576,13 +1576,14 @@ proc onPublishTick(payload: string): string =
 # that it prints only when the text CHANGES, plus a heartbeat, so a healthy
 # session costs a handful of lines and a broken one cannot hide.
 
-var gDiagLast = ""
-  ## The last VERDICT SIGNATURE (see diagfilter.nim), NOT the last block text.
-  ## Holding the text here is what made the change-detection a check that could
-  ## not fail: the text carries counters and therefore always differed.
+var gDiagRep = DiagRepeatState(sig: "", quiet: 0'i64, lastPhase: -1, announced: false)
+  ## The repeat policy's WHOLE state: the last VERDICT SIGNATURE (see
+  ## diagfilter.nim, NOT the last block text -- holding the text here is what
+  ## made the change-detection a check that could not fail, since the text
+  ## carries counters and therefore always differed), how many cycles it has
+  ## stood, and which host phase the standing not-PASS was last announced under.
+  ## `diagStep` is the only thing that reads or writes it, and it is pure.
 var gDiagTicks = 0'i64
-var gDiagQuiet = 0'i64
-  ## Consecutive ticks on which the signature was unchanged.
 var gDiagVerbose = false
   ## The `diagVerbose` setting. DEFAULT FALSE. True restores the old behaviour
   ## exactly: the whole block, every tick, unconditionally.
@@ -1721,33 +1722,14 @@ proc mapsDiagText(): string =
     lPos = "PASS  " & $good & " of " & $tried & " position read(s) validated " &
            "[" & posEverText() & "]"
 
-  # 4. the draw itself, asserted on the FINISHED state: did primitives come out?
-  var lDraw = ""
-  if not gHudOn:
-    lDraw = "INCONCLUSIVE  no HUD registered, so no draw was possible"
-  elif hudFrames() <= 0'i64:
-    lDraw = "INCONCLUSIVE  the callback has never been invoked"
-  elif hudDrawn() <= 0'i64:
-    lDraw = "FAIL  the callback ran " & $hudFrames() & " time(s) and drew " &
-            "NOTHING every time. It returns immediately because no local " &
-            "player position validated -- see `positions` above. This is the " &
-            "reason the radar is not on screen"
-  elif hudBlips() <= 0'i64:
-    lDraw = "PASS  radar drawn on " & $hudDrawn() & " frame(s), but 0 blips " &
-            "-- the ring is on screen with nothing in it"
-  else:
-    lDraw = "PASS  drawn on " & $hudDrawn() & " frame(s), " & $hudBlips() &
-            " blip(s)"
-  # BUG 2: dispatches skipped because a blocking UI surface (F12/Settings, F6,
-  # F3) was open. Stated as its own countable clause so "hidden behind a panel"
-  # never reads as the flicker failure. Zero when no panel was ever open.
-  if hudMasked() > 0'i64:
-    lDraw = lDraw & "; " & $hudMasked() & " dispatch(es) SKIPPED with an " &
-            "overlay open (aowl_ui_overlay_mask != 0 -- map hidden behind a panel)"
-  if hudGated() > 0'i64:
-    lDraw = lDraw & "; " & $hudGated() & " dispatch(es) GATED OFF by the " &
-            "master switch (enabled == 0 -- 0 primitives submitted, held frame " &
-            "dropped)"
+  # 4. the draw itself, asserted on the FINISHED state: did primitives come
+  # out, AND was anything ever supposed to come out. The ladder is in
+  # `diagfilter.drawVerdict` -- pure, and driven by tests/mapsdiag.nim -- because
+  # this check used to read FAIL at the MAIN MENU, where 0 draws is correct
+  # behaviour and its negative could not be distinguished from "not in a raid".
+  let lDraw = drawVerdict(gHudOn, hudArmed(), hudFrames(), hudDrawn(),
+                          hudBlips(), hudMasked(), hudGated(),
+                          diagActive, diagRaidWhy)
 
   # 5. the back buffer. A 0x0 screen puts every mark in the corner.
   var lScreen = ""
@@ -2444,48 +2426,60 @@ proc onDiagTick(payload: string): string =
   ## which everything is broken from the start still gets a full report -- and
   ## afterwards it prints on any CHANGE, plus a periodic heartbeat so a
   ## long-running stuck state cannot scroll away and be forgotten.
+  ##
+  ## The re-announcement schedule for a STANDING not-PASS is `diagStep`'s, not
+  ## this proc's: every 60 s in a raid, once per host phase outside one. See
+  ## diagfilter.nim for why -- at the menu the honest verdict for most of the
+  ## block is INCONCLUSIVE, and repeating "I could not look" every minute
+  ## forever is noise, while in a raid a standing FAIL must keep naming itself.
   inc gDiagTicks
   let text = mapsDiagText()
   let sig = diagSignature(text)
   let bad = diagNotPass(text)
+  lockMod()
+  let stepLive = activeRaid(gSnap)
+  unlockMod()
+  let stepPhase = hostPhase()
   if gDiagVerbose:
     # THE FIREHOSE, opt-in. Byte-for-byte the old behaviour.
     info text
-  elif gDiagLast.len == 0 or sig != gDiagLast:
-    # A VERDICT MOVED -- or this is the first tick, which always prints in
-    # full, so a session broken from the very start still gets a whole report.
-    # Print the block, because context matters exactly when something has just
-    # changed, and then name the not-PASS lines on their OWN line at warn so
-    # they are greppable and cannot be lost inside eighteen lines of prose.
-    gDiagLast = sig
-    gDiagQuiet = 0'i64
-    info text
-    if bad.len > 0:
-      warn ModName & ": diag NOT-PASS: " & bad
   else:
-    # NOTHING MOVED. This is the case that produced 40% of the host log.
-    inc gDiagQuiet
-    if bad.len > 0:
+    let emit = diagStep(gDiagRep, sig, bad.len > 0, stepLive, stepPhase)
+    case emit
+    of DeBlock:
+      # A VERDICT MOVED -- or this is the first tick, which always prints in
+      # full, so a session broken from the very start still gets a whole report.
+      # Print the block, because context matters exactly when something has just
+      # changed, and then name the not-PASS lines on their OWN line at warn so
+      # they are greppable and cannot be lost inside eighteen lines of prose.
+      info text
+      if bad.len > 0:
+        warn ModName & ": diag NOT-PASS: " & bad
+    of DeStill:
       # A FAIL or INCONCLUSIVE is NEVER collapsed into an all-clear heartbeat
-      # and is never suppressed outright. It is re-announced at warn every 30
-      # ticks (60 s), naming itself, for as long as it lasts -- so it survives
-      # any amount of scrolling and a grep for FAIL still finds it in a quiet
-      # run. That is 1 line/60 s against the old 19 lines/2 s, and the FAIL is
-      # more visible than it was, not less: it is now on a line of its own at a
-      # higher level instead of buried mid-block.
-      if (gDiagQuiet mod 30'i64) == 0'i64:
-        warn ModName & ": diag STILL NOT-PASS after " & $gDiagQuiet &
-             " unchanged cycle(s) (" & $(gDiagQuiet * 2'i64) & "s): " & bad &
-             ". Turn on the `diagVerbose` setting for the full block every tick."
-    elif (gDiagQuiet mod 150'i64) == 0'i64:
+      # and is never suppressed outright. In a raid it is re-announced every 30
+      # cycles (60 s), naming itself, for as long as it lasts. Outside a raid it
+      # is announced once per phase: the block re-prints in full the moment any
+      # verdict moves, and the phase name is PART of the signature, so a real
+      # change still surfaces on the cycle it happens.
+      var stillWhen = ", no raid -- next report on a phase change"
+      if stepLive:
+        stillWhen = ", raid live -- next report in 60s"
+      warn ModName & ": diag STILL NOT-PASS after " & $gDiagRep.quiet &
+           " unchanged cycle(s) (" & $(gDiagRep.quiet * 2'i64) & "s, phase " &
+           hostPhaseName(stepPhase) & stillWhen & "): " & bad &
+           ". Turn on the `diagVerbose` setting for the full block every tick."
+    of DeHeartbeat:
       # Everything reads PASS and has not moved. One line every 5 minutes, and
       # it is a HEARTBEAT, not a verdict: it says the instrument is still
       # running and how long the verdicts have stood. Pure silence here would
       # be indistinguishable from a dead timer, which is the same "I could not
       # look reads as a pass" failure this block exists to prevent.
-      info ModName & ": diag all-PASS, unchanged for " & $gDiagQuiet &
-           " cycle(s) (" & $(gDiagQuiet * 2'i64) & "s). The full block is " &
+      info ModName & ": diag all-PASS, unchanged for " & $gDiagRep.quiet &
+           " cycle(s) (" & $(gDiagRep.quiet * 2'i64) & "s). The full block is " &
            "re-printed the moment any verdict changes."
+    of DeNone:
+      discard
   # THE PHASE PROFILE, on the SAME 2s timer, and unconditional when the flag is
   # set: it is cumulative, so an unchanged line is still new information (the
   # means moved). It reports INCONCLUSIVE below its tick threshold rather than a

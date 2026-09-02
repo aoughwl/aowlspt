@@ -179,6 +179,199 @@ proc has(xs: seq[string]; s: string): bool =
       return true
   result = false
 
+proc emitName(e: DiagEmit): string =
+  ## `$` on an enum is not relied on here; the name is spelled out so a failure
+  ## message names the outcome instead of printing an ordinal.
+  case e
+  of DeNone: "DeNone"
+  of DeBlock: "DeBlock (full block)"
+  of DeStill: "DeStill (STILL NOT-PASS warn)"
+  of DeHeartbeat: "DeHeartbeat"
+
+# ---------------------------------------------------------------------------
+# THE `draw` VERDICT AND THE REPEAT POLICY.
+#
+# Both were live defects, MEASURED at the MAIN MENU on 2026-09-02:
+#   `warn Maps: diag NOT-PASS: ... draw:FAIL ...` on every boot, then
+#   `STILL NOT-PASS after N unchanged cycle(s)` every 60 s forever.
+# Every other line in that block correctly read INCONCLUSIVE; only `draw` said
+# FAIL, on a state -- no raid, so nothing to draw -- in which no input could
+# have made it say anything else. CLAUDE.md 9b.
+#
+# These checks are written the way that section demands: each asserts the
+# FINISHED verdict string, and each is paired with the input that produces the
+# OPPOSITE verdict, so neither can pass vacuously. In particular the FAIL is
+# asserted to still be REACHABLE -- a fix that merely deleted the FAIL branch
+# would pass the "menu is INCONCLUSIVE" check and fail this one.
+# ---------------------------------------------------------------------------
+
+proc verdictOf(line: string): string =
+  ## The bare verdict word at the head of a diag line. Uses the SHIPPED parser
+  ## (`diagNotPass` over a synthetic one-line block) rather than a `startsWith`
+  ## written here, so a line the real filter would classify differently cannot
+  ## quietly pass this suite.
+  let tagged = diagNotPass("  draw : " & line & "\n")
+  if tagged == "draw:" & DiagFail: return DiagFail
+  if tagged == "draw:" & DiagIncon: return DiagIncon
+  if tagged.len == 0: return DiagPass
+  "?" & tagged
+
+const MenuWhy = "world live and a pose read, but the local player is NOT in " &
+                "the live AllAlivePlayersList"
+
+proc drawVerdictChecks() =
+  echo ""
+  echo "the `draw` verdict -- the menu FAIL"
+
+  # THE DEFECT, exactly as measured: HUD on, region armed, the callback
+  # dispatched thousands of times at the menu, zero draws, no raid.
+  let menu = drawVerdict(true, true, 4000'i64, 0'i64, 0'i64, 0'i64, 0'i64,
+                         false, MenuWhy)
+  check("armed + dispatched + 0 draws + NO RAID reads INCONCLUSIVE",
+        verdictOf(menu) == DiagIncon,
+        "read " & verdictOf(menu) & " at the main menu: " & menu)
+  check("and it names the raid gate as the reason, not a draw failure",
+        contains(menu, "the raid gate is CLOSED") and contains(menu, MenuWhy),
+        "the reason given was: " & menu)
+  check("and it says in words that this is not a defect",
+        contains(menu, "not in a raid: a zero draw count here is not a defect"),
+        menu)
+
+  # THE POSITIVE CONTROL FOR THE NEGATIVE. Same numbers, gate OPEN. If this
+  # does not fail, the fix removed the check instead of gating it.
+  let raid = drawVerdict(true, true, 4000'i64, 0'i64, 0'i64, 0'i64, 0'i64,
+                         true, "active raid")
+  check("the SAME zero-draw state with the raid gate OPEN still reads FAIL",
+        verdictOf(raid) == DiagFail,
+        "read " & verdictOf(raid) & " in a live raid with 0 draws -- the FAIL " &
+        "is no longer reachable, so the check can no longer fail: " & raid)
+  check("and the FAIL still points at `positions` as the thing to read next",
+        contains(raid, "positions"), raid)
+
+  # An unarmed region is its OWN reason. Before this it was folded into the
+  # same FAIL, which blamed the mod for a host flag being off.
+  let unarmed = drawVerdict(true, false, 0'i64, 0'i64, 0'i64, 0'i64, 0'i64,
+                            true, "active raid")
+  check("registered but NOT armed reads INCONCLUSIVE naming sharedRegion",
+        verdictOf(unarmed) == DiagIncon and contains(unarmed, "sharedRegion"),
+        unarmed)
+  let noHud = drawVerdict(false, false, 0'i64, 0'i64, 0'i64, 0'i64, 0'i64,
+                          false, MenuWhy)
+  check("no HUD registered reads INCONCLUSIVE",
+        verdictOf(noHud) == DiagIncon, noHud)
+  let neverRan = drawVerdict(true, true, 0'i64, 0'i64, 0'i64, 0'i64, 0'i64,
+                             true, "active raid")
+  check("armed in a raid but never once dispatched reads INCONCLUSIVE",
+        verdictOf(neverRan) == DiagIncon, neverRan)
+
+  # A PASS is earned by primitives, and it is KEPT after the raid ends -- the
+  # gate must not decay a real measurement back into "I could not look".
+  let drew = drawVerdict(true, true, 4000'i64, 3900'i64, 12'i64, 0'i64, 0'i64,
+                         true, "active raid")
+  check("drawing 3900 frames with 12 blips in a raid reads PASS",
+        verdictOf(drew) == DiagPass, drew)
+  let afterRaid = drawVerdict(true, true, 9000'i64, 3900'i64, 12'i64, 0'i64,
+                              0'i64, false, MenuWhy)
+  check("that PASS SURVIVES the raid ending -- it does not decay to INCONCLUSIVE",
+        verdictOf(afterRaid) == DiagPass,
+        "after extract the earned PASS became " & verdictOf(afterRaid) &
+        ", so a session that demonstrably worked reports that it could not " &
+        "look: " & afterRaid)
+  let ring = drawVerdict(true, true, 4000'i64, 3900'i64, 0'i64, 0'i64, 0'i64,
+                         true, "active raid")
+  check("drawn with ZERO blips is a PASS that says the ring is empty",
+        verdictOf(ring) == DiagPass and contains(ring, "0 blip"), ring)
+
+  # The two countable clauses are appended in every branch, including the new
+  # INCONCLUSIVE one -- an overlay open at the menu is still worth counting.
+  let masked = drawVerdict(true, true, 4000'i64, 0'i64, 0'i64, 77'i64, 5'i64,
+                           false, MenuWhy)
+  check("the masked/gated dispatch counts survive on the INCONCLUSIVE branch",
+        contains(masked, "77 dispatch(es) SKIPPED") and
+        contains(masked, "5 dispatch(es) GATED OFF"), masked)
+
+proc repeatPolicyChecks() =
+  echo ""
+  echo "the STILL NOT-PASS repeat schedule -- raid vs menu"
+
+  const Sig = "draw=INCONCLUSIVE;phase=MENU;"
+
+  # 1. AT THE MENU: announced once when it appears, then once per PHASE.
+  var st = DiagRepeatState(sig: "", quiet: 0'i64, lastPhase: -1, announced: false)
+  var first = diagStep(st, Sig, true, false, 1)
+  check("the first menu cycle prints the FULL block (nothing is suppressed)",
+        first == DeBlock, "emitted " & emitName(first) & " on the very first cycle")
+  var stills = 0
+  var i = 0
+  while i < 600:            # 600 cycles == 20 minutes at the menu
+    if diagStep(st, Sig, true, false, 1) == DeStill: inc stills
+    inc i
+  check("20 minutes of an UNCHANGED menu not-PASS re-announces ZERO times",
+        stills == 0,
+        "it warned " & $stills & " more time(s) after the full block -- the " &
+        "old schedule warned 20")
+
+  # 2. and a PHASE CHANGE breaks the silence, on the cycle it happens.
+  let onPhase = diagStep(st, Sig, true, false, 2)   # MENU -> LOADING
+  check("a host phase change re-announces the standing not-PASS immediately",
+        onPhase == DeStill, "emitted " & emitName(onPhase) & " on the phase transition")
+  var afterPhase = 0
+  i = 0
+  while i < 200:
+    if diagStep(st, Sig, true, false, 2) == DeStill: inc afterPhase
+    inc i
+  check("and then goes quiet again within the new phase",
+        afterPhase == 0, "warned " & $afterPhase & " more time(s) in one phase")
+
+  # 3. IN A RAID the schedule is UNCHANGED: every 30 cycles, forever. This is
+  #    the control for the whole change -- quieting the menu must not quiet the
+  #    raid, which is the only place a standing FAIL is real news.
+  var rs = DiagRepeatState(sig: "", quiet: 0'i64, lastPhase: -1, announced: false)
+  discard diagStep(rs, Sig, true, true, 3)
+  var raidStills = 0
+  var longestGap = 0
+  var gap = 0
+  i = 0
+  while i < 600:
+    gap = gap + 1
+    if diagStep(rs, Sig, true, true, 3) == DeStill:
+      inc raidStills
+      if gap > longestGap: longestGap = gap
+      gap = 0
+    inc i
+  check("600 raid cycles with a standing FAIL warn 20 times (every 60s)",
+        raidStills == 20, "warned " & $raidStills & " time(s)")
+  check("and no raid cycle ever goes more than 60s unannounced",
+        longestGap <= 30 and longestGap > 0,
+        "the longest silence was " & $longestGap & " cycle(s) (" &
+        $(longestGap * 2) & "s)")
+
+  # 4. AN ALL-PASS BLOCK still heartbeats, in a raid AND at the menu -- silence
+  #    must never be the same thing as health.
+  var hs = DiagRepeatState(sig: "", quiet: 0'i64, lastPhase: -1, announced: false)
+  discard diagStep(hs, "draw=PASS;", false, false, 1)
+  var beats = 0
+  i = 0
+  while i < 600:
+    if diagStep(hs, "draw=PASS;", false, false, 1) == DeHeartbeat: inc beats
+    inc i
+  check("an all-PASS menu block still heartbeats (4 times in 20 minutes)",
+        beats == 4, "beat " & $beats & " time(s) -- a silent instrument is " &
+        "indistinguishable from a dead one")
+
+  # 5. AND THE THING THE QUIETING MUST NOT DO: a verdict that MOVES still
+  #    re-prints in full on the cycle it moves, menu or not.
+  var ms = DiagRepeatState(sig: "", quiet: 0'i64, lastPhase: -1, announced: false)
+  discard diagStep(ms, Sig, true, false, 1)
+  i = 0
+  while i < 100:
+    discard diagStep(ms, Sig, true, false, 1)
+    inc i
+  let moved = diagStep(ms, "draw=FAIL;phase=MENU;", true, false, 1)
+  check("a CHANGED verdict re-prints the full block even after 100 quiet cycles",
+        moved == DeBlock,
+        "emitted " & emitName(moved) & " -- the quieting is suppressing real news")
+
 proc main(): int =
   var path = "tests\\fixtures\\mapsdiag-blocks.txt"
   var i = 1
@@ -239,28 +432,31 @@ proc main(): int =
     announcedAt.add -1
     inc wi
 
-  var last = ""
-  var quiet = 0
+  # The replay drives the SHIPPED policy proc (`diagStep`), not a copy of it.
+  # It used to re-implement the `mod 30` / `mod 150` ladder here, which meant
+  # the corpus could keep passing while the shipped schedule drifted away from
+  # it. The corpus is a RAID session, so it is replayed with the raid gate OPEN
+  # -- that is the schedule this section is about. The menu schedule is asserted
+  # separately, in `repeatPolicyChecks`.
+  var st = DiagRepeatState(sig: "", quiet: 0'i64, lastPhase: -1, announced: false)
   bi = 0
   while bi < blocks.len:
     let blk = blocks[bi]
     let sig = diagSignature(blk)
     let bad = diagNotPass(blk)
     var emit = ""
-    if last.len == 0 or sig != last:
-      last = sig
-      quiet = 0
+    case diagStep(st, sig, bad.len > 0, true, 3)
+    of DeBlock:
       emit = blk
       if bad.len > 0:
         emit.add "warn maps: diag NOT-PASS: " & bad & "\n"
-    else:
-      inc quiet
-      if bad.len > 0:
-        if (quiet mod 30) == 0:
-          emit = "warn maps: diag STILL NOT-PASS after " & $quiet &
-                " unchanged cycle(s): " & bad & "\n"
-      elif (quiet mod 150) == 0:
-        emit = "info maps: diag all-PASS, unchanged for " & $quiet & " cycle(s)\n"
+    of DeStill:
+      emit = "warn maps: diag STILL NOT-PASS after " & $st.quiet &
+             " unchanged cycle(s): " & bad & "\n"
+    of DeHeartbeat:
+      emit = "info maps: diag all-PASS, unchanged for " & $st.quiet & " cycle(s)\n"
+    of DeNone:
+      discard
     if emit.len > 0:
       emitted.add emit
       emittedLines = emittedLines + countLines(emit)
@@ -327,6 +523,9 @@ proc main(): int =
   check("the output is not empty",
         emittedLines > 0,
         "nothing at all was emitted -- a silent instrument is not a quiet one")
+
+  drawVerdictChecks()
+  repeatPolicyChecks()
 
   echo ""
   if failures == 0:

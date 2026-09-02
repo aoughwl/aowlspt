@@ -137,3 +137,124 @@ proc diagNotPass*(text: string): string =
           result.add ", "
         result.add labelOf(text, i, c) & ":" & tok
     i = e + 1
+
+# ---------------------------------------------------------------------------
+# THE `draw` VERDICT. Pure, so the case that produced this code -- FAIL at the
+# MAIN MENU -- is testable offline.
+#
+# MEASURED, every boot on 2026-09-02, at the main menu with no raid:
+#   `warn Maps: diag NOT-PASS: ... draw:FAIL ...`
+# and then `STILL NOT-PASS after N unchanged cycle(s)` every 60 s, forever.
+#
+# The old ladder read: HUD registered, callback invoked, `hudDrawn() == 0` ->
+# FAIL, "This is the reason the radar is not on screen". At the menu the
+# callback IS dispatched every frame and correctly draws nothing, because there
+# is no raid. So the FAIL fired on a state that is not a defect, and -- worse --
+# its negative was indistinguishable from "not in a raid" (CLAUDE.md 9b): there
+# was no input at the menu for which that branch could have said anything else.
+#
+# The gate is now the raid lifecycle, and it is a real gate, not a suppression:
+#   * `drawn > 0` still reports PASS regardless of the gate, so a raid that
+#     drew and then ended keeps its earned PASS instead of decaying to
+#     INCONCLUSIVE.
+#   * `drawn == 0` with the gate OPEN is still a FAIL, with the same text. That
+#     is the input that makes this check fail, and the offline suite feeds it.
+# ---------------------------------------------------------------------------
+
+proc drawVerdict*(hudOn, armed: bool; frames, drawn, blips, masked, gated: int64;
+                  raidLive: bool; raidWhy: string): string =
+  ## The `draw` line, from the FINISHED state: did primitives come out, and was
+  ## anything ever meant to come out.
+  if not hudOn:
+    result = DiagIncon & "  no HUD registered, so no draw was possible"
+  elif not armed:
+    result = DiagIncon & "  registered, but the shared region is NOT armed " &
+             "(host flag `sharedRegion`), so the renderer was never asked to " &
+             "draw. Not a draw failure -- see `region` above"
+  elif frames <= 0'i64:
+    result = DiagIncon & "  the callback has never been invoked"
+  elif drawn > 0'i64:
+    if blips <= 0'i64:
+      result = DiagPass & "  radar drawn on " & $drawn & " frame(s), but 0 " &
+               "blip(s) -- the ring is on screen with nothing in it"
+    else:
+      result = DiagPass & "  drawn on " & $drawn & " frame(s), " & $blips &
+               " blip(s)"
+  elif not raidLive:
+    # THE MENU CASE. Nothing was supposed to be drawn, so 0 draws is not
+    # evidence of anything. Name the gate, and name what WOULD make it a FAIL.
+    result = DiagIncon & "  the callback ran " & $frames & " time(s) and drew " &
+             "nothing, but the raid gate is CLOSED (" & raidWhy & "), so " &
+             "there was nothing to draw. " &
+             "not in a raid: a zero draw count here is not a defect" &
+             ". This reads FAIL only once the gate is OPEN and the callback " &
+             "still submits no primitives"
+  else:
+    result = DiagFail & "  the callback ran " & $frames & " time(s) and drew " &
+             "NOTHING every time, while the raid gate is OPEN. It returns " &
+             "immediately because no local player position validated -- see " &
+             "`positions` above. This is the reason the radar is not on screen"
+  # Dispatches skipped because a blocking UI surface (F12/Settings, F6, F3) was
+  # open. Its own countable clause so "hidden behind a panel" never reads as the
+  # flicker failure. Zero when no panel was ever open.
+  if masked > 0'i64:
+    result = result & "; " & $masked & " dispatch(es) SKIPPED with an " &
+             "overlay open (aowl_ui_overlay_mask != 0 -- map hidden behind a panel)"
+  if gated > 0'i64:
+    result = result & "; " & $gated & " dispatch(es) GATED OFF by the " &
+             "master switch (enabled == 0 -- 0 primitives submitted, held frame " &
+             "dropped)"
+
+# ---------------------------------------------------------------------------
+# THE REPEAT POLICY for the not-PASS re-announcement.
+#
+# In a raid, a standing FAIL must keep naming itself every 30 cycles (60 s) for
+# as long as it lasts -- that is the whole point of the line and it is NOT
+# changed here. Outside a raid, most of the block is legitimately INCONCLUSIVE
+# ("I could not look" is the honest answer at the menu), and re-announcing that
+# every 60 s forever is noise that says nothing new. So outside a raid it is
+# announced ONCE PER PHASE: the full block already re-prints whenever any
+# verdict moves, and the phase name is part of the signature, so a real change
+# still surfaces immediately.
+# ---------------------------------------------------------------------------
+
+type
+  DiagEmit* = enum
+    DeNone        ## say nothing this cycle
+    DeBlock       ## a verdict moved: print the whole block (+ the not-PASS line)
+    DeStill       ## nothing moved and something is still not-PASS: re-announce
+    DeHeartbeat   ## nothing moved and everything is PASS: liveness only
+
+  DiagRepeatState* = object
+    sig*: string          ## verdict signature at the last full print
+    quiet*: int64         ## cycles since the last full print
+    lastPhase*: int       ## host phase at the last not-PASS announcement
+    announced*: bool      ## a not-PASS has been announced for `lastPhase`
+
+proc diagStep*(st: var DiagRepeatState; sig: string; hasBad, raidLive: bool;
+               phase: int): DiagEmit =
+  ## One diag cycle. `st` carries everything; nothing else is consulted.
+  if st.sig.len == 0 or sig != st.sig:
+    st.sig = sig
+    st.quiet = 0'i64
+    st.lastPhase = phase
+    st.announced = hasBad
+    return DeBlock
+  st.quiet = st.quiet + 1'i64
+  if hasBad:
+    if raidLive:
+      # IN A RAID: unchanged. Every 60 s, forever.
+      if (st.quiet mod 30'i64) == 0'i64:
+        st.lastPhase = phase
+        st.announced = true
+        return DeStill
+      return DeNone
+    # OUTSIDE A RAID: once per phase, not once per minute.
+    if (not st.announced) or phase != st.lastPhase:
+      st.lastPhase = phase
+      st.announced = true
+      return DeStill
+    return DeNone
+  if (st.quiet mod 150'i64) == 0'i64:
+    return DeHeartbeat
+  DeNone
