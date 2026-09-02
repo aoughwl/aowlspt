@@ -96,6 +96,22 @@ Start-Process -FilePath "D:\Aowlspt\aowlspt\aowlspt-launch.exe" -WorkingDirector
 
 Only ask the user for what genuinely requires human eyes or a human decision.
 
+**Three rules measured 2026-09-02, each of which cost an hour when unknown:**
+
+- `run.py` without `--keep` FORCE-STOPS the client when its verdict lands, and
+  stopping the Bash task that launched it kills the game too. Both read as a
+  clean crash afterwards. Boot with `--keep`; never TaskStop a boot.
+- Every native death leaves a Unity crash report in
+  `%LOCALAPPDATA%\Temp\Battlestate Games\EscapeFromTarkov\Crashes\Crash_<UTC>`.
+  `run.py` prints it on DIED and `python tools/crashwatch.py last` symbolises
+  it (`il2cpp_resolve.py symbolize`). Read it BEFORE theorising: four "clean"
+  deaths were a SAIN use-after-free and a mode-skip Submit race, both named
+  in the report the whole time.
+- `--until-phase MENU` now needs a MenuScreen::Show proof line; natesp's
+  `raid phase = MENU` only means "no GameWorld" and is true on the character
+  screen too (`PARKED-BEFORE-MENU`, exit 10, is that case).
+
+
 **This rule is for the COORDINATING session, not for subagents.** A subagent must never
 deploy to `D:\Aowlspt\aowlspt` and never start or stop the game: a human may be playing,
 several agents build concurrently, and every deploy must be serialised through one place
@@ -199,6 +215,10 @@ those hooks is off, not that Settings was never opened.
 
 ## 3. Build rules
 
+- **MSYS `sed -i` rewrites CRLF files as LF** (the repo has `* -text`), which
+  turns a one-line edit into a whole-file diff and a phantom conflict. Edit with
+  the Edit tool or a Python script that preserves newlines; check `git diff
+  --stat` before committing.
 - **PowerShell only.** `gcc` silently fails in Git Bash (exit 1, no output).
 - Hand-invoking `nimony` outside `aowl` silently exits 0 producing **nothing**.
 - **Name the target**: `aowl build host` ≈ 2m vs `aowl build` ≈ 4m27s warm / 18m cold.
