@@ -120,6 +120,22 @@ def ensure_settings_open():
     return False, "pressed Settings but $settings never bound: " + detail
 
 
+HOSTLOG = os.path.join(INSTALL, "aowlspt-host.log")
+
+
+def host_native_tabs_lines():
+    """Every `native tabs` line the host wrote this session, bounded read."""
+    out = []
+    try:
+        with open(HOSTLOG, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if "native tabs" in line:
+                    out.append(line.rstrip()[:300])
+    except OSError:
+        return None
+    return out
+
+
 def cmd_baseline():
     ok, detail = ensure_settings_open()
     if not ok:
@@ -153,7 +169,7 @@ def cmd_verify():
         return INCONCLUSIVE
     base = json.load(open(BASELINE, encoding="utf-8"))
 
-    ans = run(["state", "roots", "find Toggles", "children $_"])
+    ans = run(["state", "find Toggles $settings 40000", "children $f1"])
     if ans is None:
         say("INCONCLUSIVE", "the inspector never answered. NOT a pass.")
         return INCONCLUSIVE
@@ -178,6 +194,28 @@ def cmd_verify():
         problems.append("STOCK GEOMETRY CHANGED. was %s -- now %s. This is "
                         "the defect every previous attempt shipped."
                         % (base.get("settingslist"), g4))
+
+    # THE VACUOUS-PASS GUARD, measured 2026-09-02: the geometry was byte-
+    # identical because the feature had FAULTED 4/4 on the first frame Settings
+    # was known and switched itself off -- nothing was ever added, so nothing
+    # could have moved. Unchanged geometry is only evidence once the host says
+    # the tab was built. Read the host's own trail: a fault ceiling is a FAIL,
+    # and no VERDICT line at all is "I could not look", never a pass.
+    trail = host_native_tabs_lines()
+    if trail is None:
+        say("INCONCLUSIVE", "the host log could not be read, so whether the "
+                            "feature ran is unknown. NOT a pass.")
+        return INCONCLUSIVE
+    faults = [l for l in trail if "FAULTED" in l or "fault ceiling" in l]
+    if faults:
+        problems.append("the native-tabs tick FAULTED and the feature switched "
+                        "itself off; the unchanged geometry is vacuous. Host: "
+                        + faults[-1].strip())
+    elif not any("native tabs VERDICT" in l for l in trail):
+        say("INCONCLUSIVE", "the host never printed `native tabs VERDICT`, so "
+                            "the tab was not observed being built; unchanged "
+                            "geometry proves nothing. NOT a pass.")
+        return INCONCLUSIVE
 
     if problems:
         for p in problems:
