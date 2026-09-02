@@ -9181,6 +9181,15 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   # `modSettingsRender`, whose boot-time per-mod fetch is the measured
   # character-select crasher.
   gNtModsOn = readBoolKey("nativeTabsMods")
+  # STEP 4: CONTROLS > MODS, a keybind LIST (display only this pass). Default
+  # OFF. Data from /aowlspt/keybinds on the same worker transport, armed on
+  # that subtab's show edge and cached for the session.
+  gNtKbOn = readBoolKey("nativeTabsKeybinds")
+  if gNtKbOn and not gNtOn:
+    gNtOn = true
+    info "nativeTabsKeybinds needs nativeTabs (it uses the native-tab build " &
+         "and the shared Toggle::Set event), so nativeTabs has been turned " &
+         "on with it."
   gNtOn = gNtFlagOn
   if gNtOn and not gSettingsUiProbe:
     gSettingsUiProbe = true

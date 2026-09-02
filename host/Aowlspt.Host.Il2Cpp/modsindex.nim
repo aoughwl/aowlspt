@@ -320,3 +320,110 @@ proc miTick(now: uint64) =
   else:
     if gMiPhase == miDone:
       miFail("the settings index parsed but named no mod with a guid")
+
+# ===========================================================================
+# STEP 4 -- THE KEYBIND INDEX (`/aowlspt/keybinds`).
+#
+# Same shape, same transport and the same borrow discipline as the settings
+# index above, for the same reasons: armed ONCE on a show edge, never at boot,
+# answered on the overlay's worker thread, and the shared sync slot handed
+# back on every exit path. `takeModSet` is blind while we hold it, and that
+# once delayed a mod unload into the character-select transition.
+#
+# DISPLAY ONLY. This fetches what the binds ARE; nothing here rebinds
+# anything, and the rows built from it are deliberately inert. Said in the log
+# too, because a keybind row that looks clickable and silently does nothing is
+# exactly the defect this project keeps producing.
+# ===========================================================================
+
+const cKbMaxBinds = 128           ## rule 4: bounds the parse and the rows
+
+type
+  KbBind = object
+    modName*: string
+    action*: string
+    key*: string
+
+var gKbPhase = miIdle
+var gKbArmedAt = 0'u64
+var gKbArmedAttempts = 0'i32
+var gKbBinds: seq[KbBind] = @[]
+var gKbTruncated = 0
+
+proc kbCount*(): int = gKbBinds.len
+proc kbReady*(): bool = gKbPhase == miDone
+proc kbFailed*(): bool = gKbPhase == miFailed
+
+proc kbFail(why: string) =
+  gKbPhase = miFailed
+  miRelease()
+  warn "keybinds: " & why & ". The CONTROLS>MODS page lists nothing; the " &
+       "stock Controls pages are untouched and nothing was written."
+
+proc kbParse(doc: string): bool =
+  ## `{"binds":[{mod,action,key}, ...]}` -- the documented shape of
+  ## `/aowlspt/keybinds`. Built against the documented shape, and it must fail
+  ## CLEANLY on a body that is not it rather than render half a page.
+  result = false
+  var items: seq[string] = @[]
+  if not pathItems(doc, "binds", items):
+    kbFail("the keybind index did not parse as a binds array (" & $doc.len &
+           " byte(s) received) -- either an older route or an error body")
+    return
+  gKbBinds = @[]
+  var i = 0
+  while i < items.len and gKbBinds.len < cKbMaxBinds:
+    var m = ""
+    var a = ""
+    var k = ""
+    discard pathGet(items[i], "mod", m)
+    discard pathGet(items[i], "action", a)
+    discard pathGet(items[i], "key", k)
+    if a.len > 0:
+      gKbBinds.add KbBind(modName: m, action: a,
+                          key: (if k.len > 0: k else: "(unbound)"))
+    i = i + 1
+  if items.len > cKbMaxBinds:
+    gKbTruncated = items.len - cKbMaxBinds
+    warn "keybinds: the route served " & $items.len & " bind(s) and this " &
+         "host renders at most " & $cKbMaxBinds & "; " & $gKbTruncated &
+         " are NOT listed. Reported rather than silently dropped."
+  result = gKbBinds.len > 0
+
+proc kbArm*(now: uint64) =
+  ## Armed on the CONTROLS>MODS subtab's show edge, once per session.
+  if gKbPhase != miIdle: return
+  if gSyncMs <= 0:
+    kbFail("no backend is configured, so there are no keybinds to fetch")
+    return
+  gKbPhase = miArmed
+  gKbArmedAt = now
+  gKbArmedAttempts = overlaySyncAttempts()
+  overlaySyncStart("/aowlspt/keybinds", int32(cMiPollMs))
+  okLog "keybinds: the CONTROLS>MODS page was opened for the first time, so " &
+        "/aowlspt/keybinds is being fetched NOW -- once, lazily, on the " &
+        "overlay's worker thread, and cached for the session. DISPLAY ONLY: " &
+        "this pass lists the binds and does not rebind anything."
+
+proc kbTick*(now: uint64) =
+  if gKbPhase != miArmed: return
+  let doc = overlaySyncTake()
+  if doc.len == 0:
+    if now - gKbArmedAt > cMiStallMs:
+      let attempts = overlaySyncAttempts() - gKbArmedAttempts
+      if attempts <= 0'i32:
+        kbFail("keybind route not served -- the worker never issued a request " &
+               "for /aowlspt/keybinds within " & $cMiStallMs & "ms")
+      else:
+        kbFail("keybind route not served -- the worker issued " & $attempts &
+               " request(s) and none returned a body here")
+    return
+  gKbPhase = miDone
+  miRelease()
+  if kbParse(doc):
+    okLog "keybinds: " & $gKbBinds.len & " mod keybind(s) from ONE fetch of " &
+          "/aowlspt/keybinds (" & $doc.len & " byte(s)), cached for the " &
+          "session. The shared sync slot has been handed back."
+  else:
+    if gKbPhase == miDone:
+      kbFail("the keybind index parsed but named no binds")

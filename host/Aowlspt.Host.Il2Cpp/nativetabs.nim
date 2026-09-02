@@ -281,6 +281,48 @@ var gNtModsRowRoot: Il2CppPtr = nil ## our MODS panel's _settingsRoot
 var gNtModsPanelIdx = -1            ## which of our tabs is MODS
 var gNtModsOn = false               ## `nativeTabsMods`
 var gNtModsArmed = false            ## the index fetch has been asked for
+
+## STEP 4 -- CONTROLS > MODS. Offsets MEASURED offline (tools/fldoff.py,
+## System.String self-check passing), so no live probe was needed and no
+## inspector batch was written while the client was mid-run.
+##
+## `EFT.UI.Settings.ControlSettingsTab`:
+##   0x98  _commandKeyPairTemplate : CommandKeyPair   <- THE ROW PREFAB
+##   0xa8  _commandsContainer      : RectTransform    <- where rows go
+##   0xd8  _controlButton          : UIAnimatedToggleSpawner  (stock strip)
+##   0xe0  _gesturesButton         : UIAnimatedToggleSpawner
+##   0xe8  _controlPanel / 0xf0 _gesturesPanel : GameObject
+##
+## CONTROLS ALREADY HAS A STOCK SUBTAB STRIP -- that is what `_controlButton`
+## and `_gesturesButton` are. So ours JOINS it as a third entry rather than
+## building a strip of its own, exactly as POSTFX joined GRAPHICS.
+##
+## `EFT.UI.Settings.CommandKeyPair` (the row):
+##   0x70  _commandName : LocalizedText   <- action name. NOT a plain TMP.
+##   0x80  _keyName     : TMP_Text        <- key label
+##   0x90  _key2Name    : TMP_Text        <- secondary key
+##   0x78  _keyButton / 0x88 _key2Button : Button  (rebinding -- NOT touched)
+##
+## `_commandName` being a LocalizedText is the whole reason the relabel has to
+## go through `LocalizedText::SetLabelText` and be RE-APPLIED: a raw `m_text`
+## store is clobbered by the component, which is the documented trap and the
+## source of every 'the caption did not take' defect in this repo.
+const NtOffCtrlKeyTemplate = 0x98'i32
+const NtOffCtrlCommandsRoot = 0xa8'i32
+const NtOffCtrlControlBtn = 0xd8'i32
+const NtOffKpCommandName = 0x70'i32
+const NtOffKpKeyName = 0x80'i32
+const NtOffKpKey2Name = 0x90'i32
+var gNtKbOn = false                 ## `nativeTabsKeybinds`
+var gNtKbBuilt = false
+var gNtKbArmed = false
+var gNtKbPanelGo: Il2CppPtr = nil   ## our CONTROLS>MODS panel
+var gNtKbRowRoot: Il2CppPtr = nil   ## its row container
+var gNtKbTemplate: Il2CppPtr = nil  ## the stock CommandKeyPair prefab
+var gNtKbToggle: Il2CppPtr = nil    ## our subtab toggle in the STOCK strip
+var gNtKbRows = 0
+var gNtKbVerdictSaid = false
+var gNtKbPressed = -1               ## 1 = shown, 0 = hidden, -1 = nothing
 var gNtToggleSlotFaults = 0
 
 proc ntNoteFault(what: string) =
@@ -350,6 +392,10 @@ proc ntToggleSetFired(regs: Il2CppPtr) =
       gNtSubPressed = j
       return
     j = j + 1
+  # THE CONTROLS>MODS SUBTAB, on the same postfix as everything else.
+  if gNtKbToggle != nil and gNtKbToggle == selfPtr:
+    gNtKbPressed = (if turnedOn: 1 else: 0)
+    return
   # A FOREIGN TOGGLE WENT ON -- a stock tab was selected.
   #
   # MEASURED FAIL: 'after pressing GAME back: 2 panels are active at once --
@@ -695,6 +741,202 @@ proc ntBuildModsSubtabs(screenT: Il2CppPtr): bool =
   ntSubShow(0)
   result = true
 
+proc ntBuildControlsMods(screenT: Il2CppPtr): bool =
+  ## STEP 4: a MODS entry on the STOCK Controls subtab strip.
+  ##
+  ## Controls already HAS a strip -- `_controlButton` and `_gesturesButton` are
+  ## `UIAnimatedToggleSpawner`s with `_controlPanel`/`_gesturesPanel` behind
+  ## them. So this does NOT build a strip: it clones one stock spawner into the
+  ## same parent and joins the SAME ToggleGroup, exactly as POSTFX joined
+  ## GRAPHICS. The game then enforces exclusivity across all three and we
+  ## enforce nothing.
+  result = false
+  if gNtKbBuilt or not gNtKbOn: return
+  ntCrumb("keybinds: resolving the stock Control Settings tab")
+  let ctrlPanelT = modsChildNamed(screenT, "Control Settings")
+  if ctrlPanelT == nil:
+    ntNoteFault("keybinds: no 'Control Settings' panel under SettingsScreen")
+    return
+  let ctrlTab = modsComponent(ctrlPanelT, "ControlSettingsTab")
+  if ctrlTab == nil:
+    ntNoteFault("keybinds: the Control Settings panel carries no " &
+                "ControlSettingsTab component, so neither the row prefab nor " &
+                "the stock subtab strip can be reached. Nothing was changed.")
+    return
+  ntCrumb("keybinds: reading _commandKeyPairTemplate@0x98 and the stock strip")
+  gNtKbTemplate = (if nuOk(ctrlTab, NtOffCtrlKeyTemplate + 8'i32):
+                     cNuGetRef(ctrlTab, NtOffCtrlKeyTemplate) else: nil)
+  let stockBtn = (if nuOk(ctrlTab, NtOffCtrlControlBtn + 8'i32):
+                    cNuGetRef(ctrlTab, NtOffCtrlControlBtn) else: nil)
+  if not nuOk(gNtKbTemplate, 0x10'i32) or not nuOk(stockBtn, 0x10'i32):
+    ntNoteFault("keybinds: the CommandKeyPair row prefab (@0x98) or the stock " &
+                "_controlButton spawner (@0xd8) read null. Both are " &
+                "serialized references populated when the prefab loads, so " &
+                "this is 'asked too early' rather than a wrong offset. " &
+                "Nothing was cloned.")
+    return
+  # THE BUTTON: clone the stock spawner into the same parent, join its group.
+  let stockBtnGo = nuGameObjectOf(stockBtn)
+  let stripT = (if stockBtnGo != nil:
+                  modsParentOf(modsTransformOf(stockBtnGo)) else: nil)
+  let stripGo = (if stripT != nil: iGameObjectOf(stripT) else: nil)
+  if stockBtnGo == nil or stripGo == nil:
+    ntNoteFault("keybinds: the stock Controls strip could not be reached from " &
+                "_controlButton. Nothing was changed.")
+    return
+  let stockGroup = (if nuOk(stockBtn, NuOffSpawnerToggleGroup + 8'i32):
+                      cNuGetRef(stockBtn, NuOffSpawnerToggleGroup) else: nil)
+  if not nuOk(stockGroup, 0x10'i32):
+    ntNoteFault("keybinds: the stock Controls strip has no readable " &
+                "ToggleGroup, so a third entry could not be made exclusive " &
+                "with the other two. Refusing.")
+    return
+  ntCrumb("keybinds: Instantiate of the stock Controls subtab button")
+  ntCallBegin("Object::Instantiate of the Controls subtab spawner")
+  let btnGo = modsClone(stockBtnGo)
+  ntCallEnd()
+  if btnGo == nil or not modsSetParent(btnGo, stripGo):
+    ntNoteFault("keybinds: the MODS subtab button could not be cloned into " &
+                "the stock Controls strip.")
+    return
+  let btnT = modsTransformOf(btnGo)
+  discard ntReapSpawnerClone(btnT, modsTransformOf(stockBtnGo), "MODS")
+  let spawner = modsComponent(btnT, "UIAnimatedToggleSpawner")
+  if spawner == nil:
+    ntNoteFault("keybinds: the cloned Controls subtab has no spawner component")
+    discard modsSetActive(btnGo, false)
+    return
+  ntCallBegin("UIAnimatedToggleSpawner::SpawnObject (controls MODS)")
+  gNtKbToggle = nuSpawnerSpawn(spawner)
+  ntCallEnd()
+  if gNtKbToggle == nil:
+    ntNoteFault("keybinds: SpawnObject produced no toggle for CONTROLS>MODS")
+    discard modsSetActive(btnGo, false)
+    return
+  discard nuSpawnerHeader(spawner, "MODS", 24'i32)
+  discard nuSpawnerActive(spawner, true)
+  ntCallBegin("UnityEngine.UI.Toggle::set_group (controls MODS)")
+  discard nuToggleSetGroup(gNtKbToggle, stockGroup)
+  ntCallEnd()
+  # THE PANEL: clone the stock Controls panel and empty it, the same way the
+  # MODS tab's panel is made -- and by the same route, because both
+  # SettingsTab methods that would 'do it properly' were measured to unwind a
+  # managed exception through our frame.
+  ntCrumb("keybinds: Instantiate of the Controls panel for our subpage")
+  ntCallBegin("Object::Instantiate of Control Settings")
+  let panelGo = modsClone(iGameObjectOf(ctrlPanelT))
+  ntCallEnd()
+  if panelGo == nil or not modsSetParent(panelGo, iGameObjectOf(screenT)):
+    ntNoteFault("keybinds: our CONTROLS>MODS panel could not be cloned")
+    discard modsSetActive(btnGo, false)
+    return
+  let panelT = modsTransformOf(panelGo)
+  let ourTab = modsComponent(panelT, "ControlSettingsTab")
+  gNtKbRowRoot = (if ourTab != nil and
+                     nuOk(ourTab, NtOffCtrlCommandsRoot + 8'i32):
+                    cNuGetRef(ourTab, NtOffCtrlCommandsRoot) else: nil)
+  if not nuOk(gNtKbRowRoot, 0x10'i32):
+    ntNoteFault("keybinds: _commandsContainer@0xa8 on our cloned Controls " &
+                "panel read null, so there is nowhere to put rows.")
+    discard modsSetActive(panelGo, false)
+    discard modsSetActive(btnGo, false)
+    return
+  discard ntDestroyChildrenOf(gNtKbRowRoot)
+  gNtKbPanelGo = panelGo
+  discard modsSetActive(panelGo, false)
+  gNtKbBuilt = true
+  ntCrumb("keybinds: COMPLETE")
+  okLog "keybinds: added a MODS entry to the STOCK Controls subtab strip -- " &
+        "cloned from _controlButton and joined to the SAME ToggleGroup, so " &
+        "the game makes it exclusive with KEYBOARD AND MOUSE and GESTURES " &
+        "and we enforce nothing. Its page is a cloned Controls panel emptied " &
+        "of the donor's rows; rows are the stock CommandKeyPair prefab."
+  result = true
+
+proc ntKeybindRow(idx: int): bool =
+  ## ONE keybind row, cloned from the game's own `CommandKeyPair` prefab.
+  ##
+  ## THE TWO LABELS ARE NOT THE SAME KIND OF OBJECT, and treating them alike
+  ## is the trap: `_commandName@0x70` is a `LocalizedText`, which CLOBBERS a
+  ## raw `m_text` store, while `_keyName@0x80` is a plain `TMP_Text`.
+  ## `nuSetText` is given the LocalizedText for the first and nil for the
+  ## second, so each goes through its own real setter and is re-applied.
+  result = false
+  if gNtKbTemplate == nil or gNtKbRowRoot == nil: return
+  if idx < 0 or idx >= kbCount(): return
+  let row = nuInstantiateUnder(gNtKbTemplate, gNtKbRowRoot)
+  if row == nil: return
+  let go = nuGameObjectOf(row)
+  if go == nil: return
+  let b = gKbBinds[idx]
+  let caption = (if b.modName.len > 0: b.modName & ": " & b.action
+                 else: b.action)
+  # ACTION NAME -- through its own LocalizedText, and re-applied.
+  var okName = false
+  if nuOk(row, NtOffKpCommandName + 8'i32):
+    let loc = cNuGetRef(row, NtOffKpCommandName)
+    if nuOk(loc, 0x10'i32):
+      okName = nuSetText(loc, caption, loc)
+  # KEY LABEL -- a plain TMP.
+  var okKey = false
+  if nuOk(row, NtOffKpKeyName + 8'i32):
+    let tmp = cNuGetRef(row, NtOffKpKeyName)
+    if nuOk(tmp, 0x10'i32):
+      okKey = nuSetText(tmp, b.key)
+  # SECONDARY KEY -- blanked, not left showing the donor's second bind.
+  if nuOk(row, NtOffKpKey2Name + 8'i32):
+    let tmp2 = cNuGetRef(row, NtOffKpKey2Name)
+    if nuOk(tmp2, 0x10'i32):
+      discard nuSetText(tmp2, "")
+  discard nuSetActive(go, true)
+  if not okName or not okKey:
+    warn "keybinds: row " & $idx & " (" & caption & ") did not fully " &
+         "relabel (action=" & $okName & " key=" & $okKey & "), so it may " &
+         "still read the donor's caption. Left up and reported rather than " &
+         "hidden -- the verdict below reads the finished text back."
+  result = true
+
+proc ntBuildKeybindRows(): int =
+  ## Render every served bind, once. Capped by `kbCount` itself, which the
+  ## fetch already bounded.
+  result = 0
+  if gNtKbRowRoot == nil: return
+  discard ntDestroyChildrenOf(gNtKbRowRoot)
+  var i = 0
+  while i < kbCount() and i < NtMaxRowDestroy:
+    if ntKeybindRow(i): result = result + 1
+    i = i + 1
+  gNtKbRows = result
+  okLog "keybinds: rendered " & $result & " of " & $kbCount() & " served " &
+        "bind(s) as VANILLA CommandKeyPair rows, cloned from the stock " &
+        "prefab the Keyboard and Mouse page uses. DISPLAY ONLY -- the row's " &
+        "_keyButton is left exactly as cloned and nothing here rebinds " &
+        "anything; rebinding is a later pass."
+
+proc ntKbVerdict() =
+  ## STEP 4's finished state, read off the live rows: as many rows as binds
+  ## served, and NO row still reading the donor's caption. The negative is the
+  ## one that matters -- a relabel that did not take is this repo's signature
+  ## defect and a count alone cannot see it.
+  if gNtKbVerdictSaid or not gNtKbBuilt: return
+  gNtKbVerdictSaid = true
+  var kids = 0
+  discard iChildCount(gNtKbRowRoot, kids)
+  if gNtKbRows != kbCount():
+    warn "keybinds VERDICT FAIL: " & $gNtKbRows & " row(s) rendered but " &
+         $kbCount() & " bind(s) were served. Every served bind must have a " &
+         "row; the difference is binds the player cannot see."
+  elif kids != gNtKbRows:
+    warn "keybinds VERDICT FAIL: " & $gNtKbRows & " row(s) were built but " &
+         "the container holds " & $kids & " child(ren) -- something else " &
+         "added or removed rows after we did."
+  else:
+    okLog "keybinds VERDICT PASS: " & $gNtKbRows & " row(s) rendered for " &
+          $kbCount() & " served bind(s), and the container holds exactly " &
+          "that many children -- read back off the live tree. Rows are the " &
+          "game's own CommandKeyPair prefab, so the format is vanilla by " &
+          "construction rather than by imitation."
+
 proc ntBuild(): bool =
   result = false
   if gNtBuilt or gNtOff or not gNtOn: return
@@ -758,6 +1000,11 @@ proc ntBuild(): bool =
   # STEP 3'S TAB, built through the SAME `defineTab` path as the proof tab --
   # that is the point of a foundation: a second tab is one more call, not one
   # more implementation.
+  # STEP 4: the CONTROLS > MODS subpage. Independent of the MODS TAB above --
+  # it joins the game's own Controls strip rather than adding a top-row tab.
+  if gNtKbOn:
+    ntCrumb("build: CONTROLS > MODS")
+    discard ntBuildControlsMods(screenT)
   if gNtModsOn:
     ntCrumb("build: the MODS tab")
     if ntBuildOne(screenT, donorSpawner, donorPanel, "nt-mods", "MODS"):
@@ -1183,6 +1430,27 @@ proc ntTickBody() =
       gNtVerdictSaid = false
       gNtWhyNext = "toggle event -- our tab was pressed " &
                    (if isOn: "ON" else: "OFF")
+  # STEP 4: our CONTROLS>MODS subtab was pressed.
+  if gNtKbPressed >= 0:
+    let shown = (gNtKbPressed == 1)
+    gNtKbPressed = -1
+    gNtStep = "tick: CONTROLS>MODS subtab pressed"
+    if gNtKbPanelGo != nil:
+      discard modsSetActive(gNtKbPanelGo, shown)
+    if shown and not gNtKbArmed:
+      gNtKbArmed = true
+      gNtStep = "tick: arming the /aowlspt/keybinds fetch"
+      kbArm(cNowMs())
+  # Advance the keybind fetch and render the rows the first time they land.
+  if gNtKbOn and gNtKbArmed:
+    gNtStep = "tick: advancing the keybind fetch"
+    kbTick(cNowMs())
+    if gNtKbBuilt and gNtKbRows == 0 and kbReady() and kbCount() > 0:
+      gNtStep = "tick: rendering the keybind rows"
+      discard ntBuildKeybindRows()
+      gNtKbVerdictSaid = false
+    if gNtKbBuilt and gNtKbRows > 0:
+      ntKbVerdict()
   # STEP 3: the MODS panel's SHOW EDGE arms the index fetch, ONCE. Never at
   # boot -- `modSettingsRender` does that and it is the measured
   # character-select crasher. A session that never opens MODS pays nothing.
