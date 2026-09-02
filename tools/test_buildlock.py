@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-r"""test_buildlock.py -- the build lock is FIFO, and the test can fail.
+r"""test_buildlock.py -- the build lock is FIFO and answerable, and the tests
+can fail.
 
     python tools/test_buildlock.py
 
@@ -25,6 +26,21 @@ easiest kind to write so that they cannot fail. Two guards against that here:
 
 Everything runs against a throwaway lock directory. It never touches the real
 checkout's `.aowl-build.lock`, and it never runs a build.
+
+## The second thing being checked: --status --json and --wait-free
+
+An agent's wait loop matched the substring `"build lock is FREE"` against the
+human output. That string has never been printed by this file, so the loop
+could not fire, and "not free yet" and "I am asking the wrong question" look
+identical from the outside.
+
+The tests for the machine-readable answers therefore never assert a single
+state in isolation -- a status tool that hardcoded `free` would pass that. They
+run the SAME command against three constructed worlds (nobody holding, a LIVE
+process holding, a DEAD pid's lock file left behind) and require three
+different `state` values AND three different exit codes. And `--wait-free` is
+tested both ways round: it must return 0 when the holder dies, and it must
+still be blocking (exit 1, after the full timeout) when the holder does not.
 """
 
 from __future__ import annotations
@@ -145,6 +161,199 @@ def run_scenario(mode, tmp):
     return rows
 
 
+BL = os.path.join(HERE, "buildlock.py")
+
+
+def cli(repo, *args):
+    """Run the real CLI the way an agent would. Returns (rc, stdout)."""
+    r = subprocess.run([sys.executable, BL, "--repo", repo] + list(args),
+                       capture_output=True, text=True, timeout=180)
+    return r.returncode, r.stdout
+
+
+def plant_stale(path):
+    """A lock file whose holder is GONE -- a crashed build, not a running one.
+
+    The pid must be a real, now-exited Windows pid for `pid_alive`'s tasklist
+    probe to answer honestly (see plant_holder). A made-up number like 999999
+    would also read as dead, but for the wrong reason.
+    """
+    p = subprocess.Popen([sys.executable, "-c", "pass"])
+    p.wait()
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"pid": p.pid, "cmd": "crashed build",
+                   "started": time.time() - 30,
+                   "started_h": time.strftime("%Y-%m-%d %H:%M:%S")}, f)
+    return p.pid
+
+
+def test_status(tmp):
+    """One command, three constructed worlds, three distinguishable answers."""
+    print("\n--status --json: free / held / stale")
+    worlds = {}
+    procs = []
+
+    free_repo = os.path.join(tmp, "st-free")
+    os.makedirs(free_repo, exist_ok=True)
+    worlds["free"] = cli(free_repo, "--status", "--json")
+    free_human = cli(free_repo, "--status")
+
+    held_repo = os.path.join(tmp, "st-held")
+    os.makedirs(held_repo, exist_ok=True)
+    holder = plant_holder(buildlock.lock_path(held_repo))
+    procs.append(holder)
+    worlds["held"] = cli(held_repo, "--status", "--json")
+    held_human = cli(held_repo, "--status")
+
+    stale_repo = os.path.join(tmp, "st-stale")
+    os.makedirs(stale_repo, exist_ok=True)
+    dead_pid = plant_stale(buildlock.lock_path(stale_repo))
+    worlds["stale"] = cli(stale_repo, "--status", "--json")
+
+    for p in procs:
+        p.kill()
+        p.wait()
+
+    docs = {}
+    for name, (rc, out) in worlds.items():
+        try:
+            docs[name] = json.loads(out)
+        except Exception as ex:
+            check("%s world: --json printed ONE parseable json object" % name,
+                  False, "%s -- got %r" % (ex, out[:200]))
+            docs[name] = {}
+        else:
+            check("%s world: --json printed ONE parseable json object" % name,
+                  True)
+
+    states = [docs.get(n, {}).get("state") for n in ("free", "held", "stale")]
+    codes = [worlds[n][0] for n in ("free", "held", "stale")]
+    print("    states %s   exit codes %s" % (states, codes))
+
+    # THE control: a status tool that always said the same thing would satisfy
+    # any single-world assertion. Three worlds must give three answers.
+    check("the three worlds produce three DIFFERENT states",
+          len(set(states)) == 3 and None not in states, str(states))
+    check("the three worlds produce three DIFFERENT exit codes",
+          len(set(codes)) == 3, str(codes))
+    check("state names are free/held/stale in that order",
+          states == ["free", "held", "stale"], str(states))
+    check("exit codes are 0 free / 1 held / 2 stale",
+          codes == [0, 1, 2], str(codes))
+
+    check("held: pid is the LIVE holder's and running is true",
+          docs.get("held", {}).get("pid") == holder.pid
+          and docs["held"].get("running") is True,
+          "%r vs planted pid %d" % (docs.get("held"), holder.pid))
+    check("held: target is the string the holder recorded",
+          docs.get("held", {}).get("target") == "planted holder",
+          repr(docs.get("held", {}).get("target")))
+    check("stale: pid is the DEAD holder's and running is false",
+          docs.get("stale", {}).get("pid") == dead_pid
+          and docs["stale"].get("running") is False,
+          "%r vs dead pid %d" % (docs.get("stale"), dead_pid))
+    check("every world reports a queue list",
+          all(isinstance(docs.get(n, {}).get("queue"), list) for n in worlds),
+          str({n: docs.get(n, {}).get("queue") for n in worlds}))
+
+    # The human text is a separate contract and must not have drifted.
+    check("human --status still prints 'build lock FREE ('",
+          free_human[1].startswith("build lock FREE ("),
+          repr(free_human[1][:80]))
+    check("human --status still prints 'build lock HELD by pid'",
+          held_human[1].startswith("build lock HELD by pid"),
+          repr(held_human[1][:80]))
+    # The exact string the broken wait loop matched. It is not printed, was
+    # never printed, and must not be added to paper over that bug -- the fix
+    # is --json, not English that happens to match one agent's guess.
+    check("the substring an agent wrongly matched is still absent",
+          "build lock is FREE" not in free_human[1], repr(free_human[1][:80]))
+
+
+def test_wait_free(tmp):
+    """--wait-free must return when the lock frees AND block when it does not.
+
+    Only one of those halves is the feature; both together are the test. A
+    `--wait-free` that returned 0 immediately would pass the first check on its
+    own, which is why the negative control below requires a TIMEOUT with a real
+    elapsed time under a holder that never lets go.
+    """
+    print("\n--wait-free: returns when free, blocks when not")
+
+    idle = os.path.join(tmp, "wf-idle")
+    os.makedirs(idle, exist_ok=True)
+    t0 = time.time()
+    rc, out = cli(idle, "--wait-free", "30", "--json")
+    quick = time.time() - t0
+    check("no lock at all: exits 0 promptly (%.1fs)" % quick,
+          rc == 0 and quick < 5.0, "rc=%d out=%r" % (rc, out[:120]))
+    try:
+        check("no lock at all: --json says state=free",
+              json.loads(out).get("state") == "free", repr(out[:120]))
+    except Exception as ex:
+        check("no lock at all: --json says state=free", False, str(ex))
+
+    released = os.path.join(tmp, "wf-released")
+    os.makedirs(released, exist_ok=True)
+    lp = buildlock.lock_path(released)
+    holder = plant_holder(lp)
+    t0 = time.time()
+    proc = subprocess.Popen(
+        [sys.executable, BL, "--repo", released, "--wait-free", "60", "--json"],
+        stdout=subprocess.PIPE, text=True)
+    time.sleep(3.0)
+    still_running = proc.poll() is None
+    holder.kill()
+    holder.wait()
+    try:
+        os.unlink(lp)
+    except OSError:
+        pass
+    out, _ = proc.communicate(timeout=60)
+    waited = time.time() - t0
+    check("held then released: it was STILL BLOCKED 3s in",
+          still_running, "it returned before the holder was killed")
+    check("held then released: exits 0 after the release (%.1fs)" % waited,
+          proc.returncode == 0, "rc=%s out=%r" % (proc.returncode, out[:120]))
+    # --json means stdout is a data channel: a progress line in front of the
+    # object makes it unparseable, which is the very bug this feature replaces.
+    check("held then released: --json printed ONE line, no progress prose",
+          len([x for x in out.splitlines() if x.strip()]) == 1, repr(out[:200]))
+    try:
+        check("held then released: --json says state=free",
+              json.loads(out).get("state") == "free", repr(out[:160]))
+    except Exception as ex:
+        check("held then released: --json says state=free", False, str(ex))
+
+    # NEGATIVE CONTROL: the holder never goes away.
+    stuck = os.path.join(tmp, "wf-stuck")
+    os.makedirs(stuck, exist_ok=True)
+    holder2 = plant_holder(buildlock.lock_path(stuck))
+    t0 = time.time()
+    rc, out = cli(stuck, "--wait-free", "4", "--json")
+    waited = time.time() - t0
+    holder2.kill()
+    holder2.wait()
+    check("holder never releases: exits 1 (timeout), not 0",
+          rc == 1, "rc=%d -- it claimed the lock was free while a live "
+                   "process held it" % rc)
+    check("holder never releases: it actually waited the 4s (%.1fs)" % waited,
+          waited >= 3.5, "returned after %.1fs -- it is not blocking" % waited)
+    try:
+        d = json.loads(out)
+        check("timeout --json says state=timeout and names the holder",
+              d.get("state") == "timeout"
+              and d.get("status", {}).get("pid") == holder2.pid, repr(out[:160]))
+    except Exception as ex:
+        check("timeout --json says state=timeout and names the holder",
+              False, str(ex))
+
+    # And --wait-free must never be mistaken for "wait, then build".
+    rc, out = cli(idle, "--wait-free", "5", "build", "host")
+    check("--wait-free with a build command REFUSES rather than building",
+          rc == 2 and "runs NOTHING" in out, "rc=%d out=%r" % (rc, out[:160]))
+
+
 def main():
     print("buildlock: FIFO fairness")
     tmp = tempfile.mkdtemp(prefix="buildlock-test-")
@@ -182,6 +391,9 @@ def main():
               "the fair-mode pass above is therefore not evidence. The old "
               "code raced on a 2s sleep; if the scenario cannot produce an "
               "inversion, lengthen the gap between A and B." % rounds)
+
+        test_status(tmp)
+        test_wait_free(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

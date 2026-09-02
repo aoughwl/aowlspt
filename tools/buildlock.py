@@ -5,6 +5,8 @@ r"""buildlock.py -- ONE build at a time per checkout. A mechanism, not a rule.
     python tools/buildlock.py build examples
     python tools/buildlock.py --wait 900 build mods
     python tools/buildlock.py --status
+    python tools/buildlock.py --status --json  # machine-readable; see below
+    python tools/buildlock.py --wait-free 600  # block until nobody is building
     python tools/buildlock.py --steal          # only when the holder is dead
 
 Anything after the options is passed to `aowl` verbatim, so this is a drop-in
@@ -56,6 +58,39 @@ treats a lock as stale only when the process is absent OR the lock is older
 than --max-age (default 2h, comfortably longer than the 18m cold build measured
 in this repo). Anything else requires an explicit `--steal`, which prints who
 is being evicted rather than doing it quietly.
+
+## Asking the lock a question from a script
+
+`--status` prints prose for a human, and prose is not an interface. An agent
+wrote a wait loop that matched the substring `"build lock is FREE"` -- a string
+this file has never printed -- so the loop never fired and the agent waited for
+nothing. That is the failure mode CLAUDE.md 9b is about: a check that cannot
+succeed reads exactly like a check that has not succeeded YET.
+
+So there are now two contracts that do not depend on reading English:
+
+* `--status --json` prints ONE json object: `state` (`free`/`held`/`stale`),
+  `pid`, `running`, `target`, `since`, `since_epoch`, `age_s`, `queue`, `lock`.
+* `--status` EXIT CODE: **0 free, 1 held by a live process, 2 held by a dead
+  one (stale)**. Note that 1 and 2 used to both be 1; a script that only tested
+  `rc == 0` is unaffected.
+
+The human text is deliberately unchanged, because things already read it.
+
+`--wait-free [SECONDS]` blocks until the lock is free (or stale, which the next
+acquirer will break) and exits 0, or exits 1 on timeout. It is a HINT, not a
+reservation: nothing stops someone taking the lock in the microsecond after it
+returns. The only thing that serialises a build is running the build THROUGH
+this script.
+
+## The env var
+
+The child build runs with `AOWL_BUILDLOCK=<pid of this script>`. `aowl` refuses
+to build when it is absent, so `aowl.exe build host` typed by hand -- which
+corrupted this checkout's nimcache twice on 2026-09-01 while `--status` read
+FREE, because an unlocked build is invisible to the lock by construction -- now
+stops instead of colliding. `aowl build --no-lock` is the deliberate escape,
+for bootstrap and CI.
 """
 
 from __future__ import annotations
@@ -226,6 +261,82 @@ def read_lock(path):
         return None
 
 
+STATUS_EXIT = {"free": 0, "held": 1, "stale": 2}
+
+
+def status(path, max_age):
+    """One dict describing the lock. The single source for text AND --json.
+
+    Three states, never two: `free`, `held` (a live process is building) and
+    `stale` (a lock file whose holder is gone, which the next acquirer will
+    break). Collapsing `stale` into `held` is how a waiter ends up waiting for
+    a process that died -- and collapsing it into `free` would hide a crashed
+    build entirely.
+    """
+    q = read_queue(queue_dir(path), max_age)
+    qout = [{"pid": t.get("pid"), "target": t.get("cmd"),
+             "since": t.get("arrival_h"), "arrival": t.get("arrival")}
+            for t in q]
+    held = read_lock(path)
+    if not held:
+        return {"state": "free", "pid": None, "running": None, "target": None,
+                "since": None, "since_epoch": None, "age_s": None,
+                "queue": qout, "lock": path}
+    pid = int(held.get("pid", -1))
+    running = pid_alive(pid)
+    started = float(held.get("started", 0))
+    return {"state": "held" if running else "stale",
+            "pid": pid, "running": running, "target": held.get("cmd"),
+            "since": held.get("started_h"), "since_epoch": started,
+            "age_s": time.time() - started, "queue": qout, "lock": path}
+
+
+def print_status_human(st):
+    """The text a person reads. UNCHANGED on purpose -- scripts should use
+    --json or the exit code, but existing eyes and greps should not break."""
+    if st["state"] == "free":
+        print("build lock FREE (%s)" % st["lock"])
+        for i, t in enumerate(st["queue"]):
+            print("  queued %d: pid %s %r since %s"
+                  % (i + 1, t["pid"], t["target"], t["since"]))
+        return
+    print("build lock HELD by pid %d (%s) %r since %s -- %.0fs ago"
+          % (st["pid"], "running" if st["running"] else "NOT RUNNING (stale)",
+             st["target"], st["since"], st["age_s"]))
+    for i, t in enumerate(st["queue"]):
+        print("  queued %d: pid %s %r since %s%s"
+              % (i + 1, t["pid"], t["target"], t["since"],
+                 "   <- next" if i == 0 else ""))
+
+
+def wait_free(path, max_age, timeout, poll=1.0, announce=True):
+    """Block until nobody is building. Returns the final status, or None on
+    timeout.
+
+    `stale` counts as free: the next acquirer breaks a stale lock itself, so
+    waiting for it to disappear would be waiting for a dead process to tidy up.
+    The reason is printed rather than assumed.
+
+    This does NOT reserve anything (see the module docstring). It exists so a
+    wait loop can be written without parsing prose.
+    """
+    deadline = time.time() + timeout
+    announced = False
+    while True:
+        st = status(path, max_age)
+        if st["state"] != "held":
+            return st
+        if announce and not announced:
+            announced = True
+            print("waiting for the build lock: pid %s has been running %r for "
+                  "%.0fs. Up to %.0fs."
+                  % (st["pid"], st["target"], st["age_s"], timeout),
+                  flush=True)
+        if time.time() >= deadline:
+            return None
+        time.sleep(min(poll, max(0.0, deadline - time.time()) + 0.01))
+
+
 def acquire(path, cmd, wait_s, max_age, steal):
     """Take the lock, or explain precisely why not. Returns True on success.
 
@@ -386,7 +497,15 @@ def main():
                    help="break the lock even if the holder looks alive. Only "
                         "when you KNOW the holder is dead.")
     p.add_argument("--status", action="store_true",
-                   help="say who holds the lock, and exit")
+                   help="say who holds the lock, and exit. Exit 0 free, "
+                        "1 held, 2 stale.")
+    p.add_argument("--json", action="store_true",
+                   help="with --status: print ONE json object instead of "
+                        "prose (state/pid/running/target/since/queue)")
+    p.add_argument("--wait-free", type=float, nargs="?", const=1800.0,
+                   default=None, dest="wait_free", metavar="SECONDS",
+                   help="block until the lock is free, then exit 0; exit 1 on "
+                        "timeout (default 1800s). Runs nothing.")
     p.add_argument("rest", nargs=argparse.REMAINDER,
                    help="the aowl arguments, e.g. `build host`")
     a = p.parse_args()
@@ -394,26 +513,45 @@ def main():
     path = lock_path(a.repo)
 
     if a.status:
-        q = read_queue(queue_dir(path), a.max_age)
-        held = read_lock(path)
-        if not held:
-            print("build lock FREE (%s)" % path)
-            for i, t in enumerate(q):
-                print("  queued %d: pid %s %r since %s"
-                      % (i + 1, t.get("pid"), t.get("cmd"), t.get("arrival_h")))
-            return 0
-        pid = int(held.get("pid", -1))
-        print("build lock HELD by pid %d (%s) %r since %s -- %.0fs ago"
-              % (pid, "running" if pid_alive(pid) else "NOT RUNNING (stale)",
-                 held.get("cmd"), held.get("started_h"),
-                 time.time() - float(held.get("started", 0))))
-        for i, t in enumerate(q):
-            print("  queued %d: pid %s %r since %s%s"
-                  % (i + 1, t.get("pid"), t.get("cmd"), t.get("arrival_h"),
-                     "   <- next" if i == 0 else ""))
-        return 1
+        st = status(path, a.max_age)
+        if a.json:
+            print(json.dumps(st))
+        else:
+            print_status_human(st)
+        return STATUS_EXIT[st["state"]]
 
     rest = [x for x in a.rest if x != "--"]
+
+    if a.wait_free is not None:
+        if rest:
+            print("--wait-free runs NOTHING. To wait and then build, use "
+                  "`--wait %.0f %s`." % (a.wait_free, " ".join(rest)))
+            return 2
+        # In --json mode stdout is a DATA channel: the "waiting for..." line
+        # would sit in front of the object and make it unparseable, which is
+        # the same class of bug as the prose-matching wait loop this exists to
+        # replace. It cost two test failures here before it cost anyone else.
+        st = wait_free(path, a.max_age, a.wait_free, announce=not a.json)
+        if st is None:
+            cur = status(path, a.max_age)
+            msg = ("still HELD by pid %s (%r) after %.0fs"
+                   % (cur["pid"], cur["target"], a.wait_free))
+            if a.json:
+                print(json.dumps({"state": "timeout", "waited_s": a.wait_free,
+                                  "status": cur}))
+            else:
+                print("TIMEOUT: %s. NOTHING WAS WAITED OUT." % msg)
+            return 1
+        if a.json:
+            print(json.dumps(st))
+        elif st["state"] == "stale":
+            print("build lock is free enough: the lock file is present but "
+                  "its holder (pid %s) is NOT RUNNING, so the next build "
+                  "breaks it as stale." % st["pid"])
+        else:
+            print("build lock FREE (%s)" % path)
+        return 0
+
     if not rest:
         print("nothing to run. Example: python tools/buildlock.py build host")
         return 2
@@ -427,7 +565,14 @@ def main():
         print("build lock ACQUIRED by pid %d for %r" % (os.getpid(),
                                                         " ".join(rest)),
               flush=True)
-        rc = subprocess.run(cmd, cwd=a.repo).returncode
+        # The proof-of-lock the child checks for. `aowl` refuses to build
+        # without it, which turns "please use the lock" from a rule into a
+        # mechanism -- the hand-typed `aowl.exe build host` that corrupted this
+        # checkout's nimcache was invisible to the lock precisely because not
+        # taking a lock leaves no trace anywhere.
+        env = dict(os.environ)
+        env["AOWL_BUILDLOCK"] = str(os.getpid())
+        rc = subprocess.run(cmd, cwd=a.repo, env=env).returncode
     finally:
         release(path)
     print("%r finished in %.0fs with exit %d (lock released)"

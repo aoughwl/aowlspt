@@ -135,7 +135,12 @@ Ok "stamped ($h)"
 
 # --- 5. prove it. A bootstrap that reported success and left the old-driver
 # state in place would be the exact defect class this is fixing.
-$probe = & $exe build __bootstrap_probe__ 2>&1 | Out-String
+# `--no-lock` because `build` now REFUSES outside tools\buildlock.py (it checks
+# for AOWL_BUILDLOCK). This probe compiles nothing -- it exists to make the new
+# exe answer -- so the serialisation the lock provides is irrelevant here, but
+# without the flag the refusal would arrive instead of 'unknown build target'
+# and bootstrap would Die claiming the driver is broken.
+$probe = & $exe build __bootstrap_probe__ --no-lock 2>&1 | Out-String
 if ($probe -match 'has changed since aowl\.exe was last built' -or
     $probe -match 'has NO build stamp beside it' -or
     $probe -match 'there is no installer.build.aowl\.exe') {
