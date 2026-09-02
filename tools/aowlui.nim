@@ -210,6 +210,16 @@ type
     lastErr*: string       ## why the last false was false
     faults*: int           ## component faults we have SEEN this run
     timeoutPinned*: bool   ## the caller named a timeout, so it WINS
+    tag*: string
+      ## WRITER ATTRIBUTION, carried into every sentinel this Ui writes -- the
+      ## same convention `plugins/aowlsptcode/mcp/channel.py` uses
+      ## (`aowl-batch-<tag><pid>-<ms>-<n>`). The sentinel is the ONE part of a
+      ## batch that reaches the host log, because the host echoes `> echo
+      ## aowl-batch-...` and SKIPS `#`-prefixed serial lines without logging
+      ## them. Measured 2026-09-02: nine batches ran unattributed in the first
+      ## 23s of a boot and had to be traced to their writer by the SHAPE of
+      ## their sentinel (`aowl-batch-<6 digits>` was this file) instead of by
+      ## anything the log said. Empty means `aowlui`.
 
 const
   # Pressable component types, MOST SPECIFIC FIRST. Never ButtonFeedback.
@@ -225,11 +235,19 @@ const
   # advance, so this starts optimistic and HALVES on a timeout.
   MaxCmds* = 120
 
-proc initUi*(live: string; timeoutMs = 45000; pinned = false): Ui =
+proc initUi*(live: string; timeoutMs = 45000; pinned = false;
+             tag = "aowlui"): Ui =
   var l = live
   if l.len == 0: l = "D:\\Aowlspt\\aowlspt"
+  var t = ""
+  # Sanitised to [a-z0-9], exactly as `channel.py`'s `writer_tag` does, so a
+  # tag can never break the sentinel's tokenisation.
+  for c in tag:
+    if (c >= 'a' and c <= 'z') or (c >= '0' and c <= '9'): t.add c
+    elif c >= 'A' and c <= 'Z': t.add chr(int(c) + 32)
+  if t.len == 0: t = "aowlui"
   result = Ui(live: l, timeoutMs: timeoutMs, verbose: false, serial: 0,
-              lastErr: "", faults: 0, timeoutPinned: pinned)
+              lastErr: "", faults: 0, timeoutPinned: pinned, tag: t)
 
 proc cmdPath(u: Ui): string = joinPath(u.live, "aowlspt-inspect.txt")
 proc outPath(u: Ui): string = joinPath(u.live, "aowlspt-inspect-out.txt")
@@ -466,7 +484,14 @@ proc runBatchOnce(u: var Ui; cmds: seq[string]; timeoutMs: int; wr: bool;
   for c in cmds: lines.add c
   inc u.serial
   let ser = int(nowMs() mod 1000000'i64) + u.serial
-  let sentinel = "aowl-batch-" & $ser
+  # ATTRIBUTED, and unique per call: `aowl-batch-<tag><pid>-<ms>-<n>`, the
+  # shape `channel.py` writes. The old form was `aowl-batch-<ser>` with `ser`
+  # derived from `nowMs() mod 1000000` -- unattributed AND wrapping every ~17
+  # minutes, so two long-lived writers could in principle collide on it.
+  var tg = u.tag
+  if tg.len == 0: tg = "aowlui"
+  let sentinel = "aowl-batch-" & tg & $processId() & "-" & $nowMs() & "-" &
+                 $u.serial
   # A byte write with LF endings and NO BOM. PowerShell's utf8 encoder emits
   # one; `writeTextFile` cannot regress that way. The serial is what re-arms
   # the poll, because the host triggers on a CONTENT change.
@@ -509,9 +534,48 @@ proc runBatchOnce(u: var Ui; cmds: seq[string]; timeoutMs: int; wr: bool;
       return true
     sleep(DWORD(150))
   lockRelease(lock, lockFile, lockFileB)
-  answer = "no answer for batch " & $ser & " within " & $(timeoutMs div 1000) &
-           "s. " & diagnose(u)
+  answer = "no answer for batch " & sentinel & " within " &
+           $(timeoutMs div 1000) & "s. " & diagnose(u)
   result = false
+
+proc releaseChannel*(u: var Ui): bool =
+  ## Blank this process's batch out of the command file when it is DONE.
+  ##
+  ## `runBatchOnce` leaves the last batch it wrote sitting in
+  ## `aowlspt-inspect.txt` forever. The host triggers on a CONTENT change, so
+  ## nothing re-runs it in THIS session -- but the file is what the next boot's
+  ## host reads first, and the launcher's 58-command `allow write` probe batch
+  ## is not something a fresh client should be answering before anyone has
+  ## asked it anything. It also makes the file useless as a record of who is
+  ## driving the channel right now.
+  ##
+  ## So: replace it with a comment-only body. `#`-prefixed lines are skipped by
+  ## the host's parser by design, so this queues NOTHING; it only changes the
+  ## content and names the writer that finished.
+  ##
+  ## Under the SAME lock as a batch, and a busy lock is a REFUSAL, not a
+  ## retry-until-clear: another writer holding the channel has its own batch in
+  ## that file and clobbering it is exactly the collision the lock exists to
+  ## prevent. Returns false, with `lastErr` set, in that case -- the caller
+  ## should say so rather than treat it as done.
+  var lockFile = ""
+  var lockFileB = ""
+  let lock = lockAcquire(u, lockFile, lockFileB)
+  if lock == lsBusy:
+    u.lastErr = "the command file was NOT blanked: another process holds the " &
+                "inspector channel lock (" & lockFile & "), and its batch is " &
+                "what is in the file. Nothing was overwritten."
+    return false
+  var tg = u.tag
+  if tg.len == 0: tg = "aowlui"
+  let body = "# " & tg & $processId() & " released the channel at " &
+             $nowMs() & " -- no commands queued\n"
+  let w = writeTextFile(cmdPath(u), body)
+  lockRelease(lock, lockFile, lockFileB)
+  if not w.ok:
+    u.lastErr = "could not blank " & cmdPath(u) & " (error " & $w.err & ")"
+    return false
+  result = true
 
 proc runBatch*(u: var Ui; cmds: seq[string]; wr: bool; timeoutMs: int;
                answer: var string): bool =
@@ -974,7 +1038,23 @@ type
     ## than the RegisterPlayer count -- so it is reported as data.
     rootPresent*: bool
 
-proc screens*(u: var Ui; rootName: string; s: var ScreenSet): bool =
+proc screens*(u: var Ui; rootName: string; s: var ScreenSet;
+              probeActive = true): bool =
+  ## `probeActive = false` is the READ-ONLY form: roots + children only, with
+  ## every `active` left `triUnknown`.
+  ##
+  ## Why it exists: `activeInHierarchy` is only obtainable through
+  ## `call name:get_activeInHierarchy`, and the host gates EVERY `call` behind
+  ## `allow write` (inspect.nim: "the whole point is that reads are read-only,
+  ## and `call` is therefore gated by the same `allow write`"). So the ordinary
+  ## form of this proc writes a batch that arms writes and then calls into game
+  ## code once per child -- 29 calls on this build's `Menu UI`. That is a fine
+  ## price to confirm a screen is up; it is NOT a fine price to pay every three
+  ## seconds for a minute while waiting for the screen to EXIST.
+  ##
+  ## `triUnknown` is returned rather than `triNo` deliberately: a caller that
+  ## reads "not active" off a probe that never asked is the confidently-wrong
+  ## answer this whole module is written against.
   s = ScreenSet(screens: @[], rootPresent: false)
   var rs: seq[Node] = @[]
   if not roots(u, rs): return false
@@ -995,7 +1075,10 @@ proc screens*(u: var Ui; rootName: string; s: var ScreenSet): bool =
   var gos: seq[string] = @[]
   for k in kids: gos.add k.go
   var st: seq[Tri] = @[]
-  if not actives(u, gos, st): return false
+  if probeActive:
+    if not actives(u, gos, st): return false
+  else:
+    for i in 0 ..< kids.len: st.add triUnknown
   for i in 0 ..< kids.len:
     s.screens.add Screen(name: kids[i].name, t: kids[i].t, go: kids[i].go,
                          active: st[i])

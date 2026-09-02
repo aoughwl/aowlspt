@@ -173,14 +173,20 @@ Options
   --pick         show the launcher's own profile picker before starting the
                  game. OFF by default: the launcher picks a profile without
                  asking -- the one you played last, else the most recent --
-                 binds it, and (see --no-auto-enter) presses the matching
-                 in-game character-select slot for you, so the TUI is the
-                 only place you are ever asked.
+                 and binds it, so the TUI is the only place you are ever
+                 asked. The in-game character-select is answered by the HOST
+                 (see --auto-enter).
+  --auto-enter   drive the in-game character-select screen from the launcher,
+                 over the live-inspector file channel. OFF by default: the
+                 host answers that screen natively every boot (modeskip.nim,
+                 flag uxSkipModeScreen in aowlspt-host.json), so this is
+                 redundant, and it is not free -- it writes an `allow write`
+                 probe batch that calls into game code and it owns the single
+                 inspector command file while it does. Use it to debug the
+                 selector, or on a build with uxSkipModeScreen off.
   --no-auto-enter
-                 do not auto-press the in-game character-select screen after
-                 a profile was bound. The client still shows it, exactly as
-                 before this feature; use this if the auto-press ever picks
-                 the wrong slot, or to debug the selector itself.
+                 accepted and ignored -- it now asks for the default. Kept so
+                 existing scripts and shortcuts keep working.
   --low-render   (alias: --headless) run the client CHEAP, not headless. It
                  appends Unity's own player switches to the game's command
                  line: -screen-width/-screen-height (default 1280x720),
@@ -270,11 +276,30 @@ type
       ## default -- the TUI is now the ONLY place a profile is chosen (see
       ## `--no-auto-enter`); the in-game character-select is auto-pressed
       ## rather than shown to a human.
+    autoEnter: bool
+      ## `--auto-enter`: drive the in-game character-select from HERE, through
+      ## the live-inspector file channel. OFF by default since 2026-09-02, and
+      ## the default flip is the point:
+      ##
+      ## The HOST already answers that screen natively every boot
+      ## (`modeskip.nim`, flag `uxSkipModeScreen`; the host log says `skip mode
+      ## screen: Submit called for profile ...` at ~26s). So this path was
+      ## redundant -- and not free. Measured on a normal boot it wrote eight
+      ## `roots` polls and then a 58-command batch carrying `allow write` and
+      ## 29 `call name:get_activeInHierarchy` into `aowlspt-inspect.txt` within
+      ## the first 22s, i.e. it called into game code unprompted, delayed any
+      ## other tool's batch on that single-writer channel, and left the whole
+      ## probe batch sitting in the command file for the next boot to find.
+      ##
+      ## Keep it for debugging the selector itself, or for a build where
+      ## `uxSkipModeScreen` is off.
     noAutoEnter: bool
-      ## `--no-auto-enter`: the escape hatch. Restores the old behaviour --
-      ## the client boots with a bound token but still stops at its own
-      ## character-select screen for a human to click through, exactly as
-      ## before this feature existed.
+      ## `--no-auto-enter`: ACCEPTED AND IGNORED, on purpose. It was the escape
+      ## hatch from the old default and it is now what happens anyway, so
+      ## anything that still passes it -- scripts, shortcuts, `harness.py`
+      ## invocations -- keeps working and gets exactly what it asked for. It is
+      ## recorded rather than dropped only so the verdict file can say the flag
+      ## was seen.
     port: int
       ## Only meaningful when `portGiven`. The port actually used is resolved
       ## in `main`, once `root` is known and `backend.json` can be read.
@@ -358,7 +383,10 @@ proc parseArgs(): Options =
       result.modBuildForce = true
     elif a == "--pick":
       result.pick = true
+    elif a == "--auto-enter":
+      result.autoEnter = true
     elif a == "--no-auto-enter":
+      # A no-op compatibility flag, NOT an error: it asks for the default.
       result.noAutoEnter = true
     elif a == "--low-render" or a == "--headless":
       result.lowRender = true
@@ -2523,6 +2551,21 @@ proc main(): int =
     line "  would pass    " &
          clientCommandLine(backendUrl, "<the chosen profile>", o.extraArgs)
     line "  would inject  " & hostDll
+    # THE AUTO-ENTER DECISION, from the same `o.autoEnter` the real run
+    # branches on, so the plan cannot describe a different launcher from the
+    # one that executes. It is here because the traffic it decides is not
+    # local to the launcher: it is writes into the ONE inspector command file
+    # that every other tool shares.
+    if o.autoEnter:
+      line "  would enter   character-select itself (--auto-enter): " &
+           "read-only roots/children polls on aowlspt-inspect.txt until the " &
+           "screen exists, then an `allow write` batch to confirm it is up " &
+           "and one to press it. The command file is blanked afterwards."
+    else:
+      line "  would enter   nothing, and would write NOTHING to " &
+           "aowlspt-inspect.txt -- the host answers character-select " &
+           "natively (uxSkipModeScreen, modeskip.nim). Pass --auto-enter to " &
+           "drive it from the launcher instead."
     line "  nothing was started."
     return 0
 
@@ -2952,7 +2995,8 @@ proc main(): int =
   # live run's single surviving line ambiguous.
   let entryLine = "auto-enter: entered, clientExited=" & $clientExited &
     " haveChoice=" & $haveChoice &
-    " noAutoEnter=" & $o.noAutoEnter & " profile=" & chosen.id
+    " autoEnter=" & $o.autoEnter & " noAutoEnter(no-op)=" & $o.noAutoEnter &
+    " profile=" & chosen.id
   discard writeTextFile(verdictPath, entryLine & "\n")
 
   if clientExited:
@@ -2960,7 +3004,27 @@ proc main(): int =
     discard writeTextFile(verdictPath,
       entryLine & "\nauto-enter verdict: SKIPPED -- client exited while " &
       "starting\n")
-  elif haveChoice and not o.noAutoEnter:
+  elif haveChoice and not o.autoEnter:
+    # THE DEFAULT since 2026-09-02, and it is a default flip, not a removal.
+    #
+    # Nothing is skipped here: the host answers the character/mode screen
+    # natively on every boot (`modeskip.nim`, gated by `uxSkipModeScreen` in
+    # `aowlspt-host.json`; the host log line is `skip mode screen: Submit
+    # called for profile ...`, measured at ~26s). Doing the same job a second
+    # time from out here cost a burst of inspector traffic -- eight `roots`
+    # polls and a 58-command `allow write` batch with 29 `call
+    # name:get_activeInHierarchy` in it, inside the first 22s -- on a channel
+    # that has exactly one command file and one writer at a time.
+    #
+    # Said in ONE line, on stdout and in the verdict file, because "the
+    # launcher did nothing" and "the launcher decided not to" look identical
+    # from outside otherwise.
+    let msg = "auto-enter verdict: OFF (default) -- the host answers " &
+      "character-select natively (uxSkipModeScreen, modeskip.nim); pass " &
+      "--auto-enter to drive it from the launcher instead"
+    note msg
+    discard writeTextFile(verdictPath, entryLine & "\n" & msg & "\n")
+  elif haveChoice and o.autoEnter:
     # The client's own character-select screen shows on every boot
     # regardless of `-token` -- that is measured, not assumed (see the
     # "Profile" heading above: `onProfilesV2` always renders a slot, and
@@ -3056,7 +3120,11 @@ proc main(): int =
     # screen". Raised to 20s per attempt (still pinned, still a real
     # ceiling), and the wall-clock wait bound raised to 270s to match (the
     # client legitimately takes 90s+ to reach the selector).
-    var u = initUi(joinPath(root, "aowlspt"), 20000, true)
+    # The tag goes into every sentinel this process writes
+    # (`aowl-batch-launch<pid>-<ms>-<n>`), which is the only part of a batch
+    # the host echoes into its log -- so a boot-time batch is now a grep, not
+    # an investigation.
+    var u = initUi(joinPath(root, "aowlspt"), 20000, true, "launch")
     var waitTries = 0
     var screenUp = false
     var waitErr = ""
@@ -3136,22 +3204,53 @@ proc main(): int =
       ew.selectorActive = false
       ew.otherScreenActive = false
       inc ew.polls
-      if screens(u, "Menu UI", ss):
-        inc ew.answered
+      # TWO STAGES, split by what each is ALLOWED to do to the client.
+      #
+      # Stage 1 is READ-ONLY -- `roots` + `children`, no `allow write`, no call
+      # into game code -- and it answers the question that is asked on almost
+      # every iteration: is the `Menu UI` root there, and is there a node
+      # called `CharacterSelectionScreen` under it. That is the whole of the
+      # cold-boot minute.
+      #
+      # Stage 2 asks whether that node is ACTIVE, and it cannot be read-only:
+      # `activeInHierarchy` is only reachable through `call
+      # name:get_activeInHierarchy`, and the host gates every `call` behind
+      # `allow write` (inspect.nim: reads are read-only "and `call` is
+      # therefore gated by the same `allow write`"). So the write batch is not
+      # gone -- it is no longer issued on polls where there is nothing to
+      # confirm, which is what made this loop arm writes 29 calls at a time
+      # while the client was still loading.
+      var polled = false
+      var selectorSeen = false
+      if screens(u, "Menu UI", ss, false):
+        polled = true
         ew.menuRootPresent = ss.rootPresent
         if ss.rootPresent: ew.sawMenuRoot = true
         for sc in ss.screens:
           if sc.name == "CharacterSelectionScreen":
-            active = sc.active
             ew.sawSelector = true
-            if sc.active == triYes: ew.selectorActive = true
-          elif sc.active == triYes:
-            ew.otherScreenActive = true
+            selectorSeen = true
       else:
         # A poll that got no answer says nothing either way, so it must not
         # move `menuRootPresent`: reading a dropped batch as "the root is gone"
         # would call a raid on a channel hiccup.
         waitErr = u.lastErr
+      if polled and selectorSeen:
+        var sa = default(ScreenSet)
+        if screens(u, "Menu UI", sa, true):
+          for sc in sa.screens:
+            if sc.name == "CharacterSelectionScreen":
+              active = sc.active
+              if sc.active == triYes: ew.selectorActive = true
+            elif sc.active == triYes:
+              ew.otherScreenActive = true
+        else:
+          # Stage 2 dropped: `active` stays `triUnknown` and both actives stay
+          # false, so this poll is inconclusive rather than a negative. It must
+          # not read as "the selector is closed and something else is up",
+          # which is one of the two EwPassed signals.
+          waitErr = u.lastErr
+      if polled: inc ew.answered
       ew.clientAlive = cLaunchAlive(launch) != 0'i32
       ew.elapsedMs = cNowMs() - waitStart
       verdict = enterWaitVerdict(ew, verdictWhy)
@@ -3202,7 +3301,7 @@ proc main(): int =
       warn msg
       discard writeTextFile(verdictPath, entryLine & "\n" & msg & "\n")
       note "left at whatever screen is actually up; check liveInspector is " &
-           "on in aowlspt-host.json, or pass --no-auto-enter to silence this"
+           "on in aowlspt-host.json, or drop --auto-enter to silence this"
     else:
       ok "character-select is up (waited " & secsText(ew.elapsedMs) &
          ") -- matching now"
@@ -3233,8 +3332,19 @@ proc main(): int =
           "-- " & lastMsg
         warn msg
         discard writeTextFile(verdictPath, entryLine & "\n" & msg & "\n")
-        note "left at the manual selector; pass --no-auto-enter to silence " &
+        note "left at the manual selector; drop --auto-enter to silence " &
              "this warning next time"
+
+    # DO NOT LEAVE THE BATCH IN THE FILE. On every exit from this block --
+    # passed, pressed, timed out, no channel -- because the file is what the
+    # NEXT boot's host reads first, and until this existed that was this
+    # loop's last probe batch, `allow write` and 29 calls into game code
+    # included, queued at a client nobody had asked anything.
+    #
+    # A busy lock is reported, not retried: another writer's batch is in that
+    # file and clobbering it is the collision the lock exists to prevent.
+    if not releaseChannel(u):
+      note "the inspector command file was left as it was -- " & u.lastErr
 
   if o.clientWindow:
     # The second window, for anyone who wants it. It is another copy of this
