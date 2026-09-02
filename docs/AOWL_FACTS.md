@@ -5983,3 +5983,19 @@ enumerate every loaded scene plus DDOL (reported to the inspector agent).
 inside `EFT.GameWorld::OnGameStarted` -- the START of the deploy countdown.
 The ESP's first draw shares that timestamp, which is why it is visible before
 the player is released; "standing in the raid" is a later signal.
+
+## In a raid, rootless `find` ALSO excludes DontDestroyOnLoad (measured)
+
+From inside a live Woods raid: `find MenuScreen 80000` + `find more 80000` x2
+with no root ended `searched EXHAUSTIVELY. That name is genuinely NOT PRESENT
+under this root`. So in-raid, both `roots` and rootless `find` cover ONLY the
+location scene; Common UI / Menu UI / Preloader UI are unreachable through the
+inspector's walkers. Every `exitraid.py` failure tonight reduces to this.
+
+The host can reach DDOL in-raid (`splAnchorSceneRoots`, via the preloader
+anchor -- it is how the mod loading step found `LoadingSpinner/Text`), so the
+raid EXIT belongs host-side, like the host-native raid ENTRY (`autoraid.nim`):
+an inspector `raidexit` verb that triggers a guarded host sequence
+(MenuScreen::ShowInRaid @0x1539650 -> DisconnectButton -> LeaveButton -> Session
+End NEXT), with the verdict read off the live tree. The inspector walkers must
+also learn to search the union of all loaded scenes + DDOL.
