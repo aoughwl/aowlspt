@@ -7999,3 +7999,16 @@ nothing.
 Tool defect: `find X in Menu UI` takes ONE token as the root and resolved
 "Menu" to "Context Menu Area" by substring, then reported "genuinely NOT
 PRESENT"; `in "Menu UI"` finds no root at all.
+
+## 2026-09-02 12:00 (clock): the ACTIVE slot card and its Apply button, live
+
+MEASURED on the parked screen: two CharacterSelectionScreens -- `Login UI/
+CharacterSelectionScreen` (inactive) and `UI/CharacterSelectionScreen`
+0x155ebc11fe0 (active). The active `CharacterSlotView_pvp` 0x155f8c55940
+-> InfoPart -> ButtonContainer -> `Apply` 0x155ebc11460 is activeInHierarchy
+TRUE with components RectTransform, EFT.UI.DefaultUIButton 0x1566081a7e0,
+DefaultUIButtonAnimation, TweenAnimatedButton, HorizontalLayoutGroup,
+ContentSizeFitter, LayoutElement, UnityEngine.CanvasGroup, HoverTooltipArea.
+The card body has CharacterSelectionSlotViewBase + ButtonFeedback (sound
+only) and no DefaultUIButton: "click the card" is a pointer handler or a
+screen-side selection call, not a UnityEvent. Header/InfoButton is inactive.
