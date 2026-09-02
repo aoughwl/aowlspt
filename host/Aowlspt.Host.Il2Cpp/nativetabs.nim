@@ -336,19 +336,46 @@ proc ntBuildOne(screenT, donorSpawnerT, donorPanelT: Il2CppPtr;
     discard modsSetActive(panelGo, false)
     discard modsSetActive(spawnerGo, false)
     return
-  # BOTH MITIGATIONS, IN THIS ORDER (coordinator's decision, doc 2.2):
-  #   (a) disable the component BEFORE its first show, so its Awake/Show cannot
-  #       re-create the stock rows;
-  #   (b) CleanupCreatedControls once, to destroy the rows it was cloned WITH.
-  # (a) first: cleaning first and then letting Show run would simply refill it.
-  ntCrumb("panel: Behaviour::set_enabled(false) on the cloned GameSettingsTab")
-  let disabled = nuBehaviourEnable(tabComp, false)
+  # MITIGATION (a) IS NOW OFF, ON LIVE EVIDENCE. This is the fallback the doc
+  # named as the risk, and the measurement picked it.
+  #
+  # WHAT WAS MEASURED: with (a) on, the durable crumb ended at exactly
+  # "panel: Behaviour::set_enabled(false) on the cloned GameSettingsTab" on
+  # all 8 attempts, the `panel clone` line never printed, and there was NO
+  # fault line -- so the guard caught nothing and the two calls between that
+  # crumb and the next simply never both returned. Disabling a live
+  # `GameSettingsTab` before its first show is the one thing there that is
+  # not a plain read.
+  #
+  # WHY (b) IS KEPT: the clone still carries the donor's rows and they must
+  # go, or our tab shows Game Settings under our name. `CleanupCreatedControls`
+  # destroys exactly what the tab itself created, which is exactly them.
+  #
+  # THE COST OF DROPPING (a), STATED: the component stays enabled, so its own
+  # Show may re-create the stock rows after we clean them. If that happens the
+  # panel will show the donor's settings and the acceptance check will say so
+  # -- that is a visible, checkable failure, unlike the current stall.
+  const NtDisableTabComponent = false
+  var disabled = false
+  if NtDisableTabComponent:
+    ntCrumb("panel: (a) ENTERING Behaviour::set_enabled(false) on the clone")
+    disabled = nuBehaviourEnable(tabComp, false)
+    ntCrumb("panel: (a) RETURNED from Behaviour::set_enabled(false)")
+  else:
+    ntCrumb("panel: (a) SKIPPED -- the cloned GameSettingsTab is left ENABLED")
+  # CRUMBS EITHER SIDE OF THE CALL, so 'died inside it' and 'died in the step
+  # after it' are different sentences. With one crumb they were the same one,
+  # and that ambiguity is what made the last pass need another round trip.
+  ntCrumb("panel: (b) ENTERING CleanupCreatedControls on the clone")
   let cleaned = nuTabCleanupControls(tabComp)
-  okLog "native tabs: '" & header & "' panel clone -- GameSettingsTab " &
-        "component disabled=" & $disabled & ", CleanupCreatedControls " &
-        "called=" & $cleaned & ". (a) before (b) on purpose: cleaning a live " &
-        "component and then letting its Show run would refill the panel with " &
-        "the donor's rows."
+  ntCrumb("panel: (b) RETURNED from CleanupCreatedControls")
+  okLog "native tabs: '" & header & "' panel clone -- variant=" &
+        (if NtDisableTabComponent: "(a)+(b) disable-then-clean"
+         else: "(b) ONLY, clean without disabling") &
+        ", GameSettingsTab component disabled=" & $disabled &
+        ", CleanupCreatedControls called=" & $cleaned & ". (a) is off " &
+        "because with it on the build stalled inside set_enabled on every " &
+        "attempt, with no fault raised."
   ntCrumb("panel: reading _settingsRoot@0x98 off the cloned tab component")
   let rowRoot = (if nuOk(tabComp, NuOffGameTabSettingsRoot + 8'i32):
                    cNuGetRef(tabComp, NuOffGameTabSettingsRoot) else: nil)
@@ -358,6 +385,7 @@ proc ntBuildOne(screenT, donorSpawnerT, donorPanelT: Il2CppPtr;
     discard modsSetActive(panelGo, false)
     discard modsSetActive(spawnerGo, false)
     return
+  ntCrumb("panel: hiding our clone, then registering the tab")
   discard modsSetActive(panelGo, false)   # ours starts hidden; the game owns the screen
 
   if gNtToggle.len < NtMaxTabs:
@@ -367,6 +395,7 @@ proc ntBuildOne(screenT, donorSpawnerT, donorPanelT: Il2CppPtr;
     gNtRowRoot.add rowRoot
     gNtId.add id
     gNtSpawnerGo.add spawnerGo
+  ntCrumb("buildOne: COMPLETE -- tab registered")
   okLog "native tabs: built the '" & header & "' tab" &
         " -- a real UIAnimatedToggleSpawner in the STOCK ToggleGroup and a " &
         "real cloned SettingsTab panel, emptied of its stock rows. Nothing " &
