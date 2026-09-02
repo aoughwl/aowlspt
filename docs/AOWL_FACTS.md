@@ -7538,3 +7538,18 @@ MEASURED (Woods, night, DEPLOYED via `raid Woods`):
   now on for the next raid).
 * ammoloading: ARMED but NEVER FIRED (probe mode; no magazine was loaded).
 * SAIN: drive level 0 (observer) this raid -- nothing bound by config.
+
+## 2026-09-02 08:25: exit half -- first attempt refused; a false CRASH verdict
+
+MEASURED: `raidexit` while DEPLOYED in Woods: `raidExit: ARMED ON DEMAND --
+SHOW-IN-RAID -> DISCONNECT -> LEAVE -> RESULTS -> VERIFY`, then `step
+SHOW-IN-RAID found nothing within 20s -- stopping`. In-raid the host's
+searches see only the location scene (the DDOL blind spot); the entry half
+solved the same problem with show-event sites and receivers, and the exit
+is being moved onto the same pattern.
+MEASURED: run.py reported `CRASH unhandled-exception -- NullReferenceException`
+after 0.5s with the client alive: the match was the client's errors log
+`NullReferenceException ... at MalfunctionLayer.ShallUseNow () ... at
+EFT.BotsController.UpdateByUnity ()`, Tarkov's own bot-AI exception, logged
+and caught by the game in every raid. A CRASH verdict must require the
+process gone or a Crash_* report; being fixed.
