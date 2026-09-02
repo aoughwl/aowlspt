@@ -7591,3 +7591,20 @@ which is kept only as an announced fallback. A step that has sat silent for 5 s
 now EXPLAINS itself, and the disconnect-button wait prints a census of what IS
 active under the receiver -- the last refusal was unactionable precisely because
 it said nothing for 20 s and then only said "nothing".
+
+## 2026-09-02 09:05: MODS tab built; native subtabs regressed; a liveness crash at raid load
+
+MEASURED (build 4,784,128, nativeTabsMods on): `built the 'PROOF' tab`, then
+`'MODS' panel clone emptied ... 40 of 40 donor row(s) destroyed` and `built
+the 'MODS' tab` -- step 3's tab exists (its subtabs/rows are unverified).
+REGRESSION: no `native subtabs VERDICT` line this boot and acceptance found
+no PostFX strip, while the old `mods tab: caption 'GRAPHICS SETTINGS'/'POSTFX'`
+lines still print -- the deletion of the old path (73adced) left the new
+subtab build unreached under this config.
+CRASH: after that Settings session the raid entry ran to READY and the
+client died during the raid LOAD (Crash_2026-09-02_125506824): crash-site
+frames all GameAssembly .text, top `il2cpp_unity_liveness_calculation_from_
+root` -- the managed liveness walk hit a bad object at the scene transition.
+First boot with two emptied panel clones (80 donor rows Object::Destroy'ed)
+and the first crash of this shape; the previous raid (PROOF only) loaded.
+Bisect running: same build, nativeTabsMods off.
