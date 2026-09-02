@@ -260,6 +260,57 @@ const
   SplWarnUp       = 4          ## how far to climb from the warning TMP to its panel container.
   SplMaxFaults    = 3
 
+# ---------------------------------------------------------------------------
+# THE SHOW-EVENT WINDOW -- what replaced the forever-cadence
+# ---------------------------------------------------------------------------
+# Everything above this line describes a feature that HUNTED for its screen on a
+# cadence, forever. The user's report, verbatim, 2026-09-01:
+#
+#   "that singleplayer rebrand + version rebrand + other stuff should NOT
+#    constantly poll for some ui element to disable/hide it- that is very not
+#    performant!!!!!"
+#
+# They are right, and the host log agreed with them: the ~10 Hz hunt was cut off
+# by its own 18 ms wall-clock slice after 64 nodes on EVERY pass, all session,
+# resolving nothing. That is pure loss -- main-thread interop spent to produce a
+# refusal.
+#
+# The trigger is now `uihooks.nim`: a POSTFIX detour on
+# `MatchmakerOfflineRaidScreen::Show` @0x1788590 (UNIQUE, 16-byte prologue
+# verified) hands us the LIVE SCREEN OBJECT the moment the game shows it. From
+# that object the targets are reachable by a BOUNDED walk OF ONE SCREEN --
+# `splScanNode`, which is what the wide walk fed anyway -- so the scene-root
+# enumeration (`iSceneRoots`), the "Menu UI" descent and the rejected-screen
+# ledger are all unnecessary and are no longer entered.
+#
+# WHY A WINDOW AND NOT A SINGLE SHOT. Two measured reasons, both of which a
+# one-shot would get wrong:
+#   * at `Show` POSTFIX time the screen's children exist but the caption may not
+#     be populated yet, so a single scan can legitimately miss;
+#   * `LocalizedText` CLOBBERS a caption after we set it (CLAUDE.md sec.5), so
+#     the relabel has to be re-asserted, not merely issued.
+# So each show event opens a bounded window of frames during which the existing
+# per-frame re-assert runs -- from CACHED pointers, no walking -- and the window
+# then CLOSES. Outside a window this feature does nothing at all: the drain
+# rider returns on an integer compare. The window re-opens on the next show
+# event, which is the design, not a leak.
+const
+  SplShowWindowFrames = 1800
+    ## Hard cap on the frames one show event may keep this feature working
+    ## (~30 s at 60 fps). A cap, not the expected cost -- the window normally
+    ## closes far earlier, on SplSettleFrames below.
+  SplSettleFrames = 90
+    ## Once the FINISHED-STATE readback has passed for this many CONSECUTIVE
+    ## frames, close the window early. This is a settle test on the state we
+    ## assert, not on our own writes: it counts frames on which the live TMP
+    ## already read ours and the checkbox already read inactive, i.e. frames on
+    ## which we did nothing. A stretch of those is the only honest evidence that
+    ## `LocalizedText` has stopped fighting us.
+  SplRescanEveryFrames = 6
+    ## While the window is open and the targets are NOT yet resolved, re-scan
+    ## the (known!) screen at most this often. ~100 ms. This is a bounded walk
+    ## of ONE screen we were HANDED -- never a scene-root enumeration.
+
 # ---- the guarded-body thunk (ONE aowl_p_p_seh, never nested) ----
 {.emit: """
 extern void* aowl_spl_tick_body(void* a);
@@ -433,6 +484,28 @@ var gSplWarnRefused = false        ## screen resolved but NO co-op/progress warn
 var gSplConfirmed = false          ## finished-state assertion has passed+logged
 var gSplSummaryLogged = false
 
+# ---- SHOW-EVENT state (see the SplShowWindowFrames banner above) ----
+var gSplEventDriven = false        ## the uihooks show hook is BOUND. When true
+                                   ## the cadence hunt is never entered, and the
+                                   ## boot summary says so.
+var gSplWindow = 0                 ## frames of window left; 0 == fully idle
+var gSplSettled = 0                ## consecutive frames the readback has held
+var gSplOpens = 0                  ## show events we opened a window for
+var gSplWindowFramesUsed = 0       ## frames of window actually spent, cumulative
+
+# ---- THE PER-FRAME COST READBACK (CLAUDE.md 9b) ----------------------------
+# `gSplNodes` is incremented at the ONE place each walker charges its budget, so
+# it counts every live Unity node this feature touched, by construction -- it
+# cannot drift from the walkers the way a hand-maintained tally would.
+# `splCostLine` divides it by the frames the rider actually saw. BEFORE this
+# change that ratio was ~64 nodes per 18 ms slice at ~10 Hz and never fell to
+# zero; AFTER, it must fall to zero once every window has closed, and the second
+# number below (nodes since the last window closed) is the one that proves it.
+var gSplNodes = 0                  ## cumulative live-tree nodes visited, ever
+var gSplNodesAtIdle = 0            ## gSplNodes when the last window closed
+var gSplTickFrames = 0             ## rider ticks seen (after warm-up)
+var gSplWorkFrames = 0             ## rider ticks that entered the guarded body
+
 # ---------------------------------------------------------------------------
 # Small guarded primitives, each a thin reuse of an already-verified target.
 # ---------------------------------------------------------------------------
@@ -593,6 +666,7 @@ proc splFindByName(t: Il2CppPtr; name: string; depth: int;
   result = nil
   if t == nil or depth < 0 or budget <= 0 or not duOk(t, 0x20'i32): return
   budget = budget - 1
+  gSplNodes = gSplNodes + 1            # cost readback; see splScanNode
   if (budget and 31) == 0 and cNowMs() > deadline:
     budget = 0                              # poison the budget: unwinds all levels
     return
@@ -607,6 +681,7 @@ proc splFindByName(t: Il2CppPtr; name: string; depth: int;
     let c = iChildAt(t, i)
     if c != nil and duOk(c, 0x20'i32):
       budget = budget - 1
+      gSplNodes = gSplNodes + 1        # cost readback; see splScanNode
       if (budget and 31) == 0 and cNowMs() > deadline:
         budget = 0
         return
@@ -957,6 +1032,9 @@ proc splScanNode(t: Il2CppPtr; depth: int; budget: var int; deadline: uint64) =
       fi = fi + 1
       if node == nil or not duOk(node, 0x20'i32): continue
       budget = budget - 1
+      gSplNodes = gSplNodes + 1        # the cost readback -- charged HERE, at
+                                       # the one place a node is spent, so it
+                                       # cannot drift from the walk.
       gSplScanNodes = budget0 - budget
       if (budget and 31) == 0 and cNowMs() > deadline:
         budget = 0
@@ -1238,6 +1316,31 @@ proc splMaintain() =
 # The guarded body + the drain rider.
 # ---------------------------------------------------------------------------
 var gSplLastWhyLogged = ""
+
+## Carried from the show-event postfix into the guarded body. `cSplTickGuarded`
+## takes no argument, and `aowl_p_p_seh` is not re-entrant, so the receiver is
+## parked here rather than opening a second guard to pass it.
+var gSplShowSelf: Il2CppPtr = nil
+var gSplShowPending = false
+
+proc splResetTargets() =
+  ## Drop every cached target. Called when the screen is (re)built -- from the
+  ## staleness check and from a fresh show event. `gSplScreen` is NOT touched
+  ## here: the caller decides where the next screen comes from.
+  gSplResolved = false
+  gSplHeadTmp = nil; gSplHeadLoc = nil
+  gSplDescTmp = nil; gSplDescLoc = nil
+  # The TMPs are going, so the String-identity latches must go with them, or a
+  # recycled address could answer for a caption we never checked.
+  gSplHeadStrOk = nil; gSplDescStrOk = nil
+  gSplCheckGo = nil
+  gSplToggle = nil
+  gSplForceRefused = false
+  gSplWarnGo = nil; gSplWarnText = ""; gSplWarnName = ""
+  gSplWarnMatched = false; gSplWarnRefused = false
+  gSplConfirmed = false
+  gSplSummaryLogged = false
+
 proc splDiag(reason: string) =
   ## Rate-limited "why discovery has not fired" line. Logs when the reason
   ## CHANGES, or at most once per ~30 hunt passes (~30 s), so a failure path can
@@ -1268,26 +1371,39 @@ proc splRebrandTickBody(a: Il2CppPtr): Il2CppPtr {.
      (not duOk(gSplScreen, 0x20'i32) or not iUnityAlive(gSplScreen)):
     gSplScreen = nil
 
+  # ---- A FRESH SHOW EVENT, handed to us by uihooks. ----
+  # `iToTransform` is an ICALL into Unity, so it belongs INSIDE this guard and
+  # not in the postfix that parked the pointer. It returns its argument
+  # unchanged when the lookup fails, so the result is liveness-checked before it
+  # is believed -- a screen we cannot get a Transform for is a refusal, not a
+  # silently-wrong root.
+  if gSplShowPending:
+    gSplShowPending = false
+    let self = gSplShowSelf
+    gSplShowSelf = nil
+    var t: Il2CppPtr = nil
+    if self != nil and duOk(self, 0x20'i32) and iUnityAlive(self):
+      let cand = iToTransform(self)
+      if cand != nil and cand != self and duOk(cand, 0x20'i32) and
+         iUnityAlive(cand):
+        t = cand
+    if t == nil:
+      gSplWindow = 0
+      warn "singleplayer rebrand: the show event fired but " &
+           "Component::get_transform did not yield a live Transform for the " &
+           "screen (RCX=0x" & hexOf(cast[uint64](self)) & "). NOTHING was " &
+           "walked and NOTHING was written -- this is a refusal, not a miss. " &
+           "The next open will try again."
+    else:
+      gSplScreen = t
+      splResetTargets()
+
   if gSplResolved and splCacheStale():
     # The screen went away and came back (or was rebuilt). Re-discover from
     # scratch rather than writing into a dead object. `gSplScreen` is NOT dropped
     # here -- if the screen object itself survived the rebuild (only its children
-    # were replaced) we re-scan from it directly and skip the allocating scene
-    # enumeration, which is what lets the re-apply land within a few frames.
-    gSplResolved = false
-    gSplHeadTmp = nil; gSplHeadLoc = nil
-    gSplDescTmp = nil; gSplDescLoc = nil
-    gSplHeadStrOk = nil; gSplDescStrOk = nil   # the TMPs are going; so must the
-                                               # String-identity latches, or a
-                                               # recycled address could answer
-                                               # for a caption we never checked.
-    gSplCheckGo = nil
-    gSplToggle = nil
-    gSplForceRefused = false
-    gSplWarnGo = nil; gSplWarnText = ""; gSplWarnName = ""
-    gSplWarnMatched = false; gSplWarnRefused = false
-    gSplConfirmed = false
-    gSplSummaryLogged = false
+    # were replaced) we re-scan from it directly.
+    splResetTargets()
 
   cSpAdd(SpPre, tPre)
 
@@ -1297,7 +1413,18 @@ proc splRebrandTickBody(a: Il2CppPtr): Il2CppPtr {.
     # ever throttled.
     var screen = gSplScreen
     let reusedScreen = screen != nil
+    if screen == nil and gSplEventDriven:
+      # EVENT-DRIVEN: the screen only ever comes from the show hook. There is
+      # deliberately NO fallback to `splFindScreen` here -- that is the cadence
+      # walk this change exists to delete, and re-entering it "just in case"
+      # would restore the exact per-frame cost the user objected to. Close the
+      # window; the next open re-arms us.
+      gSplWindow = 0
+      return
     if screen == nil:
+      # LEGACY path, reached ONLY when the show hook did not bind (a prologue
+      # mismatch or a build difference). `bindSplShowHook` says so loudly at
+      # boot; this is the announced fallback, not a silent one.
       # splFindScreen brackets its OWN phases (ROOTS / DESCEND) internally, so
       # the decomposition stays disjoint: no bracket here would double-count.
       screen = splFindScreen()
@@ -1311,7 +1438,13 @@ proc splRebrandTickBody(a: Il2CppPtr): Il2CppPtr {.
     # full walk for the session -- that would be a check that cannot fail. After
     # a capped number of fruitless re-scans the cache is dropped and the next
     # pass does the real root enumeration again.
-    if reusedScreen:
+    if reusedScreen and not gSplEventDriven:
+      # LEGACY ONLY. The re-scan ledger exists because the cadence hunt could
+      # find the WRONG node of that name and then re-scan it forever. In
+      # event-driven mode the game HANDED us this object as the screen it just
+      # showed, so "the scan found nothing yet" means the screen is still
+      # building -- dropping it and re-walking the scene roots would be exactly
+      # the wrong inference, and would re-enter the walk this change deletes.
       inc gSplRescanMisses
       if gSplRescanMisses > SplMaxRescanMiss:
         gSplRescanMisses = 0
@@ -1432,16 +1565,156 @@ proc splRebrandTickBody(a: Il2CppPtr): Il2CppPtr {.
   # double-count and break the partition.
   splMaintain()
 
+proc splNoteFault() =
+  ## Rule 6, in one place so both entry points (the show event and the rider)
+  ## account a fault identically.
+  inc gSplFaults
+  warn "singleplayer rebrand: the guarded body faulted (" & $gSplFaults &
+       " of " & $SplMaxFaults & ")"
+  if gSplFaults >= SplMaxFaults:
+    gSplOff = true
+    gSplWindow = 0
+    warn "singleplayer rebrand: too many faults; switching itself off for " &
+         "this session and leaving the stock screen alone. This is a " &
+         "REFUSAL, not a success."
+
+proc splRunGuarded(): bool =
+  ## ONE `aowl_p_p_seh`, entered from exactly two places and never nested. The
+  ## profiler bracket is taken strictly OUTSIDE it, because that guard is not
+  ## re-entrant and this opens none of its own.
+  gSplWorkFrames = gSplWorkFrames + 1
+  cSpCallBegin()
+  let tCall = cSpNow()
+  let rc = cSplTickGuarded(nil)
+  cSpCallEnd(tCall)
+  if rc == nil:
+    splNoteFault()
+    return false
+  result = true
+
+var gSplCostLogs = 0
+var gSplIdleProofAt = 0'u64      ## ms at which the idle proof is due; 0 = none
+const SplIdleProofMs = 60000'u64 ## how long after a window closes we assert idleness
+
+proc splCloseWindow(why: string) =
+  ## Close the show window and publish the PER-FRAME COST READBACK. Reports the
+  ## work this window cost and arms the idle proof; both numbers are of the
+  ## FINISHED state (nodes actually visited), not of our intent.
+  gSplWindow = 0
+  gSplSettled = 0
+  let spent = gSplWindowFramesUsed
+  let nodes = gSplNodes - gSplNodesAtIdle
+  if gSplCostLogs < 4:
+    gSplCostLogs = gSplCostLogs + 1
+    okLog "singleplayer rebrand: SHOW WINDOW CLOSED after open #" & $gSplOpens &
+          " -- " & why & ". PER-FRAME COST: this window spent " & $spent &
+          " frame(s) of work and visited " & $nodes & " live-tree node(s) (" &
+          (if spent > 0: $(nodes div spent) else: "0") & " nodes/frame while " &
+          "OPEN). The feature is now IDLE: the rider returns on two integer " &
+          "compares and visits ZERO nodes until the screen is shown again. " &
+          "The same measurement BEFORE the show hook was ~64 nodes per 18 ms " &
+          "slice at ~10 Hz, forever, resolving nothing."
+  gSplNodesAtIdle = gSplNodes
+  gSplWindowFramesUsed = 0
+  gSplIdleProofAt = cNowMs() + SplIdleProofMs
+
+proc splRebrandOnScreenShown(self: Il2CppPtr): bool =
+  ## THE SHOW EVENT. Called by `uihooks.nim` from the POSTFIX of
+  ## `MatchmakerOfflineRaidScreen::Show` @0x1788590, on Unity's main thread,
+  ## with the live screen in `self`. Returns false ONLY if the guarded body
+  ## faulted, so uihooks can stop dispatching into a broken subscriber.
+  ##
+  ## This does the FIRST pass immediately, here, rather than waiting for the
+  ## next rider tick: the point of the event is that the screen is available
+  ## NOW, and a frame of latency is a frame of vanilla text.
+  result = true
+  if (not gSplOn and not gSplForceOffline) or gSplOff: return
+  if gSplT0 == 0'u64: gSplT0 = cNowMs()
+  gSplShowSelf = self
+  gSplShowPending = true
+  gSplWindow = SplShowWindowFrames
+  gSplWindowFramesUsed = 0
+  gSplNodesAtIdle = gSplNodes
+  gSplSettled = 0
+  gSplFrames = 0
+  gSplIdleProofAt = 0'u64
+  gSplOpens = gSplOpens + 1
+  if gSplOpens <= 4:
+    okLog "singleplayer rebrand: SHOW EVENT #" & $gSplOpens & " -- the game " &
+          "handed us the live \"" & SplScreenName & "\" (0x" &
+          hexOf(cast[uint64](self)) & ") from the postfix of " &
+          "MatchmakerOfflineRaidScreen::Show @0x1788590. Applying now, from " &
+          "THIS object; no scene-root walk, no name hunt."
+  result = splRunGuarded()
+
 proc splRebrandDrainTick() =
   ## Rides the `EFT.TarkovApplication::Update` drain (slot alias, no second
-  ## detour). Cheap when idle: off, self-disabled, or inside the warm-up it is
-  ## a handful of integer compares and makes NO call into the game.
+  ## detour).
+  ##
+  ## EVENT-DRIVEN (the normal case, `gSplEventDriven`): when no show window is
+  ## open this is TWO integer compares and returns. It makes no call into the
+  ## game, walks nothing, and allocates nothing. All the work happens inside a
+  ## bounded window opened by `splRebrandOnScreenShown`.
+  ##
+  ## LEGACY (only when the show hook did not bind, and said so at boot): the
+  ## original adaptive cadence, kept so a build whose prologue does not match
+  ## still gets the feature rather than silently losing it.
   if (not gSplOn and not gSplForceOffline) or gSplOff: return
   if gSplT0 == 0'u64: gSplT0 = cNowMs()
   if cNowMs() - gSplT0 < SplWarmupMs: return   # the menu cannot be up yet
+  gSplTickFrames = gSplTickFrames + 1
   # Count REAL frames for the flash measurement, before any throttle, so the
   # number reported is frames the player actually saw -- not ticks we took.
   if gSplStockSeen and gSplFlashFrames < 100000: inc gSplFlashFrames
+
+  if gSplEventDriven:
+    if gSplWindow <= 0:
+      # ---- THE IDLE PATH. This is the whole steady-state cost of the feature.
+      # The idle proof below is a check that CAN fail: it reports the nodes this
+      # feature visited while it claimed to be idle, and a non-zero there is a
+      # bug, not a formality. It disarms itself after firing once.
+      if gSplIdleProofAt != 0'u64 and cNowMs() >= gSplIdleProofAt:
+        gSplIdleProofAt = 0'u64
+        let leaked = gSplNodes - gSplNodesAtIdle
+        if leaked == 0:
+          okLog "singleplayer rebrand: IDLE PROOF PASS -- " &
+                $int(SplIdleProofMs div 1000'u64) & " s after the window " &
+                "closed this feature has visited " & $leaked & " live-tree " &
+                "nodes and entered its guarded body " & $gSplWorkFrames &
+                " time(s) in total across " & $gSplTickFrames & " rider tick(s). Steady-state cost is 0 nodes/frame."
+        else:
+          warn "singleplayer rebrand: IDLE PROOF FAIL -- " & $leaked &
+               " live-tree node(s) were visited while this feature was " &
+               "supposed to be idle. Something is still walking off a cadence."
+      return
+    gSplWindow = gSplWindow - 1
+    gSplWindowFramesUsed = gSplWindowFramesUsed + 1
+    # SETTLE, on the FINISHED STATE and not on our own writes: count only frames
+    # on which the live tree already read ours and we therefore did nothing. A
+    # run of those is the only honest evidence LocalizedText has stopped
+    # clobbering the caption.
+    if gSplResolved and gSplConfirmed:
+      gSplSettled = gSplSettled + 1
+      if gSplSettled >= SplSettleFrames:
+        splCloseWindow("the finished-state readback held for " &
+                       $SplSettleFrames & " consecutive frames")
+        return
+    else:
+      gSplSettled = 0
+    inc gSplFrames
+    # Re-assert EVERY frame once resolved (from cached pointers: no walking),
+    # and re-scan the ONE screen we were handed on a throttle while it is not.
+    let everyE = (if gSplResolved: SplSteadyFrames else: SplRescanEveryFrames)
+    if gSplFrames < everyE: return
+    gSplFrames = 0
+    discard splRunGuarded()
+    if gSplWindow <= 0:
+      splCloseWindow("the " & $SplShowWindowFrames & "-frame window cap was " &
+                     "reached without the readback settling -- if this line " &
+                     "keeps appearing the relabel is NOT holding, which is a " &
+                     "FAIL, not a timeout")
+    return
+
   inc gSplFrames
   # THE ADAPTIVE THROTTLE, and it lives here because this is the side that
   # decides whether to enter the guard at all (the shape `hide seasons` uses,
@@ -1465,23 +1738,51 @@ proc splRebrandDrainTick() =
                else: SplHuntFrames)
   if gSplFrames < every: return
   gSplFrames = 0
-  # THE OUTER BRACKET: the WHOLE guarded call, strictly OUTSIDE
-  # `cSplTickGuarded` -- `aowl_p_p_seh` is not re-entrant and this opens no
-  # guard of its own. It is what makes `accounted of TOTAL` an honest ratio
-  # rather than a comparison of two instruments.
-  cSpCallBegin()
-  let tCall = cSpNow()
-  let rc = cSplTickGuarded(nil)
-  cSpCallEnd(tCall)
-  if rc == nil:
-    inc gSplFaults
-    warn "singleplayer rebrand: the guarded body faulted (" & $gSplFaults &
-         " of " & $SplMaxFaults & ")"
-    if gSplFaults >= SplMaxFaults:
-      gSplOff = true
-      warn "singleplayer rebrand: too many faults; switching itself off for " &
-           "this session and leaving the stock screen alone. This is a " &
-           "REFUSAL, not a success."
+  # THE OUTER BRACKET is taken inside `splRunGuarded`, strictly OUTSIDE
+  # `cSplTickGuarded` -- `aowl_p_p_seh` is not re-entrant and nothing here opens
+  # a guard of its own.
+  discard splRunGuarded()
+
+# ---------------------------------------------------------------------------
+# SUBSCRIBING TO THE SHOW EVENT
+# ---------------------------------------------------------------------------
+proc splWantShowHook() =
+  ## Declare the subscription. MUST run before the single `uihArm` pass -- a
+  ## site nobody wanted is never patched, which is the point.
+  if not gSplOn and not gSplForceOffline: return
+  uihWant(UihSiteOfflineRaid)
+
+proc splShowHookVerdict() =
+  ## Read back whether the subscription actually BOUND, after `uihArm`. Says
+  ## which of the two modes this session is in, loudly, because the difference
+  ## is the entire performance question the user raised.
+  if not gSplOn and not gSplForceOffline: return
+  # Bound to a local first: nimony refuses to borrow an iteration path from a
+  # call's temporary ("path is not borrowable"), and a `for ln in f()` here is
+  # exactly that.
+  let uihLines = uihStatusLines()
+  var li = 0
+  while li < uihLines.len:
+    info "uihooks:" & uihLines[li]
+    li = li + 1
+  gSplEventDriven = uihBound(UihSiteOfflineRaid)
+  if gSplEventDriven:
+    okLog "singleplayer rebrand: EVENT-DRIVEN. The screen arrives from the " &
+          "POSTFIX of MatchmakerOfflineRaidScreen::Show @0x1788590 " &
+          "(sharedness UNIQUE, 16-byte prologue matched). There is NO " &
+          "per-frame search: between opens the rider returns on two integer " &
+          "compares and visits zero live-tree nodes. Each open opens a bounded " &
+          "window of at most " & $SplShowWindowFrames & " frames which closes " &
+          "early once the finished-state readback holds for " &
+          $SplSettleFrames & " consecutive frames."
+  else:
+    warn "singleplayer rebrand: the show hook did NOT bind, so this session " &
+         "falls back to the LEGACY CADENCE HUNT -- a throttled walk of the " &
+         "live scene roots, which is exactly the per-frame cost the show hook " &
+         "exists to remove. This is announced, not silent. The reason the " &
+         "hook refused is in the `uihooks:` line above; the usual causes are " &
+         "a different game build or another detour having patched " &
+         "0x1788590 first (a hook-ORDER problem)."
 
 # ---------------------------------------------------------------------------
 # THE PHASE REPORT. Emitted by `drainprof.nim` on the same throttle as the
