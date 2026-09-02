@@ -7094,3 +7094,14 @@ or Behaviour::set_enabled on a fresh clone (both throw managed exceptions
 that unwind through our frame with no SEH fault); read component fields off
 the COMPONENT, not the Transform; a reap cap that can be hit silently is how
 8 donor rows survived.
+
+## 2026-09-02 05:55: autoraid's fault crumbs name two access violations
+
+MEASURED (build 4,785,152): `faulted (1 of 3) at step PRE-MENU, in: PRE-MENU:
+pressing the SettingsScreen BackButton` (the retry then succeeded with the
+PlayButton-active readback), and after PLAY + site 3, `faulted (2 of 3)` and
+`(3 of 3) at step SIDE, in: SIDE: walking the pmc/scav containers and
+pressing` -> autoraid switched itself off. The crumb instrumentation added
+this pass named both sites on the first run; without it these would have
+been three anonymous "guarded tick body faulted" lines. The fault budget is
+shared across steps, so one PRE-MENU fault reduced SIDE's budget to two.
