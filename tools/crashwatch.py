@@ -1269,6 +1269,7 @@ class CrashReport(object):
             self.when = os.path.getmtime(folder)
         self.frames = []          # the crash-site block
         self.walked = []          # everything after the symbol-handler dump
+        self.modlines = []        # the loaded-module lines (runtime bases)
         self.ok = False
         self.why = ""
         self._parse()
@@ -1292,6 +1293,11 @@ class CrashReport(object):
         if not blocks:
             self.why = "the stack section of %s contains no frames" % self.log
             return
+        # The loaded-module lines, kept because they carry the RUNTIME BASE of
+        # every module ("GameAssembly.dll (00007FFB2ABB0000), size: ...") and
+        # nothing can rebase a frame VA to an RVA without them. Only the
+        # candidate lines are kept, not the whole 2,300-line log.
+        self.modlines = [l for l in lines if "), size: " in l]
         self.frames = blocks[0]
         for b in blocks[1:]:
             for f in b:
@@ -1407,7 +1413,51 @@ def newest_crash_report(since=None, root=DEFAULT_CRASH_ROOT, slack=0.0):
     return None
 
 
-def format_crash_report(rep, start_epoch=None, top=12, ours=None, indent="   "):
+_RESOLVERS = {}
+
+
+def symbolize_frames(frames, modlines):
+    """([(frame, Sym-or-None, per-frame note)], global_note_or_None).
+
+    The GameAssembly frames of a Unity crash report are labelled with the
+    NEAREST EXPORT (`mono_class_has_parent` for nearly everything on this
+    build) because there is no PDB -- a confidently wrong answer. This asks
+    tools/il2cpp_resolve.py to name the method whose body actually contains
+    each address, offline.
+
+    Returns (None, note) -- and NEVER a silent skip -- when the resolver's two
+    inputs are not available, because "I could not look" is INCONCLUSIVE, not
+    a pass (CLAUDE.md 9b).
+    """
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import il2cpp_resolve as ir
+    except Exception as e:                      # pragma: no cover
+        return None, ("frames NOT symbolized: could not import "
+                      "il2cpp_resolve (%s)" % e)
+    gameasm, metadec = ir.default_paths()
+    missing = [p for p in (gameasm, metadec) if not os.path.exists(p)]
+    if missing:
+        return None, ("frames NOT symbolized: %s absent. Unity's own labels "
+                      "below are NEAREST-EXPORT guesses, not the methods that "
+                      "crashed. (The metadata cache is produced by "
+                      "tools/metablob.py at .cache/global-metadata.dec.dat.)"
+                      % ", ".join(missing))
+    key = (gameasm, metadec)
+    try:
+        R = _RESOLVERS.get(key)
+        if R is None:
+            R = _RESOLVERS[key] = ir.Resolver(gameasm, metadec)
+        rows = ir.symbolize_frames(R, frames, ir.parse_module_bases(modlines),
+                                   key=key)
+    except Exception as e:
+        return None, ("frames NOT symbolized: the resolver failed (%s: %s)"
+                      % (type(e).__name__, e))
+    return rows, None
+
+
+def format_crash_report(rep, start_epoch=None, top=12, ours=None, indent="   ",
+                        symbolize=True):
     """The block run.py prints. Returns a list of lines."""
     if rep is None:
         return ["NO CRASH REPORT was written after launch -- the client was "
@@ -1420,8 +1470,20 @@ def format_crash_report(rep, start_epoch=None, top=12, ours=None, indent="   "):
     if not rep.ok:
         lines.append(indent + "INCONCLUSIVE -- " + rep.why)
         return lines
-    for f in rep.frames[:top]:
+    shown = rep.frames[:top]
+    syms, note = (symbolize_frames(shown, rep.modlines) if symbolize
+                  else (None, "symbolization was not requested"))
+    if note:
+        lines.append(indent + note)
+    for i, f in enumerate(shown):
         lines.append(indent + f.text)
+        if syms is None:
+            continue
+        _f, s, why = syms[i]
+        if s is not None:
+            lines.append(indent + "    -> " + s.line())
+        elif why:
+            lines.append(indent + "    -> " + why)
     rest = len(rep.frames) - top
     if rest > 0:
         lines.append(indent + "... %d more crash-site frame(s)" % rest)
@@ -1445,6 +1507,8 @@ def cmd_last(argv):
     n = 3
     root = DEFAULT_CRASH_ROOT
     rest = list(argv)
+    sym = "--no-symbolize" not in rest
+    rest = [a for a in rest if a != "--no-symbolize"]
     if rest and rest[0].isdigit():
         n = int(rest.pop(0))
     if rest and rest[0] == "--root":
@@ -1471,6 +1535,19 @@ def cmd_last(argv):
                 "" if source == "ours" else "   [nothing of ours at the site]"))
         if note:
             emit("      note: " + note)
+        if sym:
+            # The frames as METHODS, not as nearest exports. This is the first
+            # thing anyone does with a crash report, and it used to be done by
+            # hand.
+            rows, why = symbolize_frames(rep.frames[:8], rep.modlines)
+            if why:
+                emit("      " + why)
+            else:
+                for f, s, per in rows:
+                    if s is not None:
+                        emit("      %s -> %s" % (f.addr, s.line()))
+                    elif per:
+                        emit("      %s -> %s" % (f.addr, per))
     return 0
 
 

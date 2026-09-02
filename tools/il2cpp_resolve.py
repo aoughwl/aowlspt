@@ -187,6 +187,25 @@ guessed at.
         # shared (n owners -- do not detour) / unique / unknown (a refusal:
         # the address is not in the methodPointers histogram at all).
         # exit 0 only for `unique`.
+  il2cpp_resolve.py <GameAssembly.dll> <global-metadata.dec.dat> symbolize <RVA-or-VA>
+                                       [--base 0x...] [--max-gap N] [--no-generics]
+        # a CRASH ADDRESS -> the method whose body contains it: the greatest
+        # methodPointers (or generic-body) start <= the address, with the
+        # derived signature, the offset into the body, the PE section and the
+        # three-state sharedness of that start. Unity has no PDB for
+        # GameAssembly.dll, so its own label is the nearest EXPORT
+        # (`mono_class_has_parent` for almost everything) -- a wrong answer.
+        # Pass --base with the module base the report printed; a live
+        # ASLR address with no --base is REFUSED, not rebased off 0x180000000.
+        # INCONCLUSIVE (exit 3) outside the `il2cpp` section, past --max-gap
+        # (default 0x10000), or on a generic-SHARED body.
+  il2cpp_resolve.py <GameAssembly.dll> <global-metadata.dec.dat> symbolize-report <Player.log>
+                                       [--max-gap N]
+        # the same, for every CRASH-SITE frame of a Unity crash report, using
+        # the report's own module base lines. Frames from other modules pass
+        # through unchanged. A report with no GameAssembly base line says so
+        # per frame rather than guessing, and a report whose GameAssembly
+        # `size:` disagrees with ours is refused as a DIFFERENT BUILD.
   il2cpp_resolve.py <GameAssembly.dll> <global-metadata.dec.dat> type <idx-or-Name>...
         # per method: rid, RVA, arity, full signature, section, thunk shape.
         # add --shared to also annotate RVAs shared with other methods (this
@@ -210,7 +229,7 @@ guessed at.
   il2cpp_resolve.py <GameAssembly.dll> <global-metadata.dec.dat> settings-table
         # the SettingsScreen/SettingControl offset table Phase 1 will probe
 """
-import os, struct, sys
+import bisect, os, re, struct, sys
 
 # ---- output encoding ------------------------------------------------------
 # MEASURED: `fldoff.py fields EFT.MatchmakerOperation` died with
@@ -1301,7 +1320,7 @@ def const_check(R):
 VERBS = ("find", "methods", "member", "type", "typemethods", "bytes",
          "shared", "verify-be", "fields", "verify-fields", "verify-parents",
          "enum", "verify-consts", "settings-table", "holdersof",
-         "genericmethods", "verify-generics")
+         "genericmethods", "verify-generics", "symbolize", "symbolize-report")
 
 # ---- MethodAttributes ------------------------------------------------------
 # ECMA-335 II.23.1.10. Only the bits that change a BIND DECISION are decoded;
@@ -1916,6 +1935,473 @@ def cmd_typemethods(R, argv):
     return 0
 
 
+# ---------------------------------------------------------------------------
+# symbolize -- a crash-report ADDRESS back to the method whose body contains it
+#
+# WHY THIS EXISTS. Unity's crash handler has no PDB for GameAssembly.dll, so it
+# labels every frame with the NEAREST EXPORT. On this build that is nearly
+# always `mono_class_has_parent` or `il2cpp_alloc` -- a label that names a
+# function 20 MB away and is therefore a confidently wrong answer, which is the
+# exact failure class CLAUDE.md 9b is about. The truth is recoverable offline:
+#
+#   1. rebase the frame VA to an RVA using the module base line the report
+#      itself prints (`GameAssembly.dll (00007FFB2ABB0000), size: 126812160`);
+#   2. find the method whose methodPointers entry is the GREATEST start <= RVA.
+#
+# MEASURED against Crash_2026-09-02_045551684, whose two crash-site frames a
+# human hand-walked first:
+#   0x00007FFB2BFD0103 -> RVA 0x1420103 -> EFT.UI.SeasonWidgetData::From
+#                                          @0x141ffd0 +0x133
+#   0x00007FFB2C0E9134 -> RVA 0x1539134 -> EFT.UI.MenuScreen::Show
+#                                          @0x15387a0 +0x994
+#
+# `shared <RVA>` cannot do this: it matches EXACT starts and answers `unknown`
+# for every mid-function address, which is a refusal, not an attribution.
+#
+# THREE OUTCOMES, NEVER TWO. A nearest-start walk will happily name a method for
+# any address you give it, including an address in another section, an address
+# in a hole between functions, and an address inside an inflated generic body
+# whose start is not in methodPointers at all. Each of those is refused:
+#
+#   * not in the `il2cpp` PE section  -- generated code lives there, not in
+#     `.text`. A `.text` address is engine/runtime C++ we have no symbols for.
+#   * gap to the nearest start > --max-gap (default 64 KB) -- past the end of
+#     any plausible function body; the nearest start is printed as a CANDIDATE
+#     and the verdict stays INCONCLUSIVE.
+#   * the nearest start is a GENERIC-SHARED body -- one compiled body serving
+#     several generic method definitions (2,684 such RVAs on this build). The
+#     owners are listed; which one the frame was executing is NOT recoverable
+#     from the address, so it is not asserted.
+#
+# The start table is built from BOTH pointer tables: the per-image
+# `methodPointers` AND `Il2CppCodeRegistration.genericMethodPointers` (65,022
+# distinct RVAs here). Including the generic bodies is what stops an address
+# inside an inflated generic from being attributed to whatever ordinary method
+# happens to precede it in the section -- a wrong answer with a small,
+# innocent-looking gap. If the generic table cannot be found, or
+# `verify-generics` fails, the index says so IN EVERY VERDICT rather than
+# quietly narrowing.
+
+DEFAULT_MAX_GAP = 0x10000
+
+
+def default_paths():
+    """(GAMEASM, METADEC) -- the same defaults fldoff.py and friends use.
+
+    Overridable with $AOWLSPT_GAMEASM / $AOWLSPT_METADEC. METADEC is resolved
+    against the REPO, then against up to four parent directories, because a
+    git worktree has no `.cache` of its own -- it lives in the main checkout.
+    """
+    gameasm = os.environ.get("AOWLSPT_GAMEASM",
+                             "D:/Games/Tarkov/GameAssembly.dll")
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    metadec = os.environ.get(
+        "AOWLSPT_METADEC",
+        os.path.join(repo, ".cache", "global-metadata.dec.dat"))
+    if not os.path.exists(metadec):
+        up = repo
+        for _ in range(4):
+            up = os.path.dirname(up)
+            cand = os.path.join(up, ".cache", "global-metadata.dec.dat")
+            if os.path.exists(cand):
+                metadec = cand
+                break
+    return gameasm, metadec
+
+
+def size_of_image(b):
+    """SizeOfImage from a PE's optional header -- the number Unity's crash
+    report prints as `size:`. Comparing the two is how we know the report came
+    from THIS GameAssembly.dll and not another build."""
+    e = struct.unpack_from("<I", b, 0x3C)[0]
+    return struct.unpack_from("<I", b, e + 4 + 20 + 56)[0]
+
+
+class Sym(object):
+    """One symbolization. `ok` False means INCONCLUSIVE, never 'no match'."""
+
+    __slots__ = ("rva", "ok", "why", "start", "offset", "owner", "kind",
+                 "section", "shared_state", "shared_n", "owners", "caveat")
+
+    def __init__(self, rva):
+        self.rva, self.ok, self.why = rva, False, ""
+        self.start = self.offset = None
+        self.owner = self.kind = None
+        self.section = None
+        self.shared_state, self.shared_n = "unknown", 0
+        self.owners = []
+        self.caveat = ""
+
+    def line(self):
+        if not self.ok:
+            s = "INCONCLUSIVE: %s" % self.why
+            if self.start is not None:
+                s += ("  [nearest start 0x%x +0x%x: %s]"
+                      % (self.start, self.offset, self.owner))
+            return s
+        sh = ("[SHARED: %d methods folded onto this body -- the owner named "
+              "above is one of them]" % self.shared_n
+              if self.shared_state == "shared" else "[%s]" % self.shared_state)
+        s = ("%s @0x%x +0x%x [section %s] %s"
+             % (self.owner, self.start, self.offset, self.section, sh))
+        if self.caveat:
+            s += "  " + self.caveat
+        return s
+
+
+class SymbolIndex(object):
+    """Every compiled method START in GameAssembly.dll, sorted, with its owner.
+
+    Built once (~15 s: 5 s for methodPointers, ~10 s for the generic table) and
+    cached per (gameasm, metadec) by `symbol_index()`.
+    """
+
+    def __init__(self, R, generics=True):
+        self.R = R
+        self.owners = {}            # rva -> [("m", t, mi) | ("g", mi, nInst)]
+        self.mi_type = {}           # method index -> declaring type index
+        self.generics_note = ""
+        for t in range(R.NTYPES):
+            mp = R.MOD.get(R.image_of_type(t))
+            base, cnt = mp if mp else (None, 0)
+            for mi in R.type_methods(t):
+                self.mi_type[mi] = t
+                if not base:
+                    continue
+                rid = R.mtoken(mi) & 0xFFFFFF
+                if not (1 <= rid <= cnt):
+                    continue
+                va = R.rq(base + (rid - 1) * 8)
+                if va:
+                    self.owners.setdefault(va - R.IB, []).append(("m", t, mi))
+        self.n_method_starts = len(self.owners)
+        self.n_generic_starts = 0
+        if generics:
+            self._add_generics()
+        else:
+            self.generics_note = ("generic bodies were EXCLUDED (--no-generics)"
+                                  ": an address inside an inflated generic will "
+                                  "be attributed to the ordinary method that "
+                                  "precedes it, which is a WRONG answer")
+        self.starts = sorted(self.owners)
+
+    def _add_generics(self):
+        R = self.R
+        try:
+            ok, _rows = self_check_generics(R)
+        except Exception as e:                      # pragma: no cover
+            ok, _rows = False, e
+        if not ok:
+            self.generics_note = (
+                "the generic-body table was NOT used: verify-generics FAILED, "
+                "so an address inside an inflated generic may be attributed to "
+                "the ordinary method preceding it")
+            return
+        gi = R._generic_index()
+        if not gi:
+            self.generics_note = (
+                "genericMethodPointers was NOT FOUND, so inflated generic "
+                "bodies are missing from this index")
+            return
+        seen = {}
+        for md, rows in gi.items():
+            for rva, _ci, _mii in rows:
+                if rva:
+                    seen.setdefault(rva, {}).setdefault(md, 0)
+                    seen[rva][md] += 1
+        for rva, mds in seen.items():
+            for md, n in mds.items():
+                self.owners.setdefault(rva, []).append(("g", md, n))
+        self.n_generic_starts = len(seen)
+
+    # -- naming ----------------------------------------------------------
+    def label(self, entry):
+        R = self.R
+        if entry[0] == "m":
+            _, t, mi = entry
+            ns, nm = R.tname(t)
+            full = (ns + "." + nm) if ns else nm
+            try:
+                sig, _pc = R.sig_string(mi, R.mname(mi))
+            except Exception:
+                sig = R.mname(mi) + "(?)"
+            return vis("%s::%s" % (full, sig))
+        _, mi, n = entry
+        t = self.mi_type.get(mi)
+        full = "<type %s>" % t
+        if t is not None:
+            ns, nm = R.tname(t)
+            full = (ns + "." + nm) if ns else nm
+        try:
+            sig, _pc = R.sig_string(mi, R.mname(mi))
+        except Exception:
+            sig = R.mname(mi) + "(?)"
+        return vis("%s::%s [generic body, %d instantiation(s) here]"
+                   % (full, sig, n))
+
+    # -- the lookup ------------------------------------------------------
+    def lookup(self, rva, max_gap=DEFAULT_MAX_GAP):
+        s = Sym(rva)
+        sec = self.R.section_of_rva(rva)[0]
+        s.section = sec or "<not in any section>"
+        if sec != "il2cpp":
+            s.why = ("0x%x is in %s, not the `il2cpp` section where IL2CPP "
+                     "generated code lives -- methodPointers cannot name it. "
+                     "(A `.text` address is engine/runtime C++; an address in "
+                     "no section at all was not rebased from this image.)"
+                     % (rva, s.section))
+            return s
+        i = bisect.bisect_right(self.starts, rva) - 1
+        if i < 0:
+            s.why = ("0x%x is below the FIRST known method start 0x%x"
+                     % (rva, self.starts[0]))
+            return s
+        start = self.starts[i]
+        entries = self.owners[start]
+        s.start, s.offset = start, rva - start
+        s.owner = self.label(entries[0])
+        s.owners = entries
+        s.kind = entries[0][0]
+        gcount = sum(1 for e in entries if e[0] == "g")
+        if s.offset > max_gap:
+            s.why = ("0x%x is 0x%x bytes past the nearest method start "
+                     "(0x%x), which is more than --max-gap 0x%x -- no "
+                     "plausible function body is that long, so this address "
+                     "is NOT attributed to it"
+                     % (rva, s.offset, start, max_gap))
+            return s
+        if gcount and (gcount > 1 or len(entries) > 1):
+            s.why = ("the nearest start 0x%x is a GENERIC-SHARED body: %d "
+                     "method definition(s) compile to it, and which one this "
+                     "frame was executing is not recoverable from the address. "
+                     "Owners: %s"
+                     % (start, len(entries),
+                        "; ".join(self.label(e) for e in entries[:4])
+                        + (" ..." if len(entries) > 4 else "")))
+            return s
+        st, n = self.R.sharedness(start)
+        s.shared_state, s.shared_n = st, n
+        if s.kind == "g":
+            s.shared_state = "generic body (single owner)"
+            s.caveat = ("[sharedness: NOT APPLICABLE -- a generic body is not "
+                        "in the methodPointers histogram]")
+        elif st == "unknown":
+            s.caveat = self.R.sharedness_note(start)
+        if self.generics_note:
+            s.caveat += "  [index caveat: %s]" % self.generics_note
+        s.ok = True
+        return s
+
+
+_SYMIDX = {}
+
+
+def symbol_index(R, key=None, generics=True):
+    """A cached SymbolIndex. `key` should identify the (gameasm, metadec)."""
+    k = (key, generics)
+    if k not in _SYMIDX:
+        _SYMIDX[k] = SymbolIndex(R, generics=generics)
+    return _SYMIDX[k]
+
+
+# `D:\Aowlspt\GameAssembly.dll:GameAssembly.dll (00007FFB2ABB0000), size:
+#  126812160 (result: 0), SymType: '-deferred-', PDB: ''`
+MODBASE_RX = re.compile(
+    r"^.*?[:\\/]([^\\/:]+?)\.(?:dll|exe)\s*:\s*[^\s(]+\s+"
+    r"\(([0-9A-Fa-f]{8,16})\)\s*,\s*size:\s*(\d+)", re.IGNORECASE)
+
+
+def parse_module_bases(lines):
+    """{module_stem_lower: (base_va, size_of_image)} from a Unity crash report.
+
+    Unity prints the loaded-module list twice in some reports (a `-deferred-`
+    pass and an `-exported-` one). Both passes agree in every report measured;
+    if a second pass ever disagreed, the FIRST is kept and the conflict is
+    recorded under the key `<name>:conflict`, so a caller can refuse rather
+    than rebase against an arbitrary one of two bases.
+    """
+    if isinstance(lines, str):
+        lines = lines.splitlines()
+    out = {}
+    for ln in lines:
+        m = MODBASE_RX.match(ln)
+        if not m:
+            continue
+        name = m.group(1).lower()
+        base, size = int(m.group(2), 16), int(m.group(3))
+        if name in out:
+            if out[name] != (base, size):
+                out[name + ":conflict"] = (base, size)
+            continue
+        out[name] = (base, size)
+    return out
+
+
+def symbolize_frames(R, frames, bases, index=None, max_gap=DEFAULT_MAX_GAP,
+                     module="gameassembly", key=None):
+    """[(frame, Sym-or-None, note)] for crash-report frames.
+
+    `frames` is any sequence of objects with `.addr` (hex string or int) and
+    `.module`. A frame in another module yields (frame, None, "") -- it is
+    passed through, never guessed at. A GameAssembly frame with no base line,
+    or with a base line whose `size:` disagrees with our GameAssembly.dll,
+    yields (frame, None, <why not>) -- stated, never silently skipped.
+    """
+    idx = index if index is not None else symbol_index(R, key=key)
+    got = bases.get(module)
+    conflict = (module + ":conflict") in bases
+    ours = size_of_image(R.b)
+    why = None
+    if got is None:
+        why = ("no `%s` module base line in this report, so its frames CANNOT "
+               "be rebased to RVAs -- not symbolized (this is not 'no match')"
+               % module)
+    elif conflict:
+        why = ("this report lists TWO DIFFERENT bases for %s; refusing to "
+               "pick one" % module)
+    elif got[1] != ours:
+        why = ("the report's %s is SizeOfImage %d but ours is %d -- a "
+               "DIFFERENT BUILD. Refusing to symbolize against it."
+               % (module, got[1], ours))
+    out = []
+    for f in frames:
+        mod = (getattr(f, "module", "") or "").lower()
+        if mod != module:
+            out.append((f, None, ""))
+            continue
+        if why:
+            out.append((f, None, why))
+            continue
+        addr = f.addr if isinstance(f.addr, int) else int(str(f.addr), 16)
+        out.append((f, idx.lookup(addr - got[0], max_gap=max_gap), ""))
+    return out
+
+
+def _report_frames(lines):
+    """Crash-site frames of a report. Delegates to crashwatch's parser -- the
+    ONE place the report format is known -- imported lazily so the two modules
+    can import each other without a cycle."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import crashwatch
+    blocks = crashwatch.parse_stack_blocks(lines)
+    if blocks is None:
+        return None
+    return blocks[0] if blocks else []
+
+
+def cmd_symbolize(R, argv, key=None):
+    if not argv:
+        print("usage: symbolize <RVA-or-VA> [--base 0x...] [--max-gap N] "
+              "[--no-generics]")
+        return 2
+    max_gap = DEFAULT_MAX_GAP
+    base = None
+    gen = True
+    rest = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--max-gap" and i + 1 < len(argv):
+            max_gap = int(argv[i + 1], 0)
+            i += 2
+            continue
+        if a.startswith("--max-gap="):
+            max_gap = int(a.split("=", 1)[1], 0)
+            i += 1
+            continue
+        if a == "--base" and i + 1 < len(argv):
+            base = int(argv[i + 1], 0)
+            i += 2
+            continue
+        if a.startswith("--base="):
+            base = int(a.split("=", 1)[1], 0)
+            i += 1
+            continue
+        if a == "--no-generics":
+            gen = False
+            i += 1
+            continue
+        rest.append(a)
+        i += 1
+    if not rest:
+        print("symbolize: no address given")
+        return 2
+    addr = int(rest[0], 0)
+    if base is not None:
+        rva = addr - base
+        if rva < 0:
+            print("INCONCLUSIVE: 0x%x is BELOW the --base 0x%x you gave -- "
+                  "that address is not in this module." % (addr, base))
+            return 3
+    elif addr >= R.IB + 0x10000000:
+        # A live ASLR address with no --base. Refuse: subtracting the PREFERRED
+        # base 0x180000000 from a relocated address is the classic wrong answer.
+        print("INCONCLUSIVE: 0x%x looks like a LIVE (ASLR-relocated) address, "
+              "not an RVA. GameAssembly.dll is relocated at runtime, so pass "
+              "the module base the crash report printed: --base 0x<base>."
+              % addr)
+        return 3
+    else:
+        rva = addr - R.IB if addr >= R.IB else addr
+    idx = symbol_index(R, key=key, generics=gen)
+    print("index: %d methodPointers start(s) + %d generic body start(s); "
+          "max-gap 0x%x" % (idx.n_method_starts, idx.n_generic_starts, max_gap))
+    if idx.generics_note:
+        print("NOTE: %s" % idx.generics_note)
+    s = idx.lookup(rva, max_gap=max_gap)
+    print("0x%x  %s" % (rva, s.line()))
+    return 0 if s.ok else 3
+
+
+def cmd_symbolize_report(R, argv, key=None):
+    if not argv:
+        print("usage: symbolize-report <Player.log> [--max-gap N]")
+        return 2
+    max_gap = DEFAULT_MAX_GAP
+    path = None
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--max-gap" and i + 1 < len(argv):
+            max_gap = int(argv[i + 1], 0)
+            i += 2
+            continue
+        if a.startswith("--max-gap="):
+            max_gap = int(a.split("=", 1)[1], 0)
+            i += 1
+            continue
+        path = a
+        i += 1
+    if not path or not os.path.isfile(path):
+        print("no such file: %r" % path)
+        return 2
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        lines = fh.read().splitlines()
+    frames = _report_frames(lines)
+    if frames is None:
+        print("INCONCLUSIVE: %s has no `OUTPUTTING STACK TRACE` section -- it "
+              "is a log, not a crash report." % path)
+        return 3
+    if not frames:
+        print("INCONCLUSIVE: the stack section of %s contains no frames."
+              % path)
+        return 3
+    bases = parse_module_bases(lines)
+    out = symbolize_frames(R, frames, bases, max_gap=max_gap, key=key)
+    n_ok = 0
+    for f, s, note in out:
+        print("   %s" % f.text)
+        if s is None:
+            if note:
+                print("       -> %s" % note)
+            continue
+        print("       -> %s" % s.line())
+        n_ok += 1 if s.ok else 0
+    print("%d of %d crash-site frame(s) symbolized; the rest are other "
+          "modules or refusals stated above." % (n_ok, len(out)))
+    return 0 if n_ok else 3
+
+
 def usage_gaps():
     """VERBS that the Usage: block does not document, and documented verbs that
     do not exist. MEASURED: `methods`, `shared`, `enum`, `settings-table` and
@@ -2089,6 +2575,12 @@ def main():
         elif argc is not None and arity_rejected:
             print("-- %d hit(s) at arity %d; %d more rejected by --argc"
                   % (hits, argc, arity_rejected))
+    elif cmd == "symbolize":
+        sys.exit(cmd_symbolize(R, sys.argv[4:],
+                               key=(sys.argv[1], sys.argv[2])))
+    elif cmd == "symbolize-report":
+        sys.exit(cmd_symbolize_report(R, sys.argv[4:],
+                                      key=(sys.argv[1], sys.argv[2])))
     elif cmd == "typemethods":
         sys.exit(cmd_typemethods(R, sys.argv[4:]))
     elif cmd == "genericmethods":
