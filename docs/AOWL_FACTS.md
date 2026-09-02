@@ -8478,3 +8478,15 @@ added anyway as a *defensive* dangling-reference gate over
 `data/post1/seasonactive.json` and a profile's `SeasonalRewards` dictionary,
 with positive controls, and its module header says plainly that it is not a fix
 for this.
+
+## 2026-09-02 14:15 (clock): two user-visible defects on build 4,901,888
+
+USER-REPORTED, host log confirms: (1) the native subtab strip is built
+hidden (`built the GRAPHICS SETTINGS | POSTFX strip as a SIBLING`, `build
+attempted ... returned true`) and NEVER raised when the player clicks
+GRAPHICS -- no edge/raise/CanvasGroup line at all: the stock GraphicsToggle
+ON edge is not recognised by the Toggle::Set postfix path. (2) pressing
+Escape in Settings (menu re-show) crashes the client -- the corrupted
+Profile reference (-1) read by SeasonWidgetData::From. The corrupting
+native write therefore happens during the Settings session or at its
+close; a host-wide write audit with a write trace is in flight.
