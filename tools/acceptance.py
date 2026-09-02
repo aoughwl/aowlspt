@@ -224,14 +224,20 @@ def open_settings(live, timeout=90):
 DONOR_CAPTION = "Interface language"
 PLACEHOLDER_TEXT = "SOME TEXT"
 
-# The needle for the POSITIVE CONTROL that gates every findtext-based absence
-# claim below. `e` is the most common letter in the English UI; a settings
-# screen that renders dozens of captions and yields ZERO hits for it has not
-# proved the captions are absent, it has proved findtext could not read them.
-FINDTEXT_CONTROL = "e"
+# THE POSITIVE CONTROL THAT GATES EVERY ABSENCE CLAIM IS NOW IN-BAND.
+# There used to be a separate control walk here, `findtext e`, on the reasoning
+# that a settings screen yielding zero hits for the commonest letter in English
+# has proved only that findtext cannot read text. The reasoning was right and
+# the implementation could never pass: `e` matches far more than the 24-match
+# cap, so the control always ended HIT_CAP and every absence claim was reported
+# INCONCLUSIVE on the control rather than on the evidence -- at the cost of a
+# second full 40k-node traversal each time. The host prints its own control on
+# every findtext report (`predicate control: N node(s) carried a
+# TextMeshProUGUI (of M visited)`), measured on the SAME walk. See
+# findtext_control().
 
 SETTINGS_ROOT = "$settings"      # bound once Settings is open; `state` shows it
-WALK_BUDGET = 40000              # measured: EXHAUSTIVE in ~1263 nodes from here
+WALK_BUDGET = 40000              # measured 2026-09-02: EXHAUSTIVE in 7735 nodes
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +305,80 @@ def trusted_walk(raw):
     return comp == "EXHAUSTIVE", comp
 
 
+# ---------------------------------------------------------------------------
+# findtext HIT lines -- parsed HERE, because channel.py's shared _HIT_RE
+# CANNOT MATCH THEM. Measured 2026-09-02.
+# ---------------------------------------------------------------------------
+# `plugins/aowlsptcode/mcp/channel.py:290` reads, after the name and optional
+# parent:  (?:\s+text="(?P<text>[^"]*)")? (?:\s+active=(true|false))?
+# \s*\(\$(?P<var>f\d+)\)
+#
+# A real findtext hit on this build is:
+#
+#   HIT 0x00000203094ddf60  name="Text"  parent="Settings Drop Down(Clone)"  \
+#   text="Interface language"  activeInHierarchy=true   ($f1)
+#
+# The field is `activeInHierarchy=`, not `active=`, so that optional group does
+# not match; the regex then requires `($fN)` immediately after `text="..."`,
+# finds `activeInHierarchy=true` in the way, and the WHOLE HIT FAILS TO MATCH.
+# `parse_find`/`parse_findtext` therefore return ZERO HITS for every findtext
+# answer that carries an active flag -- i.e. every one of them. Verified:
+# ch.parse_find(<the verbatim line above>)["hits"] == [].
+#
+# That is a confidently-wrong answer in a SHARED parser (the MCP
+# `inspect_findtext` tool reads the same function), and it is reported as a P0
+# rather than patched from here: channel.py is not this task's to change. This
+# local parser is deliberately narrow -- findtext hits only -- and additionally
+# keeps the field channel.py drops entirely, `activeInHierarchy`, which several
+# assertions below must have (fact #72: an inactive node is not pressable, and
+# placeholder text nothing renders is not a defect).
+_FT_HIT_RE = re.compile(
+    r'HIT\s+(?P<ptr>0x[0-9a-fA-F]+)\s+name="(?P<name>[^"]*)"'
+    r'(?:\s+parent="(?P<parent>[^"]*)")?'
+    r'(?:\s+text="(?P<text>[^"]*)")?'
+    r'(?:\s+activeInHierarchy=(?P<active>[Tt]rue|[Ff]alse|TRUE|FALSE))?'
+    # `.*?` and not `[^()]*`: an INACTIVE hit prints
+    # `activeInHierarchy=FALSE (unpressable)   ($f1)`, so the tail legitimately
+    # contains parentheses. No DOTALL, so this still cannot span lines.
+    r'.*?\(\$(?P<var>f\d+)\)')
+
+# The host's OWN positive control, printed in-band on every findtext report:
+#   predicate control: 225 node(s) carried a TextMeshProUGUI (of 1297 visited)
+#     -- the predicate demonstrably CAN answer yes on this subtree.
+_FT_CONTROL_RE = re.compile(
+    r'predicate control:\s*(?P<seen>\d+)\s+node\(s\) carried a '
+    r'TextMeshProUGUI\s*\(of\s*(?P<visited>\d+)\s+visited\)')
+
+
+def findtext_hits(raw):
+    """findtext hits off HOST-PRINTED lines only, with text and active state."""
+    out = []
+    for m in _FT_HIT_RE.finditer(host_text(raw)):
+        a = m.group("active")
+        out.append({"ptr": m.group("ptr"), "name": m.group("name"),
+                    "parent": m.group("parent"), "text": m.group("text"),
+                    "active": None if a is None else a.lower() == "true",
+                    "var": "$" + m.group("var")})
+    return out
+
+
+def findtext_control(raw):
+    """(tmp_seen, visited) from the host's own in-band predicate control, or
+    (None, None) if it did not print one.
+
+    This REPLACES the separate `findtext e` control walk that used to gate
+    every absence claim here. That walk cost a second full traversal and,
+    measured tonight, could not do its job anyway: `e` matches so much that the
+    search stops at the 24-match cap, so it reported HIT_CAP and every absence
+    claim came back INCONCLUSIVE on the control rather than on the evidence.
+    The in-band line is strictly better: it is measured on the SAME walk whose
+    absence is being claimed, so it cannot disagree with it."""
+    m = _FT_CONTROL_RE.search(host_text(raw))
+    if not m:
+        return None, None
+    return int(m.group("seen")), int(m.group("visited"))
+
+
 _ACT_RE = re.compile(r"^\s*(PASS|FAIL|INCONCLUSIVE):\s*(.*)$")
 
 
@@ -348,8 +428,8 @@ SCREEN_ASSERTION_NAMES = (
     "top-row stock tab count",
     "top-row mod tab clones",
     "no donor caption under MODS row clones",
-    "no placeholder text anywhere",
-    "cloned mods spawner: exactly one active toggle",
+    "no placeholder text on any RENDERED node",
+    "settings tab row group: exactly one toggle is ON",
     "postfx subtab strip under GRAPHICS",
     "postfx toggles share a group, one is on",
     "exactly one settings panel is active",
@@ -507,42 +587,93 @@ def ensure_settings_ready(report, live, args):
 # assertions
 # ---------------------------------------------------------------------------
 
-def _toggle_strip_children(live):
-    """(ptrs, names, note). The top-row tab strip is `Toggles`, the direct
-    child of SettingsScreen; its children are the tab spawners. Rooted at
-    $settings with WALK_BUDGET, which is EXHAUSTIVE in ~1263 nodes (measured
-    2026-09-02); the same search rootless STOPS EARLY and decides nothing."""
+def _toggle_strip_ptr(live):
+    """(ptr, note). The top-row tab strip is `Toggles`, the direct child of
+    SettingsScreen. Rooted at $settings with WALK_BUDGET, which is EXHAUSTIVE
+    (measured 2026-09-02: 7735 nodes, 18 hits); the same search rootless STOPS
+    EARLY and decides nothing."""
     _s, raw = ch.run_batch(["find Toggles %s %d" % (SETTINGS_ROOT, WALK_BUDGET)],
-                            live_dir=live, timeout=40)
+                            live_dir=live, timeout=90)
     ok, comp = trusted_walk(raw)
     if not ok:
-        return None, None, "the `find Toggles` walk was %s, not EXHAUSTIVE" % comp
+        return None, "the `find Toggles` walk was %s, not EXHAUSTIVE" % comp
     strip = [h for h in find_hits(raw)
              if h["name"] == "Toggles" and h["parent"] == "SettingsScreen"]
     if not strip:
         names = ", ".join(h["name"] for h in find_hits(raw)[:8]) or "none"
-        return None, None, ("the walk was EXHAUSTIVE but no node named exactly "
-                            "`Toggles` with parent `SettingsScreen` was in it "
-                            "(hits: %s)" % names)
-    _s, raw2 = ch.run_batch(["children %s" % strip[0]["ptr"]],
+        return None, ("the walk was EXHAUSTIVE but no node named exactly "
+                      "`Toggles` with parent `SettingsScreen` was in it "
+                      "(hits: %s)" % names)
+    return strip[0]["ptr"], ""
+
+
+def _toggle_strip_children(live):
+    """(strip_ptr, ptrs, names, note) -- the tab spawners, the strip's direct
+    children. The strip pointer comes back too so a caller that also needs the
+    tree does not pay for a second `find Toggles` walk (7735 nodes, ~60 frames
+    -- measured, and it was being issued twice per run)."""
+    strip, note = _toggle_strip_ptr(live)
+    if strip is None:
+        return None, None, None, note
+    _s, raw2 = ch.run_batch(["children %s" % strip],
                              live_dir=live, timeout=40)
     kids = ch.parse_children(host_text(raw2))
     if not kids["parse_ok"] or kids["child_count"] is None:
-        return None, None, ("`children %s` did not answer with a child list"
-                            % strip[0]["ptr"])
+        return None, None, None, ("`children %s` did not answer with a child "
+                                  "list" % strip)
     if any(k.get("unreadable") for k in kids["children"]):
-        return None, None, "one or more children of the tab strip were unreadable"
+        return None, None, None, ("one or more children of the tab strip were "
+                                  "unreadable")
     if kids["child_count"] != len(kids["children"]):
-        return None, None, ("childCount=%d but %d child line(s) were printed"
-                            % (kids["child_count"], len(kids["children"])))
-    return ([k["ptr"] for k in kids["children"]],
+        return None, None, None, ("childCount=%d but %d child line(s) were "
+                                  "printed" % (kids["child_count"],
+                                                len(kids["children"])))
+    return (strip, [k["ptr"] for k in kids["children"]],
             [k["name"] for k in kids["children"]], "")
 
 
-def assert_tab_count(report, live, mods_built):
+_PUBLISHED_RE = re.compile(
+    r'published\s+(?P<n>\d+)\s+of\s+(?P<total>\d+)\s+client-side settings '
+    r'page\(s\)')
+
+
+def published_pages(root):
+    """(n, total, note) -- how many client-side settings pages the HOST says it
+    published, from its own log line:
+
+      client settings bridge: published 8 of 8 client-side settings page(s)
+      to the backend
+
+    n is None when the line is absent, and the caller must then report
+    INCONCLUSIVE rather than fall back to a number. This exists because the
+    expected number of mod tab clones was HARDCODED here (`>= 1`), which is a
+    check that cannot fail: seven published pages and one clone would have
+    passed. The host already knows the answer; ask it.
+
+    The LAST occurrence wins -- the bridge re-publishes every 60s, and an early
+    line can legitimately say `published 0 of 8` before the pages are built.
+    """
+    ns = argparse.Namespace(root=os.path.join(root, "aowlspt"), backend=False)
+    try:
+        _p, lines = hostlog.read(ns)
+    except SystemExit:
+        return None, None, "the host log could not be read"
+    n = total = None
+    for row in hostlog.parse(lines):
+        m = _PUBLISHED_RE.search(row[2])
+        if m:
+            n, total = int(m.group("n")), int(m.group("total"))
+    if n is None:
+        return None, None, ("the host log has no `published N of M client-side "
+                            "settings page(s)` line, so the expected number of "
+                            "mod tab clones is not known")
+    return n, total, ""
+
+
+def assert_tab_count(report, live, mods_built, published=None, pub_note=""):
     """Stock top-row tabs, counted by NAME and by activeInHierarchy, with the
     names printed so the number can be checked rather than believed."""
-    ptrs, names, note = _toggle_strip_children(live)
+    _strip, ptrs, names, note = _toggle_strip_children(live)
     if ptrs is None:
         report.record("top-row stock tab count", INCONCLUSIVE, note)
         report.record("top-row mod tab clones", INCONCLUSIVE, note)
@@ -577,56 +708,108 @@ def assert_tab_count(report, live, mods_built):
                       "to compare against; %d active clone(s) observed"
                       % len(clones_on),
                       ", ".join(clones_on) or "none")
+    elif published is None:
+        # NOT a fallback to `>= 1`, which is what this used to assert: with a
+        # hardcoded floor of one, seven missing tabs pass.
+        report.record("top-row mod tab clones", INCONCLUSIVE,
+                      "%d active clone(s), but the expected count is not known: "
+                      "%s" % (len(clones_on), pub_note),
+                      ", ".join(clones_on) or "none")
     else:
-        v = PASS if len(clones_on) >= 1 else FAIL
+        v = PASS if len(clones_on) == published else FAIL
         report.record("top-row mod tab clones", v,
-                      "%d active clone(s)" % len(clones_on),
+                      "%d active clone(s), want %d (host log: published %d "
+                      "client-side settings page(s))"
+                      % (len(clones_on), published, published),
                       ", ".join(clones_on) or "none")
 
 
 def _findtext(live, needle, timeout=60):
-    return ch.run_batch(["findtext %s %s %d all" % (needle, SETTINGS_ROOT,
-                                                     WALK_BUDGET)],
+    """`findtext` with the needle QUOTED. This is the bug that made every
+    text assertion here undecidable, measured 2026-09-02.
+
+    `findtext SUBSTR [ROOT] [BUDGET] [all]` takes ONE token as the needle
+    (inspect.nim iCmdFindText, ~3193: `let want = ftoks[1]`). Sending
+    `findtext Interface language $settings 40000 all` unquoted therefore
+    searched for "Interface" and handed `language` to iFindResolveRoot AS THE
+    ROOT; that is not a live pointer, so the command was refused and the reply
+    carried no walk verdict at all -- which is exactly the
+    `walk was UNKNOWN, not EXHAUSTIVE` that both text assertions printed. The
+    needle was never searched for. `PLACEHOLDER_TEXT` ("SOME TEXT") had the
+    same shape.
+
+    iSplit (inspect.nim ~619) keeps a double-quoted run together, so the fix is
+    to quote. A needle containing a quote cannot be expressed in that grammar,
+    so it is REFUSED here rather than sent to be mis-split."""
+    if '"' in needle:
+        raise ValueError(
+            "findtext needle %r contains a double quote; the inspector's "
+            "tokenizer cannot express that and would silently re-split the "
+            "command line into different arguments" % needle)
+    return ch.run_batch(['findtext "%s" %s %d all' % (needle, SETTINGS_ROOT,
+                                                       WALK_BUDGET)],
                          live_dir=live, timeout=timeout)[1]
 
 
 def assert_no_text(report, live, name, needle):
     """An ABSENCE claim, so it needs a POSITIVE CONTROL or it passes vacuously.
 
-    MEASURED 2026-09-02 on the live client: `findtext e $settings 40000 all`
-    visited all 1263 nodes of an open Settings screen full of captions and
-    reported `0 match(es) ... genuinely NOT PRESENT`. findtext cannot read
-    text on this build, so EVERY absence it reports here is vacuous. Without
-    this control the two assertions below would both print PASS and mean
-    nothing at all -- exactly the failure CLAUDE.md 9b names.
-    """
-    ctl_raw = _findtext(live, FINDTEXT_CONTROL)
-    ok, comp = trusted_walk(ctl_raw)
-    if not ok:
-        report.record(name, INCONCLUSIVE,
-                      "positive control `findtext %s` walk was %s, not "
-                      "EXHAUSTIVE" % (FINDTEXT_CONTROL, comp))
-        return
-    if not find_hits(ctl_raw):
-        report.record(name, INCONCLUSIVE,
-                      "POSITIVE CONTROL FAILED: `findtext %s` found 0 TMP "
-                      "text under an open Settings screen, so findtext is not "
-                      "reading text on this build and its absence verdicts "
-                      "prove nothing" % FINDTEXT_CONTROL)
-        return
+    The control is now the host's OWN in-band `predicate control:` line, taken
+    from the same walk (see findtext_control) rather than a second `findtext e`
+    traversal -- that one could never pass, because `e` stops at the 24-match
+    cap and a HIT_CAP control was treated as no control at all.
 
+    ACTIVE-ONLY VERDICT, stated rather than assumed. The walk is issued with
+    `all` so the evidence is complete, but only hits on nodes that
+    `activeInHierarchy=true` can decide FAIL. Measured 2026-09-02: `findtext
+    "SOME TEXT" $settings 40000 all` is EXHAUSTIVE with TWELVE hits, and every
+    one of them is `activeInHierarchy=FALSE` -- the stock donor prefabs
+    (`AnimatedToggle`/`SizeLabel`) ship carrying the placeholder and nothing
+    renders them. Failing on those would be failing on the game's own assets;
+    the inactive count is printed instead so it can never vanish silently.
+    """
     raw = _findtext(live, needle, timeout=90)
+    seen, visited = findtext_control(raw)
+    if seen is None:
+        report.record(name, INCONCLUSIVE,
+                      "the reply carried no in-band `predicate control:` line, "
+                      "so it is not known that findtext could read ANY text on "
+                      "this walk; an absence from it proves nothing")
+        return
+    if seen == 0:
+        report.record(name, INCONCLUSIVE,
+                      "POSITIVE CONTROL FAILED: 0 of %s visited node(s) carried "
+                      "a TextMeshProUGUI, so the predicate never had anything "
+                      "to match and its 'not present' means nothing" % visited)
+        return
     ok, comp = trusted_walk(raw)
     if not ok:
         report.record(name, INCONCLUSIVE,
-                      "walk was %s, not EXHAUSTIVE -- absence not provable" % comp)
+                      "walk was %s, not EXHAUSTIVE -- absence not provable"
+                      % comp)
         return
-    hits = find_hits(raw)
+    hits = findtext_hits(raw)
     f = ch.parse_findtext(host_text(raw))
-    v = FAIL if hits else PASS
-    report.record(name, v, "%d occurrence(s) of %r, scope=%s"
-                  % (len(hits), needle, f["scope"]),
-                  "; ".join("%s@%s" % (h["name"], h["ptr"]) for h in hits[:5]))
+    unknown = [h for h in hits if h["active"] is None]
+    if unknown:
+        report.record(name, INCONCLUSIVE,
+                      "%d of %d hit(s) printed no activeInHierarchy flag, so it "
+                      "is not known whether anything renders them"
+                      % (len(unknown), len(hits)),
+                      "; ".join("%s@%s" % (h["name"], h["ptr"])
+                                for h in unknown[:5]))
+        return
+    live_hits = [h for h in hits if h["active"]]
+    dead = [h for h in hits if not h["active"]]
+    v = FAIL if live_hits else PASS
+    report.record(name, v,
+                  "%d rendered occurrence(s) of %r (+%d on inactive, "
+                  "unrendered nodes), scope=%s, control %d TMP of %s visited"
+                  % (len(live_hits), needle, len(dead), f["scope"], seen,
+                     visited),
+                  "; ".join("%s under %s @%s" % (h["name"], h["parent"],
+                                                  h["ptr"])
+                             for h in (live_hits or dead)[:5]))
 
 
 CLONE_MARK = "(Clone)(Clone)"
@@ -667,14 +850,21 @@ def assert_no_donor_caption_on_clones(report, live, mods_built):
         return
 
     raw = _findtext(live, DONOR_CAPTION, timeout=90)
-    ok, comp = trusted_walk(raw)
-    if not ok:
-        report.record(name, INCONCLUSIVE,
-                      "walk was %s, not EXHAUSTIVE -- an absence under the "
-                      "clones is not provable from it" % comp)
-        return
-    hits = find_hits(raw)
+    hits = findtext_hits(raw)
     f = ch.parse_findtext(host_text(raw))
+    _ok, comp = trusted_walk(raw)
+
+    # COMPLETENESS IS ONLY NEEDED FOR THE NEGATIVE. A hit under a clone is a
+    # hit: it decides FAIL no matter how the walk ended. Measured 2026-09-02,
+    # this walk really does end HIT_CAP (24 matches is the cap and this needle
+    # alone produces 24), so requiring EXHAUSTIVE before looking at the hits --
+    # which is what this used to do -- threw away a decisive positive and
+    # printed INCONCLUSIVE on a screen that was visibly wrong.
+    if not hits and comp != "EXHAUSTIVE":
+        report.record(name, INCONCLUSIVE,
+                      "walk was %s, not EXHAUSTIVE, and it found nothing -- an "
+                      "absence under the clones is not provable from it" % comp)
+        return
 
     if not hits:
         report.record(name, INCONCLUSIVE,
@@ -699,48 +889,187 @@ def assert_no_donor_caption_on_clones(report, live, mods_built):
     ours = [h for h in hits if CLONE_MARK in h["parent"]]
     stock = [h for h in hits if CLONE_MARK not in h["parent"]]
     detail = "; ".join("%s under %s @%s" % (h["name"], h["parent"], h["ptr"])
-                       for h in ours[:5])
-    verdict = FAIL if ours else PASS
-    report.record(name, verdict,
-                  "%d hit(s) of %r, scope=%s: %d under %s (must be 0), %d "
-                  "stock (positive control, must be >0)"
-                  % (len(hits), DONOR_CAPTION, f["scope"], len(ours),
-                     CLONE_MARK, len(stock)),
-                  detail)
+                       for h in (ours or stock)[:5])
+    measured = ("%d hit(s) of %r, walk %s, scope=%s: %d under %s (must be 0), "
+                "%d stock (positive control, must be >0)"
+                % (len(hits), DONOR_CAPTION, comp, f["scope"], len(ours),
+                   CLONE_MARK, len(stock)))
+    if ours:
+        report.record(name, FAIL, measured, detail)
+    elif not stock:
+        report.record(name, INCONCLUSIVE, measured,
+                      "every hit sits under a clone-of-a-clone and none under "
+                      "the STOCK row, so the positive control that makes a "
+                      "zero meaningful is missing")
+    elif comp != "EXHAUSTIVE":
+        # 0 under the clones, but the walk stopped: the very next unvisited
+        # node could have been one. A capped walk cannot carry a negative.
+        report.record(name, INCONCLUSIVE, measured,
+                      "0 under %s, but the walk ended %s -- `findtext more` "
+                      "would be needed before that zero means anything"
+                      % (CLONE_MARK, comp))
+    else:
+        report.record(name, PASS, measured, detail)
 
 
-def assert_spawner_one_active_toggle(report, live, mods_built):
-    """The cloned MODS spawner. There is nothing to assert about it when the
-    mods tab was not built into the deploy, and saying PASS in that case would
-    be a check that cannot fail."""
-    if not mods_built:
-        report.record("cloned mods spawner: exactly one active toggle",
-                      INCONCLUSIVE,
-                      "mods_built=False -- the mods tab clone is not in this "
-                      "deploy, so nothing was looked at")
-        return
-    ptrs, names, note = _toggle_strip_children(live)
+# UnityEngine.UI.Toggle field offsets. NOT guessed and not taken from a
+# comment: measured offline on this build with
+#   python tools/fldoff.py field UnityEngine.UI.Toggle m_IsOn   -> 0x120
+#   python tools/fldoff.py field UnityEngine.UI.Toggle m_Group  -> 0x110
+# (fldoff self-checks System.String._stringLength@0x10 before answering).
+TOGGLE_TYPE = "UnityEngine.UI.Toggle"
+TOGGLE_ISON_OFF = 0x120
+
+_COMP_FOUND_RE = re.compile(
+    r'FOUND\s+(?P<type>[\w.]+)\s+component\s*=\s*(?P<ptr>0x[0-9a-fA-F]+)\s+'
+    r'klass=(?P<klass>0x[0-9a-fA-F]+)')
+_READ_AT_RE = re.compile(
+    r'^\s*(?P<addr>0x[0-9a-fA-F]+)\s+as\s+(?P<type>\w+)\s*=\s*(?P<val>\S+)')
+
+
+def read_toggle_ison(live, node_ptr, timeout=40):
+    """(True / False / None, note) -- Toggle.m_IsOn on `node_ptr`.
+
+    None is INCONCLUSIVE and is never collapsed to False. The two ways this
+    goes wrong are both checked, not assumed:
+
+    * the object may have no Toggle at all. `component` then prints an `iErr`
+      line (`GetComponent(Type) returned NULL -- an ANSWER`), which
+      parse_component reports as not-found. Measured shape recorded as fixture
+      `component-toggle-absent`.
+    * `$comp` STALENESS. A failed `component` has historically left `$comp`
+      holding the PREVIOUS batch's pointer, so the following `read $comp+0x120`
+      answers about a different object entirely -- a confidently wrong value.
+      Defeated arithmetically rather than by trust: the inspector prints the
+      ADDRESS it read, and it must equal comp + 0x120 exactly.
+
+    The fully-qualified type name is deliberate: bare `Toggle` falls back to
+    GetComponent(String) (the host says so), while `UnityEngine.UI.Toggle`
+    resolves offline to an Il2CppType and matches by KLASS IDENTITY -- which is
+    what makes the 0x120 offset the right offset for whatever came back.
+    """
+    _s, raw = ch.run_batch(["component %s %s" % (node_ptr, TOGGLE_TYPE),
+                            "read $comp+0x%x bool" % TOGGLE_ISON_OFF],
+                           live_dir=live, timeout=timeout)
+    h = host_text(raw)
+    if not ch.parse_component(h)["found"]:
+        return None, ("no %s component on %s (or the lookup was refused)"
+                      % (TOGGLE_TYPE, node_ptr))
+    fm = _COMP_FOUND_RE.search(h)
+    if not fm:
+        return None, "the FOUND line for %s could not be parsed" % node_ptr
+    reads = [m for m in (_READ_AT_RE.match(l) for l in h.splitlines()) if m]
+    if len(reads) != 1:
+        return None, ("expected exactly one `read` answer for %s, got %d"
+                      % (node_ptr, len(reads)))
+    r = reads[0]
+    want_addr = int(fm.group("ptr"), 16) + TOGGLE_ISON_OFF
+    if int(r.group("addr"), 16) != want_addr:
+        return None, ("the read answered about 0x%x but the component found "
+                      "for %s is at %s, whose m_IsOn is 0x%x -- refusing to "
+                      "attribute one object's field to another"
+                      % (int(r.group("addr"), 16), node_ptr, fm.group("ptr"),
+                         want_addr))
+    if r.group("type") != "bool" or r.group("val") not in ("true", "false"):
+        return None, ("m_IsOn read back as %s %r, not a bool"
+                      % (r.group("type"), r.group("val")))
+    return r.group("val") == "true", ""
+
+
+def _toggle_hosts(live, strip, spawner_ptrs, spawner_names):
+    """[(name, toggle_host_ptr)] for each tab spawner, or (None, note).
+
+    The Toggle component is NOT on the spawner: measured, each spawner has
+    exactly one child (`GameToggle`, `GameToggle(Clone)`, ...) and the Toggle
+    lives there. One `tree <strip> 2` answers for all of them at once.
+
+    parse_tree exposes no depth, so the spawner/child pairing is not assumed
+    from indentation -- it is CHECKED three ways, and any disagreement is a
+    refusal rather than a guess: the node count must be 1 + 2*N, every spawner
+    slot must report exactly `(1 child)`, and the spawner slots' pointers must
+    equal, in order, the pointers `children` independently reported.
+    """
+    _s, raw = ch.run_batch(["tree %s 2" % strip], live_dir=live, timeout=60)
+    t = ch.parse_tree(host_text(raw))
+    if not t["parse_ok"] or not t["complete"]:
+        return None, "`tree %s 2` did not print a complete tree" % strip
+    nodes = t["nodes"]
+    n = len(spawner_ptrs)
+    if len(nodes) != 1 + 2 * n:
+        return None, ("`tree %s 2` printed %d node(s); %d spawner(s) each with "
+                      "one child would print %d, so the parent/child pairing "
+                      "cannot be read off positionally"
+                      % (strip, len(nodes), n, 1 + 2 * n))
+    out = []
+    for i in range(n):
+        sp, kid = nodes[1 + 2 * i], nodes[2 + 2 * i]
+        if sp["ptr"] != spawner_ptrs[i] or sp["name"] != spawner_names[i]:
+            return None, ("tree slot %d is %s@%s but `children` reported %s@%s "
+                          "there -- the two views disagree"
+                          % (i, sp["name"], sp["ptr"], spawner_names[i],
+                             spawner_ptrs[i]))
+        if sp["child_count"] != 1:
+            return None, ("%s reports %s child(ren), not 1, so its Toggle host "
+                          "is not the next line" % (sp["name"],
+                                                    sp["child_count"]))
+        out.append((sp["name"], kid["ptr"]))
+    return out, ""
+
+
+def assert_row_group_one_on(report, live, expected_clones):
+    """EXACTLY ONE toggle in the top-row tab group is ON.
+
+    WHAT THIS USED TO CHECK, AND WHY THAT WAS WRONG (measured 2026-09-02):
+    it read `activeInHierarchy` of the 8 `GameToggleSpawner(Clone)` objects and
+    FAILED with `8 of 8 clone(s) active`. All 8 are legitimately active -- they
+    are the 8 top-row tab BUTTONS for the 8 pages the host publishes (`client
+    settings bridge: published 8 of 8 client-side settings page(s)`), and a tab
+    button you cannot see is a tab you cannot press. Selection is not
+    visibility: it is `Toggle.m_IsOn`.
+
+    It is also asserted over the WHOLE ROW GROUP, stock tabs included, not over
+    the clones alone. Measured: the 13 toggles (5 stock + 8 clones) all share
+    one ToggleGroup, `m_Group` = 0x0000020244f84a80 on every one of them, and
+    the single ON toggle was the STOCK `GameToggleSpawner`. "Exactly one of the
+    clones is on" is therefore false whenever a stock tab is selected -- which
+    is the normal state -- so it could only ever have failed.
+    """
+    name = "settings tab row group: exactly one toggle is ON"
+    strip, ptrs, names, note = _toggle_strip_children(live)
     if ptrs is None:
-        report.record("cloned mods spawner: exactly one active toggle",
-                      INCONCLUSIVE, note)
+        report.record(name, INCONCLUSIVE, note)
         return
-    idx = [i for i, n in enumerate(names) if "(Clone)" in n]
-    if not idx:
-        report.record("cloned mods spawner: exactly one active toggle", FAIL,
-                      "mods_built=True but the tab strip has no `(Clone)` child",
-                      ", ".join(names))
+    members, note = _toggle_hosts(live, strip, ptrs, names)
+    if members is None:
+        report.record(name, INCONCLUSIVE, note)
         return
-    acts = active_states(live, [ptrs[i] for i in idx])
-    if acts is None or None in acts:
-        report.record("cloned mods spawner: exactly one active toggle",
-                      INCONCLUSIVE,
-                      "activeInHierarchy unknown for at least one clone")
+
+    states = []
+    for nm, host_ptr in members:
+        val, why = read_toggle_ison(live, host_ptr)
+        states.append((nm, host_ptr, val, why))
+
+    unknown = [(nm, why) for nm, _p, v, why in states if v is None]
+    if unknown:
+        report.record(name, INCONCLUSIVE,
+                      "Toggle.m_IsOn@0x%x could not be trusted for %d of %d "
+                      "toggle(s), so the count of ON is unknown"
+                      % (TOGGLE_ISON_OFF, len(unknown), len(states)),
+                      "; ".join("%s: %s" % (nm, why) for nm, why in unknown[:3]))
         return
-    got = sum(1 for a in acts if a)
-    v = PASS if got == 1 else FAIL
-    report.record("cloned mods spawner: exactly one active toggle", v,
-                  "%d of %d clone(s) active" % (got, len(idx)),
-                  ", ".join(names[i] for i in idx))
+
+    on = [nm for nm, _p, v, _w in states if v]
+    clones = [nm for nm, _p, _v, _w in states if "(Clone)" in nm]
+    clone_note = ("%d clone(s)" % len(clones)) if expected_clones is None else (
+        "%d clone(s), host log published %d page(s)"
+        % (len(clones), expected_clones))
+    v = PASS if len(on) == 1 else FAIL
+    report.record(name, v,
+                  "%d of %d toggle(s) in the group are ON (m_IsOn@0x%x), want "
+                  "exactly 1" % (len(on), len(states), TOGGLE_ISON_OFF),
+                  "ON: %s | group: %d stock + %s"
+                  % (", ".join(on) or "none", len(states) - len(clones),
+                     clone_note))
 
 
 def assert_postfx_subtab(report, live):
@@ -748,12 +1077,20 @@ def assert_postfx_subtab(report, live):
     child of `Graphics Settings`. Falsifiable: it is absent, or it has fewer
     than two subtabs, and this FAILS.
 
-    The m_Group@0x110 / m_IsOn@0x120 half of the old assertion is NOT
-    performed and is reported as such -- reaching a `Toggle` component needs
-    the `component` verb, and MEASURED 2026-09-02 that verb FAULTED 5 times
-    out of 5 on this build (`GameObject::GetComponent(String)` @0x2a8510),
-    each fault spending one of the inspector's 8 per-session fault budget.
-    Running it here would disable the inspector mid-run.
+    The m_Group@0x110 / m_IsOn@0x120 half of the old assertion is still NOT
+    performed, but NOT for the reason this docstring used to give. It said the
+    `component` verb FAULTED 5/5 on this build and would burn the inspector's
+    8-fault session budget. RE-MEASURED 2026-09-02: `component <ptr>
+    UnityEngine.UI.Toggle` was issued ~30 times against this live screen with
+    ZERO faults -- the fully-qualified name takes the GetComponent(System.Type)
+    klass-identity route, not the GetComponent(String) one that verdict came
+    from. read_toggle_ison() below now depends on it working.
+
+    What is genuinely missing is the wiring: the strip's 4 children each carry
+    their Toggle on an `AnimatedToggle` child (measured), so this needs the
+    same tree-pairing + per-toggle read that assert_row_group_one_on does, plus
+    its own recorded fixtures and negative controls. Until that exists it stays
+    INCONCLUSIVE and says so; a stale excuse is not better than no excuse.
     """
     _s, raw = ch.run_batch(["tree %s 2" % SETTINGS_ROOT], live_dir=live,
                             timeout=40)
@@ -790,9 +1127,10 @@ def assert_postfx_subtab(report, live):
                       "subtab strip present with %s child(ren)" % nsub,
                       strip[0]["ptr"])
     report.record("postfx toggles share a group, one is on", INCONCLUSIVE,
-                  "NOT PERFORMED: reading Toggle.m_Group@0x110 needs the "
-                  "`component` verb, which FAULTED 5/5 on this build and "
-                  "spends the inspector's 8-fault session budget")
+                  "NOT PERFORMED: this needs a per-subtab Toggle read that is "
+                  "not wired up yet (the strip's 4 children each hold their "
+                  "Toggle on one `AnimatedToggle` child, measured 2026-09-02) "
+                  "-- it is not a pass and nothing about the group was checked")
 
 
 def assert_one_panel_active(report, live):
@@ -917,11 +1255,12 @@ def run_screen_assertions(report, live, args, ready, reason):
         for nm in SCREEN_ASSERTION_NAMES:
             report.record(nm, INCONCLUSIVE, "NOT PERFORMED: %s" % reason)
         return
-    assert_tab_count(report, live, args.mods_built)
+    published, _total, pub_note = published_pages(args.root)
+    assert_tab_count(report, live, args.mods_built, published, pub_note)
     assert_no_donor_caption_on_clones(report, live, args.mods_built)
-    assert_no_text(report, live, "no placeholder text anywhere",
+    assert_no_text(report, live, "no placeholder text on any RENDERED node",
                    PLACEHOLDER_TEXT)
-    assert_spawner_one_active_toggle(report, live, args.mods_built)
+    assert_row_group_one_on(report, live, published)
     assert_postfx_subtab(report, live)
     assert_one_panel_active(report, live)
 
@@ -1073,7 +1412,7 @@ def _declared_screen_assertion_names():
     import inspect as _pyinspect
     names = set()
     for fn in (assert_tab_count, assert_no_donor_caption_on_clones,
-               assert_spawner_one_active_toggle, assert_postfx_subtab,
+               assert_row_group_one_on, assert_postfx_subtab,
                assert_one_panel_active):
         src = _pyinspect.getsource(fn)
         names |= set(re.findall(r'report\.record\(\s*"([^"]+)"', src))
@@ -1223,6 +1562,241 @@ def cmd_selftest(_args):
           ("children", [FX_TOGGLES_CHILDREN]),
           ("assert-active",
            [_fx_active_batch([True, True, True, True, False])])], c6)
+
+    # --- 7-10. THE DONOR CAPTION ON THE ROW CLONES. ------------------------
+    #     Replayed from `findtext-clones-donor-caption`, which is the VERBATIM
+    #     answer to `findtext "Interface language" $settings 40000 all` on a
+    #     live screen: 24 hits, 2 under the stock `Settings Drop Down(Clone)`
+    #     and 22 under our `(Clone)(Clone)` rows, and the walk ends HIT_CAP.
+    #     Before today this assertion issued the needle UNQUOTED, so the client
+    #     never searched for it at all and the run printed
+    #     `walk was UNKNOWN, not EXHAUSTIVE`.
+    FT_DONOR = _fixtures.fx("findtext-clones-donor-caption")
+    FT_PLACEHOLDER = _fixtures.fx("findtext-placeholder-inactive-only")
+    DONOR_NAME = "no donor caption under MODS row clones"
+    PLACEHOLDER_NAME = "no placeholder text on any RENDERED node"
+
+    CAP_TRAILER = ("  -- stopped at the match cap (24). There may be more; "
+                   "`findtext more` continues from the frontier above.")
+    EXH_TRAILER = ("  -- the subtree was searched EXHAUSTIVELY. Every match "
+                   "is listed above.")
+
+    # The two controls below are DERIVED from measured text, not written: one
+    # deletes whole HIT lines, the other swaps one measured trailer for
+    # another measured trailer. Every character in them was emitted by the
+    # host; only the selection is ours, and that is said out loud here because
+    # a fixture nobody can trace is not evidence.
+    def _no_clone_hits(text):
+        return "\n".join(l for l in text.splitlines() if CLONE_MARK not in l)
+
+    if CAP_TRAILER not in FT_DONOR or EXH_TRAILER not in FT_PLACEHOLDER:
+        failures.append("the recorded findtext trailers no longer read as this "
+                        "selftest expects; re-harvest the fixtures")
+
+    def c7(rep, _rp):
+        assert_no_donor_caption_on_clones(rep, "X", True)
+        if _verdicts(rep).get(DONOR_NAME) != FAIL:
+            return "22 donor captions under the row clones did not FAIL"
+        m = [r for r in rep.rows if r[0] == DONOR_NAME][0][2]
+        if "22 under (Clone)(Clone)" not in m or "2 stock" not in m:
+            return "hits were not counted by parent: %r" % m
+        return ""
+    case("donor caption: 22 under (Clone)(Clone), 2 stock, HIT_CAP -> FAIL",
+         [('findtext "Interface language"', [FT_DONOR])], c7)
+
+    def c8(rep, _rp):
+        assert_no_donor_caption_on_clones(rep, "X", True)
+        if _verdicts(rep).get(DONOR_NAME) != PASS:
+            return ("0 under the clones + 2 stock hits + an EXHAUSTIVE walk did "
+                    "not PASS: %r"
+                    % [r for r in rep.rows if r[0] == DONOR_NAME][0][2])
+        return ""
+    case("control: 0 under clones, stock present, EXHAUSTIVE -> PASS",
+         [('findtext "Interface language"',
+           [_no_clone_hits(FT_DONOR).replace(CAP_TRAILER, EXH_TRAILER)])], c8)
+
+    def c9(rep, _rp):
+        assert_no_donor_caption_on_clones(rep, "X", True)
+        v = _verdicts(rep).get(DONOR_NAME)
+        if v == PASS:
+            return ("a walk that STOPPED AT THE MATCH CAP was allowed to prove "
+                    "an absence")
+        if v != INCONCLUSIVE:
+            return "expected INCONCLUSIVE on a capped walk, got %s" % v
+        return ""
+    case("control: 0 under clones but the walk was CAPPED -> INCONCLUSIVE",
+         [('findtext "Interface language"', [_no_clone_hits(FT_DONOR)])], c9)
+
+    print("\n---- parser: findtext HIT lines (channel.py's _HIT_RE cannot)")
+    hits = findtext_hits(FT_DONOR)
+    chan = ch.parse_find(host_text(FT_DONOR))["hits"]
+    if len(hits) != 24:
+        failures.append("findtext_hits parsed %d of 24 measured HIT lines"
+                        % len(hits))
+    elif any(h["parent"] is None or h["active"] is None or not h["text"]
+             for h in hits):
+        failures.append("a parsed hit is missing parent/text/activeInHierarchy")
+    else:
+        print("  case ok (24 hits, all with parent + text + active; the shared "
+              "channel.py parser returns %d on the same text)" % len(chan))
+
+    # --- 11-12. PLACEHOLDER TEXT, decided on RENDERED nodes only. ----------
+    def c11(rep, _rp):
+        assert_no_text(rep, "X", PLACEHOLDER_NAME, PLACEHOLDER_TEXT)
+        v = _verdicts(rep).get(PLACEHOLDER_NAME)
+        if v != PASS:
+            return ("12 hits that are ALL activeInHierarchy=FALSE are donor "
+                    "prefabs nothing renders; expected PASS, got %s (%r)"
+                    % (v, [r for r in rep.rows if r[0] == PLACEHOLDER_NAME][0][2]))
+        m = [r for r in rep.rows if r[0] == PLACEHOLDER_NAME][0][2]
+        if "+12 on inactive" not in m:
+            return "the inactive hits were not counted out loud: %r" % m
+        return ""
+    case("placeholder: 12 hits, all on INACTIVE donors -> PASS, counted",
+         [('findtext "SOME TEXT"', [FT_PLACEHOLDER])], c11)
+
+    def c12(rep, _rp):
+        assert_no_text(rep, "X", PLACEHOLDER_NAME, PLACEHOLDER_TEXT)
+        if _verdicts(rep).get(PLACEHOLDER_NAME) != FAIL:
+            return "a placeholder on a RENDERED node did not FAIL"
+        return ""
+    case("control: one placeholder hit is activeInHierarchy=true -> FAIL",
+         [('findtext "SOME TEXT"',
+           [FT_PLACEHOLDER.replace("activeInHierarchy=FALSE (unpressable)",
+                                    "activeInHierarchy=true", 1)])], c12)
+
+    # --- 13-17. THE TAB ROW GROUP. -----------------------------------------
+    #     Every batch here is a verbatim capture of ONE live screen: the strip
+    #     walk, its 13 children, the depth-2 tree that says which node carries
+    #     each Toggle, and one `component + read $comp+0x120` per toggle. On
+    #     that screen exactly one toggle is ON and it is a STOCK one, while all
+    #     8 clones are activeInHierarchy=true -- which is precisely why the old
+    #     assertion (`exactly one of the 8 clones is ACTIVE`) reported
+    #     `[FAIL] 8 of 8 clone(s) active` about a correct screen.
+    STRIP = [("find Toggles", [_fixtures.fx("find-toggles-strip-with-clones")]),
+             ("children 0x000002024b079ee0",
+              [_fixtures.fx("children-toggle-strip")]),
+             ("tree 0x000002024b079ee0 2",
+              [_fixtures.fx("tree-toggle-strip-depth2")])]
+
+    def _toggle_batches(swap=None):
+        """One script entry per measured toggle, keyed on its own command.
+        `swap` replaces slot N's answer with another fixture -- that is how the
+        negative controls are built, from measured text only."""
+        ents = sorted((e for e in _fixtures.load().entries
+                       if e.eid.startswith("toggle-ison-")),
+                      key=lambda e: e.eid)
+        if len(ents) != 13:
+            failures.append("expected 13 toggle-ison-* fixtures, found %d"
+                            % len(ents))
+        out = []
+        for i, e in enumerate(ents):
+            body = e.output
+            if swap and i in swap:
+                body = _fixtures.fx(swap[i])
+            out.append((e.command, [body]))
+        return out
+
+    GROUP_NAME = "settings tab row group: exactly one toggle is ON"
+
+    def c13(rep, _rp):
+        assert_row_group_one_on(rep, "X", 8)
+        v = _verdicts(rep).get(GROUP_NAME)
+        m = [r for r in rep.rows if r[0] == GROUP_NAME][0][2]
+        if v != PASS:
+            return "one ON toggle in a 13-strong group did not PASS: %s %r" % (v, m)
+        if "1 of 13" not in m:
+            return "the ON count was not stated: %r" % m
+        d = [r for r in rep.rows if r[0] == GROUP_NAME][0][3]
+        if "published 8" not in d:
+            return "the clone count was not tied to the host log: %r" % d
+        return ""
+    case("row group: 13 toggles, exactly one ON (a STOCK one) -> PASS",
+         STRIP + _toggle_batches(), c13)
+
+    def c14(rep, _rp):
+        assert_row_group_one_on(rep, "X", 8)
+        if _verdicts(rep).get(GROUP_NAME) != FAIL:
+            return "two toggles ON at once did not FAIL"
+        return ""
+    case("control: a second toggle reads m_IsOn=true -> FAIL",
+         STRIP + _toggle_batches(swap={5: "toggle-ison-00-true"}), c14)
+
+    def c15(rep, _rp):
+        assert_row_group_one_on(rep, "X", 8)
+        v = _verdicts(rep).get(GROUP_NAME)
+        if v == FAIL:
+            return ("an UNREADABLE m_IsOn was counted as a failure -- 'I could "
+                    "not look' is not 'the condition does not hold'")
+        if v != INCONCLUSIVE:
+            return "expected INCONCLUSIVE, got %s" % v
+        return ""
+    case("control: one toggle has no Toggle component -> INCONCLUSIVE, not FAIL",
+         STRIP + _toggle_batches(swap={7: "component-toggle-absent"}), c15)
+
+    def c16(rep, _rp):
+        assert_row_group_one_on(rep, "X", 8)
+        v = _verdicts(rep).get(GROUP_NAME)
+        if v != INCONCLUSIVE:
+            return ("`children` and `tree` disagreed about the strip and the "
+                    "assertion still returned %s" % v)
+        return ""
+    case("control: children and tree disagree -> INCONCLUSIVE",
+         [("find Toggles", [_fixtures.fx("find-toggles-strip-with-clones")]),
+          ("children 0x000002024b079ee0", [_fixtures.fx("children-ok")]),
+          ("tree 0x000002024b079ee0 2",
+           [_fixtures.fx("tree-toggle-strip-depth2")])], c16)
+
+    # --- 17-19. THE CLONE COUNT COMES FROM THE HOST LOG, not from a want. --
+    TABS = [("find Toggles", [_fixtures.fx("find-toggles-strip-with-clones")]),
+            ("children 0x000002024b079ee0",
+             [_fixtures.fx("children-toggle-strip")]),
+            ("assert-active", [_fixtures.fx("assert-active-toggle-strip")])]
+    CLONES_NAME = "top-row mod tab clones"
+
+    def c17(rep, _rp):
+        assert_tab_count(rep, "X", True, 8, "")
+        if _verdicts(rep).get("top-row stock tab count") != PASS:
+            return "4 active stock tabs (PostFx inactive by design) did not PASS"
+        if _verdicts(rep).get(CLONES_NAME) != PASS:
+            return "8 active clones against 8 published pages did not PASS"
+        return ""
+    case("tab clones: 8 active, host log published 8 -> PASS", TABS, c17)
+
+    def c18(rep, _rp):
+        assert_tab_count(rep, "X", True, 9, "")
+        if _verdicts(rep).get(CLONES_NAME) != FAIL:
+            return ("8 clones against 9 published pages did not FAIL -- the "
+                    "published number is not actually driving the verdict")
+        return ""
+    case("control: 8 active clones, host log published 9 -> FAIL", TABS, c18)
+
+    def c19(rep, _rp):
+        assert_tab_count(rep, "X", True, None, "the host log has no such line")
+        v = _verdicts(rep).get(CLONES_NAME)
+        if v != INCONCLUSIVE:
+            return ("with no published-count line the clone check reported %s; "
+                    "it must not fall back to a hardcoded want" % v)
+        return ""
+    case("control: no published-count line -> INCONCLUSIVE, no fallback want",
+         TABS, c19)
+
+    # --- 20. the published-count regex, against the measured log line. ------
+    print("\n---- published_pages: the host's own line")
+    LINE = ("client settings bridge: published 8 of 8 client-side settings "
+            "page(s) to the backend")
+    m = _PUBLISHED_RE.search(LINE)
+    if not m or (int(m.group("n")), int(m.group("total"))) != (8, 8):
+        failures.append("_PUBLISHED_RE does not read the measured host line %r"
+                        % LINE)
+        print("  ** CASE FAILED: %s" % failures[-1])
+    elif _PUBLISHED_RE.search("published 8 of 8 pages"):
+        failures.append("_PUBLISHED_RE matches an unrelated 'published N of M' "
+                        "line, so another feature's log line could set the "
+                        "expected tab count")
+        print("  ** CASE FAILED: %s" % failures[-1])
+    else:
+        print("  case ok (8 of 8, and a non-settings line does not match)")
 
     ch.run_batch, time.sleep = real_run_batch, real_sleep
 

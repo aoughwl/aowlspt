@@ -1,0 +1,212 @@
+# MEASURED live-inspector output -- `component` + `read $comp+0x120 bool`, the
+# pair that reads UnityEngine.UI.Toggle.m_IsOn. Same rules as every other file
+# here: each OUTPUT block is VERBATIM host text, never edited by hand.
+#
+# The 13 `toggle-ison-*` entries are the WHOLE top-row tab group of one live
+# screen -- 5 stock spawners and 8 mod-tab clones -- captured one batch per
+# toggle in strip order. Exactly one of them (GameToggle, the selected stock
+# tab) reads true. That is what makes an offline replay of the row-group
+# assertion evidence rather than a shape someone invented, and it is also the
+# measurement that retired the old assertion: the 8 clones are all
+# activeInHierarchy=true and all m_IsOn=false at the same time, so "8 of 8
+# clones active" was never a failure.
+#
+# `component-toggle-absent` is the negative control: GetComponent returned NULL
+# (an ANSWER, not a fault) and the following `read $comp+0x120` refused. A
+# refusal must never be counted as `false`.
+
+
+=== ENTRY toggle-ison-00-true
+--- SOURCE live client, 2026-09-02, Settings open on the GAME tab, mods tab built (8 published pages); captured by tools/ichannel.py run_batch, which strips the `echo <sentinel>` line it appends, strip slot 0 (GameToggle)
+--- SHAPE GetComponent(System.Type) klass-identity route, then m_IsOn@0x120 reading TRUE. The read prints the address it read, which is exactly the component pointer + 0x120 -- the arithmetic that ties a value to the object it claims to describe.
+--- COMMAND component 0x00000203094986c0 UnityEngine.UI.Toggle
+--- OUTPUT
+aowlspt live inspector -- batch 64, 3 command(s), on Unity thread 16676
+> component 0x00000203094986c0 UnityEngine.UI.Toggle
+  FOUND UnityEngine.UI.Toggle component = 0x000002030980dbd0  klass=0x000001ffe2f98030   ($comp)   via GetComponent(System.Type) -- klass identity, no string match
+  bound to $comp -- e.g.  allow write   then   click $comp
+> read $comp+0x120 bool
+  0x000002030980dcf0 as bool = true  (0x01)
+aowlspt live inspector -- batch 64 complete, 8 line(s)
+--- END
+
+=== ENTRY toggle-ison-01-false
+--- SOURCE live client, 2026-09-02, Settings open on the GAME tab, mods tab built (8 published pages); captured by tools/ichannel.py run_batch, which strips the `echo <sentinel>` line it appends, strip slot 1 (GraphicsToggle)
+--- SHAPE GetComponent(System.Type) klass-identity route, then m_IsOn@0x120 reading FALSE. The read prints the address it read, which is exactly the component pointer + 0x120 -- the arithmetic that ties a value to the object it claims to describe.
+--- COMMAND component 0x0000020309498400 UnityEngine.UI.Toggle
+--- OUTPUT
+aowlspt live inspector -- batch 65, 3 command(s), on Unity thread 16676
+> component 0x0000020309498400 UnityEngine.UI.Toggle
+  FOUND UnityEngine.UI.Toggle component = 0x000002030980d930  klass=0x000001ffe2f98030   ($comp)   via GetComponent(System.Type) -- klass identity, no string match
+  bound to $comp -- e.g.  allow write   then   click $comp
+> read $comp+0x120 bool
+  0x000002030980da50 as bool = false  (0x00)
+aowlspt live inspector -- batch 65 complete, 8 line(s)
+--- END
+
+=== ENTRY toggle-ison-02-false
+--- SOURCE live client, 2026-09-02, Settings open on the GAME tab, mods tab built (8 published pages); captured by tools/ichannel.py run_batch, which strips the `echo <sentinel>` line it appends, strip slot 2 (PostFxToggle)
+--- SHAPE GetComponent(System.Type) klass-identity route, then m_IsOn@0x120 reading FALSE. The read prints the address it read, which is exactly the component pointer + 0x120 -- the arithmetic that ties a value to the object it claims to describe.
+--- COMMAND component 0x00000203094980e0 UnityEngine.UI.Toggle
+--- OUTPUT
+aowlspt live inspector -- batch 66, 3 command(s), on Unity thread 16676
+> component 0x00000203094980e0 UnityEngine.UI.Toggle
+  FOUND UnityEngine.UI.Toggle component = 0x000002030980d690  klass=0x000001ffe2f98030   ($comp)   via GetComponent(System.Type) -- klass identity, no string match
+  bound to $comp -- e.g.  allow write   then   click $comp
+> read $comp+0x120 bool
+  0x000002030980d7b0 as bool = false  (0x00)
+aowlspt live inspector -- batch 66 complete, 8 line(s)
+--- END
+
+=== ENTRY toggle-ison-03-false
+--- SOURCE live client, 2026-09-02, Settings open on the GAME tab, mods tab built (8 published pages); captured by tools/ichannel.py run_batch, which strips the `echo <sentinel>` line it appends, strip slot 3 (SoundToggle)
+--- SHAPE GetComponent(System.Type) klass-identity route, then m_IsOn@0x120 reading FALSE. The read prints the address it read, which is exactly the component pointer + 0x120 -- the arithmetic that ties a value to the object it claims to describe.
+--- COMMAND component 0x00000203094a7e40 UnityEngine.UI.Toggle
+--- OUTPUT
+aowlspt live inspector -- batch 67, 3 command(s), on Unity thread 16676
+> component 0x00000203094a7e40 UnityEngine.UI.Toggle
+  FOUND UnityEngine.UI.Toggle component = 0x000002030980d3f0  klass=0x000001ffe2f98030   ($comp)   via GetComponent(System.Type) -- klass identity, no string match
+  bound to $comp -- e.g.  allow write   then   click $comp
+> read $comp+0x120 bool
+  0x000002030980d510 as bool = false  (0x00)
+aowlspt live inspector -- batch 67 complete, 8 line(s)
+--- END
+
+=== ENTRY toggle-ison-04-false
+--- SOURCE live client, 2026-09-02, Settings open on the GAME tab, mods tab built (8 published pages); captured by tools/ichannel.py run_batch, which strips the `echo <sentinel>` line it appends, strip slot 4 (ControlsToggle)
+--- SHAPE GetComponent(System.Type) klass-identity route, then m_IsOn@0x120 reading FALSE. The read prints the address it read, which is exactly the component pointer + 0x120 -- the arithmetic that ties a value to the object it claims to describe.
+--- COMMAND component 0x00000203094a7b80 UnityEngine.UI.Toggle
+--- OUTPUT
+aowlspt live inspector -- batch 68, 3 command(s), on Unity thread 16676
+> component 0x00000203094a7b80 UnityEngine.UI.Toggle
+  FOUND UnityEngine.UI.Toggle component = 0x000002030980d150  klass=0x000001ffe2f98030   ($comp)   via GetComponent(System.Type) -- klass identity, no string match
+  bound to $comp -- e.g.  allow write   then   click $comp
+> read $comp+0x120 bool
+  0x000002030980d270 as bool = false  (0x00)
+aowlspt live inspector -- batch 68 complete, 8 line(s)
+--- END
+
+=== ENTRY toggle-ison-05-false
+--- SOURCE live client, 2026-09-02, Settings open on the GAME tab, mods tab built (8 published pages); captured by tools/ichannel.py run_batch, which strips the `echo <sentinel>` line it appends, strip slot 5 (GameToggle(Clone) #1)
+--- SHAPE GetComponent(System.Type) klass-identity route, then m_IsOn@0x120 reading FALSE. The read prints the address it read, which is exactly the component pointer + 0x120 -- the arithmetic that ties a value to the object it claims to describe.
+--- COMMAND component 0x000002030962f1c0 UnityEngine.UI.Toggle
+--- OUTPUT
+aowlspt live inspector -- batch 69, 3 command(s), on Unity thread 16676
+> component 0x000002030962f1c0 UnityEngine.UI.Toggle
+  FOUND UnityEngine.UI.Toggle component = 0x00000203088f8d20  klass=0x000001ffe2f98030   ($comp)   via GetComponent(System.Type) -- klass identity, no string match
+  bound to $comp -- e.g.  allow write   then   click $comp
+> read $comp+0x120 bool
+  0x00000203088f8e40 as bool = false  (0x00)
+aowlspt live inspector -- batch 69 complete, 8 line(s)
+--- END
+
+=== ENTRY toggle-ison-06-false
+--- SOURCE live client, 2026-09-02, Settings open on the GAME tab, mods tab built (8 published pages); captured by tools/ichannel.py run_batch, which strips the `echo <sentinel>` line it appends, strip slot 6 (GameToggle(Clone) #2)
+--- SHAPE GetComponent(System.Type) klass-identity route, then m_IsOn@0x120 reading FALSE. The read prints the address it read, which is exactly the component pointer + 0x120 -- the arithmetic that ties a value to the object it claims to describe.
+--- COMMAND component 0x00000203097ae7e0 UnityEngine.UI.Toggle
+--- OUTPUT
+aowlspt live inspector -- batch 70, 3 command(s), on Unity thread 16676
+> component 0x00000203097ae7e0 UnityEngine.UI.Toggle
+  FOUND UnityEngine.UI.Toggle component = 0x000002030769abd0  klass=0x000001ffe2f98030   ($comp)   via GetComponent(System.Type) -- klass identity, no string match
+  bound to $comp -- e.g.  allow write   then   click $comp
+> read $comp+0x120 bool
+  0x000002030769acf0 as bool = false  (0x00)
+aowlspt live inspector -- batch 70 complete, 8 line(s)
+--- END
+
+=== ENTRY toggle-ison-07-false
+--- SOURCE live client, 2026-09-02, Settings open on the GAME tab, mods tab built (8 published pages); captured by tools/ichannel.py run_batch, which strips the `echo <sentinel>` line it appends, strip slot 7 (GameToggle(Clone) #3)
+--- SHAPE GetComponent(System.Type) klass-identity route, then m_IsOn@0x120 reading FALSE. The read prints the address it read, which is exactly the component pointer + 0x120 -- the arithmetic that ties a value to the object it claims to describe.
+--- COMMAND component 0x00000203090dc8a0 UnityEngine.UI.Toggle
+--- OUTPUT
+aowlspt live inspector -- batch 71, 3 command(s), on Unity thread 16676
+> component 0x00000203090dc8a0 UnityEngine.UI.Toggle
+  FOUND UnityEngine.UI.Toggle component = 0x0000020306e6ba80  klass=0x000001ffe2f98030   ($comp)   via GetComponent(System.Type) -- klass identity, no string match
+  bound to $comp -- e.g.  allow write   then   click $comp
+> read $comp+0x120 bool
+  0x0000020306e6bba0 as bool = false  (0x00)
+aowlspt live inspector -- batch 71 complete, 8 line(s)
+--- END
+
+=== ENTRY toggle-ison-08-false
+--- SOURCE live client, 2026-09-02, Settings open on the GAME tab, mods tab built (8 published pages); captured by tools/ichannel.py run_batch, which strips the `echo <sentinel>` line it appends, strip slot 8 (GameToggle(Clone) #4)
+--- SHAPE GetComponent(System.Type) klass-identity route, then m_IsOn@0x120 reading FALSE. The read prints the address it read, which is exactly the component pointer + 0x120 -- the arithmetic that ties a value to the object it claims to describe.
+--- COMMAND component 0x00000203091df740 UnityEngine.UI.Toggle
+--- OUTPUT
+aowlspt live inspector -- batch 72, 3 command(s), on Unity thread 16676
+> component 0x00000203091df740 UnityEngine.UI.Toggle
+  FOUND UnityEngine.UI.Toggle component = 0x00000202dede0930  klass=0x000001ffe2f98030   ($comp)   via GetComponent(System.Type) -- klass identity, no string match
+  bound to $comp -- e.g.  allow write   then   click $comp
+> read $comp+0x120 bool
+  0x00000202dede0a50 as bool = false  (0x00)
+aowlspt live inspector -- batch 72 complete, 8 line(s)
+--- END
+
+=== ENTRY toggle-ison-09-false
+--- SOURCE live client, 2026-09-02, Settings open on the GAME tab, mods tab built (8 published pages); captured by tools/ichannel.py run_batch, which strips the `echo <sentinel>` line it appends, strip slot 9 (GameToggle(Clone) #5)
+--- SHAPE GetComponent(System.Type) klass-identity route, then m_IsOn@0x120 reading FALSE. The read prints the address it read, which is exactly the component pointer + 0x120 -- the arithmetic that ties a value to the object it claims to describe.
+--- COMMAND component 0x00000203092f46a0 UnityEngine.UI.Toggle
+--- OUTPUT
+aowlspt live inspector -- batch 73, 3 command(s), on Unity thread 16676
+> component 0x00000203092f46a0 UnityEngine.UI.Toggle
+  FOUND UnityEngine.UI.Toggle component = 0x00000202d95f67e0  klass=0x000001ffe2f98030   ($comp)   via GetComponent(System.Type) -- klass identity, no string match
+  bound to $comp -- e.g.  allow write   then   click $comp
+> read $comp+0x120 bool
+  0x00000202d95f6900 as bool = false  (0x00)
+aowlspt live inspector -- batch 73 complete, 8 line(s)
+--- END
+
+=== ENTRY toggle-ison-10-false
+--- SOURCE live client, 2026-09-02, Settings open on the GAME tab, mods tab built (8 published pages); captured by tools/ichannel.py run_batch, which strips the `echo <sentinel>` line it appends, strip slot 10 (GameToggle(Clone) #6)
+--- SHAPE GetComponent(System.Type) klass-identity route, then m_IsOn@0x120 reading FALSE. The read prints the address it read, which is exactly the component pointer + 0x120 -- the arithmetic that ties a value to the object it claims to describe.
+--- COMMAND component 0x00000203093e7ea0 UnityEngine.UI.Toggle
+--- OUTPUT
+aowlspt live inspector -- batch 74, 3 command(s), on Unity thread 16676
+> component 0x00000203093e7ea0 UnityEngine.UI.Toggle
+  FOUND UnityEngine.UI.Toggle component = 0x000002022af5a690  klass=0x000001ffe2f98030   ($comp)   via GetComponent(System.Type) -- klass identity, no string match
+  bound to $comp -- e.g.  allow write   then   click $comp
+> read $comp+0x120 bool
+  0x000002022af5a7b0 as bool = false  (0x00)
+aowlspt live inspector -- batch 74 complete, 8 line(s)
+--- END
+
+=== ENTRY toggle-ison-11-false
+--- SOURCE live client, 2026-09-02, Settings open on the GAME tab, mods tab built (8 published pages); captured by tools/ichannel.py run_batch, which strips the `echo <sentinel>` line it appends, strip slot 11 (GameToggle(Clone) #7)
+--- SHAPE GetComponent(System.Type) klass-identity route, then m_IsOn@0x120 reading FALSE. The read prints the address it read, which is exactly the component pointer + 0x120 -- the arithmetic that ties a value to the object it claims to describe.
+--- COMMAND component 0x0000020308cd9920 UnityEngine.UI.Toggle
+--- OUTPUT
+aowlspt live inspector -- batch 75, 3 command(s), on Unity thread 16676
+> component 0x0000020308cd9920 UnityEngine.UI.Toggle
+  FOUND UnityEngine.UI.Toggle component = 0x000002030949a540  klass=0x000001ffe2f98030   ($comp)   via GetComponent(System.Type) -- klass identity, no string match
+  bound to $comp -- e.g.  allow write   then   click $comp
+> read $comp+0x120 bool
+  0x000002030949a660 as bool = false  (0x00)
+aowlspt live inspector -- batch 75 complete, 8 line(s)
+--- END
+
+=== ENTRY toggle-ison-12-false
+--- SOURCE live client, 2026-09-02, Settings open on the GAME tab, mods tab built (8 published pages); captured by tools/ichannel.py run_batch, which strips the `echo <sentinel>` line it appends, strip slot 12 (GameToggle(Clone) #8)
+--- SHAPE GetComponent(System.Type) klass-identity route, then m_IsOn@0x120 reading FALSE. The read prints the address it read, which is exactly the component pointer + 0x120 -- the arithmetic that ties a value to the object it claims to describe.
+--- COMMAND component 0x0000020308da9160 UnityEngine.UI.Toggle
+--- OUTPUT
+aowlspt live inspector -- batch 76, 3 command(s), on Unity thread 16676
+> component 0x0000020308da9160 UnityEngine.UI.Toggle
+  FOUND UnityEngine.UI.Toggle component = 0x00000203072e83f0  klass=0x000001ffe2f98030   ($comp)   via GetComponent(System.Type) -- klass identity, no string match
+  bound to $comp -- e.g.  allow write   then   click $comp
+> read $comp+0x120 bool
+  0x00000203072e8510 as bool = false  (0x00)
+aowlspt live inspector -- batch 76 complete, 8 line(s)
+--- END
+
+=== ENTRY component-toggle-absent
+--- SOURCE live client, 2026-09-02, Settings open on the GAME tab, mods tab built (8 published pages); captured by tools/ichannel.py run_batch, which strips the `echo <sentinel>` line it appends, batch 61
+--- SHAPE THE NEGATIVE CONTROL: GetComponent(Type) returned NULL on the `Toggles` strip itself (an ANSWER, not a fault), and the following `read $comp+0x120` refused with `not readable for 1 bytes at 0x0000000000000120` -- $comp went NULL rather than stale here, but either way the read yields NO VALUE and must never be read as `false`.
+--- COMMAND component 0x000002024b079ee0 UnityEngine.UI.Toggle
+--- OUTPUT
+aowlspt live inspector -- batch 61, 3 command(s), on Unity thread 16676
+> component 0x000002024b079ee0 UnityEngine.UI.Toggle
+  ! via GetComponent(Type) on 0x000002024b079ee0: GetComponent(Type) returned NULL -- an ANSWER: this object has no component of that type. (This is the klass-identity route: the offline index resolved UnityEngine.UI.Toggle to a real Il2CppType, so a NULL here is an ANSWER about this object, not a name-matching failure.)
+> read $comp+0x120 bool
+  ! not readable for 1 bytes at 0x0000000000000120
+aowlspt live inspector -- batch 61 complete, 7 line(s)
+--- END

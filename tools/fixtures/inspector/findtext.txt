@@ -50,3 +50,71 @@ aowlspt live inspector -- batch 19, 2 command(s), on Unity thread 17484
   aowl-batch-1788297676076-30
 aowlspt live inspector -- batch 19 complete, 8 line(s)
 --- END
+
+=== ENTRY findtext-clones-donor-caption
+--- SOURCE live client, 2026-09-02, Settings open, mods tab built; captured by tools/ichannel.py run_batch (the `echo <sentinel>` line it appends is stripped by run_batch itself, which is why no `> echo` echo appears), batch 56
+--- SHAPE a MULTI-WORD needle passed QUOTED, 24 hits, HIT_CAP (the match cap is 24), hits split between the stock row `Settings Drop Down(Clone)` and OUR row clones `Settings Drop Down(Clone)(Clone)` -- and every HIT line carries `text=` and `activeInHierarchy=`, which channel.py's _HIT_RE does not match at all
+--- COMMAND findtext "Interface language" $settings 40000 all
+--- OUTPUT
+aowlspt live inspector -- batch 56, 2 command(s), on Unity thread 16676
+> findtext "Interface language" $settings 40000 all
+  searching from 0x000002024b079ec0 name="SettingsScreen" for TMP text containing "Interface language" (case-insensitive; budget 40000 nodes, 12ms per frame, continuing across frames automatically; scope: ALL nodes, active and inactive)
+    HIT 0x00000203094ddf60  name="Text"  parent="Settings Drop Down(Clone)"  text="Interface language"  activeInHierarchy=true   ($f1)
+    HIT 0x00000203095d3e00  name="Text"  parent="Settings Drop Down(Clone)(Clone)"  text="Interface language"  activeInHierarchy=true   ($f2)
+    HIT 0x00000203095d36c0  name="Text"  parent="Settings Drop Down(Clone)(Clone)"  text="Interface language"  activeInHierarchy=true   ($f3)
+    HIT 0x00000203095daf60  name="Text"  parent="Settings Drop Down(Clone)(Clone)"  text="Interface language"  activeInHierarchy=true   ($f4)
+    HIT 0x00000203095da7e0  name="Text"  parent="Settings Drop Down(Clone)(Clone)"  text="Interface language"  activeInHierarchy=true   ($f5)
+    HIT 0x00000203095da140  name="Text"  parent="Settings Drop Down(Clone)(Clone)"  text="Interface language"  activeInHierarchy=true   ($f6)
+    HIT 0x00000203095f3aa0  name="Text"  parent="Settings Drop Down(Clone)(Clone)"  text="Interface language"  activeInHierarchy=true   ($f7)
+    HIT 0x00000203095f3400  name="Text"  parent="Settings Drop Down(Clone)(Clone)"  text="Interface language"  activeInHierarchy=true   ($f8)
+    HIT 0x00000203095fcb60  name="Text"  parent="Settings Drop Down(Clone)(Clone)"  text="Interface language"  activeInHierarchy=true   ($f9)
+    HIT 0x00000203095fc4c0  name="Text"  parent="Settings Drop Down(Clone)(Clone)"  text="Interface language"  activeInHierarchy=true   ($f10)
+    HIT 0x0000020309604d60  name="Text"  parent="Settings Drop Down(Clone)(Clone)"  text="Interface language"  activeInHierarchy=true   ($f11)
+    HIT 0x00000203096046c0  name="Text"  parent="Settings Drop Down(Clone)(Clone)"  text="Interface language"  activeInHierarchy=true   ($f12)
+    HIT 0x000002030960bfe0  name="Text"  parent="Settings Drop Down(Clone)(Clone)"  text="Interface language"  activeInHierarchy=true   ($f13)
+    HIT 0x000002030960b920  name="Text"  parent="Settings Drop Down(Clone)(Clone)"  text="Interface language"  activeInHierarchy=true   ($f14)
+    HIT 0x000002030960b280  name="Text"  parent="Settings Drop Down(Clone)(Clone)"  text="Interface language"  activeInHierarchy=true   ($f15)
+    HIT 0x00000203096bcaa0  name="Text"  parent="Settings Drop Down(Clone)"  text="Interface language"  activeInHierarchy=true   ($f16)
+    HIT 0x00000203096c31e0  name="Text"  parent="Settings Drop Down(Clone)(Clone)"  text="Interface language"  activeInHierarchy=true   ($f17)
+    HIT 0x00000203096c3100  name="Text"  parent="Settings Drop Down(Clone)(Clone)"  text="Interface language"  activeInHierarchy=true   ($f18)
+    HIT 0x00000203096c3020  name="Text"  parent="Settings Drop Down(Clone)(Clone)"  text="Interface language"  activeInHierarchy=true   ($f19)
+    HIT 0x00000203096caf40  name="Text"  parent="Settings Drop Down(Clone)(Clone)"  text="Interface language"  activeInHierarchy=true   ($f20)
+    HIT 0x00000203096cae60  name="Text"  parent="Settings Drop Down(Clone)(Clone)"  text="Interface language"  activeInHierarchy=true   ($f21)
+    HIT 0x00000203096cad80  name="Text"  parent="Settings Drop Down(Clone)(Clone)"  text="Interface language"  activeInHierarchy=true   ($f22)
+    HIT 0x00000203096caca0  name="Text"  parent="Settings Drop Down(Clone)(Clone)"  text="Interface language"  activeInHierarchy=true   ($f23)
+    HIT 0x00000203096cabc0  name="Text"  parent="Settings Drop Down(Clone)(Clone)"  text="Interface language"  activeInHierarchy=true   ($f24)
+  visited 1297 node(s) over 20 frame(s), 24 match(es), frontier 1352 node(s)
+  -- stopped at the match cap (24). There may be more; `findtext more` continues from the frontier above.
+  matches are bound to $f1..$f24 for the rest of this batch
+  predicate control: 225 node(s) carried a TextMeshProUGUI (of 1297 visited) -- the predicate demonstrably CAN answer yes on this subtree.
+  scope: ALL nodes, active and inactive -- `all` was passed, so some hits above may be unpressable; check activeInHierarchy on each before pressing
+aowlspt live inspector -- batch 56 complete, 34 line(s)
+--- END
+
+=== ENTRY findtext-placeholder-inactive-only
+--- SOURCE live client, 2026-09-02, Settings open, mods tab built; captured by tools/ichannel.py run_batch (the `echo <sentinel>` line it appends is stripped by run_batch itself, which is why no `> echo` echo appears), batch 57
+--- SHAPE EXHAUSTIVE walk, 12 hits, ALL activeInHierarchy=FALSE -- the donor prefabs still carry the placeholder but nothing renders it; also carries the in-band `predicate control:` line that makes a separate control walk unnecessary
+--- COMMAND findtext "SOME TEXT" $settings 40000 all
+--- OUTPUT
+aowlspt live inspector -- batch 57, 2 command(s), on Unity thread 16676
+> findtext "SOME TEXT" $settings 40000 all
+  searching from 0x000002024b079ec0 name="SettingsScreen" for TMP text containing "SOME TEXT" (case-insensitive; budget 40000 nodes, 12ms per frame, continuing across frames automatically; scope: ALL nodes, active and inactive)
+    HIT 0x0000020309629c00  name="SizeLabel"  parent="AnimatedToggle"  text="SOME TEXT"  activeInHierarchy=FALSE (unpressable)   ($f1)
+    HIT 0x0000020309629a20  name="SizeLabel"  parent="AnimatedToggle"  text="SOME TEXT"  activeInHierarchy=FALSE (unpressable)   ($f2)
+    HIT 0x000002030962ffe0  name="SizeLabel"  parent="AnimatedToggle"  text="SOME TEXT"  activeInHierarchy=FALSE (unpressable)   ($f3)
+    HIT 0x000002030962fde0  name="SizeLabel"  parent="AnimatedToggle"  text="SOME TEXT"  activeInHierarchy=FALSE (unpressable)   ($f4)
+    HIT 0x0000020309629660  name="SizeLabel"  parent="AnimatedToggle"  text="SOME TEXT"  activeInHierarchy=FALSE (unpressable)   ($f5)
+    HIT 0x0000020308e89e80  name="SizeLabel"  parent="AnimatedToggle"  text="SOME TEXT"  activeInHierarchy=FALSE (unpressable)   ($f6)
+    HIT 0x0000020309629ba0  name="Label"  parent="SizeLabel"  text="SOME TEXT"  activeInHierarchy=FALSE (unpressable)   ($f7)
+    HIT 0x00000203096299c0  name="Label"  parent="SizeLabel"  text="SOME TEXT"  activeInHierarchy=FALSE (unpressable)   ($f8)
+    HIT 0x000002030962ff60  name="Label"  parent="SizeLabel"  text="SOME TEXT"  activeInHierarchy=FALSE (unpressable)   ($f9)
+    HIT 0x000002030962fd80  name="Label"  parent="SizeLabel"  text="SOME TEXT"  activeInHierarchy=FALSE (unpressable)   ($f10)
+    HIT 0x0000020309629640  name="Label"  parent="SizeLabel"  text="SOME TEXT"  activeInHierarchy=FALSE (unpressable)   ($f11)
+    HIT 0x0000020308e89a20  name="Label"  parent="SizeLabel"  text="SOME TEXT"  activeInHierarchy=FALSE (unpressable)   ($f12)
+  visited 7735 node(s) over 62 frame(s), 12 match(es), frontier 0 node(s)
+  -- the subtree was searched EXHAUSTIVELY. Every match is listed above.
+  matches are bound to $f1..$f12 for the rest of this batch
+  predicate control: 1127 node(s) carried a TextMeshProUGUI (of 7735 visited) -- the predicate demonstrably CAN answer yes on this subtree.
+  scope: ALL nodes, active and inactive -- `all` was passed, so some hits above may be unpressable; check activeInHierarchy on each before pressing
+aowlspt live inspector -- batch 57 complete, 22 line(s)
+--- END

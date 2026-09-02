@@ -121,3 +121,40 @@ aowlspt live inspector -- batch 1, 3 command(s), on Unity thread 12320
   BATCH VERDICT: INCONCLUSIVE
 aowlspt live inspector -- batch 1 complete, 9 line(s)
 --- END
+
+=== ENTRY assert-active-toggle-strip
+--- SOURCE live client, 2026-09-02, Settings open on the GAME tab, mods tab built; captured by tools/ichannel.py run_batch, batch 77
+--- SHAPE the whole top-row tab strip in one batch: 12 PASS and 1 FAIL, the FAIL being PostFxToggleSpawner, which is inactive BY DESIGN (POSTFX is folded into GRAPHICS as a subtab). Every one of the 8 mod-tab clones is activeInHierarchy=true -- the measurement that shows `8 of 8 clones active` was never a defect
+--- COMMAND assert-active 0x000002024b079e80
+--- OUTPUT
+aowlspt live inspector -- batch 77, 14 command(s), on Unity thread 16676
+> assert-active 0x000002024b079e80
+  PASS: 0x000002024b079e80 activeInHierarchy = true, as claimed
+> assert-active 0x000002024b079e00
+  PASS: 0x000002024b079e00 activeInHierarchy = true, as claimed
+> assert-active 0x000002024b079da0
+  FAIL: 0x000002024b079da0 activeInHierarchy = false, but assert-active claimed true.  An INACTIVE node is NOT pressable: a press on one reports success and does nothing (fact #72).
+> assert-active 0x000002024b079d20
+  PASS: 0x000002024b079d20 activeInHierarchy = true, as claimed
+> assert-active 0x000002024b079cc0
+  PASS: 0x000002024b079cc0 activeInHierarchy = true, as claimed
+> assert-active 0x000002030962f640
+  PASS: 0x000002030962f640 activeInHierarchy = true, as claimed
+> assert-active 0x00000203097aeae0
+  PASS: 0x00000203097aeae0 activeInHierarchy = true, as claimed
+> assert-active 0x00000203090dcb80
+  PASS: 0x00000203090dcb80 activeInHierarchy = true, as claimed
+> assert-active 0x00000203091dfaa0
+  PASS: 0x00000203091dfaa0 activeInHierarchy = true, as claimed
+> assert-active 0x00000203092f49a0
+  PASS: 0x00000203092f49a0 activeInHierarchy = true, as claimed
+> assert-active 0x00000203093df1e0
+  PASS: 0x00000203093df1e0 activeInHierarchy = true, as claimed
+> assert-active 0x0000020308cd9c00
+  PASS: 0x0000020308cd9c00 activeInHierarchy = true, as claimed
+> assert-active 0x0000020308da9440
+  PASS: 0x0000020308da9440 activeInHierarchy = true, as claimed
+  ASSERTIONS: 12 pass, 1 fail, 0 inconclusive
+  BATCH VERDICT: FAIL
+aowlspt live inspector -- batch 77 complete, 31 line(s)
+--- END

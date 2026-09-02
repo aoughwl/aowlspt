@@ -85,3 +85,35 @@ aowlspt live inspector -- batch 1, 5 command(s), on Unity thread 20272
   aowl-batch-1788308491064-66
 aowlspt live inspector -- batch 1 complete, 14 line(s)
 --- END
+
+=== ENTRY find-toggles-strip-with-clones
+--- SOURCE live client, 2026-09-02, Settings open, mods tab built; captured by tools/ichannel.py run_batch (the `echo <sentinel>` line it appends is stripped by run_batch itself, which is why no `> echo` echo appears), batch 62
+--- SHAPE EXHAUSTIVE `find`, 18 hits: the `Toggles` strip under SettingsScreen, its 5 stock spawners, 8 `GameToggleSpawner(Clone)` mod-tab clones, and the POSTFX subtab strips
+--- COMMAND find Toggles $settings 40000
+--- OUTPUT
+aowlspt live inspector -- batch 62, 2 command(s), on Unity thread 16676
+> find Toggles $settings 40000
+  searching from 0x000002024b079ec0 name="SettingsScreen" for name containing "Toggles" (case-insensitive; budget 40000 nodes, 12ms per frame, continuing across frames automatically)
+    HIT 0x000002024b079ee0 name="Toggles"  parent="SettingsScreen"   ($f1)
+    HIT 0x000002024b079e80 name="GameToggleSpawner"  parent="Toggles"   ($f2)
+    HIT 0x000002024b079e00 name="GraphicsToggleSpawner"  parent="Toggles"   ($f3)
+    HIT 0x000002024b079da0 name="PostFxToggleSpawner"  parent="Toggles"   ($f4)
+    HIT 0x000002024b079d20 name="SoundToggleSpawner"  parent="Toggles"   ($f5)
+    HIT 0x000002024b079cc0 name="ControlsToggleSpawner"  parent="Toggles"   ($f6)
+    HIT 0x000002030962f640 name="GameToggleSpawner(Clone)"  parent="Toggles"   ($f7)
+    HIT 0x00000203097aeae0 name="GameToggleSpawner(Clone)"  parent="Toggles"   ($f8)
+    HIT 0x00000203090dcb80 name="GameToggleSpawner(Clone)"  parent="Toggles"   ($f9)
+    HIT 0x00000203091dfaa0 name="GameToggleSpawner(Clone)"  parent="Toggles"   ($f10)
+    HIT 0x00000203092f49a0 name="GameToggleSpawner(Clone)"  parent="Toggles"   ($f11)
+    HIT 0x00000203093df1e0 name="GameToggleSpawner(Clone)"  parent="Toggles"   ($f12)
+    HIT 0x0000020308cd9c00 name="GameToggleSpawner(Clone)"  parent="Toggles"   ($f13)
+    HIT 0x0000020308da9440 name="GameToggleSpawner(Clone)"  parent="Toggles"   ($f14)
+    HIT 0x0000020309629dc0 name="Toggles(Clone)"  parent="Graphics Settings"   ($f15)
+    HIT 0x00000203096291c0 name="Toggles(Clone)"  parent="PostFX Settings"   ($f16)
+    HIT 0x000002024b0719c0 name="Toggles"  parent="Control Settings"   ($f17)
+    HIT 0x000002024a9be960 name="TogglesSection"  parent="Panel"   ($f18)
+  visited 7735 node(s) over 61 frame(s), 18 match(es), frontier 0 node(s)
+  -- the subtree was searched EXHAUSTIVELY. Every match is listed above.
+  matches are bound to $f1..$f18 for the rest of this batch
+aowlspt live inspector -- batch 62 complete, 26 line(s)
+--- END
