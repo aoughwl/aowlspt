@@ -2917,6 +2917,34 @@ var gGfxInsetRef = -1'i32
 ## than writing a number nobody measured.
 var gGfxAlphaOn = -1.0'f32
 var gGfxAlphaOff = -1.0'f32
+## THE POSTFX FIRST-SHOW OBSERVATION, and why this build MEASURES instead of
+## fixing.
+##
+## Live, on the PostFX panel, raising the group padding did not shift its
+## children -- it RESIZED them:
+##   EnablePanel    sizeDelta 51.9 -> 30.0    anchoredPosition -26.0 -> -81.0
+##   SettingsPanel  sizeDelta 729.1 -> 1355.0 anchoredPosition -420.5 -> -777.5
+## A full re-flow, producing numbers the authored values never were. There are
+## exactly two readings and they have OPPOSITE fixes:
+##
+##   (A) the group was DORMANT on this panel and our SetDirty woke it, so
+##       touching the group at all is destructive and the children must be
+##       moved directly instead;
+##   (B) the group is the rightful driver but had never laid out because the
+##       panel had never been SHOWN -- our baseline was simply taken too early,
+##       the first stock show would have produced those same numbers, and
+##       padding is the correct mechanism after all.
+##
+## Under (A) the direct-shift fix is right and padding is destructive; under
+## (B) padding is right and a direct shift would be overwritten. Guessing costs
+## a live cycle and can destroy the panel, so this build DOES NOT SHIFT POSTFX
+## AT ALL. It watches the panel across its first activation, touching nothing,
+## and records whether the children move on their own. That single observation
+## decides it: they move -> (B); they do not -> (A).
+var gGfxPostPreShowT: seq[Il2CppPtr] = @[]
+var gGfxPostPreShowG: seq[NuGeom] = @[]
+var gGfxPostPreShowName: seq[string] = @[]
+var gGfxPostShowSaid = false
 ## PER PANEL, both of them: the verdict latch and the settle counter. A single
 ## pair could only ever judge whichever panel happened to be up first, and the
 ## other panel's assertion would then never run at all.
@@ -3373,6 +3401,39 @@ proc gfxBuildStrip(panelT, donorStripGo, donorStripT, donorButtonGo,
   # captured before the first change and restored on fault or self-disable, and
   # the backstop is told to expect exactly this shift and nothing else.
   # ==========================================================================
+  # POSTFX IS NOT SHIFTED THIS BUILD -- it is OBSERVED. See the
+  # `gGfxPostPreShow*` comment: raising this panel's padding re-flowed its
+  # children instead of shifting them, and the two explanations have opposite
+  # fixes. Rather than pick one by argument, snapshot the children now (the
+  # panel has never been shown this session -- `gfxBuild` only runs while the
+  # GAME tab is up) and compare after its first activation, having touched
+  # nothing in between.
+  #
+  # The strip is still built and still positioned; it simply sits at the
+  # panel's existing padding, so it may overlap the PostFX rows. That is
+  # cosmetic, reversible and confined to a panel whose content is ours --
+  # unlike a wrong write to the layout, which destroyed it.
+  if pIx == 1:
+    var pn = 0
+    if iChildCount(stackT, pn):
+      var pj = 0
+      while pj < pn and pj < GfxMaxStockWatch:
+        let pc = iChildAt(stackT, pj)
+        pj = pj + 1
+        if pc == nil or not duOk(pc, 0x20'i32): continue
+        let pg = nuReadGeom(pc)
+        if not pg.ok: continue
+        gGfxPostPreShowT.add pc
+        gGfxPostPreShowG.add pg
+        gGfxPostPreShowName.add iObjName(pc)
+    okLog "postfx subtab: POSTFX IS BEING OBSERVED, NOT SHIFTED. Snapshotted " &
+          $gGfxPostPreShowT.len & " child(ren) of " & iObjName(stackT) &
+          " BEFORE the panel has ever been shown, and touching nothing. If " &
+          "they move on their own at first activation, the layout group is " &
+          "the rightful driver and our earlier baseline was simply taken too " &
+          "early; if they do not, the group was dormant and our SetDirty " &
+          "woke it. Those two have OPPOSITE fixes, so this build measures " &
+          "rather than guesses. No padding was raised on this panel."
   let grp = modsComponent(stackT, "VerticalLayoutGroup")
   if grp == nil:
     warn "postfx subtab: " & iObjName(stackT) & " in " & iObjName(panelT) &
@@ -3435,7 +3496,18 @@ proc gfxBuildStrip(panelT, donorStripGo, donorStripT, donorButtonGo,
   let extraInset = (if gGfxInsetRef > origTop: gGfxInsetRef - origTop
                     else: 0'i32)
   let totalShift = addH + extraInset
-  if not nuSetPaddingTop(ro, grp, origTop + totalShift):
+  # THE WRITE ITSELF IS SKIPPED ON POSTFX. Everything above is a READ and is
+  # harmless; this is the only destructive step, and on this panel it re-flowed
+  # the children instead of shifting them. The strip is still positioned below,
+  # at the panel's EXISTING padding, so it may overlap -- cosmetic, and on a
+  # panel whose content is ours.
+  if pIx == 1:
+    okLog "postfx subtab: NOT raising padding.top on " & iObjName(stackT) &
+          " (measured " & $origTop & "). On this panel the same write " &
+          "re-flowed the children rather than shifting them, and the two " &
+          "explanations for that have opposite fixes. Observing across first " &
+          "activation instead; see the POSTFX IS BEING OBSERVED line."
+  elif not nuSetPaddingTop(ro, grp, origTop + totalShift):
     warn "postfx subtab: padding.top could not be raised on " &
          iObjName(stackT) & ", so no room was made and the strip would " &
          "overlap the stock rows. REFUSING this strip. Nothing was written."
@@ -3443,20 +3515,27 @@ proc gfxBuildStrip(panelT, donorStripGo, donorStripT, donorButtonGo,
     return
   # CAPTURED ONLY AFTER THE WRITE SUCCEEDED, so the restore never believes it
   # has work to do that it does not -- the rule the stock-tab hide just learned.
-  if gGfxPadRo.len < 4:
-    gGfxPadRo.add ro
-    gGfxPadGrp.add grp
-    gGfxPadOrig.add origTop
-  gGfxPadShifted = true
-  gGfxPadH = totalShift
+  if pIx != 1:
+    if gGfxPadRo.len < 4:
+      gGfxPadRo.add ro
+      gGfxPadGrp.add grp
+      gGfxPadOrig.add origTop
+    gGfxPadShifted = true
+    gGfxPadH = totalShift
   # The backstop must now expect these to move, and by exactly this much. The
   # amount is recorded PER ENTRY because the two panels no longer share one.
-  var mi = stackBaseStart
-  while mi < gGfxStockExpectShift.len and mi < GfxMaxStockWatch * 2:
-    gGfxStockExpectShift[mi] = true
-    if mi < gGfxStockShiftPx.len:
-      gGfxStockShiftPx[mi] = totalShift
-    mi = mi + 1
+  # ONLY the panel we actually wrote to is expected to move. PostFX is
+  # untouched this build, so its entries keep expectShift=false and the
+  # backstop asserts them UNCHANGED -- which is exactly the observation we
+  # want: if they move anyway, the group did it on its own and reading (B) is
+  # confirmed.
+  if pIx != 1:
+    var mi = stackBaseStart
+    while mi < gGfxStockExpectShift.len and mi < GfxMaxStockWatch * 2:
+      gGfxStockExpectShift[mi] = true
+      if mi < gGfxStockShiftPx.len:
+        gGfxStockShiftPx[mi] = totalShift
+      mi = mi + 1
   # THE STRIP GOES IN THE BAND WE JUST FREED.
   #
   # The strip is a child of the PANEL (it must be -- inside the container it
@@ -3484,7 +3563,11 @@ proc gfxBuildStrip(panelT, donorStripGo, donorStripT, donorButtonGo,
   let panelLeft = panelG.rectX
   discard panelLeft
   discard contLeft
-  let stripY = (contTop - panelTop) - float32(origTop + extraInset)
+  # No room was made on PostFX, so there is no freed band to drop into: the
+  # strip goes at the existing content top and may overlap. Stated rather than
+  # disguised.
+  let usedInset = (if pIx == 1: origTop else: origTop + extraInset)
+  let stripY = (contTop - panelTop) - float32(usedInset)
   # X COMES FROM THE DONOR, NOT FROM THE CONTAINER'S LEFT EDGE. With the
   # donor's horizontal stretch anchors copied above, `anchoredPosition.x` is an
   # offset from the CENTRE, and the donor's own value is what centres it on its
@@ -4187,6 +4270,63 @@ proc gfxStockGeomVerdictFor(pIx: int) =
             "and the assertion is deferred until the panel is actually up. " &
             "Nothing has been hidden."
     return
+  # THE POSTFX FIRST-SHOW OBSERVATION -- the whole point of this build.
+  #
+  # We are here because the panel is ACTIVE. On PostFX we shifted nothing, so
+  # any movement since the snapshot is the game's own. Reported ONCE, with
+  # every number, because it decides which of two opposite fixes is correct:
+  #   children MOVED   -> the layout group is the rightful driver and the
+  #                       earlier baseline was taken before first show;
+  #                       padding is the right mechanism, applied later.
+  #   children STILL   -> the group was dormant and our SetDirty woke it;
+  #                       the children must be moved directly instead.
+  if pIx == 1 and not gGfxPostShowSaid and gGfxPostPreShowT.len > 0:
+    gGfxPostShowSaid = true
+    var changed = 0
+    var same = 0
+    var unreadable = 0
+    var detail = ""
+    var k = 0
+    while k < gGfxPostPreShowT.len and k < GfxMaxStockWatch:
+      let t = gGfxPostPreShowT[k]
+      if t == nil or not duOk(t, 0x20'i32) or not iUnityAlive(t):
+        unreadable = unreadable + 1
+      else:
+        let now = nuReadGeom(t)
+        if not now.ok:
+          unreadable = unreadable + 1
+        elif nuGeomMoved(gGfxPostPreShowG[k], now, 1.0'f32):
+          changed = changed + 1
+          detail = detail & " | " & gGfxPostPreShowName[k] & ": was " &
+                   nuGeomNote(gGfxPostPreShowG[k]) & " -- now " &
+                   nuGeomNote(now)
+        else:
+          same = same + 1
+      k = k + 1
+    if changed > 0:
+      okLog "postfx subtab POSTFX-FIRST-SHOW = THE GROUP IS THE DRIVER " &
+            "(reading B): " & $changed & " of " & $gGfxPostPreShowT.len &
+            " child(ren) moved or resized ON THEIR OWN between the snapshot " &
+            "and this panel's first activation, and WE WROTE NOTHING to this " &
+            "panel. So the earlier re-flow was not our SetDirty waking a " &
+            "dormant group -- it was the first layout the group had ever " &
+            "run, which the stock show performs anyway. The correct fix is " &
+            "padding.top as on Graphics, with the baseline captured AFTER " &
+            "first activation instead of before." & detail
+    elif same > 0:
+      okLog "postfx subtab POSTFX-FIRST-SHOW = THE GROUP IS DORMANT " &
+            "(reading A): all " & $same & " snapshotted child(ren) are " &
+            "UNCHANGED after this panel's first activation, so the layout " &
+            "group does not arrange them and the earlier re-flow was our " &
+            "SetDirty waking it. Padding is destructive here; the correct " &
+            "fix is to shift EnablePanel/SettingsPanel anchoredPosition.y " &
+            "directly, with capture and restore, and to treat any SIZE " &
+            "change as displacement."
+    else:
+      warn "postfx subtab POSTFX-FIRST-SHOW INCONCLUSIVE: none of the " &
+           $gGfxPostPreShowT.len & " snapshotted child(ren) could be read " &
+           "back (" & $unreadable & " unreadable), so neither reading was " &
+           "confirmed. NOT a result."
   # Active. Let its own layout settle before judging it.
   if gGfxGeomTicks[pIx] < GfxGeomSettle:
     gGfxGeomTicks[pIx] = gGfxGeomTicks[pIx] + 1

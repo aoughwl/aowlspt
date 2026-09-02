@@ -6597,6 +6597,13 @@ var gModLoadCensusDone = false
   ## caption -- the host is already walking those roots during the window, so
   ## it is the instrument that can actually reach it.
 var gModLoadCapIdent = ""          ## the caption's name/parent, for the log
+var gModLoadCapLocale = ""
+  ## Whether the configured text needle agrees with the caption we matched
+  ## STRUCTURALLY. Reported, never gating -- the gate stopped depending on the
+  ## client's language once the object names were measured.
+var gModLoadCapSawParent = ""
+  ## The first non-matching parent name a TMP was seen under, so a failed pass
+  ## can distinguish "the container was renamed" from "there are no labels".
 var gModLoadWalkLevel = 3
   ## BISECT KNOB for the caption search: 0 = no walk at all, 1 = enumerate and
   ## validate the scene roots then stop, 2 = five nodes with a line before each
@@ -8180,8 +8187,10 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
          "progress, the current step's progress -- in that caption's font and " &
          "frame. It renders aowlspt-modload.txt verbatim, builds nothing at " &
          "all until that file exists, and draws NOTHING at the main menu. The " &
-         "caption is found by displayed text (LOCALIZED); modLoadCaption " &
-         "overrides the needle, currently \"" & gModLoadNeedle & "\"."
+         "caption is found STRUCTURALLY, by object name and parent name, " &
+         "which are NOT localized; modLoadCaption (currently \"" &
+         gModLoadNeedle & "\") is only a logged cross-check now, never the " &
+         "gate."
   gBotAi = readBoolKey("botAiActivate")
   if gBotAi:
     info "botAiActivate is set: a kind=12 detour on EFT.BotOwner.PreActivate will " &

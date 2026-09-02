@@ -180,6 +180,13 @@ const
   MlCapStackMax = 20_000
     ## Depth-first stack ceiling. A drop makes the pass non-exhaustive, so it is
     ## COUNTED and reported, never silently tolerated.
+  MlCapParent = "LoadingSpinner"
+    ## The caption's PARENT object name. Structural, not localized -- this is
+    ## the gate. Measured live off the running client (see mlCapStep).
+  MlCapChild = "Text"
+    ## The caption object's own name. Checked FIRST because it is one
+    ## `Object::get_name` on the node we already hold, and it rejects almost
+    ## everything before we pay for a parent lookup. Empty = accept any child.
   MlCensusMax = 14
     ## Identities remembered while searching, for the log when no caption
     ## matches. These now cost NOTHING extra: they are collected by the walk
@@ -527,14 +534,53 @@ proc mlCapStep(found: var NuStyle): bool =
       if t.len > 0:
         let nm = iObjName(node)
         if find(nm, MlNamePrefix) < 0:
-          if find(toLowerAscii(t), gModLoadNeedle) >= 0:
+          # THE MATCH IS STRUCTURAL: the caption is the TMP named `Text` under
+          # a parent named `LoadingSpinner`. MEASURED live 2026-09-01, read off
+          # the running client by this very walk, after 798 nodes:
+          #   name="Text" parent="LoadingSpinner" text="Loading..." font=26.0
+          #
+          # The displayed text is NO LONGER THE GATE. It was, and that made the
+          # whole feature depend on the client's language: an English needle
+          # finds nothing on a Russian client, and the honest reading of that
+          # miss ("wrong word") is indistinguishable in a log from the true one
+          # ("no caption"). Object names are not localized. The text is still
+          # read, and still reported -- as a CROSS-CHECK that says whether the
+          # configured needle agrees with reality, never as the condition.
+          #
+          # A NOTE ON HOW THIS OBJECT WAS NEARLY MISSED. An external tool DID
+          # find `LoadingSpinner/Text` on the first attempt, and it was
+          # rejected as "an INACTIVE 6px spinner sub-label, not the caption" --
+          # both observations were accurate and the conclusion was wrong. It is
+          # inactive and tiny OUTSIDE the load window, and 26pt and live DURING
+          # it, which is exactly the object we want and exactly why a transient
+          # thing must be measured while it exists. Do not re-reject it.
+          var structural = false
+          if MlCapChild.len == 0 or find(nm, MlCapChild) >= 0:
+            let par = mlParentTransformOf(node)
+            if par != nil:
+              let pn = iObjName(par)
+              if find(pn, MlCapParent) >= 0:
+                structural = true
+                gModLoadCapIdent = "name=\"" & nm & "\" parent=\"" & pn & "\""
+              elif gModLoadCapSawParent.len == 0 and pn.len > 0:
+                gModLoadCapSawParent = pn
+          if structural:
             var cand = nuStyleCapture(tmp, node)
             cand.text = t
             if cand.ok:
-              gModLoadCapIdent = "name=\"" & nm & "\" parent=\"" &
-                                 (let par = mlParentTransformOf(node);
-                                  if par != nil: iObjName(par) else: "<none>") &
-                                 "\""
+              # THE CROSS-CHECK, logged, never gating. If these disagree the
+              # feature still works and the log says the config needle is stale
+              # or the client is not English -- which is information, not a
+              # failure.
+              gModLoadCapLocale =
+                (if find(toLowerAscii(t), gModLoadNeedle) >= 0:
+                   "LOCALE OK (its text \"" & t & "\" does contain the " &
+                   "configured needle \"" & gModLoadNeedle & "\")"
+                 else:
+                   "LOCALE MISMATCH (its text \"" & t & "\" does NOT contain " &
+                   "the configured needle \"" & gModLoadNeedle & "\" -- " &
+                   "harmless, because the match is STRUCTURAL; it means " &
+                   "modLoadCaption is stale or this client is not English)")
               found = cand
               return true
           elif gModLoadCapCensus.len < MlCensusMax:
@@ -1047,9 +1093,11 @@ proc modLoadTick() =
           okLog "mod loading step: the client's own loading caption is up (" &
                 nuStyleNote(found) & "), so this IS a load phase and the step " &
                 "may draw. It will be torn down when that caption is. " &
-                "CAPTION IDENTITY, logged once so the LOCALIZED text needle " &
-                "can be replaced by a structural name/parent match: " &
-                gModLoadCapIdent & " text=\"" & found.text & "\" font=" &
+                "CAPTION IDENTITY: " &
+                gModLoadCapIdent & " (matched STRUCTURALLY on child \"" &
+                MlCapChild & "\" under parent \"" & MlCapParent &
+                "\", not on localized text) " & gModLoadCapLocale &
+                " text=\"" & found.text & "\" font=" &
                 nuF(found.fontSize) &
                 " frame=" & (if found.geom: "READ" else: "NOT read") &
                 " (found after " & $gModLoadCapNodes & " node(s))"
@@ -1062,7 +1110,16 @@ proc modLoadTick() =
              $gModLoadCapNodes & " node(s), " & $gModLoadCapDropped &
              " dropped) found no TMP displaying the needle \"" &
              gModLoadNeedle & "\" (override it with modLoadCaption in " &
-             "aowlspt-host.json). Measured live: writing the build file while " &
+             "aowlspt-host.json) NOR the structural pattern \"" &
+             MlCapChild & "\" under a parent named \"" & MlCapParent &
+             "\" -- and " &
+             (if gModLoadCapSawParent.len > 0:
+                "a TMP WAS seen under a parent named \"" &
+                gModLoadCapSawParent & "\", so the scene has labels but not " &
+                "that container: the container name may have changed"
+              else:
+                "no candidate parent was seen at all") &
+             ". Measured live: writing the build file while " &
              "the user sat on the MAIN MENU used to make this render there, " &
              "which is an overlay, not a step. The file's contents are kept " &
              "and will be rendered on the next load phase if one begins. " &
