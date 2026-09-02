@@ -271,6 +271,99 @@ const
     ## staleness into a refusal instead of a jump into an unrelated function --
     ## but only a human reading this string knows to re-derive them.
 
+  AimIsReadySpec* =
+    "Aiming::get_IsReady@0x1AD48C0/i>i!40534883EC30803DBBB05E0500488BD9"
+    ## THE THIRD HOP OF THE AIM ROUTE, as a host patch-by-RVA spec rather than
+    ## as a row -- because it is a POSTFIX, not a call.
+    ##
+    ## Grammar (host `parseRvaSpec`): `Type::Method@0xRVA/<shape>!<prologue>`.
+    ## `i` = instance, no declared arguments, `>i` = an integer/bool return.
+    ## The 16 bytes after `!` are compared by the host against its STARTUP
+    ## SNAPSHOT, not against live memory, so another feature's trampoline
+    ## cannot make a correct RVA self-reject.
+    ##
+    ## WHY A POSTFIX AND NOT A ROW. The old table refused this hop with a real
+    ## reason: `AimingManager::get_CurrentAiming` is declared to return the
+    ## INTERFACE `IBotAiming`, and `UnderbarrelLauncherBotAiming` implements it
+    ## WITHOUT deriving from `Aiming` (MEASURED: it declares its own
+    ## `get_IsReady` @0x1AEFE30, SHARED x2). Calling `Aiming`'s body on one of
+    ## those would run a foreign body on a foreign receiver, and this build
+    ## gives us no way to ask a live object its type.
+    ##
+    ## A postfix inverts the problem instead of solving it. WE NEVER CALL the
+    ## method and never supply a receiver: the game calls it, on whatever
+    ## object is really current, and the postfix reads `this` out of the
+    ## register the method was entered with. So:
+    ##
+    ##   * current aiming IS an `Aiming` subclass -- MEASURED that every
+    ##     `AimingToXxx` node has base class `Aiming` and declares no
+    ##     `get_IsReady` of its own, so all of them inherit this one UNIQUE
+    ##     body -- the postfix fires, `this` is that node, and it is the same
+    ##     address `amCurrent` handed back. The reading is attributed correctly.
+    ##   * current aiming is the underbarrel launcher -- its `get_IsReady` is a
+    ##     DIFFERENT address, this postfix never fires for it, no reading is
+    ##     ever stored under that key, `aimReadingFor` answers "no reading",
+    ##     and the gate does nothing. The bot shoots exactly as it did before
+    ##     this sensor existed.
+    ##
+    ## The wrong-type case therefore costs a MISSING reading, never a wrong
+    ## one and never a call into a foreign body. That asymmetry -- the gate can
+    ## only ever WITHHOLD, and only on a reading it actually has -- is the
+    ## reason this hop is allowed to exist while `hcBodyPart`'s equivalent
+    ## ambiguity is still a hard refusal: there is no postfix-shaped way to
+    ## read a body part's health.
+    ##
+    ## SHAREDNESS: `il2cpp_resolve.py shared 0x1AD48C0` says UNIQUE, owners=1.
+    ## Detouring a folded address is a write with unbounded blast radius; this
+    ## one is not folded. No other RVA in this repo names 0x1AD48C0, so this is
+    ## also not a second detour on an already-detoured function.
+
+proc sainRvaLevelFor*(key: string): int =
+  ## The minimum `sainRvaTableDriveLevel` at which a key may bind.
+  ##
+  ## 0 observer / 1 reads / 2 aim / 3 drive. It exists so that "the table is
+  ## on" stops meaning "everything the table can do is on" -- which it did
+  ## mean, and which quietly put `stLookTo`, a call that turns a live bot's
+  ## head, behind the same switch as reading a stamina float.
+  ##
+  ## DEFAULT 1. A key not named here is a read, and every row and field row in
+  ## this file except the two named below IS a read; `resolveFromRva` cannot
+  ## express a write at all on the field path and every call row but `stLookTo`
+  ## is an arity-0 getter. Naming the exceptions rather than the rule keeps a
+  ## newly-added drive call from inheriting "read" by omission -- so any row
+  ## added here with a non-zero `argc` and an `fkVoid` return that is NOT in
+  ## this list is a table bug, and `sainRvaDriveAudit` below is the check.
+  ##
+  ## `rlTryReload` is the case the shape heuristic CANNOT see and is why the
+  ## audit below is not the whole check: it is `bool TryReload()`, arity 0 with
+  ## a value return, so it has the exact shape of a getter -- and it makes the
+  ## bot reload its weapon. It is named here by hand, and that is the honest
+  ## reason a human still has to read a new row rather than trust the audit.
+  if key == "stLookTo" or key == "rlTryReload": return 3
+  if key == "boAiming" or key == "amCurrent": return 2
+  result = 1
+
+proc sainRvaDriveAudit*(rows: seq[SainRvaRow]): seq[string] =
+  ## Every row that LOOKS like a drive call (it takes arguments, or returns
+  ## nothing) but is classified as a read by `sainRvaLevelFor`.
+  ##
+  ## This is the negative check for the paragraph above, and it is written as a
+  ## negative on purpose: asserting "stLookTo is level 3" would pass forever
+  ## whatever else was added. Asserting "no row that mutates is reachable at
+  ## the read level" fails the moment somebody adds one and forgets.
+  result = @[]
+  var i = 0
+  while i < rows.len:
+    let r = rows[i]
+    if (r.argc != 0'i32 or r.ret == fkVoid) and sainRvaLevelFor(r.key) < 3:
+      result.add r.key & " (" & r.label & ") takes " & $r.argc &
+                 " argument(s) and returns " & (if r.ret == fkVoid: "void"
+                                                else: "a value") &
+                 ", which is the shape of a DRIVE call, but sainRvaLevelFor " &
+                 "puts it at level " & $sainRvaLevelFor(r.key) &
+                 ". A drive call must be level 3."
+    inc i
+
 proc sainRvaRows*(): seq[SainRvaRow] =
   ## The 23 members that resolved unambiguously. Data only.
   result = @[]
@@ -413,6 +506,71 @@ proc sainRvaRows*(): seq[SainRvaRow] =
     virt: "flags 0x0886 -- non-virtual, declared on the ABSTRACT base, so " &
           "every derived meds component inherits this exact body; folded with " &
           "2 unrelated getters. NEVER detour.", needsPlayer: false)
+
+  # --- The aim route. THREE hops, and the first two are here as ordinary
+  # UNIQUE, non-virtual getters. The third hop is NOT a row: it is a POSTFIX,
+  # installed by RVA from `AimIsReadySpec` below, and the reason for the
+  # asymmetry is the whole safety argument for this route -- see that constant.
+  #
+  # `boAiming` USED to be refused. The refusal was correct at the time and its
+  # stated ground was precise: binding it would have reported a successful read
+  # for a sensor whose only consumer matched the address against a hook on
+  # `EFT.BotAimingData::get_IsReady`, a class nothing in the image ever
+  # returns, so the key could never match and the check could never fail.
+  # THAT GROUND IS GONE, and it is gone because the hook moved, not because
+  # anyone changed their mind about the evidence: `sain.nim` now postfixes
+  # `Aiming::get_IsReady` @0x1AD48C0 by RVA, and `driver.nim` walks
+  # BotOwner -> AimingManager -> CurrentAiming so the address it caches is the
+  # very object that postfix is entered with. Re-point first, then bind, in
+  # that order -- which is what the old refusal asked for.
+  result.add SainRvaRow(key: "boAiming",
+    label: "EFT.BotOwner::get_AimingManager",
+    rva: 0x80E9B0, prologue: "48 8B 81 90 02 00 00 C3 CC CC CC CC CC CC CC CC",
+    argc: 0'i32, ret: fkPtr, shape: srPlain, owners: 1,
+    virt: "flags 0x0886 -- non-virtual. RE-MEASURED for this promotion, not " &
+          "copied: `il2cpp_resolve.py member get_AimingManager` finds exactly " &
+          "ONE member of that name in all 31,282 types, UNIQUE, arity 0, " &
+          "returning AimingManager", needsPlayer: false)
+  # Hop 2. Declared return is the INTERFACE `IBotAiming`, and that matters --
+  # see `amCurrent`'s entry in the refusal-adjacent notes and the comment on
+  # `AimIsReadySpec`. It is safe HERE because nothing calls a method on what
+  # comes back: the pointer is used as an IDENTITY and nothing else.
+  result.add SainRvaRow(key: "amCurrent",
+    label: "AimingManager::get_CurrentAiming",
+    rva: 0x23D5B60, prologue: "40 53 48 83 EC 20 80 3D EF CC CE 04 00 48 8B D9",
+    argc: 0'i32, ret: fkPtr, shape: srPlain, owners: 1,
+    virt: "flags 0x0886 -- non-virtual, UNIQUE. MEASURED: AimingManager holds " &
+          "_current (EAimingType) @0x18 and _aimingTypes " &
+          "(Dictionary<EAimingType,IBotAiming>) @0x20, so this is a dictionary " &
+          "lookup and what comes back is one of the concrete AimingToXxx " &
+          "nodes. THE RETURNED POINTER IS NEVER A RECEIVER -- driver.nim " &
+          "stores it as an address to match the postfix against, which is why " &
+          "the interface return is not a hazard here",
+    needsPlayer: false)
+
+  # --- The two safe medical READS that sit next to the three refused medical
+  # DRIVE calls. Arity 0, bool, UNIQUE, non-virtual, and neither of them makes
+  # a bot do anything: `ShallStartUse` is the game's own answer to "would this
+  # component start using itself right now", which is exactly the question
+  # `readSelf` was answering with `get_HaveWork`/`get_HaveSmth2Use` alone --
+  # i.e. "is there an item" rather than "would the game use it".
+  result.add SainRvaRow(key: "surgShall", label: "BotSurgicalKit::ShallStartUse",
+    rva: 0x1A24F40, prologue: "40 53 48 83 EC 30 48 8B 05 B3 FA 6A 05 48 8B D9",
+    argc: 0'i32, ret: fkBool, shape: srPlain, owners: 1,
+    virt: "flags 0x0086 -- non-virtual, UNIQUE. Receiver is the BotSurgicalKit " &
+          "the bound field row medSurgery (BotMedecine.SurgicalKit@0x28) " &
+          "produced, which is itself reached from the UNIQUE " &
+          "BotOwner::get_Medecine @0x80ECC0 -- the same chain surgHave " &
+          "already uses and is verified by", needsPlayer: false)
+  result.add SainRvaRow(key: "faShall", label: "BotFirstAid::ShallStartUse",
+    rva: 0x1A203F0, prologue: "40 53 48 83 EC 30 48 8B 11 48 8B D9 0F 29 74 24",
+    argc: 0'i32, ret: fkBool, shape: srPlain, owners: 1,
+    virt: "flags 0x0086 -- non-virtual, UNIQUE. The SECOND ShallStartUse in " &
+          "the image; the other is BotSurgicalKit's above. They are DIFFERENT " &
+          "addresses, so the by-name ambiguity that would exist here does not " &
+          "reach the table at all. Receiver is the BotFirstAid the bound field " &
+          "row medFirstAid (BotMedecine.FirstAid@0x18) produced",
+    needsPlayer: false)
 
   # --- Driving. The ONE driving call that resolved unambiguously.
   # `void LookToPoint(Vector3 point)`, arity 1, DERIVED not inferred:
@@ -641,32 +799,28 @@ proc sainRvaCandidates*(): seq[SainRvaCandidate] =
   ## because binding a key changes what `live.nim` does.
   result = @[]
 
-  result.add SainRvaCandidate(symbol: "EFT.BotOwner::get_AimingManager",
-    rva: 0x80E9B0, prologue: "48 8B 81 90 02 00 00 C3 CC CC CC CC CC CC CC CC",
-    argc: 0'i32, owners: 1, virt: "flags 0x0886 -- non-virtual",
-    why: "the post-1.0 replacement for the ABSENT get_AimingData, but it " &
-         "returns an AimingManager, not the AimingData shape sain.nim's aim " &
-         "postfix was written against. Binding the boAiming key to a " &
-         "different-shaped object is a change no offline evidence can check")
-  result.add SainRvaCandidate(symbol: "AimingManager::get_CurrentAiming",
-    rva: 0x23D5B60, prologue: "40 53 48 83 EC 20 80 3D EF CC CE 04 00 48 8B D9",
-    argc: 0'i32, owners: 1, virt: "flags 0x0886 -- non-virtual",
-    why: "second hop of the aim route; no key in live.nim asks for it yet")
-  result.add SainRvaCandidate(symbol: "Aiming::get_IsReady",
-    rva: 0x1AD48C0, prologue: "40 53 48 83 EC 30 80 3D BB B0 5E 05 00 48 8B D9",
-    argc: 0'i32, owners: 1,
-    virt: "flags 0x0886 -- non-virtual",
-    why: "third hop of the aim route. The receiver must be an `Aiming` -- i.e. " &
-         "exactly what get_CurrentAiming returned. The declared return type " &
-         "there is the INTERFACE IBotAiming, which has other implementors " &
-         "(UnderbarrelLauncherBotAiming does NOT derive from Aiming, MEASURED " &
-         "on the parent chain), so this is the one hop in the route that " &
-         "needs a live type check we cannot do")
-  result.add SainRvaCandidate(symbol: "BotSurgicalKit::ShallStartUse",
-    rva: 0x1A24F40, prologue: "40 53 48 83 EC 30 48 8B 05 B3 FA 6A 05 48 8B D9",
-    argc: 0'i32, owners: 1, virt: "flags 0x0086 -- non-virtual",
-    why: "a safe arity-0 bool READ next to the refused surgery drive call; " &
-         "no key in live.nim asks for it yet")
+  # THE AIM ROUTE HAS LEFT THIS TABLE. All three hops were candidates here and
+  # all three are now live: `boAiming` (get_AimingManager) and `amCurrent`
+  # (get_CurrentAiming) are bound rows above, and `Aiming::get_IsReady` is
+  # installed as a POSTFIX from `AimIsReadySpec`. `BotSurgicalKit::
+  # ShallStartUse` likewise became the `surgShall` row. Nothing was deleted
+  # quietly: each is named at its new home with the measurement that moved it.
+  result.add SainRvaCandidate(symbol: "UnderbarrelLauncherBotAiming::get_IsReady",
+    rva: 0x1AEFE30, prologue: "",
+    argc: 0'i32, owners: 2,
+    virt: "flags 0x09E6 -- VIRTUAL+FINAL+NEWSLOT, and SHARED with one other " &
+          "method",
+    why: "THE OTHER IBotAiming IMPLEMENTOR, recorded because its ABSENCE from " &
+         "the aim route is what makes the route safe rather than lucky. " &
+         "MEASURED: it declares its own get_IsReady at a different address, " &
+         "so it does NOT inherit Aiming::get_IsReady @0x1AD48C0 and does not " &
+         "derive from Aiming. When a bot's current aiming is this, the " &
+         "postfix simply never fires, no reading is stored, and the aim gate " &
+         "withholds nothing. DELIBERATELY NOT BOUND AND NOT HOOKED: its RVA " &
+         "is SHARED x2, and a detour on a folded address fires for every " &
+         "method that shares it. The prologue is left empty here BECAUSE " &
+         "nothing may bind it -- recording bytes for an address this file " &
+         "refuses to touch would only make it look ready")
 
 proc sainRvaRefusals*(): seq[SainRvaRefusal] =
   ## Every member `bindAll` asks for that this table will NOT bind, with the
@@ -680,60 +834,112 @@ proc sainRvaRefusals*(): seq[SainRvaRefusal] =
   # be refused here. They are now BOUND, as field rows, in `sainRvaFieldRows`.
   # None of them became a method; the members are still absent. What changed is
   # that the read no longer needs one.
-  result.add SainRvaRefusal(key: "boAiming", symbol: "get_AimingData",
-    why: swAbsent, detail: "no method named get_AimingData exists at any " &
-    "arity. The typed aim postfix in sain.nim therefore has no way to " &
-    "attribute a reading to a bot. The post-1.0 owner of aim state is " &
-    "AimingManager: BotOwner::get_AimingManager @0x80E9B0 (UNIQUE, " &
-    "non-virtual) -> AimingManager::get_CurrentAiming @0x23D5B60 (UNIQUE) -> " &
-    "an `Aiming`, whose get_IsReady is @0x1AD48C0. All three are measured and " &
-    "sit in sainRvaCandidates, deliberately unbound. The class literally " &
-    "named BotAimingData is NOT it: no field or getter anywhere in the image " &
-    "returns one, so it is unreachable and is not the replacement. " &
-    "DELIBERATELY STILL REFUSED although the read is now trivially available: " &
-    "EFT.BotOwner.<AimingManager> is a FIELD at 0x290 and the call site holds " &
-    "a BotOwner, so binding it would succeed and return a plausible pointer. " &
-    "It is refused because of what the ONLY consumer does with it -- " &
-    "driver.nim caches the returned ADDRESS as `aimKey` and matches it against " &
-    "readings the typed postfix on EFT.BotAimingData::get_IsReady deposits. " &
-    "That hook is on a class nothing in the image ever returns, so it never " &
-    "fires and the key can never match. Binding this would therefore report a " &
-    "successful read for a sensor that is still dead: a check that cannot " &
-    "fail (CLAUDE.md 9b). Re-point the hook first, then bind")
+  # `boAiming` USED to be refused here, with the longest detail in this file:
+  # get_AimingData is genuinely ABSENT, and the reachable replacement was
+  # refused anyway because its ONLY consumer matched the address against a
+  # postfix on EFT.BotAimingData::get_IsReady -- a class nothing in the image
+  # ever returns -- so binding it would have reported a successful read for a
+  # dead sensor. That refusal ended with "Re-point the hook first, then bind".
+  # THE HOOK HAS BEEN RE-POINTED (see AimIsReadySpec), so the key is now a
+  # BOUND ROW. The name get_AimingData is still absent and still not used.
 
   # --- WRONG ARITY: the name is here, at an arity this mod never calls.
   result.add SainRvaRefusal(key: "hcBodyPart", symbol: "GetBodyPartHealth",
-    why: swArity, detail: "declared arity 2 on EVERY owner; this mod calls it " &
-    "at arity 1. A member that exists only at an arity you never call is a " &
-    "member you can never bind. The real signature is DERIVED, not inferred: " &
-    "ValueStruct GetBodyPartHealth(EBodyPart bodyPart, bool rounded). The " &
-    "two bindable owners are ObservedPlayerHealthController @0x1E19290 and " &
-    "EFT.HealthInfoAdapter @0x8E4930, both UNIQUE, both flags 0x01E6 = " &
-    "VIRTUAL+FINAL+NEWSLOT so a direct non-virtual call is what the game " &
-    "itself makes. RECOVERABLE ONLY IF the call site is changed to arity 2 " &
-    "AND a struct-return shape: ValueStruct is a value type, so Win64 returns " &
-    "it through a caller-supplied hidden pointer. That is a call-site change, " &
-    "not a table change, so it is left refused")
+    why: swAmbiguous, detail: "REFUSED ON RECEIVER IDENTITY, which REPLACES " &
+    "the arity reason this row used to give. The arity was true and shallow: " &
+    "the signature is ValueStruct GetBodyPartHealth(EBodyPart, bool rounded), " &
+    "arity 2, and this mod called it at arity 1. Both halves of that are now " &
+    "expressible -- the arity, and the Win64 hidden-sret shape a ValueStruct " &
+    "return needs -- and the member is STILL refused, for a reason no call-" &
+    "site change can reach. THE MEASUREMENT: the receiver comes from " &
+    "EFT.Player::get_HealthController, which is `mov rax,[rcx+0xA20]; ret`, " &
+    "and EFT.Player._healthController@0xA20 is declared as the INTERFACE " &
+    "IHealthController. There are THREE implementations and this build gives " &
+    "no way to ask a live object which one it is. Two are ordinary bodies -- " &
+    "ObservedPlayerHealthController @0x1E19290 and EFT.HealthInfoAdapter " &
+    "@0x8E4930, both UNIQUE, both flags 0x01E6. The third is the one a " &
+    "spawned bot almost certainly has, EFT.HealthSystem.ActiveHealthController, " &
+    "which inherits BaseHealthController`1::GetBodyPartHealth -- a GENERIC " &
+    "with NO methodPointers entry and exactly two instantiated bodies, " &
+    "0x3BCC200 (class<object>) and 0x3BD24E0 " &
+    "(class<__Il2CppFullySharedGenericType>). BOTH ARE SHARED GENERICS, and a " &
+    "shared generic is the ONE case where the trailing MethodInfo* may not be " &
+    "NULL: it is where the body reads its type arguments from. The RVA path " &
+    "has no MethodInfo to pass. So the three candidate bodies are (a) " &
+    "uncallable without a MethodInfo, (b) and (c) correct only for a receiver " &
+    "we cannot identify -- and picking wrong runs a foreign body on a foreign " &
+    "object, which ANSWERS rather than faults. NOT RECOVERABLE by a call-site " &
+    "change; it needs a live type discriminator this build does not offer. " &
+    "CONSEQUENCE, unchanged and now stated: readHealth returns its default of " &
+    "1.0, so every bot is treated as being at full health, and no decision " &
+    "that keys on being hurt can fire. ValueStruct's layout was measured " &
+    "anyway so nobody re-derives it: Current@0x10, Maximum@0x14, Minimum@0x18 " &
+    "as fieldOffsets reports them, i.e. 0x0/0x4/0x8 into an unboxed 20-byte " &
+    "value once the 0x10 object header is removed")
+  # --- THE THREE MEDICAL DRIVE CALLS. All three are REFUSED PERMANENTLY, and
+  # the ground has changed from "the null-Action argument is unverified" to a
+  # MEASUREMENT of what each callee does with that argument. The three bodies
+  # were disassembled at their own RVAs against the installed
+  # GameAssembly.dll, and they agree exactly:
+  #
+  #   BotSurgicalKit::ApplyToCurrentPart @0x1A252F0 -- `mov rsi, rdx` takes
+  #     the Action, `call` allocates a closure, then `mov [rdi+0x18], rsi`
+  #     stores the delegate into it. NO null test anywhere before the store.
+  #   BotStimulators::TryApply @0x1A245E0 -- `mov rbp, r9` takes the
+  #     Action<bool>, then `mov [rsi+0x18], rbp`. Identical shape.
+  #   BotFirstAid::TryApplyToCurrentPart @0x1A20740 -- `mov rsi, r8` takes the
+  #     Action, then `mov r8, rsi` and forwards it to 0x181A21E70.
+  #
+  # THE FINDING, AND IT IS WORSE THAN THE THING WE WERE LOOKING FOR. None of
+  # the three dereferences the delegate inside the body at the named RVA -- so
+  # the question the refusal was waiting on ("does the callee dereference it
+  # unconditionally?") answers NO, and that answer does not clear the call.
+  # What each body does is STORE the delegate, unchecked, and hand ownership
+  # of the invoke to a continuation that runs later, on the game's own thread,
+  # when the animation or the use-timer completes. A null there is a crash
+  # that is separated from our call by an unbounded interval and by a stack
+  # that contains none of our frames -- the exact failure this project is
+  # least able to diagnose and least able to attribute. A store is not proof
+  # of safety; it is proof that the proof is not at this address.
+  #
+  # So: no offline evidence reachable from the callee can settle these, and
+  # constructing a real managed Action needs il2cpp_object_new plus a delegate
+  # whose method pointer and invoke thunk we would be assembling by hand.
+  # REFUSED PERMANENTLY unless somebody builds that delegate properly and can
+  # show it being invoked. Consequence: bots never heal, never use a stim and
+  # never do surgery on this mod's command; the game's own brain still does
+  # all three on its own schedule, which is what it did before SAIN existed.
+  # The safe READS beside them are BOUND -- faShall/surgShall (ShallStartUse)
+  # and the existing faHave/surgHave -- so the mod can SEE the state it is
+  # refusing to drive.
   result.add SainRvaRefusal(key: "faApply",
     symbol: "BotFirstAid::TryApplyToCurrentPart", why: swArity,
     detail: "declared arity 2, DERIVED: void TryApplyToCurrentPart(" &
     "Nullable<int> varianAnim, Action callback) @0x1A20740, UNIQUE, flags " &
-    "0x0086 non-virtual. Bindable in principle; NOT bound because it is a " &
-    "DRIVE call -- it makes the bot heal -- and because passing a null " &
-    "managed Action for the callback is unverified")
+    "0x0086 non-virtual. Bindable in principle; REFUSED PERMANENTLY. " &
+    "MEASURED at the RVA: the callback arrives in R8, is moved to RSI with " &
+    "no null test, and is forwarded in R8 to 0x181A21E70 -- it is never " &
+    "invoked in this body, so the delegate's fate is decided somewhere this " &
+    "disassembly does not reach, at a time our call does not bound. See the " &
+    "block comment above")
   result.add SainRvaRefusal(key: "stimApply", symbol: "BotStimulators::TryApply",
     why: swArity, detail: "declared arity 3, DERIVED: void TryApply(bool " &
     "noCheckDelay, Nullable<int> animVarian, Action<bool> callback) " &
-    "@0x1A245E0, UNIQUE, flags 0x0086 non-virtual. Same reason as faApply: a " &
-    "drive call with an unverified null-delegate argument")
+    "@0x1A245E0, UNIQUE, flags 0x0086 non-virtual. REFUSED PERMANENTLY. " &
+    "MEASURED at the RVA: the callback arrives in R9, is moved to RBP, and " &
+    "is stored into a freshly allocated closure at [rsi+0x18] with no null " &
+    "test on any path. Stored, not invoked. See the block comment above")
   result.add SainRvaRefusal(key: "surgApply",
     symbol: "BotSurgicalKit::TryApplyToCurrentPart", why: swArity,
     detail: "the only TryApplyToCurrentPart at a usable owner is arity 2; " &
     "this mod calls it at arity 0. MEASURED: BotSurgicalKit has NO method of " &
     "that name at all -- its equivalent is ApplyToCurrentPart(Action " &
-    "callbackEndUse) @0x1A252F0, arity 1, UNIQUE, non-virtual. A drive call, " &
-    "left refused. The safe READ next to it is ShallStartUse() @0x1A24F40, " &
-    "arity 0, bool, UNIQUE -- in sainRvaCandidates")
+    "callbackEndUse) @0x1A252F0, arity 1, UNIQUE, non-virtual. REFUSED " &
+    "PERMANENTLY. MEASURED at that RVA: the Action arrives in RDX, is moved " &
+    "to RSI, and after an allocation is stored at [rdi+0x18] with a GC write " &
+    "barrier and no null test. Stored, not invoked. See the block comment " &
+    "above. The safe READ next to it, ShallStartUse() @0x1A24F40, arity 0, " &
+    "bool, UNIQUE, is now the BOUND row surgShall")
 
   # --- WRONG OWNER / SHARED beyond evidence.
   #

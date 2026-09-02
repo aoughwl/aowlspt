@@ -114,6 +114,11 @@ type
     ## offline are refused BY NAME in the log rather than being retried through
     ## the token-gated by-name lookup that kills the client.
     rvaTable*: bool
+    ## How much of that table may bind: 0 observer / 1 reads / 2 aim / 3 drive.
+    ## Read even when `rvaTable` is false, and clamped by `setRvaDriveLevel`
+    ## rather than here, so that exactly one place decides what an out-of-range
+    ## number means.
+    rvaDriveLevel*: int
     ## Bot AI > Loadout: a global multiplier on how much loose loot a generated
     ## bot carries. Unlike every other field above, this one reaches the game on
     ## THIS build: it is not consumed by the client decision cascade (which never
@@ -317,6 +322,11 @@ proc loadPreset*(): Preset =
       doc.field("allowIl2cppReflection").asBool(false),
     rvaTable:
       doc.field("sainRvaTable").asBool(false),
+    rvaDriveLevel:
+      # Absent -> 0 OBSERVER, which is the same thing a missing flag has always
+      # meant here: nothing binds. A default of anything else would make an
+      # older config silently start calling into the game on upgrade.
+      int(doc.field("sainRvaTableDriveLevel").asFloat(0.0)),
     lootRichness: block:
       # Absent -> 1.0 (stock), never 0.0: a loot pass that read a missing knob
       # as empty is a silent regression to naked bots. Clamped so a typo in the

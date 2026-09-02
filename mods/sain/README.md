@@ -566,7 +566,7 @@ forty-fold apart and a log that says only "armed" cannot be used afterwards to
 say which a raid paid for.
 
 ```
-sain: bot aim result -- armed on the typed path on EFT.AimDataClass::get_IsReady, ...
+sain: bot aim result -- armed by static RVA on Aiming::get_IsReady @0x1AD48C0, ...
 sain:   measured 31 ns per firing over 512 of them, on this client's own clock
 sain: damage -- armed on the typed path on EFT.Player::ApplyDamageInfo(...), ...
 sain:   measured 31 ns per firing over 512 of them, on this client's own clock
@@ -826,7 +826,7 @@ whose magazine count cannot be read should not spend the raid reloading.
 | Any `EFT.` member name that post-1.0 renamed | That one read defaults; every other read is unaffected. Named in the binding report as `MISSING` with the class it was looked for on. |
 | `GameWorld.Grenades` (three guessed names: the getter, the list, the position) | `cdAvoidGrenade` never fires. Everything else is unaffected — the sample is raid-level and costs one refused call per tick. |
 | `BotOwner.BotsGroup` | Squads fall back to faction + proximity. Every squad decision still works. |
-| `BotOwner.AimingData` (identity only) | The aim postfix has no way to attribute its reading to a bot, so the aim gate never engages and bots shoot when the ladder says so — which is what they did before the hook existed. |
+| `BotOwner.AimingManager` / `AimingManager.CurrentAiming` (identity only) | Either hop refusing leaves the aim postfix's readings unattributable, so the aim gate never engages and bots shoot when the ladder says so — which is what they did before the hook existed. |
 | Any of the three candidate aim members, or the three candidate damage members | Named individually in the log with the signature the runtime reported. The aim gate stays off; suppression falls back to the health delta. Both are stated in the effect's own state line rather than inferred from silence. |
 | `UnityEngine.Physics::Raycast` — **now attempted**, by exact signature | No cover points. The cover *logic* runs on an empty set and the ladder falls through to the rungs below it; `moveTargetFor` substitutes "away from the enemy" for "to cover" — which is what it does on every build so far, because `tests/mockil2cpp`'s `UnityEngine.Physics` has no `Raycast` at any arity and BSG's client has never been asked. The refusal names the signature the runtime reported. |
 | `UnityEngine.AI.NavMesh::SamplePosition` — **now attempted**, by exact signature | Cover points are still produced, on the rays alone, and are no longer filtered by whether a bot can stand where one was proposed. A bot can then be sent at a place inside a wall, where `pathFailures` drops the point after three tries. Worse than having it; better than having no cover. |
@@ -946,12 +946,35 @@ right to; the difference is entirely the rate.
 The gate is built so that a wrong guess costs nothing. It can only ever
 *withhold* a shot, never order one; a bot with no fresh reading — the hook
 refused, the aim component moved, two components collided in the fixed table —
-behaves exactly as it did before this sensor existed. Three candidate names are
-tried in order, the signature of each is checked against the runtime (no
-parameters, `System.Boolean` return) before anything is patched, and a mismatch
-refuses by name. Attribution is by the aim component's own address, out of
-`this`, matched against `BotOwner.AimingData` — held as an identity and never
-dereferenced, exactly as `BotsGroup` is.
+behaves exactly as it did before this sensor existed. The postfix is installed **by verified static RVA**, not by name:
+`Aiming::get_IsReady@0x1AD48C0` (UNIQUE, owners=1), through the host's typed
+patch ABI, which needs no class lookup and no `MethodInfo`. The host checks the
+module base, that the address is committed executable memory, that it is inside
+GameAssembly's `il2cpp` PE section, and that its first sixteen bytes match its
+own **startup snapshot** — so another feature's trampoline cannot make a correct
+address self-reject.
+
+The three *name* candidates that preceded it are kept in the source as the
+record of a sensor that was dead in three different ways at once and reported
+none of them: `EFT.AimDataClass` is not a type on this build, `EFT.BotAimingData`
+is a type nothing in the image ever returns, and `EFT.BotOwner::get_AimingIsReady`
+does not exist — and `armAimHook` was in any case never reached, because
+`installHooks` returned above it.
+
+Attribution is by the aiming node's own address, out of `this`, matched against
+the two-hop walk `BotOwner → AimingManager → CurrentAiming` — held as an
+identity and never dereferenced, exactly as `BotsGroup` is. `CurrentAiming` is
+declared to return the interface `IBotAiming`, and that is safe only because
+nothing is ever called on the result: every `AimingToXxx` node inherits the one
+UNIQUE `Aiming::get_IsReady` body, while `UnderbarrelLauncherBotAiming` declares
+its own at a different address, so when *it* is current the postfix simply never
+fires, no reading is stored, and nothing is gated. The wrong-type case costs a
+**missing** reading, never a wrong one.
+
+The driver reports **fired / matched / withheld** as three separate numbers,
+because they distinguish the three ways this sensor can be dead — the hook is on
+the wrong address, the walk keys on the wrong object, or it works and every bot
+was already settled — and one number could not tell them apart.
 
 The reading is stored in a fixed direct-mapped table rather than queued. A
 queue is right for deaths, which are two per tick at worst; at sixty entries

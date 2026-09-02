@@ -607,6 +607,60 @@ proc setRvaTable*(v: bool) =
 
 proc rvaTableOn*(): bool = gRvaTable
 
+var gRvaDriveLevel = 0
+var gRvaLevelRefused = 0
+
+const RvaLevelObserver* = 0
+const RvaLevelReads* = 1
+const RvaLevelAim* = 2
+const RvaLevelDrive* = 3
+
+proc setRvaDriveLevel*(v: int) =
+  ## `sainRvaTableDriveLevel`, clamped, from `onLoad`.
+  ##
+  ## FOUR NOTCHES, and they exist because "the table is on" used to mean
+  ## "everything the table can do is on". That put `stLookTo` -- a call that
+  ## turns a live bot's head -- and `rlTryReload` -- a call that makes it
+  ## reload -- behind the same switch as reading a stamina float. A coordinator
+  ## raising one raid's worth of risk at a time could not do it, and the only
+  ## available granularity was all or nothing.
+  ##
+  ##   0 OBSERVER -- rows load, the table reports itself, NOTHING binds. Every
+  ##                 `ensure` on a keyed member refuses and says why. This is
+  ##                 what `sainRvaTable = false` does, except that the report
+  ##                 still runs, so a raid at level 0 is a dry run of the
+  ##                 refusals with no calls at all.
+  ##   1 READS    -- every getter and every field row binds. No call at this
+  ##                 level takes an argument or returns void, and the field
+  ##                 mechanism has no invoke path, so nothing here can change
+  ##                 the game's state.
+  ##   2 AIM      -- level 1, plus the two aim-route hops and the postfix on
+  ##                 `Aiming::get_IsReady`. Still read-only: the postfix
+  ##                 watches (`frameContinue`), and the gate it feeds can only
+  ##                 WITHHOLD a shot the decision ladder already ordered.
+  ##   3 DRIVE    -- level 2, plus the calls that make a bot do something:
+  ##                 `stLookTo` and `rlTryReload`. Every other drive member
+  ##                 SAIN asks for is a stated refusal, so level 3 is TWO
+  ##                 calls and not a combat brain. Saying that here rather
+  ##                 than letting the name imply otherwise.
+  if v < RvaLevelObserver:
+    gRvaDriveLevel = RvaLevelObserver
+  elif v > RvaLevelDrive:
+    gRvaDriveLevel = RvaLevelDrive
+  else:
+    gRvaDriveLevel = v
+
+proc rvaDriveLevel*(): int = gRvaDriveLevel
+
+proc rvaLevelName*(v: int): string =
+  case v
+  of RvaLevelObserver: "0 OBSERVER (nothing binds)"
+  of RvaLevelReads:    "1 READS"
+  of RvaLevelAim:      "2 AIM"
+  else:                "3 DRIVE"
+
+proc rvaLevelRefusals*(): int = gRvaLevelRefused
+
 proc rvaLoad() =
   if gRvaLoaded:
     return
@@ -849,6 +903,10 @@ type
     fldKind*: FastKind
     fldNeedsPlayer*: bool
     fldUnityObj*: bool   ## check m_CachedPtr on the receiver before reading
+    levelSaid*: bool
+    ## Whether the drive-level refusal has already been logged for this member.
+    ## One line per member per session, not one per frame -- and deliberately
+    ## NOT `rvaTried`, which would freeze the refusal in place; see `ensure`.
 
 proc emptyBinding(): Binding =
   Binding(ok: false, why: "", target: "", fn: cast[Il2CppPtr](0),
@@ -863,7 +921,7 @@ proc lazy*(member: string; argc: int32 = 0'i32): LazyCall =
            gated: false, shapeWanted: dsNoArgs, gateRefused: false,
            tried: false, why: "", rvaKey: "", rvaTried: false,
            fldOk: false, fldOff: 0, fldKind: fkNone, fldNeedsPlayer: false,
-           fldUnityObj: false)
+           fldUnityObj: false, levelSaid: false)
 
 proc keyed*(l: LazyCall; key: string): LazyCall =
   ## Point a member at its row -- or its refusal -- in `client/rvatable.nim`.
@@ -1346,6 +1404,9 @@ proc resolveFromRva(l: var LazyCall) =
   l.tried = true
   l.m = cast[Il2CppMethod](0)
   l.b = emptyBinding()
+  # (the drive-level gate is in `ensure`, BEFORE this runs -- see there. It is
+  # not repeated here, because a member refused by level must not be counted
+  # as resolved, and reaching this proc at all sets `rvaTried`.)
   l.shape = csNone
   l.fills = @[]
   l.gateRefused = false
@@ -1526,6 +1587,28 @@ proc ensure*(l: var LazyCall; obj: Il2CppPtr): bool =
   # this returns true on.
   if l.rvaKey.len > 0:
     if not gRvaTable:
+      return false
+    # --- THE DRIVE-LEVEL GATE, before the receiver check and before any
+    # resolution, so that a member above the level is not merely uncalled but
+    # UNBOUND -- nothing is verified, nothing is counted as ready, and the
+    # binding report cannot show it as available.
+    #
+    # `rvaTried` is deliberately NOT set on this path. A level refusal is a
+    # configuration state, not a measurement, and it must become a binding the
+    # moment the level is raised; setting `rvaTried` here would make the first
+    # tick at level 1 decide the whole session.
+    let need = sainRvaLevelFor(l.rvaKey)
+    if need > gRvaDriveLevel:
+      if not l.levelSaid:
+        l.levelSaid = true
+        gRvaLevelRefused = gRvaLevelRefused + 1
+        l.why = l.rvaKey & ": ABOVE THE DRIVE LEVEL. This member needs " &
+                rvaLevelName(need) & " and sainRvaTableDriveLevel is " &
+                rvaLevelName(gRvaDriveLevel) & ". Nothing was bound, nothing " &
+                "was verified and nothing was called -- this is a refusal by " &
+                "configuration, not a measurement, and raising the level " &
+                "makes it bind on the next tick without a restart."
+        warn "sain:   LEVEL   " & l.why
       return false
     if not sainReadable(obj, 8):
       return false
@@ -2039,6 +2122,16 @@ type
     ## driver caches the answer per bot and re-derives it only when the reading
     ## it is keyed on has gone stale, which in a working raid is never.
     boAiming*: LazyCall
+    amCurrent*: LazyCall
+    ## Hop 2 of the aim route: `AimingManager::get_CurrentAiming`.
+    ##
+    ## Its value is USED AS AN ADDRESS AND NOTHING ELSE. The declared return is
+    ## the interface `IBotAiming`, so what comes back may be any implementor --
+    ## and the one implementor that is not an `Aiming` subclass
+    ## (UnderbarrelLauncherBotAiming) is exactly the case where the postfix in
+    ## `sain.nim` never fires, so no reading is ever stored under that address
+    ## and the gate withholds nothing. Nothing is ever called ON this pointer;
+    ## if that changes, the interface return becomes a hazard again.
 
     # The bot's memory
     memUnderFire*: LazyCall
@@ -2068,6 +2161,8 @@ type
     faHave*: LazyCall
     stimHave*: LazyCall
     surgHave*: LazyCall
+    faShall*: LazyCall           ## BotFirstAid::ShallStartUse -- a READ
+    surgShall*: LazyCall         ## BotSurgicalKit::ShallStartUse -- a READ
     faApply*: LazyCall
     stimApply*: LazyCall
     surgApply*: LazyCall
@@ -2186,7 +2281,12 @@ proc bindAll*() =
   gB.boSteering = keyed(lazy("get_Steering"), "boSteering")
   gB.boShoot = keyed(lazy("get_ShootData"), "boShoot")
   gB.boMedecine = keyed(lazy("get_Medecine"), "boMedecine")
-  gB.boAiming = keyed(lazy("get_AimingData"), "boAiming")
+  # The aim route, hop 1 and hop 2. `lazy`'s member string is now dead weight
+  # on a keyed member -- the address comes from the row, never from a name --
+  # but it is kept truthful rather than emptied, because it is what the
+  # `unused` branch of `reportOne` prints and a lie there is worse than noise.
+  gB.boAiming = keyed(lazy("get_AimingManager"), "boAiming")
+  gB.amCurrent = keyed(lazy("get_CurrentAiming"), "amCurrent")
 
   gB.memUnderFire = keyed(lazy("get_IsUnderFire"), "memUnderFire")
   gB.memGoalEnemy = keyed(lazy("get_GoalEnemy"), "memGoalEnemy")
@@ -2209,6 +2309,8 @@ proc bindAll*() =
   gB.faHave = keyed(lazy("get_HaveSmth2Use"), "faHave")
   gB.stimHave = keyed(lazy("get_HaveSmth2Use"), "stimHave")
   gB.surgHave = keyed(lazy("get_HaveWork"), "surgHave")
+  gB.faShall = keyed(lazy("ShallStartUse"), "faShall")
+  gB.surgShall = keyed(lazy("ShallStartUse"), "surgShall")
   # The three self-actions are gated too, and for a smaller reason than the
   # movers: `TryApply` on a stimulator component takes no arguments here, and
   # a build where it takes an item or a body part would resolve at arity zero
@@ -2317,6 +2419,51 @@ proc rvaReport*() =
        "RVA, " & $gRvaFieldRows.len & " row(s) bindable by FIELD READ, " &
        $gRvaRefusals.len & " member(s) REFUSED. Derived against " &
        SainRvaScope & "."
+  # THE LEVEL, said before the rows, because it decides how much of what
+  # follows can bind at all. At level 0 every line below describes something
+  # that is loaded and will not be used, and a reader must not have to infer
+  # that from a later absence of calls.
+  info "sain: RVA drive level -- sainRvaTableDriveLevel = " &
+       rvaLevelName(gRvaDriveLevel) &
+       (if gRvaDriveLevel == RvaLevelObserver:
+          ". NOTHING WILL BIND. Every keyed member refuses at `ensure` with a " &
+          "LEVEL line naming what it would have needed. Raise it one notch " &
+          "per raid: 1 reads, 2 adds the aim route, 3 adds the two calls that " &
+          "make a bot act (stLookTo, rlTryReload)."
+        elif gRvaDriveLevel == RvaLevelReads:
+          ". Reads only: every bound member is an arity-0 getter or a field " &
+          "read, so nothing at this level can change the game's state. The " &
+          "aim route and the two drive calls are refused by level."
+        elif gRvaDriveLevel == RvaLevelAim:
+          ". Reads plus the aim route. The postfix on Aiming::get_IsReady " &
+          "WATCHES -- it returns frameContinue and never rewrites the " &
+          "readiness -- and the gate it feeds can only WITHHOLD a shot the " &
+          "decision ladder already ordered. The two drive calls are still " &
+          "refused by level."
+        else:
+          ". DRIVE. Two calls can now make a bot act: BotSteering::" &
+          "LookToPoint and BotReload::TryReload. Every OTHER drive member " &
+          "SAIN asks for -- GoToPoint, Sprint, Stop, Shoot and all three " &
+          "medical applies -- is a stated refusal below, so this level is two " &
+          "calls, not a combat brain.")
+  # The audit for the level table itself, run before anything binds, and
+  # written as a NEGATIVE: it looks for a row that mutates and is reachable
+  # below level 3, so it can actually fail. A positive assertion that
+  # `stLookTo` is level 3 would pass forever however many drive rows were
+  # added after it.
+  let driveBugs = sainRvaDriveAudit(gRvaRows)
+  if driveBugs.len == 0:
+    info "sain: RVA drive-level audit PASS -- no row with the shape of a " &
+         "drive call (arguments, or a void return) is reachable below level " &
+         "3, across all " & $gRvaRows.len & " row(s). NOTE the one case this " &
+         "audit CANNOT see: BotReload::TryReload is `bool TryReload()`, the " &
+         "exact shape of a getter, and it drives. It is classified level 3 by " &
+         "hand, which is why a human still has to read a new row."
+  else:
+    var d = 0
+    while d < driveBugs.len:
+      warn "sain: RVA drive-level audit FAIL -- " & driveBugs[d]
+      inc d
   var f = 0
   while f < gRvaFieldRows.len:
     let fr = gRvaFieldRows[f]
@@ -2392,7 +2539,8 @@ proc report*() =
   reportOne("BotOwner.Mover", gB.boMover)
   reportOne("BotOwner.Steering", gB.boSteering)
   reportOne("BotOwner.ShootData", gB.boShoot)
-  reportOne("BotOwner.AimingData (identity only)", gB.boAiming)
+  reportOne("BotOwner.AimingManager (identity only)", gB.boAiming)
+  reportOne("AimingManager.CurrentAiming (identity only)", gB.amCurrent)
   reportOne("BotOwner.BotsGroup (identity only)", gB.boBotsGroup)
   reportOne("GameWorld.Grenades", gB.wGrenades)
   reportOne("Grenade.Position", gB.grPosition)
@@ -2409,6 +2557,8 @@ proc report*() =
   reportOne("Steering.LookToPoint", gB.stLookTo)
   reportOne("ShootData.Shoot", gB.sdShoot)
   reportOne("Mover.Stop", gB.mvStop)
+  reportOne("FirstAid.ShallStartUse", gB.faShall)
+  reportOne("SurgicalKit.ShallStartUse", gB.surgShall)
   reportOne("FirstAid.TryApplyToCurrentPart", gB.faApply)
   reportOne("Stimulators.TryApply", gB.stimApply)
   reportOne("SurgicalKit.TryApplyToCurrentPart", gB.surgApply)
@@ -2482,6 +2632,7 @@ proc tally*(): BindTally =
   tallyOne(result, gB.boShoot)
   tallyOne(result, gB.boMedecine)
   tallyOne(result, gB.boAiming)
+  tallyOne(result, gB.amCurrent)
   tallyOne(result, gB.boBotsGroup)
   tallyOne(result, gB.wGrenades)
   tallyOne(result, gB.glCount)
@@ -2507,6 +2658,8 @@ proc tally*(): BindTally =
   tallyOne(result, gB.medFirstAid)
   tallyOne(result, gB.medStims)
   tallyOne(result, gB.medSurgery)
+  tallyOne(result, gB.faShall)
+  tallyOne(result, gB.surgShall)
   tallyOne(result, gB.faApply)
   tallyOne(result, gB.stimApply)
   tallyOne(result, gB.surgApply)

@@ -278,6 +278,24 @@ var gAimHooked = false
 var gAimGated = 0
   ## How many times a shot was withheld because the aim had not settled. The
   ## one number that says whether this sensor is doing anything.
+var gAimNoted = 0
+  ## How many times the postfix FIRED. Counted separately from `gAimGated`
+  ## because the two answer different questions and collapsing them hid the
+  ## interesting failure: a hook that arms and never fires -- which is exactly
+  ## what the old postfix on `EFT.BotAimingData::get_IsReady` did, on a class
+  ## nothing in the image ever returns -- looks identical, in `gAimGated`
+  ## alone, to a hook that fires constantly and finds every bot already
+  ## settled. `gAimNoted == 0` in a raid with bots is the falsifiable statement
+  ## that the re-pointed hook is on the wrong address after all.
+var gAimMatched = 0
+  ## How many times a reading was FOUND under the address the two-hop walk
+  ## produced. The third distinct number, and the one that settles whether the
+  ## key matches: `gAimNoted > 0` with `gAimMatched == 0` means the postfix
+  ## fires and the walk is keying on the wrong object, which is a different
+  ## bug from either of the other two and used to be indistinguishable.
+var gAimSaid = false
+var gAimFirstKey = 0'u64
+var gAimFirstReady = false
 
 proc setAimHooked*(v: bool) = gAimHooked = v
 proc aimHooked*(): bool = gAimHooked
@@ -297,6 +315,13 @@ proc noteAim*(who: uint64; ready: bool) =
   if who == 0'u64:
     return
   let i = aimSlotOf(who)
+  gAimNoted = gAimNoted + 1
+  if not gAimSaid:
+    # The FIRST firing only, and stashed rather than logged: this runs on
+    # whichever thread the game called the getter from, and the host's log is
+    # not this proc's to touch. `aimAnnounce`, on the host's thread, prints it.
+    gAimFirstKey = who
+    gAimFirstReady = ready
   gAimAt[i] = perfCounter()
   gAimReady[i] = (if ready: 1'u64 else: 0'u64)
   # Last, and that order is load-bearing: a reader matches on the key, so the
@@ -328,7 +353,48 @@ proc aimReadingFor(key: uint64; ready: var bool): bool =
   if nanosBetween(gAimAt[i], perfCounter()) > AimFreshNs:
     return false
   ready = gAimReady[i] != 0'u64
+  gAimMatched = gAimMatched + 1
   result = true
+
+proc aimHexU64(v: uint64): string =
+  ## A local, capped hex formatter. Sixteen iterations, no allocation past the
+  ## string itself, and it exists here rather than reaching into `live.nim`
+  ## because `rvaHexs` there is unexported and widening its surface for one log
+  ## line is a worse trade than fourteen lines of arithmetic.
+  const D = "0123456789abcdef"
+  if v == 0'u64:
+    return "0"
+  var n = v
+  var buf = ""
+  var guard = 0
+  while n > 0'u64 and guard < 16:
+    buf.add D[int(n and 15'u64)]
+    n = n shr 4
+    inc guard
+  result = ""
+  var i = buf.len - 1
+  while i >= 0:
+    result.add buf[i]
+    dec i
+
+proc aimAnnounce*() =
+  ## The readback for the re-pointed aim postfix, once, on the HOST's thread.
+  ##
+  ## It asserts a property of the finished state rather than of our own write:
+  ## that a reading exists, deposited by the game calling a method we did not
+  ## call, carrying an address and a bool. It cannot fire if the postfix never
+  ## fires, which is the failure the old hook had and could not report.
+  if gAimSaid or gAimNoted <= 0:
+    return
+  gAimSaid = true
+  info "sain: AIM POSTFIX FIRED -- " & $gAimNoted & " reading(s) so far. " &
+       "First: aiming node 0x" & aimHexU64(gAimFirstKey) & " reported IsReady=" &
+       (if gAimFirstReady: "true" else: "false") &
+       ". This is the game calling Aiming::get_IsReady @0x1AD48C0 on its own " &
+       "schedule; nothing here called it. A reading is only USED when the " &
+       "two-hop walk BotOwner -> AimingManager -> CurrentAiming produces this " &
+       "same address -- see the matched count in the status line, which is " &
+       "the number that says the key lines up."
 
 # ---------------------------------------------------------------------------
 # Damage, told rather than inferred
@@ -1171,14 +1237,36 @@ proc tickBot(index: int): bool =
       var ready = false
       var have = aimReadingFor(st.aimKey, ready)
       if not have:
-        # No reading under the address held. Re-derive it -- one bound call --
-        # and try once more. This is the only place `AimingData` is asked for,
-        # and in a raid where the hook is working it runs once per bot and
-        # then never again.
-        let ad = callObj(gB.boAiming, l.owner)
-        if ad != nil:
-          st.aimKey = cast[uint64](ad)
-          have = aimReadingFor(st.aimKey, ready)
+        # No reading under the address held. Re-derive it and try once more.
+        #
+        # TWO bound calls, not one, and the second hop is the whole reason
+        # this sensor works at all. The postfix in `sain.nim` is installed on
+        # `Aiming::get_IsReady` @0x1AD48C0, so the address it deposits a
+        # reading under is the CONCRETE AIMING NODE the game called that
+        # getter on -- not the BotOwner and not the AimingManager. Keying on
+        # the manager (which is what a single `boAiming` hop returns) could
+        # therefore never match, and a key that can never match is a sensor
+        # that reports nothing while looking wired: CLAUDE.md 9b.
+        #
+        # So: BotOwner -> AimingManager -> CurrentAiming, each hop refusing on
+        # its own. `amCurrent`'s declared return is the interface IBotAiming,
+        # and that is safe HERE and only here because the pointer is used as
+        # an IDENTITY: nothing is ever called on it. When the current aiming
+        # is the one implementor that is not an `Aiming` subclass, the postfix
+        # never fires for it, `aimReadingFor` finds nothing, and the gate
+        # withholds nothing -- the bot shoots exactly as it did before this
+        # sensor existed. The failure mode is a MISSING reading, never a wrong
+        # one.
+        #
+        # In a raid where the hook is working this runs once per bot and then
+        # never again -- the aiming node changes only when the bot's aiming
+        # TYPE changes, and a stale key simply reads as "no fresh reading".
+        let am = callObj(gB.boAiming, l.owner)
+        if am != nil:
+          let ad = callObj(gB.amCurrent, am)
+          if ad != nil:
+            st.aimKey = cast[uint64](ad)
+            have = aimReadingFor(st.aimKey, ready)
       if have and not ready:
         a.shoot = false
         gAimGated = gAimGated + 1
@@ -1336,6 +1424,10 @@ proc tick*(elapsedMs: int64) =
   if dt < 0.001: dt = 0.001
   gTimeSeconds = gTimeSeconds + dt
   updatePlayerPosition(dt)
+  # The aim readback, on the HOST's thread and before the early return: a
+  # postfix that fires while the bot table is momentarily empty is still
+  # evidence the hook is live, and returning first would have hidden it.
+  aimAnnounce()
   if gBots.len == 0:
     return
   # Three raid-level passes, once each per tick rather than once per bot. The
@@ -1545,7 +1637,15 @@ proc stats*(): string =
            $gDetached & " released, " & $gPeakConsidered &
            " bots in the busiest tick, death " &
            (if gDeathHooked: "hooked" else: "polled") &
-           ", aim " & (if gAimHooked: "hooked (" & $gAimGated &
+           # Three numbers, not one. FIRED / MATCHED / WITHHELD separate the
+           # three ways this sensor can be dead: never fired (the hook is on
+           # the wrong address), fired but never matched (the two-hop walk
+           # keys on the wrong object), matched but never withheld (it works
+           # and every bot was already settled). One number could not tell
+           # them apart, and the previous hook was dead in the FIRST way for
+           # its whole life without that ever being visible.
+           ", aim " & (if gAimHooked: "hooked (" & $gAimNoted & " fired, " &
+                       $gAimMatched & " matched, " & $gAimGated &
                        " shots withheld)" else: "not hooked") &
            ", damage " & (if gDmgHooked: "hooked (" & $gDmgEvents &
                           " hits told)" else: "inferred from health") &

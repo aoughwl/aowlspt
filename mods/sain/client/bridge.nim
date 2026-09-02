@@ -570,6 +570,14 @@ proc sensorVerdicts*(l: BotLive) =
     warn "sain: SENSOR verdicts INCONCLUSIVE for every sensor -- sainRvaTable " &
          "is OFF (its default), so no chain was walked. This is not a pass."
     return
+  if rvaDriveLevel() < RvaLevelReads:
+    gVerdictsDone = true
+    warn "sain: SENSOR verdicts INCONCLUSIVE for every sensor -- " &
+         "sainRvaTable is on but sainRvaTableDriveLevel is " &
+         rvaLevelName(rvaDriveLevel()) & ", so no member bound and no chain " &
+         "was walked. This is not a pass, and it is a DIFFERENT state from " &
+         "the flag being off: the table loaded and reported itself."
+    return
   if not l.ok or l.player == nil:
     return                      # no bot yet; try again next tick, stay silent
   gVerdictsDone = true
@@ -702,16 +710,35 @@ proc sensorVerdicts*(l: BotLive) =
     verdict("medFirstAid", "INCONCLUSIVE", "not reached: get_Medecine null")
     verdict("medStims", "INCONCLUSIVE", "not reached: get_Medecine null")
     verdict("medSurgery", "INCONCLUSIVE", "not reached: get_Medecine null")
+    verdict("faShall", "INCONCLUSIVE", "not reached: get_Medecine null")
+    verdict("surgShall", "INCONCLUSIVE", "not reached: get_Medecine null")
   else:
     let fa = callObj(gB.medFirstAid, med)
     if fa == nil:
       verdict("medFirstAid", "FAIL",
               "BotMedecine.FirstAid@0x18 read null off a BotMedecine the " &
               "UNIQUE get_Medecine produced -- receiver right, offset suspect.")
+      verdict("faShall", "INCONCLUSIVE", "not reached: medFirstAid was null")
     else:
       verdict("medFirstAid", "PASS",
               "BotMedecine.FirstAid@0x18 returned a readable BotFirstAid; " &
               "canHeal = " & $callBoolOn(gB.faHave, fa, false))
+      # Two DIFFERENT defaults on purpose. `faShall` is read with a default of
+      # TRUE at the call site, because there it is ANDed with faHave and a
+      # refused binding must not turn a false into a true. Here it is read
+      # with FALSE, because this line is asking "did the call come back" and a
+      # default that matches the interesting answer would make the verdict
+      # unfalsifiable. Same row, two questions, and they want opposite
+      # defaults -- which is worth the four extra words.
+      verdict("faShall", "PASS",
+              "BotFirstAid::ShallStartUse @0x1A203F0 (arity 0, bool, UNIQUE, " &
+              "non-virtual) called on the BotFirstAid the field row above " &
+              "produced: " & $callBoolOn(gB.faShall, fa, false) &
+              ". This is the game's own 'would I start using this now', which " &
+              "is a stricter question than faHave's 'is there an item'. It " &
+              "sits beside the PERMANENTLY REFUSED drive call " &
+              "TryApplyToCurrentPart @0x1A20740 -- see rvatable.nim for the " &
+              "disassembly that refused it.")
     let stim = callObj(gB.medStims, med)
     if stim == nil:
       verdict("medStims", "FAIL",
@@ -729,12 +756,19 @@ proc sensorVerdicts*(l: BotLive) =
       verdict("medSurgery", "FAIL",
               "BotMedecine.SurgicalKit@0x28 read null; receiver right, " &
               "offset suspect.")
+      verdict("surgShall", "INCONCLUSIVE", "not reached: medSurgery was null")
     else:
       verdict("medSurgery", "PASS",
               "BotMedecine.SurgicalKit@0x28 returned a readable " &
               "BotSurgicalKit, which is the receiver the bound " &
               "BotSurgicalKit::get_HaveWork @0x1A24F20 wants; canDoSurgery = " &
               $callBoolOn(gB.surgHave, surg, false))
+      verdict("surgShall", "PASS",
+              "BotSurgicalKit::ShallStartUse @0x1A24F40 (arity 0, bool, " &
+              "UNIQUE, non-virtual) called on that same BotSurgicalKit: " &
+              $callBoolOn(gB.surgShall, surg, false) &
+              ". The safe READ that sits beside the PERMANENTLY REFUSED " &
+              "drive call ApplyToCurrentPart @0x1A252F0.")
 
   # --- and the ones that stayed refused, said out loud here too, so a reader
   # of the verdict block is not left to infer their absence.
@@ -742,15 +776,68 @@ proc sensorVerdicts*(l: BotLive) =
           "REFUSED BY DESIGN, on receiver grounds: the field exists at 0x58 " &
           "on BotWeaponManager, but `grenadeList` passes the GAMEWORLD. A " &
           "foreign field read answers rather than faults, so it is not taken.")
-  verdict("boAiming", "INCONCLUSIVE",
-          "REFUSED BY DESIGN: BotOwner.<AimingManager>@0x290 is readable, but " &
-          "its only consumer matches the address against a hook on " &
-          "EFT.BotAimingData::get_IsReady, a class nothing in the image " &
-          "returns. Binding it would report a pass for a dead sensor.")
+  # --- The aim route, walked here as two hops and DELIBERATELY NOT verdicted
+  # as a pass on the strength of the walk alone.
+  #
+  # Both hops returning a pointer proves the walk; it does not prove the
+  # SENSOR, because the sensor is the postfix and the postfix is on an address
+  # this walk never touches. Reporting PASS here for "two pointers came back"
+  # would be the same shape of check that made the old hook look armed for its
+  # whole life. So the verdict below tops out at "the walk works", and names
+  # the number that settles the rest.
+  if l.owner == nil:
+    # "I could not look" is INCONCLUSIVE, never FAIL. Without this the two
+    # hops below would both read null off a null receiver and be reported as
+    # broken rows, which is a confidently wrong diagnosis of a correct table.
+    verdict("boAiming", "INCONCLUSIVE", "not walked: no BotOwner on this bot")
+    verdict("amCurrent", "INCONCLUSIVE", "not reached: no BotOwner")
+  elif rvaDriveLevel() < RvaLevelAim:
+    verdict("boAiming", "INCONCLUSIVE",
+            "not walked: sainRvaTableDriveLevel is " &
+            rvaLevelName(rvaDriveLevel()) & " and the aim route needs " &
+            rvaLevelName(RvaLevelAim) & ".")
+    verdict("amCurrent", "INCONCLUSIVE", "not reached: same level refusal.")
+  else:
+    let am = callObj(gB.boAiming, l.owner)
+    if am == nil:
+      verdict("boAiming", "FAIL",
+              "hop 1 of 2 (EFT.BotOwner::get_AimingManager @0x80E9B0, UNIQUE) " &
+              "returned null or refused its guard off the same BotOwner the " &
+              "five bound get_* rows are called on.")
+      verdict("amCurrent", "INCONCLUSIVE", "not reached: hop 1 failed.")
+    else:
+      verdict("boAiming", "PASS",
+              "hop 1 of 2 returned a readable AimingManager. Used as an " &
+              "identity only; nothing is called on it but hop 2.")
+      let ad = callObj(gB.amCurrent, am)
+      if ad == nil:
+        verdict("amCurrent", "FAIL",
+                "hop 2 of 2 (AimingManager::get_CurrentAiming @0x23D5B60, " &
+                "UNIQUE) returned null off an AimingManager hop 1 produced. " &
+                "A bot with no current aiming type reads this way too, so a " &
+                "single null here is not proof the row is wrong.")
+      else:
+        verdict("amCurrent", "INCONCLUSIVE",
+                "hop 2 of 2 returned a readable IBotAiming, so THE WALK " &
+                "WORKS -- and that is not the same claim as the sensor " &
+                "working, which is why this is not a PASS. The pointer is " &
+                "only useful if the postfix on Aiming::get_IsReady @0x1AD48C0 " &
+                "deposits readings under this SAME address. The falsifiable " &
+                "statement is the driver status line's aim triple: `fired` > " &
+                "0 says the postfix is on a live address, `matched` > 0 says " &
+                "this walk keys on the same object it fires with. Either at " &
+                "zero in a raid with bots is a FAIL that this one-shot walk " &
+                "cannot see.")
   verdict("hcBodyPart", "INCONCLUSIVE",
-          "STILL REFUSED: GetBodyPartHealth is arity 2 and returns a " &
-          "ValueStruct by hidden sret pointer. The table expresses neither " &
-          "shape, so this is a call-site change, not a table change.")
+          "REFUSED PERMANENTLY, on stronger grounds than the arity it used to " &
+          "cite. EFT.Player._healthController@0xA20 is declared as the " &
+          "INTERFACE IHealthController; the implementation a spawned bot most " &
+          "likely has, ActiveHealthController, inherits BaseHealthController" &
+          "`1::GetBodyPartHealth, whose only two bodies (0x3BCC200, 0x3BD24E0) " &
+          "are SHARED GENERICS and so need a non-NULL MethodInfo* the RVA " &
+          "path has none of. Nothing on this build can ask a live object " &
+          "which implementation it is. CONSEQUENCE: readHealth returns 1.0, " &
+          "so every bot is treated as at full health.")
 
 proc readSelf*(b: BotHandle; l: BotLive): SelfView =
   ## One pass of reads into a plain struct.
@@ -836,15 +923,30 @@ proc readSelf*(b: BotHandle; l: BotLive): SelfView =
   # --- what the bot could do to itself
   let med = callObj(gB.boMedecine, l.owner)
   if med != nil:
+    # TWO reads per component, ANDed, and the second is the stricter one.
+    #
+    # `get_HaveSmth2Use` / `get_HaveWork` answer "is there an item" --
+    # inventory, not intent. `ShallStartUse()` is the game's OWN answer to
+    # "would this component start using itself right now", so it folds in the
+    # cooldowns, the in-progress checks and the part selection that the mod
+    # would otherwise be re-deriving badly. Both are arity-0 bools at UNIQUE
+    # non-virtual RVAs and neither makes the bot do anything.
+    #
+    # ANDed rather than substituted: a refused `faShall` binding returns the
+    # default `true`, which leaves the pair reading exactly as `faHave` alone
+    # did. So the strictly-worse direction is the one a failure falls into,
+    # and adding the read cannot turn a false into a true.
     let fa = callObj(gB.medFirstAid, med)
     if fa != nil:
-      result.canHeal = callBoolOn(gB.faHave, fa, false)
+      result.canHeal = callBoolOn(gB.faHave, fa, false) and
+                       callBoolOn(gB.faShall, fa, true)
     let stim = callObj(gB.medStims, med)
     if stim != nil:
       result.canUseStims = callBoolOn(gB.stimHave, stim, false)
     let surg = callObj(gB.medSurgery, med)
     if surg != nil:
-      result.canDoSurgery = callBoolOn(gB.surgHave, surg, false)
+      result.canDoSurgery = callBoolOn(gB.surgHave, surg, false) and
+                            callBoolOn(gB.surgShall, surg, true)
 
   # `hasHeavyBleed` / `hasLightBleed` / `hasFracture` stay false: reading them
   # means walking the health controller's effect collection, which is a generic

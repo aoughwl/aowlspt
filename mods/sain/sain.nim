@@ -80,6 +80,7 @@ import core/settings
 import client/bridge
 import client/driver
 import client/live
+import client/rvatable  # AimIsReadySpec, SainRvaScope
 import client/coverprobe
 import client/mainthread
 import server/serverside
@@ -546,12 +547,72 @@ proc armAimHook() =
   # reason, because the loop below would otherwise fall through all three
   # candidates and report "none of them exists on this build" -- which is not
   # what happened and would send the next reader hunting for renamed types.
+  # --- THE RVA ROUTE, TRIED FIRST, and it is the only one that can work on
+  # this build.
+  #
+  # The three name candidates below are kept, unchanged, as the record of what
+  # was tried and why it failed -- but every one of them goes through
+  # `signatureOf`, which is the by-name resolution that kills the client here,
+  # so the whole ladder is refused a few lines down and always was. The
+  # measured history: `EFT.AimDataClass` does not exist on this build;
+  # `EFT.BotAimingData` exists as a TYPE but nothing in the image ever returns
+  # one, so a hook on it could never have fired; `EFT.BotOwner::
+  # get_AimingIsReady` does not exist. That is a sensor that was dead in three
+  # different ways and reported "armed" in none of them.
+  #
+  # An `@0x` spec needs no class lookup and no MethodInfo: the host's
+  # `parseRvaSpec` carries the frame shape (`i>i` -- instance, no declared
+  # arguments, integer/bool return) and the 16 prologue bytes after `!`, and
+  # `resolveByRva` checks the module base, that the address is committed
+  # executable memory with 16 whole bytes in one region, that it is inside
+  # GameAssembly's `il2cpp` PE section, and that those bytes match the STARTUP
+  # SNAPSHOT rather than live memory -- so another feature's trampoline cannot
+  # make a correct address self-reject. Four gates, none of them ours to
+  # reimplement, and a refusal that names the gate that failed.
+  #
+  # `Aiming::get_IsReady` @0x1AD48C0 is UNIQUE (owners=1), so this is not a
+  # detour on a folded address, and no other RVA anywhere in this repo names
+  # it, so it is not a second detour on an already-detoured function.
+  if rvaTableOn() and rvaDriveLevel() >= RvaLevelAim:
+    info "sain: aim postfix -- installing by VERIFIED STATIC RVA: " &
+         AimIsReadySpec
+    if hookReturnTyped(AimIsReadySpec, onBotAimTyped) == Ok:
+      setAimHooked(true)
+      gAimHookState = "armed by static RVA on Aiming::get_IsReady @0x1AD48C0 " &
+                      "(UNIQUE, 16/16 prologue bytes verified by the host " &
+                      "against its startup snapshot), withholding a shot " &
+                      "until the game says the aim has settled. Whether it " &
+                      "FIRES is a separate question and is reported " &
+                      "separately: see the fired/matched/withheld counts in " &
+                      "the driver status line, and the one-shot AIM POSTFIX " &
+                      "FIRED line. Armed is not fired"
+      return
+    gAimHookState = "refused: the by-RVA install of " & AimIsReadySpec &
+                    " did not take -- " & lastError() &
+                    ". The host names the gate that failed (module base, code " &
+                    "page, il2cpp section, or the prologue byte-compare " &
+                    "against its startup snapshot). A prologue mismatch here " &
+                    "means the installed GameAssembly.dll is not " &
+                    SainRvaScope & " and every RVA in client/rvatable.nim " &
+                    "must be re-derived. Bots shoot when the ladder says so"
+    return
+  elif rvaTableOn():
+    gAimHookState = "refused: sainRvaTableDriveLevel is " &
+                    rvaLevelName(rvaDriveLevel()) & " and the aim route needs " &
+                    rvaLevelName(RvaLevelAim) &
+                    ". Nothing was patched. This is a refusal by " &
+                    "configuration, not a measurement"
+    return
+
   if reflectionRefused():
     gAimHookState = "refused: " & ReflectionRefusal &
                     " Every candidate below is checked with signatureOf " &
                     "before it is patched, so none can be checked and none " &
                     "is patched. Bots shoot when the decision ladder says " &
-                    "so, exactly as they did before this sensor existed"
+                    "so, exactly as they did before this sensor existed. The " &
+                    "RVA route above is the way past this and it needs " &
+                    "sainRvaTable on at drive level " & $RvaLevelAim &
+                    " or higher"
     return
   var tried = 0
   var j = 0
@@ -744,9 +805,41 @@ proc installHooks() =
        "(Player.Profile@0x9c0 -> Profile.Id@0x10). Bot discovery falls back " &
        "to the 2 Hz world scan, which cannot read a spawn type; death falls " &
        "back to the per-bot health poll"
-  gAimHookState = "refused: not attempted -- installHooks declines every " &
-                  "detour on this build"
-  gDamageHookState = gAimHookState
+  # --- THE AIM POSTFIX IS ARMED HERE, ABOVE THE BLANKET REFUSAL, AND ON
+  # PURPOSE.
+  #
+  # The refusal above is real and is unchanged: it covers the SPAWN and DEATH
+  # detours, which use `hookArgs` (the JSON patch ABI) on a NAME, and both
+  # halves of that are fatal or refused on this build. Neither half applies to
+  # the aim postfix any more. `armAimHook` now installs through
+  # `hookReturnTyped` with an `@0x` spec -- the typed ABI, which the host
+  # accepts for an RVA, at an address that needs no class lookup -- so it
+  # touches neither the by-name path nor the JSON path.
+  #
+  # THIS LINE IS THE WHOLE FIX FOR A SENSOR THAT WAS DEAD THREE TIMES OVER.
+  # `armAimHook` used to be called BELOW the `return` a few lines down, so it
+  # never ran at all; before that it would have been refused by
+  # `reflectionRefused()`; and before THAT its three name candidates were a
+  # type that does not exist, a type nothing ever returns, and a name that
+  # does not exist. Each layer hid the one under it, and `gAimHookState` said
+  # "refused: not attempted" while the driver's `gAimGated` sat at 0 --
+  # indistinguishable from a working sensor with nothing to withhold. The
+  # driver now reports FIRED / MATCHED / WITHHELD separately so those cannot
+  # be confused again.
+  #
+  # It still refuses itself unless `sainRvaTable` is on AND
+  # `sainRvaTableDriveLevel` is at least 2, and it still says which.
+  info "sain: installHooks -- arming the aim postfix (the by-RVA route needs " &
+       "neither by-name resolution nor the JSON patch ABI, so the blanket " &
+       "refusal below does not cover it)"
+  armAimHook()
+  reportHookCost("bot aim result", gAimHookState, aimHookCostNs(),
+                 gAimHookSamples)
+  gDamageHookState = "refused: not attempted -- installHooks declines the " &
+                     "JSON-ABI detours on this build, and the damage postfix " &
+                     "has not been converted to an @0x spec the way the aim " &
+                     "postfix has. Suppression keeps inferring hits from the " &
+                     "health delta between two decisions"
   if true:
     return
 
@@ -1627,8 +1720,13 @@ proc sainSchema(): seq[Setting] =
                 implemented = false),
     boolSetting("sainRvaTable", "Bind members from the RVA table", false,
                 category = "Advanced", subcategory = "Diagnostics",
-                description = "From SAIN (Solarint, maintained by ArchangelWTF), rewritten from scratch for aowlspt. Binds 23 of SAIN's members from static RVAs derived offline with tools/il2cpp_resolve.py and byte-verified 16/16 before any call, instead of resolving them by name -- by-name resolution is the token-gated path that returns a random non-zero handle and kills the client. The other ~27 members SAIN asks for are REFUSED by name in the log (absent from the image, wrong arity, wrong owner, a shared RVA with hundreds of owners, or an instantiated generic whose layout is not reachable offline) and are never retried reflectively. This does NOT make bots fight: the movement, sprint, stop and shoot calls are all in the refused set. Default OFF.",
+                description = "From SAIN (Solarint, maintained by ArchangelWTF), rewritten from scratch for aowlspt. Binds 36 of SAIN's members from the table in client/rvatable.nim -- 27 direct calls at static RVAs and 9 guarded field reads -- derived offline with tools/il2cpp_resolve.py and byte-verified 16/16 before any call, instead of resolving them by name; by-name resolution is the token-gated path that returns a random non-zero handle and kills the client. The other 21 members SAIN asks for are REFUSED by name in the log (absent from the image, wrong arity, wrong owner, a shared RVA with hundreds of owners, an instantiated generic whose layout is not reachable offline, or an interface receiver that cannot be identified on a live object) and are never retried reflectively. THIS FLAG ALONE BINDS NOTHING: how much of the table may bind is sainRvaTableDriveLevel, which defaults to 0 OBSERVER. This does NOT make bots fight: the movement, sprint, stop and shoot calls are all in the refused set. Default OFF.",
                 implemented = true),
+    intSetting("sainRvaTableDriveLevel", "RVA table drive level (0-3)", 0,
+               lo = 0, hi = 3, step = 1,
+               category = "Advanced", subcategory = "Diagnostics",
+               description = "How much of the RVA table above is allowed to bind. Ignored unless sainRvaTable is on. 0 OBSERVER: nothing binds; every keyed member refuses at bind time and says what level it needed, so a raid at 0 is a dry run of the refusals with no calls into the game at all. 1 READS: every bound member is an arity-0 getter or a guarded field read, and the field mechanism has no invoke path, so nothing at this level can change the game's state. 2 AIM: adds the two-hop walk BotOwner -> AimingManager -> CurrentAiming and a POSTFIX on Aiming::get_IsReady @0x1AD48C0 (UNIQUE, prologue verified by the host against its startup snapshot). The postfix watches and never rewrites; the gate it feeds can only WITHHOLD a shot the decision ladder already ordered, so a missing reading behaves exactly like no sensor. 3 DRIVE: adds the only two calls in the table that make a bot act -- BotSteering::LookToPoint and BotReload::TryReload. Every other drive member SAIN asks for (GoToPoint, Sprint, Stop, Shoot, and all three medical applies) is a stated refusal, so level 3 is two calls and not a combat brain. Raise it one notch per raid. Default 0.",
+               implemented = true),
 
     # Bot AI > Loadout. These knobs are declared and owned here; the generation
     # they govern lives in the server's own bot generator. `richnessMultiplier`
@@ -1917,6 +2015,7 @@ proc onLoad(): Status =
     # Same reason, same moment: the RVA table decides what `ensure` does, so it
     # must be set before the first member is touched rather than at arming.
     setRvaTable(gPreset.rvaTable)
+    setRvaDriveLevel(gPreset.rvaDriveLevel)
     if gPreset.allowIl2cppReflection:
       warn "sain: allowIl2cppReflection is ON. On this build that is a " &
            "known process-killer, and the mechanism is measured rather than " &
