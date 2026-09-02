@@ -9025,6 +9025,10 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   # whose default was flipped in source was still `true` in a deployed
   # config.json for two launch cycles. A new name cannot inherit a stale value.
   gModeHideOn = readBoolKey("uxHideModeButton")
+  # Same MenuScreen event as the seasons banner and the version brand: the
+  # mode-button resolve walked on a frame cadence and gave up after 30
+  # post-warm-up walks. It now walks once per menu (re)build.
+  if gModeHideOn: uihWant(UihSiteMenuShow)
   gModeTextOn = readBoolKey("uxMenuModeText")
   # BOTH READ FIRST, THEN LOGGED AS ACTUALLY READ, THEN RESOLVED. The two are
   # MUTUALLY EXCLUSIVE and that is enforced here rather than left to fight on

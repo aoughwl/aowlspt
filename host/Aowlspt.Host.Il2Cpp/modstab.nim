@@ -4900,8 +4900,8 @@ proc verBrandTick() =
   okLog "version brand: menu epoch " & $gVerEpochSeen & " -- one bounded " &
         "pass. label=" & (if gVerTmp != nil: "RESOLVED" else: "not found") &
         ", applies so far=" & $gVerApplies & " of at most " &
-        $VerBrandMaxApplies & ". The 120-frame clobber re-check is gone: a " &
-        "clobber happens on a menu rebuild, and that is this event."
+        $VerBrandMaxApplies & ". A clobber happens on a menu rebuild, " &
+        "which is exactly this event."
 proc seasonsTick() =
   ## EVENT-DRIVEN entry for the seasons-banner hider, the mode-button hider
   ## and the beta notice -- all three share the MenuScreen and therefore share
@@ -4938,7 +4938,7 @@ proc seasonsTick() =
         "pass from the MenuScreen the Show postfix handed us. seasons " &
         "banner hides so far=" & $gSeasonsHidden & ", mode-button hides so " &
         "far=" & $gModeBtnHidden &
-        ". No walk, no throttle, no per-frame polling."
+        ". Event-driven: exactly one pass per menu rebuild."
 proc modsRidersTick(regs: Il2CppPtr) =
   ## Everything in this file that wants a frame, behind ONE call the rider
   ## chain in `aowlhost.nim` makes. Each entry re-arms the guard separately --

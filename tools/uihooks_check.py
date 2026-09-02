@@ -52,12 +52,21 @@ def grep(pattern):
 FEATURES = [
     ("hide seasons", r"hide seasons: menu epoch", re.compile(r"menu epoch (\d+)")),
     ("version brand", r"version brand: menu epoch", re.compile(r"menu epoch (\d+)")),
+    ("hide mode button", r"hide mode button: menu epoch",
+     re.compile(r"menu epoch (\d+)")),
 ]
 
 # Idioms the migration removed. Their return means something polls again.
+# Idioms the migration RETIRED. Their return means something polls again.
+#
+# THESE MUST NAME THE OLD IDIOM, NOT A WORD THAT ALSO APPEARS IN THE NEW LINES.
+# The first version matched "bounded walk", which is a substring of the NEW
+# action line "one bounded pass ..." -- so the check FAILED on exactly the
+# lines that prove the migration worked. A regex that fires on success is worse
+# than no check: it trains the reader to ignore it.
 BANNED = [
-    ("hide seasons", r"hide seasons.*(throttle|keeps looking)"),
-    ("hide mode button", r"hide mode button.*(bounded walk|post-warm-up)"),
+    ("hide seasons", r"hide seasons.*(throttle|re-checked|keeps looking)"),
+    ("hide mode button", r"hide mode button.*(post-warm-up walks|bounded walks)"),
     ("version brand", r"version brand.*[0-9]+-frame"),
 ]
 
@@ -93,9 +102,16 @@ def main():
         lines = grep(pat)
         if lines is None:
             return INCONCLUSIVE
-        if lines:
+        # NEVER SCAN A FEATURE'S OWN ACTION LINE. Measured: the action lines
+        # described what they replaced ("No walk, no throttle...", "the
+        # 120-frame clobber re-check is gone"), so the banned-idiom scan
+        # matched the very lines that PROVE the migration worked. The prose was
+        # fixed, but the check must not depend on prose staying careful --
+        # anything carrying "menu epoch" is an action line by construction.
+        offenders = [ln for ln in lines if "menu epoch" not in ln]
+        if offenders:
             problems.append("%s still logs a per-frame idiom: %s"
-                            % (label, lines[0].strip()[:110]))
+                            % (label, offenders[0].strip()[:110]))
 
     if problems:
         for p in problems:

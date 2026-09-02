@@ -89,6 +89,26 @@ var gNtWhySaid = ""
 ## prints the snapshot.
 var gNtLastAttemptStep = "no attempt has returned yet"
 
+proc ntCrumb(s: string) =
+  ## Set the live crumb AND the durable one, in one call.
+  ##
+  ## WHY BOTH, AND WHY NOT A SNAPSHOT AT THE CALL SITE. The snapshot used to be
+  ## taken in `ntTickBody` right after `ntBuild()` returned. By control flow
+  ## that line must run -- `gNtTried` is incremented only inside `ntBuild`, and
+  ## `ntBuild` is called only there -- yet after eight attempts the durable
+  ## crumb still read its INITIAL value. That is a contradiction I could not
+  ## explain by reading the code, and the honest response to a control-flow
+  ## assumption that measurably failed is to stop depending on it.
+  ##
+  ## The guarded body runs under `aowl_p_p_seh`, a setjmp/longjmp guard. Any
+  ## unwind out of `ntBuild` -- caught fault, or anything else that does not
+  ## return normally -- skips every statement after the call, including a
+  ## snapshot. Writing the durable crumb AT THE POINT THE STEP IS ENTERED
+  ## cannot be skipped by an unwind, because it has already happened.
+  gNtStep = s
+  gNtLastAttemptStep = s
+
+
 proc ntWhy(reason: string) =
   ## Log a decline reason, once per distinct reason.
   if reason == gNtWhySaid:
@@ -211,7 +231,7 @@ proc ntBuildOne(screenT, donorSpawnerT, donorPanelT: Il2CppPtr;
   # was never reached (which is what a logged failure would have done at 4),
   # and the give-up line then printed an overwritten crumb. Everything about
   # the run said 'the tick is not working' and nothing said where.
-  gNtStep = "buildOne: iGameObjectOf(SettingsScreen transform)"
+  ntCrumb("buildOne: iGameObjectOf(SettingsScreen transform)")
   let screenGo = iGameObjectOf(screenT)
   if screenGo == nil:
     ntWhy("the SettingsScreen's GameObject could not be reached from its " &
@@ -223,7 +243,7 @@ proc ntBuildOne(screenT, donorSpawnerT, donorPanelT: Il2CppPtr;
     return
 
   # ---- 1. THE BUTTON -------------------------------------------------------
-  gNtStep = "button: donor GameObject + tab bar"
+  ntCrumb("button: donor GameObject + tab bar")
   let donorSpawnerGo = iGameObjectOf(donorSpawnerT)
   let togglesT = modsParentOf(donorSpawnerT)
   let togglesGo = (if togglesT != nil: iGameObjectOf(togglesT) else: nil)
@@ -244,14 +264,14 @@ proc ntBuildOne(screenT, donorSpawnerT, donorPanelT: Il2CppPtr;
   #
   # `modsComponent` REFUSES a GameObject receiver up front, so the component
   # is resolved through it rather than by assuming the Transform will do.
-  gNtStep = "button: resolving the donor UIAnimatedToggleSpawner component"
+  ntCrumb("button: resolving the donor UIAnimatedToggleSpawner component")
   let donorSpawner = modsComponent(donorSpawnerT, "UIAnimatedToggleSpawner")
   if donorSpawner == nil:
     ntNoteFault("the donor tab button carries no UIAnimatedToggleSpawner " &
                 "component, so the stock ToggleGroup cannot be read from it. " &
                 "Nothing was changed")
     return
-  gNtStep = "button: reading _toggleGroup@0xb0 off the donor COMPONENT"
+  ntCrumb("button: reading _toggleGroup@0xb0 off the donor COMPONENT")
   let stockGroup = (if nuOk(donorSpawner, NuOffSpawnerToggleGroup + 8'i32):
                       cNuGetRef(donorSpawner, NuOffSpawnerToggleGroup)
                     else: nil)
@@ -261,33 +281,33 @@ proc ntBuildOne(screenT, donorSpawnerT, donorPanelT: Il2CppPtr;
                 "could not join it and exclusivity would have to be enforced " &
                 "by us. Refusing: that is the design this file exists to avoid")
     return
-  gNtStep = "button: Instantiate of the donor tab spawner GameObject"
+  ntCrumb("button: Instantiate of the donor tab spawner GameObject")
   let spawnerGo = modsClone(donorSpawnerGo)
   if spawnerGo == nil or not modsSetParent(spawnerGo, togglesGo):
     ntNoteFault("the tab spawner could not be cloned into the tab bar")
     return
   let spawnerT = modsTransformOf(spawnerGo)
-  gNtStep = "button: fact-93 reap of the spawner clone"
+  ntCrumb("button: fact-93 reap of the spawner clone")
   discard ntReapSpawnerClone(spawnerT, donorSpawnerT, header)
-  gNtStep = "button: resolving the CLONE's UIAnimatedToggleSpawner component"
+  ntCrumb("button: resolving the CLONE's UIAnimatedToggleSpawner component")
   let spawner = modsComponent(spawnerT, "UIAnimatedToggleSpawner")
   if spawner == nil:
     ntNoteFault("the cloned tab spawner has no UIAnimatedToggleSpawner " &
                 "component, so SpawnObject cannot be called on it")
     discard modsSetActive(spawnerGo, false)
     return
-  gNtStep = "button: SpawnObject() on the cloned spawner -- a call into game code"
+  ntCrumb("button: SpawnObject() on the cloned spawner -- a call into game code")
   let toggle = nuSpawnerSpawn(spawner)
   if toggle == nil:
     ntNoteFault("SpawnObject returned nothing for the '" & header & "' tab")
     discard modsSetActive(spawnerGo, false)
     return
-  gNtStep = "button: SetHeaderText / SetActive on the cloned spawner"
+  ntCrumb("button: SetHeaderText / SetActive on the cloned spawner")
   discard nuSpawnerHeader(spawner, header, 24'i32)
   discard nuSpawnerActive(spawner, true)
   # JOIN THE STOCK GROUP. The single most important call in this file: with it,
   # pressing our tab turns the stock ones off natively and vice versa.
-  gNtStep = "button: Toggle::set_group -- joining the stock ToggleGroup"
+  ntCrumb("button: Toggle::set_group -- joining the stock ToggleGroup")
   if not nuToggleSetGroup(toggle, stockGroup):
     ntNoteFault("the new tab's toggle could not join the stock ToggleGroup, " &
                 "so two tabs could read selected at once")
@@ -300,14 +320,14 @@ proc ntBuildOne(screenT, donorSpawnerT, donorPanelT: Il2CppPtr;
     ntNoteFault("the donor panel has no GameObject")
     discard modsSetActive(spawnerGo, false)
     return
-  gNtStep = "panel: Instantiate of the Game Settings panel"
+  ntCrumb("panel: Instantiate of the Game Settings panel")
   let panelGo = modsClone(donorPanelGo)
   if panelGo == nil or not modsSetParent(panelGo, screenGo):
     ntNoteFault("the settings panel could not be cloned")
     discard modsSetActive(spawnerGo, false)
     return
   let panelT = modsTransformOf(panelGo)
-  gNtStep = "panel: resolving the cloned GameSettingsTab component"
+  ntCrumb("panel: resolving the cloned GameSettingsTab component")
   let tabComp = modsComponent(panelT, "GameSettingsTab")
   if tabComp == nil:
     ntNoteFault("the cloned panel carries no GameSettingsTab component, so " &
@@ -321,7 +341,7 @@ proc ntBuildOne(screenT, donorSpawnerT, donorPanelT: Il2CppPtr;
   #       re-create the stock rows;
   #   (b) CleanupCreatedControls once, to destroy the rows it was cloned WITH.
   # (a) first: cleaning first and then letting Show run would simply refill it.
-  gNtStep = "panel: Behaviour::set_enabled(false) on the cloned GameSettingsTab"
+  ntCrumb("panel: Behaviour::set_enabled(false) on the cloned GameSettingsTab")
   let disabled = nuBehaviourEnable(tabComp, false)
   let cleaned = nuTabCleanupControls(tabComp)
   okLog "native tabs: '" & header & "' panel clone -- GameSettingsTab " &
@@ -329,7 +349,7 @@ proc ntBuildOne(screenT, donorSpawnerT, donorPanelT: Il2CppPtr;
         "called=" & $cleaned & ". (a) before (b) on purpose: cleaning a live " &
         "component and then letting its Show run would refill the panel with " &
         "the donor's rows."
-  gNtStep = "panel: reading _settingsRoot@0x98 off the cloned tab component"
+  ntCrumb("panel: reading _settingsRoot@0x98 off the cloned tab component")
   let rowRoot = (if nuOk(tabComp, NuOffGameTabSettingsRoot + 8'i32):
                    cNuGetRef(tabComp, NuOffGameTabSettingsRoot) else: nil)
   if not nuOk(rowRoot, 0x10'i32):
@@ -406,7 +426,7 @@ proc ntBuild(): bool =
     ntNoteFault("the aowl_nu_targets POSITIONAL self-check FAILED, so every " &
                 "call here would go to the wrong method. Nothing was built")
     return
-  gNtStep = "build: iToTransform(gModsLastTabPtr) -- the live settings tab"
+  ntCrumb("build: iToTransform(gModsLastTabPtr) -- the live settings tab")
   let tabT = iToTransform(gModsLastTabPtr)
   let screenT = (if tabT != nil: modsParentOf(tabT) else: nil)
   if screenT == nil:
@@ -423,7 +443,7 @@ proc ntBuild(): bool =
         iObjName(screenT) & "'). That parent is what this treats as the " &
         "SettingsScreen; if the name is not a settings screen, the walk is " &
         "wrong and everything below it is searching the wrong subtree.")
-  gNtStep = "build: walking SettingsScreen children (Toggles / GameToggleSpawner / Game Settings)"
+  ntCrumb("build: walking SettingsScreen children (Toggles / GameToggleSpawner / Game Settings)")
   let toggles = modsChildNamed(screenT, "Toggles")
   let donorSpawner = (if toggles != nil:
                         modsChildNamed(toggles, "GameToggleSpawner") else: nil)
@@ -435,10 +455,10 @@ proc ntBuild(): bool =
                 (if donorPanel == nil: "Game-Settings" else: "") &
                 "). Nothing was changed")
     return
-  gNtStep = "build: ntBuildOne"
+  ntCrumb("build: ntBuildOne")
   if not ntBuildOne(screenT, donorSpawner, donorPanel, "nt-proof", "PROOF"):
     return
-  gNtStep = "build: collecting the stock panels under SettingsScreen"
+  ntCrumb("build: collecting the stock panels under SettingsScreen")
   ntCollectStockPanels(screenT)
   gNtBuilt = true
   result = true
@@ -530,16 +550,18 @@ proc ntTickBody() =
     if gNtTried >= 8:
       ntWhy("the build was attempted 8 time(s) and never completed, so it " &
             "has stopped trying. THE LAST STEP THE FINAL ATTEMPT REACHED " &
-            "WAS: " & gNtLastAttemptStep & " -- snapshotted when that " &
-            "attempt returned, because gNtStep itself is reset every tick " &
-            "and printing it here reported 'tick: entry' and hid the real " &
-            "return.")
+            "WAS: " & gNtLastAttemptStep & " -- written when that step was " &
+            "ENTERED, not snapshotted when the attempt returned, so an " &
+            "unwind out of the guard cannot lose it.")
       return
     gNtStep = "tick: ntBuild (attempt " & $(gNtTried + 1) & ")"
     ntWhy("attempting the build now (attempt " & $(gNtTried + 1) & " of 8)")
     discard ntBuild()
-    # SNAPSHOT BEFORE THE NEXT TICK CAN OVERWRITE IT.
-    gNtLastAttemptStep = gNtStep
+    # NO SNAPSHOT HERE ANY MORE. `ntCrumb` writes the durable crumb at the
+    # moment each step is ENTERED, so an unwind cannot lose it -- and a
+    # snapshot taken here would actively HARM: if `ntBuild` returned at its
+    # very first line, this would overwrite the deepest build crumb with a
+    # tick-level one and hide the last thing that really ran.
     gNtStep = "tick: ntBuild returned without faulting"
     return
   if gModsLastTabPtr == nil:

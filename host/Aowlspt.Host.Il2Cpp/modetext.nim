@@ -274,6 +274,8 @@ var gMtxSaidSlow = false          ## the back-off has been announced once
 var gMtxT0: uint64 = 0            ## first tick from the rider chain
 var gMtxTResolved: uint64 = 0
 var gMtxNotReady = 0              ## passes where the button was legitimately absent
+var gMtxEpochSeen = -1        ## last uihooks menu epoch this walked on
+var gMtxWalksThisRun = 0      ## walks performed, for the per-epoch readback
 var gMtxSteadyWalks = 0          ## resolve walks counted AFTER warm-up; the hard bound
 var gMtxRaidDeclined = false     ## the raid gate has declined this rider, permanently
 
@@ -879,12 +881,35 @@ proc modeTextUpdateFired(regs: Il2CppPtr) =
     gModeTextOff = true
     return
 
-  let every = (if hunting and (warming or not gMtxSlow): MtxHuntFrames
-               else: MtxSteadyFrames)
-  inc gMtxFrames
-  if gMtxFrames < every:
+  # THE FRAME THROTTLE IS GONE -- this walks ONCE PER MENU (RE)BUILD.
+  #
+  # USER DIRECTIVE: these features must not constantly poll for a UI element.
+  # Measured, this one did: 'GIVING UP after 30 post-warm-up walks (hard cap
+  # 30) and 322 bounded walks'. Every one of those walks was looking for a
+  # button that only exists when the menu exists, on a frame cadence that knew
+  # nothing about when that was.
+  #
+  # uihooks site 2 (`MenuScreen::Show`) is that event. `modsUihMenuReady`
+  # returns true exactly once per epoch; between menus this costs ONE integer
+  # compare. The walk itself is unchanged and still bounded -- what changed is
+  # how often it is allowed to happen.
+  #
+  # The receiver is deliberately DISCARDED here rather than used: this file
+  # resolves its own target from its own detour receiver, and swapping that for
+  # the MenuScreen would be a second change riding on a timing fix. The epoch
+  # is used purely as the clock.
+  var mtxMenu: Il2CppPtr = nil
+  if not modsUihMenuReady((if gModeHideOn: "hide mode button"
+                           else: "menu mode text"), gMtxEpochSeen, mtxMenu):
     return
-  gMtxFrames = 0
+  inc gMtxWalksThisRun
+  # ONE ACTION LINE PER EPOCH, so a run can be checked as `actions <= epochs`
+  # (tools/uihooks_check.py). More actions than epochs means something is
+  # firing per frame again, which is the whole defect this replaced.
+  okLog (if gModeHideOn: "hide mode button" else: "menu mode text") &
+        ": menu epoch " & $gMtxEpochSeen & " -- one bounded resolve pass (" &
+        $gMtxWalksThisRun & " this run). Between menu rebuilds this costs " &
+        "one integer compare."
 
   # THE GIVE-UP, and LOUD. "The button is still there" must never be a silent
   # outcome. Two bounds, whichever fires first: a WALL-CLOCK ceiling and a HARD
