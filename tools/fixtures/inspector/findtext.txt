@@ -118,3 +118,18 @@ aowlspt live inspector -- batch 57, 2 command(s), on Unity thread 16676
   scope: ALL nodes, active and inactive -- `all` was passed, so some hits above may be unpressable; check activeInHierarchy on each before pressing
 aowlspt live inspector -- batch 57 complete, 22 line(s)
 --- END
+
+=== ENTRY findtext-unquoted-multiword-refusal
+--- SOURCE synthetic-from-spec, 2026-09-02. NOT a capture. Written from the refusal text added to iFindRefuseWordyRoot in host/Aowlspt.Host.Il2Cpp/inspect.nim after two agents independently hit the shape live (`findtext Interface language $settings 40000 all` -> `! not an address: language`, 0 hits, no completeness line). REPLACE THIS BLOCK with a real capture the first time the rebuilt host emits it; until then it is a spec, not evidence.
+--- SHAPE an UNQUOTED multi-word needle: the second word lands in the ROOT slot, the whole command is REFUSED, and the completeness line reads NOTHING WAS EXAMINED so a hit-counting parser cannot read it as a clean 0-hit miss
+--- COMMAND findtext Interface language $settings 40000 all
+--- OUTPUT
+aowlspt live inspector -- batch 7, 2 command(s), on Unity thread 16676
+> findtext Interface language $settings 40000 all
+  ! findtext: needle is ONE token; "language" was read as the ROOT and is not one. Quote a multi-word needle: findtext "Interface language" $settings 40000
+  visited 0 node(s) over 0 frame(s), 0 match(es), frontier 0 node(s)
+  -- NOTHING WAS EXAMINED (0 valid nodes visited). This is NOT evidence the search subject is absent -- it means `findtext` refused before it looked. Nothing was searched.
+> echo aowl-batch-1788300430504-7
+  aowl-batch-1788300430504-7
+aowlspt live inspector -- batch 7 complete, 7 line(s)
+--- END

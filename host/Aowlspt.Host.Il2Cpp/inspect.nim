@@ -3006,6 +3006,80 @@ proc iCmdRoots(toks: seq[string]) =
        "$rgo0..$rgo" & $(n - 1) & " (that is what `component` wants).")
   iOut("  e.g.  find PvE $r9        or   children $r9")
 
+proc iTokIsWordy(s: string): bool =
+  ## True when a token is made ONLY of letters (plus the `-`/`_` a caption
+  ## picks up), i.e. a token that can never be an anchor (`$x`), a hex
+  ## pointer (`0x..`) or a budget (digits). Such a token in the ROOT slot is
+  ## always a typo -- almost always an UNQUOTED multi-word needle whose
+  ## second word landed where the root belongs.
+  if s.len == 0:
+    return false
+  var sawAlpha = false
+  for i in 0 ..< s.len:
+    let c = s[i]
+    if (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z'):
+      sawAlpha = true
+    elif c == '-' or c == '_':
+      discard
+    else:
+      return false
+  result = sawAlpha
+
+proc iFindIsGrammarWord(s: string): bool =
+  ## The three bare words that are part of the grammar rather than a root.
+  let t = iLower(s)
+  result = t == "all" or t == "more" or t == "in"
+
+proc iFindNothingExamined(cmdName: string) =
+  ## Print the SAME completeness verdict `iFindReportGeneric` prints when a
+  ## walk visited zero nodes, so a refusal before the walk is classified by a
+  ## parser exactly like a refusal during one. A refusal that carries no
+  ## completeness line reads to a consumer that only counts hits as "0 hits,
+  ## nothing wrong" -- which is the silent-wrong-answer class this whole
+  ## report contract exists to prevent (CLAUDE.md 9b).
+  iOut("  visited 0 node(s) over 0 frame(s), 0 match(es), frontier 0 node(s)")
+  iOut("  -- NOTHING WAS EXAMINED (0 valid nodes visited). This is NOT " &
+       "evidence the search subject is absent -- it means `" & cmdName &
+       "` refused before it looked. Nothing was searched.")
+
+proc iFindRefuseWordyRoot(toks: seq[string]; startTok: int;
+                          cmdName: string): bool =
+  ## MEASURED TWICE, by two different agents, on the same night:
+  ## `findtext Interface language $settings 40000 all` takes ONE token as the
+  ## needle, hands `language` to the root resolver, and answers
+  ## `not an address: language` with 0 hits and no completeness line. A
+  ## consumer that counts hits reads that as "nothing is wrong".
+  ##
+  ## So: a letters-only token in the ROOT slot REFUSES THE WHOLE COMMAND and
+  ## says exactly what happened and exactly how to spell it instead. Returns
+  ## true when it refused.
+  if toks.len <= startTok:
+    return false
+  if not iTokIsWordy(toks[startTok]):
+    return false
+  if iFindIsGrammarWord(toks[startTok]):
+    return false
+  # Rebuild what the caller almost certainly meant: the needle plus the run of
+  # bare words that followed it, quoted as one token.
+  var quoted = (if toks.len > 1: toks[1] else: "")
+  var i = startTok
+  while i < toks.len and iTokIsWordy(toks[i]) and not iFindIsGrammarWord(toks[i]):
+    quoted.add ' '
+    quoted.add toks[i]
+    inc i
+  var rest = ""
+  while i < toks.len:
+    rest.add ' '
+    rest.add toks[i]
+    inc i
+  if rest.len == 0:
+    rest = " $settings 40000 all"
+  iErr(cmdName & ": needle is ONE token; \"" & toks[startTok] &
+       "\" was read as the ROOT and is not one. Quote a multi-word needle: " &
+       cmdName & " \"" & quoted & "\"" & rest)
+  iFindNothingExamined(cmdName)
+  result = true
+
 proc iFindResolveRoot(toks: seq[string]; startTok: int; cmdName: string;
                        root: var Il2CppPtr; rootExplicit: var bool;
                        budgetTok: var int): bool =
@@ -3019,6 +3093,11 @@ proc iFindResolveRoot(toks: seq[string]; startTok: int; cmdName: string;
   ## actually reads back as a live Transform/GameObject; otherwise it is a
   ## BUDGET, which is what a plain integer almost always means here.
   ## Returns false (having already `iErr`'d) if an eval failed.
+  ##
+  ## Checked FIRST, before any eval: a letters-only token in the ROOT slot is
+  ## an unquoted multi-word needle, not a root (see `iFindRefuseWordyRoot`).
+  if iFindRefuseWordyRoot(toks, startTok, cmdName):
+    return false
   if toks.len == startTok + 1:
     var v = 0'u64
     var err = ""

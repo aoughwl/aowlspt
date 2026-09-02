@@ -163,6 +163,36 @@ def inv_stale_file_not_run(t):
             "boot, against a client still on the loading screen" % (seeded, said))
 
 
+def inv_wordy_root_refused(t):
+    """A letters-only token in the ROOT slot must REFUSE, and the refusal must
+    carry a completeness verdict.
+
+    MEASURED live, twice, by two agents: `findtext Interface language
+    $settings 40000 all` took ONE token as the needle and handed `language` to
+    the root resolver, which answered `! not an address: language` with 0 hits
+    and NO completeness line -- which a consumer that only counts hits reads
+    as a clean miss. Three things must hold in the source:
+      * the refusal exists and names the real cause;
+      * it is reached from the SHARED resolver, so `find`, `findtext` and
+        `findcomp` cannot drift apart;
+      * it prints NOTHING WAS EXAMINED, the same verdict a zero-node walk
+        prints, so the two are classified identically.
+    """
+    msg = "needle is ONE token" in t
+    shared = ("iFindRefuseWordyRoot(toks, startTok, cmdName)" in t
+              and t.count("proc iFindResolveRoot(") == 1)
+    verdict = ("proc iFindNothingExamined(" in t
+               and "iFindNothingExamined(cmdName)" in t
+               and t.count(
+                   "-- NOTHING WAS EXAMINED (0 valid nodes visited") >= 2)
+    # `all`/`more`/`in` are grammar, not roots -- refusing them would break
+    # `findtext X all` and `find X in Y`.
+    grammar = "proc iFindIsGrammarWord(" in t
+    return (msg and shared and verdict and grammar,
+            "refusal_text=%s shared_resolver=%s nothing_examined=%s "
+            "grammar_exempt=%s" % (msg, shared, verdict, grammar))
+
+
 INVARIANTS = [
     ("no_combined_off_guard", inv_no_combined_off_guard),
     ("flight_report_exists", inv_flight_report_exists),
@@ -173,6 +203,7 @@ INVARIANTS = [
     ("off_still_publishes", inv_off_still_publishes),
     ("watchdog_survives_off", inv_watchdog_survives_off),
     ("stale_file_not_run", inv_stale_file_not_run),
+    ("wordy_root_refused", inv_wordy_root_refused),
 ]
 
 
