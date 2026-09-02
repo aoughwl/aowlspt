@@ -75,7 +75,7 @@
 ## against. `tests/tuilayout.nim` renders the grid at five window sizes and
 ## checks it, so none of that depends on somebody launching the game to look.
 
-import std/[strutils, syncio, cmdline]
+import std/[strutils, syncio, cmdline, envvars]
 import aowlsptinstall/[winfs, log, eft]
 import "../host/common/jsonpath"
 import aowlterm
@@ -203,6 +203,15 @@ Options
                  in front of the player's own argument handling. It is here so
                  the experiment can be run deliberately, not so it can be run
                  by accident. Requires --low-render.
+  --modbuild PATH
+                 the mod builder to run at startup (an .exe, or a .py run
+                 with an interpreter). Default: aowlspt\aowlspt-modbuild.exe
+                 if present, else aowlspt\tools\modbuild.py run with the
+                 install's bundled interpreter or python on PATH.
+  --no-mod-build do not compile the mods folder at startup. The host then
+                 loads whatever .dll files are already there.
+  --rebuild-mods ignore the build cache and recompile every mod. Slow (a cold
+                 build of all mods is minutes); for proving a rebuild works.
   --wait         stay open until the game exits
   --no-backend   do not start the backend server
   --no-logs      do not show the live log view; exit once the game is up
@@ -286,6 +295,11 @@ type
     noGraphics: bool
       ## `--nographics-anyway`: pass `-batchmode -nographics` too. Never on by
       ## default and never implied by `--low-render`.
+    modBuild: string
+      ## `--modbuild PATH`: an explicit builder, `.exe` or `.py`. Empty means
+      ## the resolution order in `resolveModBuilder`.
+    noModBuild: bool
+    modBuildForce: bool
     help: bool
 
 proc parseArgs(): Options =
@@ -299,6 +313,7 @@ proc parseArgs(): Options =
                    backendWait: 300, tailPath: "", tailTitle: "log",
                    lowRender: false, renderW: 1280, renderH: 720,
                    noGraphics: false,
+                   modBuild: "", noModBuild: false, modBuildForce: false,
                    help: false)
   var i = 1
   let n = paramCount()
@@ -328,6 +343,13 @@ proc parseArgs(): Options =
     elif a == "--tail-title":
       inc i
       if i <= n: result.tailTitle = paramStr(i)
+    elif a == "--modbuild":
+      inc i
+      if i <= n: result.modBuild = paramStr(i)
+    elif a == "--no-mod-build":
+      result.noModBuild = true
+    elif a == "--rebuild-mods":
+      result.modBuildForce = true
     elif a == "--pick":
       result.pick = true
     elif a == "--no-auto-enter":
@@ -1918,6 +1940,205 @@ proc runTailWindow(path, title: string) =
 
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Compiling the mods folder at startup
+# ---------------------------------------------------------------------------
+#
+# THE REQUIREMENT: the user's mods folder ships as SOURCE and is compiled on
+# startup, cached so an unchanged folder costs about a second.
+#
+# `tools/modbuild.py` is the compile-and-cache half and
+# `host/Aowlspt.Host.Il2Cpp/modload.nim` is the in-game screen half. Until now
+# NOTHING JOINED THEM. A grep of this file for `modbuild` returned zero hits,
+# so on a real launch the file the host renders was only ever written by hand
+# or by `tools/modloadsim.py`, the synthetic driver. The host side is verified
+# live; this side had never run at all.
+#
+# What happens now, in order:
+#
+#   1. the screen file is written SYNCHRONOUSLY, here, in its "queued" state,
+#      BEFORE the client process exists. That is not cosmetic. The file
+#      survives a reboot, so LAST session's `MODS READY` is sitting in it, and
+#      the host acts on that word: it would release the mods and dismiss the
+#      step for a build that has not started. Overwriting it first is what
+#      makes that race unlosable rather than merely unlikely.
+#   2. the builder is spawned quiet and is NOT waited for. The host defers
+#      loading mods until the file says READY (`modLoadReleaseMods`), so the
+#      compile OVERLAPS the client's own 10-60s startup instead of being added
+#      to it. That overlap is the whole reason the loading step exists.
+#   3. if no builder can be found, the file is written with the "not built"
+#      state -- which still carries `MODS READY`, so the host stops waiting,
+#      and says on its other two lines that nothing was rebuilt. The launcher
+#      warns with the full reason. A silent skip would leave the host waiting
+#      out its entire defer deadline for a build nobody started.
+#
+# ## The Python gap, stated plainly rather than papered over
+#
+# `modbuild.py` is Python, and `tools/toolchain.py` packs gcc, lld and nimony
+# but NOT an interpreter. On a machine with no Python this resolves nothing and
+# takes path 3 above: it launches, it says so, and it compiles nothing. That is
+# a real hole in the public-install story, it is NOT fixed here, and it is why
+# the resolution order below has a slot for a native `aowlspt-modbuild.exe` and
+# a slot for an interpreter bundled in the install's own toolchain. Being loud
+# about the hole beats a launcher that quietly never compiles anything.
+
+const
+  # The three-line format lives in `tools/modloadfmt.py`, which is the ONE
+  # renderer the two Python writers share. This writer cannot import it, so
+  # these literals are asserted against it by `tools/test_modloadfmt.py` --
+  # a format that drifts silently is a loading screen that lies.
+  MlQueued0 = "Loading mods..."
+  MlQueued1 = "Mods 0 of ?"
+  MlQueued2 = "starting the compiler"
+  MlNotBuilt0 = "MODS READY"
+  MlNotBuilt1 = "Mods not rebuilt"
+
+type
+  ModBuilder = object
+    exe: string
+      ## Empty when none was found; `why` then says what was looked for.
+    args: string
+    source: string
+    why: string
+
+proc modScreenPath(root: string): string =
+  joinPath(root, "aowlspt\\aowlspt-modload.txt")
+
+proc modProgressPath(root: string): string =
+  joinPath(root, "aowlspt\\aowlspt-modbuild.jsonl")
+
+proc mlWriteScreen(path, l0, l1, l2: string) =
+  ## Exactly three lines, LF. `writeTextFile` replaces the whole file; the host
+  ## reads it from another process every poll, and half a line on a loading
+  ## screen reads as corruption rather than as progress. Both calls below
+  ## happen before the client process exists, so the brief window in which
+  ## `writeTextFile` has removed the old file and not yet written the new one
+  ## is not observable by anything.
+  discard writeTextFile(path, l0 & "\n" & l1 & "\n" & l2 & "\n")
+
+proc quoteArg(s: string): string =
+  "\"" & s & "\""
+
+proc lookOnPath(exeName: string): string =
+  ## The first `exeName` on PATH, or "". `CreateProcessA` is given an explicit
+  ## application name, so it does NOT search PATH itself -- an unresolved name
+  ## would simply fail to start with no useful error, which is the failure this
+  ## avoids by finding out here and saying so.
+  result = ""
+  let p = getEnv("PATH", "")
+  var cur = ""
+  var i = 0
+  while i <= p.len:
+    let atEnd = i == p.len
+    var ch = ';'
+    if not atEnd: ch = p[i]
+    if ch == ';':
+      if cur.len > 0:
+        var d = cur
+        # PATH entries are allowed to be quoted, and a quoted one joined
+        # straight onto a file name produces a path that exists nowhere.
+        if d.len >= 2 and d[0] == '"' and d[d.len - 1] == '"':
+          d = d.substr(1, d.len - 2)
+        let cand = joinPath(d, exeName)
+        if fileExists(cand):
+          return cand
+      cur = ""
+    else:
+      cur.add ch
+    inc i
+
+proc resolveModBuilder(root, override: string): ModBuilder =
+  ## Four ways to find a builder, most specific first. Every one of them is
+  ## reported by name in `source`, because two machines silently compiling with
+  ## different tools is the class of problem that cannot be debugged afterwards.
+  result = ModBuilder(exe: "", args: "", source: "", why: "")
+  let inst = joinPath(root, "aowlspt")
+  let mods = joinPath(inst, "mods")
+  let screen = modScreenPath(root)
+  let prog = modProgressPath(root)
+
+  var script = ""
+  if override.len > 0:
+    if endsWith(toLowerAscii(override), ".exe"):
+      if not fileExists(override):
+        result.why = "--modbuild " & override & " does not exist"
+        return
+      result.exe = override
+      result.source = "--modbuild (a native builder)"
+      result.args = ""
+    else:
+      if not fileExists(override):
+        result.why = "--modbuild " & override & " does not exist"
+        return
+      script = override
+  else:
+    # A native builder, if one is ever produced. Preferred because it needs no
+    # interpreter at all, which is the gap described above.
+    let native = joinPath(inst, "aowlspt-modbuild.exe")
+    if fileExists(native):
+      result.exe = native
+      result.source = "the install's own aowlspt-modbuild.exe"
+      result.args = ""
+    else:
+      script = joinPath(inst, "tools\\modbuild.py")
+      if not fileExists(script):
+        result.why = "no aowlspt-modbuild.exe and no tools\\modbuild.py in " &
+                     inst & ", and no --modbuild was given"
+        return
+
+  if result.exe.len == 0:
+    # A script needs an interpreter: the install's bundled one first, then
+    # whatever is on PATH. A developer machine has the second; a player's
+    # machine currently has NEITHER, and that is the gap.
+    let bundled = joinPath(inst, "toolchain\\python\\python.exe")
+    if fileExists(bundled):
+      result.exe = bundled
+      result.source = "the install's bundled interpreter + " & script
+    else:
+      let onPath = lookOnPath("python.exe")
+      if onPath.len > 0:
+        result.exe = onPath
+        result.source = "python on PATH (" & onPath & ") + " & script
+      else:
+        result.why = "found " & script & " but no interpreter to run it " &
+                     "with: there is no toolchain\\python\\python.exe in " &
+                     inst & " and no python.exe on PATH. tools\\toolchain.py " &
+                     "packs gcc, lld and nimony but NOT an interpreter, so " &
+                     "this is expected on a machine that has never had " &
+                     "Python -- and it means the mods folder is NOT compiled."
+        return
+    result.args = quoteArg(script) & " "
+
+  result.args = result.args & "--mods " & quoteArg(mods) &
+                " --install " & quoteArg(inst) &
+                " --screen " & quoteArg(screen) &
+                " --progress " & quoteArg(prog)
+
+proc modBuildCommand(b: ModBuilder): string =
+  result = quoteArg(b.exe)
+  if b.args.len > 0:
+    result = result & " " & b.args
+
+proc startModBuild(root: string; b: ModBuilder; force: bool): uint64 =
+  ## Write the opening state, then spawn. In that order, always: see (1) above.
+  result = 0'u64
+  let screen = modScreenPath(root)
+  mlWriteScreen(screen, MlQueued0, MlQueued1, MlQueued2)
+  var cmd = modBuildCommand(b)
+  if force: cmd = cmd & " --force"
+  var e = b.exe
+  var w = joinPath(root, "aowlspt")
+  result = cSpawnQuiet(toCString(e), toCString(w), toCString(cmd))
+
+proc modBuildDeclined(root, why: string) =
+  ## No builder. Say so on the screen the player is looking at AND in the
+  ## console, and let the host get on with loading what is already on disk.
+  mlWriteScreen(modScreenPath(root), MlNotBuilt0, MlNotBuilt1,
+                "no compiler in this install")
+  warn "the mods folder was NOT compiled: " & why
+  note "the host will load whatever .dll files are already under " &
+       joinPath(root, "aowlspt\\mods") & ". Nothing claims a build happened."
+
 proc banner(root: string) =
   if termMode() != tmFull: return
   echo ""
@@ -2122,6 +2343,28 @@ proc main(): int =
       # "there is no backend in this install" -- and the real launch would go
       # on to start a client with nothing to talk to.
       warn "  no backend at " & be & "; the client would start alone"
+    # THE MOD BUILD, reported with the exact command a real launch would run.
+    # The dry run and the launch call `resolveModBuilder` and
+    # `modBuildCommand` -- the same two procs -- so what is printed here
+    # cannot drift from what is executed. A dry run that describes a
+    # different command from the one that runs is worse than no dry run.
+    if o.noModBuild:
+      line "  would build   no mods (--no-mod-build); the host loads the " &
+           ".dll files already under aowlspt\\mods"
+    else:
+      let db = resolveModBuilder(root, o.modBuild)
+      if db.exe.len == 0:
+        line "  would build   NOTHING -- " & db.why
+        line "  would write   " & modScreenPath(root) & "  (\"" &
+             MlNotBuilt0 & "\" / \"" & MlNotBuilt1 & "\", so the host stops " &
+             "waiting and nothing claims a build happened)"
+      else:
+        line "  would build   the mods folder via " & db.source
+        line "  would run     " & modBuildCommand(db) &
+             (if o.modBuildForce: " --force" else: "")
+        line "  would write   " & modScreenPath(root) & "  (\"" &
+             MlQueued0 & "\" first, then the builder's own progress, ending " &
+             "in \"MODS READY\")"
     let dExplicit = o.profileId.len > 0 or o.newProfile.len > 0
     let dAuto = not o.pick and not dExplicit
     # The profile routes go to the CONTROL port, never to `port`. In a dry run
@@ -2163,6 +2406,46 @@ proc main(): int =
     line "  would inject  " & hostDll
     line "  nothing was started."
     return 0
+
+  # --- the mod build ---------------------------------------------------------
+  #
+  # Started HERE, before the backend, because it is the longest-running thing
+  # in the launch and it blocks nothing: it compiles into the mods folder while
+  # the backend boots and the client loads, and the host holds mod loading
+  # until it reports READY. Started after the client instead, it would be
+  # serialised behind a 10-60s startup for no reason.
+  var modBuildProc = 0'u64
+  block:
+    heading "Mods"
+    if o.noModBuild:
+      note "--no-mod-build: the mods folder will NOT be compiled. The host " &
+           "loads the .dll files already under " &
+           joinPath(root, "aowlspt\\mods") & "."
+      # The stale-READY hazard applies here too: last session's marker is
+      # still in the file and the host would act on it. Say the true thing
+      # instead of leaving the old one to be read as this run's.
+      mlWriteScreen(modScreenPath(root), MlNotBuilt0, MlNotBuilt1,
+                    "--no-mod-build was given")
+    else:
+      let b = resolveModBuilder(root, o.modBuild)
+      if b.exe.len == 0:
+        modBuildDeclined(root, b.why)
+      else:
+        line "  " & b.source
+        modBuildProc = startModBuild(root, b, o.modBuildForce)
+        if modBuildProc == 0'u64:
+          # CreateProcess refused. Not a warning that scrolls past: the screen
+          # file currently says "Loading mods..." and would sit there until the
+          # host's deadline, so it is corrected to the truth immediately.
+          modBuildDeclined(root, "the builder could not be started: " &
+                                 modBuildCommand(b))
+        else:
+          # Not `ok`, and not "built". All that is known is that a process
+          # started. What it did is reported by the file it writes and by its
+          # own progress log -- claiming more here would be the same mistake
+          # the backend spawn line documents just below.
+          line "  spawned the mod build; it writes " & modScreenPath(root) &
+               " and the game shows it as a loading step"
 
   # The backend goes up first. The client tries to reach it as soon as it
   # starts, so starting them the other way round is a race the client loses --

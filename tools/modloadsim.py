@@ -43,6 +43,9 @@ import os
 import sys
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import modloadfmt  # noqa: E402 -- the ONE renderer, shared with modbuild.py
+
 DEFAULT_PATH = r"D:\Aowlspt\aowlspt\aowlspt-modload.txt"
 
 MODS = ["tarkov", "manager", "sain", "morebots", "fov", "settingshub",
@@ -50,12 +53,12 @@ MODS = ["tarkov", "manager", "sain", "morebots", "fov", "settingshub",
         "debug", "waypoints", "ammoloading"]
 
 
-def write(path, lines):
-    """Atomic whole-file replace. The host reads this from another process."""
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-        f.write("\n".join(lines) + "\n")
-    os.replace(tmp, path)
+# The three-line format and the atomic write both come from `modloadfmt`, the
+# same module `tools/modbuild.py` renders through. They used to be two copies,
+# and the copies had already drifted on line endings (this one LF, modbuild
+# CRLF) without either being able to see it. A simulator that renders a
+# DIFFERENT file from the real writer proves nothing about the real writer.
+write = modloadfmt.write
 
 
 def main():
@@ -80,9 +83,7 @@ def main():
         detail = "from cache" if cached else "compiling"
         if a.fail == m:
             st, detail = "FAILED", "nimony exited 1"
-        write(a.path, ["Loading mods: %s" % m,
-                       "Mods %d of %d" % (i, n),
-                       "%-14s %-12s %s" % (m, st, detail)])
+        write(a.path, modloadfmt.building(m, i, n, st, detail))
         print("  %2d/%d  %-14s %s" % (i, n, m, st), flush=True)
         if a.hold and i == 7:
             print("  -- HOLDING at 7/%d for %.0fs (deliberate; will finish) --"
@@ -93,13 +94,11 @@ def main():
     if a.fail:
         # "FAILED" MUST be on line 0: that is the host's control word for
         # "keep this on screen and say so in the log".
-        write(a.path, ["MODS READY -- 1 FAILED",
-                       "Mods %d of %d" % (n, n),
-                       "failed: %s" % a.fail])
+        write(a.path, modloadfmt.ready(n, n, [a.fail]))
         print("MODS READY -- 1 FAILED written (%s). The panel must STAY UP "
               "naming it; that is the intended behaviour." % a.fail)
     else:
-        write(a.path, ["MODS READY", "Mods %d of %d" % (n, n), ""])
+        write(a.path, modloadfmt.ready(n, n))
         print("MODS READY written after %.1fs. The panel must now dismiss; "
               "read back with:  python tools/hostlog.py grep \"mod loading "
               "step\" --max 12" % (time.time() - t0))

@@ -42,6 +42,41 @@ machine's msys2 removed from PATH. That is the check that can fail: a bundle
 that is missing something is caught here, on the machine that built it, instead
 of on a stranger's.
 
+## MEASURED, 2026-09-01, on this machine
+
+End to end, from an empty output directory to a built mods folder, with msys2
+and `~/nimony` REMOVED from PATH for every compile (the same strip `verify`
+uses, so the bundle cannot borrow a DLL from the machine that packed it):
+
+    pack                6038 files, 806.3 MB          92 s
+    install             copytree + full sha verify    17 s
+    COLD build          16 un-built mods             503 s   13 built, 3 failed
+    WARM build          the same folder again         60 s   13 cached, 3 failed
+    WARM, cache only    the 13 that build            0.45 s  13 cached
+
+Read those last two together, because the difference between them is a fact
+about the design and not noise. `60 s` is what an unchanged mods folder costs
+when three of its mods do not compile: a failed mod has NO cache entry (the
+output and its key are deleted on failure, deliberately, so a stale DLL can
+never masquerade as a fresh one), so it is retried in full on every single
+startup -- and modbuild retries once more with `nimcache` cleared, so a broken
+mod costs roughly two full compiles per launch, for ever. `0.45 s` is the real
+cache-hit cost. A player with three permanently broken mods pays a minute on
+every boot and nothing ever says why.
+
+The 3 failures are NOT toolchain defects. They are mods whose SOURCE only
+compiles inside the repo checkout: `mods/manager/mgr/cfgscan.nim` imports
+`"../../../host/common/jsonpath"`, and `mods/sain/client/drivecalls.nim`
+reaches for `abi` by a repo-relative path. In an install those resolve to
+`<install>/host/common/...` and `<install>/abi`, which do not exist. So
+"a fresh install builds every mod" is FALSE today, and the reason is packaging,
+not the compiler: 13 of 16.
+
+The measurement was taken against FROZEN copies of `abi/` and `aowl/src`.
+Against the live checkout every mod correctly rebuilt on the second pass,
+because four agents were editing both shared trees while it ran -- the cache
+was right and the experiment was wrong.
+
 ## `bootstrap` and the network
 
 `bootstrap` installs from `--from` (a directory or a .zip), or from a URL in

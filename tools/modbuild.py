@@ -68,6 +68,9 @@ import subprocess
 import sys
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import modloadfmt  # noqa: E402 -- the ONE renderer for the loading step
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 
@@ -385,36 +388,27 @@ class Progress(object):
     # It is rewritten rather than appended so the file is always the COMPLETE
     # current state: a reader that arrives late still sees every mod, and there
     # is no replay to reconstruct.
-    STATUS_W = 9
+    # The FORMAT itself lives in `tools/modloadfmt.py`, shared with
+    # `tools/modloadsim.py`. It was copied into both, and the copies had
+    # already drifted -- this one wrote CRLF (Python text mode on Windows),
+    # the simulator wrote LF. The host tolerated it; the next difference
+    # might not have. There is now one renderer, and neither file may grow
+    # its own.
 
     def render(self):
         if not self.screen:
             return
         cur = self.order[-1] if self.order else ""
         if getattr(self, "done_all", False):
-            bad = sorted(n for n, r in self.rows.items() if r[0] == "failed")
-            if bad:
-                # "FAILED" MUST appear on line 0: that is the host's control
-                # word for "keep this up longer and shout it into the log".
-                lines = ["MODS READY -- %d FAILED" % len(bad),
-                         "Mods %d of %d" % (len(self.rows), self.total),
-                         "failed: %s" % ", ".join(bad)[:64]]
-            else:
-                lines = ["MODS READY",
-                         "Mods %d of %d" % (len(self.rows), self.total),
-                         ""]
+            bad = [n for n, r in self.rows.items() if r[0] == "failed"]
+            lines = modloadfmt.ready(len(self.rows), self.total, bad)
+        elif not cur:
+            lines = modloadfmt.queued(self.total)
         else:
             st, extra = self.rows.get(cur, ("", ""))
-            lines = ["Loading mods: %s" % cur if cur else "Loading mods...",
-                     "Mods %d of %d" % (self.i, self.total),
-                     ("%-14s %-*s %s" % (cur, self.STATUS_W, st, extra)).strip()]
+            lines = modloadfmt.building(cur, self.i, self.total, st, extra)
         try:
-            # Whole-file replace via a temp + os.replace so a reader never sees
-            # a half-written file -- the host reads this from another process.
-            tmp = self.screen + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                f.write("\n".join(lines) + "\n")
-            os.replace(tmp, self.screen)
+            modloadfmt.write(self.screen, lines)
         except OSError:
             pass
 
