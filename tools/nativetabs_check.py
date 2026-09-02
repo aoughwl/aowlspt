@@ -213,8 +213,15 @@ def cmd_verify():
         problems.append("the native-tabs tick FAULTED and the feature switched "
                         "itself off; the unchanged geometry is vacuous. Host: "
                         + faults[-1].strip())
-    elif not any("native tabs VERDICT" in l for l in trail):
-        say("INCONCLUSIVE", "the host never printed `native tabs VERDICT`, so "
+    elif any("native tabs VERDICT FAIL" in l for l in trail):
+        # MEASURED 2026-09-02 05:10: the first verdict the host ever printed
+        # was `native tabs VERDICT FAIL: 6 panels are active at once ...` and
+        # this tool said PASS because it only looked for the word VERDICT.
+        # A verdict line is only a pass when the host says PASS.
+        problems.append("the host's own verdict is FAIL: "
+                        + [l for l in trail if "native tabs VERDICT FAIL" in l][-1].strip())
+    elif not any("native tabs VERDICT PASS" in l for l in trail):
+        say("INCONCLUSIVE", "the host never printed `native tabs VERDICT PASS`, so "
                             "the tab was not observed being built; unchanged "
                             "geometry proves nothing. NOT a pass.")
         return INCONCLUSIVE
