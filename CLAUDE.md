@@ -111,6 +111,13 @@ Only ask the user for what genuinely requires human eyes or a human decision.
   four flag bisects (one sample each) chased noise for an hour while the dump
   said `Rax=1 Rcx=1 Rdx=0`: a Profile argument that was the integer 1. One
   bisect sample is not a conclusion; a register is.
+- **A fail-fast death writes NO Crash_* folder.** `abort()` / `__fastfail`
+  (0xc0000409) bypasses Unity's handler entirely; the only records are the
+  Windows Application Error event, `%LOCALAPPDATA%\CrashDumps\EscapeFromTarkov.exe.<pid>.dmp`
+  and cdb (`python tools/crashwatch.py wer`). MEASURED 2026-09-02 13:18: mimalloc's
+  thread-ownership assertion in a mod ticked on a different thread than it was
+  initialised on -- run.py had called it a clean teardown. `run.py` now prints
+  all three sources on every DIED; "no crash report" is never "no crash".
 - `--until-phase MENU` now needs a MenuScreen::Show proof line; natesp's
   `raid phase = MENU` only means "no GameWorld" and is true on the character
   screen too (`PARKED-BEFORE-MENU`, exit 10, is that case).
