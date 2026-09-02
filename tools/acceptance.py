@@ -735,6 +735,144 @@ def native_tabs_built(root):
     return names, True, ""
 
 
+# ---------------------------------------------------------------------------
+# THE NATIVE SUBTAB STRIP (nativetabs.nim `ntBuildSubtabs`).
+#
+# The OLD strip -- a `Toggles(Clone)` child of the `Graphics Settings` panel,
+# built by modstab.nim's `settingsPostFxSubtab` path -- is DELETED (73adced).
+# The strip is now a SIBLING of the panels, parented to SettingsScreen: it is
+# cloned from `Control Settings/Toggles` with `Object::Instantiate` and never
+# renamed, so Unity's own "(Clone)" suffix IS its name. Deliberately not
+# `* Settings`, so assert_one_panel_active cannot mistake it for a panel.
+#
+# Two consequences the assertion below must respect, both read out of
+# nativetabs.nim rather than assumed:
+#   * the DONOR'S OWN BUTTONS COME WITH THE CLONE and are only
+#     `SetActive(false)` -- never destroyed. So the strip's child count is
+#     `donor children + our subtabs`, NOT our subtabs, and the inherited ones
+#     sit FIRST (ours are appended by SetParentAndAlign afterwards).
+#   * `ntBuildSubtabs` is guarded by ONE `gNtSubBuilt`, so at most one strip
+#     exists per session: a run that built the MODS (rows) strip has no
+#     GRAPHICS|POSTFX strip at all, and that absence is expected.
+NT_SUB_STRIP_NAME = "Toggles(Clone)"
+NT_SUB_DONOR_PANEL = "Control Settings"
+NT_SUB_DONOR_STRIP = "Toggles"
+
+# nativetabs.nim ~1149, the ONLY emit site: `native subtabs: built the
+# GRAPHICS SETTINGS | POSTFX strip as a SIBLING of the panels it switches ...`.
+# The captions are read OUT of the host's line rather than hardcoded, for the
+# same reason the top-row clone count is: a constant `2` here would keep
+# passing after someone adds a third subtab.
+_NT_SUB_BUILT_RE = re.compile(
+    r"native subtabs: built the (?P<caps>.+?) strip as a SIBLING")
+# nativetabs.nim ~1262-1278 (`ntSubVerdict`): `native subtabs VERDICT PASS
+# (subtab selection): exactly one subtab reads m_IsOn=1 (POSTFX) ...`, plus
+# four FAIL variants. Only its PRESENCE is used -- it is the host's own
+# statement that there was a strip to judge at all.
+_NT_SUB_VERDICT_RE = re.compile(
+    r"native subtabs VERDICT (?P<v>PASS|FAIL) \((?P<why>[^)]*)\)")
+# nativetabs.nim ~735: the OTHER kind of strip (`NtSubRows`, the MODS one).
+_NT_SUB_MODS_RE = re.compile(r"native mods: built (?P<n>\d+) mod subtab\(s\)")
+# nativetabs.nim ~1015: `native subtabs: build attempted (nativeTabsSubtabs is
+# ON) and returned true|false`. Better evidence than the config file, because
+# it is the host saying the flag was on IN THIS PROCESS -- and `returned
+# false` is a build that was attempted and refused, which is a different fact
+# from "the flag was off" and must not be reported as one.
+_NT_SUB_ATTEMPT_RE = re.compile(
+    r"native subtabs: build attempted \(nativeTabsSubtabs is ON\) and "
+    r"returned (?P<r>true|false)")
+
+
+def _subtabs_from_messages(msgs):
+    """(captions, mods_n, verdicts, attempt, note) from host-log message text.
+
+    Pure, so the selftest can drive it with the literals copied out of
+    nativetabs.nim instead of stubbing the log reader. `captions` is None when
+    the host never printed the build line -- the caller must NOT fall back to
+    a number then, exactly as native_tabs_built refuses to.
+    """
+    captions, mods_n, verdicts, attempt = None, None, [], None
+    for m in msgs:
+        a = _NT_SUB_ATTEMPT_RE.search(m)
+        if a:
+            attempt = (a.group("r") == "true")
+        b = _NT_SUB_BUILT_RE.search(m)
+        if b:
+            captions = [c.strip() for c in b.group("caps").split("|")
+                        if c.strip()]
+        mm = _NT_SUB_MODS_RE.search(m)
+        if mm:
+            mods_n = int(mm.group("n"))
+        v = _NT_SUB_VERDICT_RE.search(m)
+        if v:
+            verdicts.append((v.group("v"), v.group("why")))
+    if captions is None and attempt is False:
+        return None, mods_n, verdicts, attempt, (
+            "the host printed `native subtabs: build attempted "
+            "(nativeTabsSubtabs is ON) and returned false` -- the build ran "
+            "and REFUSED")
+    if captions is None and not verdicts:
+        return None, mods_n, verdicts, attempt, (
+            "the host log has NO `native subtabs: built the <A> | <B> strip "
+            "as a SIBLING ...` line and NO `native subtabs VERDICT` line")
+    if captions is None:
+        return None, mods_n, verdicts, attempt, (
+            "the host printed %d `native subtabs VERDICT` line(s) but no "
+            "`native subtabs: built the <A> | <B> strip as a SIBLING ...` "
+            "line, so how many subtabs it made is not known" % len(verdicts))
+    return captions, mods_n, verdicts, attempt, ""
+
+
+def native_subtabs_built(root):
+    """(captions, mods_n, verdicts, attempt, note) -- see
+    _subtabs_from_messages."""
+    ns = argparse.Namespace(root=os.path.join(root, "aowlspt"), backend=False)
+    try:
+        _p, lines = hostlog.read(ns)
+    except SystemExit:
+        return None, None, [], None, "the host log could not be read"
+    return _subtabs_from_messages([row[2] for row in hostlog.parse(lines)])
+
+
+def _subtabs_flag_from_cfg(hostcfg, text):
+    """(on, why) for `nativeTabsSubtabs`, resolved THE WAY THE HOST RESOLVES
+    IT (aowlhost.nim ~9172 and ~9214-9221), which is not the way a plain JSON
+    read would:
+
+      * absent means ON -- `readBoolKeyDef("nativeTabsSubtabs", true)`. A
+        reader that treated a missing key as off would report INCONCLUSIVE on
+        every default install and never look at the strip again.
+      * `settingsPostFxSubtab` being set turns it ON regardless, because the
+        old cloned-strip implementation of that feature is deleted.
+    """
+    present, raw, truthy = hostcfg.value_of(text, "nativeTabsSubtabs")
+    gpresent, graw, gtruthy = hostcfg.value_of(text, "settingsPostFxSubtab")
+    if gtruthy:
+        return True, ("settingsPostFxSubtab is set, which turns "
+                      "nativeTabsSubtabs on with it")
+    if not present:
+        return True, ("nativeTabsSubtabs is absent from aowlspt-host.json and "
+                      "the host defaults it to true")
+    if truthy:
+        return True, "nativeTabsSubtabs = %s" % raw
+    return False, ("nativeTabsSubtabs = %s in aowlspt-host.json (and "
+                   "settingsPostFxSubtab = %s), so the host built no subtab "
+                   "strip this session"
+                   % (raw, graw if gpresent else "absent"))
+
+
+def native_subtabs_flag(root):
+    """(on, why) -- on is None when the config could not be read at all."""
+    try:
+        hostcfg = __import__("hostcfg")
+        _p, text = hostcfg.read_cfg(os.path.join(root, "aowlspt"))
+    except BaseException:
+        # includes SystemExit -- read_cfg exits when the file is absent.
+        return None, ("aowlspt-host.json could not be read, so whether "
+                      "nativeTabsSubtabs was on this session is not known")
+    return _subtabs_flag_from_cfg(hostcfg, text)
+
+
 def assert_tab_count(report, live, nt_names=None, nt_on=None, nt_note=""):
     """Stock top-row tabs, counted by NAME and by activeInHierarchy, with the
     names printed so the number can be checked rather than believed; then the
@@ -1323,71 +1461,164 @@ def assert_row_group_one_on(report, live, expected_clones):
                      clone_note))
 
 
-def assert_postfx_subtab(report, live):
-    """POSTFX folded into GRAPHICS: the subtab strip is a `Toggles(Clone)`
-    child of `Graphics Settings`. Falsifiable: it is absent, or it has fewer
-    than two subtabs, and this FAILS.
+# The names of the two postfx assertions. One constant each, because several
+# functions print them (the strip branch delegates, every refusal branch names
+# them) and repeated literals would be repeated chances to drift out of
+# SCREEN_ASSERTION_NAMES.
+#
+# `under GRAPHICS` in the first name is kept for continuity of the report, but
+# it now means "the GRAPHICS SETTINGS | POSTFX strip", NOT "a child of the
+# Graphics Settings panel". The strip is a SIBLING of the panels now.
+POSTFX_STRIP_NAME = "postfx subtab strip under GRAPHICS"
+POSTFX_GROUP_NAME = "postfx toggles share a group, one is on"
 
-    The m_Group@0x110 / m_IsOn@0x120 half is NO LONGER "NOT PERFORMED": it is
-    delegated to assert_postfx_group_one_on below. The excuse it used to carry
-    (that `component` FAULTED 5/5 on this build) had already been falsified --
-    RE-MEASURED 2026-09-02, `component <ptr> UnityEngine.UI.Toggle` was issued
-    ~30 times against this live screen with ZERO faults, because the
-    fully-qualified name takes the GetComponent(System.Type) klass-identity
-    route and not the GetComponent(String) one that verdict came from.
 
-    The one path that still records INCONCLUSIVE for the group is the one where
-    there is no strip to read: nothing was measured, so nothing is claimed.
+def assert_postfx_subtab(report, live, flag_on=None, captions=None,
+                         mods_n=None, note=""):
+    """The NATIVE subtab strip: a `Toggles(Clone)` DIRECT CHILD of
+    SettingsScreen, carrying the donor's inherited buttons plus exactly the
+    subtabs the host says it built.
+
+    REWRITTEN for the native design. The old assertion looked for the strip
+    under the `Graphics Settings` panel; that path is DELETED (73adced), so it
+    could only ever have said FAIL from here on -- and its `>= 2 children`
+    test could not have failed for the right reason anyway, because the clone
+    arrives carrying the donor's own buttons and would satisfy `>= 2` with
+    zero subtabs of ours in it.
+
+    The expected child count is therefore arithmetic on two MEASURED numbers,
+    neither of them a constant in this file:
+
+        strip children  ==  `Control Settings/Toggles` children   (inherited,
+                            switched off by the host, never destroyed)
+                        +   len(captions)                          (read out
+                            of the host's own `native subtabs: built the <A> |
+                            <B> strip as a SIBLING ...` line)
+
+    Falsifying inputs, stated because a check whose failing input cannot be
+    described is not a check (CLAUDE.md 9b):
+
+      FAIL          no strip AND no `native subtabs` line in the host log --
+                    the 09:05 live regression exactly; or the host logged a
+                    build and the strip is not there; or more than one
+                    `Toggles(Clone)` sits under SettingsScreen; or the child
+                    arithmetic does not come out.
+      INCONCLUSIVE  nativeTabsSubtabs was off (nothing was built, so nothing
+                    is claimed); the one strip went to MODS this session; the
+                    tree did not print completely; the donor could not be
+                    found, so there is no expected number to compare against.
+      PASS          exactly one strip, in the right place, with exactly
+                    `inherited + logged subtabs` children.
     """
+    def refuse(kind, why, detail=""):
+        report.record(POSTFX_STRIP_NAME, kind, why, detail)
+        report.record(POSTFX_GROUP_NAME, INCONCLUSIVE,
+                      "NOT PERFORMED: %s" % why, detail)
+
+    if flag_on is False:
+        refuse(INCONCLUSIVE, note or "nativeTabsSubtabs was off this session")
+        return
     _s, raw = ch.run_batch(["tree %s 2" % SETTINGS_ROOT], live_dir=live,
-                            timeout=40)
+                           timeout=40)
     t = ch.parse_tree(host_text(raw))
     if not t["parse_ok"] or not t["complete"]:
-        report.record("postfx subtab strip under GRAPHICS", INCONCLUSIVE,
-                      "`tree %s 2` did not print a complete tree" % SETTINGS_ROOT)
+        refuse(INCONCLUSIVE,
+               "`tree %s 2` did not print a complete tree" % SETTINGS_ROOT)
         return
-    nodes = t["nodes"]
-    gi = next((i for i, n in enumerate(nodes)
-               if n["name"] == "Graphics Settings"), None)
-    if gi is None:
-        report.record("postfx subtab strip under GRAPHICS", INCONCLUSIVE,
-                      "no `Graphics Settings` node in the settings tree")
+    kids, why = _depth2_direct_children(t["nodes"])
+    if kids is None:
+        refuse(INCONCLUSIVE, why)
         return
-    # depth-2 tree: the children of Graphics Settings are the nodes after it,
-    # up to the next node that is itself a child of SettingsScreen. Bound the
-    # slice by the NEXT known panel/child name rather than by indentation
-    # width, which parse_tree does not expose.
-    sub = []
-    for n in nodes[gi + 1:]:
-        if n["name"] in ("PostFX Settings", "Sound Settings", "Control Settings"):
-            break
-        sub.append(n)
-    strip = [n for n in sub if n["name"] == "Toggles(Clone)"]
-    if not strip:
-        report.record("postfx subtab strip under GRAPHICS", FAIL,
-                      "no `Toggles(Clone)` subtab strip under `Graphics "
-                      "Settings`", ", ".join(n["name"] for n in sub) or "none")
-    else:
-        nsub = strip[0]["child_count"]
-        v = PASS if (nsub or 0) >= 2 else FAIL
-        report.record("postfx subtab strip under GRAPHICS", v,
-                      "subtab strip present with %s child(ren)" % nsub,
-                      strip[0]["ptr"])
-        assert_postfx_group_one_on(report, live, strip[0]["ptr"])
-        return
-    report.record(POSTFX_GROUP_NAME, INCONCLUSIVE,
-                  "NOT PERFORMED: there is no subtab strip to read toggles "
-                  "from -- nothing about the group was checked")
+    strips = [k for k in kids if k["name"] == NT_SUB_STRIP_NAME]
+    names = ", ".join(k["name"] for k in kids) or "none"
 
+    if len(strips) > 1:
+        refuse(FAIL,
+               "%d nodes named `%s` are direct children of SettingsScreen; "
+               "the host builds AT MOST ONE strip (`gNtSubBuilt` guards "
+               "`ntBuildSubtabs`), so this is a strip that was built twice or "
+               "not cleaned up" % (len(strips), NT_SUB_STRIP_NAME), names)
+        return
+    if not strips:
+        if captions is None and mods_n is not None:
+            refuse(INCONCLUSIVE,
+                   "the host logged `native mods: built %d mod subtab(s)`, so "
+                   "this session's ONE strip is the MODS (rows) strip and "
+                   "there is no GRAPHICS SETTINGS | POSTFX strip to find"
+                   % mods_n, names)
+        elif captions is None:
+            # THE 09:05 REGRESSION: nothing on screen and nothing in the log.
+            report.record(POSTFX_STRIP_NAME, FAIL,
+                          "no `%s` child of SettingsScreen AND %s -- the "
+                          "strip was never built this session"
+                          % (NT_SUB_STRIP_NAME,
+                             note or "the host log has no `native subtabs` "
+                                     "line"), names)
+            report.record(POSTFX_GROUP_NAME, INCONCLUSIVE,
+                          "NOT PERFORMED: there is no subtab strip to read "
+                          "toggles from -- nothing about the group was "
+                          "checked", names)
+        else:
+            report.record(POSTFX_STRIP_NAME, FAIL,
+                          "the host logged building the `%s` strip but no `%s` "
+                          "child of SettingsScreen exists"
+                          % (" | ".join(captions), NT_SUB_STRIP_NAME), names)
+            report.record(POSTFX_GROUP_NAME, INCONCLUSIVE,
+                          "NOT PERFORMED: there is no subtab strip to read "
+                          "toggles from", names)
+        return
 
-# The name of the second postfx assertion. One constant, because two functions
-# print it (the strip branch delegates, the no-strip branch refuses) and two
-# literals would be two chances to drift out of SCREEN_ASSERTION_NAMES.
-POSTFX_GROUP_NAME = "postfx toggles share a group, one is on"
+    strip = strips[0]
+    got = strip["child_count"]
+    if captions is None:
+        refuse(INCONCLUSIVE,
+               "a `%s` strip IS a direct child of SettingsScreen with %s "
+               "child(ren), but %s, so how many of them should be subtabs is "
+               "not known" % (NT_SUB_STRIP_NAME, got,
+                              note or "the host logged no subtab count"),
+               strip["ptr"])
+        return
+    donor = next((k for k in kids if k["name"] == NT_SUB_DONOR_PANEL), None)
+    dstrip = next((g for g in (donor or {}).get("grandchildren", [])
+                   if g["name"] == NT_SUB_DONOR_STRIP), None)
+    inherited = dstrip["child_count"] if dstrip else None
+    if inherited is None or got is None:
+        refuse(INCONCLUSIVE,
+               "the strip is present (%s) but `%s/%s` -- the donor whose "
+               "buttons the clone inherits -- could not be counted, so the "
+               "expected child count cannot be computed"
+               % (strip["ptr"], NT_SUB_DONOR_PANEL, NT_SUB_DONOR_STRIP),
+               names)
+        return
+
+    want = inherited + len(captions)
+    measured = ("the strip is a direct child of SettingsScreen with %d "
+                "child(ren), want %d" % (got, want))
+    detail = ("%d inherited from `%s/%s` (cloned, then SetActive(false) -- "
+              "never destroyed) + %d subtab(s) the host logged: %s | strip %s"
+              % (inherited, NT_SUB_DONOR_PANEL, NT_SUB_DONOR_STRIP,
+                 len(captions), " | ".join(captions), strip["ptr"]))
+    if got != want:
+        report.record(POSTFX_STRIP_NAME, FAIL, measured, detail)
+        report.record(POSTFX_GROUP_NAME, INCONCLUSIVE,
+                      "NOT PERFORMED: the strip's child count does not match "
+                      "`inherited + logged subtabs`, so WHICH of its children "
+                      "are ours cannot be decided -- reading a slice of them "
+                      "anyway would be a guess", detail)
+        return
+    report.record(POSTFX_STRIP_NAME, PASS, measured, detail)
+    assert_postfx_group_one_on(report, live, strip["ptr"], inherited, captions)
 
 
 def _depth2_direct_children(nodes):
     """(([direct_child_node, ...]), "") or (None, note) from a `tree X 2`.
+
+    Each returned child is a COPY of the parsed node with a `grandchildren`
+    key holding its own children (the depth-2 tree prints them but does not
+    expand them further). That is what lets the postfx assertion count the
+    DONOR strip `Control Settings/Toggles` from the same single tree it
+    already has, instead of issuing a second walk that could see a different
+    frame.
 
     parse_tree exposes no depth -- only the name, the pointer and the node's
     own child count -- so "which of these lines are DIRECT children" cannot be
@@ -1413,6 +1644,8 @@ def _depth2_direct_children(nodes):
                           "follow it, so the depth-2 layout does not add up "
                           "and the parent/child pairing cannot be trusted"
                           % (kid["name"], gc, len(nodes) - i - 1))
+        kid = dict(kid)
+        kid["grandchildren"] = nodes[i + 1:i + 1 + gc]
         kids.append(kid)
         i += 1 + gc
     want = root["child_count"]
@@ -1457,8 +1690,17 @@ def _postfx_toggle_hosts(live, strip_ptr, subtabs):
     return out, ""
 
 
-def assert_postfx_group_one_on(report, live, strip_ptr):
+def assert_postfx_group_one_on(report, live, strip_ptr, inherited=0,
+                               captions=None):
     """The postfx subtab strip is ONE ToggleGroup with EXACTLY ONE tab selected.
+
+    `inherited` is how many of the strip's children came with the CLONE and are
+    the donor's, not ours -- they are switched off, never destroyed, and they
+    sit FIRST because ours are parented in afterwards. They must be skipped:
+    the donor's own selected button would otherwise be read as a second ON and
+    reported as a confidently wrong FAIL. The slice is only taken when the
+    child count is exactly `inherited + len(captions)`; anything else is a
+    REFUSAL, because picking which children are ours would be a guess.
 
     This assertion was `NOT PERFORMED` until now and said so, which was honest
     but bought nothing. It is the same discipline as
@@ -1487,10 +1729,20 @@ def assert_postfx_group_one_on(report, live, strip_ptr):
     if subtabs is None:
         report.record(POSTFX_GROUP_NAME, INCONCLUSIVE, note)
         return
+    if captions is not None:
+        want = inherited + len(captions)
+        if len(subtabs) != want:
+            report.record(POSTFX_GROUP_NAME, INCONCLUSIVE,
+                          "the strip printed %d direct child(ren) but %d "
+                          "inherited + %d logged subtab(s) were expected, so "
+                          "which children are OURS cannot be decided"
+                          % (len(subtabs), inherited, len(captions)))
+            return
+        subtabs = subtabs[inherited:]
     if len(subtabs) < 2:
         report.record(POSTFX_GROUP_NAME, FAIL,
-                      "the subtab strip has %d child(ren); a group of tabs "
-                      "needs at least 2" % len(subtabs))
+                      "the subtab strip has %d subtab(s) of ours; a group of "
+                      "tabs needs at least 2" % len(subtabs))
         return
     members, note = _postfx_toggle_hosts(live, strip_ptr, subtabs)
     if members is None:
@@ -1666,7 +1918,14 @@ def run_screen_assertions(report, live, args, ready, reason):
     assert_no_text(report, live, "no placeholder text on any RENDERED node",
                    PLACEHOLDER_TEXT)
     assert_row_group_one_on(report, live, published)
-    assert_postfx_subtab(report, live)
+    sub_on, sub_why = native_subtabs_flag(args.root)
+    caps, mods_n, _verds, attempt, sub_note = native_subtabs_built(args.root)
+    if attempt is not None:
+        # The host said, in this process, that the flag was ON. That outranks
+        # the config file, which can have been edited since the client booted.
+        sub_on, sub_why = True, ""
+    assert_postfx_subtab(report, live, sub_on, caps, mods_n,
+                         sub_why if sub_on is False else sub_note)
     assert_one_panel_active(report, live)
 
 
@@ -1842,9 +2101,21 @@ def _fx_strip(names, base=0x21c00440000, batch=100):
 # is labelled INFERRED-FROM-SOURCE rather than measured for exactly that
 # reason. If it is wrong, `_READ_AT_RE` stops matching and the assertion goes
 # INCONCLUSIVE; it cannot turn into a false PASS.
+# THE NATIVE SUBTAB FIXTURES ARE **SHAPED**, NOT MEASURED. The live client was
+# not available to harvest from (a bisect boot was running), so only the FORMAT
+# is copied -- from the measured `tree-toggle-strip-depth2` entry in
+# tools/fixtures/inspector/tree.txt, via _fx_tree. The NAMES below are shaped
+# from nativetabs.nim (`ntBuildSubtabs` clones `Control Settings/Toggles` and
+# its `ControlToggle`, and never renames either, so Unity's "(Clone)" suffix is
+# what the tree prints); the POINTERS are invented. Only the COUNTS and the
+# ORDER -- inherited donor buttons first, ours appended after -- are
+# load-bearing, and both of those are read out of nativetabs.nim, not guessed.
 _PFX_STRIP = "0x000002024b100000"
-_PFX_SUBS = ["PostFxSubtab", "PostFxSubtab(Clone)", "PostFxSubtab(Clone)",
-             "PostFxSubtab(Clone)"]
+_PFX_CAPS = ["GRAPHICS SETTINGS", "POSTFX"]      # the host's own build line
+_PFX_DONOR_SUBS = ["ControlToggle", "GesturesToggle"]
+_PFX_DONOR_PTRS = ["0x%016x" % (0x2024b1a1000 + i * 0x40) for i in range(4)]
+_PFX_DONOR_AT_PTRS = ["0x%016x" % (0x2024b1a2000 + i * 0x40) for i in range(4)]
+_PFX_SUBS = ["ControlToggle(Clone)"] * 4
 _PFX_SUB_PTRS = ["0x%016x" % (0x2024b101000 + i * 0x40) for i in range(4)]
 _PFX_AT_PTRS = ["0x%016x" % (0x2024b102000 + i * 0x40) for i in range(4)]
 _PFX_COMP_PTRS = ["0x%016x" % (0x2024b103000 + i * 0x400) for i in range(4)]
@@ -1899,26 +2170,71 @@ ANSWER: this object has no component of that type.
                    1 if ison else 0))
 
 
-def _fx_settings_tree_with_strip(nsub=4, batch=111):
-    """`tree $settings 2` with a `Toggles(Clone)` subtab strip of `nsub`
-    children under `Graphics Settings`."""
-    return _fx_tree("SettingsScreen", "0x000002024b000000", [
-        ("Graphics Settings", "0x000002024b000100",
-         [("Toggles(Clone)", _PFX_STRIP, nsub)]),
-        ("Sound Settings", "0x000002024b000200", []),
-    ], batch=batch)
+def _fx_settings_tree(ours=2, inherited=2, strip=True, extra=0, strips=1,
+                      batch=111):
+    """`tree $settings 2` for the NATIVE design (SHAPED -- see _PFX_STRIP).
+
+    The strip is a DIRECT CHILD of SettingsScreen, a SIBLING of the panels --
+    NOT a child of `Graphics Settings`, which is why that panel is emitted with
+    no children at all here: the old path is deleted, and a fixture that still
+    showed it there would let the deleted design keep passing.
+
+    `Control Settings` still carries the donor `Toggles` the clone came from,
+    with `inherited` buttons, because that count is half the arithmetic the
+    assertion does. `extra` adds children to the strip that the host never
+    logged -- the falsifying input.
+    """
+    n = inherited + ours + extra
+    kids = [("Toggles", "0x000002024b000080",
+             [("GameToggleSpawner", "0x000002024b000090", 1)]),
+            ("Graphics Settings", "0x000002024b000100", []),
+            ("Sound Settings", "0x000002024b000200", []),
+            (NT_SUB_DONOR_PANEL, "0x000002024b000300",
+             [(NT_SUB_DONOR_STRIP, "0x000002024b000380", inherited)])]
+    for s in range(strips):
+        kids.append((NT_SUB_STRIP_NAME, "0x%016x" % (int(_PFX_STRIP, 16) +
+                                                     s * 0x1000),
+                     [(nm, ptr, 1) for nm, ptr in _fx_strip_children(
+                         ours, inherited, extra)]))
+    return _fx_tree("SettingsScreen", "0x000002024b000000", kids, batch=batch)
 
 
-def _fx_postfx_script(groups, ons, at_children=("AnimatedToggle",)):
+def _fx_strip_children(ours, inherited, extra=0):
+    """[(name, ptr)] in the order the live tree prints them: the donor's own
+    buttons FIRST (they came with the clone and were only switched off), then
+    ours. `extra` appends unaccounted-for children."""
+    out = [(_PFX_DONOR_SUBS[i % len(_PFX_DONOR_SUBS)], _PFX_DONOR_PTRS[i])
+           for i in range(inherited)]
+    out += [(_PFX_SUBS[i], _PFX_SUB_PTRS[i]) for i in range(ours)]
+    out += [("Stray(Clone)", "0x%016x" % (0x2024b1f0000 + i))
+            for i in range(extra)]
+    return out
+
+
+def _fx_postfx_script(groups, ons, at_children=("AnimatedToggle",),
+                      inherited=2, extra=0):
     """The WHOLE replay script for assert_postfx_subtab, parameterised by what
-    the four subtab toggles report. `groups[i] is None` records the refusal."""
-    script = [("tree %s 2" % SETTINGS_ROOT, [_fx_settings_tree_with_strip()]),
+    OUR subtab toggles report (`len(groups)` of them). `groups[i] is None`
+    records the refusal shape.
+
+    NOTHING IS RECORDED FOR THE INHERITED DONOR BUTTONS ON PURPOSE. They are
+    in the strip and they carry AnimatedToggle children of their own, so if the
+    assertion ever reads them the replay RAISES on an unrecorded command --
+    which is the negative control for the skip. Reading them live would find
+    the donor's selected button and report a second ON as a FAIL.
+    """
+    ours = len(groups)
+    script = [("tree %s 2" % SETTINGS_ROOT,
+               [_fx_settings_tree(ours=ours, inherited=inherited, extra=extra)]),
               ("tree %s 2" % _PFX_STRIP,
-               [_fx_tree("Toggles(Clone)", _PFX_STRIP,
-                         [(_PFX_SUBS[i], _PFX_SUB_PTRS[i],
-                           [("AnimatedToggle", _PFX_AT_PTRS[i], 2)])
-                          for i in range(4)], batch=112)])]
-    for i in range(4):
+               [_fx_tree(NT_SUB_STRIP_NAME, _PFX_STRIP,
+                         [(nm, ptr, [("AnimatedToggle",
+                                      (_PFX_DONOR_AT_PTRS[i] if i < inherited
+                                       else _PFX_AT_PTRS[i - inherited]), 2)])
+                          for i, (nm, ptr) in
+                          enumerate(_fx_strip_children(ours, inherited, extra))],
+                         batch=112)])]
+    for i in range(ours):
         # Each subtab: its AnimatedToggle child (which has grandchildren of its
         # own, so the depth-2 arithmetic is actually exercised) plus a Label.
         kids = [(nm, _PFX_AT_PTRS[i],
@@ -1929,7 +2245,7 @@ def _fx_postfx_script(groups, ons, at_children=("AnimatedToggle",)):
         script.append(("tree %s 2" % _PFX_SUB_PTRS[i],
                        [_fx_tree(_PFX_SUBS[i], _PFX_SUB_PTRS[i], kids,
                                  batch=113 + i)]))
-    for i in range(4):
+    for i in range(ours):
         script.append(
             ("component %s UnityEngine.UI.Toggle" % _PFX_AT_PTRS[i],
              [_fx_toggle_read(_PFX_AT_PTRS[i], _PFX_COMP_PTRS[i],
@@ -2436,45 +2752,61 @@ Component::get_gameObject, GameObject::get_activeSelf (calls, not field reads)
     #     assertion is worth having only if there is an input that makes it
     #     say FAIL and an input that makes it say INCONCLUSIVE.
     G = _PFX_GROUP
+    CAPS = _PFX_CAPS
+
+    def _pfx(rep, **kw):
+        """The call run_screen_assertions makes: flag ON, and the captions the
+        host logged. Anything a case wants to vary, it varies by name."""
+        kw.setdefault("flag_on", True)
+        kw.setdefault("captions", CAPS)
+        assert_postfx_subtab(rep, "X", **kw)
+
+    def _row(rep, name):
+        rows = [r for r in rep.rows if r[0] == name]
+        return rows[0] if rows else None
 
     def c16a(rep, _rp):
-        assert_postfx_subtab(rep, "X")
+        _pfx(rep)
         v = _verdicts(rep)
-        if v.get("postfx subtab strip under GRAPHICS") != PASS:
-            return "the strip half regressed: %s" % v.get(
-                "postfx subtab strip under GRAPHICS")
+        if v.get(POSTFX_STRIP_NAME) != PASS:
+            return "the strip half regressed: %s (%r)" % (
+                v.get(POSTFX_STRIP_NAME), _row(rep, POSTFX_STRIP_NAME)[2])
+        srow = _row(rep, POSTFX_STRIP_NAME)
+        if "4 child(ren), want 4" not in srow[2]:
+            return "the child arithmetic was not stated: %r" % srow[2]
+        if "2 inherited" not in srow[3]:
+            return "the inherited donor buttons were not named: %r" % srow[3]
         if v.get(POSTFX_GROUP_NAME) != PASS:
-            row = [r for r in rep.rows if r[0] == POSTFX_GROUP_NAME][0]
+            row = _row(rep, POSTFX_GROUP_NAME)
             return "one group, one ON did not PASS: %s %r" % (row[1], row[2])
-        row = [r for r in rep.rows if r[0] == POSTFX_GROUP_NAME][0]
+        row = _row(rep, POSTFX_GROUP_NAME)
         if "1 distinct m_Group, 1 ON" not in row[2]:
             return "the measurement was not stated: %r" % row[2]
         return ""
-    case("postfx subtabs: one shared group, exactly one ON -> PASS",
-         _fx_postfx_script([G] * 4, [True, False, False, False]), c16a)
+    case("native subtabs: strip is a SIBLING, one group, exactly one ON -> PASS",
+         _fx_postfx_script([G] * 2, [True, False]), c16a)
 
     def c16b(rep, _rp):
-        assert_postfx_subtab(rep, "X")
+        _pfx(rep)
         if _verdicts(rep).get(POSTFX_GROUP_NAME) != FAIL:
             return "two subtabs ON at once did not FAIL"
         return ""
     case("control: two postfx subtabs ON -> FAIL",
-         _fx_postfx_script([G] * 4, [True, True, False, False]), c16b)
+         _fx_postfx_script([G] * 2, [True, True]), c16b)
 
     def c16c(rep, _rp):
-        assert_postfx_subtab(rep, "X")
-        row = [r for r in rep.rows if r[0] == POSTFX_GROUP_NAME][0]
+        _pfx(rep)
+        row = _row(rep, POSTFX_GROUP_NAME)
         if row[1] != FAIL:
             return "two different ToggleGroups did not FAIL: %s" % row[1]
         if "2 distinct m_Group" not in row[2]:
             return "the group split was not stated: %r" % row[2]
         return ""
     case("control: postfx subtabs in two different groups -> FAIL",
-         _fx_postfx_script([G, G, G + 0x40, G], [True, False, False, False]),
-         c16c)
+         _fx_postfx_script([G, G + 0x40], [True, False]), c16c)
 
     def c16d(rep, _rp):
-        assert_postfx_subtab(rep, "X")
+        _pfx(rep)
         v = _verdicts(rep).get(POSTFX_GROUP_NAME)
         if v == FAIL:
             return ("an UNREADABLE toggle was counted as a failure -- 'I could "
@@ -2483,20 +2815,172 @@ Component::get_gameObject, GameObject::get_activeSelf (calls, not field reads)
             return "expected INCONCLUSIVE, got %s" % v
         return ""
     case("control: one postfx subtab has no Toggle -> INCONCLUSIVE, not FAIL",
-         _fx_postfx_script([G, None, G, G], [True, False, False, False]), c16d)
+         _fx_postfx_script([G, None], [True, False]), c16d)
 
     def c16e(rep, _rp):
-        assert_postfx_subtab(rep, "X")
-        row = [r for r in rep.rows if r[0] == POSTFX_GROUP_NAME][0]
+        _pfx(rep)
+        row = _row(rep, POSTFX_GROUP_NAME)
         if row[1] != INCONCLUSIVE:
             return ("a subtab with TWO AnimatedToggle children was resolved "
                     "anyway (verdict %s) -- picking the first would be an "
                     "invented answer" % row[1])
         return ""
     case("control: ambiguous AnimatedToggle child -> INCONCLUSIVE",
-         _fx_postfx_script([G] * 4, [True, False, False, False],
+         _fx_postfx_script([G] * 2, [True, False],
                            at_children=("AnimatedToggle",
                                         "AnimatedToggle(Clone)")), c16e)
+
+    # --- 16f-16k. THE NATIVE STRIP ITSELF. The old assertion looked under
+    #     `Graphics Settings`; these are the inputs that make the new one say
+    #     each of its three answers about the strip's PLACEMENT and SIZE.
+
+    def c16f(rep, rp):
+        _pfx(rep, captions=None,
+             note="the host log has no `native subtabs` line")
+        v = _verdicts(rep)
+        if v.get(POSTFX_STRIP_NAME) != FAIL:
+            return ("no strip AND no host `native subtabs` line -- the 09:05 "
+                    "live regression -- did not FAIL: %s"
+                    % v.get(POSTFX_STRIP_NAME))
+        if "native subtabs" not in _row(rep, POSTFX_STRIP_NAME)[2]:
+            return ("the FAIL does not name the missing log line: %r"
+                    % _row(rep, POSTFX_STRIP_NAME)[2])
+        if v.get(POSTFX_GROUP_NAME) != INCONCLUSIVE:
+            return "the group half claimed something with no strip to read"
+        if any(s.startswith("component ") for s in rp.sent):
+            return "read toggles although there was no strip"
+        return ""
+    case("THE 09:05 REGRESSION: no strip and no `native subtabs` line -> FAIL",
+         [("tree %s 2" % SETTINGS_ROOT, [_fx_settings_tree(strips=0)])], c16f)
+
+    def c16f2(rep, _rp):
+        _pfx(rep, captions=None,
+             note=("the host printed `native subtabs: build attempted "
+                   "(nativeTabsSubtabs is ON) and returned false` -- the "
+                   "build ran and REFUSED"))
+        if _verdicts(rep).get(POSTFX_STRIP_NAME) != FAIL:
+            return "a build that RAN AND REFUSED was not a FAIL"
+        if "REFUSED" not in _row(rep, POSTFX_STRIP_NAME)[2]:
+            return "the refusal the host reported was not carried into the row"
+        return ""
+    case("control: the host attempted the build and it returned false -> FAIL",
+         [("tree %s 2" % SETTINGS_ROOT, [_fx_settings_tree(strips=0)])], c16f2)
+
+    def c16g(rep, rp):
+        _pfx(rep, captions=None, mods_n=3,
+             note="the host log has no `native subtabs` line")
+        v = _verdicts(rep)
+        if v.get(POSTFX_STRIP_NAME) != INCONCLUSIVE:
+            return ("a session whose ONE strip went to MODS was judged %s "
+                    "rather than INCONCLUSIVE" % v.get(POSTFX_STRIP_NAME))
+        if "mod subtab" not in _row(rep, POSTFX_STRIP_NAME)[2]:
+            return "the MODS-strip reason was not stated"
+        return ""
+    case("control: the one strip was built for MODS -> INCONCLUSIVE, not FAIL",
+         [("tree %s 2" % SETTINGS_ROOT, [_fx_settings_tree(strips=0)])], c16g)
+
+    def c16h(rep, rp):
+        _pfx(rep, flag_on=False,
+             note="nativeTabsSubtabs = false in aowlspt-host.json")
+        v = _verdicts(rep)
+        if v.get(POSTFX_STRIP_NAME) != INCONCLUSIVE or \
+           v.get(POSTFX_GROUP_NAME) != INCONCLUSIVE:
+            return "a feature that was switched off produced a verdict"
+        if rp.sent:
+            return ("the client was walked anyway (%r) for a feature that was "
+                    "off" % rp.sent)
+        return ""
+    case("control: nativeTabsSubtabs OFF -> INCONCLUSIVE, nothing walked",
+         [], c16h)
+
+    def c16i(rep, rp):
+        _pfx(rep)
+        v = _verdicts(rep)
+        if v.get(POSTFX_STRIP_NAME) != FAIL:
+            return ("a strip with one child MORE than `inherited + logged` "
+                    "was judged %s" % v.get(POSTFX_STRIP_NAME))
+        if "5 child(ren), want 4" not in _row(rep, POSTFX_STRIP_NAME)[2]:
+            return "the arithmetic was not stated: %r" % _row(
+                rep, POSTFX_STRIP_NAME)[2]
+        if v.get(POSTFX_GROUP_NAME) != INCONCLUSIVE:
+            return ("the group half read a slice of a strip whose shape it "
+                    "could not account for")
+        if any(s.startswith("component ") for s in rp.sent):
+            return "read toggles out of a strip it could not account for"
+        return ""
+    case("control: strip has an unaccounted-for child -> FAIL, group refuses",
+         [("tree %s 2" % SETTINGS_ROOT,
+           [_fx_settings_tree(ours=2, extra=1)])], c16i)
+
+    def c16j(rep, _rp):
+        _pfx(rep)
+        if _verdicts(rep).get(POSTFX_STRIP_NAME) != FAIL:
+            return "two `Toggles(Clone)` strips under SettingsScreen did not FAIL"
+        return ""
+    case("control: TWO subtab strips under SettingsScreen -> FAIL",
+         [("tree %s 2" % SETTINGS_ROOT, [_fx_settings_tree(strips=2)])], c16j)
+
+    def c16k(rep, _rp):
+        _pfx(rep, captions=None, note="the host logged no subtab count")
+        v = _verdicts(rep)
+        if v.get(POSTFX_STRIP_NAME) != INCONCLUSIVE:
+            return ("a strip with no logged subtab count was judged %s -- "
+                    "there is no number to compare it against"
+                    % v.get(POSTFX_STRIP_NAME))
+        return ""
+    case("control: strip present but the host logged no count -> INCONCLUSIVE",
+         [("tree %s 2" % SETTINGS_ROOT, [_fx_settings_tree()])], c16k)
+
+    # --- 16l. THE HOST'S OWN LITERALS, against the message parser. ---------
+    print("\n---- native subtabs: the host's own log lines")
+    BUILT = ("native subtabs: built the GRAPHICS SETTINGS | POSTFX strip as a "
+             "SIBLING of the panels it switches, not inside either one.")
+    VERD = ("native subtabs VERDICT PASS (subtab selection): exactly one "
+            "subtab reads m_IsOn=1 (POSTFX) and its panel is the ONLY active "
+            "one of the two")
+    MODS = ("native mods: built 3 mod subtab(s) from the "
+            "/aowlspt/settings/index fetch")
+    ATT_NO = ("native subtabs: build attempted (nativeTabsSubtabs is ON) and "
+              "returned false. NOTE FOR ACCEPTANCE: this strip is a SIBLING "
+              "of the panels, parented to SettingsScreen")
+    caps, mods_n, verds, att, nt = _subtabs_from_messages([BUILT, VERD])
+    if caps != ["GRAPHICS SETTINGS", "POSTFX"]:
+        failures.append("_subtabs_from_messages did not read the captions out "
+                        "of the host's build line: %r" % (caps,))
+    if len(verds) != 1 or verds[0][0] != "PASS":
+        failures.append("the VERDICT line was not seen: %r" % (verds,))
+    if nt:
+        failures.append("a complete pair of lines still produced a note: %r" % nt)
+    caps2, mods2, _v2, _a2, nt2 = _subtabs_from_messages([MODS])
+    if caps2 is not None or mods2 != 3 or not nt2:
+        failures.append("the MODS-strip session was not distinguished: %r"
+                        % ((caps2, mods2, nt2),))
+    caps3, _m3, _v3, att3, nt3 = _subtabs_from_messages(["something unrelated"])
+    if caps3 is not None or att3 is not None or "native subtabs" not in nt3:
+        failures.append("a log with no subtab line did not refuse by name: %r"
+                        % nt3)
+    caps4, _m4, _v4, att4, nt4 = _subtabs_from_messages([ATT_NO])
+    if att4 is not False or caps4 is not None or "REFUSED" not in nt4:
+        failures.append("`build attempted ... returned false` -- a build that "
+                        "RAN AND REFUSED -- was not distinguished from a flag "
+                        "that was off: %r" % ((att4, nt4),))
+    print("  captions=%r mods_n=%r verdicts=%d attempt=%r/%r"
+          % (caps, mods2, len(verds), att, att4))
+
+    # --- 16m. THE FLAG, resolved the way aowlhost.nim resolves it. ---------
+    print("\n---- nativeTabsSubtabs: default-on, implied-on, off")
+    import hostcfg as _hcfg
+    for text, want in (('{"nativeTabs": true}', True),
+                       ('{"nativeTabsSubtabs": false}', False),
+                       ('{"nativeTabsSubtabs": true}', True),
+                       ('{"nativeTabsSubtabs": false, '
+                        '"settingsPostFxSubtab": true}', True)):
+        on, why = _subtabs_flag_from_cfg(_hcfg, text)
+        if on is not want:
+            failures.append("nativeTabsSubtabs for %s read %s, want %s (%s)"
+                            % (text, on, want, why))
+    print("  absent->ON, false->OFF, true->ON, "
+          "false+settingsPostFxSubtab->ON")
 
     # --- 17-19. THE CLONE COUNT COMES FROM THE HOST'S `built the` LINES. ---
     #     It used to come from `published N of M client-side settings page(s)`,
