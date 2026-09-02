@@ -60,6 +60,19 @@ one `ERRORDIALOG` line per dialog) and this believes it.
 If the host did NOT arm the dialog catcher, this says so and downgrades an IDLE
 verdict to INCONCLUSIVE, because "I could not look" is not a pass (CLAUDE.md 9b).
 
+## If the process is gone, it reads Unity's OWN crash report
+
+MEASURED 2026-09-02: four deaths were chased for an hour off nothing but "the
+client process was up and is gone", while Unity's crash handler had written a
+full stack trace for each one under `%LOCALAPPDATA%\Temp\Battlestate
+Games\EscapeFromTarkov\Crashes\Crash_<UTC stamp>\Player.log`. So on any verdict
+where the process is gone, the block now carries `CRASH REPORT <folder> (<age>s
+after launch)`, the top 12 crash-site frames, and ONE attribution line -- the
+first crash-site frame in a module of ours (the host DLL or a mod), else the
+top frame's module. When no report newer than launch exists it says `NO CRASH
+REPORT was written`, which is a fact and not an absence: that death was a
+teardown or an exit, not a native fault. Parsing lives in `crashwatch.py`.
+
 ## It STOPS the client when it is done, and it says so
 
 Without `--keep` (and without `--attach`), the client, the backend and the
@@ -656,14 +669,54 @@ class Supervisor:
         return None
 
 
+def crash_evidence(started, root=None):
+    """What Unity's OWN crash handler recorded about this death, if anything.
+
+    Returns a dict: `lines` is the block to print, and the rest is the same
+    finding in machine-readable form. `folder` None means NO report newer than
+    launch exists -- which is itself a fact, and the reason this never returns
+    None: "the client was torn down or exited" and "the client died in native
+    code" are different causes and must not both print as silence.
+
+    MEASURED 2026-09-02: four deaths were chased for an hour off the DIED line
+    alone ("the client process was up and is gone") while a full report with a
+    named module sat under %LOCALAPPDATA%\\Temp\\Battlestate Games\\...\\Crashes
+    for each one. crashwatch owns the parsing; this only prints it.
+    """
+    kw = {} if root is None else {"root": root}
+    try:
+        rep = crashwatch.newest_crash_report(since=started, **kw)
+    except Exception as e:                       # never let this hide a verdict
+        return {"folder": None, "module": None, "source": "error",
+                "age_s": None, "modules": [],
+                "lines": ["crash report lookup FAILED (%s: %s) -- this is "
+                          "INCONCLUSIVE, not 'no crash report'"
+                          % (type(e).__name__, e)]}
+    lines = crashwatch.format_crash_report(rep, start_epoch=started)
+    if rep is None:
+        return {"folder": None, "module": None, "source": "none",
+                "age_s": None, "modules": [], "lines": lines}
+    mod, source, _frame, _note = rep.attribute()
+    return {"folder": os.path.basename(rep.folder), "module": mod,
+            "source": source, "age_s": (None if rep.age_after(started) is None
+                                        else round(rep.age_after(started), 1)),
+            "modules": sorted(rep.modules), "lines": lines}
+
+
 def verdict_block(v, why, evidence, elapsed, armed, logs, as_json,
-                  teardown=False):
+                  teardown=False, crash=None):
     if as_json:
         print(jsonmod.dumps({
             "verdict": v, "why": why, "elapsed_s": round(elapsed, 1),
             "errdlg_armed": armed, "evidence": evidence[-6:], "logs": logs,
             "teardown": bool(teardown),
+            "crash": (None if crash is None
+                      else {k: crash[k] for k in
+                            ("folder", "module", "source", "age_s", "modules")}),
         }, separators=(",", ":")))
+        if crash is not None:
+            for line in crash["lines"]:
+                sys.stderr.write(line + "\n")
         if teardown:
             # --json is one machine-readable line and must stay one line, so
             # the human sentence goes to stderr rather than being dropped.
@@ -686,6 +739,10 @@ def verdict_block(v, why, evidence, elapsed, armed, logs, as_json,
         print("   | " + line[:200])
     if logs:
         print(" %-12s  %s" % ("logs", "  ".join(logs)))
+    if crash is not None:
+        print("")
+        for line in crash["lines"]:
+            print(" " + line)
     if teardown:
         print(" " + TEARDOWN_LINE)
     print(bar, flush=True)
@@ -928,9 +985,20 @@ def main():
     logs = [p for p in (harness.hostlog_path(args.root),) if os.path.isfile(p)]
     if sup.cur_dir:
         logs.append(sup.cur_dir)
+    # If the process is gone -- whatever the verdict says -- Unity may have
+    # written a crash report, and reading it is the difference between "it is
+    # gone" and "it faulted in sain::toJson". Asked for every gone-process
+    # verdict, not just DIED: a TIMEOUT or POPUP run whose client vanished
+    # under it has exactly the same evidence available. Checked BEFORE
+    # teardown, so a teardown we perform cannot be mistaken for the death.
+    crash = None
+    if verdict == "DIED" or not harness.client_alive():
+        crash = crash_evidence(started)
+
     tearing = not args.keep and not args.attach
     verdict_block(verdict, why, evidence, time.time() - started,
-                  sup.errdlg_armed, logs, args.json, teardown=tearing)
+                  sup.errdlg_armed, logs, args.json, teardown=tearing,
+                  crash=crash)
 
     if tearing:
         do_teardown(args.root, dry=args.dry_teardown)

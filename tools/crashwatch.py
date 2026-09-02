@@ -24,6 +24,9 @@ output_000.log costs nothing.
     python tools/crashwatch.py --watch       # keep observing across relaunches
     python tools/crashwatch.py --watch --kill-on matchmaking-timeout
                                              # ARM the kill, for ONE signature
+    python tools/crashwatch.py last [N]      # the morning read: the newest N
+                                             # UNITY CRASH REPORTS, each with
+                                             # the module its crash site is in
     python tools/crashwatch.py --selftest    # prove both halves; needs no game
     python tools/crashwatch.py --scan-existing   # also scan text already in the
                                                  # newest dir (off by default so
@@ -92,6 +95,7 @@ it can outlive any single launch.
 from __future__ import annotations
 
 import argparse
+import datetime
 import glob
 import os
 import re
@@ -1143,7 +1147,338 @@ def kill_selftest():
     return bad
 
 
+# ---------------------------------------------------------------------------
+# Unity's own crash reports. MEASURED 2026-09-02.
+#
+# Four clean-looking client deaths were chased for an hour with no cause while
+# Unity's crash handler had already written a full report for each one, under
+#
+#   %LOCALAPPDATA%\Temp\Battlestate Games\EscapeFromTarkov\Crashes
+#       Crash_<yyyy-MM-dd_HHmmssfff>\Player.log   (+ a small crash.dmp)
+#
+# Nothing in this repo read them. `run.py`'s DIED verdict said only "the client
+# process was up and is gone" -- which is true and useless, when the report
+# sitting on disk names the module the fault came out of.
+#
+# Two things about the format, both measured on the two 2026-09-02 reports:
+#
+#  * THE FOLDER TIMESTAMP IS UTC. Crash_2026-09-02_045033156 is 00:50:33 local.
+#    Comparing that name against a local wall clock makes a crash that just
+#    happened look ~4h in the future, i.e. "newer than launch" for every launch
+#    forever. Every comparison here goes through epoch seconds.
+#  * THE STACK SECTION CAN CONTAIN TWO FRAME BLOCKS. It opens with
+#    `========== OUTPUTTING STACK TRACE ==================`, then the crash-site
+#    frames, and in one of the two reports the symbol handler then dumped
+#    `SymInit:` plus the whole loaded-module list INTO the middle of the
+#    section, followed by a second, longer walked stack, before
+#    `========== END OF STACKTRACE ===========`.
+#
+# That second point decides the attribution rule, so it is stated rather than
+# implied: attribution is taken from the FIRST block -- the crash-site frames.
+# The walked block is kept and reported, but a module that appears only there
+# is a note, not the verdict. Crash_2026-09-02_045033156 is exactly this case:
+# its crash site is two GameAssembly frames, and aowlspt-host-il2cpp appears
+# only in the walked stack. Blaming the host off that would be a confident
+# wrong answer of the kind CLAUDE.md 9b is about.
+
+DEFAULT_CRASH_ROOT = os.path.join(
+    os.environ.get("LOCALAPPDATA", r"C:\Users\Default\AppData\Local"),
+    "Temp", "Battlestate Games", "EscapeFromTarkov", "Crashes")
+DEFAULT_INSTALL = "D:/Aowlspt/aowlspt"
+
+STACK_BEGIN = "========== OUTPUTTING STACK TRACE =================="
+STACK_END = "========== END OF STACKTRACE ==========="
+# "0x00007FFB7C61E345 (sain) toJson_0_sethgq4xy1"
+FRAME_RX = re.compile(r"^\s*(0x[0-9A-Fa-f]+)\s+\(([^)]*)\)\s*(.*?)\s*$")
+# The symbol handler interleaves these with the frames; they annotate the frame
+# that follows and must NOT split a block.
+FRAME_NOISE_RX = re.compile(r"^\s*(ERROR: Sym\w+|WARNING: Sym\w+)")
+CRASH_DIR_RX = re.compile(r"^Crash_(\d{4}-\d\d-\d\d)_(\d{6})(\d{0,3})$")
+
+
+def crash_dir_epoch(name):
+    """Epoch seconds for a Crash_* folder NAME, read as UTC. None if unparsable.
+
+    The UTC part is the whole point -- see the note above.
+    """
+    m = CRASH_DIR_RX.match(os.path.basename(str(name).rstrip("\\/")))
+    if not m:
+        return None
+    day, hms, ms = m.group(1), m.group(2), m.group(3) or "0"
+    try:
+        dt = datetime.datetime.strptime(day + "_" + hms, "%Y-%m-%d_%H%M%S")
+    except ValueError:
+        return None
+    dt = dt.replace(tzinfo=datetime.timezone.utc,
+                    microsecond=int(ms.ljust(3, "0")) * 1000)
+    return dt.timestamp()
+
+
+def our_modules(install_root=DEFAULT_INSTALL, repo_root=None):
+    """The module names on a stack that belong to US, lowercased, no extension.
+
+    Unity prints the module without its extension (`sain`, `GameAssembly`,
+    `aowlspt-host-il2cpp`), so these are stems. Sourced from BOTH the deployed
+    install (mods/<name>/<name>.dll) and this repo's mods/ directory, so the
+    answer does not silently become "nothing is ours" on a machine where
+    D:\\Aowlspt is absent -- which would turn every attribution into the top
+    frame's module without saying it had stopped looking.
+    """
+    names = {"aowlspt-host-il2cpp", "aowlspt-backend"}
+    if install_root:
+        for p in glob.glob(os.path.join(install_root, "mods", "*", "*.dll")):
+            names.add(os.path.splitext(os.path.basename(p))[0].lower())
+    if repo_root is None:
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    moddir = os.path.join(repo_root, "mods")
+    if os.path.isdir(moddir):
+        for n in os.listdir(moddir):
+            if os.path.isdir(os.path.join(moddir, n)):
+                names.add(n.lower())
+    return names
+
+
+class Frame(object):
+    __slots__ = ("addr", "module", "symbol", "walked")
+
+    def __init__(self, addr, module, symbol, walked=False):
+        self.addr, self.module, self.symbol = addr, module, symbol
+        self.walked = walked
+
+    def __repr__(self):
+        return "%s (%s) %s" % (self.addr, self.module, self.symbol)
+
+    text = property(__repr__)
+
+
+class CrashReport(object):
+    """One Crash_* folder, parsed. Three states, never two.
+
+    `ok` False with `why` set means the folder exists but could not be read as
+    a report -- no Player.log, no stack section, no frames. That is
+    INCONCLUSIVE ("I could not look"), and callers must not print it as if it
+    were an attribution.
+    """
+
+    def __init__(self, folder, when=None):
+        self.folder = folder
+        self.log = os.path.join(folder, "Player.log")
+        self.dump = os.path.join(folder, "crash.dmp")
+        self.when = when if when is not None else crash_dir_epoch(folder)
+        if self.when is None and os.path.isdir(folder):
+            self.when = os.path.getmtime(folder)
+        self.frames = []          # the crash-site block
+        self.walked = []          # everything after the symbol-handler dump
+        self.ok = False
+        self.why = ""
+        self._parse()
+
+    # -- parsing ---------------------------------------------------------
+    def _parse(self):
+        if not os.path.isfile(self.log):
+            self.why = "no Player.log in %s" % self.folder
+            return
+        try:
+            with open(self.log, "r", encoding="utf-8", errors="replace") as fh:
+                lines = fh.read().splitlines()
+        except OSError as e:
+            self.why = "could not read %s: %s" % (self.log, e)
+            return
+        blocks = parse_stack_blocks(lines)
+        if blocks is None:
+            self.why = ("%s has no %r section -- it is a log, not a crash "
+                        "report" % (os.path.basename(self.log), "STACK TRACE"))
+            return
+        if not blocks:
+            self.why = "the stack section of %s contains no frames" % self.log
+            return
+        self.frames = blocks[0]
+        for b in blocks[1:]:
+            for f in b:
+                f.walked = True
+                self.walked.append(f)
+        self.ok = True
+
+    # -- accessors -------------------------------------------------------
+    @property
+    def all_frames(self):
+        return self.frames + self.walked
+
+    @property
+    def modules(self):
+        """Every module ON THE STACK, crash site and walked stack together."""
+        return set(f.module for f in self.all_frames)
+
+    @property
+    def site_modules(self):
+        return set(f.module for f in self.frames)
+
+    def age_after(self, start_epoch):
+        if self.when is None or start_epoch is None:
+            return None
+        return self.when - start_epoch
+
+    def attribute(self, ours=None):
+        """(module, source, frame, note). Never guesses.
+
+        source is 'ours' (a frame at the crash site is in one of our modules),
+        'top' (nothing of ours at the crash site -- the top frame's module), or
+        'none' (unparsable report; module is None).
+        """
+        if ours is None:
+            ours = our_modules()
+        ours = set(m.lower() for m in ours)
+        if not self.ok or not self.frames:
+            return (None, "none", None, self.why or "no frames")
+        note = None
+        for f in self.walked:
+            if f.module.lower() in ours:
+                note = ("%s also appears in the WALKED stack (%s), which is "
+                        "not the crash site" % (f.module, f.symbol or f.addr))
+                break
+        for f in self.frames:
+            if f.module.lower() in ours:
+                return (f.module, "ours", f, note)
+        return (self.frames[0].module, "top", self.frames[0], note)
+
+
+def parse_stack_blocks(lines):
+    """Frames of a Unity crash report, grouped into contiguous blocks.
+
+    None  -> no stack section at all (not a crash report)
+    []    -> a section with no frames in it
+    [[Frame, ...], ...] -> block 0 is the crash site; later blocks are the
+                           walked stack that follows the symbol-handler dump.
+
+    Blank lines and `ERROR: SymGetSymFromAddr64 ...` annotations do not split a
+    block; anything else non-frame does.
+    """
+    if isinstance(lines, str):
+        lines = lines.splitlines()
+    start = None
+    for i, ln in enumerate(lines):
+        if STACK_BEGIN in ln:
+            start = i + 1
+            break
+    if start is None:
+        return None
+    blocks, cur = [], []
+    for ln in lines[start:]:
+        if STACK_END in ln:
+            break
+        if not ln.strip() or FRAME_NOISE_RX.match(ln):
+            continue
+        m = FRAME_RX.match(ln)
+        if m:
+            cur.append(Frame(m.group(1), m.group(2), m.group(3)))
+        elif cur:
+            blocks.append(cur)
+            cur = []
+    if cur:
+        blocks.append(cur)
+    return blocks
+
+
+def crash_folders(root=DEFAULT_CRASH_ROOT, since=None, slack=0.0):
+    """Crash_* folders, newest FIRST, optionally only those created after
+    `since` (epoch seconds, local clock -- the UTC conversion happens here)."""
+    out = []
+    for p in glob.glob(os.path.join(root, "Crash_*")):
+        if not os.path.isdir(p):
+            continue
+        t = crash_dir_epoch(p)
+        if t is None:
+            t = os.path.getmtime(p)
+        if since is not None and t < since - slack:
+            continue
+        out.append((t, p))
+    out.sort(key=lambda x: x[0], reverse=True)
+    return out
+
+
+def newest_crash_report(since=None, root=DEFAULT_CRASH_ROOT, slack=0.0):
+    """The newest crash report created after `since`, or None if there is none.
+
+    None means something: no report newer than launch is evidence that the
+    client was torn down or exited, NOT that it crashed natively.
+    """
+    for t, p in crash_folders(root, since=since, slack=slack):
+        return CrashReport(p, when=t)
+    return None
+
+
+def format_crash_report(rep, start_epoch=None, top=12, ours=None, indent="   "):
+    """The block run.py prints. Returns a list of lines."""
+    if rep is None:
+        return ["NO CRASH REPORT was written after launch -- the client was "
+                "torn down or exited, rather than dying in native code."]
+    age = rep.age_after(start_epoch)
+    head = "CRASH REPORT %s" % os.path.basename(rep.folder)
+    if age is not None:
+        head += " (%.0fs after launch)" % age
+    lines = [head]
+    if not rep.ok:
+        lines.append(indent + "INCONCLUSIVE -- " + rep.why)
+        return lines
+    for f in rep.frames[:top]:
+        lines.append(indent + f.text)
+    rest = len(rep.frames) - top
+    if rest > 0:
+        lines.append(indent + "... %d more crash-site frame(s)" % rest)
+    if rep.walked:
+        lines.append(indent + "... plus %d frame(s) in the walked stack that "
+                              "follows the module dump" % len(rep.walked))
+    mod, source, frame, note = rep.attribute(ours)
+    if source == "ours":
+        lines.append("attributed to %s -- first crash-site frame in one of our "
+                     "modules: %s" % (mod, frame.text))
+    else:
+        lines.append("attributed to %s -- top crash-site frame; nothing of "
+                     "ours is on the crash site" % mod)
+    if note:
+        lines.append(indent + "note: " + note)
+    return lines
+
+
+def cmd_last(argv):
+    """`crashwatch.py last [N]` -- the morning read, one command."""
+    n = 3
+    root = DEFAULT_CRASH_ROOT
+    rest = list(argv)
+    if rest and rest[0].isdigit():
+        n = int(rest.pop(0))
+    if rest and rest[0] == "--root":
+        rest.pop(0)
+        root = rest.pop(0) if rest else root
+    fs = crash_folders(root)
+    if not fs:
+        emit("no Crash_* folders under %s" % root)
+        return 1
+    for t, p in fs[:n]:
+        rep = CrashReport(p, when=t)
+        local = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t))
+        mod, source, frame, note = rep.attribute()
+        if not rep.ok:
+            emit("%s  %s  INCONCLUSIVE -- %s"
+                 % (os.path.basename(p), local, rep.why))
+            continue
+        emit("%s  %s  %-22s %s"
+             % (os.path.basename(p), local, mod,
+                (frame.symbol or frame.addr) if frame else ""))
+        emit("      %d crash-site frame(s), %d walked, modules: %s%s"
+             % (len(rep.frames), len(rep.walked),
+                ", ".join(sorted(rep.modules)[:8]),
+                "" if source == "ours" else "   [nothing of ours at the site]"))
+        if note:
+            emit("      note: " + note)
+    return 0
+
+
 def main():
+    # `last` is a positional subcommand and is handled before argparse, which
+    # this tool otherwise uses purely for flags.
+    if sys.argv[1:2] == ["last"]:
+        return cmd_last(sys.argv[2:])
     p = argparse.ArgumentParser(
         description="watch the live EFT client's logs; kill + report on a crash",
         formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
