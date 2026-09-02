@@ -3767,6 +3767,8 @@ type
     bound: bool        ## the drain is on Unity's thread and has fired
     methodName: string
     frames: int64
+    threadId: int64    ## the thread the drain last fired on ("mainThreadId")
+    stalled: bool      ## the drain has stopped and the host is standing in
 
 proc askMainThread(): MainThread =
   ## `call("aowlspt.host::main_thread")`, decoded. The host answers it before
@@ -3783,6 +3785,8 @@ proc askMainThread(): MainThread =
   result.bound = asBool(field(raw, "bound"), false)
   result.methodName = asText(field(raw, "method"), "")
   result.frames = int64(asInt(field(raw, "frames"), 0))
+  result.threadId = int64(asInt(field(raw, "mainThreadId"), 0))
+  result.stalled = asBool(field(raw, "stalled"), false)
 
 var gDriverState = "not attempted"
 var gDriverIsEveryMain = false
@@ -3814,6 +3818,79 @@ proc fovSelfDisabled(): bool =
     return true
   result = false
 
+var gUnityThreadId = 0'i64
+  ## The thread the host's drain last fired ON, as the host reports it in
+  ## `aowlspt.host::main_thread`.`mainThreadId`. Zero means "not established".
+var gWrongThreadTicks = 0'i64
+var gWrongThreadSaid = 0'i64
+var gLastWrongThreadId = 0'i64
+var gThreadGateState = "not attempted"
+
+proc onUnityThread(): bool =
+  ## THE CHECK THAT CAN FAIL. It asks, of the FINISHED state -- the thread this
+  ## callback is actually executing on, right now -- "is this the thread the
+  ## host's drain fires on?", and it can answer no.
+  ##
+  ## MEASURED, crash `Crash_2026-09-02_211541986` (and the identical one at
+  ## 20:43): this mod's `everyMain` tick ran on the HOST's own thread and
+  ## called `UnityEngine.Input::GetKey`, whose native body in UnityPlayer
+  ## (`+0x58CF70`) fetches a global manager pointer and dereferences it at
+  ## `+0x4A0` with NO null test. The pointer was NULL, rax=0, and the client
+  ## died 8.7 s after boot with 15 frames of `fov` on the stack.
+  ##
+  ## Why the old gate could not catch it. `armFovDriver` asked the host once,
+  ## at arm time, whether the drain was `bound` -- and `bound` is a LATCH: the
+  ## host sets it the first time the drain fires and never clears it. The host
+  ## then, by design, falls back to running queued main-thread work on its own
+  ## thread whenever the drain goes quiet for 2 s (`aowlspt-host.log`:
+  ## "the main-thread drain has not fired for 2s with work queued; running it
+  ## on the host thread until it comes back"). So between "the drain has fired
+  ## once" and "the drain is firing now" there is a window -- the whole of
+  ## early boot, and any hitch afterwards -- in which a `bound` gate says yes
+  ## and the callback lands somewhere a Unity call is illegal. An arm-time
+  ## check of a latch is a check that cannot fail.
+  ##
+  ## Cost: zero host calls on the good path. The host is re-asked only when the
+  ## observed thread is NOT the one already established, which is exactly the
+  ## case we are refusing anyway, and it lets the answer recover by itself if
+  ## the drain migrates to a different thread later.
+  let tid = currentThreadId()
+  if gUnityThreadId != 0'i64 and tid == gUnityThreadId:
+    return true
+  let mt = askMainThread()
+  if mt.ok and mt.threadId != 0'i64:
+    gUnityThreadId = mt.threadId
+  if gUnityThreadId != 0'i64 and tid == gUnityThreadId:
+    gThreadGateState = "on Unity's drain thread (" & $tid & ")"
+    return true
+  # Refuse. Three-state, not two: say WHICH of "the host cannot tell us" and
+  # "the host told us and this is the wrong thread" happened.
+  gWrongThreadTicks = gWrongThreadTicks + 1'i64
+  gLastWrongThreadId = tid
+  gThreadGateState =
+    (if gUnityThreadId == 0'i64:
+       "REFUSED: the host has not established which thread its main-thread " &
+       "drain fires on (mainThreadId=0), so there is no thread this tick " &
+       "could be shown to be on. INCONCLUSIVE is not a pass"
+     else:
+       "REFUSED: this tick is on thread " & $tid & ", the host's drain fires " &
+       "on thread " & $gUnityThreadId & " (drain stalled=" &
+       (if mt.stalled: "true" else: "false") & ")") &
+    " -- " & $gWrongThreadTicks & " tick(s) refused so far"
+  # Loud, then decaying, exactly like `noCamera`: 1, 250, 2500, 25000.
+  if gWrongThreadTicks == 1'i64 or gWrongThreadTicks == 250'i64 or
+     gWrongThreadTicks == 2_500'i64 or gWrongThreadTicks == 25_000'i64:
+    gWrongThreadSaid = gWrongThreadSaid + 1'i64
+    warn "FOV: REFUSED a driver tick on the WRONG THREAD -- " &
+         gThreadGateState & ". Nothing was called into the engine. This is " &
+         "the crash of 2026-09-02: Input::GetKey and Camera/SetFov are " &
+         "main-thread-only and their native bodies dereference a global " &
+         "manager with no null test, so running here is an ACCESS VIOLATION, " &
+         "not a wrong answer. The host runs queued main-thread work on its " &
+         "own thread while its drain is stalled; this mod waits instead."
+    bc "T3 refused a driver tick on the wrong thread"
+  result = false
+
 proc onFovTick(payload: string): string =
   ## The `everyMain` driver. One firing per drain.
   ##
@@ -3823,6 +3900,11 @@ proc onFovTick(payload: string): string =
   ## the host's own answer so the two can disagree in public.
   gDriverFirings = gDriverFirings + 1
   if fovSelfDisabled():
+    return ""
+  # BEFORE anything that can reach the engine, including the T1 breadcrumb that
+  # claims we are about to call it. A tick that is not on Unity's thread does
+  # not get to say it tried.
+  if not onUnityThread():
     return ""
   if gDriverFirings == 1:
     # The first tick ONLY. This is suspect (a) on the coordinator's list: the
@@ -4190,6 +4272,15 @@ proc reportWatch() =
     else:
       warn "    (everyMain armed and never fired: the host queued it and its " &
            "drain has not run, so nothing has been written at all)"
+    # The per-tick thread gate, reported whether or not it ever refused, so
+    # that "it never fired wrong" and "nobody looked" are distinguishable.
+    if gWrongThreadTicks > 0'i64:
+      warn "    thread gate: " & gThreadGateState & " (last wrong thread " &
+           $gLastWrongThreadId & ", said " & $gWrongThreadSaid & " time(s)). " &
+           "Those ticks made NO engine call. Before this gate existed they " &
+           "were an access violation inside UnityPlayer's Input::GetKey."
+    else:
+      info "    thread gate: " & gThreadGateState & " -- 0 tick(s) refused"
   let ns = fovCostNs()
   if ns >= 0'i64:
     info "    (measured " & $ns & " ns per applied write over " & $gFovSamples &
