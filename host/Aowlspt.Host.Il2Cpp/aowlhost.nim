@@ -9164,7 +9164,23 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   # STEP 2 (docs/NATIVETABS.md 5). Default OFF until it has a live PASS of its
   # own: `settingsPostFxSubtab`'s old cloned-strip path stays the shipping one
   # until then, so a failure here costs nothing that works today.
-  gNtSubOn = readBoolKey("nativeTabsSubtabs")
+  # DEFAULT ON: this is the shipping PostFX subtab path now. It has a live
+  # PASS ("exactly one subtab reads m_IsOn=1 and its panel is the ONLY active
+  # one of the two", with the stock SettingsList byte-identical to the
+  # feature-off baseline), and the cloned-strip approach it replaces has been
+  # deleted rather than left switched off.
+  gNtSubOn = readBoolKeyDef("nativeTabsSubtabs", true)
+  # `settingsPostFxSubtab` now means only "fold the stock POSTFX tab away and
+  # let postfxrows build into the stock PostFX panel". The STRIP is nativetabs
+  # -- so turning the old key on without the new one would hide the stock tab
+  # and leave nothing able to reach PostFX. It therefore implies the new path
+  # rather than being silently incomplete.
+  # STEP 3 (docs/NATIVETABS.md 7). Default OFF. Takes its data from
+  # `modsindex.nim`'s lazy /aowlspt/settings/index fetch -- armed on the MODS
+  # panel's show edge, cached for the session -- and NOT from
+  # `modSettingsRender`, whose boot-time per-mod fetch is the measured
+  # character-select crasher.
+  gNtModsOn = readBoolKey("nativeTabsMods")
   gNtOn = gNtFlagOn
   if gNtOn and not gSettingsUiProbe:
     gSettingsUiProbe = true
@@ -9187,6 +9203,17 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
     # mistake the native-UI census made ("0 of 25 verified (25 REJECTED)"),
     # and its comment below is why this one is not repeated.
   gGfxOn = readBoolKey("settingsPostFxSubtab")
+  if gGfxOn and not gNtSubOn:
+    gNtSubOn = true
+    info "settingsPostFxSubtab is set, so nativeTabsSubtabs has been turned " &
+         "on with it: the old cloned-strip implementation of that feature is " &
+         "DELETED, and the subtab strip is now nativetabs' defineSubtabs. " &
+         "Without it the stock POSTFX tab would be hidden with nothing able " &
+         "to reach PostFX."
+  if gNtSubOn and not gNtOn:
+    gNtOn = true
+    info "nativeTabsSubtabs needs nativeTabs (it builds the strip inside the " &
+         "native-tab machinery), so nativeTabs has been turned on with it."
   if gGfxOn and not gSettingsUiProbe:
     gSettingsUiProbe = true
     info "settingsPostFxSubtab is set, so settingsUiProbe has been turned on " &

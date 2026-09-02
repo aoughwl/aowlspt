@@ -3044,13 +3044,7 @@ var gGfxSpawnerHidden = false
 var gGfxTogglesT: Il2CppPtr = nil
 ## Our two strips' toggles: index 0 = GRAPHICS SETTINGS, 1 = POSTFX, one pair
 ## per strip. Clones we made, so these are ours to write.
-var gGfxTogA: seq[Il2CppPtr] = @[]
-var gGfxTogB: seq[Il2CppPtr] = @[]
-var gGfxLast: seq[bool] = @[]
 ## Which subtab is showing: 0 = graphics, 1 = postfx.
-var gGfxSel = 0
-var gGfxSaid = false
-var gGfxBothActiveSaid = false
 ## The two STOCK panel TRANSFORMS, kept alongside their GameObjects purely so
 ## the verdict below can ask `activeInHierarchy` (which takes a Component) and
 ## not just `activeSelf`. Read-only, never written.
@@ -3095,17 +3089,12 @@ var gGfxPostT: Il2CppPtr = nil
 ## happened yet and could only ever say "unchanged"). If anything stock moved,
 ## say so with the numbers and HIDE our strips, which returns the panel to
 ## stock -- the same discipline the POSTFX top-row button already uses.
-var gGfxStockT: seq[Il2CppPtr] = @[]
-var gGfxStockG: seq[NuGeom] = @[]
-var gGfxStockName: seq[string] = @[]
-var gGfxStockStripGo: seq[Il2CppPtr] = @[]
 ## PER-BASELINE-ENTRY: do we EXPECT this object to have moved, and by how
 ## much? Attempts 1-3 displaced the stock list by an uncontrolled amount and
 ## the backstop's job was to say "nothing moved". Attempt 5 moves it
 ## DELIBERATELY, by a known H, so the assertion becomes "moved by exactly our
 ## H and by nothing else" -- which is still falsifiable, and still fails on the
 ## 420px case. An entry with `false` here must not have moved at all.
-var gGfxStockExpectShift: seq[bool] = @[]
 ## WHICH PANEL each baseline entry belongs to: 0 = Graphics Settings,
 ## 1 = PostFX Settings.
 ##
@@ -3117,28 +3106,20 @@ var gGfxStockExpectShift: seq[bool] = @[]
 ## which is INCONCLUSIVE, and it was reported as FAIL -- and then hid the
 ## GRAPHICS strip, whose own panel had just verified to the pixel. One panel's
 ## unfinished layout must never condemn the other's finished one.
-var gGfxStockPanelIx: seq[int] = @[]
 ## Per-panel strip, so a failure on one panel hides only that panel's strip.
-var gGfxStripPanelIx: seq[int] = @[]
 ## THE OWNED WRITE. `LayoutGroup.padding.top` on the Graphics content
 ## container, its ORIGINAL value captured before the first write, and the
 ## RectOffset + group we need to put it back. Restored on fault and on
 ## self-disable. Nothing else in this feature writes anything the game owns.
 ## One entry per panel we shifted (there are two strips, so two groups).
-var gGfxPadRo: seq[Il2CppPtr] = @[]
-var gGfxPadGrp: seq[Il2CppPtr] = @[]
-var gGfxPadOrig: seq[int32] = @[]
-var gGfxPadShifted = false
 ## The shift itself, in px. One value: both strips are clones of the same donor
 ## and therefore the same height, so a second value would be the same number
 ## and one more thing to keep in step.
-var gGfxPadH = 0'i32
 ## PER BASELINE ENTRY: how far we shifted THIS object, in px. It used to be the
 ## single `gGfxPadH`, which was correct only while both panels got the same
 ## shift -- they no longer do (see `gGfxInsetRef`), so a single value would
 ## make the backstop assert the wrong number on one of the two panels and fail
 ## a healthy object.
-var gGfxStockShiftPx: seq[int32] = @[]
 ## THE TARGET INSET ABOVE THE STRIP, taken from the FIRST panel we shift.
 ##
 ## MEASURED COSMETIC DEFECT: Graphics' stock padding.top is 20 and PostFX's is
@@ -3147,7 +3128,6 @@ var gGfxStockShiftPx: seq[int32] = @[]
 ## PostFX, visibly above the panel body. The fix is to bring the smaller base
 ## up to the larger one rather than to hardcode 20 -- this is read live from
 ## whichever panel is shifted first.
-var gGfxInsetRef = -1'i32
 ## THE STOCK BUTTON ALPHAS, measured live from the top-row tab buttons.
 ##
 ## MEASURED DEFECT (coordinator, live): both spawned AnimatedToggles on our
@@ -3166,8 +3146,6 @@ var gGfxInsetRef = -1'i32
 ##
 ## -1 means NOT MEASURED; the driver then does nothing and says so, rather
 ## than writing a number nobody measured.
-var gGfxAlphaOn = -1.0'f32
-var gGfxAlphaOff = -1.0'f32
 ## THE POSTFX FIRST-SHOW OBSERVATION, and why this build MEASURES instead of
 ## fixing.
 ##
@@ -3192,16 +3170,9 @@ var gGfxAlphaOff = -1.0'f32
 ## AT ALL. It watches the panel across its first activation, touching nothing,
 ## and records whether the children move on their own. That single observation
 ## decides it: they move -> (B); they do not -> (A).
-var gGfxPostPreShowT: seq[Il2CppPtr] = @[]
-var gGfxPostPreShowG: seq[NuGeom] = @[]
-var gGfxPostPreShowName: seq[string] = @[]
-var gGfxPostShowSaid = false
 ## PER PANEL, both of them: the verdict latch and the settle counter. A single
 ## pair could only ever judge whichever panel happened to be up first, and the
 ## other panel's assertion would then never run at all.
-var gGfxGeomSaid: seq[bool] = @[false, false]
-var gGfxGeomPendingSaid: seq[bool] = @[false, false]
-var gGfxGeomTicks: seq[int] = @[0, 0]
 ## THE WATCHDOG, and the measured defect it exists for.
 ##
 ## After the per-panel split the geometry verdict stopped logging ANYTHING --
@@ -3216,8 +3187,6 @@ var gGfxGeomTicks: seq[int] = @[0, 0]
 ## GfxGeomWatchdog times and still produces no verdict, it says so ONCE and
 ## DUMPS THE RAW STATE of every guard it would have passed through. The next
 ## run therefore names the cause instead of being silent about it.
-var gGfxGeomOffered: seq[int] = @[0, 0]
-var gGfxGeomWatchSaid: seq[bool] = @[false, false]
 const GfxGeomWatchdog = 240
 const GfxGeomSettle = 20
 const GfxMaxStockWatch = 16
@@ -3254,918 +3223,67 @@ proc ntTickBody()
 proc ntTick()
 
 proc gfxNoteFault(what: string) =
+  ## The padding-restore that used to live here is GONE with the padding
+  ## shift itself -- there is nothing of the game's left to put back, because
+  ## this feature no longer writes anything of the game's. All it does now is
+  ## hide one stock toggle, and that is what the ceiling restores.
   inc gGfxFaults
   warn "postfx subtab: " & what & " (fault " & $gGfxFaults & " of " &
        $GfxMaxFaults & ")"
   if gGfxFaults >= GfxMaxFaults:
     gGfxOn = false
-    # PUT THE STOCK TAB BACK. A feature that disables itself must not leave the
-    # player without POSTFX at all -- that would be strictly worse than never
-    # having run.
-    # PUT THE PADDING BACK FIRST. It is the only thing this feature writes that
-    # the game owns, so it is the only thing that can outlive us. Done before
-    # the tab restore because it cannot fail in a way that should stop that.
-    if gGfxPadShifted:
-      var restored = 0
-      var failed = 0
-      var ri = 0
-      while ri < gGfxPadRo.len and ri < 4:
-        if nuSetPaddingTop(gGfxPadRo[ri], gGfxPadGrp[ri], gGfxPadOrig[ri]):
-          restored = restored + 1
-        else:
-          failed = failed + 1
-        ri = ri + 1
-      if failed == 0:
-        gGfxPadShifted = false
-        warn "postfx subtab: the content container LayoutGroup padding.top " &
-             "has been RESTORED on all " & $restored & " panel(s) we raised " &
-             "it on (we had added " & $gGfxPadH & "px to make room for the " &
-             "subtab strip). The stock list goes back to exactly where the " &
-             "game put it."
-      else:
-        warn "postfx subtab: LayoutGroup padding.top could NOT be restored on " &
-             $failed & " of " & $(restored + failed) & " panel(s), so the " &
-             "stock settings list will sit " & $gGfxPadH & "px lower than " &
-             "stock there until the screen is rebuilt. This is the ONLY thing " &
-             "this feature can leave behind, and it is being reported rather " &
-             "than hidden."
-    if not gGfxSpawnerHidden:
-      # THE COMMON CASE, and the one that used to be misreported. Nothing was
-      # ever hidden, so there is nothing to restore and the player has lost
-      # nothing. Say exactly that.
-      warn "postfx subtab: fault ceiling reached; the feature is OFF for this " &
-           "session. The stock POSTFX tab was NEVER HIDDEN -- the build " &
-           "refused before it got that far -- so the top row is exactly as " &
-           "the game built it and the player has lost nothing. Nothing to " &
-           "restore."
+    if gGfxSpawnerHidden and gGfxSpawnerGo != nil and
+       modsSetActive(gGfxSpawnerGo, true):
+      gGfxSpawnerHidden = false
+      warn "postfx subtab: fault ceiling reached; the feature is OFF for " &
+           "this session and the STOCK POSTFX TAB HAS BEEN PUT BACK in the " &
+           "top row."
+    elif not gGfxSpawnerHidden:
+      warn "postfx subtab: fault ceiling reached; the feature is OFF for " &
+           "this session. The stock POSTFX tab was NEVER HIDDEN, so the top " &
+           "row is exactly as the game built it and the player has lost " &
+           "nothing."
     else:
-      # We really did hide it. The restore must not depend on a handle the
-      # fault path may already have dropped, so re-find the spawner by walking
-      # from the tab bar if the one we stored is gone.
-      var go = gGfxSpawnerGo
-      if go == nil or not duOk(go, 0x20'i32) or not iUnityAlive(go):
-        if gGfxTogglesT != nil and duOk(gGfxTogglesT, 0x20'i32):
-          let again = modsChildNamed(gGfxTogglesT, "PostFxToggleSpawner")
-          if again != nil:
-            go = iGameObjectOf(again)
-      if go != nil and modsSetActive(go, true):
-        gGfxSpawnerHidden = false
-        gGfxSpawnerGo = go
-        warn "postfx subtab: fault ceiling reached; the feature is OFF for " &
-             "this session and the STOCK POSTFX TAB HAS BEEN PUT BACK in the " &
-             "top row."
-      else:
-        warn "postfx subtab: fault ceiling reached; the feature is OFF for " &
-             "this session, the stock POSTFX tab WAS hidden by us, and it " &
-             "could NOT be restored even after re-walking the tab bar to " &
-             "find it again. The player is genuinely missing a stock control " &
-             "-- open another tab and back, or restart, to get it. This is " &
-             "the only case of the three that is bad news."
-
-proc gfxContentContainerT(panelT: Il2CppPtr; why: var string): Il2CppPtr =
-  ## The panel's own content container, found BY STRUCTURE rather than by a
-  ## name borrowed from a different panel. Every stock panel under
-  ## SettingsScreen uses its own name for this child ("Container",
-  ## "Other Settings", "Panel", "Toggles" -- measured across all five stock
-  ## panels), so no single literal name is safe to hardcode. What every one of
-  ## them DOES share is an "Overlay Layer" child (holding a SettingsTooltip)
-  ## that is never the content: skip that, skip anything named like a
-  ## tooltip, and if exactly one direct child remains, that is the container.
-  ##
-  ## (No `strutils` needed here -- the one non-"Overlay Layer" name that is
-  ## not content on any measured panel is the literal "SettingsTooltip".)
-  ## Verified against the measured tree of all five panels: Game Settings
-  ## (Container / Overlay Layer), Graphics Settings (Other Settings /
-  ## Overlay Layer), PostFX Settings (Panel / Overlay Layer), Sound Settings
-  ## (Panel / SettingsTooltip) all resolve to exactly one candidate. Control
-  ## Settings (Toggles / Content / Overlay Layer) does NOT -- two candidates
-  ## remain -- so this REFUSES rather than guessing there; that panel is not
-  ## one this feature needs a container from.
-  result = nil
-  why = ""
-  if panelT == nil or not duOk(panelT, 0x20'i32):
-    why = "the panel transform itself is not readable"
-    return
-  var n = 0
-  if not iChildCount(panelT, n):
-    why = "child count of " & iObjName(panelT) & " could not be read"
-    return
-  var candidate: Il2CppPtr = nil
-  var candidates = 0
-  var seen = ""
-  var i = 0
-  while i < n and i < 16:
-    let c = iChildAt(panelT, i)
-    if c != nil and duOk(c, 0x20'i32):
-      let nm = iObjName(c)
-      if seen.len > 0: seen = seen & ", "
-      seen = seen & "'" & nm & "'"
-      # SKIP OUR OWN CLONES. Since the subtab strip is parented to the PANEL
-      # (attempt 4), it is itself a non-overlay child of the very panel this
-      # walks -- so a RETRY after a partial build would find two candidates and
-      # refuse, permanently, on a panel it had resolved correctly a moment
-      # earlier. Unity names every Instantiate result "<donor>(Clone)" and the
-      # game's own children never carry that suffix, so this is an exact
-      # discriminator rather than a heuristic.
-      if nm != "Overlay Layer" and nm != "SettingsTooltip" and
-         not nm.contains("(Clone)"):
-        candidates = candidates + 1
-        candidate = c
-    i = i + 1
-  if candidates != 1:
-    # NAME THE CHILDREN, not just the count. A bare count reproduced the exact
-    # #104 symptom (faults 4/4, self-disables) with no way to tell WHY from the
-    # log; the next live run needs the actual child names to decide whether the
-    # measured "Other Settings / Overlay Layer" tree still holds on this build.
-    why = iObjName(panelT) & " has " & $candidates & " non-overlay child(ren) " &
-          "(expected exactly 1) out of " & $n & " total [" & seen & "]; " &
-          "refusing to guess which one is the content container"
-    return
-  result = candidate
-
-proc gfxBuildStrip(panelT, donorStripGo, donorStripT, donorButtonGo,
-                   donorButtonT: Il2CppPtr;
-                   into: var seq[Il2CppPtr]; stripGoOut: var Il2CppPtr): bool =
-  ## One strip of two buttons inside one stock panel. The strip and the buttons
-  ## are CLONES; the panel they go into is the game's, and the only thing done
-  ## to it is `SetParentAndAlign` of an object of ours.
-  ##
-  ## WHERE THE STRIP GOES, and this is attempt FOUR at one defect. The first
-  ## three all put it inside the panel's CONTENT CONTAINER and then tried to
-  ## stop that container's LayoutGroup from giving it space:
-  ##
-  ##   1. reset the clone's LayoutElement min/preferred to -1. FAILED -- -1 is
-  ##      Unity's UNSET sentinel, which means "ask the strip", and the strip is
-  ##      a clone of a whole checkbox list.
-  ##   2. write an explicit small height measured off the donor button. FAILED
-  ##      live, same 420.5px displacement: a layout CHILD is allocated space no
-  ##      matter how little it asks for.
-  ##   3. `LayoutElement.ignoreLayout = true`. REFUSED live -- the clone
-  ##      carries no LayoutElement at all, and `AddComponent<LayoutElement>`
-  ##      needs a metadata-usage slot this host has not attested.
-  ##
-  ## Attempt 4 stops arguing with that layout group and asks where the GAME
-  ## puts a subtab strip. The answer was already in this file: `donorStripGo`
-  ## IS `Control Settings/Toggles`, a DIRECT CHILD OF ITS PANEL, sibling of
-  ## `Content` -- which is precisely why `gfxContentContainerT` refuses on
-  ## Control Settings, finding two candidates instead of one. That refusal was
-  ## the evidence all along.
-  ##
-  ## So the strip is parented to the PANEL, not to the content container, and
-  ## its geometry is COPIED WHOLESALE from the stock strip -- anchors, pivot,
-  ## sizeDelta and anchoredPosition, read live off the real thing in its real
-  ## position. Nothing is hardcoded, which matters at this user's 1.5x display
-  ## scaling, and nothing is invented: the placement is the game's own.
-  ##
-  ## The content container is still located, but now only so the backstop can
-  ## baseline the stock objects inside it -- `SettingsList` lives there and is
-  ## the thing every previous attempt displaced.
-  result = false
-  into = @[]
-  stripGoOut = nil
-  var why = ""
-  let stackT = gfxContentContainerT(panelT, why)
-  if stackT == nil:
-    warn "postfx subtab: no content container inside the stock panel " &
-         iObjName(panelT) & " (" & why & "), so there is nowhere to put the " &
-         "subtab strip that the stock layout group would lay out. Nothing " &
-         "was added to that panel."
-    return
-  # WHICH PANEL THIS IS. `gGfxPanelT` / `gGfxPostT` are assigned by `gfxBuild`
-  # before either strip is built, so this is settled by the time we run.
-  let pIx = (if panelT == gGfxPostT: 1 else: 0)
-  let panelGo = iGameObjectOf(panelT)
-  if panelGo == nil:
-    warn "postfx subtab: the stock panel " & iObjName(panelT) & " has no " &
-         "reachable GameObject, so there is nowhere to parent the strip."
-    return
-  # BASELINE FIRST, BEFORE ANYTHING OF OURS IS IN THE TREE.
-  #
-  # BOTH LEVELS, and that is a change: we now insert at the PANEL level, so the
-  # panel's own children are what our insertion could displace -- but the known
-  # casualty (`SettingsList`) lives one level down in the content container, so
-  # that level is watched too. Watching only where we insert would have missed
-  # every failure so far. Capped at GfxMaxStockWatch per level (rule 4), done
-  # once per strip, never per frame.
-  var bn = 0
-  if iChildCount(panelT, bn):
-    var bi = 0
-    while bi < bn and bi < GfxMaxStockWatch and
-          gGfxStockT.len < GfxMaxStockWatch * 2:
-      let bc = iChildAt(panelT, bi)
-      bi = bi + 1
-      if bc == nil or not duOk(bc, 0x20'i32): continue
-      let bg = nuReadGeom(bc)
-      if not bg.ok: continue
-      gGfxStockT.add bc
-      gGfxStockG.add bg
-      gGfxStockExpectShift.add false     # panel-level: must not move at all
-      gGfxStockShiftPx.add 0'i32
-      gGfxStockPanelIx.add pIx
-      gGfxStockName.add (iObjName(panelT) & "/" & iObjName(bc))
-  # The container-level entries are the ones our padding shift WILL move, so
-  # remember where they start and mark them once the shift has actually
-  # happened -- never before, or a failed shift would leave the backstop
-  # expecting a movement that never came and it would fail on healthy objects.
-  let stackBaseStart = gGfxStockT.len
-  var bn2 = 0
-  if iChildCount(stackT, bn2):
-    var bj = 0
-    while bj < bn2 and bj < GfxMaxStockWatch and
-          gGfxStockT.len < GfxMaxStockWatch * 2:
-      let bc = iChildAt(stackT, bj)
-      bj = bj + 1
-      if bc == nil or not duOk(bc, 0x20'i32): continue
-      let bg = nuReadGeom(bc)
-      if not bg.ok: continue
-      gGfxStockT.add bc
-      gGfxStockG.add bg
-      gGfxStockExpectShift.add false     # flipped below IF the shift succeeds
-      gGfxStockShiftPx.add 0'i32
-      gGfxStockPanelIx.add pIx
-      gGfxStockName.add (iObjName(panelT) & "/" & iObjName(stackT) & "/" &
-                         iObjName(bc))
-  # THE STOCK STRIP'S OWN GEOMETRY, read BEFORE we clone it, off the real
-  # `Control Settings/Toggles` in its real position. This is the placement we
-  # copy; there is no fallback, because a made-up rectangle here is what the
-  # last three attempts amounted to.
-  let donorG = nuReadGeom(donorStripT)
-  if not donorG.ok:
-    warn "postfx subtab: the STOCK subtab strip (Control Settings/Toggles) " &
-         "could not be measured, so there is no honest placement to copy and " &
-         "nothing was added to " & iObjName(panelT) & ". Refusing rather " &
-         "than inventing a rectangle -- that is what the three previous " &
-         "attempts did, and each one displaced the stock scroll view."
-    return
-  let strip = modsClone(donorStripGo)
-  if strip == nil or not modsSetParent(strip, panelGo):
-    warn "postfx subtab: the subtab strip could not be cloned into " &
-         iObjName(panelT) & "; nothing was added to that panel."
-    return
-  let stripT = modsTransformOf(strip)
-  # The donor strip's own buttons came along with the clone: switch them off,
-  # exactly as the MODS strip does.
-  var inherited = 0
-  if iChildCount(stripT, inherited):
-    var h = 0
-    while h < inherited and h < 32:
-      let c = iChildAt(stripT, h)
-      if c != nil and duOk(c, 0x20'i32):
-        let go = iGameObjectOf(c)
-        if go != nil:
-          discard modsSetActive(go, false)
-      h = h + 1
-  let stripGo = iGameObjectOf(stripT)
-  if stripGo == nil:
-    return
-  var made = 0
-  var i = 0
-  while i < 2:
-    let caption = (if i == 0: "GRAPHICS SETTINGS" else: "POSTFX")
-    let btn = modsClone(donorButtonGo)
-    if btn == nil or not modsSetParent(btn, stripGo):
-      warn "postfx subtab: could not clone the " & caption & " button"
-      i = i + 1
-      continue
-    let btnT = modsTransformOf(btn)
-    if not modsRelabelLike(btnT, donorButtonT, caption):
-      warn "postfx subtab: the caption " & caption & " did not fully take; " &
-           "that button reads wrong or blank on screen"
-    discard modsReapExtraToggles(btnT, donorButtonT, caption)
-    let tog = modsToggleOf(btnT)
-    modsDescribeToggle("postfx strip button " & caption, tog)
-    if tog == nil:
-      warn "postfx subtab: the " & caption & " clone has no Toggle, so it " &
-           "could never be read"
-      discard modsSetActive(btn, false)
-      i = i + 1
-      continue
-    discard modsSetActive(btn, true)
-    into.add tog
-    made = made + 1
-    i = i + 1
-  discard modsSetActive(strip, true)
-  if gGfxStockStripGo.len < 4:
-    gGfxStockStripGo.add strip
-    gGfxStripPanelIx.add pIx
-  if made != 2:
-    warn "postfx subtab: only " & $made & " of 2 buttons came out usable in " &
-         iObjName(panelT) & "; REFUSING to hide the stock POSTFX tab, because " &
-         "a half-built strip with no way back is worse than no feature."
-    return
-  # LAST SIBLING, NOT FIRST -- and this is a REVERSAL of what this block did,
-  # for a measured reason.
-  #
-  # Sibling 0 was correct while the strip was a LAYOUT child: the group laid
-  # children out in sibling order, so index 0 meant "at the top of the column".
-  # The strip is not a layout child any more -- it is absolutely positioned in
-  # a band we made -- so sibling index no longer decides WHERE it sits. In a
-  # Unity canvas it decides what draws over what AND what receives the click,
-  # and index 0 means "under every later sibling". The user reported exactly
-  # that: the strip visible but BEHIND the panel background and unclickable,
-  # with the buttons separately confirmed m_Interactable=true and
-  # raycastTarget=true -- which is what "behind" looks like, not "disabled".
-  #
-  # This is now ASSERTED, not assumed: the index is read back off the live
-  # Transform and compared with the panel's child count. A failure here means
-  # the strip is genuinely unclickable, so unlike the old cosmetic warning it
-  # is worth refusing over.
-  if not nuSetAsLastSibling(stripT):
-    warn "postfx subtab: SetAsLastSibling refused for the strip in " &
-         iObjName(panelT) & " (nativeui logged why), so it would render " &
-         "behind the panel background and swallow no clicks. Hiding it."
-    discard modsSetActive(strip, false)
-    return
-  var afterN = 0
-  let (sibOk, sibIx) = nuSiblingIndex(stripT)
-  if iChildCount(panelT, afterN) and afterN > 0 and sibOk:
-    if sibIx != int32(afterN - 1):
-      warn "postfx subtab: the strip in " & iObjName(panelT) & " is at " &
-           "sibling index " & $sibIx & " of " & $afterN & " children after " &
-           "SetAsLastSibling -- it is NOT last, so it draws under a later " &
-           "sibling and that sibling will swallow the click. Hiding it rather " &
-           "than shipping a strip the player cannot press."
-      discard modsSetActive(strip, false)
-      return
-    okLog "postfx subtab: the strip in " & iObjName(panelT) & " is sibling " &
-          $sibIx & " of " & $afterN & " -- LAST, so it draws above the panel " &
-          "background and receives the click. Read back off the live " &
-          "Transform, not assumed from the call."
-  # ==========================================================================
-  # WEAR THE STOCK STRIP'S GEOMETRY. Do not invent one, and do not argue with
-  # a layout group we are no longer inside.
-  #
-  # ATTEMPT FOUR. The three before it are recorded in this proc's doc comment
-  # because each was reasonable and each MEASURABLY did not work; the short
-  # version is that all three left the strip inside the content container's
-  # LayoutGroup and tried to make it claim no space, and a layout child is
-  # allocated space no matter what it claims.
-  #
-  # This copies `Control Settings/Toggles` -- the game's OWN subtab strip, read
-  # live, in its real position inside a real panel, where it is a direct child
-  # of that panel exactly as our clone now is. Anchors, pivot, sizeDelta and
-  # anchoredPosition all come from it. Nothing here is a pixel constant, which
-  # matters because this user runs 3840x2160 at 1.5x Windows scaling against a
-  # 1920x1080 canvas.
-  #
-  # THE ORDER IS UNITY'S: anchors, then pivot, then size, then position.
-  # `anchoredPosition` is interpreted relative to the anchors and the pivot, so
-  # setting it first and moving the anchors afterwards silently moves the
-  # object -- the same trap `nuLayout` documents.
-  # ==========================================================================
-  # SIZE AND SHAPE FROM THE STOCK STRIP; POSITION COMPUTED. Attempt 4 copied
-  # the donor's anchoredPosition too, and that was the one number that did not
-  # transfer: Control Settings' content starts lower, so -128 is a free band
-  # there and lands on Graphics' THIRD ROW here. Everything else about the
-  # donor still transfers, so only the position is replaced.
-  #
-  # Anchors and pivot are FORCED to top-left rather than copied, and the size
-  # comes from the donor's RESOLVED rect rather than its sizeDelta -- sizeDelta
-  # means different things under different anchoring, so copying it alongside a
-  # different anchor would silently change the width.
-  # HORIZONTAL FROM THE DONOR, VERTICAL FORCED TO TOP. This is a CORRECTION.
-  #
-  # The previous version forced BOTH axes to top-left and then wrote an
-  # absolute x. That lost the one thing that made the stock strip centred: the
-  # donor is stretch-anchored horizontally with a symmetric inset
-  # (anchorMin=(0,1) anchorMax=(1,1) pivot=(0.5,1) sizeDelta=(-1500,46)), so
-  # its width is "parent minus 1500" and its position is "centred" WITHOUT any
-  # x arithmetic. Re-anchoring it left-aligned it, which is exactly what the
-  # user reported.
-  #
-  # So the x half of every property is copied verbatim from the donor and only
-  # the y half is forced to top-anchored, which is what the band arithmetic
-  # below needs. Copying `sizeDelta.x` is correct precisely BECAUSE the anchors
-  # are copied with it -- the pair is what defines the width, and taking one
-  # without the other is what silently changed the width last time.
-  let sizeOk = nuSetV2(stripT, NuTRtSetAnchorMin, donorG.aMinX, 1.0'f32) and
-               nuSetV2(stripT, NuTRtSetAnchorMax, donorG.aMaxX, 1.0'f32) and
-               nuSetV2(stripT, NuTRtSetPivot, donorG.pivX, 1.0'f32) and
-               nuSetV2(stripT, NuTRtSetSizeDelta, donorG.sdX, donorG.rectH)
-  if not sizeOk:
-    warn "postfx subtab: the stock strip's SIZE could not be applied to our " &
-         "clone in " & iObjName(panelT) & " (nativeui logged which setter " &
-         "refused). Hiding it rather than shipping an unknown rectangle."
-    discard modsSetActive(strip, false)
-    return
-  let stripH = donorG.rectH
-  # ==========================================================================
-  # MAKE ROOM, THE GROUP'S OWN WAY. Attempt FIVE, and attempt 4 is the reason
-  # for it: 4 fixed the displacement completely -- the backstop reported all 7
-  # stock objects unchanged and SettingsList read back byte-for-byte stock at
-  # (0,-20)/(850,755) -- but left the strip sitting on the third row, because
-  # on THIS panel there is no free band under the top.
-  #
-  # WHY NOT SIMPLY WRITE THE LIST'S anchoredPosition. Because a LayoutGroup
-  # DRIVES its children's positions on every rebuild, and we have direct proof
-  # one drives this list: attempts 1-3 moved it -20 -> -420.5 and resized it
-  # 755 -> 354.5 purely by adding a sibling. A direct write to a driven child
-  # is reverted at the next rebuild -- possibly seconds later, on a tab switch
-  # -- so it would look right in a screenshot and snap back in play. That is a
-  # WORSE defect than the one being fixed, because it is intermittent.
-  #
-  # So we change the group's own INPUT: `padding.top`. The group then moves and
-  # resizes the list itself, correctly, and it survives every rebuild because
-  # it is what the group reads. This is an OWNED write: the original is
-  # captured before the first change and restored on fault or self-disable, and
-  # the backstop is told to expect exactly this shift and nothing else.
-  # ==========================================================================
-  # POSTFX IS NOT SHIFTED THIS BUILD -- it is OBSERVED. See the
-  # `gGfxPostPreShow*` comment: raising this panel's padding re-flowed its
-  # children instead of shifting them, and the two explanations have opposite
-  # fixes. Rather than pick one by argument, snapshot the children now (the
-  # panel has never been shown this session -- `gfxBuild` only runs while the
-  # GAME tab is up) and compare after its first activation, having touched
-  # nothing in between.
-  #
-  # The strip is still built and still positioned; it simply sits at the
-  # panel's existing padding, so it may overlap the PostFX rows. That is
-  # cosmetic, reversible and confined to a panel whose content is ours --
-  # unlike a wrong write to the layout, which destroyed it.
-  if pIx == 1:
-    var pn = 0
-    if iChildCount(stackT, pn):
-      var pj = 0
-      while pj < pn and pj < GfxMaxStockWatch:
-        let pc = iChildAt(stackT, pj)
-        pj = pj + 1
-        if pc == nil or not duOk(pc, 0x20'i32): continue
-        let pg = nuReadGeom(pc)
-        if not pg.ok: continue
-        gGfxPostPreShowT.add pc
-        gGfxPostPreShowG.add pg
-        gGfxPostPreShowName.add iObjName(pc)
-    okLog "postfx subtab: POSTFX IS BEING OBSERVED, NOT SHIFTED. Snapshotted " &
-          $gGfxPostPreShowT.len & " child(ren) of " & iObjName(stackT) &
-          " BEFORE the panel has ever been shown, and touching nothing. If " &
-          "they move on their own at first activation, the layout group is " &
-          "the rightful driver and our earlier baseline was simply taken too " &
-          "early; if they do not, the group was dormant and our SetDirty " &
-          "woke it. Those two have OPPOSITE fixes, so this build measures " &
-          "rather than guesses. No padding was raised on this panel."
-  let grp = modsComponent(stackT, "VerticalLayoutGroup")
-  if grp == nil:
-    warn "postfx subtab: " & iObjName(stackT) & " in " & iObjName(panelT) &
-         " has no VerticalLayoutGroup, so there is no padding to raise and no " &
-         "safe way to make room -- writing the stock list's anchoredPosition " &
-         "directly would be reverted by whatever DID move it in attempts 1-3. " &
-         "REFUSING this strip. Nothing was written; the panel is exactly as " &
-         "the game built it, and the stock POSTFX tab is untouched because it " &
-         "is only hidden after both strips succeed."
-    discard modsSetActive(strip, false)
-    return
-  let ro = nuGroupPadding(grp)
-  let (topOk, origTop) = nuPaddingTop(ro)
-  if not topOk:
-    warn "postfx subtab: the VerticalLayoutGroup on " & iObjName(stackT) &
-         " has no readable padding.top, so there is no original value to " &
-         "capture and therefore nothing we could promise to restore. " &
-         "REFUSING this strip rather than making an unrestorable write."
-    discard modsSetActive(strip, false)
-    return
-  # THE TWO FRAMES WE NEED, and NO assumption about how either is anchored.
-  #
-  # The previous version required the container to be top-anchored and refused
-  # when it was not. That refusal was CORRECT but the precondition was too
-  # strong: the real container is centre-pivoted and vertically STRETCHED
-  # (anchorMin=(0.5,0) anchorMax=(0.5,1) pivot=(0.5,0.5) sizeDelta=(850,0)
-  # rect=850x785), so its `anchoredPosition` is (0,0) by construction and
-  # carries no edge information at all. `nuChildEdgeInParent` solves the
-  # general case from the resolved rects instead, so the only precondition left
-  # is the one that actually matters: both rects readable, and the container
-  # tall enough to give up a band.
-  let panelG = nuReadGeom(panelT)
-  let contG = nuReadGeom(stackT)
-  if not panelG.ok or not contG.ok:
-    warn "postfx subtab: the panel (" & nuGeomNote(panelG) & ") or its " &
-         "container (" & nuGeomNote(contG) & ") has no readable rect, so the " &
-         "strip's position cannot be computed. REFUSING."
-    discard modsSetActive(strip, false)
-    return
-  if contG.rectH <= stripH * 2.0'f32:
-    warn "postfx subtab: " & iObjName(stackT) & " is only " &
-         nuF(contG.rectH) & "px tall and the strip needs " & nuF(stripH) &
-         "px; taking a band out of it would leave almost nothing for the " &
-         "stock rows. REFUSING."
-    discard modsSetActive(strip, false)
-    return
-  let addH = int32(stripH + 0.5'f32)
-  if addH < 4'i32 or addH > 400'i32:
-    warn "postfx subtab: a strip height of " & $addH & "px is not credible, " &
-         "so REFUSING rather than shifting the stock layout by it."
-    discard modsSetActive(strip, false)
-    return
-  # EQUALISE THE INSET ABOVE THE STRIP ACROSS PANELS. Graphics' stock
-  # padding.top is 20 and PostFX's is 0; adding the same 46 to both left the
-  # strip flush against PostFX's top edge while Graphics looked native. Bring
-  # the smaller base up to the first panel's base, measured live -- never a
-  # hardcoded 20.
-  if gGfxInsetRef < 0'i32:
-    gGfxInsetRef = origTop
-  let extraInset = (if gGfxInsetRef > origTop: gGfxInsetRef - origTop
-                    else: 0'i32)
-  let totalShift = addH + extraInset
-  # THE WRITE ITSELF IS SKIPPED ON POSTFX. Everything above is a READ and is
-  # harmless; this is the only destructive step, and on this panel it re-flowed
-  # the children instead of shifting them. The strip is still positioned below,
-  # at the panel's EXISTING padding, so it may overlap -- cosmetic, and on a
-  # panel whose content is ours.
-  if pIx == 1:
-    okLog "postfx subtab: NOT raising padding.top on " & iObjName(stackT) &
-          " (measured " & $origTop & "). On this panel the same write " &
-          "re-flowed the children rather than shifting them, and the two " &
-          "explanations for that have opposite fixes. Observing across first " &
-          "activation instead; see the POSTFX IS BEING OBSERVED line."
-  elif not nuSetPaddingTop(ro, grp, origTop + totalShift):
-    warn "postfx subtab: padding.top could not be raised on " &
-         iObjName(stackT) & ", so no room was made and the strip would " &
-         "overlap the stock rows. REFUSING this strip. Nothing was written."
-    discard modsSetActive(strip, false)
-    return
-  # CAPTURED ONLY AFTER THE WRITE SUCCEEDED, so the restore never believes it
-  # has work to do that it does not -- the rule the stock-tab hide just learned.
-  if pIx != 1:
-    if gGfxPadRo.len < 4:
-      gGfxPadRo.add ro
-      gGfxPadGrp.add grp
-      gGfxPadOrig.add origTop
-    gGfxPadShifted = true
-    gGfxPadH = totalShift
-  # The backstop must now expect these to move, and by exactly this much. The
-  # amount is recorded PER ENTRY because the two panels no longer share one.
-  # ONLY the panel we actually wrote to is expected to move. PostFX is
-  # untouched this build, so its entries keep expectShift=false and the
-  # backstop asserts them UNCHANGED -- which is exactly the observation we
-  # want: if they move anyway, the group did it on its own and reading (B) is
-  # confirmed.
-  if pIx != 1:
-    var mi = stackBaseStart
-    while mi < gGfxStockExpectShift.len and mi < GfxMaxStockWatch * 2:
-      gGfxStockExpectShift[mi] = true
-      if mi < gGfxStockShiftPx.len:
-        gGfxStockShiftPx[mi] = totalShift
-      mi = mi + 1
-  # THE STRIP GOES IN THE BAND WE JUST FREED.
-  #
-  # The strip is a child of the PANEL (it must be -- inside the container it
-  # would be a layout child again, and the clone has no LayoutElement to opt
-  # out with, which is what refused in attempt 3). So its anchors are relative
-  # to the PANEL's rect, and the container's edges have to be expressed in
-  # panel coordinates. That is exactly what `nuChildEdgeInParent` returns, for
-  # any anchoring of either object.
-  #
-  # The strip itself is anchored to the panel's TOP-LEFT with pivot (0,1), so
-  # its anchoredPosition is measured from the panel's own top-left corner --
-  # hence the subtraction of the panel's top and left edges. Then down by the
-  # ORIGINAL padding, which is where the first stock row used to begin and is
-  # now the top of the band the padding shift just vacated.
-  let (edgeOk, contTop, contLeft) = nuChildEdgeInParent(panelG, contG)
-  if not edgeOk:
-    warn "postfx subtab: the container's edges could not be expressed in " &
-         "panel coordinates (panel " & nuGeomNote(panelG) & ", container " &
-         nuGeomNote(contG) & "), so there is no place to put the strip. The " &
-         "padding shift is captured and will be undone if this feature " &
-         "faults out."
-    discard modsSetActive(strip, false)
-    return
-  let panelTop = panelG.rectY + panelG.rectH
-  let panelLeft = panelG.rectX
-  discard panelLeft
-  discard contLeft
-  # No room was made on PostFX, so there is no freed band to drop into: the
-  # strip goes at the existing content top and may overlap. Stated rather than
-  # disguised.
-  let usedInset = (if pIx == 1: origTop else: origTop + extraInset)
-  let stripY = (contTop - panelTop) - float32(usedInset)
-  # X COMES FROM THE DONOR, NOT FROM THE CONTAINER'S LEFT EDGE. With the
-  # donor's horizontal stretch anchors copied above, `anchoredPosition.x` is an
-  # offset from the CENTRE, and the donor's own value is what centres it on its
-  # panel. `contLeft`/`panelLeft` are still computed because the vertical
-  # arithmetic needs `contTop`, but the left edge is no longer used -- it was
-  # what left-aligned the strip.
-  let stripX = donorG.posX
-  if not nuSetV2(stripT, NuTRtSetAnchoredPos, stripX, stripY):
-    warn "postfx subtab: room was made in " & iObjName(panelT) & " but the " &
-         "strip could not be positioned into it. The padding shift is " &
-         "captured and will be undone if this feature faults out."
-    discard modsSetActive(strip, false)
-    return
-  # THE CENTRING ASSERTION, and it can fail. Read the strip's OWN rect back off
-  # the live Transform and put its centre in panel coordinates through the same
-  # general solver used for the container -- then compare with the panel's own
-  # centre. This is deliberately not "did the setters return true": they did
-  # last time, and the strip was still left-aligned at x=75 because the anchors
-  # it was given were the wrong ones.
-  let stripG = nuReadGeom(stripT)
-  let (sEdgeOk, _, sLeft) = nuChildEdgeInParent(panelG, stripG)
-  if sEdgeOk:
-    let stripMidX = sLeft + stripG.rectW * 0.5'f32
-    let panelMidX = panelG.rectX + panelG.rectW * 0.5'f32
-    let dx = stripMidX - panelMidX
-    if dx > 1.0'f32 or dx < -1.0'f32:
-      warn "postfx subtab: the strip in " & iObjName(panelT) & " is NOT " &
-           "centred -- its centre x is " & nuF(stripMidX) & " and the panel's " &
-           "is " & nuF(panelMidX) & " (" & nuF(dx) & "px off), width " &
-           nuF(stripG.rectW) & ". The stock strip it was copied from is " &
-           "stretch-anchored with a symmetric inset, so a correct copy centres " &
-           "itself with no x arithmetic; being off means the horizontal " &
-           "anchors did not transfer. Cosmetic, so the strip is LEFT UP -- but " &
-           "it is the defect the user reported and it is not being hidden."
-    else:
-      okLog "postfx subtab: the strip in " & iObjName(panelT) & " is CENTRED " &
-            "-- its centre x " & nuF(stripMidX) & " matches the panel's " &
-            nuF(panelMidX) & " to within 1px, width " & nuF(stripG.rectW) &
-            ", read back off the live RectTransform rather than from the " &
-            "values we wrote."
-  else:
-    warn "postfx subtab: the strip's centre could not be read back in " &
-         iObjName(panelT) & ", so whether it is centred was NOT observed. " &
-         "That is inconclusive, not a pass."
-  okLog "postfx subtab: made room in " & iObjName(panelT) & " the layout " &
-        "group's own way" &
-        " -- VerticalLayoutGroup padding.top raised from " & $origTop & " to " &
-        $(origTop + totalShift) & " (+" & $addH & "px for the strip's " &
-        "measured height, plus " & $extraInset & "px so the inset above it " &
-        "matches the " & $gGfxInsetRef & "px this build measured on the first " &
-        "panel -- Graphics is 20 and PostFX is 0, and adding the same amount " &
-        "to both sat the strip flush against PostFX's top edge) through " &
-        "RectOffset::set_top followed by LayoutGroup::" &
-        "SetDirty, so the group moves and resizes the stock list ITSELF and " &
-        "the change survives every rebuild. The original " & $origTop & " is " &
-        "captured and restored on fault or self-disable. The strip sits in " &
-        "the freed band at panel (" & nuF(stripX) & "," & nuF(stripY) &
-        "), derived from the container's resolved rect rather than its " &
-        "anchoredPosition (it is centre-pivoted and vertically stretched, so " &
-        "its anchoredPosition is (0,0) and carries no edge information), " &
-        nuF(donorG.rectW) &
-        "x" & nuF(donorG.rectH) & ", size copied from the stock Control " &
-        "Settings strip. The backstop now expects these stock objects to have " &
-        "moved by exactly " & $addH & "px and by nothing else."
-  # BELT AND BRACES, NEVER A REQUIREMENT. If the clone happens to carry a
-  # LayoutElement, tell it to ignore layout -- harmless where nothing lays it
-  # out, and correct insurance if the PANEL turns out to have a group of its
-  # own. Its ABSENCE is no longer a refusal: attempt 3 refused on exactly this
-  # and shipped a screen with no subtabs at all, which was worse than the bug.
-  let stripLe = modsComponent(stripT, "LayoutElement")
-  if stripLe != nil:
-    if nuSetIgnoreLayout(stripLe, true):
-      okLog "postfx subtab: the strip in " & iObjName(panelT) & " carries a " &
-            "LayoutElement, so ignoreLayout was set through the real property " &
-            "(which also calls SetDirty). Insurance only -- it is a child of " &
-            "the panel now, not of the content container's layout group."
-  else:
-    okLog "postfx subtab: the strip in " & iObjName(panelT) & " carries no " &
-          "LayoutElement. That is FINE now and was fatal in attempt 3: it is " &
-          "no longer inside the content container's layout group, so there " &
-          "is nothing to opt out of."
-  okLog "postfx subtab: the strip in " & iObjName(panelT) & " is parented to " &
-        "the PANEL" &
-        ", exactly where the game puts its own subtab strip (Control " &
-        "Settings/Toggles is a direct child of its panel, sibling of " &
-        "Content -- which is why gfxContentContainerT finds two candidates " &
-        "there and refuses). Its geometry is COPIED from that stock strip, " &
-        "read live: " & nuGeomNote(donorG) & ". Nothing was hardcoded and " &
-        "nothing was added to the content container, so the layout group that " &
-        "displaced SettingsList in the last three attempts is not involved."
-  # THE GROUP QUESTION, MEASURED PER STRIP (the two buttons made just above),
-  # exactly the check `modsBuildSubtabs` uses -- same donor, same question.
-  # MEASURED (fact #117): both buttons came out with m_Group=0 -- unlike the
-  # MODS strip, the buttons here are cloned SEPARATELY from the strip
-  # (`modsClone(donorButtonGo)`, not part of the strip's own Instantiate), so
-  # Unity has no cloned hierarchy to remap an external reference onto and the
-  # field is left null. The technique `modsBuildSubtabs` uses is passive (it
-  # only NULLS a clone that inherited the STOCK group); there is nothing to
-  # null here. So: if the strip clone itself carries a ToggleGroup component
-  # (the donor "Toggles" object is the group owner, and that identity comes
-  # along with the strip's own Instantiate), WRITE both buttons' m_Group onto
-  # it -- read-validate-write, on a clone we made, never on a stock object.
-  var groupWired = false
-  let stripGroup = modsComponent(stripT, "ToggleGroup")
-  if stripGroup != nil and into.len == 2 and
-     duOk(into[0], ModsOffGroup + 8'i32) and duOk(into[1], ModsOffGroup + 8'i32):
-    let g0 = cReadPtrAt(into[0], ModsOffGroup)
-    let g1 = cReadPtrAt(into[1], ModsOffGroup)
-    if g0 == nil and g1 == nil:
-      discard cUxWritePtr(into[0], ModsOffGroup, stripGroup)
-      discard cUxWritePtr(into[1], ModsOffGroup, stripGroup)
-      groupWired = true
-      okLog "postfx subtab: " & iObjName(panelT) & "'s strip toggle group " &
-            "-> both buttons came out m_Group=NULL (no Instantiate remap: " &
-            "the buttons are cloned separately from the strip), so both " &
-            "were WIRED onto the strip's own cloned ToggleGroup " & iPtr(stripGroup) &
-            " -- native exclusivity now runs off that group."
-    elif g0 != nil and g0 == g1:
-      groupWired = true
-      okLog "postfx subtab: " & iObjName(panelT) & "'s strip toggle group " &
-            "check -> GRAPHICS m_Group=" & iPtr(g0) & " POSTFX m_Group=" &
-            iPtr(g1) & "; exclusivity is NATIVE already (both point at the " &
-            "same cloned ToggleGroup)"
-    else:
-      okLog "postfx subtab: " & iObjName(panelT) & "'s strip toggle group " &
-            "check -> GRAPHICS m_Group=" & iPtr(g0) & " POSTFX m_Group=" &
-            iPtr(g1) & "; NOT wired (neither both-null nor matching), " &
-            "left alone -- exclusivity stays OURS, enforced every frame by " &
-            "gfxApply/gfxTickBody"
-  else:
-    # THE LOAD-BEARING #117 PATH DID NOT RUN, and that must be LOUD, not a quiet
-    # okLog. The donor strip is `Control Settings/Toggles` -- a checkbox/keybind
-    # list, which need not be a radio ToggleGroup at all -- so a clone of it may
-    # carry no ToggleGroup for m_Group to point at. Report the toggles' ACTUAL
-    # m_Group so the next live run can tell "no group anywhere" (frame
-    # enforcement is the only exclusivity) from "inherited a stray group".
-    var mg0 = "n/a"
-    var mg1 = "n/a"
-    if into.len == 2:
-      if duOk(into[0], ModsOffGroup + 8'i32): mg0 = iPtr(cReadPtrAt(into[0], ModsOffGroup))
-      if duOk(into[1], ModsOffGroup + 8'i32): mg1 = iPtr(cReadPtrAt(into[1], ModsOffGroup))
-    warn "postfx subtab: " & iObjName(panelT) & "'s strip clone carries NO " &
-         "reachable ToggleGroup component (donor 'Control Settings'/Toggles is " &
-         "not a radio group), so the #117 m_Group wiring could NOT run. " &
-         "GRAPHICS m_Group=" & mg0 & " POSTFX m_Group=" & mg1 & ". Exclusivity " &
-         "stays OURS, enforced every frame by gfxApply/gfxTickBody -- a real " &
-         "click STILL sets m_IsOn (Unity's Toggle.Set writes m_IsOn regardless " &
-         "of m_Group), which is what the rising-edge tick reads."
-  # THE CLICK QUESTION, MEASURED NOT ASSUMED. A group wiring fix does nothing
-  # if the click never reaches the Toggle at all. Read (never blind-write)
-  # Selectable.m_Interactable and the target Graphic's m_RaycastTarget for
-  # each button and say what was found; only flip m_Interactable when it
-  # measures false, because THAT alone is unambiguously wrong for a control
-  # meant to be clickable -- raycastTarget/occlusion is reported, not patched,
-  # since fixing it blind could as easily be the wrong sibling.
-  var i2 = 0
-  while i2 < into.len:
-    let tog = into[i2]
-    if tog != nil and duOk(tog, ModsOffInteractable + 1'i32):
-      let interact = cSwReadU8(tog, ModsOffInteractable) != 0'i32
-      var rtStr = "n/a"
-      if duOk(tog, ModsOffTargetGraphic + 8'i32):
-        let tg = cReadPtrAt(tog, ModsOffTargetGraphic)
-        if tg != nil and duOk(tg, GfxOffRaycastTarget + 1'i32):
-          rtStr = (if cSwReadU8(tg, GfxOffRaycastTarget) != 0'i32: "true" else: "FALSE")
-        else:
-          rtStr = "no reachable targetGraphic"
-      if not interact:
-        discard cUxWritePtr(tog, ModsOffInteractable, cast[Il2CppPtr](1))
-        warn "postfx subtab: " & iObjName(panelT) & " strip button " & $i2 &
-             " measured m_Interactable=FALSE (raycastTarget=" & rtStr &
-             ") -- a click could never reach it. Flipped to true."
-      else:
-        okLog "postfx subtab: " & iObjName(panelT) & " strip button " & $i2 &
-              " measured m_Interactable=true, targetGraphic.raycastTarget=" &
-              rtStr & "."
-    i2 = i2 + 1
-  result = true
-
-## THE SUBTAB HIGHLIGHT. Read this before changing either of the two call
-## sites below.
-##
-## THE DEFECT, as reported live: the strip shows GRAPHICS SETTINGS highlighted
-## while POSTFX is the panel that is open. The strip's own verdict reads PASS
-## at the same time.
-##
-## WHY BOTH CAN BE TRUE AT ONCE -- and this is the 9b shape, not a coincidence.
-## `modsSetToggleQuiet` writes `UnityEngine.UI.Toggle.m_IsOn` (+0x120) through
-## `SetIsOnWithoutNotify`, and `gfxVerdict` READS `m_IsOn` BACK. That check
-## cannot fail: it compares our own write against itself. What the PLAYER sees
-## is a different thing entirely.
-##
-## WHAT THE MAP SAYS THE PLAYER SEES (`docs/NATIVE-CONTROLS.md` 1, 2): these
-## strip buttons are `EFT.UI.AnimatedToggle`s living inside a
-## `UISpawnableToggle`. `AnimatedToggle` carries `_onTrigger` @0x128 and
-## `_offTrigger` @0x130 -- ANIMATOR TRIGGER NAMES -- and the visual switch is
-## fired from `AnimatedToggle::set_IsToggled(bool)` @0x16AD190 (unique). A raw
-## `m_IsOn` store never runs that setter, so the animator is never told and the
-## highlight stays wherever it was last animated to. `gfxSeedSelection` seeds
-## index 0, GRAPHICS SETTINGS -- which is exactly the stuck state reported.
-##
-## THE HYPOTHESIS THIS REPLACES, and it is DISPROVEN here, not merely
-## unfavoured: "a cloned toggle inherits the donor's serialized `m_Group`
-## @0x110, so the stock ToggleGroup still drives it". `gfxBuildStrip` already
-## MEASURED that (fact #117) and both buttons came out `m_Group=NULL` -- these
-## buttons are cloned SEPARATELY from the strip, so Unity had no cloned
-## hierarchy to remap a group reference onto. The strip's own group is written
-## by us afterwards. m_Group is therefore not the cause.
-##
-## STATUS, said plainly: INFERRED from the construction map plus the shape of
-## the defect. NOT live-verified -- the client is unbootable this pass for an
-## unrelated reason. The falsifiable prediction, for whoever runs it next:
-## with this in, `AnimatedToggle._onTrigger`/`_offTrigger` are still whatever
-## the donor serialized, and the HIGHLIGHT follows the open panel. If it does
-## not, the next thing to read live is those two trigger strings -- an
-## `_onTrigger` naming a state the donor's Animator has and this clone's does
-## not would explain it and this call would be harmless but insufficient.
-##
-## Additive, never a replacement: `modsSetToggleQuiet` still runs, so the
-## logical `m_IsOn` state and the verdict that reads it are unchanged. This
-## only makes the VISIBLE state follow it.
-proc gfxSubtabVisual(tog: Il2CppPtr; on: bool) =
-  ## Call the real setter on ONE strip button we cloned. Never on a stock one.
-  ## Silent on refusal by design -- `nuAnimToggleSetToggled` logs its own
-  ## reason through `nuFn`, and this runs on every switch, so a warn here would
-  ## be per-press noise. Gated by `nativeUiKit` inside `nuAnimToggleSetToggled`
-  ## (it checks `gNuOn`): with that flag off the highlight is left exactly as it
-  ## was before this change, which is the reported defect and not a new one.
-  if tog == nil or not iUnityAlive(tog):
-    return
-  discard nuAnimToggleSetToggled(tog, on)
-  # THE ALPHA, because the Animator will not do it for us.
-  #
-  # MEASURED: a cloned tab button's own Image reads colour alpha 0.0000, both
-  # selected and unselected -- the label renders (different Graphic) but the
-  # button is invisible. On a stock button the Animator drives that alpha per
-  # state, and our clone was made before the game initialised its Animator, so
-  # `set_IsToggled` above fires a trigger nothing listens to. That is also why
-  # this is ADDITIVE rather than a replacement: if the Animator ever does come
-  # alive, it and this agree on what selected looks like, because the numbers
-  # here were read off the game's own buttons.
-  #
-  # Refuses silently when the pair was never measured -- `gfxBuild` already
-  # logged that loudly, once, and this runs on every switch.
-  if gGfxAlphaOn < 0.0'f32 or gGfxAlphaOff < 0.0'f32:
-    return
-  if not duOk(tog, ModsOffTargetGraphic + 8'i32):
-    return
-  let img = cReadPtrAt(tog, ModsOffTargetGraphic)
-  if img == nil or not iUnityAlive(img):
-    return
-  # READ, VALIDATE, THEN WRITE -- never a blind write. The RGB is the clone's
-  # own, so only the channel that is wrong gets changed; writing a whole
-  # colour we invented would recolour a button the game styled.
-  let (okc, r, g, b, a) = nuImgReadColor(img)
-  if not okc:
-    return
-  let want = (if on: gGfxAlphaOn else: gGfxAlphaOff)
-  let d = a - want
-  if d < 0.004'f32 and d > -0.004'f32:
-    return                    # already right; do not churn the Graphic dirty
-  discard nuImgSetColor(img, r, g, b, want)
-
-proc gfxApply(sel: int) =
-  ## Switch the two STOCK panels and put both strips in agreement. Calls only
-  ## where something differs: this runs while the player is on the Graphics
-  ## tab, so it must be quiet in the steady state.
-  if gGfxPanelGo == nil or gGfxPostGo == nil:
-    return
-  let wantPost = (sel == 1)
-  if modsGoActive(gGfxPostGo) != wantPost:
-    discard modsSetActive(gGfxPostGo, wantPost)
-  if modsGoActive(gGfxPanelGo) == wantPost:
-    discard modsSetActive(gGfxPanelGo, not wantPost)
-  var i = 0
-  while i < 2:
-    let want = (i == sel)
-    if i < gGfxTogA.len and modsToggleIsOn(gGfxTogA[i]) != want:
-      discard modsSetToggleQuiet(gGfxTogA[i], want)
-    if i < gGfxTogB.len and modsToggleIsOn(gGfxTogB[i]) != want:
-      discard modsSetToggleQuiet(gGfxTogB[i], want)
-    # THE HIGHLIGHT, unconditionally -- see `gfxSubtabVisual`. Deliberately NOT
-    # guarded by "did m_IsOn differ": m_IsOn and the animator are two separate
-    # states, and the whole defect is them disagreeing. Skipping the visual
-    # because the logical state already matched is precisely how they would
-    # stay out of step forever.
-    if i < gGfxTogA.len:
-      gfxSubtabVisual(gGfxTogA[i], want)
-    if i < gGfxTogB.len:
-      gfxSubtabVisual(gGfxTogB[i], want)
-    if i < gGfxLast.len:
-      gGfxLast[i] = want
-    i = i + 1
-  gGfxSel = sel
-  if not gGfxSaid:
-    gGfxSaid = true
-    okLog "postfx subtab: switching between the STOCK Graphics Settings and " &
-          "PostFX Settings panels from a cloned two-button strip. Neither " &
-          "panel is cloned and neither is written to -- only its active state " &
-          "is driven, which is the one thing the game will not do for us, " &
-          "because it switches panels by ESettingsGroup."
-
-proc gfxSeedSelection() =
-  ## Seed the STRIP's own visual state to GRAPHICS SETTINGS selected -- and
-  ## ONLY the strip. `SetIsOnWithoutNotify` on our own clones, never
-  ## `SetActive` on a stock panel: that split is the whole fix for DEFECT A
-  ## (see `gfxBuild`) without reintroducing it. Without this the strip shows
-  ## NEITHER button selected on first open even though the game itself is
-  ## already showing Graphics Settings by default, which is exactly "should
-  ## be enabled/active by default" read backwards.
-  var i = 0
-  while i < 2:
-    let want = (i == 0)
-    if i < gGfxTogA.len:
-      discard modsSetToggleQuiet(gGfxTogA[i], want)
-      gfxSubtabVisual(gGfxTogA[i], want)
-    if i < gGfxTogB.len:
-      discard modsSetToggleQuiet(gGfxTogB[i], want)
-      gfxSubtabVisual(gGfxTogB[i], want)
-    if i < gGfxLast.len:
-      gGfxLast[i] = want
-    i = i + 1
-
+      warn "postfx subtab: fault ceiling reached; the feature is OFF for " &
+           "this session and the stock POSTFX tab could NOT be restored -- " &
+           "open another tab and back, or restart, to get it."
 proc gfxBuild(): bool =
+  ## RESOLVE THE TWO STOCK PANELS AND FOLD THE STOCK POSTFX TAB AWAY.
+  ##
+  ## THIS IS ALL THAT IS LEFT OF THE OLD POSTFX SUBTAB FEATURE, and the rest
+  ## was deleted rather than kept switched off. What went, and why:
+  ##
+  ##   gfxBuildStrip / gfxApply / gfxSeedSelection / gfxSubtabVisual
+  ##     -- a strip CLONED INTO A STOCK CONTAINER. Five attempts, each failing
+  ##        the same way: the container was owned by a LayoutGroup, so adding
+  ##        a sibling re-arranged the game's own scroll view. Measured:
+  ##        SettingsList (0,-20)/(850,755) -> (0,-420.5)/(850,354.5).
+  ##   the padding shift and gGfxPad*
+  ##     -- raising `LayoutGroup.padding.top` to make room. Correct on
+  ##        Graphics, destructive on PostFX (it re-flowed the children rather
+  ##        than shifting them), and only ever needed because the strip was
+  ##        inside the container in the first place.
+  ##   gfxStandDown / gfxStockGeomVerdictFor / gGfxStock* / gGfxStockExpectShift
+  ##     -- the per-panel backstop that existed to notice the above. A backstop
+  ##        for a hazard that no longer exists is dead weight, and its
+  ##        `expectShift` bookkeeping could only ever be right for the padding
+  ##        design.
+  ##   the PostFX first-show observation (gGfxPostPreShow*)
+  ##     -- a measurement that answered its question: the group is the driver.
+  ##
+  ## The replacement is `nativetabs.nim`'s `defineSubtabs`, live-PASSing: the
+  ## strip is a SIBLING of the panels it switches, so it is in no stock layout
+  ## group, nothing can re-arrange the game's geometry, and it does not have to
+  ## exist twice to survive a switch.
+  ##
+  ## What survives here is the part `nativetabs` does NOT do: locating the two
+  ## stock panels (which `postfxrows.nim` still needs) and hiding the stock
+  ## POSTFX top-row toggle so POSTFX appears once, as a subtab, not twice.
   result = false
   if gModsLastTabPtr == nil or not duOk(gModsLastTabPtr, 0x20'i32):
     return
   if gModsLastTabName != "game":
-    return                              # the container name comes from this tab
+    return
   inc gGfxTried
   let tabT = iToTransform(gModsLastTabPtr)
   let screenT = (if tabT != nil: modsParentOf(tabT) else: nil)
@@ -4175,789 +3293,60 @@ proc gfxBuild(): bool =
   let toggles = modsChildNamed(screenT, "Toggles")
   let gfxPanel = modsChildNamed(screenT, "Graphics Settings")
   let postPanel = modsChildNamed(screenT, "PostFX Settings")
-  let ctrlPanel = modsChildNamed(screenT, "Control Settings")
-  let donorStrip = (if ctrlPanel != nil: modsChildNamed(ctrlPanel, "Toggles")
-                    else: nil)
-  let donorButton = (if donorStrip != nil:
-                       modsChildNamed(donorStrip, "ControlToggle") else: nil)
-  if toggles == nil or gfxPanel == nil or postPanel == nil or
-     donorStrip == nil or donorButton == nil:
-    gfxNoteFault("the pieces this needs were not all found (" &
+  if toggles == nil or gfxPanel == nil or postPanel == nil:
+    gfxNoteFault("the stock panels were not all found (" &
                  (if toggles == nil: "Toggles " else: "") &
                  (if gfxPanel == nil: "Graphics-Settings " else: "") &
-                 (if postPanel == nil: "PostFX-Settings " else: "") &
-                 (if donorStrip == nil: "the donor strip " else: "") &
-                 (if donorButton == nil: "ControlToggle" else: "") &
+                 (if postPanel == nil: "PostFX-Settings" else: "") &
                  "). NOTHING was hidden: the stock POSTFX tab is untouched.")
     return
-  # MEASURE THE STOCK SELECTED/UNSELECTED BUTTON ALPHAS, once, before any
-  # object of ours exists. This proc only runs while the GAME tab is showing,
-  # so the Game button is SELECTED and the Graphics button is NOT: two real
-  # widgets in the two real states, which is where the numbers come from.
-  if gGfxAlphaOn < 0.0'f32:
-    let selT = modsChildNamed(toggles, "GameToggleSpawner")
-    let unselT = modsChildNamed(toggles, "GraphicsToggleSpawner")
-    let selTog = (if selT != nil: modsToggleOf(selT) else: nil)
-    let unselTog = (if unselT != nil: modsToggleOf(unselT) else: nil)
-    var aOn = -1.0'f32
-    var aOff = -1.0'f32
-    if selTog != nil and duOk(selTog, ModsOffTargetGraphic + 8'i32):
-      let g = cReadPtrAt(selTog, ModsOffTargetGraphic)
-      let (okc, _, _, _, av) = nuImgReadColor(g)
-      if okc: aOn = av
-    if unselTog != nil and duOk(unselTog, ModsOffTargetGraphic + 8'i32):
-      let g = cReadPtrAt(unselTog, ModsOffTargetGraphic)
-      let (okc, _, _, _, av) = nuImgReadColor(g)
-      if okc: aOff = av
-    if aOn >= 0.0'f32 and aOff >= 0.0'f32 and aOn > aOff:
-      gGfxAlphaOn = aOn
-      gGfxAlphaOff = aOff
-      okLog "postfx subtab: measured the stock tab-button alphas off the " &
-            "live top row -- SELECTED (Game, the tab showing right now) is " &
-            nuF(aOn) & " and UNSELECTED (Graphics) is " & nuF(aOff) & ". " &
-            "Our cloned buttons come out at alpha 0 because their Animator " &
-            "was never initialised, so these two MEASURED numbers are what " &
-            "the strip is driven with -- not a hardcoded pair."
-    else:
-      warn "postfx subtab: the stock tab-button alphas could NOT be " &
-           "measured (selected=" & nuF(aOn) & " unselected=" & nuF(aOff) &
-           "), so the strip's buttons keep whatever alpha the clone carries " &
-           "-- measured live as 0, i.e. INVISIBLE, though the labels still " &
-           "render. Reported rather than papered over with an invented alpha."
+  gGfxPanelGo = iGameObjectOf(gfxPanel)
+  gGfxPostGo = iGameObjectOf(postPanel)
+  gGfxPanelT = gfxPanel
+  gGfxPostT = postPanel
+  if gGfxPanelGo == nil or gGfxPostGo == nil:
+    gfxNoteFault("a stock panel GameObject was not reachable; nothing changed")
+    return
   let spawner = modsChildNamed(toggles, "PostFxToggleSpawner")
   if spawner == nil:
     gfxNoteFault("no PostFxToggleSpawner in the tab bar, so there is no stock " &
                  "tab to fold in. Nothing was changed.")
     return
-  let donorStripGo = iGameObjectOf(donorStrip)
-  let donorButtonGo = iGameObjectOf(donorButton)
-  gGfxPanelGo = iGameObjectOf(gfxPanel)
-  gGfxPostGo = iGameObjectOf(postPanel)
-  gGfxPanelT = gfxPanel
-  gGfxPostT = postPanel
-  if donorStripGo == nil or donorButtonGo == nil or gGfxPanelGo == nil or
-     gGfxPostGo == nil:
-    gfxNoteFault("a GameObject was not reachable; nothing was changed")
-    return
-  # BOTH STRIPS FIRST. The stock tab is hidden only once both exist.
-  var stripAGo: Il2CppPtr = nil
-  var stripBGo: Il2CppPtr = nil
-  if not gfxBuildStrip(gfxPanel, donorStripGo, donorStrip, donorButtonGo,
-                       donorButton, gGfxTogA, stripAGo):
-    gfxNoteFault("the strip inside Graphics Settings was not built; the stock " &
-                 "POSTFX tab is left exactly where it was")
-    return
-  if not gfxBuildStrip(postPanel, donorStripGo, donorStrip, donorButtonGo,
-                       donorButton, gGfxTogB, stripBGo):
-    # Strip A already came out usable and is live in Graphics Settings. Left
-    # alone it would be a stray, non-functional row -- exactly the kind of
-    # half-built residue this feature promises not to leave. Hide it (never
-    # destroy; the clone discipline for this file is SetActive only) so the
-    # screen is back to stock, matching the fault-ceiling promise below.
-    if stripAGo != nil:
-      discard modsSetActive(stripAGo, false)
-    gGfxTogA = @[]
-    gfxNoteFault("the strip inside PostFX Settings was not built; the stock " &
-                 "POSTFX tab is left exactly where it was, and the Graphics " &
-                 "Settings strip that was already built has been hidden")
-    return
-  gGfxLast = @[false, false]
-  # NOW, and only now, the stock tab comes out of the top row.
-  gGfxSpawnerGo = iGameObjectOf(spawner)
   gGfxTogglesT = toggles
+  gGfxSpawnerGo = iGameObjectOf(spawner)
   if gGfxSpawnerGo == nil or not modsSetActive(gGfxSpawnerGo, false):
     gGfxSpawnerGo = nil
-    gfxNoteFault("the stock POSTFX tab button could not be switched off, so " &
-                 "the top row would show five tabs AND a duplicate subtab. " &
-                 "The strips are built but the fold-in is incomplete.")
+    gfxNoteFault("the stock POSTFX tab button could not be switched off")
     return
-  # ONLY NOW is it true that we hid it. Set after the call SUCCEEDED, never
-  # before: a flag set on intent rather than on outcome is how the restore
-  # would come to believe it had work to do that it did not.
   gGfxSpawnerHidden = true
-  # THE OUTCOME CHECK: 5 stock tabs minus the one just hidden, PLUS the MODS
-  # clone if it exists. Hardcoding "4" was a false alarm waiting to happen:
-  # with settingsModsTab also on, the correct live count is 5 (5 stock + 1
-  # MODS - 1 hidden POSTFX), and a constant that assumes a stock-only world
-  # reported a CORRECT state as suspicious. Derived from the same flag the
-  # MODS feature itself sets when its clone actually exists, not re-guessed.
-  let expectTabs = 4 + (if gModsBuilt: 1 else: 0)
-  let liveTabs = modsActiveChildren(toggles)
-  if liveTabs == expectTabs:
-    okLog "postfx subtab: the top row now shows " & $liveTabs & " tab " &
-          "button(s) (expected " & $expectTabs & ", accounting for the MODS " &
-          "clone = " & $gModsBuilt & ") -- POSTFX has " &
-          # Kept as ONE literal on purpose: `tools/deploy.json` verifies this
-          # exact phrase, and a marker that spans a `&` boundary is not
-          # contiguous in the binary, so the check fails on a feature that is
-          # actually present. Reword the sentence around it, never through it.
-          "been folded into Graphics as a subtab" &
-          ". The stock button is HIDDEN, never destroyed, and comes back on " &
-          "its own if this feature turns itself off."
-  else:
-    warn "postfx subtab: the top row shows " & $liveTabs & " active tab " &
-         "button(s); " & $expectTabs & " was expected after hiding POSTFX " &
-         "(4 stock + MODS clone=" & $gModsBuilt & "). Something else is " &
-         "adding or hiding buttons -- reporting it rather than assuming."
   gGfxBuilt = true
-  gGfxSel = 0
-  # DO NOT force either panel active here. The build ran while the player is
-  # on the GAME tab (the guard above requires it), so `gGfxPanelGo` /
-  # `gGfxPostGo` are the game's to show or hide -- forcing Graphics Settings
-  # on right now was DEFECT A: it left Graphics Settings active ALONGSIDE
-  # Game Settings, with our strip drawn over the wrong panel. Panel
-  # visibility is driven only by `gfxTickBody`'s steady-state checks, and
-  # only once the game itself has actually put one of the two panels up.
-  #
-  # THE STRIP'S OWN SELECTED STATE IS A DIFFERENT CONCERN, and forcing a
-  # panel active was never required to seed it: `gfxSeedSelection` writes
-  # only to toggles WE cloned, never to a stock panel's active state.
-  gfxSeedSelection()
+  okLog "postfx subtab: the stock POSTFX tab has" &
+        " been folded into Graphics as a subtab" &
+        ". The strip itself is now nativetabs' `defineSubtabs`, which builds " &
+        "it as a SIBLING of the panels rather than inside one -- the cloned " &
+        "strip, the LayoutGroup padding shift and the per-panel geometry " &
+        "backstop that existed to police them are all DELETED, not disabled."
   result = true
 
-# ---------------------------------------------------------------------------
-# THE VERDICT. Everything above logs what it DID; none of it says whether the
-# feature ended up WORKING, and this feature's whole history is checks that
-# could only say yes (it self-disabled 4-of-4 while every individual log line
-# read fine). So: one line, once per settings-screen open, asserting the
-# FINISHED STATE of objects we did not write this frame -- `m_IsOn`@0x120 and
-# `activeInHierarchy` read back off the live toggles and the live STOCK
-# panels. Three outcomes, never two.
-#
-# What each outcome would take to be FALSIFIED, which is the point:
-#   PASS         exactly one subtab reads m_IsOn=1, both subtabs are
-#                activeInHierarchy, and the panel that names it is the ONLY
-#                one of the two that is active. Two-on, zero-on, or the wrong
-#                panel up all break it.
-#   FAIL inert   the strip is on screen and NO subtab reads m_IsOn=1 (or both
-#                do). That is the live signature of #117 recurring: a press
-#                never reaches `m_IsOn`, or nothing enforces exclusivity.
-#                NOTE, honestly: we cannot observe a PRESS -- there is no
-#                click hook here -- so this is the finished-state signature of
-#                bug 2, not a press observation. Said so in the line itself.
-#   FAIL blind   discovery never produced the strips (#104 recurring).
-#   FAIL desync  one subtab is on but the other panel is the one drawn.
-#   INCONCLUSIVE the screen never opened, or a read did not come back. "I
-#                could not look" is NOT a pass.
-# ---------------------------------------------------------------------------
-
-var gGfxVerdictSaid = false
-var gGfxArmSaid = false
-
-proc gfxStandDown(why: string) =
-  ## GET COMPLETELY OUT OF THE WAY. Every stock control back, nothing of ours
-  ## left driving anything.
-  ##
-  ## THE DEFECT THIS EXISTS FOR, reported by the user: the backstop failed on
-  ## the PostFX panel, hid THAT panel's strip, and left them looking at the
-  ## PostFX page with no way back -- our strip gone, and the stock POSTFX
-  ## top-row button still hidden by the fold. Worse, the tick kept ENFORCING
-  ## `gGfxSel == 1`, so even pressing GRAPHICS in the top row was undone on
-  ## the next frame. "Refusing costs nothing" is only true if the refusal also
-  ## stops us steering.
-  ##
-  ## Partial degradation was the mistake. A feature that cannot keep its
-  ## promise on ONE panel cannot be trusted to keep it on the other while
-  ## sharing the same padding writes and the same enforcement loop, so this
-  ## stands the whole thing down in one step, in the order that never leaves a
-  ## gap: restore what we wrote, give back the stock control, stop steering,
-  ## and only then hide our own objects.
-  if not gGfxOn:
-    return                      # already stood down; never do it twice
-  warn "postfx subtab STANDING DOWN: " & why & ". Every stock control is " &
-       "being put back and this feature stops driving the screen for the " &
-       "rest of the session. The player keeps GAME/GRAPHICS/SOUND/CONTROLS " &
-       "and gets the stock POSTFX tab back; nothing of ours is left steering " &
-       "panel visibility."
-  # 1. THE PADDING, first -- it is the only thing we wrote that the game owns.
-  if gGfxPadShifted:
-    var restored = 0
-    var failed = 0
-    var ri = 0
-    while ri < gGfxPadRo.len and ri < 4:
-      if nuSetPaddingTop(gGfxPadRo[ri], gGfxPadGrp[ri], gGfxPadOrig[ri]):
-        restored = restored + 1
-      else:
-        failed = failed + 1
-      ri = ri + 1
-    gGfxPadShifted = (failed > 0)
-    if failed == 0:
-      okLog "postfx subtab: stand-down restored LayoutGroup padding.top on " &
-            $restored & " panel(s); the stock lists go back exactly where " &
-            "the game put them."
-    else:
-      warn "postfx subtab: stand-down could NOT restore padding on " &
-           $failed & " panel(s); those stock lists stay " & $gGfxPadH &
-           "px lower until the screen is rebuilt. Reported, not hidden."
-  # 2. THE STOCK POSTFX TAB, before our strips go -- so there is never a frame
-  #    in which the player has neither.
-  if gGfxSpawnerHidden:
-    var go = gGfxSpawnerGo
-    if go == nil or not duOk(go, 0x20'i32) or not iUnityAlive(go):
-      if gGfxTogglesT != nil and duOk(gGfxTogglesT, 0x20'i32):
-        let again = modsChildNamed(gGfxTogglesT, "PostFxToggleSpawner")
-        if again != nil:
-          go = iGameObjectOf(again)
-    if go != nil and modsSetActive(go, true):
-      gGfxSpawnerHidden = false
-      okLog "postfx subtab: stand-down put the STOCK POSTFX TAB back in the " &
-            "top row, so POSTFX is reachable again by the game's own route."
-    else:
-      warn "postfx subtab: stand-down could NOT restore the stock POSTFX " &
-           "tab. The player still has GAME/GRAPHICS/SOUND/CONTROLS, but " &
-           "POSTFX is unreachable until the screen is reopened."
-  # 3. STOP STEERING. This is the part whose absence stranded the player: with
-  #    the flag still on, the steady-state enforcement below kept forcing the
-  #    PostFX panel active every frame.
-  gGfxOn = false
-  # 4. LEAVE EXACTLY ONE PANEL UP. The user saw "two backgrounds"; releasing
-  #    control without settling this would leave whichever pair happened to be
-  #    active. Graphics is the panel the stock GRAPHICS tab names, so that is
-  #    the honest resting state.
-  if gGfxPanelGo != nil and gGfxPostGo != nil:
-    if modsGoActive(gGfxPostGo):
-      discard modsSetActive(gGfxPostGo, false)
-    if not modsGoActive(gGfxPanelGo):
-      discard modsSetActive(gGfxPanelGo, true)
-    let oneUp = modsGoActive(gGfxPanelGo) and not modsGoActive(gGfxPostGo)
-    if oneUp:
-      okLog "postfx subtab: stand-down left exactly ONE panel active " &
-            "(Graphics Settings), read back off the live GameObjects -- so " &
-            "there is one background, not two."
-    else:
-      warn "postfx subtab: stand-down could not settle the panels to exactly " &
-           "one active (graphics=" & $modsGoActive(gGfxPanelGo) &
-           " postfx=" & $modsGoActive(gGfxPostGo) & "). The player may see " &
-           "two backgrounds until they leave and re-enter Settings."
-  # 5. OUR OWN OBJECTS LAST.
-  var hidden = 0
-  var h = 0
-  while h < gGfxStockStripGo.len and h < 4:
-    if gGfxStockStripGo[h] != nil and modsSetActive(gGfxStockStripGo[h], false):
-      hidden = hidden + 1
-    h = h + 1
-  okLog "postfx subtab: stand-down hid " & $hidden & " strip(s) of ours. " &
-        "Nothing was destroyed and nothing stock was written; the screen is " &
-        "the screen the game builds."
-proc gfxHideStripsOf(pIx: int): int =
-  ## Hide only the strip(s) belonging to ONE panel. The old version hid every
-  ## strip we owned, which is how a PostFX reading took the working GRAPHICS
-  ## strip down with it.
-  result = 0
-  var h = 0
-  while h < gGfxStockStripGo.len and h < 4:
-    if h < gGfxStripPanelIx.len and gGfxStripPanelIx[h] == pIx and
-       gGfxStockStripGo[h] != nil and modsSetActive(gGfxStockStripGo[h], false):
-      result = result + 1
-    h = h + 1
-
-proc gfxStockGeomVerdictFor(pIx: int) =
-  ## DID WE DISPLACE ANYTHING OF THE GAME'S, ON THIS ONE PANEL? Read off the
-  ## live objects, once per settings-screen open PER PANEL, and it can fail.
-  ##
-  ## THREE STATES, NOT TWO -- and the missing third one was a measured defect.
-  ##
-  ##   LANDED          moved by exactly the H we asked for (or, for an object
-  ##                   outside the container, not at all). PASS.
-  ##   NOT-LANDED-YET  the panel is INACTIVE, so Unity has not rebuilt its
-  ##                   layout at all: `SetDirty` only QUEUES a rebuild for an
-  ##                   inactive hierarchy and it runs when the object is next
-  ##                   enabled. INCONCLUSIVE, and it must stay pending rather
-  ##                   than resolve either way.
-  ##   DISPLACED       moved by something other than H. FAIL.
-  ##
-  ## The live failure this fixes: PostFX's padding was raised 0 -> 46 while the
-  ## PostFX panel was inactive, so `EnablePanel` had not moved when the check
-  ## ran. That was read as DISPLACED, reported FAIL, and hid BOTH strips --
-  ## including the Graphics one, whose own panel had just verified to the pixel
-  ## (SettingsList (0,-20)/755 -> (0,-66)/709, exactly -46). One panel's
-  ## unfinished layout must never condemn another panel's finished one, so the
-  ## whole check is now per-panel and gated on that panel being active.
-  ##
-  ## WHY IT RUNS ON A LATER TICK. A LayoutGroup rebuilds at the END of the
-  ## frame, so an inline re-read compares against a layout that has not run and
-  ## could only ever say "unchanged" -- a check that cannot fail.
-  if pIx < 0 or pIx > 1: return
-  # SELF-HEAL THE PER-PANEL ARRAYS BEFORE INDEXING THEM. Every early return
-  # below used to be able to fire on a length test, silently, and a bounds
-  # guard that returns without a word is precisely how this check went missing
-  # for a whole session. Growing them here means the only reasons left to
-  # return are real ones, and each of those now announces itself.
-  while gGfxGeomSaid.len < 2: gGfxGeomSaid.add false
-  while gGfxGeomPendingSaid.len < 2: gGfxGeomPendingSaid.add false
-  while gGfxGeomTicks.len < 2: gGfxGeomTicks.add 0
-  while gGfxGeomOffered.len < 2: gGfxGeomOffered.add 0
-  while gGfxGeomWatchSaid.len < 2: gGfxGeomWatchSaid.add false
-  if gGfxGeomSaid[pIx]: return
-  let panelT = (if pIx == 1: gGfxPostT else: gGfxPanelT)
-  let which = (if pIx == 1: "PostFX Settings" else: "Graphics Settings")
-  # OFFERED. Counted before any guard, so the watchdog measures "the tick
-  # reached this proc and nothing came out", which is the actual symptom.
-  gGfxGeomOffered[pIx] = gGfxGeomOffered[pIx] + 1
-  let panelOk = (panelT != nil and duOk(panelT, 0x20'i32))
-  var actOk = false
-  var act = false
-  if panelOk:
-    let (a, b) = iActiveInHierarchy(panelT)
-    actOk = a
-    act = b
-  # THE WATCHDOG. Absence is no longer possible: if this proc has been offered
-  # GfxGeomWatchdog times and still has no verdict, it reports INCONCLUSIVE
-  # once, with every input that decides the outcome, so the next run names the
-  # cause instead of being silent.
-  if gGfxGeomOffered[pIx] >= GfxGeomWatchdog and not gGfxGeomWatchSaid[pIx]:
-    gGfxGeomWatchSaid[pIx] = true
-    var mine = 0
-    var w = 0
-    while w < gGfxStockPanelIx.len and w < GfxMaxStockWatch * 2:
-      if gGfxStockPanelIx[w] == pIx: mine = mine + 1
-      w = w + 1
-    warn "postfx subtab STOCK-GEOMETRY INCONCLUSIVE (" & which & "): the " &
-         "check was offered " & $gGfxGeomOffered[pIx] & " tick(s) and never " &
-         "reached a verdict, so it has NOT been observed -- this is not a " &
-         "pass. Raw state, so the cause is named rather than guessed: " &
-         "panelT=" & iPtr(panelT) & " readable=" & $panelOk &
-         " activeReadOk=" & $actOk & " active=" & $act &
-         " settleTicks=" & $gGfxGeomTicks[pIx] & "/" & $GfxGeomSettle &
-         " baselineEntriesForThisPanel=" & $mine &
-         " totalBaseline=" & $gGfxStockT.len &
-         " panelIxLen=" & $gGfxStockPanelIx.len &
-         " padShifted=" & $gGfxPadShifted & " padH=" & $gGfxPadH &
-         ". If baselineEntriesForThisPanel is 0 the baseline was never " &
-         "captured for this panel; if active=false the panel was never shown; " &
-         "if settleTicks is stuck below the threshold something resets it " &
-         "every frame."
-  if not panelOk: return
-  # ONLY AN ACTIVE PANEL CAN BE JUDGED. Not a failure, not a pass: pending.
-  if not actOk or not act:
-    if not gGfxGeomPendingSaid[pIx]:
-      gGfxGeomPendingSaid[pIx] = true
-      okLog "postfx subtab STOCK-GEOMETRY NOT-LANDED-YET (" & which & "): the " &
-            "panel is not activeInHierarchy, and Unity does not rebuild an " &
-            "inactive hierarchy -- our padding change is QUEUED and runs when " &
-            "the panel is next shown. This is INCONCLUSIVE, not a failure, " &
-            "and the assertion is deferred until the panel is actually up. " &
-            "Nothing has been hidden."
-    return
-  # THE POSTFX FIRST-SHOW OBSERVATION -- the whole point of this build.
-  #
-  # We are here because the panel is ACTIVE. On PostFX we shifted nothing, so
-  # any movement since the snapshot is the game's own. Reported ONCE, with
-  # every number, because it decides which of two opposite fixes is correct:
-  #   children MOVED   -> the layout group is the rightful driver and the
-  #                       earlier baseline was taken before first show;
-  #                       padding is the right mechanism, applied later.
-  #   children STILL   -> the group was dormant and our SetDirty woke it;
-  #                       the children must be moved directly instead.
-  if pIx == 1 and not gGfxPostShowSaid and gGfxPostPreShowT.len > 0:
-    gGfxPostShowSaid = true
-    var changed = 0
-    var same = 0
-    var unreadable = 0
-    var detail = ""
-    var k = 0
-    while k < gGfxPostPreShowT.len and k < GfxMaxStockWatch:
-      let t = gGfxPostPreShowT[k]
-      if t == nil or not duOk(t, 0x20'i32) or not iUnityAlive(t):
-        unreadable = unreadable + 1
-      else:
-        let now = nuReadGeom(t)
-        if not now.ok:
-          unreadable = unreadable + 1
-        elif nuGeomMoved(gGfxPostPreShowG[k], now, 1.0'f32):
-          changed = changed + 1
-          detail = detail & " | " & gGfxPostPreShowName[k] & ": was " &
-                   nuGeomNote(gGfxPostPreShowG[k]) & " -- now " &
-                   nuGeomNote(now)
-        else:
-          same = same + 1
-      k = k + 1
-    if changed > 0:
-      okLog "postfx subtab POSTFX-FIRST-SHOW = THE GROUP IS THE DRIVER " &
-            "(reading B): " & $changed & " of " & $gGfxPostPreShowT.len &
-            " child(ren) moved or resized ON THEIR OWN between the snapshot " &
-            "and this panel's first activation, and WE WROTE NOTHING to this " &
-            "panel. So the earlier re-flow was not our SetDirty waking a " &
-            "dormant group -- it was the first layout the group had ever " &
-            "run, which the stock show performs anyway. The correct fix is " &
-            "padding.top as on Graphics, with the baseline captured AFTER " &
-            "first activation instead of before." & detail
-    elif same > 0:
-      okLog "postfx subtab POSTFX-FIRST-SHOW = THE GROUP IS DORMANT " &
-            "(reading A): all " & $same & " snapshotted child(ren) are " &
-            "UNCHANGED after this panel's first activation, so the layout " &
-            "group does not arrange them and the earlier re-flow was our " &
-            "SetDirty waking it. Padding is destructive here; the correct " &
-            "fix is to shift EnablePanel/SettingsPanel anchoredPosition.y " &
-            "directly, with capture and restore, and to treat any SIZE " &
-            "change as displacement."
-    else:
-      warn "postfx subtab POSTFX-FIRST-SHOW INCONCLUSIVE: none of the " &
-           $gGfxPostPreShowT.len & " snapshotted child(ren) could be read " &
-           "back (" & $unreadable & " unreadable), so neither reading was " &
-           "confirmed. NOT a result."
-  # Active. Let its own layout settle before judging it.
-  if gGfxGeomTicks[pIx] < GfxGeomSettle:
-    gGfxGeomTicks[pIx] = gGfxGeomTicks[pIx] + 1
-    return
-  var watched = 0
-  var moved = 0
-  var unread = 0
-  var landed = 0        # moved down by exactly our H: the group drives it
-  var untouched = 0     # did not move: the group does not drive it
-  var expected = 0      # entries we asked to move at all
-  var report = ""
-  var i = 0
-  while i < gGfxStockT.len and i < GfxMaxStockWatch * 2:
-    if i >= gGfxStockPanelIx.len or gGfxStockPanelIx[i] != pIx:
-      i = i + 1
-      continue
-    watched = watched + 1
-    let t = gGfxStockT[i]
-    if t == nil or not duOk(t, 0x20'i32) or not iUnityAlive(t):
-      unread = unread + 1
-    else:
-      let now = nuReadGeom(t)
-      if not now.ok:
-        unread = unread + 1
-      elif i < gGfxStockExpectShift.len and gGfxStockExpectShift[i]:
-        expected = expected + 1
-        # WE MOVED THIS ONE ON PURPOSE, so the assertion changes shape but does
-        # NOT go away: it must have moved DOWN by exactly our padding shift.
-        # Staying put or moving by any other amount still fails, so the 420px
-        # displacement of attempts 1-3 would still be caught here.
-        #
-        # Height gets two legal answers because either is correct and we cannot
-        # tell offline which this group does: unchanged (the child's height is
-        # not driven) or reduced by exactly our shift (it is). A third answer
-        # is a failure.
-        # WHICH OBJECTS THE GROUP ACTUALLY DRIVES CANNOT BE PREDICTED, so it
-        # is MEASURED. This is a correction to a false FAIL that stranded the
-        # player.
-        #
-        # The previous rule was structural: 'a direct child of the content
-        # container is expected to move by H'. `PostFX Settings/Panel/
-        # EnablePanel` IS such a child and correctly did NOT move -- a
-        # LayoutGroup only arranges the children it actually lays out, and it
-        # skips inactive ones and ones that ignore layout. So a healthy object
-        # failed the check, its panel's strip was hidden, and the user was
-        # left on the PostFX page with no way back. Same false-FAIL shape as
-        # the inactive-panel one, a level further in.
-        #
-        # `LayoutGroup.m_RectChildren` @0x58 is the real membership list, but
-        # it is a `List<RectTransform>` -- an instantiated generic whose
-        # layout is NOT reachable offline, so reading it would mean a
-        # fabricated offset into a live collection. Refused.
-        #
-        # So both legitimate outcomes are accepted and everything else still
-        # fails: an object the group drives moves down by exactly H, an object
-        # it does not drive does not move at all. A 420px displacement, or a
-        # partial drift, is neither -- which is the whole class this backstop
-        # exists for. Weaker than the old rule in exactly one way (it cannot
-        # tell that the group FAILED to move something it should have), and
-        # that gap is closed by the `landed >= 1` assertion below.
-        let shiftPx = (if i < gGfxStockShiftPx.len: gGfxStockShiftPx[i]
-                       else: gGfxPadH)
-        let want = gGfxStockG[i].posY - float32(shiftPx)
-        let dy = now.posY - want
-        let dh0 = now.rectH - gGfxStockG[i].rectH
-        let dh1 = now.rectH - (gGfxStockG[i].rectH - float32(shiftPx))
-        let yOk = dy < 2.0'f32 and dy > -2.0'f32
-        let hOk = (dh0 < 2.0'f32 and dh0 > -2.0'f32) or
-                  (dh1 < 2.0'f32 and dh1 > -2.0'f32)
-        # NOT MOVED AT ALL is the other legal answer: this object is simply
-        # not one the group arranges.
-        let still = not nuGeomMoved(gGfxStockG[i], now, 1.0'f32)
-        if yOk and hOk:
-          landed = landed + 1
-        elif still:
-          untouched = untouched + 1
-        if not (yOk and hOk) and not still:
-          moved = moved + 1
-          report = report & " | " & gGfxStockName[i] &
-                   " (we deliberately shifted this by " & $shiftPx &
-                   "px; it did NOT land there): was " &
-                   nuGeomNote(gGfxStockG[i]) & " -- expected y=" & nuF(want) &
-                   " -- now " & nuGeomNote(now)
-      elif nuGeomMoved(gGfxStockG[i], now, 1.0'f32):
-        moved = moved + 1
-        report = report & " | " & gGfxStockName[i] & ": was " &
-                 nuGeomNote(gGfxStockG[i]) & " -- now " & nuGeomNote(now)
-    i = i + 1
-  if watched == 0:
-    gGfxGeomSaid[pIx] = true
-    warn "postfx subtab STOCK-GEOMETRY INCONCLUSIVE (" & which & "): no " &
-         "pre-insertion baseline was captured for this panel, so whether our " &
-         "strip displaced anything of the game's was never observed. NOT a pass."
-    return
-  gGfxGeomSaid[pIx] = true
-  # THE SHIFT MUST HAVE TAKEN EFFECT SOMEWHERE. Accepting 'unchanged' as a
-  # legal answer above would, on its own, let a padding write that did nothing
-  # at all pass silently -- and then the strip overlaps the stock rows, which
-  # is the defect this whole mechanism exists to avoid. So: of the objects we
-  # asked to move, at least ONE must actually have moved by H.
-  if moved == 0 and expected > 0 and landed == 0:
-    warn "postfx subtab STOCK-GEOMETRY DISPLACED (" & which & "): the " &
-         "padding shift did NOTHING -- " & $expected & " object(s) were " &
-         "asked to move down by " & $gGfxPadH & "px and NONE did (" &
-         $untouched & " unmoved). No band was freed, so the strip overlaps " &
-         "the stock rows. This panel's LayoutGroup evidently does not " &
-         "arrange these children, so raising its padding cannot make room."
-    gfxStandDown("the padding shift made no room on " & which)
-    return
-  if moved > 0:
-    warn "postfx subtab STOCK-GEOMETRY DISPLACED (" & which & "): " & $moved &
-         " of " & $watched & " stock object(s) on THIS panel are not where " &
-         "they should be. ALL casualties, before and after:" & report &
-         ". Hiding only THIS panel's strip -- the other panel is judged " &
-         "separately and is not affected by this reading."
-    # STAND THE WHOLE FEATURE DOWN, not just this panel's strip. Hiding one
-    # strip and carrying on is what left the player stranded on the PostFX
-    # page with no way back and the tick still forcing that panel up.
-    gfxStandDown("the stock layout was displaced on " & which &
-                 " (see the STOCK-GEOMETRY DISPLACED line above for the" &
-                 " before/after numbers)")
-  elif unread > 0:
-    warn "postfx subtab STOCK-GEOMETRY INCONCLUSIVE (" & which & "): nothing " &
-         "was seen to move, but " & $unread & " of " & $watched & " baseline " &
-         "object(s) could not be re-read, so the panel was not fully " &
-         "observed. NOT a pass."
-  else:
-    okLog "postfx subtab STOCK-GEOMETRY LANDED (" & which & "): all " &
-          $watched & " stock object(s) on this panel are where they should be" &
-          " -- the ones outside the content container are UNCHANGED to within " &
-          "1px, and the ones inside it moved down by exactly the " & $gGfxPadH &
-          "px of LayoutGroup padding we deliberately added, and by nothing " &
-          "else. Read back off the live RectTransforms " & $GfxGeomSettle &
-          "+ frames after the panel became active. This is no longer an " &
-          "'unchanged' assertion: we make ONE owned, captured, restorable " &
-          "write to the group's padding, and this checks it did exactly what " &
-          "it said."
-
-proc gfxVerdict() =
-  ## Read-only. No writes, no calls into game state-changing code -- only the
-  ## `activeInHierarchy` / `activeSelf` getters the rest of this file already
-  ## uses, each behind `iUnityAlive`, and guarded byte reads for `m_IsOn`.
-  if gGfxVerdictSaid:
-    return
-  if not gGfxBuilt:
-    # Discovery never finished. Only a verdict once the build has actually
-    # given up (the ceiling), otherwise it is simply still trying.
-    if gGfxFaults >= GfxMaxFaults or gGfxTried >= GfxMaxBuildTries:
-      gGfxVerdictSaid = true
-      warn "postfx subtab VERDICT FAIL: the subtab strip was never built" &
-           " -- discovery gave up after " & $gGfxTried & " attempt(s) and " &
-           $gGfxFaults & " fault(s). The stock POSTFX tab is untouched or has " &
-           "been put back; the screen is stock. See the 'no content container' " &
-           "or 'pieces this needs were not all found' line above for which hop " &
-           "failed and what the children were actually named."
-    return
-  if gGfxTogA.len != 2 or gGfxTogB.len != 2:
-    return
-  # WHICH STRIP IS ON SCREEN. Only the visible one can be pressed (fact #72),
-  # so only the visible one can carry a meaningful m_IsOn.
-  let gfxUp = modsGoActive(gGfxPanelGo)
-  let postUp = modsGoActive(gGfxPostGo)
-  if not gfxUp and not postUp:
-    return                       # player is on another tab; nothing to judge yet
-  let strip = (if postUp: gGfxTogB else: gGfxTogA)
-  let hostT = (if postUp: gGfxPostT else: gGfxPanelT)
-  # activeInHierarchy on the panel we believe is up, and on each subtab.
-  let (pOk, pAct) = iActiveInHierarchy(hostT)
-  let (a0Ok, a0) = iActiveInHierarchy(strip[0])
-  let (a1Ok, a1) = iActiveInHierarchy(strip[1])
-  if not pOk or not a0Ok or not a1Ok:
-    gGfxVerdictSaid = true
-    warn "postfx subtab VERDICT INCONCLUSIVE: activeInHierarchy could not be " &
-         "read back off the live objects (panel ok=" & $pOk & " subtab0 ok=" &
-         $a0Ok & " subtab1 ok=" & $a1Ok & "), so the finished state was not " &
-         "observed. This is NOT a pass."
-    return
-  var onCount = 0
-  var onIdx = -1
-  var i = 0
-  while i < 2:
-    if modsToggleIsOn(strip[i]):
-      onCount = onCount + 1
-      onIdx = i
-    i = i + 1
-  let both = gfxUp and postUp
-  let which = (if postUp: "PostFX Settings" else: "Graphics Settings")
-  gGfxVerdictSaid = true
-  if not a0 or not a1:
-    warn "postfx subtab VERDICT FAIL: a subtab button is not " &
-         "activeInHierarchy (GRAPHICS=" & $a0 & " POSTFX=" & $a1 & ") while " &
-         which & " is up, so it cannot be pressed at all (fact #72: a press " &
-         "on an inactive object reports success and does nothing)."
-  elif not pAct:
-    warn "postfx subtab VERDICT INCONCLUSIVE: " & which & " reads activeSelf " &
-         "true but activeInHierarchy FALSE -- an ancestor is off, so what is " &
-         "on screen was not established. This is NOT a pass."
-  elif both:
-    warn "postfx subtab VERDICT FAIL: both stock panels are active at once, " &
-         "so the visible page is whichever draws last rather than the one the " &
-         "strip names. Selection reads " & $onCount & " subtab(s) on."
-  elif onCount != 1:
-    warn "postfx subtab VERDICT FAIL: the subtab strip is inert -- " &
-         $onCount & " of 2 subtabs read m_IsOn=1 while " & which & " is up. " &
-         "Exactly 1 is the only correct answer; 0 means a click never reached " &
-         "m_IsOn (fact #117) and 2 means nothing is enforcing exclusivity. " &
-         "Read back off the live toggles at 0x120, not from anything we wrote " &
-         "this frame. (We cannot see the PRESS itself -- there is no click " &
-         "hook here -- so this is bug 2's finished-state signature, not a " &
-         "press observation.)"
-  elif (onIdx == 1) != postUp:
-    warn "postfx subtab VERDICT FAIL: the selection and the visible panel " &
-         "disagree -- subtab " & $onIdx & " reads m_IsOn=1 but " & which &
-         " is the panel that is up. The switch ran and did not take."
-  else:
-    okLog "postfx subtab VERDICT PASS: exactly one subtab is selected and " &
-          "its panel is the only one active" &
-          " -- subtab " & $onIdx & " reads m_IsOn=1, both subtabs are " &
-          "activeInHierarchy, " & which & " is up and the other stock panel " &
-          "is off. Read back off the live objects."
-
-## Throttled tick diagnostic (fact from the live run: gfxTickBody's neither-
-## panel-active early return is CORRECT behaviour, but it also made an
-## experiment look like "enforcement is dead" when the player was simply on
-## another tab. This says which branch the tick took, ONCE per settings
-## screen open -- not per frame -- so the next person can tell "correctly
-## idle" from "silently broken" without re-running the experiment.
-var gGfxTickDiagSaid = false
-
-## Frames for which one of the two stock panels has ACTUALLY been up. A settle
-## count on a POSITIVE condition on purpose: counting plain ticks would reach
-## its threshold while the screen was still closed and judge nothing at all.
-var gGfxUpTicks = 0
-const GfxVerdictSettle = 30
-
 proc gfxTickBody() =
+  ## What is left to do per frame: keep the two stock panel handles fresh and
+  ## let `postfxrows.nim` build into the PostFX panel when it is up. No strip,
+  ## no padding, no backstop, no rising-edge scan -- `nativetabs` owns
+  ## selection now, on the Toggle::Set event.
   if not gGfxOn or gGfxFaults >= GfxMaxFaults:
     return
-  if not gGfxArmSaid:
-    # The standing verdict before anything has been seen, so the log ALWAYS
-    # carries one and its ABSENCE can never be read as success.
-    gGfxArmSaid = true
-    okLog "postfx subtab VERDICT INCONCLUSIVE: armed, but the settings screen " &
-          "has not been opened yet, so nothing has been observed. Any later " &
-          "'postfx subtab VERDICT' line supersedes this one; if this is the " &
-          "last one in the log, the feature was never exercised -- that is " &
-          "not a pass and not a failure."
   if not gGfxBuilt:
     if gModsLastTabPtr != nil and gGfxTried < GfxMaxBuildTries:
       discard gfxBuild()
-    gfxVerdict()
     return
   if gModsLastTabPtr == nil:
-    gGfxTickDiagSaid = false          # settings screen closed; re-arm for next open
-    gGfxVerdictSaid = false
-    gGfxUpTicks = 0
-    # The stock-geometry verdict re-arms too, but the BASELINE does not: it was
-    # captured before our strip ever existed and is the only record of what the
-    # panel looked like untouched. Re-capturing it now would capture the
-    # DISPLACED layout as "normal", which is how a check stops being able to
-    # fail.
-    # Re-arm BOTH panels' verdicts for the next open. The BASELINE is still
-    # never recaptured -- it is the only record of the untouched panel, and
-    # recapturing it would teach the check to accept whatever state we had
-    # already put the panel into.
-    gGfxGeomSaid = @[false, false]
-    gGfxGeomPendingSaid = @[false, false]
-    gGfxGeomTicks = @[0, 0]
-    gGfxGeomOffered = @[0, 0]
-    gGfxGeomWatchSaid = @[false, false]
     pfxOnScreenClosed()
+    return
   if gGfxPanelGo == nil or gGfxPostGo == nil:
     return
   if not duOk(gGfxPanelGo, 0x20'i32) or not duOk(gGfxPostGo, 0x20'i32):
     return
-  let gfxUp = modsGoActive(gGfxPanelGo)
-  let postUp = modsGoActive(gGfxPostGo)
-  if not gGfxTickDiagSaid:
-    gGfxTickDiagSaid = true
-    okLog "postfx subtab: tick diagnostic (once per open) -> " &
-          "gfxPanelActive=" & $gfxUp & " postPanelActive=" & $postUp &
-          "; branch = " &
-          (if not gfxUp and not postUp: "IDLE (player on another tab; " &
-             "nothing touched, this is correct)"
-           elif gfxUp and postUp: "BOTH-ACTIVE (forcing back to selection)"
-           else: "NORMAL (watching the strip for a rising edge)")
-  # BUG 2 -- THE PANEL'S CONTENT. The subtab machinery above is finished and
-  # verified; what it switches TO was empty, because folding the stock POSTFX
-  # tab away leaves the stock PostFX Settings panel with nothing in it. Build
-  # our own rows into it the first time it is genuinely up, and judge them from
-  # then on. Lazily, so a player who never presses POSTFX pays nothing, and
-  # inside THIS guard -- `aowl_p_p_seh` is not re-entrant and none is opened
-  # over there.
-  pfxOnPanelUp(postUp)
-  if not gfxUp and not postUp:
-    # The player is on some other tab entirely. Do NOT touch anything -- the
-    # game owns the screen here. Just remember that re-entering starts on
-    # GRAPHICS SETTINGS, which is what the stock tab used to do.
-    if gGfxSel != 0:
-      gGfxSel = 0
-      var i = 0
-      while i < gGfxLast.len:
-        gGfxLast[i] = (i == 0)
-        i = i + 1
-    return
-  if gfxUp and postUp:
-    # Both stock panels drawn at once -- the same failure the MODS tab had, and
-    # it happens here when the game switches TO graphics while our subtab still
-    # says postfx. Resolve towards what the strip says. THE OUTCOME, logged
-    # once so a real recurrence is visible without spamming every frame it
-    # persists.
-    if not gGfxBothActiveSaid:
-      gGfxBothActiveSaid = true
-      warn "postfx subtab: BOTH Graphics Settings and PostFX Settings were " &
-           "active at once (activeSelf true/true); forcing back to " &
-           "selection " & $gGfxSel & " so exactly one is up, as the game " &
-           "itself would enforce for its own stock tabs."
-    gfxApply(gGfxSel)
-    return
-  # Which subtab did the player just press? Either strip may be the visible one,
-  # so both are read and a rising edge on either wins.
-  var rising = -1
-  var i = 0
-  while i < 2:
-    let on = (i < gGfxTogA.len and modsToggleIsOn(gGfxTogA[i])) or
-             (i < gGfxTogB.len and modsToggleIsOn(gGfxTogB[i]))
-    if on and i < gGfxLast.len and not gGfxLast[i]:
-      rising = i
-    if i < gGfxLast.len:
-      gGfxLast[i] = on
-    i = i + 1
-  if rising >= 0 and rising != gGfxSel:
-    gfxApply(rising)
-    return
-  # STEADY STATE: the panel that is up must be the one the selection names.
-  if postUp and gGfxSel != 1:
-    gfxApply(gGfxSel)
-    gGfxUpTicks = 0                   # something moved; let it settle again
-    return
-  elif gfxUp and gGfxSel == 1:
-    gfxApply(1)
-    gGfxUpTicks = 0
-    return
-  # NOTHING MOVED THIS FRAME. Only now does the settle count advance, and only
-  # then is a verdict on the finished state meaningful.
-  if gGfxUpTicks < GfxVerdictSettle:
-    gGfxUpTicks = gGfxUpTicks + 1
-  else:
-    gfxVerdict()
-  # THE STOCK-GEOMETRY CHECK, PER PANEL, each on its own settle count. Both are
-  # offered every tick and each one decides for itself whether it is ready:
-  # a panel that is not activeInHierarchy stays PENDING and its counter does
-  # not advance, so the assertion runs the first time that panel is actually
-  # shown -- which for PostFX is the first time the player presses it. The
-  # steady state after both have reported is two boolean tests.
-  #
-  # Separate counters from `gGfxUpTicks` on purpose: that one resets whenever
-  # the feature moves something, which for a check about the GAME's objects
-  # would let our own activity starve it forever.
-  gfxStockGeomVerdictFor(0)
-  gfxStockGeomVerdictFor(1)
-
+  pfxOnPanelUp(modsGoActive(gGfxPostGo))
 proc gfxTick() =
   ## Every frame while armed: the steady state is two `activeSelf` reads and a
   ## handful of guarded byte reads, with no allocation and no call.

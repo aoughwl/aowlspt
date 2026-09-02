@@ -261,7 +261,26 @@ var gNtApplying = false
 ## is NOT one of ours turns ON.
 var gNtForeignOn = false
 var gNtSubVerdictSaid = false
-const NtSubCount = 2
+const NtMaxSubs = 16              ## rule 4: the hard cap on subtabs
+var gNtSubN = 0                   ## how many subtabs were actually built
+## WHAT A SUBTAB SELECTION DOES. Two kinds, one implementation.
+##   NtSubPanels (0) -- step 2: switch between the STOCK Graphics panel and
+##                      ours. The two things being switched are whole panels.
+##   NtSubRows   (1) -- step 3: our panel stays up and its ROWS are swapped,
+##                      because every mod's page lives in the same panel.
+## The alternative for step 3 was one cloned row-container per mod, shown and
+## hidden. That is more objects, more clones and more state for a screen the
+## player sees one page of at a time; swapping rows costs a re-render on each
+## switch and nothing else. Stated because it is a trade, not an obvious win.
+const NtSubPanels = 0
+const NtSubRows = 1
+var gNtSubKind = NtSubPanels
+## Step 3 state: which mod each subtab shows, and where its rows go.
+var gNtSubPageIdx: seq[int] = @[]   ## index into gSwPages, per subtab
+var gNtModsRowRoot: Il2CppPtr = nil ## our MODS panel's _settingsRoot
+var gNtModsPanelIdx = -1            ## which of our tabs is MODS
+var gNtModsOn = false               ## `nativeTabsMods`
+var gNtModsArmed = false            ## the index fetch has been asked for
 var gNtToggleSlotFaults = 0
 
 proc ntNoteFault(what: string) =
@@ -326,7 +345,7 @@ proc ntToggleSetFired(regs: Il2CppPtr) =
   # the first feature. Still O(1)-ish -- two more pointer compares -- and still
   # silent for every foreign toggle.
   var j = 0
-  while j < gNtSubToggle.len and j < NtSubCount:
+  while j < gNtSubToggle.len and j < NtMaxSubs:
     if gNtSubToggle[j] == selfPtr:
       gNtSubPressed = j
       return
@@ -637,6 +656,45 @@ proc ntCollectStockPanels(screenT: Il2CppPtr) =
     gNtStockPanels.add go
     gNtStockWasOn.add false
 
+proc ntModsPageTitles(): (seq[string], seq[int]) =
+  ## The mod pages `modsindex.nim` registered, as captions plus their index in
+  ## `gSwPages`. Filtered on `modGuid` exactly as `modsBuildPages` does, so
+  ## the host's own pages are not mistaken for mods.
+  var caps: seq[string] = @[]
+  var idxs: seq[int] = @[]
+  var i = 0
+  while i < gSwPages.len and caps.len < NtMaxSubs:
+    if gSwPages[i].modGuid.len > 0:
+      caps.add gSwPages[i].title
+      idxs.add i
+    i = i + 1
+  (caps, idxs)
+
+proc ntBuildModsSubtabs(screenT: Il2CppPtr): bool =
+  ## STEP 3: one subtab per mod, inside our own MODS panel.
+  ##
+  ## Runs only once the index fetch has actually produced pages -- it is armed
+  ## on the MODS panel's SHOW EDGE and answered asynchronously on the overlay's
+  ## worker thread, so 'no pages yet' is the normal state for the first few
+  ## frames and is NOT a failure.
+  result = false
+  if gNtSubBuilt or not gNtModsOn: return
+  let (caps, idxs) = ntModsPageTitles()
+  if caps.len == 0:
+    return                       # not yet; the fetch is still in flight
+  ntCrumb("mods: building one subtab per mod")
+  if not ntBuildSubtabs(screenT, caps, NtSubRows):
+    return
+  gNtSubPageIdx = idxs
+  okLog "native mods: built " & $caps.len & " mod subtab(s) from the " &
+        "/aowlspt/settings/index fetch -- ONE top-row MODS tab with the mods " &
+        "as subtabs, not one top-row tab per mod. The fetch was armed on this " &
+        "panel's show edge, is cached for the session, and modSettingsRender " &
+        "stays off: its boot-time per-mod fetch is the character-select " &
+        "crasher this path exists to avoid."
+  ntSubShow(0)
+  result = true
+
 proc ntBuild(): bool =
   result = false
   if gNtBuilt or gNtOff or not gNtOn: return
@@ -697,19 +755,35 @@ proc ntBuild(): bool =
   ntCrumb("build: ntBuildOne")
   if not ntBuildOne(screenT, donorSpawner, donorPanel, "nt-proof", "PROOF"):
     return
+  # STEP 3'S TAB, built through the SAME `defineTab` path as the proof tab --
+  # that is the point of a foundation: a second tab is one more call, not one
+  # more implementation.
+  if gNtModsOn:
+    ntCrumb("build: the MODS tab")
+    if ntBuildOne(screenT, donorSpawner, donorPanel, "nt-mods", "MODS"):
+      gNtModsPanelIdx = gNtPanelGo.len - 1
+      if gNtModsPanelIdx >= 0 and gNtModsPanelIdx < gNtRowRoot.len:
+        gNtModsRowRoot = gNtRowRoot[gNtModsPanelIdx]
+    else:
+      warn "native mods: the MODS tab did not build; step 3 is inert this " &
+           "session and step 1's proof tab is unaffected."
+
   ntCrumb("build: collecting the stock panels under SettingsScreen")
   ntCollectStockPanels(screenT)
   # STEP 2, flag-gated and default OFF: a failure here must not cost step 1.
   if gNtSubOn:
     ntCrumb("build: ntBuildSubtabs")
-    discard ntBuildSubtabs(screenT)
+    discard ntBuildSubtabs(screenT,
+                           @["GRAPHICS SETTINGS", "POSTFX"],
+                           NtSubPanels)
   gNtBuilt = true
   result = true
 
 # ---------------------------------------------------------------------------
 # ACTIVATION -- the one piece of steering we own (doc 4)
 # ---------------------------------------------------------------------------
-proc ntBuildSubtabs(screenT: Il2CppPtr): bool =
+proc ntBuildSubtabs(screenT: Il2CppPtr; captions: seq[string];
+                    kind: int): bool =
   ## STEP 2: the GRAPHICS SETTINGS | POSTFX strip, as a SIBLING of the panels.
   ##
   ## The donor is `Control Settings/Toggles` -- the game's own subtab strip,
@@ -722,17 +796,24 @@ proc ntBuildSubtabs(screenT: Il2CppPtr): bool =
   if gNtSubBuilt or not gNtSubOn: return
   let screenGo = iGameObjectOf(screenT)
   if screenGo == nil: return
-  ntCrumb("subtabs: locating the stock Graphics panel and the strip donor")
-  gNtGfxPanelGo = iGameObjectOf(modsChildNamed(screenT, "Graphics Settings"))
+  ntCrumb("subtabs: locating the strip donor (and, for step 2, the stock panel)")
+  # The stock Graphics panel is only needed by the PANEL-SWITCHING kind. For
+  # the MODS kind there is no second panel: our own panel stays up and its rows
+  # are swapped, so requiring Graphics here would refuse a build that does not
+  # need it.
+  if kind == NtSubPanels:
+    gNtGfxPanelGo = iGameObjectOf(modsChildNamed(screenT, "Graphics Settings"))
   let ctrlPanel = modsChildNamed(screenT, "Control Settings")
   let donorStrip = (if ctrlPanel != nil: modsChildNamed(ctrlPanel, "Toggles")
                     else: nil)
   let donorBtn = (if donorStrip != nil:
                     modsChildNamed(donorStrip, "ControlToggle") else: nil)
-  if gNtGfxPanelGo == nil or donorStrip == nil or donorBtn == nil:
+  if (kind == NtSubPanels and gNtGfxPanelGo == nil) or
+     donorStrip == nil or donorBtn == nil:
     ntNoteFault("subtabs: the stock Graphics panel or the strip donor was " &
                 "not found (" &
-                (if gNtGfxPanelGo == nil: "Graphics-Settings " else: "") &
+                (if kind == NtSubPanels and gNtGfxPanelGo == nil:
+                   "Graphics-Settings " else: "") &
                 (if donorStrip == nil: "Control-Settings/Toggles " else: "") &
                 (if donorBtn == nil: "ControlToggle" else: "") &
                 "). Nothing was added.")
@@ -773,8 +854,8 @@ proc ntBuildSubtabs(screenT: Il2CppPtr): bool =
   gNtSubToggle = @[]
   var made = 0
   var b = 0
-  while b < NtSubCount:
-    let caption = (if b == 0: "GRAPHICS SETTINGS" else: "POSTFX")
+  while b < captions.len and b < NtMaxSubs:
+    let caption = captions[b]
     ntCrumb("subtabs: cloning the '" & caption & "' button")
     ntCallBegin("Object::Instantiate of ControlToggle")
     let btn = modsClone(donorBtnGo)
@@ -799,8 +880,8 @@ proc ntBuildSubtabs(screenT: Il2CppPtr): bool =
     gNtSubToggle.add tog
     made = made + 1
     b = b + 1
-  if made != NtSubCount:
-    ntNoteFault("subtabs: only " & $made & " of " & $NtSubCount & " buttons " &
+  if made != captions.len:
+    ntNoteFault("subtabs: only " & $made & " of " & $captions.len & " buttons " &
                 "came out usable; hiding the strip rather than shipping a " &
                 "half-built one with no way back.")
     discard modsSetActive(stripGo, false)
@@ -808,6 +889,8 @@ proc ntBuildSubtabs(screenT: Il2CppPtr): bool =
     return
   gNtSubStripGo = stripGo
   gNtSubBuilt = true
+  gNtSubN = made
+  gNtSubKind = kind
   gNtSubSel = 0
   discard modsSetActive(stripGo, false)   # raised only while our tab is up
   ntCrumb("subtabs: COMPLETE")
@@ -819,6 +902,55 @@ proc ntBuildSubtabs(screenT: Il2CppPtr): bool =
         "switch. Exclusivity comes from the CLONED ToggleGroup, not from us."
   result = true
 
+proc ntDestroyChildrenOf(rt: Il2CppPtr): int =
+  ## Destroy every child of `rt`, bounded. Used to swap one mod's rows for
+  ## another's -- `Object::Destroy` on a valid object cannot throw, which is
+  ## why this is done by hand rather than through any SettingsTab method (both
+  ## of those were measured to unwind a managed exception through our frame).
+  result = 0
+  if not nuOk(rt, 0x10'i32): return
+  var kids = 0
+  if not iChildCount(rt, kids): return
+  var k = kids - 1
+  while k >= 0 and result < NtMaxRowDestroy:
+    let c = iChildAt(rt, k)
+    k = k - 1
+    if c == nil or not duOk(c, 0x20'i32): continue
+    let go = iGameObjectOf(c)
+    if go == nil: continue
+    if nuDestroy(go): result = result + 1
+
+proc ntRenderModPage(sel: int): int =
+  ## Render the selected mod's page into our MODS panel's row root, replacing
+  ## whatever was there.
+  ##
+  ## THE ROWS ARE THE SAME ONES THE F12 OVERLAY DRAWS. `swRenderPage` is the
+  ## settings-page renderer `settingspages.nim` already owns -- the row clone +
+  ## relabel path that writes each TMP's own LocalizedText and registers it for
+  ## re-assert. Reusing it is the point: a second renderer would drift from the
+  ## first, and the relabel-that-did-not-take defects all came from paths that
+  ## had no re-assert.
+  result = 0
+  if gNtModsRowRoot == nil: return
+  if sel < 0 or sel >= gNtSubPageIdx.len: return
+  let pi = gNtSubPageIdx[sel]
+  if pi < 0 or pi >= gSwPages.len: return
+  let rootGo = iGameObjectOf(gNtModsRowRoot)
+  if rootGo == nil: return
+  let cleared = ntDestroyChildrenOf(gNtModsRowRoot)
+  # `renderedFor` is `swRenderPage`'s own guard against drawing the same page
+  # onto the same tab twice. We DO want it drawn again -- the rows it drew
+  # last time have just been destroyed -- so the bookkeeping is reset rather
+  # than worked around.
+  gSwPages[pi].renderedFor = 0'u64
+  result = swRenderPage(gModsLastTabPtr, rootGo, gSwPages[pi])
+  okLog "native mods: subtab " & $sel & " -> '" & gSwPages[pi].title &
+        "' (" & gSwPages[pi].modGuid & ") rendered " & $result & " row(s) " &
+        "after clearing " & $cleared & ". Rows come from swRenderPage, the " &
+        "same renderer the F12 overlay uses, so they carry its LocalizedText " &
+        "write and its re-assert registration rather than a second copy that " &
+        "could drift."
+
 proc ntSubShow(sel: int) =
   ## Apply the subtab selection: exactly one of the two panels is active.
   ##
@@ -828,6 +960,18 @@ proc ntSubShow(sel: int) =
   ## The strip itself is untouched by this -- it is a sibling of both, so it
   ## cannot be hidden by the thing it switches.
   if not gNtSubBuilt: return
+  if gNtSubKind == NtSubRows:
+    # OUR PANEL STAYS UP; only its rows change. Nothing stock is touched at
+    # all here, which is why this kind needs no panel bookkeeping.
+    gNtApplying = true
+    var m = 0
+    while m < gNtSubToggle.len and m < NtMaxSubs:
+      discard nuAnimToggleSetToggled(gNtSubToggle[m], m == sel)
+      m = m + 1
+    gNtApplying = false
+    gNtSubSel = sel
+    discard ntRenderModPage(sel)
+    return
   let wantOurs = (sel == 1)
   if gNtGfxPanelGo != nil and modsGoActive(gNtGfxPanelGo) == wantOurs:
     discard modsSetActive(gNtGfxPanelGo, not wantOurs)
@@ -838,7 +982,7 @@ proc ntSubShow(sel: int) =
   # the old strip, and the reason `set_IsToggled` exists in the target table.
   gNtApplying = true
   var i = 0
-  while i < gNtSubToggle.len and i < NtSubCount:
+  while i < gNtSubToggle.len and i < NtMaxSubs:
     discard nuAnimToggleSetToggled(gNtSubToggle[i], i == sel)
     i = i + 1
   gNtApplying = false
@@ -852,7 +996,7 @@ proc ntSubVerdict(why: string) =
   var on = 0
   var onIdx = -1
   var i = 0
-  while i < gNtSubToggle.len and i < NtSubCount:
+  while i < gNtSubToggle.len and i < NtMaxSubs:
     let (ok, isOn) = nuToggleIsOn(gNtSubToggle[i])
     if ok and isOn:
       on = on + 1
@@ -864,7 +1008,7 @@ proc ntSubVerdict(why: string) =
                else: "none")
   if on != 1:
     warn "native subtabs VERDICT FAIL (" & why & "): " & $on & " of " &
-         $NtSubCount & " subtabs read m_IsOn=1. Exactly one is the only " &
+         $gNtSubN & " subtabs read m_IsOn=1. Exactly one is the only " &
          "correct answer; 0 means a press never reached m_IsOn and 2 means " &
          "nothing is enforcing exclusivity."
   elif gfxUp and oursUp:
@@ -1039,6 +1183,31 @@ proc ntTickBody() =
       gNtVerdictSaid = false
       gNtWhyNext = "toggle event -- our tab was pressed " &
                    (if isOn: "ON" else: "OFF")
+  # STEP 3: the MODS panel's SHOW EDGE arms the index fetch, ONCE. Never at
+  # boot -- `modSettingsRender` does that and it is the measured
+  # character-select crasher. A session that never opens MODS pays nothing.
+  if gNtModsOn and gNtShown >= 0 and gNtShown == gNtModsPanelIdx:
+    if not gNtModsArmed:
+      gNtModsArmed = true
+      gNtStep = "tick: arming the /aowlspt/settings/index fetch"
+      miArm(cNowMs())
+    # THE FETCH ALSO HAS TO BE ADVANCED. `miTick` is otherwise only called from
+    # `modsTabTickBody`, which is gated on `gModsOn` -- so a session running
+    # step 3 WITHOUT the old MODS tab would arm a fetch that nothing ever
+    # stepped, and wait forever for pages that were never collected. Calling it
+    # from both places is safe: `miTick` returns immediately unless its phase is
+    # `miArmed`, so whichever call takes the body handles it and the other is a
+    # single enum test.
+    gNtStep = "tick: advancing the settings-index fetch"
+    miTick(cNowMs())
+    if not gNtSubBuilt:
+      # The fetch answers on the overlay's worker thread, so the pages arrive a
+      # few frames later. Retried every tick until they do -- this is a cheap
+      # seq scan, not a walk, and it stops the moment the strip is built.
+      gNtStep = "tick: waiting for mod pages, then building subtabs"
+      let screenT2 = modsParentOf(iToTransform(gModsLastTabPtr))
+      if screenT2 != nil:
+        discard ntBuildModsSubtabs(screenT2)
   # A STOCK TAB WAS SELECTED -- hand the screen back. This is the edge that was
   # missing: the stock ToggleGroup clears our toggle silently (no callback for
   # the one it turns off), so our own OFF edge never fires and only this does.
