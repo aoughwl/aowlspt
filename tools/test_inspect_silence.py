@@ -259,6 +259,59 @@ def inv_in_root_exact_only(t):
             % (exact, roots_first, refuses, multiword, both_verbs, stopped))
 
 
+def inv_active_receiver_classified(t):
+    r"""A GameObject pointer must be a VALID input to the active predicate,
+    never a fault.
+
+    MEASURED live 2026-09-02 (the inspector's own out-file), fixture shape:
+
+        in:   assert-active 0x2709c6c2d80
+              # that pointer is a GameObject -- it is what the host's
+              # `native tabs INVENTORY` log line prints as `strip=<ptr>`
+        out:  !! FAULTED (caught; the game survived).
+              LAST HOP: Component::get_gameObject [active]
+              ... fault 1 of 8 before the inspector switches itself off
+
+    while `tree`/`parent` on the SAME pointer refused correctly with "was
+    given a GameObject (klass ...) where a TRANSFORM is required". So the
+    active predicate was the one path that took the Component hop
+    unconditionally, and the most common pointer an agent holds cost a
+    session fault instead of an answer.
+
+    The required outcome is a VERDICT -- PASS or FAIL -- not FAULTED, and not
+    a silent guess. Structurally that means:
+      * a receiver classifier with THREE outcomes exists;
+      * BOTH derivations (the direct call and the independent parent chain)
+        go through it, so they cannot disagree about what kind of object they
+        were handed;
+      * the Component::get_gameObject hop happens ONLY on the Component
+        branch;
+      * a GameObject is converted to a Transform for the climb with
+        GameObject::get_transform, not Component::get_transform;
+      * an unclassifiable receiver is NOTHING EXAMINED -- no verdict.
+    """
+    classifier = ("proc iActiveClassify(" in t
+                  and "ActRecvGameObject" in t
+                  and "ActRecvComponent" in t
+                  and "ActRecvUnknown" in t)
+    both_use = t.count("case iActiveClassify(cur)") >= 2
+    _c = t.find("of ActRecvComponent:")
+    _h = t.find('iMark("Component::get_gameObject [active]"')
+    _g = t.find("of ActRecvGameObject:")
+    hop_gated = (0 < _c < _h and 0 < _g < _c)
+    go_to_tf = ("node = iTransformOfGameObject(cur)" in t
+                and "Component::get_transform [active" not in t)
+    nothing = "active-receiver: NOTHING EXAMINED" in t
+    reported = ("proc iActiveRecvLabel(" in t
+                and "receiver is a GAMEOBJECT" in t
+                and "let recvLine = iActiveRecvLabel(p)" in t)
+    return (classifier and both_use and hop_gated and go_to_tf and nothing
+            and reported,
+            "classifier=%s both_derivations=%s hop_gated=%s go_to_transform=%s "
+            "nothing_examined=%s reported=%s"
+            % (classifier, both_use, hop_gated, go_to_tf, nothing, reported))
+
+
 INVARIANTS = [
     ("no_combined_off_guard", inv_no_combined_off_guard),
     ("flight_report_exists", inv_flight_report_exists),
@@ -271,6 +324,7 @@ INVARIANTS = [
     ("stale_file_not_run", inv_stale_file_not_run),
     ("wordy_root_refused", inv_wordy_root_refused),
     ("active_predicate_is_shared", inv_active_predicate_is_shared),
+    ("active_receiver_classified", inv_active_receiver_classified),
     ("in_root_exact_only", inv_in_root_exact_only),
 ]
 

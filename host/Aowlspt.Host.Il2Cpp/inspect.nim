@@ -2246,6 +2246,50 @@ proc iEnsureActiveFns(): bool =
     gFnParentOfTransform = iTargetFn(idx)
   result = gFnGoOfComponent != nil and gFnActiveInHierarchy != nil
 
+type IActiveRecv = enum
+  ## WHAT KIND OF OBJECT THE ACTIVE PREDICATE WAS HANDED.
+  ##
+  ## MEASURED 2026-09-02: `assert-active 0x2709c6c2d80`, where that pointer is
+  ## the GameObject the host's `native tabs INVENTORY` line prints as
+  ## `strip=<ptr>`, FAULTED inside `Component::get_gameObject [active]` and
+  ## burned "fault 1 of 8" from the session budget -- while `tree`/`parent` on
+  ## the SAME pointer correctly refused it as "a GameObject where a TRANSFORM
+  ## is required". The active predicate was the one path that took the
+  ## Component hop unconditionally, so a GameObject -- the single most common
+  ## pointer an agent has in hand -- was a fault instead of an input.
+  ##
+  ## So classify the receiver BEFORE the first call, exactly as the Transform
+  ## walkers already do. A GameObject is not a broken input to `assert-active`;
+  ## it is the answer's natural receiver.
+  ActRecvGameObject   ## klass is known to be a GameObject -> call get_activeInHierarchy DIRECTLY
+  ActRecvComponent    ## a live Unity object that is not a known GameObject -> Component::get_gameObject hop
+  ActRecvUnknown      ## unreadable / fake-null -> NOTHING EXAMINED, no verdict
+
+proc iActiveClassify(cur: Il2CppPtr): IActiveRecv =
+  ## Three outcomes, never two. `ActRecvUnknown` is a REFUSAL, not "inactive":
+  ## nothing was examined, so nothing is known.
+  ##
+  ## The GameObject test is the same learned klass blacklist `iRefuseIfGameObject`
+  ## uses (`gGoKlass`, populated only from pointers a target returned as a
+  ## GameObject BY CONTRACT), so this classification cannot disagree with the
+  ## refusal `tree`/`parent` print about the same pointer.
+  if cur == nil or not duOk(cur, 0x20'i32) or not iUnityAlive(cur):
+    return ActRecvUnknown
+  if iIsGameObject(cur):
+    return ActRecvGameObject
+  result = ActRecvComponent
+
+proc iActiveRecvLabel(cur: Il2CppPtr): string =
+  ## One line naming which receiver path was taken, for the verbs that report
+  ## a single pointer. Silent on the ordinary Component case.
+  case iActiveClassify(cur)
+  of ActRecvGameObject:
+    "  receiver is a GAMEOBJECT -> called GameObject::get_activeInHierarchy " &
+    "directly (no Component::get_gameObject hop)"
+  of ActRecvComponent: ""
+  of ActRecvUnknown:
+    "  receiver could not be classified -- NOTHING EXAMINED"
+
 proc iActiveInHierarchy(cur: Il2CppPtr): (bool, bool) =
   ## (ok, active). `activeInHierarchy` rather than `activeSelf`: a node that
   ## is itself active but sits under an inactive ancestor is still
@@ -2257,12 +2301,20 @@ proc iActiveInHierarchy(cur: Il2CppPtr): (bool, bool) =
   result = (false, false)
   if not iEnsureActiveFns():
     return
-  if not duOk(cur, 0x20'i32) or not iUnityAlive(cur):
+  var go = cur
+  case iActiveClassify(cur)
+  of ActRecvUnknown:
     return
-  iMark("Component::get_gameObject [active]", cur)
-  let go = cast[Il2CppPtr](cInspUP(gFnGoOfComponent, cur, nil))
-  if not duOk(go, 0x20'i32) or not iUnityAlive(go):
-    return
+  of ActRecvGameObject:
+    # ALREADY the GameObject. Taking the Component hop here is the measured
+    # fault: `Component::get_gameObject` on a GameObject reads a Component's
+    # fields off a GameObject's layout.
+    discard
+  of ActRecvComponent:
+    iMark("Component::get_gameObject [active]", cur)
+    go = cast[Il2CppPtr](cInspUP(gFnGoOfComponent, cur, nil))
+    if not duOk(go, 0x20'i32) or not iUnityAlive(go):
+      return
   iMark("GameObject::get_activeInHierarchy", go)
   let act = cInspUP(gFnActiveInHierarchy, go, nil)
   result = (true, (act and 1'u64) != 0'u64)
@@ -2296,7 +2348,27 @@ proc iActiveChainDerived(cur: Il2CppPtr; blocker: var string): (bool, bool) =
     return
   if gFnActiveSelfOfGo == nil or gFnParentOfTransform == nil:
     return
+  # `node` must be a TRANSFORM: the climb calls Component::get_gameObject and
+  # Transform::get_parent on it. A GameObject receiver is converted with
+  # GameObject::get_transform first -- NOT Component::get_transform, which is
+  # the same type confusion in the other direction.
   var node = cur
+  case iActiveClassify(cur)
+  of ActRecvUnknown:
+    return
+  of ActRecvGameObject:
+    iMark("GameObject::get_activeSelf [active chain, GO receiver]", cur)
+    let a0 = cInspUP(gFnActiveSelfOfGo, cur, nil)
+    if (a0 and 1'u64) == 0'u64:
+      blocker = iObjName(cur)
+      return (true, false)
+    node = iTransformOfGameObject(cur)
+    if node == nil or not duOk(node, 0x20'i32) or not iUnityAlive(node):
+      # Its own activeSelf is true but the ancestors were never examined ->
+      # NO verdict. Returning "active" here would be a check that cannot fail.
+      return
+  of ActRecvComponent:
+    discard
   var hops = 0
   while hops < InspActiveClimbMax:
     if not duOk(node, 0x20'i32) or not iUnityAlive(node):
@@ -2336,6 +2408,11 @@ proc iActiveInHierarchyChecked(cur: Il2CppPtr; note: var string): (bool, bool) =
   ## instruments is lying and picking a winner would just pick a lie; only one
   ## available -> that one, noted.
   note = ""
+  if iActiveClassify(cur) == ActRecvUnknown:
+    note = "active-receiver: NOTHING EXAMINED for " & iPtr(cur) &
+           " -- it is not readable, or its native half is gone (Unity " &
+           "fake-null). No active/inactive verdict was formed."
+    return (false, false)
   let (callOk, callAct) = iActiveInHierarchy(cur)
   var blocker = ""
   let (chainOk, chainAct) = iActiveChainDerived(cur, blocker)
@@ -7114,6 +7191,12 @@ proc iCmdAssertActive(toks: seq[string]) =
   # two instruments cannot answer differently about the same pointer -- which
   # is the defect this replaced: a findtext HIT presented as pressable while
   # `assert-active` on the same card said activeInHierarchy=false.
+  # SAY WHICH RECEIVER PATH WAS TAKEN. A GameObject pointer is a VALID input
+  # here -- it used to fault (see `IActiveRecv`) -- and the reader deserves to
+  # know that no Component hop happened.
+  let recvLine = iActiveRecvLabel(p)
+  if recvLine.len > 0:
+    iOut(recvLine)
   var actNote = ""
   let (okq, act) = iActiveInHierarchyChecked(p, actNote)
   if not okq:
