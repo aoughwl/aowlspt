@@ -112,6 +112,8 @@ proc cNuV3OutPtr(): Il2CppPtr {.importc: "aowl_nu_v3out_ptr", nodecl.}
 proc cNuV3OutX(): float32 {.importc: "aowl_nu_v3out_x", nodecl.}
 proc cNuV3OutY(): float32 {.importc: "aowl_nu_v3out_y", nodecl.}
 proc cNuV3OutZ(): float32 {.importc: "aowl_nu_v3out_z", nodecl.}
+proc cNuCallVPBB(fn, self: Il2CppPtr; a0, a1: int32) {.
+  importc: "aowl_nu_call_v_pbb", nodecl.}
 proc cNuCallPS3PPB(fn, a0, a1: Il2CppPtr; a2: int32): Il2CppPtr {.
   importc: "aowl_nu_call_p_s3ppb", nodecl.}
 proc cNuCallVPFFP(fn, self: Il2CppPtr; a0, a1: float32; a2: Il2CppPtr) {.
@@ -902,6 +904,25 @@ proc nuToggleSetGroup*(toggle, group: Il2CppPtr): bool =
   let fn = nuFn(NuTToggleSetGroup)
   if fn == nil: return
   cNuCallVPP(fn, toggle, group)
+  true
+
+proc nuTogglePress*(toggle: Il2CppPtr; on: bool): bool =
+  ## `Toggle::Set(value, sendCallback: true)` -- a REAL press.
+  ##
+  ## sendCallback=true is the whole point: it runs the game's own
+  ## onValueChanged and lets the ToggleGroup enforce exclusivity, which is what
+  ## a proof of selection has to exercise. Writing `m_IsOn` raw would prove
+  ## nothing about the screen -- that is the mistake the subtab strip made, and
+  ## it is why its verdict passed while the wrong panel was showing.
+  ##
+  ## Our own `Toggle::Set` postfix ignores sendCallback=false, so this press
+  ## DOES re-enter it -- which is correct here: the tick must see the press it
+  ## just made exactly as it would see the player's.
+  result = false
+  if not gNuOn or not nuOk(toggle, NuOffToggleIsOn + 4'i32): return
+  let fn = nuFn(NuTToggleSet)
+  if fn == nil: return
+  cNuCallVPBB(fn, toggle, (if on: 1'i32 else: 0'i32), 1'i32)
   true
 
 proc nuToggleIsOn*(toggle: Il2CppPtr): (bool, bool) =

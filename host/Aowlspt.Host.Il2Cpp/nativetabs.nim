@@ -42,7 +42,17 @@
 
 const NtMaxFaults = 4
 const NtMaxTabs = 4              ## how many tabs this file will own at once
-const NtMaxReap = 32             ## rule 4 on the fact-#93 reap walk
+const NtMaxReap = 32             ## rule 4 on the fact-#93 spawner reap
+## THE PANEL EMPTY WALK GETS ITS OWN, LARGER CAP -- and this is why.
+##
+## MEASURED: '32 of 40 donor row(s) destroyed'. The two walks were sharing
+## `NtMaxReap`, which is sized for a spawner clone's handful of children, and
+## the Game Settings panel has 40 rows. So 8 survived, silently, and our tab
+## would have shown eight of the donor's settings under its own name.
+##
+## Raised, still bounded (rule 4), and the caller now REPORTS hitting it --
+## a cap that can be reached without saying so is how the 8 got through.
+const NtMaxRowDestroy = 256
 
 ## `gNtOn` / `gNtOff` are declared in `aowlhost.nim` beside the other feature
 ## flags, NOT here. `modstab.nim`'s rider gate must test `gNtOn`, and modstab is
@@ -177,6 +187,32 @@ var gNtShown = -1                     ## index of the tab currently showing
 ## postfix itself does the absolute minimum -- compare `this` against our
 ## table and record an index -- because it runs on the game's click path.
 var gNtPressed = -1
+## THE SELECTION PROOF (`nativeTabsProofSelect`).
+##
+## Step 1 is not proven by a tab EXISTING. The first live build produced a
+## real spawner, a real cloned panel and byte-identical stock geometry -- and
+## the verdict still read `selection=-1`, because nothing had ever pressed our
+## toggle. 'It is on screen' and 'selecting it shows our panel and only ours'
+## are different claims, and only the second is the one doc 4/6 makes.
+##
+## So the proof presses its own toggle through `Toggle::Set(true, true)` --
+## sendCallback TRUE, so the game's own onValueChanged and the stock
+## ToggleGroup run exactly as they would for the player -- then judges, then
+## presses GAME back and judges again. Both directions, because a tab that
+## takes the screen and never gives it back is a worse defect than one that
+## never takes it.
+##
+## Frame-separated on purpose: a panel switched this frame is not laid out
+## until the next, and judging on the switching frame is what produced the
+## meaningless '6 panels active'.
+var gNtProofOn = false            ## `nativeTabsProofSelect`, default ON
+var gNtGameToggle: Il2CppPtr = nil ## the stock GAME tab's toggle, for the way back
+var gNtProofPhase = 0             ## 0 idle .. 6 done
+var gNtProofWait = 0
+## Why the NEXT verdict is being taken. Set by whatever prompted it, so every
+## verdict line names its occasion rather than all of them saying the same word.
+var gNtWhyNext = "steady state"
+const NtProofSettle = 20          ## frames to let a switch settle before judging
 var gNtToggleSlotFaults = 0
 
 proc ntNoteFault(what: string) =
@@ -305,6 +341,10 @@ proc ntBuildOne(screenT, donorSpawnerT, donorPanelT: Il2CppPtr;
   #
   # `modsComponent` REFUSES a GameObject receiver up front, so the component
   # is resolved through it rather than by assuming the Transform will do.
+  # THE STOCK GAME TOGGLE, for the proof's way back. Captured from the DONOR
+  # spawner (the one we cloned), because after our tab joins the stock group
+  # pressing GAME is the only way to hand the screen back.
+  gNtGameToggle = modsToggleOf(donorSpawnerT)
   ntCrumb("button: resolving the donor UIAnimatedToggleSpawner component")
   let donorSpawner = modsComponent(donorSpawnerT, "UIAnimatedToggleSpawner")
   if donorSpawner == nil:
@@ -428,7 +468,7 @@ proc ntBuildOne(screenT, donorSpawnerT, donorPanelT: Il2CppPtr;
     # frame so the child list does not shift under us, but iterating down is
     # correct either way and costs nothing.
     var k = kids - 1
-    while k >= 0 and destroyed < NtMaxReap:
+    while k >= 0 and destroyed < NtMaxRowDestroy:
       let c = iChildAt(rowRoot, k)
       k = k - 1
       if c == nil or not duOk(c, 0x20'i32): continue
@@ -437,6 +477,18 @@ proc ntBuildOne(screenT, donorSpawnerT, donorPanelT: Il2CppPtr;
       if nuDestroy(go):
         destroyed = destroyed + 1
   ntCallEnd()
+  if destroyed >= NtMaxRowDestroy:
+    warn "native tabs: the panel-empty walk hit its " & $NtMaxRowDestroy &
+         "-row cap, so donor rows MAY REMAIN under our tab. Reported rather " &
+         "than left to be noticed on screen -- the previous cap was 32 and " &
+         "quietly left 8 of 40 behind."
+  let leftOver = kids - destroyed
+  if leftOver > 0:
+    warn "native tabs: " & $leftOver & " of " & $kids & " child(ren) under " &
+         "_settingsRoot were NOT destroyed. They are the ones whose " &
+         "Transform or GameObject could not be read, or that Object::Destroy " &
+         "refused -- not a cap. If they render, our tab shows that many of " &
+         "the donor's rows."
   okLog "native tabs: '" & header & "' panel clone emptied WITHOUT calling " &
         "any SettingsTab method -- " & $destroyed & " of " & $kids &
         " donor row(s) destroyed under _settingsRoot via Object::Destroy. " &
@@ -588,39 +640,66 @@ proc ntHide() =
       discard modsSetActive(gNtStockPanels[i], true)
     i = i + 1
 
-proc ntVerdict() =
-  ## THE FINISHED-STATE TEST (doc 4/6), read off the live tree. Exactly one
-  ## panel under SettingsScreen is active, and it is the one our selection
-  ## names. Zero or two is FAIL. Three outcomes.
-  if gNtVerdictSaid or not gNtBuilt: return
-  var active = 0
-  var oursActive = false
+proc ntActivePanelNames(oursActive: var bool): (int, string) =
+  ## How many panels under SettingsScreen are active, AND WHICH. Naming them
+  ## is not decoration: the first verdict said '6 panels are active at once'
+  ## and there was no way to tell whether that was six stock panels the game
+  ## had not settled yet, or six of ours. A count alone cannot distinguish a
+  ## real defect from a moment measured too early.
+  oursActive = false
+  var n = 0
+  var names = ""
   var i = 0
   while i < gNtStockPanels.len and i < 24:
-    if modsGoActive(gNtStockPanels[i]): active = active + 1
+    if modsGoActive(gNtStockPanels[i]):
+      n = n + 1
+      names = names & (if names.len > 0: ", " else: "") &
+              iObjName(gNtStockPanels[i]) & " (stock)"
     i = i + 1
   var k = 0
   while k < gNtPanelGo.len and k < NtMaxTabs:
     if modsGoActive(gNtPanelGo[k]):
-      active = active + 1
+      n = n + 1
       oursActive = true
+      names = names & (if names.len > 0: ", " else: "") &
+              (if k < gNtId.len: gNtId[k] else: "?") & " (OURS)"
     k = k + 1
+  (n, names)
+
+proc ntVerdict(why: string) =
+  ## THE FINISHED-STATE TEST (doc 4/6), read off the live tree: exactly one
+  ## panel under SettingsScreen is active, and it is the one our selection
+  ## names. Zero or two is FAIL. Three outcomes.
+  ##
+  ## NEVER ON THE BUILD FRAME. The first live run judged the screen 63ms after
+  ## building and reported '6 panels active' -- true at that instant and
+  ## meaningless, because the game had not yet settled its own tab selection
+  ## (acceptance measured 1 of 5 on the same screen moments later) and our
+  ## toggle had never been pressed (selection=-1). A verdict taken before the
+  ## thing it judges has happened is not a failing check, it is a wrong one.
+  ## `why` names the occasion, so every verdict line says what prompted it.
+  if gNtVerdictSaid or not gNtBuilt: return
+  var oursActive = false
+  let (active, names) = ntActivePanelNames(oursActive)
   gNtVerdictSaid = true
   if active == 1 and gNtShown >= 0 and oursActive:
-    okLog "native tabs VERDICT PASS: our tab is selected and OUR panel is the " &
-          "only active panel under SettingsScreen. Read back off the live " &
-          "GameObjects, not from what we wrote."
+    okLog "native tabs VERDICT PASS (" & why & "): our tab is selected and " &
+          "OUR panel is the only active panel under SettingsScreen -- " &
+          names & ". Read back off the live GameObjects, not from what we " &
+          "wrote."
   elif active == 1 and gNtShown < 0 and not oursActive:
-    okLog "native tabs VERDICT PASS: a stock tab is selected and exactly one " &
-          "STOCK panel is active; ours is off. The stock screen is undisturbed."
+    okLog "native tabs VERDICT PASS (" & why & "): a stock tab is selected " &
+          "and exactly one STOCK panel is active -- " & names & ". Ours is " &
+          "off. The stock screen is undisturbed."
   elif active == 0:
-    warn "native tabs VERDICT FAIL: NO panel under SettingsScreen is active, " &
-         "so the screen is blank. Our selection says " & $gNtShown & "."
+    warn "native tabs VERDICT FAIL (" & why & "): NO panel under " &
+         "SettingsScreen is active, so the screen is blank. Our selection " &
+         "says " & $gNtShown & "."
   else:
-    warn "native tabs VERDICT FAIL: " & $active & " panels are active at once " &
-         "under SettingsScreen (ours active=" & $oursActive & ", selection=" &
-         $gNtShown & "). Exactly one is the only correct answer."
-
+    warn "native tabs VERDICT FAIL (" & why & "): " & $active & " panels " &
+         "are active at once under SettingsScreen -- " & names &
+         " (ours active=" & $oursActive & ", selection=" & $gNtShown &
+         "). Exactly one is the only correct answer."
 proc ntTickBody() =
   ## Every frame while armed. Steady state: two boolean tests and, once built,
   ## one integer compare -- the press arrives from the detour, not from a hunt.
@@ -672,9 +751,63 @@ proc ntTickBody() =
     if ok:
       if isOn: ntShow(idx)
       else: ntHide()
+      # RE-JUDGE ON THE EVENT, which is what doc 4 actually asks for: the
+      # verdict follows a selection change, not a frame counter.
       gNtVerdictSaid = false
-  gNtStep = "tick: verdict (reading panel activeSelf off the live tree)"
-  ntVerdict()
+      gNtWhyNext = "toggle event -- our tab was pressed " &
+                   (if isOn: "ON" else: "OFF")
+  gNtStep = "tick: proof / verdict"
+  # THE PROOF, one bounded step per frame. Each phase waits `NtProofSettle`
+  # frames before judging, because a panel switched this frame is not laid out
+  # until the next -- judging on the switching frame is exactly what produced
+  # the meaningless '6 panels active' reading.
+  if gNtProofOn and gNtProofPhase < 6:
+    if gNtProofWait > 0:
+      gNtProofWait = gNtProofWait - 1
+    elif gNtProofPhase == 0:
+      # Let the GAME's own tab selection settle first, and judge THAT: the
+      # stock screen must be sane before we touch it, or a later failure
+      # cannot be attributed to us.
+      gNtVerdictSaid = false
+      ntVerdict("before we press anything -- the stock screen as the game left it")
+      gNtProofPhase = 1
+      gNtProofWait = 2
+    elif gNtProofPhase == 1:
+      if gNtToggle.len > 0 and nuTogglePress(gNtToggle[0], true):
+        okLog "native tabs PROOF: pressed OUR tab through " &
+              "Toggle::Set(true, sendCallback=true) -- the game's own " &
+              "onValueChanged and the stock ToggleGroup run exactly as they " &
+              "would for the player. Judging in " & $NtProofSettle & " frames."
+      else:
+        warn "native tabs PROOF: could not press our own toggle; the " &
+             "selection half of step 1 is UNPROVEN."
+        gNtProofPhase = 5
+      gNtProofPhase = (if gNtProofPhase == 5: 5 else: 2)
+      gNtProofWait = NtProofSettle
+    elif gNtProofPhase == 2:
+      gNtVerdictSaid = false
+      ntVerdict("after pressing OUR tab -- expect exactly one active, ours")
+      gNtProofPhase = 3
+      gNtProofWait = 2
+    elif gNtProofPhase == 3:
+      if gNtGameToggle != nil and nuTogglePress(gNtGameToggle, true):
+        okLog "native tabs PROOF: pressed the stock GAME tab back. A tab " &
+              "that takes the screen and never returns it is a worse defect " &
+              "than one that never takes it, so both directions are judged."
+      else:
+        warn "native tabs PROOF: the stock GAME toggle was not available, so " &
+             "the way BACK is unproven. Our panel may still be up."
+      gNtProofPhase = 4
+      gNtProofWait = NtProofSettle
+    elif gNtProofPhase == 4:
+      gNtVerdictSaid = false
+      ntVerdict("after pressing GAME back -- expect exactly one active, stock")
+      gNtProofPhase = 6
+    elif gNtProofPhase == 5:
+      gNtProofPhase = 6
+    return
+  ntVerdict(gNtWhyNext)
+  gNtWhyNext = "steady state"
   gNtStep = "tick: idle"
 
 proc ntBindToggleEvent(verbose: bool): bool =

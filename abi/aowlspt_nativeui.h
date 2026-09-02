@@ -1230,6 +1230,16 @@ static float aowl_nu_call_f_p(void* fn, void* self, float defVal) {
     if (!fn || !self) return defVal;
     return ((AowlNu_F_P)fn)(self, NULL);
 }
+/* INSTANCE, (bool, bool) -> void. `Toggle::Set(value, sendCallback)`.
+ * sendCallback=1 is a REAL press: it runs the game's own onValueChanged and
+ * the ToggleGroup's exclusivity, which is exactly what a proof of selection
+ * must exercise -- setting m_IsOn raw proves nothing about the screen. */
+typedef void (*AowlNu_V_PBB)(void*, unsigned char, unsigned char, void*);
+static void aowl_nu_call_v_pbb(void* fn, void* self, int32_t a0, int32_t a1) {
+    if (!fn || !self) return;
+    ((AowlNu_V_PBB)fn)(self, (unsigned char)(a0 ? 1 : 0),
+                       (unsigned char)(a1 ? 1 : 0), NULL);
+}
 /* The generic shape. A NULL MethodInfo* is REFUSED rather than passed: the
  * shared body dereferences it at +0x38, so a NULL there is an immediate access
  * violation with nothing learned. */

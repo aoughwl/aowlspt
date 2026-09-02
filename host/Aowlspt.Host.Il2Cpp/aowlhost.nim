@@ -9156,6 +9156,11 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   # the postfx subtab below, and binds ONE read-only detour on
   # UnityEngine.UI.Toggle::Set for the tab-press event.
   gNtFlagOn = readBoolKey("nativeTabs")
+  # THE SELECTION PROOF, default ON while step 1 is being proven: after the tab
+  # builds it presses its own toggle, judges, presses GAME back and judges
+  # again. "The tab exists" is not the claim doc 4 makes; "selecting it shows
+  # our panel and only ours" is.
+  gNtProofOn = readBoolKeyDef("nativeTabsProofSelect", true)
   gNtOn = gNtFlagOn
   if gNtOn and not gSettingsUiProbe:
     gSettingsUiProbe = true
