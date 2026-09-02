@@ -7617,3 +7617,17 @@ during the raid load again (Crash_2026-09-02_130231246, GameAssembly .text,
 liveness walk). So step 3 (the MODS tab) is not the cause. Both crashing
 boots had Settings opened before the raid; the raid that loaded at 08:13
 never opened Settings. Step 2 (same build, Settings never opened) running.
+
+## 2026-09-02 09:30: liveness crash bisect, step 2 -- the build itself dies at menu arrival
+
+MEASURED (build 4,784,128): Settings never opened, no raid: the client died
+at menu arrival (Crash_2026-09-02_130410862): `SeasonWidgetData::From
+@0x141ffd0+0x133 <- MenuScreen::Show(5-arg) @0x15387a0+0x994`, the crash
+family fixed in modeskip (whose tick+1 Submit fired normally at 27.45s).
+The host's last line: `uihooks: FIRST show event -- EFT.UI.MenuScreen::Awake
+on thread 9812 -- Unity's main thread`. The raidexit ladder build made
+uihooks sites 1 (MenuScreen::Awake) and 2 wanted whenever the inspector is
+on; site 1 was never bound on any surviving build tonight. Awake runs
+immediately before Show. Bisect step 3 (liveInspector off, which un-wants
+both) running. The two raid-load liveness crashes on this build are
+presumed the same cause until shown otherwise.
