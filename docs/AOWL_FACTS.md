@@ -7745,3 +7745,59 @@ a shared detour target, a second detour on the same function, a clobbered
 register or a per-call allocation. This is an absence of evidence from a static
 audit, not proof of innocence — but it agrees with the minidump, which put the
 menu-arrival fault in modeskip's Submit race.
+
+## 2026-09-02: the minidump names the crash -- Submit hands MenuScreen::Show an unpopulated selection
+
+MEASURED, `tools/dmpread.py` on `Crash_2026-09-02_131229783` (menu arrival, the
+4,737,536 build, no site 1 ever bound):
+
+    ACCESS_VIOLATION at 0x7ffb3ee80103 -- a READ of 0x21 faulted
+    Rax=1  Rcx=1  Rdx=0
+
+The faulting instruction is `mov r8,[rax+0x20]` inside
+`SeasonWidgetData::From(Profile, SeasonalRewardController)`: **the Profile
+argument is the integer 1 and the SeasonalRewardController is NULL.** So
+`MenuScreen::Show(5-arg)` was entered by the game's own `MainMenuShowOperation`
+with a selection that had never been built -- and that flow starts from
+modeskip's `Submit`.
+
+**Calling `CharacterSelectionScreenController::Submit` at its RVA skips the work
+the game does between a player's click and `Show`.** The showing-1 tick+1 rule
+made the crash RARER, not impossible: roughly 4 deaths against 5 survivals with
+the rule in place. Recorded because it is the general lesson: **a timing rule
+cannot fix a missing step**, and "rarer" was twice mistaken for "fixed" in one
+night. Both earlier explanations in this file -- the millisecond race, and later
+the tick phase -- described real correlations and neither was the cause.
+
+modeskip now answers the screen the way a player does: `ShowSlot` hands it the
+SLOT VIEW in RDX and the screen in RCX, and it presses that slot's own `Apply`
+(`EFT.UI.DefaultUIButton`) through the same OnClick path the raid-entry steps
+use -- the route `tools/entergame.py` has always used and which is verified live.
+The game then runs its own selection flow. The `ShowSlot` capture is kept only to
+learn WHICH slot matches `launchProfileId`. `Submit`'s row stays in
+`aowl_msk_targets` (removing it would renumber the rows below it) and nothing
+calls it.
+
+The readback is an EVENT, not a self-comparison: `MenuScreen::Show` (uihooks
+site 2) firing after the press. If it does not fire within 900 drain ticks the
+host says NO READBACK and prints a census of what is active under the selection
+screen, rather than reporting the press as success -- which is exactly what the
+old `Submit` path did, right up to the crash.
+
+**Separately, and NOT the fix:** site 1 (`MenuScreen::Awake`) is no longer wanted
+by anything. It had never been bound on any surviving build, a build that wanted
+it died 3/3, and an inspector-off boot of the same build survived -- but the
+4,737,536 build, which never wanted it, died the same way with the inspector on.
+So dropping it is right on the evidence available (nothing needs it, no survivor
+ever had it) and it is NOT established as a cause.
+
+## 2026-09-02 11:00: acceptance 12/12 PASS live on the 4,737,536 build
+
+MEASURED: `acceptance.py run --no-launch --keep --mods-built`: past mode
+selector, Settings opened (active), 4 stock tabs, 1 native tab clone (=
+the host's `built the 'PROOF' tab`), 0 donor captions on cloned rows, 0
+rendered placeholders, exactly one toggle ON in the 6-toggle row group,
+PostFX strip a direct child of SettingsScreen with 4 children, 2 subtabs one
+group one ON, exactly one panel active, 0 fault-caught lines, strict JSON
+index. So native subtabs work on this build; the 09:05 "no strip" was
+specific to the 4,784,128 build.
