@@ -6768,3 +6768,92 @@ character screen. natesp's MENU means "no GameWorld cached" and is true on
 the loading screen, the slot screen and the menu alike. The main-menu proof
 is the MenuScreen::Show epoch line (uihooks site 2); run.py is being taught
 to require it.
+
+## 2026-09-02: the MODS row captions reverted AFTER the check that passed
+
+MEASURED (live inspector, build 4,717,056, Settings open):
+`findtext Interface language $settings 40000` returned FOUR hits -- one genuine
+`Text` under `Settings Drop Down(Clone)` (the stock Game-tab row, which shows
+that caption legitimately) and THREE `Text` nodes under
+`Settings Drop Down(Clone)(Clone)`, all `activeInHierarchy=true`. The
+`(Clone)(Clone)` nodes are our cloned rows, and they still read the row donor's
+caption.
+
+MEASURED in the host log at the same time: `modsRelabelRow` reported success for
+every one of those rows -- "written to all N of the clone's TextMeshProUGUI;
+none still read the donor's".
+
+**Both statements were true, at different times.** `modsRelabelRow` re-reads
+every TMP under the clone microseconds after writing it, so its negative check
+is honest; then the row's inherited `LocalizedText` re-applies its key on the
+next refresh (a subtab `SetActive(true)` on re-select reliably triggers one) and
+puts the donor's caption back. This is a new shape of the 9b failure: not a
+check that cannot fail, but a check taken **before the only event that could
+make it fail**. A one-shot write against a system that re-applies on its own
+schedule is not a write.
+
+Why nothing put it back: `modsRelabelLike` (the tab/subtab BUTTON captions) has
+always registered its writes in `gModsLabelTmp`/`gModsLabelText` so
+`modsReassertLabels` can re-apply them on its 60-frame poll. **`modsRelabelRow`
+never registered anything**, so the poll only ever guarded the buttons and every
+row reverted unwatched. Rows now register too.
+
+Three further defects found in the same path by reading it against this
+measurement, each of which could report a clean build having proved nothing:
+
+* `modsRelabelRow`'s verdict was `stale == 0`, guarded by
+  `donorCaption.len > 0`. With **no** donor caption `stale` can never
+  increment, so the verdict was an unconditional PASS about a test that did
+  not run. Now INCONCLUSIVE, and success additionally requires that at least
+  one TMP reads the new text -- an all-blank row was passing.
+* a **null row donor** skipped the entire re-assert loop while the summary line
+  still read "re-asserted 0 row caption(s) (0 did not take)". "0 failed" and
+  "0 examined" now print as different facts.
+* `modsReassertLabels` passed `nil` as `swRelabelControl`'s control, which skips
+  `LocalizedText::SetLabelText @0x140FE70` and leaves only
+  `TMP_Text::set_text @0x51BC1E0`. It re-applied our string to the TMP while
+  leaving the LocalizedText source holding the donor's key -- re-applying
+  everything except the thing doing the clobbering. The control is now carried
+  per label in `gModsLabelCtrl`.
+
+`ModsMaxLabels` was 24, sized for the tab button plus subtabs. With rows
+registering (up to `cSwMaxRows` = 48 a page) that cap would silently stop
+recording after the first few rows, which looks exactly like a feature that
+worked. Now 192.
+
+`tools/acceptance.py` asserted `no donor caption under MODS` as **zero**
+occurrences of "Interface language" anywhere under `$settings`. That is false by
+construction -- the stock row shows it -- so the assertion could never pass on a
+correct build. It is now scoped to hits whose `parent` contains `(Clone)(Clone)`,
+and the **stock hit is its own positive control**: zero hits anywhere means
+findtext is not reading the caption, which is INCONCLUSIVE, not PASS.
+
+## 2026-09-02: there is NO second showing of the character screen -- answer showing 1, one tick late
+
+MEASURED on the 4,736,512-byte build, which answered showing 2 by design:
+`[0:00:27.844] ShowSlot first fired`, `the match captured on showing 1 is
+DISCARDED`, `SHOWING 1 ... closed on this frame -- 3 ShowSlot call(s)` -- and
+then **nothing for 3+ minutes**: no showing 2, no Submit, no
+`MenuScreen::Show`, mods still HELD, the client parked on the character screen.
+
+So the "~372 ms re-show" that older comments in `modeskip.nim` lean on **does not
+happen by itself on this build**. Re-reading the surviving boots with that in
+hand: their `after 15-31ms` was showing 1 answered one or two drain ticks after
+its burst, and the crashing boot's `after 0ms` was showing 1 answered in the
+SAME tick as its burst. The whole difference between a dead client and a live
+one was tick phase.
+
+**The rule, with no clock in it:** answer showing 1, on the first drain tick
+that sees NO ShowSlot after the run of ticks that did. A tick that sees slots
+EXTENDS the burst (so a showing spanning several frames is one showing, not
+several) and submits nothing; the first empty tick closes it and is the tick the
+answer goes out on. Unit = a drain tick, i.e. an observed frame, because
+milliseconds are exactly what decided crash-vs-survive. The per-showing counters
+stay, so if this client ever does produce a showing 2 the log says so instead of
+this note being believed forever. `ModeSkipAnswerBurst` is now 1; the
+decline-if-it-never-comes branch is unreachable at that value and says so.
+
+Also worth keeping: the "false settle" in the same run -- run.py reported
+REACHED MENU off natesp's no-GameWorld phase while the client was still on the
+character screen. A readiness signal borrowed from an unrelated feature is not a
+readiness signal.

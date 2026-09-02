@@ -195,7 +195,7 @@ const
     ## after this many answers the feature stops answering and says so, because
     ## an unbounded answer loop against a screen that keeps coming back would
     ## be exactly the kind of thing that must never run in a live client.
-  ModeSkipAnswerBurst = 2
+  ModeSkipAnswerBurst = 1
     ## WHICH SHOWING OF THE SCREEN IS ANSWERED. Not the first.
     ##
     ## MEASURED 2026-09-02: the client died at 48 s in
@@ -219,19 +219,29 @@ const
     ## .ctor` rule added earlier CANNOT have shortened this. It only ever
     ## BLOCKS a re-answer; the first answer's path does not read it.)
     ##
-    ## So the gate is now an EVENT COUNT, not a clock: answer the SECOND
-    ## showing. A showing ("burst") is a group of `ShowSlot` calls not
-    ## separated by a `TarkovApplication::Update` tick -- a FRAME boundary,
-    ## which is an observable event and does not rot with the frame rate the
-    ## way a millisecond threshold does. The client's own second Show, the one
-    ## its flow performs ~372 ms later, is burst 2.
+    ## ANSWERING THE SECOND SHOWING WAS TRIED, AND THERE IS NO SECOND SHOWING.
+    ## MEASURED on the very next build: `SHOWING 1 ... 3 ShowSlot call(s)`, the
+    ## match discarded as designed -- and then nothing at all for over three
+    ## minutes. No showing 2, no Submit, no `MenuScreen::Show`, mods still
+    ## HELD, the client parked on the character screen. The "~372 ms re-show"
+    ## this file's older comments lean on does NOT happen by itself here; the
+    ## boots that survived were showing 1 answered a tick or two after its
+    ## burst, and the boot that died was showing 1 answered in the SAME tick.
+    ##
+    ## So this is 1: answer the FIRST showing, but never on the tick its burst
+    ## ends -- see the deferral in `modeSkipDrainTick`. The unit is a DRAIN
+    ## TICK (an observed frame), not a millisecond, because tick phase is
+    ## precisely what decided crash-vs-survive before. The counters below keep
+    ## running regardless, so if this client ever does produce a showing 2 the
+    ## log will say so rather than this comment being believed forever.
   ModeSkipDeclineTicks = 900
-    ## If burst 2 never arrives within this many drain ticks of burst 1 (~15 s
-    ## at 60 fps), DECLINE: never press, leave the stock screen for the player.
-    ## This is a BOUND, and it is deliberately not dressed up as a readiness
-    ## signal -- "the second showing has not come" is not the same claim as
-    ## "the flow is ready", and answering anyway is exactly the guess that
-    ## killed the client.
+    ## If the showing this host answers never arrives within this many drain
+    ## ticks of showing 1 (~15 s at 60 fps), DECLINE: never press, leave the
+    ## stock screen for the player. UNREACHABLE while `ModeSkipAnswerBurst` is
+    ## 1, which is the shipped value -- it exists for whoever raises that
+    ## constant, and it is deliberately not dressed up as a readiness signal:
+    ## "the showing has not come" is not the same claim as "the flow is
+    ## ready", and answering anyway is the guess that killed the client.
   ModeSkipStarveTicks = 3600
     ## Roughly a minute of drain ticks. If the feature is armed and the screen
     ## has never been seen, it says so once rather than being a silent no-op.
@@ -266,6 +276,9 @@ var gModeSkipBursts = 0                ## SHOWINGS closed so far, this controlle
 var gModeSkipBurstMs = 0'u64           ## when the last burst closed
 var gModeSkipPendingBurst = 0          ## the burst the queued match came from
 var gModeSkipBurst1Tick = 0            ## drain tick on which burst 1 closed
+var gModeSkipBurstOpen = false         ## a showing is in progress right now
+var gModeSkipBurstSlots = 0            ## ShowSlot calls in the open showing
+var gModeSkipBurstLastTick = 0         ## last drain tick that saw a ShowSlot
 var gModeSkipDeclinedLate = false      ## the "burst 2 never came" refusal, once
 var gModeSkipStaleLogged = false       ## the stale-controller refusal, once
 var gModeSkipMenuEpoch = 0             ## last seen uihooks MenuScreen::Show epoch
@@ -420,6 +433,9 @@ proc modeSkipCtorFired(regs: Il2CppPtr) =
   gModeSkipSlotsThisTick = 0
   gModeSkipPendingBurst = 0
   gModeSkipBurst1Tick = 0
+  gModeSkipBurstOpen = false
+  gModeSkipBurstSlots = 0
+  gModeSkipBurstLastTick = 0
   gModeSkipBurstMs = 0'u64
   gModeSkipDeclinedLate = false
   inc gModeSkipCtors
@@ -620,45 +636,76 @@ proc modeSkipDrainTick() =
   modeSkipMenuTick()
   inc gModeSkipTicks
 
-  # ---- CLOSE A BURST ------------------------------------------------------
-  # A drain tick is a FRAME. Any ShowSlot calls that arrived since the last one
-  # belong to a single showing of the screen, and this tick ends it. That makes
-  # "which showing is this" an event count rather than a clock reading.
+  # ---- SHOWING BOOKKEEPING, AND THE ONE-TICK DEFERRAL ---------------------
+  #
+  # MEASURED 2026-09-02, and this is the third rule here because the first two
+  # were wrong in opposite directions:
+  #
+  #   * a MILLISECOND quiet window. `ModeSkipQuietMs` was 0 while its own
+  #     comment argued for 500, so Submit went out on the first drain tick after
+  #     the matching slot -- sometimes in the SAME millisecond as the burst
+  #     (logged `after 0ms`), which killed the client inside
+  #     `SeasonWidgetData::From` under the first `MenuScreen::Show`, and
+  #     sometimes one or two ticks later (logged `after 15-31ms`), which
+  #     survived. A coin flip, decided by tick phase.
+  #   * answering SHOWING 2. There IS no showing 2: a run on the build that
+  #     tried it logged `SHOWING 1 ... closed on this frame -- 3 ShowSlot
+  #     call(s)`, discarded the match, and then sat on the character screen for
+  #     over three minutes with no second showing, no Submit and no
+  #     MenuScreen::Show. The client does NOT re-show this screen by itself
+  #     here; the surviving boots were showing 1 answered a tick or two late.
+  #
+  # So the rule is showing 1, answered ONE DRAIN TICK after its burst ends, and
+  # the tick is the unit because a tick is an OBSERVED FRAME rather than a
+  # reading off a clock whose phase decided the outcome:
+  #
+  #   a tick that saw ShowSlot calls  -> the burst is still OPEN. Extend it and
+  #                                      submit NOTHING this tick.
+  #   the first tick that saw NONE    -> the burst has ended one full tick ago.
+  #                                      Close the showing and let the gate
+  #                                      below answer on THIS tick.
+  #
+  # A burst that spans several ticks therefore extends rather than counting as
+  # several showings, which is what "if more ShowSlot calls arrive in that next
+  # tick, the burst is still open" means in code.
   if gModeSkipSlotsThisTick > 0:
-    let n = gModeSkipSlotsThisTick
+    gModeSkipBurstSlots = gModeSkipBurstSlots + gModeSkipSlotsThisTick
     gModeSkipSlotsThisTick = 0
+    gModeSkipBurstOpen = true
+    gModeSkipBurstLastTick = gModeSkipTicks
+    return
+  if gModeSkipBurstOpen:
+    gModeSkipBurstOpen = false
     inc gModeSkipBursts
     let nowB = cNowMs()
     let gap = (if gModeSkipBurstMs == 0'u64: 0'u64 else: nowB - gModeSkipBurstMs)
     gModeSkipBurstMs = nowB
     if gModeSkipBursts == 1:
       gModeSkipBurst1Tick = gModeSkipTicks
-    # DROP a match captured on a showing we do not answer. Two reasons, and the
-    # first one alone makes it mandatory: `modeSkipShowSlotFired` returns early
-    # while a match is pending, so a burst-1 capture would BLOCK burst 2 from
-    # ever capturing and the feature would sit until it declined -- a gate that
-    # can never open. And the profile-data pointer from showing 1 is a frame's
-    # worth of assumption older than the one showing 2 hands us; the whole point
-    # here is to stop using values from before the client was ready.
+    if gModeSkipBursts <= 4:
+      okLog "skip mode screen: SHOWING " & $gModeSkipBursts & " of the " &
+            "character/mode screen ENDED -- " & $gModeSkipBurstSlots &
+            " ShowSlot call(s), and this tick is the first with none, so the " &
+            "burst is over" &
+            (if gModeSkipBursts == 1: " (the first showing)"
+             else: " (" & $int(gap) & "ms after showing " &
+                   $(gModeSkipBursts - 1) & ")") &
+            ". The counters keep running, so if this client ever DOES produce " &
+            "a showing 2 the log will say so."
+    gModeSkipBurstSlots = 0
+    # A match captured on a showing this host does not answer is DISCARDED
+    # rather than left queued: `modeSkipShowSlotFired` returns early while a
+    # match is pending, so a stale queued match would BLOCK the showing that IS
+    # answered from ever capturing -- a gate that can never open. With
+    # ModeSkipAnswerBurst = 1 this cannot trigger today; it is kept because the
+    # constant is the thing someone will change.
     if gModeSkipPending and gModeSkipPendingBurst < ModeSkipAnswerBurst:
       gModeSkipPending = false
       gModeSkipPendingPd = nil
       gModeSkipPendingBurst = 0
       info "skip mode screen: the match captured on showing " &
            $gModeSkipBursts & " is DISCARDED, not queued -- this host answers " &
-           "showing " & $ModeSkipAnswerBurst & ", and it will use the profile " &
-           "data THAT showing hands it, not this one's."
-    if gModeSkipBursts <= 4:
-      okLog "skip mode screen: SHOWING " & $gModeSkipBursts & " of the " &
-            "character/mode screen closed on this frame -- " & $n &
-            " ShowSlot call(s), " &
-            (if gModeSkipBursts == 1: "the first showing"
-             else: $int(gap) & "ms after showing " & $(gModeSkipBursts - 1)) &
-            ". This host answers showing " & $ModeSkipAnswerBurst &
-            ", never the first: the client's own RunCharacterSelectionFlow " &
-            "shows this screen again ~372ms later, and answering the first " &
-            "one hands that flow a Profile it is still building (MEASURED " &
-            "2026-09-02: SeasonWidgetData::From inside MenuScreen::Show)."
+           "showing " & $ModeSkipAnswerBurst & "."
 
   if not gModeSkipPending:
     # ARMED BUT STARVED. One shot, and only once the drain has demonstrably
@@ -687,16 +734,17 @@ proc modeSkipDrainTick() =
        gModeSkipTicks - gModeSkipBurst1Tick > ModeSkipDeclineTicks:
       gModeSkipDeclinedLate = true
       gModeSkipPending = false
-      warn "skip mode screen: DECLINING. Showing 1 closed " &
+      warn "skip mode screen: DECLINING. Showing 1 ended " &
            $(gModeSkipTicks - gModeSkipBurst1Tick) & " drain ticks ago and " &
-           "showing " & $ModeSkipAnswerBurst & " never arrived (showings so " &
-           "far: " & $gModeSkipBursts & "). NOTHING WAS PRESSED and nothing " &
-           "will be: this host answers the second showing because the first " &
-           "one is the client still building the flow, and \"the second " &
-           "showing has not come\" is NOT the same claim as \"the flow is " &
-           "ready\" -- pressing anyway is the guess that faulted " &
+           "the showing this host is configured to answer (" &
+           $ModeSkipAnswerBurst & ") never arrived (showings seen: " &
+           $gModeSkipBursts & "). NOTHING WAS PRESSED and nothing will be: " &
+           "\"the showing has not come\" is NOT the same claim as \"the " &
+           "flow is ready\", and pressing on that guess is what faulted " &
            "SeasonWidgetData::From inside MenuScreen::Show on 2026-09-02. " &
-           "The stock screen is left exactly as the client built it."
+           "The stock screen is left exactly as the client built it. This " &
+           "branch is unreachable while ModeSkipAnswerBurst is 1, which is " &
+           "its shipped value; it exists for whoever changes that constant."
     return
 
   # ---- THE READINESS GATE -------------------------------------------------
@@ -747,11 +795,16 @@ proc modeSkipDrainTick() =
            "session. The selection screen is left for the player to use."
     return
   okLog "skip mode screen: Submit called for profile " & gModeSkipWantId &
-        " (gameMode=" & $gModeSkipPendingMode & ") on SHOWING " &
+        " (gameMode=" & $gModeSkipPendingMode & ") -- answering showing " &
+        $gModeSkipPendingBurst & " on tick +" &
+        $(gModeSkipTicks - gModeSkipBurstLastTick) &
+        " after its ShowSlot burst ended (never on the burst's own tick: a " &
+        "same-tick Submit is what faulted SeasonWidgetData::From inside the " &
+        "first MenuScreen::Show on 2026-09-02). SHOWING " &
         $gModeSkipPendingBurst & " of " & $gModeSkipBursts &
-        " seen so far (this host answers showing " & $ModeSkipAnswerBurst &
-        ", never the first), " & $int(cNowMs() - gModeSkipArmedAtMs) &
-        "ms after that showing's matching slot. The " &
+        " seen so far; " & $int(cNowMs() - gModeSkipArmedAtMs) &
+        "ms after that showing's matching slot (a wall-clock READING, not the " &
+        "gate -- the gate is the tick count above). The " &
         "character/mode selection screen has been answered without a human. " &
         "This is ANSWER " & $gModeSkipSubmits & " of at most " &
         $ModeSkipMaxAnswers & " this session (ShowSlot firings seen: " &
