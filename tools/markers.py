@@ -82,6 +82,23 @@ own PE section table says it should be longer than the bytes we read -- the
 recorded case where a freshly-built DLL came back TRUNCATED and every marker
 therefore read MISSING.
 
+GIT BASH REWRITES A MARKER THAT STARTS WITH `/`
+-----------------------------------------------
+MEASURED: under Git Bash (MSYSTEM set), `--string "/aowlspt/keybinds"` reaches
+python as `C:/Program Files/Git/aowlspt/keybinds` -- the MSYS runtime converts
+POSIX-looking absolute paths to Windows paths before the process starts -- and
+the tool reported a confident MISSING for a marker that IS in the DLL. EVERY
+marker beginning with `/` is affected. The original cannot be recovered, so
+markers.py now REFUSES (INCONCLUSIVE, exit 3) when a literal has the rewritten
+shape, and names it. Run such a check as:
+
+    MSYS_NO_PATHCONV=1 python tools/markers.py --string "/aowlspt/keybinds" DLL
+
+or from PowerShell. A leading `//` stops the conversion but leaves the extra
+slash in the literal, so it is not a fix. Only the root-prefixed shape is
+detectable: `/c/Users` becomes `C:/Users`, which is indistinguishable from an
+intentional literal and is still searched as given.
+
 Use `--string` when you have just ADDED a marker and want to assert it landed
 in the build. Do NOT add it to `tools/deploy.json` for that purpose, and above
 all never relax an existing entry there to make a check pass.
@@ -885,6 +902,62 @@ def string_selftest(C):
             ok = False
             print("%sFAIL%s neither method found the U+2026 literal -- the "
                   "fixture is stale, not a pass." % (red, reset))
+    # MSYS path conversion. Both cases run through the REAL command line with
+    # a synthetic root list, so they behave identically under bash, PowerShell
+    # and CI -- and the CONTROL is the half that matters: a genuine `C:/...`
+    # literal that is not under an MSYS root must still be SEARCHED, or the
+    # refusal would just be a new way to answer nothing.
+    fake_root = "C:/Program Files/Git"
+    saved = {k: os.environ.get(k) for k in
+             ("MSYSTEM", "MSYS_NO_PATHCONV", "AOWLSPT_MSYS_ROOTS")}
+    os.environ["MSYSTEM"] = "MINGW64"
+    os.environ.pop("MSYS_NO_PATHCONV", None)
+    os.environ["AOWLSPT_MSYS_ROOTS"] = fake_root
+    try:
+        for (label, lit, want) in (
+            ("MSYS INCONCLUSIVE: an argument path-converted by Git Bash "
+             "(a marker typed as `/aowlspt/keybinds`) is REFUSED, not "
+             "reported MISSING",
+             fake_root + "/aowlspt/keybinds", 3),
+            ("MSYS control: a genuine C:/ literal NOT under the MSYS root is "
+             "searched normally (an honest MISSING, not a refusal)",
+             "C:/Users/nobody/zzzNotAMarkerAtAll", 1),
+        ):
+            av = ["--string", lit, _dll("uihub"), "--quiet", "--no-color"]
+            buf, keep = io.StringIO(), sys.stdout
+            sys.stdout = buf
+            try:
+                got = main(av)
+            except SystemExit as e:
+                got = e.code
+            finally:
+                sys.stdout = keep
+            good = (got == want)
+            if not good:
+                ok = False
+            print("%s%s%s %s" % (green if good else red,
+                                 "PASS" if good else "FAIL", reset, label))
+            if not good:
+                print("    wanted exit %s, got %s  (literal %s)"
+                      % (want, got, ascii(lit)))
+                for ln in buf.getvalue().splitlines():
+                    print("      " + ln)
+        # And the refusal must not fire when conversion was disabled -- the
+        # very command line the refusal tells you to run must WORK.
+        os.environ["MSYS_NO_PATHCONV"] = "1"
+        if pathconv_suspect(fake_root + "/aowlspt/keybinds") is not None:
+            ok = False
+            print("%sFAIL%s the refusal still fires under MSYS_NO_PATHCONV=1, "
+                  "so the fix it recommends does not work." % (red, reset))
+        else:
+            print("%sPASS%s MSYS_NO_PATHCONV=1 disables the refusal, so the "
+                  "recommended re-run actually searches" % (green, reset))
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
     # And a TRUNCATED read must be INCONCLUSIVE, never MISSING.
     import tempfile
     src = _dll("uihub")
@@ -969,6 +1042,99 @@ def deploy_parity(C):
         print("%sFAIL%s deploy.py --contains never produced these verdicts, "
               "so the delegation is not demonstrated: %s" % (red, reset, gone))
     return ok
+
+
+# ------------------------------------------------- MSYS argument rewriting
+#
+# MEASURED under Git Bash (MSYSTEM=MINGW64) on this machine:
+#
+#     $ python -c 'import sys;print(sys.argv[1:])' --string "/aowlspt/keybinds" x
+#     ['--string', 'C:/Program Files/Git/aowlspt/keybinds', 'x']
+#     $ MSYS_NO_PATHCONV=1 python ... --string "/aowlspt/keybinds" x
+#     ['--string', '/aowlspt/keybinds', 'x']
+#
+# The MSYS runtime rewrites any argument that looks like a POSIX absolute path
+# into a Windows path BEFORE the process starts, so Python never sees what was
+# typed. `markers.py --string "/aowlspt/keybinds" mod.dll` therefore searched
+# for `C:/Program Files/Git/aowlspt/keybinds` and reported a confident MISSING
+# for a marker that is in the DLL. That is precisely the confidently-wrong
+# answer this whole tool exists to prevent, and EVERY marker beginning with `/`
+# is affected.
+#
+# We cannot recover the original -- the information is gone before main() runs
+# -- so the only honest outcome is a REFUSAL (INCONCLUSIVE, exit 3) naming the
+# rewritten string.
+#
+# KNOWN LIMIT, stated rather than papered over: only the root-prefixed shape is
+# detectable. `/c/Users` is rewritten to `C:/Users`, which carries no MSYS root
+# prefix and is byte-identical to a literal somebody may genuinely want to
+# search for; that case is NOT detected and will still be searched as given.
+MSYS_ROOT_FILES = (("usr", "bin", "bash.exe"), ("etc", "fstab"))
+
+
+def _is_msys_root(d):
+    """True if `d` is the install root of an MSYS/Git-Bash environment."""
+    return all(os.path.isfile(os.path.join(d, *parts))
+               for parts in MSYS_ROOT_FILES)
+
+
+def pathconv_suspect(lit, env=None):
+    """(root, recovered-original) if `lit` looks MSYS-rewritten, else None.
+
+    Only fires when the process was actually started from an MSYS shell
+    (`MSYSTEM` set) with conversion enabled (`MSYS_NO_PATHCONV` unset), the
+    literal has the `<X>:/` shape conversion produces, AND some prefix of it is
+    a real MSYS install root. That last condition is what keeps a genuine
+    `C:/...` literal that is not under such a root from being refused.
+
+    `AOWLSPT_MSYS_ROOTS` (os.pathsep-separated) replaces the filesystem probe
+    with an explicit root list; the self-test uses it so both the positive and
+    the negative case are deterministic on any machine.
+    """
+    env = os.environ if env is None else env
+    if not env.get("MSYSTEM") or env.get("MSYS_NO_PATHCONV"):
+        return None
+    if len(lit) < 4 or not lit[0].isalpha() or lit[1:3] != ":/":
+        return None
+    forced = env.get("AOWLSPT_MSYS_ROOTS")
+    roots = None
+    if forced:
+        roots = [os.path.normcase(r.rstrip("/\\").replace("\\", "/"))
+                 for r in forced.split(os.pathsep) if r]
+    for i, ch in enumerate(lit):
+        if ch != "/" or i < 3:          # i==2 is the drive's own slash
+            continue
+        cand = lit[:i]
+        hit = (os.path.normcase(cand) in roots if roots is not None
+               else _is_msys_root(cand))
+        if hit:
+            return cand, lit[i:]
+    return None
+
+
+def pathconv_refusal(lits, env=None):
+    """None, or the INCONCLUSIVE refusal text for the first rewritten literal."""
+    for lit in lits:
+        hit = pathconv_suspect(lit, env)
+        if not hit:
+            continue
+        root, orig = hit
+        return (
+            "the literal reaching this process is %s, which is an MSYS "
+            "path-converted argument, NOT what you typed: the shell rewrote a "
+            "leading %s into %s%s before python started. Searching for the "
+            "rewritten form would report a confident MISSING for a marker that "
+            "may well be in the file, so nothing was searched.\n"
+            "  re-run with conversion off:\n"
+            "      MSYS_NO_PATHCONV=1 python tools/markers.py --string %s FILE\n"
+            "  (or run it from PowerShell, which does not rewrite arguments.)\n"
+            "  NOTE, measured: prefixing the argument with `//` does stop the "
+            "conversion, but the literal then still carries the extra leading "
+            "slash -- `//aowlspt/keybinds` arrives verbatim, not as "
+            "`/aowlspt/keybinds` -- so it is NOT a fix for this."
+            % (_q(lit), _q(orig), root, "" if root.endswith("/") else "/",
+               _q(orig)))
+    return None
 
 
 def _looks_like_path(s):
@@ -1087,6 +1253,13 @@ def main(argv):
 
     if args.selftest:
         return selftest(C)
+    # Before ANY searching: was an argv literal mangled by MSYS path conversion?
+    # Only argv-borne literals can be -- markers read from a file are untouched.
+    refusal = pathconv_refusal(list(args.strings) + list(args.markers)
+                              + list(args.absent) + list(args.control))
+    if refusal:
+        print("%sINCONCLUSIVE%s markers.py: %s" % (C[2], C[4], refusal))
+        return 3
     if args.list_artifacts:
         try:
             for a in load_deploy_artifacts():

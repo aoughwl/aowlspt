@@ -285,7 +285,7 @@ Repeatable (`--string A --string B`), takes an arbitrary PATH (a build in a work
 nothing needs to be a declared artifact, and it never deploys), prints the byte offset and
 WHICH encoding matched, and exits 0 PRESENT / 1 MISSING / 3 INCONCLUSIVE. It is also the
 right way to assert a marker you **just added** landed in the build — do **not** add it to
-`tools/deploy.json` for that, and never relax an entry there to make a check pass.
+`tools/deploy.json` for that, and never relax an entry there to make a check pass. MEASURED: under **Git Bash** a `--string` that begins with `/` is rewritten by MSYS path conversion before python ever sees it (`/aowlspt/keybinds` arrives as `C:/Program Files/Git/aowlspt/keybinds`, and was reported a confident MISSING); markers.py now REFUSES that shape as INCONCLUSIVE — re-run with `MSYS_NO_PATHCONV=1` or from PowerShell (a leading `//` is **not** a fix, it leaves the extra slash in the literal).
 
 **NEVER marker-check a binary with PowerShell** —
 `[Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($p)).Contains($s)`.
