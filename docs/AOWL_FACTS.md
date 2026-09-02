@@ -6069,3 +6069,18 @@ Measured 2026-09-01 night: `aowl build host` failed tree-wide in 24s with
 buildlock broke a killed agent's stale lock mid-build. Fix: ONE serialised
 `aowl clean` under the lock, then rebuild. Do not read "build failed" on a
 tree with no source errors as your own bug -- check for this first.
+
+## NEVER detour `Toggle::set_isOn` @0x55BA430 -- it is an 11-byte tail-jump thunk
+
+Measured 2026-09-01: `set_isOn` is `xor r9d,r9d; mov r8b,1; jmp +0x15` then
+`CC` padding, and `SetIsOnWithoutNotify` @0x55BA440 is the same shape. A
+16-byte detour steals bytes PAST the function and the trampoline would have to
+relocate a rel32. Both thunks jump to `Toggle::Set(bool value, bool
+sendCallback)` @0x55BA450 (UNIQUE, real prologue) -- bind THAT. Bonus:
+`sendCallback` is true for a real press and false for `SetIsOnWithoutNotify`,
+so a postfix there cannot be re-entered by our own quiet writes. Calling
+set_isOn is still fine (it is what `forceOfflinePractice` and the inspector do).
+
+Also from the same pass: the Win64 register index for `this` is 0 (RCX), args
+1/2/3 = RDX/R8/R9. A postfix that read index 1 as `this` would have compared a
+bool against a pointer table -- never matching, no log, feature silently dead.
