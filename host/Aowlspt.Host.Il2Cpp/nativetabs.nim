@@ -273,6 +273,10 @@ var gNtSubPressedGfx = -1             ## 1 = GRAPHICS on, 0 = off, -1 = nothing
 ## press it' and 'the player can press it' are different claims and only the
 ## second was in doubt.
 var gNtSubPressedByPlayer = false
+## Toggles we have already reported once. Capped: this is a census, not a
+## log of every press.
+const NtMaxSeenToggles = 24
+var gNtSeenToggles: seq[Il2CppPtr] = @[]
 ## OUR OWN SELECTION WRITES MUST NOT RE-ENTER OUR OWN POSTFIX.
 ##
 ## MEASURED: ten `native subtabs VERDICT PASS` lines inside 160ms, alternating
@@ -386,7 +390,19 @@ proc ntNoteFault(what: string) =
 # and returns. It logs NOTHING unless one of ours matched.
 # ---------------------------------------------------------------------------
 proc ntToggleSetFired(regs: Il2CppPtr) =
-  if not gNtOn or gNtOff or gNtToggle.len == 0:
+  ## THE `gNtToggle.len == 0` GUARD THAT USED TO BE HERE WAS THE BUG.
+  ##
+  ## It meant "we own no tabs, so no toggle event can concern us" -- true when
+  ## the only thing this feature watched was its OWN tab toggles. It stopped
+  ## being true the moment the subtab strip became furniture of the STOCK
+  ## GRAPHICS tab, and it became FATAL in the same change that defaulted the
+  ## PROOF tab off: with no tab of ours, `gNtToggle` is empty, so this returned
+  ## on every event and the stock GraphicsToggle edge was never seen. The user
+  ## saw the strip build and then never appear, with nothing in the log --
+  ## because this line ran before anything could be logged.
+  ##
+  ## The subtab path is now INDEPENDENT of whether we own any tab at all.
+  if not gNtOn or gNtOff:
     return
   # REGISTER INDICES, and getting these wrong is silent: index 0 is RCX. For
   # the instance method `Set(this, bool value, bool sendCallback, MethodInfo*)`
@@ -428,11 +444,50 @@ proc ntToggleSetFired(regs: Il2CppPtr) =
   if gNtKbToggle != nil and gNtKbToggle == selfPtr:
     gNtKbPressed = (if turnedOn: 1 else: 0)
     return
+  # NAME THE EVENT, ONCE PER DISTINCT TOGGLE. Every toggle in the game funnels
+  # through here, so this must not be per-event work -- it is per NEW pointer,
+  # capped, and it is what turns "nothing happened" into a list of what
+  # actually arrived and how each one was classified.
+  var matchedAs = "other"
+  if gNtGfxTabToggle != nil and gNtGfxTabToggle == selfPtr:
+    matchedAs = "graphics(cached)"
+  # MATCH BY NAME TOO, not only by the pointer captured at build. A spawner
+  # respawns its toggle, so a cached pointer can go stale while the button on
+  # screen is the same button -- and a stale pointer fails silently, which is
+  # the failure mode this whole pass has been chasing.
+  var goName = ""
+  var parentName = ""
+  let selfGo = nuGameObjectOf(selfPtr)
+  if selfGo != nil:
+    goName = iObjName(selfGo)
+    let pt = modsParentOf(modsTransformOf(selfGo))
+    if pt != nil: parentName = iObjName(pt)
+  if matchedAs == "other" and
+     (parentName.contains("GraphicsToggleSpawner") or
+      goName.contains("GraphicsToggle")):
+    matchedAs = "graphics(by name)"
+    gNtGfxTabToggle = selfPtr      # re-cache: the pointer we had was stale
+  var known = false
+  var si = 0
+  while si < gNtSeenToggles.len and si < NtMaxSeenToggles:
+    if gNtSeenToggles[si] == selfPtr:
+      known = true
+      break
+    si = si + 1
+  if not known and gNtSeenToggles.len < NtMaxSeenToggles:
+    gNtSeenToggles.add selfPtr
+    okLog "native subtabs TOGGLE EVENT (first time for this toggle): this=" &
+          iPtr(selfPtr) & " go='" & goName & "' parent='" & parentName &
+          "' value=" & $turnedOn & " matched-as=" & matchedAs &
+          ". Every Toggle::Set in the game passes through here; this line is " &
+          "printed once per distinct toggle, so the whole tab strip appears " &
+          "in the log exactly once and a toggle we FAIL to classify is " &
+          "visible rather than silent."
   # THE STOCK GRAPHICS TAB. The strip is its furniture, so its edges -- ON and
   # OFF -- are what raise and hide it. This is checked BEFORE the generic
   # foreign-toggle branch so that selecting GRAPHICS does not read as "some
   # stock tab was selected, hide everything of ours".
-  if gNtGfxTabToggle != nil and gNtGfxTabToggle == selfPtr:
+  if matchedAs != "other":
     gNtSubPressedGfx = (if turnedOn: 1 else: 0)
     return
   # A FOREIGN TOGGLE WENT ON -- a stock tab was selected.
@@ -1221,15 +1276,28 @@ proc ntBuildSubtabs(screenT: Il2CppPtr; captions: seq[string];
   # Selectable under it inert -- which is EXACTLY the reported defect: POSTFX
   # visible but unclickable, while our own `Toggle::Set` call still worked.
   # Read it, say what it was, and only then make it usable.
+  # ALWAYS SAY WHAT WAS FOUND. The previous version only logged when a
+  # CanvasGroup existed AND read back cleanly, so "no CanvasGroup" and "could
+  # not read it" were both silent -- and silence is what this whole pass has
+  # been spent turning into sentences.
   let stripCg = modsComponent(stripT, "CanvasGroup")
-  if stripCg != nil:
+  if stripCg == nil:
+    okLog "native subtabs: the cloned strip carries NO CanvasGroup, so that " &
+          "is not why a subtab would refuse a click. Nothing was forced."
+  else:
     let (cgOk, cgA, cgI) = nuCgRead(stripCg)
     if cgOk:
       okLog "native subtabs: the cloned strip's CanvasGroup arrived alpha=" &
-            nuF(cgA) & " interactable=" & $cgI & " (inherited from the HIDDEN " &
-            "donor panel). Forcing alpha 1 / interactable / blocksRaycasts -- " &
-            "this is the most likely reason a subtab rendered but would not " &
-            "take a mouse click."
+            nuF(cgA) & " interactable=" & $cgI & " (inherited from the donor " &
+            "panel, which was HIDDEN when we cloned it). Forcing alpha 1 / " &
+            "interactable / blocksRaycasts -- a CanvasGroup with alpha 0 or " &
+            "blocksRaycasts false makes every Selectable under it inert while " &
+            "our own Toggle::Set call still works, which is exactly the " &
+            "'renders but will not click' shape."
+    else:
+      warn "native subtabs: the cloned strip HAS a CanvasGroup but it could " &
+           "not be read, so whether it is the reason a subtab refuses a click " &
+           "is UNKNOWN. Forcing it usable anyway."
     discard nuCgMakeUsable(stripCg)
   # DRAW ON TOP AND RECEIVE THE CLICK. Sibling order is raycast order.
   discard nuSetAsLastSibling(stripT)
