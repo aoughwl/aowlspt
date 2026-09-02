@@ -6720,3 +6720,36 @@ yet proven: submitting on the first showing hands the flow a Profile that is
 still being built; the earlier stale-controller crash (8115849) is the same
 family. A millisecond timer cannot be the gate; the second showing or a
 readiness field is.
+
+## 2026-09-02: modeskip's Submit was a millisecond COIN FLIP, and the quiet window was 0
+
+MEASURED (coordinator's run on the 4,728,320-byte build, crash
+`Crash_2026-09-02_065209929`): the client died at 48 s in
+`SeasonWidgetData::From @0x141FFD0+0x133` called from
+`MenuScreen::Show(5-arg) @0x15387A0+0x994` -- the FIRST MenuScreen::Show of the
+session, faulting on its own Profile/SeasonalRewardController argument. Host
+trail: `[0:00:26.844] CharacterSelectionScreenController #1 constructed`,
+`[0:00:26.859] Submit called ... after 0ms of waiting`, then NO
+`MenuScreen::Show fired` epoch line and no `release gated` line. Every boot that
+SURVIVED logged `after 15-31ms`.
+
+**The "wait" never existed.** `ModeSkipQuietMs` is `0'u64` in `modeskip.nim`
+while its own 40-line doc comment argues for 500 ms. With zero, Submit goes out
+on the first drain tick after the matching slot, so `0ms` vs `15-31ms` records
+only which millisecond that tick landed in -- a coin flip against the client's
+own `RunCharacterSelectionFlow`, which shows this screen AGAIN ~372 ms later.
+Answering the FIRST showing hands that flow a Profile it is still building.
+
+**The `answer only after a NEW .ctor` rule added earlier did NOT shorten it**
+(asked and checked in the source): that rule is read only on the re-answer path
+in `modeSkipShowSlotFired`; the first answer never consults it.
+
+The gate is now an EVENT COUNT, not a clock: **answer showing 2**. A showing
+("burst") is a group of `ShowSlot` calls not separated by a
+`TarkovApplication::Update` tick -- a FRAME boundary, which is observable and
+does not rot with the frame rate. A match captured on showing 1 is DISCARDED
+rather than queued, which is mandatory and not tidiness: `modeSkipShowSlotFired`
+returns early while a match is pending, so a burst-1 capture would block burst 2
+from ever capturing and turn the gate into one that can never open. If showing 2
+never arrives within 900 drain ticks the feature DECLINES and presses nothing --
+"the second showing has not come" is not the same claim as "the flow is ready".
