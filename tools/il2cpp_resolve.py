@@ -222,6 +222,22 @@ guessed at.
         # address mid-body has no edges of its own and "0 callers" for it would
         # be a wrong answer; it offers `symbolize` instead. A name that matches
         # several distinct addresses is REFUSED with the candidates listed.
+  il2cpp_resolve.py <GameAssembly.dll> <global-metadata.dec.dat> disasm <RVA-or-VA-or-Type::Method>
+                                       [--len N | --to RVA] [--base 0x...] [--max-gap N] [--no-fields]
+        # THE INSTRUCTIONS AROUND AN ADDRESS -- what `bytes` cannot give you,
+        # and what crash triage needs (`From @0x141ffd0 +0x11f` is
+        # `cmp qword ptr [rbx + 0x118], r12`). Needs `capstone`; without it the
+        # verb REFUSES with the install line and prints no instructions.
+        # Decoding starts at the OWNER'S START, never mid-stream, because x86
+        # has no instruction alignment and decoding backwards from a guessed
+        # boundary yields plausible WRONG mnemonics; 0x20 bytes of preceding
+        # context are shown when the start is known, and NONE when it is not
+        # (a `.text` address), which it says. The requested address is marked
+        # `>>`. `call/jmp rel32` targets are resolved through the SAME
+        # symbolize index (owner @start +off). `[reg+disp]` is annotated with
+        # the FIELD NAME only when the register traces back to a reference-type
+        # argument and exactly one candidate type has a field there -- anything
+        # else prints `?`, never a guessed name. Default length 64 bytes.
   il2cpp_resolve.py <GameAssembly.dll> <global-metadata.dec.dat> type <idx-or-Name>...
         # per method: rid, RVA, arity, full signature, section, thunk shape.
         # add --shared to also annotate RVAs shared with other methods (this
@@ -550,6 +566,24 @@ class Resolver:
                                               self.PAR_OFF + (ps + i)*self.PARS)
             ps_list.append((self.s(ni), self.field_typename(ti) if ti >= 0 else "?"))
         return ret, ps_list, pc
+
+    def method_sig_indices(self, mi):
+        """(return_type_index, [(param_name, param_type_index)]) -- the RAW
+        Il2CppType indices behind `method_sig`, which returns rendered names.
+        `disasm` needs the indices because a NAME is ambiguous: 'Profile'
+        matches both EFT.Profile and uLipSync.Profile, and picking the wrong
+        one yields field offsets that are structurally plausible and wrong."""
+        self._ensure_params()
+        base = self.M_OFF + mi*self.MS
+        rt = struct.unpack_from("<i", self.m, base + 8)[0]
+        ps = struct.unpack_from("<i", self.m, base + 16)[0]
+        pc = struct.unpack_from("<H", self.m, base + 34)[0]
+        out = []
+        for i in range(pc):
+            ni, _tok, ti = struct.unpack_from("<iIi", self.m,
+                                              self.PAR_OFF + (ps + i)*self.PARS)
+            out.append((self.s(ni), ti))
+        return rt, out
 
     def sig_string(self, mi, name):
         ret, ps, pc = self.method_sig(mi)
@@ -1337,7 +1371,7 @@ VERBS = ("find", "methods", "member", "type", "typemethods", "bytes",
          "shared", "verify-be", "fields", "verify-fields", "verify-parents",
          "enum", "verify-consts", "settings-table", "holdersof",
          "genericmethods", "verify-generics", "symbolize", "symbolize-report",
-         "callers")
+         "callers", "disasm")
 
 # ---- MethodAttributes ------------------------------------------------------
 # ECMA-335 II.23.1.10. Only the bits that change a BIND DECISION are decoded;
@@ -2863,6 +2897,566 @@ def cmd_symbolize_report(R, argv, key=None):
     return 0 if n_ok else 3
 
 
+# ---------------------------------------------------------------------------
+# disasm -- the instructions AROUND an address, not 16 raw bytes
+# ---------------------------------------------------------------------------
+# MEASURED need (2026-09-02): two agents in one night wrote throwaway capstone
+# scripts, because `bytes` prints 16 bytes and crash triage needs the code
+# around a fault offset. The worked example both wanted:
+#   `From @0x141ffd0 +0x11f` -> `cmp qword ptr [rbx + 0x118], r12`, where rbx
+#   holds the `profile` argument, so 0x118 is `EFT.Profile.BattlePass`.
+#
+# THREE things this does that a throwaway script does not:
+#   * it decodes from the OWNER'S START, never from the middle. x86 has no
+#     instruction alignment: decoding from `fault - 0x20` produces plausible,
+#     WRONG mnemonics. When the start is unknown (a `.text` address) it says so
+#     and shows NO preceding context rather than inventing it.
+#   * `call/jmp rel32` targets go through the SAME symbolize index the
+#     `symbolize`/`callers` verbs use, so a target names its owner and offset.
+#   * `[reg+disp]` is annotated with a FIELD NAME only when the register can be
+#     traced back to an argument whose type is a reference type with a concrete
+#     layout, and only when exactly one candidate type has a field at that
+#     displacement. Everything else prints `?`. The Win64 mapping is a
+#     best-effort inference (a value-type return steals RCX for a hidden return
+#     buffer, and whether a small struct does that is not decidable offline),
+#     so BOTH mappings are tried and a name is printed only if they agree on
+#     one field. A wrong field name would be exactly the confidently-wrong
+#     answer this repo treats as worst-case.
+
+DISASM_DEFAULT_LEN = 64
+DISASM_CONTEXT = 0x20            # bytes of preceding context, when reachable
+DISASM_MAX_BACKSCAN = 0x20000    # refuse to decode a longer run-up than this
+
+# every sub-register name -> its 64-bit root. Built explicitly; capstone's
+# register ids are not stable enough across versions to key on.
+_GPR64 = {}
+for _r in ("ax", "bx", "cx", "dx", "si", "di", "bp", "sp"):
+    _full = "r" + _r
+    _GPR64[_full] = _full
+    _GPR64["e" + _r] = _full
+    _GPR64[_r] = _full
+    if _r in ("ax", "bx", "cx", "dx"):
+        _GPR64[_r[0] + "l"] = _full
+        _GPR64[_r[0] + "h"] = _full
+    else:
+        _GPR64[_r + "l"] = _full
+for _n in range(8, 16):
+    _full = "r%d" % _n
+    for _sfx in ("", "b", "w", "d"):
+        _GPR64[_full + _sfx] = _full
+del _r, _n
+
+
+def reg_root(name):
+    """'ebx' -> 'rbx'; None for xmm/segment/unknown."""
+    return _GPR64.get((name or "").lower())
+
+
+def import_capstone():
+    """(module, None) or (None, refusal-text). Never raises."""
+    try:
+        import capstone
+    except Exception as e:                                  # pragma: no cover
+        return (None, "disasm: capstone is NOT importable (%s), so there is "
+                "nothing to disassemble. This verb prints NO instructions "
+                "rather than guessing at them.\n"
+                "  install it:   python -m pip install capstone\n"
+                "  meanwhile:    `bytes <RVA> <N>` still prints raw bytes."
+                % e)
+    return (capstone, None)
+
+
+class FieldAtOffset(object):
+    """{typedef index -> {offset -> [ 'Full.Name' ]}} for INSTANCE fields with
+    a concrete layout. A generic definition contributes NOTHING: its
+    fieldOffsets array is all zeros and reading it as offsets is the fabricated
+    answer `field_offsets_base` exists to refuse."""
+
+    def __init__(self, R):
+        self.R = R
+        self._c = {}
+
+    def table(self, tdi):
+        if tdi in self._c:
+            return self._c[tdi]
+        t = {}
+        try:
+            rows = self.R.all_fields_ex(tdi)
+        except Exception:
+            rows = []
+        for r in rows:
+            if r["static"] or not r["has_storage"]:
+                continue
+            if r["off"] is None or r["layout"] != "concrete":
+                continue
+            t.setdefault(r["off"], []).append(
+                "%s.%s" % (r["declared_by"].split(".")[-1], r["name"]))
+        self._c[tdi] = t
+        return t
+
+    def at(self, tdi, off):
+        return self.table(tdi).get(off, [])
+
+
+def arg_register_map(R, t, mi):
+    """({reg -> [(tdi, 'arg name')]}, [display strings], [caveats]).
+
+    Win64 + IL2CPP: RCX/RDX/R8/R9 carry, in order, a hidden return buffer (only
+    when the return value does not fit in a register), `this` for an instance
+    method, then the declared parameters, then the hidden trailing
+    `const MethodInfo*`. Only CLASS-typed slots (type enum 0x12) become
+    annotation candidates -- a value type may be passed by hidden pointer and
+    its field offsets are relative to a different base, which is precisely the
+    kind of plausible-but-wrong offset this file refuses elsewhere.
+    """
+    REGS = ("rcx", "rdx", "r8", "r9")
+    caveats = []
+    static = bool(R.mflags(mi) & 0x10)
+    rt, params = R.method_sig_indices(mi)
+    ret_te = R.type_enum_of(rt) if (rt is not None and rt >= 0) else None
+    ret_name = R.field_typename(rt) if (rt is not None and rt >= 0) else "?"
+
+    def slots(with_sret):
+        s = []
+        if with_sret:
+            s.append(("<retbuf: %s>" % ret_name, None))
+        if not static:
+            ns, nm = R.tname(t)
+            s.append(("this: %s" % nm, t if _is_class_type_def(R, t) else None))
+        for pname, ti in params:
+            tdi = R.typedef_of_type_va(R.rq(R.TYPES_PTR + ti * 8))
+            te = R.type_enum_of(ti)
+            usable = (te == 0x12) and tdi is not None
+            s.append(("%s %s" % (R.field_typename(ti), pname),
+                      tdi if usable else None))
+        s.append(("<MethodInfo*>", None))
+        return s
+
+    # A VALUE-TYPE return MAY take RCX as a hidden buffer (measured on this
+    # build: a 16-byte Rect does, an 8-byte Vector2 does not -- it comes back
+    # in RAX). Which one applies is not decidable from metadata, so both
+    # mappings are carried and only an offset both agree on is ever named.
+    maybe_sret = ret_te in (0x11, 0x15)
+    prim = slots(maybe_sret)
+    alt = slots(not maybe_sret) if maybe_sret else None
+    if maybe_sret:
+        caveats.append(
+            "return type %s is a VALUE TYPE: RCX is shown as the hidden return "
+            "buffer, but a struct of 8 bytes or less is returned in RAX and "
+            "every argument shifts down one register. BOTH mappings are tried "
+            "for field annotation and a name is printed ONLY if they agree."
+            % ret_name)
+
+    cand = {}
+    disp = []
+    for i, reg in enumerate(REGS):
+        labels = []
+        for s in (prim, alt):
+            if not s or i >= len(s):
+                continue
+            lbl, tdi = s[i]
+            if lbl not in labels:
+                labels.append(lbl)
+            if tdi is not None:
+                cand.setdefault(reg, []).append((tdi, lbl))
+        if labels:
+            disp.append("%s=%s" % (reg, " | ".join(labels)))
+    over = max(len(prim), len(alt) if alt else 0) - len(REGS)
+    if over > 0:
+        caveats.append("%d further argument slot(s) are passed on the STACK "
+                       "and are not traced." % over)
+    return cand, disp, caveats
+
+
+def _is_class_type_def(R, tdi):
+    """True when the typedef is a reference type (so a register holding it
+    points AT the object header and metadata field offsets apply directly)."""
+    if tdi is None:
+        return False
+    if R.is_generic_definition(tdi):
+        return False
+    try:
+        return not R.derives_from(tdi, "System.ValueType")
+    except Exception:
+        return False
+
+
+class RegTrace(object):
+    """A deliberately dumb forward tracer: 64-bit register-to-register moves
+    and argument homing to the stack frame, nothing else.
+
+    It is STRAIGHT-LINE only -- it walks the bytes in address order and knows
+    nothing about branches, so a register written on a path it did not follow
+    is simply DROPPED, never carried. Dropping yields `?`; carrying would yield
+    a wrong field name. Every write that is not an understood copy clears the
+    destination.
+    """
+
+    def __init__(self, cand):
+        self.regs = {r: list(v) for r, v in cand.items()}
+        self.slots = {}
+        self.rsp = 0
+        self.rsp_ok = True
+
+    def types_of(self, reg):
+        return self.regs.get(reg, [])
+
+    def step(self, cs, ins):
+        ops = [o for o in ins.operands]
+        mn = ins.mnemonic
+        copy = None
+        store = None
+        load = None
+        if mn == "mov" and len(ops) == 2:
+            d, s = ops[0], ops[1]
+            if (d.type == cs.x86.X86_OP_REG and s.type == cs.x86.X86_OP_REG
+                    and d.size == 8 and s.size == 8):
+                copy = (reg_root(ins.reg_name(d.reg)),
+                        reg_root(ins.reg_name(s.reg)))
+            elif (d.type == cs.x86.X86_OP_MEM and s.type == cs.x86.X86_OP_REG
+                  and s.size == 8):
+                fo = self._frame_off(cs, ins, d)
+                if fo is not None:
+                    store = (fo, reg_root(ins.reg_name(s.reg)))
+            elif (d.type == cs.x86.X86_OP_REG and s.type == cs.x86.X86_OP_MEM
+                  and d.size == 8):
+                fo = self._frame_off(cs, ins, s)
+                if fo is not None:
+                    load = (reg_root(ins.reg_name(d.reg)), fo)
+        # every written register loses its type unless the write is a copy we
+        # understand; this is applied FIRST so a copy can then reinstate it.
+        try:
+            _read, written = ins.regs_access()
+        except Exception:                                   # pragma: no cover
+            written = []
+        for w in written:
+            root = reg_root(ins.reg_name(w))
+            if root and root != "rsp":
+                self.regs.pop(root, None)
+        if copy and copy[0] and copy[1] is not None:
+            src = self.regs.get(copy[1])
+            if src:
+                self.regs[copy[0]] = list(src)
+        if load and load[0]:
+            got = self.slots.get(load[1])
+            if got:
+                self.regs[load[0]] = list(got)
+        if store and store[1]:
+            got = self.regs.get(store[1])
+            if got:
+                self.slots[store[0]] = list(got)
+        self._track_rsp(cs, ins, ops)
+
+    def _frame_off(self, cs, ins, op):
+        """Frame offset (relative to the entry RSP) for an [rsp+disp] operand,
+        or None. Anything that makes RSP unknown disables slot tracking."""
+        if not self.rsp_ok:
+            return None
+        m = op.mem
+        if m.index != 0 or m.base == 0:
+            return None
+        if reg_root(ins.reg_name(m.base)) != "rsp":
+            return None
+        return self.rsp + m.disp
+
+    def _track_rsp(self, cs, ins, ops):
+        if not self.rsp_ok:
+            return
+        mn = ins.mnemonic
+        if mn == "push":
+            self.rsp -= 8
+            return
+        if mn == "pop":
+            self.rsp += 8
+            return
+        if mn in ("sub", "add") and len(ops) == 2:
+            d, s = ops[0], ops[1]
+            if (d.type == cs.x86.X86_OP_REG
+                    and reg_root(ins.reg_name(d.reg)) == "rsp"):
+                if s.type == cs.x86.X86_OP_IMM:
+                    self.rsp += (-s.imm if mn == "sub" else s.imm)
+                    return
+                self.rsp_ok = False
+                self.slots = {}
+                return
+            return
+        try:
+            _r, written = ins.regs_access()
+        except Exception:                                   # pragma: no cover
+            written = []
+        for w in written:
+            if reg_root(ins.reg_name(w)) == "rsp":
+                self.rsp_ok = False
+                self.slots = {}
+                return
+
+
+def _mem_annotation(R, cs, ins, trace, fmap, idx, max_gap):
+    """'; Profile.BattlePass@0x118 (rbx <- arg ...)' for one instruction, or
+    '' when there is no memory operand worth a word. `?` is printed rather
+    than a guess whenever the base register's type is not derivable."""
+    for op in ins.operands:
+        if op.type != cs.x86.X86_OP_MEM:
+            continue
+        m = op.mem
+        base = reg_root(ins.reg_name(m.base)) if m.base else None
+        if m.base and ins.reg_name(m.base) == "rip":
+            tgt = ins.address + ins.size + m.disp
+            sec = R.section_of_rva(tgt)[0] or "no section"
+            return "; rip-> 0x%x [%s]" % (tgt, sec)
+        if base in (None, "rsp", "rbp"):
+            continue
+        if m.index or m.disp <= 0:
+            continue
+        cands = trace.types_of(base)
+        if not cands:
+            return "; [%s+0x%x] -> ? (%s's type is not derivable here)" % (
+                base, m.disp, base)
+        names = []
+        for tdi, lbl in cands:
+            for n in fmap.at(tdi, m.disp):
+                if n not in names:
+                    names.append(n)
+        if len(names) == 1:
+            return "; %s@0x%x  (%s <- %s)" % (names[0], m.disp, base,
+                                              cands[0][1])
+        if not names:
+            return ("; [%s+0x%x] -> ? (no field of %s at that offset)"
+                    % (base, m.disp, "/".join(sorted(
+                        set(l for _t, l in cands)))))
+        return ("; [%s+0x%x] -> AMBIGUOUS: %s" % (base, m.disp,
+                                                  " | ".join(names)))
+    return ""
+
+
+def _branch_annotation(R, cs, ins, idx, max_gap):
+    """'-> Owner @0xstart +0xoff' for a direct call/jmp, else ''."""
+    if ins.mnemonic not in ("call", "jmp") and not ins.mnemonic.startswith("j"):
+        return ""
+    ops = ins.operands
+    if len(ops) != 1 or ops[0].type != cs.x86.X86_OP_IMM:
+        return ""
+    tgt = ops[0].imm
+    if ins.mnemonic.startswith("j") and ins.mnemonic not in ("jmp",):
+        return ""                      # conditional: stays inside the body
+    sec = R.section_of_rva(tgt)[0]
+    if sec is None:
+        return "-> 0x%x [not in any section]" % tgt
+    s = idx.lookup(tgt, max_gap=max_gap)
+    if not s.ok:
+        return "-> 0x%x [%s: no IL2CPP owner]" % (tgt, sec)
+    off = "" if s.offset == 0 else " +0x%x" % s.offset
+    lab = s.owner
+    if len(lab) > 96:
+        lab = lab[:93] + "..."
+    return "-> %s @0x%x%s" % (lab, s.start, off)
+
+
+def cmd_disasm(R, argv, key=None):
+    if not argv:
+        print("usage: disasm <RVA-or-VA-or-Type::Method> [--len N | --to RVA] "
+              "[--base 0x...] [--max-gap N] [--no-fields]")
+        return 2
+    length = None
+    to = None
+    base = None
+    max_gap = DEFAULT_MAX_GAP
+    want_fields = True
+    rest = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("--len", "--length") and i + 1 < len(argv):
+            length = int(argv[i + 1], 0)
+            i += 2
+            continue
+        if a.startswith("--len="):
+            length = int(a.split("=", 1)[1], 0)
+            i += 1
+            continue
+        if a == "--to" and i + 1 < len(argv):
+            to = int(argv[i + 1], 0)
+            i += 2
+            continue
+        if a.startswith("--to="):
+            to = int(a.split("=", 1)[1], 0)
+            i += 1
+            continue
+        if a == "--base" and i + 1 < len(argv):
+            base = int(argv[i + 1], 0)
+            i += 2
+            continue
+        if a.startswith("--base="):
+            base = int(a.split("=", 1)[1], 0)
+            i += 1
+            continue
+        if a == "--max-gap" and i + 1 < len(argv):
+            max_gap = int(argv[i + 1], 0)
+            i += 2
+            continue
+        if a.startswith("--max-gap="):
+            max_gap = int(a.split("=", 1)[1], 0)
+            i += 1
+            continue
+        if a == "--no-fields":
+            want_fields = False
+            i += 1
+            continue
+        rest.append(a)
+        i += 1
+    if not rest:
+        print("disasm: no address or Type::Method given")
+        return 2
+    if length is not None and to is not None:
+        print("disasm: --len and --to are mutually exclusive; pass one.")
+        return 2
+
+    cs, refusal = import_capstone()
+    if cs is None:
+        print(refusal)
+        return 4
+
+    spec = rest[0]
+    named = None
+    try:
+        addr = int(spec, 0)
+    except ValueError:
+        rva, msg = resolve_callee_name(R, spec)
+        if rva is None:
+            print(msg)
+            return 3
+        named, addr, base = msg, rva, None
+    if base is not None:
+        rva = addr - base
+        if rva < 0:
+            print("INCONCLUSIVE: 0x%x is BELOW the --base 0x%x you gave -- "
+                  "that address is not in this module." % (addr, base))
+            return 3
+    elif named is not None:
+        rva = addr
+    elif addr >= R.IB + 0x10000000:
+        print("INCONCLUSIVE: 0x%x looks like a LIVE (ASLR-relocated) address, "
+              "not an RVA. GameAssembly.dll is relocated at runtime, so pass "
+              "the module base the crash report printed: --base 0x<base>."
+              % addr)
+        return 3
+    else:
+        rva = addr - R.IB if addr >= R.IB else addr
+
+    sec, fo, avail = R.section_of_rva(rva)
+    print("disasm   0x%x  (VA 0x%x)   section %s"
+          % (rva, R.IB + rva, sec or "NONE -- not inside any section"))
+    if fo is None:
+        print("REFUSED: no raw bytes are mapped at that address, so there is "
+              "nothing to decode.")
+        return 3
+
+    idx = symbol_index(R, key=key)
+    s = idx.lookup(rva, max_gap=max_gap)
+    if named:
+        print("named    %s" % named)
+    print("owner    %s" % s.line())
+
+    # ---- where decoding STARTS. Never mid-instruction-stream guessing.
+    start = None
+    if s.start is not None and 0 <= rva - s.start <= DISASM_MAX_BACKSCAN:
+        start = s.start
+    if start is None:
+        start = rva
+        print("NOTE     no owner start is known for this address, so decoding "
+              "begins AT it and NO preceding context is shown -- x86 has no "
+              "instruction alignment and decoding backwards from a guessed "
+              "boundary produces plausible, WRONG mnemonics.")
+    show_from = rva if start == rva else max(start, rva - DISASM_CONTEXT)
+    if to is not None:
+        end = (to - base) if base is not None else (
+            to - R.IB if to >= R.IB else to)
+        if end <= rva:
+            print("disasm: --to 0x%x is not above the start address 0x%x."
+                  % (end, rva))
+            return 2
+    else:
+        end = rva + (DISASM_DEFAULT_LEN if length is None else length)
+
+    # ---- argument registers, for the field annotation
+    fmap = FieldAtOffset(R)
+    cand, disp, caveats = {}, [], []
+    if want_fields and s.start is not None:
+        entries = idx.owners.get(s.start, [])
+        mentries = [e for e in entries if e[0] == "m"]
+        if len(mentries) == 1 and len(entries) == 1:
+            try:
+                cand, disp, caveats = arg_register_map(R, mentries[0][1],
+                                                       mentries[0][2])
+            except Exception as e:                          # pragma: no cover
+                caveats = ["argument mapping FAILED (%s); every [reg+disp] "
+                           "below reads `?`" % e]
+        elif entries:
+            caveats = ["%d method definitions share this body, so an argument "
+                       "register has no single type -- every [reg+disp] below "
+                       "reads `?`" % len(entries)]
+    if disp:
+        print("args     %s" % "  ".join(disp))
+    for c in caveats:
+        print("CAVEAT   %s" % c)
+    if start != rva:
+        print("decoding from the owner start 0x%x (exact instruction "
+              "boundaries); showing from 0x%x" % (start, show_from))
+
+    nbytes = (end - start) + 16
+    blob = R.code_bytes(start, nbytes)
+    if not blob:
+        print("REFUSED: no raw bytes at 0x%x." % start)
+        return 3
+    md = cs.Cs(cs.CS_ARCH_X86, cs.CS_MODE_64)
+    md.detail = True
+    trace = RegTrace(cand)
+    print("%-2s %-10s %-22s %s" % ("", "RVA", "BYTES", "INSTRUCTION"))
+    printed = 0
+    hit = False
+    decoded_to = start
+    for ins in md.disasm(bytes(blob), start):
+        if ins.address >= end:
+            break
+        decoded_to = ins.address + ins.size
+        marker = "  "
+        inside = 0
+        if ins.address <= rva < ins.address + ins.size:
+            marker = ">>"
+            hit = True
+            inside = rva - ins.address
+        note = ""
+        if ins.address >= show_from:
+            note = _branch_annotation(R, cs, ins, idx, max_gap)
+            if not note and want_fields:
+                note = _mem_annotation(R, cs, ins, trace, fmap, idx, max_gap)
+        trace.step(cs, ins)
+        if ins.address < show_from:
+            continue
+        printed += 1
+        print("%-2s 0x%-8x %-22s %s %s%s"
+              % (marker, ins.address, ins.bytes.hex(), ins.mnemonic,
+                 ins.op_str, ("   " + note) if note else ""))
+        if inside:
+            # The requested address is not an instruction boundary. Saying so
+            # matters: a fault reported at +0x11f2 that is really 3 bytes into
+            # one instruction is a different fact from a fault at its start.
+            print("   ^^ requested 0x%x is INSIDE this instruction, at byte "
+                  "+%d of %d -- it is NOT an instruction boundary."
+                  % (rva, inside, ins.size))
+    if not printed:
+        print("REFUSED: capstone decoded NOTHING in this range -- these bytes "
+              "are not valid x86-64 at this boundary. This is not an empty "
+              "function.")
+        return 3
+    if not hit:
+        print("NOTE     0x%x itself was NOT reached: the decode stopped at "
+              "0x%x. It is INSIDE no instruction printed above."
+              % (rva, decoded_to))
+        return 3
+    return 0
+
+
 def usage_gaps():
     """VERBS that the Usage: block does not document, and documented verbs that
     do not exist. MEASURED: `methods`, `shared`, `enum`, `settings-table` and
@@ -3044,6 +3638,8 @@ def main():
                                       key=(sys.argv[1], sys.argv[2])))
     elif cmd == "callers":
         sys.exit(cmd_callers(R, sys.argv[4:], key=(sys.argv[1], sys.argv[2])))
+    elif cmd == "disasm":
+        sys.exit(cmd_disasm(R, sys.argv[4:], key=(sys.argv[1], sys.argv[2])))
     elif cmd == "typemethods":
         sys.exit(cmd_typemethods(R, sys.argv[4:]))
     elif cmd == "genericmethods":
