@@ -7915,3 +7915,15 @@ never printed a uihooks 'site 2 ... BOUND' line` while the log has `site 2
 EFT.UI.MenuScreen::Show(5-arg) @0x15387a0: BOUND (slot 7)` at [0:00:01] --
 the capability line is only observed from the attach point forward. Both
 being fixed.
+
+## 2026-09-02 11:05 (clock): the user's "two mode selectors / cannot select PvE"
+
+MEASURED: with build 4,851,200 the mode-skip pressed the profile slot's
+`Apply` ([0:00:27.703]) and the flow never completed (`NO READBACK` at
+39s); the slot screen stayed half-transitioned and neither card responded
+to the mouse. A coordinator chain then ran entergame.py against the same
+screen (it pressed the empty "PvE Zone" card). Remedy applied:
+`uxSkipModeScreen off`, chain stopped, client relaunched plainly. Rule: when
+the user is at the machine, no host feature and no tool may drive the slot
+screen; the corrected card-press mode-skip (e5613f3) is deployed only with
+the user's go-ahead.
