@@ -6149,3 +6149,25 @@ hunting a "death" that was the harness's own teardown. Rule: a boot that the
 coordinator intends to keep driving is `run.py --keep ...`; and before calling
 any disappearance a crash, check whether a run.py without `--keep` exited at
 that second.
+
+## 2026-09-01 late: "Unable to check the client version" = the client spawned before ITS backend listened
+
+MEASURED (boot at 22:51): aowlspt-launch 22:51:29.213, aowlspt-backend
+22:51:29.234, EscapeFromTarkov 22:51:31.285 -- the client was spawned 2.05s
+after the backend, while that backend's `listening on https://127.0.0.1:443`
+came at 0:00:05.9. The client's version check is a NATIVE pre-init step: it
+fails hard, `il2cpp_init returned 0 after 1900ms` in the host log, no client
+log folder is ever created, and the dialog `Fatal error [EscapeFromTarkov.exe]
+Unable to check the client version` appears at ~8s. Four boots in a row
+(22:44, 22:46, 22:48, 22:51) failed this way, on both the new backend and the
+22:39 backup; the survivors had the backend listening by 3.5s (earlier in
+the night) or a 60s uncached mod build between the two spawns.
+
+WHY the launcher spawned early (read from tools/aowllaunch.nim waitForBackend):
+in TLS mode readiness is "the backend's own `listening on` line in
+aowlspt-backend.log" -- and on a restart that file is still the PREVIOUS
+run's until the new backend truncates it, so the stale line is found within
+~2s. Waiting 12s with everything stopped did not help, because the stale line
+does not go away with time. Coordinator workaround: truncate the backend log
+before launching. Real fix (in flight): the launcher must only accept a line
+written after its own spawn and then see a real TCP accept on :443.
