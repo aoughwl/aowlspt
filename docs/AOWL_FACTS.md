@@ -5934,3 +5934,29 @@ four interleaved hunks). Voice runtime needs whisper/piper tools, a mic
 (currently NO_DEVICES), and an LLM (builtin template by default; OPENAI_API_KEY
 env only). Upstream EscapeFromMyBasement shipped a hardcoded OpenAI key in its
 DLL -- treat as leaked; nothing here carries a key.
+
+## Regressions audit vs integ-beta9 (2026-09-01 night, read-only, file:line verified)
+
+* **Host-native auto-raid EXISTS**, two implementations, both default OFF:
+  `autoraid.nim` (`uxAutoRaid`, `autoRaidMap`="Woods", rides the
+  TarkovApplication::Update drain) and `natraid.nim` (`uxNativeRaid` stage-1
+  probe + `uxNativeRaidDrive` stage-2). Live: 969-985ms menu-to-READY. The
+  inspector-driven `tools/enterraid.py` is the fragile path; the host one is
+  the real autonomous loop.
+* **FOV "needs RVA" is STALE**: `CalculateScaleValueByFov @0x6FC250`,
+  `SightComponent::get_GetCurrentSensitivity @0x104a140`,
+  `FirearmController::get_AimingSensitivity @0x7773f0` -- all UNIQUE. Real
+  blocker: the mod ABI has only by-name `patchTyped`; no `patchRva`.
+* **$1-loot**: FIXED with a negative-controlled self-check (bots.nim
+  `moneyStacks`). **Nested-config persistence**: FIXED with tests.
+  **Maps off-toggle**: FIXED (fact #280) -- invariant: every write transport
+  must call `onMapsApply` (maps.nim:2500).
+* **Bot loadouts**: `slotFilter` fixed; chamber + spare-mag paths exist; gap:
+  no bots-side self-check feeds a stock-shaped `_props.filters` fixture.
+* **Native ESP**: go/no-go ANSWERED by `nativeUiImageProof` (PASS). natesp
+  fails in SEEDING (`rootsObtained=178 liveRootsSeeded=0 discFaults=24`).
+* **SAIN**: observer mode; `rvatable.nim` exists (23/60 members); the aim hook
+  targets `BotAimingData::get_IsReady`, a class nothing returns -- a check
+  that cannot fire. Route: `BotOwner::get_AimingManager @0x80E9B0` ->
+  `AimingManager::get_CurrentAiming @0x23D5B60` -> `Aiming::get_IsReady
+  @0x1AD48C0`. Blocker #24 (ToESain) is retired-by-rewrite, not fixed.
