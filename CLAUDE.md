@@ -221,7 +221,8 @@ those hooks is off, not that Settings was never opened.
   --stat` before committing.
 - **PowerShell only.** `gcc` silently fails in Git Bash (exit 1, no output).
 - Hand-invoking `nimony` outside `aowl` silently exits 0 producing **nothing**.
-- **Name the target**: `aowl build host` ≈ 2m vs `aowl build` ≈ 4m27s warm / 18m cold.
+- **Name the target**: `aowl build host` ≈ 2m on a quiet machine, but MEASURED 740-840s
+  (12-14 min) on 2026-09-02 with several agents and builds contending for the CPU; `aowl build` ≈ 4m27s warm / 18m cold.
   Targets: host backend sim launch installer emutest verify probe mods examples deploy.
 - `aowl build` does **not** rebuild `aowl.exe` itself → use `aowl bootstrap`.
   `installer/build/` is gitignored, so a fresh worktree has **no** `aowl.exe` at all.
