@@ -44,7 +44,7 @@
 ## with no host, no registry and no files.
 
 import std/syncio
-import "../../../host/common/jsonpath"
+import aowlspt/jsonpath
 
 type
   ModConfigFault* = object

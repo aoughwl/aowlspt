@@ -85,7 +85,7 @@ import aowlspt
 import aowlspt/il2cpp
 import aowlspt/fast
 import aowlspt/callrva
-import ".." / ".." / ".." / abi / aowlspt_symtab
+import aowlspt_symtab
 import ".." / core / vec
 
 # ---------------------------------------------------------------------------
