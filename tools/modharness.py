@@ -78,6 +78,13 @@ in a raid.
 * `aowlspt_abi_version()` matches the header the harness parsed, not a constant
   typed in here -- so bumping the ABI cannot make this pass vacuously.
 * `on_load` returns OK.
+* A **second** `on_load` is REFUSED rather than publishing a second
+  schema: the page the mod serves must be byte-identical across it.  The
+  client host ran init+on_load twice per mod for a whole session
+  (2026-09-02) because two load paths reached one directory, so this is
+  not hypothetical -- and the loader-side guard is one process's worth of
+  protection, while the mod's own guard is what stops its rows being
+  freed under a live reader.
 * Every payload emitted on an announce event `json.loads` under STRICT JSON.
   Not `contains`, not "it looked like a list" -- the backend selftest passed for
   months on a substring check against something that was not JSON at all.
@@ -723,6 +730,37 @@ def run_worker(dll: Path, side: int, phase: Phase, log_min: int, trace: bool,
                 b = host.deliver(EV_APPLY_QUERY, body)
                 _judge(check, "applyQuery", a, b)
 
+    # -- init/on_load runs ONCE per session ---------------------------------
+    #
+    # MEASURED 2026-09-02 (aowlspt-host.log): the client host ran init +
+    # on_load TWICE for six mods in one session -- the backend's mod-set poll
+    # loaded them at 4.5s and the deferred mod release loaded that same
+    # directory again at 40.7s.  sain's publish-once selftest PASSED on run
+    # one and FAILED on run two, reporting the schema already published before
+    # it had declared anything.
+    #
+    # The assertion is on the FINISHED STATE and it is a NEGATIVE: after a
+    # second on_load, the page this mod serves must be byte-identical to the
+    # one it served before.  A mod that re-declared answers a different -- or
+    # freed -- schema, and "identical" is not something a self-comparison can
+    # fake.  Silence is INCONCLUSIVE, not a pass: unchanged bytes cannot tell
+    # a publish-once guard apart from an on_load that declares nothing.
+    phase.set("on_load #2")
+    if not modapi.on_load:
+        check("on_load#2", "INCONCLUSIVE", "the mod supplied no on_load")
+    elif EV_PAGE_QUERY not in subscribed:
+        check("on_load#2", "INCONCLUSIVE",
+              "the mod does not answer pageQuery, so there is no schema to "
+              "read back and nothing here would notice a second declaration")
+    else:
+        before = host.deliver(EV_PAGE_QUERY, guid.encode())
+        mark = len(host.logs)
+        st2 = int(modapi.on_load(modapi.self))
+        after = host.deliver(EV_PAGE_QUERY, guid.encode())
+        said = [t for _, t in host.logs[mark:]]
+        verdict, detail = judge_on_load2(before, after, said, st2)
+        check("on_load#2", verdict, detail)
+
     phase.set("done")
     res["logs"] = [{"level": l, "text": t} for l, t in host.logs]
     res["calls"] = host.calls
@@ -758,6 +796,34 @@ def _judge(check, short: str, a: list, b: list):
               f"shape a schema freed under a reader produces")
         return
     check(short, "PASS", f"{len(ann_a)} announce(s), strict JSON, identical twice")
+
+
+def judge_on_load2(before, after, said, status=0):
+    """PASS/FAIL/INCONCLUSIVE for a SECOND `on_load`, from the finished state.
+
+    Split out of the caller so `--selftest` can drive it with synthetic inputs.
+    The FAIL branch is the whole point of this check and, unlike the fault the
+    negative-control mod produces, no mod in the tree currently reaches it -- so
+    without that it would be a branch nobody has ever seen taken, which is
+    section 9b's definition of the bug rather than the check.
+    """
+    refused = any("REFUS" in t.upper() for t in said)
+    if before != after:
+        return ("FAIL",
+                f"a SECOND on_load CHANGED the schema this mod serves "
+                f"({len(before)} announce(s) before, {len(after)} after, or "
+                f"the bytes differ). That is a re-declaration -- the free "
+                f"under a live reader this guard exists to stop")
+    if not refused:
+        return ("INCONCLUSIVE",
+                "the schema is unchanged after a second on_load, but the mod "
+                "said nothing about refusing one, so this cannot tell a "
+                "publish-once guard apart from an on_load that declares no "
+                "settings at all. Make the refusal say so and this becomes a "
+                "PASS")
+    return ("PASS",
+            f"a second on_load returned {status}, was REFUSED with a reason, "
+            f"and the page served is byte-identical")
 
 
 def _first_key(page_replies):
@@ -883,6 +949,31 @@ def selftest(a, log_min: int) -> int:
         print(f"   {'PASS' if ok else 'FAIL'}: got {r['verdict']} -- "
               f"{detail[:200] or 'no FAIL check was recorded'}")
         verdicts.append("PASS" if ok else "FAIL")
+
+    # -- third control: the on_load#2 JUDGEMENT, driven directly ------------
+    #
+    # sain exercises only its PASS branch, and the faulting fixture dies two
+    # phases earlier, so nothing in the tree takes the FAIL branch. Driving the
+    # function with synthetic replies is what stops "a second on_load changed
+    # the schema" from being a sentence that has never once been produced.
+    print("-- third control: judge_on_load2 must reach all three verdicts",
+          flush=True)
+    same = [("aowlspt.settings.pageAnnounce", b'{"rows":[1]}')]
+    diff = [("aowlspt.settings.pageAnnounce", b'{"rows":[1,2]}')]
+    cases = [("FAIL", same, diff, ["settings: ...REFUSED..."]),
+             ("INCONCLUSIVE", same, list(same), ["nothing to say"]),
+             ("PASS", same, list(same), ["settings: declareSettings ... REFUSED"])]
+    bad3 = []
+    for want, b, a2, said in cases:
+        got, _ = judge_on_load2(b, a2, said)
+        if got != want:
+            bad3.append(f"wanted {want}, got {got}")
+    if bad3:
+        print("   FAIL: " + "; ".join(bad3))
+        verdicts.append("FAIL")
+    else:
+        print("   PASS: FAIL, INCONCLUSIVE and PASS are all reachable")
+        verdicts.append("PASS")
 
     if "FAIL" in verdicts:
         print("selftest FAIL")

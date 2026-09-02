@@ -969,11 +969,45 @@ proc modLoadReleaseMods(why: string; force: bool = false) =
           mlSinceBoot(gModLoadPendingAt) & ", MenuScreen::Show at " &
           mlSinceBoot(gModLoadMenuShownAt) & ", releasing now"
   okLog "mod loading: releasing deferred mods now -- " & why
-  if modhost.loadAll(gModsDirDeferred, modhost.SideClient,
-                     HostName, HostVersion) == 0:
+
+  # THE READBACK, and it is a DELTA rather than a total on purpose.
+  #
+  # `loadAll` answers `gMods.len` -- every slot this session has ever used,
+  # dead ones included. Tested against zero, that is a check that cannot fail
+  # once anything else has already loaded a mod: on 2026-09-02 the backend's
+  # mod-set poll had six mods up by 4.5s, so this release could have brought
+  # up NOTHING at all and still read "not zero, fine". What is actually being
+  # asked here is "did the deferral deliver the mods it withheld", and only
+  # the difference answers that.
+  #
+  # The other half of the same measurement is `already`: mods the release
+  # found already running and did NOT initialise a second time. That number
+  # is expected to be non-zero -- two load paths legitimately reach this same
+  # directory -- and `loadMod` names each one it skipped.
+  var liveBefore = 0
+  for i in 0 ..< modhost.modCount():
+    if modhost.modIsLive(i): inc liveBefore
+  let rowsBefore = modhost.modCount()
+  let total = modhost.loadAll(gModsDirDeferred, modhost.SideClient,
+                              HostName, HostVersion)
+  let broughtUp = modhost.modCount() - rowsBefore
+  if total == 0:
     warn "mod loading: the deferred load produced NO mods from " &
          gModsDirDeferred & ". If mods were expected, this is the failure to " &
          "chase -- the client started clean on purpose and nothing filled it."
+  elif broughtUp == 0:
+    warn "mod loading: the deferred release brought up NO NEW mods -- all " &
+         $liveBefore & " were already running before it ran. The deferral " &
+         "therefore withheld nothing, and whatever loaded them (the " &
+         "backend's mod-set poll is the one that does) is the real load " &
+         "path in this session. Not a failure; but the loading screen was " &
+         "showing a wait that had already ended."
+  else:
+    okLog "mod loading: the deferred release brought up " & $broughtUp &
+          " mod(s); " & $liveBefore & " were already running and were " &
+          "SKIPPED rather than initialised a second time (each names " &
+          "itself above with 'init #2 SKIPPED'). Every mod in this " &
+          "session has had exactly one init and one on_load."
 
 proc mlLoadPhaseOver(): bool =
   ## HAS THE MAIN MENU ARRIVED? Answered only when we can answer it honestly.

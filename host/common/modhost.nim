@@ -458,6 +458,13 @@ type
     version*: string
     hasUpdate*: bool
     live*: bool
+    loadedAt*: int64
+      ## `elapsedMs()` at the moment this mod's `init` was accepted, i.e.
+      ## when it became live. Read only by the once-per-session refusal in
+      ## `loadMod`, which names it so the log says WHEN the first
+      ## initialisation happened rather than merely that one did:
+      ## "already initialised" and "already initialised at 4.5s, by the
+      ## backend's mod-set poll" are different amounts of evidence.
     tickFails*: int
       ## How many times in a row `on_update` has answered non-OK. Reset by the
       ## first tick that answers OK, so this counts a *run* of failures rather
@@ -1020,6 +1027,27 @@ proc probeGuid(path: string; guid: var string): bool =
   cFreeLibrary(module)
   result = got
 
+proc liveIndexOfGuid(guid: string): int =
+  ## Which slot holds a LIVE mod with this guid, or -1.
+  ##
+  ## Deliberately NOT `modIndexOf` (declared far below, and it answers for
+  ## dead slots too). A slot is KEPT after an unload -- every context pointer
+  ## handed to a mod is its index -- so "is this guid in the table" and "is
+  ## this mod RUNNING" are different questions. The second is the one that
+  ## matters here, because unload-then-load-again is the hot reload and the
+  ## manager switching a mod off and back on, and both must keep working.
+  result = -1
+  if guid.len == 0: return
+  for i in 0 ..< gMods.len:
+    if gMods[i].live and gMods[i].guid == guid:
+      return i
+
+proc atSecs(ms: int64): string =
+  ## `ms` since this host started, as seconds to one decimal. "?" rather
+  ## than a fabricated number when there is nothing to report.
+  if ms < 0: return "?"
+  result = $(ms div 1000'i64) & "." & $((ms mod 1000'i64) div 100'i64) & "s"
+
 proc loadMod*(path: string; side: int32; hostName, hostVersion: string;
               sptVersion = ""; gameVersion = ""; homeDir = ""): bool =
   ## Brings one mod up: version probe, describe, init, on_load. A step that
@@ -1044,7 +1072,8 @@ proc loadMod*(path: string; side: int32; hostName, hostVersion: string;
                     module: cast[HostPtr](0), info: cast[HostPtr](0),
                     api: cast[HostPtr](0), hostBlock: cast[HostPtr](0),
                     guid: "", name: "", author: "", version: "",
-                    hasUpdate: false, live: false, tickFails: 0,
+                    hasUpdate: false, live: false, loadedAt: 0'i64,
+                    tickFails: 0,
                     tickWarned: false, tickFaulted: false, flags: 0'u32,
                     profSlot: -1'i32)
 
@@ -1104,6 +1133,50 @@ proc loadMod*(path: string; side: int32; hostName, hostVersion: string;
     cFreeLibrary(m.module)
     return false
 
+  # INITIALISE EXACTLY ONCE PER SESSION.
+  #
+  # MEASURED 2026-09-02 in aowlspt-host.log: the backend's mod-set poll
+  # loaded aowl.sain at 4.5s ("the backend wants aowl.sain loaded; queueing
+  # ...\mods\sain\sain.dll"), and the DEFERRED mod release then ran
+  # `loadAll` over that same directory at 40.7s and loaded it a second time
+  # -- 16 candidate libraries, no consultation of the loaded set. Six mods
+  # got two `init` + `on_load` runs in one session. `modcontrol.doLoad` has
+  # always been idempotent (`gOps.indexOf(guid) >= 0` -> noop); `loadAll`
+  # never was, and nothing below it knew either.
+  #
+  # sain's publish-once selftest is what made this visible rather than
+  # merely fatal: it PASSED at 4.5s and FAILED at 40.7s, reporting the
+  # schema already published before it had declared anything. The settings
+  # publish-once guard is the only reason run two refused instead of
+  # freeing run one's rows under a live reader.
+  #
+  # Refused HERE, and not in `loadAll`, for a specific reason: `loadAll`
+  # would have to learn the guid from the FILE, and the only way to do that
+  # is `probeGuid` -- which ends in `cModAllocTeardown` + `cFreeLibrary`.
+  # Run against a library that is already live in this process, that
+  # collects the RUNNING mod's heap: a use-after-free generator standing in
+  # for a use-after-free fix. By this line the library is open and has
+  # described itself, so the check is one walk of a table of at most
+  # `ModSlotLimit` rows and costs no second load.
+  #
+  # `cFreeLibrary` on the way out is correct and not a double free: this
+  # call's own `cLoadLibrary` took a reference on an already-mapped module,
+  # so this drops the count back to what it was. It is the same exit the
+  # side check above takes, and like that one it does NOT tear the
+  # allocator down.
+  let already = liveIndexOfGuid(m.guid)
+  if already >= 0:
+    warn "mod " & m.guid & ": init #2 SKIPPED (already initialised at " &
+         atSecs(gMods[already].loadedAt) & " from " & gMods[already].path &
+         "). A mod's init and on_load run ONCE per session. The second run " &
+         "would re-register every route, event, timer and detour the first " &
+         "one registered, and re-declare its settings schema over the live " &
+         "one. Nothing was loaded and the running mod is untouched: this is " &
+         "two load paths reaching the same library, not a broken mod."
+    cModInfoFree(m.info)
+    cFreeLibrary(m.module)
+    return false
+
   let index = gMods.len
   # Refused here rather than discovered later: past the end of the slot table
   # there is no flag and no counter for this mod, so `modEnter` would refuse
@@ -1147,6 +1220,7 @@ proc loadMod*(path: string; side: int32; hostName, hostVersion: string;
 
   m.hasUpdate = cModApiHasUpdate(m.api) != 0'i32
   m.live = true
+  m.loadedAt = elapsedMs()
   gMods.add m
 
   if cModApiOnLoad(m.api) != StatusOk:

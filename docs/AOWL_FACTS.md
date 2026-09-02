@@ -7813,3 +7813,50 @@ declared it, i.e. the client mod initialised twice (MOD-PERF's "modload
 double-inits every mod at 18s"). The publish-once guard (8a5d83d) is what
 turned tonight's use-after-free into a refusal; the double-init itself is
 being fixed in modload. The keybinds route now serves value/default live.
+
+## 2026-09-02 ~10:00: the mod double-init is TWO load paths, not a re-entrant one
+
+MEASURED, `aowlspt-host.log` of the 4,737,536 host, read with
+`tools/hostlog.py grep`. Two independent loaders reached the same directory:
+
+* `[0:00:01.172] asking the backend on port 80 which client mods should be
+  running, every 3000ms` -> `[0:00:04.563] the backend wants aowl.sain
+  loaded; queueing D:\Aowlsptowlspt\mods\sain\sain.dll` -> `loaded Bot AI
+  (aowl.sain)`. Six mods came up this way (morebots, sain, fovfix, graphics,
+  debug, ammoloading). This is `modcontrol` -> `opsLoad` -> `modhost.loadOne`.
+* `[0:00:40.656] releasing deferred mods now` -> `[0:00:40.672] 16 candidate
+  libraries under D:\Aowlsptowlspt\mods` -> the same six `loaded ...` lines
+  again at `[0:00:40.688]`. This is `modload.modLoadReleaseMods` ->
+  `modhost.loadAll`.
+
+`16 candidate libraries` appears ONCE in the whole log, so `loadAll` ran once:
+the duplication is two DIFFERENT entry points, not a loop.
+
+`modcontrol.doLoad` was already idempotent by contract (`gOps.indexOf(guid)
+  >= 0` -> `moNoop`, with the comment saying the apply route states a whole
+desired set rather than a diff). `loadAll` and `loadMod` never consulted the
+loaded set at all. So the ordering mattered: poll-then-release double-inits,
+release-then-poll does not.
+
+FIXED in `host/common/modhost.nim`: `loadMod` refuses a guid that is already
+LIVE, after `describe` and before `cModInit`, logging `mod <guid>: init #2
+SKIPPED (already initialised at Ns from <path>)`. Live slots only, so
+unload-then-load (hot reload, and the manager toggling a mod) still works.
+
+The refusal is NOT in `loadAll`, and that is the load-bearing detail: to skip
+by file `loadAll` would have to learn the guid via `probeGuid`, which ends in
+`cModAllocTeardown` + `cFreeLibrary`. Against a module already live in this
+process, `cLoadLibrary` returns the SAME HMODULE and that teardown collects
+the RUNNING mod's heap -- a use-after-free generator standing in for a
+use-after-free fix. Inside `loadMod` the library is already open and has
+described itself, so the check is one walk of `gMods` and no second load.
+
+MEASURED offline afterwards, `python tools/modharness.py mods/sain/bin/sain.dll`
+(0.2s, no client): a second `on_load` reproduces the live failure exactly --
+`publish-once selftest FAIL -- ... the pre-publish schema walk returned 45953
+bytes instead of an empty array` (live said 45949) -- and `settings:
+declareSettings was called a SECOND time with 55 row(s). REFUSED`. The page
+the mod serves is byte-identical across it. So sain's own guard held; the
+defect was entirely the loader's. The harness now asserts this as `on_load#2`,
+and `--selftest` drives `judge_on_load2` to all three verdicts, because no mod
+in the tree takes its FAIL branch.
