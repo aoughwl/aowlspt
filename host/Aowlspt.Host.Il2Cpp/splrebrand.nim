@@ -544,10 +544,25 @@ proc splComponent(node, typeStr: Il2CppPtr): Il2CppPtr =
     result = comp
 
 proc splTmpOf(node: Il2CppPtr): Il2CppPtr =
-  ## The TextMeshProUGUI component on a node, via the cached "TextMeshProUGUI"
-  ## type string `findtext` already seeds.
+  ## The TextMeshProUGUI component on a node, BY KLASS IDENTITY.
+  ##
+  ## This used to be `Component::GetComponent(String)` with the managed string
+  ## "TextMeshProUGUI", shared with `findtext`. MEASURED 2026-09-02 on build
+  ## 1.1.0.1.46777: that overload returns NULL for every node -- a walk of all
+  ## 1263 nodes of an OPEN Settings screen found zero TMP components, while
+  ## `label` reads their text fine. So this helper could only ever answer "no
+  ## TMP here", whatever the node. It now uses the same `System.Type` findtext
+  ## resolves from the OFFLINE name index (no reflection, no allocation).
+  ##
+  ## PREDICTION, stated rather than assumed: if this path ever appeared to
+  ## work, that was not through this call. It is worth re-checking splrebrand
+  ## live after this change.
   if not iInspSeedTextType(): return nil
-  splComponent(node, gTxtTypeStr)
+  var why = ""
+  let comp = iGetComponentOfType(node, gTmpTypeObj, why)
+  if comp != nil and duOk(comp, 0xE8'i32) and iUnityAlive(comp):
+    return comp
+  result = nil
 
 proc splTmpText(tmp: Il2CppPtr): string =
   ## m_text @0x0E0, decoded by the fixed System.String layout. Guarded exactly

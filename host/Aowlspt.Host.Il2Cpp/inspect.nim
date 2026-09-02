@@ -421,14 +421,27 @@ var gTxtBudgetLeft = 0
 var gTxtOwnerIdx = -1
 var gTxtOwnerBatch = -1
 var gTxtFrames = 0
-var gTxtTypeStr: Il2CppPtr = nil
+var gTmpTypeObj: Il2CppPtr = nil
+  ## The live `System.Type` for `TMPro.TextMeshProUGUI`, resolved through the
+  ## OFFLINE name index (no reflection) once per frame slice. This replaced
+  ## the "TextMeshProUGUI" managed string that
+  ## `GetComponent(String)` never matched -- see `iInspSeedTextType`.
+var gTxtSeedWhy = ""
+var gTxtTmpSeen = 0
+  ## THE POSITIVE CONTROL. How many nodes this search found a TMP component
+  ## ON -- not how many matched the substring. Zero TMP components across a
+  ## large, active subtree does not mean the text is absent; it means the
+  ## predicate is not seeing components at all, and the verdict must say so.
+var gTxtTmpNull = 0
+var gTxtTmpKlass = 0'u64
+var gTxtKlassNote = ""
   ## `findtext` state, deliberately separate from `find`'s own -- same shape,
   ## same resume contract (see gFindQueue et al. above), but a DIFFERENT
-  ## search so the two verbs never stomp each other's frontier. `gTxtTypeStr`
-  ## is the "TextMeshProUGUI" managed string, allocated ONCE per search
-  ## (il2cpp_string_new) and reused for every node's GetComponent call --
-  ## never re-allocated per node, which is what keeps this out of the
-  ## per-frame-managed-allocation trap.
+  ## search so the two verbs never stomp each other's frontier. The type
+  ## handle is `gTmpTypeObj` above: a System.Type resolved once per frame
+  ## slice, never per node, and `GetComponent(Type)` allocates nothing -- so
+  ## the predicate stays out of the per-frame-managed-allocation trap that
+  ## the old per-node string would have fallen into.
 
 var gInspPolls = 0
   ## Times `inspectPoll` has been ENTERED. If this stops advancing while the
@@ -607,10 +620,20 @@ proc iIsSpace(c: char): bool = c == ' ' or c == '\t' or c == '\r'
 proc iSplit(s: string): seq[string] =
   ## Whitespace split that keeps a double-quoted run together, so
   ## `write $x str "hello world"` is three tokens and not four.
+  ##
+  ## AN EXPLICITLY QUOTED EMPTY TOKEN IS KEPT. `""` used to vanish here,
+  ## because both flush sites tested `cur.len > 0` -- so `findtext "" $settings
+  ## 40000` arrived as three tokens and every argument SHIFTED ONE LEFT:
+  ## `$settings` was taken as the needle and `40000` as the root, and the
+  ## report then described, in full detail, a search nobody had asked for.
+  ## Silently changing which argument is which is the worst class of answer
+  ## this instrument can give, so an empty quoted run now becomes a real empty
+  ## token and the verb that receives it can refuse it by name.
   result = @[]
   var cur = ""
   var i = 0
   var inQuote = false
+  var wasQuoted = false
   while i < s.len:
     let c = s[i]
     if inQuote:
@@ -620,14 +643,16 @@ proc iSplit(s: string): seq[string] =
         cur.add c
     elif c == '"':
       inQuote = true
+      wasQuoted = true
     elif iIsSpace(c):
-      if cur.len > 0:
+      if cur.len > 0 or wasQuoted:
         result.add cur
         cur = ""
+        wasQuoted = false
     else:
       cur.add c
     inc i
-  if cur.len > 0:
+  if cur.len > 0 or wasQuoted:
     result.add cur
 
 proc iLines(s: string): seq[string] =
@@ -1651,6 +1676,13 @@ const
     ## exceptional one. Aligned with `find`'s default; `findtext more`
     ## resumes cheaply regardless, so a search that is genuinely slow just
     ## takes more frames, not a worse default.
+  InspTextBlindMinNodes = 200
+    ## THE POSITIVE-CONTROL THRESHOLD. Above this many nodes visited, a search
+    ## that saw ZERO TMP components has told us about its own predicate, not
+    ## about the text: any real UI subtree of this size on this client carries
+    ## captions. Below it, "no TMP here" is an ordinary and truthful outcome,
+    ## so the control would be a false alarm. 200 is chosen against the
+    ## measured 1263-node Settings screen, which is 6x it.
   InspTextFindMaxBudget = 60000
     ## Ceiling on an explicit request. Kept well under `find`'s ceiling for the
     ## same reason: a managed call per node is heavier than a pointer chase.
@@ -1674,18 +1706,254 @@ var InspFindSliceMs = 12'u64
   ## This is the per-FRAME time cap, SEPARATE from the per-command NODE budget
   ## that find/findtext already accept.
 
-proc iInspSeedTextType(): bool =
-  ## Allocate the "TextMeshProUGUI" managed string ONCE, at search start, and
-  ## reuse the same pointer for every node's GetComponent call for the rest
-  ## of the search -- including across resumed frames. Allocating a fresh
-  ## string per node would be exactly the per-frame managed allocation this
-  ## project's rules forbid, and at thousands of nodes it would also be slow
-  ## enough to fight the 12ms slice on every single node instead of once.
-  if gTxtTypeStr != nil and duOk(gTxtTypeStr, 0x18'i32):
+# --- MOVED UP 2026-09-02, not rewritten -----------------------------------
+# The klass-name reader and the receiver-type gate used to live ~1500 lines
+# further down, after `components`. `findtext` now needs them: its predicate
+# resolves a component by TYPE and then CONFIRMS the returned object's klass
+# chain, so the confirmation has to be declared before the search. Moved
+# verbatim rather than duplicated -- two copies of a type gate is how the two
+# copies come to disagree.
+# --------------------------------------------------------------------------
+proc cCompNameOf(klass: Il2CppPtr): int32 {.importc: "aowl_comp_name_of", nodecl.}
+proc cCompNameBuf(): cstring {.importc: "aowl_comp_name_buf", nodecl.}
+proc cCompIsKnownType(s: cstring): int32 {.
+  importc: "aowl_comp_is_known_type", nodecl.}
+proc cCompTypeRva(s: cstring): uint32 {.importc: "aowl_comp_type_rva", nodecl.}
+proc cCompMax(): int32 {.importc: "aowl_comp_max", nodecl.}
+proc cCompOffName(): int32 {.importc: "aowl_comp_off_name", nodecl.}
+proc cCompDataAt(rva: uint64): Il2CppPtr {.importc: "aowl_comp_data_at", nodecl.}
+
+proc iKlassName(k: uint64; verified: var bool): string =
+  ## The type name of an Il2CppClass, READ RAW AND THEN CHECKED.
+  ##
+  ## `il2cpp_class_get_name` is not an accessor on this build -- it is a
+  ## TLS thread-attach wrapper, which is the most likely reason calling it
+  ## faults -- so the name comes out of the struct directly. The `namespaze`
+  ## offset is measured from `il2cpp_class_get_namespace`'s own instruction
+  ## bytes; the `name` offset one slot earlier is INFERRED, and therefore is
+  ## never trusted on its own. Whatever string comes back must be a type that
+  ## exists in this build's metadata, per the offline table. If it is not,
+  ## this returns the string with `verified = false` and the caller prints it
+  ## as UNVERIFIED rather than as a type.
+  verified = false
+  result = ""
+  if k == 0'u64:
+    return
+  let kp = cast[Il2CppPtr](k)
+  if not duOk(kp, 0x20'i32):
+    return
+  iMark("Il2CppClass name/namespace raw read", kp)
+  if cCompNameOf(kp) == 0'i32:
+    return
+  result = readCString(cCompNameBuf())
+  if result.len == 0:
+    return
+  var nm = result
+  verified = cCompIsKnownType(toCString(nm)) != 0'i32
+
+# ---------------------------------------------------------------------------
+# THE RECEIVER TYPE CHECK, and why every verb that calls a typed method needs it
+#
+# MEASURED, live, today: `tab` was handed an `EFT.UI.AnimatedToggle` and then a
+# `UnityEngine.CanvasRenderer`. It called `EFT.UI.Settings.SettingsTab::
+# set_IsSelected` on both, wrote +0x90 on objects that have no such field, and
+# printed a perfectly plausible "first-select latch ... -> ..." line each time.
+# Nothing faulted in a way the batch survived (`escapes=1` on the channel
+# counters) and the Settings screen ended up desynced -- GRAPHICS highlighted
+# with the Game panel showing.
+#
+# That is the worst failure this instrument can produce, and it is not
+# preventable by a readability check: `duOk(tab, 0xA0)` passes on ANY object
+# that is at least 0xA0 bytes, which is nearly all of them. The only question
+# that separates "this call is correct" from "this call is a blind write into a
+# stranger's fields" is WHAT TYPE THE RECEIVER IS.
+#
+# So: read the klass name out of the object and walk `Il2CppClass.parent` until
+# the wanted type appears or the chain ends at System.Object. Three outcomes,
+# never two -- YES / NO / INCONCLUSIVE -- because "I could not read the chain"
+# is not "it is the right type", and flattening those two is the same mistake
+# in a different place.
+# ---------------------------------------------------------------------------
+
+const
+  InspKlassParentOff = 0x58'i32
+    ## `Il2CppClass.parent`. MEASURED out of the shipped GameAssembly.dll, from
+    ## `il2cpp_class_get_parent`'s OWN BODY -- the same method
+    ## `abi/aowlspt_components.h` used for `namespaze`, not a guess:
+    ##
+    ##   il2cpp_class_get_parent         40 53 48 83 ec 20 48 8b c2 48 8b d9
+    ##                                   48 85 d2 74 23 41 b8 20 00 00 00 ...
+    ##                                   85 c0 75 0a 48 8b 43 58  <- [rbx+0x58]
+    ##   il2cpp_class_get_declaring_type  ... same body ... 48 8b 43 50
+    ##   il2cpp_class_get_element_class   48 8b 41 40 c3   (folded accessor)
+    ##
+    ## 0x40 / 0x50 / 0x58 are consecutive slots of the canonical Il2CppClass
+    ## head, and `element_class` at 0x40 is independently a one-instruction
+    ## accessor, so the three corroborate each other.
+    ##
+    ## The FIELD IS READ, NEVER THE EXPORT CALLED. `il2cpp_class_get_parent` is
+    ## one of the TOKEN-GATED exports (`48 85 d2` tests a second argument we do
+    ## not pass, then `41 b8 20` -> a 32-byte memcmp); on mismatch those return
+    ## a uniform random non-zero uint64, which passes a nil check and kills the
+    ## client on first dereference.
+  InspKlassChainMax = 24
+    ## Cap on the walk. The deepest real chain measured offline is 10
+    ## (EFT.UI.Settings.SettingsScreen -> System.Object); 24 is slack with a
+    ## hard stop, because an unbounded loop on the Unity thread is a hang.
+
+  KlassNo = 0
+  KlassYes = 1
+  KlassUnknown = -1
+
+proc iKlassIs(p: Il2CppPtr; wanted: string; chain: var string): int =
+  ## Does `p`'s type derive from (or equal) `wanted`? `chain` always comes back
+  ## holding whatever WAS read, so a refusal can name the actual type.
+  ##
+  ## Every name is validated against the offline type table before it is
+  ## believed (`iKlassName`'s `verified` out-parameter). An unverified name
+  ## stops the walk with INCONCLUSIVE rather than being compared: if the name
+  ## offset were wrong for this object, comparing garbage to `wanted` would
+  ## answer NO with total confidence, and a confident NO is as bad as a
+  ## confident YES.
+  chain = ""
+  var k = iKlassOf(p)
+  if k == 0'u64:
+    return KlassUnknown
+  var hop = 0
+  while hop < InspKlassChainMax:
+    let kp = cast[Il2CppPtr](k)
+    if not duOk(kp, InspKlassParentOff + 8'i32):
+      if chain.len > 0: chain.add " <- "
+      chain.add "<klass " & iPtrU(k) & " unreadable>"
+      return KlassUnknown
+    var verified = false
+    let nm = iKlassName(k, verified)
+    if nm.len == 0:
+      if chain.len > 0: chain.add " <- "
+      chain.add "<klass " & iPtrU(k) & " has no readable name>"
+      return KlassUnknown
+    if chain.len > 0: chain.add " <- "
+    chain.add nm
+    if not verified:
+      chain.add " (UNVERIFIED -- not a type on this build)"
+      return KlassUnknown
+    if nm == wanted:
+      return KlassYes
+    let par = cast[uint64](cReadPtrAt(kp, InspKlassParentOff))
+    if par == 0'u64:
+      # The chain terminated at System.Object with every name verified. This
+      # is the ONLY way to answer NO, and it is a complete answer.
+      return KlassNo
+    if par == k:
+      chain.add " <- (self-referential parent; chain is not walkable)"
+      return KlassUnknown
+    k = par
+    inc hop
+  chain.add " <- ... (chain longer than " & $InspKlassChainMax & " hops)"
+  result = KlassUnknown
+
+proc iRequireKlass(p: Il2CppPtr; wanted, verb: string): bool =
+  ## THE GATE. True only on a POSITIVE, COMPLETE answer.
+  var chain = ""
+  let r = iKlassIs(p, wanted, chain)
+  if r == KlassYes:
+    iOut("  receiver type: " & chain & "   -- IS a " & wanted)
     return true
-  var typeName = "TextMeshProUGUI"
-  gTxtTypeStr = cNavNewString(toCString(typeName))
-  result = gTxtTypeStr != nil
+  if r == KlassNo:
+    iErr(verb & " REFUSED -- WRONG RECEIVER TYPE. This object is " & chain &
+         ", which does not derive from " & wanted & ". Nothing was called. " &
+         "A " & wanted & " method run on it would impose " & wanted & "'s " &
+         "field layout on unrelated memory, RETURN NORMALLY, and print a " &
+         "plausible line: that is measured, not hypothetical -- `tab` on an " &
+         "EFT.UI.AnimatedToggle and on a UnityEngine.CanvasRenderer wrote " &
+         "+0x90 on both and desynced the Settings screen without faulting.")
+    return false
+  iErr(verb & " REFUSED -- TYPE INCONCLUSIVE. The klass chain could not be " &
+       "read to the end: " &
+       (if chain.len > 0: chain else: "no klass pointer at all") &
+       ". 'I could not look' is not 'it is the right type', so nothing was " &
+       "called. Try `components " & (if verb == "open": "$settings" else: "EXPR") &
+       "` to see what this object actually is.")
+  result = false
+
+
+proc iTypeObjectFor(fullName: string; why: var string): Il2CppPtr =
+  ## A live `System.Type` for a FULLY-QUALIFIED type name, with no reflection
+  ## anywhere in the chain:
+  ##
+  ##   "Ns.Type" -> offline index key `Ns.Type::@type/0` -> the RVA of the
+  ##   STATIC `Il2CppType` -> `System.Type::GetTypeFromHandle`, whose argument
+  ##   is a `RuntimeTypeHandle`: a one-field struct whose value IS that
+  ##   pointer, so on Win64 it is a plain pointer in RCX.
+  ##
+  ## This is `components`' route, factored out, because `findtext` now needs
+  ## the same thing per search. `why` is always set on failure -- a silent nil
+  ## here would be indistinguishable from "the type has no components", and
+  ## those are different facts.
+  result = nil
+  why = ""
+  if cNameIdxReady() == 0'i32:
+    why = "the offline name index is not loaded, so no Il2CppType address is " &
+          "available: " & readCString(cNameIdxReason())
+    return
+  var fn = fullName
+  let rva = cCompTypeRva(toCString(fn))
+  if rva == 0'u32:
+    why = "\"" & fullName & "\" has no `::@type` entry in the offline index " &
+          "(not a type on this build, or its name mapped to two Il2CppType " &
+          "descriptors and was DROPPED rather than guessed at)"
+    return
+  let td = cCompDataAt(uint64(rva))
+  if td == nil or not duOk(td, 16'i32):
+    why = "the index gave Il2CppType RVA 0x" & iHexPad(uint64(rva), 6) &
+          " for " & fullName & ", but that address is not readable here"
+    return
+  var fnH: Il2CppPtr = nil
+  var rvaH = 0'u32
+  if not iNavFind("Type::GetTypeFromHandle", fnH, rvaH):
+    why = "System.Type::GetTypeFromHandle did not byte-verify on this build"
+    return
+  iMark("System.Type::GetTypeFromHandle", td)
+  let t = cast[Il2CppPtr](cInspUP(fnH, td, nil))
+  if t == nil or not duOk(t, 0x20'i32):
+    why = "GetTypeFromHandle returned " & iPtr(t) &
+          ", which is not a usable System.Type"
+    return
+  result = t
+
+proc iInspSeedTextType(): bool =
+  ## Get the `System.Type` for `TMPro.TextMeshProUGUI` that findtext's
+  ## predicate needs. Called ONCE PER FRAME SLICE, never per node.
+  ##
+  ## WHAT THIS REPLACED, AND WHY -- MEASURED 2026-09-02, build 1.1.0.1.46777.
+  ## It used to allocate the managed STRING "TextMeshProUGUI" and hand it to
+  ## `Component::GetComponent(String)` at every node. That call never faulted
+  ## and never answered: `findtext e $settings 40000 all` visited ALL 1263
+  ## nodes of an OPEN Settings screen -- a screen made of captions -- and
+  ## reported `0 match(es) ... genuinely NOT PRESENT`, while `label` reads TMP
+  ## text off those very nodes. Unity's string overload matches through a
+  ## runtime type-name lookup that does not resolve on this IL2CPP build, so
+  ## it returned NULL for every node. A predicate that cannot say yes makes
+  ## EVERY absence verdict vacuous (CLAUDE.md 9b), which is what it did.
+  ##
+  ## The Type overload matches by KLASS IDENTITY inside the runtime, which is
+  ## the thing we actually want to ask, and `GetComponent(Type)` allocates
+  ## NOTHING -- unlike `GetComponents(Type)`, which returns an array and is
+  ## therefore banned from a per-node path.
+  ##
+  ## Re-derived each slice rather than cached across frames: GetTypeFromHandle
+  ## returns the runtime's own cached Type object, so this is a lookup and not
+  ## an allocation, and re-deriving means a search that spans frames never
+  ## carries a stale managed pointer over a GC.
+  if gTmpTypeObj != nil and duOk(gTmpTypeObj, 0x20'i32):
+    return true
+  var why = ""
+  gTmpTypeObj = iTypeObjectFor("TMPro.TextMeshProUGUI", why)
+  if gTmpTypeObj == nil:
+    gTxtSeedWhy = why
+    return false
+  gTxtSeedWhy = ""
+  result = true
 
 proc iNavFindQuiet(want: string; fn: var Il2CppPtr): bool =
   ## Same lookup, no logging. `find` calls this thousands of times inside one
@@ -1696,6 +1964,43 @@ proc iNavFindQuiet(want: string; fn: var Il2CppPtr): bool =
       fn = cNavFn(int32(i))
       return fn != nil
   result = false
+
+proc iGetComponentOfType(target, typeObj: Il2CppPtr;
+                         why: var string): Il2CppPtr =
+  ## `GetComponent(System.Type)` with the overload picked from the receiver's
+  ## KLASS, never assumed.
+  ##
+  ## MEASURED: `UnityEngine.GameObject` declares NO `GetComponent(string)` on
+  ## this build (offline `typemethods`), so the table entry that used to be
+  ## called "GameObject::GetComponent(String)" @0x52A8510 is in fact
+  ## `GetComponent(Type)`. Passing it an `Il2CppString*` is what faulted
+  ## `component <GameObject> TextMeshProUGUI` five times out of five.
+  result = nil
+  why = ""
+  if typeObj == nil or not duOk(typeObj, 0x20'i32):
+    why = "no usable System.Type was resolved, so nothing was called"
+    return
+  if not duOk(target, 0x20'i32) or not iUnityAlive(target):
+    why = "the receiver is not readable, or its native half is null"
+    return
+  let isGo = iIsGameObject(target)
+  let overload = (if isGo: "GameObject::GetComponent(Type)"
+                  else: "Component::GetComponent(Type)")
+  var fn: Il2CppPtr = nil
+  if not iNavFindQuiet(overload, fn) or fn == nil:
+    why = overload & " did not resolve, or its prologue did not verify"
+    return
+  iMark(overload, target)
+  let c = cast[Il2CppPtr](cInspUPP(fn, target, typeObj, nil))
+  if c == nil:
+    why = "GetComponent(Type) returned NULL -- an ANSWER: this object has no " &
+          "component of that type"
+    return
+  if not duOk(c, 0x20'i32):
+    why = "GetComponent(Type) returned " & iPtr(c) & ", which is not readable"
+    return
+  iNoteKlass(c)
+  result = c
 
 proc iChildCount(t: Il2CppPtr; n: var int): bool =
   ## `Transform::get_childCount` is an ICALL, so the liveness check is not
@@ -1787,6 +2092,22 @@ proc iObjName(p: Il2CppPtr): string =
   iMark("Object::get_name", p)
   result = suiReadString(cast[Il2CppPtr](cInspUP(fn, p, nil)))
 
+# MOVED UP 2026-09-02: `children` now makes the same Component->Transform
+# conversion `tree` does, so this has to be declared before it.
+proc iToTransform(p: Il2CppPtr): Il2CppPtr =
+  ## `get_transform` on something that is already a Transform returns itself,
+  ## so this is safe for a component or a transform alike.
+  result = p
+  var idx = 0
+  var hits = 0
+  if iFindTarget("Component::get_transform", idx, hits):
+    let fn = iTargetFn(idx)
+    if fn != nil and iUnityAlive(p):
+      iMark("Component::get_transform", p)
+      let t = cast[Il2CppPtr](cInspUP(fn, p, nil))
+      if duOk(t, 0x20'i32):
+        result = t
+
 proc iCmdChildren(toks: seq[string]) =
   ## `children EXPR [N]` -- DOWNWARD traversal, the thing the inspector could
   ## never do. Walking up a parent chain can never reach a Button, so without
@@ -1805,6 +2126,21 @@ proc iCmdChildren(toks: seq[string]) =
     return
   if iRefuseIfGameObject(t, "children"):
     return
+  # ONE PREDICATE FOR BOTH VERBS. `tree` converts its argument with
+  # `iToTransform` and `children` did not, so the two DISAGREED about the same
+  # anchor: `tree $settings 2` walked it happily while `children $settings`
+  # refused with "probably not a Transform". Neither answer was wrong about
+  # what it did -- `$settings` is a SettingsScreen COMPONENT, not a Transform,
+  # and get_childCount on a component is meaningless -- but a tool that gives
+  # two different verdicts for one pointer teaches the operator to distrust
+  # both. `Component::get_transform` on something that is already a Transform
+  # returns itself, so this is the same step `tree` takes, not a new risk.
+  let t0 = t
+  t = iToTransform(t)
+  if t != t0:
+    iOut("  " & iPtr(t0) & " is a Component, not a Transform; listing the " &
+         "children of its Transform " & iPtr(t) & " (this is the same " &
+         "conversion `tree` makes -- the two verbs now agree).")
   if not iUnityAlive(t):
     iErr("that object's native half (m_CachedPtr +0x" &
          iHexPad(uint64(cNavOffCachedPtr()), 2) & ") is NULL. Every child " &
@@ -1913,20 +2249,6 @@ proc iActiveInHierarchy(cur: Il2CppPtr): (bool, bool) =
   let act = cInspUP(gFnActiveInHierarchy, go, nil)
   result = (true, (act and 1'u64) != 0'u64)
 
-proc iToTransform(p: Il2CppPtr): Il2CppPtr =
-  ## `get_transform` on something that is already a Transform returns itself,
-  ## so this is safe for a component or a transform alike.
-  result = p
-  var idx = 0
-  var hits = 0
-  if iFindTarget("Component::get_transform", idx, hits):
-    let fn = iTargetFn(idx)
-    if fn != nil and iUnityAlive(p):
-      iMark("Component::get_transform", p)
-      let t = cast[Il2CppPtr](cInspUP(fn, p, nil))
-      if duOk(t, 0x20'i32):
-        result = t
-
 proc iHierRoot(p: Il2CppPtr): Il2CppPtr =
   ## Climb to the top of the hierarchy. ONLY called when the caller did not
   ## name a root -- doing it unconditionally is the bug that made every
@@ -2007,7 +2329,7 @@ proc iFindStep(): int =
   result = FindDone
 
 proc iFindReportGeneric(status: int; visited, frames, found, invalidSkips,
-                         frontier: int; verb, subjectAbsent: string;
+                         frontier: int; verb, subjectAbsent, blindNote: string;
                          active: var bool; ownerIdx, ownerBatch: var int) =
   ## Shared reporting contract for `find` and `findtext`. Only called when the
   ## search has actually STOPPED -- running out of time is not stopping, that
@@ -2039,6 +2361,15 @@ proc iFindReportGeneric(status: int; visited, frames, found, invalidSkips,
             else: "") &
            "). This is NOT evidence the search subject is absent -- it " &
            "means the search never actually looked. Check the root pointer.")
+    elif found == 0 and blindNote.len > 0:
+      # THE THIRD OUTCOME. The walk completed and matched nothing, but the
+      # caller has evidence that its own PREDICATE never saw the thing it
+      # tests -- so "exhaustive" is true of the traversal and says nothing
+      # about the subject. A verdict of NOT PRESENT here would be a check
+      # that cannot fail, which is the bug this whole report contract exists
+      # to prevent (CLAUDE.md 9b). Three outcomes, never two.
+      iOut("  -- INCONCLUSIVE, NOT a miss. The traversal was exhaustive; the " &
+           "PREDICATE was not usable. " & blindNote)
     else:
       iOut("  -- the subtree was searched EXHAUSTIVELY. " &
            (if found == 0:
@@ -2093,8 +2424,11 @@ proc iFindStopReason(st: int; budgetLeft, frames: int): int =
 proc iFindReport(status: int) =
   iFindReportGeneric(status, gFindVisited, gFindFrames, gFindFound,
                       gFindInvalidSkips, gFindQueue.len - gFindHead,
-                      "find", "That name", gFindActive, gFindOwnerIdx,
+                      "find", "That name", "", gFindActive, gFindOwnerIdx,
                       gFindOwnerBatch)
+  # `find`'s predicate is a raw name compare on a node it already walked --
+  # it has no separate instrument that can go blind -- so it passes no blind
+  # note. That is a statement about this predicate, not a default.
 
 proc iFindFirstByName(want: string; root: Il2CppPtr; budget: int): Il2CppPtr =
   ## Resolve a root BY NAME, so `find X in Y` does not require already knowing
@@ -2188,9 +2522,26 @@ proc iFindTextStep(): int =
   ## than stopping at the first TMP found under a subtree -- each TMP in
   ## practice sits on its own GameObject, so a full node-by-node walk already
   ## covers all of them without a second, heavier per-node component listing.
+  ## THE PREDICATE IS NOW KLASS IDENTITY, NOT A TYPE-NAME STRING.
+  ## `Component::GetComponent(Type)` @0x52A45E0 matches inside the runtime by
+  ## class, takes the `System.Type` resolved once per slice from the offline
+  ## index, and allocates nothing. The string overload it replaced returned
+  ## NULL on all 1263 nodes of an open Settings screen -- see
+  ## `iInspSeedTextType` for that measurement.
+  # A SEEDING FAILURE MID-SEARCH IS A STOP, NOT A COMPLETION. Returning
+  # FindDone here would let the report say "searched EXHAUSTIVELY" about a
+  # frame in which the predicate did not exist -- the same wrong-answer shape
+  # this whole change is about. FindOutOfBudget reports STOPPED EARLY.
+  if not iInspSeedTextType():
+    gTxtKlassNote = "the System.Type for TMPro.TextMeshProUGUI stopped " &
+      "resolving mid-search (" & gTxtSeedWhy & "), so this search STOPPED " &
+      "rather than finished; no absence verdict is available"
+    return FindOutOfBudget
   var fn: Il2CppPtr = nil
-  if not iNavFindQuiet("Component::GetComponent(String)", fn) or fn == nil:
-    return FindDone
+  if not iNavFindQuiet("Component::GetComponent(Type)", fn) or fn == nil:
+    gTxtKlassNote = "Component::GetComponent(Type) @0x52A45E0 did not " &
+      "resolve or did not byte-verify, so nothing could be asked of any node"
+    return FindOutOfBudget
   let started = cNowMs()
   var spent = 0
   while gTxtHead < gTxtQueue.len:
@@ -2212,9 +2563,35 @@ proc iFindTextStep(): int =
     # EVERY HOP GUARDED. `cur` is a Transform by contract (queue is seeded and
     # fed only from Transforms below), so the Component overload is correct
     # here without the GameObject/Component branch `component` needs.
-    iMark("Component::GetComponent(String) [findtext]", cur)
-    let comp = cast[Il2CppPtr](cInspUPP(fn, cur, gTxtTypeStr, nil))
+    iMark("Component::GetComponent(Type) [findtext]", cur)
+    let comp = cast[Il2CppPtr](cInspUPP(fn, cur, gTmpTypeObj, nil))
+    if comp == nil:
+      inc gTxtTmpNull
     if comp != nil and duOk(comp, 0xE8'i32) and iUnityAlive(comp):
+      # THE POSITIVE CONTROL, counted at the source: a TMP component was
+      # actually returned for this node. `gTxtTmpSeen == 0` over a large walk
+      # is the signature of a blind predicate, and the report refuses to say
+      # NOT PRESENT in that case.
+      inc gTxtTmpSeen
+      # KLASS IDENTITY, CONFIRMED ONCE PER DISTINCT KLASS, not per node. The
+      # runtime already matched by class; this checks that what came back
+      # really is a TextMeshProUGUI by walking its Il2CppClass.parent chain
+      # and validating every name against this build's metadata. A repeat of
+      # a klass already confirmed costs one pointer compare.
+      let ck = iKlassOf(comp)
+      if ck != 0'u64 and ck != gTxtTmpKlass and gTxtKlassNote.len == 0:
+        var chain = ""
+        let verdict = iKlassIs(comp, "TMPro.TextMeshProUGUI", chain)
+        if verdict == KlassYes:
+          gTxtTmpKlass = ck
+        elif verdict == KlassNo:
+          gTxtKlassNote = "the component returned for the TMP type is " &
+            chain & ", which does NOT derive from TMPro.TextMeshProUGUI -- " &
+            "the hits below are suspect"
+        else:
+          gTxtKlassNote = "the klass chain of the returned component could " &
+            "not be read to the end (" & chain & "); hits are reported but " &
+            "their type is UNCONFIRMED"
       # `comp` is a real Component pointer returned by GetComponent by
       # contract -- unlike `label`'s EXPR, it is never a bare Transform, so
       # no klass-confusion guard is needed here. `sp` (m_text at +0xE0) IS
@@ -2259,10 +2636,36 @@ proc iFindTextReport(status: int) =
   ## unpressable nodes is the same wrong-answer class as the other findtext
   ## defects (fact #72: a press on an inactive node returns ok=True and does
   ## nothing).
+  # THE POSITIVE CONTROL, EVALUATED HERE AND NOWHERE ELSE.
+  #
+  # `gTxtTmpSeen` counts nodes that RETURNED a TMP component, which is a
+  # different question from how many matched the substring. If a large,
+  # normally caption-rich walk found ZERO components, the predicate is blind
+  # and no absence verdict is available -- that is exactly the state the old
+  # string-overload predicate was in permanently, and it reported "genuinely
+  # NOT PRESENT" for 1263 nodes of an open Settings screen.
+  #
+  # The threshold is on NODES VISITED, not on hits: a 5-node search that
+  # legitimately contains no TMP must still be able to answer NOT PRESENT.
+  var blindNote = ""
+  if gTxtVisited > InspTextBlindMinNodes and gTxtTmpSeen == 0:
+    blindNote = "INCONCLUSIVE: no TMP component was seen on any node, " &
+      "the predicate is blind. " & $gTxtVisited & " node(s) were visited and " &
+      "Component::GetComponent(Type) returned NULL on every one of them (" &
+      $gTxtTmpNull & " NULLs), so this search never had a way to say yes. " &
+      "This is NOT evidence the text is absent. Check that the offline name " &
+      "index is loaded (`state`) and that TMPro.TextMeshProUGUI resolved."
   iFindReportGeneric(status, gTxtVisited, gTxtFrames, gTxtFound,
                       gTxtInvalidSkips, gTxtQueue.len - gTxtHead,
                       "findtext", "No TMP text containing that substring",
+                      blindNote,
                       gTxtActive, gTxtOwnerIdx, gTxtOwnerBatch)
+  if gTxtTmpSeen > 0:
+    iOut("  predicate control: " & $gTxtTmpSeen & " node(s) carried a " &
+         "TextMeshProUGUI (of " & $gTxtVisited & " visited) -- the predicate " &
+         "demonstrably CAN answer yes on this subtree.")
+  if gTxtKlassNote.len > 0:
+    iErr("klass identity: " & gTxtKlassNote)
   if gTxtActiveOnly:
     iOut("  scope: ACTIVE nodes only (activeInHierarchy)" &
          (if gTxtInactiveSkipped > 0:
@@ -2739,8 +3142,9 @@ proc iCmdFindText(toks: seq[string]) =
     if budget > InspTextFindMaxBudget:
       budget = InspTextFindMaxBudget
     if not iInspSeedTextType():
-      iErr("il2cpp_string_new failed for \"TextMeshProUGUI\"; nothing was " &
-           "called.")
+      iErr("could not resolve a System.Type for TMPro.TextMeshProUGUI, so " &
+           "the predicate has nothing to match with and NOTHING WAS " &
+           "SEARCHED (this is not a miss): " & gTxtSeedWhy)
       return
     iOut("  resuming text search for \"" & gTxtWant & "\" from a frontier of " &
          $(gTxtQueue.len - gTxtHead) & " node(s), budget " & $budget)
@@ -2756,14 +3160,10 @@ proc iCmdFindText(toks: seq[string]) =
     iFindTextReport(iFindStopReason(st, gTxtBudgetLeft, gTxtFrames))
     return
 
-  if cNavIcallReady() == 0'i32:
-    iErr("the icall \"UnityEngine.Component::GetComponent(System.String)\" is " &
-         "NOT registered in this runtime, so findtext cannot resolve any " &
-         "components. Nothing was searched.")
-    return
   if not iInspSeedTextType():
-    iErr("il2cpp_string_new failed for \"TextMeshProUGUI\"; nothing was " &
-         "searched.")
+    iErr("could not resolve a System.Type for TMPro.TextMeshProUGUI, so the " &
+         "predicate has nothing to match with and NOTHING WAS SEARCHED " &
+         "(this is not a miss): " & gTxtSeedWhy)
     return
 
   # `all` is a trailing keyword, stripped before ROOT/BUDGET parsing so it
@@ -2775,6 +3175,19 @@ proc iCmdFindText(toks: seq[string]) =
   let includeInactive = ftoks.len > 2 and iLower(ftoks[^1]) == "all"
   if includeInactive:
     ftoks.setLen(ftoks.len - 1)
+
+  # AN EMPTY NEEDLE IS A REFUSAL, NOT A SEARCH.
+  #
+  # `findtext "" $settings 40000` used to drop the empty token during
+  # splitting and SHIFT the arguments left: `$settings` became the needle,
+  # `40000` became the root, and the report described a search nobody asked
+  # for. An empty substring also matches every string trivially, so there is
+  # no reading of it that produces a useful answer.
+  if ftoks[1].len == 0:
+    iErr("findtext REFUSED: the needle is empty. An empty substring matches " &
+         "every label, and an empty token shifts ROOT/BUDGET one place left " &
+         "-- so this is a typo, not a query. Nothing was searched.")
+    return
 
   let want = ftoks[1]
   var root: Il2CppPtr = nil
@@ -2808,6 +3221,13 @@ proc iCmdFindText(toks: seq[string]) =
   gTxtInvalidSkips = 0
   gTxtActiveOnly = not includeInactive
   gTxtInactiveSkipped = 0
+  # The positive control is per SEARCH, not per frame -- a resumed search
+  # keeps counting, so `findtext more` cannot inherit a stale "the predicate
+  # works" from a previous needle.
+  gTxtTmpSeen = 0
+  gTxtTmpNull = 0
+  gTxtTmpKlass = 0'u64
+  gTxtKlassNote = ""
   gTxtFound = 0
   gTxtActive = false
   gTxtBudgetLeft = budget
@@ -3124,17 +3544,63 @@ proc iCmdComponent(toks: seq[string]) =
   # `gGoKlass` is learned only from sources that return a GameObject BY
   # CONTRACT, so this is a fact about the pointer, not a guess, and it is a
   # klass compare -- it costs nothing and cannot fault.
-  let isGo = iIsGameObject(target)
-  let overload = (if isGo: "GameObject::GetComponent(String)"
-                  else: "Component::GetComponent(String)")
+  # THE TYPE ROUTE FIRST, AND WHY THE OLD OVERLOAD CHOICE WAS THE FAULT.
+  #
+  # MEASURED offline (`typemethods UnityEngine.GameObject`): this build's
+  # GameObject declares NO `GetComponent(string)` -- only `GetComponent(Type)`
+  # @0x52A8510. This command used to pick that RVA for a GameObject receiver,
+  # believing it to be the string overload, and hand it an `Il2CppString*`.
+  # That is a managed type confusion inside Unity's own code and it is what
+  # faulted `component <GameObject> TextMeshProUGUI` 5/5 tonight -- five of
+  # the session's eight faults, spent on a mislabelled table entry.
+  #
+  # So: if the name resolves to a real Il2CppType in the offline index, the
+  # TYPE overload is used, which matches by klass identity and works on both
+  # receivers. Only if it does not (a short name like `Button`) do we fall
+  # back to the STRING overload -- and that one exists ONLY on Component, so
+  # a GameObject receiver is converted to its Transform first rather than
+  # being handed to a function that does not take a string.
+  var wantType = toks[2]
+  var typeWhy = ""
+  let tobj = iTypeObjectFor(wantType, typeWhy)
+  if tobj != nil:
+    var why = ""
+    let c = iGetComponentOfType(target, tobj, why)
+    if c == nil:
+      iErr("via GetComponent(Type) on " & iPtr(target) & ": " & why &
+           ". (This is the klass-identity route: the offline index resolved " &
+           toks[2] & " to a real Il2CppType, so a NULL here is an ANSWER " &
+           "about this object, not a name-matching failure.)")
+      return
+    iSetVar("comp", cast[uint64](c))
+    iOut("  FOUND " & toks[2] & " component = " & iPtr(c) &
+         "  klass=" & iPtrU(iKlassOf(c)) & "   ($comp)   " &
+         "via GetComponent(System.Type) -- klass identity, no string match")
+    iOut("  bound to $comp -- e.g.  allow write   then   click $comp")
+    return
+  iOut("  \"" & toks[2] & "\" did not resolve as a fully-qualified type in " &
+       "the offline index (" & typeWhy & "), so the STRING overload is used " &
+       "instead. Prefer the fully-qualified name (e.g. " &
+       "TMPro.TextMeshProUGUI, UnityEngine.UI.Button): that route matches by " &
+       "klass identity rather than by Unity's short-name lookup.")
+  # The string overload is a Component method and nothing else on this build.
+  var strTarget = target
+  if iIsGameObject(target):
+    let t = iTransformOfGameObject(target)
+    if t == nil:
+      iErr("this is a GameObject and there is no string GetComponent on " &
+           "GameObject in this build, so its Transform is needed as the " &
+           "receiver -- and GameObject::get_transform did not return one. " &
+           "Nothing was called and no fault was spent.")
+      return
+    strTarget = t
+    iOut("  target is a GameObject; the string overload exists only on " &
+         "Component, so its Transform " & iPtr(t) & " is the receiver.")
+  let overload = "Component::GetComponent(String)"
   var fn: Il2CppPtr = nil
   var rva = 0'u32
   if not iNavFind(overload, fn, rva):
     return
-  if isGo:
-    iOut("  target is a GameObject, so the GameObject overload is used " &
-         "rather than the Component one (calling Component::GetComponent on " &
-         "a GameObject is a native type confusion that faults inside Unity).")
   # The wrapper's failure branch RAISES a missing-method exception, and a
   # managed throw from inside our own call on the Unity thread is not something
   # to discover empirically. Ask first, off the hot path.
@@ -3152,10 +3618,10 @@ proc iCmdComponent(toks: seq[string]) =
          "\"; nothing was called.")
     return
   iOut("  via UnityEngine." & overload & " @0x" &
-       iHexPad(uint64(rva), 6) & " (call) on " & iPtr(target) &
+       iHexPad(uint64(rva), 6) & " (call) on " & iPtr(strTarget) &
        "   type string = " & iPtr(sp))
-  iMark(overload, target)
-  let comp = cast[Il2CppPtr](cInspUPP(fn, target, sp, nil))
+  iMark(overload, strTarget)
+  let comp = cast[Il2CppPtr](cInspUPP(fn, strTarget, sp, nil))
   if comp == nil:
     iErr("GetComponent returned NULL -- this is an ANSWER, not a crash. " &
          "Either this object genuinely has no " & toks[2] & " (it may be a " &
@@ -3171,167 +3637,6 @@ proc iCmdComponent(toks: seq[string]) =
        "  klass=" & iPtrU(iKlassOf(comp)) & "   ($comp)")
   iOut("  bound to $comp -- e.g.  allow write   then   click $comp")
 
-proc cCompNameOf(klass: Il2CppPtr): int32 {.importc: "aowl_comp_name_of", nodecl.}
-proc cCompNameBuf(): cstring {.importc: "aowl_comp_name_buf", nodecl.}
-proc cCompIsKnownType(s: cstring): int32 {.
-  importc: "aowl_comp_is_known_type", nodecl.}
-proc cCompTypeRva(s: cstring): uint32 {.importc: "aowl_comp_type_rva", nodecl.}
-proc cCompMax(): int32 {.importc: "aowl_comp_max", nodecl.}
-proc cCompOffName(): int32 {.importc: "aowl_comp_off_name", nodecl.}
-proc cCompDataAt(rva: uint64): Il2CppPtr {.importc: "aowl_comp_data_at", nodecl.}
-
-proc iKlassName(k: uint64; verified: var bool): string =
-  ## The type name of an Il2CppClass, READ RAW AND THEN CHECKED.
-  ##
-  ## `il2cpp_class_get_name` is not an accessor on this build -- it is a
-  ## TLS thread-attach wrapper, which is the most likely reason calling it
-  ## faults -- so the name comes out of the struct directly. The `namespaze`
-  ## offset is measured from `il2cpp_class_get_namespace`'s own instruction
-  ## bytes; the `name` offset one slot earlier is INFERRED, and therefore is
-  ## never trusted on its own. Whatever string comes back must be a type that
-  ## exists in this build's metadata, per the offline table. If it is not,
-  ## this returns the string with `verified = false` and the caller prints it
-  ## as UNVERIFIED rather than as a type.
-  verified = false
-  result = ""
-  if k == 0'u64:
-    return
-  let kp = cast[Il2CppPtr](k)
-  if not duOk(kp, 0x20'i32):
-    return
-  iMark("Il2CppClass name/namespace raw read", kp)
-  if cCompNameOf(kp) == 0'i32:
-    return
-  result = readCString(cCompNameBuf())
-  if result.len == 0:
-    return
-  var nm = result
-  verified = cCompIsKnownType(toCString(nm)) != 0'i32
-
-# ---------------------------------------------------------------------------
-# THE RECEIVER TYPE CHECK, and why every verb that calls a typed method needs it
-#
-# MEASURED, live, today: `tab` was handed an `EFT.UI.AnimatedToggle` and then a
-# `UnityEngine.CanvasRenderer`. It called `EFT.UI.Settings.SettingsTab::
-# set_IsSelected` on both, wrote +0x90 on objects that have no such field, and
-# printed a perfectly plausible "first-select latch ... -> ..." line each time.
-# Nothing faulted in a way the batch survived (`escapes=1` on the channel
-# counters) and the Settings screen ended up desynced -- GRAPHICS highlighted
-# with the Game panel showing.
-#
-# That is the worst failure this instrument can produce, and it is not
-# preventable by a readability check: `duOk(tab, 0xA0)` passes on ANY object
-# that is at least 0xA0 bytes, which is nearly all of them. The only question
-# that separates "this call is correct" from "this call is a blind write into a
-# stranger's fields" is WHAT TYPE THE RECEIVER IS.
-#
-# So: read the klass name out of the object and walk `Il2CppClass.parent` until
-# the wanted type appears or the chain ends at System.Object. Three outcomes,
-# never two -- YES / NO / INCONCLUSIVE -- because "I could not read the chain"
-# is not "it is the right type", and flattening those two is the same mistake
-# in a different place.
-# ---------------------------------------------------------------------------
-
-const
-  InspKlassParentOff = 0x58'i32
-    ## `Il2CppClass.parent`. MEASURED out of the shipped GameAssembly.dll, from
-    ## `il2cpp_class_get_parent`'s OWN BODY -- the same method
-    ## `abi/aowlspt_components.h` used for `namespaze`, not a guess:
-    ##
-    ##   il2cpp_class_get_parent         40 53 48 83 ec 20 48 8b c2 48 8b d9
-    ##                                   48 85 d2 74 23 41 b8 20 00 00 00 ...
-    ##                                   85 c0 75 0a 48 8b 43 58  <- [rbx+0x58]
-    ##   il2cpp_class_get_declaring_type  ... same body ... 48 8b 43 50
-    ##   il2cpp_class_get_element_class   48 8b 41 40 c3   (folded accessor)
-    ##
-    ## 0x40 / 0x50 / 0x58 are consecutive slots of the canonical Il2CppClass
-    ## head, and `element_class` at 0x40 is independently a one-instruction
-    ## accessor, so the three corroborate each other.
-    ##
-    ## The FIELD IS READ, NEVER THE EXPORT CALLED. `il2cpp_class_get_parent` is
-    ## one of the TOKEN-GATED exports (`48 85 d2` tests a second argument we do
-    ## not pass, then `41 b8 20` -> a 32-byte memcmp); on mismatch those return
-    ## a uniform random non-zero uint64, which passes a nil check and kills the
-    ## client on first dereference.
-  InspKlassChainMax = 24
-    ## Cap on the walk. The deepest real chain measured offline is 10
-    ## (EFT.UI.Settings.SettingsScreen -> System.Object); 24 is slack with a
-    ## hard stop, because an unbounded loop on the Unity thread is a hang.
-
-  KlassNo = 0
-  KlassYes = 1
-  KlassUnknown = -1
-
-proc iKlassIs(p: Il2CppPtr; wanted: string; chain: var string): int =
-  ## Does `p`'s type derive from (or equal) `wanted`? `chain` always comes back
-  ## holding whatever WAS read, so a refusal can name the actual type.
-  ##
-  ## Every name is validated against the offline type table before it is
-  ## believed (`iKlassName`'s `verified` out-parameter). An unverified name
-  ## stops the walk with INCONCLUSIVE rather than being compared: if the name
-  ## offset were wrong for this object, comparing garbage to `wanted` would
-  ## answer NO with total confidence, and a confident NO is as bad as a
-  ## confident YES.
-  chain = ""
-  var k = iKlassOf(p)
-  if k == 0'u64:
-    return KlassUnknown
-  var hop = 0
-  while hop < InspKlassChainMax:
-    let kp = cast[Il2CppPtr](k)
-    if not duOk(kp, InspKlassParentOff + 8'i32):
-      if chain.len > 0: chain.add " <- "
-      chain.add "<klass " & iPtrU(k) & " unreadable>"
-      return KlassUnknown
-    var verified = false
-    let nm = iKlassName(k, verified)
-    if nm.len == 0:
-      if chain.len > 0: chain.add " <- "
-      chain.add "<klass " & iPtrU(k) & " has no readable name>"
-      return KlassUnknown
-    if chain.len > 0: chain.add " <- "
-    chain.add nm
-    if not verified:
-      chain.add " (UNVERIFIED -- not a type on this build)"
-      return KlassUnknown
-    if nm == wanted:
-      return KlassYes
-    let par = cast[uint64](cReadPtrAt(kp, InspKlassParentOff))
-    if par == 0'u64:
-      # The chain terminated at System.Object with every name verified. This
-      # is the ONLY way to answer NO, and it is a complete answer.
-      return KlassNo
-    if par == k:
-      chain.add " <- (self-referential parent; chain is not walkable)"
-      return KlassUnknown
-    k = par
-    inc hop
-  chain.add " <- ... (chain longer than " & $InspKlassChainMax & " hops)"
-  result = KlassUnknown
-
-proc iRequireKlass(p: Il2CppPtr; wanted, verb: string): bool =
-  ## THE GATE. True only on a POSITIVE, COMPLETE answer.
-  var chain = ""
-  let r = iKlassIs(p, wanted, chain)
-  if r == KlassYes:
-    iOut("  receiver type: " & chain & "   -- IS a " & wanted)
-    return true
-  if r == KlassNo:
-    iErr(verb & " REFUSED -- WRONG RECEIVER TYPE. This object is " & chain &
-         ", which does not derive from " & wanted & ". Nothing was called. " &
-         "A " & wanted & " method run on it would impose " & wanted & "'s " &
-         "field layout on unrelated memory, RETURN NORMALLY, and print a " &
-         "plausible line: that is measured, not hypothetical -- `tab` on an " &
-         "EFT.UI.AnimatedToggle and on a UnityEngine.CanvasRenderer wrote " &
-         "+0x90 on both and desynced the Settings screen without faulting.")
-    return false
-  iErr(verb & " REFUSED -- TYPE INCONCLUSIVE. The klass chain could not be " &
-       "read to the end: " &
-       (if chain.len > 0: chain else: "no klass pointer at all") &
-       ". 'I could not look' is not 'it is the right type', so nothing was " &
-       "called. Try `components " & (if verb == "open": "$settings" else: "EXPR") &
-       "` to see what this object actually is.")
-  result = false
 
 proc iGetComponentQuiet(target: Il2CppPtr; typeName: string;
                         why: var string): Il2CppPtr =
@@ -3345,9 +3650,22 @@ proc iGetComponentQuiet(target: Il2CppPtr; typeName: string;
   if not duOk(target, 0x20'i32) or not iUnityAlive(target):
     why = "the object is not readable, or its native half is null"
     return
-  let isGo = iIsGameObject(target)
-  let overload = (if isGo: "GameObject::GetComponent(String)"
-                  else: "Component::GetComponent(String)")
+  # The STRING overload exists ONLY on UnityEngine.Component in this build
+  # (MEASURED: `typemethods UnityEngine.GameObject` lists GetComponent(Type)
+  # and no string form). Handing a GameObject to the RVA that was mislabelled
+  # "GameObject::GetComponent(String)" passed a String where a System.Type was
+  # expected, and faulted. So a GameObject receiver is converted to its
+  # Transform, which IS a Component, rather than being passed through.
+  var recv = target
+  if iIsGameObject(target):
+    let t = iTransformOfGameObject(target)
+    if t == nil:
+      why = "this is a GameObject, the string GetComponent overload does not " &
+            "exist on GameObject in this build, and get_transform gave no " &
+            "Component receiver -- so nothing could be asked"
+      return
+    recv = t
+  let overload = "Component::GetComponent(String)"
   var fn: Il2CppPtr = nil
   var rva = 0'u32
   if not iNavFind(overload, fn, rva):
@@ -3362,8 +3680,8 @@ proc iGetComponentQuiet(target: Il2CppPtr; typeName: string;
   if sp == nil:
     why = "il2cpp_string_new returned null for \"" & typeName & "\""
     return
-  iMark(overload, target)
-  let comp = cast[Il2CppPtr](cInspUPP(fn, target, sp, nil))
+  iMark(overload, recv)
+  let comp = cast[Il2CppPtr](cInspUPP(fn, recv, sp, nil))
   if comp == nil:
     why = "GetComponent(\"" & typeName & "\") returned NULL -- an ANSWER: " &
           "this object has no such component"
@@ -4986,9 +5304,19 @@ proc iVisComponent(target: Il2CppPtr; typeName: string; comp: var Il2CppPtr;
   if not iVisSelfOk(target):
     why = "the receiver is unreadable, or its native half is null"
     return false
-  let isGo = iIsGameObject(target)
-  let overload = (if isGo: "GameObject::GetComponent(String)"
-                  else: "Component::GetComponent(String)")
+  # Same correction as `iGetComponentQuiet`: on this build the string
+  # overload is declared by UnityEngine.Component ONLY, so a GameObject
+  # receiver is converted to its Transform instead of being sent to
+  # GetComponent(Type) with a String in RDX.
+  var recv = target
+  if iIsGameObject(target):
+    let t = iTransformOfGameObject(target)
+    if t == nil:
+      why = "this is a GameObject and no Component receiver could be " &
+            "obtained from it, so the string overload could not be asked"
+      return false
+    recv = t
+  let overload = "Component::GetComponent(String)"
   var fn: Il2CppPtr = nil
   if not iNavFindQuiet(overload, fn) or fn == nil:
     why = overload & " did not resolve or did not verify on this build"
@@ -5003,8 +5331,8 @@ proc iVisComponent(target: Il2CppPtr; typeName: string; comp: var Il2CppPtr;
   if sp == nil:
     why = "il2cpp_string_new returned null for \"" & typeName & "\""
     return false
-  iMark(overload & " [visible " & typeName & "]", target)
-  let c = cast[Il2CppPtr](cInspUPP(fn, target, sp, nil))
+  iMark(overload & " [visible " & typeName & "]", recv)
+  let c = cast[Il2CppPtr](cInspUPP(fn, recv, sp, nil))
   if c != nil and not duOk(c, 0x20'i32):
     why = "GetComponent(\"" & typeName & "\") returned 0x" &
           iHexPad(cast[uint64](c), 16) & ", which is not readable memory"

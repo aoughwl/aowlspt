@@ -345,11 +345,65 @@ static const AowlNavTarget aowl_nav_targets[] = {
      * right overload exists at 0x52A8510, and that which one to use is decided
      * from the klass pointer for free, before anything is called. A fault that
      * can be avoided by picking the right function should never be spent. */
-    { "UnityEngine.GameObject::GetComponent(String)", 0x52A8510u,
+    /* ---- CORRECTED 2026-09-02: THIS RVA IS THE **Type** OVERLOAD.
+     *
+     * It was in this table as "GameObject::GetComponent(String)" and it is
+     * not one. MEASURED, offline, out of this build's own metadata:
+     *
+     *   python tools/il2cpp_resolve.py <GameAssembly.dll> <metadata.dec.dat> \
+     *          typemethods UnityEngine.GameObject   | grep GetComponent
+     *   -> Component GetComponent(Type type)   arity=1  RVA=0x52a8510  UNIQUE
+     *
+     * `UnityEngine.GameObject` declares NO `GetComponent(string)` overload at
+     * all on this build -- only `UnityEngine.Component` does (0x52A48E0,
+     * "Component GetComponent(string type)", also confirmed by typemethods).
+     * So every caller that picked "the GameObject overload" for a GameObject
+     * receiver and then passed an `Il2CppString*` was calling
+     * GetComponent(Type) with a String in RDX. That is a managed type
+     * confusion inside Unity's own code, and it is the measured cause of
+     * `component <GameObject> TextMeshProUGUI` faulting 5/5 tonight.
+     *
+     * The name is corrected rather than kept for compatibility: a table entry
+     * that names the wrong signature is exactly the confidently-wrong answer
+     * this instrument exists to abolish. Only inspect.nim looked this one up.
+     * (`Component::GetComponent(String)` @0x52A48E0 above is untouched and IS
+     * correctly named -- other host files depend on it.) */
+    { "UnityEngine.GameObject::GetComponent(Type)", 0x52A8510u,
       { 0x48,0x89,0x5C,0x24,0x08,
         0x57,
         0x48,0x83,0xEC,0x20,
         0x48,0x8B,0x05,0x17,0xC0,0xE2 }, 16 },
+
+    /* ---- `UnityEngine.Component::GetComponent(Type)` -- THE PREDICATE THAT
+     * ACTUALLY SEES A TextMeshProUGUI.
+     *
+     *   typemethods UnityEngine.Component:
+     *     Component GetComponent(Type type)  arity=1  RVA=0x52a45e0  UNIQUE
+     *
+     * WHY IT IS NEEDED, MEASURED: the String overload (0x52A48E0) never
+     * faults and never answers -- `findtext e $settings 40000 all` visited
+     * ALL 1263 nodes of an OPEN Settings screen and returned 0 hits, while
+     * `label` reads TMP text off those same nodes. Unity's string overload
+     * matches by a runtime type-name lookup that does not resolve
+     * "TextMeshProUGUI" on this IL2CPP build, so it returns NULL for every
+     * node: a predicate that cannot say yes, i.e. every absence verdict
+     * findtext ever gave was vacuous.
+     *
+     * The Type overload takes a live `System.Type`, which is reachable with
+     * NO reflection: the static `Il2CppType*` comes out of the offline name
+     * index (`TMPro.TextMeshProUGUI::@type/0` -> RVA 0x6F91860) and
+     * `System.Type::GetTypeFromHandle` (already in this table) turns it into
+     * the Type object. That is the same route `components` already uses, and
+     * unlike `GetComponents(Type)` this one ALLOCATES NOTHING, so it is legal
+     * in a per-node walk.
+     *
+     * A Transform IS a Component, so this takes exactly what the traversal
+     * already holds, with no GameObject conversion to get wrong. */
+    { "UnityEngine.Component::GetComponent(Type)", 0x52A45E0u,
+      { 0x48,0x89,0x5C,0x24,0x08,
+        0x57,
+        0x48,0x83,0xEC,0x20,
+        0x48,0x8B,0x05,0xF7,0xFE,0xE2 }, 16 },
 
     { "System.Type::GetTypeFromHandle", 0x458B020u,
       { 0x40,0x53,

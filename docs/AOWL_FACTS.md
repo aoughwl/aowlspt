@@ -4288,6 +4288,22 @@ Backend log line: "listening on http://127.0.0.1:6969". Port 80 is actively refu
 
 - evidence: urlopen to 127.0.0.1:80 -> WinError 10061 actively refused, while the same POST to 127.0.0.1:6969 returned the 6-profile list.
 
+### #330 — the sain client crash of 2026-09-02 03:00 (toJson/schemaJson/onPageQuery)
+
+**the published settings schema buffer had been FREED -- mimalloc's 0xDF fill -- NOT an out-of-range walk and NOT an uninitialised field**
+
+`Player.log` named `toJson <- schemaJson <- onPageQuery <- eventTrampoline` under six host frames and `BaseThreadInitThunk`, i.e. a `aowlspt.settings.pageQuery` delivered on a host worker thread. Those three procs are NOT in `mods/sain/client/*.nim`: the mangling suffix `sethgq4xy1` is `aowl/src/aowlspt/settings.nim`, the SDK module every mod that calls `declareSettings` compiles in, so 15 mods carry the identical handler.
+
+Disassembling the faulting RVA (0x4E345, imagebase 0x180000000) gives `mov 0xa0(%rbx),%rax; mov (%rax),%rax` -- `len(s.optionsUrl)` reading `more_0->fullLen_0`, the out-of-line length of a nimony long string (`{bytes_0: u64 whose low byte is the length if <= 14, more_0: LongString*}`; tag 0xFE = static literal, 0xFF = refcounted heap). From the dump: RAX = 0xdfdfdfdfdfdfdfdf, RDX = 0xdf, RBX = 0x21dd2054180, and the seq header on the stack read `len = 54, data = 0x21dd2053000`. RBX - data = 0x1180 = exactly 20 * 224, and `sizeof(Setting)` IS 224 -- so the index was in range and the arithmetic exact. 0xDF is mimalloc's `MI_DEBUG_FREED`, and nimony's `alloc` is `mi_malloc`. The 12 KB schema buffer had been freed under a live reader.
+
+That rules out the two readings the stack alone supports. It is not a handler running before init (`declareSettings` assigns `gDeclared` BEFORE it subscribes `onPageQuery`, so the handler cannot exist before the schema does) and not an uninitialised field (nimony zero-fills fields omitted from an object constructor -- `boolSetting` emits `.optionsUrl_0 = {0, NIL}` explicitly -- and every sain row sets `optionsUrl = ""`).
+
+WHO freed it is NOT established. The whole ownership chain was audited in the generated C and is balanced: `atQ` dups each array-literal element, `=dup(Setting)` dups all nine string fields, `declareSettings` deep-copies, `onLoad` destroys the temp once per path, `declaredSettings()` dups, and `schemaJson(gDeclared)` borrows without destroying. sain declares exactly once. So the free came from outside the settings path -- a second declaration on a reload, or heap damage elsewhere in the client process. Do not record a cause until one is measured.
+
+<sub>method: `measured` · scope: `aowlspt-ga:e0ea3ad3b76b-db:41313127` · status: live · recorded: 2026-09-02 · last seen: 2026-09-02</sub>
+
+- evidence: `python tools/dmpread.py "<Crashes>/Crash_2026-09-02_030042716/crash.dmp"` prints `Rax is 0xdf-filled: mimalloc MI_DEBUG_FREED`; `objdump -d --start-address=0x18004E300 sain.dll` gives the faulting instruction; `Setting` layout from `mods/sain/nimcache/saika7pi6/sethgq4xy1.c`. Only 1 of the 12 crash dumps on this machine has this stack.
+
 
 ## Relayed measurements (subagent backlog)
 
@@ -6499,3 +6515,96 @@ EFT.TarkovApplication::Update` and a Unity crash report of two frames
 _045551684). The suspect is a cached game pointer from the character screen
 (answered at ~27s) dereferenced for its klass on the first drain frame after
 the menu replaced that screen. Install rolled back to 5cff328's DLL.
+
+## 2026-09-02: `mono_class_has_parent` in a crash stack is a NEAREST-EXPORT MISLABEL
+
+MEASURED, offline, from the two crash reports themselves plus
+`tools/il2cpp_resolve.py` against `D:\Aowlspt\GameAssembly.dll` and
+`.cache/global-metadata.dec.dat`.
+
+Both deaths print the identical pair of return addresses once rebased by the
+`GameAssembly.dll` load address given in the same report (bases differ per run,
+RVAs do not):
+
+| report | frame 0 | frame 1 |
+|---|---|---|
+| Crash_2026-09-02_045033156 | RVA `0x1420103` | RVA `0x1539134` |
+| Crash_2026-09-02_045551684 | RVA `0x1420103` | RVA `0x1539134` |
+
+`il2cpp_resolve.py ... bytes` puts BOTH in the **`il2cpp` section (generated
+code)**, not in the runtime's own `.text`. Walking the per-image
+`methodPointers` tables for the nearest preceding method start resolves them to:
+
+* `0x1420103` = **`EFT.UI.SeasonWidgetData::From(Profile, SeasonalRewardController)`**
+  @ RVA `0x141FFD0` (UNIQUE, static, arity 2) **+0x133**. The instruction there
+  is `4C 8B 40 20` = `mov r8,[rax+0x20]` — the faulting dereference.
+* `0x1539134` = **`EFT.UI.MenuScreen::Show` @ RVA `0x15387A0` +0x994** — which is
+  the very 5-arg `MenuScreen::Show` the host already documents and hooks
+  (`modload.nim`: "EFT.UI.MenuScreen::Show(5-arg) @0x15387A0").
+
+**So there is no class-hierarchy walk in this stack at all.** Unity's crash
+symboliser has no PDB for `GameAssembly.dll` (`SymType: '-deferred-'`) and
+attributes every address to the nearest EXPORTED symbol; `mono_class_has_parent`
+is simply the closest export below a very large stretch of generated code. The
+same mislabel appears in the 2026-08-19 stack quoted at the top of
+`abi/aowlspt_il2cppready.h`, where the actual fault was inside
+`il2cpp_domain_get`. **Never read `mono_class_has_parent` as evidence of a cast,
+a `GetComponent`-by-type or one of our klass gates. Rebase and resolve first.**
+
+The client's own last managed stack in the same log is the ordinary main-menu
+construction path on the Unity main thread —
+`MainMenuShowOperation:ShowMenuScreen -> ScreenController::ShowScreenAsync ->
+EftScreenController::PrepareEnvironment` under
+`UnityEngine.UnitySynchronizationContext:Exec()`. Combined with the two resolved
+frames, that establishes: **the fault is on the UNITY MAIN THREAD inside the
+game's own `MenuScreen::Show`, on a null/garbage reference reaching
+`SeasonWidgetData::From` (`profile` or `seasonalRewardController`)** — not on the
+host thread, and not in a klass gate.
+
+**INFERRED, not measured** (say so before acting on it): the build bisect above
+is real, so something in `8115849` changes what `MenuScreen::Show` sees. The two
+candidates that touch that exact moment are (a) the host's own prefix work on
+`MenuScreen::Show` @0x15387A0 — the modload release gate runs mod `on_load`
+*inside* that call, so a mod's load can perturb managed state before the rest of
+`Show` runs — and (b) `modeskip`'s re-arm, which changes which mode/profile
+state exists by the time the season widget is built. Neither is established. The
+discriminating experiment is a run of `8115849` with the modload release gate
+off and modeskip off; nothing here proves it is our code rather than a profile
+served without seasonal-reward data.
+
+TOOL GAP (raised, per CLAUDE.md 10): `il2cpp_resolve.py` has no
+`owner <RVA>` / `symbolize <RVA>` verb. `shared <RVA>` only matches EXACT method
+starts, so a crash-report address — always mid-function — comes back `unknown`.
+The nearest-preceding-start walk above was written by hand against the
+`Resolver` internals and took ~15 lines; it belongs in the tool, because
+symbolising a crash frame is the first thing anyone does with one of these
+reports.
+
+## 2026-09-02: `mono_class_has_parent` at menu arrival = Submit on a controller the client already destroyed
+
+MEASURED (coordinator's live runs): the host build carrying an UNCONDITIONAL
+modeskip re-arm died **2 of 2 boots at ~36 s**, on the host-log line
+`the main-thread drain is firing again on EFT.TarkovApplication::Update` (menu
+arrival), with Unity crash reports naming `(GameAssembly) mono_class_has_parent`
+x2 (`Crash_2026-09-02_045033156`, `_045551684`). The previous build (5cff328,
+4,604,928 bytes) survived 2/2 with the same config, and modeskip answered the
+character screen at ~27 s on every run including the crashing ones.
+
+The line: in `modeSkipShowSlotFired`, a ShowSlot after a Submit cleared
+`gModeSkipSubmittedAtMs` / `gModeSkipSubmittedFor`, which re-opened the deferred
+Submit gate. `modeSkipSubmitBody` then called
+`CharacterSelectionScreenController::Submit` with **`gModeSkipController` as
+captured from its `.ctor` at ~26 s** -- a screen the client had already torn
+down. `Submit` type-checks its arguments, and a class read on a freed managed
+object is precisely `mono_class_has_parent`.
+
+Generalisation worth keeping: **the profile data was fresh (the game handed it
+to us in R9 on that very frame) while the controller was ten seconds old.** A
+capture-time validity check says nothing about use time, and readability is not
+liveness -- freed memory stays mapped. The only sound rule is an OBSERVED
+freshness event, so the re-arm now requires a NEW `.ctor` firing since the last
+Submit (counted, and refused loudly by name when absent), the receiver is
+re-checked with `aowl_is_readable` at the point of use as a floor, and the
+cached pointers are DROPPED on the `MenuScreen::Show` show event (uihooks site
+2, index verified by reading the site's NAME back, because `uihooks.nim` is
+included after `modeskip.nim` and its constants are not in scope there).
