@@ -301,7 +301,25 @@ def main():
     # boots straight to the main menu. Running entergame.py here just polled for a
     # screen that no longer appears -- pure wasted time. Go straight to the menu.
     log("waiting for menu (fast poll for a visible PlayButton under MenuScreen)...")
-    if not ui.wait_until(menu_ready, timeout=180.0, poll=1.0):
+    ready = ui.wait_until(menu_ready, timeout=25.0, poll=1.0)
+    if not ready:
+        # A screen OVER the menu (Settings, Credits, a results page) hides the
+        # PlayButton while the menu is otherwise perfectly ready. Measured
+        # 2026-09-01: the coordinator left the client on the Settings screen,
+        # and this poll waited its full 180s and reported INCONCLUSIVE for a
+        # menu that was one BACK press away. Try that press ONCE -- `pressname`
+        # refuses unless exactly one BackButton is VISIBLE, so on a bare menu
+        # it does nothing and says so.
+        try:
+            out = ui._run(["allow write", "pressname BackButton", "wait 30"])
+            fired = "OnClick" in out and "refus" not in out.lower()
+            log("menu not ready after 25s; tried to dismiss an overlaying screen "
+                "with `pressname BackButton` -> %s"
+                % ("pressed" if fired else "nothing visible to press"))
+        except Exception as e:
+            log("menu not ready after 25s; BackButton dismiss attempt failed: %s" % e)
+        ready = ui.wait_until(menu_ready, timeout=155.0, poll=1.0)
+    if not ready:
         # INCONCLUSIVE, not FAIL: the menu never appearing tells us nothing
         # about whether a raid can be entered. Name the likelier cause if the
         # host's own counters say the channel is wedged.
