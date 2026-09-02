@@ -169,6 +169,29 @@ const
   ArFailed    = 9
   ArSide      = 10  ## after PLAY: the PMC/SCAV side selector
   ArPreMenu   = 11  ## before the menu: dismiss a screen overlaying MenuScreen
+  ArScreen    = 12  ## GENERIC: advance whichever show-event screen is up
+
+# ---------------------------------------------------------------------------
+# THE GENERIC SCREEN TABLE.
+#
+# Every screen in this flow is advanced the same way and NOTHING ELSE WORKS:
+# press THAT screen's own `ScreenDefaultButtons -> NextButton`, resolved from
+# the receiver its own `::Show` handed us, then read back that the screen went
+# INACTIVE and wait for the next screen's show event. This session produced the
+# same 45-second refusal THREE times -- `NEXT->location`, then after SIDE, then
+# `NEXT->insurance` -- and every one was the same mistake: hunting a NextButton
+# across the scene roots for a screen nobody had handed us.
+#
+# So it is a TABLE, not another hand-written step. Adding the next screen in the
+# chain is a row plus a uihooks site, and the driver below does not change.
+#
+# `practice` marks the one row that needs a pre-action: on the offline raid
+# screen the practice/offline toggle decides whether the raid routes to the
+# emulated backend at all, so its state is READ AND LOGGED before anything is
+# pressed, and set only if it reads off.
+const
+  ArScrN = 3
+  ArScrPracticeRow = 0        ## the offline raid screen, and only it
 
 # ---- the guarded-body thunk (ONE aowl_p_p_seh, never nested) ----
 {.emit: """
@@ -238,6 +261,18 @@ var gArSideFires = 0               ## side-screen show events observed while arm
 var gArSideTr: Il2CppPtr = nil     ## the live side screen's Transform, from the
                                    ## receiver the GAME handed us in RCX
 var gArSideNamesLogged = false     ## the control-name census, once per session
+## The rows. Parallel arrays rather than a tuple array: nimony's object/tuple
+## literals in a module-level `var` are more trouble than three arrays, and the
+## indices are checked by `arScrSite` below, which is the ONLY place that maps a
+## row to a site.
+var gArScrEpoch: array[ArScrN, int]
+var gArScrTr: Il2CppPtr = nil      ## receiver of the screen currently being advanced
+var gArScrIdx = -1                 ## which row that is, -1 = none
+var gArScrPressed = false          ## its NextButton has been pressed
+var gArScrMs = 0'u64               ## when (readback clock)
+var gArScrLogMs = 0'u64
+var gArScrDone = 0                 ## screens advanced this session
+var gArPracticeChecked = false     ## the toggle state has been read+logged
 var gArLocEpoch = 0                ## last seen uihooks site-4 epoch
 var gArLocFires = 0                ## location-screen show events while armed
 var gArLocTr: Il2CppPtr = nil      ## the live location screen's Transform
@@ -311,6 +346,12 @@ proc arCrumbName(c: int): string =
   of 32: "SELECT-MAP: pressing this screen's own NextButton"
   of 33: "SELECT-MAP: the location-screen INACTIVE readback"
   of 34: "reading the location-screen show epoch (uihooks site 4)"
+  of 35: "SCREEN-NEXT: walking the offline raid screen for the practice toggle"
+  of 36: "SCREEN-NEXT: setting the practice toggle"
+  of 37: "reading the generic screen table's show epochs"
+  of 38: "SCREEN-NEXT: BFS for this screen's own NextButton"
+  of 39: "SCREEN-NEXT: pressing this screen's own NextButton"
+  of 40: "SCREEN-NEXT: the screen-INACTIVE readback"
   else:  "unknown (" & $c & ")"
 
 proc arStepName(s: int): string =
@@ -326,6 +367,7 @@ proc arStepName(s: int): string =
   of ArDone:      "DONE"
   of ArSide:      "SIDE"
   of ArPreMenu:   "PRE-MENU"
+  of ArScreen:    "SCREEN-NEXT"
   else:           "FAILED"
 
 proc arGoto(s: int) =
@@ -674,6 +716,36 @@ proc arPress(node: Il2CppPtr; compType: string): bool =
   if not duOk(comp, off + 8'i32) or not iUnityAlive(comp): return
   let ev = cReadPtrAt(comp, off)
   if ev == nil or iIsGameObject(ev) or iIsKnownKlass(cast[uint64](ev)): return
+  # WHAT THIS POINTER IS, BEFORE IT IS CALLED. MEASURED 2026-09-02: PRE-MENU's
+  # BackButton press faulted ONCE per session inside this invoke and then
+  # worked on the retry, which is the signature of a control read while it is
+  # being built or torn down.
+  #
+  # A managed object's FIRST QWORD is its Il2CppClass*, so an object that is
+  # really there has a readable klass pointer with a readable name field. This
+  # checks the SHAPE of that -- readable klass, and the klass's own first
+  # pointer readable -- rather than asserting an identity it cannot prove:
+  # `iIsKnownKlass` only knows klasses this session has already SEEN, so
+  # requiring it here would refuse every first press. Stated plainly: this is a
+  # FLOOR, not proof. It cannot certify that `ev` is a UnityEvent; it can and
+  # does reject a value that is not a live managed object at all, which is the
+  # class of value that faults.
+  if not duOk(ev, 0x40'i32):
+    warn "autoRaid: REFUSING to invoke the OnClick at +0x" & hexOf(uint64(off)) &
+         " on a " & compType & ": the event pointer (0x" &
+         hexOf(cast[uint64](ev)) & ") is not readable for 0x40 bytes, so it " &
+         "is not a live managed object. Nothing was called."
+    return
+  let evKlass = cReadPtrAt(ev, 0'i32)
+  if evKlass == nil or not duOk(evKlass, 0x40'i32):
+    warn "autoRaid: REFUSING to invoke the OnClick at +0x" & hexOf(uint64(off)) &
+         " on a " & compType & ": the object at 0x" & hexOf(cast[uint64](ev)) &
+         " has no readable Il2CppClass* in its first qword (read 0x" &
+         hexOf(cast[uint64](evKlass)) & "), so it is not a live managed " &
+         "object. Nothing was called. This is the guard the once-per-session " &
+         "BackButton fault asked for -- a FLOOR, not proof that it is a " &
+         "UnityEvent."
+    return
   var fn: Il2CppPtr = nil
   var rva = 0'u32
   if not iNavFind("UnityEvent::Invoke", fn, rva): return
@@ -1281,6 +1353,112 @@ proc arPressMapTileUnder(scr: Il2CppPtr; want: string; nTiles: var int;
         (if names.len > 0: names else: "<none readable>") &
         ". NOTHING WAS PRESSED -- match one of those"
 
+proc arScrSite(row: int): int =
+  ## Row -> uihooks site. THE ONLY mapping, so a row cannot mean two things in
+  ## two places (fact #187 in miniature).
+  case row
+  of 0: UihSiteOfflineRaid
+  of 1: UihSiteInsurance
+  of 2: UihSiteAccept
+  else: -1
+
+proc arScrName(row: int): string =
+  case row
+  of 0: "offline raid screen"
+  of 1: "insurance screen"
+  of 2: "accept screen (its READY is itself a NextButton)"
+  else: "unknown row"
+
+proc arScrLast(row: int): bool =
+  ## Is this the row after which the raid is LOADING and the host must go
+  ## hands-off? Pressing anything during the load errors matchmaking (fact
+  ## #261), so this is the one row whose success ends the machine.
+  row == 2
+
+proc arScrTransform(row: int): Il2CppPtr =
+  result = nil
+  let site = arScrSite(row)
+  if site < 0: return
+  let self = uihSelf(site)
+  if self == nil: return
+  let tr = iToTransform(self)
+  if tr == nil or not duOk(tr, 0x20'i32): return
+  result = tr
+
+proc arScrActive(row: int): bool =
+  let tr = arScrTransform(row)
+  if tr == nil: return false
+  let a = iActiveInHierarchy(tr)
+  result = a[0] and a[1]
+
+proc arToggleIsOn(comp: Il2CppPtr; ok: var bool): bool =
+  ## `UnityEngine.Toggle.m_IsOn` @0x120 -- offset from tools/fldoff.py, never
+  ## guessed (the same layout dump that proved 0x100 is `toggleTransition` and
+  ## not an event). `ok` says whether the read HAPPENED; the result is
+  ## meaningless when it did not, and a caller that ignores `ok` would be
+  ## reading "off" out of a failure.
+  result = false
+  ok = false
+  if comp == nil or not duOk(comp, 0x128'i32) or not iUnityAlive(comp): return
+  ok = true
+  # There is no byte-read primitive in this host, so the 4 bytes AT the field
+  # are read and only the low one is tested: `m_IsOn` is a 1-byte bool at
+  # 0x120 and the three bytes after it are padding. The address is computed
+  # explicitly rather than via an offset helper that does not exist.
+  let addrOn = cast[Il2CppPtr](cast[uint64](comp) + 0x120'u64)
+  result = (cReadI32At(addrOn) and 0xFF'i32) != 0'i32
+
+proc arAssertPracticeToggle(scr: Il2CppPtr) =
+  ## READ AND LOG the practice/offline toggle on the offline raid screen, and
+  ## set it only if it reads OFF. This is the toggle that decides whether the
+  ## raid routes to the emulated backend, so its state is worth a line in the
+  ## log whatever it is -- "I set it" and "it was already on" are different
+  ## facts and both are reported.
+  ##
+  ## HONEST LIMIT: `singleplayerRebrand` deactivates this checkbox's GameObject
+  ## on purpose, so on a session with that feature on the toggle is INACTIVE and
+  ## this finds nothing. That is reported as "not found", never as "off".
+  if scr == nil or gArPracticeChecked: return
+  gArPracticeChecked = true
+  var nodes: seq[Il2CppPtr] = @[]
+  var b = ArNodeBudget
+  gArCrumb = 35
+  arCollectBFS(scr, ArLocDepth, b, cNowMs() + ArWalkMs, nodes, ArMaxTiles, "")
+  var i = 0
+  while i < nodes.len:
+    if iObjName(nodes[i]) == "AnimatedToggle":
+      let lbl = iLower(arLabelUnderName(nodes[i], "Label", ArMapDepth))
+      if lbl.len > 0 and (iContains(lbl, "practice") or iContains(lbl, "offline")):
+        var comp: Il2CppPtr = nil
+        var w = ""
+        if iVisComponent(nodes[i], "AnimatedToggle", comp, w) and comp != nil:
+          var ok = false
+          let isOn = arToggleIsOn(comp, ok)
+          if not ok:
+            warn "autoRaid SCREEN-NEXT: found the practice toggle but could " &
+                 "NOT read m_IsOn@0x120 on it. Its state is UNKNOWN -- that " &
+                 "is not the same as off, and nothing was pressed."
+            return
+          if isOn:
+            okLog "autoRaid SCREEN-NEXT: the practice/offline toggle reads " &
+                  "m_IsOn=TRUE already; nothing was pressed. The raid should " &
+                  "route to the emulated backend."
+            return
+          okLog "autoRaid SCREEN-NEXT: the practice/offline toggle reads " &
+                "m_IsOn=FALSE. Setting it via Toggle::Set(true, true)."
+          gArCrumb = 36
+          if not arPress(nodes[i], "AnimatedToggle"):
+            warn "autoRaid SCREEN-NEXT: could not set the practice toggle. " &
+                 "The raid may not route offline; this is announced, not " &
+                 "silently accepted."
+          return
+    i = i + 1
+  info "autoRaid SCREEN-NEXT: no ACTIVE toggle under the offline raid screen " &
+       "has a Label mentioning practice/offline, so its state was NOT read. " &
+       "With `singleplayerRebrand` on this is EXPECTED -- that feature " &
+       "deactivates the checkbox's GameObject deliberately -- and it is " &
+       "reported as `not found`, never as `off`."
+
 proc arActiveCensus(root: Il2CppPtr; depth: int; count: var int;
                     into: var string) =
   ## Names of the ACTIVE nodes at depth <= `depth` under `root`. The honest
@@ -1558,6 +1736,32 @@ proc arTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ar_tick_body", cdecl.}
       info "autoRaid: MatchMakerSelectionLocationScreen::Show fired (uihooks " &
            "site 4, epoch " & $lep & ") while at step " & arStepName(gArStep) &
            "; noted, no resynchronisation."
+  # ---- THE GENERIC SCREEN WATCHER ----------------------------------------
+  # One integer compare per row per tick. Whichever table screen announces
+  # itself becomes the current screen, and the SCREEN-NEXT step advances it.
+  # This is the whole of "add the next screen in the chain": a uihooks site and
+  # a row.
+  gArCrumb = 37
+  var row = 0
+  while row < ArScrN:
+    let site = arScrSite(row)
+    if site >= 0:
+      let e = uihEpoch(site)
+      if e != gArScrEpoch[row]:
+        gArScrEpoch[row] = e
+        if gArStep != ArDone and gArStep != ArFailed:
+          gArScrIdx = row
+          gArScrTr = arScrTransform(row)
+          gArScrPressed = false
+          gArScrMs = 0'u64
+          gArLastPressed = nil
+          okLog "autoRaid: READBACK -- the " & arScrName(row) & " announced " &
+                "itself (uihooks site " & $site & ", epoch " & $e &
+                "), receiver 0x" & hexOf(cast[uint64](gArScrTr)) &
+                ". SCREEN-NEXT will press THAT screen's own NextButton, from " &
+                "THAT receiver -- the only thing that has ever worked here."
+          arGoto(ArScreen)
+    row = row + 1
   gArCrumb = 1
   let ep = uihEpoch(UihSiteOfflineRaid)
   if ep != gArOffEpoch:
@@ -1565,13 +1769,17 @@ proc arTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ar_tick_body", cdecl.}
     gArOffFires = gArOffFires + 1
     if gArStep == ArSide or gArStep == ArNext1 or
        gArStep == ArSelectMap or gArStep == ArNext2:
+      # The GENERIC SCREEN DRIVER below owns this screen (row 0): it presses
+      # THIS screen's own NextButton from THIS receiver. All this block does is
+      # note the event and stop the ArNext2 wait; it must not send the machine
+      # to a legacy step, or the same "hunt a NextButton across the roots"
+      # mistake happens for a fourth time.
       okLog "autoRaid: READBACK -- MatchmakerOfflineRaidScreen::Show fired " &
             "(uihooks site 0, epoch " & $ep & "). The offline raid screen is " &
-            "UP, which is an observation, not a guess. Resynchronising from " &
-            "step " & arStepName(gArStep) & " to NEXT->insurance."
+            "UP, which is an observation, not a guess. The generic screen " &
+            "driver takes it from here."
       gArLastPressed = nil
       gArOffAwaitMs = 0'u64
-      arGoto(ArNext3)
     else:
       info "autoRaid: MatchmakerOfflineRaidScreen::Show fired (uihooks site " &
            "0, epoch " & $ep & ") while at step " & arStepName(gArStep) &
@@ -1832,6 +2040,84 @@ proc arTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ar_tick_body", cdecl.}
     else:
       warn "autoRaid PRE-MENU: could not call SettingsScreen::Close either -- " &
            why & "."
+    return
+
+  if gArStep == ArScreen:
+    if gArScrIdx < 0 or gArScrTr == nil:
+      # Nothing to advance. Never a silent stall: say so once and go back to
+      # waiting for an event.
+      if now - gArScrLogMs > 5000'u64:
+        gArScrLogMs = now
+        warn "autoRaid SCREEN-NEXT: no current screen receiver, which should " &
+             "be impossible in this step. Nothing was pressed."
+      return
+    if not gArScrPressed:
+      # Row 0 has a pre-action: read and log the practice/offline toggle.
+      if gArScrIdx == ArScrPracticeRow:
+        arAssertPracticeToggle(gArScrTr)
+      gArCrumb = 38
+      var seen = 0
+      var seenNames = ""
+      let nb = arFindActiveNamedBFS(gArScrTr, "NextButton", ArSideNextDepth,
+                                    ArMaxSideNext, seen, seenNames)
+      if nb == nil:
+        if now - gArScrLogMs > 5000'u64:
+          gArScrLogMs = now
+          warn "autoRaid SCREEN-NEXT: NO ACTIVE node named `NextButton` under " &
+               "the " & arScrName(gArScrIdx) & "'s own receiver (0x" &
+               hexOf(cast[uint64](gArScrTr)) & ") -- BFS, depth " &
+               $ArSideNextDepth & ", cap " & $ArMaxSideNext & ", examined " &
+               $seen & " ACTIVE node(s): " &
+               (if seenNames.len > 0: seenNames else: "<none>") &
+               ". NOTHING WAS PRESSED. If `NextButton` is in that list the " &
+               "comparison is wrong; if the count is at the cap the search " &
+               "was truncated; if it is tiny the receiver is not the screen."
+        return
+      gArCrumb = 39
+      if arPress(nb, "DefaultUIButton"):
+        gArScrPressed = true
+        gArScrMs = now
+        gArLastPressed = nb
+        gArLastActionMs = now
+        okLog "autoRaid: SCREEN-NEXT -- pressed the " & arScrName(gArScrIdx) &
+              "'s own NextButton (EFT.UI.DefaultUIButton, from its own show " &
+              "receiver). PRESSED IS NOT ADVANCED: the readback is this " &
+              "screen going INACTIVE, and then the next screen's show event."
+      elif now - gArScrLogMs > 5000'u64:
+        gArScrLogMs = now
+        warn "autoRaid SCREEN-NEXT: found the " & arScrName(gArScrIdx) &
+             "'s ACTIVE `NextButton` but its DefaultUIButton OnClick could " &
+             "not be resolved and validated, so it was NOT pressed."
+      return
+    # PRESSED: the readback is a NEGATIVE -- this screen is no longer active.
+    gArCrumb = 40
+    if not arScrActive(gArScrIdx):
+      gArScrDone = gArScrDone + 1
+      let wasLast = arScrLast(gArScrIdx)
+      okLog "autoRaid: READBACK -- the " & arScrName(gArScrIdx) & " is no " &
+            "longer active after its own NextButton. Screens advanced this " &
+            "session: " & $gArScrDone & "." &
+            (if wasLast:
+               " That was the ACCEPT screen, so the raid is now LOADING: this " &
+               "feature goes hands-off and will not touch the UI again this " &
+               "session (touching it during the load errors matchmaking)."
+             else:
+               " Waiting for the next screen's show event; if none arrives " &
+               "this step times out and refuses with a census.")
+      gArScrIdx = -1
+      gArScrTr = nil
+      gArScrPressed = false
+      gArLastPressed = nil
+      gArLastActionMs = now
+      if wasLast:
+        arGoto(ArDone)
+      return
+    if now - gArScrMs > ArSideSettleMs:
+      warn "autoRaid SCREEN-NEXT: the " & arScrName(gArScrIdx) & " is STILL " &
+           "ACTIVE " & $int(now - gArScrMs) & "ms after its own NextButton " &
+           "was pressed. The press ran and did not advance the screen; the " &
+           "step timeout will refuse with a census."
+      gArScrMs = now
     return
 
   if gArStep == ArNext2 and gArOffAwaitMs != 0'u64:
@@ -2174,6 +2460,16 @@ proc arArmOnDemand() =
   # not evidence about this run.
   gArSideEpoch = uihEpoch(UihSiteSideSelect)
   gArLocEpoch = uihEpoch(UihSiteLocation)
+  var arow = 0
+  while arow < ArScrN:
+    let asite = arScrSite(arow)
+    gArScrEpoch[arow] = (if asite >= 0: uihEpoch(asite) else: 0)
+    arow = arow + 1
+  gArScrIdx = -1
+  gArScrTr = nil
+  gArScrPressed = false
+  gArScrLogMs = 0'u64
+  gArPracticeChecked = false
   gArLocTr = nil
   gArLocPressed = false
   gArLocNextDone = false
@@ -2483,6 +2779,13 @@ proc arWantShowHook() =
   # model sits in the same subtree -- which is the search that has failed three
   # times this session.
   uihWant(UihSiteLocation)
+  # The generic table's screens. A row whose site is not wanted is a row whose
+  # screen this machine cannot see arrive.
+  var wrow = 0
+  while wrow < ArScrN:
+    let ws = arScrSite(wrow)
+    if ws >= 0: uihWant(ws)
+    wrow = wrow + 1
 
 proc arShowHookVerdict() =
   ## Read back whether it actually BOUND, after `uihArm`. Announced either way:
@@ -2490,6 +2793,20 @@ proc arShowHookVerdict() =
   ## falls back to its per-step timeout, which is exactly the failure mode this
   ## change exists to remove.
   if not gArOn and not gInspOn: return
+  var vrow = 0
+  while vrow < ArScrN:
+    let vs = arScrSite(vrow)
+    if vs >= 0:
+      if uihBound(vs):
+        okLog "autoRaid: the " & arScrName(vrow) & "'s show event is LIVE " &
+              "(uihooks site " & $vs & "), so SCREEN-NEXT advances it from " &
+              "its own receiver."
+      else:
+        warn "autoRaid: uihooks site " & $vs & " (" & arScrName(vrow) &
+             ") did NOT bind, so that screen's arrival is invisible to this " &
+             "machine and the flow will stall there. The reason is in the " &
+             "`uihooks:` lines above."
+    vrow = vrow + 1
   if uihBound(UihSiteLocation):
     okLog "autoRaid: the LOCATION list's show event is LIVE -- " &
           "MatchMakerSelectionLocationScreen::Show @0x178ACB0 (uihooks site " &

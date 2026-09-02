@@ -106,14 +106,20 @@ const
     ## side selector's own NextButton lands on DIRECTLY (MEASURED 2026-09-02:
     ## there is no NEXT to press to reach it). Note the word order of the type
     ## name; "LocationSelection" matches only a coroutine class.
-  UihSiteCount = 5
+  UihSiteInsurance   = 5
+    ## `EFT.UI.Matchmaker.MatchmakerInsuranceScreen::Show(controller)`
+    ## @0x1769910, UNIQUE. RCX = the live screen.
+  UihSiteAccept      = 6
+    ## `EFT.UI.Matchmaker.MatchMakerAcceptScreen::Show(controller)` @0x1773EF0,
+    ## UNIQUE. RCX = the live screen. Its READY control is itself a NextButton.
+  UihSiteCount = 7
     ## Must equal `aowl_uih_site_count()`. Checked at arm time and logged as a
     ## REFUSAL if it ever drifts, rather than silently indexing past the table.
   UihMaxDispatchFaults = 3
     ## After this many faulted dispatches into one site, stop dispatching to it.
 
 ## Per-site state. All plain integers; nothing here is a managed object.
-var gUihSlot:   array[UihSiteCount, int] = [-1, -1, -1, -1, -1]  ## detour slot, -1 = unbound
+var gUihSlot:   array[UihSiteCount, int] = [-1, -1, -1, -1, -1, -1, -1]  ## detour slot, -1 = unbound
 var gUihWant:   array[UihSiteCount, bool]            ## a feature subscribed
 var gUihFires:  array[UihSiteCount, int]             ## postfix firings
 var gUihEpoch:  array[UihSiteCount, int]             ## firings with a GOOD receiver

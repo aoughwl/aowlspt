@@ -60,6 +60,8 @@
 #define AOWL_UIH_SITE_MENU_SHOW    2
 #define AOWL_UIH_SITE_SIDE_SELECT  3
 #define AOWL_UIH_SITE_LOCATION     4
+#define AOWL_UIH_SITE_INSURANCE    5
+#define AOWL_UIH_SITE_ACCEPT       6
 
 /* Why the last `aowl_uih_site_at` returned NULL. A refusal must name itself;
  * "returned NULL" is not a diagnosis (CLAUDE.md 6). */
@@ -274,6 +276,34 @@ static const AowlUihSite aowl_uih_sites[] = {
     { "EFT.UI.Matchmaker.MatchMakerSelectionLocationScreen::Show", 0x178ACB0u,
       { 0x48,0x89,0x5C,0x24,0x08, 0x57, 0x48,0x83,0xEC,0x30,
         0x80,0x3D,0x22,0x3A,0x93,0x05 }, 16, 1 },
+
+    /* [5] EFT.UI.Matchmaker.MatchmakerInsuranceScreen::Show(
+     *         InsuranceScreenController controller)
+     *   RVA 0x1769910, UNIQUE (owners=1), section il2cpp, arity 1,
+     *   RCX=this, RDX=controller, R8=MethodInfo*.
+     *   48 89 5C 24 08 | 57 | 48 83 EC 30 | 80 3D E8 4C 95 05 00
+     *   The SAME prologue shape as [0], [3] and [4] -- 17-byte steal whose only
+     *   relative operand is the RIP-relative `cmp`. relocatable=1.
+     *
+     * [6] EFT.UI.Matchmaker.MatchMakerAcceptScreen::Show(
+     *         MatchmakerAcceptScreenController controller)
+     *   RVA 0x1773EF0, UNIQUE (owners=1), section il2cpp, arity 1, same shape:
+     *   48 89 5C 24 08 | 57 | 48 83 EC 30 | 80 3D 51 A7 94 05 00
+     *
+     * BOTH ARE APPENDED, AND BOTH EXIST FOR ONE MEASURED REASON: every screen
+     * in this flow is advanced by ITS OWN `ScreenDefaultButtons -> NextButton`,
+     * and the only reliable way to reach that button is from the receiver the
+     * screen's own ::Show handed us. Three separate 45-second refusals this
+     * session (`NEXT->location`, then again after SIDE, then
+     * `NEXT->insurance`) were all the same mistake: hunting a NextButton across
+     * roots for a screen we had not been handed. */
+    { "EFT.UI.Matchmaker.MatchmakerInsuranceScreen::Show", 0x1769910u,
+      { 0x48,0x89,0x5C,0x24,0x08, 0x57, 0x48,0x83,0xEC,0x30,
+        0x80,0x3D,0xE8,0x4C,0x95,0x05 }, 16, 1 },
+
+    { "EFT.UI.Matchmaker.MatchMakerAcceptScreen::Show", 0x1773EF0u,
+      { 0x48,0x89,0x5C,0x24,0x08, 0x57, 0x48,0x83,0xEC,0x30,
+        0x80,0x3D,0x51,0xA7,0x94,0x05 }, 16, 1 },
 };
 
 #define AOWL_UIH_SITE_COUNT \

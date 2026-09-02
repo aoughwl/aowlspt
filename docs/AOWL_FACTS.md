@@ -7455,3 +7455,53 @@ description: PASS; forced isOn: PASS; hide: PASS; coop-warning: PASS`;
 60 s after the window closed this feature has visited 0 live-tree nodes`.
 The user's two asks -- the rebrand working, and no polling for UI elements
 -- are both met by the uihooks show-event design.
+
+## 2026-09-02: every screen is advanced by ITS OWN NextButton -- so it is a TABLE, not another step
+
+MEASURED on the 4,831,232-byte build, which got further than anything before it:
+PRE-MENU (one fault at `firing the BackButton OnClick`, then success), PLAY,
+site 3, SIDE (toggle + its own NextButton, side screen inactive), site 4, then
+`SELECT-MAP: pressed the tile whose Label reads "WOODS"` with
+`Tiles offered: [RESERVE][LIGHTHOUSE][INTERCHANGE][CUSTOMS][GROUND ZERO]
+[ICEBREAKER][WOODS]`, its own NextButton, then
+`MatchmakerOfflineRaidScreen::Show fired (uihooks site 0, epoch 1)` -- and then
+`step NEXT->insurance never completed within 45 s`.
+
+**The same mistake for the third time in one session**, and the pattern is now
+stated once rather than rediscovered: a screen in this flow is advanced ONLY by
+`ScreenDefaultButtons -> NextButton` **under that screen's own show-event
+receiver**, and the readback is that screen going INACTIVE plus the next
+screen's show event. Hunting a `NextButton` across the scene roots finds the
+wrong one or none, every time.
+
+So autoraid now carries a GENERIC SCREEN TABLE (`arScrSite`, the single row->site
+mapping) driving one `SCREEN-NEXT` step. Adding the next screen in the chain is
+a uihooks row plus a table row; the driver does not change. Two more sites,
+resolved offline, both `sharedness=UNIQUE owners=1` and both byte-for-byte the
+prologue shape of sites 0/3/4 (17-byte steal, only a RIP-relative `cmp`):
+
+* **`EFT.UI.Matchmaker.MatchmakerInsuranceScreen::Show(controller)` @`0x1769910`**
+  -- `48 89 5C 24 08 | 57 | 48 83 EC 30 | 80 3D E8 4C 95 05 00` (site 5)
+* **`EFT.UI.Matchmaker.MatchMakerAcceptScreen::Show(controller)` @`0x1773EF0`**
+  -- `48 89 5C 24 08 | 57 | 48 83 EC 30 | 80 3D 51 A7 94 05 00` (site 6)
+
+The ACCEPT row is the last: once its NextButton (the READY) is pressed and the
+screen goes inactive, the raid is loading and the machine goes hands-off, because
+touching the UI during the load errors matchmaking (fact #261).
+
+**The practice/offline toggle is now READ before it is touched.** On the offline
+raid screen the toggle's `m_IsOn` @`0x120` (the same measured `UnityEngine.UI.Toggle`
+layout that proved 0x100 is `toggleTransition`) is read and LOGGED whatever it
+says, and set with `Toggle::Set(true,true)` only if it reads off. Three outcomes,
+never two: on / off-and-set / **not found** -- and "not found" is EXPECTED with
+`singleplayerRebrand` on, because that feature deactivates the checkbox's
+GameObject deliberately. Reporting that as "off" would be a lie the log has told
+before.
+
+**The once-per-session BackButton fault now has a guard rather than a shrug.**
+Before `UnityEvent::Invoke`, the OnClick pointer must be readable for 0x40 bytes
+AND its first qword -- a managed object's `Il2CppClass*` -- must itself be
+readable. Recorded honestly in the code: this is a FLOOR, not proof that the
+value is a UnityEvent. `iIsKnownKlass` cannot be used as the positive test,
+because it only knows klasses this session has already seen and would refuse
+every first press.
