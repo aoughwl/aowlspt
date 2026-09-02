@@ -59,16 +59,62 @@ def check(name, ok, detail=""):
     return bool(ok)
 
 
-def head_source():
-    """The file as of HEAD, or None if git cannot produce it."""
+def source_at(rev):
+    """The file as of `rev`, or None if git cannot produce it."""
     try:
-        out = subprocess.run(["git", "show", "HEAD:" + REL],
+        out = subprocess.run(["git", "show", "%s:%s" % (rev, REL)],
                              cwd=ROOT, capture_output=True, timeout=60)
     except Exception:
         return None
     if out.returncode != 0:
         return None
     return out.stdout.decode("utf-8", "replace")
+
+
+def head_source():
+    return source_at("HEAD")
+
+
+def revs_touching(limit=40):
+    """Commits that changed this file, newest first."""
+    try:
+        out = subprocess.run(["git", "rev-list", "--max-count=%d" % limit,
+                              "HEAD", "--", REL],
+                             cwd=ROOT, capture_output=True, timeout=60)
+    except Exception:
+        return []
+    if out.returncode != 0:
+        return []
+    return out.stdout.decode("ascii", "replace").split()
+
+
+def pre_fix_source(limit=40):
+    """The newest revision of this file that at least ONE invariant rejects.
+
+    The control used to be pinned to HEAD, which only works while the fix is
+    UNCOMMITTED: the moment someone commits it, HEAD passes everything and the
+    control goes vacuous -- and it correctly said so rather than reporting a
+    pass, which is how this was found. Pinning to a hardcoded sha would rot the
+    other way: the invariant set has grown from 9 to 14 across four commits, so
+    the right pre-fix source is a different commit for each generation of it.
+
+    So: walk back until one is found. -> (rev, text, n_failing) or None.
+    """
+    for rev in revs_touching(limit):
+        text = source_at(rev)
+        if text is None:
+            continue
+        n = 0
+        for _name, fn in INVARIANTS:
+            try:
+                ok, _ = fn(text)
+            except Exception:
+                ok = False
+            if not ok:
+                n += 1
+        if n:
+            return rev, text, n
+    return None
 
 
 def first(text, needle):
@@ -345,36 +391,28 @@ def main():
         if verbose:
             print("  fixed/%-30s %s" % (name, "ok" if ok else detail))
 
-    old = head_source()
-    if old is None:
-        check("control/available", False,
-              "git show HEAD:%s failed -- the negative control could not run, "
-              "so these checks are UNPROVEN, not passing" % REL)
+    found = pre_fix_source()
+    if found is None:
+        check("control/can_fail", False,
+              "no revision of %s in the last 40 that touched it fails ANY of "
+              "these %d invariants, so this suite cannot distinguish fixed "
+              "from broken. Either git could not be read, or the checks are "
+              "vacuous." % (REL, len(INVARIANTS)))
     else:
-        failed_on_old = 0
-        for name, fn in INVARIANTS:
-            try:
-                ok, _ = fn(old)
-            except Exception:
-                ok = False
-            if not ok:
-                failed_on_old += 1
-            if verbose:
-                print("  HEAD/%-30s %s" % (name, "PASSES (bad)" if ok
-                                           else "fails (good)"))
-        # HEAD is the pre-fix source only if the fix is uncommitted. If someone
-        # commits the fix, every check passes on HEAD too and this control
-        # becomes vacuous -- so say that rather than reporting a pass.
-        if failed_on_old == 0:
-            check("control/can_fail", False,
-                  "every invariant PASSES on HEAD as well, so this suite "
-                  "cannot distinguish fixed from broken. Either the fix is "
-                  "committed (re-point the control at the pre-fix commit) or "
-                  "the checks are vacuous.")
-        else:
-            check("control/can_fail", True,
-                  "%d of %d invariants fail on the pre-fix source"
-                  % (failed_on_old, len(INVARIANTS)))
+        rev, old, failed_on_old = found
+        if verbose:
+            for name, fn in INVARIANTS:
+                try:
+                    ok, _ = fn(old)
+                except Exception:
+                    ok = False
+                print("  %s/%-30s %s" % (rev[:8], name,
+                                         "PASSES (bad)" if ok
+                                         else "fails (good)"))
+        check("control/can_fail", True,
+              "%d of %d invariants fail on %s, the newest revision of this "
+              "file that any of them rejects"
+              % (failed_on_old, len(INVARIANTS), rev[:8]))
 
     bad = [r for r in RESULTS if not r[1]]
     print("\n%s -- %d/%d checks passed"

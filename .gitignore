@@ -112,3 +112,7 @@ tools/test_settings_display.exe
 # a SQLite backup of the fact store; it carried the private address into the tree once
 docs/aowl-facts.db.backup
 *.db.backup
+
+# tools/selftests.py caches its last verdict here so a deploy gate can reuse
+# a green run instead of re-running the suite. Machine state, not a source.
+.aowl-selftests.json

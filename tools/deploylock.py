@@ -35,6 +35,21 @@ def main():
     repo = buildlock.REPO
     lock = buildlock.lock_path(repo)
     argv = sys.argv[1:] or ["check"]
+    # deploy.py now gates a deploy on `selftests.py --fast` (~60 s). Run it
+    # BEFORE taking the lock, not under it: the build lock is the one genuinely
+    # serial resource in this repo, and holding it for a minute of python tests
+    # would make the gate the reason somebody's build is queued. The run writes
+    # .aowl-selftests.json, so deploy.py's own gate finds a green cache for the
+    # same HEAD+tree and returns immediately -- the suite is not run twice.
+    if argv and argv[0] == "deploy" and "--no-selftest" not in argv:
+        rc = subprocess.run([sys.executable,
+                             os.path.join(HERE, "selftests.py"), "--fast"],
+                            cwd=repo).returncode
+        if rc != 0:
+            print("refusing to take the build lock: selftests.py --fast "
+                  "exited %d. Nothing was deployed and no build was blocked."
+                  % rc)
+            return 1
     # Detection ON, killing OFF. A deploy is the LAST thing that should be
     # given a licence to kill somebody's build, but it is very often the
     # process sitting behind a stopped one -- the 25-minute wait that produced

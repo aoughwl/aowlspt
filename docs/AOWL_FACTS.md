@@ -16,6 +16,74 @@ This is a **complete dump** of the SQLite store that backed the `aowlfacts` MCP 
 | edges | 31 |
 | scopes | 2 |
 
+## 2026-09-02 — the six vacuous passes, and the rule that came out of them
+
+**This section is hand-maintained.** Everything below `## Scopes` is generated
+by `tools/factexport.py`; this block is not, and a regeneration will drop it.
+If you regenerate, re-add it.
+
+On 2026-09-01 six separate verifiers reported PASS on state that was visibly
+wrong. None of them was a hard bug. All six were the same shape: a check that
+could only ever say yes.
+
+| # | verifier | what it actually asserted | why that can never fail |
+|---|---|---|---|
+| 1 | `nativetabs_check` | that the geometry string was unchanged | it accepted a FAIL **verdict string** as the geometry, so a refusal compared equal to a refusal |
+| 2 | `acceptance.py` | that a control's geometry matched | it read an `echo` line as geometry — the echo is whatever you typed |
+| 3 | `acceptance.py` | that a toggle was on | it read `activeInHierarchy` as `isOn`; every visible toggle is activeInHierarchy |
+| 4 | maps draw check | that the overlay drew | FAIL at the menu only meant "not in a raid" — the check ran where it could not succeed |
+| 5 | settings row relabel | that the write took | it sized the write by counting the **donor's** TMPs and then re-read only what it had just written; 16 visibly wrong rows reported "0 did not take" |
+| 6 | backend selftest | that the payload was right | it asserted with substring `contains`, so a body that was not valid JSON at all passed for months |
+
+Each of those got a self-test **after** the fact. Nothing ran them all, and
+nothing gated a deploy on them — so the suite existed and was not true. When
+`tools/selftests.py` was first pointed at the tree on 2026-09-02 it found
+**six self-tests already red** that no one knew about, and one
+(`test_inspect_silence.py`) whose own vacuity detector was firing: its negative
+control was pinned to `HEAD`, which stops distinguishing fixed from broken the
+moment the fix is committed.
+
+### The rule
+
+> **A verifier ships with its falsifier, or the runner fails.**
+
+Concretely, enforced by `tools/selftests.py`:
+
+* Every tool in `tools/` that emits a verdict must appear in its `VERIFIERS`
+  registry with either a **named negative control** and a `proof` string saying
+  where that control lives, or an explicit **stated gap**.
+* A verdict-emitting tool that is in neither state is `VERIFIER NOT TRIAGED`
+  and is a **hard FAIL of the runner in every mode**. New debt cannot be added
+  silently; the signature that detects a verifier is mechanical (`VERDICT`, or
+  `INCONCLUSIVE` together with `PASS`), so a tool that *starts* printing
+  verdicts is picked up without anyone remembering to register it.
+* Existing gaps are enumerated by name on **every single run**, and are a FAIL
+  under `--strict`/`--all`. They are a loud NOTE, not a refusal, in the deploy
+  gate — a gate that refused every deploy on day one would simply be routed
+  around with `--no-selftest`, which is the outcome this whole mechanism
+  exists to prevent.
+* Three outcomes, never two. `INCONCLUSIVE` means the item **could not run**,
+  and is never folded into PASS. A timeout is INCONCLUSIVE. "I could not look"
+  is not a pass.
+
+`python tools/deploy.py deploy` runs `selftests.py --fast` before it copies a
+single byte, reusing a cached green result only when it matches the current
+HEAD **and** the working-tree content hash **and** is under 30 minutes old.
+
+### Two measurements worth keeping
+
+* **`test_aowlbuild.py` is not a fast test, however fast it looks.** It runs
+  `aowl` through `buildlock.py --wait 1800`. Measured 2.2 s with the build slot
+  free and **still queued after 725 s** behind another agent's `build host`.
+  An item in the deploy gate that blocks on the one genuinely serial resource
+  in this repo makes the gate the reason deploys hang.
+* **A negative control pinned to `HEAD` self-destructs on commit.**
+  `test_inspect_silence.py` now walks back through the revisions that touched
+  `inspect.nim` and uses the newest one that any invariant *rejects* — because
+  the invariant set grew from 9 to 14 across four commits, so the correct
+  pre-fix source is a different commit for each generation of it. A hardcoded
+  sha would have rotted the other way.
+
 ## Scopes
 
 ### `aowlspt-ga:e0ea3ad3b76b-db:41313127`

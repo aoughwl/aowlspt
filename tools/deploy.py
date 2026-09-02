@@ -193,6 +193,7 @@ import os
 import posixpath
 import re
 import shutil
+import subprocess
 import sys
 import time
 
@@ -330,6 +331,118 @@ def _sha(path):
             if not b:
                 return h.hexdigest()
             h.update(b)
+
+
+SIDECAR_SUFFIX = ".built.json"
+
+
+def sidecar_check(src, expect=None):
+    """Do these bytes still match the build that produced them?
+
+    `tools/buildlock.py` writes `<artifact>.built.json` beside every artifact
+    it builds. A verifier opening the DLL minutes later otherwise has no way to
+    tell whether it is reading the build it thinks it is -- and a hand-copied
+    file with a fresh mtime and stale bytes is a measured state, not a
+    hypothetical one.
+
+    THREE outcomes. A MISSING sidecar is a one-line NOTE, not a refusal:
+    artifacts built before the lock existed have none, and refusing them would
+    only teach people to pass --no-selftest. A sidecar that DISAGREES is a
+    refusal, because it is positive evidence the file changed.
+
+    -> (ok, lines)
+    """
+    lines = []
+    side = src + SIDECAR_SUFFIX
+    try:
+        with open(side, "r", encoding="utf-8") as f:
+            doc = json.load(f)
+    except (OSError, ValueError):
+        doc = None
+    have = None
+    if doc or expect:
+        try:
+            have = _sha(src)
+        except OSError as e:
+            return False, ["INCONCLUSIVE: could not hash %s (%s) -- that is "
+                           "not a pass." % (src, e)]
+    if doc is None:
+        lines.append("NOTE no %s -- this artifact was not built through "
+                     "buildlock.py, so nothing vouches for its bytes."
+                     % os.path.basename(side))
+    else:
+        want = doc.get("sha256")
+        if not want:
+            lines.append("NOTE %s has no sha256 field -- it vouches for "
+                         "nothing." % os.path.basename(side))
+        elif want != have:
+            lines.append("ARTIFACT REPLACED SINCE BUILD: %s" % src)
+            lines.append("  built  %s  (target %r, pid %s, %s)"
+                         % (want, doc.get("target"), doc.get("pid"),
+                            doc.get("finished_h") or doc.get("finished")))
+            lines.append("  now    %s" % have)
+            lines.append("  The file on disk is not the one the build "
+                         "recorded. Rebuild, or find out who overwrote it "
+                         "-- do NOT deploy these bytes.")
+            return False, lines
+        else:
+            lines.append("built %s by %r at %s (sha matches)"
+                         % (want[:12], doc.get("target"),
+                            doc.get("finished_h") or doc.get("finished")))
+    if expect:
+        if have is None:
+            try:
+                have = _sha(src)
+            except OSError as e:
+                return False, ["INCONCLUSIVE: could not hash %s (%s)"
+                               % (src, e)]
+        if have.lower() != expect.lower():
+            lines.append("EXPECTED SHA MISMATCH: %s" % src)
+            lines.append("  --expect %s" % expect)
+            lines.append("  actual   %s" % have)
+            return False, lines
+        lines.append("--expect matches")
+    return True, lines
+
+
+def selftest_gate(args, C):
+    """Run `selftests.py --fast` before copying anything. -> (ok, why).
+
+    Six verifiers reported PASS on visibly wrong state on 2026-09-01 because
+    their checks could not fail. Each got a self-test afterwards; nothing ran
+    them, and when a runner was finally pointed at the tree it found six
+    already red. A gate is the difference between a suite that exists and a
+    suite that is true.
+    """
+    red, green, yellow, dim, reset = C
+    if getattr(args, "no_selftest", False):
+        print("%s!! --no-selftest: the self-test suite was NOT run. Nothing "
+              "has checked that this repo's verifiers can still fail.%s"
+              % (yellow, reset))
+        return True, "skipped by --no-selftest"
+    runner = os.path.join(HERE, "selftests.py")
+    if not os.path.isfile(runner):
+        print("%sNOTE%s selftests.py is not present in this checkout -- the "
+              "deploy gate could not run. That is INCONCLUSIVE, not a pass."
+              % (yellow, reset))
+        return True, "runner absent"
+    try:
+        sys.path.insert(0, HERE)
+        import selftests                                # noqa: E402
+        fresh, why = selftests.cache_is_green()
+    except Exception as e:                              # noqa: BLE001
+        fresh, why = False, "could not read the cache (%s)" % e
+    if fresh:
+        print("self-tests: %s%s%s" % (green, why, reset))
+        return True, why
+    print("self-tests: %s -- running `selftests.py --fast`" % why)
+    r = subprocess.run([sys.executable, runner, "--fast"], cwd=REPO)
+    if r.returncode == 0:
+        print("%sself-tests green%s" % (green, reset))
+        return True, "ran green"
+    return False, ("selftests.py --fast exited %d. Re-run "
+                   "`python tools/selftests.py --fast` for the table; the "
+                   "failing items are named there." % r.returncode)
 
 
 ENABLED = "ENABLED"
@@ -1081,6 +1194,41 @@ def cmd_deploy(args, cfg, C):
         print("\n%srefusing to deploy.%s" % (red, reset))
         return 1
 
+    # The bytes are verified; now verify the INSTRUMENTS that verified them,
+    # and that these are still the bytes the build produced. Both run BEFORE
+    # any copy, for the same reason the marker check does: a partial deploy is
+    # its own class of confusing bug.
+    if getattr(args, "expect", None) and len(arts) != 1:
+        print("\n%srefusing to deploy: --expect names ONE sha256 but %d "
+              "artifacts are selected. Use --only.%s"
+              % (red, len(arts), reset))
+        return 1
+    ok, lines = True, []
+    for art in arts:
+        src = os.path.join(REPO, art["src"].replace("/", os.sep))
+        if not os.path.isfile(src):
+            continue
+        good, ls = sidecar_check(src, getattr(args, "expect", None)
+                                 if len(arts) == 1 else None)
+        for ln in ls:
+            lines.append("%-8s %s" % (art["name"], ln))
+        ok = ok and good
+    if lines:
+        print()
+        for ln in lines:
+            print("  %s" % ln)
+    if not ok:
+        print("\n%srefusing to deploy: the artifact is not the build that was "
+              "recorded.%s" % (red, reset))
+        return 1
+    if not args.dry_run:
+        green_gate, why = selftest_gate(args, C)
+        if not green_gate:
+            print("\n%srefusing to deploy: %s%s" % (red, why, reset))
+            print("  Pass --no-selftest to deploy anyway. It says so, loudly, "
+                  "in the output.")
+            return 1
+
     if not os.path.isdir(install):
         sys.exit("install directory does not exist: %s" % install)
 
@@ -1667,6 +1815,15 @@ def main():
                    help="switch a mod back ON that the install had switched "
                         "off as <name>.dll.off. Without this, deploy refreshes "
                         "the .off file and LEAVES it off (fact #156).")
+    p.add_argument("--no-selftest", action="store_true",
+                   help="`deploy` only: skip the `selftests.py --fast` gate. "
+                        "Prints a loud line saying nothing checked that this "
+                        "repo's verifiers can still fail.")
+    p.add_argument("--expect", default=None, metavar="SHA256",
+                   help="`deploy` only, with a single --only artifact: refuse "
+                        "unless the artifact's sha256 is exactly this. Use it "
+                        "when you hashed a build in a worktree and want the "
+                        "install to get THOSE bytes.")
     p.add_argument("--no-color", action="store_true")
     args = p.parse_args()
     if args.target and not args.only:
@@ -1682,6 +1839,8 @@ def main():
         sys.exit("--control is the positive control for --contains/--absent; "
                  "it does nothing on its own. Use --contains to assert "
                  "presence, --absent to assert removal.")
+    if (args.no_selftest or args.expect) and args.command != "deploy":
+        sys.exit("--no-selftest/--expect are only meaningful with `deploy`.")
     if args.artifact and args.command != "check":
         sys.exit("--artifact is only meaningful with `check`: it verifies a "
                  "file in place and never copies anything.")
