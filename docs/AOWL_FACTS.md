@@ -7608,3 +7608,12 @@ root` -- the managed liveness walk hit a bad object at the scene transition.
 First boot with two emptied panel clones (80 donor rows Object::Destroy'ed)
 and the first crash of this shape; the previous raid (PROOF only) loaded.
 Bisect running: same build, nativeTabsMods off.
+
+## 2026-09-02 09:20: liveness crash bisect, step 1
+
+MEASURED (build 4,784,128): nativeTabsMods OFF, Settings opened once (PROOF
+tab built, 40 donor rows destroyed), then `raid Woods` -> the client died
+during the raid load again (Crash_2026-09-02_130231246, GameAssembly .text,
+liveness walk). So step 3 (the MODS tab) is not the cause. Both crashing
+boots had Settings opened before the raid; the raid that loaded at 08:13
+never opened Settings. Step 2 (same build, Settings never opened) running.
