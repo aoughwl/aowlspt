@@ -7001,3 +7001,16 @@ come from: `modsComponent` is defined in `modstab.nim`, which is `include`d
 AFTER `settingspages.nim`, so that file has no GetComponent-by-name available
 and the fix needs a helper moved earlier. That is the remaining work, and it is
 in a file this session did not own.
+
+## 2026-09-02 05:25: host-native raid entry reached the side screen and pressed PMC
+
+MEASURED (build 4,766,208): `raid Woods` -> PRE-MENU dismissed Settings via
+the BackButton (PlayButton active readback) -> PLAY pressed -> site 3
+(MatchMakerSideSelectionScreen::Show) fired -> SIDE collected `[Button
+Button]` in the pmc scope (the AnimatedToggle under PMCs/AnimatedToggleSpawner
+was NOT collected) and pressed it via Button::Press @0x539A7A0 -> handed to
+the old NEXT->location step, which waits for the NEXT of the following
+screen and therefore never pressed this screen's `ScreenDefaultButtons/
+NextButton`; refusal census after 45s: `[UI][MatchMaker Side Selection
+Screen][Operation Queue Indicator]`. Three screens of the chain are now
+event-driven and proven; the side screen's own NEXT is the next step.
