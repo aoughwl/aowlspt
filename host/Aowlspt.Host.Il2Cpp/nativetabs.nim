@@ -242,6 +242,24 @@ var gNtSubToggle: seq[Il2CppPtr] = @[]  ## [0]=GRAPHICS SETTINGS, [1]=POSTFX
 var gNtSubSel = 0
 var gNtGfxPanelGo: Il2CppPtr = nil ## the STOCK Graphics Settings panel
 var gNtSubPressed = -1
+## OUR OWN SELECTION WRITES MUST NOT RE-ENTER OUR OWN POSTFIX.
+##
+## MEASURED: ten `native subtabs VERDICT PASS` lines inside 160ms, alternating
+## between POSTFX and GRAPHICS SETTINGS. That is not a noisy cadence, it is a
+## FEEDBACK LOOP: `ntSubShow` calls `AnimatedToggle::set_IsToggled`, which
+## calls `Toggle::Set` with sendCallback TRUE, which re-enters this feature's
+## own postfix, which records a press, which makes the next tick call
+## `ntSubShow` again. Each turn also drags the ToggleGroup into turning the
+## other button off, so the two alternate until it settles.
+##
+## `sendCallback=false` already protects us from `SetIsOnWithoutNotify`, but
+## `set_IsToggled` is not that call. So the applying window is marked
+## explicitly and the postfix ignores anything inside it -- a press we caused
+## is not a press the player made, and only the second one means anything.
+var gNtApplying = false
+## A STOCK tab was selected: hide ours. Set by the postfix when a toggle that
+## is NOT one of ours turns ON.
+var gNtForeignOn = false
 var gNtSubVerdictSaid = false
 const NtSubCount = 2
 var gNtToggleSlotFaults = 0
@@ -291,6 +309,12 @@ proc ntToggleSetFired(regs: Il2CppPtr) =
   let sendCallback = (cast[uint64](cRegsInt(regs, 2'i32)) and 0xFF'u64) != 0'u64
   if not sendCallback:
     return
+  # OUR OWN APPLY IS NOT A PRESS. Without this the feature drives itself in a
+  # loop -- see `gNtApplying`.
+  if gNtApplying:
+    return
+  # `value` is RDX (index 1): did this toggle just go ON?
+  let turnedOn = (cast[uint64](cRegsInt(regs, 1'i32)) and 0xFF'u64) != 0'u64
   var i = 0
   while i < gNtToggle.len and i < NtMaxTabs:
     if gNtToggle[i] == selfPtr:
@@ -307,6 +331,20 @@ proc ntToggleSetFired(regs: Il2CppPtr) =
       gNtSubPressed = j
       return
     j = j + 1
+  # A FOREIGN TOGGLE WENT ON -- a stock tab was selected.
+  #
+  # MEASURED FAIL: 'after pressing GAME back: 2 panels are active at once --
+  # Game Settings (stock), nt-proof (OURS)'. The stock ToggleGroup turned OUR
+  # toggle off for us, but nothing turned our PANEL off, because the only place
+  # that happened was our own toggle's OFF edge -- and the group does not send
+  # a callback for the toggle it silently clears. So the stock panel came back
+  # while ours was still up.
+  #
+  # This is the missing edge, and it is deliberately noticed on ANY foreign
+  # toggle rather than only the tab bar's: whatever it was, if it turned on and
+  # it is not ours, our panel has no business still being drawn.
+  if turnedOn:
+    gNtForeignOn = true
 
 # ---------------------------------------------------------------------------
 # BUILD
@@ -798,10 +836,12 @@ proc ntSubShow(sel: int) =
   # THE HIGHLIGHT, through the real setter. A raw `m_IsOn` store leaves the
   # Animator untold and the wrong button looks selected -- live-confirmed on
   # the old strip, and the reason `set_IsToggled` exists in the target table.
+  gNtApplying = true
   var i = 0
   while i < gNtSubToggle.len and i < NtSubCount:
     discard nuAnimToggleSetToggled(gNtSubToggle[i], i == sel)
     i = i + 1
+  gNtApplying = false
   gNtSubSel = sel
 
 proc ntSubVerdict(why: string) =
@@ -999,6 +1039,16 @@ proc ntTickBody() =
       gNtVerdictSaid = false
       gNtWhyNext = "toggle event -- our tab was pressed " &
                    (if isOn: "ON" else: "OFF")
+  # A STOCK TAB WAS SELECTED -- hand the screen back. This is the edge that was
+  # missing: the stock ToggleGroup clears our toggle silently (no callback for
+  # the one it turns off), so our own OFF edge never fires and only this does.
+  if gNtForeignOn:
+    gNtForeignOn = false
+    if gNtShown >= 0:
+      gNtStep = "tick: a stock tab was selected -- hiding ours"
+      ntHide()
+      gNtVerdictSaid = false
+      gNtWhyNext = "a stock tab was selected -- ours must be off"
   # THE SUBTAB EVENT, drained from the same postfix as the tab event.
   if gNtSubPressed >= 0:
     let sidx = gNtSubPressed
