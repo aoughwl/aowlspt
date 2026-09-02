@@ -775,6 +775,31 @@ at the stock group registers itself the moment its GameObject is enabled.**
 
 ---
 
+
+### 2.10a LIVE ANSWER, MEASURED 2026-09-02 15:06 (coordinator, live inspector)
+
+On the STOCK `Toggles/GesturesToggle/AnimatedToggle` (component 0x23e5be7fe70,
+Game tab up, Controls tab never shown this session):
+
+* `onValueChanged@0x118` -> `UnityEventBase.m_PersistentCalls@0x18` ->
+  `PersistentCallGroup.m_Calls@0x10` -> `List._size@0x18` = **0**.
+* `UnityEventBase.m_Calls@0x10` -> `InvokableCallList.m_RuntimeCalls@0x18` ->
+  `List._size@0x18` = **0**.
+* The CLONED strip's GesturesToggle reads the same: 0 persistent, 0 runtime.
+
+So the subtab `onValueChanged -> HandleGesturesToggle` edge is **NOT
+prefab-serialized** (§2.10's inference is refuted). With zero calls of either
+kind before the Controls tab has been shown, the wiring must be made at
+runtime by `ControlSettingsTab::Show` or later -- most plausibly through the
+SHARED generic ``UnityEvent`1<bool>::AddListener``, which a rel32 callgraph
+cannot attribute (INFERRED). Consequence for §6.2: a cloned strip carries NO
+handler at all, so the clone's toggles are inert until we wire our own
+drain -- and there is nothing stale on them to remove.
+
+`SettingsScreen+0x90` is a `SettingsScreenController` (Assembly-CSharp):
+read live, klass name at `klass+0x10` = "SettingsScreenController". §8's
+`ScreenController@0x90` question is settled.
+
 ## 3. The Unity side actually present in this build
 
 Every RVA MEASURED `R typemethods`; every sharedness MEASURED `R shared`.
