@@ -6907,3 +6907,97 @@ UIAnimatedToggleSpawner (the settings-tab family) plus a `Button`. A walk
 probing only DefaultUIButton/AnimatedToggle klasses under the pmc/scav
 containers found nothing here (04:20), so those klass names are wrong for
 this screen; `components` on the live nodes is the way to learn them.
+
+## 2026-09-02: the side selector's real klasses, read off the live client
+
+MEASURED with the inspector's `components` verb against the parked client
+(read-only, no `allow write`), on the pointers the coordinator's `tree` gave:
+
+* the toggle node (`AnimatedToggle`, under `AnimatedToggleSpawner`), 0x200f4c00960:
+  `UnityEngine.RectTransform`, `CanvasRenderer`, `UI.Image`, `Animator`,
+  **`EFT.UI.AnimatedToggle`**, **`EFT.UI.UISpawnableToggle`**,
+  `UI.HorizontalLayoutGroup`, `UI.LayoutElement`.
+* the `Button` node beside it, 0x200f53ef7e0: `RectTransform`, `CanvasRenderer`,
+  **`UnityEngine.UI.Button`**, `EventSystems.EventTrigger`. **No
+  DefaultUIButton**, so it has no `_text` and no caption to match on.
+* `NextButton` (under the sibling `ScreenDefaultButtons`), 0x1ffe26efe20:
+  `RectTransform`, **`EFT.UI.DefaultUIButton`**, `DefaultUIButtonAnimation`,
+  `TweenAnimatedButton`, layout components -- so the existing
+  DefaultUIButton/+0x120 press path is right for NEXT.
+
+**Both sides live under `PMCs`**: `PMCs -> [PMCPlayerMV] [AnimatedToggleSpawner
+-> AnimatedToggle] [Button] [ScavPlayerMV -> [AnimatedToggleSpawner] [Button]]
+[RandomToggleSpawner -> RandomToggle]`. So the side cannot be chosen by name (the
+controls are called `AnimatedToggle`/`Button`) nor by caption (no
+DefaultUIButton). It is STRUCTURAL: the PMC control is the first control under
+`PMCs` **not** inside a `*scav*` subtree; the SCAV control is the one inside it.
+
+**And the reason the previous probe reported ZERO: the collector was
+DEPTH-FIRST.** `PMCs`' first child is `PMCPlayerMV`, the character model, so a
+depth-first walk capped at 24 nodes spent the whole cap inside its mesh and never
+reached the sibling spawner two levels down. Breadth-before-depth finds the
+controls in the first two levels. This is the third time in this file's history
+that a breadth-first walk was the fix (`splFindByName`, `arWalkActive`, now
+this) -- on this UI, containers are wide and shallow and models are deep.
+
+`UnityEngine.UI.Button` is pressed through **`Button::Press` @0x539A7A0** (the
+game's own path, which re-checks IsActive/IsInteractable), not through a
+UnityEvent read at `arOnClickOff`'s generic 0x100 -- that offset is measured for
+DefaultUIButton and AnimatedToggle, and firing a guessed slot on a klass this
+file had never handled is a blind write.
+
+## 2026-09-02 (later): the 22 rows still reading "Interface language" are NOT the MODS tab's
+
+CORRECTION to the entry above. Acceptance on the 4,758,016 deploy reported
+`24 hit(s) of 'Interface language' ... 22 under Settings Drop Down(Clone)(Clone)`
+and the check named them "MODS row clones". **They are not.** Three separate
+measurements:
+
+* `hostlog.py grep "row caption|re-asserted|NO ROW CAPTION" --max 0` over that
+  run returned **zero** lines. The mods-tab row path never executed. Only the
+  postfx subtab strip (`ControlToggle(Clone)`) appears in the log. The tab is
+  built "the first time Settings -> Game is opened" and that had not happened.
+* inspector `parent 0x00000203095d3e00 7`, and the same for two more of the
+  reported pointers, all walked:
+  `Text -> Settings Drop Down(Clone)(Clone) -> Settings -> Viewport ->
+  Scroll View -> Container -> Game Settings`, sharing ONE container
+  `0x0000020244f7e840` under the **stock Game Settings panel**.
+* the renderer that puts rows there is `settingspages.nim:1526`
+  (`swRenderPage` -> `swCloneRow`), a different feature in a different file
+  from `modstab.nim`.
+
+`(Clone)(Clone)` means "aowlspt cloned a stock row" -- the game's own rows are
+already `(Clone)` because it instantiates them from a prefab. It does **not**
+mean the MODS tab. Attributing by NAME sent this investigation at the wrong
+file; attributing by ANCESTRY answered it in one inspector batch.
+
+### Why those rows keep the donor's caption -- MEASURED, and it is not the poll
+
+`swCloneRow` labels through `swControlTmp`, which resolves
+`control.Text(+0x80) -> LocalizedText -> _labels[0]` -- **exactly one TMP** --
+and then logs "cloned row ... labelled via LocalizedText::SetLabelText
+TMP_Text::set_text". Fact #88, in the settings-pages renderer.
+
+The decisive measurement, on one of the offending rows:
+
+* `component 0x00000203095d3e00 LocalizedText` -> **FOUND `0x00000203091c2210`**
+  (the `Text` CHILD, the node that actually renders)
+* `component 0x00000203095d3f40 LocalizedText` -> **GetComponent returned NULL**
+  (`Settings Drop Down(Clone)(Clone)`, the row itself)
+
+So the TMP that renders hangs on a child with its **own** LocalizedText, and
+`swSetLocalizedText` derives its target as `control + 0x80` -- the ROW
+control's. Every write went to a component nobody reads while the child
+re-localised itself straight back. This is why re-applying on a poll only ever
+produced a fight: the clobbering component was never being written.
+
+**The fix is to call `LocalizedText::SetLabelText @0x140FE70` on the
+LocalizedText resolved from the TMP's OWN node** (GetComponent on that node),
+not on the row control -- the shape `modetext.nim:615` already uses
+(`cSwFn2(SwLocSetLabelText)` then `cSwCallVPP(fn, loc, s)`). Done in
+`modstab.nim` (`modsApplyLabel`, used by the row relabel AND the re-assert
+poll). **NOT done in `settingspages.nim`**, which is where the 22 live rows
+come from: `modsComponent` is defined in `modstab.nim`, which is `include`d
+AFTER `settingspages.nim`, so that file has no GetComponent-by-name available
+and the fix needs a helper moved earlier. That is the remaining work, and it is
+in a file this session did not own.

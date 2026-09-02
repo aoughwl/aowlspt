@@ -124,7 +124,7 @@ const
                                 ## CONTAINER is the thing to walk, not the
                                 ## screen.
   ArMaxSideConts  = 8           ## pmc/scav containers examined.
-  ArMaxSideProbe  = 24          ## nodes GetComponent-probed INSIDE one
+  ArMaxSideProbe  = 40          ## nodes GetComponent-probed INSIDE one
                                 ## container. Bounded because each probe
                                 ## allocates a managed string inside
                                 ## GetComponent(String); this runs only while
@@ -712,14 +712,33 @@ proc arSelectMap(): bool =
 # SELECT-MAP -- and the raid path's later readback is site 0,
 # `MatchmakerOfflineRaidScreen::Show`.
 # ---------------------------------------------------------------------------
-proc arCollectAllActive(t: Il2CppPtr; depth: int; budget: var int;
-                        deadline: uint64; into: var seq[Il2CppPtr]; cap: int) =
-  ## Every ACTIVE node under `t`, capped and time-sliced like every other walk
-  ## here. Used by the SIDE step, which must report the names it saw -- a
-  ## refusal that cannot list the candidates is not evidence.
-  if t == nil or depth < 0 or budget <= 0 or into.len >= cap: return
+proc arCollectActiveBF(t: Il2CppPtr; depth: int; budget: var int;
+                       deadline: uint64; into: var seq[Il2CppPtr]; cap: int;
+                       skip: string) =
+  ## Every ACTIVE node under `t`, BREADTH BEFORE DEPTH, skipping any subtree
+  ## whose name contains `skip` (lowercased; "" skips nothing).
+  ##
+  ## THE BREADTH ORDER IS THE WHOLE FIX HERE, not a preference. MEASURED
+  ## 2026-09-02: the depth-first version of this walk, capped at 24 nodes,
+  ## reported ZERO pressable nodes under the side selector -- because `PMCs`'
+  ## FIRST child is `PMCPlayerMV`, the character MODEL, and a depth-first walk
+  ## spends the entire cap inside its mesh before it ever reaches the sibling
+  ## `AnimatedToggleSpawner` two levels down. The live tree (inspector, on the
+  ## parked client) is
+  ##   PMCs -> [PMCPlayerMV] [AnimatedToggleSpawner -> AnimatedToggle] [Button]
+  ##           [ScavPlayerMV -> [AnimatedToggleSpawner] [Button]]
+  ##           [RandomToggleSpawner -> RandomToggle]
+  ## so the controls are shallow and the model is deep. Breadth-first finds them
+  ## in the first two levels; depth-first cannot find them at all. This is the
+  ## same lesson `arWalkActive` and `arCollectChildren` already carry.
+  ##
+  ## `skip` is how one side is chosen without guessing: BOTH sides live under
+  ## `PMCs`, and the Scav one is inside a `ScavPlayerMV` subtree, so "the PMC
+  ## control" is "the first control under PMCs that is NOT under a scav node".
+  if t == nil or depth <= 0 or budget <= 0 or into.len >= cap: return
   var n = 0
   if not iChildCount(t, n): return
+  # Pass 1 -- breadth.
   var i = 0
   while i < n and i < ArFanout and budget > 0 and into.len < cap:
     let c = iChildAt(t, i)
@@ -730,10 +749,25 @@ proc arCollectAllActive(t: Il2CppPtr; depth: int; budget: var int;
         return
       let a = iActiveInHierarchy(c)
       if a[0] and a[1]:
-        into.add c
-        if into.len >= cap: return
-        arCollectAllActive(c, depth - 1, budget, deadline, into, cap)
+        if skip.len == 0 or not iContains(iLower(iObjName(c)), skip):
+          into.add c
+          if into.len >= cap: return
     i = i + 1
+  # Pass 2 -- depth, only once the whole level has been taken.
+  i = 0
+  while i < n and i < ArFanout and budget > 0 and into.len < cap:
+    let c = iChildAt(t, i)
+    if c != nil and duOk(c, 0x20'i32):
+      let a = iActiveInHierarchy(c)
+      if a[0] and a[1] and
+         (skip.len == 0 or not iContains(iLower(iObjName(c)), skip)):
+        arCollectActiveBF(c, depth - 1, budget, deadline, into, cap, skip)
+    i = i + 1
+
+proc arCollectAllActive(t: Il2CppPtr; depth: int; budget: var int;
+                        deadline: uint64; into: var seq[Il2CppPtr]; cap: int) =
+  ## Breadth-first, no subtree skipped. Kept as the name the census callers use.
+  arCollectActiveBF(t, depth, budget, deadline, into, cap, "")
 
 proc arSideScreen(): Il2CppPtr =
   ## The live side selector, as a TRANSFORM -- obtained from the RECEIVER THE
@@ -770,38 +804,95 @@ proc arBtnCaption(comp: Il2CppPtr): string =
     result = suiReadString(sp)
 
 proc arButtonOn(node: Il2CppPtr; comp: var Il2CppPtr): string =
-  ## Which pressable component this node carries, "" for none. DefaultUIButton
-  ## first (what this file presses everywhere), AnimatedToggle second (the map
-  ## tiles' type). Returns the TYPE NAME so the caller hands the same string
-  ## back to `arPress` and the two cannot disagree about what was found.
+  ## Which pressable component this node carries, "" for none.
+  ##
+  ## THE THREE KLASS NAMES ARE MEASURED, NOT GUESSED. Read live off the parked
+  ## side-selection screen with the inspector's `components` verb, 2026-09-02:
+  ##
+  ##   the toggle node   (`AnimatedToggle`, under `AnimatedToggleSpawner`)
+  ##       UnityEngine.RectTransform, CanvasRenderer, UI.Image, Animator,
+  ##       EFT.UI.AnimatedToggle, EFT.UI.UISpawnableToggle,
+  ##       UI.HorizontalLayoutGroup, UI.LayoutElement
+  ##   the `Button` node under each side
+  ##       UnityEngine.RectTransform, CanvasRenderer,
+  ##       **UnityEngine.UI.Button**, EventSystems.EventTrigger
+  ##   `NextButton` (under the sibling `ScreenDefaultButtons`)
+  ##       UnityEngine.RectTransform, **EFT.UI.DefaultUIButton**,
+  ##       DefaultUIButtonAnimation, TweenAnimatedButton, layout components
+  ##
+  ## So the previous probe -- DefaultUIButton then AnimatedToggle -- could only
+  ## ever have matched the toggle, and the earlier run reported ZERO because the
+  ## depth-first walk never reached it. `UnityEngine.UI.Button` is a THIRD
+  ## klass this file had never looked for, and it is what the side's `Button`
+  ## node carries.
+  ##
+  ## GetComponent here is the STRING overload, which Unity matches by SHORT type
+  ## name, so `AnimatedToggle` finds `EFT.UI.AnimatedToggle` and `Button` finds
+  ## `UnityEngine.UI.Button` -- the short names above, not the namespaces.
   result = ""
   comp = nil
   var w = ""
-  if iVisComponent(node, "DefaultUIButton", comp, w) and comp != nil:
-    return "DefaultUIButton"
-  comp = nil
   if iVisComponent(node, "AnimatedToggle", comp, w) and comp != nil:
     return "AnimatedToggle"
   comp = nil
+  if iVisComponent(node, "DefaultUIButton", comp, w) and comp != nil:
+    return "DefaultUIButton"
+  comp = nil
+  if iVisComponent(node, "Button", comp, w) and comp != nil:
+    return "Button"
+  comp = nil
+
+proc arPressUnityButton(comp: Il2CppPtr): bool =
+  ## `UnityEngine.UI.Button::Press` @0x539A7A0 -- THE GAME'S OWN CLICK PATH. It
+  ## re-checks IsActive and IsInteractable itself and then fires m_OnClick,
+  ## exactly as a real click does, which is why the inspector's `click` uses it.
+  ##
+  ## It is used INSTEAD of `arPress` for this klass on purpose: `arOnClickOff`
+  ## returns the generic 0x100 for everything that is not a DefaultUIButton, and
+  ## firing a UnityEvent read at a guessed offset on a klass this file has never
+  ## handled is precisely the blind write the host does not do. Resolved through
+  ## `iNavFind`, so it is byte-verified against the startup prologue snapshot
+  ## and refused if it does not match.
+  result = false
+  if comp == nil or not iUnityAlive(comp): return
+  var fn: Il2CppPtr = nil
+  var rva = 0'u32
+  if not iNavFind("Button::Press", fn, rva) or fn == nil: return
+  iMark("autoRaid: Button::Press", comp)
+  discard cInspUP(fn, comp, nil)
+  result = true
+
+proc arPressAny(node, comp: Il2CppPtr; compType: string): bool =
+  ## Press `node`, by whichever route its klass calls for.
+  if compType == "Button":
+    return arPressUnityButton(comp)
+  result = arPress(node, compType)
 
 proc arPressSideUnder(scr: Il2CppPtr; want: string; nSeen: var int;
                       names: var string; why: var string): bool =
-  ## Press the side control whose CAPTION reads `want` (default "pmc", from
-  ## `autoRaidSide`); the object NAME is only a fallback, used when no caption
-  ## could be read at all.
+  ## Press the control for the wanted side on the live side-selection screen.
   ##
-  ## WHY IT WALKS THE CONTAINERS AND NOT THE SCREEN. MEASURED 2026-09-02: a
-  ## depth-6 census of ACTIVE nodes from the screen returned
-  ##   [Logo][CaptionsHolder][MainCaption][SubCation][PMCs][PMCPlayerMV]
-  ##   [PlayerMVObject][Lights][Fill Light][Main Light][Down Light][Hair Light]
-  ##   [Camera_matchmaker][MenuPlayer][Mesh][USEC_head_Hugh] .. [pistol_holster]
-  ##   [Pants_Usec_AC_Combat_Crye_lod0]
-  ## -- `PMCs` is a CONTAINER holding the character MODEL as well as the
-  ## control, so a flat walk spends its whole cap on mesh nodes and never
-  ## reaches anything pressable. The SIDE step failed nine times in a row on
-  ## exactly that. So: find the containers by name, walk INSIDE each one for a
-  ## node that actually CARRIES a button, and report every one found WITH ITS
-  ## CAPTION -- a refusal that cannot list its candidates is not evidence.
+  ## THE STRUCTURE, read off the live client with the inspector (`tree`,
+  ## 2026-09-02) rather than guessed:
+  ##
+  ##   MatchMaker Side Selection Screen
+  ##     +- PMCs                      <- the container for BOTH sides
+  ##     |    +- PMCPlayerMV          <- the PMC character MODEL (deep, huge)
+  ##     |    +- AnimatedToggleSpawner -> AnimatedToggle   <- the PMC control
+  ##     |    +- Button                                     <- and its Button
+  ##     |    +- ScavPlayerMV                              <- the SCAV side,
+  ##     |    |    +- AnimatedToggleSpawner                    NESTED INSIDE
+  ##     |    |    +- Button                                   the PMC container
+  ##     |    +- RandomToggleSpawner -> RandomToggle
+  ##     +- ScreenDefaultButtons -> NextButton, BackButton
+  ##
+  ## So "the PMC control" cannot be found by a name containing "pmc" (the
+  ## controls are called `AnimatedToggle` and `Button`) and cannot be found by a
+  ## caption either (they carry no `DefaultUIButton`, so there is no `_text`).
+  ## It is a STRUCTURAL fact: the PMC control is the first control under `PMCs`
+  ## that is NOT inside a `scav` subtree, and the SCAV control is the first one
+  ## inside the `scav` subtree. That is what the `skip` argument of
+  ## `arCollectActiveBF` expresses, and it is why the walk must be breadth-first.
   result = false
   nSeen = 0
   names = ""
@@ -810,91 +901,108 @@ proc arPressSideUnder(scr: Il2CppPtr; want: string; nSeen: var int;
     why = "no live side screen"
     return false
 
-  # Phase 1 -- the containers: anything ACTIVE under the screen whose name
-  # mentions a side. `PMCs` and a `Scavs`/`SCAVs` sibling are what this build
-  # showed; the match is a lowercased substring, so `PMC` or `ScavsHolder`
-  # still lands.
+  # Phase 1 -- the container(s), breadth-first from the screen.
   var all: seq[Il2CppPtr] = @[]
   var b0 = ArNodeBudget
   arCollectAllActive(scr, ArSideDepth, b0, cNowMs() + ArWalkMs, all,
                      ArMaxSideBtns)
-  var conts: seq[Il2CppPtr] = @[]
+  var cont: Il2CppPtr = nil
   var i = 0
-  while i < all.len and conts.len < ArMaxSideConts:
+  while i < all.len:
     let nm = iLower(iObjName(all[i]))
     if nm.len > 0 and (iContains(nm, "pmc") or iContains(nm, "scav")):
-      conts.add all[i]
+      cont = all[i]
+      break
     i = i + 1
-  if conts.len == 0:
+  if cont == nil:
     why = "no ACTIVE node under the live side screen has a name mentioning " &
           "`pmc` or `scav`, so there is no container to walk into. NOTHING " &
           "WAS PRESSED -- this is a refusal, not a miss"
     return false
 
-  # Phase 2 -- inside each container, every node that CARRIES a pressable
-  # component, with the caption a person reads on it.
-  var best: Il2CppPtr = nil
-  var bestType = ""
-  var bestCap = ""
-  var byName: Il2CppPtr = nil
-  var byNameType = ""
-  var ci = 0
-  while ci < conts.len:
-    var nodes: seq[Il2CppPtr] = @[]
-    var b = ArNodeBudget
-    nodes.add conts[ci]                     # the container itself may BE it
-    arCollectAllActive(conts[ci], ArSideDeepDepth, b, cNowMs() + ArWalkMs,
-                       nodes, ArMaxSideProbe)
-    var ni = 0
-    while ni < nodes.len:
-      var comp: Il2CppPtr = nil
-      let ct = arButtonOn(nodes[ni], comp)
-      if ct.len > 0:
-        nSeen = nSeen + 1
-        let nm = iObjName(nodes[ni])
-        let cap = (if ct == "DefaultUIButton": arBtnCaption(comp) else: "")
-        if names.len < 620:
-          names = names & "[" & nm & " " & ct & " caption=" &
-                  (if cap.len > 0: cap else: "<unreadable>") & "]"
-        if best == nil and cap.len > 0 and iContains(iLower(cap), want):
-          best = nodes[ni]
-          bestType = ct
-          bestCap = cap
-        if byName == nil and nm.len > 0 and iContains(iLower(nm), want):
-          byName = nodes[ni]
-          byNameType = ct
-      ni = ni + 1
-    ci = ci + 1
+  # Phase 2 -- narrow to the wanted SIDE inside that container.
+  var scope = cont
+  var skip = ""
+  let wantScav = iContains(want, "scav")
+  if wantScav:
+    # The scav side is a NESTED subtree; find it and search only there.
+    var inner: seq[Il2CppPtr] = @[]
+    var b1 = ArNodeBudget
+    arCollectAllActive(cont, ArSideDeepDepth, b1, cNowMs() + ArWalkMs, inner,
+                       ArMaxSideProbe)
+    var found: Il2CppPtr = nil
+    var j = 0
+    while j < inner.len:
+      if iContains(iLower(iObjName(inner[j])), "scav"):
+        found = inner[j]
+        break
+      j = j + 1
+    if found == nil:
+      why = "wanted the SCAV side but no ACTIVE node named `*scav*` exists " &
+            "under the container. NOTHING WAS PRESSED"
+      return false
+    scope = found
+  else:
+    # The PMC side is everything under the container EXCEPT the scav subtree.
+    skip = "scav"
 
-  # THE CAPTION WINS; the name is the fallback and says so when it is used. On
-  # the boot slot screen the object names were measured to lie outright
-  # (`CharacterSlotView_pvp` is labelled "PvE"), so preferring a name match
-  # while a caption was readable would be choosing the worse evidence.
-  if best != nil:
-    if arPress(best, bestType):
-      okLog "autoRaid SIDE: matched by CAPTION \"" & bestCap & "\" on a " &
-            bestType & " inside a `pmc`/`scav` container."
-      return true
-    why = "the control captioned \"" & bestCap & "\" matched \"" & want &
-          "\" but could not be pressed: its " & bestType & " OnClick could " &
-          "not be resolved and validated"
+  # Phase 3 -- the first node in that scope that CARRIES a control, breadth
+  # first, every candidate reported with the klass that matched and (where the
+  # klass has one) the caption a person reads.
+  var nodes: seq[Il2CppPtr] = @[]
+  var b2 = ArNodeBudget
+  nodes.add scope                             # the scope itself may carry it
+  arCollectActiveBF(scope, ArSideDeepDepth, b2, cNowMs() + ArWalkMs, nodes,
+                    ArMaxSideProbe, skip)
+  var hit: Il2CppPtr = nil
+  var hitComp: Il2CppPtr = nil
+  var hitType = ""
+  var ni = 0
+  while ni < nodes.len:
+    var comp: Il2CppPtr = nil
+    let ct = arButtonOn(nodes[ni], comp)
+    if ct.len > 0:
+      nSeen = nSeen + 1
+      let nm = iObjName(nodes[ni])
+      let cap = (if ct == "DefaultUIButton": arBtnCaption(comp) else: "")
+      if names.len < 620:
+        names = names & "[" & nm & " " & ct &
+                (if cap.len > 0: " caption=" & cap else: "") & "]"
+      # PREFER THE TOGGLE. It is the control the screen's own spawner created
+      # for this side (EFT.UI.AnimatedToggle + EFT.UI.UISpawnableToggle, the
+      # same family as the settings tabs); the bare UnityEngine.UI.Button
+      # alongside it is taken only if no toggle is found.
+      if ct == "AnimatedToggle" and (hit == nil or hitType != "AnimatedToggle"):
+        hit = nodes[ni]
+        hitComp = comp
+        hitType = ct
+      elif hit == nil:
+        hit = nodes[ni]
+        hitComp = comp
+        hitType = ct
+    ni = ni + 1
+
+  if hit == nil:
+    why = "walked the " & (if wantScav: "`scav` subtree" else: "`pmc` " &
+          "container with `scav` subtrees EXCLUDED") & " breadth-first and " &
+          "found NO node carrying an AnimatedToggle, a DefaultUIButton or a " &
+          "UnityEngine.UI.Button (" & $nodes.len & " active node(s) probed, " &
+          "cap " & $ArMaxSideProbe & "). NOTHING WAS PRESSED"
     return false
-  if byName != nil:
-    if arPress(byName, byNameType):
-      okLog "autoRaid SIDE: matched by object NAME, not by caption -- no " &
-            "caption under the containers could be read. Names can lie on " &
-            "this build, so this is the WEAKER match, and it is announced " &
-            "rather than silently preferred."
-      return true
-    why = "the control whose NAME matched \"" & want & "\" could not be " &
-          "pressed: its " & byNameType & " OnClick could not be resolved and " &
-          "validated"
-    return false
-  why = "walked " & $conts.len & " `pmc`/`scav` container(s) and found " &
-        $nSeen & " node(s) carrying a DefaultUIButton or AnimatedToggle, " &
-        "none with a caption or a name containing \"" & want &
-        "\" (`autoRaidSide`). The candidates are listed above; match one of " &
-        "those. NOTHING WAS PRESSED"
+  if arPressAny(hit, hitComp, hitType):
+    okLog "autoRaid SIDE: pressed the " & hitType & " on `" &
+          iObjName(hit) & "` for side \"" & want & "\", chosen STRUCTURALLY " &
+          "(the control under the container that is " &
+          (if wantScav: "INSIDE the scav subtree" else: "NOT inside the scav " &
+           "subtree") & "), because these controls have neither a matching " &
+          "name nor a caption to match on. Candidates: " & names
+    return true
+  why = "the " & hitType & " on `" & iObjName(hit) & "` was found but could " &
+        "not be pressed" &
+        (if hitType == "Button":
+           " (UnityEngine.UI.Button::Press did not verify against the startup " &
+           "prologue snapshot, or the component's native half is null)"
+         else: " (its OnClick UnityEvent could not be resolved and validated)")
 
 proc arActiveCensus(root: Il2CppPtr; depth: int; count: var int;
                     into: var string) =
@@ -1527,10 +1635,11 @@ proc arTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ar_tick_body", cdecl.}
       # reads on it (`DefaultUIButton._text` @0xB8, offset from fldoff.py).
       # This is what turns the next refusal into evidence instead of a shrug.
       gArSideNamesLogged = true
-      info "autoRaid SIDE: " & $nSeen & " pressable node(s) inside the " &
-           "`pmc`/`scav` container(s): " & names & " -- wanted a CAPTION " &
-           "containing \"" & want & "\" (`autoRaidSide`), with the object " &
-           "name as fallback only."
+      info "autoRaid SIDE: " & $nSeen & " node(s) carrying a control in the " &
+           "wanted side's scope: " & names & " -- side \"" & want &
+           "\" (`autoRaidSide`) is chosen STRUCTURALLY (both sides live under " &
+           "`PMCs`; the scav one is nested in a `*scav*` subtree), because " &
+           "these controls carry no DefaultUIButton and therefore no caption."
     if pressed:
       gArSidePresses = gArSidePresses + 1
       gArSidePressedMs = now
