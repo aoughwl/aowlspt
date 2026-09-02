@@ -3453,6 +3453,182 @@ proc gfxTick() =
 # only one branch runs per guarded call and none of them nests a second guard.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# THE TWO MAIN-MENU WIDGETS, REACHED FROM THE RECEIVER INSTEAD OF BY NAME
+# ---------------------------------------------------------------------------
+#
+# WHAT WAS WRONG. `uxHideSeasons` and `uxHideModeButton` both found their
+# target by walking the MenuScreen's children looking for a GameObject NAMED
+# `SeasonsButton` / the mode button. A name walk answers three ways -- found,
+# absent, or BUDGET -- and this session's host log shows no line from either
+# feature at all, which is the third one. The banner is on screen.
+#
+# WHAT IS RIGHT, AND IT IS MEASURED, NOT GUESSED. Both widgets are DECLARED
+# FIELDS of the receiver site 2 hands us:
+#
+#   python tools/il2cpp_resolve.py ... fields EFT.UI.MenuScreen
+#     0xd8  _changeGameModeButton  ChangeGameModeButton   <- the PVE ZONE
+#                                                            change-mode selector
+#     0xe8  _seasonWidget          SeasonWidget           <- the KORD BREACH banner
+#
+# and `R disasm 0x15387A0` confirms the game itself reads exactly those two
+# offsets off `rsi` (= `this`) while showing the menu:
+#     0x1538ed0  mov rcx,[rsi+0xd8]   ; _changeGameModeButton
+#     0x1539118  mov rbx,[rsi+0xe8]   ; _seasonWidget
+# There is nothing to search for. One field read replaces the walk.
+#
+# THE CODE HOP THAT WAS FOUND AND NOT TAKEN, recorded so the next attempt does
+# not have to re-derive it. The game hides each widget on its own data gate:
+#
+#   0x1538ed7  cmp qword [rsi+0x120], 0      ; _modeDescriptor == NULL?
+#   0x1538edf  jne ...                       ;   no  -> the SHOW vtable slot
+#   0x1538eea  call [klass+0x258] (MethodInfo* [klass+0x260])   ; the HIDE call
+#
+#   0x15390f4  cmp byte [rsi+0x100], 0      ; _reconnectAvailable != 0?
+#   0x1539112  ... -> 0x153939b
+#   0x153939b  rcx = [rsi+0xe8] ; call [klass+0x258]            ; the SAME HIDE call
+#
+# So both widgets share ONE base-declared 0-arg vtable slot pair
+# {klass+0x258, klass+0x260} that the game uses to hide them, and making the
+# game's own gate say `hidden` would mean writing `_reconnectAvailable = 1` or
+# nulling `_modeDescriptor` -- both BLIND WRITES to fields the rest of the menu
+# reads (`_reconnectAvailable` also gates the reconnect button; `_modeDescriptor`
+# is written by Show itself from R9, so a write before Show is undone by Show).
+# Calling the vtable slot directly is the better hop and is left for a follow-up:
+# it needs the slot's identity CONFIRMED (which method is at +0x258 on these two
+# concrete klasses), and this host does not claim a method's identity from a
+# vtable index. Until then the established primitive is used -- ONE
+# `GameObject::SetActive(false)` -- and the VERDICT below is what decides
+# whether that was enough.
+#
+# SAFETY. This runs INSIDE branch 3's single `aowl_p_p_seh` and opens none of
+# its own (rule 3). Every hop is checked: `duOk` on the field slot, `iUnityAlive`
+# on the component, `iUnityAlive` on the GameObject inside `modsSetActive`. No
+# loop. Nothing is written except the one `SetActive` on an object we resolved
+# and validated (rule 8). Both flags default OFF.
+
+const
+  MwOffModeButton   = 0xd8'i32
+    ## `EFT.UI.MenuScreen._changeGameModeButton` (ChangeGameModeButton).
+    ## MEASURED, `R fields EFT.UI.MenuScreen`; corroborated by the body's own
+    ## `mov rcx,[rsi+0xd8]` at 0x1538ed0.
+  MwOffSeasonWidget = 0xe8'i32
+    ## `EFT.UI.MenuScreen._seasonWidget` (SeasonWidget). MEASURED the same two
+    ## ways; the body reads it at 0x1539118 and again at 0x153939b.
+  MwVerdictDelayMs  = 150
+    ## How long after the hide the verdict reads the finished state back. The
+    ## point is to read it on a LATER frame than the write, so what is asserted
+    ## is the state of the tree and not the success of our own call
+    ## (CLAUDE.md 9b). 150 ms is several frames at any playable rate.
+  MwMaxFaults = 3
+
+var gMwSeasonGo: Il2CppPtr = nil   ## the GameObject we switched off, or nil
+var gMwModeGo:   Il2CppPtr = nil
+var gMwPendingAt = 0'u64          ## 0 = no verdict outstanding
+var gMwFaults = 0
+var gMwEpochs = 0
+var gMwPass = 0
+var gMwFail = 0
+var gMwInconclusive = 0
+
+proc mwHideField(menu: Il2CppPtr; off: int32; what: string): Il2CppPtr =
+  ## Read ONE declared field off the live MenuScreen, validate every hop, and
+  ## switch its GameObject off. Returns the GameObject so the verdict can read
+  ## it back later, or nil -- and a nil is always explained, never silent.
+  result = nil
+  modsCrumbP("menu widgets: " & what & " field @0x" & hexOf(uint64(off)), menu)
+  if not duOk(menu, off + 8'i32):
+    warn "menu widgets: the MenuScreen is not readable as far as +0x" &
+         hexOf(uint64(off)) & ", so " & what & " was NOT read. Nothing was " &
+         "hidden. (This is a refusal, not an absence.)"
+    return
+  let comp = cReadPtrAt(menu, off)
+  if comp == nil:
+    info "menu widgets: MenuScreen." & what & " is NULL on this menu -- the " &
+         "game itself has no such widget here, so there is nothing to hide. " &
+         "NOT a failure."
+    return
+  modsCrumbP("menu widgets: " & what & " component", comp)
+  if not iUnityAlive(comp):
+    warn "menu widgets: MenuScreen." & what & " reads back 0x" &
+         hexOf(cast[uint64](comp)) & " but its native half is gone (a Unity " &
+         "fake-null). NOTHING was called on it."
+    return
+  let go = iGameObjectOf(comp)
+  if go == nil:
+    warn "menu widgets: Component::get_gameObject on " & what &
+         " did not yield a live GameObject. Nothing was hidden."
+    return
+  if not modsSetActive(go, false):
+    warn "menu widgets: GameObject::SetActive(false) was REFUSED for " &
+         what & " (the target did not pass the liveness check at the icall). " &
+         "Nothing was hidden."
+    return
+  result = go
+
+proc menuWidgetsFrom(menu: Il2CppPtr) =
+  ## Rides branch 3 -- the SAME single `aowl_p_p_seh` as the seasons pass and
+  ## the beta notice -- and adds no guard of its own, because that guard is not
+  ## re-entrant. Called once per MENU SHOW EVENT (uihooks site 2), never on a
+  ## cadence: there is no polling anywhere in this path.
+  if menu == nil:
+    return
+  if not (gSeasonsOn or gModeHideOn):
+    return
+  gMwSeasonGo = nil
+  gMwModeGo = nil
+  if gSeasonsOn:
+    gMwSeasonGo = mwHideField(menu, MwOffSeasonWidget, "_seasonWidget")
+  if gModeHideOn:
+    gMwModeGo = mwHideField(menu, MwOffModeButton, "_changeGameModeButton")
+  gMwEpochs = gMwEpochs + 1
+  gMwPendingAt = cNowMs()
+  okLog "menu widgets: menu event " & $gMwEpochs & " -- from the RECEIVER, " &
+        "not a name walk. _seasonWidget(0xe8)=" &
+        (if gSeasonsOn: (if gMwSeasonGo != nil: "switched off" else: "NOT " &
+           "switched off (see the line above)") else: "uxHideSeasons OFF") &
+        ", _changeGameModeButton(0xd8)=" &
+        (if gModeHideOn: (if gMwModeGo != nil: "switched off" else: "NOT " &
+           "switched off (see the line above)") else: "uxHideModeButton OFF") &
+        ". The VERDICT is read back in " & $MwVerdictDelayMs & " ms; this " &
+        "line is not the verdict."
+
+proc mwOneVerdict(go: Il2CppPtr; what: string) =
+  ## Read the FINISHED STATE of one widget. Three outcomes, never two, and the
+  ## assertion is a NEGATIVE -- `activeInHierarchy` must be false -- so it can
+  ## be falsified. `iActiveInHierarchyChecked` cross-checks the icall against a
+  ## parent-chain derivation and reports INCONCLUSIVE when the two disagree,
+  ## which is exactly the case a plain `SetActive returned true` cannot see.
+  if go == nil:
+    return
+  var note = ""
+  let (ok, act) = iActiveInHierarchyChecked(go, note)
+  if not ok:
+    gMwInconclusive = gMwInconclusive + 1
+    warn "menu widgets: INCONCLUSIVE for " & what & " -- activeInHierarchy " &
+         "could not be established" & (if note.len > 0: ": " & note else: ".") &
+         " This is NOT a pass: the widget may still be on screen."
+  elif act:
+    gMwFail = gMwFail + 1
+    warn "menu widgets: FAIL -- " & what & " reads activeInHierarchy=TRUE " &
+         $MwVerdictDelayMs & " ms after SetActive(false). The widget is STILL " &
+         "ON SCREEN and something re-enabled it. SetActive on this GameObject " &
+         "is the wrong lever here; the game's own hide is the 0-arg vtable " &
+         "slot {klass+0x258, klass+0x260} it calls at 0x1538eea / 0x153939b."
+  else:
+    gMwPass = gMwPass + 1
+    okLog "menu widgets: PASS -- " & what & " reads activeInHierarchy=false " &
+          $MwVerdictDelayMs & " ms after the hide, on a later frame than the " &
+          "write. This is the finished state of the live tree, not a readback " &
+          "of our own call."
+
+proc menuWidgetsStatusLine(): string =
+  "  menu widgets: " & $gMwEpochs & " menu event(s), " & $gMwPass & " PASS, " &
+  $gMwFail & " FAIL, " & $gMwInconclusive & " INCONCLUSIVE, " & $gMwFaults &
+  " fault(s)" &
+  (if gMwFail > 0: " -- a widget is still on screen"
+   elif gMwPass == 0: " -- nothing was ever confirmed hidden"
+   else: "")
 proc modsBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_mods_body", cdecl.} =
   ## Returns non-nil so the caller can tell "ran" from "faulted" --
   ## `aowl_p_p_seh` gives back NULL when it caught something.
@@ -3479,10 +3655,45 @@ proc modsBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_mods_body", cdecl.} =
     # child lookup. If nothing was resolved, `gSeasonsMenu` is nil and this
     # returns immediately.
     betaNoticeFrom(gSeasonsMenu)
+    # THE TWO WIDGETS, from the RECEIVER's own declared fields rather than
+    # from a name walk. Same branch, same single guard -- `aowl_p_p_seh` is
+    # not re-entrant, so a guard of its own would DISARM this one.
+    menuWidgetsFrom(gSeasonsMenu)
+  elif gModsBranch == 6:
+    menuWidgetsVerdictBody()
   elif gModsBranch == 4:
     gfxTickBody()
   elif gModsBranch == 5:
     ntTickBody()
+
+proc menuWidgetsVerdictBody() =
+  ## Branch 6. Runs under the same single guard as every other branch.
+  mwOneVerdict(gMwSeasonGo, "_seasonWidget (the KORD BREACH banner)")
+  mwOneVerdict(gMwModeGo, "_changeGameModeButton (the PVE ZONE selector)")
+  info "menu widgets:" & menuWidgetsStatusLine()
+
+proc menuWidgetsVerdictTick() =
+  ## Called from `seasonsTick`, which already runs every frame for the cost of
+  ## one integer compare. This adds one more compare and enters the guard ONLY
+  ## when a verdict is outstanding and its delay has elapsed.
+  if gMwPendingAt == 0'u64 or gMwFaults >= MwMaxFaults:
+    return
+  if cNowMs() - gMwPendingAt < uint64(MwVerdictDelayMs):
+    return
+  gMwPendingAt = 0'u64          # cleared BEFORE the call, so a caught fault
+                                # cannot leave this retrying every frame
+  gModsBranch = 6
+  if cModsGuarded(cast[Il2CppPtr](0)) == nil:
+    gMwFaults = gMwFaults + 1
+    warn "menu widgets: the VERDICT read FAULTED and was caught; the game " &
+         "survived. LAST HOP: " & readCString(cInspCrumb()) & " at " &
+         iPtr(cInspCrumbPtr()) & " (fault " & $gMwFaults & " of " &
+         $MwMaxFaults & "). No verdict was formed for this menu event."
+    if gMwFaults >= MwMaxFaults:
+      warn "menu widgets: fault ceiling reached; no further verdicts will be " &
+           "read this session. The HIDE itself is unaffected -- but nothing " &
+           "will confirm it worked, so treat it as INCONCLUSIVE."
+
 
 proc modsTabTick() =
   ## The rider's entry, called every frame from the shared
@@ -3639,7 +3850,17 @@ proc seasonsTick() =
   ## known, every 10 frames once the menu was, and a full scene enumeration
   ## otherwise. Now: one integer compare per frame, and one bounded pass per
   ## menu (re)build, from a receiver the postfix handed us. Nothing hunts.
-  if not (gSeasonsOn or gBetaNoticeOn) or gSeasonsFaults >= SeasonsMaxFaults:
+  # THE DEFERRED VERDICT FIRST, and OUTSIDE the flag gate below: once a hide
+  # has been performed, its finished state must be read back even if the
+  # feature is switched off in between. A verdict that can be skipped by the
+  # same condition that produced the write is a verdict that cannot fail.
+  menuWidgetsVerdictTick()
+  # `gModeHideOn` is in this gate because the mode-button hide and the widget
+  # pass ride this same branch. It was NOT before, so a config with
+  # uxHideModeButton on and uxHideSeasons off returned here and the mode button
+  # was never touched -- silently, with no line in the log saying so.
+  if not (gSeasonsOn or gBetaNoticeOn or gModeHideOn) or
+     gSeasonsFaults >= SeasonsMaxFaults:
     return
   var menu: Il2CppPtr = nil
   if not modsUihMenuReady("hide seasons", gSeasonsEpochSeen, menu):

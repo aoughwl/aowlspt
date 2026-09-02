@@ -23,7 +23,7 @@
 # WHAT THIS IS
 # ------------
 # A tiny registry of screen SHOW SITES. A feature calls `uihWant(site)` before
-# arming; `uihArm` installs ONE byte-verified POSTFIX detour per wanted site;
+# arming; `uihArm` installs ONE byte-verified detour per wanted site;
 # when the game shows that screen the detour hands the live screen object
 # straight to the feature, which applies its change once and goes idle.
 #
@@ -31,8 +31,39 @@
 # this file runs off a frame tick at all. The subscriber's own rider still ticks,
 # but it can return on a single integer compare (`uihEpoch(site)` unchanged).
 #
-# THE SITE TABLE LIVES IN C (`abi/aowlspt_uihooks.h`) and carries, per site, the
-# RVA, the SHAREDNESS verdict, and the 16 prologue bytes. `aowl_uih_site_at`
+# PREFIX OR POSTFIX IS NOT A PREFERENCE. It is decided per site from the
+# `slots` column of the C table, and getting it wrong killed the client.
+#
+# MEASURED 2026-09-02. Site 2, `MenuScreen::Show(5-arg)` @0x15387A0, was
+# bound as a POSTFIX. That method's compiled call uses SEVEN register slots
+# (this + 5 declared arguments + IL2CPP's trailing MethodInfo*), so three of
+# them arrive ON THE STACK. The postfix thunk in `aowlspt_detour.h` does
+# `subq $0x98,%rsp` and then `call *tramp`, so the original runs with a
+# DIFFERENT rsp and reads those three out of the thunk's own frame. The
+# first of them is the `Profile`:
+#
+#   R disasm 0x15387A0 -> 0x1538a4f  mov rax,[rsp+0xc0]   (= entry_rsp+0x28)
+#                         0x1538a57  mov [r14+0x18],rax
+#                         0x1539126  mov rdx,[r14+0x18]
+#                         0x153912f  call EFT.UI.SeasonWidgetData::From
+#                                         (Profile, SeasonalRewardController)
+#
+# and that is exactly the frame the three crash dumps of 2026-09-02 died in,
+# with `Rcx=1`: a Profile that is the integer 1. The host's OWN engine
+# documents this refusal -- `invoke.nim`'s `postfixRefusal`, `PostfixMaxSlots
+# = 4` -- but only `hostPatch` (the mod-facing path) applied it. `attachDrain`
+# never did, so this file bound the one detour the engine says is impossible.
+#
+# So: `uihArm` reads `aowl_uih_site_slots` and binds a site with more than
+# four slots as a PREFIX. The prefix path is `addq $0x98,%rsp ; jmp *tramp`,
+# which restores rsp EXACTLY, so every stack argument is where the original
+# expects it. A prefix fires on ENTRY rather than on return; for site 2 that
+# is strictly EARLIER, which is fine for every subscriber here because all of
+# them use it as an ORDERING fact and take the receiver from RCX, which the
+# thunk saves on both paths.
+#
+# THE SITE TABLE LIVES IN C (`abi/aowlspt_uihooks.h`) and carries, per site,
+# the RVA, the SHAREDNESS verdict, the 16 prologue bytes and the slot count. `aowl_uih_site_at`
 # VirtualQuerys for committed executable memory and memcmps the prologue before
 # handing back a pointer, and names the refusal when it does not.
 #
@@ -74,6 +105,11 @@ proc cUihSiteName(i: int32): Il2CppPtr {.importc: "aowl_uih_site_name", nodecl.}
 proc cUihSiteRva(i: int32): uint32 {.importc: "aowl_uih_site_rva", nodecl.}
 proc cUihReasonCode(): int32 {.importc: "aowl_uih_reason_code", nodecl.}
 proc cUihReasonText(c: int32): Il2CppPtr {.importc: "aowl_uih_reason_text", nodecl.}
+proc cUihSiteSlots(i: int32): int32 {.importc: "aowl_uih_site_slots", nodecl.}
+proc cUihStackArg(regs: Il2CppPtr; k: int32; ok: ptr int32): Il2CppPtr {.
+  importc: "aowl_uih_stack_arg", nodecl.}
+proc cUihObjShape(p: Il2CppPtr): int32 {.importc: "aowl_uih_obj_shape", nodecl.}
+proc cUihObjKlass(p: Il2CppPtr): Il2CppPtr {.importc: "aowl_uih_obj_klass", nodecl.}
 
 const
   UihSiteOfflineRaid = 0
@@ -129,6 +165,18 @@ const
     ## REFUSAL if it ever drifts, rather than silently indexing past the table.
   UihMaxDispatchFaults = 3
     ## After this many faulted dispatches into one site, stop dispatching to it.
+  UihPostfixMaxSlots = 4
+    ## The Win64 register-argument count. A compiled call using more slots
+    ## than this passes the rest ON THE STACK, and the postfix thunk cannot
+    ## serve those -- see the banner. Same number as `invoke.nim`'s
+    ## `PostfixMaxSlots`, and deliberately the same number, because it is the
+    ## same ABI fact; it is restated here rather than imported because this
+    ## file is included before `invoke.nim` is in scope.
+  UihMaxProfileOkLines = 16
+    ## How many OK lines the argument drain writes before it goes quiet.
+    ## REFUSALS are never suppressed by this -- only confirmations are, so a
+    ## long session cannot bury the one line that matters under 400 good ones.
+  UihMaxProfileBadLines = 8
 
 ## Per-site state. All plain integers; nothing here is a managed object.
 var gUihSlot:   array[UihSiteCount, int] = [-1, -1, -1, -1, -1, -1, -1, -1, -1]  ## detour slot, -1 = unbound
@@ -139,6 +187,18 @@ var gUihBad:    array[UihSiteCount, int]             ## firings whose RCX was un
 var gUihFaults: array[UihSiteCount, int]             ## faulted dispatches
 var gUihSelf:   array[UihSiteCount, Il2CppPtr]       ## last good receiver
 var gUihSiteOff: array[UihSiteCount, bool]           ## dispatch disabled (rule 6)
+var gUihPostfix: array[UihSiteCount, bool]           ## bound POSTFIX (else PREFIX)
+
+## The argument drain on site 2. All plain integers and one pointer; nothing
+## managed, nothing allocated on a firing.
+var gUihProfKlass: Il2CppPtr = nil   ## klass seen on the first PLAUSIBLE profile
+var gUihProfOk = 0                   ## firings whose profile was plausible
+var gUihProfNull = 0                 ## firings whose profile was NULL (legal)
+var gUihProfBad = 0                  ## firings whose profile was NOT an object
+var gUihProfOther = 0                ## plausible, but a DIFFERENT klass
+var gUihProfNoFrame = 0              ## the frame arithmetic did not hold
+var gUihProfOkSaid = 0
+var gUihProfBadSaid = 0
 
 var gUihArming = -1        ## which site `attachDrain` is currently binding
 var gUihArmed = false      ## `uihArm` has run
@@ -239,14 +299,41 @@ proc uihArm(verbose: bool) =
              ". Nothing was patched for it, and every feature subscribed to it " &
              "will say so rather than fall back to hunting silently."
       else:
+        # PREFIX OR POSTFIX, decided from the ABI and never from taste. See
+        # the banner: a postfix on a call with stack arguments feeds the
+        # original the thunk's own frame where those arguments belong.
+        let slots = int(cUihSiteSlots(int32(s)))
+        if slots < 0:
+          warn "uihooks: site " & $s & " (" & spec & ") has NO slot count " &
+               "in the C table. That is a source drift in this repo, not a " &
+               "game build difference. Nothing was patched for it."
+          s = s + 1
+          continue
+        let post = slots <= UihPostfixMaxSlots
         gUihArming = s
         let ok = attachDrain(spec, fn, cast[Il2CppMethod](0), false, verbose,
-                             26'i32, true)
+                             26'i32, post)
         gUihArming = -1
         if ok:
-          okLog "uihooks: SHOW-EVENT hook armed POSTFIX on " & spec & " @0x" &
-                hexOf(uint64(cUihSiteRva(int32(s)))) & " (sharedness UNIQUE, " &
-                "16-byte prologue matched). Subscribers to site " & $s &
+          gUihPostfix[s] = post
+          okLog "uihooks: SHOW-EVENT hook armed " &
+                (if post: "POSTFIX" else: "PREFIX") & " on " & spec &
+                " @0x" & hexOf(uint64(cUihSiteRva(int32(s)))) &
+                " (sharedness UNIQUE, 16-byte prologue matched, " & $slots &
+                " register slot(s)). " &
+                (if post:
+                   "Every argument is in a register, so the postfix thunk " &
+                   "can call the original without moving its arguments."
+                 else:
+                   "MORE THAN " & $UihPostfixMaxSlots & " SLOTS, so " &
+                   $(slots - UihPostfixMaxSlots) & " argument(s) arrive on " &
+                   "the STACK and a POSTFIX would make the original read " &
+                   "the thunk's own frame for them. Bound PREFIX, which " &
+                   "restores rsp exactly. This fires on ENTRY, which is " &
+                   "earlier than a postfix; every subscriber here uses it " &
+                   "as an ordering fact and takes the receiver from RCX, " &
+                   "which the thunk saves on both paths.") &
+                " Subscribers to site " & $s &
                 " now fire on the screen being shown and do NO per-frame " &
                 "searching."
         else:
@@ -269,13 +356,135 @@ proc uihDispatch(site: int; self: Il2CppPtr): bool =
   if site == UihSiteOfflineRaid:
     result = splRebrandOnScreenShown(self)
 
+proc uihMenuProfileDrain(regs: Il2CppPtr) =
+  ## READ-ONLY. Site 2's fifth argument, `Profile profile`, checked BEFORE
+  ## the game dereferences it -- so the crash this file's prefix/postfix rule
+  ## fixes shows up as a SENTENCE in the host log rather than as a dump.
+  ##
+  ## Register map, taken from the declared signature and confirmed against
+  ## `R disasm 0x15387A0`: rcx=this(MenuScreen), rdx=MatchmakerPlayersController,
+  ## r8=ExpansionsPlayerInfo, r9=GameModeDescriptor, [entry_rsp+0x28]=Profile,
+  ## [entry_rsp+0x30]=SeasonalRewardController, [entry_rsp+0x38]=MethodInfo*.
+  ## The body itself reads its `profile` at `[rsp+0xc0]` after `sub rsp,0x98`,
+  ## which IS [entry_rsp+0x28] -- so this reads the same bytes the game does,
+  ## not an offset anyone guessed.
+  ##
+  ## THREE OUTCOMES, never two. `aowl_uih_stack_arg` refuses outright if the
+  ## qword at [entry_rsp] is not committed executable memory, i.e. if the
+  ## thunk's frame layout ever stops matching the arithmetic; that is
+  ## INCONCLUSIVE and says so, and is never reported as a good profile.
+  ##
+  ## It opens NO guard -- `uihShowFired` is called from the dispatcher, and
+  ## `aowl_p_p_seh` is not re-entrant (rule 3). It needs none: every
+  ## dereference it makes goes through `aowl_uih_readable` first, and it
+  ## touches nothing else.
+  var ok: int32 = 0
+  let prof = cUihStackArg(regs, 0'i32, addr ok)
+  if ok == 0'i32:
+    inc gUihProfNoFrame
+    if gUihProfNoFrame <= 3:
+      warn "uihooks: INCONCLUSIVE -- MenuScreen::Show fired but the fifth " &
+           "argument could not be read: the qword at the computed entry rsp " &
+           "is not a committed executable return address, so the thunk frame " &
+           "arithmetic (regs + 0x58) no longer matches aowlspt_detour.h. " &
+           "NOTHING is claimed about the Profile argument. This is a refusal, " &
+           "not a pass."
+    return
+  let shape = cUihObjShape(prof)
+  let n = gUihFires[UihSiteMenuShow]
+  if shape == 0'i32:
+    # A NULL Profile is a legal argument value and the game's own body
+    # tolerates it; it is counted, not called a fault.
+    inc gUihProfNull
+    if gUihProfOkSaid < UihMaxProfileOkLines:
+      inc gUihProfOkSaid
+      info "uihooks: MenuScreen::Show #" & $n & " profile=NULL -- legal, " &
+           "and NOT the crash shape (that one is a small non-zero integer)."
+    return
+  if shape != 1'i32:
+    inc gUihProfBad
+    if gUihProfBadSaid < UihMaxProfileBadLines:
+      inc gUihProfBadSaid
+      warn "uihooks: REFUSAL -- MenuScreen::Show #" & $n & ": the profile " &
+           "argument is not a managed object (value=0x" &
+           hexOf(cast[uint64](prof)) & "). It is about to be handed to " &
+           "EFT.UI.SeasonWidgetData::From(Profile, SeasonalRewardController) " &
+           "@0x141FFD0, which dereferences it. If the client dies in the " &
+           "next instant, THIS is the value that killed it. The known cause " &
+           "of this shape is a POSTFIX detour on this 7-slot call feeding " &
+           "the original the thunk's own frame -- check the ARMED line " &
+           "above says PREFIX, not POSTFIX."
+    return
+  let k = cUihObjKlass(prof)
+  if gUihProfKlass == nil:
+    gUihProfKlass = k
+  inc gUihProfOk
+  if k != gUihProfKlass:
+    inc gUihProfOther
+    if gUihProfBadSaid < UihMaxProfileBadLines:
+      inc gUihProfBadSaid
+      warn "uihooks: REFUSAL -- MenuScreen::Show #" & $n & " profile=0x" &
+           hexOf(cast[uint64](prof)) & " klass=0x" &
+           hexOf(cast[uint64](k)) & ", which is NOT the klass every earlier " &
+           "firing carried (0x" & hexOf(cast[uint64](gUihProfKlass)) &
+           "). One of the two is not an EFT.Profile. The klass NAME is not " &
+           "printed on purpose: il2cpp_class_get_name is token-gated and " &
+           "il2cpp_object_get_class is `mov rax,[rcx]; ret`, so a name here " &
+           "would be an invention."
+    return
+  if gUihProfOkSaid < UihMaxProfileOkLines:
+    inc gUihProfOkSaid
+    okLog "uihooks: MenuScreen::Show #" & $n & " profile=0x" &
+          hexOf(cast[uint64](prof)) & " klass=0x" & hexOf(cast[uint64](k)) &
+          " OK -- readable, and the same klass every firing has carried. " &
+          "(The klass is compared as a POINTER; this host cannot ask for its " &
+          "NAME without inventing one.)"
+
+proc uihProfileLine(): string =
+  ## One line for the boot summary. Counts the four outcomes SEPARATELY --
+  ## collapsing `no frame` into `bad` would hide the case where the drain
+  ## never looked at all.
+  "  site " & $UihSiteMenuShow & " profile argument: " & $gUihProfOk &
+  " ok, " & $gUihProfNull & " null, " & $gUihProfBad &
+  " NOT AN OBJECT, " & $gUihProfOther & " wrong klass, " & $gUihProfNoFrame &
+  " unreadable frame" &
+  (if gUihProfBad > 0 or gUihProfOther > 0:
+     " -- FAIL: the game was handed something that is not a Profile"
+   elif gUihProfOk + gUihProfNull == 0: " -- INCONCLUSIVE: never looked"
+   else: " -- PASS")
+
 proc uihShowFired(i: int; regs: Il2CppPtr) =
-  ## The POSTFIX half, dispatched by slot identity from `patchReturned`. Opens
-  ## NO guard -- see rule 3 in the banner. Reads two registers, validates the
-  ## receiver, and hands it to the subscriber.
+  ## The firing half, dispatched by slot identity from EITHER `patchReturned`
+  ## (a POSTFIX site) or `patchFired` (a PREFIX site -- see the banner for
+  ## which sites are which and why). Opens NO guard -- rule 3.
+  ##
+  ## The two routes differ in ONE thing that matters to a subscriber: on a
+  ## prefix the body has NOT run yet. Every subscriber here either uses the
+  ## epoch as an ordering fact or acts from the drain on a LATER frame (the
+  ## seasons/mode/widget pass compares `uihEpoch` on the next
+  ## `TarkovApplication::Update` tick, by which time Show has returned), so
+  ## none of them is broken by the earlier firing. A subscriber that genuinely
+  ## needs the body to have finished must check `gUihPostfix` and say so.
   let site = uihSiteOfSlot(i)
   if not uihValidSite(site): return
   gUihFires[site] = gUihFires[site] + 1
+  # THE ARGUMENT DRAIN, before anything else and regardless of whether a
+  # subscriber wants this firing: its whole value is that it reads the
+  # Profile argument BEFORE the game's body dereferences it, and it can only
+  # do that on a PREFIX. On a postfix the body has already run (and, on a
+  # 7-slot call, has already read the wrong bytes), so there is nothing left
+  # to warn about -- which is exactly why it says so instead of staying
+  # quiet.
+  if site == UihSiteMenuShow:
+    if gUihPostfix[site]:
+      if gUihProfNoFrame == 0:
+        gUihProfNoFrame = 1
+        warn "uihooks: the MenuScreen::Show argument drain is INERT -- " &
+             "site 2 is bound POSTFIX, so this fires after the body has " &
+             "already read its stack arguments out of the thunk frame. " &
+             "Nothing is claimed about the Profile."
+    else:
+      uihMenuProfileDrain(regs)
   if gUihSiteOff[site]: return
   let self = cast[Il2CppPtr](cRegsInt(regs, 0'i32))
   if self == nil or not duOk(self, 0x20'i32) or not iUnityAlive(self):
@@ -319,10 +528,15 @@ proc uihStatusLines(): seq[string] =
     if gUihWant[s] or gUihSlot[s] >= 0:
       result.add("  site " & $s & " " & readCString(cUihSiteName(int32(s))) &
         " @0x" & hexOf(uint64(cUihSiteRva(int32(s)))) & ": " &
-        (if gUihSlot[s] >= 0: "BOUND (slot " & $gUihSlot[s] & ")"
+        (if gUihSlot[s] >= 0:
+           "BOUND " & (if gUihPostfix[s]: "POSTFIX" else: "PREFIX") &
+           " (slot " & $gUihSlot[s] & ", " & $int(cUihSiteSlots(int32(s))) &
+           " register slot(s))"
          else: "NOT BOUND") &
         ", fired " & $gUihFires[s] & "x, " & $gUihEpoch[s] &
         " with a live receiver, " & $gUihBad[s] & " rejected, " &
         $gUihFaults[s] & " faulted dispatch(es)" &
         (if gUihSiteOff[s]: " -- DISPATCH DISABLED" else: ""))
+      if s == UihSiteMenuShow:
+        result.add(uihProfileLine())
     s = s + 1

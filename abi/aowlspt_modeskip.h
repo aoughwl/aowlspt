@@ -76,14 +76,40 @@
  * The predicate is ProfileId EQUALITY against the launcher's `launchProfileId`,
  * and nothing else.
  *
- * `Status` is READ and LOGGED but NOT gated on. That is deliberate and it is a
- * refusal to guess: `ECharacterSelectionProfileStatus`'s constant values live in
- * metadata `fieldDefaultValues`, which neither resolver verb exposes, so the
- * integer meaning "Available" is not something this host KNOWS. Gating on a
- * guessed enum value would be exactly the "never guess an offset" mistake in
- * another costume. ProfileId equality is strictly stronger anyway: an empty slot
- * carries no ProfileId to match, so it cannot be selected by accident, and the
- * one profile the launcher bound is by construction the one that is available.
+ * `Status` is READ and LOGGED but NOT gated on.
+ *
+ * *** THE REASON GIVEN HERE FOR THAT WAS WRONG. CORRECTED 2026-09-02. ***
+ *
+ * This file used to say that `ECharacterSelectionProfileStatus`'s constant
+ * values live in metadata `fieldDefaultValues`, "which neither resolver verb
+ * exposes", and therefore that the integer meaning "Available" was not
+ * something this host could KNOW. That was true of the resolver at the time
+ * and is not true now. MEASURED:
+ *
+ *   python tools/il2cpp_resolve.py D:/Games/Tarkov/GameAssembly.dll \r
+ *          .cache/global-metadata.dec.dat fields \r
+ *          EFT.ECharacterSelectionProfileStatus
+ *
+ * prints the HASDEFAULT constants directly:
+ *
+ *   Locked = 0    Empty = 1    Available = 2    InRaid = 3
+ *
+ * (docs/BOOT-FLOW-MAP.md sec. 1.7 and sec. 7 item 1.) So a `Status == 2`
+ * gate is now a MEASURED gate, not a guessed one, and the refusal above must
+ * not be copied forward into new code. The game's own flow relies on exactly
+ * these values: `<SubmitAsync>d__43::MoveNext` @0x13F1500 refuses outright
+ * when `profileData.Status@0x20 == 0` (Locked), and
+ * `<ExecuteCharacterSelection>d__131::MoveNext` @0x9B6E60 takes its fast path
+ * only when `Status == 2` (Available).
+ *
+ * THIS FILE'S OWN PREDICATE IS STILL ProfileId EQUALITY, and that is still
+ * right for THIS path: ProfileId equality is strictly stronger here, because
+ * an empty slot carries no ProfileId to match and the one profile the
+ * launcher bound is by construction the one that is available. What changes
+ * is that any path which SUBSTITUTES its own (gameMode, profileData) pair --
+ * notably a `TryCreateInRaidCharacterSelection` @0x97BBF0 bypass, which the
+ * game's own code does NOT status-check because `TryGetInRaidProfile` is what
+ * enforces InRaid there -- MUST gate on `Status == 2` itself, and can.
  *
  * ===========================================================================
  * SAFETY

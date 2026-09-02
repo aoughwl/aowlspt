@@ -83,7 +83,38 @@ typedef struct {
      * 0 = it is NOT, and `aowl_uih_site_at` refuses it up front rather than
      * letting `aowl_hook_prepare_ex` discover it at bind time. */
     int32_t       relocatable;
+    /* HOW MANY REGISTER SLOTS THE COMPILED CALL USES: `this` (0 for a
+     * static), the declared arguments, and IL2CPP's trailing
+     * `MethodInfo*`. Past FOUR they arrive ON THE STACK, and a POSTFIX
+     * detour cannot serve them.
+     *
+     * MEASURED 2026-09-02, and it is the cause of a real crash, not a
+     * precaution. The postfix thunk in `aowlspt_detour.h` does
+     * `subq $0x98,%rsp` and then `call *tramp`, so the original is
+     * entered with a DIFFERENT rsp and reads its fifth argument out of
+     * the THUNK'S OWN FRAME. For site [2] that argument is exactly the
+     * `Profile`:
+     *   R disasm 0x15387A0  ->  0x1538a4f  mov rax,[rsp+0xc0]
+     *                                      (= [entry_rsp+0x28], arg 5)
+     *                           0x1538a57  mov [r14+0x18],rax
+     *                           0x1539126  mov rdx,[r14+0x18]
+     *                           0x153912f  call SeasonWidgetData::From
+     * and [entry_rsp+0x28] lands on thunk-frame +0x20, the slot the
+     * thunk uses to park RAX across the dispatcher call -- not yet
+     * written at the moment of the call. That is the `Rcx=1` in the
+     * crash dumps: a Profile that is a small integer.
+     *
+     * `invoke.nim`'s `postfixRefusal` already refuses this shape for a
+     * MOD's patch (`PostfixMaxSlots = 4`). `attachDrain` never applied
+     * it, so this host bound the one detour its own engine documents as
+     * impossible. This column is how uihooks applies it.
+     *
+     * A site with slots > 4 is bound as a PREFIX instead. The prefix
+     * path restores rsp exactly (`addq $0x98,%rsp ; jmp *tramp`), so
+     * every stack argument is where the original expects it. */
+    int32_t       slots;
 } AowlUihSite;
+
 
 static int32_t aowl_uih_reason = AOWL_UIH_R_OK;
 
@@ -112,7 +143,7 @@ static const AowlUihSite aowl_uih_sites[] = {
      *   host has detoured for months. NO relative BRANCH is cut. */
     { "EFT.UI.Matchmaker.MatchmakerOfflineRaidScreen::Show", 0x1788590u,
       { 0x48,0x89,0x5C,0x24,0x08, 0x57, 0x48,0x83,0xEC,0x30,
-        0x80,0x3D,0x2F,0x61,0x93,0x05 }, 16, 1 },
+        0x80,0x3D,0x2F,0x61,0x93,0x05 }, 16, 1, 3 },
 
     /* [1] EFT.UI.MenuScreen::Awake()
      *
@@ -169,7 +200,7 @@ static const AowlUihSite aowl_uih_sites[] = {
      *   documented here and NOT listed. */
     { "EFT.UI.MenuScreen::Awake", 0x1538360u,
       { 0x40,0x53, 0x48,0x83,0xEC,0x20,
-        0x80,0x3D,0x2D,0x55,0xB8,0x05,0x00, 0x48,0x8B,0xD9 }, 16, 1 },
+        0x80,0x3D,0x2D,0x55,0xB8,0x05,0x00, 0x48,0x8B,0xD9 }, 16, 1, 2 },
 
     /* [2] EFT.UI.MenuScreen::Show(MatchmakerPlayersController matchmaker,
      *         ExpansionsPlayerInfo expansionsInfo,
@@ -210,7 +241,7 @@ static const AowlUihSite aowl_uih_sites[] = {
      *   exist yet. It is used here only as an ORDERING fact. */
     { "EFT.UI.MenuScreen::Show(5-arg)", 0x15387A0u,
       { 0x48,0x89,0x5C,0x24,0x10, 0x48,0x89,0x74,0x24,0x18,
-        0x48,0x89,0x4C,0x24,0x08, 0x57 }, 16, 1 },
+        0x48,0x89,0x4C,0x24,0x08, 0x57 }, 16, 1, 7 },
 
     /* [3] EFT.UI.Matchmaker.MatchMakerSideSelectionScreen::Show(
      *         RaidSideSelectionScreenController controller)
@@ -256,7 +287,7 @@ static const AowlUihSite aowl_uih_sites[] = {
      *   reason site [0] is. */
     { "EFT.UI.Matchmaker.MatchMakerSideSelectionScreen::Show", 0x1790180u,
       { 0x48,0x89,0x5C,0x24,0x08, 0x57, 0x48,0x83,0xEC,0x30,
-        0x80,0x3D,0x79,0xE5,0x92,0x05 }, 16, 1 },
+        0x80,0x3D,0x79,0xE5,0x92,0x05 }, 16, 1, 3 },
 
     /* [4] EFT.UI.Matchmaker.MatchMakerSelectionLocationScreen::Show(
      *         SelectionLocationScreenController controller)
@@ -296,7 +327,7 @@ static const AowlUihSite aowl_uih_sites[] = {
      *   relocatable=1 for exactly the same reason. */
     { "EFT.UI.Matchmaker.MatchMakerSelectionLocationScreen::Show", 0x178ACB0u,
       { 0x48,0x89,0x5C,0x24,0x08, 0x57, 0x48,0x83,0xEC,0x30,
-        0x80,0x3D,0x22,0x3A,0x93,0x05 }, 16, 1 },
+        0x80,0x3D,0x22,0x3A,0x93,0x05 }, 16, 1, 3 },
 
     /* [5] EFT.UI.Matchmaker.MatchmakerInsuranceScreen::Show(
      *         InsuranceScreenController controller)
@@ -320,11 +351,11 @@ static const AowlUihSite aowl_uih_sites[] = {
      * roots for a screen we had not been handed. */
     { "EFT.UI.Matchmaker.MatchmakerInsuranceScreen::Show", 0x1769910u,
       { 0x48,0x89,0x5C,0x24,0x08, 0x57, 0x48,0x83,0xEC,0x30,
-        0x80,0x3D,0xE8,0x4C,0x95,0x05 }, 16, 1 },
+        0x80,0x3D,0xE8,0x4C,0x95,0x05 }, 16, 1, 3 },
 
     { "EFT.UI.Matchmaker.MatchMakerAcceptScreen::Show", 0x1773EF0u,
       { 0x48,0x89,0x5C,0x24,0x08, 0x57, 0x48,0x83,0xEC,0x30,
-        0x80,0x3D,0x51,0xA7,0x94,0x05 }, 16, 1 },
+        0x80,0x3D,0x51,0xA7,0x94,0x05 }, 16, 1, 3 },
 
     /* ---- THE EXIT HALF. Appended, like everything above. ----
      *
@@ -362,11 +393,11 @@ static const AowlUihSite aowl_uih_sites[] = {
      *   that anything is ready. */
     { "EFT.UI.MenuScreen::ShowInRaid", 0x1539650u,
       { 0x48,0x89,0x5C,0x24,0x08, 0x48,0x89,0x74,0x24,0x10,
-        0x57, 0x48,0x83,0xEC,0x20, 0x48 }, 16, 1 },
+        0x57, 0x48,0x83,0xEC,0x20, 0x48 }, 16, 1, 2 },
 
     { "EFT.UI.SessionEnd.SessionEndUI::Awake", 0x1726850u,
       { 0x48,0x89,0x5C,0x24,0x08, 0x48,0x89,0x74,0x24,0x10,
-        0x57, 0x48,0x83,0xEC,0x30, 0x80 }, 16, 1 },
+        0x57, 0x48,0x83,0xEC,0x30, 0x80 }, 16, 1, 2 },
 };
 
 #define AOWL_UIH_SITE_COUNT \
@@ -382,6 +413,104 @@ static const char* aowl_uih_site_name(int32_t i) {
 static uint32_t aowl_uih_site_rva(int32_t i) {
     if (i < 0 || i >= AOWL_UIH_SITE_COUNT) return 0u;
     return aowl_uih_sites[i].rva;
+}
+
+/* The i'th site's compiled register-slot count. uihooks.nim reads this to
+ * decide PREFIX vs POSTFIX; > 4 means the call has stack arguments and a
+ * postfix would feed the original garbage for them. Answers -1 for a bad
+ * index rather than a plausible number. */
+static int32_t aowl_uih_site_slots(int32_t i) {
+    if (i < 0 || i >= AOWL_UIH_SITE_COUNT) return -1;
+    return aowl_uih_sites[i].slots;
+}
+
+/* Committed-and-readable (optionally executable) for `n` bytes, wholly
+ * inside ONE region. Used by the two readers below; nothing here ever
+ * dereferences a pointer this has not passed. */
+static int aowl_uih_readable(const void* p, size_t n, int wantExec) {
+    MEMORY_BASIC_INFORMATION mbi;
+    const unsigned char* c = (const unsigned char*)p;
+    if (!p) return 0;
+    if ((uintptr_t)p < 0x10000u) return 0;
+    if (VirtualQuery(p, &mbi, sizeof(mbi)) == 0) return 0;
+    if (mbi.State != MEM_COMMIT) return 0;
+    if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return 0;
+    if (c + n > (const unsigned char*)mbi.BaseAddress + mbi.RegionSize)
+        return 0;
+    if (wantExec && !(mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                                     PAGE_EXECUTE_READWRITE |
+                                     PAGE_EXECUTE_WRITECOPY)))
+        return 0;
+    return 1;
+}
+
+/* THE STACK-ARGUMENT READER. PREFIX firings only.
+ *
+ * `regs` is the `AowlRegs` the thunk hands the dispatcher. The thunk
+ * (aowlspt_detour.h) does `subq $0x98,%rsp` on entry and passes
+ * `leaq 0x40(%rsp),%rdx` as `regs`, so
+ *     entry_rsp == (char*)regs - 0x40 + 0x98 == (char*)regs + 0x58
+ * and the original was entered with THAT rsp, because a prefix is
+ * reached by a JMP from the patched prologue and not by a CALL.
+ *
+ * Win64: [entry_rsp] is the return address, [entry_rsp+8 .. +0x20) is
+ * the home space for RCX/RDX/R8/R9, and the FIFTH argument is at
+ * [entry_rsp+0x28]. CONFIRMED against site [2]'s own body, which after
+ * `sub rsp,0x98` reads its `profile` at `[rsp+0xc0]` == [entry_rsp+0x28]
+ * (R disasm 0x15387A0, instruction 0x1538a4f).
+ *
+ * THE CHECK THAT CAN FAIL: the qword at [entry_rsp] must be a committed
+ * EXECUTABLE address. If the frame arithmetic above ever stops matching
+ * the thunk -- someone changes the 0x98, or moves where `regs` points --
+ * that word is not a return address and this REFUSES rather than
+ * handing back a plausible pointer. `*ok` is 0 on refusal and 1 on
+ * success; the value is never invented.
+ *
+ * `k` is 0 for the fifth argument slot, 1 for the sixth, and so on. */
+#define AOWL_UIH_REGS_TO_ENTRY_RSP 0x58
+
+static void* aowl_uih_stack_arg(void* regs, int32_t k, int32_t* ok) {
+    unsigned char* entry;
+    void* ret;
+    if (ok) *ok = 0;
+    if (!regs || k < 0 || k > 7) return 0;
+    entry = (unsigned char*)regs + AOWL_UIH_REGS_TO_ENTRY_RSP;
+    if (!aowl_uih_readable(entry, (size_t)(0x30 + 8 * k), 0)) return 0;
+    ret = *(void**)entry;
+    if (!aowl_uih_readable(ret, 1, 1)) return 0;   /* the falsifiable one */
+    if (ok) *ok = 1;
+    return *(void**)(entry + 0x28 + 8 * k);
+}
+
+/* Is `p` shaped like a live managed object? Three answers, never two:
+ *   0  NULL -- a legal argument value, not a fault
+ *   1  PLAUSIBLE -- readable, and its first qword (the Il2CppClass*) is
+ *      itself readable
+ *   2  IMPLAUSIBLE -- a small integer, or unreadable, or a klass slot
+ *      that does not read back
+ *
+ * This deliberately does NOT claim the klass IS `EFT.Profile`.
+ * `il2cpp_object_get_class` is `mov rax,[rcx]; ret`, so it answers a
+ * plausible number for a bad pointer instead of failing, and
+ * `il2cpp_class_get_name` is token-gated. A type NAME printed here would
+ * be an invention. Identity is established instead by uihooks comparing
+ * the klass POINTER against the one seen on the first good firing.
+ *
+ * The integer 1 from the crash dumps answers 2. */
+static int32_t aowl_uih_obj_shape(void* p) {
+    void* klass;
+    if (!p) return 0;
+    if (!aowl_uih_readable(p, 8, 0)) return 2;
+    klass = *(void**)p;
+    if (!aowl_uih_readable(klass, 8, 0)) return 2;
+    return 1;
+}
+
+/* The Il2CppClass* of a PLAUSIBLE object, else NULL. Nothing here
+ * dereferences it any further. */
+static void* aowl_uih_obj_klass(void* p) {
+    if (aowl_uih_obj_shape(p) != 1) return 0;
+    return *(void**)p;
 }
 
 static int32_t aowl_uih_reason_code(void) { return aowl_uih_reason; }

@@ -4140,6 +4140,24 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
   if i == gSettingsSlot:
     settingsProbeFired(regs)
     return 0'i32
+  # SHOW-EVENT hooks (uihooks.nim) that were bound as a PREFIX rather than a
+  # POSTFIX, by slot identity. Same handler, same contract, same `return 0`
+  # (never suppress the original) as the postfix route in `patchReturned`.
+  #
+  # WHY BOTH ROUTES EXIST. A uihooks site is bound PREFIX when its compiled
+  # call uses more than four register slots, because the postfix thunk calls
+  # the original from inside its own frame and the original would then read
+  # that frame where its STACK arguments belong -- measured 2026-09-02 on site
+  # 2, `MenuScreen::Show(5-arg)`, whose fifth argument is the `Profile` that
+  # `SeasonWidgetData::From` dereferences. See the banner in uihooks.nim.
+  #
+  # A prefix firing is EARLIER than a postfix one -- the body has not run yet.
+  # `uihShowFired` reads only RCX (the receiver, which the thunk saves on both
+  # paths) and the stack arguments, so it is correct on either route; a
+  # subscriber that needs the body to have finished must say so itself.
+  if uihIsSlot(i):
+    uihShowFired(i, regs)
+    return 0'i32
   # READ-ONLY GameWorld bot/player census, likewise by identity: it enumerates
   # the registered players and only logs -- it must never suppress the original.
   if i == gBotDiagSlot:
