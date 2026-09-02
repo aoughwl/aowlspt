@@ -37,7 +37,10 @@ every outcome that has actually happened on this project.
     TIMEOUT       none of the above within --timeout. Exit 2.
     STALLED       it got somewhere real and then stopped getting anywhere: one
                   raid phase, unchanged, past --phase-max, while the host is
-                  still alive and talking. Exit 8.
+                  still alive and talking. Exit 8. NOT reported for the phase
+                  `--until-phase` asked for -- being parked there is the goal,
+                  so a stall there requires the host log to have stopped
+                  entirely, heartbeat included. See Supervisor.check_clocks.
     BACKENDDOWN   the launcher gave up restarting the server. The client is
                   usually still up and still looks fine. Exit 9.
 
@@ -124,15 +127,80 @@ BOOT_GRACE_S = 95
 # timeout with a supervisor that looked healthy the whole time. A heartbeat is
 # not progress. Treating it as progress makes a liveness check assert only that
 # the clock still ticks.
+# PERIODIC STATUS lines: the second family of the same bug, measured
+# 2026-09-01 23:03 across three consecutive boots of the same build.
+#
+# `raid phase =` was not the only line the host re-prints forever. At a client
+# parked on the main menu, five more families repeat on fixed cadences and say
+# nothing new. Measured occurrence times (host-relative), identical in shape in
+# all three runs:
+#
+#   live inspector: IDLE and HEALTHY      every ~15s   (25/28/0 occurrences)
+#   ... ARMED but NEVER FIRED             every  30s   (14/16/9)
+#   ... unchanged cycle(s)                every  60s   (12/13/8)
+#   camera: acquire=                      every  60s   ( 7/ 8/5)
+#   client settings bridge: published     every  60s   ( 8/ 9/6)
+#
+# Each of these refreshed `last_progress`, so the MENU-settle window could
+# never open: the 15s inspector line alone makes a 20s quiet window impossible.
+# The run then sat in MENU until some OTHER bound fired, and WHICH one fired
+# depended on the flags -- `--phase-max 200` produced a false STALLED at 219s
+# on a healthy client sitting at the menu, while the same boot with the default
+# `--phase-max 900` produced a false TIMEOUT at 300s. A third boot, on which
+# nobody happened to be driving the live inspector, had no 15s line, opened a
+# 24s quiet window and correctly said REACHED. Three different verdicts for one
+# client state, decided by which periodic line landed in the window.
+#
+# `unchanged cycle(s)` is deliberately the predicate rather than the two
+# feature names that print it (natesp's VERDICT block and Maps' diag block).
+# It is a literal those features emit ONLY when they are re-stating an
+# unchanged result -- the FIRST diag of a run, and any diag whose verdict
+# actually moved, does not carry it and is still counted as progress. A
+# heartbeat entry that swallowed a real state change would be the mirror of
+# this bug.
+#
+# NOT added, though they were proposed: `version brand ... re-applied` and the
+# `hide seasons` re-hide. Checked against all three runs -- each occurs EXACTLY
+# ONCE per boot, so they are one-shot progress, not periodic status. A false
+# entry here silently deletes real progress, which is strictly worse than a
+# missing one.
+PERIODIC_HOST_LINES = (
+    "live inspector: IDLE and HEALTHY",
+    "ARMED but NEVER FIRED",
+    "unchanged cycle(s)",
+    "camera: acquire=",
+    "client settings bridge: published ",
+)
+
 HEARTBEAT_HOST_LINES = (
     "natesp: raid phase = ",
     "frameMeter:",
-)
+) + PERIODIC_HOST_LINES
+
+
+def is_progress(line):
+    """THE single definition of progress. Every clock in here uses this one.
+
+    The false STALLED above was not a wrong threshold; it was two rules with
+    two different ideas of what counts. `--menu-settle` measured quiet against
+    `last_progress` (which periodic lines refreshed), while the phase bound
+    measured against `phase_since` (which they did not). They therefore
+    disagreed about whether a client parked at the menu was making progress,
+    and the disagreement was resolved by whichever line happened to land in the
+    window. One predicate, used by all of them, makes that disagreement
+    impossible to express.
+    """
+    return not any(h in line for h in HEARTBEAT_HOST_LINES)
 
 # The phase the host publishes. `raidphase.nim` has emitted this all along and
 # nothing consumed it -- the raid was bounded by `time.sleep(60.0)` in
 # enterraid.py, which asserts a DURATION and never a STATE.
 RAID_PHASE = re.compile(r"raid phase = ([A-Z]+)")
+
+# The host's raid-phase cadence, MEASURED: 40 consecutive `raid phase = MENU`
+# lines at 5.015s apart. It is the proof-of-life the silence test leans on -- a
+# host that has printed nothing for several multiples of this has stopped.
+HOST_HEARTBEAT_S = 5.0
 
 # The launcher's own watchdog verdict. It prints this and gives up; until now
 # nothing read the backend log at all, so the supervisor kept waiting on a game
@@ -308,6 +376,11 @@ class Supervisor:
         self.errdlg_armed = None      # None = not stated yet in this run's log
         self.seen_any = False
         self.last_progress = time.time()
+        # ANY host line, heartbeats included. Distinct from `last_progress` on
+        # purpose: a host that has stopped printing even its 5s heartbeat is
+        # not idle, it is gone -- and that, not "nothing interesting is
+        # happening", is what a stall at the destination phase looks like.
+        self.last_line = None
         self.evidence = []
         self.marks = []
         # The client's own logs, through crashwatch so the signature list stays
@@ -396,17 +469,95 @@ class Supervisor:
             self.marks.append(text)
             print("  .. %s" % text, flush=True)
 
+    def check_clocks(self, now, evidence=None):
+        """The TIME-driven rules, in ONE place and in an EXPLICIT order.
+
+        These used to be scattered: the MENU-settle test lived in an `elif` of
+        the phase-change branch, the phase bound in the next `elif`, and the
+        IDLE test in the main loop. Nothing stated which outranked which, so
+        the answer was "whichever the log happened to reach first" -- and that
+        is exactly how one client state produced REACHED, STALLED and TIMEOUT
+        on three consecutive boots.
+
+        The order, stated once:
+
+          0. TOTAL SILENCE at the destination is a STALL. The host prints its
+             raid phase every 5s forever; a log that has produced NOTHING AT
+             ALL for `--stall` is a host that stopped, not a client parked at a
+             screen. This is checked FIRST because it is the only reading of
+             "stalled at the phase you asked for" that a healthy parked client
+             cannot also satisfy.
+          1. ARRIVAL. `--until-phase` was asked for, the client is in that
+             phase, no progress for `--menu-settle`, AND the host is still
+             heartbeating. It cannot lose to a stall bound, because being
+             parked where you asked to be parked is success, not a wedge.
+          2. THE PHASE BOUND, but only away from the destination. In the phase
+             you ASKED for, "one phase for a long time" is the goal, so it
+             cannot also be the failure -- reporting STALLED there is the
+             measured false positive this ordering exists to prevent.
+
+        The liveness qualifier on rule 1 is what keeps rule 0 reachable. Quiet
+        is the SUCCESS condition here, and silence is a superset of quiet, so
+        without it a host that died at the menu would satisfy arrival first
+        (at `--menu-settle`) and never reach the silence test (at `--stall`,
+        which is longer). `HOST_HEARTBEAT_S` is measured; the allowance of
+        three missed beats is a stated tolerance, not a measurement.
+
+        This still cannot distinguish a host that died from one parked at the
+        menu if `--menu-settle` is set below that allowance. Say so rather than
+        pretending otherwise: the process poll and the crash detector are what
+        cover a dead client, not this.
+
+        Returns a verdict tuple or None. `evidence` is the line that prompted
+        the call, when there was one.
+        """
+        if self.phase is None:
+            return None
+        ev = [evidence] if evidence else self.host_tail[-1:]
+        at_destination = bool(self.until_phase) and self.phase == self.until_phase
+        quiet = now - self.last_progress
+        silent = now - self.last_line if self.last_line else 0.0
+
+        # 0. THE HOST STOPPED TALKING ALTOGETHER.
+        if at_destination and self.last_line and silent >= self.stall:
+            return ("STALLED",
+                    "raid phase %s is where --until-phase asked to stop, but "
+                    "the host log has printed NOTHING AT ALL -- not even its "
+                    "%.0fs heartbeat -- for %ds. A live host heartbeats, so "
+                    "this is a host that stopped, not a client parked at a "
+                    "screen" % (self.phase, HOST_HEARTBEAT_S, int(silent)), ev)
+
+        # 1. ARRIVAL.
+        if (at_destination and self.phase == "MENU"
+                and quiet >= self.menu_settle
+                and silent <= HOST_HEARTBEAT_S * 3):
+            return ("REACHED",
+                    "raid phase = MENU has held with no other host progress "
+                    "for %ds -- the boot is over and the client is parked at "
+                    "the menu" % int(quiet), ev)
+
+        # 2. THE PHASE BOUND.
+        if (self.phase_max and not at_destination
+                and now - self.phase_since > self.phase_max):
+            return ("STALLED",
+                    "stuck in raid phase %s for %ds (limit %ds) -- the host is "
+                    "alive and still publishing, so this is a wedged run, not "
+                    "a dead one"
+                    % (self.phase, int(now - self.phase_since),
+                       int(self.phase_max)), ev)
+        return None
+
     def poll_host(self):
         for line in self._host_lines():
             if not self.seen_any:
                 self.mark("host attached, log restarted")
             self.seen_any = True
+            self.last_line = time.time()
 
             # A HEARTBEAT proves the host is alive; it does not prove the RUN
             # is going anywhere. Only a non-periodic line refreshes the
             # progress clock -- see HEARTBEAT_HOST_LINES for what this cost.
-            beat = any(h in line for h in HEARTBEAT_HOST_LINES)
-            if not beat:
+            if is_progress(line):
                 self.last_progress = time.time()
 
             # RAID PHASE. The signal existed and nothing consumed it. A phase
@@ -438,14 +589,6 @@ class Supervisor:
                         return ("REACHED",
                                 "the host published raid phase = %s" % ph,
                                 [line.strip()])
-                elif (self.until_phase == "MENU" and ph == "MENU"
-                      and time.time() - self.last_progress >= self.menu_settle):
-                    return ("REACHED",
-                            "raid phase = MENU has held with no other host "
-                            "progress for %ds -- the boot is over and the "
-                            "client is parked at the menu"
-                            % int(time.time() - self.last_progress),
-                            [line.strip()])
 
                     # NOTE on a rule deliberately NOT implemented here: it is
                     # tempting to declare a load-phase `--until` FUTILE the
@@ -457,18 +600,14 @@ class Supervisor:
                     # FATAL_HOST_LINES did. The honest bound for "parked at a
                     # screen" is the IDLE detector, which works now that
                     # heartbeats no longer refresh the progress clock.
-                elif (self.phase_max and
-                      time.time() - self.phase_since > self.phase_max):
-                    # Bounded on a STATE, not a duration: the host is still
-                    # talking, the process is fine, and the run has been in one
-                    # phase past the point where that can be normal.
-                    return ("STALLED",
-                            "stuck in raid phase %s for %ds (limit %ds) -- the "
-                            "host is alive and still publishing, so this is a "
-                            "wedged run, not a dead one"
-                            % (ph, int(time.time() - self.phase_since),
-                               int(self.phase_max)),
-                            [line.strip()])
+
+                # Settle and the phase bound are BOTH time-driven, so they live
+                # in check_clocks and are evaluated in a stated order. They are
+                # re-checked here as well as from the main loop so that a
+                # verdict lands on the exact line that carried the phase.
+                hit = self.check_clocks(time.time(), line.strip())
+                if hit:
+                    return hit
             if self.quiet:
                 self.host_tail.append(line)
                 del self.host_tail[:-40]
@@ -579,9 +718,13 @@ def main():
                    help="seconds allowed in ONE raid phase before the run is "
                         "called STALLED. Bounds the raid on a published "
                         "state rather than on a blind sleep; a phase change "
-                        "re-arms it. 0 disables the bound.")
+                        "re-arms it. 0 disables the bound. It does NOT apply "
+                        "to the phase --until-phase asked for.")
     p.add_argument("--stall", type=int, default=45,
-                   help="seconds of host-log silence that count as IDLE")
+                   help="seconds with no PROGRESS line that count as IDLE. In "
+                        "the phase --until-phase asked for it means something "
+                        "stricter: seconds with no host line AT ALL, "
+                        "heartbeats included, before that counts as STALLED.")
     p.add_argument("--attach", action="store_true",
                    help="do not launch; the client is already running")
     p.add_argument("--keep", action="store_true",
@@ -682,7 +825,12 @@ def main():
         # Host first (it names causes), then the BACKEND (a dead server is
         # the cause of symptoms that surface minutes later in the client),
         # then the client's own logs.
-        hit = sup.poll_host() or sup.poll_backend() or sup.poll_client()
+        # `check_clocks` is asked on every tick, not only when a line arrives:
+        # the settle window and the total-silence test are about time PASSING,
+        # and a rule that can only be evaluated by an incoming log line cannot
+        # observe the absence of log lines.
+        hit = (sup.poll_host() or sup.check_clocks(now)
+               or sup.poll_backend() or sup.poll_client())
         if hit:
             verdict, why, evidence = hit
             break
@@ -736,10 +884,18 @@ def main():
                 evidence = sup.host_tail[-6:]
                 break
         if sup.seen_any and now - sup.last_progress > args.stall:
-            verdict = "IDLE"
-            why = ("alive, but no host-log line for %ds" % args.stall)
-            evidence = sup.host_tail[-3:]
-            break
+            # ORDERING, stated rather than implied. If `--until-phase` was
+            # asked for and the client is sitting in that phase, quiet is the
+            # SUCCESS condition, not the idle condition -- check_clocks owns
+            # this state and will return REACHED once --menu-settle elapses.
+            # With the defaults settle (20s) < stall (45s) so REACHED already
+            # wins on time, but a run given `--menu-settle 60` would otherwise
+            # be reported IDLE at 45s for doing exactly what was asked.
+            if not (sup.until_phase and sup.phase == sup.until_phase):
+                verdict = "IDLE"
+                why = ("alive, but no host-log line for %ds" % args.stall)
+                evidence = sup.host_tail[-3:]
+                break
         if now - started > args.timeout:
             verdict, why = "TIMEOUT", "%ds elapsed" % args.timeout
             evidence = sup.host_tail[-3:]

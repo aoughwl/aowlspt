@@ -69,7 +69,8 @@ class Bed:
         kw.setdefault("quiet", True)
         s = runmod.Supervisor(self.root, kw["until"], kw["stall"], kw["quiet"],
                               phase_max=kw.get("phase_max", 900.0),
-                              until_phase=kw.get("until_phase"))
+                              until_phase=kw.get("until_phase"),
+                              menu_settle=kw.get("menu_settle", 20.0))
         # The real host log path comes from harness; point it at the bed.
         s.host_path = self.host
         s.host_pos = 0
@@ -360,6 +361,289 @@ def t_teardown_silent_with_keep():
         shutil.rmtree(root, ignore_errors=True)
 
 
+# -- 6d. THE MEASURED FALSE STALLED --------------------------------------
+#
+# 2026-09-01 23:03. Three consecutive boots of ONE build, one client state --
+# alive, parked at the main menu, host heartbeating -- produced THREE different
+# verdicts:
+#
+#   bootT  --phase-max 200  -> STALLED at 219s   (exit 8)   FALSE
+#   bootR  --phase-max 900  -> TIMEOUT at 300s   (exit 2)   FALSE
+#   bootL  (inspector idle line absent) -> REACHED at 119.7s          correct
+#
+# The cause was not a threshold. `--menu-settle` measured quiet against
+# `last_progress`, which every PERIODIC status line refreshed, while the phase
+# bound measured against `phase_since`, which they did not. The two rules
+# disagreed about whether a parked client was making progress, and the
+# disagreement was settled by which periodic line happened to land in the
+# window -- bootL differs from bootT only in that nobody was driving the live
+# inspector on it, so its 15s `IDLE and HEALTHY` line was absent and a 20s
+# quiet window could open.
+#
+# These replay all three from synthetic logs on the measured cadences. The
+# clock is virtual (a shim over `run.time`) so a 350-second run costs
+# milliseconds; everything else -- the tailing, the classification, the
+# ordering -- is the real code.
+
+class Clock:
+    """A stand-in for the `time` module inside run.py. Only .time() moves."""
+
+    def __init__(self, t0=1_000_000.0):
+        self.t = t0
+
+    def time(self):
+        return self.t
+
+    def sleep(self, s):
+        self.t += s
+
+    def strftime(self, *a, **k):
+        return time.strftime(*a, **k)
+
+
+# Cadences measured off the three runs, in host-relative seconds.
+# (substring, first emission, period).  period=None means one-shot.
+PERIODIC_MEASURED = [
+    ("[t] warn live inspector: IDLE and HEALTHY -- batch 9 completed",
+     31.0, 15.0),
+    ("[t] info ammoloading  ARMED but NEVER FIRED. mode=probe", 28.0, 30.0),
+    ("[t] warn natesp: VERDICT STILL INCONCLUSIVE after N unchanged cycle(s)",
+     69.0, 60.0),
+    ("[t] warn Maps: diag STILL NOT-PASS after N unchanged cycle(s)",
+     81.0, 60.0),
+    ("[t] info camera: acquire=Camera.main is null -- menu", 8.0, 60.0),
+    ("[t] ok   client settings bridge: published 8 of 8 client-side "
+     "settings page(s)", 16.0, 60.0),
+]
+
+# The REAL progress of a boot, measured: the host log is DENSE from attach to
+# ~0:00:45 (hundreds of lines: flag banners, RVA verifications, the FOV block),
+# thins out, and the last genuinely new thing it says is at ~0:01:04 -- after
+# which it says nothing new for the rest of the run. The early density matters:
+# without it the settle window opens during the boot, which is the trap
+# `menu/first-sighting-is-not-reached` already guards.
+PROGRESS_MEASURED = [(float(t), "[t] info boot chatter %d" % t)
+                     for t in range(0, 37)] + [
+    (37.0, "[t] ok   the main-thread drain is firing again"),
+    (41.0, "[t] info FOV, what was actually applied:"),
+    (42.0, "[t] ok   hide seasons: the banner came back after a menu rebuild"),
+    (54.0, "[t] info region projector: not installed yet -- bind state 3"),
+    (64.0, "[t] warn hide mode button: GIVING UP after 30 post-warm-up walks"),
+]
+
+LAST_REAL_PROGRESS_S = 64.0
+
+
+def replay(bed, sup, clock, horizon, periodics, progress, phase_from=8.0,
+           die_at=None):
+    """Drive `sup` over a synthetic boot in virtual time. Returns the first
+    verdict and the virtual second it landed on, or (None, horizon)."""
+    events = list(progress)
+    for text, first, period in periodics:
+        t = first
+        while t <= horizon:
+            events.append((t, text))
+            if not period:
+                break
+            t += period
+    # the 5s raid-phase heartbeat
+    t = phase_from
+    while t <= horizon:
+        events.append((t, phase_line("MENU")))
+        t += 5.0
+    if die_at is not None:
+        events = [e for e in events if e[0] < die_at]
+    events.sort(key=lambda e: e[0])
+
+    t0 = clock.t
+    i = 0
+    vt = 0.0
+    while vt <= horizon:
+        clock.t = t0 + vt
+        while i < len(events) and events[i][0] <= vt:
+            bed.say(events[i][1])
+            i += 1
+        hit = sup.poll_host() or sup.check_clocks(clock.time())
+        if hit:
+            return hit, vt
+        vt += 1.0
+    return None, horizon
+
+
+def _with_clock(fn):
+    clock = Clock()
+    real = runmod.time
+    runmod.time = clock
+    try:
+        return fn(clock)
+    finally:
+        runmod.time = real
+
+
+def t_measured_false_stalled():
+    def body(clock):
+        # bootT, exactly: --until-phase MENU --phase-max 200, and the live
+        # inspector's 15s line present because another session was driving it.
+        b = Bed()
+        try:
+            s = b.sup(until_phase="MENU", phase_max=200.0, menu_settle=20.0,
+                      stall=45.0)
+            s.phase_since = clock.t
+            s.last_progress = clock.t
+            hit, vt = replay(b, s, clock, 260.0, PERIODIC_MEASURED,
+                             PROGRESS_MEASURED)
+            got = hit[0] if hit else None
+            check("measured/bootT-is-not-stalled", got == "REACHED",
+                  "the 219s false STALLED: a client parked at the menu with "
+                  "the host heartbeating must REACH, not stall. got %r at "
+                  "t=%ss -- %s" % (got, vt, (hit[1][:110] if hit else "")))
+            # ...and it must arrive at the settle window, not at the bound.
+            check("measured/bootT-arrives-at-the-settle-window",
+                  hit is not None and LAST_REAL_PROGRESS_S + 20.0 <= vt <= 95.0,
+                  "expected ~%ds (last real progress %ds + settle 20s), got %s"
+                  % (LAST_REAL_PROGRESS_S + 20, LAST_REAL_PROGRESS_S, vt))
+        finally:
+            b.close()
+    _with_clock(body)
+
+
+def t_measured_control_run():
+    # bootL: the run that was already CORRECT. It differs from bootT only by
+    # the absence of the 15s inspector line. A fix that changed this one would
+    # be changing the answer that was already right -- this is the negative
+    # control on the whole change.
+    def body(clock):
+        b = Bed()
+        try:
+            s = b.sup(until_phase="MENU", phase_max=900.0, menu_settle=20.0,
+                      stall=45.0)
+            s.phase_since = clock.t
+            s.last_progress = clock.t
+            periodics = [p for p in PERIODIC_MEASURED
+                         if "IDLE and HEALTHY" not in p[0]]
+            hit, vt = replay(b, s, clock, 260.0, periodics, PROGRESS_MEASURED)
+            got = hit[0] if hit else None
+            check("measured/bootL-still-reaches", got == "REACHED",
+                  "got %r at t=%ss" % (got, vt))
+            check("measured/bootL-time-unchanged",
+                  hit is not None and LAST_REAL_PROGRESS_S + 20.0 <= vt <= 95.0,
+                  "the already-correct run must not move; got t=%ss" % vt)
+        finally:
+            b.close()
+    _with_clock(body)
+
+
+def t_measured_real_stall_stays_stalled():
+    # THE FALSIFYING HALF, and the reason the arrival rule carries a liveness
+    # qualifier. A host that keeps making REAL progress and then stops dead
+    # must not be laundered into REACHED by the settle window -- quiet is a
+    # subset of silence, so without the qualifier arrival (20s) would always
+    # beat silence (45s) and this verdict could never fire.
+    def body(clock):
+        b = Bed()
+        try:
+            s = b.sup(until_phase="MENU", phase_max=900.0, menu_settle=20.0,
+                      stall=45.0)
+            s.phase_since = clock.t
+            s.last_progress = clock.t
+            # Real progress right up to the INSTANT everything stops. That
+            # detail is the whole scenario: a host that goes quiet ten seconds
+            # BEFORE it dies is genuinely ambiguous at the moment the settle
+            # window closes, and this suite does not assert a hard verdict on
+            # an ambiguous input. "Progressing, then gone" is not ambiguous.
+            progress = [(float(t), "[t] ok   settings page %d rendered" % t)
+                        for t in range(20, 200, 5)]
+            hit, vt = replay(b, s, clock, 400.0, PERIODIC_MEASURED, progress,
+                             die_at=200.0)
+            got = hit[0] if hit else None
+            check("measured/dead-host-at-menu-stays-stalled", got == "STALLED",
+                  "the host stopped printing entirely at t=200s; got %r at "
+                  "t=%ss -- %s" % (got, vt, (hit[1][:110] if hit else "")))
+            check("measured/dead-host-stalls-at-the-stall-window",
+                  hit is not None and 240.0 <= vt <= 260.0,
+                  "expected ~245s (silence began at 199s + stall 45s), got %s"
+                  % vt)
+            check("measured/dead-host-verdict-names-the-heartbeat",
+                  hit is not None and "heartbeat" in hit[1],
+                  "the verdict must say WHY silence is decisive; got %r"
+                  % (hit[1][:120] if hit else None))
+            # THE ORDERING MUST BE EXPRESSIBLE AT THE DEFAULTS. Arrival is
+            # gated on the host having heartbeated within
+            # HOST_HEARTBEAT_S * 3; if that allowance were >= --menu-settle,
+            # arrival could never be blocked and the STALLED above could never
+            # fire -- a check that cannot fail.
+            check("measured/liveness-allowance-is-below-default-settle",
+                  runmod.HOST_HEARTBEAT_S * 3 < 20.0,
+                  "allowance %.0fs vs default --menu-settle 20s"
+                  % (runmod.HOST_HEARTBEAT_S * 3))
+        finally:
+            b.close()
+    _with_clock(body)
+
+
+def t_stall_at_destination_needs_total_silence():
+    # THE FALSIFYING HALF of the false positive itself. The bug reported
+    # STALLED for a client sitting in exactly the phase --until-phase asked
+    # for, while the host was still heartbeating. Drive well past --phase-max
+    # with heartbeats only and assert the run never stalls -- and then, with
+    # NO --until-phase, assert the same input DOES stall, so the exemption is
+    # shown to be the reason and not an accidental pass.
+    def body(clock):
+        for dest, want in (("MENU", None), (None, "STALLED")):
+            b = Bed()
+            try:
+                s = b.sup(until_phase=dest, phase_max=30.0, menu_settle=20.0,
+                          stall=45.0)
+                s.phase_since = clock.t
+                s.last_progress = clock.t
+                # Heartbeats ONLY, forever. No progress at all.
+                hit, vt = replay(b, s, clock, 120.0, [], [], phase_from=1.0)
+                got = hit[0] if hit else None
+                if dest == "MENU":
+                    # With --until-phase MENU this must ARRIVE, never stall.
+                    check("destination/never-stalls-while-heartbeating",
+                          got == "REACHED",
+                          "the measured false positive: phase_max 30s passed "
+                          "at the requested destination; got %r at t=%ss"
+                          % (got, vt))
+                else:
+                    check("destination/exemption-is-what-spares-it",
+                          got == want,
+                          "the SAME input with no --until-phase must still "
+                          "stall, or the test above proves nothing; got %r"
+                          % got)
+            finally:
+                b.close()
+    _with_clock(body)
+
+
+def t_periodic_table_is_honest():
+    # A heartbeat entry that swallows a REAL line silently deletes progress,
+    # which is worse than a missing entry. Two directions, both falsifiable.
+    for text in ("[t] warn live inspector: IDLE and HEALTHY -- batch 9",
+                 "[t] info ammoloading  ARMED but NEVER FIRED. mode=probe",
+                 "[t] warn Maps: diag STILL NOT-PASS after 90 unchanged "
+                 "cycle(s) (180s)",
+                 "[t] ok   natesp: raid phase = MENU -- S1: synthetic"):
+        check("periodic/suppresses %s" % text[10:38].strip(),
+              not runmod.is_progress(text))
+    # MEASURED one-shots. Each occurs EXACTLY ONCE per boot in all three runs,
+    # so classifying them as periodic would delete the last real progress a
+    # parked boot ever makes -- which is precisely the line the settle window
+    # is measured from.
+    for text in ("[t] ok   version brand: the bottom label now reads "
+                 "\"aowlspt beta9\"",
+                 "[t] ok   hide seasons: the banner came back after a menu "
+                 "rebuild",
+                 "[t] warn hide mode button: GIVING UP after 30 post-warm-up "
+                 "walks",
+                 "[t] ok   the main-thread drain is firing again",
+                 "[t] ok   Maps: diag NOT-PASS: placement:INCONCLUSIVE",
+                 "[t] ok   inspect| aowlspt live inspector -- batch 10"):
+        check("periodic/keeps %s" % text[10:38].strip(),
+              runmod.is_progress(text))
+
+
 # -- 7. every verdict has a DISTINCT exit code ---------------------------
 def t_exit_codes_distinct():
     codes = list(runmod.EXIT.values())
@@ -372,6 +656,9 @@ def main():
     for fn in (t_stalled_fires, t_progress_never_stalls, t_bound_disable,
                t_heartbeat_is_not_progress, t_backend_down,
                t_existing_verdicts, t_menu_must_settle,
+               t_periodic_table_is_honest, t_measured_false_stalled,
+               t_measured_control_run, t_measured_real_stall_stays_stalled,
+               t_stall_at_destination_needs_total_silence,
                t_teardown_announced, t_teardown_silent_with_keep,
                t_exit_codes_distinct):
         if VERBOSE:
