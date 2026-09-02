@@ -206,6 +206,22 @@ guessed at.
         # through unchanged. A report with no GameAssembly base line says so
         # per frame rather than guessing, and a report whose GameAssembly
         # `size:` disagrees with ours is refused as a DIFFERENT BUILD.
+  il2cpp_resolve.py <GameAssembly.dll> <global-metadata.dec.dat> callers <RVA-or-Type::Method>
+                                       [--base 0x...] [--max-gap N] [--limit=N] [--no-cache]
+        # WHO REACHES THIS METHOD. Scans the `il2cpp` and `.text` sections once
+        # for `E8 rel32` (call) and `E9 rel32` (tail jmp) edges, caches the
+        # ~2.4M-edge map under .cache/callgraph-<sha256-of-GameAssembly>.bin,
+        # and prints every site as `<site RVA> in <Owner::Method @start +off>
+        # [unique|shared xN|generic-body]`. Owners come from the SAME index
+        # `symbolize` uses, so a site inside an inflated generic body is named
+        # as such instead of being credited to the ordinary method before it.
+        # `0 direct callers -- reached only through a vtable/delegate/event` is
+        # a REAL ANSWER (exit 0): this finds direct edges only, so virtual
+        # dispatch, delegates and event subscriptions leave no trace here.
+        # INCONCLUSIVE (exit 3) when the address is NOT a method start -- an
+        # address mid-body has no edges of its own and "0 callers" for it would
+        # be a wrong answer; it offers `symbolize` instead. A name that matches
+        # several distinct addresses is REFUSED with the candidates listed.
   il2cpp_resolve.py <GameAssembly.dll> <global-metadata.dec.dat> type <idx-or-Name>...
         # per method: rid, RVA, arity, full signature, section, thunk shape.
         # add --shared to also annotate RVAs shared with other methods (this
@@ -229,7 +245,7 @@ guessed at.
   il2cpp_resolve.py <GameAssembly.dll> <global-metadata.dec.dat> settings-table
         # the SettingsScreen/SettingControl offset table Phase 1 will probe
 """
-import bisect, os, re, struct, sys
+import array, bisect, hashlib, os, re, struct, sys, time
 
 # ---- output encoding ------------------------------------------------------
 # MEASURED: `fldoff.py fields EFT.MatchmakerOperation` died with
@@ -1320,7 +1336,8 @@ def const_check(R):
 VERBS = ("find", "methods", "member", "type", "typemethods", "bytes",
          "shared", "verify-be", "fields", "verify-fields", "verify-parents",
          "enum", "verify-consts", "settings-table", "holdersof",
-         "genericmethods", "verify-generics", "symbolize", "symbolize-report")
+         "genericmethods", "verify-generics", "symbolize", "symbolize-report",
+         "callers")
 
 # ---- MethodAttributes ------------------------------------------------------
 # ECMA-335 II.23.1.10. Only the bits that change a BIND DECISION are decoded;
@@ -2204,6 +2221,450 @@ def symbol_index(R, key=None, generics=True):
     return _SYMIDX[k]
 
 
+# ---------------------------------------------------------------------------
+# callers -- who reaches this method, from a rel32 edge scan of the image
+# ---------------------------------------------------------------------------
+# MEASURED need (2026-09-01/02): agents twice wrote throwaway E8-rel32 scanners
+# to answer "who calls this RVA" -- once to establish that
+# `MenuScreen::Show(EMenuScreenType)` @0x15387a0 has exactly ONE caller, at
+# 0x1538790 inside `MenuScreen::Show(controller)` @0x1538760, and once to
+# establish that `OnActionButtonPressed` @0x13f61b0 has ZERO direct callers
+# because it is wired through `CompositeDisposable::SubscribeEvent`. A third
+# scratchpad `callers.py` mislabelled owners inside generic-body regions,
+# because it attributed sites with a nearest-start walk over methodPointers
+# ONLY -- exactly the wrong answer `SymbolIndex._add_generics` exists to stop.
+# So the edge scan is here, it shares the symbolize index, and it is cached.
+#
+# WHAT THIS IS, precisely -- it is a BYTE SCAN, not a disassembler:
+#   every `E8 rel32` (call) and `E9 rel32` (jmp) byte pattern in the `il2cpp`
+#   and `.text` sections whose computed target lands inside those sections.
+# Two consequences that are stated in the output rather than hidden:
+#   * FALSE POSITIVES are possible -- a jump table, a float constant or the
+#     middle of a longer instruction can spell E8/E9 followed by four bytes
+#     that happen to point at a method start. Every site is therefore printed
+#     with its owner, and a site that lands in no attributable body is tagged
+#     `<unattributed>` rather than counted as a caller.
+#   * FALSE NEGATIVES are CERTAIN for indirect edges -- virtual dispatch,
+#     delegates, events, `call [rax]`, `call qword ptr [rip+...]`. "0 direct
+#     callers" therefore means exactly that and is worded to say so.
+
+
+CALLGRAPH_SECTIONS = ("il2cpp", ".text")
+_CALLGRAPH_MAGIC = b"AOWLCG01"
+
+
+def cache_dir_for(metadec=None):
+    """The shared `.cache` directory. Prefers the one the DECRYPTED metadata
+    was found in, because `default_paths()` resolves that against parent
+    directories: a git worktree has no `.cache` of its own, so a worktree run
+    reuses the main checkout's cache instead of rebuilding a 2.4M-edge graph
+    per worktree."""
+    if metadec:
+        d = os.path.dirname(os.path.abspath(metadec))
+        if os.path.basename(d).lower() == ".cache":
+            return d
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(repo, ".cache")
+
+
+class CallGraph(object):
+    """target RVA -> [(site RVA, kind)], kind 0 = `call` (E8), 1 = `jmp` (E9).
+
+    Held as three parallel arrays sorted by target so the cache file is a raw
+    dump and a lookup is a bisect. ~2.4M edges on this build = ~21 MB.
+    """
+
+    __slots__ = ("T", "S", "K", "n_scanned", "sections", "source",
+                 "build_secs", "load_secs", "path")
+
+    def __init__(self, T, S, K, n_scanned, sections):
+        self.T, self.S, self.K = T, S, K
+        self.n_scanned = n_scanned
+        self.sections = sections
+        self.source = "?"
+        self.build_secs = self.load_secs = 0.0
+        self.path = None
+
+    # -- build -----------------------------------------------------------
+    @classmethod
+    def build(cls, R):
+        t0 = time.time()
+        b = R.b
+        lo = hi = None
+        segs = []
+        for name, vs, vz, raw, rz in R.SEC:
+            if name not in CALLGRAPH_SECTIONS:
+                continue
+            lo = vs if lo is None else min(lo, vs)
+            hi = vs + vz if hi is None else max(hi, vs + vz)
+            segs.append((name, vs, raw, min(rz, vz)))
+        if not segs:
+            raise RuntimeError("neither `il2cpp` nor `.text` is present in "
+                               "this PE -- refusing to build a call graph")
+        rows = []
+        add = rows.append
+        n_scanned = 0
+        for _name, vs, raw, size in segs:
+            end = raw + size
+            n_scanned += size
+            for op, kind in ((0xE8, 0), (0xE9, 1)):
+                pat = bytes((op,))
+                i = b.find(pat, raw, end - 5)
+                while i != -1:
+                    tgt = (vs + (i - raw) + 5
+                           + struct.unpack_from("<i", b, i + 1)[0])
+                    if lo <= tgt < hi:
+                        add((tgt, vs + (i - raw), kind))
+                    i = b.find(pat, i + 1, end - 5)
+        rows.sort()
+        g = cls(array.array("I", [r[0] for r in rows]),
+                array.array("I", [r[1] for r in rows]),
+                array.array("B", [r[2] for r in rows]),
+                n_scanned, [s[0] for s in segs])
+        g.source = "built"
+        g.build_secs = time.time() - t0
+        return g
+
+    # -- disk cache ------------------------------------------------------
+    @staticmethod
+    def cache_path(gameasm_bytes, cdir):
+        h = hashlib.sha256(gameasm_bytes).hexdigest()[:16]
+        return os.path.join(cdir, "callgraph-%s.bin" % h)
+
+    def save(self, path):
+        tmp = path + ".tmp%d" % os.getpid()
+        d = os.path.dirname(path)
+        if d and not os.path.isdir(d):
+            os.makedirs(d)
+        with open(tmp, "wb") as fh:
+            fh.write(_CALLGRAPH_MAGIC)
+            fh.write(struct.pack("<QQ", len(self.T), self.n_scanned))
+            self.T.tofile(fh)
+            self.S.tofile(fh)
+            self.K.tofile(fh)
+        os.replace(tmp, path)
+        self.path = path
+
+    @classmethod
+    def load(cls, path, sections):
+        """A CallGraph, or None if the file is absent/short/wrong-magic. A
+        truncated cache must read as a MISS, never as a graph with fewer
+        edges -- that would silently under-report callers."""
+        try:
+            with open(path, "rb") as fh:
+                head = fh.read(len(_CALLGRAPH_MAGIC) + 16)
+                if (len(head) < len(_CALLGRAPH_MAGIC) + 16
+                        or head[:len(_CALLGRAPH_MAGIC)] != _CALLGRAPH_MAGIC):
+                    return None
+                n, n_scanned = struct.unpack_from(
+                    "<QQ", head, len(_CALLGRAPH_MAGIC))
+                want = len(_CALLGRAPH_MAGIC) + 16 + n * 9
+                if os.path.getsize(path) != want:
+                    return None
+                T, S, K = array.array("I"), array.array("I"), array.array("B")
+                T.fromfile(fh, n)
+                S.fromfile(fh, n)
+                K.fromfile(fh, n)
+        except (OSError, EOFError, ValueError):
+            return None
+        g = cls(T, S, K, n_scanned, sections)
+        g.source = "cache"
+        g.path = path
+        return g
+
+    # -- query -----------------------------------------------------------
+    def edges_to(self, rva):
+        """[(site RVA, kind)] for an EXACT target address, in address order."""
+        i = bisect.bisect_left(self.T, rva)
+        out = []
+        T, S, K = self.T, self.S, self.K
+        n = len(T)
+        while i < n and T[i] == rva:
+            out.append((S[i], K[i]))
+            i += 1
+        out.sort()
+        return out
+
+    def note(self):
+        if self.source == "cache":
+            return ("callgraph: CACHE HIT -- %d rel32 edge(s) loaded in "
+                    "%.2fs from %s" % (len(self.T), self.load_secs, self.path))
+        return ("callgraph: CACHE MISS -- scanned %d byte(s) of %s for E8/E9 "
+                "rel32, %d edge(s), built in %.2fs%s"
+                % (self.n_scanned, "+".join(self.sections), len(self.T),
+                   self.build_secs,
+                   (", cached at " + self.path) if self.path else
+                   " (NOT cached -- the cache directory was not writable)"))
+
+
+_CALLGRAPH = {}
+
+
+def call_graph(R, key=None, cache_dir=None, use_cache=True):
+    """A CallGraph for this image: process cache, then disk cache, then build.
+
+    Keyed on disk by the sha256 of GameAssembly.dll's BYTES, so a Tarkov update
+    misses rather than answering from the previous build's edges.
+    """
+    if key in _CALLGRAPH:
+        return _CALLGRAPH[key]
+    cdir = cache_dir or cache_dir_for(key[1] if isinstance(key, tuple) else None)
+    path = CallGraph.cache_path(R.b, cdir)
+    g = None
+    if use_cache:
+        t0 = time.time()
+        g = CallGraph.load(path, list(CALLGRAPH_SECTIONS))
+        if g is not None:
+            g.load_secs = time.time() - t0
+    if g is None:
+        g = CallGraph.build(R)
+        if use_cache:
+            try:
+                g.save(path)
+            except OSError:
+                g.path = None
+    _CALLGRAPH[key] = g
+    return g
+
+
+def method_starts(idx):
+    """The set of addresses `callers` will accept: every methodPointers start
+    plus every inflated generic-body start, i.e. exactly the keys the
+    symbolize index owns."""
+    return idx.owners
+
+
+def site_tag(R, idx, site, max_gap=DEFAULT_MAX_GAP):
+    """(owner_label, start, offset, tag) for a call SITE, or (None, ...) when
+    the site is not attributable. `tag` is one of unique / shared(n) /
+    generic-body / <unattributed>."""
+    s = idx.lookup(site, max_gap=max_gap)
+    if s.start is None:
+        return (None, None, None, "<unattributed>")
+    entries = idx.owners.get(s.start, [])
+    if any(e[0] == "g" for e in entries):
+        tag = "generic-body"
+        if len(entries) > 1:
+            tag = "generic-body, %d owners" % len(entries)
+    else:
+        st, n = R.sharedness(s.start)
+        tag = "shared x%d" % n if st == "shared" else st
+    if not s.ok and s.offset is not None and s.offset > max_gap:
+        return (None, s.start, s.offset, "<unattributed>")
+    return (s.owner, s.start, s.offset, tag)
+
+
+def resolve_callee_name(R, spec):
+    """(rva, label) for a `Type::Method` or bare method name, or (None, msg).
+
+    Never guesses: more than one candidate address is a refusal that PRINTS
+    the candidates, because "the only substring match" is how `fields
+    EFT.CharacterController` once answered for a different type entirely.
+    """
+    tyname, sep, mname = spec.partition("::")
+    cands = []
+    if sep:
+        wanted_types = [t for t, full in R.find(tyname)
+                        if full == tyname or full.split(".")[-1] == tyname]
+        if not wanted_types:
+            return (None, "NO SUCH TYPE %r (searched all %d exhaustively)."
+                    % (tyname, R.NTYPES))
+    else:
+        mname = tyname
+        wanted_types = range(R.NTYPES)
+    for t in wanted_types:
+        for mi in R.type_methods(t):
+            if R.mname(mi) != mname:
+                continue
+            rva = method_rva_of(R, t, mi)
+            ns, nm = R.tname(t)
+            full = (ns + "." + nm) if ns else nm
+            try:
+                sig, _pc = R.sig_string(mi, R.mname(mi))
+            except Exception:
+                sig = mname + "(?)"
+            cands.append((rva, vis("%s::%s" % (full, sig))))
+    if not cands:
+        return (None, "NO METHOD NAMED %r%s (searched exhaustively). "
+                "`callers` matches the method name EXACTLY; use `member %s` "
+                "to search by substring."
+                % (mname, (" on type %r" % tyname) if sep else "", mname))
+    addrs = set(a for a, _ in cands if a is not None)
+    if len(addrs) == 1 and len(cands) == 1:
+        return (cands[0][0], cands[0][1])
+    if len(addrs) == 1:
+        # Several overloads folded onto ONE address is itself the answer worth
+        # stating: the caller list below is the union over all of them.
+        return (sorted(addrs)[0],
+                "%s  [%d definitions resolve to this one address]"
+                % (cands[0][1], len(cands)))
+    lines = ["AMBIGUOUS: %d method(s) named %r, at %d distinct addresses -- "
+             "refusing to pick one. Pass an RVA, or Type::Method:"
+             % (len(cands), mname, len(addrs))]
+    for a, lab in cands[:20]:
+        lines.append("  %-12s %s" % ("NO-CODE" if a is None else hex(a), lab))
+    if len(cands) > 20:
+        lines.append("  ... and %d more" % (len(cands) - 20))
+    return (None, "\n".join(lines))
+
+
+def cmd_callers(R, argv, key=None):
+    if not argv:
+        print("usage: callers <RVA-or-VA-or-Type::Method> [--base 0x...] "
+              "[--max-gap N] [--no-cache] [--limit=N]")
+        return 2
+    max_gap = DEFAULT_MAX_GAP
+    base = None
+    use_cache = True
+    limit = 200
+    rest = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--max-gap" and i + 1 < len(argv):
+            max_gap = int(argv[i + 1], 0); i += 2; continue
+        if a.startswith("--max-gap="):
+            max_gap = int(a.split("=", 1)[1], 0); i += 1; continue
+        if a == "--base" and i + 1 < len(argv):
+            base = int(argv[i + 1], 0); i += 2; continue
+        if a.startswith("--base="):
+            base = int(a.split("=", 1)[1], 0); i += 1; continue
+        if a == "--no-cache":
+            use_cache = False; i += 1; continue
+        if a.startswith("--limit="):
+            limit = int(a.split("=", 1)[1], 0); i += 1; continue
+        rest.append(a); i += 1
+    if not rest:
+        print("callers: no address or name given")
+        return 2
+    spec = rest[0]
+    label = None
+    try:
+        addr = int(spec, 0)
+    except ValueError:
+        rva, label = resolve_callee_name(R, spec)
+        if rva is None:
+            print(label)
+            return 3
+        addr = rva
+        base = None
+    else:
+        if base is not None:
+            addr -= base
+            if addr < 0:
+                print("INCONCLUSIVE: 0x%x is BELOW the --base you gave -- "
+                      "that address is not in this module." % (addr + base))
+                return 3
+        elif addr >= R.IB + 0x10000000:
+            print("INCONCLUSIVE: 0x%x looks like a LIVE (ASLR-relocated) "
+                  "address, not an RVA. GameAssembly.dll is relocated at "
+                  "runtime; pass --base 0x<module base>. Subtracting the "
+                  "PREFERRED base 0x%x from a relocated address is the "
+                  "classic wrong answer." % (addr, R.IB))
+            return 3
+        elif addr >= R.IB:
+            addr -= R.IB
+    rva = addr
+
+    idx = symbol_index(R, key=key)
+    print("index: %d methodPointers start(s) + %d generic body start(s)"
+          % (idx.n_method_starts, idx.n_generic_starts))
+    if idx.generics_note:
+        print("NOTE: %s" % idx.generics_note)
+
+    # -- the refusal: `callers` answers for a method START, nothing else.
+    if rva not in idx.owners:
+        sec = R.section_of_rva(rva)[0] or "<no section>"
+        s = idx.lookup(rva, max_gap=max_gap)
+        print("INCONCLUSIVE: 0x%x is NOT a method start (section %s). "
+              "`callers` matches an EXACT rel32 target; an address in the "
+              "middle of a body has no call edges of its own, and answering "
+              "'0 callers' for it would be a confidently wrong answer."
+              % (rva, sec))
+        if s.start is not None and s.offset is not None:
+            print("  nearest start 0x%x is +0x%x below: %s"
+                  % (s.start, s.offset, s.owner))
+            print("  did you mean:  callers 0x%x" % s.start)
+        print("  to name the containing method instead:  symbolize 0x%x"
+              % rva)
+        return 3
+
+    entries = idx.owners[rva]
+    if label is None:
+        label = idx.label(entries[0])
+    print("callee: 0x%x  %s" % (rva, label))
+    if len(entries) > 1:
+        print("WARNING: %d method definitions share this address, so the "
+              "callers below are the UNION over all of them and cannot be "
+              "split apart:" % len(entries))
+        for e in entries[:6]:
+            print("    %s" % idx.label(e))
+        if len(entries) > 6:
+            print("    ... and %d more" % (len(entries) - 6))
+    else:
+        st, n = R.sharedness(rva)
+        if st == "shared":
+            print("WARNING: %s" % R.sharedness_note(rva))
+
+    g = call_graph(R, key=key, use_cache=use_cache)
+    print(g.note())
+
+    edges = g.edges_to(rva)
+    n_call = n_jmp = n_unattr = 0
+    shown = 0
+    self_rec = 0
+    for site, kind in edges:
+        owner, start, off, tag = site_tag(R, idx, site, max_gap=max_gap)
+        if owner is None:
+            n_unattr += 1
+        elif kind == 0:
+            n_call += 1
+        else:
+            n_jmp += 1
+        if start == rva:
+            self_rec += 1
+        if shown < limit:
+            shown += 1
+            if owner is None:
+                print("  0x%-9x %-4s in <unattributed> -- no method body "
+                      "contains this site (nearest start %s). Most likely a "
+                      "byte coincidence in data, NOT a call."
+                      % (site, "call" if kind == 0 else "jmp",
+                         ("0x%x, +0x%x away" % (start, off))
+                         if start is not None else "none"))
+            else:
+                print("  0x%-9x %-4s in %s @0x%x +0x%x [%s]%s"
+                      % (site, "call" if kind == 0 else "jmp", owner, start,
+                         off, tag, "  <- SELF (recursion)"
+                         if start == rva else ""))
+    if shown < len(edges):
+        print("  ... %d more site(s) suppressed by --limit=%d"
+              % (len(edges) - shown, limit))
+
+    total = n_call + n_jmp
+    if total == 0:
+        if n_unattr:
+            print("   (%d rel32 byte pattern(s) DO point here but lie in no "
+                  "attributable method body -- counted as data coincidences, "
+                  "not callers. They are listed above so you can judge.)"
+                  % n_unattr)
+        print("-- 0 direct callers -- reached only through a vtable/delegate/"
+              "event. That is a REAL ANSWER, not a failure: this scan finds "
+              "`E8 rel32` / `E9 rel32` edges only, so a virtual dispatch, a "
+              "delegate, an event subscription (e.g. via "
+              "CompositeDisposable::SubscribeEvent) or a `call [reg]` leaves "
+              "no edge here. It also means NOTHING inlined this body away.")
+        return 0
+    print("-- %d direct caller site(s): %d call (E8), %d tail jmp (E9)%s%s"
+          % (total, n_call, n_jmp,
+             ("; %d self-recursive" % self_rec) if self_rec else "",
+             ("; %d unattributed candidate(s) NOT counted" % n_unattr)
+             if n_unattr else ""))
+    print("   (a tail `jmp` is a real edge -- the compiler reused the "
+          "caller's frame -- but the caller does not return through it.)")
+    return 0
+
+
 # `D:\Aowlspt\GameAssembly.dll:GameAssembly.dll (00007FFB2ABB0000), size:
 #  126812160 (result: 0), SymType: '-deferred-', PDB: ''`
 MODBASE_RX = re.compile(
@@ -2581,6 +3042,8 @@ def main():
     elif cmd == "symbolize-report":
         sys.exit(cmd_symbolize_report(R, sys.argv[4:],
                                       key=(sys.argv[1], sys.argv[2])))
+    elif cmd == "callers":
+        sys.exit(cmd_callers(R, sys.argv[4:], key=(sys.argv[1], sys.argv[2])))
     elif cmd == "typemethods":
         sys.exit(cmd_typemethods(R, sys.argv[4:]))
     elif cmd == "genericmethods":
