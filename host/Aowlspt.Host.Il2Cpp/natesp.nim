@@ -291,6 +291,45 @@ var gNeCanvasW = 0'f32
 var gNeCanvasH = 0'f32
 var gNeGraphicDonor: Il2CppPtr = nil ## a live Graphic, for nuRegisterReference
 
+# ---- THE THREE RECTANGLES --------------------------------------------------
+# They are NOT the same rectangle, and conflating any two of them is what made
+# every contact read offScreen. MEASURED 2026-09-01, host log [0:03:24]:
+#
+#   region window client rect (region.nim, via duCanvasSize) : 3840 x 2160 (16:9)
+#   our overlay Canvas RectTransform rect (nuGetRect readback):2560 x 1600 (16:10)
+#
+# Different ASPECT ratios, so one is not the other scaled -- at most one of them
+# can be the space `Camera::WorldToScreenPoint` outputs in, and the placement
+# was testing against the WINDOW one while writing anchoredPosition into the
+# CANVAS one. The projection space is neither by assumption: it is
+# `UnityEngine.Screen.width/height`, so it is ASKED, here, and the ratio
+# canvas/screen is derived from two numbers that both came off the live game.
+var gNeUsw = 0'f32                    ## UnityEngine.Screen::get_width
+var gNeUsh = 0'f32                    ## UnityEngine.Screen::get_height
+var gNeUsOk = false                   ## did Screen actually answer? (3-state)
+var gNeUsAt = 0'i64                   ## tick of the last Screen read
+
+# ---- THE ONE-LINE SPACE PROBE ---------------------------------------------
+# RAW NUMBERS ONLY. Nothing here builds a string: this is written inside the
+# guarded per-frame body and rule 7 forbids a per-frame managed allocation.
+# `neSpaceLine` formats it later, outside the guard, in the diag path.
+var gNeSpHave = false
+var gNeSpWx = 0.0
+var gNeSpWy = 0.0
+var gNeSpWz = 0.0                     ## nearest projected contact, WORLD
+                                      ## (float64: the census stores it so)
+var gNeSpPx = 0'f32
+var gNeSpPy = 0'f32
+var gNeSpPz = 0'f32                   ## ... its SCREEN point (Screen px)
+var gNeSpCx = 0'f32
+var gNeSpCy = 0'f32                   ## ... its CANVAS point (canvas units)
+var gNeSpOn = false                   ## ... and the on-screen answer for it
+var gNeSpMinX = 0'f32
+var gNeSpMaxX = 0'f32
+var gNeSpMinY = 0'f32
+var gNeSpMaxY = 0'f32                 ## canvas-space bbox over ALL projected
+var gNeSpN = 0'i32                    ## how many went into that bbox
+
 # ---- OUR OWN CANVAS ------------------------------------------------------
 # `gNeOwnCanvasGo` is set ONLY when we created it, and it is what teardown
 # destroys. It is deliberately a SECOND variable rather than a flag on
@@ -1969,6 +2008,71 @@ proc neHideAllFrom(first: int) =
       neFlkNoteBoxOff(1)
     inc k
 
+proc neUnityScreen() =
+  ## THE PROJECTION SPACE, ASKED OF THE GAME -- `UnityEngine.Screen::get_width`
+  ## and `get_height`, the two statics `Camera::WorldToScreenPoint` measures its
+  ## output against. This is NOT `duCanvasSize`, which publishes region.nim's
+  ## window CLIENT RECT; that number is a real measurement of a different
+  ## rectangle and using it as the projection space is the defect this replaces.
+  ##
+  ## THREE-STATE. `gNeUsOk` false means "could not ask", which is not the same
+  ## as a screen of 0x0 and is never flattened into one: the caller falls back
+  ## to an identity ratio and the probe line SAYS it assumed.
+  ##
+  ## Refreshed at most every 60 ticks, because a resolution change is a rare
+  ## event and this is a per-frame path. `cMi2Fn` is used rather than `mi2Fn`
+  ## deliberately: `mi2Fn` warns on every nil, which in here would be a log line
+  ## a second forever. The unbound case is reported ONCE, by the probe line.
+  if gNeUsOk and (gNeTicks - gNeUsAt) < 60'i64: return
+  gNeUsAt = gNeTicks
+  let fw = cMi2Fn(Mi2ScreenWidth)
+  let fh = cMi2Fn(Mi2ScreenHeight)
+  if fw == nil or fh == nil:
+    gNeUsOk = false
+    return
+  let w = cMi2CallIV(fw)
+  let h = cMi2CallIV(fh)
+  # A refusal, not a clamp: a screen of 0 or of 100000 is a read that did not
+  # work, and dividing by it would manufacture a plausible coordinate.
+  if w < 16'i32 or h < 16'i32 or w > 16384'i32 or h > 16384'i32:
+    gNeUsOk = false
+    return
+  gNeUsw = float32(w)
+  gNeUsh = float32(h)
+  gNeUsOk = true
+
+proc neSpaceKx(): float32 =
+  ## SCREEN PIXELS -> CANVAS UNITS on X. Numerator: the canvas RectTransform's
+  ## own rect readback. Denominator: Screen.width. Both came off the live game;
+  ## neither is a constant and neither is our own write.
+  if gNeUsOk and gNeUsw > 0'f32 and gNeCanvasW > 0'f32: gNeCanvasW / gNeUsw
+  else: 1'f32
+
+proc neSpaceKy(): float32 =
+  if gNeUsOk and gNeUsh > 0'f32 and gNeCanvasH > 0'f32: gNeCanvasH / gNeUsh
+  else: 1'f32
+
+proc neSpaceProbe(ci: int; cvx, cvy, depth, kx, ky: float32;
+                  onScreen: bool) =
+  ## ONE CONTACT, ONE SPACE, RECORDED AS RAW NUMBERS. Called from PASS 3 at
+  ## `idx == 0`, i.e. the NEAREST projected contact -- deliberately the same
+  ## contact whose on-screen answer is recorded, because a line that describes
+  ## one contact's coordinates beside a different contact's verdict is exactly
+  ## the check that cannot fail. The screen point is reconstructed by dividing
+  ## the conversion back out, so the line shows both sides of the mapping that
+  ## was actually applied rather than a second, independent measurement.
+  if ci < 0 or ci >= NeMaxContacts: return
+  gNeSpWx = gNeCx[ci]
+  gNeSpWy = gNeCy[ci]
+  gNeSpWz = gNeCz[ci]
+  gNeSpCx = cvx
+  gNeSpCy = cvy
+  gNeSpPx = (if kx != 0'f32: cvx / kx else: cvx)
+  gNeSpPy = (if ky != 0'f32: cvy / ky else: cvy)
+  gNeSpPz = depth
+  gNeSpOn = onScreen
+  gNeSpHave = true
+
 proc nePlace(sw, sh: float64) =
   ## THREE THINGS CHANGED HERE, and they are one change.
   ##
@@ -2005,6 +2109,13 @@ proc nePlace(sw, sh: float64) =
   gNeOffScr = 0
   gNeSetFail = 0
   gNePn = 0
+  gNeSpHave = false
+  gNeSpN = 0
+  # THE SPACE, REFRESHED BEFORE ANYTHING IS PROJECTED. Two static il2cpp calls
+  # at most once every 60 ticks.
+  neUnityScreen()
+  let kx = neSpaceKx()
+  let ky = neSpaceKy()
   if fnW2S == nil or cam == nil:
     # hide everything rather than leave the last frame's boxes frozen on screen
     gNeBehind = gNeCn
@@ -2034,8 +2145,28 @@ proc nePlace(sw, sh: float64) =
     if gNePn >= NeMaxContacts:
       inc gNeDropped
       continue
-    gNePx[gNePn] = float32(cDuScreenX())
-    gNePy[gNePn] = float32(cDuScreenY())
+    # ---- THE CONVERSION, IN ONE PLACE ---------------------------------
+    # `WorldToScreenPoint` answers in SCREEN PIXELS (origin bottom-left).
+    # `anchoredPosition` on a box under a full-stretch root is in CANVAS
+    # UNITS. Those are the same number only when the canvas rect equals the
+    # screen -- measured, it does not. gNePx/gNePy hold CANVAS UNITS from
+    # here on, and every consumer (the on-screen test, the setter, the
+    # verdict readback) is therefore in one space.
+    let spx = float32(cDuScreenX())
+    let spy = float32(cDuScreenY())
+    let cvx = spx * kx
+    let cvy = spy * ky
+    if gNeSpN == 0'i32:
+      gNeSpMinX = cvx; gNeSpMaxX = cvx
+      gNeSpMinY = cvy; gNeSpMaxY = cvy
+    else:
+      if cvx < gNeSpMinX: gNeSpMinX = cvx
+      if cvx > gNeSpMaxX: gNeSpMaxX = cvx
+      if cvy < gNeSpMinY: gNeSpMinY = cvy
+      if cvy > gNeSpMaxY: gNeSpMaxY = cvy
+    inc gNeSpN
+    gNePx[gNePn] = cvx
+    gNePy[gNePn] = cvy
     gNePz[gNePn] = float32(cDuScreenZ())
     gNeOrd[gNePn] = int32(ci)
     inc gNePn
@@ -2088,12 +2219,17 @@ proc nePlace(sw, sh: float64) =
     if boxH < 6.0'f32: boxH = 6.0'f32
     if boxH > 220.0'f32: boxH = 220.0'f32
     let boxW = boxH * 0.45'f32
+    # TESTED AGAINST THE RECT THE POINT IS ACTUALLY IN. It used to be tested
+    # against `sw x sh` -- region.nim's WINDOW client rect -- while the point
+    # was written into the CANVAS rect. The canvas rect is the one the box
+    # lives in, so it is the one that decides whether the box is visible.
     if not cNeOnScreenB(gNePx[idx], gNePy[idx], boxW, boxH,
-                        float32(sw), float32(sh)):
+                        gNeCanvasW, gNeCanvasH):
       # OFF-SCREEN IS ITS OWN OUTCOME. Placing it anyway would leave a box
       # pinned to the screen edge, and counting it as `shown` would inflate the
       # only number the verdict has.
       inc gNeOffScr
+      if idx == 0: neSpaceProbe(ci, gNePx[0], gNePy[0], depth, kx, ky, false)
       if gNeBoxActive[idx]:
         discard nuSetActive(gNeBoxGo[idx], false)
         gNeBoxActive[idx] = false
@@ -2117,6 +2253,7 @@ proc nePlace(sw, sh: float64) =
         continue
       gNeBoxActive[idx] = true
       gNeFlkBoxOn = gNeFlkBoxOn + 1
+    if idx == 0: neSpaceProbe(ci, gNePx[0], gNePy[0], depth, kx, ky, true)
     inc gNeShown
     inc idx
   # hide the tail of the flat pool that this frame did not use
@@ -2138,7 +2275,7 @@ proc nePlace(sw, sh: float64) =
 # pool was silently destroyed by a scene change. It cannot be satisfied by our
 # own bookkeeping, because none of the three reads is a variable we wrote.
 # ---------------------------------------------------------------------------
-proc neVerdict(sw, sh: float64): int32 =
+proc neVerdict(): int32 =
   gNeOnScreen = 0
   if gNeState != NeRun or gNeBuilt <= 0 or gNeCanvasTr == nil:
     return NeVInconclusive
@@ -2148,8 +2285,14 @@ proc neVerdict(sw, sh: float64): int32 =
       if nuActiveInHierarchy(gNeBoxGo[i]):
         let (okP, px, py) = nuGetPos(gNeBoxRt[i])
         let (okS, bw, bh) = nuGetSize(gNeBoxRt[i])
+        # THE SAME RECT THE PLACEMENT TESTED AGAINST. `anchoredPosition` and
+        # `sizeDelta` both come back in CANVAS UNITS, so the canvas rect is
+        # the only rectangle they can be compared with. Testing them against
+        # the window client rect measured a different thing than the feature
+        # does, which is precisely the drift `cNeOnScreenB`'s shared-predicate
+        # comment forbids.
         if okP and okS and
-           cNeOnScreen(px, py, bw, bh, float32(sw), float32(sh)) != 0'i32:
+           cNeOnScreen(px, py, bw, bh, gNeCanvasW, gNeCanvasH) != 0'i32:
           inc gNeOnScreen
     inc i
   if gNeOnScreen > 0: return NeVPass
@@ -2466,6 +2609,52 @@ proc neVerdictAge(): string =
     "runs every " & $int(cNeVerdictEvery()) & " ticks, throttled because it " &
     "is 3 il2cpp calls per box and was 6.8ms of a 14.5ms tick)"
 
+proc neSpaceLine(sw, sh: float64): string =
+  ## THE ONE LINE A COORDINATE-SPACE MISMATCH SHOWS UP IN.
+  ##
+  ## Three rectangles are in play and they are NOT the same rectangle:
+  ##   * region.nim's window CLIENT RECT      (`duCanvasSize`, printed as screen=)
+  ##   * `UnityEngine.Screen.width/height`    -- what WorldToScreenPoint outputs in
+  ##   * our overlay Canvas RectTransform rect -- what anchoredPosition is in
+  ##
+  ## MEASURED 2026-09-01, Woods, host log [0:03:24]: window 3840x2160 (16:9)
+  ## against canvas 2560x1600 (16:10). Different ASPECT ratios, so one is not
+  ## the other scaled and at most one of them could ever have been the
+  ## projection space -- yet the on-screen test used the WINDOW rect while the
+  ## setter wrote the CANVAS rect, and 42 of 42 contacts came back offScreen.
+  ##
+  ## So this prints, for ONE contact (the nearest, the same one whose verdict
+  ## is quoted): the world position, the screen point, the canvas point, and
+  ## the rect it was tested against -- plus the canvas-space bounding box over
+  ## EVERY projected contact, which is the number that separates the two
+  ## explanations that produce identical counters. A bbox that sits inside the
+  ## canvas rect while shown=0 means the TEST is wrong; a bbox spread over tens
+  ## of thousands of units means the contacts really are outside the frustum
+  ## and offScreen is the honest answer. One counter cannot tell those apart;
+  ## this line can, and it can come out either way.
+  result = "natesp SPACE: screen px -> canvas units. projection=" &
+    (if gNeUsOk: "Screen.width/height " & neF(gNeUsw) & "x" & neF(gNeUsh) &
+                 " (asked of the game)"
+     else: "Screen.width/height COULD NOT BE ASKED -- ratio ASSUMED 1:1, " &
+           "which is a fallback and not a measurement") &
+    " canvasRect=" & neF(gNeCanvasW) & "x" & neF(gNeCanvasH) &
+    " k=" & formatFloat(float64(neSpaceKx()), ffDecimal, 4) & "," &
+    formatFloat(float64(neSpaceKy()), ffDecimal, 4) &
+    " windowClientRect=" & duFmt0(sw) & "x" & duFmt0(sh) &
+    " (region.nim's, NOT the projection space and no longer tested against)."
+  if gNeSpHave:
+    result = result & " nearest contact: world=(" & duFmt1(gNeSpWx) & "," &
+      duFmt1(gNeSpWy) & "," & duFmt1(gNeSpWz) & ") screen=(" & neF(gNeSpPx) & "," &
+      neF(gNeSpPy) & ") depth=" & neF(gNeSpPz) & " canvas=(" & neF(gNeSpCx) &
+      "," & neF(gNeSpCy) & ") testedAgainst=" & neF(gNeCanvasW) & "x" &
+      neF(gNeCanvasH) & " -> " & (if gNeSpOn: "ON-SCREEN" else: "offScreen")
+  else:
+    result = result & " nearest contact: NONE reached placement this frame, " &
+      "so there is no per-contact reading -- INCONCLUSIVE, not a pass."
+  result = result & " projected canvas bbox over " & $int(gNeSpN) &
+    " contact(s): x[" & neF(gNeSpMinX) & ".." & neF(gNeSpMaxX) & "] y[" &
+    neF(gNeSpMinY) & ".." & neF(gNeSpMaxY) & "]."
+
 proc neVerdictBody(sw, sh: float64): string =
   case int(gNeVerdict)
   of 2:
@@ -2477,7 +2666,8 @@ proc neVerdictBody(sw, sh: float64): string =
       "of our own writes -- but it is still not proof a human can SEE them. " &
       "`activeInHierarchy` is TRANSITIVE, so a box reading back active is also " &
       "a readback of the whole parent chain box -> aowlspt-esp-root -> " &
-      neOriginName(gNeCanvasOrigin) & " canvas being active." & neVerdictAge()
+      neOriginName(gNeCanvasOrigin) & " canvas being active." & neVerdictAge() &
+      "  " & neSpaceLine(sw, sh)
   of 1:
     "natesp VERDICT FAIL -- " & neCanvasLine() &
       ". Contacts exist but ZERO boxes read back active " &
@@ -2485,7 +2675,8 @@ proc neVerdictBody(sw, sh: float64): string =
       $gNeShown & " built=" & $gNeBuilt & " canvas=" & neF(gNeCanvasW) & "x" &
       neF(gNeCanvasH) & " screen=" & duFmt0(sw) & "x" & duFmt0(sh) &
       ". The pool exists and the placement ran; the finished state is empty. " &
-      neAccountLine() & "." & neVerdictAge()
+      neAccountLine() & "." & neVerdictAge() &
+      "  " & neSpaceLine(sw, sh)
   else:
     "natesp VERDICT INCONCLUSIVE -- " & neCanvasLine() & ". " &
       readCString(cNeRefusalText(gNeWhy)) &
@@ -2828,7 +3019,7 @@ proc neTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ne_tick_body", cdecl.}
     if (gNeTicks - gNeVerdictAt) >= int64(cNeVerdictEvery()) or
        gNeVerdictAt == 0:
       cNeSubBegin(NeSubVerdict)
-      gNeVerdict = neVerdict(sw, sh)
+      gNeVerdict = neVerdict()
       cNeSubEnd(NeSubVerdict)
       gNeVerdictAt = gNeTicks
   else:
