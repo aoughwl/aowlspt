@@ -5,6 +5,31 @@ r"""raidprof.py -- WHERE DOES THE TIME GO between launch and standing in a raid.
     python tools/raidprof.py --top 20        more gaps
     python tools/raidprof.py --json
     python tools/raidprof.py --session log_2026.09.01_13-56-55_1.1.0.1.46777
+    python tools/raidprof.py --phases                 launch -> GameRunned, by phase
+    python tools/raidprof.py --compare OLD NEW        two sessions side by side
+
+## Phases and buckets (`--phases`)
+
+The gap list says WHERE the silence is; it does not say whose fault it is. The
+phase table cuts launch -> GameRunned ("deployed", the moment the player can
+move) at the client's own milestones and, inside each phase, splits the wall
+clock three ways using only what the client itself logged:
+
+    server   the UNION of every [---> Request .. <--- Response] interval, so
+             ten parallel requests that all take 0.8s count 0.8s, not 8s.
+             This is server time PLUS transfer; it is an upper bound on what
+             the backend can be blamed for.
+    parse    the sum of ParseSeconds -- the client turning our JSON into
+             objects. Ours to shrink only by shrinking the payload.
+    client   everything else: scene load, pooling, spawning, waiting.
+
+`bots` is the number of `AIDATA create` lines in the phase: how many bots
+the client built before the phase ended, which is decided by OUR wave table.
+The union is computed per phase over requests that STARTED in it.
+
+Phase boundaries are first occurrences, so a session that never reached
+GameRunned prints the phases it did reach and says INCONCLUSIVE for the rest
+(exit 3), and `--compare` refuses to print a delta it cannot stand behind.
 
 ## The question this answers
 
@@ -102,6 +127,192 @@ def parse(paths):
     return out
 
 
+# --------------------------------------------------------------- phases
+# (name, regex on the message) -- the first line matching each one ends the
+# named phase.  Order matters and is the order the client emits them.
+MILESTONES = [
+    ("boot",          r"Request HTTPS, id \[1\]"),
+    ("login+statics", r"Request HTTPS.*?/client/game/profile/select"),
+    ("menu",          r"scene preset path:|TRACE-NetworkGameMatching G"),
+    ("matching",      r"TRACE-NetworkGameMatching I"),
+    ("scene load",    r"^LocationLoaded:"),
+    ("game create",   r"^GameCreated:"),
+    ("player spawn",  r"^PlayerSpawnEvent:"),
+    ("pooling",       r"^GamePooled:"),
+    ("initial spawn", r"^GameRunned:"),
+]
+MILESTONE_RE = [(n, re.compile(rx)) for n, rx in MILESTONES]
+
+REQ = re.compile(r"---> Request HTTPS, id \[(\d+)\]: URL: \S*?(/\S+?)\.?\s*$")
+RSP = re.compile(r"<--- Response HTTPS, id \[(\d+)\]: URL: \S*?(/\S+?), "
+                 r"DownloadSeconds: ([0-9.]+), ParseSeconds: ([0-9.]+)")
+AIDATA = re.compile(r"AIDATA create")
+
+
+def union_seconds(intervals):
+    """Total length covered by a set of [a,b] intervals, overlaps counted once."""
+    tot = 0.0
+    cur_a = cur_b = None
+    for a, b in sorted(intervals):
+        if cur_b is None or a > cur_b:
+            if cur_b is not None:
+                tot += cur_b - cur_a
+            cur_a, cur_b = a, b
+        elif b > cur_b:
+            cur_b = b
+    if cur_b is not None:
+        tot += cur_b - cur_a
+    return tot
+
+
+def phase_table(rows):
+    """Cut launch -> GameRunned at the milestones; attribute each phase.
+
+    Returns (phases, reached_end). Each phase is a dict: name, start_s,
+    seconds, server_s, parse_s, bots, requests, biggest_gap (g, before, after).
+    Requests are keyed by id so the same line mirrored into both
+    application_000.log and output_000.log is counted once; bot lines are
+    deduplicated by (timestamp, message) for the same reason.
+    """
+    t0 = rows[0][0]
+    bounds = []
+    idx = 0
+    for i, (_t, _ch, msg) in enumerate(rows):
+        if idx >= len(MILESTONE_RE):
+            break
+        name, rx = MILESTONE_RE[idx]
+        if rx.search(msg):
+            bounds.append((name, i))
+            idx += 1
+    reached_end = idx == len(MILESTONE_RE)
+
+    reqs = {}
+    for t, _ch, msg in rows:
+        m = REQ.search(msg)
+        if m:
+            reqs.setdefault(m.group(1), [t, None, m.group(2), 0.0])
+            continue
+        m = RSP.search(msg)
+        if m:
+            r = reqs.setdefault(m.group(1), [t, None, m.group(2), 0.0])
+            if r[1] is None:
+                r[1] = t
+                r[3] = float(m.group(4))
+
+    phases = []
+    start_i = 0
+    for name, end_i in bounds:
+        ts, te = rows[start_i][0], rows[end_i][0]
+        sec = (te - ts).total_seconds()
+        ivals = []
+        parse = 0.0
+        nreq = 0
+        for _rid, (a, b, _route, ps) in reqs.items():
+            if ts <= a < te:
+                nreq += 1
+                parse += ps
+                if b is not None:
+                    # the "<--- Response" line is written AFTER the client has
+                    # parsed the body, so the server interval ends ParseSeconds
+                    # earlier than the line's timestamp; otherwise every big
+                    # payload is double-counted as server AND parse.
+                    end = (b - t0).total_seconds() - ps
+                    ivals.append(((a - t0).total_seconds(), max(end, (a - t0).total_seconds())))
+        seen = set()
+        bots = 0
+        for t, _c, m in rows[start_i:end_i]:
+            if AIDATA.search(m) and (t, m) not in seen:
+                seen.add((t, m))
+                bots += 1
+        big = (0.0, None, None)
+        for i in range(start_i + 1, end_i + 1):
+            g = (rows[i][0] - rows[i - 1][0]).total_seconds()
+            if g > big[0]:
+                big = (g, rows[i - 1][2], rows[i][2])
+        phases.append({
+            "name": name, "start_s": (ts - t0).total_seconds(), "seconds": sec,
+            "server_s": union_seconds(ivals), "parse_s": parse, "bots": bots,
+            "requests": nreq, "biggest_gap": big,
+        })
+        start_i = end_i
+    return phases, reached_end
+
+
+def print_phases(phases, reached_end, label):
+    bar = "-" * 78
+    total = sum(p["seconds"] for p in phases)
+    print(bar)
+    print(" %s" % label)
+    if reached_end:
+        print(" launch -> GameRunned (deployed): %.1fs" % total)
+    else:
+        got = [p["name"] for p in phases]
+        print(" INCONCLUSIVE: GameRunned never logged; reached only: %s (%.1fs)"
+              % (", ".join(got) or "nothing", total))
+    print(bar)
+    print(" %-14s %7s %5s | %7s %7s %7s | %4s %4s  biggest silence"
+          % ("phase", "sec", "%", "server", "parse", "client", "bots", "req"))
+    for p in phases:
+        client = max(0.0, p["seconds"] - p["server_s"] - p["parse_s"])
+        pct = 100.0 * p["seconds"] / total if total else 0
+        g = p["biggest_gap"][0]
+        print(" %-14s %7.1f %4.0f%% | %7.1f %7.1f %7.1f | %4d %4d  %.1fs"
+              % (p["name"], p["seconds"], pct, p["server_s"], p["parse_s"],
+                 client, p["bots"], p["requests"], g))
+    srv = sum(p["server_s"] for p in phases)
+    prs = sum(p["parse_s"] for p in phases)
+    rest = total - srv - prs
+    print(bar)
+    print(" buckets: server(upper bound) %.1fs %.0f%% | parse %.1fs %.0f%% | client %.1fs %.0f%%"
+          % (srv, 100.0 * srv / total if total else 0,
+             prs, 100.0 * prs / total if total else 0,
+             rest, 100.0 * rest / total if total else 0))
+    print(" 'server' is request->response wall (server + transfer), overlapping")
+    print(" requests counted once; 'parse' is the client's own ParseSeconds.")
+    print(bar)
+
+
+def print_compare(pa, ea, la, pb, eb, lb):
+    bar = "-" * 78
+    print(bar)
+    print(" OLD: %s" % la)
+    print(" NEW: %s" % lb)
+    ta = sum(p["seconds"] for p in pa)
+    tb = sum(p["seconds"] for p in pb)
+    if ea and eb:
+        print(" launch -> GameRunned: %.1fs -> %.1fs  (%+.1fs, %+.0f%%)"
+              % (ta, tb, tb - ta, 100.0 * (tb - ta) / ta if ta else 0))
+    else:
+        who = "both" if not ea and not eb else ("OLD" if not ea else "NEW")
+        print(" INCONCLUSIVE: %s did not reach GameRunned; partial phases only" % who)
+    print(bar)
+    print(" %-14s %8s %8s %8s | %7s %7s | %5s %5s"
+          % ("phase", "old", "new", "delta", "srv old", "srv new", "bots", "bots"))
+    da = {p["name"]: p for p in pa}
+    db = {p["name"]: p for p in pb}
+    nan = float("nan")
+    for name, _rx in MILESTONES:
+        a, b = da.get(name), db.get(name)
+        if a is None and b is None:
+            continue
+        sa = a["seconds"] if a else nan
+        sb = b["seconds"] if b else nan
+        print(" %-14s %8.1f %8.1f %+8.1f | %7.1f %7.1f | %5s %5s"
+              % (name, sa, sb, sb - sa,
+                 a["server_s"] if a else nan, b["server_s"] if b else nan,
+                 a["bots"] if a else "-", b["bots"] if b else "-"))
+    print(bar)
+
+
+def load_session(root, name):
+    d = os.path.join(root, name) if name else newest_session(root)
+    if not d or not os.path.isdir(d):
+        return None, []
+    paths = [f for f in glob.glob(os.path.join(d, "*.log"))
+             if f.endswith(("application_000.log", "output_000.log"))]
+    return d, parse(paths)
+
+
 def main():
     p = argparse.ArgumentParser(
         description="where the time goes between launch and being in a raid",
@@ -110,7 +321,23 @@ def main():
     p.add_argument("--session", default=None)
     p.add_argument("--top", type=int, default=12)
     p.add_argument("--json", action="store_true")
+    p.add_argument("--phases", action="store_true",
+                   help="launch -> GameRunned cut at the client's milestones, "
+                        "each phase split into server / parse / client")
+    p.add_argument("--compare", nargs=2, metavar=("OLD", "NEW"),
+                   help="phase table of two sessions side by side with deltas")
     a = p.parse_args()
+
+    if a.compare:
+        da, ra = load_session(a.logs, a.compare[0])
+        db_, rb = load_session(a.logs, a.compare[1])
+        if len(ra) < 2 or len(rb) < 2:
+            print("INCONCLUSIVE: a session is missing or has no timestamped lines")
+            return 3
+        pa, ea = phase_table(ra)
+        pb, eb = phase_table(rb)
+        print_compare(pa, ea, os.path.basename(da), pb, eb, os.path.basename(db_))
+        return 0 if (ea and eb) else 3
 
     d = os.path.join(a.logs, a.session) if a.session else newest_session(a.logs)
     if not d or not os.path.isdir(d):
@@ -127,6 +354,23 @@ def main():
 
     t0, t1 = rows[0][0], rows[-1][0]
     total = (t1 - t0).total_seconds()
+
+    if a.phases:
+        phases, reached = phase_table(rows)
+        if a.json:
+            out = []
+            for ph in phases:
+                o = dict(ph)
+                o["biggest_gap"] = round(ph["biggest_gap"][0], 2)
+                for k in ("start_s", "seconds", "server_s", "parse_s"):
+                    o[k] = round(o[k], 2)
+                out.append(o)
+            print(jsonmod.dumps({"session": os.path.basename(d),
+                                 "reached_gamerunned": reached, "phases": out},
+                                separators=(",", ":")))
+            return 0 if reached else 3
+        print_phases(phases, reached, os.path.basename(d))
+        return 0 if reached else 3
 
     gaps = []
     for i in range(1, len(rows)):

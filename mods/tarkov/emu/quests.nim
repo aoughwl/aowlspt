@@ -188,6 +188,9 @@ proc freshIds*(itemsJson: string): string =
     out1.add d
   result = text(out1)
 
+var gRefreshId = ""
+var gRefreshText = ""
+
 proc refreshAvailability*(p: var Profile; nowSeconds: int): int =
   ## The ENTRY POINT of the quest chain.
   ##
@@ -208,6 +211,21 @@ proc refreshAvailability*(p: var Profile; nowSeconds: int): int =
   ## frame. It is NOT paid per condition-evaluation: the table is taken apart
   ## once with `members`, for the reason `unlockFollowUps` documents.
   result = 0
+  # Nothing has happened to this profile since the last pass, so this pass has
+  # nothing to find.
+  #
+  # The pass is idempotent by design -- it only ever moves a quest out of
+  # absent/`Locked` -- which means running it against a profile document byte
+  # for byte identical to the one it last ran against cannot produce a
+  # different answer. `/client/quest/list` calls it on EVERY menu load, and a
+  # menu load does not change the profile, so in the steady state this is the
+  # whole cost of the route. The key is the profile TEXT, not its id or a
+  # revision counter, so a change to the profile from any direction misses.
+  # The one input it does NOT key on is `templates.quests` itself: a `dbPatch`
+  # of the quest table while the server is up would not be seen. That is
+  # stated rather than defended -- nothing in this emulator patches it.
+  if p.id.len > 0 and p.id == gRefreshId and p.text == gRefreshText:
+    return 0
   let all = dbRead("templates.quests")
   if not all.ok or all.raw.len == 0:
     return
@@ -217,9 +235,26 @@ proc refreshAvailability*(p: var Profile; nowSeconds: int): int =
   var list = parseArray(p.field("Quests").raw())
   if not list.ok:
     list = newList()
+  # The profile's quest states, read once rather than re-scanned per template.
+  # `questStatus` walks the profile's whole `Quests` array from the front, and
+  # this loop runs it 558 times; see `questListFor` for the measurement.
+  var sIds: seq[string] = @[]
+  var sStates: seq[string] = @[]
+  let mine0 = field(p.text, "Quests")
+  if mine0.found:
+    for e in each(mine0):
+      let id0 = e.field("qid").asText("")
+      if id0.len == 0:
+        continue
+      sIds.add id0
+      sStates.add e.field("status").asText("")
   var changed = false
   for m in table.fields:
-    let status = questStatus(p.text, m.name)
+    var status = ""
+    for k in 0 ..< sIds.len:
+      if sIds[k] == m.name:
+        status = sStates[k]
+        break
     # Empty and `Locked` are both "not decided in the player's favour yet".
     # Anything else is a state the player reached and must keep.
     if status.len > 0 and status != "Locked":
@@ -239,6 +274,11 @@ proc refreshAvailability*(p: var Profile; nowSeconds: int): int =
     inc result
   if changed:
     setTopLevel(p, "Quests", text(list))
+  # Remembered AFTER the write, so the memo holds the text a *later* call will
+  # actually arrive with. Remembering the input instead would memo a document
+  # that no longer exists and the skip above would never fire.
+  gRefreshId = p.id
+  gRefreshText = p.text
 
 proc unlockFollowUps(p: var Profile; qid: string; nowSeconds: int): int =
   ## Marks every quest that was waiting on this one as available.
@@ -838,6 +878,31 @@ proc questListFor*(p: Profile): string =
   let list = parseArray(base)
   if not list.ok:
     return base
+
+  # The profile's quest states, read ONCE.
+  #
+  # This used to call `questStatus(p.text, qid)` inside the loop below, and
+  # that proc re-locates `Quests` in the profile text and walks the whole array
+  # from the start. With 558 templates against a profile carrying a few hundred
+  # entries that is a quadratic scan over a ~200 KB document, and it was the
+  # cost of the route: MEASURED with `tools/loadpathbench.py`, `/client/quest/
+  # list` took 2004 ms on the first request and 1803 ms on the second -- i.e.
+  # essentially all of it was this, not serialization and not the deflate.
+  #
+  # Same answer, one pass. `questStatus` is left exactly as it is: it is the
+  # right shape for its other callers, which ask about one quest.
+  var qIds: seq[string] = @[]
+  var qCodes: seq[int] = @[]
+  let mine = field(p.text, "Quests")
+  if mine.found:
+    for e in each(mine):
+      let id = e.field("qid").asText("")
+      if id.len == 0:
+        continue
+      let c = statusCode(e.field("status").asText(""))
+      qIds.add id
+      qCodes.add(if c >= 0: c else: 0)
+
   var out1 = newList()
   for i in 0 ..< list.len:
     var d = parseObject(list.items[i])
@@ -846,11 +911,10 @@ proc questListFor*(p: Profile): string =
     let qid = get(d, "_id").asText("")
     var code = 0
     if qid.len > 0:
-      let s = questStatus(p.text, qid)
-      if s.len > 0:
-        let c = statusCode(s)
-        if c >= 0:
-          code = c
+      for k in 0 ..< qIds.len:
+        if qIds[k] == qid:
+          code = qCodes[k]
+          break
     setNumber(d, "status", code)
     out1.add d
   result = text(out1)

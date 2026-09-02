@@ -6137,3 +6137,15 @@ schema fetch exactly in the character-select window that modsindex.nim
 already documents as the crasher. Fix applied: `modSettingsRender off` in
 the deployed config (it is default OFF in code; the deployed file had it ON).
 The MODS tab's data comes from the lazy single-request `modsindex` path.
+
+## 2026-09-01 late: `run.py` without `--keep` STOPS THE CLIENT when its verdict lands
+
+MEASURED twice. `tools/run.py --until-phase MENU` prints `REACHED ... parked
+at the menu` and then, because `--keep` was not given, force-stops
+EscapeFromTarkov, the backend and the launcher. Read afterwards, that looks
+exactly like a clean crash: host log ends on an ordinary heartbeat, client
+log ends at the menu GC, no crash folder, no popup. Twenty minutes were spent
+hunting a "death" that was the harness's own teardown. Rule: a boot that the
+coordinator intends to keep driving is `run.py --keep ...`; and before calling
+any disappearance a crash, check whether a run.py without `--keep` exited at
+that second.

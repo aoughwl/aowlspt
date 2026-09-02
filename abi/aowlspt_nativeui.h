@@ -583,6 +583,40 @@ typedef struct AowlNuTarget {
  * 0x628110 universal stub. Both are CALLED, never detoured. */
 #define AOWL_NU_TR_SETASLASTSIB       53
 #define AOWL_NU_TR_GETSIBLINGINDEX    54
+/* --- NATIVE TABS (indices 55..61) -- see docs/NATIVETABS.md ---------------
+ *
+ * The foundation that replaces the clone-a-strip approach: a tab is a real
+ * `UIAnimatedToggleSpawner` in the stock ToggleGroup plus a real cloned
+ * SettingsTab panel, emptied of its stock rows, whose own LayoutGroup lays out
+ * the prefab rows we add. Geometry stops being ours to negotiate.
+ *
+ * PROVENANCE, every row: il2cpp_resolve.py typemethods <T> -> RVA and
+ * sharedness; bytes <RVA> 16 -> the sig below. None is the 0x628110 universal
+ * stub; all are in the `il2cpp` section.
+ *
+ * TWO ARE SHARED AND ARE CALLED, NEVER DETOURED. `Behaviour::set_enabled` is
+ * SHARED x32. Calling a shared RVA is correct -- it is the right code for the
+ * receiver in RCX. Detouring one has unbounded blast radius. These are calls.
+ *
+ * THE TOGGLE EVENT TARGET IS `Set`, NOT `set_isOn`, AND THAT IS A CORRECTION.
+ * `set_isOn` @0x55BA430 is an ELEVEN-BYTE TAIL-JUMP THUNK:
+ *     45 33 C9  41 B0 01  E9 15 00 00 00  CC CC CC CC CC
+ *     xor r9d,r9d ; mov r8b,1 ; jmp +0x15   then padding
+ * `SetIsOnWithoutNotify` @0x55BA440 is the same shape. Stealing 16 bytes there
+ * would overwrite past the end of the function and the trampoline would have
+ * to relocate a rel32 -- a detour engine that does not is silently wrong.
+ * Both thunks jump to `Toggle::Set(bool value, bool sendCallback)`
+ * @0x55BA450, which is UNIQUE and has a real 16-byte prologue. That is the
+ * hook, and it is SELF-GUARDING: `sendCallback` (R8B) is TRUE for a real user
+ * press and FALSE for `SetIsOnWithoutNotify`, which is what our own
+ * `modsSetToggleQuiet` calls -- so our writes cannot re-enter our own hook. */
+#define AOWL_NU_BEHAVIOUR_SET_ENABLED 55
+#define AOWL_NU_SPAWNER_SPAWNOBJECT   56
+#define AOWL_NU_SPAWNER_SETHEADER     57
+#define AOWL_NU_SPAWNER_SETACTIVE     58
+#define AOWL_NU_TAB_CLEANUPCONTROLS   59
+#define AOWL_NU_TOGGLE_SET_GROUP      60
+#define AOWL_NU_TOGGLE_SET            61
 
 /* UnityEngine.RenderMode. Named, because `0` appearing bare in a refusal is
  * indistinguishable from "we did not read anything". */
@@ -822,6 +856,29 @@ static const AowlNuTarget aowl_nu_targets[] = {
     { "UnityEngine.Transform::GetSiblingIndex", 0x52B9DF0u,
       { 0x40,0x53,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,0xD3,0xAD,0xE1,0x01,
         0x48,0x8B,0xD9 }, 16 },
+    /* --- native tabs. See AOWL_NU_BEHAVIOUR_SET_ENABLED. --- */
+    { "UnityEngine.Behaviour::set_enabled", 0xC4C760u,
+      { 0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,
+        0x4F,0x7D,0x48 }, 16 },
+    { "EFT.UI.UIAnimatedToggleSpawner::SpawnObject", 0x16BC7F0u,
+      { 0x48,0x89,0x5C,0x24,0x10,0x57,0x48,0x83,0xEC,0x20,0x80,0x3D,0xAC,
+        0x19,0xA0,0x05 }, 16 },
+    { "EFT.UI.UIAnimatedToggleSpawner::SetHeaderText", 0x16BCC30u,
+      { 0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x30,0x83,0x3D,0xFF,
+        0x98,0x9F,0x05 }, 16 },
+    { "EFT.UI.UIAnimatedToggleSpawner::SetActive", 0x16BCCE0u,
+      { 0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x74,0x24,0x10,0x57,0x48,0x83,
+        0xEC,0x20,0x80 }, 16 },
+    { "EFT.UI.Settings.SettingsTab::CleanupCreatedControls", 0x171BE50u,
+      { 0x48,0x89,0x5C,0x24,0x10,0x48,0x89,0x4C,0x24,0x08,0x57,0x48,0x83,
+        0xEC,0x60,0x48 }, 16 },
+    { "UnityEngine.UI.Toggle::set_group", 0x55B9D30u,
+      { 0x40,0x53,0x48,0x83,0xEC,0x20,0x45,0x33,0xC9,0x41,0xB0,0x01,0x48,
+        0x8B,0xD9,0xE8 }, 16 },
+    /* THE TOGGLE EVENT. `Set`, not `set_isOn` -- see the block comment. */
+    { "UnityEngine.UI.Toggle::Set", 0x55BA450u,
+      { 0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x74,0x24,0x10,0x57,0x48,0x83,
+        0xEC,0x20,0x80 }, 16 },
 };
 
 #define AOWL_NU_TARGET_COUNT \

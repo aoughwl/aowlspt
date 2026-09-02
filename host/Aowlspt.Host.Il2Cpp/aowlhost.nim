@@ -7828,8 +7828,7 @@ include "modsettingsrender.nim"
 ## THE MODS TAB'S DATA. AFTER `modsettingsrender.nim` because it reuses that
 ## file's `modSetParseF64`, and after `settingspages.nim` for `SwPage`/`SwRow`/
 ## `swPageRegister`. `modstab.nim` forward-declares `miArm`/`miTick`.
-when false:
-  include "modsindex.nim"
+include "modsindex.nim"
 
 ## STEP 1 of docs/NATIVETABS.md. After `modstab.nim` for `modsClone` /
 ## `modsComponent` / `modsSetParent` / `modsGoActive`, and after `nativeui.nim`

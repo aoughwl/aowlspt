@@ -20,6 +20,12 @@
   "cultistsEnabled": true,
   "bossSlotExclusive": true,
 
+  "_stagedStartComment": "Staged raid start. OFF = the table this emulator always served (12 waves at Time:-1, 40 bots, every rolled boss immediate). ON = same waves, same bots, but at most stagedStartInitialBots stay on the synchronous arm; the rest land from stagedStartFirstDelaySec on, immediate bosses get stagedStartBossDelaySec, and the map's own BotStart is restored. Measured why: docs/MOD-PERF.md.",
+  "stagedStart": false,
+  "stagedStartInitialBots": 0,
+  "stagedStartFirstDelaySec": 20,
+  "stagedStartBossDelaySec": 45,
+
   "_lootComment": "The Loot page. Every default below is the behaviour this emulator shipped with, so an untouched config generates the same floor it always did -- emu/loot.selfCheck asserts exactly that ('every new knob at its default reproduces the previous floor EXACTLY'). lootPreset is MOMENTARY (it writes the rows below and the page then shows what it wrote) and lootSummary is written BY the server, the same way spawnNow/spawnResult work. Docs: docs/LOOT-CONFIG.md.",
   "lootPreset": "custom",
   "lootSummary": "",

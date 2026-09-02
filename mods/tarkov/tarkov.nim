@@ -132,6 +132,8 @@ const
   AssetUrl = "http://127.0.0.1"
 
 var gRequests = 0
+var gDeployNoted = false
+  ## One `/client/globals` readback per process; see `onGlobals`.
 
 # Is a raid being played right now?
 #
@@ -1417,7 +1419,29 @@ proc onGlobals(url, body, session: string): string =
   ## ballistics, stamina, malfunction, skill and flea-market code parses at
   ## session start. `applyGlobalTunes` returns its argument unchanged, without
   ## reparsing it, when nothing is overridden -- see `emu/tuning`.
-  result = envelope(raw(applyGlobalTunes(applyGlobalsGaps(globals()))))
+  let served = applyGlobalTunes(applyGlobalsGaps(globals()))
+  # The readback, once per process, and it reads the BYTES that are about to go
+  # out rather than the config key that was supposed to change them.
+  #
+  # `TimeBeforeDeployLocal` is the raid deploy countdown, and MEASURED by the
+  # client-log agent it is a FIXED 10 s inside the 21.7 s GamePooled ->
+  # GameRunned tail in all three sessions. It is already an exposed server
+  # value modifier -- `g_TimeBeforeDeployLocal` in `emu/globaltunedata`,
+  # 0..100, unset = whatever db.json holds -- so there is nothing new to add
+  # and nothing to default ON. What was missing is the half that can fail:
+  # a line saying what the client was actually handed. If this prints 10 while
+  # config.json says 3, the override did not reach the wire.
+  if not gDeployNoted:
+    gDeployNoted = true
+    let cfg = field(served, "config.TimeBeforeDeployLocal")
+    if cfg.found:
+      info "globals: TimeBeforeDeployLocal served as " & $cfg.asInt(-1) &
+           " s (set g_TimeBeforeDeployLocal in mods/tarkov/config.json to " &
+           "change it; unset is vanilla)"
+    else:
+      warn "globals: the served document has no config.TimeBeforeDeployLocal " &
+           "-- the deploy countdown cannot be read back from it"
+  result = envelope(raw(served))
 proc onHandbook(url, body, session: string): string = envelope(raw(handbook()))
 proc onCustomization(url, body, session: string): string =
   envelope(raw(customization()))
@@ -3565,6 +3589,22 @@ proc tarkovSchema(): seq[Setting] =
                 category = "Bots/Bosses",
       description = "aowlspt original (server emulator); acts on the post-1.0 location table. Bosses that compete for a map's boss slot -- Shturman OR the Goons on Woods, Reshala OR Wedge on Customs -- are rolled in the table's order and the first winner takes the slot. Off lets every one of them roll independently, which is the pre-fix behaviour and can put four boss groups in one raid. Partisan and the Cultists are not part of the slot and always roll on their own."),
 
+    boolSetting("stagedStart", "Staged raid start (defer extra waves)", false,
+                category = "Bots/Spawns", appliesOn = "next raid",
+      description = "aowlspt original (server emulator); acts on the post-1.0 location table. OFF serves the pre-existing table: 12 waves at Time:-1 (40 bots) plus every rolled boss, all placed synchronously while the raid loads -- measured at 41.9-49.5 s from PlayerSpawnEvent to GameRunned on Woods (docs/MOD-PERF.md). ON keeps the SAME waves and the SAME bots per raid but leaves at most 'Staged start: bots at start' on the synchronous arm and moves the rest to the timer arm from 'Staged start: first delay' onward, gives every immediate boss 'Staged start: boss delay', and restores the map's own BotStart (the non-wave spawner the client refuses at 0). The served table is logged per map as 'staged-start readback'."),
+    intSetting("stagedStartInitialBots", "Staged start: bots at start", 0,
+               lo = 0, hi = 60, step = 2, category = "Bots/Spawns",
+               appliesOn = "next raid",
+      description = "aowlspt original (server emulator). How many bots stay on the synchronous Time:-1 arm when staged start is ON. 0 means the map's own vanilla at-start total (Woods: 8), never below 4 (one wave)."),
+    intSetting("stagedStartFirstDelaySec", "Staged start: first delay (s)", 20,
+               lo = 5, hi = 300, step = 5, category = "Bots/Spawns",
+               appliesOn = "next raid",
+      description = "aowlspt original (server emulator). time_min of the first deferred wave; each further deferred wave lands 10 s later. 20 s puts the first one right after the 10 s deploy countdown."),
+    intSetting("stagedStartBossDelaySec", "Staged start: boss delay (s)", 45,
+               lo = 0, hi = 600, step = 5, category = "Bots/Spawns",
+               appliesOn = "next raid",
+      description = "aowlspt original (server emulator). The Time written on every rolled boss that the table ships at Time:-1 (Shturman, the Goons, the Cultists); a boss already on its own clock (Partisan at 900) or on a trigger is left alone. INFERRED from Partisan's own Time being honoured; the boss-roll log names the Time each kept boss was served with."),
+
     boolSetting("lootEnabled", "Loot enabled", true, category = "Loot/Global",
       description = "aowlspt original (server emulator); acts on the SPT-derived database. The master switch. Off means every map serves an empty floor, and the server says so in its log rather than serving a silent []."),
     floatSetting("lootGlobalMultiplier", "Global loot multiplier", 1.0,
@@ -4464,6 +4504,10 @@ proc onTarkovApply(key: string) =
   if key.startsWith("stash") or key.startsWith("raid") or
      key.startsWith("extracts") or key == "progressionExperience":
     applySvmSettings()
+  # The staged-start rows: one call reads all four and drops the tuned-
+  # locations cache only if something changed (emu/raid.applyStagedStartSettings).
+  if key.startsWith("stagedStart"):
+    applyStagedStartSettings()
   if key.startsWith("progression"):
     configureProgression(setting("progressionPlayerLevel").asInt(0),
                          setting("progressionSkillLevel").asInt(0),
@@ -4825,6 +4869,7 @@ proc onLoad(): Status =
   # The non-globals SVM rows: stash size, exact XP, raid time, extracts. One
   # call, which is also the ledger's first run -- see `emu/svm`.
   applySvmSettings()
+  applyStagedStartSettings()
   configureMarket(setting("fleaSpreadPercent").asInt(20),
                   setting("fleaOfferHours").asInt(12),
                   setting("fleaMaxOffers").asInt(600),
@@ -4959,10 +5004,41 @@ proc onLoad(): Status =
   let all = allProfileIds()
   success "Tarkov emulator loaded, " & $all.len & " profile(s)"
   for id in all:
-    let p = loadProfile(id)
+    var p = loadProfile(id)
     if p.ok:
       info "  " & id & "  " & p.nickname & " (" & p.side & ", level " &
            $p.level & ")"
+      # The quest availability pass, paid HERE instead of on the player's
+      # login.
+      #
+      # `/client/quest/list` calls `refreshAvailability` on every menu load and
+      # the pass is a full condition evaluation over ~558 templates. MEASURED
+      # with `tools/loadpathbench.py`: the route cost 871 ms on its first
+      # request and 38 ms on its second, so the pass is essentially the whole
+      # of the first one -- and the first one is the one the client waits for
+      # while the menu is blank. Nothing about it needs a request: it depends
+      # on the profile and the database, both of which exist now.
+      #
+      # It is NOT removed from the route. This is a warm-up, not a
+      # replacement: a profile the client creates later, or one that changes,
+      # still gets the pass where it always got it, and `refreshAvailability`
+      # memoises on the profile text so the request-time call is then a
+      # comparison instead of a scan.
+      let opened = refreshAvailability(p, nowSeconds())
+      # And the SERVED array, for the same reason and with a separate
+      # measurement: `emu/templates.questList` builds a 3.4 MB array out of the
+      # id-keyed table on its first call, and `questListFor` then parses it and
+      # 558 objects. MEASURED: with this line absent, the first
+      # `/client/quest/list` cost 862 ms even with the availability pass
+      # already done at load. The result is thrown away -- what is kept is the
+      # `questList()` memo it builds on the way.
+      discard questListFor(p)
+      if opened > 0:
+        if saveProfile(p):
+          info "  " & id & "  " & $opened & " quest(s) opened at load"
+        else:
+          warn "could not save " & id & " after opening " & $opened &
+               " quest(s) at load"
   Ok
 
 proc onUnload(): Status =

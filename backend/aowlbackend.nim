@@ -1886,6 +1886,19 @@ type
     err: string
     stampMs: int64
     live: bool
+    ## The RESOLVED values, not just the document.
+    ##
+    ## Caching the document alone took a bot batch from 469 ms of setup to
+    ## 170 ms and no further, because each of the ~700 reads still copied the
+    ## 41 KB document out of the cache and then scanned it for one key. The
+    ## keys are the same 700 every batch and the document has not changed, so
+    ## the answer has not either. Parallel seqs rather than a table: nothing
+    ## else in this file uses `std/tables`, the set is bounded by the mod's own
+    ## schema, and a linear scan of a few hundred short strings is nothing
+    ## against the scan it replaces.
+    keys: seq[string]
+    vals: seq[string]
+    stats: seq[int32]
 
 var gConfigCache: array[ConfigCacheMods, ConfigCacheEntry]
 
@@ -1912,9 +1925,48 @@ proc configReadCached(idx: int; text: var string; err: var string): int32 =
   let st = configRead(idx, text, err)
   cLock()
   gConfigCache[idx] = ConfigCacheEntry(text: text, status: st, err: err,
-                                       stampMs: now, live: true)
+                                       stampMs: now, live: true,
+                                       keys: @[], vals: @[], stats: @[])
   cUnlock()
   result = st
+
+proc configValueCached(idx: int; key: string; into: var string;
+                       hit: var bool): int32 =
+  ## One resolved key out of the live document cache, or `hit = false` when
+  ## this key has not been looked up since the document was read.
+  ##
+  ## Only ever consulted while the entry it belongs to is live, so it cannot
+  ## outlive the document it was resolved from -- the memo is a field OF the
+  ## entry and is thrown away with it, by `configDrop` and by the TTL alike.
+  hit = false
+  result = ErrNotFound
+  if idx < 0 or idx >= ConfigCacheMods or key.len == 0:
+    return
+  cLock()
+  if gConfigCache[idx].live:
+    for i in 0 ..< gConfigCache[idx].keys.len:
+      if gConfigCache[idx].keys[i] == key:
+        into = gConfigCache[idx].vals[i]
+        result = gConfigCache[idx].stats[i]
+        hit = true
+        break
+  cUnlock()
+
+proc configValueRemember(idx: int; key, value: string; st: int32) =
+  if idx < 0 or idx >= ConfigCacheMods or key.len == 0:
+    return
+  cLock()
+  if gConfigCache[idx].live:
+    var seen = false
+    for i in 0 ..< gConfigCache[idx].keys.len:
+      if gConfigCache[idx].keys[i] == key:
+        seen = true
+        break
+    if not seen:
+      gConfigCache[idx].keys.add key
+      gConfigCache[idx].vals.add value
+      gConfigCache[idx].stats.add st
+  cUnlock()
 
 proc hostConfigGet(ctx: HostPtr; key: HostPtr; keyLen: int32;
                    outPtr, outLen: HostPtr): int32 {.
@@ -1929,6 +1981,20 @@ proc hostConfigGet(ctx: HostPtr; key: HostPtr; keyLen: int32;
   # to answer "no such key" for a document no key could ever come out of. A mod
   # that falls back to its defaults on any failure, which is most of them, then
   # ran a whole session on defaults with nothing anywhere saying so.
+  # The resolved-value memo, checked before the document is even copied out of
+  # the cache. This is the whole win for the generators: `botGearConfig` +
+  # `modRarityConfig` are ~700 reads of the same ~700 keys per bot batch.
+  if k.len > 0:
+    var memo = ""
+    var memoHit = false
+    let memoSt = configValueCached(idx, k, memo, memoHit)
+    if memoHit:
+      if memoSt != StatusOk:
+        gLastError = "no such key: " & k
+        return memoSt
+      return cOutCopy(outPtr, outLen, cast[HostPtr](toCString(memo)),
+                      int32(memo.len))
+
   var text = ""
   var err = ""
   let st = configReadCached(idx, text, err)
@@ -1948,8 +2014,15 @@ proc hostConfigGet(ctx: HostPtr; key: HostPtr; keyLen: int32;
   if k.len == 0:
     value = text
   elif not pathGet(text, k, value):
+    # Remembered as ABSENT, not just skipped. A key the file does not hold is
+    # the common case for a generator knob -- the settings page writes a key
+    # only when somebody edits it -- so caching only the hits would leave the
+    # majority of the 700 reads scanning the document every time.
+    configValueRemember(idx, k, "", ErrNotFound)
     gLastError = "no such key: " & k
     return ErrNotFound
+  if k.len > 0:
+    configValueRemember(idx, k, value, StatusOk)
   # `value` is handed to `cOutCopy` directly. It used to be copied into a local
   # `v` first, which on `templates.items` is a 4.25 MB allocation and copy that
   # nothing reads: `cOutCopy` takes a pointer and a length and does its own

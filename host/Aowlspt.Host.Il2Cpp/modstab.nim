@@ -126,7 +126,19 @@ const ModsOffLeFlexibleHeight = 0x38'i32
 ## Unity objects a bad page table could instantiate into a live screen. Raised
 ## from 5 to fit the built-in host pages (4) plus one subtab per fetched mod
 ## page (`modsBuildPages` appends those from `gSwPages`) with room to spare.
-const ModsMaxSubtabs = 8
+## RAISED FROM 8. There are 16 mods in the tree and `modsBuildPages` adds ~4
+## host pages of its own, so 8 silently dropped more than half the strip -- the
+## player saw a MODS tab that was simply missing pages, with nothing anywhere
+## saying so. 20 covers the current tree; the accounting above REPORTS an
+## overflow rather than hiding one, so the next person gets a number instead of
+## a mystery.
+##
+## HONEST LIMIT: this bounds how many buttons are BUILT, not how many fit. The
+## strip is the donor's width, so at 20 buttons it may overflow horizontally,
+## and nothing here can see that -- it needs a live look. Raising this trades a
+## silent drop for a possible visual overflow, which is the better failure of
+## the two because it is visible.
+const ModsMaxSubtabs = 20
 
 ## How many times the lazy build may be attempted before it gives up quietly.
 const ModsMaxBuildTries = 8
@@ -1026,10 +1038,22 @@ proc modsBuildPages(): seq[SwPage] =
   # (`modSetParseSchema`), so filtering on `modGuid.len > 0` picks out exactly
   # the fetched pages and none of the built-in ones above.
   var m = 0
-  while m < gSwPages.len and result.len < ModsMaxSubtabs:
+  var modPages = 0
+  while m < gSwPages.len:
     if gSwPages[m].modGuid.len > 0:
-      result.add gSwPages[m]
+      modPages = modPages + 1
+      if result.len < ModsMaxSubtabs:
+        result.add gSwPages[m]
     m = m + 1
+  # NEVER A SILENT CAP. There are 16 mods in the tree and this used to stop at
+  # `ModsMaxSubtabs` without a word, so the player saw a MODS tab that was
+  # simply missing pages with nothing anywhere saying so.
+  if modPages + 1 > ModsMaxSubtabs:
+    warn "mods tab: " & $modPages & " mod page(s) are registered plus the " &
+         "host's own, and the strip holds " & $ModsMaxSubtabs & ". " &
+         $(modPages + 1 - ModsMaxSubtabs) & " page(s) are NOT reachable from " &
+         "the strip. This is a real limit being reported, not a truncation " &
+         "being hidden -- raise ModsMaxSubtabs or page the strip."
 
 # ---------------------------------------------------------------------------
 # The build. Runs at most once, from the live SettingsScreen, and every step
@@ -1773,6 +1797,10 @@ proc modsTabTickBody() =
   modsCrumb("STAGE: entered modsTabTickBody")
   if not gModsOn or gModsFaults >= ModsMaxFaults:
     return
+  # THE MODS INDEX FETCH, one bounded step, inside THIS guard -- `aowl_p_p_seh`
+  # is not re-entrant and `modsindex.nim` opens none of its own. Before the tab
+  # has ever been opened, and after the fetch finishes, this is one enum test.
+  miTick(cNowMs())
   if not gModsBuilt:
     # Build lazily, once the settings screen has been opened onto the tab whose
     # rows we clone. GATE ON THE SAME POINTER THE BUILD USES: a guard naming a
@@ -1797,6 +1825,11 @@ proc modsTabTickBody() =
         modsRestoreStockPanels()        # never leave the screen with nothing up
         return
       gModsShown = true
+      # THE ONLY PLACE THE FETCH IS ARMED. Lazily, on the show edge, so a
+      # session that never opens MODS pays nothing -- no request, no slot
+      # borrow, no parse. `miArm` is idempotent (it returns unless the phase is
+      # still `miIdle`), so re-opening the tab does not re-fetch.
+      miArm(cNowMs())
       if not gModsSaidShown:
         gModsSaidShown = true
         okLog "mods tab: the MODS panel is showing; " & $gModsHidden.len &
@@ -2983,6 +3016,24 @@ const GfxMaxStockWatch = 16
 ## what is inside the PostFX one. Neither reaches into the other's state.
 proc pfxOnPanelUp(postUp: bool)
 proc pfxOnScreenClosed()
+
+## FORWARD DECLARATIONS into `modsindex.nim`, included AFTER this file because
+## it reuses `modSetParseF64` from `modsettingsrender.nim`, which is itself
+## included after modstab. Same device `postfxrows` uses above, and for the
+## same reason: nimony forward-resolves PROCS across an include boundary but
+## not variables or types, which is why both signatures are plain.
+##
+## `miArm` is called on the MODS panel's SHOW EDGE and nowhere else -- that is
+## the entire fix for the character-select crash, which is a timing defect: the
+## old path armed the same fetch at boot and held the shared sync slot through
+## the profile Submit.
+proc miArm(now: uint64)
+proc miTick(now: uint64)
+
+## FORWARD DECLARATIONS into `nativetabs.nim`, included after this file. Same
+## device as `postfxrows`/`modsindex` above.
+proc ntTickBody()
+proc ntTick()
 
 proc gfxNoteFault(what: string) =
   inc gGfxFaults
@@ -4733,6 +4784,8 @@ proc modsBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_mods_body", cdecl.} =
     betaNoticeFrom(gSeasonsMenu)
   elif gModsBranch == 4:
     gfxTickBody()
+  elif gModsBranch == 5:
+    ntTickBody()
 
 proc modsTabTick() =
   ## The rider's entry, called every frame from the shared
@@ -4885,6 +4938,7 @@ proc modsRidersTick(regs: Il2CppPtr) =
   verBrandTick()
   seasonsTick()
   gfxTick()
+  ntTick()
 
 proc bindModsTab(verbose: bool): bool =
   ## A RIDER on `EFT.UI.PreloaderUI::Update`, never a second detour on it: two

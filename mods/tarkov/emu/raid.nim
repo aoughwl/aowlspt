@@ -669,6 +669,68 @@ proc botPmcZonesFor(spawnPointParams: JsonRef): seq[string] =
     if not seen:
       result.add zn
 
+# ---------------------------------------------------------------------------
+# Staged start
+# ---------------------------------------------------------------------------
+#
+# MEASURED 2026-09-01, three Woods sessions (client output logs 12-10-54,
+# 13-52-07, 13-56-55): the table `offlineScavWavesWith` emits put 12 waves at
+# Time:-1 (8 x 4 assault + 4 x 2 PMC = 40 bots) plus every rolled boss on the
+# client's synchronous `Run(1)` arm, and the client created 43 / 41 / 42 AI
+# between GameCreated and GameRunned (`AIDATA create` minus the player).
+# Vanilla Woods ships 16 waves at -1 whose `slots_max` sum to 8. GameRunned IS
+# the end of the spawn phase (`GameSpawned` logs in the same millisecond) and
+# fired 41.9 / 47.2 / 49.5 s after PlayerSpawnEvent; the last pre-GameRunned
+# `ActivateBotCallback` came 16 / 10 / 17 s before GameRunned, and a fixed 10 s
+# deploy countdown (`globals.config.TimeBeforeDeployLocal`) sits inside that
+# tail. So the burst is ON the load path but is not the whole of it. The
+# numbers and the rules they prove are in `docs/MOD-PERF.md`.
+#
+# The policy keeps the SAME waves and the SAME bots per raid and moves only the
+# clock each wave is dispatched on: at most `initialBots` stay on the
+# synchronous arm, the rest go to the timer arm from `firstDelaySec` on, and a
+# rolled boss whose `Time` is -1 (immediate) is given `bossDelaySec`. Default
+# OFF, and `selfCheckRaid` pins the OFF table to the measured 12-at-minus-one
+# shape so turning the flag off is provably the previous behaviour.
+
+type
+  StagedStartPolicy* = object
+    enabled*: bool
+    initialBots*: int     ## bots kept at Time:-1; 0 = the map's own vanilla
+                          ## at-start slot total (floor 4 = one wave)
+    firstDelaySec*: int   ## time_min of the first deferred wave, seconds
+    bossDelaySec*: int    ## `Time` written on an immediate rolled boss
+
+  StagedStats* = object
+    ## The readback: counted from the EMITTED waves, never from the policy
+    ## that asked for them, so the log line describes the served table.
+    wavesAtStart*, botsAtStart*: int      ## Time:-1, the synchronous arm
+    wavesDeferred*, botsDeferred*: int    ## seed waves moved by staging
+    wavesTrickle*, botsTrickle*: int      ## the timer-arm waves that always were
+    firstDeferredSec*, lastDeferredSec*: int
+    vanillaAtStart*: int  ## what the base shipped at -1 (slots_max sum)
+    cap*: int             ## the at-start cap the policy resolved to; 0 = off
+
+proc defaultStagedStart*(): StagedStartPolicy =
+  StagedStartPolicy(enabled: false, initialBots: 0, firstDelaySec: 20,
+                    bossDelaySec: 45)
+
+var gStagedStart = defaultStagedStart()
+
+proc stagedStartPolicy*(): StagedStartPolicy = gStagedStart
+
+proc stagedCap*(pol: StagedStartPolicy; vanillaAtStart: int): int =
+  ## How many bots the synchronous arm may carry under `pol`; 0 when off.
+  if not pol.enabled: return 0
+  result = pol.initialBots
+  if result <= 0: result = vanillaAtStart
+  if result < 4: result = 4
+
+proc stagedTime(pol: StagedStartPolicy; deferredIdx: int): int =
+  ## time_min of the deferredIdx-th deferred wave: `firstDelaySec`, then 10 s
+  ## apart, so the timer arm never has to place two waves in one tick.
+  result = pol.firstDelaySec + deferredIdx * 10
+
 proc oneWave(number, tmin, tmax, smin, smax: int; zone: string;
              wildType = "assault"; botSide = "Savage"): JsonObject =
   ## One wave in BSG's own `waves[]` shape (capture seq 158). Every member the
@@ -707,9 +769,14 @@ proc oneWave(number, tmin, tmax, smin, smax: int; zone: string;
   put(w, "time_min", tmin)
   result = w
 
-proc offlineScavWaves(zones: seq[string]; pmcZones: seq[string] = @[]): string =
+proc offlineScavWavesWith*(zones: seq[string]; pmcZones: seq[string];
+                           pol: StagedStartPolicy; vanillaAtStart: int;
+                           stats: var StagedStats): string =
   ## Fresh assault waves that fill the map with scavs early and reliably,
-  ## replacing BSG's online-tuned table.
+  ## replacing BSG's online-tuned table. Pure: the same inputs give the same
+  ## table, which is what lets `selfCheckRaid` compare a staged table against
+  ## an unstaged one. `pol` decides which arm each wave takes (see "Staged
+  ## start" above); `stats` reports what was actually emitted.
   ##
   ## ## Which arm of the client actually places a wave
   ##
@@ -802,11 +869,16 @@ proc offlineScavWaves(zones: seq[string]; pmcZones: seq[string] = @[]): string =
                          ## more scavs than PMCs, PMCs a minority that is
                          ## actually present. Two USEC + two BEAR waves of span 2
                          ## is ~8 PMCs against ~16-32 scavs.
+  stats = StagedStats(vanillaAtStart: vanillaAtStart)
   var useZones = zones
   if useZones.len == 0:
     useZones = @[""]
   var a = arr()
   var number = 0
+  let cap = stagedCap(pol, vanillaAtStart)
+  stats.cap = cap
+  var atStart = 0        # bots already on the synchronous arm
+  var deferredIdx = 0    # deferred waves emitted so far; spaces the timer arm
   # The seed. Negative time, so these take `Run(1)` -- dispatched synchronously
   # while the raid is still loading, which is how BSG seeds a map and the one
   # arm that does not depend on the timer service. Four at minimum so a
@@ -817,8 +889,21 @@ proc offlineScavWaves(zones: seq[string]; pmcZones: seq[string] = @[]): string =
   if seeds < 4: seeds = 4
   if seeds > 8: seeds = 8
   while number < seeds:
-    a.add oneWave(number, -1, -1, perWave, perWave * 2,
-                  useZones[number mod useZones.len])
+    let zone = useZones[number mod useZones.len]
+    if cap == 0 or atStart + perWave <= cap:
+      a.add oneWave(number, -1, -1, perWave, perWave * 2, zone)
+      atStart += perWave
+      inc stats.wavesAtStart
+      stats.botsAtStart += perWave
+    else:
+      let t = stagedTime(pol, deferredIdx)
+      a.add oneWave(number, t, t + 10, perWave, perWave * 2, zone)
+      inc deferredIdx
+      inc stats.wavesDeferred
+      stats.botsDeferred += perWave
+      if stats.firstDeferredSec == 0 or t < stats.firstDeferredSec:
+        stats.firstDeferredSec = t
+      if t > stats.lastDeferredSec: stats.lastDeferredSec = t
     inc number
   # The PMCs. A stock offline raid served only `assault`/`Savage` waves, so it
   # spawned ~40 scavs, the bosses, and zero PMCs. The earlier attempt here --
@@ -850,12 +935,30 @@ proc offlineScavWaves(zones: seq[string]; pmcZones: seq[string] = @[]): string =
   var pmcUse = pmcZones
   if pmcUse.len > 0:
     var pmc = 0
-    while pmc < 2:
-      a.add oneWave(number, -1, -1, pmcWave, pmcWave * 2,
-                    pmcUse[number mod pmcUse.len], "pmcUSEC", "Usec")
-      inc number
-      a.add oneWave(number, -1, -1, pmcWave, pmcWave * 2,
-                    pmcUse[number mod pmcUse.len], "pmcBEAR", "Bear")
+    while pmc < 4:
+      # Two USEC + two BEAR, alternating. Under staging these are the first to
+      # move: the cap is normally used up by the scav seeds, and a PMC wave is
+      # also the one the client answers with `Wrong wave WildSpawnType` (it
+      # still places it -- measured: 2+2 PMC groups spawned per raid) and the
+      # one that can sit in `Delays in progress ... noData` for minutes.
+      let side = pmc mod 2
+      let wt = if side == 0: "pmcUSEC" else: "pmcBEAR"
+      let bs = if side == 0: "Usec" else: "Bear"
+      let zone = pmcUse[number mod pmcUse.len]
+      if cap == 0 or atStart + pmcWave <= cap:
+        a.add oneWave(number, -1, -1, pmcWave, pmcWave * 2, zone, wt, bs)
+        atStart += pmcWave
+        inc stats.wavesAtStart
+        stats.botsAtStart += pmcWave
+      else:
+        let t = stagedTime(pol, deferredIdx)
+        a.add oneWave(number, t, t + 10, pmcWave, pmcWave * 2, zone, wt, bs)
+        inc deferredIdx
+        inc stats.wavesDeferred
+        stats.botsDeferred += pmcWave
+        if stats.firstDeferredSec == 0 or t < stats.firstDeferredSec:
+          stats.firstDeferredSec = t
+        if t > stats.lastDeferredSec: stats.lastDeferredSec = t
       inc number
       inc pmc
   # The trickle. Non-negative, so these take `Run(2)`'s timer arm: a bonus if
@@ -868,10 +971,50 @@ proc offlineScavWaves(zones: seq[string]; pmcZones: seq[string] = @[]): string =
   while i < early:
     let zone = useZones[(seeds + i) mod useZones.len]
     a.add oneWave(number, 20 + i * 30, 40 + i * 30, trickle, trickle * 2, zone)
+    inc stats.wavesTrickle
+    stats.botsTrickle += trickle
     inc i
     inc number
   a.add oneWave(number, 360, 420, trickle, trickle * 2, useZones[0])
+  inc stats.wavesTrickle
+  stats.botsTrickle += trickle
   result = done(a).text
+
+proc deferBossTimes*(bossLocationSpawn: string; delaySec: int;
+                     deferred: var int): string =
+  ## The staged-start half of the boss table. Every entry `bossRollGroup`
+  ## classifies as a boss whose `Time` is negative (= spawn with the initial
+  ## burst) and that has no `TriggerId` gets `Time = delaySec`; everything else
+  ## -- the PMC/`exUsec`/`pmcBot` entries, a boss already on a clock such as
+  ## Partisan's `Time:900` (which the client logs as `partisan by time`), a
+  ## triggered boss -- is passed through byte for byte. Pure, and reports how
+  ## many entries it moved so the caller can say so.
+  ##
+  ## INFERRED, not measured: that the client honours a non-negative `Time` on a
+  ## `boss*` entry the same way it honours Partisan's. The readback line names
+  ## the served `Time` per boss so the client log can confirm or refute it.
+  let v = whole(bossLocationSpawn)
+  if not v.isArray:
+    return bossLocationSpawn
+  var out1 = arr()
+  let n = count(v)
+  var i = 0
+  while i < n:
+    let e = v.at(i)
+    inc i
+    let name = e.field("BossName").asText("")
+    if bossRollGroup(name) == 0 or e.field("Time").asInt(-1) >= 0 or
+       e.field("TriggerId").asText("").len > 0:
+      out1.add raw(e.raw)
+      continue
+    var w = parseObject(e.raw)
+    if not w.ok:
+      out1.add raw(e.raw)
+      continue
+    setNumber(w, "Time", delaySec)
+    out1.add raw(text(w))
+    inc deferred
+  result = done(out1).text
 
 # ---------------------------------------------------------------------------
 # The boss roll
@@ -1003,6 +1146,9 @@ proc applyBossPolicy*(d: var Doc; seed: string) =
       if bossRollGroup(nm) != 0:
         if kept.len > 0: kept.add ","
         kept.add nm
+        # The clock each kept boss is on: -1 is the initial burst, anything
+        # else is seconds into the raid (staged start writes these).
+        kept.add "@Time:" & $rv.at(i).field("Time").asInt(-1)
       inc i
   if kept.len == 0: kept = "(none)"
   info "boss roll: seed=" & seed & " kept=" & kept
@@ -1041,9 +1187,58 @@ proc tuneOfflineSpawns*(d: var Doc) =
   ## are untouched here.
   let zones = botZonesFor(whole(getRaw(d, "SpawnPointParams")))
   let pmcZones = botPmcZonesFor(whole(getRaw(d, "SpawnPointParams")))
-  setRaw(d, "waves", offlineScavWaves(zones, pmcZones))
-  setNumber(d, "BotStart", 0)
+  # What the base shipped on the synchronous arm, read BEFORE it is replaced:
+  # the staged cap defaults to it (Woods: 16 waves at -1, slots_max sum 8).
+  var vanillaAtStart = 0
+  let baseWaves = get(d, "waves")
+  if baseWaves.isArray:
+    var wi = 0
+    while wi < count(baseWaves):
+      let w = baseWaves.at(wi)
+      if w.field("time_min").asInt(0) < 0:
+        vanillaAtStart += w.field("slots_max").asInt(0)
+      inc wi
+  let pol = gStagedStart
+  var st = StagedStats()
+  setRaw(d, "waves", offlineScavWavesWith(zones, pmcZones, pol,
+                                          vanillaAtStart, st))
+  # `BotStart` is the non-wave spawner's opening second. Writing 0 here was a
+  # bug: the client logs "BotStart for non-wave spawn <= 0" (in Russian) and
+  # disables that scenario, so the vanilla replenishment (Woods ships 10)
+  # never ran. Under staging the base's own value is kept (10 if the base
+  # itself ships 0, e.g. Factory); that spawner only places while alive <
+  # BotMax, so it cannot add to the start burst. Off the flag, 0 is still
+  # written -- unchanged behaviour is the contract.
+  let baseBotStart = get(d, "BotStart").asInt(0)
+  var servedBotStart = 0
+  if pol.enabled:
+    servedBotStart = baseBotStart
+    if servedBotStart <= 0: servedBotStart = 10
+  setNumber(d, "BotStart", servedBotStart)
   setNumber(d, "BotStop", 86400)
+  # The bosses' clock. Applied to the table as shipped (this path) so that both
+  # served documents agree; `applyBossPolicy` rolls on top of it and its own
+  # log line names the `Time` each kept boss carries.
+  var bossesDeferred = 0
+  if pol.enabled and has(d, "BossLocationSpawn"):
+    setRaw(d, "BossLocationSpawn",
+           deferBossTimes(getRaw(d, "BossLocationSpawn"), pol.bossDelaySec,
+                          bossesDeferred))
+  # The readback. One line per map, counted from the emitted table, so the
+  # coordinator can hold it against the client's own `SpawnWave Time:` dump.
+  var mapId = ""
+  if has(d, "Id"): mapId = get(d, "Id").asText("")
+  if mapId.len == 0 and has(d, "_Id"): mapId = get(d, "_Id").asText("")
+  info "staged-start readback " & mapId & ": " &
+       (if pol.enabled: "ON" else: "OFF") & " -- " &
+       $st.wavesAtStart & " wave(s) at Time:-1 (" & $st.botsAtStart &
+       " bots), " & $st.wavesDeferred & " deferred to " &
+       $st.firstDeferredSec & ".." & $st.lastDeferredSec & " s (" &
+       $st.botsDeferred & " bots), " & $st.wavesTrickle &
+       " trickle wave(s) (" & $st.botsTrickle & " bots, unchanged); " &
+       "vanilla at -1 = " & $st.vanillaAtStart & ", cap = " & $st.cap &
+       "; BotStart " & $baseBotStart & " -> " & $servedBotStart &
+       "; bosses moved to Time " & $pol.bossDelaySec & ": " & $bossesDeferred
   # Budgets. These are the two throttles that can silently eat the waves above:
   # `BotMax` is the map-wide alive cap and `MaxBotPerZone` the per-`BotZone`
   # one. Factory's own base ships `BotMax = 0` and `MaxBotPerZone = 4` -- with
@@ -1222,6 +1417,36 @@ var gRaidTuneExits = 0
 proc setRaidTunePolicy*(p: RaidTunePolicy) =
   gRaidTune = p
   gTunedLocations = ""
+
+proc setStagedStartPolicy*(p: StagedStartPolicy) =
+  ## Install the staged-start policy and DROP the tuned-locations cache --
+  ## the same rule as the two setters above: `/client/locations` is answered
+  ## from `gTunedLocations`, so a policy change that left it standing would
+  ## serve the previous table until restart.
+  gStagedStart = p
+  gTunedLocations = ""
+
+proc applyStagedStartSettings*() =
+  ## Read the four `stagedStart*` rows and install them. Drops the cache only
+  ## when something actually changed, so an idle apply does not rebuild the
+  ## 24-map document; says what it installed either way.
+  let p = StagedStartPolicy(
+    enabled: setting("stagedStart").asBool(false),
+    initialBots: setting("stagedStartInitialBots").asInt(0),
+    firstDelaySec: setting("stagedStartFirstDelaySec").asInt(20),
+    bossDelaySec: setting("stagedStartBossDelaySec").asInt(45))
+  let same = p.enabled == gStagedStart.enabled and
+             p.initialBots == gStagedStart.initialBots and
+             p.firstDelaySec == gStagedStart.firstDelaySec and
+             p.bossDelaySec == gStagedStart.bossDelaySec
+  if not same:
+    setStagedStartPolicy(p)
+  info "staged start: " & (if p.enabled: "ON" else: "OFF") &
+       " (initialBots=" & $p.initialBots & " [0 = the map's vanilla at-start" &
+       " total], firstDelaySec=" & $p.firstDelaySec & ", bossDelaySec=" &
+       $p.bossDelaySec & ")" &
+       (if same: " -- unchanged, cache kept"
+        else: " -- installed, tuned-locations cache dropped")
 
 proc raidTuneTimeActive*(): bool =
   gRaidTune.timeMinutes > 0 or gRaidTune.timeMultiplier != 1.0
@@ -1881,6 +2106,113 @@ proc selfCheckRaid*(into: var seq[string]): bool =
   if cultistsOffPriests > 0:
     into.add "raid: cultistsEnabled=false still spawned " &
              $cultistsOffPriests & " cultist entrie(s)"
+
+  # Staged start: same waves, same bots, different clocks -- with a negative
+  # control on every assertion so none can pass vacuously.
+  block:
+    let zones = @["ZoneA", "ZoneB", "ZoneC", "ZoneD", "ZoneE", "ZoneF",
+                  "ZoneG", "ZoneH"]
+    let pmc = @["ZoneA", "ZoneB"]
+    var off = StagedStats()
+    var onS = StagedStats()
+    let offText = offlineScavWavesWith(zones, pmc, defaultStagedStart(), 8,
+                                       off)
+    var pol = defaultStagedStart()
+    pol.enabled = true
+    let onText = offlineScavWavesWith(zones, pmc, pol, 8, onS)
+    let offBots = off.botsAtStart + off.botsDeferred + off.botsTrickle
+    let onBots = onS.botsAtStart + onS.botsDeferred + onS.botsTrickle
+    if offBots != onBots:
+      into.add "raid: staged start changed the bots per raid (" & $offBots &
+               " off vs " & $onBots & " on)"
+    let offWaves = off.wavesAtStart + off.wavesDeferred + off.wavesTrickle
+    let onWaves = onS.wavesAtStart + onS.wavesDeferred + onS.wavesTrickle
+    if offWaves != onWaves:
+      into.add "raid: staged start changed the wave count (" & $offWaves &
+               " off vs " & $onWaves & " on)"
+    if onS.botsAtStart > onS.cap:
+      into.add "raid: staged start left " & $onS.botsAtStart &
+               " bots at Time:-1 over a cap of " & $onS.cap
+    if off.botsAtStart <= onS.cap:
+      into.add "raid: the unstaged table already fits the staged cap, so " &
+               "the cap assertion cannot fail and is not a check"
+    if off.wavesDeferred != 0 or off.cap != 0:
+      into.add "raid: staged start OFF still deferred " & $off.wavesDeferred &
+               " wave(s)"
+    if onS.wavesDeferred == 0:
+      into.add "raid: staged start ON deferred nothing"
+    if onS.firstDeferredSec < pol.firstDelaySec:
+      into.add "raid: a deferred wave landed at " & $onS.firstDeferredSec &
+               " s, before firstDelaySec " & $pol.firstDelaySec
+    # Counted from the TEXT, not the stats, so the stats cannot vouch for
+    # themselves: the OFF table must be the measured 12-at-minus-one shape
+    # (8 seeds + 4 PMC, span 40), the ON table must carry exactly `cap` there.
+    var offN = 0
+    var offB = 0
+    var onN = 0
+    var onB = 0
+    let offV = whole(offText)
+    var k = 0
+    while k < count(offV):
+      let w = offV.at(k)
+      inc k
+      if w.field("time_min").asInt(0) < 0:
+        inc offN
+        offB += w.field("slots_max").asInt(0) - w.field("slots_min").asInt(0)
+    let onV = whole(onText)
+    k = 0
+    while k < count(onV):
+      let w = onV.at(k)
+      inc k
+      if w.field("time_min").asInt(0) < 0:
+        inc onN
+        onB += w.field("slots_max").asInt(0) - w.field("slots_min").asInt(0)
+    if offN != 12 or offB != 40:
+      into.add "raid: staged start OFF serves " & $offN & " wave(s) / " &
+               $offB & " bots at Time:-1; the measured pre-flag table is 12 / 40"
+    if onB != onS.cap or onB != onS.botsAtStart or onN != onS.wavesAtStart:
+      into.add "raid: staged start ON serves " & $onN & " wave(s) / " & $onB &
+               " bots at Time:-1 (text) against cap " & $onS.cap &
+               " and stats " & $onS.wavesAtStart & " / " & $onS.botsAtStart
+    # And the bosses. The check literal carries Kojaniy, Knight and the
+    # Priest at Time:-1 (movable), Partisan at Time:900 and pmcBot at -1
+    # (both must NOT move). The negative control is that the literal has
+    # something to move at all.
+    var movable = 0
+    let cv = whole(ChkBossSpawn)
+    var ci = 0
+    while ci < count(cv):
+      let e = cv.at(ci)
+      inc ci
+      if bossRollGroup(e.field("BossName").asText("")) != 0 and
+         e.field("Time").asInt(-1) < 0: inc movable
+    if movable == 0:
+      into.add "raid: the boss literal has no immediate boss, so the " &
+               "defer check cannot fail and is not a check"
+    var moved = 0
+    let deferredText = deferBossTimes(ChkBossSpawn, 45, moved)
+    let dv = whole(deferredText)
+    if moved != movable:
+      into.add "raid: deferBossTimes moved " & $moved & " of " & $movable &
+               " immediate bosses"
+    ci = 0
+    while ci < count(dv):
+      let e = dv.at(ci)
+      inc ci
+      let nm = e.field("BossName").asText("")
+      let t = e.field("Time").asInt(-1)
+      if bossRollGroup(nm) != 0 and t < 0:
+        into.add "raid: " & nm & " is still at Time:-1 after deferBossTimes"
+      if nm == "bossPartisan" and t != 900:
+        into.add "raid: deferBossTimes touched Partisan's own Time:900 (now " &
+                 $t & ")"
+      if nm == "pmcBot" and t != -1:
+        into.add "raid: deferBossTimes touched the pmcBot entry (Time " & $t & ")"
+    var moved0 = 0
+    discard deferBossTimes(deferredText, 45, moved0)
+    if moved0 != 0:
+      into.add "raid: deferBossTimes is not idempotent (moved " & $moved0 &
+               " on a second pass)"
 
   let d = textDb(ChkLocations)
   let idx = buildLocationIndex(d)

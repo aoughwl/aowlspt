@@ -237,6 +237,25 @@ const
   NuTLayoutGrpDirty  = 52'i32  ## UnityEngine.UI.LayoutGroup::SetDirty
   NuTTrSetAsLastSib  = 53'i32  ## UnityEngine.Transform::SetAsLastSibling
   NuTTrGetSiblingIdx = 54'i32  ## UnityEngine.Transform::GetSiblingIndex
+  # --- native tabs (docs/NATIVETABS.md). Two are SHARED and are CALLED only.
+  NuTBehaviourEnable = 55'i32  ## UnityEngine.Behaviour::set_enabled
+  NuTSpawnerSpawn    = 56'i32  ## EFT.UI.UIAnimatedToggleSpawner::SpawnObject
+  NuTSpawnerHeader   = 57'i32  ## EFT.UI.UIAnimatedToggleSpawner::SetHeaderText
+  NuTSpawnerActive   = 58'i32  ## EFT.UI.UIAnimatedToggleSpawner::SetActive
+  NuTTabCleanupCtrls = 59'i32  ## EFT.UI.Settings.SettingsTab::CleanupCreatedControls
+  NuTToggleSetGroup  = 60'i32  ## UnityEngine.UI.Toggle::set_group
+  NuTToggleSet       = 61'i32  ## UnityEngine.UI.Toggle::Set
+
+## Field offsets for the tab machinery. MEASURED (tools/fldoff.py, String
+## self-check passing) and written up in docs/NATIVETABS.md. All NULL-CAPABLE.
+const
+  NuOffSpawnerToggleGroup = 0xb0'i32  ## UIAnimatedToggleSpawner._toggleGroup
+  NuOffSpawnerSiblingIdx  = 0xbc'i32  ## ._siblingIndex : int
+  NuOffSpawnerPrefab      = 0xc0'i32  ## ._spawnableToggle : UISpawnableToggle
+  NuOffToggleGroup        = 0x110'i32 ## UnityEngine.UI.Toggle.m_Group
+  NuOffToggleIsOn         = 0x120'i32 ## UnityEngine.UI.Toggle.m_IsOn
+  NuOffTabCreatedControls = 0x88'i32  ## SettingsTab._createdControls
+  NuOffGameTabSettingsRoot = 0x98'i32 ## GameSettingsTab._settingsRoot
 
 ## `LayoutGroup.m_Padding` @0x20 : RectOffset. A plain reference field, so it
 ## is READ raw -- no call, and in particular not `get_padding`, which is
@@ -823,6 +842,82 @@ type
     ## at that arithmetic could only work for top-anchored parents.
     rectX*, rectY*: float32
 
+proc nuBehaviourEnable*(behaviour: Il2CppPtr; on: bool): bool =
+  ## `Behaviour.enabled = value`. SHARED x32 -- CALLED, never detoured: it is
+  ## the correct code for whatever receiver is in RCX, and detouring a shared
+  ## RVA fires for every one of its 32 owners.
+  result = false
+  if not gNuOn or not nuOk(behaviour, 0x18'i32): return
+  let fn = nuFn(NuTBehaviourEnable)
+  if fn == nil: return
+  cNuCallVPB(fn, behaviour, (if on: 1'i32 else: 0'i32))
+  true
+
+proc nuSpawnerSpawn*(spawner: Il2CppPtr): Il2CppPtr =
+  ## `UIAnimatedToggleSpawner.SpawnObject()` -> AnimatedToggle. The game's own
+  ## tab-button factory; the spawned toggle is a genuine prefab instance of
+  ## `_spawnableToggle @0xC0`, not a relabelled donor.
+  result = nil
+  if not gNuOn or not nuOk(spawner, NuOffSpawnerPrefab + 8'i32): return
+  let fn = nuFn(NuTSpawnerSpawn)
+  if fn == nil: return
+  result = cNuCallPP(fn, spawner)
+  if not nuOk(result, 0x10'i32): result = nil
+
+proc nuSpawnerHeader*(spawner: Il2CppPtr; caption: string; size: int32): bool =
+  result = false
+  if not gNuOn or not nuOk(spawner, 0x10'i32): return
+  let fn = nuFn(NuTSpawnerHeader)
+  if fn == nil: return
+  let sp = nuStr(caption)
+  if sp == nil: return
+  cNuCallVPPB(fn, spawner, sp, size)
+  true
+
+proc nuSpawnerActive*(spawner: Il2CppPtr; on: bool): bool =
+  result = false
+  if not gNuOn or not nuOk(spawner, 0x10'i32): return
+  let fn = nuFn(NuTSpawnerActive)
+  if fn == nil: return
+  cNuCallVPB(fn, spawner, (if on: 1'i32 else: 0'i32))
+  true
+
+proc nuTabCleanupControls*(tab: Il2CppPtr): bool =
+  ## `SettingsTab.CleanupCreatedControls()` -- destroys everything in the tab's
+  ## own `_createdControls @0x88`. Called on a panel WE cloned, to empty it of
+  ## the stock rows it was cloned with. Never on a panel the game owns.
+  result = false
+  if not gNuOn or not nuOk(tab, NuOffTabCreatedControls + 8'i32): return
+  let fn = nuFn(NuTTabCleanupCtrls)
+  if fn == nil: return
+  discard cNuCallPP(fn, tab)
+  true
+
+proc nuToggleSetGroup*(toggle, group: Il2CppPtr): bool =
+  ## `Toggle.group = value` -- the PROPERTY, so the group's own bookkeeping
+  ## runs. Joining the stock ToggleGroup is what makes tab exclusivity NATIVE:
+  ## the game turns the other tabs off for us and we enforce nothing.
+  result = false
+  if not gNuOn or not nuOk(toggle, NuOffToggleGroup + 8'i32): return
+  let fn = nuFn(NuTToggleSetGroup)
+  if fn == nil: return
+  cNuCallVPP(fn, toggle, group)
+  true
+
+proc nuToggleIsOn*(toggle: Il2CppPtr): (bool, bool) =
+  ## `m_IsOn @0x120`, read raw. A read, so the field is fine; the WRITE path is
+  ## the property, because a raw store never fires the Animator (measured).
+  ## Read through `cNuGetRef`-style pointer arithmetic done here rather than
+  ## with a u8 accessor: the byte reader lives in `settingswrite.nim`, which is
+  ## included AFTER this file, and `duPtrAdd` in `debugui.nim`, likewise. So the
+  ## address is formed locally and read as i32 -- m_IsOn is a bool at 0x120
+  ## with further fields after it, so a 4-byte read is in bounds once `nuOk`
+  ## has cleared it, and only the low byte is used.
+  result = (false, false)
+  if not nuOk(toggle, NuOffToggleIsOn + 4'i32): return
+  let addr2 = cast[Il2CppPtr](cast[uint64](toggle) + uint64(NuOffToggleIsOn))
+  result = (true, (cReadI32At(addr2) and 0xFF'i32) != 0'i32)
+
 proc nuSetAsLastSibling*(rt: Il2CppPtr): bool =
   ## `Transform::SetAsLastSibling()` -- LAST in the parent's child list.
   ##
@@ -1271,6 +1366,16 @@ proc nuTargetsBindOk(): bool =
   want.add "UnityEngine.Transform::SetAsFirstSibling"
   idx.add NuTTrSetAsLastSib
   want.add "UnityEngine.Transform::SetAsLastSibling"
+  # The three spawner rows are adjacent and same-shaped; a mis-index would call
+  # SetActive with SpawnObject's frame and every call would still "succeed".
+  idx.add NuTSpawnerSpawn
+  want.add "EFT.UI.UIAnimatedToggleSpawner::SpawnObject"
+  idx.add NuTSpawnerActive
+  want.add "EFT.UI.UIAnimatedToggleSpawner::SetActive"
+  # The DETOUR target. A mis-index here patches the wrong function, which is
+  # the single most expensive mistake available in this file.
+  idx.add NuTToggleSet
+  want.add "UnityEngine.UI.Toggle::Set"
   var i = 0
   while i < idx.len:                      # capped: idx is built right here
     let ix = idx[i]
