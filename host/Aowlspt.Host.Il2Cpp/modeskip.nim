@@ -179,6 +179,22 @@ const
     ## client built it and the player can use it. A visible screen the player
     ## can click is strictly better than a blank background, which is the
     ## outcome this whole change exists to prevent.
+  ModeSkipMaxAnswers = 4
+    ## How many SHOWINGS of the character/mode screen this feature will answer
+    ## in one session. It used to answer exactly ONE and then switch itself off
+    ## the moment a slot was shown again -- and MEASURED 2026-09-01, the client
+    ## shows this screen AGAIN after the main-menu PLAY button is pressed, so
+    ## "one-shot" meant the second showing was never answered by anything and
+    ## autoraid sat on the next step until it timed out.
+    ##
+    ## The old self-disable was written when the blank-background bug was
+    ## believed to be a race with the client's own second Show. It was NOT --
+    ## the banner above records that it was the `pvp-season` slot and a null
+    ## SeasonalPerksData, and that dropping the seasonal key fixed it outright.
+    ## So a re-showing is now RE-ARMED rather than fatal. It is still BOUNDED:
+    ## after this many answers the feature stops answering and says so, because
+    ## an unbounded answer loop against a screen that keeps coming back would
+    ## be exactly the kind of thing that must never run in a live client.
   ModeSkipStarveTicks = 3600
     ## Roughly a minute of drain ticks. If the feature is armed and the screen
     ## has never been seen, it says so once rather than being a silent no-op.
@@ -205,6 +221,11 @@ var gModeSkipSubmits = 0
 var gModeSkipSlotsSeen = 0
 var gModeSkipStarved = false
 var gModeSkipCtorLogged = false
+var gModeSkipBoundLogged = false        ## the answer-bound message, once
+var gModeSkipCtors = 0                 ## controller constructions observed
+var gModeSkipShows = 0                 ## ShowSlot firings observed
+var gModeSkipSubmittedAtLogMs = 0'u64  ## last Submit time, kept for the log
+                                       ## after the re-arm clears the gate
 ## The wanted ProfileId as a STABLE NUL-terminated char buffer.
 ##
 ## `gModeSkipWantId` is a Nim string and cannot be handed to C as a `cstring`
@@ -339,10 +360,17 @@ proc modeSkipCtorFired(regs: Il2CppPtr) =
   # itself on a false positive.
   gModeSkipSubmittedAtMs = 0'u64
   gModeSkipLateShow = false
-  if not gModeSkipCtorLogged:
+  inc gModeSkipCtors
+  # EVERY construction is logged, not just the first, and the log carries the
+  # counter. The old once-only line made the whole question "does the client
+  # build a NEW controller for the post-PLAY showing?" unanswerable from the
+  # log, which is the question this feature's behaviour depends on. Capped at
+  # 8 lines so a pathological loop cannot flood the log; the counter continues.
+  if gModeSkipCtors <= 8:
     gModeSkipCtorLogged = true
     let tid = int(cThreadId())
-    okLog "skip mode screen: CharacterSelectionScreenController constructed " &
+    okLog "skip mode screen: CharacterSelectionScreenController #" &
+          $gModeSkipCtors & " constructed " &
           "(0x" & hexOf(cast[uint64](ctl)) & ") on thread " & $tid &
           (if tid == int(gHostThreadId):
              " (HOST thread -- unexpected, NOT Unity's)"
@@ -363,22 +391,38 @@ proc modeSkipShowSlotFired(regs: Il2CppPtr) =
   # has already been queued. The old code returned early once a slot matched,
   # which is precisely how the late Show became invisible to this feature.
   gModeSkipLastSlotMs = cNowMs()
-  if gModeSkipSubmittedAtMs != 0'u64 and not gModeSkipLateShow:
-    # A slot AFTER our Submit. The screen is being re-shown by the client's own
-    # flow, which is the exact condition that used to abort RunInitialLobbyFlow.
-    # It is reported rather than swallowed: a silent decline is this host's
-    # recurring failure mode.
+  inc gModeSkipShows
+  if gModeSkipSubmittedAtMs != 0'u64:
+    # A slot AFTER our Submit: the screen is being SHOWN AGAIN. MEASURED
+    # 2026-09-01 that this is what the client does after the main-menu PLAY
+    # button, and answering it is the whole point of the feature -- the screen
+    # that shows after PLAY is the same character/mode selector, and nothing
+    # answered it, so autoraid's next step never got a screen and refused.
+    #
+    # RE-ARM, bounded, and say so. This is not the blank-background condition:
+    # that was the `pvp-season` slot and a null SeasonalPerksData (see the
+    # banner), not a second Show.
     gModeSkipLateShow = true
-    warn "skip mode screen: CharacterSelectionScreen.ShowSlot fired AGAIN " &
-         $int(cNowMs() - gModeSkipSubmittedAtMs) & "ms AFTER Submit was " &
-         "called. That means the client re-showed the selection screen after " &
-         "it had been answered -- the condition that throws inside " &
-         "CharacterSelectionSeasonPanel.ShowPerks and leaves the player on a " &
-         "blank background. The quiet window (" & $int(ModeSkipQuietMs) &
-         "ms) was NOT long enough on this run. Switching this feature off for " &
-         "the session so it cannot do it twice."
-    gModeSkipOff = true
-    return
+    if gModeSkipSubmits >= ModeSkipMaxAnswers:
+      if not gModeSkipBoundLogged:
+        gModeSkipBoundLogged = true
+        warn "skip mode screen: the selection screen has been shown again " &
+             "after " & $gModeSkipSubmits & " answers, which is the bound " &
+             "(ModeSkipMaxAnswers). NOT answering it: an unbounded answer " &
+             "loop against a screen that keeps returning is not something " &
+             "this host will run. The stock screen is left for the player."
+      return
+    gModeSkipSubmittedAtMs = 0'u64
+    gModeSkipSubmittedFor = nil
+    gModeSkipPending = false
+    gModeSkipPendingPd = nil
+    gModeSkipSlotsSeen = 0
+    okLog "skip mode screen: ShowSlot fired AGAIN " &
+          $int(cNowMs() - gModeSkipSubmittedAtLogMs) & "ms after the last " &
+          "Submit -- the client is showing the character/mode screen for the " &
+          "" & $gModeSkipShows & "th slot event this session. RE-ARMING " &
+          "(answers so far " & $gModeSkipSubmits & " of at most " &
+          $ModeSkipMaxAnswers & "); this showing will be answered too."
   if gModeSkipPending:
     return                                   # a slot already matched
   let pdRaw = cRegsInt(regs, 3'i32)            # R9
@@ -419,6 +463,7 @@ proc modeSkipSubmitBody(a: Il2CppPtr): Il2CppPtr {.
   cMskCallSubmit(fn, gModeSkipController, gModeSkipPendingMode,
                  gModeSkipPendingPd)
   gModeSkipSubmittedAtMs = cNowMs()
+  gModeSkipSubmittedAtLogMs = gModeSkipSubmittedAtMs
   inc gModeSkipSubmits
 
 proc modeSkipDrainTick() =
@@ -494,7 +539,11 @@ proc modeSkipDrainTick() =
         $int(cNowMs() - gModeSkipArmedAtMs) & "ms of waiting, the last " &
         $int(ModeSkipQuietMs) & "ms of it with no further ShowSlot. The " &
         "character/mode selection screen has been answered without a human. " &
-        "Submits this session: " & $gModeSkipSubmits & ". THIS IS NOT PROOF " &
+        "This is ANSWER " & $gModeSkipSubmits & " of at most " &
+        $ModeSkipMaxAnswers & " this session (ShowSlot firings seen: " &
+        $gModeSkipShows & ", controllers constructed: " & $gModeSkipCtors &
+        "). The screen is answered EVERY time it is shown, not once -- the " &
+        "client shows it again after the main-menu PLAY button. THIS IS NOT PROOF " &
         "THE MENU APPEARED -- assert that separately: MenuScreen (parent " &
         "\"Common UI\") must be activeInHierarchy, and BOTH " &
         "CharacterSelectionScreen copies (parents \"Login UI\" and \"UI\") " &

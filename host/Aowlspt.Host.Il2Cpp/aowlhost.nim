@@ -8613,6 +8613,14 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
     let m = readStrKey("autoRaidMap")
     if m.len > 0:
       gArMap = m
+  block:
+    # The character/mode slot to answer with, by the TEXT A PERSON READS on it
+    # ("PvE Zone"), never by the object name -- `CharacterSlotView_pvp` is
+    # labelled "PvE" on this build, so a name-keyed match picks confidently
+    # wrong. MEASURED 2026-09-01: the screen after PLAY is this selector.
+    let c = readStrKey("autoRaidCharacter")
+    if c.len > 0:
+      gArChar = c
   if gArOn:
     info "uxAutoRaid is set: on launch the host will drive the main menu into " &
          "an OFFLINE raid on map \"" & gArMap & "\" natively (PLAY -> NEXT -> " &
@@ -9337,9 +9345,11 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
       # features share, and the second would overwrite the first's trampoline.
       splWantShowHook()
       modLoadWantShowHook()
+      arWantShowHook()
       uihArm(true)
       splShowHookVerdict()
       modLoadShowHookVerdict()
+      arShowHookVerdict()
 
       # Version-label brand (opt-in). Static code, so it installs now and fires
       # when PreloaderUI.Awake runs on its way to the menu. Fail-safe if the

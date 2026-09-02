@@ -6267,3 +6267,75 @@ must show `release HELD` with `MODS READY` on disk and no mods loaded. With it
 OFF a normal run must show `the main menu SHOW EVENT fired` followed by
 `mod loading: release gated -- READY at Ns, MenuScreen::Show at Ms, releasing
 now`. Both lines carry times, so both can be wrong out loud.
+
+## 2026-09-01 night: PLAY does NOT lead to the location list -- it re-shows the character/mode screen
+
+MEASURED, client 1.1.0.1.46777, one run, three instruments:
+
+* `python tools/hostlog.py feature "skip mode screen"` -- the whole session's
+  modeskip trail is FOUR events, all before 0:00:29: ctor at `0:00:28.266`,
+  `ShowSlot first fired` at `0:00:28.282`, slots 1 and 2 (slot 2 =
+  `00000000000a00000000004f` "Savant", gameMode=0, matched), `Submit called`
+  at `0:00:28.313`.
+* the host log's `autoRaid:` lines -- `ARMED ON DEMAND` at `0:04:30.188`,
+  `pressed PLAY (MenuScreen PlayButton)` at `0:04:30.407`, then
+  `step NEXT->location never completed within 45 s` at `0:05:15.641`.
+* one screenshot: the screen up after PLAY is "SELECT YOUR CHARACTER / PVE
+  ZONE"; the live inspector read `BackButton` parent =
+  `CharacterSelectionScreen`.
+
+So: **pressing the main-menu PLAY button puts the character/mode selector up
+again**, and the autoraid state machine had no step for it, which is what its
+45 s NEXT->location refusal really was.
+
+**`CharacterSelectionScreen::ShowSlot` did NOT fire for that second showing.**
+That is a negative read off the same log, and it is checkable: after the
+`Submit`, modeskip would have printed either further `slot N` info lines (the
+per-slot log resets per controller and prints the first 8) or its
+`ShowSlot fired AGAIN` warning (which, in the code of that build, also
+self-disabled the feature). The log has NEITHER, in a session where the
+feature was armed and had not self-disabled. Whether the client constructs a
+NEW `CharacterSelectionScreenController` for that showing was NOT decidable
+from that log -- the ctor line was gated to fire once -- so the ctor log is now
+counted and printed for the first 8 constructions specifically to settle it.
+
+CONSEQUENCE for design: a feature driven by the `ShowSlot` postfix cannot
+answer an event it never hears, so "make uxSkipModeScreen answer every time"
+is necessary but NOT sufficient. Both were done:
+* modeskip re-arms on a re-showing instead of switching itself off (bounded at
+  `ModeSkipMaxAnswers = 4`, every answer numbered in the log). Its old
+  self-disable was written against a race that was later falsified -- the
+  blank-background bug was the `pvp-season` slot and a null
+  `SeasonalPerksData`, not a second `Show`.
+* autoraid gained an explicit `CHARACTER` step between PLAY and
+  NEXT->location, which answers the screen the way `tools/entergame.py`
+  verified live: the ACTIVE `CharacterSelectionScreen` (the Login UI copy is
+  INACTIVE and pressing it silently does nothing) -> `CharacterSlotView*` by
+  name PREFIX -> descendant `Title` TMP == the wanted DISPLAYED text
+  (`autoRaidCharacter`, default "PvE Zone") -> descendant `Apply` ->
+  DefaultUIButton OnClick(+0x120). **Object names are not titles**:
+  `CharacterSlotView_pvp` is labelled "PvE".
+
+## 2026-09-01 night: after the character screen the client does NOT return to the main menu
+
+MEASURED (coordinator's run, same client): after `tools/entergame.py` answered
+the character screen, autoraid's WAIT-MENU logged
+`MenuScreen found=1, PlayButton under it=1, active=0` for the full 180 s bound.
+A found-but-INACTIVE PlayButton is not "the menu is slow"; it is "the client is
+on some other screen". Which screen it is, is still **UNKNOWN** -- so the
+autoraid step timeout now prints a bounded census of the ACTIVE nodes at
+depth <= 2 under the `Menu UI` and `Common UI` roots, which answers it from the
+live tree without guessing class names.
+
+## 2026-09-01 night: autoraid advances NEXT->offline-raid on the SHOW EVENT, not on a timeout
+
+`MatchmakerOfflineRaidScreen::Show` @`0x1788590` is uihooks site 0 (UNIQUE,
+prologue-verified there, already wanted by `splrebrand`). autoraid now
+subscribes to it (`arWantShowHook` before the single `uihArm`, verdict read
+back after) and uses `uihEpoch(UihSiteOfflineRaid)` -- one integer compare per
+tick, no walk -- as a POSITIVE readback that the next screen is up. It also
+RESYNCHRONISES: a site-0 firing while the machine is at CHARACTER, NEXT->
+location, SELECT-MAP or NEXT->offline-raid moves it straight to NEXT->
+insurance, because where we are is then an observation rather than a count of
+presses. If the site did not bind, or fires nowhere within `ArOffWaitMs`
+(20 s), the machine continues and the log says the advance is UNVERIFIED.

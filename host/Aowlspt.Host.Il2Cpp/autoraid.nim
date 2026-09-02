@@ -99,6 +99,25 @@ const
                                 ## "seen once then hidden" is a transient popup, not a
                                 ## refusal -- extend the wait rather than self-disable.
                                 ## 6 * ArMenuWaitMs is a generous but BOUNDED cap.
+  ArCharGraceMs   = 12000'u64   ## CHARACTER: how long to wait for the character/
+                                ## mode screen to become ACTIVE after PLAY before
+                                ## concluding this flow does not show one and
+                                ## continuing. MEASURED 2026-09-01: pressing PLAY
+                                ## puts "SELECT YOUR CHARACTER / PVE ZONE"
+                                ## (GameObject `CharacterSelectionScreen`, under
+                                ## the `Menu UI` root) on screen, and nothing
+                                ## answered it -- the step after PLAY is NOT the
+                                ## location list.
+  ArCharSettleMs  = 6000'u64    ## after pressing a slot's Apply, how long the
+                                ## screen may stay active before we try again.
+  ArMaxCharPresses = 2          ## presses of the character slot, EVER. Then the
+                                ## step refuses by name rather than mashing.
+  ArMaxSlots      = 8           ## CharacterSlotView* collected per screen.
+  ArCharDepth     = 8           ## descent under the screen for slots/Title/Apply.
+  ArCensusCap     = 24          ## names printed by the stuck-step screen census.
+  ArOffWaitMs     = 20000'u64   ## after NEXT->offline-raid, how long we wait for
+                                ## the MatchmakerOfflineRaidScreen::Show event
+                                ## before saying the readback never arrived.
 
 # ---- step ids ----
 const
@@ -112,6 +131,7 @@ const
   ArReady     = 7   ## -> Final Countdown (the READY is itself a NextButton)
   ArDone      = 8
   ArFailed    = 9
+  ArCharacter = 10  ## after PLAY: answer the character/mode selection screen
 
 # ---- the guarded-body thunk (ONE aowl_p_p_seh, never nested) ----
 {.emit: """
@@ -144,6 +164,15 @@ var gArStarted = false
 var gArPlaySeen = false            ## the MenuScreen PlayButton has been visible >=1x
 var gArPlayExtends = 0             ## popup-wait extensions granted on the PLAY step
 var gArWaitLogMs = 0'u64          ## rate limiter for the WAIT-MENU candidate line
+var gArChar = "PvE Zone"           ## `autoRaidCharacter`: the slot TITLE to press
+var gArCharPresses = 0             ## slot Apply presses this session
+var gArCharPressedMs = 0'u64       ## when the slot was pressed (readback clock)
+var gArCharLogMs = 0'u64           ## rate limiter for the CHARACTER census line
+var gArCharAnswered = 0            ## character screens dismissed by THIS feature
+var gArOffEpoch = 0                ## last seen uihooks site-0 epoch (offline raid)
+var gArOffFires = 0                ## site-0 show events observed while armed
+var gArOffAwaitMs = 0'u64          ## when NEXT->offline-raid was pressed
+var gArCensused = false            ## the stuck-step census has been printed once
 
 proc arStepName(s: int): string =
   case s
@@ -156,6 +185,7 @@ proc arStepName(s: int): string =
   of ArNext4:     "NEXT->accept"
   of ArReady:     "READY"
   of ArDone:      "DONE"
+  of ArCharacter: "CHARACTER"
   else:           "FAILED"
 
 proc arGoto(s: int) =
@@ -544,6 +574,188 @@ proc arSelectMap(): bool =
     i = i + 1
 
 # ---------------------------------------------------------------------------
+# THE CHARACTER/MODE SELECTION SCREEN, answered by the TEXT A PERSON READS.
+#
+# MEASURED 2026-09-01 (aowlspt-host.log + one screenshot + the live inspector):
+# pressing PLAY does NOT go to the location list. It puts the character/mode
+# screen up again -- "SELECT YOUR CHARACTER / PVE ZONE", GameObject
+# `CharacterSelectionScreen` (the inspector read `BackButton` parent =
+# CharacterSelectionScreen) -- and NOTHING answered it, so the old machine sat
+# on NEXT->location for its whole 45 s bound and refused.
+#
+# WHY THIS IS HERE AND NOT ONLY IN modeskip.nim: modeskip is driven by a POSTFIX
+# on `CharacterSelectionScreen::ShowSlot`, and in that run the event did NOT
+# fire for the second showing. The host log has the boot slots (slot 1 and slot
+# 2 at 0:00:28, Submit at 0:00:28.313) and NOTHING after PLAY at 0:04:30 --
+# neither further slot lines (the per-slot log resets per controller and prints
+# the first 8) nor the "ShowSlot fired AGAIN" warning, in a session where the
+# feature was armed and had not self-disabled. A feature cannot answer an event
+# it never hears. modeskip is still made RE-ANSWERABLE (it is the cheaper and
+# genuinely event-driven path when the event does fire, and its log now says so
+# either way); this step is the one that does not depend on that.
+#
+# The route is the one tools/entergame.py verified live from the inspector side:
+#   the ACTIVE `CharacterSelectionScreen`  (two copies exist; the Login UI one
+#     is INACTIVE and pressing it silently does nothing -- fact #72 -- so the
+#     screen is found with `arWalkActive`, which returns only ACTIVE nodes)
+#     -> `CharacterSlotView*`   (matched by name PREFIX: the suffix names the
+#        slot, and object NAMES ARE NOT TITLES -- `CharacterSlotView_pvp` is
+#        labelled "PvE", so keying on the name would confidently pick wrong)
+#        -> descendant `Title` TMP == the wanted title (`autoRaidCharacter`,
+#           default "PvE Zone")
+#        -> descendant `Apply` -> DefaultUIButton OnClick(+0x120)
+# ---------------------------------------------------------------------------
+proc arStartsWith(s, pre: string): bool =
+  if pre.len > s.len: return false
+  var i = 0
+  while i < pre.len:
+    if s[i] != pre[i]: return false
+    i = i + 1
+  return true
+
+proc arCollectPrefixChildren(t: Il2CppPtr; pre: string; depth: int;
+                             budget: var int; deadline: uint64;
+                             into: var seq[Il2CppPtr]; cap: int) =
+  ## Breadth-before-depth collect by name PREFIX. Same shape and the same bounds
+  ## as `arCollectChildren`; only the predicate differs, so the two cannot drift
+  ## apart in their budget or deadline handling.
+  if depth <= 0 or budget <= 0 or into.len >= cap: return
+  var n = 0
+  if not iChildCount(t, n): return
+  var i = 0
+  while i < n and i < ArFanout and budget > 0 and into.len < cap:
+    let c = iChildAt(t, i)
+    if c != nil and duOk(c, 0x20'i32):
+      budget = budget - 1
+      if (budget and 31) == 0 and cNowMs() > deadline:
+        budget = 0
+        return
+      if arStartsWith(iObjName(c), pre):
+        into.add c
+        if into.len >= cap: return
+    i = i + 1
+  i = 0
+  while i < n and i < ArFanout and budget > 0 and into.len < cap:
+    let c = iChildAt(t, i)
+    if c != nil:
+      arCollectPrefixChildren(c, pre, depth - 1, budget, deadline, into, cap)
+    i = i + 1
+
+proc arCollectPrefix(t: Il2CppPtr; pre: string; depth: int; budget: var int;
+                     deadline: uint64; into: var seq[Il2CppPtr]; cap: int) =
+  if t == nil or budget <= 0 or into.len >= cap or not duOk(t, 0x20'i32): return
+  budget = budget - 1
+  if arStartsWith(iObjName(t), pre):
+    into.add t
+    if into.len >= cap: return
+  arCollectPrefixChildren(t, pre, depth, budget, deadline, into, cap)
+
+proc arCharScreen(): Il2CppPtr =
+  ## The ACTIVE `CharacterSelectionScreen`: `Menu UI` first, then any root.
+  result = arFindActiveAcross("Menu UI", "CharacterSelectionScreen", nil)
+
+proc arLabelUnder(node: Il2CppPtr; name: string; depth: int): string =
+  ## TMP text of the first descendant named `name`. "" means NOT FOUND or
+  ## UNREADABLE -- the caller must never treat that as a match (an empty string
+  ## comparing equal to an empty wanted title would be a check that cannot fail).
+  result = ""
+  var hits: seq[Il2CppPtr] = @[]
+  var b = ArNodeBudget
+  arCollect(node, name, depth, b, cNowMs() + ArWalkMs, hits, 4)
+  var i = 0
+  while i < hits.len:
+    let tmp = splTmpOf(hits[i])
+    if tmp != nil:
+      let t = arTrim(splTmpText(tmp))
+      if t.len > 0: return t
+    i = i + 1
+
+proc arAnswerCharacterUnder(scr: Il2CppPtr; nSlots, nTitled: var int;
+                            titles: var string): bool =
+  ## Press the `Apply` of the slot whose displayed Title == `gArChar`. True ONLY
+  ## when a real match was pressed; an unmatched title keeps the step (a
+  ## REFUSAL), never a silent advance. `titles` collects what was actually
+  ## readable so that a refusal is evidence rather than a shrug.
+  result = false
+  nSlots = 0
+  nTitled = 0
+  titles = ""
+  if scr == nil: return
+  var slots: seq[Il2CppPtr] = @[]
+  var b = ArNodeBudget
+  arCollectPrefix(scr, "CharacterSlotView", ArCharDepth, b,
+                  cNowMs() + ArWalkMs, slots, ArMaxSlots)
+  nSlots = slots.len
+  let want = iLower(arTrim(gArChar))
+  var i = 0
+  while i < slots.len:
+    let slot = slots[i]
+    let title = arLabelUnder(slot, "Title", ArCharDepth)
+    if title.len > 0:
+      nTitled = nTitled + 1
+      if titles.len < 240:
+        titles = titles & "[" & iObjName(slot) & "=" & title & "]"
+      if iLower(title) == want and want.len > 0:
+        var b2 = ArNodeBudget
+        let apply = arWalkActive(slot, "Apply", ArCharDepth, b2,
+                                 cNowMs() + ArWalkMs, nil)
+        if apply == nil:
+          warn "autoRaid: step CHARACTER -- the slot titled " & title &
+               " was found but has no ACTIVE descendant named `Apply`, so " &
+               "there is nothing pressable on it. NOTHING WAS PRESSED."
+          return false
+        if arPress(apply, "DefaultUIButton"):
+          return true
+        warn "autoRaid: step CHARACTER -- the slot titled " & title &
+             " has an active `Apply`, but its DefaultUIButton OnClick could " &
+             "not be resolved and validated, so it was NOT pressed."
+        return false
+    i = i + 1
+
+proc arActiveCensus(root: Il2CppPtr; depth: int; count: var int;
+                    into: var string) =
+  ## Names of the ACTIVE nodes at depth <= `depth` under `root`. The honest
+  ## answer to "what screen is up": it guesses no class names, it reports what
+  ## the live tree really has ACTIVE, and it is bounded by `ArCensusCap` names
+  ## and by the same fanout every other walk here uses.
+  if root == nil or depth <= 0 or count >= ArCensusCap: return
+  var n = 0
+  if not iChildCount(root, n): return
+  var i = 0
+  while i < n and i < ArFanout and count < ArCensusCap:
+    let c = iChildAt(root, i)
+    if c != nil and duOk(c, 0x20'i32):
+      let a = iActiveInHierarchy(c)
+      if a[0] and a[1]:
+        count = count + 1
+        if into.len < 700:
+          into = into & "[" & iObjName(c) & "]"
+        arActiveCensus(c, depth - 1, count, into)
+    i = i + 1
+
+proc arScreenCensus(): string =
+  ## ONE line naming the ACTIVE nodes under `Menu UI` and `Common UI`. Printed
+  ## when a step is about to refuse, so that a timeout is EVIDENCE about which
+  ## screen the client is really on instead of "the control never became
+  ## visible", which names only what we failed to find.
+  result = ""
+  var roots: seq[Il2CppPtr] = @[]
+  arEnumRoots(roots)
+  var i = 0
+  while i < roots.len:
+    let r = iToTransform(roots[i])
+    if r != nil and duOk(r, 0x20'i32):
+      let nm = iObjName(r)
+      if nm == "Menu UI" or nm == "Common UI":
+        var count = 0
+        var names = ""
+        arActiveCensus(r, 2, count, names)
+        result = result & " " & nm & " active(depth<=2)=" & $count & ": " & names
+    i = i + 1
+  if result.len == 0:
+    result = " (neither `Menu UI` nor `Common UI` is an enumerated root now)"
+
+# ---------------------------------------------------------------------------
 # The tick body -- everything that touches managed memory, under ONE guard.
 # ---------------------------------------------------------------------------
 proc arFail(why: string) =
@@ -563,6 +775,31 @@ proc arTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ar_tick_body", cdecl.}
   if gArStep == ArDone or gArStep == ArFailed: return
 
   let now = cNowMs()
+  # ---- THE SCREEN-ARRIVAL ORACLE ------------------------------------------
+  # `MatchmakerOfflineRaidScreen::Show` @0x1788590 (uihooks site 0, UNIQUE,
+  # prologue-verified there). ONE integer compare per tick when nothing has
+  # happened; no walk, no call into the game. This is a POSITIVE READBACK that
+  # the next screen is really up -- the thing a visibility timeout can never be.
+  # It also RESYNCHRONISES the machine: if the offline raid screen is up, then
+  # whatever we believed about PLAY/CHARACTER/location/map is settled by
+  # observation and the correct next action is the NEXT on THIS screen.
+  let ep = uihEpoch(UihSiteOfflineRaid)
+  if ep != gArOffEpoch:
+    gArOffEpoch = ep
+    gArOffFires = gArOffFires + 1
+    if gArStep == ArCharacter or gArStep == ArNext1 or
+       gArStep == ArSelectMap or gArStep == ArNext2:
+      okLog "autoRaid: READBACK -- MatchmakerOfflineRaidScreen::Show fired " &
+            "(uihooks site 0, epoch " & $ep & "). The offline raid screen is " &
+            "UP, which is an observation, not a guess. Resynchronising from " &
+            "step " & arStepName(gArStep) & " to NEXT->insurance."
+      gArLastPressed = nil
+      gArOffAwaitMs = 0'u64
+      arGoto(ArNext3)
+    else:
+      info "autoRaid: MatchmakerOfflineRaidScreen::Show fired (uihooks site " &
+           "0, epoch " & $ep & ") while at step " & arStepName(gArStep) &
+           "; noted, no resynchronisation (that step is already past it)."
   # Enforce a settle gap after every press so a screen has time to transition.
   if gArLastActionMs != 0'u64 and now - gArLastActionMs < ArMinActionMs: return
 
@@ -583,8 +820,23 @@ proc arTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ar_tick_body", cdecl.}
            "waiting for it to clear (extension " & $gArPlayExtends & " of " &
            $ArMaxPlayExtends & ")."
       return
+    # A REFUSAL MUST NAME THE STEP AND SAY WHAT WAS ON SCREEN. "the control
+    # never became visible" names only what we failed to find; the census names
+    # what the client actually had ACTIVE, which is what settles where we are.
+    var census = ""
+    if not gArCensused:
+      gArCensused = true
+      census = arScreenCensus()
     arFail("step " & arStepName(gArStep) & " never completed within " &
-           $(int(stepTimeout div 1000'u64)) & " s (control never became visible)")
+           $(int(stepTimeout div 1000'u64)) & " s (control never became " &
+           "visible)." &
+           (if gArStep == ArCharacter:
+              " Wanted the character slot titled \"" & gArChar &
+              "\" (`autoRaidCharacter`)."
+            else: "") &
+           " Offline-raid show events seen while armed: " & $gArOffFires &
+           ". Character screens answered: " & $gArCharAnswered & "." &
+           (if census.len > 0: " ACTIVE:" & census else: ""))
     return
 
   # WAIT-MENU and PLAY are ONE step: the instant the MenuScreen PlayButton reads
@@ -613,7 +865,10 @@ proc arTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ar_tick_body", cdecl.}
               gArMap & "\"."
         gArLastPressed = nil
         gArLastActionMs = now
-        arGoto(ArNext1)
+        # MEASURED: the screen after PLAY is the character/mode selector, not
+        # the location list. CHARACTER grace-skips itself if no such screen
+        # becomes active, so this ordering costs nothing on a flow without one.
+        arGoto(ArCharacter)
     else:
       # No pressable PlayButton this tick -- log the candidate census (§9b), so a
       # failure is EVIDENCE (roots enumerated? MenuScreen found? a PlayButton
@@ -626,6 +881,28 @@ proc arTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ar_tick_body", cdecl.}
         info "autoRaid WAIT-MENU: roots=" & $gArRootCount &
              ", MenuScreen found=" & $nMs & ", PlayButton under it=" & $nPb &
              ", active=" & $nActive & " (nothing pressable this tick)"
+    return
+
+  if gArStep == ArNext2 and gArOffAwaitMs != 0'u64:
+    # NEXT->offline-raid has been pressed and we are waiting for the show
+    # EVENT. Do not press anything meanwhile: a second press here skips a
+    # screen. Either the oracle fires (handled at the top of this body) or the
+    # window lapses, and a lapse is ANNOUNCED, not swallowed.
+    if now - gArOffAwaitMs < ArOffWaitMs: return
+    gArOffAwaitMs = 0'u64
+    var census = ""
+    if not gArCensused:
+      gArCensused = true
+      census = arScreenCensus()
+    warn "autoRaid: NEXT->offline-raid was pressed " &
+         $(int(ArOffWaitMs div 1000'u64)) & " s ago and " &
+         "MatchmakerOfflineRaidScreen::Show (uihooks site 0) has NOT fired, " &
+         "so this host has NO evidence the offline raid screen came up. " &
+         "Continuing to NEXT->insurance UNVERIFIED -- treat any raid entered " &
+         "from here as unconfirmed." &
+         (if census.len > 0: " ACTIVE:" & census else: "")
+    gArLastPressed = nil
+    arGoto(ArNext3)
     return
 
   if gArStep == ArNext1 or gArStep == ArNext2 or gArStep == ArNext3 or
@@ -643,13 +920,98 @@ proc arTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_ar_tick_body", cdecl.}
       gArLastPressed = nb
       gArLastActionMs = now
       if gArStep == ArNext1:   arGoto(ArSelectMap)
-      elif gArStep == ArNext2: arGoto(ArNext3)
+      elif gArStep == ArNext2:
+        if not uihBound(UihSiteOfflineRaid):
+          # No oracle this session. Advance exactly as before -- but say that
+          # the advance is UNVERIFIED rather than letting it read as a success.
+          warn "autoRaid: pressed NEXT->offline-raid and advancing WITHOUT a " &
+               "readback: uihooks site 0 is not bound this session, so " &
+               "nothing here can confirm the offline raid screen came up."
+          arGoto(ArNext3)
+          return
+        # Do NOT advance on the press. The screen-arrival oracle above advances
+        # this step when `MatchmakerOfflineRaidScreen::Show` really fires; the
+        # step's own timeout still bounds it if the event never comes.
+        gArOffAwaitMs = now
+        okLog "autoRaid: NEXT->offline-raid pressed. NOT advancing on the " &
+              "press: the step advances when MatchmakerOfflineRaidScreen::" &
+              "Show (uihooks site 0) fires, which is a readback that the " &
+              "screen is really up. If that event never arrives this step " &
+              "times out and says so."
       elif gArStep == ArNext3: arGoto(ArNext4)
       elif gArStep == ArNext4: arGoto(ArReady)
       else:
         okLog "autoRaid: READY pressed -- the raid scene is loading. Going " &
               "hands-off; this feature will not touch the UI again this session."
         arGoto(ArDone)
+    return
+
+  if gArStep == ArCharacter:
+    let scr = arCharScreen()
+    # (a) ALREADY PRESSED: assert the FINISHED STATE, which is a NEGATIVE --
+    # no ACTIVE CharacterSelectionScreen anywhere. Never "the press returned
+    # cleanly": a handler that returns normally is not proof it did anything.
+    if gArCharPresses > 0:
+      if scr == nil:
+        gArCharAnswered = gArCharAnswered + 1
+        okLog "autoRaid: READBACK -- no ACTIVE CharacterSelectionScreen " &
+              "remains after pressing the slot titled \"" & gArChar &
+              "\" (press " & $gArCharPresses & "). The character/mode screen " &
+              "is answered; continuing to NEXT->location. Answered this " &
+              "session: " & $gArCharAnswered & "."
+        gArCharPresses = 0
+        gArLastPressed = nil
+        gArLastActionMs = now
+        arGoto(ArNext1)
+        return
+      if now - gArCharPressedMs < ArCharSettleMs:
+        return                                # still settling; do not re-press
+      if gArCharPresses >= ArMaxCharPresses:
+        var census = ""
+        if not gArCensused:
+          gArCensused = true
+          census = arScreenCensus()
+        arFail("step CHARACTER -- the slot titled \"" & gArChar &
+               "\" was pressed " & $gArCharPresses & " times and an ACTIVE " &
+               "CharacterSelectionScreen is STILL up after " &
+               $int(now - gArCharPressedMs) & "ms, so the press ran and did " &
+               "not advance the screen" &
+               (if census.len > 0: ". ACTIVE:" & census else: ""))
+        return
+      # settled, still up, and presses remain: fall through and press again.
+    if scr == nil:
+      # (b) NO SCREEN. Not an error -- some flows may not show one. Wait the
+      # grace window, then continue and SAY SO, rather than failing on a screen
+      # that was never going to appear.
+      if now - gArStepT0 > ArCharGraceMs:
+        okLog "autoRaid: step CHARACTER -- no ACTIVE CharacterSelectionScreen " &
+              "appeared within " & $(int(ArCharGraceMs div 1000'u64)) &
+              " s of pressing PLAY. Nothing was pressed and nothing is " &
+              "claimed; continuing to NEXT->location. If the selector IS on " &
+              "screen, then it is not named `CharacterSelectionScreen` on " &
+              "this build, and that is the thing to check."
+        gArLastPressed = nil
+        arGoto(ArNext1)
+      return
+    var nSlots = 0
+    var nTitled = 0
+    var titles = ""
+    if arAnswerCharacterUnder(scr, nSlots, nTitled, titles):
+      gArCharPresses = gArCharPresses + 1
+      gArCharPressedMs = now
+      gArLastActionMs = now
+      okLog "autoRaid: step CHARACTER -- pressed the `Apply` of the slot " &
+            "titled \"" & gArChar & "\" (" & $nSlots & " CharacterSlotView* " &
+            "under the ACTIVE screen, " & $nTitled & " with a readable " &
+            "Title). PRESSED IS NOT ANSWERED: the readback is the next tick " &
+            "finding NO active CharacterSelectionScreen."
+    elif now - gArCharLogMs > 5000'u64:
+      gArCharLogMs = now
+      info "autoRaid CHARACTER: an ACTIVE CharacterSelectionScreen is up, " &
+           "slots=" & $nSlots & ", titled=" & $nTitled & ", titles=" &
+           (if titles.len > 0: titles else: "<none readable>") & ", wanted=\"" &
+           gArChar & "\" (`autoRaidCharacter`). Object NAMES are not titles " &
+           "on this build, so the match is on the DISPLAYED text only."
     return
 
   if gArStep == ArSelectMap:
@@ -690,6 +1052,15 @@ proc arArmOnDemand() =
   gArPlaySeen = false
   gArPlayExtends = 0
   gArWaitLogMs = 0'u64
+  gArCharPresses = 0
+  gArCharPressedMs = 0'u64
+  gArCharLogMs = 0'u64
+  gArCensused = false
+  gArOffAwaitMs = 0'u64
+  # Snapshot the show-event epoch NOW: an event from BEFORE this arming is not
+  # evidence about this run, and consuming a stale one would resynchronise the
+  # machine to a screen that is no longer up.
+  gArOffEpoch = uihEpoch(UihSiteOfflineRaid)
   arGoto(ArWaitMenu)
   gInspRaidAns = "ARMED on demand, map \"" & gArMap & "\", step WAIT-MENU"
   okLog "autoRaid: ARMED ON DEMAND (inspector `raid`), map \"" & gArMap &
@@ -967,6 +1338,34 @@ proc raidExitDrainTick() =
          $XrMaxFaults & ")"
     if gXrFaults >= XrMaxFaults:
       xrFail("too many faults")
+
+proc arWantShowHook() =
+  ## Declare the subscription to `MatchmakerOfflineRaidScreen::Show` (uihooks
+  ## site 0). MUST run before the single `uihArm` pass -- a site nobody wanted
+  ## is never patched. Wanted when `uxAutoRaid` is set OR the live inspector is
+  ## on, because the inspector `raid` verb arms this machine on demand in
+  ## sessions where the launch flag is off.
+  if not gArOn and not gInspOn: return
+  uihWant(UihSiteOfflineRaid)
+
+proc arShowHookVerdict() =
+  ## Read back whether it actually BOUND, after `uihArm`. Announced either way:
+  ## without it this machine has no positive readback that a screen arrived and
+  ## falls back to its per-step timeout, which is exactly the failure mode this
+  ## change exists to remove.
+  if not gArOn and not gInspOn: return
+  if uihBound(UihSiteOfflineRaid):
+    okLog "autoRaid: the screen-arrival oracle is LIVE -- " &
+          "MatchmakerOfflineRaidScreen::Show @0x1788590 (uihooks site 0) is " &
+          "bound, so NEXT->offline-raid advances on the show EVENT rather " &
+          "than on a visibility timeout."
+  else:
+    warn "autoRaid: uihooks site 0 (MatchmakerOfflineRaidScreen::Show) did " &
+         "NOT bind, so this session has no positive readback that the offline " &
+         "raid screen arrived: NEXT->offline-raid falls back to its per-step " &
+         "timeout. The reason is in the `uihooks:` lines; the usual causes " &
+         "are a different game build or another detour having patched " &
+         "0x1788590 first (a hook-ORDER problem)."
 
 proc autoRaidDrainTick() =
   ## Rides the `EFT.TarkovApplication::Update` drain (slot alias, no second
