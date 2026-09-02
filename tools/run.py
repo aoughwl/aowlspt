@@ -1172,8 +1172,53 @@ class Supervisor:
                 % int(stall), self.host_tail[-3:])
 
 
-def crash_evidence(started, root=None, symbolize=True):
+def looks_like_crashes_root(path):
+    """(ok, why) -- is `path` plausibly Unity's Crashes directory?
+
+    Three-state by construction (CLAUDE.md 9b): the caller turns `ok=False`
+    into an INCONCLUSIVE answer, never into "no crash report". Accepts a
+    directory that either
+
+      * has held a report at some point (any `Crash_*` entry, ever -- NOT only
+        ones newer than launch, since "empty right now" is normal), or
+      * sits at a `...\\Temp\\Battlestate Games\\...\\Crashes` shaped path, which
+        is the genuine-but-never-yet-used case.
+
+    Everything else is a refusal, because the falsifying input is real: the
+    INSTALL root `D:\\Aowlspt` was passed here, it exists, it is a directory,
+    and it has never contained a crash report -- so every lookup answered "no
+    crash report newer than launch" and that answer could not fail.
+    """
+    if not path:
+        return False, "empty path"
+    if not os.path.exists(path):
+        return False, "does not exist"
+    if not os.path.isdir(path):
+        return False, "is not a directory"
+    try:
+        entries = os.listdir(path)
+    except OSError as e:
+        return False, "could not be listed (%s)" % e
+    if any(n.startswith("Crash_") for n in entries):
+        return True, "contains Crash_* entries"
+    norm = os.path.normpath(os.path.abspath(path)).replace("/", "\\").lower()
+    if "\\temp\\battlestate games\\" in norm and norm.endswith("\\crashes"):
+        return True, "is a Battlestate Games Crashes path (currently empty)"
+    return False, ("has no Crash_* entry and is not a "
+                   "Temp\\Battlestate Games\\...\\Crashes path -- this looks "
+                   "like the INSTALL root, not Unity's Crashes root")
+
+
+def crash_evidence(started, crashes_root=None, symbolize=True):
     """What Unity's OWN crash handler recorded about this death, if anything.
+
+    `crashes_root` is UNITY'S CRASHES DIRECTORY
+    (%LOCALAPPDATA%\\Temp\\Battlestate Games\\EscapeFromTarkov\\Crashes), NOT
+    the install root. It used to be called `root`, and `D:\\Aowlspt` was passed
+    for it: a directory that has never held a report, so the lookup answered
+    "no crash report newer than launch" forever. That is refused now -- the
+    result comes back source="inconclusive" and says which directory it was
+    handed and why it does not look like a Crashes root.
 
     Returns a dict: `lines` is the block to print, and the rest is the same
     finding in machine-readable form. `folder` None means NO report newer than
@@ -1186,7 +1231,20 @@ def crash_evidence(started, root=None, symbolize=True):
     named module sat under %LOCALAPPDATA%\\Temp\\Battlestate Games\\...\\Crashes
     for each one. crashwatch owns the parsing; this only prints it.
     """
-    kw = {} if root is None else {"root": root}
+    if crashes_root is not None:
+        ok, why = looks_like_crashes_root(crashes_root)
+        if not ok:
+            return {"folder": None, "path": None, "module": None,
+                    "source": "inconclusive", "age_s": None, "modules": [],
+                    "modlines": [],
+                    "lines": ["crash report lookup NOT PERFORMED -- %s %s."
+                              % (crashes_root, why),
+                              "This is INCONCLUSIVE, NOT 'no crash report': "
+                              "nothing was searched. Pass Unity's Crashes "
+                              "root (%%LOCALAPPDATA%%\\Temp\\Battlestate "
+                              "Games\\EscapeFromTarkov\\Crashes), not the "
+                              "install root."]}
+    kw = {} if crashes_root is None else {"root": crashes_root}
     try:
         rep = crashwatch.newest_crash_report(since=started, **kw)
     except Exception as e:                       # never let this hide a verdict
@@ -1379,7 +1437,15 @@ def _unity_forensics(started, crash, runner, resolve_paths, crash_root,
     out += ["   " + l for l in crash["lines"]]
 
     folder = crash.get("path")
-    if not folder:
+    if not folder and crash.get("source") in ("inconclusive", "error"):
+        # Distinct from the line below on purpose: "we searched and found
+        # nothing" and "we never searched" must not print the same sentence.
+        out.append("2. minidump    NOT LOOKED AT: the crash-report lookup was "
+                   "INCONCLUSIVE (see step 1) -- no directory was searched, so "
+                   "this says NOTHING about whether a report exists.")
+        out.append("3. disasm      NOT LOOKED AT: without a dump there is no "
+                   "faulting address to decode.")
+    elif not folder:
         out.append("2. minidump    NOT LOOKED AT: no Unity crash report newer "
                    "than launch, so there is no crash.dmp to read. This is NOT "
                    "yet a teardown -- see step 4.")

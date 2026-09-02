@@ -1566,9 +1566,89 @@ ARTIFACT_MTIME_SLACK = 2.0
 
 SIDECAR_SUFFIX = ".built.json"
 
+# What a nimony build here actually READS. Deliberately narrow: a broader set
+# (docs, tools/*.py) would make every no-op rebuild look stale again, which is
+# the false refusal this exists to remove.
+SOURCE_EXTS = (".nim", ".nims", ".nimble", ".cfg", ".h", ".c", ".cpp",
+               ".hlsl", ".inc")
+# Roots every module in this checkout compiles against, on top of its own
+# module directory. Missing one here can only produce a FALSE UP-TO-DATE, so
+# the list errs wide and the scan REPORTS which roots it looked at.
+SHARED_SOURCE_ROOTS = ("abi", "host/common")
+SOURCE_SCAN_BUDGET = 8.0
+SOURCE_SKIP_DIRS = {".git", "bin", "build", "nimcache", ".cache", "__pycache__",
+                    ".claude", "node_modules"}
+
 
 def _norm(p):
     return p.replace("\\", "/")
+
+
+def artifact_source_roots(repo, art):
+    """Directories whose contents are INPUTS to this artifact.
+
+    The module directory is everything in `src` above its `bin/` component
+    (`host/Aowlspt.Host.Il2Cpp/bin/x.dll` -> `host/Aowlspt.Host.Il2Cpp`), plus
+    the shared roots above. An artifact may name its own list with a `sources`
+    key in tools/deploy.json; nothing does today.
+
+    Returns `(roots, why_empty)`. An artifact that is not a build output (e.g.
+    checked-in data that a build only ships) has no source roots and must not
+    be given an mtime verdict at all.
+    """
+    declared = art.get("sources")
+    if declared:
+        rel = [_norm(x) for x in declared if isinstance(x, str)]
+    else:
+        s = _norm(art["src"])
+        if "/bin/" not in s:
+            return [], ("%s is not under a bin/ directory, so its module "
+                        "root cannot be derived" % s)
+        rel = [s.split("/bin/", 1)[0]] + list(SHARED_SOURCE_ROOTS)
+    out = []
+    for r in rel:
+        full = os.path.join(repo, r.replace("/", os.sep))
+        if os.path.isdir(full):
+            out.append(r)
+    if not out:
+        return [], "none of %s exists under %s" % (rel, repo)
+    return out, ""
+
+
+def newest_source(repo, roots, budget=SOURCE_SCAN_BUDGET):
+    """The newest source file under `roots`.
+
+    dict: mtime / path / files / roots / truncated / error. `truncated` or
+    `error` means the walk did NOT see everything, and a caller must treat that
+    as INCONCLUSIVE -- never as "nothing is newer". That distinction is the
+    whole point: "I did not look" reading as "it is fine" is CLAUDE.md 9b.
+    """
+    t0 = time.time()
+    res = {"mtime": None, "path": None, "files": 0, "roots": list(roots),
+           "truncated": False, "error": None}
+    try:
+        for r in roots:
+            base = os.path.join(repo, r.replace("/", os.sep))
+            for dirpath, dirnames, filenames in os.walk(base):
+                dirnames[:] = [d for d in dirnames
+                               if d not in SOURCE_SKIP_DIRS]
+                if time.time() - t0 > budget:
+                    res["truncated"] = True
+                    return res
+                for fn in filenames:
+                    if not fn.lower().endswith(SOURCE_EXTS):
+                        continue
+                    p = os.path.join(dirpath, fn)
+                    try:
+                        mt = os.stat(p).st_mtime
+                    except OSError:
+                        continue
+                    res["files"] += 1
+                    if res["mtime"] is None or mt > res["mtime"]:
+                        res["mtime"], res["path"] = mt, p
+    except OSError as e:
+        res["error"] = "%s: %s" % (type(e).__name__, e)
+    return res
 
 
 def deploy_artifacts(repo):
@@ -1728,30 +1808,85 @@ def artifact_status(repo, art, started=None, want_sha=True):
             type(e).__name__, e)
         return rec
     rec["size"], rec["mtime"] = stt.st_size, stt.st_mtime
+    unwritten = (started is not None and rec["built"]
+                 and stt.st_mtime < started - ARTIFACT_MTIME_SLACK)
     if started is not None and rec["built"]:
         rec["mtime_checked"] = True
-        if stt.st_mtime < started - ARTIFACT_MTIME_SLACK:
+    try:
+        rec["sha256"] = sha256_file(full) if (want_sha or unwritten) else None
+    except OSError as e:
+        rec["why"] = "could not be hashed (%s: %s) -- NOT CHECKED" % (
+            type(e).__name__, e)
+        return rec
+    if unwritten:
+        # MEASURED 2026-09-02: a no-op `build host` (41s, nothing changed,
+        # aowl left the existing DLL alone) exited 6 ARTIFACT STALE purely
+        # because the mtime predated the build. That is a FALSE REFUSAL: the
+        # build was asked to make the artifact current and the artifact IS
+        # current. STALE now means what it says -- a source is newer than the
+        # artifact and this build did not rewrite it.
+        #
+        # UP-TO-DATE needs BOTH halves, and the asymmetry is deliberate:
+        # everything unproven falls through to STALE, so a scan that could not
+        # complete refuses rather than passing.
+        side = read_sidecar(full)
+        roots, why_empty = artifact_source_roots(repo, art)
+        src = newest_source(repo, roots) if roots else None
+        rec["sources"] = src
+        when = time.strftime("%H:%M:%S", time.localtime(stt.st_mtime))
+        if not side or not side.get("sha256"):
             rec["state"] = "stale"
-            rec["why"] = ("its mtime is %.0fs BEFORE this build started (%s) "
-                          "-- this file is an EARLIER build's output"
-                          % (started - stt.st_mtime,
+            rec["why"] = ("this build did not write it (mtime %s, %.0fs before "
+                          "the build started) and there is NO SIDECAR beside "
+                          "it, so which build produced these bytes is UNKNOWN"
+                          % (when, started - stt.st_mtime))
+        elif side.get("sha256") != rec["sha256"]:
+            rec["state"] = "stale"
+            rec["why"] = ("this build did not write it (mtime %s) and its "
+                          "sha %s does NOT match the sidecar's %s -- something "
+                          "replaced it outside this lock"
+                          % (when, rec["sha256"][:12],
+                             str(side.get("sha256"))[:12]))
+        elif src is None:
+            rec["state"] = "stale"
+            rec["why"] = ("this build did not write it (mtime %s) and its "
+                          "source inputs could not be identified (%s), so "
+                          "'nothing is newer' was NOT ESTABLISHED"
+                          % (when, why_empty))
+        elif src["error"] or src["truncated"]:
+            rec["state"] = "stale"
+            rec["why"] = ("this build did not write it (mtime %s) and the "
+                          "source scan of %s did NOT COMPLETE (%s) -- refusing "
+                          "rather than assuming nothing is newer"
+                          % (when, ", ".join(src["roots"]),
+                             src["error"] or "time budget exceeded"))
+        elif src["mtime"] is not None and src["mtime"] > stt.st_mtime:
+            rec["state"] = "stale"
+            rec["why"] = ("%s was modified %s, AFTER the artifact's mtime %s, "
+                          "and this build did not rewrite the artifact"
+                          % (_norm(os.path.relpath(src["path"], repo)),
                              time.strftime("%H:%M:%S",
-                                           time.localtime(stt.st_mtime))))
-            return rec
-    if want_sha:
-        try:
-            rec["sha256"] = sha256_file(full)
-        except OSError as e:
-            rec["why"] = "could not be hashed (%s: %s) -- NOT CHECKED" % (
-                type(e).__name__, e)
-            return rec
+                                           time.localtime(src["mtime"])),
+                             when))
+        else:
+            rec["state"] = "up-to-date"
+            rec["why"] = ("this build wrote nothing, and nothing needed "
+                          "writing: all %d source file(s) under %s are older "
+                          "than the artifact (mtime %s) and its sha %s is "
+                          "byte-identical to the sidecar pid %s wrote"
+                          % (src["files"], ", ".join(src["roots"]), when,
+                             rec["sha256"][:12], side.get("pid")))
+        return rec
     rec["state"] = "ok"
     return rec
 
 
 def artifact_exit(recs):
     """The exit code for a set of artifact records. ABSENT outranks STALE
-    because it is the stronger statement; both refuse."""
+    because it is the stronger statement; both refuse.
+
+    `up-to-date` is a PASS: the build wrote nothing because nothing needed
+    writing, and refusing that was a false alarm (see artifact_status)."""
     if any(r["state"] == "absent" for r in recs):
         return ARTIFACT_ABSENT_EXIT
     if any(r["state"] == "stale" for r in recs):
@@ -1768,6 +1903,10 @@ def artifact_lines(recs):
         if r["state"] == "ok":
             out.append("  %-14s %s   %d bytes   sha256 %s"
                        % (r["name"], r["src"], r["size"], r["sha256"]))
+        elif r["state"] == "up-to-date":
+            out.append("  UP-TO-DATE     %s (%s)   %d bytes   sha256 %s"
+                       % (r["name"], r["src"], r["size"], r["sha256"]))
+            out.append("                 %s" % r["why"])
         elif r["state"] == "absent":
             out.append("  BUILT BUT ARTIFACT ABSENT: %s (%s) -- %s"
                        % (r["name"], r["src"], r["why"]))

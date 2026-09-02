@@ -34,6 +34,18 @@ import il2cpp_resolve as IR                                   # noqa: E402
 FAILURES = []
 
 
+def searched_names(blob):
+    """True iff `methods` actually SEARCHED method names and found none.
+
+    Matched case-insensitively and by both halves of the sentence, because the
+    tool's own wording is not a stable API: it moved from "no method name
+    contains" to "no METHOD NAME contains" and a case-sensitive `in` turned
+    one check red and its partner's negative clause VACUOUS at the same time.
+    """
+    low = blob.lower()
+    return "no method name contains" in low
+
+
 def check(name, got, want):
     ok = got == want
     print("%-4s %-46s got=%-28r want=%r"
@@ -102,17 +114,25 @@ def main():
                        capture_output=True, text=True)
     blob = p.stdout + p.stderr
     check("methods <number> refuses",
-          ("usage error" in blob and "ambiguous" in blob
-           and "no method name contains" not in blob),
+          ("usage error" in blob.lower() and "ambiguous" in blob.lower()
+           and not searched_names(blob)),
           True)
     check("methods <number> exits non-zero", p.returncode != 0, True)
 
-    # 9. and --name still lets you mean the digits.
+    # 9. and --name still lets you mean the digits. This is ALSO the positive
+    #    control for check 8's negative clause: the two use the same matcher,
+    #    so if searched_names() ever stops recognising the zero-hit line, THIS
+    #    check goes red instead of check 8 passing vacuously. It did exactly
+    #    that once -- the tool's wording changed case to "no METHOD NAME
+    #    contains", a case-sensitive `in` stopped matching, check 9 failed and
+    #    check 8's negative became a clause that could not fail.
     p = subprocess.run([sys.executable, os.path.join(HERE, "il2cpp_resolve.py"),
                         ga, md, "methods", "--name", "16622"],
                        capture_output=True, text=True)
+    nblob = p.stdout + p.stderr
     check("methods --name <number> searches the substring",
-          "no method name contains" in (p.stdout + p.stderr), True)
+          searched_names(nblob), True)
+    check("methods --name <number> does NOT refuse", p.returncode == 0, True)
 
     # 10. usage text vs VERBS.
     check("no verb missing from the Usage: block", IR.usage_gaps(), [])

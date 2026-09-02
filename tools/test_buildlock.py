@@ -60,6 +60,60 @@ sys.path.insert(0, HERE)
 import buildlock  # noqa: E402
 
 FAILURES = []
+TIMINGS = []
+
+# ---------------------------------------------------------------------------
+# THE SANDBOX GUARD.
+#
+# MEASURED 2026-09-02: this suite ran for over two minutes while a REAL
+# `buildlock.py build host` held `.aowl-build.lock` in this very checkout, and
+# it was not obvious whether the suite was blocked on that lock or merely slow.
+# It must not be possible to wonder. A unit suite has no business touching the
+# live lock, the live nimcache or the live `aowl`, so every path into
+# buildlock -- in-process and through the CLI -- is funnelled past this guard,
+# and main() additionally asserts the real lock file was neither created nor
+# modified by the run. The guard has its own positive control (guard/fires),
+# because a guard that cannot fire is exactly the defect it is guarding
+# against.
+# ---------------------------------------------------------------------------
+
+REAL_LOCK = buildlock.lock_path(REPO)
+
+
+def _inside_repo(path):
+    a = os.path.normcase(os.path.abspath(path))
+    b = os.path.normcase(os.path.abspath(REPO))
+    return a == b or a.startswith(b + os.sep)
+
+
+class SandboxViolation(AssertionError):
+    pass
+
+
+def guard_repo(repo):
+    """Refuse any repo whose lock file would land in the real checkout."""
+    lp = _real_lock_path(repo)
+    if _inside_repo(lp):
+        raise SandboxViolation(
+            "a test aimed buildlock at the REAL checkout: --repo %r resolves "
+            "its lock to %s, which is inside %s. Point it at a temp dir."
+            % (repo, lp, REPO))
+    return repo
+
+
+_real_lock_path = buildlock.lock_path
+
+
+def _guarded_lock_path(repo):
+    lp = _real_lock_path(repo)
+    if _inside_repo(lp):
+        raise SandboxViolation(
+            "buildlock.lock_path(%r) -> %s is inside the real checkout"
+            % (repo, lp))
+    return lp
+
+
+buildlock.lock_path = _guarded_lock_path
 
 
 def check(name, cond, detail=""):
@@ -261,7 +315,7 @@ BL = os.path.join(HERE, "buildlock.py")
 
 def cli(repo, *args):
     """Run the real CLI the way an agent would. Returns (rc, stdout)."""
-    r = subprocess.run([sys.executable, BL, "--repo", repo] + list(args),
+    r = subprocess.run([sys.executable, BL, "--repo", guard_repo(repo)] + list(args),
                        capture_output=True, text=True, timeout=180)
     return r.returncode, r.stdout
 
@@ -508,7 +562,7 @@ def test_wait_free(tmp):
     holder = plant_holder(lp)
     t0 = time.time()
     proc = subprocess.Popen(
-        [sys.executable, BL, "--repo", released, "--wait-free", "60", "--json"],
+        [sys.executable, BL, "--repo", guard_repo(released), "--wait-free", "60", "--json"],
         stdout=subprocess.PIPE, text=True)
     time.sleep(3.0)
     still_running = proc.poll() is None
@@ -582,7 +636,7 @@ def test_status_streams(tmp):
     print("\n--status: which stream, and which exit code")
 
     def streams(repo, *args):
-        r = subprocess.run([sys.executable, BL, "--repo", repo] + list(args),
+        r = subprocess.run([sys.executable, BL, "--repo", guard_repo(repo)] + list(args),
                            capture_output=True, text=True, timeout=60)
         return r.returncode, r.stdout, r.stderr
 
@@ -685,7 +739,7 @@ def test_forwarding(tmp):
         return
 
     proc = subprocess.Popen(
-        [sys.executable, BL, "--repo", repo, "build", "mod", "maps"],
+        [sys.executable, BL, "--repo", guard_repo(repo), "build", "mod", "maps"],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     held = None
     deadline = time.time() + 30
@@ -736,7 +790,7 @@ def test_forwarding(tmp):
     os.makedirs(repo2, exist_ok=True)
     out2 = make_fake_driver(repo2, sleep_s=0.1)
     if out2 is not None:
-        subprocess.run([sys.executable, BL, "--repo", repo2,
+        subprocess.run([sys.executable, BL, "--repo", guard_repo(repo2),
                         "build", "test", "mapsdiag"],
                        capture_output=True, text=True, timeout=60)
         called2 = {}
@@ -817,7 +871,7 @@ def make_effect_driver(repo, creates=None, rc=0, sleep_s=0.6):
 
 
 def run_build(repo):
-    r = subprocess.run([sys.executable, BL, "--repo", repo, "build", "host"],
+    r = subprocess.run([sys.executable, BL, "--repo", guard_repo(repo), "build", "host"],
                        capture_output=True, text=True, timeout=180)
     return r.returncode, r.stdout
 
@@ -940,19 +994,43 @@ def test_snapshot_unit(tmp):
           "REWRITTEN" in lines and "host/x.nim" in lines, lines)
 
 
-def test_snapshot_speed():
-    """It runs on every build, so it has to be cheap. Measured against the
-    REAL checkout, which is the biggest tree it will ever see here."""
-    print("\nsnapshot cost on the real checkout")
+def test_snapshot_speed(tmp):
+    """It runs on every build, so it has to be cheap.
+
+    Measured on a THROWAWAY git repo, not the live checkout. It used to run
+    `git status` in the real tree, which (a) is contended precisely when a
+    build is running -- the case this suite must survive -- and (b) made the
+    <1s assertion flaky for reasons that have nothing to do with the code.
+    The real checkout is still measured, but only as INFORMATION and only when
+    nobody is building; an unmeasured cost is printed as NOT MEASURED, never
+    as a pass.
+    """
+    print("\nsnapshot cost")
+    repo = make_git_repo(tmp, "snap-speed")
+    if repo is None:
+        check("INCONCLUSIVE: git would not make a throwaway repo, so snapshot "
+              "cost was NOT MEASURED", False)
+        return
     t = time.time()
-    snap = buildlock.tree_snapshot(buildlock.REPO)
+    snap = buildlock.tree_snapshot(repo)
     dt = time.time() - t
-    print("    tree_snapshot(%s) took %.3fs, %d paths, error=%r"
-          % (buildlock.REPO, dt, len(snap["status"]), snap["error"]))
-    check("the snapshot reads the real repo without error",
+    print("    tree_snapshot(<temp repo>) took %.3fs, %d paths, error=%r"
+          % (dt, len(snap["status"]), snap["error"]))
+    check("the snapshot reads a repo without error",
           snap["error"] is None and snap["head"], repr(snap["error"]))
     check("the snapshot takes under 1s (%.3fs)" % dt, dt < 1.0,
           "%.3fs -- it runs twice per build" % dt)
+
+    st = buildlock.status(REAL_LOCK, buildlock.DEFAULT_MAX_AGE)
+    if st["state"] == "held":
+        print("    real checkout: NOT MEASURED -- pid %s is building right "
+              "now, so any number here would be a measure of the contention, "
+              "not of the snapshot" % st["pid"])
+        return
+    t = time.time()
+    rsnap = buildlock.tree_snapshot(REPO)
+    print("    real checkout (information only, read-only): %.3fs, %d paths, "
+          "error=%r" % (time.time() - t, len(rsnap["status"]), rsnap["error"]))
 
 
 # ---------------------------------------------------------------------------
@@ -1240,7 +1318,7 @@ def test_wait_free_reports_hung(tmp):
     print("\n--wait-free: it reports a hung holder without touching it")
     repo, parent, _ = make_hung_world(tmp, "wf-hung", CHILD_SLEEP)
     try:
-        r = subprocess.run([sys.executable, BL, "--repo", repo,
+        r = subprocess.run([sys.executable, BL, "--repo", guard_repo(repo),
                             "--wait-free", "18", "--hung-window", "3",
                             "--hung-after", "0"],
                            capture_output=True, text=True, timeout=180)
@@ -1275,8 +1353,12 @@ def test_break_hung(tmp):
         kill_world(parent)
         return
     try:
-        r = subprocess.run([sys.executable, BL, "--repo", repo,
-                            "--wait", "30", "--hung-window", "3",
+        r = subprocess.run([sys.executable, BL, "--repo", guard_repo(repo),
+                            # 14s, not 30: without --break-hung this waiter
+                            # can only exit when the wait expires, so the
+                            # extra 16s bought nothing. Two 3s windows still
+                            # fit, which is what the strike assertions need.
+                            "--wait", "14", "--hung-window", "3",
                             "--hung-strikes", "2", "--hung-after", "0",
                             "build", "host"],
                            capture_output=True, text=True, timeout=180)
@@ -1313,7 +1395,7 @@ def test_break_hung(tmp):
         kill_world(parent2)
         return
     try:
-        r = subprocess.run([sys.executable, BL, "--repo", repo2,
+        r = subprocess.run([sys.executable, BL, "--repo", guard_repo(repo2),
                             "--wait", "90", "--break-hung",
                             "--hung-window", "3", "--hung-strikes", "2",
                             "--hung-after", "0", "build", "host"],
@@ -1413,9 +1495,17 @@ def test_hung_units(tmp):
               buildlock.hung_verdict(prev, cur, 20, 0.5))))
 
 
-def test_proc_table_real():
+def test_proc_table_real(tmp):
     """The instrument itself, against this machine. If proc_table() cannot see
-    a process we just started, every verdict above is built on nothing."""
+    a process we just started, every verdict above is built on nothing.
+
+    The nimcache half runs against a CONSTRUCTED tree, not the live checkout's
+    nimcache: walking a nimcache that a real build is writing measures that
+    build, not this walker, and it was the slowest thing in the suite whenever
+    anyone was building. Constructing the tree also makes the `dirs > 0`
+    assertion mean something -- against the real checkout it passed whether or
+    not the walk worked, because the directories were there either way.
+    """
     print("\nprocess table: can it see a tree we just made?")
     t = time.time()
     table, err = buildlock.proc_table()
@@ -1445,15 +1535,33 @@ def test_proc_table_real():
     finally:
         kill_world(p)
 
+    # A constructed checkout: two nimcache dirs at different depths, plus one
+    # under a directory the walker is documented to SKIP.
+    ncrepo = os.path.join(tmp, "nc-repo")
+    for rel in ("host/nimcache", "mods/maps/nimcache",
+                ".claude/worktrees/other/nimcache"):
+        d = os.path.join(ncrepo, rel.replace("/", os.sep))
+        os.makedirs(d, exist_ok=True)
+        for i in range(50):
+            with open(os.path.join(d, "f%d.c" % i), "w",
+                      encoding="utf-8", newline="\n") as f:
+                f.write("/* %d */\n" % i)
     t = time.time()
-    nc = buildlock.nimcache_newest(buildlock.REPO)
+    nc = buildlock.nimcache_newest(ncrepo)
     dt = time.time() - t
-    print("    nimcache_newest(real checkout): %d dirs, %d files, %.2fs, "
+    print("    nimcache_newest(constructed): %d dirs, %d files, %.2fs, "
           "truncated=%s" % (nc["dirs"], nc["files"], dt, nc["truncated"]))
-    check("the real checkout's nimcache walk finds directories",
-          nc["dirs"] > 0, str(nc))
-    check("the nimcache walk completes inside its budget on the real checkout",
+    check("the nimcache walk finds BOTH nimcache dirs and skips "
+          ".claude/worktrees", nc["dirs"] == 2, str(nc))
+    check("the nimcache walk sees the files it planted",
+          nc["files"] >= 100, str(nc))
+    check("the nimcache walk completes inside its budget",
           not nc["truncated"] and nc["error"] is None, str(nc))
+    check("the newest mtime it reports is one of the planted files",
+          nc["newest"] is not None and nc["path"]
+          and os.path.exists(os.path.join(ncrepo,
+                                          nc["path"].replace("/", os.sep))),
+          str(nc))
 
 
 ART_REL = "host/Aowlspt.Host.Il2Cpp/bin/aowlspt-host-il2cpp.dll"
@@ -1503,7 +1611,7 @@ def make_artifact_repo(tmp, name, writes=True, rc=0, payload="one",
 
 
 def build_in(repo, *args):
-    r = subprocess.run([sys.executable, BL, "--repo", repo] + list(args),
+    r = subprocess.run([sys.executable, BL, "--repo", guard_repo(repo)] + list(args),
                        capture_output=True, text=True, timeout=180)
     return r.returncode, r.stdout + r.stderr
 
@@ -1614,6 +1722,96 @@ def test_artifact_check(tmp):
     check("--no-artifact-check turns the refusal off (and only that)",
           rc7 == 0 and "BUILT BUT ARTIFACT ABSENT" not in out7,
           "rc=%d\n%s" % (rc7, out7[-600:]))
+
+
+def _plant_prebuilt(repo, art, payload="one", art_age=3600.0, src_age=7200.0,
+                    sidecar=True):
+    """An artifact that an EARLIER build produced, its sidecar, and one source
+    file. Returns the artifact's mtime."""
+    os.makedirs(os.path.dirname(art), exist_ok=True)
+    with open(art, "w", encoding="utf-8", newline="\n") as f:
+        f.write(payload)
+    now = time.time()
+    amt = now - art_age
+    os.utime(art, (amt, amt))
+    src = os.path.join(repo, "host", "Aowlspt.Host.Il2Cpp", "aowlhost.nim")
+    os.makedirs(os.path.dirname(src), exist_ok=True)
+    with open(src, "w", encoding="utf-8", newline="\n") as f:
+        f.write("# a source file\n")
+    smt = now - src_age
+    os.utime(src, (smt, smt))
+    if sidecar:
+        with open(art + buildlock.SIDECAR_SUFFIX, "w", encoding="utf-8",
+                  newline="\n") as f:
+            json.dump({"target": "build host", "artifact": ART_REL,
+                       "sha256": buildlock.sha256_file(art),
+                       "size": os.path.getsize(art), "mtime": amt,
+                       "started": amt - 60, "finished": amt,
+                       "pid": 4242, "git_head": None}, f)
+    return amt, src
+
+
+def test_noop_rebuild_is_up_to_date(tmp):
+    """MEASURED 2026-09-02: a no-op `build host` -- 41s, nothing changed, aowl
+    left the existing DLL in place -- exited 6 ARTIFACT STALE because the DLL's
+    mtime predated the build start. A false refusal.
+
+    The two directions are the whole test, and neither can pass vacuously:
+
+      * nothing changed  -> exit 0, and it must SAY up-to-date rather than
+        printing the normal success line, and it must not rewrite the sidecar;
+      * a source is newer than an unwritten artifact -> still exit 6. Without
+        this half, "always exit 0" would pass the first check.
+    """
+    print("\nno-op rebuild: UP-TO-DATE vs ARTIFACT STALE")
+
+    # (a) the measured case: driver rewrites nothing, sources are older.
+    repo, art = make_artifact_repo(tmp, "art-noop", writes=False,
+                                   remove=False, rc=0)
+    if repo is None:
+        check("INCONCLUSIVE: the stand-in driver would not run", False)
+        return
+    _plant_prebuilt(repo, art)
+    side_before = os.path.getmtime(art + buildlock.SIDECAR_SUFFIX)
+    rc, out = build_in(repo, "build", "host")
+    check("no-op rebuild exits 0 (was exit 6 ARTIFACT STALE)", rc == 0,
+          "rc=%d\n%s" % (rc, out[-900:]))
+    check("...and SAYS up-to-date rather than claiming it built something",
+          "UP-TO-DATE" in out, out[-900:])
+    check("...and does not print the refusal banner",
+          "REFUSING TO REPORT SUCCESS" not in out
+          and "ARTIFACT STALE" not in out, out[-900:])
+    check("...and refreshes nothing (the sidecar is untouched)",
+          os.path.exists(art + buildlock.SIDECAR_SUFFIX)
+          and abs(os.path.getmtime(art + buildlock.SIDECAR_SUFFIX)
+                  - side_before) < 0.5,
+          "sidecar mtime moved")
+
+    # (b) THE FALSIFYING INPUT. Same unwritten artifact, one source newer.
+    repo2, art2 = make_artifact_repo(tmp, "art-noop-stale", writes=False,
+                                     remove=False, rc=0)
+    if repo2 is None:
+        check("INCONCLUSIVE: the stand-in driver would not run (b)", False)
+        return
+    _, src = _plant_prebuilt(repo2, art2, src_age=60.0)   # newer than the art
+    rc2, out2 = build_in(repo2, "build", "host")
+    check("a source NEWER than an unwritten artifact is still exit 6",
+          rc2 == buildlock.ARTIFACT_STALE_EXIT, "rc=%d\n%s" % (rc2, out2[-900:]))
+    check("...and the refusal names the file that is newer",
+          "aowlhost.nim" in out2 and "ARTIFACT STALE" in out2, out2[-900:])
+
+    # (c) no sidecar at all: who wrote these bytes is UNKNOWN, so refuse.
+    repo3, art3 = make_artifact_repo(tmp, "art-noop-nosidecar", writes=False,
+                                     remove=False, rc=0)
+    if repo3 is None:
+        check("INCONCLUSIVE: the stand-in driver would not run (c)", False)
+        return
+    _plant_prebuilt(repo3, art3, sidecar=False)
+    rc3, out3 = build_in(repo3, "build", "host")
+    check("an unwritten artifact with NO SIDECAR still refuses (exit 6)",
+          rc3 == buildlock.ARTIFACT_STALE_EXIT, "rc=%d\n%s" % (rc3, out3[-900:]))
+    check("...and says which fact is missing, not that it is stale-by-mtime",
+          "NO SIDECAR" in out3, out3[-900:])
 
 
 def test_verify_artifact(tmp):
@@ -1847,7 +2045,7 @@ def make_output_driver(repo, text, rc=1):
 
 
 def bl(repo, *args, timeout=180):
-    r = subprocess.run([sys.executable, BL, "--repo", repo] + list(args),
+    r = subprocess.run([sys.executable, BL, "--repo", guard_repo(repo)] + list(args),
                        capture_output=True, text=True, timeout=timeout)
     return r.returncode, r.stdout + r.stderr
 
@@ -2100,7 +2298,45 @@ def test_internal_crash_report(tmp):
           CRASH_TAG not in out3 and rc3 == 0, "exit %d\n%s" % (rc3, out3[-400:]))
 
 
+def preflight_sandbox():
+    """Before anything runs: prove the guard exists AND that it can fire.
+
+    A guard nobody can falsify is the defect this suite is full of warnings
+    about, so the FIRST thing checked is that pointing buildlock at the real
+    checkout RAISES, and the second is that a temp repo is NOT refused -- a
+    guard that refuses everything would pass the first check and quietly break
+    every test below.
+    """
+    print("sandbox guard")
+    fired = False
+    try:
+        guard_repo(REPO)
+    except SandboxViolation:
+        fired = True
+    check("guard/fires: aiming a test at the REAL checkout is refused", fired,
+          "guard_repo(%s) returned instead of raising" % REPO)
+    fired2 = False
+    try:
+        buildlock.lock_path(REPO)
+    except SandboxViolation:
+        fired2 = True
+    check("guard/fires: buildlock.lock_path(REAL) is refused too", fired2)
+    with tempfile.TemporaryDirectory() as td:
+        ok = True
+        try:
+            guard_repo(td)
+            buildlock.lock_path(td)
+        except SandboxViolation:
+            ok = False
+        check("guard/does-not-fire-on-a-temp-repo (or it proves nothing)", ok)
+    return (os.path.exists(REAL_LOCK),
+            os.path.getmtime(REAL_LOCK) if os.path.exists(REAL_LOCK) else None)
+
+
 def main():
+    t_suite = time.time()
+    before_lock = preflight_sandbox()
+    print("")
     print("buildlock: FIFO fairness")
     tmp = tempfile.mkdtemp(prefix="buildlock-test-")
     try:
@@ -2167,33 +2403,48 @@ def main():
               "B never won in %d rounds -- the gate is not landing inside the "
               "window, so the fair-mode pass above is NOT evidence" % rw_rounds)
 
-        test_status(tmp)
-        test_fifo_reporting(tmp)
-        test_wait_free(tmp)
-        test_status_streams(tmp)
-        test_forwarding(tmp)
-        test_concurrent_edits(tmp)
-        test_snapshot_unit(tmp)
-        test_snapshot_speed()
-        test_proc_table_real()
-        test_hung_units(tmp)
-        test_hung_verdicts(tmp)
-        test_hung_human_text(tmp)
-        test_hung_across_calls(tmp)
-        test_wait_free_reports_hung(tmp)
-        test_break_hung(tmp)
-        test_artifact_units(tmp)
-        test_artifact_check(tmp)
-        test_verify_artifact(tmp)
-        test_nimlint_units(tmp)
-        test_lint_preflight(tmp)
-        test_internal_crash_units(tmp)
-        test_internal_crash_report(tmp)
+        # Timed individually. "the suite hung" and "the suite is slow" are
+        # different reports, and without a per-test cost nobody can tell them
+        # apart from the outside -- which is exactly what happened on
+        # 2026-09-02 while a real build held the lock.
+        for fn in (test_status, test_fifo_reporting, test_wait_free,
+                   test_status_streams, test_forwarding, test_concurrent_edits,
+                   test_snapshot_unit, test_snapshot_speed,
+                   test_proc_table_real, test_hung_units, test_hung_verdicts,
+                   test_hung_human_text, test_hung_across_calls,
+                   test_wait_free_reports_hung, test_break_hung,
+                   test_artifact_units, test_artifact_check,
+                   test_noop_rebuild_is_up_to_date, test_verify_artifact,
+                   test_nimlint_units, test_lint_preflight,
+                   test_internal_crash_units, test_internal_crash_report):
+            t0 = time.time()
+            fn(tmp)
+            TIMINGS.append((fn.__name__, time.time() - t0))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
-    print("\n%s -- %d failure(s)"
-          % ("FAIL" if FAILURES else "PASS", len(FAILURES)))
+    # A property of the FINISHED STATE, not of our intentions: whatever the
+    # tests did, the real checkout's lock file must be exactly as we found it.
+    # This is the line that would have answered "is the suite blocked on the
+    # live lock, or merely slow?" without anyone having to guess.
+    after = (os.path.exists(REAL_LOCK),
+             os.path.getmtime(REAL_LOCK) if os.path.exists(REAL_LOCK)
+             else None)
+    check("the real checkout's lock file is untouched (%s)" % REAL_LOCK,
+          after[0] == before_lock[0]
+          and (after[1] is None or before_lock[1] is None
+               or abs(after[1] - before_lock[1]) < 0.5),
+          "before=%r after=%r -- a test wrote the LIVE build lock"
+          % (before_lock, after))
+
+    if TIMINGS:
+        print("\nslowest tests")
+        for nm, dt in sorted(TIMINGS, key=lambda x: -x[1])[:6]:
+            print("    %6.1fs  %s" % (dt, nm))
+
+    print("\n%s -- %d failure(s) in %.1fs"
+          % ("FAIL" if FAILURES else "PASS", len(FAILURES),
+             time.time() - t_suite))
     return 1 if FAILURES else 0
 
 

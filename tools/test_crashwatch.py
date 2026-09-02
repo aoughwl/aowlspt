@@ -339,7 +339,7 @@ def t_run_prints_the_block():
     with tempfile.TemporaryDirectory() as td:
         make_folder(td, "Crash_2026-09-02_030042716", SAIN_REPORT)
         started = crashwatch.crash_dir_epoch("Crash_2026-09-02_030042716") - 42
-        info = runmod.crash_evidence(started, root=td)
+        info = runmod.crash_evidence(started, crashes_root=td)
         check("run/evidence/folder",
               info["folder"] == "Crash_2026-09-02_030042716", repr(info))
         check("run/evidence/module", info["module"] == "sain", repr(info))
@@ -366,13 +366,68 @@ def t_run_prints_the_block():
               and "attributed to sain" in out, out[-400:])
 
         started = crashwatch.crash_dir_epoch("Crash_2026-09-02_030042716") + 60
-        info = runmod.crash_evidence(started, root=td)
+        info = runmod.crash_evidence(started, crashes_root=td)
         check("run/evidence/none-newer",
               info["folder"] is None and info["module"] is None, repr(info))
         check("run/evidence/none-says-no-crash-report",
               any("NO CRASH REPORT" in ln for ln in info["lines"]),
               repr(info["lines"]))
         check("run/evidence/none-is-not-silent", len(info["lines"]) >= 1)
+
+
+def t_refuses_a_non_crashes_root():
+    """MEASURED 2026-09-02: `crash_evidence(started, D:\\Aowlspt)` searched the
+    INSTALL root -- a real directory that has never held a report -- and
+    answered "no crash report newer than launch" every single time. The
+    directory existed, the glob ran, the answer was confident, and it could not
+    fail. Both refusals below are checked to be INCONCLUSIVE-shaped, and the
+    positive control at the end proves the guard is not simply refusing
+    everything."""
+    started = time.time() - 60
+
+    # (a) a directory that exists but is not a Crashes root -- the measured bug.
+    with tempfile.TemporaryDirectory() as td:
+        os.makedirs(os.path.join(td, "aowlspt"), exist_ok=True)
+        open(os.path.join(td, "ConsistencyInfo"), "w").close()
+        info = runmod.crash_evidence(started, crashes_root=td)
+        blob = "\n".join(info["lines"])
+        check("refuse/install-root/source-inconclusive",
+              info["source"] == "inconclusive", repr(info["source"]))
+        check("refuse/install-root/not-a-no-report-answer",
+              "NO CRASH REPORT" not in blob.upper()
+              or "INCONCLUSIVE" in blob.upper(), blob)
+        check("refuse/install-root/says-nothing-was-searched",
+              "NOT PERFORMED" in blob and "INCONCLUSIVE" in blob, blob)
+        check("refuse/install-root/names-the-directory", td in blob, blob)
+
+    # (b) a directory that does not exist at all.
+    with tempfile.TemporaryDirectory() as td:
+        gone = os.path.join(td, "no-such-dir")
+        info = runmod.crash_evidence(started, crashes_root=gone)
+        blob = "\n".join(info["lines"])
+        check("refuse/missing-dir/source-inconclusive",
+              info["source"] == "inconclusive", repr(info["source"]))
+        check("refuse/missing-dir/says-why",
+              "does not exist" in blob, blob)
+        check("refuse/missing-dir/folder-is-none", info["folder"] is None)
+
+    # (c) THE POSITIVE CONTROL. Same guard, a directory that HAS held a report:
+    #     it must go through and answer normally, or (a) and (b) prove nothing.
+    with tempfile.TemporaryDirectory() as td:
+        make_folder(td, "Crash_2026-09-02_030042716", SAIN_REPORT)
+        st = crashwatch.crash_dir_epoch("Crash_2026-09-02_030042716") - 5
+        info = runmod.crash_evidence(st, crashes_root=td)
+        check("refuse/control/guard-lets-a-real-root-through",
+              info["source"] != "inconclusive"
+              and info["folder"] == "Crash_2026-09-02_030042716", repr(info))
+
+    # (d) an EMPTY but genuinely-shaped Crashes path is NOT refused -- a client
+    #     that has never crashed must still get a real "no report" answer.
+    ok, why = runmod.looks_like_crashes_root(
+        os.path.join(os.environ.get("LOCALAPPDATA", "C:\\x"), "Temp",
+                     "Battlestate Games", "EscapeFromTarkov", "Crashes"))
+    check("refuse/real-empty-crashes-root-is-accepted-or-absent",
+          ok or "does not exist" in why, why)
 
 
 def t_top_12_is_a_cap():
@@ -397,7 +452,8 @@ def main():
     for fn in (t_parses_sain_frames, t_parses_ga_two_blocks,
                t_not_a_crash_report, t_attribution, t_our_modules_finds_the_mods,
                t_folder_time_is_utc, t_older_folder_ignored,
-               t_run_prints_the_block, t_top_12_is_a_cap):
+               t_run_prints_the_block, t_refuses_a_non_crashes_root,
+               t_top_12_is_a_cap):
         if VERBOSE:
             print("%s:" % fn.__name__)
         try:
