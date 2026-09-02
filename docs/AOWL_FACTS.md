@@ -7631,3 +7631,15 @@ on; site 1 was never bound on any surviving build tonight. Awake runs
 immediately before Show. Bisect step 3 (liveInspector off, which un-wants
 both) running. The two raid-load liveness crashes on this build are
 presumed the same cause until shown otherwise.
+
+## 2026-09-02 09:45: liveness/menu crash bisect, step 3 -- the MenuScreen::Awake detour is the killer
+
+MEASURED (build 4,784,128): liveInspector OFF (which un-wants uihooks sites
+1 and 2 in that build) -> boot survived at the menu; the first show event
+logged was `EFT.UI.MenuScreen::Show(5-arg)`, no Awake. With the inspector
+ON the same build died 3 of 3 times (twice during raid load in the liveness
+walk, once at menu arrival inside MenuScreen::Show right after the first
+MenuScreen::Awake postfix fired). Every surviving build tonight never bound
+site 1. Rule: a postfix on MenuScreen::Awake is not safe on this build as
+stolen; do not want it. Install rolled back to the 4,737,536 build
+(bak-20260902-084933) until the exit-half build drops site 1.
