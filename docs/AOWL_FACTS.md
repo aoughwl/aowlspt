@@ -6084,3 +6084,27 @@ set_isOn is still fine (it is what `forceOfflinePractice` and the inspector do).
 Also from the same pass: the Win64 register index for `this` is 0 (RCX), args
 1/2/3 = RDX/R8/R9. A postfix that read index 1 as `this` would have compared a
 bool against a pointer table -- never matching, no log, feature silently dead.
+
+## The tree-wide `getOrQuit: missing key` crash: bisected to uihooks.nim (2026-09-01 night)
+
+Nimony's hexer (dce pass) died at the nifmake graph stage on EVERY host and
+backend build for ~2 hours, naming no file. Falsified in isolated worktrees
+(concurrent builds in separate worktrees are safe, so the shared checkout was
+never touched): a corrupt shared nimcache (`aowl clean` did not help); the
+driver's new `natesplog` pre-step compiling nelogpol.nim as a module into the
+same cache (disabled -> identical crash). Then an automated include-bisect:
+remove each new host include in turn, classify CRASH vs ORDINARY-errors vs OK.
+`nativetabs` removed -> still CRASH; `uihooks` removed -> ORDINARY errors.
+**`host/Aowlspt.Host.Il2Cpp/uihooks.nim` is the trigger.** The construct is
+being minimised by its author.
+
+Two bisect lessons that cost a probe each: inside a worktree, `git rev-parse
+HEAD` is the WORKTREE's head, not the main checkout's; and a commit that
+contains a re-export shim but not the moved module it re-exports fails with
+"file not found" -- an unrelated failure that looks like the one being hunted.
+
+Uncovered underneath, once the crash was out of the way:
+`aowlhost.nim(2051): undeclared identifier: 'pathGet'` -- the jsonpath move to
+`aowl/src/aowlspt/` left `host/common/jsonpath.nim` as `import
+aowlspt/jsonpath; export jsonpath`, and the host's `import jsonpath` does not
+see the symbols through it. A plain `include` of the moved file is being tested.
