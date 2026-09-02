@@ -7927,3 +7927,75 @@ screen (it pressed the empty "PvE Zone" card). Remedy applied:
 the user is at the machine, no host feature and no tool may drive the slot
 screen; the corrected card-press mode-skip (e5613f3) is deployed only with
 the user's go-ahead.
+
+## 2026-09-02: DERIVED -- a card click is `TweenAnimatedButton::OnPointerClick`, and neither EFT button is a UnityEngine.UI.Button
+
+The guessing stopped here. Everything below is offline metadata plus one
+disassembly, and it contradicts two things this file previously assumed.
+
+**The chain** (`tools/fldoff.py`, `il2cpp_resolve.py typemethods`):
+
+    the card control `Apply`      carries  EFT.UI.DefaultUIButton
+    DefaultUIButton._button @0x108      -> EFT.UI.TweenAnimatedButton
+    DefaultUIButton.OnClick @0x120         UnityEvent  (what we fired)
+    TweenAnimatedButton._interactable @0x68  bool
+    TweenAnimatedButton.OnClick       @0x70  ACTION, not a UnityEvent
+    TweenAnimatedButton::OnPointerClick(PointerEventData) @0x14359B0  UNIQUE
+
+**Neither wrapper derives from `UnityEngine.UI.Button`**: `DefaultUIButton`
+derives from `EFT.UI.ButtonFeedback`, `TweenAnimatedButton` from
+`Sirenix.OdinInspector.SerializedMonoBehaviour`. So `Button::Press` @0x539A7A0
+does **not** apply to either, and calling it on one would be native type
+confusion. (It remains correct for the side selector's `Button` node, which
+really is a `UnityEngine.UI.Button`.)
+
+**The 16 bytes of `OnPointerClick`, which is why NULL is a safe argument:**
+
+    80 79 68 00   cmp  byte [rcx+0x68], 0     ; _interactable
+    74 18         je   +0x18                  ; not interactable -> return
+    48 8B 49 70   mov  rcx, [rcx+0x70]        ; the OnClick Action
+    48 85 C9      test rcx, rcx
+    74 0F         je   +0x0F                  ; null -> return
+    48 ..         (invokes the Action)
+
+The `PointerEventData` in RDX is **never read**. That is the disassembly of the
+function, not an assumption about Unity, so calling it with NULL runs exactly
+the code a real click runs.
+
+**Why the direct UnityEvent invoke was wrong:** firing `DefaultUIButton.OnClick`
+@0x120 reaches the same handler but skips this gate, and MEASURED 2026-09-02 it
+left the profile/mode screen HALF-TRANSITIONED with neither card clickable -- a
+user-visible regression. Going through the button's own entry point also makes an
+`_interactable == false` control a no-op BY CONSTRUCTION instead of something
+this host has to model.
+
+**And the Submit shape was NOT the bug.**
+`CharacterSelectionScreenController::Submit(EGameMode gameMode,
+CharacterSelectionProfileData profileData)` -- arity 2, RVA `0x13F0BF0`, UNIQUE --
+matches what `aowl_msk_call_submit` passed exactly (RCX=this, RDX=gameMode,
+R8=profileData, R9=MethodInfo*). The `Profile == 1` in the crash dump is an
+argument of `MenuScreen::Show`, downstream, produced by the game's own flow after
+an out-of-band Submit. A correct call at the wrong point in a flow is still
+wrong; the signature was never the defect.
+
+`arPress` now routes every `DefaultUIButton` through the player's path, with the
+old direct invoke kept only as an announced fallback, and modeskip's NO-READBACK
+line reads `_interactable` back and states whether the card is still clickable.
+This host writes nothing to the screen, so there is nothing to undo -- and the
+log says that rather than leaving it to be assumed.
+
+## 2026-09-02 11:50 (clock): the slot card, live
+
+MEASURED on the parked "SELECT PROFILE AND MODE" screen: rootless `find
+CharacterSlotView_pvp 200000` hits 0x155f3428dc0 -- activeInHierarchy=FALSE
+(the Login UI twin). Its components: RectTransform, LayoutElement,
+CanvasRenderer, EFT.UI.CharacterSelectionSlotViewBase, EFT.UI.NonDrawingGraphic,
+EFT.UI.ButtonFeedback (click sound, presses nothing). Subtree: BgGlow
+(Idle/Hover), BgImage, BgSide, View (PlayerModelView/Empty), InfoPart
+(Header, CharacterInfo, ButtonContainer with 2 children). The player's click
+lands on ButtonContainer's children; the mode-skip's Apply press likely hit
+the INACTIVE twin (ShowSlot's receiver), which reports success and does
+nothing.
+Tool defect: `find X in Menu UI` takes ONE token as the root and resolved
+"Menu" to "Context Menu Area" by substring, then reported "genuinely NOT
+PRESENT"; `in "Menu UI"` finds no root at all.
