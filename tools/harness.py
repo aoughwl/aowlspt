@@ -304,6 +304,17 @@ def cmd_run(args):
     if not args.keep:
         # The launcher kills the backend it started when it exits; the client
         # it deliberately never kills, so that is ours to do.
+        # Recorded BEFORE the kill, so run.py can report a death here as
+        # KILLED-BY-TOOL instead of as a crash. See tools/runledger.py; a
+        # silently stopped client is indistinguishable from a crashed one.
+        try:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            import runledger as _rl
+            _rl.record("harness.py",
+                       "harness run finished without --keep: stopping the "
+                       "client and the backend", root=root)
+        except Exception:
+            pass
         try:
             proc.terminate()
         except Exception:

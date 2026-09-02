@@ -477,6 +477,26 @@ def kill_game(signature, detail, procs=None, killer=None):
     """
     procs = procs if procs is not None else PROCS
     victims = list_pids(procs) if killer is None else killer("list", procs)
+    # THE MACHINE-READABLE HALF of rule 2, added 2026-09-02. The loud sink line
+    # below is for a human reading this tool's own log; the ledger is what
+    # run.py reads back, so a client killed here is reported as KILLED-BY-TOOL
+    # rather than as a crash. Written BEFORE the kill, and never allowed to
+    # raise: bookkeeping must not be able to block a kill.
+    #
+    # ONLY on a REAL kill (`killer is None`). The selftest injects `killer` and
+    # stops nothing; writing a ledger entry there would tell run.py that
+    # crashwatch had killed a client it never touched -- a fabricated
+    # attribution, which is the exact failure this ledger exists to prevent.
+    if killer is None:
+        try:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            import runledger as _rl
+            _rl.record("crashwatch.py",
+                       "force-kill on signature %r (%s)"
+                       % (signature, (detail or "")[:120]),
+                       pids=[p for p, _n in victims] or None)
+        except Exception:
+            pass
     names = ", ".join("%s(%d)" % (n, p) for p, n in victims) or "nothing running"
     emit("%s|KILL|crashwatch|FORCE-KILLING THE GAME on signature %r (%s) -- "
          "killed: %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), signature,
@@ -1502,6 +1522,375 @@ def format_crash_report(rep, start_epoch=None, top=12, ours=None, indent="   ",
     return lines
 
 
+# ---------------------------------------------------------------------------
+# FAIL-FAST: the death Unity's crash handler NEVER sees
+#
+# MEASURED 2026-09-02 13:18. A client died with NO Crash_* folder at all, and
+# "no crash report newer than launch" was read -- wrongly -- as a teardown or a
+# clean exit. It was neither: it was 0xc0000409 FAST_FAIL_FATAL_APP_EXIT, an
+# abort() out of a mimalloc assertion inside a MOD DLL. `__fastfail` does not
+# raise a catchable SEH exception and does not run the process's unhandled
+# exception filter, so Unity's handler is never entered and writes nothing.
+#
+# The OS, however, records it in three places, and all three were sitting there:
+#
+#   1. the Application event log -- provider `Application Error` (faulting
+#      module, exception code, fault offset) and `Windows Error Reporting`;
+#   2. %LOCALAPPDATA%\CrashDumps\EscapeFromTarkov.exe.<pid>.dmp, when
+#      LocalDumps is configured;
+#   3. that dump, read by cdb -- and cdb's `k` names OUR DLLs and nim procs
+#      (`admin!mi_assert_fail` <- `admin!mi_malloc` <- ... <- `admin!onUpdate`),
+#      which is the whole answer in one line.
+#
+# So the rule, and it is the point of this section: a death may be called a
+# teardown or an exit ONLY when the Crash_* folders, the event log AND
+# CrashDumps are ALL empty -- and only when each of those questions was
+# actually ASKED and ANSWERED. A query that failed is INCONCLUSIVE and must
+# never collapse into "nothing was found".
+# ---------------------------------------------------------------------------
+
+WER_PROVIDERS = ("Application Error", "Windows Error Reporting")
+WER_IMAGE = "EscapeFromTarkov.exe"
+CRASHDUMPS_DIR = os.path.join(
+    os.environ.get("LOCALAPPDATA", r"C:\Users\Default\AppData\Local"),
+    "CrashDumps")
+CDB_EXE = r"C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe"
+
+# Printed by the PowerShell probe as its LAST line. Its absence means the query
+# did not complete, which is a different answer from "no events".
+WER_DONE = "===WERDONE==="
+WER_SEP = "===EVENT==="
+
+# `Exception code: 0xc0000409` -- the one that started this.
+FAST_FAIL_CODE = 0xC0000409
+EXC_NAMES = {
+    0xC0000409: "STATUS_STACK_BUFFER_OVERRUN / FAST_FAIL_FATAL_APP_EXIT -- a "
+                "__fastfail or abort(), NOT a page fault. Unity's crash "
+                "handler never sees this one.",
+    0xC0000005: "ACCESS_VIOLATION",
+    0xC000001D: "ILLEGAL_INSTRUCTION",
+    0x80000003: "BREAKPOINT",
+    0xE0434352: "a managed (.NET/CLR) exception",
+}
+
+WER_FIELDS = (
+    ("module", re.compile(r"Faulting module name:\s*([^,\r\n]+)")),
+    ("app", re.compile(r"Faulting application name:\s*([^,\r\n]+)")),
+    ("code", re.compile(r"Exception code:\s*(0x[0-9A-Fa-f]+)")),
+    ("offset", re.compile(r"Fault offset:\s*(0x[0-9A-Fa-f]+)")),
+    ("pid", re.compile(r"Faulting process id:\s*(0x[0-9A-Fa-f]+|\d+)")),
+    ("path", re.compile(r"Faulting module path:\s*([^\r\n]+)")),
+)
+
+
+def _ps(script, timeout=120, runner=None):
+    """(rc, text) from PowerShell. Never raises; injectable for tests."""
+    if runner is not None:
+        return runner(script)
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive",
+                            "-Command", script],
+                           capture_output=True, text=True, timeout=timeout)
+    except Exception as e:
+        return 127, "could not run PowerShell (%s: %s)" % (type(e).__name__, e)
+    return r.returncode, (r.stdout or "") + (r.stderr or "")
+
+
+def wer_query_script(since_local):
+    """The Application-log query, as one PowerShell command.
+
+    Filtered server-side by StartTime so the whole log is never materialised
+    (it is routinely six figures of records), then narrowed to the two
+    providers that record a process death and to messages naming the client.
+    """
+    return (
+        "$ErrorActionPreference='SilentlyContinue';"
+        "$e = Get-WinEvent -FilterHashtable @{LogName='Application'; "
+        "StartTime=[datetime]'%s'} -ErrorAction SilentlyContinue;"
+        "foreach ($x in $e) { if (($x.ProviderName -eq 'Application Error' -or "
+        "$x.ProviderName -eq 'Windows Error Reporting') -and "
+        "($x.Message -like '*%s*')) { "
+        "Write-Output '%s'; "
+        "Write-Output $x.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss'); "
+        "Write-Output $x.ProviderName; Write-Output $x.Message } };"
+        "Write-Output '%s'" % (since_local, WER_IMAGE, WER_SEP, WER_DONE))
+
+
+def parse_wer_output(text):
+    """([event, ...], note) or (None, why) when the query did not complete.
+
+    None is the INCONCLUSIVE state and callers must keep it: "I could not read
+    the event log" is not "the client did not crash".
+    """
+    if text is None:
+        return None, "the event-log query produced no output at all"
+    if WER_DONE not in text:
+        return None, ("the event-log query did not complete (no %s marker) -- "
+                      "this is INCONCLUSIVE, not 'no events'. Output was: %s"
+                      % (WER_DONE, (text or "").strip()[:300]))
+    body = text.split(WER_DONE)[0]
+    out = []
+    for chunk in body.split(WER_SEP)[1:]:
+        lines = chunk.strip().splitlines()
+        if len(lines) < 2:
+            continue
+        ev = {"when": lines[0].strip(), "provider": lines[1].strip(),
+              "message": "\n".join(lines[2:]).strip()}
+        for name, rx in WER_FIELDS:
+            m = rx.search(ev["message"])
+            ev[name] = m.group(1).strip() if m else None
+        out.append(ev)
+    return out, None
+
+
+def wer_events(since, runner=None):
+    """([event, ...], note). `None` for the list means the query FAILED."""
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(since))
+    rc, text = _ps(wer_query_script(stamp), runner=runner)
+    evs, why = parse_wer_output(text)
+    if evs is None and rc != 0:
+        why = ("the event-log query exited %d: %s"
+               % (rc, (text or "").strip()[:300]))
+    return evs, why
+
+
+def crash_dumps(since, directory=None):
+    """(dumps, note) -- WER LocalDumps files newer than launch.
+
+    An ABSENT directory is a fact ("Windows only writes there when LocalDumps
+    is configured"), not a failure, and it is stated: a reader must not take an
+    empty list for proof that no dump was written if the feature was simply off.
+    """
+    d = directory or CRASHDUMPS_DIR
+    if not os.path.isdir(d):
+        return [], ("%s does not exist -- LocalDumps is not configured, so the "
+                    "ABSENCE of a dump here proves nothing" % d)
+    out = []
+    try:
+        for name in os.listdir(d):
+            if not name.lower().endswith(".dmp"):
+                continue
+            if WER_IMAGE.lower() not in name.lower():
+                continue
+            p = os.path.join(d, name)
+            try:
+                mt = os.path.getmtime(p)
+            except OSError:
+                continue
+            if since is None or mt > since:
+                out.append((mt, p))
+    except OSError as e:
+        return None, "could not list %s: %s" % (d, e)
+    out.sort(reverse=True)
+    return [p for _mt, p in out], None
+
+
+CDB_CMD = ".ecxr; k 40; q"
+
+
+def cdb_stack(dmp, cdb=None, runner=None, timeout=300):
+    """(call-site lines, note). `None` for the lines means cdb could not run.
+
+    cdb's `k` is the only thing in this whole file that names a nim proc inside
+    one of our mod DLLs. When it is absent that is SAID, and the caller falls
+    back to dmpread's registers rather than printing nothing.
+    """
+    exe = cdb or CDB_EXE
+    if not os.path.isfile(exe):
+        return None, ("cdb.exe is NOT installed at %s, so the call stack of "
+                      "this dump was not read. Install the Windows SDK "
+                      "Debugging Tools, or read the registers below." % exe)
+    cmd = [exe, "-z", dmp, "-c", CDB_CMD]
+    if runner is not None:
+        rc, text = runner(cmd)
+    else:
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=timeout)
+            rc, text = r.returncode, (r.stdout or "") + (r.stderr or "")
+        except Exception as e:
+            return None, ("cdb exists but could not be run (%s: %s)"
+                          % (type(e).__name__, e))
+    lines = [l.rstrip() for l in (text or "").splitlines()]
+    out = []
+    seen = False
+    for l in lines:
+        if "Call Site" in l:
+            seen = True
+            out.append(l)
+            continue
+        if not seen:
+            continue
+        if not l.strip() or l.strip().startswith("quit:"):
+            break
+        out.append(l)
+    if not out:
+        return None, ("cdb ran (exit %d) but printed no `Call Site` column -- "
+                      "the stack was NOT read. Its output began: %s"
+                      % (rc, " / ".join(l for l in lines if l.strip())[:300]))
+    return out, None
+
+
+def code_int(code):
+    """The exception code as an int, or None. Never guesses at a bad string."""
+    try:
+        s = str(code).strip()
+        return int(s, 16) if s.lower().startswith("0x") else int(s)
+    except (TypeError, ValueError):
+        return None
+
+
+def code_name(code):
+    n = code_int(code)
+    return None if n is None else EXC_NAMES.get(n)
+
+
+# The four states a vanished client can be in. Three, never two -- and the
+# fourth is INCONCLUSIVE, which is what the old code silently collapsed into
+# "teardown".
+DEATH_NATIVE = "NATIVE-CRASH"
+DEATH_FAILFAST = "FAIL-FAST"
+DEATH_OS_DUMP = "OS-DUMP"
+DEATH_QUIET = "EXIT-OR-TEARDOWN"
+DEATH_UNKNOWN = "INCONCLUSIVE"
+
+
+def death_kind(crash_folder, events, dumps, events_note=None,
+               dumps_note=None):
+    """(kind, sentence). THE rule this section exists to enforce.
+
+    `events` / `dumps` are None when their question could not be answered.
+    "teardown or exit" is reachable ONLY when all three sources were asked and
+    all three came back empty -- which is what makes it falsifiable.
+    """
+    if crash_folder:
+        return (DEATH_NATIVE,
+                "Unity's crash handler wrote %s, so this was a native fault it "
+                "could see." % os.path.basename(str(crash_folder)))
+    if events is None:
+        return (DEATH_UNKNOWN,
+                "no Crash_* folder, and the Windows event log could NOT be "
+                "queried (%s). This is INCONCLUSIVE -- a fail-fast "
+                "(0xc0000409) leaves no Crash_* folder at all, so absence of "
+                "one is not evidence of a teardown."
+                % (events_note or "no reason given"))
+    if events:
+        codes = set(e.get("code") for e in events if e.get("code"))
+        fast = any(code_int(c) == FAST_FAIL_CODE for c in codes)
+        mods = sorted(set(e.get("module") for e in events if e.get("module")))
+        return ((DEATH_FAILFAST if fast else DEATH_NATIVE),
+                "no Crash_* folder, but the Windows Application log recorded "
+                "%d %s event(s) for %s: code(s) %s, faulting module(s) %s. "
+                "This was a CRASH, not a teardown%s."
+                % (len(events), "/".join(sorted(set(e["provider"]
+                                                    for e in events))),
+                   WER_IMAGE, ", ".join(sorted(codes)) or "unstated",
+                   ", ".join(mods) or "unstated",
+                   " -- __fastfail/abort(), which Unity's handler never sees"
+                   if fast else ""))
+    if dumps is None:
+        return (DEATH_UNKNOWN,
+                "no Crash_* folder, no matching event-log entry, and "
+                "%%LOCALAPPDATA%%\\CrashDumps could not be listed (%s)."
+                % (dumps_note or "no reason given"))
+    if dumps:
+        return (DEATH_OS_DUMP,
+                "no Crash_* folder and no event-log entry, but Windows wrote "
+                "%d dump(s) under CrashDumps after launch (%s). A dump is a "
+                "crash." % (len(dumps), os.path.basename(dumps[0])))
+    return (DEATH_QUIET,
+            "asked all three -- no Crash_* folder newer than launch, no "
+            "`Application Error`/`Windows Error Reporting` entry naming %s, "
+            "and no new dump under CrashDumps%s. Only now does this read as a "
+            "teardown or an exit rather than a crash."
+            % (WER_IMAGE, (" (%s)" % dumps_note) if dumps_note else ""))
+
+
+def format_wer(since, indent="   ", ps_runner=None, cdb_runner=None,
+               dumps_dir=None, cdb=None, dmpread_lines=None,
+               crash_folder=None):
+    """(lines, kind, detail). The block run.py prints, and `crashwatch.py wer`.
+
+    Every one of the three questions is asked and REPORTED, including when the
+    answer is "I could not look".
+    """
+    lines = []
+    evs, note = wer_events(since, runner=ps_runner)
+    lines.append("Windows Application event log since launch:")
+    if evs is None:
+        lines.append(indent + "COULD NOT LOOK -- " + (note or "unstated"))
+    elif not evs:
+        lines.append(indent + "no `Application Error` / `Windows Error "
+                              "Reporting` entry naming %s" % WER_IMAGE)
+    else:
+        for e in evs[:6]:
+            lines.append(indent + "%s  %s" % (e["when"], e["provider"]))
+            lines.append(indent + "   faulting module %s  code %s  offset %s"
+                         % (e.get("module") or "(unstated)",
+                            e.get("code") or "(unstated)",
+                            e.get("offset") or "(unstated)"))
+            cn = code_name(e.get("code"))
+            if cn:
+                lines.append(indent + "   %s" % cn)
+        if len(evs) > 6:
+            lines.append(indent + "... %d more event(s)" % (len(evs) - 6))
+
+    dumps, dnote = crash_dumps(since, directory=dumps_dir)
+    lines.append("%LOCALAPPDATA%\\CrashDumps newer than launch:")
+    if dumps is None:
+        lines.append(indent + "COULD NOT LOOK -- " + (dnote or "unstated"))
+    elif not dumps:
+        lines.append(indent + "none" + ((" -- " + dnote) if dnote else ""))
+    else:
+        for p in dumps[:5]:
+            lines.append(indent + p)
+
+    if dumps:
+        stack, snote = cdb_stack(dumps[0], cdb=cdb, runner=cdb_runner)
+        lines.append("cdb -z %s -c %r:" % (os.path.basename(dumps[0]), CDB_CMD))
+        if stack is None:
+            lines.append(indent + "NOT READ -- " + (snote or "unstated"))
+            for l in (dmpread_lines or []):
+                lines.append(indent + l)
+            if not dmpread_lines:
+                lines.append(indent + "(no dmpread registers were supplied "
+                                      "either, so nothing describes this "
+                                      "dump's faulting instruction)")
+        else:
+            for l in stack[:45]:
+                lines.append(indent + l)
+
+    kind, sentence = death_kind(crash_folder, evs, dumps, note, dnote)
+    lines.append("DEATH KIND  %s -- %s" % (kind, sentence))
+    return lines, kind, {"events": evs, "dumps": dumps, "events_note": note,
+                         "dumps_note": dnote}
+
+
+def cmd_wer(argv):
+    """`crashwatch.py wer [--since EPOCH|ISO] [--minutes N]` -- standalone."""
+    since = time.time() - 3600.0
+    rest = list(argv)
+    if "--since" in rest:
+        v = rest[rest.index("--since") + 1]
+        try:
+            since = float(v)
+        except ValueError:
+            since = time.mktime(time.strptime(v, "%Y-%m-%d %H:%M:%S"))
+    if "--minutes" in rest:
+        since = time.time() - 60.0 * float(rest[rest.index("--minutes") + 1])
+    emit("since %s" % time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(since)))
+    rep = newest_crash_report(since=since)
+    folder = rep.folder if rep is not None else None
+    if folder:
+        emit("Crash_* folder newer than launch: %s" % folder)
+    else:
+        emit("no Crash_* folder newer than that time")
+    lines, _kind, _d = format_wer(since, crash_folder=folder)
+    for l in lines:
+        emit(l)
+    return 0
+
+
 def cmd_last(argv):
     """`crashwatch.py last [N]` -- the morning read, one command."""
     n = 3
@@ -1556,6 +1945,8 @@ def main():
     # this tool otherwise uses purely for flags.
     if sys.argv[1:2] == ["last"]:
         return cmd_last(sys.argv[2:])
+    if sys.argv[1:2] == ["wer"]:
+        return cmd_wer(sys.argv[2:])
     p = argparse.ArgumentParser(
         description="watch the live EFT client's logs; kill + report on a crash",
         formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)

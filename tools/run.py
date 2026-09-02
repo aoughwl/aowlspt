@@ -7,7 +7,8 @@ verdict small enough to read.
     python tools/run.py --inspect "state" "find SettingsScreen"
     python tools/run.py --attach              the game is already running
     python tools/run.py --json                machine-readable, one line
-    python tools/run.py --keep                leave the client up afterwards
+    python tools/run.py --teardown            stop the client at the verdict
+                                              (NOT the default any more)
 
 ## Why this exists
 
@@ -40,7 +41,15 @@ every outcome that has actually happened on this project.
                   `EFT.BotsController.UpdateByUnity`) in every raid, and that
                   alone once produced `CRASH` at 0.5s for a client standing in
                   a raid. See Supervisor.poll_client.
-    DIED          the process is gone. Exit 1.
+    DIED          the process is gone. Exit 1. NEVER printed bare: a DIED
+                  verdict always carries the DIED FORENSICS block (the crash
+                  report, crashwatch's frames, dmpread's faulting registers and
+                  `il2cpp_resolve disasm` at the faulting RVA) or an explicit
+                  sentence saying why each of those could not be collected.
+    KILLED-BY-TOOL <tool> <reason>
+                  the process is gone AND a tool recorded a teardown within 10s
+                  of it in aowlspt-teardown.jsonl. Exit 11. This is our own
+                  kill, not the client's fault.
     TIMEOUT       none of the above within --timeout. Exit 2.
     STALLED       it got somewhere real and then stopped getting anywhere: one
                   raid phase, unchanged, past --phase-max, while the host is
@@ -88,19 +97,33 @@ top frame's module. When no report newer than launch exists it says `NO CRASH
 REPORT was written`, which is a fact and not an absence: that death was a
 teardown or an exit, not a native fault. Parsing lives in `crashwatch.py`.
 
-## It STOPS the client when it is done, and it says so
+## It does NOT stop the client any more unless you ask (changed 2026-09-02)
 
-Without `--keep` (and without `--attach`), the client, the backend and the
-launcher are force-stopped the moment the verdict lands. That default is
-right -- the host DLL is locked while the game runs -- but it was SILENT, and a
-silently stopped client is indistinguishable, after the fact, from one that
-crashed: the host log just ends, on a heartbeat, with no fault and no crash
-folder. That cost twenty minutes once.
+`--keep` used to be opt-in, and the default force-stopped the client, the
+backend and the launcher the moment the verdict landed. Read afterwards, that is
+indistinguishable from a clean crash -- the host log ends on a heartbeat, with
+no fault and no crash folder -- and it was mistaken for one three times, ~20
+minutes each. Stopping the Bash task that launched a run did the same thing.
 
-So the teardown announces itself twice: a `TEARDOWN:` line inside the verdict
-block, and a timestamped line appended to `aowlspt-run-teardown.log` beside the
-host log, written BEFORE anything is killed. `--dry-teardown` does both and
-kills nothing.
+So the default is now to LEAVE THE CLIENT RUNNING. `--teardown` asks for the old
+behaviour and prints a line saying so; `--keep` is still accepted and does
+nothing, so old callers and recipes keep working.
+
+Every teardown, by any tool, is also recorded as one JSON line in
+`aowlspt-teardown.jsonl` (`tools/runledger.py`) BEFORE anything is killed. A
+death within 10s of such an entry is reported as `KILLED-BY-TOOL <tool>
+<reason>` (exit 11), never as DIED. The prose `TEARDOWN:` line in the verdict
+block and the timestamped `aowlspt-run-teardown.log` note both remain.
+`--dry-teardown` does all the announcing and kills nothing.
+
+## It prints what the boot is carrying, BEFORE it launches
+
+`this boot carries: host DLL <size> built <time> from <sha or dirty: N files>;
+<K> commits and <M> uncommitted host/mod files since the previous boot`, and a
+WARN when K+M is over 4: *a crash on this boot cannot be attributed without a
+bisect*. All of it is derived -- the deployed DLL's size and mtime, `git log
+--since` the previous recorded launch, `git status --porcelain` -- and anything
+that could not be measured prints as `?` with a reason, never as a zero.
 
 ## Token discipline
 
@@ -132,6 +155,7 @@ sys.path.insert(0, HERE)
 import crashwatch  # noqa: E402  -- reuse the measured signatures, do not restate
 import popups     # noqa: E402  -- native dialogs, which reach NO log at all
 import harness     # noqa: E402  -- reuse the launcher + process check
+import runledger   # noqa: E402  -- the teardown + boot ledgers, one definition
 
 DEFAULT_ROOT = r"D:\Aowlspt"
 
@@ -411,19 +435,33 @@ EXIT = {
     # (nothing is wedged and the host is alive and heartbeating) so a caller
     # can branch on "it parked one screen short" without parsing prose.
     "PARKED-BEFORE-MENU": 10,
+    # A TOOL stopped the client. Not a death: `run.py`'s own teardown, a
+    # deploy, crashwatch's killer or a reaped harness. Distinct from DIED so a
+    # caller can never mistake our own kill for the client's fault -- measured
+    # cost of NOT having this: three chased "crashes" at ~20 minutes each.
+    "KILLED-BY-TOOL": 11,
 }
+
+# The verdict token is `KILLED-BY-TOOL <tool> <reason>`, so the exit code is
+# looked up on the FIRST WORD. Stated here rather than inline because it is the
+# only verdict whose printed name carries data.
+def exit_code(verdict):
+    return EXIT.get((verdict or "").split(" ", 1)[0], EXIT["INCONCLUSIVE"])
 
 
 def install_dir(root):
-    return os.path.join(root, "aowlspt")
+    # ONE definition, in runledger, so the ledgers and the logs cannot end up in
+    # two different directories.
+    return runledger.install_dir(root)
 
 
 # The single sentence a later reader needs. It is one literal so the console
 # block and the on-disk note cannot drift apart -- a warning that says two
 # slightly different things in two places is how you end up trusting neither.
 TEARDOWN_LINE = ("TEARDOWN: stopping the client, backend and launcher now "
-                 "(no --keep). If you meant to keep driving it, rerun with "
-                 "--keep.")
+                 "(you passed --teardown). This is recorded in "
+                 "aowlspt-teardown.jsonl, so a later reader can tell this stop "
+                 "from a crash. Drop --teardown to leave the client running.")
 
 # Written next to aowlspt-host.log, deliberately: whoever is reading the host
 # log after the fact is already in that directory.
@@ -433,7 +471,8 @@ STOP_PS = ("Get-Process -Name EscapeFromTarkov,aowlspt-backend,aowlspt-launch "
            "-ErrorAction SilentlyContinue | Stop-Process -Force")
 
 
-def do_teardown(root, dry=False):
+def do_teardown(root, dry=False, reason="--teardown: stopping the client at "
+                                        "the verdict"):
     """Stop the client -- and LEAVE A TRACE THAT WE DID.
 
     Measured cost, 2026-09-01: ~20 minutes. `run.py` without `--keep` kills the
@@ -452,6 +491,17 @@ def do_teardown(root, dry=False):
     The note is written BEFORE the kill, so it exists even if the kill hangs or
     this process is itself reaped mid-teardown.
     """
+    # THE LEDGER FIRST. The prose note below is for a human reading the
+    # directory; this is the machine-readable half that run.py's own DIED path
+    # reads back, and it is written BEFORE anything is stopped so it survives a
+    # kill that reaps us too.
+    if runledger.record("run.py", reason + ("  (--dry-teardown: nothing was "
+                                            "stopped)" if dry else ""),
+                        root=root) is None:
+        print("  (could not write the teardown ledger at %s -- a death in the "
+              "next %ds will NOT be attributable to this stop)"
+              % (runledger.teardown_path(root), runledger.KILLED_WINDOW_S),
+              flush=True)
     stamp = time.strftime("%Y-%m-%d %H:%M:%S")
     note = os.path.join(install_dir(root), TEARDOWN_LOG)
     try:
@@ -1122,7 +1172,7 @@ class Supervisor:
                 % int(stall), self.host_tail[-3:])
 
 
-def crash_evidence(started, root=None):
+def crash_evidence(started, root=None, symbolize=True):
     """What Unity's OWN crash handler recorded about this death, if anything.
 
     Returns a dict: `lines` is the block to print, and the rest is the same
@@ -1145,30 +1195,345 @@ def crash_evidence(started, root=None):
                 "lines": ["crash report lookup FAILED (%s: %s) -- this is "
                           "INCONCLUSIVE, not 'no crash report'"
                           % (type(e).__name__, e)]}
-    lines = crashwatch.format_crash_report(rep, start_epoch=started)
+    lines = crashwatch.format_crash_report(rep, start_epoch=started,
+                                           symbolize=symbolize)
     if rep is None:
-        return {"folder": None, "module": None, "source": "none",
-                "age_s": None, "modules": [], "lines": lines}
+        return {"folder": None, "path": None, "module": None, "source": "none",
+                "age_s": None, "modules": [], "modlines": [], "lines": lines}
     mod, source, _frame, _note = rep.attribute()
-    return {"folder": os.path.basename(rep.folder), "module": mod,
+    return {"folder": os.path.basename(rep.folder), "path": rep.folder,
+            "module": mod,
             "source": source, "age_s": (None if rep.age_after(started) is None
                                         else round(rep.age_after(started), 1)),
-            "modules": sorted(rep.modules), "lines": lines}
+            "modules": sorted(rep.modules), "modlines": list(rep.modlines),
+            "lines": lines}
+
+
+# ---------------------------------------------------------------------------
+# DIED FORENSICS -- automatic, because nobody reads them otherwise
+#
+# MEASURED, the night of 2026-09-01: every "clean" client death had a Unity
+# crash report AND a minidump naming the faulting argument in registers, and
+# ~2.5 hours went into theories before anyone opened either. The tools existed
+# the whole time (`crashwatch.py last`, `dmpread.py`, `il2cpp_resolve.py
+# disasm`); what did not exist was anything that ran them WITHOUT being asked.
+#
+# So a DIED verdict now costs four tool calls it never has to be told to make,
+# and the rule is absolute: a DIED line NEVER appears without this block or
+# without an explicit `forensics unavailable because ...`. A skipped step must
+# read as skipped -- CLAUDE.md 9b, "I could not look" is not a pass -- so every
+# refusal any of these tools emits is printed VERBATIM and nothing is swallowed.
+# ---------------------------------------------------------------------------
+
+DMPREAD_PY = os.path.join(HERE, "dmpread.py")
+RESOLVE_PY = os.path.join(HERE, "il2cpp_resolve.py")
+
+FORENSICS_HEADER = "DIED FORENSICS (run automatically -- read these first)"
+
+# `thread 12  ACCESS_VIOLATION (0xc0000005)  at 0x7ffb2c0be110`
+FAULT_AT_RX = re.compile(r"\bat 0x([0-9A-Fa-f]+)")
+
+# How much of a tool's own output is reproduced. These are short by
+# construction (dmpread prints a fault line plus 5 register rows); the cap only
+# bounds a pathological answer, and it SAYS when it truncates.
+TOOL_LINE_CAP = 40
+
+
+def _run_tool(cmd, timeout=180):
+    """(rc, text). Never raises -- a tool that cannot be run is a REFUSAL to
+    print, not an exception that hides the whole block."""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except Exception as e:
+        return 127, ("could not run %s (%s: %s)"
+                     % (" ".join(cmd), type(e).__name__, e))
+    return r.returncode, (r.stdout or "") + (r.stderr or "")
+
+
+def _tool_lines(text, cap=TOOL_LINE_CAP):
+    ls = [l.rstrip() for l in (text or "").splitlines() if l.strip()]
+    if len(ls) > cap:
+        ls = ls[:cap] + ["... %d more line(s) from this tool, not shown"
+                         % (len(ls) - cap)]
+    return ls or ["(the tool printed nothing at all)"]
+
+
+def module_for_va(modlines, va):
+    """(name, base, size) of the loaded module containing `va`, or None.
+
+    The bases come from the crash report's own module list, because
+    GameAssembly.dll is ASLR-relocated and 0x180000000 is only its PREFERRED
+    base -- hardcoding that is how an RVA ends up 200MB wrong.
+    """
+    try:
+        import il2cpp_resolve as ir
+    except Exception:
+        return None
+    try:
+        bases = ir.parse_module_bases(list(modlines or []))
+    except Exception:
+        return None
+    for name, (base, size) in sorted(bases.items()):
+        if name.endswith(":conflict"):
+            continue
+        if base <= va < base + size:
+            return (name, base, size)
+    return None
+
+
+def disasm_excerpt(text):
+    """The four things worth reading out of `il2cpp_resolve.py disasm`.
+
+    owner / args / CAVEAT lines, then the `>>` line (the faulting instruction)
+    and the three after it. If there is no `>>` line the excerpt SAYS so -- a
+    disasm whose window never covered the address proves nothing and must not
+    be presented as if it had.
+    """
+    lines = [l.rstrip() for l in (text or "").splitlines()]
+    head = [l for l in lines
+            if l.startswith(("disasm ", "named ", "owner ", "args ",
+                             "CAVEAT ", "REFUSED", "INCONCLUSIVE", "NOTE "))]
+    hit = None
+    for i, l in enumerate(lines):
+        if l.startswith(">>"):
+            hit = i
+            break
+    if hit is None:
+        return head + ["no `>>` line: this disassembly never reached the "
+                       "faulting address, so it does NOT show the faulting "
+                       "instruction"]
+    return head + lines[hit:hit + 4]
+
+
+def died_forensics(started, crash=None, runner=None, resolve_paths=None,
+                   crash_root=None, symbolize=True, wer=True, ps_runner=None,
+                   cdb_runner=None, dumps_dir=None, cdb=None):
+    """(lines, kind) -- the block printed before any DIED exit line.
+
+    Six questions, in the order that answers a death fastest:
+      1. did Unity write a crash report newer than this launch?
+      2. what do the crash-site frames say (crashwatch, symbolized)?
+      3. what were the registers at the faulting instruction (dmpread)?
+      4. what IS that instruction (il2cpp_resolve disasm, owner + args + `>>`)?
+      5. what does the WINDOWS event log say -- because a fail-fast
+         (0xc0000409, abort()/__fastfail out of a mod) writes NO Crash_* folder
+         at all, and reading that absence as a teardown was wrong on
+         2026-09-02 13:18;
+      6. is there a WER dump, and what does cdb's `k` name in it? That column
+         is what prints `admin!mi_assert_fail <- ... <- admin!onUpdate`.
+
+    `kind` is crashwatch's death classification (NATIVE-CRASH / FAIL-FAST /
+    OS-DUMP / EXIT-OR-TEARDOWN / INCONCLUSIVE). Every question can answer "I
+    could not look", and each says so in its own words. The runners are
+    injectable so tools/test_supervise.py can drive the whole path, including
+    the branches that need a real minidump, a real event log and cdb.
+    """
+    runner = runner or _run_tool
+    out = [FORENSICS_HEADER]
+    crash, native, dmp_lines = _unity_forensics(
+        started, crash, runner, resolve_paths, crash_root, symbolize)
+    out += native
+    if not wer:
+        out.append("4. Windows     NOT LOOKED AT: the event-log / CrashDumps / "
+                   "cdb pass was disabled for this call, so NOTHING here may "
+                   "be read as 'not a crash'.")
+        return out, crashwatch.DEATH_UNKNOWN
+    out.append("4. Windows     the OS's own record -- a fail-fast (0xc0000409) "
+               "writes NO Crash_* folder, so absence of one is not a teardown")
+    try:
+        wlines, kind, _detail = crashwatch.format_wer(
+            started, ps_runner=ps_runner, cdb_runner=cdb_runner,
+            dumps_dir=dumps_dir, cdb=cdb, dmpread_lines=dmp_lines,
+            crash_folder=crash.get("path"))
+    except Exception as e:
+        out.append("   the Windows pass RAISED (%s: %s) -- INCONCLUSIVE, not "
+                   "'no crash'" % (type(e).__name__, e))
+        return out, crashwatch.DEATH_UNKNOWN
+    out += ["   " + l for l in wlines]
+    return out, kind
+
+
+def _unity_forensics(started, crash, runner, resolve_paths, crash_root,
+                     symbolize):
+    """(crash, lines, dmpread_lines) -- steps 1-4, Unity's own crash report.
+
+    Split out so that every "I could not look" branch below can return early
+    WITHOUT skipping the Windows pass that follows it. That skip is precisely
+    the bug of 2026-09-02 13:18: no Crash_* folder ended the enquiry, and the
+    death was reported as a teardown when the event log held a fail-fast.
+    """
+    out = []
+    dmp_lines = []
+    if crash is None:
+        # NOTE the argument name: `crash_root` is Unity's Crashes directory
+        # (%LOCALAPPDATA%\Temp\Battlestate Games\...), NOT the install root.
+        # Passing D:\Aowlspt here would search a directory that has never
+        # contained a crash report and answer "no crash report" every time --
+        # a check that cannot fail.
+        crash = crash_evidence(started, crash_root, symbolize=symbolize)
+
+    # 1 + 2 -- the crash report and its frames. crashwatch owns both; when there
+    # is none it says so, and step 4 below is what decides whether that absence
+    # means anything.
+    out.append("1. crash report")
+    out += ["   " + l for l in crash["lines"]]
+
+    folder = crash.get("path")
+    if not folder:
+        out.append("2. minidump    NOT LOOKED AT: no Unity crash report newer "
+                   "than launch, so there is no crash.dmp to read. This is NOT "
+                   "yet a teardown -- see step 4.")
+        out.append("3. disasm      NOT LOOKED AT: without a dump there is no "
+                   "faulting address to decode.")
+        return crash, out, dmp_lines
+
+    dmp = os.path.join(folder, "crash.dmp")
+    out.append("2. minidump    %s" % dmp)
+    rc, text = runner([sys.executable, DMPREAD_PY, dmp])
+    dmp_lines = _tool_lines(text)
+    out += ["   " + l for l in dmp_lines]
+    if rc != 0:
+        out.append("   (dmpread exited %d -- the text above is its refusal, "
+                   "printed verbatim)" % rc)
+
+    m = FAULT_AT_RX.search(text or "")
+    if not m:
+        out.append("3. disasm      NOT LOOKED AT: dmpread named no faulting "
+                   "address, so there is nothing to decode. This is "
+                   "INCONCLUSIVE, not 'the instruction is fine'.")
+        return crash, out, dmp_lines
+    va = int(m.group(1), 16)
+
+    hit = module_for_va(crash.get("modlines"), va)
+    if hit is None:
+        out.append("3. disasm      NOT LOOKED AT: 0x%x is in NO module the "
+                   "crash report lists a base for, so it cannot be rebased to "
+                   "an RVA. GameAssembly.dll is ASLR-relocated; guessing "
+                   "0x180000000 would be a confidently wrong answer." % va)
+        return crash, out, dmp_lines
+    name, base, _size = hit
+    if name != "gameassembly":
+        out.append("3. disasm      NOT DECODED: the fault is at 0x%x, inside "
+                   "%s (base 0x%x), not GameAssembly.dll. il2cpp_resolve only "
+                   "decodes GameAssembly; for %s read the crash-site frames "
+                   "above and the cdb stack in step 4." % (va, name, base, name))
+        return crash, out, dmp_lines
+    gameasm, metadec = (resolve_paths if resolve_paths
+                        else _resolve_paths())
+    missing = [p for p in (gameasm, metadec) if not p or not os.path.exists(p)]
+    if missing:
+        out.append("3. disasm      NOT LOOKED AT: %s absent, so the resolver "
+                   "cannot run. (.cache/global-metadata.dec.dat is produced by "
+                   "tools/metablob.py and is NOT shared between worktrees.)"
+                   % ", ".join(str(p) for p in missing))
+        return crash, out, dmp_lines
+    rva = va - base
+    out.append("3. disasm      RVA 0x%x (0x%x - %s base 0x%x)"
+               % (rva, va, name, base))
+    rc, text = runner([sys.executable, RESOLVE_PY, gameasm, metadec, "disasm",
+                       hex(va), "--base", hex(base)])
+    if rc != 0:
+        out += ["   " + l for l in _tool_lines(text)]
+        out.append("   (il2cpp_resolve exited %d -- the text above is its "
+                   "refusal, printed verbatim)" % rc)
+        return crash, out, dmp_lines
+    out += ["   " + l for l in disasm_excerpt(text)]
+    return crash, out, dmp_lines
+
+
+def _resolve_paths():
+    try:
+        import il2cpp_resolve as ir
+        return ir.default_paths()
+    except Exception:
+        return (None, None)
+
+
+def classify_death(verdict, why, evidence, when, kind, root=None,
+                   not_before=None, path=None):
+    """(verdict, why, evidence, note) -- was this death OUR doing?
+
+    Lives outside `main` so it can be driven from a test with a synthetic
+    ledger; inline, the one decision that turns a DIED into a KILLED-BY-TOOL
+    could not be exercised without killing a real client.
+
+    TWO conditions, and the second is what keeps this from becoming a verdict
+    that launders real crashes:
+
+      * a teardown entry within KILLED_WINDOW_S of the death, recorded AFTER
+        this client was launched (`not_before`);
+      * AND the OS recording no crash. A fail-fast writes no Crash_* folder, so
+        a stop that happened to land beside one would otherwise bury it -- the
+        exact 2026-09-02 13:18 failure, in reverse.
+    """
+    if not needs_forensics(verdict):
+        return verdict, why, evidence, None
+    killer = runledger.near(when, root=root, not_before=not_before, path=path)
+    if not killer:
+        return verdict, why, evidence, None
+    if kind not in (crashwatch.DEATH_QUIET, crashwatch.DEATH_UNKNOWN):
+        return verdict, why, evidence, (
+            "NOTE: %s recorded a teardown at %s, within %ds of this death -- "
+            "but the OS recorded a real crash (%s), so this is NOT reported as "
+            "KILLED-BY-TOOL."
+            % (killer.get("tool"), killer.get("when_local"),
+               runledger.KILLED_WINDOW_S, kind))
+    verdict = ("KILLED-BY-TOOL %s %s"
+               % (killer.get("tool") or "?",
+                  killer.get("reason") or "(no reason recorded)"))
+    why = ("this was NOT a crash: %s recorded a teardown at %s, within %ds of "
+           "the client disappearing (pid %s), and the OS recorded no crash "
+           "(%s). The original reading was: %s"
+           % (killer.get("tool"), killer.get("when_local"),
+              runledger.KILLED_WINDOW_S, killer.get("pid"), kind, why))
+    return (verdict, why,
+            list(evidence) + [jsonmod.dumps(killer, separators=(",", ":"))],
+            None)
+
+
+def needs_forensics(v):
+    """Which verdicts may NEVER be printed bare. Exactly the deaths.
+
+    Stated as a predicate rather than as an `if` inside the printer so a test
+    can assert the rule itself, and so a future verdict that means "it died"
+    has one place to be added.
+    """
+    return (v or "").split(" ", 1)[0] == "DIED"
+
+
+FORENSICS_MISSING = ("forensics unavailable because they were never collected "
+                     "for this DIED verdict -- this is a BUG in run.py, not a "
+                     "statement that the client died cleanly")
 
 
 def verdict_block(v, why, evidence, elapsed, armed, logs, as_json,
-                  teardown=False, crash=None, notes=()):
+                  teardown=False, crash=None, notes=(), forensics=None):
     notes = [n for n in (notes or ()) if n]
+    # THE RULE, enforced HERE and not at the call site: a DIED line never
+    # appears without the forensics block or without an explicit sentence
+    # saying why there is none. A caller that forgets gets the sentence, which
+    # is a visible defect; silence would be an invisible one.
+    if needs_forensics(v) and not forensics:
+        forensics = ([FORENSICS_HEADER]
+                     + ["   " + l for l in (crash or {}).get("lines", [])]
+                     + ["   " + FORENSICS_MISSING])
     if as_json:
         print(jsonmod.dumps({
             "verdict": v, "why": why, "elapsed_s": round(elapsed, 1),
             "errdlg_armed": armed, "evidence": evidence[-6:], "logs": logs,
             "teardown": bool(teardown), "notes": notes,
+            "forensics": list(forensics or []),
             "crash": (None if crash is None
                       else {k: crash[k] for k in
                             ("folder", "module", "source", "age_s", "modules")}),
         }, separators=(",", ":")))
-        if crash is not None:
+        if forensics:
+            # --json is one machine-readable line; the human-readable block
+            # goes to stderr rather than being dropped, because dropping it is
+            # exactly the failure this change exists to end.
+            for line in forensics:
+                sys.stderr.write(line + "\n")
+        elif crash is not None:
             for line in crash["lines"]:
                 sys.stderr.write(line + "\n")
         if teardown:
@@ -1195,7 +1560,14 @@ def verdict_block(v, why, evidence, elapsed, armed, logs, as_json,
         print("   | " + line[:200])
     if logs:
         print(" %-12s  %s" % ("logs", "  ".join(logs)))
-    if crash is not None:
+    if forensics:
+        # The forensics block ALREADY contains the crash-report lines (it is
+        # built around them), so printing `crash` as well would say everything
+        # twice.
+        print("")
+        for line in forensics:
+            print(" " + line)
+    elif crash is not None:
         print("")
         for line in crash["lines"]:
             print(" " + line)
@@ -1243,10 +1615,17 @@ def main():
                         "heartbeats included, before that counts as STALLED.")
     p.add_argument("--attach", action="store_true",
                    help="do not launch; the client is already running")
+    p.add_argument("--teardown", action="store_true",
+                   help="STOP the client, backend and launcher once the "
+                        "verdict lands. Off by default since 2026-09-02: the "
+                        "old default killed the client at its verdict and the "
+                        "result was mistaken for a crash three times, ~20 "
+                        "minutes each. Every stop is recorded in "
+                        "aowlspt-teardown.jsonl.")
     p.add_argument("--keep", action="store_true",
-                   help="leave the client running afterwards. Without it the "
-                        "client, backend and launcher are STOPPED once the "
-                        "verdict lands, and the verdict block says so.")
+                   help="ACCEPTED AND IGNORED -- keeping the client is now the "
+                        "default. Kept so existing callers and recipes do not "
+                        "break; pass --teardown for the old behaviour.")
     p.add_argument("--dry-teardown", action="store_true",
                    help="announce the teardown and write the teardown note, "
                         "but do not actually Stop-Process anything. Exists so "
@@ -1261,6 +1640,26 @@ def main():
 
     quiet = not args.verbose
     started = time.time()
+    # The floor for "did a tool kill THIS client". None with --attach, on
+    # purpose: there the client predates us, so a teardown from before we
+    # attached can genuinely be the one that killed it. When WE launched it,
+    # nothing before the launch can have.
+    launched_at = None
+    if args.keep and not args.teardown:
+        print("(--keep is now the default and does nothing; pass --teardown to "
+              "stop the client at the verdict)", flush=True)
+    if args.teardown:
+        print("(--teardown: the client WILL be stopped when the verdict lands, "
+              "and that stop will be recorded in %s)"
+              % runledger.teardown_path(args.root), flush=True)
+
+    # THE BOOT LEDGER. Printed before anything is launched, because its whole
+    # job is to tell you -- in advance -- whether a crash on this boot will be
+    # attributable at all. Last night ~7 commits landed per boot, so every
+    # crash needed a bisect and two one-sample bisects gave wrong answers.
+    bfacts = runledger.boot_facts(args.root)
+    for line in runledger.boot_line(bfacts):
+        print(line, flush=True)
 
     # SAY SOMETHING WHEN KILLED FROM OUTSIDE.
     #
@@ -1304,6 +1703,14 @@ def main():
         # the flag means "this invocation stops no processes", and a test that
         # opted out of the teardown but still reaped a human's running client
         # on the way in would be worse than no test.
+        # Recorded like any other stop -- but see `not_before` below: a stop
+        # that happened BEFORE this client existed can never explain its death,
+        # and the ledger lookup is floored at the launch instant for exactly
+        # that reason.
+        runledger.record("run.py", "pre-launch stop: the host DLL is locked "
+                                   "while the game runs" +
+                         ("  (--dry-teardown: nothing was stopped)"
+                          if args.dry_teardown else ""), root=args.root)
         if args.dry_teardown:
             print("(--dry-teardown: not stopping any running client first)",
                   flush=True)
@@ -1324,6 +1731,8 @@ def main():
             cmd += extra.split(" ", 1) if " " in extra else [extra]
         print("$ %s" % " ".join(cmd), flush=True)
         subprocess.Popen(cmd, cwd=install_dir(args.root))
+        launched_at = time.time()
+        runledger.record_boot(args.root, facts=bfacts, when=launched_at)
 
     sup = Supervisor(args.root, args.until, args.stall, quiet,
                      phase_max=args.phase_max,
@@ -1455,17 +1864,41 @@ def main():
     # under it has exactly the same evidence available. Checked BEFORE
     # teardown, so a teardown we perform cannot be mistaken for the death.
     crash = None
-    if verdict == "DIED" or not harness.client_alive():
+    if needs_forensics(verdict) or not harness.client_alive():
         crash = crash_evidence(started)
 
-    tearing = not args.keep and not args.attach
+    # THE FORENSICS, collected FIRST -- because the OS's own record is what
+    # decides whether a teardown entry beside the death is the explanation or a
+    # coincidence. Doing it the other way round would let a stop that happened
+    # to land within 10s of a real fail-fast bury the crash.
+    forensics = None
+    kind = crashwatch.DEATH_UNKNOWN
+    if needs_forensics(verdict):
+        try:
+            forensics, kind = died_forensics(started, crash=crash)
+        except Exception as e:
+            forensics = [FORENSICS_HEADER,
+                         "   forensics unavailable because collecting them "
+                         "RAISED (%s: %s). That is a tool failure, not "
+                         "evidence about the client."
+                         % (type(e).__name__, e)]
+
+    # DID A TOOL KILL IT? Only when nothing in the OS's record says otherwise.
+    verdict, why, evidence, extra = classify_death(
+        verdict, why, evidence, time.time(), kind, root=args.root,
+        not_before=launched_at)
+    if extra:
+        forensics = (forensics or []) + [extra]
+
+    tearing = bool(args.teardown) and not args.attach
     verdict_block(verdict, why, evidence, time.time() - started,
                   sup.errdlg_armed, logs, args.json, teardown=tearing,
-                  crash=crash, notes=[sup.exception_note()])
+                  crash=crash, notes=[sup.exception_note()],
+                  forensics=forensics)
 
     if tearing:
         do_teardown(args.root, dry=args.dry_teardown)
-    return EXIT.get(verdict, EXIT["INCONCLUSIVE"])
+    return exit_code(verdict)
 
 
 if __name__ == "__main__":

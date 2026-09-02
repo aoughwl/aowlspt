@@ -47,6 +47,7 @@ sys.path.insert(0, HERE)
 
 import run as runmod   # noqa: E402  -- the code under test, not a copy of it
 import crashwatch      # noqa: E402  -- the real tailers, not a stand-in
+import runledger       # noqa: E402  -- the real ledgers, not a stand-in
 
 VERBOSE = "-v" in sys.argv
 
@@ -489,11 +490,11 @@ def t_teardown_announced():
     root, inst = _run_bed()
     note = os.path.join(inst, runmod.TEARDOWN_LOG)
     try:
-        rc, out = _run_py(root, [])
+        rc, out = _run_py(root, ["--teardown"])
         check("teardown/line-in-verdict-block", "TEARDOWN:" in out,
               "a silent teardown reads as a crash afterwards; got %r"
               % out[-300:])
-        check("teardown/line-names-the-escape-hatch", "--keep" in out)
+        check("teardown/line-names-the-escape-hatch", "--teardown" in out)
         check("teardown/note-written", os.path.isfile(note),
               "expected %s" % note)
         if os.path.isfile(note):
@@ -505,7 +506,7 @@ def t_teardown_announced():
             check("teardown/note-is-timestamped",
                   txt.lstrip().startswith("[") and ":" in txt.split("]")[0],
                   repr(txt)[:120])
-            _run_py(root, [])
+            _run_py(root, ["--teardown"])
             n = open(note, encoding="utf-8").read().count(runmod.TEARDOWN_LINE)
             check("teardown/note-appends", n == 2,
                   "a second run must ADD a line, not replace the file; "
@@ -1145,6 +1146,581 @@ def t_logged_exception_is_not_a_crash():
             b.close()
 
 
+# -- 12. --teardown is OPT-IN now, and --keep is a no-op -----------------
+#
+# MEASURED last night, three times at ~20 minutes each: `run.py` without
+# `--keep` force-stopped the client at its verdict, and a TaskStop of the
+# launching shell did the same. Both read afterwards as a clean crash. The
+# default is therefore inverted, and BOTH directions are asserted here --
+# without the second, "the default keeps the client" would be indistinguishable
+# from a teardown that simply stopped announcing itself.
+
+def t_teardown_is_opt_in():
+    root, inst = _run_bed()
+    note = os.path.join(inst, runmod.TEARDOWN_LOG)
+    try:
+        rc, out = _run_py(root, [])
+        check("teardown/default-does-not-tear-down", "TEARDOWN:" not in out,
+              "the default must now LEAVE the client running; got %r"
+              % out[-300:])
+        check("teardown/default-writes-no-note", not os.path.isfile(note))
+        rc2, out2 = _run_py(root, ["--teardown"])
+        check("teardown/flag-is-what-tears-down", "TEARDOWN:" in out2,
+              "and --teardown must still do it, or the check above proves "
+              "only that the feature was deleted; got %r" % out2[-300:])
+        check("teardown/flag-announces-itself-up-front",
+              "the client WILL be stopped" in out2, out2[:400])
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def t_keep_is_accepted_and_says_so():
+    root, inst = _run_bed()
+    try:
+        rc, out = _run_py(root, ["--keep"])
+        check("teardown/keep-still-accepted",
+              "unrecognized arguments" not in out and "usage:" not in out,
+              "old callers and recipes pass --keep; it must not become an "
+              "argparse error. got %r" % out[:300])
+        check("teardown/keep-says-it-is-a-no-op",
+              "--keep is now the default and does nothing" in out, out[:400])
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+# -- 13. THE TEARDOWN LEDGER, and KILLED-BY-TOOL -------------------------
+#
+# The ledger is the machine-readable half of the announcement: a later reader --
+# possibly another session with no transcript at all -- can ask "did a tool stop
+# the client at 13:18:04?" and get an answer. `classify_death` is the one
+# decision that turns a DIED into a KILLED-BY-TOOL, and it is tested here
+# against a synthetic ledger, with all four negative controls.
+
+def t_teardown_ledger_written():
+    root, inst = _run_bed()
+    try:
+        _run_py(root, ["--teardown"])
+        rows = runledger.read(runledger.teardown_path(root))
+        check("ledger/teardown-written", bool(rows),
+              "expected entries in %s" % runledger.teardown_path(root))
+        if rows:
+            e = rows[-1]
+            for k in ("when", "pid", "tool", "reason", "argv"):
+                check("ledger/field %s" % k, k in e, repr(e)[:200])
+            check("ledger/names-the-tool", e.get("tool") == "run.py",
+                  repr(e)[:200])
+            check("ledger/argv-is-a-list", isinstance(e.get("argv"), list)
+                  and any("run.py" in str(a) for a in e["argv"]),
+                  repr(e.get("argv"))[:200])
+        # The PRE-LAUNCH stop is recorded too -- it is a real stop of whatever
+        # client was up, and a reader must see it.
+        check("ledger/pre-launch-stop-recorded",
+              any("pre-launch stop" in (r.get("reason") or "") for r in rows),
+              "%d row(s)" % len(rows))
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def t_killed_by_tool():
+    root = tempfile.mkdtemp(prefix="aowl-killed-")
+    led = os.path.join(root, "teardown.jsonl")
+    try:
+        now = 1_000_000.0
+        # Written directly at a KNOWN path and time: `record` would shell out
+        # to tasklist and stamp the real clock, and this case is about a
+        # SPECIFIC two-second gap.
+        runledger._append(led, {
+            "when": now - 2.0, "when_local": "2026-09-02 13:18:04",
+            "pid": 4242, "pids_known": True, "tool": "deploy.py",
+            "reason": "deploying the host DLL",
+            "argv": ["deploy.py", "deploy", "host"]})
+
+        v, why, ev, note = runmod.classify_death(
+            "DIED", "the client process was up and is gone", [], now,
+            crashwatch.DEATH_QUIET, path=led)
+        check("killed/fires", v.startswith("KILLED-BY-TOOL"), repr(v)[:160])
+        check("killed/names-the-tool-and-reason",
+              "deploy.py" in v and "deploying the host DLL" in v, repr(v)[:200])
+        check("killed/exit-code-is-distinct",
+              runmod.exit_code(v) == runmod.EXIT["KILLED-BY-TOOL"]
+              and runmod.exit_code(v) != runmod.EXIT["DIED"],
+              "exit_code(%r) = %r" % (v, runmod.exit_code(v)))
+        check("killed/evidence-carries-the-entry",
+              any("deploy.py" in e for e in ev), repr(ev)[:200])
+
+        # NEGATIVE 1: too far away in time.
+        v2, _w, _e, _n = runmod.classify_death(
+            "DIED", "gone", [], now + 60.0, crashwatch.DEATH_QUIET, path=led)
+        check("killed/outside-the-window-stays-DIED", v2 == "DIED", repr(v2))
+
+        # NEGATIVE 2: the entry predates THIS client's launch, so it cannot
+        # have killed it. Without this floor, run.py's own pre-launch stop
+        # would explain every early death -- a verdict that cannot be wrong.
+        v3, _w, _e, _n = runmod.classify_death(
+            "DIED", "gone", [], now, crashwatch.DEATH_QUIET, path=led,
+            not_before=now - 1.0)
+        check("killed/entry-before-launch-stays-DIED", v3 == "DIED", repr(v3))
+
+        # NEGATIVE 3: the OS recorded a real crash. A teardown that lands beside
+        # a fail-fast must NOT bury it.
+        v4, _w, _e, n4 = runmod.classify_death(
+            "DIED", "gone", [], now, crashwatch.DEATH_FAILFAST, path=led)
+        check("killed/real-crash-outranks-a-teardown", v4 == "DIED", repr(v4))
+        check("killed/real-crash-says-why-it-was-not-attributed",
+              bool(n4) and "NOT reported as KILLED-BY-TOOL" in n4,
+              repr(n4)[:200])
+
+        # NEGATIVE 4: a healthy verdict is never rewritten.
+        v5, _w, _e, _n = runmod.classify_death(
+            "REACHED", "fine", [], now, crashwatch.DEATH_QUIET, path=led)
+        check("killed/reached-is-untouched", v5 == "REACHED", repr(v5))
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+# -- 14. DIED FORENSICS -------------------------------------------------------
+#
+# MEASURED last night: every "clean" death had a Unity crash report AND a
+# minidump naming the faulting argument in registers, and ~2.5 hours went into
+# theories before either was opened. And MEASURED 2026-09-02 13:18: a death with
+# NO Crash_* folder at all was a fail-fast (0xc0000409, abort() from a mimalloc
+# assertion inside admin.dll), which Unity's handler never sees -- so "no crash
+# report newer than launch" was itself a WRONG teardown verdict.
+
+# dmpread's real output shape (tools/dmpread.py main()).
+DMPREAD_TEXT = """thread 12  ACCESS_VIOLATION (0xc0000005)  at 0x7ffb2c0be110
+  a READ of 0x0 faulted
+  Rax=0000000000000001 Rbx=00000228bf001200 Rcx=0000000000000001 Rdx=0000000000000000
+  Rsp=000000e5d51fe8a0 Rbp=0000000000000000 Rsi=0000000000000000 Rdi=0000000000000000
+  (no register holds a known allocator fill pattern)"""
+
+# il2cpp_resolve disasm's real output shape (tools/il2cpp_resolve.py cmd_disasm).
+DISASM_TEXT = """disasm   0x150e110  (VA 0x18150e110)   section il2cpp
+owner    Profile::get_Health @0x150e0f0 [unique]
+args     rcx=EFT.Profile this   rdx=System.Int32 mode
+decoding from the owner start 0x150e0f0 (exact instruction boundaries)
+   RVA        BYTES                  INSTRUCTION
+   0x150e0f0  4883ec28               sub rsp, 0x28
+>> 0x150e110  488b09                 mov rcx, qword ptr [rcx]    Profile._healthController@0x0
+   0x150e113  4885c9                 test rcx, rcx
+   0x150e116  7405                   je 0x150e11d
+   0x150e118  e893ffffff             call 0x150e0b0"""
+
+# The 2026-09-02 13:18 Application Error record, as PowerShell hands it back.
+WER_TEXT = ("%s\n2026-09-02 13:18:05\nApplication Error\n"
+            "Faulting application name: EscapeFromTarkov.exe, version: "
+            "0.16.8.1.46777, time stamp: 0x68a1b2c3\n"
+            "Faulting module name: ucrtbase.dll, version: 10.0.19041.5794, "
+            "time stamp: 0x9a1f2b3c\n"
+            "Exception code: 0xc0000409\n"
+            "Fault offset: 0x000000000007286e\n"
+            "Faulting process id: 0x424c\n"
+            "Faulting module path: C:\\WINDOWS\\System32\\ucrtbase.dll\n"
+            "%s\n" % (crashwatch.WER_SEP, crashwatch.WER_DONE))
+
+# cdb's real answer on that dump (measured, 2026-09-02).
+CDB_TEXT = """Loading Dump File [EscapeFromTarkov.exe.16972.dmp]
+Child-SP          RetAddr               Call Site
+000000e5`d51fe8a0 00007ffb`5ede21ef     ucrtbase!abort+0x4e
+000000e5`d51fe8d0 00007ffb`5edfa3dd     admin!mi_assert_fail+0x3d
+000000e5`d51fe920 00007ffb`5ee06a1b     admin!mi_malloc+0xcb
+000000e5`d51ff410 00007ffb`5ee0a75a     admin!onUpdate_0_adm65d7rb+0x38
+
+quit:
+"""
+
+MODLINE = (r"D:\Games\Tarkov\GameAssembly.dll:GameAssembly.dll "
+           "(00007FFB2ABB0000), size: 126812160 (result: 0), "
+           "SymType: '-deferred-', PDB: ''")
+
+PLAYER_LOG = "\n".join([
+    "Unity Player [version: Unity 2021.3.x]",
+    "",
+    crashwatch.STACK_BEGIN,
+    "",
+    "0x00007FFB2C0BE110 (GameAssembly) mono_class_has_parent",
+    "0x00007FFB5EE0A75A (admin) onUpdate_0_adm65d7rb",
+    "",
+    crashwatch.STACK_END,
+    "",
+    MODLINE,
+    "",
+])
+
+
+def _crash_fixture(when=None, with_dmp=False):
+    """A real Crash_<UTC stamp> folder, parsed by the real CrashReport."""
+    root = tempfile.mkdtemp(prefix="aowl-crashroot-")
+    when = time.time() if when is None else when
+    name = time.strftime("Crash_%Y-%m-%d_%H%M%S",
+                         time.gmtime(when)) + "000"
+    d = os.path.join(root, name)
+    os.makedirs(d)
+    with open(os.path.join(d, "Player.log"), "w", encoding="utf-8",
+              newline="\n") as f:
+        f.write(PLAYER_LOG)
+    if with_dmp:
+        open(os.path.join(d, "crash.dmp"), "wb").close()
+    return root, d
+
+
+def _fake_tools(dmpread=DMPREAD_TEXT, disasm=DISASM_TEXT, rc=0):
+    def runner(cmd):
+        joined = " ".join(str(c) for c in cmd)
+        if "dmpread.py" in joined:
+            return rc, dmpread
+        if "il2cpp_resolve.py" in joined:
+            return rc, disasm
+        return 127, "unexpected command: " + joined
+    return runner
+
+
+def t_died_forensics_block():
+    """The whole block, driven end to end against a fixture crash report.
+
+    The tools themselves are injected -- a real minidump and a real
+    GameAssembly.dll cannot be fixtures -- but everything BETWEEN them is the
+    real code: crashwatch's report parser, the fault-address extraction, the
+    module rebase off the report's own base line, and the disasm excerpt.
+    """
+    root, folder = _crash_fixture()
+    dumps = tempfile.mkdtemp(prefix="aowl-dumps-")
+    try:
+        open(os.path.join(dumps, "EscapeFromTarkov.exe.16972.dmp"),
+             "wb").close()
+        started = time.time() - 30.0
+        lines, kind = runmod.died_forensics(
+            started, crash_root=root, runner=_fake_tools(), symbolize=False,
+            ps_runner=lambda script: (0, WER_TEXT),
+            cdb_runner=lambda cmd: (0, CDB_TEXT),
+            dumps_dir=dumps, cdb=sys.executable)
+        txt = "\n".join(lines)
+        check("forensics/has-a-header",
+              lines and lines[0] == runmod.FORENSICS_HEADER, repr(lines[:1]))
+        check("forensics/names-the-crash-folder",
+              os.path.basename(folder) in txt, txt[:300])
+        check("forensics/prints-crash-site-frames",
+              "mono_class_has_parent" in txt, txt[:600])
+        check("forensics/prints-the-faulting-registers",
+              "Rax=0000000000000001" in txt and "ACCESS_VIOLATION" in txt,
+              txt[:600])
+        check("forensics/rebases-to-an-rva",
+              "RVA 0x150e110" in txt,
+              "0x7FFB2C0BE110 - base 0x7FFB2ABB0000; got: %s" % txt[-900:])
+        check("forensics/prints-the-disasm-owner",
+              "owner    Profile::get_Health" in txt, txt[-900:])
+        check("forensics/prints-the-disasm-args", "args     rcx=" in txt,
+              txt[-900:])
+        check("forensics/prints-the-faulting-instruction-and-three-after",
+              ">> 0x150e110" in txt and "0x150e118" in txt
+              and "0x150e11d" in txt, txt[-700:])
+        check("forensics/asks-the-windows-event-log",
+              "Windows Application event log since launch:" in txt
+              and "ucrtbase.dll" in txt,
+              "the event log must be asked and its answer printed -- a "
+              "fail-fast writes no Crash_* folder at all: %s" % txt[-900:])
+        check("forensics/prints-the-event-code",
+              "0xc0000409" in txt and "FAST_FAIL" in txt, txt[-1200:])
+        check("forensics/prints-the-cdb-call-sites",
+              "admin!onUpdate_0_adm65d7rb" in txt, txt[-1200:])
+        check("forensics/states-a-death-kind",
+              "DEATH KIND" in txt and kind == crashwatch.DEATH_NATIVE,
+              "a Crash_* folder exists, so this is a native crash: %r" % kind)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(dumps, ignore_errors=True)
+
+
+def t_forensics_refusals_are_verbatim():
+    """A tool that REFUSES must be quoted, never skipped.
+
+    Two real refusals, neither mocked: dmpread on a crash.dmp that does not
+    exist, and the disasm step which then has no faulting address to work from.
+    """
+    root, folder = _crash_fixture()
+    try:
+        started = time.time() - 30.0
+        lines, _kind = runmod.died_forensics(
+            started, crash_root=root, symbolize=False, wer=False)
+        txt = "\n".join(lines)
+        check("forensics/dmpread-refusal-is-printed",
+              "dmpread" in txt.lower() or "No such file" in txt
+              or "cannot find" in txt.lower(),
+              "the refusal must be quoted; got: %s" % txt[-500:])
+        check("forensics/refusal-is-not-silent",
+              "NOT LOOKED AT" in txt or "exited" in txt,
+              "a step that could not run must SAY so: %s" % txt[-500:])
+        check("forensics/disabled-windows-pass-is-inconclusive",
+              _kind == crashwatch.DEATH_UNKNOWN
+              and "NOT LOOKED AT" in txt, repr(_kind))
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def t_died_is_never_bare():
+    """THE RULE: a DIED line never appears without forensics or a reason.
+
+    Both directions. The falsifying half is the second: if the block printed
+    unconditionally, the first check would pass while proving nothing.
+    """
+    import io
+    import contextlib
+    for v, forensics, want in (
+            ("DIED", None, runmod.FORENSICS_MISSING),
+            ("DIED", ["BLOCK", "   a line"], "BLOCK"),
+            ("KILLED-BY-TOOL run.py x", None, None),
+            ("REACHED", None, None)):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            runmod.verdict_block(v, "why", [], 1.0, True, [], False,
+                                 forensics=forensics)
+        out = buf.getvalue()
+        if want:
+            check("bare/%s prints %s" % (v.split()[0], want[:12]),
+                  want in out, out[-400:])
+        else:
+            check("bare/%s prints no forensics stub" % v.split()[0],
+                  runmod.FORENSICS_MISSING not in out, out[-400:])
+    check("bare/only-DIED-demands-forensics",
+          runmod.needs_forensics("DIED")
+          and not runmod.needs_forensics("KILLED-BY-TOOL run.py x")
+          and not runmod.needs_forensics("REACHED")
+          and not runmod.needs_forensics("TIMEOUT"))
+
+
+# -- 15. the FAIL-FAST verdict logic -------------------------------------
+#
+# `death_kind` is the rule that "no Crash_* folder" is NOT a teardown. Every
+# branch, and the two INCONCLUSIVE ones especially: a question that could not
+# be asked must never collapse into "nothing was found".
+
+def t_death_kind():
+    ev = [{"provider": "Application Error", "code": "0xc0000409",
+           "module": "ucrtbase.dll", "when": "2026-09-02 13:18:05"}]
+    av = [{"provider": "Application Error", "code": "0xc0000005",
+           "module": "GameAssembly.dll", "when": "2026-09-02 13:18:05"}]
+    cases = (
+        ("failfast", None, ev, [], crashwatch.DEATH_FAILFAST),
+        ("native-via-event", None, av, [], crashwatch.DEATH_NATIVE),
+        ("native-via-folder", "Crash_2026-09-02_131805000", [], [],
+         crashwatch.DEATH_NATIVE),
+        ("os-dump-only", None, [], ["EscapeFromTarkov.exe.16972.dmp"],
+         crashwatch.DEATH_OS_DUMP),
+        ("quiet", None, [], [], crashwatch.DEATH_QUIET),
+        ("events-unreadable", None, None, [], crashwatch.DEATH_UNKNOWN),
+        ("dumps-unreadable", None, [], None, crashwatch.DEATH_UNKNOWN),
+    )
+    for name, folder, events, dumps, want in cases:
+        kind, sentence = crashwatch.death_kind(folder, events, dumps,
+                                               "query blew up", "dir blew up")
+        check("deathkind/%s" % name, kind == want,
+              "wanted %r, got %r -- %s" % (want, kind, sentence[:160]))
+        if want == crashwatch.DEATH_QUIET:
+            check("deathkind/quiet-says-it-asked-all-three",
+                  "all three" in sentence, sentence[:200])
+        if want == crashwatch.DEATH_FAILFAST:
+            check("deathkind/failfast-names-the-module-and-code",
+                  "ucrtbase.dll" in sentence and "0xc0000409" in sentence,
+                  sentence[:250])
+    # THE MEASURED FAILURE, stated as a check: an unaskable question must not
+    # be reported as a teardown.
+    kind, _s = crashwatch.death_kind(None, None, [])
+    check("deathkind/unreadable-log-is-not-a-teardown",
+          kind != crashwatch.DEATH_QUIET,
+          "'I could not read the event log' must never read as 'it was torn "
+          "down'")
+
+
+def t_wer_parsing():
+    evs, why = crashwatch.parse_wer_output(WER_TEXT)
+    check("wer/parses-one-event", evs is not None and len(evs) == 1,
+          "%r %r" % (evs, why))
+    if evs:
+        e = evs[0]
+        check("wer/reads-the-faulting-module", e["module"] == "ucrtbase.dll",
+              repr(e)[:200])
+        check("wer/reads-the-exception-code", e["code"] == "0xc0000409",
+              repr(e)[:200])
+        check("wer/reads-the-fault-offset",
+              e["offset"] == "0x000000000007286e", repr(e)[:200])
+        check("wer/reads-the-time-and-provider",
+              e["when"] == "2026-09-02 13:18:05"
+              and e["provider"] == "Application Error", repr(e)[:200])
+    check("wer/names-the-code",
+          "FAST_FAIL" in (crashwatch.code_name("0xc0000409") or ""),
+          repr(crashwatch.code_name("0xc0000409")))
+    # THE FALSIFYING HALF: a truncated answer is INCONCLUSIVE, not "no events".
+    evs2, why2 = crashwatch.parse_wer_output(WER_TEXT.split(
+        crashwatch.WER_DONE)[0])
+    check("wer/truncated-output-is-inconclusive",
+          evs2 is None and "INCONCLUSIVE" in (why2 or ""), repr(why2)[:200])
+    evs3, _w = crashwatch.parse_wer_output(crashwatch.WER_DONE + "\n")
+    check("wer/complete-but-empty-is-zero-events", evs3 == [], repr(evs3))
+
+
+def t_cdb_stack():
+    stack, note = crashwatch.cdb_stack("x.dmp", cdb=sys.executable,
+                                       runner=lambda cmd: (0, CDB_TEXT))
+    check("cdb/reads-the-call-site-column", stack is not None
+          and any("admin!onUpdate_0_adm65d7rb" in l for l in stack),
+          repr(stack)[:300])
+    check("cdb/stops-at-the-end-of-the-stack",
+          stack is not None and not any("quit:" in l for l in stack),
+          repr(stack)[:300])
+    # cdb ABSENT: say so and do not pretend the stack was read.
+    stack2, note2 = crashwatch.cdb_stack(
+        "x.dmp", cdb=os.path.join(tempfile.gettempdir(), "no-such-cdb.exe"))
+    check("cdb/absent-is-stated", stack2 is None
+          and "NOT installed" in (note2 or ""), repr(note2)[:200])
+    # cdb ran but said nothing useful -- also not a pass.
+    stack3, note3 = crashwatch.cdb_stack("x.dmp", cdb=sys.executable,
+                                         runner=lambda cmd: (0, "hello"))
+    check("cdb/no-call-site-column-is-stated", stack3 is None
+          and "no `Call Site`" in (note3 or ""), repr(note3)[:200])
+
+
+# -- 16. THE BOOT LEDGER --------------------------------------------------
+#
+# ~7 commits landed per boot last night, so every crash needed a bisect and two
+# one-sample bisects gave wrong answers. This line says, before the client is
+# even launched, whether a crash on this boot will be attributable at all --
+# and it is derived from git and the deployed file, never guessed.
+
+def _git_repo():
+    """A throwaway repo whose commit TIMES are set explicitly.
+
+    Deterministic dates matter here: `boot_facts` counts `git log --since=<the
+    previous boot>`, and with wall-clock commits the base commit and the boot
+    marker land in the same second and the count is off by one depending on
+    which side of it git rounds. A test that is one commit out at random is
+    worse than no test.
+    """
+    d = tempfile.mkdtemp(prefix="aowl-gitrepo-")
+    def g(*a, **kw):
+        env = dict(os.environ)
+        when = kw.get("when")
+        if when is not None:
+            stamp = "%d +0000" % int(when)
+            env["GIT_AUTHOR_DATE"] = stamp
+            env["GIT_COMMITTER_DATE"] = stamp
+        subprocess.run(["git", "-C", d] + list(a), capture_output=True,
+                       text=True, timeout=60, env=env)
+    g("init", "-q")
+    g("config", "user.email", "savant.eclipse@gmail.com")
+    g("config", "user.name", "savannt")
+    g("config", "commit.gpgsign", "false")
+    os.makedirs(os.path.join(d, "host"))
+    return d, g
+
+
+def t_boot_facts_are_measured():
+    repo, g = _git_repo()
+    root = tempfile.mkdtemp(prefix="aowl-bootroot-")
+    try:
+        os.makedirs(runledger.install_dir(root))
+        dll = os.path.join(runledger.install_dir(root), runledger.HOST_DLL)
+        with open(dll, "wb") as f:
+            f.write(b"x" * 4321)
+        # A first commit, then a recorded boot, then SIX more commits: exactly
+        # the shape of last night. All times are explicit -- see _git_repo.
+        t0 = time.time() - 7200.0
+        with open(os.path.join(repo, "host", "a.nim"), "w", newline="\n") as f:
+            f.write("one\n")
+        g("add", "-A")
+        g("commit", "-qm", "base", when=t0)
+        led = os.path.join(root, "boots.jsonl")
+        runledger.record_boot(root, facts={}, when=t0 + 1800.0, path=led)
+        for i in range(6):
+            with open(os.path.join(repo, "host", "a.nim"), "a",
+                      newline="\n") as f:
+                f.write("line %d\n" % i)
+            g("add", "-A")
+            g("commit", "-qm", "change %d" % i, when=t0 + 3600.0 + i * 60.0)
+        # ...plus two uncommitted host files, and one under tools/ that must
+        # NOT be counted (it cannot be in the DLL that just booted).
+        for name in ("b.nim", "c.nim"):
+            with open(os.path.join(repo, "host", name), "w",
+                      newline="\n") as f:
+                f.write("dirty\n")
+        os.makedirs(os.path.join(repo, "tools"))
+        with open(os.path.join(repo, "tools", "t.py"), "w",
+                  newline="\n") as f:
+            f.write("# not host code\n")
+
+        f = runledger.boot_facts(root, repo=repo, path=led)
+        check("boot/counts-commits-since-the-previous-boot", f["commits"] == 6,
+              "wanted 6, got %r" % (f["commits"],))
+        check("boot/counts-uncommitted-host-files",
+              f["dirty"] is not None and len(f["dirty"]) == 2,
+              "wanted the 2 host files and NOT tools/t.py; got %r"
+              % (f["dirty"],))
+        check("boot/reads-the-deployed-dll", f["dll_size"] == 4321,
+              repr(f["dll_size"]))
+        check("boot/reads-the-sha", bool(f["sha"]) and len(f["sha"]) >= 6,
+              repr(f["sha"]))
+
+        lines = runledger.boot_line(f)
+        check("boot/line-shape", lines[0].startswith("this boot carries: "),
+              lines[0][:160])
+        check("boot/line-states-size-and-time",
+              "4,321 bytes built " in lines[0], lines[0][:200])
+        check("boot/line-states-dirty-count", "dirty: 2 files" in lines[0],
+              lines[0][:200])
+        check("boot/line-states-both-counts",
+              "6 commit(s) and 2 uncommitted host/mod file(s)" in lines[0],
+              lines[0][:250])
+        check("boot/warns-when-a-bisect-would-be-needed",
+              runledger.WARN_BISECT in lines,
+              "6+2 > %d must warn; got %r" % (runledger.BISECT_LIMIT, lines))
+
+        # THE FALSIFYING HALF: a SMALL boot must not warn, or the warning is
+        # noise that will be ignored within a day.
+        small = dict(f, commits=1, dirty=[])
+        check("boot/small-boot-does-not-warn",
+              runledger.WARN_BISECT not in runledger.boot_line(small),
+              repr(runledger.boot_line(small)))
+
+        # ...and an UNMEASURABLE boot must say so rather than reading clean.
+        blind = dict(f, commits=None, dirty=None, sha=None,
+                     git_error="git could not be run at all")
+        bl = runledger.boot_line(blind)
+        check("boot/unmeasured-is-not-a-clean-bill",
+              any("could NOT be measured" in l for l in bl), repr(bl))
+        check("boot/unmeasured-names-the-reason",
+              any("git could not be run" in l for l in bl), repr(bl))
+
+        # A FIRST boot has no previous launch and must say UNKNOWN, not 0.
+        first = runledger.boot_facts(root, repo=repo,
+                                     path=os.path.join(root, "none.jsonl"))
+        fl = runledger.boot_line(first)
+        check("boot/no-previous-boot-says-unknown",
+              "NO previous boot is recorded" in fl[0], fl[0][:250])
+    finally:
+        shutil.rmtree(repo, ignore_errors=True)
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def t_boot_line_is_printed_and_recorded():
+    root, inst = _run_bed()
+    try:
+        rc, out = _run_py(root, [])
+        check("boot/printed-at-launch", "this boot carries: " in out,
+              out[:400])
+        rows = [r for r in runledger.read(runledger.boot_path(root))
+                if r.get("kind") == "launch"]
+        check("boot/launch-recorded", len(rows) == 1,
+              "one launch must be recorded so the NEXT boot can count against "
+              "it; got %d" % len(rows))
+        rc, out = _run_py(root, [])
+        rows = [r for r in runledger.read(runledger.boot_path(root))
+                if r.get("kind") == "launch"]
+        check("boot/second-launch-appends", len(rows) == 2, repr(rows)[:200])
+        check("boot/second-boot-counts-against-the-first",
+              "since the previous boot" in out, out[:400])
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def main():
     for fn in (t_stalled_fires, t_progress_never_stalls, t_bound_disable,
                t_heartbeat_is_not_progress, t_backend_down,
@@ -1156,7 +1732,12 @@ def main():
                t_exit_codes_distinct, t_attach_reads_existing_arming,
                t_attach_reads_site2_capability,
                t_loading_quiet_is_not_idle, t_client_log_carries_a_load,
-               t_logged_exception_is_not_a_crash):
+               t_logged_exception_is_not_a_crash,
+               t_teardown_is_opt_in, t_keep_is_accepted_and_says_so,
+               t_teardown_ledger_written, t_killed_by_tool,
+               t_died_forensics_block, t_forensics_refusals_are_verbatim,
+               t_died_is_never_bare, t_death_kind, t_wer_parsing, t_cdb_stack,
+               t_boot_facts_are_measured, t_boot_line_is_printed_and_recorded):
         if VERBOSE:
             print("%s:" % fn.__name__)
         try:
