@@ -260,6 +260,13 @@ def compile_cmd(nimony_exe, nimony_root, abi_dir, aowl_src, mod_dir, source, out
     can see."""
     return [
         nimony_exe, "c", "--app:lib",
+        # Vendored mimalloc with its debug machinery OFF -- identical to
+        # `mimallocFlags` in tools/aowl.nim, which carries the measurement.
+        # Short version: MI_DEBUG defaults to 2, and `mi_error_default`
+        # (mimalloc src/options.c:543) calls abort() on EFAULT only under
+        # `#if (MI_DEBUG>0)`. That abort killed the client on 2026-09-03 with
+        # "corrupted thread-free list." (src/page.c:205).
+        "--passC:-DMI_BUILD_RELEASE", "--passC:-DMI_DEBUG=0",
         "--passC:-I" + abi_dir,
         "--passC:-I" + mod_dir,
         "-p:" + aowl_src,

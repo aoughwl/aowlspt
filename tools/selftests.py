@@ -165,6 +165,9 @@ ITEMS = [
     S("acceptance.py", "fast", args=("selftest",)),    # 0.2s -- positional
     S("dlss.py", "fast", args=("selftest",)),          # fake install + manifest falsifiers
     S("consistency.py", "fast", args=("selftest",)),   # injected-manifest container + falsifiers
+    # The allocator must not be a crash source. Its own --selftest builds four
+    # synthetic binaries and asserts FAIL / PASS / INCONCLUSIVE all fire.
+    S("allocasserts.py", "fast"),                      # mimalloc MI_DEBUG sentinels
     S("nativetabs_check.py", "fast", args=("selftest",)),
     S("uihooks_check.py", "fast", args=("selftest",)),
 
@@ -294,6 +297,15 @@ VERIFIERS = [
       "serialiser that cannot reproduce the shipped bytes must EACH be refused; "
       "the last is the anti-vacuous gate -- without it `inject` would happily "
       "rewrite the payload in a serialisation the client cannot read"),
+    V("allocasserts.py", "allocasserts.py --selftest",
+      "four synthetic binaries: one carrying mimalloc's control string AND an "
+      "MI_DEBUG-only assertion literal must come back FAIL (the measured shape "
+      "of every DLL shipped before 2026-09-03); one carrying only the control "
+      "must PASS; one carrying NEITHER must be INCONCLUSIVE, because with no "
+      "proof mimalloc is even in the file, 'no assertions found' is 'we could "
+      "not look'; and a fourth shows one surviving sentinel of five is enough. "
+      "The runner also refuses if the case set does not exercise all three "
+      "verdicts"),
     V("dlss.py", "dlss.py selftest",
       "synthetic install tree; the wrong (unsigned) checksum formula, an "
       "off-by-one checksum, a same-size DLL tamper and a truncated backup "

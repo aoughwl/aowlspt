@@ -186,6 +186,34 @@ proc prepareEnv(e: Env) =
     except:
       warn "could not set PATH; gcc and the linker may not be found"
 
+const mimallocFlags* = " --passC:-DMI_BUILD_RELEASE --passC:-DMI_DEBUG=0"
+  ## Build the VENDORED mimalloc (nimony `lib/std/system/mimalloc.nim` compiles
+  ## `vendor/mimalloc/src/static.c`) with its debug machinery OFF, in EVERY
+  ## aowlspt binary.
+  ##
+  ## MEASURED 2026-09-03, WER dump EscapeFromTarkov.exe.636.dmp read with cdb:
+  ## the client died in `ucrtbase!abort` called from the HOST DLL, and the
+  ## string argument on the stack (`da 00007ffb3dfd1373`) was mimalloc's
+  ## `"corrupted thread-free list."` -- `vendor/mimalloc/src/page.c:205`,
+  ## reached from `mi_malloc` on the ops thread. The abort itself is
+  ## `mi_error_default` in `src/options.c:543`, whose `abort()` for `EFAULT`
+  ## is compiled in ONLY under `#if (MI_DEBUG>0)`. nimony leaves `MI_DEBUG` at
+  ## 2 unless `MI_BUILD_RELEASE` or `NDEBUG` is defined (`types.h:69-75`), and
+  ## aowl never passed `-d:release`, so every shipped DLL carried it --
+  ## confirmed by `markers.py --string "mimalloc: assertion failed"` finding
+  ## the literal PRESENT in the deployed host DLL and in `sain.dll`.
+  ##
+  ## With MI_DEBUG=0 the SAME corruption check still runs and still refuses to
+  ## free the suspect list; it just returns instead of killing the process
+  ## (the thread-free blocks leak). That is the honest trade: a real heap bug
+  ## now surfaces later and less precisely. `MI_SECURE` (types.h:55-63) would
+  ## restore the abort and is deliberately NOT enabled.
+  ##
+  ## `--passC` reaches the `{.compile.}` TU (same `cc` invocation), and
+  ## nimony keys `nimcache_static/` objects on the cc command line, so this
+  ## produces a fresh object rather than reusing the assert-laden one.
+  ## Kept identical in `tools/modbuild.py:compile_cmd`.
+
 proc nimonyExe(e: Env): string =
   result = joinPath(e.nimony, "bin\\nimony.exe")
 
@@ -503,7 +531,7 @@ proc buildMod(e: Env; modPathIn: string): bool =
   discard removeFileAt(outPath)
 
   var cmd = quoted(nimonyExe(e))
-  cmd.add " c --app:lib"
+  cmd.add " c --app:lib" & mimallocFlags
   # Mods get the ABI include path too.
   #
   # They did not, and the consequence was invisible until someone tried: a mod
@@ -625,7 +653,7 @@ proc buildHosts(e: Env): bool =
   discard removeFileAt(outPath)
 
   var cmd = quoted(nimonyExe(e))
-  cmd.add " c"
+  cmd.add " c" & mimallocFlags
   cmd.add abiInclude(e)
   if e.debugBuild:
     cmd.add " -d:debug"
@@ -729,7 +757,7 @@ proc buildIl2CppHost(e: Env): bool =
   discard removeFileAt(outPath)
 
   var cmd = quoted(nimonyExe(e))
-  cmd.add " c --app:lib"
+  cmd.add " c --app:lib" & mimallocFlags
   cmd.add abiInclude(e)
   if e.debugBuild:
     cmd.add " -d:debug"
@@ -909,7 +937,7 @@ proc buildOverlayTests(e: Env): bool =
     okAll = false
 
   var cmd = quoted(nimonyExe(e))
-  cmd.add " c"
+  cmd.add " c" & mimallocFlags
   cmd.add abiInclude(e)
   cmd.add " -p:" & quoted(joinPath(e.repo, "host\\Aowlspt.Overlay"))
   cmd.add " -o:" & quoted(joinPath(dir, "overlaynimtest.exe"))
@@ -928,7 +956,7 @@ proc buildBackend(e: Env): bool =
   discard removeFileAt(outPath)
 
   var cmd = quoted(nimonyExe(e))
-  cmd.add " c"
+  cmd.add " c" & mimallocFlags
   cmd.add abiInclude(e)
   cmd.add " --passL:-lws2_32 --passL:-lz"
   if e.debugBuild:
@@ -945,7 +973,7 @@ proc buildProbe(e: Env): bool =
   let outDir = joinPath(e.repo, "installer\\build")
   discard ensureDir(outDir)
   var cmd = quoted(nimonyExe(e))
-  cmd.add " c"
+  cmd.add " c" & mimallocFlags
   cmd.add abiInclude(e)
   cmd.add " --passL:-lws2_32 --passL:-lz"
   cmd.add " -p:" & quoted(joinPath(e.repo, "backend"))
@@ -963,7 +991,7 @@ proc buildPerfBench(e: Env): bool =
   let outDir = joinPath(e.repo, "installer\\build")
   discard ensureDir(outDir)
   var cmd = quoted(nimonyExe(e))
-  cmd.add " c"
+  cmd.add " c" & mimallocFlags
   cmd.add abiInclude(e)
   cmd.add " --passC:-DAOWLSPT_FAST_BENCH"
   cmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
@@ -980,7 +1008,7 @@ proc buildSoak(e: Env): bool =
   let outDir = joinPath(e.repo, "installer\\build")
   discard ensureDir(outDir)
   var cmd = quoted(nimonyExe(e))
-  cmd.add " c"
+  cmd.add " c" & mimallocFlags
   cmd.add abiInclude(e)
   cmd.add " --passL:-lws2_32 --passL:-lz"
   cmd.add " -p:" & quoted(joinPath(e.repo, "backend"))
@@ -996,7 +1024,7 @@ proc buildEmuTest(e: Env): bool =
   let outDir = joinPath(e.repo, "installer\\build")
   discard ensureDir(outDir)
   var cmd = quoted(nimonyExe(e))
-  cmd.add " c"
+  cmd.add " c" & mimallocFlags
   cmd.add abiInclude(e)
   cmd.add " --passL:-lws2_32 --passL:-lz"
   cmd.add " -p:" & quoted(joinPath(e.repo, "backend"))
@@ -1013,7 +1041,7 @@ proc buildRealTest(e: Env): bool =
   let outDir = joinPath(e.repo, "installer\\build")
   discard ensureDir(outDir)
   var cmd = quoted(nimonyExe(e))
-  cmd.add " c"
+  cmd.add " c" & mimallocFlags
   cmd.add abiInclude(e)
   cmd.add " --passL:-lws2_32 --passL:-lz"
   cmd.add " -p:" & quoted(joinPath(e.repo, "backend"))
@@ -1031,7 +1059,7 @@ proc buildStoreCrash(e: Env): bool =
   let outDir = joinPath(e.repo, "installer\\build")
   discard ensureDir(outDir)
   var cmd = quoted(nimonyExe(e))
-  cmd.add " c"
+  cmd.add " c" & mimallocFlags
   cmd.add abiInclude(e)
   cmd.add " -p:" & quoted(joinPath(e.repo, "host\\common"))
   cmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
@@ -1047,7 +1075,7 @@ proc buildFuzzWire(e: Env): bool =
   let outDir = joinPath(e.repo, "installer\\build")
   discard ensureDir(outDir)
   var cmd = quoted(nimonyExe(e))
-  cmd.add " c"
+  cmd.add " c" & mimallocFlags
   cmd.add abiInclude(e)
   cmd.add " --passL:-lws2_32 --passL:-lz"
   cmd.add " -p:" & quoted(joinPath(e.repo, "backend"))
@@ -1064,7 +1092,7 @@ proc buildWsTest(e: Env): bool =
   let outDir = joinPath(e.repo, "installer\\build")
   discard ensureDir(outDir)
   var cmd = quoted(nimonyExe(e))
-  cmd.add " c"
+  cmd.add " c" & mimallocFlags
   cmd.add abiInclude(e)
   cmd.add " --passL:-lws2_32 --passL:-lz"
   cmd.add " -p:" & quoted(joinPath(e.repo, "backend"))
@@ -1082,7 +1110,7 @@ proc buildLiveCtl(e: Env): bool =
   let outDir = joinPath(e.repo, "installer\\build")
   discard ensureDir(outDir)
   var cmd = quoted(nimonyExe(e))
-  cmd.add " c"
+  cmd.add " c" & mimallocFlags
   cmd.add abiInclude(e)
   cmd.add " --passL:-lws2_32 --passL:-lz"
   cmd.add " -p:" & quoted(joinPath(e.repo, "backend"))
@@ -1101,7 +1129,7 @@ proc buildOvSync(e: Env): bool =
   let outDir = joinPath(e.repo, "installer\\build")
   discard ensureDir(outDir)
   var cmd = quoted(nimonyExe(e))
-  cmd.add " c"
+  cmd.add " c" & mimallocFlags
   cmd.add abiInclude(e)
   cmd.add " --passL:-lws2_32 --passL:-lz"
   cmd.add " -p:" & quoted(joinPath(e.repo, "backend"))
@@ -1123,7 +1151,7 @@ proc buildAllMods(e: Env): bool =
   let outDir = joinPath(e.repo, "installer\\build")
   discard ensureDir(outDir)
   var cmd = quoted(nimonyExe(e))
-  cmd.add " c"
+  cmd.add " c" & mimallocFlags
   cmd.add abiInclude(e)
   cmd.add " --passL:-lws2_32 --passL:-lz"
   cmd.add " -p:" & quoted(joinPath(e.repo, "backend"))
@@ -1142,7 +1170,7 @@ proc buildModResolve(e: Env): bool =
   let outDir = joinPath(e.repo, "installer\\build")
   discard ensureDir(outDir)
   var cmd = quoted(nimonyExe(e))
-  cmd.add " c"
+  cmd.add " c" & mimallocFlags
   cmd.add abiInclude(e)
   cmd.add " -p:" & quoted(joinPath(e.repo, "mods\\manager\\mgr"))
   cmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
@@ -1160,7 +1188,7 @@ proc buildBench(e: Env): bool =
   let outDir = joinPath(e.repo, "installer\\build")
   discard ensureDir(outDir)
   var cmd = quoted(nimonyExe(e))
-  cmd.add " c"
+  cmd.add " c" & mimallocFlags
   cmd.add abiInclude(e)
   cmd.add " --passL:-lws2_32 --passL:-lz"
   cmd.add " -p:" & quoted(joinPath(e.repo, "backend"))
@@ -1177,7 +1205,7 @@ proc buildVerifyInstall(e: Env): bool =
   let outDir = joinPath(e.repo, "installer\\build")
   discard ensureDir(outDir)
   var cmd = quoted(nimonyExe(e))
-  cmd.add " c"
+  cmd.add " c" & mimallocFlags
   cmd.add abiInclude(e)
   cmd.add " --passL:-lws2_32 --passL:-lz"
   cmd.add " -p:" & quoted(joinPath(e.repo, "backend"))
@@ -1206,7 +1234,7 @@ proc buildFirstRun(e: Env): bool =
   let outDir = joinPath(e.repo, "installer\\build")
   discard ensureDir(outDir)
   var cmd = quoted(nimonyExe(e))
-  cmd.add " c"
+  cmd.add " c" & mimallocFlags
   cmd.add abiInclude(e)
   cmd.add " --passL:-lws2_32 --passL:-lz"
   cmd.add " -p:" & quoted(joinPath(e.repo, "backend"))
@@ -1222,7 +1250,7 @@ proc buildTool(e: Env; source, exeName, label: string): bool =
   let outDir = joinPath(e.repo, "installer\\build")
   discard ensureDir(outDir)
   var cmd = quoted(nimonyExe(e))
-  cmd.add " c"
+  cmd.add " c" & mimallocFlags
   cmd.add abiInclude(e)
   if e.debugBuild:
     cmd.add " -d:debug"
@@ -1238,7 +1266,7 @@ proc buildInstaller(e: Env): bool =
   let dir = joinPath(e.repo, "installer")
   discard ensureDir(joinPath(dir, "build"))
   var cmd = quoted(nimonyExe(e))
-  cmd.add " c"
+  cmd.add " c" & mimallocFlags
   if e.debugBuild:
     cmd.add " -d:debug"
   cmd.add " -p:" & quoted(joinPath(dir, "src"))
@@ -1250,7 +1278,7 @@ proc buildInstallerTests(e: Env): bool =
   let dir = joinPath(e.repo, "installer")
   discard ensureDir(joinPath(dir, "build"))
   var cmd = quoted(nimonyExe(e))
-  cmd.add " c -p:" & quoted(joinPath(dir, "src"))
+  cmd.add " c" & mimallocFlags & " -p:" & quoted(joinPath(dir, "src"))
   cmd.add " -o:" & quoted(joinPath(dir, "build\\test-installer.exe"))
   cmd.add " " & quoted(joinPath(dir, "tests\\test_installer.nim"))
   result = run(e, "installer tests (compile)", cmd)
@@ -1609,7 +1637,7 @@ proc cmdBootstrap(e: Env): int =
   discard removeFileAt(nextExe)
 
   var cmd = quoted(nimonyExe(e))
-  cmd.add " c"
+  cmd.add " c" & mimallocFlags
   cmd.add abiInclude(e)
   cmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
   cmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
@@ -1750,7 +1778,7 @@ proc cmdSelfCheck(e: Env; modPath: string): int =
     return 1
 
   var cmd = quoted(nimonyExe(e))
-  cmd.add " c"
+  cmd.add " c" & mimallocFlags
   cmd.add abiInclude(e)
   cmd.add " -p:" & quoted(dir)
   cmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
@@ -1790,7 +1818,7 @@ proc cmdLootHash(e: Env; extra: seq[string]): int =
   discard ensureDir(outDir)
   let exe = joinPath(outDir, "loothash.exe")
   var cmd = quoted(nimonyExe(e))
-  cmd.add " c"
+  cmd.add " c" & mimallocFlags
   cmd.add abiInclude(e)
   cmd.add " -p:" & quoted(modDir)
   cmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
@@ -1933,7 +1961,7 @@ proc testBuildCmd(e: Env; name: string; outExe: string): string =
   ## REFUSAL, not a default: inventing a plausible `-p:` set here would build a
   ## different binary from the one the suite runs.
   var cmd = quoted(nimonyExe(e))
-  cmd.add " c"
+  cmd.add " c" & mimallocFlags
   cmd.add abiInclude(e)
   case name
   of "tickrace", "regrace":
@@ -2272,7 +2300,7 @@ proc cmdTestOneMod(e: Env; name: string): int =
     return 3
   let exe = joinPath(outDir, name & "_selftest.exe")
   var cmd = quoted(nimonyExe(e))
-  cmd.add " c"
+  cmd.add " c" & mimallocFlags
   cmd.add abiInclude(e)
   cmd.add " -p:" & quoted(core)
   cmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
@@ -2323,7 +2351,7 @@ proc cmdTest(e: Env): int =
   heading "ABI layout (nimony)"
   let nimExe = joinPath(testsDir, "abi_layout_nim.exe")
   var cmd = quoted(nimonyExe(e))
-  cmd.add " c -p:" & quoted(joinPath(e.repo, "aowl\\src"))
+  cmd.add " c" & mimallocFlags & " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
   cmd.add " -o:" & quoted(nimExe) & " "
   cmd.add quoted(joinPath(testsDir, "abi_layout.nim"))
   if run(e, "compile abi_layout.nim", cmd):
@@ -3462,7 +3490,7 @@ proc cmdTest(e: Env): int =
     let outDir = joinPath(e.repo, "installer\\build")
     discard ensureDir(outDir)
     var cmd = quoted(nimonyExe(e))
-    cmd.add " c"
+    cmd.add " c" & mimallocFlags
     cmd.add abiInclude(e)
     cmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
     cmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
@@ -3496,7 +3524,7 @@ proc cmdTest(e: Env): int =
     let outDir = joinPath(e.repo, "installer\\build")
     discard ensureDir(outDir)
     var cmd = quoted(nimonyExe(e))
-    cmd.add " c"
+    cmd.add " c" & mimallocFlags
     cmd.add abiInclude(e)
     cmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
     cmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
@@ -3538,7 +3566,7 @@ proc buildScript(e: Env; scriptPath: string; exeOut: var string): bool =
     stem = stem.substr(0, stem.len - 5)
   exeOut = joinPath(outDir, stem & ".exe")
   var cmd = quoted(nimonyExe(e))
-  cmd.add " c"
+  cmd.add " c" & mimallocFlags
   cmd.add abiInclude(e)
   cmd.add " --passL:-lws2_32"
   cmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
@@ -4054,7 +4082,7 @@ proc cmdRelease(e: Env; extra: seq[string]): int =
   let outDir = joinPath(e.repo, "installer\\build")
   discard ensureDir(outDir)
   var cmd = quoted(nimonyExe(e))
-  cmd.add " c"
+  cmd.add " c" & mimallocFlags
   cmd.add abiInclude(e)
   cmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
   cmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
@@ -4085,7 +4113,7 @@ proc cmdImportDb(e: Env; extra: seq[string]): int =
   let outDir = joinPath(e.repo, "installer\\build")
   discard ensureDir(outDir)
   var cmd = quoted(nimonyExe(e))
-  cmd.add " c"
+  cmd.add " c" & mimallocFlags
   cmd.add abiInclude(e)
   cmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
   cmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
