@@ -202,6 +202,23 @@ var gPfxScrollSaid = false
 ## dangling managed reference in the game's own object.
 var gPfxOrigRootT: Il2CppPtr = nil
 var gPfxOrigGeom = nuNoGeom()
+## THE PANELS, RESOLVED FROM THE TAB ITSELF rather than borrowed from
+## modstab's `gGfxPostT` / `gGfxPanelT`. Those two are populated by the SUBTAB
+## feature's tick, so the graft depended on another feature having run first
+## -- and when it had not, the graft returned SILENTLY (postfxrows.nim:633-634
+## on the deployed build a7386d1f: two bare `return false` lines with no
+## refusal between them). The whole run then produced no 'SCROLL GRAFT' line
+## at all and only the verdict's INCONCLUSIVE, which read as "there is no
+## ScrollRect" when the truth was "the graft never ran".
+var gPfxPostPanelT: Il2CppPtr = nil
+var gPfxGfxPanelT: Il2CppPtr = nil
+## THE GRAFT'S OWN OUTCOME, so the verdict can tell 'declined, and why' apart
+## from 'applied, but the result is wrong'. Both printed the same INCONCLUSIVE
+## before, which is the same class of defect as the checks 9b is about: one
+## sentence covering two different causes with different fixes.
+var gPfxGraftTried = false
+var gPfxGraftOk = false
+var gPfxGraftWhy = ""
 
 ## ---- the gray-out (defect 3) -------------------------------------------
 var gPfxGrayInit = false
@@ -584,6 +601,69 @@ proc pfxMoveKids(fromT, toT: Il2CppPtr): int =
     i = i - 1
     steps = steps + 1
 
+proc pfxGraftRefuse(why: string) =
+  ## EVERY exit from the graft that is not a success comes through here. There
+  ## is no silent `return` left in `pfxScrollify`, and that is the point: the
+  ## deployed build had exactly two, they fired, and the only trace was a
+  ## verdict line about a missing ScrollRect that had nothing to do with the
+  ## cause.
+  gPfxGraftWhy = why
+  pfxNoteFault("SCROLL GRAFT DECLINED -- " & why)
+
+proc pfxResolvePanels(tab: Il2CppPtr; postT, gfxT: var Il2CppPtr): bool =
+  ## BOTH PANELS, WALKED FROM THE TAB THE CALLER ALREADY VALIDATED. Nothing
+  ## here reads `gGfxPostT` / `gGfxPanelT`: those belong to the subtab feature
+  ## and are nil until ITS tick has run, so depending on them made this graft
+  ## silently ordering-dependent on a different feature.
+  ##
+  ## The walk, with every hop validated and NOTHING assumed about which node
+  ## the tab component sits on -- the tab's own GameObject is checked BY NAME
+  ## and, only if that is not the panel, its parent is. Guessing either way
+  ## round would produce a plausible transform and a wrong donor.
+  postT = nil
+  gfxT = nil
+  let go = nuGameObjectOf(tab)
+  if go == nil:
+    pfxGraftRefuse("the PostFXSettingsTab component has no reachable " &
+                   "GameObject, so neither panel can be walked to. Nothing " &
+                   "was cloned.")
+    return false
+  let tt = modsTransformOf(go)
+  if tt == nil or not duOk(tt, 0x20'i32) or not iUnityAlive(tt):
+    pfxGraftRefuse("the PostFXSettingsTab's own Transform could not be read, " &
+                   "so the walk to 'PostFX Settings' cannot start. Nothing " &
+                   "was cloned.")
+    return false
+  var pp = tt
+  if iObjName(tt) != "PostFX Settings":
+    let par = modsParentOf(tt)
+    if par != nil and iObjName(par) == "PostFX Settings":
+      pp = par
+    else:
+      pfxGraftRefuse("neither the tab's own node ('" & iObjName(tt) &
+                     "') nor its parent ('" & iObjName(par) &
+                     "') is named 'PostFX Settings', so the walk landed " &
+                     "somewhere this file does not recognise. Refusing " &
+                     "rather than grafting a scroll host onto an unknown node.")
+      return false
+  let screenT = modsParentOf(pp)
+  if screenT == nil or not duOk(screenT, 0x20'i32):
+    pfxGraftRefuse("the SettingsScreen transform (the parent of 'PostFX " &
+                   "Settings') could not be reached, so the Graphics donor " &
+                   "panel cannot be found. Nothing was cloned.")
+    return false
+  let gp = modsChildNamed(screenT, "Graphics Settings")
+  if gp == nil or not duOk(gp, 0x20'i32) or not iUnityAlive(gp):
+    pfxGraftRefuse("'Graphics Settings' is not a child of the SettingsScreen " &
+                   "we walked to from the tab, so there is no donor to clone " &
+                   "a ScrollRect from. Nothing was cloned.")
+    return false
+  postT = pp
+  gfxT = gp
+  gPfxPostPanelT = pp
+  gPfxGfxPanelT = gp
+  return true
+
 proc pfxScrollify(tab, rowParent: Il2CppPtr; newRootOut: var Il2CppPtr): bool =
   ## DEFECT 2, SECOND ATTEMPT -- and the first one is worth stating, because
   ## the verdict that blessed it is the exact failure 9b is about.
@@ -629,51 +709,57 @@ proc pfxScrollify(tab, rowParent: Il2CppPtr; newRootOut: var Il2CppPtr): bool =
   ##      so the Viewport ends with exactly ONE active child.
   result = false
   newRootOut = nil
+  gPfxGraftTried = true
   if gPfxScrollGo != nil: return true
-  if gGfxPanelT == nil or gGfxPostT == nil: return false
-  if not iUnityAlive(gGfxPanelT) or not iUnityAlive(gGfxPostT): return false
+  # THE TWO SILENT RETURNS THAT USED TO BE HERE WERE THE WHOLE BUG on
+  # a7386d1f: `if gGfxPanelT == nil or gGfxPostT == nil: return false` and its
+  # liveness twin, both bare. One of them fired on every run and said nothing.
+  # Both panels now come from the tab, and every exit below announces itself.
+  var postT: Il2CppPtr = nil
+  var gfxT: Il2CppPtr = nil
+  if not pfxResolvePanels(tab, postT, gfxT): return
   # (1) THE AUTHORED RECT, read before we write anything anywhere. Without it
   # there is nothing to size the scroll region to and nothing to restore, so
   # this is a refusal, not a fallback.
   let og = nuReadGeom(rowParent)
   if not og.ok:
-    pfxNoteFault("the authored geometry of _settingsRoot (the SettingsPanel " &
+    pfxGraftRefuse("the authored geometry of _settingsRoot (the SettingsPanel " &
                  "the scroll region must exactly replace) could not be read, " &
                  "so there is no rect to size the clone to. Nothing was " &
                  "cloned and the page is untouched.")
     return
-  var donorT = modsChildNamed(modsChildNamed(gGfxPanelT, "Other Settings"),
+  var donorT = modsChildNamed(modsChildNamed(gfxT, "Other Settings"),
                               "SettingsList")
   if donorT == nil:
-    donorT = modsFindNamed(gGfxPanelT, "SettingsList", 4)
+    donorT = modsFindNamed(gfxT, "SettingsList", 4)
   if donorT == nil or not duOk(donorT, 0x20'i32) or not iUnityAlive(donorT):
-    pfxNoteFault("the Graphics page's 'SettingsList' (the ScrollRect donor) " &
+    pfxGraftRefuse("the Graphics page's 'SettingsList' (the ScrollRect donor) " &
                  "could not be reached by walking 'Graphics Settings' -> " &
                  "'Other Settings' -> 'SettingsList', nor found by name " &
                  "within 4 levels. Nothing was cloned.")
     return
   if modsComponent(donorT, "ScrollRect") == nil:
-    pfxNoteFault("the node found as the Graphics 'SettingsList' carries no " &
+    pfxGraftRefuse("the node found as the Graphics 'SettingsList' carries no " &
                  "ScrollRect, so it is NOT the scroll host and cloning it " &
                  "would graft a container that cannot scroll. Refused.")
     return
-  let panelT = modsChildNamed(gGfxPostT, "Panel")
+  let panelT = modsChildNamed(postT, "Panel")
   let panelGo = (if panelT != nil: iGameObjectOf(panelT) else: nil)
   let donorGo = iGameObjectOf(donorT)
   if panelT == nil or panelGo == nil or donorGo == nil:
-    pfxNoteFault("'PostFX Settings' -> 'Panel' or the donor SettingsList has " &
+    pfxGraftRefuse("'PostFX Settings' -> 'Panel' or the donor SettingsList has " &
                  "no reachable GameObject, so there is nowhere to put a " &
                  "scroll host and nothing to clone. The page is untouched.")
     return
   let cloneGo = modsClone(donorGo)
   let cloneT = (if cloneGo != nil: modsTransformOf(cloneGo) else: nil)
   if cloneGo == nil or cloneT == nil:
-    pfxNoteFault("Object::Instantiate of the Graphics SettingsList returned " &
+    pfxGraftRefuse("Object::Instantiate of the Graphics SettingsList returned " &
                  "null or a clone with no reachable Transform. Nothing is " &
                  "parented anywhere.")
     return
   if not modsSetParent(cloneGo, panelGo):
-    pfxNoteFault("the cloned SettingsList could not be parented under the " &
+    pfxGraftRefuse("the cloned SettingsList could not be parented under the " &
                  "PostFX 'Panel'. It is destroyed rather than left at the " &
                  "scene root, where it would render over the screen.")
     discard nuDestroy(cloneGo)
@@ -681,7 +767,7 @@ proc pfxScrollify(tab, rowParent: Il2CppPtr; newRootOut: var Il2CppPtr): bool =
   # (1) THE CLONE ROOT BECOMES THE AUTHORED PANEL, exactly.
   if not nuLayout(cloneT, og.aMinX, og.aMinY, og.aMaxX, og.aMaxY,
                   og.pivX, og.pivY, og.sdX, og.sdY, og.posX, og.posY):
-    pfxNoteFault("the authored SettingsPanel geometry could not be applied " &
+    pfxGraftRefuse("the authored SettingsPanel geometry could not be applied " &
                  "to the clone root, so the scroll region would sit wherever " &
                  "the donor happened to sit -- the inset box the user saw. " &
                  "The clone is destroyed.")
@@ -695,7 +781,7 @@ proc pfxScrollify(tab, rowParent: Il2CppPtr; newRootOut: var Il2CppPtr): bool =
     var missing = "its 'Viewport/Content' child"
     if sr == nil: missing = "its ScrollRect"
     elif viewportT == nil: missing = "its 'Viewport' child"
-    pfxNoteFault("the clone is missing " & missing & ", so it cannot host " &
+    pfxGraftRefuse("the clone is missing " & missing & ", so it cannot host " &
                  "anything. It is destroyed and the PostFX page is left " &
                  "exactly as it was.")
     discard nuDestroy(cloneGo)
@@ -705,7 +791,7 @@ proc pfxScrollify(tab, rowParent: Il2CppPtr; newRootOut: var Il2CppPtr): bool =
   # overhang the user reported.
   if not nuLayout(viewportT, 0.0'f32, 0.0'f32, 1.0'f32, 1.0'f32,
                   0.5'f32, 0.5'f32, 0.0'f32, 0.0'f32, 0.0'f32, 0.0'f32):
-    pfxNoteFault("the cloned Viewport could not be stretched to the clone " &
+    pfxGraftRefuse("the cloned Viewport could not be stretched to the clone " &
                  "root, so it would clip at the donor's own inset width. The " &
                  "clone is destroyed.")
     discard nuDestroy(cloneGo)
@@ -718,7 +804,7 @@ proc pfxScrollify(tab, rowParent: Il2CppPtr; newRootOut: var Il2CppPtr): bool =
   # anywhere above leaves it naming the panel that still holds the rows.
   let moved = pfxMoveKids(rowParent, contentT)
   if moved <= 0:
-    pfxNoteFault("not one row could be moved from SettingsPanel into the " &
+    pfxGraftRefuse("not one row could be moved from SettingsPanel into the " &
                  "cloned Content, so the rows are still in the unscrolled " &
                  "panel. The clone is destroyed and _settingsRoot is " &
                  "untouched -- nothing is half-moved.")
@@ -726,7 +812,7 @@ proc pfxScrollify(tab, rowParent: Il2CppPtr; newRootOut: var Il2CppPtr): bool =
     return
   if not nuOk(sr, NuOffScrollContent + 8'i32) or
      not nuOk(tab, PfxOffSettingsRoot + 8'i32):
-    pfxNoteFault("ScrollRect.m_Content@0x20 or PostFXSettingsTab." &
+    pfxGraftRefuse("ScrollRect.m_Content@0x20 or PostFXSettingsTab." &
                  "_settingsRoot@0xa0 could not be READ, so neither is " &
                  "written. The rows have already moved into the cloned " &
                  "Content; they are moved back and the clone destroyed.")
@@ -735,7 +821,7 @@ proc pfxScrollify(tab, rowParent: Il2CppPtr; newRootOut: var Il2CppPtr): bool =
     return
   if cNuSetRef(sr, NuOffScrollContent, contentT) == 0'i32 or
      cNuSetRef(tab, PfxOffSettingsRoot, contentT) == 0'i32:
-    pfxNoteFault("the write to m_Content@0x20 or _settingsRoot@0xa0 was " &
+    pfxGraftRefuse("the write to m_Content@0x20 or _settingsRoot@0xa0 was " &
                  "refused by the writability check. The rows are moved back " &
                  "into SettingsPanel and the clone destroyed, so the page is " &
                  "unscrolled but intact.")
@@ -766,6 +852,8 @@ proc pfxScrollify(tab, rowParent: Il2CppPtr; newRootOut: var Il2CppPtr): bool =
   gPfxOrigRootT = rowParent
   gPfxOrigGeom = og
   newRootOut = contentT
+  gPfxGraftOk = true
+  gPfxGraftWhy = ""
   okLog "postfx rows: SCROLL GRAFT (v2) applied -- the clone root was given " &
         "the AUTHORED SettingsPanel rect verbatim (" & nuGeomNote(og) &
         "), its Viewport stretched to fill that root, " & $retired &
@@ -801,7 +889,34 @@ proc pfxScrollVerdict(rowParent: Il2CppPtr) =
   ##     the page;
   ##   * content no taller than the viewport -> there is nothing to scroll.
   ## INCONCLUSIVE is a third outcome throughout and is never a pass.
+  ## GRAFT OUTCOME FIRST, AND IT IS THREE OUTCOMES, NOT ONE. On a7386d1f the
+  ## graft returned silently and this verdict printed "no ScrollRect was found
+  ## under PostFX Settings" -- a true sentence about a completely different
+  ## cause, and the reason a whole deploy was spent looking at the wrong half
+  ## of the feature. "The graft never ran" and "the graft ran and produced no
+  ## ScrollRect" are different bugs with different fixes and must never share
+  ## a line.
+  if not gPfxScrollOn:
+    warn "postfx rows SCROLL: the graft is DISABLED (settingsPostFxScroll is " &
+         "off), so the PostFX page is the flat unscrolled panel by choice. " &
+         "This is not a verdict about a missing ScrollRect."
+    return
+  if gPfxGraftTried and not gPfxGraftOk:
+    warn "postfx rows SCROLL VERDICT INCONCLUSIVE -- THE GRAFT NEVER " &
+         "COMPLETED, so there is nothing to judge. Reason: " &
+         (if gPfxGraftWhy.len > 0: gPfxGraftWhy
+          else: "not recorded, which is itself a defect -- every exit from " &
+                "pfxScrollify is supposed to name itself") &
+         ". Note this is NOT 'no ScrollRect exists': nothing was ever cloned."
+    return
+  if not gPfxGraftTried:
+    warn "postfx rows SCROLL VERDICT INCONCLUSIVE: the graft was never even " &
+         "attempted this build, so the page is unchanged and no geometry " &
+         "claim is being made."
+    return
   let host = (if gPfxScrollHostT != nil: gPfxScrollHostT
+              elif gPfxPostPanelT != nil:
+                modsFindNamed(gPfxPostPanelT, "SettingsList", 4)
               else: modsFindNamed(gGfxPostT, "SettingsList", 4))
   let sr = (if host != nil: modsComponent(host, "ScrollRect") else: nil)
   if sr == nil:
@@ -828,7 +943,8 @@ proc pfxScrollVerdict(rowParent: Il2CppPtr) =
                     cNuGetRef(sr, NuOffScrollViewport) else: nil)
   let vg = nuReadGeom(viewport)
   let cg = nuReadGeom(content)
-  let pg = nuReadGeom(gGfxPostT)
+  let pg = nuReadGeom(if gPfxPostPanelT != nil: gPfxPostPanelT
+                      else: gGfxPostT)
   if not vg.ok or not cg.ok:
     warn "postfx rows SCROLL VERDICT INCONCLUSIVE: m_Content is correct but " &
          (if not vg.ok: "the viewport" else: "the content") &
@@ -988,8 +1104,13 @@ proc pfxStockToggle(): Il2CppPtr =
   ## not something this file may assume.
   result = nil
   if gPfxStockTog != nil and nuAlive(gPfxStockTog): return gPfxStockTog
-  if gGfxPostT == nil or not iUnityAlive(gGfxPostT): return
-  let panelT = modsChildNamed(gGfxPostT, "Panel")
+  # PREFER THE PANEL WE WALKED TO FROM THE TAB. modstab's `gGfxPostT` is
+  # populated by the SUBTAB feature's tick and is nil until that has run;
+  # leaning on it is exactly what made the scroll graft silently
+  # ordering-dependent on another feature, and the same trap applies here.
+  let base = (if gPfxPostPanelT != nil: gPfxPostPanelT else: gGfxPostT)
+  if base == nil or not iUnityAlive(base): return
+  let panelT = modsChildNamed(base, "Panel")
   if panelT == nil: return
   let enT = modsChildNamed(panelT, "EnablePanel")
   if enT == nil or not duOk(enT, 0x20'i32): return
