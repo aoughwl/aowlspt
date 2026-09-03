@@ -4,7 +4,9 @@ r"""dlss.py -- DLSS Super Resolution DLL management for the live aowlspt install
     python tools/dlss.py fetch [--version V]       download + verify into .cache/dlss/ (never the repo tree)
     python tools/dlss.py install [--version V] [--preset K] [--dry-run]
     python tools/dlss.py rollback [--backup TS]
-    python tools/dlss.py preset get|set LETTER|clear
+    python tools/dlss.py preset get|set LETTER|clear      driver-side (NVAPI DRS) override
+    python tools/dlss.py game-set --mode Quality --preset K
+                                                   game-side Graphics.ini, only while stopped
     python tools/dlss.py selftest                  fake install dir + falsifiers, exit 0/1
 
 Everything this tool asserts is a property of the FINISHED STATE, read back
@@ -229,13 +231,26 @@ def gpu_generation(name):
     return {"2": "Turing (RTX 20)", "3": "Ampere (RTX 30)", "4": "Ada (RTX 40)", "5": "Blackwell (RTX 50)"}.get(m.group(1))
 
 
-def game_running():
+def game_pids():
+    """[pid, ...] for EscapeFromTarkov.exe, or None if tasklist could not answer.
+    An empty list means MEASURED not running; None means UNKNOWN -- the two are
+    never collapsed, because 'I could not look' is not 'it is not running'."""
     try:
-        out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq EscapeFromTarkov.exe", "/NH"],
+        out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq EscapeFromTarkov.exe", "/NH", "/FO", "CSV"],
                              capture_output=True, text=True, timeout=20).stdout
-        return "EscapeFromTarkov.exe" in out
     except Exception:
         return None
+    pids = []
+    for line in out.splitlines():
+        m = re.match(r'"EscapeFromTarkov\.exe","(\d+)"', line.strip())
+        if m:
+            pids.append(int(m.group(1)))
+    return pids
+
+
+def game_running():
+    p = game_pids()
+    return None if p is None else bool(p)
 
 
 def load_state():
@@ -632,6 +647,136 @@ def cmd_fetch(a):
 
 
 # ---------------------------------------------------------------------------
+# game-side settings file
+#
+# MEASURED 2026-09-03: the client persists graphics settings ON SAVE to
+#   %APPDATA%\Battlestate Games\Escape from Tarkov\Settings\Graphics.ini
+# which is JSON despite the .ini name; it carries "DLSSMode", "DLSSPreset" and
+# "DLSSEnabled" at the top level (observed "Quality" / "K" / true, file mtime
+# 11:48:06 immediately after pressing Save). This is the GAME side of the
+# picture; the DRS override above is the DRIVER side, and they are independent.
+#
+# Reading it is three-state: PASS with the values, or INCONCLUSIVE naming the
+# reason (absent / not JSON / no DLSS keys). It is never guessed.
+# ---------------------------------------------------------------------------
+GRAPHICS_INI = os.path.join(os.environ.get("APPDATA", ""), "Battlestate Games",
+                            "Escape from Tarkov", "Settings", "Graphics.ini")
+GAME_DLSS_KEYS = ("DLSSMode", "DLSSPreset", "DLSSEnabled")
+# EDLSSPreset names the game itself uses (Unity.Postprocessing.Runtime), same
+# set as the comment on PRESETS above. Anything else is refused rather than
+# written, because an unknown enum name is a value the client may reject.
+GAME_PRESETS = ("Default", "F", "J", "K", "L", "M")
+
+
+def read_graphics(path=None):
+    """Three outcomes. Returns a dict with 'status' PASS or INCONCLUSIVE, 'why',
+    the three DLSS values (None when the key is absent) and the file mtime."""
+    p = path or GRAPHICS_INI
+    out = {"path": p, "status": "INCONCLUSIVE", "why": "", "mtime": None}
+    for k in GAME_DLSS_KEYS:
+        out[k] = None
+    if not p:
+        out["why"] = "no path (APPDATA unset)"
+        return out
+    if not os.path.exists(p):
+        out["why"] = "file ABSENT"
+        return out
+    out["mtime"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(p)))
+    try:
+        raw = open(p, "rb").read()
+    except Exception as e:
+        out["why"] = "unreadable: %s" % e
+        return out
+    try:
+        doc = json.loads(raw.decode("utf-8-sig"))
+    except Exception as e:
+        out["why"] = "not JSON (%d bytes): %s" % (len(raw), e)
+        return out
+    if not isinstance(doc, dict):
+        out["why"] = "JSON root is %s, not an object" % type(doc).__name__
+        return out
+    present = [k for k in GAME_DLSS_KEYS if k in doc]
+    if not present:
+        out["why"] = "parsed, but none of %s is present" % ", ".join(GAME_DLSS_KEYS)
+        return out
+    for k in present:
+        out[k] = doc[k]
+    out["status"] = "PASS"
+    if len(present) != len(GAME_DLSS_KEYS):
+        out["why"] = "keys absent: %s" % ", ".join(k for k in GAME_DLSS_KEYS if k not in present)
+    return out
+
+
+def _replace_json_key(text, key, literal):
+    """Rewrite one top-level scalar value in place, keeping every other byte.
+    Refuses unless the key occurs EXACTLY once (a second occurrence would make
+    the edit ambiguous)."""
+    pat = re.compile(r'("%s"\s*:\s*)(".*?"|true|false|null|-?\d+(?:\.\d+)?)' % re.escape(key))
+    hits = pat.findall(text)
+    if len(hits) != 1:
+        raise RuntimeError("key %s occurs %d times; refusing an ambiguous edit" % (key, len(hits)))
+    return pat.sub(lambda m: m.group(1) + literal, text, count=1)
+
+
+def cmd_game_set(a):
+    p = a.graphics or GRAPHICS_INI
+    before = read_graphics(p)
+    if before["status"] != "PASS":
+        die("game-set: will not write %s -- %s" % (p, before["why"]), 3)
+    pids = game_pids()
+    if pids is None:
+        die("game-set: could not determine whether EscapeFromTarkov.exe runs (tasklist failed); "
+            "refusing to write %s. Nothing written." % p, 3)
+    if pids:
+        die("game-set: EscapeFromTarkov.exe is RUNNING (pid %s) -- it rewrites this file on save "
+            "and on exit, so a write now would be silently lost. Stop it first. Nothing written."
+            % ", ".join(str(x) for x in pids))
+    want = {}
+    if a.mode is not None:
+        want["DLSSMode"] = json.dumps(a.mode)
+    if a.preset is not None:
+        if a.preset not in GAME_PRESETS:
+            die("unknown game preset %r; the client's EDLSSPreset names are: %s" % (a.preset, ", ".join(GAME_PRESETS)))
+        want["DLSSPreset"] = json.dumps(a.preset)
+    if a.enabled is not None:
+        want["DLSSEnabled"] = "true" if a.enabled == "true" else "false"
+    if not want:
+        die("game-set: nothing to do; pass --mode / --preset / --enabled")
+    text = open(p, "r", encoding="utf-8-sig", newline="").read()
+    new = text
+    for k, lit in want.items():
+        try:
+            new = _replace_json_key(new, k, lit)
+        except RuntimeError as e:
+            die("game-set: %s. Nothing written." % e)
+    json.loads(new)          # the rewritten text must still parse, before it lands
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    backup = p + ".bak-" + ts
+    shutil.copy2(p, backup)
+    tmp = p + ".new"
+    with open(tmp, "w", encoding="utf-8", newline="") as f:
+        f.write(new)
+    os.replace(tmp, p)
+    after = read_graphics(p)
+    say("game-set: %s" % p)
+    say("  backup  : %s" % backup)
+    for k in GAME_DLSS_KEYS:
+        say("  %-12s %r -> %r" % (k, before[k], after[k]))
+    if after["status"] != "PASS":
+        die("game-set: re-read after write is %s (%s); restore with: copy \"%s\" \"%s\"" % (
+            after["status"], after["why"], backup, p))
+    bad = [k for k, lit in want.items() if json.dumps(after[k]) != lit]
+    if bad:
+        die("game-set: readback MISMATCH for %s; restore with: copy \"%s\" \"%s\"" % (", ".join(bad), backup, p))
+    unchanged = [k for k in GAME_DLSS_KEYS if k not in want and after[k] != before[k]]
+    if unchanged:
+        die("game-set: a key we did NOT ask for changed: %s; restore with: copy \"%s\" \"%s\"" % (
+            ", ".join(unchanged), backup, p))
+    say("game-set: PASS (re-read from disk; keys not requested are unchanged)")
+    say("  rollback: copy \"%s\" \"%s\"" % (backup, p))
+
+
+# ---------------------------------------------------------------------------
 # status
 # ---------------------------------------------------------------------------
 def describe_live(root):
@@ -696,8 +841,19 @@ def cmd_status(a):
         say("  DRS 0x%08X preset override: INCONCLUSIVE (%s)" % (DRS_PRESET_ID, note))
     else:
         say("  DRS 0x%08X preset override: %s (%s)" % (DRS_PRESET_ID, "unset" if v is None else "%d = %s" % (v, preset_name(v)), note))
-    say("  game-side preset (in Graphics settings; EDLSSPreset): Default/F/J/K/L/M -- read it from the client's log "
-        "'\"DLSSPreset\"' line or the live inspector, not from here")
+    say("== game-side (%s) ==" % ("Graphics.ini" if not getattr(a, "graphics", None) else a.graphics))
+    g = read_graphics(getattr(a, "graphics", None))
+    say("  file      : %s" % g["path"])
+    if g["status"] != "PASS":
+        say("  INCONCLUSIVE: %s" % g["why"])
+    else:
+        say("  mode      : %r" % g["DLSSMode"])
+        say("  preset    : %r" % g["DLSSPreset"])
+        say("  enabled   : %r" % g["DLSSEnabled"])
+        if g["why"]:
+            say("  partial   : %s" % g["why"])
+    say("  mtime     : %s" % g["mtime"])
+    say("  (written by the client on SAVE; the DRS override above is independent of it)")
     say("== cache ==")
     st = load_state()
     for ver in CATALOG:
@@ -1104,6 +1260,105 @@ def cmd_selftest(a):
         except SystemExit:
             refused = True
         check("rollback REFUSES an incomplete backup", refused)
+
+        say("selftest: game-side Graphics.ini (fixture + falsifiers)")
+        gpath = os.path.join(root, "Graphics.ini")
+        fixture = ('{\n  "Version": 9,\n  "Sharpen": 0.6,\n  "DLSSMode": "Quality",\n'
+                   '  "DLSSPreset": "K",\n  "DLSSEnabled": true,\n  "NVidiaReflex": "Off"\n}\n')
+        with open(gpath, "w", encoding="utf-8", newline="") as f:
+            f.write(fixture)
+        g = read_graphics(gpath)
+        check("fixture reads PASS with mode/preset/enabled",
+              g["status"] == "PASS" and (g["DLSSMode"], g["DLSSPreset"], g["DLSSEnabled"]) == ("Quality", "K", True),
+              repr(g))
+        check("fixture read reports an mtime", bool(g["mtime"]))
+        # falsifier 1: a file that is not JSON must be INCONCLUSIVE, never a guess
+        bad = os.path.join(root, "Graphics-bad.ini")
+        with open(bad, "w", encoding="utf-8", newline="") as f:
+            f.write("[Graphics]\nDLSSPreset=K\n")
+        gb = read_graphics(bad)
+        check("a non-JSON file is INCONCLUSIVE (not parsed as a value)",
+              gb["status"] == "INCONCLUSIVE" and "not JSON" in gb["why"] and gb["DLSSPreset"] is None, repr(gb))
+        gm = read_graphics(os.path.join(root, "nope.ini"))
+        check("an ABSENT file is INCONCLUSIVE naming absence",
+              gm["status"] == "INCONCLUSIVE" and "ABSENT" in gm["why"], repr(gm))
+        nk = os.path.join(root, "Graphics-nokeys.ini")
+        with open(nk, "w", encoding="utf-8", newline="") as f:
+            f.write('{"Version": 9}')
+        check("valid JSON without DLSS keys is INCONCLUSIVE", read_graphics(nk)["status"] == "INCONCLUSIVE")
+
+        class _NS:
+            pass
+
+        def gset(path, **kw):
+            ns = _NS()
+            ns.graphics = path
+            ns.mode = kw.get("mode")
+            ns.preset = kw.get("preset")
+            ns.enabled = kw.get("enabled")
+            return cmd_game_set(ns)
+
+        # falsifier 2: a write while the game "runs" must be REFUSED, naming the pid
+        real_pids = globals()["game_pids"]
+        globals()["game_pids"] = lambda: [4242]
+        refused, named = False, False
+        try:
+            gset(gpath, preset="M")
+        except SystemExit:
+            refused = True
+        named = read_graphics(gpath)["DLSSPreset"] == "K"
+        globals()["game_pids"] = lambda: None
+        refused_unknown = False
+        try:
+            gset(gpath, preset="M")
+        except SystemExit:
+            refused_unknown = True
+        globals()["game_pids"] = real_pids
+        check("game-set REFUSES while a pid is 'running'", refused)
+        check("... and the file is UNCHANGED after that refusal", named)
+        check("game-set REFUSES when the running state is UNKNOWN", refused_unknown)
+        # the real write, with the game measured stopped in this fake world
+        globals()["game_pids"] = lambda: []
+        try:
+            gset(gpath, mode="Balanced", preset="M")
+            g2 = read_graphics(gpath)
+            check("game-set wrote mode+preset (re-read from disk)",
+                  (g2["DLSSMode"], g2["DLSSPreset"]) == ("Balanced", "M"), repr(g2))
+            check("game-set left DLSSEnabled alone", g2["DLSSEnabled"] is True)
+            baks = [x for x in os.listdir(root) if x.startswith("Graphics.ini.bak-")]
+            check("game-set left exactly one timestamped backup", len(baks) == 1, repr(baks))
+            check("the backup holds the ORIGINAL bytes",
+                  open(os.path.join(root, baks[0]), encoding="utf-8").read() == fixture)
+            check("unrelated keys survived the rewrite",
+                  json.load(open(gpath, encoding="utf-8"))["Sharpen"] == 0.6)
+            # falsifier 3: an unknown preset name must be refused, file untouched
+            refused = False
+            try:
+                gset(gpath, preset="Z")
+            except SystemExit:
+                refused = True
+            check("game-set REFUSES an unknown preset name", refused and read_graphics(gpath)["DLSSPreset"] == "M")
+            # falsifier 4: a non-JSON target must be refused before any write
+            refused = False
+            try:
+                gset(bad, preset="K")
+            except SystemExit:
+                refused = True
+            check("game-set REFUSES a non-JSON Graphics.ini",
+                  refused and open(bad, encoding="utf-8").read() == "[Graphics]\nDLSSPreset=K\n")
+            # falsifier 5: an ambiguous duplicate key must be refused
+            dup = os.path.join(root, "Graphics-dup.ini")
+            with open(dup, "w", encoding="utf-8", newline="") as f:
+                f.write('{"DLSSPreset": "K", "Nested": {"DLSSPreset": "F"}, "DLSSMode": "Quality", "DLSSEnabled": true}')
+            refused = False
+            try:
+                gset(dup, preset="L")
+            except SystemExit:
+                refused = True
+            check("game-set REFUSES a duplicated key rather than editing the wrong one",
+                  refused and read_graphics(dup)["DLSSPreset"] == "K")
+        finally:
+            globals()["game_pids"] = real_pids
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -1123,7 +1378,12 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--root", default=LIVE_DEFAULT, help="install root (default %s)" % LIVE_DEFAULT)
     sub = ap.add_subparsers(dest="cmd", required=True)
+    ap.add_argument("--graphics", help="game-side Graphics.ini (default %s)" % GRAPHICS_INI)
     sub.add_parser("status")
+    gs = sub.add_parser("game-set", help="rewrite DLSS keys in the game's Graphics.ini (only while the game is stopped)")
+    gs.add_argument("--mode", help='e.g. Quality (written verbatim as a JSON string)')
+    gs.add_argument("--preset", help="one of %s" % ", ".join(GAME_PRESETS))
+    gs.add_argument("--enabled", choices=["true", "false"])
     f = sub.add_parser("fetch")
     f.add_argument("--version", help="catalog version (default %s)" % DEFAULT_VERSION)
     f.add_argument("--all", action="store_true", help="every SR version in the catalog")
@@ -1142,7 +1402,7 @@ def main(argv=None):
     sub.add_parser("selftest")
     a = ap.parse_args(argv)
     {"status": cmd_status, "fetch": cmd_fetch, "install": cmd_install, "rollback": cmd_rollback,
-     "preset": cmd_preset, "selftest": cmd_selftest}[a.cmd](a)
+     "preset": cmd_preset, "selftest": cmd_selftest, "game-set": cmd_game_set}[a.cmd](a)
 
 
 if __name__ == "__main__":
