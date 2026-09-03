@@ -290,6 +290,25 @@ var gGatedHandleRefusals* = 0
   ## filter is working" and "the trap never fired" answer identically from
   ## outside, and only this counter tells them apart.
 
+var gGatedHandleLastValue* = 0'u64
+  ## The VALUE of the most recent refusal, and `gGatedHandleLastWhy` says which
+  ## filter rejected it.
+  ##
+  ## These exist because the first version of this filter had only the counter
+  ## above, and nobody prints a counter. MEASURED 2026-09-02 19:46: it refused
+  ## every per-frame drain candidate, the main-thread drain never bound, queued
+  ## work was held for 28 minutes, and the only thing the log said was "no
+  ## per-frame candidate UnityEngine.UI.CanvasUpdateRegistry in this build" --
+  ## which is a sentence about the BUILD and was not true. A refusal that does
+  ## not say what it refused is the silent decline this repo treats as the
+  ## worst outcome available; it cost a whole boot to work out by hand.
+  ##
+  ## Cheap by construction: two stores on a path that is already returning nil,
+  ## and nothing at all on the accepting path.
+
+var gGatedHandleLastWhy* = ""
+  ## "non-canonical/misaligned" or "not readable". See above.
+
 proc gatedHandle(p: Il2CppPtr): Il2CppPtr =
   ## The HANDLE half of the defence `readCString` (below) already applies to
   ## strings, and the half that was missing.
@@ -345,10 +364,14 @@ proc gatedHandle(p: Il2CppPtr): Il2CppPtr =
   # 200,000 uniform random 64-bit values, of which it accepted 0.
   if handleShapeOk(cast[uint64](p)) == 0'i32:
     gGatedHandleRefusals = gGatedHandleRefusals + 1
+    gGatedHandleLastValue = cast[uint64](p)
+    gGatedHandleLastWhy = "non-canonical or misaligned"
     return
   # Filter 3 needs the OS, which is why it is here and not in that header.
   if isReadable(p, 0x10'i32) == 0'i32:
     gGatedHandleRefusals = gGatedHandleRefusals + 1
+    gGatedHandleLastValue = cast[uint64](p)
+    gGatedHandleLastWhy = "canonical and aligned, but not readable memory"
     return
   result = p
 

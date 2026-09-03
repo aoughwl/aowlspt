@@ -6156,6 +6156,62 @@ proc scanMethodPointer(m: Il2CppMethod; foundOff: var int): Il2CppPtr =
       foundOff = int(off)
       return p
 
+proc gatedRefusalNote(): string =
+  ## What the LAST `gatedHandle` refusal was, appended to the log lines that
+  ## would otherwise say only "not in this build".
+  ##
+  ## MEASURED 2026-09-02 19:46, build 07ba6863: `findClass` began (correctly)
+  ## refusing the MT19937-64 value that `il2cpp_class_from_name` returns when
+  ## called without its nonce token, and the only thing the log said was
+  ## "no per-frame candidate UnityEngine.UI.CanvasUpdateRegistry in this
+  ## build". That sentence is about the BUILD and it was FALSE -- the type is
+  ## there; the export was trapped. The drain never bound, queued work was held
+  ## for 28 minutes, and it took a disassembly session to find out why. A
+  ## refusal that does not name what it refused is the silent decline this repo
+  ## treats as the worst outcome available.
+  if gGatedHandleRefusals == 0:
+    return " (no gated-handle refusal has happened this session, so the " &
+           "runtime genuinely answered nothing for this name)"
+  result = " -- NOTE: this is not necessarily absent from the build. The last " &
+           "gated-handle refusal was 0x" & hexOf(gGatedHandleLastValue) &
+           " (" & gGatedHandleLastWhy & "), " & $gGatedHandleRefusals &
+           " refusal(s) so far. `il2cpp_class_from_name` and " &
+           "`il2cpp_class_get_method_from_name` are NONCE-GATED and this call " &
+           "site passes NO token, so what comes back here is the trap's " &
+           "MT19937-64 output. The name-only routes below do not need the " &
+           "handle and are tried anyway."
+
+proc resolveDrainByName(spec: string; verbose: bool): Il2CppPtr =
+  ## The half of `resolveDrainPointer` that needs only the NAME -- no
+  ## `MethodInfo`, no `Il2CppClass`, nothing out of a gated export.
+  ##
+  ## Split out because of a MEASURED regression on 2026-09-02. Until then the
+  ## drain bound on this client through a sequence nobody had noticed was
+  ## load-bearing: `findClass` returned the trap's random non-zero value,
+  ## `findMethod` returned another one, both passed their `!= nil` checks, and
+  ## `resolveDrainPointer` then reported "MethodInfo ... is not readable" and
+  ## fell through to `nameIndexResolve`, which takes only `spec` and had never
+  ## looked at either handle. A GARBAGE POINTER WAS THE TICKET PAST TWO NIL
+  ## CHECKS INTO A ROUTE THAT NEVER DEREFERENCED IT.
+  ##
+  ## The moment the garbage was correctly refused, `if cls == nil: continue`
+  ## skipped the candidate and this route became unreachable. The fix is here
+  ## and not in the filter: accepting a random 64-bit value again is the
+  ## 10-second `il2cpp_value_box` crash of `Crash_2026-09-02_224920325`.
+  result = cast[Il2CppPtr](0)
+  if not gNameIndex:
+    if verbose:
+      info "no MethodInfo for " & spec & " and nameIndex is not set, so there " &
+           "is no name-only route to try"
+    return
+  # The drain is a DETOUR, so it asks as a patch: a shared RVA here would drain
+  # every method folded onto it. No override -- same rule as the caller below.
+  var whyShared = ""
+  let viaName = nameIndexResolve(spec, -1'i32, true, false, whyShared)
+  if viaName == nil:
+    return
+  result = viaName
+
 proc resolveDrainPointer(m: Il2CppMethod; spec: string;
                          verbose: bool): Il2CppPtr =
   ## The full per-candidate resolution used by both binders: the ordinary
@@ -6187,11 +6243,9 @@ proc resolveDrainPointer(m: Il2CppMethod; spec: string;
   # this exact GameAssembly.dll -- and the scan below is a guess at "some field
   # that looks like code".
   if gNameIndex:
-    # The drain is a DETOUR, so it asks as a patch: a shared RVA here would
-    # drain every method folded onto it. No override: a diagnostic drain is
-    # never worth an unbounded write.
-    var whyShared = ""
-    let viaName = nameIndexResolve(spec, -1'i32, true, false, whyShared)
+    # One implementation, in `resolveDrainByName` above, so the route reached
+    # WITH a MethodInfo and the route reached WITHOUT one cannot drift apart.
+    let viaName = resolveDrainByName(spec, verbose)
     if viaName != nil:
       warn "name index: binding the drain for " & spec & " at il2cpp+0x" &
            hexOf(uint64(cIl2cppRvaOf(viaName))) & ", from the offline index " &
@@ -6494,17 +6548,39 @@ proc bindMainDrain(verbose: bool): bool =
     let typePart = spec.substr(0, sep - 1)
     let member = spec.substr(sep + 2)
 
+    # A NIL CLASS OR METHOD IS NO LONGER THE END OF THIS CANDIDATE.
+    #
+    # Both of these come out of NONCE-GATED exports called with no token, so on
+    # this client they answer with the trap's random value and `gatedHandle`
+    # refuses them. That refusal is correct -- see `resolveDrainByName` -- but
+    # `nameIndexResolve` needs only `spec`, and it is how this drain has
+    # actually been binding all along. So a refused handle now costs the
+    # runtime route and nothing else.
     let cls = findClass(gRt, typePart)
+    var m: Il2CppMethod = cast[Il2CppMethod](0)
     if cls == nil:
-      if verbose: info "no per-frame candidate " & typePart & " in this build"
-      continue
-    # -1: a per-frame update takes no arguments, but naming an arity here would
-    # miss an overload set and there is nothing to gain from being strict.
-    let m = findMethod(gRt, cls, member, -1)
-    if m == nil:
-      if verbose: info typePart & " has no " & member
-      continue
-    let fn = resolveDrainPointer(m, spec, verbose)
+      if verbose:
+        info "no per-frame candidate " & typePart & " from the runtime" &
+             gatedRefusalNote()
+    else:
+      # -1: a per-frame update takes no arguments, but naming an arity here
+      # would miss an overload set and there is nothing to gain from strictness.
+      m = findMethod(gRt, cls, member, -1)
+      if m == nil and verbose:
+        info typePart & " has no " & member & " from the runtime" &
+             gatedRefusalNote()
+
+    var fn: Il2CppPtr = cast[Il2CppPtr](0)
+    if m != nil:
+      fn = resolveDrainPointer(m, spec, verbose)
+    else:
+      fn = resolveDrainByName(spec, verbose)
+      if fn != nil:
+        warn "name index: binding the drain for " & spec & " at il2cpp+0x" &
+             hexOf(uint64(cIl2cppRvaOf(fn))) & " with NO MethodInfo at all -- " &
+             "the runtime refused to name the type or the method (see the note " &
+             "above). The address came from metadata and the by-RVA binder " &
+             "byte-verified its prologue."
     if fn == nil:
       continue
 
@@ -6573,15 +6649,30 @@ proc bindRenderDrain(verbose: bool): bool =
       continue
     let typePart = spec.substr(0, sep - 1)
     let member = spec.substr(sep + 2)
+    # Same shape as `bindMainDrain` above, and for the same measured reason:
+    # a handle refused by `gatedHandle` must not cost the name-only route.
     let cls = findClass(gRt, typePart)
+    var m: Il2CppMethod = cast[Il2CppMethod](0)
     if cls == nil:
-      if verbose: info "no render candidate " & typePart & " in this build"
-      continue
-    let m = findMethod(gRt, cls, member, -1)
-    if m == nil:
-      if verbose: info typePart & " has no " & member
-      continue
-    let fn = resolveDrainPointer(m, spec, verbose)
+      if verbose:
+        info "no render candidate " & typePart & " from the runtime" &
+             gatedRefusalNote()
+    else:
+      m = findMethod(gRt, cls, member, -1)
+      if m == nil and verbose:
+        info typePart & " has no " & member & " from the runtime" &
+             gatedRefusalNote()
+
+    var fn: Il2CppPtr = cast[Il2CppPtr](0)
+    if m != nil:
+      fn = resolveDrainPointer(m, spec, verbose)
+    else:
+      fn = resolveDrainByName(spec, verbose)
+      if fn != nil:
+        warn "name index: binding the RENDER drain for " & spec &
+             " at il2cpp+0x" & hexOf(uint64(cIl2cppRvaOf(fn))) &
+             " with NO MethodInfo at all -- the runtime refused to name the " &
+             "type or the method (see the note above)."
     if fn == nil:
       continue
     if attachDrain(spec, fn, m, true, verbose, 1'i32):
@@ -9900,7 +9991,8 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
              "on which a queued invoke_main callback is safe; the host HOLDS " &
              "them rather than running them on its own thread (" &
              $int(gHostThreadId) & "). A mod that gates on " &
-             "aowlspt.host::main_thread.bound simply will not tick"
+             "aowlspt.host::main_thread.bound simply will not tick" &
+             gatedRefusalNote()
       # The render-phase drain, tried once here and retried in the tick loop.
       # Its primary target rides a render callback that may only be alive in a
       # raid, so a boot failure is expected in the menu and is not warned about;

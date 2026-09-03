@@ -8993,3 +8993,74 @@ the caller's exact frame) was considered and **refused**, on two grounds:
    restores the saved return address, and that case cannot be proven by an
    offline test that only checks RAX and the stack arguments — which is
    precisely the shape of a check that cannot fail.
+
+## 2026-09-02 19:46: a GARBAGE POINTER was load-bearing. The drain bound because two nil checks passed on trap output.
+
+Build `07ba6863` (the `gatedHandle` fix above) booted, did **not** crash, and
+then did something worse: the main-thread drain never bound, `invoke_main` work
+was HELD, the mode-screen `Submit` never ran, and the client sat on the
+character screen for 28 minutes. The only thing the log said was
+
+    no per-frame candidate UnityEngine.UI.CanvasUpdateRegistry in this build
+
+which is a sentence about the BUILD, and it was **false**.
+
+### What was actually happening, and had been all along
+
+`bindMainDrain` did, per candidate:
+
+    let cls = findClass(gRt, typePart)          # il2cpp_class_from_name
+    if cls == nil: continue
+    let m = findMethod(gRt, cls, member, -1)    # il2cpp_class_get_method_from_name
+    if m == nil: continue
+    let fn = resolveDrainPointer(m, spec, verbose)
+
+Both of those exports are **NONCE-GATED** and `il2cpp.nim` calls them through
+`rt.fns[...]` — the raw `GetProcAddress` pointer, **with no token**. So both
+returned MT19937-64 trap output. Both `!= nil` checks passed on it.
+`resolveDrainPointer` then found the MethodInfo unreadable (the good boot log
+says exactly that: `deep-probe: MethodInfo for EFT.TarkovApplication::Update is
+not readable`) and fell through to `nameIndexResolve(spec, …)` — which takes
+**only the spec string** and had never looked at either handle.
+
+**A random 64-bit number was the ticket past two nil checks into a route that
+never dereferenced it.** The instant `gatedHandle` correctly refused it,
+`if cls == nil: continue` skipped the candidate and the name-index route became
+unreachable. Nothing about the name index changed; it simply stopped being
+reached.
+
+### The filter was NOT the bug — measured, not argued
+
+Every real pointer shape from today's logs passes `aowl_handle_shape_ok`:
+
+| value | canonical | 8-aligned | accepted |
+|---|---|---|---|
+| `0x230e2951810` (live klass) | yes | yes | **yes** |
+| `0x1ebcd25c100` (live receiver) | yes | yes | **yes** |
+| `0x1ed62c8c1f0` (RDX at the crash) | yes | yes | **yes** |
+| `0x7ffb180d9a78` (code pointer) | yes | yes | **yes** |
+| `0x6e11f7fc349b3101` (trap) | **no** | **no** | no |
+
+The first two are now case 0 positive controls in
+`tools/test_handleshape.py`. Loosening the filter to accept the trap value
+would restore the 10-second `il2cpp_value_box` crash; it was never the fix.
+
+### What changed
+
+* `resolveDrainByName(spec, verbose)` — the name-only half of
+  `resolveDrainPointer`, extracted so there is ONE implementation. Both
+  `bindMainDrain` and `bindRenderDrain` now try it when `cls` or `m` is nil,
+  and `attachDrain` already documents and handles `meth == nil`.
+* `gatedHandle` records `gGatedHandleLastValue` / `gGatedHandleLastWhy`, and
+  `gatedRefusalNote()` appends them to every "not in this build" line **and**
+  to the un-gated "no per-frame method could be detoured" warning. The first
+  version had only a counter, and nobody prints a counter.
+
+### The general lesson, which is the expensive one
+
+**A nil check that a garbage value passes is not a gate, it is a turnstile.**
+Hardening it is correct AND is a behaviour change, because anything downstream
+that never dereferenced the value was being kept alive by the garbage. Before
+tightening a validity check, ask what the invalid value was reaching — the
+answer here was "the only route that actually worked".
+

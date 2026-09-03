@@ -66,17 +66,26 @@ int main(void) {
             0x000001ed62c8c1f0ull,   /* MEASURED: RDX at the fault            */
             0x0000000180001000ull,   /* a module .text address                */
             0x00007ffb180d9a78ull,   /* RIP at the fault, rounded to 8        */
-            0x0000000000001000ull    /* the lowest plausible mapped page      */
+            0x0000000000001000ull,   /* the lowest plausible mapped page      */
+            /* MEASURED 2026-09-02, real pointer shapes taken from today's host
+             * logs -- a live Il2CppClass* and a live managed receiver. They are
+             * here because a live regression was reported as "the shape filter
+             * rejected a real klass". It does not, and this is the control that
+             * SAYS so instead of an argument that says so. The real cause was
+             * control flow: see `resolveDrainByName` in
+             * host/Aowlspt.Host.Il2Cpp/aowlhost.nim. */
+            0x00000230e2951810ull,   /* klass                                 */
+            0x000001ebcd25c100ull    /* receiver                              */
         };
         int i;
-        for (i = 0; i < 4; i++) {
+        for (i = 0; i < 6; i++) {
             if (!aowl_handle_shape_ok(real[i])) {
                 printf("FAIL case0 positive control: rejected 0x%016llx\n",
                        (unsigned long long)real[i]);
                 fails++;
             }
         }
-        if (!fails) printf("PASS case0 positive control: 4 real handles accepted\n");
+        if (!fails) printf("PASS case0 positive control: 6 real handles accepted\n");
     }
     /* 1  THE MEASURED TRAP VALUE. */
     if (aowl_handle_shape_ok(0x6e11f7fc349b3101ull)) {
