@@ -349,6 +349,10 @@ proc pfxDestroyAll(): int =
   gPfxRowWant = @[]
   gPfxRowName = @[]
   gPfxRowCtrl = @[]
+  # The value binding's handles name the very rows just destroyed. Dropping
+  # them here is also the DISCARD half of the revert: anything staged and not
+  # saved is thrown away rather than written. See `sbdSweep`.
+  sbdSweep()
   gPfxGrayHave = false
   gPfxGrayApplied = false
   gPfxOwnTog = nil
@@ -1263,6 +1267,13 @@ proc pfxOnToggleSet(tog: Il2CppPtr; turnedOn: bool) =
   ##
   ## Two pointer compares for every toggle in the game, and nothing else in
   ## the steady state.
+  ##
+  ## THE VALUE BINDING DRAINS HERE FIRST, and above the gray-out's own gates on
+  ## purpose: `settingsRowsBind` and `settingsPostFxGrayOut` are independent
+  ## flags, and putting this after the `gPfxGrayOn` test would make every row's
+  ## value silently depend on a cosmetic feature being on. Its own gate is one
+  ## boolean compare when the binding is off.
+  sbdOnToggleSet(tog, turnedOn)
   if not gPfxGrayOn or not gPfxBuilt or gPfxOff: return
   if tog == nil: return
   if tog == gPfxStockTog:
@@ -1392,6 +1403,7 @@ proc pfxBuild(): bool =
   var built = 0
   var refused = 0
   var i = 0
+  var seededFromConfig = 0
   while i < rows.len and i < PfxMaxRows and gPfxRowGo.len < PfxMaxHandles:
     let r = rows[i]
     if r.kind == pkChoice:
@@ -1415,6 +1427,26 @@ proc pfxBuild(): bool =
       gPfxRowWant.add r.def
       gPfxRowName.add r.key
       built = built + 1
+      # THE VALUE BINDING (settingsbind.nim), flag `settingsRowsBind`, default
+      # OFF -- with it off both calls return false having done nothing and the
+      # row is exactly what it was before: a real control that changes nothing.
+      #
+      # The pointers handed over are the ones this loop ALREADY HOLDS, from
+      # `Instantiate` and from `SettingFloatSlider.Slider@0xa8`. Nothing is
+      # re-found by name or by sibling index later, which is what made a
+      # previous version of the subtab strip stop responding silently once the
+      # player cycled tabs.
+      #
+      # The return value is "was this seeded from the CONFIG": false means the
+      # row is showing the schema's DECLARED DEFAULT, and that is counted so
+      # the banner can say which of the two the numbers are instead of letting
+      # a default read as the player's setting.
+      if r.kind == pkToggle:
+        if sbdRegisterToggle(SbdPostFxGuid, r.key, ct, false):
+          seededFromConfig = seededFromConfig + 1
+      elif sl != nil:
+        if sbdRegisterSlider(SbdPostFxGuid, r.key, sl, r.lo, r.hi, r.def):
+          seededFromConfig = seededFromConfig + 1
     else:
       refused = refused + 1
     i = i + 1
@@ -1457,9 +1489,14 @@ proc pfxBuild(): bool =
         "40px slot at y=-60 was the empty band above the first row, so it " &
         "cost a visible defect and said nothing; the '* ' prefix marked " &
         "preset-owned rows in a way no stock row does. Both facts live here " &
-        "now: " & $built & " row(s) built, values are the mod's DECLARED " &
-        "DEFAULTS rather than the saved config, and the rows are NOT BOUND " &
-        "-- moving one changes nothing yet. Owned by the active Preset and " &
+        "now: " & $built & " row(s) built, " & $seededFromConfig &
+        " seeded FROM THE SAVED CONFIG and " & $(built - seededFromConfig) &
+        " showing the mod's DECLARED DEFAULT, binding " &
+        (if seededFromConfig > 0 or gSbdRows.len > 0:
+           "ON (settingsRowsBind): edits are staged and written on SAVE"
+         else:
+           "OFF (settingsRowsBind): moving a row changes nothing") &
+        ". Owned by the active Preset and " &
         "ignored until Preset=custom (" & $po & "): " &
         (if presetOwnedTxt.len > 0: presetOwnedTxt else: "-") &
         ". No row for: " & (if declinedTxt.len > 0: declinedTxt else: "-") &
@@ -1680,6 +1717,13 @@ proc pfxVerdict() =
 proc pfxOnPanelUp(postUp: bool) =
   ## Called every tick from `gfxTickBody`, inside its existing guard. The
   ## steady state is two boolean tests.
+  ##
+  ## THE VALUE BINDING'S TICK, above every gate here on purpose. It owns the
+  ## write queue (the shared POST slot is single, so exactly one write is
+  ## released per tick) and the two verdicts, and neither has anything to do
+  ## with whether the PostFX panel happens to be up. Its own gate is one
+  ## boolean compare when `settingsRowsBind` is off.
+  sbdTick()
   if not gPfxOn or gPfxOff:
     return
   if not postUp:

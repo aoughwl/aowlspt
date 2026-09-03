@@ -993,6 +993,28 @@ static const AowlNuTarget aowl_nu_targets[] = {
     { "EFT.UI.Settings.SettingsScreen::CloseAll", 0x17207A0u,
       { 0x40,0x53,0x48,0x83,0xEC,0x20,0x80,0x3D,0x70,0xDC,0x99,0x05,0x00,
         0x48,0x8B,0xD9 }, 16 },
+    /* --- THE VALUE BINDING (settingsbind.nim). Two rows, APPENDED: this table
+     * is indexed POSITIONALLY by the `NuT*` constants, so a row inserted in
+     * the middle silently re-points every constant after it. Appending is the
+     * only safe edit, and the positional self-check below covers the rest.
+     *
+     * `UnityEngine.UI.Slider::Set(float input, bool sendCallback)` -- the
+     * general slider-changed event. MEASURED 2026-09-03 with
+     * `il2cpp_resolve.py typemethods UnityEngine.UI.Slider` (arity 2),
+     * `shared 0x55b44a0` -> UNIQUE owners=1, and `bytes 0x55b44a0` for the
+     * prologue below. NOT `set_value` and NOT `SetValueWithoutNotify`: both
+     * are thin wrappers that funnel here, and `Set` is where sendCallback --
+     * the flag that separates a player's drag from a programmatic restore --
+     * actually exists as an argument.
+     *
+     * `SettingsScreenController::SaveSettings()` -- the persist edge.
+     * `shared 0x1721e20` -> UNIQUE owners=1; arity 0, so 2 register slots. */
+    { "UnityEngine.UI.Slider::Set", 0x55B44A0u,
+      { 0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x30,0x80,0x3D,0x86,
+        0x3C,0xB2,0x01 }, 16 },
+    { "EFT.UI.Settings.SettingsScreenController::SaveSettings", 0x1721E20u,
+      { 0x40,0x53,0x48,0x83,0xEC,0x70,0x80,0x3D,0xFE,0xC5,0x99,0x05,0x00,
+        0x48,0x8B,0xD9 }, 16 },
 };
 
 #define AOWL_NU_TARGET_COUNT \

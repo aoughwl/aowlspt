@@ -1687,6 +1687,14 @@ var gBotCapDone = false
 ## below). `Set` and not `set_isOn`, because that one is an eleven-byte
 ## tail-jump thunk -- see the block comment in `abi/aowlspt_nativeui.h`.
 var gNtToggleSlot = -1
+## THE VALUE BINDING's two slots and its two firing procs. Declared here, above
+## `patchFired`, for the same reason every other feature's are: `include` is
+## textual, `patchFired` sits above the include point, and a rider whose proc is
+## not visible there cannot be dispatched. Implemented in `settingsbind.nim`.
+var gSbdSlotSlider = -1
+var gSbdSlotSave = -1
+proc sbdSliderSetFired(regs: Il2CppPtr)
+proc sbdSaveFired()
 var gNtFlagOn = false
 ## Declared HERE, not in `nativetabs.nim`: `modstab.nim`'s rider gate tests
 ## `gNtOn`, and modstab is included first. Procs forward-resolve across an
@@ -1701,7 +1709,7 @@ var gNtOff = false               ## self-disabled after the fault ceiling
 ## 2026-09-02's deaths had and which nothing could see.
 var gNtCloseSlot = -1
 var gNtCloseAllSlot = -1
-const KindMaxFeature = 31
+const KindMaxFeature = 33
   ## The highest `kind` that `attachDrain` treats as a FEATURE detour rather than
   ## as the main-thread update drain. Bump this when a new kind is added, and
   ## nothing else in `attachDrain` needs touching: the two places that used to
@@ -4439,6 +4447,17 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
   # O(<=4) pointer compares, silent for every foreign toggle -- and every
   # toggle in the game funnels through here, so that matters. Must never
   # suppress the original: the game's own toggle logic has to run.
+  # THE VALUE-BINDING DRAINS (settingsbind.nim). Both read-only, both by slot
+  # IDENTITY rather than by scanning, both returning 0 so the original always
+  # runs. `Slider::Set` fires for EVERY slider in the game, so this branch must
+  # stay a compare and a return: `sbdSliderSetFired` is one flag test and at
+  # most SbdMaxRows pointer compares with no dereference.
+  if i == gSbdSlotSlider:
+    sbdSliderSetFired(regs)
+    return 0'i32
+  if i == gSbdSlotSave:
+    sbdSaveFired()
+    return 0'i32
   if i == gNtToggleSlot:
     ntToggleSetFired(regs)
     return 0'i32
@@ -5980,6 +5999,8 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
               elif kind == 25: "errdlg-critical"
               elif kind == 27: "loadperf"
               elif kind == 28: "native-tabs"
+              elif kind == 32: "settings-bind-slider"
+              elif kind == 33: "settings-bind-save"
               else: "main-thread")
   # THE POSTFIX SLOT GATE. Before the lock, before the slot claim, before any
   # byte of the target is touched: a postfix whose target uses more register
@@ -6119,6 +6140,10 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
     lpNoteSlot(claimed)
   elif kind == 28:
     gNtToggleSlot = int(claimed)
+  elif kind == 32:
+    gSbdSlotSlider = int(claimed)
+  elif kind == 33:
+    gSbdSlotSave = int(claimed)
   elif kind == 30:
     gNtCloseSlot = int(claimed)
   elif kind == 31:
@@ -8549,6 +8574,7 @@ include "modsindex.nim"
 ## STEP 1 of docs/NATIVETABS.md. After `modstab.nim` for `modsClone` /
 ## `modsComponent` / `modsSetParent` / `modsGoActive`, and after `nativeui.nim`
 ## for the byte-verified call wrappers.
+include "settingsbind.nim"
 include "nativetabs.nim"
 
 ## THE NATIVE COLOUR WIDGET. Fulfils `settingspages.nim`'s three forward
@@ -10119,6 +10145,13 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
       # the prologue snapshot is primed and GameAssembly.dll is loaded, so a
       # verify means something. Bound after `bindNativeUi` so the target table
       # has already been censused and any refusal is attributable.
+      # THE VALUE BINDING's two detours, in the same region and for the same
+      # reason: the prologue snapshot is primed and GameAssembly.dll is loaded,
+      # so a verify means something. Two detours on two DIFFERENT functions
+      # (Slider::Set and SaveSettings); neither is patched by anything else in
+      # this host, and the toggle half rides nativetabs' existing Toggle::Set
+      # prefix rather than adding a second one to it.
+      sbdBind(false)
       if gNtOn:
         if not ntBindToggleEvent(false):
           gNtOn = false

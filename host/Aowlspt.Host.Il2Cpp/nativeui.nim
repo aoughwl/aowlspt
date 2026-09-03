@@ -269,6 +269,11 @@ const
   ## is a throw or fault unwound through the close.
   NuTScreenClose     = 71'i32  ## EFT.UI.Settings.SettingsScreen::Close
   NuTScreenCloseAll  = 72'i32  ## EFT.UI.Settings.SettingsScreen::CloseAll
+  ## THE VALUE BINDING (settingsbind.nim). Both APPENDED, both MEASURED
+  ## sharedness=UNIQUE, provenance and prologue bytes on the rows in
+  ## `abi/aowlspt_nativeui.h`.
+  NuTSliderSet       = 73'i32  ## UnityEngine.UI.Slider::Set
+  NuTSaveSettings    = 74'i32  ## EFT.UI.Settings.SettingsScreenController::SaveSettings
 
 ## Field offsets for the tab machinery. MEASURED (tools/fldoff.py, String
 ## self-check passing) and written up in docs/NATIVETABS.md. All NULL-CAPABLE.
@@ -848,35 +853,6 @@ proc nuGetSize(rt: Il2CppPtr): (bool, float32, float32) =
 proc nuGetPos(rt: Il2CppPtr): (bool, float32, float32) =
   nuGetV2(rt, NuTRtGetAnchoredPos)
 
-proc nuLayout(rt: Il2CppPtr;
-              anchorMinX, anchorMinY, anchorMaxX, anchorMaxY: float32;
-              pivotX, pivotY: float32;
-              width, height: float32;
-              posX, posY: float32): bool =
-  ## The whole geometry of an element, in one call, in the order Unity itself
-  ## uses: anchors, then pivot, then size, then position. Position is applied
-  ## LAST because `anchoredPosition` is interpreted relative to the anchors and
-  ## the pivot -- setting it first and then moving the anchors silently moves
-  ## the element.
-  ##
-  ## This is not optional. An element created without it has
-  ## `sizeDelta == (0,0)` and renders nothing while every call succeeds, which
-  ## is exactly what the invoke2 ladder produced.
-  if not gNuOn: return false
-  if not nuOk(rt, 0x10'i32):
-    warn "nativeui: layout: the RectTransform is null or unreadable; refusing"
-    return false
-  if cNuRectRenderable(width, height) == 0'i32:
-    warn "nativeui: layout: refusing a size of " & nuF(width) & "x" &
-         nuF(height) & " -- it is zero-area, non-finite or absurd, and would " &
-         "render nothing while every call reported success"
-    return false
-  result = nuSetV2(rt, NuTRtSetAnchorMin, anchorMinX, anchorMinY) and
-           nuSetV2(rt, NuTRtSetAnchorMax, anchorMaxX, anchorMaxY) and
-           nuSetV2(rt, NuTRtSetPivot, pivotX, pivotY) and
-           nuSetV2(rt, NuTRtSetSizeDelta, width, height) and
-           nuSetV2(rt, NuTRtSetAnchoredPos, posX, posY)
-
 type
   NuGeom* = object
     ## One RectTransform's layout, read off a LIVE object. `ok` is false when
@@ -900,6 +876,123 @@ type
     ## edge in a parent's coordinates; discarding it was why the first attempt
     ## at that arithmetic could only work for top-anchored parents.
     rectX*, rectY*: float32
+
+## Forward-declared: `nuLayout` now READS BACK what it wrote, and the
+## readers are defined further down. A layout call that cannot check
+## itself is the check-that-cannot-fail this file keeps paying for.
+proc nuReadGeom*(rt: Il2CppPtr): NuGeom
+proc nuGeomNote*(g: NuGeom): string
+
+proc nuLayout(rt: Il2CppPtr;
+              anchorMinX, anchorMinY, anchorMaxX, anchorMaxY: float32;
+              pivotX, pivotY: float32;
+              width, height: float32;
+              posX, posY: float32): bool =
+  ## The whole geometry of an element, in one call, in the order Unity itself
+  ## uses: anchors, then pivot, then size, then position. Position is applied
+  ## LAST because `anchoredPosition` is interpreted relative to the anchors and
+  ## the pivot -- setting it first and then moving the anchors silently moves
+  ## the element.
+  ##
+  ## This is not optional. An element created without it has
+  ## `sizeDelta == (0,0)` and renders nothing while every call succeeds, which
+  ## is exactly what the invoke2 ladder produced.
+  ##
+  ## `width`/`height` ARE `sizeDelta`, AND THAT IS NOT ALWAYS A SIZE. This is
+  ## the defect that cost a whole deploy, MEASURED live 2026-09-03 18:0x: the
+  ## PostFX scroll graft called
+  ## `nuLayout(viewport, 0,0, 1,1, 0.5,0.5, 0.0,0.0, 0,0)` -- a full-stretch
+  ## viewport, for which `sizeDelta (0,0)` is not merely legal but REQUIRED
+  ## (it is the inset from the parent's edges, so 0 means "exactly fill").
+  ## The blanket `aowl_nu_rect_renderable` check rejected it as "zero-area",
+  ## `nuLayout` returned false, the graft destroyed its clone and refused with
+  ## a message about the viewport, and the true cause -- our own guard -- was
+  ## invisible. This file's own `NuGeom` comment had already written the rule
+  ## down: "for a stretched anchor sizeDelta is an INSET ... legitimately
+  ## reports sizeDelta.x = 0 while rect.width is the panel width."
+  ##
+  ## So the extent check is now PER AXIS and conditional on the anchors:
+  ## a FIXED axis (anchorMin == anchorMax) must have a real positive extent,
+  ## because there nothing else determines the size; a STRETCHED axis takes
+  ## any finite inset, including 0 and including a negative one.
+  if not gNuOn: return false
+  if not nuOk(rt, 0x10'i32):
+    warn "nativeui: layout: the RectTransform is null or unreadable; refusing"
+    return false
+  let stretchX = (anchorMaxX - anchorMinX) > 0.001'f32
+  let stretchY = (anchorMaxY - anchorMinY) > 0.001'f32
+  # An INSET is finite and not absurd; sign and zero are both legal for
+  # one. A FIXED axis must have a real positive extent.
+  let xOk = (if stretchX: (width > -1.0e6'f32) and (width < 1.0e6'f32)
+             else: cNuRectRenderable(width, 1.0'f32) != 0'i32)
+  let yOk = (if stretchY: (height > -1.0e6'f32) and (height < 1.0e6'f32)
+             else: cNuRectRenderable(1.0'f32, height) != 0'i32)
+  if not xOk or not yOk:
+    warn "nativeui: layout: refusing sizeDelta (" & nuF(width) & "," &
+         nuF(height) & ") -- the " & (if not xOk: "X" else: "Y") &
+         " axis is FIXED (anchorMin == anchorMax there) and its extent is " &
+         "zero, non-finite or absurd, so the element would render nothing " &
+         "while every call reported success. anchors (" & nuF(anchorMinX) &
+         "," & nuF(anchorMinY) & ")-(" & nuF(anchorMaxX) & "," &
+         nuF(anchorMaxY) & "): X is " &
+         (if stretchX: "STRETCHED" else: "FIXED") & ", Y is " &
+         (if stretchY: "STRETCHED" else: "FIXED") & ". On a STRETCHED axis " &
+         "sizeDelta is an INSET and 0 is legal; this refusal is only ever " &
+         "about a fixed one."
+    return false
+  # EACH SETTER SEPARATELY, AND NAME THE ONE THAT REFUSED. The `and` chain
+  # that used to be here short-circuited into a bare `false`, so a caller
+  # could only report "the layout failed" -- which is what made the live
+  # refusal above describe the wrong thing for a whole deploy.
+  var step = ""
+  if not nuSetV2(rt, NuTRtSetAnchorMin, anchorMinX, anchorMinY):
+    step = "set_anchorMin_Injected"
+  elif not nuSetV2(rt, NuTRtSetAnchorMax, anchorMaxX, anchorMaxY):
+    step = "set_anchorMax_Injected"
+  elif not nuSetV2(rt, NuTRtSetPivot, pivotX, pivotY):
+    step = "set_pivot_Injected"
+  elif not nuSetV2(rt, NuTRtSetSizeDelta, width, height):
+    step = "set_sizeDelta_Injected"
+  elif not nuSetV2(rt, NuTRtSetAnchoredPos, posX, posY):
+    step = "set_anchoredPosition_Injected"
+  if step.len > 0:
+    # `nuSetV2` refuses for exactly two reasons and both are worth printing:
+    # the target did not bind (an unverified prologue or a positional
+    # mismatch, so `nuFn` handed back nil) or the receiver stopped being
+    # readable between the checks.
+    warn "nativeui: layout: " & step & " REFUSED on " & iPtr(rt) & " ('" &
+         iObjName(rt) & "'). nuFn(" & step & ") is " &
+         (if nuFn(NuTRtSetAnchorMin) == nil: "part of a target table that did " &
+            "not bind" else: "bound") & " and the receiver reads back " &
+         (if nuOk(rt, 0x10'i32): "readable" else: "UNREADABLE") &
+         ". Nothing further was written, so the object keeps whatever " &
+         "geometry it already had -- it is not half-laid-out."
+    return false
+  # THE READBACK. A setter that returns and does not take is the driven-rect
+  # case -- a LayoutGroup, a ContentSizeFitter or a ScrollRect re-applying the
+  # rect after us -- and it is indistinguishable from success without this.
+  let g = nuReadGeom(rt)
+  if not g.ok:
+    warn "nativeui: layout: every setter was called on " & iPtr(rt) & " ('" &
+         iObjName(rt) & "') but the geometry could not be READ BACK, so " &
+         "whether any of it took is UNKNOWN. That is not a success."
+    return false
+  let dMin = (g.aMinX - anchorMinX) + (g.aMinY - anchorMinY)
+  let dMax = (g.aMaxX - anchorMaxX) + (g.aMaxY - anchorMaxY)
+  let dSd = (g.sdX - width) + (g.sdY - height)
+  if dMin > 0.01'f32 or dMin < -0.01'f32 or dMax > 0.01'f32 or
+     dMax < -0.01'f32 or dSd > 1.0'f32 or dSd < -1.0'f32:
+    warn "nativeui: layout: the writes were ACCEPTED but did not STICK on " &
+         iPtr(rt) & " ('" & iObjName(rt) & "'). Asked for anchors (" &
+         nuF(anchorMinX) & "," & nuF(anchorMinY) & ")-(" & nuF(anchorMaxX) &
+         "," & nuF(anchorMaxY) & ") sizeDelta (" & nuF(width) & "," &
+         nuF(height) & "); read back " & nuGeomNote(g) &
+         ". Something re-applies this rect after us -- a LayoutGroup, a " &
+         "ContentSizeFitter or the ScrollRect driving its own viewport -- so " &
+         "the fix is to disable that driver or to write through it, never to " &
+         "write again."
+    return false
+  result = true
 
 proc nuBehaviourEnable*(behaviour: Il2CppPtr; on: bool): bool =
   ## `Behaviour.enabled = value`. SHARED x32 -- CALLED, never detoured: it is
