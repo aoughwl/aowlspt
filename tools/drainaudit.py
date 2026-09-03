@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""drainaudit.py -- no host detour may POSTFIX a call with stack arguments.
+"""drainaudit.py -- what a host detour target may be: not a stack-argument
+POSTFIX (D1/D2), not a function already detoured (D5), not a SHARED RVA (D4).
 
 ## The crash this makes impossible
 
@@ -31,11 +32,13 @@ refuses the BUILD, so the bad shape never reaches a client at all.
 ## Three states, never two
 
   PASS          every postfix site declares a slot count, every declared count
-                agrees with the metadata, and none exceeds four.
-  FAIL   (1)    at least one does not. Named, with the number.
+                agrees with the metadata, none exceeds four, no RVA is a target
+                twice (D5), and every target's sharedness is UNIQUE (D4).
+  FAIL   (1)    at least one is not. Named, with the number.
   INCONCLUSIVE  the metadata inputs are absent, so the declared counts could
-         (3)    not be CHECKED -- only their internal consistency was. "I could
-                not look" is not a pass, and this never exits 0 on it.
+         (3)    not be CHECKED and sharedness was not checked AT ALL -- only
+                internal consistency and D5 were. "I could not look" is not a
+                pass, and this never exits 0 on it.
 
 ## What it reads
 
@@ -425,26 +428,31 @@ def audit_sites(root, tables_by_accessor):
 # the metadata ground truth
 
 def metadata_slots(gameasm, metadec):
-    """{rva: max_slots} over every method with generated code, or (None, why).
+    """({rva: max_slots}, resolver, why). The resolver is returned so the
+    D4 sharedness pass reads the SAME opened metadata rather than paying for a
+    second one -- and so a PASS can never come from a resolver that failed to
+    open while the slot pass silently used a cached table.
+
+    {rva: max_slots} spans every method with generated code.
 
     MAX, where an RVA is shared by folded bodies: being wrong in the safe
     direction is the only acceptable direction for a gate.
     """
     if not os.path.exists(gameasm):
-        return None, "GameAssembly.dll not found at %s" % gameasm
+        return None, None, "GameAssembly.dll not found at %s" % gameasm
     if not os.path.exists(metadec):
-        return None, ("decrypted metadata not found at %s (make it with "
-                      "tools/metablob.py)" % metadec)
+        return None, None, ("decrypted metadata not found at %s (make it with "
+                            "tools/metablob.py)" % metadec)
     sys.path.insert(0, HERE)
     try:
         import struct
         import il2cpp_resolve as R
     except Exception as e:                                  # pragma: no cover
-        return None, "tools/il2cpp_resolve.py unimportable: %s" % e
+        return None, None, "tools/il2cpp_resolve.py unimportable: %s" % e
     try:
         r = R.Resolver(gameasm, metadec)
     except Exception as e:                                  # pragma: no cover
-        return None, "the resolver would not open the inputs: %s" % e
+        return None, None, "the resolver would not open the inputs: %s" % e
     idx = {}
     for t in range(r.NTYPES):
         try:
@@ -466,7 +474,7 @@ def metadata_slots(gameasm, metadec):
             rva = va - r.IB
             if slots > idx.get(rva, 0):
                 idx[rva] = slots
-    return idx, None
+    return idx, r, None
 
 
 # ---------------------------------------------------------------------------
@@ -528,6 +536,82 @@ def nim_accessor_names(root, c_accessors):
     return out
 
 
+def duplicate_targets(rows, root):
+    """D5 -- no function is detoured twice.
+
+    Two detours on one function do not fail loudly: the SECOND overwrites the
+    first's trampoline, and the first feature simply stops firing, with no
+    error anywhere. Every row in every audited table is a detour target, so two
+    rows carrying the same RVA -- in one table or across two -- is that shape,
+    offline, before it is built.
+
+    Needs no metadata: it is a property of our own tables.
+    """
+    by = {}
+    for tbl, idx, name, rva, slots, path, line in rows:
+        by.setdefault(rva, []).append(
+            "%s:%d %s[%d] %s" % (os.path.relpath(path, root), line, tbl, idx,
+                                 name))
+    out = []
+    for rva, where in sorted(by.items()):
+        if len(where) > 1:
+            out.append(Finding(
+                "RVA 0x%X" % rva, "FAIL",
+                "is a detour target in %d places: %s. The second patch "
+                "overwrites the first's trampoline, so one of these features "
+                "silently stops firing and nothing reports it. Ride the "
+                "existing detour as a drain instead of adding a second one."
+                % (len(where), "; ".join(where))))
+    return out
+
+
+def sharedness_findings(rows, resolver, root):
+    """D4 -- every detour target is UNIQUE; `unknown` refuses.
+
+    28.3% of by-name lookups on this build land on a SHARED RVA. CALLING one is
+    fine -- it is correct code for the receiver passed. DETOURING one is a write
+    with unbounded blast radius: the hook fires for every method folded onto
+    that address (up to 6,438 for the universal empty-body stub 0x628110).
+
+    `unknown` -- the address is not in the methodPointers histogram at all -- is
+    a REFUSAL, not "probably fine". Never re-derive this from
+    shared_rva_counts() with a `.get(rva, 1)` default: that default made every
+    unknown address read back as "1 owner, safe to detour".
+    """
+    out = []
+    seen = set()
+    for tbl, idx, name, rva, slots, path, line in rows:
+        if rva in seen:
+            continue                      # duplicate_targets already says so
+        seen.add(rva)
+        where = "%s:%d %s[%d] %s @0x%X" % (os.path.relpath(path, root), line,
+                                           tbl, idx, name, rva)
+        try:
+            state, n = resolver.sharedness(rva)
+        except Exception as e:             # pragma: no cover
+            out.append(Finding(where, "FAIL",
+                               "sharedness could not be computed (%s: %s). An "
+                               "unchecked detour target is a refusal."
+                               % (type(e).__name__, e)))
+            continue
+        if state == "shared":
+            out.append(Finding(where, "FAIL",
+                               "is a SHARED RVA: %d methods resolve here, so a "
+                               "detour on it fires for all of them. Detouring "
+                               "a shared address is a write with unbounded "
+                               "blast radius. Find the unique body, or ride an "
+                               "existing detour." % n))
+        elif state != "unique":
+            out.append(Finding(where, "FAIL",
+                               "sharedness is UNKNOWN -- this RVA is not in "
+                               "the methodPointers histogram at all. That is "
+                               "NOT 'not shared': it is a static RVA from a "
+                               "different GameAssembly.dll, a live ASLR "
+                               "address, or not code. A target that cannot be "
+                               "checked is refused."))
+    return out
+
+
 def audit(root, gameasm, metadec, quiet=False):
     w = (lambda s: None) if quiet else sys.stdout.write
     rows, findings, c_accessors = collect_tables(root)
@@ -570,13 +654,20 @@ def audit(root, gameasm, metadec, quiet=False):
                 "always uses at least one (the trailing MethodInfo*). Fill "
                 "the column in." % slots))
 
-    meta, why = metadata_slots(gameasm, metadec)
+    # D5: a property of our own tables, so it is checked with or without the
+    # metadata and never reported as INCONCLUSIVE.
+    findings.extend(duplicate_targets(rows, root))
+
+    meta, resolver, why = metadata_slots(gameasm, metadec)
     checked = 0
+    shared_checked = 0
     if meta is None:
         w("INCONCLUSIVE input: %s\n" % why)
         w("  The %d table row(s) and %d postfix site(s) were checked for "
           "INTERNAL consistency only. Their declared slot counts were NOT "
-          "verified against the metadata.\n" % (len(rows), len(sites)))
+          "verified against the metadata, and their SHAREDNESS (D4) was not "
+          "checked at all -- a detour target that was not checked for "
+          "sharedness is not a checked target.\n" % (len(rows), len(sites)))
     else:
         for tbl, idx, name, rva, slots, path, line in rows:
             truth = meta.get(rva)
@@ -599,10 +690,15 @@ def audit(root, gameasm, metadec, quiet=False):
                     "The declared column is what the host binds on; a wrong "
                     "one in the LOW direction binds a postfix on a call with "
                     "stack arguments." % (slots, truth)))
+        sf = sharedness_findings(rows, resolver, root)
+        shared_checked = len({r[3] for r in rows})
+        findings.extend(sf)
 
     w("\ndrainaudit: %d table row(s) with a `slots` column, %d verified "
-      "against the metadata; %d literal POSTFIX site(s) within the "
-      "%d-slot limit.\n" % (len(rows), checked, len(sites), POSTFIX_MAX_SLOTS))
+      "against the metadata; %d distinct detour RVA(s) checked for sharedness "
+      "(D4) and duplication (D5); %d literal POSTFIX site(s) within the "
+      "%d-slot limit.\n" % (len(rows), checked, shared_checked, len(sites),
+                            POSTFIX_MAX_SLOTS))
     for where, spec, n in sorted(sites):
         w("    ok  postfix %d slot(s)  %s\n" % (n, where))
 
@@ -610,10 +706,14 @@ def audit(root, gameasm, metadec, quiet=False):
         w("\nFAIL -- %d finding(s):\n\n" % len(findings))
         for f in findings:
             w(f.human() + "\n\n")
-        w("A POSTFIX on a call using more than %d register slots makes the "
-          "ORIGINAL read its stack arguments out of the detour thunk's own "
-          "frame. Bind it PREFIX, or read the stack arguments at "
-          "[entry_rsp+0x28+8*(n-4)].\n" % POSTFIX_MAX_SLOTS)
+        w("D1/D2: a POSTFIX on a call using more than %d register slots makes "
+          "the ORIGINAL read its stack arguments out of the detour thunk's own "
+          "frame -- bind it PREFIX, or read the stack arguments at "
+          "[entry_rsp+0x28+8*(n-4)].\n"
+          "D5: a second detour on one function overwrites the first's "
+          "trampoline and the first feature silently stops firing.\n"
+          "D4: a detour on a SHARED RVA fires for every method folded onto "
+          "that address.\n" % POSTFIX_MAX_SLOTS)
         return FAIL
     if meta is None:
         return INCONCLUSIVE

@@ -255,6 +255,15 @@ finds. So:
   on warnings. If nimlint cannot be imported or cannot scan, the pre-flight
   says **NOT PERFORMED / INCONCLUSIVE** and builds anyway -- a missing linter
   must not block work, and must never read as a clean lint.
+* **The offline invariants.** In the same place and for the same reason, four
+  checks that the compiler cannot make: `drainaudit.py` (D1/D2 postfix slots,
+  D4 sharedness, D5 a function detoured twice) -> **exit 9**, `gateaudit.py`
+  (X1, a token-gated il2cpp export bound or called outside `aowl_gate_call`)
+  -> **exit 11**, `sehnest.py` (D8, a nested `aowl_p_p_seh`) -> **exit 12**,
+  `flagaudit.py` (D10, a feature flag defaulting ON with no allowlisted
+  reason) -> **exit 13**. Each refusal names the invariant and the first
+  file:line. Each has its own `--no-*-audit`. INCONCLUSIVE never refuses and
+  never reads as a pass: it prints NOT PERFORMED and builds anyway.
 * **Post-mortem.** The build's output is tee'd (every byte still reaches
   stdout) and, on failure, scanned. `getOrQuit: missing key`, or any compiler
   fatal whose only printed locations are inside the compiler's own sources,
@@ -2268,6 +2277,14 @@ DRAIN_EXIT = 9
     # caller (or a script, or the next session) that cannot tell them apart
     # will fix the wrong thing. 8 is already the internal-crash code.
 INTERNAL_CRASH_EXIT = 8
+GATE_EXIT = 11
+    # X1: a token-gated il2cpp export bound or called outside the armed path.
+SEH_EXIT = 12
+    # D8: a nested `aowl_p_p_seh`.
+FLAG_EXIT = 13
+    # D10: a feature flag that defaults ON without an allowlist entry.
+    # Each pre-flight gets its OWN code for the reason DRAIN_EXIT does: a
+    # caller that cannot tell them apart fixes the wrong thing.
 LOG_RING = 4000
 
 CRASH_LINE = ("COMPILER-INTERNAL CRASH (no file named): run "
@@ -2460,6 +2477,67 @@ def drain_preflight(repo, out=None):
     return 0
 
 
+FIRST_LOC = re.compile(r"((?:[\w./\\-]+\.(?:nim|h|c|json))(?::\d+)?)")
+
+
+def invariant_preflight(repo, module, invariant, exit_code, skip_flag,
+                        out=None, kwargs=None):
+    """One offline invariant, refused BEFORE the lock. 0 = go, exit_code = no.
+
+    Same place and same reasoning as the nimlint and drainaudit pre-flights:
+    a build that must not be deployed should not first spend forty minutes in
+    the queue and then hold the one serial resource in the checkout while it
+    fails. These three refuse shapes that kill the CLIENT (X1, D8) or ship an
+    unproven path to every user (D10) -- none of which the compiler can see.
+
+    INCONCLUSIVE never refuses. It says, in full, that the check was NOT
+    PERFORMED, because "I could not look" must never read as a pass and a gate
+    that refuses on a machine missing an input becomes the flag everyone
+    passes.
+    """
+    w = out.write if out is not None else (lambda s: sys.stdout.write(s))
+    import io as _io
+    try:
+        sys.path.insert(0, os.path.join(repo, "tools"))
+        mod = __import__(module)
+    except Exception as e:
+        w("%s PRE-FLIGHT NOT PERFORMED: tools/%s.py unimportable (%s). The "
+          "build is NOT being vouched for; it is only not being blocked.\n"
+          % (module, module, e))
+        return 0
+    buf = _io.StringIO()
+    try:
+        old, sys.stdout = sys.stdout, buf
+        try:
+            rc = mod.audit(repo, **(kwargs or {}))
+        finally:
+            sys.stdout = old
+    except Exception as e:
+        w("%s PRE-FLIGHT NOT PERFORMED: it raised %s: %s. Not a pass; "
+          "building anyway.\n" % (module, type(e).__name__, e))
+        return 0
+    text = buf.getvalue()
+    w(text)
+    if rc == mod.INCONCLUSIVE:
+        w("%s PRE-FLIGHT INCONCLUSIVE: %s was NOT checked. Not a pass; "
+          "building anyway.\n" % (module, invariant))
+        return 0
+    if rc != 0:
+        # The first file:line AFTER the FAIL header -- sehnest's finding line
+        # is a call CHAIN and carries its location in the sentence below it,
+        # so scanning only the "FAIL" line itself would print a refusal that
+        # names no file at all.
+        at = text.find("FAIL --")
+        m = FIRST_LOC.search(text[at:] if at >= 0 else text)
+        where = m.group(1) if m else ""
+        w("\nBUILD REFUSED BEFORE THE LOCK: %s -- %s. Nothing was built and no "
+          "lock was taken. Fix it, or `%s` if you are certain this is not it "
+          "(and then say so).\n" % (invariant, where or "see the finding(s) "
+                                    "above", skip_flag))
+        return exit_code
+    return 0
+
+
 def run_teed(cmd, cwd, env, ring=LOG_RING):
     """Run the build, pass its output straight through, and keep the tail.
 
@@ -2557,6 +2635,20 @@ def main():
                         "BEFORE taking the lock when a host detour would "
                         "POSTFIX a call whose arguments do not all fit in "
                         "registers." % (DRAIN_EXIT, LINT_EXIT))
+    p.add_argument("--no-gate-audit", action="store_true", dest="no_gate_audit",
+                   help="skip the tools/gateaudit.py pre-flight (X1). It "
+                        "refuses with exit %d when a TOKEN-GATED il2cpp "
+                        "export is bound or called outside aowl_gate_call."
+                        % GATE_EXIT)
+    p.add_argument("--no-seh-audit", action="store_true", dest="no_seh_audit",
+                   help="skip the tools/sehnest.py pre-flight (D8). It "
+                        "refuses with exit %d when a guarded body reaches a "
+                        "second aowl_p_p_seh." % SEH_EXIT)
+    p.add_argument("--no-flag-audit", action="store_true", dest="no_flag_audit",
+                   help="skip the tools/flagaudit.py pre-flight (D10). It "
+                        "refuses with exit %d when a host feature flag "
+                        "defaults ON without an allowlisted reason."
+                        % FLAG_EXIT)
     p.add_argument("--lint-strict", action="store_true", dest="lint_strict",
                    help="the pre-flight refuses on nimlint WARNINGS too "
                         "(three exist in this tree today, in code that "
@@ -2644,6 +2736,26 @@ def main():
         drc = drain_preflight(a.repo)
         if drc:
             return drc
+    # Three more offline invariants from docs/INTERACTION-LAYER-MAP.md 7.1,
+    # each with its OWN exit code so a script can tell them apart.
+    for enabled, module, invariant, code, flag, kw in (
+            (not a.no_gate_audit, "gateaudit",
+             "X1 (a token-gated il2cpp export bound or called outside "
+             "aowl_gate_call, which returns MT19937-64 output that passes a "
+             "nil check)", GATE_EXIT, "--no-gate-audit", None),
+            (not a.no_seh_audit, "sehnest",
+             "D8 (a nested aowl_p_p_seh -- the inner guard DISARMS the outer "
+             "one)", SEH_EXIT, "--no-seh-audit", None),
+            (not a.no_flag_audit, "flagaudit",
+             "D10 (a feature flag that defaults ON with no allowlist entry in "
+             "tools/deploy.json flagDefaultsOn)", FLAG_EXIT, "--no-flag-audit",
+             None)):
+        if not enabled:
+            continue
+        rc = invariant_preflight(a.repo, module, invariant, code, flag,
+                                 kwargs=kw)
+        if rc:
+            return rc
 
     cmd = [aowl_exe(a.repo)] + rest
     if not acquire(path, " ".join(rest), a.wait, a.max_age, a.steal,

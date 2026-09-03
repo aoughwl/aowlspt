@@ -161,6 +161,14 @@ ITEMS = [
     S("modharness.py", "fast"),                        # 0.6s
     S("offscreen.py", "fast"),                         # 1.7s
     S("shapeaudit.py", "fast"),                        # 0.1s
+    # The three offline invariant gates from docs/INTERACTION-LAYER-MAP.md 7.2.
+    # Each --selftest builds fixture trees and asserts PASS, FAIL and
+    # INCONCLUSIVE are all reachable, including the negative controls (a log
+    # message that merely NAMES a gated export; two unrelated guards that are
+    # not nested; an allowlist entry whose site is gone).
+    S("gateaudit.py", "fast"),                         # 0.6s  X1
+    S("sehnest.py", "fast"),                           # 0.2s  D8
+    S("flagaudit.py", "fast"),                         # 0.1s  D10
     S("nimlint.py", "fast"),                           # 0.1s
     S("acceptance.py", "fast", args=("selftest",)),    # 0.2s -- positional
     S("dlss.py", "fast", args=("selftest",)),          # fake install + manifest falsifiers
@@ -396,6 +404,25 @@ VERIFIERS = [
     V("inspectfixtures.py", reason="a fixture LIBRARY, not a verifier -- it "
       "carries the measured inspector prose the other self-tests replay. It "
       "is exercised by every fixture-driven item above."),
+    V("gateaudit.py", "gateaudit.py --selftest",
+      "case 2 puts a raw GetProcAddress bind and a raw call of two gated "
+      "exports in a fixture tree and asserts FAIL; case 1 asserts the measured "
+      "false positive -- a LOG MESSAGE naming a gated export followed by '(' "
+      "-- is not reported; case 4 asserts a NEW site still FAILs while the "
+      "baseline waives only the two keys it lists; case 5 asserts a missing "
+      "export table is INCONCLUSIVE, never PASS"),
+    V("sehnest.py", "sehnest.py --selftest",
+      "case 3 makes a guarded body reach a second aowl_p_p_seh three hops "
+      "down and asserts FAIL; case 2 (two UNRELATED guards) and case 7 (a "
+      "guard body plus the emitted C wrapper that guards it -- the measured "
+      "false positive that named five real files) assert it does NOT fire; "
+      "case 6 asserts a tree with no guard at all is INCONCLUSIVE, because a "
+      "graph with nothing to search cannot fail"),
+    V("flagaudit.py", "flagaudit.py --selftest",
+      "case 2 asserts a readBoolKeyDef defaulting true FAILs, case 4 that an "
+      "allowlist entry with no real reason FAILs, case 5 that a STALE entry "
+      "FAILs, case 6 that a non-literal default FAILs, and case 7 that a tree "
+      "with no call site is INCONCLUSIVE"),
     V("inspector.py", "inspector.py --selftest",
       "replays measured inspector prose including the silence case; "
       "test_inspect_silence.py additionally asserts the suite can DISTINGUISH "

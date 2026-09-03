@@ -1,0 +1,9 @@
+{
+ "//": "The D8 debt inventory read by tools/sehnest.py. MEASURED 2026-09-03:",
+ "//1": "the tree is CLEAN at depth 6, so this file has no entries and should",
+ "//2": "stay that way. An entry waives a NESTED aowl_p_p_seh chain -- which",
+ "//3": "DISARMS the outer guard, turning any unrelated fault in that body into a",
+ "//4": "hard client kill. Add one only with the measurement that says why the",
+ "//5": "nesting is safe; never to make a build go green.",
+ "//6": "Key = <guard body>><offending function>, as printed by the tool."
+}
