@@ -216,6 +216,12 @@ var gPfxGfxPanelT: Il2CppPtr = nil
 ## from 'applied, but the result is wrong'. Both printed the same INCONCLUSIVE
 ## before, which is the same class of defect as the checks 9b is about: one
 ## sentence covering two different causes with different fixes.
+## Frames between the graft and judging it. A LayoutGroup rebuild lands in
+## `willRenderCanvases`, and the ContentSizeFitter's height follows the
+## rebuild, so two frames is the minimum honest delay and three is cheap.
+const PfxScrollJudgeDelay = 3
+var gPfxScrollJudge = 0
+var gPfxScrollJudgeRoot: Il2CppPtr = nil
 var gPfxGraftTried = false
 var gPfxGraftOk = false
 var gPfxGraftWhy = ""
@@ -837,6 +843,82 @@ proc pfxScrollify(tab, rowParent: Il2CppPtr; newRootOut: var Il2CppPtr): bool =
   # raycast target and still a layout participant.
   let oldGo = iGameObjectOf(rowParent)
   if oldGo != nil: discard modsSetActive(oldGo, false)
+  # ---- MAKE THE LAYOUT ACTUALLY RUN ------------------------------------
+  #
+  # MEASURED live on 82cb47ee (host log 18:36, lines 1750-1751): the graft
+  # applied, and then "29 pair(s) of consecutive rows have intersecting y
+  # ranges ... content 850x1490". 1490 is the DONOR's height, computed for the
+  # 33 Graphics rows we had just retired. A stale height and 31 rows all at the
+  # same y are one symptom, not two: the LayoutGroup and ContentSizeFitter on
+  # the Content never re-ran after the reparent, so every moved row kept the
+  # absolute position it had inside the old fixed SettingsPanel box (which had
+  # no layout group at all, so those positions were authored, not driven).
+  #
+  # A LayoutGroup only positions children on a REBUILD, and a rebuild happens
+  # when something marks the rect dirty. `Transform::SetParent` marks the
+  # TRANSFORM hierarchy dirty; it does not queue a CanvasUpdate layout pass for
+  # a group that was already enabled and already thought itself clean.
+  #
+  # THE CHEAPEST HONEST TRIGGER IS THE ONE THE GAME ITSELF USES: deactivate and
+  # reactivate the Content. Every component's `OnEnable` runs again, and both
+  # `LayoutGroup::OnEnable` and `ContentSizeFitter::OnEnable` call `SetDirty`,
+  # which is `LayoutRebuilder::MarkLayoutForRebuild`. That needs NO new entry in
+  # the target table -- `LayoutRebuilder::MarkLayoutForRebuild` @0x559B970 and
+  # `ForceRebuildLayoutImmediate` @0x559AA70 are both UNIQUE and would be the
+  # direct route, but adding a row to `aowl_nu_targets` is an ABI-header change
+  # that drops every cache, and another agent is appending rows to that same
+  # table this session -- two appends racing is a positional-index collision,
+  # which is fact #187 and is worse than the problem it would solve.
+  var layoutNote = ""
+  let vlg = modsComponent(contentT, "VerticalLayoutGroup")
+  let csf = modsComponent(contentT, "ContentSizeFitter")
+  layoutNote = "VerticalLayoutGroup=" & (if vlg != nil: "present" else: "ABSENT") &
+               " ContentSizeFitter=" & (if csf != nil: "present" else: "ABSENT")
+  # ENABLE, unconditionally and deliberately. `UnityEngine.Behaviour.m_Enabled`
+  # is NATIVE-side -- `fldoff.py fields UnityEngine.Behaviour` lists no such
+  # il2cpp field -- so there is no field to read-then-write, and this is the
+  # one place in this file where a read-validate-write is not available. It is
+  # safe in the only way that matters: enabling an already-enabled Behaviour is
+  # a no-op in Unity, and enabling a disabled one is exactly the repair.
+  if vlg != nil: discard nuBehaviourEnable(vlg, true)
+  if csf != nil: discard nuBehaviourEnable(csf, true)
+  if vlg == nil or csf == nil:
+    warn "postfx rows: the cloned Content is missing " &
+         (if vlg == nil and csf == nil: "BOTH its VerticalLayoutGroup and its " &
+            "ContentSizeFitter"
+          elif vlg == nil: "its VerticalLayoutGroup"
+          else: "its ContentSizeFitter") &
+         ", so nothing will position the rows or drive the content height no " &
+         "matter how often a rebuild is requested. The rows are already in " &
+         "place; this names the reason the page will still look wrong."
+  # A ROW THAT OPTS OUT OF LAYOUT CANNOT BE POSITIONED BY THE GROUP. The rows
+  # came from a container with no layout group, so an authored
+  # `ignoreLayout = true` on any of them would have been invisible there and is
+  # fatal here. Cleared through the PROPERTY, which also calls
+  # `LayoutElement::SetDirty` -- a raw store to m_IgnoreLayout@0x20 would
+  # change the flag and leave the group holding its old arrangement.
+  var optedOut = 0
+  var kids2 = 0
+  if iChildCount(contentT, kids2):
+    var k = 0
+    while k < kids2 and k < 64:
+      let c = iChildAt(contentT, k)
+      if c != nil and duOk(c, 0x20'i32):
+        let le = modsComponent(c, "LayoutElement")
+        if le != nil and nuSetIgnoreLayout(le, false): optedOut = optedOut + 1
+      k = k + 1
+  # THE TRIGGER ITSELF, last, so every component it re-enables is already in
+  # the state we want it in.
+  let cGo = iGameObjectOf(contentT)
+  var bounced = false
+  if cGo != nil:
+    if modsSetActive(cGo, false) and modsSetActive(cGo, true): bounced = true
+  if not bounced:
+    warn "postfx rows: the cloned Content could not be deactivated and " &
+         "reactivated, so no layout rebuild was requested and the rows will " &
+         "keep the absolute positions they had in the old SettingsPanel -- " &
+         "all stacked at the same y. This is the exact defect measured on " &
+         "82cb47ee and it is being reported, not hidden."
   # (5) THE SCROLLBAR. Only touched if it is NOT already right-anchored, and
   # then only with numbers read off itself -- its own resolved width. A
   # scrollbar outside the panel is a visible defect and the verdict checks it
@@ -870,7 +952,14 @@ proc pfxScrollify(tab, rowParent: Il2CppPtr; newRootOut: var Il2CppPtr): bool =
         (if barT == nil: "NOT FOUND"
          elif barFixed: "re-anchored to the right edge from its own width"
          else: "left as authored (already right-anchored)") &
-        ". Every claim here is re-read by the verdict below."
+        ". Layout on the cloned Content: " & layoutNote & "; " &
+        $optedOut & " row(s) had a LayoutElement whose ignoreLayout was " &
+        "cleared; the Content was " &
+        (if bounced: "deactivated and reactivated to force OnEnable -> " &
+           "SetDirty -> MarkLayoutForRebuild"
+         else: "NOT bounced, so no rebuild was requested") &
+        ". Every claim here is re-read by the verdict, which now runs " &
+        "LATER -- see below."
   result = true
 
 proc pfxScrollVerdict(rowParent: Il2CppPtr) =
@@ -1497,7 +1586,10 @@ proc pfxBuild(): bool =
         "40px slot at y=-60 was the empty band above the first row, so it " &
         "cost a visible defect and said nothing; the '* ' prefix marked " &
         "preset-owned rows in a way no stock row does. Both facts live here " &
-        "now: " & $built & " row(s) built, " & $seededFromConfig &
+        "now: " & $built & " row(s) built, " & $gSbdRows.len &
+        " REGISTERED with the value binding (a count of 0 here with the flag " &
+        "on means every row on screen is bound to nothing, and no SAVE is " &
+        "needed to find that out), " & $seededFromConfig &
         " seeded FROM THE SAVED CONFIG and " & $(built - seededFromConfig) &
         " showing the mod's DECLARED DEFAULT, binding " &
         (if seededFromConfig > 0 or gSbdRows.len > 0:
@@ -1552,7 +1644,18 @@ proc pfxBuild(): bool =
   let judgeRoot = (if scrollRoot != nil: scrollRoot else: parent)
   let jg = nuReadGeom(judgeRoot)
   if jg.ok: gPfxParentW = jg.rectW
-  pfxScrollVerdict(judgeRoot)
+  # JUDGED LATER, NEVER NOW -- AND THE PREVIOUS BUILD GOT THIS WRONG.
+  # `pfxScrollVerdict` used to be called right here, on the same frame as
+  # the graft. A LayoutGroup rebuild is deferred to `willRenderCanvases`,
+  # so on that frame the content still reports the DONOR's height and
+  # every row still reports its pre-move position. The live FAIL on
+  # 82cb47ee -- '29 pair(s) of consecutive rows have intersecting y
+  # ranges ... content 850x1490' -- is partly a real defect and partly
+  # this: a reading taken before the thing it measures had happened. That
+  # makes it INCONCLUSIVE dressed as FAIL, which is the same family of
+  # error as a check that cannot fail and is no more acceptable.
+  gPfxScrollJudgeRoot = judgeRoot
+  gPfxScrollJudge = PfxScrollJudgeDelay
   gPfxBuilt = true
   okLog "postfx rows: built " & $built & " NATIVE PREFAB row(s) into " &
         "PostFXSettingsTab._settingsRoot -- " &
@@ -1744,6 +1847,10 @@ proc pfxOnPanelUp(postUp: bool) =
   # edge. It runs BEFORE the row verdict so that a gray-out fault is reported
   # against the same frame it happened in.
   pfxGrayTick()
+  if gPfxScrollJudge > 0:
+    gPfxScrollJudge = gPfxScrollJudge - 1
+    if gPfxScrollJudge == 0:
+      pfxScrollVerdict(gPfxScrollJudgeRoot)
   pfxVerdict()
 
 proc pfxOnScreenClosed() =
