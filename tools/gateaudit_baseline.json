@@ -8,13 +8,5 @@
  "//6": "cannot rot into a blanket waiver).",
  "//7": "Key = <path>|<export>|<kind>. Measured 2026-09-03 by",
  "//8": "`python tools/gateaudit.py --baseline <empty>`; three sites, all in abi/.",
-
- "abi/aowlspt_invoke2.h|il2cpp_class_get_type|bind-gpa":
-   "MEASURED 2026-09-03, UNFIXED. aowl_mi2_exports_init binds it by name and aowl_mi2_type_object calls g_mi2_class_get_type(klass) at :447 with no token. il2cpp_class_get_type is a STATIC gate (argidx 1) -- the return is MT19937-64 output that passes the `if (!t)` check on the next line. Baselined only so this gate could land; the fix is to route it through aowl_gate_call().",
-
- "abi/aowlspt_navui.h|il2cpp_class_from_name|bind-gpa":
-   "MEASURED 2026-09-03, UNFIXED. g_nav_class_byname is called at :597 with no token; il2cpp_class_from_name is a NONCE gate (argidx 3, tls 0x2B0), the shape mods/sain already routes through sainGateCall. Baselined only so this gate could land.",
-
- "abi/aowlspt_navui.h|il2cpp_class_get_type|bind-gpa":
-   "MEASURED 2026-09-03, UNFIXED. g_nav_class_type is called at :610 with no token, and its result is fed straight to il2cpp_type_get_object. Same STATIC gate as the invoke2.h entry. Baselined only so this gate could land."
+ "//9": "EMPTY since 2026-09-03: navui's dead domain->class->type chain was DELETED and invoke2's il2cpp_class_get_type now goes through aowl_gate_call + aowl_handle_shape_ok. Do not add an entry to make a check pass."
 }

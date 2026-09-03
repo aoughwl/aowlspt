@@ -395,16 +395,32 @@ static void* aowl_mi2_call_generic0(void* fn, void* self, void* mi) {
  * verdict on this build is that most of the reflection surface faults.
  * ------------------------------------------------------------------ */
 
+/* `il2cpp_class_get_type` is a STATIC-token gate (argidx 1) in
+ * `abi/aowlspt_il2cpp_gates_data.h`. It is DELIBERATELY not bound here: called
+ * without its token it returns MT19937-64 output, which passed the `if (!t)`
+ * on the next line and was fed straight to `il2cpp_type_get_object` -- the
+ * shape that killed the client on 2026-09-02 18:49. It now goes through
+ * `aowl_gate_call`, which supplies the token, byte-verifies the export against
+ * the startup snapshot, VirtualQueries the argument and runs the call under
+ * one SEH guard. `il2cpp_object_new`, `il2cpp_string_new` and
+ * `il2cpp_type_get_object` are UNGATED (checked against the row table), so a
+ * raw bind of those three is correct. */
+#include "aowlspt_il2cpp_gates.h"
+#include "aowlspt_handle.h"
+
 typedef void* (*AowlMi2ObjectNew)(void*);
 typedef void* (*AowlMi2StringNew)(const char*);
-typedef void* (*AowlMi2ClassGetType)(void*);
 typedef void* (*AowlMi2TypeGetObject)(void*);
 
 static AowlMi2ObjectNew     g_mi2_object_new     = 0;
 static AowlMi2StringNew     g_mi2_string_new     = 0;
-static AowlMi2ClassGetType  g_mi2_class_get_type = 0;
 static AowlMi2TypeGetObject g_mi2_type_get_object= 0;
 static int                  g_mi2_exports_done   = 0;
+
+/* Why the last type-route attempt refused. Every refusal names itself; nobody
+ * prints a counter. */
+static const char* g_mi2_type_why = "not attempted";
+static const char* aowl_mi2_type_route_why(void) { return g_mi2_type_why; }
 
 static void aowl_mi2_exports_init(void) {
     HMODULE ga;
@@ -416,17 +432,25 @@ static void aowl_mi2_exports_init(void) {
         GetProcAddress(ga, "il2cpp_object_new");
     g_mi2_string_new = (AowlMi2StringNew)(void*)
         GetProcAddress(ga, "il2cpp_string_new");
-    g_mi2_class_get_type = (AowlMi2ClassGetType)(void*)
-        GetProcAddress(ga, "il2cpp_class_get_type");
     g_mi2_type_get_object = (AowlMi2TypeGetObject)(void*)
         GetProcAddress(ga, "il2cpp_type_get_object");
 }
 static int32_t aowl_mi2_have_object_new(void) {
     aowl_mi2_exports_init(); return g_mi2_object_new ? 1 : 0;
 }
+/* "Reachable" now means: the ungated half is bound AND the gated half has a
+ * row we can arm. `aowl_gate_is_gated` is a table lookup, not a call. */
 static int32_t aowl_mi2_have_type_route(void) {
     aowl_mi2_exports_init();
-    return (g_mi2_class_get_type && g_mi2_type_get_object) ? 1 : 0;
+    if (!g_mi2_type_get_object) {
+        g_mi2_type_why = "il2cpp_type_get_object is not exported";
+        return 0;
+    }
+    if (!aowl_gate_is_gated("il2cpp_class_get_type")) {
+        g_mi2_type_why = "il2cpp_class_get_type has no gate row in this build";
+        return 0;
+    }
+    return 1;
 }
 static void* aowl_mi2_object_new(void* klass) {
     aowl_mi2_exports_init();
@@ -441,12 +465,45 @@ static void* aowl_mi2_string_new(const char* s) {
 /* klass -> Il2CppType* -> System.Type object, in one hop so a fault inside
  * either half is one guarded step rather than two. */
 static void* aowl_mi2_type_object_of(void* klass) {
+    aowl_gate_call_t c;
+    void* argv[1];
     void* t;
+    void* obj;
+
     aowl_mi2_exports_init();
-    if (!g_mi2_class_get_type || !g_mi2_type_get_object || !klass) return NULL;
-    t = g_mi2_class_get_type(klass);
-    if (!t) return NULL;
-    return g_mi2_type_get_object(t);
+    if (!aowl_mi2_have_type_route()) return NULL;
+    if (!klass) { g_mi2_type_why = "no klass"; return NULL; }
+    if (!aowl_handle_shape_ok((uint64_t)(uintptr_t)klass) ||
+        !aowl_is_readable(klass, 8)) {
+        g_mi2_type_why = "the klass handed in is not shaped like a handle";
+        return NULL;
+    }
+
+    argv[0] = klass;
+    if (!aowl_gate_call("il2cpp_class_get_type", argv, 1, &c)) {
+        /* `ret != NULL` is NOT success here: the trap never returns NULL. */
+        g_mi2_type_why = aowl_gate_why(c.why);
+        return NULL;
+    }
+    t = c.ret;
+    if (!t) { g_mi2_type_why = "the gated call succeeded and returned no type";
+              return NULL; }
+    if (!aowl_handle_shape_ok((uint64_t)(uintptr_t)t) ||
+        !aowl_is_readable(t, 8)) {
+        g_mi2_type_why = "Il2CppType* failed the shape/readable filter";
+        aowl_gate_note_fault();
+        return NULL;
+    }
+
+    /* Ungated, and its argument has now been validated three ways. */
+    obj = g_mi2_type_get_object(t);
+    if (obj && (!aowl_handle_shape_ok((uint64_t)(uintptr_t)obj) ||
+                !aowl_is_readable(obj, 8))) {
+        g_mi2_type_why = "System.Type object failed the shape/readable filter";
+        return NULL;
+    }
+    g_mi2_type_why = obj ? "ok" : "il2cpp_type_get_object returned null";
+    return obj;
 }
 
 /* The two probe strings, and their allocation, kept HERE rather than on the Nim

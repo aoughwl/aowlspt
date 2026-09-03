@@ -85,6 +85,8 @@ proc cMi2ProbeTextStr(): Il2CppPtr {.
   importc: "aowl_mi2_probe_text_str", nodecl.}
 proc cMi2TypeObjectOf(klass: Il2CppPtr): Il2CppPtr {.
   importc: "aowl_mi2_type_object_of", nodecl.}
+proc cMi2TypeRouteWhy(): cstring {.
+  importc: "aowl_mi2_type_route_why", nodecl.}
 proc cMi2GoClassSlot(): Il2CppPtr {.importc: "aowl_mi2_go_class_slot", nodecl.}
 proc cMi2AddCompRectMi(): Il2CppPtr {.
   importc: "aowl_mi2_addcomp_rect_mi", nodecl.}
@@ -340,16 +342,17 @@ proc mi2Step4() =
 
   # ---- 4b: can a System.Type be produced at all on this build? ----
   if cMi2HaveTypeRoute() == 0'i32:
-    okLog "invoke2 STEP 4b: il2cpp_class_get_type / il2cpp_type_get_object are " &
-          "not both exported; the AddComponent(Type) route is unreachable"
+    okLog "invoke2 STEP 4b: the AddComponent(Type) route is unreachable -- " &
+          $cMi2TypeRouteWhy()
   elif gMi2GoClass == nil:
     okLog "invoke2 STEP 4b: no klass to convert; skipping"
   else:
-    okLog "invoke2 STEP 4b: probing il2cpp_class_get_type + il2cpp_type_get_object " &
-          "on the GameObject klass (this is the reflection surface that faulted " &
-          "in P2-P5, so it is probed, not assumed)"
+    okLog "invoke2 STEP 4b: probing il2cpp_class_get_type (through the ARMED " &
+          "token gate) + il2cpp_type_get_object on the GameObject klass -- " &
+          "probed, not assumed"
     let tobj = cMi2TypeObjectOf(gMi2GoClass)
     okLog "invoke2 STEP 4b: System.Type object = 0x" & hexOf(cast[uint64](tobj)) &
+          "  (" & $cMi2TypeRouteWhy() & ")" &
           (if tobj != nil:
              "  <-- a live System.Type EXISTS, so AddComponent(Type) is reachable " &
              "for any type we hold a klass for"

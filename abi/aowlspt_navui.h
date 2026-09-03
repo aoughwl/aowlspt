@@ -326,8 +326,9 @@ static const AowlNavTarget aowl_nav_targets[] = {
      * (domain -> assemblies -> image -> class_from_name -> class_get_type ->
      * type_get_object). Six exported calls versus one managed call at a
      * byte-verified RVA, on a build whose standing verdict is that the
-     * exported reflection surface faults. The old chain is left in place
-     * because other commands still reference it; nothing new should use it. */
+     * exported reflection surface faults. The old chain was DELETED on
+     * 2026-09-03: it was unreferenced, and it called two token-gated exports
+     * with no token. Nothing may re-bind them by name here. */
     /* ---- THE OVERLOAD THAT WAS MISSING, AND THE FAULTS IT EXPLAINS.
      *
      * `component EXPR Type` has only ever called the COMPONENT overload
@@ -467,76 +468,25 @@ static int32_t aowl_nav_off_curselected(void) { return AOWL_NAV_ES_CURSELECTED; 
 #define AOWL_NAV_UOBJ_CACHEDPTR  0x010  /* UnityEngine.Object.m_CachedPtr    */
 
 /* ------------------------------------------------------------------ *
- * GETTING A `System.Type`, WHICH IS WHAT GetComponent NEEDS.
+/* ------------------------------------------------------------------ *
+ * REMOVED 2026-09-03 -- the domain -> assembly -> image -> class -> type
+ * route that used to live here.
  *
- * This project's standing verdict is that IL2CPP REFLECTION IS DEAD on this
- * build: il2cpp_object_get_class, il2cpp_class_get_name and il2cpp_value_box
- * all fault. So nothing here assumes anything. What is established is only
- * that the following are present in GameAssembly.dll's PE export table, which
- * was read directly to confirm it:
+ * It bound `il2cpp_class_from_name` (NONCE gate) and `il2cpp_class_get_type`
+ * (STATIC gate) with a raw GetProcAddress and called them with NO TOKEN, so
+ * each returned MT19937-64 output that passed the `if (!klass)` / `if (!ty)`
+ * check on the next line -- invariant X1 of docs/INTERACTION-LAYER-MAP.md
+ * section 3, and the exact shape that killed the client on 2026-09-02 18:49.
  *
- *   il2cpp_domain_get, il2cpp_domain_get_assemblies, il2cpp_assembly_get_image,
- *   il2cpp_class_from_name, il2cpp_class_get_type, il2cpp_type_get_object
+ * It is DELETED rather than routed through `aowl_gate_call`, because nothing
+ * ever called it: `aowl_nav_find_class`, `aowl_nav_type_object`,
+ * `aowl_nav_have_type_route` and `aowl_nav_last_hop` had no importc on the
+ * Nim side and no C caller. A dead hazard is removed, not hardened.
  *
- * Exported is not the same as working, and this file does not pretend
- * otherwise. The chain below is ATTEMPTED, once, from inside the inspector's
- * per-command SEH guard, with a breadcrumb set before each hop -- so if any
- * link faults, the caught fault names the exact hop instead of taking the
- * client down. That is precisely the shape this instrument exists to make
- * safe: try the risky thing under a guard that reports, rather than reason
- * about it from the outside and guess.
- *
- * `il2cpp_class_from_name` in particular is already relied on elsewhere in the
- * project (see aowlspt_bridge.h), which is the reason this route is worth
- * trying at all rather than being dismissed with the rest of reflection.
+ * If a System.Type is needed again, use `aowl_mi2_type_object_of`
+ * (abi/aowlspt_invoke2.h), which goes through the armed gate plus
+ * `aowl_handle_shape_ok`. Do not re-bind these exports by name here.
  * ------------------------------------------------------------------ */
-
-typedef void*  (*AowlNavDomainGet)(void);
-typedef void** (*AowlNavDomainAssemblies)(void*, size_t*);
-typedef void*  (*AowlNavAssemblyImage)(void*);
-typedef void*  (*AowlNavClassFromName)(void*, const char*, const char*);
-typedef void*  (*AowlNavClassGetType)(void*);
-typedef void*  (*AowlNavTypeGetObject)(void*);
-
-static AowlNavDomainGet        g_nav_domain_get   = 0;
-static AowlNavDomainAssemblies g_nav_assemblies   = 0;
-static AowlNavAssemblyImage    g_nav_asm_image    = 0;
-static AowlNavClassFromName    g_nav_class_byname = 0;
-static AowlNavClassGetType     g_nav_class_type   = 0;
-static AowlNavTypeGetObject    g_nav_type_object  = 0;
-static int                     g_nav_exports_done = 0;
-
-/* Which hop was last attempted, so a caught fault can name it. */
-static int32_t aowl_nav_hop = 0;
-#define AOWL_NAV_HOP_NONE       0
-#define AOWL_NAV_HOP_DOMAIN     1
-#define AOWL_NAV_HOP_ASSEMBLIES 2
-#define AOWL_NAV_HOP_IMAGE      3
-#define AOWL_NAV_HOP_CLASS      4
-#define AOWL_NAV_HOP_TYPE       5
-#define AOWL_NAV_HOP_TYPEOBJ    6
-
-static void aowl_nav_exports_init(void) {
-    HMODULE ga;
-    if (g_nav_exports_done) return;
-    g_nav_exports_done = 1;
-    ga = GetModuleHandleA("GameAssembly.dll");
-    if (!ga) return;
-    g_nav_domain_get   = (AowlNavDomainGet)(void*)GetProcAddress(ga, "il2cpp_domain_get");
-    g_nav_assemblies   = (AowlNavDomainAssemblies)(void*)GetProcAddress(ga, "il2cpp_domain_get_assemblies");
-    g_nav_asm_image    = (AowlNavAssemblyImage)(void*)GetProcAddress(ga, "il2cpp_assembly_get_image");
-    g_nav_class_byname = (AowlNavClassFromName)(void*)GetProcAddress(ga, "il2cpp_class_from_name");
-    g_nav_class_type   = (AowlNavClassGetType)(void*)GetProcAddress(ga, "il2cpp_class_get_type");
-    g_nav_type_object  = (AowlNavTypeGetObject)(void*)GetProcAddress(ga, "il2cpp_type_get_object");
-}
-
-static int32_t aowl_nav_have_type_route(void) {
-    aowl_nav_exports_init();
-    return (g_nav_domain_get && g_nav_assemblies && g_nav_asm_image &&
-            g_nav_class_byname && g_nav_class_type && g_nav_type_object) ? 1 : 0;
-}
-
-static int32_t aowl_nav_last_hop(void) { return aowl_nav_hop; }
 
 /* ---- THE PRE-FLIGHT PROBE for the string route.
  *
@@ -567,53 +517,6 @@ static int32_t aowl_nav_icall_ready(void) {
     return g_nav_icall_ok;
 }
 
-/* Search every loaded assembly's image for <ns>.<name>. Capped, because a
- * corrupt count from a faulting export must not become an unbounded loop on
- * the Unity thread -- a hang costs the whole session, a wrong answer costs one
- * command. */
-static void* aowl_nav_find_class(const char* ns, const char* name) {
-    void* domain;
-    void** asms;
-    size_t count = 0, i;
-    aowl_nav_exports_init();
-    if (!aowl_nav_have_type_route()) return NULL;
-
-    aowl_nav_hop = AOWL_NAV_HOP_DOMAIN;
-    domain = g_nav_domain_get();
-    if (!domain) return NULL;
-
-    aowl_nav_hop = AOWL_NAV_HOP_ASSEMBLIES;
-    asms = g_nav_assemblies(domain, &count);
-    if (!asms || count == 0 || count > 512) return NULL;
-
-    for (i = 0; i < count; i++) {
-        void* img;
-        void* klass;
-        if (!asms[i]) continue;
-        aowl_nav_hop = AOWL_NAV_HOP_IMAGE;
-        img = g_nav_asm_image(asms[i]);
-        if (!img) continue;
-        aowl_nav_hop = AOWL_NAV_HOP_CLASS;
-        klass = g_nav_class_byname(img, ns, name);
-        if (klass) { aowl_nav_hop = AOWL_NAV_HOP_NONE; return klass; }
-    }
-    aowl_nav_hop = AOWL_NAV_HOP_NONE;
-    return NULL;
-}
-
-/* klass -> Il2CppType* -> System.Type object. */
-static void* aowl_nav_type_object(void* klass) {
-    void* ty;
-    aowl_nav_exports_init();
-    if (!klass || !g_nav_class_type || !g_nav_type_object) return NULL;
-    aowl_nav_hop = AOWL_NAV_HOP_TYPE;
-    ty = g_nav_class_type(klass);
-    if (!ty) { aowl_nav_hop = AOWL_NAV_HOP_NONE; return NULL; }
-    aowl_nav_hop = AOWL_NAV_HOP_TYPEOBJ;
-    ty = g_nav_type_object(ty);
-    aowl_nav_hop = AOWL_NAV_HOP_NONE;
-    return ty;
-}
 
 /* ---- MANAGED ARRAY LAYOUT, corroborated by the runtime's OWN accessors.
  *
