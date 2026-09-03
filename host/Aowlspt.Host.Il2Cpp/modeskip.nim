@@ -627,6 +627,14 @@ proc modeSkipShowSlotFired(regs: Il2CppPtr) =
   # has already been queued. The old code returned early once a slot matched,
   # which is precisely how the late Show became invisible to this feature.
   gModeSkipLastSlotMs = cNowMs()
+  # THE VERSION BRAND'S VERDICT ANCHOR. `CharacterSelectionScreen::ShowSlot` is
+  # the only bound event in this host that means "the character-selection
+  # screen is on screen" -- uihooks has no site for that screen (site 3 is the
+  # PMC/SCAV side selector, which is much later). This stores ONE timestamp and
+  # does no pointer work; the read-back happens in `modstab.nim` under that
+  # feature's own guard. It is therefore gated on `skipModeScreen` being on --
+  # with modeskip off the brand reports INCONCLUSIVE rather than PASS.
+  verBrandNoteCharSelect()
   inc gModeSkipShows
   inc gModeSkipSlotsThisTick
   if gModeSkipSubmittedAtMs != 0'u64:

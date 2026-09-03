@@ -2297,6 +2297,21 @@ var gVerStock = ""
 var gVerWhy = ""
 ## One-shot: the empty-label refusal explains itself once, not every poll.
 var gVerSaidEmpty = false
+## THE VERDICT LATCH. `cNowMs()` of the first `CharacterSelectionScreen::ShowSlot`
+## firing -- the moment the character-selection screen is put on screen, which is
+## the event the brand is required to beat. Written by `verBrandNoteCharSelect`
+## from modeskip's PREFIX (a timestamp store and nothing else, so it adds no
+## pointer work to a detour handler); READ inside `verBrandTickBody`, which is
+## already under this feature's single guard.
+var gVerCharSelMs: uint64 = 0
+var gVerVerdictSaid = false
+
+proc verBrandNoteCharSelect() =
+  ## Called from `modeskip.nim`'s ShowSlot prefix (included EARLIER than this
+  ## file; nimony forward-resolves procs across an include boundary, which is
+  ## why this is a proc and not a bare variable write). Stores one timestamp.
+  if gVerCharSelMs == 0:
+    gVerCharSelMs = cNowMs()
 
 proc verTrim(s: string): string =
   ## Leading/trailing ASCII blanks removed. Written out rather than reaching for
@@ -2461,6 +2476,28 @@ proc verBrandTickBody() =
           "PreloaderUI::Update tick, on hunt pass " & $(gVerNotReady + 1) &
           ". Nothing this feature does can happen before that moment; it is " &
           "the floor on how early the brand can correctly be."
+  # THE VERDICT, and it is deliberately a read of the FINISHED STATE, not of
+  # our own write (CLAUDE.md 9b). The question is not "did we call set_text" --
+  # it is "by the time the player is looking at the character-selection screen,
+  # does the bottom-left label read the brand". Three outcomes, never two.
+  if gVerCharSelMs != 0 and not gVerVerdictSaid:
+    gVerVerdictSaid = true
+    if gVerTmp == nil or not duOk(gVerTmp, 0xE8'i32):
+      warn "version brand VERDICT: INCONCLUSIVE at the character-selection " &
+           "screen -- the AlphaLabel's TextMeshProUGUI was not resolved at " &
+           "that moment, so nothing could be read back. LAST REASON: " &
+           gVerWhy & ". This is not a pass."
+    else:
+      let seen = suiReadString(cReadPtrAt(gVerTmp, 0xE0'i32))
+      if seen.startsWith("aowlspt"):
+        okLog "version brand VERDICT: PASS -- at the character-selection " &
+              "screen the bottom-left label already read \"" & seen & "\"."
+      else:
+        warn "version brand VERDICT: FAIL -- the character-selection screen " &
+             "was shown at " & $int(gVerCharSelMs) & " ms (host clock) and " &
+             "the bottom-left label still read the STOCK text \"" & seen &
+             "\". The player sees the game's own version string during the " &
+             "whole loading and character-select phase."
   let cur = suiReadString(cReadPtrAt(gVerTmp, 0xE0'i32))
   if cur.len == 0:
     # THE ASSERTION. An empty label is the FINGERPRINT OF THE WRONG OBJECT --
@@ -3820,11 +3857,51 @@ proc verBrandTick() =
          "epoch(s) and kept being overwritten. Something else owns this " &
          "label's text; it is left as the game made it."
     return
-  var menu: Il2CppPtr = nil
-  if not modsUihMenuReady("version brand", gVerEpochSeen, menu):
-    return
+  # THE HONEST T0. MEASURED 2026-09-03, boot 13:11: this was set AFTER the
+  # menu-epoch gate below, so every "N ms after the first PreloaderUI::Update
+  # tick" line in this feature was measuring from the MENU, not from the first
+  # tick -- and printed 0 ms at 0:00:41.172 while the host log's own
+  # `live inspector: rider FIRST DISPATCHED` line says the first tick was
+  # 0:00:15.000. A 26-second error, reported as zero. It is set here now, on
+  # the first dispatch of this rider, which is what the sentence claims.
   if gVerT0 == 0:
     gVerT0 = cNowMs()
+  # PHASE 1 -- THE PRE-MENU HUNT, and the reason the brand was 26 s late.
+  #
+  # MEASURED, same boot: `EFT.UI.PreloaderUI::Awake` (postfix, slot bound at
+  # 0:00:01.047) DID fire, at 0:00:15.000, on Unity's thread, and read
+  # "1.1.0.1.46777" out of the label component's String slots -- so the label
+  # object graph exists 26 s before the menu. Nothing was wrong with the RVA,
+  # the binding or the walk: `modsUihMenuReady` simply returned false until
+  # uihooks site 2 (MenuScreen::Show) fired at 0:00:41.172, so the walk was
+  # never ATTEMPTED before then, and "reachable on hunt pass 1, 0 ms" is
+  # exactly what a first attempt made after the target already exists looks
+  # like. Event-driving the CLOBBER re-apply was right; event-driving the
+  # FIRST apply on the same event was not.
+  #
+  # So until the first successful apply, this rider -- which is
+  # `PreloaderUI::Update` itself, live from 0:00:15.000 -- drives a bounded
+  # hunt at `VerBrandHuntFrames`, under the SAME slice guard, walk-fault
+  # ceiling and wall-clock budget that already exist. The menu epoch stays as
+  # the clobber re-apply AND as the backstop: if every hunt pass declines, the
+  # 41 s path still brands the label exactly as it does today.
+  var menu: Il2CppPtr = nil
+  let menuEvent = modsUihMenuReady("version brand", gVerEpochSeen, menu)
+  if not menuEvent:
+    if gVerSaid and (gVerCharSelMs == 0 or gVerVerdictSaid):
+      return          # branded already; only a menu rebuild can clobber it
+    # NOTE the second half of that condition. Without it, a brand that applied
+    # BEFORE the character-selection screen -- i.e. the success case -- would
+    # return here and the verdict would never be read back at all, so the check
+    # could only ever fire on failure. A verdict that cannot say PASS is not a
+    # verdict.
+    if cNowMs() - gVerT0 > VerBrandHuntMs:
+      return          # the hunt's wall-clock budget; the backstop still runs
+    inc gVerFrames
+    let every = (if gVerSlow: VerBrandEveryFrames else: VerBrandHuntFrames)
+    if gVerFrames < every:
+      return
+    gVerFrames = 0
   gModsBranch = 2
   if cModsGuarded(cast[Il2CppPtr](0)) == nil:
     inc gVerWalkFaults
@@ -3835,7 +3912,11 @@ proc verBrandTick() =
            iPtr(cInspCrumbPtr()) & " (" & $gVerWalkFaults & " of " &
            $VerBrandMaxWalkFaults & ")"
     return
-  # ONE ACTION LINE PER EPOCH.
+  # ONE ACTION LINE PER EPOCH -- and ONLY on the epoch, never on a hunt pass:
+  # the hunt runs every 2 frames and would otherwise turn a bounded feature
+  # into a log flood.
+  if not menuEvent:
+    return
   okLog "version brand: menu epoch " & $gVerEpochSeen & " -- one bounded " &
         "pass. label=" & (if gVerTmp != nil: "RESOLVED" else: "not found") &
         ", applies so far=" & $gVerApplies & " of at most " &
