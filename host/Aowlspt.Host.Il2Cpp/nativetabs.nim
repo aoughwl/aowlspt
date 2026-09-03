@@ -2201,6 +2201,207 @@ proc ntSubApply(sel: int) =
         "ShowScreen POSTFIX, the same path a stock tab click takes, so our " &
         "own switch and the player's are handled by one piece of code."
 
+# =========================================================================
+# THE BODY OFFSET -- give the subtab strip a band of its own.
+#
+# THE DEFECT, MEASURED on the live tree (inspector, 2026-09-03 11:45):
+#
+#   [15] "Toggles(Clone)"    -- our strip -- anchoredPosition (0,-128)
+#                               sizeDelta (-1428.56, 46), i.e. it occupies
+#                               128..174 px below the screen top.
+#   [4]  "Graphics Settings" -- BOTTOM-anchored: anchorMin (0.5,0)
+#                               anchorMax (0.5,1) pivot (0.5,0)
+#                               anchoredPosition (0,60) sizeDelta (1000,-225)
+#                               -> rect h=785, top edge 165 px below the top.
+#   [5]  "PostFX Settings"   -- TOP-anchored: anchoredPosition (0,-165)
+#                               sizeDelta (930,785).
+#
+# Both bodies therefore START 165 px down while the strip ENDS at 174. The
+# overlap is 9 px and the visible symptom is the first row crowded under the
+# strip. Nothing about this is a layout-group problem: it is two siblings
+# authored against a screen with no strip in it.
+#
+# THE FIX, and why the two panels need DIFFERENT arithmetic. "Shrink from the
+# top by N" is not one operation in Unity; it depends on where the rect is
+# anchored, which is why a single formula applied to both would move one of
+# them and resize the other:
+#
+#   Graphics is bottom-pivoted and vertically stretched, so its TOP edge is
+#   `parentHeight + sizeDelta.y` measured from the bottom -- reducing
+#   sizeDelta.y alone lowers the top edge and leaves the bottom where it is.
+#   anchoredPosition MUST NOT change.
+#
+#   PostFX is top-anchored with a fixed height, so its top edge is
+#   anchoredPosition.y and its bottom is that minus sizeDelta.y. BOTH must
+#   move by the same amount: the position to push the top down, the height to
+#   keep the bottom still.
+#
+# THE ORIGINALS ARE READ, NEVER HARDCODED. The numbers above are this
+# machine's, at this user's 1.5x display scaling, on this window size; a
+# constant transcribed from them would be wrong on the next resolution. The
+# only constant here is the SHRINK, which is a fraction of nothing -- it is
+# the strip's own measured height plus clearance.
+const NtBodyShrink = 55.0'f32     ## px removed from the top of each body
+const NtBodyStripBottom = 174.0'f32
+  ## MEASURED: the strip's lower edge, px below the screen top (128 + 46).
+  ## The verdict asserts each body's top edge is at least this far down.
+const NtBodyMaxFaults = 4         ## rule 6
+
+var gNtBodyInit = false
+var gNtBodyOn = false             ## `settingsSubtabBodyOffset`, DEFAULT OFF
+var gNtBodyOff = false            ## self-disabled
+var gNtBodyFaults = 0
+var gNtBodyHave = false           ## the originals have been captured
+var gNtBodyGfx0 = nuNoGeom()      ## "Graphics Settings" as the game authored it
+var gNtBodyPfx0 = nuNoGeom()      ## "PostFX Settings"   as the game authored it
+var gNtBodyApplied = false        ## our offset is currently in effect
+var gNtBodyJudge = 0              ## frames until the verdict may be read
+var gNtBodyWant = false           ## what the pending verdict must find
+
+proc ntBodyNoteFault(what: string) =
+  inc gNtBodyFaults
+  warn "subtab body offset: " & what & " (fault " & $gNtBodyFaults & " of " &
+       $NtBodyMaxFaults & ")"
+  if gNtBodyFaults >= NtBodyMaxFaults:
+    gNtBodyOff = true
+    warn "subtab body offset: fault ceiling reached; OFF for the rest of the " &
+         "session. The last write stands, so the bodies keep whatever offset " &
+         "was applied -- nothing is left half-written mid-panel."
+
+proc ntBodyCapture(): bool =
+  ## Read both bodies ONCE, before anything of ours has ever written to them.
+  ## `gNtBodyHave` is the interlock that makes "capture the originals" and
+  ## "capture our own shrunken values" distinguishable: an apply cannot run
+  ## before a capture, and a capture cannot run twice.
+  if gNtBodyHave: return true
+  if gGfxPanelT == nil or gGfxPostT == nil: return false
+  if not iUnityAlive(gGfxPanelT) or not iUnityAlive(gGfxPostT): return false
+  let g = nuReadGeom(gGfxPanelT)
+  let p = nuReadGeom(gGfxPostT)
+  if not g.ok or not p.ok: return false
+  gNtBodyGfx0 = g
+  gNtBodyPfx0 = p
+  gNtBodyHave = true
+  okLog "subtab body offset: captured the AUTHORED geometry of both bodies " &
+        "before writing anything. Graphics Settings " & nuGeomNote(g) &
+        "; PostFX Settings " & nuGeomNote(p) & ". Every restore goes back to " &
+        "exactly these numbers; none of them is hardcoded."
+  true
+
+proc ntBodySet(rt: Il2CppPtr; g0: NuGeom; dPos, dSd: float32): bool =
+  ## Read-validate-write, always ABSOLUTE and always relative to the captured
+  ## original -- never `current + delta`, which accumulates if it is ever
+  ## called twice and is the shape that walks a panel off the screen.
+  result = false
+  if not g0.ok: return
+  if not nuOk(rt, 0x10'i32) or not iUnityAlive(rt): return
+  if not nuSetV2(rt, NuTRtSetSizeDelta, g0.sdX, g0.sdY + dSd): return
+  if not nuSetV2(rt, NuTRtSetAnchoredPos, g0.posX, g0.posY + dPos): return
+  result = true
+
+proc ntBodyApply(up: bool) =
+  ## Called from the ShowScreen rider, on the EDGE only. `up` is "our strip is
+  ## on screen", which is exactly the condition under which the bodies must
+  ## make room for it.
+  if not gNtBodyInit:
+    gNtBodyInit = true
+    gNtBodyOn = readBoolKeyDef("settingsSubtabBodyOffset", false)
+  if not gNtBodyOn or gNtBodyOff: return
+  if not gNtSubBuilt or gNtSubKind != NtSubPanels: return
+  if not ntBodyCapture():
+    ntBodyNoteFault("neither body's geometry could be read, so there is no " &
+                    "original to restore to and NOTHING was written. This is " &
+                    "'asked before the panels exist', not a wrong pointer.")
+    return
+  if up == gNtBodyApplied: return
+  let d = (if up: -NtBodyShrink else: 0.0'f32)
+  let okG = ntBodySet(gGfxPanelT, gNtBodyGfx0, 0.0'f32, d)
+  let okP = ntBodySet(gGfxPostT, gNtBodyPfx0, d, d)
+  if not (okG and okP):
+    ntBodyNoteFault("the write was refused on " &
+                    (if not okG: "Graphics Settings" else: "PostFX Settings") &
+                    ". Both bodies are being put back to their captured " &
+                    "originals so the screen cannot be left half-offset.")
+    discard ntBodySet(gGfxPanelT, gNtBodyGfx0, 0.0'f32, 0.0'f32)
+    discard ntBodySet(gGfxPostT, gNtBodyPfx0, 0.0'f32, 0.0'f32)
+    gNtBodyApplied = false
+    return
+  gNtBodyApplied = up
+  gNtBodyWant = up
+  gNtBodyJudge = NtVerdictDelay
+
+proc ntBodyVerdict() =
+  ## THE FINISHED STATE, read off the live tree one frame after the write --
+  ## never the value we passed in.
+  ##
+  ## RAISED asserts a NEGATIVE that can actually fail: no body's top edge is
+  ## still inside the strip's band. HIDDEN asserts equality with the captured
+  ## original, which is the only reading that distinguishes "restored" from
+  ## "never written".
+  let screenT = modsParentOf(gGfxPanelT)
+  if screenT == nil:
+    warn "subtab body offset VERDICT INCONCLUSIVE: the SettingsScreen " &
+         "transform (the bodies' own parent, walked from 'Graphics Settings') " &
+         "could not be reached, so a screen-relative edge cannot be computed. " &
+         "'I could not look' is not a pass."
+    return
+  let sg = nuReadGeom(screenT)
+  let gg = nuReadGeom(gGfxPanelT)
+  let pg = nuReadGeom(gGfxPostT)
+  if not sg.ok or not gg.ok or not pg.ok:
+    var which = "PostFX Settings"
+    if not sg.ok: which = "the screen"
+    elif not gg.ok: which = "Graphics Settings"
+    warn "subtab body offset VERDICT INCONCLUSIVE: " & which &
+         " did not read back a valid rect, so no edge can be judged."
+    return
+  if not gNtBodyWant:
+    let dG = (gg.sdY - gNtBodyGfx0.sdY)
+    let dP = (pg.posY - gNtBodyPfx0.posY)
+    let dP2 = (pg.sdY - gNtBodyPfx0.sdY)
+    if dG > -0.5'f32 and dG < 0.5'f32 and dP > -0.5'f32 and dP < 0.5'f32 and
+       dP2 > -0.5'f32 and dP2 < 0.5'f32:
+      okLog "subtab body offset VERDICT PASS (hidden): both bodies read back " &
+            "EQUAL to the geometry captured before we ever wrote -- Graphics " &
+            "sizeDelta.y " & nuF(gg.sdY) & ", PostFX anchoredPosition.y " &
+            nuF(pg.posY) & " / sizeDelta.y " & nuF(pg.sdY) & ". The strip is " &
+            "down and the screen is exactly as the game authored it."
+    else:
+      warn "subtab body offset VERDICT FAIL (hidden): the restore did not " &
+           "take. Graphics sizeDelta.y is " & nuF(gg.sdY) & " against a " &
+           "captured " & nuF(gNtBodyGfx0.sdY) & "; PostFX is " &
+           nuF(pg.posY) & "/" & nuF(pg.sdY) & " against " &
+           nuF(gNtBodyPfx0.posY) & "/" & nuF(gNtBodyPfx0.sdY) & ". A body " &
+           "left short with no strip above it is a visible defect."
+    return
+  let (okG, topG, leftG) = nuChildEdgeInParent(sg, gg)
+  let (okP, topP, leftP) = nuChildEdgeInParent(sg, pg)
+  discard leftG
+  discard leftP
+  if not okG or not okP:
+    let which = (if not okG: "Graphics Settings" else: "PostFX Settings")
+    warn "subtab body offset VERDICT INCONCLUSIVE: the child-edge arithmetic " &
+         "refused for " & which & " (a NaN or an absurd magnitude), so no " &
+         "screen-relative top edge exists to judge."
+    return
+  let screenTop = sg.rectY + sg.rectH
+  let belowG = screenTop - topG
+  let belowP = screenTop - topP
+  if belowG >= NtBodyStripBottom and belowP >= NtBodyStripBottom:
+    okLog "subtab body offset VERDICT PASS (raised): NO body's top edge is " &
+          "still inside the strip's band. Graphics Settings starts " &
+          nuF(belowG) & " px below the screen top and PostFX Settings " &
+          nuF(belowP) & " px, both at or past the strip's measured lower " &
+          "edge of " & nuF(NtBodyStripBottom) & " px. Read from get_rect on " &
+          "the live RectTransforms and the live screen, one frame after the " &
+          "write."
+  else:
+    warn "subtab body offset VERDICT FAIL (raised): a body still overlaps " &
+         "the strip. Graphics Settings top edge " & nuF(belowG) &
+         " px below the screen top, PostFX Settings " & nuF(belowP) &
+         " px; the strip ends at " & nuF(NtBodyStripBottom) & " px. The " &
+         "first row of the offending page is drawn under the strip."
+
 proc ntOnShowScreen(screen: Il2CppPtr; group: int32) =
   ## THE ONE PLACE STRIP VISIBILITY AND HIGHLIGHT ARE DECIDED.
   ##
@@ -2233,6 +2434,13 @@ proc ntOnShowScreen(screen: Il2CppPtr; group: int32) =
   if wanted:
     ntSubHighlight(if group == NtGroupPostFx: 1 else: 0)
     ntTabBarSync(group)
+  # THE BODIES MAKE ROOM FOR THE STRIP, and they do it here for the same
+  # reason the strip is raised here: this rider is the ONE place that fires
+  # for every route into a group -- the player's click, our own ntSubApply,
+  # and OpenGroup on first open. Doing it at the click site would miss two of
+  # the three. It runs inside the ShowScreen postfix's single `aowl_p_p_seh`
+  # and opens no guard of its own (the guard is not re-entrant).
+  ntBodyApply(wanted)
   # JUDGE ONE FRAME LATER, NEVER THIS ONE. A LayoutGroup rebuild is deferred
   # to `willRenderCanvases` and `Object.Destroy` to end of frame, so a
   # same-frame read is INCONCLUSIVE (§6.5 predicate 9).
@@ -2915,6 +3123,14 @@ proc ntTickBody() =
   # OURS -- so under the stock GRAPHICS tab, which is where this strip
   # actually lives, it never ran at all and a boot with BOTH subtabs lit
   # printed no FAIL whatsoever.
+  # THE BODY-OFFSET VERDICT, judged `NtVerdictDelay` frames after the write
+  # and never on the frame of the write: a RectTransform change is not
+  # reflected in `get_rect` until the driven-property/layout rebuild that
+  # Unity defers to `willRenderCanvases`.
+  if gNtBodyJudge > 0:
+    gNtBodyJudge = gNtBodyJudge - 1
+    if gNtBodyJudge == 0 and gNtBodyOn and not gNtBodyOff:
+      ntBodyVerdict()
   if gNtVerdictDue > 0:
     gNtVerdictDue = gNtVerdictDue - 1
     if gNtVerdictDue == 0 and gNtSubBuilt and gNtSubKind == NtSubPanels:
