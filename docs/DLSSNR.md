@@ -246,3 +246,8 @@ Turing without `--force-model`, and a backup without its manifest. Two of these 
 failed on the first run (CRLF lost by a text-mode read; `os.walk` pruning only leaf
 directories) -- both were defects in the test fixture and the rollback pruner, fixed
 before the PASS above.
+
+
+## Turning the model OFF while leaving the install in place (measured 2026-09-03)
+
+In `D:\Aowlspt\OptiScaler.ini`: `[Upscalers] Dx11Upscaler=dlss` (OptiScaler passes the game's DLSS request through to the real nvngx_dlss.dll -- `dlss` is a documented value for Dx11 games) and `[DlssNr] Enabled=false`. Turning it back on: `Dx11Upscaler=ffx_12` (FSR 3.1 bridged; FSR 2.2 smears wind-moving foliage) and `Enabled=true`; the user's preferred look was `WorkingScale=0.25`, `Intensity=2.0` (a stylised post-process; ~10 fps at 4K on the RTX 2060 SUPER at 0.5 scale).
