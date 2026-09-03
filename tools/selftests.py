@@ -164,6 +164,7 @@ ITEMS = [
     S("nimlint.py", "fast"),                           # 0.1s
     S("acceptance.py", "fast", args=("selftest",)),    # 0.2s -- positional
     S("dlss.py", "fast", args=("selftest",)),          # fake install + manifest falsifiers
+    S("dlssnr.py", "fast", args=("selftest",)),        # OptiScaler-DLSSNR install tree + falsifiers
     S("abilint.py", "fast", args=("--selftest",)),      # ABI ownership lint + falsifier
     S("consistency.py", "fast", args=("selftest",)),   # injected-manifest container + falsifiers
     # The allocator must not be a crash source. Its own --selftest builds four
@@ -314,6 +315,15 @@ VERIFIERS = [
       "synthetic install tree; the wrong (unsigned) checksum formula, an "
       "off-by-one checksum, a same-size DLL tamper and a truncated backup "
       "must each make install/rollback FAIL, so PASS is not the only answer"),
+    V("dlssnr.py", "dlssnr.py selftest",
+      "synthetic game root and a synthetic OptiScaler zip: a model whose sha256 "
+      "!= pin, a native-DX11 upscaler, a zip whose OptiScaler.dll is another "
+      "DLL, a same-size model tamper, an ini edited back to auto, a manifest "
+      "that LISTS a planned file, a fake running pid, an UNKNOWN running state, "
+      "driver 581.42 without --force-driver, a Blackwell-only model on Turing, "
+      "and a backup without its manifest must EACH be refused or FAIL; the "
+      "manifest negative is re-armed and shown to PASS again so it is not "
+      "stuck on"),
     V("nativetabs_check.py", "nativetabs_check.py selftest",
       "self-test case 4 is the negative control: changed geometry must make "
       "the comparison FAIL. This is the check that once accepted a FAIL "

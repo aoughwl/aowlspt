@@ -832,8 +832,8 @@ def cmd_status(a):
         if ent["kind"] == "sr" and ent.get("min_driver") and drv:
             ok = ver_tuple(drv) >= ver_tuple(ent["min_driver"])
             say("  %-10s min driver %s -> %s" % (v, ent["min_driver"], "OK" if ok else "TOO OLD"))
-    say("  DLSS-NR (leaked 'DLSS 5' nvngx_dlssnr 310.8.0.0): fork author states driver >= 616.56 -> %s; "
-        "this game uses the D3D11 NGX API; no official source exists. NOT SUPPORTED by this tool." % (
+    say("  DLSS-NR (leaked 'DLSS 5' nvngx_dlssnr): fork author states driver >= 616.56 -> %s; "
+        "this game uses the D3D11 NGX API. Handled by tools/dlssnr.py (docs/DLSSNR.md), not here." % (
             "OK" if drv and ver_tuple(drv) >= (616, 56) else "TOO OLD"))
     say("== driver-side override ==")
     v, note = preset_get()

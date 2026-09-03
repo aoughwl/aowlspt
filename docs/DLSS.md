@@ -27,8 +27,10 @@ with its source. The tool is `tools/dlss.py`; its self-test is registered in
   (re-lighting) model. There is no official source for it, NVIDIA's own launch
   (2026-09-03, NBA 2K27) is RTX 50-only, the community fork that wires it into
   arbitrary games states a 616.56 driver minimum (this machine: 581.42), and
-  this game drives NGX through the **D3D11** API. The tool refuses it and says
-  why. Details and sources in section 5.
+  this game drives NGX through the **D3D11** API. `dlss.py` refuses it and says
+  why. Details and sources in section 5. **2026-09-03: the user asked for it
+  anyway, knowingly** -- that is `tools/dlssnr.py` and `docs/DLSSNR.md`, a
+  separate tool with its own catalog, gates and falsifiers.
 
 ## 1. This machine and this install (measured)
 
@@ -215,6 +217,11 @@ Sources: [TechPowerUp, 2026-08-30](https://www.techpowerup.com/352181/leaked-dls
 If NVIDIA ships DLSS-NR officially with Turing support and a D3D11 path, the catalog in
 `tools/dlss.py` is where a pinned `nvngx_dlssnr.dll` goes; the manifest/backup/verify
 machinery is feature-agnostic.
+
+**Superseded 2026-09-03 by an explicit user decision**: the leaked route IS installed
+here, eyes open, through `tools/dlssnr.py` -- see `docs/DLSSNR.md` for the measured state
+of the fork, the Turing rebuild, the hashes, and what remains unproven. The four reasons
+above are still true; they are now printed as gates and caveats, not a refusal.
 
 ## 6. Override mechanisms, for the record
 
