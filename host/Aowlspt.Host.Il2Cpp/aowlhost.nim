@@ -1396,7 +1396,48 @@ var gBenchReport = ""
   ## reader sees is the empty string it started with, which reads as "not
   ## ready" and is exactly right.
 var gBenchRuns = 0
-var gLastError = ""
+## THREAD-LOCAL, and this pragma is the whole fix for a measured heap
+## corruption. MEASURED 2026-09-03 09:21:51 (WER dump
+## `EscapeFromTarkov.exe.636.dmp`, cdb): the HOST's mimalloc hit
+## `"corrupted thread-free list."` (vendor/mimalloc/src/page.c:205) inside
+## `mi_malloc`, stack `mi_malloc <- three host frames <- sain!resolve_0 <-
+## sain!resolveNow_0 <- sain!ready_0 <- sain!onUpdate_0 <- sain!modOnUpdate <-
+## host tick`.
+##
+## It was NOT a cross-module free -- the ABI's "borrowed in, owned out" rule is
+## honoured everywhere (`allocBuffer`/`takeBuffer` route through `gHost.alloc`/
+## `gHost.free`, and `modapi_new`/`modapi_free`, `hostapi_new`/`hostapi_free`
+## are each called from one side only). It was THIS variable.
+##
+## As a plain global it was assigned from ~40 sites across every mod-callable
+## ABI entry point -- `hostResolve`, `hostCall`, `hostConfigGet/Set`,
+## `hostDbGet/Patch`, `hostRouteRegister`, `hostHandlePointer`, `hostHandlePin`
+## -- which run on the mod OPS thread, and also from `installPatch` and patch
+## callbacks, which run on the UNITY MAIN THREAD. With no lock. Under ARC, an
+## assignment to a global string FREES the previous buffer, so:
+##
+##   * a string allocated on the main thread was freed by an assignment on the
+##     ops thread -- a cross-thread free into the page's thread-free list; and
+##   * two threads assigning concurrently freed the SAME old buffer twice,
+##     which is precisely what corrupts that list.
+##
+## `hostLastError` also handed out `toCString(gLastError)` -- a raw interior
+## pointer into that global -- so a mod reading it raced a free on another
+## thread as well.
+##
+## `{.threadvar.}` fixes all three at once: every allocation and every free of
+## this string now happens on one thread, and the pointer `hostLastError`
+## returns is thread-local, valid until the next host call ON THAT THREAD --
+## which is exactly what `abi/aowlspt.nim`'s `lastError()` has always
+## documented ("the host's text for the most recent failure on this thread")
+## and what this global did not implement.
+##
+## `backend/aowlbackend.nim:1960` already declared its identically-named
+## `gLastError` as a threadvar; this host and `Aowlspt.Sim` did not. The
+## divergence, not the design, was the defect. No initialiser: threadvars are
+## zero-initialised per thread, which for a string is a valid empty string, and
+## an initialiser is not permitted here.
+var gLastError {.threadvar.}: string
 var gHandles: seq[Il2CppPtr] = @[]
 var gHandleIsObject: seq[bool] = @[]
 ## For an object handle, the IL2CPP GC handle keeping it alive; zero for a type

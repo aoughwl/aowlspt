@@ -164,6 +164,7 @@ ITEMS = [
     S("nimlint.py", "fast"),                           # 0.1s
     S("acceptance.py", "fast", args=("selftest",)),    # 0.2s -- positional
     S("dlss.py", "fast", args=("selftest",)),          # fake install + manifest falsifiers
+    S("abilint.py", "fast", args=("--selftest",)),      # ABI ownership lint + falsifier
     S("consistency.py", "fast", args=("selftest",)),   # injected-manifest container + falsifiers
     # The allocator must not be a crash source. Its own --selftest builds four
     # synthetic binaries and asserts FAIL / PASS / INCONCLUSIVE all fire.
@@ -306,6 +307,9 @@ VERIFIERS = [
       "not look'; and a fourth shows one surviving sentinel of five is enough. "
       "The runner also refuses if the case set does not exercise all three "
       "verdicts"),
+    V("abilint.py", "abilint.py --selftest",
+      "negative controls: a threadvar global, a mention inside a comment and a "
+      "non-exported writer must all read CLEAN, so HAZARD is not the only answer"),
     V("dlss.py", "dlss.py selftest",
       "synthetic install tree; the wrong (unsigned) checksum formula, an "
       "off-by-one checksum, a same-size DLL tamper and a truncated backup "

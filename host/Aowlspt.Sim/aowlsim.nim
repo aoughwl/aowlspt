@@ -297,7 +297,14 @@ type
 var gRoutes: seq[Route] = @[]
 var gSubs: seq[Sub] = @[]
 var gTimers: seq[Timer] = @[]
-var gLastError = ""
+## THREAD-LOCAL for the same reason as `aowlhost.nim`'s: a plain global string
+## assigned from ABI entry points on more than one thread frees the previous
+## buffer on whichever thread assigns, which is a cross-thread free and, when
+## two threads race, a double free. That corrupted mimalloc's thread-free list
+## in the IL2CPP host (measured 2026-09-03, WER dump EscapeFromTarkov.exe.636).
+## The sim host is less exposed but the shape is identical, and a threadvar is
+## also what makes `hostLastError`'s borrowed pointer honestly per-thread.
+var gLastError {.threadvar.}: string
 var gStubs = ""
 var gStubFile = ""
 var gSide = SideSim
