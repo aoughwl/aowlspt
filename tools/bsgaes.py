@@ -2,7 +2,9 @@
 #
 # Exists because this machine has no pip and therefore no `pycryptodome`, and
 # because `bsgwire` needs AES-192-CBC to read a captured Escape From Tarkov
-# response. Decryption only: nothing here ever needs to encrypt.
+# response. It was decrypt-only until `tools/consistency.py` had to REWRITE the
+# manifest injected into EscapeFromTarkov.exe; the encrypt direction below is
+# held to the same FIPS-197 known answers.
 #
 # The "equivalent inverse cipher" of FIPS-197 section 5.3.5 -- the round keys
 # are reordered and pushed through InvMixColumns once, up front, so the inner
@@ -81,6 +83,79 @@ def dec_block(ct,dk,Nr):
         struct.pack_into(">I",o,4*i,v)
     return bytes(o)
 
+def enc_schedule(key):
+    """Forward-cipher round keys (list of 4*(Nr+1) uint32) + Nr.
+
+    Added for `tools/consistency.py`, which must REWRITE an AES-256-CBC blob
+    inside EscapeFromTarkov.exe, not merely read one. The module header's
+    "decryption only" claim is no longer true; the encrypt direction is held to
+    the same FIPS-197 known answers below, in both directions, because an
+    encryptor that is subtly wrong here produces an exe that fails the game's
+    own consistency check with no diagnostic at all.
+    """
+    Nk=len(key)//4; Nr={4:10,6:12,8:14}[Nk]
+    w=list(struct.unpack(">%dI"%Nk,key))
+    for i in range(Nk,4*(Nr+1)):
+        t=w[i-1]
+        if i%Nk==0:
+            t=((t<<8)|(t>>24))&M
+            t=(_S[(t>>24)&0xff]<<24)|(_S[(t>>16)&0xff]<<16)|(_S[(t>>8)&0xff]<<8)|_S[t&0xff]
+            t^=Rcon[i//Nk-1]<<24
+        elif Nk>6 and i%Nk==4:
+            t=(_S[(t>>24)&0xff]<<24)|(_S[(t>>16)&0xff]<<16)|(_S[(t>>8)&0xff]<<8)|_S[t&0xff]
+        w.append(w[i-Nk]^t)
+    return w,Nr
+
+def _xtime(a): return ((a<<1)^0x1b)&0xff if a&0x80 else (a<<1)
+
+def enc_block(pt,ek,Nr):
+    s=bytearray(pt)
+    for i in range(4):
+        v=ek[i]
+        for j in range(4): s[4*i+j]^=(v>>(24-8*j))&0xff
+    for r in range(1,Nr+1):
+        s=bytearray(_S[b] for b in s)
+        # ShiftRows (state is column-major: s[4*c+r])
+        t=bytearray(16)
+        for c in range(4):
+            for r2 in range(4): t[4*c+r2]=s[4*((c+r2)&3)+r2]
+        s=t
+        if r!=Nr:
+            for c in range(4):
+                a=s[4*c:4*c+4]
+                x=a[0]^a[1]^a[2]^a[3]
+                b0=a[0]
+                s[4*c+0]=a[0]^x^_xtime(a[0]^a[1])
+                s[4*c+1]=a[1]^x^_xtime(a[1]^a[2])
+                s[4*c+2]=a[2]^x^_xtime(a[2]^a[3])
+                s[4*c+3]=a[3]^x^_xtime(a[3]^b0)
+        for c in range(4):
+            v=ek[4*r+c]
+            for j in range(4): s[4*c+j]^=(v>>(24-8*j))&0xff
+    return bytes(s)
+
+def ecb_encrypt(key,data):
+    ek,Nr=enc_schedule(key);out=bytearray()
+    for i in range(0,len(data),16): out+=enc_block(data[i:i+16],ek,Nr)
+    return bytes(out)
+
+def cbc_encrypt(key,iv,data):
+    ek,Nr=enc_schedule(key);out=bytearray();prev=iv
+    for i in range(0,len(data),16):
+        b=bytes(x^y for x,y in zip(data[i:i+16],prev))
+        c=enc_block(b,ek,Nr);out+=c;prev=c
+    return bytes(out)
+
+def pkcs7_pad(data,bs=16):
+    n=bs-(len(data)%bs)
+    return data+bytes([n])*n
+
+def pkcs7_unpad(data,bs=16):
+    if not data or len(data)%bs: raise ValueError("not a whole number of blocks")
+    n=data[-1]
+    if n<1 or n>bs or data[-n:]!=bytes([n])*n: raise ValueError("bad PKCS#7 padding")
+    return data[:-n]
+
 def cbc_decrypt(key,iv,data):
     dk,Nr=dec_schedule(key);out=bytearray();prev=iv
     for i in range(0,len(data),16):
@@ -134,6 +209,35 @@ def selftest() -> int:
     print(f"  {'ok  ' if ok else 'FAIL'}  AES-192-CBC chains and uses its IV")
     if not ok:
         failures += 1
+
+    # --- encrypt direction (added for tools/consistency.py) ----------------- #
+    for key_hex, pt_hex, ct_hex in _VECTORS:
+        key = bytes.fromhex(key_hex)
+        got = ecb_encrypt(key, bytes.fromhex(pt_hex))
+        ok = got == bytes.fromhex(ct_hex)
+        print(f"  {'ok  ' if ok else 'FAIL'}  AES-{len(key)*8} FIPS-197 known answer (ENCRYPT)")
+        if not ok:
+            failures += 1
+    # CBC encrypt must be the exact inverse of CBC decrypt, and must NOT be
+    # ECB in disguise: two identical plaintext blocks must encrypt differently.
+    key = bytes.fromhex(_VECTORS[2][0])
+    iv = bytes(range(16, 32))
+    msg = pkcs7_pad(b"consistency injector round trip, 41 bytes.")
+    ct = cbc_encrypt(key, iv, msg)
+    ok = cbc_decrypt(key, iv, ct) == msg
+    print(f"  {'ok  ' if ok else 'FAIL'}  AES-256-CBC encrypt/decrypt round trip")
+    failures += 0 if ok else 1
+    two = cbc_encrypt(key, iv, b"\x00" * 32)
+    ok = two[:16] != two[16:]
+    print(f"  {'ok  ' if ok else 'FAIL'}  AES-256-CBC is chained, not ECB (negative control)")
+    failures += 0 if ok else 1
+    try:
+        pkcs7_unpad(b"\x00" * 16)
+        ok = False
+    except ValueError:
+        ok = True
+    print(f"  {'ok  ' if ok else 'FAIL'}  PKCS#7 unpad REFUSES bad padding (negative control)")
+    failures += 0 if ok else 1
     print("")
     print(f"{failures} failure(s)")
     return 1 if failures else 0

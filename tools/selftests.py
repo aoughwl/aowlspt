@@ -164,6 +164,7 @@ ITEMS = [
     S("nimlint.py", "fast"),                           # 0.1s
     S("acceptance.py", "fast", args=("selftest",)),    # 0.2s -- positional
     S("dlss.py", "fast", args=("selftest",)),          # fake install + manifest falsifiers
+    S("consistency.py", "fast", args=("selftest",)),   # injected-manifest container + falsifiers
     S("nativetabs_check.py", "fast", args=("selftest",)),
     S("uihooks_check.py", "fast", args=("selftest",)),
 
@@ -287,6 +288,12 @@ VERIFIERS = [
     V("uihooks_check.py", "test_uihooks_falsifier.py",
       "feeds a per-frame action trail and asserts FAIL, so PASS is not the "
       "only reachable verdict"),
+    V("consistency.py", "consistency.py selftest",
+      "a wrong AES key, a corrupted cipherLen, a removed signature, a build id "
+      "that does not open the blob, a manifest too large for the record, and a "
+      "serialiser that cannot reproduce the shipped bytes must EACH be refused; "
+      "the last is the anti-vacuous gate -- without it `inject` would happily "
+      "rewrite the payload in a serialisation the client cannot read"),
     V("dlss.py", "dlss.py selftest",
       "synthetic install tree; the wrong (unsigned) checksum formula, an "
       "off-by-one checksum, a same-size DLL tamper and a truncated backup "

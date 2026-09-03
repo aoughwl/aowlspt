@@ -738,7 +738,8 @@ def plan_install(root, src_dll, version, expect_sha):
     new_size = os.path.getsize(src_dll)
     new_cks = ci_checksum_file(src_dll)
     old_entry, new_entry = ci_resync_doc(json.loads(raw.decode("utf-8")), DLL_REL, new_size, new_cks)
-    return {"dll": dll, "ci": ci, "ci_raw": raw, "ci_doc": doc, "old_entry": old_entry, "new_entry": new_entry,
+    return {"dll": dll, "ci": ci, "root": root, "ci_raw": raw, "ci_doc": doc,
+            "old_entry": old_entry, "new_entry": new_entry,
             "src": src_dll, "src_sha": sha256_file(src_dll), "src_ver": pe_file_version(src_dll),
             "live_sha": sha256_file(dll), "live_ver": pe_file_version(dll), "version": version}
 
@@ -760,7 +761,36 @@ def do_install(plan, backup_dir, checksum_fn=ci_checksum_file):
     with open(ctmp, "wb") as f:
         f.write(ci_dump(doc))
     os.replace(ctmp, plan["ci"])
+    # The plain file above is the LAUNCHER's manifest. The CLIENT reads a
+    # separate, encrypted copy injected into EscapeFromTarkov.exe, and that is
+    # the one whose size mismatch produces
+    #   files-checker|Consistency ensurance failed. File size does not match.
+    # Resyncing only the plain file is what left the game unbootable.
+    plan["embedded"] = embedded_resync(plan, backup_dir, checksum_fn)
     return verify_install(plan, checksum_fn)
+
+
+def embedded_resync(plan, backup_dir, checksum_fn=ci_checksum_file):
+    """Rewrite the manifest injected into EscapeFromTarkov.exe. Returns a
+    status string; never raises. `absent` means there is no exe to patch (a
+    synthetic tree), which is reported, not silently treated as success."""
+    import consistency
+    try:
+        emb = consistency.load(plan["root"])
+    except Exception as e:
+        return "NOT UPDATED: %s" % e
+    doc = json.loads(emb.plain.decode("utf-8"))
+    hits = [e for e in doc["Entries"] if e.get("Path") == DLL_REL]
+    if len(hits) != 1:
+        return "NOT UPDATED: %d embedded entries for %s" % (len(hits), DLL_REL)
+    hits[0]["Size"] = os.path.getsize(plan["dll"])
+    hits[0]["Checksum"] = checksum_fn(plan["dll"])
+    try:
+        data = consistency.rebuild(emb, doc)
+        backup = consistency.replace_file(emb.path, data, backup_dir)
+    except Exception as e:
+        return "NOT UPDATED: %s" % e
+    return "updated %s (rollback: copy \"%s\" \"%s\")" % (emb.path, backup, emb.path)
 
 
 def verify_install(plan, checksum_fn=ci_checksum_file):
@@ -773,6 +803,26 @@ def verify_install(plan, checksum_fn=ci_checksum_file):
         reasons.append("live DLL PE version %r != source %r" % (ver, plan["src_ver"]))
     ok, why = ci_verify(plan["ci"], DLL_REL, plan["dll"], before_doc=plan["ci_doc"], checksum_fn=checksum_fn)
     reasons += why
+    # The manifest the CLIENT actually reads. A tree with no exe (the
+    # self-test's synthetic root) is INCONCLUSIVE for this check and says so;
+    # an exe that is present and still stale is a hard FAIL, because that is
+    # exactly the state that refuses to boot.
+    try:
+        import consistency
+        emb = consistency.load(plan["root"])
+        e = emb.entry(DLL_REL)
+        size = os.path.getsize(plan["dll"])
+        cks = checksum_fn(plan["dll"])
+        if e is None:
+            reasons.append("embedded manifest has no single entry for %s" % DLL_REL)
+        elif (e["Size"], e["Checksum"]) != (size, cks):
+            reasons.append("embedded manifest STILL STALE: Size %d Checksum %d "
+                           "!= on-disk %d / %d -- the client will refuse to boot"
+                           % (e["Size"], e["Checksum"], size, cks))
+        else:
+            plan.setdefault("embedded_verified", True)
+    except Exception as e:
+        plan["embedded_verified"] = "INCONCLUSIVE: %s" % e
     return not reasons, reasons
 
 
@@ -824,6 +874,8 @@ def cmd_install(a):
         say("DRY RUN: nothing written. Rollback line would be: python tools/dlss.py rollback --backup %s" % ts)
         return
     ok, why = do_install(plan, backup)
+    say("install: embedded manifest (the one the CLIENT reads): %s"
+        % plan.get("embedded", "not attempted"))
     rec = {"when": ts, "version": version, "root": a.root, "backup": backup, "src_sha": plan["src_sha"],
            "prev_sha": plan["live_sha"], "prev_entry": plan["old_entry"], "verified": ok, "preset": None}
     prior = None
