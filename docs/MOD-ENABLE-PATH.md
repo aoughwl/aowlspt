@@ -57,6 +57,29 @@ removes the override and lets the lists decide again. `enable` refuses an id
 that is not in the registry, so a typo cannot leave a permanent entry naming
 nothing.
 
+### What the UIs use is a DIFFERENT route — measured, 2026-09-03
+
+The three GETs above are the **command-line** way, and they are `overrideLocked`
+in `mods/manager/manager.nim`. Neither in-game UI uses them:
+
+```
+POST /aowlspt/mods/toggle/<id>   {"enabled": true|false}
+```
+
+is what the **F12 mod panel** sends (`AOWL_CMD_TOGGLE` in
+`abi/aowlspt_overlay.h`) and now also what the **native MODS tab's per-mod
+ENABLED switch** sends, through the same command queue rather than a second
+implementation. It is `toggleLocked`: absolute state when `enabled` is present
+(not a flip), a protected-row refusal, and `afterChange()` broadcast.
+
+Instruments: the route table at `mods/manager/manager.nim:2295-2306`, and the
+command leg of the overlay worker loop.
+
+**A claim this repo carried in writing and that is false:** that the mod-enable
+write is only the GET pair, and that a native switch therefore needed a
+one-shot GET added to the overlay bridge. It did not — the bridge already had
+the queue the F12 panel uses.
+
 The client host picks the change up on its next poll (a few seconds) and loads
 the mod live — no restart.
 

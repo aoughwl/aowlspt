@@ -594,6 +594,114 @@ proc sbdPump(): bool =
   gSbdQAt = gSbdQAt + 1
   false
 
+## ---------------------------------------------------------------------------
+## V3 ENABLE -- the read-back for a per-mod ENABLED switch.
+##
+## V1 (the live control) and V2 (the mod's own settings page) cannot answer
+## this one: an enable does not go to `/aowlspt/settings/<guid>` and the
+## on-screen toggle is the thing we just wrote, so comparing against it is a
+## check that cannot fail. The only accessor that can falsify it is the MOD
+## MANAGER'S OWN ANSWER, which arrives in the overlay's panel poll -- the same
+## table the F12 rows are drawn from.
+##
+## Two things make it fail-able rather than decorative:
+##   * it waits out `overlayModPending`, so it is not reading the optimistic
+##     value the toggle wrote into the table on the way out;
+##   * it records what the manager said BEFORE the ask, and a run where that
+##     already equalled the wanted state is reported INCONCLUSIVE, because a
+##     comparison against a value that was already correct cannot fail.
+## A timeout is INCONCLUSIVE too, never a pass.
+## TICKS, not frames, and there may be TWO per frame: this is driven from
+## `sbdTick` (via `pfxOnPanelUp`) AND from `modsTickSubtabs`, because either
+## path may be the only one running depending on which flags are on. Double
+## counting only shortens the wall-clock wait, so the budget is sized for the
+## worst case -- 1800 ticks is >=15 s even at two per frame at 60 fps, against
+## an overlay panel poll that answers every 1 s.
+const SbdEnableWaitMax = 1800
+const SbdMaxEnableWatch = 8
+var gSbdEnGuid: seq[string] = @[]
+var gSbdEnWant: seq[bool] = @[]
+var gSbdEnWas: seq[int] = @[]    ## 1/0 = the manager's answer, -1 = it had none
+var gSbdEnFrames = 0
+
+proc sbdEnableWatch(guid: string; want: bool) =
+  ## Arms the V3 read-back for one guid. The pre-state is sampled HERE, on the
+  ## way out, because a sample taken later is a sample taken after the write.
+  if gSbdEnGuid.len >= SbdMaxEnableWatch: return
+  var was = -1
+  case overlayModEnabled(guid)
+  of ovModEnabled: was = 1
+  of ovModDisabled: was = 0
+  else: was = -1
+  gSbdEnGuid.add guid
+  gSbdEnWant.add want
+  gSbdEnWas.add was
+  gSbdEnFrames = 0
+
+proc swEnableWatch(guid: string; want: bool) =
+  ## Implements the forward declaration in `settingspages.nim`. The
+  ## settings-pages read-back reaches V3 through this and nothing else, so
+  ## there is one enable verdict for both row paths rather than two that can
+  ## drift.
+  sbdEnableWatch(guid, want)
+
+proc sbdVerdictEnable() =
+  ## Runs once per tick while anything is armed. Cheap: one interlocked-free
+  ## table scan per armed guid, under the overlay's own short lock.
+  if gSbdEnGuid.len == 0: return
+  gSbdEnFrames = gSbdEnFrames + 1
+  var i = 0
+  var stillPending = false
+  while i < gSbdEnGuid.len and i < SbdMaxEnableWatch:
+    if overlayModPending(gSbdEnGuid[i]): stillPending = true
+    i = i + 1
+  if stillPending and gSbdEnFrames <= SbdEnableWaitMax:
+    return
+  if stillPending:
+    warn "settings bind: V3 ENABLE INCONCLUSIVE -- the mod manager had not " &
+         "confirmed " & $gSbdEnGuid.len & " queued enable/disable(s) within " &
+         $SbdEnableWaitMax & " frame(s). The gesture WAS sent; whether it " &
+         "took could not be read back. This is not a pass."
+    gSbdEnGuid = @[]; gSbdEnWant = @[]; gSbdEnWas = @[]
+    return
+  var pass = 0
+  var fail = 0
+  var incon = 0
+  var firstFail = ""
+  i = 0
+  while i < gSbdEnGuid.len and i < SbdMaxEnableWatch:
+    let now = overlayModEnabled(gSbdEnGuid[i])
+    let nowB = (if now == ovModEnabled: 1
+                elif now == ovModDisabled: 0 else: -1)
+    if nowB < 0:
+      incon = incon + 1
+    elif nowB != (if gSbdEnWant[i]: 1 else: 0):
+      fail = fail + 1
+      if firstFail.len == 0:
+        firstFail = gSbdEnGuid[i] & " (manager reports " &
+                    swBoolText(nowB == 1) & ", asked for " &
+                    swBoolText(gSbdEnWant[i]) & ")"
+    elif gSbdEnWas[i] < 0 or gSbdEnWas[i] == nowB:
+      # It already read that way before we asked, so agreeing now proves
+      # nothing about our write. Named, not counted.
+      incon = incon + 1
+    else:
+      pass = pass + 1
+    i = i + 1
+  if fail > 0:
+    warn "settings bind: V3 ENABLE FAIL -- " & $fail & " mod(s) did NOT end " &
+         "in the state the switch asked for. First: " & firstFail & ". The " &
+         "POST /aowlspt/mods/toggle went out and the manager's own answer " &
+         "disagrees with it; treat the manager as the truth."
+  else:
+    okLog "settings bind: V3 ENABLE PASS -- " & $pass & " mod(s) CHANGED in " &
+          "the mod manager's own read-back to the state the switch asked " &
+          "for" &
+          (if incon > 0: ", " & $incon & " INCONCLUSIVE (the manager has no " &
+                         "answer for that guid, or it already read that way " &
+                         "before the ask -- NOT counted as a pass)" else: "")
+  gSbdEnGuid = @[]; gSbdEnWant = @[]; gSbdEnWas = @[]
+
 proc sbdFlush() =
   ## Persist every staged edit through the SAME write the F12 overlay uses, so
   ## the mod's `onSettingsApplied` runs. Then V1.
@@ -614,28 +722,48 @@ proc sbdFlush() =
                    sbdF(gSbdRows[i].stagedF))
         gSbdRows[i].flushedF = gSbdRows[i].stagedF
       else:
-        # A PER-MOD ENABLED SWITCH. It is registered, it is staged, and it is
-        # NOT WRITTEN -- because it does not go to /aowlspt/settings/<guid> at
-        # all. MEASURED: the mod manager's own route is
-        # `GET /aowlspt/mods/enable/<guid>` / `.../disable/<guid>`
-        # (`installer/payload/aowlspt/mods/manager/manager.nim:2303-2304`,
-        # documented in `docs/MOD-ENABLE-PATH.md`), and the overlay bridge this
-        # host reaches the backend through exposes a one-shot POST
-        # (`overlayPostStart`) and a POLLING GET feed (`overlaySyncStart`) --
-        # there is no one-shot GET. Firing the polling feed at an enable route
-        # would re-issue the enable every interval forever.
+        # A PER-MOD ENABLED SWITCH, and it is now WRITTEN -- through the F12
+        # panel's own command queue.
         #
-        # So this is DECLINED, by name, rather than written to the wrong place
-        # or dropped in silence. Closing it is a one-shot-GET helper in the
-        # overlay bridge, and it is what the MODS-tab pass needs from here.
+        # THE PREVIOUS COMMENT HERE WAS WRONG, and it is worth saying why
+        # rather than deleting it. It stated that the mod-enable write is
+        # `GET /aowlspt/mods/enable|disable/<guid>` and that the gap was a
+        # missing one-shot GET on the overlay bridge. MEASURED against the two
+        # instruments that settle it -- `mods/manager/manager.nim:2295-2306`
+        # (the route table) and the AOWL_CMD_TOGGLE leg of the overlay worker
+        # (`abi/aowlspt_overlay.h`) -- what F12 actually sends is
+        # `POST /aowlspt/mods/toggle/<guid>` `{"enabled":..}`, which takes the
+        # manager's `toggleLocked` path. The enable/disable GETs are a
+        # different, older route (`overrideLocked`). A native switch that must
+        # do exactly what F12 does therefore needed no new verb at all: it
+        # needed the same command queue, which `overlayModToggle` enters.
         gSbdRows[i].flushedB = gSbdRows[i].stagedB
-        warn "settings bind: mod '" & gSbdRows[i].guid & "' was switched " &
-             swBoolText(gSbdRows[i].stagedB) & " on screen and that was NOT " &
-             "written. The mod manager's route is GET /aowlspt/mods/" &
-             (if gSbdRows[i].stagedB: "enable/" else: "disable/") &
-             gSbdRows[i].guid & ", and the overlay bridge has no one-shot GET " &
-             "-- only a POST and a polling feed. The switch is honest about " &
-             "having done nothing rather than appearing to work."
+        let rc = overlayModToggle(gSbdRows[i].guid, gSbdRows[i].stagedB)
+        if rc == 1'i32:
+          sbdEnableWatch(gSbdRows[i].guid, gSbdRows[i].stagedB)
+          okLog "settings bind: mod '" & gSbdRows[i].guid & "' switched " &
+                swBoolText(gSbdRows[i].stagedB) & " -- queued as " &
+                "POST /aowlspt/mods/toggle/" & gSbdRows[i].guid &
+                " {\"enabled\":" & swBoolText(gSbdRows[i].stagedB) & "}, the " &
+                "same gesture the F12 panel queues. The manager's answer is " &
+                "read back below; until it lands this is INCONCLUSIVE, not a " &
+                "pass."
+        else:
+          warn "settings bind: mod '" & gSbdRows[i].guid & "' was switched " &
+               swBoolText(gSbdRows[i].stagedB) & " on screen and NOTHING was " &
+               "sent -- " &
+               (if rc == 0'i32:
+                  "the overlay's mod table has no row for that guid, so there " &
+                  "is nothing to ask the manager about (the panel poll has " &
+                  "not run, or the manager does not know this mod)"
+                elif rc == -1'i32:
+                  "the row is PROTECTED; the manager refuses to switch off " &
+                  "the mod serving the request, and so does this"
+                else:
+                  "this overlay was started with no backend port, so it is " &
+                  "read-only and has nothing to ask") &
+               ". The switch is honest about having done nothing rather than " &
+               "appearing to work."
       gSbdRows[i].flushed = true
       gSbdRows[i].staged = false
       wrote = wrote + 1
@@ -767,6 +895,15 @@ proc sbdVerdictConfig(): bool =
 proc sbdTick*() =
   ## The drain rider. Idle cost with the flag off is one boolean compare.
   sbdInitFlags()
+  # V3 FIRST, AND OUTSIDE THE READY GATE. The enable watch is armed by TWO
+  # callers -- `sbdFlush` here and `swReadBackPage` in `settingspages.nim` --
+  # and the second is behind `settingsPages`/`nativeTabsMods`, not behind
+  # `settingsRowsBind`. Draining it only when this feature is on would let an
+  # enable armed by the pages path sit in the table forever, fill it at
+  # SbdMaxEnableWatch, and then silently drop every later one: a verdict that
+  # stops running looks exactly like a verdict that keeps passing.
+  # Idle cost when nothing is armed is one length compare.
+  sbdVerdictEnable()
   if not sbdReady(): return
   if gSbdSaveSeen:
     gSbdSaveSeen = false

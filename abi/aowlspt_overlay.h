@@ -372,6 +372,38 @@ static int32_t aowl_ov_post_take(char* out, int32_t cap, int32_t* ok);
  * exactly the distinction a stalled caller needs in order to name a cause
  * instead of saying "never came back". */
 static int32_t aowl_ov_post_stage(void);
+
+/* --- THE PER-MOD ENABLE LEG, for the native MODS tab -------------------
+ *
+ * CORRECTING A CLAIM THIS REPOSITORY CARRIED IN WRITING. `settingsbind.nim`
+ * and `docs/MOD-ENABLE-PATH.md` said the mod-enable write is
+ * `GET /aowlspt/mods/enable|disable/<guid>` and that closing the gap needed a
+ * one-shot GET on this bridge. MEASURED against the two instruments that
+ * settle it -- `mods/manager/manager.nim:2295-2306` (the route table) and the
+ * command leg of this file's own worker loop -- that is NOT what the F12 mod
+ * manager does. F12 queues `AOWL_CMD_TOGGLE`, which sends
+ * `POST /aowlspt/mods/toggle/<guid>` with `{"enabled":true|false}` and takes
+ * the manager's `toggleLocked` path (absolute state when `enabled` is present,
+ * protected-row refusal, `afterChange()` broadcast, the reply row). The
+ * enable/disable GETs are a DIFFERENT, older route (`overrideLocked`).
+ *
+ * So a native ENABLED switch that must do "exactly what the F12 mod manager
+ * does" needs no new HTTP verb here at all: it needs to enter the SAME command
+ * queue, which is what these two do. `aowl_ov_mod_toggle` is
+ * `aowl_ov_panel_toggle`'s body with the flip removed -- a switch on a settings
+ * screen carries the state the player chose, and flipping whatever the table
+ * last held would race the 1 s panel poll.
+ *
+ * Three states, never two. `aowl_ov_mod_enabled` returns:
+ *    1 / 0  the manager's own answer for this guid
+ *      -2   a row exists, but the manager has not answered about it, so the
+ *           value is only this process's report of what it loaded
+ *      -1   no row at all -- nothing is known, which is not "disabled"
+ * `aowl_ov_mod_toggle` returns 1 queued, 0 no such row, -1 protected (the
+ * manager would refuse it anyway), -2 no backend is configured. */
+static int32_t aowl_ov_mod_enabled(const char* guid);
+static int32_t aowl_ov_mod_pending(const char* guid);
+static int32_t aowl_ov_mod_toggle(const char* guid, int32_t enabled);
 /* Sends the armed POST, if any, and publishes its outcome. Extracted from the
  * worker loop so that ANY long-running worker-thread routine can pump it --
  * see `aowl_ov_settings_verify`, which waits on progress that only this leg
@@ -5222,6 +5254,71 @@ static void aowl_ov_queue_cmd(int32_t kind, const char* arg, int32_t enabled) {
 
 static void aowl_ov_queue(const char* guid, int32_t enabled) {
     aowl_ov_queue_cmd(AOWL_CMD_TOGGLE, guid, enabled);
+}
+
+/* --- the per-mod enable leg. See the forward declarations for why this is a
+ * queued command and not a new HTTP verb. Host thread; the table is the
+ * worker's, so every read of it is under the same lock the worker writes it
+ * under. */
+static int32_t aowl_ov_mod_enabled(const char* guid) {
+    int32_t r = -1;
+    int32_t i;
+    if (!g_ov.started || !guid || !guid[0]) return -1;
+    EnterCriticalSection(&g_ov.cs);
+    for (i = 0; i < g_ov.modCount; i++) {
+        if (strcmp(g_ov.mods[i].guid, guid) == 0) {
+            r = g_ov.mods[i].backendRow ? (g_ov.mods[i].enabled ? 1 : 0) : -2;
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_ov.cs);
+    return r;
+}
+
+/* 1 while a toggle for this guid has been queued and the manager has not yet
+ * confirmed it. A verdict that reads the enable back MUST wait this out, or it
+ * reads the value it just wrote optimistically into the table and can only
+ * ever say yes. */
+static int32_t aowl_ov_mod_pending(const char* guid) {
+    int32_t r = 0;
+    int32_t i;
+    if (!g_ov.started || !guid || !guid[0]) return 0;
+    EnterCriticalSection(&g_ov.cs);
+    for (i = 0; i < g_ov.modCount; i++) {
+        if (strcmp(g_ov.mods[i].guid, guid) == 0) {
+            r = g_ov.mods[i].pending ? 1 : 0;
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_ov.cs);
+    return r;
+}
+
+static int32_t aowl_ov_mod_toggle(const char* guid, int32_t enabled) {
+    int32_t found = 0, prot = 0;
+    int32_t i;
+    int32_t want = enabled ? 1 : 0;
+    if (!g_ov.started || !guid || !guid[0]) return 0;
+    if (g_ov.backendPort <= 0) return -2;
+    EnterCriticalSection(&g_ov.cs);
+    for (i = 0; i < g_ov.modCount; i++) {
+        if (strcmp(g_ov.mods[i].guid, guid) == 0) {
+            found = 1;
+            if (g_ov.mods[i].protectedRow && !want) {
+                prot = 1;
+            } else {
+                g_ov.mods[i].enabled = want;
+                g_ov.mods[i].pending = 1;
+            }
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_ov.cs);
+    if (!found) return 0;
+    if (prot) return -1;
+    g_ov.dataSerial++;
+    aowl_ov_queue_cmd(AOWL_CMD_TOGGLE, guid, want);
+    return 1;
 }
 
 /* The two settings-mode requests. They fully populate the slot (the shared

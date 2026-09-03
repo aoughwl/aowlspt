@@ -2102,6 +2102,15 @@ proc modsTabTickBody() =
   # The FAULT budget still gates it: a feature that has trapped its way to
   # ModsMaxFaults stops touching the screen. A flag is a preference; a fault
   # count is evidence.
+  # THE ENABLE READ-BACK, PRE-FLAG, for the same measured reason the relabel
+  # poll above is pre-flag: it is armed by `swReadBackPage` (which belongs to
+  # `settingsPages`) as well as by `sbdFlush` (which belongs to
+  # `settingsRowsBind`), and its only other driver is `sbdTick`, reached
+  # through `pfxOnPanelUp` -- i.e. through the graphics feature. A verdict that
+  # can only run when a third, unrelated flag is on is a verdict that silently
+  # stops. It returns on a length compare when nothing is armed, and it touches
+  # no game memory at all (the overlay's own table, under the overlay's lock).
+  sbdVerdictEnable()
   if gModsFaults < ModsMaxFaults:
     modsCrumb("STAGE: modsReassertLabels (pre-flag, covers settings pages)")
     modsReassertLabels()

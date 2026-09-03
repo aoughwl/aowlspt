@@ -457,6 +457,46 @@ proc modSetParseSchema(doc: string; guid, name: string; page: var SwPage): bool 
       rawRows.add row
     i = i + 1
   page.rows = modSetGroupByCategory(rawRows)
+  # THE PER-MOD ENABLED SWITCH, first row on the page.
+  #
+  # It is NOT part of the schema and must not be: the schema is the mod's own
+  # settings, and whether the mod runs at all belongs to the mod manager. It is
+  # prepended here, where every mod page is built, so there is exactly one
+  # place a page can acquire one -- rather than in the renderer, where it would
+  # have to be suppressed for host pages, or in `modsBuildPages`, which would
+  # miss any other consumer of `gSwPages`.
+  #
+  # SEEDED FROM THE MANAGER, NOT ASSUMED. `overlayModEnabled` answers with four
+  # states and two of them are not booleans. When the manager has no answer for
+  # this guid -- no panel poll yet, or a mod it does not know -- NO ROW IS
+  # ADDED AT ALL. That is deliberate and it is the whole of rule 8: a switch
+  # seeded from a guess is a switch that, on the next SAVE, writes the guess.
+  # An absent row is visibly incomplete; a wrong one silently disables a mod.
+  let ms = overlayModEnabled(guid)
+  if ms == ovModEnabled or ms == ovModDisabled:
+    var er = SwRow(key: "__enabled", label: "Enabled",
+                   kind: swkToggle, bval: (ms == ovModEnabled),
+                   implemented: true, enableRow: true)
+    var withEnable: seq[SwRow] = @[er]
+    var k = 0
+    while k < page.rows.len and withEnable.len < cSwMaxRows:
+      withEnable.add page.rows[k]
+      k = k + 1
+    if withEnable.len < page.rows.len + 1:
+      warn "mod settings render: the ENABLED switch for '" & guid & "' cost " &
+           "the last schema row its place -- the page is at the " &
+           $cSwMaxRows & "-row cap. The switch is shown and one setting is " &
+           "NOT. Raise cSwMaxRows rather than leaving this unsaid."
+    page.rows = withEnable
+  else:
+    okLog "mod settings render: page '" & guid & "' gets NO enabled switch -- " &
+          "the mod manager has " &
+          (if ms == ovModHostOnly:
+             "not answered about this guid (the row is this process's own " &
+             "report of what it loaded, which is not the selection)"
+           else: "no row for it at all") &
+          ". A switch seeded from a guess would write the guess on the next " &
+          "save; an absent switch is visibly incomplete instead."
   inc gModSetPagesParsed
   result = true
 

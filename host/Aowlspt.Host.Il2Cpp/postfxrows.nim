@@ -1164,6 +1164,14 @@ proc pfxGraySet(cg: Il2CppPtr; free: bool): bool =
   cNuCallVPB(fB, cg, (if free: 1'i32 else: 0'i32))
   result = true
 
+## The two thin wrappers that implement the forward declarations in
+## `settingspages.nim`. ONE implementation of the gray-out, two consumers: the
+## PostFX subtab (whose live verdict derived it) and the MODS tab's per-mod
+## pages, which gray a disabled mod's settings the same way rather than
+## inventing a second mechanism with a second set of offsets.
+proc swRowGrayGroup(ctrl: Il2CppPtr): Il2CppPtr = pfxRowGroup(ctrl)
+proc swRowGraySet(cg: Il2CppPtr; free: bool): bool = pfxGraySet(cg, free)
+
 proc pfxGrayApply(free: bool; applied, declined: var int) =
   ## Every row of OURS except the 'enabled' row itself.
   applied = 0

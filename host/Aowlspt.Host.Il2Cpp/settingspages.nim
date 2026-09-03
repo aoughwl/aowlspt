@@ -187,6 +187,21 @@ type
     ## state at all. Without it a demoted colour row is indistinguishable from a
     ## string row, and the check could only ever say yes.
     declaredColor*: bool
+    ## THIS ROW IS THE MOD'S OWN ENABLED SWITCH, not one of its settings.
+    ##
+    ## It renders as an ordinary `swkToggle` (it IS one -- the same cloned
+    ## `SettingToggle` every other bool row uses), and everything about drawing,
+    ## seeding and reading it back is unchanged. What differs is the ONE thing
+    ## that must differ: where a change goes. A settings row POSTs to
+    ## `/aowlspt/settings/<guid>`; this one is not a setting of the mod at all,
+    ## it is the mod manager's selection, and writing it to the settings route
+    ## would create a config key called `__enabled` that nothing reads while
+    ## the mod stayed exactly as enabled as it was.
+    ##
+    ## A separate FIELD rather than a magic key, because a key comparison in
+    ## the read-back is a string test that a mod author can collide with by
+    ## naming a setting `__enabled`; a field cannot be collided with.
+    enableRow*: bool
 
   SwPage* = object
     id*: string                 ## stable key, e.g. "host"
@@ -233,6 +248,32 @@ const cSwMaxKeyLen = 200
 ## named here.
 ##
 ## Three entry points, and nothing else crosses the boundary:
+## FORWARD DECLARATION into `settingsbind.nim` (included later), for the same
+## reason as the `colorwidget` three below: the ENABLED switch's read-back
+## verdict lives with the other verdicts, not here. Arms V3 for one guid --
+## see `sbdVerdictEnable`.
+proc swEnableWatch(guid: string; want: bool)
+## And its drain, forward-declared here because `modstab.nim` is included
+## before `settingsbind.nim` and drives it (see the call site there for why it
+## needs a second driver).
+proc sbdVerdictEnable()
+## THE GRAY-OUT, forward-declared into `postfxrows.nim` (included later), which
+## is where the two primitives were derived and byte-verified: the walk
+## `SettingControl._blocker@0x88 | _elementBlocker@0xa0 -> UiElementBlocker.
+## Group@0x20`, and the mirror of `MyExtensions::SetUnlockStatus` @0x1d20100
+## (set_alpha 1.0|0.3, set_interactable, set_blocksRaycasts, in that order).
+##
+## REUSED RATHER THAN REDERIVED, deliberately. A second implementation of a
+## gray-out would be a second set of offsets to get wrong, and the PostFX one
+## already has a live verdict behind it. Either can DECLINE (a prefab instance
+## may legitimately have no blocker), and a decline is reported, never treated
+## as done.
+proc swRowGrayGroup(ctrl: Il2CppPtr): Il2CppPtr
+proc swRowGraySet(cg: Il2CppPtr; free: bool): bool
+## Applies that gray-out over one page, from the page's own ENABLED switch.
+## Declared here because `swRenderPage` calls it and is defined first.
+proc swApplyEnableGray(page: var SwPage; why: string)
+
 proc cwBuildForRow(rowClone, parentGo: Il2CppPtr; key, modGuid: string;
                    r, g, b, a: float32): int32
 proc cwRowColor(slot: int32; r, g, b, a: var float32): bool
@@ -1043,6 +1084,63 @@ proc swRenderPage(tabPtr, parentGo: Il2CppPtr; page: var SwPage): int =
            " -- " & $skipped & " row(s) SKIPPED as unsafe (last reason: " &
            lastSkipWhy & ")"
          else: "")
+  # THE MOD'S ENABLED STATE, APPLIED TO WHAT WAS JUST DRAWN. Done here rather
+  # than per-row, because a row cloned before the switch row was read would be
+  # left free while its neighbours were blocked.
+  swApplyEnableGray(page, "render")
+
+proc swApplyEnableGray(page: var SwPage; why: string) =
+  ## A DISABLED MOD'S SETTINGS ARE NOT EDITABLE, and they say so the way this
+  ## game already says it: the `UiElementBlocker` gray-out, through the exact
+  ## primitives the PostFX subtab uses (see the forward declarations above).
+  ##
+  ## The ENABLED switch itself is never grayed -- graying the one control that
+  ## can undo the state is how a mod becomes impossible to switch back on from
+  ## this screen.
+  ##
+  ## THREE OUTCOMES, and the middle one is why this logs at all: `applied` is
+  ## rows whose CanvasGroup was driven, `declined` is rows that have no blocker
+  ## to drive (legitimate on a prefab instance), and a page where every row
+  ## declined is reported as such rather than as a gray-out that worked. A row
+  ## that looks editable while its mod is off is the visible bug; a silent
+  ## count of zero is the invisible one.
+  var free = true
+  var haveSwitch = false
+  var i = 0
+  while i < page.rows.len and i < cSwMaxRows:
+    if page.rows[i].enableRow:
+      haveSwitch = true
+      free = page.rows[i].bval
+    i = i + 1
+  if not haveSwitch: return
+  var applied = 0
+  var declined = 0
+  i = 0
+  while i < page.rows.len and i < cSwMaxRows:
+    if not page.rows[i].enableRow and page.rows[i].clone != 0'u64:
+      let ctrl = cast[Il2CppPtr](page.rows[i].clone)
+      let cg = swRowGrayGroup(ctrl)
+      if cg == nil: declined = declined + 1
+      elif swRowGraySet(cg, free): applied = applied + 1
+      else: declined = declined + 1
+    i = i + 1
+  if applied == 0 and declined == 0:
+    okLog "settings pages: gray-out for '" & page.id & "' (" & why &
+          ") examined NO rows -- the page has an enabled switch and no other " &
+          "rendered row. Nothing was done and nothing was wrong."
+  elif applied == 0:
+    warn "settings pages: gray-out for '" & page.id & "' (" & why & ") is " &
+         "INCONCLUSIVE -- all " & $declined & " row(s) declined: none of them " &
+         "exposes a UiElementBlocker to drive. The mod reads " &
+         (if free: "ENABLED" else: "DISABLED") & " and its rows look " &
+         "editable either way. This is NOT a working gray-out."
+  else:
+    okLog "settings pages: gray-out for '" & page.id & "' (" & why & ") -- " &
+          $applied & " row(s) set " & (if free: "FREE" else: "BLOCKED") &
+          " through UiElementBlocker.Group" &
+          (if declined > 0: ", " & $declined & " declined (no blocker on the " &
+                            "prefab instance; those rows stay editable)"
+           else: "")
 
 proc swHexNib(v: int): string =
   const digits = "0123456789abcdef"
@@ -1164,7 +1262,36 @@ proc swReadBackPage(page: var SwPage) =
         okLog "settings pages: row '" & page.rows[i].key & "' changed " &
               swBoolText(page.rows[i].bval) & " -> " & swBoolText(live) &
               " in game"
-        if page.modGuid.len > 0:
+        if page.rows[i].enableRow:
+          # THE MOD'S OWN ENABLED SWITCH. Not a setting: this is the mod
+          # manager's selection, and it goes through the F12 panel's own
+          # command queue (`POST /aowlspt/mods/toggle/<guid>`), never through
+          # `/aowlspt/settings/<guid>`. See `SwRow.enableRow`.
+          let rc = overlayModToggle(page.modGuid, live)
+          if rc == 1'i32:
+            swEnableWatch(page.modGuid, live)
+            page.rows[i].bval = live
+            # Immediately, so the page reflects the state the player chose
+            # rather than waiting on the manager's 1 s confirmation. The
+            # verdict above is what says whether that state actually took;
+            # this is only the screen keeping up.
+            swApplyEnableGray(page, "the switch moved")
+          else:
+            # The row is NOT updated, so the switch springs back to what is
+            # actually true on the next read rather than showing a state
+            # nobody applied.
+            warn "settings pages: the ENABLED switch for '" & page.modGuid &
+                 "' was moved to " & swBoolText(live) & " and NOTHING was " &
+                 "sent -- " &
+                 (if rc == 0'i32:
+                    "the overlay's mod table has no row for that guid"
+                  elif rc == -1'i32:
+                    "the row is PROTECTED and the manager would refuse it"
+                  else:
+                    "no backend port is configured, so the overlay is " &
+                    "read-only") &
+                 ". The switch will read back as the manager's own answer."
+        elif page.modGuid.len > 0:
           # A mod page: the file that would change is the mod's, not ours, and
           # it lives across a process boundary -- POST it, and take the value
           # only optimistically (see `modsettingsrender.swModSetDrainPost` for

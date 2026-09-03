@@ -71,6 +71,10 @@ proc cOvTakeEditKick(): int32 {.importc: "aowl_ov_take_edit_kick", nodecl.}
 proc cOvPostStage(): int32 {.importc: "aowl_ov_post_stage", nodecl.}
 proc cOvPostTake(buf: ptr char; cap: int32; ok: ptr int32): int32 {.
   importc: "aowl_ov_post_take", nodecl.}
+proc cOvModEnabled(guid: cstring): int32 {.importc: "aowl_ov_mod_enabled", nodecl.}
+proc cOvModPending(guid: cstring): int32 {.importc: "aowl_ov_mod_pending", nodecl.}
+proc cOvModToggle(guid: cstring; enabled: int32): int32 {.
+  importc: "aowl_ov_mod_toggle", nodecl.}
 proc cOvSetPrePresent(fn: pointer) {.importc: "aowl_ov_set_pre_present", nodecl.}
 proc cOvSetPreResize(fn: pointer) {.importc: "aowl_ov_set_pre_resize", nodecl.}
 
@@ -253,6 +257,52 @@ proc overlayPostTake*(): tuple[got: bool, ok: bool, body: string] =
   while i < int(n):
     result.body.add buf[i]
     inc i
+
+type
+  OvModState* = enum
+    ovModUnknown      ## no row at all -- NOT "disabled"
+    ovModHostOnly     ## a row exists, the manager has not answered about it
+    ovModDisabled
+    ovModEnabled
+
+proc overlayModEnabled*(guid: string): OvModState =
+  ## What the MOD MANAGER says about this guid, as the overlay's 1 s panel
+  ## poll last heard it -- the same table the F12 rows are drawn from, so the
+  ## native MODS tab and the F12 panel cannot disagree about a mod's state.
+  ##
+  ## FOUR STATES, and the two negative ones are the point. `ovModUnknown` is
+  ## "nothing is known", which a caller must not fold into "off": seeding a
+  ## switch to off from an unknown and then saving would DISABLE a mod the
+  ## player never touched. `ovModHostOnly` is a row this process pushed in
+  ## itself (`overlaySetMod`) that the manager has not confirmed -- honest
+  ## about the library being loaded, not authoritative about the selection.
+  var g = guid
+  let r = cOvModEnabled(toCString(g))
+  result = ovModUnknown
+  if r == 1'i32: result = ovModEnabled
+  elif r == 0'i32: result = ovModDisabled
+  elif r == -2'i32: result = ovModHostOnly
+
+proc overlayModPending*(guid: string): bool =
+  ## True while a queued toggle for this guid is unconfirmed. A read-back
+  ## verdict that ignores this is reading its own optimistic write and cannot
+  ## fail.
+  var g = guid
+  cOvModPending(toCString(g)) != 0'i32
+
+proc overlayModToggle*(guid: string; enabled: bool): int32 =
+  ## Ask for this mod to be enabled/disabled, THROUGH THE F12 PANEL'S OWN
+  ## COMMAND QUEUE -- `POST /aowlspt/mods/toggle/<guid>` `{"enabled":..}`,
+  ## sent by the overlay worker on its own thread, answered by the manager's
+  ## `toggleLocked` (absolute state, protected-row refusal, `afterChange()`
+  ## broadcast). Not a second implementation of the gesture: the same one.
+  ##
+  ## Returns 1 queued, 0 no such guid in the table, -1 the row is protected
+  ## (the manager would refuse it too), -2 no backend port is configured so
+  ## the overlay is read-only. A caller must report every non-1 by name -- a
+  ## switch that says nothing is the defect this repository produces most.
+  var g = guid
+  cOvModToggle(toCString(g), if enabled: 1'i32 else: 0'i32)
 
 proc overlaySyncAttempts*(): int32 =
   ## How many times the worker has FIRED a fetch for whatever path is
