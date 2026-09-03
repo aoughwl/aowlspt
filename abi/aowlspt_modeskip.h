@@ -176,9 +176,35 @@ typedef struct AowlMskTarget {
 
 static const AowlMskTarget aowl_msk_targets[] = {
     /* [0] EFT.UI.CharacterSelectionScreen::ShowSlot -- the READ-ONLY capture
-     * point. A POSTFIX detour, so the saved argument registers are still the
-     * ones the caller passed. Never suppresses the original: the screen is
-     * allowed to build itself normally, and is dismissed a frame later.
+     * point. A PREFIX detour since eb39963: ShowSlot uses SIX register slots
+     * (`this` + 4 declared arguments + IL2CPP's hidden trailing MethodInfo*),
+     * and a POSTFIX thunk on more than four shifts the caller's stack
+     * arguments. At PREFIX ENTRY the saved registers are exactly the ones the
+     * caller passed. Never suppresses the original: the screen is allowed to
+     * build itself normally, and is dismissed a frame later.
+     *
+     * WHAT EACH SAVED SLOT HOLDS -- MEASURED, `il2cpp_resolve.py disasm
+     * 0x13efae0`, whose own argument tracing prints:
+     *   slot 0 RCX = this: CharacterSelectionScreen
+     *   slot 1 RDX = CharacterSelectionSlotViewBase slotView
+     *   slot 2 R8  = EGameMode gameMode        (32-bit enum; read as R8D)
+     *   slot 3 R9  = CharacterSelectionProfileData profileData
+     *   slot 4     = controller  -- ON THE STACK at entry_rsp+0x28
+     *   slot 5     = MethodInfo* -- ON THE STACK at entry_rsp+0x30
+     * Corroborated inside the body: `mov r13,r9` / `mov edi,r8d` at +0x1d/+0x20,
+     * `test r13,r13` guarding the empty-slot path, and
+     * `mov rax,[rsp+0xf0]` -- which after `push rbx/rbp/rdi/r13` and
+     * `sub rsp,0xa8` is exactly entry_rsp+0x28, the controller.
+     *
+     * AND WHY READING R8/R9 IS NOT A SUBSTITUTE FOR THE SLOT VIEW'S FIELDS BUT
+     * THE SAME VALUES ONE CALL EARLIER: at +0x727 ShowSlot does
+     * `mov r8,r13 ; mov edx,edi ; call 0x13f3ca0`
+     * = `CharacterSelectionSlotViewBase::Show(gameMode, profileData, viewModel)`,
+     * and that method at +0xdd/+0xe4 does
+     * `mov [rbx+0x160], r12d`  -> `_gameMode@0x160`
+     * `mov [rbx+0x178], r13`   -> `_profileData@0x178`.
+     * So ShowSlot's R8/R9 ARE what those two fields become. At PREFIX entry the
+     * fields are still 0 -- that is why reading them there pressed nothing.
      *
      *   44 89 44 24 18    mov  [rsp+0x18], r8d      ; gameMode
      *   48 89 4C 24 08    mov  [rsp+0x08], rcx      ; this
@@ -403,5 +429,57 @@ static void aowl_msk_call_submit(void* fn, void* controller,
     if (!fn || !controller) return;
     ((AowlMsk_Submit)fn)(controller, gameMode, profileData, NULL);
 }
+
+/* ---- KLASS IDENTITY: the check that can actually fail ------------------ *
+ *
+ * `aowl_msk_readable` proves a page is mapped. It does NOT prove the pointer
+ * is a `CharacterSelectionProfileData`, and the crash of 2026-09-02 was
+ * exactly that failure: `EGameMode.Pve == 1` sitting where a profile belongs,
+ * which no page check can distinguish from an object.
+ *
+ * The type name is MEASURED, not assumed:
+ *   `il2cpp_resolve.py find CharacterSelectionProfileData`
+ *     -> 8775 EFT.CharacterSelectionProfileData  (1 hit, searched EXHAUSTIVELY)
+ *
+ * THREE OUTCOMES, never two. 1 = the klass names that type. 0 = it names
+ * something ELSE -- a positive mismatch, and refused. -1 = no name could be
+ * read at all, which is INCONCLUSIVE and is logged as such; on its own it does
+ * NOT refuse, because the caller has already passed ProfileId string equality,
+ * which is a strictly stronger identity test than a name compare (an integer
+ * cannot carry a matching 24-hex-digit profile id). Making an unreadable name
+ * a refusal would let one bad layout inference kill the whole feature.
+ */
+#define AOWL_MSK_PD_TYPE   "EFT.CharacterSelectionProfileData"
+#define AOWL_MSK_KLASS_MAX 400
+
+/* A FORWARD DECLARATION, not a second implementation.
+ * `aowl_comp_klass_fullname` is defined in `abi/aowlspt_components.h`, which
+ * `inspect.nim` includes LATER in this SAME translation unit (modeskip.nim and
+ * inspect.nim are both `include`d into aowlhost.nim, so there is one C file
+ * and the order is the include order). C permits a `static` function to be
+ * declared before it is defined; copying the klass->name reader in here would
+ * mean two implementations and therefore two possible answers to one question
+ * -- and the inspector's `component` verb has already proven THAT reader
+ * against live objects on THIS build. */
+static int32_t aowl_comp_klass_fullname(const void *klass, char *out, int32_t cap);
+
+static char aowl_msk_klassbuf[AOWL_MSK_KLASS_MAX];
+
+static int32_t aowl_msk_klass_is_pd(void* obj) {
+    void* klass = NULL;
+    aowl_msk_klassbuf[0] = 0;
+    if (!obj) return -1;
+    if (!aowl_msk_readable(obj, sizeof(void*))) return -1;
+    memcpy(&klass, obj, sizeof(void*));
+    if (!klass) return -1;
+    if (!aowl_msk_readable(klass, 0x20)) return -1;
+    if (!aowl_comp_klass_fullname(klass, aowl_msk_klassbuf,
+                                  AOWL_MSK_KLASS_MAX)) return -1;
+    return strcmp(aowl_msk_klassbuf, AOWL_MSK_PD_TYPE) == 0 ? 1 : 0;
+}
+
+/* Whatever the last `aowl_msk_klass_is_pd` read, so a refusal can NAME the
+ * type it actually found instead of asserting a cause with no evidence. */
+static const char* aowl_msk_klass_name(void) { return aowl_msk_klassbuf; }
 
 #endif /* AOWLSPT_MODESKIP_H */

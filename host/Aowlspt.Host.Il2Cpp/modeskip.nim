@@ -133,14 +133,45 @@ proc cMskReadPtr(base: Il2CppPtr; off: int32): Il2CppPtr {.
   importc: "aowl_msk_read_ptr", nodecl.}
 proc cMskReadI32(base: Il2CppPtr; off: int32): int32 {.
   importc: "aowl_msk_read_i32", nodecl.}
+## KLASS IDENTITY, three-valued: 1 = names EFT.CharacterSelectionProfileData,
+## 0 = names something ELSE (refuse), -1 = no name readable (INCONCLUSIVE).
+## `cMskKlassName` returns whatever the last call read, so a refusal can name
+## the type it found instead of asserting a cause.
+proc cMskKlassIsPd(obj: Il2CppPtr): int32 {.
+  importc: "aowl_msk_klass_is_pd", nodecl.}
+proc cMskKlassName(): cstring {.importc: "aowl_msk_klass_name", nodecl.}
 
 const
   # `EFT.UI.CharacterSelectionSlotViewBase`, from the offline derivation
-  # (docs/AOWL_FACTS.md). These are the two arguments `Submit` takes, and they
-  # are read from the slot view the game handed us -- NOT from the argument
-  # registers, which is where the previous call got them and got them wrong.
+  # (docs/AOWL_FACTS.md). These are the two arguments `Submit` takes.
+  #
+  # THEY ARE A LATE CROSS-CHECK, NOT THE SOURCE. `ShowSlot` is a PREFIX detour,
+  # and at PREFIX ENTRY these fields have not been written yet: the host log of
+  # boot 20:41 (build 0a9d871) line 416 reads "NOTHING WAS PRESSED -- the slot
+  # view's `_profileData` @0x178 read back as 0x0", and the client parked on the
+  # character screen. `ShowSlot` writes them LATER in its own body, at +0x727:
+  #     mov r8, r13 ; mov edx, edi ; call 0x13f3ca0
+  #       = CharacterSelectionSlotViewBase::Show(gameMode, profileData, vm)
+  #   and Show @0x13f3ca0 +0xdd/+0xe4 does
+  #     mov [rbx+0x160], r12d   -> _gameMode@0x160
+  #     mov [rbx+0x178], r13    -> _profileData@0x178
+  # where `edi` is ShowSlot's R8D and `r13` is ShowSlot's R9. So the ARGUMENT
+  # REGISTERS AT ENTRY ARE THE SAME TWO VALUES, one call earlier -- measured
+  # with `il2cpp_resolve.py disasm`, not inferred from the method names.
+  #
+  # The registers are therefore what is captured; these offsets are re-read at
+  # SUBMIT time (hundreds of ms later, by which point the client has populated
+  # them) purely so the two can be COMPARED. A disagreement is logged loudly and
+  # the FIELD wins, because the field is what a player's click would pass.
   MskSlotGameModeOff = 0x160'i32   ## _gameMode      EGameMode, int32
   MskSlotProfileOff  = 0x178'i32   ## _profileData   CharacterSelectionProfileData
+  MskStatusAvailable = 2'i32
+    ## `EFT.ECharacterSelectionProfileStatus`: Locked=0, Empty=1, Available=2,
+    ## InRaid=3 -- MEASURED from the metadata `HASDEFAULT` constants and written
+    ## up in docs/BOOT-FLOW-MAP.md §4.4, which also measures that `SubmitAsync`
+    ## itself refuses `Status == 0` and only proceeds on `Status == 2`. The old
+    ## comment here said the enum was not knowable offline; it is, and this is
+    ## the value.
 
 const
   MskTShowSlot = 0'i32                 ## EFT.UI.CharacterSelectionScreen::ShowSlot
@@ -320,6 +351,11 @@ var gModeSkipSlotView: Il2CppPtr = nil     ## ShowSlot RDX: the slot view
 var gModeSkipScreen: Il2CppPtr = nil       ## ShowSlot RCX: the screen
 var gModeSkipPendingView: Il2CppPtr = nil  ## the MATCHING slot's view
 var gModeSkipPendingScreen: Il2CppPtr = nil
+var gModeSkipArgFromRegs = false
+  ## The Submit pair currently held came from `ShowSlot`'s ARGUMENT REGISTERS
+  ## (R8D/R9) rather than from the slot view's fields, because at PREFIX entry
+  ## the fields are not written yet. `modeSkipSubmitBody` re-reads the fields
+  ## later and flips this to false if they agree or supersede.
 var gModeSkipPressedOk = false             ## the Apply press went through
 var gModeSkipPressWhy = ""                 ## why it did not
 var gModeSkipPressAtTick = 0               ## drain tick of the press
@@ -429,27 +465,60 @@ proc modeSkipSlotBody(a: Il2CppPtr): Il2CppPtr {.
          $gModeSkipSlotMode & " profileId=" & idStr &
          " nickname=\"" & nickStr & "\" status=" & $status & " side=" & $side
 
-  # THE PREDICATE: ProfileId equality, and nothing else. `status` is logged
-  # above but deliberately NOT gated on -- the integer that means "Available"
-  # is not something this host knows (the enum's constants are in metadata
-  # `fieldDefaultValues`, which no resolver verb exposes), and gating on a
-  # guessed enum value would be a guessed offset in another costume. Equality
-  # is strictly stronger: an EMPTY slot carries no ProfileId to match.
+  # THE PREDICATE: ProfileId equality first, and it is the strong one -- an
+  # EMPTY slot carries no ProfileId to match, and an integer masquerading as a
+  # pointer cannot carry a matching 24-hex-digit id.
   if cMskProfileIs(pd, cast[cstring](addr gModeSkipWantBuf[0])) == 0'i32:
+    return
+
+  # THE KLASS CHECK. Readability is not identity: the 2026-09-02 minidump had
+  # `EGameMode.Pve == 1` sitting where a Profile belongs, and every page check
+  # in the world says nothing about that. Three outcomes, never two.
+  let klassVerdict = cMskKlassIsPd(pd)
+  if klassVerdict == 0'i32:
+    warn "skip mode screen: NOT ANSWERING -- the profileData in R9 (0x" &
+         hexOf(cast[uint64](pd)) & ") is a `" & $cMskKlassName() &
+         "`, not an EFT.CharacterSelectionProfileData. Nothing was pressed."
+    return
+  if klassVerdict < 0'i32:
+    info "skip mode screen: the klass of the R9 profileData could not be " &
+         "named (INCONCLUSIVE, not a pass). Proceeding on ProfileId equality, " &
+         "which is the stronger test and has already matched."
+
+  # THE STATUS GATE. MEASURED (docs/BOOT-FLOW-MAP.md §4.4): the client's own
+  # `SubmitAsync` refuses `Status == 0` and its bypass path proceeds only on
+  # `Status == 2 (Available)`; ShowSlot itself compares `[profileData+0x20]`
+  # against 2 twice. Locked/Empty/InRaid must not be pressed.
+  if status != MskStatusAvailable:
+    warn "skip mode screen: NOT ANSWERING -- profile " & idStr &
+         " matched launchProfileId but its Status@0x20 is " & $status &
+         ", not " & $MskStatusAvailable &
+         " (Available). Locked=0 Empty=1 Available=2 InRaid=3. Nothing was " &
+         "pressed; the screen is left for the player."
     return
 
   if gModeSkipPending:
     return                                   # already have one; first wins
   gModeSkipPendingPd = pd
   gModeSkipPendingView = gModeSkipSlotView
-  # THE TWO ARGUMENTS, READ OFF THE SLOT VIEW ITSELF. The click a player makes
-  # runs `CharacterSelectionSlotViewBase::OnActionButtonPressed` @0x13F61B0,
-  # which calls `Selected(_gameMode, _profileData)` -- i.e. it passes THESE
-  # FIELDS, not whatever happened to be in the argument registers at ShowSlot.
-  # Taking them from the registers is what put an EGameMode where a Profile
-  # belongs and produced `Profile == 1` in the crash dump.
-  gModeSkipArgMode = cMskReadI32(gModeSkipSlotView, MskSlotGameModeOff)
-  gModeSkipArgPd = cMskReadPtr(gModeSkipSlotView, MskSlotProfileOff)
+  # THE TWO ARGUMENTS, TAKEN FROM `ShowSlot`'S OWN ARGUMENT REGISTERS.
+  #
+  # This is a PREFIX detour. At entry the slot view's `_gameMode`@0x160 and
+  # `_profileData`@0x178 HAVE NOT BEEN WRITTEN -- boot 20:41 read 0x0 out of
+  # 0x178 and pressed nothing. `ShowSlot` writes them itself, further down its
+  # own body, by calling `CharacterSelectionSlotViewBase::Show(gameMode,
+  # profileData, viewModel)` @0x13f3ca0 with edx = its own R8D and r8 = its own
+  # R9; `Show` then stores rdx -> +0x160 and r8 -> +0x178. So R8/R9 at entry are
+  # not a substitute for the fields, they are literally the values the fields
+  # are about to hold. Measured with `il2cpp_resolve.py disasm`, both bodies.
+  #
+  # The click path a player takes -- `OnActionButtonPressed` @0x13F61B0 ->
+  # `Selected(_gameMode, _profileData)` -> `Submit` -- passes those same fields,
+  # so this is still the player's pair. `modeSkipSubmitBody` re-reads the fields
+  # at press time, when they ARE populated, and prefers them if they disagree.
+  gModeSkipArgMode = cast[int32](cast[uint32](gModeSkipSlotMode))  # R8D
+  gModeSkipArgPd = pd                                             # R9
+  gModeSkipArgFromRegs = true
   gModeSkipPendingScreen = gModeSkipScreen
   gModeSkipPendingMode = gModeSkipSlotMode
   gModeSkipPending = true
@@ -469,6 +538,14 @@ proc modeSkipCtorFired(regs: Il2CppPtr) =
   ## PREFIX on `CharacterSelectionScreenController::.ctor`. Captures `this`.
   ## This is a single register read and a pointer compare; it dereferences
   ## nothing, so it needs no guarded body of its own.
+  ##
+  ## AT CTOR ENTRY NOTHING IS INITIALISED -- not one field of the object in RCX,
+  ## and that is exactly the hazard that made the ShowSlot prefix read 0x0 out
+  ## of `_profileData`. So this reads `this` AND NOTHING ELSE, forever. Anything
+  ## the feature needs about the controller's contents must come from a later
+  ## call that has been handed it -- `ShowSlot`'s arguments, in practice.
+  ## The .ctor uses 8 register slots (`this` + 6 declared arguments + the hidden
+  ## MethodInfo*), which is the other reason it is a prefix and not a postfix.
   if gModeSkipOff or not gModeSkipOn:
     return
   let raw = cRegsInt(regs, 0'i32)              # RCX = the controller `this`
@@ -483,6 +560,7 @@ proc modeSkipCtorFired(regs: Il2CppPtr) =
   gModeSkipController = ctl
   gModeSkipPending = false
   gModeSkipPendingPd = nil
+  gModeSkipArgFromRegs = false
   gModeSkipSlotsSeen = 0
   # A NEW controller means a NEW screen, so the previous screen's Submit must
   # not be mistaken for this one's -- otherwise the very first slot of a second
@@ -521,10 +599,25 @@ proc modeSkipCtorFired(regs: Il2CppPtr) =
 
 proc modeSkipShowSlotFired(regs: Il2CppPtr) =
   ## PREFIX on `EFT.UI.CharacterSelectionScreen::ShowSlot`.
-  ##   RCX = this (the screen)   RDX = slotView
-  ##   R8  = gameMode (EGameMode) R9 = profileData
-  ## The fourth argument, `controller`, is on the STACK and is therefore NOT
-  ## reachable here -- which is why it is captured from the .ctor instead.
+  ##   slot 0  RCX = this (the screen)
+  ##   slot 1  RDX = slotView                 (CharacterSelectionSlotViewBase)
+  ##   slot 2  R8D = gameMode                 (EGameMode, a 32-bit enum)
+  ##   slot 3  R9  = profileData              (CharacterSelectionProfileData)
+  ##   slot 4  STACK entry_rsp+0x28 = controller
+  ##   slot 5  STACK entry_rsp+0x30 = MethodInfo*
+  ## MEASURED with `il2cpp_resolve.py disasm 0x13efae0`, which prints that arg
+  ## mapping itself and whose 16 prologue bytes match this feature's signature
+  ## table exactly. The two stack slots are the reason this is a PREFIX and not
+  ## a postfix (eb39963): a postfix thunk on more than four slots shifts them.
+  ##
+  ## The fourth argument, `controller`, is not read here -- it is captured from
+  ## the controller's own .ctor, where it is `this` in RCX. (`aowl_uih_stack_arg`
+  ## could reach it now; that is a change with its own evidence requirement and
+  ## is deliberately NOT made as part of this fix.)
+  ##
+  ## WHAT IS **NOT** READ AT ENTRY: the slot view's `_gameMode`@0x160 and
+  ## `_profileData`@0x178. `ShowSlot` has not written them yet -- that is the
+  ## whole bug this comment exists for.
   if gModeSkipOff or not gModeSkipOn:
     return
   # STAMPED FIRST, AND UNCONDITIONALLY. This timestamp is the readiness signal
@@ -693,7 +786,7 @@ proc modeSkipSubmitBody(a: Il2CppPtr): Il2CppPtr {.
   # site-2 show event.
   if gModeSkipController == nil:
     gModeSkipPressWhy = "the CharacterSelectionScreenController was never " &
-                        "captured (its .ctor postfix did not fire), so there " &
+                        "captured (its .ctor PREFIX did not fire), so there " &
                         "is no receiver for Submit"
     return
   if cIsReadable(gModeSkipController, 0x30'i32) == 0'i32:
@@ -701,18 +794,72 @@ proc modeSkipSubmitBody(a: Il2CppPtr): Il2CppPtr {.
                         hexOf(cast[uint64](gModeSkipController)) &
                         ") is not readable at the moment of use"
     return
+  # ---- RECONCILE: the registers we captured against the fields, NOW ----
+  #
+  # This runs hundreds of milliseconds after `ShowSlot` returned, so by here the
+  # slot view's own `_gameMode`/`_profileData` HAVE been written (ShowSlot ->
+  # CharacterSelectionSlotViewBase::Show @0x13f3ca0 stores them). That makes
+  # this a check that CAN fail: two independently-sourced values for the same
+  # pair, compared. The FIELD wins when both are present, because the field is
+  # exactly what a player's click passes; a mismatch is reported, never hidden.
+  let fieldPd = cMskReadPtr(gModeSkipPendingView, MskSlotProfileOff)
+  let fieldMode = cMskReadI32(gModeSkipPendingView, MskSlotGameModeOff)
+  if fieldPd != nil and cIsReadable(fieldPd, 0x30'i32) != 0'i32:
+    if fieldPd != gModeSkipArgPd or fieldMode != gModeSkipArgMode:
+      warn "skip mode screen: the slot view's fields DISAGREE with the " &
+           "ShowSlot arguments -- _profileData@0x178 = 0x" &
+           hexOf(cast[uint64](fieldPd)) & " vs R9 = 0x" &
+           hexOf(cast[uint64](gModeSkipArgPd)) & "; _gameMode@0x160 = " &
+           $fieldMode & " vs R8D = " & $gModeSkipArgMode & ". Using the " &
+           "FIELDS, which are what a player's click passes."
+    gModeSkipArgPd = fieldPd
+    gModeSkipArgMode = fieldMode
+    gModeSkipArgFromRegs = false
+  else:
+    info "skip mode screen: the slot view's `_profileData`@0x178 still reads " &
+         "0x" & hexOf(cast[uint64](fieldPd)) & " at press time, so the pair " &
+         "captured from ShowSlot's argument registers (R8D/R9) is used. Those " &
+         "are the same two values the view is written FROM -- ShowSlot passes " &
+         "R8D/R9 to CharacterSelectionSlotViewBase::Show @0x13f3ca0, which " &
+         "stores them into 0x160/0x178."
+
   if gModeSkipArgPd == nil or cIsReadable(gModeSkipArgPd, 0x30'i32) == 0'i32:
-    gModeSkipPressWhy = "the slot view's `_profileData` @0x" &
-                        hexOf(uint64(MskSlotProfileOff)) & " read back as 0x" &
-                        hexOf(cast[uint64](gModeSkipArgPd)) & ", which is not " &
-                        "a readable object. NOTHING WAS CALLED"
+    gModeSkipPressWhy = "the profileData is 0x" &
+                        hexOf(cast[uint64](gModeSkipArgPd)) &
+                        ", which is not a readable object. It was read from " &
+                        (if gModeSkipArgFromRegs:
+                           "ShowSlot's REGISTER SLOT 3 (R9, the declared " &
+                           "`CharacterSelectionProfileData profileData` " &
+                           "argument)"
+                         else:
+                           "the slot view's `_profileData` field @0x" &
+                           hexOf(uint64(MskSlotProfileOff))) &
+                        ". NOTHING WAS CALLED"
+    return
+  if cMskKlassIsPd(gModeSkipArgPd) == 0'i32:
+    gModeSkipPressWhy = "the profileData (0x" &
+                        hexOf(cast[uint64](gModeSkipArgPd)) &
+                        ") is a `" & $cMskKlassName() & "`, not an " &
+                        "EFT.CharacterSelectionProfileData. NOTHING WAS CALLED"
+    return
+  if cMskProfileStatus(gModeSkipArgPd) != MskStatusAvailable:
+    gModeSkipPressWhy = "the profileData's Status@0x20 is " &
+                        $cMskProfileStatus(gModeSkipArgPd) & ", not " &
+                        $MskStatusAvailable & " (Available; Locked=0 Empty=1 " &
+                        "InRaid=3). The client's own SubmitAsync refuses that " &
+                        "too. NOTHING WAS CALLED"
     return
   if gModeSkipArgMode < 0 or gModeSkipArgMode > 8:
-    gModeSkipPressWhy = "the slot view's `_gameMode` @0x" &
-                        hexOf(uint64(MskSlotGameModeOff)) & " read back as " &
-                        $gModeSkipArgMode & ", which is not a plausible " &
-                        "EGameMode (Regular=0, Pve=1, PvpSeason=2). NOTHING " &
-                        "WAS CALLED"
+    gModeSkipPressWhy = "the gameMode is " & $gModeSkipArgMode &
+                        ", which is not a plausible EGameMode (Regular=0, " &
+                        "Pve=1, PvpSeason=2). It was read from " &
+                        (if gModeSkipArgFromRegs:
+                           "ShowSlot's REGISTER SLOT 2 (R8D, the declared " &
+                           "`EGameMode gameMode` argument)"
+                         else:
+                           "the slot view's `_gameMode` field @0x" &
+                           hexOf(uint64(MskSlotGameModeOff))) &
+                        ". NOTHING WAS CALLED"
     return
   let fn = cMskFn(MskTSubmit)
   if fn == nil:
@@ -805,7 +952,13 @@ proc modeSkipPressReadback() =
     warn "skip mode screen: the values passed to Submit were controller=0x" &
          hexOf(cast[uint64](gModeSkipController)) & ", EGameMode=" &
          $gModeSkipArgMode & ", profileData=0x" &
-         hexOf(cast[uint64](gModeSkipArgPd)) & ", MethodInfo=0. Nothing was " &
+         hexOf(cast[uint64](gModeSkipArgPd)) & ", MethodInfo=0, sourced from " &
+         (if gModeSkipArgFromRegs:
+            "ShowSlot's argument registers (slot 2 = R8D gameMode, slot 3 = " &
+            "R9 profileData)"
+          else:
+            "the slot view's fields (_gameMode@0x160, _profileData@0x178)") &
+         ". Nothing was " &
          "pressed and no screen state was written by this host, so the " &
          "selection screen is exactly as the client left it."
     warn "skip mode screen: NO READBACK. Submit was called " &
