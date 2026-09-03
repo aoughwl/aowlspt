@@ -248,3 +248,18 @@ Other known DRS ids (emoose): `0x10E41DF4` FORCE_DLAA, `0x10E41DF5` scaling rati
 * **Whether `DLSSCommands` console commands can flip the preset at runtime.** Not enumerated.
 * The two WebFetch-refused pages (NVIDIA custhelp 5620, VideoCardz) were read only through
   search-engine summaries; NVIDIA's own DLSS 4.5 news page was read in full.
+
+## 8. MEASURED 2026-09-03: where the game's DLSS setting lives, and the whole install proven
+
+* The client's REAL consistency manifest is an AES blob appended to `EscapeFromTarkov.exe`
+  (see `tools/consistency.py`); the plain `ConsistencyInfo` is the launcher's copy. `dlss.py
+  install` now re-injects it; `files-checker_000.log` read `Consistency ensurance is succeed`
+  on the patched exe (09:19:47).
+* The game persists its graphics settings to
+  `%APPDATA%\Battlestate Games\Escape from Tarkov\Settings\Graphics.ini` (JSON despite the
+  name) on SAVE. After selecting Quality through the game's own dropdown
+  (`BaseDropDownBox` item Button click via the inspector) and preset K, and pressing SAVE:
+  `"DLSSMode": "Quality"`, `"DLSSPreset": "K"`, `"DLSSEnabled": true` (11:48:06).
+* No route is hit on the backend for this save, and no NGX line appears in `Player.log`
+  either way; the rendering-side proof is the NVIDIA on-screen indicator
+  (`ShowDlssIndicator`), which only a human can read.
