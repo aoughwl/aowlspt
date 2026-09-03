@@ -581,6 +581,111 @@ proc ntNoteFault(what: string) =
 # through here, so this compares `this` against at most `NtMaxTabs` pointers
 # and returns. It logs NOTHING unless one of ours matched.
 # ---------------------------------------------------------------------------
+## ---- WHERE THE STRIP SITS IN THE SIBLING LIST -------------------------
+##
+## THE DEFECT, reported by the user on the deployed build: the strip drew
+## ABOVE EVERYTHING, including each panel's 'Overlay Layer/SettingsTooltip'.
+## Every stock tab and panel draws UNDER the tooltip; ours drew over it.
+##
+## THE CAUSE was one line, `nuSetAsLastSibling(stripT)`, and the comment next
+## to it -- "sibling order IS raycast order" -- was true and was the wrong
+## conclusion. In a Unity canvas sibling order is BOTH draw order and raycast
+## order, and LAST means topmost in both. That is right for a floating overlay
+## with nothing else to answer to; it is wrong for a strip that is furniture
+## of the screen and must live in the same stacking band as the tab bar.
+##
+## THE FIX IS A POSITION, NOT A Z-HACK: the strip goes at the FRONT of the
+## list, before the tab bar and before every '* Settings' panel, so it draws
+## under all of them and under their tooltips.
+##
+## WHY IT STILL RECEIVES ITS CLICKS, and this is the part that must be checked
+## rather than asserted: a bottom sibling only loses a click to something that
+## OVERLAPS it. The body offset (`ntBodyApply`) already moves both panels out
+## of the strip's 128..174 px band, and the tab bar sits above that band. So
+## nothing overlaps the strip and index 0 costs nothing -- but if that ever
+## stops being true the strip goes inert with no other symptom, which is why
+## the verdict below measures the overlap instead of trusting this paragraph.
+##
+## DEVIATION, STATED: the request was "immediately after the 'Toggles' tab bar
+## (index 3)". There is no `UnityEngine.Transform::SetSiblingIndex` in the
+## target table -- only SetAsFirstSibling / SetAsLastSibling -- and adding one
+## means editing the ABI header, which correctly drops every cache and forces
+## a full rebuild. Reaching index 3 without it would mean moving the GAME'S
+## OWN tab bar to index 0, i.e. writing stock draw order to fix ours. FIRST
+## satisfies the stated property exactly ("strip index < index of every
+## '* Settings' panel") and writes nothing but our own object.
+proc ntStripOrder(stripT: Il2CppPtr): bool =
+  result = nuFirstSibling(stripT)
+  if not result:
+    warn "gfx strip: SetAsFirstSibling was refused, so the strip keeps " &
+         "whatever sibling index it has -- if that is LAST it will draw over " &
+         "the panels' SettingsTooltip, which is the reported defect. Nothing " &
+         "else was changed."
+
+proc ntStripOrderVerdict() =
+  ## THE NEGATIVE, read back one frame later off `Transform::GetSiblingIndex`:
+  ## NO '* Settings' panel has a LOWER sibling index than the strip.
+  ##
+  ## FAIL looks like: any panel at an index below the strip's (the strip is
+  ## drawing over that panel and over its tooltip), or the strip's band
+  ## intersecting the tab bar's (at index 0 an overlapping sibling would
+  ## swallow every click and the strip would look disabled while
+  ## `m_Interactable` is true).
+  if not gNtSubBuilt or gNtSubKind != NtSubPanels: return
+  if gNtSubStripGo == nil: return
+  let stripT = modsTransformOf(gNtSubStripGo)
+  let screenT = modsParentOf(stripT)
+  if stripT == nil or screenT == nil:
+    warn "gfx strip ORDER VERDICT INCONCLUSIVE: the strip's transform or its " &
+         "parent could not be read, so no sibling index can be compared."
+    return
+  let (sok, sidx) = nuSiblingIndex(stripT)
+  if not sok:
+    warn "gfx strip ORDER VERDICT INCONCLUSIVE: Transform::GetSiblingIndex " &
+         "refused on the strip. 'I could not look' is not a pass."
+    return
+  var n = 0
+  if not iChildCount(screenT, n):
+    warn "gfx strip ORDER VERDICT INCONCLUSIVE: the SettingsScreen's " &
+         "childCount could not be read."
+    return
+  var panels = 0
+  var above = 0
+  var firstAbove = ""
+  var togIdx = -1
+  var i = 0
+  while i < n and i < 48:
+    let c = iChildAt(screenT, i)
+    if c != nil and duOk(c, 0x20'i32):
+      let nm = iObjName(c)
+      if nm == "Toggles": togIdx = i
+      if modsNameHas(nm, "Settings") and c != stripT:
+        panels = panels + 1
+        if i < sidx:
+          above = above + 1
+          if firstAbove.len == 0: firstAbove = nm & " at index " & $i
+    i = i + 1
+  if panels == 0:
+    warn "gfx strip ORDER VERDICT INCONCLUSIVE: not one '* Settings' panel " &
+         "was found among the SettingsScreen's " & $n & " child(ren), so " &
+         "there is nothing to compare the strip against."
+    return
+  if above > 0:
+    warn "gfx strip ORDER VERDICT FAIL: the strip is at sibling index " &
+         $sidx & " and " & $above & " of " & $panels & " '* Settings' " &
+         "panel(s) sit BELOW it (first: " & firstAbove & "), so the strip " &
+         "draws over those panels and over their 'Overlay Layer/" &
+         "SettingsTooltip'. Every stock tab draws UNDER the tooltip; this is " &
+         "the reported defect, read back from Transform::GetSiblingIndex."
+    return
+  okLog "gfx strip ORDER VERDICT PASS: the strip is at sibling index " &
+        $sidx & " and NO '* Settings' panel (of " & $panels &
+        ") has a lower index, so it draws under every panel and under their " &
+        "SettingsTooltip. The 'Toggles' tab bar is at index " &
+        (if togIdx >= 0: $togIdx else: "NOT FOUND") &
+        ". Read back from Transform::GetSiblingIndex one frame after the " &
+        "change, not from the call that made it."
+
 ## THE POSTFX GRAY-OUT RIDES THIS DRAIN. Forward-declared because
 ## `postfxrows.nim` is `include`d after this file; the alternative -- a second
 ## physical detour on `UnityEngine.UI.Toggle::Set` -- would overwrite this
@@ -1789,7 +1894,7 @@ proc ntBuildGfxStrip(screenT: Il2CppPtr): bool =
     let le = modsComponent(stripT, "LayoutElement")
     if le != nil and nuSetIgnoreLayout(le, true):
       gNtStripIgnoreLayout = true
-  discard nuSetAsLastSibling(stripT)      # sibling order IS raycast order
+  discard ntStripOrder(stripT)   # UNDER the panels and their tooltips
   gNtSubStripGo = stripGo
   gNtSubBuilt = true
   gNtSubN = made
@@ -1994,8 +2099,9 @@ proc ntBuildSubtabs(screenT: Il2CppPtr; captions: seq[string];
            "not be read, so whether it is the reason a subtab refuses a click " &
            "is UNKNOWN. Forcing it usable anyway."
     discard nuCgMakeUsable(stripCg)
-  # DRAW ON TOP AND RECEIVE THE CLICK. Sibling order is raycast order.
-  discard nuSetAsLastSibling(stripT)
+  # UNDER THE PANELS, AND STILL CLICKABLE BECAUSE NOTHING OVERLAPS IT.
+  # See ntStripOrder: LAST made the strip draw over every SettingsTooltip.
+  discard ntStripOrder(stripT)
   gNtSubStripGo = stripGo
   gNtSubBuilt = true
   gNtSubN = made
@@ -3148,6 +3254,7 @@ proc ntTickBody() =
     gNtVerdictDue = gNtVerdictDue - 1
     if gNtVerdictDue == 0 and gNtSubBuilt and gNtSubKind == NtSubPanels:
       ntSubVerdict(gNtWhyNext)
+      ntStripOrderVerdict()
       gNtWhyNext = "steady state"
   elif gNtSubBuilt and gNtSubKind == NtSubRows and gNtShown >= 0:
     ntSubVerdict("mod subtab selection")
