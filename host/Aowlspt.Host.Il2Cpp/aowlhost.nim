@@ -9782,7 +9782,7 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
          "subtab. The top row loses its POSTFX button (SetActive(false) -- " &
          "HIDDEN, never destroyed, and restored if the feature faults out) " &
          "and both the Graphics and PostFX panels gain a cloned two-button " &
-         "strip, GRAPHICS SETTINGS | POSTFX, that switches the two STOCK " &
+         "strip, GENERAL | POSTFX, that switches the two STOCK " &
          "panels. Neither panel is cloned or written to; only their active " &
          "state is driven, because the game switches panels by ESettingsGroup " &
          "and a subtab of ours is not one."

@@ -191,8 +191,17 @@ var gPfxRowCtrl: seq[Il2CppPtr] = @[]
 var gPfxScrollInit = false
 var gPfxScrollOn = false           ## `settingsPostFxScroll`, DEFAULT OFF
 var gPfxScrollGo: Il2CppPtr = nil  ## the cloned SettingsList we own
-var gPfxScrollContentT: Il2CppPtr = nil  ## the row parent we made the content
+var gPfxScrollHostT: Il2CppPtr = nil     ## ...its transform (the scroll host)
+var gPfxScrollContentT: Il2CppPtr = nil  ## the clone's Content -- the new root
+var gPfxScrollBarT: Il2CppPtr = nil      ## the clone's Scrollbar
 var gPfxScrollSaid = false
+## The AUTHORED `SettingsPanel`: the object and the rect it had BEFORE we
+## touched anything. The rect is what the scroll region must reproduce, and
+## the object is what `_settingsRoot@0xa0` is put back to on tear-down -- the
+## tab holds that field, and leaving it pointing at a clone we destroyed is a
+## dangling managed reference in the game's own object.
+var gPfxOrigRootT: Il2CppPtr = nil
+var gPfxOrigGeom = nuNoGeom()
 
 ## ---- the gray-out (defect 3) -------------------------------------------
 var gPfxGrayInit = false
@@ -200,6 +209,19 @@ var gPfxGrayOn = false             ## `settingsPostFxGrayOut`, DEFAULT OFF
 var gPfxGrayApplied = false        ## the state currently written to the rows
 var gPfxGrayHave = false           ## ...and whether it has ever been written
 var gPfxGraySaid = false
+## THE TWO TOGGLES THE ROWS FOLLOW. `gPfxStockTog` is the GAME'S own 'Enable
+## PostFX' in `EnablePanel` -- the one the user actually unchecked while our
+## 26 rows stayed live -- and `gPfxOwnTog` is our own 'Enable post-process'
+## row. The rows are free only when BOTH are on.
+var gPfxStockTog: Il2CppPtr = nil
+var gPfxOwnTog: Il2CppPtr = nil
+var gPfxStockOn = false
+var gPfxOwnOn = false
+## WHICH STATES WERE ACTUALLY OBSERVED. A PASS may only ever be claimed for a
+## state the run really reached; these are what let the summary say so out
+## loud instead of implying both were checked.
+var gPfxSeenFree = false
+var gPfxSeenBlocked = false
 ## THE STOCK DONOR GEOMETRY, read live and captured once per build. See
 ## `pfxDonorGeom`. `gPfxParentW` is the row parent's own rect width, and it is
 ## what the finished-state check measures every row against -- a row wider than
@@ -312,6 +334,7 @@ proc pfxDestroyAll(): int =
   gPfxRowCtrl = @[]
   gPfxGrayHave = false
   gPfxGrayApplied = false
+  gPfxOwnTog = nil
   gPfxBuilt = false
 
 proc pfxDonorTmp(): Il2CppPtr =
@@ -527,40 +550,98 @@ proc pfxMakeRow(prefab, parent: Il2CppPtr; r: PfxRow; idx: int32;
   ctrlOut = row
   result = go
 
-proc pfxScrollify(rowParent: Il2CppPtr): bool =
-  ## DEFECT 2. Give the PostFX page the SAME scroll structure the Graphics page
-  ## has, by cloning the Graphics page's own `SettingsList` -- ScrollRect,
-  ## Viewport, Content, Scrollbar and all -- rather than assembling one.
+proc pfxRetireKids(parentT: Il2CppPtr): int =
+  ## SetActive(false) on every child, capped. NEVER Destroy: `Object.Destroy`
+  ## is deferred to end of frame, so a destroyed node is still walkable, still
+  ## counted and still readable for the rest of the frame -- a verdict that ran
+  ## in that window would report a tree that no longer exists (the map's
+  ## Destroy trap).
+  result = 0
+  var n = 0
+  if parentT == nil or not iChildCount(parentT, n): return
+  var i = 0
+  while i < n and i < 64:
+    let c = iChildAt(parentT, i)
+    if c != nil and duOk(c, 0x20'i32):
+      let go = iGameObjectOf(c)
+      if go != nil and modsSetActive(go, false): result = result + 1
+    i = i + 1
+
+proc pfxMoveKids(fromT, toT: Il2CppPtr): int =
+  ## Move every child of `fromT` under `toT`, LAST FIRST. Walking forwards is
+  ## the bug: `SetParent` removes the child from the source list, so indices
+  ## shift under the loop and every second child is skipped. Backwards, the
+  ## indices below the cursor are untouched.
+  result = 0
+  var n = 0
+  if fromT == nil or toT == nil or not iChildCount(fromT, n): return
+  var i = n - 1
+  var steps = 0
+  while i >= 0 and steps < 64:
+    let c = iChildAt(fromT, i)
+    if c != nil and duOk(c, 0x20'i32):
+      if nuParentTransform(c, toT, false): result = result + 1
+    i = i - 1
+    steps = steps + 1
+
+proc pfxScrollify(tab, rowParent: Il2CppPtr; newRootOut: var Il2CppPtr): bool =
+  ## DEFECT 2, SECOND ATTEMPT -- and the first one is worth stating, because
+  ## the verdict that blessed it is the exact failure 9b is about.
   ##
-  ## WHY A CLONE AND NOT AN AddComponent: a `ScrollRect` built from scratch has
-  ## every serialized reference null (`m_Viewport`, the Viewport's
-  ## `Mask`/`RectMask2D`, the Content's `ContentSizeFitter`, both scrollbars),
-  ## and `nuAdd` has no ScrollRect kind and no attested `.data` cache slot for
-  ## one. `Object.Instantiate` copies the whole wiring AND remaps the internal
-  ## references to the clone's own children, which is the part that cannot be
-  ## reproduced by hand.
+  ## WHAT THE FIRST ATTEMPT DID: cloned the Graphics page's `SettingsList`,
+  ## moved `SettingsPanel` (the row parent) into the clone's Viewport, and
+  ## pointed `ScrollRect.m_Content@0x20` at it. The verdict then compared
+  ## `m_Content` against the row parent and two heights -- and passed.
   ##
-  ## WHAT MUST SURVIVE: `PostFXSettingsTab._settingsRoot@0xa0` is the row
-  ## parent for the game's OWN stock rows as well as our 27, and the tab holds
-  ## that pointer. So the row parent's IDENTITY is never changed -- it is MOVED
-  ## into the cloned Viewport and made the ScrollRect's `m_Content`.
-  ## `EnablePanel` stays where it is, a sibling under `Panel`, deliberately:
-  ## the game's own enable toggle belongs above the scrolled body, not inside
-  ## it.
+  ## WHAT WAS ACTUALLY ON SCREEN (inspector, 2026-09-03 12:16):
+  ##   * the clone sat top-LEFT of the 930-wide panel: anchors (0,1)-(0,1),
+  ##     pivot (0,1), anchoredPosition (0,-59), sizeDelta (850,726) -- an inset
+  ##     box, not the space `SettingsPanel` used to occupy;
+  ##   * its Viewport resolved to 750x686 while `SettingsPanel` inside it kept
+  ##     a FIXED 850x726 with pivot (0.5,0.5) -- 100 px WIDER than the viewport
+  ##     that was supposed to clip it, with nothing driving its height;
+  ##   * the donor `Content` was still an ACTIVE 1490 px tall object sitting in
+  ##     the same Viewport, so the Viewport had TWO children.
+  ## Every one of those is a geometry fact the verdict never looked at.
   ##
-  ## THE CLONE'S OWN `Content` IS RETIRED, NOT DESTROYED -- `SetActive false`.
-  ## The map's Destroy trap: `Object.Destroy` is deferred to end of frame, so a
-  ## destroyed node is still walkable, still counted and still readable for the
-  ## rest of the frame, and a verdict that ran in that window would report a
-  ## tree that no longer exists.
+  ## SO THE SHAPE IS FIXED BY CONSTRUCTION, not by adjustment:
+  ##
+  ##   1. `SettingsPanel`'s AUTHORED geometry is captured BEFORE anything is
+  ##      touched, and given verbatim to the CLONE ROOT. The scroll region then
+  ##      occupies precisely the space the authored panel occupied -- no
+  ##      constant is involved and it is resolution-independent.
+  ##   2. The clone's Viewport is STRETCHED to the clone root (anchors
+  ##      (0,0)-(1,1), sizeDelta (0,0)), so viewport rect == the authored
+  ##      SettingsPanel rect. The donor's own centred 750-wide viewport is
+  ##      exactly the inset the user saw and is not kept.
+  ##   3. THE CONTENT IS THE CLONE'S OWN `Content`, not `SettingsPanel`. This
+  ##      is the part that removes a whole class of defect instead of patching
+  ##      it: the donor Content already carries the LayoutGroup and
+  ##      ContentSizeFitter that DRIVE its height, already has top-stretch
+  ##      anchors (0,1)-(1,1) with pivot (0.5,1), and already is what the
+  ##      cloned ScrollRect names. Nothing has to be added, and `nuAdd` has no
+  ##      attested ContentSizeFitter kind, so adding one was never available.
+  ##      The rows MOVE into it and `_settingsRoot@0xa0` is repointed at it, so
+  ##      the game's own future stock rows land there too.
+  ##   4. The donor's 33 rows are retired FIRST (SetActive false), so the
+  ##      ContentSizeFitter recomputes from our rows alone -- a layout group
+  ##      skips inactive children. The emptied `SettingsPanel` is retired whole,
+  ##      so the Viewport ends with exactly ONE active child.
   result = false
+  newRootOut = nil
   if gPfxScrollGo != nil: return true
   if gGfxPanelT == nil or gGfxPostT == nil: return false
   if not iUnityAlive(gGfxPanelT) or not iUnityAlive(gGfxPostT): return false
-  # THE DONOR, reached by WALKING the measured path and validating each hop --
-  # "Graphics Settings" -> "Other Settings" -> "SettingsList" (inspector,
-  # 2026-09-03). A depth-limited name search is the fallback, not the first
-  # choice, because a name search can find a DIFFERENT SettingsList.
+  # (1) THE AUTHORED RECT, read before we write anything anywhere. Without it
+  # there is nothing to size the scroll region to and nothing to restore, so
+  # this is a refusal, not a fallback.
+  let og = nuReadGeom(rowParent)
+  if not og.ok:
+    pfxNoteFault("the authored geometry of _settingsRoot (the SettingsPanel " &
+                 "the scroll region must exactly replace) could not be read, " &
+                 "so there is no rect to size the clone to. Nothing was " &
+                 "cloned and the page is untouched.")
+    return
   var donorT = modsChildNamed(modsChildNamed(gGfxPanelT, "Other Settings"),
                               "SettingsList")
   if donorT == nil:
@@ -569,30 +650,21 @@ proc pfxScrollify(rowParent: Il2CppPtr): bool =
     pfxNoteFault("the Graphics page's 'SettingsList' (the ScrollRect donor) " &
                  "could not be reached by walking 'Graphics Settings' -> " &
                  "'Other Settings' -> 'SettingsList', nor found by name " &
-                 "within 4 levels. Nothing was cloned and the PostFX page is " &
-                 "exactly as it was.")
+                 "within 4 levels. Nothing was cloned.")
     return
-  let donorSr = modsComponent(donorT, "ScrollRect")
-  if donorSr == nil:
+  if modsComponent(donorT, "ScrollRect") == nil:
     pfxNoteFault("the node found as the Graphics 'SettingsList' carries no " &
                  "ScrollRect, so it is NOT the scroll host and cloning it " &
-                 "would graft a container with no scrolling into the PostFX " &
-                 "page. Refused; nothing was cloned.")
+                 "would graft a container that cannot scroll. Refused.")
     return
   let panelT = modsChildNamed(gGfxPostT, "Panel")
-  if panelT == nil or not duOk(panelT, 0x20'i32) or not iUnityAlive(panelT):
-    pfxNoteFault("'PostFX Settings' -> 'Panel' could not be reached, so " &
-                 "there is nowhere to put the scroll host. Nothing was " &
-                 "cloned.")
-    return
+  let panelGo = (if panelT != nil: iGameObjectOf(panelT) else: nil)
   let donorGo = iGameObjectOf(donorT)
-  let panelGo = iGameObjectOf(panelT)
-  if donorGo == nil or panelGo == nil:
-    pfxNoteFault("the donor SettingsList or the PostFX 'Panel' has no " &
-                 "reachable GameObject, so it could be neither cloned nor " &
-                 "parented. Nothing was cloned.")
+  if panelT == nil or panelGo == nil or donorGo == nil:
+    pfxNoteFault("'PostFX Settings' -> 'Panel' or the donor SettingsList has " &
+                 "no reachable GameObject, so there is nowhere to put a " &
+                 "scroll host and nothing to clone. The page is untouched.")
     return
-  let dg = nuReadGeom(donorT)
   let cloneGo = modsClone(donorGo)
   let cloneT = (if cloneGo != nil: modsTransformOf(cloneGo) else: nil)
   if cloneGo == nil or cloneT == nil:
@@ -606,105 +678,138 @@ proc pfxScrollify(rowParent: Il2CppPtr): bool =
                  "scene root, where it would render over the screen.")
     discard nuDestroy(cloneGo)
     return
-  # SetParentAndAlign zeroes the local pose, so the donor's OWN geometry is
-  # re-applied afterwards. Read from the live donor, never a constant: this
-  # user runs 1.5x display scaling and a transcribed pixel is wrong on the
-  # next machine.
-  if dg.ok:
-    discard nuLayout(cloneT, dg.aMinX, dg.aMinY, dg.aMaxX, dg.aMaxY,
-                     dg.pivX, dg.pivY, dg.sdX, dg.sdY, dg.posX, dg.posY)
+  # (1) THE CLONE ROOT BECOMES THE AUTHORED PANEL, exactly.
+  if not nuLayout(cloneT, og.aMinX, og.aMinY, og.aMaxX, og.aMaxY,
+                  og.pivX, og.pivY, og.sdX, og.sdY, og.posX, og.posY):
+    pfxNoteFault("the authored SettingsPanel geometry could not be applied " &
+                 "to the clone root, so the scroll region would sit wherever " &
+                 "the donor happened to sit -- the inset box the user saw. " &
+                 "The clone is destroyed.")
+    discard nuDestroy(cloneGo)
+    return
   let sr = modsComponent(cloneT, "ScrollRect")
   let viewportT = modsChildNamed(cloneT, "Viewport")
   let contentT = (if viewportT != nil: modsChildNamed(viewportT, "Content")
                   else: nil)
   if sr == nil or viewportT == nil or contentT == nil:
-    pfxNoteFault("the clone is missing " &
-                 (if sr == nil: "its ScrollRect"
-                  elif viewportT == nil: "its 'Viewport' child"
-                  else: "its 'Viewport/Content' child") &
-                 ", so it cannot host anything. It is destroyed and the " &
-                 "PostFX page is left exactly as it was.")
+    var missing = "its 'Viewport/Content' child"
+    if sr == nil: missing = "its ScrollRect"
+    elif viewportT == nil: missing = "its 'Viewport' child"
+    pfxNoteFault("the clone is missing " & missing & ", so it cannot host " &
+                 "anything. It is destroyed and the PostFX page is left " &
+                 "exactly as it was.")
     discard nuDestroy(cloneGo)
     return
-  # RETIRE the donor rows the clone brought with it. SetActive false, capped,
-  # and never Destroy (see the header note above).
-  var retired = 0
-  var kids = 0
-  if iChildCount(contentT, kids):
-    var i = 0
-    while i < kids and i < 64:
-      let c = iChildAt(contentT, i)
-      if c != nil and duOk(c, 0x20'i32):
-        let cgo = iGameObjectOf(c)
-        if cgo != nil and modsSetActive(cgo, false): retired = retired + 1
-      i = i + 1
-  # MOVE the real row parent into the clone's Viewport and give it the
-  # Content's authored anchoring, keeping its OWN height: the row parent has
-  # its own LayoutGroup and its own resolved height, and overwriting that with
-  # the donor Content's would be inventing a number.
-  let cg = nuReadGeom(contentT)
-  let rg = nuReadGeom(rowParent)
-  if not nuParentTransform(rowParent, viewportT, false):
-    pfxNoteFault("_settingsRoot could not be reparented into the cloned " &
-                 "Viewport. The clone is destroyed and the rows stay exactly " &
-                 "where they already are -- unscrolled, but intact.")
+  # (2) THE VIEWPORT FILLS THE CLONE ROOT. The donor's viewport is a centred
+  # 750-wide inset of an 850-wide list; kept, it is the 100 px of unclipped
+  # overhang the user reported.
+  if not nuLayout(viewportT, 0.0'f32, 0.0'f32, 1.0'f32, 1.0'f32,
+                  0.5'f32, 0.5'f32, 0.0'f32, 0.0'f32, 0.0'f32, 0.0'f32):
+    pfxNoteFault("the cloned Viewport could not be stretched to the clone " &
+                 "root, so it would clip at the donor's own inset width. The " &
+                 "clone is destroyed.")
     discard nuDestroy(cloneGo)
     return
-  if cg.ok and rg.ok:
-    discard nuLayout(rowParent, cg.aMinX, cg.aMinY, cg.aMaxX, cg.aMaxY,
-                     cg.pivX, cg.pivY, cg.sdX, rg.sdY, cg.posX, cg.posY)
-  # The clone's own Content is now redundant; retire it whole.
-  let contentGo = iGameObjectOf(contentT)
-  if contentGo != nil: discard modsSetActive(contentGo, false)
-  # THE ONE WRITE THAT MATTERS: `ScrollRect.m_Content@0x20` (MEASURED,
-  # `fldoff.py fields UnityEngine.UI.ScrollRect`). Read first -- a field that
-  # cannot be read is not a field that may be written.
-  if not nuOk(sr, NuOffScrollContent + 8'i32):
-    pfxNoteFault("the cloned ScrollRect's m_Content@0x20 could not be READ, " &
-                 "so it is not written either. The clone is destroyed.")
+  # (4) DONOR ROWS OUT FIRST, so the ContentSizeFitter never sees them plus
+  # ours and resolves a 1490 px content that scrolls past the end.
+  let retired = pfxRetireKids(contentT)
+  # (3) OUR ROWS IN, and `_settingsRoot` repointed at the thing that now holds
+  # them. The tab's field is written LAST of the three so that a refusal
+  # anywhere above leaves it naming the panel that still holds the rows.
+  let moved = pfxMoveKids(rowParent, contentT)
+  if moved <= 0:
+    pfxNoteFault("not one row could be moved from SettingsPanel into the " &
+                 "cloned Content, so the rows are still in the unscrolled " &
+                 "panel. The clone is destroyed and _settingsRoot is " &
+                 "untouched -- nothing is half-moved.")
     discard nuDestroy(cloneGo)
     return
-  if cNuSetRef(sr, NuOffScrollContent, rowParent) == 0'i32:
-    pfxNoteFault("the write to the cloned ScrollRect's m_Content@0x20 was " &
-                 "refused by the writability check. The clone is destroyed " &
-                 "rather than left pointing at its own retired Content.")
+  if not nuOk(sr, NuOffScrollContent + 8'i32) or
+     not nuOk(tab, PfxOffSettingsRoot + 8'i32):
+    pfxNoteFault("ScrollRect.m_Content@0x20 or PostFXSettingsTab." &
+                 "_settingsRoot@0xa0 could not be READ, so neither is " &
+                 "written. The rows have already moved into the cloned " &
+                 "Content; they are moved back and the clone destroyed.")
+    discard pfxMoveKids(contentT, rowParent)
     discard nuDestroy(cloneGo)
     return
+  if cNuSetRef(sr, NuOffScrollContent, contentT) == 0'i32 or
+     cNuSetRef(tab, PfxOffSettingsRoot, contentT) == 0'i32:
+    pfxNoteFault("the write to m_Content@0x20 or _settingsRoot@0xa0 was " &
+                 "refused by the writability check. The rows are moved back " &
+                 "into SettingsPanel and the clone destroyed, so the page is " &
+                 "unscrolled but intact.")
+    discard pfxMoveKids(contentT, rowParent)
+    discard nuDestroy(cloneGo)
+    return
+  # (4) THE EMPTIED PANEL GOES DOWN, leaving the Viewport with exactly one
+  # active child. An empty-but-active 850x726 box in the viewport is still a
+  # raycast target and still a layout participant.
+  let oldGo = iGameObjectOf(rowParent)
+  if oldGo != nil: discard modsSetActive(oldGo, false)
+  # (5) THE SCROLLBAR. Only touched if it is NOT already right-anchored, and
+  # then only with numbers read off itself -- its own resolved width. A
+  # scrollbar outside the panel is a visible defect and the verdict checks it
+  # either way.
+  let barT = modsChildNamed(cloneT, "Scrollbar")
+  var barFixed = false
+  if barT != nil:
+    let bg = nuReadGeom(barT)
+    if bg.ok and bg.aMinX < 0.99'f32:
+      barFixed = nuLayout(barT, 1.0'f32, 0.0'f32, 1.0'f32, 1.0'f32,
+                          1.0'f32, 0.5'f32, bg.rectW, 0.0'f32,
+                          0.0'f32, 0.0'f32)
   gPfxScrollGo = cloneGo
-  gPfxScrollContentT = rowParent
-  okLog "postfx rows: SCROLL GRAFT applied -- cloned the Graphics page's own " &
-        "'SettingsList' (ScrollRect + Viewport + Content + Scrollbar) under " &
-        "'PostFX Settings'/'Panel', retired " & $retired & " donor row(s) " &
-        "from the clone with SetActive(false) (never Destroy -- a destroyed " &
-        "node is still walkable for the rest of the frame), moved " &
-        "_settingsRoot@0xa0 into the clone's Viewport and pointed " &
-        "ScrollRect.m_Content@0x20 at it. EnablePanel was NOT moved: the " &
-        "game's enable toggle stays above the scrolled body. The verdict " &
-        "below reads all of that back off the live components."
+  gPfxScrollHostT = cloneT
+  gPfxScrollContentT = contentT
+  gPfxScrollBarT = barT
+  gPfxOrigRootT = rowParent
+  gPfxOrigGeom = og
+  newRootOut = contentT
+  okLog "postfx rows: SCROLL GRAFT (v2) applied -- the clone root was given " &
+        "the AUTHORED SettingsPanel rect verbatim (" & nuGeomNote(og) &
+        "), its Viewport stretched to fill that root, " & $retired &
+        " donor row(s) retired, " & $moved & " row(s) MOVED into the clone's " &
+        "own Content (which already carries the LayoutGroup + " &
+        "ContentSizeFitter that drive height -- nothing was AddComponent'd), " &
+        "and BOTH ScrollRect.m_Content@0x20 and PostFXSettingsTab." &
+        "_settingsRoot@0xa0 repointed at it. The emptied SettingsPanel was " &
+        "retired so the Viewport has exactly one active child. Scrollbar " &
+        (if barT == nil: "NOT FOUND"
+         elif barFixed: "re-anchored to the right edge from its own width"
+         else: "left as authored (already right-anchored)") &
+        ". Every claim here is re-read by the verdict below."
   result = true
 
 proc pfxScrollVerdict(rowParent: Il2CppPtr) =
-  ## REPLACES the INCONCLUSIVE this file used to print. The old verdict asked
-  ## `modsComponent(gGfxPostT, "ScrollRect")` -- a GetComponent on the PANEL
-  ## ROOT, not a search of its children -- so it could only ever answer "no
-  ## ScrollRect", which is precisely the shape of check that cannot fail.
+  ## GEOMETRY, one frame later, off the live tree. The previous verdict read
+  ## `m_Content` and two heights and passed on a visibly broken page; every
+  ## check below is one of the facts it failed to look at.
   ##
-  ## FOUR readings, all off live components, none of them our own write:
-  ##   1. a ScrollRect exists under 'PostFX Settings';
-  ##   2. its `m_Content@0x20` IS the row parent (`_settingsRoot@0xa0`);
-  ##   3. the content's resolved height EXCEEDS the viewport's -- if it does
-  ##      not, there is nothing to scroll and a scrollbar would be decoration;
-  ##   4. the scrollbar GameObject is active in the hierarchy.
-  let host = (if gPfxScrollGo != nil: modsTransformOf(gPfxScrollGo)
+  ## FAIL LOOKS LIKE, precisely:
+  ##   * viewport rect not equal (+-1 px) to the authored SettingsPanel rect
+  ##     -> the scroll region is not where the panel was: the inset box;
+  ##   * content anchors not top-stretch (0,1)-(1,1) pivot y 1, or content
+  ##     width != viewport width -> nothing drives the content and it will
+  ##     overhang, which is the 850-in-a-750 defect;
+  ##   * more than one ACTIVE child under the Viewport -> a retired object is
+  ##     still live in there (the 1490 px donor Content);
+  ##   * any active row wider than the viewport -> a row is clipped or spills;
+  ##   * two consecutive rows whose y ranges intersect -> the rows are stacked
+  ##     on each other because no layout group is driving them;
+  ##   * the scrollbar rect not inside the panel rect -> it is drawn outside
+  ##     the page;
+  ##   * content no taller than the viewport -> there is nothing to scroll.
+  ## INCONCLUSIVE is a third outcome throughout and is never a pass.
+  let host = (if gPfxScrollHostT != nil: gPfxScrollHostT
               else: modsFindNamed(gGfxPostT, "SettingsList", 4))
   let sr = (if host != nil: modsComponent(host, "ScrollRect") else: nil)
   if sr == nil:
     warn "postfx rows SCROLL VERDICT INCONCLUSIVE: no ScrollRect was found " &
-         "under 'PostFX Settings' at all, so whether our row parent is the " &
-         "thing that scrolls could not be asked. NOTE this is now a search " &
-         "of the panel's CHILDREN; the previous verdict asked GetComponent " &
-         "on the panel root, where a ScrollRect was never going to be, and " &
-         "therefore could only ever answer INCONCLUSIVE."
+         "under 'PostFX Settings'. NOTE this searches the panel's CHILDREN; " &
+         "the original verdict asked GetComponent on the panel ROOT, where a " &
+         "ScrollRect was never going to be, so it could only ever answer " &
+         "INCONCLUSIVE -- a check that could not fail."
     return
   if not nuOk(sr, NuOffScrollContent + 8'i32):
     warn "postfx rows SCROLL VERDICT INCONCLUSIVE: the ScrollRect was found " &
@@ -712,47 +817,154 @@ proc pfxScrollVerdict(rowParent: Il2CppPtr) =
          "pass."
     return
   let content = cNuGetRef(sr, NuOffScrollContent)
-  if content != rowParent:
+  let want = (if gPfxScrollContentT != nil: gPfxScrollContentT else: rowParent)
+  if content != want:
     warn "postfx rows SCROLL VERDICT FAIL: ScrollRect.m_Content@0x20 is " &
-         iPtr(content) & " ('" & iObjName(content) & "') but our rows are in " &
-         "_settingsRoot@0xa0 at " & iPtr(rowParent) & " ('" &
-         iObjName(rowParent) & "'). Our rows are NOT in the scrolled content, " &
-         "and no change to heights, fitters or layout groups can fix that."
+         iPtr(content) & " ('" & iObjName(content) & "') but the rows are in " &
+         iPtr(want) & " ('" & iObjName(want) & "'). The rows are NOT in the " &
+         "scrolled content and no change to heights or fitters can fix that."
     return
   let viewport = (if nuOk(sr, NuOffScrollViewport + 8'i32):
                     cNuGetRef(sr, NuOffScrollViewport) else: nil)
   let vg = nuReadGeom(viewport)
-  let cgm = nuReadGeom(content)
-  if not vg.ok or not cgm.ok:
-    warn "postfx rows SCROLL VERDICT INCONCLUSIVE: m_Content is correct, but " &
+  let cg = nuReadGeom(content)
+  let pg = nuReadGeom(gGfxPostT)
+  if not vg.ok or not cg.ok:
+    warn "postfx rows SCROLL VERDICT INCONCLUSIVE: m_Content is correct but " &
          (if not vg.ok: "the viewport" else: "the content") &
-         " did not read back a valid rect, so whether there is anything to " &
-         "scroll is unknown."
+         " did not read back a valid rect, so no geometry can be judged."
     return
-  var barActive = false
-  let barT = (if host != nil: modsChildNamed(host, "Scrollbar") else: nil)
-  let barGo = (if barT != nil: iGameObjectOf(barT) else: nil)
-  if barGo != nil: barActive = nuActiveInHierarchy(barGo)
-  if cgm.rectH > vg.rectH and barActive:
-    okLog "postfx rows SCROLL VERDICT PASS: the ScrollRect under 'PostFX " &
-          "Settings' names our row parent as m_Content@0x20, its content " &
-          "resolves to " & nuF(cgm.rectH) & " px against a " & nuF(vg.rectH) &
-          " px viewport (so there IS something to scroll), and the scrollbar " &
-          "reads activeInHierarchy. Every number read from get_rect on the " &
-          "live RectTransforms."
+  var fails = 0
+  var why = ""
+  # 1. the scroll region occupies exactly the authored SettingsPanel space.
+  if gPfxOrigGeom.ok:
+    let dw = vg.rectW - gPfxOrigGeom.rectW
+    let dh = vg.rectH - gPfxOrigGeom.rectH
+    if dw > 1.0'f32 or dw < -1.0'f32 or dh > 1.0'f32 or dh < -1.0'f32:
+      fails = fails + 1
+      if why.len == 0:
+        why = "the viewport resolves to " & nuF(vg.rectW) & "x" &
+              nuF(vg.rectH) & " but the AUTHORED SettingsPanel was " &
+              nuF(gPfxOrigGeom.rectW) & "x" & nuF(gPfxOrigGeom.rectH) &
+              " -- the scroll region is not the space the panel occupied, " &
+              "which is the inset-box defect"
+  # 2. the content is top-stretch and as wide as the viewport.
+  if cg.aMinX > 0.01'f32 or cg.aMaxX < 0.99'f32 or
+     cg.aMinY < 0.99'f32 or cg.aMaxY < 0.99'f32 or cg.pivY < 0.99'f32:
+    fails = fails + 1
+    if why.len == 0:
+      why = "the content anchors are " & nuGeomNote(cg) & ", not the " &
+            "top-stretch (0,1)-(1,1) pivot-y 1 that lets a ContentSizeFitter " &
+            "drive height"
+  let cwd = cg.rectW - vg.rectW
+  if cwd > 1.0'f32 or cwd < -1.0'f32:
+    fails = fails + 1
+    if why.len == 0:
+      why = "the content is " & nuF(cg.rectW) & " px wide against a " &
+            nuF(vg.rectW) & " px viewport, so it overhangs or underfills"
+  # 3. exactly ONE active child under the Viewport.
+  var vkids = 0
+  var activeKids = 0
+  if iChildCount(viewport, vkids):
+    var i = 0
+    while i < vkids and i < 32:
+      let c = iChildAt(viewport, i)
+      if c != nil and duOk(c, 0x20'i32):
+        let go = iGameObjectOf(c)
+        if go != nil and nuActiveInHierarchy(go): activeKids = activeKids + 1
+      i = i + 1
+    if activeKids != 1:
+      fails = fails + 1
+      if why.len == 0:
+        why = $activeKids & " ACTIVE child(ren) under the Viewport, not 1 " &
+              "-- a retired object is still live in the scroll area"
   else:
-    warn "postfx rows SCROLL VERDICT FAIL: m_Content@0x20 is correct, but " &
-         (if cgm.rectH <= vg.rectH:
-            "the content resolves to " & nuF(cgm.rectH) &
+    warn "postfx rows SCROLL VERDICT INCONCLUSIVE: the Viewport's childCount " &
+         "could not be read, so 'exactly one active child' is unknown."
+    return
+  # 4/5. every active row fits, and consecutive rows do not overlap.
+  var rows = 0
+  var tooWide = 0
+  var overlaps = 0
+  var prevBottom = 0.0'f32
+  var havePrev = false
+  var n = 0
+  if iChildCount(content, n):
+    var i = 0
+    while i < n and i < 64:
+      let c = iChildAt(content, i)
+      if c != nil and duOk(c, 0x20'i32):
+        let go = iGameObjectOf(c)
+        if go != nil and nuActiveInHierarchy(go):
+          let rg = nuReadGeom(c)
+          if rg.ok:
+            rows = rows + 1
+            if rg.rectW > vg.rectW + 1.0'f32: tooWide = tooWide + 1
+            let (eok, top, lft) = nuChildEdgeInParent(cg, rg)
+            discard lft
+            if eok:
+              if havePrev and top > prevBottom + 0.5'f32:
+                overlaps = overlaps + 1
+              prevBottom = top - rg.rectH
+              havePrev = true
+      i = i + 1
+  if rows == 0:
+    warn "postfx rows SCROLL VERDICT INCONCLUSIVE: not one ACTIVE row was " &
+         "found under the content, so neither width nor stacking could be " &
+         "judged. An empty scroll area is not a passing scroll area."
+    return
+  if tooWide > 0:
+    fails = fails + 1
+    if why.len == 0:
+      why = $tooWide & " of " & $rows & " active row(s) are wider than the " &
+            nuF(vg.rectW) & " px viewport"
+  if overlaps > 0:
+    fails = fails + 1
+    if why.len == 0:
+      why = $overlaps & " pair(s) of consecutive rows have intersecting y " &
+            "ranges -- the rows are stacked on each other, so no layout " &
+            "group is driving them"
+  # 6. the scrollbar is inside the panel.
+  if gPfxScrollBarT != nil and pg.ok:
+    let bg = nuReadGeom(gPfxScrollBarT)
+    if bg.ok:
+      let (bok, btop, bleft) = nuChildEdgeInParent(pg, bg)
+      discard btop
+      if bok and (bleft < pg.rectX - 1.0'f32 or
+                  bleft + bg.rectW > pg.rectX + pg.rectW + 1.0'f32):
+        fails = fails + 1
+        if why.len == 0:
+          why = "the scrollbar spans " & nuF(bleft) & ".." &
+                nuF(bleft + bg.rectW) & " in a panel that spans " &
+                nuF(pg.rectX) & ".." & nuF(pg.rectX + pg.rectW) &
+                " -- it is drawn outside the page"
+  # 7. and there must be something to scroll at all.
+  if cg.rectH <= vg.rectH:
+    fails = fails + 1
+    if why.len == 0:
+      why = "the content resolves to " & nuF(cg.rectH) &
             " px which is NOT taller than the " & nuF(vg.rectH) &
-            " px viewport, so nothing can scroll -- the row parent has a " &
-            "LayoutGroup but its height is not being driven (a " &
-            "ContentSizeFitter is what does that on the Graphics page)"
-          else:
-            "the 'Scrollbar' child is not activeInHierarchy, so the page " &
-            "scrolls with the wheel and shows the player nothing") & "."
+            " px viewport, so nothing can scroll"
+  if fails == 0:
+    okLog "postfx rows SCROLL VERDICT PASS: viewport " & nuF(vg.rectW) & "x" &
+          nuF(vg.rectH) & " matches the AUTHORED SettingsPanel rect within " &
+          "1 px; the content is top-stretch, " & nuF(cg.rectW) &
+          " px wide (== the viewport) and " & nuF(cg.rectH) &
+          " px tall (so there is something to scroll); the Viewport has " &
+          "exactly ONE active child; all " & $rows & " active row(s) fit " &
+          "inside the viewport width and no two consecutive rows' y ranges " &
+          "intersect; the scrollbar rect is inside the panel rect. Every " &
+          "number read from get_rect on the live RectTransforms one frame " &
+          "after the graft."
+  else:
+    warn "postfx rows SCROLL VERDICT FAIL (" & $fails &
+         " geometry check(s) failed): " & why & ". " & $rows &
+         " active row(s) judged, viewport " & nuF(vg.rectW) & "x" &
+         nuF(vg.rectH) & ", content " & nuF(cg.rectW) & "x" & nuF(cg.rectH) &
+         ", " & $activeKids & " active Viewport child(ren). This is the page " &
+         "the user is looking at, not a summary of what we wrote."
 
-proc pfxEnableToggle(): Il2CppPtr =
+proc pfxOwnToggle(): Il2CppPtr =
   ## The `UpdatableToggle` inside OUR own 'enabled' row -- reached from the
   ## `SettingControl` instance Instantiate handed us, through
   ## `SettingToggle.Toggle@0xa8`. Never by name and never by position.
@@ -763,9 +975,38 @@ proc pfxEnableToggle(): Il2CppPtr =
       let c = gPfxRowCtrl[i]
       if nuOk(c, NuOffSettingToggleTog + 8'i32):
         let t = cNuGetRef(c, NuOffSettingToggleTog)
-        if nuOk(t, 0x18'i32) and nuAlive(t): return t
+        if nuOk(t, NuOffToggleIsOn + 4'i32) and nuAlive(t): return t
       return nil
     i = i + 1
+
+proc pfxStockToggle(): Il2CppPtr =
+  ## THE GAME'S OWN 'Enable PostFX' toggle, in `EnablePanel` -- the one the
+  ## user actually unchecked. Reached by WALKING 'PostFX Settings' -> 'Panel'
+  ## -> 'EnablePanel' and validating each hop, then by SHAPE (`modsToggleOf`,
+  ## which prefers an ACTIVE toggle) rather than by a child name, because the
+  ## panel's single child is a prefab instance whose name is the prefab's and
+  ## not something this file may assume.
+  result = nil
+  if gPfxStockTog != nil and nuAlive(gPfxStockTog): return gPfxStockTog
+  if gGfxPostT == nil or not iUnityAlive(gGfxPostT): return
+  let panelT = modsChildNamed(gGfxPostT, "Panel")
+  if panelT == nil: return
+  let enT = modsChildNamed(panelT, "EnablePanel")
+  if enT == nil or not duOk(enT, 0x20'i32): return
+  var t = modsToggleOf(enT)
+  if t == nil:
+    # The control may hang off the panel's single child rather than the panel.
+    var n = 0
+    if iChildCount(enT, n) and n > 0:
+      let c = iChildAt(enT, 0)
+      if c != nil and duOk(c, 0x20'i32):
+        let ctrl = modsComponent(c, "SettingToggle")
+        if ctrl != nil and nuOk(ctrl, NuOffSettingToggleTog + 8'i32):
+          t = cNuGetRef(ctrl, NuOffSettingToggleTog)
+        if t == nil: t = modsToggleOf(c)
+  if t != nil and nuOk(t, NuOffToggleIsOn + 4'i32) and nuAlive(t):
+    gPfxStockTog = t
+    result = t
 
 proc pfxRowGroup(ctrl: Il2CppPtr): Il2CppPtr =
   ## The CanvasGroup the game's own blocker would drive for this row:
@@ -798,7 +1039,7 @@ proc pfxGraySet(cg: Il2CppPtr; free: bool): bool =
   cNuCallVPB(fB, cg, (if free: 1'i32 else: 0'i32))
   result = true
 
-proc pfxGrayApply(enabled: bool; applied, declined: var int) =
+proc pfxGrayApply(free: bool; applied, declined: var int) =
   ## Every row of OURS except the 'enabled' row itself.
   applied = 0
   declined = 0
@@ -807,14 +1048,23 @@ proc pfxGrayApply(enabled: bool; applied, declined: var int) =
     if i < gPfxRowName.len and gPfxRowName[i] != PfxEnableKey:
       let g = pfxRowGroup(gPfxRowCtrl[i])
       if g == nil: declined = declined + 1
-      elif pfxGraySet(g, enabled): applied = applied + 1
+      elif pfxGraySet(g, free): applied = applied + 1
       else: declined = declined + 1
     i = i + 1
 
-proc pfxGrayVerdict(enabled: bool; applied, declined: int) =
-  ## THE FINISHED STATE, read through the CanvasGroup GETTERS -- a different
-  ## path than the setters that wrote it -- and stated as a NEGATIVE that can
-  ## fail: with the enable toggle OFF, NO row of ours still reads free.
+proc pfxGrayVerdict(free: bool; why: string; applied, declined: int) =
+  ## THE STATE THAT WAS ACTUALLY OBSERVED, NAMED. A PASS may only be claimed
+  ## for a state the run really reached.
+  ##
+  ## THE CHECK THIS REPLACES COULD NOT FAIL: it keyed on OUR row alone, which
+  ## was ON, so it only ever judged the FREE state and printed "with Enable
+  ## post-process ON, no row reads blocked" -- true, vacuous, and PASS while
+  ## 26 rows sat interactive under an UNCHECKED stock toggle. Naming the state
+  ## and reporting whether the OFF state was ever observed is what makes the
+  ## difference visible in the log instead of only on screen.
+  ##
+  ## Read through the CanvasGroup GETTERS -- a different path than the setters
+  ## that wrote -- and stated as a negative: NO row of ours disagrees.
   var judged = 0
   var wrong = 0
   var firstWrong = ""
@@ -826,68 +1076,135 @@ proc pfxGrayVerdict(enabled: bool; applied, declined: int) =
         let (ok, alpha, inter) = nuCgRead(g)
         if ok:
           judged = judged + 1
-          let free = (alpha > 0.9'f32) and inter
-          let blocked = (alpha < 0.9'f32) and not inter
-          if (enabled and not free) or ((not enabled) and not blocked):
+          let isFree = (alpha > 0.9'f32) and inter
+          let isBlocked = (alpha < 0.9'f32) and not inter
+          if (free and not isFree) or ((not free) and not isBlocked):
             wrong = wrong + 1
             if firstWrong.len == 0:
               firstWrong = gPfxRowName[i] & " (alpha " & nuF(alpha) &
                            ", interactable " &
                            (if inter: "true" else: "false") & ")"
     i = i + 1
+  if free: gPfxSeenFree = true
+  else: gPfxSeenBlocked = true
+  let seen = " FREE state observed: " & (if gPfxSeenFree: "yes" else: "no") &
+             "; OFF (blocked) state observed: " &
+             (if gPfxSeenBlocked: "yes" else: "no") &
+             ". A verdict covers ONLY the state named above; the other is " &
+             "UNJUDGED until the user's own toggles reach it -- nothing here " &
+             "ever flips a toggle to manufacture the observation."
   if judged == 0:
     warn "postfx rows GRAY-OUT VERDICT INCONCLUSIVE: not one of our " &
          $gPfxRowCtrl.len & " row(s) exposed a readable CanvasGroup through " &
          "SettingControl._blocker@0x88 -> UiElementBlocker.Group@0x20 (" &
-         $declined & " declined at the walk). Nothing was judged, and 'I " &
-         "could not look' is not a pass."
+         $declined & " declined at the walk). Nothing was judged." & seen
   elif wrong == 0:
-    okLog "postfx rows GRAY-OUT VERDICT PASS: with 'Enable post-process' " &
-          (if enabled: "ON" else: "OFF") & ", NO row of ours reads " &
-          (if enabled: "blocked" else: "free") & " -- all " & $judged &
-          " judged row(s) report CanvasGroup alpha " &
-          (if enabled: "1.0 and interactable"
+    okLog "postfx rows GRAY-OUT VERDICT PASS for the " &
+          (if free: "FREE" else: "BLOCKED") & " state (" & why & "): NO row " &
+          "of ours reads " & (if free: "blocked" else: "free") & " -- all " &
+          $judged & " judged row(s) report CanvasGroup alpha " &
+          (if free: "1.0 and interactable"
            else: "0.3 and non-interactable") &
-          ", read back through get_alpha/get_interactable rather than from " &
-          "what we wrote. " & $applied & " written, " & $declined &
-          " declined for want of a blocker."
+          ", read back through get_alpha/get_interactable and not from what " &
+          "we wrote. " & $applied & " written, " & $declined &
+          " declined for want of a blocker." & seen
   else:
-    warn "postfx rows GRAY-OUT VERDICT FAIL: " & $wrong & " of " & $judged &
-         " judged row(s) do not match the enable toggle, which reads " &
-         (if enabled: "ON" else: "OFF") & ". First: " & firstWrong &
-         ". A row that looks live and is inert (or looks dead and is live) " &
-         "is worse than no gray-out at all."
+    warn "postfx rows GRAY-OUT VERDICT FAIL for the " &
+         (if free: "FREE" else: "BLOCKED") & " state (" & why & "): " &
+         $wrong & " of " & $judged & " judged row(s) disagree. First: " &
+         firstWrong & ". A row that looks live and is inert, or looks dead " &
+         "and is live, is worse than no gray-out at all." & seen
+
+proc pfxGrayEval(why: string) =
+  ## THE EFFECTIVE STATE IS THE AND OF TWO TOGGLES, and that is the whole
+  ## correction. Our rows describe a post-process chain the game's own
+  ## 'Enable PostFX' switch can disable outright, so they must read blocked
+  ## whenever EITHER that stock toggle or our own 'Enable post-process' row is
+  ## off. Keying on ours alone is what let 26 rows stay interactive under an
+  ## unchecked stock toggle while the verdict printed PASS.
+  if not gPfxGrayOn or not gPfxBuilt: return
+  let free = gPfxStockOn and gPfxOwnOn
+  if gPfxGrayHave and free == gPfxGrayApplied: return
+  var applied = 0
+  var declined = 0
+  pfxGrayApply(free, applied, declined)
+  gPfxGrayApplied = free
+  gPfxGrayHave = true
+  pfxGrayVerdict(free, why, applied, declined)
+
+proc pfxOnToggleSet(tog: Il2CppPtr; turnedOn: bool) =
+  ## RIDES THE EXISTING `UnityEngine.UI.Toggle::Set` PREFIX in nativetabs --
+  ## it installs NOTHING. The double-detour rule: a second physical detour on
+  ## Toggle::Set would overwrite the first's trampoline and silently kill the
+  ## subtab strip. It runs inside that body's single `aowl_p_p_seh` and opens
+  ## no guard of its own; the guard is not re-entrant and a nested one DISARMS
+  ## the outer.
+  ##
+  ## Two pointer compares for every toggle in the game, and nothing else in
+  ## the steady state.
+  if not gPfxGrayOn or not gPfxBuilt or gPfxOff: return
+  if tog == nil: return
+  if tog == gPfxStockTog:
+    gPfxStockOn = turnedOn
+    pfxGrayEval("the game's own 'Enable PostFX' toggle went " &
+                (if turnedOn: "ON" else: "OFF") & ", seen on the Toggle::Set " &
+                "drain")
+    return
+  if tog == gPfxOwnTog:
+    gPfxOwnOn = turnedOn
+    pfxGrayEval("our 'Enable post-process' row went " &
+                (if turnedOn: "ON" else: "OFF") & ", seen on the Toggle::Set " &
+                "drain")
 
 proc pfxGrayTick() =
-  ## DEFECT 3, driven by POLLING our own 'enabled' toggle rather than by an
-  ## onValueChanged delegate -- stated plainly because the alternative is not
-  ## available: our rows are UNBOUND, and attaching a callback needs a managed
-  ## `Action`, which needs runtime type injection. Injection is PLAUSIBLE on
-  ## this build and UNPROVEN, so it is not used and nothing pretends it is.
-  ## The poll is one field read and one call on ONE toggle per frame; the 26
-  ## writes happen only on the EDGE, so there is no per-frame allocation.
+  ## DEFECT 3. The EDGES arrive on the Toggle::Set drain above; this is the
+  ## BUILD-TIME initial read and the backstop.
+  ##
+  ## WHY A BACKSTOP AND NOT ONLY THE DRAIN: the drain sees `Set(value, true)`,
+  ## so anything that writes `m_IsOn` without a callback -- the game restoring
+  ## a saved setting, a SetIsOnWithoutNotify on screen open -- is invisible to
+  ## it. The poll is two raw field reads per frame and no allocation, and it
+  ## makes a missed edge a one-frame delay instead of a wrong screen.
+  ##
+  ## NOTHING HERE EVER WRITES A TOGGLE. The user's own switches are read only.
   if not gPfxGrayInit:
     gPfxGrayInit = true
     gPfxGrayOn = readBoolKeyDef("settingsPostFxGrayOut", false)
   if not gPfxGrayOn or not gPfxBuilt: return
-  let tog = pfxEnableToggle()
-  if tog == nil:
+  if gPfxOwnTog == nil: gPfxOwnTog = pfxOwnToggle()
+  let stock = pfxStockToggle()
+  if gPfxOwnTog == nil or stock == nil:
     if not gPfxGraySaid:
       gPfxGraySaid = true
-      warn "postfx rows GRAY-OUT INCONCLUSIVE: our 'enabled' row's " &
-           "UpdatableToggle (SettingToggle.Toggle@0xa8) could not be " &
-           "reached, so there is no state to mirror and NOTHING was written " &
-           "to any row. The other 26 rows are left exactly as they were."
+      warn "postfx rows GRAY-OUT INCONCLUSIVE: " &
+           (if stock == nil:
+              "the GAME'S OWN 'Enable PostFX' toggle could not be reached by " &
+              "walking 'PostFX Settings' -> 'Panel' -> 'EnablePanel'"
+            else:
+              "our own 'enabled' row's UpdatableToggle " &
+              "(SettingToggle.Toggle@0xa8) could not be reached") &
+           ", so the effective state is UNKNOWN and NOTHING was written to " &
+           "any row. Our rows are left exactly as they were -- this declines " &
+           "rather than guessing at half the condition, which is the bug it " &
+           "replaces."
     return
-  let (ok, on) = nuToggleIsOn(tog)
-  if not ok: return
-  if gPfxGrayHave and on == gPfxGrayApplied: return
-  var applied = 0
-  var declined = 0
-  pfxGrayApply(on, applied, declined)
-  gPfxGrayApplied = on
-  gPfxGrayHave = true
-  pfxGrayVerdict(on, applied, declined)
+  # `m_IsOn@0x120`, read raw off both toggles (MEASURED, `fldoff.py field
+  # UnityEngine.UI.Toggle m_IsOn`). At build this IS the initial state; every
+  # frame after, it is the backstop for an edge the drain could not see.
+  let (okS, onS) = nuToggleIsOn(stock)
+  let (okO, onO) = nuToggleIsOn(gPfxOwnTog)
+  if not okS or not okO: return
+  let changed = (onS != gPfxStockOn) or (onO != gPfxOwnOn)
+  gPfxStockOn = onS
+  gPfxOwnOn = onO
+  if not gPfxGrayHave:
+    pfxGrayEval("initial state read from Toggle.m_IsOn@0x120 at build: " &
+                "stock 'Enable PostFX' " & (if onS: "ON" else: "OFF") &
+                ", our 'Enable post-process' " & (if onO: "ON" else: "OFF"))
+  elif changed:
+    pfxGrayEval("a state change seen by the m_IsOn backstop rather than by " &
+                "the Toggle::Set drain (stock " & (if onS: "ON" else: "OFF") &
+                ", ours " & (if onO: "ON" else: "OFF") & ")")
 
 proc pfxBuild(): bool =
   ## Build the catalogue into the live PostFX panel. Called ONCE, from the
@@ -1058,9 +1375,18 @@ proc pfxBuild(): bool =
   if not gPfxScrollInit:
     gPfxScrollInit = true
     gPfxScrollOn = readBoolKeyDef("settingsPostFxScroll", false)
+  var scrollRoot: Il2CppPtr = nil
   if gPfxScrollOn:
-    discard pfxScrollify(parent)
-  pfxScrollVerdict(parent)
+    discard pfxScrollify(tab, parent, scrollRoot)
+  # THE ROW PARENT MAY HAVE MOVED. If the graft succeeded, the rows now live
+  # in the clone's Content and every later measurement -- the width check, the
+  # verdict -- must be against THAT, not against the panel they were built in.
+  # Reading this back rather than assuming it is the difference between the
+  # verdict judging the finished page and judging our intent.
+  let judgeRoot = (if scrollRoot != nil: scrollRoot else: parent)
+  let jg = nuReadGeom(judgeRoot)
+  if jg.ok: gPfxParentW = jg.rectW
+  pfxScrollVerdict(judgeRoot)
   gPfxBuilt = true
   okLog "postfx rows: built " & $built & " NATIVE PREFAB row(s) into " &
         "PostFXSettingsTab._settingsRoot -- " &
@@ -1262,8 +1588,21 @@ proc pfxOnScreenClosed() =
   # `pfxScrollify` return "already done" on a host that no longer exists.
   if gPfxScrollGo != nil and (not duOk(gPfxScrollGo, 0x20'i32) or
                               not iUnityAlive(gPfxScrollGo)):
+    # PUT THE TAB'S FIELD BACK FIRST. `_settingsRoot@0xa0` was repointed at the
+    # clone's Content; with the clone gone, that field names a destroyed object
+    # and the game's own `CreateControls` would parent stock rows into it.
+    let tab2 = pfxTab()
+    if tab2 != nil and gPfxOrigRootT != nil and
+       nuOk(tab2, PfxOffSettingsRoot + 8'i32):
+      discard cNuSetRef(tab2, PfxOffSettingsRoot, gPfxOrigRootT)
+      warn "postfx rows: the scroll host was destroyed under us; " &
+           "PostFXSettingsTab._settingsRoot@0xa0 has been put back to the " &
+           "authored SettingsPanel so the game's own CreateControls cannot " &
+           "parent stock rows into a dead object."
     gPfxScrollGo = nil
+    gPfxScrollHostT = nil
     gPfxScrollContentT = nil
+    gPfxScrollBarT = nil
   if gPfxBuilt and (gGfxPostGo == nil or not duOk(gGfxPostGo, 0x20'i32) or
                     not iUnityAlive(gGfxPostGo)):
     let n = pfxDestroyAll()

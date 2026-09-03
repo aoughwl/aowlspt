@@ -262,7 +262,7 @@ const NtProofSettle = 20          ## frames to let a switch settle before judgin
 var gNtSubOn = false               ## `nativeTabsSubtabs`
 var gNtSubBuilt = false
 var gNtSubStripGo: Il2CppPtr = nil ## the strip container (ours, a sibling)
-var gNtSubToggle: seq[Il2CppPtr] = @[]  ## [0]=GRAPHICS SETTINGS, [1]=POSTFX
+var gNtSubToggle: seq[Il2CppPtr] = @[]  ## [0]=GENERAL, [1]=POSTFX
 var gNtSubSel = 0
 var gNtGfxPanelGo: Il2CppPtr = nil ## the STOCK Graphics Settings panel
 var gNtSubPressed = -1
@@ -303,7 +303,7 @@ var gNtSeenToggles: seq[Il2CppPtr] = @[]
 ## OUR OWN SELECTION WRITES MUST NOT RE-ENTER OUR OWN POSTFIX.
 ##
 ## MEASURED: ten `native subtabs VERDICT PASS` lines inside 160ms, alternating
-## between POSTFX and GRAPHICS SETTINGS. That is not a noisy cadence, it is a
+## between POSTFX and GENERAL. That is not a noisy cadence, it is a
 ## FEEDBACK LOOP: `ntSubShow` calls `AnimatedToggle::set_IsToggled`, which
 ## calls `Toggle::Set` with sendCallback TRUE, which re-enters this feature's
 ## own postfix, which records a press, which makes the next tick call
@@ -581,6 +581,13 @@ proc ntNoteFault(what: string) =
 # through here, so this compares `this` against at most `NtMaxTabs` pointers
 # and returns. It logs NOTHING unless one of ours matched.
 # ---------------------------------------------------------------------------
+## THE POSTFX GRAY-OUT RIDES THIS DRAIN. Forward-declared because
+## `postfxrows.nim` is `include`d after this file; the alternative -- a second
+## physical detour on `UnityEngine.UI.Toggle::Set` -- would overwrite this
+## one's trampoline and silently kill the subtab strip, which is the
+## double-detour rule stated as code rather than as a comment.
+proc pfxOnToggleSet(tog: Il2CppPtr; turnedOn: bool)
+
 proc ntToggleSetFired(regs: Il2CppPtr) =
   ## THE `gNtToggle.len == 0` GUARD THAT USED TO BE HERE WAS THE BUG.
   ##
@@ -615,6 +622,12 @@ proc ntToggleSetFired(regs: Il2CppPtr) =
     return
   # `value` is RDX (index 1): did this toggle just go ON?
   let turnedOn = (cast[uint64](cRegsInt(regs, 1'i32)) and 0xFF'u64) != 0'u64
+  # THE POSTFX GRAY-OUT DRAINS HERE, FIRST, and returns immediately unless
+  # this pointer is one of the two toggles it follows. It is placed before the
+  # tab loops on purpose: the GAME'S 'Enable PostFX' toggle is not one of our
+  # tabs or subtabs, so every loop below would fall through to the "other"
+  # classification and the event would be lost. Two pointer compares.
+  pfxOnToggleSet(selfPtr, turnedOn)
   # MATCH AGAINST THE CURRENT SPAWNED TOGGLE, NEVER A CACHED ONE (T13).
   # This is <=4 guarded 8-byte reads on the game's click path, which is a real
   # cost and is accepted deliberately: the alternative -- comparing against a
@@ -649,13 +662,13 @@ proc ntToggleSetFired(regs: Il2CppPtr) =
       # OTHER one from inside the first call -- so the nested OFF arrives
       # LAST and, before this test, overwrote the press with the index of the
       # toggle that was switched OFF. Live, every press then read as POSTFX:
-      # GRAPHICS SETTINGS lit up, the PostFX panel stayed, both looked
+      # GENERAL lit up, the PostFX panel stayed, both looked
       # selected. The OFF edge carries no information the ON edge does not.
       if turnedOn:
         # THE SETTLE WINDOW, and the measurement it exists for.
         #
         # MEASURED (deployed build a1fa38, host log 2026-09-02 6:59.469 and
-        # 7:25.532): every GRAPHICS SETTINGS press was followed 0.4-1.0s later
+        # 7:25.532): every GENERAL press was followed 0.4-1.0s later
         # by a POSTFX ON edge the player never made, so GRAPHICS lit while the
         # page flipped back to PostFX and both looked selected. MEASURED CAUSE
         # (`R disasm 0x16ad190`): `AnimatedToggle::set_IsToggled` -- which
@@ -1444,7 +1457,7 @@ proc ntBuild(): bool =
            "independent of it and still will."
   else:
     okLog "native tabs: the PROOF tab is OFF (nativeTabsProofTab), so no tab " &
-          "of ours is added to the row. The GRAPHICS|POSTFX subtab strip is " &
+          "of ours is added to the row. The GENERAL|POSTFX subtab strip is " &
           "unaffected -- it belongs to the STOCK Graphics tab, not to ours."
   # STEP 3'S TAB, built through the SAME `defineTab` path as the proof tab --
   # that is the point of a foundation: a second tab is one more call, not one
@@ -1489,7 +1502,7 @@ proc ntBuild(): bool =
 # ACTIVATION -- the one piece of steering we own (doc 4)
 # ---------------------------------------------------------------------------
 proc ntBuildGfxStrip(screenT: Il2CppPtr): bool =
-  ## STEP 5: the GRAPHICS SETTINGS | POSTFX strip, built the way the map says
+  ## STEP 5: the GENERAL | POSTFX strip, built the way the map says
   ## and switched by the game's own `ShowScreen`.
   ##
   ## WHAT CHANGED FROM THE VERSION THIS REPLACES, and each line is a measured
@@ -1616,7 +1629,7 @@ proc ntBuildGfxStrip(screenT: Il2CppPtr): bool =
     ntNoteFault("gfx strip: the clone has " & $kids & " child(ren) and the " &
                 "donor has " & $donorKids & "; this path reuses the donor's " &
                 "TWO cloned toggles (ControlToggle, GesturesToggle) as " &
-                "GRAPHICS SETTINGS and POSTFX and expects exactly two. " &
+                "GENERAL and POSTFX and expects exactly two. " &
                 "Refusing rather than reusing children by index in a tree " &
                 "that is not the one the map describes.")
     discard modsSetActive(stripGo, false)
@@ -1628,7 +1641,7 @@ proc ntBuildGfxStrip(screenT: Il2CppPtr): bool =
   var alreadyOurs = 0
   var b = 0
   while b < 2 and b < NtMaxSubs:
-    let caption = (if b == 0: "GRAPHICS SETTINGS" else: "POSTFX")
+    let caption = (if b == 0: "GENERAL" else: "POSTFX")
     let c = iChildAt(stripT, b)
     let donorC = iChildAt(donorStrip, b)
     if c == nil or not duOk(c, 0x20'i32):
@@ -1735,7 +1748,7 @@ proc ntBuildGfxStrip(screenT: Il2CppPtr): bool =
     gNtSubToggle = @[]
     gNtSubSpawner = @[]
     return
-  okLog "gfx strip: reused the CLONE'S OWN two toggles as GRAPHICS SETTINGS " &
+  okLog "gfx strip: reused the CLONE'S OWN two toggles as GENERAL " &
         "and POSTFX -- " & $alreadyOurs & " already named the cloned " &
         "ToggleGroup (Instantiate remapped the reference, as expected) and " &
         $joined & " were joined with Toggle::SetToggleGroup @0x55BA150, the " &
@@ -1784,7 +1797,7 @@ proc ntBuildGfxStrip(screenT: Il2CppPtr): bool =
   gNtSubSel = 0
   discard modsSetActive(stripGo, false)   # raised by the ShowScreen rider
   ntCrumb("gfx strip: COMPLETE")
-  okLog "gfx strip: built GRAPHICS SETTINGS | POSTFX as a SIBLING of the " &
+  okLog "gfx strip: built GENERAL | POSTFX as a SIBLING of the " &
         "panels, parented to SettingsScreen. Selection is now the GAME's: a " &
         "press calls SettingsScreen::ShowScreen(screen, group, NULL) " &
         "@0x1720DE0 and NOTHING else is SetActive'd by us -- ShowScreen does " &
@@ -1798,7 +1811,7 @@ proc ntBuildGfxStrip(screenT: Il2CppPtr): bool =
 
 proc ntBuildSubtabs(screenT: Il2CppPtr; captions: seq[string];
                     kind: int): bool =
-  ## STEP 2: the GRAPHICS SETTINGS | POSTFX strip, as a SIBLING of the panels.
+  ## STEP 2: the GENERAL | POSTFX strip, as a SIBLING of the panels.
   ##
   ## The donor is `Control Settings/Toggles` -- the game's own subtab strip,
   ## which brings its `ToggleGroup` along in the clone. That matters: we cannot
@@ -2195,7 +2208,7 @@ proc ntSubApply(sel: int) =
                 "consolation -- doing that by hand is what left _currentTab " &
                 "naming a different panel than the one on screen.")
     return
-  okLog "native subtabs: " & (if sel == 1: "POSTFX" else: "GRAPHICS SETTINGS") &
+  okLog "native subtabs: " & (if sel == 1: "POSTFX" else: "GENERAL") &
         " -> SettingsScreen::ShowScreen(group=" & $g & ", MethodInfo*=NULL). " &
         "The strip's visibility and highlight now come back through the " &
         "ShowScreen POSTFIX, the same path a stock tab click takes, so our " &
@@ -2514,7 +2527,7 @@ proc ntSubVerdict(why: string) =
           on = on + 1
           onIdx = i
     i = i + 1
-  let which = (if onIdx == 1: "POSTFX" elif onIdx == 0: "GRAPHICS SETTINGS"
+  let which = (if onIdx == 1: "POSTFX" elif onIdx == 0: "GENERAL"
                else: "none")
   if readable != ntSubCount():
     incon = incon & "[P4 only " & $readable & " of " & $ntSubCount() &
@@ -3108,7 +3121,7 @@ proc ntTickBody() =
     if gNtSubPressedByPlayer:
       gNtSubPressedByPlayer = false
       okLog "native subtabs: subtab pressed by the player: " &
-            (if sidx == 1: "POSTFX" else: "GRAPHICS SETTINGS") &
+            (if sidx == 1: "POSTFX" else: "GENERAL") &
             " -- the click reached the toggle through the game's own raycast, " &
             "not through our code. That is the half that was in doubt."
     ntSubShow(sidx)
