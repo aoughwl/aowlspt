@@ -9064,3 +9064,493 @@ that never dereferenced the value was being kept alive by the garbage. Before
 tightening a validity check, ask what the invalid value was reaching — the
 answer here was "the only route that actually worked".
 
+## 2026-09-03: facts relayed by subagents on 2026-09-02/03 (drained from the factnote relay, tags as the authors set them)
+
+```text
+--- 1/74  (from ?)
+  subject    EFT.Profile.BattlePass
+  predicate  field offset
+  object     0x118 (BattlePassController, instance, declared by EFT.Profile)
+  method     measured
+  evidence   il2cpp_resolve.py fields EFT.Profile via all_fields_ex; corroborated by SeasonWidgetData::From @0x141ffd0+0x11f reading [rbx+0x118] where rbx=the profile argument
+--- 2/74  (from ?)
+  subject    EFT.UI.SeasonWidgetData::From(Profile,SeasonalRewardController) @0x141ffd0
+  predicate  instruction at +0x11f
+  object     4C 39 A3 18 01 00 00 = cmp qword ptr [rbx+0x118], r12 -- a null test on Profile.BattlePass; the branch at +0x126 skips the whole season widget when it is null
+  method     measured
+  evidence   capstone decode from the owner start via il2cpp_resolve.py disasm 0x14200ef
+--- 3/74  (from ?)
+  subject    EFT.UI.SeasonWidgetData::From(Profile,SeasonalRewardController)
+  predicate  win64 arg registers
+  object     STATIC method returning the VALUE TYPE SeasonWidgetData: RCX is the hidden return buffer, RDX=profile, R8=seasonalRewardController, R9=MethodInfo*
+  method     measured
+  evidence   prologue mov rbx,rdx then [rbx+0x118] resolves to EFT.Profile.BattlePass; SeasonalRewardController has no field at 0x118, so the unshifted mapping is excluded
+--- 4/74  (from ?)
+  subject    tools/il2cpp_resolve.py disasm
+  predicate  new verb
+  object     disasm <RVA-or-VA-or-Type::Method> [--len N|--to RVA] [--base] [--no-fields]: capstone decode from the OWNER START, >> marks the requested address, call/jmp rel32 targets named through the symbolize index, [reg+disp] annotated with the field name when the register traces to a reference-type argument
+  method     measured
+  evidence   tools/test_il2cpp_disasm.py -- 38 cases, all pass, including capstone-absent (exit 4) and generic-definition-contributes-no-offsets negative controls
+--- 5/74  (from ?)
+  subject    EFT.UI.SeasonWidgetData::From @0x141ffd0
+  predicate  correction to the previous relay
+  object     the BRANCH READING is INFERRED, not measured: the je at +0x126 targets 0x142030a, the same target as the null-profile test at +0x119, which I read as the early-out path. Only the bytes and the mnemonic are measured.
+  method     inferred
+  evidence   both je targets read from the same capstone decode; I did not trace 0x142030a itself
+--- 6/74  (from ?)
+  subject    tools/buildlock.py
+  predicate  refuses success when a declared artifact is absent or predates the build
+  object     exit 5 BUILT BUT ARTIFACT ABSENT / exit 6 ARTIFACT STALE; artifacts resolved from <repo>/tools/deploy.json src fields; sidecar <artifact>.built.json + verify-artifact MATCH0/REPLACED2/ABSENT3/NOSIDECAR5
+  method     measured
+  evidence   tools/test_buildlock.py 141 cases -> 178, all pass; each verdict paired with a control. Live: 'python tools/buildlock.py verify-artifact host' on integ-beta9 reports NO SIDECAR (exit 5) for the 3 host artifacts, which predate the feature.
+--- 7/74  (from ?)
+  subject    nimony whole-module re-export
+  predicate  fatal shape is a re-export whose module name collides with the re-exporting file's own name
+  object     host/common/jsonpath.nim re-exporting aowlspt/jsonpath killed the hexer; aowl/src/aowlspt.nim 'export abi', mods/maps/sp/hud.nim 'export place', mods/morebots/bots/dbpath.nim 'export pending' all build today
+  method     inferred
+  evidence   measured: those three whole-module re-exports exist in the tree on 2026-09-02 and the tree builds, so the recorded blanket rule 'never export a module' is too broad. The name-collision discriminator is inferred, not built-tested. tools/nimlint.py splits them ERROR vs WARN.
+--- 8/74  (from ?)
+  subject    tools/nimlint.py
+  predicate  catches the 2026-09-01 getOrQuit build killer offline in 1.7s
+  object     268 nim files, 0 errors, 3 warnings on integ-beta9; exit 0/1/3
+  method     measured
+  evidence   ran tools/nimlint.py on the checkout (1.7s wall). Fires on git blob 531498a:host/common/jsonpath.nim line 46 and is silent on cb9a816's fixed version -- both asserted in tools/test_buildlock.py.
+--- 9/74  (from ?)
+  subject    tools/buildlock.py
+  predicate  new exit codes 7 (nimlint pre-flight refusal, before the lock) and 8 (COMPILER-INTERNAL CRASH, no file named)
+  object     --no-lint and --lint-strict added; build output is now tee'd so it can be scanned
+  method     measured
+  evidence   tools/test_buildlock.py grew 4 test functions; a stand-in driver emitting 'getOrQuit: missing key' with rc=1 produces the distinct line and exit 8, while one emitting 'x.nim(12, 3) Error: ...' forwards exit 1 with no crash line.
+--- 10/74  (from ?)
+  subject    EscapeFromTarkov client death 2026-09-02 13:18
+  predicate  was a fail-fast (0xc0000409) from admin.dll, not a teardown
+  object     Application Error event names ucrtbase.dll offset 0x7286e; cdb on CrashDumps/EscapeFromTarkov.exe.16972.dmp shows ucrtbase!abort <- admin!mi_assert_fail <- admin!mi_malloc <- admin!alloc_0_sysvq0asl <- admin!newWideCString <- admin!toWide <- admin!openIl2Cpp <- admin!dataOpen <- admin!onUpdate
+  method     measured
+  evidence   python tools/crashwatch.py wer --since '2026-09-02 13:00:00' on this machine; no Crash_* folder exists for it because __fastfail never enters Unity's unhandled-exception filter
+--- 11/74  (from ?)
+  subject    Unity Crash_* folders
+  predicate  are ABSENT for fail-fast deaths, so their absence is not evidence of a teardown
+  object     must also check the Windows Application event log (Application Error / Windows Error Reporting) and %LOCALAPPDATA%\CrashDumps before concluding exit-or-teardown
+  method     measured
+  evidence   the 13:18 death had 2 event-log entries and a CrashDumps dump but zero Crash_* folders; tools/crashwatch.py death_kind now encodes this rule
+--- 12/74  (from ?)
+  subject    tools/run.py
+  predicate  no longer stops the client at its verdict by default
+  object     --teardown is now opt-in; --keep is accepted as a no-op; every stop by run.py/crashwatch.py/harness.py is logged to D:\Aowlspt\aowlspt\aowlspt-teardown.jsonl and a death within 10s of an entry is verdict KILLED-BY-TOOL, exit 11
+  method     measured
+  evidence   tools/test_supervise.py 168/168, incl. teardown/default-does-not-tear-down and killed/fires plus four negative controls
+--- 13/74  (from ?)
+  subject    tools/test_aowlbuild.py
+  predicate  blocks on the build lock (buildlock.py --wait 1800)
+  object     2.2s when the build slot is free; still queued after 725s behind another agent's 'build host' on 2026-09-02 -- it must NOT be in a deploy gate's fast set
+  method     measured
+  evidence   ran it twice while 'python tools/buildlock.py --status' showed pid 15896 holding 'build host' for 725s and my two runs queued at positions 2 and 3; the same test finished in 2.2s an hour earlier with the lock free
+--- 14/74  (from ?)
+  subject    aowlspt self-test suite
+  predicate  state before tools/selftests.py existed
+  object     6 of 34 self-tests were already RED in integ-beta9 and nobody knew: test_crashwatch (43/46), test_inspect_silence (vacuous control), test_supervise, test_resolver_flags, plus test_resolver_shared/test_fldoff_generics which merely needed their two path arguments
+  method     measured
+  evidence   ran every tools/test_*.py and every --selftest tool once each on 2026-09-02 and recorded rc + duration
+--- 15/74  (from ?)
+  subject    tools/il2cpp_resolve.py methods --name
+  predicate  regression, red as of 2026-09-02
+  object     'methods --name <number> searches the substring' FAILS: got=False want=True; the other 3 checks in test_resolver_flags.py pass
+  method     measured
+  evidence   python tools/test_resolver_flags.py D:/Games/Tarkov/GameAssembly.dll .cache/global-metadata.dec.dat -> 'FAIL -- 1 check(s) failed'
+--- 16/74  (from ?)
+  subject    a negative control pinned to git HEAD
+  predicate  self-destructs the moment the fix is committed
+  object     test_inspect_silence.py's control compared HEAD against the working tree, so committing the fix made all 14 invariants pass on both sides; it correctly reported 'cannot distinguish fixed from broken' rather than PASS. Fixed by walking back to the newest revision of inspect.nim that any invariant rejects (a761563)
+  method     measured
+  evidence   before: 'FAILED control/can_fail'; after the walk-back: '1 of 14 invariants fail on a7615635', 14/14 checks pass
+--- 17/74  (from ?)
+  subject    tools/test_aowlbuild.py
+  predicate  measured wall time under build-lock contention
+  object     15m17s (rc=1), against 2.2s with the slot free -- a 417x spread that depends entirely on whether another agent is building. Confirms it must stay OUT of any deploy gate's fast set.
+  method     measured
+  evidence   backgrounded 'time python tools/test_aowlbuild.py' on 2026-09-02 while buildlock --status showed a 'build host' holder; it returned after 15m17.528s with rc=1. Supersedes the weaker earlier note of 'still queued after 725s'.
+--- 18/74  (from ?)
+  subject    tools/test_buildlock.py
+  predicate  runtime with a live-pid lock held at .aowl-build.lock
+  object     193s, 0 failures; free-lock baseline 208s -- the real lock does NOT block the suite
+  method     measured
+  evidence   planted a lock file naming a sleeping python pid at C:/Users/savant/Projects/aowlspt/.aowl-build.lock, ran python tools/test_buildlock.py to completion, removed it; slowest tests test_break_hung 31.4s, test_hung_verdicts 24.9s, test_hung_across_calls 19.7s, test_wait_free_reports_hung 18.3s
+--- 19/74  (from ?)
+  subject    tools/il2cpp_resolve.py methods --name <number>
+  predicate  is NOT broken; test_resolver_flags.py was matching the wrong case
+  object     the tool prints 'no METHOD NAME contains' (upper); the test asserted lowercase, so check 9 failed AND check 8's negative clause became vacuous
+  method     measured
+  evidence   python tools/il2cpp_resolve.py D:/Games/Tarkov/GameAssembly.dll .cache/global-metadata.dec.dat methods --name 16622 -> exit 0, 'no METHOD NAME contains 16622 (searched the method names of all 31282 types EXHAUSTIVELY)'
+--- 20/74  (from ?)
+  subject    buildlock artifact check
+  predicate  exit 6 ARTIFACT STALE on a no-op rebuild was a false refusal
+  object     STALE now requires sources newer than the artifact AND an unwritten artifact; sha==sidecar + all sources older => UP-TO-DATE exit 0, no sidecar refresh
+  method     measured
+  evidence   tools/test_buildlock.py::test_noop_rebuild_is_up_to_date -- 5 checks fail on the pre-change buildlock.py, 8 pass after; falsifying half (a newer source) still exits 6
+--- 21/74  (from ?)
+  subject    run.py crash_evidence
+  predicate  lives in tools/run.py, not tools/crashwatch.py
+  object     parameter renamed root -> crashes_root and now refuses a directory that is neither a Crash_* holder nor a Temp/Battlestate Games/.../Crashes path, returning source='inconclusive'
+  method     measured
+  evidence   grep -rn crash_evidence tools/ -> tools/run.py:1175 only; new test t_refuses_a_non_crashes_root passes 10/10 after, raises TypeError before
+--- 22/74  (from ?)
+  subject    ESettingsGroup
+  predicate  enum values
+  object     Screen=0 (the GRAPHICS tab), Game=1, Sound=2, Control=3, PostFX=4; exactly five, no spare
+  method     measured
+  evidence   R fields ESettingsGroup
+  note       EnsureTabInitialized @0x171FF10 default case throws ArgumentOutOfRangeException (.ctor 0x4491DD0); OpenGroup @0x1720C80 instead cmovs-falls back to Game(1). A sixth tab cannot use an invented enum value.
+--- 23/74  (from ?)
+  subject    SettingsTab::set_IsSelected @0x171BCA0
+  predicate  is the panel switch
+  object     calls MonoBehaviour::get_gameObject then GameObject::SetActive(go,value); if value: gated OnFirstSelect (vtable klass+0x2C8) then OnSelect (klass+0x2D8)
+  method     measured
+  evidence   R disasm 0x171bca0 --to 0x171bda0
+  note       A settings 'panel' IS the tab component's own GameObject. UNIQUE. Close() is vtable klass+0x288.
+--- 24/74  (from ?)
+  subject    settings tab press ordering
+  predicate  callback order
+  object     Toggle::Set(B,true,true) -> NotifyToggleOn -> every OTHER toggle Set(false,true) and its onValueChanged(false) runs FIRST; only then B.onValueChanged(true)
+  method     measured
+  evidence   R disasm 0x55ba450 / 0x55babc0 / 0x17240a0
+  note       The tab handler <>c__DisplayClass26_0::<Awake>b__1 @0x17240A0 RETURNS IMMEDIATELY when isOn==false. So OFF edges are no-ops and the panel switch happens once, inside ShowScreen @0x1720DE0, after every OFF edge.
+--- 25/74  (from ?)
+  subject    Toggle::Set @0x55BA450
+  predicate  early-return trap
+  object     if m_IsOn@0x120 == value it returns before anything: no callback, no animation, no switch
+  method     measured
+  evidence   R disasm 0x55ba450, first branch
+  note       Set(t,true,true) on an already-on toggle looks exactly like success. Read m_IsOn@0x120 first.
+--- 26/74  (from ?)
+  subject    ToggleGroup::NotifyToggleOn @0x55BABC0
+  predicate  throws on a foreign toggle
+  object     calls ValidateToggleIsInGroup @0x55BAA00, which throws if the toggle is not in m_Toggles@0x28
+  method     measured
+  evidence   R disasm 0x55babc0 +0x6d; 0x55baa00 ends at throw helpers 0x5D21C0/0x5D2340
+  note       A clone whose m_Group@0x110 points at the stock group but is not registered throws an IL2CPP C++ exception that unwinds THROUGH aowl_p_p_seh without tripping it. Join via Toggle::SetToggleGroup @0x55BA150, which unregisters+registers; Toggle::OnEnable @0x55B9F50 calls it unconditionally.
+--- 27/74  (from ?)
+  subject    0x628110 universal empty stub
+  predicate  owner count
+  object     SHARED, 9614 owners (CLAUDE.md says 6438)
+  method     measured
+  evidence   R shared 0x628110
+  note       SettingsTab::OnFirstSelect and OnSelect BOTH land here, so the base first-select hook is a no-op; real ones are vtable overrides. Second stub 0x66C100 (xor eax,eax; ret) has 540 owners.
+--- 28/74  (from ?)
+  subject    SettingsTab::CreateControl<T>
+  predicate  is a shared generic
+  object     one instantiation, body RVA 0x2B86E20, method<object>; dereferences [MethodInfo*+0x38] first
+  method     measured
+  evidence   R genericmethods EFT.UI.Settings.SettingsTab::CreateControl; R disasm 0x2b86e20
+  note       args rcx=this rdx=prefab r8=parent r9=MethodInfo*. A NULL MethodInfo* is an immediate null deref. This is THE exception to 'NULL MethodInfo is fine'.
+--- 29/74  (from ?)
+  subject    0xCFD7D0
+  predicate  is a shared ctor thunk
+  object     SHARED x26 and TAILJUMP; it is the .ctor of SettingsTab, SettingControl, SettingToggle, SettingFloatSlider, SettingDropDown, SettingSelectSlider, GraphicsSettingsTab, PostFXSettingsTab, GameSettingsTab
+  method     measured
+  evidence   R shared 0xCFD7D0; R typemethods on each type
+  note       docs/SETTINGS.md lists it as SettingFloatSlider::.ctor as if unique. Never detour.
+--- 30/74  (from ?)
+  subject    ControlSettingsTab subtab mechanism
+  predicate  is the model for subtabs
+  object     HandleGesturesToggle @0x16FED50 does ONE thing: GameObject::SetActive(_gesturesPanel@0xF0, isOn). No hide-all sweep; exclusivity is ToggleGroup's.
+  method     measured
+  evidence   R disasm 0x16fed50; R fields EFT.UI.Settings.ControlSettingsTab
+  note       _controlButton@0xD8 and _gesturesButton@0xE0 are UIAnimatedToggleSpawner; _controlPanel@0xE8 / _gesturesPanel@0xF0 are GameObjects. No AddListener anywhere in Show @0x16FD4F0 or SettingsScreen::Awake -> the edge is INFERRED to be prefab-serialized.
+--- 31/74  (from ?)
+  subject    EnsureTabInitialized @0x171FF10
+  predicate  Graphics differs from PostFX
+  object     case Screen(0) makes NO Show() call: it writes _tempSettings@0xD8, _isInRaidBlockersActive@0x140, _textureMessageShown@0x141, _originalSettings@0xE0 and lets OnFirstSelect @0x170A8B0 build. PostFX(4) calls PostFXSettingsTab::Show @0x17193C0 with the group AND the controller.
+  method     measured
+  evidence   R disasm 0x171ff10 --to 0x1720380
+--- 32/74  (from ?)
+  subject    docs/SETTINGS-UI-MAP.md
+  predicate  exists
+  object     complete offline map of the settings screen with per-claim evidence
+  method     measured
+  evidence   written 2026-09-02 from il2cpp_resolve.py only; game never touched
+--- 33/74  (from ?)
+  subject    AnimatedToggle::set_IsToggled @0x16AD190
+  predicate  calls Toggle::Set with sendCallback=TRUE
+  object     mov r8b,1 at +0x14, then TriggerAnimation iff m_Transition@0x50==3
+  method     measured
+  evidence   il2cpp_resolve.py disasm 0x16AD190 --to 0x16AD1E0
+  note       This is the mechanism behind the phantom 'subtab pressed by the player: POSTFX' 0.4-1.0s after every GRAPHICS press: every highlight the host applied was a real press re-entering its own drain. UIAnimatedToggleSpawner::ToggleSilently @0x16BCBA0 is the identical body with xor r8d,r8d (sendCallback=0) and is the correct call.
+--- 34/74  (from ?)
+  subject    Toggle::set_group @0x55B9D30
+  predicate  does NOT unregister from the old ToggleGroup
+  object     writes m_Group@0x110 only; Toggle::SetToggleGroup @0x55BA150 is the registering call (UnregisterToggle 0x55BADD0, store, RegisterToggle 0x55BAE50)
+  method     measured
+  evidence   docs/SETTINGS-UI-MAP.md 7.10 + R disasm 0x55ba150 + R disasm 0x16bc7f0 (SpawnObject makes the SetToggleGroup call)
+  note       nativetabs' ntDetachFromStockGroups used set_group(null), so every 'detached N toggle(s)' line it ever printed left our toggles IN the stock group's m_Toggles with m_Group nulled -- a worse dangling shape than before the call. Fixed to SetToggleGroup(null).
+--- 35/74  (from ?)
+  subject    branch integ-beta9 at 8d0f22b
+  predicate  does not compile
+  object     inspect.nim iCmdComponentBody: 9x 'cannot prove that result has been initialized'
+  method     measured
+  evidence   python tools/buildlock.py build host with ALL unrelated changes git-stashed, exit 1, 87s
+  note       Fix is one line: result = false at the top of iCmdComponentBody. The body's own comment already asserted 'result defaults to false'; nimony no longer accepts that.
+--- 36/74  (from ?)
+  subject    SettingsScreen::Close @0x1720B10
+  predicate  calls CloseAll @0x17207A0 at +0x2F then nulls _session@0x120 and _profileInfo@0x128
+  object     both UNIQUE
+  method     measured
+  evidence   R disasm 0x1720b10 --to 0x1720bc0; R shared on both
+  note       Enables a PREFIX on Close + POSTFIX on CloseAll -- two detours on two different functions -- so 'entered, never returned' becomes a log line instead of a silence.
+--- 37/74  (from ?)
+  subject    UnityEngine.UI.ScrollRect
+  predicate  m_Content@0x20, m_Viewport@0x40
+  object     measured offsets
+  method     measured
+  evidence   tools/fldoff.py fields UnityEngine.UI.ScrollRect, System.String self-check passing
+  note       Used by the postfx SCROLL verdict: the falsifiable question for 'the PostFX page does not scroll' is whether ScrollRect.m_Content is the same RectTransform as PostFXSettingsTab._settingsRoot@0xa0.
+--- 38/74  (from ?)
+  subject    EFT.TarkovApplication::TryCreateInRaidCharacterSelection
+  predicate  RVA
+  object     0x97bbf0 PRIVATE|STATIC|HIDEBYSIG arity=2 UNIQUE
+  method     measured
+  evidence   il2cpp_resolve.py D:/Games/Tarkov/GameAssembly.dll .cache/global-metadata.dec.dat member TryCreateInRaidCharacterSelection
+  note       The game's OWN no-UI character-selection bypass. RCX=CharacterSelectionDataResponse, RDX=&CharacterSelectionResult (24-byte out), R8=MethodInfo*(NULL). Prologue 48 89 5C 24 10 57 48 83 EC 40 33 FF 48 8B DA -- no rip-relative in the relocation window. Two callers: <RunInitialLobbyFlow>d__121+0x785 and <OpenCharacterSelectionFromMenu>d__118+0x8ef.
+--- 39/74  (from ?)
+  subject    EFT.ECharacterSelectionProfileStatus
+  predicate  enum values
+  object     Locked=0 Empty=1 Available=2 InRaid=3
+  method     measured
+  evidence   il2cpp_resolve.py D:/Games/Tarkov/GameAssembly.dll .cache/global-metadata.dec.dat fields EFT.ECharacterSelectionProfileStatus
+  note       SUPERSEDES abi/aowlspt_modeskip.h which says these are not exposed by any resolver verb. They are: fields prints HASDEFAULT constants.
+--- 40/74  (from ?)
+  subject    CharacterSelectionResult
+  predicate  unboxed layout
+  object     GameMode@0x0 dword, ProfileData@0x8 qword, Cancelled@0x10 byte; 24 bytes total
+  method     measured
+  evidence   il2cpp_resolve.py D:/Games/Tarkov/GameAssembly.dll .cache/global-metadata.dec.dat disasm 0x97bbf0 and il2cpp_resolve.py D:/Games/Tarkov/GameAssembly.dll .cache/global-metadata.dec.dat fields <ExecuteCharacterSelection>d__131 (result spans 0x30..0x48)
+  note       R fields prints the BOXED offsets 0x10/0x18/0x20. It is a value type; code uses the unboxed layout.
+--- 41/74  (from ?)
+  subject    CharacterSelectionScreenController::Submit @0x13f0bf0
+  predicate  does
+  object     calls SubmitAsync then Task::ContinueWith; writes NO field of its own
+  method     measured
+  evidence   il2cpp_resolve.py D:/Games/Tarkov/GameAssembly.dll .cache/global-metadata.dec.dat disasm 0x13f0bf0 --to 0x13f0cc0
+  note       SubmitAsync's whole effect is _completion@0x60 TaskCompletionSource<CharacterSelectionResult>.TrySetResult({gameMode, profileData, false}), gated on profileData!=null, profileData.Status!=0, and await TryCloseScreen(false,0).
+--- 42/74  (from ?)
+  subject    IL2CPP async state machines (d__NN types)
+  predicate  field offsets
+  object     R fields prints them WITH the 0x10 object header; the compiled body uses them UNBOXED -- subtract 0x10
+  method     measured
+  evidence   il2cpp_resolve.py D:/Games/Tarkov/GameAssembly.dll .cache/global-metadata.dec.dat fields <SubmitAsync>d__43 vs il2cpp_resolve.py D:/Games/Tarkov/GameAssembly.dll .cache/global-metadata.dec.dat disasm 0x13f1500
+  note       profileData table 0x30 -> body [rdi+0x20]; <>4__this 0x38 -> [rdi+0x28]; gameMode 0x40 -> [rdi+0x30]. Using the table value reads the neighbouring field and never faults.
+--- 43/74  (from ?)
+  subject    EFT.CharacterSelectionDataResponse
+  predicate  base class
+  object     System.Collections.Generic.Dictionary<EGameMode, CharacterSelectionProfileData>
+  method     measured
+  evidence   il2cpp_resolve.py D:/Games/Tarkov/GameAssembly.dll .cache/global-metadata.dec.dat typemethods EFT.CharacterSelectionDataResponse
+  note       So a correct (gameMode, profileData) pair is a KEY/VALUE of this dictionary -- never computed. Instantiated layout is NOT reachable offline (GENERIC NO-LAYOUT).
+--- 44/74  (from ?)
+  subject    EFT.UI.ProfileLoadingScreen
+  predicate  the game's loading caption
+  object     _statusField@0xb0 (CustomTextMeshProUGUI); written by SetLivingStatus@0x157abe0 via TMP_Text::set_text@0x51BC1E0
+  method     measured
+  evidence   il2cpp_resolve.py D:/Games/Tarkov/GameAssembly.dll .cache/global-metadata.dec.dat fields EFT.UI.ProfileLoadingScreen; il2cpp_resolve.py D:/Games/Tarkov/GameAssembly.dll .cache/global-metadata.dec.dat disasm 0x157abe0
+  note       SetLivingStatus picks PROFILE_LOADING_TEXT/PROFILE_LEAVING_TEXT, resolves via LocalizationManager::LocalizedValue@0xaf7ae0, then calls the TMP set_text vtable slot {klass+0x558}. Also _loadingPanel@0xa0, _errorPanel@0xa8. SUPERSEDES modload.nim's 'that method is not identified on this build'.
+--- 45/74  (from ?)
+  subject    EFT.TarkovApplication::OnApplicationLoaded @0x9839e0
+  predicate  is
+  object     the game's own 'loading is done' signal
+  method     measured
+  evidence   il2cpp_resolve.py D:/Games/Tarkov/GameAssembly.dll .cache/global-metadata.dec.dat disasm 0x9839e0; il2cpp_resolve.py D:/Games/Tarkov/GameAssembly.dll .cache/global-metadata.dec.dat callers 0x9839e0
+  note       Calls ClientLoadTimeMetrics::OnMainMenuShown@0x9687a0, MenuLoadProfiler::RequestReport@0x9e37b0, invokes AfterApplicationLoaded@0x218, clears _isFirstTimeApplicationLoad@0x140. Two callers: <MainMenu>d__191+0x724, <Run>d__184+0x1e7d. Strictly LATER than MenuScreen::Show.
+--- 46/74  (from ?)
+  subject    EFT.MenuLoadProfiler
+  predicate  is
+  object     the game's own named boot-stage log; StartFlow@0x9e2e80 Begin@0x9e3310 Mark@0x9e3640 all UNIQUE and static
+  method     measured
+  evidence   il2cpp_resolve.py D:/Games/Tarkov/GameAssembly.dll .cache/global-metadata.dec.dat typemethods EFT.MenuLoadProfiler; il2cpp_resolve.py D:/Games/Tarkov/GameAssembly.dll .cache/global-metadata.dec.dat bytes 0x9e3310
+  note       Begin/StartFlow have CLEAN 15-byte relocation windows and take the stage name in RCX -- the cheapest read-only instrument for the real boot ordering. Mark has a rip-relative 80 3D at byte 9. PrintReport resolves to 0x628110, the universal stub SHARED x9614.
+--- 47/74  (from ?)
+  subject    boot flow ordering
+  predicate  RunInitialLobbyFlow d__121 @0x9d7fb0
+  object     await LoadCharacterSelectionBootstrap -> HasOnlyEmptyProfileSlots -> TryCreateInRaidCharacterSelection ? (ShowLanguageSelectionIfNeeded, ExecuteCharacterSelection) : RunCharacterSelectionFlow
+  method     measured
+  evidence   il2cpp_resolve.py D:/Games/Tarkov/GameAssembly.dll .cache/global-metadata.dec.dat disasm 0x9d7fb0 --to 0x9d8940
+  note       RunCharacterSelectionFlow -> ShowCharacterSelectionScreen (constructs the controller, ShowScreenAsync via vtable {klass+0x308}, awaits CompletionTask) -> ExecuteCharacterSelection@0x97c5e0.
+--- 48/74  (from ?)
+  subject    EFT.TarkovApplication::RunInitialLobbyFlow @0x97b550
+  predicate  callers
+  object     0 direct callers AND 0 rip-relative lea references -- reached via vtable or delegate only
+  method     measured
+  evidence   il2cpp_resolve.py D:/Games/Tarkov/GameAssembly.dll .cache/global-metadata.dec.dat callers 0x97b550 plus a PE scan of il2cpp/.text for 48 8D /r disp32 and 4C 8D /r disp32 targeting the RVA
+  note       Same for ShowMenuScreen@0x978a00, InitPreloaderUI@0x97a530, LoadLoginScenes@0x977f50, LoadMainMenu@0x9792f0. The only 8-byte-VA hit in the file is its own methodPointers slot at file offset 0x6c52540.
+--- 49/74  (from ?)
+  subject    prologue relocation windows (boot path)
+  predicate  rip-relative 80 3D inside the first 16 bytes
+  object     ShowProfileLoadingScreen@0x979a10 byte 4; PrepareGame@0x97cc70 and MainMenuLoad@0x97a380 byte 6; MenuLoadProfiler::Mark@0x9e3640 byte 9; OnApplicationLoaded@0x9839e0 byte 10
+  method     measured
+  evidence   il2cpp_resolve.py D:/Games/Tarkov/GameAssembly.dll .cache/global-metadata.dec.dat bytes on each
+  note       Direct CALLS are unaffected. A DETOUR needs a relocator that fixes up 80 3D <rel32>, or it must refuse -- the same shape that made CharacterSelectionScreen::Show@0x13ef4d0 unrelocatable.
+--- 50/74  (from ?)
+  subject    TarkovApplication::<StartTask>b__85_0 @0x987c40
+  predicate  is NOT a boot stage
+  object     it is the open-chat action: _menuOperation@0x128 . MainMenuShowOperation::ShowScreen(EMenuType.Chat=4, true)@0x9f8100
+  method     measured
+  evidence   il2cpp_resolve.py D:/Games/Tarkov/GameAssembly.dll .cache/global-metadata.dec.dat disasm 0x987c40 --to 0x987c70; il2cpp_resolve.py D:/Games/Tarkov/GameAssembly.dll .cache/global-metadata.dec.dat fields EFT.UI.EMenuType
+  note       Reading edx=4 as a boot ordering step would be a confidently wrong answer. EMenuType: Play=0 Player=1 Trade=3 Chat=4 MainMenu=100.
+--- 51/74  (from ?)
+  subject    UISpawner`1::get_SpawnedObject generic body 0x37EA0C0
+  predicate  is a LAZY FACTORY, not an accessor: it RESPAWNS when _spawnedObject@0xa0 is null OR Unity-dead
+  object     reads rdi=[this+0xa0]; if rdi==null or [rdi+0x10]==0 -> vtable klass+0x268 SpawnObject, klass+0x278 SetHeaderText([this+0x78],[this+0x80]), klass+0x288 SetMinWidth if [this+0x90]>=0, klass+0x298 SetEllipsis([this+0x94]); returns [this+0xa0]
+  method     measured
+  evidence   il2cpp_resolve.py disasm 0x37EA0C0 --to 0x37EA210
+  note       TRAP: a pointer captured from SpawnObject() becomes an orphan the moment its toggle is destroyed - still readable, m_IsOn reads 0 forever, never again the object the player clicks. Recorded as T13 in docs/SETTINGS-UI-MAP.md. Corroborated: R callers 0x16BC7F0 = 0 direct callers (vtable klass+0x268 only), and NEITHER UISpawner`1 (9 declared methods) NOR UIAnimatedToggleSpawner (9) declares OnEnable/Awake/Start - so the trigger is 'the old one is dead when someone asks', NOT 'the GameObject was enabled'.
+--- 52/74  (from ?)
+  subject    UIAnimatedToggleSpawner runtime field offsets (T=AnimatedToggle)
+  predicate  _headerCaption@0x78, _headerFontSize@0x80, _minWidth@0x90 (f32), _useEllipsis@0x94 (bool), _spawnedObject@0xa0
+  object     BORROWED from a verified body - the UISpawner`1 fields are GENERIC and have no offline fieldOffsets row
+  method     measured
+  evidence   il2cpp_resolve.py disasm 0x37EA0C0 (get_SpawnedObject reads/returns [this+0xa0] and passes 0x78/0x80/0x90/0x94 to the respawn calls)
+  note       T is AnimatedToggle, cross-confirmed: ToggleSilently @0x16BCBA0 passes the getter's return straight to Toggle::Set and then reads m_Transition@0x50 and _onTrigger@0x128 off it.
+--- 53/74  (from ?)
+  subject    UIAnimatedToggleSpawner::SpawnObject @0x16BC7F0
+  predicate  joins a RESPAWNED toggle to the SPAWNER's _toggleGroup@0xb0, not to whatever the old toggle was joined to
+  object     SetToggleGroup(tog, this._toggleGroup@0xb0, setMemberValue)
+  method     measured
+  evidence   docs/SETTINGS-UI-MAP.md 2.10, R disasm 0x16bc7f0
+  note       Consequence for cloned strips: joining the toggle you can see fixes only that toggle. The durable guarantee is the spawner's field. Host now READS _toggleGroup@0xb0 and REFUSES the subtab on disagreement rather than writing an 8-byte managed reference slot.
+--- 54/74  (from ?)
+  subject    aowlspt detour engine: attachDrain
+  predicate  does not apply the postfix stack-argument refusal that invoke.nim's postfixRefusal applies to mod patches (PostfixMaxSlots=4)
+  object     uihooks site 2 EFT.UI.MenuScreen::Show(5-arg) @0x15387A0 was bound POSTFIX with 7 register slots
+  method     measured
+  evidence   grep: PostfixMaxSlots is referenced only from invoke.nim:871 and aowlhost.nim:5034 (rvaPostfixRefusal); attachDrain @aowlhost.nim:5612 has no slot check and uihooks.nim passed postfix=true unconditionally
+--- 55/74  (from ?)
+  subject    EFT.UI.MenuScreen::Show(5-arg) @0x15387A0
+  predicate  reads its 5th argument (Profile) at [entry_rsp+0x28] and hands it to SeasonWidgetData::From
+  object     0x1538a4f mov rax,[rsp+0xc0] -> 0x1538a57 mov [r14+0x18],rax -> 0x1539126 mov rdx,[r14+0x18] -> 0x153912f call 0x141ffd0
+  method     measured
+  evidence   python tools/il2cpp_resolve.py D:/Games/Tarkov/GameAssembly.dll .cache/global-metadata.dec.dat disasm 0x15387A0 --to 0x1539650
+--- 56/74  (from ?)
+  subject    aowl postfix thunk (abi/aowlspt_detour.h aowl_thunk_common .Laowl_post)
+  predicate  enters the original with rsp = entry_rsp-0xA0, so the original's 5th stack argument resolves to thunk-frame +0x20, the slot used to park RAX across the dispatcher call and unwritten at call time
+  object     explains Rcx=1 in the three SeasonWidgetData::From crash dumps of 2026-09-02: a Profile that is a small integer
+  method     measured
+  evidence   the asm in abi/aowlspt_detour.h lines 1596-1700 (subq 0x98 then call *tramp) plus the MenuScreen::Show disassembly above
+--- 57/74  (from ?)
+  subject    EFT.UI.MenuScreen fields
+  predicate  carries both menu widgets as declared fields on the receiver uihooks site 2 hands us
+  object     _changeGameModeButton@0xd8 (the PVE ZONE change-mode selector), _seasonWidget@0xe8 (the KORD BREACH banner); no name walk is needed
+  method     measured
+  evidence   R fields EFT.UI.MenuScreen; corroborated in the body by mov rcx,[rsi+0xd8] @0x1538ed0 and mov rbx,[rsi+0xe8] @0x1539118
+--- 58/74  (from ?)
+  subject    EFT.UI.MenuScreen::Show widget gates
+  predicate  the game hides each widget through the SAME 0-arg vtable slot pair {klass+0x258, klass+0x260}
+  object     mode selector hidden when _modeDescriptor@0x120 == NULL (0x1538ed7 -> 0x1538eea); seasons widget hidden when _reconnectAvailable@0x100 != 0 or a static byte is set (0x15390f4/0x1539112 -> 0x153939b)
+  method     measured
+  evidence   R disasm 0x15387A0 --to 0x1539650
+  note       this is the CODE HOP for hiding both widgets; not taken yet because the identity of the method at vtable +0x258 on those two concrete klasses is unconfirmed
+--- 59/74  (from ?)
+  subject    abi/aowlspt_modeskip.h claim that ECharacterSelectionProfileStatus values are unreachable
+  predicate  is WRONG and superseded
+  object     Locked=0 Empty=1 Available=2 InRaid=3
+  method     measured
+  evidence   R fields EFT.ECharacterSelectionProfileStatus prints the HASDEFAULT constants (docs/BOOT-FLOW-MAP.md 1.7)
+--- 60/74  (from ?)
+  subject    UIAnimatedToggleSpawner._spawnedObject@0xa0
+  predicate  IS the AnimatedToggle itself; the +0xd0 Toggle hop belongs to _spawnableToggle@0xc0 (a UISpawnableToggle), NOT to @0xa0
+  object     SpawnObject 0x16BC7F0: rdi=base SpawnObject() -> Selectable::set_interactable(rdi); rax=get_SpawnableToggle() reads [rbx+0xc0]; rsi=[rax+0xd0]=UISpawnableToggle.Toggle -> SetToggleGroup/PlayEffect
+  method     measured
+  evidence   il2cpp_resolve.py disasm 0x16BC7F0 and 0x16BC670; fldoff.py fields EFT.UI.UISpawnableToggle
+  note       Decisive: set_interactable takes a Selectable and is called on rdi, and UISpawnableToggle is NOT a Selectable - its _sizeLabel@0xb0 collides with Selectable.m_SpriteState@0xb0. Confirmed twice more: ToggleSilently passes get_SpawnedObject's return straight to Toggle::Set then reads m_Transition@0x50 and _onTrigger@0x128 off it with no +0xd0; get_SpawnableToggle loads mov rdi,[rbx+0xc0]. A coordinator hypothesis that @0xa0 needed a +0xd0 hop was REFUTED by this.
+--- 61/74  (from ?)
+  subject    A freshly Instantiate'd UIAnimatedToggleSpawner clone
+  predicate  has _spawnedObject@0xa0 null until something asks the lazy factory
+  object     verifying the field at build time before calling SpawnObject refuses a perfectly good clone
+  method     measured
+  evidence   live host log 2026-09-02 17:38 lines 873-875: both cloned subtab spawners read null-or-dead at build, build reported 'only 0 of 2 subtabs came out usable' and hid the strip
+  note       FALSE POSITIVE of my own making: the build check was testing for a thing whose absence the checker caused. Correct order is ask-once-then-verify, using SpawnObject @0x16BC7F0 (UNIQUE, NON-generic, so no MethodInfo* hazard) rather than get_SpawnedObject @0x37EA0C0 (shared generic, needs a real MethodInfo* a host cannot supply). Do not call it when the field already holds a live toggle - fact #93 gives a second toggle.
+--- 62/74  (from ?)
+  subject    Object::op_Implicit liveness call inside a Toggle::Set prefix drain
+  predicate  is both a click-path cost and a silent-failure source; the game's own test is a raw m_CachedPtr@0x10 read
+  object     get_SpawnedObject tests cmp qword ptr [rdi+0x10], 0 at 0x37EA17B - no managed call
+  method     measured
+  evidence   il2cpp_resolve.py disasm 0x37EA0C0
+  note       Host now uses a raw @0x10 read for liveness and NO liveness test at all for pointer identity (a pointer equal to the this of an executing Set is alive by construction). Prime suspect for the 17:38 miss where the stock GraphicsToggle fell through to the by-name branch.
+--- 63/74  (from ?)
+  subject    tools/buildlock.py post-build staleness check
+  predicate  false-positived on abi/aowlspt_symtab.nim because that file is regenerated by symTab() in tools/aowl.nim on every build
+  object     fixed: generated files are declared in tools/deploy.json generatedSources and excluded from newest_source(), with the exclusion printed
+  method     measured
+  evidence   two no-op build host runs exited 6 ARTIFACT STALE; reproduced in tools/test_buildlock.py test_generated_is_not_a_source with a falsifier (real source newer -> still exit 6) and a control (same file undeclared -> exit 6)
+--- 64/74  (from ?)
+  subject    python tools/deploylock.py markers <args>
+  predicate  runs tools/markers.py under the build lock, and only when the target path is an artifact declared in this checkout's tools/deploy.json
+  object     closes the INCONCLUSIVE 'no such file' race where a concurrent build had removed the artifact; undeclared/worktree paths and --list-artifacts/--selftest take no lock; an unresolvable target locks
+  method     measured
+  evidence   tools/test_buildlock.py test_markers_under_lock: same planted live holder gives exit 4 NOTHING WAS CHECKED for the declared path (waited 4.5s) and immediate PRESENT (0.2s) for an undeclared path
+--- 65/74  (from ?)
+  subject    gcc under Git Bash (aowlspt dev machine)
+  predicate  fails because Git\mingw64\bin precedes msys64\ucrt64\bin on PATH; cc1.exe dies with 0xC0000139 STATUS_ENTRYPOINT_NOT_FOUND before main and prints nothing
+  object     cc1.exe rc=0xC0000139 with poisoned PATH, rc=0 with clean PATH; 17 DLL names collide between the two dirs (libgmp-10, libiconv-2, libwinpthread-1, libintl-8, libzstd, zlib1, libgcc_s_seh-1, ...), all differing in size
+  method     measured
+  evidence   Ran C:\msys64\ucrt64\lib\gcc\x86_64-w64-mingw32\15.2.0\cc1.exe directly under both PATHs from python; env bisect ruled out MSYSTEM, TMPDIR/TEMPDIR and msys-only vars independently (all still rc=1); only removing Git dirs or prepending ucrt64 fixed it. Prepend-only of each Git dir showed Git\mingw64\bin is the sole offender.
+--- 66/74  (from ?)
+  subject    tools/cctool.py find_cc/cc_run
+  predicate  makes compiler-shelling selftests shell-independent by prepending the compiler's own bin dir to PATH and verifying with a real TU compile
+  object     test_mqpolicy.py: 11 PASS 0 FAIL 0 INCONCLUSIVE from BOTH Git Bash and PowerShell (was INCONCLUSIVE from Bash); selftests.py --fast from Bash: 36 PASS 0 FAIL 0 INCONCLUSIVE, exit 0
+  method     measured
+  evidence   Ran test_mqpolicy.py and test_cctool.py from both shells, and selftests.py --fast from Bash, after the change.
+--- 67/74  (from ?)
+  subject    il2cpp_symtab.py --selftest PROOF 2 (poisoned identifier)
+  predicate  reported a confident FAIL, not INCONCLUSIVE, when run from Git Bash: its CONTROL TU could not compile for environmental reasons
+  object     FAIL emitted for an environment fault
+  method     inferred
+  evidence   Code read: it used bare shutil.which(gcc)+subprocess.run and branched to rec('compile','FAIL', 'clean rc=%d (want 0)') whenever rc_ok!=0. Under Bash gcc returns rc=1 with no output (measured). Not executed end to end here because the selftest needs GameAssembly.dll; now guarded by an explicit INCONCLUSIVE branch when the control fails with no diagnostic.
+--- 68/74  (from ?)
+  subject    FilesChecker.ConsistencyController
+  predicate  reads its manifest from
+  object     an AES-256-CBC blob injected into EscapeFromTarkov.exe at file offset 0xa3000, NOT from the plain ConsistencyInfo file; there is NO fallback (both catch blocks only LogException)
+  method     measured
+  evidence   il2cpp_resolve disasm 0x27d4310/0x27d8dd0/0x27d9de0; python tools/consistency.py dump decrypts 10601 entries whose Size/Checksum match D:/Games/Tarkov/ConsistencyInfo on all 10564 common entries
+--- 69/74  (from ?)
+  subject    injected consistency resource
+  predicate  format
+  object     at P: u8 ivLen=16, IV, i32 cipherLen, ciphertext; at S-8: i64 P; at S: 32-byte signature = SHA256(ASCII 'BSG_RESOURCE_V1'). Key = SHA256(ASCII buildId), buildId = the client version string, AES-256-CBC/PKCS7. Payload is Newtonsoft compact JSON with EscapeHtml UPPERCASE-hex escaping of & < > ' +
+  method     measured
+  evidence   SHA256 of all 32305 metadata string literals searched in the exe: exactly one hit at 0x27066d; dumps_newtonsoft round-trips the 1889861-byte payload byte-exactly
+--- 70/74  (from ?)
+  subject    fact #86 (plain ConsistencyInfo is re-syncable)
+  predicate  is corrected to
+  object     the client never reads that file; boot enforces SIZE from the embedded manifest but evidently NOT checksum for ordinary files -- Logging.config on disk has checksum 255412 vs embedded 255628, same size, and the game boots
+  method     measured
+  evidence   python tools/consistency.py verify --all-sizes: 1 of 10601 entries mismatch (nvngx_dlss.dll only); Logging.config size matches, checksum does not
+--- 71/74  (from ?)
+  subject    vendored mimalloc (nimony lib/std/system/mimalloc.nim)
+  predicate  was built with MI_DEBUG=2 in every aowlspt binary until 2026-09-03, and its EFAULT abort() is compiled in ONLY under #if (MI_DEBUG>0)
+  object     mi_error_default, vendor/mimalloc/src/options.c:541
+  method     measured
+  evidence   cdb -z EscapeFromTarkov.exe.636.dmp -c '.ecxr; k 40' put ucrtbase!abort under mi_malloc on the ops thread (via sain!resolve_0); dpp over the abort frame gave one string ptr, da 00007ffb3dfd1373 = 'corrupted thread-free list.' (page.c:205). markers.py found 'mi_page_queue_contains' PRESENT at 0x2aed11 in the deployed 5083136-byte host DLL and MISSING in the 5019648-byte rebuild made with --passC:-DMI_BUILD_RELEASE --passC:-DMI_DEBUG=0
+  note       MI_SECURE is 0, so MI_DEBUG was the sole reason the abort existed. Fix: mimallocFlags in tools/aowl.nim + tools/modbuild.py compile_cmd. Gate: tools/allocasserts.py (registered in selftests VERIFIERS). Trade: the page.c:205 corruption check still runs and still refuses the free, it just leaks instead of aborting. The cross-thread free anomaly on the sain resolve path is NOT fixed and is still open.
+--- 72/74  (from ?)
+  subject    aowlhost.nim gLastError (plain global, not threadvar)
+  predicate  caused
+  object     mimalloc 'corrupted thread-free list' (page.c:205) on the HOST heap, 2026-09-03 09:21:51
+  method     measured
+  evidence   WER dump EscapeFromTarkov.exe.636.dmp via cdb gave the stack (mi_malloc <- 3 host frames <- sain!resolve_0 <- resolveNow_0 <- ready_0 <- onUpdate_0 <- modOnUpdate). Source trace: var gLastError = '' at aowlhost.nim:1399 was a plain ARC global assigned from ~40 sites inside exportc ABI entry points (hostResolve, hostCall, hostConfigGet/Set, hostDbGet/Patch, hostRouteRegister, hostHandlePointer, hostHandlePin) reached on the mod OPS thread, and from installPatch on the UNITY MAIN thread, with no lock. Under ARC, assigning a global string FREES the previous buffer on the assigning thread => cross-thread free; two threads racing => double free of one buffer, which is exactly what corrupts that list. hostLastError also handed out toCString(gLastError), a raw interior pointer into the global.
+  note       Fix = {.threadvar.} in aowlhost.nim and Aowlspt.Sim/aowlsim.nim. backend/aowlbackend.nim:1960 ALREADY had the pragma on its identically-named gLastError and was unaffected -- the divergence between the three hosts was the defect. NOT a cross-module free.
+--- 73/74  (from ?)
+  subject    aowl mod/host ABI memory ownership
+  predicate  has no
+  object     cross-module allocator mismatch
+  method     measured
+  evidence   Audit of abi/aowlspt_shim.h + aowl/src/aowlspt.nim + host/common/modhost.nim: slice()=borrow, toString()=copy-in, allocBuffer()=mod copies into gHost.alloc and host frees, takeBuffer()=mod copies out then calls gHost.free. Allocator matched in both directions. aowl_modapi_new/free and aowl_hostapi_new/free are static-in-header (each DLL has a copy) but BOTH ends are called only from the host (modhost.nim:1239/1242/1545/1711), so one allocator owns each object.
+  note       The only borrowed pointer returned to mods is lastError's AowlSlice, documented 'valid until the next host call on this thread'. That contract became TRUE only with the threadvar fix.
+--- 74/74  (from ?)
+  subject    tools/abilint.py
+  predicate  detects
+  object     the gLastError crash shape, with a passing falsifier
+  method     measured
+  evidence   python tools/abilint.py --selftest = 5/5 PASS, including negative controls (threadvar-fixed shape clean; a gLastError= mention inside a comment block clean; a non-exported writer clean). Full-tree run: 20 HAZARD (ARC string globals written from exportc procs), 8 REVIEW (seq registries needing a lock, not a threadvar), 0 unreadable, across 88 files.
+  note       REVIEW is deliberately exit-0: a question that blocks a build gets waived reflexively. Waiver is an explicit '## abilint: shared-by-design -- <reason>' on the declaration.
+
+74 relayed measurement(s) (74 well-formed, 0 malformed).
+Do NOT file one you cannot stand behind -- check it first; the agent may have inferred what it labelled measured.
+Nothing was cleared. File each with fact_record, then re-run with --drain --clear (or empty C:/Users/savant/.aowl/relay.jsonl).
+```
