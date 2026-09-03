@@ -507,18 +507,32 @@ proc swReadToggle(control: Il2CppPtr; ok: var bool): bool =
   result = (b != 0'i32)
 
 proc swWriteToggle(control: Il2CppPtr; value: bool): bool =
-  ## Store one bool into a SettingToggle's widget. Model only -- the checkmark
-  ## does NOT move, because Unity repaints a Toggle from `Toggle::Set` and this
-  ## is a field store. Returns false and writes nothing if the slot is not
-  ## safely writable.
+  ## Set one bool on a SettingToggle's widget -- BY CALLING THE GAME, not by
+  ## storing (INTERACTION-LAYER-MAP M3, and the settings map).
+  ##
+  ## THIS USED TO BE A RAW `m_IsOn@0x120` STORE, and its own comment admitted
+  ## the defect: "the checkmark does NOT move". A model that is right while the
+  ## screen is wrong, reported as success, is the check-that-cannot-fail shape
+  ## (CLAUDE.md 9b) -- and it is the third time this exact trap appeared in
+  ## this feature. `Toggle::Set(value, sendCallback: FALSE)` @0x55BA450 moves
+  ## the checkmark and runs the Animator; sendCallback stays FALSE because
+  ## nothing the host issues may present itself to the game as a player press.
+  ##
+  ## `frRecvOk` is the type gate: there is no offset to bound when the callee
+  ## chooses it, so the receiver's TYPE is the whole of the protection, and it
+  ## is the thing that was missing in both 2026-09-02 crash dumps.
   result = false
   if control == nil or cIsReadable(control, cSuiOffCtrlValue() + 8'i32) == 0'i32:
     return
   let widget = cReadPtrAt(control, cSuiOffCtrlValue())
   if widget == nil or cIsReadable(widget, cSwOffToggleIsOn() + 4'i32) == 0'i32:
     return
-  result = cDuWriteU8(widget, cSwOffToggleIsOn(),
-                      (if value: 1'i32 else: 0'i32)) != 0'i32
+  # The widget is the control's own declared value component, so its klass is a
+  # fact about the layout rather than a guess about the contents.
+  discard frAdmit("settingswrite/toggle", frToggleIsOn(), widget)
+  if not frRecvOk("settingswrite/toggle", frToggleIsOn(), widget):
+    return
+  result = nuToggleSetQuiet(widget, value)
 
 proc swReadFloatSlider(control: Il2CppPtr; ok: var bool;
                        value, lo, hi: var float64) =

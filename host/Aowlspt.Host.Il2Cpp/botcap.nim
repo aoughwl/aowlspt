@@ -71,7 +71,14 @@ proc botCapBodyImpl(a: Il2CppPtr): Il2CppPtr {.
   if cur == 0'i32:
     okLog "botcap: BotSpawner.MaxBots already 0 (unlimited) -- nothing to do"
     return cast[Il2CppPtr](1)
-  if cBcWriteI32(sp, off, 0'i32) != 0'i32:
+  # THE TYPED STORE (INTERACTION-LAYER-MAP M3/M6). `bcSanePtr` is a canonical-
+  # range test and `cBcReadI32` a VirtualQuery -- neither can fail on the
+  # IL2CPP GC heap, so neither was ever a guard. `sp` is RCX of
+  # `EFT.BotSpawner::AddPlayer`, so its type is a FACT, not a plausibility:
+  # that is what makes admitting its klass here legitimate rather than
+  # circular. Every later fire must present the SAME klass or be refused.
+  discard frAdmit("botcap", frBcMaxBots(), sp)
+  if frStoreI32("botcap", frBcMaxBots(), sp, 0'i32):
     okLog "botcap: BotSpawner.MaxBots was " & $int(cur) &
           ", set to 0 (unlimited) -- offline bot cap lifted"
   else:

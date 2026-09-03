@@ -5608,6 +5608,40 @@ proc iCmdWrite(toks: seq[string]) =
   var buf = default(array[8, uint8])
   for i in 0 ..< 8:
     buf[i] = uint8((raw shr uint64(i * 8)) and 0xFF'u64)
+  # THE FIELDREF VERDICT ON A DELIBERATELY RAW WRITE.
+  #
+  # This verb stays raw on purpose -- it is the one escape hatch in the tree
+  # (WRITE-AUDIT #10) and an operator debugging a live client has to be able to
+  # write things the metadata has never heard of. What it must not do is write
+  # into a slot the metadata DOES know about without saying so: `write <expr>
+  # i32 -1` into a reference slot is a literal match for the producer of the
+  # 0x00000000FFFFFFFF that killed the liveness walk.
+  #
+  # ADVISORY, never a refusal. And it says NOTHING unless it can name a
+  # FieldRef whose receiver at `p - off` presents an ADMITTED klass -- matching
+  # on the offset alone would be a confidently wrong answer, which is worse
+  # than none. "no known field" is therefore not "safe"; it is "the table
+  # cannot claim this address", and it says exactly that.
+  var frWhy = 0'i32
+  let frRow = cFrLookup(p, size, frWhy)
+  if frRow >= 0'i32:
+    let what = $cFrRowType(frRow) & "." & $cFrRowField(frRow)
+    if frWhy == 1'i32:
+      iOut("  FIELDREF WARNING: " & iPtr(p) & " is " & what & ", which the " &
+           "metadata declares an 8-byte managed REFERENCE. Writing " &
+           $int(size) & " byte(s) of " & t & " there is exactly the store " &
+           "the typed path refuses (R1): a 4-byte -1 into a zeroed reference " &
+           "slot IS 0x00000000FFFFFFFF. Proceeding, because this verb is the " &
+           "deliberate escape hatch -- but that is what you are doing.")
+    elif frWhy == 2'i32:
+      iOut("  FIELDREF WARNING: " & iPtr(p) & " is inside " & what &
+           ", which is " & $int(cFrRowWidth(frRow)) & " byte(s) wide; this " &
+           "write of " & $int(size) & " byte(s) runs past the end of it.")
+    else:
+      iOut("  fieldref: " & iPtr(p) & " is " & what & " (" &
+           $int(cFrRowWidth(frRow)) & " bytes, " &
+           (if cFrRowIsRef(frRow) != 0'i32: "reference" else: "value") &
+           "); the typed path would allow this width.")
   iMark(("WRITE " & t & " at " & iPtr(p)), p)
   if cInspWriteBytes(p, 0'i32, size, cast[ptr uint8](addr buf[0])) == 0'i32:
     iErr("that address is not safely writable for " & $int(size) & " bytes")

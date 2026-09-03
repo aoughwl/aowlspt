@@ -120,7 +120,13 @@ proc botAiBodyImpl(a: Il2CppPtr): Il2CppPtr {.
     # Already ready. Nothing to do; the game will activate this bot by itself.
     return cast[Il2CppPtr](1)
 
-  if cBaWriteU8(mgr, cBaOffIsReady(), 1'i32) != 0'i32:
+  # THE TYPED STORE (INTERACTION-LAYER-MAP M3/M6). `mgr` was read out of
+  # `BotOwner.WeaponManager`, a field the metadata declares
+  # `BotWeaponManager` -- so its type is a fact about the layout, not a guess
+  # about the contents, which is what makes admitting its klass legitimate.
+  # `baSanePtr` + VirtualQuery, the previous guards, cannot fail on the GC heap.
+  discard frAdmit("botai", frBaIsReady(), mgr)
+  if frStoreU8("botai", frBaIsReady(), mgr, 1'u8):
     gBotAiPokes = gBotAiPokes + 1
     if gBotAiPokes <= 12 or (gBotAiPokes mod 25) == 0:
       okLog "botai: BotOwner=0x" & hexOf(ownerRaw) & " state=" &

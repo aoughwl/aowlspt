@@ -4884,6 +4884,13 @@ proc hexOf(v: uint64): string =
     x = x shr 4
   return s
 
+## THE TYPED STORE PATH. Included HERE, before every site that stores into
+## game-owned memory, because Nim's `include` is textual and botcap/botai/
+## nativeui all come below. It depends on nothing above except `Il2CppPtr`,
+## `hexOf`, `okLog` and `warn`. Defines `frStore*`/`frRecvOk`/`frAdmit` over the
+## GENERATED `abi/aowlspt_fieldrefs.h`. See INTERACTION-LAYER-MAP M3/M6.
+include "hostfieldwrite.nim"
+
 var gCodeGenRefusals = 0
 const CodeGenRefusalCap = 24
   ## Self-limiting log, not self-disabling behaviour: the walk itself cannot
@@ -7017,7 +7024,8 @@ proc versionBrandFired(regs: Il2CppPtr) =
   # Raw scan for the text-backing String on the component. Read each pointer slot
   # and interpret it as a System.String by its FIXED layout (length @ +0x10,
   # UTF-16 chars @ +0x14) -- NO objectClass/className, because runtime reflection
-  # is dead on this build (the settings-probe verdict). The version String is
+  # TOKEN-GATED on this build and answer with a plausible random value when
+  # called without their token (CLAUDE.md section 5). The version String is
   # found by CONTENT (`looksLikeVersion`), which is self-validating: a slot whose
   # bytes are not a short version-looking ASCII string is skipped, so a wrong slot
   # cannot be mistaken for the target.
@@ -7059,12 +7067,42 @@ proc versionBrandFired(regs: Il2CppPtr) =
     return
   okLog "version brand: allocated branded String ok; writing it into label " &
         "slot +0x" & hexOf(uint64(textField))
-  if cUxWritePtr(label, int32(textField), ns) != 0'i32:
-    okLog "version brand: slot +0x" & hexOf(uint64(textField)) &
-          " set to \"" & gBrandText & "\" (raw field write, no reflection)"
+  # THE STATED EXCEPTION, AND WHY IT IS NOW BOUNDED (WRITE-AUDIT #9, section
+  # 5.4; INTERACTION-LAYER-MAP M3/M6).
+  #
+  # This is the ONLY host store whose offset never came out of the field table:
+  # it is DISCOVERED by scanning the component in 8-byte steps for a slot whose
+  # CONTENTS look like a version string. That acceptance test is a test of the
+  # contents, not of the declared type -- the check-that-cannot-fail shape
+  # (CLAUDE.md 9b), and it is why the write audit ranked this site #2.
+  #
+  # The scan is kept (it is how the slot is identified at all) but it no longer
+  # has the authority to write. The discovered offset must MATCH
+  # `TMPro.TMP_Text.m_text`'s metadata offset, and the store then goes through
+  # the generated FieldRef like every other site -- an 8-byte reference store
+  # into a slot the metadata declares a reference, on a receiver whose klass
+  # has been admitted. A discovered offset that is NOT m_text means this
+  # component is not the type we think it is, and the honest answer to that is
+  # to write nothing.
+  if int32(textField) != cFrOff(frTmpMText()):
+    warn "version brand: the discovered version-String slot is +0x" &
+         hexOf(uint64(textField)) & ", but TMPro.TMP_Text.m_text is at +0x" &
+         hexOf(uint64(cFrOff(frTmpMText()))) & " on this build. A slot found " &
+         "by its CONTENTS is not evidence of a declared type, so nothing was " &
+         "written (WRITE-AUDIT #9)."
+    return
+  # The label component was read out of PreloaderUI at its declared offset, so
+  # its klass is a fact about the layout; a later fire presenting a different
+  # klass is refused rather than written through.
+  discard frAdmit("version brand", frTmpMText(), label)
+  if frStorePtr("version brand", frTmpMText(), label, ns):
+    okLog "version brand: TMPro.TMP_Text.m_text (+0x" &
+          hexOf(uint64(cFrOff(frTmpMText()))) & ") set to \"" & gBrandText &
+          "\" through the generated FieldRef"
   else:
-    warn "version brand: field slot +0x" & hexOf(uint64(textField)) &
-         " was not safely writable; left unchanged"
+    warn "version brand: the typed store into TMP_Text.m_text was REFUSED " &
+         "(see the hostwrite REFUSED line above for which rule); the stock " &
+         "version is left in place"
 
 proc bindVersionBrand(verbose: bool): bool =
   ## Installs the POSTFIX detour on `EFT.UI.PreloaderUI::Awake` from the verified

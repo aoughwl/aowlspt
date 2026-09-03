@@ -823,11 +823,22 @@ proc swSeedToggle(control: Il2CppPtr; value: bool): bool =
     return false
   let fn = swFn(SwToggleNoNotify)
   if fn == nil:
-    # Fall back to the raw store: the model will be right even though the
-    # checkmark will not move until the player clicks it. Better than a row
-    # whose value is simply the donor's.
-    return cDuWriteU8(widget, cSwOffToggleIsOn(),
-                      (if value: 1'i32 else: 0'i32)) != 0'i32
+    # THE RAW-STORE FALLBACK IS GONE (INTERACTION-LAYER-MAP M3). It stored
+    # `m_IsOn@0x120` directly and its own comment conceded "the checkmark will
+    # not move until the player clicks it" -- a model that is right while the
+    # screen is wrong, reported as success. There is no safe raw version of
+    # this write, so the honest outcome is a refusal that says why.
+    warn "settings page: Toggle::SetIsOnWithoutNotify @0x55BA440 did not " &
+         "byte-verify, so this row's value was NOT applied. The raw " &
+         "m_IsOn@0x120 store that used to stand in here has been removed: it " &
+         "moved the model and not the checkmark, and reported success either " &
+         "way (INTERACTION-LAYER-MAP M3)."
+    return false
+  # The receiver's TYPE is the whole of the protection for a setter call; the
+  # widget is the row's declared value component, so its klass is a fact.
+  discard frAdmit("settingspages/toggle", frToggleIsOn(), widget)
+  if not frRecvOk("settingspages/toggle", frToggleIsOn(), widget):
+    return false
   cSwCallVPB(fn, widget, (if value: 1'i32 else: 0'i32))
   result = true
 

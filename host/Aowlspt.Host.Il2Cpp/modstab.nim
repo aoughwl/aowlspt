@@ -1512,7 +1512,22 @@ proc modsBuildSubtabs(stripT, buttonDonorGo, donorT: Il2CppPtr;
       let g = cReadPtrAt(bound, ModsOffGroup)
       if g != nil and g == stockGroup:
         gModsOwnExclusive = true
-        discard cUxWritePtr(bound, ModsOffGroup, cast[Il2CppPtr](0))
+        # NO LONGER A STORE. Writing `m_Group@0x110` to null leaves this
+        # toggle in the stock group's `m_Toggles` while claiming no group --
+        # MEASURED (docs/AOWL_FACTS.md, SETTINGS-UI-MAP 7.10) to be a WORSE
+        # dangling shape than before the call, and the same defect nativetabs'
+        # `ntDetachFromStockGroups` had. `Toggle::SetToggleGroup(null, false)`
+        # @0x55BA150 unregisters from the old group, stores, and registers --
+        # the game's own code doing the store, which is the whole point of
+        # INTERACTION-LAYER-MAP M3.
+        #
+        # `bound` is a component the game returned for its declared type, so
+        # its klass is a fact; `frRecvOk` then refuses the call outright if a
+        # later fire presents a DIFFERENT klass, which is what a stale pointer
+        # into recycled GC memory looks like.
+        discard frAdmit("modstab/detach", frToggleGroup(), bound)
+        if frRecvOk("modstab/detach", frToggleGroup(), bound):
+          discard nuToggleJoinGroup(bound, nil)
     discard modsSetActive(btn, true)
     gModsSubs.add ModsSub(name: gModsPages[p].title, toggle: bound,
                           pageGo: nil, lastOn: false)

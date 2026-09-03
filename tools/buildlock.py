@@ -2283,6 +2283,10 @@ SEH_EXIT = 12
     # D8: a nested `aowl_p_p_seh`.
 FLAG_EXIT = 13
     # D10: a feature flag that defaults ON without an allowlist entry.
+STORE_EXIT = 14
+    # M3/M6: a raw store into game-owned memory outside the typed FieldRef
+    # path. Its own code, like the four above, because a caller that cannot
+    # tell these apart fixes the wrong thing.
     # Each pre-flight gets its OWN code for the reason DRAIN_EXIT does: a
     # caller that cannot tell them apart fixes the wrong thing.
 LOG_RING = 4000
@@ -2649,6 +2653,12 @@ def main():
                         "refuses with exit %d when a host feature flag "
                         "defaults ON without an allowlisted reason."
                         % FLAG_EXIT)
+    p.add_argument("--no-store-audit", action="store_true",
+                   dest="no_store_audit",
+                   help="skip the tools/storelint.py pre-flight (M3/M6). It "
+                        "refuses with exit %d when a raw store into "
+                        "game-owned memory appears outside the typed FieldRef "
+                        "path in hostfieldwrite.nim." % STORE_EXIT)
     p.add_argument("--lint-strict", action="store_true", dest="lint_strict",
                    help="the pre-flight refuses on nimlint WARNINGS too "
                         "(three exist in this tree today, in code that "
@@ -2749,7 +2759,12 @@ def main():
             (not a.no_flag_audit, "flagaudit",
              "D10 (a feature flag that defaults ON with no allowlist entry in "
              "tools/deploy.json flagDefaultsOn)", FLAG_EXIT, "--no-flag-audit",
-             None)):
+             None),
+            (not a.no_store_audit, "storelint",
+             "M3/M6 (a raw store into game-owned memory outside the typed "
+             "FieldRef path -- a bare offset guarded only by readability, "
+             "which cannot fail on the IL2CPP GC heap)", STORE_EXIT,
+             "--no-store-audit", {"quiet": True})):
         if not enabled:
             continue
         rc = invariant_preflight(a.repo, module, invariant, code, flag,

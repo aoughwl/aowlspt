@@ -1551,9 +1551,19 @@ proc nuWireTextDeps(fresh, donor: Il2CppPtr): bool =
   okLog "nativeui: wireTextDeps: got gMat=0x" & hexOf(cast[uint64](gMat)) &
         "; about to SET m_fontAsset on the FRESH component"
 
-  if cNuSetRef(fresh, NuOffTmpFontAsset, font) == 0'i32:
-    warn "nativeui: wireTextDeps: m_fontAsset slot on the fresh TMP is not " &
-         "writable; refusing"
+  # THE TYPED STORES (INTERACTION-LAYER-MAP M3/M6). All three of these are
+  # 8-byte REFERENCE slots, so R1 applies: the FieldRef refuses any narrower
+  # store into them, which is producer (A) of the 0x00000000FFFFFFFF crash.
+  # `fresh` is what `AddComponent<TextMeshProUGUI>` just returned and `donor`
+  # a live TMP the game built, so both klasses are facts; they are the same
+  # klass, and admission is done once here from `fresh`.
+  discard frAdmit("nativeui/wireTextDeps", frTmpFontAsset(), fresh)
+  discard frAdmit("nativeui/wireTextDeps", frTmpSharedMat(), fresh)
+  discard frAdmit("nativeui/wireTextDeps", frGraphicMat(), fresh)
+  if not frStorePtr("nativeui/wireTextDeps", frTmpFontAsset(), fresh, font):
+    warn "nativeui: wireTextDeps: the typed store into m_fontAsset was " &
+         "REFUSED (see the hostwrite REFUSED line above for which rule); " &
+         "refusing to build a TMP whose font never landed"
     return false
   okLog "nativeui: wireTextDeps: SET m_fontAsset ok (font 0x" &
         hexOf(cast[uint64](font)) & " copied from donor 0x" &
@@ -1561,7 +1571,7 @@ proc nuWireTextDeps(fresh, donor: Il2CppPtr): bool =
 
   if nuOk(sharedMat, 0x10'i32):
     okLog "nativeui: wireTextDeps: about to SET m_sharedMaterial on the FRESH"
-    if cNuSetRef(fresh, NuOffTmpSharedMaterial, sharedMat) != 0'i32:
+    if frStorePtr("nativeui/wireTextDeps", frTmpSharedMat(), fresh, sharedMat):
       okLog "nativeui: wireTextDeps: SET m_sharedMaterial ok (0x" &
             hexOf(cast[uint64](sharedMat)) & ")"
   else:
@@ -1570,7 +1580,7 @@ proc nuWireTextDeps(fresh, donor: Il2CppPtr): bool =
 
   if nuOk(gMat, 0x10'i32):
     okLog "nativeui: wireTextDeps: about to SET Graphic m_Material on the FRESH"
-    discard cNuSetRef(fresh, NuOffGraphicMaterial, gMat)
+    discard frStorePtr("nativeui/wireTextDeps", frGraphicMat(), fresh, gMat)
     okLog "nativeui: wireTextDeps: SET Graphic m_Material ok (0x" &
           hexOf(cast[uint64](gMat)) & ")"
   okLog "nativeui: wireTextDeps: DONE -- all reachable deps copied"

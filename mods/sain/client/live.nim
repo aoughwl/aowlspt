@@ -1938,14 +1938,47 @@ proc callVec*(l: var LazyCall; obj: Il2CppPtr; p: Vec3; flag: bool): bool =
   var i = 1
   while i < n:
     let tn = typeName(gRt, methodParam(gRt, l.m, i))
+    # THE STACK-ADDRESS-AS-A-REFERENCE DEFECT, and the refusal that replaces it
+    # (docs/WRITE-AUDIT-2026-09-02.md section 4, candidate #1).
+    #
+    # IL2CPP's `runtime_invoke` marshalling -- restated four lines above and
+    # again in `abi/aowlspt_shim.h` -- is that a VALUE-TYPE slot POINTS AT the
+    # value while a REFERENCE slot *IS* the pointer. The `else:` branch used to
+    # zero `scratch[i]` and hand the callee `&scratch[i]` regardless, so for
+    # every parameter that was not Single or Boolean -- and this function's own
+    # doc comment says that branch covers "an integer, an enum OR A REFERENCE"
+    # -- the callee received A HOST STACK ADDRESS as a managed object. A callee
+    # that stores it into a field makes the next liveness walk
+    # (`il2cpp_unity_liveness_calculation_from_root`, `test byte ptr [rcx],1`)
+    # follow host stack memory, arbitrarily far from here.
+    #
+    # There is no safe way to synthesise a managed object for an unknown
+    # reference parameter from native code, so this REFUSES rather than
+    # guessing. The value-type list is explicit; anything not on it is not
+    # marshalled. A drive call that declines is a bot that keeps its previous
+    # order. A corrupt reference is a client kill minutes later.
     if tn == "System.Single":
       writeFloat(gF0, cast[Il2CppPtr](addr scratch[i]), -1.0)
+      argv[i] = cast[Il2CppPtr](addr scratch[i])
     elif tn == "System.Boolean":
       if i == 1 and flag:
         scratch[i] = 1'i64
-    else:
+      argv[i] = cast[Il2CppPtr](addr scratch[i])
+    elif tn == "System.Int32" or tn == "System.UInt32" or
+         tn == "System.Int64" or tn == "System.UInt64" or
+         tn == "System.Int16" or tn == "System.UInt16" or
+         tn == "System.SByte" or tn == "System.Byte" or
+         tn == "System.Char" or tn == "System.Double" or
+         tn == "System.IntPtr" or tn == "System.UIntPtr":
       scratch[i] = 0'i64
-    argv[i] = cast[Il2CppPtr](addr scratch[i])
+      argv[i] = cast[Il2CppPtr](addr scratch[i])
+    else:
+      warn "sain: runtime_invoke REFUSED -- parameter " & $i & " of this " &
+           "drive call is declared '" & tn & "', which is not a value type " &
+           "this marshaller can build. Passing &scratch[i] for it would hand " &
+           "the callee A HOST STACK ADDRESS as a managed reference " &
+           "(WRITE-AUDIT candidate #1); the call was not made."
+      return false
     inc i
   discard reflect(l.m, obj, cast[Il2CppPtr](addr argv[0]))
   result = true

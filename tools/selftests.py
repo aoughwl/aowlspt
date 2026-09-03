@@ -174,6 +174,17 @@ ITEMS = [
     S("dlss.py", "fast", args=("selftest",)),          # fake install + manifest falsifiers
     S("dlssnr.py", "fast", args=("selftest",)),        # OptiScaler-DLSSNR install tree + falsifiers
     S("abilint.py", "fast", args=("--selftest",)),      # ABI ownership lint + falsifier
+    # M3/M6: no raw store into game-owned memory outside the typed FieldRef
+    # path. `--falsify` asserts the lint FIRES on a synthetic raw store, stays
+    # SILENT on the annotated one, and exempts the gate file itself.
+    S("storelint.py", "fast", args=("--falsify",)),
+    # The generated FieldRef header must still agree with the metadata.
+    # INCONCLUSIVE-by-absence is handled by `needs`: with no GameAssembly.dll
+    # or decrypted metadata this cannot run, and "I could not look" is not a
+    # pass.
+    S("fieldrefs.py", "fast", args=("check",),
+      needs=(GAMEASM, METADEC),
+      note="regenerates abi/aowlspt_fieldrefs.h and diffs it; exit 5 = drift"),
     S("consistency.py", "fast", args=("selftest",)),   # injected-manifest container + falsifiers
     # The allocator must not be a crash source. Its own --selftest builds four
     # synthetic binaries and asserts FAIL / PASS / INCONCLUSIVE all fire.
@@ -298,6 +309,25 @@ VERIFIERS = [
       "declared column that DISAGREES with the metadata fails, and that an "
       "accessor whose table the parser cannot see fails instead of passing "
       "vacuously -- which is the hole that really existed"),
+    V("storelint.py", "storelint.py --falsify",
+      "the falsifier asserts THREE things, because the lint has three ways to "
+      "be worthless: a synthetic raw `cUxWritePtr` store MUST be flagged (so "
+      "CLEAN is not the only reachable verdict); the same line carrying the "
+      "`# storelint: allow HOST-OWNED --` annotation MUST NOT be (an exemption "
+      "that does not work turns every legitimate site into a permanent finding "
+      "and the lint gets switched off); and the gate file itself MUST NOT be "
+      "flagged, since the raw store has to live somewhere. The BASELINE is "
+      "additionally self-falsifying: an entry that no longer matches anything "
+      "in the tree FAILS, so a routed site cannot leave a permanent hole"),
+    V("fieldrefs.py", "fieldrefs.py check",
+      "two self-checks gate every emission and both can fail: fldoff's "
+      "System.String._stringLength@0x10 / _firstChar@0x14 (the OFFSET scan), "
+      "and this tool's own `fieldref_self_check`, which re-derives "
+      "UnityEngine.UI.Toggle.m_Group as width 8 / IS_REFERENCE. That last row "
+      "is the one that matters: if the type-byte decoder were wrong a CLASS "
+      "field would decode as a primitive and M4 (no narrow store into a "
+      "reference slot) would silently stop applying to the whole table. "
+      "`check` regenerates and diffs, so a hand-edited header exits 5"),
     V("uihooks_check.py", "test_uihooks_falsifier.py",
       "feeds a per-frame action trail and asserts FAIL, so PASS is not the "
       "only reachable verdict"),

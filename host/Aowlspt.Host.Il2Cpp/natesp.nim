@@ -1596,10 +1596,20 @@ proc neColour(box: Il2CppPtr; faction: int32; alpha: float32): bool =
   ## It does NOT prove the colour reaches the screen -- that is `neVerdict`, and
   ## even that stops short of "a human saw it".
   if not neOk(box, NeOffGraphicColor + 16'i32): return false
+  # THE TYPED STORE (INTERACTION-LAYER-MAP M3/M6). `box` is what
+  # `GameObject::AddComponent<Image>` just returned (`nuAdd(go, NuKindImage)`
+  # in `neBuildPool`), so its klass is a fact. The FieldRef declares
+  # `UnityEngine.UI.Graphic`; the runtime klass is the concrete `Image`, which
+  # is exactly why admission is an allowlist and not one recorded pointer.
+  #
+  # The four channels go in as four SUB-FIELD f32 stores. `aowl_fr_gate`
+  # bounds `sub + 4` by the metadata-derived 16-byte width of `Color`, so a
+  # fifth channel could not be written even if this loop were wrong.
+  discard frAdmit("natesp/build", frGraphicColor(), box)
   var i = 0'i32
   while i < 4'i32:
     let v = (if i == 3'i32: alpha else: cNeFactionRgba(faction, i))
-    if cDuWriteF32(box, NeOffGraphicColor + i * 4'i32, float64(v)) == 0'i32:
+    if not frStoreF32("natesp/build", frGraphicColor(), box, v, i * 4'i32):
       return false
     inc i
   cReadI32At(duPtrAdd(box, NeOffGraphicColor + 12'i32)) != 0'i32

@@ -192,6 +192,12 @@ const
 {.emit: """
 #include <windows.h>
 #include <string.h>
+/* THE TYPED STORE PATH (docs/INTERACTION-LAYER-MAP.md M3/M6). `aowlspt_hostwrite.h`
+ * pulls in the GENERATED `aowlspt_fieldrefs.h`, which carries
+ * Diz.Resources.EasyBundle._path's offset, WIDTH and IS_REFERENCE straight out
+ * of Il2CppMetadataRegistration.fieldOffsets. Everything it declares is static,
+ * so including it here costs this module nothing it does not call. */
+#include "aowlspt_hostwrite.h"
 
 /* Committed-and-readable, out to `n` bytes, without leaving the region the
  * query answered for. Every dereference on this path goes through it: `this`
@@ -276,6 +282,18 @@ proc breReadMem(p, outp: Il2CppPtr; n: int32): int32 {.importc: "aowl_bre_readme
 proc breReadPtr(p: Il2CppPtr): Il2CppPtr {.importc: "aowl_bre_readptr", nodecl.}
 proc breReadI32(p: Il2CppPtr; outv: ptr int32): int32 {.importc: "aowl_bre_readi32", nodecl.}
 proc breWritePtr(p, v: Il2CppPtr): int32 {.importc: "aowl_bre_writeptr", nodecl.}
+# The typed path. `breWritePtr` above is now used ONLY by this module's own
+# host-owned scratch, never on the managed heap -- `tools/storelint.py` fails
+# the build if a raw store into game memory reappears outside these helpers.
+# Bound through the GENERATED per-row accessor, never as `(&AOWL_FR_EB_PATH)`:
+# `importc` on a proc emits a CALL, so that spelling compiles to
+# `(&AOWL_FR_EB_PATH)()` and gcc refuses it (measured 2026-09-03).
+type FieldRefPtr = Il2CppPtr
+proc frEbPath(): FieldRefPtr {.importc: "aowl_fr_eb_path", nodecl.}
+proc frAdmit(fr, recv: FieldRefPtr): int32 {.importc: "aowl_fr_admit", nodecl.}
+proc frStorePtr(fr, recv: FieldRefPtr; sub: int32; v: Il2CppPtr;
+                why: var int32): int32 {.importc: "aowl_fr_store_ptr", nodecl.}
+proc frOff(fr: FieldRefPtr): int32 {.importc: "aowl_fr_off", nodecl.}
 proc breRva(rva: uint32): Il2CppPtr {.importc: "aowl_bre_rva", nodecl.}
 
 proc at(p: Il2CppPtr; off: uint): Il2CppPtr =
@@ -619,8 +637,29 @@ proc onBundleLoad(frame: PatchFrame): TypedResult =
   if cast[uint](sp) == 0'u:
     inc gAllocFailed
     return frameContinue()
-  if breWritePtr(at(eb, EbPathOff), sp) == 0'i32:
+  # THE TYPED STORE. Reading the old slot back and requiring a readable string
+  # (above) was the best guard in the tree at the time of the write audit, and
+  # it is still not sufficient: it tests the CONTENTS, not the declared type,
+  # and on the IL2CPP GC heap a stale pointer into recycled memory can hold a
+  # readable string belonging to something else entirely.
+  #
+  # `AOWL_FR_EB_PATH` is generated from the metadata and says `_path` is an
+  # 8-byte managed REFERENCE, so R1 refuses any narrower store into it -- the
+  # producer of the 0x00000000FFFFFFFF that killed the liveness walk. `eb` is
+  # RCX of the EasyBundle method this drain rides, so its type is a fact and
+  # admitting its klass here is legitimate rather than circular.
+  discard frAdmit(frEbPath(), eb)
+  var frWhy = 0'i32
+  if frStorePtr(frEbPath(), eb, 0'i32, sp, frWhy) == 0'i32:
     inc gWriteRefused
+    # Capped so a per-bundle path cannot flood the log. The REFUSAL is never
+    # capped -- only the sentence about it.
+    if gWriteRefused <= 4'i64:
+      warn "textures  REFUSED: the typed store into Diz.Resources.EasyBundle." &
+           "_path (+0x" & $frOff(frEbPath()) & ") was refused with rule code " &
+           $frWhy & " (1=narrow-into-reference 2=too-wide 3=klass-not-admitted " &
+           "4=receiver 5=bound 6=unusable FieldRef). Nothing was written; the " &
+           "bundle loads from its stock path."
     discard fault()
     return frameContinue()
 
