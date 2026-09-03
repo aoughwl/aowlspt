@@ -263,3 +263,9 @@ Other known DRS ids (emoose): `0x10E41DF4` FORCE_DLAA, `0x10E41DF5` scaling rati
 * No route is hit on the backend for this save, and no NGX line appears in `Player.log`
   either way; the rendering-side proof is the NVIDIA on-screen indicator
   (`ShowDlssIndicator`), which only a human can read.
+
+* **PROVEN 2026-09-03 ~12:30.** `Get-Process EscapeFromTarkov` lists module `nvngx_dlss.dll`
+  FileVersion 310,7,0,0 loaded from `D:\Aowlspt\EscapeFromTarkov_Data\Plugins\x86_64\`
+  while the client sits at the menu (NGX only loads it when DLSS initialises);
+  `HKLM\SOFTWARE\NVIDIA Corporation\Global\NGXCore\ShowDlssIndicator` = 1024; the user
+  reports the NVIDIA DLSS badge on screen in raid. DLSS 310.7.0 / preset K is live.
