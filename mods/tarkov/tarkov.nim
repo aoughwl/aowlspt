@@ -396,8 +396,35 @@ proc onProfileList(url, body, session: string): string =
   ## Every profile, PMC and scav side by side. An empty list is what puts the
   ## client on its "create a character" screen, which is the correct first-run
   ## behaviour rather than something to avoid.
+  ##
+  ## THE ONE WINDOW A LOADOUT CAN LAND IN. MEASURED
+  ## (`data/capture/raid1/manifest.json`, its own seq): the client fetches
+  ## `profile/list` at 096, selects at 098, configures the raid at 156 and
+  ## starts the match at 158 -- and never fetches `profile/list` again in
+  ## between. `onMatchStart` sends `profile: null`. So the inventory the
+  ## character spawns with is the one built HERE, and this is the last moment
+  ## anything can change it for the raid that follows.
+  ##
+  ## `tarkov.profile.listing` is emitted before a single profile is loaded, so a
+  ## subscriber may mint into the store during it -- `mods/autoraid`'s server
+  ## half does exactly that, via `autoraid.loadout.apply` -> `emu/raidloadout` --
+  ## and the loop below then reads the profiles FRESH and serves the updated
+  ## text. Emitted even when no profile is bound to the session: an unbound
+  ## session is the first-run case, and a subscriber that wants to know about
+  ## it should hear about it rather than be told nothing happened.
+  ##
+  ## `arListingBegin`/`arListingEnd` bracket it so an apply can report whether
+  ## it landed inside the window. An apply outside it is honoured and does NOT
+  ## reach the coming raid, and it says so.
   var a = arr()
   let all = allProfileIds()
+  arListingBegin()
+  var listing = obj()
+  put(listing, "session", session)
+  put(listing, "profileId", currentProfile(session).id)
+  put(listing, "cycle", arListingCycle())
+  discard broadcast("tarkov.profile.listing", listing)
+  arListingEnd()
   # Deduplicate on the PARSED `_id`, which is what the client keys on -- NOT on
   # the id `allProfileIds` derives from the store FILENAME.
   #
@@ -804,12 +831,12 @@ proc onProfileSelect(url, body, session: string): string =
     info "menu corner label: profile " & id & " has no nickname to show"
   applyMenuCornerLabel()
 
-  # AutoRaid's first of two triggers. MEASURED (capture raid1, manifest seq
-  # 096 then 098): this fires immediately AFTER the client's last
+  # A useful signal, and TOO LATE to change this raid. MEASURED (capture raid1,
+  # manifest seq 096 then 098): this fires immediately AFTER the client's last
   # `/client/game/profile/list`, so a loadout applied here reaches the client at
-  # the NEXT list, not the raid that is about to start. See the header of
-  # `emu/raidloadout`, where the ordering is written out in full rather than
-  # left for a subscriber to discover from inside a raid.
+  # the NEXT list, not the raid that is about to start. The window that DOES
+  # reach it is `tarkov.profile.listing`, emitted from `onProfileList` above.
+  # Kept, because knowing which profile a session bound to is worth knowing.
   var selected = obj()
   put(selected, "session", session)
   put(selected, "profileId", id)
@@ -2330,10 +2357,12 @@ proc onRaidConfiguration(url, body, session: string): string =
   # profile, so a subscriber could not tell WHOSE raid it was. Every member of
   # `cfg` is still there; `session`, `profileId` and `raidMode` are added.
   #
-  # This is AutoRaid's second trigger, and it is LATER than the last
-  # `/client/game/profile/list` (capture raid1 seq 096 vs 156), so gear applied
-  # from it spawns with the NEXT raid, not this one. `emu/raidloadout` says so
-  # in its status route too.
+  # Later still: this is seq 156 against the last `profile/list` at 096, so gear
+  # applied from here spawns with the NEXT raid, not this one. It is kept
+  # because the MAP is known here and nowhere earlier, which is the thing this
+  # event is actually for. `tarkov.profile.listing` is the window that reaches
+  # the coming raid, and `emu/raidloadout`'s status route says which of the two
+  # the last apply used.
   var cfgDoc = parseObject(cfg)
   setText(cfgDoc, "session", session)
   setText(cfgDoc, "profileId", currentProfile(session).id)
@@ -2552,8 +2581,33 @@ proc onMatchEnd(url, body, session: string): string =
            " (" & $karmaKills & " kill(s) priced)"
     for problem in karmaProblems:
       warn "scav karma: " & problem
+    # AutoRaid's ephemeral gear, on the SCAV path too.
+    #
+    # The minted set is keyed by the PMC's profile id and a scav never has one
+    # of its own, so this looks like it could be skipped -- and skipping it is
+    # exactly the bug. `p` here IS the PMC profile (the scav's loot has just
+    # been merged into it) and a minted PMC kit is sitting in that inventory. A
+    # scav raid run between arming a spawned loadout and taking it into a PMC
+    # raid would otherwise save minted gear into the stash permanently.
+    #
+    # The consequence is stated rather than hidden: a scav raid CONSUMES the
+    # armed PMC loadout. That is the honest behaviour for gear that only exists
+    # for one raid, and the alternative -- leaving it -- is the duplication this
+    # module exists to prevent.
+    # The id is bound to a local FIRST. `arStripBeforeSave(p, p.id, ...)` reads
+    # a field of the very object it takes as `var`, which nimony refuses as
+    # "mutable argument aliases with immutable parameter" -- correctly, since
+    # the callee could rewrite the text the id was read out of.
+    var arScavMinted: seq[string] = @[]
+    let arScavId = p.id
+    let arScavActed = arStripBeforeSave(p, arScavId, arScavMinted)
+    if not arScavActed:
+      info "autoraid loadout: no minted set for " & arScavId &
+           " at the end of a scav raid; nothing to strip"
     if not saveProfile(p):
       return failure(1, "could not save the profile after the scav raid")
+    if arScavActed:
+      arEndVerdict(arScavId, arScavMinted)
     success "scav raid ended: " & $brought & " item(s) brought home"
     discard broadcast("tarkov.raid.ended", objOf("profile", p.id))
     return envelopeNull()
@@ -2692,6 +2746,9 @@ proc onMatchEnd(url, body, session: string): string =
   # handler is holding.
   var arMinted: seq[string] = @[]
   let arActed = arStripBeforeSave(updated, p.id, arMinted)
+  if not arActed:
+    info "autoraid loadout: no minted set for " & p.id &
+         " at the end of this raid; nothing to strip"
 
   if not saveProfile(updated):
     return failure(1, "could not save the profile after the raid")

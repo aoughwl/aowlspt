@@ -36,20 +36,37 @@
 ## **not seen by the client for the raid that is starting** -- it is seen at the
 ## next `profile/list`, i.e. the next menu cycle.
 ##
-## That is why `autoraid.loadout.apply` is honoured the moment it arrives and
-## its result says WHEN it will land rather than pretending the timing is free.
-## The two orderings that DO reach the client, and the only two, are:
+## THE ONE PLACE A LOADOUT CAN LAND FOR THE COMING RAID
+## ----------------------------------------------------
+## The measurement above leaves exactly one window: BEFORE `onProfileList`
+## builds its response. So `onProfileList` emits `tarkov.profile.listing`
+## `{session, profileId, cycle}` before it loads a single profile, and a
+## subscriber may emit `autoraid.loadout.apply` from inside that event.
+## `applyLoadout` writes the store, `onProfileList` then loads the profiles
+## fresh, and the UPDATED text is what goes on the wire -- so the raid that
+## follows this menu cycle spawns with it.
 ##
-##   * an apply that lands before the menu's `profile/list` -- which is what a
-##     command-line-armed AutoRaid gets, because the backend and the mod are up
-##     long before the character screen; and
-##   * an apply that lands during a raid or at its end, which the NEXT raid
-##     spawns with.
+## `arListingBegin` / `arListingEnd` bracket that window. An apply honoured
+## inside it reports `landsThisCycle: true`; one honoured outside it reports
+## false, because it does not, and saying otherwise would be a status route
+## that cannot be wrong.
 ##
-## `tarkov.raid.configured` remains the right trigger for the *bookkeeping* (the
-## map is known there and nowhere earlier) and for a NEXT-raid loadout. It is
-## the wrong trigger for a same-raid one, and this module says so in its status
-## route rather than leaving the caller to discover it inside a raid.
+## IDEMPOTENT INSIDE THE WINDOW
+## ----------------------------
+## The client fetches `profile/list` more than once per session (measured: seq
+## 083 and 096 in the same menu, and again at 208/273 after a raid). A second
+## apply while a minted set is still ACTIVE -- a raid configured with no
+## `match/local/end` yet -- would mint a second kit on top of the first and
+## make the two indistinguishable at strip time. So it is REFUSED and says so;
+## `"force": true` in the payload is the deliberate override, which strips the
+## previous set first.
+##
+## `tarkov.raid.configured` and `tarkov.profile.selected` are still emitted and
+## are still useful signals -- the map is known at the first and nowhere
+## earlier -- but both are TOO LATE for the raid they announce. They are the
+## right trigger for a NEXT-raid loadout and the wrong one for this raid, and
+## this module says so in its status route rather than leaving the caller to
+## discover it inside a raid.
 ##
 ## HOW EPHEMERALITY IS PROVEN, NOT ASSERTED
 ## ----------------------------------------
@@ -108,6 +125,32 @@ var
     ## "spawned". This module cannot read `mods/autoraid`'s config -- a client
     ## mod's config.json does not reach the backend -- so the mode reported here
     ## is what has actually been ASKED FOR on the bus, not what a file says.
+  gARInListing = false
+    ## True only between `arListingBegin` and `arListingEnd`, i.e. while
+    ## `onProfileList` is about to build a response. An apply honoured here is
+    ## seen by the client THIS menu cycle; one honoured anywhere else is not.
+  gARLastAtListing = false
+  gARListingCycles = 0
+
+proc arListingBegin*() =
+  ## `onProfileList` is about to emit `tarkov.profile.listing`. Everything a
+  ## subscriber does until `arListingEnd` lands on the wire in this response.
+  inc gARListingCycles
+  gARInListing = true
+
+proc arListingEnd*() =
+  gARInListing = false
+
+proc arListingCycle*(): int = gARListingCycles
+
+proc arRefusesRemint*(activeMinted: int; force: bool): bool =
+  ## The idempotency decision, on its own so it can be checked without a store.
+  ##
+  ## An ACTIVE minted set means a kit was minted and no `match/local/end` has
+  ## taken it back. Minting again would put two kits in the profile with one
+  ## recorded set, and the strip would then be unable to tell them apart. The
+  ## only way past it is an explicit `force`.
+  result = activeMinted > 0 and not force
 
 proc arMintedKey*(profileId: string): string = ARMintedPrefix & profileId
 
@@ -348,6 +391,11 @@ proc arResultJson(profileId, verdict, why, reason: string;
   put(o, "rejected", rejected)
   put(o, "reason", reason)
   put(o, "why", why)
+  # Whether this apply reaches the client for the raid that follows THIS menu
+  # cycle. True only inside the `tarkov.profile.listing` window; anywhere else
+  # the client has already been handed its profile and will not ask again.
+  put(o, "landsThisCycle", gARInListing)
+  put(o, "cycle", gARListingCycles)
   result = done(o).text
 
 proc arFinish(profileId, verdict, why, reason: string;
@@ -356,6 +404,7 @@ proc arFinish(profileId, verdict, why, reason: string;
                         placed, rejected)
   gARLastResult = result
   gARLastProfile = profileId
+  gARLastAtListing = gARInListing
   discard emit(ARResultEvent, result)
 
 proc arApply*(payload: string): string =
@@ -388,10 +437,23 @@ proc arApply*(payload: string): string =
                     "so no gear was minted -- a second set on top of an " &
                     "unknown one cannot be told apart later",
                     reason, 0, 0, 0, 0)
+  let force = field(payload, "force").asBool(false)
+  if arRefusesRemint(previous.len, force):
+    # The client asks for `profile/list` more than once per menu (measured: seq
+    # 083 and 096 in the same cycle), so this fires on the ordinary path, not
+    # only on a fault. It is an announcement, not a failure.
+    return arFinish(profileId, "INCONCLUSIVE",
+                    "a minted set of " & $previous.len & " item(s) is ALREADY " &
+                    "ACTIVE for " & profileId & " -- a raid was armed and no " &
+                    "/client/match/local/end has taken it back yet -- so " &
+                    "nothing was minted again. Two kits under one recorded set " &
+                    "could not be told apart at strip time. Pass " &
+                    "\"force\": true to strip the active set and mint afresh.",
+                    reason, 0, 0, 0, 0)
   if previous.len > 0:
-    warn "autoraid loadout: " & $previous.len & " minted id(s) from an earlier " &
-         "raid are still recorded for " & profileId &
-         "; they are stripped now, before this apply"
+    warn "autoraid loadout: `force` was asked for, so the " & $previous.len &
+         " minted id(s) still recorded for " & profileId &
+         " are stripped now, before this apply"
     var p0 = loadProfile(profileId)
     if p0.ok:
       var strippedOld = 0
@@ -471,8 +533,15 @@ proc arApply*(payload: string): string =
   why = why & " | moved " & $moved & " worn item(s) to the stash, recorded " &
         $mintedIds.len & " minted id(s) as " &
         (if ephemeral: "EPHEMERAL" else: "PERMANENT") &
-        " | the client sees this at its NEXT /client/game/profile/list -- " &
-        ARWireOrder
+        (if gARInListing:
+           " | applied INSIDE the tarkov.profile.listing window (cycle " &
+           $gARListingCycles & "), so the profile served by this " &
+           "/client/game/profile/list carries it and the raid that follows " &
+           "this menu cycle spawns with it"
+         else:
+           " | applied OUTSIDE the tarkov.profile.listing window, so the " &
+           "client does NOT see it for the raid it is arming -- it sees it at " &
+           "the NEXT /client/game/profile/list. " & ARWireOrder)
   result = arFinish(profileId, rep.verdict, why, reason, rep.requested,
                     rep.minted, rep.placed, rep.rejected.len)
 
@@ -537,10 +606,13 @@ proc arStatusJson*(): string =
   put(o, "lastProfile", gARLastProfile)
   put(o, "lastResult", raw(gARLastResult))
   put(o, "wireOrder", ARWireOrder)
-  # Named as a FALSE rather than left out: the whole point of the measurement is
-  # that an apply triggered by either tarkov event misses the raid it was
-  # triggered for.
-  put(o, "loadoutLandsBeforeLastProfileList", false)
+  # The measured fact, per apply rather than as a constant: an apply honoured
+  # inside the `tarkov.profile.listing` window DOES reach the coming raid; one
+  # triggered by `tarkov.profile.selected` or `tarkov.raid.configured` does not,
+  # because the client has already been handed its profile by then.
+  put(o, "loadoutLandsBeforeLastProfileList", gARLastAtListing)
+  put(o, "listingCycles", gARListingCycles)
+  put(o, "inListingWindow", gARInListing)
   var pending = arr()
   var keysJson = ""
   var readable = false
@@ -668,4 +740,52 @@ proc selfCheckRaidLoadout*(into: var seq[string]): bool =
   let noSpec = arApply("{\"profileId\":\"aaaaaaaaaaaaaaaaaaaaaaaa\"}")
   if field(noSpec, "verdict").asText("") == "PASS":
     into.add "raidloadout: an apply with no spec reported PASS"
+    result = false
+
+  # 7. THE IDEMPOTENCY DECISION, on its own. An active minted set must refuse a
+  #    second mint, `force` must get past it, and no active set must not refuse
+  #    -- that third one is the negative control, without which the rule would
+  #    be "always refuse" and would pass for the wrong reason.
+  if not arRefusesRemint(3, false):
+    into.add "raidloadout: an ACTIVE minted set of 3 did not refuse a second " &
+             "mint, so two kits could be minted under one recorded set"
+    result = false
+  if arRefusesRemint(3, true):
+    into.add "raidloadout: `force` did not get past the active-set refusal"
+    result = false
+  if arRefusesRemint(0, false):
+    into.add "raidloadout: an EMPTY minted set refused a mint, so case 7 " &
+             "proves nothing -- the rule would be `always refuse`"
+    result = false
+
+  # 8. THE LISTING WINDOW. An apply honoured inside it must SAY it lands this
+  #    cycle, and one outside it must say it does not. Run over the synthetic
+  #    profile `aaaaaaaaaaaaaaaaaaaaaaaa`, which does not exist -- the verdict
+  #    is INCONCLUSIVE either way and that is not what is being asserted here.
+  #    What is asserted is the window bookkeeping, which is what decides whether
+  #    the gear reaches the coming raid.
+  let cycleBefore = arListingCycle()
+  arListingBegin()
+  if not gARInListing:
+    into.add "raidloadout: arListingBegin did not open the listing window"
+    result = false
+  let inside = arApply("{\"profileId\":\"aaaaaaaaaaaaaaaaaaaaaaaa\"," &
+                       "\"spec\":{\"gear\":[]},\"reason\":\"selfcheck\"}")
+  if not field(inside, "landsThisCycle").asBool(false):
+    into.add "raidloadout: an apply INSIDE the listing window reported that " &
+             "it does not land this cycle"
+    result = false
+  arListingEnd()
+  if gARInListing:
+    into.add "raidloadout: arListingEnd did not close the listing window"
+    result = false
+  let outside = arApply("{\"profileId\":\"aaaaaaaaaaaaaaaaaaaaaaaa\"," &
+                        "\"spec\":{\"gear\":[]},\"reason\":\"selfcheck\"}")
+  if field(outside, "landsThisCycle").asBool(true):
+    into.add "raidloadout: an apply OUTSIDE the listing window claimed it " &
+             "lands this cycle -- the status route would then be unable to be " &
+             "wrong, which is the defect CLAUDE.md 9b names"
+    result = false
+  if arListingCycle() != cycleBefore + 1:
+    into.add "raidloadout: the listing cycle counter did not advance by one"
     result = false
