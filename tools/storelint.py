@@ -127,12 +127,16 @@ BASELINE = [
      "raw 8-byte reference stores into ScrollRect.content and the settings "
      "tab's root. NOT YET ROUTED -- no FieldRef has been generated for either "
      "field, so routing them would mean guessing a type. Reported, not fixed."),
-    (os.path.join("mods", "fov", "fov.nim"),
-     "fovWriteFloat",
-     "WRITE-AUDIT #12: CameraManager._fov@0xF8. NOT YET ROUTED; the field type "
-     "is INFERRED in the audit from two agreeing instruments, not from the "
-     "field table, so no FieldRef has been generated for it."),
 ]
+# REMOVED 2026-09-04: (mods/fov/fov.nim, "fovWriteFloat") -- WRITE-AUDIT #12,
+# CameraManager._fov. Its baseline reason was "the field type is INFERRED ...
+# not from the field table, so no FieldRef has been generated for it". That was
+# never re-measured, and it was false: `python tools/fldoff.py fields
+# EFT.CameraControl.CameraManager` reports `0xf8  _fov  float  private`, so
+# tools/fieldrefs.py generates AOWL_FR_CM_FOV (off=0xf8 w=4 ref=0) and the site
+# now goes through `aowl_fr_store_f32`. The baseline SHRANK, which is the only
+# direction it may move. `fovWriteFloat` itself is retained in GATE_HELPERS
+# above only for this module's own host-owned scratch.
 
 
 # ---------------------------------------------------------------------------

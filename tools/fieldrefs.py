@@ -137,6 +137,33 @@ MANIFEST = [
      "dlssrows.nim tooltip template: SettingsTooltipData.UsageProperty (EUsageProperty)"),
     ("TTD_USAGETEXT",  "EFT.UI.Settings.SettingsTooltipData", "UsageText",
      "dlssrows.nim tooltip template: SettingsTooltipData.UsageText (string)"),
+    # --- APPENDED 2026-09-04, mods/fov WRITE-AUDIT #12.
+    #
+    # This was baselined in tools/storelint.py as "NOT YET ROUTED; the field
+    # type is INFERRED in the audit from two agreeing instruments, not from the
+    # field table". THAT IS NO LONGER TRUE, and it is the reason the debt could
+    # sit: the claim was never re-measured. MEASURED 2026-09-04,
+    # `python tools/fldoff.py fields EFT.CameraControl.CameraManager` with the
+    # System.String self-check passing:
+    #
+    #   0xf8  _fov  float  0x0001 private  EFT.CameraControl.CameraManager
+    #
+    # -- a declared, non-static, 4-byte VALUE field, so the width and the
+    # is-reference bit come from the metadata here and are not fov.nim's
+    # `OffCamMgrFov = 0xF8` literal restated. The disassembly of
+    # `CameraManager::get_Fov` (`movss xmm0,[rcx+0xF8]; ret`) now agrees with a
+    # third instrument rather than standing in for the missing one.
+    #
+    # THE OTHER HALF OF THAT AUDIT SITE HAS NO ROW AND MUST NOT BE GIVEN ONE:
+    # `UnityEngine.Camera.fieldOfView` is NOT in fieldOffsets at all (measured
+    # the same way -- Camera declares only m_CachedPtr and static literals; the
+    # property is native-side, exactly like RectTransform's). There is nothing
+    # to generate, and fov.nim already writes it by CALLING
+    # `Camera::set_fieldOfView`, which is the correct route for a native
+    # property. Inventing an offset for it would be the guess this file exists
+    # to prevent.
+    ("CM_FOV",         "EFT.CameraControl.CameraManager", "_fov",
+     "audit #12 mods/fov/fov.nim CameraManager._fov (float)"),
 ]
 
 # ---------------------------------------------------------------------------

@@ -151,6 +151,13 @@ static AowlFieldRef AOWL_FR_TTD_USAGETEXT = {
     "EFT.UI.Settings.SettingsTooltipData", "UsageText", 0x30, 8, 1, 0x38, { 0, 0, 0, 0 }, 0
 };
 
+/* audit #12 mods/fov/fov.nim CameraManager._fov (float)
+ *   EFT.CameraControl.CameraManager._fov : float   (primitive, declared by EFT.CameraControl.CameraManager)
+ */
+static AowlFieldRef AOWL_FR_CM_FOV = {
+    "EFT.CameraControl.CameraManager", "_fov", 0xf8, 4, 0, 0x160, { 0, 0, 0, 0 }, 0
+};
+
 
 static AowlFieldRef* aowl_fr_bc_maxbots(void) { return &AOWL_FR_BC_MAXBOTS; }
 static AowlFieldRef* aowl_fr_ba_isready(void) { return &AOWL_FR_BA_ISREADY; }
@@ -168,6 +175,7 @@ static AowlFieldRef* aowl_fr_ttd_text(void) { return &AOWL_FR_TTD_TEXT; }
 static AowlFieldRef* aowl_fr_ttd_usagestyle(void) { return &AOWL_FR_TTD_USAGESTYLE; }
 static AowlFieldRef* aowl_fr_ttd_usageprop(void) { return &AOWL_FR_TTD_USAGEPROP; }
 static AowlFieldRef* aowl_fr_ttd_usagetext(void) { return &AOWL_FR_TTD_USAGETEXT; }
+static AowlFieldRef* aowl_fr_cm_fov(void) { return &AOWL_FR_CM_FOV; }
 
 static AowlFieldRef* AOWL_FR_ALL[] = {
     &AOWL_FR_BC_MAXBOTS,
@@ -186,7 +194,8 @@ static AowlFieldRef* AOWL_FR_ALL[] = {
     &AOWL_FR_TTD_USAGESTYLE,
     &AOWL_FR_TTD_USAGEPROP,
     &AOWL_FR_TTD_USAGETEXT,
+    &AOWL_FR_CM_FOV,
 };
-#define AOWL_FR_TABLE_ROWS 16
+#define AOWL_FR_TABLE_ROWS 17
 
 #endif /* AOWLSPT_FIELDREFS_H */

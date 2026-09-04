@@ -132,9 +132,26 @@ proc hwSay(site: string; recv, want, got: Il2CppPtr; off: int32;
     # refusal is the one that says a corrupting write was stopped.
     if gHwSaidNo[idx] >= HwRefusePerSite: return
     gHwSaidNo[idx] = gHwSaidNo[idx] + 1'i32
+    # THE KLASS CLAUSE MUST DESCRIBE THE KLASS, NOT THE REFUSAL.
+    # MEASURED 2026-09-04 (tools/hostlog.py grep, boot 6bd304e3): four
+    # modsReassertLabels refusals printed "klass=1d72283cda0 but wanted
+    # 1d72283cda0" -- the two EQUAL. The gate was right; those were the
+    # DESTROYED-object branch. "but wanted" asserts a klass mismatch that did
+    # not happen, and it was read as a comparison bug in a gate that has none.
+    # A refusal line now states which of the two facts is true, so the reason
+    # in the message can be checked against the numbers in the message.
+    let kl =
+      if got == want:
+        " klass=" & hexOf(cast[uint64](got)) &
+        " (MATCHES the one recorded at capture -- this refusal is NOT about " &
+        "the klass)"
+      elif want == nil:
+        " klass=" & hexOf(cast[uint64](got)) & " (none was recorded to want)"
+      else:
+        " klass=" & hexOf(cast[uint64](got)) & " but wanted " &
+        hexOf(cast[uint64](want))
     warn "hostWrite[" & site & "] REFUSED: recv=" & hexOf(cast[uint64](recv)) &
-         " klass=" & hexOf(cast[uint64](got)) & " but wanted " &
-         hexOf(cast[uint64](want)) & "; +0x" & hexOf(uint64(off)) & " = " & val &
+         kl & "; +0x" & hexOf(uint64(off)) & " = " & val &
          " -- " & why & ". NOTHING WAS WRITTEN. (" & $gHwSaidNo[idx] & "/" &
          $HwRefusePerSite & ")"
 

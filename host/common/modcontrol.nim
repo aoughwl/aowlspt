@@ -315,6 +315,56 @@ var gRlEpoch = 0
   ## number twice, the library did not actually change over and "it reloaded" was
   ## indistinguishable from "nothing happened".
 
+const RlMaxNotes* = 12
+  ## Rule 4. Capped, and the cap is REPORTED when it bites -- a truncated list
+  ## that does not say it is truncated is a list that reads as complete.
+
+var gRlNotes: seq[string] = @[]
+var gRlDropped = 0
+
+proc rlNote(kind, who, why: string) =
+  ## THE REASON, RECORDED NEXT TO THE COUNTER IT EXPLAINS.
+  ##
+  ## MEASURED 2026-09-04 (tools/hostlog.py grep, boot 6bd304e3): the run line
+  ## read `hotreload: attempted=4 completed=0 released=0 refused=4` and the
+  ## host log contained NO refusal reason at all -- every `gOps.log(why)`
+  ## below had fired into a seam that produced nothing readable. Four refusals
+  ## with no cause is indistinguishable from four refusals with the wrong
+  ## cause, so the count alone was not actionable.
+  ##
+  ## The reason now rides the ledger itself. It cannot be separated from the
+  ## counter by log ordering, by a filter, or by a nil `log` seam, because the
+  ## same call that increments the counter records it.
+  if gRlNotes.len >= RlMaxNotes:
+    inc gRlDropped
+    return
+  gRlNotes.add(kind & " " & (if who.len > 0: who else: "<unnamed>") & ": " & why)
+
+proc hotReloadNotes*(): seq[string] = gRlNotes
+  ## One line per attempt that did not complete, oldest first.
+
+proc hotReloadNotesDropped*(): int = gRlDropped
+
+var gRlVerBefore: seq[string] = @[]
+var gRlVerAfter: seq[string] = @[]
+
+proc rlVersionBefore(guid, ver: string) =
+  ## THE FALSIFIABLE HALF OF "IT RELOADED". `epoch` proves the unload half ran;
+  ## it cannot prove the NEW code is what came back. The mod's own version
+  ## string, read off the loader before the unload and again after the reload,
+  ## can: same string twice is "nothing changed over", and that is exactly the
+  ## reading a rising epoch alone would have hidden.
+  if gRlVerBefore.len >= RlMaxNotes: return
+  gRlVerBefore.add(guid & "=" & (if ver.len > 0: ver else: "?"))
+
+proc rlVersionAfter(guid, ver: string) =
+  if gRlVerAfter.len >= RlMaxNotes: return
+  gRlVerAfter.add(guid & "=" & (if ver.len > 0: ver else: "?"))
+
+proc hotReloadVersions*(): (seq[string], seq[string]) =
+  ## (before-unload, after-reload) version strings, per guid, in attempt order.
+  (gRlVerBefore, gRlVerAfter)
+
 proc hotReloadCounters*(): (int, int, int, int, int, int) =
   ## attempted / completed / released / refused / deferred / epoch.
   ##
@@ -849,6 +899,14 @@ proc doLoad(p: Pending) =
               "), so it is running and this host cannot stop it"
       answer(p.guid, "load", false, false, why, moRefused, CodeWrongGuid)
       return
+    # THE VERDICT READS THE MOD'S NEW VERSION STRING. Recorded only for a guid
+    # this session actually unloaded, so an ordinary first load does not
+    # manufacture a reload that never happened.
+    for b in gRlVerBefore:
+      if b.len > got.len and b[0 ..< got.len] == got and b[got.len] == '=':
+        rlVersionAfter(got,
+                       (if gOps.versionOf != nil: gOps.versionOf(idx) else: ""))
+        break
     answer(got, "load", true, false, "", moOk, "")
   else:
     # `loadMod` refuses for reasons it has already written to the log with the
@@ -880,6 +938,8 @@ proc doUnload(p: Pending): bool =
     inc gRlAttempted
     inc gRlRefused
     let nm = (if gOps.nameOf != nil: gOps.nameOf(idx) else: p.guid)
+    rlNote("REFUSED", nm, "does not declare AOWLSPT_MOD_HOT_RELOADABLE (" &
+           CodeNotHot & "); it stays loaded and the change holds on restart")
     let why = nm & " does not declare AOWLSPT_MOD_HOT_RELOADABLE, so this " &
               "host will not free its library while the game is running; it " &
               "stays loaded and the change holds on restart"
@@ -903,10 +963,17 @@ proc doUnload(p: Pending): bool =
                 " drains, so its library was not freed. It stays loaded and " &
                 "the change holds on restart."
       if gOps.log != nil: gOps.log(why)
+      rlNote("DEFERRED", nm, what & " in " & $DeferLimit & " drains (" &
+             CodeNotQuiet & ")")
       answer(p.guid, "unload", false, true, why, moDeferred, CodeNotQuiet)
       return
 
   inc gRlAttempted
+  # The version BEFORE the swap, read off the loader while the old library is
+  # still the live one. There is no second chance: after `unload` the slot is
+  # gone and `versionOf` has nothing to answer with.
+  rlVersionBefore(p.guid,
+                  (if gOps.versionOf != nil: gOps.versionOf(idx) else: ""))
   # Asked *before* the attempt, so the reason can be told apart afterwards. A
   # host with no teardown refuses every unload for one reason and a host with
   # one refuses a particular unload for another; both answer `deferred`, and a
@@ -922,6 +989,9 @@ proc doUnload(p: Pending): bool =
     if gOps.released != nil and gOps.released():
       inc gRlReleased
     else:
+      rlNote("NOT-RELEASED", p.guid,
+             "the teardown ran and the DLL file is still locked, so a rebuilt " &
+             "library cannot replace it")
       if gOps.log != nil:
         gOps.log("hotreload: " & p.guid & " unloaded but its library was NOT " &
                  "released -- the teardown ran and the file is still locked, " &
@@ -933,6 +1003,8 @@ proc doUnload(p: Pending): bool =
     # "this host cannot do it live", and the change still holds on restart
     # because the selection is stored rather than inferred from what is
     # running.
+    rlNote("FAILED", p.guid, err & " (" &
+           (if live: CodeUnloadFailed else: CodeNoTeardown) & ")")
     answer(p.guid, "unload", false, true, err, moDeferred,
            (if live: CodeUnloadFailed else: CodeNoTeardown))
 

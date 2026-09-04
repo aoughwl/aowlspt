@@ -911,6 +911,15 @@ proc openRuntime(): bool =
 #include <stdio.h>
 #include <windows.h>
 
+/* THE TYPED STORE PATH (docs/INTERACTION-LAYER-MAP.md M3/M6), the same route
+ * mods/textures/redirect.nim uses. `aowlspt_hostwrite.h` pulls in the
+ * GENERATED `aowlspt_fieldrefs.h`, which now carries
+ * EFT.CameraControl.CameraManager._fov's offset, WIDTH and IS_REFERENCE
+ * straight out of Il2CppMetadataRegistration.fieldOffsets. Everything it
+ * declares is static, so including it costs this module nothing it does not
+ * call. */
+#include "aowlspt_hostwrite.h"
+
 /* Calling a raw address needs C: nimony refuses `cast[proc(...)](pointer)`
  * outright. The int32 form is a REAL int32 thunk rather than the low half of
  * a pointer return -- an int32 return leaves the upper 32 bits of RAX
@@ -1121,6 +1130,36 @@ proc fovFloatAt(p: Il2CppPtr; off: int32): float {.
   importc: "fov_float_at", nodecl.}
 proc fovWriteFloat(p: Il2CppPtr; off: int32; value: float): int32 {.
   importc: "fov_write_float", nodecl.}
+
+# ---------------------------------------------------------------------------
+# THE TYPED STORE for CameraManager._fov.
+#
+# `fovWriteFloat` above is a RAW store: it takes an offset and a width this
+# file chose, so this file could be wrong about both. It was the last raw store
+# into game-owned memory in the tree and sat in tools/storelint.py's BASELINE
+# with the reason "the field type is INFERRED in the audit from two agreeing
+# instruments, not from the field table, so no FieldRef has been generated for
+# it". RE-MEASURED 2026-09-04 with the System.String self-check passing:
+#
+#   python tools/fldoff.py fields EFT.CameraControl.CameraManager
+#   0xf8  _fov  float  0x0001 private
+#
+# The field table DOES declare it -- the baseline's reason had simply never
+# been re-checked. `python tools/fieldrefs.py print` now emits
+# `CM_FOV ... off=0xf8 w=4 ref=0 instmin=0x160`, so the width and the
+# is-reference bit are DERIVED here rather than being `OffCamMgrFov` restated,
+# and R1 (narrow-into-reference) and the instance bound are enforced by code
+# this file does not own.
+#
+# Bound through the GENERATED per-row accessor, never as `(&AOWL_FR_CM_FOV)`:
+# `importc` on a proc emits a CALL, so that spelling compiles to
+# `(&AOWL_FR_CM_FOV)()` and gcc refuses it (measured 2026-09-03, redirect.nim).
+type FieldRefPtr = Il2CppPtr
+proc frCmFov(): FieldRefPtr {.importc: "aowl_fr_cm_fov", nodecl.}
+proc frAdmit(fr, recv: FieldRefPtr): int32 {.importc: "aowl_fr_admit", nodecl.}
+proc frStoreF32(fr, recv: FieldRefPtr; sub: int32; v: float32;
+                why: var int32): int32 {.importc: "aowl_fr_store_f32", nodecl.}
+proc frOff(fr: FieldRefPtr): int32 {.importc: "aowl_fr_off", nodecl.}
 
 # EFT.CameraControl.CameraManager._fov, a private float.
 #
@@ -3150,17 +3189,30 @@ proc applyFov() =
                              "field whose value we cannot corroborate."
             if gAdsFieldRefusals == 0: warn "FOV: " & gAdsFieldState
             gAdsFieldRefusals = gAdsFieldRefusals + 1
-          elif fovWriteFloat(cm, OffCamMgrFov, endpoint) != 0'i32:
-            gAdsFieldWrites = gAdsFieldWrites + 1
-            gAdsFieldState = "WROTE CameraManager._fov@0xF8 = " & $endpoint &
-                             " (was " & $fovField & "), readback-verified"
-            if gAdsFieldWrites == 1: info "FOV: " & gAdsFieldState
           else:
-            gAdsFieldState = "REFUSED -- CameraManager._fov@0xF8 is not " &
-                             "writable, or the value did not read back. " &
-                             "Nothing was changed."
-            if gAdsFieldRefusals == 0: warn "FOV: " & gAdsFieldState
-            gAdsFieldRefusals = gAdsFieldRefusals + 1
+            # `cm` came back from `CameraManager::get_Instance`, so its type is
+            # a fact of the call rather than of a pointer we walked to, and
+            # admitting its klass here is legitimate rather than circular --
+            # the same argument redirect.nim makes for its EasyBundle receiver.
+            discard frAdmit(frCmFov(), cm)
+            var frWhy = 0'i32
+            if frStoreF32(frCmFov(), cm, 0'i32, float32(endpoint), frWhy) !=
+               0'i32:
+              gAdsFieldWrites = gAdsFieldWrites + 1
+              gAdsFieldState = "WROTE CameraManager._fov@+0x" &
+                               $frOff(frCmFov()) & " = " & $endpoint &
+                               " (was " & $fovField &
+                               ") through the typed FieldRef gate"
+              if gAdsFieldWrites == 1: info "FOV: " & gAdsFieldState
+            else:
+              gAdsFieldState = "REFUSED -- the typed store into " &
+                               "CameraManager._fov (+0x" & $frOff(frCmFov()) &
+                               ") was refused with rule code " & $frWhy &
+                               " (1=narrow-into-reference 2=too-wide " &
+                               "3=klass-not-admitted 4=receiver 5=bound " &
+                               "6=unusable FieldRef). Nothing was written."
+              if gAdsFieldRefusals == 0: warn "FOV: " & gAdsFieldState
+              gAdsFieldRefusals = gAdsFieldRefusals + 1
         gAdsVerdict = "LEARNED -- the game ramped its own FOV from " &
                       $gAdsStart & " to " & $gAdsBase & " over " &
                       $(gAdsObsT * 1000.0) & " ms with this mod writing " &

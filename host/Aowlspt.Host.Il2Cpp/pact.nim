@@ -468,7 +468,8 @@ proc pactCheckIndices(): bool =
     "EFT.InventoryLogic.Weapon::GetCurrentMagazine",
     "EFT.InventoryLogic.Magazine::get_Count",
     "EFT.InventoryLogic.Magazine::FirstRealAmmo",
-    "EFT.MovementContext::CalculateLookAtDirection"]
+    "EFT.MovementContext::CalculateLookAtDirection",
+    "EFT.MovementContext::get_Rotation"]
   var ok = true
   var bad = ""
   var i = 0

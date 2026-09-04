@@ -182,7 +182,11 @@ TABLES = [
         "array": "aowl_pact_targets",
         "const_prefix": "PactT",
         "const_file": "host/Aowlspt.Host.Il2Cpp/pact.nim",
-        "expect_file": None,
+        # MEASURED 2026-09-04: this was None, so only the (c2) annotation path
+        # ran and the runtime `expect` list went unchecked -- the C table grew
+        # get_Rotation to 32 rows while pact.nim still named 31, and idxbind
+        # exited 0. pact.nim carries BOTH bindings, so BOTH are checked here.
+        "expect_file": "host/Aowlspt.Host.Il2Cpp/pact.nim",
         "users": ["host/Aowlspt.Host.Il2Cpp/pact.nim"],
         "accessors": ["cPactFn", "cPactName", "cPactRva", "pactFn"],
     },
@@ -471,9 +475,19 @@ def nim_expect_list(src):
     against, so the two checks cannot drift apart unnoticed."""
     m = re.search(r"const\s+expect\s*:\s*array\[(\d+),\s*string\]\s*=\s*\[",
                   src)
-    if not m:
-        return None, None
-    declared = int(m.group(1))
+    if m:
+        declared = int(m.group(1))
+    else:
+        # The other shape actually in the tree: `let expect = [ ... ]`, which
+        # declares no length. MEASURED 2026-09-04: pact.nim uses exactly this,
+        # so the regex above returned (None, None), check_table skipped the
+        # whole comparison, and idxbind printed PASS while the C table had 32
+        # rows and pact.nim named 31. A parser that silently matches nothing is
+        # a check that cannot fail.
+        m = re.search(r"let\s+expect\s*=\s*\[", src)
+        if not m:
+            return None, None
+        declared = None
     i = m.end()
     depth = 1
     start = i
@@ -811,7 +825,7 @@ def check_table(t, verbose):
                 "runtime check cannot be cross-verified here."
                 % t["expect_file"])
         else:
-            if declared != len(names):
+            if declared is not None and declared != len(names):
                 problems.append(
                     "%s declares `array[%d, string]` but %s holds %d rows. "
                     "The runtime check would refuse to arm, and every "
@@ -837,10 +851,12 @@ def check_table(t, verbose):
     # neither, the only thing checked is that the index is in range, and an
     # in-range index onto the wrong row is precisely fact #187: a byte-verified,
     # non-shared, perfectly valid function OF THE WRONG SHAPE.
-    if not t["expect_file"]:
+    # Both bindings are checked whenever both exist; the annotation check is
+    # only *required* when there is no `expect` array to stand in for it.
+    if True:
         ann = nim_const_annotations(csrc, t["const_prefix"])
         unannotated = sorted(k for k in consts if k not in ann)
-        if unannotated:
+        if unannotated and not t["expect_file"]:
             problems.append(
                 "%s: %d of %d %s* constant(s) carry no `## RowName` "
                 "annotation (%s). Nothing then ties them to %s, so a row "
