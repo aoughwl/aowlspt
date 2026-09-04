@@ -125,6 +125,30 @@ TABLES = [
         "users": ["host/Aowlspt.Host.Il2Cpp/cursorfree.nim"],
         "accessors": ["cCurFn", "cCurName", "cCurRva"],
     },
+    # The POSTFX subtab's NATIVE row set (nativepostfx.nim): the twelve
+    # appliers and getters that drive the GAME'S OWN post-processing and
+    # shading. Registered the day the table was written, not the day it gained
+    # its second consumer, because the coverage sweep at the bottom FAILS the
+    # build for an unregistered array precisely so a later row cannot arrive
+    # unguarded.
+    #
+    # This table is exactly the shape the check exists for. Rows [3..8] are six
+    # PostFxSettingsController::TryUpdate* methods with an IDENTICAL frame
+    # (RCX=this, EDX=int, R8=MethodInfo*) and different targets, so a shifted
+    # constant would call a VALID, byte-verified, correctly-shaped function
+    # that changes the WRONG setting -- brightness moving when the player drags
+    # saturation, with every call reporting success. Nothing but this check
+    # would catch that.
+    {
+        "mode": "positional",
+        "header": "abi/aowlspt_nativepostfx.h",
+        "array": "aowl_npf_targets",
+        "const_prefix": "NpfT",
+        "const_file": "host/Aowlspt.Host.Il2Cpp/nativepostfx.nim",
+        "expect_file": None,
+        "users": ["host/Aowlspt.Host.Il2Cpp/nativepostfx.nim"],
+        "accessors": ["cNpfFn", "cNpfName", "cNpfRva"],
+    },
     # The game-Settings-open probe behind aowl_ui_overlay_mask's bit0. Two
     # instance getters, indexed by the AOWL_UI_T_* #defines in the C header and
     # mirrored by the annotated UiT* constants here, which is what ties each row

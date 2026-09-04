@@ -110,6 +110,25 @@ proc frTtdUsageProp(): AowlFieldRefPtr {.
   importc: "aowl_fr_ttd_usageprop", nodecl.}
 proc frTtdUsageText(): AowlFieldRefPtr {.
   importc: "aowl_fr_ttd_usagetext", nodecl.}
+# APPENDED 2026-09-04 -- Prism's AO block, for `nativepostfx.nim` rows 2 and 3.
+# These are the ONE part of the native POSTFX row set that is a STORE rather
+# than a call: MEASURED `tools/fldoff.py fields PrismEffects`, they are PUBLIC
+# instance fields the Prism scripts sample every frame and there is no applier
+# method to call.
+#
+# The klass admission is doing real work here, not ceremony. The receiver is
+# walked from `CameraManager._prismEffects@0xE8` (typed `PrismEffects`), while
+# a near-identical AO block also exists on `PrismSSAO` at COMPLETELY different
+# offsets (`aoIntensity@0xA4` vs `@0x27C`). A store of 0x27C onto a PrismSSAO
+# receiver would land mid-field and read back plausibly; `aowl_fr_recvok` is
+# what refuses it. Widths and is-reference bits are DERIVED by
+# tools/fieldrefs.py from the metadata, never spelled here.
+proc frPeAoIntensity(): AowlFieldRefPtr {.
+  importc: "aowl_fr_pe_ao_intensity", nodecl.}
+proc frPeAoRadius(): AowlFieldRefPtr {.
+  importc: "aowl_fr_pe_ao_radius", nodecl.}
+proc frPeAoBlurIter(): AowlFieldRefPtr {.
+  importc: "aowl_fr_pe_ao_bluriter", nodecl.}
 
 # ---------------------------------------------------------------------------
 # Refusal reporting. Capped per site so a per-frame path cannot flood the log,

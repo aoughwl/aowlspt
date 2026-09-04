@@ -10027,9 +10027,25 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
          "panels. Neither panel is cloned or written to; only their active " &
          "state is driven, because the game switches panels by ESettingsGroup " &
          "and a subtab of ours is not one."
-  # THE POSTFX SUBTAB'S CONTENT (`settingsPostFxRows`). Default OFF, and inert
-  # without BOTH of the two features it stands on, so it is resolved here rather
-  # than left to discover its own emptiness on the Unity thread.
+  # THE POSTFX SUBTAB'S **LEGACY** CONTENT (`settingsPostFxRows`).
+  #
+  # DEFAULT OFF, AND NOW LEGACY. These 29 rows are the front end for
+  # `mods/graphics` -- our OWN D3D composite pass over the back buffer. That
+  # approach is superseded by `settingsNativePostFx` (default ON, further
+  # down), which drives the GAME'S OWN post-processing and shading instead:
+  # the same knobs, in BSG's pipeline, in the right colour space, at no extra
+  # frame cost, and with a read-back off the game's own state rather than a
+  # name-only row that admits it changes nothing.
+  #
+  # This flag is kept, rather than deleted, because the graphics mod still
+  # exists and someone may want its pass. It is meaningful only when that mod
+  # is actually present; with it off and the native set on, the POSTFX page
+  # carries the native rows alone. The two sets are additive and independent,
+  # so turning this back on gives both.
+  #
+  # Still inert without BOTH of the two features it stands on, so that is
+  # resolved here rather than left to discover its own emptiness on the Unity
+  # thread.
   gPfxOn = readBoolKey("settingsPostFxRows")
   if gPfxOn and not gGfxOn:
     gPfxOn = false

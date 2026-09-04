@@ -164,6 +164,41 @@ MANIFEST = [
     # to prevent.
     ("CM_FOV",         "EFT.CameraControl.CameraManager", "_fov",
      "audit #12 mods/fov/fov.nim CameraManager._fov (float)"),
+    # --- APPENDED 2026-09-04, host/Aowlspt.Host.Il2Cpp/nativepostfx.nim
+    # rows 2 and 3 (AO intensity / radius / blur iterations).
+    #
+    # These are the ONE part of the native POSTFX row set that is a STORE
+    # rather than a call. Every other row drives the game's own applier
+    # (SetSSAO, SetSharpen, TryUpdate*, ChangedShadowQuality), which is always
+    # preferable -- but Prism's AO block has no applier: MEASURED
+    # `tools/fldoff.py fields PrismEffects`, these are PUBLIC instance fields
+    # that the Prism scripts read out of themselves every frame, and BSG's own
+    # code sets them by plain assignment. There is no method to call.
+    #
+    #   0x27c  aoIntensity       float
+    #   0x284  aoRadius          float
+    #   0x290  aoBlurIterations  int
+    #
+    # So they go through the typed gate instead, and the gate is doing real
+    # work here rather than ceremony. The receiver is reached by WALKING
+    # `CameraManager.Instance -> _prismEffects@0xE8`, and that field is TYPED
+    # `PrismEffects` while a nearly identical AO block also exists on
+    # `PrismSSAO` at completely different offsets (`aoIntensity@0xA4`,
+    # `aoRadius@0xAC`, `aoBlurIterations@0xB8` -- also measured). Writing
+    # 0x27C on a PrismSSAO receiver would land in the middle of an unrelated
+    # field and read back plausibly. `aowl_fr_recvok`'s klass admission is what
+    # refuses that, and it is the reason these three are rows here rather than
+    # three integer literals in the Nim.
+    #
+    # The widths and is-reference bits below are DERIVED by this file from the
+    # metadata -- not restated from the offsets above -- which is what stops a
+    # 4-byte store landing in a reference slot.
+    ("PE_AO_INTENSITY", "PrismEffects", "aoIntensity",
+     "nativepostfx.nim row 2: PrismEffects.aoIntensity (float)"),
+    ("PE_AO_RADIUS",    "PrismEffects", "aoRadius",
+     "nativepostfx.nim row 2: PrismEffects.aoRadius (float)"),
+    ("PE_AO_BLURITER",  "PrismEffects", "aoBlurIterations",
+     "nativepostfx.nim row 3: PrismEffects.aoBlurIterations (int)"),
 ]
 
 # ---------------------------------------------------------------------------

@@ -158,6 +158,27 @@ static AowlFieldRef AOWL_FR_CM_FOV = {
     "EFT.CameraControl.CameraManager", "_fov", 0xf8, 4, 0, 0x160, { 0, 0, 0, 0 }, 0
 };
 
+/* nativepostfx.nim row 2: PrismEffects.aoIntensity (float)
+ *   PrismEffects.aoIntensity : float   (primitive, declared by PrismEffects)
+ */
+static AowlFieldRef AOWL_FR_PE_AO_INTENSITY = {
+    "PrismEffects", "aoIntensity", 0x27c, 4, 0, 0x2e0, { 0, 0, 0, 0 }, 0
+};
+
+/* nativepostfx.nim row 2: PrismEffects.aoRadius (float)
+ *   PrismEffects.aoRadius : float   (primitive, declared by PrismEffects)
+ */
+static AowlFieldRef AOWL_FR_PE_AO_RADIUS = {
+    "PrismEffects", "aoRadius", 0x284, 4, 0, 0x2e0, { 0, 0, 0, 0 }, 0
+};
+
+/* nativepostfx.nim row 3: PrismEffects.aoBlurIterations (int)
+ *   PrismEffects.aoBlurIterations : int   (primitive, declared by PrismEffects)
+ */
+static AowlFieldRef AOWL_FR_PE_AO_BLURITER = {
+    "PrismEffects", "aoBlurIterations", 0x290, 4, 0, 0x2e0, { 0, 0, 0, 0 }, 0
+};
+
 
 static AowlFieldRef* aowl_fr_bc_maxbots(void) { return &AOWL_FR_BC_MAXBOTS; }
 static AowlFieldRef* aowl_fr_ba_isready(void) { return &AOWL_FR_BA_ISREADY; }
@@ -176,6 +197,9 @@ static AowlFieldRef* aowl_fr_ttd_usagestyle(void) { return &AOWL_FR_TTD_USAGESTY
 static AowlFieldRef* aowl_fr_ttd_usageprop(void) { return &AOWL_FR_TTD_USAGEPROP; }
 static AowlFieldRef* aowl_fr_ttd_usagetext(void) { return &AOWL_FR_TTD_USAGETEXT; }
 static AowlFieldRef* aowl_fr_cm_fov(void) { return &AOWL_FR_CM_FOV; }
+static AowlFieldRef* aowl_fr_pe_ao_intensity(void) { return &AOWL_FR_PE_AO_INTENSITY; }
+static AowlFieldRef* aowl_fr_pe_ao_radius(void) { return &AOWL_FR_PE_AO_RADIUS; }
+static AowlFieldRef* aowl_fr_pe_ao_bluriter(void) { return &AOWL_FR_PE_AO_BLURITER; }
 
 static AowlFieldRef* AOWL_FR_ALL[] = {
     &AOWL_FR_BC_MAXBOTS,
@@ -195,7 +219,10 @@ static AowlFieldRef* AOWL_FR_ALL[] = {
     &AOWL_FR_TTD_USAGEPROP,
     &AOWL_FR_TTD_USAGETEXT,
     &AOWL_FR_CM_FOV,
+    &AOWL_FR_PE_AO_INTENSITY,
+    &AOWL_FR_PE_AO_RADIUS,
+    &AOWL_FR_PE_AO_BLURITER,
 };
-#define AOWL_FR_TABLE_ROWS 17
+#define AOWL_FR_TABLE_ROWS 20
 
 #endif /* AOWLSPT_FIELDREFS_H */

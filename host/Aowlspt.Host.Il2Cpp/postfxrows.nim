@@ -269,6 +269,19 @@ var gPfxReassert = 0
 var gPfxReassertSaid = false
 var gPfxLayoutNote = ""
 
+## FORWARD DECLARATIONS into `nativepostfx.nim`, which is `include`d AFTER this
+## file. Exactly the device -- and exactly the seam shape -- `modstab.nim` uses
+## to reach `pfxOnPanelUp` / `pfxOnScreenClosed` from one include earlier.
+##
+## Two entry points and nothing else crosses the boundary: no `gNpf*` global is
+## named here and no state is shared. This file owns the LEGACY rows for
+## `mods/graphics`; that file owns the NATIVE rows that drive the game's own
+## pipeline. Neither reaches into the other's state, and neither gates the
+## other -- see the call site in `pfxOnPanelUp` for why that independence is
+## load-bearing rather than tidy.
+proc npfOnPanelUp(postUp: bool)
+proc npfOnScreenClosed()
+
 ## ---- defect 3: the flash ------------------------------------------------
 ## `Time.frameCount` at the graft, and at the FIRST frame the PostFX panel was
 ## observed active. The page flashed because the graft ran on the first
@@ -3224,6 +3237,21 @@ proc pfxOnPanelUp(postUp: bool) =
   ## with whether the PostFX panel happens to be up. Its own gate is one
   ## boolean compare when `settingsRowsBind` is off.
   sbdTick()
+  # THE NATIVE ROW SET (`nativepostfx.nim`, flag `settingsNativePostFx`,
+  # DEFAULT ON), driven from HERE and deliberately ABOVE this file's own gate.
+  #
+  # The two row sets are INDEPENDENT and ADDITIVE, and that independence is the
+  # whole point of the placement: these rows drive the GAME'S OWN pipeline,
+  # while everything below drives `mods/graphics` -- our D3D composite pass,
+  # which is now LEGACY and default OFF. Putting this call under `gPfxOn` would
+  # silently make the replacement require the thing it replaces, so the default
+  # configuration (legacy off, native on) would show an EMPTY POSTFX page while
+  # every flag read as intended.
+  #
+  # It opens no guard: this runs inside `gfxTickBody`'s single `aowl_p_p_seh`,
+  # which is not re-entrant. Its own gate is one boolean compare when the flag
+  # is off.
+  npfOnPanelUp(postUp)
   if not gPfxOn or gPfxOff:
     return
   # THE FIRST FRAME THE PANEL WAS ACTUALLY ACTIVE, latched once. Everything
@@ -3280,6 +3308,11 @@ proc pfxOnScreenClosed() =
   ## a fresh one, and drop our rows if the container they were parented to has
   ## been destroyed under us. We own these rows outright (they are NOT in the
   ## tab's `_createdControls`), so nothing else will ever clean them up.
+  # The NATIVE row set's teardown, driven from here for the same reason its
+  # tick is: it owns rows on this page and the game will never clean them up.
+  # Unconditional and above this file's own state, so the native rows are torn
+  # down and rebuilt per visit whether or not the legacy set is armed.
+  npfOnScreenClosed()
   gPfxVerdictSaid = false
   gPfxScrollSaid = false
   gPfxGraySaid = false
