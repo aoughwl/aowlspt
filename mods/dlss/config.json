@@ -14,5 +14,5 @@
   "nrWorkingScale": 0.25,
 
   "//nrIntensity": "OptiScaler [DlssNr] Intensity, 0..2. How hard the model's re-lighting reads. APPLIES ON RESTART.",
-  "nrIntensity": 1.0
+  "nrIntensity": 2.0
 }
