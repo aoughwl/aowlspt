@@ -205,6 +205,11 @@ ITEMS = [
       note="proves hostcfg.py --selftest CAN fail"),
     T("test_uihooks_falsifier.py", "fast",
       note="proves uihooks_check selftest CAN fail"),
+    T("test_symtab.py", "fast",
+      note="proves il2cpp_symtab.py's consumer scan matches DECLARED symbol "
+           "names exactly (AOWL_SYM_OBJ_GET_NAME is not a use of OBJ_GET) and "
+           "does not read comments; its falsifiers re-run the old "
+           "unconditional-strip logic and assert it gives the WRONG answer"),
     T("test_il2cpp_flags.py", "fast",
       note="proves il2cpp_resolve.py REFUSES an unknown flag instead of "
            "ignoring it (--count on disasm was dropped silently, so a "
@@ -449,7 +454,11 @@ VERIFIERS = [
     V("harness.py", gap="drives the live client end to end"),
     V("idxbind.py", gap="needs a live index"),
     V("il2cpp_gatevalidate.py", gap="needs GameAssembly; probe-driven"),
-    V("il2cpp_symtab.py", gap="needs GameAssembly"),
+    V("il2cpp_symtab.py", "test_symtab.py",
+      "`selftest` needs GameAssembly.dll, but the CONSUMER SCAN is pure text "
+      "and is where the tool was measurably wrong (2026-09-04): "
+      "test_symtab.py falsifies both defects by re-running the old logic and "
+      "asserting the wrong answer, so the proofs CAN fail."),
     V("itemrefs.py", gap="needs db.json (41 MB, one line)"),
     V("litscan.py", gap="covered indirectly by test_deploy_contains.py, but "
       "has no direct negative control of its own"),

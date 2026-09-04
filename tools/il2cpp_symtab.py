@@ -62,6 +62,20 @@ allowed to reference. Generation resolves each one and splits them:
 greps the consumer tree for `AOWL_SYM_<IDENT>` / `AOWL_SYMC_<IDENT>` uses and
 FAILS THE BUILD, naming file, line, symbol and reason, if a referenced symbol
 is rejected, if a shared RVA is referenced through the non-escape-hatch macro,
+--- and the rule it applies to a reference, exactly ---
+  * COMMENTS ARE NOT SCANNED. `#`, `##` and `#[ ]#` in Nim, `//` and C block
+    comments in C/C++ headers (including inside `{.emit.}` bodies) are blanked
+    before the scan, byte-for-byte so line numbers survive. String literals are
+    NOT blanked: a symbol in a string is a real use. Naming a symbol in prose is
+    documentation, not a reference, and it used to fail the build.
+  * A token `AOWL_SYM[C]_<TOKEN>` is matched EXACTLY against the manifest first.
+    Only if that fails is the LONGEST companion suffix (`_ARITY`, `_OWNERS`,
+    `_NAME`, `_SECTION`, `_PROLOGUE`) whose remainder is a declared symbol
+    stripped. Unconditional stripping reported `AOWL_SYM_OBJ_GET_NAME` -- a real
+    symbol -- as a use of `OBJ_GET`, which nothing had written.
+  * A token nothing explains is reported AS WRITTEN, with the source line and
+    the declared symbols that are near matches.
+--- and check also fails ---
 if the header's recorded prologue no longer matches the DLL, or if the header
 was generated from a different GameAssembly.dll than the one on disk. That last
 one is what makes a Tarkov update fail loudly instead of lying.
@@ -495,15 +509,127 @@ def write_lf(path, text):
 # ------------------------------------------------------------------- check
 
 USE_RE = re.compile(r"\bAOWL_SYM(C?)_([A-Z][A-Z0-9_]*)\b")
-# The suffix macros are uses of the same symbol; strip them before lookup.
-SUFFIXES = ("_ARITY", "_OWNERS", "_NAME", "_SECTION", "_PROLOGUE")
+
+# The GENERATED header emits, for a symbol IDENT, both the bare RVA macro
+# `AOWL_SYM_<IDENT>` and five companion macros `AOWL_SYM_<IDENT><SUFFIX>`.
+# So a reference has to be mapped back to its IDENT by stripping a suffix --
+# but ONLY when the whole thing is not itself a declared symbol. Stripping
+# unconditionally is what broke `OBJ_GET_NAME` (a real symbol,
+# UnityEngine.Object::get_name/0): every reference to it was reported as a
+# reference to `OBJ_GET`, a name no source file has ever written.
+#
+# THE RULE, in order:
+#   1. exact match against a declared symbol wins (longest match, since the
+#      full token is longer than any suffix-stripped remainder);
+#   2. otherwise strip the LONGEST suffix that leaves a declared symbol;
+#   3. otherwise it is an undeclared reference, reported with the source line
+#      and the declared symbols that are near matches.
+SUFFIXES = ("_PROLOGUE", "_SECTION", "_OWNERS", "_ARITY", "_NAME")
 
 SCAN_EXT = (".h", ".c", ".nim", ".cpp")
 SKIP_NAMES = ("aowlspt_symtab.h", "aowlspt_symtab.nim", "il2cpp_symtab.py")
 
 
-def scan_uses(dirs):
-    """[(file, line_no, is_call_only, ident)] over every consumer source."""
+def resolve_use(token, declared):
+    """token = the text after AOWL_SYM_/AOWL_SYMC_. -> (ident, matched_exactly)
+    or (None, False) when nothing declared explains it."""
+    if token in declared:
+        return token, True
+    for s in sorted(SUFFIXES, key=len, reverse=True):
+        if token.endswith(s):
+            base = token[:-len(s)]
+            if base in declared:
+                return base, False
+    return None, False
+
+
+def strip_comments(text, ext):
+    """Blank out COMMENT text, preserving every byte position and newline so
+    line numbers and column offsets are unchanged.
+
+    A symbol named in prose is not a reference. The gate used to fail a build
+    because a comment EXPLAINING a symbol mentioned it, which meant the only
+    way to document one was to not write its name down.
+
+    Handled: `#` and `#[ ]#` for Nim, `//` and C block comments for C/C++
+    headers, `{.emit.}` bodies included (they are Nim string literals holding C,
+    and the C comments inside them are blanked by the C pass -- see below).
+    String literals are respected in both languages, so a `"# not a comment"`
+    keeps its text.
+    """
+    out = list(text)
+    n = len(text)
+    i = 0
+    nim = ext == ".nim"
+    blockdepth = 0          # nim #[ ]# nesting / C /* */ (depth 0 or 1)
+    while i < n:
+        c = text[i]
+        if blockdepth:
+            if nim and text.startswith("#[", i):
+                blockdepth += 1
+                out[i] = out[i + 1] = " "
+                i += 2
+                continue
+            if nim and text.startswith("]#", i):
+                blockdepth -= 1
+                out[i] = out[i + 1] = " "
+                i += 2
+                continue
+            if not nim and text.startswith("*/", i):
+                blockdepth = 0
+                out[i] = out[i + 1] = " "
+                i += 2
+                continue
+            if c != "\n":
+                out[i] = " "
+            i += 1
+            continue
+        if text.startswith('"""', i) and nim:
+            j = text.find('"""', i + 3)
+            i = n if j < 0 else j + 3
+            continue
+        if c == '"':
+            i += 1
+            while i < n and text[i] != '"':
+                if text[i] == "\\":
+                    i += 1
+                elif text[i] == "\n" and not nim:
+                    break
+                i += 1
+            i += 1
+            continue
+        if c == "'" and not nim:
+            i += 1
+            while i < n and text[i] != "'":
+                if text[i] == "\\":
+                    i += 1
+                i += 1
+            i += 1
+            continue
+        if nim and text.startswith("#[", i):
+            blockdepth = 1
+            out[i] = out[i + 1] = " "
+            i += 2
+            continue
+        if not nim and text.startswith("/*", i):
+            blockdepth = 1
+            out[i] = out[i + 1] = " "
+            i += 2
+            continue
+        if (nim and c == "#") or (not nim and text.startswith("//", i)):
+            while i < n and text[i] != "\n":
+                out[i] = " "
+                i += 1
+            continue
+        i += 1
+    return "".join(out)
+
+
+def scan_uses(dirs, declared=None):
+    """[(file, line_no, is_call_only, ident, raw_token, line_text)] over every
+    consumer source. COMMENTS ARE NOT SCANNED. `ident` is None when no declared
+    symbol explains the token; the caller reports that with the source line."""
+    declared = declared if declared is not None else set()
     uses = []
     for d in dirs:
         if os.path.isfile(d):
@@ -521,17 +647,30 @@ def scan_uses(dirs):
                 continue
             try:
                 with open(p, "r", encoding="utf-8", errors="replace") as f:
-                    for n, line in enumerate(f, 1):
-                        for m in USE_RE.finditer(line):
-                            ident = m.group(2)
-                            for s in SUFFIXES:
-                                if ident.endswith(s):
-                                    ident = ident[:-len(s)]
-                                    break
-                            uses.append((p, n, m.group(1) == "C", ident))
+                    raw = f.read()
             except OSError:
                 continue
+            ext = os.path.splitext(p)[1].lower()
+            code = strip_comments(raw, ext)
+            raw_lines = raw.split("\n")
+            for n, line in enumerate(code.split("\n"), 1):
+                for m in USE_RE.finditer(line):
+                    token = m.group(2)
+                    ident, _exact = resolve_use(token, declared)
+                    uses.append((p, n, m.group(1) == "C", ident, token,
+                                 raw_lines[n - 1].strip() if n <= len(raw_lines)
+                                 else ""))
     return uses
+
+
+def near_matches(token, declared):
+    """Declared symbols a human would call 'close' to what was written."""
+    import difflib
+    cands = set(difflib.get_close_matches(token, sorted(declared), 5, 0.6))
+    for d in declared:
+        if d.startswith(token) or token.startswith(d):
+            cands.add(d)
+    return sorted(cands)
 
 
 def parse_header(path):
@@ -631,19 +770,27 @@ def do_check(gameasm, metadec, manifest, header, dirs, header_only=False):
 
     # 2. every symbol the manifest declares must have survived its gates, or
     #    no consumer may reference it.
-    uses = scan_uses(dirs)
+    uses = scan_uses(dirs, set(entries))
     used = {}
-    for path, n, call_only, ident in uses:
+    for path, n, call_only, ident, token, text in uses:
+        if ident is None:
+            # UNDECLARED. Name what the source actually wrote -- never a
+            # suffix-stripped invention -- and show the line and the closest
+            # declared symbols, because "not declared" with no candidates is
+            # indistinguishable from a tool bug.
+            near = near_matches(token, set(entries))
+            fails.append(
+                "FAIL  %s:%d references AOWL_SYM%s_%s, which is not declared in "
+                "%s\n        %s\n        near matches in the manifest: %s"
+                % (rel(path), n, "C" if call_only else "", token,
+                   os.path.basename(manifest), text,
+                   ", ".join(near) if near else
+                   "(none -- check the spelling against the manifest)"))
+            continue
         used.setdefault(ident, []).append((path, n, call_only))
 
     for ident, sites in sorted(used.items()):
         e = entries.get(ident)
-        if e is None:
-            for path, n, _c in sites:
-                fails.append("FAIL  %s:%d references AOWL_SYM_%s, which is not "
-                             "declared in %s"
-                             % (rel(path), n, ident, os.path.basename(manifest)))
-            continue
         if e.reject:
             for path, n, _c in sites:
                 fails.append("FAIL  %s:%d references %s -- REJECTED: %s (%s)"

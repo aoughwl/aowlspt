@@ -207,30 +207,11 @@ proc installTargets() =
     hexOf(AOWL_SYM_GO_ACTIVE_IN_HIERARCHY_PROLOGUE),
     owners = int32(AOWL_SYM_GO_ACTIVE_IN_HIERARCHY_OWNERS))
 
-  # `UnityEngine.Object::get_name` IS in the generated table -- and it is
-  # hand-declared here anyway, for a TOOLING reason that is worth stating so
-  # nobody "fixes" it back:
-  #
-  #   `tools/il2cpp_symtab.py`'s consumer scan strips the suffixes
-  #   `_ARITY | _OWNERS | _SECTION | _PROLOGUE` and the display-name one from
-  #   any `AOWL_SYM*` identifier before looking it up, and it scans COMMENTS as
-  #   well as code. For a symbol whose OWN ident ends in that last suffix --
-  #   `OBJ_GET` + the display-name suffix, which is this one -- the strip turns
-  #   the bare RVA constant into a lookup for a shorter ident that does not
-  #   exist, and the gate fails naming a symbol the source never wrote. The
-  #   generated constant is correct and simply cannot be referenced, in code or
-  #   in a comment. Reported to the coordinator; this file works around it
-  #   rather than silently routing around it.
-  #
-  # The RVA and the sixteen bytes below are the SAME ones the generated table
-  # carries, and they are ALSO the same ones `abi/aowlspt_nativeui.h` measured
-  # independently. That agreement between two tables produced by different means
-  # is the check that makes a hand-declared prologue safe here.
   tGetName = rvaTarget(
-    "UnityEngine.Object::get_name/0 -> string",
-    0x52AD4B0'u32,
-    "40 53 48 83 EC 20 80 3D 36 72 E2 01 00 48 8B D9",
-    owners = 1'i32)
+    AOWL_SYM_OBJ_GET_NAME_NAME & " -> string",
+    AOWL_SYM_OBJ_GET_NAME,
+    hexOf(AOWL_SYM_OBJ_GET_NAME_PROLOGUE),
+    owners = int32(AOWL_SYM_OBJ_GET_NAME_OWNERS))
 
   tCompGameObject = rvaTarget(
     AOWL_SYMC_COMPONENT_GET_GAMEOBJECT_NAME & " -> GameObject",
