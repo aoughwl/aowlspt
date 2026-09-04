@@ -88,6 +88,7 @@ import emu/tuning   # the globals overrides -- the settings that reach the CLIEN
 import emu/svm      # the SVM rows that are NOT globals.config, + the read ledger
 import emu/spawn    # spawning items into a stash from the settings page
 import emu/loadout  # the automation library's declarative gear minter
+import emu/raidloadout # AutoRaid's EPHEMERAL loadout: minted, then stripped
 
 const
   ModGuid = "aowl.tarkov"
@@ -802,6 +803,17 @@ proc onProfileSelect(url, body, session: string): string =
   else:
     info "menu corner label: profile " & id & " has no nickname to show"
   applyMenuCornerLabel()
+
+  # AutoRaid's first of two triggers. MEASURED (capture raid1, manifest seq
+  # 096 then 098): this fires immediately AFTER the client's last
+  # `/client/game/profile/list`, so a loadout applied here reaches the client at
+  # the NEXT list, not the raid that is about to start. See the header of
+  # `emu/raidloadout`, where the ordering is written out in full rather than
+  # left for a subscriber to discover from inside a raid.
+  var selected = obj()
+  put(selected, "session", session)
+  put(selected, "profileId", id)
+  discard broadcast("tarkov.profile.selected", selected)
 
   # Insurance returns are checked at login as well as on a timer. A server that
   # was switched off when a return came due must still deliver it, and a timer
@@ -1722,6 +1734,24 @@ proc onAutoscriptLoadout(url, body, session: string): string =
   info "autoscript loadout: " & rep.verdict & " -- " & rep.reason
   result = reportJson(rep)
 
+proc onAutoRaidLoadoutStatus(url, body, session: string): string =
+  ## `/aowlspt/autoraid/loadout/status` -- what AutoRaid's ephemeral loadout has
+  ## done, and the measured wire order that decides WHEN it can be seen.
+  ##
+  ## Bare JSON built by the builders, never a hand-rolled string: the whole
+  ## reason `errJson`/`obj()` exist is that a status route which answers
+  ## something that is not JSON is indistinguishable from a working one until
+  ## something parses it.
+  ##
+  ## Served under BOTH namespaces on purpose. Measured (see the ORBIT comment in
+  ## `onLoad`): a route at `/aowlspt/orbit/plan` 404s on a running backend while
+  ## `/aowlspt/tarkov/...` beside it answers, so the contract's
+  ## `/aowlspt/autoraid/...` path may not reach a mod on this host at all. Both
+  ## are registered and both answer the same document; the `/aowlspt/tarkov/`
+  ## one is the one known to work.
+  inc gRequests
+  result = arStatusJson()
+
 proc onAutoscriptVerify(url, body, session: string): string =
   ## `/aowlspt/tarkov/autoscript/verify` -- the read-back half alone. Mints
   ## nothing and saves nothing; the same `countPlaced` decides. A script uses it
@@ -2295,7 +2325,20 @@ proc onRaidConfiguration(url, body, session: string): string =
     enterRaid(session, configured, field(body, "raidMode").asText(""))
   info "raid configured: " & field(cfg, "location").asText("?") & " as " &
        field(cfg, "side").asText("?")
-  discard broadcast("tarkov.raid.configured", raw(cfg))
+  # A SUPERSET of what this used to send. It sent `raw(cfg)` -- the five members
+  # the client gets echoed back -- which carries neither the session nor the
+  # profile, so a subscriber could not tell WHOSE raid it was. Every member of
+  # `cfg` is still there; `session`, `profileId` and `raidMode` are added.
+  #
+  # This is AutoRaid's second trigger, and it is LATER than the last
+  # `/client/game/profile/list` (capture raid1 seq 096 vs 156), so gear applied
+  # from it spawns with the NEXT raid, not this one. `emu/raidloadout` says so
+  # in its status route too.
+  var cfgDoc = parseObject(cfg)
+  setText(cfgDoc, "session", session)
+  setText(cfgDoc, "profileId", currentProfile(session).id)
+  setText(cfgDoc, "raidMode", field(body, "raidMode").asText(""))
+  discard broadcast("tarkov.raid.configured", text(cfgDoc))
   # The ORBIT plan for this map, built here because this is the FIRST moment
   # the map is known and it is known before any bot exists. `emitPlan` is a
   # no-op when the map has not changed, so the second caller below costs
@@ -2632,8 +2675,29 @@ proc onMatchEnd(url, body, session: string): string =
   var earnedAchievements: seq[string] = @[]
   discard awardAchievements(updated, nowSeconds(), earnedAchievements)
 
+  # AUTORAID'S EPHEMERAL GEAR, out before the save.
+  #
+  # Placed here, after `raidCarriedFullInventory` has decided which inventory is
+  # being written, and that ordering is the whole of it: on a DEATH the client
+  # posts no stash, the guard above puts the STORED inventory back into
+  # `updated`, and the minted items are in that stored inventory -- so stripping
+  # before the guard would strip a copy that is then thrown away and the gear
+  # would come home anyway. On an EXTRACT the posted inventory is kept and the
+  # minted items are in that one. Both cases are handled by stripping whatever
+  # `updated.Inventory.items` holds at this point, which is the array that is
+  # about to be saved.
+  #
+  # `minted` is kept across the save so the verdict below can be a NEGATIVE over
+  # the profile as it was actually written, rather than over the object this
+  # handler is holding.
+  var arMinted: seq[string] = @[]
+  let arActed = arStripBeforeSave(updated, p.id, arMinted)
+
   if not saveProfile(updated):
     return failure(1, "could not save the profile after the raid")
+
+  if arActed:
+    arEndVerdict(p.id, arMinted)
 
   # `transferItems`: everything the player handed to the BTR container or
   # carried into a transit. It is in the request body and it is **not** in the
@@ -3292,6 +3356,11 @@ proc registerRoutes() =
   discard serve("/aowlspt/tarkov/autoscript/loadout", onAutoscriptLoadout)
   discard serve("/aowlspt/tarkov/autoscript/verify", onAutoscriptVerify)
   discard serve("/aowlspt/tarkov/autoscript/capabilities", onAutoscriptCaps)
+
+  # AutoRaid's ephemeral loadout status. Both namespaces; see the handler.
+  discard serve("/aowlspt/autoraid/loadout/status", onAutoRaidLoadoutStatus)
+  discard serve("/aowlspt/tarkov/autoraid/loadout/status",
+                onAutoRaidLoadoutStatus)
 
   discard serve("/client/profile/status", onProfileStatus)
   # `GetProfileSettings` answers a bare `true`; the client only checks that the
@@ -5000,6 +5069,22 @@ proc onLoad(): Status =
     return ErrUnsupported
 
   registerRoutes()
+
+  # AutoRaid's ephemeral loadout, subscribed AFTER the self-check gate so a
+  # build that fails its own arithmetic never mints anything.
+  if on(ARApplyEvent, arApply) != Ok:
+    warn "no " & ARApplyEvent & " subscription on this host: " & lastError() &
+         " -- AutoRaid's spawned loadout will do nothing, and it will do it " &
+         "silently unless this line is read"
+  # A process that has just started cannot have a raid in progress, so any
+  # minted set still on disk belongs to a raid that never ended -- a crash, a
+  # killed client, a backend restarted mid-raid. Stripped now and announced,
+  # because minted gear that is never stripped is indistinguishable from gear
+  # the player owns one menu load later.
+  let swept = arSweepStale()
+  if swept > 0:
+    warn "autoraid loadout: " & $swept &
+         " profile(s) carried a stale minted set from a raid that never ended"
 
   # A minute is the right period for this: it is not a game loop, and every
   # thing it does is something the player would otherwise wait for a screen

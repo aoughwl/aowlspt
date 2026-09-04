@@ -52,6 +52,7 @@ import itemsadd
 import mailcheck
 import spawn
 import loadout
+import raidloadout
 import decorate
 import dialogue
 import insurance
@@ -158,6 +159,16 @@ proc selfCheckFailures*(): seq[string] =
   # deliberately does NOT assert that gear arrived -- that needs a real profile,
   # and a check written to pass without one is the check that cannot fail.
   discard loadout.selfCheckLoadout(result)
+  # `raidloadout` is AutoRaid's EPHEMERAL half, and the one thing standing
+  # between a minted test loadout and a permanently duplicated stash. Its
+  # offline half is over synthetic item arrays, and every assertion is a
+  # negative that can fail: a nested minted subtree must leave NOTHING behind
+  # (delete the `descendantsOf` walk and it goes red), an ABSENT minted id must
+  # not be counted as stripped, an item the player OWNED must survive, and a
+  # FULL grid must refuse `findSpace` while an EMPTY one of the same size does
+  # not -- without that second half the no-room refusal would be passing
+  # because the placer refuses everything.
+  discard raidloadout.selfCheckRaidLoadout(result)
   # `mailcheck` proves the served-mail payload check can FAIL. It is run on
   # the exact bad body measured in a live mailbox on 2026-08-28 -- a message
   # whose one attachment is the tpl of a stash -- and refuses the load if the
