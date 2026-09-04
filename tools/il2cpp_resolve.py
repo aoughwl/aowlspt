@@ -223,7 +223,15 @@ guessed at.
         # be a wrong answer; it offers `symbolize` instead. A name that matches
         # several distinct addresses is REFUSED with the candidates listed.
   il2cpp_resolve.py <GameAssembly.dll> <global-metadata.dec.dat> disasm <RVA-or-VA-or-Type::Method>
-                                       [--len N | --to RVA] [--base 0x...] [--max-gap N] [--no-fields]
+                                       [--count N | -n N | --len N | --to RVA]
+                                       [--base 0x...] [--max-gap N] [--no-fields]
+        # WINDOW FLAGS, all mutually exclusive: `--count N` (== `-n N`,
+        # == `--insns N`) N INSTRUCTIONS; `--len N` (== `--length N`) N BYTES;
+        # `--to RVA` up to an address. Default 64 BYTES. Every run ends with a
+        # `window` line stating instructions/bytes decoded and `limit reached:
+        # YES/no`, so a truncated window can never read as a whole function.
+        # An unknown flag is REFUSED (exit 2) -- `--count` was once ignored
+        # silently and 16 instructions read as the function's whole body.
         # THE INSTRUCTIONS AROUND AN ADDRESS -- what `bytes` cannot give you,
         # and what crash triage needs (`From @0x141ffd0 +0x11f` is
         # `cmp qword ptr [rbx + 0x118], r12`). Needs `capstone`; without it the
@@ -1372,6 +1380,64 @@ VERBS = ("find", "methods", "member", "type", "typemethods", "bytes",
          "enum", "verify-consts", "settings-table", "holdersof",
          "genericmethods", "verify-generics", "symbolize", "symbolize-report",
          "callers", "disasm")
+
+# ---- the flags each verb ACCEPTS -------------------------------------------
+# An unknown flag used to be silently dropped: `disasm ... --count 200` printed
+# the DEFAULT 64-byte window, which read as "the function is 16 instructions
+# long" -- a confidently wrong answer (CLAUDE.md 10). Every verb now refuses
+# a flag it does not implement, naming the full command line and its own flag
+# list. A verb with no flags is listed with an empty tuple ON PURPOSE, so that
+# adding a flag without registering it here fails LOUDLY rather than silently.
+VERB_FLAGS = {
+    "find": (),
+    "methods": ("--name", "--shared", "--argc", "--limit"),
+    "member": ("--name", "--argc", "--limit", "--exact"),
+    "holdersof": ("--limit", "--fields", "--getters", "--exact"),
+    "type": ("--shared",),
+    "typemethods": ("--inherited",),
+    "genericmethods": (),
+    "bytes": (),
+    "shared": (),
+    "fields": (),
+    "enum": (),
+    "verify-be": (),
+    "verify-fields": (),
+    "verify-parents": (),
+    "verify-consts": (),
+    "verify-generics": (),
+    "settings-table": (),
+    "symbolize": ("--base", "--max-gap", "--no-generics"),
+    "symbolize-report": ("--max-gap",),
+    "callers": ("--base", "--max-gap", "--limit", "--no-cache"),
+    "disasm": ("--count", "-n", "--insns", "--len", "--length", "--to",
+               "--base", "--max-gap", "--no-fields"),
+}
+
+
+def _looks_like_flag(tok):
+    """A leading '-' that is not a number. `-0x10` is an address, not a flag."""
+    if not tok.startswith("-") or tok == "-":
+        return False
+    try:
+        int(tok, 0)
+        return False
+    except ValueError:
+        return True
+
+
+def unknown_flags(cmd, args):
+    """Every token in `args` that looks like a flag and is not accepted."""
+    ok = VERB_FLAGS.get(cmd)
+    if ok is None:
+        return []
+    bad = []
+    for tok in args:
+        if not _looks_like_flag(tok):
+            continue
+        name = tok.split("=", 1)[0]
+        if name not in ok:
+            bad.append(tok)
+    return bad
 
 # ---- MethodAttributes ------------------------------------------------------
 # ECMA-335 II.23.1.10. Only the bits that change a BIND DECISION are decoded;
@@ -3254,10 +3320,16 @@ def _branch_annotation(R, cs, ins, idx, max_gap):
 
 def cmd_disasm(R, argv, key=None):
     if not argv:
-        print("usage: disasm <RVA-or-VA-or-Type::Method> [--len N | --to RVA] "
-              "[--base 0x...] [--max-gap N] [--no-fields]")
+        print("usage: disasm <RVA-or-VA-or-Type::Method> "
+              "[--count N | -n N | --len N | --to RVA] "
+              "[--base 0x...] [--max-gap N] [--no-fields]\n"
+              "  --count N / -n N / --insns N   N INSTRUCTIONS\n"
+              "  --len N   / --length N         N BYTES (default %d)\n"
+              "  --to RVA                       decode up to that address"
+              % DISASM_DEFAULT_LEN)
         return 2
     length = None
+    count = None
     to = None
     base = None
     max_gap = DEFAULT_MAX_GAP
@@ -3272,6 +3344,15 @@ def cmd_disasm(R, argv, key=None):
             continue
         if a.startswith("--len="):
             length = int(a.split("=", 1)[1], 0)
+            i += 1
+            continue
+        if a in ("--count", "-n", "--insns") and i + 1 < len(argv):
+            count = int(argv[i + 1], 0)
+            i += 2
+            continue
+        if (a.startswith("--count=") or a.startswith("--insns=")
+                or a.startswith("-n=")):
+            count = int(a.split("=", 1)[1], 0)
             i += 1
             continue
         if a == "--to" and i + 1 < len(argv):
@@ -3307,8 +3388,18 @@ def cmd_disasm(R, argv, key=None):
     if not rest:
         print("disasm: no address or Type::Method given")
         return 2
-    if length is not None and to is not None:
-        print("disasm: --len and --to are mutually exclusive; pass one.")
+    if len(rest) > 1:
+        print("usage error: disasm takes ONE address or Type::Method, but got "
+              "%d positional tokens: %s\n"
+              "  a stray token is never ignored here: an ignored argument "
+              "produced a default window that read as the whole function."
+              % (len(rest), " ".join(repr(x) for x in rest)))
+        return 2
+    given = [n for n, v in (("--len", length), ("--to", to),
+                            ("--count", count)) if v is not None]
+    if len(given) > 1:
+        print("disasm: %s are mutually exclusive; pass one."
+              % " and ".join(given))
         return 2
 
     cs, refusal = import_capstone()
@@ -3375,8 +3466,21 @@ def cmd_disasm(R, argv, key=None):
             print("disasm: --to 0x%x is not above the start address 0x%x."
                   % (end, rva))
             return 2
+    elif count is not None:
+        # 15 bytes is the x86-64 maximum instruction length, so this cannot
+        # cut the requested instruction count short; the count itself stops it.
+        end = rva + 15 * count + 16
     else:
         end = rva + (DISASM_DEFAULT_LEN if length is None else length)
+    if count is not None:
+        window_req = "%d instructions (--count)" % count
+    elif to is not None:
+        window_req = "up to 0x%x (--to)" % end
+    elif length is not None:
+        window_req = "%d bytes (--len)" % length
+    else:
+        window_req = "%d bytes (DEFAULT -- no window flag given)" % \
+            DISASM_DEFAULT_LEN
 
     # ---- argument registers, for the field annotation
     fmap = FieldAtOffset(R)
@@ -3411,12 +3515,20 @@ def cmd_disasm(R, argv, key=None):
     md = cs.Cs(cs.CS_ARCH_X86, cs.CS_MODE_64)
     md.detail = True
     trace = RegTrace(cand)
+    print("window   requested %s" % window_req)
     print("%-2s %-10s %-22s %s" % ("", "RVA", "BYTES", "INSTRUCTION"))
     printed = 0
     hit = False
     decoded_to = start
+    first_printed = None
+    truncated = False
+    last_mnemonic = ""
     for ins in md.disasm(bytes(blob), start):
         if ins.address >= end:
+            truncated = True
+            break
+        if count is not None and printed >= count:
+            truncated = True
             break
         decoded_to = ins.address + ins.size
         marker = "  "
@@ -3434,6 +3546,9 @@ def cmd_disasm(R, argv, key=None):
         if ins.address < show_from:
             continue
         printed += 1
+        if first_printed is None:
+            first_printed = ins.address
+        last_mnemonic = ins.mnemonic
         print("%-2s 0x%-8x %-22s %s %s%s"
               % (marker, ins.address, ins.bytes.hex(), ins.mnemonic,
                  ins.op_str, ("   " + note) if note else ""))
@@ -3449,6 +3564,25 @@ def cmd_disasm(R, argv, key=None):
               "are not valid x86-64 at this boundary. This is not an empty "
               "function.")
         return 3
+    print("window   %d instructions / %d bytes decoded, 0x%x..0x%x   "
+          "limit reached: %s"
+          % (printed, decoded_to - (first_printed if first_printed is not None
+                                    else decoded_to),
+             first_printed if first_printed is not None else decoded_to,
+             decoded_to, "YES" if truncated else "no"))
+    if truncated:
+        print("         TRUNCATED -- this window ENDED AT THE LIMIT, not at "
+              "the end of the function. Do NOT read the last instruction as "
+              "the last instruction of the body. Re-run with a bigger "
+              "--count N / --len N, or --to <RVA>.")
+    elif last_mnemonic in ("ret", "jmp", "int3", "ud2"):
+        print("         complete within the requested window; it ends on "
+              "`%s`, which MAY be the end of the body (a tail `jmp` or a "
+              "mid-body `ret` is not proof)." % last_mnemonic)
+    else:
+        print("         the decoder stopped before the limit (capstone could "
+              "not decode the next bytes) -- this is NOT proof the body ends "
+              "here.")
     if not hit:
         print("NOTE     0x%x itself was NOT reached: the decode stopped at "
               "0x%x. It is INSIDE no instruction printed above."
@@ -3505,11 +3639,32 @@ def main():
                      "GameAssembly.dll and argv[2] the DECRYPTED "
                      "global-metadata (see tools/metablob.py; the encrypted "
                      "file on disk will NOT parse)." % p)
-    R = Resolver(sys.argv[1], sys.argv[2])
     cmd = sys.argv[3]
     if cmd not in VERBS:
         sys.exit("usage error: unknown verb %r. Known verbs: %s"
                  % (cmd, ", ".join(VERBS)))
+    missing_reg = [v for v in VERBS if v not in VERB_FLAGS]
+    if missing_reg:
+        sys.stderr.write("WARNING: these verbs have no VERB_FLAGS entry, so "
+                         "their flags are NOT checked: %s\n"
+                         % ", ".join(missing_reg))
+    # Refuse unknown flags BEFORE loading the metadata: an ignored flag is a
+    # wrong answer, and this one costs nothing to catch.
+    bad = unknown_flags(cmd, sys.argv[4:])
+    if bad:
+        accepted = VERB_FLAGS.get(cmd) or ()
+        sys.exit(
+            "usage error: `%s` does not accept %s.\n"
+            "  you ran:   %s\n"
+            "  `%s` accepts: %s\n"
+            "  NOTHING was disassembled/searched. An unknown flag is REFUSED "
+            "rather than ignored, because an ignored window flag makes a "
+            "DEFAULT-sized result read as a complete one."
+            % (cmd, ", ".join(repr(b) for b in bad),
+               " ".join([os.path.basename(sys.argv[0])] + sys.argv[1:]),
+               cmd, ", ".join(accepted) if accepted
+               else "no flags at all (positional arguments only)"))
+    R = Resolver(sys.argv[1], sys.argv[2])
     if cmd == "find":
         needle = sys.argv[4]
         n = 0

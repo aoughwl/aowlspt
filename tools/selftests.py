@@ -204,6 +204,11 @@ ITEMS = [
       note="proves hostcfg.py --selftest CAN fail"),
     T("test_uihooks_falsifier.py", "fast",
       note="proves uihooks_check selftest CAN fail"),
+    T("test_il2cpp_flags.py", "fast",
+      note="proves il2cpp_resolve.py REFUSES an unknown flag instead of "
+           "ignoring it (--count on disasm was dropped silently, so a "
+           "DEFAULT-sized window read as a whole function); its own "
+           "falsifiers register --bogus and watch the same argv pass"),
 
     # ---- slow -------------------------------------------------------------
     T("test_buildlock.py", "slow", note="spawns real lock contenders; >90s"),
@@ -285,7 +290,10 @@ VERIFIERS = [
       "absent when the module cannot be named"),
     V("il2cpp_resolve.py", "test_resolver_shared.py",
       "asserts sharedness answers unknown (not 'unique') for an address that "
-      "is not in the methodPointers histogram -- the .get(rva,1) bug"),
+      "is not in the methodPointers histogram -- the .get(rva,1) bug; and "
+      "test_il2cpp_flags.py covers the CLI half: it registers a --bogus flag "
+      "in VERB_FLAGS and asserts the SAME argv then passes, so the refusal is "
+      "the registry's and not the message's"),
     V("markers.py", "test_markers_falsifier.py",
       "asserts MISSING for an absent literal and INCONCLUSIVE for a truncated "
       "read, so PRESENT is not the only reachable answer"),

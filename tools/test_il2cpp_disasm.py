@@ -238,6 +238,40 @@ def main():
     case("G: --len bounds the window", bool(rows)
          and max(a for _m, a, _t in rows) < FROM + 16)
 
+    # ---- the WINDOW is named in the output, and --count is honoured -------
+    # The defect this guards: `--count 200` was silently ignored, the default
+    # 64-byte window was printed, and 16 instructions read as a whole body.
+    rc, out = run(R, key, ["0x%x" % FROM, "--count", "5"])
+    rows = insn_lines(out)
+    case("W: --count N prints exactly N instructions", rc == 0
+         and len(rows) == 5, "rc=%d rows=%d" % (rc, len(rows)))
+    case("W: the header states the REQUESTED window",
+         "window   requested 5 instructions (--count)" in out)
+    case("W: the footer states instructions/bytes decoded and the limit",
+         any(ln.startswith("window   5 instructions /") and
+             "limit reached: YES" in ln for ln in out.splitlines()),
+         " | ".join(ln for ln in out.splitlines()
+                    if ln.startswith("window   ")))
+    case("W: a truncated window SAYS it is not the end of the function",
+         "TRUNCATED" in out and "not at the end of the function" in out)
+    case("W: -n is the same flag as --count",
+         insn_lines(run(R, key, ["0x%x" % FROM, "-n", "5"])[1]) == rows)
+    case("W: --insns is the same flag as --count",
+         insn_lines(run(R, key, ["0x%x" % FROM, "--insns", "5"])[1]) == rows)
+    rc, out = run(R, key, ["0x%x" % FROM, "--count", "5", "--len", "64"])
+    case("W: --count with --len is REFUSED (exit 2), never silently one of "
+         "them", rc == 2 and "mutually exclusive" in out, out.strip()[:70])
+    rc, out = run(R, key, ["0x%x" % FROM, "0x141fff0"])
+    case("W: a stray extra positional is REFUSED (exit 2) rather than "
+         "ignored", rc == 2 and "positional" in out, out.strip()[:70])
+    # FALSIFIER for the window line: the DEFAULT run must say it is a default,
+    # so no run can present a default-sized window as a deliberate one.
+    rc, out = run(R, key, ["0x%x" % FAULT])
+    case("W-falsifier: a run with NO window flag says so in the header",
+         "DEFAULT -- no window flag given" in out)
+    case("W-falsifier: and still prints a limit verdict",
+         any("limit reached:" in ln for ln in out.splitlines()))
+
     # ---- capstone absent: the NEGATIVE CONTROL for "it is importable" -----
     saved = sys.modules.get("capstone")
     sys.modules["capstone"] = None      # makes `import capstone` raise
