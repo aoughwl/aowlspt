@@ -1709,7 +1709,7 @@ var gNtOff = false               ## self-disabled after the fault ceiling
 ## 2026-09-02's deaths had and which nothing could see.
 var gNtCloseSlot = -1
 var gNtCloseAllSlot = -1
-const KindMaxFeature = 33
+const KindMaxFeature = 35
   ## The highest `kind` that `attachDrain` treats as a FEATURE detour rather than
   ## as the main-thread update drain. Bump this when a new kind is added, and
   ## nothing else in `attachDrain` needs touching: the two places that used to
@@ -1975,6 +1975,20 @@ var gModeSkipCtorSlot = -1
 var gModeSkipShowSlot = -1
 var gModeSkipOn = false
 var gModeSkipWantId = ""
+
+## FEATURE F2 -- the NO-FRAME skip, on
+## `EFT.TarkovApplication::TryCreateInRaidCharacterSelection` @0x97BBF0. A
+## THIRD detour for `modeskip.nim`, and the only one of the three that ever
+## suppresses its original. Declared here for the same reason the two above
+## are: `patchFired` and `attachDrain` are defined before `modeskip.nim` is
+## included, and while procs resolve across the whole module, module-level
+## `var`s do not.
+##
+## 0x97BBF0 is UNSHARED and nothing else in this host names it, so there is no
+## double-detour hazard here either.
+var gModeSkipTryCreateSlot = -1
+var gModeSkipProbeOn = false      ## `modeSkipProbe`, READ ONLY, default OFF
+var gModeSkipNativeOn = false     ## `uxSkipModeScreenNative`, default OFF
 
 ## THE LIVE INSPECTOR'S slot -- the THIRD rider on `EFT.UI.PreloaderUI::Update`,
 ## declared here for the same reason `gModeTextSlot` is: `attachDrain` and
@@ -4514,6 +4528,21 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
   if i == gModeSkipShowSlot:
     modeSkipShowSlotFired(regs)
     return 0'i32
+  # FEATURE F2, and the ONE place this host suppresses an original on the
+  # boot path. `modeSkipTryCreateFired` returns 1 only after its guarded body
+  # has actually WRITTEN a 24-byte CharacterSelectionResult built from the
+  # game's own dictionary -- a fault, an unreadable dictionary, a failed
+  # self-check or a non-writable out-param all return 0 and let the original
+  # run, which shows the screen. Suppression with an unfilled result is
+  # unreachable by construction: the write happens before the flag is set.
+  #
+  # PREFIX, and not by preference either: the whole point is to decide whether
+  # the original runs at all. It is also STATIC with two declared arguments,
+  # i.e. THREE register slots (data, &result, MethodInfo*), so nothing of it
+  # ever lives on the caller's stack and `attachDrain`'s postfix gate is not
+  # in question.
+  if i == gModeSkipTryCreateSlot:
+    return modeSkipTryCreateFired(regs)
   if i == gBotAiSlot:
     botAiPreActivateFired(regs)
     return 0'i32
@@ -4716,6 +4745,14 @@ proc patchReturned(slot: int32; regs: Il2CppPtr): int32 {.
   # 0 always -- a postfix drain that never changes what the caller gets. With
   # `natespDeployProbe` off, `gNdpBound` is 0 and this costs one compare.
   if ndpSlotFired(int32(i)):
+    return 0'i32
+  # THE NATIVE MOD-LOAD STEP's read-only drains, by slot identity and for the
+  # same reason: the handler reads at most ONE register and passes it to a
+  # VirtualQuery-guarded C decoder, dereferences no game pointer itself, and
+  # allocates nothing on the Nim heap -- so it needs no guard, and it returns
+  # 0 always. With `modLoadNative` off `gMlnBound` is 0 and this is one
+  # compare.
+  if mlnSlotFired(int32(i), regs):
     return 0'i32
   # THE SETTINGS CLOSE, POSTFIX half, on the OTHER function: `CloseAll`
   # returned. Its handler reads no register and touches no game memory -- one
@@ -6001,6 +6038,7 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
               elif kind == 28: "native-tabs"
               elif kind == 32: "settings-bind-slider"
               elif kind == 33: "settings-bind-save"
+              elif kind == 35: "modload-native"
               else: "main-thread")
   # THE POSTFIX SLOT GATE. Before the lock, before the slot claim, before any
   # byte of the target is touched: a postfix whose target uses more register
@@ -6115,6 +6153,13 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
     gModeSkipCtorSlot = int(claimed)
   elif kind == 18:
     gModeSkipShowSlot = int(claimed)
+  elif kind == 34:
+    gModeSkipTryCreateSlot = int(claimed)
+  elif kind == 35:
+    # THE NATIVE MOD-LOAD STEP (modloadnative.nim). One kind for ALL of its
+    # rows, the same shape as uihooks/loadperf/nedeploy above: the row being
+    # bound is parked in `gMlnArming` around the call.
+    mlnNoteSlot(claimed)
   elif kind == 19:
     gSplPreloaderSlot = int(claimed)
   elif kind == 20:
@@ -7494,6 +7539,8 @@ var gModLoadCapCensus: seq[string] = @[]
 var gModLoadNeedle = "loading"
   ## Displayed-text needle for the caption; `modLoadCaption` overrides it. The
   ## match is LOCALIZED, so this is a config key rather than a constant.
+include "modloadnative.nim"
+
 include "modload.nim"
 
 
@@ -9141,6 +9188,23 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   # (READY on disk, mods NOT released) rather than only ever demonstrating it
   # opening. A gate nobody has watched hold has not been shown to be a gate.
   gModLoadGateHold = readBoolKeyDef("modLoadGateHold", false)
+  # THE NATIVE LOADING STEP (F1 of docs/BOOT-FLOW-MAP.md), DEFAULT OFF. It puts
+  # the mod-build progress on the CLIENT'S OWN profile-loading caption instead
+  # of on our from-scratch overlay, and it logs the game's own MenuLoadProfiler
+  # stages with their thread ids. Gated on `modLoadScreen` as well as on its own
+  # key, because it rides `modLoadTick` for its pump and reads the very lines
+  # that tick parses -- with the screen off there is nothing to drive it.
+  # IT DOES NOT DELAY THE BOOT: the deferred release stays gated on
+  # MenuScreen::Show behind `deferModLoad`, exactly as before.
+  gMlnOn = gModLoad and readBoolKeyDef("modLoadNative", false)
+  if gMlnOn:
+    info "modLoadNative is on: the mod-build progress is written to the " &
+         "client's OWN profile-loading caption (ProfileLoadingScreen." &
+         "_statusField@0xb0, reached from the screen receiver the game hands " &
+         "us, written through TMP_Text::set_text @0x51BC1E0 and re-applied), " &
+         "and modload.nim's three-line overlay stands down ONLY once a write " &
+         "has been read back off the live TMP. Four read-only POSTFIX drains " &
+         "are installed; nothing is delayed and no return value is changed."
   block:
     gModLoadWalkLevel = readIntKey("modLoadWalkLevel", 3)
     let n = readStrKey("modLoadCaption")
@@ -9311,6 +9375,16 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   # only thing that gives the client a PHPSESSID -- so if the launcher got far
   # enough to start the client at all, it knew this id.
   gModeSkipOn = readBoolKey("uxSkipModeScreen")
+  # FEATURE F2, two independent flags, BOTH DEFAULT OFF and both independent of
+  # `uxSkipModeScreen` above -- they bind a different function.
+  #   `modeSkipProbe`          read-only census of the dictionary the boot
+  #                            hands TryCreateInRaidCharacterSelection, once.
+  #   `uxSkipModeScreenNative` the actual skip: answer true with the game's own
+  #                            (key, value) pair and never construct the
+  #                            selection controller, so there is NO frame of
+  #                            the character/mode screen.
+  gModeSkipProbeOn = readBoolKey("modeSkipProbe")
+  gModeSkipNativeOn = readBoolKey("uxSkipModeScreenNative")
   gModeSkipWantId = readStrKey("launchProfileId")
   if gModeSkipOn and gModeSkipWantId.len == 0:
     warn "uxSkipModeScreen is set but `launchProfileId` is absent or empty in " &
@@ -10349,6 +10423,10 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
       # THE IN-GAME MOD LOADING SCREEN (default ON). Nothing to detour; this
       # only resolves the file it will render.
       discard bindModLoad(true)
+      # THE NATIVE LOADING STEP (modloadnative.nim), `modLoadNative`, default
+      # OFF. Four read-only POSTFIX drains; it binds nothing when the flag is
+      # off and says so loudly when it binds nothing while the flag is on.
+      discard bindModLoadNative(true)
 
       if gErrDlg and not bindErrDlg(true):
         warn "errdlg did not arm; in-game error dialogs will NOT be caught on " &
@@ -10425,6 +10503,18 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
           info "skip mode screen did not arm (see the reason logged above: " &
                "no launchProfileId, targets unverified on this build, or " &
                "drain disabled). The selection screen will appear as normal."
+
+      # FEATURE F2 -- the NO-FRAME skip, bound HERE and not later because the
+      # site it hooks fires inside the boot's own `RunInitialLobbyFlow`, which
+      # is well after the first `TarkovApplication::Update` tick this block
+      # runs on but well BEFORE the first `ShowSlot`. If the log never shows
+      # this site firing, binding too late is the first thing to check.
+      if gModeSkipProbeOn or gModeSkipNativeOn:
+        if not bindModeSkipNative(true):
+          info "skip mode screen (F2, native) did not arm (see the reason " &
+               "logged above: the 0x97BBF0 prologue did not verify, no " &
+               "launchProfileId with the probe off, or the drain is " &
+               "disabled). The selection screen will appear as normal."
 
       # THE LIVE INSPECTOR (opt-in). Bound LAST of the three riders on
       # `EFT.UI.PreloaderUI::Update`, which is exactly where it wants to be:
@@ -10880,6 +10970,41 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
            " deferred=" & $rl[4] & " epoch=" & $rl[5] &
            (if rl[1] > rl[2]: "  <-- COMPLETED BUT NOT RELEASED: the teardown " &
                               "ran and the DLL is still locked" else: "")
+      # THE REASON, PER ATTEMPT, ON THE SAME OCCASION AS THE COUNT.
+      # MEASURED 2026-09-04: the 6bd304e3 boot printed refused=4 and the host
+      # log carried no cause for any of the four, so the number could not be
+      # acted on. These lines come from the ledger itself rather than from a
+      # separate log call, so a count without a reason is no longer possible.
+      let notes = modcontrol.hotReloadNotes()
+      var ni = 0
+      while ni < notes.len:
+        info "hotreload:   " & notes[ni]
+        ni = ni + 1
+      let dropped = modcontrol.hotReloadNotesDropped()
+      if dropped > 0:
+        info "hotreload:   ... and " & $dropped & " further attempt(s) whose " &
+             "reason was not recorded (the " & $modcontrol.RlMaxNotes &
+             "-line cap). This list is TRUNCATED, not complete."
+      if rl[0] > 0 and notes.len == 0 and rl[1] == 0:
+        warn "hotreload: " & $rl[0] & " attempt(s) and no completion and NO " &
+             "RECORDED REASON. That is a defect in this ledger, not a verdict " &
+             "about the mods."
+      # The falsifiable half. `epoch` says the unload ran; only the version
+      # string says the NEW code came back.
+      let (vb, va) = modcontrol.hotReloadVersions()
+      var vi = 0
+      while vi < vb.len:
+        if vi < va.len:
+          info "hotreload:   version " & vb[vi] & " -> " & va[vi] &
+               (if vb[vi] == va[vi]:
+                  "  <-- THE SAME STRING: the library did not change over, " &
+                  "however healthy the counters look"
+                else: "  (changed over)")
+        else:
+          info "hotreload:   version " & vb[vi] & " -> UNMEASURED: this mod " &
+               "was unloaded and has not come back, so whether the new code " &
+               "loads is unknown, not proven"
+        vi = vi + 1
     # And the answer, on the way back out. It rides the next poll of the same
     # route the desired set came in on -- see `publishReport`.
     publishReport(now)
