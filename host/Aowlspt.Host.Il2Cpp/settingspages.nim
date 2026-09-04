@@ -1370,6 +1370,15 @@ proc swRegistryCensus*(settings, mods: seq[SwPage]; where: string) =
     if settings[i].modGuid.len > 0: modPagesHere = modPagesHere + 1
     else: settingsPages = settingsPages + 1
     i = i + 1
+  # M is MOD pages, not "every page on the MODS tab": that registry also holds
+  # the four built-in pages (Interface/Bots/Assets/Diagnostics), which are
+  # constructed there and shared with nothing. Counting them as mod pages
+  # would make the census's own number a small lie.
+  var modPagesThere = 0
+  var k = 0
+  while k < mods.len and k < 64:                  # rule 4: capped
+    if mods[k].modGuid.len > 0: modPagesThere = modPagesThere + 1
+    k = k + 1
   var shared = 0
   var aliasing = 0
   var firstShared = ""
@@ -1388,8 +1397,8 @@ proc swRegistryCensus*(settings, mods: seq[SwPage]; where: string) =
       j = j + 1
     i = i + 1
   let line = "page registry (" & where & "): " & $settingsPages &
-             " settings page(s), " & $mods.len & " mod page(s), " & $shared &
-             " shared"
+             " settings page(s), " & $modPagesThere & " mod page(s), " &
+             $shared & " shared"
   if shared > 0:
     warn line & " -- AND SHARED IS NOT ZERO. '" & firstShared &
          "' is in both registries" &
