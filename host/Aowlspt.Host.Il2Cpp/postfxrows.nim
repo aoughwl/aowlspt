@@ -2354,6 +2354,38 @@ var gPfxAlignWhy = ""
 var gPfxAlignStockX = 0.0'f32
 var gPfxAlignHaveStock = false
 
+## THE DONOR IS NOT THERE YET AT BUILD TIME. MEASURED, host stage
+## 4e1f9e7bc8fd, `aowlspt-host.log`:
+##
+##   [0:00:44.031] warn postfx rows: the stock Graphics row container reports
+##                      0 child(ren); nothing to measure.
+##   [0:00:45.312] ok   dlss rows: TOOLTIPS -- 5 of 5 row(s) READ BACK ...
+##
+## i.e. 1.3 s AFTER our pass refused, `dlssrows.nim` walked the SAME container
+## (`GraphicsSettingsTab._settingsContainer@0x98`) and found rows in it. The
+## pointer is not a different one and the PostFX page does not empty the list:
+## both passes run from `pfxBuild`, which BY DESIGN builds while the panel is
+## still hidden (same log: applied at frame 1989, "panel first seen ACTIVE at
+## frame NEVER YET"), and at that moment the GRAPHICS tab has not instantiated
+## its own rows yet. The donor is LATE, not absent -- by the time the verdict
+## printed at 0:00:49.234 it had existed for four seconds.
+##
+## So a refusal whose cause is "no donor" is now DEFERRED rather than final:
+## the pass is re-run from the tick, bounded by `PfxDonorRetryMax`, and the
+## verdict is withheld until it settles or the budget is spent. Both outcomes
+## still print -- a deferred pass that never settles says so, WITH the number
+## of ticks it waited, which is the INCONCLUSIVE third outcome and not a pass.
+const PfxDonorRetryMax = 600   ## ticks; ~10 s at 60 fps. Capped, never open.
+
+var gPfxTipDeferred = false
+var gPfxTipRetry = 0
+var gPfxTipSaid = false
+var gPfxTipDeferNoted = false
+var gPfxAlignDeferred = false
+var gPfxAlignRetry = 0
+var gPfxAlignSaid = false
+var gPfxAlignDeferNoted = false
+
 proc pfxGfxContainer(): Il2CppPtr =
   ## The stock Graphics row container, reached by WALKING from the live
   ## "Graphics Settings" panel transform this feature already located and
@@ -2453,6 +2485,13 @@ proc pfxApplyTooltips() =
     gPfxTipInit = true
     gPfxTipsOn = readBoolKeyDef("settingsPostFxTooltips", false)
   if not gPfxTipsOn or gPfxRowCtrl.len == 0: return
+  # A RETRY MUST NOT ACCUMULATE. Every count below is recomputed from scratch,
+  # so asked/called/verified always describe ONE pass over the rows and never
+  # the sum of a refused attempt and a later good one.
+  gPfxTipAsked = 0
+  gPfxTipCalled = 0
+  gPfxTipVerified = 0
+  gPfxTipWhy = ""
   gPfxTipWant = @[]
   var z = 0
   while z < gPfxRowCtrl.len and z < PfxMaxRows:
@@ -2462,7 +2501,11 @@ proc pfxApplyTooltips() =
   let donor = pfxDonorTooltipData(wd0)
   if donor == nil:
     gPfxTipWhy = wd0
+    # DEFERRED, not failed: the stock Graphics rows are instantiated later than
+    # this build runs (see the measurement above). The tick re-runs the pass.
+    gPfxTipDeferred = true
     return
+  gPfxTipDeferred = false
   gPfxTipKlass = nuKlassOf(donor)
   if gPfxTipKlass == nil:
     gPfxTipWhy = "the donor SettingsTooltipData's object header did not read " &
@@ -2562,13 +2605,21 @@ proc pfxAlignToggleLabels() =
     gPfxAlignInit = true
     gPfxAlignOn = readBoolKeyDef("settingsPostFxToggleAlign", false)
   if not gPfxAlignOn or gPfxRowCtrl.len == 0: return
+  # Recomputed per pass, for the same reason as the tooltip counters above.
+  gPfxAlignAsked = 0
+  gPfxAlignCopied = 0
+  gPfxAlignVerified = 0
+  gPfxAlignInconclusive = 0
+  gPfxAlignWhy = ""
   var whyStock = ""
   let stockCtrl = pfxStockRowComponent("SettingToggle", whyStock)
   if stockCtrl == nil:
     gPfxAlignWhy = "no STOCK toggle row could be found to measure -- " &
                    whyStock & ". Nothing was written; our rows keep the " &
                    "prefab's own caption placement, which is the defect"
+    gPfxAlignDeferred = true
     return
+  gPfxAlignDeferred = false
   let stockG = nuCtrlLabelGeom(stockCtrl)
   if not stockG.ok:
     gPfxAlignWhy = "a stock SettingToggle was found and its caption TMP's " &
@@ -2634,6 +2685,19 @@ proc pfxAlignToggleLabels() =
 proc pfxTooltipVerdict() =
   ## ONE line, and it can FAIL. Silence would make "the flag is off" and "the
   ## flag is on and every row refused" print identically.
+  if gPfxTipSaid: return
+  if gPfxTipDeferred and gPfxTipRetry < PfxDonorRetryMax:
+    if not gPfxTipDeferNoted:
+      gPfxTipDeferNoted = true
+      info "postfx rows: TOOLTIPS -- VERDICT WITHHELD, the pass is DEFERRED. " &
+           "The donor is a STOCK Graphics row and at build time " & gPfxTipWhy &
+           ". That is the late-donor case, not a failure: the pass is being " &
+           "re-run from the tick (budget " & $PfxDonorRetryMax & " tick(s)) " &
+           "and a real verdict -- pass, fail, or a named INCONCLUSIVE -- is " &
+           "printed the moment it settles or the budget is spent. Silence " &
+           "here would itself be the defect."
+    return
+  gPfxTipSaid = true
   if not gPfxTipsOn:
     info "postfx rows: TOOLTIPS are OFF (settingsPostFxTooltips). No row " &
          "carries a description, which is the state the player reported; " &
@@ -2662,6 +2726,17 @@ proc pfxTooltipVerdict() =
 proc pfxAlignVerdict() =
   ## ONE line, three outcomes, and the PASS is a negative: no toggle caption of
   ## ours is more than 1 px from the stock one's left edge.
+  if gPfxAlignSaid: return
+  if gPfxAlignDeferred and gPfxAlignRetry < PfxDonorRetryMax:
+    if not gPfxAlignDeferNoted:
+      gPfxAlignDeferNoted = true
+      info "postfx rows: TOGGLE ALIGNMENT -- VERDICT WITHHELD, the pass is " &
+           "DEFERRED. " & gPfxAlignWhy & ". The stock toggle row is " &
+           "instantiated later than this build runs, so the pass is being " &
+           "re-run from the tick (budget " & $PfxDonorRetryMax & " tick(s)); " &
+           "a pass, a fail, or a named INCONCLUSIVE follows."
+    return
+  gPfxAlignSaid = true
   if not gPfxAlignOn:
     info "postfx rows: TOGGLE-CAPTION ALIGNMENT is OFF " &
          "(settingsPostFxToggleAlign). Our toggle rows keep the " &
@@ -3101,6 +3176,44 @@ proc pfxVerdict() =
   pfxTooltipVerdict()
   pfxAlignVerdict()
 
+proc pfxDonorRetryTick() =
+  ## Re-run a pass whose ONLY refusal was "the stock Graphics donor is not
+  ## there yet". Bounded by `PfxDonorRetryMax` ticks, and it announces the
+  ## outcome itself the moment it has one: a pass that settles prints its
+  ## normal verdict here rather than waiting for another visit, and an
+  ## exhausted budget prints the refusal WITH the number of ticks waited, so
+  ## "the donor never arrived" can never read the same as "we never looked
+  ## again".
+  ##
+  ## Runs inside `gfxTickBody`'s existing guard -- it adds NO second SEH, no
+  ## detour and no managed allocation; a deferred re-run only walks the stock
+  ## container, which is itself capped at `PfxMaxTipScan` children.
+  ##
+  ## Steady state, once neither pass is deferred: two boolean tests.
+  if gPfxTipDeferred:
+    if gPfxTipRetry < PfxDonorRetryMax:
+      gPfxTipRetry = gPfxTipRetry + 1
+      pfxApplyTooltips()
+      if not gPfxTipDeferred:
+        pfxTooltipVerdict()
+    else:
+      gPfxTipDeferred = false
+      gPfxTipWhy = gPfxTipWhy & " -- and that was still true after " &
+                   $gPfxTipRetry & " later tick(s) of re-checking, so the " &
+                   "donor never arrived while this screen was open"
+      pfxTooltipVerdict()
+  if gPfxAlignDeferred:
+    if gPfxAlignRetry < PfxDonorRetryMax:
+      gPfxAlignRetry = gPfxAlignRetry + 1
+      pfxAlignToggleLabels()
+      if not gPfxAlignDeferred:
+        pfxAlignVerdict()
+    else:
+      gPfxAlignDeferred = false
+      gPfxAlignWhy = gPfxAlignWhy & " -- and that was still true after " &
+                     $gPfxAlignRetry & " later tick(s) of re-checking"
+      pfxAlignVerdict()
+
 proc pfxOnPanelUp(postUp: bool) =
   ## Called every tick from `gfxTickBody`, inside its existing guard. The
   ## steady state is two boolean tests.
@@ -3157,6 +3270,9 @@ proc pfxOnPanelUp(postUp: bool) =
     gPfxScrollJudge = gPfxScrollJudge - 1
     if gPfxScrollJudge == 0:
       pfxScrollVerdict(gPfxScrollJudgeRoot)
+  # THE LATE DONOR. Runs BEFORE the verdict so a pass that settles on this
+  # tick is judged on this tick.
+  pfxDonorRetryTick()
   pfxVerdict()
 
 proc pfxOnScreenClosed() =
@@ -3167,6 +3283,16 @@ proc pfxOnScreenClosed() =
   gPfxVerdictSaid = false
   gPfxScrollSaid = false
   gPfxGraySaid = false
+  # The two donor-dependent passes get a fresh announcement AND a fresh retry
+  # budget per visit: a donor absent on this visit may exist on the next one,
+  # and a verdict that printed once must print again for the visit the player
+  # is actually looking at.
+  gPfxTipSaid = false
+  gPfxTipDeferNoted = false
+  gPfxTipRetry = 0
+  gPfxAlignSaid = false
+  gPfxAlignDeferNoted = false
+  gPfxAlignRetry = 0
   # The next visit is a fresh "when did this panel first become active", so
   # the flash check judges THAT visit and not a stale pairing.
   gPfxFirstActiveFrame = -1
