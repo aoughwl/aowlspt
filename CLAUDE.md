@@ -235,14 +235,14 @@ those hooks is off, not that Settings was never opened.
 
 ## 3. Build rules
 
-- **The Edit tool does the same on MIXED-ending files** (measured 2026-09-04 on
-  `tools/aowl.nim`: a 14-line edit at line ~2279 silently rewrote 29 unrelated CRLF
-  lines at 189-217 to LF). After any edit to a file with mixed endings, check
-  `git diff --numstat`; if the counts exceed the edit, restore the bytes.
 - **MSYS `sed -i` rewrites CRLF files as LF** (the repo has `* -text`), which
   turns a one-line edit into a whole-file diff and a phantom conflict. Edit with
   the Edit tool or a Python script that preserves newlines; check `git diff
   --stat` before committing.
+- **The Edit tool does the same on MIXED-ending files** (measured 2026-09-04 on
+  `tools/aowl.nim`: a 14-line edit at line ~2279 silently rewrote 29 unrelated CRLF
+  lines at 189-217 to LF). After any edit to a file with mixed endings, check
+  `git diff --numstat`; if the counts exceed the edit, restore the bytes.
 - **PowerShell only, and the cause is PATH ORDER — measured 2026-09-02.** Git
   Bash prepends `C:\Program Files\Git\mingw64\bin`, which precedes
   `C:\msys64\ucrt64\bin`. `gcc.exe` itself still loads (Windows searches an
