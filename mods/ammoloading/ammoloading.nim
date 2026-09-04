@@ -950,6 +950,460 @@ proc onLoadMagazineEnd(frame: PatchFrame): TypedResult =
   endSession(true)
 
 # ---------------------------------------------------------------------------
+# THE PROBE BANK -- read-only PREFIX drains on the MEASURED in-raid reload path
+# ---------------------------------------------------------------------------
+#
+# WHY THIS EXISTS. The hooks above target `LoadMagazineProcess`, and across a
+# full raid in which the player loaded and unloaded magazines they were entered
+# ZERO times (instrument: this mod's own heartbeat in `aowlspt-host.log`).
+# `docs/AMMO-LOADING-MAP.md` says why, and the reason is structural, not a bad
+# RVA: MEASURED `il2cpp_resolve.py callers 0x768d40` returns exactly ONE caller
+# site, `<LoadMagazine>d__51::MoveNext`, and the declaring-type walk puts all of
+# it inside `EFT.Player/PlayerInventoryController`. `LoadMagazineProcess` is the
+# round-by-round INVENTORY magazine-filling process. A weapon reload never
+# constructs it -- it runs `FirearmController`'s reload OPERATIONS, which either
+# swap a whole magazine (external mag: there is no per-round transfer at all) or
+# commit an ammo delta directly (internal mag).
+#
+# So the identification-by-shape was wrong, and this bank is the empirical
+# replacement: one prefix per MEASURED entry point, grouped into KINDS, so the
+# next raid prints `fired N times` per site and names the receiver.
+#
+# EVERY SITE IS:
+#   * MEASURED UNIQUE (owners == 1) by `il2cpp_resolve.py shared <RVA>`. Not one
+#     SHARED address is bound -- notably NOT `FirearmController`'s
+#     `IEventsConsumerOnAddAmmoInMag`/`AddAmmoToMag` pair @0x77FA80, which is
+#     SHARED x2 and therefore ineligible however benign two owners look.
+#   * in the `il2cpp` PE section, and NOT the `C2 00 00` universal empty stub.
+#   * bound as a PREFIX. `CommitReloadWithAmmo` @0x7B45C0 has SIX slots
+#     (this + 5); its 5th argument lives on the CALLER's stack, so a POSTFIX
+#     there is a crash by construction. Prefix-only removes the question.
+#   * READ-ONLY. It increments a counter and, on the FIRST firing of that site
+#     only, reads the receiver's klass name. It never writes, never calls into
+#     game code, and always returns `frameContinue()`, on every rung.
+#
+# No `aowl_p_p_seh` is opened here: the host's guard already wraps each handler
+# body and it is NOT re-entrant.
+
+const
+  ## Probe kinds. The verdict in `reportText` is written in terms of these,
+  ## not of individual sites, because which OPERATION a weapon uses is chosen
+  ## at runtime and is not knowable offline.
+  PkInput   = 0   ## the LOCAL player's reload input reached FirearmController
+  PkOpStart = 1   ## a reload operation began -- the reload animation is running
+  PkAnim    = 2   ## the animator was told to reload (ALSO fires for OTHER
+                  ## players: 7 of the 13 measured call sites of
+                  ## FirearmsAnimator::Reload(bool) are NextObservedPlayer
+                  ## hands operations)
+  PkAmmo    = 3   ## the magazine's ammo actually changed
+  PkInv     = 4   ## an INVENTORY magazine fill/empty (in raid or out of raid)
+  PkCount   = 5
+
+  ProbeKindName: array[PkCount, string] =
+    ["input", "opstart", "anim", "ammo", "inv"]
+
+  NProbe = 19
+
+  ## name / RVA / prologue / shape / kind, as five parallel arrays so the table
+  ## is editable one column at a time and a length mismatch is a compile error.
+  ProbeName: array[NProbe, string] = [
+    "FirearmController::ReloadMag",
+    "FirearmController::QuickReloadMag",
+    "FirearmController::ReloadWithAmmo",
+    "FirearmController::ReloadCylinderMagazine",
+    "FirearmController::ReloadBarrels",
+    "FirearmController::CheckAmmo",
+    "ReloadExternalMagOperation::Start",
+    "ReloadInternalMagBase::Start",
+    "FirearmsAnimator::Reload_b",
+    "FirearmsAnimator::Reload_iib",
+    "FirearmsAnimator::LoadOneTrigger",
+    "ReloadExternalMagOperation::OnMagInsertedToWeapon",
+    "ReloadInternalMagOperation::CommitReloadWithAmmo",
+    "ReloadInternalMagOperation::AddAmmoToMag",
+    "ReloadCylinderMagOperation::AddAmmoToMag",
+    "PlayerInventoryController::LoadMagazine",
+    "PlayerInventoryController::UnloadMagazine",
+    "ItemController::LoadMagazine",
+    "ItemUiContext::LoadAmmoByType"]
+
+  ProbeRva: array[NProbe, uint32] = [
+    0x7843E0'u32, 0x784570'u32, 0x7848F0'u32, 0x7847A0'u32, 0x784AD0'u32,
+    0x7840C0'u32, 0x7B08F0'u32, 0x7B3580'u32, 0x1C82E80'u32, 0x1C7E7C0'u32,
+    0x1C82A90'u32, 0x7B1C70'u32, 0x7B45C0'u32, 0x7B40F0'u32, 0x7AF550'u32,
+    0x766930'u32, 0x766BC0'u32, 0x10E5180'u32, 0x151DB70'u32]
+
+  ## The 16 prologue bytes, MEASURED with `Resolver.code_bytes(rva, 16)` on
+  ## GameAssembly.dll (123,891,024 bytes, 2026-08-12). Several rows are
+  ## IDENTICAL: sixteen bytes of a standard register-save prologue are not an
+  ## identity check, they are a "has anyone already patched this" check.
+  ## Identity comes from the per-image methodPointers RVA.
+  ProbeProlog: array[NProbe, string] = [
+    "48895C240848896C2410488974241857",
+    "48895C24084889742410574883EC3080",
+    "48895C24084889742410574883EC3080",
+    "48895C240848896C2410488974241857",
+    "48895C240848896C2410488974241857",
+    "40534883EC20803D5742930600488BD9",
+    "405341574883EC588B05425C90064C8D",
+    "48895C241048896C2418574883EC3049",
+    "40534883EC20803D07D5430500488BD9",
+    "48895C24084889742410574883EC2041",
+    "48895C2408574883EC30803DEFD84305",
+    "40534883EC2080797C00488BD90F85A1",
+    "4053574154415541574883EC40803D5C",
+    "48895C2410574883EC20803D2D439006",
+    "48895C2408574883EC2033D2488BD9E8",
+    "48895C240848896C2410488974241857",
+    "48895C2408574881EC80000000803DBA",
+    "48895C24084889742410574883EC5080",
+    "48895C240848896C2410488974241857"]
+
+  ## Frame shapes, DERIVED from the metadata signature (returnType@8 /
+  ## parameterStart@16 / parameterCount@34), never inferred from the name.
+  ## `i` = integer/bool/enum and `this`, `o` = managed reference, `x` = void.
+  ProbeShape: array[NProbe, string] = [
+    "iooo>x",   # ReloadMag(Magazine, ItemAddress, Callback)
+    "ioo>x",    # QuickReloadMag(Magazine, Callback)
+    "ioo>x",    # ReloadWithAmmo(AmmoPack, Callback)
+    "iooi>x",   # ReloadCylinderMagazine(AmmoPack, Callback, bool)
+    "iooo>x",   # ReloadBarrels(AmmoPack, ItemAddress, Callback)
+    "i>i",      # CheckAmmo() -> bool
+    "ioo>x",    # ReloadExternalMagOperation::Start(Result, Callback)
+    "ioo>x",    # ReloadInternalMagBase::Start(AmmoPack, Callback)
+    "ii>x",     # FirearmsAnimator::Reload(bool)
+    "iiii>x",   # FirearmsAnimator::Reload(int, int, bool)
+    "ii>x",     # FirearmsAnimator::LoadOneTrigger(bool)
+    "i>x",      # OnMagInsertedToWeapon()
+    "iiooo>x",  # CommitReloadWithAmmo(int, AmmoPack, Player, Magazine, Weapon)
+    "i>x",      # ReloadInternalMagOperation::AddAmmoToMag()
+    "i>x",      # ReloadCylinderMagOperation::AddAmmoToMag()
+    "iooii>o",  # LoadMagazine(Ammo, Magazine, int, bool) -> Task<IResult>
+    "ioi>o",    # UnloadMagazine(Magazine, bool) -> Task<IResult>
+    "iooii>o",  # ItemController::LoadMagazine(...) -> Task<IResult>
+    "iooo>o"]   # LoadAmmoByType(Magazine, string, Action) -> Task
+
+  ProbeKind: array[NProbe, int] = [
+    PkInput, PkInput, PkInput, PkInput, PkInput, PkInput,
+    PkOpStart, PkOpStart,
+    PkAnim, PkAnim, PkAnim,
+    PkAmmo, PkAmmo, PkAmmo, PkAmmo,
+    PkInv, PkInv, PkInv, PkInv]
+
+  ## `Il2CppClass.name`. MEASURED either side (`image`@0x00 from
+  ## il2cpp_class_get_image, `namespaze`@0x18 from il2cpp_class_get_namespace);
+  ## 0x10 itself is INFERRED from the canonical head, exactly as
+  ## abi/aowlspt_components.h documents, because il2cpp_class_get_name on this
+  ## build is a TLS thread-attach wrapper and not an accessor. It is therefore
+  ## never TRUSTED -- see `readKlassName`, which refuses anything that is not a
+  ## NUL-terminated run of printable ASCII and prints UNREADABLE instead of a
+  ## plausible wrong type name.
+  KlassNameOff = 0x10'u
+  KlassNameMax = 64
+
+var
+  gProbeFires:  array[NProbe, int64]
+  gProbeBound:  array[NProbe, bool]
+  gProbeNamed:  array[NProbe, bool]
+  gProbeKlass:  array[NProbe, string]
+  gProbeArmed   = false
+  gProbeBoundN  = 0
+  gProbeRefused = 0
+
+proc probeInit() =
+  for i in 0 ..< NProbe:
+    gProbeFires[i] = 0'i64
+    gProbeBound[i] = false
+    gProbeNamed[i] = false
+    gProbeKlass[i] = ""
+
+proc hex16(s: string): array[16, uint8] =
+  ## 32 hex characters -> 16 bytes. A malformed row yields bytes that cannot
+  ## match, so `verifyTarget` refuses loudly rather than binding something
+  ## unchecked.
+  result = [0'u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  if s.len < 32:
+    return
+  for i in 0 ..< 16:
+    var v = 0
+    for k in 0 ..< 2:
+      let c = s[i * 2 + k]
+      var d = 0
+      if c >= '0' and c <= '9':
+        d = int(ord(c) - ord('0'))
+      elif c >= 'A' and c <= 'F':
+        d = int(ord(c) - ord('A')) + 10
+      elif c >= 'a' and c <= 'f':
+        d = int(ord(c) - ord('a')) + 10
+      v = v * 16 + d
+    result[i] = uint8(v)
+
+proc readKlassName(obj: Il2CppPtr): string =
+  ## `obj -> klass -> name`, three guarded hops, capped, and FENCED.
+  ##
+  ## Returns "" for anything it could not read or could not validate. The
+  ## caller must print UNREADABLE for "", never a guess: an INFERRED offset
+  ## that is allowed to print a plausible name is precisely the
+  ## confidently-wrong answer this project treats as worse than a crash.
+  result = ""
+  if cast[uint](obj) == 0'u:
+    return
+  if lamReadable(obj, 8'i32) == 0'i32:
+    return
+  let klass = lamReadPtr(obj)
+  if cast[uint](klass) == 0'u:
+    return
+  if lamReadable(at(klass, KlassNameOff), 8'i32) == 0'i32:
+    return
+  let namep = lamReadPtr(at(klass, KlassNameOff))
+  if cast[uint](namep) == 0'u:
+    return
+  var buf: array[KlassNameMax, uint8] = [
+    0'u8, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0]
+  # A C string that straddles into an uncommitted page must be TRUNCATED, not
+  # faulted, so the long read is attempted first and a short one is the
+  # fallback. Both are fixed-size reads behind VirtualQuery.
+  var got = 0
+  if lamReadMem(namep, cast[Il2CppPtr](addr buf[0]), int32(KlassNameMax)) != 0'i32:
+    got = KlassNameMax
+  elif lamReadMem(namep, cast[Il2CppPtr](addr buf[0]), 16'i32) != 0'i32:
+    got = 16
+  else:
+    return
+  var n = 0
+  while n < got and buf[n] != 0'u8:
+    inc n
+  if n == 0 or n >= got:
+    # No terminator inside the window: this is not a C string we looked at all
+    # of, so it is not evidence. "" -> UNREADABLE.
+    return
+  for i in 0 ..< n:
+    if buf[i] < 0x20'u8 or buf[i] > 0x7E'u8:
+      return
+  var s = ""
+  for i in 0 ..< n:
+    s.add char(buf[i])
+  result = s
+
+proc probeFire(i: int; f: PatchFrame) =
+  ## The whole body of every drain. Counts FIRST -- a caught fault unwinds the
+  ## guarded body silently, so a counter bumped afterwards would under-report
+  ## exactly the firings that matter.
+  gProbeFires[i] = gProbeFires[i] + 1'i64
+  if gProbeNamed[i]:
+    return
+  gProbeNamed[i] = true
+  if gRetired:
+    gProbeKlass[i] = "RETIRED-BEFORE-CENSUS"
+    return
+  let self = selfPointer(f)
+  let nm = readKlassName(cast[Il2CppPtr](self))
+  if nm.len == 0:
+    inc gUnreadable
+    gProbeKlass[i] = "UNREADABLE"
+  else:
+    gProbeKlass[i] = nm
+  success "ammoloading  PROBE FIRED [" & ProbeKindName[ProbeKind[i]] & "] " &
+          ProbeName[i] & " @0x" & rvaHex(ProbeRva[i]) &
+          "  receiver klass?=" & gProbeKlass[i] &
+          "  (klass->name@0x10 is INFERRED and validated as printable ASCII; " &
+          "UNREADABLE means it did not validate, never a guess)"
+
+proc pFire0(f: PatchFrame): TypedResult =
+  probeFire(0, f)
+  frameContinue()
+proc pFire1(f: PatchFrame): TypedResult =
+  probeFire(1, f)
+  frameContinue()
+proc pFire2(f: PatchFrame): TypedResult =
+  probeFire(2, f)
+  frameContinue()
+proc pFire3(f: PatchFrame): TypedResult =
+  probeFire(3, f)
+  frameContinue()
+proc pFire4(f: PatchFrame): TypedResult =
+  probeFire(4, f)
+  frameContinue()
+proc pFire5(f: PatchFrame): TypedResult =
+  probeFire(5, f)
+  frameContinue()
+proc pFire6(f: PatchFrame): TypedResult =
+  probeFire(6, f)
+  frameContinue()
+proc pFire7(f: PatchFrame): TypedResult =
+  probeFire(7, f)
+  frameContinue()
+proc pFire8(f: PatchFrame): TypedResult =
+  probeFire(8, f)
+  frameContinue()
+proc pFire9(f: PatchFrame): TypedResult =
+  probeFire(9, f)
+  frameContinue()
+proc pFire10(f: PatchFrame): TypedResult =
+  probeFire(10, f)
+  frameContinue()
+proc pFire11(f: PatchFrame): TypedResult =
+  probeFire(11, f)
+  frameContinue()
+proc pFire12(f: PatchFrame): TypedResult =
+  probeFire(12, f)
+  frameContinue()
+proc pFire13(f: PatchFrame): TypedResult =
+  probeFire(13, f)
+  frameContinue()
+proc pFire14(f: PatchFrame): TypedResult =
+  probeFire(14, f)
+  frameContinue()
+proc pFire15(f: PatchFrame): TypedResult =
+  probeFire(15, f)
+  frameContinue()
+proc pFire16(f: PatchFrame): TypedResult =
+  probeFire(16, f)
+  frameContinue()
+proc pFire17(f: PatchFrame): TypedResult =
+  probeFire(17, f)
+  frameContinue()
+proc pFire18(f: PatchFrame): TypedResult =
+  probeFire(18, f)
+  frameContinue()
+
+proc probeHandler(i: int): TypedPatchHandler =
+  ## Nineteen named procs rather than a closure per site: a closure would be a
+  ## per-bind allocation, and this is the shape `mods/textures/loadprobe.nim`
+  ## already uses for the same reason.
+  case i
+  of 0:  result = pFire0
+  of 1:  result = pFire1
+  of 2:  result = pFire2
+  of 3:  result = pFire3
+  of 4:  result = pFire4
+  of 5:  result = pFire5
+  of 6:  result = pFire6
+  of 7:  result = pFire7
+  of 8:  result = pFire8
+  of 9:  result = pFire9
+  of 10: result = pFire10
+  of 11: result = pFire11
+  of 12: result = pFire12
+  of 13: result = pFire13
+  of 14: result = pFire14
+  of 15: result = pFire15
+  of 16: result = pFire16
+  of 17: result = pFire17
+  else:  result = pFire18
+
+proc armProbes() =
+  ## Binds all 19 drains, once. Each refusal is STATED with its site name --
+  ## a probe that was never installed and a probe that never fired look
+  ## identical in a counter, and the heartbeat is written so they cannot be
+  ## confused (`bound=n/19`).
+  if gProbeArmed:
+    return
+  gProbeArmed = true
+  for i in 0 ..< NProbe:
+    let why = verifyTarget(ProbeRva[i], ProbeName[i], hex16(ProbeProlog[i]))
+    if why.len > 0:
+      inc gProbeRefused
+      warn "ammoloading  probe NOT bound: " & ProbeName[i] & " -- " & why
+      continue
+    let spec = ProbeName[i] & "@0x" & rvaHex(ProbeRva[i]) & "/" &
+               ProbeShape[i] & "!" & ProbeProlog[i]
+    let st = hookTyped(spec, probeHandler(i))
+    if st != Ok:
+      inc gProbeRefused
+      warn "ammoloading  hookTyped refused probe " & ProbeName[i] &
+           " @0x" & rvaHex(ProbeRva[i]) & ": " & lastError()
+      continue
+    gProbeBound[i] = true
+    inc gProbeBoundN
+  info "ammoloading  probe bank bound " & $gProbeBoundN & "/" & $NProbe &
+       " sites (" & $gProbeRefused & " refused). All UNIQUE, all PREFIX, all " &
+       "read-only. See docs/AMMO-LOADING-MAP.md for how each RVA was measured."
+
+proc probeKindFires(k: int): int64 =
+  result = 0'i64
+  for i in 0 ..< NProbe:
+    if ProbeKind[i] == k:
+      result = result + gProbeFires[i]
+
+proc probeKindBound(k: int): int =
+  result = 0
+  for i in 0 ..< NProbe:
+    if ProbeKind[i] == k and gProbeBound[i]:
+      inc result
+
+proc probeCensus(): string =
+  ## One entry per site that has fired, plus the kind totals. Sites that never
+  ## fired are summarised as a count, not listed, so a 19-line block does not
+  ## drown the verdict.
+  var fired = ""
+  var silent = 0
+  for i in 0 ..< NProbe:
+    if not gProbeBound[i]:
+      continue
+    if gProbeFires[i] == 0'i64:
+      inc silent
+      continue
+    fired.add " | " & ProbeKindName[ProbeKind[i]] & " " & ProbeName[i] &
+              " fired " & $gProbeFires[i] & " times" &
+              (if gProbeKlass[i].len > 0: " klass?=" & gProbeKlass[i] else: "")
+  result = "bound=" & $gProbeBoundN & "/" & $NProbe
+  for k in 0 ..< PkCount:
+    result.add "  " & ProbeKindName[k] & "=" & $probeKindFires(k) &
+               "(" & $probeKindBound(k) & " bound)"
+  result.add "  silentSites=" & $silent & fired
+
+proc probeVerdict(): string =
+  ## THE NEGATIVE. Three outcomes, never two.
+  ##
+  ## The property asserted is a property of the FINISHED STATE of the run, and
+  ## it is falsifiable: if the local player reloaded (an `input` site was
+  ## entered) and NO ammo-change site was entered, then §3.3 of
+  ## `docs/AMMO-LOADING-MAP.md` names the wrong methods and this must read FAIL.
+  ##
+  ## `anim` alone is deliberately NOT accepted as proof the player reloaded:
+  ## MEASURED, 7 of the 13 call sites of FirearmsAnimator::Reload(bool) are
+  ## NextObservedPlayer hands operations, so a bot reloading nearby increments
+  ## it. A check a bot can satisfy is a check that cannot fail.
+  if gProbeBoundN == 0:
+    return "INCONCLUSIVE (no probe bound -- every zero below is that, not evidence)"
+  let inp  = probeKindFires(PkInput)
+  let ammo = probeKindFires(PkAmmo)
+  let ops  = probeKindFires(PkOpStart)
+  let anim = probeKindFires(PkAnim)
+  let inv  = probeKindFires(PkInv)
+  if inp == 0'i64 and ops == 0'i64 and inv == 0'i64:
+    return "INCONCLUSIVE -- no local reload and no inventory magazine action " &
+           "was observed this run" &
+           (if anim > 0'i64:
+              " (anim fired " & $anim & ", but that also counts OTHER players " &
+              "and is not evidence about this one)"
+            else: "") &
+           ". Nobody reloaded, so this says nothing about the mapping."
+  if inp > 0'i64 and ammo == 0'i64:
+    return "FAIL -- the local player reloaded (input=" & $inp & ", opstart=" &
+           $ops & ") and NOT ONE ammo-change site was entered. The ammo half " &
+           "of docs/AMMO-LOADING-MAP.md section 3.3 names the wrong methods."
+  if inp > 0'i64 and ammo > 0'i64:
+    return "PASS -- input=" & $inp & " opstart=" & $ops & " ammo=" & $ammo &
+           ". The reload path and the ammo-change site were BOTH entered; the " &
+           "census above names the receiver at each."
+  if inv > 0'i64:
+    return "INVENTORY-ONLY -- inv=" & $inv & " and input=0. The magazine " &
+           "action observed was an inventory fill/empty, not a weapon reload. " &
+           "Which of PlayerInventoryController::LoadMagazine (in raid) and " &
+           "ItemController::LoadMagazine (out of raid) fired is in the census."
+  result = "INCONCLUSIVE -- opstart=" & $ops & " with input=0 and ammo=0, " &
+           "which no branch above predicts. Read the census, not this line."
+
+# ---------------------------------------------------------------------------
 # Configuration and arming
 # ---------------------------------------------------------------------------
 
@@ -989,8 +1443,11 @@ proc readyToArm(): bool =
     return false
   if not gRt.loaded:
     gRt = openIl2Cpp()
-  result = verifyTarget(TgtStartRva, "LoadMagazineProcess::Start",
-                        StartProlog).len == 0
+  # Deliberately NOT gated on LoadMagazineProcess::Start verifying. That
+  # target is the one measured to be off the player's reload path, and making
+  # the probe bank -- the instrument that proves it -- conditional on it would
+  # be a check that cannot fail.
+  result = true
 
 proc maybeArm(): bool =
   ## Installs the two verified prefixes exactly once, and only when it is safe
@@ -1031,11 +1488,18 @@ proc maybeArm(): bool =
          "key or animator state name can be built -- running at most in " &
          "`read`. This is a refusal that says so, not a silent degradation."
 
+  # THE PROBE BANK FIRST. It is the instrument that decides whether the
+  # LoadMagazineProcess hooks below are on the player's path at all, and it is
+  # bound before them so that a refusal of one cannot hide the other.
+  armProbes()
+
   let st = hookTyped(TgtStart, onLoadMagazineStart)
   if st != Ok:
     warn "ammoloading  hookTyped refused LoadMagazineProcess::Start: " &
-         lastError()
-    return false
+         lastError() & " -- the probe bank above is unaffected and stays " &
+         "bound; only the inventory-load feature is unavailable."
+    gArmed = true
+    return true
   if whyCtor.len == 0:
     let st2 = hookTyped(TgtFactoryCtor, onFactoryCtor)
     if st2 != Ok:
@@ -1073,9 +1537,12 @@ proc maybeArm(): bool =
 
   gArmed = true
   success "ammoloading  ARMED in mode " & modeName(gMode) &
-          "; trigger LoadMagazineProcess::Start @0x768F50 (UNIQUE, prologue " &
-          "verified), latch ObjectsFactory::.ctor @0x938430. Vanilla magazine " &
-          "loading is never suppressed on any rung."
+          "; reload PROBE BANK bound " & $gProbeBoundN & "/" & $NProbe &
+          " (all UNIQUE, all PREFIX, all read-only -- " &
+          "docs/AMMO-LOADING-MAP.md), inventory trigger " &
+          "LoadMagazineProcess::Start @0x768F50, latch " &
+          "ObjectsFactory::.ctor @0x938430. Vanilla magazine loading and " &
+          "vanilla reloading are never suppressed on any rung."
   result = true
 
 proc loadAmmoAnimStats*(): string =
@@ -1111,6 +1578,14 @@ proc loadAmmoAnimStats*(): string =
            ",\"fakeNull\":" & $gFakeNull &
            ",\"unreadable\":" & $gUnreadable &
            ",\"faults\":" & $gFaults &
+           ",\"probeBound\":" & $gProbeBoundN &
+           ",\"probeRefused\":" & $gProbeRefused &
+           ",\"probeInput\":" & $probeKindFires(PkInput) &
+           ",\"probeOpStart\":" & $probeKindFires(PkOpStart) &
+           ",\"probeAnim\":" & $probeKindFires(PkAnim) &
+           ",\"probeAmmo\":" & $probeKindFires(PkAmmo) &
+           ",\"probeInv\":" & $probeKindFires(PkInv) &
+           ",\"probeVerdict\":\"" & probeVerdict().replace("\"", "'") & "\"" &
            ",\"lastTpl\":\"" & gSessionTpl & "\"" &
            ",\"lastMesh\":\"" & gSessionMesh & "\"}"
 
@@ -1134,30 +1609,37 @@ proc reportText(): string =
             elif not gArmTried: " (waiting out armDelayMs)"
             else: " (arming was TRIED and REFUSED -- see the warn above)") &
            ". No hook is installed, so every counter below would be zero for " &
-           "that reason alone. This is NOT evidence about the trigger."
+           "that reason alone. This is NOT evidence about the trigger, and " &
+           "the reload PROBE BANK is not bound either."
 
   let probeState =
     if not gCtorHooked: "NOT INSTALLED"
     elif gCtorFires == 0'i64: "installed, never fired"
     else: "fired " & $gCtorFires
 
+  # THE PROBE BANK IS THE VERDICT NOW.
+  #
+  # The old text here said "LoadMagazineProcess::Start has been entered ZERO
+  # times ... if a magazine was loaded, the identification is wrong". It was
+  # right, and it printed for a whole raid. `docs/AMMO-LOADING-MAP.md` settles
+  # the why (that type is the INVENTORY fill process, reachable from one async
+  # body only), so the heartbeat no longer asks the reader to work it out -- it
+  # reports the measured reload path directly.
+  let bank = "  PROBES " & probeCensus() & "  VERDICT: " & probeVerdict()
+
   if gStartFires == 0'i64 and gCtorFires == 0'i64:
-    return "ammoloading  ARMED but NEVER FIRED. mode=" & modeName(gMode) &
+    return "ammoloading  mode=" & modeName(gMode) &
            ", latched=" & (if gLatched: "yes" else: "no") &
-           ". LoadMagazineProcess::Start @0x768F50 has been entered ZERO " &
-           "times and the broad probe LoadMagazineProcess::.ctor @0x768D40 is " &
-           probeState & ". Both are installed and verified, so this is " &
-           "'installed and never entered', NOT 'not installed'. If a magazine " &
-           "was loaded during this run, LoadMagazineProcess is NOT the type " &
-           "that in-raid load goes through and the shape-based identification " &
-           "is wrong. If no magazine was loaded, this line is INCONCLUSIVE."
+           ". LoadMagazineProcess::Start @0x768F50 entered 0 times and the " &
+           "broad probe @0x768D40 is " & probeState & " -- EXPECTED: that " &
+           "type is the inventory magazine-fill process, not the weapon " &
+           "reload path (docs/AMMO-LOADING-MAP.md section 0)." & bank
 
   if gStartFires == 0'i64:
-    return "ammoloading  ARMED; broad probe " & probeState & " but " &
-           "LoadMagazineProcess::Start @0x768F50 fired ZERO times. The TYPE " &
-           "is right and the hooked ENTRY POINT is wrong -- the process is " &
-           "constructed and Start is not the method that runs. Look at " &
-           "LoadProcess @0x7693E0 / PlaySound @0x7695E0 instead."
+    return "ammoloading  broad probe " & probeState & ", " &
+           "LoadMagazineProcess::Start @0x768F50 fired ZERO times -- the " &
+           "inventory process was CONSTRUCTED and Start is not the method " &
+           "that runs." & bank
 
   result = "ammoloading  ARMED and FIRING. mode=" & modeName(gMode) &
            " startFires=" & $gStartFires &
@@ -1171,7 +1653,8 @@ proc reportText(): string =
            " unreadable=" & $gUnreadable & " faults=" & $gFaults &
            " retired=" & (if gRetired: "YES" else: "no") &
            " lastTpl=" & (if gSessionTpl.len == 0: "-" else: gSessionTpl) &
-           " lastMesh=" & (if gSessionMesh.len == 0: "-" else: gSessionMesh)
+           " lastMesh=" & (if gSessionMesh.len == 0: "-" else: gSessionMesh) &
+           bank
   if gMode <= ModeProbe:
     result.add "  [mode=probe: Start is counted and NOTHING further is read, " &
                "spawned or animated -- the zeros after startFires are the " &
@@ -1252,6 +1735,7 @@ proc schema(): seq[Setting] =
 
 proc onLoad(): Status =
   loadConfig()
+  probeInit()
   declareSettings(schema())
   gLoadedAtMs = nowMs()
   # NO `serve("/aowlspt/ammoloading/stats", onStats)` HERE, DELIBERATELY.
