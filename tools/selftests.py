@@ -175,6 +175,8 @@ ITEMS = [
     S("dlssnr.py", "fast", args=("selftest",)),
     S("dlssapply.py", "fast", args=("selftest",)),  # ini key writer + tampered-key falsifiers        # OptiScaler-DLSSNR install tree + falsifiers
     S("abilint.py", "fast", args=("--selftest",)),      # ABI ownership lint + falsifier
+    S("test_hostwrite_gate.py", "fast"),
+    S("test_hotreload_ledger.py", "fast"),
     # M3/M6: no raw store into game-owned memory outside the typed FieldRef
     # path. `--falsify` asserts the lint FIRES on a synthetic raw store, stays
     # SILENT on the annotated one, and exempts the gate file itself.
