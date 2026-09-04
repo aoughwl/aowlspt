@@ -234,6 +234,40 @@ var gPfxDonorBarG = nuNoGeom()
 ## says what it looked at.
 var gPfxBgT: Il2CppPtr = nil
 var gPfxBgWhy = ""
+## ---- the layout driver on 'Panel' ---------------------------------------
+## MEASURED LIVE on 6bd304e3 (host log 09:5x, line 1209): the graft applied
+## with the clone root at 850x729.1, and by the panel's first ACTIVE frame the
+## SAME root read **850.0x0.0**. Nothing of ours wrote that: the PostFX
+## 'Panel' drives its children, and our clone root -- a `SettingsList` whose
+## only ILayoutElement is a ScrollRect, which reports no preferred height --
+## is measured as 0 and squashed. The authored `SettingsPanel` was not,
+## because of whatever ILayoutElement IT carries.
+##
+## `LayoutElement.ignoreLayout = true` is the ONE lever available here without
+## an ABI-header change (`NuTLayoutElemIgnore` @49 is the PROPERTY, so it also
+## calls `LayoutElement::SetDirty`; there is no float writer in
+## `aowlspt_nativeui.h` and adding one drops every cache while another agent
+## is editing that header). A child that opts out of the group keeps the rect
+## we gave it, which is the AUTHORED SettingsPanel rect, verbatim.
+##
+## And because "the group re-ran and squashed us again" is a thing that can
+## happen no matter what we set, the root's height is RE-READ every active
+## frame and re-asserted a bounded number of times -- read, compare, write,
+## never blind, and it gives up loudly rather than fighting forever.
+const
+  PfxLeIgnore  = 0x20'i32   ## UnityEngine.UI.LayoutElement.m_IgnoreLayout (bool)
+  PfxLeMinW    = 0x24'i32   ## ...m_MinWidth
+  PfxLeMinH    = 0x28'i32   ## ...m_MinHeight
+  PfxLePrefW   = 0x2c'i32   ## ...m_PreferredWidth
+  PfxLePrefH   = 0x30'i32   ## ...m_PreferredHeight
+  PfxLeFlexW   = 0x34'i32   ## ...m_FlexibleWidth
+  PfxLeFlexH   = 0x38'i32   ## ...m_FlexibleHeight
+  ## every one MEASURED: `python tools/fldoff.py fields UnityEngine.UI.LayoutElement`
+  PfxMaxReassert = 8
+var gPfxReassert = 0
+var gPfxReassertSaid = false
+var gPfxLayoutNote = ""
+
 ## ---- defect 3: the flash ------------------------------------------------
 ## `Time.frameCount` at the graft, and at the FIRST frame the PostFX panel was
 ## observed active. The page flashed because the graft ran on the first
@@ -746,6 +780,114 @@ proc pfxBackground(panelT, rowParent, cloneT: Il2CppPtr): bool =
               "so nothing draws the scroll area's background and this run " &
               "cannot supply one. Reported, not hidden."
 
+proc pfxLeNote(t: Il2CppPtr): string =
+  ## One LayoutElement, READ ONLY, at MEASURED offsets. Never written here.
+  ## A node with no LayoutElement is stated as such -- that is the interesting
+  ## answer, not a blank.
+  if t == nil: return "node absent"
+  let le = modsComponent(t, "LayoutElement")
+  if le == nil: return "no LayoutElement"
+  if not nuOk(le, PfxLeFlexH + 4'i32): return "LayoutElement UNREADABLE"
+  var okI = 0'i32
+  let ign = cNuGetI32(le, PfxLeIgnore, okI)
+  var o1 = 0'i32
+  var o2 = 0'i32
+  var o3 = 0'i32
+  var o4 = 0'i32
+  var o5 = 0'i32
+  var o6 = 0'i32
+  let mw = cNuGetF32(le, PfxLeMinW, addr o1)
+  let mh = cNuGetF32(le, PfxLeMinH, addr o2)
+  let pw = cNuGetF32(le, PfxLePrefW, addr o3)
+  let ph = cNuGetF32(le, PfxLePrefH, addr o4)
+  let fw = cNuGetF32(le, PfxLeFlexW, addr o5)
+  let fh = cNuGetF32(le, PfxLeFlexH, addr o6)
+  if okI == 0 or o1 == 0 or o2 == 0 or o3 == 0 or o4 == 0 or o5 == 0 or
+     o6 == 0:
+    return "LayoutElement present but a field read was refused"
+  "LayoutElement ignoreLayout=" &
+    (if (ign and 0xff'i32) != 0'i32: "true" else: "false") &
+    " min=(" & nuF(mw) & "," & nuF(mh) & ") preferred=(" & nuF(pw) & "," &
+    nuF(ph) & ") flexible=(" & nuF(fw) & "," & nuF(fh) & ")"
+
+proc pfxDrivers(t: Il2CppPtr): string =
+  ## WHICH components on this node can drive a child's rect. Asked by name
+  ## through GetComponent, which works on an inactive node.
+  if t == nil: return "absent"
+  var parts = ""
+  if modsComponent(t, "VerticalLayoutGroup") != nil:
+    parts = parts & "VerticalLayoutGroup "
+  if modsComponent(t, "HorizontalLayoutGroup") != nil:
+    parts = parts & "HorizontalLayoutGroup "
+  if modsComponent(t, "GridLayoutGroup") != nil:
+    parts = parts & "GridLayoutGroup "
+  if modsComponent(t, "ContentSizeFitter") != nil:
+    parts = parts & "ContentSizeFitter "
+  if parts.len == 0: parts = "no layout driver "
+  parts & "| " & pfxLeNote(t)
+
+proc pfxLayoutCensus(panelT, rowParent, cloneT, enableT: Il2CppPtr): string =
+  ## THE MEASUREMENT the 850x0 defect needed and did not have. Read-only, run
+  ## once at graft time, printed whole -- so the next person does not have to
+  ## deduce which node squashed the clone.
+  "'Panel' -> " & pfxDrivers(panelT) & " ;; authored SettingsPanel -> " &
+    pfxDrivers(rowParent) & " ;; 'EnablePanel' -> " & pfxDrivers(enableT) &
+    " ;; our clone root -> " & pfxDrivers(cloneT)
+
+proc pfxOptOutOfGroup(t: Il2CppPtr; who: string; note: var string): bool =
+  ## `LayoutElement.ignoreLayout = true` through the PROPERTY, so the parent
+  ## group re-runs without this child. Returns false when the node has no
+  ## LayoutElement at all -- which is not a failure of ours, but it IS the
+  ## reason the group can still squash it, so the caller says so out loud.
+  result = false
+  if t == nil:
+    note = note & who & ": node absent. "
+    return
+  let le = modsComponent(t, "LayoutElement")
+  if le == nil:
+    note = note & who & ": NO LayoutElement, so it cannot opt out of the " &
+           "parent group and the group is free to size it (this is the " &
+           "850x0 defect's mechanism). "
+    return
+  if nuSetIgnoreLayout(le, true):
+    note = note & who & ": ignoreLayout=true through the property (SetDirty " &
+           "ran, so the group re-laid out without it). "
+    result = true
+  else:
+    note = note & who & ": set_ignoreLayout was REFUSED. "
+
+proc pfxReassertRoot() =
+  ## THE FINISHED-STATE REPAIR, bounded. Read the root's live height, compare
+  ## it with the AUTHORED height, and only then write. A group that re-runs
+  ## after we opted out would squash us again; this notices, repairs it a
+  ## bounded number of times, and then reports rather than fighting forever.
+  if gPfxScrollHostT == nil or not gPfxOrigGeom.ok: return
+  if gPfxReassert >= PfxMaxReassert:
+    if not gPfxReassertSaid:
+      gPfxReassertSaid = true
+      warn "postfx rows: the scroll host's height has been re-asserted " &
+           $PfxMaxReassert & " times and the layout keeps overriding it. " &
+           "GIVING UP rather than writing every frame. Census at graft: " &
+           gPfxLayoutNote
+    return
+  let g = nuReadGeom(gPfxScrollHostT)
+  if not g.ok: return
+  let dh = g.rectH - gPfxOrigGeom.rectH
+  if dh <= 1.0'f32 and dh >= -1.0'f32: return
+  gPfxReassert = gPfxReassert + 1
+  let did = pfxApplyGeom(gPfxScrollHostT, gPfxOrigGeom)
+  var bgDid = false
+  if gPfxBgT != nil and gPfxBgT == gPfxOrigRootT:
+    bgDid = pfxApplyGeom(gPfxBgT, gPfxOrigGeom)
+  warn "postfx rows: the scroll host read " & nuF(g.rectW) & "x" &
+       nuF(g.rectH) & " against the AUTHORED " & nuF(gPfxOrigGeom.rectW) &
+       "x" & nuF(gPfxOrigGeom.rectH) & " -- something in the parent chain " &
+       "re-sized it. Re-asserted (" & $gPfxReassert & " of " &
+       $PfxMaxReassert & "): root " & (if did: "rewritten" else: "REFUSED") &
+       (if gPfxBgT != nil and gPfxBgT == gPfxOrigRootT:
+          ", background quad " & (if bgDid: "rewritten" else: "REFUSED")
+        else: "") & "."
+
 proc pfxGraftRefuse(why: string) =
   ## EVERY exit from the graft that is not a success comes through here. There
   ## is no silent `return` left in `pfxScrollify`, and that is the point: the
@@ -965,6 +1107,23 @@ proc pfxScrollify(tab, rowParent: Il2CppPtr; newRootOut: var Il2CppPtr): bool =
                  "destroyed.")
     discard nuDestroy(cloneGo)
     return
+  # (2b) THE PARENT GROUP MUST NOT SIZE THE CLONE ROOT -- MEASURED DEFECT, not
+  # a precaution. Census FIRST (read-only, printed whole), then the one lever
+  # available: opt the root out of the group and re-apply the authored rect,
+  # because `set_ignoreLayout` runs SetDirty and the group re-lays out
+  # immediately afterwards.
+  gPfxLayoutNote = pfxLayoutCensus(panelT, rowParent, cloneT,
+                                   modsChildNamed(panelT, "EnablePanel"))
+  var optNote = ""
+  let rootOpted = pfxOptOutOfGroup(cloneT, "clone root", optNote)
+  if rootOpted:
+    if not pfxApplyGeom(cloneT, og):
+      pfxGraftRefuse("the clone root opted out of the parent layout group " &
+                   "but its AUTHORED rect could not be re-applied " &
+                   "afterwards, so it would keep whatever size the group " &
+                   "last gave it -- the 850x0 defect. The clone is destroyed.")
+      discard nuDestroy(cloneGo)
+      return
   # (4) DONOR ROWS OUT FIRST, so the ContentSizeFitter never sees them plus
   # ours and resolves a 1490 px content that scrolls past the end.
   let retired = pfxRetireKids(contentT)
@@ -1005,6 +1164,18 @@ proc pfxScrollify(tab, rowParent: Il2CppPtr; newRootOut: var Il2CppPtr): bool =
   let keepPanel = pfxBackground(panelT, rowParent, cloneT)
   let oldGo = iGameObjectOf(rowParent)
   if oldGo != nil and not keepPanel: discard modsSetActive(oldGo, false)
+  # A BACKGROUND QUAD MUST NOT ALSO TAKE LAYOUT SPACE. Kept active inside the
+  # same group, the emptied SettingsPanel would be measured a second time and
+  # the column's height would double. It opts out too, and is then given the
+  # root's rect -- it is now only something that draws.
+  if keepPanel:
+    discard pfxOptOutOfGroup(rowParent, "kept background SettingsPanel",
+                             optNote)
+    if not pfxApplyGeom(rowParent, og):
+      warn "postfx rows: the kept background SettingsPanel could not be " &
+           "given the authored rect back, so the quad behind the scroll " &
+           "region may not cover it. The rows are unaffected; this names the " &
+           "reason the background may look wrong."
   # ---- MAKE THE LAYOUT ACTUALLY RUN ------------------------------------
   #
   # MEASURED live on 82cb47ee (host log 18:36, lines 1750-1751): the graft
@@ -1108,7 +1279,8 @@ proc pfxScrollify(tab, rowParent: Il2CppPtr; newRootOut: var Il2CppPtr): bool =
         "the AUTHORED SettingsPanel rect verbatim (" & nuGeomNote(og) &
         "), its Viewport given the DONOR's authored inset verbatim (" &
         nuGeomNote(gPfxDonorVpG) & ") so the scrollbar keeps its margin, " &
-        "background: " & gPfxBgWhy & ". " & $retired &
+        "background: " & gPfxBgWhy & ". LAYOUT CENSUS: " & gPfxLayoutNote &
+        " ;; OPT-OUT: " & optNote & " " & $retired &
         " donor row(s) retired, " & $moved & " row(s) MOVED into the clone's " &
         "own Content (which already carries the LayoutGroup + " &
         "ContentSizeFitter that drive height -- nothing was AddComponent'd), " &
@@ -1451,9 +1623,29 @@ proc pfxScrollVerdict(rowParent: Il2CppPtr) =
                   (if not covers: " -- it does not COVER the viewport rect"
                    else: "")
       else:
-        bgNote = "the background node's edges could not be placed"
+        fails = fails + 1
+        bgNote = "INCONCLUSIVE (not a pass): '" & iObjName(gPfxBgT) &
+                 "' read a valid rect but its edges could not be placed in " &
+                 (if inRoot: "the scroll host's" else: "the Panel's") & " frame"
+        if why.len == 0: why = bgNote
     else:
-      bgNote = "the background node's rect could not be read"
+      # NAME WHICH READ FAILED. The deployed build printed one sentence for
+      # three different causes, and the real one was that the scroll host's
+      # height was 0, which makes every edge computation in this block
+      # degenerate -- nothing was wrong with the background node at all.
+      fails = fails + 1
+      bgNote = "INCONCLUSIVE (not a pass): " &
+               (if not bgg.ok: "the background node '" & iObjName(gPfxBgT) &
+                  "' did not read back a valid rect"
+                elif not rok3: "the scroll host could not be placed inside " &
+                  "the 'Panel' (host rect " & nuF(rg0.rectW) & "x" &
+                  nuF(rg0.rectH) & ", panel rect " & nuF(pg.rectW) & "x" &
+                  nuF(pg.rectH) & " -- a zero dimension on either makes every " &
+                  "edge here degenerate)"
+                else: "the viewport could not be placed inside the scroll " &
+                  "host (host rect " & nuF(rg0.rectW) & "x" & nuF(rg0.rectH) &
+                  ")")
+      if why.len == 0: why = bgNote
   else:
     fails = fails + 1
     if why.len == 0:
@@ -1516,8 +1708,9 @@ proc pfxScrollVerdict(rowParent: Il2CppPtr) =
          " active row(s) judged, viewport " & nuF(vg.rectW) & "x" &
          nuF(vg.rectH) & ", content " & nuF(cg.rectW) & "x" & nuF(cg.rectH) &
          ", " & $activeKids & " active Viewport child(ren); background: " &
-         bgNote & "; first-frame: " & flashNote &
-         ". This is the page the user is looking at, not a summary of what " &
+         bgNote & "; first-frame: " & flashNote & "; layout census at " &
+         "graft: " & gPfxLayoutNote & "; height re-asserted " & $gPfxReassert &
+         " time(s). This is the page the user is looking at, not a summary of what " &
          "we wrote."
 
 proc pfxOwnToggle(): Il2CppPtr =
@@ -2217,6 +2410,9 @@ proc pfxOnPanelUp(postUp: bool) =
     return
   if not postUp:
     return
+  # THE LAYOUT DRIVER ON 'Panel' GETS THE LAST WORD OTHERWISE. Read-compare-
+  # write, bounded, and it reports when it gives up. See `pfxReassertRoot`.
+  if gPfxGraftOk: pfxReassertRoot()
   # DEFECT 3, polled. One toggle read per frame; the 26 writes only on the
   # edge. It runs BEFORE the row verdict so that a gray-out fault is reported
   # against the same frame it happened in.
@@ -2238,6 +2434,10 @@ proc pfxOnScreenClosed() =
   # The next visit is a fresh "when did this panel first become active", so
   # the flash check judges THAT visit and not a stale pairing.
   gPfxFirstActiveFrame = -1
+  # A fresh re-assert budget per visit: the group re-runs on show, so the
+  # repair must be available again -- while still bounded within one visit.
+  gPfxReassert = 0
+  gPfxReassertSaid = false
   # The scroll host is ours and lives under the PostFX panel; if that panel is
   # gone the clone went with it, so the handle must not survive as a pointer
   # into a destroyed object. Dropped BEFORE the row tear-down below, because
