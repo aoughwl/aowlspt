@@ -63,12 +63,32 @@ const cMiRoute = "/aowlspt/settings/index/full"
 const cMiPollMs = 250          ## worker re-poll cadence while we hold the slot
 const cMiStallMs = 8000'u64    ## hard ceiling on the borrow (rule 4, in time)
 const cMiMaxMods = 32          ## bounds the parse; NOT a silent cap -- see below
-const cMiMaxSettings = 64      ## per mod, same
+## PER MOD. MEASURED 2026-09-04 against the live backend (curl, identity):
+## the largest schema on this install is `aowl.tarkov` at 949 rows, then
+## aowl.maps 61, aowl.sain 55, aowl.graphics 29. At 64 this cap cut the
+## biggest mod down to 64 and printed `truncated` for it every session --
+## a bound chosen before anything had been measured. 1024 is the measured
+## maximum with headroom, and it bounds the PARSE only.
+##
+## IT IS NOT WHAT LIMITS A PAGE ON SCREEN. `cSwMaxRows` (settingspages.nim,
+## 48) bounds how many rows any page RENDERS, because each row instantiates
+## Unity objects into a live screen. So a 949-row mod parses whole here and
+## still shows 48 rows, and the verdict below says which of the two bounds
+## did it rather than reporting one number. Completing such a page needs the
+## renderer to instantiate in slices too -- that is settingspages.nim's
+## bound, shared with two other consumers, and it is deliberately NOT raised
+## from here.
+const cMiMaxSettings = 1024
+## Rows parsed per host tick. Rule 4 is a cap; this is the cap made small
+## enough that the cap itself is not a stall: 11 mods x up to 949 rows in one
+## tick is a frame the player sees.
+const cMiSliceRows = 32
 
 type
   MiPhase = enum
     miIdle                     ## never armed; the MODS tab has not been opened
     miArmed                    ## slot borrowed, waiting for a body
+    miParsing                  ## body in hand, parsed a slice at a time
     miDone                     ## parsed and registered; never runs again
     miFailed                   ## refused; never runs again
 
@@ -86,6 +106,29 @@ var gMiTruncated = 0
 ## bounded, and reported as a FAIL that names the mod.
 var gMiShort = ""
 var gMiShortN = 0
+## RESUMABLE PARSE STATE. The body is held and walked a slice per tick rather
+## than in one call; see `miParseSlice`.
+var gMiDoc = ""
+var gMiModsSeq: seq[string] = @[]
+var gMiModAt = 0
+var gMiItems: seq[string] = @[]
+var gMiHaveItems = false
+var gMiRaw: seq[SwRow] = @[]
+var gMiRowAt = 0
+var gMiGuid = ""
+var gMiName = ""
+var gMiWant = 0
+var gMiInconc = false
+## WHAT IT COST THE FRAME, in ms, measured with the host's own clock rather
+## than asserted. `gMiWorstMs` is the number that matters: an average hides
+## the stall that a player sees, and the whole reason this parse is sliced is
+## a 569,247-byte document arriving on the Unity main thread.
+var gMiSlices = 0
+var gMiParseMs = 0'u64
+var gMiWorstMs = 0'u64
+var gMiWorstWhat = ""
+var gMiTruncatedFirst = ""
+var gMiRenderCapped = 0
 
 proc miRelease() =
   ## Give the shared slot back to whatever the host was polling. Called on
@@ -244,72 +287,129 @@ proc miGroupRows(rows: seq[SwRow]): seq[SwRow] =
       result.add rows[u]
     u = u + 1
 
-proc miParse(doc: string): bool =
-  ## `{"mods":[{guid,name,settings:[...]}, ...]}` -- the documented shape of
-  ## `/aowlspt/settings/index`. Built against the documented shape on purpose,
-  ## and it must fail CLEANLY on a body that is not it rather than register
-  ## half a tab.
+proc miParseBegin(doc: string): bool =
+  ## Split the document into its mods ONCE, and do nothing else this tick.
+  ## Returns false (and has already failed loudly) when the body is not the
+  ## documented shape.
+  ##
+  ## This is the one unavoidably whole-document step -- 569,247 bytes on the
+  ## measured install -- so it is a tick of its own, it is TIMED, and the
+  ## timing is reported whether or not anybody asks. Everything after it is
+  ## bounded by `cMiSliceRows`.
   result = false
-  var mods: seq[string] = @[]
-  if not pathItems(doc, "mods", mods):
+  let t0 = cNowMs()
+  gMiDoc = doc
+  gMiModsSeq = @[]
+  if not pathItems(doc, "mods", gMiModsSeq):
     miFail("the settings index did not parse as a mods array (" & $doc.len &
            " byte(s) received). This is built against the documented shape of " &
-           "/aowlspt/settings/index, so the body is either an older route or " &
-           "an error page")
+           cMiRoute & ", so the body is either an older route or an error page")
     return
-  var m = 0
-  while m < mods.len and m < cMiMaxMods:
-    var guid = ""
-    var name = ""
-    discard pathGet(mods[m], "guid", guid)
-    discard pathGet(mods[m], "name", name)
-    if guid.len == 0:
-      m = m + 1
-      continue
-    var items: seq[string] = @[]
-    discard pathItems(mods[m], "settings", items)
-    var raw: seq[SwRow] = @[]
-    var i = 0
-    while i < items.len and i < cMiMaxSettings:
-      var row = SwRow()
-      if miParseSetting(items[i], row):
-        raw.add row
-      i = i + 1
-    if items.len > cMiMaxSettings:
-      gMiTruncated = gMiTruncated + 1
-    var page = SwPage(id: "mod:" & guid,
-                      title: (if name.len > 0: name else: guid),
-                      modGuid: guid, stub: false, note: "",
-                      renderedFor: 0'u64)
-    page.rows = miGroupRows(raw)
-    swPageRegister(page)
-    gMiPages = gMiPages + 1
-    gMiRows = gMiRows + page.rows.len
-    # THE CHECK THAT CAN FAIL. Compare what we BUILT against what the MOD
-    # DECLARED (`count`), not against our own parse -- re-reading our own
-    # output is the check that cannot fail. `rowsMissing` is the route saying
-    # it could not look, which is INCONCLUSIVE and is reported as its own
-    # thing, never folded into "0 rows".
+  let dt = cNowMs() - t0
+  gMiSlices = gMiSlices + 1
+  gMiParseMs = gMiParseMs + dt
+  if dt > gMiWorstMs:
+    gMiWorstMs = dt
+    gMiWorstWhat = "the whole-document split into " & $gMiModsSeq.len & " mod(s)"
+  gMiModAt = 0
+  gMiHaveItems = false
+  result = true
+
+proc miFinishParse() =
+  ## Everything that used to be said after the single-call parse, said once
+  ## the last slice has run.
+  gMiPhase = miDone
+  if gMiModsSeq.len > cMiMaxMods:
+    warn "mods index: the route named " & $gMiModsSeq.len & " mod(s) and " &
+         "this host parses at most " & $cMiMaxMods & ", so " &
+         $(gMiModsSeq.len - cMiMaxMods) & " were NOT registered. Said out " &
+         "loud rather than dropped silently."
+  # Let the document go. It is the largest single allocation this host makes
+  # and nothing reads it again.
+  gMiDoc = ""
+  gMiModsSeq = @[]
+  gMiItems = @[]
+  gMiRaw = @[]
+
+proc miParseSlice() =
+  ## ONE BOUNDED STEP. Either the split of one mod's `settings` array, or up
+  ## to `cMiSliceRows` rows of it -- never both, and never more.
+  let t0 = cNowMs()
+  var what = ""
+  if gMiModAt >= gMiModsSeq.len or gMiModAt >= cMiMaxMods:
+    miFinishParse()
+    return
+  if not gMiHaveItems:
+    gMiGuid = ""
+    gMiName = ""
+    discard pathGet(gMiModsSeq[gMiModAt], "guid", gMiGuid)
+    discard pathGet(gMiModsSeq[gMiModAt], "name", gMiName)
+    if gMiGuid.len == 0:
+      gMiModAt = gMiModAt + 1
+      return
     var declared = ""
-    discard pathGet(mods[m], "count", declared)
+    discard pathGet(gMiModsSeq[gMiModAt], "count", declared)
+    gMiWant = int(modSetParseF64(declared, 0.0))
     var missing = ""
-    let inconclusive = pathGet(mods[m], "rowsMissing", missing) and
-                       (missing == "1" or missing == "true")
-    let want = int(modSetParseF64(declared, 0.0))
-    if want > 0 and raw.len < want and gMiShortN < 8:
-      gMiShortN = gMiShortN + 1
-      gMiShort = gMiShort & (if gMiShort.len > 0: ", " else: "") &
-                 (if name.len > 0: name else: guid) & " declares " & $want &
-                 " and rendered " & $raw.len &
-                 (if inconclusive: " (the route said rowsMissing -- it could " &
-                  "not read that mod's page, so this is INCONCLUSIVE rather " &
-                  "than a render failure)" else: "")
-    m = m + 1
-  if mods.len > cMiMaxMods:
-    warn "mods index: the route named " & $mods.len & " mod(s) and this host " &
-         "parses at most " & $cMiMaxMods & ", so " & $(mods.len - cMiMaxMods) &
-         " were NOT registered. Said out loud rather than dropped silently."
-  result = gMiPages > 0
+    gMiInconc = pathGet(gMiModsSeq[gMiModAt], "rowsMissing", missing) and
+                (missing == "1" or missing == "true")
+    gMiItems = @[]
+    discard pathItems(gMiModsSeq[gMiModAt], "settings", gMiItems)
+    gMiRaw = @[]
+    gMiRowAt = 0
+    gMiHaveItems = true
+    what = "the settings split of " & gMiGuid & " (" & $gMiItems.len & " row(s))"
+  else:
+    var n = 0
+    while gMiRowAt < gMiItems.len and gMiRowAt < cMiMaxSettings and
+          n < cMiSliceRows:
+      var row = SwRow()
+      if miParseSetting(gMiItems[gMiRowAt], row):
+        gMiRaw.add row
+      gMiRowAt = gMiRowAt + 1
+      n = n + 1
+    what = $n & " row(s) of " & gMiGuid
+    if gMiRowAt >= gMiItems.len or gMiRowAt >= cMiMaxSettings:
+      # THIS MOD IS DONE -- register its page and account for it.
+      if gMiItems.len > cMiMaxSettings:
+        gMiTruncated = gMiTruncated + 1
+        if gMiTruncatedFirst.len == 0:
+          gMiTruncatedFirst = gMiGuid & " (" & $gMiItems.len & " declared, " &
+                              $cMiMaxSettings & " parsed)"
+      var page = SwPage(id: "mod:" & gMiGuid,
+                        title: (if gMiName.len > 0: gMiName else: gMiGuid),
+                        modGuid: gMiGuid, stub: false, note: "",
+                        renderedFor: 0'u64)
+      page.rows = miGroupRows(gMiRaw)
+      swPageRegister(page)
+      gMiPages = gMiPages + 1
+      gMiRows = gMiRows + page.rows.len
+      # THE CHECK THAT CAN FAIL, and it now separates the two bounds instead
+      # of blaming the mod for either. `count` is what the mod declared;
+      # `gMiRaw.len` is what we PARSED; `page.rows.len` is what the renderer
+      # will accept (`cSwMaxRows`, and grouping adds a heading row per
+      # category, so rows >= parsed is normal and is not a discrepancy).
+      if gMiWant > 0 and gMiRaw.len < gMiWant:
+        if gMiRaw.len >= cMiMaxSettings:
+          discard   # already counted as a parse truncation above
+        elif gMiShortN < 8:
+          gMiShortN = gMiShortN + 1
+          gMiShort = gMiShort & (if gMiShort.len > 0: ", " else: "") &
+                     (if gMiName.len > 0: gMiName else: gMiGuid) &
+                     " declares " & $gMiWant & " and parsed " & $gMiRaw.len &
+                     (if gMiInconc: " (the route said rowsMissing -- it could " &
+                      "not read that mod's page, so this is INCONCLUSIVE " &
+                      "rather than a render failure)" else: "")
+      if gMiRaw.len > cSwMaxRows:
+        gMiRenderCapped = gMiRenderCapped + 1
+      gMiModAt = gMiModAt + 1
+      gMiHaveItems = false
+  let dt = cNowMs() - t0
+  gMiSlices = gMiSlices + 1
+  gMiParseMs = gMiParseMs + dt
+  if dt > gMiWorstMs:
+    gMiWorstMs = dt
+    gMiWorstWhat = what
 
 proc miArm(now: uint64) =
   ## Borrow the slot and ask for the index. Called ONCE, from the first MODS
@@ -331,9 +431,63 @@ proc miArm(now: uint64) =
         $cMiStallMs & "ms, after which the shared sync slot goes back to live " &
         "mod control whatever has arrived."
 
+proc miParseReport() =
+  ## Said ONCE, when the sliced parse finishes. Separated from `miTick` only
+  ## so the reporting is not buried inside the state machine.
+  if gMiPages > 0:
+    okLog "mods index: registered " & $gMiPages & " mod page(s) holding " &
+          $gMiRows & " row(s) from ONE fetch of " & cMiRoute &
+          ", cached for the session -- no per-mod round trip and nothing at " &
+          "boot. " & $gMiDeclined & " setting(s) are drawn as labelled stubs " &
+          "because this host has no native control for their type" &
+          (if gMiDeclinedFirst.len > 0: ", first " & gMiDeclinedFirst else: "") &
+          "."
+    # THE COST, MEASURED, not asserted. One frame at 60fps is 16.7ms; the
+    # number that decides whether this parse belongs on the main thread at
+    # all is the WORST slice, not the total.
+    okLog "mods index PARSE COST: " & $gMiParseMs & "ms over " & $gMiSlices &
+          " tick(s), worst single tick " & $gMiWorstMs & "ms (" & gMiWorstWhat &
+          "). A tick over ~16ms is a frame the player sees, and the fix for " &
+          "that is to parse on the overlay worker and hand this thread a " &
+          "built table -- stated here so the decision is made against a " &
+          "number rather than a feeling."
+    if gMiShort.len > 0:
+      warn "mods index ROW VERDICT FAIL: " & $gMiShortN & " mod(s) parsed " &
+           "fewer rows than they declare -- " & gMiShort &
+           ". A mod page showing fewer controls than its schema is the " &
+           "player-visible defect; named here rather than hidden inside the " &
+           "total of " & $gMiRows & "."
+    else:
+      okLog "mods index ROW VERDICT PASS: every mod parsed at least as many " &
+            "rows as its own `count` declares (" & $gMiRows & " row(s) over " &
+            $gMiPages & " page(s)). Compared against the route's `count`, " &
+            "not against this host's own parse."
+    if gMiTruncated > 0:
+      warn "mods index: " & $gMiTruncated & " mod(s) declared more than " &
+           $cMiMaxSettings & " settings, this host's PARSE cap, so those " &
+           "pages are incomplete" &
+           (if gMiTruncatedFirst.len > 0: " -- first " & gMiTruncatedFirst
+            else: "") & ". Reported rather than silently truncated."
+    if gMiRenderCapped > 0:
+      warn "mods index: " & $gMiRenderCapped & " mod(s) parsed MORE rows " &
+           "than cSwMaxRows (" & $cSwMaxRows & "), which is what the RENDERER " &
+           "accepts, so those pages show the first " & $cSwMaxRows & " rows " &
+           "and no more. This is a DIFFERENT bound from the parse cap above " &
+           "and it lives in settingspages.nim, shared with two other " &
+           "consumers: raising it lets one page instantiate that many Unity " &
+           "objects in a single frame, so it needs a sliced renderer, not a " &
+           "bigger number. Named so the page is not read as complete."
+  else:
+    miFail("the settings index parsed but named no mod with a guid")
+
 proc miTick(now: uint64) =
-  ## One bounded step per host tick while armed. Before the first open and
-  ## after the fetch completes this is a single enum test.
+  ## One bounded step per host tick. Before the first open and after the parse
+  ## completes this is a single enum test.
+  if gMiPhase == miParsing:
+    miParseSlice()
+    if gMiPhase == miDone:
+      miParseReport()
+    return
   if gMiPhase != miArmed:
     return
   let doc = overlaySyncTake()
@@ -371,39 +525,20 @@ proc miTick(now: uint64) =
                  "Either the route is not implemented yet or something " &
                  "else consumed the slot's take cursor first")
     return
-  gMiPhase = miDone
+  # THE BODY IS IN HAND. Hand the slot back at once -- the parse does not
+  # need it and live mod control does -- then walk the document a slice per
+  # tick from `miTick` above.
   miRelease()
-  if miParse(doc):
-    okLog "mods index: registered " & $gMiPages & " mod page(s) holding " &
-          $gMiRows & " row(s) from ONE fetch of " & cMiRoute & " (" &
-          $doc.len & " byte(s)), cached for the session -- no per-mod round " &
-          "trip and nothing at boot. " & $gMiDeclined & " setting(s) are drawn " &
-          "as labelled stubs because this host has no native control for " &
-          "their type" &
-          (if gMiDeclinedFirst.len > 0: ", first " & gMiDeclinedFirst else: "") &
-          ". The shared sync slot has been handed back to live mod control."
-    # THE ROW VERDICT, stated as PASS / FAIL / INCONCLUSIVE and naming the
-    # mod. A tab that renders 0 rows for a mod that declares 14 is the defect
-    # the player reported as "MODS page did nothing"; a total row count could
-    # not see it.
-    if gMiShort.len > 0:
-      warn "mods index ROW VERDICT FAIL: " & $gMiShortN & " mod(s) rendered " &
-           "fewer rows than they declare -- " & gMiShort &
-           ". A mod page showing fewer controls than its schema is the " &
-           "player-visible defect; named here rather than hidden inside the " &
-           "total of " & $gMiRows & "."
-    else:
-      okLog "mods index ROW VERDICT PASS: every mod that declares settings " &
-            "rendered at least as many rows as it declares (" & $gMiRows &
-            " row(s) over " & $gMiPages & " page(s)). Compared against the " &
-            "route's own `count`, not against this host's parse."
-    if gMiTruncated > 0:
-      warn "mods index: " & $gMiTruncated & " mod(s) declared more settings " &
-           "than this host parses per page, so those pages are INCOMPLETE. " &
-           "Reported rather than silently truncated."
-  else:
-    if gMiPhase == miDone:
-      miFail("the settings index parsed but named no mod with a guid")
+  if not miParseBegin(doc):
+    return
+  gMiPhase = miParsing
+  okLog "mods index: a " & $doc.len & " byte body arrived from " & cMiRoute &
+        " naming " & $gMiModsSeq.len & " mod(s). Parsing it " &
+        $cMiSliceRows & " row(s) per tick rather than in one call: the whole " &
+        "document is bigger than anything this host has parsed on the Unity " &
+        "main thread before, and the split alone took " & $gMiWorstMs &
+        "ms. The shared sync slot has ALREADY been handed back to live mod " &
+        "control -- the parse does not need it."
 
 # ===========================================================================
 # STEP 4 -- THE KEYBIND INDEX (`/aowlspt/keybinds`).
