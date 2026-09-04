@@ -304,6 +304,27 @@ type
     ## at `begin` from the klass census. Zero -> this tab has none, and every
     ## enum row on this page is demoted to a labelled stub that says so.
     renderDonorDrop*: uint64
+    ## WHERE THAT DROPDOWN DONOR CAME FROM, in words, so the BEGUN line names
+    ## the source instead of only printing a pointer. MEASURED 2026-09-04:
+    ## every one of the 11 index-driven pages logged `dropdownDonor=0x0`,
+    ## because the Game tab's klass census learns `gSwKlassDropdown` from a
+    ## stock dropdown ROW and the Game tab has none -- the tab that has one is
+    ## Graphics. See `gSwDropTemplate`.
+    renderDonorDropWhy*: string
+    ## THE HEADING CLONE, and the reason it is kept: the liveness test that
+    ## decides whether a page "lost its clones" scanned `rows[].clone` only.
+    ## A page that has had its GRAFT tick but not yet a ROW tick has no row
+    ## clone at all, so that test answered "lost" for a page that was healthy
+    ## and mid-render -- which is exactly what the deployed run did, on every
+    ## page, on every tab-built event. The heading clone and the scroll host
+    ## are the two objects a begun page always owns.
+    headClone*: uint64
+    ## TICKS THIS PAGE VISIT HAS CONSUMED. The second, frame-based bound on
+    ## the verdict: `cSwPageVerdictMs` is wall clock and cannot fire while a
+    ## page is being re-begun, and a page that is never granted a tick must
+    ## still eventually account for itself. Both bounds are mandatory and
+    ## neither is redundant.
+    ticks*: int
 
 ## The marker a not-yet-wired row carries. Deliberately verbose: a settings row
 ## that silently does nothing is worse than no row, and this is the project's
@@ -351,6 +372,42 @@ const cSwSliceMs = 8'u64
 ## screen, and how long the page has been trying. It does not stop the render
 ## -- the page keeps filling and its completion verdict still lands later.
 const cSwPageVerdictMs = 12000'u64
+
+## THE SECOND BOUND ON THE VERDICT, IN TICKS RATHER THAN MILLISECONDS.
+##
+## `cSwPageVerdictMs` is measured from `beganAt`, which `swRenderPageBegin`
+## resets -- so a page that is re-begun more often than every 12 s can never
+## reach it, and that is precisely what the deployed run did: every tab-built
+## event re-began every page, and NOT ONE `RENDER VERDICT` line was printed in
+## a 65-minute run. A tick count cannot be reset by anything except a genuine
+## new page visit, so it fires even under that pathology.
+##
+## 1024 ticks at 24 rows is 24k rows -- far above `cSwMaxRows`, so a page that
+## is actually progressing NEVER hits it. Reaching it means the page stopped
+## advancing, and that is a TIMEOUT verdict with the shortfall named, not
+## silence.
+const cSwMaxPageTicks = 1024
+
+## `EFT.UI.Settings.GraphicsSettingsTab._dropDownTemplate` @ 0xB0 -- MEASURED
+## (`python tools/fldoff.py field EFT.UI.Settings.GraphicsSettingsTab
+## _dropDownTemplate`), and it is the SAME offset `dlssrows.nim` reads and
+## clones from successfully on this build (`DlrOffDropDownTmpl`). It is read
+## here rather than borrowed from that module because `dlssrows.nim` is
+## `include`d after this file and only ever holds it as a local.
+##
+## NULL-CAPABLE like every serialized template field, so it is treated as an
+## offer and never as a guarantee: unreadable, null, or a fake-null Unity
+## object all leave `gSwDropTemplate` at zero and every enum row stays a
+## labelled stub that says so.
+const cSwGfxDropTemplate = 0xb0'i32
+
+## Captured on a GRAPHICS tab visit -- the tab that HAS a dropdown. The Game
+## tab, where the pages render, has none, which is why the klass census leaves
+## `gSwKlassDropdown` at 0 there and why `swFindDonor` on the Game tab can
+## only ever return nil.
+var gSwDropTemplate = 0'u64
+var gSwDropTemplateWhy = ""
+var gSwDropTemplateSaid = false
 
 ## Sanity bounds for a row that came off the wire (`modsettingsrender.nim`
 ## parses `/aowlspt/settings/<guid>` -- an HTTP response from whatever the mod
@@ -1228,6 +1285,15 @@ var gSwGraftWorstWhere = ""
 ## unbounded frame the slice exists to prevent, wearing the word "slice".
 var gSwSliceWorked = false
 
+## THE TAB THE PAGES BELONG TO, remembered so the per-tick drain can BEGIN the
+## next page once the current one has finished. Without this, "one page begun
+## per tab-built event" would mean eleven trips to the Settings screen to see
+## eleven pages. Set only by `swPagesOnTabBuilt`, and re-proved live (readable,
+## not a fake null) every time it is used -- a remembered Unity pointer is an
+## offer, never a guarantee.
+var gSwPagesTabPtr = 0'u64
+var gSwPagesTabKey = 0'u64
+
 proc swSliceNote(): string =
   "slice clock: " & $gSwSliceTicks & " row tick(s), worst " &
     $gSwSliceWorstMs & " ms" &
@@ -1286,6 +1352,21 @@ proc swRowGeom(row: SwRow; g: var NuGeom): bool =
   g = nuReadGeom(rt)
   result = g.ok
 
+proc swRowCaptionNow(row: SwRow): string =
+  ## WHAT THIS ROW READS RIGHT NOW, off the live TMP -- never off anything this
+  ## file remembers writing. `m_text` at `cSuiOffTmpMText()` through the same
+  ## label chain `swControlTmp` validated hop by hop; "" means the caption
+  ## could not be read at all, which is INCONCLUSIVE and never a match.
+  result = ""
+  if row.clone == 0'u64: return
+  let ctrl = cast[Il2CppPtr](row.clone)
+  if not duOk(ctrl, 0x20'i32): return
+  let tmp = swControlTmp(ctrl)
+  if tmp == nil: return
+  let s = cReadPtrAt(tmp, cSuiOffTmpMText())
+  if s == nil: return
+  result = suiReadString(s)
+
 proc swRenderVerdict(page: var SwPage) =
   ## THE PER-PAGE RENDER VERDICT. Three outcomes, and it is stated over the
   ## FINISHED PAGE, never over the writes that produced it.
@@ -1331,9 +1412,38 @@ proc swRenderVerdict(page: var SwPage) =
   var prevTop = 0'f32
   var prevBot = 0'f32
   var prevName = ""
+  # THE LIVE-TREE CAPTION CENSUS. The finished-state question, asked as a
+  # NEGATIVE: how many rows under this page's Content read back a caption that
+  # is OURS, and does any still read something else (the donor's -- fact #88)?
+  # A count of what we wrote cannot fail; this can.
+  var contentKids = 0
+  if page.renderParent != 0'u64:
+    let pgo2 = cast[Il2CppPtr](page.renderParent)
+    if duOk(pgo2, 0x20'i32):
+      let prt2 = nuTransformOf(pgo2)
+      var kn = 0
+      if prt2 != nil and iChildCount(prt2, kn):
+        contentKids = kn
+  var carry = 0        ## reads the caption this row was given
+  var foreign = 0      ## reads SOMETHING ELSE -- the donor's caption
+  var mute = 0         ## no readable caption at all: inconclusive, not a pass
+  var firstForeign = ""
   var i = 0
   while i < page.rows.len and i < cSwMaxRows:      # rule 4: capped
     if page.rows[i].clone != 0'u64:
+      var want = page.rows[i].label
+      if not page.rows[i].implemented:
+        want = want & cSwNotDone
+      let now = swRowCaptionNow(page.rows[i])
+      if now.len == 0:
+        mute = mute + 1
+      elif now == want:
+        carry = carry + 1
+      else:
+        foreign = foreign + 1
+        if firstForeign.len == 0:
+          firstForeign = "row '" & page.rows[i].key & "' should read '" &
+                         want & "' and reads '" & now & "'"
       var g = nuNoGeom()
       if not swRowGeom(page.rows[i], g):
         unread = unread + 1
@@ -1363,10 +1473,22 @@ proc swRenderVerdict(page: var SwPage) =
     i = i + 1
   let who = "page '" & page.id & "'" &
             (if page.modGuid.len > 0: " (mod " & page.modGuid & ")" else: "")
-  let tail = "  [" & swSliceNote() & "; scroll host: " &
+  let tail = "  [live tree: " & $contentKids & " child(ren) under the page's " &
+             "Content, " & $carry & " row(s) read back OUR caption, " &
+             $foreign & " read a FOREIGN one, " & $mute &
+             " had no readable caption; index asked for " & $want &
+             " row(s). " & $page.ticks & " render tick(s). " & swSliceNote() &
+             "; scroll host: " &
              (if page.scrollGo != 0'u64: "built"
               else: "NONE -- " & page.scrollWhy) & "]"
-  if shortfall > 0:
+  if foreign > 0:
+    warn "settings pages RENDER VERDICT FAIL: " & who & " has " & $foreign &
+         " row(s) under its Content that read a caption which is NOT the one " &
+         "the index gave them -- " & firstForeign &
+         ". That is fact #88's signature (the clone kept the donor's " &
+         "localised text), read off the live TMP and not off our own write." &
+         tail
+  elif shortfall > 0:
     warn "settings pages RENDER VERDICT FAIL: " & who & " rendered " & $got &
          " row(s) of the " & $want & " the parser produced (" & $page.skipped &
          " were SKIPPED as unsafe" &
@@ -1391,18 +1513,72 @@ proc swRenderVerdict(page: var SwPage) =
           else: "not one row's rect could be read (" & $unread &
             " unreadable)") & ". Nothing was observed; this is NOT a pass." &
          tail
-  elif unread > 0:
+  elif unread > 0 or mute > 0 or carry < got:
     warn "settings pages RENDER VERDICT INCONCLUSIVE: " & who & " -- " &
          $measured & " of " & $got & " rendered row(s) read back inside the " &
          "container with no overlap, but " & $unread &
-         " could not be read at all and were not observed either way. This " &
-         "is NOT a pass." & tail
+         " could not have their rect read and " & $mute &
+         " could not have their caption read, so only " & $carry & " of " &
+         $got & " were observed to carry our text. They were not observed " &
+         "either way. This is NOT a pass." & tail
   else:
     okLog "settings pages RENDER VERDICT PASS: " & who & " rendered " & $got &
           " row(s) of " & $want & " parsed (" & $page.skipped &
           " skipped as unsafe); all " & $measured &
           " read back inside the " & nuF(contW) &
-          " px container and no consecutive pair overlaps." & tail
+          " px container, no consecutive pair overlaps, and all " & $carry &
+          " read their OWN caption off the live TMP with none left on the " &
+          "donor's." & tail
+
+proc swCaptureDropTemplate(tabPtr: Il2CppPtr; tabName: string) =
+  ## LEARN THE DROPDOWN DONOR FROM THE TAB THAT HAS ONE.
+  ##
+  ## Called for EVERY tab visit, including the ones this feature declines to
+  ## render onto -- that is the point. The pages render onto `game`; the only
+  ## stock `SettingDropDown` prefab on this screen hangs off `graphics`.
+  ##
+  ## Every hop is guarded and the result is proved LIVE before it is kept: a
+  ## readable pointer is not a live Unity object (`iUnityAlive` is the
+  ## fake-null test), and a control we cannot get a GameObject for is not a
+  ## control we may Instantiate. A refusal records its reason in
+  ## `gSwDropTemplateWhy`, which the BEGUN line prints -- so "no dropdown" is
+  ## always a sentence and never a bare 0x0.
+  if gSwDropTemplate != 0'u64 or tabName != "graphics" or tabPtr == nil:
+    return
+  if cIsReadable(tabPtr, cSwGfxDropTemplate + 8'i32) == 0'i32:
+    gSwDropTemplateWhy = "GraphicsSettingsTab+0x" &
+      hexOf(uint64(cSwGfxDropTemplate)) & " is not readable on this tab " &
+      "object, so _dropDownTemplate was never read"
+    return
+  let tmpl = cReadPtrAt(tabPtr, cSwGfxDropTemplate)
+  if tmpl == nil or not duOk(tmpl, 0x20'i32):
+    gSwDropTemplateWhy = "GraphicsSettingsTab._dropDownTemplate @0x" &
+      hexOf(uint64(cSwGfxDropTemplate)) & " read null or unreadable (it is a " &
+      "serialized field -- this is 'asked too early', not a wrong offset)"
+    return
+  if not iUnityAlive(tmpl):
+    gSwDropTemplateWhy = "GraphicsSettingsTab._dropDownTemplate @0x" &
+      hexOf(uint64(cSwGfxDropTemplate)) & " is readable but its native half " &
+      "is gone (fake null), so cloning it would be a use-after-free"
+    return
+  let go = iGameObjectOf(tmpl)
+  if go == nil or not iUnityAlive(go):
+    gSwDropTemplateWhy = "GraphicsSettingsTab._dropDownTemplate @0x" &
+      hexOf(uint64(cSwGfxDropTemplate)) & " has no live GameObject, so it is " &
+      "not an Instantiate-able control"
+    return
+  gSwDropTemplate = cast[uint64](tmpl)
+  gSwDropTemplateWhy = "GraphicsSettingsTab._dropDownTemplate @0x" &
+    hexOf(uint64(cSwGfxDropTemplate)) & " on the Graphics tab"
+  if not gSwDropTemplateSaid:
+    gSwDropTemplateSaid = true
+    okLog "settings pages: DROPDOWN DONOR captured = 0x" &
+          hexOf(gSwDropTemplate) & " from " & gSwDropTemplateWhy &
+          " (proved live: readable, not a fake null, has a live GameObject). " &
+          "The GAME tab, where the pages render, has NO stock dropdown row, " &
+          "so the klass census there leaves gSwKlassDropdown at 0 and " &
+          "swFindDonor can only return nil -- which is why every page in the " &
+          "deployed run logged dropdownDonor=0x0. Enum rows now clone THIS."
 
 proc swRenderPageBegin(tabPtr, parentGo: Il2CppPtr; page: var SwPage): bool =
   ## ONCE PER PAGE. Picks the donor, builds the scroll host, draws the heading,
@@ -1423,6 +1599,9 @@ proc swRenderPageBegin(tabPtr, parentGo: Il2CppPtr; page: var SwPage): bool =
   page.timedOut = false
   page.beganAt = cNowMs()
   page.renderDonorDrop = 0'u64
+  page.renderDonorDropWhy = ""
+  page.headClone = 0'u64
+  page.ticks = 0
   swCrumb("STAGE: swRenderPageBegin -- swAnyDonor for page '" & page.id & "'")
   var donorKind = ""
   let donorToggle = swAnyDonor(tabPtr, donorKind)
@@ -1442,16 +1621,40 @@ proc swRenderPageBegin(tabPtr, parentGo: Il2CppPtr; page: var SwPage): bool =
   # labelled stub that names the reason. Never substituted with the toggle
   # donor -- a control that renders and cannot select is the defect this
   # repository produces most often.
+  #
+  # TWO SOURCES, TRIED IN ORDER, AND THE ONE THAT ANSWERED IS NAMED.
+  #   1. a stock dropdown ROW on THIS tab (`swFindDonor` on the learned klass);
+  #   2. the GRAPHICS tab's `_dropDownTemplate`, captured on an earlier visit
+  #      by `swCaptureDropTemplate` -- the same prefab `dlssrows.nim` clones.
+  # Source 1 has NEVER answered on the Game tab (there is no stock dropdown
+  # there), which is the whole of the deployed run's `dropdownDonor=0x0`.
   let donorDrop = swFindDonor(tabPtr, gSwKlassDropdown)
   if donorDrop != nil:
     page.renderDonorDrop = cast[uint64](donorDrop)
+    page.renderDonorDropWhy = "a stock SettingDropDown row on this tab " &
+                              "(klass 0x" & hexOf(gSwKlassDropdown) & ")"
+  elif gSwDropTemplate != 0'u64 and
+       duOk(cast[Il2CppPtr](gSwDropTemplate), 0x20'i32) and
+       iUnityAlive(cast[Il2CppPtr](gSwDropTemplate)):
+    page.renderDonorDrop = gSwDropTemplate
+    page.renderDonorDropWhy = "BORROWED from " & gSwDropTemplateWhy &
+      " -- this tab has none of its own"
+  else:
+    page.renderDonorDropWhy =
+      "NONE: this tab has no stock SettingDropDown row, and " &
+      (if gSwDropTemplate == 0'u64:
+         (if gSwDropTemplateWhy.len > 0: gSwDropTemplateWhy
+          else: "the Graphics tab has not been opened this session, so its " &
+                "_dropDownTemplate was never offered")
+       else: "the borrowed Graphics template no longer reads back as a live " &
+             "object") &
+      ". Every enum row on this page is a labelled stub"
   page.begun = true
   okLog "settings pages: page '" & page.id & "' BEGUN -- donor and dropdown " &
         "donor captured, nothing instantiated yet. The scroll graft is the " &
         "NEXT tick's work and is clocked separately from the rows; " &
-        "dropdownDonor=0x" & hexOf(cast[uint64](donorDrop)) &
-        " (0x0 -> this tab has no stock dropdown to clone and every enum " &
-        "row here will be a labelled stub)."
+        "dropdownDonor=0x" & hexOf(page.renderDonorDrop) &
+        " from " & page.renderDonorDropWhy & "."
   result = true
 
 proc swRenderPageGraft(page: var SwPage) =
@@ -1487,7 +1690,13 @@ proc swRenderPageGraft(page: var SwPage) =
          $page.rows.len & " row(s) are about to be rendered into it."
   page.renderParent = cast[uint64](rowParent)
   swCrumb("render the heading row for page '" & page.id & "'")
-  discard swCloneRow(donorToggle, rowParent, page.title)
+  # THE HEADING CLONE IS KEPT, not discarded. It is the one object a begun
+  # page owns before any schema row exists, and the liveness test in
+  # `swPagesOnTabBuilt` needs it: without it a page between its graft tick and
+  # its first row tick reads as "lost its clones" and is re-begun, forever.
+  let headCtrl = swCloneRow(donorToggle, rowParent, page.title)
+  if headCtrl != nil:
+    page.headClone = cast[uint64](headCtrl)
   page.grafted = true
   page.graftMs = cNowMs() - t0
   swGraftRecord(page.id, page.graftMs)
@@ -1507,6 +1716,27 @@ proc swRenderPageSlice(page: var SwPage): int =
   ## progress every time.
   result = 0
   if not page.begun or page.complete: return
+  # THE TICK BOUND, CHECKED FIRST. A page that has been granted this many
+  # ticks and is still not complete has stopped advancing; it says so, with
+  # its shortfall, and stops asking for ticks. This is the bound that CANNOT
+  # be reset by a re-begin, which is why it exists alongside the wall clock.
+  page.ticks = page.ticks + 1
+  if page.ticks > cSwMaxPageTicks:
+    page.complete = true
+    page.timedOut = true
+    var short = page.rows.len - page.skipped - page.drawn
+    if short < 0: short = 0
+    warn "settings pages RENDER VERDICT TIMEOUT (ticks): page '" & page.id &
+         "' has been granted " & $page.ticks & " render tick(s) -- over the " &
+         $cSwMaxPageTicks & "-tick bound -- and is STILL NOT COMPLETE. " &
+         $page.drawn & " row(s) on screen of " & $page.rows.len & " parsed (" &
+         $page.skipped & " skipped), so " & $short & " row(s) are NOT on " &
+         "screen. The page stops asking for ticks rather than spinning for " &
+         "the rest of the session; re-open the tab to try again. Its " &
+         "finished-state verdict follows immediately and is read off the " &
+         "live tree, not off these counters."
+    swRenderVerdict(page)
+    return
   # THE GRAFT IS A TICK OF ITS OWN, and it is the FIRST thing a begun page
   # does. Returning 0 here is correct and is not "no progress": the registry
   # reads `gSwSliceWorked`, not the row count, precisely so a graft cannot be
@@ -1564,8 +1794,10 @@ proc swRenderPageSlice(page: var SwPage): int =
         page.rows[i].implemented = false
         text = page.rows[i].label & cSwNotDone
         warn "settings pages: row '" & page.rows[i].key & "' declares an " &
-             "enum and this tab has NO stock SettingDropDown to clone " &
-             "(klass census dropdown=0x" & hexOf(gSwKlassDropdown) &
+             "enum and there is no dropdown donor -- " &
+             page.renderDonorDropWhy & " (klass census dropdown=0x" &
+             hexOf(gSwKlassDropdown) & ", Graphics template=0x" &
+             hexOf(gSwDropTemplate) &
              "), so it is drawn as a labelled stub. Nothing was cloned off a " &
              "toggle to stand in for it."
     let clone = swCloneRow(donorForRow, rowParent, text)
@@ -1745,6 +1977,59 @@ proc swVerdictWatch(pages: var seq[SwPage]; who: string) =
            "follows if it finishes."
     i = i + 1
 
+proc swAutoBeginNext(pages: var seq[SwPage]): bool =
+  ## BEGIN THE NEXT PAGE, ONCE THE PREVIOUS ONE HAS FINISHED, FROM THE TICK.
+  ##
+  ## `swPagesOnTabBuilt` begins at most ONE page per tab-built event so that a
+  ## tab visit costs one graft rather than eleven. This is the other half of
+  ## that: the drain begins the next page when -- and only when -- no page is
+  ## in flight, so the registry fills one page at a time, each one reaching its
+  ## own verdict, without needing eleven trips to the Settings screen.
+  ##
+  ## Returns true if it begun one (that page's graft is then the next tick's
+  ## work, so this call itself instantiates nothing).
+  result = false
+  if gSwPagesTabPtr == 0'u64 or gSwPagesTabKey == 0'u64: return
+  var i = 0
+  while i < pages.len and i < 32:                  # rule 4: capped
+    if pages[i].begun and not pages[i].complete:
+      return                                       # one at a time
+    i = i + 1
+  # The first page that has not been rendered onto THIS tab object yet.
+  var pick = -1
+  i = 0
+  while i < pages.len and i < 32:
+    if pages[i].renderedFor != gSwPagesTabKey:
+      pick = i
+      break
+    i = i + 1
+  if pick < 0: return
+  let tabPtr = cast[Il2CppPtr](gSwPagesTabPtr)
+  if not duOk(tabPtr, 0x20'i32) or not iUnityAlive(tabPtr):
+    warn "settings pages: the next page cannot be begun from the tick -- the " &
+         "remembered SettingsTab 0x" & hexOf(gSwPagesTabPtr) & " no longer " &
+         "reads back as a live object. The registry is left where it is; " &
+         "re-opening Settings -> Game re-arms it."
+    gSwPagesTabPtr = 0'u64
+    return
+  var why = ""
+  let parentGo = swRowContainerGo(tabPtr, why)
+  if parentGo == nil:
+    warn "settings pages: the next page ('" & pages[pick].id & "') cannot be " &
+         "begun from the tick -- the row container is not reachable (" & why &
+         "). Nothing was written."
+    return
+  var pg = pages[pick]
+  if not swRenderPageBegin(tabPtr, parentGo, pg):
+    pages[pick] = pg
+    return
+  pg.renderedFor = gSwPagesTabKey
+  pages[pick] = pg
+  okLog "settings pages: page '" & pages[pick].id & "' BEGUN FROM THE TICK -- " &
+        "the previous page finished and its verdict is above. One page fills " &
+        "at a time; this one's graft is the next tick's work."
+  result = true
+
 proc swSliceRegistry(pages: var seq[SwPage]; who: string): int =
   ## THE PER-TICK DRAIN, over one registry. Read-modify-write per element, for
   ## the aliasing reason `swPagesOnTabBuilt` documents at length: a scalar
@@ -1757,6 +2042,15 @@ proc swSliceRegistry(pages: var seq[SwPage]; who: string): int =
   result = 0
   swVerdictWatch(pages, who)
   gSwSliceWorked = false
+  # ONLY THE REGISTRY THAT `swPagesOnTabBuilt` OWNS may be auto-advanced, and
+  # `who` is how the caller (modstab.nim's tick) names it -- "settings pages"
+  # is `gSwPages`, "mods pages" is `gModsPages`, whose pages are rendered into
+  # the MODS tab's own per-subtab containers by that file and must not be
+  # begun against the Game tab's container.
+  if who == "settings pages":
+    if swAutoBeginNext(pages):
+      gSwSliceWorked = true
+      return
   var i = 0
   while i < pages.len and i < 32:                 # rule 4: capped
     if pages[i].begun and not pages[i].complete:
@@ -2328,6 +2622,10 @@ proc swPagesOnTabBuilt(tabPtr: Il2CppPtr; tabName: string; revisit: bool) =
   # returned out of the `tabName != "game"` branch below with the Game tab's
   # clones still parented and still active, which is Bug 1.
   swPagesEnforceTabOwnership(tabKey, tabName)
+  # LEARN THE DROPDOWN DONOR FROM WHICHEVER TAB HAS ONE. Before the Game-tab
+  # filter below, deliberately: the tab that carries `_dropDownTemplate` is
+  # `graphics`, which this feature never renders onto.
+  swCaptureDropTemplate(tabPtr, tabName)
   if tabName != "game":
     if gSwPagesFires <= 8:
       okLog "settings pages: DECLINED -- pages render only onto the Game tab " &
@@ -2369,10 +2667,51 @@ proc swPagesOnTabBuilt(tabPtr: Il2CppPtr; tabName: string; revisit: bool) =
          "building the host page. Nothing can be rendered; this is a host bug, " &
          "not a game one, and nothing was written to the settings screen."
     return
+  # REMEMBERED FOR THE TICK, so the drain can begin page N+1 when page N is
+  # done rather than waiting for another tab visit. See `swAutoBeginNext`.
+  gSwPagesTabPtr = tabKey
+  gSwPagesTabKey = tabKey
   var i = 0
+  # ---- ONE PAGE IS BEGUN PER TAB-BUILT EVENT, AND NEVER ONE THAT IS ALREADY
+  # RENDERING. MEASURED 2026-09-04 (host log, entries #7..#18, 11 pages between
+  # [1:05:07] and [1:05:11]):
+  #
+  #   * this loop called `swRenderPage` -- which is BEGIN plus one slice -- for
+  #     EVERY page in the registry inside ONE call. Each page's slice spends
+  #     that tick on its GRAFT (a SettingsList clone, measured 265 ms), so the
+  #     whole loop was 11 grafts back to back: a ~3.2 s stall on the Unity main
+  #     thread, wearing the word "slice", and exactly one row per page (the
+  #     heading) ever drawn;
+  #   * `swRenderPageBegin` resets `beganAt`, `verdictDone`, `ticks`, `drawn`
+  #     and `nextRow`. Re-beginning every page on every tab-built event
+  #     therefore reset the verdict deadline faster than it could expire, which
+  #     is why a 65-minute run printed NOT ONE `RENDER VERDICT` line;
+  #   * and the liveness test that decided to re-render scanned `rows[].clone`
+  #     only. A page between its graft tick and its first row tick owns no row
+  #     clone, so the test said "lost its clones" for a perfectly healthy page,
+  #     every time -- the log's `row0.clone=0x0` on every entry line is that.
+  #
+  # So: a page that is BEGUN and not COMPLETE is IN FLIGHT and is left alone --
+  # `swSliceRegistry` owns it and will finish it and state its verdict. A page
+  # that has never been begun is begun only if nothing else is in flight, which
+  # bounds a tab-built event to at most ONE graft.
+  var inFlight = -1
+  var f = 0
+  while f < gSwPages.len and f < 32:               # rule 4: capped
+    if gSwPages[f].begun and not gSwPages[f].complete:
+      inFlight = f
+      break
+    f = f + 1
+  var begunThisCall = false
   while i < gSwPages.len:
     swCrumb("STAGE: swPagesOnTabBuilt -- page[" & $i & "/" & $gSwPages.len &
             "] id='" & gSwPages[i].id & "' rows=" & $gSwPages[i].rows.len)
+    # IN FLIGHT: the drain owns it. Reading its values back is safe and is
+    # still wanted; re-beginning it is what produced the 4-second cycle.
+    if gSwPages[i].begun and not gSwPages[i].complete:
+      swReadBackPage(gSwPages[i])
+      i = i + 1
+      continue
     # Read back BEFORE deciding whether to re-render, so a value the player
     # changed is captured even on the pass that decides to rebuild the page.
     if gSwPages[i].renderedFor == tabKey:
@@ -2380,9 +2719,20 @@ proc swPagesOnTabBuilt(tabPtr: Il2CppPtr; tabName: string; revisit: bool) =
       # Still rendered into this same tab object; nothing to rebuild. A clone
       # that has been destroyed under us reads unreadable, and that is what
       # forces a re-render.
+      #
+      # THREE THINGS COUNT AS A LIVE CLONE, not one: any row clone, the HEADING
+      # clone, or the scroll host. The heading and the scroll host are what a
+      # page owns before its first row exists, and omitting them is what made
+      # this test unable to answer anything but "lost".
       var alive = false
+      if gSwPages[i].headClone != 0'u64 and
+         cIsReadable(cast[Il2CppPtr](gSwPages[i].headClone), 8'i32) != 0'i32:
+        alive = true
+      if not alive and gSwPages[i].scrollGo != 0'u64 and
+         cIsReadable(cast[Il2CppPtr](gSwPages[i].scrollGo), 8'i32) != 0'i32:
+        alive = true
       var r = 0
-      while r < gSwPages[i].rows.len:
+      while not alive and r < gSwPages[i].rows.len and r < cSwMaxRows:
         if gSwPages[i].rows[r].clone != 0'u64 and
            cIsReadable(cast[Il2CppPtr](gSwPages[i].rows[r].clone), 8'i32) != 0'i32:
           alive = true
@@ -2392,7 +2742,25 @@ proc swPagesOnTabBuilt(tabPtr: Il2CppPtr; tabName: string; revisit: bool) =
         i = i + 1
         continue
       okLog "settings pages: page '" & gSwPages[i].id & "' lost its clones " &
-            "(the tab was rebuilt under it); re-rendering"
+            "(the tab was rebuilt under it) -- no row clone, no heading " &
+            "clone (0x" & hexOf(gSwPages[i].headClone) & ") and no scroll " &
+            "host (0x" & hexOf(gSwPages[i].scrollGo) &
+            ") is readable; re-rendering"
+    # THE ONE-BEGIN BOUND. Everything past here BEGINS a page, which costs a
+    # graft tick; at most one of those per tab-built event.
+    if begunThisCall or inFlight >= 0:
+      if gSwPagesFires <= 8:
+        okLog "settings pages: page '" & gSwPages[i].id &
+              "' is NOT begun on this tab-built event -- " &
+              (if begunThisCall: "another page was already begun in this call"
+               else: "page '" & gSwPages[inFlight].id &
+                     "' is still filling (" & $gSwPages[inFlight].drawn &
+                     " of " & $gSwPages[inFlight].rows.len & " rows)") &
+              ". One page renders at a time and swSliceRegistry finishes it; " &
+              "beginning all of them here cost ~3.2 s of Unity main thread " &
+              "per tab visit and let no page reach its verdict."
+      i = i + 1
+      continue
     var why = ""
     let parentGo = swRowContainerGo(tabPtr, why)
     if parentGo == nil:
@@ -2423,6 +2791,12 @@ proc swPagesOnTabBuilt(tabPtr: Il2CppPtr; tabName: string; revisit: bool) =
     discard swRenderPage(tabPtr, parentGo, pg)
     pg.renderedFor = tabKey
     gSwPages[i] = pg
+    # THIS CALL HAS SPENT ITS ONE BEGIN. Recorded from the WRITTEN-BACK page,
+    # not from the local, so a begin that did not persist does not lock the
+    # rest of the registry out.
+    if gSwPages[i].begun and not gSwPages[i].complete:
+      begunThisCall = true
+      inFlight = i
     # ISOLATE WHICH HALF FAILS. `pg` is what we just built; `gSwPages[i]` is
     # what the registry holds one statement later. If they disagree, the
     # element assignment itself is the no-op and no amount of read-modify-write
