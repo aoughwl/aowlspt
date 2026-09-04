@@ -9554,3 +9554,38 @@ answer here was "the only route that actually worked".
 Do NOT file one you cannot stand behind -- check it first; the agent may have inferred what it labelled measured.
 Nothing was cleared. File each with fact_record, then re-run with --drain --clear (or empty C:/Users/savant/.aowl/relay.jsonl).
 ```
+
+## 2026-09-03 (evening): facts relayed by subagents (drained from the factnote relay, tags as the authors set them)
+
+```text
+--- 1/4  (from ?)
+  subject    EFT.TarkovApplication::Update
+  predicate  is RVA 0x977b10 and sharedness=UNIQUE (owners=1)
+  object     the per-frame main-thread bridge
+  method     measured
+  evidence   R type EFT.TarkovApplication -> void Update() rid=50571 arity=0 RVA=0x977b10 ; R shared 0x977b10 -> sharedness=UNIQUE owners=1
+  note       re-verified while writing docs/INTERACTION-LAYER-MAP.md
+--- 2/4  (from ?)
+  subject    docs/INTERACTION-LAYER-MAP.md
+  predicate  states 41 interaction-layer invariants, 15 enforced by a fail-closed tool and 26 UNENFORCED
+  object     process model / detour engine / gated export ABI / managed memory / inspector / game-side integrity
+  method     measured
+  evidence   invariant table built from abi/*.h, tools/{drainaudit,abilint,allocasserts,consistency,test_mqpolicy,test_handleshape}.py and tools/selftests.py registry
+  note       top unenforced by blast radius: X1 gated export called without a token; D5/D4 double or shared detour; M3/M6 readability-only write guard; D8 nested aowl_p_p_seh; D10 flag default not OFF. Each has a proposed smallest fail-closed check.
+--- 3/4  (from ?)
+  subject    tools/buildlock.py
+  predicate  refuses with exit 15 when a source under the target's roots is edited after the lock was acquired
+  object     SOURCES CHANGED DURING THE BUILD; sidecar stale_sources=true; deploy.py sidecar_check refuses it
+  method     measured
+  evidence   tools/test_buildlock.py test_source_change: touching driver -> rc 15 + flagged sidecar + deploy refusal; untouched control -> rc 0, source_check=unchanged, deploy accepts with 'sha matches'
+--- 4/4  (from ?)
+  subject    tools/storelint.py audit(root)
+  predicate  returns FAIL (6/GONE baseline) for any tree that is not this checkout but contains a .nim under host/
+  object     buildlock's pre-flight refuses such a repo with exit 14; temp-repo tests must pass --no-store-audit
+  method     measured
+  evidence   test_buildlock temp repo with host/Aowlspt.Host.Il2Cpp/hostmain.nim -> 'STORELINT: the baseline has rotted' listing real-checkout files, BUILD REFUSED BEFORE THE LOCK exit 14
+
+4 relayed measurement(s) (4 well-formed, 0 malformed).
+Do NOT file one you cannot stand behind -- check it first; the agent may have inferred what it labelled measured.
+Nothing was cleared. File each with fact_record, then re-run with --drain --clear (or empty C:/Users/savant/.aowl/relay.jsonl).
+```
