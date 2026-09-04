@@ -1062,6 +1062,10 @@ proc modLoadReleaseDrain*() =
   gModLoadReleaseApproved = false
   gModLoadReleaseDone = true
   let tid = modhost.cSysThreadId()
+  # THE ORDERING LEDGER for the native step's verdicts (3) and (4). Integers
+  # only, and this is the ONE place they are written -- see `mlnNoteRelease`
+  # for why a Nim string must not be assigned from this thread.
+  mlnNoteRelease(tid)
   okLog "mod loading: release performed on thread " & $int(tid) &
         " (ops thread), gate opened on thread " & $int(gModLoadReleaseTid) &
         " (Unity)"
@@ -1089,6 +1093,91 @@ proc mlLoadPhaseOver(): bool =
   if gModLoadCaptionNode == nil: return false
   result = not mlPhaseLive()
 
+const MlNativeLineBreak = "\x0A"
+  ## The line separator for the native caption. Written as an explicit code
+  ## point rather than as an escape inside the join expression so that no
+  ## editing tool between here and the compiler can turn it into a REAL
+  ## newline in the source -- which is a parse error, and is exactly what
+  ## happened once while this proc was being written.
+
+proc mlNativeCaption(lines: seq[string]): string =
+  ## The three protocol lines as ONE caption string for the game's own status
+  ## field, joined with newlines.
+  ##
+  ## RENDERED VERBATIM, exactly as the overlay renders them, and for the same
+  ## reason: `tools/modbuild.py`'s `Progress.render` is the only writer and it
+  ## decides what the player reads. Nothing is parsed here and nothing is
+  ## reformatted -- a host that rewrote the writer's words would make the two
+  ## renderers disagree about what the build is doing.
+  ##
+  ## Empty lines are dropped so a two-line report does not leave a blank row
+  ## in the middle of the client's own caption.
+  result = ""
+  var n = 0
+  for i in 0 ..< lines.len:
+    if lines[i].len == 0: continue
+    if n > 0: result.add MlNativeLineBreak
+    result.add lines[i]
+    inc n
+    if n >= MlMaxRows + 1: break
+
+
+proc mlReleaseFromLines(lines: seq[string]; now: uint64; visible: bool) =
+  ## THE RELEASE HALF of the tick, factored out of `modLoadTick` so that BOTH
+  ## renderers can drive it: the from-scratch three-line overlay (`visible` =
+  ## `gModLoadBuilt`) and the NATIVE step in `modloadnative.nim`, which drives
+  ## the client's own caption instead and never sets `gModLoadBuilt` at all.
+  ##
+  ## It was extracted rather than duplicated on purpose. The mods being
+  ## released is the half that is NOT cosmetic, and a second copy of it that
+  ## drifted from this one would strand every mod on whichever path had the
+  ## stale copy -- silently, because a mod that never loads looks exactly like
+  ## a mod that was never written.
+  ##
+  ## `visible` is "the progress text is actually on screen", whichever renderer
+  ## put it there. The done marker is only acted on once it is, because a fully
+  ## cached build writes "MODS READY" as its first and only render.
+  # The done marker is only acted on ONCE THE TEXT IS ACTUALLY UP. A fully
+  # cached build writes "MODS READY" as its very first (and only) render, so
+  # arming the dismiss timer on the reading rather than on the display would
+  # start the clock before a canvas even exists -- and it would be torn down
+  # having never been shown. `linger` means "after it is visible".
+  if visible:
+    # "MODS READY" is the writer's own done marker.
+    if lines[0].startsWith("MODS READY"):
+      if gModLoadReadyAt == 0'u64:
+        gModLoadReadyAt = now
+      if find(lines[0], "FAILED") < 0:
+        # The build is done and clean: this is the intended release point.
+        modLoadReleaseMods("the mod build reported READY: " & lines[0])
+      elif not gModLoadFailed:
+        gModLoadFailed = true
+        # A run with a failed mod stays up LONGER, on purpose -- but it is no
+        # longer left up for ever. "For ever" meant "over the main menu", which
+        # is defect (1) and outranks this. The failure is shouted into the log,
+        # which is where it survives the dismissal.
+        warn "mod loading step: the build finished with FAILURES. The line " &
+             "naming them stays on screen for " &
+             $int(MlFailLingerMs div 1000'u64) & "s and is recorded here so " &
+             "it outlives the screen: " & lines[0]
+        # Release anyway. Some mods failed; the ones that BUILT are still real
+        # and withholding them helps nobody.
+        modLoadReleaseMods("the build finished WITH FAILURES; the mods that " &
+                           "did build are loaded and the line keeps naming " &
+                           "the ones that did not")
+
+  # THE DEADLINE. Checked every tick, and deliberately independent of whether
+  # anything ever built: the text is cosmetic, the mods are not.
+  if gModLoadDeferMods and not gModsReleased and gModsDirDeferred.len > 0 and
+     gModLoadDeferredAt != 0'u64 and
+     now - gModLoadDeferredAt > ModLoadDeferMaxMs:
+    modLoadReleaseMods("the build never reported ready within " &
+                       $int(ModLoadDeferMaxMs div 1000'u64) & "s, so the " &
+                       "deadline fired. The loading step did not finish, or " &
+                       "the main-menu show event never arrived; the mods are " &
+                       "loaded anyway rather than lost.", true)
+
+
 proc modLoadTick() =
   ## Runs from the shared per-frame drain, on the Unity main thread, inside the
   ## existing guard -- this adds NO guard of its own, because `aowl_p_p_seh` is
@@ -1112,6 +1201,14 @@ proc modLoadTick() =
           mlSinceBoot(nowFrame) & " after the deferral started. Observed on " &
           "the frame AFTER the detour, so this time is within one frame, not " &
           "exact. The release gate is now OPEN."
+  # THE NATIVE STEP'S OWN PUMP, before every early return below and for the
+  # same reason the release gate is: the read-only MenuLoadProfiler stage
+  # drains must report even on the boots where NO build file ever appears (the
+  # normal path on an install whose mods are already compiled), and the
+  # verdicts must be printed even when this tick short-circuits. With
+  # `modLoadNative` off both calls return on one boolean compare.
+  mlnDrive()
+  mlnVerdicts()
   if gModLoadPendingWhy.len > 0 and not gModsReleased and mlGateOpen():
     let why = gModLoadPendingWhy
     modLoadReleaseMods(why)
@@ -1216,6 +1313,39 @@ proc modLoadTick() =
          " are rendered (what it is doing now, overall progress, current step " &
          "progress). The writer -- Progress.render in tools/modbuild.py -- is " &
          "the thing to fix; the host renders verbatim on purpose."
+
+
+  # ===================================================================
+  # THE NATIVE STEP (modloadnative.nim, flag `modLoadNative`, DEFAULT OFF).
+  #
+  # F1 of docs/BOOT-FLOW-MAP.md: put this progress on the CLIENT'S OWN loading
+  # caption -- `ProfileLoadingScreen._statusField@0xb0`, reached by walking
+  # from the screen receiver the game itself hands us -- instead of drawing a
+  # from-scratch three-line overlay beside it.
+  #
+  # The two renderers are MUTUALLY EXCLUSIVE and the switch is a property of
+  # the FINISHED STATE, not of our own write: `mlnDrives()` is true only once
+  # a caption write has been READ BACK off the live TMP. Until that happens
+  # the old overlay keeps running, so a native step that cannot reach the
+  # caption never costs the player their progress display. When it does become
+  # true, anything the overlay had already built is TORN DOWN here -- two
+  # progress readings on one screen is worse than either alone.
+  #
+  # `modLoadNative` off => `mlnCaptionSet`/`mlnDrive`/`mlnDrives` return on one
+  # boolean compare and this block costs nothing.
+  mlnCaptionSet(mlNativeCaption(lines))
+  mlnDrive()
+  mlnVerdicts()
+  if mlnDrives():
+    if gModLoadBuilt:
+      mlDismiss("the native loading step is driving the client's OWN caption " &
+                "now, so this overlay is redundant -- two progress readings " &
+                "on one screen is worse than either alone")
+    # The RELEASE still has to run on this path, and it is the half that is
+    # not cosmetic. `visible = true` because the progress text IS on screen --
+    # on the game's own caption rather than on ours, which is the whole point.
+    mlReleaseFromLines(lines, now, true)
+    return
 
   # ===================================================================
   # THE LOAD-PHASE GATE. Nothing below this draws unless the client's own
@@ -1326,45 +1456,7 @@ proc modLoadTick() =
       mlRefresh(lines)
     mlRetryStyle(cap)
 
-  # The done marker is only acted on ONCE THE TEXT IS ACTUALLY UP. A fully
-  # cached build writes "MODS READY" as its very first (and only) render, so
-  # arming the dismiss timer on the reading rather than on the display would
-  # start the clock before a canvas even exists -- and it would be torn down
-  # having never been shown. `linger` means "after it is visible".
-  if gModLoadBuilt:
-    # "MODS READY" is the writer's own done marker.
-    if lines[0].startsWith("MODS READY"):
-      if gModLoadReadyAt == 0'u64:
-        gModLoadReadyAt = now
-      if find(lines[0], "FAILED") < 0:
-        # The build is done and clean: this is the intended release point.
-        modLoadReleaseMods("the mod build reported READY: " & lines[0])
-      elif not gModLoadFailed:
-        gModLoadFailed = true
-        # A run with a failed mod stays up LONGER, on purpose -- but it is no
-        # longer left up for ever. "For ever" meant "over the main menu", which
-        # is defect (1) and outranks this. The failure is shouted into the log,
-        # which is where it survives the dismissal.
-        warn "mod loading step: the build finished with FAILURES. The line " &
-             "naming them stays on screen for " &
-             $int(MlFailLingerMs div 1000'u64) & "s and is recorded here so " &
-             "it outlives the screen: " & lines[0]
-        # Release anyway. Some mods failed; the ones that BUILT are still real
-        # and withholding them helps nobody.
-        modLoadReleaseMods("the build finished WITH FAILURES; the mods that " &
-                           "did build are loaded and the line keeps naming " &
-                           "the ones that did not")
-
-  # THE DEADLINE. Checked every tick, and deliberately independent of whether
-  # anything ever built: the text is cosmetic, the mods are not.
-  if gModLoadDeferMods and not gModsReleased and gModsDirDeferred.len > 0 and
-     gModLoadDeferredAt != 0'u64 and
-     now - gModLoadDeferredAt > ModLoadDeferMaxMs:
-    modLoadReleaseMods("the build never reported ready within " &
-                       $int(ModLoadDeferMaxMs div 1000'u64) & "s, so the " &
-                       "deadline fired. The loading step did not finish, or " &
-                       "the main-menu show event never arrived; the mods are " &
-                       "loaded anyway rather than lost.", true)
+  mlReleaseFromLines(lines, now, gModLoadBuilt)
 
   if gModLoadReadyAt != 0'u64:
     let linger = (if gModLoadFailed: MlFailLingerMs else: MlLingerMs)
