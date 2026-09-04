@@ -172,7 +172,8 @@ ITEMS = [
     S("nimlint.py", "fast"),                           # 0.1s
     S("acceptance.py", "fast", args=("selftest",)),    # 0.2s -- positional
     S("dlss.py", "fast", args=("selftest",)),          # fake install + manifest falsifiers
-    S("dlssnr.py", "fast", args=("selftest",)),        # OptiScaler-DLSSNR install tree + falsifiers
+    S("dlssnr.py", "fast", args=("selftest",)),
+    S("dlssapply.py", "fast", args=("selftest",)),  # ini key writer + tampered-key falsifiers        # OptiScaler-DLSSNR install tree + falsifiers
     S("abilint.py", "fast", args=("--selftest",)),      # ABI ownership lint + falsifier
     # M3/M6: no raw store into game-owned memory outside the typed FieldRef
     # path. `--falsify` asserts the lint FIRES on a synthetic raw store, stays
@@ -353,6 +354,13 @@ VERIFIERS = [
       "synthetic install tree; the wrong (unsigned) checksum formula, an "
       "off-by-one checksum, a same-size DLL tamper and a truncated backup "
       "must each make install/rollback FAIL, so PASS is not the only answer"),
+    V("dlssapply.py", "dlssapply.py selftest",
+      "a synthetic OptiScaler.ini: the four keys are written and read back, "
+      "every OTHER key and every comment must survive, a missing file must "
+      "read INCONCLUSIVE rather than PASS, a commented-out key must never "
+      "match, a tampered key must read as a mismatch, and the version/upscaler "
+      "names must still appear in mods/dlss/dlss.nim -- so PASS is not the "
+      "only answer"),
     V("dlssnr.py", "dlssnr.py selftest",
       "synthetic game root and a synthetic OptiScaler zip: a model whose sha256 "
       "!= pin, a native-DX11 upscaler, a zip whose OptiScaler.dll is another "

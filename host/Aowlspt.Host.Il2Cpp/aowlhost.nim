@@ -8598,6 +8598,7 @@ include "colorwidget.nim"
 ## is read in the flag pass, because nimony forward-resolves procs across an
 ## include boundary but NOT variables.
 include "postfxrows.nim"
+include "dlssrows.nim"
 
 ## THE NATIVE INVENTORY / ITEM-SPAWNER SCREEN. Defines `iuDrainTick`, called
 ## from the `TarkovApplication::Update` drain, and `bindInvUi`.
@@ -9877,6 +9878,36 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
          "The banner on the page says so, and rows the active Preset owns are " &
          "marked, because a control that silently does nothing is worse than " &
          "a label that admits what it is."
+  # THE DLSS SECTION ON THE STOCK GRAPHICS PAGE (`settingsDlssRows`).
+  # DEFAULT OFF, and resolved here rather than left to discover its own
+  # emptiness on the Unity thread: it stands on the same two features the
+  # PostFX rows do -- `settingsPostFxSubtab` is what locates and validates the
+  # "Graphics Settings" panel transform this file walks from, and `nativeUiKit`
+  # is what arms the byte-verified target table every call goes through.
+  gDlrOn = readBoolKey("settingsDlssRows")
+  if gDlrOn and not gGfxOn:
+    gDlrOn = false
+    warn "settingsDlssRows is set but settingsPostFxSubtab is NOT. The rows " &
+         "are parented into GraphicsSettingsTab._settingsContainer, which is " &
+         "reached by walking from the 'Graphics Settings' panel transform " &
+         "that feature locates -- without it there is no validated receiver " &
+         "to walk from. NOT arming it; set settingsPostFxSubtab too."
+  if gDlrOn and not gNkOn:
+    gDlrOn = false
+    warn "settingsDlssRows is set but nativeUiKit is NOT. Every row is an " &
+         "instantiated game prefab driven through nuikit's byte-verified " &
+         "target table, which refuses wholesale while that flag is off, so " &
+         "this would refuse five rows and build nothing. NOT arming it; set " &
+         "nativeUiKit too."
+  if gDlrOn:
+    info "settingsDlssRows is set: five aowl.dlss rows (DLSS version, " &
+         "upscaler, and the three DLSS-5 re-lighting knobs) are instantiated " &
+         "from the game's own toggle/float-slider prefabs into the stock " &
+         "Graphics page. NOTHING IS APPLIED IN-PROCESS -- nvngx_dlss.dll is " &
+         "open in this process and OptiScaler read its ini at attach, so the " &
+         "values take effect on the NEXT launch, where aowlspt-launch runs " &
+         "tools/dlssapply.py and prints a PASS/FAIL verdict. Every caption " &
+         "says 'applies on restart'."
   gSeasonsOn = readBoolKey("uxHideSeasons")
   gBetaNoticeOn = readBoolKey("uxBetaNotice")
   # Same event for the seasons banner, the mode button and the beta notice --

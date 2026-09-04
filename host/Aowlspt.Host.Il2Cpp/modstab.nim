@@ -3354,6 +3354,11 @@ const GfxMaxStockWatch = 16
 ## what is inside the PostFX one. Neither reaches into the other's state.
 proc pfxOnPanelUp(postUp: bool)
 proc pfxOnScreenClosed()
+## Same seam, for the DLSS section on the stock GRAPHICS panel
+## (`dlssrows.nim`, `include`d after `postfxrows.nim`). Forward-declared for
+## the same reason: this file is included first.
+proc dlrOnPanelUp(gfxUp: bool)
+proc dlrOnScreenClosed()
 
 ## FORWARD DECLARATIONS into `modsindex.nim`, included AFTER this file because
 ## it reuses `modSetParseF64` from `modsettingsrender.nim`, which is itself
@@ -3492,12 +3497,16 @@ proc gfxTickBody() =
     return
   if gModsLastTabPtr == nil:
     pfxOnScreenClosed()
+    dlrOnScreenClosed()
     return
   if gGfxPanelGo == nil or gGfxPostGo == nil:
     return
   if not duOk(gGfxPanelGo, 0x20'i32) or not duOk(gGfxPostGo, 0x20'i32):
     return
   pfxOnPanelUp(modsGoActive(gGfxPostGo))
+  # The DLSS rows live in the OTHER stock panel, so they are driven off the
+  # Graphics panel's own active state -- never off the PostFX one.
+  dlrOnPanelUp(modsGoActive(gGfxPanelGo))
 proc gfxTick() =
   ## Every frame while armed: the steady state is two `activeSelf` reads and a
   ## handful of guarded byte reads, with no allocation and no call.

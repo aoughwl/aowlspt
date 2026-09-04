@@ -82,6 +82,7 @@ import aowlterm
 import aowllayout
 import aowlsession
 import aowlui
+import aowldlss
 
 {.emit: """#include <stdlib.h>""".}
 {.emit: """#include <string.h>""".}
@@ -2927,6 +2928,13 @@ proc main(): int =
       warn "--nographics-anyway: also passing -batchmode -nographics. This " &
            "has never been observed to boot this client. If the game exits " &
            "immediately or never reaches the menu, that is why."
+  # THE DLSS STEP, and it MUST be here -- before the process exists.
+  # `nvngx_dlss.dll` is opened by the client and is listed IsCritical in the
+  # consistency manifest, and OptiScaler reads its ini at attach; neither can
+  # be changed once the game is running. `tools/aowldlss.nim` says what it did,
+  # or says plainly that it was skipped, and never aborts the launch.
+  dlssPreLaunch(root)
+
   let cmdLine = clientCommandLine(backendUrl, token, o.extraArgs)
   # Whole, not fitted. It is long, and it is the one line somebody will be
   # asked to paste when the client comes up talking to the wrong server.
@@ -2974,6 +2982,13 @@ proc main(): int =
     if backendProc != 0'u64: cSpawnKill(backendProc)
     return 1
   ok "client resumed"
+
+  # THE BOOT VERDICT. Read-only, against the process that now exists: the
+  # nvngx_dlss.dll it actually LOADED and the OptiScaler keys actually on disk,
+  # each compared with the aowl.dlss config. INCONCLUSIVE is printed as itself
+  # -- NGX loads the DLL lazily, so a client still booting legitimately has no
+  # such module yet, and that is not a pass.
+  dlssVerdict(root, int(cLaunchPid(launch)))
 
   let hostLog = joinPath(root, "aowlspt\\aowlspt-host.log")
   line ""
