@@ -9643,3 +9643,64 @@ Cleared as a suspect: `overlaySyncTake`'s size-then-copy TOCTOU. It looks like a
 classic overrun, but `aowl_ov_sync_take` (`abi/aowlspt_overlay.h:5069`) compares
 `syncLen >= cap` under the critical section and returns `-1` rather than
 copying, and the Nim caller treats `<= 0` as "nothing this time".
+
+
+## 2026-09-04 -- the AFK kick is `settings.config.AFKTimeoutSeconds`, and 0 disables it
+
+MEASURED. The client, idle ~9 h at the main menu, raised ERRORDIALOG
+`kind=critical` header "AFK timeout", text "The game will be closed due to a long
+period of inactivity", and stopped calling `TarkovApplication::Update`. No crash,
+no Crash_* folder -- the game asked itself to quit.
+
+**The mechanism** (`tools/il2cpp_resolve.py ... typemethods/fields/disasm/callers`):
+
+* `EFT.AFKMonitor`, type 7945, Assembly-CSharp. Fields `_afkTimeout`@0x10
+  (float), `_cancellationSource`@0x18, `_errorWindowContext`@0x20; consts
+  `TIME_TO_CANCEL_SECONDS = 30`, `AFK_ERROR_HEADER`, `AFK_ERROR_TEXT`.
+* Methods, all **UNIQUE** RVAs: `Start`@0x9e8450, `Stop`@0x9e87a0,
+  `StartWaiting`@0x9e8910, `TryQuitApplication`@0x9e8ac0,
+  `QuitApplication`@0x9e8db0, `AwaitInput`@0x9e8e00. Its `.ctor` resolves to
+  `0x628110`, this build's universal empty-body stub (SHARED x9614) -- so the
+  threshold is NOT set at construction.
+* Owned in two places: `EFT.MatchmakerOperation._afkMonitor`@0x68 (started by a
+  tail `jmp` at 0xa2debd) and `EFT.CreateProfileOperation`+0x48 (called at
+  0x9f3d1c). `callers 0x9e8450` finds 4 sites, 2 call + 2 tail jmp.
+* `Start` reads the threshold from a **static singleton**, not from its owner:
+
+  ```
+  0x9e8513  call 0x9f70                      ; il2cpp static-field getter thunk
+  0x9e8526  movss xmm6, [rax + 0x90]         ; the config value
+  0x9e852e  movss [rbx + 0x10], xmm6         ; this._afkTimeout = it
+  0x9e854a  comiss xmm6, [.rdata 0x65b55a0]  ; 0x00000001 = 1.401e-45
+  0x9e8556  setb  al
+  0x9e855b  jne   0x9e8769                   ; -> UnityEngine.Debug::LogError; RET
+  ```
+
+  So **a threshold <= 0 is the game's own disabled path**: `Start` logs an error
+  and returns before building the cancellation source, the async state machine
+  or the error window. That is BSG's branch, not a patch of ours.
+
+**Where the number comes from -- and the measurement that ties it to the dialog.**
+The value is `config.AFKTimeoutSeconds` in the document served at
+`/client/settings` (NOT `/client/globals`: `bigjson.py find --key
+AFKTimeoutSeconds D:/Aowlspt/aowlspt/db.json` answers `settings.config....`).
+Our live database holds **32000**; the stock captured value is **1800**
+(`data/capture/raid1/responses/large/037.json`, `data.config.AFKTimeoutSeconds`).
+The dialog fired at host-log elapsed **8:54:00 = 32040 s**, and 32000 s is
+8 h 53 m 20 s. The disassembly alone shows only which field `Start` reads; the
+timing match is what ties that field to the observed dialog.
+
+The dialog text is `Errors/AFKQuitText` in `mods/tarkov/data/post1/locale_en.json`
+(`bigjson.py search --value "long period of inactivity"`).
+
+**The fix is DATA.** `mods/tarkov/emu/afk.nim` rewrites exactly that one member
+to `0` in the `/client/settings` body (`onSettings` in `mods/tarkov/tarkov.nim`);
+`selfCheckAfk` reads the FINISHED document back through the JSON reader and
+fails if it still carries a non-zero value, if a sibling was destroyed, if the
+override is not idempotent, or if a document without `config` was rewritten
+anyway. No host flag, no detour, no code hop.
+
+NOT verified: that a live client boots with the served 0 and logs the
+`Debug.LogError` branch instead of arming the monitor -- that needs a deploy and
+a run, which a subagent must not do. Falsified by: a future AFK dialog on a
+build serving 0.

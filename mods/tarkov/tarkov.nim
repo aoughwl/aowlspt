@@ -81,6 +81,7 @@ import emu/selfchecks
 import emu/metadata
 import emu/post1
 import emu/globalsgaps # the config members REAL BSG sends and db.json lacks
+import emu/afk # the AFK kick, disabled in the served /client/settings
 import emu/itemsgaps # the `_props` members REAL BSG sends and db.json lacks
 import emu/itemsadd  # the WHOLE item templates BSG serves and db.json lacks
 import emu/tuning   # the globals overrides -- the settings that reach the CLIENT
@@ -1514,9 +1515,14 @@ proc onMenuLocale(url, body, session: string): string =
   result = envelope(objOf("menu", raw(menuLocale(lang1))))
 
 proc onSettings(url, body, session: string): string =
+  ## The AFK kick is disabled HERE, at the data source. `config.AFKTimeoutSeconds`
+  ## is the value `EFT.AFKMonitor::Start`@0x9e8450 loads into `_afkTimeout`, and a
+  ## value <= 0 takes the client's own `Debug.LogError` branch, never arming the
+  ## monitor -- see `emu/afk.nim` for the disassembly and for the timing
+  ## measurement that ties the served number to the observed dialog.
   let v = dbRead("settings")
   if v.ok:
-    return envelope(raw(v.raw))
+    return envelope(raw(disableAfkKick(v.raw)))
   result = envelope(emptyObject())
 
 proc onServerList(url, body, session: string): string =

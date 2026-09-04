@@ -46,6 +46,7 @@ import customise
 import tuning
 import svm
 import globalsgaps
+import afk
 import itemsgaps
 import itemsadd
 import mailcheck
@@ -132,6 +133,13 @@ proc selfCheckFailures*(): seq[string] =
   # a negative over the merged text, plus the two ways a merge silently lies
   # (dropping what the database had, or overwriting it).
   discard globalsgaps.selfCheckGlobalsGaps(result)
+
+  # `afk` proves the AFK kick is off in the document the CLIENT receives.
+  # `EFT.AFKMonitor::Start` refuses to arm when config.AFKTimeoutSeconds <= 0,
+  # so the falsifiable assertion is a READ-BACK of the finished /client/settings
+  # body: a non-zero value there means the game will kick an idle single-player
+  # session again.
+  discard afk.selfCheckAfk(result)
 
   # `itemsgaps` proves the per-item `_props` members REAL BSG sends and our
   # pre-1.0 database lacks are spliced in at the right depth, without
