@@ -5,6 +5,32 @@ A togglable full-frame post-processing stack for post-1.0 Escape From Tarkov
 `TarkovGraphics` mod (AgX tonemapper), rebuilt for the native aowlspt host where
 there is no BepInEx and managed C# does not run.
 
+## STATUS: LEGACY — kept as a backup, not developed further (2026-09-04)
+
+This D3D11 back-buffer pass is **no longer the direction**. It stays in the tree,
+buildable and unchanged, default OFF, as a fallback; it will not get new
+features. Work on making the game look better moves to driving the game's *own*
+renderer — see **`docs/NATIVE-POSTFX-MAP.md`**, which maps the stock PostFX
+settings BSG folded away in 1.0, the shadow/AO/quality appliers, and the field
+offsets and RVAs to reach them.
+
+**Why the shipped default looked grey, plainly:** this pass runs on the **back
+buffer**, which BSG has *already* tonemapped and encoded to LDR sRGB. Every
+preset here then applied a **second** tonemapper (AgX at `tonemapStrength`
+0.85-1.0). A tonemapper's job is to compress highlights into range; run one on an
+image whose highlights are already at 1.0 and it has nothing left to recover and
+everything to flatten — the toe crushes the blacks, the shoulder pulls the whites
+down, and saturation follows luma down with them. That is the grey. It was a
+double tonemap, not a taste disagreement, and the fix was never to re-season it.
+Anyone reviving this pass should start from `tonemapStrength 0`, `tonemapper 0`,
+bloom off, and keep only what BSG's frame does not already do (local contrast,
+edge-adaptive sharpening, vibrance, dither).
+
+The other structural limit, unchanged: the pass sees the shipped LDR image, not
+the linear HDR scene, and has no scene depth — so SSAO, contact shadows and fog
+were never reachable from here at all. The native route in the map above has all
+three, because the game already renders them.
+
 ## The split (why this mod is only half the story)
 
 The **rendering runs in the host, not in this mod.** A mod DLL has no GPU, no
