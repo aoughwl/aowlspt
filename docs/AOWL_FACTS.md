@@ -9589,3 +9589,57 @@ Nothing was cleared. File each with fact_record, then re-run with --drain --clea
 Do NOT file one you cannot stand behind -- check it first; the agent may have inferred what it labelled measured.
 Nothing was cleared. File each with fact_record, then re-run with --drain --clear (or empty C:/Users/savant/.aowl/relay.jsonl).
 ```
+
+## 2026-09-03 11:52:45 -- the unattended crash is the gLastError thread-free corruption, in the LAST build without the fix
+
+Instrument: `cdb.exe -z crash.dmp -c ".ecxr; k; lmv"` on
+`Crash_2026-09-03_155245216`, plus `objdump -t/-d` of the deployed backup
+`D:\Aowlspt\aowlspt\aowlspt-host-il2cpp.dll.bak-20260903-122227`
+(sha256 `B9B51C73...E92CDB`), which is the module in the dump: `lmv` reports
+`Timestamp: Thu Sep 3 11:22:30 2026 (6A9990B6)` and that file's mtime is 11:22.
+
+MEASURED:
+
+* Fault: `aowlspt_host_il2cpp+0x80c4`, ACCESS_VIOLATION reading `0x19`.
+  Disassembly of the backup at VA `0x1800080c4` is `mov (%rdx),%r8` inside
+  **`_mi_page_free_collect+0x6d`** (function starts `0x180008057`). The list
+  being walked is `page->xthread_free`, taken by the `lock cmpxchg` on
+  `0x38(%rbx)` at `0x180008086` -- mimalloc's **cross-thread free list**.
+* Registers: `rdx=0x19` (the next pointer -- a small integer, not a heap
+  address), `rcx=0xa` (the walk counter, 10th node), `r9=0x280` (`page->capacity`,
+  the walk bound from `movzwl 0xa(%rbx)`), `rbx=0x21270000480` (the `mi_page_t`),
+  `r10=0x21270092580` (the previous node, i.e. the block whose first word is
+  `0x19`).
+* `rdi=0x7ffb1df2f640` = module RVA `0x39f640` = **`_mi_heap_main`**
+  (objdump: `_mi_heap_main` is sec 4 = `.data` @ `0x18039e000` + `0x1640`).
+* Callers, from stack words symbolised against the same backup:
+  `mi_malloc+0x76` <- `_mi_malloc_generic+0x57` <- fault; above them
+  `parseDesired_0_mod65rrto1`, `pathGet_0_jsok2v72h1`,
+  `skipValue_0_jsok2v72h1`, `strip_0_str7j0ifg` -- i.e. `takeModSet`'s JSON
+  parse of the backend's mod set.
+* The faulting thread is index **1**, unnamed, with a TEB below every named
+  Unity worker -- an early non-Unity thread, i.e. the host's own loop thread.
+  The Unity main thread is index 0.
+* **The crashing build does not contain the fix.** `objdump -t` of
+  `bak-20260903-122227` has `gLastError_0_aowayxgkm1` as a plain **`.data`**
+  symbol (sec 4). Every later backup (`130647`, `163720`, `180214`, `183658`,
+  `200314`, `214404`) has `__emutls_v.gLastError...` instead -- the
+  `{.threadvar.}` form. The fix first shipped in the build with mtime 12:19.
+
+CONCLUSION (attribution, not measurement): this is the **same** defect as the
+09:21:51 WER crash already documented at `aowlhost.nim:1399` -- a global Nim
+string freed from two threads under ARC, corrupting the page's thread-free
+list -- manifesting as an AV rather than mimalloc's `"corrupted thread-free
+list."` abort only because the bad next pointer is dereferenced before the
+post-walk count check at `0x18000811d` can fire. It is **already fixed** by the
+`gLastError {.threadvar.}` change; no new defect, no code change made.
+
+What would falsify it: the minidump carries registers and stack only -- every
+heap read (`dq 0x21270092580`, the page, the free-list head) returns `????`, so
+the corrupting write itself was NOT observed. A recurrence on a build that has
+`__emutls_v.gLastError` would refute the attribution.
+
+Cleared as a suspect: `overlaySyncTake`'s size-then-copy TOCTOU. It looks like a
+classic overrun, but `aowl_ov_sync_take` (`abi/aowlspt_overlay.h:5069`) compares
+`syncLen >= cap` under the critical section and returns `-1` rather than
+copying, and the Nim caller treats `<= 0` as "nothing this time".
