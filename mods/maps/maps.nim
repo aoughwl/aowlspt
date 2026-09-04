@@ -143,6 +143,19 @@ var gLastErr = ""
 
 var gOpts: HudOpts
 var gHudOn = false
+var gHudRefusal = ""
+  ## The reason `hudRegister` gave the LAST time it actually refused, captured at
+  ## the refusal site. Empty means registration was never attempted OR it
+  ## succeeded -- `gHudTried` tells those two apart. This exists because the
+  ## `region` diag line used to ASSERT a cause ("radar, map and indicators are
+  ## all off in config.json") that it had not measured: on the 2026-09-04 run
+  ## the live config held spatialMode=radar and enabled=false, so every clause
+  ## of that sentence was false and the one true cause was not named. A verdict
+  ## may only report a cause it read.
+var gHudTried = false
+  ## True once `armFeed` has reached the registration decision at all. False
+  ## means `onLoad` returned at the `enabled=false` gate and no registration was
+  ## ever attempted -- which is a deliberately-disabled feature, not a failure.
 var gFeedRunning = false
   ## True once the client-side collector and publish timer are actually
   ## registered. This is NO LONGER load-time-only: `armFeed` is called from the
@@ -1629,18 +1642,83 @@ proc mapsDiagText(): string =
 
   # 1. the shared region: is anything dispatching us at all?
   var lRegion = ""
+  # WHY THIS IS NOT ONE `not gHudOn` BRANCH ANY MORE.
+  #
+  # It was, and it printed a single FAIL asserting "radar, map and indicators
+  # are all off in config.json". MEASURED on the 2026-09-04 run (build
+  # 6bd304e3): the live config held `spatialMode=radar` with `enabled=false`, so
+  # that sentence was false in every clause while the real cause -- the master
+  # switch -- went unnamed. A verdict that states an unmeasured cause is worse
+  # than no verdict, and a deliberately-disabled feature is not a FAIL at all.
+  #
+  # So the absence of a participant now resolves through the state that was
+  # actually recorded, in the order the code takes it, and only the last case is
+  # a failure:
+  #   * `gHudTried=false`  -- onLoad returned at the `enabled=false` gate and
+  #     registration was NEVER ATTEMPTED. Deliberate; INCONCLUSIVE, and it names
+  #     the key and the one-line remedy.
+  #   * tried, no surface   -- armFeed reached the decision and declined because
+  #     every spatial surface is off. Deliberate; INCONCLUSIVE, and it names
+  #     WHICH surfaces it read, so the reader can check them.
+  #   * tried, surface on, `gHudRefusal` set -- the region genuinely said no.
+  #     FAIL, quoting the refusal the region itself produced.
+  # The raid phase is reported alongside, because "no participant" while
+  # DEPLOYED is the case the user is complaining about and it must not read the
+  # same as "no participant at the menu".
+  let rgPhase = hostPhase()
+  let rgInRaid = rgPhase == RpDeployed
+  let rgWhere = (if rgInRaid: " -- and the host phase is DEPLOYED, so this is " &
+                              "exactly the in-raid frame that should be drawing"
+                 else: " (host phase is not DEPLOYED, so nothing would be " &
+                       "drawing yet regardless)")
+  let rgSurfaces = "spatialMode=" & modeName(gOpts.mode) &
+                   " indicators=" & $gOpts.indicators &
+                   " fullscreenKey=" & (if gFsKeyKc >= 0: gFsKeyName
+                                        else: "(unbound)")
   if not gHudOn:
-    lRegion = "FAIL  the in-game HUD was never registered with the shared " &
-              "region (radar, map and indicators are all off in config.json, " &
-              "or registration was refused at load -- see the load line above)"
+    if not gHudTried:
+      lRegion = "INCONCLUSIVE  no draw participant, and registration was never " &
+                "ATTEMPTED: config.json `enabled` is false, so onLoad returned " &
+                "before arming. This is the master switch, NOT the surface " &
+                "keys -- they currently read " & rgSurfaces & ". Set " &
+                "`enabled` true (F12 late-arms it in place, no relaunch) and " &
+                "watch for 'maps: LATE ARM'" & rgWhere
+    elif gHudRefusal.len > 0:
+      lRegion = "FAIL  the missing participant is 'maps.hud': registration was " &
+                "attempted and the shared region REFUSED it -- " & gHudRefusal &
+                ". Surfaces read " & rgSurfaces & rgWhere
+    else:
+      lRegion = "INCONCLUSIVE  no draw participant, and registration was " &
+                "attempted but DECLINED by this mod because every spatial " &
+                "surface is off: " & rgSurfaces & ". Set `spatialMode` to " &
+                "radar/map, or `indicators` true, or bind the full-screen key" &
+                rgWhere
   elif not hudArmed():
     lRegion = "FAIL  registered, but the region is NOT armed, so the draw " &
               "callback can never fire. Set host flag `sharedRegion`"
   elif hudFrames() <= 0'i64:
     lRegion = "INCONCLUSIVE  registered and armed, but ZERO frames have been " &
               "dispatched to us yet -- nothing has called us even once"
+  elif rgInRaid and hudDrawn() <= 0'i64:
+    # DISPATCH IS NOT DRAW. `hudFrames` counts times the region CALLED us;
+    # `hudDrawn` counts frames on which the callback actually submitted the
+    # pane. While the host phase is DEPLOYED those must not read the same:
+    # a callback that is invoked every frame and returns early at its master
+    # gate would otherwise PASS this line forever while the screen is empty,
+    # which is precisely a check that cannot fail. Only the in-raid case is
+    # judged, because outside a raid drawing nothing is correct.
+    lRegion = "FAIL  participant 'maps.hud' IS registered and armed and has " &
+              "been dispatched " & $hudFrames() & " frame(s), but it has drawn " &
+              "on ZERO of them while the host phase is DEPLOYED -- the " &
+              "callback is being called and is returning before it submits a " &
+              "pane. " & $hudGated() & " dispatch(es) were gated off, " &
+              $hudMasked() & " masked. Surfaces read " & rgSurfaces
   else:
-    lRegion = "PASS  armed, " & $hudFrames() & " frame(s) dispatched to us"
+    lRegion = "PASS  armed, " & $hudFrames() & " frame(s) dispatched to us, " &
+              $hudDrawn() & " of them drawn (" & $hudBlips() & " blip(s))" &
+              (if rgInRaid: " with the host phase DEPLOYED"
+               else: " -- host phase is not DEPLOYED, so a zero draw count " &
+                     "here is correct and this PASS covers dispatch only")
 
   # 2. the world: is there a raid, and can we see it?
   var lWorld = ""
@@ -2583,12 +2661,18 @@ proc armFeed(): bool =
   # which is a surface even with the widget mode OFF. Without that clause a
   # player whose only spatial surface is the full-screen map would get no draw
   # participant at all and the key would open nothing, silently.
+  # Reaching here means the registration DECISION is being taken -- which is the
+  # fact the `region` diag line needs in order to tell "never attempted" apart
+  # from "attempted and refused". Set before the surface gate, so a config with
+  # every surface off is still recorded as tried.
+  gHudTried = true
   if (gOpts.mode != ModeOff or gOpts.indicators or
       (gOpts.fsEnabled and gFsKeyKc >= 0)) and not gHudOn:
     hudInit(gOpts)
     var whyHud = ""
     if hudRegister(gOpts, whyHud):
       gHudOn = true
+      gHudRefusal = ""
       if hudArmed():
         success ModName & ": in-game HUD registered with the shared region " &
                 "and the region is ARMED -- mode=" & modeName(gOpts.mode) &
@@ -2600,6 +2684,7 @@ proc armFeed(): bool =
              "drawn. Set the host flag `sharedRegion` in aowlspt-host.json. " &
              "This is not 'the radar is off' -- it is 'nothing is dispatching'."
     else:
+      gHudRefusal = whyHud
       warn ModName & ": the shared region refused the in-game HUD: " & whyHud &
            ". The map page still works; the radar and the indicators do not."
   result = gFeedRunning
