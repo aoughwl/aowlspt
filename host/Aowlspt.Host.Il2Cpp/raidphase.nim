@@ -382,6 +382,13 @@ proc rpDrainTick*() =
 
 proc rpPhase*(): int32 = gRpPhase
 
+proc rpGameWorld*(): bool = gRpS1
+  ## S1 verbatim: the borrowed GameWorld cache is non-null AND readable. NOT a
+  ## synonym for "in a raid" -- it is still true on the results screen (see the
+  ## CLEAR edge below), which is exactly why `rpPhase` exists and why this is
+  ## reported alongside the phase by `aowlspt.host::raid_phase` rather than
+  ## instead of it.
+
 proc rpDeployed*(): bool = gRpPhase == RpPhaseDeployed
   ## THE gate. False on UNKNOWN by design: "I could not look" must darken the
   ## overlays, not arm them.

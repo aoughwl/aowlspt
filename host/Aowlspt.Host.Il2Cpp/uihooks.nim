@@ -200,6 +200,15 @@ var gUihProfNoFrame = 0              ## the frame arithmetic did not hold
 var gUihProfOkSaid = 0
 var gUihProfBadSaid = 0
 
+## THE MOD-FACING SHOW EVENT (`ui.show`). Flag `uiShowEvents`, read in
+## aowlhost.nim's flag pass and DEFAULT ON, so the sites are wanted before the
+## single `uihArm` pass whether or not any mod has loaded yet -- a mod cannot
+## subscribe in time to influence arming, and making arming depend on mod load
+## order is how a feature ends up working on one machine and not another.
+var gUihEventsOn = true
+var gUihEventsSent = 0     ## `ui.show` emissions
+var gUihEventsSaid = false ## the first-emission log line
+
 var gUihArming = -1        ## which site `attachDrain` is currently binding
 var gUihArmed = false      ## `uihArm` has run
 var gUihThread = 0         ## thread id of the FIRST firing, for the log
@@ -458,6 +467,63 @@ proc uihProfileLine(): string =
    elif gUihProfOk + gUihProfNull == 0: " -- INCONCLUSIVE: never looked"
    else: " -- PASS")
 
+proc uihEventsWantShowHook() =
+  ## Runs in the STRICT ORDER block in aowlhost.nim, with the other
+  ## `*WantShowHook`s and BEFORE the single `uihArm` pass.
+  ##
+  ## It wants every site except 1. Site 1 (`MenuScreen::Awake`) is NEVER
+  ## wanted: it killed the client on three boots and is a construction event
+  ## rather than a show event, so a subscriber would get a receiver whose
+  ## fields are not written yet. That exclusion is the reason this is a
+  ## hand-written list and not `for s in 0 ..< UihSiteCount`.
+  if not gUihEventsOn: return
+  uihWant(UihSiteOfflineRaid)
+  uihWant(UihSiteMenuShow)
+  uihWant(UihSiteSideSelect)
+  uihWant(UihSiteLocation)
+  uihWant(UihSiteInsurance)
+  uihWant(UihSiteAccept)
+  uihWant(UihSiteShowInRaid)
+  uihWant(UihSiteSessionEnd)
+
+proc uihEmitShow(site: int; self: Il2CppPtr) =
+  ## Emit `ui.show` to every subscribed mod.
+  ##
+  ## THREAD OF DELIVERY, and it is the thing a consumer must know: `hostEmit`
+  ## is `deliverEvent`, which is SYNCHRONOUS on the calling thread
+  ## (aowlhost.nim:3234, `hostEventEmit`'s own doc comment). The calling thread
+  ## here is the detour thunk on a `::Show` site, i.e. the UNITY MAIN THREAD --
+  ## the same thread `uihooks` logs on its first firing. So a subscriber's
+  ## handler runs ON the main thread, INSIDE the game's own call, and may touch
+  ## Unity objects; it must also return fast, because it is holding a frame.
+  ##
+  ## `receiver` is a raw pointer as a hex string and is ONLY valid on that
+  ## thread, for that call: a screen that has been destroyed stays READABLE
+  ## with `m_CachedPtr` zeroed (fact #182), so a consumer that stashes it must
+  ## re-validate before use, exactly as `uihSelf` does here.
+  ##
+  ## Allocation: this builds one small JSON string per SHOW event. A show event
+  ## is a screen opening -- single-digit counts per session, not per frame --
+  ## so rule 7 (no per-frame managed allocation) is not engaged; when the flag
+  ## is off the cost is one bool compare.
+  if not gUihEventsOn: return
+  let payload = "{\"site\":" & $site &
+                ",\"name\":\"" & readCString(cUihSiteName(int32(site))) & "\"" &
+                ",\"rva\":\"0x" & hexOf(uint64(cUihSiteRva(int32(site)))) & "\"" &
+                ",\"epoch\":" & $gUihEpoch[site] &
+                ",\"postfix\":" & (if gUihPostfix[site]: "true" else: "false") &
+                ",\"receiver\":\"0x" & hexOf(cast[uint64](self)) & "\"}"
+  hostEmit("ui.show", payload)
+  gUihEventsSent = gUihEventsSent + 1
+  if not gUihEventsSaid:
+    gUihEventsSaid = true
+    info "uihooks: first `ui.show` event emitted (" &
+         readCString(cUihSiteName(int32(site))) & ", site " & $site &
+         "). Delivery is SYNCHRONOUS on this thread, which is Unity's main " &
+         "thread inside the game's own ::Show call; a subscriber that blocks " &
+         "here blocks the frame. Zero subscribers is normal and is logged " &
+         "once by the event bus, not here."
+
 proc uihShowFired(i: int; regs: Il2CppPtr) =
   ## The firing half, dispatched by slot identity from EITHER `patchReturned`
   ## (a POSTFIX site) or `patchFired` (a PREFIX site -- see the banner for
@@ -502,6 +568,7 @@ proc uihShowFired(i: int; regs: Il2CppPtr) =
     return
   gUihSelf[site] = self
   gUihEpoch[site] = gUihEpoch[site] + 1
+  uihEmitShow(site, self)
   if not gUihFirstLogged:
     gUihFirstLogged = true
     gUihThread = int(cThreadId())
@@ -545,3 +612,56 @@ proc uihStatusLines(): seq[string] =
       if s == UihSiteMenuShow:
         result.add(uihProfileLine())
     s = s + 1
+
+proc uihShowStatusJson(): string =
+  ## `call("aowlspt.host::ui_show_status", "")` -- per-site state, so a mod can
+  ## ASK instead of waiting for an event it may have missed (a mod loaded after
+  ## MenuScreen::Show fired would otherwise never learn the menu is up).
+  ##
+  ## Three things are reported separately and must stay separate: `bound` (the
+  ## detour installed), `fires` (the method ran) and `epoch` (the receiver was
+  ## a live Unity object). A firing whose receiver was rejected is NOT an
+  ## epoch, and collapsing them would hide exactly the case the receiver check
+  ## exists to catch. `verdict` names which of the three is the honest answer.
+  var sites = ""
+  var s = 0
+  while s < UihSiteCount:
+    if s > 0: sites = sites & ","
+    # NOT `uihSelf`, deliberately: that one CLEARS `gUihSelf[site]` when the
+    # receiver has gone stale, and this verb can be called from a mod's own
+    # thread. A reporting path must not mutate the state it reports on from a
+    # thread that does not own it. The two guarded READS are the same ones
+    # `uihSelf` makes, and neither calls into Unity: `duOk` is a VirtualQuery
+    # and `iUnityAlive` is a guarded read of `m_CachedPtr`.
+    var self: Il2CppPtr = gUihSelf[s]
+    if self != nil and (not duOk(self, 0x20'i32) or not iUnityAlive(self)):
+      self = nil
+    sites = sites & "{\"site\":" & $s &
+      ",\"name\":\"" & readCString(cUihSiteName(int32(s))) & "\"" &
+      ",\"rva\":\"0x" & hexOf(uint64(cUihSiteRva(int32(s)))) & "\"" &
+      ",\"wanted\":" & (if gUihWant[s]: "true" else: "false") &
+      ",\"bound\":" & (if gUihSlot[s] >= 0: "true" else: "false") &
+      ",\"postfix\":" & (if gUihPostfix[s]: "true" else: "false") &
+      ",\"fires\":" & $gUihFires[s] &
+      ",\"epoch\":" & $gUihEpoch[s] &
+      ",\"rejected\":" & $gUihBad[s] &
+      ",\"receiver\":\"" &
+        (if self != nil: "0x" & hexOf(cast[uint64](self)) else: "") & "\"" &
+      ",\"verdict\":\"" &
+        (if gUihSiteOff[s]: "DISPATCH DISABLED after " & $gUihFaults[s] &
+                            " faults -- INCONCLUSIVE"
+         elif gUihSlot[s] < 0:
+           (if gUihWant[s]: "WANTED but NOT BOUND -- the prologue did not " &
+                            "verify or the drain is disabled"
+            else: "not wanted, so not bound -- nothing was looked at")
+         elif gUihFires[s] == 0: "BOUND, never fired yet"
+         elif gUihEpoch[s] == 0: "BOUND and fired " & $gUihFires[s] &
+                                 "x, but every receiver was rejected"
+         else: "LIVE") & "\"}"
+    s = s + 1
+  result = "{\"flag\":" & (if gUihEventsOn: "true" else: "false") &
+           ",\"armed\":" & (if gUihArmed: "true" else: "false") &
+           ",\"emitted\":" & $gUihEventsSent &
+           ",\"event\":\"ui.show\"" &
+           ",\"thread\":" & $gUihThread &
+           ",\"sites\":[" & sites & "]}"

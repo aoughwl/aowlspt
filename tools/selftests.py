@@ -123,6 +123,7 @@ ITEMS = [
       note="waits on the build lock: 2s free, up to 30 min contended"),
     T("test_autoenter.py", "fast"),                    # 0.8s
     T("test_crashwatch.py", "fast"),                   # 12.1s
+    T("test_cmdargs.py", "fast"),                      # 2s with a built launcher
     T("test_deploy_contains.py", "fast"),              # 1.5s
     T("test_hostlog.py", "fast"),                      # 6.4s
     T("test_inspect_silence.py", "fast"),              # 0.1s
@@ -232,6 +233,16 @@ ITEMS = [
      "speed": "slow", "needs": ("a built emutest binary",),
      "note": "Nim; reachable only via `aowl build emutest`. Always "
              "INCONCLUSIVE from this runner -- never PASS."},
+    {"name": "mods/tarkov/emu/raidloadout.nim", "kind": "nim", "cmd": None,
+     "speed": "slow", "needs": ("a built tarkov.dll + a running backend",),
+     "note": "Nim; `selfCheckRaidLoadout` runs at tarkov.dll LOAD and a "
+             "failure refuses the load, so the gate is the backend starting "
+             "at all -- and it is readable at /aowlspt/tarkov/selfcheck. Its "
+             "falsifiers are in-module and each names the mutation that turns "
+             "it red: drop the descendantsOf walk (a minted magazine "
+             "survives), count absent roots as stripped, or make findSpace "
+             "optimistic (the no-room refusal cannot fire). Always "
+             "INCONCLUSIVE from this runner -- never PASS."},
 ]
 
 # `--selftest` appears in these files only as prose, or as a flag the tool does
@@ -294,6 +305,14 @@ VERIFIERS = [
       "test_il2cpp_flags.py covers the CLI half: it registers a --bogus flag "
       "in VERB_FLAGS and asserts the SAME argv then passes, so the refusal is "
       "the registry's and not the message's"),
+    V("test_cmdargs.py", "test_cmdargs.py",
+      "every case carries its negative control IN THE SAME RUN: --force (an "
+      "option the launcher owns) must produce no -aowl. token, so a launcher "
+      "that forwarded everything cannot pass; a fabricated option name must be "
+      "reported as a difference by the LauncherOptions drift comparison; and a "
+      "fabricated verb name must be found ABSENT in aowlhost.nim. MEASURED "
+      "2026-09-04: run against the launcher exe built BEFORE the forwarding "
+      "change, it reported 3 FAIL and exit 1"),
     V("markers.py", "test_markers_falsifier.py",
       "asserts MISSING for an absent literal and INCONCLUSIVE for a truncated "
       "read, so PRESENT is not the only reachable answer"),

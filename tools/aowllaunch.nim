@@ -246,6 +246,23 @@ Options
   --force        launch even if the client looks wrong for this host
   -h, --help     this
 
+Mod arguments
+  Any --option this launcher does not own is FORWARDED to the game as
+  `-aowl.<name>=<value>`, and each forward is printed as it is decided:
+
+      aowlspt-launch --raid Woods          ->  -aowl.raid=Woods
+      aowlspt-launch --raid="Ground Zero"  ->  -aowl.raid="Ground Zero"
+      aowlspt-launch --raiddebug           ->  -aowl.raiddebug=true
+
+  The host parses those once at startup and any mod reads them through
+  `aowlspt/args`. A `-aowl.*` name no loaded mod declared is WARNED about in
+  aowlspt-host.log, so a misspelling announces itself instead of doing
+  nothing. Which arguments exist is documented by each mod's README and, when
+  it lists them, by registry/mods.json -- `--help` prints that list below.
+  A launcher option written in a form this launcher does not accept
+  (--root=D:\path) is REFUSED rather than forwarded. `--dry-run` prints the
+  final client command line, forwarded tokens included.
+
 Transport is read from backend.json's backendUrl: https:// starts the backend
 with --tls (HTTPS, what a real post-1.0 client needs) and hands the client an
 https url; http:// is plain, for development and the tests.
@@ -261,6 +278,11 @@ type
     root: string
     exeName: string
     extraArgs: string
+    forwarded: seq[string]
+      ## `--<name>[=<value>]` options this launcher does not own, already
+      ## rendered as `-aowl.<name>=<value>` tokens for the game's command line.
+      ## Folded into `extraArgs` at the end of `parseArgs`, so the dry run and
+      ## the real launch read the ONE field and cannot drift.
     wait: bool
     force: bool
     noBackend: bool
@@ -334,8 +356,94 @@ type
       ## `listening on` with nothing at all on the port. That case must exit 3.
     help: bool
 
+const LauncherOptions = [
+  "root", "exe", "args", "profile", "new", "side", "tail", "tail-title",
+  "modbuild", "no-mod-build", "rebuild-mods", "pick", "auto-enter",
+  "no-auto-enter", "low-render", "headless", "nographics-anyway",
+  "render-size", "wait", "no-backend", "no-logs", "logs", "client-window",
+  "plain", "ascii", "port", "allow-port-mismatch", "backend-wait",
+  "ready-probe", "dry-run", "force", "help"]
+  ## Every long option this launcher owns, WITHOUT the leading dashes. Used
+  ## only to refuse the ambiguous `--<ownoption>=<value>` spelling; the real
+  ## parse is still the `if` chain below, so a new option added there and
+  ## forgotten here is refused as a MOD argument rather than misparsed --
+  ## `tools/test_cmdargs.py` fails on exactly that drift.
+
+proc isLauncherOption(name: string): bool =
+  for o in LauncherOptions:
+    if o == name: return true
+  false
+
+proc validArgName(name: string): bool =
+  ## What may follow `-aowl.`: a name a host-side table can key on and a log
+  ## line can print unambiguously.
+  if name.len == 0 or name.len > 64: return false
+  for c in name:
+    if not ((c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
+            (c >= '0' and c <= '9') or c == '.' or c == '_' or c == '-'):
+      return false
+  true
+
+proc modArgsFromRegistry(root: string): seq[string] =
+  ## Best-effort listing of mod arguments for `--help`, read from
+  ## `registry/mods.json`'s optional per-mod `args: [{name, description,
+  ## example}]`. READ-ONLY and advisory: the registry is not the authority on
+  ## what a mod understands (the mod's own `declareArgs` is, and the host
+  ## audits it at boot), so a missing or unreadable registry is reported as
+  ## "could not look", never as "this build has no mod arguments".
+  result = @[]
+  var path = ""
+  var cands: seq[string] = @[]
+  if root.len > 0: cands.add joinPath(root, "registry\\mods.json")
+  cands.add "registry\\mods.json"
+  for cand in cands:
+    if exists(cand):
+      path = cand
+      break
+  if path.len == 0:
+    result.add "  (no registry/mods.json found next to " &
+               (if root.len > 0: root else: "this launcher") &
+               ", so no mod arguments could be listed -- that is 'could not " &
+               "look', not 'there are none')"
+    return
+  var text = ""
+  if not readTextFile(path, text):
+    result.add "  (" & path & " could not be read, so no mod arguments could " &
+               "be listed -- that is 'could not look', not 'there are none')"
+    return
+  # A deliberately small scanner: find each `"args"` array and pull the
+  # `"name"`/`"description"` pairs inside it. It never fails a launch; the
+  # worst case is a shorter list.
+  var i = 0
+  while true:
+    let at = text.find("\"args\"", i)
+    if at < 0: break
+    let open = text.find('[', at)
+    let close = if open >= 0: text.find(']', open) else: -1
+    if open < 0 or close < 0: break
+    var j = open
+    while j < close:
+      let na = text.find("\"name\"", j)
+      if na < 0 or na > close: break
+      var k = text.find('"', text.find(':', na) + 1)
+      var e = if k >= 0: text.find('"', k + 1) else: -1
+      if k < 0 or e < 0 or e > close: break
+      let nm = text.substr(k + 1, e - 1)
+      var desc = ""
+      let da = text.find("\"description\"", e)
+      if da >= 0 and da < close:
+        let k2 = text.find('"', text.find(':', da) + 1)
+        let e2 = if k2 >= 0: text.find('"', k2 + 1) else: -1
+        if k2 >= 0 and e2 >= 0 and e2 < close: desc = text.substr(k2 + 1, e2 - 1)
+      result.add "  --" & nm & "  " & desc
+      j = e + 1
+    i = close + 1
+  if result.len == 0:
+    result.add "  (no mod in registry/mods.json declares an `args` list; a " &
+               "mod's README is the other place to look)"
+
 proc parseArgs(): Options =
-  result = Options(root: "", exeName: "EscapeFromTarkov.exe", extraArgs: "",
+  result = Options(root: "", exeName: "EscapeFromTarkov.exe", extraArgs: "", forwarded: @[],
                    wait: false, force: false, noBackend: false, noLogs: false,
                    logsOnly: false,
                    clientWindow: false, plain: false, ascii: false,
@@ -469,8 +577,65 @@ proc parseArgs(): Options =
       result.force = true
     elif a == "--help" or a == "-h":
       result.help = true
+    elif a.startsWith("--"):
+      # ---------------------------------------------------------------
+      # MOD ARGUMENT FORWARDING.
+      #
+      # An option this launcher does not own is not an error any more: it is
+      # a MOD's argument, and it is forwarded to the game verbatim as
+      # `-aowl.<name>=<value>`. `--raid=Woods` and `--raid Woods` and a bare
+      # `--raiddebug` all work; the host parses the `-aowl.*` tokens once at
+      # startup and any mod reads them through `aowlspt/args`.
+      #
+      # It is announced, every time, on the line it is decided. A silent
+      # forward would turn a typo into a launch that looks perfect and does
+      # nothing, which is exactly the failure this whole path exists to make
+      # impossible: the host warns at the other end about any `-aowl.*`
+      # token no loaded mod declared, and this line is the first half of
+      # that trail.
+      var nm = a.substr(2, a.len - 1)
+      var val = ""
+      var haveVal = false
+      let eq = nm.find('=')
+      if eq >= 0:
+        val = nm.substr(eq + 1, nm.len - 1)
+        nm = nm.substr(0, eq - 1)
+        haveVal = true
+      # THE AMBIGUOUS CASE, REFUSED RATHER THAN GUESSED. A launcher option
+      # written in a form this launcher does not accept (`--root=D:\x`) has
+      # fallen through to here. Forwarding it would put the user's ROOT on
+      # the game's command line as a mod argument and start the launcher in
+      # the wrong directory, silently. It is named instead.
+      if isLauncherOption(nm):
+        fatal "--" & nm & " is one of THIS LAUNCHER's own options, but " &
+              "written as `--" & nm & "=...`, which it does not accept. It " &
+              "was NOT forwarded to the game as a mod argument, because " &
+              "that would silently change what --" & nm & " means. Write it " &
+              "as `--" & nm & " <value>`. Nothing was started."
+      if not validArgName(nm):
+        fatal "unknown option: " & a & " -- it is not one of this " &
+              "launcher's options, and `" & nm & "` is not a usable mod " &
+              "argument name either (letters, digits, `.`, `_` and `-` " &
+              "only, and it may not be empty). Nothing was started."
+      if not haveVal:
+        # `--name value`: only when the next token is not itself an option.
+        # A bare `--name` at the end of the line, or followed by another
+        # `-...`, is a FLAG and forwards as the string "true".
+        if i + 1 <= n and not paramStr(i + 1).startsWith("-"):
+          inc i
+          val = paramStr(i)
+        else:
+          val = "true"
+      let tok = "-aowl." & nm & "=" & (if val.contains(' ') or val.len == 0:
+                                         "\"" & val & "\"" else: val)
+      result.forwarded.add tok
+      echo "forwarding " & a & (if haveVal: "" else: " " & val) &
+           " to the game as " & tok
     elif a.startsWith("-"):
-      fatal "unknown option: " & a
+      fatal "unknown option: " & a & " -- single-dash options all belong to " &
+            "this launcher, so an unknown one is a typo, not a mod " &
+            "argument. Mod arguments are forwarded from the LONG form: " &
+            "`--" & a.substr(1, a.len - 1) & "=<value>`. Nothing was started."
     elif result.root.len == 0:
       result.root = a
     inc i
@@ -494,6 +659,20 @@ proc parseArgs(): Options =
       result.extraArgs = pre & " " & result.extraArgs
     else:
       result.extraArgs = pre
+
+  # MOD ARGUMENTS LAST, for the same reason `--low-render` goes first: the
+  # user's explicit `--args` string is the most specific thing they typed, and
+  # nothing this launcher synthesises should sit after it. `-aowl.*` tokens are
+  # order-independent to the host's parser, so nothing is lost by that choice.
+  if result.forwarded.len > 0:
+    var post = ""
+    for t in result.forwarded:
+      if post.len > 0: post.add " "
+      post.add t
+    if result.extraArgs.len > 0:
+      result.extraArgs = result.extraArgs & " " & post
+    else:
+      result.extraArgs = post
 
 # ---------------------------------------------------------------------------
 # Small formatting
@@ -2264,6 +2443,10 @@ proc main(): int =
   let o = parseArgs()
   if o.help:
     echo Usage
+    echo ""
+    echo "Mod arguments this build's registry knows about:"
+    for line in modArgsFromRegistry(o.root):
+      echo line
     return 0
 
   discard termStart()

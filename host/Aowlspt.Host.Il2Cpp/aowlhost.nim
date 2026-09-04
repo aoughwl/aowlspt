@@ -414,6 +414,15 @@ static int aowl_rva_is_code(unsigned int rva) {
 ## classification over a value the caller already read -- it dereferences
 ## nothing, which is why it is safe to share across the host/mod boundary.
 {.emit: """#include "aowlspt_wildspawn.h" """.}
+## THE NATIVE POSTFX CALL TABLE -- the twelve targets the POSTFX subtab's
+## native rows CALL to drive the game's own post-processing and shading
+## (CameraManager::SetSharpen / SetSSAO, PostFxSettingsController::TryUpdate*,
+## ChangedShadowQuality, QualitySettings::get_shadowCascades). Nothing here is
+## detoured; every row is a direct call at a byte-verified prologue.
+##
+## Included BEFORE `aowl_pro_prime_all` below so that table can name
+## `aowl_npf_prime_all` directly rather than through a forward declaration.
+{.emit: """#include "aowlspt_nativepostfx.h" """.}
 ## THE EAGER PROLOGUE SNAPSHOT. Defined here because it needs every target
 ## table above it, and CALLED from `hostReady` before any feature binds -- that
 ## ordering is the whole guarantee. Once this has run, no later verify can be
@@ -497,6 +506,11 @@ static void aowl_pro_prime_all(void) {
      * today -- primed anyway, because the eager pass exists precisely so that
      * no verify ever depends on "nothing else patches that". */
     aowl_pmn_prime_all();
+    /* The native POSTFX row set's twelve call targets. Uncontended by anything
+     * in this host today -- none of them is detoured anywhere -- and primed
+     * anyway, because the eager pass exists precisely so that no verify has to
+     * depend on "nothing else patches that". */
+    aowl_npf_prime_all();
 }
 """.}
 {.emit: """#include "aowlspt_detour.h" """.}
@@ -2692,6 +2706,13 @@ proc hostResolve(ctx: Il2CppPtr; typeName: Il2CppPtr; nameLen: int32;
   copyMem(outHandle, cast[Il2CppPtr](addr tmp), 8)
   result = StatusOk
 
+## MOD-REGISTERED COMMAND-LINE ARGUMENTS. Included HERE, and not down with the
+## other includes at 4900+, for one reason: `hostCall` below is the only door a
+## mod has and it is defined at ~2820 -- far above every other include -- so the
+## parser has to be in scope by then. It installs no detour, touches no game
+## memory and reads the process command line exactly once.
+include "cmdargs.nim"
+
 proc mainThreadReport(): string =
   ## What `call("aowlspt.host::main_thread")` answers.
   ##
@@ -2911,6 +2932,50 @@ proc hostCall(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
 
   if spec == "aowlspt.host::render_thread":
     var report = renderThreadReport()
+    return cOutCopy(outPtr, outLen, cast[Il2CppPtr](toCString(report)),
+                    int32(report.len))
+
+  # ---- the four GENERIC services a mod needs before it can do anything -----
+  #
+  # All four are answered WITHOUT the runtime, above the `gReady` gate, and all
+  # four are safe from any thread: each builds its answer out of scalars and
+  # COPIES of host-owned strings, allocating the reply on the CALLING thread
+  # and freeing nothing this side owns. None of them touches game memory.
+  #
+  # `cmdline` -- the whole parsed `-aowl.*` table plus the raw line. The table
+  # is immutable after `caParseOnce` ran in `hostMain`, so this is a read of
+  # frozen state, not a snapshot of a moving one.
+  if spec == "aowlspt.host::cmdline":
+    var report = caCmdlineJson()
+    return cOutCopy(outPtr, outLen, cast[Il2CppPtr](toCString(report)),
+                    int32(report.len))
+
+  # `args_declare` -- the AUDIT. It does not gate reading; it is what lets the
+  # boot log say which arguments this build understands and which were given,
+  # and it is what makes an undeclared `-aowl.*` token a WARNING instead of
+  # silence.
+  if spec == "aowlspt.host::args_declare":
+    var report = caDeclareJson(argText)
+    return cOutCopy(outPtr, outLen, cast[Il2CppPtr](toCString(report)),
+                    int32(report.len))
+
+  # `ui_show_status` -- per-site state for the `ui.show` event bus, so a mod
+  # that loaded after a screen was shown can ASK rather than wait forever for
+  # an event that already happened.
+  if spec == "aowlspt.host::ui_show_status":
+    var report = uihShowStatusJson()
+    return cOutCopy(outPtr, outLen, cast[Il2CppPtr](toCString(report)),
+                    int32(report.len))
+
+  # `raid_phase` -- raidphase.nim's verdict, verbatim. Generic: nothing about
+  # it is autoraid's. UNKNOWN is a REFUSAL ("I could not look"), never "not in
+  # a raid", and `why` carries the reason; a consumer that flattens the two has
+  # written a check that cannot fail.
+  if spec == "aowlspt.host::raid_phase":
+    var report = "{\"phase\":\"" & rpPhaseName(rpPhase()) & "\"" &
+                 ",\"gameWorld\":" & (if rpGameWorld(): "true" else: "false") &
+                 ",\"deployed\":" & (if rpDeployed(): "true" else: "false") &
+                 ",\"why\":\"" & caEsc(rpWhy()) & "\"}"
     return cOutCopy(outPtr, outLen, cast[Il2CppPtr](toCString(report)),
                     int32(report.len))
 
@@ -4266,6 +4331,11 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
     # PreloaderUI can be assumed. Idle cost is one clock compare; when the file
     # is unchanged it does not even allocate. Flag `modLoadScreen`, default ON.
     modLoadTick()
+    # THE COMMAND-LINE AUDIT SWEEP. One integer compare per frame until it
+    # fires, once, and nothing at all afterwards. It names every `-aowl.*`
+    # token no loaded mod declared -- a misspelled argument announces itself
+    # instead of doing nothing.
+    caSweepTick()
     # HOST-NATIVE AUTO-RAID. Rides THIS drain (TarkovApplication::Update ticks
     # the whole session, including the matchmaker screens that are up before the
     # main menu's PreloaderUI can be assumed), not a second detour. Default OFF
@@ -8647,6 +8717,20 @@ include "colorwidget.nim"
 include "postfxrows.nim"
 include "dlssrows.nim"
 
+## THE POSTFX SUBTAB'S **NATIVE** ROWS -- the ones that drive the GAME'S OWN
+## post-processing and shading rather than a D3D pass of ours. Additive to
+## `postfxrows.nim` above and independent of it: with `settingsNativePostFx` on
+## and the legacy `settingsPostFxRows` off, the page carries only these.
+##
+## Position is load-bearing in exactly the two directions the two files above
+## are: it needs `nativeui.nim` for the byte-verified prefab wrappers
+## (`nuInstantiateUnder` / `nuRowSlider` / `nuSliderValue` / `nuDropDownIndex`),
+## `modstab.nim` for `gGfxPostT` / `modsComponent`, and `hostfieldwrite.nim`
+## for the typed store gate the three AO rows go through -- and it must come
+## BEFORE `gNpfOn` is read in the flag pass, because nimony forward-resolves
+## procs across an include boundary but NOT variables.
+include "nativepostfx.nim"
+
 ## THE NATIVE INVENTORY / ITEM-SPAWNER SCREEN. Defines `iuDrainTick`, called
 ## from the `TarkovApplication::Update` drain, and `bindInvUi`.
 ##
@@ -8873,6 +8957,12 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
     HostName & " " & HostVersion & "\n" &
     "directory " & gDir & "\n" &
     "thread " & $int(gHostThreadId) & "\n\n")
+
+  # THE COMMAND LINE, parsed ONCE, here, before anything else can want it and
+  # before a single mod exists. `cmdargs.nim` owns the table; from this point
+  # on it is IMMUTABLE and every reader only copies out of it, which is what
+  # makes `aowlspt.host::cmdline` safe to call from a mod's own thread.
+  caParseOnce()
 
   # The first thing said, because it is the first thing that happened and
   # because a client that does not start says nothing else. The guard ran in
@@ -9466,6 +9556,18 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   # reusing inspect.nim's find/active/press primitives. It only advances screens;
   # it relies on `singleplayerRebrand` to force the practice toggle so the raid
   # stays offline, so it should be run WITH that flag on.
+  # THE MOD-FACING UI SHOW-EVENT BUS. Default ON: it installs the same
+  # byte-verified detours the in-host subscribers already use, adds no second
+  # detour to any site, and its per-firing cost is one small JSON string on a
+  # screen open. Turning it OFF means a mod can still ASK
+  # (`aowlspt.host::ui_show_status`) but will never be TOLD.
+  gUihEventsOn = readBoolKeyDef("uiShowEvents", true)
+  if not gUihEventsOn:
+    info "uiShowEvents is OFF: the host will not emit the `ui.show` event, " &
+         "and the show sites are bound only if an in-host feature wants them. " &
+         "`aowlspt.host::ui_show_status` still answers, and its `flag` field " &
+         "says false so a mod can tell this apart from a site that failed to " &
+         "bind."
   gArOn = readBoolKey("uxAutoRaid")
   block:
     let m = readStrKey("autoRaidMap")
@@ -10011,6 +10113,77 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
          "the typed hostfieldwrite gate. The verdict re-reads " &
          "_tooltipSettingsHover@0x98 -> _tooltipData@0x20 -> Text@0x20 off " &
          "each row, because SetTooltip has three silent no-op paths."
+  # ===========================================================================
+  # THE POSTFX SUBTAB'S **NATIVE** ROWS (`settingsNativePostFx`) -- DEFAULT ON.
+  #
+  # This is the only flag in this block that defaults ON, and the reason is
+  # that it REPLACES something rather than adding to it. `mods/graphics` --
+  # our own D3D composite pass, and the 29 name-only rows `settingsPostFxRows`
+  # builds for it -- is now LEGACY and DEFAULT OFF (see the note on that flag
+  # above). Shipping the replacement OFF as well would leave the POSTFX page
+  # empty, which reads to a player as a feature that was removed.
+  #
+  # What these rows do instead: they drive the GAME'S OWN pipeline. Every one
+  # of them either calls an applier the game already ships
+  # (`CameraManager::SetSharpen` / `SetSSAO`,
+  # `PostFxSettingsController::TryUpdate*`, `ChangedShadowQuality`) at a
+  # byte-verified prologue, or stores into a PrismEffects AO field through the
+  # typed hostfieldwrite gate. No detour is bound and nothing is composited.
+  #
+  # It is still inert without the two features it stands on, so that is
+  # resolved HERE rather than left to discover its own emptiness on the Unity
+  # thread.
+  gNpfOn = readBoolKeyDef("settingsNativePostFx", true)
+  if gNpfOn and not gGfxOn:
+    gNpfOn = false
+    warn "settingsNativePostFx is on but settingsPostFxSubtab is NOT. The " &
+         "rows are instantiated into PostFXSettingsTab._settingsRoot@0xa0, " &
+         "reached by walking from the POSTFX panel transform that feature " &
+         "locates -- without it there is no validated receiver to walk from, " &
+         "and no way for the player to reach the panel at all. NOT arming " &
+         "it; set settingsPostFxSubtab too."
+  if gNpfOn and not gNkOn:
+    gNpfOn = false
+    warn "settingsNativePostFx is on but nativeUiKit is NOT. Every row is an " &
+         "instantiated game prefab driven through nuikit's byte-verified " &
+         "target table, which refuses wholesale while that flag is off, so " &
+         "this would refuse every row and build nothing. NOT arming it; set " &
+         "nativeUiKit too."
+  if gNpfOn:
+    info "settingsNativePostFx is ON (default): the POSTFX page carries " &
+         "NATIVE rows that drive the game's own post-processing and shading " &
+         "-- sharpen, the six folded-away 1.0 colour settings (clarity, " &
+         "brightness, saturation, colourfulness, luma sharpen, adaptive " &
+         "sharpen), SSAO quality at ALL SIX ESSAOMode levels rather than the " &
+         "four the stock dropdown offers, and Prism's AO intensity / radius / " &
+         "blur passes. Each row is SEEDED from the game's own current value " &
+         "read back off the live component, applies through the game's own " &
+         "applier, and prints an APPLIED line carrying the value read back " &
+         "from the FINISHED STATE -- never our own write read back. " &
+         "CameraManager.Instance being null (the main menu, where there is no " &
+         "raid camera) is reported INCONCLUSIVE, not off. " & npfSummary()
+  # THE SHADOW ROWS (`settingsNativeShadows`) -- ITS OWN FLAG, DEFAULT OFF.
+  #
+  # Separate from the set above because it is the ONE row that can cost real
+  # frames: `ChangedShadowQuality` drives `QualityLevelPreset::Apply`, which
+  # re-renders the shadow map at more cascades and a higher resolution. Every
+  # other native row on that page is free or nearly so. A single flag would
+  # make "the postfx rows regressed" and "the game got slower" the same bisect.
+  gNpfShadowsOn = readBoolKey("settingsNativeShadows")
+  if gNpfShadowsOn and not gNpfOn:
+    gNpfShadowsOn = false
+    warn "settingsNativeShadows is set but settingsNativePostFx is NOT. The " &
+         "shadow row is built by that feature, so with it off there is " &
+         "nothing for this to add. NOT arming it."
+  if gNpfShadowsOn:
+    info "settingsNativeShadows is set: a shadow-quality row is added to the " &
+         "NATIVE postfx set. THIS IS THE EXPENSIVE ONE -- it is the only row " &
+         "on that page that can cost real frames, because raising it " &
+         "re-renders the shadow map at more cascades and higher resolution. " &
+         "Its tooltip says so in those words. Its verdict reads back " &
+         "QualitySettings.shadowCascades -- the ENGINE's own opinion, not the " &
+         "QualityLevelPreset object we asked to be installed, because reading " &
+         "the preset back would be a check that cannot fail."
   gSeasonsOn = readBoolKey("uxHideSeasons")
   gBetaNoticeOn = readBoolKey("uxBetaNotice")
   # Same event for the seasons banner, the mode button and the beta notice --
@@ -10346,6 +10519,11 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
       splWantShowHook()
       modLoadWantShowHook()
       arWantShowHook()
+      # THE MOD-FACING `ui.show` BUS. Wants its sites here, with everyone
+      # else, because arming happens ONCE and mods load later: if this waited
+      # for a mod to subscribe, whether a site was bound would depend on mod
+      # load order. Flag `uiShowEvents`, default ON; it never wants site 1.
+      uihEventsWantShowHook()
       # The MenuScreen::Show site index is verified BY NAME here and only then
       # handed to modeskip, which cannot see `UihSiteMenuShow` at all (it is
       # included before uihooks.nim, so that constant and that header's C
