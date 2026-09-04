@@ -129,6 +129,13 @@ var gMiWorstMs = 0'u64
 var gMiWorstWhat = ""
 var gMiTruncatedFirst = ""
 var gMiRenderCapped = 0
+## THE ENABLED SWITCH, COUNTED. `gMiEnabled` is pages that got one;
+## `gMiNoEnable` is pages that deliberately did not, with the first reason
+## named. A total of zero used to be indistinguishable from "the feature is
+## not wired", which is exactly what the deployed run could not tell anyone.
+var gMiEnabled = 0
+var gMiNoEnable = 0
+var gMiNoEnableFirst = ""
 
 proc miRelease() =
   ## Give the shared slot back to whatever the host was polling. Called on
@@ -145,34 +152,82 @@ proc miFail(why: string) =
        "and no mod page is registered. NOTHING was hidden and nothing was " &
        "written, so this refusal costs the player nothing."
 
+proc miUnquote(raw: string): string =
+  ## One element of a JSON string array, as its text. `pathItems` is a
+  ## SPLITTER, not a decoder -- it hands each element back verbatim, so a
+  ## string element still carries its quotes and its escapes. An option
+  ## rendered as `"High"` including the quote marks is a caption the player
+  ## can see is wrong.
+  ##
+  ## Deliberately minimal: the four escapes a settings schema can actually
+  ## produce, and an UNKNOWN escape keeps its character rather than being
+  ## dropped, because losing a character silently is worse than showing a
+  ## backslash. Capped at 64 characters -- a dropdown caption longer than that
+  ## is clipped by the control anyway.
+  result = ""
+  var v = strip(raw)
+  if v.len >= 2 and v[0] == '"' and v[v.len - 1] == '"':
+    v = v.substr(1, v.len - 2)
+  var i = 0
+  while i < v.len and result.len < 64:
+    if v[i] == '\\' and i + 1 < v.len:
+      let c = v[i + 1]
+      if c == 'n': result.add '\n'
+      elif c == 't': result.add '\t'
+      elif c == '\"': result.add '\"'
+      elif c == '\\': result.add '\\'
+      else: result.add c
+      i = i + 2
+    else:
+      result.add v[i]
+      i = i + 1
+
 proc miKindOf(ty: string; row: var SwRow): bool =
   ## Map the route's declared type onto a row kind this host can actually draw.
   ## Returns false when there is no native control for it.
   ##
-  ## THE DECLINE IS THE POINT. A `choice` needs a `SettingDropDown`, and every
-  ## dropdown bind on this build is a GENERIC method with no entry in
-  ## `methodPointers`: `BindTo`, `BindToEnum`, `BindDropDownToSetting`,
-  ## `UpdateDropDownValue`, and all three `SettingSelectSlider.BindIndexTo`
-  ## overloads. `il2cpp_resolve.py genericmethods` can now reach instantiations
-  ## offline, but `SettingDropDown::BindTo<int>` comes back sharedness UNKNOWN
-  ## -- and unknown is a REFUSAL, not "probably fine".
+  ## THE DECLINE IS STILL THE POINT -- for the types that have no control.
+  ## `string`, `keybind` and anything unrecognised are drawn as labelled stubs
+  ## and marked not-wired, and are NOT faked out of a toggle: a control that
+  ## renders, moves and silently does nothing is this repository's most-
+  ## repeated defect.
   ##
-  ## So a choice row is drawn as a labelled stub and marked not-wired. It is
-  ## NOT faked out of a toggle: a control that renders, moves and silently does
-  ## nothing is this repository's most-repeated defect.
-  ##
-  ## NOTE ON `swkChoice`: a new `SwKind` value was considered and NOT added.
-  ## `swkStub` already means exactly "drawn, labelled, bound to nothing", which
-  ## is the required behaviour, and adding an enum case would have to be
-  ## handled in every `SwKind` switch in `settingspages.nim` -- a file this
-  ## change does not otherwise touch. The reason travels on the row's own label
-  ## instead, where the player can read it.
+  ## WHAT CHANGED 2026-09-04, and why the paragraph that stood here was wrong.
+  ## It argued that a choice can only ever be a stub because every dropdown
+  ## BIND (`BindTo`, `BindToEnum`, `BindDropDownToSetting`, the three
+  ## `SettingSelectSlider.BindIndexTo` overloads) is a generic whose
+  ## instantiation comes back sharedness UNKNOWN. That is all true and it is
+  ## also beside the point: NONE of those is needed. `dlssrows.nim` had
+  ## already been filling a cloned `SettingDropDown` for months by CALLING the
+  ## game's own `BaseDropDownBox::Show` through the receiver's own vtable slot
+  ## 24, and repainting the caption through the game's own `SetLabelText`.
+  ## MEASURED consequence of the old reading: 62 settings across 11 mods
+  ## rendered as captioned stubs on the deployed build 61238a816f58 while a
+  ## working mechanism for them sat in the next file.
   result = true
   if ty == "bool":
     row.kind = swkToggle
     row.implemented = true
   elif ty == "float" or ty == "int":
     row.kind = swkSlider
+    row.implemented = true
+  elif (ty == "enum" or ty == "select") and row.choices.len > 0 and
+       row.choices.len <= 16:
+    # AN ENUM IS NOW A REAL DROPDOWN, and the long paragraph above -- which
+    # concluded a choice row can only ever be a stub -- was answering the
+    # wrong question. The generic `BindTo<T>` is not needed and was never the
+    # only way in: `dlssrows.nim` fills a cloned `SettingDropDown` by CALLING
+    # the game's own `BaseDropDownBox::Show` through the RECEIVER'S OWN vtable
+    # slot 24, with all three candidate bodies byte-verified and the interface
+    # table pre-checked (`nuDropDownShow`, six proofs), and repaints the
+    # caption through the game's own `SetLabelText`. That mechanism is REUSED
+    # here, not copied; `settingspages.nim` demotes the row back to a labelled
+    # stub, loudly, if any of those proofs refuses on the live control.
+    #
+    # 1..16 is the bound `nuDropDownShow` itself enforces. A schema offering
+    # more options than that is still a stub -- and the decline below names
+    # the type, so it is not silent.
+    row.kind = swkChoice
     row.implemented = true
   else:
     row.kind = swkStub
@@ -202,6 +257,23 @@ proc miParseSetting(item: string; row: var SwRow): bool =
   if not pathGet(item, "category", grp):
     discard pathGet(item, "group", grp)
   row.category = grp
+  # THE OPTIONS, PARSED BEFORE THE KIND IS DECIDED, because the kind depends on
+  # them. `options` carries the values that are PERSISTED; `optionLabels`,
+  # when the schema ships exactly as many, carries display names only. Field
+  # names are `aowl/src/aowlspt/settings.nim`'s own (`toJson`, lines 405-410),
+  # not a guess.
+  var opts: seq[string] = @[]
+  var labels: seq[string] = @[]
+  if pathItems(item, "options", opts):
+    discard pathItems(item, "optionLabels", labels)
+    var oi = 0
+    while oi < opts.len and oi < 16:
+      row.choiceVals.add miUnquote(opts[oi])
+      if labels.len == opts.len:
+        row.choices.add miUnquote(labels[oi])
+      else:
+        row.choices.add miUnquote(opts[oi])
+      oi = oi + 1
   let drawable = miKindOf(ty, row)
   if not drawable:
     gMiDeclined = gMiDeclined + 1
@@ -220,6 +292,29 @@ proc miParseSetting(item: string; row: var SwRow): bool =
       row.bval = (cur == "1" or cur == "true")
     elif row.kind == swkSlider:
       row.fval = modSetParseF64(cur, 0.0)
+    elif row.kind == swkChoice:
+      # THE STORED VALUE IS THE OPTION STRING, so the selection is found by
+      # MATCHING it, never by parsing it as a number. A value matching no
+      # option leaves the row on option 1 and SAYS so: inventing an index for
+      # it would show the player a selection the config does not hold.
+      var found = 0
+      var ci = 0
+      while ci < row.choiceVals.len:
+        if row.choiceVals[ci] == cur:
+          found = ci + 1
+          break
+        ci = ci + 1
+      if found > 0:
+        row.fval = float64(found)
+      else:
+        row.fval = 1.0
+        okLog "mods index: setting '" & key & "' stores '" & cur &
+              "', which is NOT one of the " & $row.choiceVals.len &
+              " option(s) its own schema declares. The dropdown shows " &
+              "option 1; nothing was written, and the stored value stands " &
+              "until the player picks one."
+  elif row.kind == swkChoice:
+    row.fval = 1.0
   var lo = ""
   var hi = ""
   if pathGet(item, "min", lo):
@@ -381,6 +476,52 @@ proc miParseSlice() =
                         modGuid: gMiGuid, stub: false, note: "",
                         renderedFor: 0'u64)
       page.rows = miGroupRows(gMiRaw)
+      # THE PER-MOD ENABLED SWITCH, THE FIRST ROW OF THE PAGE.
+      #
+      # MEASURED ABSENCE, deployed build 61238a816f58: not one 'ENABLED row'
+      # or 'V3 ENABLE' line in a run with the MODS tab open for two minutes,
+      # so no mod could be switched on or off from the tab at all. The reason
+      # is structural rather than a bug in the switch: `modSetParseSchema`
+      # (modsettingsrender.nim) prepends it, and these pages do not come from
+      # there -- they are built HERE, from one fetch of the index, and this
+      # was the one place a page could be born without one.
+      #
+      # Same rule as the other builder, deliberately identical: the state is
+      # SEEDED FROM THE MANAGER and never guessed. `overlayModEnabled` answers
+      # with four states, two of which are not booleans; when it has no answer
+      # for this guid NO ROW IS ADDED and the log says which of the two
+      # not-an-answer cases it was. A switch seeded from a guess writes the
+      # guess on the next save.
+      let ms = overlayModEnabled(gMiGuid)
+      if ms == ovModEnabled or ms == ovModDisabled:
+        var er = SwRow()
+        er.key = "__enabled"
+        er.label = "Enabled"
+        er.kind = swkToggle
+        er.bval = (ms == ovModEnabled)
+        er.implemented = true
+        er.enableRow = true
+        var withEnable: seq[SwRow] = @[er]
+        var wi = 0
+        while wi < page.rows.len and withEnable.len < cSwMaxRows:
+          withEnable.add page.rows[wi]
+          wi = wi + 1
+        if withEnable.len < page.rows.len + 1:
+          warn "mods index: the ENABLED switch for '" & gMiGuid & "' cost " &
+               "the last schema row its place -- the page is at the " &
+               $cSwMaxRows & "-row cap. The switch is shown and one setting " &
+               "is NOT. Raise cSwMaxRows rather than leaving this unsaid."
+        page.rows = withEnable
+        gMiEnabled = gMiEnabled + 1
+      else:
+        gMiNoEnable = gMiNoEnable + 1
+        if gMiNoEnableFirst.len == 0:
+          gMiNoEnableFirst = gMiGuid & " (" &
+            (if ms == ovModHostOnly:
+               "the mod manager has not answered about this guid -- the row " &
+               "this process holds is its own report of what it LOADED, " &
+               "which is not the selection"
+             else: "the mod manager has no row for it at all") & ")"
       swPageRegister(page)
       gMiPages = gMiPages + 1
       gMiRows = gMiRows + page.rows.len
@@ -451,6 +592,24 @@ proc miParseReport() =
           "that is to parse on the overlay worker and hand this thread a " &
           "built table -- stated here so the decision is made against a " &
           "number rather than a feeling."
+    if gMiEnabled > 0:
+      okLog "mods index ENABLE ROW: " & $gMiEnabled & " of " &
+            $gMiPages & " page(s) carry a per-mod ENABLED switch as their " &
+            "FIRST row, seeded from the mod manager's own state and bound " &
+            "through sbdRegisterEnable, whose edit goes out as " &
+            "POST /aowlspt/mods/toggle/<guid> -- the same gesture F12 " &
+            "queues. The V3 ENABLE verdict reads the manager's answer back; " &
+            "until it lands a switch is INCONCLUSIVE, not a pass." &
+            (if gMiNoEnable > 0: " " & $gMiNoEnable & " page(s) got NO " &
+               "switch, first: " & gMiNoEnableFirst & "." else: "")
+    else:
+      warn "mods index ENABLE ROW FAIL: NOT ONE of the " & $gMiPages &
+           " page(s) carries a per-mod ENABLED switch, so no mod can be " &
+           "switched on or off from this tab" &
+           (if gMiNoEnableFirst.len > 0: " -- first reason: " &
+              gMiNoEnableFirst else: "") &
+           ". This is the deployed build's measured defect, stated as a " &
+           "check that can fail rather than as silence."
     if gMiShort.len > 0:
       warn "mods index ROW VERDICT FAIL: " & $gMiShortN & " mod(s) parsed " &
            "fewer rows than they declare -- " & gMiShort &

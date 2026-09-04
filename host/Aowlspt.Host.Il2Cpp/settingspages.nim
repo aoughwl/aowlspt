@@ -107,6 +107,13 @@ type
     swkToggle                   ## a bool -> SettingToggle clone
     swkSlider                   ## a float -> SettingFloatSlider clone
     swkColor                    ## an RGB colour -> a NUIKIT-BUILT widget
+    swkChoice                   ## an enum -> a CLONED SettingDropDown, filled
+    ## by the game's own `BaseDropDownBox::Show` through the receiver's own
+    ## vtable slot 24 -- the identical mechanism `dlssrows.nim` uses, reached
+    ## through `nuDropDownOf`/`nuDropDownShow`/`nuDropDownReseat` rather than
+    ## copied. A `swkChoice` row that cannot get a dropdown donor, or whose
+    ## `Show` refuses any of its six proofs, is DEMOTED back to `swkStub` and
+    ## says so -- it is never faked out of a toggle.
     ## `swkColor` is the ONE kind here that is not a clone of a game widget.
     ## There is no colour control anywhere on a stock settings tab to clone, so
     ## it is BUILT from `nuPanel`/`nuLabel` primitives (a swatch, three channel
@@ -211,6 +218,28 @@ type
     ## the read-back is a string test that a mod author can collide with by
     ## naming a setting `__enabled`; a field cannot be collided with.
     enableRow*: bool
+    ## THE ENUM ROW'S OPTIONS, verbatim from the schema, in schema order. The
+    ## value is stored as a ONE-BASED index (`fval`) because that is what the
+    ## config and the F12 overlay already use for a choice (see
+    ## `sbdRegisterDropdown`), while the control is zero-based; the conversion
+    ## lives only at the seed and the flush.
+    choices*: seq[string]
+    ## The values PERSISTED for those options, parallel to `choices`. An
+    ## aowlspt `enum` setting stores the OPTION STRING (`aowl/src/aowlspt/
+    ## settings.nim` `enumSetting`: `default: string`, `options: seq[string]`),
+    ## while `optionLabels` -- when the schema ships them -- are display names
+    ## only. Writing the one-based INDEX instead, which is what the DLSS rows'
+    ## `sbdRegisterDropdown` flush does (its schema really is numeric), would
+    ## put a value in the mod's config that the mod's own reader rejects --
+    ## the identical defect the colour rows had when every format was
+    ## persisted as `#rrggbb`. So the index lives only on screen and in
+    ## `fval`; what crosses the wire is `choiceVals[index-1]`.
+    choiceVals*: seq[string]
+    ## This row's edits are owned by `settingsbind.nim` (it was registered
+    ## through `sbdRegister*`), so `swReadBackPage` must NOT also write it.
+    ## Two independent writers for one gesture is how a switch gets toggled
+    ## twice; the field makes that impossible rather than forbidden.
+    sbdBound*: bool
 
   SwPage* = object
     id*: string                 ## stable key, e.g. "host"
@@ -254,6 +283,27 @@ type
     scrollWhy*: string
     skipped*: int
     lastSkipWhy*: string
+    ## ---- THE GRAFT, ITS OWN TICK ---------------------------------------
+    ## MEASURED (host log 2026-09-04, every one of 11 index-driven pages):
+    ## "RENDER SLICE OVERRAN its budget -- page 'mod:aowl.tarkov' spent 62 ms
+    ## instantiating 1 row(s)". That 62-78 ms is not row cost: it is the
+    ## SettingsList clone and graft that used to run inside `begin`, landing
+    ## in the same wall-clock window as the first row and being reported as
+    ## the row's price. So the graft is now a STEP OF ITS OWN -- it runs on
+    ## its own tick, before any row, and is clocked into its own counters.
+    grafted*: bool
+    graftMs*: uint64
+    ## When this page visit began, and whether its verdict has been said.
+    ## A verdict that only fires on completion never fires for a page that
+    ## stops advancing -- which is exactly what the deployed run did: 2+
+    ## minutes with the tab open and not one RENDER VERDICT line.
+    beganAt*: uint64
+    verdictDone*: bool
+    timedOut*: bool
+    ## A dropdown control on the tab to clone for `swkChoice` rows, captured
+    ## at `begin` from the klass census. Zero -> this tab has none, and every
+    ## enum row on this page is demoted to a labelled stub that says so.
+    renderDonorDrop*: uint64
 
 ## The marker a not-yet-wired row carries. Deliberately verbose: a settings row
 ## that silently does nothing is worse than no row, and this is the project's
@@ -286,6 +336,21 @@ const cSwSliceRows = 24
 ## that overruns is reported with its worst measurement, never silently
 ## absorbed.
 const cSwSliceMs = 8'u64
+
+## HOW LONG A PAGE MAY FILL BEFORE IT MUST ACCOUNT FOR ITSELF.
+##
+## MEASURED, and this constant exists because of it: in the deployed run of
+## 2026-09-04 the MODS tab was open for over two minutes and NOT ONE
+## `RENDER VERDICT` line was printed for any of the 11 index-driven pages.
+## The verdict only ever ran on completion, so a page that stopped advancing
+## produced silence -- and silence read as "fine". A verdict that can only
+## fire when the thing worked is a check that cannot fail (CLAUDE.md 9b).
+##
+## So the verdict is now ALSO said on a deadline, once per page visit, with
+## the SHORTFALL as its subject: how many rows were asked for, how many are on
+## screen, and how long the page has been trying. It does not stop the render
+## -- the page keeps filling and its completion verdict still lands later.
+const cSwPageVerdictMs = 12000'u64
 
 ## Sanity bounds for a row that came off the wire (`modsettingsrender.nim`
 ## parses `/aowlspt/settings/<guid>` -- an HTTP response from whatever the mod
@@ -954,6 +1019,76 @@ proc swSeedToggle(control: Il2CppPtr; value: bool): bool =
   cSwCallVPB(fn, widget, (if value: 1'i32 else: 0'i32))
   result = true
 
+## THE ENUM ROW, AS A REAL DROPDOWN.
+##
+## Every step is the DLSS rows' step, reached through the shared nativeui
+## helpers rather than copied: `SettingDropDown.DropDown@0xA8`
+## (`nuDropDownOf`), the game's own `BaseDropDownBox::Show` dispatched through
+## the RECEIVER'S OWN vtable slot 24 (`nuDropDownShow`, six proofs, any of
+## which refuses), the index applied and its CAPTION read back off the live
+## TMPs (`nuDropDownReseat`), and the value bound one-based through
+## `sbdRegisterDropdown`, which writes an INTEGER on SAVE.
+##
+## Returns false with a reason for every refusal, and the caller demotes the
+## row to a labelled stub -- never to a toggle standing in for a choice.
+proc swSeedChoice(row: var SwRow; guid: string; clone: Il2CppPtr;
+                  why: var string): bool =
+  result = false
+  why = ""
+  if row.choices.len <= 0 or row.choices.len > 16:
+    why = "its schema offers " & $row.choices.len & " option(s), outside the " &
+          "1..16 the game's own Show accepts"
+    return
+  swCrumbP("nuDropDownOf for enum row '" & row.key & "' clone", clone)
+  let ddb = nuDropDownOf(clone)
+  if ddb == nil:
+    why = "SettingDropDown.DropDown @0xA8 read null or unreadable on the " &
+          "cloned row, so there is no DropDownBox to fill"
+    return
+  var w2 = ""
+  swCrumbP("nuDropDownShow for enum row '" & row.key & "'", ddb)
+  if not nuDropDownShow(ddb, row.choices, w2):
+    why = "the game's own Show refused -- " & w2
+    return
+  # ONE-BASED, like every other choice on this host (the config, the F12
+  # overlay and `sbdRegisterDropdown` all agree on that and the control is the
+  # only zero-based surface).
+  var one = int32(row.fval + 0.5)
+  if one < 1'i32: one = 1'i32
+  if one > int32(row.choices.len): one = int32(row.choices.len)
+  var w3 = ""
+  let painted = nuDropDownReseat(clone, ddb, row.choices, one, w3)
+  if not painted:
+    # NOT a refusal of the row: the selection is real and bound. What failed
+    # is the CAPTION, and saying so is the whole point -- a silently blank
+    # dropdown is exactly the reported defect.
+    warn "settings pages: enum row '" & row.key & "' is bound and selects " &
+         "option " & $one & " of " & $row.choices.len & ", but its visible " &
+         "caption could not be confirmed -- " & w3 &
+         ". Reported rather than assumed; the row still works when opened."
+  # THE BIND, AND WHY IT IS NOT `sbdRegisterDropdown`.
+  #
+  # `settingsbind.nim`'s dropdown row flushes `$int(stagedF)` -- a ONE-BASED
+  # INTEGER -- because the only schema it has ever served (`mods/dlss`) really
+  # does declare numeric choices. An aowlspt `enum` setting does not: its
+  # value is the OPTION STRING. Binding these rows there would write `2` into
+  # a config key whose owner expects `"High"`, the mod's reader would reject
+  # it, and the edit would silently revert on the next read -- exactly the
+  # colour-format defect, repeated.
+  #
+  # So an enum row is read back HERE, by this page, against the value it was
+  # seeded with, and what is written is `choiceVals[index-1]`. `seeded` is
+  # therefore TRUE (this file owns the row) and `sbdBound` FALSE.
+  row.fval = float64(one)
+  row.seeded = true
+  row.sbdBound = false
+  okLog "settings pages: enum row '" & row.key & "' rendered as a REAL " &
+        "dropdown -- " & $row.choices.len & " option(s), showing option " &
+        $one & " ('" & row.choices[int(one) - 1] & "'), filled by the game's " &
+        "own Show through the receiver's own vtable slot 24. Its edit is " &
+        "persisted as the OPTION STRING, not as an index."
+  result = true
+
 ## One-shot, so a full page does not print sixty lines.
 var gSwGeomDumped = false
 
@@ -1073,11 +1208,50 @@ var gSwSliceWorstWhere = ""
 var gSwSliceTicks = 0
 var gSwSliceOverruns = 0
 
+## THE GRAFT CLOCK, DELIBERATELY SEPARATE FROM THE ROW CLOCK.
+##
+## The graft (clone a SettingsList, reparent, find its Content) is a one-off
+## per page and costs tens of milliseconds; a row costs ~1 ms. Adding the two
+## into one number produced the deployed run's most misleading line -- 62 ms
+## "instantiating 1 row(s)" -- which reads as "rows cost 62 ms each" and is
+## false. Two clocks, two statements, and the row budget is now a statement
+## about rows.
+var gSwGraftTicks = 0
+var gSwGraftMs = 0'u64
+var gSwGraftWorstMs = 0'u64
+var gSwGraftWorstWhere = ""
+
+## Did ANY page do work on this tick? `swSliceRegistry` stops after the first
+## page that did, so one frame pays one budget -- and a graft tick counts as
+## work even though it instantiates no row. Without this a tick that grafted
+## page 1 would fall through and graft pages 2..11 as well, which is the same
+## unbounded frame the slice exists to prevent, wearing the word "slice".
+var gSwSliceWorked = false
+
 proc swSliceNote(): string =
-  "slice clock: " & $gSwSliceTicks & " tick(s), worst " & $gSwSliceWorstMs &
-    " ms" & (if gSwSliceWorstWhere.len > 0: " (" & gSwSliceWorstWhere & ")"
-             else: "") & ", budget " & $cSwSliceMs & " ms/" &
-    $cSwSliceRows & " rows, " & $gSwSliceOverruns & " overrun(s)"
+  "slice clock: " & $gSwSliceTicks & " row tick(s), worst " &
+    $gSwSliceWorstMs & " ms" &
+    (if gSwSliceWorstWhere.len > 0: " (" & gSwSliceWorstWhere & ")"
+     else: "") & ", budget " & $cSwSliceMs & " ms/" &
+    $cSwSliceRows & " rows, " & $gSwSliceOverruns & " overrun(s); graft " &
+    "clock: " & $gSwGraftTicks & " tick(s), " & $gSwGraftMs & " ms total, " &
+    "worst " & $gSwGraftWorstMs & " ms" &
+    (if gSwGraftWorstWhere.len > 0: " (" & gSwGraftWorstWhere & ")" else: "") &
+    " -- the graft is the per-page scroll clone and is NOT row cost"
+
+proc swGraftRecord(pageId: string; ms: uint64) =
+  inc gSwGraftTicks
+  gSwGraftMs = gSwGraftMs + ms
+  if ms > gSwGraftWorstMs:
+    gSwGraftWorstMs = ms
+    gSwGraftWorstWhere = "page '" & pageId & "'"
+  if ms > cSwSliceMs:
+    okLog "settings pages: page '" & pageId & "' GRAFT tick cost " & $ms &
+          " ms (the SettingsList clone and reparent), over the " &
+          $cSwSliceMs & " ms row budget. Reported as a graft, on its own " &
+          "tick, and NOT charged to the first row -- the deployed run " &
+          "before this change said '62 ms instantiating 1 row(s)', which " &
+          "made a one-off page cost read as a per-row cost."
 
 proc swSliceRecord(pageId: string; ms: uint64; rows: int) =
   inc gSwSliceTicks
@@ -1129,6 +1303,8 @@ proc swRenderVerdict(page: var SwPage) =
   ## INCONCLUSIVE is the third outcome and is never a pass: a row whose rect
   ## could not be read was not observed either way, and a page whose container
   ## has no readable rect was not measured at all.
+  if page.verdictDone: return
+  page.verdictDone = true
   let want = page.rows.len
   let got = page.drawn
   var shortfall = want - page.skipped - got
@@ -1241,6 +1417,12 @@ proc swRenderPageBegin(tabPtr, parentGo: Il2CppPtr; page: var SwPage): bool =
   page.lastSkipWhy = ""
   page.scrollGo = 0'u64
   page.scrollWhy = ""
+  page.grafted = false
+  page.graftMs = 0'u64
+  page.verdictDone = false
+  page.timedOut = false
+  page.beganAt = cNowMs()
+  page.renderDonorDrop = 0'u64
   swCrumb("STAGE: swRenderPageBegin -- swAnyDonor for page '" & page.id & "'")
   var donorKind = ""
   let donorToggle = swAnyDonor(tabPtr, donorKind)
@@ -1253,13 +1435,39 @@ proc swRenderPageBegin(tabPtr, parentGo: Il2CppPtr; page: var SwPage): bool =
   okLog "settings pages: page '" & page.id & "' donor=0x" &
         hexOf(cast[uint64](donorToggle)) & " chosen by " & donorKind &
         "; parent=0x" & hexOf(cast[uint64](parentGo))
-  # THE SCROLL HOST, BEFORE THE HEADING, so the heading lands inside it too.
-  #
-  # EVERY page needs one. `aowl.tarkov` is 949 rows; in the authored
-  # fixed-height panel rows 20..949 are not "below the fold", they are
-  # unreachable -- there is nothing to scroll them into view with. A page that
-  # could not get one is still rendered (a truncated page beats no page) and
-  # says so, in its own warning and again in its verdict.
+  page.renderDonor = cast[uint64](donorToggle)
+  page.renderParent = cast[uint64](parentGo)
+  # A DROPDOWN DONOR, for `swkChoice` rows. Optional: a tab with no stock
+  # dropdown yields zero here and every enum row on this page is demoted to a
+  # labelled stub that names the reason. Never substituted with the toggle
+  # donor -- a control that renders and cannot select is the defect this
+  # repository produces most often.
+  let donorDrop = swFindDonor(tabPtr, gSwKlassDropdown)
+  if donorDrop != nil:
+    page.renderDonorDrop = cast[uint64](donorDrop)
+  page.begun = true
+  okLog "settings pages: page '" & page.id & "' BEGUN -- donor and dropdown " &
+        "donor captured, nothing instantiated yet. The scroll graft is the " &
+        "NEXT tick's work and is clocked separately from the rows; " &
+        "dropdownDonor=0x" & hexOf(cast[uint64](donorDrop)) &
+        " (0x0 -> this tab has no stock dropdown to clone and every enum " &
+        "row here will be a labelled stub)."
+  result = true
+
+proc swRenderPageGraft(page: var SwPage) =
+  ## THE GRAFT, ON ITS OWN TICK. Clones the SettingsList that makes the page
+  ## scroll, reparents it, draws the heading, and stops. NO schema row is
+  ## instantiated here, which is the whole point: it is the one expensive
+  ## step per page and it is now measured as itself.
+  ##
+  ## EVERY page needs a scroll host. `aowl.tarkov` is 949 rows; in the
+  ## authored fixed-height panel rows 20..949 are not "below the fold", they
+  ## are unreachable. A page that could not get one is still rendered (a
+  ## truncated page beats no page) and says so, in its own warning and again
+  ## in its verdict.
+  let t0 = cNowMs()
+  let parentGo = cast[Il2CppPtr](page.renderParent)
+  let donorToggle = cast[Il2CppPtr](page.renderDonor)
   var rowParent = parentGo
   var contentGo: Il2CppPtr = nil
   var scrollNote = ""
@@ -1277,17 +1485,18 @@ proc swRenderPageBegin(tabPtr, parentGo: Il2CppPtr; page: var SwPage): bool =
          scrollNote & ". Its rows go into the fixed-height panel, so any row " &
          "past the bottom edge is UNREACHABLE, not merely off-screen. " &
          $page.rows.len & " row(s) are about to be rendered into it."
-  page.renderDonor = cast[uint64](donorToggle)
   page.renderParent = cast[uint64](rowParent)
   swCrumb("render the heading row for page '" & page.id & "'")
   discard swCloneRow(donorToggle, rowParent, page.title)
-  page.begun = true
+  page.grafted = true
+  page.graftMs = cNowMs() - t0
+  swGraftRecord(page.id, page.graftMs)
   if page.stub:
     discard swCloneRow(donorToggle, rowParent, page.note & cSwNotDone)
     page.complete = true
     okLog "settings pages: page '" & page.id & "' is a STUB -- heading and " &
           "note rendered, no rows bound"
-  result = true
+    swRenderVerdict(page)
 
 proc swRenderPageSlice(page: var SwPage): int =
   ## AT MOST ONE FRAME BUDGET OF WORK. Returns rows instantiated this tick.
@@ -1298,6 +1507,15 @@ proc swRenderPageSlice(page: var SwPage): int =
   ## progress every time.
   result = 0
   if not page.begun or page.complete: return
+  # THE GRAFT IS A TICK OF ITS OWN, and it is the FIRST thing a begun page
+  # does. Returning 0 here is correct and is not "no progress": the registry
+  # reads `gSwSliceWorked`, not the row count, precisely so a graft cannot be
+  # mistaken for an idle page and cannot be followed by ten more grafts in the
+  # same frame.
+  if not page.grafted:
+    gSwSliceWorked = true
+    swRenderPageGraft(page)
+    return
   let donorToggle = cast[Il2CppPtr](page.renderDonor)
   let rowParent = cast[Il2CppPtr](page.renderParent)
   if donorToggle == nil or rowParent == nil or
@@ -1313,6 +1531,7 @@ proc swRenderPageSlice(page: var SwPage): int =
     return
   let t0 = cNowMs()
   var thisTick = 0
+  gSwSliceWorked = true
   while page.nextRow < page.rows.len and page.nextRow < cSwMaxRows and
         thisTick < cSwSliceRows:
     let i = page.nextRow
@@ -1328,13 +1547,73 @@ proc swRenderPageSlice(page: var SwPage): int =
     if not page.rows[i].implemented:
       text = text & cSwNotDone
     swCrumb("render row " & $i & " of " & $page.rows.len & " ('" & text & "')")
-    let clone = swCloneRow(donorToggle, rowParent, text)
+    # WHICH DONOR THIS ROW IS COPIED FROM. An enum row needs a stock
+    # `SettingDropDown` to clone; a clone of a toggle has no DropDownBox at
+    # 0xA8 and every dropdown call on it would be a read of a different
+    # layout. If this tab has no dropdown, the row is demoted here -- before
+    # anything is instantiated -- rather than cloned into something it is not.
+    var donorForRow = donorToggle
+    if page.rows[i].kind == swkChoice:
+      if page.renderDonorDrop != 0'u64:
+        donorForRow = cast[Il2CppPtr](page.renderDonorDrop)
+        if not duOk(donorForRow, 0x20'i32):
+          donorForRow = donorToggle
+          page.renderDonorDrop = 0'u64
+      if page.renderDonorDrop == 0'u64:
+        page.rows[i].kind = swkStub
+        page.rows[i].implemented = false
+        text = page.rows[i].label & cSwNotDone
+        warn "settings pages: row '" & page.rows[i].key & "' declares an " &
+             "enum and this tab has NO stock SettingDropDown to clone " &
+             "(klass census dropdown=0x" & hexOf(gSwKlassDropdown) &
+             "), so it is drawn as a labelled stub. Nothing was cloned off a " &
+             "toggle to stand in for it."
+    let clone = swCloneRow(donorForRow, rowParent, text)
     if clone != nil:
       page.rows[i].clone = cast[uint64](clone)
       page.rows[i].relabelled = false
       if page.rows[i].kind == swkToggle:
         swCrumbP("swSeedToggle for row '" & text & "' clone", clone)
         page.rows[i].seeded = swSeedToggle(clone, page.rows[i].bval)
+        if page.rows[i].enableRow and page.modGuid.len > 0:
+          # THE PER-MOD ENABLED SWITCH, BOUND THE WAY F12 WRITES IT.
+          # `sbdRegisterEnable` puts the row on `settingsbind.nim`'s table, so
+          # the SAVE gesture queues `POST /aowlspt/mods/toggle/<guid>` (commit
+          # 249a843's path) and the V3 ENABLE verdict reads the manager's own
+          # answer back. When it refuses, the row stays on this file's own
+          # read-back path (`swReadBackPage`) instead -- one writer either
+          # way, never two.
+          page.rows[i].sbdBound =
+            sbdRegisterEnable(page.modGuid, clone, page.rows[i].bval)
+          if page.rows[i].sbdBound:
+            okLog "settings pages: page '" & page.id & "' ENABLED row bound " &
+                  "through sbdRegisterEnable -- its edit goes out on SAVE as " &
+                  "POST /aowlspt/mods/toggle/" & page.modGuid &
+                  ", and the V3 ENABLE verdict reads the mod manager's own " &
+                  "answer back. This row is the FIRST row of the page."
+          else:
+            warn "settings pages: page '" & page.id & "' ENABLED row is drawn " &
+                 "but settingsbind REFUSED to bind it (its reason is logged " &
+                 "above as a settings bind fault). The switch falls back to " &
+                 "this file's own read-back, which still queues the same " &
+                 "toggle -- but there is no V3 ENABLE verdict for it."
+      elif page.rows[i].kind == swkChoice:
+        # AN ENUM ROW, AS A REAL DROPDOWN. Same mechanism as the DLSS rows:
+        # `SettingDropDown.DropDown@0xA8` -> the game's own
+        # `BaseDropDownBox::Show` through the receiver's own vtable slot 24,
+        # then the ONE-BASED config value seeded through
+        # `sbdRegisterDropdown`, which reads it back through the OTHER
+        # function (`get_CurrentIndex`).
+        var why = ""
+        if not swSeedChoice(page.rows[i], page.modGuid, clone, why):
+          page.rows[i].kind = swkStub
+          page.rows[i].implemented = false
+          page.rows[i].seeded = false
+          warn "settings pages: row '" & page.rows[i].key & "' declares an " &
+               "enum and is DEMOTED to a labelled stub -- " & why &
+               ". It is not faked out of a toggle: a control that renders " &
+               "and selects nothing is worse than a row that says it is not " &
+               "wired."
       elif page.rows[i].kind == swkColor:
         # THE COLOUR WIDGET. Not a clone: there is no colour control on any
         # stock settings tab to clone, so it is BUILT on top of the row's own
@@ -1430,6 +1709,42 @@ proc swRenderPage(tabPtr, parentGo: Il2CppPtr; page: var SwPage): int =
   if not swRenderPageBegin(tabPtr, parentGo, page): return
   result = swRenderPageSlice(page)
 
+proc swVerdictWatch(pages: var seq[SwPage]; who: string) =
+  ## THE BOUNDED VERDICT. Said once per page visit for a page that has been
+  ## filling for longer than `cSwPageVerdictMs` and has not completed --
+  ## because the deployed run proved that "print the verdict when the page
+  ## completes" prints nothing at all when the page does not.
+  ##
+  ## It names the SHORTFALL and the elapsed time, and it is a WARNING: a page
+  ## still short of its rows after twelve seconds is a player-visible defect
+  ## whether or not it eventually finishes.
+  let now = cNowMs()
+  var i = 0
+  while i < pages.len and i < 32:                 # rule 4: capped
+    if pages[i].begun and not pages[i].complete and not pages[i].timedOut and
+       pages[i].beganAt > 0'u64 and now - pages[i].beganAt > cSwPageVerdictMs:
+      pages[i].timedOut = true
+      let want = pages[i].rows.len
+      let got = pages[i].drawn
+      var short = want - pages[i].skipped - got
+      if short < 0: short = 0
+      warn "settings pages RENDER VERDICT TIMEOUT (" & who & "): page '" &
+           pages[i].id & "'" &
+           (if pages[i].modGuid.len > 0: " (mod " & pages[i].modGuid & ")"
+            else: "") & " has been filling for " &
+           $(now - pages[i].beganAt) & " ms and is STILL NOT COMPLETE -- " &
+           $got & " row(s) on screen of " & $want & " parsed (" &
+           $pages[i].skipped & " skipped), so " & $short &
+           " row(s) of this page are NOT on screen right now. Graft: " &
+           (if pages[i].grafted: $pages[i].graftMs & " ms, done"
+            else: "NOT RUN YET -- the page has not even been granted its " &
+                  "graft tick, which means this registry's drain is not " &
+                  "being called") & ". [" & swSliceNote() &
+           "] This is the bounded statement the completion verdict could " &
+           "never make; the page keeps filling and its own verdict still " &
+           "follows if it finishes."
+    i = i + 1
+
 proc swSliceRegistry(pages: var seq[SwPage]; who: string): int =
   ## THE PER-TICK DRAIN, over one registry. Read-modify-write per element, for
   ## the aliasing reason `swPagesOnTabBuilt` documents at length: a scalar
@@ -1440,13 +1755,18 @@ proc swSliceRegistry(pages: var seq[SwPage]; who: string): int =
   ## three pages of 24 rows in one frame is three times the budget wearing the
   ## word "slice".
   result = 0
+  swVerdictWatch(pages, who)
+  gSwSliceWorked = false
   var i = 0
   while i < pages.len and i < 32:                 # rule 4: capped
     if pages[i].begun and not pages[i].complete:
       var pg = pages[i]
       let n = swRenderPageSlice(pg)
       pages[i] = pg
-      if n > 0 or pg.complete:
+      # STOP ON WORK, NOT ON ROWS. A graft tick renders zero rows and is the
+      # most expensive tick a page has; reading `n > 0` as "did something"
+      # would let one frame graft every page in the registry.
+      if gSwSliceWorked or pg.complete:
         result = n
         return
     i = i + 1
@@ -1615,7 +1935,11 @@ proc swReadBackPage(page: var SwPage) =
   var i = 0
   while i < page.rows.len:
     if page.rows[i].clone != 0'u64 and page.rows[i].seeded and
-       page.rows[i].kind == swkToggle:
+       page.rows[i].kind == swkToggle and not page.rows[i].sbdBound:
+      # `sbdBound` rows belong to `settingsbind.nim` -- it staged them, it
+      # flushes them on SAVE and it states the V3 verdict. Reading one here
+      # too would give a single gesture two independent writers, which for the
+      # ENABLED switch means toggling the mod twice.
       let control = cast[Il2CppPtr](page.rows[i].clone)
       swCrumbP("read back row '" & page.rows[i].key & "' clone", control)
       var ok = false
@@ -1662,6 +1986,32 @@ proc swReadBackPage(page: var SwPage) =
           page.rows[i].bval = live
         elif swSetHostFlag(page.rows[i].key, live):
           page.rows[i].bval = live
+    elif page.rows[i].kind == swkChoice and page.rows[i].seeded and
+         page.rows[i].clone != 0'u64:
+      # THE ENUM ROW'S READ-BACK. The index comes from the GAME'S OWN
+      # `get_CurrentIndex` on the live DropDownBox -- a different function
+      # from the `set_CurrentIndex` that seeded it -- so this is a reading of
+      # the finished state and not a comparison against our own write.
+      let ctrl = cast[Il2CppPtr](page.rows[i].clone)
+      let ddb = nuDropDownOf(ctrl)
+      if ddb != nil:
+        let (okIdx, zero) = nuDropDownIndex(ddb)
+        let one = zero + 1'i32
+        if okIdx and one >= 1'i32 and int(one) <= page.rows[i].choiceVals.len and
+           float64(one) != page.rows[i].fval:
+          let val = page.rows[i].choiceVals[int(one) - 1]
+          okLog "settings pages: row '" & page.rows[i].key & "' changed " &
+                "option " & $int(page.rows[i].fval) & " -> " & $one &
+                " in game (persisted as the option STRING '" & val &
+                "', which is what an aowlspt enum setting stores)"
+          if page.modGuid.len > 0:
+            modSetQueueWrite(page.modGuid, page.rows[i].key, val)
+            page.rows[i].fval = float64(one)
+          else:
+            warn "settings pages: row '" & page.rows[i].key & "' is an enum " &
+                 "on a HOST page, and this host has no string-valued flag " &
+                 "writer. The selection moved on screen and NOTHING was " &
+                 "persisted; said out loud rather than dropped."
     elif page.rows[i].kind == swkColor and page.rows[i].seeded and
          page.rows[i].cwIdx > 0'i32:
       # THE COLOUR ROW'S READ-BACK. Deliberately the same shape as the toggle
