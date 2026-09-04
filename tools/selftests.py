@@ -203,6 +203,13 @@ ITEMS = [
       note="proves markers.py cannot answer PRESENT to everything"),
     T("test_hostcfg_falsifier.py", "fast",
       note="proves hostcfg.py --selftest CAN fail"),
+    # MEASURED 2026-09-04: `hostcfg.py keys` printed `default off` for every
+    # boolean, including the three readBoolKeyDef(..., true) flags that
+    # flagaudit.py listed as DEFAULT ON in the same second. This asserts the
+    # default column against a PLAIN GREP of host/*.nim -- not against either
+    # tool -- and that a non-literal default reads INCONCLUSIVE, never off.
+    T("test_hostcfg.py", "fast",
+      note="hostcfg's default column vs an independent grep of host/*.nim"),
     T("test_uihooks_falsifier.py", "fast",
       note="proves uihooks_check selftest CAN fail"),
     T("test_symtab.py", "fast",
@@ -323,6 +330,12 @@ VERIFIERS = [
       "read, so PRESENT is not the only reachable answer"),
     V("hostcfg.py", "test_hostcfg_falsifier.py",
       "breaks the key table and asserts hostcfg's own --selftest goes red"),
+    V("test_hostcfg.py", "test_hostcfg.py --falsify",
+      "restores the pre-2026-09-04 `keys` column (the default hardcoded to "
+      "`off`) and asserts test_hostcfg.py then reports FAIL and exit 1 -- "
+      "measured 13 of 30 cases red. Its ground truth is a grep of the host "
+      "sources, so hostcfg and flagaudit sharing one parser cannot make it "
+      "pass vacuously"),
     V("test_mqpolicy.py", "test_mqpolicy.py",
       "case F recompiles the SAME header with -DAOWL_MQ_FALSIFY, restoring the "
       "pre-2026-09-02 'a stalled drain may run its work here' policy, and "

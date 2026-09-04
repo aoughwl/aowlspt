@@ -90,17 +90,81 @@ INT_KEYS = {
     "modSyncMs": 3000,
 }
 
-BOOL_CALL = re.compile(r'readBoolKey(?:Def)?\(\s*"([A-Za-z0-9_]+)"')
-# `readBoolKeyDef(key, true)` defaults ON when the key is ABSENT. This tool
-# printed `off` for every absent bool, so four keys that the host runs with ON
-# out of the box -- catchErrorDialogs, modLoadScreen, deferModLoad,
-# forceOfflinePractice -- read as off here. That is the confidently-wrong shape
-# CLAUDE.md 9b is about: the number was not a guess, it was a wrong measurement
-# of the wrong thing.
-BOOL_DEF = re.compile(
-    r'readBoolKeyDef\(\s*"([A-Za-z0-9_]+)"\s*,\s*(true|false)\s*\)')
-# Populated by scrape_keys() from the source, never hand-maintained.
+# THE BOOLEAN DEFAULT IS NOT PARSED HERE. It is parsed by flagaudit.py, and
+# this tool imports that parser rather than carrying a second copy.
+#
+# MEASURED 2026-09-04: `hostcfg.py keys` printed `default off` for EVERY bool,
+# including forceOfflinePractice / uiShowEvents / settingsNativePostFx, all of
+# which are `readBoolKeyDef(name, true)` and which flagaudit.py listed
+# correctly as DEFAULT ON at the same moment. Two implementations of "what is
+# this flag's default" disagreed, and the wrong one was the one a human reads
+# before deciding whether a feature is live. So there is now ONE: flagaudit's
+# `CALL_RE` over `strip_nim`-ed source, which also excludes commented-out call
+# sites (hostcfg's old regex did not) and, unlike the old `BOOL_DEF`, SEES a
+# default that is not a literal instead of silently skipping it.
+#
+# Three states, never two: True / False / None. None is INCONCLUSIVE -- the
+# default is an expression, or two call sites disagree, or the key is read by a
+# hand-rolled needle with no default this tool can see (bridgeStaticRva). None
+# must never be rendered as `off`; that is the bug above, re-spelled.
+sys.path.insert(0, HERE)
+import flagaudit  # noqa: E402  (needs HERE on sys.path)
+
+BOOL_CALL = flagaudit.CALL_RE
+# {key: True|False|None}, and why, when None. Populated by scrape_keys() from
+# the source, never hand-maintained.
+BOOL_DEFAULTS = {}
+BOOL_DEFAULT_WHY = {}
+# Kept as a derived VIEW of BOOL_DEFAULTS so existing callers keep working; a
+# key whose default is INCONCLUSIVE is in neither this set nor its complement
+# in any meaningful sense, so consult BOOL_DEFAULTS when that matters.
 BOOL_DEFAULT_TRUE = set()
+
+
+def bool_default(key):
+    """(value, why) -- value is True / False / None(=INCONCLUSIVE)."""
+    return BOOL_DEFAULTS.get(key, None), BOOL_DEFAULT_WHY.get(
+        key, "no readBoolKey/readBoolKeyDef call site was parsed for this key, "
+             "so its default was NOT determined")
+
+
+def default_str(key, kind):
+    """The default column, honestly, for any kind of key."""
+    if kind == "int":
+        return str(INT_KEYS.get(key, 0))
+    if kind == "str":
+        return '""'
+    v, _why = bool_default(key)
+    return "on" if v is True else ("off" if v is False else "INCONCLUSIVE")
+
+
+def _note_bool_site(name, default_expr, is_def, where):
+    """Fold one call site into BOOL_DEFAULTS, three-state."""
+    if not is_def:
+        val, why = False, None          # readBoolKey has no default: OFF
+    elif default_expr == "true":
+        val, why = True, None
+    elif default_expr == "false":
+        val, why = False, None
+    else:
+        val = None
+        why = ("readBoolKeyDef's default at %s is %r, not the literal `true` "
+               "or `false` -- it cannot be read offline" % (where,
+                                                            default_expr))
+    if name in BOOL_DEFAULTS:
+        prev = BOOL_DEFAULTS[name]
+        if prev is None:
+            return
+        if val is None or val != prev:
+            BOOL_DEFAULTS[name] = None
+            BOOL_DEFAULT_WHY[name] = why or (
+                "two call sites disagree about the default for %s (one says "
+                "%s, %s says %s)" % (name, "on" if prev else "off", where,
+                                     "on" if val else "off"))
+        return
+    BOOL_DEFAULTS[name] = val
+    if why:
+        BOOL_DEFAULT_WHY[name] = why
 # String-valued flags go through `readStrKey`, a shape `scrape_keys` did not
 # know about at all, so every string key was invisible to this tool -- measured
 # missing: `launchProfileId` (aowlhost.nim) and `uxBetaOverlayPos`
@@ -150,6 +214,10 @@ def scrape_keys(hostdir):
     happening to appear somewhere in the same file.
     """
     keys = {}
+    # Scraping is per-directory: a second call against a different --host must
+    # not inherit the first one's defaults.
+    BOOL_DEFAULTS.clear()
+    BOOL_DEFAULT_WHY.clear()
     files = host_sources(hostdir)
     if not files:
         sys.exit("no host sources under %s -- pass --host PATH" % hostdir)
@@ -158,17 +226,28 @@ def scrape_keys(hostdir):
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             text = f.read()
         hit = False
-        for m in BOOL_CALL.finditer(text):
-            keys.setdefault(m.group(1), ("bool", os.path.basename(path)))
+        # flagaudit's own scan: comments and doc-comments stripped, so a
+        # commented-out call site is not mistaken for a live flag.
+        stripped = flagaudit.strip_nim(text)
+        for m in BOOL_CALL.finditer(stripped):
+            name = m.group(2)
+            keys.setdefault(name, ("bool", os.path.basename(path)))
+            where = "%s:%d" % (os.path.basename(path),
+                               stripped.count("\n", 0, m.start()) + 1)
+            _note_bool_site(name, (m.group(3) or "").strip(),
+                            bool(m.group(1)), where)
             hit = True
-        for m in BOOL_DEF.finditer(text):
-            # A default of `true` overrides the assumed-off entry above. Last
-            # writer does not win here: an explicit default is always better
-            # evidence than the absence of one.
-            if m.group(2) == "true":
-                BOOL_DEFAULT_TRUE.add(m.group(1))
         for m in NEEDLE_LIT.finditer(text):
+            # A hand-rolled needle (readStaticBridgeEnabled). There is no
+            # default argument to read, so the default stays INCONCLUSIVE
+            # rather than being assumed off.
             keys.setdefault(m.group(1), ("bool", os.path.basename(path)))
+            BOOL_DEFAULTS.setdefault(m.group(1), None)
+            BOOL_DEFAULT_WHY.setdefault(
+                m.group(1),
+                "read by a hand-rolled needle in %s, not by readBoolKey/"
+                "readBoolKeyDef, so there is no default argument to parse"
+                % os.path.basename(path))
             hit = True
         for m in STR_CALL.finditer(text):
             keys.setdefault(m.group(1), ("str", os.path.basename(path)))
@@ -187,6 +266,8 @@ def scrape_keys(hostdir):
     # they are named explicitly, and asserted to still be present in the source.
     for k, _d in INT_KEYS.items():
         keys[k] = ("int", "aowlhost.nim")
+    BOOL_DEFAULT_TRUE.clear()
+    BOOL_DEFAULT_TRUE.update(k for k, v in BOOL_DEFAULTS.items() if v is True)
     return keys
 
 
@@ -597,13 +678,46 @@ def insert_key(text, key, newval):
 
 def cmd_keys(args, keys, C):
     print("keys the host actually parses (scraped from %s):" % args.host)
+    # The file is read if it is there, so the `value` column says what THIS
+    # machine boots with; if it is not, the column says so instead of printing
+    # the default a second time under a different heading.
+    try:
+        _p, text = read_cfg(args.root)
+    except SystemExit:
+        text = None
+    if text is None:
+        print("  (no aowlspt-host.json at %s -- the `value` column could not "
+              "be read; defaults only)" % args.root)
+    incon = 0
     for k in sorted(keys):
         kind, where = keys[k]
-        d = INT_KEYS.get(k, '""' if kind == "str" else "off")
-        print("  %-24s %-5s default %-8s %s%s%s"
-              % (k, kind, d, DIM if C else "", where, RESET if C else ""))
+        d = default_str(k, kind)
+        if text is None:
+            val = "?"
+        else:
+            present, raw, truthy = value_of(text, k)
+            if kind == "bool":
+                if present:
+                    val = "on" if truthy else "off"
+                else:
+                    val = d           # already "on"/"off"/"INCONCLUSIVE"
+            elif present:
+                val = raw
+            else:
+                val = d
+        if kind == "bool" and d == "INCONCLUSIVE":
+            incon += 1
+        print("  %-24s %-5s default %-12s value %-12s %s%s%s"
+              % (k, kind, d, val, DIM if C else "", where, RESET if C else ""))
     print("\n%d key(s). Anything not on this list is IGNORED by the host, "
           "silently." % len(keys))
+    if incon:
+        print("%d boolean key(s) read INCONCLUSIVE -- their default could not "
+              "be parsed offline, and printing `off` for those is exactly the "
+              "defect this column was fixed for. Why, per key:" % incon)
+        for k in sorted(keys):
+            if keys[k][0] == "bool" and default_str(k, "bool") == "INCONCLUSIVE":
+                print("  %-24s %s" % (k, bool_default(k)[1]))
     return 0
 
 
@@ -638,12 +752,22 @@ def cmd_show(args, keys, C, only_diff=False):
     for k in sorted(keys):
         kind, _where = keys[k]
         present, raw, truthy = value_of(text, k)
-        default = INT_KEYS.get(k, k in BOOL_DEFAULT_TRUE)
+        bd, bd_why = bool_default(k) if kind == "bool" else (None, None)
+        default = INT_KEYS.get(k, bd)
+        unknown_default = False
         if kind == "bool":
-            # An ABSENT bool is not automatically off: four keys are read with
-            # readBoolKeyDef(..., true) and default ON.
-            effective = truthy if present else (k in BOOL_DEFAULT_TRUE)
-            is_default = (effective == (k in BOOL_DEFAULT_TRUE))
+            # An ABSENT bool is not automatically off: several keys are read
+            # with readBoolKeyDef(..., true) and default ON -- and a key whose
+            # default this tool cannot parse is INCONCLUSIVE, not off.
+            if present:
+                effective = truthy
+            elif bd is None:
+                effective, unknown_default = False, True
+            else:
+                effective = bd
+            # An unparseable default is never "the default": it shows up in
+            # `diff` so it cannot hide.
+            is_default = (bd is not None and effective == bd)
         elif kind == "str":
             # This branch did not exist: string keys fell into the integer one,
             # where `int(re.sub(...))` threw and the value printed as the
@@ -665,9 +789,15 @@ def cmd_show(args, keys, C, only_diff=False):
                    else "%soff%s" % (DIM if C else "", RESET if C else "")
         else:
             mark = str(effective)
-        note = "" if present else ("%s(absent -> default)%s"
-                                   % (DIM if C else "", RESET if C else ""))
-        if eff and kind == "bool":
+        note = "" if present else ("%s(absent -> default %s)%s"
+                                   % (DIM if C else "",
+                                      default_str(k, kind),
+                                      RESET if C else ""))
+        if unknown_default:
+            mark = "%s???%s" % (YELLOW if C else "", RESET if C else "")
+            note = ("INCONCLUSIVE: absent from the file and its default could "
+                    "not be parsed -- %s" % bd_why)
+        if eff and kind == "bool" and not unknown_default:
             ev, why, incon = eff.get(k, (effective, None, False))
             if incon:
                 note = ("INCONCLUSIVE: the boot rules disagree about this key "
@@ -707,8 +837,11 @@ def cmd_get(args, keys, C):
     present, raw, truthy = value_of(text, k)
     kind = keys[k][0]
     if not present:
-        print("%s: absent -> default %s"
-              % (k, INT_KEYS.get(k, "on" if k in BOOL_DEFAULT_TRUE else "off")))
+        d = default_str(k, kind)
+        print("%s: absent -> default %s" % (k, d))
+        if d == "INCONCLUSIVE":
+            print("  the value the host boots with was NOT determined: %s"
+                  % bool_default(k)[1])
     else:
         print("%s: %s   (host reads this as %s)"
               % (k, raw, ("on" if truthy else "off") if kind == "bool" else raw))
