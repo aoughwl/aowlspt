@@ -2263,10 +2263,23 @@ proc modsPanelSanity() =
 ## 0.1.0 and describes the release BUNDLE, while this is the string a player
 ## reads on the menu.
 const VerBrandOurVersion = "1.0"
-const VerBrandMaxApplies = 8
+## The apply ceiling. RAISED from 8 on 2026-09-03: with the pre-menu watch
+## above, a clobber during loading is now CAUGHT rather than missed, and
+## each catch spends an apply. The 10:0x boot shows one clobber before
+## the menu; a budget of 8 could plausibly be exhausted by loading alone
+## and leave nothing for the menu rebuilds, which is the failure this
+## feature already learned once with its WALK budget.
+const VerBrandMaxApplies = 16
 ## THE STEADY-STATE cadence, once the label is ours: a cheap re-check for a
 ## clobber, not a search.
 const VerBrandEveryFrames = 120
+## THE WATCH cadence: how often the label is re-READ once it is ours and
+## before the menu epoch exists. A read is not a walk -- it is a `duOk`
+## and one string fetch -- so this is cheap, but it is not free, and 30
+## frames is the measured compromise between catching the pre-menu
+## clobber (13.6 s wide on the 10:0x boot) and touching the label every
+## frame on the Unity thread.
+const VerBrandWatchFrames = 30
 ## THE HUNTING cadence, while the label has not been reached yet. This is the
 ## whole reason the brand used to appear late: the throttle was 120 frames for
 ## BOTH phases, and the first attempt was not made until frame 120 either. At
@@ -3921,17 +3934,36 @@ proc verBrandTick() =
   var menu: Il2CppPtr = nil
   let menuEvent = modsUihMenuReady("version brand", gVerEpochSeen, menu)
   if not menuEvent:
-    if gVerSaid and (gVerCharSelMs == 0 or gVerVerdictSaid):
-      return          # branded already; only a menu rebuild can clobber it
-    # NOTE the second half of that condition. Without it, a brand that applied
-    # BEFORE the character-selection screen -- i.e. the success case -- would
-    # return here and the verdict would never be read back at all, so the check
-    # could only ever fire on failure. A verdict that cannot say PASS is not a
-    # verdict.
-    if cNowMs() - gVerT0 > VerBrandHuntMs:
-      return          # the hunt's wall-clock budget; the backstop still runs
+    # MEASURED 2026-09-03, live boot 10:0x (host log lines 328 / 432 / 433):
+    # the pre-menu hunt WORKED. The AlphaLabel resolved 62 ms after the first
+    # PreloaderUI::Update tick and the brand was applied at 0:00:15.000. The
+    # verdict at 0:00:28.641 still said FAIL, and the very next line says why:
+    # "the label was CLOBBERED back to the game's own text and has been
+    # re-applied (1 of at most 7), 13641 ms after the first apply".
+    #
+    # So the remaining defect is NOT lateness. Between the first apply and the
+    # menu epoch nothing re-checked the label, because this early-return fired
+    # the moment `gVerSaid` was set -- and the ONLY reason a tick ran at
+    # 28.641 s at all was the pending verdict. The clobber therefore stood on
+    # screen for up to 13.6 s, through the whole character-select phase.
+    #
+    # THE PRE-MENU WINDOW GETS A CHEAP STEADY-STATE WATCH. It is not a hunt:
+    # `gVerTmp` is already resolved, so one pass is a `duOk` plus one `m_text`
+    # read -- no walk, no 15 ms slice (the walk is what cost 15 ms, not the
+    # read), and nothing allocated on the game's heap. The 120-frame clobber
+    # re-check that was deleted as "polling" was correct for THIS window and
+    # wrong only for the post-menu one, where the epoch is the real event.
+    # It runs at 30 frames rather than 120 because a frame counter is not a
+    # clock and menu-load frames are long.
+    let live = gVerTmp != nil and duOk(gVerTmp, 0xE8'i32)
+    if not live and cNowMs() - gVerT0 > VerBrandHuntMs:
+      return          # the HUNT's wall-clock budget. The watch has no budget:
+                      # it is bounded by the menu epoch arriving, and it costs
+                      # one pointer check per 30 frames.
     inc gVerFrames
-    let every = (if gVerSlow: VerBrandEveryFrames else: VerBrandHuntFrames)
+    let every = (if live: VerBrandWatchFrames
+                 elif gVerSlow: VerBrandEveryFrames
+                 else: VerBrandHuntFrames)
     if gVerFrames < every:
       return
     gVerFrames = 0
