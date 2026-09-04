@@ -107,7 +107,10 @@ def main():
     # reason that had nothing to do with what they assert, and 8e PASSED
     # VACUOUSLY -- it only asks for a non-zero exit, and a crash is non-zero.
     # A check that a crash satisfies is the shape CLAUDE.md 9b is about.
-    for dep in ("litscan.py", "markers.py"):
+    # (2026-09-04: `stage.py` joined that list when deploy.py learned to
+    # deploy from `.stage/`. Same failure, same shape -- the dependency list
+    # is the thing that rots.)
+    for dep in ("litscan.py", "markers.py", "stage.py"):
         shutil.copyfile(os.path.join(HERE, dep), os.path.join(tools, dep))
     # A fake artifact shaped like the real ones: one string only as raw bytes,
     # one string ONLY as UTF-16LE, and padding so a size is reported.

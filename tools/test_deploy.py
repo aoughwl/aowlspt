@@ -41,12 +41,14 @@ import contextlib
 import shutil
 import sys
 import tempfile
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import deploy                                        # noqa: E402
 import selftests                                     # noqa: E402
+import stage                                         # noqa: E402
 
 VERBOSE = "-v" in sys.argv
 MARKER = "aowlsptTestMarkerOne"
@@ -102,6 +104,56 @@ class Bed:
         with open(self.src(i) + ".built.json", "w", encoding="utf-8",
                   newline="\n") as f:
             json.dump(doc, f, indent=1)
+
+    def stage(self, i=0, payload=None, stale=False, finished=None,
+              marker=True):
+        """Put a build into `.stage/`, the way buildlock.py does.
+
+        `payload` distinguishes one staged build from another BY ITS BYTES, so
+        a test can assert WHICH build was deployed rather than merely that
+        something was. `marker=False` stages bytes the marker check must
+        reject; `stale=True` stages a build whose sidecar says its sources
+        moved under it.
+        """
+        rel = "bin/fake%d.dll" % i
+        src = self.src(i)
+        keep = open(src, "rb").read() if os.path.isfile(src) else None
+        body = b"\x00" * 32
+        if marker:
+            body += MARKER.encode("utf-8")
+        body += (payload or "staged").encode("utf-8")
+        with open(src, "wb") as f:
+            f.write(body)
+        sha = hashlib.sha256(body).hexdigest()
+        doc = {"target": "build fake", "artifact": rel, "sha256": sha,
+               "size": len(body), "mtime": os.path.getmtime(src),
+               "started": 0,
+               "finished": time.time() if finished is None else finished,
+               "finished_h": "2026-09-04 00:00:00", "pid": 4321,
+               "git_head": "cafe" * 10,
+               "source_check": "CHANGED" if stale else "clean",
+               "stale_sources": bool(stale)}
+        with open(src + ".built.json", "w", encoding="utf-8",
+                  newline="\n") as f:
+            json.dump(doc, f, indent=1)
+        rec, why = stage.put(self.repo, "build fake", src, artifact_src=rel,
+                             name="fake%d" % i)
+        assert rec, why
+        if keep is not None:
+            with open(src, "wb") as f:
+                f.write(keep)
+            os.unlink(src + ".built.json")
+        return rec
+
+    def unbuild(self, i=0):
+        """What `aowl` does at the start of every build: remove the output."""
+        for p in (self.src(i), self.src(i) + ".built.json"):
+            if os.path.exists(p):
+                os.unlink(p)
+
+    def dst_bytes(self, i=0):
+        with open(self.dst(i), "rb") as f:
+            return f.read()
 
     def drop(self):
         shutil.rmtree(self.root, ignore_errors=True)
@@ -231,6 +283,127 @@ b = Bed()
 rc, out, calls = deploy_once(b, gate_rc=1, cached=(True, "cached green run"))
 check("cached green: does not re-run the suite",
       rc == 0 and not calls and "cached green run" in out, out[-400:])
+b.drop()
+
+
+# ---- STAGING: the 2026-09-04 race ----------------------------------------
+# MEASURED 08:58: a clean `build host` finished; before the deploy copied it,
+# a queued build took the lock and `aowl` deleted the artifact. The deploy
+# refused (correctly) and the launcher ran the OLD host DLL. Every case below
+# asserts the deployed BYTES, so "something was copied" cannot pass for "the
+# right build was copied".
+
+b = Bed()
+rec = b.stage(payload="first")
+rc, out, _ = deploy_once(b, gate_rc=0)
+check("stage: a staged build is what gets deployed",
+      rc == 0 and b"first" in b.dst_bytes() and "from STAGE" in out,
+      out[-600:])
+b.drop()
+
+# THE INCIDENT, reproduced: the stage exists, bin/ has been deleted by the
+# next build. The bytes must still reach the install.
+b = Bed()
+rec = b.stage(payload="first")
+b.unbuild()
+rc, out, _ = deploy_once(b, gate_rc=0, sha=rec["sha"])
+check("stage: --sha deploys the first build AFTER a later build deleted bin/",
+      rc == 0 and os.path.isfile(b.dst()) and b"first" in b.dst_bytes(),
+      "rc=%s\n%s" % (rc, out[-800:]))
+b.drop()
+
+# THE FALSIFIER. Identical situation with NO stage: the deploy must refuse and
+# copy nothing. Without this, the case above would pass for a deploy that had
+# been reading bin/ all along.
+b = Bed()
+b.unbuild()
+rc, out, _ = deploy_once(b, gate_rc=0)
+check("stage FALSIFIER: with bin/ deleted and NO stage, the deploy refuses",
+      rc == 3 and not os.path.exists(b.dst()),
+      "rc=%s exists=%s\n%s" % (rc, os.path.exists(b.dst()), out[-600:]))
+b.drop()
+
+# --sha that names nothing must refuse, not fall back to some other build.
+b = Bed()
+b.stage(payload="first")
+rc, out, _ = deploy_once(b, gate_rc=0, sha="0123456789ab")
+check("stage: --sha with no such stage REFUSES and copies nothing",
+      rc == 1 and not os.path.exists(b.dst()) and "no stage matches" in out,
+      "rc=%s\n%s" % (rc, out[-600:]))
+b.drop()
+
+# stale_sources is never auto-selected: the NEWER stage is stale, so the older
+# clean one must be the one that lands. Asserted on the deployed BYTES.
+b = Bed()
+b.stage(payload="clean", finished=1000.0)
+b.stage(payload="stalebuild", stale=True, finished=2000.0)
+b.unbuild()
+rc, out, _ = deploy_once(b, gate_rc=0)
+check("stage: a stale_sources stage is skipped for an older CLEAN one",
+      rc == 0 and os.path.isfile(b.dst()) and b"clean" in b.dst_bytes()
+      and b"stalebuild" not in b.dst_bytes(),
+      "rc=%s\n%s" % (rc, out[-800:]))
+check("stage: and it says which stage it skipped, and why",
+      "stale_sources" in out, out[-600:])
+b.drop()
+
+# ... and when the ONLY stage is stale, naming it explicitly is refused too.
+b = Bed()
+r = b.stage(payload="stalebuild", stale=True)
+b.unbuild()
+rc, out, _ = deploy_once(b, gate_rc=0, sha=r["sha"])
+check("stage: --sha pointing AT a stale_sources stage is refused",
+      rc == 1 and not os.path.exists(b.dst()), "rc=%s\n%s" % (rc, out[-600:]))
+b.drop()
+
+# A staged build whose MARKERS are missing is not a deployable build. The
+# older marker-bearing stage must win -- selection is not by age alone.
+b = Bed()
+b.stage(payload="good", finished=1000.0)
+b.stage(payload="nomarker", marker=False, finished=2000.0)
+b.unbuild()
+rc, out, _ = deploy_once(b, gate_rc=0)
+check("stage: a stage that fails its markers is skipped",
+      rc == 0 and os.path.isfile(b.dst()) and b"good" in b.dst_bytes(),
+      "rc=%s\n%s" % (rc, out[-800:]))
+b.drop()
+
+# The escape hatch, and it must be visible.
+b = Bed()
+b.stage(payload="first")
+rc, out, _ = deploy_once(b, gate_rc=0, no_stage=True)
+check("stage: --no-stage deploys from bin/ and says so",
+      rc == 0 and b"first" not in b.dst_bytes() and "--no-stage" in out,
+      "rc=%s\n%s" % (rc, out[-600:]))
+b.drop()
+
+# --stage-only refuses instead of falling back; the default does fall back,
+# loudly -- artifacts built before staging existed have no stage and must not
+# become undeployable.
+b = Bed()
+rc, out, _ = deploy_once(b, gate_rc=0, stage_only=True)
+check("stage: --stage-only refuses when nothing is staged",
+      rc == 1 and not os.path.exists(b.dst()), "rc=%s\n%s" % (rc, out[-600:]))
+b.drop()
+
+b = Bed()
+rc, out, _ = deploy_once(b, gate_rc=0)
+check("stage CONTROL: bin/ present and no stage -- deploys, and SAYS it is "
+      "not staged",
+      rc == 0 and os.path.isfile(b.dst()) and "NO USABLE STAGE" in out,
+      "rc=%s\n%s" % (rc, out[-600:]))
+b.drop()
+
+# Retention: six per artifact, oldest pruned, newest kept.
+b = Bed()
+kept = [b.stage(payload="p%d" % i, finished=1000.0 + i) for i in range(9)]
+recs = stage.stages(b.repo, artifact_src="bin/fake0.dll")
+check("stage: retention keeps %d and prunes the rest" % stage.KEEP,
+      len(recs) == stage.KEEP, "kept %d" % len(recs))
+check("stage: the pruned ones are the OLDEST",
+      recs and recs[0]["sha"] == kept[-1]["sha"]
+      and all(r["sha"] != kept[0]["sha"] for r in recs),
+      str([r["sha"] for r in recs]))
 b.drop()
 
 # ---- the cache is not a way to pass a red run ----------------------------

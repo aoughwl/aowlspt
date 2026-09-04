@@ -118,3 +118,9 @@ docs/aowl-facts.db.backup
 # tools/selftests.py caches its last verdict here so a deploy gate can reuse
 # a green run instead of re-running the suite. Machine state, not a source.
 .aowl-selftests.json
+
+# Staged builds. tools/buildlock.py copies every artifact it proves into
+# .stage/<target>/<sha12>/ so that a LATER build (aowl removes its output
+# before writing it) cannot delete the bytes a deploy is about to copy --
+# measured 2026-09-04. Derived, per-checkout, never committed.
+.stage/

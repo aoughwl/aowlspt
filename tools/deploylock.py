@@ -21,6 +21,17 @@ builds: nothing can start under it, and a queued build simply waits the few
 seconds a deploy takes. deploy.py itself is unchanged and still verifies every
 marker before copying.
 
+## The stage closes the other half of the same race
+
+MEASURED 2026-09-04 08:58: a clean `build host` finished and released the lock;
+before this script could copy the DLL, a queued `build host` took the lock and
+`aowl` deleted the artifact. Holding the lock for the copy does not help when
+the file is already gone. `tools/buildlock.py` now copies every artifact it
+proves into `.stage/<target>/<sha12>/`, and `deploy.py` deploys from there --
+so the bytes cannot vanish between the build and the deploy. Everything here is
+unchanged; `--sha PREFIX` and `--stage-only` pass straight through to
+deploy.py.
+
 ## `markers` -- the same race, one command down
 
 MEASURED 2026-09-02: `python tools/markers.py

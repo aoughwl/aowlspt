@@ -271,6 +271,32 @@ finds. So:
   the child's code -- and runs nimlint, saying plainly when nimlint is CLEAN,
   because a clean lint after that signature means the shape is a NEW one.
 
+## The bytes still vanish AFTER the lock is released -- measured 2026-09-04
+
+08:58: a clean `build host` finished (exit 0, sidecar written, sha recorded).
+Before `deploylock.py deploy host` copied it, another agent's queued
+`build host` acquired the lock and `aowl` -- which REMOVES its output before
+writing it -- deleted the artifact. The deploy refused with "the artifact is
+not the build that was recorded", which was correct, and the launcher ran the
+OLD host DLL. With several agents building in one checkout this is the normal
+case, not an exotic one, and no lock can fix it: the deletion happens after the
+first build's lock has been released.
+
+So a proven artifact is COPIED where no build writes:
+
+    .stage/<target>/<sha256[:12]>/<basename>  + its sidecar + stage.json
+
+printed on the success line, six kept per artifact, older pruned.
+`tools/deploy.py` deploys FROM the stage (`--sha PREFIX`, else the newest
+stage that is not `stale_sources` and whose markers all pass), so a running
+build cannot remove the file mid-copy. `--status` lists the stages; so does
+`deploy.py stages [NAME]`. `--no-stage` opts out and says so.
+
+The stage is not a second opinion about whether a build was good: the sidecar
+sha, `stale_sources` and the deploy.json marker list are all applied to the
+staged bytes exactly as they were applied to `bin/`. It only removes the window
+in which the file can disappear.
+
 ## A build whose SOURCES moved under it -- measured 2026-09-03 19:24
 
 `buildlock.py build host` reported success (exit 0, sidecar written) for a
@@ -313,6 +339,9 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+import stage as stagemod                                        # noqa: E402
 
 # A cold `aowl build` is measured at ~18m in this repo; a warm one ~4m27s, and a
 # named target ~2m. Two hours is far past any of those, so a lock older than
@@ -564,7 +593,7 @@ def status(path, max_age):
                 "queued_since": None, "queued_arrival": None, "fifo": "n/a",
                 "hung": None, "you": you, "artifacts": [],
                 "artifacts_why": "nobody is building", "queue": qout,
-                "lock": path}
+                "stages": status_stages(repo), "lock": path}
     arts, arts_why = holder_artifacts(repo, held.get("cmd"))
     pid = int(held.get("pid", -1))
     running = pid_alive(pid)
@@ -582,7 +611,28 @@ def status(path, max_age):
             # expensive. `null` means NOT CHECKED, never "not hung".
             "hung": None,
             "you": you, "artifacts": arts, "artifacts_why": arts_why,
-            "queue": qout, "lock": path}
+            "queue": qout, "stages": status_stages(repo, held.get("cmd")),
+            "lock": path}
+
+
+STATUS_STAGES = 6
+
+
+def status_stages(repo, held_target=None, limit=STATUS_STAGES):
+    """The most recent staged builds, for `--status`.
+
+    The holder's own target first when there is one, because the next question
+    after "who is building" is "what can I deploy right now" -- and the answer
+    is a stage, not whatever happens to be in bin/ at the instant you look.
+    """
+    try:
+        recs = stagemod.stages(repo)
+    except Exception:                                    # noqa: BLE001
+        return []
+    if held_target:
+        key = stagemod.target_key(held_target)
+        recs.sort(key=lambda r: (r["target_key"] != key, -r["built_at"]))
+    return recs[:limit]
 
 
 def fifo_verdict(held, q):
@@ -1118,6 +1168,25 @@ def print_you(st):
                   % (st.get("artifacts_why") or "no reason recorded"))
 
 
+def print_stages(st):
+    """What is deployable RIGHT NOW, independently of what bin/ holds.
+
+    A stage is a copy no build writes to, so this list is the honest answer to
+    "what can be deployed while somebody is building". Absence is stated
+    outright: an empty section reads as "the tool did not print anything",
+    which is not the same as "there is nothing to deploy".
+    """
+    recs = st.get("stages") or []
+    if not recs:
+        print("  staged builds: NONE under .stage/ -- a deploy will have to "
+              "read bin/, where a build can delete the file mid-copy.")
+        return
+    print("  staged builds (newest first; deploy with "
+          "`deploy.py deploy --only NAME --sha PREFIX`):")
+    for ln in stagemod.lines(recs):
+        print(ln)
+
+
 def print_status_human(st):
     """The text a person reads. UNCHANGED on purpose -- scripts should use
     --json or the exit code, but existing eyes and greps should not break."""
@@ -1127,6 +1196,7 @@ def print_status_human(st):
             print("  queued %d: pid %s %r since %s"
                   % (i + 1, t["pid"], t["target"], t["since"]))
         print_you(st)
+        print_stages(st)
         return
     print("build lock HELD by pid %d (%s) %r since %s -- %.0fs ago"
           % (st["pid"], "running" if st["running"] else "NOT RUNNING (stale)",
@@ -1147,6 +1217,7 @@ def print_status_human(st):
               % (i + 1, t["pid"], t["target"], t["since"],
                  "   <- next" if i == 0 else ""))
     print_you(st)
+    print_stages(st)
     if st.get("fifo") == "INVERTED":
         print("  FIFO INVERTED: the holder joined the queue AFTER a waiter "
               "that is still waiting. That is a real fairness bug, measured "
@@ -2363,8 +2434,39 @@ def write_sidecar(rec, target, started, finished, git_head, src_change=None):
     return doc
 
 
+def stage_artifacts(repo, rest, recs):
+    """Copy every artifact this build proved into `.stage/`, and say where.
+
+    MEASURED 2026-09-04 08:58: a clean `build host` finished, and before the
+    deploy could copy the DLL a queued build took the lock and `aowl` removed
+    it. The deploy refused (correctly) and the launcher ran the OLD host. The
+    bytes existed and were good for a few seconds and then did not exist at
+    all.
+
+    A staging failure is printed and does NOT fail the build: the artifact is
+    still in `bin/` and still deployable the old way. Silence is what is
+    forbidden -- an unexplained absent stage is how somebody concludes the
+    build never happened.
+    """
+    out = []
+    for r in recs:
+        if r["state"] not in ("ok", "up-to-date") or not r["built"]:
+            continue
+        rec, why = stagemod.put(repo, " ".join(rest), r["path"],
+                                artifact_src=r["src"], name=r["name"])
+        if rec:
+            out.append("  staged %s -> %s   (sha %s)"
+                       % (r["name"], _norm(os.path.relpath(rec["path"], repo)),
+                          rec["sha"]))
+        else:
+            out.append("  NOT STAGED %s: %s" % (r["name"], why))
+            out.append("    a deploy will have to read %s directly, where a "
+                       "concurrent build can delete it mid-copy." % r["src"])
+    return out
+
+
 def check_and_record(repo, rest, started, finished, no_sidecar=False,
-                     src_change=None):
+                     src_change=None, no_stage=False):
     """Post-build: did the thing we asked for actually appear? Returns an exit
     code -- 0, ARTIFACT_ABSENT_EXIT or ARTIFACT_STALE_EXIT."""
     arts, why = target_artifacts(repo, rest)
@@ -2397,6 +2499,13 @@ def check_and_record(repo, rest, started, finished, no_sidecar=False,
         if r["state"] == "ok" and r["built"]:
             write_sidecar(r, " ".join(rest), started, finished, head,
                           src_change)
+    if no_stage:
+        print("  --no-stage: these bytes were NOT copied to .stage/, so a "
+              "deploy must read bin/ and a concurrent build can delete the "
+              "file first (measured 2026-09-04).")
+        return 0
+    for ln in stage_artifacts(repo, rest, recs):
+        print(ln)
     return 0
 
 
@@ -2893,6 +3002,10 @@ def main():
                         "sidecar. The check is what turns exit 0 into "
                         "evidence; turning it off means the exit code is a "
                         "claim about the build PROCESS only.")
+    p.add_argument("--no-stage", action="store_true", dest="no_stage",
+                   help="do NOT copy the built artifact into .stage/. The "
+                        "deploy then reads bin/, where a queued build can "
+                        "delete it mid-copy (measured 2026-09-04).")
     p.add_argument("--no-source-check", action="store_true",
                    dest="no_source_check",
                    help="do not check whether a source was edited AFTER the "
@@ -3112,7 +3225,7 @@ def main():
         # actually asked -- measured five times on 2026-09-02 answering `ok`
         # for an artifact a queued build had already deleted.
         arc = check_and_record(a.repo, rest, t0, finished,
-                               src_change=srcchg)
+                               src_change=srcchg, no_stage=a.no_stage)
         if arc:
             return arc
     # AFTER the artifact check, so the sidecar carries the flag before we

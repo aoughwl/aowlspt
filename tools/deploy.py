@@ -239,6 +239,7 @@ def select(cfg, only):
 # so that deploy.py (host DLL) and tools/markers.py (mod DLLs) cannot drift
 # apart. Re-exported under the names this file already used.
 import litscan                                       # noqa: E402
+import stage                                         # noqa: E402
 import markers                                       # noqa: E402  (classify)
 from litscan import OK, FAIL, INCONCLUSIVE           # noqa: E402
 from litscan import FRAGMENT_NOTE                    # noqa: E402
@@ -426,6 +427,117 @@ def sidecar_check(src, expect=None):
             return False, lines
         lines.append("--expect matches")
     return True, lines
+
+
+def is_build_output(rel):
+    """Is this artifact WRITTEN by a build, or checked-in data a deploy ships?
+
+    Only a build output can be deleted out from under a deploy by another
+    build, and only a build output is ever staged. `registry/mods.json` is the
+    second kind: it is in git, no build writes it, and looking for a stage of
+    it would report a missing stage for every deploy.
+    """
+    r = rel.replace("\\", "/")
+    return ("/bin/" in r or r.startswith("bin/")
+            or r.startswith("installer/build/"))
+
+
+def stage_accept(art, C):
+    """The predicate `stage.pick` applies to each candidate: do the STAGED
+    bytes pass this artifact's own marker/export check?
+
+    It is the same `verify()` the deploy already runs, pointed at the staged
+    file. Selecting a stage on age alone would be a choice made without
+    looking, and the marker rule (CLAUDE.md 4) is not weakened by where the
+    bytes live.
+    """
+    def accept(rec):
+        verdict, problems = verify(art, rec["path"], C)
+        if verdict == OK:
+            return True, ""
+        return False, "%s -- %s" % (verdict, "; ".join(problems[:2])
+                                    or "no detail")
+    return accept
+
+
+def resolve_stages(args, arts, C):
+    """Which bytes each artifact will be deployed FROM. -> (map, notes, refuse).
+
+    `map` is artifact-name -> stage record. An artifact absent from it is
+    deployed from the repo path exactly as before.
+
+    MEASURED 2026-09-04 08:58: a good `build host` was deleted by the next
+    build before the deploy could copy it, and the launcher ran the old DLL.
+    Deploying from `.stage/` closes that window, because no build writes there.
+
+    Three outcomes, and the middle one is the point:
+
+      * a stage exists and passes its markers -> deploy those bytes;
+      * `--sha` was given and no such stage exists -> REFUSE (never silently
+        substitute different bytes for the ones that were named);
+      * no stage exists at all -> a loud NOTE and a fall back to bin/, unless
+        `--stage-only`. Artifacts built before staging existed have none, and
+        refusing them by default would make this change a deploy outage rather
+        than a safety net. The fallback is the pre-existing behaviour, with the
+        pre-existing sidecar guard still in front of it.
+    """
+    notes, out = [], {}
+    if getattr(args, "no_stage", False):
+        notes.append("--no-stage: deploying from bin/. A build running now "
+                     "can delete a file mid-copy (measured 2026-09-04).")
+        return out, notes, False
+    repo = REPO
+    sha = getattr(args, "sha", None)
+    if sha and len(arts) != 1:
+        notes.append("--sha names ONE build but %d artifacts are selected. "
+                     "Use --only." % len(arts))
+        return out, notes, True
+    refuse = False
+    for art in arts:
+        if not is_build_output(art["src"]):
+            notes.append("%-8s is checked-in data, not a build output -- no "
+                         "stage is expected; deploying from the repo copy."
+                         % art["name"])
+            continue
+        rec, why = stage.pick(repo, artifact_src=art["src"].replace("\\", "/"),
+                              artifact=os.path.basename(art["src"]),
+                              sha_prefix=sha, accept=stage_accept(art, C))
+        for w in why:
+            notes.append("%-8s %s" % (art["name"], w))
+        if rec:
+            out[art["name"]] = rec
+            notes.append("%-8s deploying from STAGE %s (built %s, git %s)"
+                         % (art["name"], rec["sha"], rec["built_h"],
+                            (rec["git_head"] or "?")[:12]))
+            continue
+        if sha:
+            notes.append("%-8s REFUSING: --sha %s named a stage that does not "
+                         "exist or was rejected above." % (art["name"], sha))
+            refuse = True
+            continue
+        if getattr(args, "stage_only", False):
+            notes.append("%-8s REFUSING: --stage-only and no usable stage. "
+                         "Rebuild through tools/buildlock.py." % art["name"])
+            refuse = True
+            continue
+        notes.append("%-8s NO USABLE STAGE -- falling back to %s. A build "
+                     "running right now can delete that file mid-copy; that "
+                     "is the race staging exists to close."
+                     % (art["name"], art["src"]))
+    return out, notes, refuse
+
+
+def art_source(art, args):
+    """The path this artifact is verified AND copied from. One function, so a
+    deploy can never check one file and copy another."""
+    override = getattr(args, "artifact", None)
+    if override:
+        return os.path.abspath(override)
+    smap = getattr(args, "_stage_map", None) or {}
+    rec = smap.get(art["name"])
+    if rec:
+        return rec["path"]
+    return os.path.join(REPO, art["src"].replace("/", os.sep))
 
 
 def selftest_gate(args, C):
@@ -1104,8 +1216,7 @@ def cmd_check(args, cfg, C, check_data=True):
     bad = 0
     unknown = 0
     for art in arts:
-        src = (override if override
-               else os.path.join(REPO, art["src"].replace("/", os.sep)))
+        src = art_source(art, args)
         verdict, problems = verify(art, src, C)
         if contains or absent:
             # ADDITIVE. The literal scan can only make the verdict worse; a
@@ -1202,6 +1313,21 @@ def cmd_deploy(args, cfg, C):
     install = args.install or cfg["install"]
     arts = select(cfg, args.only)
 
+    # WHICH BYTES. Resolved BEFORE the pre-check, and stored on `args`, so
+    # that cmd_check verifies exactly the file cmd_deploy will copy. Checking
+    # bin/ and then copying a stage (or the reverse) would be a verification
+    # of the wrong file -- the failure shape CLAUDE.md 9b is about.
+    smap, snotes, srefuse = resolve_stages(args, arts, C)
+    args._stage_map = smap
+    if snotes:
+        print("source of the bytes:")
+        for ln in snotes:
+            print("  %s" % ln)
+    if srefuse:
+        print("\n%srefusing to deploy: the requested build is not staged.%s"
+              % (red, reset))
+        return 1
+
     # Verify EVERYTHING first, then copy. A partial deploy -- new host DLL
     # against an old tarkov.dll -- is its own class of confusing bug, so if any
     # selected artifact is bad, nothing moves.
@@ -1228,7 +1354,7 @@ def cmd_deploy(args, cfg, C):
         return 1
     ok, lines = True, []
     for art in arts:
-        src = os.path.join(REPO, art["src"].replace("/", os.sep))
+        src = art_source(art, args)
         if not os.path.isfile(src):
             continue
         good, ls = sidecar_check(src, getattr(args, "expect", None)
@@ -1258,7 +1384,7 @@ def cmd_deploy(args, cfg, C):
     print("\ninstall %s" % install)
     rollbacks = []
     for art in arts:
-        src = os.path.join(REPO, art["src"].replace("/", os.sep))
+        src = art_source(art, args)
         dst = os.path.join(install, art["dst"].replace("/", os.sep))
         if args.dry_run:
             off = off_path(dst)
@@ -1770,13 +1896,87 @@ def cmd_rollback(args, cfg, C):
     return 0
 
 
+def cmd_stages(args, cfg, C):
+    """`stages [NAME]` -- what is deployable, and what is live.
+
+    NAME is matched against BOTH an artifact name from deploy.json and a stage
+    target key, because those are two different vocabularies for the same
+    thing (`host` happens to be both) and guessing which one the reader meant
+    is how a listing comes back empty for a stage that exists. Which
+    interpretation matched is printed.
+
+    `DEPLOYED` compares the staged bytes with the INSTALLED file by sha, not
+    by mtime -- a hand-copied file with a fresh mtime and stale bytes is a
+    measured state in this repo, not a hypothetical one.
+    """
+    red, green, yellow, dim, reset = C
+    install = args.install or cfg["install"]
+    want = (args.target or args.only or "").strip()
+    arts = [a for a in cfg["artifacts"] if not a["name"].startswith("//")]
+    by_name = {a["name"]: a for a in arts}
+    recs = stage.stages(REPO)
+    if want:
+        keys = {stage.target_key(want), want.lower()}
+        art = by_name.get(want)
+        sel = [r for r in recs
+               if r["target_key"] in keys
+               or (art and (r["artifact_src"] == art["src"]
+                            or r["artifact"] == os.path.basename(art["src"])))
+               or r["name"] == want]
+        print("stages matching %r (as %s)"
+              % (want, "an artifact name and a target key" if art
+                 else "a target key"))
+        recs = sel
+    if not recs:
+        print("NO STAGES%s. .stage/ is written by tools/buildlock.py after a "
+              "successful build; nothing here means no build has been staged "
+              "%s, NOT that a build failed."
+              % ((" match %r" % want) if want else "",
+                 "for that target" if want else "in this checkout"))
+        return 3
+    # What is live, per staged artifact, so DEPLOYED can be stated as a fact.
+    live = {}
+    for r in recs:
+        art = None
+        for a in arts:
+            if a["src"] == r["artifact_src"] or                     os.path.basename(a["src"]) == r["artifact"]:
+                art = a
+                break
+        if not art:
+            continue
+        d = os.path.join(install, art["dst"].replace("/", os.sep))
+        if os.path.isfile(d):
+            try:
+                live[r["sha"]] = _sha(d)
+            except OSError:
+                pass
+    for r in recs:
+        flags = []
+        if r["stale_sources"]:
+            flags.append("STALE_SOURCES (never auto-selected)")
+        if r.get("source_check") == "not-performed":
+            flags.append("source-check NOT PERFORMED")
+        got = live.get(r["sha"])
+        if got is None:
+            flags.append("live copy NOT COMPARED")
+        elif got.lower() == r["sha256"].lower():
+            flags.append("DEPLOYED")
+        print("  %-10s %-12s %-19s git %-12s %s%s"
+              % (r["target_key"], r["sha"], r["built_h"] or "?",
+                 (r["git_head"] or "?")[:12], r["artifact"],
+                 ("   [%s]" % ", ".join(flags)) if flags else ""))
+    print("\ndeploy a specific one with: python tools/deploy.py deploy "
+          "--only NAME --sha PREFIX")
+    return 0
+
+
 def main():
     p = argparse.ArgumentParser(
         description="verify, back up and deploy aowlspt build artifacts",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__)
     p.add_argument("command", choices=["check", "deploy", "rollback",
-                                     "status", "where"])
+                                     "status", "where", "stages"])
     p.add_argument("target", nargs="?", default=None,
                    help="artifact name(s), comma separated; same as --only")
     p.add_argument("--only", default=None,
@@ -1847,6 +2047,17 @@ def main():
                         "unless the artifact's sha256 is exactly this. Use it "
                         "when you hashed a build in a worktree and want the "
                         "install to get THOSE bytes.")
+    p.add_argument("--sha", default=None, metavar="PREFIX",
+                   help="deploy THIS staged build (a sha256 prefix from "
+                        "`stages`). Refuses if no such stage exists; it never "
+                        "silently substitutes other bytes.")
+    p.add_argument("--no-stage", action="store_true",
+                   help="deploy from bin/ instead of .stage/. A build running "
+                        "now can delete the file mid-copy -- that is the race "
+                        "measured on 2026-09-04.")
+    p.add_argument("--stage-only", action="store_true",
+                   help="refuse rather than fall back to bin/ when a build "
+                        "output has no usable stage.")
     p.add_argument("--no-color", action="store_true")
     args = p.parse_args()
     if args.target and not args.only:
@@ -1867,6 +2078,10 @@ def main():
     if args.artifact and args.command != "check":
         sys.exit("--artifact is only meaningful with `check`: it verifies a "
                  "file in place and never copies anything.")
+    if (args.sha or args.stage_only) and args.command != "deploy":
+        sys.exit("--sha/--stage-only are only meaningful with `deploy`.")
+    if args.command == "stages":
+        return cmd_stages(args, cfg, C)
     if args.command == "status":
         return cmd_status(args, cfg, C)
     if args.command == "where":

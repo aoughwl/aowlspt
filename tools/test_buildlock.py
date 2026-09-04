@@ -57,7 +57,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 sys.path.insert(0, HERE)
 
-import buildlock  # noqa: E402
+import buildlock
+import stage as stagemod  # noqa: E402
 
 FAILURES = []
 TIMINGS = []
@@ -1837,6 +1838,128 @@ def test_source_change(tmp):
           repr(lines_good))
 
 
+def _rewrite_driver(repo, body):
+    """Replace the stand-in `aowl` script -- i.e. run a DIFFERENT build in the
+    same checkout, which is exactly the situation this file is about."""
+    with open(os.path.join(repo, "build"), "w", encoding="utf-8",
+              newline="\n") as f:
+        f.write(body)
+
+
+def test_stage(tmp):
+    """A build's bytes must survive the NEXT build.
+
+    MEASURED 2026-09-04 08:58: `build host` finished clean, a queued
+    `build host` then took the lock and `aowl` -- which removes its output
+    before writing it -- deleted the artifact before the deploy copied it. The
+    deploy refused ("the artifact is not the build that was recorded", which
+    was the correct answer) and the launcher ran the OLD host DLL.
+
+    The falsifier for every claim below is the same one: with the stage
+    removed, `bin/` is empty and there is nothing to deploy. That control is
+    asserted, not assumed.
+    """
+    print("\nstage: the next build must not be able to delete these bytes")
+    repo, art = make_artifact_repo(tmp, "stage-ok", payload="firstbuild")
+    if repo is None:
+        check("INCONCLUSIVE: no runnable stand-in driver, nothing was tested",
+              False, "the copied python.exe would not start")
+        return
+
+    rc, out = build_in(repo, "build", "host")
+    check("a successful build still exits 0 with staging on", rc == 0,
+          "rc=%d\n%s" % (rc, out[-600:]))
+    check("it PRINTS where it staged the artifact",
+          "staged host" in out and ".stage" in out, out[-800:])
+
+    recs = stagemod.stages(repo)
+    check("exactly one stage exists after one build", len(recs) == 1,
+          str([r["path"] for r in recs]))
+    if not recs:
+        return
+    r0 = recs[0]
+    check("the staged bytes are the artifact's bytes",
+          os.path.isfile(r0["path"])
+          and open(r0["path"], "rb").read() == open(art, "rb").read(),
+          r0["path"])
+    check("the sidecar was staged beside them, with the same sha",
+          r0["sidecar"].get("sha256") == buildlock.sha256_file(art)
+          and r0["sha256"] == buildlock.sha256_file(art),
+          json.dumps(r0["sidecar"])[:200])
+    check("the stage records the target and the git head field",
+          r0["target"] == "build host" and "git_head" in r0["sidecar"],
+          r0["target"])
+
+    # THE INCIDENT. A second build in the same checkout removes the artifact
+    # and fails. bin/ is empty; the stage must still hold the first build.
+    _rewrite_driver(repo, "import os, sys\nart = %r\n"
+                          "os.path.exists(art) and os.unlink(art)\n"
+                          "sys.exit(1)\n" % art)
+    rc2, out2 = build_in(repo, "build", "host")
+    check("the second build failed and removed bin/", rc2 != 0
+          and not os.path.exists(art),
+          "rc=%d exists=%s" % (rc2, os.path.exists(art)))
+    check("THE POINT: the first build's bytes are still in the stage",
+          os.path.isfile(r0["path"])
+          and open(r0["path"], "rb").read().decode("utf-8",
+                                                   "replace") == "firstbuild",
+          r0["path"])
+    pick, notes = stagemod.pick(repo, artifact_src=ART_REL)
+    check("and pick() selects it by default",
+          pick is not None and pick["sha"] == r0["sha"], "; ".join(notes))
+    # --status must list what is deployable; asked BEFORE the control below
+    # deletes the stage, or it would be measuring the wrong world.
+    rc5, out5 = build_in(repo, "--status")
+    check("--status lists the staged builds",
+          "staged builds" in out5 and r0["sha"] in out5, out5[-600:])
+
+    check("CONTROL: with the stage deleted there is nothing left at all",
+          _no_stage_left(repo, r0), "the stage or bin/ still holds something")
+
+    # A stale_sources build is staged (so it can be inspected) but is NEVER
+    # auto-selected. Without both halves this would be untestable: a stage
+    # that is not written cannot be shown to be skipped.
+    repo3, art3 = make_artifact_repo(tmp, "stage-stale", payload="stalebytes",
+                                     touches=SRC_REL, sleep_s=1.5)
+    _plant_source(repo3)
+    rc3, out3 = build_in(repo3, "build", "host")
+    check("a build whose sources moved still exits %d"
+          % buildlock.SOURCES_CHANGED_EXIT,
+          rc3 == buildlock.SOURCES_CHANGED_EXIT, "rc=%d\n%s"
+          % (rc3, out3[-400:]))
+    st3 = stagemod.stages(repo3)
+    check("its bytes ARE staged (so they can be looked at)",
+          len(st3) == 1 and st3[0]["stale_sources"],
+          str([(r["sha"], r["stale_sources"]) for r in st3]))
+    pick3, notes3 = stagemod.pick(repo3, artifact_src=ART_REL)
+    check("but pick() refuses to select a stale_sources stage",
+          pick3 is None and any("stale_sources" in n for n in notes3),
+          "; ".join(notes3))
+
+    # The escape hatch, and it must be loud.
+    repo4, _art4 = make_artifact_repo(tmp, "stage-off", payload="two")
+    rc4, out4 = build_in(repo4, "--no-stage", "build", "host")
+    check("--no-stage stages nothing and SAYS so",
+          rc4 == 0 and not stagemod.stages(repo4) and "--no-stage" in out4,
+          "rc=%d\n%s" % (rc4, out4[-400:]))
+
+    rc6, out6 = build_in(repo4, "--status")
+    check("--status says NONE rather than printing nothing",
+          "NONE" in out6, out6[-400:])
+
+
+def _no_stage_left(repo, rec):
+    """Delete the stage and confirm the checkout then holds nothing.
+
+    This is the falsifier for the test above: if `bin/` still had the bytes,
+    every 'the stage saved it' claim would pass for the wrong reason.
+    """
+    shutil.rmtree(os.path.join(repo, ".stage"), ignore_errors=True)
+    return (not stagemod.stages(repo)
+            and not os.path.exists(os.path.join(repo,
+                                                ART_REL.replace("/", os.sep))))
+
+
 def test_artifact_check(tmp):
     """Exit 0 is a claim about a PROCESS. The artifact is a different question.
 
@@ -2839,6 +2962,7 @@ def main():
                    test_hung_human_text, test_hung_across_calls,
                    test_wait_free_reports_hung, test_break_hung,
                    test_artifact_units, test_artifact_check,
+                   test_stage,
                    test_source_change, test_status_you,
                    test_noop_rebuild_is_up_to_date,
                    test_generated_is_not_a_source, test_markers_under_lock,
