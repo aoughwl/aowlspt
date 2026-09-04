@@ -1746,12 +1746,11 @@ def test_source_change(tmp):
         return
     src = _plant_source(repo)
     t_build = time.time()
-    # --no-store-audit: tools/storelint.py returns FAIL (not INCONCLUSIVE) for
-    # ANY tree that is not this checkout, because every one of its baseline
-    # entries reads as "GONE" there. That is a pre-existing rough edge in the
-    # pre-flight, not part of what is under test here, and it fires as soon as
-    # a temp repo contains a .nim under host/.
-    rc, out = build_in(repo, "--no-store-audit", "build", "host")
+    # No --no-store-audit here, deliberately: the storelint pre-flight now
+    # answers INCONCLUSIVE (never FAIL) for a tree its baseline was not
+    # written for, so a synthetic repo with a .nim under host/ no longer
+    # refuses the build. These worlds therefore exercise the real pre-flight.
+    rc, out = build_in(repo, "build", "host")
     touched_after = os.stat(src).st_mtime > t_build
 
     check("the driver really did touch the source mid-build (else this world "
@@ -1783,7 +1782,7 @@ def test_source_change(tmp):
               "evidence", False, "")
         return
     _plant_source(repo2)
-    rc2, out2 = build_in(repo2, "--no-store-audit", "build", "host")
+    rc2, out2 = build_in(repo2, "build", "host")
     check("CONTROL: the same build without the edit exits 0", rc2 == 0,
           "rc=%d\n%s" % (rc2, out2[-800:]))
     check("CONTROL: it does NOT print SOURCES CHANGED",
@@ -1798,7 +1797,7 @@ def test_source_change(tmp):
           and side2.get("source_check") == "unchanged", repr(side2))
 
     # THIRD OUTCOME: nothing to scan is NOT PERFORMED, and never a pass.
-    rc3, out3 = build_in(repo2, "--no-store-audit", "build", "sim")
+    rc3, out3 = build_in(repo2, "build", "sim")
     check("a target with no declared artifact prints SOURCE-CHANGE CHECK NOT "
           "PERFORMED", "SOURCE-CHANGE CHECK NOT PERFORMED" in out3,
           "rc=%d tail: %r" % (rc3, out3[-600:]))
@@ -1812,7 +1811,7 @@ def test_source_change(tmp):
     if repo3 is not None:
         _plant_source(repo3)
         rc4, out4 = build_in(repo3, "--no-source-check",
-                             "--no-store-audit", "build", "host")
+                             "build", "host")
         check("--no-source-check builds the same tree without the refusal",
               rc4 == 0 and "SOURCES CHANGED" not in out4,
               "rc=%d\n%s" % (rc4, out4[-600:]))
@@ -1883,7 +1882,7 @@ def test_artifact_check(tmp):
     # THE INCIDENT. Same command, same repo shape, a driver that removes the
     # artifact and produces nothing while still exiting 0.
     repo2, art2 = make_artifact_repo(tmp, "art-absent", writes=False)
-    rc2, out2 = build_in(repo2, "--no-store-audit", "build", "host")
+    rc2, out2 = build_in(repo2, "build", "host")
     check("a build that exits 0 with NO artifact is REFUSED",
           rc2 == buildlock.ARTIFACT_ABSENT_EXIT,
           "rc=%d (wanted %d)\n%s" % (rc2, buildlock.ARTIFACT_ABSENT_EXIT,
@@ -2016,7 +2015,7 @@ def test_noop_rebuild_is_up_to_date(tmp):
         check("INCONCLUSIVE: the stand-in driver would not run (b)", False)
         return
     _, src = _plant_prebuilt(repo2, art2, src_age=60.0)   # newer than the art
-    rc2, out2 = build_in(repo2, "--no-store-audit", "build", "host")
+    rc2, out2 = build_in(repo2, "build", "host")
     check("a source NEWER than an unwritten artifact is still exit 6",
           rc2 == buildlock.ARTIFACT_STALE_EXIT, "rc=%d\n%s" % (rc2, out2[-900:]))
     check("...and the refusal names the file that is newer",
@@ -2593,7 +2592,7 @@ def test_generated_is_not_a_source(tmp):
     _plant_prebuilt(repo2, art2, src_age=30.0)   # aowlhost.nim is newer
     _plant_generated(repo2)
     _declare_generated(repo2, [GEN_REL])
-    rc2, out2 = build_in(repo2, "--no-store-audit", "build", "host")
+    rc2, out2 = build_in(repo2, "build", "host")
     check("a REAL source newer than the artifact is still exit 6",
           rc2 == buildlock.ARTIFACT_STALE_EXIT,
           "rc=%d\n%s" % (rc2, out2[-1200:]))

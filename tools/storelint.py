@@ -42,7 +42,9 @@ THREE OUTCOMES, NEVER TWO
 =========================
   exit 0  CLEAN
   exit 6  FINDINGS -- a raw store outside the gate
-  exit 3  INCONCLUSIVE -- the tree could not be scanned (missing dirs, etc.)
+  exit 3  INCONCLUSIVE -- the tree could not be scanned (missing dirs), or the
+          scanned root is not the checkout the BASELINE was written for, so the
+          baseline half of the check could not be performed.
 
 FALSIFIER
 =========
@@ -54,7 +56,9 @@ to fire is not a lint.
 
 import os
 import re
+import shutil
 import sys
+import tempfile
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO = os.path.dirname(_HERE)
@@ -129,6 +133,44 @@ BASELINE = [
      "is INFERRED in the audit from two agreeing instruments, not from the "
      "field table, so no FieldRef has been generated for it."),
 ]
+
+
+# ---------------------------------------------------------------------------
+# WHICH TREE THE BASELINE BELONGS TO.
+#
+# `audit(root)` is called by buildlock with an arbitrary root -- a worktree, or
+# in the tests a synthetic temp repo. The BASELINE above is a statement about
+# THIS checkout's source files. Against any other tree every entry reads GONE,
+# and "the baseline has rotted" was returned as a FAIL: a confidently wrong
+# answer about a tree the baseline never described, naming real-checkout paths
+# that do not exist under the scanned root.
+#
+# So the baseline carries the identity of the tree it was written for. Rot is a
+# FAIL only when the scanned root IS that tree; anywhere else it is
+# INCONCLUSIVE with the reason stated. Findings themselves are still real
+# everywhere -- a raw store is a raw store -- and are always named relative to
+# the SCANNED root.
+#
+# Identity is by marker file rather than by git: a temp repo can be a git repo,
+# and a worktree of this checkout is legitimately the same tree, which is
+# exactly the "same source, different directory" case the baseline still
+# describes.
+# ---------------------------------------------------------------------------
+BASELINE_ROOT_MARKERS = tuple(sorted(GATE_FILES)) + (
+    os.path.join("host", "Aowlspt.Host.Il2Cpp", "inspect.nim"),
+    os.path.join("tools", "storelint.py"),
+)
+
+
+def baseline_owner_missing(root):
+    """-> [] when `root` is the tree the BASELINE was written for.
+
+    Otherwise the marker paths that are absent, which is what the refusal
+    prints. Deliberately checks several markers: one file could plausibly be
+    copied into an unrelated tree; four is the checkout.
+    """
+    return [m for m in BASELINE_ROOT_MARKERS
+            if not os.path.isfile(os.path.join(root, m))]
 
 
 def rel(p):
@@ -219,13 +261,20 @@ def run(verbose=False):
                 continue
             findings.append((rel(f), ln, kind, line))
 
+    owner_missing = baseline_owner_missing(_REPO)
+
     if verbose:
         print("storelint: scanned %d nim file(s) under %s" %
               (len(files), ", ".join(SCAN_DIRS)))
-        for bp, needle, why in BASELINE:
-            state = "present" if (bp, needle) in seen_baseline else "GONE"
-            print("  baseline %-8s %s :: %s" % (state, bp, needle))
-            print("           %s" % why)
+        if owner_missing:
+            print("  baseline NOT APPLICABLE to this root -- its entries "
+                  "describe files that are not part of the scanned tree, so "
+                  "they are not listed here.")
+        else:
+            for bp, needle, why in BASELINE:
+                state = "present" if (bp, needle) in seen_baseline else "GONE"
+                print("  baseline %-8s %s :: %s" % (state, bp, needle))
+                print("           %s" % why)
 
     if findings:
         print("STORELINT FINDINGS: %d raw store(s) into game-owned memory "
@@ -244,6 +293,17 @@ def run(verbose=False):
 
     missing = [(bp, n, w) for bp, n, w in BASELINE
                if (bp, n) not in seen_baseline]
+    if missing and owner_missing:
+        print("storelint: INCONCLUSIVE -- the baseline belongs to the aowlspt "
+              "checkout, and the scanned root is %s, which is not it. %d "
+              "baseline entry(ies) do not match anything here; that is "
+              "expected of a different tree and is NOT evidence of rot. The "
+              "baseline was NOT checked." % (_REPO, len(missing)))
+        print("  missing identity marker(s) under the scanned root: %s"
+              % ", ".join(owner_missing))
+        print("  %d nim file(s) WERE scanned for raw stores and none was "
+              "found; only the baseline half is inconclusive." % len(files))
+        return 3
     if missing:
         print("STORELINT: the baseline has rotted -- %d entry(ies) no longer "
               "match anything in the tree. Delete them; a baseline that lists "
@@ -267,6 +327,55 @@ FALSIFY_OK = '''proc synthetic(p: Il2CppPtr) =
 '''
 
 
+def _falsify_baseline_scope():
+    """The baseline-scope rule, and its falsifier.
+
+    Two worlds, and BOTH have to come out the stated way or the rule is either
+    a check that cannot fail or a check that fires on the wrong tree:
+
+      A. a foreign root (a synthetic tree with a .nim under host/, exactly what
+         tools/test_buildlock.py builds) -> INCONCLUSIVE, never FAIL, and the
+         message must not name a real-checkout path.
+      B. THE REAL ROOT with a baseline entry that matches nothing -> still
+         FAIL. If B passed, the whole scope rule would be a way of never
+         failing.
+    """
+    global BASELINE
+    out = []
+    tmp = tempfile.mkdtemp(prefix="storelint-falsify-")
+    try:
+        d = os.path.join(tmp, "host", "Aowlspt.Host.Il2Cpp")
+        os.makedirs(d)
+        with open(os.path.join(d, "hostmain.nim"), "w", newline="\n") as fh:
+            fh.write("proc main() =\n  discard\n")
+        os.makedirs(os.path.join(tmp, "mods"))
+        rc = audit(tmp, quiet=False)
+        if rc != INCONCLUSIVE:
+            out.append("world A: a foreign tree returned %d, expected "
+                       "INCONCLUSIVE (%d). A baseline written for another "
+                       "checkout must not read as rot here."
+                       % (rc, INCONCLUSIVE))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # World B: the real root, with a deliberately rotten entry.
+    saved = BASELINE
+    try:
+        BASELINE = list(saved) + [
+            (os.path.join("host", "Aowlspt.Host.Il2Cpp", "hostmain.nim"),
+             "cThisPrimitiveDoesNotExist",
+             "synthetic falsifier entry -- must read as rot in THIS tree")]
+        rc = audit(_REPO, quiet=True)
+        if rc != FAIL:
+            out.append("world B: the real checkout with a rotted baseline "
+                       "entry returned %d, expected FAIL (%d). The scope rule "
+                       "would then be a check that cannot fail."
+                       % (rc, FAIL))
+    finally:
+        BASELINE = saved
+    return out
+
+
 def falsify():
     """A lint that has never been shown to fire is not a lint."""
     fake = os.path.join(_REPO, "host", "Aowlspt.Host.Il2Cpp", "_falsify.nim")
@@ -286,6 +395,8 @@ def falsify():
     if gate:
         fails.append("the gate file itself was flagged (%d hits) -- the raw "
                      "store has to live somewhere" % len(gate))
+    fails.extend(_falsify_baseline_scope())
+
     if fails:
         print("FALSIFIER FAILED -- this lint cannot be trusted:")
         for m in fails:
