@@ -117,6 +117,18 @@ type
     ## Damage told to us by the hook and not yet credited to the accumulator.
     ## Summed on the drain, spent on the next decision, cleared either way.
     pendingDamage: float
+    ## WHO last shot this bot, and when, as the enemy table keys enemies: an
+    ## `EFT.Player` address. Written only by `drainDamage`, and only after the
+    ## candidate matched a player this mod already holds, so a foreign read
+    ## cannot land here.
+    lastShooterKey: uint64
+    lastShotAt: float
+    ## Per-raid census flags. One-shot per bot, so the counts they feed are
+    ## DISTINCT BOTS rather than ticks -- "1,400 reads" across one bot and
+    ## across forty are different facts and a tick count cannot separate them.
+    everRead: bool
+    everEnemy: bool
+    everInCover: bool
     seesEnemy: bool
     inCombat: bool
     lastDecisionAt: float
@@ -420,6 +432,13 @@ const DamageQueueSize = 64
 
 var gDmgWho: array[DamageQueueSize, uint64]
 var gDmgAmount: array[DamageQueueSize, float]
+var gDmgShooter: array[DamageQueueSize, uint64]
+  ## The CANDIDATE address of whoever produced the hit, walked out of the
+  ## `DamageInfo` by `live.shooterFromDamageInfo`, or 0 when the walk refused.
+  ## It is a candidate and not an identity: see that proc for why, and see
+  ## `drainDamage` for the match that is allowed to reject it.
+var gShotMatched = 0
+var gShotUnmatched = 0
 var gDmgWrite = 0
 var gDmgRead = 0
 var gDmgHooked = false
@@ -428,7 +447,19 @@ var gDmgEvents = 0
 proc setDamageHooked*(v: bool) = gDmgHooked = v
 proc damageHooked*(): bool = gDmgHooked
 
-proc noteDamage*(who: uint64; amount: float) =
+proc shotCounters*(matched, unmatched: var int) =
+  ## How many queued shooter candidates were credited to a bot this mod is
+  ## tracking, and how many matched nothing. THE SECOND NUMBER IS THE CHECK.
+  ## `DamageInfo.Player` is declared as an interface and this build cannot ask
+  ## a live object its type, so a wrong implementor would make the walk read a
+  ## foreign field and answer a plausible address. Such an address matches no
+  ## bot and lands in `unmatched`. A census where unmatched dwarfs matched is
+  ## the signal that the walk is wrong -- which is a thing this instrument can
+  ## say, unlike a bare "shots seen" count.
+  matched = gShotMatched
+  unmatched = gShotUnmatched
+
+proc noteDamage*(who: uint64; amount: float; shooter: uint64 = 0'u64) =
   ## Called from the damage postfix, on the game's thread, with the victim's
   ## address and how much it lost -- or 0.0 when the method's declared shape
   ## carried no number this mod was willing to read.
@@ -440,6 +471,7 @@ proc noteDamage*(who: uint64; amount: float) =
     return
   gDmgWho[gDmgWrite mod DamageQueueSize] = who
   gDmgAmount[gDmgWrite mod DamageQueueSize] = amount
+  gDmgShooter[gDmgWrite mod DamageQueueSize] = shooter
   gDmgWrite = gDmgWrite + 1
 
 # ---------------------------------------------------------------------------
@@ -627,6 +659,8 @@ proc spawnBot*(id: string; spawnType: string; difficulty: float) =
     sup: newSuppression(), enemyKey: 0'u64, groupKey: 0'u64,
     prevPosition: zeroVec(), lastHealth: -1.0, lastDamagedAt: -9999.0,
     aimKey: 0'u64, aimReady: false, aimAt: 0'i64, pendingDamage: 0.0,
+    lastShooterKey: 0'u64, lastShotAt: -1.0,
+    everRead: false, everEnemy: false, everInCover: false,
     seesEnemy: false, inCombat: false,
     lastDecisionAt: 0.0, lastAppliedCombat: cdNone,
     lastAppliedMove: zeroVec(), lastApplyAt: -999.0,
@@ -1027,6 +1061,65 @@ proc buildView(st: BotState; me: SelfView; heard: Heard): BotView =
     raidSeconds: gTimeSeconds, moveTarget: zeroVec(), hasMoveTarget: false,
     hasObjective: haveObjective, objectiveTarget: objDest)
 
+const FiredAtUsWindow = 1.0
+  ## How long a hit stays "this tick" for the enemy that landed it, in seconds.
+  ##
+  ## One second, and the number matters: the decision loop runs at
+  ## `decisionHz`, so a bot decides every few hundred milliseconds and a window
+  ## shorter than one decision interval would drop most hits between two
+  ## decisions -- a signal that fires only when the timing happens to line up
+  ## is worse than no signal. One second is long enough to survive a slow tick
+  ## and short enough that a bot does not go on believing it is being shot at
+  ## by an enemy that stopped.
+
+var gFiredAtUsCredited = 0
+var gBotsRead = 0
+var gBotsWithEnemy = 0
+var gBotsInCover = 0
+
+# --- PER-DECISION-KIND ACCOUNTING.
+#
+# `stats()` counts decisions in total. A total tells a reader that the loop
+# ran; it cannot tell them that the loop only ever produced `cdNone`, which is
+# what a decision core with no sensor readings does and is indistinguishable in
+# a total from a working one. So the kinds are counted separately and the
+# census prints only the NON-ZERO ones, in order.
+var gDecisionKind: array[int(high(CombatDecision)) + 1, int]
+
+proc noteDecisionKind(d: CombatDecision) =
+  let i = int(d)
+  if i >= 0 and i < gDecisionKind.len:
+    gDecisionKind[i] = gDecisionKind[i] + 1
+
+proc decisionKindLine*(): string =
+  ## Every combat decision this raid produced, by kind, with its count.
+  ##
+  ## The line names `cdNone` EXPLICITLY when it is the only kind seen, because
+  ## "1,482 decisions" beside no behaviour is the single most misleading number
+  ## this mod can print.
+  var parts = ""
+  var nonNone = 0
+  var i = 0
+  while i < gDecisionKind.len:
+    if gDecisionKind[i] > 0:
+      if parts.len > 0: parts.add ", "
+      parts.add decisionName(CombatDecision(i)) & "=" & $gDecisionKind[i]
+      if CombatDecision(i) != cdNone:
+        nonNone = nonNone + gDecisionKind[i]
+    inc i
+  if parts.len == 0:
+    return "sain DECISIONS: none -- the decision loop produced no decision at " &
+           "all this raid. That is not 'bots decided to do nothing'; it is " &
+           "the loop never running or never reaching a bot."
+  result = "sain DECISIONS: " & parts & " -- " & $nonNone &
+           " of them are something other than cdNone"
+  if nonNone == 0:
+    result = result & ". EVERY decision was cdNone, which is what the ladder " &
+             "produces when no sensor reading reached it. Read the LEVEL 1 " &
+             "census before reading this as bot behaviour."
+
+proc firedAtUsCredited*(): int = gFiredAtUsCredited
+
 proc tickBot(index: int): bool =
   ## One bot's whole decision, start to finish. False when the bot has died and
   ## should be dropped from the table.
@@ -1068,6 +1161,22 @@ proc tickBot(index: int): bool =
     return false
 
   var me = readSelf(st.handle, l)
+
+  # THE LEVEL 1 READ-BACK, counted here and nowhere else.
+  #
+  # `me.position` is the falsifier and it is chosen for one property: its
+  # DEFAULT is the zero vector. `readSelf` fills every field with the value
+  # that makes the decision core behave as though nothing were wrong -- full
+  # health, a full magazine, a ready weapon -- so none of those can distinguish
+  # "read from a live receiver" from "the read refused and you got the
+  # default". A non-zero position cannot be produced by the default path, so it
+  # is positive evidence that `EFT.Player::get_Position` @0x6F32C0 was called
+  # on a real receiver and answered. `weaponReady` and `healthNormalized` are
+  # deliberately NOT used for this and the verdict says why.
+  if (not st.everRead) and l.ok and
+     (me.position.x != 0.0 or me.position.y != 0.0 or me.position.z != 0.0):
+    st.everRead = true
+    gBotsRead = gBotsRead + 1
 
   # --- velocity, from the previous decision rather than from a second bound
   # `Vector3` getter. Two subtractions and a divide against a ~10 ns call plus
@@ -1132,6 +1241,22 @@ proc tickBot(index: int): bool =
     var obs = observeEnemy(st.handle, l, gTimeSeconds)
     if obs.key != 0'u64:
       st.enemyKey = obs.key
+      if not st.everEnemy:
+        st.everEnemy = true
+        gBotsWithEnemy = gBotsWithEnemy + 1
+      # FIRED AT US, per enemy, for the first time since this field was
+      # written. `core/enemy.nim` has read `firedAtUsThisTick` since it was
+      # written and nothing ever set it, so `suppressingUs` was permanently
+      # false and the ladder rung that keys on it was unreachable.
+      #
+      # It is credited ONLY when the shooter the damage hook walked out of the
+      # DamageInfo is the SAME player this bot currently believes in. A hit by
+      # somebody else does not become "this enemy fired at us" -- it stays a
+      # suppression event with no attribution, which is what it was before.
+      if st.lastShooterKey == obs.key and st.lastShotAt > 0.0 and
+         gTimeSeconds - st.lastShotAt <= FiredAtUsWindow:
+        obs.firedAtUsThisTick = true
+        gFiredAtUsCredited = gFiredAtUsCredited + 1
       # A sound attributed to the *same* enemy the game has selected is folded
       # in as a hearing of them. One that belongs to somebody else is left for
       # the unattributed-sound branch of the ladder, which is what
@@ -1172,10 +1297,20 @@ proc tickBot(index: int): bool =
     me.hasCoverPoint = true
     me.coverPointDistance = distance(me.position, held.position)
     me.inCoverStatus = statusFor(me.coverPointDistance, st.settings)
+    # THE COVER VERDICT'S ONE FACT. `csFarFromCover` is the initialiser in
+    # `readSelf`, so it is exactly what a bot with no cover sensor reads
+    # forever. Any OTHER value can only have come from `statusFor` running on a
+    # chosen point that the sampler produced on Unity's thread, which means the
+    # ray was cast and answered. This is the negative the brief asks for and it
+    # is the only thing here that can fail.
+    if me.inCoverStatus != csFarFromCover and not st.everInCover:
+      st.everInCover = true
+      gBotsInCover = gBotsInCover + 1
 
   var view = buildView(st, me, heard)
   let d = decide(st.ctx, view, st.settings)
   inc gDecisionsMade
+  noteDecisionKind(d.combat)
 
   # The search state machine only advances while the decision is a search. SAIN
   # ticks its `SearchClass` regardless and guards inside; not entering at all is
@@ -1345,6 +1480,52 @@ proc tickBot(index: int): bool =
   gBots[index] = st
   result = true
 
+const KnownPlayersCap = 128
+  ## Rule 4. The bot table is bounded by `maxBotsPerTick` upstream and by the
+  ## raid below that, but the cap is written here rather than assumed: a
+  ## corrupt length must not turn this into an unbounded loop inside a frame.
+
+var gKnown: array[KnownPlayersCap, uint64]
+var gKnownLen = 0
+
+proc knownPlayer(p: uint64): bool =
+  ## Is this address one this mod already holds as a live player?
+  ##
+  ## THIS IS THE FALSIFIER for the shooter walk. `DamageInfo.Player` is an
+  ## interface field, so a wrong implementor makes the walk read a foreign
+  ## offset and answer a plausible, readable, entirely wrong address. Such an
+  ## address is not in this set, so it is rejected and counted -- which is a
+  ## check that CAN fail. Widening this to "any readable pointer" would make it
+  ## a check that cannot.
+  result = false
+  if p == 0'u64:
+    return
+  var i = 0
+  while i < gKnownLen:
+    if gKnown[i] == p:
+      return true
+    inc i
+
+proc refreshKnownPlayers() =
+  ## One pass over the bot table, resolving each handle exactly once, before
+  ## the damage drain reads it. Both a bot's OWN address and the address of the
+  ## enemy it currently believes in are known players: a bot shooting another
+  ## bot is the common case in an offline raid, and the human is reached
+  ## through some bot's `enemyKey`.
+  gKnownLen = 0
+  var i = 0
+  while i < gBots.len and gKnownLen < KnownPlayersCap - 1:
+    let st = gBots[i]
+    inc i
+    if st.handle.gcPlayer != 0'u32:
+      let p = target(st.handle.gcPlayer)
+      if p != nil:
+        gKnown[gKnownLen] = cast[uint64](p)
+        gKnownLen = gKnownLen + 1
+    if st.enemyKey != 0'u64 and gKnownLen < KnownPlayersCap:
+      gKnown[gKnownLen] = st.enemyKey
+      gKnownLen = gKnownLen + 1
+
 proc drainDamage() =
   ## Turn the addresses the damage hook queued into suppression, once per tick,
   ## on the host's own thread where the bot table is safe to touch.
@@ -1361,6 +1542,7 @@ proc drainDamage() =
     # Overflowed: the oldest entries are gone. Skip to what is still there
     # rather than reading round the ring and crediting a stale address.
     gDmgRead = gDmgWrite - DamageQueueSize
+  refreshKnownPlayers()
   let first = gDmgRead
   let last = gDmgWrite
   var i = 0
@@ -1382,6 +1564,19 @@ proc drainDamage() =
             st.pendingDamage = st.pendingDamage +
                                (if amount > 0.0: amount else: 0.01)
             gDmgEvents = gDmgEvents + 1
+            # WHO SHOT, credited only on a match against a player this mod is
+            # already tracking -- see `shotCounters` for why the reject branch
+            # is the whole value of this. `knownPlayer` answers off the bot
+            # table and the current enemy keys, both of which are addresses
+            # read on this same tick, so no stale pointer is compared.
+            let sh = gDmgShooter[j mod DamageQueueSize]
+            if sh != 0'u64:
+              if knownPlayer(sh):
+                st.lastShooterKey = sh
+                st.lastShotAt = gTimeSeconds
+                gShotMatched = gShotMatched + 1
+              else:
+                gShotUnmatched = gShotUnmatched + 1
           j = j + 1
         gBots[i] = st
     inc i
@@ -1630,6 +1825,101 @@ proc driveStats*(): string =
   if driveDisabled():
     result = result & " [SELF-DISABLED after " & $driveFaults() & " faults]"
   result = result & " -- " & driveVerdict()
+
+proc levelOneVerdict*(alivePlayers: int): string =
+  ## PASS / FAIL / INCONCLUSIVE for "did any bot's state come back off a live
+  ## receiver this raid".
+  ##
+  ## `alivePlayers` is the count the arming probe read off
+  ## `GameWorld.AllAlivePlayersList@0x1c8`, passed in rather than re-read, so
+  ## the verdict and the probe cannot disagree about how many players existed.
+  ##
+  ## THREE OUTCOMES. FAIL is reserved for the case the brief names: players
+  ## existed and this mod read none of them. "No players at all" is
+  ## INCONCLUSIVE -- there was nothing to read, and calling that a pass is the
+  ## check that cannot fail.
+  let c = "bots attached " & $gAttached & ", bots the decision loop reached " &
+          $gBots.len & ", alive players the world reported " & $alivePlayers &
+          ", distinct bots whose POSITION came back non-zero " & $gBotsRead &
+          ", distinct bots with a goal enemy " & $gBotsWithEnemy &
+          ". NOT USED AS EVIDENCE: healthNormalized and weaponReady, whose " &
+          "refusal defaults (1.0 and true) are indistinguishable from a " &
+          "successful read -- hcBodyPart is a permanent stated refusal, so " &
+          "every bot reads as unhurt whether or not anything was read"
+  if alivePlayers <= 1:
+    return "sain LEVEL 1 VERDICT: INCONCLUSIVE -- the world reported " &
+           $alivePlayers & " alive player(s), so there was no bot to read. " &
+           "This is not a pass. " & c
+  if gBotsRead > 0:
+    return "sain LEVEL 1 VERDICT: PASS -- " & $gBotsRead &
+           " distinct bot(s) had state read back off a live receiver. " & c
+  result = "sain LEVEL 1 VERDICT: FAIL -- the world reported " &
+           $alivePlayers & " alive player(s) and NOT ONE bot had any state " &
+           "read back off a live receiver. Read the LEVEL 1 census line " &
+           "above this one: it names which members refused and why. " & c
+
+proc coverVerdict*(): string =
+  ## Did `inCoverStatus` ever take a value other than `csFarFromCover`.
+  if gBotsInCover > 0:
+    return "sain COVER VERDICT: PASS -- " & $gBotsInCover &
+           " distinct bot(s) reached an inCoverStatus other than " &
+           "csFarFromCover, which can only come from a cover point the " &
+           "Unity-thread sampler produced, which means Physics::Raycast was " &
+           "called and answered."
+  if gBots.len == 0:
+    return "sain COVER VERDICT: INCONCLUSIVE -- no bot was reached at all, " &
+           "so the sampler was never asked for a point. Not a failure of the " &
+           "raycast."
+  result = "sain COVER VERDICT: FAIL -- " & $gBots.len & " bot(s) were " &
+           "decided about and every one of them read csFarFromCover for the " &
+           "whole raid. The ray itself is byte-verified at bind time (see " &
+           "the `cover sensor -- ray:` line); what this says is that no " &
+           "CHOSEN COVER POINT ever reached a bot, so look at the sample " &
+           "counters in the status line -- points proposed, rays cast, " &
+           "samples taken -- to see which half is empty."
+
+proc firedAtUsVerdict*(): string =
+  ## Did the per-enemy shot signal ever attribute a hit to the enemy a bot
+  ## currently believes in.
+  var matched = 0
+  var unmatched = 0
+  shotCounters(matched, unmatched)
+  var asked = 0
+  var walked = 0
+  var refused = 0
+  shooterCounters(asked, walked, refused)
+  let c = "DamageInfo walks asked " & $asked & ", produced a candidate " &
+          $walked & ", refused a guard " & $refused &
+          "; candidates matching a player this mod holds " & $matched &
+          ", matching nothing " & $unmatched &
+          "; credited to the bot's CURRENT enemy " & $gFiredAtUsCredited
+  if asked == 0:
+    return "sain FIRED-AT-US VERDICT: INCONCLUSIVE -- the damage prefix never " &
+           "fired, so no DamageInfo was ever walked. Nothing was hit, or the " &
+           "hook did not arm; the `damage` clause of the status line says " &
+           "which. " & c
+  if walked == 0:
+    return "sain FIRED-AT-US VERDICT: FAIL -- the hook fired " & $asked &
+           " time(s) and the walk produced no candidate at all, so either " &
+           "DamageInfo.Player was null on every hit or one of the two " &
+           "offsets is wrong for the installed build. " & c
+  if matched == 0:
+    return "sain FIRED-AT-US VERDICT: FAIL -- " & $walked & " candidate " &
+           "shooter address(es) were produced and NONE matched a player this " &
+           "mod holds. That is the exact signature of the risk this walk " &
+           "declares: DamageInfo.Player is an interface field, and a wrong " &
+           "implementor makes +0x18 read a foreign offset and answer a " &
+           "plausible address. Treat the offsets as unproven. " & c
+  if gFiredAtUsCredited == 0:
+    return "sain FIRED-AT-US VERDICT: INCONCLUSIVE -- " & $matched &
+           " shooter(s) were identified as real players, but none was ever " &
+           "the enemy the hit bot currently believed in, so no per-enemy " &
+           "signal was set. The walk works; the attribution had nothing to " &
+           "attribute to. " & c
+  result = "sain FIRED-AT-US VERDICT: PASS -- " & $gFiredAtUsCredited &
+           " hit(s) were attributed to the enemy the bot was already " &
+           "tracking, which is the first time firedAtUsThisTick has ever " &
+           "been set. " & c
 
 proc stats*(): string =
   result = $gBots.len & " bots, " & $gDecisionsMade & " decisions, " &

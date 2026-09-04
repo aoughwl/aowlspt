@@ -113,6 +113,11 @@ type
     capFull            ## bots can be read and driven
 
 var gCapability = capNone
+var gAliveCount = 0
+proc aliveCount*(): int = gAliveCount
+  ## What step 7 counted off `GameWorld.AllAlivePlayersList@0x1c8` on the last
+  ## pass. Handed to `levelOneVerdict` rather than re-read, so the probe and
+  ## the verdict cannot disagree about how many players there were.
 var gAnnounced = false
 var gProbeNote = ""
 
@@ -284,6 +289,53 @@ proc probe*(): Capability =
   # (docs/SAIN_RVA.md) -- the ~6 drive setters AND the ~50 sensor getters -- not
   # re-enabling `capFull` over the fatal path. That conversion is not done here.
   let liveCount = listLen(list)
+  gAliveCount = liveCount
+
+  # STEP 7's REFUSAL IS NOW CONDITIONAL, and the condition is exactly the thing
+  # the long comment above says would have to change.
+  #
+  # That comment ends "Reviving to capFull needs those call sites replaced with
+  # the byte-verified RVA table, not the fatal path re-enabled." THE CALL SITES
+  # HAVE BEEN REPLACED. `client/rvatable.nim` carries 27 static-RVA rows and 9
+  # field rows; `live.ensure` takes the RVA path FIRST for any member carrying
+  # an `rvaKey` and never reaches `il2cpp_object_get_class` for one; and every
+  # member the table does not cover is a STATED refusal that is never retried
+  # reflectively.
+  #
+  # So the honest reading is that the refusal was discharged by the RVA table
+  # and then OUTLIVED it: the mod went on refusing capFull for a mechanism it
+  # no longer uses, which made every downstream verdict -- reads, cover,
+  # decisions, drives -- INCONCLUSIVE for a reason that had stopped being true.
+  # That is CLAUDE.md 9b from the other side: not a check that cannot fail, but
+  # a refusal that cannot lift.
+  #
+  # THE CONDITION IS THE DRIVE LEVEL, NOT THE FLAG, and deliberately so. At
+  # level 0 nothing binds at all, so capFull would be a licence to walk members
+  # that are all going to refuse. `sainRvaTable` false leaves the refusal below
+  # EXACTLY as it was, so turning the table off is still the way back to the
+  # previously shipped behaviour without a rebuild.
+  if rvaTableOn() and rvaDriveLevel() >= RvaLevelReads:
+    gCapability = capFull
+    gProbeNote = "the world and the alive-players list were both reached " &
+      "without calling into game code, and the list COUNTS: " & $liveCount &
+      " alive players. capFull is GRANTED because the second blocker was " &
+      "REMOVED rather than waived: every sensor read on the walk past this " &
+      "point carries an rvaKey and binds either at a static RVA whose 16 " &
+      "prologue bytes the host compares against its startup snapshot, or at a " &
+      "fieldOffsets offset with a VirtualQuery per hop. No member reaches " &
+      "il2cpp_class_get_method_from_name. Members the table does not cover are " &
+      "stated refusals and are NOT retried by name. Drive level is " &
+      rvaLevelName(rvaDriveLevel()) & ", which bounds how much of the table " &
+      "may bind. THIS IS NOT A CLAIM THAT ANY BOT WAS READ -- it is a claim " &
+      "that the walk is allowed to try. The per-raid LEVEL census and the " &
+      "verdicts are the instrument for whether it worked"
+    crumb("step 7/7: counted the alive-players list = " & $liveCount &
+          "; capFull GRANTED (RVA table on at " &
+          rvaLevelName(rvaDriveLevel()) & ")")
+    crumb("step 7/7 granted; the arming path is complete and this trace stops")
+    gCrumbsDone = true
+    return gCapability
+
   crumb("step 7/7: counted the alive-players list = " & $liveCount &
         " (measured layout, no game call); capFull still refused -- by-name " &
         "sensor/drive binding")
@@ -302,7 +354,11 @@ proc probe*(): Capability =
                "with the byte-verified RVA table (docs/SAIN_RVA.md), not the " &
                "fatal path re-enabled. Meanwhile difficulty and per-role " &
                "difficulty do reach bots, over server/drive.nim's botnav " &
-               "path, which uses byte-verified RVAs and no name lookup"
+               "path, which uses byte-verified RVAs and no name lookup. THE WAY PAST " &
+               "THIS on this build is sainRvaTable = true at " &
+               "sainRvaTableDriveLevel >= 1; it is currently " &
+               (if rvaTableOn(): "ON at " & rvaLevelName(rvaDriveLevel())
+                else: "OFF")
   crumb("step 7/7 refused; the arming path is complete and this trace stops")
   gCrumbsDone = true
   result = gCapability
@@ -1246,6 +1302,71 @@ proc resetDriveRefusals*() =
   gDriveRefusedLogged = 0
   resetDriveGateCounters()
 
+# --- PER-DRIVE-KIND ACCOUNTING.
+#
+# `driveStats` already counts calls in total and names what was NOT delivered.
+# What it could not say is, for ONE kind of drive call, how many times the
+# decision core ORDERED it and how many times the call was actually made -- and
+# those two differing is the only thing that distinguishes "the ladder never
+# asked" from "the ladder asked and the channel refused". A single total cannot
+# tell those apart, and at level 3 that is exactly the question.
+#
+# ONE reason is kept per kind, the FIRST, not the last: a channel that refuses
+# for a real reason on the first order and then for a cascade of consequences
+# afterwards should report the cause, not the tail.
+var gLookOrdered = 0
+var gLookMade = 0
+var gLookRefusedWhy = ""
+var gShootOrdered = 0
+var gShootMade = 0
+var gShootRefusedWhy = ""
+
+proc noteDriveKind(slot: var string; why: string) =
+  if slot.len == 0:
+    slot = why
+
+proc driveKindLines*(): seq[string] =
+  ## One line per drive-call kind: ordered, made, and the first refusal.
+  ##
+  ## Written as ordered-vs-made rather than as a success count on purpose. A
+  ## line reading "0 ordered, 0 made" is INCONCLUSIVE and says so; a line
+  ## reading "31 ordered, 0 made" is a FAIL with a reason attached. A bare
+  ## "0 calls" is indistinguishable between the two, and that ambiguity is what
+  ## made every previous drive verdict unreadable.
+  result = @[]
+  result.add "sain DRIVE KIND look (BotSteering::LookToPoint @0x1A3B690): " &
+    $gLookOrdered & " ordered, " & $gLookMade & " made, first refusal: " &
+    (if gLookRefusedWhy.len > 0: gLookRefusedWhy
+     elif gLookOrdered == 0: "none -- and none was possible: the decision core " &
+       "never ordered a look this raid, so this channel is INCONCLUSIVE " &
+       "rather than passing"
+     else: "none")
+  result.add "sain DRIVE KIND shoot (ShootData::Shoot): " &
+    $gShootOrdered & " ordered, " & $gShootMade & " made, first refusal: " &
+    (if gShootRefusedWhy.len > 0: gShootRefusedWhy
+     elif gShootOrdered == 0: "none -- and none was possible: no shot was " &
+       "ordered this raid, so this channel is INCONCLUSIVE rather than passing"
+     else: "none")
+  result.add "sain DRIVE KIND sprint (BotMover::Sprint): " &
+    $(gSprintIssued + gSprintWithheld) & " ordered, " & $gSprintIssued &
+    " made, first refusal: " &
+    (if gSprintWithheld > 0 and not gClientLocomotion:
+       "clientDrivesLocomotion is OFF, so locomotion belongs to " &
+       "server/drive.nim by the one-writer rule and this actuator withheld " &
+       $gSprintWithheld & " calls DELIBERATELY. This is not a failure of the " &
+       "call and must not be read as one"
+     else: "none")
+  result.add "sain DRIVE KIND move (BotMover::GoToPoint): " &
+    $gMoveTargetsDropped & " ordered, 0 made, first refusal: GoToPoint needs " &
+    "8 register slots and EFT.BotOwner::GoToPoint 9; the shape dispatcher " &
+    "tops out at 5 and REFUSES rather than spilling to the stack. This is a " &
+    "permanent, stated refusal on this build, not a runtime failure"
+  result.add "sain DRIVE KIND self (BotReload::TryReload and the three " &
+    "medical applies): " & $gSelfActionsRefused & " refused. The three " &
+    "medical applies are PERMANENT refusals (each stores an unchecked managed " &
+    "Action for a continuation to invoke later, off any stack of ours); " &
+    "TryReload is a level-3 row and binds only at sainRvaTableDriveLevel 3"
+
 proc applyTo*(l: BotLive; a: Actuation): int =
   ## Push an actuation into the game. Returns how many calls were made, which is
   ## what the driver budgets against.
@@ -1349,14 +1470,32 @@ proc applyTo*(l: BotLive; a: Actuation): int =
           inc calls
 
   if a.hasLookTarget:
+    inc gLookOrdered
     let st = steeringOf(l.owner)
-    if st != nil and lookToPoint(st, a.lookAt):
+    if st == nil:
+      noteDriveKind(gLookRefusedWhy,
+        "BotSteering: the component hop off EFT.BotOwner.<Steering>@0x148 " &
+        "returned null or refused its guard, so nothing was called")
+    elif lookToPoint(st, a.lookAt):
+      inc gLookMade
       inc calls
+    else:
+      noteDriveKind(gLookRefusedWhy,
+        "BotSteering::LookToPoint refused at the call: " & driveWhy())
 
   if a.shoot:
+    inc gShootOrdered
     let sd = shootDataOf(l.owner)
-    if sd != nil and fireOnce(sd):
+    if sd == nil:
+      noteDriveKind(gShootRefusedWhy,
+        "ShootData: the component hop off EFT.BotOwner.<ShootData>@0x280 " &
+        "returned null or refused its guard, so nothing was called")
+    elif fireOnce(sd):
+      inc gShootMade
       inc calls
+    else:
+      noteDriveKind(gShootRefusedWhy,
+        "ShootData::Shoot refused at the call: " & driveWhy())
 
   result = calls
 

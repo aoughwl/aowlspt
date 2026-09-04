@@ -1,4 +1,4 @@
-﻿# SAIN driver â€” the RVA table, and the one live measurement that gates it
+# SAIN driver â€” the RVA table, and the one live measurement that gates it
 
 This is the byte-verified static-RVA table that replaces SAIN's per-tick by-name
 binding (`ensure`/`resolveOn`/`findOn` â†’ the token-gated `il2cpp_class_*` exports,
@@ -147,6 +147,57 @@ Why this is NOT a subagent job and NOT a wiring afternoon:
 
 Do it incrementally, in the coordinating session, one component at a time, each
 verified live against `K>0` and a value read-back before the next is added.
+
+
+## 2026-09-04 -- the rows and gates that changed, one line each
+
+Measured with `tools/il2cpp_resolve.py D:/Games/Tarkov/GameAssembly.dll
+.cache/global-metadata.dec.dat` against build 1.1.0.1.46777, the same scope
+string every row in this file carries.
+
+| what | change | the measurement |
+|---|---|---|
+| `capFull` | GRANTED when `sainRvaTable` is on at `sainRvaTableDriveLevel >= 1`, refused verbatim as before otherwise | `client/bridge.nim` step 7. Nothing about the client changed: the refusal cited "every sensor read past the count binds BY NAME", and that stopped being true when the RVA table landed. The refusal OUTLIVED its reason and made every downstream verdict INCONCLUSIVE. |
+| `EFT.Player::OnHealthApplyDamage(EBodyPart, float, DamageInfo)` | NEW patch-by-RVA PREFIX, `DamageShooterSpec`, level 1 | `0x7395E0`, `shared` = UNIQUE owners=1, section `il2cpp`; `bytes 0x7395E0 16` = `48 89 5C 24 08 48 89 74 24 10 57 48 81 EC 10 01`. **4 register slots** including `this`, the only one of the three damage entry points that fits: `ApplyDamageInfo` is 5 and `ApplyShot` is 6, so their later arguments are on the caller's stack. |
+| `EFT.Ballistics.DamageInfo.Player` | NEW field read, `0x60` boxed / **`0x50` unboxed** | `fields EFT.Ballistics.DamageInfo`. The host hands a typed frame's `argPointer` a pointer to the UNBOXED copy for an `AOWLSPT_ARG_BIGVALUE`, so the 0x10 object header is not there. Declared type is the INTERFACE `IObserverToPlayerBridge` -- see the refusal note below. |
+| `EFT.PlayerBridge._player` | NEW field read, `0x18` | `fields EFT.PlayerBridge`. Reference type, so the offset is used as `fieldOffsets` prints it. `EFT.PlayerBridge::get_iPlayer` @0x6898F0 is literally `mov rax,[rcx+0x18]; ret`, which is the same field and is why the read is taken instead of the (folded) call. |
+
+### The one thing the shooter walk cannot prove, and what is done about it
+
+`DamageInfo.Player` is declared as an interface and this build gives no way to
+ask a live object its type. If a shooter's bridge is some implementor other
+than `EFT.PlayerBridge`, `+0x18` reads a foreign field and **answers** a
+plausible, readable, wrong address -- it does not fault.
+
+So `live.shooterFromDamageInfo` produces a **candidate**, never an identity,
+and `driver.drainDamage` credits it only when it equals a player this mod
+already holds (`knownPlayer`, built once per drain off the bot table and the
+current enemy keys). A foreign read matches nothing and is counted in
+`unmatched`. **The `unmatched` count is the falsifier**: a raid where it dwarfs
+`matched` says the offsets are wrong, and `sain FIRED-AT-US VERDICT` reports
+exactly that case as a FAIL with the reason attached.
+
+### Two statements in this document that were re-measured and are FALSE
+
+Both were in `mods/sain/sain.nim`'s damage-hook comment rather than here, but
+they gated a row this file is about:
+
+1. *"the DamageInfo arrives as `akBigValue`, a pointer to a copy the host
+   refuses to hand over."* `abi/aowlspt_frame.h:aowl_frame_ptr` accepts
+   `AOWLSPT_ARG_BIGVALUE` explicitly and returns the pointer. It was never
+   refused.
+2. *"nothing in the DamageInfo names the shooter."* `Player` @0x60 does, via
+   one further hop.
+
+### The cover sensor: the row was never unbound
+
+`Physics::Raycast @0x5328830` is bound and byte-verified by
+`client/drivecalls.nim` and reports `RVA 0x5328830, 1 owner, prologue verified`
+at `bindProbe`. That log line was accurate the whole time. What never happened
+is the **sample**: `runSample` is reached only from `driver.coverJob`, the
+driver's `scan`/`tick` are gated on `capFull` in `sain.nim:onUpdate`, and step 7
+refused `capFull` unconditionally. So the sensor was armed and never asked.
+Nothing about the raycast row changed; the gate above it did.
 
 ## fact-#24 disposal â€” NOT in this path (cleared)
 

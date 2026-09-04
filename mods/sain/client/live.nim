@@ -2392,7 +2392,7 @@ proc bindAll*() =
 proc reportOne(name: string; l: LazyCall) =
   ## The shape is named separately from "fast", and deliberately so. A shaped
   ## binding is the one kind here that rests on an asserted calling convention
-  ## rather than on the runtime'''s own answer, so anyone reading a log after a
+  ## rather than on the runtime's own answer, so anyone reading a log after a
   ## client update needs to be able to see at a glance which calls those are.
   if l.fldOk:
     # Named separately from `fast` for the same reason `shaped` is: a field row
@@ -2541,6 +2541,64 @@ proc rvaFieldTally*(): (int, int, int) =
   rvaLoad()
   result = (gRvaFieldRows.len, gRvaFieldBound, gRvaFieldFaults)
 
+type
+  MemberRow* = object
+    ## One entry of the binding table, as data.
+    ##
+    ## THE POINT OF THIS TYPE IS THAT THERE IS ONE LIST. `report()` and
+    ## `levelCensus()` ask different questions of the same 45 members, and
+    ## before this existed the only way to ask a second question was to paste
+    ## the list again -- at which point the two drift and the census silently
+    ## stops covering a member somebody added. The copy is 45 objects, built
+    ## twice a raid on the reporting path, and never in a tick.
+    name*: string
+    call*: LazyCall
+
+proc memberRows*(): seq[MemberRow] =
+  ## Every member `bindAll` covers, in the order a human reads them.
+  result = @[]
+  result.add MemberRow(name: "List.Count", call: gB.listCount)
+  result.add MemberRow(name: "List.Item", call: gB.listItem)
+  result.add MemberRow(name: "Player.IsAI", call: gB.pIsAI)
+  result.add MemberRow(name: "Player.ProfileId", call: gB.pProfileId)
+  result.add MemberRow(name: "Player.AIData", call: gB.pAIData)
+  result.add MemberRow(name: "Player.HealthController", call: gB.pHealth)
+  result.add MemberRow(name: "Player.MovementContext", call: gB.pMovement)
+  result.add MemberRow(name: "Player.Position", call: gB.pPosition)
+  result.add MemberRow(name: "Player.LookDirection", call: gB.pLookDir)
+  result.add MemberRow(name: "AIData.BotOwner", call: gB.aiBotOwner)
+  result.add MemberRow(name: "MovementContext.IsSprintEnabled", call: gB.mcSprint)
+  result.add MemberRow(name: "HealthController.IsAlive", call: gB.hcAlive)
+  result.add MemberRow(name: "HealthController.GetBodyPartHealth", call: gB.hcBodyPart)
+  result.add MemberRow(name: "BotOwner.Memory", call: gB.boMemory)
+  result.add MemberRow(name: "BotOwner.WeaponManager", call: gB.boWeapon)
+  result.add MemberRow(name: "BotOwner.Mover", call: gB.boMover)
+  result.add MemberRow(name: "BotOwner.Steering", call: gB.boSteering)
+  result.add MemberRow(name: "BotOwner.ShootData", call: gB.boShoot)
+  result.add MemberRow(name: "BotOwner.AimingManager (identity only)", call: gB.boAiming)
+  result.add MemberRow(name: "AimingManager.CurrentAiming (identity only)", call: gB.amCurrent)
+  result.add MemberRow(name: "BotOwner.BotsGroup (identity only)", call: gB.boBotsGroup)
+  result.add MemberRow(name: "GameWorld.Grenades", call: gB.wGrenades)
+  result.add MemberRow(name: "Grenade.Position", call: gB.grPosition)
+  result.add MemberRow(name: "BotMemory.IsUnderFire", call: gB.memUnderFire)
+  result.add MemberRow(name: "BotMemory.GoalEnemy", call: gB.memGoalEnemy)
+  result.add MemberRow(name: "Enemy.Person", call: gB.enPerson)
+  result.add MemberRow(name: "Enemy.IsVisible", call: gB.enVisible)
+  result.add MemberRow(name: "Enemy.CanShoot", call: gB.enCanShoot)
+  result.add MemberRow(name: "Enemy.CurrPosition", call: gB.enPosition)
+  result.add MemberRow(name: "Weapon.HaveBullets", call: gB.wmHaveBullets)
+  result.add MemberRow(name: "Reload.TryReload", call: gB.rlTryReload)
+  result.add MemberRow(name: "Mover.GoToPoint", call: gB.mvGoTo)
+  result.add MemberRow(name: "Mover.Sprint", call: gB.mvSprint)
+  result.add MemberRow(name: "Steering.LookToPoint", call: gB.stLookTo)
+  result.add MemberRow(name: "ShootData.Shoot", call: gB.sdShoot)
+  result.add MemberRow(name: "Mover.Stop", call: gB.mvStop)
+  result.add MemberRow(name: "FirstAid.ShallStartUse", call: gB.faShall)
+  result.add MemberRow(name: "SurgicalKit.ShallStartUse", call: gB.surgShall)
+  result.add MemberRow(name: "FirstAid.TryApplyToCurrentPart", call: gB.faApply)
+  result.add MemberRow(name: "Stimulators.TryApply", call: gB.stimApply)
+  result.add MemberRow(name: "SurgicalKit.TryApplyToCurrentPart", call: gB.surgApply)
+
 proc report*() =
   ## Every binding's own account of itself, once.
   ##
@@ -2554,47 +2612,11 @@ proc report*() =
   info "sain: IL2CPP bindings --"
   info "sain:   " & gB.worldWhy
   info "sain:   " & gB.aliveWhy
-  reportOne("List.Count", gB.listCount)
-  reportOne("List.Item", gB.listItem)
-  reportOne("Player.IsAI", gB.pIsAI)
-  reportOne("Player.ProfileId", gB.pProfileId)
-  reportOne("Player.AIData", gB.pAIData)
-  reportOne("Player.HealthController", gB.pHealth)
-  reportOne("Player.MovementContext", gB.pMovement)
-  reportOne("Player.Position", gB.pPosition)
-  reportOne("Player.LookDirection", gB.pLookDir)
-  reportOne("AIData.BotOwner", gB.aiBotOwner)
-  reportOne("MovementContext.IsSprintEnabled", gB.mcSprint)
-  reportOne("HealthController.IsAlive", gB.hcAlive)
-  reportOne("HealthController.GetBodyPartHealth", gB.hcBodyPart)
-  reportOne("BotOwner.Memory", gB.boMemory)
-  reportOne("BotOwner.WeaponManager", gB.boWeapon)
-  reportOne("BotOwner.Mover", gB.boMover)
-  reportOne("BotOwner.Steering", gB.boSteering)
-  reportOne("BotOwner.ShootData", gB.boShoot)
-  reportOne("BotOwner.AimingManager (identity only)", gB.boAiming)
-  reportOne("AimingManager.CurrentAiming (identity only)", gB.amCurrent)
-  reportOne("BotOwner.BotsGroup (identity only)", gB.boBotsGroup)
-  reportOne("GameWorld.Grenades", gB.wGrenades)
-  reportOne("Grenade.Position", gB.grPosition)
-  reportOne("BotMemory.IsUnderFire", gB.memUnderFire)
-  reportOne("BotMemory.GoalEnemy", gB.memGoalEnemy)
-  reportOne("Enemy.Person", gB.enPerson)
-  reportOne("Enemy.IsVisible", gB.enVisible)
-  reportOne("Enemy.CanShoot", gB.enCanShoot)
-  reportOne("Enemy.CurrPosition", gB.enPosition)
-  reportOne("Weapon.HaveBullets", gB.wmHaveBullets)
-  reportOne("Reload.TryReload", gB.rlTryReload)
-  reportOne("Mover.GoToPoint", gB.mvGoTo)
-  reportOne("Mover.Sprint", gB.mvSprint)
-  reportOne("Steering.LookToPoint", gB.stLookTo)
-  reportOne("ShootData.Shoot", gB.sdShoot)
-  reportOne("Mover.Stop", gB.mvStop)
-  reportOne("FirstAid.ShallStartUse", gB.faShall)
-  reportOne("SurgicalKit.ShallStartUse", gB.surgShall)
-  reportOne("FirstAid.TryApplyToCurrentPart", gB.faApply)
-  reportOne("Stimulators.TryApply", gB.stimApply)
-  reportOne("SurgicalKit.TryApplyToCurrentPart", gB.surgApply)
+  let rows = memberRows()
+  var ri = 0
+  while ri < rows.len:
+    reportOne(rows[ri].name, rows[ri].call)
+    inc ri
 
 type
   BindTally* = object
@@ -2989,3 +3011,168 @@ proc drop*(h: uint32) =
   if h == 0'u32 or not gLive:
     return
   gcHandleFree(gRt, h)
+
+# ---------------------------------------------------------------------------
+# The shooter, out of a DamageInfo the game handed us
+# ---------------------------------------------------------------------------
+#
+# MEASURED 2026-09-04, offline, against GameAssembly.dll 1.1.0.1.46777 with
+# `tools/il2cpp_resolve.py ... fields EFT.Ballistics.DamageInfo`:
+#
+#   EFT.Ballistics.DamageInfo.Player   @0x60  IObserverToPlayerBridge
+#   EFT.PlayerBridge._player           @0x18  EFT.Player
+#
+# BOTH numbers as `fieldOffsets` prints them, i.e. INCLUDING the 0x10 object
+# header. `DamageInfo` is a value type wider than a register, so the host hands
+# a typed frame's `argPointer` a pointer to an UNBOXED COPY -- no header -- and
+# the offset to use there is 0x60 - 0x10 = 0x50. `EFT.PlayerBridge` is a
+# reference type and keeps its header, so 0x18 is used as printed. Getting that
+# subtraction backwards is the whole hazard on this path, so it is spelled out
+# rather than folded into a literal.
+#
+# THE ONE THING THIS WALK CANNOT PROVE, stated plainly: `DamageInfo.Player` is
+# declared as the INTERFACE `IObserverToPlayerBridge`, and this build gives no
+# way to ask a live object its type. If the shooter's bridge is some other
+# implementor, `+0x18` reads a foreign field and ANSWERS rather than faults --
+# the exact failure mode a field row has. So this proc DOES NOT decide who shot;
+# it produces a CANDIDATE address, and `driver.drainDamage` credits it only when
+# it equals a player the bot table already holds. A foreign read yields an
+# address that matches nothing and is counted as unmatched, which is a check
+# that can fail. Never widen that.
+const DamageInfoPlayerUnboxedOff* = 0x50
+  ## `DamageInfo.Player` at 0x60 boxed, minus the 0x10 object header.
+const PlayerBridgePlayerOff* = 0x18
+  ## `EFT.PlayerBridge._player`, a reference type, as fieldOffsets prints it.
+
+var gShooterAsked = 0
+var gShooterWalked = 0
+var gShooterRefused = 0
+
+proc shooterCounters*(asked, walked, refused: var int) =
+  asked = gShooterAsked
+  walked = gShooterWalked
+  refused = gShooterRefused
+
+proc shooterFromDamageInfo*(di: uint64): uint64 =
+  ## A candidate `EFT.Player` address for whoever produced this `DamageInfo`,
+  ## or 0. Every hop VirtualQueried; nothing is called; nothing is written.
+  result = 0'u64
+  if di == 0'u64 or not gLive:
+    return
+  gShooterAsked = gShooterAsked + 1
+  let base = cast[Il2CppPtr](di)
+  if not sainReadable(base, DamageInfoPlayerUnboxedOff + 8):
+    gShooterRefused = gShooterRefused + 1
+    return
+  let bridge = sainFldPtr(base, int64(DamageInfoPlayerUnboxedOff))
+  if bridge == nil or not sainReadable(bridge, PlayerBridgePlayerOff + 8):
+    gShooterRefused = gShooterRefused + 1
+    return
+  let who = sainFldPtr(bridge, int64(PlayerBridgePlayerOff))
+  if who == nil or not sainReadable(who, 8):
+    gShooterRefused = gShooterRefused + 1
+    return
+  gShooterWalked = gShooterWalked + 1
+  result = cast[uint64](who)
+
+# ---------------------------------------------------------------------------
+# The per-raid LEVEL census
+# ---------------------------------------------------------------------------
+#
+# `report()` says what each member did; `rvaReport()` says what the TABLE
+# claims. Neither answers the question a coordinator raising one notch per raid
+# actually has, which is: *at this level, how many of the members that were
+# ALLOWED to bind did, and what did the rest say?*
+#
+# That question has to be asked against the finished state and it has to be
+# askable of a member NOTHING EVER USED -- a `LazyCall` resolves on first use,
+# so a member no bot reached reports `unused`, and counting `unused` as bound
+# would be a census that cannot fail (CLAUDE.md 9b). So `unused` is its own
+# bucket here and is reported as such; it is neither bound nor refused.
+
+type
+  LevelCensus* = object
+    level*: int
+    eligible*: int    ## members whose level requirement this level satisfies
+    bound*: int       ## bound by static RVA or by field read
+    refused*: int     ## attempted and refused, with a reason
+    unused*: int      ## never reached by any bot, so never resolved
+    aboveLevel*: int  ## eligible only at a higher level
+    detail*: string   ## "name: reason; ..." for every refusal, capped
+
+const CensusDetailCap = 12
+  ## How many refusal reasons go into the one line. Past this the line names
+  ## the count it withheld rather than growing without bound -- the host log is
+  ## read by a tool, and a 40-refusal line is a line nobody reads.
+
+proc levelCensusOf*(kind: string): LevelCensus =
+  ## `kind` is "reads", "aim" or "drive" -- which SLICE of the table this
+  ## census is about. The slice is decided by `sainRvaLevelFor`, the same
+  ## function the gate in `ensure` uses, so a census and a gate cannot disagree.
+  let want = (if kind == "drive": RvaLevelDrive
+              elif kind == "aim": RvaLevelAim
+              else: RvaLevelReads)
+  result = LevelCensus(level: gRvaDriveLevel, eligible: 0, bound: 0,
+                       refused: 0, unused: 0, aboveLevel: 0, detail: "")
+  var shown = 0
+  var hidden = 0
+  let rows = memberRows()
+  var i = 0
+  while i < rows.len:
+    let r = rows[i]
+    inc i
+    if r.call.rvaKey.len == 0:
+      continue
+    let need = sainRvaLevelFor(r.call.rvaKey)
+    if need != want:
+      continue
+    result.eligible = result.eligible + 1
+    if need > gRvaDriveLevel:
+      result.aboveLevel = result.aboveLevel + 1
+      continue
+    if r.call.b.ok or r.call.fldOk:
+      result.bound = result.bound + 1
+    elif r.call.rvaTried or r.call.tried:
+      result.refused = result.refused + 1
+      if shown < CensusDetailCap:
+        shown = shown + 1
+        if result.detail.len > 0: result.detail.add "; "
+        result.detail.add r.name & " (" & r.call.rvaKey & "): " &
+          (if r.call.why.len > 0: r.call.why
+           else: "REFUSED WITH NO REASON -- that is a bug in this file, not " &
+                 "a fact about the client")
+      else:
+        hidden = hidden + 1
+    else:
+      result.unused = result.unused + 1
+  if hidden > 0:
+    result.detail.add "; (+" & $hidden & " more refusal(s) withheld from this line)"
+  if result.detail.len == 0:
+    result.detail = "none"
+
+proc levelCensusLine*(kind: string): string =
+  ## The one line a coordinator greps for after a raid.
+  let c = levelCensusOf(kind)
+  let label = (if kind == "drive": "LEVEL 3"
+               elif kind == "aim": "LEVEL 2"
+               else: "LEVEL 1")
+  result = "sain " & label & ": " & $c.bound & " of " & $c.eligible &
+           " " & kind & " bound, " & $c.refused & " refused: " & c.detail
+  # The two buckets that are NEITHER, always, because a reader who sees
+  # "3 of 27 bound, 0 refused" and no third number will conclude the other 24
+  # failed silently. They did not; they were never asked.
+  # THE CENSUS'S OWN INVARIANT, checked rather than assumed: every eligible
+  # member lands in exactly one bucket. A member that fell through the
+  # classification would otherwise vanish from the line and make "3 of 3 bound"
+  # true of a table where three members were quietly unaccounted for.
+  if c.bound + c.refused + c.unused + c.aboveLevel != c.eligible:
+    result = result & " -- CENSUS BUG: the buckets sum to " &
+             $(c.bound + c.refused + c.unused + c.aboveLevel) &
+             " but " & $c.eligible & " member(s) were eligible, so at least " &
+             "one member is unaccounted for and these numbers must not be " &
+             "used as a verdict"
+  result = result & " -- also " & $c.unused &
+           " never reached by any bot (a LazyCall resolves on FIRST USE, so " &
+           "this is 'not asked', not 'failed'), and " & $c.aboveLevel &
+           " eligible only above sainRvaTableDriveLevel = " &
+           rvaLevelName(gRvaDriveLevel)

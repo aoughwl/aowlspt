@@ -318,6 +318,56 @@ const
     ## one is not folded. No other RVA in this repo names 0x1AD48C0, so this is
     ## also not a second detour on an already-detoured function.
 
+  DamageShooterSpec* =
+    "EFT.Player::OnHealthApplyDamage@0x7395E0/iifV>x!48895C24084889742410574881EC1001"
+    ## THE PER-ENEMY "FIRED AT US" SIGNAL, as a PREFIX patch-by-RVA spec.
+    ##
+    ## `README.md` said this row was blocked because the damage hook could not
+    ## name the aggressor. That statement rested on two things, and BOTH have
+    ## been re-measured 2026-09-04 and are false today:
+    ##
+    ##  1. "the DamageInfo arrives as akBigValue, a pointer to a copy the host
+    ##     refuses to hand over." MEASURED in `abi/aowlspt_frame.h`:
+    ##     `aowl_frame_ptr` accepts `AOWLSPT_ARG_BIGVALUE` explicitly and
+    ##     returns the pointer to the copy. It was never refused.
+    ##  2. "nothing in the DamageInfo names the shooter." MEASURED with
+    ##     `il2cpp_resolve.py ... fields EFT.Ballistics.DamageInfo`: field
+    ##     `Player` @0x60, and `EFT.PlayerBridge._player` @0x18 is an
+    ##     `EFT.Player` -- the same kind of address `EnemyInfo::get_Person`
+    ##     hands back, which is what the enemy table is keyed on. See
+    ##     `client/live.nim:shooterFromDamageInfo` for the walk and for the one
+    ##     thing it cannot prove.
+    ##
+    ## WHY THIS METHOD AND NOT `ApplyDamageInfo` OR `ApplyShot`. Slot count.
+    ## MEASURED signatures on this build:
+    ##
+    ##   EFT.Player::ApplyShot(DamageInfo,EBodyPart,EBodyPartColliderType,
+    ##                         EArmorPlateCollider,ShotId)  arity 5  -> 6 slots
+    ##   EFT.Player::ApplyDamageInfo(DamageInfo,EBodyPart,
+    ##                         EBodyPartColliderType,float) arity 4  -> 5 slots
+    ##   EFT.Player::OnHealthApplyDamage(EBodyPart,float,DamageInfo)
+    ##                                                      arity 3  -> 4 slots
+    ##
+    ## Only the last fits entirely in RCX/RDX/R8/R9, so it is the only one of
+    ## the three whose every argument is readable from the frame at all, and it
+    ## is the only one on which a postfix would even be legal. It is bound as a
+    ## PREFIX regardless: the handler reads and returns `frameContinue`, and a
+    ## prefix cannot be wrong about a return value it never touches.
+    ##
+    ## SHAPE `iifV>x`: instance, then `i` EBodyPart (enum), `f` float damage,
+    ## `V` the value type wider than a register, then a void return.
+    ##
+    ## SHAREDNESS: `il2cpp_resolve.py shared 0x7395E0` says UNIQUE, owners=1,
+    ## section `il2cpp`. No other RVA in this repo names 0x7395E0, so this is
+    ## not a second detour on an already-detoured function. The 16 prologue
+    ## bytes are what `bytes 0x7395E0 16` printed on 2026-09-04 and the host
+    ## compares them against its STARTUP SNAPSHOT.
+    ##
+    ## WHAT IT DOES NOT DO: it does not replace the existing suppression feed
+    ## and it changes no decision by itself. It writes one address and one
+    ## timestamp per hit; `core/enemy.nim` already reads `firedAtUsThisTick`
+    ## and has done since it was written, against a field nothing ever set.
+
 proc sainRvaLevelFor*(key: string): int =
   ## The minimum `sainRvaTableDriveLevel` at which a key may bind.
   ##
@@ -1053,3 +1103,85 @@ proc findRvaRefusal*(rs: seq[SainRvaRefusal]; key: string;
       hit = rs[i]
       return true
     inc i
+
+# ---------------------------------------------------------------------------
+# The table's own self-test
+# ---------------------------------------------------------------------------
+
+proc hasChar(s: string; c: char): bool =
+  result = false
+  var i = 0
+  while i < s.len:
+    if s[i] == c:
+      return true
+    inc i
+
+proc specField(spec: string; sep: char; idx: int): string =
+  ## The `idx`th `sep`-separated field of a spec, or "".
+  result = ""
+  var seen = 0
+  var i = 0
+  while i < spec.len:
+    if spec[i] == sep:
+      inc seen
+      if seen > idx:
+        return
+    elif seen == idx:
+      result.add spec[i]
+    inc i
+
+proc rvaSelfCheck*(problems: var seq[string]): bool =
+  ## Everything about this file that can be decided without a client.
+  ##
+  ## It is written as a list of NEGATIVES, each of which a plausible future
+  ## edit would trip: a drive call classified as a read, a spec with no
+  ## prologue to compare, a spec whose declared shape does not match the arity
+  ## the handler indexes, an unboxed offset that forgot the object header.
+  ## A positive restatement of what is already in the file would pass forever.
+  problems = @[]
+
+  # 1. No mutating row is reachable below level 3. Same call the boot report
+  #    makes, run here so a `--fast` selftest fails before a raid does.
+  let bugs = sainRvaDriveAudit(sainRvaRows())
+  var i = 0
+  while i < bugs.len:
+    problems.add "drive-level audit: " & bugs[i]
+    inc i
+
+  # 2. Every row's prologue is 16 bytes, i.e. 47 characters of "XX " pairs.
+  #    A short prologue verifies a prefix and passes on a function that merely
+  #    STARTS the same way, which on this build is a large family: every
+  #    `48 8B 81 ...` field getter begins identically.
+  let rows = sainRvaRows()
+  i = 0
+  while i < rows.len:
+    if rows[i].prologue.len != 47:
+      problems.add rows[i].key & ": prologue is " & $rows[i].prologue.len &
+                   " characters, not the 47 that sixteen space-separated hex " &
+                   "bytes take. A short prologue verifies a PREFIX, and on " &
+                   "this build whole families of getters share one."
+    inc i
+
+  # 3. The two patch-by-RVA specs each carry a prologue at all. A spec with no
+  #    `!` parses, installs, and verifies NOTHING -- the exact shape of a check
+  #    that cannot fail.
+  if not hasChar(AimIsReadySpec, '!'):
+    problems.add "AimIsReadySpec carries no ! prologue, so the host would " &
+                 "install it without any byte comparison"
+  if not hasChar(DamageShooterSpec, '!'):
+    problems.add "DamageShooterSpec carries no ! prologue, so the host would " &
+                 "install it without any byte comparison"
+
+  # 4. DamageShooterSpec's declared shape must be exactly `iifV>x`, because
+  #    `sain.nim` indexes argument 1 for the damage and argument 2 for the
+  #    DamageInfo by hand. If the shape ever changes, those indices are wrong
+  #    and the handler reads a different register with no complaint from
+  #    anybody -- the frame's kind table would agree with the SPEC, which is
+  #    the thing that moved.
+  let shape = specField(specField(DamageShooterSpec, '!', 0), '/', 1)
+  if shape != "iifV>x":
+    problems.add "DamageShooterSpec declares the shape '" & shape &
+                 "', but sain.nim reads argument 1 as the float damage and " &
+                 "argument 2 as the DamageInfo, which only holds for 'iifV>x'"
+
+  result = problems.len == 0

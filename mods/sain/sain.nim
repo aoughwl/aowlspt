@@ -90,6 +90,60 @@ var gWorld = whenReady("EFT.GameWorld")
 var gDeferNoted = false
 var gPreset: Preset
 var gProbedAt = 0'i64
+
+# --- THE PER-RAID CENSUS, and WHEN it is emitted.
+#
+# Twice, and both times for a reason:
+#
+#  1. `CensusAtMs` after the mod first reaches capFull. A coordinator running
+#     one raid per level needs the verdicts while the raid is still up, because
+#     a raid that is exited by killing the client never reaches an unload path
+#     at all -- which is how every previous "we will report it at the end"
+#     instrument produced nothing.
+#  2. On the transition OUT of capFull, and on unload. That is the complete
+#     raid, and its numbers supersede the first emission rather than repeat it;
+#     each is labelled with which it is.
+#
+# It is NOT emitted per tick. The census walks the 45-member table and builds
+# strings; that is a reporting cost, not a frame cost, and rule 7 is explicit
+# that nothing in an update path may allocate per frame.
+const CensusAtMs = 60_000'i64
+  ## One minute into a raid. Long enough that bots have spawned, been scanned,
+  ## been decided about and had a chance to be shot at; short enough that a
+  ## coordinator does not have to keep a raid alive to get an answer.
+var gCensusAt = 0'i64
+var gCensusEarlyDone = false
+var gCensusFinalDone = false
+var gWasFull = false
+
+proc emitCensus(label: string) =
+  ## The lines a coordinator greps for after a raid. Every one of them is a
+  ## statement about the FINISHED STATE -- what bound, what was ordered, what
+  ## came back -- and not about what this mod attempted.
+  info "sain CENSUS (" & label & ") -- sainRvaTableDriveLevel = " &
+       rvaLevelName(rvaDriveLevel())
+  info levelCensusLine("reads")
+  info levelOneVerdict(aliveCount())
+  info coverVerdict()
+  info firedAtUsVerdict()
+  if rvaDriveLevel() >= RvaLevelAim:
+    info levelCensusLine("aim")
+  else:
+    info "sain LEVEL 2: not censused -- sainRvaTableDriveLevel is " &
+         rvaLevelName(rvaDriveLevel()) & " and the aim route needs " &
+         rvaLevelName(RvaLevelAim) & ". This is a refusal by configuration."
+  if rvaDriveLevel() >= RvaLevelDrive:
+    info levelCensusLine("drive")
+  else:
+    info "sain LEVEL 3: not censused -- sainRvaTableDriveLevel is " &
+         rvaLevelName(rvaDriveLevel()) & " and the drive calls need " &
+         rvaLevelName(RvaLevelDrive) & ". This is a refusal by configuration."
+  info decisionKindLine()
+  let dk = driveKindLines()
+  var i = 0
+  while i < dk.len:
+    info dk[i]
+    inc i
 var gHooked = false
 
 ## The methods that might carry a newly activated bot as an argument.
@@ -400,6 +454,15 @@ var gDamageHookNs = 0'i64
 var gDamageHookSamples = 0
 var gDamageHookState = "not attempted"
 var gDamageTyped = false
+var gDamageInfoArg = -1
+  ## Which declared parameter carries the `EFT.Ballistics.DamageInfo`, or -1
+  ## for a shape whose layout this mod has not measured.
+  ##
+  ## SET IN EXACTLY ONE PLACE, the by-RVA arm below, and never by the by-name
+  ## path. The offsets in `live.shooterFromDamageInfo` were measured for THIS
+  ## signature on THIS build; reading them out of some other method's argument
+  ## because it happened to be called DamageInfo would be a foreign read that
+  ## answers rather than faults.
 var gDamageAmountArg = -1
   ## Which declared parameter carries the damage, or -1 for a shape that has
   ## none. Settled once, in `armDamageHook`, out of the runtime's own metadata
@@ -489,7 +552,20 @@ proc onPlayerDamagedTyped(f: PatchFrame): TypedResult =
     let v = f.argFloat(gDamageAmountArg, ok)
     if ok and v > 0.0:
       amount = v
-  noteDamage(who, amount)
+  # WHO SHOT, when the frame carries a DamageInfo this mod knows the shape of.
+  #
+  # `gDamageInfoArg` is -1 on every by-name shape, so this is inert unless the
+  # hook armed by RVA on the one signature whose DamageInfo is measured. The
+  # walk itself is guarded and reports its own refusals; nothing is credited
+  # here, only queued, and `driver.drainDamage` is where a candidate has to
+  # match a player this mod already holds before it becomes an attribution.
+  var shooter = 0'u64
+  if gDamageInfoArg >= 0:
+    var pok = false
+    let di = f.argPointer(gDamageInfoArg, pok)
+    if pok:
+      shooter = shooterFromDamageInfo(di)
+  noteDamage(who, amount, shooter)
   if measuring:
     gDamageHookNs = gDamageHookNs + nanosBetween(t0, perfCounter())
     gDamageHookSamples = gDamageHookSamples + 1
@@ -682,6 +758,64 @@ proc armAimHook() =
                     " candidate aim members exists on this build; bots " &
                     "shoot when the ladder says so, exactly as before"
 
+proc armDamageHookByRva(): bool =
+  ## The damage prefix on a VERIFIED STATIC ADDRESS.
+  ##
+  ## This is the route past the refusal the by-name path below states: every
+  ## candidate there is checked with `signatureOf` first, `signatureOf` is the
+  ## token-gated by-name path, so on this build NOTHING arms and the hook has
+  ## never fired in a raid. An `@0x` spec resolves no name at all.
+  ##
+  ## PREFIX, not postfix, and the slot count is why it is allowed to be either:
+  ## `EFT.Player::OnHealthApplyDamage(EBodyPart, float, DamageInfo)` is 4
+  ## register slots including `this`, so no argument of it lives on the
+  ## caller's stack and the >4-slot postfix hazard cannot apply. It is bound as
+  ## a prefix anyway because the handler reads and never writes, and a prefix
+  ## has no return value it could get wrong.
+  ##
+  ## Level 1. Nothing about it changes the game's state: it reads three
+  ## registers, walks two guarded field hops, and appends to a fixed ring.
+  result = false
+  if not (rvaTableOn() and rvaDriveLevel() >= RvaLevelReads):
+    gDamageHookState = "refused: the by-RVA damage prefix needs sainRvaTable " &
+      "on at sainRvaTableDriveLevel >= " & $RvaLevelReads & "; it is " &
+      (if rvaTableOn(): "on at " & rvaLevelName(rvaDriveLevel()) else: "OFF") &
+      ". This is a refusal by configuration, not a measurement"
+    return
+  if not typedPatchesReady():
+    gDamageHookState = "refused: the typed frame needs host ABI revision 4 " &
+      "and this host reports " & $hostApiSize() & " bytes of HostApi. There " &
+      "is no JSON fallback for this route: the JSON payload cannot carry a " &
+      "pointer to a by-value DamageInfo copy, which is the whole argument " &
+      "this hook exists to read"
+    return
+  info "sain: damage prefix -- installing by VERIFIED STATIC RVA: " &
+       DamageShooterSpec
+  if hookTyped(DamageShooterSpec, onPlayerDamagedTyped) != Ok:
+    gDamageHookState = "refused: the by-RVA install of " & DamageShooterSpec &
+      " did not take -- " & lastError() & ". The host names the gate that " &
+      "failed (module base, code page, il2cpp section, or the prologue " &
+      "byte-compare against its startup snapshot). A prologue mismatch means " &
+      "the installed GameAssembly.dll is not " & SainRvaScope
+    return
+  setDamageHooked(true)
+  gDamageTyped = true
+  # THE ARGUMENT INDICES, from the DECLARED signature in the spec's own shape
+  # letters (`iifV`), not guessed and not searched for at run time: argument 0
+  # is EBodyPart, 1 is the float damage, 2 is the DamageInfo.
+  gDamageAmountArg = 1
+  gDamageInfoArg = 2
+  gDamageHookState = "armed by static RVA on EFT.Player::OnHealthApplyDamage " &
+    "@0x7395E0 (UNIQUE owners=1, 16/16 prologue bytes verified by the host " &
+    "against its startup snapshot, 4 register slots so no argument is on the " &
+    "caller's stack), telling suppression each hit as it lands AND walking " &
+    "DamageInfo.Player@0x60 -> PlayerBridge._player@0x18 for the shooter. " &
+    "ARMED IS NOT FIRED and a walk is not an identification: the FIRED-AT-US " &
+    "VERDICT line in the census is the only thing that settles either, and it " &
+    "counts candidates that matched NOTHING as the falsifier"
+  info "sain: damage prefix BOUND at 0x7395E0 EFT.Player::OnHealthApplyDamage"
+  result = true
+
 proc armDamageHook() =
   ## The damage postfix, typed where the host has it and JSON where it does
   ## not.
@@ -698,6 +832,18 @@ proc armDamageHook() =
   ## The same up-front refusal as `armAimHook`, for the same measured reason:
   ## every candidate here is checked with `signatureOf` first, and `signatureOf`
   ## is the by-name path that takes the client down on this build.
+  ##
+  ## THE BY-RVA PREFIX IS TRIED FIRST and returns on success. What follows is
+  ## not a fallback for it: it is the pre-RVA path, and on this build it cannot
+  ## arm at all, because every candidate is checked with `signatureOf` first.
+  ## When the RVA table is on, the by-name ladder is not even entered -- there
+  ## is nothing to gain from walking a ladder whose every rung is a refusal,
+  ## and entering it would overwrite the by-RVA refusal reason with a vaguer
+  ## one.
+  if armDamageHookByRva():
+    return
+  if rvaTableOn():
+    return
   if reflectionRefused():
     gDamageHookState = "refused: " & ReflectionRefusal &
                        " Suppression keeps inferring hits from the health " &
@@ -1346,7 +1492,23 @@ proc runSelfTest(s: Settings): int =
   else:
     success "sain: flanking dispatcher arithmetic, " &
             "distance and personality draw both check out"
-  result = r.failed + dispatchFails.len + runCostReport(s)
+  # The RVA TABLE's own self-check, run here so a table edit fails a --fast
+  # selftest rather than a raid. Everything it asserts is decidable without a
+  # client and every assertion is a negative: a mutating row reachable below
+  # level 3, a prologue too short to be sixteen bytes, a patch spec with no
+  # prologue at all, or a spec shape that no longer matches the argument
+  # indices sain.nim reads by hand.
+  var rvaFails: seq[string] = @[]
+  if not rvaSelfCheck(rvaFails):
+    for line in rvaFails:
+      error "sain: RVA TABLE SELF-CHECK FAILED -- " & line
+  else:
+    success "sain: RVA table self-check passed -- no mutating row is " &
+            "reachable below level 3, every row carries a full 16-byte " &
+            "prologue, both patch-by-RVA specs carry one to compare, and " &
+            "DamageShooterSpec's declared shape still matches the argument " &
+            "indices the damage handler reads"
+  result = r.failed + dispatchFails.len + rvaFails.len + runCostReport(s)
 
 proc runDriveQueueSelfTest(): int =
   ## The order ring between the two threads, exercised on one.
@@ -2189,6 +2351,17 @@ proc onUpdate(elapsedMs: int64): Status =
     installHooks()
     info "sain: installHooks returned; arming complete"
 
+  # The capFull EDGE, both ways, before anything else reads the capability.
+  if capability() == capFull and not gWasFull:
+    gWasFull = true
+    gCensusAt = now + CensusAtMs
+  elif capability() != capFull and gWasFull:
+    gWasFull = false
+    if not gCensusFinalDone:
+      gCensusFinalDone = true
+      emitCensus("raid ended -- capability fell back to " &
+                 (if capability() == capReadOnly: "capReadOnly" else: "capNone"))
+
   if capability() != capFull:
     # Re-probe occasionally rather than every frame: the answer only changes
     # when the game loads a raid, and `resolve` walks every loaded assembly.
@@ -2203,6 +2376,11 @@ proc onUpdate(elapsedMs: int64): Status =
   # the game rather than the defaults.
   scan(now)
   tick(elapsedMs)
+
+  if (not gCensusEarlyDone) and gCensusAt > 0'i64 and now >= gCensusAt:
+    gCensusEarlyDone = true
+    emitCensus("one minute in -- the raid is still running, so these numbers " &
+               "are a floor and the raid-ended census supersedes them")
   Ok
 
 proc onUnload(): Status =
@@ -2211,6 +2389,9 @@ proc onUnload(): Status =
   if side() == sideClient:
     # Order matters: the stats line names how many handles were released, and
     # `releaseAll` is what makes that number true.
+    if gWasFull and not gCensusFinalDone:
+      gCensusFinalDone = true
+      emitCensus("unload")
     releaseAll()
     info "sain: " & stats()
   Ok
