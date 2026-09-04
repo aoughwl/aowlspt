@@ -156,6 +156,10 @@ proc cNuIntern(s: cstring): Il2CppPtr {.importc: "aowl_nu_intern", nodecl.}
 proc cNuInternCount(): int32 {.importc: "aowl_nu_intern_count", nodecl.}
 proc cNuInternOverflowed(): int32 {.
   importc: "aowl_nu_intern_overflowed", nodecl.}
+proc cNuInternTooLong(): int32 {.importc: "aowl_nu_intern_toolong", nodecl.}
+proc cNuInternNewFail(): int32 {.importc: "aowl_nu_intern_newfail", nodecl.}
+proc cNuInternMaxSeen(): int32 {.importc: "aowl_nu_intern_maxseen", nodecl.}
+proc cNuInternMaxLen*(): int32 {.importc: "aowl_nu_intern_maxlen", nodecl.}
 
 proc cNuOwn(go: Il2CppPtr): int32 {.importc: "aowl_nu_own", nodecl.}
 proc cNuDisown(go: Il2CppPtr) {.importc: "aowl_nu_disown", nodecl.}
@@ -497,6 +501,26 @@ proc nuOk(p: Il2CppPtr; n: int32): bool =
   p != nil and cIsReadable(p, n) != 0'i32
 
 proc nuF(v: float32): string = formatFloat(float64(v), ffDecimal, 1)
+
+proc nuStrWhy*(s: string; why: var string): Il2CppPtr =
+  ## `nuStr`, but a NULL result NAMES ITSELF. The plain `nuStr` returns nil for
+  ## three unrelated reasons and callers have already been burnt reporting the
+  ## wrong one: a 181-character tooltip body was refused for LENGTH and the
+  ## caller blamed `il2cpp_object_new`.
+  var tmp = s
+  why = ""
+  result = cNuIntern(toCString(tmp))
+  if result != nil: return
+  if s.len >= int(cNuInternMaxLen()):
+    why = "the text is " & $s.len & " characters and the intern table's " &
+          "per-entry cap is " & $int(cNuInternMaxLen()) & "; it was REFUSED " &
+          "for length and no managed string was made"
+  elif cNuInternOverflowed() != 0'i32:
+    why = "the intern table is FULL at " & $int(cNuInternCount()) &
+          " entries, so no new managed string can be made this session"
+  else:
+    why = "il2cpp_string_new refused or is not resolvable (newfail=" &
+          $int(cNuInternNewFail()) & ")"
 
 proc nuStr(s: string): Il2CppPtr =
   ## An INTERNED managed string. Allocated at most once per distinct text for

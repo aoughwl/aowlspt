@@ -1961,7 +1961,21 @@ static int32_t aowl_nu_slot_judge(int32_t k, void* got) {
  * into a clean, named refusal instead of unbounded growth on the Unity thread.
  */
 #define AOWL_NU_MAX_INTERN     512
-#define AOWL_NU_MAX_INTERN_LEN 128
+/* WAS 128, RAISED TO 512 on 2026-09-04, and the measurement that forced it is
+ * worth keeping: the first live run of the DLSS tooltips reported "5 asked, 1
+ * call(s) made, 1 READ BACK". Four of the five tooltip bodies are 156, 181,
+ * 223 and 270 characters long and the fifth is 108. `aowl_nu_intern` returned
+ * NULL for every string >= AOWL_NU_MAX_INTERN_LEN, so four templates were
+ * never built -- and the caller's diagnosis blamed `il2cpp_object_new` or the
+ * fieldref gate, neither of which had been anywhere near it. The length
+ * refusal was SILENT and indistinguishable from a full table and from a failed
+ * `il2cpp_string_new`; it is counted separately now (below) for that reason.
+ *
+ * Cost of the raise: the table is a flat array, so this is
+ * 512 * (512 + 8) = 266,240 bytes of .bss in the host DLL. That is the whole
+ * price, it is paid once, and it buys a cap no caption or tooltip in this
+ * codebase can reach by accident. */
+#define AOWL_NU_MAX_INTERN_LEN 512
 
 typedef struct AowlNuIntern {
     char  text[AOWL_NU_MAX_INTERN_LEN];
@@ -1971,6 +1985,12 @@ typedef struct AowlNuIntern {
 static AowlNuIntern g_nu_intern[AOWL_NU_MAX_INTERN];
 static int32_t      g_nu_intern_n = 0;
 static int32_t      g_nu_intern_full = 0;
+/* THREE DIFFERENT REASONS `aowl_nu_intern` RETURNS NULL, counted apart:
+ * the string is longer than the cap, the table is full, or il2cpp_string_new
+ * itself refused. They used to be one silent NULL. */
+static int32_t      g_nu_intern_toolong = 0;
+static int32_t      g_nu_intern_newfail = 0;
+static int32_t      g_nu_intern_maxseen = 0;
 
 typedef void* (*AowlNuStringNew)(const char*);
 static AowlNuStringNew g_nu_string_new = 0;
@@ -1994,7 +2014,11 @@ static void* aowl_nu_intern(const char* s) {
     size_t n;
     if (!s) return NULL;
     n = strlen(s);
-    if (n >= AOWL_NU_MAX_INTERN_LEN) return NULL;
+    if ((int32_t)n > g_nu_intern_maxseen) g_nu_intern_maxseen = (int32_t)n;
+    if (n >= AOWL_NU_MAX_INTERN_LEN) {
+        g_nu_intern_toolong++;
+        return NULL;
+    }
     for (i = 0; i < g_nu_intern_n; i++)                 /* capped by n <= 64 */
         if (strcmp(g_nu_intern[i].text, s) == 0)
             return g_nu_intern[i].str;
@@ -2003,10 +2027,10 @@ static void* aowl_nu_intern(const char* s) {
         return NULL;
     }
     aowl_nu_exports_init();
-    if (!g_nu_string_new) return NULL;
+    if (!g_nu_string_new) { g_nu_intern_newfail++; return NULL; }
     {
         void* v = g_nu_string_new(s);
-        if (!v) return NULL;
+        if (!v) { g_nu_intern_newfail++; return NULL; }
         memcpy(g_nu_intern[g_nu_intern_n].text, s, n + 1);
         g_nu_intern[g_nu_intern_n].str = v;
         g_nu_intern_n++;
@@ -2014,6 +2038,10 @@ static void* aowl_nu_intern(const char* s) {
     }
 }
 static int32_t aowl_nu_intern_count(void) { return g_nu_intern_n; }
+static int32_t aowl_nu_intern_toolong(void) { return g_nu_intern_toolong; }
+static int32_t aowl_nu_intern_newfail(void) { return g_nu_intern_newfail; }
+static int32_t aowl_nu_intern_maxseen(void) { return g_nu_intern_maxseen; }
+static int32_t aowl_nu_intern_maxlen(void) { return AOWL_NU_MAX_INTERN_LEN; }
 static int32_t aowl_nu_intern_overflowed(void) { return g_nu_intern_full; }
 
 /* ------------------------------------------------------------------ *

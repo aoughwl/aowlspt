@@ -128,6 +128,10 @@ const
   DlrOffToggleTmpl    = 0xb8'i32
   DlrOffFloatSliderTmpl = 0xc8'i32
   DlrOffDropDownTmpl  = 0xb0'i32
+  ## SettingControl, for the tooltip diagnosis. MEASURED, `tools/fldoff.py
+  ## fields EFT.UI.Settings.SettingDropDown`.
+  DlrOffScBlocker     = 0x88'i32
+  DlrOffScTooltipHover = 0x98'i32
 
 var gDlrOn = false        ## `settingsDlssRows` -- read once at boot
 var gDlrOff = false       ## self-disabled
@@ -515,7 +519,7 @@ proc dlrDonorTooltipData(parent: Il2CppPtr): Il2CppPtr =
         return
     i = i + 1
 
-proc dlrMakeTooltipData(title, body: string): Il2CppPtr =
+proc dlrMakeTooltipData(title, body: string; why: var string): Il2CppPtr =
   ## One `SettingsTooltipData` TEMPLATE, allocated against the donor's klass
   ## and filled through `hostfieldwrite`'s typed gate.
   ##
@@ -530,25 +534,60 @@ proc dlrMakeTooltipData(title, body: string): Il2CppPtr =
   ## EUsageProperty. These rows are not BSG settings and must not claim one of
   ## BSG's option keys or advertise a CPU/GPU cost the host has not measured.
   result = nil
-  if gDlrTipKlass == nil: return
+  why = ""
+  if gDlrTipKlass == nil:
+    why = "no donor class pointer"
+    return
   let obj = cNuObjectNew(gDlrTipKlass)
-  if not nuOk(obj, 0x38'i32): return
-  if not frAdmit("dlssrows.tooltip", frTtdText(), obj): return
+  if not nuOk(obj, 0x38'i32):
+    why = "il2cpp_object_new(donor klass) returned " &
+          (if obj == nil: "null" else: "0x" & hexOf(cast[uint64](obj)) &
+           ", which is not readable for the 0x38 bytes SettingsTooltipData " &
+           "declares")
+    return
+  if not frAdmit("dlssrows.tooltip", frTtdText(), obj):
+    why = "the fieldref klass allowlist refused to admit the allocated " &
+          "object (its own 'hostwrite REFUSED' line says on which ground)"
+    return
   discard frAdmit("dlssrows.tooltip", frTtdKey(), obj)
   discard frAdmit("dlssrows.tooltip", frTtdTitle(), obj)
   discard frAdmit("dlssrows.tooltip", frTtdUsageStyle(), obj)
   discard frAdmit("dlssrows.tooltip", frTtdUsageProp(), obj)
   discard frAdmit("dlssrows.tooltip", frTtdUsageText(), obj)
-  let ts = nuStr(title)
-  let bs = nuStr(body)
-  let es = nuStr("")
-  if ts == nil or bs == nil or es == nil: return
-  if not frStoreI32("dlssrows.tooltip", frTtdKey(), obj, 0'i32): return
-  if not frStorePtr("dlssrows.tooltip", frTtdTitle(), obj, ts): return
-  if not frStorePtr("dlssrows.tooltip", frTtdText(), obj, bs): return
-  if not frStoreI32("dlssrows.tooltip", frTtdUsageStyle(), obj, 0'i32): return
-  if not frStoreI32("dlssrows.tooltip", frTtdUsageProp(), obj, 0'i32): return
-  if not frStorePtr("dlssrows.tooltip", frTtdUsageText(), obj, es): return
+  var w1 = ""
+  var w2 = ""
+  var w3 = ""
+  let ts = nuStrWhy(title, w1)
+  let bs = nuStrWhy(body, w2)
+  let es = nuStrWhy("", w3)
+  if ts == nil or bs == nil or es == nil:
+    # THE MEASURED DEFECT OF 2026-09-04, and why this branch is this verbose:
+    # four tooltip bodies were 156..270 characters against a 128-character
+    # intern cap, `nuStr` returned nil for LENGTH, and this proc returned nil
+    # in silence while the caller printed a message blaming il2cpp_object_new.
+    why = "the managed string(s) could not be made -- " &
+          (if ts == nil: "TITLE: " & w1 & ". " else: "") &
+          (if bs == nil: "BODY: " & w2 & ". " else: "") &
+          (if es == nil: "EMPTY: " & w3 & "." else: "")
+    return
+  if not frStoreI32("dlssrows.tooltip", frTtdKey(), obj, 0'i32):
+    why = "the typed store of Key was refused"
+    return
+  if not frStorePtr("dlssrows.tooltip", frTtdTitle(), obj, ts):
+    why = "the typed store of Title was refused"
+    return
+  if not frStorePtr("dlssrows.tooltip", frTtdText(), obj, bs):
+    why = "the typed store of Text was refused"
+    return
+  if not frStoreI32("dlssrows.tooltip", frTtdUsageStyle(), obj, 0'i32):
+    why = "the typed store of UsageStyle was refused"
+    return
+  if not frStoreI32("dlssrows.tooltip", frTtdUsageProp(), obj, 0'i32):
+    why = "the typed store of UsageProperty was refused"
+    return
+  if not frStorePtr("dlssrows.tooltip", frTtdUsageText(), obj, es):
+    why = "the typed store of UsageText was refused"
+    return
   obj
 
 proc dlrApplyTooltips(parent: Il2CppPtr) =
@@ -575,28 +614,62 @@ proc dlrApplyTooltips(parent: Il2CppPtr) =
   while i < gDlrRowCtrl.len and i < DlrMaxRows:
     if gDlrRowTip[i].len > 0 and gDlrRowCtrl[i] != nil:
       gDlrTipAsked = gDlrTipAsked + 1
-      let body = nuStr(gDlrRowTip[i])
-      let data = dlrMakeTooltipData(gDlrRowKey[i], gDlrRowTip[i])
+      var wb = ""
+      var wd = ""
+      let body = nuStrWhy(gDlrRowTip[i], wb)
+      let data = dlrMakeTooltipData(gDlrRowKey[i], gDlrRowTip[i], wd)
       if data != nil and body != nil:
         gDlrTipWant[i] = body
         if nuSetTooltip(gDlrRowCtrl[i], data):
           gDlrTipCalled = gDlrTipCalled + 1
-      elif gDlrTipWhy.len == 0:
-        gDlrTipWhy = "the SettingsTooltipData template for '" &
-                     gDlrRowKey[i] & "' could not be built -- " &
-                     "il2cpp_object_new refused, or one of the six typed " &
-                     "stores was refused by the fieldref gate (that refusal " &
-                     "names itself on its own 'hostwrite REFUSED' line)"
+        else:
+          warn "dlss rows: tooltip '" & gDlrRowKey[i] & "' -- the template " &
+               "was BUILT and SetTooltip was refused before it was made (the " &
+               "control did not validate, or the @0x16FAC00 prologue did not " &
+               "verify). Nothing was called for this row."
+      else:
+        # ONE LINE PER FAILING ROW, naming the row AND the cause. The previous
+        # version recorded only the FIRST failure into a shared string, so four
+        # rows failing for one reason read as one row failing for another.
+        warn "dlss rows: tooltip '" & gDlrRowKey[i] & "' NOT applied -- " &
+             (if data == nil: wd else: "the body string: " & wb) & "."
+        if gDlrTipWhy.len == 0:
+          gDlrTipWhy = "first failure was '" & gDlrRowKey[i] & "': " &
+                       (if data == nil: wd else: wb)
     i = i + 1
   # THE VERDICT, and it is a property of the FINISHED STATE: the tooltip the
   # control now carries must be the string we handed over. Reading back what we
   # wrote into our own template would be a check that cannot fail; this reads
   # the object the GAME constructed, through the control.
+  #
+  # A row that WAS called and does not read back is the case the coordinator
+  # suspected on 2026-09-04 -- a prefab whose `_blocker@0x88` or
+  # `_tooltipSettingsHover@0x98` is null, which makes SetTooltip a silent
+  # no-op. That hypothesis is neither assumed nor dismissed here: both fields
+  # are read and NAMED, so the next run says outright whether a hover area has
+  # to be cloned from the stock row or whether the write simply did not land.
   var i2 = 0
   while i2 < gDlrRowCtrl.len and i2 < DlrMaxRows:
     if gDlrTipWant[i2] != nil:
       if nuTooltipTextOf(gDlrRowCtrl[i2]) == gDlrTipWant[i2]:
         gDlrTipVerified = gDlrTipVerified + 1
+      else:
+        let hov = (if nuOk(gDlrRowCtrl[i2], DlrOffScTooltipHover + 8'i32):
+                     cNuGetRef(gDlrRowCtrl[i2], DlrOffScTooltipHover) else: nil)
+        let blk = (if nuOk(gDlrRowCtrl[i2], DlrOffScBlocker + 8'i32):
+                     cNuGetRef(gDlrRowCtrl[i2], DlrOffScBlocker) else: nil)
+        warn "dlss rows: tooltip '" & gDlrRowKey[i2] & "' -- SetTooltip was " &
+             "CALLED and the finished state does NOT carry our string. On " &
+             "this row _tooltipSettingsHover@0x98 = " &
+             (if hov == nil: "NULL" else: "0x" & hexOf(cast[uint64](hov))) &
+             " and _blocker@0x88 = " &
+             (if blk == nil: "NULL" else: "0x" & hexOf(cast[uint64](blk))) &
+             ". A NULL blocker is SetTooltip's FIRST no-op path and means " &
+             "this prefab needs a SettingsHoverTooltipArea cloned from the " &
+             "stock '" & DlrAnchorName & "' row before any tooltip can " &
+             "attach; a non-null blocker with a null hover area means " &
+             "TryGetTooltip answered false. Either way this row shows NO " &
+             "tooltip and is not counted as a pass."
     i2 = i2 + 1
 
 proc dlrBuild(): bool =
@@ -725,6 +798,17 @@ proc dlrBuild(): bool =
   dlrApplyTooltips(parent)
   result = true
 
+proc dlrSeedSourceText(): string =
+  ## WHICH SOURCE ANSWERED. Before the disk fallback existed this line asserted
+  ## a cause -- "because no /aowlspt/settings/aowl.dlss page had been fetched"
+  ## -- which was a guess dressed as a measurement: nothing had asked the file
+  ## on disk at all. Now both sources are counted and the line reports them.
+  let (page, disk) = sbdSeedSource()
+  "Seeds came from: the fetched schema page " & $page & " time(s), the " &
+  "DEPLOYED mods/dlss/config.json (modhost.configRead, the same reader the " &
+  "backend uses) " & $disk & " time(s). A row counted in neither had no " &
+  "value under its key in either source."
+
 proc dlrVerdict() =
   ## ONE line per visit to the page, and it states which values are on screen.
   if gDlrSaid or not gDlrBuilt: return
@@ -733,9 +817,8 @@ proc dlrVerdict() =
         "page (GraphicsSettingsTab._settingsContainer@0x98), " & $gDlrRefused &
         " refused. " & $gDlrSeeded & " of " & $gDlrBuiltN & " show the " &
         "player's CONFIG value; the other " & $(gDlrBuiltN - gDlrSeeded) &
-        " show mods/dlss' DECLARED DEFAULT because no " &
-        "/aowlspt/settings/aowl.dlss page had been fetched when they were " &
-        "built (modSettingsRender). Nothing here applies anything: the " &
+        " show mods/dlss' DECLARED DEFAULT. " & dlrSeedSourceText() &
+        " Nothing here applies anything: the " &
         "launcher's dlssapply.py step applies these before the next start " &
         "and prints the PASS/FAIL verdict in the boot log."
   # THE DROPDOWN CENSUS. Silence here would mean "the flag is off" and "the

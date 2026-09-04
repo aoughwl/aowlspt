@@ -351,30 +351,131 @@ proc sbdPageFor(guid: string; idx: var int): bool =
       return true
     i = i + 1
 
+## HOW MANY ROWS WERE SEEDED FROM WHICH SOURCE. Three states, and the boot
+## line used to flatten two of them: "0 of 5 show the player's CONFIG value"
+## was true and read as "the config was not applied", when in fact the SCHEMA
+## PAGE had simply not been fetched yet and the file on disk had never been
+## asked.
+var gSbdSeedPage = 0
+var gSbdSeedDisk = 0
+
+proc sbdSeedSource*(): (int, int) =
+  ## (from the fetched schema page, from the deployed config.json). The DLSS
+  ## verdict prints both, because "the config was not applied" and "the schema
+  ## page had not been fetched yet" used to print the same line.
+  (gSbdSeedPage, gSbdSeedDisk)
+
+proc sbdModIndex(guid: string): int =
+  ## The loaded-mod index for a guid, or -1. Capped by `modCount()`, which is
+  ## the loader's own count.
+  result = -1
+  if guid.len == 0: return
+  let n = modhost.modCount()
+  var i = 0
+  while i < n and i < 256:
+    if modhost.modGuidOf(i) == guid: return i
+    i = i + 1
+
+proc sbdDiskValue(guid, key: string; outv: var string): bool =
+  ## The value of `key` in the DEPLOYED `config.json` of mod `guid`, read
+  ## through `modhost.configRead` -- the same single reader the backend and the
+  ## simulator use, and the same one `aowlspt_nim_config_get` answers from.
+  ##
+  ## WHY THIS EXISTS. The seed used to come only from the parsed
+  ## `/aowlspt/settings/<guid>` page, which `modsettingsrender.nim` fetches
+  ## asynchronously. Opening the Graphics tab before that fetch lands built
+  ## every row on its DECLARED DEFAULT -- MEASURED live on 2026-09-04, "0 of 5
+  ## show the player's CONFIG value" -- so a player who had saved a setting saw
+  ## the default and, if they then pressed SAVE, would have written it back.
+  ## The file on disk is authoritative, is present before the first frame, and
+  ## needed no fetch at all.
+  ##
+  ## It is the FALLBACK and not the primary: the page reflects writes this
+  ## session has already made and the file may not yet, so a stale disk read
+  ## must never override a fresher page.
+  result = false
+  outv = ""
+  let idx = sbdModIndex(guid)
+  if idx < 0: return
+  var text = ""
+  var cfgErr = ""
+  if modhost.configRead(idx, text, cfgErr) != StatusOk: return
+  if text.len == 0: return
+  var v = ""
+  if not pathGet(text, key, v): return
+  outv = v
+  true
+
 proc sbdConfigF(guid, key: string; outv: var float32): bool =
   ## The mod's CURRENT value for a float key. False means "could not ask" --
   ## never 0.0, which is a legal value for most of these settings and would
   ## make every check unable to fail.
+  ##
+  ## The fetched schema page FIRST, the deployed config.json SECOND. Both are
+  ## counted, because "seeded from the page" and "seeded from disk" are
+  ## different facts and the verdict says which.
   result = false
   var p = -1
-  if not sbdPageFor(guid, p): return
+  if not sbdPageFor(guid, p):
+    var raw = ""
+    if sbdDiskValue(guid, key, raw):
+      # `duParseNum`, not `parseFloat`: the latter is `.raises` in nimony and a
+      # config value that is not a number must be a SKIP (keep the declared
+      # default) rather than an exception -- see its own comment in debugui.nim.
+      var numOk = false
+      let v = duParseNum(strip(raw), numOk)
+      if not numOk: return false
+      outv = float32(v)
+      gSbdSeedDisk = gSbdSeedDisk + 1
+      return true
+    return
   var r = 0
   while r < gSwPages[p].rows.len and r < 256:
     if gSwPages[p].rows[r].key == key and gSwPages[p].rows[r].kind == swkSlider:
       outv = float32(gSwPages[p].rows[r].fval)
+      gSbdSeedPage = gSbdSeedPage + 1
       return true
     r = r + 1
+  # The page exists but has no row for this key -- fall through to the file
+  # rather than report "could not ask". A schema that has not caught up with a
+  # config key is exactly the case that would otherwise show a default.
+  var raw2 = ""
+  if sbdDiskValue(guid, key, raw2):
+    var numOk2 = false
+    let v2 = duParseNum(strip(raw2), numOk2)
+    if not numOk2: return false
+    outv = float32(v2)
+    gSbdSeedDisk = gSbdSeedDisk + 1
+    return true
+
+proc sbdDiskBool(guid, key: string; outv: var bool): bool =
+  ## `true`/`false` out of the deployed config.json. Anything else is REFUSED
+  ## rather than coerced -- a config holding `"yes"` is a broken config, not a
+  ## true one.
+  result = false
+  var raw = ""
+  if not sbdDiskValue(guid, key, raw): return
+  let t = strip(raw)
+  if t == "true": outv = true
+  elif t == "false": outv = false
+  else: return
+  gSbdSeedDisk = gSbdSeedDisk + 1
+  true
 
 proc sbdConfigB(guid, key: string; outv: var bool): bool =
+  ## The page first, the deployed config.json second -- see `sbdConfigF`.
   result = false
   var p = -1
-  if not sbdPageFor(guid, p): return
+  if not sbdPageFor(guid, p):
+    return sbdDiskBool(guid, key, outv)
   var r = 0
   while r < gSwPages[p].rows.len and r < 256:
     if gSwPages[p].rows[r].key == key and gSwPages[p].rows[r].kind == swkToggle:
       outv = gSwPages[p].rows[r].bval
+      gSbdSeedPage = gSbdSeedPage + 1
       return true
     r = r + 1
+  return sbdDiskBool(guid, key, outv)
 
 # ---------------------------------------------------------------------------
 # REGISTRATION. Called by the builder as each row is made, with the pointers
