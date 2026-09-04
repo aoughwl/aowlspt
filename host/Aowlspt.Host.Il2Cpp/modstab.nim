@@ -286,6 +286,15 @@ type
 
 var gModsSubs: seq[ModsSub] = @[]
 var gModsPages: seq[SwPage] = @[]
+## THE ROW DONOR, kept between ticks. See `gModsRowDonorT`'s write site: the
+## renderer is sliced, so rows keep arriving after the build call returns and
+## the caption re-assert has to run on a tick rather than once.
+var gModsRowDonorT: Il2CppPtr = nil
+## Per-tick cap on the caption re-assert. It is the SAME order of work as a
+## render slice (a walk of every TMP under a row), so it gets the same kind of
+## bound -- and a smaller one, because it runs in addition to a slice, not
+## instead of it.
+const ModsRelabelPerTick = 24
 ## Index of the subtab currently showing, or -1 when none has been chosen yet.
 var gModsSel = -1
 ## True when the cloned subtabs share the STOCK ToggleGroup and we had to null
@@ -1152,6 +1161,86 @@ proc modsRelabelRow(cloneT, donorT: Il2CppPtr; text: string;
          $wrote & " write(s). That TMP is the one rendering, and it did " &
          "not take the new caption."
 
+
+proc modsRelabelPage(page: var SwPage; donorT: Il2CppPtr;
+                     seen, fixed, bad: var int): int =
+  ## RE-ASSERT EVERY ROW'S CAPTION ACROSS ALL ITS TMPs, for the rows that have
+  ## appeared since the last pass and no others.
+  ##
+  ## `swCloneRow` labels through `swControlTmp` -- ONE TextMeshProUGUI -- which
+  ## is fact #88: the write lands and the row still reads the donor's caption.
+  ## That renderer is shared with the Game-tab pages, so rather than change its
+  ## behaviour underneath that feature, this re-labels the clones it produced.
+  ##
+  ## WHAT CHANGED WITH THE SLICE: rows now arrive over many ticks, so this can
+  ## no longer be a single loop over a finished page. `SwRow.relabelled` is the
+  ## latch -- a LATCH and not a count, because a count cannot say WHICH row was
+  ## missed, and a row re-labelled every tick forever would be a per-frame walk
+  ## of every TMP on the page.
+  ##
+  ## Returns how many rows it examined this call, capped at
+  ## `ModsRelabelPerTick` (rule 4).
+  result = 0
+  if donorT == nil: return
+  var q = 0
+  while q < page.rows.len and q < cSwMaxRows and result < ModsRelabelPerTick:
+    if page.rows[q].clone != 0'u64 and not page.rows[q].relabelled:
+      let ctrl = cast[Il2CppPtr](page.rows[q].clone)
+      if ctrl != nil and duOk(ctrl, 0x20'i32):
+        var text = page.rows[q].label
+        if not page.rows[q].implemented:
+          text = text & cSwNotDone
+        let rowT = iToTransform(ctrl)
+        if rowT != nil:
+          seen = seen + 1
+          result = result + 1
+          # LATCHED WHETHER IT TOOK OR NOT, deliberately. A row whose relabel
+          # was REFUSED is not going to start succeeding on the next frame --
+          # retrying it forever would be an unbounded per-frame walk, and the
+          # refusal is already counted in `bad` and reported. `rowsBad > 0` is
+          # the signal, not a retry loop.
+          page.rows[q].relabelled = true
+          if modsRelabelRow(rowT, donorT, text, ctrl):
+            fixed = fixed + 1
+          else:
+            bad = bad + 1
+    q = q + 1
+
+var gModsRelabelSaid = 0
+
+proc modsRelabelPending() =
+  ## The per-tick half of the above, over BOTH registries -- the mods pages and
+  ## the Game-tab pages, because both are rendered by the same sliced renderer
+  ## and both suffer fact #88 identically.
+  if gModsRowDonorT == nil or not duOk(gModsRowDonorT, 0x20'i32): return
+  var seen = 0
+  var fixed = 0
+  var bad = 0
+  var p = 0
+  var budget = ModsRelabelPerTick
+  while p < gModsPages.len and p < 32 and budget > 0:
+    var pg = gModsPages[p]
+    let did = modsRelabelPage(pg, gModsRowDonorT, seen, fixed, bad)
+    gModsPages[p] = pg
+    budget = budget - did
+    p = p + 1
+  if seen == 0: return
+  # Reported for the first few ticks only: the fact that matters is that late
+  # rows ARE being captioned, and after that a line every frame is noise. The
+  # per-page RENDER VERDICT is the falsifiable statement, not this.
+  if gModsRelabelSaid < 12:
+    inc gModsRelabelSaid
+    if bad > 0:
+      warn "mods tab: caption re-assert on LATE rows -- " & $fixed &
+           " of " & $seen & " row(s) took, " & $bad &
+           " did NOT. A row that did not take is showing the DONOR's caption " &
+           "('Interface language'), not its own, and it is not retried."
+    else:
+      okLog "mods tab: caption re-assert on LATE rows -- " & $fixed & " of " &
+            $seen & " row(s) captioned across every TextMeshProUGUI they " &
+            "carry. These are rows that did not exist when the page was " &
+            "begun; the renderer is sliced."
+
 proc modsRelabel(t: Il2CppPtr; text: string): bool =
   ## Relabel with no donor to compare against: the clone is its own reference.
   ## Kept for callers that have no donor handy; everything on the build path
@@ -1795,6 +1884,12 @@ proc modsTabBuild(): bool =
   var rowDonorKind = ""
   let rowDonor = swAnyDonor(tabPtr, rowDonorKind)
   let rowDonorT = (if rowDonor != nil: iToTransform(rowDonor) else: nil)
+  # KEPT FOR THE TICK. The renderer is SLICED now (settingspages.nim): a page's
+  # rows arrive 24-ish per host tick, not all inside this call, so the caption
+  # re-assert below can no longer be a one-shot loop over a finished page. It
+  # runs every tick from `modsRelabelPending`, which needs this donor, and a
+  # donor re-searched per tick would be a per-frame tree walk for a constant.
+  gModsRowDonorT = rowDonorT
   var r = 0
   var rowsFixed = 0
   var rowsBad = 0
@@ -1811,21 +1906,9 @@ proc modsTabBuild(): bool =
       # so rather than change its behaviour underneath that feature, this
       # re-labels the clones it produced, using the donor-count rule.
       if rowDonorT != nil:
-        var q = 0
-        while q < gModsPages[r].rows.len and q < cSwMaxRows:
-          let ctrl = cast[Il2CppPtr](gModsPages[r].rows[q].clone)
-          if ctrl != nil and duOk(ctrl, 0x20'i32):
-            var text = gModsPages[r].rows[q].label
-            if not gModsPages[r].rows[q].implemented:
-              text = text & cSwNotDone
-            let rowT = iToTransform(ctrl)
-            if rowT != nil:
-              rowsSeen = rowsSeen + 1
-              if modsRelabelRow(rowT, rowDonorT, text, ctrl):
-                rowsFixed = rowsFixed + 1
-              else:
-                rowsBad = rowsBad + 1
-          q = q + 1
+        var pg = gModsPages[r]
+        discard modsRelabelPage(pg, rowDonorT, rowsSeen, rowsFixed, rowsBad)
+        gModsPages[r] = pg
     r = r + 1
   # "0 fixed, 0 failed" and "0 fixed, 0 EXAMINED" are different facts, and the
   # previous version printed the same cheerful line for both -- including the
@@ -2194,6 +2277,25 @@ proc modsTabTickBody() =
     return
   modsCrumb("STAGE: modsTickSubtabs")
   modsTickSubtabs()
+  # ---- THE RENDER SLICE, one page's worth of rows per tick ----------------
+  #
+  # This is the drain the sliced renderer needs and the only thing that makes a
+  # 949-row page possible: `swRenderPage` now begins a page and draws its first
+  # slice, and every row after that arrives here. BOTH registries are driven,
+  # because the Game-tab pages (`gSwPages`) use the identical renderer.
+  #
+  # `swSliceRegistry` does at most ONE page per call and stops on the first of
+  # `cSwSliceRows` rows or `cSwSliceMs` of wall clock -- so this line costs one
+  # frame budget per tick, never one per page. The worst tick ever measured is
+  # printed with every RENDER VERDICT.
+  #
+  # The caption re-assert follows in the same tick and on its own cap, because
+  # a row that is drawn but still reads the donor's caption is not a rendered
+  # row -- it is fact #88 wearing one.
+  modsCrumb("STAGE: swSliceRegistry")
+  discard swSliceRegistry(gSwPages, "settings pages")
+  discard swSliceRegistry(gModsPages, "mods pages")
+  modsRelabelPending()
 
 var gModsSanityFrames = 0
 const ModsSanityEveryFrames = 30

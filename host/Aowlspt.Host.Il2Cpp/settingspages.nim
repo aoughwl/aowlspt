@@ -144,6 +144,15 @@ type
     ## it was last seeded with, so a change made by the player can be spotted.
     clone*: uint64
     seeded*: bool
+    ## SLICING. `swRenderPage` used to draw a whole page inside one frame, so
+    ## "this row has a clone" and "this row has been captioned" were the same
+    ## fact and neither needed recording. With the renderer sliced they are
+    ## two facts separated by frames: `modstab.nim` re-asserts every caption
+    ## across all of a row's TextMeshProUGUIs (fact #88 -- the single-TMP write
+    ## lands and the row still reads the donor's caption), and it must do that
+    ## for rows that appeared THIS tick without re-walking the ones it already
+    ## did. A latch, not a count: a count cannot say WHICH row was missed.
+    relabelled*: bool
     ## Current value for `swkColor`, 0..1 per channel. Kept as four floats
     ## rather than a packed uint32 because that is the form every setter on the
     ## path (`Graphic::set_color`, `nuSetColor`) actually takes, and a
@@ -219,6 +228,32 @@ type
     ## than threaded through every call so `swReadBackPage` needs no second
     ## signature.
     modGuid*: string
+    ## ---- SLICED RENDER STATE -------------------------------------------
+    ## A page is no longer drawn in one frame. These five fields ARE the
+    ## renderer's resumption point, and they are on the page rather than in a
+    ## side table so that `gSwPages[i] = pg` (the read-modify-write the
+    ## registry already needs -- see the aliasing note in `swPagesOnTabBuilt`)
+    ## carries the progress along with the rows.
+    ##
+    ## `begun` without `complete` is the state the whole feature exists to
+    ## make usable: rows are on screen, top-down, and more arrive each tick.
+    begun*: bool
+    complete*: bool
+    nextRow*: int            ## index of the next schema row to instantiate
+    drawn*: int              ## rows actually instantiated so far
+    ## Where rows are parented and what they are cloned from, captured at
+    ## `begin` so a slice needs no tab pointer and no second donor search.
+    renderParent*: uint64    ## GameObject: the scroll Content, or the panel
+    renderDonor*: uint64     ## the row prefab instance every clone comes from
+    ## THE SCROLL HOST. Non-zero -> `renderParent` is a cloned SettingsList's
+    ## `Content` and the page scrolls. Zero -> it does not, and `scrollWhy`
+    ## says why in words. 949 rows in a fixed-height panel are not "mostly
+    ## visible", they are unreachable, so a page without a scroll host is a
+    ## reported shortfall and not a quiet fallback.
+    scrollGo*: uint64
+    scrollWhy*: string
+    skipped*: int
+    lastSkipWhy*: string
 
 ## The marker a not-yet-wired row carries. Deliberately verbose: a settings row
 ## that silently does nothing is worse than no row, and this is the project's
@@ -230,7 +265,27 @@ const cSwNotDone = "  (not done yet)"
 ## a live screen. Raised from 24 to fit a mod schema's real rows PLUS one
 ## header row per category (mods/tarkov alone is 22 rows across 8 categories =
 ## 30) -- still a bound, not a target.
-const cSwMaxRows = 48
+const cSwMaxRows = 1024
+
+## HOW MANY ROWS ONE HOST TICK MAY INSTANTIATE. This is the whole point of the
+## slice: `cSwMaxRows` is now 1024 to match what `modsindex.nim`'s parser
+## actually produces (aowl.tarkov alone is 949 rows, maps 61, sain 55), and
+## 949 `Object::Instantiate` calls plus 949 caption re-asserts in ONE frame is
+## a multi-second stall on the Unity main thread -- the rule-7 violation the
+## 48-row cap was hiding rather than solving.
+##
+## 24 is a budget, not a target: the tick ALSO stops on `cSwSliceMs`, so a
+## machine where a row costs more than expected does fewer than 24 and says so.
+## Neither bound is allowed to be the only one -- a row count alone cannot
+## bound time, and a clock alone cannot bound how many managed objects one
+## frame creates.
+const cSwSliceRows = 24
+
+## The wall-clock half of the budget, measured with `cNowMs` (the same clock
+## the inspector's find slice uses). Deliberately under a 60 Hz frame: a tick
+## that overruns is reported with its worst measurement, never silently
+## absorbed.
+const cSwSliceMs = 8'u64
 
 ## Sanity bounds for a row that came off the wire (`modsettingsrender.nim`
 ## parses `/aowlspt/settings/<guid>` -- an HTTP response from whatever the mod
@@ -273,6 +328,22 @@ proc swRowGraySet(cg: Il2CppPtr; free: bool): bool
 ## Applies that gray-out over one page, from the page's own ENABLED switch.
 ## Declared here because `swRenderPage` calls it and is defined first.
 proc swApplyEnableGray(page: var SwPage; why: string)
+## FORWARD DECLARATION into `postfxrows.nim` (included later), for THE SCROLL
+## HOST -- the one that already works.
+##
+## `pfxScrollify`'s v3 graft is the only thing in this codebase that has ever
+## produced a scrolling settings region, and it took three attempts and a
+## measured geometry verdict to get there. Its generic core is now
+## `pfxScrollHostMake` / `pfxScrollHostFinish`, and `swScrollHostFor` is the
+## thin entry point BOTH the PostFX page and every mods page reach it through.
+## A second copy of that geometry would be a second set of rules to get wrong,
+## and the two would drift the first time either was fixed.
+##
+## Returns false and fills `note` when no scroll host could be built. That is
+## reported on the page, never swallowed: without it only the first screenful
+## of a 949-row page is reachable at all.
+proc swScrollHostFor(anchorT, hostGo: Il2CppPtr; contentGoOut: var Il2CppPtr;
+                     note: var string): bool
 
 proc cwBuildForRow(rowClone, parentGo: Il2CppPtr; key, modGuid: string;
                    r, g, b, a: float32): int32
@@ -962,14 +1033,215 @@ proc swDumpRowGeometry(donor, clone, parentGo: Il2CppPtr) =
             " activeSelf=" & duDescribeInt(DuGoActiveSelf, parentGo) &
             " localScale=" & duDescribeVec3(DuGetLocalScale, pt)
 
-proc swRenderPage(tabPtr, parentGo: Il2CppPtr; page: var SwPage): int =
-  ## Render one page's rows onto a tab. Returns how many rows were rendered.
+# ---------------------------------------------------------------------------
+# THE SLICED RENDERER
+#
+# WHY IT IS SLICED, measured rather than assumed: `modsindex.nim`'s parser now
+# reads a mod's schema whole (commit 16a9775) -- `aowl.tarkov` is 949 rows,
+# `maps` 61, `sain` 55. The old renderer drew a page inside ONE call, bounded
+# by `cSwMaxRows = 48`, which is why that cap read as "a page has 48 rows": it
+# was not a safety bound doing its job, it was the reason 901 of aowl.tarkov's
+# rows did not exist on screen.
+#
+# Raising the cap ALONE would have replaced an invisible truncation with a
+# visible stall -- 949 `Object::Instantiate` calls and 949 layout participants
+# inside one Unity frame. So the render is a state machine on the page instead:
+#
+#   swRenderPageBegin   once: pick the donor, build the SCROLL HOST, draw the
+#                       heading. Nothing else.
+#   swRenderPageSlice   every tick: at most `cSwSliceRows` rows AND at most
+#                       `cSwSliceMs` of wall clock, whichever binds first.
+#                       Rows appear top-down and the page is usable while it
+#                       fills, which is the requirement -- not a loading
+#                       screen that finishes.
+#   swRenderVerdict     once, when the last row lands: the finished-state
+#                       check (9b), stated as counts and negatives read off the
+#                       live tree.
+#
+# The two bounds are both mandatory and neither is redundant. A row count
+# cannot bound TIME (a row that costs 3 ms is a 72 ms frame), and a clock
+# cannot bound how many managed objects one frame creates (rule 7). The worst
+# tick ever measured is kept and printed with the verdict, so "one frame
+# budget per tick" is a measurement in the log and not a claim in a comment.
+# ---------------------------------------------------------------------------
+
+## THE SLICE CLOCK. `gSwSliceWorstMs` is the worst single tick this session
+## across every page -- printed with each verdict, because a budget nobody
+## reads back is a budget nobody keeps.
+var gSwSliceWorstMs = 0'u64
+var gSwSliceWorstWhere = ""
+var gSwSliceTicks = 0
+var gSwSliceOverruns = 0
+
+proc swSliceNote(): string =
+  "slice clock: " & $gSwSliceTicks & " tick(s), worst " & $gSwSliceWorstMs &
+    " ms" & (if gSwSliceWorstWhere.len > 0: " (" & gSwSliceWorstWhere & ")"
+             else: "") & ", budget " & $cSwSliceMs & " ms/" &
+    $cSwSliceRows & " rows, " & $gSwSliceOverruns & " overrun(s)"
+
+proc swSliceRecord(pageId: string; ms: uint64; rows: int) =
+  inc gSwSliceTicks
+  if ms > gSwSliceWorstMs:
+    gSwSliceWorstMs = ms
+    gSwSliceWorstWhere = "page '" & pageId & "', " & $rows & " row(s)"
+  if ms > cSwSliceMs:
+    inc gSwSliceOverruns
+    # An overrun is reported the first few times and then only counted: a
+    # per-tick warning on a slow machine would be exactly the log spam rule 7
+    # exists to prevent, and the count plus the worst measurement carries the
+    # fact without it.
+    if gSwSliceOverruns <= 4:
+      warn "settings pages: RENDER SLICE OVERRAN its budget -- page '" &
+           pageId & "' spent " & $ms & " ms instantiating " & $rows &
+           " row(s), over the " & $cSwSliceMs & " ms budget. The slice still " &
+           "stopped at the row it was on; this names a frame that hitched " &
+           "rather than hiding it."
+
+proc swRowGeom(row: SwRow; g: var NuGeom): bool =
+  ## One rendered row's LIVE geometry, or false. Never reads anything this
+  ## file wrote -- the clone pointer is a handle, the rect comes from
+  ## `get_rect` on the live RectTransform.
+  g = nuNoGeom()
+  if row.clone == 0'u64: return false
+  let ctrl = cast[Il2CppPtr](row.clone)
+  if not duOk(ctrl, 0x20'i32): return false
+  let go = iGameObjectOf(ctrl)
+  if go == nil: return false
+  let rt = nuTransformOf(go)
+  if rt == nil: return false
+  g = nuReadGeom(rt)
+  result = g.ok
+
+proc swRenderVerdict(page: var SwPage) =
+  ## THE PER-PAGE RENDER VERDICT. Three outcomes, and it is stated over the
+  ## FINISHED PAGE, never over the writes that produced it.
   ##
-  ## A heading row comes first, then one row per schema row. A stub page renders
-  ## its heading and its note and stops -- which is the point of `stub`: the
-  ## player sees the page exists and is told plainly that it does nothing yet.
-  result = 0
-  swCrumb("STAGE: swRenderPage -- swAnyDonor for page '" & page.id & "'")
+  ## PASS requires all three, each of which can fail:
+  ##   * rendered == the rows the parser produced for this mod, minus the ones
+  ##     explicitly SKIPPED as unsafe (which are counted and named, not
+  ##     silently dropped) -- a shortfall names the mod and the number;
+  ##   * every rendered row's live rect is inside the container's width -- the
+  ##     same predicate `pfxScrollVerdict` uses, because a row wider than the
+  ##     viewport is clipped whether it is a PostFX row or a mod row;
+  ##   * no two consecutive rows have intersecting y ranges -- the "all stacked
+  ##     at the same y" signature of a layout group that never rebuilt.
+  ##
+  ## INCONCLUSIVE is the third outcome and is never a pass: a row whose rect
+  ## could not be read was not observed either way, and a page whose container
+  ## has no readable rect was not measured at all.
+  let want = page.rows.len
+  let got = page.drawn
+  var shortfall = want - page.skipped - got
+  if shortfall < 0: shortfall = 0
+  # --- geometry, off the live tree ---
+  var contW = 0'f32
+  var haveCont = false
+  if page.renderParent != 0'u64:
+    let pgo = cast[Il2CppPtr](page.renderParent)
+    if duOk(pgo, 0x20'i32):
+      let prt = nuTransformOf(pgo)
+      if prt != nil:
+        let pg = nuReadGeom(prt)
+        if pg.ok and pg.rectW > 1.0'f32:
+          contW = pg.rectW
+          haveCont = true
+  var measured = 0
+  var unread = 0
+  var tooWide = 0
+  var overlaps = 0
+  var firstWide = ""
+  var firstOverlap = ""
+  var prevOk = false
+  var prevTop = 0'f32
+  var prevBot = 0'f32
+  var prevName = ""
+  var i = 0
+  while i < page.rows.len and i < cSwMaxRows:      # rule 4: capped
+    if page.rows[i].clone != 0'u64:
+      var g = nuNoGeom()
+      if not swRowGeom(page.rows[i], g):
+        unread = unread + 1
+        prevOk = false
+      else:
+        measured = measured + 1
+        if haveCont and g.rectW > contW + 1.0'f32:
+          tooWide = tooWide + 1
+          if firstWide.len == 0:
+            firstWide = "'" & page.rows[i].label & "' is " & nuF(g.rectW) &
+                        " wide inside a " & nuF(contW) & " container"
+        # The y range in the PARENT's space: anchoredPosition plus the rect's
+        # own origin. Using sizeDelta here would be the stretched-anchor trap
+        # `NuGeom` documents -- for a stretched row sizeDelta is an INSET.
+        let bot = g.posY + g.rectY
+        let top = bot + g.rectH
+        if prevOk and top > prevBot + 0.5'f32 and bot < prevTop - 0.5'f32:
+          overlaps = overlaps + 1
+          if firstOverlap.len == 0:
+            firstOverlap = "'" & prevName & "' [" & nuF(prevBot) & ".." &
+                           nuF(prevTop) & "] and '" & page.rows[i].label &
+                           "' [" & nuF(bot) & ".." & nuF(top) & "]"
+        prevOk = true
+        prevTop = top
+        prevBot = bot
+        prevName = page.rows[i].label
+    i = i + 1
+  let who = "page '" & page.id & "'" &
+            (if page.modGuid.len > 0: " (mod " & page.modGuid & ")" else: "")
+  let tail = "  [" & swSliceNote() & "; scroll host: " &
+             (if page.scrollGo != 0'u64: "built"
+              else: "NONE -- " & page.scrollWhy) & "]"
+  if shortfall > 0:
+    warn "settings pages RENDER VERDICT FAIL: " & who & " rendered " & $got &
+         " row(s) of the " & $want & " the parser produced (" & $page.skipped &
+         " were SKIPPED as unsafe" &
+         (if page.lastSkipWhy.len > 0: ", last reason: " & page.lastSkipWhy
+          else: "") & "), so " & $shortfall &
+         " row(s) of this mod's settings ARE NOT ON SCREEN AT ALL." & tail
+  elif tooWide > 0 or overlaps > 0:
+    warn "settings pages RENDER VERDICT FAIL: " & who & " rendered all " &
+         $got & " row(s), but " & $tooWide &
+         " row(s) are wider than the container" &
+         (if firstWide.len > 0: " (" & firstWide & ")" else: "") & " and " &
+         $overlaps & " consecutive pair(s) have intersecting y ranges" &
+         (if firstOverlap.len > 0: " (" & firstOverlap & ")" else: "") &
+         " -- rows stacked on each other mean the layout group never " &
+         "rebuilt, and a clipped row is unreadable whether or not it exists." &
+         tail
+  elif measured == 0 or not haveCont:
+    warn "settings pages RENDER VERDICT INCONCLUSIVE: " & who & " reports " &
+         $got & " rendered row(s), but " &
+         (if not haveCont: "the container's own rect could not be read, so " &
+            "no width comparison was possible"
+          else: "not one row's rect could be read (" & $unread &
+            " unreadable)") & ". Nothing was observed; this is NOT a pass." &
+         tail
+  elif unread > 0:
+    warn "settings pages RENDER VERDICT INCONCLUSIVE: " & who & " -- " &
+         $measured & " of " & $got & " rendered row(s) read back inside the " &
+         "container with no overlap, but " & $unread &
+         " could not be read at all and were not observed either way. This " &
+         "is NOT a pass." & tail
+  else:
+    okLog "settings pages RENDER VERDICT PASS: " & who & " rendered " & $got &
+          " row(s) of " & $want & " parsed (" & $page.skipped &
+          " skipped as unsafe); all " & $measured &
+          " read back inside the " & nuF(contW) &
+          " px container and no consecutive pair overlaps." & tail
+
+proc swRenderPageBegin(tabPtr, parentGo: Il2CppPtr; page: var SwPage): bool =
+  ## ONCE PER PAGE. Picks the donor, builds the scroll host, draws the heading,
+  ## and stops. No schema row is instantiated here -- that is the slice's job,
+  ## so even the very first tick's cost is bounded.
+  result = false
+  page.begun = false
+  page.complete = false
+  page.nextRow = 0
+  page.drawn = 0
+  page.skipped = 0
+  page.lastSkipWhy = ""
+  page.scrollGo = 0'u64
+  page.scrollWhy = ""
+  swCrumb("STAGE: swRenderPageBegin -- swAnyDonor for page '" & page.id & "'")
   var donorKind = ""
   let donorToggle = swAnyDonor(tabPtr, donorKind)
   if donorToggle == nil:
@@ -981,37 +1253,85 @@ proc swRenderPage(tabPtr, parentGo: Il2CppPtr; page: var SwPage): int =
   okLog "settings pages: page '" & page.id & "' donor=0x" &
         hexOf(cast[uint64](donorToggle)) & " chosen by " & donorKind &
         "; parent=0x" & hexOf(cast[uint64](parentGo))
-  # The heading, cloned from the same donor so it inherits the row styling. It
-  # is a toggle underneath, which is not ideal and IS honest: there is no label
-  # widget to clone on a settings tab that we can identify without reflection.
+  # THE SCROLL HOST, BEFORE THE HEADING, so the heading lands inside it too.
+  #
+  # EVERY page needs one. `aowl.tarkov` is 949 rows; in the authored
+  # fixed-height panel rows 20..949 are not "below the fold", they are
+  # unreachable -- there is nothing to scroll them into view with. A page that
+  # could not get one is still rendered (a truncated page beats no page) and
+  # says so, in its own warning and again in its verdict.
+  var rowParent = parentGo
+  var contentGo: Il2CppPtr = nil
+  var scrollNote = ""
+  let anchorT = (if parentGo != nil: nuTransformOf(parentGo) else: nil)
+  if swScrollHostFor(anchorT, parentGo, contentGo, scrollNote) and
+     contentGo != nil:
+    rowParent = contentGo
+    page.scrollGo = cast[uint64](contentGo)
+    okLog "settings pages: page '" & page.id & "' SCROLLS -- rows are " &
+          "parented into a cloned SettingsList's Content (the same graft " &
+          "postfxrows.nim uses, shared and not copied). " & scrollNote
+  else:
+    page.scrollWhy = scrollNote
+    warn "settings pages: page '" & page.id & "' has NO scroll host -- " &
+         scrollNote & ". Its rows go into the fixed-height panel, so any row " &
+         "past the bottom edge is UNREACHABLE, not merely off-screen. " &
+         $page.rows.len & " row(s) are about to be rendered into it."
+  page.renderDonor = cast[uint64](donorToggle)
+  page.renderParent = cast[uint64](rowParent)
   swCrumb("render the heading row for page '" & page.id & "'")
-  discard swCloneRow(donorToggle, parentGo, page.title)
+  discard swCloneRow(donorToggle, rowParent, page.title)
+  page.begun = true
   if page.stub:
-    discard swCloneRow(donorToggle, parentGo, page.note & cSwNotDone)
+    discard swCloneRow(donorToggle, rowParent, page.note & cSwNotDone)
+    page.complete = true
     okLog "settings pages: page '" & page.id & "' is a STUB -- heading and " &
           "note rendered, no rows bound"
+  result = true
+
+proc swRenderPageSlice(page: var SwPage): int =
+  ## AT MOST ONE FRAME BUDGET OF WORK. Returns rows instantiated this tick.
+  ##
+  ## Every early exit leaves `nextRow` where it was, so the next tick resumes
+  ## at the same row rather than restarting or skipping -- a resumable loop
+  ## that silently restarts is how a page renders row 0 forever and reports
+  ## progress every time.
+  result = 0
+  if not page.begun or page.complete: return
+  let donorToggle = cast[Il2CppPtr](page.renderDonor)
+  let rowParent = cast[Il2CppPtr](page.renderParent)
+  if donorToggle == nil or rowParent == nil or
+     not duOk(donorToggle, 0x20'i32) or not duOk(rowParent, 0x20'i32):
+    page.complete = true
+    warn "settings pages: page '" & page.id & "' STOPPED at row " &
+         $page.nextRow & " of " & $page.rows.len & " -- its donor or its row " &
+         "container is no longer readable (the tab was rebuilt under it). " &
+         "The rows drawn so far are left alone; the page is marked complete " &
+         "so this does not retry every frame, and re-opening the tab " &
+         "re-renders it."
+    swRenderVerdict(page)
     return
-  var i = 0
-  var skipped = 0
-  var lastSkipWhy = ""
-  while i < page.rows.len and result < cSwMaxRows:
-    swCrumb("STAGE: swRenderPage -- validate row " & $i & " of " &
-            $page.rows.len & " page '" & page.id & "'")
+  let t0 = cNowMs()
+  var thisTick = 0
+  while page.nextRow < page.rows.len and page.nextRow < cSwMaxRows and
+        thisTick < cSwSliceRows:
+    let i = page.nextRow
     var why = ""
     if not swRowIsSane(page.rows[i], why):
-      skipped = skipped + 1
-      lastSkipWhy = why
+      page.skipped = page.skipped + 1
+      page.lastSkipWhy = why
       warn "settings pages: page '" & page.id & "' row " & $i &
            " SKIPPED (not rendered) -- " & why
-      i = i + 1
+      page.nextRow = i + 1
       continue
     var text = page.rows[i].label
     if not page.rows[i].implemented:
       text = text & cSwNotDone
     swCrumb("render row " & $i & " of " & $page.rows.len & " ('" & text & "')")
-    let clone = swCloneRow(donorToggle, parentGo, text)
+    let clone = swCloneRow(donorToggle, rowParent, text)
     if clone != nil:
       page.rows[i].clone = cast[uint64](clone)
+      page.rows[i].relabelled = false
       if page.rows[i].kind == swkToggle:
         swCrumbP("swSeedToggle for row '" & text & "' clone", clone)
         page.rows[i].seeded = swSeedToggle(clone, page.rows[i].bval)
@@ -1023,7 +1343,7 @@ proc swRenderPage(tabPtr, parentGo: Il2CppPtr; page: var SwPage): int =
         # as a labelled clone, `seeded` stays false, and read-back therefore
         # gives it no vote, exactly like a toggle whose seed refused.
         swCrumbP("cwBuildForRow for row '" & text & "' clone", clone)
-        let slot = cwBuildForRow(clone, parentGo, page.rows[i].key,
+        let slot = cwBuildForRow(clone, rowParent, page.rows[i].key,
                                  page.modGuid,
                                  page.rows[i].cr, page.rows[i].cg,
                                  page.rows[i].cb, page.rows[i].ca)
@@ -1037,7 +1357,8 @@ proc swRenderPage(tabPtr, parentGo: Il2CppPtr; page: var SwPage): int =
                "row and its widget did NOT build (colorwidget logged the " &
                "reason above). The row is drawn and labelled and is bound to " &
                "nothing; no value will be written for it."
-      result = result + 1
+      page.drawn = page.drawn + 1
+      thisTick = thisTick + 1
       # ONE-SHOT GEOMETRY DUMP. Rows are being cloned and labelled and the user
       # sees nothing, so the next question is WHERE they went -- and that is a
       # question to ask the client, not to reason about. Dump the donor and the
@@ -1045,49 +1366,90 @@ proc swRenderPage(tabPtr, parentGo: Il2CppPtr; page: var SwPage): int =
       # every field that differs is ours.
       if not gSwGeomDumped:
         gSwGeomDumped = true
-        swDumpRowGeometry(donorToggle, clone, parentGo)
+        swDumpRowGeometry(donorToggle, clone, rowParent)
+    page.nextRow = i + 1
+    # THE CLOCK HALF OF THE BUDGET, checked AFTER a row rather than before, so
+    # a tick always makes progress -- a budget that can render zero rows is a
+    # page that never finishes.
+    if cNowMs() - t0 >= cSwSliceMs: break
+  let spent = cNowMs() - t0
+  if thisTick > 0: swSliceRecord(page.id, spent, thisTick)
+  result = thisTick
+  if page.nextRow >= page.rows.len or page.nextRow >= cSwMaxRows:
+    page.complete = true
+    if page.rows.len > cSwMaxRows:
+      warn "settings pages: page '" & page.id & "' has " & $page.rows.len &
+           " parsed row(s), over the " & $cSwMaxRows & "-row render cap, so " &
+           $(page.rows.len - cSwMaxRows) & " row(s) were NOT rendered. Raise " &
+           "cSwMaxRows rather than leaving this unsaid."
+    # THE COLOUR CHECK, over the finished page. THREE OUTCOMES: no declared
+    # colour row at all is INCONCLUSIVE, not a pass.
+    var declared = 0
+    var stillStub = 0
+    var unbound = 0
+    var k = 0
+    while k < page.rows.len and k < cSwMaxRows:
+      if page.rows[k].declaredColor:
+        inc declared
+        if page.rows[k].kind != swkColor:
+          inc stillStub
+        elif page.rows[k].cwIdx == 0'i32 or not page.rows[k].seeded:
+          inc unbound
+      k = k + 1
+    if declared == 0:
+      okLog "settings pages: page '" & page.id & "' colour check " &
+            "INCONCLUSIVE -- this page's schema declared no colour row, so " &
+            "nothing was examined. That is not a pass."
+    elif stillStub > 0 or unbound > 0:
+      warn "settings pages: page '" & page.id & "' colour check FAIL -- of " &
+           $declared & " row(s) whose schema declared a colour, " & $stillStub &
+           " still render as a plain text/stub row (the value would not " &
+           "parse) and " & $unbound & " drew no working widget. THIS IS THE " &
+           "REPORTED BUG's SIGNATURE: a colour setting showing its raw value " &
+           "as text."
+    else:
+      okLog "settings pages: page '" & page.id & "' colour check PASS -- all " &
+            $declared & " row(s) whose schema declared a colour render a " &
+            "bound colour widget; none is left as a stub or a bare text row."
+    # THE MOD'S ENABLED STATE, APPLIED TO WHAT WAS JUST DRAWN. Done once the
+    # page is complete rather than per-row, because a row cloned before the
+    # switch row was read would be left free while its neighbours were blocked.
+    swApplyEnableGray(page, "render")
+    swRenderVerdict(page)
+
+proc swRenderPage(tabPtr, parentGo: Il2CppPtr; page: var SwPage): int =
+  ## COMPATIBILITY ENTRY POINT, and deliberately NOT a whole-page render any
+  ## more: it begins the page and draws the FIRST slice only. Callers that used
+  ## to get a finished page now get a page that is visibly filling, and must
+  ## drive `swSliceRegistry` from their tick -- `modstab.nim` does.
+  ##
+  ## Returns rows drawn on this FIRST SLICE, not the page total, and the
+  ## distinction matters: reading it as the total is exactly the
+  ## check-that-cannot-fail section 9b is about.
+  result = 0
+  if not swRenderPageBegin(tabPtr, parentGo, page): return
+  result = swRenderPageSlice(page)
+
+proc swSliceRegistry(pages: var seq[SwPage]; who: string): int =
+  ## THE PER-TICK DRAIN, over one registry. Read-modify-write per element, for
+  ## the aliasing reason `swPagesOnTabBuilt` documents at length: a scalar
+  ## field written through `pages[i].field = x` was MEASURED not to persist,
+  ## while the `seq` of rows (whose buffer every copy shares) did.
+  ##
+  ## ONE page per tick, not all of them: the budget is per TICK, and slicing
+  ## three pages of 24 rows in one frame is three times the budget wearing the
+  ## word "slice".
+  result = 0
+  var i = 0
+  while i < pages.len and i < 32:                 # rule 4: capped
+    if pages[i].begun and not pages[i].complete:
+      var pg = pages[i]
+      let n = swRenderPageSlice(pg)
+      pages[i] = pg
+      if n > 0 or pg.complete:
+        result = n
+        return
     i = i + 1
-  # THE FALSIFIABLE NEGATIVE, over the FINISHED PAGE rather than over our own
-  # write: "no row whose SCHEMA declared a colour still ended up rendered as a
-  # stub or as an unbound text row". Stated as a negative because a negative can
-  # fail -- counting the widgets we built and comparing that to itself cannot.
-  # THREE OUTCOMES: no declared colour rows at all is INCONCLUSIVE, not a pass.
-  var declared = 0
-  var stillStub = 0
-  var unbound = 0
-  var k = 0
-  while k < page.rows.len:                 # capped: cSwMaxRows
-    if page.rows[k].declaredColor:
-      inc declared
-      if page.rows[k].kind != swkColor:
-        inc stillStub
-      elif page.rows[k].cwIdx == 0'i32 or not page.rows[k].seeded:
-        inc unbound
-    k = k + 1
-  if declared == 0:
-    okLog "settings pages: page '" & page.id & "' colour check INCONCLUSIVE " &
-          "-- this page's schema declared no colour row, so nothing was " &
-          "examined. That is not a pass."
-  elif stillStub > 0 or unbound > 0:
-    warn "settings pages: page '" & page.id & "' colour check FAIL -- of " &
-         $declared & " row(s) whose schema declared a colour, " & $stillStub &
-         " still render as a plain text/stub row (the value would not parse) " &
-         "and " & $unbound & " drew no working widget. THIS IS THE REPORTED " &
-         "BUG's SIGNATURE: a colour setting showing its raw value as text."
-  else:
-    okLog "settings pages: page '" & page.id & "' colour check PASS -- all " &
-          $declared & " row(s) whose schema declared a colour render a bound " &
-          "colour widget; none is left as a stub or a bare text row."
-  okLog "settings pages: page '" & page.id & "' rendered " & $result &
-        " row(s) of " & $page.rows.len &
-        (if skipped > 0:
-           " -- " & $skipped & " row(s) SKIPPED as unsafe (last reason: " &
-           lastSkipWhy & ")"
-         else: "")
-  # THE MOD'S ENABLED STATE, APPLIED TO WHAT WAS JUST DRAWN. Done here rather
-  # than per-row, because a row cloned before the switch row was read would be
-  # left free while its neighbours were blocked.
-  swApplyEnableGray(page, "render")
 
 proc swApplyEnableGray(page: var SwPage; why: string) =
   ## A DISABLED MOD'S SETTINGS ARE NOT EDITABLE, and they say so the way this

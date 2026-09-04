@@ -951,76 +951,49 @@ proc pfxResolvePanels(tab: Il2CppPtr; postT, gfxT: var Il2CppPtr): bool =
   gPfxGfxPanelT = gp
   return true
 
-proc pfxScrollify(tab, rowParent: Il2CppPtr; newRootOut: var Il2CppPtr): bool =
-  ## DEFECT 2, SECOND ATTEMPT -- and the first one is worth stating, because
-  ## the verdict that blessed it is the exact failure 9b is about.
-  ##
-  ## WHAT THE FIRST ATTEMPT DID: cloned the Graphics page's `SettingsList`,
-  ## moved `SettingsPanel` (the row parent) into the clone's Viewport, and
-  ## pointed `ScrollRect.m_Content@0x20` at it. The verdict then compared
-  ## `m_Content` against the row parent and two heights -- and passed.
-  ##
-  ## WHAT WAS ACTUALLY ON SCREEN (inspector, 2026-09-03 12:16):
-  ##   * the clone sat top-LEFT of the 930-wide panel: anchors (0,1)-(0,1),
-  ##     pivot (0,1), anchoredPosition (0,-59), sizeDelta (850,726) -- an inset
-  ##     box, not the space `SettingsPanel` used to occupy;
-  ##   * its Viewport resolved to 750x686 while `SettingsPanel` inside it kept
-  ##     a FIXED 850x726 with pivot (0.5,0.5) -- 100 px WIDER than the viewport
-  ##     that was supposed to clip it, with nothing driving its height;
-  ##   * the donor `Content` was still an ACTIVE 1490 px tall object sitting in
-  ##     the same Viewport, so the Viewport had TWO children.
-  ## Every one of those is a geometry fact the verdict never looked at.
-  ##
-  ## SO THE SHAPE IS FIXED BY CONSTRUCTION, not by adjustment:
-  ##
-  ##   1. `SettingsPanel`'s AUTHORED geometry is captured BEFORE anything is
-  ##      touched, and given verbatim to the CLONE ROOT. The scroll region then
-  ##      occupies precisely the space the authored panel occupied -- no
-  ##      constant is involved and it is resolution-independent.
-  ##   2. The clone's Viewport is STRETCHED to the clone root (anchors
-  ##      (0,0)-(1,1), sizeDelta (0,0)), so viewport rect == the authored
-  ##      SettingsPanel rect. The donor's own centred 750-wide viewport is
-  ##      exactly the inset the user saw and is not kept.
-  ##   3. THE CONTENT IS THE CLONE'S OWN `Content`, not `SettingsPanel`. This
-  ##      is the part that removes a whole class of defect instead of patching
-  ##      it: the donor Content already carries the LayoutGroup and
-  ##      ContentSizeFitter that DRIVE its height, already has top-stretch
-  ##      anchors (0,1)-(1,1) with pivot (0.5,1), and already is what the
-  ##      cloned ScrollRect names. Nothing has to be added, and `nuAdd` has no
-  ##      attested ContentSizeFitter kind, so adding one was never available.
-  ##      The rows MOVE into it and `_settingsRoot@0xa0` is repointed at it, so
-  ##      the game's own future stock rows land there too.
-  ##   4. The donor's 33 rows are retired FIRST (SetActive false), so the
-  ##      ContentSizeFitter recomputes from our rows alone -- a layout group
-  ##      skips inactive children. The emptied `SettingsPanel` is retired whole,
-  ##      so the Viewport ends with exactly ONE active child.
+
+# ---------------------------------------------------------------------------
+# THE SCROLL HOST, EXTRACTED SO THERE IS EXACTLY ONE OF IT.
+#
+# `pfxScrollify` (defect 2, v3) is the only thing that has ever built a working
+# scroll region in this screen, and the mods pages need the identical structure
+# -- 949 rows on `aowl.tarkov` are simply unreachable in a fixed-height panel.
+# A SECOND COPY of this would be a second set of geometry rules to get wrong,
+# and the two would drift the first time either was fixed. So the generic core
+# is here and BOTH callers use it: the PostFX graft below, and
+# `swScrollHostFor` (settingspages.nim) for every mods page.
+#
+# What is generic: find the Graphics `SettingsList` donor, clone it, parent it
+# under `hostGo`, give the clone root the AUTHORED rect `og`, give its Viewport
+# the donor's authored inset (so the scrollbar keeps its margin), opt the root
+# out of the parent layout group, retire the donor's own rows, and hand back
+# the clone's `Content` -- the node that already carries the VerticalLayoutGroup
+# and ContentSizeFitter that DRIVE height.
+#
+# What is NOT generic and stays with each caller: which rows move in, which
+# managed field is repointed at the Content, and the background-quad decision.
+#
+# Every refusal is returned as text rather than routed through
+# `pfxGraftRefuse`, because that charges the PostFX feature's fault budget and
+# a mods-page failure must not disable the PostFX rows.
+# ---------------------------------------------------------------------------
+proc pfxScrollHostMake(gfxT, hostGo: Il2CppPtr; og: NuGeom;
+                       censusPanelT, censusRowT: Il2CppPtr;
+                       cloneGoOut, cloneTOut, srOut, viewportTOut,
+                       contentTOut: var Il2CppPtr;
+                       optNoteOut: var string; retiredOut: var int;
+                       why: var string): bool =
   result = false
-  newRootOut = nil
-  gPfxGraftTried = true
-  if gPfxScrollGo != nil: return true
-  # THE TWO SILENT RETURNS THAT USED TO BE HERE WERE THE WHOLE BUG on
-  # a7386d1f: `if gGfxPanelT == nil or gGfxPostT == nil: return false` and its
-  # liveness twin, both bare. One of them fired on every run and said nothing.
-  # Both panels now come from the tab, and every exit below announces itself.
-  var postT: Il2CppPtr = nil
-  var gfxT: Il2CppPtr = nil
-  if not pfxResolvePanels(tab, postT, gfxT): return
-  # (1) THE AUTHORED RECT, read before we write anything anywhere. Without it
-  # there is nothing to size the scroll region to and nothing to restore, so
-  # this is a refusal, not a fallback.
-  let og = nuReadGeom(rowParent)
-  if not og.ok:
-    pfxGraftRefuse("the authored geometry of _settingsRoot (the SettingsPanel " &
-                 "the scroll region must exactly replace) could not be read, " &
-                 "so there is no rect to size the clone to. Nothing was " &
-                 "cloned and the page is untouched.")
-    return
+  cloneGoOut = nil; cloneTOut = nil; srOut = nil
+  viewportTOut = nil; contentTOut = nil
+  retiredOut = 0
+  why = ""
   var donorT = modsChildNamed(modsChildNamed(gfxT, "Other Settings"),
                               "SettingsList")
   if donorT == nil:
     donorT = modsFindNamed(gfxT, "SettingsList", 4)
   if donorT == nil or not duOk(donorT, 0x20'i32) or not iUnityAlive(donorT):
-    pfxGraftRefuse("the Graphics page's 'SettingsList' (the ScrollRect donor) " &
+    why = ("the Graphics page's 'SettingsList' (the ScrollRect donor) " &
                  "could not be reached by walking 'Graphics Settings' -> " &
                  "'Other Settings' -> 'SettingsList', nor found by name " &
                  "within 4 levels. Nothing was cloned.")
@@ -1033,27 +1006,26 @@ proc pfxScrollify(tab, rowParent: Il2CppPtr; newRootOut: var Il2CppPtr): bool =
   gPfxDonorVpG = nuReadGeom(gPfxDonorVpT)
   gPfxDonorBarG = nuReadGeom(modsChildNamed(donorT, "Scrollbar"))
   if modsComponent(donorT, "ScrollRect") == nil:
-    pfxGraftRefuse("the node found as the Graphics 'SettingsList' carries no " &
+    why = ("the node found as the Graphics 'SettingsList' carries no " &
                  "ScrollRect, so it is NOT the scroll host and cloning it " &
                  "would graft a container that cannot scroll. Refused.")
     return
-  let panelT = modsChildNamed(postT, "Panel")
-  let panelGo = (if panelT != nil: iGameObjectOf(panelT) else: nil)
   let donorGo = iGameObjectOf(donorT)
-  if panelT == nil or panelGo == nil or donorGo == nil:
-    pfxGraftRefuse("'PostFX Settings' -> 'Panel' or the donor SettingsList has " &
-                 "no reachable GameObject, so there is nowhere to put a " &
-                 "scroll host and nothing to clone. The page is untouched.")
+  if hostGo == nil or donorGo == nil:
+    why = ("the host GameObject the scroll region must be parented " &
+                 "under, or the donor SettingsList's own GameObject, is not " &
+                 "reachable -- so there is nowhere to put a scroll host and " &
+                 "nothing to clone. The page is untouched.")
     return
   let cloneGo = modsClone(donorGo)
   let cloneT = (if cloneGo != nil: modsTransformOf(cloneGo) else: nil)
   if cloneGo == nil or cloneT == nil:
-    pfxGraftRefuse("Object::Instantiate of the Graphics SettingsList returned " &
+    why = ("Object::Instantiate of the Graphics SettingsList returned " &
                  "null or a clone with no reachable Transform. Nothing is " &
                  "parented anywhere.")
     return
-  if not modsSetParent(cloneGo, panelGo):
-    pfxGraftRefuse("the cloned SettingsList could not be parented under the " &
+  if not modsSetParent(cloneGo, hostGo):
+    why = ("the cloned SettingsList could not be parented under the " &
                  "PostFX 'Panel'. It is destroyed rather than left at the " &
                  "scene root, where it would render over the screen.")
     discard nuDestroy(cloneGo)
@@ -1061,7 +1033,7 @@ proc pfxScrollify(tab, rowParent: Il2CppPtr; newRootOut: var Il2CppPtr): bool =
   # (1) THE CLONE ROOT BECOMES THE AUTHORED PANEL, exactly.
   if not nuLayout(cloneT, og.aMinX, og.aMinY, og.aMaxX, og.aMaxY,
                   og.pivX, og.pivY, og.sdX, og.sdY, og.posX, og.posY):
-    pfxGraftRefuse("the authored SettingsPanel geometry could not be applied " &
+    why = ("the authored SettingsPanel geometry could not be applied " &
                  "to the clone root, so the scroll region would sit wherever " &
                  "the donor happened to sit -- the inset box the user saw. " &
                  "The clone is destroyed.")
@@ -1075,7 +1047,7 @@ proc pfxScrollify(tab, rowParent: Il2CppPtr; newRootOut: var Il2CppPtr): bool =
     var missing = "its 'Viewport/Content' child"
     if sr == nil: missing = "its ScrollRect"
     elif viewportT == nil: missing = "its 'Viewport' child"
-    pfxGraftRefuse("the clone is missing " & missing & ", so it cannot host " &
+    why = ("the clone is missing " & missing & ", so it cannot host " &
                  "anything. It is destroyed and the PostFX page is left " &
                  "exactly as it was.")
     discard nuDestroy(cloneGo)
@@ -1092,7 +1064,7 @@ proc pfxScrollify(tab, rowParent: Il2CppPtr; newRootOut: var Il2CppPtr): bool =
   # donor whose Viewport cannot be read is a refusal, not a fallback to
   # stretching -- guessing this is what produced the defect.
   if not gPfxDonorVpG.ok:
-    pfxGraftRefuse("the DONOR Graphics SettingsList's own 'Viewport' rect " &
+    why = ("the DONOR Graphics SettingsList's own 'Viewport' rect " &
                  "could not be read, so the authored inset that leaves room " &
                  "for the scrollbar is unknown. Stretching instead is what " &
                  "put the bar through the slider values; refusing. The clone " &
@@ -1100,7 +1072,7 @@ proc pfxScrollify(tab, rowParent: Il2CppPtr; newRootOut: var Il2CppPtr): bool =
     discard nuDestroy(cloneGo)
     return
   if not pfxApplyGeom(viewportT, gPfxDonorVpG):
-    pfxGraftRefuse("the donor Viewport's authored geometry (" &
+    why = ("the donor Viewport's authored geometry (" &
                  nuGeomNote(gPfxDonorVpG) & ") could not be applied to the " &
                  "clone's Viewport, so its right margin is not guaranteed " &
                  "and the scrollbar would overlap the rows. The clone is " &
@@ -1112,13 +1084,14 @@ proc pfxScrollify(tab, rowParent: Il2CppPtr; newRootOut: var Il2CppPtr): bool =
   # available: opt the root out of the group and re-apply the authored rect,
   # because `set_ignoreLayout` runs SetDirty and the group re-lays out
   # immediately afterwards.
-  gPfxLayoutNote = pfxLayoutCensus(panelT, rowParent, cloneT,
-                                   modsChildNamed(panelT, "EnablePanel"))
+  if censusPanelT != nil:
+    gPfxLayoutNote = pfxLayoutCensus(censusPanelT, censusRowT, cloneT,
+                                     modsChildNamed(censusPanelT, "EnablePanel"))
   var optNote = ""
   let rootOpted = pfxOptOutOfGroup(cloneT, "clone root", optNote)
   if rootOpted:
     if not pfxApplyGeom(cloneT, og):
-      pfxGraftRefuse("the clone root opted out of the parent layout group " &
+      why = ("the clone root opted out of the parent layout group " &
                    "but its AUTHORED rect could not be re-applied " &
                    "afterwards, so it would keep whatever size the group " &
                    "last gave it -- the 850x0 defect. The clone is destroyed.")
@@ -1127,55 +1100,29 @@ proc pfxScrollify(tab, rowParent: Il2CppPtr; newRootOut: var Il2CppPtr): bool =
   # (4) DONOR ROWS OUT FIRST, so the ContentSizeFitter never sees them plus
   # ours and resolves a 1490 px content that scrolls past the end.
   let retired = pfxRetireKids(contentT)
-  # (3) OUR ROWS IN, and `_settingsRoot` repointed at the thing that now holds
-  # them. The tab's field is written LAST of the three so that a refusal
-  # anywhere above leaves it naming the panel that still holds the rows.
-  let moved = pfxMoveKids(rowParent, contentT)
-  if moved <= 0:
-    pfxGraftRefuse("not one row could be moved from SettingsPanel into the " &
-                 "cloned Content, so the rows are still in the unscrolled " &
-                 "panel. The clone is destroyed and _settingsRoot is " &
-                 "untouched -- nothing is half-moved.")
-    discard nuDestroy(cloneGo)
-    return
-  if not nuOk(sr, NuOffScrollContent + 8'i32) or
-     not nuOk(tab, PfxOffSettingsRoot + 8'i32):
-    pfxGraftRefuse("ScrollRect.m_Content@0x20 or PostFXSettingsTab." &
-                 "_settingsRoot@0xa0 could not be READ, so neither is " &
-                 "written. The rows have already moved into the cloned " &
-                 "Content; they are moved back and the clone destroyed.")
-    discard pfxMoveKids(contentT, rowParent)
-    discard nuDestroy(cloneGo)
-    return
-  if cNuSetRef(sr, NuOffScrollContent, contentT) == 0'i32 or
-     cNuSetRef(tab, PfxOffSettingsRoot, contentT) == 0'i32:
-    pfxGraftRefuse("the write to m_Content@0x20 or _settingsRoot@0xa0 was " &
-                 "refused by the writability check. The rows are moved back " &
-                 "into SettingsPanel and the clone destroyed, so the page is " &
-                 "unscrolled but intact.")
-    discard pfxMoveKids(contentT, rowParent)
-    discard nuDestroy(cloneGo)
-    return
-  # (4) THE EMPTIED PANEL GOES DOWN, leaving the Viewport with exactly one
-  # active child. An empty-but-active 850x726 box in the viewport is still a
-  # raycast target and still a layout participant.
-  # ...UNLESS IT IS THE THING THAT DRAWS THE BACKGROUND. The census runs
-  # before the retire and decides which of the three cases this build is in.
-  let keepPanel = pfxBackground(panelT, rowParent, cloneT)
-  let oldGo = iGameObjectOf(rowParent)
-  if oldGo != nil and not keepPanel: discard modsSetActive(oldGo, false)
-  # A BACKGROUND QUAD MUST NOT ALSO TAKE LAYOUT SPACE. Kept active inside the
-  # same group, the emptied SettingsPanel would be measured a second time and
-  # the column's height would double. It opts out too, and is then given the
-  # root's rect -- it is now only something that draws.
-  if keepPanel:
-    discard pfxOptOutOfGroup(rowParent, "kept background SettingsPanel",
-                             optNote)
-    if not pfxApplyGeom(rowParent, og):
-      warn "postfx rows: the kept background SettingsPanel could not be " &
-           "given the authored rect back, so the quad behind the scroll " &
-           "region may not cover it. The rows are unaffected; this names the " &
-           "reason the background may look wrong."
+  cloneGoOut = cloneGo
+  cloneTOut = cloneT
+  srOut = sr
+  viewportTOut = viewportT
+  contentTOut = contentT
+  optNoteOut = optNote
+  retiredOut = retired
+  result = true
+
+proc pfxScrollHostFinish(cloneT, contentT: Il2CppPtr;
+                         layoutNoteOut: var string; optedOutOut: var int;
+                         bouncedOut: var bool; barFixedOut: var bool):
+                         Il2CppPtr =
+  ## The second half that is equally generic: make the layout actually run on
+  ## the cloned Content, clear any authored `ignoreLayout` on the rows now in
+  ## it, bounce the Content so `OnEnable -> SetDirty -> MarkLayoutForRebuild`
+  ## fires, and give the Scrollbar the donor's authored placement. Returns the
+  ## Scrollbar transform (or nil), and reports each outcome through its `var`
+  ## parameters rather than asserting any of them.
+  ##
+  ## CALL THIS AFTER the rows are in `contentT`, never before: the bounce is
+  ## what positions them, and a bounce that runs on an empty Content leaves the
+  ## rows stacked at the same y -- the exact 82cb47ee defect named below.
   # ---- MAKE THE LAYOUT ACTUALLY RUN ------------------------------------
   #
   # MEASURED live on 82cb47ee (host log 18:36, lines 1750-1751): the graft
@@ -1261,6 +1208,306 @@ proc pfxScrollify(tab, rowParent: Il2CppPtr; newRootOut: var Il2CppPtr): bool =
   var barFixed = false
   if barT != nil and gPfxDonorBarG.ok:
     barFixed = pfxApplyGeom(barT, gPfxDonorBarG)
+  layoutNoteOut = layoutNote
+  optedOutOut = optedOut
+  bouncedOut = bounced
+  barFixedOut = barFixed
+  result = barT
+
+
+# ---------------------------------------------------------------------------
+# THE MODS-PAGE ENTRY POINT INTO THE SAME SCROLL HOST
+#
+# `settingspages.nim` forward-declares exactly this one proc. Everything below
+# it is `pfxScrollHostMake` / `pfxScrollHostFinish` -- the SAME code the PostFX
+# graft runs, not a copy of it -- so a geometry fix lands on both pages at once
+# and neither can drift.
+#
+# WHY A MODS PAGE NEEDS IT AT ALL: `modsindex.nim` now parses a mod's schema
+# whole. `aowl.tarkov` is 949 rows. A fixed-height authored panel shows about
+# twenty of them and there is no way to reach the rest -- not "below the fold",
+# UNREACHABLE. Every page gets a scroll view or the rows do not exist.
+# ---------------------------------------------------------------------------
+var gSwScrollInit = false
+var gSwScrollOn = false            ## `settingsPagesScroll`, DEFAULT OFF
+var gSwScrollFaults = 0
+const SwScrollFaultCeiling = 3     ## rule 6: self-disable after N faults
+
+proc pfxGraphicsPanelFrom(anchorT: Il2CppPtr; why: var string): Il2CppPtr =
+  ## The ScrollRect donor's OWNER panel, reached by WALKING UP from a node the
+  ## caller already validated -- never by an offset and never from a cached
+  ## global. `gPfxGfxPanelT` exists and is deliberately not used here: it is
+  ## nil until the PostFX tick has run, so reading it would make a mods page's
+  ## scroll region silently depend on a different feature having been opened
+  ## first. That exact dependency is what made the v1 graft fail silently.
+  ##
+  ## Bounded to 10 hops (rule 4) and every hop validated (rule 2).
+  result = nil
+  why = ""
+  if anchorT == nil or not duOk(anchorT, 0x20'i32) or not iUnityAlive(anchorT):
+    why = "the page container's own Transform is not readable, so the walk " &
+          "up to the SettingsScreen cannot even start"
+    return
+  var t = anchorT
+  var hops = 0
+  while t != nil and hops < 10:
+    if duOk(t, 0x20'i32):
+      let g = modsChildNamed(t, "Graphics Settings")
+      if g != nil and duOk(g, 0x20'i32) and iUnityAlive(g):
+        result = g
+        return
+    t = modsParentOf(t)
+    hops = hops + 1
+  why = "no ancestor of the page container within " & $hops &
+        " hop(s) has a 'Graphics Settings' child, so the SettingsScreen was " &
+        "not found and there is no stock ScrollRect to clone. This is a " &
+        "REFUSAL, not a fallback: building a scroll region from scratch is " &
+        "the geometry that took three attempts to get right on PostFX"
+
+proc swScrollHostFor(anchorT, hostGo: Il2CppPtr; contentGoOut: var Il2CppPtr;
+                     note: var string): bool =
+  ## Build one page's scroll region and hand back the GameObject rows should be
+  ## instantiated into. Returns false with `note` set whenever it cannot -- the
+  ## caller renders into the fixed panel and SAYS SO; nothing here pretends.
+  ##
+  ## Rule 5 (flag-gated, default OFF) and rule 6 (self-disable after N faults)
+  ## are both honoured here rather than in the renderer, because this is the
+  ## half that clones and reparents live Unity objects.
+  result = false
+  contentGoOut = nil
+  if not gSwScrollInit:
+    gSwScrollInit = true
+    gSwScrollOn = readBoolKeyDef("settingsPagesScroll", false)
+    if gSwScrollOn:
+      okLog "settings pages: settingsPagesScroll is ON -- every rendered " &
+            "page gets a cloned SettingsList scroll region (the shared v3 " &
+            "graft). With it OFF the pages render into the authored " &
+            "fixed-height panel exactly as before, and any row past its " &
+            "bottom edge is unreachable."
+  if not gSwScrollOn:
+    note = "settingsPagesScroll is OFF (default), so no scroll region was " &
+           "built. This is the flag, not a failure"
+    return
+  if gSwScrollFaults >= SwScrollFaultCeiling:
+    note = "the scroll graft has already declined " & $gSwScrollFaults &
+           " time(s) this session and has SELF-DISABLED rather than retry " &
+           "on every page"
+    return
+  if hostGo == nil:
+    note = "the page has no host GameObject to parent a scroll region under"
+    inc gSwScrollFaults
+    return
+  var gfxWhy = ""
+  let gfxT = pfxGraphicsPanelFrom(anchorT, gfxWhy)
+  if gfxT == nil:
+    note = gfxWhy
+    inc gSwScrollFaults
+    return
+  # THE CLONE ROOT FILLS THE PAGE CONTAINER. Unlike the PostFX graft there is
+  # no authored SettingsPanel whose rect must be reproduced -- the page
+  # container IS the space, and the clone is its child, so "fill your parent"
+  # is the honest geometry: anchors (0,0)-(1,1), zero inset. A copy of the
+  # container's OWN rect would be wrong by construction, because its
+  # anchoredPosition is expressed in ITS parent's space, not its own.
+  let og = NuGeom(ok: true,
+                  aMinX: 0'f32, aMinY: 0'f32, aMaxX: 1'f32, aMaxY: 1'f32,
+                  pivX: 0.5'f32, pivY: 0.5'f32,
+                  sdX: 0'f32, sdY: 0'f32, posX: 0'f32, posY: 0'f32,
+                  rectW: 0'f32, rectH: 0'f32, rectX: 0'f32, rectY: 0'f32)
+  var cloneGo: Il2CppPtr = nil
+  var cloneT: Il2CppPtr = nil
+  var sr: Il2CppPtr = nil
+  var viewportT: Il2CppPtr = nil
+  var contentT: Il2CppPtr = nil
+  var optNote = ""
+  var retired = 0
+  var why = ""
+  if not pfxScrollHostMake(gfxT, hostGo, og, nil, nil,
+                           cloneGo, cloneT, sr, viewportT, contentT,
+                           optNote, retired, why):
+    note = why
+    inc gSwScrollFaults
+    return
+  # `ScrollRect.m_Content@0x20` must name the Content we are about to fill.
+  # The clone already names its own Content, so this is a re-assert rather than
+  # a repair -- and it is READ before it is written (rule 8), never blind.
+  if not nuOk(sr, NuOffScrollContent + 8'i32) or
+     cNuSetRef(sr, NuOffScrollContent, contentT) == 0'i32:
+    note = "ScrollRect.m_Content@0x20 could not be read or written on the " &
+           "cloned SettingsList, so the region would not scroll what we put " &
+           "in it. The clone is destroyed and the page is left unscrolled"
+    discard nuDestroy(cloneGo)
+    inc gSwScrollFaults
+    return
+  var layoutNote = ""
+  var optedOut = 0
+  var bounced = false
+  var barFixed = false
+  # The bounce runs on an EMPTY Content here, which is correct and is the
+  # difference from the PostFX caller: those rows were reparented in bulk from
+  # a container with no layout group, so they carried stale absolute positions
+  # that only a rebuild could fix. These rows do not exist yet -- they are
+  # Instantiate'd into the Content one slice at a time, and each Instantiate
+  # dirties the group itself. What the bounce buys us here is that the group
+  # and the ContentSizeFitter are demonstrably ENABLED before the first row
+  # lands, rather than on whatever state the clone inherited.
+  let barT = pfxScrollHostFinish(cloneT, contentT, layoutNote, optedOut,
+                                 bounced, barFixed)
+  let cgo = iGameObjectOf(contentT)
+  if cgo == nil:
+    note = "the cloned Content has no reachable GameObject, so rows cannot " &
+           "be instantiated into it. The clone is destroyed"
+    discard nuDestroy(cloneGo)
+    inc gSwScrollFaults
+    return
+  contentGoOut = cgo
+  note = $retired & " donor row(s) retired; " & layoutNote & "; scrollbar " &
+         (if barT == nil: "NOT FOUND"
+          elif barFixed: "given the donor's authored placement"
+          else: "left as the clone carried it") &
+         "; content bounced=" & (if bounced: "yes" else: "NO") &
+         "; opt-out: " & optNote
+  result = true
+
+proc pfxScrollify(tab, rowParent: Il2CppPtr; newRootOut: var Il2CppPtr): bool =
+  ## DEFECT 2, SECOND ATTEMPT -- and the first one is worth stating, because
+  ## the verdict that blessed it is the exact failure 9b is about.
+  ##
+  ## WHAT THE FIRST ATTEMPT DID: cloned the Graphics page's `SettingsList`,
+  ## moved `SettingsPanel` (the row parent) into the clone's Viewport, and
+  ## pointed `ScrollRect.m_Content@0x20` at it. The verdict then compared
+  ## `m_Content` against the row parent and two heights -- and passed.
+  ##
+  ## WHAT WAS ACTUALLY ON SCREEN (inspector, 2026-09-03 12:16):
+  ##   * the clone sat top-LEFT of the 930-wide panel: anchors (0,1)-(0,1),
+  ##     pivot (0,1), anchoredPosition (0,-59), sizeDelta (850,726) -- an inset
+  ##     box, not the space `SettingsPanel` used to occupy;
+  ##   * its Viewport resolved to 750x686 while `SettingsPanel` inside it kept
+  ##     a FIXED 850x726 with pivot (0.5,0.5) -- 100 px WIDER than the viewport
+  ##     that was supposed to clip it, with nothing driving its height;
+  ##   * the donor `Content` was still an ACTIVE 1490 px tall object sitting in
+  ##     the same Viewport, so the Viewport had TWO children.
+  ## Every one of those is a geometry fact the verdict never looked at.
+  ##
+  ## SO THE SHAPE IS FIXED BY CONSTRUCTION, not by adjustment:
+  ##
+  ##   1. `SettingsPanel`'s AUTHORED geometry is captured BEFORE anything is
+  ##      touched, and given verbatim to the CLONE ROOT. The scroll region then
+  ##      occupies precisely the space the authored panel occupied -- no
+  ##      constant is involved and it is resolution-independent.
+  ##   2. The clone's Viewport is STRETCHED to the clone root (anchors
+  ##      (0,0)-(1,1), sizeDelta (0,0)), so viewport rect == the authored
+  ##      SettingsPanel rect. The donor's own centred 750-wide viewport is
+  ##      exactly the inset the user saw and is not kept.
+  ##   3. THE CONTENT IS THE CLONE'S OWN `Content`, not `SettingsPanel`. This
+  ##      is the part that removes a whole class of defect instead of patching
+  ##      it: the donor Content already carries the LayoutGroup and
+  ##      ContentSizeFitter that DRIVE its height, already has top-stretch
+  ##      anchors (0,1)-(1,1) with pivot (0.5,1), and already is what the
+  ##      cloned ScrollRect names. Nothing has to be added, and `nuAdd` has no
+  ##      attested ContentSizeFitter kind, so adding one was never available.
+  ##      The rows MOVE into it and `_settingsRoot@0xa0` is repointed at it, so
+  ##      the game's own future stock rows land there too.
+  ##   4. The donor's 33 rows are retired FIRST (SetActive false), so the
+  ##      ContentSizeFitter recomputes from our rows alone -- a layout group
+  ##      skips inactive children. The emptied `SettingsPanel` is retired whole,
+  ##      so the Viewport ends with exactly ONE active child.
+  result = false
+  newRootOut = nil
+  gPfxGraftTried = true
+  if gPfxScrollGo != nil: return true
+  # THE TWO SILENT RETURNS THAT USED TO BE HERE WERE THE WHOLE BUG on
+  # a7386d1f: `if gGfxPanelT == nil or gGfxPostT == nil: return false` and its
+  # liveness twin, both bare. One of them fired on every run and said nothing.
+  # Both panels now come from the tab, and every exit below announces itself.
+  var postT: Il2CppPtr = nil
+  var gfxT: Il2CppPtr = nil
+  if not pfxResolvePanels(tab, postT, gfxT): return
+  # (1) THE AUTHORED RECT, read before we write anything anywhere. Without it
+  # there is nothing to size the scroll region to and nothing to restore, so
+  # this is a refusal, not a fallback.
+  let og = nuReadGeom(rowParent)
+  if not og.ok:
+    pfxGraftRefuse("the authored geometry of _settingsRoot (the SettingsPanel " &
+                 "the scroll region must exactly replace) could not be read, " &
+                 "so there is no rect to size the clone to. Nothing was " &
+                 "cloned and the page is untouched.")
+    return
+  var cloneGo: Il2CppPtr = nil
+  var cloneT: Il2CppPtr = nil
+  var sr: Il2CppPtr = nil
+  var viewportT: Il2CppPtr = nil
+  var contentT: Il2CppPtr = nil
+  var optNote = ""
+  var retired = 0
+  var graftWhy = ""
+  let panelT = modsChildNamed(postT, "Panel")
+  let panelGo = (if panelT != nil: iGameObjectOf(panelT) else: nil)
+  if panelT == nil or panelGo == nil:
+    pfxGraftRefuse("'PostFX Settings' -> 'Panel' has no reachable " &
+                 "GameObject, so there is nowhere to put a scroll host. The " &
+                 "page is untouched.")
+    return
+  if not pfxScrollHostMake(gfxT, panelGo, og, panelT, rowParent,
+                           cloneGo, cloneT, sr, viewportT, contentT,
+                           optNote, retired, graftWhy):
+    pfxGraftRefuse(graftWhy)
+    return
+  # (3) OUR ROWS IN, and `_settingsRoot` repointed at the thing that now holds
+  # them. The tab's field is written LAST of the three so that a refusal
+  # anywhere above leaves it naming the panel that still holds the rows.
+  let moved = pfxMoveKids(rowParent, contentT)
+  if moved <= 0:
+    pfxGraftRefuse("not one row could be moved from SettingsPanel into the " &
+                 "cloned Content, so the rows are still in the unscrolled " &
+                 "panel. The clone is destroyed and _settingsRoot is " &
+                 "untouched -- nothing is half-moved.")
+    discard nuDestroy(cloneGo)
+    return
+  if not nuOk(sr, NuOffScrollContent + 8'i32) or
+     not nuOk(tab, PfxOffSettingsRoot + 8'i32):
+    pfxGraftRefuse("ScrollRect.m_Content@0x20 or PostFXSettingsTab." &
+                 "_settingsRoot@0xa0 could not be READ, so neither is " &
+                 "written. The rows have already moved into the cloned " &
+                 "Content; they are moved back and the clone destroyed.")
+    discard pfxMoveKids(contentT, rowParent)
+    discard nuDestroy(cloneGo)
+    return
+  if cNuSetRef(sr, NuOffScrollContent, contentT) == 0'i32 or
+     cNuSetRef(tab, PfxOffSettingsRoot, contentT) == 0'i32:
+    pfxGraftRefuse("the write to m_Content@0x20 or _settingsRoot@0xa0 was " &
+                 "refused by the writability check. The rows are moved back " &
+                 "into SettingsPanel and the clone destroyed, so the page is " &
+                 "unscrolled but intact.")
+    discard pfxMoveKids(contentT, rowParent)
+    discard nuDestroy(cloneGo)
+    return
+  # (4) THE EMPTIED PANEL GOES DOWN, leaving the Viewport with exactly one
+  # active child. An empty-but-active 850x726 box in the viewport is still a
+  # raycast target and still a layout participant.
+  # ...UNLESS IT IS THE THING THAT DRAWS THE BACKGROUND. The census runs
+  # before the retire and decides which of the three cases this build is in.
+  let keepPanel = pfxBackground(panelT, rowParent, cloneT)
+  let oldGo = iGameObjectOf(rowParent)
+  if oldGo != nil and not keepPanel: discard modsSetActive(oldGo, false)
+  # A BACKGROUND QUAD MUST NOT ALSO TAKE LAYOUT SPACE. Kept active inside the
+  # same group, the emptied SettingsPanel would be measured a second time and
+  # the column's height would double. It opts out too, and is then given the
+  # root's rect -- it is now only something that draws.
+  if keepPanel:
+    discard pfxOptOutOfGroup(rowParent, "kept background SettingsPanel",
+                             optNote)
+    if not pfxApplyGeom(rowParent, og):
+      warn "postfx rows: the kept background SettingsPanel could not be " &
+           "given the authored rect back, so the quad behind the scroll " &
+           "region may not cover it. The rows are unaffected; this names the " &
+           "reason the background may look wrong."
+  var layoutNote = ""
+  var optedOut = 0
+  var bounced = false
+  var barFixed = false
+  let barT = pfxScrollHostFinish(cloneT, contentT, layoutNote, optedOut,
+                                 bounced, barFixed)
   gPfxScrollGo = cloneGo
   gPfxScrollHostT = cloneT
   gPfxScrollContentT = contentT
