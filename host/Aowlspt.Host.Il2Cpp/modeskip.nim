@@ -1302,3 +1302,418 @@ proc bindModeSkip(verbose: bool): bool =
         "screen is built and visible for that whole wait; it is dismissed, " &
         "not prevented."
   return true
+
+# ===========================================================================
+# F2 -- SKIP THE SCREEN WITH **NO FRAME OF UI**
+# ===========================================================================
+#
+# Everything above this line is F2's predecessor: it lets the character/mode
+# screen be BUILT and SHOWN, then presses the slot's own Apply a few frames
+# later. It works, and it flashes the screen. This section removes the flash by
+# answering the question one level earlier, before the selection controller
+# exists at all.
+#
+# THE HOOK -- `EFT.TarkovApplication::TryCreateInRaidCharacterSelection`
+# @0x97bbf0, target [3] in `abi/aowlspt_modeskip.h`, where its full derivation
+# lives (STATIC, arity 2, UNIQUE, clean 16-byte relocation window, two callers).
+# The boot BRANCHES ON ITS RETURN VALUE: `true` with a filled 24-byte
+# `CharacterSelectionResult` means "a character is already chosen", and the
+# selection screen is never constructed. `ShowLanguageSelectionIfNeeded(data)`
+# @0x97bd20 sits on the bypass side of that branch, so taking the bypass does
+# not skip it -- which is why this hooks HERE and not further down.
+#
+# TWO STAGES, ONE BUILD, TWO INDEPENDENT FLAGS:
+#
+#   `modeSkipProbe`          READ ONLY, default OFF. On the FIRST firing it
+#                            dumps the dictionary in RCX -- header bytes, the
+#                            candidate _buckets/_entries/_count, and every
+#                            entry's key and value with the value's klass name,
+#                            Status and ProfileId. It changes nothing and
+#                            always lets the original run.
+#
+#   `uxSkipModeScreenNative` THE SKIP, default OFF. On the FIRST firing it
+#                            looks for the entry whose value passes ALL THREE
+#                            runtime self-checks, writes the result exactly as
+#                            the original would have for that entry, and
+#                            returns true WITHOUT calling the original. If any
+#                            check fails it falls through to the original --
+#                            the screen shows and the old Submit path (if
+#                            `uxSkipModeScreen` is also on) handles it -- and
+#                            the log says which check failed and what it read.
+#
+# WHY THE VALUES CANNOT BE COMPUTED. `data` is the game's own
+# `Dictionary<EGameMode, CharacterSelectionProfileData>`; the pair the original
+# writes is `(a key of that dictionary, the value stored under it)`. The host
+# never constructs either. The 2026-09-02 minidump -- `Rcx=1`, a Profile
+# argument that was the integer 1 -- is what computing them costs.
+#
+# WHY THE CANDIDATE LAYOUT IS NOT A GUESS IN THE DANGEROUS SENSE. The
+# instantiated generic layout is not reachable offline (map section 4.3), so
+# the offsets in the header ARE a candidate. What makes them safe is that a
+# wrong candidate cannot pass the self-check: the value it produces would have
+# to have a klass whose full name reads `EFT.CharacterSelectionProfileData`,
+# AND a `Status@0x20` of exactly 2, AND a `ProfileId@0x78` equal to
+# `launchProfileId`. A readability check alone would prove nothing -- that is
+# how a plausible number becomes a crash.
+#
+# ONE-SHOT, AND WHY. The site has TWO callers (header target [3]): the boot's
+# `<RunInitialLobbyFlow>d__121` and the in-menu `switch character`
+# `<OpenCharacterSelectionFromMenu>d__118`. Only the boot call may be
+# bypassed -- bypassing the in-menu one would make "switch character" silently
+# do nothing. This acts on the FIRST call of the session only. REASONED, not
+# measured: the boot call necessarily precedes any in-menu switch, because the
+# menu does not exist until the boot flow has passed this point.
+#
+# THE EIGHT RULES: prologue byte-verified against the startup snapshot before
+# anything binds; every pointer hop VirtualQuery-guarded in C; ONE
+# `aowl_p_p_seh` around the whole body and no nested guard; every loop capped
+# at `AOWL_MSK_ENT_MAX`; both flags default OFF; self-disables after
+# `ModeSkipMaxFaults` faults; no managed allocation anywhere (this path runs
+# ONCE per session, not per frame); and the single write is read-validate-write
+# with an explicit writability query.
+
+proc cMskKlassNameOf(obj: Il2CppPtr; outBuf: cstring; cap: int32): int32 {.
+  importc: "aowl_msk_klass_name_of", nodecl.}
+proc cMskHexdump(p: Il2CppPtr; n: int32; outBuf: cstring; cap: int32): int32 {.
+  importc: "aowl_msk_hexdump", nodecl.}
+proc cMskArrData(a: Il2CppPtr): Il2CppPtr {.
+  importc: "aowl_msk_arr_data", nodecl.}
+proc cMskArrLen(a: Il2CppPtr): int64 {.
+  importc: "aowl_msk_arr_len", nodecl.}
+proc cMskEntry(data: Il2CppPtr; i: int32; key: var int32;
+               value: var Il2CppPtr): int32 {.
+  importc: "aowl_msk_entry", nodecl.}
+proc cMskResultWrite(res: Il2CppPtr; gameMode: int32; pd: Il2CppPtr): int32 {.
+  importc: "aowl_msk_result_write", nodecl.}
+proc cMskTcSetRet(p: Il2CppPtr; v: uint64) {.
+  importc: "aowl_regs_set_ret_int", nodecl.}
+
+const
+  MskTTryCreate = 3'i32 ## EFT.TarkovApplication::TryCreateInRaidCharacterSelection
+  MskDictBucketsOff = 0x10'i32
+  MskDictEntriesOff = 0x18'i32
+  MskDictCountOff   = 0x20'i32
+  MskEntMax = 16'i32
+    ## Mirrors `AOWL_MSK_ENT_MAX`. A corrupt `_count` cannot become an
+    ## unbounded loop inside a frame; a walk that stops AT the cap says so, so
+    ## a truncation can never read as an absence.
+  MskF2MaxFaults = 3
+    ## Same shape and reason as `ModeSkipMaxFaults`. In practice this path runs
+    ## once per session, so reaching 3 would mean something is badly wrong.
+
+var gMskTcCalls = 0                     ## firings of the site, this session
+var gMskTcOff = false                   ## self-disabled after faults
+var gMskTcFaults = 0
+var gMskTcProbed = false                ## the dump has been printed once
+var gMskTcSuppressed = false            ## the bypass was taken
+var gMskTcData: Il2CppPtr = nil         ## RCX, parked for the guarded body
+var gMskTcRes: Il2CppPtr = nil          ## RDX, ditto
+var gMskTcWantSkip = false              ## body -> caller: suppress the original
+var gMskTcSkipMode: int32 = 0           ## the key that was chosen
+var gMskTcSkipPd: Il2CppPtr = nil       ## the value stored under it
+var gMskTcWhy = ""                      ## why the skip was declined
+var gMskTcBoundLogged = false
+## Scratch, MODULE level for the same reason `gModeSkipIdBuf` is: Nimony cannot
+## prove a local array initialised before it is handed to C, and these are only
+## ever touched from the ONE guarded body on Unity's thread.
+var gMskTcKlassBuf: array[404, char]
+var gMskTcDumpBuf: array[416, char]
+var gMskTcIdBuf: array[264, char]
+
+{.emit: """
+extern void* aowl_msk_tc_body(void* a);
+static void* aowl_msk_tc_guarded(void* a) {
+    return aowl_p_p_seh((void*)aowl_msk_tc_body, a);
+}
+""".}
+proc cMskTcGuarded(a: Il2CppPtr): Il2CppPtr {.
+  importc: "aowl_msk_tc_guarded", nodecl.}
+
+proc mskTcKlassOf(p: Il2CppPtr): string =
+  ## The klass full name of `p`, or the INCONCLUSIVE marker. Never asserts
+  ## "not that type" from an unreadable name.
+  if cMskKlassNameOf(p, cast[cstring](addr gMskTcKlassBuf[0]), 404'i32) == 0'i32:
+    return "<no klass name readable -- INCONCLUSIVE>"
+  return $cast[cstring](addr gMskTcKlassBuf[0])
+
+proc modeSkipTryCreateBody(a: Il2CppPtr): Il2CppPtr {.
+    exportc: "aowl_msk_tc_body", cdecl.} =
+  ## THE WHOLE BODY, under the ONE guard installed by `aowl_msk_tc_guarded`.
+  ## Nothing in here opens a second guard: `aowl_p_p_seh` is not re-entrant and
+  ## a nested region would DISARM this one.
+  ##
+  ## `a` is unused; the inputs are `gMskTcData` / `gMskTcRes`, parked by the
+  ## caller immediately before the guarded call, exactly as `modeSkipSlotBody`
+  ## takes its inputs.
+  result = cast[Il2CppPtr](1)
+  gMskTcWantSkip = false
+  gMskTcSkipPd = nil
+  gMskTcSkipMode = 0
+  let data = gMskTcData
+  let res = gMskTcRes
+  if data == nil:
+    gMskTcWhy = "the `data` argument in RCX was NULL, so there is no " &
+                "dictionary to read. The original decides (it fails the same " &
+                "way) and the screen appears."
+    return
+
+  # ---- stage (a): the read-only census -----------------------------------
+  let buckets = cMskReadPtr(data, MskDictBucketsOff)
+  let entries = cMskReadPtr(data, MskDictEntriesOff)
+  let count = cMskReadI32(data, MskDictCountOff)
+  let entData = cMskArrData(entries)
+  let entLen = cMskArrLen(entries)
+
+  let doProbe = gModeSkipProbeOn and not gMskTcProbed
+  if doProbe:
+    gMskTcProbed = true
+    let dumped = cMskHexdump(data, 128'i32,
+                             cast[cstring](addr gMskTcDumpBuf[0]), 416'i32)
+    info "modeSkipProbe: TryCreateInRaidCharacterSelection @0x97BBF0 fired " &
+         "(call " & $gMskTcCalls & "). RCX data=0x" &
+         hexOf(cast[uint64](data)) & " klass=`" & mskTcKlassOf(data) &
+         "`, RDX result buffer=0x" & hexOf(cast[uint64](res)) &
+         ". Header " & (if dumped < 0: "UNREADABLE" else: $dumped &
+         " bytes: " & $cast[cstring](addr gMskTcDumpBuf[0]))
+    info "modeSkipProbe: CANDIDATE Dictionary<EGameMode," &
+         "CharacterSelectionProfileData> layout (NOT measured -- the " &
+         "instantiated generic layout is not reachable offline; this is the " &
+         "shape IL2CPP compiles CoreCLR's Dictionary into, and the entry " &
+         "walk below is what CONFIRMS or REFUTES it): _buckets@0x10=0x" &
+         hexOf(cast[uint64](buckets)) & " klass=`" & mskTcKlassOf(buckets) &
+         "`, _entries@0x18=0x" & hexOf(cast[uint64](entries)) & " klass=`" &
+         mskTcKlassOf(entries) & "` max_length=" & $entLen &
+         " data=0x" & hexOf(cast[uint64](entData)) & ", _count@0x20=" & $count
+    info "modeSkipProbe: CharacterSelectionResult is 24 bytes and the " &
+         "original writes exactly three fields into the caller's out-param " &
+         "(MEASURED, `R disasm 0x97bbf0 --to 0x97bd20`): GameMode dword@0x00 " &
+         "= the dictionary KEY, ProfileData qword@0x08 = the VALUE stored " &
+         "under it, Cancelled byte@0x10 = 0, followed by GC write barriers " &
+         "for the two managed slots, then `return true`. The failure path " &
+         "zeroes all 24 bytes and returns false."
+
+  if entData == nil or entLen <= 0:
+    gMskTcWhy = "the candidate `_entries`@0x18 (0x" &
+                hexOf(cast[uint64](entries)) & ") did not read back as an " &
+                "array (max_length=" & $entLen & "). The CANDIDATE dictionary " &
+                "layout is therefore REFUTED on this build, not confirmed. " &
+                "Nothing was written; the original runs and the screen appears."
+    return
+
+  # How many entries to examine: `_count` if it is sane, else the array length,
+  # and never more than the cap. A walk that stops AT the cap says so below.
+  var n = count
+  if n <= 0 or int64(n) > entLen:
+    n = int32(entLen)
+  var capped = false
+  if n > MskEntMax:
+    n = MskEntMax
+    capped = true
+
+  var chosenMode: int32 = 0
+  var chosenPd: Il2CppPtr = nil
+  var idMatches = 0
+  var i: int32 = 0
+  while i < n:
+    var key: int32 = 0
+    var value: Il2CppPtr = nil
+    if cMskEntry(entData, i, key, value) == 0'i32:
+      if doProbe:
+        info "modeSkipProbe: entry " & $i & " NOT READABLE at stride 0x18 -- " &
+             "the candidate entry layout does not hold here"
+      inc i
+      continue
+    let klass = (if value == nil: "<null value>" else: mskTcKlassOf(value))
+    let isPd = (if value == nil: 0'i32 else: cMskKlassIsPd(value))
+    var status: int32 = -1
+    var idStr = "<none>"
+    if isPd == 1'i32:
+      status = cMskProfileStatus(value)
+      let idLen = cMskProfileId(value, cast[cstring](addr gMskTcIdBuf[0]),
+                                264'i32)
+      if idLen > 0:
+        idStr = $cast[cstring](addr gMskTcIdBuf[0])
+    if doProbe:
+      info "modeSkipProbe: entry " & $i & " key(EGameMode)=" & $key &
+           " value=0x" & hexOf(cast[uint64](value)) & " klass=`" & klass &
+           "` isCharacterSelectionProfileData=" & $isPd &
+           " Status@0x20=" & $status & " (Locked0 Empty1 Available2 InRaid3)" &
+           " ProfileId@0x78=" & idStr
+    # THE SELF-CHECK, all three parts, in the order that makes a wrong layout
+    # cheapest to reject. `isPd == 1` is a POSITIVE name match, never an
+    # unreadable name treated as a pass.
+    if isPd == 1'i32 and chosenPd == nil and gModeSkipWantLen > 0:
+      if cMskProfileIs(value, cast[cstring](addr gModeSkipWantBuf[0])) != 0'i32:
+        inc idMatches
+        if status == MskStatusAvailable:
+          chosenMode = key
+          chosenPd = value
+    inc i
+
+  if capped:
+    info "modeSkipProbe/native: the entry walk STOPPED AT THE CAP of " &
+         $MskEntMax & " entries (_count read " & $count & "). That is a " &
+         "TRUNCATION, not an absence -- if the profile was not found, this " &
+         "line is why."
+
+  # ---- stage (b): the skip ------------------------------------------------
+  if not gModeSkipNativeOn:
+    gMskTcWhy = "uxSkipModeScreenNative is OFF, so this firing was READ ONLY. " &
+                "The original runs and the screen appears."
+    return
+  if gModeSkipWantLen == 0:
+    gMskTcWhy = "`launchProfileId` is absent, so there is no profile to " &
+                "match. Nothing was written; the screen appears."
+    return
+  if chosenPd == nil:
+    gMskTcWhy = "no dictionary entry passed all three self-checks. " &
+                $idMatches & " entr(y/ies) matched launchProfileId " &
+                gModeSkipWantId & " by ProfileId; of those, none also read " &
+                "Status@0x20 == 2 (Available). Walked " & $n & " of _count=" &
+                $count & " entries. NOTHING WAS WRITTEN and the original " &
+                "runs, so the stock character/mode screen appears and the " &
+                "ShowSlot/Submit path (uxSkipModeScreen) can still answer it."
+    return
+  # THE WRITE. Read-validate-write: `aowl_msk_result_write` VirtualQueries the
+  # 24 bytes for COMMITTED WRITABLE and refuses a buffer that straddles a
+  # region boundary rather than writing half of one.
+  if cMskResultWrite(res, chosenMode, chosenPd) == 0'i32:
+    gMskTcWhy = "the 24-byte CharacterSelectionResult out-param at 0x" &
+                hexOf(cast[uint64](res)) & " is not committed writable " &
+                "memory (VirtualQuery refused it). Nothing was written and " &
+                "the original runs."
+    return
+  gMskTcSkipMode = chosenMode
+  gMskTcSkipPd = chosenPd
+  gMskTcWantSkip = true
+
+proc modeSkipTryCreateFired(regs: Il2CppPtr): int32 =
+  ## PREFIX on `EFT.TarkovApplication::TryCreateInRaidCharacterSelection`.
+  ##   slot 0  RCX = data   (CharacterSelectionDataResponse, a Dictionary)
+  ##   slot 1  RDX = &result (24-byte CharacterSelectionResult out-param)
+  ##   slot 2  R8  = MethodInfo* (the caller passes NULL)
+  ## STATIC, three register slots, nothing on the caller's stack.
+  ##
+  ## Returns 1 to SUPPRESS the original -- the only place this host does that
+  ## on this site -- and 0 to let it run. It returns 1 only when the guarded
+  ## body actually wrote a result built from the game's own dictionary.
+  result = 0'i32
+  if gMskTcOff:
+    return
+  if not (gModeSkipProbeOn or gModeSkipNativeOn):
+    return
+  inc gMskTcCalls
+  if gMskTcCalls > 1:
+    # THE IN-MENU `switch character` PATH, and it is left alone. Bypassing it
+    # would make that button silently do nothing.
+    if gMskTcCalls == 2:
+      info "modeSkipProbe/native: TryCreateInRaidCharacterSelection fired a " &
+           "SECOND time. Only the FIRST call of the session is acted on -- " &
+           "the site has two callers (the boot's RunInitialLobbyFlow and the " &
+           "in-menu OpenCharacterSelectionFromMenu) and the in-menu switch " &
+           "must keep working. This firing was not touched."
+    return
+  let data = cast[Il2CppPtr](cRegsInt(regs, 0'i32))
+  let res = cast[Il2CppPtr](cRegsInt(regs, 1'i32))
+  if res == nil:
+    warn "modeSkipProbe/native: the out-param pointer in RDX was NULL. " &
+         "Nothing read, nothing written; the original runs."
+    return
+  gMskTcData = data
+  gMskTcRes = res
+  gMskTcWhy = ""
+  if cMskTcGuarded(cast[Il2CppPtr](0)) == nil:
+    inc gMskTcFaults
+    warn "modeSkipProbe/native: the guarded body faulted (" & $gMskTcFaults &
+         " of " & $MskF2MaxFaults & "). The original RUNS -- suppression " &
+         "requires a completed write, so a fault can never leave the caller " &
+         "with an unfilled result."
+    if gMskTcFaults >= MskF2MaxFaults:
+      gMskTcOff = true
+      warn "modeSkipProbe/native: too many faults; switching itself off for " &
+           "this session."
+    return
+  if not gMskTcWantSkip:
+    if gMskTcWhy.len > 0:
+      info "modeSkipProbe/native: NOT skipping -- " & gMskTcWhy
+    return
+  # SUPPRESS. RAX = 1 (`true`), and the caller's 24-byte result is already
+  # filled with the game's own (key, value) pair.
+  cMskTcSetRet(regs, 1'u64)
+  gMskTcSuppressed = true
+  okLog "skip mode screen NATIVELY (F2): TryCreateInRaidCharacterSelection " &
+        "@0x97BBF0 SUPPRESSED and answered true. The out-param at 0x" &
+        hexOf(cast[uint64](res)) & " was written GameMode@0x00=" &
+        $gMskTcSkipMode & " (the dictionary KEY, not a computed value), " &
+        "ProfileData@0x08=0x" & hexOf(cast[uint64](gMskTcSkipPd)) &
+        " (the VALUE stored under that key, klass-verified as EFT." &
+        "CharacterSelectionProfileData with Status@0x20=2 Available and " &
+        "ProfileId@0x78=" & gModeSkipWantId & "), Cancelled@0x10=0. The " &
+        "selection controller is never constructed, so there is NO frame of " &
+        "the character/mode screen. Returning true proves only that the " &
+        "branch was taken: the readback is MenuScreen::Show (uihooks site 2) " &
+        "firing with the selection screen's show-site count still at 0."
+  return 1'i32
+
+proc bindModeSkipNative(verbose: bool): bool =
+  ## Binds the F2 PREFIX. Opt-in twice over: either `modeSkipProbe` or
+  ## `uxSkipModeScreenNative` must be on, and the skip half additionally needs
+  ## a `launchProfileId`. A build whose prologue does not match binds nothing.
+  ##
+  ## Nothing else in this host names 0x97BBF0, so there is no double-detour
+  ## hazard and no rider alias to take. It is a PREFIX because the whole point
+  ## is to decide whether the original runs at all -- and because the method is
+  ## static with two declared arguments, i.e. THREE register slots, so
+  ## `attachDrain`'s postfix gate is not even in question.
+  if not (gModeSkipProbeOn or gModeSkipNativeOn):
+    return false
+  if gModeSkipTryCreateSlot >= 0:
+    return true
+  if not gReady or gDisableDrain:
+    return false
+  if gModeSkipNativeOn and gModeSkipWantId.len == 0:
+    warn "uxSkipModeScreenNative is on but `launchProfileId` is absent or " &
+         "empty in aowlspt-host.json. There is no profile to select, so the " &
+         "skip half can never pass its self-check. Binding anyway ONLY if " &
+         "modeSkipProbe is on; otherwise nothing is bound and the screen " &
+         "appears as normal."
+    if not gModeSkipProbeOn:
+      return false
+  if gModeSkipWantId.len > 0 and gModeSkipWantLen == 0:
+    if not modeSkipSetWantBuf(gModeSkipWantId):
+      warn "skip mode screen (native): `launchProfileId` does not fit the " &
+           "fixed comparison buffer. REFUSING rather than comparing a " &
+           "truncated id, which would match nothing and look like a silent " &
+           "no-op. Nothing bound."
+      return false
+  let fn = cMskFn(MskTTryCreate)
+  if fn == nil:
+    warn "skip mode screen (native): " &
+         "EFT.TarkovApplication::TryCreateInRaidCharacterSelection @0x97BBF0 " &
+         "did not verify against the STARTUP PROLOGUE SNAPSHOT on this build " &
+         "(" & $int(cMskOkCount()) & " verified, " & $int(cMskBadCount()) &
+         " rejected). Nothing bound; the selection screen will appear as " &
+         "normal. Expected 48 89 5C 24 10 57 48 83 EC 40 33 FF 48 8B DA 89."
+    return false
+  if not attachDrain("EFT.TarkovApplication::TryCreateInRaidCharacterSelection",
+                     fn, cast[Il2CppMethod](0), false, verbose, 34'i32, false,
+                     3'i32):
+    warn "skip mode screen (native): the prefix on " &
+         "TryCreateInRaidCharacterSelection did not bind. Nothing is skipped " &
+         "and the screen appears as normal."
+    return false
+  if not gMskTcBoundLogged:
+    gMskTcBoundLogged = true
+    okLog "skip mode screen (F2) ARMED: PREFIX on EFT.TarkovApplication::" &
+          "TryCreateInRaidCharacterSelection @0x97BBF0 (slot " &
+          $gModeSkipTryCreateSlot & "), probe=" &
+          (if gModeSkipProbeOn: "ON" else: "off") & " skip=" &
+          (if gModeSkipNativeOn: "ON" else: "off") & ". On the FIRST firing " &
+          "only, the game's own Dictionary<EGameMode,CharacterSelection" &
+          "ProfileData> in RCX is read; a value that is klass-verified, " &
+          "Status==2 Available and whose ProfileId is " &
+          (if gModeSkipWantId.len > 0: gModeSkipWantId else: "<unset>") &
+          " is written into the 24-byte out-param and the original is " &
+          "SUPPRESSED with true. Any failed check falls through to the " &
+          "original, which shows the screen, and says which check failed."
+  return true

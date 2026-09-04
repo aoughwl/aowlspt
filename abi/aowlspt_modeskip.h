@@ -156,6 +156,63 @@
 #define AOWL_MSK_SHOWSLOT_RVA    0x13efae0u
 #define AOWL_MSK_CTOR_RVA        0x13f0530u
 #define AOWL_MSK_SUBMIT_RVA      0x13f0bf0u
+#define AOWL_MSK_TRYCREATE_RVA   0x97bbf0u
+
+/* ---- F2: the CANDIDATE layouts, to be confirmed at RUNTIME -------------
+ *
+ * EVERYTHING IN THIS BLOCK IS A CANDIDATE, NOT A MEASUREMENT, and the code
+ * that uses it says so in the log. The reason is recorded in
+ * docs/BOOT-FLOW-MAP.md 4.3: `CharacterSelectionDataResponse` IS a
+ * `Dictionary<EGameMode, CharacterSelectionProfileData>`, and the
+ * INSTANTIATED generic layout is NOT reachable offline -- `R fields
+ * EFT.CharacterSelectionDataResponse` ends in the `GENERIC -- NO LAYOUT`
+ * refusal, and every `Il2CppGenericClass.cached_class` in the metadata file is
+ * null. So these offsets come from the SHAPE of CoreCLR's
+ * `Dictionary<TKey,TValue>` as IL2CPP compiles it, and the ONLY thing that
+ * makes them usable is the runtime self-check in `modeskip.nim`: the value
+ * pointer a candidate entry yields must have a klass whose full name reads
+ * `EFT.CharacterSelectionProfileData`, its `Status@0x20` must read
+ * `Available (2)`, and its `ProfileId@0x78` must equal `launchProfileId`.
+ * A wrong layout cannot pass all three. A wrong layout that passed only a
+ * readability check is precisely the failure mode this project keeps paying
+ * for -- `il2cpp_object_get_class` is `mov rax,[rcx]; ret`, so a bad pointer
+ * yields a plausible number in silence.
+ *
+ * Dictionary<K,V> instance fields, CANDIDATE:
+ *   0x10  _buckets   int[]
+ *   0x18  _entries   Entry[]
+ *   0x20  _count     int32
+ * Entry, for TKey = EGameMode (int32) and TValue = a reference, CANDIDATE:
+ *   0x00  hashCode  uint32
+ *   0x04  next      int32
+ *   0x08  key       int32   (+4 padding)
+ *   0x10  value     void*
+ *   stride 0x18
+ * Il2CppArray, the ordinary IL2CPP array header:
+ *   0x00 klass  0x08 monitor  0x10 bounds  0x18 max_length  0x20 element 0
+ */
+#define AOWL_MSK_DICT_BUCKETS_OFF 0x10
+#define AOWL_MSK_DICT_ENTRIES_OFF 0x18
+#define AOWL_MSK_DICT_COUNT_OFF   0x20
+#define AOWL_MSK_ARR_LEN_OFF      0x18
+#define AOWL_MSK_ARR_DATA_OFF     0x20
+#define AOWL_MSK_ENT_HASH_OFF     0x00
+#define AOWL_MSK_ENT_NEXT_OFF     0x04
+#define AOWL_MSK_ENT_KEY_OFF      0x08
+#define AOWL_MSK_ENT_VALUE_OFF    0x10
+#define AOWL_MSK_ENT_STRIDE       0x18
+#define AOWL_MSK_ENT_MAX          16
+    /* Hard cap on entries examined. A corrupt `_count` cannot become an
+     * unbounded loop inside a frame. */
+
+/* CharacterSelectionResult -- the 24-byte out-param. MEASURED from the disasm
+ * of 0x97bbf0 (see target [3] below), NOT from a field table: it is a value
+ * type, so it has no object header and no klass, and `tools/fldoff.py` cannot
+ * describe where a CALLER's buffer lives. */
+#define AOWL_MSK_RES_GAMEMODE_OFF  0x00   /* dword */
+#define AOWL_MSK_RES_PROFILE_OFF   0x08   /* qword, a managed reference */
+#define AOWL_MSK_RES_CANCELLED_OFF 0x10   /* byte  */
+#define AOWL_MSK_RES_SIZE          24
 
 /* EFT.CharacterSelectionProfileData */
 #define AOWL_MSK_PD_STATUS_OFF   0x20
@@ -242,6 +299,65 @@ static const AowlMskTarget aowl_msk_targets[] = {
     { "CharacterSelectionScreenController::Submit", AOWL_MSK_SUBMIT_RVA,
       { 0x48,0x89,0x5C,0x24,0x08, 0x48,0x89,0x74,0x24,0x10,
         0x57, 0x48,0x83,0xEC,0x20, 0x80 }, 16 },
+
+    /* [3] EFT.TarkovApplication::TryCreateInRaidCharacterSelection(
+     *         CharacterSelectionDataResponse data,
+     *         out CharacterSelectionResult result)   @0x97bbf0
+     *
+     * THIS IS THE F2 SITE -- the one that skips the screen with NO frame of UI,
+     * as opposed to the ShowSlot/Submit route above, which lets the screen be
+     * built and then dismisses it.
+     *
+     * MEASURED (docs/BOOT-FLOW-MAP.md 4.1, `il2cpp_resolve.py member` /
+     * `bytes` / `callers`):
+     *   attrs 0x0091 PRIVATE|STATIC|HIDEBYSIG, arity 2, section il2cpp,
+     *   sharedness UNIQUE (owners=1).
+     * It is STATIC, so the ABI is
+     *   RCX = data (CharacterSelectionDataResponse)
+     *   RDX = &result -- a 24-byte out buffer the CALLER supplies; the boot
+     *         passes `lea rdx,[rsi+0x40]`, a field of its own state machine
+     *   R8  = MethodInfo*  (the caller passes `xor r8d,r8d`, i.e. NULL)
+     * THREE register slots, so no argument of this method ever lives on the
+     * caller's stack and a PREFIX sees all of them.
+     *
+     * ITS BODY, MEASURED (`R disasm 0x97bbf0 --to 0x97bd20`):
+     *   if (data == null) goto fail
+     *   if (!data.TryGetInRaidProfile(out gameMode, out profile)) goto fail
+     *   result->GameMode    = gameMode   (dword at +0x00)
+     *   result->ProfileData = profile    (qword at +0x08)
+     *   result->Cancelled   = 0          (byte  at +0x10)
+     *   <GC write barriers for the two managed slots>
+     *   return true
+     * fail:
+     *   result->{0,0,0}; return false
+     * There is no other side effect: it touches no TarkovApplication field,
+     * starts no task and shows nothing. THAT is why returning `true` with a
+     * correctly filled result skips the screen outright -- the caller branches
+     * on the return value BEFORE the selection controller is constructed, and
+     * `ShowLanguageSelectionIfNeeded(data)` @0x97bd20 sits on the bypass side
+     * of that branch, so taking the bypass does not skip it.
+     *
+     *   48 89 5C 24 10    mov  [rsp+0x10], rbx
+     *   57                push rdi
+     *   48 83 EC 40       sub  rsp, 0x40
+     *   33 FF             xor  edi, edi
+     *   48 8B DA          mov  rbx, rdx
+     *   89 ..             (byte 15)
+     * NO rip-relative operand in the window, so the 14-byte absolute-jump
+     * detour has a clean relocation window -- unlike ShowProfileLoadingScreen,
+     * PrepareGame or MainMenuLoad, each of which carries `80 3D <rel32>`
+     * inside the first 16 bytes (map section 5, T3).
+     *
+     * TWO CALLERS, MEASURED (`R callers 0x97bbf0`):
+     *   0x9d8735  <RunInitialLobbyFlow>d__121::MoveNext        <- the boot
+     *   0x9cd95f  <OpenCharacterSelectionFromMenu>d__118::MoveNext <- in-menu
+     * A detour fires for BOTH, and the in-menu "switch character" path must be
+     * left alone. `modeskip.nim` therefore acts on the FIRST call of the
+     * session only. */
+    { "EFT.TarkovApplication::TryCreateInRaidCharacterSelection",
+      AOWL_MSK_TRYCREATE_RVA,
+      { 0x48,0x89,0x5C,0x24,0x10, 0x57, 0x48,0x83,0xEC,0x40,
+        0x33,0xFF, 0x48,0x8B,0xDA, 0x89 }, 16 },
 };
 
 #define AOWL_MSK_TARGET_COUNT \
@@ -250,6 +366,7 @@ static const AowlMskTarget aowl_msk_targets[] = {
 #define AOWL_MSK_T_SHOWSLOT 0
 #define AOWL_MSK_T_CTOR     1
 #define AOWL_MSK_T_SUBMIT   2
+#define AOWL_MSK_T_TRYCREATE 3
 
 /* Diagnostics, so a refusal in the log names its own reason rather than being
  * indistinguishable from "the feature was off". */
@@ -481,5 +598,146 @@ static int32_t aowl_msk_klass_is_pd(void* obj) {
 /* Whatever the last `aowl_msk_klass_is_pd` read, so a refusal can NAME the
  * type it actually found instead of asserting a cause with no evidence. */
 static const char* aowl_msk_klass_name(void) { return aowl_msk_klassbuf; }
+
+/* ---- F2 probe + skip primitives ---------------------------------------
+ *
+ * Every one of these is READ-ONLY except `aowl_msk_result_write`, and every
+ * one VirtualQuery-checks the exact bytes it is about to touch. None calls
+ * into managed code, none allocates, none loops without a cap.
+ */
+
+/* The klass full name of an arbitrary object, into the caller's buffer.
+ * Returns 1 on success, 0 if no name could be read -- which is INCONCLUSIVE
+ * and must never be flattened into "it is not that type". */
+static int32_t aowl_msk_klass_name_of(void* obj, char* out, int32_t cap) {
+    void* klass = NULL;
+    if (!out || cap <= 0) return 0;
+    out[0] = 0;
+    if (!obj) return 0;
+    if (!aowl_msk_readable(obj, sizeof(void*))) return 0;
+    memcpy(&klass, obj, sizeof(void*));
+    if (!klass) return 0;
+    if (!aowl_msk_readable(klass, 0x20)) return 0;
+    return aowl_comp_klass_fullname(klass, out, cap) ? 1 : 0;
+}
+
+/* `n` bytes at `p` as "xx xx xx ...". Returns the number of BYTES rendered,
+ * or -1 if the region is not readable -- never a partial line that could read
+ * as data. `n` is hard-capped so a bad argument cannot produce a huge line. */
+#define AOWL_MSK_DUMP_MAX 128
+static int32_t aowl_msk_hexdump(void* p, int32_t n, char* out, int32_t cap) {
+    static const char* aowl_msk_hexd = "0123456789ABCDEF";
+    const unsigned char* b = (const unsigned char*)p;
+    int32_t i = 0, w = 0;
+    if (!out || cap <= 0) return -1;
+    out[0] = 0;
+    if (n < 0) return -1;
+    if (n > AOWL_MSK_DUMP_MAX) n = AOWL_MSK_DUMP_MAX;
+    if (!p || !aowl_msk_readable(p, (size_t)n)) return -1;
+    for (i = 0; i < n; i++) {
+        if (w + 4 >= cap) break;          /* capped, never mid-byte */
+        if (i) out[w++] = ' ';
+        out[w++] = aowl_msk_hexd[(b[i] >> 4) & 0xF];
+        out[w++] = aowl_msk_hexd[b[i] & 0xF];
+    }
+    out[w] = 0;
+    return i;
+}
+
+/* Guarded u64 read. `ok` is set to 0 when the address was not readable, so a
+ * genuine 0 and an unreadable page stay distinguishable -- two outcomes are
+ * not enough here either. */
+static uint64_t aowl_msk_read_u64(void* base, int32_t off, int32_t* ok) {
+    uint64_t v = 0;
+    if (ok) *ok = 0;
+    if (!base) return 0;
+    if (!aowl_msk_readable((const char*)base + off, sizeof(uint64_t))) return 0;
+    memcpy(&v, (const char*)base + off, sizeof(uint64_t));
+    if (ok) *ok = 1;
+    return v;
+}
+
+/* Il2CppArray element base and length, under the array header above. */
+static void* aowl_msk_arr_data(void* arr) {
+    if (!arr) return NULL;
+    if (!aowl_msk_readable(arr, AOWL_MSK_ARR_DATA_OFF + 8)) return NULL;
+    return (void*)((char*)arr + AOWL_MSK_ARR_DATA_OFF);
+}
+static int64_t aowl_msk_arr_len(void* arr) {
+    int64_t n = 0;
+    if (!arr) return -1;
+    if (!aowl_msk_readable((const char*)arr + AOWL_MSK_ARR_LEN_OFF,
+                           sizeof(int64_t))) return -1;
+    memcpy(&n, (const char*)arr + AOWL_MSK_ARR_LEN_OFF, sizeof(int64_t));
+    if (n < 0 || n > 0x10000) return -1;   /* absurd length: refuse */
+    return n;
+}
+
+/* One CANDIDATE Entry. Returns 1 when the whole entry was readable, 0 when it
+ * was not; `key` and `value` are only meaningful on 1. */
+static int32_t aowl_msk_entry(void* data, int32_t i, int32_t* key, void** value) {
+    const char* e;
+    if (key) *key = 0;
+    if (value) *value = NULL;
+    if (!data || i < 0 || i >= AOWL_MSK_ENT_MAX) return 0;
+    e = (const char*)data + (size_t)i * AOWL_MSK_ENT_STRIDE;
+    if (!aowl_msk_readable(e, AOWL_MSK_ENT_STRIDE)) return 0;
+    if (key)   memcpy(key,   e + AOWL_MSK_ENT_KEY_OFF,   sizeof(int32_t));
+    if (value) memcpy(value, e + AOWL_MSK_ENT_VALUE_OFF, sizeof(void*));
+    return 1;
+}
+
+/* THE ONLY WRITE IN THIS FILE.
+ *
+ * WHICH KIND OF WRITE IT IS: an OUT-PARAMETER store, not a managed field
+ * store. `result` is a 24-byte `CharacterSelectionResult` buffer the CALLER
+ * owns; in the boot path it is `[rsi+0x40]`, a field of the caller's own async
+ * state machine, so the bytes may well live on the managed heap even though
+ * the thing being written is a value type with no header and no klass.
+ *
+ * That is exactly why it does NOT go through `hostfieldwrite`/`AowlFieldRef`.
+ * A FieldRef is admitted by comparing the RECEIVER'S KLASS against the klass
+ * the field was resolved on (`aowl_fr_recv_ok`), and this receiver HAS no
+ * klass to compare: there is no object header at `result`. Handing a
+ * headerless buffer to that path would mean either a refusal every time or,
+ * worse, reading a klass pointer out of whatever `[rsi+0x40]` happens to
+ * contain -- a check that cannot fail, in the other direction. So the guard
+ * used here is the one that actually applies to a raw buffer: an explicit
+ * VirtualQuery for 24 COMMITTED WRITABLE bytes inside a single region. The
+ * values themselves are never computed -- they are read out of the game's own
+ * dictionary.
+ *
+ * NO GC WRITE BARRIER IS EMITTED, and the original does emit two. REASONED,
+ * not measured: this build's collector is Boehm, which is non-moving, so the
+ * stored pointer stays valid; and the `CharacterSelectionProfileData` written
+ * here is simultaneously reachable from the very dictionary the caller handed
+ * us in RCX, which the caller's own state machine holds -- so it cannot be
+ * collected while this result is live. This is repeated in `modeskip.nim`
+ * where the feature is armed, and it is listed there as UNVERIFIED.
+ *
+ * Returns 1 if all 24 bytes were written, 0 if the buffer was not writable --
+ * in which case the caller MUST let the original run. */
+static int32_t aowl_msk_result_write(void* result, int32_t gameMode, void* pd) {
+    MEMORY_BASIC_INFORMATION mbi;
+    unsigned char zero = 0;
+    if (!result) return 0;
+    memset(&mbi, 0, sizeof(mbi));
+    if (VirtualQuery(result, &mbi, sizeof(mbi)) != sizeof(mbi)) return 0;
+    if (mbi.State != MEM_COMMIT) return 0;
+    if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return 0;
+    if (!(mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY |
+                         PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
+        return 0;
+    /* All 24 bytes must sit inside that one committed writable region; a
+     * result straddling a region boundary is refused rather than half
+     * written. */
+    if ((size_t)((char*)result - (char*)mbi.BaseAddress) + AOWL_MSK_RES_SIZE
+        > mbi.RegionSize) return 0;
+    memcpy((char*)result + AOWL_MSK_RES_GAMEMODE_OFF, &gameMode, sizeof(int32_t));
+    memcpy((char*)result + AOWL_MSK_RES_PROFILE_OFF,  &pd,       sizeof(void*));
+    memcpy((char*)result + AOWL_MSK_RES_CANCELLED_OFF, &zero,
+           sizeof(unsigned char));
+    return 1;
+}
 
 #endif /* AOWLSPT_MODESKIP_H */
