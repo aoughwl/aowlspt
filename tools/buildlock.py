@@ -333,6 +333,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -2945,6 +2946,52 @@ def aowl_exe(repo):
     return p if os.path.exists(p) else "aowl"
 
 
+NO_DRIVER_EXIT = 16
+
+
+def resolve_command(repo, rest):
+    """(cmd, message, exit_code) -- what to actually run for `rest`.
+
+    MEASURED 2026-09-04: with no `installer\\build\\aowl.exe` (the normal state
+    of a FRESH worktree -- that directory is gitignored), `aowl_exe` fell back
+    to the bare name "aowl", nothing on PATH provides it, and
+    `subprocess.Popen` raised FileNotFoundError [WinError 2] out of `main`.
+    A python traceback where a build verdict belongs is unreadable, and worse,
+    it happened for `bootstrap` -- the ONE verb whose entire purpose is to
+    create the missing driver. The chicken-and-egg is not real:
+    `tools\\bootstrap.ps1` compiles `tools\\aowl.nim` with nimony directly and
+    needs no driver, so bootstrap runs THAT, still under this script's lock.
+
+    Any other target with no driver is a refusal that names the fix, not a
+    traceback and not a silent PATH guess.
+    """
+    exe = os.path.join(repo, "installer", "build", "aowl.exe")
+    if os.path.exists(exe):
+        return [exe] + list(rest), "", 0
+    onpath = shutil.which("aowl")
+    if rest and rest[0] == "bootstrap":
+        ps1 = os.path.join(repo, "tools", "bootstrap.ps1")
+        if not os.path.exists(ps1):
+            return None, ("there is no installer\\build\\aowl.exe and no "
+                          "tools\\bootstrap.ps1 in %s, so there is no way to "
+                          "build the driver from here. NOTHING WAS RUN."
+                          % repo), NO_DRIVER_EXIT
+        return (["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                 "-File", ps1] + list(rest[1:])),\
+               ("no installer\\build\\aowl.exe: bootstrapping through "
+                "tools\\bootstrap.ps1, which compiles tools\\aowl.nim with "
+                "nimony directly (no driver needed). The lock is held for it."),\
+               0
+    if onpath:
+        return [onpath] + list(rest), "", 0
+    return None, ("there is no installer\\build\\aowl.exe in %s and no `aowl` "
+                  "on PATH, so %r cannot be run. NOTHING WAS RUN and no lock "
+                  "was taken. Build the driver first: `python "
+                  "tools/buildlock.py bootstrap`. (Do NOT copy aowl.exe from "
+                  "another checkout -- it runs THAT checkout's tools/aowl.nim.)"
+                  % (repo, " ".join(rest))), NO_DRIVER_EXIT
+
+
 def main():
     p = argparse.ArgumentParser(
         description="serialise `aowl build` within one checkout",
@@ -3157,7 +3204,12 @@ def main():
         if rc:
             return rc
 
-    cmd = [aowl_exe(a.repo)] + rest
+    cmd, why, drc = resolve_command(a.repo, rest)
+    if cmd is None:
+        print("BUILD REFUSED: %s" % why)
+        return drc
+    if why:
+        print(why, flush=True)
     if not acquire(path, " ".join(rest), a.wait, a.max_age, a.steal,
                    hopts):
         return 4

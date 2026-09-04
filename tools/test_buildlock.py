@@ -2881,6 +2881,79 @@ def preflight_sandbox():
             os.path.getmtime(REAL_LOCK) if os.path.exists(REAL_LOCK) else None)
 
 
+NO_AUDITS = ["--no-lint", "--no-drain-audit", "--no-gate-audit",
+             "--no-seh-audit", "--no-flag-audit", "--no-store-audit",
+             "--no-snapshot", "--no-source-check", "--no-artifact-check",
+             "--no-stage"]
+
+
+def test_no_driver(tmp):
+    """A worktree with NO installer\\build\\aowl.exe must get a verdict, not a
+    traceback.
+
+    MEASURED 2026-09-04: `python tools/buildlock.py bootstrap` in a fresh
+    worktree (installer/build is gitignored, so that is its NORMAL state) died
+    with FileNotFoundError [WinError 2] from subprocess.Popen -- `aowl_exe`
+    had fallen back to the bare name "aowl", which is on nobody's PATH. The
+    verb whose whole job is to CREATE the driver was the one that needed it.
+
+    Three worlds, and the third is the one that keeps the second honest:
+      (a) driver present            -> run it, unchanged;
+      (b) absent + `bootstrap`      -> run tools\\bootstrap.ps1 (needs no
+                                       driver), under the lock;
+      (c) absent + any other target -> REFUSE with an exit code, naming
+                                       bootstrap. Not a traceback, and not a
+                                       silent guess at PATH.
+    """
+    print("\nno driver: bootstrap must not need the thing it builds")
+    repo = os.path.join(tmp, "nodriver")
+    os.makedirs(os.path.join(repo, "installer", "build"), exist_ok=True)
+    os.makedirs(os.path.join(repo, "tools"), exist_ok=True)
+    ps1 = os.path.join(repo, "tools", "bootstrap.ps1")
+    with open(ps1, "w", newline="\n") as f:
+        f.write("exit 0\n")
+
+    # PATH is emptied for the units so that a real `aowl` on this machine
+    # cannot make (c) pass for the wrong reason.
+    saved = os.environ.get("PATH", "")
+    try:
+        os.environ["PATH"] = ""
+        cmd, why, rc = buildlock.resolve_command(repo, ["bootstrap"])
+        check("no aowl.exe + bootstrap -> runs tools\\bootstrap.ps1",
+              cmd is not None and rc == 0
+              and any(str(x).endswith("bootstrap.ps1") for x in cmd),
+              "cmd=%r rc=%r" % (cmd, rc))
+        check("...and says so rather than pretending a driver ran",
+              "bootstrap.ps1" in why, repr(why))
+
+        cmd, why, rc = buildlock.resolve_command(repo, ["build", "host"])
+        check("no aowl.exe + `build host` -> REFUSED with an exit code",
+              cmd is None and rc == buildlock.NO_DRIVER_EXIT,
+              "cmd=%r rc=%r" % (cmd, rc))
+        check("...and the refusal names the fix (bootstrap)",
+              "bootstrap" in (why or ""), repr(why))
+
+        # (a): the positive control. Without it, (b) and (c) could both be
+        # passing because resolve_command never finds anything.
+        exe = os.path.join(repo, "installer", "build", "aowl.exe")
+        with open(exe, "wb") as f:
+            f.write(b"MZ")
+        cmd, _why, rc = buildlock.resolve_command(repo, ["build", "host"])
+        check("driver present -> it is what runs (positive control)",
+              cmd is not None and rc == 0 and cmd[0] == exe
+              and cmd[1:] == ["build", "host"], "cmd=%r" % (cmd,))
+        os.remove(exe)
+    finally:
+        os.environ["PATH"] = saved
+
+    # End to end, which is where the traceback actually appeared.
+    rc, out = build_in(repo, *(NO_AUDITS + ["build", "host"]))
+    check("end to end: no traceback from a driverless checkout",
+          "Traceback (most recent call last)" not in out, out[-400:])
+    check("end to end: exit %d (NO DRIVER), not 0" % buildlock.NO_DRIVER_EXIT,
+          rc == buildlock.NO_DRIVER_EXIT, "exit %d: %s" % (rc, out[-400:]))
+
+
 def main():
     t_suite = time.time()
     before_lock = preflight_sandbox()
@@ -2968,7 +3041,8 @@ def main():
                    test_generated_is_not_a_source, test_markers_under_lock,
                    test_verify_artifact,
                    test_nimlint_units, test_lint_preflight,
-                   test_internal_crash_units, test_internal_crash_report):
+                   test_internal_crash_units, test_internal_crash_report,
+                   test_no_driver):
             t0 = time.time()
             fn(tmp)
             TIMINGS.append((fn.__name__, time.time() - t0))

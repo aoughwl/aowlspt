@@ -2276,8 +2276,19 @@ proc cmdTestOneMod(e: Env; name: string): int =
         "pure decision logic belongs in core/; this verb cannot test a mod " &
         "whose logic only exists inside a live client.)"
     return 3
-  let outDir = joinPath(e.repo, "installer\\build\\modselftest")
+  # PER MOD, and the working directory below is this same directory. MEASURED
+  # 2026-09-04: with one shared directory, nimony's `nimcache` (which it writes
+  # relative to the WORKING directory -- see `run`) was shared by every mod's
+  # harness, and the .nif index of the previous mod's modules survived into the
+  # next build. `aowl test --mod sain` then `--mod maps` failed with
+  # `cannot open: nimcache\vec4ymjhj.s.nif` (sain's `vec`), and the reverse
+  # order failed on `plagncxy51.s.nif` (maps' `place`) -- exit 1, reading
+  # exactly like a failing suite. Order-dependence in a verdict tool is the
+  # confidently-wrong answer this verb exists to prevent, so the caches cannot
+  # be allowed to touch.
+  let outDir = joinPath(joinPath(e.repo, "installer\\build\\modselftest"), name)
   discard ensureDir(outDir)
+  discard ensureDir(joinPath(outDir, "nimcache"))
   let mainNim = joinPath(outDir, name & "_selftest.nim")
   # Generated, not committed: the harness must follow whatever `core/selftest`
   # is on the branch being tested, and a committed copy per mod would be one
@@ -2307,7 +2318,7 @@ proc cmdTestOneMod(e: Env; name: string): int =
   cmd.add " -o:" & quoted(exe)
   cmd.add " " & quoted(mainNim)
   heading "mods\\" & name & "\\core\\selftest"
-  if not run(e, name & " selftest builds", cmd, e.repo):
+  if not run(e, name & " selftest builds", cmd, outDir):
     return 1
   # NOT through `run()`. `run` discards a successful command's output unless
   # --verbose, which is precisely the behaviour that made `aowl test` emit
