@@ -1293,6 +1293,9 @@ var gSwSliceWorked = false
 ## offer, never a guarantee.
 var gSwPagesTabPtr = 0'u64
 var gSwPagesTabKey = 0'u64
+## Said once: the settings registry is declining pages the MODS
+## registry owns. Per-tick would be log spam (rule 7).
+var gSwForeignSaid = false
 
 ## WHICH REGISTRY A DRAIN IS DRIVING. This used to be a bare `who: string`
 ## that `modstab.nim` passed as the literals "settings pages" / "mods pages",
@@ -1318,6 +1321,97 @@ proc swRegName*(r: SwRegistry): string =
 ## file's `gModsSubs`; the drain here only decides WHEN. Returns true if it
 ## begun a page, in which case this tick's budget is spent.
 proc modsAutoBeginNext(pages: var seq[SwPage]): bool
+
+## Also into `modstab.nim`: does the MODS registry currently OWN the `mod:*`
+## pages? `gModsPages` is a variable in that file and variables do NOT
+## forward-resolve across an include boundary (procs do), so this is a proc.
+##
+## It decides ownership, and ownership decides who may render: after the MODS
+## tab has built, a `mod:*` page that reappears in `gSwPages` (the fetch
+## re-stages on its refresh cycle, and `modsettingsrender.nim` registers into
+## the settings registry) must NOT be rendered onto the Game tab as well.
+proc modsOwnsModPages(): bool
+
+## And the census, which needs BOTH registries and therefore lives where
+## `gModsPages` is visible.
+proc modsRegistryCensus(where: string)
+
+## How many times the OK form of the census has been said. A failure is always
+## printed; a pass is printed the first few times and then counted, because a
+## line on every tab-built event is the log spam rule 7 exists to prevent.
+var gSwCensusOk = 0
+const cSwCensusOkMax = 8
+
+proc swRegistryCensus*(settings, mods: seq[SwPage]; where: string) =
+  ## THE OWNERSHIP ASSERTION, stated as numbers that can be wrong.
+  ##
+  ## A mod page must exist in exactly ONE registry. It used to exist in two --
+  ## `modsBuildPages` COPIED it out of `gSwPages`, and a Nim `seq` copy shares
+  ## its elements' `rows` buffer, so both copies wrote `rows[i].clone` over
+  ## each other and each one's verdict read the other's clones.
+  ##
+  ## `shared` is computed by looking for a page id that appears in BOTH
+  ## registries -- that is the condition which produces the shared buffer, and
+  ## it is what this check exists to falsify. For any such id the two `rows[0]
+  ## .clone` values are ALSO compared: if the buffer really is shared they are
+  ## necessarily equal, so an id collision whose clones differ is a different
+  ## (weaker) fault than one whose clones alias, and the line says which.
+  ##
+  ## NOTE, said plainly rather than implied: this cannot read a seq's buffer
+  ## ADDRESS -- nothing in this host takes `addr` of a managed container and
+  ## the codegen is not exercised for it. The id-collision test detects exactly
+  ## the situation that creates the aliasing, and the clone comparison
+  ## corroborates it; it is not a pointer identity proof, and it is not
+  ## reported as one.
+  var settingsPages = 0
+  var modPagesHere = 0
+  var i = 0
+  while i < settings.len and i < 64:              # rule 4: capped
+    if settings[i].modGuid.len > 0: modPagesHere = modPagesHere + 1
+    else: settingsPages = settingsPages + 1
+    i = i + 1
+  var shared = 0
+  var aliasing = 0
+  var firstShared = ""
+  i = 0
+  while i < settings.len and i < 64:
+    var j = 0
+    while j < mods.len and j < 64:
+      if settings[i].id == mods[j].id:
+        shared = shared + 1
+        if firstShared.len == 0: firstShared = settings[i].id
+        if settings[i].rows.len > 0 and mods[j].rows.len > 0 and
+           settings[i].rows[0].clone == mods[j].rows[0].clone and
+           settings[i].rows[0].clone != 0'u64:
+          aliasing = aliasing + 1
+        break
+      j = j + 1
+    i = i + 1
+  let line = "page registry (" & where & "): " & $settingsPages &
+             " settings page(s), " & $mods.len & " mod page(s), " & $shared &
+             " shared"
+  if shared > 0:
+    warn line & " -- AND SHARED IS NOT ZERO. '" & firstShared &
+         "' is in both registries" &
+         (if aliasing > 0: " and " & $aliasing &
+            " of them read the SAME rows[0].clone, so the rows buffer really " &
+            "is shared: two renderers are writing over each other"
+          else: ", though none aliases a clone yet -- it will as soon as both " &
+            "render") & ". A mod page must belong to swRegMods and to nothing " &
+         "else; " & $modPagesHere & " mod page(s) are still sitting in the " &
+         "settings registry."
+  elif modPagesHere > 0:
+    warn line & " -- no id is in both registries, but " & $modPagesHere &
+         " mod page(s) are STILL in the settings registry (over the subtab " &
+         "cap, or the MODS tab has not built yet). They are not owned by " &
+         "swRegMods and the Game tab will render them."
+  else:
+    inc gSwCensusOk
+    if gSwCensusOk <= cSwCensusOkMax:
+      okLog line & " -- every mod page belongs to the mods registry and to " &
+            "nothing else, so no rows buffer is reachable from two " &
+            "renderers. (pass #" & $gSwCensusOk & " of " & $cSwCensusOkMax &
+            " printed; later passes are counted, failures always print.)"
 
 proc swSliceNote(): string =
   "slice clock: " & $gSwSliceTicks & " row tick(s), worst " &
@@ -2021,15 +2115,30 @@ proc swAutoBeginNext(pages: var seq[SwPage]): bool =
     if pages[i].begun and not pages[i].complete:
       return                                       # one at a time
     i = i + 1
-  # The first page that has not been rendered onto THIS tab object yet.
+  # The first page that has not been rendered onto THIS tab object yet AND
+  # that this registry actually OWNS. A `mod:*` page belongs to swRegMods once
+  # the MODS tab has built it; the fetch re-stages on its refresh cycle and
+  # `modsettingsrender.nim` registers into THIS registry, so without this test
+  # a mod page would be rendered twice -- once per tab -- over one rows buffer.
   var pick = -1
+  var skippedForeign = 0
+  let modsOwn = modsOwnsModPages()
   i = 0
   while i < pages.len and i < 32:
-    if pages[i].renderedFor != gSwPagesTabKey:
+    if pages[i].modGuid.len > 0 and modsOwn:
+      skippedForeign = skippedForeign + 1
+    elif pages[i].renderedFor != gSwPagesTabKey:
       pick = i
       break
     i = i + 1
-  if pick < 0: return
+  if pick < 0:
+    if skippedForeign > 0 and not gSwForeignSaid:
+      gSwForeignSaid = true
+      okLog "settings pages: " & $skippedForeign & " page(s) in the settings " &
+            "registry are mod pages that the MODS registry owns, so they are " &
+            "NOT rendered onto the Game tab. They are rendered once, on the " &
+            "MODS tab, into their own subtab container."
+    return
   let tabPtr = cast[Il2CppPtr](gSwPagesTabPtr)
   if not duOk(tabPtr, 0x20'i32) or not iUnityAlive(tabPtr):
     warn "settings pages: the next page cannot be begun from the tick -- the " &
@@ -2685,6 +2794,8 @@ proc swPagesOnTabBuilt(tabPtr: Il2CppPtr; tabName: string; revisit: bool) =
   # page counts as a non-empty registry.
   swCrumb("STAGE: swPagesOnTabBuilt -- modSetDrainStaged")
   modSetDrainStaged()
+  # THE OWNERSHIP ASSERTION, right after the only place this registry grows.
+  modsRegistryCensus("settings tab built")
   # The registry is rebuilt from the config each time the tab is opened, so the
   # rows show what the file currently says.
   if gSwPages.len == 0:
@@ -2736,6 +2847,14 @@ proc swPagesOnTabBuilt(tabPtr: Il2CppPtr; tabName: string; revisit: bool) =
   while i < gSwPages.len:
     swCrumb("STAGE: swPagesOnTabBuilt -- page[" & $i & "/" & $gSwPages.len &
             "] id='" & gSwPages[i].id & "' rows=" & $gSwPages[i].rows.len)
+    # NOT OURS: a `mod:*` page belongs to the MODS registry once that tab has
+    # built it, and rendering it here as well would be two renderers over one
+    # shared rows buffer (see `swRegistryCensus`). Read-back is still ours to
+    # do -- the value the player left is the same value either way.
+    if gSwPages[i].modGuid.len > 0 and modsOwnsModPages():
+      swReadBackPage(gSwPages[i])
+      i = i + 1
+      continue
     # IN FLIGHT: the drain owns it. Reading its values back is safe and is
     # still wanted; re-beginning it is what produced the 4-second cycle.
     if gSwPages[i].begun and not gSwPages[i].complete:

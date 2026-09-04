@@ -1319,14 +1319,50 @@ proc modsBuildPages(): seq[SwPage] =
   # `swPageRegister` keys pages by id and a mod's id is always "mod:<guid>"
   # (`modSetParseSchema`), so filtering on `modGuid.len > 0` picks out exactly
   # the fetched pages and none of the built-in ones above.
+  #
+  # THIS IS A MOVE, NOT A COPY, AND THAT IS THE WHOLE POINT.
+  #
+  # It used to `result.add gSwPages[m]`, and a Nim `seq` copy SHARES its
+  # elements' `rows` buffer. So the same mod page existed in BOTH registries
+  # over ONE row buffer: two renderers writing `rows[i].clone` on top of each
+  # other, each one's verdict reading clones the other had replaced, and the
+  # Game tab drawing every mod's rows a second time in a panel that has no
+  # subtab to reach them from. A mod page belongs to the MODS registry; the
+  # settings registry keeps the host page(s) only.
+  #
+  # `gSwPages` is rebuilt here with the mod pages removed, so after this call
+  # no rows buffer is reachable from two registries. `swRegistryCensus` below
+  # states that as a number that can be wrong.
   var m = 0
   var modPages = 0
+  var keptSettings: seq[SwPage] = @[]
+  var moved = 0
+  var movedIds = ""
   while m < gSwPages.len:
     if gSwPages[m].modGuid.len > 0:
       modPages = modPages + 1
       if result.len < ModsMaxSubtabs:
         result.add gSwPages[m]
+        moved = moved + 1
+        if movedIds.len < 200:
+          movedIds = movedIds & (if movedIds.len > 0: ", " else: "") &
+                     gSwPages[m].id
+      else:
+        # Over the strip cap: it cannot be shown here, so it is LEFT in the
+        # settings registry rather than dropped on the floor. The warning
+        # below still names the shortfall.
+        keptSettings.add gSwPages[m]
+    else:
+      keptSettings.add gSwPages[m]
     m = m + 1
+  gSwPages = keptSettings
+  okLog "mods tab: MOVED " & $moved & " mod page(s) out of the settings " &
+        "registry into the mods registry (" & movedIds &
+        (if movedIds.len >= 200: ", ..." else: "") &
+        "). A move and not a copy: a seq copy shares its elements' rows " &
+        "buffer, so the same page in two registries was two renderers " &
+        "writing the same rows[i].clone. gSwPages now holds " &
+        $gSwPages.len & " page(s)."
   # NEVER A SILENT CAP. There are 16 mods in the tree and this used to stop at
   # `ModsMaxSubtabs` without a word, so the player saw a MODS tab that was
   # simply missing pages with nothing anywhere saying so.
@@ -1821,6 +1857,7 @@ proc modsTabBuild(): bool =
     return
   let stripT = modsTransformOf(stripClone)
   gModsPages = modsBuildPages()
+  modsRegistryCensus("mods tab built")
   gModsSubs = @[]
   let made = modsBuildSubtabs(stripT, donorButtonGo, donorButton,
                               modsToggleOf(donorTab))
@@ -2129,6 +2166,21 @@ proc modsReassertLabels() =
             "re-assert poll has switched itself off for this session"
   else:
     gModsLabelStable = 0
+
+proc modsOwnsModPages(): bool =
+  ## Does the MODS registry own the `mod:*` pages? Forward-declared in
+  ## `settingspages.nim`, which cannot see `gModsPages` (a variable does not
+  ## forward-resolve across an include boundary; a proc does).
+  ##
+  ## OWNERSHIP IS A STATE, NOT A FLAG: it is true only when the MODS tab has
+  ## actually built pages. Before that -- the tab is off, or has not been
+  ## opened -- the settings registry is still the only renderer a mod page has,
+  ## and answering true would make those pages render NOWHERE.
+  gModsBuilt and gModsPages.len > 0
+
+proc modsRegistryCensus(where: string) =
+  ## The ownership assertion over BOTH registries. See `swRegistryCensus`.
+  swRegistryCensus(gSwPages, gModsPages, where)
 
 proc modsAutoBeginNext(pages: var seq[SwPage]): bool =
   ## BEGIN ONE MODS PAGE, FROM THE TICK, WHEN NOTHING ELSE IS FILLING.
