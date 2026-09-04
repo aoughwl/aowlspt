@@ -205,6 +205,24 @@ var gSbdRows: seq[SbdRow] = @[]
 ## side needs no equivalent: this file never writes a toggle, and the drain
 ## already ignores `sendCallback=false`.
 var gSbdApplying = false
+## THE EVENT CENSUS. Three states have to be distinguishable and, before this,
+## none of them were: (a) the drain never reached us at all, (b) it reached us
+## and matched no row, (c) it matched. A silent (a) and a silent (b) look
+## identical from the log, and that is exactly the pair that cost the live
+## session at 18:36 -- a toggle whose `m_IsOn` provably went 1 -> 0 produced no
+## line of any kind.
+var gSbdTogSeen = 0        ## Toggle::Set events that reached `sbdOnToggleSet`
+var gSbdTogMatched = 0     ## ...of those, how many matched a registered row
+var gSbdSlidSeen = 0
+var gSbdSlidMatched = 0
+var gSbdSaveCount = 0
+## Pointers already probed for a BIND MISS report, so the name lookup is done
+## at most once per distinct toggle and the work on the game's click path stays
+## bounded. Capped hard: this is on the path of EVERY toggle in the game.
+var gSbdMissProbed: seq[Il2CppPtr] = @[]
+var gSbdMissSaid = 0
+const SbdMaxMissSaid = 4
+const SbdMaxMissProbed = 12
 ## `gSbdSlotSlider` / `gSbdSlotSave` are declared in `aowlhost.nim` beside
 ## `gNtToggleSlot`, above `patchFired`, because that is where the dispatcher
 ## can see them. They are NOT re-declared here: a second `var` of the same name
@@ -494,14 +512,50 @@ proc sbdOnToggleSet*(tog: Il2CppPtr; turnedOn: bool) =
   ## Cost for every foreign toggle in the game: one boolean and at most
   ## `SbdMaxRows` pointer compares, no dereference, no log.
   if not sbdReady() or tog == nil: return
+  gSbdTogSeen = gSbdTogSeen + 1
   var i = 0
   while i < gSbdRows.len and i < SbdMaxRows:
     if (gSbdRows[i].kind == sbdToggle or gSbdRows[i].kind == sbdEnable) and
        gSbdRows[i].ev == tog:
       gSbdRows[i].stagedB = turnedOn
       gSbdRows[i].staged = true
+      gSbdTogMatched = gSbdTogMatched + 1
+      okLog "settings bind: STAGED '" & gSbdRows[i].key & "' = " &
+            swBoolText(turnedOn) & " (Toggle::Set on the registered pointer " &
+            "0x" & hexOf(cast[uint64](tog)) & "). Not written yet -- it goes " &
+            "out on the next SaveSettings."
       return
     i = i + 1
+  # A MISS. Every toggle in the game funnels through here, so a miss is the
+  # NORMAL case and must not log -- except for a toggle that is demonstrably
+  # ONE OF OURS, which is the defect this exists to make impossible to miss.
+  #
+  # The name lookup is what costs, so it is done at most once per distinct
+  # pointer (`gSbdMissProbed`, capped) and only while the registry is
+  # non-empty. With no rows registered there is nothing to have missed; that
+  # case is reported by the SAVE line's registry count instead.
+  if gSbdRows.len == 0: return
+  if gSbdMissSaid >= SbdMaxMissSaid: return
+  if gSbdMissProbed.len >= SbdMaxMissProbed: return
+  var q = 0
+  while q < gSbdMissProbed.len:
+    if gSbdMissProbed[q] == tog: return
+    q = q + 1
+  gSbdMissProbed.add tog
+  let go = nuGameObjectOf(tog)
+  if go == nil: return
+  let nm = iObjName(go)
+  if nm.len < 11 or nm[0 .. 10] != "aowlspt-pfx":
+    return                            # a foreign toggle; silence is correct
+  gSbdMissSaid = gSbdMissSaid + 1
+  warn "settings bind: BIND MISS: Toggle::Set on '" & nm & "' (toggle 0x" &
+       hexOf(cast[uint64](tog)) & ") matched NO registered row -- the " &
+       "registry holds " & $gSbdRows.len & " row(s). That GameObject name is " &
+       "ours, so this row was built and NOT registered, or it was registered " &
+       "with a DIFFERENT pointer than the one the game raises the event on. " &
+       "Registration takes SettingToggle.Toggle@0xa8 (an UpdatableToggle, " &
+       "which derives from UnityEngine.UI.Toggle) off the SettingControl that " &
+       "Instantiate returned. The row is on screen and changes nothing."
 
 proc sbdSliderSetFired(regs: Il2CppPtr) =
   ## `UnityEngine.UI.Slider::Set(this, float input, bool sendCallback)`.
@@ -516,19 +570,50 @@ proc sbdSliderSetFired(regs: Il2CppPtr) =
   # `SetValueWithoutNotify` and the game's own restore pass sendCallback=false.
   # Those are not edits.
   if (cast[uint64](cRegsInt(regs, 2'i32)) and 0xFF'u64) == 0'u64: return
+  gSbdSlidSeen = gSbdSlidSeen + 1
   var i = 0
   while i < gSbdRows.len and i < SbdMaxRows:
     if gSbdRows[i].kind == sbdSlider and gSbdRows[i].ev == selfPtr:
+      gSbdSlidMatched = gSbdSlidMatched + 1
       sbdStageF(i, float32(cRegsF32(regs, 1'i32)))
       return
     i = i + 1
 
+proc sbdStagedCount(): int =
+  result = 0
+  var i = 0
+  while i < gSbdRows.len and i < SbdMaxRows:
+    if gSbdRows[i].staged: result = result + 1
+    i = i + 1
+
+proc sbdCensus(): string =
+  ## The one string that separates the three failure states from each other.
+  "registry=" & $gSbdRows.len & " staged=" & $sbdStagedCount() &
+  " toggleEvents=" & $gSbdTogSeen & "/matched " & $gSbdTogMatched &
+  " sliderEvents=" & $gSbdSlidSeen & "/matched " & $gSbdSlidMatched
+
 proc sbdSaveFired() =
-  ## `SettingsScreenController::SaveSettings()` PREFIX. Sets a flag and returns:
-  ## it is inside the game's own save and does no allocation, no POST and no
-  ## logging. The flush happens on the next drain tick.
+  ## `SettingsScreenController::SaveSettings()` PREFIX.
+  ##
+  ## IT LOGS, ON EVERY PRESS, and that is a deliberate reversal. The previous
+  ## version set a flag silently and left the reporting to the tick -- so when
+  ## the second SAVE of the live 18:36 session produced NO line at all, nothing
+  ## could distinguish "the prefix never fired" from "the prefix fired and the
+  ## tick never drained it". Those have completely different fixes. One line
+  ## here answers it outright.
+  ##
+  ## Rule 7 (no per-frame managed allocation) is not weakened: a SAVE press is
+  ## a human action, not a frame. This is the only allocating line on the
+  ## game's own save path and it is one per press.
   if not sbdReady(): return
+  gSbdSaveCount = gSbdSaveCount + 1
   gSbdSaveSeen = true
+  okLog "settings bind: SAVE #" & $gSbdSaveCount & " seen on the " &
+        "SettingsScreenController::SaveSettings prefix -- " & sbdCensus() &
+        ". The writes and the verdicts run on the next tick; if no further " &
+        "'settings bind' line follows this one, the PREFIX fired and the TICK " &
+        "did not drain it (sbdTick rides pfxOnPanelUp), which is a different " &
+        "fault from the prefix not firing."
 
 # ---------------------------------------------------------------------------
 # THE FLUSH AND THE TWO VERDICTS
@@ -795,17 +880,29 @@ proc sbdFlush() =
                           ", wrote " & sbdF(gSbdRows[i].flushedF) & ")"
     i = i + 1
   if wrote == 0:
-    okLog "settings bind: SAVE pressed with nothing staged -- no row changed, " &
-          "so nothing was written. This is not a failure; it is the empty case."
+    # NOT a pass and not silence. With nothing staged there is nothing for V1
+    # or V2 to judge, so the honest verdict is INCONCLUSIVE plus the census
+    # that says WHY it was empty -- a registry of 0 and a registry of 27 that
+    # saw no matching event are different bugs and used to print the same line.
+    warn "settings bind: SAVE #" & $gSbdSaveCount & " flushed NOTHING -- " &
+         sbdCensus() & ". V1/V2 are INCONCLUSIVE, not PASS. Read it as: " &
+         "registry=0 means no row ever registered (the rows are on screen and " &
+         "bound to nothing); toggleEvents=0 means the Toggle::Set drain is " &
+         "not reaching this feature at all (that detour belongs to nativeTabs " &
+         "-- if that feature is off, nothing is bound); toggleEvents>0 with " &
+         "matched=0 means the event arrives and the pointer does not match, " &
+         "and a BIND MISS line names the row."
     return
   if fail > 0:
-    warn "settings bind: V1 LIVE FAIL -- " & $fail & " of " & $wrote &
+    warn "settings bind: SAVE #" & $gSbdSaveCount &
+         " V1 LIVE FAIL -- " & $fail & " of " & $wrote &
          " flushed row(s) do NOT read back as the value that was written. " &
          "First: " & firstFail & ". The write went out anyway, which means " &
          "the config and the screen now disagree; treat the SCREEN as wrong " &
          "and the config as what the mod received."
   else:
-    okLog "settings bind: V1 LIVE PASS -- " & $pass & "/" & $wrote &
+    okLog "settings bind: SAVE #" & $gSbdSaveCount &
+          " V1 LIVE PASS -- " & $pass & "/" & $wrote &
           " flushed row(s) read back through the game's own getter as the " &
           "value written" &
           (if incon > 0: ", " & $incon & " INCONCLUSIVE (the control could " &
@@ -933,7 +1030,7 @@ proc sbdTick*() =
 # THE BINDS. Two detours on two DIFFERENT functions, never two on one.
 # ---------------------------------------------------------------------------
 
-proc sbdBind*(verbose: bool) =
+proc sbdBind*(verbose: bool; toggleDrainLive: bool) =
   ## Called once, from the same place `nativetabs.nim` binds its own drain --
   ## i.e. after `cProPrimeAll()` and after GameAssembly.dll is loaded. Binding
   ## earlier makes the prologue snapshot capture fail and every verify then
@@ -941,6 +1038,24 @@ proc sbdBind*(verbose: bool) =
   sbdInitFlags()
   if gSbdBound or not sbdReady(): return
   gSbdBound = true
+  # THE DEPENDENCY, stated before anything is bound. The toggle half of this
+  # feature has no detour of its own by design; it drains the one `nativetabs`
+  # installs on `UnityEngine.UI.Toggle::Set`. If that did not bind -- because
+  # `nativeTabs` is off, or because its own bind refused -- then every toggle
+  # row registered below is inert, and NOTHING in the log would have said so.
+  # MEASURED consequence, live 18:36: a row whose `m_IsOn` provably went 1 -> 0
+  # produced no line of any kind.
+  if not toggleDrainLive:
+    warn "settings bind: the UnityEngine.UI.Toggle::Set drain is NOT LIVE -- " &
+         "nativeTabs did not bind it (that feature owns the only detour on " &
+         "that function; a second one would overwrite its trampoline). Every " &
+         "TOGGLE row registered by this feature is therefore inert: it will " &
+         "move on screen and stage nothing. Slider rows are unaffected -- " &
+         "they use this feature's own prefix on Slider::Set. Turn on " &
+         "`nativeTabs` to make toggle rows bind."
+  else:
+    okLog "settings bind: the UnityEngine.UI.Toggle::Set drain is LIVE " &
+          "(nativeTabs slot " & $gNtToggleSlot & "); toggle rows will stage."
   let fs = nuFn(NuTSliderSet)
   if fs == nil:
     warn "settings bind: UnityEngine.UI.Slider::Set could not be bound -- " &
@@ -991,6 +1106,7 @@ proc sbdSummary*(): string =
     if gSbdRows[i].flushed: flushed = flushed + 1
     if gSbdRows[i].fromConfig: seeded = seeded + 1
     i = i + 1
-  "settings bind: " & $gSbdRows.len & " row(s) bound, " & $seeded &
+  sbdCensus() & " | settings bind: " & $gSbdRows.len &
+    " row(s) bound, " & $seeded &
     " seeded FROM CONFIG (the rest show the schema's DECLARED DEFAULT), " &
     $staged & " staged, " & $flushed & " written"

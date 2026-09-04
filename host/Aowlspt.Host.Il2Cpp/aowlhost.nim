@@ -10145,13 +10145,6 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
       # the prologue snapshot is primed and GameAssembly.dll is loaded, so a
       # verify means something. Bound after `bindNativeUi` so the target table
       # has already been censused and any refusal is attributable.
-      # THE VALUE BINDING's two detours, in the same region and for the same
-      # reason: the prologue snapshot is primed and GameAssembly.dll is loaded,
-      # so a verify means something. Two detours on two DIFFERENT functions
-      # (Slider::Set and SaveSettings); neither is patched by anything else in
-      # this host, and the toggle half rides nativetabs' existing Toggle::Set
-      # prefix rather than adding a second one to it.
-      sbdBind(false)
       if gNtOn:
         if not ntBindToggleEvent(false):
           gNtOn = false
@@ -10165,6 +10158,14 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
           # fatal: without it the close is merely as invisible as it has
           # always been, which is a lost instrument, not a broken feature.
           discard ntBindCloseProbe(false)
+      # THE VALUE BINDING's two detours, AFTER the nativetabs block and not
+      # before it. Its toggle half owns no detour at all: it rides the
+      # `Toggle::Set` prefix nativeTabs binds just above, because two detours
+      # on one function have the second overwrite the first's trampoline.
+      # Binding first meant it could not SEE whether that prefix exists, and a
+      # feature whose event source is another feature's flag must say so out
+      # loud rather than register rows that nothing will ever fire.
+      sbdBind(false, gNtToggleSlot >= 0)
       if gAuOn:
         bindAowlUi(true)
       # The native-UI toolkit's readiness report, in the same region and for the
