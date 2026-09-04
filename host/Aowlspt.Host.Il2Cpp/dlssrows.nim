@@ -112,6 +112,10 @@ var gDlrRowKey: seq[string] = @[]
 var gDlrBuiltN = 0
 var gDlrSeeded = 0
 var gDlrRefused = 0
+var gDlrRowT: seq[Il2CppPtr] = @[]   ## each row's TRANSFORM, for placement
+var gDlrPlaced = -1       ## rows whose sibling index READ BACK as asked
+var gDlrPlaceWhy = ""     ## why placement did not happen, when it did not
+var gDlrRestartShown = 0
 
 type
   DlrKind = enum dlrToggle, dlrSlider
@@ -137,16 +141,24 @@ proc dlrCatalogue(): seq[DlrRow] =
   ## and ITS defaults. A STATIC MIRROR of that schema (the live values come
   ## from the fetch, the RANGES do not), so it drifts if the mod's schema
   ## changes -- `tools/dlssapply.py selftest` cross-checks the naming.
+  ##
+  ## THE " - applies on restart" SUFFIX IS CONDITIONAL, and the condition is
+  ## the honest one. It is dropped only when `settingsRowsBind` is live, i.e.
+  ## when a SAVE can actually reach `dlrOnSaved` and raise the game's own
+  ## restart confirmation. With the bind OFF nothing observes the SAVE, no
+  ## dialog can appear, and a caption that had quietly stopped saying so would
+  ## leave the player with no statement anywhere that these need a restart.
+  let sfx = (if sbdReady(): "" else: " - applies on restart")
   @[dlrS("version",
-         "DLSS version  (1 = 310.5.3 shipped / 2 = 310.7.0 / 3 = 310.7.129) - applies on restart",
+         "DLSS version  (1 = 310.5.3 shipped / 2 = 310.7.0 / 3 = 310.7.129)" & sfx,
          "F0", 1.0'f32, 3.0'f32, 2.0'f32),
     dlrS("upscaler",
-         "Upscaler  (1 = DLSS / 2 = FSR 3.1 / 3 = XeSS) - applies on restart",
+         "Upscaler  (1 = DLSS / 2 = FSR 3.1 / 3 = XeSS)" & sfx,
          "F0", 1.0'f32, 3.0'f32, 1.0'f32),
-    dlrB("nrEnabled", "DLSS 5 re-lighting - applies on restart", false),
-    dlrS("nrWorkingScale", "DLSS 5 working scale - applies on restart",
+    dlrB("nrEnabled", "DLSS 5 re-lighting" & sfx, false),
+    dlrS("nrWorkingScale", "DLSS 5 working scale" & sfx,
          "F2", 0.25'f32, 1.0'f32, 0.25'f32),
-    dlrS("nrIntensity", "DLSS 5 intensity - applies on restart",
+    dlrS("nrIntensity", "DLSS 5 intensity" & sfx,
          "F2", 0.0'f32, 2.0'f32, 1.0'f32)]
 
 proc dlrNoteFault(what: string) =
@@ -172,6 +184,9 @@ proc dlrDestroyAll(): int =
     i = i + 1
   gDlrRowGo = @[]
   gDlrRowKey = @[]
+  gDlrRowT = @[]
+  gDlrPlaced = -1
+  gDlrPlaceWhy = ""
   gDlrBuilt = false
   gDlrBuiltN = 0
   gDlrSeeded = 0
@@ -234,6 +249,95 @@ proc dlrMakeRow(prefab, parent: Il2CppPtr; r: DlrRow;
   ctrlOut = row
   result = go
 
+## ---------------------------------------------------------------------------
+## PLACEMENT -- our section sits DIRECTLY AFTER the stock DLSS pair
+##
+## `Instantiate` appends, so without this the five rows land at the BOTTOM of
+## the Graphics page, far from the two stock rows they belong with
+## ("Setting14: NvidiaDlss" and "Setting15: DlssPreset"). Order inside the row
+## container is the container's LayoutGroup's business and sibling index is how
+## the game itself orders its own rows, so it is the only ordering that
+## survives a relayout.
+##
+## THE ANCHOR IS FOUND BY NAME, ON THE LIVE CONTAINER, EVERY BUILD -- never by
+## a remembered index. "Setting15" is a POSITION in BSG's own list: a patch
+## that adds one graphics setting renumbers it, and an index we cached would
+## then insert our block in the middle of an unrelated stock section while
+## every call still succeeded. The name that carries meaning is `DlssPreset`,
+## so that is the substring matched, and the numeric prefix is not required.
+##
+## THE VERDICT IS A READBACK THROUGH `Transform::GetSiblingIndex`, which is a
+## different function from the one that wrote it (both named in the nativeui
+## positional self-check for exactly that reason). It can FAIL: if the write
+## did not take, or Unity clamped it, the index read back differs from the one
+## asked for and the count says so.
+const DlrMaxScanChildren = 128
+const DlrAnchorName = "DlssPreset"
+
+proc dlrFindAnchor(parent: Il2CppPtr; outIdx: var int32; why: var string): bool =
+  ## The sibling index of the stock `Setting15: DlssPreset` row under
+  ## `parent`, by walking the container's children and reading each
+  ## GameObject's own name. Bounded by `DlrMaxScanChildren` and every hop
+  ## validated: a corrupt `childCount` inside a frame is an infinite loop on
+  ## the Unity main thread.
+  result = false
+  outIdx = -1'i32
+  why = ""
+  var n = 0
+  if not iChildCount(parent, n):
+    why = "the row container did not answer childCount"
+    return
+  if n <= 0 or n > DlrMaxScanChildren:
+    why = "the row container reported " & $n & " child(ren), which is outside " &
+          "the 1.." & $DlrMaxScanChildren & " range this walk accepts"
+    return
+  var i = 0
+  var seen = 0
+  while i < n and i < DlrMaxScanChildren:
+    let c = iChildAt(parent, i)
+    if c != nil and duOk(c, 0x20'i32) and iUnityAlive(c):
+      seen = seen + 1
+      let nm = iObjName(c)
+      if nm.len > 0 and modsNameHas(nm, DlrAnchorName):
+        outIdx = int32(i)
+        return true
+    i = i + 1
+  why = "no child of the row container has a name containing '" &
+        DlrAnchorName & "' (" & $seen & " of " & $n & " children were live " &
+        "and named). The stock DLSS pair is not on this page on this build"
+  false
+
+proc dlrPlaceRows(parent: Il2CppPtr) =
+  ## Move every row of ours to sit immediately after the anchor, in catalogue
+  ## order, and READ BACK where each one landed.
+  ##
+  ## The moves go in ascending order for a reason: our rows start at the END of
+  ## the container, so moving the first to `anchor+1` shifts everything between
+  ## `anchor+1` and its old slot up by one -- the anchor itself does not move,
+  ## because it sits BELOW the insertion point. Re-reading the anchor between
+  ## moves would therefore be wrong as often as it was right.
+  gDlrPlaced = -1
+  gDlrPlaceWhy = ""
+  if gDlrRowT.len == 0:
+    gDlrPlaceWhy = "no row transform was captured, so nothing could be moved"
+    return
+  var anchorIdx = -1'i32
+  var why = ""
+  if not dlrFindAnchor(parent, anchorIdx, why):
+    gDlrPlaceWhy = why
+    return
+  var ok = 0
+  var k = 0
+  while k < gDlrRowT.len and k < DlrMaxRows:
+    let t = gDlrRowT[k]
+    let want = anchorIdx + 1'i32 + int32(k)
+    if t != nil and duOk(t, 0x20'i32) and iUnityAlive(t) and
+       nuSetSiblingIndex(t, want):
+      let (readOk, got) = nuSiblingIndex(t)
+      if readOk and got == want: ok = ok + 1
+    k = k + 1
+  gDlrPlaced = ok
+
 proc dlrBuild(): bool =
   ## Build the five rows into the live Graphics panel. Called ONCE, from the
   ## tick, only after that panel has actually been observed up.
@@ -274,6 +378,7 @@ proc dlrBuild(): bool =
   let rows = dlrCatalogue()
   gDlrRowGo = @[]
   gDlrRowKey = @[]
+  gDlrRowT = @[]
   var built = 0
   var refused = 0
   var seeded = 0
@@ -291,6 +396,10 @@ proc dlrBuild(): bool =
     if go != nil:
       gDlrRowGo.add go
       gDlrRowKey.add r.key
+      # The row's TRANSFORM, captured HERE rather than re-found by name later:
+      # a second lookup could bind a different object and the placement
+      # readback would then be true of something that is not our row.
+      gDlrRowT.add nuTransformOf(go)
       built = built + 1
       # THE VALUE BINDING (settingsbind.nim, flag `settingsRowsBind`, default
       # OFF -- with it off both calls do nothing and the row is a real control
@@ -314,6 +423,7 @@ proc dlrBuild(): bool =
   gDlrBuiltN = built
   gDlrSeeded = seeded
   gDlrRefused = refused
+  dlrPlaceRows(parent)
   result = true
 
 proc dlrVerdict() =
@@ -329,6 +439,71 @@ proc dlrVerdict() =
         "built (modSettingsRender). Nothing here applies anything: the " &
         "launcher's dlssapply.py step applies these before the next start " &
         "and prints the PASS/FAIL verdict in the boot log."
+  if gDlrPlaced >= 0:
+    okLog "dlss rows: PLACEMENT -- " & $gDlrPlaced & " of " & $gDlrBuiltN &
+          " row(s) READ BACK through Transform::GetSiblingIndex at the index " &
+          "they were asked to take, directly after the stock '" &
+          DlrAnchorName & "' row. Any shortfall is a row that is still " &
+          "wherever Instantiate appended it -- at the bottom of the page -- " &
+          "not a row that is missing."
+  else:
+    warn "dlss rows: PLACEMENT DECLINED -- " &
+         (if gDlrPlaceWhy.len > 0: gDlrPlaceWhy
+          else: "no reason was recorded, which is itself a defect") &
+         ". The rows are BUILT and usable; they sit at the BOTTOM of the " &
+         "Graphics page instead of beside the stock DLSS pair. Nothing stock " &
+         "was reordered."
+
+## ---------------------------------------------------------------------------
+## THE RESTART CONFIRMATION -- the GAME'S OWN modal, not a panel of ours
+##
+## Every one of these five settings takes effect on the next launch, and the
+## game already has exactly the right dialog for that: changing texture quality
+## and saving raises "... will be applied after game restart" with an OK
+## button. MEASURED `il2cpp_resolve.py disasm 0x1714ea0 --len 520` --
+## `GraphicsSettingsTab::ShowTextureQualityChangedMessage()` is
+## `LocalizationManager::LocalizedValue(id)` ->
+## `ItemUiContext::ShowMessageWindow(...)` @0x1517C00, guarded by
+## `_textureMessageShown@0x141`. So the player gets BSG's window, BSG's
+## localized text and BSG's OK button, on BSG's own ItemUiContext.
+##
+## IT FIRES ONLY ON A REAL EDIT. `sbdTakeSaved` is set in `sbdFlush`, which is
+## the one place that knows a row was STAGED by the game's own
+## `Slider::Set` / `Toggle::Set` event and has now been persisted -- the SAVE
+## prefix itself fires on presses that changed nothing, and asking it would
+## pop a restart dialog at every SAVE.
+##
+## WHAT THIS CANNOT ASSERT, and says so: `nuGfxShowRestartMessage` returning
+## true means THE CALL WAS MADE. Whether a window appeared depends on
+## `_textureMessageShown` (the game latches it once per screen visit) and on
+## ItemUiContext being up. Neither is read back here, so the log line claims
+## the call and never the window.
+proc dlrOnSaved() =
+  if not gDlrOn or gDlrOff or not gDlrBuilt: return
+  if not sbdTakeSaved(DlrGuid): return
+  let tab = dlrTab()
+  if tab == nil:
+    warn "dlss rows: a DLSS row was changed and SAVED, and the restart " &
+         "confirmation was NOT raised -- the GraphicsSettingsTab component " &
+         "could not be reached by walking from the live Graphics panel. The " &
+         "setting IS written; the player was simply not told it needs a " &
+         "restart."
+    return
+  if nuGfxShowRestartMessage(tab):
+    gDlrRestartShown = gDlrRestartShown + 1
+    okLog "dlss rows: a DLSS row was changed and SAVED, so the game's own " &
+          "restart confirmation was requested (GraphicsSettingsTab::" &
+          "ShowTextureQualityChangedMessage @0x1714EA0, call #" &
+          $gDlrRestartShown & "). That is the SAME dialog, text and OK " &
+          "button the game shows for texture quality. This line means the " &
+          "CALL was made; the game suppresses the window if it has already " &
+          "shown one this screen visit (_textureMessageShown@0x141), so it " &
+          "is not proof a window appeared."
+  else:
+    warn "dlss rows: a DLSS row was changed and SAVED and the restart " &
+         "confirmation call was REFUSED before it was made (the tab pointer " &
+         "did not validate, or the ShowTextureQualityChangedMessage prologue " &
+         "did not verify). Nothing was called."
 
 proc dlrOnPanelUp(gfxUp: bool) =
   ## Called every tick from `gfxTickBody`, inside its existing guard. The
@@ -340,6 +515,7 @@ proc dlrOnPanelUp(gfxUp: bool) =
       discard dlrBuild()
     return
   dlrVerdict()
+  dlrOnSaved()
 
 proc dlrOnScreenClosed() =
   ## The settings screen went away. Our rows are OURS -- the game's

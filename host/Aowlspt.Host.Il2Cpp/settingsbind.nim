@@ -216,6 +216,40 @@ var gSbdTogMatched = 0     ## ...of those, how many matched a registered row
 var gSbdSlidSeen = 0
 var gSbdSlidMatched = 0
 var gSbdSaveCount = 0
+
+## WHICH MODS ACTUALLY HAD A VALUE CHANGE AT THE LAST SAVE.
+##
+## A feature that must react to "the player changed one of MY rows and pressed
+## SAVE" cannot ask the SAVE prefix, which fires on every press including the
+## ones that changed nothing, and it must not ask its own record of what it
+## wrote. `sbdFlush` is the only place that knows a row was STAGED (an edit
+## the game's own Slider::Set / Toggle::Set event delivered) and is now
+## written, so the guid is recorded there and nowhere else.
+##
+## Capped, and CONSUMED by the reader: a guid left in this list would make the
+## next screen visit look like a fresh change.
+const SbdMaxSavedGuids = 8
+var gSbdSavedGuids: seq[string] = @[]
+
+proc sbdNoteSaved(guid: string) =
+  if guid.len == 0 or gSbdSavedGuids.len >= SbdMaxSavedGuids: return
+  var i = 0
+  while i < gSbdSavedGuids.len and i < SbdMaxSavedGuids:
+    if gSbdSavedGuids[i] == guid: return
+    i = i + 1
+  gSbdSavedGuids.add guid
+
+proc sbdTakeSaved*(guid: string): bool =
+  ## True EXACTLY ONCE per SAVE that carried a changed row of `guid`, and it
+  ## removes the entry, so a second caller in the same frame gets false. The
+  ## caller owns the consequence of consuming it.
+  result = false
+  var i = 0
+  while i < gSbdSavedGuids.len and i < SbdMaxSavedGuids:
+    if gSbdSavedGuids[i] == guid:
+      gSbdSavedGuids.delete(i)
+      return true
+    i = i + 1
 ## Pointers already probed for a BIND MISS report, so the name lookup is done
 ## at most once per distinct toggle and the work on the game's click path stays
 ## bounded. Capped hard: this is on the path of EVERY toggle in the game.
@@ -852,6 +886,9 @@ proc sbdFlush() =
       gSbdRows[i].flushed = true
       gSbdRows[i].staged = false
       wrote = wrote + 1
+      # The mod owning this row had a REAL edit persisted. Recorded here and
+      # only here -- the SAVE prefix fires on presses that changed nothing.
+      sbdNoteSaved(gSbdRows[i].guid)
       # V1, immediately: does the LIVE control agree with what was just sent?
       # An `sbdEnable` row is a toggle on screen, so it reads back like one --
       # what differs is only where its value would be WRITTEN.

@@ -274,6 +274,13 @@ const
   ## `abi/aowlspt_nativeui.h`.
   NuTSliderSet       = 73'i32  ## UnityEngine.UI.Slider::Set
   NuTSaveSettings    = 74'i32  ## EFT.UI.Settings.SettingsScreenController::SaveSettings
+  ## DLSS ROW PLACEMENT AND THE GAME'S OWN RESTART MODAL (dlssrows.nim).
+  ## APPENDED at the END of `aowl_nu_targets`; both MEASURED 2026-09-04
+  ## sharedness=UNIQUE, both in the `il2cpp` section, neither the 0x628110
+  ## universal stub. Provenance and prologue bytes are on the rows in
+  ## `abi/aowlspt_nativeui.h`.
+  NuTTrSetSiblingIdx = 75'i32  ## UnityEngine.Transform::SetSiblingIndex
+  NuTGfxRestartMsg   = 76'i32  ## EFT.UI.Settings.GraphicsSettingsTab::ShowTextureQualityChangedMessage
 
 ## Field offsets for the tab machinery. MEASURED (tools/fldoff.py, String
 ## self-check passing) and written up in docs/NATIVETABS.md. All NULL-CAPABLE.
@@ -1362,6 +1369,48 @@ proc nuSiblingIndex*(rt: Il2CppPtr): (bool, int32) =
   if v < 0'i32 or v > 4096'i32: return
   result = (true, v)
 
+proc nuSetSiblingIndex*(rt: Il2CppPtr; idx: int32): bool =
+  ## `Transform::SetSiblingIndex(index)` -- WHERE a row sits among its
+  ## siblings, which is what a LayoutGroup lays out in order. Distinct from
+  ## `nuRowSetSiblingIndex`, which is `SettingControl::SetSiblingIndex` and
+  ## takes a SettingControl receiver; this one takes the TRANSFORM, so it works
+  ## for a cloned row reached as a transform as well as for a prefab row.
+  ##
+  ## A NEGATIVE index is REFUSED here rather than passed on: Unity clamps it
+  ## silently, so the call would "succeed" and put the row somewhere nobody
+  ## asked for -- and the readback would then agree with the clamped value, not
+  ## with what was requested. Refusing is the only way that stays falsifiable.
+  result = false
+  if not gNuOn or not nuOk(rt, 0x10'i32): return
+  if idx < 0'i32 or idx > 4096'i32: return
+  let fn = nuFn(NuTTrSetSiblingIdx)
+  if fn == nil: return
+  cNuCallVPI(fn, rt, idx)
+  true
+
+proc nuGfxShowRestartMessage*(gfxTab: Il2CppPtr): bool =
+  ## `GraphicsSettingsTab::ShowTextureQualityChangedMessage()` -- THE GAME'S
+  ## OWN "will be applied after game restart" modal, raised on the game's own
+  ## `ItemUiContext` with the game's own localized header, body and OK button.
+  ##
+  ## This is deliberately NOT a dialog of ours. MEASURED `disasm 0x1714ea0`:
+  ## it reads `_textureMessageShown@0x141`, returns at once when that is
+  ## already set, and otherwise goes
+  ## `LocalizationManager::LocalizedValue(id)` ->
+  ## `ItemUiContext::ShowMessageWindow(...)` @0x1517C00, then latches the flag.
+  ## So calling it twice in one screen visit shows one dialog, which is the
+  ## game's behaviour and not a bug of ours -- and `true` here means "the call
+  ## was made", never "a window appeared". The caller must say so.
+  ##
+  ## arity 0 instance: the frame is (this, MethodInfo*), so `cNuCallPP`, whose
+  ## return is discarded because the method returns void.
+  result = false
+  if not gNuOn or not nuOk(gfxTab, 0x150'i32) or not nuAlive(gfxTab): return
+  let fn = nuFn(NuTGfxRestartMsg)
+  if fn == nil: return
+  discard cNuCallPP(fn, gfxTab)
+  true
+
 proc nuGroupPadding*(layoutGroup: Il2CppPtr): Il2CppPtr =
   ## `LayoutGroup.m_Padding` @0x20 -> RectOffset. Read raw on purpose: the
   ## property getter is SHARED x479 and this is an ordinary reference field.
@@ -1821,6 +1870,18 @@ proc nuTargetsBindOk(): bool =
   want.add "EFT.UI.Settings.SettingsScreen::Close"
   idx.add NuTScreenCloseAll
   want.add "EFT.UI.Settings.SettingsScreen::CloseAll"
+  # THE APPENDED PAIR, and both are the silent kind. `SetSiblingIndex` and
+  # `GetSiblingIndex` are ADJACENT in Transform and differ only in direction --
+  # a mis-index would WRITE the sibling index while the verdict believes it
+  # READ it, which is a readback that cannot fail. `ShowTextureQualityChanged-
+  # Message` is arity 0 on a GraphicsSettingsTab receiver; a mis-index there
+  # calls something else with a live tab pointer in RCX.
+  idx.add NuTTrSetSiblingIdx
+  want.add "UnityEngine.Transform::SetSiblingIndex"
+  idx.add NuTTrGetSiblingIdx
+  want.add "UnityEngine.Transform::GetSiblingIndex"
+  idx.add NuTGfxRestartMsg
+  want.add "EFT.UI.Settings.GraphicsSettingsTab::ShowTextureQualityChangedMessage"
   var i = 0
   while i < idx.len:                      # capped: idx is built right here
     let ix = idx[i]

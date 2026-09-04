@@ -696,6 +696,12 @@ typedef struct AowlNuTarget {
 #define AOWL_NU_SCREEN_CLOSE          71
 #define AOWL_NU_SCREEN_CLOSEALL       72
 
+/* --- APPENDED (dlssrows.nim). Provenance is on the table rows themselves. */
+#define AOWL_NU_SLIDER_SET            73
+#define AOWL_NU_SAVESETTINGS          74
+#define AOWL_NU_TR_SETSIBLINGIDX      75
+#define AOWL_NU_GFXTAB_RESTARTMSG     76
+
 /* UnityEngine.RenderMode. Named, because `0` appearing bare in a refusal is
  * indistinguishable from "we did not read anything". */
 #define AOWL_NU_RENDERMODE_OVERLAY   0
@@ -1015,6 +1021,48 @@ static const AowlNuTarget aowl_nu_targets[] = {
     { "EFT.UI.Settings.SettingsScreenController::SaveSettings", 0x1721E20u,
       { 0x40,0x53,0x48,0x83,0xEC,0x70,0x80,0x3D,0xFE,0xC5,0x99,0x05,0x00,
         0x48,0x8B,0xD9 }, 16 },
+    /* --- DLSS ROW PLACEMENT AND THE GAME'S OWN RESTART MODAL (dlssrows.nim).
+     * APPENDED at the END, which is the only safe edit to a POSITIONALLY
+     * indexed table -- another agent may append after these; do not insert
+     * above them.
+     *
+     * `UnityEngine.Transform::SetSiblingIndex(int index)`. MEASURED 2026-09-04
+     * `il2cpp_resolve.py type UnityEngine.Transform` -> rid=3241 arity=1
+     * RVA=0x52b9d90; `shared 0x52b9d90` -> UNIQUE owners=1; `bytes 0x52b9d90
+     * 16` -> the prologue below. Section `il2cpp`, NOT the 0x628110 universal
+     * stub.
+     *
+     * WHY IT IS HERE WHEN `SettingControl::SetSiblingIndex` @0x16FA910 ALREADY
+     * IS: MEASURED `disasm 0x16fa910` -- that method is
+     * `get_transform(this)` then this very function, and it THROWS (call
+     * 0x5d2530, the null-ref helper) if the transform reads null. It is also
+     * only callable on a receiver that IS a SettingControl. A CLONED row is
+     * reached as a Transform, so the Transform-level call is the one that
+     * works for both shapes and takes no throw path we cannot pre-check.
+     *
+     * `EFT.UI.Settings.GraphicsSettingsTab::ShowTextureQualityChangedMessage()`
+     * -- THE GAME'S OWN "applied after game restart" modal, not a panel of
+     * ours. MEASURED `type EFT.UI.Settings.GraphicsSettingsTab` -> rid=94756
+     * arity=0 RVA=0x1714ea0; `shared` -> UNIQUE owners=1; `bytes` -> below.
+     * MEASURED `disasm 0x1714ea0 --len 520`: it tests
+     * `_textureMessageShown@0x141`, returns immediately when set, otherwise
+     * calls `LocalizationManager::get_Instance` -> `LocalizedValue(id)` ->
+     * `ItemUiContext::ShowMessageWindow(string description, Action accept,
+     * ...)` @0x1517C00 and then sets `_textureMessageShown = 1`.
+     *
+     * So calling it gives the player the identical dialog, with BSG's own
+     * localized header and body and BSG's own OK button, on BSG's own
+     * ItemUiContext -- there is no text of ours and no window of ours. The one
+     * stock side effect is that `_textureMessageShown` latches, exactly as it
+     * does when the player changes texture quality; the game clears it itself.
+     * arity 0 instance -> the frame is (this, MethodInfo*). */
+    { "UnityEngine.Transform::SetSiblingIndex", 0x52B9D90u,
+      { 0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,
+        0x27,0xAE,0xE1 }, 16 },
+    { "EFT.UI.Settings.GraphicsSettingsTab::ShowTextureQualityChangedMessage",
+      0x1714EA0u,
+      { 0x40,0x57,0x48,0x83,0xEC,0x60,0x80,0x3D,0x18,0x95,0x9A,0x05,0x00,
+        0x48,0x8B,0xF9 }, 16 },
 };
 
 #define AOWL_NU_TARGET_COUNT \
