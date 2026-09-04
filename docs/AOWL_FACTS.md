@@ -9704,3 +9704,136 @@ NOT verified: that a live client boots with the served 0 and logs the
 `Debug.LogError` branch instead of arming the monitor -- that needs a deploy and
 a run, which a subagent must not do. Falsified by: a future AFK dialog on a
 build serving 0.
+
+## 2026-09-04: facts relayed by subagents (drained from the factnote relay, tags as the authors set them)
+
+```text
+--- 1/20  (from ?)
+  subject    EFT.UI.Settings.GraphicsSettingsTab
+  predicate  field offsets (differ from PostFXSettingsTab)
+  object     _settingsContainer@0x98 (row parent), _dropDownTemplate@0xb0, _toggleTemplate@0xb8, _selectSliderTemplate@0xc0, _selectFloatSliderTemplate@0xc8
+  method     measured
+  evidence   python tools/fldoff.py fields EFT.UI.Settings.GraphicsSettingsTab (String self-check passing), 2026-09-03
+  note       Used by host/Aowlspt.Host.Il2Cpp/dlssrows.nim; PostFX's 0xa0/0xb0/0xc0 numbers do NOT apply to this tab.
+--- 2/20  (from ?)
+  subject    D:/Aowlspt/OptiScaler.ini
+  predicate  keys the DLSS section writes
+  object     [Upscalers] Dx11Upscaler (dlss / ffx_12 / xess_12); [DlssNr] Enabled, WorkingScale, Intensity
+  method     measured
+  evidence   grep of the live ini 2026-09-03; live Intensity=2.0 vs config 1.0 made dlssapply.py verify print FAIL
+  note       tools/dlssapply.py apply/verify
+--- 3/20  (from ?)
+  subject    Crash_2026-09-03_155245216 crash site
+  predicate  is really
+  object     _mi_page_free_collect+0x6D under mi_malloc (mimalloc), reached from substr_0 <- strip_0 <- pathGet_0 <- parseDesired_0 <- takeModSet_0 <- tickMods_0; Unity labelled all seven of those frames 'aowl_region_screen_known_x' and the four mimalloc ones '(function-name not available)'
+  method     measured
+  evidence   crashwatch.py symbolize-host on the folder; objdump -t of aowlspt-host-il2cpp.dll.bak-20260903-122227 matched by PE TimeDateStamp 0x6A9990B6
+--- 4/20  (from ?)
+  subject    aowlspt-host-il2cpp.dll build identity
+  predicate  is uniquely given by
+  object     the PE TimeDateStamp; SizeOfImage alone is NOT an identity
+  method     measured
+  evidence   TimeDateStamp 0x6A9990B6 matched exactly 1 of 275 candidate files under D:/Aowlspt/aowlspt; SizeOfImage 0x2A16000 matched 2. Across all candidates 22 of 231 distinct timestamps and 46 of 168 distinct sizes have duplicates
+--- 5/20  (from ?)
+  subject    cdb 'k' on our DLLs
+  predicate  collapses after one frame
+  object     the walk yields 1 usable frame then 0x84 / 0x1 garbage, because our mingw DLLs carry no unwind info cdb trusts; 'dps @rsp L400' recovers the chain and it matches the frames Unity's own walked block reported
+  method     measured
+  evidence   cdb -z Crash_2026-09-03_155245216/crash.dmp -c '.ecxr; k 40' vs '.ecxr; dps @rsp L200'
+--- 6/20  (from ?)
+  subject    objdump -t symbol addresses on a PE
+  predicate  are SECTION-relative, with (sec N) 1-based into the PE section table
+  object     symbol RVA = section.VirtualAddress + printed value; .text starts at RVA 0x1000 on this build, so reading the value as an RVA shifts every name by 0x1000 and yields plausible wrong function names
+  method     measured
+  evidence   tools/test_crashwatch.py objdump/section-rva-actually-matters; the mutation that drops section.rva turns 113/113 into 96/113
+--- 7/20  (from ?)
+  subject    a stack word pointing into a DATA section of our DLL
+  predicate  must not be symbolised
+  object     nearest-preceding-code-symbol over 0x39E040 (.data) returned '__add_nanbits_D2A+0xF8630' -- a real name and a plausible offset, entirely fictional; crashwatch now checks the containing section is executable first
+  method     measured
+  evidence   observed in the first run of symbolize-host on Crash_2026-09-03_155245216; guarded by test t_a_data_address_is_refused_not_named
+--- 8/20  (from ?)
+  subject    EscapeFromTarkov.exe.636.dmp
+  predicate  no longer exists
+  object     %LOCALAPPDATA%\CrashDumps holds only python.exe dumps as of 2026-09-04; the 636 WER fixture in tools/fixtures/crashwatch is RECONSTRUCTED from docs/AOWL_FACTS.md #71/#72 and says so in its first line
+  method     measured
+  evidence   ls of the CrashDumps directory
+--- 9/20  (from ?)
+  subject    Il2CppClass (this build)
+  predicate  vtable base offset is
+  object     klass+0x138, entries 16 bytes {methodPtr@0, const MethodInfo*@8}
+  method     measured
+  evidence   il2cpp_resolve.py disasm 0x52d0 --len 200 -- the build's own interface-dispatch stub: shl rax,4; add rax,0x138; add rax,r11; mov r8,[rax]; mov rdx,[rax+8]
+--- 10/20  (from ?)
+  subject    Il2CppClass (this build)
+  predicate  interfaceOffsets live at
+  object     ptr klass+0xB0, u16 count klass+0x12E, 16-byte stride, interface klass at +0
+  method     measured
+  evidence   same stub: cmp qword ptr [r10+rcx*8], rdx with rcx = 2*i
+--- 11/20  (from ?)
+  subject    Il2CppArray (this build)
+  predicate  max_length/data offsets are
+  object     +0x18 (u32) and +0x20
+  method     measured
+  evidence   il2cpp_resolve.py disasm 0x5360: cmp edx,[rcx+0x18] then mov [rdx+rcx+0x20], r8b
+--- 12/20  (from ?)
+  subject    EFT.UI.DropDownBox::Show
+  predicate  is VIRTUAL at vtable slot
+  object     24, the same slot as DropDownBoxNewStyle::Show and BaseDropDownBox::Show
+  method     measured
+  evidence   Il2CppMethodDefinition.slot@32 for all three; attrs 0x00C6 PUBLIC|VIRTUAL
+--- 13/20  (from ?)
+  subject    EFT.UI.DropDownBoxNewStyle
+  predicate  is a SIBLING of DropDownBox, not a subclass
+  object     both derive EFT.UI.BaseDropDownBox, so a direct call at DropDownBox::Show's RVA on a NewStyle receiver runs a body reading _button@0xF8 off a different layout
+  method     measured
+  evidence   Resolver.parent_chain on type indices 15436/15437/15421
+--- 14/20  (from ?)
+  subject    EFT.UI.BaseDropDownBox::Show @0x16ADC90
+  predicate  does NOT isinst its argument
+  object     it INTERFACE-DISPATCHES via 0x52D0 against the IEnumerable<string> klass in the .data metadata-usage slot at RVA 0x6DF5A38 (raw token 0x2000964F until the game first runs Show); a miss leaves a slow path whose throw is MANAGED and uncatchable by aowl_p_p_seh
+  method     measured
+  evidence   il2cpp_resolve.py disasm 0x16adc90 --len 480, sites +0x17F and +0x1B3
+--- 15/20  (from ?)
+  subject    String[] implements IEnumerable<string>
+  predicate  is NOT answerable offline on this build
+  object     IL2CPP builds array classes at runtime; their interfaceOffsets are not in global-metadata and every Il2CppGenericClass.cached_class on disk is null. nuDropDownShow therefore answers it AT RUNTIME, reading the same table with the same stride the dispatch stub reads, before the call
+  method     inferred
+  evidence   genericmethods/type walks found no offline evidence either way; the runtime probe is what settles it
+--- 16/20  (from ?)
+  subject    EFT.UI.Settings.SettingControl::SetTooltip @0x16FAC00
+  predicate  does not keep the SettingsTooltipData it is handed
+  object     it constructs its own via SettingsTooltipData::.ctor(ESettingsOption) @0x16FCD70 and copies the fields; three silent no-op paths (_blocker@0x88 null, TryGetTooltip false, null data) and NO throw path, so the only verdict is re-reading _tooltipSettingsHover@0x98 -> _tooltipData@0x20 -> Text@0x20
+  method     measured
+  evidence   il2cpp_resolve.py disasm 0x16fac00 --len 940
+--- 17/20  (from ?)
+  subject    il2cpp_array_new and il2cpp_object_new
+  predicate  are UNGATED on this build
+  object     present in aowl_il2cpp_exports, absent from aowl_gate_rows
+  method     measured
+  evidence   abi/aowlspt_il2cpp_gates_data.h
+--- 18/20  (from ?)
+  subject    EFT.UI.BaseDropDownBox set_/get_CurrentIndex
+  predicate  are folded trivial accessors at 0x698560 / 0x698550
+  object     89 91 E8 00 00 00 C3 = mov [rcx+0xE8],edx; ret and 8B 81 E8 00 00 00 C3 = mov eax,[rcx+0xE8]; ret. SHARED x2 -- fine to CALL, never to detour
+  method     measured
+  evidence   il2cpp_resolve.py bytes + fldoff.py fields EFT.UI.BaseDropDownBox
+--- 19/20  (from ?)
+  subject    maps region FAIL verdict
+  predicate  is caused by
+  object     config.json enabled=false, not by a refused registration -- onLoad returns at the enabled gate before armFeed(), so no participant is ever registered; the old verdict asserted 'radar, map and indicators are all off in config.json', false in every clause for the 2026-09-04 run whose config held spatialMode=radar
+  method     measured
+  evidence   grep region/Maps in D:/Aowlspt/aowlspt/aowlspt-host.log build 6bd304e3: line 530 'Maps: master OFF (enabled=false)', line 533 'config spatialMode=radar', line 547 region FAIL
+  note       Fixed in mods/maps/maps.nim: gHudTried/gHudRefusal record measured state; verdict splits never-attempted / declined-no-surface (both INCONCLUSIVE) from region-refused (FAIL, quotes the refusal). PASS now requires hudDrawn()>0 when hostPhase()==RpDeployed, not dispatch count alone.
+--- 20/20  (from ?)
+  subject    LoadMagazineProcess (0x768F50/0x768D40)
+  predicate  is NOT on the in-raid weapon-reload path
+  object     it is EFT.Player/PlayerInventoryController/LoadMagazineProcess, the INVENTORY round-by-round magazine-fill process, constructed only from <LoadMagazine>d__51::MoveNext @0x76f070
+  method     measured
+  evidence   il2cpp_resolve.py callers 0x768d40 returns exactly 1 caller site; Il2CppTypeDefinition.declaringTypeIndex@12 walk gives the nesting. The real reload path is FirearmController::ReloadMag 0x7843E0 / QuickReloadMag 0x784570 -> ReloadExternalMagOperation::Start 0x7B08F0 or ReloadInternalMagBase::Start 0x7B3580 -> FirearmsAnimator::Reload(bool) 0x1C82E80 (13 call sites, 7 of them NextObservedPlayer); ammo change at 0x7B1C70 / 0x7B45C0 / 0x7B40F0 / 0x7AF550. All UNIQUE, all il2cpp section.
+  note       Full map: docs/AMMO-LOADING-MAP.md. 19 read-only PREFIX drains now bound in mods/ammoloading/ammoloading.nim; staged mod-ammoloading sha 0e8b97422b4a.
+
+20 relayed measurement(s) (20 well-formed, 0 malformed).
+Do NOT file one you cannot stand behind -- check it first; the agent may have inferred what it labelled measured.
+Nothing was cleared. File each with fact_record, then re-run with --drain --clear (or empty C:/Users/savant/.aowl/relay.jsonl).
+```
