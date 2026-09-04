@@ -271,9 +271,32 @@ finds. So:
   the child's code -- and runs nimlint, saying plainly when nimlint is CLEAN,
   because a clean lint after that signature means the shape is a NEW one.
 
+## A build whose SOURCES moved under it -- measured 2026-09-03 19:24
+
+`buildlock.py build host` reported success (exit 0, sidecar written) for a
+build whose sources were edited AFTER the lock was acquired: source mtimes
+19:24, lock acquired 19:22:39. The DLL was a PRE-EDIT snapshot and `grep -a`
+found ZERO of the seven literals the edit had added -- so the marker check that
+followed measured the wrong file, confidently.
+
+The lock cannot serialise EDITS and should not try. It can refuse to call that
+a success. The newest source mtime under the artifact's declared source roots
+(the SAME roots and the SAME generated-file exclusions the UP-TO-DATE/STALE
+logic uses -- one walker, so they cannot drift) is recorded at acquire and
+again at build exit. Anything newer than the acquire instant prints
+`SOURCES CHANGED DURING THE BUILD` with the files and their mtimes, marks the
+sidecar `stale_sources: true`, and exits **15**. `deploy.py` refuses a sidecar
+carrying that flag, so the bytes cannot reach the live install by another
+route. `--no-source-check` turns it off.
+
+Three states, never two: a scan that was truncated, errored, or whose roots
+could not be derived prints `SOURCE-CHANGE CHECK NOT PERFORMED`, records
+`source_check: "not-performed"` in the sidecar and does NOT refuse -- it must
+not block a build that is fine, and it must not read as a clean bill either.
+
 Exit codes now: 0 ok, 2 usage, 4 lock not acquired, 5 artifact absent, 6
-artifact stale, 7 lint refusal, 8 compiler-internal crash, otherwise the
-child's own code.
+artifact stale, 7 lint refusal, 8 compiler-internal crash, 15 sources changed
+during the build, otherwise the child's own code.
 """
 
 from __future__ import annotations
@@ -463,6 +486,62 @@ def read_lock(path):
 STATUS_EXIT = {"free": 0, "held": 1, "stale": 2}
 
 
+def you_state(held, q, pids):
+    """Where the CALLER stands: holding, queued at position K, or neither.
+
+    Two agents asked for this on 2026-09-03 for the same reason: `--status`
+    described the world without saying where the reader is in it, so "pid 12345
+    is building" had to be compared by hand against a pid the reader often did
+    not have. Three outcomes, and `not-in-queue` is said in as many words --
+    silence there reads as "queued", which is the answer that makes somebody
+    wait for nothing.
+
+    `pids` is the caller's own pid plus, when set, `AOWL_BUILDLOCK` -- which
+    every process spawned under a locked build inherits, so a script running
+    INSIDE a build resolves to that build rather than to nothing.
+    """
+    for pid in pids:
+        if held and int(held.get("pid", -1)) == int(pid):
+            return {"pid": int(pid), "state": "holding", "position": None,
+                    "of": len(q),
+                    "via": "the lock file" if pid == pids[0]
+                           else "AOWL_BUILDLOCK"}
+    for pid in pids:
+        for i, t in enumerate(q):
+            if int(t.get("pid", -1)) == int(pid):
+                return {"pid": int(pid), "state": "queued", "position": i + 1,
+                        "of": len(q),
+                        "via": "a queue ticket" if pid == pids[0]
+                               else "AOWL_BUILDLOCK"}
+    return {"pid": int(pids[0]), "state": "not-in-queue", "position": None,
+            "of": len(q), "via": None}
+
+
+def caller_pids():
+    pids = [os.getpid()]
+    env = os.environ.get("AOWL_BUILDLOCK")
+    if env and env.strip().isdigit() and int(env) not in pids:
+        pids.append(int(env))
+    return pids
+
+
+def holder_artifacts(repo, target):
+    """The path(s) the holder's build will WRITE. `(paths, why_none)`.
+
+    A waiter's next question after "who is building" is always "what will land
+    on disk when it finishes", and answering it from `--status` is the
+    difference between waiting and re-deriving the deploy.json mapping by hand.
+    `why_none` is printed rather than swallowed: a target that declares no
+    artifact must not look like a target that writes nothing.
+    """
+    if not target:
+        return [], "the lock records no target"
+    arts, why = target_artifacts(repo, target.split())
+    if arts is None:
+        return [], why
+    return [_norm(a["src"]) for a in arts], ""
+
+
 def status(path, max_age):
     """One dict describing the lock. The single source for text AND --json.
 
@@ -477,11 +556,16 @@ def status(path, max_age):
              "since": t.get("arrival_h"), "arrival": t.get("arrival")}
             for t in q]
     held = read_lock(path)
+    repo = os.path.dirname(path) or "."
+    you = you_state(held, q, caller_pids())
     if not held:
         return {"state": "free", "pid": None, "running": None, "target": None,
                 "since": None, "since_epoch": None, "age_s": None,
                 "queued_since": None, "queued_arrival": None, "fifo": "n/a",
-                "hung": None, "queue": qout, "lock": path}
+                "hung": None, "you": you, "artifacts": [],
+                "artifacts_why": "nobody is building", "queue": qout,
+                "lock": path}
+    arts, arts_why = holder_artifacts(repo, held.get("cmd"))
     pid = int(held.get("pid", -1))
     running = pid_alive(pid)
     started = float(held.get("started", 0))
@@ -497,6 +581,7 @@ def status(path, max_age):
             # process-table query per poll would make the cheap question
             # expensive. `null` means NOT CHECKED, never "not hung".
             "hung": None,
+            "you": you, "artifacts": arts, "artifacts_why": arts_why,
             "queue": qout, "lock": path}
 
 
@@ -1012,6 +1097,27 @@ def kill_tree(pid, table=None):
     return victims
 
 
+def print_you(st):
+    """Where the reader stands, and what the holder will write."""
+    y = st.get("you") or {}
+    if y.get("state") == "holding":
+        print("  you are pid %s: HOLDING this lock (via %s)"
+              % (y["pid"], y.get("via")))
+    elif y.get("state") == "queued":
+        print("  you are pid %s: QUEUED position %d of %d (via %s)"
+              % (y["pid"], y["position"], y["of"], y.get("via")))
+    else:
+        print("  you are pid %s: NOT IN THE QUEUE -- nothing here is waiting "
+              "on your behalf" % y.get("pid"))
+    if st["state"] != "free":
+        if st.get("artifacts"):
+            print("  the holder will write: %s" % ", ".join(st["artifacts"]))
+        else:
+            print("  the holder's artifact path is UNKNOWN (%s) -- not "
+                  "'it writes nothing'"
+                  % (st.get("artifacts_why") or "no reason recorded"))
+
+
 def print_status_human(st):
     """The text a person reads. UNCHANGED on purpose -- scripts should use
     --json or the exit code, but existing eyes and greps should not break."""
@@ -1020,6 +1126,7 @@ def print_status_human(st):
         for i, t in enumerate(st["queue"]):
             print("  queued %d: pid %s %r since %s"
                   % (i + 1, t["pid"], t["target"], t["since"]))
+        print_you(st)
         return
     print("build lock HELD by pid %d (%s) %r since %s -- %.0fs ago"
           % (st["pid"], "running" if st["running"] else "NOT RUNNING (stale)",
@@ -1039,6 +1146,7 @@ def print_status_human(st):
         print("  queued %d: pid %s %r since %s (arrived)%s"
               % (i + 1, t["pid"], t["target"], t["since"],
                  "   <- next" if i == 0 else ""))
+    print_you(st)
     if st.get("fifo") == "INVERTED":
         print("  FIFO INVERTED: the holder joined the queue AFTER a waiter "
               "that is still waiting. That is a real fairness bug, measured "
@@ -1560,6 +1668,13 @@ def print_concurrent_edits(before, after):
 
 ARTIFACT_ABSENT_EXIT = 5
 ARTIFACT_STALE_EXIT = 6
+# A build whose SOURCES moved under it. See source_change_check().
+SOURCES_CHANGED_EXIT = 15
+# Filesystem/clock granularity around the acquire instant. A file written in
+# the same second the lock was taken cannot be attributed to either side, and
+# calling that a mid-build edit would refuse builds that are fine. One second
+# is granularity; the incident this catches had the edit MINUTES after acquire.
+SOURCE_CHANGE_SLACK = 1.0
 
 VERIFY_MATCH_EXIT = 0
 VERIFY_REPLACED_EXIT = 2
@@ -1709,10 +1824,20 @@ def artifact_source_roots(repo, art):
     return out, ""
 
 
-def newest_source(repo, roots, budget=SOURCE_SCAN_BUDGET, generated=None):
+def newest_source(repo, roots, budget=SOURCE_SCAN_BUDGET, generated=None,
+                  newer_than=None):
     """The newest source file under `roots`, IGNORING build outputs.
 
-    dict: mtime / path / files / roots / truncated / error / excluded.
+    dict: mtime / path / files / roots / truncated / error / excluded / newer.
+
+    `newer_than` (an epoch time) additionally COLLECTS every source whose mtime
+    is after it, into `newer`. It is the same walk on purpose: a separate
+    "which sources changed during the build" scanner would use a second copy of
+    the extension list, the skip list and the generated-file exclusions, and
+    the moment those two copies disagree one of them is answering a question
+    nobody asked. `newer` is only meaningful when `truncated` and `error` are
+    both falsey -- an incomplete walk that found nothing has established
+    NOTHING.
     `truncated` or `error` means the walk did NOT see everything, and a caller
     must treat that as INCONCLUSIVE -- never as "nothing is newer". That
     distinction is the whole point: "I did not look" reading as "it is fine" is
@@ -1726,7 +1851,7 @@ def newest_source(repo, roots, budget=SOURCE_SCAN_BUDGET, generated=None):
     t0 = time.time()
     generated = dict(generated or {})
     res = {"mtime": None, "path": None, "files": 0, "roots": list(roots),
-           "truncated": False, "error": None, "excluded": []}
+           "truncated": False, "error": None, "excluded": [], "newer": []}
     try:
         for r in roots:
             base = os.path.join(repo, r.replace("/", os.sep))
@@ -1753,9 +1878,133 @@ def newest_source(repo, roots, budget=SOURCE_SCAN_BUDGET, generated=None):
                     res["files"] += 1
                     if res["mtime"] is None or mt > res["mtime"]:
                         res["mtime"], res["path"] = mt, p
+                    if newer_than is not None and mt > newer_than:
+                        res["newer"].append({"path": rel, "mtime": mt})
     except OSError as e:
         res["error"] = "%s: %s" % (type(e).__name__, e)
     return res
+
+
+def build_source_roots(repo, rest):
+    """The union of source roots for everything `rest` will build.
+
+    `(roots, why_empty)`. Empty roots is NOT "no sources changed" -- it is "I
+    do not know what this target reads", and every caller must print that
+    rather than pass.
+    """
+    arts, why = target_artifacts(repo, rest)
+    if arts is None:
+        return [], why
+    roots, whys = [], []
+    for a in arts:
+        r, w = artifact_source_roots(repo, a)
+        for x in r:
+            if x not in roots:
+                roots.append(x)
+        if w:
+            whys.append(w)
+    if not roots:
+        return [], "; ".join(whys) or "no source roots could be derived"
+    return roots, ""
+
+
+def source_change_check(repo, roots, why_empty, acquired_at, before=None,
+                        slack=SOURCE_CHANGE_SLACK):
+    """Did a source move UNDER this build? -> a dict with `state`.
+
+    ## The defect this exists for
+
+    MEASURED 2026-09-03 ~19:24: `buildlock.py build host` reported success
+    (exit 0, sidecar written) for a build whose sources were edited AFTER the
+    lock was acquired -- source mtimes 19:24, lock acquired 19:22:39. The DLL
+    was a PRE-EDIT snapshot, and `grep -a` found ZERO of the seven literals
+    the edit had added. Every downstream check then measured the wrong file:
+    marker-checking an artifact that does not contain the change you are
+    looking for is the silent-wrong-answer class this repo treats as worst
+    case, because the marker verdict is confident and the bytes are stale.
+
+    The lock serialises BUILDS, not EDITS (see the module docstring), and it
+    should not try to stop anyone editing. What it must not do is call the
+    result a success.
+
+    ## Three states, never two
+
+    * `unchanged`     -- the walk completed and nothing under the roots is
+                         newer than the acquire instant. This is the only pass.
+    * `CHANGED`       -- named files, with mtimes. Refusal, exit 15.
+    * `not-performed` -- the roots could not be derived, or the walk was
+                         truncated or errored. It NEVER refuses (a build that
+                         is genuinely fine must not be blocked by a scan that
+                         could not look) and it NEVER reads as a pass: it is
+                         printed as NOT PERFORMED and recorded in the sidecar
+                         as `source_check: "not-performed"` so a later verifier
+                         knows the question was not answered.
+
+    `before` is the acquire-time scan (same roots), carried only so the report
+    can say what the newest source was when the build started.
+    """
+    res = {"state": "not-performed", "why": "", "roots": list(roots),
+           "files": [], "cutoff": acquired_at,
+           "before_newest": (before or {}).get("mtime"),
+           "before_path": (before or {}).get("path"),
+           "scan": None}
+    if not roots:
+        res["why"] = ("this target's source roots could not be derived (%s), "
+                      "so 'no source changed during the build' was NOT "
+                      "ESTABLISHED" % (why_empty or "no reason recorded"))
+        return res
+    gen, gen_notes = generated_sources(repo)
+    scan = newest_source(repo, roots, generated=gen,
+                         newer_than=acquired_at + slack)
+    res["scan"] = scan
+    res["generated_notes"] = gen_notes
+    if scan["error"] or scan["truncated"]:
+        res["why"] = ("the source scan of %s did NOT COMPLETE (%s), so "
+                      "'nothing changed during the build' was NOT ESTABLISHED"
+                      % (", ".join(scan["roots"]),
+                         scan["error"] or "time budget exceeded"))
+        return res
+    if scan["newer"]:
+        res["state"] = "CHANGED"
+        res["files"] = sorted(scan["newer"], key=lambda r: -r["mtime"])
+        res["why"] = ("%d source file(s) under %s were modified after the "
+                      "lock was acquired" % (len(scan["newer"]),
+                                             ", ".join(scan["roots"])))
+        return res
+    res["state"] = "unchanged"
+    res["why"] = ("all %d source file(s) under %s predate the acquire instant "
+                  "(%d build output(s) excluded)"
+                  % (scan["files"], ", ".join(scan["roots"]),
+                     len(scan.get("excluded") or [])))
+    return res
+
+
+def source_change_lines(chg, acquired_at):
+    """What the build prints about its own inputs."""
+    when = time.strftime("%H:%M:%S", time.localtime(acquired_at))
+    if chg["state"] == "CHANGED":
+        out = ["", "SOURCES CHANGED DURING THE BUILD: %s" % chg["why"],
+               "  the lock was acquired at %s; these are NEWER, so the "
+               "artifact is a snapshot of the tree BEFORE them:" % when]
+        for f in chg["files"][:20]:
+            out.append("    %s   mtime %s"
+                       % (f["path"], time.strftime("%H:%M:%S",
+                                                   time.localtime(f["mtime"]))))
+        if len(chg["files"]) > 20:
+            out.append("    ... and %d more" % (len(chg["files"]) - 20))
+        out.append("  THIS IS NOT A SUCCESS. Marker-checking these bytes would "
+                   "measure the pre-edit build; the sidecar is flagged "
+                   "stale_sources and deploy.py will refuse it. Re-run the "
+                   "build.")
+        out.append("  exit %d (sources changed during the build)"
+                   % SOURCES_CHANGED_EXIT)
+        return out
+    if chg["state"] == "not-performed":
+        return ["  SOURCE-CHANGE CHECK NOT PERFORMED: %s. Exit 0 above is a "
+                "claim about the build, not about which revision of the "
+                "sources it compiled." % chg["why"]]
+    return ["  sources unchanged during the build (acquired %s): %s"
+            % (when, chg["why"])]
 
 
 def deploy_artifacts(repo):
@@ -2066,7 +2315,7 @@ def read_sidecar(artifact_path):
         return None
 
 
-def write_sidecar(rec, target, started, finished, git_head):
+def write_sidecar(rec, target, started, finished, git_head, src_change=None):
     """Record WHICH bytes this build produced, beside the artifact.
 
     The point is not bookkeeping. A verifier that opens the DLL minutes later
@@ -2082,6 +2331,21 @@ def write_sidecar(rec, target, started, finished, git_head):
            "finished_h": time.strftime("%Y-%m-%d %H:%M:%S",
                                        time.localtime(finished)),
            "pid": os.getpid(), "git_head": git_head}
+    # WHICH REVISION OF THE SOURCES these bytes are. `stale_sources` true means
+    # a source was edited after the lock was acquired, so the artifact predates
+    # that edit; deploy.py refuses on it. The field is written in EVERY state
+    # (including "not-performed") so that its absence means "built by a
+    # buildlock too old to know", never "checked and clean".
+    if src_change is not None:
+        doc["source_check"] = src_change["state"]
+        doc["stale_sources"] = src_change["state"] == "CHANGED"
+        doc["source_check_why"] = src_change.get("why", "")
+        if src_change.get("files"):
+            doc["sources_changed"] = [
+                {"path": f["path"],
+                 "mtime_h": time.strftime("%Y-%m-%d %H:%M:%S",
+                                          time.localtime(f["mtime"]))}
+                for f in src_change["files"][:50]]
     p = sidecar_path(rec["path"])
     tmp = p + ".tmp%d" % os.getpid()
     try:
@@ -2099,7 +2363,8 @@ def write_sidecar(rec, target, started, finished, git_head):
     return doc
 
 
-def check_and_record(repo, rest, started, finished, no_sidecar=False):
+def check_and_record(repo, rest, started, finished, no_sidecar=False,
+                     src_change=None):
     """Post-build: did the thing we asked for actually appear? Returns an exit
     code -- 0, ARTIFACT_ABSENT_EXIT or ARTIFACT_STALE_EXIT."""
     arts, why = target_artifacts(repo, rest)
@@ -2130,7 +2395,8 @@ def check_and_record(repo, rest, started, finished, no_sidecar=False):
     head = head.strip() if head else None
     for r in recs:
         if r["state"] == "ok" and r["built"]:
-            write_sidecar(r, " ".join(rest), started, finished, head)
+            write_sidecar(r, " ".join(rest), started, finished, head,
+                          src_change)
     return 0
 
 
@@ -2627,6 +2893,12 @@ def main():
                         "sidecar. The check is what turns exit 0 into "
                         "evidence; turning it off means the exit code is a "
                         "claim about the build PROCESS only.")
+    p.add_argument("--no-source-check", action="store_true",
+                   dest="no_source_check",
+                   help="do not check whether a source was edited AFTER the "
+                        "lock was acquired. With it off, exit 0 stops being "
+                        "evidence that the artifact contains your edit "
+                        "(measured 2026-09-03: it did not).")
     p.add_argument("--no-lint", action="store_true", dest="no_lint",
                    help="skip the tools/nimlint.py pre-flight. The pre-flight "
                         "refuses (exit %d) BEFORE taking the lock when the "
@@ -2793,6 +3065,16 @@ def main():
         # the interval the child runs in, and before the child starts so the
         # child's own outputs are not mistaken for someone's edit.
         before = tree_snapshot(a.repo) if not a.no_snapshot else None
+        # The acquire-time source scan. Taken here, in the same instant the
+        # child starts, so "newer than the acquire time" means exactly that.
+        src_roots, src_why = ([], "--no-source-check was passed, so nothing "
+                                  "was scanned")
+        src_before = None
+        if not a.no_source_check:
+            src_roots, src_why = build_source_roots(a.repo, rest)
+            if src_roots:
+                gen, _n = generated_sources(a.repo)
+                src_before = newest_source(a.repo, src_roots, generated=gen)
         rc, build_text = run_teed(cmd, a.repo, env)
     finally:
         release(path)
@@ -2814,14 +3096,30 @@ def main():
     # anything if seeing it means something.
     if rc != 0 and before is not None:
         print_concurrent_edits(before, tree_snapshot(a.repo))
+    # Did the sources move under us? Asked on SUCCESS only: a failed build's
+    # exit code is already telling the truth, and the failure path prints the
+    # concurrent-edit block above. On success the exit code is a claim, and
+    # this is the half of that claim nobody was checking.
+    srcchg = None
+    if rc == 0 and not a.no_source_check:
+        srcchg = source_change_check(a.repo, src_roots, src_why, t0,
+                                     src_before)
+        for ln in source_change_lines(srcchg, t0):
+            print(ln)
     if rc == 0 and not a.no_artifact_check:
         # The build said it worked. That is a claim about a PROCESS. Whether a
         # file exists is a different question, and it is the one the caller
         # actually asked -- measured five times on 2026-09-02 answering `ok`
         # for an artifact a queued build had already deleted.
-        arc = check_and_record(a.repo, rest, t0, finished)
+        arc = check_and_record(a.repo, rest, t0, finished,
+                               src_change=srcchg)
         if arc:
             return arc
+    # AFTER the artifact check, so the sidecar carries the flag before we
+    # refuse: the artifact exists and somebody will look at it, and the whole
+    # point is that what they find beside it says these bytes predate an edit.
+    if srcchg is not None and srcchg["state"] == "CHANGED":
+        return SOURCES_CHANGED_EXIT
     return rc
 
 

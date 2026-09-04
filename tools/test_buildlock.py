@@ -1568,7 +1568,7 @@ ART_REL = "host/Aowlspt.Host.Il2Cpp/bin/aowlspt-host-il2cpp.dll"
 
 
 def make_artifact_repo(tmp, name, writes=True, rc=0, payload="one",
-                       remove=True, extra=None):
+                       remove=True, extra=None, touches=None, sleep_s=0.0):
     """A repo with its OWN tools/deploy.json and a stand-in `aowl` that
     reproduces the measured behaviour: it REMOVES the declared artifact before
     (maybe) writing it, then exits with a chosen code.
@@ -1595,14 +1595,27 @@ def make_artifact_repo(tmp, name, writes=True, rc=0, payload="one",
     art = os.path.join(repo, ART_REL.replace("/", os.sep))
     with open(os.path.join(repo, "build"), "w", encoding="utf-8",
               newline="\n") as f:
-        f.write("import os, sys\n"
+        # `touches` REWRITES a source file after the artifact is written --
+        # i.e. it reproduces the 2026-09-03 incident inside the stand-in
+        # driver, where another agent's edit lands while the build is running
+        # and the artifact is therefore a pre-edit snapshot.
+        f.write("import os, sys, time\n"
                 "art = %r\n"
                 "os.makedirs(os.path.dirname(art), exist_ok=True)\n"
                 "if %r and os.path.exists(art):\n"
                 "    os.unlink(art)\n"
                 "if %r:\n"
                 "    open(art, 'w').write(%r)\n"
-                "sys.exit(%d)\n" % (art, remove, writes, payload, rc))
+                "time.sleep(%r)\n"
+                "t = %r\n"
+                "if t:\n"
+                "    os.makedirs(os.path.dirname(t), exist_ok=True)\n"
+                "    open(t, 'a').write('# edited mid-build\\n')\n"
+                "    os.utime(t, None)\n"
+                "sys.exit(%d)\n"
+                % (art, remove, writes, payload, sleep_s,
+                   (os.path.join(repo, touches.replace("/", os.sep))
+                    if touches else None), rc))
     probe = subprocess.run([exe, "-c", "print('ok')"],
                            capture_output=True, text=True)
     if probe.returncode != 0 or "ok" not in probe.stdout:
@@ -1614,6 +1627,215 @@ def build_in(repo, *args):
     r = subprocess.run([sys.executable, BL, "--repo", guard_repo(repo)] + list(args),
                        capture_output=True, text=True, timeout=180)
     return r.returncode, r.stdout + r.stderr
+
+
+def test_status_you(tmp):
+    """`--status` must say where the READER stands, and what will be written.
+
+    Two agents asked for this on 2026-09-03: the report described the world
+    but not the reader's place in it. Three worlds again, because "you are
+    queued" printed unconditionally would be worse than nothing -- it would
+    make somebody wait for a build that is not theirs.
+    """
+    print("\n--status: where the caller stands, and the holder's artifact")
+    repo, _art = make_artifact_repo(tmp, "you-status", writes=False)
+    if repo is None:
+        check("INCONCLUSIVE: no stand-in driver, nothing was tested", False,
+              "")
+        return
+    lp = buildlock.lock_path(repo)
+
+    # 1. A bystander: somebody else holds it, building `build host`.
+    holder = plant_holder(lp)
+    with open(lp, "r", encoding="utf-8") as f:
+        rec = json.load(f)
+    rec["cmd"] = "build host"
+    with open(lp, "w", encoding="utf-8") as f:
+        json.dump(rec, f)
+    try:
+        rc, out = cli(repo, "--status")
+        _rc, jout = cli(repo, "--status", "--json")
+        you = json.loads(jout).get("you") or {}
+        check("a bystander is told NOT IN THE QUEUE, explicitly",
+              "NOT IN THE QUEUE" in out and you.get("state") == "not-in-queue",
+              repr(out))
+
+        # 2. The SAME command, with AOWL_BUILDLOCK set to the holder's pid --
+        # what a script running inside the build sees.
+        env = dict(os.environ)
+        env["AOWL_BUILDLOCK"] = str(holder.pid)
+        r = subprocess.run([sys.executable, BL, "--repo", guard_repo(repo),
+                            "--status"], capture_output=True, text=True,
+                           env=env, timeout=60)
+        check("a process running INSIDE the build is told it is HOLDING",
+              "HOLDING this lock" in r.stdout, repr(r.stdout))
+        check("the two answers DIFFER (else the line is unconditional)",
+              ("HOLDING this lock" in r.stdout)
+              != ("HOLDING this lock" in out), repr(r.stdout))
+
+        # 3. A queued waiter, seen from its own pid.
+        w, _t = plant_ticket(buildlock.queue_dir(lp),
+                             int(time.time() * 1e9), "build host")
+        try:
+            env2 = dict(os.environ)
+            env2["AOWL_BUILDLOCK"] = str(w.pid)
+            r2 = subprocess.run([sys.executable, BL, "--repo",
+                                 guard_repo(repo), "--status"],
+                                capture_output=True, text=True, env=env2,
+                                timeout=60)
+            check("a queued waiter is told its POSITION",
+                  "QUEUED position 1 of 1" in r2.stdout, repr(r2.stdout))
+        finally:
+            w.kill()
+            w.wait()
+
+        check("the held report names the path the holder will write",
+              ART_REL in out, repr(out))
+    finally:
+        holder.kill()
+        holder.wait()
+
+    # A holder whose target declares no artifact must not read as "writes
+    # nothing"; it must say the path is UNKNOWN and why.
+    holder2 = plant_holder(lp)      # its recorded cmd is "planted holder"
+    try:
+        _rc, out2 = cli(repo, "--status")
+        check("an underivable artifact path says UNKNOWN, not nothing",
+              "artifact path is UNKNOWN" in out2, repr(out2))
+    finally:
+        holder2.kill()
+        holder2.wait()
+
+
+SRC_REL = "host/Aowlspt.Host.Il2Cpp/hostmain.nim"
+
+
+def _plant_source(repo, rel=SRC_REL, age=120.0):
+    """One ordinary source file, comfortably older than any build."""
+    p = os.path.join(repo, rel.replace("/", os.sep))
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p, "w", encoding="utf-8", newline="\n") as f:
+        f.write("# a source the build reads\n")
+    t = time.time() - age
+    os.utime(p, (t, t))
+    return p
+
+
+def test_source_change(tmp):
+    """A build whose SOURCES moved under it must not be reported as success.
+
+    MEASURED 2026-09-03 ~19:24: `buildlock.py build host` exited 0 and wrote a
+    sidecar for a build whose sources were edited AFTER the lock was acquired
+    (source mtimes 19:24, acquire 19:22:39). The DLL was a PRE-EDIT snapshot --
+    `grep -a` found zero of the seven literals the edit added -- so the marker
+    check that followed measured the wrong bytes and said so confidently.
+
+    THE FALSIFIER, and it is the whole test: the second world runs the SAME
+    driver, writing the SAME artifact, with the touch turned off. If both
+    worlds refused, the refusal would be unconditional and would prove
+    nothing; if both passed, the check would be inert. Three worlds, three
+    outcomes, and the third (`build sim`, which declares no artifact) pins
+    that "I could not look" prints NOT PERFORMED instead of passing quietly.
+    """
+    print("\nsources changed during the build (exit %d)"
+          % buildlock.SOURCES_CHANGED_EXIT)
+    repo, art = make_artifact_repo(tmp, "srcchg", touches=SRC_REL, sleep_s=2.0)
+    if repo is None:
+        check("INCONCLUSIVE: no runnable stand-in driver, nothing was tested",
+              False, "the copied python.exe would not start")
+        return
+    src = _plant_source(repo)
+    t_build = time.time()
+    # --no-store-audit: tools/storelint.py returns FAIL (not INCONCLUSIVE) for
+    # ANY tree that is not this checkout, because every one of its baseline
+    # entries reads as "GONE" there. That is a pre-existing rough edge in the
+    # pre-flight, not part of what is under test here, and it fires as soon as
+    # a temp repo contains a .nim under host/.
+    rc, out = build_in(repo, "--no-store-audit", "build", "host")
+    touched_after = os.stat(src).st_mtime > t_build
+
+    check("the driver really did touch the source mid-build (else this world "
+          "is vacuous)", touched_after,
+          "source mtime %.1f vs build start %.1f"
+          % (os.stat(src).st_mtime, t_build))
+    check("a build whose source changed exits %d, NOT 0"
+          % buildlock.SOURCES_CHANGED_EXIT,
+          rc == buildlock.SOURCES_CHANGED_EXIT, "rc=%d\n%s" % (rc, out[-800:]))
+    check("it prints SOURCES CHANGED DURING THE BUILD",
+          "SOURCES CHANGED DURING THE BUILD" in out, "tail: %r" % out[-600:])
+    check("it NAMES the file and its mtime",
+          "hostmain.nim" in out.split("SOURCES CHANGED", 1)[-1],
+          "tail: %r" % out[-600:])
+
+    side = buildlock.read_sidecar(art)
+    check("the sidecar exists and is flagged stale_sources=true",
+          bool(side) and side.get("stale_sources") is True
+          and side.get("source_check") == "CHANGED", repr(side))
+    check("the sidecar names the changed file, so a later reader needs no log",
+          any("hostmain.nim" in (f.get("path") or "")
+              for f in (side or {}).get("sources_changed") or []),
+          repr((side or {}).get("sources_changed")))
+
+    # THE CONTROL. Same driver, same artifact, no mid-build edit.
+    repo2, art2 = make_artifact_repo(tmp, "srcchg-ok", sleep_s=2.0)
+    if repo2 is None:
+        check("INCONCLUSIVE: no control driver, the refusal above is not "
+              "evidence", False, "")
+        return
+    _plant_source(repo2)
+    rc2, out2 = build_in(repo2, "--no-store-audit", "build", "host")
+    check("CONTROL: the same build without the edit exits 0", rc2 == 0,
+          "rc=%d\n%s" % (rc2, out2[-800:]))
+    check("CONTROL: it does NOT print SOURCES CHANGED",
+          "SOURCES CHANGED" not in out2, "tail: %r" % out2[-600:])
+    check("CONTROL: it says the sources were unchanged, in as many words",
+          "sources unchanged during the build" in out2,
+          "tail: %r" % out2[-600:])
+    side2 = buildlock.read_sidecar(art2)
+    check("CONTROL: the sidecar records source_check=unchanged and "
+          "stale_sources=false",
+          bool(side2) and side2.get("stale_sources") is False
+          and side2.get("source_check") == "unchanged", repr(side2))
+
+    # THIRD OUTCOME: nothing to scan is NOT PERFORMED, and never a pass.
+    rc3, out3 = build_in(repo2, "--no-store-audit", "build", "sim")
+    check("a target with no declared artifact prints SOURCE-CHANGE CHECK NOT "
+          "PERFORMED", "SOURCE-CHANGE CHECK NOT PERFORMED" in out3,
+          "rc=%d tail: %r" % (rc3, out3[-600:]))
+    check("...and does not refuse on it", rc3 == 0, "rc=%d" % rc3)
+
+    # And the flag must be able to turn it off, or the escape hatch is a lie.
+    # In its OWN repo: re-running the touching driver over `repo` would
+    # overwrite the flagged sidecar the deploy assertions below depend on.
+    repo3, _art3 = make_artifact_repo(tmp, "srcchg-off", touches=SRC_REL,
+                                      sleep_s=2.0)
+    if repo3 is not None:
+        _plant_source(repo3)
+        rc4, out4 = build_in(repo3, "--no-source-check",
+                             "--no-store-audit", "build", "host")
+        check("--no-source-check builds the same tree without the refusal",
+              rc4 == 0 and "SOURCES CHANGED" not in out4,
+              "rc=%d\n%s" % (rc4, out4[-600:]))
+
+    # DEPLOY MUST REFUSE THOSE BYTES. This calls the real function deploy.py's
+    # cmd_deploy calls, on the real sidecars written above -- a refusal in
+    # buildlock that deploy ignores would leave the pre-edit DLL one command
+    # away from the live install.
+    try:
+        import deploy as deploymod
+    except Exception as ex:
+        check("INCONCLUSIVE: tools/deploy.py could not be imported, so the "
+              "deploy refusal was NOT TESTED", False, str(ex))
+        return
+    ok_bad, lines_bad = deploymod.sidecar_check(art)
+    ok_good, lines_good = deploymod.sidecar_check(art2)
+    check("deploy.py REFUSES an artifact whose sidecar says stale_sources",
+          ok_bad is False and any("SOURCES CHANGED" in l for l in lines_bad),
+          repr(lines_bad))
+    check("CONTROL: deploy.py accepts the artifact built with no mid-build "
+          "edit -- and vouches for it, so the acceptance is not vacuous",
+          ok_good is True and any("sha matches" in l for l in lines_good),
+          repr(lines_good))
 
 
 def test_artifact_check(tmp):
@@ -1661,7 +1883,7 @@ def test_artifact_check(tmp):
     # THE INCIDENT. Same command, same repo shape, a driver that removes the
     # artifact and produces nothing while still exiting 0.
     repo2, art2 = make_artifact_repo(tmp, "art-absent", writes=False)
-    rc2, out2 = build_in(repo2, "build", "host")
+    rc2, out2 = build_in(repo2, "--no-store-audit", "build", "host")
     check("a build that exits 0 with NO artifact is REFUSED",
           rc2 == buildlock.ARTIFACT_ABSENT_EXIT,
           "rc=%d (wanted %d)\n%s" % (rc2, buildlock.ARTIFACT_ABSENT_EXIT,
@@ -1794,7 +2016,7 @@ def test_noop_rebuild_is_up_to_date(tmp):
         check("INCONCLUSIVE: the stand-in driver would not run (b)", False)
         return
     _, src = _plant_prebuilt(repo2, art2, src_age=60.0)   # newer than the art
-    rc2, out2 = build_in(repo2, "build", "host")
+    rc2, out2 = build_in(repo2, "--no-store-audit", "build", "host")
     check("a source NEWER than an unwritten artifact is still exit 6",
           rc2 == buildlock.ARTIFACT_STALE_EXIT, "rc=%d\n%s" % (rc2, out2[-900:]))
     check("...and the refusal names the file that is newer",
@@ -2371,7 +2593,7 @@ def test_generated_is_not_a_source(tmp):
     _plant_prebuilt(repo2, art2, src_age=30.0)   # aowlhost.nim is newer
     _plant_generated(repo2)
     _declare_generated(repo2, [GEN_REL])
-    rc2, out2 = build_in(repo2, "build", "host")
+    rc2, out2 = build_in(repo2, "--no-store-audit", "build", "host")
     check("a REAL source newer than the artifact is still exit 6",
           rc2 == buildlock.ARTIFACT_STALE_EXIT,
           "rc=%d\n%s" % (rc2, out2[-1200:]))
@@ -2618,6 +2840,7 @@ def main():
                    test_hung_human_text, test_hung_across_calls,
                    test_wait_free_reports_hung, test_break_hung,
                    test_artifact_units, test_artifact_check,
+                   test_source_change, test_status_you,
                    test_noop_rebuild_is_up_to_date,
                    test_generated_is_not_a_source, test_markers_under_lock,
                    test_verify_artifact,

@@ -385,10 +385,33 @@ def sidecar_check(src, expect=None):
                          "recorded. Rebuild, or find out who overwrote it "
                          "-- do NOT deploy these bytes.")
             return False, lines
+        elif doc.get("stale_sources"):
+            # MEASURED 2026-09-03 19:24: buildlock reported success for a
+            # build whose sources were edited AFTER the lock was acquired.
+            # The bytes are internally consistent -- the sha matches -- and
+            # they are still a PRE-EDIT snapshot, so every marker check on
+            # them measures the wrong build. That is why this refusal is
+            # separate from the sha one: agreement with the sidecar proves
+            # nothing about which revision was compiled.
+            lines.append("SOURCES CHANGED DURING THAT BUILD: %s" % src)
+            lines.append("  the sidecar records stale_sources=true (%s)"
+                         % (doc.get("source_check_why") or "no reason "
+                            "recorded"))
+            for f in (doc.get("sources_changed") or [])[:8]:
+                lines.append("    %s   mtime %s"
+                             % (f.get("path"), f.get("mtime_h")))
+            lines.append("  These bytes predate those edits. Rebuild before "
+                         "deploying; do NOT marker-check this artifact.")
+            return False, lines
         else:
             lines.append("built %s by %r at %s (sha matches)"
                          % (want[:12], doc.get("target"),
                             doc.get("finished_h") or doc.get("finished")))
+            if doc.get("source_check") == "not-performed":
+                lines.append("NOTE the source-change check was NOT PERFORMED "
+                             "for that build (%s) -- which revision of the "
+                             "sources these bytes are is unestablished."
+                             % (doc.get("source_check_why") or ""))
     if expect:
         if have is None:
             try:
