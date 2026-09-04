@@ -212,6 +212,35 @@ var gPfxOrigGeom = nuNoGeom()
 ## ScrollRect" when the truth was "the graft never ran".
 var gPfxPostPanelT: Il2CppPtr = nil
 var gPfxGfxPanelT: Il2CppPtr = nil
+## ---- defect 1: the DONOR's authored inset ------------------------------
+## v2 STRETCHED the clone's Viewport to fill the whole clone root, on the
+## reasoning that the donor's centred 750-wide viewport was "the inset box the
+## user saw". That was wrong, and the user's screen said so: the donor keeps
+## its Viewport 750 wide and centred *precisely so that the Scrollbar has a
+## right margin to live in*. Filling the root put the viewport under the
+## scrollbar, so the bar draws straight through the slider values at the far
+## right. The authored inset is restored VERBATIM from the donor -- read off
+## the live Graphics SettingsList, never a constant -- and the donor Viewport
+## transform is kept so the verdict can re-read its width from the DONOR
+## rather than from anything we wrote.
+var gPfxDonorVpT: Il2CppPtr = nil
+var gPfxDonorVpG = nuNoGeom()
+var gPfxDonorBarG = nuNoGeom()
+## ---- defect 2: the background ------------------------------------------
+## The scroll area had no background because the node that drew it was the
+## `SettingsPanel` we retired (or a child of it that went down with it).
+## Which node it actually is is MEASURED at graft time by a census, never
+## assumed; `gPfxBgWhy` is that census, verbatim, so a run that found nothing
+## says what it looked at.
+var gPfxBgT: Il2CppPtr = nil
+var gPfxBgWhy = ""
+## ---- defect 3: the flash ------------------------------------------------
+## `Time.frameCount` at the graft, and at the FIRST frame the PostFX panel was
+## observed active. The page flashed because the graft ran on the first
+## panel-up tick, i.e. after the stock layout had already rendered. The only
+## honest finished-state check is the ordering of those two numbers.
+var gPfxGraftFrame = -1
+var gPfxFirstActiveFrame = -1
 ## THE GRAFT'S OWN OUTCOME, so the verdict can tell 'declined, and why' apart
 ## from 'applied, but the result is wrong'. Both printed the same INCONCLUSIVE
 ## before, which is the same class of defect as the checks 9b is about: one
@@ -611,6 +640,112 @@ proc pfxMoveKids(fromT, toT: Il2CppPtr): int =
     i = i - 1
     steps = steps + 1
 
+proc pfxFrameNow(): int32 =
+  ## `UnityEngine.Time::get_frameCount`, through invoke2's byte-verified table
+  ## (`Mi2FrameCount`). Returns -1 when the target is not bound, which is an
+  ## honest "unknown" -- the flash check reports INCONCLUSIVE on it rather than
+  ## inventing an ordering.
+  result = -1'i32
+  let fn = mi2Fn(Mi2FrameCount)
+  if fn == nil: return
+  result = cMi2CallIV(fn)
+
+proc pfxApplyGeom(rt: Il2CppPtr; g: NuGeom): bool =
+  ## Copy one RectTransform's WHOLE authored layout onto another. Used only to
+  ## put the donor's own numbers on the clone's Viewport and Scrollbar; the
+  ## values are read live off the donor, so no constant of ours is involved
+  ## and it is resolution-independent.
+  result = false
+  if rt == nil or not g.ok: return
+  result = nuLayout(rt, g.aMinX, g.aMinY, g.aMaxX, g.aMaxY,
+                    g.pivX, g.pivY, g.sdX, g.sdY, g.posX, g.posY)
+
+proc pfxHasImage(t: Il2CppPtr): bool =
+  ## Does this node DRAW? `Image` is the only Graphic the settings panels use
+  ## for their flat backgrounds. Asked through `GetComponent(String)`, which
+  ## works on an inactive node.
+  if t == nil or not duOk(t, 0x20'i32) or not iUnityAlive(t): return false
+  modsComponent(t, "Image") != nil
+
+proc pfxBackground(panelT, rowParent, cloneT: Il2CppPtr): bool =
+  ## DEFECT 1 OF THIS ROUND: there is no background behind the scroll area.
+  ##
+  ## The census is run FIRST and recorded whole, because "which node draws the
+  ## dark background" is a measurement, not something this file may assume --
+  ## and the three plausible answers need three different actions:
+  ##
+  ##   a. the PostFX 'Panel' itself (or a child of it that is NOT the
+  ##      SettingsPanel) already draws it -> do NOTHING. Reparenting a
+  ##      background that is already behind the clone would only reorder it.
+  ##   b. a 'Background' child of the retired SettingsPanel draws it -> move
+  ##      that node into the clone root, first sibling (so it draws BEHIND the
+  ##      viewport) and stretched to the root.
+  ##   c. the SettingsPanel ITSELF carries the Image -> do not retire it. It
+  ##      is already a SIBLING of the clone under 'Panel', so it is kept
+  ##      ACTIVE and pushed to sibling 0; emptied of rows it is exactly a
+  ##      background quad, which is what the Graphics page has.
+  ##
+  ## Returns TRUE when the SettingsPanel must be KEPT ACTIVE (case c) -- the
+  ## caller retires it otherwise.
+  result = false
+  gPfxBgT = nil
+  var note = ""
+  let panelImg = pfxHasImage(panelT)
+  let rootImg = pfxHasImage(rowParent)
+  let bgChild = modsChildNamed(rowParent, "Background")
+  let bgChildImg = pfxHasImage(bgChild)
+  let panelBg = modsChildNamed(panelT, "Background")
+  let panelBgImg = pfxHasImage(panelBg)
+  note = "'Panel' Image=" & (if panelImg: "YES" else: "no") &
+         ", 'Panel'/Background=" &
+         (if panelBg == nil: "absent"
+          elif panelBgImg: "present WITH Image" else: "present, no Image") &
+         ", SettingsPanel Image=" & (if rootImg: "YES" else: "no") &
+         ", SettingsPanel/Background=" &
+         (if bgChild == nil: "absent"
+          elif bgChildImg: "present WITH Image" else: "present, no Image")
+  if panelImg or panelBgImg:
+    gPfxBgT = (if panelImg: panelT else: panelBg)
+    gPfxBgWhy = note & " -> the PostFX panel ALREADY draws its own " &
+                "background behind the clone; nothing was moved."
+    return
+  if bgChildImg:
+    let bgGo = iGameObjectOf(bgChild)
+    if bgGo != nil and nuParentTransform(bgChild, cloneT, false) and
+       nuLayout(bgChild, 0.0'f32, 0.0'f32, 1.0'f32, 1.0'f32,
+                0.5'f32, 0.5'f32, 0.0'f32, 0.0'f32, 0.0'f32, 0.0'f32):
+      discard modsSetFirstSibling(bgChild)
+      discard modsSetActive(bgGo, true)
+      gPfxBgT = bgChild
+      gPfxBgWhy = note & " -> that Background node was MOVED into the clone " &
+                  "root, stretched to it and pushed to sibling 0 so it draws " &
+                  "behind the viewport."
+      return
+    gPfxBgWhy = note & " -> the Background child was found but could not be " &
+                "reparented or laid out, so the scroll area has NO background."
+    return
+  if rootImg:
+    # ONLY safe as a "draw behind the clone" if the two really are siblings.
+    # Sibling index is an ordering among ONE parent's children and says
+    # nothing across parents, so this is checked rather than assumed.
+    let par = modsParentOf(rowParent)
+    let sameParent = (par != nil and par == panelT)
+    gPfxBgT = rowParent
+    if sameParent: discard modsSetFirstSibling(rowParent)
+    gPfxBgWhy = note & " -> the SettingsPanel itself carries the Image, so it " &
+                "is KEPT ACTIVE (emptied of rows it is exactly a background " &
+                "quad)" &
+                (if sameParent: " and pushed to sibling 0 under 'Panel', so " &
+                   "it draws behind the clone."
+                 else: ", but its parent is '" & iObjName(par) &
+                   "', not the 'Panel' the clone sits under -- sibling order " &
+                   "cannot be used to put it behind, so its draw order is " &
+                   "whatever the tree already gives it.")
+    return true
+  gPfxBgWhy = note & " -> NO node with an Image was found on either panel, " &
+              "so nothing draws the scroll area's background and this run " &
+              "cannot supply one. Reported, not hidden."
+
 proc pfxGraftRefuse(why: string) =
   ## EVERY exit from the graft that is not a success comes through here. There
   ## is no silent `return` left in `pfxScrollify`, and that is the point: the
@@ -748,6 +883,13 @@ proc pfxScrollify(tab, rowParent: Il2CppPtr; newRootOut: var Il2CppPtr): bool =
                  "'Other Settings' -> 'SettingsList', nor found by name " &
                  "within 4 levels. Nothing was cloned.")
     return
+  # THE DONOR'S AUTHORED INSET, read BEFORE anything is cloned. The Graphics
+  # page keeps its Viewport narrower than its list root and puts the Scrollbar
+  # in the margin that leaves; taking those two rects off the live donor is
+  # the whole of defect 1's fix, and it is a measurement, not a constant.
+  gPfxDonorVpT = modsChildNamed(donorT, "Viewport")
+  gPfxDonorVpG = nuReadGeom(gPfxDonorVpT)
+  gPfxDonorBarG = nuReadGeom(modsChildNamed(donorT, "Scrollbar"))
   if modsComponent(donorT, "ScrollRect") == nil:
     pfxGraftRefuse("the node found as the Graphics 'SettingsList' carries no " &
                  "ScrollRect, so it is NOT the scroll host and cloning it " &
@@ -796,14 +938,31 @@ proc pfxScrollify(tab, rowParent: Il2CppPtr; newRootOut: var Il2CppPtr): bool =
                  "exactly as it was.")
     discard nuDestroy(cloneGo)
     return
-  # (2) THE VIEWPORT FILLS THE CLONE ROOT. The donor's viewport is a centred
-  # 750-wide inset of an 850-wide list; kept, it is the 100 px of unclipped
-  # overhang the user reported.
-  if not nuLayout(viewportT, 0.0'f32, 0.0'f32, 1.0'f32, 1.0'f32,
-                  0.5'f32, 0.5'f32, 0.0'f32, 0.0'f32, 0.0'f32, 0.0'f32):
-    pfxGraftRefuse("the cloned Viewport could not be stretched to the clone " &
-                 "root, so it would clip at the donor's own inset width. The " &
-                 "clone is destroyed.")
+  # (2) THE VIEWPORT KEEPS THE DONOR'S AUTHORED INSET -- REVERSED FROM v2.
+  #
+  # v2 stretched this to fill the clone root, calling the donor's centred
+  # 750-wide viewport "the inset box the user saw". MEASURED on the deployed
+  # build, by the user's own eyes: the scrollbar then runs straight through
+  # the slider values at the far right, because the margin the donor leaves on
+  # the right is EXACTLY where the Scrollbar lives. The donor's numbers are
+  # re-applied verbatim (the clone already carries them, but writing them
+  # explicitly makes the intent auditable and survives any later touch), and a
+  # donor whose Viewport cannot be read is a refusal, not a fallback to
+  # stretching -- guessing this is what produced the defect.
+  if not gPfxDonorVpG.ok:
+    pfxGraftRefuse("the DONOR Graphics SettingsList's own 'Viewport' rect " &
+                 "could not be read, so the authored inset that leaves room " &
+                 "for the scrollbar is unknown. Stretching instead is what " &
+                 "put the bar through the slider values; refusing. The clone " &
+                 "is destroyed.")
+    discard nuDestroy(cloneGo)
+    return
+  if not pfxApplyGeom(viewportT, gPfxDonorVpG):
+    pfxGraftRefuse("the donor Viewport's authored geometry (" &
+                 nuGeomNote(gPfxDonorVpG) & ") could not be applied to the " &
+                 "clone's Viewport, so its right margin is not guaranteed " &
+                 "and the scrollbar would overlap the rows. The clone is " &
+                 "destroyed.")
     discard nuDestroy(cloneGo)
     return
   # (4) DONOR ROWS OUT FIRST, so the ContentSizeFitter never sees them plus
@@ -841,8 +1000,11 @@ proc pfxScrollify(tab, rowParent: Il2CppPtr; newRootOut: var Il2CppPtr): bool =
   # (4) THE EMPTIED PANEL GOES DOWN, leaving the Viewport with exactly one
   # active child. An empty-but-active 850x726 box in the viewport is still a
   # raycast target and still a layout participant.
+  # ...UNLESS IT IS THE THING THAT DRAWS THE BACKGROUND. The census runs
+  # before the retire and decides which of the three cases this build is in.
+  let keepPanel = pfxBackground(panelT, rowParent, cloneT)
   let oldGo = iGameObjectOf(rowParent)
-  if oldGo != nil: discard modsSetActive(oldGo, false)
+  if oldGo != nil and not keepPanel: discard modsSetActive(oldGo, false)
   # ---- MAKE THE LAYOUT ACTUALLY RUN ------------------------------------
   #
   # MEASURED live on 82cb47ee (host log 18:36, lines 1750-1751): the graft
@@ -919,18 +1081,15 @@ proc pfxScrollify(tab, rowParent: Il2CppPtr; newRootOut: var Il2CppPtr): bool =
          "keep the absolute positions they had in the old SettingsPanel -- " &
          "all stacked at the same y. This is the exact defect measured on " &
          "82cb47ee and it is being reported, not hidden."
-  # (5) THE SCROLLBAR. Only touched if it is NOT already right-anchored, and
-  # then only with numbers read off itself -- its own resolved width. A
-  # scrollbar outside the panel is a visible defect and the verdict checks it
-  # either way.
+  # (5) THE SCROLLBAR GETS THE DONOR'S AUTHORED PLACEMENT, verbatim, for the
+  # same reason as the Viewport: the bar and the viewport's right margin are
+  # ONE authored arrangement and re-deriving either half is how they came to
+  # overlap. Nothing is computed here; the verdict then checks the finished
+  # state -- every row's right edge strictly left of the bar's left edge.
   let barT = modsChildNamed(cloneT, "Scrollbar")
   var barFixed = false
-  if barT != nil:
-    let bg = nuReadGeom(barT)
-    if bg.ok and bg.aMinX < 0.99'f32:
-      barFixed = nuLayout(barT, 1.0'f32, 0.0'f32, 1.0'f32, 1.0'f32,
-                          1.0'f32, 0.5'f32, bg.rectW, 0.0'f32,
-                          0.0'f32, 0.0'f32)
+  if barT != nil and gPfxDonorBarG.ok:
+    barFixed = pfxApplyGeom(barT, gPfxDonorBarG)
   gPfxScrollGo = cloneGo
   gPfxScrollHostT = cloneT
   gPfxScrollContentT = contentT
@@ -940,18 +1099,31 @@ proc pfxScrollify(tab, rowParent: Il2CppPtr; newRootOut: var Il2CppPtr): bool =
   newRootOut = contentT
   gPfxGraftOk = true
   gPfxGraftWhy = ""
-  okLog "postfx rows: SCROLL GRAFT (v2) applied -- the clone root was given " &
+  gPfxGraftFrame = int(pfxFrameNow())
+  okLog "postfx rows: SCROLL GRAFT (v3) applied at frame " & $gPfxGraftFrame &
+        " (panel first seen ACTIVE at frame " &
+        (if gPfxFirstActiveFrame >= 0: $gPfxFirstActiveFrame
+         else: "NEVER YET -- the panel is still hidden, which is the point") &
+        ") -- the clone root was given " &
         "the AUTHORED SettingsPanel rect verbatim (" & nuGeomNote(og) &
-        "), its Viewport stretched to fill that root, " & $retired &
+        "), its Viewport given the DONOR's authored inset verbatim (" &
+        nuGeomNote(gPfxDonorVpG) & ") so the scrollbar keeps its margin, " &
+        "background: " & gPfxBgWhy & ". " & $retired &
         " donor row(s) retired, " & $moved & " row(s) MOVED into the clone's " &
         "own Content (which already carries the LayoutGroup + " &
         "ContentSizeFitter that drive height -- nothing was AddComponent'd), " &
         "and BOTH ScrollRect.m_Content@0x20 and PostFXSettingsTab." &
         "_settingsRoot@0xa0 repointed at it. The emptied SettingsPanel was " &
-        "retired so the Viewport has exactly one active child. Scrollbar " &
+        (if keepPanel: "KEPT ACTIVE as the background quad (it carries the " &
+           "Image), so the Viewport still has exactly one active child -- it " &
+           "is a SIBLING of the clone, not a child of the Viewport"
+         else: "retired so the Viewport has exactly one active child") &
+        ". Scrollbar " &
         (if barT == nil: "NOT FOUND"
-         elif barFixed: "re-anchored to the right edge from its own width"
-         else: "left as authored (already right-anchored)") &
+         elif barFixed: "given the DONOR's authored placement verbatim (" &
+           nuGeomNote(gPfxDonorBarG) & ")"
+         else: "left exactly as the clone carried it -- the donor's own bar " &
+           "rect was UNREADABLE, so nothing was written to it") &
         ". Layout on the cloned Content: " & layoutNote & "; " &
         $optedOut & " row(s) had a LayoutElement whose ignoreLayout was " &
         "cleared; the Content was " &
@@ -1045,18 +1217,43 @@ proc pfxScrollVerdict(rowParent: Il2CppPtr) =
     return
   var fails = 0
   var why = ""
-  # 1. the scroll region occupies exactly the authored SettingsPanel space.
-  if gPfxOrigGeom.ok:
-    let dw = vg.rectW - gPfxOrigGeom.rectW
-    let dh = vg.rectH - gPfxOrigGeom.rectH
+  let rg0 = nuReadGeom(gPfxScrollHostT)
+  # 1. THE CLONE ROOT occupies exactly the authored SettingsPanel space. This
+  # used to be asked of the VIEWPORT, which is what forced the viewport to be
+  # stretched over the scrollbar's margin in the first place: a check that
+  # could only be satisfied by the defect. The root is the thing that must
+  # replace the panel; the viewport is deliberately narrower than it.
+  if gPfxOrigGeom.ok and rg0.ok:
+    let dw = rg0.rectW - gPfxOrigGeom.rectW
+    let dh = rg0.rectH - gPfxOrigGeom.rectH
     if dw > 1.0'f32 or dw < -1.0'f32 or dh > 1.0'f32 or dh < -1.0'f32:
       fails = fails + 1
       if why.len == 0:
-        why = "the viewport resolves to " & nuF(vg.rectW) & "x" &
-              nuF(vg.rectH) & " but the AUTHORED SettingsPanel was " &
+        why = "the scroll host root resolves to " & nuF(rg0.rectW) & "x" &
+              nuF(rg0.rectH) & " but the AUTHORED SettingsPanel was " &
               nuF(gPfxOrigGeom.rectW) & "x" & nuF(gPfxOrigGeom.rectH) &
               " -- the scroll region is not the space the panel occupied, " &
               "which is the inset-box defect"
+  # 1b. THE VIEWPORT IS AS WIDE AS THE DONOR'S, re-read LIVE off the Graphics
+  # page's own Viewport -- a different object than anything we wrote, so this
+  # can actually fail. A viewport as wide as its root is the defect the user
+  # reported: it leaves the scrollbar no margin and the bar draws through the
+  # slider values.
+  let dvg = nuReadGeom(gPfxDonorVpT)
+  if not dvg.ok:
+    warn "postfx rows SCROLL VERDICT: the DONOR Graphics Viewport could not " &
+         "be re-read, so 'viewport width == donor viewport width' is " &
+         "INCONCLUSIVE -- it is not being counted as a pass. The remaining " &
+         "checks still run."
+  else:
+    let dvw = vg.rectW - dvg.rectW
+    if dvw > 1.0'f32 or dvw < -1.0'f32:
+      fails = fails + 1
+      if why.len == 0:
+        why = "the viewport is " & nuF(vg.rectW) & " px wide but the DONOR " &
+              "Graphics viewport is " & nuF(dvg.rectW) &
+              " px -- the authored inset that leaves room for the scrollbar " &
+              "was not reproduced"
   # 2. the content is top-stretch and as wide as the viewport.
   if cg.aMinX > 0.01'f32 or cg.aMaxX < 0.99'f32 or
      cg.aMinY < 0.99'f32 or cg.aMaxY < 0.99'f32 or cg.pivY < 0.99'f32:
@@ -1147,6 +1344,122 @@ proc pfxScrollVerdict(rowParent: Il2CppPtr) =
                 nuF(bleft + bg.rectW) & " in a panel that spans " &
                 nuF(pg.rectX) & ".." & nuF(pg.rectX + pg.rectW) &
                 " -- it is drawn outside the page"
+  # 8. NO ROW IS UNDER THE SCROLLBAR. This is defect 1 stated as the thing the
+  # user actually sees, and it is the check that would have failed on the
+  # deployed build: every row's RIGHT edge must be strictly left of the bar's
+  # LEFT edge. Both are read from live rects and expressed in the CLONE ROOT's
+  # coordinate frame -- rows live three levels down (root -> Viewport ->
+  # Content -> row), so each hop's offset is composed rather than assumed.
+  # `nuChildEdgeInParent` answers in the PARENT's local frame, so converting a
+  # frame is (that edge) - (the parent's own rect.x).
+  var barLeftRoot = 0.0'f32
+  var haveBar = false
+  if gPfxScrollBarT != nil and rg0.ok:
+    let bg2 = nuReadGeom(gPfxScrollBarT)
+    if bg2.ok:
+      let (bok2, btop2, bleft2) = nuChildEdgeInParent(rg0, bg2)
+      discard btop2
+      if bok2:
+        barLeftRoot = bleft2
+        haveBar = true
+  if haveBar and rg0.ok:
+    let (vok, vtop, vleft) = nuChildEdgeInParent(rg0, vg)
+    discard vtop
+    let (cok2, ctop2, cleft2) = nuChildEdgeInParent(vg, cg)
+    discard ctop2
+    if vok and cok2:
+      let offVp = vleft - vg.rectX
+      let offCt = (cleft2 - cg.rectX) + offVp
+      var under = 0
+      var worst = 0.0'f32
+      var worstName = ""
+      var n2 = 0
+      if iChildCount(content, n2):
+        var i2 = 0
+        while i2 < n2 and i2 < 64:
+          let c2 = iChildAt(content, i2)
+          if c2 != nil and duOk(c2, 0x20'i32):
+            let go2 = iGameObjectOf(c2)
+            if go2 != nil and nuActiveInHierarchy(go2):
+              let rg2 = nuReadGeom(c2)
+              if rg2.ok:
+                let (rok2, rtop2, rleft2) = nuChildEdgeInParent(cg, rg2)
+                discard rtop2
+                if rok2:
+                  let right = rleft2 + rg2.rectW + offCt
+                  if right > barLeftRoot - 0.5'f32:
+                    under = under + 1
+                    if right - barLeftRoot > worst:
+                      worst = right - barLeftRoot
+                      worstName = iObjName(c2)
+          i2 = i2 + 1
+      if under > 0:
+        fails = fails + 1
+        if why.len == 0:
+          why = $under & " active row(s) extend past the scrollbar's left " &
+                "edge (" & nuF(barLeftRoot) & " in the scroll host's frame); " &
+                "the worst is '" & worstName & "', " & nuF(worst) &
+                " px under the bar -- this is the bar drawn through the " &
+                "slider values"
+    else:
+      warn "postfx rows SCROLL VERDICT: the Viewport/Content edges could not " &
+           "be expressed in the scroll host's frame, so 'no row under the " &
+           "scrollbar' is INCONCLUSIVE. It is not counted as a pass."
+  elif gPfxScrollBarT != nil:
+    warn "postfx rows SCROLL VERDICT: the scrollbar's rect could not be " &
+         "placed in the scroll host's frame, so 'no row under the scrollbar' " &
+         "is INCONCLUSIVE, not a pass."
+  # 9. SOMETHING WITH AN ACTIVE IMAGE COVERS THE VIEWPORT. Defect 2 as a
+  # finished-state property of the PAGE, not a re-read of what we moved: the
+  # background node is asked for its live rect and must cover the viewport's
+  # rect, both expressed in the PostFX 'Panel' frame.
+  var bgNote = "no background node was identified at graft time"
+  if gPfxBgT != nil and pg.ok and rg0.ok:
+    let bgg = nuReadGeom(gPfxBgT)
+    let bgGo2 = iGameObjectOf(gPfxBgT)
+    let bgAlive = (bgGo2 != nil and nuActiveInHierarchy(bgGo2))
+    let bgDraws = pfxHasImage(gPfxBgT)
+    let (rok3, rtop3, rleft3) = nuChildEdgeInParent(pg, rg0)
+    let (vok3, vtop3, vleft3) = nuChildEdgeInParent(rg0, vg)
+    if bgg.ok and rok3 and vok3:
+      # the background may hang off the Panel or off the clone root; both are
+      # resolved into the Panel frame the same way.
+      let par3 = modsParentOf(gPfxBgT)
+      let inRoot = (par3 != nil and par3 == gPfxScrollHostT)
+      let pgOff = (if inRoot: (rleft3 - rg0.rectX) else: 0.0'f32)
+      let pgOffY = (if inRoot: (rtop3 - (rg0.rectY + rg0.rectH)) else: 0.0'f32)
+      let (bok3, btop3, bleft3) = nuChildEdgeInParent(
+        (if inRoot: rg0 else: pg), bgg)
+      if bok3:
+        let bl = bleft3 + pgOff
+        let bt = btop3 + pgOffY
+        let vl = vleft3 + (rleft3 - rg0.rectX)
+        let vt = vtop3 + (rtop3 - (rg0.rectY + rg0.rectH))
+        let covers = bl <= vl + 1.0'f32 and
+                     bl + bgg.rectW >= vl + vg.rectW - 1.0'f32 and
+                     bt >= vt - 1.0'f32 and
+                     bt - bgg.rectH <= vt - vg.rectH + 1.0'f32
+        bgNote = "'" & iObjName(gPfxBgT) & "' " &
+                 (if bgAlive: "ACTIVE" else: "INACTIVE") & ", Image=" &
+                 (if bgDraws: "yes" else: "NO") & ", " & nuF(bgg.rectW) & "x" &
+                 nuF(bgg.rectH) & " against a " & nuF(vg.rectW) & "x" &
+                 nuF(vg.rectH) & " viewport"
+        if not (bgAlive and bgDraws and covers):
+          fails = fails + 1
+          if why.len == 0:
+            why = "the scroll area has no drawn background: " & bgNote &
+                  (if not covers: " -- it does not COVER the viewport rect"
+                   else: "")
+      else:
+        bgNote = "the background node's edges could not be placed"
+    else:
+      bgNote = "the background node's rect could not be read"
+  else:
+    fails = fails + 1
+    if why.len == 0:
+      why = "NO node was identified as drawing the scroll area's background. " &
+            "Census at graft time: " &
+            (if gPfxBgWhy.len > 0: gPfxBgWhy else: "not recorded")
   # 7. and there must be something to scroll at all.
   if cg.rectH <= vg.rectH:
     fails = fails + 1
@@ -1154,10 +1467,42 @@ proc pfxScrollVerdict(rowParent: Il2CppPtr) =
       why = "the content resolves to " & nuF(cg.rectH) &
             " px which is NOT taller than the " & nuF(vg.rectH) &
             " px viewport, so nothing can scroll"
+  # 10. THE FLASH. `gPfxGraftFrame` is Time.frameCount at the graft and
+  # `gPfxFirstActiveFrame` is the first frame the panel was observed ACTIVE.
+  # If the graft ran at or after that frame, at least one frame WAS rendered
+  # with the stock pre-graft layout -- which is exactly what the user sees as
+  # a flash on the first press of POSTFX. Unknown frame numbers are
+  # INCONCLUSIVE and never a pass.
+  var flashNote = ""
+  if gPfxGraftFrame < 0 or gPfxFirstActiveFrame < 0:
+    flashNote = "INCONCLUSIVE (graft frame " & $gPfxGraftFrame &
+                ", first active frame " & $gPfxFirstActiveFrame &
+                "; Time.get_frameCount unbound or the panel was never seen " &
+                "active) -- not counted as a pass"
+    warn "postfx rows SCROLL VERDICT: the flash check is " & flashNote & "."
+  elif gPfxGraftFrame >= gPfxFirstActiveFrame:
+    fails = fails + 1
+    flashNote = "FAILED: grafted at frame " & $gPfxGraftFrame &
+                " but the panel was already active at frame " &
+                $gPfxFirstActiveFrame
+    if why.len == 0:
+      why = "the page FLASHED: the graft ran at frame " & $gPfxGraftFrame &
+            ", at or after the panel's first ACTIVE frame " &
+            $gPfxFirstActiveFrame & ", so at least " &
+            $(gPfxGraftFrame - gPfxFirstActiveFrame + 1) &
+            " frame(s) were rendered with the stock pre-graft layout"
+  else:
+    flashNote = "PASS: grafted at frame " & $gPfxGraftFrame &
+                ", " & $(gPfxFirstActiveFrame - gPfxGraftFrame) &
+                " frame(s) BEFORE the panel first became active, so no frame " &
+                "was rendered with the pre-graft layout"
   if fails == 0:
-    okLog "postfx rows SCROLL VERDICT PASS: viewport " & nuF(vg.rectW) & "x" &
-          nuF(vg.rectH) & " matches the AUTHORED SettingsPanel rect within " &
-          "1 px; the content is top-stretch, " & nuF(cg.rectW) &
+    okLog "postfx rows SCROLL VERDICT PASS: the scroll host root matches the " &
+          "AUTHORED SettingsPanel rect within 1 px and the viewport keeps " &
+          "the DONOR's " & nuF(vg.rectW) & " px inset (so the scrollbar has " &
+          "its margin and no active row reaches it); background: " & bgNote &
+          "; first-frame: " & flashNote & "; the content is top-stretch, " &
+          nuF(cg.rectW) &
           " px wide (== the viewport) and " & nuF(cg.rectH) &
           " px tall (so there is something to scroll); the Viewport has " &
           "exactly ONE active child; all " & $rows & " active row(s) fit " &
@@ -1170,8 +1515,10 @@ proc pfxScrollVerdict(rowParent: Il2CppPtr) =
          " geometry check(s) failed): " & why & ". " & $rows &
          " active row(s) judged, viewport " & nuF(vg.rectW) & "x" &
          nuF(vg.rectH) & ", content " & nuF(cg.rectW) & "x" & nuF(cg.rectH) &
-         ", " & $activeKids & " active Viewport child(ren). This is the page " &
-         "the user is looking at, not a summary of what we wrote."
+         ", " & $activeKids & " active Viewport child(ren); background: " &
+         bgNote & "; first-frame: " & flashNote &
+         ". This is the page the user is looking at, not a summary of what " &
+         "we wrote."
 
 proc pfxOwnToggle(): Il2CppPtr =
   ## The `UpdatableToggle` inside OUR own 'enabled' row -- reached from the
@@ -1837,11 +2184,38 @@ proc pfxOnPanelUp(postUp: bool) =
   sbdTick()
   if not gPfxOn or gPfxOff:
     return
-  if not postUp:
-    return
+  # THE FIRST FRAME THE PANEL WAS ACTUALLY ACTIVE, latched once. Everything
+  # defect 3 claims is an ordering between this number and the graft's, so it
+  # is recorded before any gate that could skip it.
+  if postUp and gPfxFirstActiveFrame < 0:
+    gPfxFirstActiveFrame = int(pfxFrameNow())
   if not gPfxBuilt:
-    if gPfxTried < 4:
+    # DEFECT 3: BUILD WHILE THE PANEL IS STILL HIDDEN.
+    #
+    # This used to `return` above unless `postUp`, so the rows and the whole
+    # scroll graft ran on the FIRST panel-up tick -- i.e. after Unity had
+    # already rendered the stock layout at least once. That single frame is
+    # the flash the user reports on the first press of POSTFX.
+    #
+    # Nothing in the build needs the panel to be visible: `_settingsRoot@0xa0`
+    # is a SERIALIZED field populated when the prefab loads, `GetComponent`
+    # and `Instantiate` both work on inactive objects, and the layout is
+    # rebuilt for free when the panel is finally activated -- Unity runs
+    # `OnEnable` on the whole subtree then, and `LayoutGroup::OnEnable` /
+    # `ContentSizeFitter::OnEnable` both `SetDirty`, so the first rendered
+    # frame is already the grafted one.
+    #
+    # The try budget is SPLIT rather than shared: at most 2 attempts while
+    # hidden, so a build that can only succeed once the panel is up still has
+    # attempts left. Merging them would let a hidden-only failure mode burn
+    # the whole budget and silently produce no rows at all.
+    if postUp:
+      if gPfxTried < 4:
+        discard pfxBuild()
+    elif gPfxTried < 2:
       discard pfxBuild()
+    return
+  if not postUp:
     return
   # DEFECT 3, polled. One toggle read per frame; the 26 writes only on the
   # edge. It runs BEFORE the row verdict so that a gray-out fault is reported
@@ -1861,6 +2235,9 @@ proc pfxOnScreenClosed() =
   gPfxVerdictSaid = false
   gPfxScrollSaid = false
   gPfxGraySaid = false
+  # The next visit is a fresh "when did this panel first become active", so
+  # the flash check judges THAT visit and not a stale pairing.
+  gPfxFirstActiveFrame = -1
   # The scroll host is ours and lives under the PostFX panel; if that panel is
   # gone the clone went with it, so the handle must not survive as a pointer
   # into a destroyed object. Dropped BEFORE the row tear-down below, because
