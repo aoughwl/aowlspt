@@ -107,6 +107,11 @@ export place
 #define MHUD_MODE_RADAR   1
 #define MHUD_MODE_NORTHUP 2
 #define MHUD_MODE_HEADUP  3
+/* BOTH -- the minimap AND the radar on screen at once, two panes through the
+ * ONE pane renderer. It is the only mode for which more than one pane per
+ * dispatch is legal, and that legality is EXPRESSED as a number (paneExpect)
+ * that the ledger compares against, never as an exemption from the check. */
+#define MHUD_MODE_BOTH    4
 
 /* Where the small widget sits. MANUAL is the historical behaviour and stays
  * the value an existing config resolves to, so nobody's widget moves because
@@ -340,6 +345,36 @@ static struct {
     int32_t  paneCalls;
     int64_t  paneCallsOver;
     int64_t  paneCallsTotal;
+    /* How many panes THIS dispatch was entitled to draw, written at the top of
+     * the draw section from the resolved mode BEFORE any pane is drawn. 1 for
+     * every single-surface mode and for the overlay, 2 for MHUD_MODE_BOTH, 0
+     * when nothing is selected. `paneCallsOver` compares against this instead
+     * of against a hardcoded 1, so BOTH does not weaken the assertion: a third
+     * pane, or a second pane in a single-surface mode, still raises it. */
+    int32_t  paneExpect;
+    int64_t  paneCallsUnder;   /* fewer panes than the mode entitled us to */
+
+    /* ---- THE RADAR SUB-WIDGET, used only by MHUD_MODE_BOTH ---------------
+     * In every other mode the one widget uses mapSize / the widget anchor.
+     * BOTH needs a second rect or the two panes sit exactly on top of each
+     * other, so the radar keeps the EXISTING radarX/radarY/radarSize fields
+     * (already fed by mhud_configure) and gains only its own anchor. Reusing
+     * them rather than adding a parallel set is deliberate: two sources for one
+     * rect is how `radarSize` became storable and inert in the first place. */
+    int32_t  radarAnchor;
+    float    radarWx, radarWy;   /* the origin the radar anchor resolved to */
+    int32_t  radarPrims;         /* radar submissions, most recent frame */
+    int32_t  mapPrims;           /* minimap submissions, most recent frame */
+
+    /* ---- THE BOUNDED DRAW VERDICT --------------------------------------
+     * `raidFrames` counts dispatches that got PAST the in-raid lifecycle gate
+     * -- i.e. frames on which drawing was genuinely possible. It exists so the
+     * "nothing drew" question stops being an eternal INCONCLUSIVE: a mode is
+     * selected, N in-raid dispatches have gone by, and the renderer has still
+     * submitted nothing is a FAIL, and N is finite. Counted after the gate,
+     * from the gate's own decision, so it can never count menu frames. */
+    int64_t  raidFrames;
+    int64_t  raidDrew;         /* ... of those, ones that submitted geometry */
     /* The rect the renderer was LAST handed, recorded by the renderer itself
      * rather than by the caller, so the full-screen check compares the pane
      * that was actually drawn against the screen square it should have been. */
@@ -691,6 +726,11 @@ static void mhud_reset(void) {
     g_mhud.fsSpanM        = 1200.0f;
     g_mhud.fsZoom         = 1.0f;
     g_mhud.fsOpacity      = 0.92f;
+    /* The radar sub-widget's anchor, for BOTH. MANUAL is the legacy placement,
+     * so an existing config's radar does not move because BOTH exists.
+     * radarX/radarY/radarSize are set by mhud_configure and are NOT re-set
+     * here -- one owner per field. */
+    g_mhud.radarAnchor    = MHUD_ANCHOR_MANUAL;
 }
 
 /* ---- the mirror, filled on Unity's thread before the draw ------------- */
@@ -913,7 +953,7 @@ static void mhud_configure_pane(int32_t mode, float zoom, float opacity,
                                 int32_t drawArt, float contactPx,
                                 uint32_t colBot, uint32_t colPlayer,
                                 uint32_t colSelf) {
-    g_mhud.mode = (mode >= MHUD_MODE_OFF && mode <= MHUD_MODE_HEADUP)
+    g_mhud.mode = (mode >= MHUD_MODE_OFF && mode <= MHUD_MODE_BOTH)
                   ? mode : MHUD_MODE_OFF;
     g_mhud.zoom = (zoom >= 0.1f && zoom <= 16.0f) ? zoom : 1.0f;
     g_mhud.opacity = opacity < 0.05f ? 0.05f : (opacity > 1.0f ? 1.0f : opacity);
@@ -928,8 +968,29 @@ static void mhud_configure_pane(int32_t mode, float zoom, float opacity,
      * mirrorDrift, armFeed's art gate -- keeps working and can no longer be
      * put into a state the draw does not actually implement. */
     g_mhud.mapOn   = (g_mhud.mode == MHUD_MODE_NORTHUP ||
-                      g_mhud.mode == MHUD_MODE_HEADUP) ? 1 : 0;
-    g_mhud.radarOn = (g_mhud.mode == MHUD_MODE_RADAR) ? 1 : 0;
+                      g_mhud.mode == MHUD_MODE_HEADUP  ||
+                      g_mhud.mode == MHUD_MODE_BOTH) ? 1 : 0;
+    g_mhud.radarOn = (g_mhud.mode == MHUD_MODE_RADAR ||
+                      g_mhud.mode == MHUD_MODE_BOTH) ? 1 : 0;
+}
+
+/* How many panes the resolved mode entitles ONE dispatch to draw. The overlay
+ * replaces the widget entirely, so it is 1 whatever the mode. This is the
+ * number `paneCallsOver` compares against; it is derived from the mode here,
+ * once, so the ledger and the draw cannot disagree about what BOTH means. */
+static int32_t mhud_pane_expect(void) {
+    if (g_mhud.fsOn) return 1;
+    if (g_mhud.mode == MHUD_MODE_OFF) return 0;
+    if (g_mhud.mode == MHUD_MODE_BOTH) return 2;
+    return 1;
+}
+
+/* The radar sub-widget's placement, used ONLY by MHUD_MODE_BOTH. Separate from
+ * mhud_configure_chrome so that a config with no radar keys keeps the legacy
+ * radar geometry rather than silently inheriting the minimap's. */
+static void mhud_configure_radar(int32_t anchor) {
+    g_mhud.radarAnchor = (anchor >= MHUD_ANCHOR_MANUAL && anchor <= MHUD_ANCHOR_BR)
+                         ? anchor : MHUD_ANCHOR_MANUAL;
 }
 
 /* Placement and chrome. Separate from mhud_configure_pane only so that an old
@@ -956,24 +1017,41 @@ static void mhud_configure_chrome(int32_t anchor, int32_t border,
  * widget cannot be pushed entirely off the back buffer by a large inset -- an
  * off-screen widget and a widget that never armed look identical to the
  * player, and that is the ambiguity this clamp removes. */
-static void mhud_widget_origin(float scrW, float scrH, float size,
-                               float* ox, float* oy) {
-    float x = g_mhud.mapX, y = g_mhud.mapY;
-    switch (g_mhud.anchor) {
-        case MHUD_ANCHOR_TL: x = g_mhud.mapX;                    y = g_mhud.mapY;                    break;
-        case MHUD_ANCHOR_TR: x = scrW - size - g_mhud.mapX;      y = g_mhud.mapY;                    break;
-        case MHUD_ANCHOR_BL: x = g_mhud.mapX;                    y = scrH - size - g_mhud.mapY;      break;
-        case MHUD_ANCHOR_BR: x = scrW - size - g_mhud.mapX;      y = scrH - size - g_mhud.mapY;      break;
-        default: break;   /* MANUAL: mapX/mapY verbatim */
+static void mhud_origin_of(int32_t anchor, float ix, float iy,
+                           float scrW, float scrH, float size,
+                           float* ox, float* oy) {
+    float x = ix, y = iy;
+    switch (anchor) {
+        case MHUD_ANCHOR_TL: x = ix;                    y = iy;                    break;
+        case MHUD_ANCHOR_TR: x = scrW - size - ix;      y = iy;                    break;
+        case MHUD_ANCHOR_BL: x = ix;                    y = scrH - size - iy;      break;
+        case MHUD_ANCHOR_BR: x = scrW - size - ix;      y = scrH - size - iy;      break;
+        default: break;   /* MANUAL: the insets verbatim */
     }
-    if (g_mhud.anchor != MHUD_ANCHOR_MANUAL) {
+    if (anchor != MHUD_ANCHOR_MANUAL) {
         if (x < 0.0f) x = 0.0f;
         if (y < 0.0f) y = 0.0f;
         if (x > scrW - size) x = (scrW - size) > 0.0f ? (scrW - size) : 0.0f;
         if (y > scrH - size) y = (scrH - size) > 0.0f ? (scrH - size) : 0.0f;
     }
-    g_mhud.wx = x; g_mhud.wy = y;
     *ox = x; *oy = y;
+}
+
+static void mhud_widget_origin(float scrW, float scrH, float size,
+                               float* ox, float* oy) {
+    mhud_origin_of(g_mhud.anchor, g_mhud.mapX, g_mhud.mapY,
+                   scrW, scrH, size, ox, oy);
+    g_mhud.wx = *ox; g_mhud.wy = *oy;
+}
+
+/* The radar sub-widget's origin, through the SAME resolver -- so a corner
+ * behaves identically for both panes and there is no second placement rule to
+ * drift. Recorded separately so `both` can be diagnosed without a screenshot. */
+static void mhud_radar_origin(float scrW, float scrH, float size,
+                              float* ox, float* oy) {
+    mhud_origin_of(g_mhud.radarAnchor, g_mhud.radarX, g_mhud.radarY,
+                   scrW, scrH, size, ox, oy);
+    g_mhud.radarWx = *ox; g_mhud.radarWy = *oy;
 }
 
 static void mhud_configure_fs(float margin, float spanM, float zoom,
@@ -2074,6 +2152,13 @@ static void mhud_draw(void* user, int64_t frame) {
         g_mhud.heldValid = 0;
         return;
     }
+    /* PAST THE LIFECYCLE GATE. Drawing is genuinely possible from here on, so
+     * this is the frame count the bounded draw verdict is allowed to use. It is
+     * bumped from the gate's own decision rather than from a belief about the
+     * raid, and it is what turns "nothing drew" from a permanent INCONCLUSIVE
+     * into a FAIL after a finite number of frames. */
+    g_mhud.raidFrames++;
+
     if (g_mhud.hasLocal) {
         /* A fresh centre: draw it, and remember it as the held frame so the
          * dispatches that arrive between the next two publishes can re-draw it. */
@@ -2194,8 +2279,14 @@ static void mhud_draw(void* user, int64_t frame) {
      * showing 120 m would be a very large radar. */
     g_mhud.fsSmallPrims = 0;
     g_mhud.fsLastPrims  = 0;
-    /* Zeroed per dispatch; the renderer bumps it. See paneCallsOver. */
+    /* Zeroed per dispatch; the renderer bumps it. See paneCallsOver. The
+     * entitlement is resolved from the mode HERE, before any pane is drawn, so
+     * the ledger's expectation cannot be written after the fact to match what
+     * happened. */
     g_mhud.paneCalls    = 0;
+    g_mhud.paneExpect   = mhud_pane_expect();
+    g_mhud.mapPrims     = 0;
+    g_mhud.radarPrims   = 0;
 
     if (g_mhud.fsOn) {
         /* Full-screen: a centred square, inset by the margin, sized to the
@@ -2235,20 +2326,41 @@ static void mhud_draw(void* user, int64_t frame) {
          * draws NO art; the two minimap modes take theirs from `mapSpanM` and
          * differ only in whether `rot` is the measured heading or zero -- which
          * is decided once, above, so art, grid and blips share one transform. */
-        int32_t radar = (g_mhud.mode == MHUD_MODE_RADAR);
-        float baseSpan = radar ? g_mhud.radiusM * 2.0f : g_mhud.mapSpanM;
-        float span = baseSpan / (g_mhud.zoom > 0.1f ? g_mhud.zoom : 1.0f);
-        float cull = radar ? (span * 0.5f) : 0.0f;
         int64_t _tp = mhud_now_us(), _tpd;
         float ox, oy;
-        /* The anchor is resolved against the MEASURED back buffer, so a corner
-         * mode holds its corner at any resolution. MANUAL reproduces the old
-         * absolute placement exactly. */
-        mhud_widget_origin(scrW, scrH, g_mhud.mapSize, &ox, &oy);
-        g_mhud.fsSmallPrims = mhud_draw_pane_full(
-            ox, oy, g_mhud.mapSize, span,
-            (g_mhud.mode == MHUD_MODE_NORTHUP) ? 0.0f : rot,
-            radar ? 0 : 1, g_mhud.opacity, cull);
+        float zoom = (g_mhud.zoom > 0.1f ? g_mhud.zoom : 1.0f);
+
+        /* THE MINIMAP PANE -- northup, headingup, and the map half of BOTH.
+         * `mapOn`/`radarOn` are derived from the mode in mhud_configure_pane,
+         * so these two ifs are the mode, not a second interpretation of it. */
+        if (g_mhud.mapOn) {
+            float span = g_mhud.mapSpanM / zoom;
+            /* The anchor is resolved against the MEASURED back buffer, so a
+             * corner mode holds its corner at any resolution. MANUAL
+             * reproduces the old absolute placement exactly. */
+            mhud_widget_origin(scrW, scrH, g_mhud.mapSize, &ox, &oy);
+            g_mhud.mapPrims = mhud_draw_pane_full(
+                ox, oy, g_mhud.mapSize, span,
+                (g_mhud.mode == MHUD_MODE_NORTHUP) ? 0.0f : rot,
+                1, g_mhud.opacity, 0.0f);
+        }
+
+        /* THE RADAR PANE -- radar mode, and the radar half of BOTH. Radius-
+         * culled, no art. In BOTH it takes its own rect; alone it keeps the
+         * widget's, so nothing about single-surface radar moves. */
+        if (g_mhud.radarOn) {
+            float span = (g_mhud.radiusM * 2.0f) / zoom;
+            float rsize = (g_mhud.mode == MHUD_MODE_BOTH)
+                          ? g_mhud.radarSize : g_mhud.mapSize;
+            if (g_mhud.mode == MHUD_MODE_BOTH)
+                mhud_radar_origin(scrW, scrH, rsize, &ox, &oy);
+            else
+                mhud_widget_origin(scrW, scrH, rsize, &ox, &oy);
+            g_mhud.radarPrims = mhud_draw_pane_full(
+                ox, oy, rsize, span, rot, 0, g_mhud.opacity, span * 0.5f);
+        }
+
+        g_mhud.fsSmallPrims = g_mhud.mapPrims + g_mhud.radarPrims;
         _tpd = mhud_now_us() - _tp;
         if (_tpd > g_mhud.paneUsPeak) g_mhud.paneUsPeak = _tpd;
     }
@@ -2257,7 +2369,11 @@ static void mhud_draw(void* user, int64_t frame) {
      * This counts the renderer's own entries, so it fails loudly if a second
      * draw path is ever added -- it is not a claim that the code above has an
      * else-if. */
-    if (g_mhud.paneCalls > 1) g_mhud.paneCallsOver++;
+    if (g_mhud.paneCalls > g_mhud.paneExpect) g_mhud.paneCallsOver++;
+    /* AND THE OTHER DIRECTION, which the old hardcoded check could not express:
+     * BOTH was selected and only one pane was drawn. Without this, dropping a
+     * pane would read as a clean run. */
+    else if (g_mhud.paneCalls < g_mhud.paneExpect) g_mhud.paneCallsUnder++;
 
     /* THE OPPOSITE ASSERTION -- "NOTHING DREW" MUST NEVER READ AS A PASS.
      *
@@ -2268,9 +2384,10 @@ static void mhud_draw(void* user, int64_t frame) {
      * is an invariant the diag can also check. */
     if (g_mhud.fsOn || g_mhud.mode != MHUD_MODE_OFF) {
         g_mhud.selFrames++;
-        if ((int32_t)(g_mhud.fsLastPrims + g_mhud.fsSmallPrims) > 0)
+        if ((int32_t)(g_mhud.fsLastPrims + g_mhud.fsSmallPrims) > 0) {
             g_mhud.selDrew++;
-        else
+            g_mhud.raidDrew++;
+        } else
             g_mhud.selBlank++;
     }
 
@@ -2521,6 +2638,7 @@ static float   mhud_live_fsopacity(void) { return g_mhud.fsOpacity; }
 static int32_t mhud_live_fsnorthup(void) { return g_mhud.fsNorthUp; }
 
 static int32_t mhud_live_anchor(void)    { return g_mhud.anchor; }
+static int32_t mhud_live_radaranchor(void) { return g_mhud.radarAnchor; }
 static int32_t mhud_live_border(void)    { return g_mhud.border; }
 static int32_t mhud_live_northpip(void)  { return g_mhud.northPip; }
 static float   mhud_live_borderpx(void)  { return g_mhud.borderPx; }
@@ -2547,6 +2665,14 @@ static int64_t mhud_live_fadems(void)    { return g_mhud.fadeMs; }
 /* THE THREE FALSIFIABLE LEDGERS. Each can be non-zero on the failing side. */
 static int64_t mhud_pane_calls_total(void) { return g_mhud.paneCallsTotal; }
 static int64_t mhud_pane_calls_over(void)  { return g_mhud.paneCallsOver; }
+static int64_t mhud_pane_calls_under(void) { return g_mhud.paneCallsUnder; }
+static int32_t mhud_pane_expect_last(void) { return g_mhud.paneExpect; }
+static int64_t mhud_raid_frames(void)      { return g_mhud.raidFrames; }
+static int64_t mhud_raid_drew(void)        { return g_mhud.raidDrew; }
+static int32_t mhud_map_prims(void)        { return g_mhud.mapPrims; }
+static int32_t mhud_radar_prims(void)      { return g_mhud.radarPrims; }
+static float   mhud_radar_wx(void)         { return g_mhud.radarWx; }
+static float   mhud_radar_wy(void)         { return g_mhud.radarWy; }
 static int64_t mhud_sel_frames(void)       { return g_mhud.selFrames; }
 static int64_t mhud_sel_drew(void)         { return g_mhud.selDrew; }
 static int64_t mhud_sel_blank(void)        { return g_mhud.selBlank; }
@@ -2815,6 +2941,7 @@ proc cHudConfigureChrome(anchor, border: int32; borderPx, backdropA: cfloat;
                          northPip: int32) {.
   importc: "mhud_configure_chrome", nodecl.}
 proc cHudLiveAnchor(): int32 {.importc: "mhud_live_anchor", nodecl.}
+proc cHudLiveRadarAnchor(): int32 {.importc: "mhud_live_radaranchor", nodecl.}
 proc cHudLiveBorder(): int32 {.importc: "mhud_live_border", nodecl.}
 proc cHudLiveNorthPip(): int32 {.importc: "mhud_live_northpip", nodecl.}
 proc cHudFsKeyDowns(): int64 {.importc: "mhud_fs_keydowns", nodecl.}
@@ -2840,6 +2967,15 @@ proc cHudLiveHoldMs(): int64 {.importc: "mhud_live_holdms", nodecl.}
 proc cHudLiveFadeMs(): int64 {.importc: "mhud_live_fadems", nodecl.}
 proc cHudPaneCallsTotal(): int64 {.importc: "mhud_pane_calls_total", nodecl.}
 proc cHudPaneCallsOver(): int64 {.importc: "mhud_pane_calls_over", nodecl.}
+proc cHudPaneCallsUnder(): int64 {.importc: "mhud_pane_calls_under", nodecl.}
+proc cHudPaneExpect(): int32 {.importc: "mhud_pane_expect_last", nodecl.}
+proc cHudRaidFrames(): int64 {.importc: "mhud_raid_frames", nodecl.}
+proc cHudRaidDrew(): int64 {.importc: "mhud_raid_drew", nodecl.}
+proc cHudMapPrims(): int32 {.importc: "mhud_map_prims", nodecl.}
+proc cHudRadarPrims(): int32 {.importc: "mhud_radar_prims", nodecl.}
+proc cHudRadarWx(): cfloat {.importc: "mhud_radar_wx", nodecl.}
+proc cHudRadarWy(): cfloat {.importc: "mhud_radar_wy", nodecl.}
+proc cHudConfigureRadar(anchor: int32) {.importc: "mhud_configure_radar", nodecl.}
 proc cHudSelFrames(): int64 {.importc: "mhud_sel_frames", nodecl.}
 proc cHudSelDrew(): int64 {.importc: "mhud_sel_drew", nodecl.}
 proc cHudSelBlank(): int64 {.importc: "mhud_sel_blank", nodecl.}
@@ -2920,6 +3056,12 @@ proc hudRebaseMsMax*(): int64 = cHudRebaseMsMax()
 
 # ---- the widget's placement/chrome, read back from the LIVE mirror --------
 proc hudLiveAnchor*(): int = int(cHudLiveAnchor())
+proc hudLiveRadarAnchor*(): int = int(cHudLiveRadarAnchor())
+  ## The radar sub-widget anchor AS THE RENDER THREAD SEES IT. Mirrored, not
+  ## remembered: the reconcile compares config.json against this, so a
+  ## radarAnchor that was stored and never pushed reads as drift instead of
+  ## agreeing with itself. That divergence is exactly how `radarSize` was
+  ## storable and inert for a whole release.
 proc hudLiveScreenW*(): float = float(cHudLiveScreenW())
 proc hudLiveScreenH*(): float = float(cHudLiveScreenH())
 proc hudLiveRadarSize*(): float = float(cHudLiveRadarSize())
@@ -2974,6 +3116,22 @@ proc hudWidgetY*(): float = float(cHudLiveWy())
 # ---- the three falsifiable ledgers ---------------------------------------
 proc hudPaneCalls*(): int64 = cHudPaneCallsTotal()
 proc hudPaneCallsOver*(): int64 = cHudPaneCallsOver()
+proc hudPaneCallsUnder*(): int64 = cHudPaneCallsUnder()
+  ## Dispatches on which FEWER panes were rendered than the resolved mode
+  ## entitled us to. `both` losing one of its two surfaces is the failure this
+  ## counts; the old hardcoded `> 1` check could not express it at all.
+proc hudPaneExpect*(): int = int(cHudPaneExpect())
+proc hudRaidFrames*(): int64 = cHudRaidFrames()
+  ## Dispatches that got PAST the in-raid lifecycle gate. This is the clock the
+  ## bounded draw verdict runs on -- see `drawVerdictFrames`.
+proc hudRaidDrew*(): int64 = cHudRaidDrew()
+proc hudMapPrims*(): int = int(cHudMapPrims())
+proc hudRadarPrims*(): int = int(cHudRadarPrims())
+  ## The two panes' most recent submissions, kept APART so `both` can be
+  ## diagnosed: a mode that draws one surface and silently drops the other is
+  ## the exact failure a combined count would hide.
+proc hudRadarWx*(): float = float(cHudRadarWx())
+proc hudRadarWy*(): float = float(cHudRadarWy())
 proc hudSelFrames*(): int64 = cHudSelFrames()
   ## Dispatches on which the config had SELECTED a surface to draw.
 proc hudSelDrew*(): int64 = cHudSelDrew()
@@ -3167,6 +3325,11 @@ type
     ## PLACEMENT AND CHROME. `anchor` 0 = manual (mapX/mapY are absolute),
     ## 1..4 = TL/TR/BL/BR with mapX/mapY read as an inset from that corner.
     anchor*: int
+    radarAnchor*: int
+      ## The RADAR sub-widget's anchor, read only in `both`. In every other mode
+      ## there is one pane and `anchor` places it; in `both` the two panes need
+      ## two rects or they land on top of each other. The radar's SIZE and inset
+      ## stay the existing radarSize/radarX/radarY keys -- one owner per field.
     border*: bool
     northPip*: bool      ## draw the amber NORTH pip near the pane centre
     borderPx*: float
@@ -3193,28 +3356,26 @@ type
       ## historical behaviour; see MHUD_FSACT_* in the C above for why HOLD is a
       ## level read rather than an edge pair.
 
-const
-  ModeOff*     = 0
-  ModeRadar*   = 1
-  ModeNorthUp* = 2
-  ModeHeadUp*  = 3
-
+# THE MODE TABLE MOVED to mods/maps/core/place.nim, for the reason the anchor
+# table did: the offline suite can reach `core/` and cannot reach this file, and
+# `spatialMode` was the one enum in this mod whose schema list was never checked
+# against its own parser. `ModeOff..ModeBoth`, `modeNameOf`, `modeOfName`,
+# `modeRecognisedName`, `modeOptions` and `modePanesExpected` come in through
+# `export place` at the top of this file.
+#
+# These two thin aliases keep every existing call site compiling unchanged.
+# `modeName` deliberately keeps its LONGER, human spellings for the log --
+# "minimap-northup" reads better in a diag than "northup" -- while
+# `modeNameOf` is the CONFIG spelling that must round-trip. Two names for two
+# jobs; the offline suite round-trips the config one, which is the one a player
+# can get wrong.
 proc modeName*(m: int): string =
   case m
-  of ModeRadar:   "radar"
   of ModeNorthUp: "minimap-northup"
   of ModeHeadUp:  "minimap-headingup"
-  else:           "off"
+  else:           modeNameOf(m)
 
-proc modeOf*(s: string): int =
-  ## Names, not magic numbers, in config.json. An UNRECOGNISED name is `off` --
-  ## a refusal the diag reports by name, never a silent fall-through to some
-  ## mode the player did not ask for.
-  case s
-  of "radar":             ModeRadar
-  of "northup", "minimap", "north-up": ModeNorthUp
-  of "headingup", "heading-up", "rotating": ModeHeadUp
-  else:                   ModeOff
+proc modeOf*(s: string): int = modeOfName(s)
 
 # THE ANCHOR TABLE MOVED to mods/maps/core/place.nim -- AnchorManual/TL/TR/BL/BR,
 # `anchorOfName` and `anchorRecognisedName` are re-exported above. These three
@@ -3327,6 +3488,7 @@ proc hudInit*(o: HudOpts) =
                     (if o.drawArt: 1'i32 else: 0'i32), cfloat(o.contactPx),
                     o.colBot, o.colPlayer, o.colSelf)
   hudPushClasses(o)
+  cHudConfigureRadar(int32(o.radarAnchor))
   cHudConfigureChrome(int32(o.anchor), (if o.border: 1'i32 else: 0'i32),
                       cfloat(o.borderPx), cfloat(o.backdropOpacity),
                       (if o.northPip: 1'i32 else: 0'i32))
@@ -3379,6 +3541,7 @@ proc hudReconfigure*(o: HudOpts; live: bool) =
                     (if o.drawArt: 1'i32 else: 0'i32), cfloat(o.contactPx),
                     o.colBot, o.colPlayer, o.colSelf)
   hudPushClasses(o)
+  cHudConfigureRadar(int32(o.radarAnchor))
   cHudConfigureChrome(int32(o.anchor), (if o.border: 1'i32 else: 0'i32),
                       cfloat(o.borderPx), cfloat(o.backdropOpacity),
                       (if o.northPip: 1'i32 else: 0'i32))
@@ -3606,5 +3769,5 @@ proc spatialModeSurfaces*(o: var HudOpts) =
   ## are now a VIEW of `mode` rather than independent switches, so the state
   ## "map on AND radar on" -- which the draw never implemented -- is no longer
   ## reachable from any config.
-  o.map   = (o.mode == ModeNorthUp or o.mode == ModeHeadUp)
-  o.radar = (o.mode == ModeRadar)
+  o.map   = (o.mode == ModeNorthUp or o.mode == ModeHeadUp or o.mode == ModeBoth)
+  o.radar = (o.mode == ModeRadar or o.mode == ModeBoth)

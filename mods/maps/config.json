@@ -39,6 +39,18 @@
   "_renderer": "mapsRenderer picks WHICH KEY SET owns the one map draw path (mhud_draw_pane_full). 'unified' -- the shipped value -- means spatialMode owns it and the LEGACY hudRadar/hudMap/radarX/radarY/radarSize keys are NOT read, so turning a Legacy toggle off can no longer leave nothing drawing (the reported bug). 'legacy' hands ownership back to the old pair and spatialMode is not read. 'auto' is what a config written before this key gets: legacy owns it only while spatialMode is unwritten, which is the migration behaviour and is exactly the state the bug lived in. The loser is deselected, never unbound -- switching applies live.",
   "mapsRenderer": "unified",
 
+  "_both": "spatialMode `both` draws the minimap AND the radar at once -- two panes in one dispatch, through the ONE pane renderer, so they cannot drift apart. It is the only mode entitled to more than one pane, and that entitlement is a NUMBER the draw ledger compares against (paneCallsOver counts panes above it, paneCallsUnder panes below it), never an exemption from the check. `both` is also the only mode in which radarAnchor/radarX/radarY/radarSize are live geometry rather than migration-only keys: the two panes need two rects or they land exactly on top of each other. radarAnchor defaults to `manual`, which is the historical absolute placement, so taking this build moves nobody's radar.",
+  "radarAnchor": "manual",
+
+  "_markers": "The four marker kinds are declared as SEPARATE rows and every one is implemented=false, for the reason the umbrella `markers` key already carried: on build 1.1.0.1.46777 no field offset has been measured for the loot, extract, quest or dead lists, and sp/world.nim walks the ALIVE players list only. Naming them per kind does not make any of them draw -- it makes the refusal specific about which measurement is missing, instead of one switch that silently does nothing.",
+  "markerLoot": false,
+  "markerExtracts": false,
+  "markerQuests": false,
+  "markerCorpses": false,
+
+  "_drawVerdict": "drawVerdictFrames bounds the draw verdict. `a surface is selected and nothing has drawn YET` is true on frame 3 and is a defect on frame 3000, and unbounded it is a verdict no input could falsify. The clock is dispatches that got PAST the in-raid lifecycle gate, counted by the C renderer, so menu frames cannot spend it; once it is exhausted the maps diag says FAIL and names the mode. It may be large. It may not be infinite.",
+  "drawVerdictFrames": 300,
+
   "_widget": "ONE spatial widget replaces the separate hudRadar/hudMap surfaces. spatialMode 'auto' means: derive the mode from the legacy hudRadar/hudMap/heading keys above, so an existing config keeps the surface it had (a migrated radar also carries radarX/radarY/radarSize into mapX/mapY/mapSize). Pick any other mode and the legacy keys stop being consulted.",
   "spatialMode": "auto",
   "zoom": 1.0,

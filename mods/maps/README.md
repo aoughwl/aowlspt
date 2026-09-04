@@ -154,3 +154,52 @@ Live, needs a raid — this is the part nobody has run:
 
 Step 4 is the one that matters. Steps 1–3 only prove numbers are arriving —
 they cannot prove the numbers mean what the map says they mean.
+
+## `both`, and the bounded draw verdict (2026-09-04)
+
+**`spatialMode="both"` draws the minimap and the radar at once** — two panes in
+one dispatch, both through `mhud_draw_pane_full`, the one pane renderer, so the
+two surfaces cannot drift apart. It is the only mode entitled to a second pane,
+and that entitlement is a NUMBER (`mhud_pane_expect`, resolved from the mode
+*before* any pane is drawn) that the ledger compares against — not an exemption
+from the check. `paneCallsOver` still catches a third pane; the new
+`paneCallsUnder` catches the opposite and quieter failure, `both` selected and
+only one surface drawn, which the old hardcoded `> 1` test could not express at
+all.
+
+`both` is also the only mode in which `radarAnchor` / `radarX` / `radarY` /
+`radarSize` are live geometry rather than migration-only keys: two panes need
+two rects or they land exactly on top of each other. `radarAnchor` defaults to
+`manual`, the historical absolute placement, so no existing radar moves, and it
+goes through the same anchor resolver as the widget — one placement rule, not
+two that can disagree. It is mirrored (`hudLiveRadarAnchor`) and compared by the
+reconcile, so a value stored and never pushed reads as DRIFT rather than
+agreeing with itself.
+
+**`drawVerdictFrames` bounds the draw verdict.** "A surface is selected and
+nothing has drawn *yet*" is true on frame 3 and a defect on frame 3000, and
+unbounded it is a verdict no input could falsify — the exact shape §9b is about.
+The clock is dispatches that got past the in-raid lifecycle gate
+(`mhud_raid_frames`), counted by the C renderer, so menu frames cannot spend it.
+Past the budget the diag says FAIL and names the mode.
+
+**The mode table moved to `core/place.nim`.** `spatialMode` was the one enum in
+this mod whose schema list was never checked against its own parser — precisely
+the defect `widgetAnchor` shipped — because the table lived in `sp/hud.nim`,
+which the offline suite cannot reach. The suite now asserts that every spelling
+the schema offers is recognised, that the canonical spellings round-trip, that a
+typo resolves to OFF and not to some third surface, and that no single-surface
+mode claims two panes.
+
+**The four marker kinds are named, and every one is `implemented=false`.**
+Splitting the umbrella `markers` switch into `markerLoot` / `markerExtracts` /
+`markerQuests` / `markerCorpses` makes nothing draw. It makes the refusal
+specific about which measurement is missing per kind — no field offset has been
+taken on build 1.1.0.1.46777 for the loot, exfiltration, quest or dead lists,
+and `sp/world.nim` walks the ALIVE players list only. A switch that stores a
+value and silently does nothing would be worse than an absent one.
+
+**Unverified:** none of the above has been seen in a running raid — a subagent
+may not start the game. `both`'s two-pane draw, the radar anchor's live
+placement and the bounded FAIL are asserted offline and by counters the live
+diag prints; that is evidence, not proof.

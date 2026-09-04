@@ -326,3 +326,80 @@ proc enemyPolicyOptions*(): seq[string] =
 
 proc anchorOptions*(): seq[string] =
   result = @["manual", "topleft", "topright", "bottomleft", "bottomright"]
+
+# ---------------------------------------------------------------------------
+# THE SPATIAL WIDGET'S MODE
+# ---------------------------------------------------------------------------
+#
+# This lived in sp/hud.nim, beside the C renderer, where the offline suite could
+# not reach it -- so `spatialMode` was the ONE enum in this mod whose schema
+# list was never checked against its own parser. That is precisely the defect
+# `widgetAnchor` shipped and that these lists exist to prevent, and it was
+# sitting unguarded while four other enums were covered. It is here now; hud.nim
+# re-exports it, so every existing call site is unchanged.
+#
+# `auto` is DELIBERATELY not in this table. It is not a mode: it is an
+# instruction to derive one from the legacy keys, resolved in maps.nim's
+# readOpts before `modeOf` is ever called. Listing it here would mean
+# `modeOf("auto")` had to answer some mode, and whichever one it answered would
+# be wrong for half the configs.
+
+const
+  ModeOff* = 0
+  ModeRadar* = 1
+  ModeNorthUp* = 2
+  ModeHeadUp* = 3
+  ModeBoth* = 4
+    ## The minimap AND the radar, two panes, one dispatch. It is the only mode
+    ## entitled to more than one pane, and that entitlement is a number the
+    ## draw ledger compares against -- never an exemption from the check.
+
+proc modeNameOf*(m: int): string =
+  case m
+  of ModeRadar: "radar"
+  of ModeNorthUp: "northup"
+  of ModeHeadUp: "headingup"
+  of ModeBoth: "both"
+  else: "off"
+
+proc modeRecognisedName*(s: string): bool =
+  ## The predicate that CAN say no. `modeOfName` answers ModeOff for a typo AND
+  ## for the literal word "off", so its return value alone cannot tell "the
+  ## player asked for nothing" from "the player asked for something we did not
+  ## understand" -- the same trap `anchorOf` set.
+  case s
+  of "off", "radar", "northup", "north-up", "minimap",
+     "headingup", "heading-up", "rotating", "both", "radar+minimap": true
+  else: false
+
+proc modeOfName*(s: string): int =
+  case s
+  of "radar": ModeRadar
+  of "northup", "north-up", "minimap": ModeNorthUp
+  of "headingup", "heading-up", "rotating": ModeHeadUp
+  of "both", "radar+minimap": ModeBoth
+  else: ModeOff
+
+proc modeOptions*(): seq[string] =
+  ## The real modes -- what `modeOfName` parses. `auto` is NOT here: it is a
+  ## migration instruction resolved in readOpts before `modeOfName` is called,
+  ## and listing it would force the parser to answer some mode for it.
+  result = @["off", "radar", "minimap", "headingup", "both"]
+
+proc modeSchemaOptions*(): seq[string] =
+  ## What the settings UI offers: the modes, with `auto` in front. One place
+  ## builds this so the schema row and the parser cannot drift; the offline
+  ## suite checks `modeOptions` (the parsable ones) and this list's tail
+  ## against it.
+  result = @["auto", "off", "radar", "minimap", "headingup", "both"]
+
+proc modePanesExpected*(m: int; overlayOpen: bool): int =
+  ## How many panes ONE dispatch in this mode is entitled to draw. The C
+  ## renderer computes the same number in `mhud_pane_expect`; this copy exists
+  ## so the offline suite can assert the TABLE (off draws none, both draws two,
+  ## the overlay replaces the widget whatever the mode) without a running game.
+  ## The two are asserted to agree by the live diag, which prints the C value.
+  if overlayOpen: 1
+  elif m == ModeOff: 0
+  elif m == ModeBoth: 2
+  else: 1

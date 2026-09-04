@@ -207,6 +207,10 @@ proc near(a, b: float): bool =
   let d = a - b
   (if d < 0.0: -d else: d) <= 0.01
 
+var gRadarAnchorRefused = ""
+  ## Same once-per-distinct-bad-value contract as `gAnchorRefused` below, for
+  ## the radar sub-widget's corner. Kept SEPARATE rather than shared, so a typo
+  ## in one key cannot suppress the refusal for the other.
 var gAnchorRefused = ""
   ## The last `widgetAnchor` text this build did not recognise, so the refusal is
   ## logged once per distinct bad value rather than once a second forever
@@ -241,6 +245,13 @@ var gMasterGatedAt = 0'i64
 var gPlaceLast = ""
   ## The last placement line emitted, so the resolved widget rect is logged once
   ## per change rather than once a frame.
+
+var gDrawVerdictFrames = 300
+  ## How many IN-RAID dispatches may pass with a surface selected and nothing
+  ## submitted before the draw verdict stops saying INCONCLUSIVE and says FAIL.
+  ## Read from config each readOpts. The bound is the whole point: an
+  ## unbounded "nothing has drawn YET" is a verdict no input can falsify, and
+  ## this mod has already paid for one of those.
 
 var gHeadingOn = false
   ## The `heading` setting. Flag-gated and default OFF, like everything else
@@ -648,6 +659,32 @@ proc readOpts(o: var HudOpts) =
     # Recognised again: forget the refusal so a later re-typo says so afresh.
     gAnchorRefused = ""
   o.anchor          = anchorOf(anchorText)
+
+  # ---- THE RADAR SUB-WIDGET'S CORNER, read ONLY in `both` ---------------
+  # In every other mode there is one pane and `widgetAnchor` places it. In
+  # `both` the minimap and the radar are two panes and need two rects, or they
+  # land exactly on top of each other. The radar's SIZE and INSET are the
+  # existing radarSize/radarX/radarY keys -- those keys stop being migration-
+  # only and become live geometry in this one mode, and the schema now says so
+  # instead of still calling them inert.
+  # Same loud-refusal contract as `widgetAnchor`: `anchorOf` cannot tell a typo
+  # from the word "manual", so `anchorRecognised` is the predicate that can fail.
+  let radarAnchorText = asText(setting("radarAnchor"), "manual")
+  if not anchorRecognised(radarAnchorText):
+    if radarAnchorText != gRadarAnchorRefused:
+      gRadarAnchorRefused = radarAnchorText
+      warn ModName & ": REFUSED radarAnchor=\"" & radarAnchorText & "\" -- " &
+           "not a spelling this build accepts, so the radar pane of " &
+           "spatialMode=\"both\" is being placed with the historical MANUAL " &
+           "placement (radarX/radarY as absolute pixels) and your corner was " &
+           "NOT applied. Accepted: manual, topleft, topright, bottomleft, " &
+           "bottomright (hyphenated and tl/tr/bl/br also work). This key is " &
+           "read ONLY in `both`; in every other mode there is one pane and " &
+           "`widgetAnchor` places it."
+  else:
+    gRadarAnchorRefused = ""
+  o.radarAnchor     = anchorOf(radarAnchorText)
+
   o.border          = asBool(setting("widgetBorder"), true)
   o.borderPx        = asFloat(setting("widgetBorderPx"), 2.0)
   o.backdropOpacity = asFloat(setting("widgetBackdropOpacity"), 1.0)
@@ -655,6 +692,9 @@ proc readOpts(o: var HudOpts) =
   # what every existing config already draws -- this switch exists so the thing
   # is NAMED and removable, not to change anyone's map underneath them.
   o.northPip        = asBool(setting("northPip"), true)
+
+  gDrawVerdictFrames = asInt(setting("drawVerdictFrames"), 300)
+  if gDrawVerdictFrames < 30: gDrawVerdictFrames = 30
 
   o.fsEnabled = asBool(setting("hotkeys"), false)
   o.fsKey     = asText(setting("fullscreenKey"), "M")
@@ -808,7 +848,7 @@ proc spatialSchema(): seq[Setting] =
 
     # ---- THE ONE SPATIAL WIDGET -----------------------------------------
     enumSetting("spatialMode", "Spatial widget", "auto",
-                @["auto", "off", "radar", "northup", "headingup"],
+                modeSchemaOptions(),
                 category = "Widget",
                 description = "ONE widget, one mode -- this replaces the " &
                               "separate `In-game radar` and `In-game map` " &
@@ -820,7 +860,12 @@ proc spatialSchema(): seq[Setting] =
                               "northup = minimap with the baked map art, " &
                               "north at the top; headingup = the same " &
                               "minimap rotated to your facing (art included " &
-                              "-- the region rotates the tiles). " &
+                              "-- the region rotates the tiles); " &
+                              "both = the minimap AND the radar at once, two " &
+                              "panes in one dispatch. `both` is the ONLY mode " &
+                              "that reads radarAnchor/radarX/radarY/radarSize " &
+                              "as live geometry -- it needs a second rect or " &
+                              "the two panes land on top of each other. " &
                               "auto = derive the mode from the old " &
                               "hudRadar/hudMap/heading keys. " &
                               "MIGRATION: while this key reads `auto` the old " &
@@ -1268,6 +1313,74 @@ proc spatialSchema(): seq[Setting] =
                 category = "HUD", implemented = false,
                 description = "Specified from the pre-1.0 BepInEx map/radar mods (no upstream code carried; map art and calibration provenance in mods/maps/data/maps/README.md). Not collected: no field offset for any of those " &
                               "lists has been measured on this build"),
+
+    # ---- THE MARKER KINDS, one row each, each DECLARED not available -----
+    #
+    # These are named rather than hidden, and every one is `implemented=false`
+    # for the same measured reason the umbrella `markers` row above carries: on
+    # build 1.1.0.1.46777 no field offset has been taken for the loot, extract
+    # or quest lists, and `sp/world.nim` does its own IL2CPP walk rather than
+    # consuming another mod's feed, so there is nothing to draw from. Splitting
+    # the umbrella into four rows changes NOTHING about what draws; it makes
+    # the request answerable per kind and states, per kind, what is missing.
+    # A silent no-op toggle would be worse than an absent one -- fact #72's
+    # shape -- so none of these is offered as a working switch.
+    boolSetting("markerLoot", "Marker kind: loot", false,
+                category = "Markers", implemented = false,
+                description = "NOT AVAILABLE on this build. Needs a measured " &
+                              "field offset for GameWorld's loot item list; " &
+                              "none has been taken. Turning it on stores the " &
+                              "value and draws nothing, and the maps diag " &
+                              "says so by name rather than pretending"),
+    boolSetting("markerExtracts", "Marker kind: extracts", false,
+                category = "Markers", implemented = false,
+                description = "NOT AVAILABLE on this build. Needs a measured " &
+                              "offset for the raid's ExfiltrationPoint list " &
+                              "and its per-point world position; none has " &
+                              "been taken"),
+    boolSetting("markerQuests", "Marker kind: quest objectives", false,
+                category = "Markers", implemented = false,
+                description = "NOT AVAILABLE on this build. Needs both a " &
+                              "measured offset for the active quest list and " &
+                              "a world position per objective; neither has " &
+                              "been taken"),
+    boolSetting("markerCorpses", "Marker kind: corpses", false,
+                category = "Markers", implemented = false,
+                description = "NOT AVAILABLE on this build. The contact walk " &
+                              "in sp/world.nim reads the ALIVE players list, " &
+                              "so a corpse is not in the feed at all; this " &
+                              "needs the dead list and a measured offset for " &
+                              "it"),
+
+    # ---- THE RADAR SUB-WIDGET, live geometry in `both` only -------------
+    enumSetting("radarAnchor", "Radar corner (both mode)", "manual",
+                anchorOptions(), category = "Widget",
+                description = "Where the RADAR pane sits when spatialMode is " &
+                              "`both`. manual = radarX/radarY are absolute " &
+                              "pixels, which is the historical placement, so " &
+                              "nobody's radar moves. Any corner turns them " &
+                              "into an inset from that corner, resolved each " &
+                              "frame against the measured back buffer and " &
+                              "clamped on-screen. READ ONLY IN `both`: every " &
+                              "other mode draws one pane, placed by " &
+                              "`Widget corner`. An unrecognised spelling is " &
+                              "REFUSED by name in the host log, never applied " &
+                              "silently as manual"),
+
+    # ---- THE BOUNDED DRAW VERDICT ---------------------------------------
+    intSetting("drawVerdictFrames", "Draw verdict: frames before FAIL", 300,
+               lo = 30, hi = 20000, step = 30, category = "Diagnostics",
+               description = "How many IN-RAID dispatches may go by with a " &
+                             "surface selected and NOTHING submitted before " &
+                             "the maps diag calls it a FAIL instead of an " &
+                             "INCONCLUSIVE. This bound is the point: without " &
+                             "it `nothing has drawn yet` stays inconclusive " &
+                             "forever, which is a verdict no input can " &
+                             "falsify. The clock is dispatches past the " &
+                             "in-raid lifecycle gate, counted by the C " &
+                             "renderer, so menu frames can never spend it. " &
+                             "Raise it if you load on a slow disk; it can be " &
+                             "large but it may not be infinite"),
   ]
 
 proc onMapsApply(key: string)
@@ -2325,6 +2438,15 @@ proc mapsDiagText(): string =
       "for EXPLICITLY, and that is honoured under both renderers. Nothing drew " &
       "and nothing was asked to -- this is not a pass and not a fault. " &
       rendererSurfaces()
+    elif hudPaneCallsOver() > 0'i64 or hudPaneCallsUnder() > 0'i64:
+      "FAIL  the pane ledger disagrees with the mode: " &
+      $hudPaneCallsOver() & " dispatch(es) drew MORE panes than " &
+      modeName(gOpts.mode) & " entitles (a second draw path exists) and " &
+      $hudPaneCallsUnder() & " drew FEWER (a selected surface was dropped). " &
+      "The entitlement (" & $hudPaneExpect() & ") is resolved from the mode " &
+      "BEFORE any pane is drawn, so this compares the draw against an " &
+      "expectation it could not have been written to match. " &
+      rendererDecision()
     elif selD + selB != selF:
       "FAIL  the draw-site counters do not add up (selDrew " & $selD &
       " + selBlank " & $selB & " != selFrames " & $selF & "), so no verdict " &
@@ -2332,11 +2454,26 @@ proc mapsDiagText(): string =
     elif not gHudOn:
       "INCONCLUSIVE  no draw participant is registered, so no dispatch has " &
       "reached the renderer and nothing has been observed. " & rendererDecision()
+    elif selF == 0'i64 and hudRaidFrames() >= int64(gDrawVerdictFrames):
+      # THE BOUND. The arm below this one is honest while the raid is still
+      # starting and dishonest forever after: "no dispatch has reached the draw
+      # section yet" is a sentence that can be true on frame 3 and is a defect
+      # on frame 3000. `hudRaidFrames` counts dispatches that got PAST the
+      # in-raid lifecycle gate -- so this can only fire when drawing was
+      # genuinely possible, and it names the mode that was asked for.
+      "FAIL  spatialMode=" & modeName(gOpts.mode) & " has been selected for " &
+      $hudRaidFrames() & " in-raid dispatch(es) (budget " &
+      $gDrawVerdictFrames & ", `drawVerdictFrames`) and NOT ONE of them " &
+      "reached the draw section with a surface switched on. The mode is set " &
+      "and the draw path is never being entered -- that is a defect, not a " &
+      "slow start. " & rendererSurfaces() & ". " & rendererDecision()
     elif selF == 0'i64:
       "INCONCLUSIVE  a renderer is selected in config but ZERO dispatches " &
       "reached the draw section with any surface switched on (the widget " &
       "mode is " & modeName(gOpts.mode) & " and the overlay has not been " &
-      "opened). Nothing drew and nothing was asked to -- this is NOT a pass. " &
+      "opened) -- after " & $hudRaidFrames() & " in-raid dispatch(es) of a " &
+      $gDrawVerdictFrames & "-frame budget, past which this becomes a FAIL. " &
+      "Nothing drew and nothing was asked to -- this is NOT a pass. " &
       rendererSurfaces() & ". " & rendererDecision()
     elif selD == 0'i64:
       "FAIL  a surface was selected on all " & $selF & " dispatch(es) and " &
@@ -2346,9 +2483,19 @@ proc mapsDiagText(): string =
       rendererDecision()
     else:
       "PASS  the selected renderer submitted geometry on " & $selD & " of " &
-      $selF & " dispatch(es) (" & $selB & " blank), and no dispatch ever " &
-      "rendered more than one pane (" & $hudPaneCallsOver() & " violation(s)), " &
+      $selF & " dispatch(es) (" & $selB & " blank), every dispatch rendered " &
+      "EXACTLY the number of panes its mode entitles it to (" &
+      $hudPaneExpect() & " for " & modeName(gOpts.mode) & "; " &
+      $hudPaneCallsOver() & " over, " & $hudPaneCallsUnder() & " under), " &
       "AND the owning renderer has at least one surface switched on. " &
+      (if gOpts.mode == ModeBoth:
+         "BOTH: last frame the minimap pane submitted " & $hudMapPrims() &
+         " primitive(s) at (" & $int(hudLivePaneX()) & "," &
+         $int(hudLivePaneY()) & ") and the radar pane " & $hudRadarPrims() &
+         " at (" & $int(hudRadarWx()) & "," & $int(hudRadarWy()) &
+         ") -- counted apart, because a mode that draws one surface and " &
+         "silently drops the other is exactly what a combined count hides. "
+       else: "") &
       rendererSurfaces() & ". " & rendererDecision()
 
   # ---- THE FULL-SCREEN OVERLAY -------------------------------------------
@@ -2951,6 +3098,9 @@ proc mirrorDrift(): string =
   if w.anchor != hudLiveAnchor():
     return "widgetAnchor config=" & anchorName(w.anchor) &
            " mirror=" & anchorName(hudLiveAnchor())
+  if w.radarAnchor != hudLiveRadarAnchor():
+    return "radarAnchor config=" & anchorName(w.radarAnchor) &
+           " mirror=" & anchorName(hudLiveRadarAnchor())
   if w.border != hudLiveBorder():
     return "widgetBorder config=" & $w.border & " mirror=" & $hudLiveBorder()
   if w.northPip != hudLiveNorthPip():

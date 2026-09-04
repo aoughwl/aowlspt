@@ -242,6 +242,7 @@ proc schemaChecks(r: var TestReport) =
   let details = detailOptions()
   let acts = activationOptions()
   let pols = enemyPolicyOptions()
+  let modes = modeOptions()
 
   for s in anchors:
     n = n + 1
@@ -262,6 +263,20 @@ proc schemaChecks(r: var TestReport) =
     elif enemyPolicyNameOf(enemyPolicyOfName(s)) != s:
       bad = bad & " enemy-roundtrip:" & s
 
+  # THE MODE TABLE, which until this build was the ONE enum in this mod whose
+  # schema list was never checked against its own parser -- exactly the defect
+  # `widgetAnchor` shipped. `minimap` is offered as the friendly spelling and
+  # `northup` is the canonical one, so this list is checked for RECOGNITION and
+  # for a stable int, and the round-trip is asserted separately below on the
+  # canonical spellings only. A blanket name round-trip here would have forced
+  # the schema to offer `northup` instead of `minimap`, which is a worse label
+  # for a worse reason.
+  for s in modes:
+    n = n + 1
+    if not modeRecognisedName(s): bad = bad & " mode:" & s
+    elif modeOfName(s) == ModeOff and s != "off":
+      bad = bad & " mode-falls-to-off:" & s
+
   check(r, "every option in every enum the schema offers parses and round-trips (" & $n & " options)",
         bad.len == 0, "unparsed or non-round-tripping:" & bad)
 
@@ -277,12 +292,84 @@ proc schemaChecks(r: var TestReport) =
         not enemyPolicyRecognisedName("onsight"), "accepted 'onsight'")
 
   # And a typo must resolve to the SAFE value, not to some third state.
+  # THE TWO MODE LISTS MAY NOT DRIFT. The schema offers `auto` plus the modes;
+  # the parser understands the modes. If someone adds a mode to one list only,
+  # the settings UI grows an option that silently falls back -- the exact defect
+  # `widgetAnchor` shipped -- or a parsable mode becomes unreachable from the UI.
+  block:
+    let sch = modeSchemaOptions()
+    let par = modeOptions()
+    var same = sch.len == par.len + 1 and sch.len > 0 and sch[0] == "auto"
+    if same:
+      var i = 0
+      while i < par.len:
+        if sch[i + 1] != par[i]: same = false
+        i = i + 1
+    check(r, "the schema's mode list is exactly `auto` + the parsable modes",
+          same, "schema and parser mode lists have drifted")
+    check(r, "`auto` is NOT a parsable mode (it is a migration instruction)",
+          not modeRecognisedName("auto"), "the parser claims to understand auto")
+
+  check(r, "the mode recogniser CAN say no",
+        not modeRecognisedName("minimapp"), "accepted a typo")
+  check(r, "an unrecognised mode resolves to OFF, not to some third surface",
+        modeOfName("minimapp") == ModeOff, modeNameOf(modeOfName("minimapp")))
+  check(r, "the canonical mode spellings round-trip",
+        modeNameOf(modeOfName("off")) == "off" and
+        modeNameOf(modeOfName("radar")) == "radar" and
+        modeNameOf(modeOfName("northup")) == "northup" and
+        modeNameOf(modeOfName("headingup")) == "headingup" and
+        modeNameOf(modeOfName("both")) == "both",
+        "a canonical spelling did not survive name -> int -> name")
+  check(r, "`minimap` and `northup` are the SAME mode (one surface, two names)",
+        modeOfName("minimap") == modeOfName("northup"), "they differ")
+  check(r, "`both` is a mode of its own, not an alias of either half",
+        modeOfName("both") != modeOfName("radar") and
+        modeOfName("both") != modeOfName("northup"), "both aliases a half")
+
   check(r, "an unrecognised anchor resolves to manual",
         anchorOfName("bottomleftt") == AnchorManual, anchorNameOf(anchorOfName("bottomleftt")))
   check(r, "an unrecognised detail resolves to custom",
         detailOfName("ultra") == DetailCustom, detailNameOf(detailOfName("ultra")))
   check(r, "an unrecognised activation resolves to press",
         activationOfName("doubletap") == ActPress, activationNameOf(activationOfName("doubletap")))
+
+# ---------------------------------------------------------------------------
+# 4b. THE PANE ENTITLEMENT -- how many panes a mode may draw
+# ---------------------------------------------------------------------------
+
+proc paneChecks(r: var TestReport) =
+  ## `both` is the only mode allowed a second pane, and the ledger in the C
+  ## renderer enforces that by comparing the panes drawn against this number.
+  ## The number is therefore load-bearing and is asserted here, INCLUDING the
+  ## cases that must NOT be 2 -- a table that answered 2 for everything would
+  ## make the over-draw check vacuous, which is the failure this whole file is
+  ## about.
+  check(r, "off draws NO pane", modePanesExpected(ModeOff, false) == 0,
+        $modePanesExpected(ModeOff, false))
+  check(r, "radar draws exactly one", modePanesExpected(ModeRadar, false) == 1,
+        $modePanesExpected(ModeRadar, false))
+  check(r, "northup draws exactly one", modePanesExpected(ModeNorthUp, false) == 1,
+        $modePanesExpected(ModeNorthUp, false))
+  check(r, "headingup draws exactly one", modePanesExpected(ModeHeadUp, false) == 1,
+        $modePanesExpected(ModeHeadUp, false))
+  check(r, "both draws exactly TWO", modePanesExpected(ModeBoth, false) == 2,
+        $modePanesExpected(ModeBoth, false))
+  # THE NEGATIVE CONTROL. If the table simply returned 2 whenever a map is on,
+  # the check above would pass and the over-draw ledger would be worthless.
+  check(r, "no single-surface mode is entitled to two panes",
+        modePanesExpected(ModeRadar, false) < 2 and
+        modePanesExpected(ModeNorthUp, false) < 2 and
+        modePanesExpected(ModeHeadUp, false) < 2,
+        "a single-surface mode claimed two panes")
+  # The overlay REPLACES the widget. `both` with the map open must still be 1,
+  # or the fullscreen suppression assertion in the renderer would read FAIL on
+  # every frame the overlay is open in that mode.
+  check(r, "the overlay replaces the widget -- one pane whatever the mode",
+        modePanesExpected(ModeBoth, true) == 1 and
+        modePanesExpected(ModeRadar, true) == 1 and
+        modePanesExpected(ModeOff, true) == 1,
+        "the overlay did not collapse the entitlement to one")
 
 # ---------------------------------------------------------------------------
 # 5. THE ENEMY POLICY IS DECLARED UNAVAILABLE, NOT SILENTLY IGNORED
@@ -303,10 +390,11 @@ proc enemyChecks(r: var TestReport) =
 
 proc run*(): TestReport =
   var r = TestReport(lines: @[], passed: 0, failed: 0)
-  r.lines.add "mods/maps/core -- placement, detail, activation, schema, policy"
+  r.lines.add "mods/maps/core -- placement, detail, activation, schema, panes, policy"
   placementChecks(r)
   detailChecks(r)
   activationChecks(r)
   schemaChecks(r)
+  paneChecks(r)
   enemyChecks(r)
   result = r
