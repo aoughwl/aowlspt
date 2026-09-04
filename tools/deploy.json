@@ -50,7 +50,8 @@
   "modLoadScreen": "The in-game mod loading screen. It writes nothing to the game, installs no detour, and builds nothing until the compile writes its file, so on an install whose mods are already built it is inert. It exists to make a long silent wait legible, and a screen you have to switch on does not do that.",
   "deferModLoad": "Gated by modLoadScreen (`gModLoad and readBoolKeyDef(...)`), so it cannot be on while the screen it belongs to is off. Same shipping decision as modLoadScreen.",
   "forceOfflinePractice": "Forces the Matchmaker Offline Raid Screen's practice/offline toggle ON (Toggle::set_isOn @0x55BA430) so a raid entered by pressing straight through the menus stays OFFLINE and never enters the online NetworkGameMatching that times out and crashes the load. Default OFF means the automated raid path is the crashing one.",
-  "nativeTabsSubtabs": "The shipping PostFX subtab path. It has a live PASS -- exactly one subtab reads m_IsOn=1 and its panel is the only active one of the two, with the stock SettingsList byte-identical to the feature-off baseline -- and it replaces the cloned-strip approach."
+  "nativeTabsSubtabs": "The shipping PostFX subtab path. It has a live PASS -- exactly one subtab reads m_IsOn=1 and its panel is the only active one of the two, with the stock SettingsList byte-identical to the feature-off baseline -- and it replaces the cloned-strip approach.",
+  "settingsNativePostFx": "The POSTFX subtab's NATIVE rows, which drive the GAME'S OWN post-processing and shading. It defaults ON because it REPLACES rather than adds: `settingsPostFxRows` (mods/graphics, our own D3D composite pass) is now LEGACY and default OFF, so shipping the replacement off as well would leave the POSTFX page EMPTY, which reads to a player as a removed feature. What it arms is not a new risk surface: NO DETOUR IS BOUND ANYWHERE by this feature. Every one of its twelve targets is a DIRECT CALL at a 16-byte prologue verified against the startup snapshot (abi/aowlspt_nativepostfx.h), all MEASURED UNIQUE (owners=1) and in the `il2cpp` section, and its only store into game memory (PrismEffects' three AO fields) goes through the typed hostfieldwrite gate whose klass admission refuses a wrong-klass receiver. It is inert unless BOTH settingsPostFxSubtab and nativeUiKit are on, and it refuses to arm otherwise with a named warning. Idle cost off the settings screen is one boolean test; nothing runs per frame in a raid. The one genuinely expensive knob -- shadow quality, which re-renders the shadow map -- is behind its OWN flag `settingsNativeShadows`, DEFAULT OFF. The one managed-throw hazard on the path (CameraManager::SetSharpen raises a managed NullReferenceException on a null _ccSharpen@0xD0, MEASURED by disassembly, and SEH cannot catch that) is handled by reading and null-checking that field first, with the C wrapper demanding the pointer as an argument so the check cannot be skipped."
  },
  "install": "D:\\Aowlspt\\aowlspt",
  "artifacts": [
@@ -167,7 +168,12 @@
     "pact: armed. ",
     "pact magcycle: COMPLETE -- ",
     "EFT.GamePlayerOwner::TranslateCommand",
-    "PlayerInventoryController::LoadMagazine"
+    "PlayerInventoryController::LoadMagazine",
+    "native postfx: ",
+    "postfx: sharpen -> ",
+    "postfx: SSAO -> ",
+    "postfx: shadowQuality -> ",
+    "settingsNativePostFx is ON (default): "
    ]
   },
   {
@@ -601,6 +607,61 @@
      "minFiles": 40,
      "why": "every map JSON and every terrain SVG layer. On 2026-08-27 none of the 59 files were shipped and the backend logged 'data/bigmap.json is not on disk -- that map will report no data' for 8 maps"
     }
+   ]
+  },
+  {
+   "//": "aowl.autoraid: enters (and leaves) a raid with no mouse. ONE DLL,",
+   "//1": "sides client+server, so the same file is the game-side state machine",
+   "//2": "AND the backend loadout policy. `aowl.autoraid` below is IDENTITY;",
+   "//3": "everything under it is a FEATURE check, and each one is a literal a",
+   "//4": "rebuild from a wrong base would drop:",
+   "//5": "  * the two routes/events the server half owns,",
+   "//6": "  * the three host verbs it asks (raid_phase, ui_show_status, and",
+   "//7": "    the -aowl.raid token it reads through aowlspt/args),",
+   "//8": "  * `autoraid.menu`, the region participant name, which is what the",
+   "//9": "    host logs when it refuses to arm it,",
+   "//a": "  * the two press-route target names -- if EITHER is gone the mod has",
+   "//b": "    lost the measured route for that klass and is back to the generic",
+   "//c": "    UnityEvent-at-a-guessed-offset that killed the client twice,",
+   "//d": "  * four verdict/readback lines, because a build whose verdicts are",
+   "//e": "    missing is a build that can only ever succeed.",
+   "//f": "TWO deliberately OMITTED: `AutoRaid MENU VERDICT PASS -- opened ` and",
+   "//g": "`the maps ON OFFER are ` are nimony `&`-concatenated and land as",
+   "//h": "SEPARATE rodata fragments, so markers.py answers INCONCLUSIVE on them",
+   "//i": "-- correctly. A marker that cannot be contiguous is not a marker.",
+   "name": "autoraid",
+   "src": "mods/autoraid/bin/autoraid.dll",
+   "dst": "mods/autoraid/autoraid.dll",
+   "seed": [
+    {
+     "src": "mods/autoraid/config.json",
+     "dst": "mods/autoraid/config.json",
+     "why": "the hotkey gate, the two key rows, the map list and the loadout mode. Without it the mod reads its defaults, which is INERT -- so a missing config.json here looks exactly like a mod that does nothing, which is the failure this seed exists to prevent"
+    },
+    {
+     "src": "mods/autoraid/loadout.json",
+     "dst": "mods/autoraid/loadout.json",
+     "why": "the spawned kit. Only read when loadoutMode is `spawned`, and its absence is announced rather than silently falling back to `current` -- but announcing a missing file on every raid is not shipping it"
+    }
+   ],
+   "minBytes": 700000,
+   "markers": [
+    "aowl.autoraid",
+    "/aowlspt/autoraid/status",
+    "autoraid.loadout.apply",
+    "autoraid.loadout.result",
+    "tarkov.raid.configured",
+    "aowlspt.host::raid_phase",
+    "aowlspt.host::ui_show_status",
+    "-aowl.raid=",
+    "autoraid.menu",
+    "UnityEngine.UI.Toggle::Set(bool value, bool sendCallback)",
+    "EFT.UI.TweenAnimatedButton::OnPointerClick(PointerEventData)",
+    "AutoRaid CMDLINE VERDICT PASS -- the client reports phase ",
+    "AutoRaid LOADOUT VERDICT ",
+    "AutoRaid: menu ready -- pressed PLAY (MenuScreen PlayButton, ",
+    "AutoRaid SELECT-MAP: pressed the tile whose Label reads ",
+    "Streets of Tarkov"
    ]
   },
   {

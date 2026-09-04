@@ -1,0 +1,392 @@
+# AUTORAID-MAP — the three flows, with the evidence behind each claim
+
+`mods/autoraid` (`aowl.autoraid`), written 2026-09-04. One DLL,
+`sides = {sideClient, sideServer}`.
+
+Every claim below is tagged **MEASURED** (somebody read it off the live client,
+off `GameAssembly.dll`, or off the wire, and the command is named) or
+**inferred** (it follows from something measured, but has not itself been
+observed). A MEASURED label on an inference poisons the document the same way it
+poisoned the fact store, so the tags are not decoration.
+
+Nothing in this document has been verified **live for this mod** yet. The
+measurements are the host's and the tools', re-used; the mod's own live
+behaviour is unproven and is listed as such in §5.
+
+---
+
+## 0. What the mod is, in one paragraph
+
+Three features on one code base: a command-line raid (`--raid="Woods"` on the
+launcher), a map menu on a key (`F8`, gated), and an optional spawned default
+loadout (server side). The client half **installs no detour, resolves no IL2CPP
+name and writes nothing into game memory**. It reaches Unity through three
+existing host facilities — `everyMain` for the tick, the `ui.show` event bus for
+screen arrivals, the shared region for drawing — and makes every state change by
+CALLING the method the game itself calls at a byte-verified RVA.
+
+---
+
+## 1. Flow A — the command-line raid
+
+```
+aowlspt-launch --raid="Woods"
+      |                                                    (agent H owns this)
+      v  the launcher forwards an unknown --name=value as -aowl.name=value
+EscapeFromTarkov.exe ... -aowl.raid=Woods
+      |
+      v  the HOST parses every -aowl.<name>=<value> token once, at boot
+aowlspt/args.nim  ->  cmdArg("raid")            [ar/cmdline.nim]
+      |
+      v  onLoad: declareArgs(...), report the token found (or its absence)
+      |          then every(1000, waitForDrain) -- OFF Unity's thread, and it
+      |          touches nothing in the game
+      v  call("aowlspt.host::main_thread").bound == true
+everyMain(onMainTick) registered  ->  onMainThread(armFromCmdline)
+      |
+      v  machine.arm("Woods", "pmc", "-aowl.raid")
+   [the state machine, §2]
+      |
+      v  poll call("aowlspt.host::raid_phase") every 2 s
+   phase == DEPLOYED   ->  AutoRaid CMDLINE VERDICT PASS
+   machine refused     ->  AutoRaid CMDLINE VERDICT FAIL <why>
+   240 s, still going  ->  AutoRaid CMDLINE VERDICT INCONCLUSIVE <why>
+```
+
+* **MEASURED** — the host's main-thread drain must have FIRED before anything
+  touches Unity. Crash `Crash_2026-09-02_211541986`: a mod's `everyMain` tick ran
+  on the HOST's own thread and called `UnityEngine.Input::GetKey`, whose native
+  body in UnityPlayer (`+0x58CF70`) fetches a global manager pointer and
+  dereferences it at `+0x4A0` **with no null test**. The pointer was NULL.
+  `call("aowlspt.host::main_thread").bound` is the gate, and NOT BOUND IS A
+  REFUSAL, not a fallback.
+* **MEASURED** — `DEPLOYED` is the game's own deploy signal, from the host's
+  `raidphase.nim` (`SpatialAudioSystem::AfterGameStarted` @0x2194770,
+  `ExfiltrationTimerSoundPlayer::AfterGameStarted` @0xA4CAF0). The mod does not
+  install those detours; a second detour on one function overwrites the first's
+  trampoline.
+* **inferred** — that `--raid` reaches the client as `-aowl.raid`. That is agent
+  H's launcher change and the mod builds against the contract, not against an
+  observation.
+* **Refusals are not retried.** `machine.arm` refuses when a live `GameWorld` is
+  readable, and that refusal is terminal for the command-line path: retrying it
+  would press at a UI that is not there.
+
+---
+
+## 2. The raid-entry state machine (`ar/machine.nim`)
+
+A port of `host/Aowlspt.Host.Il2Cpp/autoraid.nim`. The flow:
+
+```
+   WAIT-MENU ──(SettingsScreen over the menu)──> PRE-MENU ──┐
+       │                                                    │
+       │ press PlayButton (atomic find-and-press)   <───────┘
+       v
+     SIDE ──press the side control, then THIS screen's own NextButton──┐
+       │   readback: the screen goes INACTIVE                          │
+       v                                                               │
+  WAIT-LOCATION  <── site 4 (MatchMakerSelectionLocationScreen::Show) ─┘
+       │
+       v
+  SELECT-MAP ──press the tile whose Label reads the map, then THIS
+       │        screen's own NextButton; readback: screen INACTIVE
+       v
+  WAIT-OFFLINE  <── site 0 (MatchmakerOfflineRaidScreen::Show)
+       │
+       v
+  SCREEN-NEXT   the generic table: row 0 offline raid (site 0),
+       │        row 1 insurance (site 5), row 2 accept (site 6).
+       │        Press THAT screen's own NextButton from THAT receiver.
+       v
+     DONE        the accept screen advanced. HANDS OFF for the session.
+```
+
+### 2.1 Every screen comes from its own `::Show` receiver
+
+**MEASURED, three times in one session (2026-09-02).** The host's original
+`NEXT->location`, post-SIDE and `NEXT->insurance` steps each timed out after 45 s
+while their own census already showed the screen on screen. Every one was the
+same mistake: hunting a `NextButton` across the scene roots for a screen nobody
+had handed us. The rule that came out of it: **a screen is advanced only from its
+own `::Show` receiver.**
+
+The mod gets those receivers from the host's generic bus (`ar/showbus.nim`):
+
+| site | method | RVA | used for |
+|---|---|---|---|
+| 0 | `MatchmakerOfflineRaidScreen::Show` | 0x1788590 | SCREEN-NEXT row 0 |
+| 2 | `MenuScreen::Show(5-arg)` | 0x15387A0 | WAIT-MENU root, exit fallback |
+| 3 | `MatchMakerSideSelectionScreen::Show` | 0x1790180 | SIDE |
+| 4 | `MatchMakerSelectionLocationScreen::Show` | 0x178ACB0 | SELECT-MAP |
+| 5 | `MatchmakerInsuranceScreen::Show` | 0x1769910 | SCREEN-NEXT row 1 |
+| 6 | `MatchMakerAcceptScreen::Show` | 0x1773EF0 | SCREEN-NEXT row 2 |
+| 7 | `MenuScreen::ShowInRaid` | 0x1539650 | raid exit |
+| 8 | `SessionEndUI::Awake` | 0x1726850 | raid exit, results |
+
+**MEASURED** — site 1 (`MenuScreen::Awake`) is never wanted and never read.
+Wanting it bound that method for the first time on any build this project has
+run, and the very next boot died at MENU ARRIVAL in `SeasonWidgetData::From
+@0x141FFD0+0x133` under `MenuScreen::Show(5-arg) @0x15387A0+0x994`. Three boots,
+three deaths.
+
+**inferred** — that the host's `ui.show` payload carries `{site,name,rva,epoch,
+receiver}` and that `aowlspt.host::ui_show_status` reports per-site
+`{bound,epoch,receiver}`. Agent H is building both against exactly these names.
+
+### 2.2 What the port CHANGED, and why
+
+| Host | Mod | Why |
+|---|---|---|
+| rides the `TarkovApplication::Update` drain slot | `everyMain` | a mod may not add a second detour: the second overwrites the first's trampoline and silently kills the first feature |
+| falls back to enumerating `DontDestroyOnLoad` roots | never enumerates; climbs with `Transform::get_root` from a live receiver | **MEASURED** `Scene::GetRootGameObjects` ALLOCATES (a List and an array), banned on a per-frame path; and in a raid the enumeration is the LOCATION scene, where the menu is not — which is exactly why `raidexit` refused with "step SHOW-IN-RAID found nothing" while the menu was alive |
+| keeps `ArNext1..ArReady` (all-roots NextButton hunts) | DELETED; replaced by `WAIT-LOCATION` / `WAIT-OFFLINE` | those steps were measured wrong three times; keeping a superseded path "just in case" is how a run quietly becomes the weaker one |
+| ONE `aowl_p_p_seh` around the whole tick body | one guard per CALL (callrva's), none around the tick | `aowl_crva_invoke` REFUSES to arm inside another guard (`GUARD_BUSY`, checked on its own flag AND the shim's) because nesting disarms the outer one. Nothing is ever nested; every read is `VirtualQuery`-gated instead |
+| per-step budget counted from "the guarded body did not return" | per-step budget counted from the DELTA in callrva's process-wide fault counter, with a CRUMB naming the operation | strictly better information. **MEASURED** the budget must stay PER STEP: on 2026-09-02 one recovered PRE-MENU fault plus two SIDE faults tripped a session-wide budget of three and switched the whole feature off |
+| `Component::GetComponent(String)` | `GetComponent(Type)` via `GetTypeFromHandle` and an offline `Il2CppType` RVA | **MEASURED** the String overload returns NULL for every node on this build; a walk of all 1263 nodes of an open Settings screen found ZERO TMP components while `label` reads their text fine |
+
+### 2.3 The three press routes — and why there is no fourth
+
+**MEASURED 2026-09-02, two deterministic client deaths.** The host's generic
+press read a "UnityEvent" at component `+0x100` for every klass that was not a
+`DefaultUIButton`. On an `EFT.UI.AnimatedToggle` (which derives from
+`UnityEngine.UI.Toggle`) that offset is `toggleTransition` — **an enum**. Layout,
+from `tools/fldoff.py`:
+
+```
+0x100 toggleTransition  ToggleTransition   <- AN ENUM, not an event
+0x108 graphic           Graphic
+0x110 m_Group           ToggleGroup
+0x118 onValueChanged    ToggleEvent        <- the real event
+0x120 m_IsOn            bool
+```
+
+A small integer is not null, is not a GameObject and is not a known klass, so it
+passed every guard, and was then CALLED as a UnityEvent.
+
+| klass | route | source of the RVA + prologue |
+|---|---|---|
+| `EFT.UI.AnimatedToggle` | `Toggle::Set(true, true)` @0x55BA450 | `abi/aowlspt_premenu.h` row [1], UNIQUE, non-virtual |
+| `EFT.UI.DefaultUIButton` | `_button`@0x108 → `TweenAnimatedButton::OnPointerClick(NULL)` @0x14359B0 | `abi/aowlspt_premenu.h` row [2] |
+| `UnityEngine.UI.Button` | `Button::Press()` @0x539A7A0 | `abi/aowlspt_navui.h` |
+| anything else | **NOT PRESSED**, reported | there is no generic route because the generic route is what faulted |
+
+**MEASURED** — `OnPointerClick`'s own sixteen bytes are
+`cmp byte [rcx+0x68],0 / je / mov rcx,[rcx+0x70] / test rcx,rcx / je / …`: it
+gates on `_interactable`, loads its `Action OnClick` and invokes it, and **never
+reads** the `PointerEventData` in RDX. That is why NULL is a safe argument — a
+statement about this disassembly, not about Unity. Firing
+`DefaultUIButton.OnClick`@+0x120 directly reaches the same handler but skips that
+gate, and **MEASURED 2026-09-02** that left the profile/mode screen
+half-transitioned with neither card clickable. The direct-UnityEvent path
+therefore survives only as an ANNOUNCED fallback when `_button` is unreachable.
+
+### 2.4 SELECT-MAP: the map is chosen by the text a person reads
+
+**MEASURED live with the inspector, 2026-09-02:**
+
+```
+Matchmaker Location Selection          <- the site-4 receiver
+  +- Content -> Map -> Image
+  |    +- "Location Template(Clone)"   <- ONE PER MAP, ALL IDENTICALLY NAMED,
+  |         |                             so the OBJECT NAME cannot select a map
+  |         +- Info -> Text            <- reads "NOT AVAILABLE" etc: a STATUS,
+  |         |                             and a red herring
+  |         +- Button Panel
+  |              +- AnimatedToggle     <- the control
+  |                   +- SizeLabel
+  |                        +- Label    <- TMP, reads "WOODS"
+  +- ScreenDefaultButtons -> NextButton, BackButton
+```
+
+**MEASURED offer set, 2026-09-02:** `[RESERVE][LIGHTHOUSE][INTERCHANGE][CUSTOMS]
+[GROUND ZERO][ICEBREAKER][WOODS]` — seven, not the twelve the menu lists. A map
+that is not on offer produces a refusal that NAMES every map that was.
+
+### 2.5 SIDE: the side is chosen STRUCTURALLY
+
+**MEASURED live with the inspector, 2026-09-02:**
+
+```
+MatchMaker Side Selection Screen       <- the site-3 receiver
+  +- PMCs                              <- the container for BOTH sides
+  |    +- PMCPlayerMV                  <- the PMC character MODEL (deep, huge)
+  |    +- AnimatedToggleSpawner -> AnimatedToggle    <- the PMC control
+  |    +- Button                                     <- and its Button
+  |    +- ScavPlayerMV                  <- the SCAV side, NESTED INSIDE the
+  |    |    +- AnimatedToggleSpawner       PMC container
+  |    |    +- Button
+  |    +- RandomToggleSpawner -> RandomToggle
+  +- ScreenDefaultButtons -> NextButton, BackButton
+```
+
+The controls are called `AnimatedToggle` and `Button` — no name contains "pmc" —
+and they carry no `DefaultUIButton`, so there is no caption either. "The PMC
+control" is therefore a STRUCTURAL fact: the first control under `PMCs` that is
+NOT inside a `scav` subtree.
+
+**MEASURED** — this is why the walk must be a TRUE level-by-level BFS. A
+breadth-per-node walk takes a level and then recurses into child 0, which here is
+`PMCPlayerMV`, and spends its whole 40-node cap in the character mesh: the
+depth-first version reported ZERO pressable nodes under a screen that had two.
+`ar/uitree.collectBFS` uses its own queue; `walkActive`/`collect` are the
+breadth-per-node shape and are used only where the subtree is known shallow.
+
+### 2.6 PRE-MENU: the finished state is THE MENU BEING USABLE
+
+**MEASURED 2026-09-02.** `SettingsScreen::Close()` @0x1720B10 HIDES the settings
+screen and does **not** restore the menu: its own readback passed ("no ACTIVE
+SettingsScreen remains") and WAIT-MENU then sat for its full 180 s bound with no
+MenuScreen active at all. That is the exact shape of a check that cannot fail —
+the step asserted the thing it had just done rather than the thing it was for.
+
+So the ladder is (1) the screen's own `BackButton`, scoped to its subtree, and
+(2) `Close()` as an announced fallback; and the finished state is an ACTIVE,
+PRESSABLE `PlayButton` obtained from the SAME function WAIT-MENU uses.
+
+**MEASURED** — `ChatScreen` reads ACTIVE in a healthy menu too (both censuses on
+2026-09-02, one with Settings over the menu and one with PLAY pressable). It is a
+normal part of the menu and is never touched.
+
+---
+
+## 3. Flow B — the map menu on a key
+
+```
+config: hotkeys=false (SHIPPED OFF), menuKey="F8", enterKey="None"
+      |
+      v  everyMain tick -> menu.poll()   [Unity's thread ONLY]
+UnityEngine.Input::GetKeyDown @0x531EB80, CALLED at a byte-verified RVA
+      |     prologue 40 53 48 83 EC 20 48 8B 05 9B 71 DB 01 8B D9 48
+      |     return type is ONE BYTE (AL); the icall's upper EAX bits are junk
+      |     control key: Joystick8Button19 (509) -- if IT reads down too the
+      |     press is REFUSED and counted
+      v
+menu opens -> abi/aowlspt_region.h participant `autoraid.menu`
+      |        DRAW callback is C over a POD mirror: holds no game pointer,
+      |        allocates nothing, cannot fault inside the region's guard
+      v  Enter -> machine.arm(label) -> the same state machine as Flow A
+```
+
+* **MEASURED (twice, independently)** — `Input::GetKeyDown` @0x531EB80 and its
+  sixteen prologue bytes: once for `abi/aowlspt_admin.h` on 2026-08-31, once for
+  `mods/maps/sp/hud.nim` on 2026-09-01. The agreement is the self-check.
+* **MEASURED** — the return type is `bool` in AL with EAX bits 8..31 UNDEFINED;
+  the method tail-jumps into Unity's native icall. Declaring it `int32_t` made
+  maps' overlay open on ANY keypress (41 toggles in a raid where M was pressed a
+  handful of times).
+* **MEASURED** — off Unity's thread this call is an access violation, not a
+  theoretical hazard (see §1).
+* **inferred** — nothing about this mod's own region participant. Registration
+  and ARMING are reported as separate facts and the verdict reads the region's
+  own `drawn` counter, so "opened but nothing painted" is a FAIL rather than a
+  silent success.
+
+---
+
+## 4. Flow C — the spawned loadout (server side)
+
+```
+mods/autoraid (backend)                      mods/tarkov (backend)
+  loadoutMode == "spawned"
+  loadout.json read at load
+        |
+        |  tarkov.raid.configured  /  tarkov.profile.selected
+        |<--------------------------------------------------
+        |   applied ONCE per raid, idempotent within 120 s
+        |
+        |  autoraid.loadout.apply
+        |-------------------------------------------------->
+        |   {profileId, spec:{clear,gear}, ephemeral:true, reason}
+        |                                     move worn gear to the STASH,
+        |                                     applyLoadout(), record minted ids
+        |  autoraid.loadout.result            under autoraid.minted.<profileId>
+        |<--------------------------------------------------
+        |   {profileId, verdict, requested, minted, placed, rejected, why}
+        v
+  AutoRaid LOADOUT VERDICT PASS|FAIL|INCONCLUSIVE   (logged VERBATIM)
+
+  at match end, mods/tarkov strips every minted subtree from the posted
+  profile before saveProfile, respecting the raidCarriedFullInventory guard
+```
+
+* **MEASURED (from the route table, `mods/tarkov/tarkov.nim:3246-3452`)** — the
+  spawn equipment is the PMC profile's Inventory delivered at
+  `/client/game/profile/list`; `/client/match/local/start` sends
+  `profile: null` (`tarkov.nim:2381`). So the loadout must be in the stored
+  profile before the client's LAST profile/list fetch.
+* **MEASURED (from `tarkov.nim:2524-2539`)** — the whole stored profile is
+  replaced by the posted one at match end EXCEPT under the
+  `raidCarriedFullInventory` guard, and death does not re-remove gear. So
+  minted-before-raid gear is indistinguishable from owned gear after a raid and
+  would land in the stash on extract. Ephemerality is therefore a RECORDED SET
+  of minted ids plus a strip step, not a property of the items.
+* **NOT MEASURED, and this is why `applyAt` defaults to `auto`** — which of
+  `tarkov.profile.selected` and `tarkov.raid.configured` precedes the client's
+  last profile/list fetch. That is a wire measurement (agent S's), and this mod
+  does not guess: `auto` subscribes to both and applies once per raid,
+  idempotently, which is correct either way.
+* **MEASURED offline, 2026-09-04** — every `query` and every `tpl` in the shipped
+  `loadout.json` was checked against `D:\Aowlspt\aowlspt\db.json` with the SAME
+  matching rule `emu/spawn.searchItemsCounted` uses (substring over the English
+  locale name, intersected with `templates.items`). Four entries carry a `tpl`
+  instead of a `query` because the name is genuinely ambiguous:
+  `5.45x39mm BT gs` (also three ammo packs), `PACA Soft Armor` (also the Rivals
+  Edition), `9x18mm PM PS gs PPO` (also two packs), and
+  `PM 9x18PM 90-93 8-round magazine` (**two template ids share that exact name**).
+  `loadout.nim` REFUSES an ambiguous query rather than taking the first hit, so
+  each of those would have been a named refusal, not a wrong item.
+
+---
+
+## 5. What is NOT verified
+
+Nothing in this mod has been run against the live client. Specifically unproven:
+
+1. **Every `Il2CppType` data RVA** in `ar/calls.nim`. They come from
+   `tools/il2cpp_nameindex.py lookup … ::@type 0` against an index whose stamp
+   matches this build, and there is **no prologue to byte-verify data against**.
+   The live check is: `typeObject` returns non-nil AND `componentOf` returns a
+   component on a node that visibly has one. Until that is seen, a mis-resolved
+   type reads as "this object has no such component" — i.e. as a silent absence.
+   This is the single most likely thing in the mod to be wrong.
+2. **That `Component::GetComponent(Type)` works from a Transform receiver.** The
+   host does it from the inspector; this mod has not.
+3. **The region participant drawing at all.** Registration is not arming.
+4. **The `ui.show` payload shape and `ui_show_status`** — agent H's, built
+   against the names.
+5. **`-aowl.raid` reaching the client** — agent H's launcher change.
+6. **The loadout handshake** — agent S's half of both events.
+7. **The raid-exit half.** The host's own note stands: site 7 must bind or
+   SHOW-IN-RAID refuses, and that path has never been re-stated as solved with a
+   live PASS.
+
+---
+
+## 6. The lines a reviewer greps after a boot
+
+```
+AutoRaid client: loaded, DEFAULT INERT.
+AutoRaid cmdline: -aowl.raid=
+AutoRaid: the host's main-thread drain is BOUND
+AutoRaid: call surface verified --
+AutoRaid: subscribed to `ui.show`.
+AutoRaid MENU: registered as region participant `autoraid.menu`
+AutoRaid: ARMED (
+AutoRaid WAIT-MENU: MenuScreen found=
+AutoRaid: menu ready -- pressed PLAY
+AutoRaid: READBACK -- MatchMakerSideSelectionScreen::Show fired
+AutoRaid SIDE: pressed the
+AutoRaid: READBACK -- MatchMakerSelectionLocationScreen::Show fired
+AutoRaid SELECT-MAP: pressed the tile whose Label reads
+AutoRaid: READBACK -- the offline raid screen announced itself
+AutoRaid SCREEN-NEXT: the practice/offline toggle
+AutoRaid: SCREEN-NEXT -- pressed the
+AutoRaid CMDLINE VERDICT
+AutoRaid MENU VERDICT
+AutoRaid LOADOUT VERDICT
+```
+
+A run that reaches a raid shows the READBACK lines in order. A run that does not
+shows exactly one refusal naming the step, the crumb and a census of what was
+ACTIVE — read that line, not the screen.

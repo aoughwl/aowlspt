@@ -633,6 +633,58 @@
         "voice",
         "ai"
       ]
+    },
+    {
+      "id": "aowl.autoraid",
+      "name": "AutoRaid",
+      "author": "aowlspt",
+      "version": "0.1.0",
+      "description": "Enter (and leave) a raid without touching the mouse. Three features: a COMMAND-LINE raid (aowlspt-launch --raid=\"Woods\" becomes -aowl.raid=Woods, and the mod drives the main menu into an offline raid on that map once the host's main-thread drain has fired), a MAP MENU on a key (F8 by default, drawn on the host's shared region; gated behind `hotkeys`, which ships OFF), and an optional SPAWNED default loadout (server side: a kit from loadout.json is created for the raid, the gear you were wearing is moved to the stash first and never destroyed, and every created item is stripped at match end so none of it reaches the stash). The client half installs NO detour, resolves NO IL2CPP name and writes NOTHING into game memory -- every state change is a call to the method the game itself calls, at an RVA byte-verified against the sixteen bytes it is declared to begin with, and every screen is taken from its own ::Show receiver over the host's `ui.show` bus rather than searched for by name. SHIPS INERT: with no command-line argument and `hotkeys` off it does nothing at all.",
+      "pipeline": ">=0.1.0",
+      "sides": [
+        "client",
+        "server"
+      ],
+      "source": {
+        "kind": "intree",
+        "path": "mods/autoraid",
+        "url": null
+      },
+      "artifact": {
+        "dir": "autoraid",
+        "library": "autoraid.dll"
+      },
+      "args": [
+        {
+          "name": "raid",
+          "description": "Enter an offline raid on this map as soon as the main menu is up. The value is the map's DISPLAYED name on the location screen, matched case-insensitively -- that displayed text is the only thing that identifies a map on this build, because every tile GameObject is called `Location Template(Clone)`. Absent = the mod does nothing at launch. A map that is not currently on offer is REFUSED, and the refusal names every map that WAS on offer.",
+          "example": "-aowl.raid=\"Ground Zero\"   (launcher: aowlspt-launch --raid=\"Ground Zero\")"
+        },
+        {
+          "name": "raidside",
+          "description": "Which side to choose on the PMC/SCAV selector before the map list: `pmc` or `scav`. Default `pmc`. Only consulted when -aowl.raid is present.",
+          "example": "-aowl.raidside=scav"
+        }
+      ],
+      "upstream": {
+        "note": "No upstream. The state machine is a port of host/Aowlspt.Host.Il2Cpp/autoraid.nim into a mod: same states, same bounds, same readback lines and the same measured refusals, with the scene-root enumeration removed (it allocates, and in a raid it enumerates the LOCATION scene where the menu is not) and the three superseded all-roots NextButton steps deleted rather than left disabled. docs/AUTORAID-MAP.md records what changed and why."
+      },
+      "license": "see repository",
+      "download": null,
+      "requires": [],
+      "conflicts": [],
+      "provides": [
+        "aowl.capability.raidentry"
+      ],
+      "loadAfter": [
+        "aowl.tarkov"
+      ],
+      "tags": [
+        "client",
+        "server",
+        "automation",
+        "raid"
+      ]
     }
   ],
   "lists": [
@@ -716,6 +768,11 @@
           "id": "aowl.maps",
           "enabled": true,
           "note": "selected so the map browser and its routes are served; the LIVE FEED is still off by its own config.json `enabled` flag, so selecting it cannot make anything touch game memory"
+        },
+        {
+          "id": "aowl.autoraid",
+          "enabled": true,
+          "note": "selected so the --raid launcher flag and the F8 map menu are available. Selecting it changes NOTHING on its own: with no -aowl.raid token and `hotkeys` false in its config.json, the mod polls no key, draws nothing and makes no call into the game at all."
         },
         {
           "id": "aowl.debug",

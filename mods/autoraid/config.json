@@ -1,0 +1,24 @@
+{
+  "_comment": "aowl.autoraid - enter (and leave) a raid without touching the mouse. Three features: a command-line raid (aowlspt-launch --raid=\"Woods\"), a map menu on a key, and an optional SPAWNED default loadout. The mod installs no detour, resolves no IL2CPP name, and writes NOTHING into game memory: every state change is a CALL to the method the game itself calls, at an RVA byte-verified against the sixteen bytes it is declared to begin with. SHIPS INERT: hotkeys is false and loadoutMode is `current`, so with no command-line argument this mod does nothing at all. See mods/autoraid/README.md and docs/AUTORAID-MAP.md.",
+
+  "//hotkeys": "THE GATE for both key rows below. With this false NOTHING is polled - not GetModuleHandle, not UnityEngine.Input::GetKeyDown - and menuKey/enterKey provably do nothing. It is itself flagged as a keybind row so that a keybinds-only view cannot show you a key while hiding the switch that makes it fire. Default OFF.",
+  "hotkeys": false,
+
+  "//menuKey": "Opens the map menu overlay. Up/Down or 1-9 to choose, Enter to enter that raid, Escape or this key again to close. A UnityEngine.KeyCode NAME (F8, F9, Home, Insert, BackQuote, ...); an unknown name resolves to UNBOUND and says so in the log rather than silently never firing. Needs hotkeys ON. APPLIES LIVE.",
+  "menuKey": "F8",
+
+  "//enterKey": "One key that arms a raid on defaultMap immediately, with no menu drawn - so it keeps working even where the overlay cannot be drawn at all. \"None\" = off, which is the shipped value. Needs hotkeys ON. APPLIES LIVE.",
+  "enterKey": "None",
+
+  "//defaultMap": "The map enterKey uses, and the row the menu starts on. This is the map's DISPLAYED name on the location screen, matched case-insensitively - the only thing that identifies a map on this build, because every tile GameObject is called `Location Template(Clone)`. A map that is not currently on offer is REFUSED, and the refusal names every map that WAS on offer. APPLIES LIVE.",
+  "defaultMap": "Woods",
+
+  "//maps": "Comma-separated DISPLAYED map names, in the order the menu lists them; up to 12 are drawn. These are the maps offered BY THE MENU, not the maps the game is offering right now: the location screen shows only what the current mode allows (MEASURED 2026-09-02: RESERVE, LIGHTHOUSE, INTERCHANGE, CUSTOMS, GROUND ZERO, ICEBREAKER, WOODS - seven of the twelve here). APPLIES LIVE.",
+  "maps": "Customs,Woods,Shoreline,Interchange,Reserve,Lighthouse,Streets of Tarkov,Ground Zero,Factory,Laboratory,Icebreaker,Terminal",
+
+  "//loadoutMode": "SERVER SIDE. `current` (the shipped value) means this mod does NOTHING to your gear: you go in wearing whatever the character wears, and loadout.json is not even opened. `spawned` means the kit in mods/autoraid/loadout.json is CREATED for the raid - the gear you were wearing is moved to the STASH first (never destroyed), and every created item is stripped from the profile at match end so none of it can reach the stash. APPLIES ON RESTART / NEXT RAID: the loadout lands before the client's last profile fetch, which has already happened by the time you can change this.",
+  "loadoutMode": "current",
+
+  "//applyAt": "SERVER SIDE. Which backend event triggers a spawned loadout. `auto` (the shipped value) subscribes to BOTH tarkov.raid.configured and tarkov.profile.selected and applies ONCE PER RAID, idempotently within a two-minute window - which is correct whichever of the two precedes the client's last /client/game/profile/list fetch, and that ordering is a wire measurement rather than something this mod should guess at. `raidconfigured` and `profileselected` pin it to one event, for diagnosing that ordering. APPLIES ON RESTART.",
+  "applyAt": "auto"
+}
