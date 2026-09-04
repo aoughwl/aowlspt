@@ -48,6 +48,18 @@
 ## live-verified.
 ## ===========================================================================
 
+## THE ROUTE, MEASURED. `/aowlspt/settings/index` is the COMPACT index: it
+## carries `{guid,name,count,done,pageRoute,...}` per mod and NO `settings`
+## array at all (`mods/settingshub/settingshub.nim`, `onModsIndex`) -- which is
+## exactly what the deployed run reported: 'registered 11 mod page(s) holding 0
+## row(s) from ONE fetch of /aowlspt/settings/index (960 byte(s))'. 960 bytes
+## for 11 mods is a list of names, not a schema. `/aowlspt/settings/index/full`
+## is the SAME list with each mod's full row array embedded (`onIndexFull`),
+## which is the one-fetch contract this file was written against; the compact
+## route was simply the wrong URL. The lazy-fetch discipline is unchanged and
+## is what `onIndexFull`'s own header demands: on the tab opening, never on a
+## poll, never at boot.
+const cMiRoute = "/aowlspt/settings/index/full"
 const cMiPollMs = 250          ## worker re-poll cadence while we hold the slot
 const cMiStallMs = 8000'u64    ## hard ceiling on the borrow (rule 4, in time)
 const cMiMaxMods = 32          ## bounds the parse; NOT a silent cap -- see below
@@ -68,6 +80,12 @@ var gMiRows = 0
 var gMiDeclined = 0
 var gMiDeclinedFirst = ""
 var gMiTruncated = 0
+## PER-MOD ROW ACCOUNTING. `count` is what the mod itself declared; `rows` is
+## what we actually built. A total is not a check -- one mod with rows hides
+## ten with none, which is how a 0-row tab shipped looking healthy. Named,
+## bounded, and reported as a FAIL that names the mod.
+var gMiShort = ""
+var gMiShortN = 0
 
 proc miRelease() =
   ## Give the shared slot back to whatever the host was polling. Called on
@@ -132,8 +150,14 @@ proc miParseSetting(item: string; row: var SwRow): bool =
   row = SwRow()
   row.key = key
   row.label = (if label.len > 0: label else: key)
+  # THE FIELD NAMES ARE THE ROUTE'S, NOT A GUESS. `aowl/src/aowlspt/settings.nim`
+  # `toJson` emits `category` (and `subcategory`/`path`); it never emits
+  # `group`. Reading `group` could only ever produce a flat page, silently.
+  # `group` is still accepted as a fallback so an older mod that really does
+  # send it is not dropped.
   var grp = ""
-  discard pathGet(item, "group", grp)
+  if not pathGet(item, "category", grp):
+    discard pathGet(item, "group", grp)
   row.category = grp
   let drawable = miKindOf(ty, row)
   if not drawable:
@@ -141,8 +165,14 @@ proc miParseSetting(item: string; row: var SwRow): bool =
     if gMiDeclinedFirst.len == 0:
       gMiDeclinedFirst = key & " (type '" & ty & "')"
     row.label = row.label & "  [" & ty & " - no native control]"
+  # Likewise the current value is `value` -- `toJson` line 400. `current` was
+  # never emitted by anything, so every row drew at its zero default and a
+  # toggle showed OFF for a setting that is ON. Fallback kept for the same
+  # reason as above.
   var cur = ""
-  if pathGet(item, "current", cur):
+  if not pathGet(item, "value", cur):
+    discard pathGet(item, "current", cur)
+  if cur.len > 0:
     if row.kind == swkToggle:
       row.bval = (cur == "1" or cur == "true")
     elif row.kind == swkSlider:
@@ -255,6 +285,25 @@ proc miParse(doc: string): bool =
     swPageRegister(page)
     gMiPages = gMiPages + 1
     gMiRows = gMiRows + page.rows.len
+    # THE CHECK THAT CAN FAIL. Compare what we BUILT against what the MOD
+    # DECLARED (`count`), not against our own parse -- re-reading our own
+    # output is the check that cannot fail. `rowsMissing` is the route saying
+    # it could not look, which is INCONCLUSIVE and is reported as its own
+    # thing, never folded into "0 rows".
+    var declared = ""
+    discard pathGet(mods[m], "count", declared)
+    var missing = ""
+    let inconclusive = pathGet(mods[m], "rowsMissing", missing) and
+                       (missing == "1" or missing == "true")
+    let want = int(modSetParseF64(declared, 0.0))
+    if want > 0 and raw.len < want and gMiShortN < 8:
+      gMiShortN = gMiShortN + 1
+      gMiShort = gMiShort & (if gMiShort.len > 0: ", " else: "") &
+                 (if name.len > 0: name else: guid) & " declares " & $want &
+                 " and rendered " & $raw.len &
+                 (if inconclusive: " (the route said rowsMissing -- it could " &
+                  "not read that mod's page, so this is INCONCLUSIVE rather " &
+                  "than a render failure)" else: "")
     m = m + 1
   if mods.len > cMiMaxMods:
     warn "mods index: the route named " & $mods.len & " mod(s) and this host " &
@@ -273,9 +322,9 @@ proc miArm(now: uint64) =
   gMiPhase = miArmed
   gMiArmedAt = now
   gMiArmedAttempts = overlaySyncAttempts()
-  overlaySyncStart("/aowlspt/settings/index", int32(cMiPollMs))
+  overlaySyncStart(cMiRoute, int32(cMiPollMs))
   okLog "mods index: the MODS tab was opened for the first time, so the " &
-        "settings index is being fetched NOW -- once, lazily, on the " &
+        "settings index (" & cMiRoute & ") is being fetched NOW -- once, lazily, on the " &
         "overlay's worker thread. Deliberately NOT the boot-time per-mod " &
         "fetch that crashes at character-select: this is ONE request for " &
         "every mod and every setting, cached for the session. Borrow ceiling " &
@@ -293,12 +342,12 @@ proc miTick(now: uint64) =
       let attempts = overlaySyncAttempts() - gMiArmedAttempts
       if attempts <= 0'i32:
         miFail("settings index route not served -- the worker never issued a " &
-               "request for /aowlspt/settings/index within " & $cMiStallMs &
+               "request for " & cMiRoute & " within " & $cMiStallMs &
                "ms (attempts-since-arm=0), which is a slot-changeover problem " &
                "rather than a missing route")
       else:
         miFail("settings index route not served -- the worker issued " &
-               $attempts & " request(s) for /aowlspt/settings/index and none " &
+               $attempts & " request(s) for " & cMiRoute & " and none " &
                "returned a body here. Either the route is not implemented yet " &
                "or something else consumed the slot's take cursor first")
     return
@@ -306,13 +355,28 @@ proc miTick(now: uint64) =
   miRelease()
   if miParse(doc):
     okLog "mods index: registered " & $gMiPages & " mod page(s) holding " &
-          $gMiRows & " row(s) from ONE fetch of /aowlspt/settings/index (" &
+          $gMiRows & " row(s) from ONE fetch of " & cMiRoute & " (" &
           $doc.len & " byte(s)), cached for the session -- no per-mod round " &
           "trip and nothing at boot. " & $gMiDeclined & " setting(s) are drawn " &
           "as labelled stubs because this host has no native control for " &
           "their type" &
           (if gMiDeclinedFirst.len > 0: ", first " & gMiDeclinedFirst else: "") &
           ". The shared sync slot has been handed back to live mod control."
+    # THE ROW VERDICT, stated as PASS / FAIL / INCONCLUSIVE and naming the
+    # mod. A tab that renders 0 rows for a mod that declares 14 is the defect
+    # the player reported as "MODS page did nothing"; a total row count could
+    # not see it.
+    if gMiShort.len > 0:
+      warn "mods index ROW VERDICT FAIL: " & $gMiShortN & " mod(s) rendered " &
+           "fewer rows than they declare -- " & gMiShort &
+           ". A mod page showing fewer controls than its schema is the " &
+           "player-visible defect; named here rather than hidden inside the " &
+           "total of " & $gMiRows & "."
+    else:
+      okLog "mods index ROW VERDICT PASS: every mod that declares settings " &
+            "rendered at least as many rows as it declares (" & $gMiRows &
+            " row(s) over " & $gMiPages & " page(s)). Compared against the " &
+            "route's own `count`, not against this host's parse."
     if gMiTruncated > 0:
       warn "mods index: " & $gMiTruncated & " mod(s) declared more settings " &
            "than this host parses per page, so those pages are INCOMPLETE. " &

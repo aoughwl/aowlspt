@@ -318,6 +318,14 @@ var gNtApplying = false
 ## A STOCK tab was selected: hide ours. Set by the postfix when a toggle that
 ## is NOT one of ours turns ON.
 var gNtForeignOn = false
+## THE STOCK GRAPHICS TAB WENT ON. Separate from `gNtForeignOn` because the
+## GRAPHICS edge is classified BEFORE the foreign-toggle branch (it is the
+## strip's furniture) and therefore never reached it -- MEASURED, host log
+## 2026-09-04: 'native subtabs VERDICT FAIL: P1 2 panel(s) active: Graphics
+## Settings (stock), nt-mods (OURS)', repeatedly, after pressing GRAPHICS
+## while the MODS tab was up. Our panel is not the strip, so its ON edge has
+## to hide ours as any other stock selection would.
+var gNtStockGfxOn = false
 var gNtSubVerdictSaid = false
 const NtMaxSubs = 16              ## rule 4: the hard cap on subtabs
 var gNtSubN = 0                   ## how many subtabs were actually built
@@ -882,6 +890,13 @@ proc ntToggleSetFired(regs: Il2CppPtr) =
   # stock tab was selected, hide everything of ours".
   if matchedAs != "other":
     gNtSubPressedGfx = (if turnedOn: 1 else: 0)
+    # ...BUT THE STRIP IS NOT THE ONLY THING OF OURS ON THIS SCREEN. If one of
+    # OUR top-level panels (MODS) is up, a GRAPHICS ON edge is a stock
+    # selection like any other and our panel must go. Recorded as its own flag
+    # and drained in the tick, because `ntHide` is defined far below this
+    # postfix and nothing here may call into the game.
+    if turnedOn:
+      gNtStockGfxOn = true
     return
   # A FOREIGN TOGGLE WENT ON -- a stock tab was selected.
   #
@@ -2788,6 +2803,23 @@ proc ntHide() =
       discard modsSetActive(gNtStockPanels[i], true)
     i = i + 1
 
+proc ntHideOursOnly() =
+  ## OURS OFF, AND NOTHING PUT BACK. Used when the GAME is already raising a
+  ## stock panel of its own (the stock GRAPHICS tab going ON): `ntHide`'s
+  ## restore would put back whichever stock panel was up when we took the
+  ## screen, which -- with Graphics now coming up -- is the two-stock-panels
+  ## picture, the same defect in the other direction. The remembered flags are
+  ## cleared as well, so a LATER `ntHide` cannot resurrect a panel the game has
+  ## since moved on from.
+  if gNtShown >= 0 and gNtShown < gNtPanelGo.len:
+    discard modsSetActive(gNtPanelGo[gNtShown], false)
+  if gNtSubStripGo != nil: discard modsSetActive(gNtSubStripGo, false)
+  gNtShown = -1
+  var i = 0
+  while i < gNtStockWasOn.len and i < 24:
+    gNtStockWasOn[i] = false
+    i = i + 1
+
 proc ntActivePanelNames(oursActive: var bool): (int, string) =
   ## How many panels under SettingsScreen are active, AND WHICH. Naming them
   ## is not decoration: the first verdict said '6 panels are active at once'
@@ -3046,6 +3078,8 @@ proc ntTeardown(why: string) =
   gNtPostFxTabSpawner = nil
   gNtStockPanels = @[]
   gNtStockWasOn = @[]
+  gNtForeignOn = false
+  gNtStockGfxOn = false
   gNtSubToggle = @[]
   gNtSubPageIdx = @[]
   gNtSubStripGo = nil
@@ -3191,6 +3225,19 @@ proc ntTickBody() =
       ntHide()
       gNtVerdictSaid = false
       gNtWhyNext = "a stock tab was selected -- ours must be off"
+  # THE STOCK GRAPHICS TAB GOING ON IS ALSO A STOCK SELECTION.
+  # It is classified above the foreign-toggle branch (it owns the strip), so it
+  # never set `gNtForeignOn` and our MODS panel stayed up beside Graphics --
+  # the P1 FAIL measured 2026-09-04. Drained here, and only when one of ours is
+  # actually shown, so a GRAPHICS press with nothing of ours up is still a
+  # no-op.
+  if gNtStockGfxOn:
+    gNtStockGfxOn = false
+    if gNtShown >= 0:
+      gNtStep = "tick: the stock GRAPHICS tab went ON -- hiding ours"
+      ntHideOursOnly()
+      gNtVerdictSaid = false
+      gNtWhyNext = "the stock GRAPHICS tab was selected -- ours must be off"
   # THE STOCK GRAPHICS TAB EDGE IS NO LONGER ACTED ON HERE.
   #
   # It used to raise and hide the strip and re-apply the selection. That is
