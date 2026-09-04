@@ -158,6 +158,7 @@ const PfxOffToggleTemplate = 0xc0'i32   ## _toggleLeftTemplate
 ## readable, and that the verdict below reads, is the CanvasGroup's own alpha
 ## and interactable, through the getters and not through what we wrote.
 const PfxOffCtrlBlocker  = 0x88'i32  ## SettingControl._blocker : UiElementBlocker
+const PfxOffCtrlTipHover = 0x98'i32  ## SettingControl._tooltipSettingsHover
 const PfxOffCtrlBlocker2 = 0xa0'i32  ## SettingControl._elementBlocker (fallback)
 const PfxOffBlockerGroup = 0x20'i32  ## UiElementBlocker.Group : CanvasGroup
 const PfxAlphaFree    = 1.0'f32      ## MEASURED [.rdata 0x65b6000]
@@ -335,18 +336,29 @@ type
     ## Range and DECLARED DEFAULT, transcribed from `mods/graphics/graphics.nim
     ## :schema()`. Meaningless for `pkToggle` / `pkChoice`.
     lo*, hi*, def*: float32
+    ## THE TOOLTIP BODY, transcribed from the `description =` argument of the
+    ## matching entry in `mods/graphics/graphics.nim:schema()` -- the same text
+    ## the settings-hub page shows. A STATIC MIRROR, exactly like the ranges
+    ## above: it drifts if that file changes and nothing here pretends
+    ## otherwise. The shared "aowlspt original (native D3D11 post-process)"
+    ## preamble every schema entry carries is dropped -- it is identical on all
+    ## 29 and says nothing about the row -- and every body is kept well under
+    ## the 512-character intern cap (`AOWL_NU_MAX_INTERN_LEN`), which is the
+    ## limit that SILENTLY refused four DLSS tooltip bodies on 2026-09-04.
+    tip*: string
 
-proc pfxF(label, key: string; owned: bool; lo, hi, def: float32): PfxRow =
+proc pfxF(label, key: string; owned: bool; lo, hi, def: float32;
+          tip: string = ""): PfxRow =
   PfxRow(kind: pkSlider, label: label, key: key, presetOwned: owned,
-         lo: lo, hi: hi, def: def)
+         lo: lo, hi: hi, def: def, tip: tip)
 
-proc pfxB(label, key: string; owned: bool): PfxRow =
+proc pfxB(label, key: string; owned: bool; tip: string = ""): PfxRow =
   PfxRow(kind: pkToggle, label: label, key: key, presetOwned: owned,
-         lo: 0.0'f32, hi: 0.0'f32, def: 0.0'f32)
+         lo: 0.0'f32, hi: 0.0'f32, def: 0.0'f32, tip: tip)
 
-proc pfxE(label, key: string): PfxRow =
+proc pfxE(label, key: string; tip: string = ""): PfxRow =
   PfxRow(kind: pkChoice, label: label, key: key, presetOwned: false,
-         lo: 0.0'f32, hi: 0.0'f32, def: 0.0'f32)
+         lo: 0.0'f32, hi: 0.0'f32, def: 0.0'f32, tip: tip)
 
 proc pfxCatalogue(): seq[PfxRow] =
   ## The 29 settings `mods/graphics/graphics.nim:schema()` declares, with the
@@ -357,35 +369,103 @@ proc pfxCatalogue(): seq[PfxRow] =
   ## Ordered by the schema's own category, and WITHOUT category headers: a
   ## settings tab has no header prefab, and inventing one out of a label would
   ## be exactly the from-scratch construction this change exists to remove.
-  @[pfxE("Preset", "preset"),
-    pfxB("Enable post-process", "enabled", false),
-    pfxB("Raid only (menu stays stock)", "raidOnly", false),
-    pfxE("Tonemapper", "tonemapper"),
-    pfxF("Tonemap strength", "tonemapStrength", true, 0.0'f32, 1.0'f32, 0.85'f32),
-    pfxF("Exposure (EV)", "exposure", true, -3.0'f32, 3.0'f32, 0.0'f32),
-    pfxF("Contrast", "contrast", true, 0.5'f32, 1.8'f32, 1.05'f32),
-    pfxF("Saturation", "saturation", true, 0.0'f32, 2.0'f32, 1.05'f32),
-    pfxF("Vibrance", "vibrance", true, 0.0'f32, 1.0'f32, 0.35'f32),
-    pfxF("Shadow detail (toe lift)", "shadowDetail", true, 0.0'f32, 1.0'f32, 0.35'f32),
-    pfxF("Temperature", "temperature", true, -1.0'f32, 1.0'f32, 0.0'f32),
-    pfxF("Tint", "tint", true, -1.0'f32, 1.0'f32, 0.0'f32),
-    pfxF("Lift (shadows)", "lift", true, -0.2'f32, 0.2'f32, 0.0'f32),
-    pfxF("Gamma (midtones)", "gamma", true, 0.5'f32, 1.8'f32, 1.0'f32),
-    pfxF("Gain (highlights)", "gain", true, 0.5'f32, 1.8'f32, 1.0'f32),
-    pfxF("Shadow lift (additive)", "shadows", true, -0.2'f32, 0.2'f32, 0.0'f32),
-    pfxF("Highlight roll-off", "highlights", true, 0.5'f32, 2.0'f32, 1.1'f32),
-    pfxF("Sharpening (CAS)", "sharpness", true, 0.0'f32, 1.0'f32, 0.35'f32),
-    pfxB("Bloom", "bloom", true),
-    pfxF("Bloom strength", "bloomStrength", true, 0.0'f32, 2.0'f32, 0.35'f32),
-    pfxF("Bloom threshold", "bloomThreshold", true, 0.0'f32, 1.0'f32, 0.70'f32),
-    pfxF("Vignette", "vignette", true, 0.0'f32, 1.0'f32, 0.18'f32),
-    pfxF("Vignette radius", "vignetteRadius", true, 0.5'f32, 1.5'f32, 1.0'f32),
-    pfxF("Clarity (local contrast)", "clarity", true, 0.0'f32, 1.0'f32, 0.30'f32),
-    pfxF("Film grain", "grain", true, 0.0'f32, 1.0'f32, 0.18'f32),
-    pfxF("Grain size (px)", "grainSize", true, 1.0'f32, 4.0'f32, 1.5'f32),
-    pfxF("Output dither (LSB)", "dither", true, 0.0'f32, 2.0'f32, 1.0'f32),
-    pfxF("Chromatic aberration", "chroma", true, 0.0'f32, 1.0'f32, 0.0'f32),
-    pfxB("Red-tint diagnostic", "diag", false)]
+  @[pfxE("Preset", "preset",
+          "A finished look in one word. While this is anything but " &
+          "'custom' it OWNS every look slider below and they are " &
+          "ignored -- pick 'custom' to drive them yourself. neutral = " &
+          "cleanup only; filmic = the default look; cold-clinical = " &
+          "visibility first (no bloom, no vignette, shadows pulled " &
+          "open); warm-cinematic = the screenshot look; night-owl = " &
+          "dark interiors and night raids."),
+    pfxB("Enable post-process", "enabled", false,
+          "Master switch. Off = the game renders untouched."),
+    pfxB("Raid only (menu stays stock)", "raidOnly", false,
+          "Grade only in-raid; the menu and 2D UI stay stock. Off = " &
+          "grade everywhere (also needed if you run without the " &
+          "backend, which is what supplies the raid signal)."),
+    pfxE("Tonemapper", "tonemapper",
+          "0 none, 1 AgX (filmic, neutral highlights), 2 ACES."),
+    pfxF("Tonemap strength", "tonemapStrength", true, 0.0'f32, 1.0'f32, 0.85'f32,
+          "Blend of the tonemap look over the linear image."),
+    pfxF("Exposure (EV)", "exposure", true, -3.0'f32, 3.0'f32, 0.0'f32,
+          "EV bias applied before the tonemap."),
+    pfxF("Contrast", "contrast", true, 0.5'f32, 1.8'f32, 1.05'f32,
+          "Contrast around 18% mid-grey, in linear."),
+    pfxF("Saturation", "saturation", true, 0.0'f32, 2.0'f32, 1.05'f32,
+          "0 greyscale, 1 neutral, above 1 vivid."),
+    pfxF("Vibrance", "vibrance", true, 0.0'f32, 1.0'f32, 0.35'f32,
+          "Saturation weighted by how unsaturated a pixel already is. " &
+          "Gains colour separation without turning foliage neon, which " &
+          "a flat saturation multiplier does. Free (no extra taps)."),
+    pfxF("Shadow detail (toe lift)", "shadowDetail", true, 0.0'f32, 1.0'f32, 0.35'f32,
+          "Re-lifts ONLY the toe after contrast, so raising contrast " &
+          "does not cost you the ability to see a player standing in a " &
+          "doorway. Free."),
+    pfxF("Temperature", "temperature", true, -1.0'f32, 1.0'f32, 0.0'f32,
+          "Cool (-) to warm (+)."),
+    pfxF("Tint", "tint", true, -1.0'f32, 1.0'f32, 0.0'f32,
+          "Green (-) to magenta (+)."),
+    pfxF("Lift (shadows)", "lift", true, -0.2'f32, 0.2'f32, 0.0'f32,
+          "Lift, Gamma, Gain: the SHADOW end of the classic three-way " &
+          "grade."),
+    pfxF("Gamma (midtones)", "gamma", true, 0.5'f32, 1.8'f32, 1.0'f32,
+          "Lift, Gamma, Gain: the MIDTONE end of the classic three-way " &
+          "grade."),
+    pfxF("Gain (highlights)", "gain", true, 0.5'f32, 1.8'f32, 1.0'f32,
+          "Lift, Gamma, Gain: the HIGHLIGHT end of the classic " &
+          "three-way grade."),
+    pfxF("Shadow lift (additive)", "shadows", true, -0.2'f32, 0.2'f32, 0.0'f32,
+          "From TarkovGraphics (the original's grade knob), " &
+          "reimplemented in aowlspt's native post-process. Matches the " &
+          "original TarkovGraphics shadow knob."),
+    pfxF("Highlight roll-off", "highlights", true, 0.5'f32, 2.0'f32, 1.1'f32,
+          "From TarkovGraphics (the original's grade knob), " &
+          "reimplemented in aowlspt's native post-process. Pre-tonemap " &
+          "highlight compression."),
+    pfxF("Sharpening (CAS)", "sharpness", true, 0.0'f32, 1.0'f32, 0.35'f32,
+          "Contrast-adaptive sharpening, applied after the grade."),
+    pfxB("Bloom", "bloom", true,
+          "Bloom on or off."),
+    pfxF("Bloom strength", "bloomStrength", true, 0.0'f32, 2.0'f32, 0.35'f32,
+          "How much of the bright pass is added back over the frame."),
+    pfxF("Bloom threshold", "bloomThreshold", true, 0.0'f32, 1.0'f32, 0.70'f32,
+          "Luma knee for the bright pass. Raise it so only real light " &
+          "sources bloom."),
+    pfxF("Vignette", "vignette", true, 0.0'f32, 1.0'f32, 0.18'f32,
+          "Corner darkening strength."),
+    pfxF("Vignette radius", "vignetteRadius", true, 0.5'f32, 1.5'f32, 1.0'f32,
+          "How far in from the corners the vignette begins."),
+    pfxF("Clarity (local contrast)", "clarity", true, 0.0'f32, 1.0'f32, 0.30'f32,
+          "Wide-radius local contrast. This is what makes a flat, hazy " &
+          "frame read as three-dimensional. Costs 4 texture taps; " &
+          "masked to mid-tones so it cannot crush blacks or blow " &
+          "highlights."),
+    pfxF("Film grain", "grain", true, 0.0'f32, 1.0'f32, 0.18'f32,
+          "Animated, weighted toward the shadows -- where real grain " &
+          "lives and where banding lives. Free."),
+    pfxF("Grain size (px)", "grainSize", true, 1.0'f32, 4.0'f32, 1.5'f32,
+          "Grain cell size, in pixels."),
+    pfxF("Output dither (LSB)", "dither", true, 0.0'f32, 2.0'f32, 1.0'f32,
+          "Triangular-PDF noise at about 1 least-significant bit before " &
+          "the 8-bit write. The cheapest real win here: it is the only " &
+          "thing that kills banding in dark interiors. Leave it on."),
+    pfxF("Chromatic aberration", "chroma", true, 0.0'f32, 1.0'f32, 0.0'f32,
+          "Radial, red/blue only, exactly zero at the screen centre so " &
+          "it never smears what you are aiming at. Off by default. " &
+          "Costs 2 texture taps."),
+    pfxB("Red-tint diagnostic", "diag", false,
+          "Tints the frame red to confirm the blit lands.")]
+
+## Parallel to `gPfxRowGo`: the tooltip body each row should show, and the row
+## KIND. Both are needed after the build loop -- the tooltip pass because the
+## catalogue is not re-walked there, and the alignment pass because only the
+## toggle rows are touched and re-deriving "is this a toggle" from the live
+## object would be a guess where the catalogue already holds the fact.
+##
+## Declared here rather than beside `gPfxRowCtrl` for one boring reason:
+## `PfxKind` is declared below that point and Nim needs the type first.
+var gPfxRowTip: seq[string] = @[]
+var gPfxRowKind: seq[PfxKind] = @[]
 
 proc pfxNoteFault(what: string) =
   inc gPfxFaults
@@ -2222,6 +2302,393 @@ proc pfxGrayTick() =
                 "the Toggle::Set drain (stock " & (if onS: "ON" else: "OFF") &
                 ", ours " & (if onO: "ON" else: "OFF") & ")")
 
+## ---------------------------------------------------------------------------
+## TOOLTIPS, AND TOGGLE-CAPTION ALIGNMENT
+##
+## Both were reported by the player against the deployed build 61238a816f58:
+## "some fields have no tooltip" (every PostFX row: this file had never called
+## SetTooltip at all) and the toggle rows rendering CENTRE-aligned while stock
+## toggle rows do not.
+##
+## THE TOOLTIP MECHANISM IS NOT NEW HERE, and deliberately so. It is exactly
+## the one `dlssrows.nim` proved live on the Graphics page: borrow a live
+## `SettingsTooltipData` from a stock row (`SettingControl._tooltipSettings-
+## Hover@0x98 -> _tooltipData@0x20`), take its class pointer out of the
+## object header, allocate against THAT, fill it through hostfieldwrite's
+## typed FieldRef gate, hand it to `SettingControl::SetTooltip` @0x16FAC00 and
+## then RE-READ the control. The shared half now lives in `nativeui.nim` as
+## `nuMakeTooltipData`, so this file and dlssrows cannot drift apart.
+##
+## `SetTooltip` has THREE no-op paths and no throw path (MEASURED `disasm
+## 0x16fac00 --len 940`: `_blocker@0x88` null, `UiElementBlocker::TryGetTooltip`
+## false, or a null data argument -- each returns `this` untouched). So a
+## successful call proves nothing, and the verdict reads
+## `_tooltipSettingsHover@0x98 -> _tooltipData@0x20 -> Text@0x20` back and
+## demands POINTER IDENTITY with the interned string handed over. SetTooltip
+## copies the REFERENCE (MEASURED `mov rax,[rbp+0x20] ; mov [rdi+0x20],rax`),
+## so identity is a real finished-state test.
+##
+## THE DONOR COMES FROM THE GRAPHICS PAGE, not this one. The stock PostFX panel
+## is EMPTY on this build (`PostFXSettingsTab::Show` / `OnFirstSelect` never
+## run -- see the scroll verdict below), so there is no stock PostFX row to
+## borrow anything from. `gGfxPanelT` is the live, already-validated Graphics
+## panel transform this file's geometry donor also walks from.
+const PfxMaxTipScan = 32
+
+var gPfxTipsOn = false        ## `settingsPostFxTooltips`, DEFAULT OFF
+var gPfxTipInit = false
+var gPfxTipKlass: Il2CppPtr = nil
+var gPfxTipAsked = 0
+var gPfxTipCalled = 0
+var gPfxTipVerified = 0
+var gPfxTipWhy = ""
+var gPfxTipWant: seq[Il2CppPtr] = @[]
+
+var gPfxAlignOn = false       ## `settingsPostFxToggleAlign`, DEFAULT OFF
+var gPfxAlignInit = false
+var gPfxAlignAsked = 0
+var gPfxAlignCopied = 0
+var gPfxAlignVerified = 0
+var gPfxAlignInconclusive = 0
+var gPfxAlignWhy = ""
+var gPfxAlignStockX = 0.0'f32
+var gPfxAlignHaveStock = false
+
+proc pfxGfxContainer(): Il2CppPtr =
+  ## The stock Graphics row container, reached by WALKING from the live
+  ## "Graphics Settings" panel transform this feature already located and
+  ## validated -- `gGfxPanelT` -> `GraphicsSettingsTab` component ->
+  ## `_settingsContainer@0x98`. Never by an offset that can read null from
+  ## nowhere. Identical to the walk `pfxDonorGeom` makes; factored out because
+  ## two more callers now need it.
+  result = nil
+  if gGfxPanelT == nil or not duOk(gGfxPanelT, 0x20'i32): return
+  if not iUnityAlive(gGfxPanelT): return
+  let gfxTab = modsComponent(gGfxPanelT, "GraphicsSettingsTab")
+  if not nuOk(gfxTab, PfxOffGfxContainer + 8'i32): return
+  let cont = cNuGetRef(gfxTab, PfxOffGfxContainer)
+  if not nuOk(cont, 0x10'i32) or not nuAlive(cont): return
+  cont
+
+proc pfxStockRowComponent(compName: string; why: var string): Il2CppPtr =
+  ## The FIRST stock row in the Graphics container carrying component
+  ## `compName` -- a `SettingToggle` for the alignment donor, anything with a
+  ## tooltip for the tooltip donor.
+  ##
+  ## "(Clone)" IS THE DISCRIMINATOR, and it is exact rather than heuristic:
+  ## Unity names every `Instantiate` result `<donor>(Clone)`, our rows are all
+  ## instantiated, and the game's own rows never carry that suffix. Without
+  ## this the walk would happily pick one of OUR rows as the donor -- a
+  ## comparison of a thing against itself, which is the check that cannot fail
+  ## this repo keeps paying for.
+  result = nil
+  why = ""
+  let cont = pfxGfxContainer()
+  if cont == nil:
+    why = "the stock Graphics row container could not be reached by walking " &
+          "from the live 'Graphics Settings' panel transform (gGfxPanelT -> " &
+          "GraphicsSettingsTab -> _settingsContainer@0x98)"
+    return
+  var n = 0
+  if not iChildCount(cont, n) or n <= 0:
+    why = "the stock Graphics row container reports " & $n & " child(ren)"
+    return
+  var i = 0
+  var seen = 0
+  var clones = 0
+  while i < n and i < PfxMaxTipScan:
+    let c = iChildAt(cont, i)
+    i = i + 1
+    if c == nil or not duOk(c, 0x20'i32) or not iUnityAlive(c): continue
+    if iObjName(c).contains("(Clone)"):
+      clones = clones + 1
+      continue
+    seen = seen + 1
+    let comp = modsComponent(c, compName)
+    if comp != nil and nuOk(comp, 0x10'i32): return comp
+  why = "none of the " & $seen & " stock (non-clone) row(s) examined in the " &
+        "Graphics container carries a '" & compName & "' component (" &
+        $clones & " child(ren) skipped as our own clones, out of " & $n & ")"
+
+proc pfxDonorTooltipData(why: var string): Il2CppPtr =
+  ## A LIVE `SettingsTooltipData`, borrowed off a stock Graphics row, so that
+  ## `il2cpp_object_new` gets a class pointer that came out of an object the
+  ## GAME made rather than out of any metadata lookup.
+  result = nil
+  why = ""
+  let cont = pfxGfxContainer()
+  if cont == nil:
+    why = "the stock Graphics row container could not be reached, so no " &
+          "SettingsTooltipData can be borrowed and none is invented"
+    return
+  var n = 0
+  if not iChildCount(cont, n) or n <= 0:
+    why = "the stock Graphics row container reports " & $n & " child(ren)"
+    return
+  var i = 0
+  var probed = 0
+  while i < n and i < PfxMaxTipScan:
+    let c = iChildAt(cont, i)
+    i = i + 1
+    if c == nil or not duOk(c, 0x20'i32) or not iUnityAlive(c): continue
+    if iObjName(c).contains("(Clone)"): continue
+    for cn in ["SettingToggle", "SettingFloatSlider", "SettingDropDown",
+               "SettingSelectSlider"]:
+      let ctrl = modsComponent(c, cn)
+      if ctrl == nil: continue
+      probed = probed + 1
+      let d = nuTooltipDataOf(ctrl)
+      if d != nil: return d
+  why = "of the stock Graphics rows examined, " & $probed & " carried a " &
+        "SettingControl and NONE of them had a live " &
+        "_tooltipSettingsHover@0x98 -> _tooltipData@0x20 to borrow. Without " &
+        "a donor there is no class pointer to allocate against, and none is " &
+        "invented"
+
+proc pfxApplyTooltips() =
+  ## Attach the schema's own description to every row we built, then VERIFY by
+  ## reading the finished state back. Runs ONCE per build; nothing here is on
+  ## a per-frame path and nothing here allocates after it has run.
+  if not gPfxTipInit:
+    gPfxTipInit = true
+    gPfxTipsOn = readBoolKeyDef("settingsPostFxTooltips", false)
+  if not gPfxTipsOn or gPfxRowCtrl.len == 0: return
+  gPfxTipWant = @[]
+  var z = 0
+  while z < gPfxRowCtrl.len and z < PfxMaxRows:
+    gPfxTipWant.add nil
+    z = z + 1
+  var wd0 = ""
+  let donor = pfxDonorTooltipData(wd0)
+  if donor == nil:
+    gPfxTipWhy = wd0
+    return
+  gPfxTipKlass = nuKlassOf(donor)
+  if gPfxTipKlass == nil:
+    gPfxTipWhy = "the donor SettingsTooltipData's object header did not read " &
+                 "back a class pointer"
+    return
+  var i = 0
+  while i < gPfxRowCtrl.len and i < PfxMaxRows and i < gPfxRowTip.len:
+    if gPfxRowTip[i].len > 0 and gPfxRowCtrl[i] != nil:
+      gPfxTipAsked = gPfxTipAsked + 1
+      var wb = ""
+      var wd = ""
+      let body = nuStrWhy(gPfxRowTip[i], wb)
+      let data = nuMakeTooltipData(gPfxTipKlass, "postfxrows.tooltip",
+                                   gPfxRowName[i], gPfxRowTip[i], wd)
+      if data != nil and body != nil:
+        gPfxTipWant[i] = body
+        if nuSetTooltip(gPfxRowCtrl[i], data):
+          gPfxTipCalled = gPfxTipCalled + 1
+        else:
+          warn "postfx rows: tooltip '" & gPfxRowName[i] & "' -- the template " &
+               "was BUILT and SetTooltip was refused before it was made (the " &
+               "control did not validate, or the @0x16FAC00 prologue did not " &
+               "verify). Nothing was called for this row."
+      else:
+        # ONE LINE PER FAILING ROW, naming the row AND the cause. Recording
+        # only the FIRST failure into a shared string made four rows failing
+        # for one reason read as one row failing for another -- MEASURED, on
+        # the DLSS rows, 2026-09-04.
+        warn "postfx rows: tooltip '" & gPfxRowName[i] & "' NOT applied -- " &
+             (if data == nil: wd else: "the body string: " & wb) & "."
+        if gPfxTipWhy.len == 0:
+          gPfxTipWhy = "first failure was '" & gPfxRowName[i] & "': " &
+                       (if data == nil: wd else: wb)
+    i = i + 1
+  # THE VERDICT: a property of the FINISHED STATE. The tooltip the control now
+  # carries must BE the string handed over, read back through the control,
+  # from the object the GAME constructed out of our template.
+  var i2 = 0
+  while i2 < gPfxRowCtrl.len and i2 < PfxMaxRows and i2 < gPfxTipWant.len:
+    if gPfxTipWant[i2] != nil:
+      if nuTooltipTextOf(gPfxRowCtrl[i2]) == gPfxTipWant[i2]:
+        gPfxTipVerified = gPfxTipVerified + 1
+      else:
+        let hov = (if nuOk(gPfxRowCtrl[i2], PfxOffCtrlTipHover + 8'i32):
+                     cNuGetRef(gPfxRowCtrl[i2], PfxOffCtrlTipHover) else: nil)
+        let blk = (if nuOk(gPfxRowCtrl[i2], PfxOffCtrlBlocker + 8'i32):
+                     cNuGetRef(gPfxRowCtrl[i2], PfxOffCtrlBlocker) else: nil)
+        warn "postfx rows: tooltip '" & gPfxRowName[i2] & "' -- SetTooltip " &
+             "was CALLED and the finished state does NOT carry our string. " &
+             "On this row _tooltipSettingsHover@0x98 = " &
+             (if hov == nil: "NULL" else: "0x" & hexOf(cast[uint64](hov))) &
+             " and _blocker@0x88 = " &
+             (if blk == nil: "NULL" else: "0x" & hexOf(cast[uint64](blk))) &
+             ". A NULL blocker is SetTooltip's FIRST no-op path and means " &
+             "this prefab needs a SettingsHoverTooltipArea before any " &
+             "tooltip can attach; a non-null blocker with a null hover area " &
+             "means TryGetTooltip answered false. Either way this row shows " &
+             "NO tooltip and is not counted as a pass."
+    i2 = i2 + 1
+
+## ---------------------------------------------------------------------------
+## TOGGLE-CAPTION ALIGNMENT
+##
+## OBSERVED (the player, on build 61238a816f58): our toggle rows -- "Red tint
+## diagnostic", "Enable post-process", "Raid only" -- render CENTRE-aligned
+## while stock toggle rows do not.
+##
+## WHAT IS AND IS NOT ALREADY DONE. `pfxMakeRow` applies `nuApplyGeomX` to each
+## ROW's own RectTransform, copying anchorMin.x / anchorMax.x / pivot.x /
+## sizeDelta.x from a stock Graphics row. It does NOT touch anchoredPosition
+## (correctly -- the parent LayoutGroup owns that) and, more to the point, it
+## does not touch anything INSIDE the row. The caption's placement is authored
+## in the prefab, and our toggles come from `PostFXSettingsTab._toggleLeft-
+## Template@0xc0` while every stock toggle row on screen came from the GRAPHICS
+## tab's own toggle template. Two different prefabs, two different authored
+## caption rects; nothing in the row-level copy can equalise them.
+##
+## WHAT IS DELIBERATELY NOT ASSERTED. This code does NOT claim to know which
+## property differs. Reading the source cannot establish that, the live tree
+## dump in `docs/settings-tree-live-2026-09-02.txt` records no RectTransform
+## numbers for either row, and a subagent may not drive the client. So the
+## whole X half of the stock caption's rect is MEASURED LIVE and copied, and
+## the LOG PRINTS BOTH GEOMETRIES -- so the next run says which property was
+## wrong even though this run did not need to know.
+##
+## THE VERDICT IS A NEGATIVE AND IT CAN FAIL: our caption's left edge, computed
+## as `anchoredPosition.x + rect.x` (the pivot-corrected left edge -- see
+## `nuCtrlLabelLeft`), must sit within 1 px of the STOCK toggle row's. A
+## centred caption in a differently sized rect cannot pass that by accident,
+## and "the label could not be read at all" is a THIRD outcome, counted apart.
+const PfxAlignTolPx = 1.0'f32
+
+proc pfxAlignToggleLabels() =
+  ## Copy the stock toggle row's caption geometry onto each of our toggle rows,
+  ## then judge by re-reading the finished left edge.
+  if not gPfxAlignInit:
+    gPfxAlignInit = true
+    gPfxAlignOn = readBoolKeyDef("settingsPostFxToggleAlign", false)
+  if not gPfxAlignOn or gPfxRowCtrl.len == 0: return
+  var whyStock = ""
+  let stockCtrl = pfxStockRowComponent("SettingToggle", whyStock)
+  if stockCtrl == nil:
+    gPfxAlignWhy = "no STOCK toggle row could be found to measure -- " &
+                   whyStock & ". Nothing was written; our rows keep the " &
+                   "prefab's own caption placement, which is the defect"
+    return
+  let stockG = nuCtrlLabelGeom(stockCtrl)
+  if not stockG.ok:
+    gPfxAlignWhy = "a stock SettingToggle was found and its caption TMP's " &
+                   "RectTransform could not be read in full " &
+                   "(SettingControl.Text@0x80 -> _labels@0x78 -> [0]). A " &
+                   "partial geometry is not a measurement, so nothing was " &
+                   "copied"
+    return
+  let (okS, stockX) = nuCtrlLabelLeft(stockCtrl)
+  if not okS:
+    gPfxAlignWhy = "the stock caption's left edge could not be computed"
+    return
+  gPfxAlignStockX = stockX
+  gPfxAlignHaveStock = true
+  okLog "postfx rows: STOCK TOGGLE CAPTION MEASURED LIVE -- " &
+        nuGeomNote(stockG) & ", left edge (anchoredPosition.x + rect.x) = " &
+        nuF(stockX) & ". This is the geometry our toggle captions are copied " &
+        "to, read off a row the GAME built."
+  var i = 0
+  while i < gPfxRowCtrl.len and i < PfxMaxRows and i < gPfxRowKind.len:
+    if gPfxRowKind[i] != pkToggle or gPfxRowCtrl[i] == nil:
+      i = i + 1
+      continue
+    gPfxAlignAsked = gPfxAlignAsked + 1
+    let (okB, beforeX) = nuCtrlLabelLeft(gPfxRowCtrl[i])
+    let beforeG = nuCtrlLabelGeom(gPfxRowCtrl[i])
+    var w = ""
+    if not nuCopyLabelGeom(gPfxRowCtrl[i], stockG, w):
+      gPfxAlignInconclusive = gPfxAlignInconclusive + 1
+      if gPfxAlignWhy.len == 0:
+        gPfxAlignWhy = "'" & gPfxRowName[i] & "': " & w
+      i = i + 1
+      continue
+    gPfxAlignCopied = gPfxAlignCopied + 1
+    let (okA, afterX) = nuCtrlLabelLeft(gPfxRowCtrl[i])
+    if not okA:
+      gPfxAlignInconclusive = gPfxAlignInconclusive + 1
+      if gPfxAlignWhy.len == 0:
+        gPfxAlignWhy = "'" & gPfxRowName[i] & "': the five setters were " &
+                       "called and the caption's left edge could not be read " &
+                       "back afterwards, so this row is INCONCLUSIVE -- " &
+                       "neither aligned nor proven misaligned"
+      i = i + 1
+      continue
+    let d = (if afterX > stockX: afterX - stockX else: stockX - afterX)
+    if d <= PfxAlignTolPx:
+      gPfxAlignVerified = gPfxAlignVerified + 1
+    else:
+      warn "postfx rows: ALIGN '" & gPfxRowName[i] & "' -- the stock toggle " &
+           "caption's left edge is " & nuF(stockX) & " and ours reads " &
+           nuF(afterX) & " after the copy (" & nuF(d) & " px out, tolerance " &
+           nuF(PfxAlignTolPx) & "). BEFORE the copy it was " &
+           (if okB: nuF(beforeX) else: "unreadable") & " and its rect was " &
+           (if beforeG.ok: nuGeomNote(beforeG) else: "unreadable") &
+           "; the stock rect is " & nuGeomNote(stockG) & ". Those two lines " &
+           "name the property that still differs -- this file does not guess " &
+           "which one it is."
+      if gPfxAlignWhy.len == 0:
+        gPfxAlignWhy = "'" & gPfxRowName[i] & "': " & nuF(d) & " px out " &
+                       "after the copy"
+    i = i + 1
+
+proc pfxTooltipVerdict() =
+  ## ONE line, and it can FAIL. Silence would make "the flag is off" and "the
+  ## flag is on and every row refused" print identically.
+  if not gPfxTipsOn:
+    info "postfx rows: TOOLTIPS are OFF (settingsPostFxTooltips). No row " &
+         "carries a description, which is the state the player reported; " &
+         "turn the flag on to attach them."
+    return
+  if gPfxTipAsked == 0:
+    warn "postfx rows: TOOLTIPS -- the flag is ON and ZERO rows were even " &
+         "asked. " & (if gPfxTipWhy.len > 0: gPfxTipWhy
+                      else: "No reason was recorded, which is itself a defect") &
+         "."
+  elif gPfxTipVerified == gPfxTipAsked:
+    okLog "postfx rows: TOOLTIPS -- " & $gPfxTipVerified & " of " &
+          $gPfxTipAsked & " row(s) READ BACK through " &
+          "_tooltipSettingsHover@0x98 -> _tooltipData@0x20 -> Text@0x20 as " &
+          "the exact string handed to SettingControl::SetTooltip @0x16FAC00. " &
+          "Texts are mods/graphics' own schema descriptions. That is the " &
+          "object the GAME built from our template, read through the control " &
+          "-- not our own write read back."
+  else:
+    warn "postfx rows: TOOLTIPS -- only " & $gPfxTipVerified & " of " &
+         $gPfxTipAsked & " row(s) read back (" & $gPfxTipCalled &
+         " call(s) made). The rest show NO tooltip. First reason: " &
+         (if gPfxTipWhy.len > 0: gPfxTipWhy
+          else: "none was recorded, which is itself a defect") & "."
+
+proc pfxAlignVerdict() =
+  ## ONE line, three outcomes, and the PASS is a negative: no toggle caption of
+  ## ours is more than 1 px from the stock one's left edge.
+  if not gPfxAlignOn:
+    info "postfx rows: TOGGLE-CAPTION ALIGNMENT is OFF " &
+         "(settingsPostFxToggleAlign). Our toggle rows keep the " &
+         "_toggleLeftTemplate@0xc0 prefab's own authored caption placement, " &
+         "which is the centred rendering the player reported."
+    return
+  if gPfxAlignAsked == 0:
+    warn "postfx rows: TOGGLE ALIGNMENT -- the flag is ON and ZERO toggle " &
+         "rows were examined. " &
+         (if gPfxAlignWhy.len > 0: gPfxAlignWhy
+          else: "No reason was recorded, which is itself a defect") & "."
+  elif gPfxAlignVerified == gPfxAlignAsked and gPfxAlignInconclusive == 0:
+    okLog "postfx rows: TOGGLE ALIGNMENT -- all " & $gPfxAlignVerified &
+          " of our toggle row(s) now have a caption whose left edge " &
+          "(anchoredPosition.x + rect.x, pivot-corrected) is within " &
+          nuF(PfxAlignTolPx) & " px of a STOCK SettingToggle row's, measured " &
+          "live at " & nuF(gPfxAlignStockX) & ". That is a comparison against " &
+          "a row the GAME built, not against our own write."
+  else:
+    warn "postfx rows: TOGGLE ALIGNMENT -- " & $gPfxAlignVerified & " of " &
+         $gPfxAlignAsked & " toggle row(s) line up with the stock caption (" &
+         $gPfxAlignCopied & " copied, " & $gPfxAlignInconclusive &
+         " INCONCLUSIVE -- could not be measured, which is neither a pass nor " &
+         "a fail). First reason: " &
+         (if gPfxAlignWhy.len > 0: gPfxAlignWhy
+          else: "none was recorded, which is itself a defect") & "."
+
 proc pfxBuild(): bool =
   ## Build the catalogue into the live PostFX panel. Called ONCE, from the
   ## tick, only after the panel has actually been observed up.
@@ -2283,6 +2750,8 @@ proc pfxBuild(): bool =
   gPfxRowWant = @[]
   gPfxRowName = @[]
   gPfxRowCtrl = @[]
+  gPfxRowTip = @[]
+  gPfxRowKind = @[]
   gPfxDeclined = @[]
   var built = 0
   var refused = 0
@@ -2310,6 +2779,11 @@ proc pfxBuild(): bool =
       gPfxRowCtrl.add ct
       gPfxRowWant.add r.def
       gPfxRowName.add r.key
+      # The schema description and the row KIND, from the catalogue entry this
+      # iteration is already holding. Kept parallel to `gPfxRowCtrl` so the two
+      # passes below never re-derive either from the live object.
+      gPfxRowTip.add r.tip
+      gPfxRowKind.add r.kind
       built = built + 1
       # THE VALUE BINDING (settingsbind.nim), flag `settingsRowsBind`, default
       # OFF -- with it off both calls return false having done nothing and the
@@ -2340,6 +2814,14 @@ proc pfxBuild(): bool =
                  "an unreachable row kind). Nothing is left in the panel.")
     discard pfxDestroyAll()
     return
+  # THE TOOLTIPS AND THE TOGGLE-CAPTION ALIGNMENT. Both run ONCE, here, after
+  # every row exists and after the value binding has seeded them; both are
+  # separately flag-gated and DEFAULT OFF; and both judge by re-reading the
+  # live object rather than by trusting their own calls. Their verdict lines
+  # are printed from `pfxVerdict`, not from here, so a build that never
+  # reaches the verdict cannot claim either of them succeeded.
+  pfxApplyTooltips()
+  pfxAlignToggleLabels()
   # THE BANNER IS GONE, AND ITS SENTENCE IS HERE INSTEAD.
   #
   # MEASURED on the deployed build (user report + live rect): the from-scratch
@@ -2611,6 +3093,13 @@ proc pfxVerdict() =
           "-- a different method than the one that wrote it. " & $gPfxDeclined.len & " setting(s) have NO row at all " &
           "and that is deliberate, not a failure: their kind is a dropdown, " &
           "whose binds are generic and have no offline address."
+  # TWO MORE VERDICTS, EACH ITS OWN LINE AND EACH ABLE TO FAIL. They are NOT
+  # folded into the PASS above: a page whose rows are all present, correctly
+  # sized and correctly valued can still have no tooltips and centred toggle
+  # captions -- which is exactly what the player reported on 61238a816f58,
+  # while that PASS line was printing.
+  pfxTooltipVerdict()
+  pfxAlignVerdict()
 
 proc pfxOnPanelUp(postUp: bool) =
   ## Called every tick from `gfxTickBody`, inside its existing guard. The

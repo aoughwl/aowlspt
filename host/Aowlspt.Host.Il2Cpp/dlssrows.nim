@@ -148,6 +148,13 @@ var gDlrRowT: seq[Il2CppPtr] = @[]   ## each row's TRANSFORM, for placement
 var gDlrRowCtrl: seq[Il2CppPtr] = @[]  ## each row's SettingControl, for tooltips
 var gDlrRowTip: seq[string] = @[]      ## the tooltip body each row should show
 var gDlrTipWant: seq[Il2CppPtr] = @[]  ## the INTERNED string handed to SetTooltip
+## THE DROPDOWN LABEL. Parallel to `gDlrRowGo`: the `EFT.UI.DropDownBox` the
+## builder already held (never re-found), and the caption list that row
+## declares. Both are needed AFTER the build loop because the index a row ends
+## up on is decided inside `sbdRegisterDropdown` from the player's config, and
+## the label has to name whichever value that was.
+var gDlrRowDdb: seq[Il2CppPtr] = @[]
+var gDlrRowChoices: seq[seq[string]] = @[]
 var gDlrPlaced = -1       ## rows whose sibling index READ BACK as asked
 var gDlrPlaceWhy = ""     ## why placement did not happen, when it did not
 var gDlrRestartShown = 0
@@ -163,6 +170,17 @@ var gDlrDropWhy = ""
 ## player can see a tooltip: it counts rows whose `_tooltipSettingsHover@0x98
 ## -> _tooltipData@0x20 -> Text@0x20` READ BACK as the exact interned string
 ## that was handed to SetTooltip.
+## THE LABEL CENSUS. `gDlrLblVerified` is the only number that means the player
+## can READ the value: it counts boxes whose `_currentValueText@0xf0` TMP reads
+## back the chosen caption. `gDlrLblInconclusive` is the third outcome and is
+## NOT folded into either of the other two -- a `DropDownBoxNewStyle` receiver
+## has no `_currentValueText` field at all, so "could not look" must not print
+## as "the label is wrong".
+var gDlrLblAsked = 0
+var gDlrLblCalled = 0
+var gDlrLblVerified = 0
+var gDlrLblInconclusive = 0
+var gDlrLblWhy = ""
 var gDlrTipAsked = 0
 var gDlrTipCalled = 0
 var gDlrTipVerified = 0
@@ -294,6 +312,8 @@ proc dlrDestroyAll(): int =
   gDlrRowCtrl = @[]
   gDlrRowTip = @[]
   gDlrTipWant = @[]
+  gDlrRowDdb = @[]
+  gDlrRowChoices = @[]
   gDlrDropWanted = 0
   gDlrDropBuilt = 0
   gDlrDropWhy = ""
@@ -520,75 +540,16 @@ proc dlrDonorTooltipData(parent: Il2CppPtr): Il2CppPtr =
     i = i + 1
 
 proc dlrMakeTooltipData(title, body: string; why: var string): Il2CppPtr =
-  ## One `SettingsTooltipData` TEMPLATE, allocated against the donor's klass
-  ## and filled through `hostfieldwrite`'s typed gate.
+  ## ONE `SettingsTooltipData` TEMPLATE for a DLSS row.
   ##
-  ## `frAdmit` is called on this receiver because its type is a FACT and not an
-  ## inference: `il2cpp_object_new(klass)` returns an object OF klass, and
-  ## klass was read out of a live donor's object header a moment earlier. That
-  ## is the standard hostfieldwrite.nim asks for -- "an object the game itself
-  ## just handed back", one hop removed.
-  ##
-  ## Key / UsageStyle / UsageProperty are all `None = 0`, MEASURED with
-  ## `il2cpp_resolve.py enum` on ESettingsOption, EUsageStyle and
-  ## EUsageProperty. These rows are not BSG settings and must not claim one of
-  ## BSG's option keys or advertise a CPU/GPU cost the host has not measured.
-  result = nil
-  why = ""
-  if gDlrTipKlass == nil:
-    why = "no donor class pointer"
-    return
-  let obj = cNuObjectNew(gDlrTipKlass)
-  if not nuOk(obj, 0x38'i32):
-    why = "il2cpp_object_new(donor klass) returned " &
-          (if obj == nil: "null" else: "0x" & hexOf(cast[uint64](obj)) &
-           ", which is not readable for the 0x38 bytes SettingsTooltipData " &
-           "declares")
-    return
-  if not frAdmit("dlssrows.tooltip", frTtdText(), obj):
-    why = "the fieldref klass allowlist refused to admit the allocated " &
-          "object (its own 'hostwrite REFUSED' line says on which ground)"
-    return
-  discard frAdmit("dlssrows.tooltip", frTtdKey(), obj)
-  discard frAdmit("dlssrows.tooltip", frTtdTitle(), obj)
-  discard frAdmit("dlssrows.tooltip", frTtdUsageStyle(), obj)
-  discard frAdmit("dlssrows.tooltip", frTtdUsageProp(), obj)
-  discard frAdmit("dlssrows.tooltip", frTtdUsageText(), obj)
-  var w1 = ""
-  var w2 = ""
-  var w3 = ""
-  let ts = nuStrWhy(title, w1)
-  let bs = nuStrWhy(body, w2)
-  let es = nuStrWhy("", w3)
-  if ts == nil or bs == nil or es == nil:
-    # THE MEASURED DEFECT OF 2026-09-04, and why this branch is this verbose:
-    # four tooltip bodies were 156..270 characters against a 128-character
-    # intern cap, `nuStr` returned nil for LENGTH, and this proc returned nil
-    # in silence while the caller printed a message blaming il2cpp_object_new.
-    why = "the managed string(s) could not be made -- " &
-          (if ts == nil: "TITLE: " & w1 & ". " else: "") &
-          (if bs == nil: "BODY: " & w2 & ". " else: "") &
-          (if es == nil: "EMPTY: " & w3 & "." else: "")
-    return
-  if not frStoreI32("dlssrows.tooltip", frTtdKey(), obj, 0'i32):
-    why = "the typed store of Key was refused"
-    return
-  if not frStorePtr("dlssrows.tooltip", frTtdTitle(), obj, ts):
-    why = "the typed store of Title was refused"
-    return
-  if not frStorePtr("dlssrows.tooltip", frTtdText(), obj, bs):
-    why = "the typed store of Text was refused"
-    return
-  if not frStoreI32("dlssrows.tooltip", frTtdUsageStyle(), obj, 0'i32):
-    why = "the typed store of UsageStyle was refused"
-    return
-  if not frStoreI32("dlssrows.tooltip", frTtdUsageProp(), obj, 0'i32):
-    why = "the typed store of UsageProperty was refused"
-    return
-  if not frStorePtr("dlssrows.tooltip", frTtdUsageText(), obj, es):
-    why = "the typed store of UsageText was refused"
-    return
-  obj
+  ## The body of this proc MOVED to `nativeui.nim` as `nuMakeTooltipData` on
+  ## 2026-09-04, unchanged, so that `postfxrows.nim` gets this exact mechanism
+  ## rather than a second copy of it that could drift. The two row files are
+  ## `include`d in the order postfx-then-dlss and cannot see each other;
+  ## nativeui is `include`d before both. Nothing about the DLSS behaviour
+  ## changes: the same donor klass, the same `frAdmit` gate, the same six
+  ## typed stores, the same named refusals.
+  nuMakeTooltipData(gDlrTipKlass, "dlssrows.tooltip", title, body, why)
 
 proc dlrApplyTooltips(parent: Il2CppPtr) =
   ## Attach a tooltip to every row of ours that declares one, then VERIFY by
@@ -671,6 +632,106 @@ proc dlrApplyTooltips(parent: Il2CppPtr) =
              "TryGetTooltip answered false. Either way this row shows NO " &
              "tooltip and is not counted as a pass."
     i2 = i2 + 1
+
+## ---------------------------------------------------------------------------
+## THE DROPDOWN LABEL -- what "Blank item" actually was
+##
+## OBSERVED on the deployed build 61238a816f58 (the player, looking at the
+## Graphics page): the two DLSS choice rows read "Blank item". OBSERVED in the
+## host log for the same boot: "DROPDOWNS -- 2 of 2 ... filled by CALLING the
+## game's own Show" and "5 of 5 show the player's CONFIG value". Both log lines
+## were true and neither was about the label.
+##
+## MEASURED, and this is the whole diagnosis: `set_CurrentIndex` @0x698560 is
+## `mov [rcx+0xE8], edx ; ret` (`disasm 0x698560`). It stores the index and
+## refreshes nothing. The game itself never calls it alone -- `UpdateValue`
+## @0x16AEAC0 writes the same field and then tail-dispatches through
+## `[klass+0x308]/[klass+0x310]` with `_values[i]`'s string (`disasm 0x16aeac0
+## --len 470`, +0x121 onward). `BaseDropDownBox::SetLabelText` @0x16AEE60 is
+## seventeen bytes performing exactly that dispatch (`disasm 0x16aee60`). So
+## the box was correctly SELECTED and never TOLD to redraw, and "Blank item" is
+## the caption the cloned prefab was authored with.
+##
+## THE INDEX IS READ BACK FROM THE CONTROL, NOT REMEMBERED. Which choice a row
+## ends on is decided inside `sbdRegisterDropdown` from the player's config,
+## clamped to the choice count, and this file does not see that number. Asking
+## `get_CurrentIndex` @0x698550 -- a DIFFERENT function from the one that
+## wrote it -- is both the only way to know and the only way this stays correct
+## if the seed changes.
+##
+## THE VERDICT IS THE TMP, NOT THE CALL. `nuDropDownSetLabel` returning true
+## means a call was made. What the player reads is
+## `DropDownBox._currentValueText@0xf0`, which the game's own `SetTextInternal`
+## writes (`disasm 0x16b0c40`), so reading THAT back and comparing it to the
+## caption is a property of the finished state. Its being null is a THIRD
+## outcome -- a `DropDownBoxNewStyle` has no such field -- and is counted apart.
+proc dlrApplyDropdownLabels() =
+  ## Refresh the visible caption of every dropdown row we built, then judge by
+  ## reading the label TMP. Runs ONCE per build, off any per-frame path, and
+  ## allocates only the interned caption strings, which the intern table holds
+  ## for the session.
+  if gDlrRowDdb.len == 0: return
+  var i = 0
+  while i < gDlrRowDdb.len and i < DlrMaxRows:
+    let ddb = gDlrRowDdb[i]
+    if ddb == nil:
+      i = i + 1
+      continue
+    gDlrLblAsked = gDlrLblAsked + 1
+    let (readable, idx) = nuDropDownIndex(ddb)
+    if not readable:
+      gDlrLblInconclusive = gDlrLblInconclusive + 1
+      if gDlrLblWhy.len == 0:
+        gDlrLblWhy = "'" & gDlrRowKey[i] & "': get_CurrentIndex @0x698550 " &
+                     "did not answer, so there is no chosen value to name " &
+                     "and NOTHING was written to the label"
+      i = i + 1
+      continue
+    let choices = gDlrRowChoices[i]
+    if idx < 0'i32 or int(idx) >= choices.len:
+      gDlrLblInconclusive = gDlrLblInconclusive + 1
+      if gDlrLblWhy.len == 0:
+        gDlrLblWhy = "'" & gDlrRowKey[i] & "': the box reports index " & $idx &
+                     " and this row declares " & $choices.len & " choice(s), " &
+                     "so the caption for that index is not knowable here. " &
+                     "NOTHING was written -- inventing a string would put a " &
+                     "caption on screen that names no real value"
+      i = i + 1
+      continue
+    let want = choices[int(idx)]
+    var w = ""
+    if not nuDropDownSetLabel(ddb, want, w):
+      if gDlrLblWhy.len == 0:
+        gDlrLblWhy = "'" & gDlrRowKey[i] & "': " & w
+      i = i + 1
+      continue
+    gDlrLblCalled = gDlrLblCalled + 1
+    # THE READBACK. A different object from anything written above: the TMP the
+    # game's own SetTextInternal drives.
+    let tmp = nuDropDownLabelTmp(ddb)
+    if tmp == nil:
+      gDlrLblInconclusive = gDlrLblInconclusive + 1
+      if gDlrLblWhy.len == 0:
+        gDlrLblWhy = "'" & gDlrRowKey[i] & "': SetLabelText was CALLED and " &
+                     "_currentValueText@0xf0 read null, so the label could " &
+                     "not be examined. That field is declared by DropDownBox " &
+                     "and not by DropDownBoxNewStyle, so this is most likely " &
+                     "'this clone is a NewStyle box', which is INCONCLUSIVE " &
+                     "and not a failure"
+      i = i + 1
+      continue
+    let got = nuGetText(tmp)
+    if got == want:
+      gDlrLblVerified = gDlrLblVerified + 1
+    else:
+      warn "dlss rows: LABEL '" & gDlrRowKey[i] & "' -- SetLabelText " &
+           "@0x16AEE60 was called with '" & want & "' (index " & $idx &
+           ") and the box's own _currentValueText@0xf0 now reads '" & got &
+           "'. The player sees that second string, not the first."
+      if gDlrLblWhy.len == 0:
+        gDlrLblWhy = "'" & gDlrRowKey[i] & "': the label reads '" & got &
+                     "' after the call, not '" & want & "'"
+    i = i + 1
 
 proc dlrBuild(): bool =
   ## Build the five rows into the live Graphics panel. Called ONCE, from the
@@ -766,6 +827,12 @@ proc dlrBuild(): bool =
       gDlrRowCtrl.add ct
       gDlrRowTip.add r.tip
       gDlrTipWant.add nil
+      # The DropDownBox this row ended up with (nil for a slider or a toggle,
+      # and nil for a choice row that FELL BACK to the stepper), plus the
+      # captions it declares. Captured HERE, from the pointers this loop
+      # already holds, so the label pass cannot bind a different object.
+      gDlrRowDdb.add (if wantDrop: dd else: nil)
+      gDlrRowChoices.add r.choices
       built = built + 1
       # THE VALUE BINDING (settingsbind.nim, flag `settingsRowsBind`, default
       # OFF -- with it off both calls do nothing and the row is a real control
@@ -795,6 +862,9 @@ proc dlrBuild(): bool =
   gDlrSeeded = seeded
   gDlrRefused = refused
   dlrPlaceRows(parent)
+  # AFTER the seed, because the caption must name whichever value the seed
+  # chose, and the seed happens inside sbdRegisterDropdown in the loop above.
+  dlrApplyDropdownLabels()
   dlrApplyTooltips(parent)
   result = true
 
@@ -838,6 +908,28 @@ proc dlrVerdict() =
            "the stepper SLIDER this file shipped before, which WORKS and is " &
            "not a missing control. Reason: " &
            (if gDlrDropWhy.len > 0: gDlrDropWhy
+            else: "none was recorded, which is itself a defect") & "."
+    # THE LABEL CENSUS, kept SEPARATE from the dropdown census above. The
+    # 2026-09-04 defect was precisely that "the box was built and filled" and
+    # "the box displays the right words" were reported by one line, so a box
+    # reading "Blank item" was announced as a success.
+    if gDlrLblVerified == gDlrLblAsked and gDlrLblAsked > 0:
+      okLog "dlss rows: DROPDOWN LABELS -- " & $gDlrLblVerified & " of " &
+            $gDlrLblAsked & " box(es) DISPLAY the chosen value: their own " &
+            "DropDownBox._currentValueText@0xf0 reads the caption that " &
+            "BaseDropDownBox::SetLabelText @0x16AEE60 was given, which is the " &
+            "TMP the game's own SetTextInternal writes and not our store read " &
+            "back. set_CurrentIndex alone never refreshes this -- MEASURED, " &
+            "it is 'mov [rcx+0xE8], edx ; ret'."
+    elif gDlrLblAsked > 0:
+      warn "dlss rows: DROPDOWN LABELS -- " & $gDlrLblVerified & " of " &
+           $gDlrLblAsked & " box(es) read back the chosen caption (" &
+           $gDlrLblCalled & " call(s) made, " & $gDlrLblInconclusive &
+           " INCONCLUSIVE -- could not be examined at all, which is neither a " &
+           "pass nor a fail). A box that does not read back is still showing " &
+           "the cloned prefab's authored caption, which is what the player " &
+           "reported as 'Blank item'. First reason: " &
+           (if gDlrLblWhy.len > 0: gDlrLblWhy
             else: "none was recorded, which is itself a defect") & "."
   if gDlrTipsOn:
     if gDlrTipVerified == gDlrTipAsked and gDlrTipAsked > 0:

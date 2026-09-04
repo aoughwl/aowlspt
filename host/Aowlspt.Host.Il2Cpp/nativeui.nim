@@ -314,6 +314,13 @@ const
   NuTDdbShow         = 80'i32  ## EFT.UI.DropDownBox::Show
   NuTDdbNsShow       = 81'i32  ## EFT.UI.DropDownBoxNewStyle::Show
   NuTBaseDdbShow     = 82'i32  ## EFT.UI.BaseDropDownBox::Show
+  ## THE DROPDOWN LABEL REFRESH (dlssrows.nim). APPENDED at the END of
+  ## `aowl_nu_targets`. MEASURED UNIQUE, section `il2cpp`, seventeen bytes
+  ## total, and it TAIL-DISPATCHES through the receiver's own class at
+  ## 0x308/0x310 -- the same two loads the game's own `UpdateValue` makes to
+  ## refresh the visible caption. Provenance and prologue bytes are on the row
+  ## in `abi/aowlspt_nativeui.h`.
+  NuTDdbSetLabel     = 83'i32  ## EFT.UI.BaseDropDownBox::SetLabelText
   ## The vtable slot `Show` occupies. MEASURED from
   ## `Il2CppMethodDefinition.slot@32` -- all three bodies report 24.
   NuVSlotShow        = 24'i32
@@ -2174,6 +2181,13 @@ proc nuTargetsBindOk(): bool =
   want.add "EFT.UI.DropDownBoxNewStyle::Show"
   idx.add NuTBaseDdbShow
   want.add "EFT.UI.BaseDropDownBox::Show"
+  # THE APPENDED ONE. `SetLabelText` sits directly after three rows named
+  # `...::Show` and takes the SAME frame shape as `SettingControl::SetText`
+  # (this, string, MethodInfo*) -- so a mis-index would call a different
+  # one-string-argument method on a live receiver, succeed, and change some
+  # other caption. Only the name distinguishes them.
+  idx.add NuTDdbSetLabel
+  want.add "EFT.UI.BaseDropDownBox::SetLabelText"
   var i = 0
   while i < idx.len:                      # capped: idx is built right here
     let ix = idx[i]
@@ -3298,3 +3312,398 @@ proc bindNativeUi(verbose: bool) =
     okLog "nativeui: the visual self-proof is ARMED. It rides invoke2's " &
           "POSTFIX detour on SettingsScreen::EnsureTabInitialized, so it needs " &
           "`managedInvokeProbe` on as well; open Settings and click a tab."
+
+# ---------------------------------------------------------------------------
+# APPLY A SELECTION TO A DROPDOWN AND PROVE THE PLAYER CAN SEE IT
+# (appended 2026-09-04, for the enum rows on the index-driven mod pages)
+#
+# `set_CurrentIndex` @0x698560 is MEASURED to be `mov [rcx+0xE8], edx ; ret`:
+# it moves the MODEL and repaints nothing, which is the whole of the "Blank
+# item" defect. So this is the two halves together -- the index, through the
+# game's own setter and read back through the game's OTHER function
+# (`get_CurrentIndex`), and then the CAPTION, through `nuDropDownSetLabel`
+# (the game's own `BaseDropDownBox::SetLabelText`, added alongside this by the
+# agent fixing `dlssrows.nim`; REUSED here, not re-implemented) read back off
+# `_currentValueText@0xF0` -- an object the game writes and this host does not.
+#
+# THREE OUTCOMES. `true` is index AND caption both reading back correct.
+# `false` with a reason is one of them not doing so -- a dropdown that selects
+# correctly and displays the wrong caption is still a defect, and it is the
+# caller's job to SAY so rather than assume. A caption that could not be read
+# at all is reported as INCONCLUSIVE inside the reason.
+#
+# `ctrl` is accepted and deliberately unused for now: every refusal above is
+# expressed on the box itself, and a walk of the control's other TMPs would
+# add a second, weaker answer to a question `_currentValueText` settles.
+# ---------------------------------------------------------------------------
+proc nuDropDownReseat*(ctrl, ddb: Il2CppPtr; items: seq[string];
+                       oneBased: int32; why: var string): bool =
+  result = false
+  why = ""
+  discard ctrl
+  if items.len <= 0 or oneBased < 1'i32 or oneBased > int32(items.len):
+    why = "index " & $oneBased & " is outside 1.." & $items.len
+    return
+  let wanted = items[int(oneBased) - 1]
+  if not nuDropDownSetIndex(ddb, oneBased - 1'i32):
+    why = "set_CurrentIndex @0x698560 refused (the receiver is not a live " &
+          "DropDownBox, or the index is outside the bound this host accepts)"
+    return
+  let (okRead, got) = nuDropDownIndex(ddb)
+  if not okRead or got != oneBased - 1'i32:
+    why = "the index was written and the GAME'S OWN get_CurrentIndex " &
+          "@0x698550 reads " & (if okRead: $got else: "NOTHING (unreadable)") &
+          " rather than " & $(oneBased - 1'i32) &
+          ". The model and this host disagree; the caption was not touched"
+    return
+  var w = ""
+  if not nuDropDownSetLabel(ddb, wanted, w):
+    why = "the selection is correct but the caption could not be set -- " & w
+    return
+  let tmp = nuDropDownLabelTmp(ddb)
+  if tmp == nil:
+    why = "INCONCLUSIVE -- the caption was set through SetLabelText and " &
+          "_currentValueText@0xF0 could not be read back, so what the box " &
+          "DISPLAYS was never observed"
+    return
+  let shown = nuGetText(tmp)
+  if shown == wanted:
+    return true
+  why = "SetLabelText was called with '" & wanted & "' and the box's own " &
+        "_currentValueText now reads '" & shown &
+        "'. The selection is right and the caption is not"
+
+# ---------------------------------------------------------------------------
+# APPENDED 2026-09-04 -- THE DROPDOWN LABEL REFRESH, THE SHARED TOOLTIP
+# TEMPLATE BUILDER, AND THE ROW-LABEL GEOMETRY READER.
+#
+# All three exist because a caller in `dlssrows.nim` or `postfxrows.nim` needed
+# them and this file is included BEFORE both, so a proc here is reachable from
+# either without either file depending on the other. Nothing above this line
+# moved.
+#
+# Every offset below is MEASURED with `tools/fldoff.py fields <Type>`, the
+# System.String `_stringLength@0x10 / _firstChar@0x14` self-check passing, and
+# every one of them is NULL-CAPABLE -- each hop is `nuOk`-guarded.
+# ---------------------------------------------------------------------------
+const
+  ## `EFT.UI.DropDownBox._currentValueText` : TextMeshProUGUI. THE LABEL THE
+  ## PLAYER READS. Declared by DropDownBox, NOT by BaseDropDownBox -- so it is
+  ## absent on a `DropDownBoxNewStyle` receiver, and a null read here is
+  ## INCONCLUSIVE ("this is not a DropDownBox"), never a FAIL.
+  ## Corroborated independently of the field table: MEASURED
+  ## `disasm 0x16b0c40` (`DropDownBox::SetTextInternal`) loads `[rcx+0xf0]`
+  ## twice and dispatches through it.
+  NuOffDdbCurValueText  = 0xf0'i32
+  ## `EFT.UI.Settings.SettingControl.Text` : LocalizedText -- the row caption
+  ## component, the object `SettingControl::SetText` drives.
+  NuOffScTextLoc        = 0x80'i32
+  ## `EFT.UI.LocalizedText._labels` : List<TextMeshProUGUI> -- the TMPs that
+  ## component actually writes.
+  NuOffLocLabels        = 0x78'i32
+  ## Generic `List` layout and the managed-array header, both CONFIRMED
+  ## against this build's own code rather than remembered: MEASURED
+  ## `disasm 0x16aeac0` reads `_values@0xd0`, then `[rax+0x18]` as the count,
+  ## `[rax+0x10]` as the backing array, and indexes that array at `16*(i+2)`
+  ## bytes for a 16-byte element -- i.e. array data begins at 0x20.
+  ## NOTE (another agent's block, minimal de-duplication 2026-09-04): the
+  ## identical `NuOffListItems`/`NuOffListSize` are already declared ~3,050
+  ## lines above with the same values (0x10 / 0x18), and re-declaring them is
+  ## a hard nimony error that broke the whole host build. The two duplicates
+  ## are removed and the third, `NuOffArrData`, is kept -- it is 0x20, the
+  ## same number the existing `NuOffArrayFirst` holds, but this block's
+  ## measurement derives it from a different function, so the name is left
+  ## alone rather than merged blind.
+  NuOffArrData          = 0x20'i32
+  NuMaxListScan         = 64'i32
+
+proc nuDropDownSetLabel*(ddb: Il2CppPtr; text: string; why: var string): bool =
+  ## Refresh the caption a dropdown DISPLAYS, by calling the game's own
+  ## `BaseDropDownBox::SetLabelText(string)` @0x16AEE60.
+  ##
+  ## THE DEFECT THIS EXISTS FOR, stated as an observation. On the deployed
+  ## build 61238a816f58 the host log said "DROPDOWNS -- 2 of 2 ... filled by
+  ## CALLING the game's own Show" and "5 of 5 show the player's CONFIG value",
+  ## and both boxes on screen read "Blank item". Both log lines were TRUE:
+  ## `Show` had run and `<CurrentIndex>k__BackingField@0xE8` held the right
+  ## number. Neither is a statement about the LABEL, which is the whole defect.
+  ##
+  ## MEASURED `disasm 0x698560`: `set_CurrentIndex` is `mov [rcx+0xE8], edx ;
+  ## ret` -- it refreshes nothing. MEASURED `disasm 0x16aeac0 --len 470`: the
+  ## game's own `UpdateValue` writes that same field and THEN tail-dispatches
+  ## through `[klass+0x308] / [klass+0x310]` with the chosen value's string.
+  ## And MEASURED `disasm 0x16aee60 --len 120`: `SetLabelText` is seventeen
+  ## bytes that perform exactly that dispatch and nothing else. So this IS the
+  ## game's own refresh, reached by the shortest frame that reaches it.
+  ##
+  ## `UpdateValue` itself is deliberately NOT called: seven argument slots, two
+  ## of them `Nullable<int>` value structs, three of them on the CALLER's
+  ## stack -- a frame this host would have to build by hand -- and it
+  ## additionally fires `_onValueChanged@0xb0`, which for a row we are merely
+  ## INITIALISING would run the game's apply path on a value nobody chose.
+  ##
+  ## THE VTABLE PRE-CHECK IS NOT CEREMONY. The body dereferences `[ddb]` and
+  ## then `[klass+0x308]` and jumps there; if either is not committed memory
+  ## the jump lands in nowhere, and `aowl_p_p_seh` catching that still costs
+  ## the frame. Both loads are performed as READS here first, and a refusal
+  ## names which one failed.
+  result = false
+  why = ""
+  if not gNuOn:
+    why = "the nativeui layer is off"
+    return
+  if text.len <= 0:
+    why = "the caller offered an EMPTY caption, which would blank the box " &
+          "rather than fix it"
+    return
+  if not nuOk(ddb, NuOffDdbCurValueText + 8'i32) or not nuAlive(ddb):
+    why = "the DropDownBox pointer is not a live readable object"
+    return
+  let fn = nuFn(NuTDdbSetLabel)
+  if fn == nil:
+    why = "SetLabelText @0x16AEE60 did not byte-verify against the startup " &
+          "snapshot; nothing was called"
+    return
+  let klass = nuKlassOf(ddb)
+  if klass == nil or not nuOk(klass, 0x318'i32):
+    why = "the receiver's object header did not read back a class pointer " &
+          "readable for the 0x318 bytes SetLabelText's own first two loads " &
+          "reach ([klass+0x308] and [klass+0x310]). Nothing was called"
+    return
+  let slotFn = cNuGetRef(klass, 0x308'i32)
+  if slotFn == nil or cIsReadable(slotFn, 16'i32) == 0'i32:
+    why = "[klass+0x308] -- the code pointer SetLabelText tail-jumps to -- " &
+          "read back " & (if slotFn == nil: "NULL" else: "0x" &
+          hexOf(cast[uint64](slotFn)) & ", which is not committed memory") &
+          ". This receiver's class carries no SetTextInternal body in that " &
+          "slot and nothing was called"
+    return
+  var w = ""
+  let sp = nuStrWhy(text, w)
+  if sp == nil:
+    why = "the caption string could not be made -- " & w
+    return
+  cNuCallVPP(fn, ddb, sp)
+  result = true
+
+proc nuDropDownLabelTmp*(ddb: Il2CppPtr): Il2CppPtr =
+  ## `DropDownBox._currentValueText@0xf0` -- the TMP the player reads.
+  ##
+  ## THIS IS THE READBACK OBJECT, and it is deliberately a DIFFERENT object
+  ## from anything this host writes: `SetLabelText` hands a string to the
+  ## game's own `SetTextInternal`, which calls a TMP setter on this field. So
+  ## comparing `nuGetText` here against the caption we asked for is a property
+  ## of the FINISHED STATE, not a comparison with our own store.
+  ##
+  ## NULL is a real, ordinary answer: the field is declared by `DropDownBox`
+  ## and does not exist on a `DropDownBoxNewStyle`. A caller must report that
+  ## as INCONCLUSIVE, never as a failed label.
+  result = nil
+  if not nuOk(ddb, NuOffDdbCurValueText + 8'i32): return
+  result = cNuGetRef(ddb, NuOffDdbCurValueText)
+  if not nuOk(result, 0x10'i32): result = nil
+
+proc nuListRef*(lst: Il2CppPtr; i: int32): Il2CppPtr =
+  ## `List[i]` for a REFERENCE element type, bounded by the list's own
+  ## `_size@0x18` AND by the backing array's own `max_length@0x18`. Both are
+  ## checked because they can disagree on a corrupt object, and it is the
+  ## array's that bounds the actual memory.
+  result = nil
+  if i < 0'i32 or i >= NuMaxListScan: return
+  if not nuOk(lst, NuOffListSize + 4'i32): return
+  var okv = 0'i32
+  let n = cNuGetI32(lst, NuOffListSize, okv)
+  if okv == 0'i32 or n <= 0'i32 or i >= n: return
+  let arr = cNuGetRef(lst, NuOffListItems)
+  if not nuOk(arr, NuOffArrData): return
+  let maxLen = cNuGetI32(arr, NuOffListSize, okv)
+  if okv == 0'i32 or i >= maxLen: return
+  if not nuOk(arr, NuOffArrData + 8'i32 * (i + 1'i32)): return
+  result = cNuGetRef(arr, NuOffArrData + 8'i32 * i)
+  if not nuOk(result, 0x10'i32): result = nil
+
+proc nuCtrlLabelTmp*(ctrl: Il2CppPtr): Il2CppPtr =
+  ## The TMP that renders a settings row's CAPTION, walked from the control:
+  ## `SettingControl.Text@0x80` (LocalizedText) -> `_labels@0x78`
+  ## (List of TextMeshProUGUI) -> element 0. THREE hops, three guards, and any
+  ## of them may legitimately read null on a prefab that has no caption.
+  result = nil
+  if not nuOk(ctrl, NuOffScTextLoc + 8'i32): return
+  let loc = cNuGetRef(ctrl, NuOffScTextLoc)
+  if not nuOk(loc, NuOffLocLabels + 8'i32): return
+  let labels = cNuGetRef(loc, NuOffLocLabels)
+  if labels == nil: return
+  result = nuListRef(labels, 0'i32)
+
+proc nuCtrlLabelGeom*(ctrl: Il2CppPtr): NuGeom =
+  ## The caption TMP's own RectTransform layout. Two byte-verified hops to get
+  ## there (`Component::get_gameObject`, then `GameObject::get_transform`), so
+  ## no offset is invented for a Transform.
+  result = nuNoGeom()
+  let tmp = nuCtrlLabelTmp(ctrl)
+  if tmp == nil: return
+  let go = nuGameObjectOf(tmp)
+  if go == nil: return
+  let rt = nuTransformOf(go)
+  if rt == nil: return
+  result = nuReadGeom(rt)
+
+proc nuCtrlLabelLeft*(ctrl: Il2CppPtr): (bool, float32) =
+  ## WHERE THE CAPTION'S LEFT EDGE IS, in the label's own parent's local
+  ## coordinates: `anchoredPosition.x + rect.x`.
+  ##
+  ## `anchoredPosition.x` ALONE is not the answer, and taking it would be the
+  ## obvious wrong move: for a centre-pivoted label it is the CENTRE, so two
+  ## labels with the same anchoredPosition and different widths begin at
+  ## different places, and two labels with different pivots and the same left
+  ## edge report different numbers. `rect.x` is the rect's origin in the
+  ## object's own local space (negative for a centre pivot), which is exactly
+  ## the pivot correction. This is the number the "within 1 px" verdict
+  ## compares, and it is why that verdict can distinguish a CENTRED caption
+  ## from a left-aligned one at all.
+  result = (false, 0.0'f32)
+  let g = nuCtrlLabelGeom(ctrl)
+  if not g.ok: return
+  let x = g.posX + g.rectX
+  if not (x > -1.0e5'f32) or not (x < 1.0e5'f32): return
+  result = (true, x)
+
+proc nuCopyLabelGeom*(dstCtrl: Il2CppPtr; src: NuGeom; why: var string): bool =
+  ## Copy a STOCK row's caption geometry onto one of OUR rows -- the X half
+  ## only, exactly as `nuApplyGeomX` does for the row itself, because the row's
+  ## own LayoutGroup owns Y and height and fighting it loses on the next
+  ## relayout.
+  ##
+  ## `anchoredPosition.x` IS copied here and is NOT copied by `nuApplyGeomX`.
+  ## That difference is the whole point: a ROW rect is placed by its parent's
+  ## LayoutGroup, so its anchoredPosition is the group's to write and ours to
+  ## leave alone; a CAPTION inside a row is placed by the prefab's author, so
+  ## its anchoredPosition is authored data -- and authored data is precisely
+  ## what differs between two different prefabs.
+  ##
+  ## NOT A BLIND WRITE: the current geometry is read in full first (a partial
+  ## read refuses outright), every Y component is preserved from the live
+  ## object rather than taken from the donor, and the caller re-reads
+  ## `nuCtrlLabelLeft` afterwards to judge. `true` from here means only that
+  ## five setters were called.
+  result = false
+  why = ""
+  if not gNuOn:
+    why = "the nativeui layer is off"
+    return
+  if not src.ok:
+    why = "the donor geometry was never successfully measured, so there is " &
+          "nothing to copy and nothing was written"
+    return
+  let tmp = nuCtrlLabelTmp(dstCtrl)
+  if tmp == nil:
+    why = "this row has no reachable caption TMP (SettingControl.Text@0x80 " &
+          "-> _labels@0x78 -> [0] read null), so there is nothing to align"
+    return
+  let go = nuGameObjectOf(tmp)
+  if go == nil:
+    why = "the caption TMP's GameObject could not be reached"
+    return
+  let rt = nuTransformOf(go)
+  if rt == nil:
+    why = "the caption TMP's RectTransform could not be reached"
+    return
+  let cur = nuReadGeom(rt)
+  if not cur.ok:
+    why = "the caption's CURRENT geometry could not be read in full, and a " &
+          "partial read is worse than none. Nothing was written"
+    return
+  let a = nuSetV2(rt, NuTRtSetAnchorMin, src.aMinX, cur.aMinY)
+  let b = nuSetV2(rt, NuTRtSetAnchorMax, src.aMaxX, cur.aMaxY)
+  let c = nuSetV2(rt, NuTRtSetPivot, src.pivX, cur.pivY)
+  let d = nuSetV2(rt, NuTRtSetSizeDelta, src.sdX, cur.sdY)
+  let e = nuSetV2(rt, NuTRtSetAnchoredPos, src.posX, cur.posY)
+  if not (a and b and c and d and e):
+    why = "one or more of the five X-setters refused (anchorMin=" &
+          (if a: "ok" else: "REFUSED") & ", anchorMax=" &
+          (if b: "ok" else: "REFUSED") & ", pivot=" &
+          (if c: "ok" else: "REFUSED") & ", sizeDelta=" &
+          (if d: "ok" else: "REFUSED") & ", anchoredPosition=" &
+          (if e: "ok" else: "REFUSED") & "). The caption is in a MIXED state " &
+          "and the readback below will say so"
+    return
+  result = true
+
+proc nuMakeTooltipData*(klass: Il2CppPtr; owner, title, body: string;
+                        why: var string): Il2CppPtr =
+  ## ONE `SettingsTooltipData` TEMPLATE, allocated against a class pointer that
+  ## came out of a LIVE donor's object header, and filled through
+  ## `hostfieldwrite`'s typed gate.
+  ##
+  ## HOISTED OUT OF `dlssrows.nim` WITH ITS BEHAVIOUR UNCHANGED, so that
+  ## `postfxrows.nim` gets the identical, already-proven mechanism rather than
+  ## a second implementation of it. The two files are `include`d in that order
+  ## and cannot see each other; this file is `include`d before both.
+  ##
+  ## `frAdmit` is called on this receiver because its type is a FACT, not an
+  ## inference: `il2cpp_object_new(klass)` returns an object OF klass, and
+  ## klass was read out of a live donor's object header a moment earlier.
+  ##
+  ## Key / UsageStyle / UsageProperty are all `None = 0` (MEASURED with
+  ## `il2cpp_resolve.py enum` on ESettingsOption, EUsageStyle and
+  ## EUsageProperty). These rows are not BSG settings: they must not claim one
+  ## of BSG's option keys nor advertise a CPU/GPU cost this host has not
+  ## measured.
+  ##
+  ## Every refusal NAMES the step that refused. The MEASURED defect of
+  ## 2026-09-04 was four tooltip bodies of 156..270 characters hitting a
+  ## 128-character intern cap, `nuStr` returning nil for LENGTH, and the caller
+  ## printing a diagnosis that blamed `il2cpp_object_new` -- which had never
+  ## been reached.
+  result = nil
+  why = ""
+  if klass == nil:
+    why = "no donor class pointer"
+    return
+  let obj = cNuObjectNew(klass)
+  if not nuOk(obj, 0x38'i32):
+    why = "il2cpp_object_new(donor klass) returned " &
+          (if obj == nil: "null" else: "0x" & hexOf(cast[uint64](obj)) &
+           ", which is not readable for the 0x38 bytes SettingsTooltipData " &
+           "declares")
+    return
+  if not frAdmit(owner, frTtdText(), obj):
+    why = "the fieldref klass allowlist refused to admit the allocated " &
+          "object (its own 'hostwrite REFUSED' line says on which ground)"
+    return
+  discard frAdmit(owner, frTtdKey(), obj)
+  discard frAdmit(owner, frTtdTitle(), obj)
+  discard frAdmit(owner, frTtdUsageStyle(), obj)
+  discard frAdmit(owner, frTtdUsageProp(), obj)
+  discard frAdmit(owner, frTtdUsageText(), obj)
+  var w1 = ""
+  var w2 = ""
+  var w3 = ""
+  let ts = nuStrWhy(title, w1)
+  let bs = nuStrWhy(body, w2)
+  let es = nuStrWhy("", w3)
+  if ts == nil or bs == nil or es == nil:
+    why = "the managed string(s) could not be made -- " &
+          (if ts == nil: "TITLE: " & w1 & ". " else: "") &
+          (if bs == nil: "BODY: " & w2 & ". " else: "") &
+          (if es == nil: "EMPTY: " & w3 & "." else: "")
+    return
+  if not frStoreI32(owner, frTtdKey(), obj, 0'i32):
+    why = "the typed store of Key was refused"
+    return
+  if not frStorePtr(owner, frTtdTitle(), obj, ts):
+    why = "the typed store of Title was refused"
+    return
+  if not frStorePtr(owner, frTtdText(), obj, bs):
+    why = "the typed store of Text was refused"
+    return
+  if not frStoreI32(owner, frTtdUsageStyle(), obj, 0'i32):
+    why = "the typed store of UsageStyle was refused"
+    return
+  if not frStoreI32(owner, frTtdUsageProp(), obj, 0'i32):
+    why = "the typed store of UsageProperty was refused"
+    return
+  if not frStorePtr(owner, frTtdUsageText(), obj, es):
+    why = "the typed store of UsageText was refused"
+    return
+  obj

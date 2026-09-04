@@ -1175,6 +1175,65 @@ static const AowlNuTarget aowl_nu_targets[] = {
     { "EFT.UI.BaseDropDownBox::Show", 0x16ADC90u,
       { 0x48,0x89,0x5C,0x24,0x10,0x48,0x89,0x74,0x24,0x18,0x57,0x41,0x54,
         0x41,0x55,0x41 }, 16 },
+    /* --- THE DROPDOWN LABEL REFRESH. APPENDED at the END.
+     *
+     * `EFT.UI.BaseDropDownBox::SetLabelText(string)` @0x16AEE60. MEASURED
+     * `typemethods EFT.UI.BaseDropDownBox` -> arity 1, non-virtual, PUBLIC,
+     * `shared 0x16AEE60` -> sharedness=UNIQUE owners=1, section `il2cpp`, and
+     * it is NOT the 0x628110 universal empty-body stub.
+     *
+     * WHAT IT ACTUALLY IS, and why it is the right call rather than a
+     * plausible-sounding one. MEASURED `disasm 0x16aee60 --len 120`, the whole
+     * body is seventeen bytes:
+     *
+     *     4C 8B 01                mov r8, [rcx]            ; the Il2CppClass*
+     *     49 8B 80 08 03 00 00    mov rax, [r8+0x308]      ; a code pointer
+     *     4D 8B 80 10 03 00 00    mov r8,  [r8+0x310]      ; its MethodInfo*
+     *     48 FF E0                jmp rax
+     *
+     * -- a TAIL-DISPATCH through the RECEIVER'S OWN class at byte offsets
+     * 0x308/0x310, i.e. the virtual `SetTextInternal(string)`. That matters
+     * twice over: it is correct for `DropDownBox` AND for its sibling
+     * `DropDownBoxNewStyle` without this host having to know which it holds,
+     * and it is the SAME two loads the game itself makes.
+     *
+     * That last clause is the measurement that settles the 2026-09-04 "Blank
+     * item" defect, and it is not an inference from a name. MEASURED `disasm
+     * 0x16aeac0 --len 470` (`BaseDropDownBox::UpdateValue`), at +0x121:
+     *
+     *     mov [rsi+0xE8], edi                 ; <CurrentIndex>k__BackingField
+     *     ...
+     *     mov r8, [rsi]                       ; the Il2CppClass*
+     *     movups xmm0, [rcx+rax*8]            ; _values[i] (DropDownItem, 16B)
+     *     mov rax, [r8+0x308]                 ; THE SAME SLOT
+     *     mov r8,  [r8+0x310]                 ; THE SAME SLOT
+     *     movq rdx, xmm0                      ; ...its first 8 bytes: a string
+     *     call rax
+     *
+     * So the game's own `UpdateValue` writes the index and then refreshes the
+     * visible label through EXACTLY the dispatch this one instruction-triple
+     * performs. `set_CurrentIndex` @0x698560 is `mov [rcx+0xE8], edx ; ret` and
+     * does NOT refresh anything -- which is why five dropdowns whose
+     * CurrentIndex read back correctly still displayed the prefab's authored
+     * "Blank item" caption.
+     *
+     * `SetLabelText` is called INSTEAD OF mirroring `UpdateValue` because
+     * UpdateValue has SEVEN argument slots, two of them `Nullable<int>` value
+     * structs, three of them on the caller's stack -- a frame this host would
+     * have to construct by hand -- while `SetLabelText` is (this, string,
+     * MethodInfo*) and reaches the identical slot. The one thing UpdateValue
+     * does that this does not is fire `_onValueChanged@0xb0`, which is exactly
+     * what we do NOT want: our rows are filled at build time and a callback
+     * there would run the game's graphics-apply path on a value nobody chose.
+     *
+     * The FINISHED-STATE readback is a different object again -- the label TMP
+     * `DropDownBox._currentValueText@0xf0` (MEASURED `fldoff.py fields
+     * EFT.UI.DropDownBox`, String self-check passing; and `disasm 0x16b0c40`,
+     * `DropDownBox::SetTextInternal`, reads exactly that field twice) -- so
+     * the check reads what the GAME wrote, never what we passed. */
+    { "EFT.UI.BaseDropDownBox::SetLabelText", 0x16AEE60u,
+      { 0x4C,0x8B,0x01,0x49,0x8B,0x80,0x08,0x03,0x00,0x00,0x4D,0x8B,0x80,
+        0x10,0x03,0x00 }, 16 },
 };
 
 #define AOWL_NU_TARGET_COUNT \
