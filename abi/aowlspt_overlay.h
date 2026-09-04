@@ -159,7 +159,23 @@ static AowlAdminShared* g_ov_admin = NULL;
  * the point -- half a feed applied to loaded code is the failure this guards.
  * (This used to describe a truncation losing its terminating key and being
  * rejected by the reader. The reader never sees it.) */
-#define AOWL_OV_SYNC_MAX 16384
+/* MEASURED 2026-09-04, curl against the live backend on port 80 with
+ * `Accept-Encoding: identity` (which this file already sends, and which the
+ * backend honours):
+ *   /aowlspt/settings/index          960 bytes
+ *   /aowlspt/settings/index/full 569,247 bytes
+ *   /aowlspt/settings/aowl.tarkov  434,140 bytes
+ *   /aowlspt/settings/aowl.sain     51,846 bytes
+ *   /aowlspt/settings/aowl.maps     31,854 bytes
+ * At 16,384 every one of those but the compact index and the small pages was
+ * DROPPED, and dropped SILENTLY -- the host saw only "5 request(s) and none
+ * returned a body here", which reads as a missing route and is not one. The
+ * read buffer above it (`AOWL_OV_HTTP_BUF`) has been 1 MiB for a while; this
+ * bound was the only thing still refusing whole, correct bodies. Matched to it
+ * deliberately: two bounds on one path that disagree is how this hid. The
+ * drop is also RECORDED now (`aowl_ov_sync_drop_reason`) so that a body
+ * refused for being too large can never again present as a network problem. */
+#define AOWL_OV_SYNC_MAX 1048576   /* == AOWL_OV_HTTP_BUF, defined below */
 
 /* One row of the panel. Fixed-size fields rather than pointers: the render
  * thread reads this table every frame and a pointer into a string the worker
@@ -358,6 +374,7 @@ static int32_t aowl_ov_frame_ns_max(void);
 static void    aowl_ov_sync_start(const char* path, int32_t intervalMs);
 static int32_t aowl_ov_sync_pending(void);
 static int32_t aowl_ov_sync_take(char* out, int32_t cap);
+static int32_t aowl_ov_sync_drop_reason(int32_t* lastLen, int32_t* wasZlib);
 static int32_t aowl_ov_sync_attempts(void);
 
 /* The write leg. `aowl_ov_post_start` arms one path+body; the worker sends it
@@ -1255,6 +1272,14 @@ typedef struct AowlOvState {
     char    syncPath[192];              /* "" until the host asks for it */
     int32_t syncMs;                     /* 0 = off */
     char    syncBody[AOWL_OV_SYNC_MAX];
+    /* WHY THE LAST BODY WAS NOT PUBLISHED. A drop used to be an `if` with
+     * no else: the serial simply did not move and every consumer could only
+     * say "nothing arrived". These three make the refusal speakable -- how
+     * many, how big the last refused one was, and whether it was refused for
+     * its size or for arriving zlib-deflated. */
+    int32_t syncDrops;
+    int32_t syncDropLen;
+    int32_t syncDropZlib;
     int32_t syncLen;
     int32_t syncSerial;                 /* bumped on every successful fetch */
     int32_t syncTaken;                  /* the serial the host last read */
@@ -4987,6 +5012,16 @@ static DWORD WINAPI aowl_ov_worker(LPVOID unused) {
                     g_ov.syncLen = rc;
                     g_ov.syncSerial++;
                     LeaveCriticalSection(&g_ov.cs);
+                } else if (rc > 0) {
+                    /* A WHOLE, CORRECT BODY CAN LAND HERE. Recorded rather
+                     * than dropped into silence -- this branch is what made
+                     * a 569,247-byte `/aowlspt/settings/index/full` look
+                     * like an unimplemented route for a whole session. */
+                    EnterCriticalSection(&g_ov.cs);
+                    g_ov.syncDrops++;
+                    g_ov.syncDropLen = rc;
+                    g_ov.syncDropZlib = ((unsigned char)buf[0] == 0x78);
+                    LeaveCriticalSection(&g_ov.cs);
                 }
             }
         }
@@ -5080,6 +5115,23 @@ static int32_t aowl_ov_sync_take(char* out, int32_t cap) {
         n = g_ov.syncLen;
         g_ov.syncTaken = g_ov.syncSerial;
     }
+    LeaveCriticalSection(&g_ov.cs);
+    return n;
+}
+
+/* How many bodies the feed REFUSED, and what the last refusal was. A caller
+ * that sees no body asks this before blaming the route: `*lastLen` is the
+ * size of the last body that was thrown away and `*wasZlib` says it arrived
+ * compressed (which means `Accept-Encoding: identity` was not honoured), so
+ * "too large", "compressed" and "never answered" are three outcomes rather
+ * than one. */
+static int32_t aowl_ov_sync_drop_reason(int32_t* lastLen, int32_t* wasZlib) {
+    int32_t n = 0;
+    if (!g_ov.started) return 0;
+    EnterCriticalSection(&g_ov.cs);
+    n = g_ov.syncDrops;
+    if (lastLen) *lastLen = g_ov.syncDropLen;
+    if (wasZlib) *wasZlib = g_ov.syncDropZlib;
     LeaveCriticalSection(&g_ov.cs);
     return n;
 }

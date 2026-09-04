@@ -64,6 +64,8 @@ proc cOvSyncPending(): int32 {.importc: "aowl_ov_sync_pending", nodecl.}
 proc cOvSyncTake(buf: ptr char; cap: int32): int32 {.
   importc: "aowl_ov_sync_take", nodecl.}
 proc cOvSyncAttempts(): int32 {.importc: "aowl_ov_sync_attempts", nodecl.}
+proc cOvSyncDropReason(lastLen, wasZlib: ptr int32): int32 {.
+  importc: "aowl_ov_sync_drop_reason", nodecl.}
 proc cOvPostStart(path: cstring; body: cstring) {.
   importc: "aowl_ov_post_start", nodecl.}
 proc cOvPostPending(): int32 {.importc: "aowl_ov_post_pending", nodecl.}
@@ -188,6 +190,20 @@ proc overlaySyncTake*(): string =
   while i < int(got):
     result.add buf[i]
     inc i
+
+proc overlaySyncDrops*(lastLen: var int32; wasZlib: var bool): int32 =
+  ## How many whole bodies the feed REFUSED to publish, and the last one's
+  ## size. MEASURED 2026-09-04: `/aowlspt/settings/index/full` is 569,247
+  ## bytes with `Accept-Encoding: identity`, the publish bound was 16,384,
+  ## and the refusal had no voice at all -- the host could only report that
+  ## five requests went out and no body came back, which reads as a missing
+  ## route. A consumer that finds no body must ask this before it blames the
+  ## far end.
+  var l: int32 = 0
+  var z: int32 = 0
+  result = cOvSyncDropReason(addr l, addr z)
+  lastLen = l
+  wasZlib = z != 0'i32
 
 proc overlayPostStart*(path: string; body: string) =
   ## Arms one POST for the worker thread: `path` and `body` (a JSON literal

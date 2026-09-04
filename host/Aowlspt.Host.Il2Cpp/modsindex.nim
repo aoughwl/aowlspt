@@ -346,10 +346,30 @@ proc miTick(now: uint64) =
                "ms (attempts-since-arm=0), which is a slot-changeover problem " &
                "rather than a missing route")
       else:
-        miFail("settings index route not served -- the worker issued " &
-               $attempts & " request(s) for " & cMiRoute & " and none " &
-               "returned a body here. Either the route is not implemented yet " &
-               "or something else consumed the slot's take cursor first")
+        # THE THIRD OUTCOME, and it is the one that actually happened.
+        # The overlay worker REFUSES a body it cannot publish, and until
+        # 2026-09-04 it refused in silence -- so a 569,247-byte answer to
+        # a route that works perfectly read as "not implemented yet".
+        # Ask the transport what it threw away before blaming the far end.
+        var dropLen: int32 = 0
+        var dropZlib = false
+        let drops = overlaySyncDrops(dropLen, dropZlib)
+        if drops > 0:
+          miFail("settings index NOT DELIVERED BY THE TRANSPORT -- the " &
+                 "worker issued " & $attempts & " request(s) for " & cMiRoute &
+                 " and the overlay feed REFUSED " & $drops & " body(ies), the " &
+                 "last of them " & $dropLen & " byte(s)" &
+                 (if dropZlib: " and zlib-deflated (Accept-Encoding: " &
+                  "identity was not honoured by the backend)" else:
+                  " (too large for the publish bound)") &
+                 ". The ROUTE ANSWERED; this is a transport bound, not a " &
+                 "missing route")
+        else:
+          miFail("settings index route not served -- the worker issued " &
+                 $attempts & " request(s) for " & cMiRoute & " and none " &
+                 "returned a body here, and the feed refused none either. " &
+                 "Either the route is not implemented yet or something " &
+                 "else consumed the slot's take cursor first")
     return
   gMiPhase = miDone
   miRelease()
