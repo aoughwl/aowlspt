@@ -87,6 +87,38 @@ Set it to `spawned` and, for each raid:
 3. every created item is **stripped from the profile at match end**, so none of
    it can ever reach the stash — whether you extract, die or disconnect.
 
+#### When it happens, and why that is the only moment that works
+
+The PMC Inventory reaches the client at `/client/game/profile/list` and nowhere
+else — `/client/match/local/start` sends `profile: null`. Measured from the real
+wire capture, one menu cycle is:
+
+```
+/client/game/profile/list        <-- the ONLY time the Inventory is sent
+/client/game/profile/select
+/client/raid/configuration
+/client/match/local/start
+/client/match/local/end
+/client/game/profile/list        <-- the NEXT cycle
+```
+
+`profile/list` is fetched **once per menu cycle and never after select or
+configuration**. So a loadout applied on `tarkov.raid.configured` or
+`tarkov.profile.selected` would arrive **one raid late, every time — while still
+reporting PASS**, because the items really would have been minted into the
+stored profile. It simply would not be in the profile the client already had.
+
+The kit is therefore minted from inside `tarkov.profile.listing`, the
+**synchronous** event the backend emits immediately before it serves that
+document. The mod still subscribes to the other two events, and applies nothing
+from them: they log one line saying they are too late for the coming raid, and
+they are kept as the standing evidence that the ordering still holds.
+
+Idempotence is **per cycle**, not per profile — the next menu cycle is the next
+raid and is applied for normally. A second mint while a set is still active is
+refused by the backend, which says why, and that refusal is logged as the
+verdict rather than swallowed.
+
 The verdict comes from the backend and is logged verbatim:
 
 ```
@@ -127,8 +159,8 @@ MODS tab.
 | `enterKey` | `"None"` | live |
 | `defaultMap` | `"Woods"` | live |
 | `maps` | twelve labels | live |
-| `loadoutMode` | `"current"` | next raid |
-| `applyAt` | `"auto"` | restart |
+| `loadoutMode` | `"current"` | next menu cycle |
+| `applyAt` | `"listing"` | restart |
 
 `hotkeys` is **the gate**. With it off, nothing is polled — not
 `GetModuleHandle`, not `UnityEngine.Input::GetKeyDown` — and the two key rows
@@ -242,3 +274,8 @@ that line, not the screen.
 
 `docs/AUTORAID-MAP.md` has the three flows with the evidence behind every claim,
 and a list of what has **not** been verified live.
+
+`applyAt` is a switch, not a choice of trigger: `listing` mints the kit at the
+one moment that reaches the coming raid, and `off` subscribes and logs but mints
+nothing — which is how you tell "the trigger never fired" apart from "the mint
+failed".

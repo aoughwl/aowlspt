@@ -10,40 +10,83 @@
 ## ---------------------------------
 ## Everything that actually touches a profile lives in `mods/tarkov` -- which IS
 ## the SPT-shaped server, and which already has the item builder
-## (`emu/loadout.nim`, 1600 lines: template resolution with a REFUSAL on an
-## ambiguous name, minting, magazine mounting, cartridge filling, `_required`
-## mod slots, grid placement, slot validation, and a PASS/FAIL/INCONCLUSIVE
-## report). Reimplementing any of that here would be a second answer to a
-## question that already has one, and the second answer is always the one that
-## rots.
+## (`emu/loadout.nim`: template resolution with a REFUSAL on an ambiguous name,
+## minting, magazine mounting, cartridge filling, `_required` mod slots, grid
+## placement, slot validation, and a PASS/FAIL/INCONCLUSIVE report).
+## Reimplementing any of that here would be a second answer to a question that
+## already has one, and the second answer is always the one that rots.
 ##
 ## So this file OWNS THE POLICY and tarkov OWNS THE MECHANISM, and they talk
 ## over the event bus:
 ##
 ##   autoraid  --  autoraid.loadout.apply   -->  tarkov
 ##                 {"profileId":..,"spec":{clear,gear},"ephemeral":true,
-##                  "reason":"tarkov.raid.configured"}
+##                  "reason":"tarkov.profile.listing"}
 ##   tarkov    --  autoraid.loadout.result  -->  autoraid
 ##                 {"profileId":..,"verdict":"PASS|FAIL|INCONCLUSIVE",
 ##                  "requested":n,"minted":n,"placed":n,"rejected":n,"why":".."}
 ##
-## WHICH EVENT TRIGGERS IT, AND WHY BOTH ARE SUBSCRIBED
-## ----------------------------------------------------
-## The loadout has to be in the stored profile BEFORE the client's LAST
-## `/client/game/profile/list` fetch, because that route is where the PMC
-## Inventory reaches the client (`/client/match/local/start` sends
-## `profile: null`). Which of `tarkov.profile.selected` and
-## `tarkov.raid.configured` precedes that fetch is a WIRE MEASUREMENT, and this
-## mod does not get to guess at it. So `applyAt = auto` -- the shipped value --
-## subscribes to BOTH and applies ONCE PER RAID, idempotently: whichever fires
-## first wins, the second is a no-op that says so. The two pinned values exist
-## for diagnosing the ordering, not for normal use.
+## ===========================================================================
+## WHEN THE LOADOUT MUST LAND -- MEASURED, AND IT IS NOT WHERE THIS FILE FIRST
+## PUT IT
+## ===========================================================================
 ##
-## THE VERDICT IS A NEGATIVE, AND IT IS TARKOV'S TO EMIT. This file logs
-## `AutoRaid LOADOUT VERDICT <verdict>` verbatim from the result event; it does
-## not compute its own opinion. The end-of-raid half -- "no minted id remains
-## anywhere in the saved profile" -- is likewise tarkov's, for the same reason:
-## the only process that can read the saved profile is the one that saved it.
+## The PMC Inventory reaches the client at `/client/game/profile/list`, and
+## NOWHERE else: `/client/match/local/start` sends `profile: null`
+## (`mods/tarkov/tarkov.nim:2381`). So a spawned kit is only in the raid if it
+## is in the stored profile BEFORE that fetch is served.
+##
+## MEASURED by agent S from the real wire capture (`data/capture/raid1`), one
+## menu cycle:
+##
+##     /client/game/profile/list        <-- the ONLY time the Inventory is sent
+##     /client/game/profile/select
+##     /client/raid/configuration
+##     /client/match/local/start
+##     /client/match/local/end
+##     /client/game/profile/list        <-- the NEXT cycle's fetch
+##
+## `profile/list` is fetched ONCE per menu cycle and NEVER AGAIN after select or
+## configuration. That single fact invalidates the design this file shipped
+## with, and it is written down rather than quietly replaced:
+##
+##   **A loadout applied on `tarkov.raid.configured` or
+##   `tarkov.profile.selected` reaches the client on the NEXT menu cycle, not
+##   the coming raid.**
+##
+## It would have "worked" -- one raid late, every time, for ever -- and the
+## verdict would still have said PASS, because tarkov really would have minted
+## the items into the stored profile. That is the exact shape of a check that
+## cannot fail: it asserts our own write and never asks whether the write
+## REACHED the client. Nothing in the old design could have caught it. Only the
+## wire could, and only agent S looked.
+##
+## So the trigger is now `tarkov.profile.listing`, which agent S emits
+## SYNCHRONOUSLY from inside `onProfileList` BEFORE it serves the profile. A
+## subscriber that emits `autoraid.loadout.apply` from inside that handler gets
+## the kit minted into the very document the client is about to receive.
+## Synchronous is the whole point: an event that merely fired "around then"
+## would be a race, and a race that loses is indistinguishable from the bug
+## above.
+##
+## THE OTHER TWO SUBSCRIPTIONS ARE KEPT, AND THEY APPLY NOTHING. They log one
+## line saying they are TOO LATE FOR THE COMING RAID. They are kept for two
+## reasons: they are the standing evidence that the ordering above still holds
+## on a future build, and deleting them would leave the next reader to
+## re-derive by experiment the thing this comment exists to state.
+##
+## IDEMPOTENCE IS PER CYCLE -- not per profile, and not on a clock. `cycle`
+## comes in the payload; one `profile/list` is one cycle, and this file applies
+## at most once for a given (profileId, cycle). Beyond that it does not need to
+## guard: tarkov REFUSES a second mint while a minted set is still active and
+## SAYS WHY, and that refusal arrives here as a verdict like any other rather
+## than being swallowed.
+##
+## THE VERDICT IS TARKOV'S TO EMIT. This file logs `AutoRaid LOADOUT VERDICT
+## <verdict>` verbatim; it does not compute its own opinion. The end-of-raid
+## half -- "no minted id remains anywhere in the saved profile" -- is likewise
+## tarkov's, for the same reason: the only process that can read the saved
+## profile is the one that saved it.
 
 import std/syncio
 import aowlspt
@@ -52,37 +95,35 @@ import aowlspt/json
 import cfg
 
 const
-  DedupWindowMs* = 120000'i64
-    ## THE IDEMPOTENCE WINDOW, and why it is a window rather than a flag.
-    ##
-    ## `auto` subscribes to BOTH trigger events, so ONE raid produces two
-    ## events a moment apart and only the first may apply. A bare "have we
-    ## applied for this profile" flag would achieve that -- and would then
-    ## refuse the SECOND RAID of the same session, silently, for the same
-    ## profile, which is a bug that only shows up after somebody plays twice.
-    ##
-    ## Two minutes is far longer than the gap between profile-select and
-    ## raid-configuration for one raid (they are consecutive requests) and far
-    ## shorter than any real raid, so the window separates "the other trigger
-    ## for THIS raid" from "the trigger for the NEXT raid" without needing an
-    ## end-of-raid event this mod does not own.
-
   StatusRoute* = "/aowlspt/autoraid/status"
   ApplyEvent*  = "autoraid.loadout.apply"
   ResultEvent* = "autoraid.loadout.result"
+
+  ListingEvent* = "tarkov.profile.listing"
+    ## THE ONLY TRIGGER THAT WORKS. Emitted SYNCHRONOUSLY from inside
+    ## `onProfileList`, BEFORE the profile document is serialised and served,
+    ## carrying `{"session":..,"profileId":..,"cycle":N}`. Emitting the apply
+    ## from inside this handler puts the minted items in the document the
+    ## client is about to receive.
+
   RaidConfiguredEvent* = "tarkov.raid.configured"
+    ## INFORMATIONAL ONLY. Fires AFTER the profile has already been served, so
+    ## a loadout applied here would land in the NEXT menu cycle's fetch.
   ProfileSelectedEvent* = "tarkov.profile.selected"
+    ## INFORMATIONAL ONLY, for the same measured reason.
 
 var gSpec = ""              ## loadout.json, verbatim
 var gSpecWhy = ""           ## why it is empty, when it is
 var gSpecGear = 0           ## entries in it, for the log line
 var gApplied = 0            ## applies emitted this session
-var gSkipped = 0            ## events that found an apply already done
-var gLastProfile = ""       ## the profile the last apply was for (idempotence)
-var gLastApplyMs = 0'i64    ## when, so the window below can expire
+var gSkipped = 0            ## listings that found this cycle already applied
+var gLate = 0               ## informational (too-late) events observed
+var gLastProfile = ""       ## the profile the last apply was for
+var gLastCycle = -1         ## ...and the cycle, which is what makes it unique
 var gLastReason = ""
 var gLastResult = ""        ## the result payload, verbatim
 var gLastVerdict = ""
+var gSaidLate = false       ## the "these two are too late" line, once per run
 
 proc slurp(path: string; into: var string): bool =
   ## `readFile` is `{.raises.}` in nimony, so it is wrapped. A missing file and
@@ -154,11 +195,22 @@ proc buildApply(profileId, reason: string): string =
   put(o, "reason", jstr(reason))
   result = done(o).text
 
-proc applyFor(profileId, reason: string) =
-  ## Emit ONE apply for this raid. IDEMPOTENT: a second event for the same
-  ## profile is a no-op that says so, which is what makes subscribing to both
-  ## trigger events safe rather than a double-spawn.
+proc onProfileListing(payload: string): string =
+  ## THE ONLY HANDLER THAT APPLIES ANYTHING.
+  ##
+  ## SYNCHRONOUS, and everything about this proc depends on that: it runs
+  ## INSIDE `onProfileList`, before the profile document is serialised. The
+  ## `emit` below is therefore not a notification -- it is a call, and by the
+  ## time it returns the items are in the profile the client is about to be
+  ## handed. Anything moved out of this call stack (a timer, a queue, a "do it
+  ## soon") reintroduces the one-raid-late bug this replaced.
+  result = ""
   if loadoutMode() != "spawned":
+    return
+  if applyAt() == "off":
+    info "AutoRaid LOADOUT: " & ListingEvent & " fired and `applyAt` is " &
+         "`off`, so NOTHING was applied. That is a diagnostic setting, not a " &
+         "failure -- set it back to `listing` to have the kit minted."
     return
   if not specReady():
     warn "AutoRaid LOADOUT: `loadoutMode` is `spawned` but no usable " &
@@ -166,50 +218,63 @@ proc applyFor(profileId, reason: string) =
          "the character goes in with whatever it is wearing. This is a " &
          "REFUSAL, not a silent fall back to `current`."
     return
+  let profileId = asText(field(payload, "profileId"), "")
   if profileId.len == 0:
-    warn "AutoRaid LOADOUT: " & reason & " carried no profileId, so there is " &
-         "no profile to apply to. NOTHING was emitted."
+    warn "AutoRaid LOADOUT: " & ListingEvent & " carried no profileId, so " &
+         "there is no profile to apply to. NOTHING was emitted."
     return
-  let now = nowMs()
-  if gLastProfile == profileId and now - gLastApplyMs < DedupWindowMs:
+  let cycle = asInt(field(payload, "cycle"), -1)
+  if cycle >= 0 and profileId == gLastProfile and cycle == gLastCycle:
     gSkipped = gSkipped + 1
-    info "AutoRaid LOADOUT: " & reason & " fired for profile " & profileId &
-         " " & $int(now - gLastApplyMs) & " ms after an apply via " &
-         gLastReason & ". Skipped -- ONE apply per raid, idempotently, which " &
-         "is what makes subscribing to BOTH trigger events safe. The window " &
-         "is " & $int(DedupWindowMs div 1000'i64) & " s, so the NEXT raid in " &
-         "this session is applied for normally rather than being silently " &
-         "refused as a duplicate."
+    info "AutoRaid LOADOUT: " & ListingEvent & " fired again for profile " &
+         profileId & " cycle " & $cycle & ", which has already been applied " &
+         "for. Skipped -- ONE apply per CYCLE. Note that is per CYCLE and not " &
+         "per profile: the next menu cycle is the next raid and is applied " &
+         "for normally."
     return
   gLastProfile = profileId
-  gLastApplyMs = now
-  gLastReason = reason
+  gLastCycle = cycle
+  gLastReason = ListingEvent & " (cycle " & $cycle & ")"
   gApplied = gApplied + 1
-  if emit(ApplyEvent, buildApply(profileId, reason)) != Ok:
+  if emit(ApplyEvent, buildApply(profileId, ListingEvent)) != Ok:
     warn "AutoRaid LOADOUT: the host refused to emit `" & ApplyEvent &
          "`. Nothing will be spawned and mods/tarkov was never asked."
     return
   info "AutoRaid LOADOUT: emitted `" & ApplyEvent & "` for profile " &
-       profileId & " (" & $gSpecGear & " gear entr(ies), reason " & reason &
-       "). EMITTED IS NOT APPLIED: the verdict is the `" & ResultEvent &
-       "` that mods/tarkov sends back, and it is logged verbatim."
+       profileId & " cycle " & $cycle & " (" & $gSpecGear & " gear " &
+       "entr(ies)), from INSIDE " & ListingEvent & " -- so the items land in " &
+       "the /client/game/profile/list document the client is about to " &
+       "receive, which the wire capture shows is the ONLY time the PMC " &
+       "Inventory is sent. EMITTED IS NOT APPLIED: the verdict is the `" &
+       ResultEvent & "` mods/tarkov sends back, logged verbatim."
 
-proc wants(eventName: string): bool =
-  ## Does the configured `applyAt` want this event?
-  case applyAt()
-  of "raidconfigured":  eventName == RaidConfiguredEvent
-  of "profileselected": eventName == ProfileSelectedEvent
-  else:                 true          # "auto": both, applied once per raid
+proc noteTooLate(eventName: string) =
+  ## The two informational subscriptions. THEY APPLY NOTHING.
+  ##
+  ## Kept rather than deleted because they are the standing evidence that the
+  ## measured order still holds: if a future build ever fetched profile/list
+  ## after one of these, the fix would start here. Said ONCE per run, because
+  ## the fact does not change and a line per raid is noise.
+  gLate = gLate + 1
+  if gSaidLate: return
+  gSaidLate = true
+  info "AutoRaid LOADOUT: `" & eventName & "` fired. This is OBSERVED AND NOT " &
+       "ACTED ON, and that is a measurement rather than an oversight: agent " &
+       "S's wire capture shows /client/game/profile/list is fetched ONCE per " &
+       "menu cycle and NEVER after select or configuration, so a loadout " &
+       "applied here would reach the client on the NEXT menu cycle -- one " &
+       "raid late, every time, while still reporting PASS. The apply happens " &
+       "inside `" & ListingEvent & "` instead."
 
 proc onRaidConfigured(payload: string): string =
   result = ""
-  if not wants(RaidConfiguredEvent): return
-  applyFor(asText(field(payload, "profileId"), ""), RaidConfiguredEvent)
+  if loadoutMode() != "spawned": return
+  noteTooLate(RaidConfiguredEvent)
 
 proc onProfileSelected(payload: string): string =
   result = ""
-  if not wants(ProfileSelectedEvent): return
-  applyFor(asText(field(payload, "profileId"), ""), ProfileSelectedEvent)
+  if loadoutMode() != "spawned": return
+  noteTooLate(ProfileSelectedEvent)
 
 proc onResult(payload: string): string =
   ## THE LOADOUT VERDICT, logged VERBATIM. This mod does not form its own
@@ -217,6 +282,10 @@ proc onResult(payload: string): string =
   ## the saved profile back is the one that saved it, and a second opinion
   ## computed here could only ever be a restatement of what we asked for --
   ## which is a check that cannot fail.
+  ##
+  ## A REFUSAL IS A VERDICT TOO. tarkov declines a second mint while a minted
+  ## set is still active and says why; that answer arrives here like any other
+  ## and is logged, never swallowed.
   result = ""
   gLastResult = payload
   gLastVerdict = asText(field(payload, "verdict"), "INCONCLUSIVE")
@@ -239,21 +308,25 @@ proc onStatus(url, body, session: string): string =
   ## `/aowlspt/autoraid/status` -- bare JSON, built with the builders so a path
   ## or a reason containing a quote cannot produce a body that is not JSON.
   ##
-  ## It reports the CONFIG and the LAST RESULT and keeps them apart. The two
-  ## disagreeing is the interesting case: `mode` spawned with `applies` 0 means
-  ## neither trigger event ever reached this mod, which is a completely
-  ## different bug from an apply that came back FAIL.
+  ## It reports the CONFIG and the LAST RESULT and keeps them apart. The
+  ## interesting disagreement is `applies` 0 with `tooLateEvents` non-zero:
+  ## that means `tarkov.profile.listing` never reached this mod while the other
+  ## two did -- an older mods/tarkov -- which is a completely different bug
+  ## from an apply that came back FAIL.
   var o = obj()
   put(o, "mod", jstr("aowl.autoraid"))
   put(o, "side", jstr("server"))
   put(o, "loadoutMode", jstr(loadoutMode()))
   put(o, "applyAt", jstr(applyAt()))
+  put(o, "trigger", jstr(ListingEvent))
   put(o, "specReady", jbool(specReady()))
   put(o, "specGearEntries", jint(gSpecGear))
   put(o, "specWhy", jstr(gSpecWhy))
   put(o, "applies", jint(gApplied))
-  put(o, "skippedDuplicates", jint(gSkipped))
+  put(o, "skippedSameCycle", jint(gSkipped))
+  put(o, "tooLateEvents", jint(gLate))
   put(o, "lastProfile", jstr(gLastProfile))
+  put(o, "lastCycle", jint(gLastCycle))
   put(o, "lastReason", jstr(gLastReason))
   put(o, "lastVerdict", jstr(gLastVerdict))
   if gLastResult.len > 0:
@@ -268,13 +341,22 @@ proc install*(): bool =
   ## trigger did not subscribe looks exactly like a mod that was never asked.
   loadSpec()
   var ok = true
+  if on(ListingEvent, onProfileListing) != Ok:
+    warn "AutoRaid LOADOUT: could NOT subscribe to `" & ListingEvent &
+         "`. That is the ONLY event from which a loadout can reach the coming " &
+         "raid, so with it unsubscribed NOTHING will ever be spawned -- the " &
+         "other two subscriptions apply nothing by design. If this " &
+         "mods/tarkov predates that event, that is a VERSION MISMATCH and not " &
+         "a bug here; the status route reports `applies` 0 with " &
+         "`tooLateEvents` climbing, which is exactly that shape."
+    ok = false
   if on(RaidConfiguredEvent, onRaidConfigured) != Ok:
     warn "AutoRaid LOADOUT: could not subscribe to `" & RaidConfiguredEvent &
-         "`; a raid configured by the client will not trigger a loadout."
+         "` (informational only; nothing is ever applied from it)."
     ok = false
   if on(ProfileSelectedEvent, onProfileSelected) != Ok:
     warn "AutoRaid LOADOUT: could not subscribe to `" & ProfileSelectedEvent &
-         "`; profile selection will not trigger a loadout."
+         "` (informational only; nothing is ever applied from it)."
     ok = false
   if on(ResultEvent, onResult) != Ok:
     warn "AutoRaid LOADOUT: could not subscribe to `" & ResultEvent &
@@ -296,9 +378,15 @@ proc reportLoadout*() =
     return
   if specReady():
     info "AutoRaid LOADOUT: mode `spawned`, " & $gSpecGear & " gear entr(ies) " &
-         "read from loadout.json, trigger `" & applyAt() & "`. Items are " &
-         "created for the raid and STRIPPED at match end; the gear you were " &
-         "wearing is moved to the stash first, never destroyed."
+         "read from loadout.json, applied from INSIDE `" & ListingEvent &
+         "` -- the synchronous event mods/tarkov emits before it serves " &
+         "/client/game/profile/list, which the wire capture shows is the ONLY " &
+         "time the PMC Inventory is sent. `" & RaidConfiguredEvent & "` and `" &
+         ProfileSelectedEvent & "` are observed and NEVER applied from: both " &
+         "are after that fetch, so a loadout applied there would arrive one " &
+         "raid late while still reporting PASS. Items are created for the " &
+         "raid and STRIPPED at match end; the gear you were wearing is moved " &
+         "to the stash first, never destroyed."
   else:
     warn "AutoRaid LOADOUT: mode is `spawned` and the spec is NOT usable -- " &
          gSpecWhy & ". No loadout will be applied and this is announced " &

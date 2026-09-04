@@ -286,18 +286,49 @@ menu opens -> abi/aowlspt_region.h participant `autoraid.menu`
 
 ## 4. Flow C — the spawned loadout (server side)
 
+### 4.1 The measured wire order, which settles the whole design
+
+**MEASURED** by agent S from the real capture (`data/capture/raid1`), one menu
+cycle:
+
+```
+/client/game/profile/list        <-- the ONLY request that carries the PMC
+                                     Inventory (match/local/start sends
+                                     profile: null, tarkov.nim:2381)
+/client/game/profile/select
+/client/raid/configuration
+/client/match/local/start
+/client/match/local/end
+/client/game/profile/list        <-- the NEXT cycle's fetch
+```
+
+`profile/list` is fetched **ONCE per menu cycle and NEVER after select or
+configuration**.
+
+**This invalidated the first design of this mod, and the failure would have been
+invisible.** Applying on `tarkov.raid.configured` or `tarkov.profile.selected`
+mints the items into the stored profile *after* the client has already been
+handed its copy — so the kit arrives on the NEXT menu cycle, one raid late,
+every time, **while the verdict says PASS**, because tarkov really did mint them.
+That is a check that cannot fail: it asserts our own write and never asks whether
+the write reached the client. Only the wire could catch it.
+
+### 4.2 The handshake
+
 ```
 mods/autoraid (backend)                      mods/tarkov (backend)
-  loadoutMode == "spawned"
+  loadoutMode == "spawned", applyAt == "listing"
   loadout.json read at load
         |
-        |  tarkov.raid.configured  /  tarkov.profile.selected
-        |<--------------------------------------------------
-        |   applied ONCE per raid, idempotent within 120 s
+        |  tarkov.profile.listing   {session, profileId, cycle}
+        |<==================================================  SYNCHRONOUS,
+        |   emitted from INSIDE onProfileList, BEFORE the      inside the
+        |   profile document is serialised and served          request
         |
         |  autoraid.loadout.apply
         |-------------------------------------------------->
-        |   {profileId, spec:{clear,gear}, ephemeral:true, reason}
+        |   {profileId, spec:{clear,gear}, ephemeral:true,
+        |    reason:"tarkov.profile.listing"}
         |                                     move worn gear to the STASH,
         |                                     applyLoadout(), record minted ids
         |  autoraid.loadout.result            under autoraid.minted.<profileId>
@@ -305,39 +336,46 @@ mods/autoraid (backend)                      mods/tarkov (backend)
         |   {profileId, verdict, requested, minted, placed, rejected, why}
         v
   AutoRaid LOADOUT VERDICT PASS|FAIL|INCONCLUSIVE   (logged VERBATIM)
+        |
+        |  tarkov.profile.selected / tarkov.raid.configured
+        |<--------------------------------------------------
+        v   OBSERVED, NEVER APPLIED FROM. One log line saying they are too
+            late for the coming raid; kept as the standing evidence that the
+            order above still holds.
 
   at match end, mods/tarkov strips every minted subtree from the posted
   profile before saveProfile, respecting the raidCarriedFullInventory guard
 ```
 
-* **MEASURED (from the route table, `mods/tarkov/tarkov.nim:3246-3452`)** — the
-  spawn equipment is the PMC profile's Inventory delivered at
-  `/client/game/profile/list`; `/client/match/local/start` sends
-  `profile: null` (`tarkov.nim:2381`). So the loadout must be in the stored
-  profile before the client's LAST profile/list fetch.
+* **Synchronous is load-bearing.** An event that merely fired "around then"
+  would be a race, and a race that loses is indistinguishable from the
+  one-raid-late bug above. The `emit` happens inside the listing handler's call
+  stack; by the time it returns the items are in the document about to be
+  served.
+* **Idempotence is per (profileId, cycle)**, from the `cycle` field — not per
+  profile and not on a clock. Per-profile would silently refuse the second raid
+  of a session; a clock would be a guess. Beyond that this mod does not guard:
+  tarkov refuses a second mint while a minted set is active and says why, and
+  that refusal is logged as the verdict.
 * **MEASURED (from `tarkov.nim:2524-2539`)** — the whole stored profile is
   replaced by the posted one at match end EXCEPT under the
   `raidCarriedFullInventory` guard, and death does not re-remove gear. So
   minted-before-raid gear is indistinguishable from owned gear after a raid and
   would land in the stash on extract. Ephemerality is therefore a RECORDED SET
   of minted ids plus a strip step, not a property of the items.
-* **NOT MEASURED, and this is why `applyAt` defaults to `auto`** — which of
-  `tarkov.profile.selected` and `tarkov.raid.configured` precedes the client's
-  last profile/list fetch. That is a wire measurement (agent S's), and this mod
-  does not guess: `auto` subscribes to both and applies once per raid,
-  idempotently, which is correct either way.
-* **MEASURED offline, 2026-09-04** — every `query` and every `tpl` in the shipped
-  `loadout.json` was checked against `D:\Aowlspt\aowlspt\db.json` with the SAME
-  matching rule `emu/spawn.searchItemsCounted` uses (substring over the English
-  locale name, intersected with `templates.items`). Four entries carry a `tpl`
-  instead of a `query` because the name is genuinely ambiguous:
-  `5.45x39mm BT gs` (also three ammo packs), `PACA Soft Armor` (also the Rivals
-  Edition), `9x18mm PM PS gs PPO` (also two packs), and
-  `PM 9x18PM 90-93 8-round magazine` (**two template ids share that exact name**).
-  `loadout.nim` REFUSES an ambiguous query rather than taking the first hit, so
-  each of those would have been a named refusal, not a wrong item.
-
----
+* **MEASURED offline, 2026-09-04** — every `query` and every `tpl` in the
+  shipped `loadout.json` was checked against `D:\Aowlspt\aowlspt\db.json` with
+  the SAME matching rule `emu/spawn.searchItemsCounted` uses (substring over the
+  English locale name, intersected with `templates.items`). Four entries carry a
+  `tpl` because the name is genuinely ambiguous: `5.45x39mm BT gs` (also three
+  ammo packs), `PACA Soft Armor` (also the Rivals Edition), `9x18mm PM PS gs
+  PPO` (also two packs), and `PM 9x18PM 90-93 8-round magazine` (**two template
+  ids share that exact name**). `loadout.nim` REFUSES an ambiguous query rather
+  than taking the first hit, so each would have been a named refusal, not a
+  wrong item.
+* **inferred** — the `tarkov.profile.listing` payload shape and the fact that
+  tarkov handles `autoraid.loadout.apply` inline. Both are agent S's, and this
+  mod builds against the names.
 
 ## 5. What is NOT verified
 
@@ -356,7 +394,10 @@ Nothing in this mod has been run against the live client. Specifically unproven:
 4. **The `ui.show` payload shape and `ui_show_status`** — agent H's, built
    against the names.
 5. **`-aowl.raid` reaching the client** — agent H's launcher change.
-6. **The loadout handshake** — agent S's half of both events.
+6. **The loadout handshake** — agent S's `tarkov.profile.listing`, that it is
+   emitted synchronously before the profile is serialised, and that an apply
+   emitted from inside it lands in that same document. The whole feature rests
+   on this and it has not been observed end to end.
 7. **The raid-exit half.** The host's own note stands: site 7 must bind or
    SHOW-IN-RAID refuses, and that path has never been re-stated as solved with a
    live PASS.
@@ -384,6 +425,7 @@ AutoRaid SCREEN-NEXT: the practice/offline toggle
 AutoRaid: SCREEN-NEXT -- pressed the
 AutoRaid CMDLINE VERDICT
 AutoRaid MENU VERDICT
+AutoRaid LOADOUT: emitted `autoraid.loadout.apply`
 AutoRaid LOADOUT VERDICT
 ```
 

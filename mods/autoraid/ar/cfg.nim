@@ -43,7 +43,7 @@ var cfgEnterKey = "None"
 var cfgDefaultMap = "Woods"
 var cfgMaps = DefaultMaps
 var cfgLoadoutMode = "current"
-var cfgApplyAt = "auto"
+var cfgApplyAt = "listing"
 
 proc hotkeysOn*(): bool = cfgHotkeys
 proc menuKeyName*(): string = cfgMenuKey
@@ -156,14 +156,21 @@ proc schema*(): seq[Setting] =
         "is applied before the client's last profile fetch, which has already " &
         "happened by the time you can change this."),
 
-    enumSetting("applyAt", "When to apply a spawned loadout", "auto",
-      options = @["auto", "raidconfigured", "profileselected"],
+    enumSetting("applyAt", "Apply a spawned loadout at all", "listing",
+      options = @["listing", "off"],
       category = "Loadout", appliesOn = "restart",
       description =
-        "Which backend event triggers the loadout. `auto` (the shipped value) " &
-        "subscribes to BOTH `tarkov.raid.configured` and " &
-        "`tarkov.profile.selected` and applies ONCE PER RAID, idempotently -- " &
-        "which is correct whichever of the two precedes the client's last " &
-        "`/client/game/profile/list` fetch, and that ordering is a wire " &
-        "measurement, not something this mod should guess at. The other two " &
-        "values pin it to one event and are for diagnosing that ordering.")]
+        "THERE IS ONLY ONE MOMENT AT WHICH THIS CAN WORK, so this row is a " &
+        "switch and not a choice. MEASURED from the real wire capture: " &
+        "/client/game/profile/list -> profile/select -> raid/configuration -> " &
+        "match/local/start -> match/local/end -> profile/list. The PMC " &
+        "Inventory is sent ONLY at profile/list, and profile/list is fetched " &
+        "ONCE per menu cycle and NEVER after select or configuration -- so a " &
+        "loadout applied on `tarkov.raid.configured` or " &
+        "`tarkov.profile.selected` arrives ONE RAID LATE, every time, while " &
+        "still reporting PASS. `listing` (the shipped value) applies from " &
+        "inside `tarkov.profile.listing`, the synchronous event mods/tarkov " &
+        "emits BEFORE it serves that document, so the kit is in the profile " &
+        "the client is about to receive. `off` subscribes and logs but mints " &
+        "nothing -- a diagnostic, for separating `the trigger never fired` " &
+        "from `the mint failed`.")]

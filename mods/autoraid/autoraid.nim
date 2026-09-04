@@ -300,12 +300,15 @@ proc onSettingsHotApply(key: string) =
   loadConfig()
   if key == "loadoutMode" or key == "applyAt":
     settingAppliesOnRestart(
-      "stored. It takes effect on the NEXT RAID, not this one: the loadout is " &
-      "applied before the client's LAST /client/game/profile/list fetch, and " &
-      "by the time you can change this setting that fetch has already " &
-      "happened. It is also read by the SERVER half, in the backend process, " &
-      "so a client-side edit reaches it only when the backend re-reads its " &
-      "config. Current stored state: " & summary())
+      "stored, and it takes effect on the NEXT MENU CYCLE, not this one. " &
+      "MEASURED: /client/game/profile/list is the ONLY request that carries " &
+      "the PMC Inventory, it is fetched ONCE per menu cycle, and the loadout " &
+      "is minted from inside `tarkov.profile.listing` just before that " &
+      "document is served -- which by the time you can touch this setting has " &
+      "already happened for the raid you are about to enter. It is also read " &
+      "by the SERVER half, in the backend process, so a client-side edit " &
+      "reaches it only when the backend re-reads its config. Current stored " &
+      "state: " & summary())
     return
   if key == "hotkeys" or key == "menuKey" or key == "enterKey":
     menu.bindKeys()
