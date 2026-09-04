@@ -1894,9 +1894,32 @@ proc modsTabBuild(): bool =
   var rowsFixed = 0
   var rowsBad = 0
   var rowsSeen = 0
+  # ---- ONLY THE SHOWN SUBTAB'S PAGE IS BEGUN HERE ------------------------
+  #
+  # MEASURED on the Game-tab twin of this loop (host log 4e1f9e7bc8fd, entries
+  # #7..#18): rendering EVERY page in one call is 11 GRAFT ticks back to back,
+  # 265 ms each, ~3.2 s of Unity main thread inside a single frame -- and only
+  # the heading row of each page, because `swRenderPage` is BEGIN plus ONE
+  # slice and a begun page spends its first slice on its graft. The MODS tab
+  # runs the identical loop, which is what the player sees as a mods page that
+  # "did nothing": the tab appears, one caption lands, and the frame stalls.
+  #
+  # `modsShowSubtab`/the build below make subtab 0 the visible one, so that is
+  # the page that is begun here. Every other page is begun LATER, one per tick,
+  # by `modsAutoBeginNext` off `swSliceRegistry` -- so a subtab the player has
+  # not opened yet costs nothing this frame and is still filled in before they
+  # get to it.
+  let shownAtBuild = (if gModsSel >= 0: gModsSel else: 0)
   while r < gModsSubs.len and r < gModsPages.len:
     if gModsSubs[r].pageGo != nil:
-      discard swRenderPage(tabPtr, gModsSubs[r].pageGo, gModsPages[r])
+      if r == shownAtBuild:
+        discard swRenderPage(tabPtr, gModsSubs[r].pageGo, gModsPages[r])
+      else:
+        okLog "mods tab: page '" & gModsPages[r].id & "' is NOT begun during " &
+              "the build -- subtab " & $shownAtBuild & " is the shown one and " &
+              "is the only page begun in this frame. The rest are begun one " &
+              "per tick by modsAutoBeginNext; beginning all of them here is " &
+              "one GRAFT tick each (265 ms measured) inside a single frame."
       # RE-ASSERT EVERY ROW'S CAPTION ACROSS ALL ITS TMPs.
       #
       # `swCloneRow` labels through `swControlTmp` -- ONE TextMeshProUGUI --
@@ -2107,6 +2130,84 @@ proc modsReassertLabels() =
   else:
     gModsLabelStable = 0
 
+proc modsAutoBeginNext(pages: var seq[SwPage]): bool =
+  ## BEGIN ONE MODS PAGE, FROM THE TICK, WHEN NOTHING ELSE IS FILLING.
+  ##
+  ## The other half of "the build begins only the shown subtab". Called by
+  ## `swSliceRegistry(gModsPages, swRegMods)` -- the enum, not a caption, is
+  ## what routes it here, because beginning a MODS page against the Game tab's
+  ## row container would put a mod's rows in the wrong panel.
+  ##
+  ## ORDER, and it is not arbitrary: the SHOWN subtab first, then the rest in
+  ## strip order. A page the player is looking at fills before one they are
+  ## not, and a page they never open still ends up filled -- but never at the
+  ## cost of the frame they are looking at.
+  ##
+  ## Returns true if a page was begun; that page's GRAFT is then the next
+  ## tick's work, so this call instantiates nothing itself.
+  result = false
+  if not gModsBuilt or gModsSubs.len == 0:
+    return
+  # ONE AT A TIME. A page that is begun and not complete owns the drain.
+  var i = 0
+  while i < pages.len and i < ModsMaxSubtabs:      # rule 4: capped
+    if pages[i].begun and not pages[i].complete:
+      return
+    i = i + 1
+  # THE SHOWN SUBTAB FIRST, then the rest in strip order.
+  var pick = -1
+  if gModsSel >= 0 and gModsSel < pages.len and gModsSel < gModsSubs.len and
+     not pages[gModsSel].begun:
+    pick = gModsSel
+  else:
+    i = 0
+    while i < pages.len and i < gModsSubs.len and i < ModsMaxSubtabs:
+      if not pages[i].begun:
+        pick = i
+        break
+      i = i + 1
+  if pick < 0:
+    return                              # every page has been begun already
+  let parentGo = gModsSubs[pick].pageGo
+  if parentGo == nil or not duOk(parentGo, 0x20'i32) or
+     not modsGoActive(parentGo) and pick == gModsSel:
+    # An inactive container is NORMAL for a subtab that is not shown, and is
+    # rendered into deliberately; an inactive container for the page we are
+    # SHOWING is not, and is worth saying rather than filling invisibly.
+    if parentGo == nil or not duOk(parentGo, 0x20'i32):
+      warn "mods tab: page '" & pages[pick].id & "' cannot be begun -- its " &
+           "page container is null or unreadable, so nothing was rendered " &
+           "and nothing was written."
+      return
+    warn "mods tab: page '" & pages[pick].id & "' is the SHOWN subtab but " &
+         "its container reads activeInHierarchy=false, so its rows would be " &
+         "drawn where nobody can see them. Rendering anyway and saying so; " &
+         "if this repeats, the subtab strip and modsShowSubtab disagree."
+  let tabPtr = gModsLastTabPtr
+  if tabPtr == nil or not duOk(tabPtr, 0x20'i32):
+    warn "mods tab: page '" & pages[pick].id & "' cannot be begun -- the " &
+         "remembered SettingsTab is null or unreadable. The registry is left " &
+         "where it is; re-opening Settings re-arms it."
+    return
+  var pg = pages[pick]
+  if not swRenderPageBegin(tabPtr, parentGo, pg):
+    # `swRenderPageBegin` has already said why. `begun` stays false, so this
+    # would retry every tick forever -- mark it complete instead, which makes
+    # it state its verdict once and stop asking.
+    pg.complete = true
+    pages[pick] = pg
+    warn "mods tab: page '" & pages[pick].id & "' REFUSED to begin (the " &
+         "settings-pages line above names the reason). It is marked complete " &
+         "so it does not retry every frame; re-opening the MODS tab rebuilds " &
+         "the panel and tries again."
+    return
+  pages[pick] = pg
+  okLog "mods tab: page '" & pages[pick].id & "' BEGUN FROM THE TICK into " &
+        "subtab " & $pick & "'s own container (shown subtab is " & $gModsSel &
+        "). One page fills at a time; its graft is the next tick's work and " &
+        "its RENDER VERDICT follows when it completes."
+  result = true
+
 proc modsShowSubtab(sel: int) =
   ## Make `sel` the visible page. Calls only where something changes.
   var i = 0
@@ -2293,8 +2394,8 @@ proc modsTabTickBody() =
   # a row that is drawn but still reads the donor's caption is not a rendered
   # row -- it is fact #88 wearing one.
   modsCrumb("STAGE: swSliceRegistry")
-  discard swSliceRegistry(gSwPages, "settings pages")
-  discard swSliceRegistry(gModsPages, "mods pages")
+  discard swSliceRegistry(gSwPages, swRegSettings)
+  discard swSliceRegistry(gModsPages, swRegMods)
   modsRelabelPending()
 
 var gModsSanityFrames = 0

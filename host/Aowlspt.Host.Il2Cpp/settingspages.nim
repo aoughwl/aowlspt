@@ -1294,6 +1294,31 @@ var gSwSliceWorked = false
 var gSwPagesTabPtr = 0'u64
 var gSwPagesTabKey = 0'u64
 
+## WHICH REGISTRY A DRAIN IS DRIVING. This used to be a bare `who: string`
+## that `modstab.nim` passed as the literals "settings pages" / "mods pages",
+## and `swSliceRegistry` then compared that literal to decide whether it was
+## allowed to BEGIN the next page. A behavioural switch on a log caption is a
+## seam that drifts the first time someone improves the wording, and the
+## failure would be silent: pages that simply never begin.
+##
+## So the two registries are named ONCE, here, and both files use the enum.
+## The caption is derived from it and not the other way round.
+type
+  SwRegistry* = enum
+    swRegSettings                ## `gSwPages` -- the Game tab's flat list
+    swRegMods                    ## `gModsPages` -- the MODS tab's subtabs
+
+proc swRegName*(r: SwRegistry): string =
+  case r
+  of swRegSettings: "settings pages"
+  of swRegMods: "mods pages"
+
+## FORWARD DECLARATION into `modstab.nim` (included later). The MODS tab's
+## pages live in their own per-subtab containers, so beginning one needs that
+## file's `gModsSubs`; the drain here only decides WHEN. Returns true if it
+## begun a page, in which case this tick's budget is spent.
+proc modsAutoBeginNext(pages: var seq[SwPage]): bool
+
 proc swSliceNote(): string =
   "slice clock: " & $gSwSliceTicks & " row tick(s), worst " &
     $gSwSliceWorstMs & " ms" &
@@ -1941,7 +1966,7 @@ proc swRenderPage(tabPtr, parentGo: Il2CppPtr; page: var SwPage): int =
   if not swRenderPageBegin(tabPtr, parentGo, page): return
   result = swRenderPageSlice(page)
 
-proc swVerdictWatch(pages: var seq[SwPage]; who: string) =
+proc swVerdictWatch(pages: var seq[SwPage]; reg: SwRegistry) =
   ## THE BOUNDED VERDICT. Said once per page visit for a page that has been
   ## filling for longer than `cSwPageVerdictMs` and has not completed --
   ## because the deployed run proved that "print the verdict when the page
@@ -1950,6 +1975,7 @@ proc swVerdictWatch(pages: var seq[SwPage]; who: string) =
   ## It names the SHORTFALL and the elapsed time, and it is a WARNING: a page
   ## still short of its rows after twelve seconds is a player-visible defect
   ## whether or not it eventually finishes.
+  let who = swRegName(reg)
   let now = cNowMs()
   var i = 0
   while i < pages.len and i < 32:                 # rule 4: capped
@@ -2030,7 +2056,7 @@ proc swAutoBeginNext(pages: var seq[SwPage]): bool =
         "at a time; this one's graft is the next tick's work."
   result = true
 
-proc swSliceRegistry(pages: var seq[SwPage]; who: string): int =
+proc swSliceRegistry(pages: var seq[SwPage]; reg: SwRegistry): int =
   ## THE PER-TICK DRAIN, over one registry. Read-modify-write per element, for
   ## the aliasing reason `swPagesOnTabBuilt` documents at length: a scalar
   ## field written through `pages[i].field = x` was MEASURED not to persist,
@@ -2040,17 +2066,21 @@ proc swSliceRegistry(pages: var seq[SwPage]; who: string): int =
   ## three pages of 24 rows in one frame is three times the budget wearing the
   ## word "slice".
   result = 0
-  swVerdictWatch(pages, who)
+  swVerdictWatch(pages, reg)
   gSwSliceWorked = false
-  # ONLY THE REGISTRY THAT `swPagesOnTabBuilt` OWNS may be auto-advanced, and
-  # `who` is how the caller (modstab.nim's tick) names it -- "settings pages"
-  # is `gSwPages`, "mods pages" is `gModsPages`, whose pages are rendered into
-  # the MODS tab's own per-subtab containers by that file and must not be
-  # begun against the Game tab's container.
-  if who == "settings pages":
-    if swAutoBeginNext(pages):
-      gSwSliceWorked = true
-      return
+  # EACH REGISTRY IS ADVANCED BY THE THING THAT KNOWS WHERE ITS PAGES GO.
+  # `gSwPages` renders into the Game tab's one row container; `gModsPages`
+  # renders into the MODS tab's per-subtab containers, which only
+  # `modstab.nim` can reach. Beginning one against the other's parent would
+  # put every mod's rows in the wrong place, which is why this dispatches on
+  # the enum and not on a caption.
+  var begunOne = false
+  case reg
+  of swRegSettings: begunOne = swAutoBeginNext(pages)
+  of swRegMods: begunOne = modsAutoBeginNext(pages)
+  if begunOne:
+    gSwSliceWorked = true
+    return
   var i = 0
   while i < pages.len and i < 32:                 # rule 4: capped
     if pages[i].begun and not pages[i].complete:
