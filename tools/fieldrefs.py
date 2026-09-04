@@ -104,6 +104,39 @@ MANIFEST = [
      "audit #6/#9 settingswrite/invoke2/version brand: TMP_Text.m_text"),
     ("EB_PATH",        "Diz.Resources.EasyBundle", "_path",
      "audit #11 mods/textures/redirect.nim EasyBundle._path"),
+    # --- APPENDED 2026-09-04, dlssrows.nim TOOLTIPS.
+    #
+    # `SettingsTooltipData` is the TEMPLATE argument of
+    # `SettingControl::SetTooltip` @0x16FAC00. MEASURED `disasm 0x16fac00
+    # --len 940`: SetTooltip does NOT keep the object it is handed -- it
+    # constructs its OWN through `SettingsTooltipData::.ctor(ESettingsOption)`
+    # @0x16FCD70 and copies the fields across (`mov rax,[rbp+0x20]` ->
+    # `mov [rdi+0x20],rax` is Text). So the six stores below are into an
+    # object THIS HOST allocated with `il2cpp_object_new` and which the game
+    # has never seen -- but they go through the typed gate anyway, because the
+    # klass the allocation was made against is borrowed from a live donor row
+    # and "it read back plausibly" is not a fact (hostfieldwrite.nim header).
+    #
+    # Offsets MEASURED `tools/fldoff.py fields EFT.UI.Settings.SettingsTooltipData`
+    # with the System.String self-check passing: Key@0x10 (ESettingsOption, an
+    # enum -> 4 bytes, value type), Title@0x18 (string, REFERENCE), Text@0x20
+    # (string, REFERENCE), UsageStyle@0x28 (EUsageStyle, 4), UsageProperty@0x2C
+    # (EUsageProperty, 4), UsageText@0x30 (string, REFERENCE). Nothing here is
+    # a literal in the Nim; the widths and the is-reference bits are derived by
+    # this file from the metadata, which is what stops a 4-byte store landing
+    # in a reference slot.
+    ("TTD_KEY",        "EFT.UI.Settings.SettingsTooltipData", "Key",
+     "dlssrows.nim tooltip template: SettingsTooltipData.Key (ESettingsOption)"),
+    ("TTD_TITLE",      "EFT.UI.Settings.SettingsTooltipData", "Title",
+     "dlssrows.nim tooltip template: SettingsTooltipData.Title (string)"),
+    ("TTD_TEXT",       "EFT.UI.Settings.SettingsTooltipData", "Text",
+     "dlssrows.nim tooltip template: SettingsTooltipData.Text (string)"),
+    ("TTD_USAGESTYLE", "EFT.UI.Settings.SettingsTooltipData", "UsageStyle",
+     "dlssrows.nim tooltip template: SettingsTooltipData.UsageStyle (EUsageStyle)"),
+    ("TTD_USAGEPROP",  "EFT.UI.Settings.SettingsTooltipData", "UsageProperty",
+     "dlssrows.nim tooltip template: SettingsTooltipData.UsageProperty (EUsageProperty)"),
+    ("TTD_USAGETEXT",  "EFT.UI.Settings.SettingsTooltipData", "UsageText",
+     "dlssrows.nim tooltip template: SettingsTooltipData.UsageText (string)"),
 ]
 
 # ---------------------------------------------------------------------------

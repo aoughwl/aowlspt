@@ -168,6 +168,24 @@ proc cNuGetRef(obj: Il2CppPtr; off: int32): Il2CppPtr {.
   importc: "aowl_nu_get_ref", nodecl.}
 proc cNuSetRef(obj: Il2CppPtr; off: int32; val: Il2CppPtr): int32 {.
   importc: "aowl_nu_set_ref", nodecl.}
+proc cNuGetI32(obj: Il2CppPtr; off: int32; ok: var int32): int32 {.
+  importc: "aowl_nu_get_i32", nodecl.}
+# THE DROPDOWN PATH. Every one of these is a READ or a bounds-checked store
+# into an array THIS HOST allocated; none of them touches a game field.
+proc cNuArrNewString(n: int32): Il2CppPtr {.
+  importc: "aowl_nu_arr_new_string", nodecl.}
+proc cNuArrSetString(arr: Il2CppPtr; i: int32; s: cstring): int32 {.
+  importc: "aowl_nu_arr_set_string", nodecl.}
+proc cNuIEnumStringKlass(): Il2CppPtr {.
+  importc: "aowl_nu_ienum_string_klass", nodecl.}
+proc cNuKlassHasIface(obj, iface: Il2CppPtr): int32 {.
+  importc: "aowl_nu_klass_has_iface", nodecl.}
+proc cNuVSlot(obj: Il2CppPtr; slot: int32; fn, mi: var Il2CppPtr): int32 {.
+  importc: "aowl_nu_vslot", nodecl.}
+proc cNuCallShow(fn, self, values, validator, mi: Il2CppPtr) {.
+  importc: "aowl_nu_call_show", nodecl.}
+proc cNuCallPPPPr(fn, self, a0, a1: Il2CppPtr): Il2CppPtr {.
+  importc: "aowl_nu_call_p_ppp", nodecl.}
 
 # ---- target indices, mirroring the AOWL_NU_* defines --------------------
 #
@@ -281,6 +299,20 @@ const
   ## `abi/aowlspt_nativeui.h`.
   NuTTrSetSiblingIdx = 75'i32  ## UnityEngine.Transform::SetSiblingIndex
   NuTGfxRestartMsg   = 76'i32  ## EFT.UI.Settings.GraphicsSettingsTab::ShowTextureQualityChangedMessage
+  ## DROPDOWNS AND TOOLTIPS (dlssrows.nim). APPENDED at the END of
+  ## `aowl_nu_targets`; provenance, sharedness and prologue bytes are on the
+  ## rows in `abi/aowlspt_nativeui.h`. The three `Show` rows are in the table
+  ## ONLY to be byte-verified: the pointer that is actually CALLED comes from
+  ## the receiver's own vtable and must compare equal to one of them.
+  NuTDdbSetCurIdx    = 77'i32  ## EFT.UI.BaseDropDownBox::set_CurrentIndex
+  NuTDdbGetCurIdx    = 78'i32  ## EFT.UI.BaseDropDownBox::get_CurrentIndex
+  NuTScSetTooltip    = 79'i32  ## EFT.UI.Settings.SettingControl::SetTooltip
+  NuTDdbShow         = 80'i32  ## EFT.UI.DropDownBox::Show
+  NuTDdbNsShow       = 81'i32  ## EFT.UI.DropDownBoxNewStyle::Show
+  NuTBaseDdbShow     = 82'i32  ## EFT.UI.BaseDropDownBox::Show
+  ## The vtable slot `Show` occupies. MEASURED from
+  ## `Il2CppMethodDefinition.slot@32` -- all three bodies report 24.
+  NuVSlotShow        = 24'i32
 
 ## Field offsets for the tab machinery. MEASURED (tools/fldoff.py, String
 ## self-check passing) and written up in docs/NATIVETABS.md. All NULL-CAPABLE.
@@ -1411,6 +1443,223 @@ proc nuGfxShowRestartMessage*(gfxTab: Il2CppPtr): bool =
   discard cNuCallPP(fn, gfxTab)
   true
 
+## ---------------------------------------------------------------------------
+## DROPDOWNS AND TOOLTIPS (dlssrows.nim). Everything below is APPENDED; nothing
+## above it moved.
+##
+## Field offsets, all MEASURED with `tools/fldoff.py fields <Type>` and the
+## System.String `_stringLength@0x10 / _firstChar@0x14` self-check passing.
+## NONE is guessed, and every one of them is NULL-CAPABLE -- each hop below is
+## `nuOk`-guarded rather than assumed.
+const
+  NuOffSettingDropDown  = 0xa8'i32  ## SettingDropDown.DropDown -> DropDownBox
+  NuOffDdbCurIndex      = 0xe8'i32  ## BaseDropDownBox.<CurrentIndex>k__BackingField
+  NuOffScTooltipHover   = 0x98'i32  ## SettingControl._tooltipSettingsHover
+  NuOffHoverTooltipData = 0x20'i32  ## SettingsHoverTooltipArea._tooltipData
+  NuOffTtdText          = 0x20'i32  ## SettingsTooltipData.Text (string)
+  NuOffGfxDropDownTmpl  = 0xb0'i32  ## GraphicsSettingsTab._dropDownTemplate
+
+proc nuDropDownOf*(ctrl: Il2CppPtr): Il2CppPtr =
+  ## `SettingDropDown.DropDown` @0xA8 -> the `DropDownBox` that actually holds
+  ## the values and the index. Read raw: it is an ordinary reference field and
+  ## the property getter would be one more shared thunk for nothing.
+  result = nil
+  if not nuOk(ctrl, NuOffSettingDropDown + 8'i32) or not nuAlive(ctrl): return
+  let d = cNuGetRef(ctrl, NuOffSettingDropDown)
+  if not nuOk(d, NuOffDdbCurIndex + 4'i32) or not nuAlive(d): return
+  d
+
+proc nuDropDownIndex*(ddb: Il2CppPtr): (bool, int32) =
+  ## `BaseDropDownBox.<CurrentIndex>k__BackingField` @0xE8, through the game's
+  ## own `get_CurrentIndex` @0x698550 -- which MEASURED
+  ## (`il2cpp_resolve.py bytes 0x698550`) is literally
+  ## `mov eax,[rcx+0xE8] ; ret`. Calling it rather than reading the offset here
+  ## is not superstition: the byte-verify against the startup snapshot is what
+  ## proves the offset the CALL uses is still 0xE8 on the running build.
+  ##
+  ## The bool is separate from the value because index 0 is a legitimate
+  ## selection and must never double as "could not read".
+  result = (false, 0'i32)
+  if not gNuOn or not nuOk(ddb, NuOffDdbCurIndex + 4'i32) or
+     not nuAlive(ddb): return
+  let fn = nuFn(NuTDdbGetCurIdx)
+  if fn == nil: return
+  let v = cNuCallIP(fn, ddb, -1'i32)
+  if v < 0'i32 or v > 4096'i32: return
+  result = (true, v)
+
+proc nuDropDownSetIndex*(ddb: Il2CppPtr; idx: int32): bool =
+  ## `BaseDropDownBox::set_CurrentIndex(int)` @0x698560, MEASURED
+  ## `mov [rcx+0xE8], edx ; ret`. SHARED x2, which is irrelevant to a CALL --
+  ## a shared body is correct code for the receiver you pass; it would be
+  ## unacceptable only as a detour target.
+  ##
+  ## NOT a blind write: the value is bounded first, and the caller checks the
+  ## FINISHED STATE by reading the index back through the OTHER function
+  ## (`get_CurrentIndex`), which is a different address.
+  result = false
+  if not gNuOn or not nuOk(ddb, NuOffDdbCurIndex + 4'i32) or
+     not nuAlive(ddb): return
+  if idx < 0'i32 or idx > 4096'i32: return
+  let fn = nuFn(NuTDdbSetCurIdx)
+  if fn == nil: return
+  cNuCallVPI(fn, ddb, idx)
+  true
+
+proc nuDropDownShow*(ddb: Il2CppPtr; items: seq[string];
+                     why: var string): bool =
+  ## Fill a dropdown with our own captions, by calling the game's own
+  ## `Show(IEnumerable<string> values, Func<int,bool> validator)`.
+  ##
+  ## SIX THINGS ARE PROVED BEFORE ANYTHING IS CALLED, and each failure names
+  ## itself in `why` rather than returning a bare false:
+  ##
+  ##  1. all three `Show` bodies byte-verify against the STARTUP SNAPSHOT
+  ##     (DropDownBox @0x16AFC80, DropDownBoxNewStyle @0x16B1080,
+  ##     BaseDropDownBox @0x16ADC90);
+  ##  2. the receiver's OWN vtable slot 24 resolves to a function pointer and
+  ##     a `const MethodInfo*` out of committed memory;
+  ##  3. that function pointer EQUALS one of the three verified bodies. This
+  ##     is the check that makes the vtable read falsifiable -- and it is not
+  ##     hypothetical: `DropDownBoxNewStyle` is a SIBLING of `DropDownBox`
+  ##     (both derive `BaseDropDownBox`, MEASURED via Resolver.parent_chain),
+  ##     so a direct call at DropDownBox's RVA on a NewStyle receiver would run
+  ##     a body that reads `_button@0xF8` off a different layout;
+  ##  4. a managed `String[]` is allocated (`il2cpp_array_new`, UNGATED --
+  ##     absent from `aowl_gate_rows`) and every element reads back as a live
+  ##     `System.String`;
+  ##  5. the `Il2CppClass* IEnumerable<string>` the game's own Show dispatches
+  ##     against is READABLE in its metadata-usage slot -- before the game has
+  ##     run Show once that slot still holds a raw token, and this refuses
+  ##     rather than passing an argument the dispatch could not resolve;
+  ##  6. that class is PRESENT in the array's `interfaceOffsets` table -- the
+  ##     same table, read the same way, that this build's own dispatch stub at
+  ##     0x52D0 walks. A miss there leaves the stub's slow path, and any throw
+  ##     it takes is MANAGED and cannot be caught by `aowl_p_p_seh`.
+  ##
+  ## The validator is NULL. MEASURED: `BaseDropDownBox::Show` stores it
+  ## straight into `_validator@0xE0` and every use is null-checked.
+  result = false
+  why = ""
+  if not gNuOn:
+    why = "the nativeui layer is off"
+    return
+  if items.len <= 0 or items.len > 16:
+    why = "the caller offered " & $items.len & " item(s), which is outside " &
+          "the 1..16 this path accepts"
+    return
+  if not nuOk(ddb, NuOffDdbCurIndex + 4'i32) or not nuAlive(ddb):
+    why = "the DropDownBox pointer is not a live readable object"
+    return
+  let f0 = nuFn(NuTDdbShow)
+  let f1 = nuFn(NuTDdbNsShow)
+  let f2 = nuFn(NuTBaseDdbShow)
+  if f0 == nil or f1 == nil or f2 == nil:
+    why = "one or more of the three Show prologues did not byte-verify " &
+          "against the startup snapshot (DropDownBox=" &
+          (if f0 == nil: "REFUSED" else: "ok") & ", DropDownBoxNewStyle=" &
+          (if f1 == nil: "REFUSED" else: "ok") & ", BaseDropDownBox=" &
+          (if f2 == nil: "REFUSED" else: "ok") & ")"
+    return
+  var fn: Il2CppPtr = nil
+  var mi: Il2CppPtr = nil
+  if cNuVSlot(ddb, NuVSlotShow, fn, mi) == 0'i32:
+    why = "vtable slot " & $NuVSlotShow & " on the receiver's own class did " &
+          "not read back a function pointer and a MethodInfo* out of " &
+          "committed memory"
+    return
+  if fn != f0 and fn != f1 and fn != f2:
+    why = "vtable slot " & $NuVSlotShow & " resolved to 0x" &
+          hexOf(cast[uint64](fn)) & ", which is NOT any of the three " &
+          "byte-verified Show bodies. This receiver is not a dropdown of a " &
+          "shape this host knows, or the slot number moved on this build. " &
+          "Nothing was called"
+    return
+  let arr = cNuArrNewString(int32(items.len))
+  if arr == nil:
+    why = "il2cpp_array_new refused, or the array it returned did not report " &
+          "the length that was asked for"
+    return
+  var k = 0
+  while k < items.len and k < 16:
+    var tmp = items[k]
+    if cNuArrSetString(arr, int32(k), toCString(tmp)) == 0'i32:
+      why = "element " & $k & " of the String[] could not be stored (the " &
+            "interned string did not read back as a System.String, or the " &
+            "slot is outside the array's own max_length). The array is " &
+            "INCOMPLETE, so nothing was called"
+      return
+    k = k + 1
+  let ie = cNuIEnumStringKlass()
+  if ie == nil:
+    why = "the Il2CppClass* for IEnumerable<string> is not yet in the " &
+          "metadata-usage slot the game's own Show reads (RVA 0x6DF5A38 " &
+          "still holds its raw token), so the interface dispatch inside Show " &
+          "could not be pre-checked. This is 'asked before the game ever " &
+          "opened a dropdown', not a wrong address. Nothing was called"
+    return
+  let hasIt = cNuKlassHasIface(arr, ie)
+  if hasIt != 1'i32:
+    why = "the allocated String[] " &
+          (if hasIt == 0'i32:
+             "does NOT carry IEnumerable<string> in its interfaceOffsets table"
+           else:
+             "could not have its interfaceOffsets table read (INCONCLUSIVE)") &
+          ". Show interface-dispatches on that exact table, and a miss leaves " &
+          "a slow path whose throw would be MANAGED and uncatchable here. " &
+          "Nothing was called"
+    return
+  cNuCallShow(fn, ddb, arr, nil, mi)
+  true
+
+proc nuTooltipDataOf*(ctrl: Il2CppPtr): Il2CppPtr =
+  ## `SettingControl._tooltipSettingsHover` @0x98 -> `_tooltipData` @0x20.
+  ## TWO hops, TWO guards. This is both how a DONOR row's tooltip class is
+  ## borrowed and how our own rows are verified afterwards.
+  result = nil
+  if not nuOk(ctrl, NuOffScTooltipHover + 8'i32): return
+  let hov = cNuGetRef(ctrl, NuOffScTooltipHover)
+  if not nuOk(hov, NuOffHoverTooltipData + 8'i32): return
+  let d = cNuGetRef(hov, NuOffHoverTooltipData)
+  if not nuOk(d, NuOffTtdText + 8'i32): return
+  d
+
+proc nuTooltipTextOf*(ctrl: Il2CppPtr): Il2CppPtr =
+  ## The `SettingsTooltipData.Text` @0x20 a control is ACTUALLY showing, walked
+  ## from the control. The verdict compares this against the interned string
+  ## that was handed to `SetTooltip` -- `SetTooltip` copies the REFERENCE
+  ## (MEASURED `mov rax,[rbp+0x20] ; mov [rdi+0x20],rax`), so pointer identity
+  ## is a real finished-state test and not a comparison with our own write.
+  result = nil
+  let d = nuTooltipDataOf(ctrl)
+  if d == nil: return
+  cNuGetRef(d, NuOffTtdText)
+
+proc nuSetTooltip*(ctrl, data: Il2CppPtr): bool =
+  ## `SettingControl::SetTooltip(SettingsTooltipData, SettingsTooltip)`
+  ## @0x16FAC00 -- UNIQUE, non-virtual, section `il2cpp`.
+  ##
+  ## MEASURED `disasm 0x16fac00 --len 940`: it returns `this` untouched when
+  ## `_blocker@0x88` is null, when `UiElementBlocker::TryGetTooltip` answers
+  ## false, or when the data argument is null; otherwise it builds its OWN
+  ## `SettingsTooltipData` via `.ctor(ESettingsOption)` @0x16FCD70, copies the
+  ## fields over and stores the hover area into `_tooltipSettingsHover@0x98`.
+  ## THREE no-op paths and no throw path -- which is exactly why `true` here
+  ## means only "the call was made", and the caller must read the finished
+  ## state back through `nuTooltipTextOf`.
+  ##
+  ## The second argument is NULL: MEASURED, the view is fetched from the
+  ## blocker's own `TryGetTooltip` and the parameter is only a preferred
+  ## override.
+  result = false
+  if not gNuOn or not nuOk(ctrl, NuOffScTooltipHover + 8'i32) or
+     not nuAlive(ctrl): return
+  if not nuOk(data, NuOffTtdText + 8'i32): return
+  let fn = nuFn(NuTScSetTooltip)
+  if fn == nil: return
+  discard cNuCallPPPPr(fn, ctrl, data, nil)
+  true
+
 proc nuGroupPadding*(layoutGroup: Il2CppPtr): Il2CppPtr =
   ## `LayoutGroup.m_Padding` @0x20 -> RectOffset. Read raw on purpose: the
   ## property getter is SHARED x479 and this is an ordinary reference field.
@@ -1882,6 +2131,25 @@ proc nuTargetsBindOk(): bool =
   want.add "UnityEngine.Transform::GetSiblingIndex"
   idx.add NuTGfxRestartMsg
   want.add "EFT.UI.Settings.GraphicsSettingsTab::ShowTextureQualityChangedMessage"
+  # THE APPENDED SIX. `set_CurrentIndex` and `get_CurrentIndex` are ADJACENT
+  # RVAs differing by 0x10 whose bodies are a STORE and a LOAD at the same
+  # offset -- a mis-index would silently WRITE the index a readback believes it
+  # READ, which is the readback-that-cannot-fail this file already had one of.
+  # The three `Show` rows matter even more here: DropDownBox::Show and
+  # DropDownBoxNewStyle::Show have IDENTICAL first 16 prologue bytes, so a
+  # signature check cannot tell them apart and only the NAME can.
+  idx.add NuTDdbSetCurIdx
+  want.add "EFT.UI.BaseDropDownBox::set_CurrentIndex"
+  idx.add NuTDdbGetCurIdx
+  want.add "EFT.UI.BaseDropDownBox::get_CurrentIndex"
+  idx.add NuTScSetTooltip
+  want.add "EFT.UI.Settings.SettingControl::SetTooltip"
+  idx.add NuTDdbShow
+  want.add "EFT.UI.DropDownBox::Show"
+  idx.add NuTDdbNsShow
+  want.add "EFT.UI.DropDownBoxNewStyle::Show"
+  idx.add NuTBaseDdbShow
+  want.add "EFT.UI.BaseDropDownBox::Show"
   var i = 0
   while i < idx.len:                      # capped: idx is built right here
     let ix = idx[i]

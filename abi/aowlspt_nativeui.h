@@ -702,6 +702,67 @@ typedef struct AowlNuTarget {
 #define AOWL_NU_TR_SETSIBLINGIDX      75
 #define AOWL_NU_GFXTAB_RESTARTMSG     76
 
+/* --- APPENDED 2026-09-04 (dlssrows.nim DROPDOWNS + TOOLTIPS). Provenance is
+ * on the table rows themselves. APPEND ONLY: this table is indexed by
+ * POSITION from nativeui.nim. */
+#define AOWL_NU_DDB_SET_CURIDX        77
+#define AOWL_NU_DDB_GET_CURIDX        78
+#define AOWL_NU_SC_SETTOOLTIP         79
+#define AOWL_NU_DDB_SHOW              80
+#define AOWL_NU_DDBNS_SHOW            81
+#define AOWL_NU_BDDB_SHOW             82
+
+/* The vtable slot `Show(IEnumerable<string>, Func<int,bool>)` occupies, and
+ * the byte offset of `Il2CppClass.vtable`. NEITHER IS GUESSED.
+ *
+ * SLOT: MEASURED from `Il2CppMethodDefinition.slot@32` for all three bodies --
+ * EFT.UI.DropDownBox::Show, EFT.UI.DropDownBoxNewStyle::Show and
+ * EFT.UI.BaseDropDownBox::Show all report slot 24, which is what an override
+ * of one base method must look like.
+ *
+ * VTABLE BASE: MEASURED by disassembling THIS BUILD'S OWN interface-dispatch
+ * stub at RVA 0x52D0 (`il2cpp_resolve.py disasm 0x52d0 --len 200`), which the
+ * game's own BaseDropDownBox::Show calls twice. Its tail is
+ *   shl rax,4 ; add rax,0x138 ; add rax,r11 ; mov r8,[rax] ; mov rdx,[rax+8]
+ * i.e. entry = klass + 0x138 + 16*index, entry[0] = methodPtr,
+ * entry[8] = const MethodInfo*. The same routine reads the interface-offset
+ * table at klass+0xB0 with its count in the u16 at klass+0x12E and a 16-byte
+ * stride (`cmp qword ptr [r10 + rcx*8], rdx` with rcx = 2*i).
+ *
+ * WHY VIRTUAL DISPATCH AT ALL, when a direct call at a byte-verified RVA is
+ * this host's normal move: `DropDownBoxNewStyle` is a SIBLING of
+ * `DropDownBox`, not a subclass of it (both derive `BaseDropDownBox` --
+ * MEASURED via Resolver.parent_chain). `Show` is PUBLIC|VIRTUAL. So a direct
+ * call to DropDownBox::Show on a NewStyle receiver would run a body that
+ * reads `_button@0xF8` and writes `_overlayLayer@0x148` on an object of a
+ * different layout. The dispatch below cannot make that mistake, and the
+ * identity check in nativeui.nim -- the resolved pointer must equal one of the
+ * three INDEPENDENTLY byte-verified Show targets -- is what makes the vtable
+ * read falsifiable instead of merely plausible. */
+#define AOWL_NU_VSLOT_SHOW            24
+#define AOWL_NU_KLASS_VTABLE_OFF      0x138
+#define AOWL_NU_KLASS_IFOFFS_PTR      0xB0
+#define AOWL_NU_KLASS_IFOFFS_CNT      0x12E
+#define AOWL_NU_IFOFF_STRIDE          16
+#define AOWL_NU_MAX_IFACES            512
+
+/* `Il2CppArray`: max_length in the u32 at +0x18, first element at +0x20.
+ * MEASURED from this build's own bounds-checked array-store helper at RVA
+ * 0x5360 (`cmp edx,[rcx+0x18]` then `mov [rdx+rcx+0x20], r8b`), reached from
+ * the same disassembly window as the dispatch stub above. */
+#define AOWL_NU_ARR_LEN_OFF           0x18
+#define AOWL_NU_ARR_DATA_OFF          0x20
+
+/* The `.data` slot holding `Il2CppClass* IEnumerable<string>`, read out of the
+ * ONE instruction that uses it: `BaseDropDownBox::Show` +0x178 is
+ * `mov rdx, qword ptr [rip + 0x5747C29]` -> RVA 0x6DF5A38, and rdx is the
+ * value the dispatch stub compares against each `interfaceOffsets[i]`. It is a
+ * metadata-usage slot: before the game first runs Show it holds the raw token
+ * 0x2000964F (`il2cpp_resolve.py bytes 0x6df5a38 8`), which is not a mappable
+ * address -- so "has it been initialised" is answered by asking whether it
+ * points at committed memory, and never assumed. */
+#define AOWL_NU_IENUM_STRING_SLOT_RVA 0x6DF5A38u
+
 /* UnityEngine.RenderMode. Named, because `0` appearing bare in a refusal is
  * indistinguishable from "we did not read anything". */
 #define AOWL_NU_RENDERMODE_OVERLAY   0
@@ -1063,6 +1124,57 @@ static const AowlNuTarget aowl_nu_targets[] = {
       0x1714EA0u,
       { 0x40,0x57,0x48,0x83,0xEC,0x60,0x80,0x3D,0x18,0x95,0x9A,0x05,0x00,
         0x48,0x8B,0xF9 }, 16 },
+    /* --- DLSS DROPDOWNS AND TOOLTIPS (dlssrows.nim). APPENDED at the END.
+     *
+     * `EFT.UI.BaseDropDownBox::set_CurrentIndex(int)` @0x698560 and
+     * `get_CurrentIndex()` @0x698550. MEASURED `typemethods
+     * EFT.UI.BaseDropDownBox`: arity 1 / arity 0, both SHARED x2 -- which is
+     * fine here because this layer CALLS them and detours nothing. The bytes
+     * say what they are without any name being trusted: `89 91 E8 00 00 00 C3`
+     * is `mov [rcx+0xE8], edx ; ret` and `8B 81 E8 00 00 00 C3` is
+     * `mov eax, [rcx+0xE8] ; ret` -- exactly
+     * `<CurrentIndex>k__BackingField@0xE8` (`tools/fldoff.py fields
+     * EFT.UI.BaseDropDownBox`, String self-check passing). siglen is SEVEN,
+     * not sixteen: everything past the `ret` is `CC` alignment padding that
+     * belongs to no method, and asserting on padding is asserting on the
+     * linker.
+     *
+     * `EFT.UI.Settings.SettingControl::SetTooltip(SettingsTooltipData,
+     * SettingsTooltip)` @0x16FAC00. MEASURED sharedness=UNIQUE, non-virtual,
+     * section `il2cpp`. MEASURED `disasm 0x16fac00 --len 940`: it reads
+     * `_blocker@0x88` and RETURNS `this` when it is null; calls
+     * `UiElementBlocker::TryGetTooltip` and returns when that is false;
+     * returns when the data argument is null. Only then does it construct its
+     * OWN `SettingsTooltipData` through `.ctor(ESettingsOption)` @0x16FCD70,
+     * copy the fields across, and store the hover area into
+     * `_tooltipSettingsHover@0x98`. Three no-op paths, no throw path -- which
+     * is why the object we hand it is a TEMPLATE and why the verdict has to
+     * read `_tooltipSettingsHover@0x98 -> _tooltipData@0x20 -> Text@0x20`
+     * back rather than trust the call's return.
+     *
+     * The three `Show(IEnumerable<string>, Func<int,bool>)` bodies. All three
+     * are in the table ONLY so that each is byte-verified through the ordinary
+     * `aowl_nu_fn` path; NONE of them is called directly by index. The pointer
+     * actually called comes from the receiver's own vtable slot 24 and must
+     * COMPARE EQUAL to one of these three. DropDownBox and DropDownBoxNewStyle
+     * share their first 16 prologue bytes -- that is why the positional
+     * self-check in nativeui.nim compares NAMES, which differ. */
+    { "EFT.UI.BaseDropDownBox::set_CurrentIndex", 0x698560u,
+      { 0x89,0x91,0xE8,0x00,0x00,0x00,0xC3 }, 7 },
+    { "EFT.UI.BaseDropDownBox::get_CurrentIndex", 0x698550u,
+      { 0x8B,0x81,0xE8,0x00,0x00,0x00,0xC3 }, 7 },
+    { "EFT.UI.Settings.SettingControl::SetTooltip", 0x16FAC00u,
+      { 0x40,0x55,0x56,0x41,0x57,0x48,0x83,0xEC,0x30,0x80,0x3D,0x29,0x37,
+        0x9C,0x05,0x00 }, 16 },
+    { "EFT.UI.DropDownBox::Show", 0x16AFC80u,
+      { 0x48,0x89,0x5C,0x24,0x10,0x48,0x89,0x74,0x24,0x18,0x57,0x48,0x83,
+        0xEC,0x20,0x80 }, 16 },
+    { "EFT.UI.DropDownBoxNewStyle::Show", 0x16B1080u,
+      { 0x48,0x89,0x5C,0x24,0x10,0x48,0x89,0x74,0x24,0x18,0x57,0x48,0x83,
+        0xEC,0x20,0x80 }, 16 },
+    { "EFT.UI.BaseDropDownBox::Show", 0x16ADC90u,
+      { 0x48,0x89,0x5C,0x24,0x10,0x48,0x89,0x74,0x24,0x18,0x57,0x41,0x54,
+        0x41,0x55,0x41 }, 16 },
 };
 
 #define AOWL_NU_TARGET_COUNT \
@@ -2050,4 +2162,247 @@ static float aowl_nu_get_f32(void* obj, int32_t off, int32_t* ok) {
     return v;
 }
 
+/* ------------------------------------------------------------------------
+ * 8. THE DROPDOWN PATH -- a managed String[], the interface proof, and
+ *    virtual dispatch on Show.
+ *
+ * Everything here exists to make ONE call safe:
+ *   BaseDropDownBox::Show(IEnumerable<string> values, Func<int,bool> validator)
+ *
+ * `Show` does not type-test its argument with `isinst`; it INTERFACE-DISPATCHES
+ * on it (RVA 0x52D0, disassembled with `il2cpp_resolve.py disasm 0x52d0
+ * --len 200`). That routine walks the receiver's `interfaceOffsets` looking for
+ * the interface class, and a MISS falls through to a slow path we do not
+ * control. A managed throw is not catchable by `aowl_p_p_seh`, so "String[]
+ * implements IEnumerable<string>" must not be assumed -- and it cannot be
+ * settled offline either, because IL2CPP builds array classes at RUNTIME
+ * (their `interfaceOffsets` are not in the metadata file at all, and every
+ * `Il2CppGenericClass.cached_class` on disk is null).
+ *
+ * So it is settled AT RUNTIME, by asking the exact question the dispatch stub
+ * asks, of the exact table the dispatch stub reads, BEFORE the call:
+ * `aowl_nu_klass_has_iface(array, IEnumerable<string>)`. If the answer is no,
+ * or if either klass cannot be read, nothing is called. That is a check that
+ * CAN fail, which an offline assertion about il2cpp internals would not be.
+ * ------------------------------------------------------------------------ */
+
+/* `il2cpp_array_new(Il2CppClass* elementClass, uintptr_t length)`.
+ * UNGATED -- MEASURED: it appears in `aowl_il2cpp_exports` in
+ * abi/aowlspt_il2cpp_gates_data.h and NOT in `aowl_gate_rows`, so it takes no
+ * trailing 32-byte token and cannot return MT19937-64 noise. */
+typedef void* (*AowlNuArrayNew)(void*, uintptr_t);
+static AowlNuArrayNew g_nu_array_new = 0;
+
+static void* aowl_nu_array_new(void* elemKlass, int32_t n) {
+    HMODULE ga;
+    if (!elemKlass || n <= 0 || n > 64) return NULL;
+    if (!g_nu_array_new) {
+        ga = GetModuleHandleA("GameAssembly.dll");
+        if (!ga) return NULL;
+        g_nu_array_new = (AowlNuArrayNew)(void*)
+            GetProcAddress(ga, "il2cpp_array_new");
+        if (!g_nu_array_new) return NULL;
+    }
+    return g_nu_array_new(elemKlass, (uintptr_t)n);
+}
+
+/* The `System.String` Il2CppClass, taken from the OBJECT HEADER of a string
+ * the runtime itself just made. No metadata lookup and no gated export:
+ * holding one instance of a type makes its class pointer free (the same
+ * reasoning as `aowl_nu_object_new`'s header comment). Cached;
+ * `aowl_nu_intern` keeps the donor string alive. */
+static void* g_nu_string_klass = 0;
+static void* aowl_nu_string_klass(void) {
+    void* s;
+    void* k;
+    if (g_nu_string_klass) return g_nu_string_klass;
+    s = aowl_nu_intern("aowl");
+    if (!s) return NULL;
+    if (!aowl_nu_region_ok(s, (int32_t)sizeof(void*), 0)) return NULL;
+    k = NULL;
+    memcpy(&k, s, sizeof(void*));
+    if (!k) return NULL;
+    /* A klass pointer must at least address its own vtable base. */
+    if (!aowl_nu_region_ok(k, AOWL_NU_KLASS_VTABLE_OFF, 0)) return NULL;
+    g_nu_string_klass = k;
+    return k;
+}
+
+/* Does `obj`'s class carry `iface` in the SAME interface-offset table the
+ * game's own dispatch stub at 0x52D0 walks? Three outcomes, and the caller
+ * must keep them apart: 1 = yes, 0 = no (the table was read and the interface
+ * is not in it), -1 = INCONCLUSIVE (a pointer would not read; nothing was
+ * decided). Bounded by AOWL_NU_MAX_IFACES as well as by the u16 count. */
+static int32_t aowl_nu_klass_has_iface(void* obj, void* iface) {
+    void* klass;
+    void* tbl;
+    uint16_t cnt;
+    int32_t i;
+    if (!obj || !iface) return -1;
+    if (!aowl_nu_region_ok(obj, (int32_t)sizeof(void*), 0)) return -1;
+    klass = NULL;
+    memcpy(&klass, obj, sizeof(void*));
+    if (!klass) return -1;
+    if (!aowl_nu_region_ok((char*)klass + AOWL_NU_KLASS_IFOFFS_CNT,
+                           (int32_t)sizeof(uint16_t), 0)) return -1;
+    if (!aowl_nu_region_ok((char*)klass + AOWL_NU_KLASS_IFOFFS_PTR,
+                           (int32_t)sizeof(void*), 0)) return -1;
+    cnt = 0;
+    memcpy(&cnt, (const char*)klass + AOWL_NU_KLASS_IFOFFS_CNT,
+           sizeof(uint16_t));
+    tbl = NULL;
+    memcpy(&tbl, (const char*)klass + AOWL_NU_KLASS_IFOFFS_PTR, sizeof(void*));
+    if (cnt == 0) return 0;
+    if (cnt > AOWL_NU_MAX_IFACES) return -1;
+    if (!tbl) return -1;
+    if (!aowl_nu_region_ok(tbl, (int32_t)cnt * AOWL_NU_IFOFF_STRIDE, 0))
+        return -1;
+    for (i = 0; i < (int32_t)cnt; i++) {
+        void* e = NULL;
+        memcpy(&e, (const char*)tbl + (size_t)i * AOWL_NU_IFOFF_STRIDE,
+               sizeof(void*));
+        if (e == iface) return 1;
+    }
+    return 0;
+}
+
+/* `Il2CppClass* IEnumerable<string>` out of the metadata-usage slot the game's
+ * own Show reads. NULL when the slot still holds its raw token, i.e. when the
+ * game has not yet run Show even once -- which is a REFUSAL, never a guess. */
+static void* aowl_nu_ienum_string_klass(void) {
+    HMODULE ga;
+    void* slot;
+    void* k;
+    ga = GetModuleHandleA("GameAssembly.dll");
+    if (!ga) return NULL;
+    slot = (void*)((char*)ga + AOWL_NU_IENUM_STRING_SLOT_RVA);
+    if (!aowl_nu_region_ok(slot, (int32_t)sizeof(void*), 0)) return NULL;
+    k = NULL;
+    memcpy(&k, slot, sizeof(void*));
+    if (!k) return NULL;
+    if (!aowl_nu_region_ok(k, AOWL_NU_KLASS_VTABLE_OFF, 0)) return NULL;
+    return k;
+}
+
+/* Build a managed String[] in two steps: allocate it, then fill one element at
+ * a time. Both stores happen HERE, in C, over an array THIS LAYER allocated --
+ * an array ELEMENT is not a field, so there is no offset for
+ * `tools/fieldrefs.py` to type, and deliberately no Nim-visible raw-store
+ * primitive is introduced by any of it.
+ *
+ * Each store is bounds-checked against the array's OWN `max_length` at +0x18
+ * rather than against the caller's idea of the length, so a short allocation
+ * refuses instead of writing past the object; and every element must read back
+ * as a live managed String (its header must equal the String klass) before it
+ * is stored.
+ *
+ * GC: this build's IL2CPP uses the conservative collector, which scans the
+ * calling thread's stack and loaded modules' data segments. The array is live
+ * in a local in the caller across the whole window, and each element is
+ * additionally held by `aowl_nu_intern`'s static table. */
+static void* aowl_nu_arr_new_string(int32_t n) {
+    void* klass;
+    void* arr;
+    uint32_t len;
+    if (n <= 0 || n > 64) return NULL;
+    klass = aowl_nu_string_klass();
+    if (!klass) return NULL;
+    arr = aowl_nu_array_new(klass, n);
+    if (!arr) return NULL;
+    if (!aowl_nu_region_ok((char*)arr + AOWL_NU_ARR_LEN_OFF,
+                           (int32_t)sizeof(uint32_t), 0)) return NULL;
+    len = 0;
+    memcpy(&len, (const char*)arr + AOWL_NU_ARR_LEN_OFF, sizeof(uint32_t));
+    /* The array must be EXACTLY the length that was asked for. A shorter one
+     * would let every later bounds check pass on a smaller object. */
+    if (len != (uint32_t)n) return NULL;
+    return arr;
+}
+
+static int32_t aowl_nu_arr_set_string(void* arr, int32_t i, const char* utf8) {
+    void* klass;
+    void* s;
+    void* sk;
+    uint32_t len;
+    if (!arr || !utf8 || i < 0) return 0;
+    klass = aowl_nu_string_klass();
+    if (!klass) return 0;
+    if (!aowl_nu_region_ok((char*)arr + AOWL_NU_ARR_LEN_OFF,
+                           (int32_t)sizeof(uint32_t), 0)) return 0;
+    len = 0;
+    memcpy(&len, (const char*)arr + AOWL_NU_ARR_LEN_OFF, sizeof(uint32_t));
+    /* Bounded by the array's OWN max_length, never by the caller's idea of
+     * how long it is. */
+    if ((uint32_t)i >= len) return 0;
+    s = aowl_nu_intern(utf8);
+    if (!s) return 0;
+    if (!aowl_nu_region_ok(s, (int32_t)sizeof(void*), 0)) return 0;
+    sk = NULL;
+    memcpy(&sk, s, sizeof(void*));
+    /* Not a System.String -- refuse rather than store something Show would
+     * hand to a string cast. */
+    if (sk != klass) return 0;
+    if (!aowl_nu_is_writable((char*)arr + AOWL_NU_ARR_DATA_OFF +
+                             (size_t)i * sizeof(void*),
+                             (int32_t)sizeof(void*))) return 0;
+    memcpy((char*)arr + AOWL_NU_ARR_DATA_OFF + (size_t)i * sizeof(void*),
+           &s, sizeof(void*));
+    return 1;
+}
+
+/* The receiver's own `vtable[slot]`: `fn` out, `mi` (the const MethodInfo* the
+ * hidden trailing argument wants) out. Returns 1 only when BOTH read back out
+ * of committed memory. */
+static int32_t aowl_nu_vslot(void* obj, int32_t slot, void** fn, void** mi) {
+    void* klass;
+    char* e;
+    if (fn) *fn = NULL;
+    if (mi) *mi = NULL;
+    if (!obj || !fn || !mi || slot < 0 || slot > 4095) return 0;
+    if (!aowl_nu_region_ok(obj, (int32_t)sizeof(void*), 0)) return 0;
+    klass = NULL;
+    memcpy(&klass, obj, sizeof(void*));
+    if (!klass) return 0;
+    e = (char*)klass + AOWL_NU_KLASS_VTABLE_OFF + (size_t)slot * 16u;
+    if (!aowl_nu_region_ok(e, 16, 0)) return 0;
+    memcpy(fn, e, sizeof(void*));
+    memcpy(mi, e + 8, sizeof(void*));
+    return (*fn && *mi) ? 1 : 0;
+}
+
+/* Call an already-resolved `void (this, void*, void*, MethodInfo*)`. The
+ * pointer is NOT taken from the target table by index: it came from
+ * `aowl_nu_vslot`, and the caller has compared it against the three
+ * byte-verified Show targets before getting here. */
+/* (this, a0, a1, MethodInfo*) -> object. SetTooltip is non-generic and
+ * non-virtual, so a NULL MethodInfo* is correct for it. */
+typedef void* (*AowlNu_P_PPP)(void*, void*, void*, void*);
+static void* aowl_nu_call_p_ppp(void* fn, void* self, void* a0, void* a1) {
+    if (!fn || !self) return NULL;
+    return ((AowlNu_P_PPP)fn)(self, a0, a1, NULL);
+}
+
+typedef void (*AowlNu_V_PPPP)(void*, void*, void*, void*);
+static void aowl_nu_call_show(void* fn, void* self, void* values,
+                              void* validator, void* mi) {
+    if (!fn || !self) return;
+    ((AowlNu_V_PPPP)fn)(self, values, validator, mi);
+}
+
+/* Read an int32 field RAW, VirtualQuery-guarded. Used ONLY for
+ * `BaseDropDownBox.<CurrentIndex>k__BackingField` @0xE8 readbacks, where 0 is
+ * a legitimate index and must not double as "could not read" -- hence the
+ * out-flag, for the same reason `aowl_nu_get_f32` has one. */
+static int32_t aowl_nu_get_i32(void* obj, int32_t off, int32_t* ok) {
+    int32_t v = 0;
+    if (ok) *ok = 0;
+    if (!obj || off < 0) return 0;
+    if (!aowl_nu_region_ok((char*)obj + off, (int32_t)sizeof(int32_t), 0))
+        return 0;
+    memcpy(&v, (const char*)obj + off, sizeof(int32_t));
+    if (ok) *ok = 1;
+    return v;
+}
+
 #endif /* AOWLSPT_NATIVEUI_H */
+

@@ -98,6 +98,18 @@ proc frToggleGroup(): AowlFieldRefPtr {.importc: "aowl_fr_toggle_group", nodecl.
 proc frToggleIsOn(): AowlFieldRefPtr {.importc: "aowl_fr_toggle_ison", nodecl.}
 proc frTmpMText(): AowlFieldRefPtr {.importc: "aowl_fr_tmp_mtext", nodecl.}
 proc frEbPath(): AowlFieldRefPtr {.importc: "aowl_fr_eb_path", nodecl.}
+# APPENDED 2026-09-04 -- the six fields of the `SettingsTooltipData` TEMPLATE
+# `SettingControl::SetTooltip` @0x16FAC00 reads. Widths and is-reference bits
+# are DERIVED by tools/fieldrefs.py from the metadata, never spelled here.
+proc frTtdKey(): AowlFieldRefPtr {.importc: "aowl_fr_ttd_key", nodecl.}
+proc frTtdTitle(): AowlFieldRefPtr {.importc: "aowl_fr_ttd_title", nodecl.}
+proc frTtdText(): AowlFieldRefPtr {.importc: "aowl_fr_ttd_text", nodecl.}
+proc frTtdUsageStyle(): AowlFieldRefPtr {.
+  importc: "aowl_fr_ttd_usagestyle", nodecl.}
+proc frTtdUsageProp(): AowlFieldRefPtr {.
+  importc: "aowl_fr_ttd_usageprop", nodecl.}
+proc frTtdUsageText(): AowlFieldRefPtr {.
+  importc: "aowl_fr_ttd_usagetext", nodecl.}
 
 # ---------------------------------------------------------------------------
 # Refusal reporting. Capped per site so a per-frame path cannot flood the log,

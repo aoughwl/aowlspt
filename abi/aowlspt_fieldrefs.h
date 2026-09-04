@@ -109,6 +109,48 @@ static AowlFieldRef AOWL_FR_EB_PATH = {
     "Diz.Resources.EasyBundle", "_path", 0x20, 8, 1, 0x71, { 0, 0, 0, 0 }, 0
 };
 
+/* dlssrows.nim tooltip template: SettingsTooltipData.Key (ESettingsOption)
+ *   EFT.UI.Settings.SettingsTooltipData.Key : ESettingsOption   (valuetype, declared by EFT.UI.Settings.SettingsTooltipData)
+ */
+static AowlFieldRef AOWL_FR_TTD_KEY = {
+    "EFT.UI.Settings.SettingsTooltipData", "Key", 0x10, 4, 0, 0x38, { 0, 0, 0, 0 }, 0
+};
+
+/* dlssrows.nim tooltip template: SettingsTooltipData.Title (string)
+ *   EFT.UI.Settings.SettingsTooltipData.Title : string   (reference, declared by EFT.UI.Settings.SettingsTooltipData)
+ */
+static AowlFieldRef AOWL_FR_TTD_TITLE = {
+    "EFT.UI.Settings.SettingsTooltipData", "Title", 0x18, 8, 1, 0x38, { 0, 0, 0, 0 }, 0
+};
+
+/* dlssrows.nim tooltip template: SettingsTooltipData.Text (string)
+ *   EFT.UI.Settings.SettingsTooltipData.Text : string   (reference, declared by EFT.UI.Settings.SettingsTooltipData)
+ */
+static AowlFieldRef AOWL_FR_TTD_TEXT = {
+    "EFT.UI.Settings.SettingsTooltipData", "Text", 0x20, 8, 1, 0x38, { 0, 0, 0, 0 }, 0
+};
+
+/* dlssrows.nim tooltip template: SettingsTooltipData.UsageStyle (EUsageStyle)
+ *   EFT.UI.Settings.SettingsTooltipData.UsageStyle : EUsageStyle   (valuetype, declared by EFT.UI.Settings.SettingsTooltipData)
+ */
+static AowlFieldRef AOWL_FR_TTD_USAGESTYLE = {
+    "EFT.UI.Settings.SettingsTooltipData", "UsageStyle", 0x28, 4, 0, 0x38, { 0, 0, 0, 0 }, 0
+};
+
+/* dlssrows.nim tooltip template: SettingsTooltipData.UsageProperty (EUsageProperty)
+ *   EFT.UI.Settings.SettingsTooltipData.UsageProperty : EUsageProperty   (valuetype, declared by EFT.UI.Settings.SettingsTooltipData)
+ */
+static AowlFieldRef AOWL_FR_TTD_USAGEPROP = {
+    "EFT.UI.Settings.SettingsTooltipData", "UsageProperty", 0x2c, 4, 0, 0x38, { 0, 0, 0, 0 }, 0
+};
+
+/* dlssrows.nim tooltip template: SettingsTooltipData.UsageText (string)
+ *   EFT.UI.Settings.SettingsTooltipData.UsageText : string   (reference, declared by EFT.UI.Settings.SettingsTooltipData)
+ */
+static AowlFieldRef AOWL_FR_TTD_USAGETEXT = {
+    "EFT.UI.Settings.SettingsTooltipData", "UsageText", 0x30, 8, 1, 0x38, { 0, 0, 0, 0 }, 0
+};
+
 
 static AowlFieldRef* aowl_fr_bc_maxbots(void) { return &AOWL_FR_BC_MAXBOTS; }
 static AowlFieldRef* aowl_fr_ba_isready(void) { return &AOWL_FR_BA_ISREADY; }
@@ -120,6 +162,12 @@ static AowlFieldRef* aowl_fr_toggle_group(void) { return &AOWL_FR_TOGGLE_GROUP; 
 static AowlFieldRef* aowl_fr_toggle_ison(void) { return &AOWL_FR_TOGGLE_ISON; }
 static AowlFieldRef* aowl_fr_tmp_mtext(void) { return &AOWL_FR_TMP_MTEXT; }
 static AowlFieldRef* aowl_fr_eb_path(void) { return &AOWL_FR_EB_PATH; }
+static AowlFieldRef* aowl_fr_ttd_key(void) { return &AOWL_FR_TTD_KEY; }
+static AowlFieldRef* aowl_fr_ttd_title(void) { return &AOWL_FR_TTD_TITLE; }
+static AowlFieldRef* aowl_fr_ttd_text(void) { return &AOWL_FR_TTD_TEXT; }
+static AowlFieldRef* aowl_fr_ttd_usagestyle(void) { return &AOWL_FR_TTD_USAGESTYLE; }
+static AowlFieldRef* aowl_fr_ttd_usageprop(void) { return &AOWL_FR_TTD_USAGEPROP; }
+static AowlFieldRef* aowl_fr_ttd_usagetext(void) { return &AOWL_FR_TTD_USAGETEXT; }
 
 static AowlFieldRef* AOWL_FR_ALL[] = {
     &AOWL_FR_BC_MAXBOTS,
@@ -132,7 +180,13 @@ static AowlFieldRef* AOWL_FR_ALL[] = {
     &AOWL_FR_TOGGLE_ISON,
     &AOWL_FR_TMP_MTEXT,
     &AOWL_FR_EB_PATH,
+    &AOWL_FR_TTD_KEY,
+    &AOWL_FR_TTD_TITLE,
+    &AOWL_FR_TTD_TEXT,
+    &AOWL_FR_TTD_USAGESTYLE,
+    &AOWL_FR_TTD_USAGEPROP,
+    &AOWL_FR_TTD_USAGETEXT,
 };
-#define AOWL_FR_TABLE_ROWS 10
+#define AOWL_FR_TABLE_ROWS 16
 
 #endif /* AOWLSPT_FIELDREFS_H */

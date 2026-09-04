@@ -28,35 +28,59 @@
 ## "Graphics Settings" panel transform the subtab feature already located and
 ## validated -- and never by an offset that can read null.
 ##
-## WHY THE TWO CHOICES ARE STEP-VALUED SLIDERS AND NOT DROPDOWNS
-## -------------------------------------------------------------
-## "DLSS version" and "Upscaler" are choices, and a native choice row is a
-## `SettingDropDown` or a `SettingSelectSlider`. EVERY bind either of those has
-## -- `BindTo`, `BindToEnum`, `UpdateDropDownValue`, all three
-## `SettingSelectSlider.BindIndexTo` overloads -- is a GENERIC method with no
-## entry in `methodPointers` and therefore NO RVA offline. `postfxrows.nim`
-## declines `preset` and `tonemapper` for exactly that reason, and this file
-## does not quietly un-decline it: instantiating a select-slider we cannot bind
-## would render a control that moves and changes nothing.
+## THE TWO CHOICES ARE DROPDOWNS -- and what had to be measured first
+## ------------------------------------------------------------------
+## "DLSS version" and "Upscaler" are choices. They were STEP-VALUED SLIDERS
+## until 2026-09-04, because every declared bind on `SettingDropDown` and
+## `SettingSelectSlider` (`BindTo`, `BindToEnum`, `UpdateDropDownValue`, all
+## three `BindIndexTo` overloads) is a GENERIC method with no entry in
+## `methodPointers` and therefore no RVA offline. That is still true. What
+## changed is that a dropdown does not NEED one of those binds: the widget is
+## driven directly through three non-generic functions, and the selection is
+## read off the widget instead of arriving as an event.
 ##
-## The two BINDABLE kinds on this build (`settingsbind.nim`, measured event
-## routes) are a `Toggle` and a `NumberSlider`. So each choice is a slider with
-## an integer range and an "F0" format -- a stepper, mutually exclusive by
-## construction, which a set of independent toggles is not -- and the caption
-## carries the mapping. The number is the same in all three surfaces (this row,
-## the F12 overlay, `mods/dlss/config.json`), so they cannot drift.
+##   `SettingDropDown.DropDown` @0xA8            -> the EFT.UI.DropDownBox
+##   `BaseDropDownBox::Show(IEnumerable<string>, Func<int,bool>)`  -- the items
+##   `BaseDropDownBox::set_/get_CurrentIndex` @0x698560 / @0x698550  -- the value
+##   `GraphicsSettingsTab._dropDownTemplate` @0xB0  -- the prefab
 ##
-## WHAT IS DECLINED, LOUDLY: TOOLTIPS
-## ----------------------------------
-## The brief asks for the schema's descriptions as tooltips.
-## `SettingControl::SetTooltip(SettingsTooltipData, SettingsTooltip)`
-## @0x16fac00 is unique and byte-verifiable, but its first argument is a
-## managed `SettingsTooltipData` INSTANCE, and constructing one is runtime type
-## injection -- PLAUSIBLE and UNPROVEN on this build. It is called with a real
-## object or not at all, never with NULL. So NO tooltip is attached: the fact
-## each description carries that a player must see -- "applies on restart", and
-## what each step means -- is in the CAPTION instead, where `SetText` (a
-## measured, unique, non-generic setter) really does put it.
+## `settingsbind.nim` gained an `sbdDropdown` kind for it, POLLED once per tick
+## through `get_CurrentIndex` rather than through a drain: there is no
+## `DropDownBox` detour to ride, and binding a second one to make an event
+## would overwrite another feature's trampoline.
+##
+## THE ONE REAL HAZARD, and how it is settled. `Show` does not `isinst` its
+## argument; it INTERFACE-DISPATCHES on it through the stub at RVA 0x52D0
+## (disassembled), which walks the receiver's `interfaceOffsets`. A miss leaves
+## a slow path whose throw would be MANAGED and therefore uncatchable by
+## `aowl_p_p_seh`. Whether a `String[]` carries `IEnumerable<string>` CANNOT be
+## answered offline -- IL2CPP builds array classes at runtime and every
+## `Il2CppGenericClass.cached_class` in the metadata file is null -- so it is
+## answered AT RUNTIME, in `nuDropDownShow`, by reading the same table with the
+## same stride the stub reads before the call is made. A refusal there builds
+## the row as a SLIDER instead, which is the shape that has been shipping.
+##
+## TOOLTIPS -- previously declined, now measured and built
+## -------------------------------------------------------
+## The earlier pass declined them, saying that constructing a
+## `SettingsTooltipData` was "runtime type injection, PLAUSIBLE and UNPROVEN".
+## That was wrong in two ways and is corrected rather than deleted:
+##   * `il2cpp_object_new` is UNGATED (it is in `aowl_il2cpp_exports` and NOT
+##     in `aowl_gate_rows`) and takes an ordinary klass pointer -- which is
+##     borrowed from a LIVE donor, the stock DlssPreset row's own
+##     `_tooltipSettingsHover@0x98 -> _tooltipData@0x20`. Nothing is injected.
+##   * MEASURED `disasm 0x16fac00 --len 940`: `SetTooltip` does not KEEP the
+##     object it is given. It constructs its own through
+##     `SettingsTooltipData::.ctor(ESettingsOption)` @0x16FCD70 and copies the
+##     fields across. So what we build is a TEMPLATE, and the six stores go
+##     through `hostfieldwrite`'s typed gate over FieldRefs generated by
+##     `tools/fieldrefs.py` (widths and is-reference bits DERIVED, never
+##     spelled in this file).
+## SetTooltip has THREE no-op paths (`_blocker@0x88` null, `TryGetTooltip`
+## false, data null) and no throw path, so the verdict cannot be the call's
+## return: it re-reads `_tooltipSettingsHover@0x98 -> _tooltipData@0x20 ->
+## Text@0x20` off each row and requires the pointer to be the interned string
+## that was handed over.
 ##
 ## THE VALUES ARE THE CONFIG'S, OR THE DECLARED DEFAULTS, AND THE LOG SAYS WHICH
 ## ---------------------------------------------------------------------------
@@ -80,7 +104,10 @@
 ##  3. NO guard is opened: this runs inside `gfxTickBody`'s single
 ##     `aowl_p_p_seh`, which is not re-entrant.
 ##  4. Every loop is capped (`DlrMaxRows`).
-##  5. Flag-gated `settingsDlssRows`, DEFAULT OFF, and inert without
+##  5. Flag-gated `settingsDlssRows`, DEFAULT OFF, with `settingsDlssDropdowns`
+##     and `settingsDlssTooltips` as their own DEFAULT-OFF sub-flags -- with
+##     both off this file behaves exactly as it did before this change.
+##     Inert without
 ##     `settingsPostFxSubtab` (which is what locates the Graphics panel) and
 ##     `nativeUiKit`.
 ##  6. Self-disables after `DlrMaxFaults`.
@@ -100,6 +127,7 @@ const
   DlrOffGfxContainer  = 0x98'i32
   DlrOffToggleTmpl    = 0xb8'i32
   DlrOffFloatSliderTmpl = 0xc8'i32
+  DlrOffDropDownTmpl  = 0xb0'i32
 
 var gDlrOn = false        ## `settingsDlssRows` -- read once at boot
 var gDlrOff = false       ## self-disabled
@@ -113,12 +141,32 @@ var gDlrBuiltN = 0
 var gDlrSeeded = 0
 var gDlrRefused = 0
 var gDlrRowT: seq[Il2CppPtr] = @[]   ## each row's TRANSFORM, for placement
+var gDlrRowCtrl: seq[Il2CppPtr] = @[]  ## each row's SettingControl, for tooltips
+var gDlrRowTip: seq[string] = @[]      ## the tooltip body each row should show
+var gDlrTipWant: seq[Il2CppPtr] = @[]  ## the INTERNED string handed to SetTooltip
 var gDlrPlaced = -1       ## rows whose sibling index READ BACK as asked
 var gDlrPlaceWhy = ""     ## why placement did not happen, when it did not
 var gDlrRestartShown = 0
+var gDlrDropOn = false    ## `settingsDlssDropdowns` -- read once at boot
+var gDlrTipsOn = false    ## `settingsDlssTooltips`  -- read once at boot
+## THE DROPDOWN CENSUS. "asked for a dropdown", "got one", and "fell back to
+## the slider" are three different outcomes and none of them may be inferred
+## from either of the others.
+var gDlrDropWanted = 0
+var gDlrDropBuilt = 0
+var gDlrDropWhy = ""
+## THE TOOLTIP CENSUS. `gDlrTipVerified` is the only number that means the
+## player can see a tooltip: it counts rows whose `_tooltipSettingsHover@0x98
+## -> _tooltipData@0x20 -> Text@0x20` READ BACK as the exact interned string
+## that was handed to SetTooltip.
+var gDlrTipAsked = 0
+var gDlrTipCalled = 0
+var gDlrTipVerified = 0
+var gDlrTipWhy = ""
+var gDlrTipKlass: Il2CppPtr = nil
 
 type
-  DlrKind = enum dlrToggle, dlrSlider
+  DlrKind = enum dlrToggle, dlrSlider, dlrDropdown
 
   DlrRow = object
     kind*: DlrKind
@@ -127,14 +175,34 @@ type
     fmt*: string        ## NumberSlider::Show format; "F0" for the steppers
     lo*, hi*, def*: float32
     defB*: bool
+    ## For `dlrDropdown` only: the captions, in order, and the ONE-BASED
+    ## default. The catalogue is the single place the choice text lives, so the
+    ## row caption and the item list cannot say different things.
+    choices*: seq[string]
+    ## The tooltip body, condensed from the matching "//key" description in
+    ## `mods/dlss/config.json`. A STATIC MIRROR, exactly like the ranges above
+    ## -- it drifts if that file changes, and nothing here pretends otherwise.
+    tip*: string
 
-proc dlrS(key, label, fmt: string; lo, hi, def: float32): DlrRow =
+proc dlrS(key, label, fmt: string; lo, hi, def: float32;
+          tip: string = ""): DlrRow =
   DlrRow(kind: dlrSlider, key: key, label: label, fmt: fmt,
-         lo: lo, hi: hi, def: def, defB: false)
+         lo: lo, hi: hi, def: def, defB: false, choices: @[], tip: tip)
 
-proc dlrB(key, label: string; def: bool): DlrRow =
+proc dlrB(key, label: string; def: bool; tip: string = ""): DlrRow =
   DlrRow(kind: dlrToggle, key: key, label: label, fmt: "",
-         lo: 0.0'f32, hi: 0.0'f32, def: 0.0'f32, defB: def)
+         lo: 0.0'f32, hi: 0.0'f32, def: 0.0'f32, defB: def,
+         choices: @[], tip: tip)
+
+proc dlrD(key, label: string; choices: seq[string]; def: float32;
+          tip: string = ""): DlrRow =
+  ## A CHOICE row. `def` is ONE-BASED, the same number the config and the F12
+  ## overlay carry. `lo`/`hi` mirror the choice count so the slider FALLBACK --
+  ## used whenever the dropdown path refuses -- is identical to the stepper
+  ## this file shipped before dropdowns existed.
+  DlrRow(kind: dlrDropdown, key: key, label: label, fmt: "F0",
+         lo: 1.0'f32, hi: float32(choices.len), def: def, defB: false,
+         choices: choices, tip: tip)
 
 proc dlrCatalogue(): seq[DlrRow] =
   ## The five settings `mods/dlss/dlss.nim:schema()` declares, with ITS ranges
@@ -149,17 +217,51 @@ proc dlrCatalogue(): seq[DlrRow] =
   ## dialog can appear, and a caption that had quietly stopped saying so would
   ## leave the player with no statement anywhere that these need a restart.
   let sfx = (if sbdReady(): "" else: " - applies on restart")
-  @[dlrS("version",
-         "DLSS version  (1 = 310.5.3 shipped / 2 = 310.7.0 / 3 = 310.7.129)" & sfx,
-         "F0", 1.0'f32, 3.0'f32, 2.0'f32),
-    dlrS("upscaler",
-         "Upscaler  (1 = DLSS / 2 = FSR 3.1 / 3 = XeSS)" & sfx,
-         "F0", 1.0'f32, 3.0'f32, 1.0'f32),
-    dlrB("nrEnabled", "DLSS 5 re-lighting" & sfx, false),
+  # THE CAPTION CARRIES THE CHOICE MAPPING only when the row ends up as a
+  # SLIDER, and the text is DERIVED from `choices` in `dlrChoiceMap` at that
+  # moment -- not written twice here. A dropdown captioned "1 = DLSS / 2 = FSR
+  # 3.1" beside a box already reading "FSR 3.1" is two answers to one question,
+  # and a mapping hard-coded here would disagree with `choices` the first time
+  # either changed.
+  @[dlrD("version", "DLSS version" & sfx,
+         @["310.5.3", "310.7.0", "310.7.129"], 2.0'f32,
+         "Which DLSS Super Resolution DLL to install. 310.5.3 is the one " &
+         "shipped with the game and is the rollback target. Applies on the " &
+         "next launch: the DLL is locked while the client runs."),
+    dlrD("upscaler", "Upscaler" & sfx,
+         @["DLSS", "FSR 3.1", "XeSS"], 1.0'f32,
+         "OptiScaler's Dx11Upscaler. DLSS is the game's own, native DX11; " &
+         "FSR 3.1 and XeSS go through OptiScaler's DX11-on-DX12 bridge. Only " &
+         "takes effect when OptiScaler is installed beside the executable. " &
+         "Applies on the next launch."),
+    dlrB("nrEnabled", "DLSS 5 re-lighting" & sfx, false,
+         "OptiScaler [DlssNr] Enabled -- the leaked neural re-lighting pass. " &
+         "An unsigned third-party rebuild of a leaked NVIDIA binary, with a " &
+         "stated 616.56 driver minimum, bridged onto D3D12 -- which REPLACES " &
+         "DLSS with FSR/XeSS while it is on. Off by default. See docs/DLSSNR.md."),
     dlrS("nrWorkingScale", "DLSS 5 working scale" & sfx,
-         "F2", 0.25'f32, 1.0'f32, 0.25'f32),
+         "F2", 0.25'f32, 1.0'f32, 0.25'f32,
+         "OptiScaler [DlssNr] WorkingScale, 0.25 to 1 -- the fraction of the " &
+         "frame the model works on. Cost falls with the SQUARE of this. " &
+         "Applies on the next launch."),
     dlrS("nrIntensity", "DLSS 5 intensity" & sfx,
-         "F2", 0.0'f32, 2.0'f32, 1.0'f32)]
+         "F2", 0.0'f32, 2.0'f32, 1.0'f32,
+         "OptiScaler [DlssNr] Intensity, 0 to 2 -- how hard the model's " &
+         "re-lighting reads. Applies on the next launch.")]
+
+proc dlrChoiceMap(r: DlrRow): string =
+  ## "  (1 = DLSS / 2 = FSR 3.1 / 3 = XeSS)" -- the caption suffix a CHOICE row
+  ## needs when it is built as a stepper slider instead of a dropdown, derived
+  ## from the catalogue's own `choices` so the two can never disagree.
+  result = ""
+  if r.choices.len == 0: return
+  var acc = "  ("
+  var i = 0
+  while i < r.choices.len and i < 16:
+    if i > 0: acc = acc & " / "
+    acc = acc & $(i + 1) & " = " & r.choices[i]
+    i = i + 1
+  acc & ")"
 
 proc dlrNoteFault(what: string) =
   inc gDlrFaults
@@ -185,6 +287,16 @@ proc dlrDestroyAll(): int =
   gDlrRowGo = @[]
   gDlrRowKey = @[]
   gDlrRowT = @[]
+  gDlrRowCtrl = @[]
+  gDlrRowTip = @[]
+  gDlrTipWant = @[]
+  gDlrDropWanted = 0
+  gDlrDropBuilt = 0
+  gDlrDropWhy = ""
+  gDlrTipAsked = 0
+  gDlrTipCalled = 0
+  gDlrTipVerified = 0
+  gDlrTipWhy = ""
   gDlrPlaced = -1
   gDlrPlaceWhy = ""
   gDlrBuilt = false
@@ -203,8 +315,8 @@ proc dlrTab(): Il2CppPtr =
   if result != nil and not nuOk(result, DlrOffFloatSliderTmpl + 8'i32):
     result = nil
 
-proc dlrMakeRow(prefab, parent: Il2CppPtr; r: DlrRow;
-                sliderOut, ctrlOut: var Il2CppPtr): Il2CppPtr =
+proc dlrMakeRow(prefab, parent: Il2CppPtr; r: DlrRow; asDropdown: bool;
+                sliderOut, ctrlOut, ddbOut: var Il2CppPtr): Il2CppPtr =
   ## ONE row, the game's own way. No `SetSiblingIndex` is called: `Instantiate`
   ## appends, which puts our section AFTER the stock rows -- and any index we
   ## chose would REORDER controls the game created, which is a write to stock
@@ -212,6 +324,7 @@ proc dlrMakeRow(prefab, parent: Il2CppPtr; r: DlrRow;
   result = nil
   sliderOut = nil
   ctrlOut = nil
+  ddbOut = nil
   let row = nuInstantiateUnder(prefab, parent)
   if row == nil: return
   let go = nuGameObjectOf(row)
@@ -223,14 +336,35 @@ proc dlrMakeRow(prefab, parent: Il2CppPtr; r: DlrRow;
   # `SetText` takes a LOCALIZATION KEY; an aowlspt setting has no BSG locale
   # entry, so the literal renders as itself. A raw `m_text` store would be
   # clobbered by `LocalizedText`, which is why the setter is called.
-  if not nuRowSetText(row, r.label):
+  let caption = (if r.kind == dlrDropdown and not asDropdown:
+                   r.label & dlrChoiceMap(r) else: r.label)
+  if not nuRowSetText(row, caption):
     warn "dlss rows: SetText refused for '" & r.key & "'; the row would carry " &
          "the PREFAB's own caption, which reads as a stock setting that is " &
          "not there. Refusing this row."
     discard nuDestroy(go)
     return
   discard nuRowSetName(row, "aowlspt-dlss-" & r.key)
-  if r.kind == dlrSlider:
+  if asDropdown:
+    # A CLONED `SettingDropDown`. The widget is reached through
+    # `SettingDropDown.DropDown` @0xA8 and filled by CALLING the game's own
+    # `Show` -- see `nuDropDownShow`, which refuses unless the receiver's own
+    # vtable slot 24 resolves to one of three byte-verified bodies AND the
+    # String[] it built really carries `IEnumerable<string>` in the interface
+    # table `Show` dispatches against.
+    let ddb = nuDropDownOf(row)
+    if ddb == nil:
+      gDlrDropWhy = "SettingDropDown.DropDown @0xA8 read null or unreadable " &
+                    "on the cloned row, so there is no DropDownBox to fill"
+      discard nuDestroy(go)
+      return
+    var why = ""
+    if not nuDropDownShow(ddb, r.choices, why):
+      gDlrDropWhy = why
+      discard nuDestroy(go)
+      return
+    ddbOut = ddb
+  elif r.kind == dlrSlider or r.kind == dlrDropdown:
     let sl = nuRowSlider(row)
     if sl == nil:
       warn "dlss rows: '" & r.key & "' instantiated but its inner NumberSlider " &
@@ -338,6 +472,133 @@ proc dlrPlaceRows(parent: Il2CppPtr) =
     k = k + 1
   gDlrPlaced = ok
 
+## ---------------------------------------------------------------------------
+## TOOLTIPS -- the game's own hover tooltip, on our rows
+##
+## `SettingControl::SetTooltip(SettingsTooltipData, SettingsTooltip)` @0x16FAC00
+## (UNIQUE, non-virtual, section `il2cpp`) does NOT keep the object it is
+## handed: MEASURED `disasm 0x16fac00 --len 940`, it builds its own through
+## `SettingsTooltipData::.ctor(ESettingsOption)` @0x16FCD70, copies the fields
+## across (`mov rax,[rbp+0x20]` -> `mov [rdi+0x20],rax` is Text), and stores
+## the hover area into `_tooltipSettingsHover@0x98`. It has THREE no-op paths
+## -- `_blocker@0x88` null, `UiElementBlocker::TryGetTooltip` false, and a null
+## data argument -- and NO throw path.
+##
+## So what we build is a TEMPLATE, and `true` from the call proves nothing.
+## The verdict re-reads `_tooltipSettingsHover@0x98 -> _tooltipData@0x20 ->
+## Text@0x20` off each row and requires the POINTER to be the exact interned
+## string that was handed over, which is a property of the finished state and
+## is falsifiable by every one of the three no-op paths.
+const DlrMaxTipScan = 128
+
+proc dlrDonorTooltipData(parent: Il2CppPtr): Il2CppPtr =
+  ## A LIVE `SettingsTooltipData`, borrowed from the stock DlssPreset row, so
+  ## that `il2cpp_object_new` gets a class pointer that came off an object the
+  ## GAME made rather than out of any metadata lookup. Walked, never offset-ed
+  ## into from nowhere: container child (matched on the same name the placement
+  ## anchor uses) -> its `SettingDropDown` component -> `_tooltipSettingsHover`
+  ## @0x98 -> `_tooltipData` @0x20.
+  result = nil
+  var n = 0
+  if not iChildCount(parent, n): return
+  if n <= 0 or n > DlrMaxTipScan: return
+  var i = 0
+  while i < n and i < DlrMaxTipScan:
+    let c = iChildAt(parent, i)
+    if c != nil and duOk(c, 0x20'i32) and iUnityAlive(c):
+      let nm = iObjName(c)
+      if nm.len > 0 and modsNameHas(nm, DlrAnchorName):
+        let ctrl = modsComponent(c, "SettingDropDown")
+        if ctrl != nil:
+          let d = nuTooltipDataOf(ctrl)
+          if d != nil: return d
+        return
+    i = i + 1
+
+proc dlrMakeTooltipData(title, body: string): Il2CppPtr =
+  ## One `SettingsTooltipData` TEMPLATE, allocated against the donor's klass
+  ## and filled through `hostfieldwrite`'s typed gate.
+  ##
+  ## `frAdmit` is called on this receiver because its type is a FACT and not an
+  ## inference: `il2cpp_object_new(klass)` returns an object OF klass, and
+  ## klass was read out of a live donor's object header a moment earlier. That
+  ## is the standard hostfieldwrite.nim asks for -- "an object the game itself
+  ## just handed back", one hop removed.
+  ##
+  ## Key / UsageStyle / UsageProperty are all `None = 0`, MEASURED with
+  ## `il2cpp_resolve.py enum` on ESettingsOption, EUsageStyle and
+  ## EUsageProperty. These rows are not BSG settings and must not claim one of
+  ## BSG's option keys or advertise a CPU/GPU cost the host has not measured.
+  result = nil
+  if gDlrTipKlass == nil: return
+  let obj = cNuObjectNew(gDlrTipKlass)
+  if not nuOk(obj, 0x38'i32): return
+  if not frAdmit("dlssrows.tooltip", frTtdText(), obj): return
+  discard frAdmit("dlssrows.tooltip", frTtdKey(), obj)
+  discard frAdmit("dlssrows.tooltip", frTtdTitle(), obj)
+  discard frAdmit("dlssrows.tooltip", frTtdUsageStyle(), obj)
+  discard frAdmit("dlssrows.tooltip", frTtdUsageProp(), obj)
+  discard frAdmit("dlssrows.tooltip", frTtdUsageText(), obj)
+  let ts = nuStr(title)
+  let bs = nuStr(body)
+  let es = nuStr("")
+  if ts == nil or bs == nil or es == nil: return
+  if not frStoreI32("dlssrows.tooltip", frTtdKey(), obj, 0'i32): return
+  if not frStorePtr("dlssrows.tooltip", frTtdTitle(), obj, ts): return
+  if not frStorePtr("dlssrows.tooltip", frTtdText(), obj, bs): return
+  if not frStoreI32("dlssrows.tooltip", frTtdUsageStyle(), obj, 0'i32): return
+  if not frStoreI32("dlssrows.tooltip", frTtdUsageProp(), obj, 0'i32): return
+  if not frStorePtr("dlssrows.tooltip", frTtdUsageText(), obj, es): return
+  obj
+
+proc dlrApplyTooltips(parent: Il2CppPtr) =
+  ## Attach a tooltip to every row of ours that declares one, then VERIFY by
+  ## reading the finished state back. Runs ONCE per build; nothing here is on a
+  ## per-frame path and nothing here allocates after it has run.
+  if not gDlrTipsOn or gDlrRowCtrl.len == 0: return
+  gDlrTipKlass = nil
+  let donor = dlrDonorTooltipData(parent)
+  if donor == nil:
+    gDlrTipWhy = "no live SettingsTooltipData could be borrowed from the " &
+                 "stock '" & DlrAnchorName & "' row (no child of the row " &
+                 "container carries that name, it has no SettingDropDown " &
+                 "component, or its _tooltipSettingsHover@0x98 / " &
+                 "_tooltipData@0x20 read null). Without a donor there is no " &
+                 "class pointer to allocate against, and none is invented"
+    return
+  gDlrTipKlass = nuKlassOf(donor)
+  if gDlrTipKlass == nil:
+    gDlrTipWhy = "the donor SettingsTooltipData's object header did not read " &
+                 "back a class pointer"
+    return
+  var i = 0
+  while i < gDlrRowCtrl.len and i < DlrMaxRows:
+    if gDlrRowTip[i].len > 0 and gDlrRowCtrl[i] != nil:
+      gDlrTipAsked = gDlrTipAsked + 1
+      let body = nuStr(gDlrRowTip[i])
+      let data = dlrMakeTooltipData(gDlrRowKey[i], gDlrRowTip[i])
+      if data != nil and body != nil:
+        gDlrTipWant[i] = body
+        if nuSetTooltip(gDlrRowCtrl[i], data):
+          gDlrTipCalled = gDlrTipCalled + 1
+      elif gDlrTipWhy.len == 0:
+        gDlrTipWhy = "the SettingsTooltipData template for '" &
+                     gDlrRowKey[i] & "' could not be built -- " &
+                     "il2cpp_object_new refused, or one of the six typed " &
+                     "stores was refused by the fieldref gate (that refusal " &
+                     "names itself on its own 'hostwrite REFUSED' line)"
+    i = i + 1
+  # THE VERDICT, and it is a property of the FINISHED STATE: the tooltip the
+  # control now carries must be the string we handed over. Reading back what we
+  # wrote into our own template would be a check that cannot fail; this reads
+  # the object the GAME constructed, through the control.
+  var i2 = 0
+  while i2 < gDlrRowCtrl.len and i2 < DlrMaxRows:
+    if gDlrTipWant[i2] != nil:
+      if nuTooltipTextOf(gDlrRowCtrl[i2]) == gDlrTipWant[i2]:
+        gDlrTipVerified = gDlrTipVerified + 1
+    i2 = i2 + 1
+
 proc dlrBuild(): bool =
   ## Build the five rows into the live Graphics panel. Called ONCE, from the
   ## tick, only after that panel has actually been observed up.
@@ -367,6 +628,13 @@ proc dlrBuild(): bool =
     return
   let togPrefab = (if nuOk(tab, DlrOffToggleTmpl + 8'i32):
                      cNuGetRef(tab, DlrOffToggleTmpl) else: nil)
+  # `GraphicsSettingsTab._dropDownTemplate` @0xB0 -- MEASURED
+  # (`tools/fldoff.py field EFT.UI.Settings.GraphicsSettingsTab
+  # _dropDownTemplate`), and NULL-CAPABLE like every other serialized template
+  # here. Fetched unconditionally so the census can say "the flag was on and
+  # the prefab was missing", which is not the same as "the flag was off".
+  let ddPrefab = (if nuOk(tab, DlrOffDropDownTmpl + 8'i32):
+                    cNuGetRef(tab, DlrOffDropDownTmpl) else: nil)
   let sliPrefab = (if nuOk(tab, DlrOffFloatSliderTmpl + 8'i32):
                      cNuGetRef(tab, DlrOffFloatSliderTmpl) else: nil)
   if not nuOk(togPrefab, 0x10'i32) and not nuOk(sliPrefab, 0x10'i32):
@@ -379,6 +647,9 @@ proc dlrBuild(): bool =
   gDlrRowGo = @[]
   gDlrRowKey = @[]
   gDlrRowT = @[]
+  gDlrRowCtrl = @[]
+  gDlrRowTip = @[]
+  gDlrTipWant = @[]
   var built = 0
   var refused = 0
   var seeded = 0
@@ -392,7 +663,26 @@ proc dlrBuild(): bool =
       continue
     var sl: Il2CppPtr = nil
     var ct: Il2CppPtr = nil
-    let go = dlrMakeRow(prefab, parent, r, sl, ct)
+    var dd: Il2CppPtr = nil
+    # THE DROPDOWN IS TRIED FIRST AND FALLS BACK, NEVER THE OTHER WAY. A
+    # refusal at any of the six proofs inside `nuDropDownShow` leaves the row
+    # as the stepper slider that has been shipping -- a working control, not a
+    # missing one -- and the census records that it happened and why.
+    var wantDrop = (r.kind == dlrDropdown and gDlrDropOn and
+                    nuOk(ddPrefab, 0x10'i32))
+    if r.kind == dlrDropdown and gDlrDropOn:
+      gDlrDropWanted = gDlrDropWanted + 1
+      if not wantDrop and gDlrDropWhy.len == 0:
+        gDlrDropWhy = "GraphicsSettingsTab._dropDownTemplate @0xB0 did not " &
+                      "read back as a live object, so there is no dropdown " &
+                      "prefab to clone"
+    var go: Il2CppPtr = nil
+    if wantDrop:
+      go = dlrMakeRow(ddPrefab, parent, r, true, sl, ct, dd)
+      if go == nil:
+        wantDrop = false
+    if go == nil:
+      go = dlrMakeRow(prefab, parent, r, false, sl, ct, dd)
     if go != nil:
       gDlrRowGo.add go
       gDlrRowKey.add r.key
@@ -400,12 +690,20 @@ proc dlrBuild(): bool =
       # a second lookup could bind a different object and the placement
       # readback would then be true of something that is not our row.
       gDlrRowT.add nuTransformOf(go)
+      gDlrRowCtrl.add ct
+      gDlrRowTip.add r.tip
+      gDlrTipWant.add nil
       built = built + 1
       # THE VALUE BINDING (settingsbind.nim, flag `settingsRowsBind`, default
       # OFF -- with it off both calls do nothing and the row is a real control
       # that changes nothing). The pointers handed over are the ones this loop
       # ALREADY HOLDS; nothing is re-found by name or by index later.
-      if r.kind == dlrToggle:
+      if wantDrop and dd != nil:
+        gDlrDropBuilt = gDlrDropBuilt + 1
+        if sbdRegisterDropdown(DlrGuid, r.key, dd,
+                               int32(r.choices.len), int32(r.def + 0.5'f32)):
+          seeded = seeded + 1
+      elif r.kind == dlrToggle:
         if sbdRegisterToggle(DlrGuid, r.key, ct, r.defB):
           seeded = seeded + 1
       elif sl != nil:
@@ -424,6 +722,7 @@ proc dlrBuild(): bool =
   gDlrSeeded = seeded
   gDlrRefused = refused
   dlrPlaceRows(parent)
+  dlrApplyTooltips(parent)
   result = true
 
 proc dlrVerdict() =
@@ -439,6 +738,39 @@ proc dlrVerdict() =
         "built (modSettingsRender). Nothing here applies anything: the " &
         "launcher's dlssapply.py step applies these before the next start " &
         "and prints the PASS/FAIL verdict in the boot log."
+  # THE DROPDOWN CENSUS. Silence here would mean "the flag is off" and "the
+  # flag is on and every dropdown refused" printed the same, which is the
+  # failure shape this repo keeps paying for.
+  if gDlrDropOn:
+    if gDlrDropBuilt == gDlrDropWanted and gDlrDropWanted > 0:
+      okLog "dlss rows: DROPDOWNS -- " & $gDlrDropBuilt & " of " &
+            $gDlrDropWanted & " choice row(s) are real EFT.UI.DropDownBox " &
+            "controls, cloned from GraphicsSettingsTab._dropDownTemplate@0xB0 " &
+            "and filled by CALLING the game's own Show through the receiver's " &
+            "own vtable slot 24. Their captions carry no '1 = .. / 2 = ..' " &
+            "mapping because the box itself names the choice."
+    else:
+      warn "dlss rows: DROPDOWNS -- only " & $gDlrDropBuilt & " of " &
+           $gDlrDropWanted & " choice row(s) became a dropdown; the rest are " &
+           "the stepper SLIDER this file shipped before, which WORKS and is " &
+           "not a missing control. Reason: " &
+           (if gDlrDropWhy.len > 0: gDlrDropWhy
+            else: "none was recorded, which is itself a defect") & "."
+  if gDlrTipsOn:
+    if gDlrTipVerified == gDlrTipAsked and gDlrTipAsked > 0:
+      okLog "dlss rows: TOOLTIPS -- " & $gDlrTipVerified & " of " &
+            $gDlrTipAsked & " row(s) READ BACK through " &
+            "_tooltipSettingsHover@0x98 -> _tooltipData@0x20 -> Text@0x20 as " &
+            "the exact string handed to SettingControl::SetTooltip @0x16FAC00. " &
+            "That is the object the GAME built from our template, read through " &
+            "the control -- not our own write read back."
+    else:
+      warn "dlss rows: TOOLTIPS -- " & $gDlrTipAsked & " asked, " &
+           $gDlrTipCalled & " call(s) made, and only " & $gDlrTipVerified &
+           " READ BACK as the string handed over. SetTooltip has three silent " &
+           "no-op paths (_blocker@0x88 null, TryGetTooltip false, null data) " &
+           "and no throw path, so a call that 'succeeded' proves nothing" &
+           (if gDlrTipWhy.len > 0: ". " & gDlrTipWhy else: "") & "."
   if gDlrPlaced >= 0:
     okLog "dlss rows: PLACEMENT -- " & $gDlrPlaced & " of " & $gDlrBuiltN &
           " row(s) READ BACK through Transform::GetSiblingIndex at the index " &

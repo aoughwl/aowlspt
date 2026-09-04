@@ -9908,6 +9908,35 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
          "values take effect on the NEXT launch, where aowlspt-launch runs " &
          "tools/dlssapply.py and prints a PASS/FAIL verdict. Every caption " &
          "says 'applies on restart'."
+  # THE TWO SUB-FLAGS, both DEFAULT OFF and both inert unless the section
+  # itself is armed. Kept separate from `settingsDlssRows` on purpose: each
+  # turns on a DIFFERENT new call path into the client, and a single flag would
+  # make "the rows regressed" and "the dropdowns regressed" the same bisect.
+  gDlrDropOn = readBoolKey("settingsDlssDropdowns")
+  gDlrTipsOn = readBoolKey("settingsDlssTooltips")
+  if (gDlrDropOn or gDlrTipsOn) and not gDlrOn:
+    gDlrDropOn = false
+    gDlrTipsOn = false
+    warn "settingsDlssDropdowns/settingsDlssTooltips are set but " &
+         "settingsDlssRows is NOT. Both only decorate rows that feature " &
+         "builds, so with it off there is nothing for either to act on. NOT " &
+         "arming them."
+  if gDlrDropOn:
+    info "settingsDlssDropdowns is set: 'DLSS version' and 'Upscaler' are " &
+         "cloned from GraphicsSettingsTab._dropDownTemplate@0xB0 and filled " &
+         "by calling the game's own DropDownBox::Show. That call is refused " &
+         "unless the receiver's own vtable slot 24 resolves to one of three " &
+         "byte-verified Show bodies AND the managed String[] this host builds " &
+         "really carries IEnumerable<string> in the interfaceOffsets table " &
+         "Show dispatches against -- a MANAGED throw there could not be " &
+         "caught. Any refusal falls back to the stepper slider and says so."
+  if gDlrTipsOn:
+    info "settingsDlssTooltips is set: each DLSS row gets the game's own " &
+         "hover tooltip, via a SettingsTooltipData template allocated against " &
+         "a class borrowed from the stock DlssPreset row and filled through " &
+         "the typed hostfieldwrite gate. The verdict re-reads " &
+         "_tooltipSettingsHover@0x98 -> _tooltipData@0x20 -> Text@0x20 off " &
+         "each row, because SetTooltip has three silent no-op paths."
   gSeasonsOn = readBoolKey("uxHideSeasons")
   gBetaNoticeOn = readBoolKey("uxBetaNotice")
   # Same event for the seasons banner, the mode button and the beta notice --

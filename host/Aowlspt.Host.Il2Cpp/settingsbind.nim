@@ -166,6 +166,15 @@ type
     sbdToggle
     sbdSlider
     sbdEnable                  ## a per-MOD enabled switch, not a setting row
+    ## A NATIVE DROPDOWN (`EFT.UI.DropDownBox`). It is a row like any other in
+    ## everything except HOW ITS EDIT ARRIVES: there is no `Slider::Set` or
+    ## `Toggle::Set` drain for a dropdown on this build (the whole
+    ## `SettingDropDown` bind family -- `BindTo`, `BindToEnum`,
+    ## `UpdateDropDownValue` -- is generic and has NO RVA offline), so the
+    ## selection is POLLED off the control itself in `sbdTick`. That is the
+    ## honest shape here: it observes the FINISHED STATE of the game's own
+    ## widget rather than an event we hoped would arrive.
+    sbdDropdown
 
   SbdRow = object
     guid*: string
@@ -216,6 +225,10 @@ var gSbdTogMatched = 0     ## ...of those, how many matched a registered row
 var gSbdSlidSeen = 0
 var gSbdSlidMatched = 0
 var gSbdSaveCount = 0
+## Dropdown selections observed to MOVE by the poll. A dropdown row that never
+## moves and a poll that never runs are different bugs and must not print the
+## same line.
+var gSbdDropMoved = 0
 
 ## WHICH MODS ACTUALLY HAD A VALUE CHANGE AT THE LAST SAVE.
 ##
@@ -461,6 +474,107 @@ proc sbdRegisterToggle*(guid, key: string; ctrl: Il2CppPtr;
                       flushedB: v, flushedF: 0.0'f32, flushed: false)
   fromCfg
 
+proc sbdRegisterDropdown*(guid, key: string; ddb: Il2CppPtr;
+                          nChoices: int32; declaredDefault: int32): bool =
+  ## Register a NATIVE DROPDOWN row and SEED it. `ddb` is the
+  ## `EFT.UI.DropDownBox` the builder already holds (through
+  ## `SettingDropDown.DropDown@0xA8`) -- never re-found by name or by index.
+  ##
+  ## The config value is ONE-BASED, because that is what `mods/dlss`'s schema
+  ## and the F12 overlay both show ("1 = 310.5.3, 2 = 310.7.0, ..."), while the
+  ## control is ZERO-BASED. The conversion happens HERE, in the only two places
+  ## that cross the boundary -- the seed and the flush -- so the three surfaces
+  ## cannot drift apart the way they would if each caller did its own.
+  ##
+  ## Returns true when the seed came from the config; false means the row shows
+  ## `declaredDefault` and the caller must say so.
+  result = false
+  if not sbdReady(): return
+  if gSbdRows.len >= SbdMaxRows:
+    sbdFault("the row table is full at " & $SbdMaxRows & " row(s); '" & key &
+             "' is NOT bound and will change nothing when selected")
+    return
+  if nChoices <= 0'i32 or nChoices > 16'i32:
+    sbdFault("'" & key & "' declares " & $nChoices & " choice(s), which is " &
+             "outside 1..16. NOT bound")
+    return
+  # The receiver must answer the GAME'S OWN getter before anything is written
+  # to it: a pointer that reads plausibly but is not a dropdown would take the
+  # seed and never show it.
+  let (readable, _) = nuDropDownIndex(ddb)
+  if not readable:
+    sbdFault("'" & key & "': the DropDownBox did not answer get_CurrentIndex " &
+             "@0x698550, so it is not a live dropdown this row could be " &
+             "matched to. NOT bound")
+    return
+  var one = declaredDefault
+  var fromCfg = false
+  var cfg = 0.0'f32
+  if sbdConfigF(guid, key, cfg):
+    var v = int32(cfg + 0.5'f32)
+    # CLAMP TO THE DECLARED CHOICE COUNT. A hand-edited config, or a schema
+    # that moved, must not select an index the control does not have.
+    if v < 1'i32: v = 1'i32
+    if v > nChoices: v = nChoices
+    one = v
+    fromCfg = true
+  if one < 1'i32: one = 1'i32
+  if one > nChoices: one = nChoices
+  gSbdApplying = true
+  let wrote = nuDropDownSetIndex(ddb, one - 1'i32)
+  gSbdApplying = false
+  if not wrote:
+    sbdFault("'" & key & "' could not be seeded through set_CurrentIndex " &
+             "@0x698560, so the selection on screen is whatever the cloned " &
+             "prefab came up with and not this setting's. NOT bound")
+    return
+  # READ IT BACK THROUGH THE OTHER FUNCTION. `set_CurrentIndex` is a bare
+  # store; comparing our own record against itself would be a check that
+  # cannot fail.
+  let (ok2, got) = nuDropDownIndex(ddb)
+  if not ok2 or got != one - 1'i32:
+    sbdFault("'" & key & "' was seeded to index " & $(one - 1'i32) &
+             " and get_CurrentIndex reads " &
+             (if ok2: $got else: "NOTHING (unreadable)") &
+             ". The control and this registry disagree, so the row is NOT " &
+             "bound rather than bound to a value the player is not seeing")
+    return
+  gSbdRows.add SbdRow(guid: guid, key: key, kind: sbdDropdown, ev: ddb,
+                      read: ddb, lo: 1.0'f32, hi: float32(nChoices),
+                      seedB: false, seedF: float32(one), fromConfig: fromCfg,
+                      stagedB: false, stagedF: float32(one), staged: false,
+                      flushedB: false, flushedF: float32(one), flushed: false)
+  fromCfg
+
+proc sbdPollDropdowns() =
+  ## THE DROPDOWN "EVENT". Called once per tick, and it is the only place a
+  ## dropdown edit can be noticed, because there is no `DropDownBox` drain to
+  ## ride and binding a second detour to make one would overwrite somebody
+  ## else's trampoline.
+  ##
+  ## Cost is one guarded 4-byte read per registered dropdown row per frame --
+  ## no allocation, and no log line unless the selection actually MOVED.
+  ## `gSbdApplying` keeps our own seed from reading as a player edit.
+  if gSbdApplying: return
+  var i = 0
+  while i < gSbdRows.len and i < SbdMaxRows:
+    if gSbdRows[i].kind == sbdDropdown:
+      let (ok, zero) = nuDropDownIndex(gSbdRows[i].read)
+      if ok:
+        let one = float32(zero + 1'i32)
+        if one >= gSbdRows[i].lo and one <= gSbdRows[i].hi:
+          let was = (if gSbdRows[i].staged: gSbdRows[i].stagedF
+                     else: gSbdRows[i].seedF)
+          if one != was:
+            gSbdRows[i].stagedF = one
+            gSbdRows[i].staged = true
+            gSbdDropMoved = gSbdDropMoved + 1
+            okLog "settings bind: STAGED '" & gSbdRows[i].key & "' = " &
+                  $int(one) & " (the dropdown's own get_CurrentIndex moved " &
+                  "from " & $int(was) & " to " & $int(one) & "). Not written " &
+                  "yet -- it goes out on the next SaveSettings."
+    i = i + 1
+
 proc sbdRegisterEnable*(guid: string; ctrl: Il2CppPtr;
                         currentlyEnabled: bool): bool =
   ## A PER-MOD ENABLED SWITCH, for the native MODS tab. Same event route as any
@@ -624,7 +738,8 @@ proc sbdCensus(): string =
   ## The one string that separates the three failure states from each other.
   "registry=" & $gSbdRows.len & " staged=" & $sbdStagedCount() &
   " toggleEvents=" & $gSbdTogSeen & "/matched " & $gSbdTogMatched &
-  " sliderEvents=" & $gSbdSlidSeen & "/matched " & $gSbdSlidMatched
+  " sliderEvents=" & $gSbdSlidSeen & "/matched " & $gSbdSlidMatched &
+  " dropdownMoves=" & $gSbdDropMoved
 
 proc sbdSaveFired() =
   ## `SettingsScreenController::SaveSettings()` PREFIX.
@@ -840,6 +955,13 @@ proc sbdFlush() =
         sbdEnqueue(gSbdRows[i].guid, gSbdRows[i].key,
                    sbdF(gSbdRows[i].stagedF))
         gSbdRows[i].flushedF = gSbdRows[i].stagedF
+      elif gSbdRows[i].kind == sbdDropdown:
+        # AN INTEGER, not "2.0000". The schema key is a one-based CHOICE and
+        # `tools/dlssapply.py` reads it as one; writing a float here would put
+        # a value in the config that does not match what the mod declares.
+        sbdEnqueue(gSbdRows[i].guid, gSbdRows[i].key,
+                   $int(gSbdRows[i].stagedF))
+        gSbdRows[i].flushedF = gSbdRows[i].stagedF
       else:
         # A PER-MOD ENABLED SWITCH, and it is now WRITTEN -- through the F12
         # panel's own command queue.
@@ -892,7 +1014,19 @@ proc sbdFlush() =
       # V1, immediately: does the LIVE control agree with what was just sent?
       # An `sbdEnable` row is a toggle on screen, so it reads back like one --
       # what differs is only where its value would be WRITTEN.
-      if gSbdRows[i].kind != sbdSlider:
+      if gSbdRows[i].kind == sbdDropdown:
+        # Through the GAME'S OWN getter, at a different address from the
+        # setter that wrote it.
+        let (ok3, zero) = nuDropDownIndex(gSbdRows[i].read)
+        if not ok3: incon = incon + 1
+        elif float32(zero + 1'i32) == gSbdRows[i].flushedF: pass = pass + 1
+        else:
+          fail = fail + 1
+          if firstFail.len == 0:
+            firstFail = gSbdRows[i].key & " (dropdown reads " &
+                        $(zero + 1'i32) & ", wrote " &
+                        $int(gSbdRows[i].flushedF) & ")"
+      elif gSbdRows[i].kind != sbdSlider:
         var lv = false
         if not sbdReadLiveB(i, lv): incon = incon + 1
         elif lv == gSbdRows[i].flushedB: pass = pass + 1
@@ -1039,6 +1173,9 @@ proc sbdTick*() =
   # Idle cost when nothing is armed is one length compare.
   sbdVerdictEnable()
   if not sbdReady(): return
+  # BEFORE the save drain, so a selection changed on the same frame as the
+  # press is staged in time to be flushed by it.
+  sbdPollDropdowns()
   if gSbdSaveSeen:
     gSbdSaveSeen = false
     sbdFlush()
