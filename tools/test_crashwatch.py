@@ -448,12 +448,360 @@ def t_top_12_is_a_cap():
               repr(lines))
 
 
+# =========================================================================
+# HOST / MOD SYMBOLISATION  (crashwatch.py symbolize-host)
+#
+# The fixtures under tools/fixtures/crashwatch are:
+#
+#   cdb_crash_20260903_155245216.txt   VERBATIM cdb output (`.ecxr; k 40;
+#   cdb_dps_20260903_155245216.txt     lmv m aowlspt*` and `dps @rsp L200`)
+#   objdump_t_host_20260903_122227.txt from Crash_2026-09-03_155245216, plus a
+#   pe_host_20260903_122227.json       real `objdump -t` excerpt and the real
+#                                      PE header of the build that was loaded.
+#   cdb_wer_636_RECONSTRUCTED.txt      RECONSTRUCTED -- the 636 WER dump is
+#   cdb_da_636_RECONSTRUCTED.txt       gone from disk; content is transcribed
+#                                      from docs/AOWL_FACTS.md #71/#72 and the
+#                                      layout copied from the verbatim file.
+#                                      Both say so in their first line.
+#
+# The 5 MB DLL itself cannot be committed, so each test SYNTHESISES a PE with
+# the recorded header (timestamp, SizeOfImage, CheckSum, section table) and
+# feeds the recorded objdump text through an injected runner. That exercises
+# the real matcher and the real symboliser; only the two subprocesses are
+# stubbed.
+
+FIXDIR = os.path.join(HERE, "fixtures", "crashwatch")
+
+
+def fixture(name):
+    with open(os.path.join(FIXDIR, name), encoding="utf-8") as fh:
+        return fh.read()
+
+
+def pe_json():
+    import json
+    return json.loads(fixture("pe_host_20260903_122227.json"))
+
+
+def make_pe(path, ident):
+    """Write a minimal PE32+ with the given header fields and section table.
+
+    Only the bytes `crashwatch.pe_ident` reads are meaningful. This is what
+    lets the matcher and the symboliser be tested for real without committing
+    a 5 MB DLL: the identity and the section RVAs are the recorded ones.
+    """
+    import struct
+    buf = bytearray(0x600)
+    buf[0:2] = b"MZ"
+    struct.pack_into("<I", buf, 0x3C, 0x80)
+    o = 0x80
+    buf[o:o + 4] = b"PE\0\0"
+    optsz = 0xF0
+    struct.pack_into("<HHIIIHH", buf, o + 4,
+                     ident.get("machine", 0x8664), len(ident["sections"]),
+                     ident["timestamp"], 0, 0, optsz, 0x2022)
+    opt = o + 24
+    struct.pack_into("<H", buf, opt, 0x20B)
+    struct.pack_into("<Q", buf, opt + 24, ident.get("base", 0x180000000))
+    struct.pack_into("<I", buf, opt + 56, ident["image_size"])
+    struct.pack_into("<I", buf, opt + 64, ident["checksum"])
+    st = opt + optsz
+    for i, s in enumerate(ident["sections"]):
+        e = st + 40 * i
+        buf[e:e + 8] = s["name"].encode("ascii")[:8].ljust(8, b"\0")
+        struct.pack_into("<II", buf, e + 8, s["size"], s["rva"])
+        struct.pack_into("<I", buf, e + 36, 0x20 if s["code"] else 0x40)
+    with open(path, "wb") as fh:
+        fh.write(bytes(buf))
+    return path
+
+
+HOST_STEM = "aowlspt-host-il2cpp"
+LOADED_BAK = HOST_STEM + ".dll.bak-20260903-122227"
+
+
+def objdump_runner(_cmd):
+    return 0, fixture("objdump_t_host_20260903_122227.txt")
+
+
+def t_pe_ident_reads_the_recorded_header():
+    want = pe_json()
+    with tempfile.TemporaryDirectory() as td:
+        p = make_pe(os.path.join(td, "x.dll"), want)
+        got = crashwatch.pe_ident(p)
+    check("pe/timestamp", got["timestamp"] == 0x6A9990B6, hex(got["timestamp"]))
+    check("pe/image-size", got["image_size"] == 0x2A16000, hex(got["image_size"]))
+    check("pe/section-count", len(got["sections"]) == len(want["sections"]))
+    text = [s for s in got["sections"] if s["name"] == ".text"]
+    check("pe/text-is-code-at-0x1000",
+          len(text) == 1 and text[0]["code"] and text[0]["rva"] == 0x1000,
+          repr(text))
+    data = [s for s in got["sections"] if s["name"] == ".data"]
+    check("pe/data-is-not-code", data and not data[0]["code"], repr(data))
+    check("pe/not-a-pe-is-None", crashwatch.pe_ident(__file__) is None)
+
+
+def _decoys(td, ident):
+    """Three files that must NOT win: right size wrong stamp, right stamp in a
+    different SizeOfImage, and a non-PE."""
+    a = dict(ident, timestamp=0x11111111)
+    make_pe(os.path.join(td, HOST_STEM + ".dll"), a)          # the DEPLOYED one
+    b = dict(ident, image_size=0x2A44000)
+    make_pe(os.path.join(td, HOST_STEM + ".dll.bak-other"), b)
+    with open(os.path.join(td, HOST_STEM + ".dll.bak-junk"), "wb") as fh:
+        fh.write(b"not a pe at all")
+
+
+def t_match_build_picks_the_loaded_backup():
+    ident = pe_json()
+    with tempfile.TemporaryDirectory() as td:
+        _decoys(td, ident)
+        target = make_pe(os.path.join(td, LOADED_BAK), ident)
+        cands = crashwatch.build_candidates(HOST_STEM, td, td)
+        check("match/candidates-found", len(cands) >= 4, repr(cands))
+        want = {"timestamp": ident["timestamp"],
+                "image_size": ident["image_size"],
+                "checksum": ident["checksum"]}
+        p, how, why = crashwatch.match_build(want, cands)
+        check("match/picks-the-backup-not-the-deployed-file",
+              p == target, "%s (%s)" % (p, why))
+        check("match/says-which-keys-it-compared",
+              how and "timestamp" in how, repr(how))
+        # The falsifier for "it just returns the newest file": the deployed
+        # file is newer AND is the one every other tool would reach for.
+        check("match/deployed-file-was-rejected",
+              p != os.path.join(td, HOST_STEM + ".dll"), repr(p))
+
+
+def t_match_build_no_backup_is_inconclusive():
+    """THE required falsifier. A timestamp matching nothing must not degrade
+    into "close enough"; it must name the timestamp and symbolise nothing."""
+    ident = pe_json()
+    with tempfile.TemporaryDirectory() as td:
+        _decoys(td, ident)                       # the loaded build is ABSENT
+        cands = crashwatch.build_candidates(HOST_STEM, td, td)
+        want = {"timestamp": 0x6A9990B6, "image_size": 0x2A16000,
+                "checksum": 0}
+        p, how, why = crashwatch.match_build(want, cands)
+        check("falsifier/no-match-returns-nothing", p is None and how is None,
+              repr(p))
+        check("falsifier/says-INCONCLUSIVE", why and "INCONCLUSIVE" in why,
+              repr(why))
+        check("falsifier/NAMES-the-timestamp",
+              why and "0x6A9990B6" in why, repr(why))
+        # and the whole pipeline must refuse, not just the matcher
+        hs, w2 = crashwatch.load_host_symbols(want, HOST_STEM, td, td,
+                                              objdump_runner=objdump_runner)
+        check("falsifier/load_host_symbols-refuses",
+              hs is None and "0x6A9990B6" in (w2 or ""), repr(w2))
+        lines = crashwatch.symbolize_host_dump(
+            "nodump", ours={HOST_STEM}, install_root=td, repo_mods=td,
+            cdb_text=fixture("cdb_crash_20260903_155245216.txt"),
+            dps_text="", objdump_runner=objdump_runner)
+        blob = "\n".join(lines)
+        check("falsifier/report-says-nothing-was-symbolised",
+              "NOTHING below is symbolised" in blob and "0x6A9990B6" in blob,
+              blob[-400:])
+        check("falsifier/report-invents-no-function-name",
+              "_mi_page_free_collect" not in blob, blob[-400:])
+
+
+def t_match_build_identical_copies_are_not_ambiguous():
+    ident = pe_json()
+    with tempfile.TemporaryDirectory() as td:
+        a = make_pe(os.path.join(td, LOADED_BAK), ident)
+        make_pe(os.path.join(td, HOST_STEM + ".dll.bak-copy"), ident)
+        want = {"timestamp": ident["timestamp"],
+                "image_size": ident["image_size"], "checksum": 0}
+        p, how, why = crashwatch.match_build(
+            want, crashwatch.build_candidates(HOST_STEM, td, td))
+        check("dupe/identical-copies-still-match", p is not None, repr(why))
+        check("dupe/says-they-were-identical",
+              how and "byte-identical" in how, repr(how))
+        # ...but two DIFFERENT files sharing all three keys must NOT.
+        p2, how2, why2 = crashwatch.match_build(
+            want, crashwatch.build_candidates(HOST_STEM, td, td),
+            hasher=lambda path: path)      # pretend every file differs
+        check("dupe/different-files-are-INCONCLUSIVE",
+              p2 is None and "INCONCLUSIVE" in (why2 or ""), repr(why2))
+        check("dupe/names-the-rivals",
+              why2 and os.path.basename(a) in why2, repr(why2))
+
+
+def t_objdump_addresses_are_section_relative():
+    """The measured trap: an objdump symbol value is SECTION-relative and
+    `(sec N)` is 1-based. Reading it as an RVA shifts every name by 0x1000 --
+    which yields plausible wrong function names, not an error."""
+    ident = pe_json()
+    syms = crashwatch.parse_objdump_symbols(
+        fixture("objdump_t_host_20260903_122227.txt"), ident["sections"])
+    check("objdump/parsed-some", len(syms) > 100, str(len(syms)))
+    hs = crashwatch.HostSymbols("x", syms, sections=ident["sections"])
+    for rva, want in ((0x80C4, "_mi_page_free_collect+0x6D"),
+                      (0xE734, "_mi_segment_page_alloc+0x3DB"),
+                      (0xEE33, "_mi_malloc_generic+0x57"),
+                      (0xF844, "mi_malloc+0x76"),
+                      (0x23E4E0, "substr_0_sysvq0asl+0x8B"),
+                      (0x1BC069, "takeModSet_0_aowayxgkm1+0x9D")):
+        got = hs.lookup(rva)
+        check("objdump/0x%X" % rva,
+              got is not None and ("%s+0x%X" % got) == want,
+              "got %r want %r" % (got, want))
+    # the negative control: with the section RVAs zeroed, 0x80c4 must NOT come
+    # back as _mi_page_free_collect. Without this, a symboliser that ignored
+    # the section table entirely would pass every case above by luck.
+    flat = [dict(s, rva=0) for s in ident["sections"]]
+    bad = crashwatch.parse_objdump_symbols(
+        fixture("objdump_t_host_20260903_122227.txt"), flat)
+    hb = crashwatch.HostSymbols("x", bad, sections=flat)
+    g = hb.lookup(0x80C4)
+    check("objdump/section-rva-actually-matters",
+          g is None or g[0] != "_mi_page_free_collect", repr(g))
+
+
+def t_a_data_address_is_refused_not_named():
+    """0x39E040 is in `.data`. It was reported as `__add_nanbits_D2A+0xF8630`
+    until the code-section check went in -- a real name, a plausible offset,
+    and entirely fictional."""
+    ident = pe_json()
+    syms = crashwatch.parse_objdump_symbols(
+        fixture("objdump_t_host_20260903_122227.txt"), ident["sections"])
+    hs = crashwatch.HostSymbols("x", syms, sections=ident["sections"])
+    check("data/in_code-says-no", hs.in_code(0x39E040) is False)
+    check("data/lookup-refuses", hs.lookup(0x39E040) is None,
+          repr(hs.lookup(0x39E040)))
+    check("data/label-explains-why",
+          "not code" not in hs.label(0x39E040).lower()
+          or "data" in hs.label(0x39E040).lower(), hs.label(0x39E040))
+    check("code/lookup-still-works", hs.lookup(0x80C4) is not None)
+
+
+def t_scrape_recovers_the_chain_and_is_labelled_a_scrape():
+    ident = pe_json()
+    with tempfile.TemporaryDirectory() as td:
+        _decoys(td, ident)
+        make_pe(os.path.join(td, LOADED_BAK), ident)
+        lines = crashwatch.symbolize_host_dump(
+            "nodump", ours={HOST_STEM}, install_root=td, repo_mods=td,
+            cdb_text=fixture("cdb_crash_20260903_155245216.txt"),
+            dps_text=fixture("cdb_dps_20260903_155245216.txt"),
+            objdump_runner=objdump_runner)
+    blob = "\n".join(lines)
+    check("scrape/matched-the-loaded-build", LOADED_BAK in blob, blob[:300])
+    check("scrape/walk-collapsed-to-one-frame",
+          "cdb walked 1 frame(s)" in blob, blob)
+    check("scrape/says-SCRAPE-NOT-A-WALK",
+          "THIS IS A SCRAPE, NOT A WALK" in blob, blob)
+    for want in ("_mi_page_free_collect+0x6D", "_mi_segment_page_alloc+0x3DB",
+                 "_mi_malloc_generic+0x57", "mi_malloc+0x76",
+                 "substr_0_sysvq0asl+0x8B", "strip_0_str7j0ifg+0xBA",
+                 "pathGet_0_jsok2v72h1+0xFE", "takeModSet_0_aowayxgkm1+0x9D",
+                 "tickMods_0_mod1gv081+0xD4D"):
+        check("scrape/names %s" % want, want in blob)
+    check("scrape/reports-the-crash-site",
+          "crash site: _mi_page_free_collect+0x6D" in blob, blob)
+    # the data words are dropped, and their absence is STATED rather than silent
+    check("scrape/drops-data-words",
+          "__add_nanbits_D2A" not in blob, blob)
+    check("scrape/says-it-dropped-them",
+          "DATA section" in blob, blob)
+    # and mimalloc: `da` was not run here (no cdb), so it must say so rather
+    # than inventing an assertion string.
+    check("scrape/mimalloc-not-guessed",
+          "corrupted" not in blob and "mimalloc:" in blob, blob)
+
+
+def t_mimalloc_string_is_read_not_guessed():
+    ident = pe_json()
+
+    def cdb_runner(cmd):
+        return (0, fixture("cdb_da_636_RECONSTRUCTED.txt")) \
+            if " da " in " " + cmd[-1] else (0, "")
+
+    with tempfile.TemporaryDirectory() as td:
+        make_pe(os.path.join(td, LOADED_BAK), ident)
+        lines = crashwatch.symbolize_host_dump(
+            "nodump", ours={HOST_STEM}, install_root=td, repo_mods=td,
+            cdb_text=fixture("cdb_wer_636_RECONSTRUCTED.txt"),
+            objdump_runner=objdump_runner, cdb_runner=cdb_runner)
+        blob = "\n".join(lines)
+        check("mimalloc/walked-not-scraped",
+              "cdb walked 5 frame(s)" in blob
+              and "THIS IS A SCRAPE" not in blob, blob)
+        check("mimalloc/site-is-mi_malloc",
+              "crash site: mi_malloc+0x76" in blob, blob)
+        check("mimalloc/names-the-assertion-string",
+              "corrupted thread-free list." in blob, blob)
+        # falsifier: with `da` yielding nothing, the string must NOT appear and
+        # the tool must say the text was not recovered.
+        lines2 = crashwatch.symbolize_host_dump(
+            "nodump", ours={HOST_STEM}, install_root=td, repo_mods=td,
+            cdb_text=fixture("cdb_wer_636_RECONSTRUCTED.txt"),
+            objdump_runner=objdump_runner,
+            cdb_runner=lambda cmd: (0, "00007ffb`3dfd1373  \"\"\n"))
+        b2 = "\n".join(lines2)
+        check("mimalloc/no-da-string-means-NOT-RECOVERED",
+              "corrupted" not in b2 and "was NOT recovered" in b2, b2)
+
+
+def t_host_frames_present_detects_both_shapes():
+    """The trigger for running any of this from `last`. Two shapes, plus a
+    negative control that must stay False."""
+    F = crashwatch.Frame
+
+    class R(object):
+        def __init__(self, frames):
+            self.ok, self.why = True, ""
+            self.frames, self.walked = frames, []
+
+        @property
+        def all_frames(self):
+            return self.frames + self.walked
+
+    ours = {HOST_STEM, "sain"}
+    unavailable = R([F("0x1", HOST_STEM, "(function-name not available)")])
+    check("trigger/function-name-not-available",
+          crashwatch.host_frames_present(unavailable, ours))
+    repeated = R([F("0x%d" % i, HOST_STEM, "aowl_region_screen_known_x")
+                  for i in range(7)])
+    check("trigger/one-export-repeated-across-frames",
+          crashwatch.host_frames_present(repeated, ours))
+    clean = R([F("0x1", "GameAssembly", "Foo"),
+               F("0x2", HOST_STEM, "aowl_real_symbol"),
+               F("0x3", HOST_STEM, "aowl_other_symbol")])
+    check("trigger/negative-control-stays-False",
+          not crashwatch.host_frames_present(clean, ours))
+    check("trigger/unparsable-report-is-False",
+          not crashwatch.host_frames_present(None, ours))
+
+
+def t_fixtures_declare_what_they_are():
+    """A reconstructed fixture that does not SAY it is reconstructed is how a
+    transcription becomes a measurement. Asserted, not trusted."""
+    for n in os.listdir(FIXDIR):
+        if "RECONSTRUCTED" not in n:
+            continue
+        head = fixture(n).splitlines()[0]
+        check("fixtures/%s declares itself" % n,
+              "RECONSTRUCTED" in head, head)
+
+
 def main():
     for fn in (t_parses_sain_frames, t_parses_ga_two_blocks,
                t_not_a_crash_report, t_attribution, t_our_modules_finds_the_mods,
                t_folder_time_is_utc, t_older_folder_ignored,
                t_run_prints_the_block, t_refuses_a_non_crashes_root,
-               t_top_12_is_a_cap):
+               t_top_12_is_a_cap,
+               t_pe_ident_reads_the_recorded_header,
+               t_match_build_picks_the_loaded_backup,
+               t_match_build_no_backup_is_inconclusive,
+               t_match_build_identical_copies_are_not_ambiguous,
+               t_objdump_addresses_are_section_relative,
+               t_a_data_address_is_refused_not_named,
+               t_scrape_recovers_the_chain_and_is_labelled_a_scrape,
+               t_mimalloc_string_is_read_not_guessed,
+               t_host_frames_present_detects_both_shapes,
+               t_fixtures_declare_what_they_are):
         if VERBOSE:
             print("%s:" % fn.__name__)
         try:

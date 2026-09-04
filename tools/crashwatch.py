@@ -27,6 +27,15 @@ output_000.log costs nothing.
     python tools/crashwatch.py last [N]      # the morning read: the newest N
                                              # UNITY CRASH REPORTS, each with
                                              # the module its crash site is in
+    python tools/crashwatch.py symbolize-host <dmp|Crash_dir>
+                                             # our OWN frames as function
+                                             # names: picks the DLL build that
+                                             # was actually loaded (PE
+                                             # TimeDateStamp vs every .bak-*),
+                                             # reads its COFF symbols with
+                                             # objdump -t, and scrapes the
+                                             # stack when the walk collapses.
+                                             # `last` and `wer` run it for you.
     python tools/crashwatch.py --selftest    # prove both halves; needs no game
     python tools/crashwatch.py --scan-existing   # also scan text already in the
                                                  # newest dir (off by default so
@@ -95,10 +104,13 @@ it can outlive any single launch.
 from __future__ import annotations
 
 import argparse
+import bisect
 import datetime
 import glob
+import hashlib
 import os
 import re
+import struct
 import subprocess
 import sys
 import time
@@ -1866,6 +1878,721 @@ def format_wer(since, indent="   ", ps_runner=None, cdb_runner=None,
                          "dumps_note": dnote}
 
 
+# ---------------------------------------------------------------------------
+# HOST / MOD SYMBOLISATION. MEASURED 2026-09-03, and done BY HAND twice that day.
+#
+# Our DLLs ship without a PDB, so every tool that reads a crash of ours prints
+# the same two useless things:
+#
+#   * Unity's report:  `0x00007FFB1DB980C4 (aowlspt-host-il2cpp) (function-name
+#     not available)`, and -- worse -- `aowl_region_screen_known_x` for SEVEN
+#     consecutive different frames, because dbghelp falls back to the nearest
+#     EXPORT and we export very few. That is a confidently wrong answer.
+#   * cdb's `k`:  `aowlspt_host_il2cpp+0x80c4` and then `0x84`, `0x1` -- the
+#     walk collapses after one frame ("0 walked") because there is no unwind
+#     information it will trust for our frames.
+#
+# Both are recoverable OFFLINE, because the mingw link leaves a full COFF symbol
+# table in the DLL. The whole method, measured end to end on
+# Crash_2026-09-03_155245216:
+#
+#  1. WHICH BUILD WAS LOADED. The deployed file has already been replaced by the
+#     time anyone reads the crash (measured: the dump's host DLL is stamped
+#     11:22:30, the deployed file at read time was the 21:12 build), so
+#     symbolising against `D:\Aowlspt\aowlspt\aowlspt-host-il2cpp.dll` gives
+#     wrong names with no warning. The PE TimeDateStamp identifies the build:
+#     cdb `lmv m aowlspt*` prints `Timestamp: ... (6A9990B6)`, `ImageSize`,
+#     `CheckSum`, and every candidate file's own header carries the same three.
+#     MEASURED: TimeDateStamp 0x6A9990B6 matched EXACTLY ONE of 275 candidate
+#     files (`aowlspt-host-il2cpp.dll.bak-20260903-122227`); SizeOfImage alone
+#     matched two, so size alone is not an identity.
+#  2. THE SYMBOLS. `objdump -t` on that file lists 2,630 `.text` symbols. An
+#     objdump symbol's printed address is SECTION-RELATIVE, so its RVA is
+#     `section_rva + value`, with the 1-based `(sec N)` indexing the PE section
+#     table. Frame RVA = frame VA - the module base from the dump.
+#     MEASURED result for the four "(function-name not available)" frames:
+#     `_mi_page_free_collect+0x6d`, `_mi_segment_page_alloc+0x3db`,
+#     `_mi_malloc_generic+0x57`, `mi_malloc+0x76` -- i.e. a mimalloc crash,
+#     which no reading of the raw report could have told you. The seven frames
+#     dbghelp all called `aowl_region_screen_known_x` are really `substr_0`,
+#     `strip_0`, `pathGet_0`, `parseDesired_0`, `takeModSet_0`, ...
+#  3. WHEN THE WALK FAILS. `dps @rsp L400` and keep the words that land inside
+#     one of our modules. That is a SCRAPE, not a walk: it is stack memory in
+#     address order and it can contain stale return addresses from earlier,
+#     deeper calls. It is labelled as a scrape everywhere it is printed, and it
+#     must never be presented as a call stack.
+#  4. MIMALLOC. When a frame is inside mimalloc, `da` on the argument registers
+#     often holds the assertion/abort text -- that is how
+#     `"corrupted thread-free list."` (page.c:205) was read out of
+#     EscapeFromTarkov.exe.636.dmp on 2026-09-03. Only reported when `da`
+#     actually yields a printable string; never guessed from the function name.
+#
+# objdump is run through tools/cctool.py's environment, with its OWN directory
+# forced to the front of PATH. Not decoration: objdump.exe links the same
+# msys2 libraries cc1.exe does, so under Git Bash it can bind Git's
+# mingw64 copies and die in the loader before main with no diagnostic --
+# CLAUDE.md section 3.
+
+OBJDUMP_EXE = r"C:\msys64\ucrt64\bin\objdump.exe"
+DEFAULT_REPO_MODS = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "mods")
+
+# "[  0](sec  1)(fl 0x00)(ty   20)(scl   2) (nx 0) 0x00000000000000 _CRT_INIT"
+OBJDUMP_SYM_RX = re.compile(
+    r"^\[\s*\d+\]\(sec\s+(-?\d+)\)\(fl\s+\S+\)\(ty\s+(\S+)\)\(scl\s+(\d+)\)"
+    r"\s+\(nx\s+\d+\)\s+0x([0-9a-fA-F]+)\s+(.+?)\s*$")
+
+# cdb `lmv`: "00007ffb`1db90000 00007ffb`205a6000   aowlspt_host_il2cpp   T ..."
+LMV_HEAD_RX = re.compile(
+    r"^([0-9a-fA-F`]+)\s+([0-9a-fA-F`]+)\s+(\S+)\s")
+LMV_KV_RX = re.compile(r"^\s+([A-Za-z ]+?):\s+(.*?)\s*$")
+# cdb `dps`: "00000030`6f7ff158  00007ffb`1db9e734 aowlspt_host_il2cpp+0xe734"
+DPS_RX = re.compile(
+    r"^([0-9a-fA-F`]+)\s+([0-9a-fA-F`]+)\s+(\S+?)\+0x([0-9a-fA-F]+)\s*$")
+# cdb `da 00007ffb...`: "00007ffb`3dfd1373  \"corrupted thread-free list.\""
+DA_RX = re.compile(r"^[0-9a-fA-F`]+\s+\"(.*)\"\s*$")
+
+MIMALLOC_FN_RX = re.compile(r"^_?mi_|^mi_|_mi_assert|mi_error")
+ARG_REGS = ("rcx", "rdx", "r8", "r9", "rax", "rbx", "rsi", "rdi")
+
+
+def _unhex(s):
+    """A cdb address (`00007ffb`1db90000`) as an int, or None."""
+    try:
+        return int(str(s).replace("`", "").strip(), 16)
+    except (TypeError, ValueError):
+        return None
+
+
+def pe_ident(path):
+    """The PE identity of a file on disk, or None if it is not a PE.
+
+    Returns the three things cdb's `lmv` prints -- TimeDateStamp, SizeOfImage,
+    CheckSum -- plus the ImageBase and the section table, which is what turns
+    an objdump symbol into an RVA. Pure Python: no external tool, so this half
+    can never fail for environment reasons.
+    """
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(0x1000)
+    except OSError:
+        return None
+    if len(head) < 0x40 or head[:2] != b"MZ":
+        return None
+    try:
+        off = struct.unpack_from("<I", head, 0x3C)[0]
+        if head[off:off + 4] != b"PE\0\0":
+            return None
+        machine, nsec = struct.unpack_from("<HH", head, off + 4)
+        stamp = struct.unpack_from("<I", head, off + 8)[0]
+        optsz = struct.unpack_from("<H", head, off + 20)[0]
+        opt = off + 24
+        magic = struct.unpack_from("<H", head, opt)[0]
+        if magic == 0x20B:                      # PE32+
+            base = struct.unpack_from("<Q", head, opt + 24)[0]
+        else:
+            base = struct.unpack_from("<I", head, opt + 28)[0]
+        image_size = struct.unpack_from("<I", head, opt + 56)[0]
+        checksum = struct.unpack_from("<I", head, opt + 64)[0]
+        secs = []
+        st = opt + optsz
+        for i in range(nsec):
+            e = st + 40 * i
+            if e + 40 > len(head):
+                break
+            name = head[e:e + 8].rstrip(b"\0").decode("ascii", "replace")
+            vsize, vaddr = struct.unpack_from("<II", head, e + 8)
+            chars = struct.unpack_from("<I", head, e + 36)[0]
+            secs.append({"name": name, "rva": vaddr, "size": vsize,
+                         "code": bool(chars & 0x20)})
+    except (struct.error, IndexError):
+        return None
+    return {"path": path, "timestamp": stamp, "image_size": image_size,
+            "checksum": checksum, "base": base, "machine": machine,
+            "sections": secs}
+
+
+def build_candidates(stem, install_root=DEFAULT_INSTALL, repo_mods=None):
+    """Every file on disk that could BE the build named `stem`.
+
+    The live artifact plus each of its backups: `.bak-*` is what deploy.py
+    writes, and the `.MINE-*` / `.MODLOAD-*` siblings exist in the install too.
+    Mods are covered from both the install (`mods/<n>/<n>.dll*`) and the repo
+    (`mods/<n>/bin/<n>.dll*`), because after a redeploy the loaded build often
+    survives only in the worktree that produced it.
+    """
+    stem = str(stem).lower().replace("_", "-")
+    pats = []
+    if install_root:
+        pats += [os.path.join(install_root, stem + ".dll*"),
+                 os.path.join(install_root, "mods", "*", stem + ".dll*")]
+    if repo_mods is None:
+        repo_mods = DEFAULT_REPO_MODS
+    if repo_mods:
+        pats += [os.path.join(repo_mods, "*", "bin", stem + ".dll*"),
+                 os.path.join(repo_mods, "*", stem + ".dll*")]
+    out, seen = [], set()
+    for pat in pats:
+        for p in glob.glob(pat):
+            k = os.path.normcase(os.path.abspath(p))
+            if k in seen or not os.path.isfile(p):
+                continue
+            seen.add(k)
+            out.append(p)
+    return sorted(out)
+
+
+def _sha256(path):
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return None
+
+
+def match_build(want, candidates, hasher=_sha256):
+    """(path, how, note) for the file that IS the loaded build, or (None, None,
+    why).
+
+    `want` is a dict with any of timestamp / image_size / checksum. Only the
+    keys actually present are compared, and `how` names them -- so a match on
+    size alone can never read as a match on the TimeDateStamp.
+
+    Three outcomes, never two. Zero survivors is INCONCLUSIVE and NAMES THE
+    TIMESTAMP, because "no backup has that stamp" is the actionable fact (the
+    build was never backed up, or it came from a worktree that is gone). More
+    than one survivor is INCONCLUSIVE too -- unless the survivors are
+    byte-identical, which happens routinely because a redeploy of an unchanged
+    artifact makes another .bak.
+    """
+    keys = [k for k in ("timestamp", "image_size", "checksum")
+            if want.get(k) is not None]
+    if not keys:
+        return None, None, ("nothing identifies the loaded build (no "
+                            "TimeDateStamp, SizeOfImage or CheckSum was "
+                            "read from the dump), so no file was matched")
+    idents = []
+    for p in candidates:
+        i = pe_ident(p)
+        if i is not None:
+            idents.append(i)
+    if not idents:
+        return None, None, ("no candidate file on disk is a PE at all "
+                            "(%d path(s) looked at)" % len(candidates))
+    hits = [i for i in idents if all(i[k] == want[k] for k in keys)]
+    shown = "TimeDateStamp 0x%08X" % want["timestamp"] if "timestamp" in keys \
+        else "SizeOfImage 0x%X" % (want.get("image_size") or 0)
+    if not hits:
+        return None, None, (
+            "INCONCLUSIVE: none of the %d candidate build(s) on disk has %s "
+            "(also compared: %s). The loaded build was not backed up, or its "
+            "backup has been deleted -- so its addresses were NOT symbolised, "
+            "and nothing below should be read as if they had been."
+            % (len(idents), shown,
+               ", ".join("%s=%s" % (k, hex(want[k])) for k in keys)))
+    if len(hits) > 1:
+        digests = set()
+        for i in hits:
+            d = hasher(i["path"])
+            digests.add(d if d is not None else i["path"])
+        if len(digests) == 1:
+            return (hits[0]["path"],
+                    "matched %s; %d byte-identical copies, used the first"
+                    % (", ".join(keys), len(hits)), None)
+        return None, None, (
+            "INCONCLUSIVE: %d DIFFERENT files share %s (%s) -- the loaded "
+            "build cannot be told apart from them, so no symbols were used: %s"
+            % (len(hits), shown, ", ".join(keys),
+               ", ".join(os.path.basename(i["path"]) for i in hits[:6])))
+    return hits[0]["path"], "matched %s" % ", ".join(
+        "%s=0x%X" % (k, want[k]) for k in keys), None
+
+
+def find_objdump(path=None):
+    """(objdump path, note) or (None, why). Never guesses that one exists."""
+    if path and os.path.isfile(path):
+        return path, None
+    if os.path.isfile(OBJDUMP_EXE):
+        return OBJDUMP_EXE, None
+    import shutil as _sh
+    p = _sh.which("objdump")
+    if p:
+        return p, "using objdump from PATH: %s" % p
+    return None, ("objdump.exe is NOT present at %s and not on PATH, so the "
+                  "host/mod frames were NOT symbolised. Install msys2's "
+                  "binutils." % OBJDUMP_EXE)
+
+
+def objdump_symbol_text(dll, objdump=None, runner=None, timeout=180):
+    """(raw `objdump -t` text, note). None for the text means it did not run.
+
+    Run through cctool's environment so objdump's own directory leads PATH.
+    """
+    exe, note = find_objdump(objdump)
+    if exe is None:
+        return None, note
+    if runner is not None:
+        rc, text = runner([exe, "-t", dll])
+    else:
+        try:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            import cctool
+            r = cctool.cc_run([exe, "-t", dll], timeout=timeout)
+        except Exception as e:
+            return None, ("objdump could not be run (%s: %s)"
+                          % (type(e).__name__, e))
+        rc, text = r.returncode, (r.stdout or "") + (r.stderr or "")
+    if rc != 0 or "SYMBOL TABLE" not in (text or ""):
+        return None, ("objdump -t exited %s without a SYMBOL TABLE for %s -- "
+                      "the frames were NOT symbolised. Output began: %s"
+                      % (rc, os.path.basename(dll),
+                         (text or "").strip()[:200]))
+    return text, note
+
+
+def parse_objdump_symbols(text, sections):
+    """[(rva, name), ...] sorted, for CODE sections only.
+
+    An objdump symbol address is SECTION-RELATIVE and `(sec N)` is 1-based into
+    the PE section table -- getting that wrong shifts every name by the section
+    RVA, which produces plausible wrong function names rather than an error.
+    """
+    out = []
+    for line in (text or "").splitlines():
+        m = OBJDUMP_SYM_RX.match(line.rstrip())
+        if not m:
+            continue
+        sec = int(m.group(1))
+        if sec < 1 or sec > len(sections):
+            continue                       # -1/0 = absolute/undefined
+        s = sections[sec - 1]
+        if not s.get("code"):
+            continue
+        name = m.group(5).strip()
+        if not name or name.startswith("."):
+            continue
+        out.append((s["rva"] + int(m.group(4), 16), name))
+    out.sort()
+    return out
+
+
+class HostSymbols(object):
+    """Nearest-preceding-symbol lookup over one build's COFF symbol table."""
+
+    def __init__(self, dll, symbols, how=None, sections=None):
+        self.dll = dll
+        self.how = how
+        self.symbols = symbols
+        self.sections = sections or []
+        self._keys = [r for r, _n in symbols]
+
+    def in_code(self, rva):
+        """Is this RVA inside a CODE section of the build?
+
+        The check that stops the worst answer this class could give. Without
+        it, a .data address scraped off the stack (0x39E040 in the measured
+        dump) falls after the last .text symbol and is reported as
+        `__add_nanbits_D2A+0xF8630` -- a real function name, a plausible
+        offset, and entirely fictional. If the section table is unavailable the
+        answer is None (unknown), never True.
+        """
+        if not self.sections:
+            return None
+        for s in self.sections:
+            if s["rva"] <= rva < s["rva"] + max(s["size"], 1):
+                return bool(s.get("code"))
+        return False
+
+    def lookup(self, rva):
+        """(name, offset) or None. None means the RVA is outside every code
+        section, or before every symbol -- said, never fabricated."""
+        if not self._keys or self.in_code(rva) is False:
+            return None
+        i = bisect.bisect_right(self._keys, rva) - 1
+        if i < 0:
+            return None
+        r, n = self.symbols[i]
+        return n, rva - r
+
+    def label(self, rva):
+        got = self.lookup(rva)
+        if got is None:
+            return ("(no preceding symbol -- RVA 0x%X is before every code "
+                    "symbol in this build)" % rva)
+        return "%s+0x%X" % got
+
+
+def load_host_symbols(want, stem, install_root=DEFAULT_INSTALL,
+                      repo_mods=None, objdump=None, objdump_runner=None,
+                      candidates=None, hasher=_sha256):
+    """(HostSymbols, note) or (None, why). The whole steps 1+2 in one call."""
+    cands = (candidates if candidates is not None
+             else build_candidates(stem, install_root, repo_mods))
+    if not cands:
+        return None, ("INCONCLUSIVE: no file named %s.dll* exists under %s or "
+                      "%s, so nothing could be matched against the dump's "
+                      "module list" % (stem, install_root, repo_mods
+                                       or DEFAULT_REPO_MODS))
+    path, how, why = match_build(want, cands, hasher=hasher)
+    if path is None:
+        return None, why
+    ident = pe_ident(path)
+    text, note = objdump_symbol_text(path, objdump=objdump,
+                                     runner=objdump_runner)
+    if text is None:
+        return None, "%s (build matched: %s)" % (note, os.path.basename(path))
+    syms = parse_objdump_symbols(text, ident["sections"])
+    if not syms:
+        return None, ("objdump -t on %s listed no code-section symbols, so "
+                      "nothing was symbolised" % os.path.basename(path))
+    return HostSymbols(path, syms,
+                       "%s (%s; %d code symbols)"
+                       % (os.path.basename(path), how, len(syms)),
+                       sections=ident["sections"]), note
+
+
+# -- cdb: the module list, the scraped stack, and the mimalloc string --------
+
+def cdb_run(dmp, commands, cdb=None, runner=None, timeout=300):
+    """(text, note). None for the text means cdb did not run."""
+    exe = cdb or CDB_EXE
+    if runner is not None:
+        rc, text = runner([exe, "-z", dmp, "-c", commands])
+        return (text, None) if text is not None else (None, "no cdb output")
+    if not os.path.isfile(exe):
+        return None, ("cdb.exe is NOT installed at %s, so the dump's module "
+                      "list and stack were not read (Windows SDK Debugging "
+                      "Tools)." % exe)
+    try:
+        r = subprocess.run([exe, "-z", dmp, "-c", commands],
+                           capture_output=True, text=True, timeout=timeout)
+    except Exception as e:
+        return None, ("cdb exists but could not be run (%s: %s)"
+                      % (type(e).__name__, e))
+    return (r.stdout or "") + (r.stderr or ""), None
+
+
+def parse_lmv(text):
+    """{stem: {...}} from `lmv` output: base, end, path, timestamp, image_size,
+    checksum. Keys absent from the output stay absent -- never defaulted."""
+    mods = {}
+    cur = None
+    for raw in (text or "").splitlines():
+        line = raw.rstrip()
+        m = LMV_HEAD_RX.match(line)
+        if m and not line.startswith(" "):
+            base, end = _unhex(m.group(1)), _unhex(m.group(2))
+            if base is None:
+                cur = None
+                continue
+            cur = {"stem": m.group(3), "base": base, "end": end}
+            mods[m.group(3)] = cur
+            continue
+        if cur is None:
+            continue
+        kv = LMV_KV_RX.match(line)
+        if not kv:
+            continue
+        key, val = kv.group(1).strip().lower(), kv.group(2)
+        if key == "image path":
+            cur["path"] = val
+        elif key == "image name":
+            cur["name"] = val
+        elif key == "timestamp":
+            m2 = re.search(r"\(([0-9A-Fa-f]{8})\)", val)
+            if m2:
+                cur["timestamp"] = int(m2.group(1), 16)
+        elif key == "imagesize":
+            cur["image_size"] = _unhex(val)
+        elif key == "checksum":
+            cur["checksum"] = _unhex(val)
+    return mods
+
+
+def parse_dps(text, modules=None):
+    """[(stack_addr, va, stem, module_offset), ...] in stack order.
+
+    THIS IS A SCRAPE. It is every qword on the stack that cdb annotated as
+    living inside a module, which includes stale return addresses from calls
+    that already returned. It is not a walk and callers must not print it as
+    one.
+    """
+    out = []
+    for raw in (text or "").splitlines():
+        m = DPS_RX.match(raw.rstrip())
+        if not m:
+            continue
+        sp, va = _unhex(m.group(1)), _unhex(m.group(2))
+        if sp is None or va is None:
+            continue
+        stem = m.group(3)
+        if modules is not None and stem not in modules:
+            continue
+        out.append((sp, va, stem, int(m.group(4), 16)))
+    return out
+
+
+def parse_registers(text):
+    """{'rcx': int, ...} from an `.ecxr` register dump."""
+    regs = {}
+    for m in re.finditer(r"\b(r[a-z0-9]{1,3}|[er][a-z]{2})=([0-9a-fA-F`]{8,16})\b",
+                         text or ""):
+        v = _unhex(m.group(2))
+        if v is not None:
+            regs.setdefault(m.group(1), v)
+    return regs
+
+
+def mimalloc_message(dmp, regs, cdb=None, runner=None):
+    """(string, note) -- the assertion/abort text, or (None, why).
+
+    `da` on each argument register; keep the longest printable result that
+    looks like a sentence. Nothing is inferred from the function name: if `da`
+    yields no string, this says so and names nothing.
+    """
+    cands = [(r, regs[r]) for r in ARG_REGS
+             if regs.get(r) and regs[r] > 0x10000]
+    if not cands:
+        return None, ("no argument register held a plausible pointer, so no "
+                      "`da` was attempted")
+    cmds = "; ".join("da 0x%X L40" % v for _r, v in cands) + "; q"
+    text, note = cdb_run(dmp, cmds, cdb=cdb, runner=runner)
+    if text is None:
+        return None, note or "cdb did not run, so no string was read"
+    found = []
+    for raw in (text or "").splitlines():
+        m = DA_RX.match(raw.rstrip())
+        if not m:
+            continue
+        s = m.group(1).strip()
+        if len(s) >= 8 and sum(ch.isalpha() for ch in s) >= 5:
+            found.append(s)
+    if not found:
+        return None, ("`da` on %s yielded no printable string, so the "
+                      "assertion text was NOT recovered (it is not guessed "
+                      "from the function name)"
+                      % ", ".join(r for r, _v in cands))
+    found.sort(key=len, reverse=True)
+    return found[0], None
+
+
+# -- the command ------------------------------------------------------------
+
+def _our_stems(ours=None):
+    return set(m.lower().replace("_", "-")
+               for m in (ours if ours is not None else our_modules()))
+
+
+def _stem_of(mod):
+    return str(mod).lower().replace("_", "-")
+
+
+def symbolize_host_dump(dmp, ours=None, install_root=DEFAULT_INSTALL,
+                        repo_mods=None, cdb=None, objdump=None,
+                        cdb_runner=None, objdump_runner=None, indent="   ",
+                        scrape_words=0x400, cdb_text=None, dps_text=None):
+    """The `symbolize-host` block, as a list of lines.
+
+    Every step states its own outcome, including "not performed". `cdb_text` /
+    `dps_text` are injected by the tests so the whole pipeline is exercised
+    against recorded output with no debugger present.
+    """
+    lines = ["HOST/MOD SYMBOLISATION of %s" % dmp]
+    stems = _our_stems(ours)
+    if cdb_text is None:
+        cdb_text, note = cdb_run(
+            dmp, ".ecxr; k 40; lm 1m; lmv m aowlspt*; lmv m *; q",
+            cdb=cdb, runner=cdb_runner)
+        if cdb_text is None:
+            lines.append(indent + "NOT PERFORMED -- " + (note or "unstated"))
+            return lines
+    mods = parse_lmv(cdb_text)
+    ourmods = {s: m for s, m in mods.items() if _stem_of(s) in stems}
+    if not ourmods:
+        lines.append(indent + "no module of ours is in the dump's module list "
+                             "(%d module(s) listed), so there is nothing here "
+                             "to symbolise" % len(mods))
+        return lines
+    regs = parse_registers(cdb_text)
+
+    # Step 1+2: match each of our loaded modules to a build on disk and load
+    # its COFF symbols.
+    symtabs, base_of = {}, {}
+    for stem, m in sorted(ourmods.items()):
+        base_of[stem] = m.get("base")
+        want = dict((k, m[k]) for k in ("timestamp", "image_size", "checksum")
+                    if m.get(k) is not None)
+        hs, why = load_host_symbols(want, _stem_of(stem),
+                                    install_root=install_root,
+                                    repo_mods=repo_mods, objdump=objdump,
+                                    objdump_runner=objdump_runner)
+        if hs is None:
+            lines.append(indent + "%s @ 0x%X: %s"
+                         % (stem, m.get("base") or 0, why))
+            continue
+        symtabs[stem] = hs
+        lines.append(indent + "%s @ 0x%X -> %s" % (stem, m.get("base") or 0,
+                                                   hs.how))
+        if why:
+            lines.append(indent + "    " + why)
+    if not symtabs:
+        lines.append(indent + "no build was matched, so NOTHING below is "
+                              "symbolised")
+        return lines
+
+    def label(stem, va, why=False):
+        hs, base = symtabs.get(stem), base_of.get(stem)
+        if hs is None or base is None:
+            return None
+        rva = va - base
+        got = hs.lookup(rva)
+        if got is not None:
+            return "%s+0x%X" % got
+        if not why:
+            return None
+        # Saying WHICH of the two it is matters: a data address on the stack is
+        # a local, not a return address, and reporting it as a function is the
+        # exact failure this check exists to prevent.
+        return ("(not code -- RVA 0x%X is in a data section, so it is a local "
+                "or a heap pointer, not a return address)" % rva
+                if hs.in_code(rva) is False
+                else "(no preceding code symbol for RVA 0x%X)" % rva)
+
+    # The walked frames cdb did produce, symbolised.
+    walked = []
+    seen_k = False
+    for raw in (cdb_text or "").splitlines():
+        line = raw.strip()
+        if line.startswith("Child-SP"):
+            seen_k = True
+            continue
+        if not seen_k or not line:
+            continue
+        m = re.search(r"(\S+)\+0x([0-9a-fA-F]+)$", line)
+        if not m:
+            if walked:
+                break
+            continue
+        stem = m.group(1)
+        if stem not in ourmods:
+            walked.append((stem, None, line))
+            continue
+        va = (base_of.get(stem) or 0) + int(m.group(2), 16)
+        walked.append((stem, va, line))
+    lines.append(indent + "cdb walked %d frame(s):" % len(walked))
+    for stem, va, raw in walked[:20]:
+        lab = label(stem, va) if va is not None else None
+        lines.append(indent + "    %s%s" % (raw, ("   -> " + lab) if lab else ""))
+    if not walked:
+        lines.append(indent + "    (none -- the walk produced no frames)")
+
+    # Step 3: the scrape, only worth doing when the walk collapsed.
+    if len(walked) <= 2:
+        if dps_text is None:
+            dps_text, dnote = cdb_run(dmp, ".ecxr; dps @rsp L%X; q"
+                                      % scrape_words, cdb=cdb,
+                                      runner=cdb_runner)
+            if dps_text is None:
+                lines.append(indent + "SCRAPE NOT PERFORMED -- "
+                             + (dnote or "unstated"))
+                dps_text = ""
+        rows = parse_dps(dps_text, modules=ourmods)
+        lines.append(indent + "the walk yielded %d frame(s), so `dps @rsp "
+                              "L%X` was SCRAPED instead. THIS IS A SCRAPE, NOT "
+                              "A WALK: it is every stack word pointing into "
+                              "one of our modules, in address order, and it "
+                              "can include stale return addresses from calls "
+                              "that already returned."
+                     % (len(walked), scrape_words))
+        if not rows:
+            lines.append(indent + "    no stack word pointed into one of our "
+                                  "modules")
+        shown = [r for r in rows if label(r[2], r[1]) is not None]
+        dropped = len(rows) - len(shown)
+        for sp, va, stem, off in shown[:40]:
+            lines.append(indent + "    [rsp+0x%-5x] 0x%016X %s+0x%X   -> %s"
+                         % (sp - rows[0][0], va, stem, off,
+                            label(stem, va, why=True)))
+        if len(shown) > 40:
+            lines.append(indent + "    ... %d more scraped word(s)"
+                         % (len(shown) - 40))
+        if dropped:
+            lines.append(indent + "    (%d further word(s) pointed into a "
+                                  "DATA section of one of our modules and are "
+                                  "not shown: they are locals or heap "
+                                  "pointers, not return addresses)" % dropped)
+
+    # Step 4: mimalloc.
+    site = None
+    for stem, va, _raw in walked:
+        if va is not None:
+            site = label(stem, va)
+            break
+    if site is None and regs.get("rip") is not None:
+        for stem in symtabs:
+            b = base_of.get(stem) or 0
+            m = ourmods[stem]
+            if b <= regs["rip"] < (m.get("end") or (b + (m.get("image_size")
+                                                         or 0))):
+                site = label(stem, regs["rip"])
+                break
+    if site:
+        lines.append(indent + "crash site: %s" % site)
+    if site and MIMALLOC_FN_RX.match(site):
+        msg, why = mimalloc_message(dmp, regs, cdb=cdb, runner=cdb_runner)
+        if msg:
+            lines.append(indent + "mimalloc: the crash is inside the allocator "
+                                  "and `da` on an argument register reads: %r"
+                         % msg)
+        else:
+            lines.append(indent + "mimalloc: the crash is inside the "
+                                  "allocator, but " + (why or "unstated"))
+    return lines
+
+
+def cmd_symbolize_host(argv):
+    """`crashwatch.py symbolize-host <dmp|Crash_dir>` -- steps 1-4, one call."""
+    rest = list(argv)
+    if not rest:
+        emit("usage: crashwatch.py symbolize-host <crash.dmp | Crash_* dir>")
+        return 2
+    target = rest.pop(0)
+    if os.path.isdir(target):
+        target = os.path.join(target, "crash.dmp")
+    if not os.path.isfile(target):
+        emit("no such dump: %s" % target)
+        return 2
+    for l in symbolize_host_dump(target):
+        emit(l)
+    return 0
+
+
+def host_frames_present(rep, ours=None):
+    """True when a Crash_* report has a frame in one of our modules whose
+    symbol is missing or is dbghelp's nearest-export guess.
+
+    The guess is detectable: dbghelp repeats ONE export name across many
+    different addresses, because our DLLs export very few symbols. Three or
+    more frames sharing a symbol is that, not three calls to one function.
+    """
+    if rep is None or not rep.ok:
+        return False
+    stems = _our_stems(ours)
+    names = {}
+    hit = False
+    for f in rep.all_frames:
+        if _stem_of(f.module) not in stems:
+            continue
+        s = (f.symbol or "").strip()
+        if not s or "not available" in s.lower():
+            hit = True
+        names[s] = names.get(s, 0) + 1
+    return hit or any(v >= 3 for k, v in names.items() if k)
+
+
 def cmd_wer(argv):
     """`crashwatch.py wer [--since EPOCH|ISO] [--minutes N]` -- standalone."""
     since = time.time() - 3600.0
@@ -1885,9 +2612,19 @@ def cmd_wer(argv):
         emit("Crash_* folder newer than launch: %s" % folder)
     else:
         emit("no Crash_* folder newer than that time")
-    lines, _kind, _d = format_wer(since, crash_folder=folder)
+    lines, _kind, d = format_wer(since, crash_folder=folder)
     for l in lines:
         emit(l)
+    # A WER dump of a fail-fast is exactly the case where cdb's `k` collapses
+    # in our modules -- so the host/mod symbolisation runs on it automatically
+    # rather than being a thing someone has to know to ask for.
+    dumps = (d or {}).get("dumps") or []
+    if dumps:
+        for l in symbolize_host_dump(dumps[0]):
+            emit(l)
+    elif folder and os.path.isfile(os.path.join(folder, "crash.dmp")):
+        for l in symbolize_host_dump(os.path.join(folder, "crash.dmp")):
+            emit(l)
     return 0
 
 
@@ -1897,7 +2634,9 @@ def cmd_last(argv):
     root = DEFAULT_CRASH_ROOT
     rest = list(argv)
     sym = "--no-symbolize" not in rest
-    rest = [a for a in rest if a != "--no-symbolize"]
+    host = "--no-host-symbols" not in rest
+    rest = [a for a in rest
+            if a not in ("--no-symbolize", "--no-host-symbols")]
     if rest and rest[0].isdigit():
         n = int(rest.pop(0))
     if rest and rest[0] == "--root":
@@ -1937,6 +2676,17 @@ def cmd_last(argv):
                         emit("      %s -> %s" % (f.addr, s.line()))
                     elif per:
                         emit("      %s -> %s" % (f.addr, per))
+        # AND the half il2cpp_resolve cannot do: our OWN modules. Unity prints
+        # `(function-name not available)` for them, or repeats one export name
+        # across many addresses. Two agents did this by hand on 2026-09-03.
+        if host and host_frames_present(rep):
+            if os.path.isfile(rep.dump):
+                for l in symbolize_host_dump(rep.dump):
+                    emit("      " + l)
+            else:
+                emit("      host/mod frames are unsymbolised in this report, "
+                     "and %s does not exist, so they were NOT symbolised "
+                     "(that is inconclusive, not clean)" % rep.dump)
     return 0
 
 
@@ -1947,6 +2697,8 @@ def main():
         return cmd_last(sys.argv[2:])
     if sys.argv[1:2] == ["wer"]:
         return cmd_wer(sys.argv[2:])
+    if sys.argv[1:2] == ["symbolize-host"]:
+        return cmd_symbolize_host(sys.argv[2:])
     p = argparse.ArgumentParser(
         description="watch the live EFT client's logs; kill + report on a crash",
         formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
