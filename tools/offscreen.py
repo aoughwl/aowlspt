@@ -605,6 +605,24 @@ def _make_window():
     u32.DefWindowProcW.argtypes = [w.HWND, ctypes.c_uint,
                                    ctypes.c_ulonglong, ctypes.c_longlong]
     proc = _WNDPROC(lambda h, m, wp, lp: u32.DefWindowProcW(h, m, wp, lp))
+    # The same rule for the HANDLES. MEASURED 2026-09-05: with no restype,
+    # GetModuleHandleW's 64-bit HMODULE came back truncated to a C int, and
+    # with no argtypes CreateWindowExW then re-converted that hInstance as a
+    # C int and raised `argument 11: OverflowError: int too long to convert`.
+    # The module base moves with ASLR, so this passed on one run and blocked
+    # a deploy on the next -- a flaky gate is worse than none.
+    k32.GetModuleHandleW.restype = w.HMODULE
+    k32.GetModuleHandleW.argtypes = [w.LPCWSTR]
+    u32.RegisterClassW.restype = w.ATOM
+    u32.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASS)]
+    u32.CreateWindowExW.restype = w.HWND
+    u32.CreateWindowExW.argtypes = [w.DWORD, w.LPCWSTR, w.LPCWSTR, w.DWORD,
+                                    ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                    ctypes.c_int, w.HWND, w.HMENU,
+                                    w.HINSTANCE, w.LPVOID]
+    u32.SetLayeredWindowAttributes.restype = w.BOOL
+    u32.SetLayeredWindowAttributes.argtypes = [w.HWND, w.COLORREF, w.BYTE,
+                                               w.DWORD]
     cls = WNDCLASS()
     cls.lpfnWndProc = proc
     cls.hInstance = k32.GetModuleHandleW(None)
@@ -612,7 +630,6 @@ def _make_window():
     if not u32.RegisterClassW(ctypes.byref(cls)):
         if ctypes.get_last_error() != 1410:      # already registered
             raise OSError("RegisterClassW failed")
-    u32.CreateWindowExW.restype = w.HWND
     hwnd = u32.CreateWindowExW(
         0x00080080,        # WS_EX_TOOLWINDOW (no taskbar button) | WS_EX_LAYERED
         "AowlsptOffscreenSelftest", "aowlspt offscreen selftest",
