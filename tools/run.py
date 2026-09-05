@@ -449,6 +449,32 @@ def exit_code(verdict):
     return EXIT.get((verdict or "").split(" ", 1)[0], EXIT["INCONCLUSIVE"])
 
 
+def archive_previous_logs(root):
+    """Copy the previous boot's aowlspt-host.log and aowlspt-backend.log to
+    <root>/Logs/hostlogs/<name>.<mtime>.log before a launch overwrites them.
+    Prints what it did; a failure here is reported, never fatal."""
+    import shutil
+    dst_dir = os.path.join(root, "Logs", "hostlogs")
+    try:
+        os.makedirs(dst_dir, exist_ok=True)
+    except OSError as e:
+        print("host-log archive: could not create %s (%s); not archived" % (dst_dir, e))
+        return
+    for name in ("aowlspt-host.log", "aowlspt-backend.log"):
+        src = os.path.join(install_dir(root), name)
+        if not os.path.isfile(src):
+            continue
+        try:
+            stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(os.path.getmtime(src)))
+            dst = os.path.join(dst_dir, "%s.%s.log" % (name[:-4], stamp))
+            if os.path.exists(dst):
+                continue
+            shutil.copy2(src, dst)
+            print("host-log archive: %s -> %s (%d bytes)" % (name, dst, os.path.getsize(dst)))
+        except OSError as e:
+            print("host-log archive: %s not archived (%s)" % (name, e))
+
+
 def install_dir(root):
     # ONE definition, in runledger, so the ledgers and the logs cannot end up in
     # two different directories.
@@ -1796,6 +1822,14 @@ def main():
         for extra in (args.launcher_arg or []):
             cmd += extra.split(" ", 1) if " " in extra else [extra]
         print("$ %s" % " ".join(cmd), flush=True)
+        # ARCHIVE THE PREVIOUS BOOT'S HOST AND BACKEND LOGS FIRST. The host
+        # rewrites aowlspt-host.log on every start, and the client's own
+        # D:\Aowlspt\Logs\<ts>\ never holds it. MEASURED 2026-09-05: a hung
+        # boot's host log -- the only record of what the host did before the
+        # freeze -- was overwritten by the two bisect boots that followed, so
+        # the graft's timing in the hung boot is unknowable. One copy per
+        # launch, named by the log's own mtime, never blocks the launch.
+        archive_previous_logs(args.root)
         subprocess.Popen(cmd, cwd=install_dir(args.root))
         launched_at = time.time()
         runledger.record_boot(args.root, facts=bfacts, when=launched_at)
