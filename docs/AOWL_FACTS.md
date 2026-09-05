@@ -9862,3 +9862,10 @@ Filed by the coordinator from `tools/factnote.py --drain` (20 rows). Evidence is
 * **The page liveness test scanned `rows[].clone` only (MEASURED)** -- a page between its graft tick and its first row tick owns no row clone, so "lost its clones" fired on every healthy page and reset `beganAt/verdictDone` every visit: zero RENDER VERDICT lines in a 65-minute run. Fixed in 92d8587.
 * **The Settings Game tab has no stock SettingDropDown row (MEASURED, klass census `dropdown=0x0`)** -- `swFindDonor` there can only return nil; the dropdown prefab is `GraphicsSettingsTab._dropDownTemplate@0xB0` on the graphics tab (what dlssrows clones).
 * **`LoadMagazineProcess` (0x768F50/0x768D40) is NOT on the in-raid reload path (MEASURED, `callers`)** -- it is the INVENTORY magazine-fill process, constructed only from `<LoadMagazine>d__51::MoveNext @0x76f070`. The real reload path: `FirearmController::ReloadMag 0x7843E0 / QuickReloadMag 0x784570 -> ReloadExternalMagOperation::Start 0x7B08F0 | ReloadInternalMagBase::Start 0x7B3580 -> FirearmsAnimator::Reload(bool) 0x1C82E80` (13 call sites, 7 NextObservedPlayer); ammo change at `0x7B1C70 / 0x7B45C0 / 0x7B40F0 / 0x7AF550`. All UNIQUE. Full map: docs/AMMO-LOADING-MAP.md.
+
+
+## 2026-09-05: facts relayed by subagents (drained from the factnote relay; tags as the authors set them)
+
+Filed by the coordinator from `tools/factnote.py --drain` (1 row).
+
+* **`tools/il2cpp_symtab.py check` matches a referenced `AOWL_SYM_*` token against the declared symbols EXACTLY first, strips a companion suffix only if the remainder is declared, and blanks comments before scanning (MEASURED, commit 4dee4de)** -- `AOWL_SYM_OBJ_GET_NAME` now resolves to `OBJ_GET_NAME`, not `OBJ_GET`. Evidence: `python tools/il2cpp_symtab.py check D:/Aowlspt/GameAssembly.dll .cache/global-metadata.dec.dat abi/aowlspt_symbols.txt abi/aowlspt_symtab.h` -> PASS, 77 symbols; a scratch `.nim` writing `AOWL_SYM_OBJ_GET` still FAILS with the source line and the near matches `OBJ_GET_INSTANCE_ID/OBJ_GET_NAME/OBJ_SET_NAME`; a comment mention of `AOWL_SYM_TF_GET_CHILD` in the same file is not reported; `tools/test_symtab.py` 8/8 PASS.

@@ -765,7 +765,8 @@
    "markers": [
     "aowl.ammoloading",
     "LoadMagazineProcess::.ctor@0x768D40/ioooiif>x",
-    "ARMED but NEVER FIRED",
+    "ammoloading  NOT ARMED",
+    "installed, never fired",
     "FIRST FIRING: LoadMagazineProcess::Start",
     "ARMED and FIRING",
     "LoadMagazineProcess::Start@0x768F50/i>o",
