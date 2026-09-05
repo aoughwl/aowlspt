@@ -1830,7 +1830,25 @@ def main():
         # the graft's timing in the hung boot is unknowable. One copy per
         # launch, named by the log's own mtime, never blocks the launch.
         archive_previous_logs(args.root)
-        subprocess.Popen(cmd, cwd=install_dir(args.root))
+        # THE CLIENT MUST NOT INHERIT OUR STDIO. MEASURED 2026-09-05 15:20:
+        # `python tools/run.py --keep --until-phase MENU --timeout 300` run
+        # through a PowerShell pipeline (`| Select-Object -Last 8`) printed
+        # nothing for 16 minutes and the pipeline never ended, although the
+        # host log showed MenuScreen::Show at 41 s and run.py itself had
+        # exited: the launcher, and the game it starts, had inherited the
+        # pipe's write handle, so the pipeline waited on the GAME. The same
+        # inheritance is why stopping the shell task that launched a boot has
+        # been measured to take the client down with it. Detached, with its
+        # own process group and no handles of ours, the client outlives any
+        # shell, and this script's verdict reaches its caller when it lands.
+        flags = 0
+        if os.name == "nt":
+            flags = (subprocess.CREATE_NEW_PROCESS_GROUP |
+                     getattr(subprocess, "DETACHED_PROCESS", 0x00000008))
+        subprocess.Popen(cmd, cwd=install_dir(args.root),
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, close_fds=True,
+                         creationflags=flags)
         launched_at = time.time()
         runledger.record_boot(args.root, facts=bfacts, when=launched_at)
 
