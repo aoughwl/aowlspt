@@ -293,18 +293,19 @@ proc arStashWornGear*(p: var Profile; moved: var int; why: var string): bool =
 # Stripping
 # ---------------------------------------------------------------------------
 
-proc arStripIds*(itemsJson: string; minted: seq[string];
-                 stripped: var int): string =
+proc arStripIdsD*(itemsJson: string; minted: seq[string];
+                  stripped: var int; doomed: var seq[string]): string =
   ## Remove every subtree rooted at a recorded minted id. Returns the new item
   ## array text; `stripped` counts the ROOTS actually found (a root that is not
   ## there -- lost in the raid, sold, never delivered -- is counted as absent,
-  ## not as an error).
+  ## not as an error). `doomed` comes back as every id removed -- roots AND
+  ## descendants -- so the caller can prune REFERENCES to them elsewhere.
   stripped = 0
   result = itemsJson
   var inv = openInventory(itemsJson)
   if not inv.items.ok:
     return
-  var doomed: seq[string] = @[]
+  doomed = @[]
   for id in minted:
     if id.len == 0:
       continue
@@ -327,6 +328,117 @@ proc arStripIds*(itemsJson: string; minted: seq[string];
     add(kept, inv.items.items[i])
   result = text(kept)
 
+proc arStripIds*(itemsJson: string; minted: seq[string];
+                 stripped: var int): string =
+  ## `arStripIdsD` without the doomed list, for callers that only need the
+  ## item array back.
+  var doomed: seq[string] = @[]
+  result = arStripIdsD(itemsJson, minted, stripped, doomed)
+
+# ---------------------------------------------------------------------------
+# References OUTSIDE the item array.
+#
+# MEASURED 2026-09-05, the first live raid with a spawned kit: the END VERDICT
+# found 3 of 29 minted ids surviving the save, and all three were KEYS of
+# `CheckedMagazines` -- the map the client posts back at match end for the
+# magazines it inspected in the raid. A dangling item id there is the
+# "Cannot find ... for item" class of client throw, so every place the profile
+# can name an item id is pruned with the same doomed set. Each helper is pure
+# over JSON text, returns the input unchanged when nothing matched, and is
+# exercised by `selfCheckRaidLoadout` with a positive AND a negative case.
+# ---------------------------------------------------------------------------
+
+proc arPruneObjectKeys*(objText: string; doomed: seq[string];
+                        pruned: var int): string =
+  ## `{"<itemId>": v, ...}` (CheckedMagazines) without the doomed keys.
+  result = objText
+  let j = whole(objText)
+  if not isObject(j):
+    return
+  var o = obj()
+  var hit = 0
+  for k in keys(j):
+    if arHas(doomed, k):
+      inc hit
+      continue
+    put(o, k, raw(field(j, k).raw))
+  if hit == 0:
+    return
+  pruned = pruned + hit
+  result = done(o).text
+
+proc arPruneObjectValues*(objText: string; doomed: seq[string];
+                          pruned: var int): string =
+  ## `{"<slot>": "<itemId>", ...}` (Inventory.fastPanel) without the entries
+  ## whose VALUE is a doomed id.
+  result = objText
+  let j = whole(objText)
+  if not isObject(j):
+    return
+  var o = obj()
+  var hit = 0
+  for k in keys(j):
+    let v = field(j, k).asText("")
+    if v.len > 0 and arHas(doomed, v):
+      inc hit
+      continue
+    put(o, k, raw(field(j, k).raw))
+  if hit == 0:
+    return
+  pruned = pruned + hit
+  result = done(o).text
+
+proc arPruneList*(listText: string; doomed: seq[string]; keyField: string;
+                  pruned: var int): string =
+  ## `["<itemId>", ...]` (keyField == "", favoriteItems) or
+  ## `[{"<keyField>": "<itemId>", ...}, ...]` (InsuredItems.itemId) without
+  ## the entries that name a doomed id.
+  result = listText
+  let j = whole(listText)
+  if not isArray(j):
+    return
+  var l = newList()
+  var hit = 0
+  let n = count(j)
+  for i in 0 ..< n:
+    let e = at(j, i)
+    let id = if keyField.len == 0: e.asText("") else: e.field(keyField).asText("")
+    if id.len > 0 and arHas(doomed, id):
+      inc hit
+      continue
+    add(l, e.raw)
+  if hit == 0:
+    return
+  pruned = pruned + hit
+  result = text(l)
+
+proc arPruneReferences*(updated: var Profile; doomed: seq[string]): int =
+  ## Apply the three prunes to the profile about to be saved. Returns how many
+  ## references went; zero is the ordinary case and is not a failure.
+  result = 0
+  if doomed.len == 0:
+    return
+  let cm = updated.field("CheckedMagazines")
+  if cm.found and isObject(cm):
+    let t = arPruneObjectKeys(cm.raw, doomed, result)
+    if t != cm.raw:
+      setRaw(updated, "CheckedMagazines", t)
+  let fp = updated.field("Inventory.fastPanel")
+  if fp.found and isObject(fp):
+    let t = arPruneObjectValues(fp.raw, doomed, result)
+    if t != fp.raw:
+      setRaw(updated, "Inventory.fastPanel", t)
+  let fav = updated.field("Inventory.favoriteItems")
+  if fav.found and isArray(fav):
+    let t = arPruneList(fav.raw, doomed, "", result)
+    if t != fav.raw:
+      setRaw(updated, "Inventory.favoriteItems", t)
+  let ins = updated.field("InsuredItems")
+  if ins.found and isArray(ins):
+    let t = arPruneList(ins.raw, doomed, "itemId", result)
+    if t != ins.raw:
+      setRaw(updated, "InsuredItems", t)
+
 proc arStripBeforeSave*(updated: var Profile; profileId: string;
                         minted: var seq[string]): bool =
   ## Called from `onMatchEnd` on the profile that is ABOUT to be saved.
@@ -345,12 +457,25 @@ proc arStripBeforeSave*(updated: var Profile; profileId: string;
   if minted.len == 0:
     return false
   var stripped = 0
+  var doomed: seq[string] = @[]
   let itemsJson = updated.field("Inventory.items").raw
-  let after = arStripIds(itemsJson, minted, stripped)
+  let after = arStripIdsD(itemsJson, minted, stripped, doomed)
   if stripped > 0:
     setRaw(updated, "Inventory.items", after)
+  # The recorded set covers roots; what the client posted back may reference
+  # any descendant too (a magazine inside the minted rifle). Prune by the
+  # recorded ids AND everything the strip removed.
+  var refs = minted
+  for d in doomed:
+    if not arHas(refs, d):
+      refs.add d
+  let pruned = arPruneReferences(updated, refs)
   info "autoraid loadout: STRIPPED " & $stripped & " of " & $minted.len &
-       " minted item(s)"
+       " minted item(s)" &
+       (if pruned > 0: ", and " & $pruned & " reference(s) to them outside " &
+                       "Inventory.items (CheckedMagazines / fastPanel / " &
+                       "favoriteItems / InsuredItems)"
+        else: "")
   discard arClearMinted(profileId)
   result = true
 
@@ -707,6 +832,50 @@ proc selfCheckRaidLoadout*(into: var seq[string]): bool =
     result = false
   if arItemIds(untouched).len != 5:
     into.add "raidloadout: stripping an absent id changed the item array"
+    result = false
+
+  # 5. References OUTSIDE the item array go with the items -- and ONLY the
+  #    doomed ones. The positive half: a CheckedMagazines key, a fastPanel
+  #    value and an InsuredItems entry naming a doomed id are pruned while
+  #    their neighbours survive. The negative half: a doomed set that names
+  #    nothing present leaves every text byte-identical and counts zero.
+  let doomedIds = @["mag00000000000000000000m"]
+  var pruned5 = 0
+  let cm = arPruneObjectKeys(
+    "{\"mag00000000000000000000m\":2,\"keep0000000000000000000k\":1}",
+    doomedIds, pruned5)
+  if cm.contains("mag00000000000000000000m") or
+     not cm.contains("keep0000000000000000000k"):
+    into.add "raidloadout: CheckedMagazines prune kept a doomed key or " &
+             "dropped an owned one: " & cm
+    result = false
+  let fp = arPruneObjectValues(
+    "{\"4\":\"mag00000000000000000000m\",\"5\":\"keep0000000000000000000k\"}",
+    doomedIds, pruned5)
+  if fp.contains("mag00000000000000000000m") or
+     not fp.contains("keep0000000000000000000k"):
+    into.add "raidloadout: fastPanel prune kept a doomed value or dropped " &
+             "an owned one: " & fp
+    result = false
+  let ins = arPruneList(
+    "[{\"tid\":\"t\",\"itemId\":\"mag00000000000000000000m\"}," &
+    "{\"tid\":\"t\",\"itemId\":\"keep0000000000000000000k\"}]",
+    doomedIds, "itemId", pruned5)
+  if ins.contains("mag00000000000000000000m") or
+     not ins.contains("keep0000000000000000000k"):
+    into.add "raidloadout: InsuredItems prune kept a doomed entry or " &
+             "dropped an owned one: " & ins
+    result = false
+  if pruned5 != 3:
+    into.add "raidloadout: three references to a doomed id should count 3, " &
+             "counted " & $pruned5
+    result = false
+  var pruned5n = 0
+  let cmSame = "{\"keep0000000000000000000k\":1}"
+  if arPruneObjectKeys(cmSame, @["nothere0000000000000000n"], pruned5n) != cmSame or
+     pruned5n != 0:
+    into.add "raidloadout: pruning an absent id changed CheckedMagazines or " &
+             "counted a reference"
     result = false
 
   # 4. The no-room refusal. A full grid must have nowhere to put worn gear --

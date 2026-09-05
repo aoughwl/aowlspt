@@ -429,11 +429,26 @@ What the exit needed, and what the offline map had wrong:
   the outer `AutoRaid EXIT VERDICT` therefore accepts any not-DEPLOYED phase and
   keeps "still DEPLOYED" as the disagreement that yields INCONCLUSIVE.
 
+4. **The loadout handshake, end to end** (old item 6), boots 7 and 8 with
+   `loadoutMode: spawned`: `autoraid.loadout.apply` emitted from INSIDE
+   `tarkov.profile.listing` (cycle 2 of the boot), the kit minted into the
+   document that /client/game/profile/list then served, and at match end the
+   CLIENT posted every minted id back (29, then 31) -- which is the only proof
+   that the kit reached it for THAT raid. Then `STRIPPED 31 of 31 ... and 4
+   reference(s) ... (CheckedMagazines ...)` and `END VERDICT PASS -- none of
+   31 minted id(s) occurs anywhere in the saved profile`. Two defects the
+   verdicts caught on boot 7 and fixed for boot 8: the minter compared a
+   magazine NAME against the weapon's filter of template ids (`resolveNamed`
+   now resolves `magazine`/`ammo` names like `query`), and the strip left the
+   minted ids as KEYS of `CheckedMagazines`, which the client posts back for
+   magazines it inspected (`arPruneReferences` now prunes CheckedMagazines,
+   fastPanel, favoriteItems and InsuredItems by the doomed set). MEASURED
+   also: the client fetches profile/list again right after match end, so a
+   FRESH kit is minted at that listing for the next raid, and the second
+   listing of that menu answers "ALREADY ACTIVE" (idempotent, by design).
+
 Still NOT verified:
 
-6. **The loadout handshake** -- `tarkov.profile.listing` emitted synchronously
-   before the profile is serialised, and an apply from inside it landing in
-   that same document. Nothing has run with `loadoutMode: spawned` yet.
 7. **The map menu on a key** (flow B) and the region participant drawing:
    `hotkeys` has stayed off.
 

@@ -273,6 +273,35 @@ proc canonicalSlot*(name: string): string =
       return s
   result = ""
 
+proc resolveNamed(q: string; why: var string): string =
+  ## `magazine` / `ammo` -> ONE template id, by the rule `resolve` applies to
+  ## `query`: a 24-hex id is kept verbatim (its existence is checked at mint
+  ## time, as before), a NAME must match exactly one item, and ambiguity is
+  ## refused with the candidates named. MEASURED 2026-09-05, first spawned kit
+  ## in a live raid: the shipped AK-74N entry names its magazine ("6L20
+  ## 30-round magazine"), that text went verbatim into the mod_magazine
+  ## filter check, and the rifle spawned with NO magazine under the refusal
+  ## "filter does not admit 6l20 30-round magazine" -- a name compared against
+  ## template ids can never be admitted. Resolving here is what makes a name
+  ## in these two fields mean what the kit's own comments say it means.
+  why = ""
+  if q.len == 24 and isTemplateId(q):
+    return toLowerAscii(q)
+  var matched = 0
+  let hits = searchItemsCounted(q, 8, matched)
+  if hits.len == 0:
+    why = "no item matches \"" & q & "\""
+    return ""
+  if matched > 1:
+    var names = ""
+    for h in hits:
+      if names.len > 0: names.add "; "
+      names.add h.name & " (" & h.tpl & ")"
+    why = "\"" & q & "\" matches " & $matched &
+          " items -- narrow it or paste an id: " & names
+    return ""
+  result = hits[0].tpl
+
 proc parseSpec*(body: string; profileId: var string; clear: var bool;
                 problems: var seq[string]): seq[GearReq] =
   ## The spec, taken apart. Every malformed entry is NAMED and dropped rather
@@ -315,8 +344,8 @@ proc parseSpec*(body: string; profileId: var string; clear: var bool;
       problems.add "gear[" & $i & "] (" & r.query & ") asks for " & $r.count &
                    "; " & $MaxCountPerRequest & " is the cap"
       continue
-    r.ammo = toLowerAscii(e.field("ammo").asText(""))
-    r.magazine = toLowerAscii(e.field("magazine").asText(""))
+    r.ammo = e.field("ammo").asText("")
+    r.magazine = e.field("magazine").asText("")
     if r.magazine.len > 0 and r.ammo.len == 0:
       problems.add "gear[" & $i & "] (" & r.query & ") names a `magazine` but " &
                    "no `ammo`. A mounted magazine with nothing in it is a " &
@@ -324,6 +353,21 @@ proc parseSpec*(body: string; profileId: var string; clear: var bool;
                    "raid from the magazine never having been mounted -- say " &
                    "which round it holds."
       continue
+    # Both may be names (see `resolveNamed`); an id passes through unchanged.
+    if r.magazine.len > 0:
+      var wMag = ""
+      let magTpl = resolveNamed(r.magazine, wMag)
+      if magTpl.len == 0:
+        problems.add "gear[" & $i & "] (" & r.query & ") `magazine`: " & wMag
+        continue
+      r.magazine = magTpl
+    if r.ammo.len > 0:
+      var wAmmo = ""
+      let ammoTpl = resolveNamed(r.ammo, wAmmo)
+      if ammoTpl.len == 0:
+        problems.add "gear[" & $i & "] (" & r.query & ") `ammo`: " & wAmmo
+        continue
+      r.ammo = ammoTpl
     # `chamber` defaults to true when ammo was named. The default is only ACTED
     # ON if the template really declares `_props.Chambers`; `chamberName` below
     # is what decides that, so asking for a chamber on a magazine is a no-op
