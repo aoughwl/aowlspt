@@ -39,7 +39,8 @@
 # identical one-instruction bodies get folded), so neither may be detoured.
 #
 # WHAT IS PROVEN, and is what this module gates on:
-#   S1  the borrowed GameWorld cache is non-null and readable
+#   S1  the borrowed GameWorld cache is non-null, readable AND Unity-alive
+#       (m_CachedPtr non-zero) -- after a raid the cache outlives the world
 #   S2  GameWorld.MainPlayer is non-null, readable AND UNITY-ALIVE. Unity's fake
 #       null keeps a destroyed object readable with m_CachedPtr zeroed, so
 #       readability alone is not liveness (this is the check ESP did not have).
@@ -240,7 +241,14 @@ proc rpTickBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_rp_tick_body", cdecl.}
   gRpS5 = rpCameraMain() != nil
 
   let gw = gDuGameWorld
-  gRpS1 = bdOk(gw, cBdOffMainPlayer() + 8'i32)
+  # S1 is READABLE **AND UNITY-ALIVE**. MEASURED 2026-09-05 (six auto raids):
+  # after a raid the borrowed cache still points at a GameWorld whose page is
+  # readable, so S1 stayed true at the rebuilt MAIN MENU and this reported
+  # LOADING for as long as the process lived -- never MENU again. The same
+  # fake-null test S2 applies to the player applies to the world: a destroyed
+  # UnityEngine.Object keeps its managed shell with m_CachedPtr zeroed.
+  gRpS1 = bdOk(gw, cBdOffMainPlayer() + 8'i32) and bdSanePtr(gw) and
+          iUnityAlive(gw)
   var you: Il2CppPtr = nil
   if gRpS1:
     you = cReadPtrAt(gw, cBdOffMainPlayer())

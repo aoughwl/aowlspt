@@ -253,13 +253,14 @@ proc onMainTick(payload: string): string =
       let stg = exitmachine.stage()
       if stg == "DONE":
         gExitVerdict = true
-        # MEASURED 2026-09-05 (cycle 6): the host's phase reads LOADING at the
-        # main menu after a raid, and stays there -- its cached GameWorld
-        # outlives the raid, so its S1 "no GameWorld" route to MENU never
-        # fires post-raid. The tree (an ACTIVE PlayButton, MenuScreen::Show
-        # with a real profile 0.3 s earlier) is the finished state. The phase
-        # is kept as the ONE cross-check that can still fail: a host that
-        # still says DEPLOYED contradicts the tree and neither is trusted.
+        # The tree (an ACTIVE PlayButton, MenuScreen::Show with a real profile
+        # 0.3 s earlier) is the finished state. The host phase is the ONE
+        # cross-check that can still fail: a host that still says DEPLOYED
+        # contradicts the tree and neither is trusted. MEASURED 2026-09-05
+        # (cycle 6): hosts before the Unity-alive S1 fix read LOADING at the
+        # rebuilt main menu (the cached GameWorld outlived the raid); that
+        # is not DEPLOYED and passes here, and the line prints the phase so
+        # a reader can see which host they are on.
         let p = raidPhase()
         if p.asked and deployed(p):
           warn "AutoRaid EXIT VERDICT INCONCLUSIVE -- the tree shows an " &
@@ -269,10 +270,9 @@ proc onMainTick(payload: string): string =
         else:
           success "AutoRaid EXIT VERDICT PASS -- " & exitmachine.answer() &
                   "; the host reports phase " & p.phase &
-                  (if p.asked: " (not DEPLOYED, which is all the host can " &
-                               "say after a raid: its cached GameWorld " &
-                               "outlives the raid, so it reads LOADING, not " &
-                               "MENU, at the rebuilt main menu)"
+                  (if p.asked: " (not DEPLOYED -- the cross-check; MENU is " &
+                               "the host's own word for it, LOADING is a " &
+                               "host from before the Unity-alive S1 fix)"
                    else: " (host phase verb absent; tree only)") & "."
       elif stg == "FAILED":
         gExitVerdict = true

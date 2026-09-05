@@ -424,10 +424,13 @@ What the exit needed, and what the offline map had wrong:
   verifier as "first bytes are a JUMP" (boot 1, FAIL at SIDE). The host now
   answers `aowlspt.host::original_bytes` from its pre-detour prologue table and
   the verifier compares against that (commit 2b22617).
-* **The host's `raid_phase` does not return to MENU after a raid.** Its cached
-  GameWorld outlives the raid, so it reads LOADING at the rebuilt main menu;
-  the outer `AutoRaid EXIT VERDICT` therefore accepts any not-DEPLOYED phase and
-  keeps "still DEPLOYED" as the disagreement that yields INCONCLUSIVE.
+* **The host's `raid_phase` used to read LOADING at the rebuilt main menu**
+  (its cached GameWorld outlived the raid). FIXED 2026-09-05 (host
+  raidphase.nim: S1 now requires the cached GameWorld to be Unity-alive, the
+  same fake-null test S2 applies to the player); boot 14:45 reads
+  `AutoRaid EXIT VERDICT PASS ... the host reports phase MENU`. The outer
+  verdict still keeps "still DEPLOYED" as the disagreement that yields
+  INCONCLUSIVE, and prints the phase so a reader can tell an older host.
 
 4. **The loadout handshake, end to end** (old item 6), boots 7 and 8 with
    `loadoutMode: spawned`: `autoraid.loadout.apply` emitted from INSIDE
