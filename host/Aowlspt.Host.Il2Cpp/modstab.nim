@@ -559,6 +559,8 @@ var gModsScreenT: Il2CppPtr = nil
 ## version brand. Both go through ONE guard entry, so only one branch runs per
 ## guarded call and neither re-enters -- `aowl_p_p_seh` is not re-entrant.
 var gModsBranch = 0
+const SwDrainMaxFaults = 3          ## the Game-tab drain switches itself off here
+var gSwDrainFaults = 0              ## caught faults in branch 7 (never the MODS tab's count)
 
 # ---------------------------------------------------------------------------
 # THE DONORS, AND WHY EACH ONE. Every one was chosen from a live hierarchy dump
@@ -2434,8 +2436,14 @@ proc modsTabTickBody() =
   #
   # This is the drain the sliced renderer needs and the only thing that makes a
   # 949-row page possible: `swRenderPage` now begins a page and draws its first
-  # slice, and every row after that arrives here. BOTH registries are driven,
-  # because the Game-tab pages (`gSwPages`) use the identical renderer.
+  # slice, and every row after that arrives here. ONLY the MODS registry is
+  # driven from here. The Game-tab registry (`gSwPages`) has a rider of its
+  # own (`swPagesDrainTick`, branch 7), because this line sits below
+  # `if not gModsShown: return` -- MEASURED 2026-09-05 (host 377451de478b):
+  # with both registries drained here, Settings -> Game showed the host page
+  # as its heading and NOTHING else, `row0.clone=0x0`, no RENDER VERDICT ever.
+  # The Game tab's pages only filled while the MODS tab was on screen, which
+  # is the one place nobody looks at them.
   #
   # `swSliceRegistry` does at most ONE page per call and stops on the first of
   # `cSwSliceRows` rows or `cSwSliceMs` of wall clock -- so this line costs one
@@ -2446,7 +2454,6 @@ proc modsTabTickBody() =
   # a row that is drawn but still reads the donor's caption is not a rendered
   # row -- it is fact #88 wearing one.
   modsCrumb("STAGE: swSliceRegistry")
-  discard swSliceRegistry(gSwPages, swRegSettings)
   discard swSliceRegistry(gModsPages, swRegMods)
   modsRelabelPending()
 
@@ -3967,6 +3974,33 @@ proc menuWidgetsStatusLine(): string =
   (if gMwFail > 0: " -- a widget is still on screen"
    elif gMwPass == 0: " -- nothing was ever confirmed hidden"
    else: "")
+proc swPagesDrainBody() =
+  ## Branch 7: THE GAME-TAB DRAIN, on a rider of its own with gates of its own.
+  ##
+  ## MEASURED 2026-09-05 on host 377451de478b, Settings -> Game after a raid:
+  ## the 'aowlspt - host' page rendered its heading and nothing else. Host log:
+  ## `page 'host' BEGUN`, `GRAFT tick cost 94 ms`, then `row0.clone=0x0`,
+  ## census `toggle=0x0`, and no RENDER VERDICT of either kind, ever.
+  ## `findtext "Bot registration logging"` (active AND inactive, EXHAUSTIVE)
+  ## found nothing. `swRenderPage` begins a page and draws only its first
+  ## slice -- and the graft spends that slice -- so every row after it needs
+  ## `swSliceRegistry(gSwPages, swRegSettings)`, which lived in
+  ## `modsTabTickBody` BELOW `if not gModsShown: return`. The Game tab's pages
+  ## therefore filled only while the MODS tab was on screen: the same shape as
+  ## the 09-02 relabel-poll defect two screens up (a registry drained behind
+  ## another feature's gate), one layer down.
+  ##
+  ## Cheap when nothing is filling: `swSliceRegistry` is then a flag loop over
+  ## at most 32 pages. It costs a frame's row budget only while a page is
+  ## begun and incomplete, which is exactly when the player is waiting for it.
+  modsCrumb("STAGE: swPagesDrainBody")
+  discard swSliceRegistry(gSwPages, swRegSettings)
+  if not gModsShown:
+    # The caption re-assert for the rows just drawn (fact #88). While MODS is
+    # shown its own tick runs this same pass over both registries; running it
+    # twice a frame would spend its per-tick budget twice.
+    modsRelabelPending()
+
 proc modsBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_mods_body", cdecl.} =
   ## Returns non-nil so the caller can tell "ran" from "faulted" --
   ## `aowl_p_p_seh` gives back NULL when it caught something.
@@ -3999,6 +4033,8 @@ proc modsBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_mods_body", cdecl.} =
     menuWidgetsFrom(gSeasonsMenu)
   elif gModsBranch == 6:
     menuWidgetsVerdictBody()
+  elif gModsBranch == 7:
+    swPagesDrainBody()
   elif gModsBranch == 4:
     gfxTickBody()
   elif gModsBranch == 5:
@@ -4289,6 +4325,29 @@ proc seasonsTick() =
         "banner hides so far=" & $gSeasonsHidden & ", mode-button hides so " &
         "far=" & $gModeBtnHidden &
         ". Event-driven: exactly one pass per menu rebuild."
+proc swPagesDrainTick() =
+  ## The Game-tab drain's entry, every frame from the PreloaderUI rider. Gated
+  ## on the `settingsPages` flag and on ITS OWN fault budget -- never on the
+  ## MODS tab's flag, its build, or whether it is showing, which is the whole
+  ## point (see `swPagesDrainBody`). Returns on one compare while Settings ->
+  ## Game has never been built, because nothing can have been begun.
+  if not gSwPagesOn or gSwDrainFaults >= SwDrainMaxFaults:
+    return
+  if gSwPagesTabPtr == 0'u64:
+    return
+  gModsBranch = 7
+  if cModsGuarded(cast[Il2CppPtr](0)) == nil:
+    gSwDrainFaults = gSwDrainFaults + 1
+    warn "settings pages: the Game-tab DRAIN faulted and was caught (" &
+         $gSwDrainFaults & " of " & $SwDrainMaxFaults & "); the game " &
+         "survived. Rows already drawn stay; the page keeps filling on the " &
+         "next frame" &
+         (if gSwDrainFaults >= SwDrainMaxFaults:
+            " -- NO: this was the last try, the drain is OFF for this " &
+            "session and every page still short of rows stays short. " &
+            "Its RENDER VERDICT TIMEOUT names the shortfall."
+          else: ".")
+
 proc modsRidersTick(regs: Il2CppPtr) =
   ## Everything in this file that wants a frame, behind ONE call the rider
   ## chain in `aowlhost.nim` makes. Each entry re-arms the guard separately --
@@ -4329,6 +4388,7 @@ proc modsRidersTick(regs: Il2CppPtr) =
         if gInspPreloader == nil:
           gInspPreloader = self
   modsTabTick()
+  swPagesDrainTick()
   verBrandTick()
   seasonsTick()
   gfxTick()
