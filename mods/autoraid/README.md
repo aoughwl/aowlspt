@@ -135,12 +135,21 @@ AutoRaid LOADOUT VERDICT PASS -- profile <id>, requested 11, minted 11, placed 1
 |---|---|---|
 | `-aowl.raid=<MapLabel>` | enter an offline raid on this map at launch | absent = do nothing |
 | `-aowl.raidside=pmc\|scav` | which side to choose | `pmc` |
+| `-aowl.raidexit=<seconds>` | stay this long after DEPLOYED, then leave through the in-raid menu (ESC -> DISCONNECT -> LEAVE -> results -> main menu) | `0` = never leave |
 
 The **map label is the map's displayed name on the location screen**, matched
 case-insensitively. That displayed text is the only thing that identifies a map
 on this build: every tile GameObject is called `Location Template(Clone)`.
 
 Quote a label with a space: `--raid="Ground Zero"`.
+
+`aowlspt-launch --raid Woods --raidexit 45` is one unattended round trip:
+menu -> raid -> 45 s in -> main menu, MEASURED 2026-09-05 at 3:46 from launch.
+The exit presses the player's own ESC (posted to the game window, so it works
+whether or not the game is the foreground window), waits for the game's own
+`MenuScreen::Show` event, and reads the verdict off the tree: an ACTIVE,
+pressable PlayButton. `MenuScreen::ShowInRaid()` does NOT open that menu
+(measured; its body only touches the EnvironmentUI).
 
 A bare `-aowl.raid` with no value arms **nothing**. There is no default map worth
 guessing at, and entering the wrong raid is worse than entering none.

@@ -30,7 +30,17 @@
 ##
 ## THE SEQUENCE, and what each step ASSERTS rather than assumes
 ## ------------------------------------------------------------
-##   SHOW        call `MenuScreen::ShowInRaid()` on the receiver
+##   SHOW        press ESC -- the player's own path -- and WAIT for uihooks
+##               site 2 (`MenuScreen::Show(5-arg)`) to fire AFTER the press;
+##               the receiver is then the menu the game itself just showed.
+##               MEASURED 2026-09-05 in a live raid: a real ESC fires site 2
+##               with profile=NULL; `ShowInRaid()` fires nothing and shows
+##               nothing (its body only touches the EnvironmentUI), and the
+##               hidden menu's `ScreenController` slot (+0x90, borrowed) reads
+##               NULL at exit time, so `Show(controller)` has no argument.
+##               The key is POSTED to the game window (WM_KEYDOWN/WM_KEYUP),
+##               which MEASURED opens the menu with the game NOT foreground;
+##               a person in another window is never interrupted.
 ##   DISCONNECT  `_disconnectButton` @0xC0 -- WAIT for its GameObject to read
 ##               activeInHierarchy (a READBACK, because pressing an inactive
 ##               object returns success and does nothing, fact #72) then press
@@ -105,6 +115,9 @@ var gSaidNoRecv = false
 var gSaidNoDisc = false
 var gStage = "IDLE"
 var gAnswer = ""
+var gEscPhase = 0                 ## 0 nothing sent, 1 ESC down sent, 2 up sent
+var gEscEpoch = 0                 ## site-2 epoch when ESC went down
+var gSaidWaitShow = false
 
 proc stage*(): string = gStage
 proc answer*(): string = gAnswer
@@ -121,22 +134,6 @@ proc fail(why: string) =
   gStage = "FAILED"
   gAnswer = "FAILED: " & why
   warn "AutoRaid exit: " & why & " -- stopping. This is a REFUSAL, not a success."
-
-proc menuFromEvent(via: var string): Il2CppPtr =
-  ## The live MenuScreen COMPONENT, from a show event rather than from a search.
-  ## See the banner for why a search cannot work here.
-  result = nil
-  via = ""
-  var self = receiverOf(SiteShowInRaid)
-  if self != nil:
-    via = "uihooks site 7 (MenuScreen::ShowInRaid -- the in-raid menu was shown)"
-    return self
-  self = receiverOf(SiteMenuShow)
-  if self != nil:
-    via = "uihooks site 2 (MenuScreen::Show(5-arg) from before the raid; " &
-          "MenuScreen is DontDestroyOnLoad and the pointer was re-validated " &
-          "for liveness, not merely readability)"
-    return self
 
 proc arm*(reason: string; why: var string): bool =
   ## Arm the exit sequence. MAIN THREAD ONLY.
@@ -172,11 +169,29 @@ proc arm*(reason: string; why: var string): bool =
   gResults = 0
   gSaidNoRecv = false
   gSaidNoDisc = false
+  gEscPhase = 0
+  gEscEpoch = 0
+  gSaidWaitShow = false
   goto(XrShow)
   gAnswer = "ARMED, step SHOW-IN-RAID"
   success "AutoRaid exit: ARMED (" & reason & ") -- SHOW-IN-RAID -> " &
           "DISCONNECT -> LEAVE -> RESULTS -> VERIFY. ARMED IS NOT OUT."
   result = true
+
+proc xrHex(p: Il2CppPtr): string =
+  const digits = "0123456789abcdef"
+  var v = cast[uint64](p)
+  if v == 0'u64: return "NULL"
+  result = ""
+  var started = false
+  var shift = 60
+  while shift >= 0:
+    let nib = int((v shr uint64(shift)) and 0xF'u64)
+    if nib != 0 or started or shift == 0:
+      started = true
+      result.add digits[nib]
+    shift = shift - 4
+  result = "0x" & result
 
 proc menuRootOf(): Il2CppPtr =
   ## `Common UI`, climbed from the MenuScreen's own Transform. The only route
@@ -198,34 +213,61 @@ proc tickBody(now: int64) =
     return
 
   if gStep == XrShow:
-    var via = ""
-    let comp = menuFromEvent(via)
+    if gEscPhase == 0:
+      if not gameWindowExists():
+        fail("there is no `UnityWndClass` window in this process, so there " &
+             "is nothing to post ESC to")
+        return
+      gEscEpoch = snapshotEpoch(SiteMenuShow)
+      if not keyEscape(true):
+        fail("PostMessage(WM_KEYDOWN, VK_ESCAPE) to the game window was " &
+             "refused, so no key went in")
+        return
+      gEscPhase = 1
+      info "AutoRaid exit: ESC posted (WM_KEYDOWN) to the game window -- " &
+           "the player's own path, foreground or not. WAITING for uihooks " &
+           "site 2 (MenuScreen::Show(5-arg)) to fire AFTER this press " &
+           "(epoch was " & $gEscEpoch & "); the key going in is not the " &
+           "readback, the game's own Show event is."
+      return
+    if gEscPhase == 1:
+      discard keyEscape(false)
+      gEscPhase = 2
+      return
+    if epochOf(SiteMenuShow) <= gEscEpoch:
+      if now - gStepT0 > XrSayMs and not gSaidWaitShow:
+        gSaidWaitShow = true
+        info "AutoRaid exit: ESC went in and site 2 has not fired yet (epoch " &
+             "still " & $epochOf(SiteMenuShow) & "). Still waiting; the step " &
+             "ceiling bounds this and names it."
+      return
+    let comp = receiverOf(SiteMenuShow)
     if comp == nil:
       if now - gStepT0 > XrSayMs and not gSaidNoRecv:
         gSaidNoRecv = true
-        warn "AutoRaid exit: no MenuScreen receiver from ANY show event (site " &
-             "7 ShowInRaid empty, site 2 Show(5-arg) empty or unbound; site 1 " &
-             "Awake is deliberately never used). There is NO fallback search: " &
-             "in a raid the enumerated scene roots are the LOCATION scene and " &
-             "the menu lives in DontDestroyOnLoad, so a search there finds " &
-             "nothing and would only produce a confidently wrong refusal. " &
-             "Check the host's `uihooks:` lines for whether site 7 bound."
-      return                        # keep looking; the step timeout bounds this
-    if not readable(comp, OffMenuDisconnect + 8):
-      fail("the MenuScreen component is not readable to +0x" &
-           $(OffMenuDisconnect + 8) & ", so `_disconnectButton` could not be " &
-           "reached and nothing was called")
+        warn "AutoRaid exit: site 2 fired after the ESC but its receiver is " &
+             "not readable or not alive; waiting."
       return
-    var w = ""
-    if not menuShowInRaid(comp, w):
-      fail("MenuScreen::ShowInRaid was not called -- " & w)
+    if not readable(comp, OffMenuModeDesc + 8):
+      fail("the MenuScreen component is not readable to +0x" &
+           $(OffMenuModeDesc + 8) & ", so `_disconnectButton` could not be " &
+           "reached; nothing was pressed")
       return
     gMenu = comp
     gMenuTr = transformOf(comp)
-    success "AutoRaid exit: called MenuScreen::ShowInRaid, receiver via " &
-            via & " -- now WAITING for `_disconnectButton` @+0xC0 to become " &
-            "activeInHierarchy. That wait is a READBACK, not an assumption: " &
-            "pressing an inactive object returns success and does nothing."
+    # READ-ONLY INSTRUMENTATION for the native path: what the two borrowed
+    # generic-base slots hold while the game's OWN Show has just run. Cycle 4
+    # read +0x90 as NULL on the HIDDEN menu; this says what it is when shown.
+    let s90 = readPtr(comp, OffMenuController)
+    let s98 = readPtr(comp, 0x98)
+    success "AutoRaid exit: uihooks site 2 fired after our ESC (epoch " &
+            $epochOf(SiteMenuShow) & "), receiver " & xrHex(comp) &
+            " -- the game showed its own in-raid menu. Slots while shown: " &
+            "+0x90=" & xrHex(s90) & " +0x98=" & xrHex(s98) &
+            " (_matchmaker@0x118=" & xrHex(readPtr(comp, OffMenuMatchmaker)) &
+            "). Now WAITING for `_disconnectButton` @+0xC0 to become " &
+            "activeInHierarchy: a READBACK, since pressing an inactive " &
+            "object returns success and does nothing."
     goto(XrDisconnect)
     return
 

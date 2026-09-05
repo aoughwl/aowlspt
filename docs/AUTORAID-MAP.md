@@ -377,32 +377,65 @@ mods/autoraid (backend)                      mods/tarkov (backend)
   tarkov handles `autoraid.loadout.apply` inline. Both are agent S's, and this
   mod builds against the names.
 
-## 5. What is NOT verified
+## 5. What is verified, and what is not
 
-Nothing in this mod has been run against the live client. Specifically unproven:
+**MEASURED 2026-09-05, five consecutive boots on Woods (`aowlspt-launch --raid
+Woods`, then `--raidexit 45`).** The map above was written offline; this is
+what the live client said.
 
-1. **Every `Il2CppType` data RVA** in `ar/calls.nim`. They come from
-   `tools/il2cpp_nameindex.py lookup … ::@type 0` against an index whose stamp
-   matches this build, and there is **no prologue to byte-verify data against**.
-   The live check is: `typeObject` returns non-nil AND `componentOf` returns a
-   component on a node that visibly has one. Until that is seen, a mis-resolved
-   type reads as "this object has no such component" — i.e. as a silent absence.
-   This is the single most likely thing in the mod to be wrong.
-2. **That `Component::GetComponent(Type)` works from a Transform receiver.** The
-   host does it from the inspector; this mod has not.
-3. **The region participant drawing at all.** Registration is not arming.
-4. **The `ui.show` payload shape and `ui_show_status`** — agent H's, built
-   against the names.
-5. **`-aowl.raid` reaching the client** — agent H's launcher change.
-6. **The loadout handshake** — agent S's `tarkov.profile.listing`, that it is
-   emitted synchronously before the profile is serialised, and that an apply
-   emitted from inside it lands in that same document. The whole feature rests
-   on this and it has not been observed end to end.
-7. **The raid-exit half.** The host's own note stands: site 7 must bind or
-   SHOW-IN-RAID refuses, and that path has never been re-stated as solved with a
-   live PASS.
+Verified:
 
----
+1. **The command-line raid ENTRY, end to end, 5 of 5 boots** -- PLAY at ~0:42,
+   SIDE (Toggle::Set), SELECT-MAP "WOODS", offline NEXT, insurance NEXT, accept
+   READY, `AutoRaid CMDLINE VERDICT PASS -- phase DEPLOYED` at 2:36-2:42. Every
+   receiver came from its own `ui.show` event (items 1, 2 and 4 of the old
+   list: the type RVAs, `GetComponent(Type)` from a Transform receiver, and the
+   `ui.show` payload shape all held).
+2. **`-aowl.raid` reaches the client** (old item 5): `cmdline: raw = ...
+   -aowl.raid=Woods` on the host's first line.
+3. **The raid EXIT, end to end** (old item 7), boot 6: ESC -> the game's own
+   `MenuScreen::Show(5-arg)` 30 ms later -> DISCONNECT -> LEAVE -> four results
+   NextButtons -> `MenuScreen::Show` with a real profile -> `AutoRaid exit
+   VERDICT PASS` (an ACTIVE, pressable PlayButton) at 3:46 from launch.
+
+What the exit needed, and what the offline map had wrong:
+
+* **`MenuScreen::ShowInRaid()` does NOT open the in-raid menu.** Called on the
+  re-validated pre-raid MenuScreen it returns and leaves nothing active; its
+  body reads `_environment@0x108` and works on the EnvironmentUI. Site 7 never
+  fires on a real ESC. The claim in section 2.1 and in AOWL_FACTS (2026-09-01,
+  offline) that it is the opener is retracted; the OBJECT (`Common UI/
+  MenuScreen`, DontDestroyOnLoad) was right.
+* **A real ESC fires site 2 -- `MenuScreen::Show(5-arg)` with profile=NULL** --
+  through `MenuScreen::Show(MainMenuBaseScreenController)` @0x1538760, its
+  only direct caller, which forwards `Matchmaker@0x48 ModeDescriptor@0x50
+  Profile@0x58 ExpansionsPlayerInfo@0x60 SeasonalRewardController@0x68` off
+  the controller. The controller lives in the generic base's slot at +0x90
+  (borrowed): it reads NULL on the hidden menu at exit time and a live object
+  while the menu is shown, so `Show(controller)` has no argument when the mod
+  needs it.
+* **So the mod presses ESC.** `keybd_event` reaches only the foreground window
+  (boot 5 refused correctly while the user was in another window);
+  `PostMessageW(WM_KEYDOWN/WM_KEYUP, VK_ESCAPE)` to the `UnityWndClass` window
+  opened the menu with the game NOT foreground, and is what ships. The readback
+  is the site-2 epoch advancing after the post, never the post itself.
+* **The three call targets the host itself hooks** (`Toggle::Set`,
+  `SettingsScreen::Close`, `MenuScreen::ShowInRaid`) were refused by the SDK
+  verifier as "first bytes are a JUMP" (boot 1, FAIL at SIDE). The host now
+  answers `aowlspt.host::original_bytes` from its pre-detour prologue table and
+  the verifier compares against that (commit 2b22617).
+* **The host's `raid_phase` does not return to MENU after a raid.** Its cached
+  GameWorld outlives the raid, so it reads LOADING at the rebuilt main menu;
+  the outer `AutoRaid EXIT VERDICT` therefore accepts any not-DEPLOYED phase and
+  keeps "still DEPLOYED" as the disagreement that yields INCONCLUSIVE.
+
+Still NOT verified:
+
+6. **The loadout handshake** -- `tarkov.profile.listing` emitted synchronously
+   before the profile is serialised, and an apply from inside it landing in
+   that same document. Nothing has run with `loadoutMode: spawned` yet.
+7. **The map menu on a key** (flow B) and the region participant drawing:
+   `hotkeys` has stayed off.
 
 ## 6. The lines a reviewer greps after a boot
 

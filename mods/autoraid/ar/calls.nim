@@ -102,6 +102,23 @@ const
     ## all, so the `LocalizedText` clobber trap has no surface here.
 
   OffMenuDisconnect* = 0xC0
+  OffMenuController* = 0x90
+    ## `MenuScreen.ScreenController` -- a field of the GENERIC base
+    ## (`EftScreen<TController>`), so fieldOffsets has no number for it.
+    ## BORROWED, from the layout: MenuScreen's own fields run `_hideCoroutine`
+    ## @0x88 then `_playButton`@0xA0, and the two base fields between them are
+    ## `ScreenController` (a pointer) and `<Destroyed>k__BackingField` (a
+    ## bool) -- one pointer slot at 0x90, the bool at 0x98. NEVER trusted on
+    ## its own: exitmachine cross-checks the object it reads here against the
+    ## menu's own `_matchmaker`/`_modeDescriptor`, which the game copied out
+    ## of that same controller at its last Show, and refuses on a mismatch.
+  OffMenuMatchmaker* = 0x118   ## MenuScreen._matchmaker (fieldOffsets)
+  OffMenuModeDesc* = 0x120     ## MenuScreen._modeDescriptor (fieldOffsets)
+  OffCtrlMatchmaker* = 0x48    ## MainMenuBaseScreenController.Matchmaker
+  OffCtrlModeDesc* = 0x50      ## MainMenuBaseScreenController.ModeDescriptor
+    ## Both controller offsets are fieldOffsets facts, read off the annotated
+    ## disassembly of MenuScreen::Show(controller) @0x1538760, which loads
+    ## exactly these and hands them to the 5-arg Show.
     ## `EFT.UI.MenuScreen._disconnectButton`.
 
 # ---------------------------------------------------------------------------
@@ -171,6 +188,7 @@ var tToggleSet: RvaTarget
 var tPointerClick: RvaTarget
 var tSettingsClose: RvaTarget
 var tShowInRaid: RvaTarget
+var tMenuShowCtrl: RvaTarget
 
 var gInstalled = false
 
@@ -309,6 +327,21 @@ proc installTargets() =
     "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 48",
     owners = 1'i32)
 
+  # MEASURED 2026-09-05, live Woods raid: a real ESC fires uihooks site 2 --
+  # `MenuScreen::Show(5-arg)` with profile=NULL -- and site 7 (ShowInRaid)
+  # never fires. The 5-arg Show's ONLY direct caller is this one-arg
+  # `Show(MainMenuBaseScreenController)`, which loads Matchmaker@0x48,
+  # ModeDescriptor@0x50, Profile@0x58, ExpansionsPlayerInfo@0x60 and
+  # SeasonalRewardController@0x68 off the controller and calls it. UNIQUE,
+  # arity 1, virtual -- but the receiver is a MenuScreen itself, never a
+  # subclass, so calling this body directly is the body the game runs.
+  # Bytes: `il2cpp_resolve.py bytes 0x1538760 16`.
+  tMenuShowCtrl = rvaTarget(
+    "EFT.UI.MenuScreen::Show(MainMenuBaseScreenController controller)",
+    0x1538760'u32,
+    "48 83 EC 48 48 85 D2 74 31 48 8B 42 68 4C 8B 4A",
+    owners = 1'i32)
+
 # ---------------------------------------------------------------------------
 # Verification, ONCE, at load. Reading the code page is safe at mod init: it
 # neither patches nor calls, and a target that refuses here refuses loudly with
@@ -364,6 +397,7 @@ proc verifyAll*(): CallsState =
   note tPointerClick
   note tSettingsClose
   note tShowInRaid
+  note tMenuShowCtrl
   result = gS
 
 proc callsDisabled*(): bool =
@@ -717,8 +751,36 @@ proc settingsClose*(comp: Il2CppPtr; why: var string): bool =
     return
   result = true
 
+proc menuShowWithController*(comp, ctrl: Il2CppPtr; why: var string): bool =
+  ## `MenuScreen::Show(MainMenuBaseScreenController)` -- the body the ESC key
+  ## reaches in a raid (MEASURED 2026-09-05, see `tMenuShowCtrl`). `ctrl` is
+  ## read off the live MenuScreen by the caller and cross-checked there; this
+  ## only refuses an unreadable receiver or controller.
+  result = false
+  why = ""
+  if not receiverOk(comp):
+    why = "the MenuScreen component is not readable, or its native half is null"
+    return
+  if ctrl == nil:
+    why = "the controller is NULL; Show(controller) throws on a null " &
+          "controller (the body's first test), so it was not called"
+    return
+  var a = callArgs()
+  addPtr(a, comp)
+  addPtr(a, ctrl)
+  let o = callVoid(tMenuShowCtrl, a)
+  if o.kind != coOk:
+    why = o.why
+    return
+  result = true
+
 proc menuShowInRaid*(comp: Il2CppPtr; why: var string): bool =
-  ## `MenuScreen::ShowInRaid()` -- what puts the in-raid menu up.
+  ## `MenuScreen::ShowInRaid()`. MEASURED 2026-09-05 in a live Woods raid: it
+  ## does NOT put the in-raid menu up. Its body reads `_environment@0x108`
+  ## and works on the EnvironmentUI; it never reaches the 5-arg Show, and
+  ## calling it left NOTHING active under the MenuScreen (the exit's
+  ## DISCONNECT step then found nothing for 20 s). Kept as a call, unused by
+  ## the exit path; `menuShowWithController` is what opens the menu.
   result = false
   why = ""
   if not receiverOk(comp):

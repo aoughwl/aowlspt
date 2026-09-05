@@ -116,6 +116,10 @@ const
   PhasePollMs = 2000'i64
     ## How often the phase is polled while waiting for DEPLOYED. A bounded
     ## cadence rather than every frame: the verb is cheap, not free.
+  ExitBoundMs = 240000'i64
+    ## Four minutes from arming the exit to a verdict on it. The results chain
+    ## after a raid can take a while; past this the verdict is INCONCLUSIVE
+    ## with the step named -- never a silent give-up.
 
 # ---------------------------------------------------------------------------
 # Client-side state
@@ -129,6 +133,12 @@ var gCmdlineT0 = 0'i64
 var gLastPhasePoll = 0'i64
 var gDrainWaits = 0
 var gSaidNoDrain = false
+var gDeployedAt = 0'i64      ## when the cmdline raid's PASS verdict fired
+var gExitArmed = false       ## the exit machine has been armed by -aowl.raidexit
+var gExitVerdict = false     ## ...and its verdict has been printed
+var gExitT0 = 0'i64
+var gLastExitPoll = 0'i64
+var gExitSaidWait = false
 
 # ---------------------------------------------------------------------------
 # The main-thread gate.
@@ -185,6 +195,7 @@ proc onMainTick(payload: string): string =
       let p = raidPhase()
       if deployed(p):
         gCmdlineVerdict = true
+        gDeployedAt = now
         success "AutoRaid CMDLINE VERDICT PASS -- the client reports phase " &
                 "DEPLOYED for map \"" & machine.wantedMap() & "\" (" & p.why &
                 "). That is the game's OWN deploy signal, not this mod " &
@@ -210,6 +221,69 @@ proc onMainTick(payload: string): string =
              "and it has NOT refused -- so this is a bound on my patience, " &
              "not a failure of the flow. Read the AutoRaid lines above for " &
              "the step that is waiting."
+
+  # The command-line EXIT (-aowl.raidexit=N). Only ever after the command-line
+  # raid's own verdict was PASS: dwell N seconds from the moment the client
+  # reported DEPLOYED, arm the exit machine, then report ITS finished state --
+  # the tree (an active PlayButton) AND the host's phase, because "every press
+  # returned" is not evidence of being back at the menu.
+  if gDeployedAt != 0'i64 and exitAfterSeconds() > 0 and not gExitVerdict:
+    let now = nowMs()
+    if not gExitArmed:
+      if now - gDeployedAt >= int64(exitAfterSeconds()) * 1000'i64:
+        var why = ""
+        if exitmachine.arm("-aowl.raidexit", why):
+          gExitArmed = true
+          gExitT0 = now
+          gLastExitPoll = 0'i64
+          success "AutoRaid EXIT: dwelt " & $exitAfterSeconds() & " s after " &
+                  "DEPLOYED, so the exit sequence is ARMED (-aowl.raidexit): " &
+                  "SHOW-IN-RAID -> DISCONNECT -> LEAVE -> RESULTS -> VERIFY. " &
+                  "ARMED IS NOT EXITED: the verdict is read off the live tree."
+        else:
+          gExitVerdict = true
+          warn "AutoRaid EXIT VERDICT FAIL -- the exit asked for on the " &
+               "command line was REFUSED and will NOT be retried: " & why
+      elif not gExitSaidWait:
+        gExitSaidWait = true
+        info "AutoRaid EXIT: DEPLOYED observed; leaving the raid in " &
+             $exitAfterSeconds() & " s (-aowl.raidexit)."
+    elif now - gLastExitPoll >= PhasePollMs:
+      gLastExitPoll = now
+      let stg = exitmachine.stage()
+      if stg == "DONE":
+        gExitVerdict = true
+        # MEASURED 2026-09-05 (cycle 6): the host's phase reads LOADING at the
+        # main menu after a raid, and stays there -- its cached GameWorld
+        # outlives the raid, so its S1 "no GameWorld" route to MENU never
+        # fires post-raid. The tree (an ACTIVE PlayButton, MenuScreen::Show
+        # with a real profile 0.3 s earlier) is the finished state. The phase
+        # is kept as the ONE cross-check that can still fail: a host that
+        # still says DEPLOYED contradicts the tree and neither is trusted.
+        let p = raidPhase()
+        if p.asked and deployed(p):
+          warn "AutoRaid EXIT VERDICT INCONCLUSIVE -- the tree shows an " &
+               "active PlayButton (" & exitmachine.answer() & ") but the " &
+               "host still reports phase DEPLOYED (" & p.why & "). The two " &
+               "disagree, so neither is trusted."
+        else:
+          success "AutoRaid EXIT VERDICT PASS -- " & exitmachine.answer() &
+                  "; the host reports phase " & p.phase &
+                  (if p.asked: " (not DEPLOYED, which is all the host can " &
+                               "say after a raid: its cached GameWorld " &
+                               "outlives the raid, so it reads LOADING, not " &
+                               "MENU, at the rebuilt main menu)"
+                   else: " (host phase verb absent; tree only)") & "."
+      elif stg == "FAILED":
+        gExitVerdict = true
+        warn "AutoRaid EXIT VERDICT FAIL -- " & exitmachine.answer()
+      elif now - gExitT0 > ExitBoundMs:
+        gExitVerdict = true
+        warn "AutoRaid EXIT VERDICT INCONCLUSIVE -- " &
+             $(int(ExitBoundMs div 1000'i64)) & " s since arming and the " &
+             "exit machine is at step " & stg & " without refusing; a bound " &
+             "on my patience, not a failure. Read the `AutoRaid exit:` " &
+             "lines above for the step that is waiting."
 
 # ---------------------------------------------------------------------------
 # Arming the command-line raid, from the main thread.

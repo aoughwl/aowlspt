@@ -473,6 +473,40 @@ static int32_t aowl_ar_keycode_of(const char* name) {
     return aowl_keycode_of(name);
 }
 static int32_t aowl_ar_kc_unbound(void) { return AOWL_KC_UNBOUND; }
+/* ==================================================================== *
+ * 5. THE PLAYER'S OWN ESC.
+ *
+ * MEASURED 2026-09-05 in a live Woods raid: a real ESC makes the game call
+ * `MenuScreen::Show(5-arg)` (uihooks site 2, profile=NULL) on the
+ * DontDestroyOnLoad MenuScreen, and nothing else we tried does --
+ * `ShowInRaid()` only touches the EnvironmentUI, and `Show(controller)` needs
+ * a controller the hidden menu no longer holds (+0x90 read NULL at exit).
+ * So the exit half presses the key the player would press and then WAITS
+ * for site 2 to fire: the readback is the game's own Show event, never the
+ * fact that a key was injected.
+ *
+ * DELIVERY, MEASURED 2026-09-05 in the same raid, two ways:
+ *   keybd_event (the OS input queue) reaches only the FOREGROUND window --
+ *     it opened the menu when the game was foreground, and cycle 5 had to
+ *     REFUSE when the user was in another window, because the ESC would
+ *     have gone there.
+ *   PostMessageW(WM_KEYDOWN / WM_KEYUP, VK_ESCAPE) straight to the
+ *     `UnityWndClass` window opened the menu with the game NOT foreground
+ *     (`uihooks: MenuScreen::Show #2 profile=NULL` 4 s after the post).
+ * So this posts. Nothing else on the machine sees the key, and a human in
+ * another window is not interrupted. The only refusal left is "no window".
+ * -------------------------------------------------------------------- */
+static int32_t aowl_ar_game_window(void) {
+    return FindWindowW(L"UnityWndClass", NULL) ? 1 : 0;
+}
+static int32_t aowl_ar_key_escape(int32_t down) {
+    HWND h = FindWindowW(L"UnityWndClass", NULL);
+    LPARAM lp;
+    if (!h) return 0;
+    if (down) lp = (LPARAM)(1 | (0x01 << 16));
+    else      lp = (LPARAM)(1 | (0x01 << 16) | (1 << 30)) | ((LPARAM)1 << 31);
+    return PostMessageW(h, down ? WM_KEYDOWN : WM_KEYUP, (WPARAM)VK_ESCAPE, lp) ? 1 : 0;
+}
 """.}
 
 import aowlspt/il2cpp
@@ -499,6 +533,18 @@ proc cKeyBindState(): int32 {.importc: "aowl_ar_key_bind_state", nodecl.}
 proc cKeyDisabled(): int32 {.importc: "aowl_ar_key_disabled", nodecl.}
 proc cKeyDowns(): int64 {.importc: "aowl_ar_key_downs", nodecl.}
 proc cKeyRefused(): int64 {.importc: "aowl_ar_key_refused", nodecl.}
+proc cGameWindow(): int32 {.importc: "aowl_ar_game_window", nodecl.}
+proc cKeyEscape(down: int32): int32 {.importc: "aowl_ar_key_escape", nodecl.}
+
+proc gameWindowExists*(): bool =
+  cGameWindow() != 0'i32
+
+proc keyEscape*(down: bool): bool =
+  ## ONE half of an ESC keystroke, POSTED to the game window (see the C note:
+  ## measured to open the in-raid menu whether or not the game is foreground).
+  ## Down on one tick and up on the next, so the game sees a real press across
+  ## a frame edge. False = there was no window to post to, or the post failed.
+  cKeyEscape(if down: 1'i32 else: 0'i32) != 0'i32
 proc cDataAt(rva: uint32): Il2CppPtr {.importc: "aowl_ar_data_at", nodecl.}
 proc cKeycodeOf(name: Il2CppPtr): int32 {.importc: "aowl_ar_keycode_of", nodecl.}
 proc cKcUnbound(): int32 {.importc: "aowl_ar_kc_unbound", nodecl.}

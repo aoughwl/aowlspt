@@ -45,6 +45,13 @@ const
     ## `-aowl.raidside=pmc|scav` -- which side control to press on the PMC/SCAV
     ## selector. Default `pmc`.
 
+const
+  ArgExit* = "raidexit"
+    ## `-aowl.raidexit=<seconds>` -- how long to stay in the command-line raid
+    ## after the client reports DEPLOYED before leaving it through the in-raid
+    ## menu. 0 = never leave, which is the default and what makes the mod
+    ## inert on this axis when the token is absent.
+
 proc declare*() =
   ## Declare both arguments. Called ONCE from `onLoad`, before anything reads
   ## them.
@@ -60,7 +67,15 @@ proc declare*() =
       "Which side to choose on the PMC/SCAV selector before the map list. " &
       "`pmc` or `scav`. Only consulted when -aowl.raid is present.",
       default = "pmc", kind = akString,
-      example = "-aowl.raidside=scav")])
+      example = "-aowl.raidside=scav"),
+    argSpec(ArgExit,
+      "After the command-line raid reaches DEPLOYED, stay this many SECONDS " &
+      "and then LEAVE through the in-raid menu (SHOW-IN-RAID -> DISCONNECT " &
+      "-> LEAVE -> results -> main menu), so one launch can enter AND exit a " &
+      "raid with nobody at the keyboard. 0 (the default) = never leave. " &
+      "Only consulted when -aowl.raid is present.",
+      default = "0", kind = akInt,
+      example = "-aowl.raidexit=90  (launcher: --raidexit 90)")])
 
 proc requestedMap*(): string =
   ## The map asked for on the command line, or "" for "nothing was asked".
@@ -68,6 +83,12 @@ proc requestedMap*(): string =
 
 proc requestedSide*(): string =
   cmdArg(ArgSide, "pmc")
+
+proc exitAfterSeconds*(): int =
+  ## Seconds to dwell in the raid before leaving; 0 = never. Read from the
+  ## parsed table, so an unparseable value reads as the default and the
+  ## host's own cmdline audit line is where a typo shows up.
+  cmdArgInt(ArgExit, 0)
 
 proc wasAsked*(): bool =
   ## Was `-aowl.raid` present AND non-empty? A BARE `-aowl.raid` with no value
@@ -96,6 +117,10 @@ proc reportArgs*() =
          "entering the wrong raid is worse than entering none."
     return
   info "AutoRaid cmdline: -aowl.raid=\"" & requestedMap() & "\" side=\"" &
-       requestedSide() & "\". Arming is deferred until the host's main-thread " &
+       requestedSide() & "\"" &
+       (if exitAfterSeconds() > 0:
+          " raidexit=" & $exitAfterSeconds() & "s (leave that long after DEPLOYED)"
+        else: " raidexit=0 (stay in the raid)") &
+       ". Arming is deferred until the host's main-thread " &
        "drain has fired -- calling into Unity before that is the documented " &
        "way to crash a frame or two later."
