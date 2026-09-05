@@ -1959,7 +1959,13 @@ proc auditInternalMags*(items: List; flat: var seq[string]): int =
     let slot = toLowerAscii(one.field("slotId").asText(""))
     if slot == "mod_magazine":
       continue
-    inc gInternalMagServed
+    # The LIVE counter is NOT touched here. MEASURED 2026-09-05: it was, so
+    # the self-check's planted tube (below) counted as a served bug at every
+    # backend start, and the census line said `served loose: 2 -- FAIL, this
+    # must be zero` on every raid of every boot regardless of what was served
+    # -- a check that always fails is as blind as one that cannot. The live
+    # call site adds this proc's return value; the self-check asserts the
+    # counter did not move.
     result = result + 1
     if flat.len < 8:
       flat.add tpl & " in " & (if slot.len == 0: "(grid)" else: slot)
@@ -2568,6 +2574,7 @@ proc generateProfile*(t: BotTables; base: string; req: BotRequest;
   # the only place it can be seen for certain is the finished payload.
   var looseTubes: seq[string] = @[]
   let tubeN = auditInternalMags(items, looseTubes)
+  gInternalMagServed = gInternalMagServed + tubeN
   if tubeN > 0:
     aowlspt.warn("bots: WARN " & $tubeN & " internal magazine(s) served " &
                  "outside mod_magazine -- a fixed tube/cylinder carried as a " &
@@ -3115,6 +3122,7 @@ proc selfCheckBots*(into: var seq[string]): bool =
     #     `mod_magazine`. `good` is the same tube fitted to its own gun and must
     #     NOT be counted, or the check would "pass" by counting everything and
     #     "fail" by counting nothing. `bad` is the deliberate injection.
+    let servedBefore = gInternalMagServed
     var clean = newList()
     clean.add slotItem("sg1", "shotgun", "", "")
     clean.add slotItem("sm1", "tubemag", "sg1", "mod_magazine")   # legitimate
@@ -3142,6 +3150,11 @@ proc selfCheckBots*(into: var seq[string]): bool =
                "planted loose in a rig and auditInternalMags returned " &
                $dirtyN & " rather than 1, so the shotgun check cannot fail " &
                "and proves nothing"
+    if gInternalMagServed != servedBefore:
+      into.add "bots: the self-check's planted tube LEAKED into the live " &
+               "served-loose counter (" & $servedBefore & " -> " &
+               $gInternalMagServed & "), so the census line would report " &
+               "FAIL on every raid on the strength of this fixture alone"
     var namedTube = false
     for line in dirtyFlat:
       if find(line, "tubemag") >= 0:
