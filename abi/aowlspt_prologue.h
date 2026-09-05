@@ -267,6 +267,22 @@ static int32_t aowl_pro_have(uint32_t rva) {
     return aowl_pro_find(rva) ? 1 : 0;
 }
 
+/* Copy an RVA's ORIGINAL bytes out for a reader outside this TU -- the
+ * `aowlspt.host::original_bytes` verb, which is how a MOD's own verifier
+ * (aowlspt/callrva) byte-verifies a call target the host has ALREADY
+ * detoured: the live bytes there are our trampoline's JMP and the truth is in
+ * this table, primed before any detour. FIND only, never capture: a capture
+ * from here would run after the host's detours and could record a trampoline
+ * as the truth. Returns the bytes copied; 0 when the RVA was never primed,
+ * which the caller must treat as "no answer", not as "no such function". */
+static int32_t aowl_pro_copy(uint32_t rva, unsigned char* out, int32_t n) {
+    AowlProRow* r = aowl_pro_find(rva);
+    if (!r || !out || n <= 0) return 0;
+    if (n > r->len) n = r->len;
+    memcpy(out, r->b, (size_t)n);
+    return n;
+}
+
 /* Diagnostics, so the boot log can state the snapshot's health rather than
  * leaving it to be inferred. */
 static int32_t aowl_pro_rows_used(void)   { return aowl_pro_used; }

@@ -16,11 +16,14 @@
 ##   declared prologue against a CAPTURE-ONCE snapshot of the original bytes,
 ##   and refuses -- by name, with a sentence -- on a mismatch, on an RVA outside
 ##   the image, on an RVA outside the `il2cpp` section (generated code lives
-##   there, NOT in `.text`), and on a first byte that is a JUMP. That last one
-##   is the important refusal: it means somebody detoured the function before we
-##   looked, so what is at that address is a TRAMPOLINE and not the function --
-##   a hook-ORDER problem, which is named as such instead of being blamed on the
-##   RVA.
+##   there, NOT in `.text`). A first byte that is a JUMP means somebody
+##   detoured the function before we looked -- almost always the HOST's own
+##   uihooks/nativetabs hooks (MEASURED 2026-09-05: `Toggle::Set`,
+##   `SettingsScreen::Close`, `MenuScreen::ShowInRaid`, and the raid entry
+##   stopped at SIDE while they were refused). Calling THROUGH a hook is
+##   correct, so `callrva` then asks the host for its pre-detour snapshot
+##   (`aowlspt.host::original_bytes`) and byte-verifies against THAT; a host
+##   with no row for the RVA, or a mismatch, is still a refusal by name.
 ## * **Never DETOUR a shared RVA.** This file detours nothing at all, so the
 ##   hazard has no surface here. `owners` is still carried from the generated
 ##   table and printed, because "1 owner" said out loud is worth more than an

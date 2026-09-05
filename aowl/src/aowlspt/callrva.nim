@@ -63,6 +63,8 @@
 ##
 ## The C side is `abi/aowlspt_callrva.h`. Compile with `--passC:-I<repo>/abi`.
 
+import std/strutils
+import ".." / aowlspt
 import aowlspt/il2cpp
 
 {.emit: """#include "aowlspt_callrva.h" """.}
@@ -75,6 +77,7 @@ proc cTargetInit(t: Il2CppPtr; rva: uint32) {.importc: "aowl_crva_t_init", nodec
 proc cTargetSigByte(t: Il2CppPtr; i: int32; v: int32) {.importc: "aowl_crva_t_sigbyte", nodecl.}
 proc cTargetSetOwners(t: Il2CppPtr; n: int32) {.importc: "aowl_crva_t_owners", nodecl.}
 proc cTargetVerify(t: Il2CppPtr): int32 {.importc: "aowl_crva_verify_w", nodecl.}
+proc cTargetAccept(t: Il2CppPtr; snap: Il2CppPtr; n: int32): int32 {.importc: "aowl_crva_t_accept", nodecl.}
 
 proc cSlotSetP(a: Il2CppPtr; i: int32; v: Il2CppPtr) {.importc: "aowl_fast_set_p", nodecl.}
 proc cSlotSetG(a: Il2CppPtr; i: int32; v: int64) {.importc: "aowl_fast_set_g", nodecl.}
@@ -113,6 +116,36 @@ static void aowl_crva_t_owners(void* p, int32_t n) {
 }
 static int32_t aowl_crva_verify_w(void* p) {
     return aowl_crva_verify((AowlCrvaTarget*)p);
+}
+
+/* The DETOURED case, resolved. `aowl_crva_verify` refused because the live
+ * first bytes are a JUMP; the nimony side then asked the HOST for its startup
+ * snapshot of that RVA (`aowlspt.host::original_bytes`, primed before any
+ * detour) and hands those bytes here. Same compare as the verify, against the
+ * host's bytes instead of live memory; on a match the host's bytes are what
+ * this mod's own snapshot table records for the RVA -- never the trampoline.
+ * Everything that could refuse still refuses: module, section, page, length,
+ * mismatch. */
+static int32_t aowl_crva_t_accept(void* tp, const unsigned char* snap, int32_t n) {
+    AowlCrvaTarget* t = (AowlCrvaTarget*)tp;
+    int32_t why = AOWL_CRVA_OK;
+    void* p;
+    unsigned char b[AOWL_CRVA_SIG_BYTES];
+    if (!t || !snap || n <= 0 || n > AOWL_CRVA_SIG_BYTES) return AOWL_CRVA_BAD_ARG;
+    if (t->siglen <= 0) { t->why = AOWL_CRVA_NO_SIG; t->verified = 1; return t->why; }
+    if (n < t->siglen) { t->why = AOWL_CRVA_MISMATCH; t->verified = 1; return t->why; }
+    p = aowl_crva_code(t->rva, &why);
+    if (!p) { t->why = why; t->verified = 1; return t->why; }
+    if (memcmp(snap, t->sig, (size_t)t->siglen) != 0) {
+        t->why = AOWL_CRVA_MISMATCH; t->verified = 1; return t->why;
+    }
+    memset(b, 0, sizeof b);
+    memcpy(b, snap, (size_t)n);
+    if (!aowl_crva_snap_find(t->rva)) (void)aowl_crva_snap_take(t->rva, b);
+    t->fn = p;
+    t->why = AOWL_CRVA_OK;
+    t->verified = 1;
+    return AOWL_CRVA_OK;
 }
 
 /* The nimony side carries the target as an opaque byte array, so the two
@@ -381,9 +414,69 @@ proc looksZeroed*(t: RvaTarget): bool =
   ## was declared" -- which is true, and is not the cause.
   t.rva == 0'u32 and t.declaredSig.len == 0 and t.name.len == 0
 
+const AowlCrvaDetoured = 5'i32
+  ## `AOWL_CRVA_DETOURED` in abi/aowlspt_callrva.h; mirrored here because the
+  ## nimony side branches on it and a header define is not visible to nimony.
+
+proc hostSnapshot(rva: uint32; outb: var array[16, uint8]; n: var int;
+                  why: var string): bool =
+  ## Ask the host for its STARTUP snapshot of the first bytes at `rva` --
+  ## `call("aowlspt.host::original_bytes", {"rva":"0x.."})`, answered from the
+  ## prologue table the host primes before it installs any detour. Three
+  ## outcomes: bytes (true), the host said it has no row (false, `why` quotes
+  ## it), or the host has no such verb / is not bound (false, `why` says so).
+  ## A host that predates the verb makes every detoured target a refusal, as
+  ## before -- never a silent pass.
+  n = 0
+  why = ""
+  if not hostReady():
+    why = "the host is not bound yet, so it could not be asked"
+    return false
+  var raw = ""
+  let args = "{\"rva\":\"0x" & hexRva(rva) & "\"}"
+  let st = call("aowlspt.host::original_bytes", args, raw)
+  if st != Ok:
+    why = "this host has no `aowlspt.host::original_bytes` verb (status " &
+          $st & "), so a function the host detours cannot be verified from " &
+          "a mod on this host build"
+    return false
+  if find(raw, "\"have\":true") < 0:
+    why = "the host answered without bytes: " & raw
+    return false
+  let at = find(raw, "\"bytes\":\"")
+  if at < 0:
+    why = "the host said have=true but carried no `bytes` field: " & raw
+    return false
+  var i = at + 9
+  var hi = -1'i32
+  while i < raw.len and n < 16:
+    let c = raw[i]
+    if c == '"': break
+    var v = 0'i32
+    if not hexNib(c, v):
+      why = "the host's `bytes` field is not hex: " & raw
+      n = 0
+      return false
+    if hi < 0:
+      hi = v
+    else:
+      outb[n] = uint8(hi * 16'i32 + v)
+      inc n
+      hi = -1'i32
+    inc i
+  if n == 0:
+    why = "the host's `bytes` field was empty: " & raw
+    return false
+  result = true
+
 proc verify*(t: var RvaTarget): CallOutcome =
   ## Byte-verify the target without calling it. Idempotent and cached. Safe to
   ## run at mod init: it only reads the code page and never patches.
+  ##
+  ## A target whose LIVE first bytes are a JUMP is not refused outright any
+  ## more: the host is asked for its pre-detour snapshot and the compare runs
+  ## against that (see `hostSnapshot`). Calling through a hook is correct;
+  ## what was never acceptable was trusting a trampoline as identity.
   if looksZeroed(t):
     return CallOutcome(kind: coRefused, code: 7'i32, g: 0'i64, f: 0.0,
       why: "this RvaTarget is entirely ZEROED (no name, rva 0, no prologue). " &
@@ -392,14 +485,48 @@ proc verify*(t: var RvaTarget): CallOutcome =
            "zeroed. Declare the global BARE and assign it from onLoad, never " &
            "`var t = rvaTarget(...)` at module scope.")
   prepare(t)
+  let ownersNote =
+    (if t.owners == 1'i32: ", 1 owner"
+     elif t.owners > 1'i32: ", " & $t.owners & " owners share this RVA (fine to CALL, never to detour)"
+     else: "")
   let code = cTargetVerify(cast[Il2CppPtr](addr t.storage[0]))
   if code == 0'i32:
     result = CallOutcome(kind: coOk, why: t.name & ": prologue verified " &
-      "against the snapshot [" & describe(t) & "]" &
-      (if t.owners == 1'i32: ", 1 owner"
-       elif t.owners > 1'i32: ", " & $t.owners & " owners share this RVA (fine to CALL, never to detour)"
-       else: ""),
+      "against the snapshot [" & describe(t) & "]" & ownersNote,
       code: 0'i32, g: 0'i64, f: 0.0)
+  elif code == AowlCrvaDetoured:
+    # The live bytes are somebody's JUMP. That somebody is almost always the
+    # HOST (MEASURED 2026-09-05: Toggle::Set, SettingsScreen::Close and
+    # MenuScreen::ShowInRaid, all hooked by uihooks/nativetabs), and CALLING
+    # through a hook is correct -- the hook runs, then the original. What the
+    # byte-compare is for is identity, and the host kept the pre-detour bytes:
+    # ask it. No answer, or a different answer, is still a refusal.
+    var snap = [0'u8, 0'u8, 0'u8, 0'u8, 0'u8, 0'u8, 0'u8, 0'u8,
+                0'u8, 0'u8, 0'u8, 0'u8, 0'u8, 0'u8, 0'u8, 0'u8]
+    var n = 0
+    var whyHost = ""
+    if hostSnapshot(t.rva, snap, n, whyHost):
+      let code2 = cTargetAccept(cast[Il2CppPtr](addr t.storage[0]),
+                                cast[Il2CppPtr](addr snap[0]), int32(n))
+      if code2 == 0'i32:
+        result = CallOutcome(kind: coOk, why: t.name & ": prologue verified " &
+          "against the HOST's startup snapshot -- the live bytes are a JUMP " &
+          "because the host itself detours this function; a CALL goes " &
+          "through its hook and then the original, which is correct code " &
+          "for this receiver [" & describe(t) & "]" & ownersNote,
+          code: 0'i32, g: 0'i64, f: 0.0)
+      else:
+        result = CallOutcome(kind: coRefused,
+          why: t.name & ": " & reasonOf(code2) & " -- compared against the " &
+               "HOST's startup snapshot, because the live bytes are a JUMP [" &
+               describe(t) & "]",
+          code: code2, g: 0'i64, f: 0.0)
+    else:
+      result = CallOutcome(kind: coRefused,
+        why: t.name & ": " & reasonOf(code) & "; the host was asked for its " &
+             "startup snapshot of this RVA and " & whyHost & " [" &
+             describe(t) & "]",
+        code: code, g: 0'i64, f: 0.0)
   else:
     result = CallOutcome(kind: coRefused,
       why: t.name & ": " & reasonOf(code) & " [" & describe(t) & "]",

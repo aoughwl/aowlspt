@@ -1122,6 +1122,7 @@ proc cGtLine(i: int32): cstring {.importc: "aowl_gt_line", nodecl.}
 var gGatesOn = false
 proc cProBadCount(): int32 {.importc: "aowl_pro_bad_count", nodecl.}
 proc cProHave(rva: uint32): int32 {.importc: "aowl_pro_have", nodecl.}
+proc cProCopy(rva: uint32; outp: Il2CppPtr; n: int32): int32 {.importc: "aowl_pro_copy", nodecl.}
 ## THE OVERFLOW REPORT. `aowl_pro_full` was incremented on every refused row and
 ## read by NOTHING, so a table that had run out of rows was invisible: the
 ## affected features' verifies failed closed and each of them reported the
@@ -2829,6 +2830,52 @@ proc tableStatsReport(): string =
            ",\"allocBytes\":" & $allocatedBytes() &
            ",\"allocLive\":" & $liveBytes() & "}"
 
+proc obHexToU32(s: string; ok: var bool): uint32 =
+  ## "0x55ba450", "55BA450" or a plain decimal -> uint32, by hand. The verb
+  ## that uses this answers on any thread with no runtime, and a parse that
+  ## throws is not an answer; a string it cannot read yields ok=false.
+  ok = false
+  var i = 0
+  var hex = false
+  if s.len >= 2 and s[0] == '0' and (s[1] == 'x' or s[1] == 'X'):
+    hex = true
+    i = 2
+  if i >= s.len: return 0'u32
+  var v = 0'u64
+  while i < s.len:
+    let c = s[i]
+    var d = -1
+    if c >= '0' and c <= '9': d = ord(c) - ord('0')
+    elif c >= 'a' and c <= 'f': d = ord(c) - ord('a') + 10
+    elif c >= 'A' and c <= 'F': d = ord(c) - ord('A') + 10
+    if d < 0 or (not hex and d >= 10): return 0'u32
+    v = v * (if hex: 16'u64 else: 10'u64) + uint64(d)
+    if v > 0xFFFFFFFF'u64: return 0'u32
+    inc i
+  ok = true
+  result = uint32(v)
+
+proc obHexU32(v: uint32): string =
+  const digits = "0123456789abcdef"
+  result = ""
+  var started = false
+  var shift = 28
+  while shift >= 0:
+    let nib = int((v shr uint32(shift)) and 0xF'u32)
+    if nib != 0 or started or shift == 0:
+      started = true
+      result.add digits[nib]
+    shift = shift - 4
+
+proc obHexBytes(bs: openArray[uint8]; n: int): string =
+  const digits = "0123456789abcdef"
+  result = ""
+  var i = 0
+  while i < n and i < bs.len:
+    result.add digits[int(bs[i] shr 4'u8)]
+    result.add digits[int(bs[i] and 0x0F'u8)]
+    inc i
+
 proc hostCall(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
               args: Il2CppPtr; argsLen: int32;
               outPtr: Il2CppPtr; outLen: Il2CppPtr): int32 {.
@@ -2976,6 +3023,42 @@ proc hostCall(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
                  ",\"gameWorld\":" & (if rpGameWorld(): "true" else: "false") &
                  ",\"deployed\":" & (if rpDeployed(): "true" else: "false") &
                  ",\"why\":\"" & caEsc(rpWhy()) & "\"}"
+    return cOutCopy(outPtr, outLen, cast[Il2CppPtr](toCString(report)),
+                    int32(report.len))
+
+  # `original_bytes` -- the host's STARTUP snapshot of a function's first
+  # bytes, so a mod's own verifier (`aowlspt/callrva`) can byte-verify a call
+  # target the host has ALREADY detoured. MEASURED 2026-09-05: mods/autoraid
+  # refused `Toggle::Set`, `SettingsScreen::Close` and `MenuScreen::ShowInRaid`
+  # as "the first bytes are a JUMP" because the host hooks all three, and the
+  # raid entry stopped at SIDE. The live bytes there ARE our trampoline's JMP;
+  # the truth is the prologue table, primed before any detour. FIND only: an
+  # RVA that was never primed answers have=false and the mod keeps its
+  # refusal -- this never captures, because a capture now could record a
+  # trampoline. Generic (nothing here is any one mod's), answered without the
+  # runtime, touches no game memory.
+  if spec == "aowlspt.host::original_bytes":
+    let rvaText = caJsonStr(argText, "rva", 0, argText.len)
+    var okRva = false
+    let rva = obHexToU32(rvaText, okRva)
+    var report = ""
+    if not okRva:
+      report = "{\"have\":false,\"why\":\"the args carry no parseable rva " &
+               "(want {rva: 0x<hex>} as a JSON string); got: " &
+               caEsc(rvaText) & "\"}"
+    else:
+      var buf = [0'u8, 0'u8, 0'u8, 0'u8, 0'u8, 0'u8, 0'u8, 0'u8,
+                 0'u8, 0'u8, 0'u8, 0'u8, 0'u8, 0'u8, 0'u8, 0'u8]
+      let n = cProCopy(rva, cast[Il2CppPtr](addr buf[0]), 16'i32)
+      if n <= 0'i32:
+        report = "{\"rva\":\"0x" & obHexU32(rva) & "\",\"have\":false," &
+                 "\"why\":\"no startup-snapshot row for this RVA: the host " &
+                 "never primed or patched it, so it holds no authoritative " &
+                 "original bytes (" & $cProRowsUsed() & " row(s) primed)\"}"
+      else:
+        report = "{\"rva\":\"0x" & obHexU32(rva) & "\",\"have\":true," &
+                 "\"len\":" & $n & ",\"bytes\":\"" & obHexBytes(buf, int(n)) &
+                 "\",\"source\":\"startup-snapshot\"}"
     return cOutCopy(outPtr, outLen, cast[Il2CppPtr](toCString(report)),
                     int32(report.len))
 

@@ -187,7 +187,9 @@
 #define AOWL_CRVA_DETOURED      5  /* first bytes are a JUMP and no snapshot
                                     * exists: what is here is a TRAMPOLINE,
                                     * not the function. A hook-order problem,
-                                    * not a bad RVA.                        */
+                                    * not a bad RVA. callrva.nim then asks
+                                    * the HOST for ITS snapshot (see the
+                                    * snapshot note below).                 */
 #define AOWL_CRVA_MISMATCH      6  /* snapshot != declared prologue         */
 #define AOWL_CRVA_NO_SIG        7  /* the mod declared no prologue at all   */
 #define AOWL_CRVA_BAD_ARG       8  /* an argument buffer failed VirtualQuery
@@ -301,9 +303,11 @@ static int32_t aowl_crva_looks_detoured(const unsigned char* p) {
  *
  * Identical in intent and discipline to `abi/aowlspt_prologue.h`, which is a
  * HOST header: it is `static`, so a mod that included it would get its own
- * empty table anyway, and the host does not export an accessor to the real
- * one. That is a real gap and it is stated rather than papered over --
- * see the note on AOWL_CRVA_DETOURED. What makes a mod-local table still
+ * empty table anyway. The host DOES answer for the real one since 2026-09-05:
+ * `call("aowlspt.host::original_bytes", {"rva":"0x.."})` copies a primed
+ * row out, and `aowl_crva_t_accept` (callrva.nim) runs this same compare
+ * against those bytes when the live first bytes are a JUMP -- see the note
+ * on AOWL_CRVA_DETOURED. What makes a mod-local table still
  * correct is the same argument the host header makes: a target's FIRST verify
  * necessarily precedes THIS mod's first use of it, and this file never
  * patches anything, so the only way a snapshot can be poisoned is if some
