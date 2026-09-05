@@ -507,6 +507,18 @@ static int32_t aowl_ar_key_escape(int32_t down) {
     else      lp = (LPARAM)(1 | (0x01 << 16) | (1 << 30)) | ((LPARAM)1 << 31);
     return PostMessageW(h, down ? WM_KEYDOWN : WM_KEYUP, (WPARAM)VK_ESCAPE, lp) ? 1 : 0;
 }
+/* THE FALLBACK. MEASURED 2026-09-05 14:02, DEPLOYED on Woods with the maps HUD
+ * on: the posted WM_KEYDOWN/WM_KEYUP pair (which had opened the menu on four
+ * exits and from outside the process) opened NOTHING -- site 2 never fired --
+ * while a keybd_event ESC opened it at once, with the game NOT the foreground
+ * window (Unity takes the key through raw input). Something on the game's UI
+ * thread eats posted key messages in that state (the host installs
+ * WH_GETMESSAGE/WH_CALLWNDPROC hooks for its overlays; which one is a host
+ * question). keybd_event also reaches whatever IS foreground, so it is the
+ * second try, announced, never the first. */
+static void aowl_ar_key_escape_raw(int32_t down) {
+    keybd_event(VK_ESCAPE, 0x01, down ? 0 : KEYEVENTF_KEYUP, 0);
+}
 """.}
 
 import aowlspt/il2cpp
@@ -535,9 +547,17 @@ proc cKeyDowns(): int64 {.importc: "aowl_ar_key_downs", nodecl.}
 proc cKeyRefused(): int64 {.importc: "aowl_ar_key_refused", nodecl.}
 proc cGameWindow(): int32 {.importc: "aowl_ar_game_window", nodecl.}
 proc cKeyEscape(down: int32): int32 {.importc: "aowl_ar_key_escape", nodecl.}
+proc cKeyEscapeRaw(down: int32) {.importc: "aowl_ar_key_escape_raw", nodecl.}
 
 proc gameWindowExists*(): bool =
   cGameWindow() != 0'i32
+
+proc keyEscapeRaw*(down: bool) =
+  ## ONE half of an ESC keystroke through the OS input queue (`keybd_event`).
+  ## Reaches the game through raw input whether or not it is foreground --
+  ## and ALSO whatever is foreground, so the exit machine tries the posted
+  ## message first and only falls back to this, saying so.
+  cKeyEscapeRaw(if down: 1'i32 else: 0'i32)
 
 proc keyEscape*(down: bool): bool =
   ## ONE half of an ESC keystroke, POSTED to the game window (see the C note:

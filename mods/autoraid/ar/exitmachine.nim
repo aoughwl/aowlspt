@@ -82,6 +82,7 @@ const
                               ## having said nothing for 20 s is what made the
                               ## last refusal unactionable.
   XrLeaveMs     = 6000'i64    ## how long a LeaveButton is waited for before SKIP
+  XrEscPostMs   = 3000'i64    ## how long the POSTED ESC gets before the raw fallback
   XrTotalMs     = 180000'i64  ## whole-run ceiling
   XrTickFrames  = 12          ## ~0.2 s between attempts
   XrMaxFaults   = 3
@@ -115,8 +116,10 @@ var gSaidNoRecv = false
 var gSaidNoDisc = false
 var gStage = "IDLE"
 var gAnswer = ""
-var gEscPhase = 0                 ## 0 nothing sent, 1 ESC down sent, 2 up sent
+var gEscPhase = 0                 ## 0 nothing sent, 1 ESC down sent, 2 up sent,
+                                  ## 3 raw fallback down sent, 4 raw up sent
 var gEscEpoch = 0                 ## site-2 epoch when ESC went down
+var gEscT0 = 0'i64                ## when the posted ESC went in
 var gSaidWaitShow = false
 
 proc stage*(): string = gStage
@@ -171,6 +174,7 @@ proc arm*(reason: string; why: var string): bool =
   gSaidNoDisc = false
   gEscPhase = 0
   gEscEpoch = 0
+  gEscT0 = 0'i64
   gSaidWaitShow = false
   goto(XrShow)
   gAnswer = "ARMED, step SHOW-IN-RAID"
@@ -224,6 +228,7 @@ proc tickBody(now: int64) =
              "refused, so no key went in")
         return
       gEscPhase = 1
+      gEscT0 = now
       info "AutoRaid exit: ESC posted (WM_KEYDOWN) to the game window -- " &
            "the player's own path, foreground or not. WAITING for uihooks " &
            "site 2 (MenuScreen::Show(5-arg)) to fire AFTER this press " &
@@ -234,7 +239,27 @@ proc tickBody(now: int64) =
       discard keyEscape(false)
       gEscPhase = 2
       return
+    if gEscPhase == 3:
+      keyEscapeRaw(false)
+      gEscPhase = 4
+      return
     if epochOf(SiteMenuShow) <= gEscEpoch:
+      # THE FALLBACK, after a bounded wait for the posted key. MEASURED
+      # 2026-09-05: with the maps HUD on, the posted pair opened nothing while
+      # a keybd_event ESC opened the menu at once (raw input, foreground or
+      # not). Announced, because keybd_event also reaches the foreground app.
+      if gEscPhase == 2 and now - gEscT0 > XrEscPostMs:
+        keyEscapeRaw(true)
+        gEscPhase = 3
+        warn "AutoRaid exit: the POSTED ESC did not bring site 2 in " &
+             $int(XrEscPostMs div 1000'i64) & " s (epoch still " &
+             $epochOf(SiteMenuShow) & "), so a RAW keystroke (keybd_event) " &
+             "is sent instead -- it reaches the game through raw input " &
+             "whether or not it is foreground, and ALSO whatever is " &
+             "foreground. Something on the game's UI thread eats posted key " &
+             "messages in this state; the host's message hooks are the " &
+             "suspects."
+        return
       if now - gStepT0 > XrSayMs and not gSaidWaitShow:
         gSaidWaitShow = true
         info "AutoRaid exit: ESC went in and site 2 has not fired yet (epoch " &
