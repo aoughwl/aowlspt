@@ -224,6 +224,7 @@ var gNpfSeedWhy = ""
 ## outcomes and none may be inferred from either of the others.
 var gNpfApplyAsked = 0
 var gNpfApplyCalled = 0
+var gNpfCensusLast = ""   ## the census line last printed; identical = silent
 var gNpfApplyVerified = 0
 var gNpfApplyIncon = 0
 var gNpfApplyWhy = ""
@@ -1230,13 +1231,22 @@ proc npfApplyVerdict() =
   if gNpfApplyAsked == 0: return
   if gNpfApplyVerified == gNpfApplyAsked:
     return    # every APPLIED line was already printed by npfApplyRow.
-  warn "native postfx: APPLY CENSUS -- " & $gNpfApplyAsked & " asked, " &
+  # PRINTED ON CHANGE, NEVER PER TICK. MEASURED 2026-09-05: this ran from
+  # npfOnPanelUp every frame the POSTFX panel was up and printed the SAME
+  # line 60 times a second -- 18,651 of a boot's 22,600 host-log lines, 8 MB,
+  # after eleven rows stayed INCONCLUSIVE at the menu (no raid camera). A
+  # verdict that repeats itself unchanged is noise that buries every other
+  # line; it is printed when its numbers or its reason change.
+  let line = "native postfx: APPLY CENSUS -- " & $gNpfApplyAsked & " asked, " &
        $gNpfApplyCalled & " call(s)/store(s) made, " & $gNpfApplyVerified &
        " READ BACK from the finished state, " & $gNpfApplyIncon &
        " INCONCLUSIVE (could not be examined at all, which is neither a pass " &
        "nor a fail). First reason: " &
        (if gNpfApplyWhy.len > 0: gNpfApplyWhy
         else: "none was recorded, which is itself a defect") & "."
+  if line == gNpfCensusLast: return
+  gNpfCensusLast = line
+  warn line
 
 ## ---------------------------------------------------------------------------
 ## THE TICK ENTRY POINTS. Called from the settings-screen tick, INSIDE the

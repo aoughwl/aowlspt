@@ -192,6 +192,10 @@ var gPfxRowCtrl: seq[Il2CppPtr] = @[]
 var gPfxScrollInit = false
 var gPfxScrollOn = false           ## `settingsPostFxScroll`, DEFAULT OFF
 var gPfxScrollGo: Il2CppPtr = nil  ## the cloned SettingsList we own
+var gPfxPanelUpNow = false         ## this tick's `postUp`, for the build to read
+var gPfxGraftDeferred = false      ## rows built hidden; the graft waits for panel-up
+var gPfxGraftTab: Il2CppPtr = nil
+var gPfxGraftParent: Il2CppPtr = nil
 var gPfxScrollHostT: Il2CppPtr = nil     ## ...its transform (the scroll host)
 var gPfxScrollContentT: Il2CppPtr = nil  ## the clone's Content -- the new root
 var gPfxScrollBarT: Il2CppPtr = nil      ## the clone's Scrollbar
@@ -2992,7 +2996,31 @@ proc pfxBuild(): bool =
     gPfxScrollOn = readBoolKeyDef("settingsPostFxScroll", false)
   var scrollRoot: Il2CppPtr = nil
   if gPfxScrollOn:
-    discard pfxScrollify(tab, parent, scrollRoot)
+    if gPfxPanelUpNow:
+      discard pfxScrollify(tab, parent, scrollRoot)
+    else:
+      # THE GRAFT NEVER RUNS INTO A HIDDEN PANEL. MEASURED 2026-09-05, twice
+      # (the user's click and an inspector `tab` press, same stack): with the
+      # ScrollRect clone grafted while the panel was hidden, the panel's FIRST
+      # activation -- SettingsScreen::ShowScreen(PostFX) -> SettingsTab::
+      # set_IsSelected -> SetActive -> RectMask2D.OnEnable -> MaskUtilities::
+      # Notify2DMaskStateChanged -> GameObject::GetComponentsInChildren ->
+      # UnityPlayer -> WaitForSingleObjectEx -- never returned: the Unity
+      # main thread stopped calling TarkovApplication::Update, the process
+      # stayed alive with no dialog and no crash record, and the user saw it
+      # as a crash. With the graft off the same press switched the panel in
+      # under a frame. The rows are still built hidden (defect 3, no flash
+      # for them); only the clone waits for the first panel-up tick, which is
+      # the ordering that worked before defect 3 moved the build.
+      gPfxGraftDeferred = true
+      gPfxGraftTab = tab
+      gPfxGraftParent = parent
+      info "postfx rows SCROLL: graft DEFERRED -- the panel is hidden, and " &
+           "grafting the ScrollRect clone into a hidden panel is MEASURED to " &
+           "deadlock Unity at the panel's first activation (RectMask2D " &
+           "enable -> GetComponentsInChildren -> WaitForSingleObject, " &
+           "forever). The rows are built now; the graft runs on the first " &
+           "tick the panel is up."
   # THE ROW PARENT MAY HAVE MOVED. If the graft succeeded, the rows now live
   # in the clone's Content and every later measurement -- the width check, the
   # verdict -- must be against THAT, not against the panel they were built in.
@@ -3252,6 +3280,7 @@ proc pfxOnPanelUp(postUp: bool) =
   # which is not re-entrant. Its own gate is one boolean compare when the flag
   # is off.
   npfOnPanelUp(postUp)
+  gPfxPanelUpNow = postUp
   if not gPfxOn or gPfxOff:
     return
   # THE FIRST FRAME THE PANEL WAS ACTUALLY ACTIVE, latched once. Everything
@@ -3285,6 +3314,24 @@ proc pfxOnPanelUp(postUp: bool) =
     elif gPfxTried < 2:
       discard pfxBuild()
     return
+  if gPfxGraftDeferred and postUp:
+    # The deferred half of the build (see pfxBuild): the panel is up now, so
+    # the clone is instantiated into an ACTIVE subtree, which is the ordering
+    # the graft has always worked under.
+    gPfxGraftDeferred = false
+    var root: Il2CppPtr = nil
+    if pfxScrollify(gPfxGraftTab, gPfxGraftParent, root) and root != nil:
+      let jg = nuReadGeom(root)
+      if jg.ok: gPfxParentW = jg.rectW
+      gPfxScrollJudgeRoot = root
+      gPfxScrollJudge = PfxScrollJudgeDelay
+      okLog "postfx rows SCROLL: the DEFERRED graft ran on the first " &
+            "panel-up tick (the rows were built hidden); the scroll verdict " &
+            "is re-armed against the clone's Content."
+    else:
+      warn "postfx rows SCROLL: the DEFERRED graft did not complete on the " &
+           "first panel-up tick -- its own refusal line above says why. The " &
+           "rows stay in the unscrolled panel."
   if not postUp:
     return
   # THE LAYOUT DRIVER ON 'Panel' GETS THE LAST WORD OTHERWISE. Read-compare-
