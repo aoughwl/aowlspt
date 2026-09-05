@@ -161,6 +161,9 @@ ITEMS = [
     S("markers.py", "fast"),                           # 0.5s
     S("modharness.py", "fast"),                        # 0.6s
     S("offscreen.py", "fast"),                         # 1.7s
+    S("pfxstress.py", "fast",
+      note="parsers on captured inspector fixtures; the live loop itself "
+           "needs a client at Settings and is never run from here"),      # 0.1s
     S("shapeaudit.py", "fast"),                        # 0.1s
     # The three offline invariant gates from docs/INTERACTION-LAYER-MAP.md 7.2.
     # Each --selftest builds fixture trees and asserts PASS, FAIL and
@@ -435,6 +438,11 @@ VERIFIERS = [
     V("offscreen.py", "offscreen.py --selftest",
       "creates a real window and checks the detector against it; states "
       "explicitly that it says nothing about the client"),
+    V("pfxstress.py", "pfxstress.py --selftest",
+      "parsers on captured inspector fixtures with a negative per parser "
+      "(a wrong parent name, a wrong component type) and the stall regex "
+      "refusing the boot-time 'has not called the method yet' line; the "
+      "live loop confirms a freeze with a second probe, never a lone timeout"),
     V("entergame.py", "entergame.py --selftest",
       "offline; presses nothing and asserts the refusal paths"),
     V("exitraid.py", "exitraid.py --selftest"),
