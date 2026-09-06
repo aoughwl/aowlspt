@@ -79,5 +79,16 @@
   "ambushChance": 0.15,
 
   "_autoRaidRequests": "NOT DONE, and off for that reason: /spawn emits the mod-bus event basement.raid.request {map,x,y,z}, and mods/autoraid is the intended consumer but does not subscribe to it yet (DESIGN.md §10). Turning this on today emits an event nothing listens to.",
-  "autoRaidRequests": false
+  "autoRaidRequests": false,
+
+  "_bridge": "THE CLIENT HALF (aowlspt only). Read by the same DLL when it is loaded into the game. It does nothing unless bridgeEnabled is true AND the host flags hostHttp and hostPlayWav are on (both default OFF in aowlspt-host.json); every refusal is logged once, by name.",
+  "bridgeEnabled": false,
+  "_bridgeBackendUrl": "Where the backend answers. https:// is refused by the host verb; the host allowlist is loopback only.",
+  "bridgeBackendUrl": "http://127.0.0.1:6969",
+  "_bridgePollWaitMs": "How long /events may hold the request open, clamped 0..25000 (the backend's own cap).",
+  "bridgePollWaitMs": 20000,
+  "_bridgePttKey": "Push-to-talk key. NOTHING READS IT TODAY (no host verb reports key state); drive PTT with the bus event basement.ptt {state:down|up}.",
+  "bridgePttKey": "V",
+  "_bridgeSpawnOnMenu": "At MENU, ask GET /spawn and hand the map to mods/autoraid (autoraid.arm). Never re-arms while a request is unanswered or the phase is not MENU.",
+  "bridgeSpawnOnMenu": true
 }

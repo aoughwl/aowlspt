@@ -643,6 +643,7 @@
       "pipeline": ">=0.1.0",
       "sides": [
         "server",
+        "client",
         "sim"
       ],
       "source": {

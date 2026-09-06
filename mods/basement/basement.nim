@@ -44,6 +44,7 @@ import "bm" / llm
 import "bm" / brain
 import "bm" / speech
 import "bm" / stream
+import "bridge" / bridge
 
 const
   ModGuid = "aowl.basement"
@@ -1817,8 +1818,14 @@ proc onTick(payload: string): string =
 proc onLoad(): Status =
   declareSettings(basementSchema())
   if side() == sideClient:
-    info ModName & " is a server mod; its routes do not exist on the client"
-    return Ok
+    # The CLIENT HALF: the thin bridge of CLIENT-CONTRACT.md / BRIDGE-AOWLSPT.md.
+    # It never reasons; it long-polls /events through `aowlspt.host::http`,
+    # plays `say` segments through `aowlspt.host::play_wav`, hands the next
+    # map to mods/autoraid at MENU, and reports raid facts. Every missing host
+    # verb or OFF flag is refused ONCE, by name, and the half stays inert.
+    info ModName & ": client side -- starting the bridge (server routes do " &
+         "not exist here)"
+    return bridgeInit()
   loadConfig()
 
   var parts: seq[string] = @[]
@@ -1915,11 +1922,18 @@ proc onLoad(): Status =
          StatusRoute
   Ok
 
+proc onUpdate(elapsedMs: int64): Status =
+  ## Only the client half ticks here; the server half runs on `everyMs`.
+  if side() == sideClient:
+    bridgeTick(elapsedMs)
+  Ok
+
 exportMod(
   guid = ModGuid,
   name = ModName,
   author = ModAuthor,
   version = ModVersion,
   sptRange = "*",
-  sides = {sideServer, sideSim},
-  onLoad = onLoad)
+  sides = {sideServer, sideClient, sideSim},
+  onLoad = onLoad,
+  onUpdate = onUpdate)
