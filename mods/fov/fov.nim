@@ -5120,6 +5120,8 @@ proc anyFovEffectEnabled(): bool =
   ## ~0.12 ms). Gating the arm on a real effect drops that peak to nothing.
   cfgEnableFovWrite or cfgEnableFovScaleFix or cfgChangeMouseSensitivity
 
+var gArmAsked = false   ## the one-shot that replaced `world.ready()`; see onUpdate
+
 proc onUpdate(elapsedMs: int64): Status =
   if side() != sideClient:
     return Ok
@@ -5152,7 +5154,20 @@ proc onUpdate(elapsedMs: int64): Status =
   # `world.ready()` is a one-shot -- it returns true on exactly the first tick the
   # type resolves and false forever after -- so it MUST be read once per frame, into
   # a local, or a second read consumes the edge and the arm never happens.
-  let worldReady = world.ready()
+  # ARM ON THE FIRST TICK, not on `world.ready()`. MEASURED 2026-09-06 (three
+  # DEPLOYED raids on host 5a3fcd01690f): `whenReady("EFT.GameWorld")` never
+  # fired, because the host's by-name resolve answers "no such type" for
+  # every mod until one is switched to the gated il2cpp layer (host log:
+  # "nothing resolves by name through it: no mod has been switched over";
+  # sain's arming step 1/7 "answered no" in the same boot). So this mod
+  # printed nothing past "loaded", never armed, and the camera stayed at
+  # the game's own 60.0 on ADS with enableFovWrite on -- the same 60.0 the
+  # control raid with the write OFF measured. The banner above already
+  # records that the world gate tested the wrong thing; the arming needs
+  # only the runtime and the main-thread drain, which the deferred poll
+  # below waits for. One-shot, like `ready()` was.
+  let worldReady = not gArmAsked
+  if worldReady: gArmAsked = true
   if worldReady and not anyFovEffectEnabled():
     if not gInertSaid:
       gInertSaid = true
