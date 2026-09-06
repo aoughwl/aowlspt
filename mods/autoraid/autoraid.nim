@@ -140,6 +140,53 @@ var gExitT0 = 0'i64
 var gLastExitPoll = 0'i64
 var gExitSaidWait = false
 
+# The BUS arm (`autoraid.arm`). Another client-side mod asks for a raid over the
+# host's event bus instead of the command line; it lands on the SAME
+# `machine.arm` and the SAME refusals.
+#
+# THREADING. An event handler runs on whichever thread EMITTED the event, and a
+# module-level Nim STRING assigned from a foreign thread is the measured
+# `corrupted thread-free list` crash -- an ARC value freed on a thread that does
+# not own it (`ar/showbus.nim`'s header). So the three strings this request
+# carries are staged in PLAIN CHAR ARRAYS, which are POD and owned by nobody,
+# and are turned back into Nim strings on the main thread where they are used.
+const BusTextCap = 64
+var gBusMapBuf: array[BusTextCap, char]
+var gBusMapLen = 0
+var gBusSideBuf: array[BusTextCap, char]
+var gBusSideLen = 0
+var gBusSrcBuf: array[BusTextCap, char]
+var gBusSrcLen = 0
+var gBusExitAfter = 0        ## `exitAfterSeconds` from the request; 0 = stay
+var gBusPending = false      ## a request is queued for the main thread
+var gBusArmed = false        ## ...and `machine.arm` accepted it
+var gBusVerdict = false
+var gBusT0 = 0'i64
+var gLastBusPoll = 0'i64
+var gBusRequests = 0
+var gBusRefusals = 0
+
+proc stash(dst: var array[BusTextCap, char]; n: var int; s: string) =
+  ## Copy at most `BusTextCap` bytes. TRUNCATES rather than overflowing; the
+  ## map cap `machine.arm` enforces is 32, so a 64-byte stage cannot silently
+  ## turn an over-long label into an acceptable one.
+  var i = 0
+  while i < s.len and i < BusTextCap:
+    dst[i] = s[i]
+    i = i + 1
+  n = i
+
+proc unstash(src: array[BusTextCap, char]; n: int): string =
+  result = ""
+  var i = 0
+  while i < n:
+    result.add src[i]
+    i = i + 1
+
+proc exitAfter(): int =
+  ## Seconds to dwell after DEPLOYED, from whichever request armed this raid.
+  if gBusArmed: gBusExitAfter else: exitAfterSeconds()
+
 # ---------------------------------------------------------------------------
 # The main-thread gate.
 #
@@ -222,22 +269,60 @@ proc onMainTick(payload: string): string =
              "not a failure of the flow. Read the AutoRaid lines above for " &
              "the step that is waiting."
 
+  # The BUS raid's verdict. Same shape as the command-line one and deliberately
+  # NOT folded into it: the two are armed by different requesters and a line
+  # that says CMDLINE about an event-armed raid would send the next reader to
+  # the launcher. It also sets `gDeployedAt`, which is what lets an
+  # `exitAfterSeconds` in the request reach the exit machine below.
+  if gBusArmed and not gBusVerdict:
+    let now = nowMs()
+    if machine.failed():
+      gBusVerdict = true
+      warn "AutoRaid BUS VERDICT FAIL -- " & machine.answer()
+    elif now - gLastBusPoll >= PhasePollMs:
+      gLastBusPoll = now
+      let p = raidPhase()
+      if deployed(p):
+        gBusVerdict = true
+        gDeployedAt = now
+        success "AutoRaid BUS VERDICT PASS -- the client reports phase " &
+                "DEPLOYED for map \"" & machine.wantedMap() & "\" (" & p.why &
+                "), armed by autoraid.arm from \"" &
+                unstash(gBusSrcBuf, gBusSrcLen) & "\". That is the game's OWN " &
+                "deploy signal. Screens advanced: " &
+                $machine.screensAdvanced() & "."
+      elif now - gBusT0 > CmdlineBoundMs:
+        gBusVerdict = true
+        warn "AutoRaid BUS VERDICT INCONCLUSIVE -- " &
+             $(int(CmdlineBoundMs div 1000'i64)) & " s since autoraid.arm " &
+             "from \"" & unstash(gBusSrcBuf, gBusSrcLen) & "\" and " &
+             (if p.asked: "the client reports phase " & p.phase & ", not DEPLOYED"
+              else: "this host has no `raid_phase` verb, so DEPLOYED could " &
+                    "NOT be observed at all") & ". The machine is at step " &
+             machine.stage() & " having advanced " &
+             $machine.screensAdvanced() & " screen(s) and has NOT refused. " &
+             "I could not look; that is not a pass."
+
   # The command-line EXIT (-aowl.raidexit=N). Only ever after the command-line
   # raid's own verdict was PASS: dwell N seconds from the moment the client
   # reported DEPLOYED, arm the exit machine, then report ITS finished state --
   # the tree (an active PlayButton) AND the host's phase, because "every press
   # returned" is not evidence of being back at the menu.
-  if gDeployedAt != 0'i64 and exitAfterSeconds() > 0 and not gExitVerdict:
+  if gDeployedAt != 0'i64 and exitAfter() > 0 and not gExitVerdict:
     let now = nowMs()
     if not gExitArmed:
-      if now - gDeployedAt >= int64(exitAfterSeconds()) * 1000'i64:
+      if now - gDeployedAt >= int64(exitAfter()) * 1000'i64:
         var why = ""
-        if exitmachine.arm("-aowl.raidexit", why):
+        let exitReason =
+          if gBusArmed: "autoraid.arm exitAfterSeconds from " &
+                        unstash(gBusSrcBuf, gBusSrcLen)
+          else: "-aowl.raidexit"
+        if exitmachine.arm(exitReason, why):
           gExitArmed = true
           gExitT0 = now
           gLastExitPoll = 0'i64
-          success "AutoRaid EXIT: dwelt " & $exitAfterSeconds() & " s after " &
-                  "DEPLOYED, so the exit sequence is ARMED (-aowl.raidexit): " &
+          success "AutoRaid EXIT: dwelt " & $exitAfter() & " s after " &
+                  "DEPLOYED, so the exit sequence is ARMED (" & exitReason & "): " &
                   "SHOW-IN-RAID -> DISCONNECT -> LEAVE -> RESULTS -> VERIFY. " &
                   "ARMED IS NOT EXITED: the verdict is read off the live tree."
         else:
@@ -247,7 +332,8 @@ proc onMainTick(payload: string): string =
       elif not gExitSaidWait:
         gExitSaidWait = true
         info "AutoRaid EXIT: DEPLOYED observed; leaving the raid in " &
-             $exitAfterSeconds() & " s (-aowl.raidexit)."
+             $exitAfter() & " s (" &
+             (if gBusArmed: "autoraid.arm" else: "-aowl.raidexit") & ")."
     elif now - gLastExitPoll >= PhasePollMs:
       gLastExitPoll = now
       let stg = exitmachine.stage()
@@ -286,6 +372,42 @@ proc onMainTick(payload: string): string =
              "lines above for the step that is waiting."
 
 # ---------------------------------------------------------------------------
+# Reaching Unity's thread.
+# ---------------------------------------------------------------------------
+
+proc bindTick(how: string): bool =
+  ## Register the ONE `everyMain` tick and everything that depends on being on
+  ## Unity's thread. Factored out of `waitForDrain` because the bus arm can
+  ## reach the main thread FIRST -- being executed by the host's main-thread
+  ## queue is stronger proof the drain fires than the `main_thread` verb is,
+  ## and a host without that verb would otherwise never let a bus arm tick.
+  ## Idempotent: `waitForDrain` returns early once `gTickArmed` is set.
+  if gTickArmed: return true
+  if everyMain(onMainTick) != Ok:
+    warn "AutoRaid: the host's main-thread drain is bound but `everyMain` " &
+         "REFUSED to register a callback. No key will be polled, no menu can " &
+         "open and no raid can be entered. This mod is inert for the session."
+    return false
+  gTickArmed = true
+  menu.bindKeys()
+  menu.arm()
+  let st = verifyAll()
+  info "AutoRaid: call surface verified (" & how & ") -- " & $st.ok &
+       " target(s) byte-verified, " & $st.bad & " REFUSED" &
+       (if st.why.len > 0: " (first: " & st.why & ")" else: "") &
+       ". Built against " & buildIdentity() & "."
+  if not subscribe():
+    warn "AutoRaid: could not subscribe to the host's `ui.show` event bus. " &
+         "Every screen arrival is invisible to this mod, so the state machine " &
+         "has NO receiver to act on and will refuse at its first step. This " &
+         "is announced rather than degrading into a timeout-driven guess."
+  else:
+    info "AutoRaid: subscribed to `ui.show`. Screens are taken from their own " &
+         "::Show receiver -- never searched for by name, which is the mistake " &
+         "that produced three 45-second timeouts in one session."
+  result = true
+
+# ---------------------------------------------------------------------------
 # Arming the command-line raid, from the main thread.
 # ---------------------------------------------------------------------------
 
@@ -305,6 +427,109 @@ proc armFromCmdline(payload: string): string =
   warn "AutoRaid CMDLINE VERDICT FAIL -- the raid asked for on the command " &
        "line was REFUSED and will NOT be retried: " & why
 
+
+# ---------------------------------------------------------------------------
+# Arming from the BUS -- `autoraid.arm`, emitted by another client-side mod.
+# ---------------------------------------------------------------------------
+
+proc answerBus(source, map: string; accepted: bool; why: string) =
+  ## The requester learns the OUTCOME, always -- accepted or refused, with the
+  ## machine's own reason verbatim. A request dropped in silence is the failure
+  ## this reply exists to prevent, so it is emitted on every path, including the
+  ## ones that refuse before the main thread is ever reached.
+  var d = newDoc()
+  d.setText("source", source)
+  d.setText("map", map)
+  d.setBool("accepted", accepted)
+  d.setText("why", why)
+  discard emit("autoraid.armed", d.text)
+
+proc armFromBus(payload: string): string =
+  ## MAIN THREAD, via `onMainThread` -- the same reason `armFromCmdline` is:
+  ## `machine.arm` reads the live tree.
+  result = ""
+  let map = unstash(gBusMapBuf, gBusMapLen)
+  let side = unstash(gBusSideBuf, gBusSideLen)
+  let source = unstash(gBusSrcBuf, gBusSrcLen)
+  gBusPending = false
+  if not bindTick("first reached Unity's thread through autoraid.arm"):
+    gBusRefusals = gBusRefusals + 1
+    let why = "this mod has no `everyMain` slot, so the state machine would " &
+              "never tick. Nothing was armed."
+    warn "AutoRaid: REFUSED autoraid.arm from \"" & source & "\" -- " & why
+    answerBus(source, map, false, why)
+    return
+  var why = ""
+  gBusT0 = nowMs()
+  gLastBusPoll = 0'i64
+  if machine.arm(map, side, "autoraid.arm from " & source, why):
+    gBusArmed = true
+    gBusVerdict = false
+    success "autoRaid: ARMED by bus event autoraid.arm from " & source &
+            " (map " & map & ", side " & side & ")" &
+            (if gBusExitAfter > 0:
+               ", leaving " & $gBusExitAfter & " s after DEPLOYED"
+             else: ", staying in the raid") &
+            ". ARMED IS NOT DEPLOYED: the verdict is the host's own phase."
+    answerBus(source, map, true, "armed, step " & machine.stage())
+    return
+  # THE REFUSAL IS THE MACHINE'S, VERBATIM -- including "a raid-entry request
+  # is already running", which is how a second arm while one is in flight is
+  # rejected. There is never a second machine.
+  gBusRefusals = gBusRefusals + 1
+  warn "AutoRaid: REFUSED autoraid.arm from \"" & source & "\" (map \"" &
+       map & "\") -- " & why
+  answerBus(source, map, false, why)
+
+proc onBusArm(payload: string): string =
+  ## ANY THREAD -- an event handler runs on whichever thread emitted it. Nothing
+  ## here touches the game and nothing here assigns a module-level string: it
+  ## validates, it stages POD bytes, and it hands the work to the main thread.
+  result = ""
+  gBusRequests = gBusRequests + 1
+  let map = trim(asText(field(payload, "map"), ""))
+  var side = trim(asText(field(payload, "side"), "pmc"))
+  if side.len == 0: side = "pmc"
+  var source = trim(asText(field(payload, "source"), ""))
+  if source.len == 0: source = "an unnamed mod"
+  if not busArmEnabled():
+    gBusRefusals = gBusRefusals + 1
+    let why = "`busArmEnabled` is OFF in mods/autoraid/config.json, so this " &
+              "mod refuses raids asked for over the bus. Nothing was armed."
+    warn "AutoRaid: REFUSED autoraid.arm from \"" & source & "\" -- " & why
+    answerBus(source, map, false, why)
+    return
+  if map.len == 0:
+    gBusRefusals = gBusRefusals + 1
+    let why = "autoraid.arm carried no `map`, and there is no default worth " &
+              "guessing at -- entering the wrong raid is worse than entering " &
+              "none. Nothing was armed."
+    warn "AutoRaid: REFUSED autoraid.arm from \"" & source & "\" -- " & why
+    answerBus(source, map, false, why)
+    return
+  if gBusPending:
+    gBusRefusals = gBusRefusals + 1
+    let why = "an earlier autoraid.arm is already queued for the main thread " &
+              "and has not been answered yet. Refusing rather than racing two " &
+              "requests at one state machine."
+    warn "AutoRaid: REFUSED autoraid.arm from \"" & source & "\" -- " & why
+    answerBus(source, map, false, why)
+    return
+  stash(gBusMapBuf, gBusMapLen, map)
+  stash(gBusSideBuf, gBusSideLen, side)
+  stash(gBusSrcBuf, gBusSrcLen, source)
+  gBusExitAfter = asInt(field(payload, "exitAfterSeconds"), 0)
+  if gBusExitAfter < 0: gBusExitAfter = 0
+  gBusPending = true
+  if onMainThread(armFromBus) != Ok:
+    gBusPending = false
+    gBusRefusals = gBusRefusals + 1
+    let why = "the host refused to queue work on its main thread, so nothing " &
+              "was armed. Every call this mod makes happens there, and it " &
+              "will not be made anywhere else."
+    warn "AutoRaid: REFUSED autoraid.arm from \"" & source & "\" -- " & why
+    answerBus(source, map, false, why)
+
 proc waitForDrain(payload: string): string =
   ## A bounded poll for the host's drain, from the mod's own timer thread. It
   ## touches NOTHING in the game -- it asks the host a question -- so it is
@@ -322,28 +547,8 @@ proc waitForDrain(payload: string): string =
            "If it never binds, this mod does nothing at all this session and " &
            "the reason is in the host's own log, not here."
     return
-  if everyMain(onMainTick) != Ok:
-    warn "AutoRaid: the host's main-thread drain is bound but `everyMain` " &
-         "REFUSED to register a callback. No key will be polled, no menu can " &
-         "open and no raid can be entered. This mod is inert for the session."
+  if not bindTick("the host reported its main-thread drain BOUND"):
     return
-  gTickArmed = true
-  menu.bindKeys()
-  menu.arm()
-  let st = verifyAll()
-  info "AutoRaid: call surface verified -- " & $st.ok & " target(s) " &
-       "byte-verified, " & $st.bad & " REFUSED" &
-       (if st.why.len > 0: " (first: " & st.why & ")" else: "") &
-       ". Built against " & buildIdentity() & "."
-  if not subscribe():
-    warn "AutoRaid: could not subscribe to the host's `ui.show` event bus. " &
-         "Every screen arrival is invisible to this mod, so the state machine " &
-         "has NO receiver to act on and will refuse at its first step. This " &
-         "is announced rather than degrading into a timeout-driven guess."
-  else:
-    info "AutoRaid: subscribed to `ui.show`. Screens are taken from their own " &
-         "::Show receiver -- never searched for by name, which is the mistake " &
-         "that produced three 45-second timeouts in one session."
   if wasAsked():
     info "AutoRaid: the drain has fired, so arming the command-line raid on " &
          "\"" & requestedMap() & "\" now."
@@ -397,6 +602,15 @@ proc onSettingsHotApply(key: string) =
         "`hotkeys` is OFF, so NOTHING is polled -- not GetModuleHandle, not " &
         "Input::GetKeyDown -- and both key rows provably do nothing"))
     return
+  if key == "busArmEnabled":
+    settingApplied(
+      "live now: the `autoraid.arm` handler reads this on every arriving " &
+      "event, so the next one is " &
+      (if busArmEnabled(): "accepted (and answered on `autoraid.armed`)"
+       else: "REFUSED BY NAME and answered with accepted=false") &
+      ". Requests so far this session: " & $gBusRequests & ", refused " &
+      $gBusRefusals & ".")
+    return
   if key == "maps" or key == "defaultMap":
     settingApplied(
       "live now: the menu rebuilds its rows from `maps` each time it opens, " &
@@ -419,6 +633,17 @@ proc onLoadClient(): Status =
   cmdline.declare()
   reportArgs()
   menu.bindKeys()
+  if on("autoraid.arm", onBusArm) != Ok:
+    warn "AutoRaid: could NOT subscribe to `autoraid.arm`, so no other mod " &
+         "can ask this one for a raid this session. The command line and the " &
+         "menu key are unaffected. This is announced rather than leaving a " &
+         "requester emitting into nothing."
+  else:
+    info "AutoRaid: listening for `autoraid.arm` " &
+         "{map, side, source, exitAfterSeconds} -- another client-side mod " &
+         "can arm the SAME machine `-aowl.raid` drives, and learns the " &
+         "outcome from `autoraid.armed` {source, map, accepted, why}. Gated " &
+         "by `busArmEnabled` (" & (if busArmEnabled(): "ON" else: "OFF") & ")."
   if every(1000, waitForDrain) != Ok:
     warn "AutoRaid: could not register the drain poll, so this mod will never " &
          "reach Unity's thread and is inert for the session."

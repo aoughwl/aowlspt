@@ -16,6 +16,9 @@
   "//maps": "Comma-separated DISPLAYED map names, in the order the menu lists them; up to 12 are drawn. These are the maps offered BY THE MENU, not the maps the game is offering right now: the location screen shows only what the current mode allows (MEASURED 2026-09-02: RESERVE, LIGHTHOUSE, INTERCHANGE, CUSTOMS, GROUND ZERO, ICEBREAKER, WOODS - seven of the twelve here). APPLIES LIVE.",
   "maps": "Customs,Woods,Shoreline,Interchange,Reserve,Lighthouse,Streets of Tarkov,Ground Zero,Factory,Laboratory,Icebreaker,Terminal",
 
+  "//busArmEnabled": "THE GATE on the `autoraid.arm` bus event. Another client-side mod (mods/basement, when the host reports phase MENU) may ask for a raid by emitting autoraid.arm with {\"map\":\"Woods\",\"side\":\"pmc\",\"source\":\"basement\",\"exitAfterSeconds\":0}; it runs the SAME machine.arm path -aowl.raid uses, on the main thread, and is refused on exactly the same terms (already in a raid, already armed, no map, call surface self-disabled). With this false an arriving event is REFUSED BY NAME and answered on autoraid.armed with accepted=false - never silently dropped. Default true. APPLIES LIVE.",
+  "busArmEnabled": true,
+
   "//loadoutMode": "SERVER SIDE. `current` (the shipped value) means this mod does NOTHING to your gear: you go in wearing whatever the character wears, and loadout.json is not even opened. `spawned` means the kit in mods/autoraid/loadout.json is CREATED for the raid - the gear you were wearing is moved to the STASH first (never destroyed), and every created item is stripped from the profile at match end so none of it can reach the stash. APPLIES ON RESTART / NEXT RAID: the loadout lands before the client's last profile fetch, which has already happened by the time you can change this.",
   "loadoutMode": "current",
 

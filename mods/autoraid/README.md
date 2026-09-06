@@ -158,7 +158,7 @@ guessing at, and entering the wrong raid is worse than entering none.
 
 ## Settings
 
-All seven live in `config.json` beside the DLL, and in the F12 panel / the native
+All eight live in `config.json` beside the DLL, and in the F12 panel / the native
 MODS tab.
 
 | key | default | applies |
@@ -168,6 +168,7 @@ MODS tab.
 | `enterKey` | `"None"` | live |
 | `defaultMap` | `"Woods"` | live |
 | `maps` | twelve labels | live |
+| `busArmEnabled` | `true` | live |
 | `loadoutMode` | `"current"` | next menu cycle |
 | `applyAt` | `"listing"` | restart |
 
@@ -185,6 +186,54 @@ fire.
 offering right now. The location screen shows only what the current mode allows
 (measured 2026-09-02: Reserve, Lighthouse, Interchange, Customs, Ground Zero,
 Icebreaker, Woods — seven of the twelve listed here).
+
+---
+
+## Arming from another mod — `autoraid.arm`
+
+A client-side mod can ask for exactly the raid `-aowl.raid` asks for, without a
+command line, by emitting one event:
+
+```
+emit("autoraid.arm",
+     "{\"map\":\"Woods\",\"side\":\"pmc\",\"source\":\"basement\"," &
+     "\"exitAfterSeconds\":0}")
+```
+
+* `map` is required — the map's **displayed** name, matched case-insensitively.
+  Absent or empty is a **refusal**, for the same reason a bare `-aowl.raid` is.
+* `side` is `pmc` (default) or `scav`.
+* `source` names the requester and appears in every line about the request.
+* `exitAfterSeconds > 0` leaves the raid that many seconds after the client
+  reports DEPLOYED, through the same exit machine `-aowl.raidexit` drives.
+
+It lands on **the same `machine.arm`**, on the **main thread**, with the **same
+refusals** — already in a raid, a request already running, no map, a
+self-disabled call surface. There is never a second state machine: a second arm
+while one is in flight is refused with the machine's own reason.
+
+The requester always learns the outcome, on `autoraid.armed`:
+
+```
+{"source":"basement","map":"Woods","accepted":true,"why":"armed, step WAIT-MENU"}
+```
+
+`accepted:false` carries the refusal verbatim. Nothing is ever dropped in
+silence.
+
+Accepted →
+
+```
+autoRaid: ARMED by bus event autoraid.arm from basement (map Woods, side pmc)
+```
+
+and the verdict is `AutoRaid BUS VERDICT PASS/FAIL/INCONCLUSIVE`, read off the
+host's own phase — never off "the last press returned".
+
+`busArmEnabled` (default `true`) is the gate. The command-line path has no
+switch of its own, and a raid started by *something else* has to be refusable
+without editing that other mod. With it off the event is **refused by name** and
+answered with `accepted:false`.
 
 ---
 

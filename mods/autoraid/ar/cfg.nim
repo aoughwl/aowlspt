@@ -42,6 +42,7 @@ var cfgMenuKey = "F8"
 var cfgEnterKey = "None"
 var cfgDefaultMap = "Woods"
 var cfgMaps = DefaultMaps
+var cfgBusArm = true
 var cfgLoadoutMode = "current"
 var cfgApplyAt = "listing"
 
@@ -50,6 +51,7 @@ proc menuKeyName*(): string = cfgMenuKey
 proc enterKeyName*(): string = cfgEnterKey
 proc defaultMap*(): string = cfgDefaultMap
 proc mapsCsv*(): string = cfgMaps
+proc busArmEnabled*(): bool = cfgBusArm
 proc loadoutMode*(): string = cfgLoadoutMode
 proc applyAt*(): string = cfgApplyAt
 
@@ -79,13 +81,15 @@ proc loadConfig*() =
   cfgEnterKey = setting("enterKey").asText(cfgEnterKey)
   cfgDefaultMap = setting("defaultMap").asText(cfgDefaultMap)
   cfgMaps = setting("maps").asText(cfgMaps)
+  cfgBusArm = setting("busArmEnabled").asBool(cfgBusArm)
   cfgLoadoutMode = setting("loadoutMode").asText(cfgLoadoutMode)
   cfgApplyAt = setting("applyAt").asText(cfgApplyAt)
 
 proc summary*(): string =
   "hotkeys=" & (if cfgHotkeys: "on" else: "off") &
   " menuKey=" & cfgMenuKey & " enterKey=" & cfgEnterKey &
-  " defaultMap=" & cfgDefaultMap & " loadoutMode=" & cfgLoadoutMode &
+  " defaultMap=" & cfgDefaultMap &
+  " busArmEnabled=" & (if cfgBusArm: "on" else: "off") & " loadoutMode=" & cfgLoadoutMode &
   " applyAt=" & cfgApplyAt & " maps=" & $mapList().len
 
 proc schema*(): seq[Setting] =
@@ -141,6 +145,19 @@ proc schema*(): seq[Setting] =
         "RESERVE, LIGHTHOUSE, INTERCHANGE, CUSTOMS, GROUND ZERO, ICEBREAKER, " &
         "WOODS -- seven of the twelve here). Choosing one that is not offered " &
         "produces a named refusal listing what was."),
+
+    boolSetting("busArmEnabled", "Let another mod arm a raid over the bus", true,
+      category = "Raid",
+      description =
+        "THE GATE ON `autoraid.arm`. Another client-side mod may ask for a " &
+        "raid by emitting the event `autoraid.arm` with " &
+        "{\"map\",\"side\",\"source\",\"exitAfterSeconds\"} -- the same code path " &
+        "`-aowl.raid` uses, on the main thread, with the same refusals. This " &
+        "row exists because the command-line path has no switch of its own " &
+        "and a raid started by SOMETHING ELSE must be refusable without " &
+        "editing that other mod. With this off, an arriving `autoraid.arm` is " &
+        "REFUSED BY NAME and answered on `autoraid.armed` with " &
+        "accepted=false -- never silently dropped. Default ON."),
 
     enumSetting("loadoutMode", "Loadout for a spawned raid", "current",
       options = @["current", "spawned"],
