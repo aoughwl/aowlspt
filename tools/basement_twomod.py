@@ -212,15 +212,26 @@ def main():
         say(FAIL, "world/new", "%s %s" % (st, text[:300]))
         return 1
 
+    # Loot rows exist only once a SCENE has materialised a cache (DESIGN §11):
+    # pick a cache on the requested map, materialise the scene at it, then
+    # read the placed rows back.
+    st, caches, text = w.call("/aowlspt/basement/world/caches", method="GET")
+    clist = caches.get("caches", caches) if isinstance(caches, dict) else caches
+    onmap = [c for c in (clist or []) if c.get("map") == a.map]
+    if not onmap:
+        maps = sorted(set(c.get("map", "?") for c in (clist or [])))
+        say(INC, "basement caches", "no cache on %s for seed %d; caches exist on %s (pass --map)"
+            % (a.map, a.seed, maps))
+        return 3
+    c0 = onmap[0]
+    st, scene, text = w.call("/aowlspt/basement/world/scene?map=%s&x=%s&y=%s&z=%s&radius=60"
+                             % (a.map, c0.get("x", 0), c0.get("y", 0), c0.get("z", 0)), method="GET")
     st, loot, text = w.call("/aowlspt/basement/world/loot?map=%s" % a.map, method="GET")
-    items = []
-    if isinstance(loot, dict):
-        items = [i for i in loot.get("items", []) if i.get("status", "placed") == "placed"]
-    elif isinstance(loot, list):
-        items = [i for i in loot if i.get("status", "placed") == "placed"]
+    rows = loot.get("loot", loot.get("items", [])) if isinstance(loot, dict) else (loot or [])
+    items = [i for i in rows if i.get("status", "placed") == "placed"]
     if not items:
-        say(INC, "basement loot", "basement holds no placed loot on %s (item resolver had no "
-            "usable db? reply: %s)" % (a.map, text[:300]))
+        say(INC, "basement loot", "scene at cache %s materialised nothing placed on %s (scene: %s; loot: %s)"
+            % (c0.get("id"), a.map, json.dumps(scene)[:200], text[:200]))
         return 3
 
     st, served, text = w.call("/client/location/getLocalloot", {"locationId": a.map})
@@ -252,7 +263,7 @@ def main():
     # negative control: a map basement has nothing on gains nothing of ours
     other = "factory4_day" if a.map != "factory4_day" else "Woods"
     st, oloot, _ = w.call("/aowlspt/basement/world/loot?map=%s" % other, method="GET")
-    oitems = (oloot.get("items", []) if isinstance(oloot, dict) else oloot) or []
+    oitems = (oloot.get("loot", oloot.get("items", [])) if isinstance(oloot, dict) else oloot) or []
     if oitems:
         say(INC, "negative control", "basement also holds loot on %s; pick a map it does not "
             "(--map)" % other)
