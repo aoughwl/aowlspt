@@ -22,7 +22,7 @@ RVA (VA - imagebase). Then byte-verify the prologue against GameAssembly.dll.
 
 ## Inputs (all offline; the game is never run)
 
-  GAMEASM   path to GameAssembly.dll (D:/Games/Tarkov/GameAssembly.dll)
+  GAMEASM   path to GameAssembly.dll (default: the aowlspt install's copy, tools/gamepaths.py)
   METADEC   path to the DECRYPTED global-metadata.dat. Produce it with
             `tools/metablob.py` + the installed layout blob:
                 from metablob import decrypt_with_layout, parse_layout, ...
@@ -2109,8 +2109,8 @@ def default_paths():
     against the REPO, then against up to four parent directories, because a
     git worktree has no `.cache` of its own -- it lives in the main checkout.
     """
-    gameasm = os.environ.get("AOWLSPT_GAMEASM",
-                             "D:/Games/Tarkov/GameAssembly.dll")
+    import gamepaths as _gp
+    gameasm = _gp.gameasm()
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     metadec = os.environ.get(
         "AOWLSPT_METADEC",

@@ -722,7 +722,8 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 def cmd_selftest(args: argparse.Namespace) -> int:
-    gamedir = args.gamedir or r"D:\Games\Tarkov"
+    import gamepaths as _gp
+    gamedir = args.gamedir or _gp.gamedir()
     info = derive_from_game_dir(gamedir)
     assert info.game_version == "1.1.0.1.46777", f"version mismatch: {info.game_version}"
     assert info.internal_key == 0x876F9333, f"internalKey mismatch: {info.internal_key_hex}"

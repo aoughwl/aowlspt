@@ -136,7 +136,8 @@ def scope_paths(con):
     """The two files the store's own `scope` row names, so the key is computed
     over the SAME inputs it was originally computed over rather than over
     whatever this machine happens to think the game is."""
-    ga = r"D:\Games\Tarkov\GameAssembly.dll"
+    import gamepaths as _gp
+    ga = _gp.gameasm()
     db = r"D:\Aowlspt\aowlspt\db.json"
     try:
         row = con.execute(

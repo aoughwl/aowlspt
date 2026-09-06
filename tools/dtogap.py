@@ -68,7 +68,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 REPO = os.path.dirname(HERE)
 
-GAMEASM = os.environ.get("AOWL_GAMEASM", "D:/Games/Tarkov/GameAssembly.dll")
+import gamepaths as _gp  # noqa: E402  (the binary the host runs against)
+GAMEASM = _gp.gameasm()
 METADEC = os.environ.get("AOWL_METADEC",
                          os.path.join(REPO, ".cache", "global-metadata.dec.dat"))
 

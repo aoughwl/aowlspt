@@ -21,7 +21,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import unityassets as ua  # noqa: E402  (handles the interpreter re-exec)
 
-DATA = os.environ.get("EFT_DATA", r"D:/Games/Tarkov/EscapeFromTarkov_Data")
+import gamepaths as _gp  # noqa: E402  (the data dir of the game the host runs against)
+DATA = os.environ.get("EFT_DATA", _gp.datadir())
 
 
 def scene_list():

@@ -79,7 +79,8 @@ POSTFIX_MAX_SLOTS = 4
     # Mirrors `PostfixMaxSlots` in host/Aowlspt.Host.Il2Cpp/invoke.nim. Four,
     # because that is what Win64 passes in registers.
 
-GAMEASM_DEFAULT = r"D:\Games\Tarkov\GameAssembly.dll"
+import gamepaths as _gp  # noqa: E402  (the binary the host runs against)
+GAMEASM_DEFAULT = _gp.gameasm()
 METADEC_DEFAULT = os.path.join(REPO, ".cache", "global-metadata.dec.dat")
 
 STATIC_FLAG = 0x0010    # MethodAttributes.Static, in Il2CppMethodDefinition.flags@28

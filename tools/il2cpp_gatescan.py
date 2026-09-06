@@ -109,7 +109,8 @@ def analyse(d, imgbase, r2o, md, rva, depth=0):
 
 
 def main():
-    dll = sys.argv[1] if len(sys.argv) > 1 else r"D:\Games\Tarkov\GameAssembly.dll"
+    import gamepaths as _gp
+    dll = sys.argv[1] if len(sys.argv) > 1 else _gp.gameasm()
     out = sys.argv[2] if len(sys.argv) > 2 else None
     d, imgbase, secs = load(dll)
     r2o = make_r2o(secs)

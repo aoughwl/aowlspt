@@ -80,7 +80,8 @@ PASS, FAIL, INCONCLUSIVE, SKIP = "PASS", "FAIL", "INCONCLUSIVE", "SKIP"
 
 # Inputs that several items need and that are NOT in the repo. An item that
 # declares one of these and does not find it is SKIP(needs), never PASS.
-GAMEASM = r"D:\Games\Tarkov\GameAssembly.dll"
+import gamepaths as _gp  # noqa: E402  (the binary the host runs against)
+GAMEASM = _gp.gameasm()
 METADEC = os.path.join(REPO, ".cache", "global-metadata.dec.dat")
 
 
@@ -161,6 +162,10 @@ ITEMS = [
     S("markers.py", "fast"),                           # 0.5s
     S("modharness.py", "fast"),                        # 0.6s
     S("offscreen.py", "fast"),                         # 1.7s
+    S("gamepaths.py", "fast",
+      note="the one answer to 'which GameAssembly': env override, the "
+           "aowlspt install's copy, then the retail copy -- measured "
+           "2026-09-05: the retail game updated under the tools"),   # 0.1s
     S("pfxstress.py", "fast",
       note="parsers on captured inspector fixtures; the live loop itself "
            "needs a client at Settings and is never run from here"),      # 0.1s
@@ -438,6 +443,10 @@ VERIFIERS = [
     V("offscreen.py", "offscreen.py --selftest",
       "creates a real window and checks the detector against it; states "
       "explicitly that it says nothing about the client"),
+    V("gamepaths.py", "gamepaths.py --selftest",
+      "override honoured, retail fallback when the install has no DLL, "
+      "install preferred when it does, sha16 empty on a missing file and "
+      "16 hex on a real one"),
     V("pfxstress.py", "pfxstress.py --selftest",
       "parsers on captured inspector fixtures with a negative per parser "
       "(a wrong parent name, a wrong component type) and the stall regex "

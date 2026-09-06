@@ -58,7 +58,7 @@ writable storage.
 `enum`/`enumval` run a SECOND mandatory self-check (see `enum_self_check`)
 reproducing 19 independently-known constants before printing anything.
 
-GAMEASM defaults to D:/Games/Tarkov/GameAssembly.dll; METADEC defaults to
+GAMEASM defaults to the aowlspt install's GameAssembly.dll (tools/gamepaths.py); METADEC defaults to
 .cache/global-metadata.dec.dat, resolved against the REPO (and, in a
 worktree, the parent checkout) -- both can be overridden by
 passing them explicitly as the first two arguments, matching il2cpp_resolve.py's
@@ -71,8 +71,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from il2cpp_resolve import Resolver, const_check, print_field_rows  # noqa: E402
 
-DEFAULT_GAMEASM = os.environ.get("AOWLSPT_GAMEASM",
-                                 "D:/Games/Tarkov/GameAssembly.dll")
+import gamepaths as _gp  # noqa: E402  (the binary the host runs against)
+DEFAULT_GAMEASM = _gp.gameasm()
 # Resolved against the REPO, not the CWD. It used to be a bare relative
 # path, so every one of these tools failed in a git worktree -- the cache
 # lives in the main checkout -- and the failure looked like a missing file

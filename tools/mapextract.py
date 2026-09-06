@@ -34,7 +34,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import mapextract_terrain as TER   # noqa: E402
 import mapextract_tex as TEX       # noqa: E402
 
-GAME_DIR = r"D:\Games\Tarkov\EscapeFromTarkov_Data"
+import gamepaths as _gp  # noqa: E402  (the data dir of the game the host runs against)
+GAME_DIR = _gp.datadir()
 DEFAULT_OUT = r"D:\MapExtract"
 
 # ---------------------------------------------------------------------------

@@ -384,7 +384,8 @@ def main():
     ag = ap.parse_args()
 
     from il2cpp_resolve import Resolver
-    GAMEASM = os.environ.get("AOWL_GAMEASM", "D:/Games/Tarkov/GameAssembly.dll")
+    import gamepaths as _gp
+    GAMEASM = _gp.gameasm()
     METADEC = os.environ.get("AOWL_METADEC",
                              os.path.join(REPO, ".cache", "global-metadata.dec.dat"))
     r = Resolver(GAMEASM, METADEC)
