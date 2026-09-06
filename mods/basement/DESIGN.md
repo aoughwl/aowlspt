@@ -354,17 +354,32 @@ session id for `notifyPush`).
 
 Three outcomes everywhere. "Could not look" is INCONCLUSIVE.
 
-## 10. What is NOT done (keep this list honest)
+## 10. What is NOT done (keep this list honest) — updated 2026-09-06 15:10
 
-* No client bridge exists: neither the aowlspt host side nor an SPT 4.1.5
-  plugin. `CLIENT-CONTRACT.md` is the spec both will implement.
-* No live LLM key on this machine; `anthropic` is wired and probed, never
-  exercised end-to-end here until a key exists.
-* Bot spawning/actuation (`group.spawn`, `npc.follow`, `npc.attack`) are
-  directives the client must honour; the SAIN driver does not yet move bots
-  live (fact #227).
-* Microphone capture is the client's job (the recorder exe is a fallback).
-* `autoraid` does not yet consume `basement.raid.request`.
+* **Nothing has run inside the game.** The aowlspt client half (`bridge/`)
+  loads in the sim and refuses by name; it has never long-polled a real
+  backend from inside the client, never played a wav, never armed autoraid.
+  The host verbs it needs (`aowlspt.host::http`, `play_wav`, commit ac45f94)
+  compiled only after seven `toCString` fixes and the host build was still
+  queued when this was written. Flags `hostHttp`, `hostPlayWav`,
+  `bridgeEnabled`, `enabled` are all default OFF.
+* **No SPT 4.1.5 plugin exists** (`PORT-SPT415.md` is the plan).
+* **No live LLM key on this machine**: `anthropic` is wired and probed,
+  never exercised end-to-end; the `builtin` tier answers and says so.
+* **The microphone is INCONCLUSIVE here** (`waveInGetNumDevs()==0`); PTT is
+  proven up to "the recorder ran and reported NO_DEVICES".
+* **Bot actuation** (`npc.follow/attack/goto`) is acked `ok:false` by the
+  bridge; the SAIN driver does not yet move bots live (fact #227).
+  `player_seen/aimed/moved` facts are stubs: no measured read path for the
+  player's position/aim exists on the bus yet.
+* **Captivity on aowlspt** is backend-enforced by contract; nothing strips a
+  weapon slot in the live client yet.
+* **Streaming is post-hoc**: the anthropic SSE parser hands sentences to the
+  sink in order but only after curl exits (no threads in a mod).
+* **Engine processes are unsupervised**: each offline check leaves a
+  whisper-server behind (measured, four orphans in one afternoon).
+* `/events?wait=` is a bounded poll on the request thread (no sleep/condvar
+  in the mod SDK) and says so in every reply.
 
 ---
 
