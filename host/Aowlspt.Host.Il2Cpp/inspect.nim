@@ -1824,6 +1824,19 @@ proc iKlassName(k: uint64; verified: var bool): string =
 # in a different place.
 # ---------------------------------------------------------------------------
 
+proc swWidgetIsToggle(widget: Il2CppPtr; chain: var string): int =
+  ## Forward-declared in `settingswrite.nim`: is this component a
+  ## UnityEngine.UI.Toggle, by the same parent-chain walk `tab` uses?
+  result = iKlassIs(widget, "UnityEngine.UI.Toggle", chain)
+
+proc swKlassFullName(k: uint64; known: var bool): string =
+  ## The settings census's way to a klass NAME -- forward-declared in
+  ## `settingswrite.nim`, which is included before `aowlspt_components.h` is
+  ## emitted, so the body lives here. The same reader the `components` verb
+  ## uses: name and namespace off the Il2CppClass with page checks, verified
+  ## against the offline name index; "" when nothing readable.
+  result = iKlassName(k, known)
+
 const
   InspKlassParentOff = 0x58'i32
     ## `Il2CppClass.parent`. MEASURED out of the shipped GameAssembly.dll, from

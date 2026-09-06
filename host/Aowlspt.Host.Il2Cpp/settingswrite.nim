@@ -101,15 +101,31 @@ const cSwBrandSuffix = " [aowlspt]"
 # ---------------------------------------------------------------------------
 # Per-session klass census
 #
-# Reflection is dead, so a control's TYPE is learned by observation: the klass
-# pointer at obj+0x00 is stable within one process, and the live census found
-# exactly four distinct values across all 78 controls. The host matches a
-# control whose stock label is known (the anchors in the header) and thereby
-# learns that anchor's klass for this launch; every other control is then typed
-# by pointer equality alone.
+# The export ABI is token-gated on this build, so a control's TYPE is learned
+# by observation: the klass pointer at obj+0x00 is stable within one process,
+# and the live census found exactly four distinct values across all 78
+# controls. Every control the census passes is typed by pointer equality
+# against the four learned klasses.
 #
-# Zero means "not learned yet on this launch", which is the correct state until
-# the tab carrying that anchor has been opened.
+# HOW A KLASS IS LEARNED, in order:
+#
+# 1. BY ITS TYPE NAME (`swLearnKlassByName`): the Il2CppClass's name and
+#    namespace are read with page checks and verified against the offline
+#    name index -- the same reader the inspector's `components` verb uses --
+#    and compared with the four exact `EFT.UI.Settings.Setting*` names. This
+#    is identity, not a caption, so it holds in every locale and on every tab.
+# 2. BY A CAPTION ANCHOR (the header's `AOWL_SW_ANCHOR_*`), kept as the
+#    fallback. MEASURED 2026-09-05 15:30 (host a220e060279c): the toggle
+#    anchor is 'Enable VoIP' and the dropdown anchor is 'Device:', both SOUND
+#    tab captions -- so on a first visit to Settings -> Game the census had
+#    learned only the float slider ('FOV:'), the host page's donor fell back
+#    to "the most common klass on the tab" (16 dropdown rows), all 13 of its
+#    toggle rows were drawn as dropdown clones that the seeding refuses and
+#    the read-back therefore skips, and the page could not persist anything.
+#    The Game tab has 7 stock toggle rows (Automatic RAM Cleaner .. Helmet
+#    Camera Mode); only the caption match was missing.
+#
+# Zero means "not learned yet on this launch".
 # ---------------------------------------------------------------------------
 var gSwKlassFloat: uint64 = 0
 var gSwKlassToggle: uint64 = 0
@@ -132,11 +148,90 @@ proc swKlassName(k: uint64): string =
   elif k == gSwKlassSelect: result = "select-slider"
   else: result = "?"
 
+# Forward-declared; implemented in `inspect.nim`, which is `include`d after
+# the components header it needs is emitted. Returns "" when the klass has no
+# readable name; `known` says whether the offline name index has it.
+proc swKlassFullName(k: uint64; known: var bool): string
+
+var gSwKlassSeen: seq[uint64] = @[]   ## klasses already asked for a name (cap 32)
+## THE TOGGLE WIDGET'S KLASS -- the UnityEngine.UI.Toggle-derived component
+## at `control + cSuiOffCtrlValue()` of a SettingToggle ROW. Not the row's
+## own klass (`gSwKlassToggle`), which is what `swSeedToggle` used to compare
+## it against. MEASURED 2026-09-06 13:25 (host 499ea1e6a998): with the row
+## klass finally learned, "NOT seeding a toggle value -- the cloned row's
+## widget klass is 0x209e2b2a1e0 and the learned toggle klass is
+## 0x209e2bd24a0 (the donor is not a toggle)" -- a compare of two different
+## objects' types that could never be equal, so no row was ever seeded and
+## the read-back (which reads only seeded rows) never persisted anything.
+var gSwKlassToggleWidget: uint64 = 0
+var gSwToggleWidgetSaid = false
+
+# Forward-declared; implemented in `inspect.nim` (the klass-chain walker
+# through the offline name index lives there). 1 = the widget IS a
+# UnityEngine.UI.Toggle (or derives from one), 0 = it is not, -1 = unknown.
+proc swWidgetIsToggle(widget: Il2CppPtr; chain: var string): int
+
+proc swLearnKlassByName(klass: uint64) =
+  ## Step 1 of the census (see the block comment above): type the klass by
+  ## its own name, once per distinct klass per launch. Learns ONLY a name the
+  ## offline index verifies -- a readable string that is not a known type is
+  ## refused and said, never trusted.
+  if klass == 0'u64:
+    return
+  if klass == gSwKlassFloat or klass == gSwKlassToggle or
+     klass == gSwKlassDropdown or klass == gSwKlassSelect:
+    return
+  var i = 0
+  while i < gSwKlassSeen.len:
+    if gSwKlassSeen[i] == klass:
+      return
+    i = i + 1
+  if gSwKlassSeen.len >= 32:            # rule 4: capped; a tab has four
+    return
+  gSwKlassSeen.add klass
+  var known = false
+  let nm = swKlassFullName(klass, known)
+  if nm.len == 0:
+    okLog "settings write: klass 0x" & hexOf(klass) & " has no readable " &
+          "type name, so it can only be learned from a caption anchor"
+    return
+  if not known:
+    okLog "settings write: klass 0x" & hexOf(klass) & " reads type '" & nm &
+          "', which the offline name index does NOT know -- refusing to " &
+          "learn from it; a caption anchor may still type it"
+    return
+  var slot = ""
+  if nm == "EFT.UI.Settings.SettingFloatSlider":
+    if gSwKlassFloat == 0'u64:
+      gSwKlassFloat = klass
+      slot = "float-slider"
+  elif nm == "EFT.UI.Settings.SettingToggle":
+    if gSwKlassToggle == 0'u64:
+      gSwKlassToggle = klass
+      slot = "toggle"
+  elif nm == "EFT.UI.Settings.SettingDropDown":
+    if gSwKlassDropdown == 0'u64:
+      gSwKlassDropdown = klass
+      slot = "dropdown"
+  elif nm == "EFT.UI.Settings.SettingSelectSlider":
+    if gSwKlassSelect == 0'u64:
+      gSwKlassSelect = klass
+      slot = "select-slider"
+  if slot.len > 0:
+    okLog "settings write: learned " & slot & " klass = 0x" & hexOf(klass) &
+          " from its TYPE NAME '" & nm & "' (verified against the offline " &
+          "name index) -- no caption anchor needed, so a first visit to " &
+          "any tab types every row control it carries"
+
 proc swLearnKlass(label: string; klass: uint64) =
-  ## Teach the census from one control, if its label is an anchor and that
-  ## anchor is not already learned. Logged the first time each is learned, so
-  ## the boot log shows exactly which types this session can recognise.
-  if klass == 0'u64 or label.len == 0:
+  ## Teach the census from one control: by its type name first, then -- if
+  ## its label is an anchor and that anchor is not already learned -- by the
+  ## caption. Logged the first time each is learned, so the boot log shows
+  ## exactly which types this session can recognise, and how.
+  if klass == 0'u64:
+    return
+  swLearnKlassByName(klass)
+  if label.len == 0:
     return
   if gSwKlassFloat == 0'u64 and label == readCString(cSwAnchorFloat()):
     gSwKlassFloat = klass

@@ -300,6 +300,7 @@ type
     beganAt*: uint64
     verdictDone*: bool
     timedOut*: bool
+    verdictAt*: uint64       ## when the SETTLED verdict is due; 0 = none pending
     ## A dropdown control on the tab to clone for `swkChoice` rows, captured
     ## at `begin` from the klass census. Zero -> this tab has none, and every
     ## enum row on this page is demoted to a labelled stub that says so.
@@ -372,6 +373,16 @@ const cSwSliceMs = 8'u64
 ## screen, and how long the page has been trying. It does not stop the render
 ## -- the page keeps filling and its completion verdict still lands later.
 const cSwPageVerdictMs = 12000'u64
+## HOW LONG A COMPLETED PAGE SETTLES BEFORE ITS VERDICT IS JUDGED. MEASURED
+## 2026-09-05 15:31 (host a220e060279c): the verdict judged at completion said
+## FAIL -- "row 'debugUi' should read 'F3 debug panel' and reads 'Interface
+## language'" -- and 0.8 s later the caption re-assert poll (one pass every 60
+## frames) PUT BACK 2 captions; the live tree read every caption correctly and
+## the verdict had already been said. A verdict over the finished page must be
+## read after LocalizedText's re-resolve AND the poll behind it have both had
+## their turn, which is what the player sees a second later, not the frame
+## the last row landed on.
+const cSwVerdictSettleMs = 1500'u64
 
 ## THE SECOND BOUND ON THE VERDICT, IN TICKS RATHER THAN MILLISECONDS.
 ##
@@ -1037,24 +1048,44 @@ proc swSeedToggle(control: Il2CppPtr; value: bool): bool =
   #
   # So: refuse unless the widget's klass IS the learned toggle klass. Not
   # readable -- IDENTICAL. Klass identity is the only type evidence available
-  # (reflection is dead on this build) and it is exactly how `swKlassName` and
+  # (the export ABI is token-gated on this build) and it is exactly how `swKlassName` and
   # the Phase 2b reader already decide what a control is.
   let wk = cast[uint64](cReadPtrAt(widget, 0'i32))
-  if gSwKlassToggle == 0'u64 or wk != gSwKlassToggle:
-    if not gSwSeedRefused:
-      gSwSeedRefused = true
-      okLog "settings pages: NOT seeding a toggle value -- the cloned row's " &
-            "widget klass is 0x" & hexOf(wk) & " and the learned toggle klass " &
-            "is 0x" & hexOf(gSwKlassToggle) &
-            (if gSwKlassToggle == 0'u64:
-               " (never learned: no stock toggle row was found on this tab, " &
-               "which a non-English client will also do)"
-             else: " (the donor is not a toggle)") &
-            ". Calling Toggle::SetIsOnWithoutNotify on it FAULTS, and the " &
-            "caught fault used to abort the rest of the page render -- which " &
-            "is what made the page clone itself on every tab visit. The row " &
-            "is left showing the donor's value; that is cosmetic and safe."
-    return false
+  # THE WIDGET IS TYPED AS A WIDGET. `gSwKlassToggle` is the SettingToggle
+  # ROW's klass; the object here is the Toggle component the row holds at
+  # `cSuiOffCtrlValue()`, a different type, so the two were never equal and
+  # this refused every row (MEASURED 2026-09-06, see `gSwKlassToggleWidget`).
+  # The widget klass is learned ONCE, by walking its parent chain through the
+  # offline name index to UnityEngine.UI.Toggle -- identity, not a caption --
+  # and every later widget is compared by pointer equality against that.
+  if wk != gSwKlassToggleWidget:
+    var chain = ""
+    var verdict = -1
+    if gSwKlassToggleWidget == 0'u64:
+      verdict = swWidgetIsToggle(widget, chain)
+      if verdict == 1:
+        gSwKlassToggleWidget = wk
+        okLog "settings pages: learned the toggle WIDGET klass = 0x" &
+              hexOf(wk) & " from its type chain '" & chain & "' -- the " &
+              "row's own klass (0x" & hexOf(gSwKlassToggle) & ", the " &
+              "SettingToggle control) is a different object and was what " &
+              "this used to be compared against; every seed refused on that"
+    if wk != gSwKlassToggleWidget:
+      if not gSwSeedRefused:
+        gSwSeedRefused = true
+        okLog "settings pages: NOT seeding a toggle value -- the cloned " &
+              "row's widget klass is 0x" & hexOf(wk) & ", which " &
+              (if gSwKlassToggleWidget == 0'u64:
+                 "does not walk to UnityEngine.UI.Toggle through the name " &
+                 "index (chain '" & chain & "', verdict " & $verdict &
+                 " where 1=yes 0=no -1=unreadable)"
+               else:
+                 "is not the learned toggle widget klass 0x" &
+                 hexOf(gSwKlassToggleWidget)) &
+              ". Calling Toggle::SetIsOnWithoutNotify on a non-toggle " &
+              "FAULTS, and the caught fault used to abort the rest of the " &
+              "page render. The row is left showing the donor's value."
+      return false
   let fn = swFn(SwToggleNoNotify)
   if fn == nil:
     # THE RAW-STORE FALLBACK IS GONE (INTERACTION-LAYER-MAP M3). It stored
@@ -1725,6 +1756,7 @@ proc swRenderPageBegin(tabPtr, parentGo: Il2CppPtr; page: var SwPage): bool =
   page.graftMs = 0'u64
   page.verdictDone = false
   page.timedOut = false
+  page.verdictAt = 0'u64
   page.beganAt = cNowMs()
   page.renderDonorDrop = 0'u64
   page.renderDonorDropWhy = ""
@@ -1785,6 +1817,15 @@ proc swRenderPageBegin(tabPtr, parentGo: Il2CppPtr; page: var SwPage): bool =
         " from " & page.renderDonorDropWhy & "."
   result = true
 
+proc swScheduleVerdict(page: var SwPage) =
+  ## Arm the SETTLED verdict (see `cSwVerdictSettleMs`); the registry drain
+  ## judges it when due, off the live tree. Every completion path calls this
+  ## rather than `swRenderVerdict` directly, so no page is judged on the
+  ## frame it finished.
+  if page.verdictDone or page.verdictAt != 0'u64:
+    return
+  page.verdictAt = cNowMs() + cSwVerdictSettleMs
+
 proc swRenderPageGraft(page: var SwPage) =
   ## THE GRAFT, ON ITS OWN TICK. Clones the SettingsList that makes the page
   ## scroll, reparents it, draws the heading, and stops. NO schema row is
@@ -1833,7 +1874,7 @@ proc swRenderPageGraft(page: var SwPage) =
     page.complete = true
     okLog "settings pages: page '" & page.id & "' is a STUB -- heading and " &
           "note rendered, no rows bound"
-    swRenderVerdict(page)
+    swScheduleVerdict(page)
 
 proc swRenderPageSlice(page: var SwPage): int =
   ## AT MOST ONE FRAME BUDGET OF WORK. Returns rows instantiated this tick.
@@ -1863,7 +1904,7 @@ proc swRenderPageSlice(page: var SwPage): int =
          "the rest of the session; re-open the tab to try again. Its " &
          "finished-state verdict follows immediately and is read off the " &
          "live tree, not off these counters."
-    swRenderVerdict(page)
+    swScheduleVerdict(page)
     return
   # THE GRAFT IS A TICK OF ITS OWN, and it is the FIRST thing a begun page
   # does. Returning 0 here is correct and is not "no progress": the registry
@@ -1885,7 +1926,7 @@ proc swRenderPageSlice(page: var SwPage): int =
          "The rows drawn so far are left alone; the page is marked complete " &
          "so this does not retry every frame, and re-opening the tab " &
          "re-renders it."
-    swRenderVerdict(page)
+    swScheduleVerdict(page)
     return
   let t0 = cNowMs()
   var thisTick = 0
@@ -2054,7 +2095,7 @@ proc swRenderPageSlice(page: var SwPage): int =
     # page is complete rather than per-row, because a row cloned before the
     # switch row was read would be left free while its neighbours were blocked.
     swApplyEnableGray(page, "render")
-    swRenderVerdict(page)
+    swScheduleVerdict(page)
 
 proc swRenderPage(tabPtr, parentGo: Il2CppPtr; page: var SwPage): int =
   ## COMPATIBILITY ENTRY POINT, and deliberately NOT a whole-page render any
@@ -2186,6 +2227,21 @@ proc swSliceRegistry(pages: var seq[SwPage]; reg: SwRegistry): int =
   result = 0
   swVerdictWatch(pages, reg)
   gSwSliceWorked = false
+  # THE SETTLED VERDICT, one page per tick, when its settle has elapsed. Read
+  # off the live tree here, on a later frame than the one the page finished
+  # on -- see `cSwVerdictSettleMs` for the measured reason.
+  let nowV = cNowMs()
+  var v = 0
+  while v < pages.len and v < 32:                 # rule 4: capped
+    if pages[v].verdictAt != 0'u64 and not pages[v].verdictDone and
+       nowV >= pages[v].verdictAt:
+      var pv = pages[v]
+      pv.verdictAt = 0'u64
+      swRenderVerdict(pv)
+      pages[v] = pv
+      gSwSliceWorked = true
+      return
+    v = v + 1
   # EACH REGISTRY IS ADVANCED BY THE THING THAT KNOWS WHERE ITS PAGES GO.
   # `gSwPages` renders into the Game tab's one row container; `gModsPages`
   # renders into the MODS tab's per-subtab containers, which only
