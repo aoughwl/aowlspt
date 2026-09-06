@@ -52,6 +52,10 @@
   "_ontologyMinConfidence": "How sure the intent classifier has to be before its template answer is used instead of falling through to the LLM. Every ontology reply is marked tier:'ontology' so nobody mistakes it for a model.",
   "ontologyMinConfidence": 0.6,
 
+  "_pushToTalk": "POST /aowlspt/basement/speech/ptt {session,state:down|up} moves speech CAPTURE to the backend, because on aowlspt the client cannot capture at all -- EFT holds the microphone exclusively, which is why EscapeFromMyBasement ships a standalone winmm recorder.exe (aowl.voice reuses it for the same reason). recorderExe: empty = <toolsDir>/recorder/recorder.exe. pttMaxSeconds: the recorder is spawned with this bound and CANNOT be interrupted from here -- its stop protocol is a line on stdin and a detached spawn has no stdin, and the alternative (an inherited pipe) is a hang aowl.voice measured twice -- so key-up finalises over whatever is on disk at that moment and says so in its reply. While it records, the tick feeds the GROWING file (taking the data chunk's OFFSET, never its size field: the recorder writes the RIFF sizes only when it exits) so heard.partial events appear progressively.",
+  "recorderExe": "",
+  "pttMaxSeconds": 20,
+
   "_sttPartialMs": "How much NEW audio must arrive before whisper is run again on the session buffer and a heard.partial is emitted. A partial is NEVER fed to the brain -- whisper's partials are unstable, measured in aowl.voice.",
   "sttPartialMs": 1200,
 

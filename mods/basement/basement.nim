@@ -63,6 +63,7 @@ const
   ObserveRoute   = Base & "/observe"
   SayRoute       = Base & "/say"
   ChunkRoute     = Base & "/speech/chunk"
+  PttRoute       = Base & "/speech/ptt"
   EventsRoute    = Base & "/events"
   AckRoute       = Base & "/ack"
   SpawnRoute     = Base & "/spawn"
@@ -137,6 +138,12 @@ proc loadConfig() =
 
   let tools = setting("toolsDir").asText("")
   var work = setting("workDir").asText("")
+  # Empty means %TEMP% (the config says so) -- and it must resolve to an
+  # ABSOLUTE directory here, because the push-to-talk recorder is started by a
+  # detached `cmd /c` whose working directory is not this process's.
+  if work.len == 0: work = getEnv("TEMP", "")
+  if work.len == 0: work = getEnv("TMP", "")
+  if work.len == 0: work = joinPath(dataDir(), "work")
   var cache = setting("cacheDir").asText("")
   if cache.len == 0: cache = joinPath(dataDir(), "cache")
   llmConfigure(engine = setting("llmEngine").asText("builtin"),
@@ -159,6 +166,8 @@ proc loadConfig() =
                   cacheDir = cache,
                   whisperPort = setting("whisperPort").asInt(9000),
                   sttPartialMs = setting("sttPartialMs").asInt(1200))
+  pttConfigure(recorderExe = setting("recorderExe").asText(""),
+               maxSeconds = setting("pttMaxSeconds").asInt(20))
   brainConfigure(cacheDir = cache,
                  cacheMax = setting("cacheMaxEntries").asInt(512),
                  memoryTurns = setting("maxTurns").asInt(8),
@@ -372,6 +381,7 @@ proc onStatus(url, body, session: string): string =
   o.put("stream", streamStats())
   o.put("tts", ttsStats())
   o.put("sttSessions", sttSessionCount())
+  o.put("ptt", pttStatus())
   o.put("pushSession", pushSession())
   o.put("encounters", encounterJson())
   o.put("leashM", leashM())
@@ -626,6 +636,98 @@ proc onChunk(url, body, session: string): string =
   o.put("partial", partial)
   o.put("final", finalText)
   o.put("note", note)
+  result = done(o).text
+
+proc onPtt(url, body, session: string): string =
+  ## Push to talk, aowlspt-side. `/speech/chunk` is the SPT shape (the plugin
+  ## captured the audio); here the CLIENT CANNOT CAPTURE -- EFT holds the mic
+  ## exclusively -- so `down` starts a recorder process on this machine, the
+  ## tick feeds the growing file, and `up` finalises. `poll` is the manual
+  ## pump: the simulator runs every route before it runs a single tick, so
+  ## without it the progressive half could not be exercised without a game.
+  if not gEnabled: return disabledJson()
+  let sess = jr.asText(jr.field(body, "session"), session)
+  let state = jr.asText(jr.field(body, "state"), "")
+  var o = obj()
+  o.put("session", sess)
+  o.put("state", state)
+  case state
+  of "down":
+    var wav = ""
+    var already = false
+    var note = ""
+    var ok = false
+    withModLock:
+      ok = pttStart(sess, wav, already, note)
+    o.put("ok", ok)
+    o.put("already", already)
+    o.put("wav", wav)
+    o.put("note", (if already: "already recording -- " & note else: note))
+  of "poll":
+    var partial = ""
+    var note = ""
+    var ok = false
+    withModLock:
+      ok = pttPump(partial, note)
+    if partial.len > 0:
+      discard emitEvent("heard.partial",
+                        done(objOf("text", partial)).text, false)
+    o.put("ok", ok)
+    o.put("partial", partial)
+    o.put("note", note)
+  of "up":
+    var closed = ""
+    var finalText = ""
+    var note = ""
+    var ok = false
+    withModLock:
+      ok = pttStop(closed, finalText, note)
+    o.put("ok", ok)
+    o.put("closed", closed)
+    o.put("final", finalText)
+    o.put("note", note)
+    if ok:
+      # Emitted on EVERY close, empty text included, and the note travels with
+      # it: with sttEngine=none or no capture device there is legitimately
+      # nothing to transcribe, and an event that only appears on success cannot
+      # tell the client "the utterance ended and produced nothing" apart from
+      # "the backend never noticed the key came up".
+      var eo = obj()
+      eo.put("text", finalText)
+      eo.put("source", "ptt")
+      eo.put("note", note)
+      discard emitEvent("heard.final", done(eo).text, false)
+      let addressee = captiveOf()
+      if addressee.len == 0:
+        o.put("spokeTo", "")
+        o.put("sayNote", "nobody was addressed: the encounter machine holds " &
+              "no captive/escorted person, so the brain was NOT asked. The " &
+              "client picks the addressee on aowlspt (bridge/see.nim); until " &
+              "it does, POST " & SayRoute & " with a personId.")
+      elif finalText.len == 0:
+        o.put("spokeTo", "")
+        o.put("sayNote", "'" & addressee & "' holds the player, but nothing " &
+              "was transcribed, so the brain was not asked with an empty " &
+              "utterance")
+      else:
+        var directives = 0
+        var tagNote = ""
+        var d = Decision(text: "", tags: @[], tier: "", cached: false,
+                         engine: "", ms: 0, notes: @[], segments: @[])
+        withModLock:
+          d = speakTurn(addressee, finalText, directives, tagNote)
+        o.put("spokeTo", addressee)
+        o.put("reply", d.text)
+        o.put("tier", d.tier)
+        o.put("directives", directives)
+        o.put("sayNote", "the brain answered " & addressee &
+              " (the person the encounter machine currently holds)")
+  else:
+    o.put("ok", false)
+    o.put("err", "state must be \"down\", \"up\" or \"poll\" (got '" &
+          state & "'); `poll` feeds whatever the recorder has written so far " &
+          "and is what the backend tick does every tickMs")
+  o.put("ptt", pttStatus())
   result = done(o).text
 
 proc onEvents(url, body, session: string): string =
@@ -1463,6 +1565,77 @@ proc chk13LootBus() =
         "HERE: that mods/tarkov receives it -- an emit is not delivered to " &
         "the emitting mod and tarkov is not loaded in this process.")
 
+proc chk14PushToTalk() =
+  ## Push-to-talk end to end, in one route, with no game and no client.
+  ##
+  ## The falsifiable property is the FINISHED STATE, not our own write: after
+  ## `down` + a bounded wait, the file the recorder was told to write must
+  ## EXIST and must have grown past its 44-byte header; after `up`, the stt
+  ## session must be GONE from the session table and a `heard.final` must be on
+  ## the stream. A second `up` is the negative control -- it must be refused.
+  ##
+  ## Three outcomes. A missing recorder.exe, or a recorder that exited
+  ## NO_DEVICES because `waveInGetNumDevs()` is 0 on this machine (aowl.voice
+  ## DESIGN 5.1 measured exactly that), is INCONCLUSIVE with the exit code
+  ## quoted -- never a PASS, and never reported as silence.
+  let rp = recProbe()
+  if not rp.ok:
+    check(14, "push to talk", "INCONCLUSIVE",
+          "no recorder: " & rp.note & " -- capture cannot be exercised, and a " &
+          "missing exe is INCONCLUSIVE, never PASS")
+    return
+  if pttActive():
+    var s0 = ""
+    var f0 = ""
+    var n0 = ""
+    discard pttStop(s0, f0, n0)
+  var wav = ""
+  var already = false
+  var startNote = ""
+  if not pttStart("selfcheck-ptt", wav, already, startNote):
+    check(14, "push to talk", "FAIL", "`down` refused: " & startNote)
+    return
+  # A bounded busy wait, for the same reason /events long-polls that way: the
+  # mod SDK has no sleep primitive. 1.5 s is enough audio for the header and
+  # several partial windows at 16 kHz.
+  let t0 = nowMs()
+  while (nowMs() - t0) < 1500:
+    discard
+  var partial = ""
+  var pumpNote = ""
+  let pumped = pttPump(partial, pumpNote)
+  let grew = sizeOfFile(wav) > 44
+  let statusMid = pttStatus()
+  let beforeSeq = latestSeq()
+  var closed = ""
+  var finalText = ""
+  var stopNote = ""
+  let stopped = pttStop(closed, finalText, stopNote)
+  # The negative control: a second `up` has no recording to end.
+  var c2 = ""
+  var f2 = ""
+  var n2 = ""
+  let secondRefused = not pttStop(c2, f2, n2)
+  var sawFinal = false
+  let evText = done(objOf("events", eventsSince(beforeSeq, 50))).text
+  for e in jr.each(jr.field(evText, "events")):
+    if jr.asText(jr.child(e, "kind"), "") == "heard.final": sawFinal = true
+  let sessionGone = not pttActive()
+  let evidence = "wav " & wav & " is " & $sizeOfFile(wav) & " bytes (>44 " &
+    $grew & "), pump " & $pumped & ": " & pumpNote & "; mid-recording status " &
+    done(statusMid).text & "; `up` " & $stopped & " final text " &
+    $finalText.len & " chars, heard.final on the stream " & $sawFinal &
+    ", session closed " & $sessionGone & ", a second `up` refused " &
+    $secondRefused & " (" & n2 & "); " & stopNote
+  if not grew:
+    check(14, "push to talk", "INCONCLUSIVE",
+          "the recorder produced no audio -- this is a capture-device " &
+          "question, not a code one. " & evidence)
+    return
+  check(14, "push to talk",
+        verdictOf(stopped and sawFinal and sessionGone and secondRefused),
+        evidence)
+
 proc onSelfcheck(url, body, session: string): string =
   gCheckLines = @[]
   gPassN = 0
@@ -1482,6 +1655,7 @@ proc onSelfcheck(url, body, session: string): string =
     chk11Claim()
     chk12KnownIds()
     chk13LootBus()
+    chk14PushToTalk()
     # Put back whatever was on disk: the checks above generated and advanced a
     # world in memory, and leaving that in place would quietly replace the
     # player's.
@@ -1555,6 +1729,12 @@ proc basementSchema(): seq[Setting] =
                  category = "Encounters"),
     floatSetting("threatM", "Threat range (m)", 18.0, lo = 1.0, hi = 200.0,
                  category = "Encounters"),
+    intSetting("pttMaxSeconds", "Push-to-talk max (s)", 20, lo = 1, hi = 600,
+               step = 1, category = "Engines",
+               description = "The recorder is spawned with this bound and " &
+                 "CANNOT be interrupted from here (its stop protocol is a " &
+                 "line on stdin and a detached spawn has no stdin), so key-up " &
+                 "transcribes what is on disk at that moment"),
     intSetting("maxTurns", "Conversation memory (turns)", 8, lo = 0, hi = 64,
                step = 1, category = "Dialogue"),
     intSetting("cacheMaxEntries", "Cached lines", 512, lo = 0, hi = 100000,
@@ -1618,6 +1798,15 @@ proc onTick(payload: string): string =
     discard expirePending(worldClockMs(), dropped)
     var simNote = ""
     discard simAdvance(int64(gTickMs), simNote)
+    if pttActive():
+      # The progressive half of push-to-talk. Pumping every tick is free: the
+      # session only runs whisper once `sttPartialMs` of NEW audio has arrived.
+      var pttPartial = ""
+      var pttNote = ""
+      discard pttPump(pttPartial, pttNote)
+      if pttPartial.len > 0:
+        discard emitEvent("heard.partial",
+                          done(objOf("text", pttPartial)).text, false)
     if gSaveEveryTicks > 0 and (gTicks mod gSaveEveryTicks) == 0:
       var saveNote = ""
       if saveWorld(saveNote):
@@ -1700,6 +1889,7 @@ proc onLoad(): Status =
   discard serve(ObserveRoute, onObserve)
   discard serve(SayRoute, onSay)
   discard serve(ChunkRoute, onChunk)
+  discard serve(PttRoute, onPtt)
   discard servePrefix(EventsRoute, onEvents)
   discard serve(AckRoute, onAck)
   discard serve(SpawnRoute, onSpawn)

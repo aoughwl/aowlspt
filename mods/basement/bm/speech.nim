@@ -684,3 +684,325 @@ proc sttStats*(): JsonObject =
   o.put("port", cWhisperPort)
   o.put("sessions", done(a))
   result = o
+
+# ---------------------------------------------------------------------------
+# PUSH TO TALK -- the backend holds the microphone, because the game does
+#
+# `/speech/chunk` is the SPT shape: a plugin captures PCM and posts it. On
+# aowlspt the client cannot capture at all -- EFT holds the mic exclusively,
+# which is exactly why EscapeFromMyBasement ships a standalone winmm
+# `recorder.exe` (aowl.voice reuses it for the same reason, `vx/pipeline.nim
+# ::record`). So `/speech/ptt` moves the capture to this side: `down` spawns
+# the recorder, the tick feeds the GROWING file through the same
+# `sttSessionChunk` machinery, and `up` finalises.
+#
+# TWO THINGS MEASURED HERE, both of which a naive implementation gets wrong:
+#
+# * **The recorder writes the RIFF size fields only when it exits.** Mid-
+#   recording the `data` chunk's size field reads 0 (or a stale value) while
+#   real audio sits behind it, so `parseWav` -- which trusts that field --
+#   returns an EMPTY payload and the whole thing looks like silence. The pump
+#   therefore locates the data chunk's OFFSET by walking the header and takes
+#   everything from there to EOF, and reports both numbers side by side so the
+#   discrepancy is visible rather than assumed.
+# * **The recorder cannot be stopped early from here.** Its protocol is "a
+#   line on stdin stops it", and a detached spawn has no stdin to write to.
+#   The alternative -- `CreateProcess` with an inherited pipe -- is the hang
+#   aowl.voice measured twice (the child holds our stdout write end, so the
+#   read end never sees EOF). So the recorder is started with the
+#   `pttMaxSeconds` bound and `up` finalises over WHAT IS ON DISK at that
+#   moment; the process keeps writing until its bound expires. That is stated
+#   in every `up` reply rather than being a silent property.
+#
+# It is launched through a generated `.cmd` wrapper instead of directly,
+# because the recorder's EXIT CODE is the only way to tell "recorded silence"
+# from "there are no capture devices" (`waveInGetNumDevs()==0` -> exit 2,
+# NO_DEVICES -- aowl.voice DESIGN 5.1 measured that on this machine), and a
+# detached spawn throws the exit code away. The wrapper writes it to a file.
+# `<NUL` gives the recorder the immediate stdin EOF that `execCmdEx` gives it
+# in `vx/pipeline.nim`; without it a hidden console would leave `ReadLine`
+# blocking forever.
+# ---------------------------------------------------------------------------
+
+var cRecorderExe: string = ""
+var cPttMaxSeconds: int = 20
+
+var gPttActive: bool = false
+var gPttSession: string = ""
+var gPttWav: string = ""
+var gPttOutFile: string = ""
+var gPttCodeFile: string = ""
+var gPttStartMs: int64 = 0
+var gPttSecs: int = 0
+var gPttFed: int = 0
+var gPttSeq: int = 0
+var gPttDataField: int = -1
+var gPttRate: int = 0
+var gPttChan: int = 0
+var gPttBits: int = 0
+var gPttPumps: int = 0
+var gPttLastNote: string = "no push-to-talk yet"
+
+proc pttConfigure*(recorderExe: string; maxSeconds: int) =
+  cRecorderExe = defaulted(recorderExe, joinPath(cToolsDir, "recorder/recorder.exe"))
+  if maxSeconds > 0: cPttMaxSeconds = maxSeconds
+
+proc recProbe*(): SpeechProbe = probeOf("rec", "recorder", cRecorderExe, "")
+
+proc pttActive*(): bool = gPttActive
+proc pttSessionId*(): string = gPttSession
+
+proc pttOutcome(): string =
+  ## What the recorder process has to say for itself. Three states, never two:
+  ## still running / exited with a code we read / we could not tell.
+  if gPttCodeFile.len == 0: return "no recorder has been started"
+  if not exists(gPttCodeFile):
+    # "no exit code file" is NOT the same claim as "still running", and saying
+    # the second when the first is all we know is how a wrapper that never ran
+    # reads as a recording in progress. Once the wav should certainly exist and
+    # does not, say the honest thing instead.
+    let ms = int(nowMs() - gPttStartMs)
+    if ms > 3000 and not exists(gPttWav):
+      return "NO EVIDENCE IT EVER RAN: " & $ms & " ms after the spawn there " &
+             "is neither a wav at " & gPttWav & " nor an exit code at " &
+             gPttCodeFile & " -- the wrapper (cmd /c) may not have started"
+    return "still running (no exit code file yet at " & gPttCodeFile & ")"
+  var digits = ""
+  for ch in readAll(gPttCodeFile):
+    if ch >= '0' and ch <= '9': digits.add ch
+    elif digits.len > 0: break
+  let outText = oneLine(readAll(gPttOutFile))
+  if digits.len == 0:
+    return "exited, but the exit code file was unreadable; output: " & outText
+  var code = 0
+  for ch in digits: code = code * 10 + (ord(ch) - ord('0'))
+  var why = ""
+  if code == 2 or outText.contains("NO_DEVICES"):
+    why = " (NO_DEVICES: waveInGetNumDevs()==0 -- there is no capture device " &
+          "on this machine right now, so there is no audio to transcribe; " &
+          "that is INCONCLUSIVE, not silence)"
+  result = "exited " & $code & why &
+           (if outText.len > 0: "; output: " & outText else: "")
+
+proc pcmStartOf(bytes: string; rate, chans, bits, dataField: var int): int =
+  ## The OFFSET at which PCM begins, by walking the chunk list. Deliberately
+  ## does NOT trust the `data` chunk's size field -- that is the field the
+  ## recorder leaves at 0 until it exits. Returns -1 when the header is not yet
+  ## readable, which is honest for a file that is 12 bytes old.
+  rate = 0; chans = 0; bits = 0; dataField = -1
+  if bytes.len < 44: return -1
+  if bytes[0 ..< 4] != "RIFF" or bytes[8 ..< 12] != "WAVE": return -1
+  var i = 12
+  var haveFmt = false
+  while i + 8 <= bytes.len:
+    let id = bytes[i ..< i+4]
+    let sz = rd32(bytes, i + 4)
+    if id == "fmt ":
+      if i + 24 > bytes.len: return -1
+      chans = rd16(bytes, i + 10)
+      rate = rd32(bytes, i + 12)
+      bits = rd16(bytes, i + 22)
+      haveFmt = true
+    elif id == "data":
+      if not haveFmt: return -1
+      if rate <= 0 or chans <= 0 or bits <= 0: return -1
+      dataField = sz
+      return i + 8
+    if sz <= 0: return -1          # a zero-length non-data chunk would spin
+    i = i + 8 + sz + (sz and 1)
+  result = -1
+
+proc pttPump*(partial: var string; note: var string): bool =
+  ## Feed whatever NEW audio is on disk into the session. Called from the tick
+  ## and from `/speech/ptt {"state":"poll"}`. The partial cadence is not decided
+  ## here: `sttSessionChunk` runs whisper only once `sttPartialMs` of new audio
+  ## has arrived, so pumping more often than that is free.
+  partial = ""
+  note = ""
+  if not gPttActive:
+    note = "no push-to-talk recording is running"
+    return false
+  gPttPumps = gPttPumps + 1
+  let bytes = readAll(gPttWav)
+  if bytes.len == 0:
+    note = "the recorder has written nothing yet at " & gPttWav & "; " & pttOutcome()
+    gPttLastNote = note
+    return true
+  var rate = 0
+  var chans = 0
+  var bits = 0
+  var dataField = -1
+  let start = pcmStartOf(bytes, rate, chans, bits, dataField)
+  if start < 0:
+    note = "the wav header is not readable yet (" & $bytes.len &
+           " bytes on disk); " & pttOutcome()
+    gPttLastNote = note
+    return true
+  gPttRate = rate
+  gPttChan = chans
+  gPttBits = bits
+  gPttDataField = dataField
+  let avail = bytes.len - start
+  if avail <= gPttFed:
+    note = "no new audio: " & $avail & " PCM bytes on disk, " & $gPttFed &
+           " already fed (the RIFF data size field still reads " &
+           $dataField & "); " & pttOutcome()
+    gPttLastNote = note
+    return true
+  let slice = bytes[start + gPttFed ..< bytes.len]
+  gPttFed = avail
+  gPttSeq = gPttSeq + 1
+  # Re-wrap the raw slice in a correct header rather than handing it over as
+  # "raw PCM": that path ASSUMES 16 kHz mono 16-bit, and an assumption is
+  # exactly what the session's format check exists to catch.
+  let wrapped = riffHeader(slice.len, rate, chans, bits) & slice
+  var finalText = ""
+  var sttNote = ""
+  let ok = sttSessionChunk(gPttSession, gPttSeq, "", base64.encode(wrapped),
+                           false, partial, finalText, sttNote)
+  note = "fed " & $slice.len & " new PCM bytes of " & $avail & " on disk (" &
+         $rate & " Hz " & $chans & "ch " & $bits & "-bit) while the RIFF data " &
+         "size field reads " & $dataField &
+         " -- the recorder writes the sizes only when it exits; " & sttNote
+  gPttLastNote = note
+  result = ok
+
+proc pttStart*(session: string; wav: var string; already: var bool;
+               note: var string): bool =
+  already = false
+  wav = ""
+  note = ""
+  if session.len == 0:
+    note = "no session id"
+    return false
+  if gPttActive:
+    wav = gPttWav
+    if gPttSession == session:
+      already = true
+      note = "already recording into " & gPttWav & " (" &
+             $int(nowMs() - gPttStartMs) & " ms so far); " & pttOutcome()
+      return true
+    note = "session '" & gPttSession & "' is already recording -- send it an " &
+           "`up` before starting '" & session & "'"
+    return false
+  let p = recProbe()
+  if not p.ok:
+    note = "capture unavailable -- " & p.note
+    return false
+  if not ensureDir(cWorkDir):
+    note = "workDir is not writable: " & cWorkDir
+    return false
+  # A RELATIVE workDir is refused outright. The recorder is started by a
+  # detached `cmd /c`, whose working directory is not ours, so a relative path
+  # means the wrapper is looked for in the wrong place and the wav is written
+  # somewhere nobody reads -- MEASURED 2026-09-06: with workDir defaulted to
+  # "." the check reported "still running" forever because the .cmd was never
+  # found. Every path here has to be absolute.
+  var absolute = false
+  if cWorkDir.len >= 2 and cWorkDir[1] == ':': absolute = true
+  if cWorkDir.len >= 1 and (cWorkDir[0] == '/' or cWorkDir[0] == '\\'): absolute = true
+  if not absolute:
+    note = "workDir '" & cWorkDir & "' is a RELATIVE path; the recorder runs " &
+           "under a detached cmd whose working directory is not ours, so it " &
+           "would write the wav somewhere nothing here can read. Set " &
+           "\"workDir\" in mods/basement/config.json to an absolute directory."
+    return false
+  var secs = cPttMaxSeconds
+  if secs < 1: secs = 1
+  if secs > 600: secs = 600
+  let tag = hex64(fnv1a64(session & "." & $nowMs()))
+  let wavPath = joinPath(cWorkDir, "bm_ptt_" & tag & ".wav")
+  let outPath = joinPath(cWorkDir, "bm_ptt_" & tag & ".out")
+  let codePath = joinPath(cWorkDir, "bm_ptt_" & tag & ".code")
+  let batPath = joinPath(cWorkDir, "bm_ptt_" & tag & ".cmd")
+  let bat = "@echo off\r\n" &
+            "\"" & cRecorderExe & "\" \"" & wavPath & "\" " & $secs &
+            " <NUL > \"" & outPath & "\" 2>&1\r\n" &
+            "set BMRC=%ERRORLEVEL%\r\n" &
+            # `echo %ERRORLEVEL%> f` is a TRAP: cmd reads the digit immediately
+            # before `>` as a stream HANDLE, so `echo 2> f` redirects echo's
+            # own stderr and leaves an EMPTY file -- MEASURED 2026-09-06, it
+            # made the exit code read "unreadable" while the recorder had
+            # cleanly reported NO_DEVICES. The space keeps it a value.
+            "echo %BMRC% > \"" & codePath & "\"\r\n"
+  if not writeAll(batPath, bat):
+    note = "could not write the recorder wrapper at " & batPath
+    return false
+  if not spawnDetached("cmd.exe", "/c \"" & batPath & "\""):
+    note = "the recorder wrapper could not be started (cmd.exe /c " & batPath & ")"
+    return false
+  gPttActive = true
+  gPttSession = session
+  gPttWav = wavPath
+  gPttOutFile = outPath
+  gPttCodeFile = codePath
+  gPttStartMs = nowMs()
+  gPttSecs = secs
+  gPttFed = 0
+  gPttSeq = 0
+  gPttPumps = 0
+  gPttDataField = -1
+  gPttRate = 0
+  gPttChan = 0
+  gPttBits = 0
+  wav = wavPath
+  note = "recording into " & wavPath & " for at most " & $secs & " s (the " &
+         "recorder cannot be interrupted from here -- `up` finalises over " &
+         "what is on disk at that moment)"
+  gPttLastNote = note
+  result = true
+
+proc pttStop*(sess: var string; finalText: var string; note: var string): bool =
+  ## `up`. Pumps the tail, then runs the FINAL transcription over the whole
+  ## session buffer and closes the session.
+  sess = ""
+  finalText = ""
+  note = ""
+  if not gPttActive:
+    note = "no push-to-talk recording is running -- an `up` without a `down` " &
+           "is refused, nothing was transcribed"
+    return false
+  var lastPartial = ""
+  var pumpNote = ""
+  discard pttPump(lastPartial, pumpNote)
+  sess = gPttSession
+  let heldMs = int(nowMs() - gPttStartMs)
+  let onDisk = sizeOfFile(gPttWav)
+  let outcome = pttOutcome()
+  let fed = gPttFed
+  gPttSeq = gPttSeq + 1
+  var p2 = ""
+  var sttNote = ""
+  let ok = sttSessionChunk(gPttSession, gPttSeq, "", "", true, p2, finalText,
+                           sttNote)
+  gPttActive = false
+  gPttSession = ""
+  note = "stopped after " & $heldMs & " ms; " & $fed & " PCM bytes fed, wav " &
+         $onDisk & " bytes at " & gPttWav & "; recorder " & outcome &
+         "; the recorder was bounded at " & $gPttSecs & " s and is NOT " &
+         "interrupted here, so it keeps writing until that bound expires; " &
+         pumpNote & "; " & sttNote
+  gPttLastNote = note
+  result = ok
+
+proc pttStatus*(): JsonObject =
+  let p = recProbe()
+  var o = obj()
+  o.put("recording", gPttActive)
+  o.put("session", gPttSession)
+  o.put("seconds", (if gPttActive: int(nowMs() - gPttStartMs) div 1000 else: 0))
+  o.put("wavBytes", (if gPttWav.len > 0: sizeOfFile(gPttWav) else: -1))
+  o.put("wav", gPttWav)
+  o.put("pcmFed", gPttFed)
+  o.put("pumps", gPttPumps)
+  o.put("riffDataSizeField", gPttDataField)
+  o.put("rate", gPttRate)
+  o.put("channels", gPttChan)
+  o.put("bits", gPttBits)
+  o.put("maxSeconds", cPttMaxSeconds)
+  o.put("recorder", cRecorderExe)
+  o.put("recorderOk", p.ok)
+  o.put("recorderNote", p.note)
+  o.put("outcome", pttOutcome())
+  o.put("note", gPttLastNote)
+  result = o

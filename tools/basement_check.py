@@ -514,6 +514,104 @@ def check_grounding(rep, store):
             "status=%r rumour about the cache=%s an outcome fact exists=%s; "
             "note=%r" % (status, rumour, outcome, took[:170]))
 
+# ---------------------------------------------------------------------------
+# 4. push to talk -- the backend holds the microphone
+# ---------------------------------------------------------------------------
+
+def check_ptt(rep, store):
+    """`down` -> a wav that GROWS -> `up` -> heard.final -> a second `up` refused.
+
+    Two things this has to be careful about, and neither is optional:
+
+    * The simulator runs EVERY route before it runs a single tick, so the
+      backend tick cannot be what pumps the growing file here. `/speech/ptt
+      {"state":"poll"}` is the manual pump, and `/events?wait=` -- a bounded
+      busy poll on the request thread -- is the only way to make wall-clock
+      time pass between routes without a sleep primitive.
+    * NO CAPTURE DEVICE IS INCONCLUSIVE, NEVER PASS AND NEVER "SILENCE".
+      aowl.voice DESIGN 5.1 measured `waveInGetNumDevs()==0` on this machine;
+      the recorder exits 2 with NO_DEVICES in that case. The mod runs it
+      through a .cmd wrapper that captures the exit code precisely so this
+      check can quote it instead of guessing, and `ptt.outcome` is that
+      string.
+    """
+    sess = "check-ptt"
+    routes = [
+        (BASE + "/speech/ptt", json.dumps({"session": sess, "state": "down"})),
+        (BASE + "/events?since=0&wait=2000", ""),
+        (BASE + "/speech/ptt", json.dumps({"session": sess, "state": "poll"})),
+        (BASE + "/status", ""),
+        (BASE + "/events?since=0&wait=2000", ""),
+        (BASE + "/speech/ptt", json.dumps({"session": sess, "state": "up"})),
+        (BASE + "/events?since=0&wait=0", ""),
+        (BASE + "/speech/ptt", json.dumps({"session": sess, "state": "up"})),
+    ]
+    docs, raw, err = run_sim(store, routes)
+    if err:
+        rep.add(INCONCLUSIVE, "ptt: down/up", err)
+        return
+    down, _, poll, status, _, up, events, up2 = docs
+    if not isinstance(down, dict):
+        rep.add(INCONCLUSIVE, "ptt: down",
+                "the simulator never answered %s/speech/ptt\n%s"
+                % (BASE, raw[-1200:]))
+        return
+    ptt_after_down = down.get("ptt", {})
+    if not down.get("ok"):
+        verdict = INCONCLUSIVE if "capture unavailable" in down.get("note", "") \
+                  else FAIL
+        rep.add(verdict, "ptt: down starts a recorder",
+                "note=%r recorder=%r ok=%s"
+                % (down.get("note", "")[:220], ptt_after_down.get("recorder"),
+                   ptt_after_down.get("recorderOk")))
+        return
+    rep.add(PASS, "ptt: down starts a recorder",
+            "wav=%s recording=%s max=%ss"
+            % (down.get("wav"), ptt_after_down.get("recording"),
+               ptt_after_down.get("maxSeconds")))
+
+    # The growth assertion. `wavBytes` is read off disk at /status time, and
+    # `riffDataSizeField` is what the file's own header CLAIMS -- printing both
+    # is the measurement, not a decoration: the recorder leaves that field at 0
+    # until it exits, which is why the pump takes the data chunk's offset.
+    st = (status or {}).get("ptt", {})
+    wav_bytes = st.get("wavBytes", -1)
+    outcome = st.get("outcome", "")
+    poll_note = (poll or {}).get("note", "")
+    if wav_bytes is None or wav_bytes <= 44:
+        rep.add(INCONCLUSIVE, "ptt: the wav grows while recording",
+                "wavBytes=%s (a header is 44) -- recorder %s; poll said %r. "
+                "This is a capture-device question, not a code one."
+                % (wav_bytes, outcome, poll_note[:200]))
+    else:
+        rep.add(PASS if st.get("pcmFed", 0) > 0 else FAIL,
+                "ptt: the wav grows while recording",
+                "wavBytes=%s pcmFed=%s riffDataSizeField=%s (%s Hz %sch %s-bit); "
+                "recorder %s"
+                % (wav_bytes, st.get("pcmFed"), st.get("riffDataSizeField"),
+                   st.get("rate"), st.get("channels"), st.get("bits"),
+                   outcome[:120]))
+
+    kinds = kinds_on_stream(events)
+    final_ev = event_with_kind(events, "heard.final")
+    closed = not (up or {}).get("ptt", {}).get("recording", True)
+    ok = bool(up and up.get("ok") and final_ev and closed)
+    rep.add(PASS if ok else FAIL, "ptt: up closes the session and emits heard.final",
+            "up.ok=%s heard.final on the stream=%s recording=%s final=%r; "
+            "kinds=%s; note=%r"
+            % ((up or {}).get("ok"), bool(final_ev),
+               (up or {}).get("ptt", {}).get("recording"),
+               (up or {}).get("final", ""), kinds[:8],
+               (up or {}).get("note", "")[:240]))
+
+    # Negative control: an `up` with no `down` must be refused with a note.
+    refused = bool(up2 and up2.get("ok") is False and up2.get("note"))
+    rep.add(PASS if refused else FAIL,
+            "ptt: a second up without a down is refused (negative control)",
+            "ok=%s note=%r"
+            % ((up2 or {}).get("ok"), (up2 or {}).get("note", "")[:200]))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--store", default="",
@@ -539,6 +637,8 @@ def main():
         check_story(rep, store)
         print("")
         check_grounding(rep, store)
+        print("")
+        check_ptt(rep, store)
     finally:
         if cfg_path and original is not None:
             open(cfg_path, "w", encoding="utf-8").write(original)
