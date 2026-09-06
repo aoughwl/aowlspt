@@ -444,6 +444,7 @@ var cfgAdsDeferToGame = true
   ## FOV -- which is also the reason `opticFovMulti` never behaved: `base * 1.38`
   ## has nothing to do with a scope's actual magnification.
 var cfgAdsWriteFovField = true
+var cfgAdsHoldEveryFrame = true   ## re-assert the ADS endpoint every frame (see the hold)
   ## Write the endpoint into EFT.CameraControl.CameraManager._fov (a plain
   ## float at +0xF8, from fieldOffsets) as well as into Camera.fieldOfView --
   ## i.e. change the game's own INPUT rather than correcting its output. This
@@ -615,6 +616,7 @@ proc loadConfig() =
   cfgAdsObserveCap = cfgFloat("adsObserveCap", 1.5)
   cfgAdsMaxFights = int(cfgFloat("adsMaxFights", 3.0))
   cfgAdsWriteFovField = cfgBool("adsWriteFovField", true)
+  cfgAdsHoldEveryFrame = cfgBool("adsHoldEveryFrame", true)
 
   # RENAMED, and the rename IS the fix.
   #
@@ -2246,6 +2248,8 @@ var gAdsProbeN = 0          ## samples emitted by the read-only writer probe
 var gHoldProbeN = 0         ## samples emitted by the one-shot hold probe
 var gAdsFieldState = "no CameraManager._fov write has been attempted yet"
 var gAdsFieldWrites = 0
+var gAdsHoldWrites = 0      ## per-frame re-asserts of the ADS endpoint (the hold)
+var gAdsHoldSaid = false
 var gAdsFieldRefusals = 0
 
 # ---- THE READ-ONLY WRITER PROBE.
@@ -3078,18 +3082,62 @@ proc applyFov() =
   # produce. Repeating the write every frame would destroy exactly this
   # information, and is also what the player experiences as the fight.
   if wantAds and gAdsBase > 0.0 and not gAdsObserving:
-    if gHoldProbeN < AdsProbeMax and bCamFov.ok:
+    # THE HOLD. MEASURED 2026-09-06 (fov e0571f641c01, Woods, pact ADS): the
+    # ONE-SHOT write of 53.41 into CameraManager._fov was pulled back to the
+    # game's own 60.0 in 12 frames -- 57.20, 58.91, 59.60, 59.87 ... an
+    # exponential approach, i.e. the game re-drives the field every frame
+    # from wherever it is toward ITS target (base - AimDeltaFov). A single
+    # write therefore cannot own the value; `CameraManager::SetFov` cannot
+    # either (it returns on the null <Camera>@0x70, fact #260). So while the
+    # player aims and the game's ramp has settled, the endpoint is
+    # re-asserted EVERY FRAME through the same typed FieldRef gate, and the
+    # probe below reports what the camera actually shows -- which is the
+    # only statement that matters, and which this hold may still lose if the
+    # game's step runs AFTER this drain (then the render sits between the
+    # two writers; the probe's steady value says which).
+    var s = 0.0
+    var haveS = false
+    if bCamFov.ok:
       a.reset()
-      let s = callFloat(bCamFov, cam, a)
+      s = callFloat(bCamFov, cam, a)
+      haveS = true
+    if cfgAdsHoldEveryFrame and cfgAdsWriteFovField and cm != nil and
+       haveS and fabsf(s - gAdsPendTarget) > 0.05 and
+       fovReadable(cm, int(OffCamMgrFov) + 4):
+      var frWhy = 0'i32
+      if frStoreF32(frCmFov(), cm, 0'i32, float32(gAdsPendTarget), frWhy) != 0'i32:
+        gAdsHoldWrites = gAdsHoldWrites + 1
+        if bCamSetFov.ok:
+          # The render reads the Camera, not the manager's field; the game
+          # copies one to the other on its own schedule, so both are set.
+          a.reset()
+          addFloat(a, gAdsPendTarget)
+          callVoid(bCamSetFov, cam, a)
+      elif not gAdsHoldSaid:
+        gAdsHoldSaid = true
+        warn "FOV: the per-frame hold's typed store was refused with rule " &
+             "code " & $frWhy & "; the endpoint is not being held"
+    if gHoldProbeN < AdsProbeMax and haveS:
       gHoldProbeN = gHoldProbeN + 1
       let fld = (if cm != nil and fovReadable(cm, int(OffCamMgrFov) + 4):
                    $fovFloatAt(cm, OffCamMgrFov) else: "unreadable")
       info "FOV: hold probe " & $gHoldProbeN & "/" & $AdsProbeMax &
-           " -- frame " & $gHoldProbeN & " after the ONE-SHOT write of " &
-           $gAdsPendTarget & "; no write since. Camera.fieldOfView " & $s &
-           ", CameraManager._fov " & fld & ", delta-to-our-endpoint " &
-           $fabsf(s - gAdsPendTarget) & ", delta-to-game's-own " &
-           $fabsf(s - gAdsBase) & ", dt " & $dt & ". " & gAdsFieldState
+           " -- frame " & $gHoldProbeN & " after the settle write of " &
+           $gAdsPendTarget & "; hold re-asserts so far " & $gAdsHoldWrites &
+           (if cfgAdsHoldEveryFrame: "" else: " (hold OFF by config)") &
+           ". Camera.fieldOfView " & $s & " (read BEFORE this frame's " &
+           "re-assert), CameraManager._fov " & fld &
+           ", delta-to-our-endpoint " & $fabsf(s - gAdsPendTarget) &
+           ", delta-to-game's-own " & $fabsf(s - gAdsBase) & ", dt " & $dt
+      if gHoldProbeN == AdsProbeMax:
+        info "FOV: HOLD VERDICT after " & $AdsProbeMax & " frames: the camera " &
+             "read " & $s & " against our endpoint " & $gAdsPendTarget &
+             " and the game's own " & $gAdsBase & " -- " &
+             (if fabsf(s - gAdsPendTarget) <= 0.5: "PASS, the hold owns the value"
+              elif fabsf(s - gAdsBase) <= 0.5: "FAIL, the game owns it despite " &
+                   $gAdsHoldWrites & " re-asserts (its writer runs after this drain)"
+              else: "PARTIAL, the render sits between the two writers")
+    if haveS:
       gAdsPrev = s
       gCurFov = s
     return
@@ -3124,6 +3172,8 @@ proc applyFov() =
         return
       if not gAdsObserving:
         gAdsObserving = true
+        gHoldProbeN = 0
+        gAdsHoldWrites = 0
         gAdsObsT = 0.0
         gAdsMoved = false
         gAdsStill = 0
