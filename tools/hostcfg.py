@@ -169,13 +169,26 @@ def _note_bool_site(name, default_expr, is_def, where):
 # know about at all, so every string key was invisible to this tool -- measured
 # missing: `launchProfileId` (aowlhost.nim) and `uxBetaOverlayPos`
 # (betanotice.nim). A key this tool cannot see is a key `set` refuses to write.
-STR_CALL = re.compile(r'readStrKey\(\s*"([A-Za-z0-9_]+)"')
+# `readStrListKey` (aowlhost.nim, added with the `hostHttpAllow` /
+# `hostPlayWavRoots` array flags) reads a JSON STRING ARRAY. It is the same
+# kind of key from this tool's point of view -- a name the host looks for in
+# aowlspt-host.json -- and a key this tool cannot see is a key `set` refuses to
+# write, so the shape is accepted here rather than added to a hand-list.
+STR_CALL = re.compile(r'readStr(?:List)?Key\(\s*"([A-Za-z0-9_]+)"')
 # Integer keys read through `readIntKey` were ALSO invisible -- only the three
 # hand-named INT_KEYS were known. Measured 2026-09-01: `modLoadWalkLevel`, the
 # bisect instrument for a client-killing crash, reported as UNKNOWN ("not in
 # this tool's manifest... not near any known key"), which reads as a typo
 # warning for a valid key -- a confidently wrong answer at the worst moment.
 INT_CALL = re.compile(r'readIntKey(?:Def)?\(\s*"([A-Za-z0-9_]+)"')
+# ...and their DEFAULTS, which were invisible too. MEASURED 2026-09-06: every
+# key found by INT_CALL alone reported `default 0` because only the hand-named
+# INT_KEYS carried a default -- so `inspectorSliceMs` printed `default 0` when
+# the host's own call site says `readIntKey("inspectorSliceMs", 12)`. That is a
+# confidently wrong number, which this project treats as worse than none. The
+# call site is the authority; this reads it.
+INT_CALL_DEF = re.compile(
+    r'readIntKey(?:Def)?\(\s*"([A-Za-z0-9_]+)"\s*,\s*(-?[0-9]+)\s*\)')
 # `readStaticBridgeEnabled` does not go through `readBoolKey`; it builds its own
 # needle as the nim literal `"\"bridgeStaticRva\""`. Match that shape so a flag
 # read the hand-rolled way is still known here.
@@ -255,6 +268,10 @@ def scrape_keys(hostdir):
         for m in INT_CALL.finditer(text):
             keys.setdefault(m.group(1), ("int", os.path.basename(path)))
             hit = True
+        for m in INT_CALL_DEF.finditer(text):
+            # setdefault, not assignment: the hand-named INT_KEYS below are
+            # read by dedicated procs with their own literals and win.
+            INT_KEYS.setdefault(m.group(1), int(m.group(2)))
         if hit:
             scanned += 1
     if not scanned:

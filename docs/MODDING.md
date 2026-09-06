@@ -770,6 +770,11 @@ you need inside the handler, or take an address and pin it
 | `route` / `serve` / `servePrefix` | server-side; returns `ErrUnsupported` |
 | `notifyPush` | backend only — it pushes down the game's notifier websocket, and there is no socket in the client host. ABI revision 5; `notifyReady()` answers, and it is false on the client and in the simulator |
 
+**Outbound HTTP is no longer on that list.** It is not `route`/`serve` -- a mod
+still cannot *listen* in the client -- but it can now *ask*, through the generic
+verb `aowlspt.host::http`. See "Talking to the backend, and making a sound"
+below.
+
 And one that is conditional rather than absent:
 
 **`onMainThread` gets you Unity's main thread when the host could detour a
@@ -789,6 +794,100 @@ thread here. **Do not build on that.** The ABI only ever promised the main threa
 for `invoke_main`; the backend keeps its timers on its own thread and is within
 its rights to. If you want the game's thread, say so: `onMainThread` for once,
 `everyMain` for every frame. Both are in [Timers](#timers-and-talking-to-other-mods).
+
+## Talking to the backend, and making a sound -- the generic host verbs
+
+Two things the client host could not do at all until 2026-09-06, and that a mod
+still cannot do for itself: **reach the network**, and **play audio**. Both are
+now `aowlspt_nim_call` verbs, both are **flag-gated and default OFF**, and both
+are deliberately **feature-agnostic** -- they know nothing about routes, schemas
+or what the sound is for.
+
+Measured, so the gap is on the record: a grep of the whole client host for
+`WinHttp` / `InternetOpen` / `WinINet` / `curl` found nothing but the image-CDN
+`ws2_32` redirect hook. A client mod could serve a settings page and read the
+command line, and could not ask `aowlspt-backend` a single question.
+
+### `aowlspt.host::http` -- async HTTP, off the game's thread
+
+Args `{"id":"<your token>","method":"GET|POST","url":"http://127.0.0.1:6969/...",
+"body":"...","timeoutMs":25000}`. Answers, **immediately**, either
+`{"accepted":true,"id":".."}` or `{"accepted":false,"why":".."}`.
+
+It returns on whatever thread you called it from. The request runs on a **host
+worker thread** -- never Unity's main thread, never inside a detour.
+
+The completion arrives as the mod event **`host.http.done`**:
+
+```json
+{"id":"myMod-1","status":200,"body":"...","bytes":12,"ms":41,"error":""}
+```
+
+**That event is emitted from the host's own tick loop, not from the worker.**
+This matters if you are writing host code: `aowlspt_nim_event_emit` delivers
+*synchronously on the emitting thread*, so emitting from a worker would run your
+handler on a thread your mod has never seen, possibly concurrently with its own
+ops tick, and on a thread mimalloc did not watch your mod initialise on -- the
+shape that `__fastfail`s with no Unity crash report at all.
+
+If you would rather not subscribe, poll `aowlspt.host::http_poll` with
+`{"id":".."}`. **Three outcomes, not two.** `known:false` means *no such id* --
+never submitted, or the result aged out after 120 s. `done:false, known:true`
+means still in flight. Flattening those two is how a poller waits forever on a
+typo.
+
+Calling `http` with **no arguments** returns the state of the service --
+`enabled`, `winhttp`, the allowlist, `inflight`, the caps, the counters -- so a
+mod can find out whether asking is worth it instead of discovering the flag is
+off one refusal at a time.
+
+Everything it refuses, it refuses **by name**, and every cap is a **refusal, not
+a truncation** -- a prefix of a JSON document is worse than no document, because
+every reader rejects it as a schema error and the size never appears anywhere.
+
+| flag | default | what it does |
+|---|---|---|
+| `hostHttp` | `false` | off => `{"accepted":false,"why":"flag hostHttp is off"}` |
+| `hostHttpAllow` | `["127.0.0.1","localhost"]` | hosts that may be dialled; **an empty array refuses everything** |
+| `hostHttpMaxInflight` | `4` | each in-flight request holds one thread in the game process |
+| `hostHttpMaxBody` | `1048576` | caps **both** directions; over it, refused |
+
+`https://` is refused by name rather than silently downgraded: the allowlist is
+loopback, and TLS to `127.0.0.1` buys nothing while adding a certificate surface
+inside a game process.
+
+### `aowlspt.host::play_wav` -- a sound, and only that
+
+Args `{"path":"<absolute path>.wav","volume":0.0-1.0}`. Answers `{"ok":true,...}`
+or `{"ok":false,"why":".."}`.
+
+**NON-SPATIAL, and `volume` is IGNORED.** Both are stated in the answer, not
+only in a header. `PlaySoundW` mixes into the process's default output device:
+no position, no distance falloff, no relation to the game's audio listener. The
+only volume knob winmm offers without an open stream is `waveOutSetVolume`,
+which moves the whole **output device** -- the game's own volume -- and leaves
+it moved if we die between setting and restoring. Real per-sound volume and
+position need a Unity `AudioSource` driven at byte-verified RVAs; that
+groundwork is in [VOICE_RVA.md](VOICE_RVA.md).
+
+| flag | default | what it does |
+|---|---|---|
+| `hostPlayWav` | `false` | off => `{"ok":false,"why":"flag hostPlayWav is off"}` |
+| `hostPlayWavRoots` | `["%TEMP%","D:\\Aowlspt"]` | the path must sit under one of these (env vars expanded); a `..` anywhere is refused outright rather than resolved |
+
+winmm decodes **PCM `.wav` only**. An mp3 or ogg is refused with that reason,
+not played as a system ding -- `SND_NODEFAULT` is set precisely so a file winmm
+cannot decode cannot be mistaken for success.
+
+Both verbs are answered **above the runtime gate**, like `cmdline` and
+`raid_phase`: the answer is meaningful with no IL2CPP at all. Neither touches
+game memory, resolves a name, calls an RVA or installs a detour.
+
+Tested by `python tools/test_hosthttp.py`, which compiles
+`abi/aowlspt_hostnet.h` + `abi/aowlspt_playwav.h` into
+`tests/hostnet/hostnet_drive.c` and drives them against a real loopback HTTP
+server. It does **not** cover the Nim verb layer or the event bus -- see its
+docstring, which says which half is executed and which half is only read.
 
 ## Keeping things: JSON, and a store of your own
 

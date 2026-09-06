@@ -2714,6 +2714,15 @@ proc hostResolve(ctx: Il2CppPtr; typeName: Il2CppPtr; nameLen: int32;
 ## memory and reads the process command line exactly once.
 include "cmdargs.nim"
 
+## THE TWO GENERIC TRANSPORT VERBS -- `aowlspt.host::http` / `http_poll` and
+## `aowlspt.host::play_wav`. Included HERE for exactly the reason `cmdargs.nim`
+## above is: `hostCall` is the only door a mod has and it is defined at ~2830,
+## far above the other includes, so anything it dispatches to must already be
+## in scope. Like `cmdargs.nim` it installs no detour, resolves no il2cpp name
+## and touches no game memory; the whole of its blocking work happens on its
+## own worker threads, and its completions are emitted from the host's tick.
+include "hostnet.nim"
+
 proc mainThreadReport(): string =
   ## What `call("aowlspt.host::main_thread")` answers.
   ##
@@ -3059,6 +3068,38 @@ proc hostCall(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
         report = "{\"rva\":\"0x" & obHexU32(rva) & "\",\"have\":true," &
                  "\"len\":" & $n & ",\"bytes\":\"" & obHexBytes(buf, int(n)) &
                  "\",\"source\":\"startup-snapshot\"}"
+    return cOutCopy(outPtr, outLen, cast[Il2CppPtr](toCString(report)),
+                    int32(report.len))
+
+  # `http` / `http_poll` -- the host's ONLY outbound HTTP client, and the only
+  # way a client-side mod can reach the backend at all (MEASURED 2026-09-06:
+  # before this there was none). Generic: no route, no schema, no mod named
+  # here. Answered without the runtime, touches no game memory, and returns
+  # IMMEDIATELY on whatever thread called -- the request itself runs on a
+  # worker thread and its completion is emitted from the host's own tick loop,
+  # never from that worker. See the banner in `hostnet.nim` for why that split
+  # is not optional.
+  if spec == "aowlspt.host::http":
+    var report = ""
+    if argText.len == 0:
+      report = hnStatusJson()      # no args = "what is the state of this?"
+    else:
+      report = hnHttpVerb(argText)
+    return cOutCopy(outPtr, outLen, cast[Il2CppPtr](toCString(report)),
+                    int32(report.len))
+
+  if spec == "aowlspt.host::http_poll":
+    var report = hnHttpPollVerb(argText)
+    return cOutCopy(outPtr, outLen, cast[Il2CppPtr](toCString(report)),
+                    int32(report.len))
+
+  # `play_wav` -- fire-and-forget, NON-SPATIAL winmm playback of a PCM .wav
+  # under an allowlisted root. `volume` is accepted and IGNORED, and the answer
+  # says so rather than leaving it to be discovered. Spatial playback needs a
+  # Unity AudioSource driven at byte-verified RVAs; that is a separate step and
+  # `docs/VOICE_RVA.md` is where its groundwork lives.
+  if spec == "aowlspt.host::play_wav":
+    var report = hnPlayWavVerb(argText)
     return cOutCopy(outPtr, outLen, cast[Il2CppPtr](toCString(report)),
                     int32(report.len))
 
@@ -8490,6 +8531,64 @@ proc readStrKey(key: string): string =
   if i < text.len and text[i] == '"':
     result = acc
 
+proc readStrListKey(key: string): seq[string] =
+  ## A shallow read of one `aowlspt-host.json` STRING-ARRAY key:
+  ## `"hostHttpAllow": ["127.0.0.1", "localhost"]` -> `@["127.0.0.1",
+  ## "localhost"]`. Same deliberately-shallow shape as `readBoolKey` /
+  ## `readStrKey` above, and for the same reason.
+  ##
+  ## `readStrKey` CANNOT be used for these: it requires the first non-space
+  ## character after the key to be a `"`, and for an array it is a `[`, so it
+  ## returns "" -- an empty allowlist, which refuses everything, for entirely
+  ## the wrong reason. That is exactly the shape of failure section 9b is
+  ## about, so the array gets its own reader rather than a caller that
+  ## "knows".
+  ##
+  ## Returns @[] when the key is absent, unreadable, or not an array. Bounded
+  ## on both axes: at most 32 entries, at most 512 characters each.
+  ##
+  ## `tools/hostcfg.py`'s `STR_CALL` regex accepts `readStrKey` and
+  ## `readStrListKey` alike, so a key read this way is still a key that tool
+  ## knows about -- a key it cannot see is a key it refuses to write.
+  result = @[]
+  var text = ""
+  if not readTextFile(joinPath(gDir, "aowlspt-host.json"), text):
+    return
+  let needle = "\"" & key & "\""
+  let at = find(text, needle)
+  if at < 0:
+    return
+  var i = at + needle.len
+  while i < text.len and (text[i] == ' ' or text[i] == ':' or text[i] == '\t'):
+    inc i
+  if i >= text.len or text[i] != '[':
+    return
+  inc i
+  var entries = 0
+  var guard = 0
+  while i < text.len and text[i] != ']' and entries < 32 and guard < 8192:
+    inc guard
+    if text[i] == '"':
+      inc i
+      var acc = ""
+      var n = 0
+      while i < text.len and text[i] != '"' and n < 512:
+        # An escaped backslash is the only escape a Windows path needs, and it
+        # is the only one honoured: `"D:\\Aowlspt"` -> `D:\Aowlspt`.
+        if text[i] == '\\' and i + 1 < text.len:
+          inc i
+        acc = acc & text[i]
+        inc i
+        inc n
+      if i < text.len and text[i] == '"':
+        inc i
+        result.add acc
+        inc entries
+      else:
+        return                   # unterminated -- report NOTHING, not a half
+    else:
+      inc i
+
 proc readDrainDisabled(): bool = readBoolKey("bridgeDisableDrain")
 
 proc readWaitMs(): int =
@@ -9122,6 +9221,25 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
          "bind once GameAssembly.dll is mapped, and will run its live " &
          "self-test then. It is NOT bound yet and nothing resolves by " &
          "name through it: no mod has been switched over."
+  # ---- the two GENERIC transport services (`hostnet.nim`) ----------------
+  #
+  # Both DEFAULT OFF, both answer a refusal by name when off, and neither
+  # loads a DLL, creates a thread or touches game memory until it is used.
+  # The allowlist and the root list have DEFAULTS rather than being empty when
+  # the key is absent: an empty allowlist refuses everything, which is the
+  # right behaviour for a key somebody deliberately emptied and the wrong one
+  # for a key nobody has written yet.
+  var hnAllow = readStrListKey("hostHttpAllow")
+  if hnAllow.len == 0:
+    hnAllow = @["127.0.0.1", "localhost"]
+  var pwRoots = readStrListKey("hostPlayWavRoots")
+  if pwRoots.len == 0:
+    pwRoots = @["%TEMP%", "D:\\Aowlspt"]
+  hnApplyConfig(readBoolKey("hostHttp"), hnAllow,
+                readIntKey("hostHttpMaxInflight", 4),
+                readIntKey("hostHttpMaxBody", 1048576),
+                readBoolKey("hostPlayWav"), pwRoots)
+  hnBootLog()
   gCodeGenAudit = readBoolKey("codeGenAudit")
   gRegionOn = readBoolKey("sharedRegion")
   gUnityPostProbeOn = readBoolKey("unityPostProbe")
@@ -11054,6 +11172,26 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
         warn "exit fix: no main game window appeared within 5 minutes; the " &
              "OS-close hooks are not installed yet (window-X may still hang; " &
              "the Exit button is patched). Still checking."
+    # THE HTTP COMPLETION DRAIN. Here, on the HOST thread, and not on the
+    # worker that made the request -- `hostEmit` -> `deliverEvent` calls each
+    # subscriber's handler SYNCHRONOUSLY on the emitting thread, so emitting
+    # from a fresh worker would run a mod's handler on a thread the mod has
+    # never seen, concurrently with its own ops tick, and on a thread mimalloc
+    # did not watch it initialise on (CLAUDE.md section 1: that shape
+    # `__fastfail`s with no Unity crash report at all). `hostnet.nim`'s banner
+    # is the long form of this argument.
+    #
+    # Bounded per tick. On any session that never calls the verb this is one
+    # interlocked compare and a return -- `aowl_hn_take_done` does not even
+    # take its lock when nothing was ever submitted.
+    block:
+      var hnTaken = 0
+      while hnTaken < HnDrainPerTick:
+        let hnDone = hnTakeCompletion()
+        if hnDone.len == 0: break
+        hostEmit("host.http.done", hnDone)
+        hnTaken = hnTaken + 1
+
     # Log any newly-seen resolver host from the image-CDN hook. Drained here, on
     # the host thread, because the hook fires on the game's DNS thread where
     # opening a log file mid-resolve is not safe. First sight only, so this is

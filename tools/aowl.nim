@@ -3902,7 +3902,25 @@ proc cmdPayload(e: Env): int =
       "backendPort + modSyncMs (the text rides that poll), and it refuses to " &
       "arm while debugUi/debugEsp are on, because those drain the same " &
       "PreloaderUI.Update function. Default false until proven live.\",\n" &
-      "  \"uxMenuModeText\": false\n" &
+      "  \"uxMenuModeText\": false,\n" &
+      "\n" &
+      "  \"//hostHttp\": \"The host's ONLY outbound HTTP client, exposed to mods as the GENERIC verb aowlspt.host::http (plus http_poll). When true a mod may ask the host to fetch a URL; the request runs on a host WORKER THREAD -- never the Unity main thread and never inside a detour -- and the completion is delivered as the mod event host.http.done, emitted from the host's own tick rather than from that worker. Every host must be in hostHttpAllow, https is refused by name, and a body over hostHttpMaxBody is REFUSED rather than truncated. With this false the verb still ANSWERS, with why = flag hostHttp is off. Default false.\",\n" &
+      "  \"hostHttp\": false,\n" &
+      "\n" &
+      "  \"//hostHttpAllow\": \"The hosts aowlspt.host::http may dial. An EMPTY array refuses everything; the key being ABSENT means the default shown here. Loopback only is the intended setting -- the thing on the other end is aowlspt-backend.\",\n" &
+      "  \"hostHttpAllow\": [\"127.0.0.1\", \"localhost\"],\n" &
+      "\n" &
+      "  \"//hostHttpMaxInflight\": \"How many requests may be in flight at once. Each holds one worker thread inside the game process, so this is a real resource and not a formality. Over it, submit is REFUSED with a reason. Clamped to 8.\",\n" &
+      "  \"hostHttpMaxInflight\": 4,\n" &
+      "\n" &
+      "  \"//hostHttpMaxBody\": \"Byte cap on BOTH the request body and the response body. Over it the request is REFUSED, never truncated: a prefix of a JSON document is worse than no document, because every reader rejects it as a schema error and the size never appears anywhere. Clamped to 1 MiB.\",\n" &
+      "  \"hostHttpMaxBody\": 1048576,\n" &
+      "\n" &
+      "  \"//hostPlayWav\": \"Lets a mod play a PCM .wav through the generic verb aowlspt.host::play_wav (winmm PlaySoundW, async). NON-SPATIAL: the sound has no position, no distance falloff and no relation to the game's audio listener, and the volume argument is IGNORED -- winmm's only volume knob moves the whole OUTPUT DEVICE, i.e. the game's own volume, and leaves it moved. Real per-sound volume and position need a Unity AudioSource driven at byte-verified RVAs; see docs/VOICE_RVA.md. Default false.\",\n" &
+      "  \"hostPlayWav\": false,\n" &
+      "\n" &
+      "  \"//hostPlayWavRoots\": \"The directory roots a play_wav path must sit under. Environment variables are expanded. A path containing .. anywhere is refused outright rather than resolved, because a prefix check that can be walked out of is a check that cannot fail. An EMPTY array refuses everything; the key being ABSENT means the default shown here.\",\n" &
+      "  \"hostPlayWavRoots\": [\"%TEMP%\", \"D:\\\\Aowlspt\"]\n" &
       "}\n")
 
   let staged = failures - failuresAtEntry

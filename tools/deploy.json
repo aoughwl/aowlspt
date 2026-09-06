@@ -83,6 +83,12 @@
    "minBytes": 500000,
    "markers": [
     "aowlspt-host-il2cpp",
+   "aowlspt.host::http",
+   "aowlspt.host::http_poll",
+   "aowlspt.host::play_wav",
+   "flag hostHttp is off",
+   "flag hostPlayWav is off",
+   "host.http.done",
     "float _Clarity;float _Vibrance;",
     "float _Chroma;float _BloomThreshold;float2 _Res;",
     "post GPU cost NOT MEASURED (no timestamp query yet)",
