@@ -498,34 +498,51 @@ proc pactCheckIndices(): bool =
 # The receiver chain
 # ---------------------------------------------------------------------------
 
+var gPactSaidAiData = false
+
 proc pactAcquireYou(): bool =
+  ## Find the local player, or say exactly why not. EVERY refusal names
+  ## itself in `gPactLastRefusal` (it shows on the status line as
+  ## `player=none | last refusal: acquire: ...`): MEASURED 2026-09-06, this
+  ## proc returned false in a DEPLOYED raid for a whole day of loops and
+  ## six of its seven exits said nothing, so `player=none` was read as the
+  ## detour, the capture, the offsets -- everything but the line that fired.
+  ##
   ## The local player, re-derived every tick from the borrowed GameWorld and
   ## re-validated in full. NEVER cached across frames on the strength of one
-  ## success.
-  ##
-  ## The order of the checks is deliberate and each one CAN fail:
+  ## success. The order of the checks is deliberate and each one CAN fail:
   ##   readable            -- VirtualQuery, the cheapest and weakest
   ##   Unity-alive         -- `m_CachedPtr` non-zero; a destroyed UnityEngine
   ##                          object stays readable and dies on the next
   ##                          internal call, so readability is NOT liveness
   ##   klass pinned        -- the klass word must equal the one seen first; a
-  ##                          change means the pointer is a DIFFERENT type now,
-  ##                          which is the type-confusion case that beats both
-  ##                          guards above
+  ##                          change means the pointer is a DIFFERENT type now
   ##   IsYourPlayer        -- a PURE byte read at +0xB89 compiled as
   ##                          `movzx eax,[rcx+0xB89]; ret`, so it cannot
   ##                          dispatch anywhere and cannot fault on any object
-  ##                          this large. It is the first call made, on purpose.
-  ##   AIData == nil       -- the local player must not be AI-driven. Raw field
-  ##                          read, no call.
+  ##                          this large. The game's own identity answer.
+  ##   AIData              -- READ FOR THE LOG ONLY (see below); it was a gate
+  ##                          and the gate was wrong on this build.
   gPactYou = nil
   let gw = gDuGameWorld
-  if not pactOk(gw, cPactOffMainPlayer() + 8'i32): return false
+  if not pactOk(gw, cPactOffMainPlayer() + 8'i32):
+    gPactLastRefusal = "acquire: no readable GameWorld (the MainPlayer slot " &
+                       "@0x" & hexOf(uint64(cPactOffMainPlayer())) &
+                       " is not readable)"
+    return false
   let you = cReadPtrAt(gw, cPactOffMainPlayer())
-  if not pactOk(you, 0xB90'i32): return false
-  if not iUnityAlive(you): return false
+  if not pactOk(you, 0xB90'i32):
+    gPactLastRefusal = "acquire: GameWorld.MainPlayer is null or not readable " &
+                       "to +0xB90"
+    return false
+  if not iUnityAlive(you):
+    gPactLastRefusal = "acquire: GameWorld.MainPlayer is Unity-dead (native " &
+                       "half null)"
+    return false
   let k = iKlassOf(you)
-  if k == 0'u64: return false
+  if k == 0'u64:
+    gPactLastRefusal = "acquire: GameWorld.MainPlayer has no readable klass"
+    return false
   if gPactYouKlass == 0'u64:
     gPactYouKlass = k
   elif gPactYouKlass != k:
@@ -533,13 +550,32 @@ proc pactAcquireYou(): bool =
       hexOf(gPactYouKlass) & " -> 0x" & hexOf(k) &
       "); the pointer is a different type now, refusing"
     return false
-  # AIData: a raw read, no call. Non-null means this is a bot, and a bot is
-  # never the receiver for anything in this file.
-  if not pactOk(you, cPactOffAiData() + 8'i32): return false
-  if cReadPtrAt(you, cPactOffAiData()) != nil: return false
+  # THE AIDATA READ IS INFORMATION, NOT A GATE. It used to be `AIData != nil
+  # -> return false`, on the header's claim that the local player reads NULL
+  # there (botdiag's bot-vs-you discriminator). MEASURED 2026-09-06 in a
+  # DEPLOYED Woods raid, inspector: GameWorld.MainPlayer@0x230 non-null,
+  # IsYourPlayer@0xB89 = true, AIData@0xA00 = 0x1efb3ec3480 NON-NULL -- so on
+  # this PvE build the local player HAS an AIData, that gate refused every
+  # frame, and `player=none` stood for a whole day of otherwise-green loops.
+  # The game's own answer, `get_IsYourPlayer()`, is the identity test.
+  var aid: Il2CppPtr = nil
+  if pactOk(you, cPactOffAiData() + 8'i32):
+    aid = cReadPtrAt(you, cPactOffAiData())
   let fnIsYou = pactFn(PactTIsYou)
-  if fnIsYou == nil: return false
-  if cPactBP(fnIsYou, you) != 1'i32: return false
+  if fnIsYou == nil:
+    gPactLastRefusal = "acquire: EFT.Player::get_IsYourPlayer did not " &
+                       "verify -- " & readCString(cPactReasonText())
+    return false
+  if cPactBP(fnIsYou, you) != 1'i32:
+    gPactLastRefusal = "acquire: get_IsYourPlayer() answered false on " &
+                       "GameWorld.MainPlayer"
+    return false
+  if aid != nil and not gPactSaidAiData:
+    gPactSaidAiData = true
+    okLog "pact: the local player carries an AIData (0x" &
+          hexOf(cast[uint64](aid)) & ") on this build; get_IsYourPlayer() " &
+          "says it is you, and that is the test. The old 'a player with an " &
+          "AIData is a bot' refusal is gone -- it was what kept player=none."
   gPactYou = you
   true
 

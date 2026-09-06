@@ -538,10 +538,15 @@ static const AowlPactTarget aowl_pact_targets[] = {
  * a bug in one of them. */
 #define AOWL_PACT_GW_MAINPLAYER  0x230   /* EFT.GameWorld.MainPlayer : Player  */
 #define AOWL_PACT_PL_ISYOU       0xB89   /* EFT.Player.IsYourPlayer  : bool    */
-#define AOWL_PACT_PL_AIDATA      0xA00   /* EFT.Player.AIData : IAIData; the
-                                          * local player reads NULL here, which
-                                          * is the same discriminator botdiag
-                                          * uses to tell a bot from you.       */
+#define AOWL_PACT_PL_AIDATA      0xA00   /* EFT.Player.AIData : IAIData.
+                                          * MEASURED 2026-09-06 (DEPLOYED PvE
+                                          * raid): the LOCAL player has one too
+                                          * (0x1efb3ec3480), so "NULL means
+                                          * you" is FALSE on this build and
+                                          * pact no longer gates on it; it is
+                                          * read for the log only. botdiag's
+                                          * bot-vs-you discriminator is the
+                                          * same test -- re-check it.        */
 #define AOWL_PACT_PL_MOVECTX     0x060   /* EFT.Player.MovementContext.
                                           * Corroborated by the compiled body of
                                           * get_MovementContext @0x690D20,
