@@ -143,6 +143,7 @@ import grid
 import knobs
 import botgear
 import modrarity
+import planting
 
 type
   BotRequest* = object
@@ -2685,6 +2686,28 @@ proc generate*(body: string; generated: var int): string =
   # a chamber that declined and a placement the client would refuse were both
   # perfectly silent; the refusal only surfaced 28 times over, in the CLIENT's
   # error log, after the raid load had already died.
+  # THE PLANTING ROUND-TRIP for bots. Emitted with what the CLIENT asked for
+  # in front of the planter, and answered synchronously; with no planter
+  # subscribed `composeBots` returns an empty seq and the batch below is
+  # byte-identical to the one above.
+  let groups = composeBots(currentMap(), currentRaidId(), 0,
+                           raw(field(body, "conditions")))
+  for g in groups:
+    let gTables = loadTables(g.role)
+    var k = 0
+    while k < g.count:
+      var one = parseObject(generateProfile(gTables, base,
+                    BotRequest(role: g.role, difficulty: "normal",
+                               count: g.count), k))
+      if one.ok:
+        if k < g.names.len and g.names[k].len > 0:
+          var pInfo = parseObject(get(one, "Info"))
+          if pInfo.ok:
+            setText(pInfo, "Nickname", g.names[k])
+            setRaw(one, "Info", text(pInfo))
+        out1.add raw(text(one))
+        generated = generated + 1
+      k = k + 1
   info botGuardCounters()
   result = done(out1).text
 

@@ -232,7 +232,11 @@
     "/client/items",
     "/client/locations",
     "BotLocationModifier",
-    "menuCornerLabel"
+    "menuCornerLabel",
+   "tarkov.loot.compose",
+   "tarkov.loot.plant",
+   "tarkov.bots.compose",
+   "tarkov.bots.plant"
    ],
    "data": [
     {
@@ -619,6 +623,10 @@
    "//6": "  * the three host verbs it asks (raid_phase, ui_show_status, and",
    "//7": "    the -aowl.raid token it reads through aowlspt/args),",
    "//8": "  * `autoraid.menu`, the region participant name, which is what the",
+   "//8a": "  * `autoraid.arm` / `autoraid.armed`, the CLIENT-side bus entry",
+   "//8b": "    point another mod arms a raid through and the reply it learns",
+   "//8c": "    the outcome from -- a build that dropped them would leave that",
+   "//8d": "    requester emitting into nothing, silently,",
    "//9": "    host logs when it refuses to arm it,",
    "//a": "  * the two press-route target names -- if EITHER is gone the mod has",
    "//b": "    lost the measured route for that klass and is back to the generic",
@@ -661,6 +669,8 @@
     "aowlspt.host::raid_phase",
     "aowlspt.host::ui_show_status",
     "-aowl.raid=",
+    "autoraid.arm",
+    "autoraid.armed",
     "autoraid.menu",
     "UnityEngine.UI.Toggle::Set(bool value, bool sendCallback)",
     "EFT.UI.TweenAnimatedButton::OnPointerClick(PointerEventData)",

@@ -81,6 +81,7 @@ import rand
 import knobs
 import lootconfig
 import lootcats
+import planting
 
 # ---------------------------------------------------------------------------
 # Reading the database
@@ -2011,8 +2012,20 @@ proc generateLoot*(d: LootDb; cfg: LootConfig;
   ## give the same string. `raidId` is the seed and it is the only source of
   ## variation, which is why it must be the raid's real id and not a clock --
   ## seeding from the time makes the loot on a reported raid unreachable.
+  # THE PLANTING ROUND-TRIP, and it runs BEFORE the config gates below on
+  # purpose: a planted item is a thing another mod's world says is really
+  # there, and `lootEnabled=false` is a statement about the GENERATOR, not a
+  # licence to delete somebody else's truth. With no planter subscribed this
+  # returns an empty seq and every line below is byte-identical to before it
+  # existed -- which is the negative control `plantcheck` asserts.
+  let planted = composeLoot(if d.live: "" else: d.raw, locationId, raidId)
   if not cfg.enabled or cfg.maxItems <= 0:
-    return "[]"
+    if planted.len == 0:
+      return "[]"
+    var only = newList()
+    for e in planted:
+      only.add e
+    return text(only)
   var r = seededRng(raidId & "|" & locationId)
   var budget = cfg.maxItems
 
@@ -2120,6 +2133,10 @@ proc generateLoot*(d: LootDb; cfg: LootConfig;
       info "loot: lootRuleExplain " & cfg.explainTpl & " -- that template " &
            "never appeared in any pool on " & locationId & ", so there is " &
            "nothing to explain. That is INCONCLUSIVE, not 'no rule matched'."
+  # Appended last so the generator's own budget arithmetic above is untouched
+  # by them: a planted item is not a roll and must not displace one.
+  for e in planted:
+    out1.add e
   result = text(out1)
 
 proc fmt2(v: float): string =

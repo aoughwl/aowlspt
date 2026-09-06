@@ -64,6 +64,7 @@ import botgear
 import shapes
 import modrarity
 import seasoncheck
+import plantcheck
 
 proc failedLines(report, label: string; into: var seq[string]) =
   ## `loot.selfCheck` and `questcond.selfCheck` report one line per check,
@@ -86,6 +87,10 @@ proc selfCheckFailures*(): seq[string] =
   # whether it added none. The return is discarded because the list is the
   # answer and a second way of saying the same thing can disagree with it.
   discard skills.selfCheckSkills(result)
+  # The planting round-trip other server mods use to put real loot and real bot
+  # groups into a raid. Its NEGATIVE control -- a raid no planter answered is
+  # byte-identical to the pre-hook payload -- is the assertion that can fail.
+  plantcheck.selfCheckPlanting(result)
   # The seasonal event data. Two dangling-reference invariants over
   # `data/post1/seasonactive.json` and a profile's `SeasonalRewards` dictionary,
   # each guarded by a positive control -- the profile-side one is vacuous on

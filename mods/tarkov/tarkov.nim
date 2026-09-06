@@ -78,6 +78,7 @@ import emu/gym
 import emu/customise
 import emu/decorate
 import emu/selfchecks
+import emu/planting
 import emu/metadata
 import emu/post1
 import emu/globalsgaps # the config members REAL BSG sends and db.json lacks
@@ -2374,6 +2375,8 @@ proc onRaidConfiguration(url, body, session: string): string =
   # nothing on the common path. See `emu/orbit.nim` for what a plan is and,
   # more importantly, for the three things it deliberately does not contain.
   emitPlan(field(cfg, "location").asText(""))
+  # What `bot/generate` cannot name: it carries neither the map nor the raid.
+  setRaidContext(configured, gRaidId)
   result = envelopeNull()
 
 proc onLocalLoot(url, body, session: string): string =
@@ -2610,6 +2613,9 @@ proc onMatchEnd(url, body, session: string): string =
       arEndVerdict(arScavId, arScavMinted)
     success "scav raid ended: " & $brought & " item(s) brought home"
     discard broadcast("tarkov.raid.ended", objOf("profile", p.id))
+    # Only the ids this server PLANTED, and only those found in the saved
+    # profile -- never the inventory. Nothing is emitted when none came home.
+    emitTaken(p.text)
     return envelopeNull()
 
   if playedId != p.id:
@@ -2853,6 +2859,7 @@ proc onMatchEnd(url, body, session: string): string =
   success "raid ended: " & results.field("result").asText("Left") & " for " &
           p.nickname
   discard broadcast("tarkov.raid.ended", objOf("profile", p.id))
+  emitTaken(p.text)
   result = envelopeNull()
 
 proc onMatchAvailable(url, body, session: string): string =
@@ -5096,6 +5103,15 @@ proc onLoad(): Status =
   # See `emu/selfchecks` for what runs and why a failure is fatal rather than a
   # log line -- four of these checks existed and nothing called any of them,
   # which is how a check comes to be counted as coverage without being any.
+  # The planting bus, installed BEFORE the self-checks: `emu/plantcheck` runs
+  # a real round-trip through it and would otherwise be checking nothing.
+  # A refusal here is fatal in the honest sense -- every later plant would be
+  # dropped in silence -- so it is a warning naming the cause, not a nil.
+  if not installPlanting():
+    warn "planting: could not subscribe to " & EvLootPlant & "/" & EvBotsPlant &
+         " (" & lastError() & "); no mod will be able to plant loot or bots " &
+         "into a raid on this host"
+
   let selfFails = selfCheckFailures()
 
   # One route either way, and it is registered *before* the gate below decides
