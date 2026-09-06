@@ -3019,8 +3019,21 @@ proc applyFov() =
       let live = callFloat(bCamFov, cam, a)
       let dEnd = fabsf(live - gAdsPendTarget)
       let dGame = fabsf(live - gAdsPendGameFov)
+      # ONE FRAME IS NOT THE STATEMENT WHILE THE HOLD IS ON. MEASURED
+      # 2026-09-06: with the per-frame hold, frame 1 read 57.0 (the game's
+      # ramp still running) and frame 40 read the endpoint exactly -- so a
+      # frame-1 FAIL here was contradicted by the HOLD VERDICT that followed.
+      # With the hold on, this line reports the frame-1 reading as PENDING
+      # and counts nothing; the hold's own verdict is the pass or fail.
+      let holdPending = cfgAdsHoldEveryFrame and cfgAdsWriteFovField and
+                        dEnd > 0.5
       let verdict =
         (if dEnd <= 0.5: "PASS"
+         elif holdPending:
+           "PENDING -- one frame after the settle write the camera is still " &
+           "on the game's ramp; the per-frame hold is re-asserting the " &
+           "endpoint and the HOLD VERDICT " & $AdsProbeMax & " frames on is " &
+           "the statement, not this line."
          elif dGame <= 0.5:
            "FAIL -- the camera came back to the GAME's own ADS fov " &
            $gAdsPendGameFov & ". The game is still writing this field after " &
@@ -3031,7 +3044,7 @@ proc applyFov() =
       if dEnd <= 0.5:
         gSmPasses = gSmPasses + 1
         gAdsConsecFails = 0
-      else:
+      elif not holdPending:
         gSmFails = gSmFails + 1
         gAdsConsecFails = gAdsConsecFails + 1
       gSmVerdict = verdict
