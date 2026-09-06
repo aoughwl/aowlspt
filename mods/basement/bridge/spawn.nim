@@ -96,7 +96,12 @@ proc onSpawnBody*(status: int; body: string) =
       warn "basement spawn: the backend declined to place the player -- " &
            gLastWhy
     return
-  let map = asText(field(body, "map"), "")
+  # The backend answers `{ok, spawn:{map,x,y,z,reason}, raidRequested}`
+  # (basement.nim::onSpawn); a top-level `map` is accepted too so an older
+  # or hand-written answer still works. MEASURED 2026-09-06 by the SPT plugin
+  # agent: this read the top level only and would have refused every answer.
+  var map = asText(field(body, "spawn.map"), "")
+  if map.len == 0: map = asText(field(body, "map"), "")
   if map.len == 0:
     gRefusals = gRefusals + 1
     gLastWhy = "the answer carried no `map`"
@@ -110,7 +115,9 @@ proc onSpawnBody*(status: int; body: string) =
   gArmedMap = map
   var d = newDoc()
   d.setText("map", map)
-  d.setText("side", asText(field(body, "side"), "pmc"))
+  var side = asText(field(body, "spawn.side"), "")
+  if side.len == 0: side = asText(field(body, "side"), "pmc")
+  d.setText("side", side)
   d.setText("source", "basement")
   if emit("autoraid.arm", d.text) != Ok:
     gArmPending = false
