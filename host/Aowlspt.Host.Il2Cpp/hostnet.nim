@@ -291,7 +291,12 @@ proc hnApplyConfig(httpOn: bool; allow: seq[string]; maxInflight, maxBody: int;
   var i = 0
   while i < allow.len and i < 16:
     if allow[i].len > 0:
-      if cHnAllowAdd(toCString(allow[i])) != 0'i32:
+      # A `var` copy because nimony's `toCString` takes its argument by `var`
+      # (it hands out an interior pointer, so it will not do that for a
+      # temporary or a `let`). Copying is also the honest thing here: the C
+      # side keeps its own copy of the host name anyway.
+      var one = allow[i]
+      if cHnAllowAdd(toCString(one)) != 0'i32:
         gHnAllow.add allow[i]
     i = i + 1
 
@@ -300,7 +305,8 @@ proc hnApplyConfig(httpOn: bool; allow: seq[string]; maxInflight, maxBody: int;
   while r < roots.len and r < HnRootsMax:
     if roots[r].len > 0:
       var buf = hnCBuf(1024)
-      let n = cPwExpand(toCString(roots[r]), cast[cstring](addr buf[0]), 1024'i32)
+      var rootIn = roots[r]
+      let n = cPwExpand(toCString(rootIn), cast[cstring](addr buf[0]), 1024'i32)
       if n > 0:
         gPwRoots.add hnFromBuf(buf)
       else:
@@ -379,9 +385,16 @@ proc hnHttpVerb(argText: string): string =
   let body = hnJsonStr(argText, "body")
   let timeoutMs = hnJsonInt(argText, "timeoutMs", 25000)
   var why = hnCBuf(HnWhyCap)
+  # `var` copies for the same reason as in `hnApplyConfig`: `toCString` takes
+  # its argument by `var`. The C side copies every one of these into its own
+  # slot before `aowl_hn_submit` returns, so nothing here outlives the call.
+  var idV = id
+  var methV = meth
+  var urlV = url
+  var bodyV = body
   gHnSubmitted = gHnSubmitted + 1
-  let okSub = cHnSubmit(toCString(id), toCString(meth), toCString(url),
-                        toCString(body), int32(body.len), int32(timeoutMs),
+  let okSub = cHnSubmit(toCString(idV), toCString(methV), toCString(urlV),
+                        toCString(bodyV), int32(body.len), int32(timeoutMs),
                         cast[cstring](addr why[0]), int32(HnWhyCap))
   if okSub == 0'i32:
     gHnRefused = gHnRefused + 1
@@ -401,7 +414,8 @@ proc hnResultJson(id: string; includeDone: bool): string =
   var ms = 0'i32
   var blen = 0'i32
   var errBuf = hnCBuf(256)
-  let rc = cHnResult(toCString(id), cast[cstring](addr bodyBuf[0]),
+  var idV = id
+  let rc = cHnResult(toCString(idV), cast[cstring](addr bodyBuf[0]),
                      int32(gHnMaxBody + 1), addr status, addr ms,
                      cast[cstring](addr errBuf[0]), 256'i32, addr blen)
   if rc < 0'i32:
@@ -538,7 +552,8 @@ proc hnPlayWavVerb(argText: string): string =
            "hostPlayWavRoots [" & hnEsc(rootTxt) & "]; a `..` anywhere in " &
            "the path is refused outright rather than resolved\"}"
   var why = hnCBuf(HnWhyCap)
-  let okPlay = cPwPlay(toCString(path), cast[cstring](addr why[0]),
+  var pathV = path
+  let okPlay = cPwPlay(toCString(pathV), cast[cstring](addr why[0]),
                        int32(HnWhyCap))
   if okPlay == 0'i32:
     var w = hnFromBuf(why)
