@@ -508,6 +508,7 @@ VERIFIERS = [
     V("xferproof.py", gap="needs a running backend"),
     V("acceptance_admintrader.py", gap="needs a running backend + live client"),
     V("basement_check.py", gap="needs a built mods/basement DLL + aowlspt-sim"),
+    V("basement_twomod.py", gap="needs built backend + tarkov + basement DLLs; stages a real two-mod backend"),
     V("inspectfixtures.py", reason="a fixture LIBRARY, not a verifier -- it "
       "carries the measured inspector prose the other self-tests replay. It "
       "is exercised by every fixture-driven item above."),
