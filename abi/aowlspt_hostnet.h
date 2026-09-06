@@ -68,6 +68,23 @@
 #include <string.h>
 #include <stdlib.h>
 
+/* ALLOCATION GOES THROUGH THE PROCESS HEAP, NOT malloc/free, and that is a
+ * deliberate choice rather than an old-fashioned one.
+ *
+ * A response buffer here is allocated on a WORKER thread and freed on the
+ * HOST thread. The IL2CPP host is built with mimalloc (`mimallocFlags` in
+ * `tools/aowl.nim` is on the host's own compile line), and mimalloc overrides
+ * `malloc`/`free` process-wide with a thread-local-heap allocator that has
+ * ownership assertions. CLAUDE.md section 1 records what that costs when it
+ * bites: a `__fastfail` (0xc0000409) that writes NO Unity crash report at all,
+ * caused by exactly this shape -- work ticking on a different thread than it
+ * was initialised on. `HeapAlloc(GetProcessHeap(), ...)` is a Win32 call with
+ * no allocator override in front of it and no thread affinity whatsoever, so
+ * the whole question does not arise. */
+#define AOWL_HN_ALLOC(n)      HeapAlloc(GetProcessHeap(), 0, (SIZE_T)(n))
+#define AOWL_HN_REALLOC(p, n) HeapReAlloc(GetProcessHeap(), 0, (p), (SIZE_T)(n))
+#define AOWL_HN_FREE(p)       HeapFree(GetProcessHeap(), 0, (p))
+
 #define AOWL_HN_SLOTS          8      /* hard ceiling; maxInflight <= this   */
 #define AOWL_HN_ALLOW_MAX      16     /* allowlist entries                   */
 #define AOWL_HN_ID_CAP         64
@@ -250,8 +267,8 @@ static int32_t aowl_hn_api(void) {
 /* ------------------------------------------------------------- the worker */
 
 static void aowl_hn_free_slot(AowlHnSlot* s) {
-    if (s->reqBody)  { free(s->reqBody);  s->reqBody = NULL; }
-    if (s->respBody) { free(s->respBody); s->respBody = NULL; }
+    if (s->reqBody)  { AOWL_HN_FREE(s->reqBody);  s->reqBody = NULL; }
+    if (s->respBody) { AOWL_HN_FREE(s->respBody); s->respBody = NULL; }
     if (s->thread)   { CloseHandle(s->thread); s->thread = NULL; }
     memset(s, 0, sizeof(*s));
 }
@@ -335,7 +352,7 @@ static DWORD WINAPI aowl_hn_worker(LPVOID param) {
 
     cap = 16 * 1024;
     if (cap > maxBody + 1) cap = maxBody + 1;
-    buf = (char*)malloc((size_t)cap);
+    buf = (char*)AOWL_HN_ALLOC(cap);
     if (!buf) { aowl_hn_copy(err, sizeof(err), "out of memory reading the response"); goto publish; }
     for (;;) {
         DWORD avail = 0, got = 0, want;
@@ -344,7 +361,7 @@ static DWORD WINAPI aowl_hn_worker(LPVOID param) {
             /* REFUSED, NOT TRUNCATED. A prefix of valid JSON is the worst
              * possible answer: every reader rejects it as "not a schema" and
              * the size never appears anywhere. */
-            free(buf); buf = NULL; total = 0;
+            AOWL_HN_FREE(buf); buf = NULL; total = 0;
             aowl_hn_copy(err, sizeof(err),
                          "the response body exceeds hostHttpMaxBody; it was "
                          "REFUSED rather than truncated, because a prefix of a "
@@ -356,8 +373,8 @@ static DWORD WINAPI aowl_hn_worker(LPVOID param) {
             char* nb;
             while (ncap < total + (int32_t)avail + 1) ncap *= 2;
             if (ncap > maxBody + 1) ncap = maxBody + 1;
-            nb = (char*)realloc(buf, (size_t)ncap);
-            if (!nb) { free(buf); buf = NULL; total = 0;
+            nb = (char*)AOWL_HN_REALLOC(buf, ncap);
+            if (!nb) { AOWL_HN_FREE(buf); buf = NULL; total = 0;
                        aowl_hn_copy(err, sizeof(err), "out of memory growing the response buffer");
                        goto publish; }
             buf = nb; cap = ncap;
@@ -610,7 +627,7 @@ static int32_t aowl_hn_submit(const char* id, const char* method, const char* ur
         aowl_hn_widen(s->wpath, AOWL_HN_PATH_CAP, path, plen);
     }
     if (bodyLen > 0 && body) {
-        s->reqBody = (char*)malloc((size_t)bodyLen + 1);
+        s->reqBody = (char*)AOWL_HN_ALLOC(bodyLen + 1);
         if (!s->reqBody) {
             aowl_hn_free_slot(s);
             aowl_hn_unlock();
