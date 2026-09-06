@@ -29,6 +29,7 @@ import aowlspt/json as jr
 import util
 import rng
 import world
+import items
 
 type
   Preset* = object
@@ -232,6 +233,38 @@ proc listPresets*(dir: string): seq[Preset] =
     if f.len == 0: continue
     if not f.endsWith(".json"): continue
     result.add presetFromFile(joinPath(dir, f))
+
+
+# ---------------------------------------------------------------------------
+# guards -- shared by `generate` and by the [PLANT:] tag, because a cache made
+# by a person in conversation must be indistinguishable from one the world was
+# born with. Two spawners would be two fictions.
+# ---------------------------------------------------------------------------
+
+proc spawnGuardGroup*(cacheId, factionId, map, placeId: string;
+                      x, y, z: float; n: int; r: var Rng): string =
+  ## Creates `n` living guards standing on the cache and returns their group
+  ## id. With no name tables loaded it creates NOBODY and returns "" -- a guard
+  ## called "" is worse than a cache with no guards, because the client would
+  ## spawn it.
+  if gFirst.len == 0 or gLast.len == 0: return ""
+  let grp = cacheId & "-guard"
+  var k = 0
+  while k < n:
+    let pid = cacheId & "-g" & $(k + 1)
+    let nm = pick(r, gFirst) & " \"" & pick(r, gCallsign) & "\" " & pick(r, gLast)
+    var traits: seq[string] = @[]
+    traits.add "watches the treeline more than the conversation"
+    let idx = addPerson(pid, nm, factionId, "guard", "default", map, placeId,
+                        x + float(nextInt(r, -6, 6)), y,
+                        z + float(nextInt(r, -6, 6)), traits)
+    setPersonActivity(idx, "guard")
+    setPersonGroup(idx, grp)
+    setPersonAttitude(idx, nextInt(r, -25, 0))
+    setPersonInventoryNote(idx, "a rifle and orders about who is expected")
+    addPersonKnows(idx, cacheId)
+    k = k + 1
+  result = grp
 
 # ---------------------------------------------------------------------------
 # generation
@@ -494,9 +527,113 @@ proc generate*(seed: uint64; p: Preset; worldPromptOverride: string;
                                   "a favour, unspecified"]),
                         worldClockMs() + int64(nextInt(r, 5, 12)) * 86400000'i64)
 
+
+  # ------------------------------------------------------------- caches
+  # The thing people TALK about, made real at generation time: a cache per
+  # faction (1-3), each with a story for why it exists, a guard group that is
+  # made of real people, a rumour fact that carries its id, and a pickup
+  # contract naming a bearer and a passphrase. Everything an NPC can say about
+  # a cache is a row here; nothing about it is written in code.
+  var fc = 0
+  while fc < factionCount():
+    let ai = findArch(p.archetypes[fc mod p.archetypes.len])
+    var wants: seq[string] = @[]
+    if ai >= 0: wants = archWants(ai)
+    let home = factionHomeMap(fc)
+    let homePlaces = placesOnMap(home)
+    let n = 1 + nextInt(r, 0, 2)
+    var k = 0
+    while k < n:
+      var wantText = ""
+      if wants.len > 0: wantText = wants[nextInt(r, 0, wants.len - 1)]
+      let kindWord = kindWordFor(wantText, r)
+      var pl = ""
+      var cx = 0.0
+      var cy = 0.0
+      var cz = 0.0
+      if homePlaces.len > 0:
+        let hp = homePlaces[nextInt(r, 0, homePlaces.len - 1)]
+        pl = placeId(hp)
+        placePos(hp, cx, cy, cz)
+        cx = cx + float(nextInt(r, -25, 25))
+        cz = cz + float(nextInt(r, -25, 25))
+      let cid = factionId(fc) & "-cache" & $(k + 1)
+      var placeWord = pl
+      if pl.len > 0:
+        let pidx = findPlace(pl)
+        if pidx >= 0: placeWord = placeName(pidx)
+      let nm = titleCase(pick(r, gFactionWord)) & " " & titleCase(kindWord)
+      let why = pick(r, @[
+        "It was buried the night the convoy broke up and nobody came back for it.",
+        "It is the price of a truce that has not been spoken about since.",
+        "A dead man put it there and told two people, and one of them talks.",
+        "It was skimmed off a shipment nobody dares report missing.",
+        "It is what is left of a camp that burned, dug up and moved once already."])
+      let story = factionName(fc) & " keeps " & (if wantText.len > 0: wantText
+                  else: kindWord) & " at " & (if placeWord.len > 0: placeWord
+                  else: home) & ". " & why
+      let ci = addCache(cid, nm, pl, home, factionId(fc), "", story, "",
+                        cx, cy, cz)
+      setCacheStatus(ci, "intact")
+      var tpls: seq[string] = @[]
+      var counts: seq[int] = @[]
+      var inote = ""
+      discard resolveItems(kindWord & " " & wantText, r, tpls, counts, inote)
+      var t = 0
+      while t < tpls.len:
+        cacheAddItem(ci, tpls[t], (if t < counts.len: counts[t] else: 1))
+        t = t + 1
+      let grp = spawnGuardGroup(cid, factionId(fc), home, pl, cx, cy, cz,
+                                2 + nextInt(r, 0, 2), r)
+      setCacheGuardGroup(ci, grp)
+      # who knows: the leader, every lieutenant, and one outsider -- that last
+      # one is why a rumour can cross a faction line at all.
+      for pj in peopleOfFaction(fc):
+        let role = personRole(pj)
+        if role == "leader" or role == "lieutenant":
+          addPersonKnows(pj, cid)
+          addCacheKnownBy(ci, personId(pj))
+      if personCount() > 0:
+        var tries = 0
+        while tries < 8:
+          let outsider = nextInt(r, 0, personCount() - 1)
+          if personFaction(outsider) != factionId(fc):
+            addPersonKnows(outsider, cid)
+            addCacheKnownBy(ci, personId(outsider))
+            tries = 8
+          else:
+            tries = tries + 1
+      let rid = cid & "-rumour"
+      addFactRef(rid, factionId(fc) & " cache rumour " & kindWord,
+                 story, "cache", cid, "gen")
+      for who in cacheKnownBy(ci):
+        let wi = findPerson(who)
+        if wi >= 0: addPersonKnows(wi, rid)
+      k = k + 1
+    # one pickup contract per faction: somebody is expected to come for one of
+    # these, with a passphrase. This is what an impersonator has to beat.
+    let mine = cachesOnMap(home)
+    var chosen = -1
+    for mi2 in mine:
+      if cacheOwner(mi2) == factionId(fc) and chosen < 0: chosen = mi2
+    let fpeople = peopleOfFaction(fc)
+    if chosen >= 0 and fpeople.len > 0:
+      let bearer = fpeople[nextInt(r, 0, fpeople.len - 1)]
+      let token = pick(r, gCallsign) & " " & pick(r, gFactionWord)
+      discard addPickupContract(cacheId(chosen) & "-pickup", cacheId(chosen),
+                                personId(bearer), token,
+                                worldClockMs() + int64(nextInt(r, 3, 9)) * 86400000'i64)
+      addPersonKnows(bearer, cacheId(chosen))
+      addCacheKnownBy(chosen, personId(bearer))
+      for gi in peopleOfGroup(cacheGuardGroup(chosen)):
+        remember(gi, "We are expecting " & personName(bearer) &
+                 " for the cache. The word is \"" & token & "\".")
+    fc = fc + 1
+
   note = $factionCount() & " factions, " & $personCount() & " people, " &
          $placeCount() & " places, " & $questCount() & " quests, " &
-         $factCount() & " facts, " & $contractCount() & " contracts; world \"" &
+         $factCount() & " facts, " & $contractCount() & " contracts, " &
+         $cacheCount() & " caches; world \"" &
          worldName() & "\""
   discard journal("world.generated", "", "", "{\"seed\":\"" & hex64(seed) &
                   "\",\"preset\":\"" & p.id & "\"}")

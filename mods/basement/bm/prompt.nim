@@ -26,6 +26,14 @@ type
     mood*: float
     inventoryNote*: string
     placeName*, map*: string
+    known*: string
+      ## `world.renderKnown` -- the entities this person can talk about, with
+      ## their ids. It is NOT in `stablePrefix`: knowledge grows every time a
+      ## rumour reaches them, a cache is planted or a disclosure is made, so a
+      ## prefix containing it would change between two consecutive turns and
+      ## every provider prompt-cache read would miss. It goes at the TOP of the
+      ## volatile suffix instead, where it is still the first thing the model
+      ## reads.
 
   Situation* = object
     state*: string
@@ -76,7 +84,17 @@ proc knownTags*(): seq[string] =
   result = @["MOOD", "ATTITUDE", "OFFER", "ACCEPT", "REFUSE", "DEMAND", "GIVE",
              "TAKE", "CAPTURE", "RELEASE", "FOLLOW_ME", "FOLLOW_YOU", "STAY",
              "LEAVE", "ATTACK", "STAND_DOWN", "QUEST", "QUEST_DONE", "REMEMBER",
-             "RUMOUR", "CALL", "OBJ", "ADD", "CLEAR"]
+             "RUMOUR", "CALL", "OBJ", "ADD", "CLEAR",
+             "PLANT", "REVEAL", "EXPECT", "CLAIM_OK", "CLAIM_FAIL"]
+
+proc modelForbiddenTag*(name: string): bool =
+  ## `CLAIM_OK` / `CLAIM_FAIL` are the ENCOUNTER MACHINE's own record of a
+  ## believability roll. They are in `knownTags` because `applyTags` must map
+  ## them, and they are NOT in `tagGrammar` because the model is never told
+  ## about them -- if it invents one anyway the brain drops it here, with a
+  ## note. A model that could write its own verdict would make the roll
+  ## unfalsifiable.
+  result = name == "CLAIM_OK" or name == "CLAIM_FAIL"
 
 proc attitudeWord*(a: int): string =
   if a <= -60: return "you hate them"

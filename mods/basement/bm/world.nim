@@ -42,7 +42,9 @@ const
   SchemaPlaces    = "aowl.basement.places/1"
   SchemaContracts = "aowl.basement.contracts/1"
   SchemaQuests    = "aowl.basement.quests/1"
-  SchemaFacts     = "aowl.basement.facts/1"
+  SchemaFacts     = "aowl.basement.facts/2"
+  SchemaCaches    = "aowl.basement.caches/1"
+  SchemaLoot      = "aowl.basement.loot/1"
   SchemaJournal   = "aowl.basement.journal/1"
   JournalChunk    = 500
   MemoryBound     = 48
@@ -143,10 +145,53 @@ var gQStatus: seq[string] = @[]
 var gObjQ: seq[int] = @[]
 var gObjText: seq[string] = @[]
 
-# facts
+# facts. A fact now REFERS to an entity (refKind/refId) and knows where it came
+# from (origin gen|plant|rumour|outcome). That is the whole grounding rule: a
+# person's `knows` holds entity ids, and a fact about a cache carries the cache
+# id, so "what they talk about" and "what the world holds" are the same rows.
 var gFtId: seq[string] = @[]
 var gFtTags: seq[string] = @[]
 var gFtText: seq[string] = @[]
+var gFtRefKind: seq[string] = @[]
+var gFtRefId: seq[string] = @[]
+var gFtOrigin: seq[string] = @[]
+var gFtSpread: seq[int64] = @[]
+
+# caches. `items` is a FLAT side table of (cache index, tpl, count) rather than
+# a `seq[(string,int)]` field: the contract asked for a tuple-valued getter and
+# said to use two parallel getters if tuples misbehave in nimony. They do -- a
+# `seq` of tuples has no literal initialiser here -- so `cacheItemTpls` and
+# `cacheItemCounts` are the two getters, index-aligned by construction because
+# they are produced by the same walk.
+var gChId: seq[string] = @[]
+var gChName: seq[string] = @[]
+var gChPlace: seq[string] = @[]
+var gChMap: seq[string] = @[]
+var gChOwner: seq[string] = @[]
+var gChGuard: seq[string] = @[]
+var gChStory: seq[string] = @[]
+var gChStatus: seq[string] = @[]
+var gChPlanted: seq[string] = @[]
+var gChX: seq[float] = @[]
+var gChY: seq[float] = @[]
+var gChZ: seq[float] = @[]
+var gChCreated: seq[int64] = @[]
+var gChItemC: seq[int] = @[]
+var gChItemTpl: seq[string] = @[]
+var gChItemN: seq[int] = @[]
+var gChKnowC: seq[int] = @[]
+var gChKnowP: seq[string] = @[]
+
+# loose loot (planted, or the expansion of a cache into pickable rows)
+var gLtId: seq[string] = @[]
+var gLtCache: seq[string] = @[]
+var gLtTpl: seq[string] = @[]
+var gLtMap: seq[string] = @[]
+var gLtCount: seq[int] = @[]
+var gLtX: seq[float] = @[]
+var gLtY: seq[float] = @[]
+var gLtZ: seq[float] = @[]
+var gLtStatus: seq[string] = @[]
 
 # journal
 var gJSeq: seq[int] = @[]
@@ -208,6 +253,14 @@ proc resetWorld*() =
   gQId = @[]; gQGiver = @[]; gQTitle = @[]; gQBrief = @[]; gQKind = @[]
   gQTarget = @[]; gQReward = @[]; gQStatus = @[]; gObjQ = @[]; gObjText = @[]
   gFtId = @[]; gFtTags = @[]; gFtText = @[]
+  gFtRefKind = @[]; gFtRefId = @[]; gFtOrigin = @[]; gFtSpread = @[]
+  gChId = @[]; gChName = @[]; gChPlace = @[]; gChMap = @[]; gChOwner = @[]
+  gChGuard = @[]; gChStory = @[]; gChStatus = @[]; gChPlanted = @[]
+  gChX = @[]; gChY = @[]; gChZ = @[]; gChCreated = @[]
+  gChItemC = @[]; gChItemTpl = @[]; gChItemN = @[]
+  gChKnowC = @[]; gChKnowP = @[]
+  gLtId = @[]; gLtCache = @[]; gLtTpl = @[]; gLtMap = @[]; gLtCount = @[]
+  gLtX = @[]; gLtY = @[]; gLtZ = @[]; gLtStatus = @[]
   gJSeq = @[]; gJAt = @[]; gJKind = @[]; gJActor = @[]; gJTarget = @[]
   gJData = @[]; gJNext = 1
 
@@ -780,7 +833,11 @@ proc questsOf*(giverId: string): seq[int] =
 
 proc factCount*(): int = gFtId.len
 
-proc addFact*(id, tags, text: string) =
+proc addFactRef*(id, tags, text, refKind, refId, origin: string) =
+  ## A fact that is ABOUT something. `origin` is gen | plant | rumour | outcome
+  ## and is never inferred later: a rumour that a cache was hit must be
+  ## distinguishable from the generated rumour that it exists, or the loop in
+  ## DESIGN §11.3 cannot be checked.
   if id.len == 0: return
   var i = 0
   while i < gFtId.len:
@@ -789,6 +846,49 @@ proc addFact*(id, tags, text: string) =
   gFtId.add id
   gFtTags.add tags
   gFtText.add text
+  gFtRefKind.add refKind
+  gFtRefId.add refId
+  gFtOrigin.add (if origin.len > 0: origin else: "gen")
+  gFtSpread.add gClockMs
+
+proc addFact*(id, tags, text: string) =
+  ## The un-referenced form every caller before grounding used. It is the same
+  ## row with empty refs, so the parallel seqs cannot drift out of alignment.
+  addFactRef(id, tags, text, "", "", "gen")
+
+proc factRef*(i: int; refKind, refId: var string) =
+  if i < 0 or i >= gFtId.len:
+    refKind = ""; refId = ""
+    return
+  refKind = gFtRefKind[i]; refId = gFtRefId[i]
+
+proc factOrigin*(i: int): string =
+  if i < 0 or i >= gFtOrigin.len: return ""
+  result = gFtOrigin[i]
+
+proc factSpreadMs*(i: int): int64 =
+  if i < 0 or i >= gFtSpread.len: return 0'i64
+  result = gFtSpread[i]
+
+proc setFactSpreadMs*(i: int; v: int64) =
+  if i < 0 or i >= gFtSpread.len: return
+  gFtSpread[i] = v
+
+proc findFact*(id: string): int =
+  result = -1
+  var i = 0
+  while i < gFtId.len:
+    if gFtId[i] == id: return i
+    i = i + 1
+
+proc factsAbout*(refKind, refId: string): seq[int] =
+  result = @[]
+  if refId.len == 0: return
+  var i = 0
+  while i < gFtId.len:
+    if gFtRefId[i] == refId and (refKind.len == 0 or gFtRefKind[i] == refKind):
+      result.add i
+    i = i + 1
 
 proc factId*(i: int): string =
   if i < 0 or i >= gFtId.len: return ""
@@ -848,6 +948,344 @@ proc retrieveFacts*(query, tags: string; limit: int; hitIds: var string): string
     hitIds.add gFtId[best]
     result.add "- " & gFtText[best] & "\n"
     taken = taken + 1
+
+# ---------------------------------------------------------------------------
+# caches -- the real thing an NPC is talking about (DESIGN §11)
+# ---------------------------------------------------------------------------
+
+proc cacheCount*(): int = gChId.len
+
+proc findCache*(id: string): int =
+  result = -1
+  var i = 0
+  while i < gChId.len:
+    if gChId[i] == id: return i
+    i = i + 1
+
+proc addCache*(id, name, placeId, map, ownerFactionId, guardGroupId, story,
+               plantedBy: string; x, y, z: float): int =
+  let seen = findCache(id)
+  if seen >= 0: return seen
+  gChId.add id
+  gChName.add name
+  gChPlace.add placeId
+  gChMap.add map
+  gChOwner.add ownerFactionId
+  gChGuard.add guardGroupId
+  gChStory.add story
+  gChStatus.add "rumoured"
+  gChPlanted.add plantedBy
+  gChX.add quant3(x)
+  gChY.add quant3(y)
+  gChZ.add quant3(z)
+  gChCreated.add gClockMs
+  result = gChId.len - 1
+
+proc cacheId*(i: int): string =
+  if i < 0 or i >= gChId.len: return ""
+  result = gChId[i]
+proc cacheName*(i: int): string =
+  if i < 0 or i >= gChName.len: return ""
+  result = gChName[i]
+proc cachePlace*(i: int): string =
+  if i < 0 or i >= gChPlace.len: return ""
+  result = gChPlace[i]
+proc cacheMap*(i: int): string =
+  if i < 0 or i >= gChMap.len: return ""
+  result = gChMap[i]
+proc cacheOwner*(i: int): string =
+  if i < 0 or i >= gChOwner.len: return ""
+  result = gChOwner[i]
+proc cacheGuardGroup*(i: int): string =
+  if i < 0 or i >= gChGuard.len: return ""
+  result = gChGuard[i]
+proc cacheStory*(i: int): string =
+  if i < 0 or i >= gChStory.len: return ""
+  result = gChStory[i]
+proc cachePlantedBy*(i: int): string =
+  if i < 0 or i >= gChPlanted.len: return ""
+  result = gChPlanted[i]
+proc setCacheGuardGroup*(i: int; g: string) =
+  ## The guards are created after the cache row exists (they stand ON it), so
+  ## the group id is written back rather than guessed at the call site.
+  if i < 0 or i >= gChGuard.len: return
+  gChGuard[i] = g
+
+proc cacheStatus*(i: int): string =
+  if i < 0 or i >= gChStatus.len: return ""
+  result = gChStatus[i]
+
+proc setCacheStatus*(i: int; s: string) =
+  ## rumoured | intact | looted | moved. An unknown word is REFUSED rather than
+  ## stored: a status nobody handles reads on the wire exactly like one that
+  ## does, and the scene would then materialise a cache in a state no branch
+  ## covers.
+  if i < 0 or i >= gChStatus.len: return
+  if s != "rumoured" and s != "intact" and s != "looted" and s != "moved": return
+  gChStatus[i] = s
+
+proc cachePos*(i: int; x, y, z: var float) =
+  if i < 0 or i >= gChX.len:
+    x = 0.0; y = 0.0; z = 0.0
+    return
+  x = gChX[i]; y = gChY[i]; z = gChZ[i]
+
+proc setCachePos*(i: int; map, placeId: string; x, y, z: float) =
+  if i < 0 or i >= gChX.len: return
+  gChMap[i] = map
+  gChPlace[i] = placeId
+  gChX[i] = quant3(x); gChY[i] = quant3(y); gChZ[i] = quant3(z)
+
+proc cacheAddItem*(i: int; tpl: string; count: int) =
+  if i < 0 or i >= gChId.len or tpl.len == 0 or count <= 0: return
+  gChItemC.add i
+  gChItemTpl.add tpl
+  gChItemN.add count
+
+proc cacheItemTpls*(i: int): seq[string] =
+  result = @[]
+  var k = 0
+  while k < gChItemC.len:
+    if gChItemC[k] == i: result.add gChItemTpl[k]
+    k = k + 1
+
+proc cacheItemCounts*(i: int): seq[int] =
+  ## Index-aligned with `cacheItemTpls` by construction: same table, same walk.
+  result = @[]
+  var k = 0
+  while k < gChItemC.len:
+    if gChItemC[k] == i: result.add gChItemN[k]
+    k = k + 1
+
+proc cacheItemCount*(i: int): int =
+  result = 0
+  var k = 0
+  while k < gChItemC.len:
+    if gChItemC[k] == i: result = result + 1
+    k = k + 1
+
+proc cacheKnownBy*(i: int): seq[string] =
+  result = @[]
+  var k = 0
+  while k < gChKnowC.len:
+    if gChKnowC[k] == i: result.add gChKnowP[k]
+    k = k + 1
+
+proc addCacheKnownBy*(i: int; personId: string) =
+  if i < 0 or i >= gChId.len or personId.len == 0: return
+  var k = 0
+  while k < gChKnowC.len:
+    if gChKnowC[k] == i and gChKnowP[k] == personId: return
+    k = k + 1
+  gChKnowC.add i
+  gChKnowP.add personId
+
+proc cachesOnMap*(map: string): seq[int] =
+  result = @[]
+  var i = 0
+  while i < gChId.len:
+    if map.len == 0 or gChMap[i] == map: result.add i
+    i = i + 1
+
+proc cachesNear*(map: string; x, y, z, radius: float): seq[int] =
+  result = @[]
+  let r2 = radius * radius
+  var i = 0
+  while i < gChId.len:
+    if gChMap[i] == map:
+      let dx = gChX[i] - x
+      let dy = gChY[i] - y
+      let dz = gChZ[i] - z
+      if dx*dx + dy*dy + dz*dz <= r2: result.add i
+    i = i + 1
+
+# ---------------------------------------------------------------------------
+# loose loot
+# ---------------------------------------------------------------------------
+
+proc lootCount*(): int = gLtId.len
+
+proc findLoot*(id: string): int =
+  result = -1
+  var i = 0
+  while i < gLtId.len:
+    if gLtId[i] == id: return i
+    i = i + 1
+
+proc addLoot*(id, cacheId, tpl, map: string; count: int; x, y, z: float): int =
+  let seen = findLoot(id)
+  if seen >= 0: return seen
+  gLtId.add id
+  gLtCache.add cacheId
+  gLtTpl.add tpl
+  gLtMap.add map
+  gLtCount.add (if count > 0: count else: 1)
+  gLtX.add quant3(x)
+  gLtY.add quant3(y)
+  gLtZ.add quant3(z)
+  gLtStatus.add "placed"
+  result = gLtId.len - 1
+
+proc lootId*(i: int): string =
+  if i < 0 or i >= gLtId.len: return ""
+  result = gLtId[i]
+proc lootCache*(i: int): string =
+  if i < 0 or i >= gLtCache.len: return ""
+  result = gLtCache[i]
+proc lootTpl*(i: int): string =
+  if i < 0 or i >= gLtTpl.len: return ""
+  result = gLtTpl[i]
+proc lootMap*(i: int): string =
+  if i < 0 or i >= gLtMap.len: return ""
+  result = gLtMap[i]
+proc lootN*(i: int): int =
+  if i < 0 or i >= gLtCount.len: return 0
+  result = gLtCount[i]
+proc lootStatus*(i: int): string =
+  if i < 0 or i >= gLtStatus.len: return ""
+  result = gLtStatus[i]
+
+proc setLootStatus*(i: int; s: string) =
+  if i < 0 or i >= gLtStatus.len: return
+  if s != "placed" and s != "taken" and s != "gone": return
+  gLtStatus[i] = s
+
+proc lootPos*(i: int; x, y, z: var float) =
+  if i < 0 or i >= gLtX.len:
+    x = 0.0; y = 0.0; z = 0.0
+    return
+  x = gLtX[i]; y = gLtY[i]; z = gLtZ[i]
+
+proc lootOnMap*(map: string): seq[int] =
+  result = @[]
+  var i = 0
+  while i < gLtId.len:
+    if map.len == 0 or gLtMap[i] == map: result.add i
+    i = i + 1
+
+proc lootOfCache*(cacheId: string): seq[int] =
+  result = @[]
+  if cacheId.len == 0: return
+  var i = 0
+  while i < gLtId.len:
+    if gLtCache[i] == cacheId: result.add i
+    i = i + 1
+
+# ---------------------------------------------------------------------------
+# pickup contracts -- "the guards expect a named bearer carrying a token"
+# ---------------------------------------------------------------------------
+
+proc addPickupContract*(id, cacheId, bearerId, token: string;
+                        expiresMs: int64): int =
+  ## kind "pickup", partyA = the cache, partyB = the bearer, terms = the token.
+  ## Reusing the contract table rather than a fifth entity keeps expiry, status
+  ## and the journal identical to every other promise in this world.
+  result = addContract(id, "pickup", cacheId, bearerId, token,
+                       "the cache changes hands", expiresMs)
+  setContractStatus(result, "active")
+
+proc pickupsAt*(cacheId: string): seq[int] =
+  result = @[]
+  if cacheId.len == 0: return
+  var i = 0
+  while i < contractCount():
+    if contractKind(i) == "pickup" and contractPartyA(i) == cacheId:
+      result.add i
+    i = i + 1
+
+# ---------------------------------------------------------------------------
+# knowledge -- ids in, rendered prose out
+# ---------------------------------------------------------------------------
+
+proc worldHasId*(id: string): bool =
+  ## Any kind. DESIGN §11 check 11 asserts over this, so it must cover every
+  ## kind a `knows` entry can legitimately name -- and nothing else.
+  if id.len == 0: return false
+  if findPerson(id) >= 0: return true
+  if findFaction(id) >= 0: return true
+  if findPlace(id) >= 0: return true
+  if findCache(id) >= 0: return true
+  if findLoot(id) >= 0: return true
+  if findContract(id) >= 0: return true
+  if findQuest(id) >= 0: return true
+  if findFact(id) >= 0: return true
+  result = false
+
+proc dropPersonKnows*(i: int; entityId: string): bool =
+  ## Removes one knowledge row. A `seq` here cannot shrink in place, so this is
+  ## a rebuild. It exists for the selfcheck's negative control: a bogus id is
+  ## planted, the check must FAIL on it, and then it has to be taken back out.
+  result = false
+  var p: seq[int] = @[]
+  var t: seq[string] = @[]
+  var k = 0
+  while k < gKnowP.len:
+    if gKnowP[k] == i and gKnowText[k] == entityId:
+      result = true
+    else:
+      p.add gKnowP[k]
+      t.add gKnowText[k]
+    k = k + 1
+  gKnowP = p
+  gKnowText = t
+
+proc renderKnown*(personIdx: int; limit: int): string =
+  ## One line per entity this person knows, with its ID, so a reply can name it
+  ## and `resolveClaim` / the journal can find it again.
+  ##
+  ## An id that is not in the world is SKIPPED and counted, never rendered:
+  ## the prompt must not teach a person to talk about something that does not
+  ## exist. It is not silent either -- the trailing note says how many were
+  ## dropped, and DESIGN §11 check 11 asserts over the RAW `knows` list so the
+  ## skipping here cannot hide a generator bug.
+  result = ""
+  if personIdx < 0 or personIdx >= gPId.len or limit <= 0: return
+  var shown = 0
+  var dropped = 0
+  let ids = personKnows(personIdx)
+  var k = 0
+  while k < ids.len:
+    let id = ids[k]
+    k = k + 1
+    if shown >= limit: continue
+    let ci = findCache(id)
+    if ci >= 0:
+      var guards = 0
+      let grp = gChGuard[ci]
+      if grp.len > 0:
+        for gi in peopleOfGroup(grp):
+          if personAlive(gi): guards = guards + 1
+      result.add "[cache:" & id & " \"" & gChName[ci] & "\" -- " &
+                 gChStatus[ci] & ", " & $guards & " guards, at " &
+                 gChPlace[ci] & " on " & gChMap[ci] & "] " & gChStory[ci] & "\n"
+      shown = shown + 1
+      continue
+    let fi = findFact(id)
+    if fi >= 0:
+      result.add "[fact:" & id & "] " & gFtText[fi] & "\n"
+      shown = shown + 1
+      continue
+    let pl = findPlace(id)
+    if pl >= 0:
+      result.add "[place:" & id & " \"" & gPlName[pl] & "\" on " &
+                 gPlMap[pl] & "]\n"
+      shown = shown + 1
+      continue
+    let pe = findPerson(id)
+    if pe >= 0:
+      result.add "[person:" & id & " \"" & gPName[pe] & "\", " & gPRole[pe] &
+                 " of " & gPFac[pe] & "]\n"
+      shown = shown + 1
+      continue
+    let co = findContract(id)
+    if co >= 0:
+      result.add "[contract:" & id & " " & gCKind[co] & "] " & gCTerms[co] & "\n"
+      shown = shown + 1
+      continue
+    dropped = dropped + 1
+  if dropped > 0:
+    result.add "(" & $dropped & " thing(s) this person supposedly knows are " &
+               "not in the world and were left out)\n"
 
 # ---------------------------------------------------------------------------
 # player
@@ -998,6 +1436,52 @@ proc factJson*(i: int): JsonObject =
   o.put("id", gFtId[i])
   o.put("tags", gFtTags[i])
   o.put("text", gFtText[i])
+  o.put("refKind", gFtRefKind[i])
+  o.put("refId", gFtRefId[i])
+  o.put("origin", gFtOrigin[i])
+  o.put("spreadMs", int(gFtSpread[i]))
+  result = o
+
+proc cacheJson*(i: int): JsonObject =
+  var o = obj()
+  o.put("id", gChId[i])
+  o.put("name", gChName[i])
+  o.put("place", gChPlace[i])
+  o.put("map", gChMap[i])
+  o.put("owner", gChOwner[i])
+  o.put("guardGroup", gChGuard[i])
+  o.put("story", gChStory[i])
+  o.put("status", gChStatus[i])
+  o.put("plantedBy", gChPlanted[i])
+  o.put("x", fnum(gChX[i]))
+  o.put("y", fnum(gChY[i]))
+  o.put("z", fnum(gChZ[i]))
+  o.put("createdMs", int(gChCreated[i]))
+  var items = arr()
+  let tpls = cacheItemTpls(i)
+  let counts = cacheItemCounts(i)
+  var k = 0
+  while k < tpls.len:
+    var it = obj()
+    it.put("tpl", tpls[k])
+    it.put("count", (if k < counts.len: counts[k] else: 1))
+    items.add it
+    k = k + 1
+  o.put("items", items)
+  o.put("knownBy", strArr(cacheKnownBy(i)))
+  result = o
+
+proc lootJson*(i: int): JsonObject =
+  var o = obj()
+  o.put("id", gLtId[i])
+  o.put("cacheId", gLtCache[i])
+  o.put("tpl", gLtTpl[i])
+  o.put("map", gLtMap[i])
+  o.put("count", gLtCount[i])
+  o.put("x", fnum(gLtX[i]))
+  o.put("y", fnum(gLtY[i]))
+  o.put("z", fnum(gLtZ[i]))
+  o.put("status", gLtStatus[i])
   result = o
 
 proc metaJson*(): JsonObject =
@@ -1069,6 +1553,16 @@ proc kindJsonText*(kind: string): string =
     while i < gFtId.len:
       items.add factJson(i)
       i = i + 1
+  elif kind == "caches":
+    schema = SchemaCaches
+    while i < gChId.len:
+      items.add cacheJson(i)
+      i = i + 1
+  elif kind == "loot":
+    schema = SchemaLoot
+    while i < gLtId.len:
+      items.add lootJson(i)
+      i = i + 1
   elif kind == "journal":
     schema = SchemaJournal
     while i < gJSeq.len:
@@ -1089,6 +1583,8 @@ proc worldJson*(): JsonObject =
   o.put("contracts", sv.raw(kindJsonText("contracts")))
   o.put("quests", sv.raw(kindJsonText("quests")))
   o.put("facts", sv.raw(kindJsonText("facts")))
+  o.put("caches", sv.raw(kindJsonText("caches")))
+  o.put("loot", sv.raw(kindJsonText("loot")))
   o.put("journalCount", gJSeq.len)
   result = o
 
@@ -1132,6 +1628,16 @@ proc clearKind(kind: string) =
     gQTarget = @[]; gQReward = @[]; gQStatus = @[]; gObjQ = @[]; gObjText = @[]
   elif kind == "facts":
     gFtId = @[]; gFtTags = @[]; gFtText = @[]
+    gFtRefKind = @[]; gFtRefId = @[]; gFtOrigin = @[]; gFtSpread = @[]
+  elif kind == "caches":
+    gChId = @[]; gChName = @[]; gChPlace = @[]; gChMap = @[]; gChOwner = @[]
+    gChGuard = @[]; gChStory = @[]; gChStatus = @[]; gChPlanted = @[]
+    gChX = @[]; gChY = @[]; gChZ = @[]; gChCreated = @[]
+    gChItemC = @[]; gChItemTpl = @[]; gChItemN = @[]
+    gChKnowC = @[]; gChKnowP = @[]
+  elif kind == "loot":
+    gLtId = @[]; gLtCache = @[]; gLtTpl = @[]; gLtMap = @[]; gLtCount = @[]
+    gLtX = @[]; gLtY = @[]; gLtZ = @[]; gLtStatus = @[]
   elif kind == "journal":
     gJSeq = @[]; gJAt = @[]; gJKind = @[]; gJActor = @[]; gJTarget = @[]
     gJData = @[]
@@ -1144,6 +1650,8 @@ proc schemaFor(kind: string): string =
   if kind == "contracts": return SchemaContracts
   if kind == "quests": return SchemaQuests
   if kind == "facts": return SchemaFacts
+  if kind == "caches": return SchemaCaches
+  if kind == "loot": return SchemaLoot
   if kind == "journal": return SchemaJournal
   result = ""
 
@@ -1272,9 +1780,43 @@ proc loadKindFromJson*(kind, text: string; note: var string): bool =
                        textsOf(jr.child(it, "objectives")))
       setQuestStatus(i, jr.asText(jr.child(it, "status"), "offered"))
     elif kind == "facts":
-      addFact(jr.asText(jr.child(it, "id"), ""),
-              jr.asText(jr.child(it, "tags"), ""),
-              jr.asText(jr.child(it, "text"), ""))
+      addFactRef(jr.asText(jr.child(it, "id"), ""),
+                 jr.asText(jr.child(it, "tags"), ""),
+                 jr.asText(jr.child(it, "text"), ""),
+                 jr.asText(jr.child(it, "refKind"), ""),
+                 jr.asText(jr.child(it, "refId"), ""),
+                 jr.asText(jr.child(it, "origin"), "gen"))
+      let fi = findFact(jr.asText(jr.child(it, "id"), ""))
+      if fi >= 0: gFtSpread[fi] = int64(jr.asInt(jr.child(it, "spreadMs"), 0))
+    elif kind == "caches":
+      let ci = addCache(jr.asText(jr.child(it, "id"), ""),
+                        jr.asText(jr.child(it, "name"), ""),
+                        jr.asText(jr.child(it, "place"), ""),
+                        jr.asText(jr.child(it, "map"), ""),
+                        jr.asText(jr.child(it, "owner"), ""),
+                        jr.asText(jr.child(it, "guardGroup"), ""),
+                        jr.asText(jr.child(it, "story"), ""),
+                        jr.asText(jr.child(it, "plantedBy"), ""),
+                        jr.asFloat(jr.child(it, "x"), 0.0),
+                        jr.asFloat(jr.child(it, "y"), 0.0),
+                        jr.asFloat(jr.child(it, "z"), 0.0))
+      setCacheStatus(ci, jr.asText(jr.child(it, "status"), "rumoured"))
+      if ci >= 0 and ci < gChCreated.len:
+        gChCreated[ci] = int64(jr.asInt(jr.child(it, "createdMs"), 0))
+      for e in jr.each(jr.child(it, "items")):
+        cacheAddItem(ci, jr.asText(jr.child(e, "tpl"), ""),
+                     jr.asInt(jr.child(e, "count"), 1))
+      for who in textsOf(jr.child(it, "knownBy")): addCacheKnownBy(ci, who)
+    elif kind == "loot":
+      let li = addLoot(jr.asText(jr.child(it, "id"), ""),
+                       jr.asText(jr.child(it, "cacheId"), ""),
+                       jr.asText(jr.child(it, "tpl"), ""),
+                       jr.asText(jr.child(it, "map"), ""),
+                       jr.asInt(jr.child(it, "count"), 1),
+                       jr.asFloat(jr.child(it, "x"), 0.0),
+                       jr.asFloat(jr.child(it, "y"), 0.0),
+                       jr.asFloat(jr.child(it, "z"), 0.0))
+      setLootStatus(li, jr.asText(jr.child(it, "status"), "placed"))
     elif kind == "journal":
       gJSeq.add jr.asInt(jr.child(it, "seq"), 0)
       gJAt.add int64(jr.asInt(jr.child(it, "atMs"), 0))
@@ -1320,7 +1862,8 @@ proc saveWorld*(note: var string): bool =
   var failed: seq[string] = @[]
   # meta LAST, so a torn process leaves a version number that is behind the
   # kinds rather than ahead of them; a load then re-reads a consistent set.
-  let kinds: seq[string] = @["factions", "people", "places", "contracts", "quests", "facts"]
+  let kinds: seq[string] = @["factions", "people", "places", "contracts", "quests", "facts",
+                          "caches", "loot"]
   for k in kinds:
     if save("world." & k, kindJsonText(k)) == Ok: written.add "world." & k
     else: failed.add "world." & k
@@ -1358,7 +1901,8 @@ proc loadWorld*(note: var string): bool =
   var notes: seq[string] = @[]
   var n = ""
   if not loadKindFromJson("meta", meta.raw, n): notes.add n
-  let kinds: seq[string] = @["factions", "people", "places", "contracts", "quests", "facts"]
+  let kinds: seq[string] = @["factions", "people", "places", "contracts", "quests", "facts",
+                          "caches", "loot"]
   for k in kinds:
     let st = load("world." & k)
     if st.ok:
@@ -1397,6 +1941,7 @@ proc loadWorld*(note: var string): bool =
               $priorVersion & ") -- the store may have rolled back"
   note = "loaded version " & $gVersion & ", " & $gFacId.len & " factions, " &
          $gPId.len & " people, " & $gPlId.len & " places, " &
+         $gChId.len & " caches, " & $gLtId.len & " loot rows, " &
          $gJSeq.len & " journal events"
   if notes.len > 0:
     note.add " | problems: "

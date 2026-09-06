@@ -49,6 +49,11 @@ import tempfile
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SIM = os.path.join(REPO, "host", "Aowlspt.Sim", "bin", "aowlspt-sim.exe")
 MOD = os.path.join(REPO, "mods", "basement")
+# The item resolver needs a database. `db.json` under D:\Aowlspt is 41 MB on
+# ONE line and must never be handed to anything here; the emutest fixture is
+# 94 KB and carries a real `templates.items` (34 rows, MEASURED 2026-09-06),
+# which is enough to prove a cache resolves to templates at all.
+FIXTURE_DB = os.path.join(REPO, "tests", "fixtures", "emu-full.json")
 DLL = os.path.join(MOD, "bin", "basement.dll")
 
 BASE = "/aowlspt/basement"
@@ -80,6 +85,8 @@ def run_sim(store, routes, timeout=900):
         return None, "", ("no %s -- run: python tools\\buildlock.py build-mod "
                           "mods\\basement" % DLL)
     argv = [SIM, MOD, "--side", "server", "--store", store, "--ticks", "0"]
+    if os.path.exists(FIXTURE_DB):
+        argv += ["--db", FIXTURE_DB]
     for url, body in routes:
         argv += ["--route", url + ("," + body if body else "")]
     env = dict(os.environ)
@@ -346,6 +353,167 @@ def check_story(rep, store):
               % (w.get("journal"), w.get("contracts"), w.get("captiveOf")))
 
 
+
+# ---------------------------------------------------------------------------
+# 3. the grounding story (DESIGN.md §11) -- through the ROUTES
+# ---------------------------------------------------------------------------
+#
+# The mod's own CHECK 10 already proves the `[PLANT:]` half in-process, because
+# there is no route that applies a tag to a reply and inventing one only for a
+# test would be testing the test. What is proven HERE is the part a client
+# actually walks: the world holds a cache, `world/scene` materialises it at
+# that point, `world/loot` lists the rows, `observe loot.taken` flips it and
+# creates the rumour, a scene on another map lists nothing of it, and a claim
+# with the right token is believed where the same claim with the wrong one is
+# not.
+
+
+def _cache_with_pickup(caches_doc):
+    for c in (caches_doc or {}).get("caches", []):
+        for k in c.get("pickups", []):
+            if k.get("status") == "active":
+                return c, k
+    return None, None
+
+
+def check_grounding(rep, store):
+    docs, raw, err = run_sim(store, [
+        (BASE + "/world/new", '{"preset":"warlords","seed":7}'),
+        (BASE + "/world/caches", ""),
+        (BASE + "/world/people", ""),
+    ])
+    if err:
+        rep.add(INCONCLUSIVE, "grounding: world/caches", err)
+        return
+    caches_doc, people_doc = docs[1], docs[2]
+    cache, pickup = _cache_with_pickup(caches_doc)
+    if cache is None:
+        rep.add(INCONCLUSIVE, "grounding: world/caches",
+                "the generated world has %d cache(s) and none with an active "
+                "pickup contract, so nothing downstream can be exercised"
+                % len((caches_doc or {}).get("caches", [])))
+        return
+    rep.add(PASS, "grounding: world/caches lists real caches",
+            "%d cache(s); %s %r on %s with %d item row(s), guards=%s, "
+            "knownBy=%d, story=%r"
+            % (len(caches_doc.get("caches", [])), cache["id"], cache["name"],
+               cache["map"], len(cache.get("items", [])),
+               cache.get("guardGroup"), len(cache.get("knownBy", [])),
+               (cache.get("story") or "")[:70]))
+
+    cid, cmap = cache["id"], cache["map"]
+    cx, cy, cz = cache.get("x", 0.0), cache.get("y", 0.0), cache.get("z", 0.0)
+    grp = cache.get("guardGroup", "")
+    bearer = pickup.get("partyB", "")
+    token = pickup.get("terms", "")
+
+    guards = [p for p in (people_doc or {}).get("people", [])
+              if p.get("group") == grp and p.get("alive", True)]
+    bearer_name = ""
+    for p in (people_doc or {}).get("people", []):
+        if p.get("id") == bearer:
+            bearer_name = p.get("name", "")
+
+    other_map = ""
+    for p in (people_doc or {}).get("people", []):
+        if p.get("map") and p.get("map") != cmap:
+            other_map = p["map"]
+            break
+
+    scene = "%s/world/scene?map=%s&x=%d&y=%d&z=%d&radius=80" % (
+        BASE, cmap, int(cx), int(cy), int(cz))
+    other = "%s/world/scene?map=%s&x=%d&y=%d&z=%d&radius=80" % (
+        BASE, other_map or "no-such-map", int(cx), int(cy), int(cz))
+
+    routes = [
+        (BASE + "/world/new", '{"preset":"warlords","seed":7}'),
+        (scene, ""),
+        (BASE + "/world/loot?map=" + cmap, ""),
+        (other, ""),
+    ]
+    claim_idx = None
+    if guards:
+        gid = guards[0]["id"]
+        wrong_gid = guards[1]["id"] if len(guards) > 1 else gid
+        claim_idx = len(routes)
+        routes += [
+            (BASE + "/observe", json.dumps(
+                {"kind": "player_spoke", "personId": wrong_gid,
+                 "text": "I am Nobody Atall and the word is zzzzqqqq"})),
+            (BASE + "/observe", json.dumps(
+                {"kind": "player_spoke", "personId": gid,
+                 "text": "I am %s, the word is %s" % (bearer_name, token)})),
+        ]
+    taken_idx = len(routes)
+    routes += [
+        (BASE + "/observe", json.dumps({"kind": "loot.taken", "cacheId": cid,
+                                        "by": "player"})),
+        (BASE + "/world/caches?map=" + cmap, ""),
+        (BASE + "/world", ""),
+    ]
+
+    docs, raw, err = run_sim(store, routes)
+    if err:
+        rep.add(INCONCLUSIVE, "grounding: the run", err)
+        return
+
+    sc = docs[1] or {}
+    listed = any(c.get("id") == cid for c in sc.get("caches", []))
+    kinds = [d.get("kind") for d in sc.get("directives", [])]
+    rep.add(PASS if (listed and "group.spawn" in kinds and
+                     "loot.spawn" in kinds) else FAIL,
+            "grounding: world/scene materialises the cache",
+            "scene %r lists the cache=%s, %d people, %d loot row(s), "
+            "%d newly materialised, directives=%s"
+            % (sc.get("sceneId"), listed, len(sc.get("people", [])),
+               len(sc.get("loot", [])), sc.get("materialised"), kinds))
+
+    loot = docs[2] or {}
+    mine = [l for l in loot.get("loot", []) if l.get("cacheId") == cid]
+    rep.add(PASS if mine else FAIL, "grounding: world/loot lists the rows",
+            "%d loot row(s) on %s, %d of them from %s (first=%r)"
+            % (loot.get("count", 0), cmap, len(mine), cid,
+               (mine[0] if mine else None)))
+
+    oth = docs[3] or {}
+    absent = not any(c.get("id") == cid for c in oth.get("caches", []))
+    absent = absent and not any(l.get("cacheId") == cid
+                                for l in oth.get("loot", []))
+    rep.add(PASS if absent else FAIL,
+            "grounding: a scene on another map lists nothing of it (negative)",
+            "map=%r lists it=%s (%d caches, %d loot there)"
+            % (other_map, not absent, len(oth.get("caches", [])),
+               len(oth.get("loot", []))))
+
+    if claim_idx is None:
+        rep.add(INCONCLUSIVE, "grounding: impersonation through /observe",
+                "cache %s has no living guard in group %r to claim at"
+                % (cid, grp))
+    else:
+        bad = (docs[claim_idx] or {}).get("note", "")
+        good = (docs[claim_idx + 1] or {}).get("note", "")
+        ok = "REFUSED" in bad and "BELIEVED" in good
+        rep.add(PASS if ok else FAIL,
+                "grounding: right token believed, wrong token refused",
+                "wrong=%r || right=%r" % (bad[:150], good[:190]))
+
+    took = (docs[taken_idx] or {}).get("note", "")
+    after = docs[taken_idx + 1] or {}
+    status = ""
+    for c in after.get("caches", []):
+        if c.get("id") == cid:
+            status = c.get("status", "")
+    world = (docs[taken_idx + 2] or {}).get("world", {})
+    facts_doc = json.dumps(world.get("facts", {}))
+    rumour = ('"refId": "%s"' % cid) in facts_doc or \
+             ('"refId":"%s"' % cid) in facts_doc
+    outcome = '"origin":"outcome"' in facts_doc.replace(", ", ",") or \
+              '"origin": "outcome"' in facts_doc
+    rep.add(PASS if (status == "looted" and rumour and outcome) else FAIL,
+            "grounding: loot.taken -> looted + a rumour with origin outcome",
+            "status=%r rumour about the cache=%s an outcome fact exists=%s; "
+            "note=%r" % (status, rumour, outcome, took[:170]))
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--store", default="",
@@ -369,6 +537,8 @@ def main():
         check_selfcheck(rep, store)
         print("")
         check_story(rep, store)
+        print("")
+        check_grounding(rep, store)
     finally:
         if cfg_path and original is not None:
             open(cfg_path, "w", encoding="utf-8").write(original)

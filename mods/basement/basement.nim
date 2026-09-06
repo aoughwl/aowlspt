@@ -35,6 +35,7 @@ import "bm" / util
 import "bm" / rng
 import "bm" / world
 import "bm" / gen
+import "bm" / items
 import "bm" / sim
 import "bm" / encounter
 import "bm" / prompt
@@ -65,6 +66,9 @@ const
   EventsRoute    = Base & "/events"
   AckRoute       = Base & "/ack"
   SpawnRoute     = Base & "/spawn"
+  SceneRoute     = Base & "/world/scene"
+  LootRoute      = Base & "/world/loot"
+  CachesRoute    = Base & "/world/caches"
   SelfcheckRoute = Base & "/selfcheck"
 
 # ---------------------------------------------------------------------------
@@ -89,6 +93,16 @@ var gSayPerson: string = ""
 var gSayVoice: string = ""
 var gSayWavs: seq[string] = @[]
 var gSaySegments: seq[string] = @[]
+
+# The last payloads this mod PUBLISHED on the bus. They are kept because the
+# simulator does not deliver an emit back to the mod that made it (MEASURED in
+# host/Aowlspt.Sim/aowlsim.nim `deliverEvent`), so the selfcheck cannot hear
+# its own plant. It asserts over what was composed instead, and says plainly
+# that the cross-mod half is unproven here.
+var gLastLootPlant: string = ""
+var gLastBotsPlant: string = ""
+var gLootComposeN: int = 0
+var gBotsComposeN: int = 0
 
 proc presetDir(): string = joinPath(dataDir(), "presets")
 
@@ -362,6 +376,19 @@ proc onStatus(url, body, session: string): string =
   o.put("encounters", encounterJson())
   o.put("leashM", leashM())
   o.put("presetDir", gPresetDir)
+  var io = obj()
+  io.put("indexReady", itemsIndexReady())
+  io.put("templates", itemsIndexSize())
+  io.put("kinds", itemsKindCount())
+  io.put("data", itemsDataNote())
+  io.put("build", itemsBuildNote())
+  o.put("items", io)
+  var bo = obj()
+  bo.put("lootComposes", gLootComposeN)
+  bo.put("botsComposes", gBotsComposeN)
+  bo.put("lastLootPlant", gLastLootPlant)
+  bo.put("lastBotsPlant", gLastBotsPlant)
+  o.put("bus", bo)
   result = done(o).text
 
 proc onPresets(url, body, session: string): string =
@@ -684,6 +711,201 @@ proc onSpawn(url, body, session: string): string =
              "player has no recorded position")
   result = done(root).text
 
+
+proc queryFloat(url, key: string; default: float): float =
+  ## `x=-123.5`. Hand-written for the same reason `parseIntOr` is: a malformed
+  ## coordinate must be a DEFAULT with the caller told, never an exception
+  ## across a route.
+  let v = queryValue(url, key)
+  if v.len == 0: return default
+  var i = 0
+  var sign = 1.0
+  if v[0] == '-':
+    sign = -1.0
+    i = 1
+  elif v[0] == '+':
+    i = 1
+  var whole = 0.0
+  var seen = false
+  while i < v.len and v[i] >= '0' and v[i] <= '9':
+    whole = whole * 10.0 + float(int(v[i]) - int('0'))
+    seen = true
+    i = i + 1
+  var frac = 0.0
+  var scale = 1.0
+  if i < v.len and v[i] == '.':
+    i = i + 1
+    while i < v.len and v[i] >= '0' and v[i] <= '9':
+      scale = scale * 10.0
+      frac = frac + float(int(v[i]) - int('0')) / scale
+      seen = true
+      i = i + 1
+  if not seen: return default
+  result = sign * (whole + frac)
+
+proc onScene(url, body, session: string): string =
+  ## The materialiser. GET it and the caches around that point stop being
+  ## rumours: they become intact, their items become loot rows, and the
+  ## directives that build them go on the stream.
+  if not gEnabled: return disabledJson()
+  var map = queryValue(url, "map")
+  if map.len == 0: map = jr.asText(jr.field(body, "map"), "")
+  let x = queryFloat(url, "x", jr.asFloat(jr.field(body, "x"), 0.0))
+  let y = queryFloat(url, "y", jr.asFloat(jr.field(body, "y"), 0.0))
+  let z = queryFloat(url, "z", jr.asFloat(jr.field(body, "z"), 0.0))
+  let radius = queryFloat(url, "radius", jr.asFloat(jr.field(body, "radius"), 0.0))
+  if map.len == 0:
+    return errJson("no `map`: GET " & SceneRoute &
+                   "?map=Woods&x=0&y=0&z=0&radius=150")
+  var scene = obj()
+  withModLock:
+    scene = sceneJson(map, x, y, z, radius)
+  result = done(scene).text
+
+proc onLoot(url, body, session: string): string =
+  let map = queryValue(url, "map")
+  var a = arr()
+  var placed = 0
+  for li in lootOnMap(map):
+    a.add lootJson(li)
+    if lootStatus(li) == "placed": placed = placed + 1
+  var o = obj()
+  o.put("ok", true)
+  o.put("map", map)
+  o.put("count", a.len)
+  o.put("placed", placed)
+  o.put("loot", a)
+  result = done(o).text
+
+proc onCaches(url, body, session: string): string =
+  let map = queryValue(url, "map")
+  var a = arr()
+  for ci in cachesOnMap(map):
+    var co = cacheJson(ci)
+    var pk = arr()
+    for k in pickupsAt(cacheId(ci)):
+      pk.add contractJson(k)
+    co.put("pickups", pk)
+    a.add co
+  var o = obj()
+  o.put("ok", true)
+  o.put("map", map)
+  o.put("count", a.len)
+  o.put("caches", a)
+  result = done(o).text
+
+# ---------------------------------------------------------------------------
+# The emulator bus (DESIGN.md 11). `emit` returns no payload, so each of these
+# is a round trip: mods/tarkov asks, this composes from world rows, this emits
+# the answer, mods/tarkov's subscriber applies it.
+#
+# HONESTY: an emit is NOT delivered back to the mod that made it (MEASURED by
+# agent F in host/Aowlspt.Sim/aowlsim.nim `deliverEvent`), so nothing in this
+# process can hear its own plant. The compose halves are therefore written as
+# plain procs and the handlers are two lines each: the selfcheck exercises the
+# proc, and the cross-mod delivery is left INCONCLUSIVE rather than faked.
+# ---------------------------------------------------------------------------
+
+proc composeLootPlant(raidId, map: string): string =
+  var items = arr()
+  for li in lootOnMap(map):
+    if lootStatus(li) != "placed": continue
+    var lx = 0.0
+    var ly = 0.0
+    var lz = 0.0
+    lootPos(li, lx, ly, lz)
+    var io = obj()
+    io.put("id", lootId(li))
+    io.put("tpl", lootTpl(li))
+    io.put("count", lootN(li))
+    io.put("x", lx)
+    io.put("y", ly)
+    io.put("z", lz)
+    io.put("cacheId", lootCache(li))
+    items.add io
+  var o = obj()
+  o.put("raidId", raidId)
+  o.put("map", map)
+  o.put("items", items)
+  result = done(o).text
+
+proc composeBotsPlant(raidId, map: string): string =
+  var groups = arr()
+  var seen: seq[string] = @[]
+  for ci in cachesOnMap(map):
+    let grp = cacheGuardGroup(ci)
+    if grp.len == 0: continue
+    var dup = false
+    for g in seen:
+      if g == grp: dup = true
+    if dup: continue
+    seen.add grp
+    var names = arr()
+    var count = 0
+    var gx = 0.0
+    var gy = 0.0
+    var gz = 0.0
+    for gi in peopleOfGroup(grp):
+      if not personAlive(gi): continue
+      names.add personName(gi)
+      personPos(gi, gx, gy, gz)
+      count = count + 1
+    if count == 0: continue
+    var go = obj()
+    go.put("groupId", grp)
+    go.put("factionId", cacheOwner(ci))
+    go.put("role", "guard")
+    go.put("count", count)
+    go.put("names", names)
+    go.put("x", gx)
+    go.put("y", gy)
+    go.put("z", gz)
+    groups.add go
+  var o = obj()
+  o.put("raidId", raidId)
+  o.put("map", map)
+  o.put("groups", groups)
+  result = done(o).text
+
+proc onLootCompose(payload: string): string =
+  let map = jr.asText(jr.field(payload, "map"), "")
+  let raidId = jr.asText(jr.field(payload, "raidId"), "")
+  var text = ""
+  withModLock:
+    text = composeLootPlant(raidId, map)
+  gLastLootPlant = text
+  gLootComposeN = gLootComposeN + 1
+  # Emitted from INSIDE the handler, which is the whole shape of the round
+  # trip: `emit` returns nothing, so the answer has to be a second event.
+  discard emit("tarkov.loot.plant", text)
+  result = ""
+
+proc onBotsCompose(payload: string): string =
+  let map = jr.asText(jr.field(payload, "map"), "")
+  let raidId = jr.asText(jr.field(payload, "raidId"), "")
+  var text = ""
+  withModLock:
+    text = composeBotsPlant(raidId, map)
+  gLastBotsPlant = text
+  gBotsComposeN = gBotsComposeN + 1
+  discard emit("tarkov.bots.plant", text)
+  result = ""
+
+proc onLootTakenEvent(payload: string): string =
+  var n = 0
+  var last = ""
+  withModLock:
+    for e in jr.each(jr.field(payload, "itemIds")):
+      let id = jr.asText(e, "")
+      if id.len == 0: continue
+      var note = ""
+      observeLootTaken("", id, "player", note)
+      last = note
+      n = n + 1
+  if n > 0:
+    info ModName & ": tarkov.loot.taken applied " & $n & " item(s): " & last
+  result = ""
+
 # ---------------------------------------------------------------------------
 # The selfcheck — DESIGN.md §9. Every line is PASS / FAIL / INCONCLUSIVE, and
 # "I could not look" is INCONCLUSIVE, never PASS.
@@ -736,20 +958,36 @@ proc chk2Persistence() =
   if not saveWorld(saveNote):
     check(2, "persistence", "FAIL", "saveWorld refused: " & saveNote)
     return
-  let people = kindJsonText("people")
+  # All TEN persisted kinds, not just `people`: caches and loot joined the
+  # store with grounding, and a byte-identity check that looks at one kind
+  # cannot fail for the nine it does not look at.
+  let kinds: seq[string] = @["meta", "factions", "people", "places",
+                             "contracts", "quests", "facts", "caches",
+                             "loot", "journal"]
+  var before: seq[string] = @[]
+  var bytes = 0
+  for k in kinds:
+    let t = kindJsonText(k)
+    before.add t
+    bytes = bytes + t.len
   var loadNote = ""
   if not loadWorld(loadNote):
     check(2, "persistence", "FAIL", "loadWorld refused: " & loadNote)
     return
-  let after = kindJsonText("people")
+  var differing: seq[string] = @[]
+  var i = 0
+  while i < kinds.len:
+    if kindJsonText(kinds[i]) != before[i]: differing.add kinds[i]
+    i = i + 1
   var corruptNote = ""
   let corruptOk = loadKindFromJson("quests", "{ this is not json", corruptNote)
-  let roundTrip = people == after
+  let roundTrip = differing.len == 0
   let peopleIntact = personCount() > 0
   check(2, "persistence", verdictOf(roundTrip and (not corruptOk) and peopleIntact),
-        "round trip identical " & $roundTrip & " (" & $people.len &
-        " bytes, version " & $vBefore & "->" & $worldVersion() &
-        "); a corrupt document was refused " & $(not corruptOk) & " (" &
+        $kinds.len & " kinds round-tripped byte-identically " & $roundTrip &
+        " (" & $bytes & " bytes; differing: " & joinWith(differing, " ") &
+        "), version " & $vBefore & "->" & $worldVersion() &
+        "; a corrupt document was refused " & $(not corruptOk) & " (" &
         corruptNote & "); people still loaded " & $personCount())
 
 proc chk3CatchUp() =
@@ -967,6 +1205,264 @@ proc chk9TagGrammar() =
         joinWith(unmapped, " ") & "); an invented tag emitted " & $badDirectives &
         " directives and said: " & badNote)
 
+
+# --------------------------------------------------------------- grounding
+# DESIGN.md 11 numbers its three new checks 9, 10 and 11; they are 10, 11 and
+# 12 here because 9 was already taken by the tag-grammar check. The names say
+# which is which so nobody has to reconcile two numbering schemes later.
+
+proc firstCacheWithPickup(): int =
+  result = -1
+  var i = 0
+  while i < cacheCount():
+    for k in pickupsAt(cacheId(i)):
+      if contractStatus(k) == "active" and result < 0: result = i
+    i = i + 1
+
+proc chk10Plant() =
+  ## DESIGN 11 check 9. A [PLANT:] tag in a reply makes a REAL cache: items
+  ## (or an INCONCLUSIVE item note), guards who are people in this world, the
+  ## speaker knows it, `world/scene` at that place lists it, `loot.taken` flips
+  ## it to looted and produces a rumour with origin `outcome` -- and a scene on
+  ## ANOTHER map lists nothing of it, which is the negative control.
+  if personCount() == 0:
+    check(10, "grounding: plant -> scene -> loot.taken (11.9)", "INCONCLUSIVE",
+          "no people in the world to plant anything")
+    return
+  let pid = personId(0)
+  let pi = 0
+  let map = personMap(pi)
+  var tags: seq[string] = @[]
+  tags.add "[PLANT: cache | near | two crates of ammunition and a rifle | " &
+           "guarded by " & personFaction(pi) & " x3]"
+  var tnote = ""
+  let before = cacheCount()
+  discard applyTags(pid, tags, tnote)
+  if cacheCount() != before + 1:
+    check(10, "grounding: plant -> scene -> loot.taken (11.9)", "FAIL",
+          "[PLANT] did not create a cache (" & $before & " -> " &
+          $cacheCount() & "): " & tnote)
+    return
+  let ci = cacheCount() - 1
+  let cid = cacheId(ci)
+  # guards must be PEOPLE, not a number in a field
+  var guards = 0
+  for gi in peopleOfGroup(cacheGuardGroup(ci)):
+    if personAlive(gi) and findPerson(personId(gi)) >= 0: guards = guards + 1
+  var speakerKnows = false
+  for k in personKnows(pi):
+    if k == cid: speakerKnows = true
+  let items = cacheItemCount(ci)
+  # the scene AT the cache
+  var cx = 0.0
+  var cy = 0.0
+  var cz = 0.0
+  cachePos(ci, cx, cy, cz)
+  let scene = sceneJson(map, cx, cy, cz, 60.0)
+  let sceneText = done(scene).text
+  let listed = contains(sceneText, cid)
+  # the negative control: a scene on a map this cache is not on
+  var otherMap = ""
+  var mi = 0
+  while mi < placeCount():
+    if placeMap(mi) != map and otherMap.len == 0: otherMap = placeMap(mi)
+    mi = mi + 1
+  var absentElsewhere = true
+  var otherNote = "no second map in this world -- the negative control could " &
+                  "NOT be run"
+  if otherMap.len > 0:
+    let other = done(sceneJson(otherMap, cx, cy, cz, 60.0)).text
+    absentElsewhere = not contains(other, cid)
+    otherNote = "a scene on " & otherMap & " lists it " &
+                $(not absentElsewhere) & " (must be false)"
+  # take it
+  let lootRows = lootOfCache(cid).len
+  var lnote = ""
+  observeLootTaken(cid, "", "player", lnote)
+  let looted = cacheStatus(ci) == "looted"
+  var outcome = false
+  for fi in factsAbout("cache", cid):
+    if factOrigin(fi) == "outcome": outcome = true
+  let itemsOk = items > 0 or contains(tnote, "INCONCLUSIVE")
+  let ok = guards >= 1 and speakerKnows and itemsOk and listed and
+           absentElsewhere and looted and outcome
+  check(10, "grounding: plant -> scene -> loot.taken (11.9)", verdictOf(ok),
+        "cache " & cid & ": " & $items & " item row(s) (ok " & $itemsOk &
+        "), " & $guards & " guard(s) who are real people, speaker knows it " &
+        $speakerKnows & "; scene at the cache lists it " & $listed &
+        " and materialised " & $lootRows & " loot row(s); " & otherNote &
+        "; loot.taken -> status " & cacheStatus(ci) & ", outcome fact " &
+        $outcome & " (" & lnote & ")")
+
+proc chk11Claim() =
+  ## DESIGN 11 check 10. The same guard, the same cache, two utterances: the
+  ## bearer's name plus the token, and a name and word that are neither. One
+  ## must be believed and the other must not -- a test with only the positive
+  ## half cannot fail.
+  let ci = firstCacheWithPickup()
+  if ci < 0:
+    check(11, "grounding: impersonation (11.10)", "INCONCLUSIVE",
+          "no cache in this world has an active pickup contract (" &
+          $cacheCount() & " caches), so a claim has nothing to be measured " &
+          "against")
+    return
+  let cid = cacheId(ci)
+  var bearer = ""
+  var token = ""
+  for k in pickupsAt(cid):
+    if contractStatus(k) == "active" and bearer.len == 0:
+      bearer = contractPartyB(k)
+      token = contractTerms(k)
+  let bi = findPerson(bearer)
+  var guard = -1
+  for gi in peopleOfGroup(cacheGuardGroup(ci)):
+    if personAlive(gi) and guard < 0: guard = gi
+  if guard < 0 or bi < 0:
+    check(11, "grounding: impersonation (11.10)", "INCONCLUSIVE",
+          "cache " & cid & " has a pickup but no living guard (" &
+          cacheGuardGroup(ci) & ") or no bearer we can name (" & bearer & ")")
+    return
+  let gid = personId(guard)
+  let attBefore = personAttitude(bi)
+  # negative FIRST, so a machine that simply says yes to everything is caught
+  # before the positive case can paper over it.
+  var badNote = ""
+  let badOk = resolveClaim(gid, "I am nobody at all and the word is zzzzqqqq",
+                           badNote)
+  # the guard is threatened now; that is the point, and it does not stop the
+  # second roll from being scored.
+  var goodNote = ""
+  let goodOk = resolveClaim(gid, "I am " & personName(bi) & ", the word is " &
+                            token, goodNote)
+  var stoodDown = false
+  var gave = false
+  let evText = done(eventsSince(0, 400)).text
+  stoodDown = contains(evText, "npc.stand_down")
+  gave = contains(evText, "npc.give")
+  var broken = false
+  for k in pickupsAt(cid):
+    if contractStatus(k) == "broken": broken = true
+  # The DELTA, not an absolute: the bearer's starting attitude is generated,
+  # so `<= -30` would pass or fail on the seed rather than on the code.
+  let grudge = personAttitude(bi) <= attBefore - 40 or personAttitude(bi) == -100
+  let hunted = findQuest("hunt." & bearer) >= 0
+  let ok = goodOk and (not badOk) and stoodDown and gave and broken and
+           grudge and hunted
+  check(11, "grounding: impersonation (11.10)", verdictOf(ok),
+        "guard " & gid & " at " & cid & ": right name + right token believed " &
+        $goodOk & " (" & goodNote & "); WRONG name + wrong token believed " &
+        $badOk & " (negative control -- must be false: " & badNote &
+        "); npc.stand_down " & $stoodDown & ", npc.give " & $gave &
+        ", the real bearer's contract broken " & $broken & ", bearer attitude " &
+        $attBefore & "->" & $personAttitude(bi) & " (grudge " & $grudge &
+        "), hunt quest offered " & $hunted)
+
+proc chk12KnownIds() =
+  ## DESIGN 11 check 11. No person's knowledge names an id this world does not
+  ## hold -- asserted over the RAW `knows` list, not over the rendered block,
+  ## because `renderKnown` skips what it cannot find and a check over its
+  ## output could never fail. The negative control plants one bogus id and
+  ## requires the same scan to catch it.
+  if personCount() == 0:
+    check(12, "grounding: nobody knows a thing that does not exist (11.11)",
+          "INCONCLUSIVE", "no people to check")
+    return
+  var bad: seq[string] = @[]
+  var known = 0
+  var i = 0
+  while i < personCount():
+    for id in personKnows(i):
+      known = known + 1
+      if not worldHasId(id):
+        if bad.len < 6: bad.add personId(i) & "->" & id
+    i = i + 1
+  # negative control
+  let bogus = "no-such-entity-deadbeef"
+  addPersonKnows(0, bogus)
+  var caught = false
+  for id in personKnows(0):
+    if not worldHasId(id): caught = true
+  discard dropPersonKnows(0, bogus)
+  var stillThere = false
+  for id in personKnows(0):
+    if id == bogus: stillThere = true
+  # and the rendered block must never contain the bogus id either
+  let rendered = renderKnown(0, 12)
+  let leaked = contains(rendered, bogus)
+  let ok = bad.len == 0 and caught and (not stillThere) and (not leaked) and
+           known > 0
+  check(12, "grounding: nobody knows a thing that does not exist (11.11)",
+        verdictOf(ok),
+        $known & " knowledge row(s) over " & $personCount() & " people, " &
+        $bad.len & " naming an id the world does not hold (" &
+        joinWith(bad, " ") & "); negative control: a planted bogus id WAS " &
+        "caught " & $caught & ", removed again " & $(not stillThere) &
+        ", never rendered " & $(not leaked))
+
+proc chk13LootBus() =
+  ## The emulator hand-off. What can be proven in ONE process is that a
+  ## compose produces a plant payload naming the loot rows that exist. What
+  ## CANNOT be proven here is delivery: an emit is not delivered back to the
+  ## mod that made it, and mods/tarkov is not loaded in this process, so that
+  ## half is stated as unproven instead of being simulated.
+  var map = ""
+  var i = 0
+  while i < lootCount():
+    if lootStatus(i) == "placed" and map.len == 0: map = lootMap(i)
+    i = i + 1
+  var built = ""
+  if map.len == 0:
+    # Nothing is placed yet (check 10 emptied the only cache it made), so
+    # build a scene around a cache that is still intact -- materialising is
+    # what puts loot rows on a map in the first place.
+    var ci2 = 0
+    while ci2 < cacheCount():
+      if cacheStatus(ci2) != "looted" and map.len == 0:
+        var mx = 0.0
+        var my = 0.0
+        var mz = 0.0
+        cachePos(ci2, mx, my, mz)
+        discard sceneJson(cacheMap(ci2), mx, my, mz, 60.0)
+        var li2 = 0
+        while li2 < lootCount():
+          if lootStatus(li2) == "placed" and map.len == 0: map = lootMap(li2)
+          li2 = li2 + 1
+        built = "built a scene at " & cacheId(ci2) & " first; "
+      ci2 = ci2 + 1
+  if map.len == 0:
+    check(13, "grounding: loot/bots compose payloads", "INCONCLUSIVE",
+          "no placed loot row on any map (" & $lootCount() &
+          " loot rows) and no intact cache to materialise -- nothing to compose")
+    return
+  let plant = composeLootPlant("selfcheck-raid", map)
+  var listed = 0
+  var missing = 0
+  i = 0
+  while i < lootCount():
+    if lootMap(i) == map and lootStatus(i) == "placed":
+      if contains(plant, lootId(i)): listed = listed + 1
+      else: missing = missing + 1
+    i = i + 1
+  let bots = composeBotsPlant("selfcheck-raid", map)
+  var groups = 0
+  var ci = 0
+  while ci < cacheCount():
+    if cacheMap(ci) == map and cacheGuardGroup(ci).len > 0 and
+       contains(bots, cacheGuardGroup(ci)): groups = groups + 1
+    ci = ci + 1
+  # negative control: a map with no rows composes an EMPTY items array, not
+  # every row in the world.
+  let empty = composeLootPlant("selfcheck-raid", "no-such-map-zzz")
+  let emptyOk = contains(empty, "\"items\":[]")
+  let ok = listed > 0 and missing == 0 and emptyOk
+  check(13, "grounding: loot/bots compose payloads", verdictOf(ok),
+        built & $listed & " placed loot row(s) on " & map & " are in the plant " &
+        "payload, " & $missing & " missing; " & $groups &
+        " guard group(s) in the bots payload; an unknown map composes an " &
+        "empty items array " & $emptyOk & " (negative control). NOT PROVEN " &
+        "HERE: that mods/tarkov receives it -- an emit is not delivered to " &
+        "the emitting mod and tarkov is not loaded in this process.")
+
 proc onSelfcheck(url, body, session: string): string =
   gCheckLines = @[]
   gPassN = 0
@@ -982,6 +1478,10 @@ proc onSelfcheck(url, body, session: string): string =
     chk7Engines()
     chk8Speech()
     chk9TagGrammar()
+    chk10Plant()
+    chk11Claim()
+    chk12KnownIds()
+    chk13LootBus()
     # Put back whatever was on disk: the checks above generated and advanced a
     # world in memory, and leaving that in place would quietly replace the
     # player's.
@@ -1154,6 +1654,19 @@ proc onLoad(): Status =
     parts.add $ontologyIntentCount() & " intents / " & $ontologyRowCount() & " rows"
   else:
     parts.add "ontology.json did not load: " & ontNote
+  # The item resolver: kind words from data, templates from whatever database
+  # this host loaded. Both halves report a COUNT, because "0 templates" and
+  # "no database" are different answers and only one of them is a problem.
+  itemsConfigure(readAll(joinPath(dataDir(), "lootkinds.json")))
+  parts.add "lootkinds: " & itemsDataNote()
+  var itemNote = ""
+  let itemN = itemsIndexBuild(itemNote)
+  parts.add "items: " & itemNote
+  if itemN == 0:
+    info ModName & ": no item index (" & itemNote & ") -- caches will still " &
+         "be created with their story and their guards, and every resolve " &
+         "will say INCONCLUSIVE rather than report an empty cache"
+
   var cacheNote = ""
   brainLoadCache(cacheNote)
   parts.add "brain cache: " & cacheNote
@@ -1180,6 +1693,9 @@ proc onLoad(): Status =
   discard serve(AdvanceRoute, onAdvance)
   discard servePrefix(PeopleRoute, onPeople)
   discard servePrefix(PersonRoute, onPerson)
+  discard servePrefix(SceneRoute, onScene)
+  discard servePrefix(LootRoute, onLoot)
+  discard servePrefix(CachesRoute, onCaches)
   discard servePrefix(WorldRoute, onWorld)
   discard serve(ObserveRoute, onObserve)
   discard serve(SayRoute, onSay)
@@ -1191,6 +1707,9 @@ proc onLoad(): Status =
 
   discard on("tarkov.profile.listing", onProfileListing)
   discard on("tarkov.raid.configured", onRaidConfigured)
+  discard on("tarkov.loot.compose", onLootCompose)
+  discard on("tarkov.bots.compose", onBotsCompose)
+  discard on("tarkov.loot.taken", onLootTakenEvent)
 
   if gEnabled:
     discard everyMs(gTickMs, onTick)

@@ -36,6 +36,7 @@ var gAmbushChance: float = 0.25
 var gLastWall: int64 = 0
 var gHaveWallMark: bool = false
 
+var gRumourAfterMs: int64 = 3600000'i64   ## a fact sits this long before it is retold
 var gAmbFaction: seq[string] = @[]
 var gAmbCount: seq[int] = @[]
 var gAmbNear: seq[string] = @[]
@@ -47,6 +48,9 @@ proc setSimConfig*(maxCatchUpMs: int64; moveEveryMs: int64;
   gAmbushChance = clampF(ambushChance, 0.0, 1.0)
 
 proc simMoveEveryMs*(): int64 = gMoveEveryMs
+proc simRumourAfterMs*(): int64 = gRumourAfterMs
+proc setSimRumourAfterMs*(ms: int64) =
+  if ms > 0: gRumourAfterMs = ms
 proc simMaxCatchUpMs*(): int64 = gMaxCatchUpMs
 
 proc isMobile(activity: string): bool =
@@ -160,6 +164,79 @@ proc simPendingAmbush*(factionId: var string; count: var int;
 
 proc simPendingAmbushCount*(): int = gAmbFaction.len
 
+
+proc spreadRumours(step: int): int =
+  ## One telling per person per step, at most. A person who knows a fact that
+  ## has sat for `gRumourAfterMs` tells ONE group-mate who does not know it;
+  ## the fact's `spreadMs` is then reset, so a rumour walks outward at a rate
+  ## instead of saturating the world in a single step.
+  ##
+  ## Bounded by construction: the inner loops break on the first telling, and
+  ## `addPersonKnows` is idempotent, so this cannot ping-pong between two
+  ## people who already know.
+  result = 0
+  var pi = 0
+  while pi < personCount():
+    if personAlive(pi):
+      let grp = personGroup(pi)
+      if grp.len > 0:
+        var told = false
+        for fid in personKnows(pi):
+          if told: break
+          let fi = findFact(fid)
+          if fi < 0: continue
+          if worldClockMs() - factSpreadMs(fi) < gRumourAfterMs: continue
+          for gi in peopleOfGroup(grp):
+            if gi == pi or not personAlive(gi): continue
+            var knows = false
+            for k in personKnows(gi):
+              if k == fid: knows = true
+            if knows: continue
+            addPersonKnows(gi, fid)
+            var rk = ""
+            var rid = ""
+            factRef(fi, rk, rid)
+            if rk == "cache" and rid.len > 0:
+              let ci = findCache(rid)
+              if ci >= 0: addCacheKnownBy(ci, personId(gi))
+              addPersonKnows(gi, rid)
+            setFactSpreadMs(fi, worldClockMs())
+            remember(gi, personName(pi) & " told me: " & factText(fi))
+            discard journal("rumour.spread", personId(pi), personId(gi),
+                            jdata("\"fact\":" & qs(fid) & ",\"step\":" & $step))
+            result = result + 1
+            told = true
+            break
+    pi = pi + 1
+
+proc lootedOutcomes(step: int): int =
+  ## A looted cache produces exactly ONE `outcome` fact, and the owning
+  ## faction's leader learns it. The existence check is what makes it once:
+  ## `factsAbout` with origin `outcome` is the finished state, not a flag this
+  ## code sets and then trusts.
+  result = 0
+  var ci = 0
+  while ci < cacheCount():
+    if cacheStatus(ci) == "looted":
+      let cid = cacheId(ci)
+      var have = false
+      for fi in factsAbout("cache", cid):
+        if factOrigin(fi) == "outcome": have = true
+      if not have:
+        let fid = cid & "-hit"
+        addFactRef(fid, "outcome cache " & cid,
+                   "Somebody hit " & cacheName(ci) & ". It is empty now.",
+                   "cache", cid, "outcome")
+        let owner = findFaction(cacheOwner(ci))
+        if owner >= 0:
+          for pj in peopleOfFaction(owner):
+            if personAlive(pj) and personRole(pj) == "leader":
+              addPersonKnows(pj, fid)
+        discard journal("cache.outcome", cacheOwner(ci), cid,
+                        jdata("\"fact\":" & qs(fid) & ",\"step\":" & $step))
+        result = result + 1
+    ci = ci + 1
+
 proc simAdvance*(ms: int64; note: var string): int =
   ## Returns the number of world changes made; each one is journaled.
   if not worldExists():
@@ -178,6 +255,8 @@ proc simAdvance*(ms: int64; note: var string): int =
   var stanceChanges = 0
   var expired = 0
   var healed = 0
+  var spread = 0
+  var outcomes = 0
 
   var step = 0
   while step < steps:
@@ -259,6 +338,13 @@ proc simAdvance*(ms: int64; note: var string): int =
         changes = changes + 1
       ci = ci + 1
 
+    let sp = spreadRumours(stepIdx)
+    spread = spread + sp
+    changes = changes + sp
+    let oc = lootedOutcomes(stepIdx)
+    outcomes = outcomes + oc
+    changes = changes + oc
+
     scheduleAmbush(stepIdx)
     step = step + 1
 
@@ -267,7 +353,8 @@ proc simAdvance*(ms: int64; note: var string): int =
 
   note = "advanced " & $ms & " ms in " & $steps & " step(s): " & $moved &
          " move(s), " & $stanceChanges & " stance change(s), " & $expired &
-         " contract(s) expired, " & $healed & " heal(s); " & $changes &
+         " contract(s) expired, " & $healed & " heal(s), " & $spread &
+         " rumour(s) spread, " & $outcomes & " loot outcome(s); " & $changes &
          " journaled change(s); clock now " & $worldClockMs() &
          " (day " & $worldDay() & ")"
   result = changes

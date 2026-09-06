@@ -247,7 +247,11 @@ proc decideFromRaw*(raw: string; tier: string; engine: string;
   for t in found: all.add t
   for t in all:
     let n = tagName(t)
-    if isKnownTag(n):
+    if modelForbiddenTag(n):
+      notes.add "dropped [" & n & "] -- that tag is the encounter machine's " &
+                "own record of a believability roll and is never accepted " &
+                "from a reply; the roll decides, not the speaker"
+    elif isKnownTag(n):
       d.tags.add t
     else:
       notes.add "dropped unknown tag [" & n & "] -- not in the tag grammar; " &
@@ -346,7 +350,10 @@ proc decide*(worldPrompt, rules: string; c: PersonCard; s: Situation;
                        engine: engine, ms: 0, notes: @[], segments: @[])
       for t in gStreamTags:
         let n = tagName(t)
-        if isKnownTag(n): d.tags.add t
+        if modelForbiddenTag(n):
+          notes.add "dropped [" & n & "] -- the encounter machine emits that " &
+                    "tag, a model never does"
+        elif isKnownTag(n): d.tags.add t
         else:
           notes.add "dropped unknown tag [" & n & "] -- not in the tag grammar; " &
                     "it was stripped from the spoken line and not acted on"

@@ -33,6 +33,11 @@ import aowlspt/json as jr
 import world
 import stream
 import prompt
+import ontology
+import rng
+import util
+import items
+import gen
 
 # ---------------------------------------------------------------------------
 # Configuration. Literal initialisers only — nimony zeroes a DLL global whose
@@ -71,6 +76,11 @@ var gPlayerArmed: int = 1
 var gPlayerAiming: int = 0
 var gLastAmbushMs: int64 = 0
 var gAmbushCooldownMs: int64 = 300000
+
+# What the player has handed over, by item word. `resolveClaim` needs it: a
+# token can be a passphrase OR an object, and "he gave me the thing the bearer
+# was supposed to bring" is the strongest evidence an impostor can produce.
+var gGaveItems: seq[string] = @[]
 
 # A small ring of recent facts, in words, for the prompt's `recentEvents`.
 var gRecent: seq[string] = @[]
@@ -449,9 +459,10 @@ proc cardFor*(personId: string): PersonCard =
   result = PersonCard(id: personId, name: "", faction: "", factionCreed: "",
                       role: "", voice: "", traits: "", wants: "", forbids: "",
                       attitude: 0, factionRep: 0, mood: 0.0,
-                      inventoryNote: "", placeName: "", map: "")
+                      inventoryNote: "", placeName: "", map: "", known: "")
   let i = findPerson(personId)
   if i < 0: return
+  result.known = renderKnown(i, 12)
   result.name = personName(i)
   result.role = personRole(i)
   result.voice = personVoice(i)
@@ -588,6 +599,475 @@ proc parseFloatOr(s: string; default: float): float =
       i = i + 1
   if seen == 0: return default
   result = sign * (whole + frac)
+
+
+# ---------------------------------------------------------------------------
+# GROUNDING (DESIGN.md 11) -- caches, scenes, claims.
+#
+# The rule the whole section exists for: a person may only talk about entities
+# the world holds, and the ONLY way a person creates truth is a tag the world
+# materialises here. So `[PLANT:]` does not annotate a reply, it writes a Cache
+# row with items, a story and living guards; `sceneJson` builds the scene out
+# of those rows and nothing else; and `observeLootTaken` walks the consequence
+# back into faction standing and a rumour. Nothing below invents a name, an
+# item or a position that is not already in the world or in `data/`.
+# ---------------------------------------------------------------------------
+
+proc groundRng(salt, id: string): Rng =
+  ## Deterministic per (world, clock, subject). The claim roll must be
+  ## reproducible from the world, not from whatever a generator had reached.
+  result = initRng(worldSeed() xor
+                   fnv1a64(salt & "|" & id & "|" & $worldClockMs()))
+
+proc nameWordsMatch(utterance, full: string): bool =
+  ## Any word of a person's name that is long enough to be a name and not a
+  ## title. A four-character floor is deliberate: "the" and "of" in a callsign
+  ## would otherwise make every sentence a match, which is a check that cannot
+  ## fail.
+  let u = normalizeText(utterance)
+  if u.len == 0 or full.len == 0: return false
+  for w in normalizeText(full).split(' '):
+    if w.len >= 4 and containsWord(u, w): return true
+  result = false
+
+proc applyPlant*(speakerId, spec: string; note: var string): string =
+  ## `[PLANT: cache | <placeId or "near"> | <what> | guarded by <factionId> xN]`
+  ## -> a real Cache. Returns the new cache id, or "" with a note saying why
+  ## not. Every refusal names the part of the spec it could not use.
+  result = ""
+  let pi = findPerson(speakerId)
+  if pi < 0:
+    note = "[PLANT] refused: no such person '" & speakerId & "'"
+    return
+  var parts = pipeSplit(spec)
+  if parts.len > 0 and normalizeText(parts[0]) == "cache":
+    var rest: seq[string] = @[]
+    var i = 1
+    while i < parts.len:
+      rest.add parts[i]
+      i = i + 1
+    parts = rest
+  let placeTok = (if parts.len > 0: parts[0] else: "")
+  let what = (if parts.len > 1: parts[1] else: "")
+  let guardTok = (if parts.len > 2: parts[2] else: "")
+  if what.len == 0:
+    note = "[PLANT] refused: the spec said nothing about what is in the cache " &
+           "(expected `cache | <place> | <what> | guarded by <faction> xN`, got '" &
+           spec & "')"
+    return
+  let map = personMap(pi)
+  var px = 0.0
+  var py = 0.0
+  var pz = 0.0
+  personPos(pi, px, py, pz)
+  var placeId2 = personPlace(pi)
+  let pl = findPlace(placeTok)
+  if pl >= 0:
+    placeId2 = placeId(pl)
+    placePos(pl, px, py, pz)
+  var facId = personFaction(pi)
+  var count = 2
+  if guardTok.len > 0:
+    for w in guardTok.split(' '):
+      let t = strip(w)
+      if findFaction(t) >= 0: facId = t
+      elif t.len >= 2 and (t[0] == 'x' or t[0] == 'X'):
+        let n = parseIntOr(t.substr(1), 0)
+        if n > 0 and n <= 8: count = n
+  let cid = "plant." & speakerId & "." & $cacheCount()
+  var r = groundRng("plant", cid)
+  let ci = addCache(cid, personName(pi) & "'s cache", placeId2, map, facId, "",
+                    personName(pi) & " says: " & what, speakerId, px, py, pz)
+  var tpls: seq[string] = @[]
+  var counts: seq[int] = @[]
+  var inote = ""
+  discard resolveItems(what, r, tpls, counts, inote)
+  var t2 = 0
+  while t2 < tpls.len:
+    cacheAddItem(ci, tpls[t2], (if t2 < counts.len: counts[t2] else: 1))
+    t2 = t2 + 1
+  let grp = spawnGuardGroup(cid, facId, map, placeId2, px, py, pz, count, r)
+  setCacheGuardGroup(ci, grp)
+  addPersonKnows(pi, cid)
+  addCacheKnownBy(ci, speakerId)
+  let rid = cid & "-rumour"
+  addFactRef(rid, "cache " & cid & " " & facId, personName(pi) & " says: " & what,
+             "cache", cid, "plant")
+  addPersonKnows(pi, rid)
+  var jo = obj()
+  jo.put("cacheId", cid)
+  jo.put("map", map)
+  jo.put("place", placeId2)
+  jo.put("guards", count)
+  jo.put("guardGroup", grp)
+  jo.put("items", cacheItemCount(ci))
+  jo.put("itemNote", inote)
+  discard journal("cache.planted", speakerId, cid, done(jo).text)
+  note = "planted cache " & cid & " at " & (if placeId2.len > 0: placeId2 else: map) &
+         " with " & $cacheItemCount(ci) & " item row(s) (" & inote & ") and " &
+         $count & " guard(s) in group '" & grp & "'"
+  result = cid
+
+proc applyReveal*(speakerId, entityId: string; note: var string): bool =
+  ## `[REVEAL: <entityId>]` -- a disclosure. An id the world does not hold is
+  ## REFUSED and journaled, because a person handing the player a name for
+  ## something that does not exist is the exact failure 11 is about.
+  if not worldHasId(entityId):
+    note = "[REVEAL] refused: '" & entityId & "' is not an entity in this " &
+           "world; nothing was disclosed"
+    discard journal("claim.unknown", speakerId, entityId, "{}")
+    return false
+  let ci = findCache(entityId)
+  if ci >= 0: addCacheKnownBy(ci, "player")
+  discard journal("reveal", speakerId, entityId, "{}")
+  var o = obj()
+  o.put("personId", speakerId)
+  o.put("entityId", entityId)
+  discard directive("world.reveal", done(o).text, false)
+  note = "revealed " & entityId & " to the player"
+  result = true
+
+proc applyExpect*(speakerId, spec: string; note: var string): bool =
+  ## `[EXPECT: <cacheId> | bearer <personId> | token <passphrase>]`.
+  let parts = pipeSplit(spec)
+  if parts.len < 3:
+    note = "[EXPECT] refused: expected `<cacheId> | bearer <personId> | token " &
+           "<passphrase>`, got '" & spec & "'"
+    return false
+  let cid = parts[0]
+  let ci = findCache(cid)
+  if ci < 0:
+    note = "[EXPECT] refused: '" & cid & "' is not a cache in this world"
+    return false
+  var bearer = strip(parts[1])
+  if bearer.len > 7 and normalizeText(bearer.substr(0, 5)) == "bearer":
+    bearer = strip(bearer.substr(6))
+  var token = strip(parts[2])
+  if token.len > 6 and normalizeText(token.substr(0, 4)) == "token":
+    token = strip(token.substr(5))
+  if findPerson(bearer) < 0:
+    note = "[EXPECT] refused: bearer '" & bearer & "' is nobody in this world"
+    return false
+  if token.len == 0:
+    note = "[EXPECT] refused: no token; a pickup with no token cannot be " &
+           "failed, so it would be a contract nobody could get wrong"
+    return false
+  discard addPickupContract(cid & "-pickup." & $contractCount(), cid, bearer,
+                            token, worldClockMs() + 604800000'i64)
+  addPersonKnows(findPerson(bearer), cid)
+  addCacheKnownBy(ci, bearer)
+  for gi in peopleOfGroup(cacheGuardGroup(ci)):
+    remember(gi, "We are expecting " & personName(findPerson(bearer)) &
+             ". The word is \"" & token & "\".")
+  discard journal("pickup.expected", speakerId, cid,
+                  jsonOf2("bearer", bearer, "token", token))
+  note = "guards at " & cid & " now expect " & bearer & " with the word \"" &
+         token & "\""
+  result = true
+
+proc resolveClaim*(personId, utterance: string; note: var string): bool =
+  ## Impersonation. Scored, rolled with the world's own rng, and JOURNALED
+  ## WITH THE PARTS -- `claim.ok` / `claim.fail` carry every term, so a verdict
+  ## can be argued with afterwards instead of being taken on trust.
+  result = false
+  let pi = findPerson(personId)
+  if pi < 0:
+    note = "claim refused: no such person '" & personId & "'"
+    return
+  var cands: seq[int] = @[]
+  for id in personKnows(pi):
+    let ci = findCache(id)
+    if ci >= 0: cands.add ci
+  var px = 0.0
+  var py = 0.0
+  var pz = 0.0
+  personPos(pi, px, py, pz)
+  for ci in cachesNear(personMap(pi), px, py, pz, 120.0):
+    var dup = false
+    for c in cands:
+      if c == ci: dup = true
+    if not dup: cands.add ci
+  var bestC = -1
+  var bestK = -1
+  for ci in cands:
+    for k in pickupsAt(cacheId(ci)):
+      if contractStatus(k) == "active" and bestK < 0:
+        bestC = ci
+        bestK = k
+  if bestK < 0:
+    note = "claim heard, but there is no open pickup contract at any cache " &
+           personName(pi) & " knows or stands near (" & $cands.len &
+           " cache(s) considered) -- nothing to impersonate, so nothing was rolled"
+    return
+  let bearerId = contractPartyB(bestK)
+  let bi = findPerson(bearerId)
+  let token = contractTerms(bestK)
+  let bearerNamed = bi >= 0 and nameWordsMatch(utterance, personName(bi))
+  let tokenSpoken = nameWordsMatch(utterance, token)
+  var tokenGiven = false
+  for g in gGaveItems:
+    if nameWordsMatch(g, token) or nameWordsMatch(token, g): tokenGiven = true
+  let fi = findFaction(cacheOwner(bestC))
+  var rep = 0
+  if fi >= 0: rep = factionRep(fi)
+  let repPart = clampI(rep div 5, -20, 20)
+  let role = personRole(pi)
+  var rolePart = 0
+  if role == "guard" or role == "grunt": rolePart = 15
+  elif role == "scout" or role == "medic": rolePart = 5
+  elif role == "lieutenant": rolePart = -10
+  elif role == "leader": rolePart = -20
+  var score = repPart + rolePart
+  if bearerNamed: score = score + 40
+  if tokenSpoken or tokenGiven: score = score + 40
+  var r = groundRng("claim", personId & "|" & cacheId(bestC))
+  let threshold = nextInt(r, 35, 85)
+  let believed = score >= threshold
+  var jo = obj()
+  jo.put("cacheId", cacheId(bestC))
+  jo.put("contractId", contractId(bestK))
+  jo.put("bearerId", bearerId)
+  jo.put("bearerNamed", bearerNamed)
+  jo.put("tokenSpoken", tokenSpoken)
+  jo.put("tokenGiven", tokenGiven)
+  jo.put("factionRep", repPart)
+  jo.put("guardRole", role)
+  jo.put("rolePart", rolePart)
+  jo.put("score", score)
+  jo.put("threshold", threshold)
+  jo.put("believed", believed)
+  let ei = ensureEnc(personId)
+  if believed:
+    discard journal("claim.ok", personId, "player", done(jo).text)
+    setContractStatus(bestK, "broken")
+    setState(ei, "talking", "the claim was believed")
+    var so = obj()
+    so.put("personId", personId)
+    so.put("groupId", cacheGuardGroup(bestC))
+    so.put("cacheId", cacheId(bestC))
+    so.put("reason", "the player was taken for " &
+           (if bi >= 0: personName(bi) else: bearerId))
+    discard directive("npc.stand_down", done(so).text, false)
+    for gi in peopleOfGroup(cacheGuardGroup(bestC)):
+      setPersonActivity(gi, "idle")
+      remember(gi, "We handed the cache to someone who gave the word.")
+    var go = obj()
+    go.put("personId", personId)
+    go.put("item", cacheId(bestC))
+    go.put("cacheId", cacheId(bestC))
+    discard directive("npc.give", done(go).text, true, 30000)
+    if bi >= 0:
+      setPersonAttitude(bi, clampAtt(personAttitude(bi) - 40))
+      remember(bi, "Somebody used my name to take " & cacheName(bestC) & ".")
+      let qid = "hunt." & bearerId
+      if findQuest(qid) < 0:
+        var objectives: seq[string] = @[]
+        objectives.add "find whoever used " & personName(bi) & "'s name"
+        objectives.add "take back what was handed over"
+        discard addQuest(qid, bearerId, "Somebody used my name",
+                         personName(bi) & " was expected at " &
+                         cacheName(bestC) & ". Somebody else was believed.",
+                         "hunt", "player", "whatever is left of the cache",
+                         objectives)
+      var qo = obj()
+      qo.put("questId", qid)
+      qo.put("giverId", bearerId)
+      qo.put("title", "Somebody used my name")
+      qo.put("factionId", personFaction(bi))
+      discard directive("quest.offer", done(qo).text, true, 60000)
+    note = "claim BELIEVED at " & cacheId(bestC) & ": score " & $score &
+           " vs threshold " & $threshold & " (bearer named " & $bearerNamed &
+           ", token " & $(tokenSpoken or tokenGiven) & ", rep " & $repPart &
+           ", role " & role & " " & $rolePart & ")"
+    result = true
+  else:
+    discard journal("claim.fail", personId, "player", done(jo).text)
+    setState(ei, "threatened", "the claim was not believed")
+    setPersonAttitude(pi, clampAtt(personAttitude(pi) - 10))
+    discard emitStance(personId, "hostile")
+    discard emitBark(personId, "That is not the word, and you are not him.")
+    note = "claim REFUSED at " & cacheId(bestC) & ": score " & $score &
+           " vs threshold " & $threshold & " (bearer named " & $bearerNamed &
+           ", token " & $(tokenSpoken or tokenGiven) & ", rep " & $repPart &
+           ", role " & role & " " & $rolePart & ")"
+
+proc materialiseCache(ci: int): int =
+  ## Turn a cache's item rows into real loot rows, once. Returns how many were
+  ## created. Idempotent by the FINISHED STATE (`lootOfCache` is empty), not by
+  ## a flag: a flag would survive a load that dropped the loot kind.
+  result = 0
+  if lootOfCache(cacheId(ci)).len > 0: return
+  var cx = 0.0
+  var cy = 0.0
+  var cz = 0.0
+  cachePos(ci, cx, cy, cz)
+  let tpls = cacheItemTpls(ci)
+  let counts = cacheItemCounts(ci)
+  var r = groundRng("materialise", cacheId(ci))
+  var k = 0
+  while k < tpls.len:
+    discard addLoot(cacheId(ci) & "-l" & $(k + 1), cacheId(ci), tpls[k],
+                    cacheMap(ci), (if k < counts.len: counts[k] else: 1),
+                    cx + float(nextInt(r, -2, 2)), cy,
+                    cz + float(nextInt(r, -2, 2)))
+    result = result + 1
+    k = k + 1
+
+proc sceneJson*(map: string; x, y, z, radius: float): JsonObject =
+  ## What must EXIST around a point right now, and the directives that build
+  ## it. Calling this MATERIALISES: a rumoured cache becomes intact and its
+  ## items become loot rows, because the player is standing there and the thing
+  ## people have been talking about has to be real now.
+  var rad = radius
+  if rad <= 0.0: rad = gNoticeM
+  var people = arr()
+  var groups = arr()
+  var seenGroups: seq[string] = @[]
+  for pi in peopleNear(map, x, y, z, rad):
+    var po = personJson(pi)
+    po.put("encounterState", encounterState(personId(pi)))
+    people.add po
+  var caches = arr()
+  var lootA = arr()
+  var made = 0
+  for ci in cachesNear(map, x, y, z, rad):
+    if cacheStatus(ci) == "rumoured": setCacheStatus(ci, "intact")
+    made = made + materialiseCache(ci)
+    caches.add cacheJson(ci)
+    let grp = cacheGuardGroup(ci)
+    var dup = false
+    for g in seenGroups:
+      if g == grp: dup = true
+    if grp.len > 0 and not dup:
+      seenGroups.add grp
+      var names = arr()
+      var count = 0
+      var gx = 0.0
+      var gy = 0.0
+      var gz = 0.0
+      for gi in peopleOfGroup(grp):
+        if not personAlive(gi): continue
+        names.add personName(gi)
+        personPos(gi, gx, gy, gz)
+        count = count + 1
+      if count > 0:
+        var go = obj()
+        go.put("groupId", grp)
+        go.put("factionId", cacheOwner(ci))
+        go.put("role", "guard")
+        go.put("count", count)
+        go.put("names", names)
+        go.put("map", cacheMap(ci))
+        go.put("x", gx)
+        go.put("y", gy)
+        go.put("z", gz)
+        go.put("reason", "guarding " & cacheName(ci))
+        groups.add go
+  var lootItems = arr()
+  var lootN2 = 0
+  for li in lootOnMap(map):
+    if lootStatus(li) != "placed": continue
+    var lx = 0.0
+    var ly = 0.0
+    var lz = 0.0
+    lootPos(li, lx, ly, lz)
+    let dx = lx - x
+    let dy = ly - y
+    let dz = lz - z
+    if dx*dx + dy*dy + dz*dz > rad*rad: continue
+    lootA.add lootJson(li)
+    var io = obj()
+    io.put("id", lootId(li))
+    io.put("tpl", lootTpl(li))
+    io.put("count", lootN(li))
+    io.put("x", lx)
+    io.put("y", ly)
+    io.put("z", lz)
+    io.put("cacheId", lootCache(li))
+    lootItems.add io
+    lootN2 = lootN2 + 1
+  var directives = arr()
+  if groups.len > 0:
+    var d1 = obj()
+    d1.put("kind", "group.spawn")
+    d1.put("groups", groups)
+    directives.add d1
+    discard directive("group.spawn", done(objOf("groups", groups)).text, true, 60000)
+  if lootN2 > 0:
+    var d2 = obj()
+    d2.put("kind", "loot.spawn")
+    d2.put("items", lootItems)
+    directives.add d2
+    discard directive("loot.spawn", done(objOf("items", lootItems)).text, true, 60000)
+  let sceneId = map & "@" & $int(x) & "," & $int(z) & "#" & $worldClockMs()
+  discard journal("scene.built", "", map,
+                  jsonOf2("scene", sceneId, "note",
+                          $people.len & " people, " & $caches.len & " caches, " &
+                          $lootN2 & " loot, " & $made & " newly materialised"))
+  result = obj()
+  result.put("ok", true)
+  result.put("sceneId", sceneId)
+  result.put("map", map)
+  result.put("radiusM", rad)
+  result.put("people", people)
+  result.put("caches", caches)
+  result.put("loot", lootA)
+  result.put("directives", directives)
+  result.put("materialised", made)
+
+proc observeLootTaken*(cacheId2, itemId, by: string; note: var string) =
+  ## The loop closes here: what the client says was taken flips the row, moves
+  ## the owning faction's standing, is REMEMBERED by whichever guards could see
+  ## it, and becomes a fact with `origin: outcome` -- which is the thing the
+  ## next conversation will bring up.
+  var cid = cacheId2
+  var took = 0
+  if itemId.len > 0:
+    let li = findLoot(itemId)
+    if li >= 0:
+      setLootStatus(li, "taken")
+      took = took + 1
+      if cid.len == 0: cid = lootCache(li)
+  if cid.len == 0:
+    note = "loot.taken named neither a cacheId nor a loot id we know ('" &
+           itemId & "') -- nothing was marked taken"
+    return
+  let ci = findCache(cid)
+  if ci < 0:
+    note = "loot.taken names cache '" & cid & "', which is not in this world"
+    return
+  for li in lootOfCache(cid):
+    if lootStatus(li) == "placed":
+      setLootStatus(li, "taken")
+      took = took + 1
+  setCacheStatus(ci, "looted")
+  var repNote = ""
+  let fi = findFaction(cacheOwner(ci))
+  if fi >= 0:
+    setFactionRep(fi, clampAtt(factionRep(fi) - 12))
+    repNote = factionName(fi) & " rep is now " & $factionRep(fi)
+  var witnesses = 0
+  var cx = 0.0
+  var cy = 0.0
+  var cz = 0.0
+  cachePos(ci, cx, cy, cz)
+  for wi in peopleNear(cacheMap(ci), cx, cy, cz, gNoticeM):
+    setPersonAttitude(wi, clampAtt(personAttitude(wi) - 8))
+    remember(wi, "Somebody emptied " & cacheName(ci) & " while I was standing there.")
+    witnesses = witnesses + 1
+  let fid = cid & "-hit"
+  addFactRef(fid, "outcome cache " & cid,
+             "Somebody hit " & cacheName(ci) & ". It is empty now.",
+             "cache", cid, "outcome")
+  for who in cacheKnownBy(ci):
+    let wi2 = findPerson(who)
+    if wi2 >= 0: addPersonKnows(wi2, fid)
+  discard journal("loot.taken", by, cid,
+                  jsonOf2("items", $took, "witnesses", $witnesses))
+  note = $took & " item row(s) taken from " & cacheName(ci) & " (" & cid &
+         "); status " & cacheStatus(ci) & "; " & $witnesses &
+         " witness(es) remember it; rumour '" & fid & "' created with origin " &
+         "outcome" & (if repNote.len > 0: "; " & repNote else: "")
 
 proc applyTags*(personId: string; tags: seq[string]; note: var string): int =
   ## Tag -> state / contract / directive. Returns directives emitted.
@@ -760,6 +1240,32 @@ proc applyTags*(personId: string; tags: seq[string]; note: var string): int =
       result = result + directive("hud.note",
         jsonOf2("text", val, "mode", "add"), false)
       notes.add "objective added"
+    of "PLANT":
+      var n = ""
+      let cid = applyPlant(personId, val, n)
+      if cid.len > 0:
+        var o = obj()
+        o.put("personId", personId)
+        o.put("cacheId", cid)
+        result = result + directive("world.plant", done(o).text, false)
+      notes.add n
+    of "REVEAL":
+      var n = ""
+      let before = latestSeq()
+      discard applyReveal(personId, val, n)
+      if latestSeq() > before: result = result + 1
+      notes.add n
+    of "EXPECT":
+      var n = ""
+      discard applyExpect(personId, val, n)
+      notes.add n
+    of "CLAIM_OK", "CLAIM_FAIL":
+      # The encounter machine's own verdict, never a speaker's. It is mapped
+      # (so the grammar check is honest) and it is REFUSED (so a reply cannot
+      # award itself a believability roll it did not win).
+      discard journal("claim.unknown", personId, name, "{}")
+      notes.add "[" & name & "] refused: only the believability roll in " &
+                "resolveClaim may write that verdict; nothing was changed"
     of "CLEAR":
       result = result + directive("hud.note",
         jsonOf2("text", "", "mode", "clear"), false)
@@ -1080,11 +1586,27 @@ proc observe*(kind, actorId, targetId, dataJson: string; note: var string): int 
     result = result + maybeAmbush(map, x, y, z, n2)
     if n2.len > 0: notes.add n2
 
+  of "loot.taken":
+    let cid = dataText(dataJson, "cacheId", "")
+    let iid = dataText(dataJson, "itemId", "")
+    var n = ""
+    let before = latestSeq()
+    observeLootTaken(cid, iid, dataText(dataJson, "by", "player"), n)
+    result = result + (latestSeq() - before)
+    notes.add n
+
+  of "scene.built":
+    notes.add "client acknowledged scene " & dataText(dataJson, "sceneId", "") &
+              "; the backend built it from world rows, so there is nothing to " &
+              "apply here beyond the record"
+    discard journal("scene.acked", "", dataText(dataJson, "sceneId", ""), "{}")
+
   of "player_gave":
     if pi < 0:
       note = "player_gave names no person we know ('" & who & "')"
       return 0
     let item = dataText(dataJson, "item", "")
+    if item.len > 0: gGaveItems.add item
     bump(pi, 10)
     remember(pi, "The player gave me " & item & ".")
     discard journal("player.gave", "player", who, jsonOf2("item", item, "to", who))
@@ -1127,6 +1649,19 @@ proc observe*(kind, actorId, targetId, dataJson: string; note: var string): int 
       elif gEncState[ei] == "hailed":
         setState(ei, "talking", "the conversation continued")
       notes.add "state " & gEncState[ei]
+      # Impersonation goes through the SAME classifier the reply tier uses, so
+      # "I am Vadim, Kostya sent me" cannot be a claim for the brain and small
+      # talk for the world.
+      let said = dataText(dataJson, "text", "")
+      if said.len > 0:
+        var conf = 0.0
+        let intent = classifyIntent(said, conf)
+        if intent == "claim":
+          var n = ""
+          let before = latestSeq()
+          discard resolveClaim(who, said, n)
+          result = result + (latestSeq() - before)
+          notes.add n
     else:
       notes.add "player_spoke with nobody named"
 
@@ -1159,7 +1694,8 @@ proc observe*(kind, actorId, targetId, dataJson: string; note: var string): int 
            "kinds: player_seen player_aimed_at player_fired " &
            "player_lowered_weapon player_spoke player_hit npc_died " &
            "player_died player_moved player_gave player_took " &
-           "player_extracted raid_started raid_ended tick"
+           "player_extracted raid_started raid_ended tick loot.taken " &
+           "scene.built"
     return 0
 
   if notes.len == 0: notes.add kind & " applied; nothing changed"

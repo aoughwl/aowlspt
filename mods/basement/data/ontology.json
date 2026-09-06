@@ -233,6 +233,27 @@
         "what's going on",
         "gossip"
       ]
+    },
+    {
+      "id": "claim",
+      "patterns": [
+        "i am",
+        "im",
+        "my name is",
+        "sent me",
+        "sent for",
+        "here for the",
+        "here for",
+        "the password is",
+        "the word is",
+        "password",
+        "the word",
+        "come for the",
+        "i am the one",
+        "they told me to collect",
+        "collecting for",
+        "on behalf of"
+      ]
     }
   ],
   "rows": [
@@ -928,6 +949,36 @@
         "RUMOUR: there is a list and the player is on it",
         "ATTITUDE: +2"
       ]
+    },
+    {
+      "intent": "claim",
+      "bucket": "hostile",
+      "text": "You are not who I was told to expect. Say that name again and say it slower.",
+      "tags": []
+    },
+    {
+      "intent": "claim",
+      "bucket": "wary",
+      "text": "Names are cheap out here. Who sent you, and what is the word?",
+      "tags": []
+    },
+    {
+      "intent": "claim",
+      "bucket": "neutral",
+      "text": "Then you will know the word, and you will say it before you take one more step.",
+      "tags": []
+    },
+    {
+      "intent": "claim",
+      "bucket": "warm",
+      "text": "If you say you are him, then you are him. But say the word anyway, so the others hear it.",
+      "tags": []
+    },
+    {
+      "intent": "claim",
+      "bucket": "loyal",
+      "text": "You are expected. Say the word for the record and it is yours.",
+      "tags": []
     }
   ],
   "fallback": [
