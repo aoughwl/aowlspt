@@ -124,3 +124,6 @@ docs/aowl-facts.db.backup
 # before writing it) cannot delete the bytes a deploy is about to copy --
 # measured 2026-09-04. Derived, per-checkout, never committed.
 .stage/
+
+# aowl.basement: the selfcheck writes TTS wavs and the brain line cache here
+mods/basement/data/cache/

@@ -673,6 +673,45 @@
    ]
   },
   {
+   "//": "`aowl.basement` is IDENTITY; the rest are FEATURE literals a rebuild from",
+   "//1": "a wrong base would drop: the routes, the raid-request event, the captivity",
+   "//2": "directive, the builtin-tier honesty note and the LLM cache marker.",
+   "name": "basement",
+   "src": "mods/basement/bin/basement.dll",
+   "dst": "mods/basement/basement.dll",
+   "seed": [
+    {
+     "src": "mods/basement/config.json",
+     "dst": "mods/basement/config.json",
+     "why": "enabled=false by default plus every engine path and the preset; without it the mod reads defaults and a missing file looks exactly like a disabled mod"
+    }
+   ],
+   "minBytes": 600000,
+   "markers": [
+    "aowl.basement",
+    "/aowlspt/basement/status",
+    "/aowlspt/basement/selfcheck",
+    "/aowlspt/basement/events",
+    "/aowlspt/basement/observe",
+    "basement.raid.request",
+    "player.captive",
+    "not a language model",
+    "cache_control"
+   ],
+   "data": [
+    {
+     "src": "mods/basement/data",
+     "dst": "mods/basement/data",
+     "exclude": [
+      "cache/**",
+      "*.md"
+     ],
+     "minFiles": 8,
+     "why": "presets, names, archetypes, ontology; without them world/new refuses and the brain has no rules"
+    }
+   ]
+  },
+  {
    "//": "`aowl.debug` is IDENTITY, kept for parity with `tarkov`; the route,",
    "//1": "the four settings-schema captions and the profiler's own report text",
    "//2": "are the feature checks. `THE FALSIFIER` is the self-test caption --",

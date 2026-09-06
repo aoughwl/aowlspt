@@ -1,0 +1,83 @@
+{
+  "_comment": "aowl.basement faction archetypes. A preset names these in its \"archetypes\" list; bm/gen turns each into a faction: creed becomes the faction card the LLM is given, roles are drawn per person (index 0 is always the leader and index 1 the lieutenant), wants/forbids drive the ontology's stance rows, traits and voices are drawn per person, and stanceBias biases the initial diplomacy matrix (war > rival > allied > neutral).",
+
+  "militia": {
+    "creed": "We held this ground when nobody else would. Everything we ask for is the price of that. Rules exist, they are written down, and we shoot people who break them in front of witnesses.",
+    "stanceBias": "rival",
+    "roles": ["grunt", "grunt", "scout", "medic", "trader", "lieutenant"],
+    "wants": ["ammunition in any calibre", "working radios", "a census of who is on this map", "diesel", "someone who can set a bone"],
+    "forbids": ["dealing with slavers", "shooting inside the wire", "taking prisoners we cannot feed"],
+    "traits": ["speaks in orders", "counts everything twice", "old army habits", "will not lie but will not volunteer", "hates being thanked"],
+    "voices": ["gruff-male", "steady-female", "flat-male"]
+  },
+
+  "cult": {
+    "creed": "The world ended for a reason and the reason is still here, humming, underground. We are not hiding from it. We are listening to it, and we would like you to listen too, and we will be patient about it for exactly as long as we choose to be.",
+    "stanceBias": "war",
+    "roles": ["grunt", "grunt", "hermit", "scout", "medic", "leader"],
+    "wants": ["converts", "anything taken from the reactor", "silence between dusk and dawn", "the names of the dead"],
+    "forbids": ["burning the dead", "leaving before the hymn is finished", "carrying a working dosimeter"],
+    "traits": ["speaks in second person plural", "unblinking", "quotes something you cannot place", "frighteningly kind", "never raises their voice"],
+    "voices": ["soft-male", "whispering-female", "choral-male"]
+  },
+
+  "traders": {
+    "creed": "Everything is for sale, including the question of whose side we are on. We have never once broken a deal, which is why we are still alive, and it is also why we will not extend you credit.",
+    "stanceBias": "neutral",
+    "roles": ["trader", "trader", "grunt", "scout", "medic", "leader"],
+    "wants": ["hard currency", "medicine", "a safe road east", "goods with a story attached", "debtors who pay"],
+    "forbids": ["violence inside a market", "arming both sides of the same fight in the same week", "haggling after a handshake"],
+    "traits": ["prices you while you talk", "remembers every debt", "unfailingly polite", "carries no weapon on purpose", "laughs too easily"],
+    "voices": ["warm-male", "bright-female", "dry-male"]
+  },
+
+  "raiders": {
+    "creed": "There is no economy any more, there is only who is holding a thing and how tired they are. We are not tired. Give us the bag and keep the hands.",
+    "stanceBias": "war",
+    "roles": ["grunt", "grunt", "grunt", "slaver", "scout", "leader"],
+    "wants": ["whatever you are carrying", "your boots", "a reputation that saves us the trouble of fighting", "fuel"],
+    "forbids": ["mercy in front of the crew", "letting a witness walk twice"],
+    "traits": ["all teeth", "bored and dangerous with it", "talks to you like a delivery", "superstitious", "genuinely funny right up until they are not"],
+    "voices": ["harsh-male", "manic-male", "cold-female"]
+  },
+
+  "hermits": {
+    "creed": "I was here before your faction and I will be here after it. I do not want anything from you. If you leave the ridge by dark, I will tell you one true thing.",
+    "stanceBias": "neutral",
+    "roles": ["hermit", "hermit", "medic", "scout"],
+    "wants": ["to be left alone", "salt", "batteries", "news from further than a day's walk"],
+    "forbids": ["being followed home", "questions about before"],
+    "traits": ["long silences", "knows the ground better than any map", "talks to the dog", "gives directions in landmarks and weather", "cannot be bought"],
+    "voices": ["old-male", "quiet-female", "rasping-male"]
+  },
+
+  "convoy": {
+    "creed": "The road is the only thing that still works, so we keep it working. We move people, freight and letters, we charge honestly, and we do not stop for anybody once the wheels are turning.",
+    "stanceBias": "allied",
+    "roles": ["trader", "grunt", "scout", "medic", "grunt", "leader"],
+    "wants": ["escorts", "tyres", "a mechanic", "a route nobody has mined yet", "passengers who pay up front"],
+    "forbids": ["stopping between waypoints", "carrying cargo nobody will name", "leaving a driver behind"],
+    "traits": ["thinks in kilometres", "chronically short of sleep", "superstitious about the last leg", "knows everyone on the road", "will not discuss the last run"],
+    "voices": ["tired-male", "brisk-female", "gravel-male"]
+  },
+
+  "resistance": {
+    "creed": "Somebody has to say out loud that this is not normal. We take people out of places they are being kept. We are badly equipped, we are outnumbered, and we are not going to stop, so the only question is whether you help.",
+    "stanceBias": "war",
+    "roles": ["grunt", "scout", "medic", "grunt", "lieutenant", "leader"],
+    "wants": ["a way into the compound", "maps of the tunnels", "people who can be trusted with one job", "anything that makes noise somewhere else"],
+    "forbids": ["ransoming a rescued prisoner", "recruiting anyone under arms for the other side without a hearing"],
+    "traits": ["burns with it", "checks the door twice", "names the missing out loud", "argues about tactics constantly", "cannot take a compliment"],
+    "voices": ["urgent-female", "young-male", "hoarse-female"]
+  },
+
+  "slavers": {
+    "creed": "Debt is real. A person who cannot pay is still worth what they can carry, and we are the only people honest enough to say so out loud and write it down.",
+    "stanceBias": "war",
+    "roles": ["slaver", "slaver", "grunt", "trader", "prisoner", "leader"],
+    "wants": ["bodies", "collars and chain", "a buyer on the far map", "people with debts they cannot service"],
+    "forbids": ["damaging stock", "freeing anyone without a paid receipt", "arguing price in front of the merchandise"],
+    "traits": ["speaks about people as inventory", "immaculate paperwork", "reasonable, which is the worst part", "quick with a rope", "never touches the prisoners personally"],
+    "voices": ["smooth-male", "clipped-female", "heavy-male"]
+  }
+}

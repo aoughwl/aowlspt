@@ -1,0 +1,976 @@
+{
+  "schema": "aowl.basement.ontology/1",
+  "note": "Intent x stance-bucket response table. This is DATA, not a model and not reasoning: a typed lookup with slot fills and a fixed tag set per row. The fallback rows are what the 'builtin' tier serves and they are marked notALanguageModel.",
+  "slots": [
+    "{name}",
+    "{faction}",
+    "{want}",
+    "{place}"
+  ],
+  "buckets": [
+    "hostile",
+    "wary",
+    "neutral",
+    "warm",
+    "loyal"
+  ],
+  "intents": [
+    {
+      "id": "greet",
+      "patterns": [
+        "hello",
+        "hi",
+        "hey",
+        "good morning",
+        "you there",
+        "hail",
+        "greetings",
+        "yo"
+      ]
+    },
+    {
+      "id": "farewell",
+      "patterns": [
+        "goodbye",
+        "bye",
+        "see you",
+        "i am leaving",
+        "im leaving",
+        "take care",
+        "later",
+        "so long"
+      ]
+    },
+    {
+      "id": "threaten",
+      "patterns": [
+        "kill you",
+        "shoot you",
+        "gun",
+        "drop it",
+        "hands up",
+        "or i",
+        "dont move",
+        "don't move",
+        "put it down",
+        "i will end you"
+      ]
+    },
+    {
+      "id": "plead",
+      "patterns": [
+        "please",
+        "dont shoot",
+        "don't shoot",
+        "mercy",
+        "spare me",
+        "let me go",
+        "i am begging",
+        "im begging",
+        "have mercy",
+        "help me please"
+      ]
+    },
+    {
+      "id": "offer_trade",
+      "patterns": [
+        "trade",
+        "sell",
+        "buy",
+        "barter",
+        "swap",
+        "i have",
+        "how much",
+        "deal for",
+        "exchange"
+      ]
+    },
+    {
+      "id": "accept",
+      "patterns": [
+        "yes",
+        "agreed",
+        "deal",
+        "ok",
+        "okay",
+        "alright",
+        "i accept",
+        "fine by me",
+        "sounds good"
+      ]
+    },
+    {
+      "id": "refuse",
+      "patterns": [
+        "no",
+        "never",
+        "not a chance",
+        "i refuse",
+        "forget it",
+        "no deal",
+        "not happening",
+        "pass"
+      ]
+    },
+    {
+      "id": "ask_help",
+      "patterns": [
+        "help me",
+        "can you help",
+        "i need help",
+        "need a hand",
+        "patch me",
+        "heal me",
+        "cover me",
+        "give me a hand"
+      ]
+    },
+    {
+      "id": "ask_quest",
+      "patterns": [
+        "work",
+        "job",
+        "anything for me",
+        "need anything",
+        "task",
+        "errand",
+        "contract",
+        "what do you want",
+        "got work"
+      ]
+    },
+    {
+      "id": "ask_directions",
+      "patterns": [
+        "where is",
+        "which way",
+        "how do i get",
+        "directions",
+        "where can i find",
+        "point me",
+        "where do i go",
+        "find the"
+      ]
+    },
+    {
+      "id": "insult",
+      "patterns": [
+        "idiot",
+        "coward",
+        "scum",
+        "shut up",
+        "you stink",
+        "fool",
+        "waste of air",
+        "pathetic",
+        "filth"
+      ]
+    },
+    {
+      "id": "surrender",
+      "patterns": [
+        "i surrender",
+        "i give up",
+        "dont hurt me",
+        "don't hurt me",
+        "take it",
+        "i yield",
+        "im unarmed",
+        "i am unarmed",
+        "standing down"
+      ]
+    },
+    {
+      "id": "demand",
+      "patterns": [
+        "give me",
+        "hand it over",
+        "i want",
+        "you owe me",
+        "pay up",
+        "open it",
+        "move aside",
+        "i am taking"
+      ]
+    },
+    {
+      "id": "smalltalk",
+      "patterns": [
+        "weather",
+        "how are you",
+        "cold out here",
+        "long night",
+        "quiet today",
+        "rough day",
+        "been here long",
+        "hows it going",
+        "how's it going"
+      ]
+    },
+    {
+      "id": "ask_identity",
+      "patterns": [
+        "who are you",
+        "your name",
+        "what are you",
+        "who do you run with",
+        "whose side",
+        "what faction",
+        "who sent you",
+        "identify yourself"
+      ]
+    },
+    {
+      "id": "ask_rumour",
+      "patterns": [
+        "heard anything",
+        "news",
+        "rumour",
+        "rumor",
+        "what happened",
+        "any word",
+        "whats going on",
+        "what's going on",
+        "gossip"
+      ]
+    }
+  ],
+  "rows": [
+    {
+      "intent": "greet",
+      "bucket": "hostile",
+      "text": "You keep walking. That is the whole of my greeting to you.",
+      "tags": [
+        "MOOD: -0.6",
+        "ATTITUDE: -2"
+      ]
+    },
+    {
+      "intent": "greet",
+      "bucket": "wary",
+      "text": "Far enough. Say what you came to say and keep your hands where the light is.",
+      "tags": [
+        "MOOD: -0.2"
+      ]
+    },
+    {
+      "intent": "greet",
+      "bucket": "neutral",
+      "text": "{name}. I run with {faction}. State your business and we both go on breathing.",
+      "tags": [
+        "MOOD: 0.0"
+      ]
+    },
+    {
+      "intent": "greet",
+      "bucket": "warm",
+      "text": "You again. Good. The road has been thin on faces worth seeing.",
+      "tags": [
+        "MOOD: 0.4",
+        "ATTITUDE: +2"
+      ]
+    },
+    {
+      "intent": "greet",
+      "bucket": "loyal",
+      "text": "Come in out of the open, friend. {place} is yours as much as mine.",
+      "tags": [
+        "MOOD: 0.7",
+        "ATTITUDE: +3"
+      ]
+    },
+    {
+      "intent": "farewell",
+      "bucket": "hostile",
+      "text": "Go. If I see you on this ground again I will not be talking.",
+      "tags": [
+        "MOOD: -0.5",
+        "LEAVE"
+      ]
+    },
+    {
+      "intent": "farewell",
+      "bucket": "wary",
+      "text": "Then go. Walk out the way you came in and do not circle back.",
+      "tags": [
+        "LEAVE"
+      ]
+    },
+    {
+      "intent": "farewell",
+      "bucket": "neutral",
+      "text": "Walk safe. The ground between here and there does not care about either of us.",
+      "tags": [
+        "LEAVE"
+      ]
+    },
+    {
+      "intent": "farewell",
+      "bucket": "warm",
+      "text": "Keep your head low. {place} will still be standing when you come back.",
+      "tags": [
+        "MOOD: 0.3",
+        "LEAVE"
+      ]
+    },
+    {
+      "intent": "farewell",
+      "bucket": "loyal",
+      "text": "Go on then. If it turns bad out there, say my name on the radio and I will come.",
+      "tags": [
+        "MOOD: 0.5",
+        "REMEMBER: parted on good terms; promised to answer a call"
+      ]
+    },
+    {
+      "intent": "threaten",
+      "bucket": "hostile",
+      "text": "Wrong day and wrong man. Try it.",
+      "tags": [
+        "ATTACK"
+      ]
+    },
+    {
+      "intent": "threaten",
+      "bucket": "wary",
+      "text": "Point that somewhere else. Now. You get one breath to decide.",
+      "tags": [
+        "MOOD: -0.7",
+        "ATTITUDE: -10",
+        "DEMAND: lower the weapon | I open fire"
+      ]
+    },
+    {
+      "intent": "threaten",
+      "bucket": "neutral",
+      "text": "You are two seconds from a fight you did not plan for. Lower it.",
+      "tags": [
+        "ATTITUDE: -8",
+        "DEMAND: lower the weapon | this ends badly"
+      ]
+    },
+    {
+      "intent": "threaten",
+      "bucket": "warm",
+      "text": "After what we have been through, you point that at me? Put it down and I will forget it.",
+      "tags": [
+        "MOOD: -0.5",
+        "ATTITUDE: -12",
+        "DEMAND: put it down | I forget every kindness"
+      ]
+    },
+    {
+      "intent": "threaten",
+      "bucket": "loyal",
+      "text": "I would have died for you. Lower it and we never had this conversation.",
+      "tags": [
+        "MOOD: -0.8",
+        "ATTITUDE: -20",
+        "DEMAND: lower it | I walk and never look back"
+      ]
+    },
+    {
+      "intent": "plead",
+      "bucket": "hostile",
+      "text": "Begging is cheap out here. {faction} does not take payment in it.",
+      "tags": [
+        "MOOD: -0.4",
+        "REFUSE"
+      ]
+    },
+    {
+      "intent": "plead",
+      "bucket": "wary",
+      "text": "Everyone out here has a reason. Give me something better than your voice.",
+      "tags": [
+        "DEMAND: something worth the risk | you get nothing"
+      ]
+    },
+    {
+      "intent": "plead",
+      "bucket": "neutral",
+      "text": "Stand up. I am not the one who put you down, and I am not carrying you either.",
+      "tags": [
+        "MOOD: 0.0"
+      ]
+    },
+    {
+      "intent": "plead",
+      "bucket": "warm",
+      "text": "Easy. Breathe. You are not dying on my ground today.",
+      "tags": [
+        "MOOD: 0.5",
+        "ATTITUDE: +4",
+        "GIVE: field dressing"
+      ]
+    },
+    {
+      "intent": "plead",
+      "bucket": "loyal",
+      "text": "You do not have to ask me. Get behind me and stay there.",
+      "tags": [
+        "MOOD: 0.6",
+        "STAY",
+        "FOLLOW_ME"
+      ]
+    },
+    {
+      "intent": "offer_trade",
+      "bucket": "hostile",
+      "text": "I do not trade with you. I take from you, or I leave you be. Today I am leaving you be.",
+      "tags": [
+        "REFUSE",
+        "MOOD: -0.5"
+      ]
+    },
+    {
+      "intent": "offer_trade",
+      "bucket": "wary",
+      "text": "Show me first. Hands slow. If it is junk we are finished talking.",
+      "tags": [
+        "OFFER: show the goods first, price after"
+      ]
+    },
+    {
+      "intent": "offer_trade",
+      "bucket": "neutral",
+      "text": "Everything has a price and mine is high because the road is bad. What have you got.",
+      "tags": [
+        "OFFER: fair weight for fair weight, no credit"
+      ]
+    },
+    {
+      "intent": "offer_trade",
+      "bucket": "warm",
+      "text": "For you, close to cost. {faction} still needs {want}, if you happen to be carrying it.",
+      "tags": [
+        "OFFER: near cost, and a bonus for {want}"
+      ]
+    },
+    {
+      "intent": "offer_trade",
+      "bucket": "loyal",
+      "text": "Take what you need from the crate. Square it with me when you can, or do not.",
+      "tags": [
+        "GIVE: supplies from the crate",
+        "ATTITUDE: +2"
+      ]
+    },
+    {
+      "intent": "accept",
+      "bucket": "hostile",
+      "text": "Agreeing with me does not make you welcome. It makes you convenient.",
+      "tags": [
+        "MOOD: -0.3"
+      ]
+    },
+    {
+      "intent": "accept",
+      "bucket": "wary",
+      "text": "Good. Then it is said out loud, and I hold you to it.",
+      "tags": [
+        "ACCEPT"
+      ]
+    },
+    {
+      "intent": "accept",
+      "bucket": "neutral",
+      "text": "Done. Break it and I will tell everyone who trades on this map.",
+      "tags": [
+        "ACCEPT",
+        "REMEMBER: struck an agreement; terms are on the record"
+      ]
+    },
+    {
+      "intent": "accept",
+      "bucket": "warm",
+      "text": "Then we are agreed. I will hold up my half before you hold up yours.",
+      "tags": [
+        "ACCEPT",
+        "ATTITUDE: +3"
+      ]
+    },
+    {
+      "intent": "accept",
+      "bucket": "loyal",
+      "text": "I never doubted it. It is done.",
+      "tags": [
+        "ACCEPT",
+        "ATTITUDE: +4",
+        "MOOD: 0.6"
+      ]
+    },
+    {
+      "intent": "refuse",
+      "bucket": "hostile",
+      "text": "Then we have nothing left to say, and I have somewhere to be standing without you.",
+      "tags": [
+        "MOOD: -0.5",
+        "LEAVE"
+      ]
+    },
+    {
+      "intent": "refuse",
+      "bucket": "wary",
+      "text": "Your choice. Do not come back when it gets cold and ask again nicely.",
+      "tags": [
+        "REFUSE",
+        "ATTITUDE: -3"
+      ]
+    },
+    {
+      "intent": "refuse",
+      "bucket": "neutral",
+      "text": "No is an answer. I have heard worse ones today.",
+      "tags": [
+        "REFUSE"
+      ]
+    },
+    {
+      "intent": "refuse",
+      "bucket": "warm",
+      "text": "That stings, but it is yours to say. The offer keeps a few days.",
+      "tags": [
+        "REFUSE",
+        "MOOD: -0.2"
+      ]
+    },
+    {
+      "intent": "refuse",
+      "bucket": "loyal",
+      "text": "You will have your reasons. I will not ask for them.",
+      "tags": [
+        "REFUSE",
+        "MOOD: -0.1"
+      ]
+    },
+    {
+      "intent": "ask_help",
+      "bucket": "hostile",
+      "text": "Help. From me. You have a strange idea of where you are standing.",
+      "tags": [
+        "REFUSE",
+        "MOOD: -0.6"
+      ]
+    },
+    {
+      "intent": "ask_help",
+      "bucket": "wary",
+      "text": "What is in it for {faction}? Answer that and I will consider the rest.",
+      "tags": [
+        "DEMAND: something for {faction} | I do nothing"
+      ]
+    },
+    {
+      "intent": "ask_help",
+      "bucket": "neutral",
+      "text": "I can do one thing, not everything. Say which one thing.",
+      "tags": [
+        "OFFER: one favour, named plainly"
+      ]
+    },
+    {
+      "intent": "ask_help",
+      "bucket": "warm",
+      "text": "Come on then. Stay on my left and do not shoot my back.",
+      "tags": [
+        "FOLLOW_ME",
+        "ATTITUDE: +3"
+      ]
+    },
+    {
+      "intent": "ask_help",
+      "bucket": "loyal",
+      "text": "Already moving. Lead and I am behind you.",
+      "tags": [
+        "FOLLOW_YOU",
+        "MOOD: 0.6"
+      ]
+    },
+    {
+      "intent": "ask_quest",
+      "bucket": "hostile",
+      "text": "The only work you will get from me is digging your own hole.",
+      "tags": [
+        "REFUSE",
+        "MOOD: -0.6"
+      ]
+    },
+    {
+      "intent": "ask_quest",
+      "bucket": "wary",
+      "text": "There is work. It is the kind nobody here wants, which is why you are hearing about it.",
+      "tags": [
+        "QUEST: The Bad Errand | Walk to {place} and bring back what is left in the cache. Nobody who went came back. | ammunition and a name that opens doors"
+      ]
+    },
+    {
+      "intent": "ask_quest",
+      "bucket": "neutral",
+      "text": "{faction} wants {want}. Bring it and you will be paid; do not and nothing happens to you.",
+      "tags": [
+        "QUEST: Fetch for {faction} | Find {want} and carry it to {place}. | payment in kind, and one favour owed"
+      ]
+    },
+    {
+      "intent": "ask_quest",
+      "bucket": "warm",
+      "text": "There is something, and I would only trust it to you. It pays.",
+      "tags": [
+        "QUEST: A Trusted Hand | Take word to {place} without being seen, and come straight back. | a share of the take"
+      ]
+    },
+    {
+      "intent": "ask_quest",
+      "bucket": "loyal",
+      "text": "Yes. And this one matters to me personally, so I will owe you either way.",
+      "tags": [
+        "QUEST: Personal Debt | Find who burned the cache at {place} and bring me their name. | whatever I have, and my word"
+      ]
+    },
+    {
+      "intent": "ask_directions",
+      "bucket": "hostile",
+      "text": "I am not your map. Get lost properly.",
+      "tags": [
+        "REFUSE",
+        "MOOD: -0.5"
+      ]
+    },
+    {
+      "intent": "ask_directions",
+      "bucket": "wary",
+      "text": "Past the treeline and left. That is all you are getting and it is more than you earned.",
+      "tags": [
+        "MOOD: -0.1"
+      ]
+    },
+    {
+      "intent": "ask_directions",
+      "bucket": "neutral",
+      "text": "{place} is that way, past the burnt ground. Move at dusk, not now.",
+      "tags": [
+        "OBJ: reach {place}"
+      ]
+    },
+    {
+      "intent": "ask_directions",
+      "bucket": "warm",
+      "text": "Follow the fence line to {place}, then cut inside. The open road is watched.",
+      "tags": [
+        "OBJ: reach {place} by the fence line",
+        "ATTITUDE: +2"
+      ]
+    },
+    {
+      "intent": "ask_directions",
+      "bucket": "loyal",
+      "text": "I will walk you as far as the ridge. After that you are on your own and you will be fine.",
+      "tags": [
+        "OBJ: reach {place}",
+        "FOLLOW_YOU"
+      ]
+    },
+    {
+      "intent": "insult",
+      "bucket": "hostile",
+      "text": "You have said your last clever thing.",
+      "tags": [
+        "ATTACK"
+      ]
+    },
+    {
+      "intent": "insult",
+      "bucket": "wary",
+      "text": "Keep talking. It makes the decision easier for me.",
+      "tags": [
+        "ATTITUDE: -8",
+        "MOOD: -0.6"
+      ]
+    },
+    {
+      "intent": "insult",
+      "bucket": "neutral",
+      "text": "Mouth like that gets people shot out here, and not usually by me.",
+      "tags": [
+        "ATTITUDE: -5",
+        "MOOD: -0.4"
+      ]
+    },
+    {
+      "intent": "insult",
+      "bucket": "warm",
+      "text": "That one landed. I thought better of you.",
+      "tags": [
+        "ATTITUDE: -6",
+        "MOOD: -0.5"
+      ]
+    },
+    {
+      "intent": "insult",
+      "bucket": "loyal",
+      "text": "From you? That is worse than a bullet. Say it again and I am gone.",
+      "tags": [
+        "ATTITUDE: -10",
+        "MOOD: -0.7"
+      ]
+    },
+    {
+      "intent": "surrender",
+      "bucket": "hostile",
+      "text": "On your knees. Hands behind your head. You belong to {faction} now.",
+      "tags": [
+        "CAPTURE",
+        "DEMAND: kneel and disarm | I shoot"
+      ]
+    },
+    {
+      "intent": "surrender",
+      "bucket": "wary",
+      "text": "Weapons on the ground, three steps back. Then we talk about what you are worth.",
+      "tags": [
+        "DEMAND: weapons down, three steps back | no talking at all",
+        "TAKE: primary weapon"
+      ]
+    },
+    {
+      "intent": "surrender",
+      "bucket": "neutral",
+      "text": "Keep them up. Walk to me slow. Nobody has to die in the next minute.",
+      "tags": [
+        "TAKE: primary weapon",
+        "STAND_DOWN"
+      ]
+    },
+    {
+      "intent": "surrender",
+      "bucket": "warm",
+      "text": "Put your hands down. I was never going to shoot you and you know it.",
+      "tags": [
+        "STAND_DOWN",
+        "MOOD: 0.3"
+      ]
+    },
+    {
+      "intent": "surrender",
+      "bucket": "loyal",
+      "text": "Stop that. Stand up straight. You do not surrender to me.",
+      "tags": [
+        "STAND_DOWN",
+        "MOOD: 0.5"
+      ]
+    },
+    {
+      "intent": "demand",
+      "bucket": "hostile",
+      "text": "You want it, come and take it off me. Bring more friends than that.",
+      "tags": [
+        "REFUSE",
+        "ATTITUDE: -10"
+      ]
+    },
+    {
+      "intent": "demand",
+      "bucket": "wary",
+      "text": "Demanding. Interesting choice, standing where you are standing.",
+      "tags": [
+        "REFUSE",
+        "ATTITUDE: -6"
+      ]
+    },
+    {
+      "intent": "demand",
+      "bucket": "neutral",
+      "text": "Ask, do not demand. Ask and there might be something in it.",
+      "tags": [
+        "REFUSE",
+        "ATTITUDE: -3"
+      ]
+    },
+    {
+      "intent": "demand",
+      "bucket": "warm",
+      "text": "You could have just asked. Here. Do not make a habit of the tone.",
+      "tags": [
+        "GIVE: what was asked for",
+        "ATTITUDE: -1"
+      ]
+    },
+    {
+      "intent": "demand",
+      "bucket": "loyal",
+      "text": "Take it. You never have to ask me twice for anything.",
+      "tags": [
+        "GIVE: what was asked for",
+        "MOOD: 0.4"
+      ]
+    },
+    {
+      "intent": "smalltalk",
+      "bucket": "hostile",
+      "text": "We are not doing this. Talk to someone who cares whether you are cold.",
+      "tags": [
+        "MOOD: -0.4"
+      ]
+    },
+    {
+      "intent": "smalltalk",
+      "bucket": "wary",
+      "text": "It is weather. It kills people slower than the other thing does.",
+      "tags": [
+        "MOOD: -0.1"
+      ]
+    },
+    {
+      "intent": "smalltalk",
+      "bucket": "neutral",
+      "text": "Long nights, thin food, and {faction} still wants {want}. Same as yesterday.",
+      "tags": [
+        "MOOD: 0.0"
+      ]
+    },
+    {
+      "intent": "smalltalk",
+      "bucket": "warm",
+      "text": "Better now that there is someone to say it to. Sit a minute, the fire is holding.",
+      "tags": [
+        "MOOD: 0.5",
+        "STAY"
+      ]
+    },
+    {
+      "intent": "smalltalk",
+      "bucket": "loyal",
+      "text": "Good day, bad day, they all pass. You being here makes it the first kind.",
+      "tags": [
+        "MOOD: 0.7",
+        "ATTITUDE: +2"
+      ]
+    },
+    {
+      "intent": "ask_identity",
+      "bucket": "hostile",
+      "text": "I am the reason you should have taken the other road.",
+      "tags": [
+        "MOOD: -0.6"
+      ]
+    },
+    {
+      "intent": "ask_identity",
+      "bucket": "wary",
+      "text": "Names are currency and you have not paid. {faction}. That is enough for you.",
+      "tags": [
+        "MOOD: -0.2"
+      ]
+    },
+    {
+      "intent": "ask_identity",
+      "bucket": "neutral",
+      "text": "{name}. {faction}, out of {place}. That is the whole of it.",
+      "tags": [
+        "REMEMBER: told them my name and my faction"
+      ]
+    },
+    {
+      "intent": "ask_identity",
+      "bucket": "warm",
+      "text": "{name}. You knew that. Say it like you mean it next time.",
+      "tags": [
+        "MOOD: 0.4"
+      ]
+    },
+    {
+      "intent": "ask_identity",
+      "bucket": "loyal",
+      "text": "{name}, same as I was the day you dragged me out of the water.",
+      "tags": [
+        "MOOD: 0.7",
+        "REMEMBER: they asked; the old story still stands between us"
+      ]
+    },
+    {
+      "intent": "ask_rumour",
+      "bucket": "hostile",
+      "text": "The only news you need is that I am watching you leave.",
+      "tags": [
+        "REFUSE"
+      ]
+    },
+    {
+      "intent": "ask_rumour",
+      "bucket": "wary",
+      "text": "Word travels. It does not travel to strangers for free.",
+      "tags": [
+        "OFFER: news for goods"
+      ]
+    },
+    {
+      "intent": "ask_rumour",
+      "bucket": "neutral",
+      "text": "They say a convoy went quiet near {place} and nobody has gone to look.",
+      "tags": [
+        "RUMOUR: a convoy went quiet near {place}; nobody has gone to look"
+      ]
+    },
+    {
+      "intent": "ask_rumour",
+      "bucket": "warm",
+      "text": "Keep this close: {faction} is short on {want} and someone is selling it cheap. That is never innocent.",
+      "tags": [
+        "RUMOUR: {faction} is short on {want} and someone is selling it cheap"
+      ]
+    },
+    {
+      "intent": "ask_rumour",
+      "bucket": "loyal",
+      "text": "Straight to you, then. There is a list, and your name is on it. Watch the road into {place}.",
+      "tags": [
+        "RUMOUR: there is a list and the player is on it",
+        "ATTITUDE: +2"
+      ]
+    }
+  ],
+  "fallback": [
+    {
+      "bucket": "hostile",
+      "text": "I have nothing for you and less patience. Move.",
+      "tags": [
+        "MOOD: -0.5"
+      ],
+      "notALanguageModel": true,
+      "note": "builtin tier: a template row, not a language model"
+    },
+    {
+      "bucket": "wary",
+      "text": "Say that again, plainer. I do not guess at what people mean out here.",
+      "tags": [],
+      "notALanguageModel": true,
+      "note": "builtin tier: a template row, not a language model"
+    },
+    {
+      "bucket": "neutral",
+      "text": "I did not follow that. Try it in fewer words.",
+      "tags": [],
+      "notALanguageModel": true,
+      "note": "builtin tier: a template row, not a language model"
+    },
+    {
+      "bucket": "warm",
+      "text": "You have lost me. Start again, slower.",
+      "tags": [
+        "MOOD: 0.2"
+      ],
+      "notALanguageModel": true,
+      "note": "builtin tier: a template row, not a language model"
+    },
+    {
+      "bucket": "loyal",
+      "text": "I am listening, but that made no sense. Say it again.",
+      "tags": [
+        "MOOD: 0.3"
+      ],
+      "notALanguageModel": true,
+      "note": "builtin tier: a template row, not a language model"
+    }
+  ]
+}

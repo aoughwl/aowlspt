@@ -635,6 +635,48 @@
       ]
     },
     {
+      "id": "aowl.basement",
+      "name": "Escape From My Basement",
+      "author": "savannt",
+      "version": "0.1.0",
+      "description": "The always-in-raid RPG backend: a seeded, persistent world of factions and people generated from a world prompt (five shipped presets), a three-tier BRAIN (persisted line cache -> ontology rules -> LLM with a byte-stable cached prefix) that speaks through per-sentence cached TTS, progressive STT sessions, an encounter state machine (hail, deal, threat, robbery, captivity and escort, escape, ambush) and a cursor-based directive stream that any client (aowlspt host bridge or an SPT 4.1.5 BepInEx plugin) consumes. Engine-agnostic by construction: the client reports facts and executes directives; everything else lives here. Default OFF (spawns subprocesses). No LLM key or local model on this machine, so the builtin tier answers and says so. Nothing client-side exists yet; see mods/basement/CLIENT-CONTRACT.md.",
+      "pipeline": ">=0.1.0",
+      "sides": [
+        "server",
+        "sim"
+      ],
+      "source": {
+        "kind": "intree",
+        "path": "mods/basement",
+        "url": null
+      },
+      "artifact": {
+        "dir": "basement",
+        "library": "basement.dll"
+      },
+      "upstream": {
+        "name": "EscapeFromMyBasement",
+        "author": "savannt",
+        "url": null
+      },
+      "license": "see repository",
+      "download": null,
+      "requires": [],
+      "conflicts": [],
+      "provides": [
+        "aowl.capability.livingworld"
+      ],
+      "loadAfter": [
+        "aowl.tarkov"
+      ],
+      "tags": [
+        "server",
+        "rpg",
+        "ai",
+        "voice"
+      ]
+    },
+    {
       "id": "aowl.autoraid",
       "name": "AutoRaid",
       "author": "aowlspt",
