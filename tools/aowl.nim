@@ -355,7 +355,15 @@ proc symTab(e: Env): bool =
   let outNim = joinPath(e.repo, "abi\\aowlspt_symtab.nim")
   var gameasm = getEnv("AOWLSPT_GAMEASM", "")
   if gameasm.len == 0:
-    gameasm = "D:\\Games\\Tarkov\\GameAssembly.dll"
+    # THE INSTALL THE HOST RUNS AGAINST, not the retail copy. MEASURED
+    # 2026-09-05 16:04: the retail D:/Games/Tarkov updated itself to 1.1.0.46911
+    # while D:/Aowlspt (what the client boots) stayed 46777; every gate below then
+    # read a different binary from the one the committed header describes and
+    # refused a build whose sources had not changed. tools/gamepaths.py is the
+    # same rule for the Python tools; AOWLSPT_GAMEASM overrides both.
+    gameasm = "D:\\Aowlspt\\GameAssembly.dll"
+    if not fileExists(gameasm):
+      gameasm = "D:\\Games\\Tarkov\\GameAssembly.dll"
   let meta = joinPath(e.repo, ".cache\\global-metadata.dec.dat")
 
   if fileExists(gameasm) and fileExists(meta):
@@ -711,7 +719,15 @@ proc nameIndex(e: Env, binDir: string): bool =
   let idx = joinPath(binDir, "aowlspt-names.idx")
   var gameasm = getEnv("AOWLSPT_GAMEASM", "")
   if gameasm.len == 0:
-    gameasm = "D:\\Games\\Tarkov\\GameAssembly.dll"
+    # THE INSTALL THE HOST RUNS AGAINST, not the retail copy. MEASURED
+    # 2026-09-05 16:04: the retail D:/Games/Tarkov updated itself to 1.1.0.46911
+    # while D:/Aowlspt (what the client boots) stayed 46777; every gate below then
+    # read a different binary from the one the committed header describes and
+    # refused a build whose sources had not changed. tools/gamepaths.py is the
+    # same rule for the Python tools; AOWLSPT_GAMEASM overrides both.
+    gameasm = "D:\\Aowlspt\\GameAssembly.dll"
+    if not fileExists(gameasm):
+      gameasm = "D:\\Games\\Tarkov\\GameAssembly.dll"
   let meta = joinPath(e.repo, ".cache\\global-metadata.dec.dat")
 
   if fileExists(gameasm) and fileExists(meta):
