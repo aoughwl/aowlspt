@@ -2659,6 +2659,29 @@ proc chk21Hearing() =
         " -- the yelled and spoken texts must DIFFER, and they " &
         (if t2 != t3: "do" else: "DO NOT"))
 
+# --- offscreen begin ---
+proc livingPersonId(n: int): string =
+  ## The n-th LIVING person. `personId(0)` was fine while nothing could die
+  ## between the checks; the offscreen engine can now kill someone during
+  ## CHECK 3`s six-hour advance, and a check that asks a corpse to speak fails
+  ## for a reason that is not the code under test.
+  result = ""
+  var seen = 0
+  var i = 0
+  while i < personCount():
+    if personAlive(i):
+      if seen == n: return personId(i)
+      seen = seen + 1
+    i = i + 1
+
+proc livingPeople(): int =
+  result = 0
+  var i = 0
+  while i < personCount():
+    if personAlive(i): result = result + 1
+    i = i + 1
+# --- offscreen end ---
+
 proc chk22OneReply() =
   ## ONE utterance, three people in earshot: exactly ONE of them replies.
   ##
@@ -2668,13 +2691,14 @@ proc chk22OneReply() =
   ## turned into a bark. The NEGATIVE CONTROL is the second half: with
   ## `bystanderReactChance` at 0 the same utterance must produce ZERO
   ## reactions, so "3 people were in range" cannot be passing vacuously.
-  if personCount() < 3:
+  if livingPeople() < 3:
     check(22, "only the addressee replies", "INCONCLUSIVE",
-          "fewer than three people in the world")
+          "fewer than three LIVING people in the world (" & $livingPeople() &
+          " of " & $personCount() & ")")
     return
-  let a = personId(0)
-  let b = personId(1)
-  let c = personId(2)
+  let a = livingPersonId(0)
+  let b = livingPersonId(1)
+  let c = livingPersonId(2)
   resetEncounters()
   # The three of them have to EXIST as encounter rows and have to have a
   # reported distance, and `player_seen` is the one fact that does both. It is
@@ -2738,10 +2762,11 @@ proc chk23Triggers() =
   ## PROACTIVE SPEECH, and the two negatives that make it falsifiable:
   ## a second `player_seen` must be SILENT (first_sight is once per raid), and
   ## a 3 m drift must NOT read as an approach.
-  if personCount() == 0:
-    check(23, "proactive triggers", "INCONCLUSIVE", "no people in the world")
+  if livingPeople() == 0:
+    check(23, "proactive triggers", "INCONCLUSIVE",
+          "nobody in the world is alive (" & $personCount() & " rows)")
     return
-  let pid = personId(0)
+  let pid = livingPersonId(0)
   var note = ""
   var person = ""
   var mode = ""

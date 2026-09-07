@@ -37,6 +37,15 @@ var gBarkBucket: seq[string] = @[]
 var gBarkText: seq[string] = @[]         ## unit-separator-joined
 var gBarkYell: seq[string] = @[]         ## unit-separator-joined
 
+# The OFFSCREEN narrative table (`offscreen` in ontology.json): one row per
+# event kind (fight, trade, meet, loot, hunt), each with four-plus one-line
+# templates over the slots {a} {b} {place} {extra}. bm/offscreen resolves an
+# encounter with no client and no model; this is where the sentence it writes
+# into the journal comes from, so the set of things the world can SAY about
+# itself stays in data.
+var gOffEvent: seq[string] = @[]
+var gOffText: seq[string] = @[]          ## unit-separator-joined
+
 var gFbBucket: seq[string] = @[]
 var gFbText: seq[string] = @[]
 var gFbTags: seq[string] = @[]
@@ -46,6 +55,7 @@ var gLoadNote: string = "not loaded"
 
 proc ontologyIntentCount*(): int = gIntentId.len
 proc ontologyRowCount*(): int = gRowIntent.len
+proc ontologyOffscreenRowCount*(): int = gOffEvent.len
 proc ontologyFallbackCount*(): int = gFbBucket.len
 proc ontologyBarkRowCount*(): int = gBarkTrigger.len
 proc ontologyLoaded*(): bool = gLoaded
@@ -83,6 +93,7 @@ proc ontologyLoad*(text: string; note: var string): bool =
   gRowYell = @[]
   gFbBucket = @[]; gFbText = @[]; gFbTags = @[]
   gBarkTrigger = @[]; gBarkBucket = @[]; gBarkText = @[]; gBarkYell = @[]
+  gOffEvent = @[]; gOffText = @[]
   gLoaded = false
   if text.len == 0:
     note = "ontology.json is missing or empty -- the ontology tier will never fire"
@@ -127,6 +138,14 @@ proc ontologyLoad*(text: string; note: var string): bool =
     gBarkText.add joinSep(texts)
     gBarkYell.add joinSep(textsOf(jr.child(bk, "yell")))
 
+  let offItems = jr.each(jr.field(text, "offscreen"))
+  for ov in offItems:
+    let ev = jr.asText(jr.child(ov, "event"), "")
+    let texts = textsOf(jr.child(ov, "texts"))
+    if ev.len == 0 or texts.len == 0: continue
+    gOffEvent.add ev
+    gOffText.add joinSep(texts)
+
   let fbItems = jr.each(jr.field(text, "fallback"))
   for f in fbItems:
     let b = jr.asText(jr.child(f, "bucket"), "")
@@ -162,7 +181,7 @@ proc ontologyLoad*(text: string; note: var string): bool =
          $variantN & " lines, " & $thinRows & " row(s) with fewer than 4, " &
          $gFbBucket.len & " fallback rows, " & $gBarkTrigger.len &
          " bark rows (" & $barkLines & " bark lines, " & $thinBarks &
-         " with fewer than 4)"
+         " with fewer than 4), " & $gOffEvent.len & " offscreen event row(s)"
   gLoadNote = note
   result = true
 
@@ -241,7 +260,11 @@ proc fillSlots(tpl: string; c: PersonCard): string =
   if fac.len == 0: fac = "nobody in particular"
   var nm = c.name
   if nm.len == 0: nm = "nobody you need to know"
-  var s = tpl.replace("{name}", nm)
+  # The objective clause goes in verbatim, lower case and all: the row texts
+  # are written to read correctly with a lower-case clause dropped into them,
+  # which is cheaper and less breakable than case-fixing a sentence here.
+  var s = tpl.replace("{objective}", c.objective)
+  s = s.replace("{name}", nm)
   s = s.replace("{faction}", fac)
   s = s.replace("{want}", want)
   s = s.replace("{place}", place)
@@ -291,6 +314,10 @@ proc ontologyReply*(intent: string; c: PersonCard; s: Situation;
   reply = ""
   if not gLoaded: return false
   let bucket = bucketFor(c, s)
+  # A person with NO objective must not be served the row that describes one:
+  # "{objective}" would render empty and the line would read as an answer.
+  # Falling through to the next tier is the honest outcome.
+  if intent == "ask_activity" and c.objective.len == 0: return false
   let idx = findRow(intent, bucket)
   if idx < 0: return false
   reply = fillSlots(pickVariant(gRowText[idx], c.id, utterance), c)
@@ -385,3 +412,43 @@ proc ontologyBark*(trigger, bucket, personId, salt: string;
   let n = pool.len
   let h = fnv1a64(trigger & "\x1f" & personId & "\x1f" & salt)
   result = pool[int(h mod uint64(n))]
+
+# ---------------------------------------------------------------------------
+# Offscreen narratives
+# ---------------------------------------------------------------------------
+
+proc ontologyOffscreen*(event, salt, a, b, place, extra: string;
+                        note: var string): string =
+  ## One line describing something that happened where nobody was watching.
+  ## Deterministic per (event, salt): re-running the same six hours from the
+  ## same saved state must produce byte-identical journals, so a random pick
+  ## here would break the determinism check -- which is exactly what that check
+  ## is for.
+  ##
+  ## Returns "" WITH a note when the table has no row for the event. The caller
+  ## must not substitute a sentence of its own without saying so: a narrative
+  ## this code invented would not be in the record of what the world can say.
+  note = ""
+  if not gLoaded:
+    note = "the ontology is not loaded (" & gLoadNote & ")"
+    return ""
+  var idx = -1
+  var i = 0
+  while i < gOffEvent.len:
+    if gOffEvent[i] == event: idx = i
+    i = i + 1
+  if idx < 0:
+    note = "ontology.json has no offscreen row for event '" & event & "' (" &
+           $gOffEvent.len & " offscreen rows loaded)"
+    return ""
+  let pool = splitSep(gOffText[idx])
+  if pool.len == 0:
+    note = "the offscreen row for '" & event & "' is empty"
+    return ""
+  let h = fnv1a64("offscreen" & event & "" & salt)
+  var line = pool[int(h mod uint64(pool.len))]
+  line = line.replace("{a}", a)
+  line = line.replace("{b}", b)
+  line = line.replace("{place}", place)
+  line = line.replace("{extra}", extra)
+  result = line

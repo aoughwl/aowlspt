@@ -29,6 +29,7 @@ import aowlspt
 import util
 import rng
 import world
+import offscreen
 
 var gMaxCatchUpMs: int64 = 21600000'i64      ## 6 h
 var gMoveEveryMs: int64 = 3600000'i64        ## 1 h
@@ -257,15 +258,21 @@ proc simAdvance*(ms: int64; note: var string): int =
   var healed = 0
   var spread = 0
   var outcomes = 0
+  var offsteps = 0
 
   var step = 0
   while step < steps:
     advanceClock(gMoveEveryMs)
     let stepIdx = int(worldClockMs() div gMoveEveryMs)
 
-    # people
+    # people. A FROZEN map is skipped before anything reads or writes a person
+    # on it: while the player is in a raid there, the client is the truth for
+    # that map and a backend nudge would fight it.
     var pi = 0
     while pi < personCount():
+      if offscreenFrozen(personMap(pi)):
+        pi = pi + 1
+        continue
       if personAlive(pi):
         if isMobile(personActivity(pi)):
           if (stepIdx + pi) mod cadenceOf(pi) == 0:
@@ -345,6 +352,13 @@ proc simAdvance*(ms: int64; note: var string): int =
     outcomes = outcomes + oc
     changes = changes + oc
 
+    # The offscreen world: groups plan, march, meet and fight on every map the
+    # player is NOT standing in. It runs INSIDE this loop so both clocks are
+    # the same clock.
+    let oc2 = offscreenStep(stepIdx)
+    offsteps = offsteps + oc2
+    changes = changes + oc2
+
     scheduleAmbush(stepIdx)
     step = step + 1
 
@@ -354,7 +368,10 @@ proc simAdvance*(ms: int64; note: var string): int =
   note = "advanced " & $ms & " ms in " & $steps & " step(s): " & $moved &
          " move(s), " & $stanceChanges & " stance change(s), " & $expired &
          " contract(s) expired, " & $healed & " heal(s), " & $spread &
-         " rumour(s) spread, " & $outcomes & " loot outcome(s); " & $changes &
+         " rumour(s) spread, " & $outcomes & " loot outcome(s), " & $offsteps &
+         " offscreen change(s) [frozen map: " &
+         (if offscreenFrozenMap().len > 0: offscreenFrozenMap() else: "none") &
+         "]; " & $changes &
          " journaled change(s); clock now " & $worldClockMs() &
          " (day " & $worldDay() & ")"
   result = changes

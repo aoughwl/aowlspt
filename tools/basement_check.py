@@ -268,6 +268,155 @@ def pick_person(people_doc, role):
 
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# the OFFSCREEN world: objectives, regions, and the map the client owns
+# ---------------------------------------------------------------------------
+
+def _groups_of(regions_doc):
+    out = []
+    for r in regions_doc.get("regions", []):
+        for g in r.get("groups", []):
+            out.append((r["map"], r["state"], g))
+    return out
+
+
+def _signature(regions_doc, mapname):
+    """place + objective target per group on one map, in document order.
+
+    The frozen assertion is made over THIS -- the finished state the route
+    reports -- and not over a counter, so it can actually fail.
+    """
+    sig = []
+    for r in regions_doc.get("regions", []):
+        if r["map"] != mapname:
+            continue
+        for g in r.get("groups", []):
+            o = g.get("objective") or {}
+            sig.append("%s/%s/%s/%s" % (g["groupId"], g.get("place"),
+                                        o.get("kind"), o.get("target")))
+    return sig
+
+
+def check_offscreen(rep, store):
+    """Objectives exist, the emulator runs, and a raid FREEZES its map.
+
+    Two simulator runs against ONE store: the first generates and reads the
+    regions (which is where the map name comes from -- hard-coding one would
+    make this pass or fail for the preset rather than for the code), the
+    second reloads that saved world, tells the mod a raid started on that map,
+    advances two hours and reads the regions again.
+    """
+    docs, raw, err = run_sim(store, [
+        (BASE + "/world/new", '{"preset":"warlords","seed":11}'),
+        (BASE + "/world/regions", ""),
+    ])
+    if err or not docs or docs[0] is None or docs[1] is None:
+        rep.add(INCONCLUSIVE, "offscreen: world/regions answers",
+                err or "the simulator did not answer world/new + world/regions")
+        return
+    pre = docs[1]
+    groups = _groups_of(pre)
+    if not groups:
+        rep.add(INCONCLUSIVE, "offscreen: every group has an objective",
+                "the generated world has no groups on any map")
+        return
+
+    without = [g["groupId"] for _, _, g in groups if not g.get("objective")]
+    taken = {}
+    collisions = []
+    for _, _, g in groups:
+        o = g.get("objective") or {}
+        key = (g.get("factionId"), o.get("targetKind"), o.get("target"))
+        if key in taken:
+            collisions.append("%s and %s -> %s" % (taken[key], g["groupId"],
+                                                   o.get("target")))
+        taken[key] = g["groupId"]
+    rep.add(PASS if (not without and not collisions) else FAIL,
+            "offscreen: every group has an objective and no two of one faction share a target",
+            "%d group(s) across %d map(s); without an objective: %s; "
+            "same-faction target collisions: %s"
+            % (len(groups), len(pre.get("regions", [])),
+               without or "none", collisions or "none"))
+
+    # the map with the most groups is the one the player will be raiding
+    counts = {}
+    for m, _, _ in groups:
+        counts[m] = counts.get(m, 0) + 1
+    ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    frozen_map = ordered[0][0]
+    if len(ordered) < 2:
+        rep.add(INCONCLUSIVE, "offscreen: a raid FREEZES its map",
+                "groups exist on only one map (%s), so freezing it leaves "
+                "nothing to compare against" % frozen_map)
+        return
+    other_map = ordered[1][0]
+
+    docs2, raw2, err2 = run_sim(store, [
+        (BASE + "/observe", '{"kind":"raid_started","map":"%s"}' % frozen_map),
+        (BASE + "/world/advance", '{"ms":7200000}'),
+        (BASE + "/world/regions", ""),
+    ])
+    if err2 or not docs2 or docs2[2] is None:
+        rep.add(INCONCLUSIVE, "offscreen: a raid FREEZES its map",
+                err2 or "the second run did not answer world/regions")
+        return
+    post = docs2[2]
+    state = dict((r["map"], r["state"]) for r in post.get("regions", []))
+    frozen_same = _signature(pre, frozen_map) == _signature(post, frozen_map)
+    other_moved = _signature(pre, other_map) != _signature(post, other_map)
+    rep.add(PASS if (state.get(frozen_map) == "frozen" and frozen_same
+                     and other_moved) else FAIL,
+            "offscreen: with the player raiding %s it is frozen and %s keeps running"
+            % (frozen_map, other_map),
+            "state: %s=%s %s=%s; %s unchanged over 2 h: %s; %s changed: %s "
+            "(frozenMap on the route: %r)"
+            % (frozen_map, state.get(frozen_map), other_map,
+               state.get(other_map), frozen_map, frozen_same, other_map,
+               other_moved, post.get("frozenMap")))
+
+    narrated = [r for r in post.get("regions", [])
+                if (r.get("lastResolution") or {}).get("narrative")]
+    rep.add(PASS if narrated else INCONCLUSIVE,
+            "offscreen: something resolved where nobody was watching, with a narrative",
+            ("%d region(s) report a last resolution; e.g. %s: %s"
+             % (len(narrated), narrated[0]["map"],
+                narrated[0]["lastResolution"]["narrative"]))
+            if narrated else
+            "no region resolved anything in 2 h -- possible, and not a "
+            "failure of the code; CHECK 24 in the mod's own selfcheck runs 12 h")
+
+    # a person carries the objective their group holds, on the person route
+    pid = None
+    for _, _, g in groups:
+        if g.get("objective"):
+            break
+    docs3, raw3, err3 = run_sim(store, [(BASE + "/world/people", "")])
+    if err3 or not docs3 or docs3[0] is None:
+        rep.add(INCONCLUSIVE, "offscreen: /world/person carries the objective",
+                err3 or "world/people did not answer")
+        return
+    people = docs3[0].get("people", [])
+    if not people:
+        rep.add(INCONCLUSIVE, "offscreen: /world/person carries the objective",
+                "world/people listed nobody")
+        return
+    pid = people[0]["id"]
+    docs4, raw4, err4 = run_sim(store, [(BASE + "/world/person/" + pid, "")])
+    if err4 or not docs4 or docs4[0] is None:
+        rep.add(INCONCLUSIVE, "offscreen: /world/person carries the objective",
+                err4 or "the person route did not answer")
+        return
+    doc = docs4[0]
+    obj = doc.get("objective")
+    rep.add(PASS if (obj and obj.get("kind") and obj.get("sentence")) else
+            (INCONCLUSIVE if obj is None else FAIL),
+            "offscreen: /world/person/<id> carries the objective and its sentence",
+            "%s: objective=%s; objectiveJournal rows=%d -- a null objective is "
+            "INCONCLUSIVE (that person may be in no group), an objective with "
+            "no sentence is a FAIL"
+            % (pid, obj, len(doc.get("objectiveJournal", []))))
+
+
 # 1. the mod's own selfcheck
 # ---------------------------------------------------------------------------
 
@@ -1782,6 +1931,8 @@ def main():
         check_one_reply(rep, store)
         print("")
         check_grounding(rep, store)
+        print("")
+        check_offscreen(rep, store)
         print("")
         check_dialogue(rep, store)
         print("")

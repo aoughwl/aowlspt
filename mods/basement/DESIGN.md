@@ -484,3 +484,69 @@ expected bearer + token → guards `stand_down` + `npc.give` directive; the
 same claim with the wrong token → `threatened`. 11. a person's prompt
 `Known facts:` never names an id absent from the world (assert over every
 person after generation).
+
+## 12. THE OFFSCREEN WORLD (`bm/offscreen.nim`) — added 2026-09-07 (user)
+
+> "make the mod do what it was fully intended with all the bots having their own
+> full objectives, they interact with each other even if you are not there — the
+> idea should be all of this happens in our backend so we can pretend or emulate
+> regions that are not directly loaded."
+
+**Objectives.** A GROUP (derived from `person.group`, never stored — a stored
+roster can disagree with the people it claims) holds exactly one active
+`Objective`: `kind` (patrol | guard | raid | trade | hunt | loot | escort |
+rest | scout), `targetKind`/`target` (place | cache | person), `priority`,
+`startedMs`/`untilMs`, `status`, and the planner's own reason in `note`. It is
+a persisted world kind (`aowl.basement.objectives/1`); each person carries their
+role inside it (`objRole`: leader | cover | carrier), which is an OPTIONAL field
+on `people` and deliberately not a schema bump, so an older save still loads
+whole. The planner is a ladder — a looted cache makes its owner hunt, dead
+members plus a war stance make a raid, then live contracts, then quests, then
+the faction's own `wants`, then somebody else's cache, then guard, then patrol,
+then rest — and **no two groups of one faction may hold the identical target**,
+asked of the objective table rather than of a flag.
+
+**Resolution.** `offscreenStep` runs inside `simAdvance`'s loop (one clock, not
+two): objectives expire, groups march toward their target at a speed per
+activity, arrival resolves the objective, and two groups of different factions
+within 60 m resolve an ENCOUNTER by STANCE — war fights, rival stands off (or
+fights, 35 %), allied trades, neutral meets. A fight is decided by strength ×
+numbers × condition with the rng as a rider, never as the verdict: 15 % of the
+losing side die, 35 % are wounded, 12 % are taken captive, caches change owner,
+bounties and quests naming the dead close, and the loser breaks off. A per-pair
+**disengage window of 6 h** exists because without it the same two groups
+re-fought every hour — MEASURED: 107 resolutions in 12 h, which depopulated the
+world and broke two unrelated selfchecks by killing the people they addressed.
+
+Every resolution journals `offscreen.fight` / `.trade` / `.meet` / `.loot` /
+`.hunt` with a one-line narrative from the `offscreen` table in
+`data/ontology.json` (a TABLE — a missing row is reported as missing, never
+replaced by a sentence the code invented), and seeds exactly ONE fact with
+`origin: "offscreen"`; `bm/sim.spreadRumours` carries it outward from there, so
+there is one spreading rate, not two.
+
+**Regions.** The map the player is raiding is FROZEN on `raid_started` and
+thawed on `raid_ended` / `player_extracted`: the client is the truth for it and
+both `bm/sim`'s person loop and this engine skip it BEFORE reading anything.
+Every other map keeps running. `GET /aowlspt/basement/world/regions` reports
+per map: state (frozen | emulated), the groups, each group's objective, and the
+last thing that resolved there.
+
+**Client-facing.** `world/scene` now carries every group on the map with its
+objective, each person's `objective` (kind, target, role, sentence), corpses as
+`loot.spawn` rows tagged with the dead person's `inventoryNote`, and one
+`npc.goto` per bot toward the objective's target so a materialised group WALKS.
+`/world/person/<id>` carries the same objective plus the `objective.*` journal
+rows for their group. The ontology gained the `ask_activity` intent and a
+`{objective}` slot, and the row is REFUSED for a person who has no objective
+rather than served with an empty slot.
+
+**Checks (CHECK 24-26).** (a) every group has an objective, none of one faction
+collide, and the same seed twice produces a byte-identical objectives document;
+(b) 12 h produces a resolution with a narrative and an `origin: offscreen`
+rumour, with advance(0) as the negative control; (c) 6 h replayed from the same
+generated state is a byte-identical journal; (d) with the player on one map,
+that map's position signature is unchanged over 2 h while another map's changes;
+(e) `world/regions` answers per map; (f) the scene carries a group objective and
+an `npc.goto`; (g) asked "what are you doing" a person answers with their own
+objective clause, and a person WITHOUT one is refused (the control).

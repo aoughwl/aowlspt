@@ -1,11 +1,12 @@
 {
   "schema": "aowl.basement.ontology/1",
-  "note": "Intent x stance-bucket response table. This is DATA, not a model and not reasoning: a typed lookup with slot fills and a fixed tag set per row. The fallback rows are what the 'builtin' tier serves and they are marked notALanguageModel. Every row carries `alts`: the reply is picked from text+alts by a hash of (personId, what was said), so one person is consistent and ten people are not a chorus. The `unknown` rows are what a person says when the classifier had nothing -- in character, in their own stance bucket, never a generic apology.",
+  "note": "Intent x stance-bucket response table. This is DATA, not a model and not reasoning: a typed lookup with slot fills and a fixed tag set per row. The fallback rows are what the 'builtin' tier serves and they are marked notALanguageModel. Every row carries `alts`: the reply is picked from text+alts by a hash of (personId, what was said), so one person is consistent and ten people are not a chorus. The `unknown` rows are what a person says when the classifier had nothing -- in character, in their own stance bucket, never a generic apology. The `offscreen` table is the same idea for events NOBODY witnessed: bm/offscreen resolves a fight, a trade or a meeting between two groups on an unloaded map and writes one line from here into the journal and into a rumour fact. Slots: {a} {b} {place} {extra}. No model is involved, and a missing row is reported as a missing row rather than replaced by a sentence the code made up.",
   "slots": [
     "{name}",
     "{faction}",
     "{want}",
-    "{place}"
+    "{place}",
+    "{objective}"
   ],
   "buckets": [
     "hostile",
@@ -253,6 +254,22 @@
         "they told me to collect",
         "collecting for",
         "on behalf of"
+      ]
+    },
+    {
+      "id": "ask_activity",
+      "patterns": [
+        "what are you doing",
+        "what are you up to",
+        "what is your job",
+        "whats the job",
+        "what is the job",
+        "why are you here",
+        "where are you going",
+        "what brings you here",
+        "what are you working on",
+        "what is your business",
+        "busy"
       ]
     }
   ],
@@ -1587,6 +1604,81 @@
         "I did not catch that, and it matters that I do.",
         "Again, friend. Properly this time."
       ]
+    },
+    {
+      "intent": "ask_activity",
+      "bucket": "hostile",
+      "text": "Working. Which is more than you are doing standing there. {objective}, and you are in the way.",
+      "tags": [],
+      "alts": [
+        "My business is my own. {objective}. Move.",
+        "You want the log book too? {objective}. Now go.",
+        "{objective}. That is all you get, and it was more than you earned."
+      ],
+      "yell": [
+        "{objective}! NOW WALK!",
+        "MY BUSINESS, NOT YOURS! MOVE!"
+      ]
+    },
+    {
+      "intent": "ask_activity",
+      "bucket": "wary",
+      "text": "{objective}. That is the honest answer, and it is the last free one.",
+      "tags": [],
+      "alts": [
+        "Work. {objective}, if you must know.",
+        "{objective}. Keep your hands where I can see them and we are fine.",
+        "We are on a clock. {objective}."
+      ],
+      "yell": [
+        "{objective}! KEEP BACK!",
+        "WE ARE WORKING! {objective}!"
+      ]
+    },
+    {
+      "intent": "ask_activity",
+      "bucket": "neutral",
+      "text": "{objective}. Nothing worth writing home about.",
+      "tags": [],
+      "alts": [
+        "{objective}. Same as yesterday, same as tomorrow.",
+        "Us? {objective}. {faction} does not pay us to sit.",
+        "{objective}, and then food, if there is any."
+      ],
+      "yell": [
+        "{objective}!",
+        "WORKING! {objective}!"
+      ]
+    },
+    {
+      "intent": "ask_activity",
+      "bucket": "warm",
+      "text": "{objective} -- come along if your legs are good.",
+      "tags": [],
+      "alts": [
+        "{objective}. You could carry something, you look strong enough.",
+        "{objective}, and I would rather do it with company.",
+        "{objective}. Stick with us and you eat with us."
+      ],
+      "yell": [
+        "{objective}! COME ON!",
+        "WITH US! {objective}!"
+      ]
+    },
+    {
+      "intent": "ask_activity",
+      "bucket": "loyal",
+      "text": "{objective}. You knew that. You are the one who set us on it.",
+      "tags": [],
+      "alts": [
+        "{objective} -- and it goes better with you here.",
+        "{objective}. Say the word and we go somewhere else instead.",
+        "{objective}, for {faction}, and for you."
+      ],
+      "yell": [
+        "{objective}! ON YOUR WORD!",
+        "{objective}! WITH YOU!"
+      ]
     }
   ],
   "fallback": [
@@ -2262,6 +2354,54 @@
         "WHAT HE SAID!",
         "TOLD YOU!",
         "HEAR HEAR!"
+      ]
+    }
+  ],
+  "offscreen": [
+    {
+      "event": "fight",
+      "texts": [
+        "{a} caught {b} at {place}. It was short, and {b} left {extra} behind.",
+        "Shooting at {place} before first light -- {a} walked away from it, {b} did not all walk anywhere. {extra}.",
+        "{b} were dug in at {place}. {a} went through them anyway. {extra}.",
+        "There was a firefight at {place}. {a} hold it now; {b} counted {extra}.",
+        "{a} and {b} met at {place} and settled it the loud way. {extra}."
+      ]
+    },
+    {
+      "event": "trade",
+      "texts": [
+        "{a} and {b} met at {place} and did business instead of shooting. Everyone went home heavier.",
+        "Crates changed hands at {place} between {a} and {b}, and nobody drew.",
+        "{a} paid {b} what was owed at {place}. The truce holds another week.",
+        "A trade at {place}: {a} took what {b} had spare, and left them something for it."
+      ]
+    },
+    {
+      "event": "meet",
+      "texts": [
+        "{a} and {b} passed each other at {place}. Rifles down, eyes up, nobody spoke first.",
+        "A standoff at {place} -- {a} on one side, {b} on the other, and a lot of nothing between them.",
+        "{a} watched {b} cross {place} and let them.",
+        "{a} and {b} shared {place} for an hour and neither would say who left first."
+      ]
+    },
+    {
+      "event": "loot",
+      "texts": [
+        "{a} emptied {b}. Whatever was in it is on someone's back now.",
+        "{b} is bare. {a} got there first and did not hurry.",
+        "{a} lifted {b} clean -- no shots, no witnesses, no {b} either.",
+        "Someone from {a} walked out of {b} carrying it all."
+      ]
+    },
+    {
+      "event": "hunt",
+      "texts": [
+        "{a} found {b} out past {place}. {b} is not coming back.",
+        "{a} had a name and a grudge. {b} had neither, by the end, at {place}.",
+        "They ran {b} down near {place}. {a} did not bring them back alive.",
+        "{b} stopped running at {place}. {a} made sure of it."
       ]
     }
   ]

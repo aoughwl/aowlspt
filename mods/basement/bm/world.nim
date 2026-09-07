@@ -46,6 +46,7 @@ const
   SchemaCaches    = "aowl.basement.caches/1"
   SchemaLoot      = "aowl.basement.loot/1"
   SchemaJournal   = "aowl.basement.journal/1"
+  SchemaObjectives = "aowl.basement.objectives/1"
   JournalChunk    = 500
   MemoryBound     = 48
 
@@ -111,6 +112,11 @@ var gMemP: seq[int] = @[]
 var gMemText: seq[string] = @[]
 var gKnowP: seq[int] = @[]
 var gKnowText: seq[string] = @[]
+var gPObjRole: seq[string] = @[]    ## this person's role INSIDE their group's
+                                    ## objective: leader | cover | carrier | "".
+                                    ## Deliberately NOT a schema bump: the loader
+                                    ## defaults it to "", so a world saved before
+                                    ## objectives existed still loads whole.
 
 # places
 var gPlId: seq[string] = @[]
@@ -202,6 +208,23 @@ var gJTarget: seq[string] = @[]
 var gJData: seq[string] = @[]
 var gJNext: int = 1
 
+# objectives. An objective belongs to a GROUP (ownerKind "group") or to one
+# person (ownerKind "person"), points at one target entity, and has exactly
+# one status. It is a first-class persisted kind and not a field on the group,
+# because a group is DERIVED from `person.group` (see bm/offscreen) and a row
+# hanging off a derived thing cannot survive a load.
+var gObId: seq[string] = @[]
+var gObOwnerKind: seq[string] = @[]
+var gObOwner: seq[string] = @[]
+var gObKind: seq[string] = @[]
+var gObTargetKind: seq[string] = @[]
+var gObTarget: seq[string] = @[]
+var gObPriority: seq[int] = @[]
+var gObStarted: seq[int64] = @[]
+var gObUntil: seq[int64] = @[]
+var gObStatus: seq[string] = @[]
+var gObNote: seq[string] = @[]
+
 # ---------------------------------------------------------------------------
 # meta
 # ---------------------------------------------------------------------------
@@ -261,6 +284,10 @@ proc resetWorld*() =
   gChKnowC = @[]; gChKnowP = @[]
   gLtId = @[]; gLtCache = @[]; gLtTpl = @[]; gLtMap = @[]; gLtCount = @[]
   gLtX = @[]; gLtY = @[]; gLtZ = @[]; gLtStatus = @[]
+  gPObjRole = @[]
+  gObId = @[]; gObOwnerKind = @[]; gObOwner = @[]; gObKind = @[]
+  gObTargetKind = @[]; gObTarget = @[]; gObPriority = @[]
+  gObStarted = @[]; gObUntil = @[]; gObStatus = @[]; gObNote = @[]
   gJSeq = @[]; gJAt = @[]; gJKind = @[]; gJActor = @[]; gJTarget = @[]
   gJData = @[]; gJNext = 1
 
@@ -410,6 +437,7 @@ proc addPerson*(id, name, factionId, role, voice, map, placeId: string;
   gPEscort.add 0
   gPInv.add ""
   gPLastSeen.add 0'i64
+  gPObjRole.add ""
   let idx = gPId.len - 1
   for t in traits:
     if t.len > 0:
@@ -580,6 +608,13 @@ proc addPersonKnows*(i: int; factId: string) =
     k = k + 1
   gKnowP.add i
   gKnowText.add factId
+
+proc personObjRole*(i: int): string =
+  if i < 0 or i >= gPObjRole.len: return ""
+  result = gPObjRole[i]
+
+proc setPersonObjRole*(i: int; s: string) =
+  if i >= 0 and i < gPObjRole.len: gPObjRole[i] = s
 
 proc personLastSeenMs*(i: int): int64 =
   if i < 0 or i >= gPLastSeen.len: return 0'i64
@@ -996,6 +1031,9 @@ proc cacheMap*(i: int): string =
 proc cacheOwner*(i: int): string =
   if i < 0 or i >= gChOwner.len: return ""
   result = gChOwner[i]
+proc setCacheOwner*(i: int; factionId: string) =
+  if i >= 0 and i < gChOwner.len: gChOwner[i] = factionId
+
 proc cacheGuardGroup*(i: int): string =
   if i < 0 or i >= gChGuard.len: return ""
   result = gChGuard[i]
@@ -1288,6 +1326,139 @@ proc renderKnown*(personIdx: int; limit: int): string =
                "not in the world and were left out)\n"
 
 # ---------------------------------------------------------------------------
+# objectives
+#
+# Two rules, both so that a check CAN fail:
+#
+# * `activeObjectiveOf` answers over the FINISHED STATE (a row whose status is
+#   "active"), never over a flag a planner set. An objective that was abandoned
+#   without being marked stays visible as a row with its own status.
+# * `objectiveTaken` is what enforces "no two groups of one faction chase the
+#   identical target": it asks the TABLE, so a planner that forgets to record
+#   its choice cannot satisfy it by accident.
+# ---------------------------------------------------------------------------
+
+proc objectiveCount*(): int = gObId.len
+
+proc findObjective*(id: string): int =
+  result = -1
+  var i = 0
+  while i < gObId.len:
+    if gObId[i] == id: return i
+    i = i + 1
+
+proc addObjective*(id, ownerKind, ownerId, kind, targetKind, targetId: string;
+                   priority: int; startedMs, untilMs: int64;
+                   note: string): int =
+  let seen = findObjective(id)
+  if seen >= 0: return seen
+  gObId.add id
+  gObOwnerKind.add ownerKind
+  gObOwner.add ownerId
+  gObKind.add kind
+  gObTargetKind.add targetKind
+  gObTarget.add targetId
+  gObPriority.add priority
+  gObStarted.add startedMs
+  gObUntil.add untilMs
+  gObStatus.add "active"
+  gObNote.add note
+  result = gObId.len - 1
+
+proc objectiveId*(i: int): string =
+  if i < 0 or i >= gObId.len: return ""
+  result = gObId[i]
+
+proc objectiveOwnerKind*(i: int): string =
+  if i < 0 or i >= gObOwnerKind.len: return ""
+  result = gObOwnerKind[i]
+
+proc objectiveOwner*(i: int): string =
+  if i < 0 or i >= gObOwner.len: return ""
+  result = gObOwner[i]
+
+proc objectiveKind*(i: int): string =
+  if i < 0 or i >= gObKind.len: return ""
+  result = gObKind[i]
+
+proc objectiveTargetKind*(i: int): string =
+  if i < 0 or i >= gObTargetKind.len: return ""
+  result = gObTargetKind[i]
+
+proc objectiveTarget*(i: int): string =
+  if i < 0 or i >= gObTarget.len: return ""
+  result = gObTarget[i]
+
+proc objectivePriority*(i: int): int =
+  if i < 0 or i >= gObPriority.len: return 0
+  result = gObPriority[i]
+
+proc objectiveStartedMs*(i: int): int64 =
+  if i < 0 or i >= gObStarted.len: return 0'i64
+  result = gObStarted[i]
+
+proc objectiveUntilMs*(i: int): int64 =
+  if i < 0 or i >= gObUntil.len: return 0'i64
+  result = gObUntil[i]
+
+proc setObjectiveUntilMs*(i: int; v: int64) =
+  if i >= 0 and i < gObUntil.len: gObUntil[i] = v
+
+proc objectiveStatus*(i: int): string =
+  if i < 0 or i >= gObStatus.len: return ""
+  result = gObStatus[i]
+
+proc setObjectiveStatus*(i: int; s: string) =
+  if i >= 0 and i < gObStatus.len: gObStatus[i] = s
+
+proc objectiveNote*(i: int): string =
+  if i < 0 or i >= gObNote.len: return ""
+  result = gObNote[i]
+
+proc setObjectiveNote*(i: int; s: string) =
+  if i >= 0 and i < gObNote.len: gObNote[i] = s
+
+proc activeObjectiveOf*(ownerId: string): int =
+  ## The highest-priority ACTIVE objective of one owner, or -1. Ties break on
+  ## row order, which is creation order, which is deterministic.
+  result = -1
+  var best = -1
+  var i = 0
+  while i < gObId.len:
+    if gObOwner[i] == ownerId and gObStatus[i] == "active":
+      if result < 0 or gObPriority[i] > best:
+        result = i
+        best = gObPriority[i]
+    i = i + 1
+
+proc objectivesOf*(ownerId: string): seq[int] =
+  result = @[]
+  var i = 0
+  while i < gObId.len:
+    if gObOwner[i] == ownerId: result.add i
+    i = i + 1
+
+proc objectiveTaken*(targetKind, targetId, ownerPrefix: string): bool =
+  ## Is some ACTIVE objective whose owner id starts with `ownerPrefix` already
+  ## pointed at this target? A group id carries its faction as its prefix
+  ## (`<faction>.<group>`); an empty prefix asks about the whole world.
+  result = false
+  var i = 0
+  while i < gObId.len:
+    if gObStatus[i] == "active" and gObTargetKind[i] == targetKind and
+       gObTarget[i] == targetId:
+      if ownerPrefix.len == 0 or gObOwner[i].startsWith(ownerPrefix):
+        return true
+    i = i + 1
+
+proc activeObjectiveCount*(): int =
+  result = 0
+  var i = 0
+  while i < gObStatus.len:
+    if gObStatus[i] == "active": result = result + 1
+    i = i + 1
+
+# ---------------------------------------------------------------------------
 # player
 # ---------------------------------------------------------------------------
 
@@ -1388,6 +1559,7 @@ proc personJson*(i: int): JsonObject =
   o.put("escorting", gPEscort[i] == 1)
   o.put("inventoryNote", gPInv[i])
   o.put("lastSeenMs", int(gPLastSeen[i]))
+  o.put("objRole", personObjRole(i))
   o.put("traits", strArr(personTraits(i)))
   o.put("memory", strArr(memoryOf(i, MemoryBound).split('\n')))
   o.put("knows", strArr(personKnows(i)))
@@ -1484,6 +1656,21 @@ proc lootJson*(i: int): JsonObject =
   o.put("status", gLtStatus[i])
   result = o
 
+proc objectiveJson*(i: int): JsonObject =
+  var o = obj()
+  o.put("id", gObId[i])
+  o.put("ownerKind", gObOwnerKind[i])
+  o.put("owner", gObOwner[i])
+  o.put("kind", gObKind[i])
+  o.put("targetKind", gObTargetKind[i])
+  o.put("target", gObTarget[i])
+  o.put("priority", gObPriority[i])
+  o.put("startedMs", int(gObStarted[i]))
+  o.put("untilMs", int(gObUntil[i]))
+  o.put("status", gObStatus[i])
+  o.put("note", gObNote[i])
+  result = o
+
 proc metaJson*(): JsonObject =
   var o = obj()
   o.put("schema", SchemaMeta)
@@ -1563,6 +1750,11 @@ proc kindJsonText*(kind: string): string =
     while i < gLtId.len:
       items.add lootJson(i)
       i = i + 1
+  elif kind == "objectives":
+    schema = SchemaObjectives
+    while i < gObId.len:
+      items.add objectiveJson(i)
+      i = i + 1
   elif kind == "journal":
     schema = SchemaJournal
     while i < gJSeq.len:
@@ -1585,6 +1777,7 @@ proc worldJson*(): JsonObject =
   o.put("facts", sv.raw(kindJsonText("facts")))
   o.put("caches", sv.raw(kindJsonText("caches")))
   o.put("loot", sv.raw(kindJsonText("loot")))
+  o.put("objectives", sv.raw(kindJsonText("objectives")))
   o.put("journalCount", gJSeq.len)
   result = o
 
@@ -1616,7 +1809,7 @@ proc clearKind(kind: string) =
     gPActivity = @[]; gPAlive = @[]; gPHp = @[]; gPMood = @[]; gPAtt = @[]
     gPGroup = @[]; gPEscort = @[]; gPInv = @[]; gPLastSeen = @[]
     gTraitP = @[]; gTraitText = @[]; gMemP = @[]; gMemText = @[]
-    gKnowP = @[]; gKnowText = @[]
+    gKnowP = @[]; gKnowText = @[]; gPObjRole = @[]
   elif kind == "places":
     gPlId = @[]; gPlName = @[]; gPlMap = @[]; gPlKind = @[]; gPlOwner = @[]
     gPlX = @[]; gPlY = @[]; gPlZ = @[]; gPlDanger = @[]
@@ -1638,6 +1831,10 @@ proc clearKind(kind: string) =
   elif kind == "loot":
     gLtId = @[]; gLtCache = @[]; gLtTpl = @[]; gLtMap = @[]; gLtCount = @[]
     gLtX = @[]; gLtY = @[]; gLtZ = @[]; gLtStatus = @[]
+  elif kind == "objectives":
+    gObId = @[]; gObOwnerKind = @[]; gObOwner = @[]; gObKind = @[]
+    gObTargetKind = @[]; gObTarget = @[]; gObPriority = @[]
+    gObStarted = @[]; gObUntil = @[]; gObStatus = @[]; gObNote = @[]
   elif kind == "journal":
     gJSeq = @[]; gJAt = @[]; gJKind = @[]; gJActor = @[]; gJTarget = @[]
     gJData = @[]
@@ -1652,6 +1849,7 @@ proc schemaFor(kind: string): string =
   if kind == "facts": return SchemaFacts
   if kind == "caches": return SchemaCaches
   if kind == "loot": return SchemaLoot
+  if kind == "objectives": return SchemaObjectives
   if kind == "journal": return SchemaJournal
   result = ""
 
@@ -1748,6 +1946,7 @@ proc loadKindFromJson*(kind, text: string; note: var string): bool =
       setPersonEscorting(i, jr.asBool(jr.child(it, "escorting"), false))
       setPersonInventoryNote(i, jr.asText(jr.child(it, "inventoryNote"), ""))
       setPersonLastSeenMs(i, int64(jr.asInt(jr.child(it, "lastSeenMs"), 0)))
+      setPersonObjRole(i, jr.asText(jr.child(it, "objRole"), ""))
       for m in textsOf(jr.child(it, "memory")): remember(i, m)
       for k in textsOf(jr.child(it, "knows")): addPersonKnows(i, k)
     elif kind == "places":
@@ -1817,6 +2016,18 @@ proc loadKindFromJson*(kind, text: string; note: var string): bool =
                        jr.asFloat(jr.child(it, "y"), 0.0),
                        jr.asFloat(jr.child(it, "z"), 0.0))
       setLootStatus(li, jr.asText(jr.child(it, "status"), "placed"))
+    elif kind == "objectives":
+      let oi = addObjective(jr.asText(jr.child(it, "id"), ""),
+                            jr.asText(jr.child(it, "ownerKind"), "group"),
+                            jr.asText(jr.child(it, "owner"), ""),
+                            jr.asText(jr.child(it, "kind"), ""),
+                            jr.asText(jr.child(it, "targetKind"), ""),
+                            jr.asText(jr.child(it, "target"), ""),
+                            jr.asInt(jr.child(it, "priority"), 0),
+                            int64(jr.asInt(jr.child(it, "startedMs"), 0)),
+                            int64(jr.asInt(jr.child(it, "untilMs"), 0)),
+                            jr.asText(jr.child(it, "note"), ""))
+      setObjectiveStatus(oi, jr.asText(jr.child(it, "status"), "active"))
     elif kind == "journal":
       gJSeq.add jr.asInt(jr.child(it, "seq"), 0)
       gJAt.add int64(jr.asInt(jr.child(it, "atMs"), 0))
@@ -1863,7 +2074,7 @@ proc saveWorld*(note: var string): bool =
   # meta LAST, so a torn process leaves a version number that is behind the
   # kinds rather than ahead of them; a load then re-reads a consistent set.
   let kinds: seq[string] = @["factions", "people", "places", "contracts", "quests", "facts",
-                          "caches", "loot"]
+                          "caches", "loot", "objectives"]
   for k in kinds:
     if save("world." & k, kindJsonText(k)) == Ok: written.add "world." & k
     else: failed.add "world." & k
@@ -1902,7 +2113,7 @@ proc loadWorld*(note: var string): bool =
   var n = ""
   if not loadKindFromJson("meta", meta.raw, n): notes.add n
   let kinds: seq[string] = @["factions", "people", "places", "contracts", "quests", "facts",
-                          "caches", "loot"]
+                          "caches", "loot", "objectives"]
   for k in kinds:
     let st = load("world." & k)
     if st.ok:

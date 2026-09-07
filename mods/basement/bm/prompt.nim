@@ -26,6 +26,12 @@ type
     mood*: float
     inventoryNote*: string
     placeName*, map*: string
+    objective*: string
+      ## What this person's GROUP is currently doing, as one clause
+      ## ("moving the crates to the Quarry before dark"), from
+      ## `bm/offscreen.objectiveSentence`. It is "" when they have no
+      ## objective, and "" must stay distinguishable from "an empty one":
+      ## the ontology row for `ask_activity` is only served when it is set.
     known*: string
       ## `world.renderKnown` -- the entities this person can talk about, with
       ## their ids. It is NOT in `stablePrefix`: knowledge grows every time a
