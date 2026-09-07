@@ -153,6 +153,10 @@ namespace Basement.Client
                 long seq = e.Value<long?>("seq") ?? 0;
                 string kind = e.Value<string>("kind") ?? "";
                 var data = e["data"] as JObject ?? new JObject();
+                // The ack flag and ttl are SIBLINGS of `data` at the event level
+                // (backend a00de63); fold them into data so the dispatcher sees one shape.
+                if (e["ack"] != null && data["ack"] == null) data["ack"] = e["ack"];
+                if (e["ttlMs"] != null && data["ttlMs"] == null) data["ttlMs"] = e["ttlMs"];
                 Events++;
                 if (seq > _since) _since = seq;
                 Plugin.OnMain(() => Dispatch(seq, kind, data));
@@ -179,7 +183,7 @@ namespace Basement.Client
             // The flag is a SIBLING of `data` at the event level (backend commit
             // a00de63 writes {seq, atMs, kind, ack, ttlMs, data}); the data-level
             // read is kept for any older backend.
-            bool? ackField = e.Value<bool?>("ack") ?? data.Value<bool?>("ack");
+            bool? ackField = data.Value<bool?>("ack");
             bool wantsAck = ackField ?? !(kind == "say" || kind.StartsWith("heard.") || kind == "hud.note" ||
                                           kind == "world.saved" || kind.StartsWith("directive.") || kind.StartsWith("quest."));
             if (wantsAck) Directives++;
