@@ -118,10 +118,12 @@ def run_sim(store, routes, timeout=900):
     return docs, raw, None
 
 
-def enabled_config():
+def enabled_config(overrides=None):
     """The mod ships DISABLED on purpose; the story needs it on.
 
-    A copy of config.json with `enabled: true` is written over the mod's own
+    A copy of config.json with `enabled: true` (plus any `--set key=value`
+    overrides, e.g. `--set ttsEngine=kokoro --set kokoroUrl=http://127.0.0.1:6972`
+    to run the selfcheck against a test server) is written over the mod's own
     for the duration of the run and restored afterwards, so this script never
     leaves the repo in a state where the mod is silently live.
     """
@@ -129,8 +131,106 @@ def enabled_config():
     original = open(path, "r", encoding="utf-8").read()
     doc = json.loads(original)
     doc["enabled"] = True
+    for k, v in (overrides or {}).items():
+        doc[k] = v
     open(path, "w", encoding="utf-8").write(json.dumps(doc, indent=2))
     return path, original
+
+
+def parse_set(items):
+    out = {}
+    for it in items or []:
+        if "=" not in it:
+            raise SystemExit("--set wants KEY=VALUE, got %r" % it)
+        k, v = it.split("=", 1)
+        try:
+            out[k] = json.loads(v)
+        except ValueError:
+            out[k] = v
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 0. the voice table -- static, no simulator: every tag gen can emit is mapped,
+#    and no two tags collapse to the same voice under either local engine.
+# ---------------------------------------------------------------------------
+
+# The 54 ids in voices-v1.0.bin, MEASURED 2026-09-07 from GET /health on the
+# kokoro server (tools/kokoro/server.py). A tag pointing at any other id is a
+# 400 from the server at synth time, so it is caught here instead.
+KOKORO_VOICES = set("""af_alloy af_aoede af_bella af_heart af_jessica af_kore
+af_nicole af_nova af_river af_sarah af_sky am_adam am_echo am_eric am_fenrir
+am_liam am_michael am_onyx am_puck am_santa bf_alice bf_emma bf_isabella
+bf_lily bm_daniel bm_fable bm_george bm_lewis ef_dora em_alex em_santa
+ff_siwis hf_alpha hf_beta hm_omega hm_psi if_sara im_nicola jf_alpha
+jf_gongitsune jf_nezumi jf_tebukuro jm_kumo pf_dora pm_alex pm_santa
+zf_xiaobei zf_xiaoni zf_xiaoxiao zf_xiaoyi zm_yunjian zm_yunxi zm_yunxia
+zm_yunyang""".split())
+
+
+def archetype_rows(doc):
+    if isinstance(doc, list):
+        return doc
+    for k in ("archetypes", "rows", "items"):
+        if isinstance(doc.get(k), list):
+            return doc[k]
+    return [v for v in doc.values() if isinstance(v, dict)]
+
+
+def check_voices(rep):
+    data = os.path.join(MOD, "data")
+    try:
+        voices = json.load(open(os.path.join(data, "voices.json"), encoding="utf-8"))
+        arch = json.load(open(os.path.join(data, "archetypes.json"), encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        rep.add(FAIL, "voices.json loads", str(e))
+        return
+    tags = voices.get("tags", {})
+    emitted = set()
+    for a in archetype_rows(arch):
+        for v in a.get("voices", []):
+            emitted.add(v)
+    if not emitted:
+        rep.add(INCONCLUSIVE, "voice tags gen emits",
+                "archetypes.json lists no `voices`, nothing to cover")
+    missing = sorted(emitted - set(tags))
+    rep.add(PASS if not missing else FAIL, "every gen voice tag is mapped",
+            "%d tags emitted by archetypes.json, %d in voices.json, missing: %s"
+            % (len(emitted), len(tags), missing or "none"))
+    vdir = os.path.join(data, "voices")
+    stems = set(f[:-4] for f in os.listdir(vdir) if f.lower().endswith(".wav"))         if os.path.isdir(vdir) else set()
+    seen_k, seen_c, dup_k, dup_c, bad_id, bad_stem = {}, {}, [], [], [], []
+    for t, row in tags.items():
+        k = (row.get("kokoro"), round(float(row.get("speed", 1.0)), 3))
+        c = (row.get("chatterbox"), round(float(row.get("exaggeration", 0.5)), 3),
+             round(float(row.get("cfg_weight", 0.5)), 3))
+        if k in seen_k:
+            dup_k.append((t, seen_k[k]))
+        seen_k[k] = t
+        if c in seen_c:
+            dup_c.append((t, seen_c[c]))
+        seen_c[c] = t
+        if row.get("kokoro") not in KOKORO_VOICES:
+            bad_id.append((t, row.get("kokoro")))
+        if row.get("chatterbox") not in stems and row.get("chatterbox") != "default":
+            bad_stem.append((t, row.get("chatterbox")))
+    rep.add(PASS if not dup_k else FAIL, "no two tags share a kokoro (id, speed)",
+            "%d tags, duplicates: %s" % (len(tags), dup_k or "none"))
+    rep.add(PASS if not dup_c else FAIL,
+            "no two tags share a chatterbox (stem, exaggeration, cfg_weight)",
+            "duplicates: %s" % (dup_c or "none"))
+    rep.add(PASS if not bad_id else FAIL, "every kokoro id is one voices-v1.0.bin has",
+            "unknown: %s" % (bad_id or "none"))
+    rep.add(PASS if not bad_stem else FAIL,
+            "every chatterbox stem is a wav under data/voices",
+            "%d wavs on disk (%s); unknown: %s"
+            % (len(stems), " ".join(sorted(stems)), bad_stem or "none"))
+    pools = voices.get("pools", {})
+    for pool, ok_set, name in (("kokoro", KOKORO_VOICES, "kokoro pool ids"),
+                               ("chatterbox", stems | {"default"}, "chatterbox pool stems")):
+        bad = [x for x in pools.get(pool, []) if x not in ok_set]
+        rep.add(PASS if not bad else FAIL, "%s exist" % name,
+                "%d in pool, unknown: %s" % (len(pools.get(pool, [])), bad or "none"))
 
 
 def kinds_on_stream(events_doc):
@@ -892,6 +992,9 @@ def main():
                     help="scratch store dir (default: a fresh temp dir)")
     ap.add_argument("--keep", action="store_true",
                     help="keep the scratch store instead of deleting it")
+    ap.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
+                    help="override a config.json key for the run (JSON value "
+                         "if it parses, else a string); repeatable")
     a = ap.parse_args()
 
     store = a.store or tempfile.mkdtemp(prefix="basement-check-")
@@ -901,11 +1004,13 @@ def main():
     rep = Report()
     cfg_path, original = None, None
     try:
-        cfg_path, original = enabled_config()
+        cfg_path, original = enabled_config(parse_set(a.set))
     except Exception as e:                        # noqa: BLE001 -- reported
         rep.add(INCONCLUSIVE, "config",
                 "could not enable the mod for the run: %s" % e)
     try:
+        check_voices(rep)
+        print("")
         check_selfcheck(rep, store)
         print("")
         check_story(rep, store)

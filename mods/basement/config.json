@@ -12,7 +12,7 @@
   "_worldPrompt": "Empty = the preset's own prompt. This string is the top of every system prompt: what this world IS. It is the single highest-leverage thing to edit.",
   "worldPrompt": "",
 
-  "_engines": "Each stage dispatches on these strings. llmEngine: builtin | anthropic | openai | llamacpp | none. sttEngine: whisper-server | none. ttsEngine: piper | sapi | none.",
+  "_engines": "Each stage dispatches on these strings. llmEngine: builtin | anthropic | openai | llamacpp | none. sttEngine: whisper-server | none. ttsEngine: piper | kokoro | chatterbox | client | sapi | none. kokoro = Kokoro-82M on the CPU (onnx, ~1.3 s per sentence on this i9, MEASURED 2026-09-07), chatterbox = Resemble Chatterbox on CUDA with voice CLONING from data/voices/<stem>.wav (~3.5 s per sentence on the RTX 2060 SUPER, MEASURED), client = no wav from here, the game-side plugin synthesises from the say segment's text + voiceSpec. Both local servers are started by this backend on first use (detached, via PowerShell Start-Process) when /health does not answer; tools/kokoro/setup.ps1 and tools/chatterbox/setup.ps1 install them OUTSIDE the repo under %LOCALAPPDATA%/aowlspt/<engine>/.",
   "llmEngine": "builtin",
   "sttEngine": "whisper-server",
   "ttsEngine": "piper",
@@ -36,6 +36,17 @@
   "whisperPort": 9000,
   "piperExe": "",
   "piperVoice": "",
+
+  "_kokoro": "kokoroUrl: where the kokoro server answers (POST /tts, GET /health). kokoroRoot: the setup.ps1 root holding venv/, kokoro-v1.0.onnx, voices-v1.0.bin and server.py; empty = %LOCALAPPDATA%/aowlspt/kokoro. kokoroExe: the python to spawn it with; empty = <kokoroRoot>/venv/Scripts/python.exe.",
+  "kokoroUrl": "http://127.0.0.1:6971",
+  "kokoroRoot": "",
+  "kokoroExe": "",
+
+  "_chatterbox": "chatterboxUrl / chatterboxRoot / chatterboxExe: the same three for the CUDA cloning server (root default %LOCALAPPDATA%/aowlspt/chatterbox). voicesDir: the folder of <stem>.wav reference voices it clones from; empty = data/voices beside the mod. The three shipped wavs there are PLACEHOLDERS made with piper and Windows SAPI -- drop real ~10 s recordings in and point data/voices.json tags at their stems.",
+  "chatterboxUrl": "http://127.0.0.1:6974",
+  "chatterboxRoot": "",
+  "chatterboxExe": "",
+  "voicesDir": "",
   "llamaExe": "",
   "llamaModel": "",
 

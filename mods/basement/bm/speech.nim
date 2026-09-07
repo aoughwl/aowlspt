@@ -72,8 +72,33 @@ var cCacheDir: string = ""
 var cWhisperPort: int = 9111
 var cSttPartialMs: int = 1200
 
+# HTTP TTS servers (kokoro = CPU/onnx, chatterbox = CUDA voice cloning). Each
+# is a python venv OUTSIDE the repo (tools/<engine>/setup.ps1 makes it) that
+# the backend starts detached on first use when /health does not answer.
+var cKokoroUrl: string = "http://127.0.0.1:6971"
+var cKokoroRoot: string = ""
+var cKokoroExe: string = ""
+var cChatterUrl: string = "http://127.0.0.1:6974"
+var cChatterRoot: string = ""
+var cChatterExe: string = ""
+var cVoicesDir: string = ""       ## <stem>.wav reference voices for chatterbox
+
 var gWhisperSpawned: bool = false
+var gKokoroSpawned: bool = false
+var gChatterSpawned: bool = false
 var gTmpSeq: int = 0
+
+# Voice table (data/voices.json): tag -> per-engine voice. Parallel seqs.
+var gVTag: seq[string] = @[]
+var gVKokoro: seq[string] = @[]
+var gVSpeed: seq[float] = @[]
+var gVChatter: seq[string] = @[]
+var gVExag: seq[float] = @[]
+var gVCfg: seq[float] = @[]
+var gVPiper: seq[string] = @[]
+var gPoolKokoro: seq[string] = @[]
+var gPoolChatter: seq[string] = @[]
+var gVoicesNote: string = "voices.json not loaded"
 
 # TTS cache
 var gTKey: seq[string] = @[]
@@ -120,7 +145,11 @@ proc ensureTtsDir(): bool =
 
 proc speechConfigure*(sttEngine, ttsEngine, toolsDir, whisperExe, whisperModel,
                       piperExe, piperVoice, curlExe, workDir, cacheDir: string;
-                      whisperPort, sttPartialMs: int) =
+                      whisperPort, sttPartialMs: int;
+                      kokoroUrl: string = ""; kokoroRoot: string = "";
+                      kokoroExe: string = ""; chatterboxUrl: string = "";
+                      chatterboxRoot: string = ""; chatterboxExe: string = "";
+                      voicesDir: string = ""; localAppData: string = "") =
   cSttEngine = defaulted(sttEngine, "whisper-server")
   cTtsEngine = defaulted(ttsEngine, "piper")
   cToolsDir = toolsDir
@@ -133,6 +162,121 @@ proc speechConfigure*(sttEngine, ttsEngine, toolsDir, whisperExe, whisperModel,
   cCacheDir = cacheDir
   if whisperPort > 0: cWhisperPort = whisperPort
   if sttPartialMs > 0: cSttPartialMs = sttPartialMs
+  # The roots default to where tools/kokoro/setup.ps1 and
+  # tools/chatterbox/setup.ps1 put their venvs: %LOCALAPPDATA%/aowlspt/<engine>.
+  let lad = defaulted(localAppData, ".")
+  cKokoroUrl = defaulted(kokoroUrl, "http://127.0.0.1:6971")
+  cKokoroRoot = defaulted(kokoroRoot, joinPath(lad, "aowlspt/kokoro"))
+  cKokoroExe = defaulted(kokoroExe, joinPath(cKokoroRoot, "venv/Scripts/python.exe"))
+  cChatterUrl = defaulted(chatterboxUrl, "http://127.0.0.1:6974")
+  cChatterRoot = defaulted(chatterboxRoot, joinPath(lad, "aowlspt/chatterbox"))
+  cChatterExe = defaulted(chatterboxExe, joinPath(cChatterRoot, "venv/Scripts/python.exe"))
+  cVoicesDir = voicesDir
+
+# ---------------------------------------------------------------------------
+# Voice table -- data/voices.json, loaded by the root (it owns paths).
+# ---------------------------------------------------------------------------
+
+type
+  VoiceSpec* = object
+    tag*: string         ## the person's tag as gen wrote it
+    mapped*: bool        ## false = not in voices.json, picked from the pool
+    kokoro*: string
+    speed*: float
+    chatterbox*: string
+    exaggeration*: float
+    cfgWeight*: float
+    piper*: string
+    note*: string
+
+proc voicesLoad*(text: string): int =
+  ## `{"pools":{"kokoro":[..],"chatterbox":[..]},"tags":{tag:{kokoro,speed,
+  ## chatterbox,exaggeration,cfg_weight,piper}}}`. Returns the tag count; 0
+  ## with `voicesNote` saying why when the text is empty or malformed.
+  gVTag = @[]; gVKokoro = @[]; gVSpeed = @[]; gVChatter = @[]
+  gVExag = @[]; gVCfg = @[]; gVPiper = @[]
+  gPoolKokoro = @[]; gPoolChatter = @[]
+  if text.len == 0:
+    gVoicesNote = "voices.json is empty or unreadable"
+    return 0
+  let root = jr.whole(text)
+  let pools = jr.child(root, "pools")
+  for e in jr.each(jr.child(pools, "kokoro")):
+    let t = jr.asText(e, "")
+    if t.len > 0: gPoolKokoro.add t
+  for e in jr.each(jr.child(pools, "chatterbox")):
+    let t = jr.asText(e, "")
+    if t.len > 0: gPoolChatter.add t
+  let tags = jr.child(root, "tags")
+  for k in jr.keys(tags):
+    let row = jr.child(tags, k)
+    gVTag.add k
+    gVKokoro.add jr.asText(jr.child(row, "kokoro"), "")
+    gVSpeed.add jr.asFloat(jr.child(row, "speed"), 1.0)
+    gVChatter.add jr.asText(jr.child(row, "chatterbox"), "")
+    gVExag.add jr.asFloat(jr.child(row, "exaggeration"), 0.5)
+    gVCfg.add jr.asFloat(jr.child(row, "cfg_weight"), 0.5)
+    gVPiper.add jr.asText(jr.child(row, "piper"), "")
+  gVoicesNote = $gVTag.len & " tags, pools kokoro=" & $gPoolKokoro.len &
+                " chatterbox=" & $gPoolChatter.len
+  if gVTag.len == 0: gVoicesNote = "voices.json parsed but has no `tags`"
+  result = gVTag.len
+
+proc voicesNote*(): string = gVoicesNote
+proc voiceTagCount*(): int = gVTag.len
+proc voiceTagAt*(i: int): string =
+  if i < 0 or i >= gVTag.len: return ""
+  result = gVTag[i]
+
+proc pickFrom(pool: seq[string]; seed: string; fallback: string): string =
+  if pool.len == 0: return fallback
+  let h = fnv1a64(seed)
+  result = pool[int(h mod uint64(pool.len))]
+
+proc resolveVoice*(tag, personId: string): VoiceSpec =
+  ## A tag -> the row in voices.json. An unmapped tag is resolved by a
+  ## DETERMINISTIC pick from the pools keyed on the person id (so one person
+  ## always sounds the same across restarts) and says so in `note`.
+  var r = VoiceSpec(tag: tag, mapped: false, kokoro: "am_michael", speed: 1.0,
+                    chatterbox: "default", exaggeration: 0.5, cfgWeight: 0.5,
+                    piper: "", note: "")
+  var i = 0
+  while i < gVTag.len:
+    if gVTag[i] == tag:
+      r.mapped = true
+      r.kokoro = defaulted(gVKokoro[i], "am_michael")
+      r.speed = gVSpeed[i]
+      r.chatterbox = defaulted(gVChatter[i], "default")
+      r.exaggeration = gVExag[i]
+      r.cfgWeight = gVCfg[i]
+      r.piper = gVPiper[i]
+      r.note = "voices.json[" & tag & "]"
+      return r
+    i = i + 1
+  let seed = (if personId.len > 0: personId else: tag)
+  r.kokoro = pickFrom(gPoolKokoro, seed, "am_michael")
+  r.chatterbox = pickFrom(gPoolChatter, seed, "default")
+  # Spread the speed a little too, so two unmapped people who hash to the
+  # same pool entry still differ: 0.90 .. 1.10 in 0.02 steps.
+  let step = int((fnv1a64("speed:" & seed) shr 8'u64) mod 11'u64)
+  r.speed = quant3(0.90 + 0.02 * float(step))
+  r.note = (if gVTag.len == 0: "no voices.json loaded (" & gVoicesNote & "); "
+            else: "unmapped tag '" & tag & "'; ") &
+           "picked by hash of '" & seed & "'"
+  result = r
+
+proc voiceSpecJson*(v: VoiceSpec): JsonObject =
+  var o = obj()
+  o.put("tag", v.tag)
+  o.put("mapped", v.mapped)
+  o.put("kokoro", v.kokoro)
+  o.put("speed", v.speed)
+  o.put("chatterbox", v.chatterbox)
+  o.put("exaggeration", v.exaggeration)
+  o.put("cfg_weight", v.cfgWeight)
+  o.put("piper", v.piper)
+  o.put("note", v.note)
+  result = o
 
 proc tempPath(suffix: string): string =
   gTmpSeq = gTmpSeq + 1
@@ -192,9 +336,43 @@ proc sttProbe*(): SpeechProbe =
     result.ok = false
     result.note = "unknown stt engine '" & cSttEngine & "' (have: whisper-server, none)"
 
+proc kokoroModelPath(): string = joinPath(cKokoroRoot, "kokoro-v1.0.onnx")
+proc kokoroServerPy(): string = joinPath(cKokoroRoot, "server.py")
+proc chatterServerPy(): string = joinPath(cChatterRoot, "server.py")
+
+proc serverProbe(engine, url, exe, model, serverPy, setupCmd: string): SpeechProbe =
+  ## An HTTP engine is "present" when its venv python, its model/server file
+  ## and its server.py all exist -- the files setup.ps1 leaves behind. Whether
+  ## the SERVER answers is a separate question (`serverUp`), asked at synth
+  ## time, because the backend starts it itself on first use.
+  var r = probeOf("tts", engine, exe, model)
+  if r.ok and not exists(serverPy):
+    r.ok = false
+    r.note = "missing: " & serverPy
+  if not r.ok:
+    r.note = r.note & " -- run: " & setupCmd
+  else:
+    r.note = "ok: " & exe & " serves " & url & " (started on first use)"
+  result = r
+
 proc ttsProbe*(): SpeechProbe =
   case cTtsEngine
   of "piper": result = probeOf("tts", "piper", cPiperExe, cPiperVoice)
+  of "kokoro":
+    result = serverProbe("kokoro", cKokoroUrl, cKokoroExe, kokoroModelPath(),
+                         kokoroServerPy(),
+                         "powershell -ExecutionPolicy Bypass -File tools/kokoro/setup.ps1")
+  of "chatterbox":
+    result = serverProbe("chatterbox", cChatterUrl, cChatterExe, chatterServerPy(),
+                         chatterServerPy(),
+                         "powershell -ExecutionPolicy Bypass -File tools/chatterbox/setup.ps1")
+    if result.ok and cVoicesDir.len > 0 and not dirPresent(cVoicesDir):
+      result.note = result.note & "; voicesDir " & cVoicesDir &
+                    " is MISSING, so every voice is the built-in default"
+  of "client":
+    result = probeOf("tts", "client", "", "")
+    result.note = "ok (no wav here: the client synthesises from the say " &
+                  "segment's text + voice spec)"
   of "sapi":
     result = probeOf("tts", "sapi", "", "")
     result.note = "ok (Windows System.Speech via powershell)"
@@ -202,7 +380,97 @@ proc ttsProbe*(): SpeechProbe =
   else:
     result = probeOf("tts", cTtsEngine, "", "")
     result.ok = false
-    result.note = "unknown tts engine '" & cTtsEngine & "' (have: piper, sapi, none)"
+    result.note = "unknown tts engine '" & cTtsEngine &
+                  "' (have: piper, kokoro, chatterbox, client, sapi, none)"
+
+proc urlPort(url: string; default: int): int =
+  ## The port of `http://host:PORT[/...]`, or `default` when there is none.
+  var i = url.len - 1
+  var digits = ""
+  # Walk back over an optional path, then read digits before ':'.
+  var j = 0
+  var afterScheme = url
+  if url.contains("://"):
+    j = 0
+    while j + 2 < url.len and url[j ..< j + 3] != "://": j = j + 1
+    afterScheme = url[j + 3 ..< url.len]
+  var k = 0
+  var colonAt = -1
+  while k < afterScheme.len and afterScheme[k] != '/':
+    if afterScheme[k] == ':': colonAt = k
+    k = k + 1
+  if colonAt < 0: return default
+  i = colonAt + 1
+  while i < k:
+    digits.add afterScheme[i]
+    i = i + 1
+  if digits.len == 0: return default
+  var n = 0
+  for c in digits:
+    if c < '0' or c > '9': return default
+    n = n * 10 + (int(c) - int('0'))
+  result = n
+
+proc serverUp(url: string): bool =
+  let r = runCmd(quoteArg(cCurlExe) & " -s --max-time 3 " & quoteArg(url & "/health"))
+  result = (not r.failed) and r.output.contains("\"ok\": true")
+
+proc ensureKokoro(): bool =
+  ## Same shape as ensureWhisper: Start-Process (no handle inheritance), once.
+  if gKokoroSpawned: return true
+  if serverUp(cKokoroUrl):
+    gKokoroSpawned = true
+    return true
+  gKokoroSpawned = spawnDetached(cKokoroExe,
+    quoteArg(kokoroServerPy()) & " --root " & quoteArg(cKokoroRoot) &
+    " --port " & $urlPort(cKokoroUrl, 6971))
+  result = gKokoroSpawned
+
+proc ensureChatterbox(): bool =
+  if gChatterSpawned: return true
+  if serverUp(cChatterUrl):
+    gChatterSpawned = true
+    return true
+  gChatterSpawned = spawnDetached(cChatterExe,
+    quoteArg(chatterServerPy()) & " --voices-dir " & quoteArg(cVoicesDir) &
+    " --port " & $urlPort(cChatterUrl, 6974))
+  result = gChatterSpawned
+
+proc httpTts(url, bodyJson, dst: string; retries: int; note: var string): bool =
+  ## POST bodyJson to url/tts with `out` = dst; the server writes the wav
+  ## itself. Success is judged on the FINISHED STATE -- a RIFF file at dst --
+  ## never on curl's exit code, and a non-200 carries the server's `error`.
+  let bodyPath = tempPath(".json")
+  if not writeAll(bodyPath, bodyJson):
+    note = "could not write the request body to " & bodyPath
+    return false
+  let respPath = tempPath(".resp")
+  let r = runCmd(quoteArg(cCurlExe) & " -s -o " & quoteArg(respPath) &
+                 " -w \"%{http_code}\" --retry " & $retries &
+                 " --retry-connrefused --retry-delay 1 --max-time 600" &
+                 " -H \"Content-Type: application/json\"" &
+                 " --data-binary @" & quoteArg(bodyPath) & " " &
+                 quoteArg(url & "/tts"))
+  let resp = readAll(respPath)
+  if r.failed:
+    note = "curl could not be started: " & cCurlExe
+    return false
+  let code = oneLine(r.output)
+  if code != "200":
+    let err = jr.asText(jr.field(resp, "error"), "")
+    note = "server answered HTTP " & (if code.len > 0: code else: "(none)") &
+           (if err.len > 0: ": " & err else: ": " & oneLine(resp)) &
+           (if code.len == 0 or code == "000": " -- is the server up at " & url &
+              "? (started detached; the model takes seconds to load)" else: "")
+    return false
+  let bytes = readAll(dst)
+  if bytes.len <= 44 or bytes[0 ..< 4] != "RIFF":
+    note = "server said 200 but " & dst & " is " & $bytes.len &
+           " bytes and not RIFF: " & oneLine(resp)
+    return false
+  let ms = jr.asText(jr.field(resp, "ms"), "?")
+  note = "wrote " & $bytes.len & " bytes in " & ms & " ms"
+  result = true
 
 # ---------------------------------------------------------------------------
 # TTS cache
@@ -292,12 +560,49 @@ proc ttsCacheLoad*() =
   gTLoadNote = $gTKey.len & " entries loaded" &
     (if skipped > 0: ", " & $skipped & " dropped (wav missing)" else: "")
 
-proc synthesize(voiceModel, sentence: string; dst: string; note: var string): bool =
+proc synthesize(spec: VoiceSpec; voiceModel, sentence: string; dst: string;
+                note: var string): bool =
   ## Produce a wav at `dst`. Returns false with a note a person can act on.
   case cTtsEngine
   of "none":
     note = "tts=none: no audio produced"
     return false
+  of "client":
+    note = "tts=client: no wav here, the client synthesises from text + voice"
+    return false
+  of "kokoro":
+    let p = ttsProbe()
+    if not p.ok:
+      note = "tts unavailable -- " & p.note
+      return false
+    discard ensureKokoro()
+    let body = "{\"text\":" & jr.quoted(sentence) & ",\"voice\":" &
+               jr.quoted(spec.kokoro) & ",\"speed\":" & fmtF(spec.speed) &
+               ",\"out\":" & jr.quoted(dst) & "}"
+    # kokoro loads in ~2-4 s (MEASURED 2026-09-07: 1.6-3.5 s); 30 retries at 1 s.
+    var n2 = ""
+    if not httpTts(cKokoroUrl, body, dst, 30, n2):
+      note = "kokoro: " & n2
+      return false
+    note = "kokoro " & spec.kokoro & "@" & fmtF(spec.speed) & " " & n2
+    return true
+  of "chatterbox":
+    let p = ttsProbe()
+    if not p.ok:
+      note = "tts unavailable -- " & p.note
+      return false
+    discard ensureChatterbox()
+    let body = "{\"text\":" & jr.quoted(sentence) & ",\"voice\":" &
+               jr.quoted(spec.chatterbox) & ",\"exaggeration\":" &
+               fmtF(spec.exaggeration) & ",\"cfg_weight\":" & fmtF(spec.cfgWeight) &
+               ",\"out\":" & jr.quoted(dst) & "}"
+    # chatterbox loads ~3 GB of weights onto the GPU; allow 120 s of retries.
+    var n2 = ""
+    if not httpTts(cChatterUrl, body, dst, 120, n2):
+      note = "chatterbox: " & n2
+      return false
+    note = "chatterbox " & spec.chatterbox & " " & n2
+    return true
   of "piper":
     let p = ttsProbe()
     if not p.ok:
@@ -342,15 +647,33 @@ proc synthesize(voiceModel, sentence: string; dst: string; note: var string): bo
     note = "tts unavailable -- unknown engine '" & cTtsEngine & "'"
     result = false
 
+proc voiceModelKey*(spec: VoiceSpec; voice: string): string =
+  ## The RESOLVED voice as the cache key sees it: for piper the .onnx path,
+  ## for kokoro `id@speed`, for chatterbox `stem@exX,cfgY` -- every knob that
+  ## changes the audio is in the key, so two tags that share a kokoro id but
+  ## differ in speed are two entries.
+  case cTtsEngine
+  of "piper":
+    result = voiceToPiperModel(if spec.mapped and spec.piper.len > 0: spec.piper
+                               else: voice)
+  of "kokoro": result = spec.kokoro & "@" & fmtF(spec.speed)
+  of "chatterbox":
+    result = spec.chatterbox & "@ex" & fmtF(spec.exaggeration) & ",cfg" &
+             fmtF(spec.cfgWeight)
+  else: result = voice
+
 proc ttsSegment*(voice, sentence: string; note: var string;
-                 cached: var bool): string =
-  ## One sentence -> a wav path, or "" with a note saying why not.
+                 cached: var bool; personId: string = ""): string =
+  ## One sentence -> a wav path, or "" with a note saying why not. `personId`
+  ## only matters for a tag voices.json does not list: it seeds the
+  ## deterministic pool pick so that person always gets the same voice.
   cached = false
   note = ""
   if normalizeText(sentence).len == 0:
     note = "nothing to speak (the sentence is empty after normalisation)"
     return ""
-  let model = (if cTtsEngine == "piper": voiceToPiperModel(voice) else: voice)
+  let spec = resolveVoice(voice, personId)
+  let model = voiceModelKey(spec, voice)
   let key = ttsKey(cTtsEngine, model, sentence)
   let idx = findTts(key)
   if idx >= 0 and exists(gTWav[idx]):
@@ -364,14 +687,14 @@ proc ttsSegment*(voice, sentence: string; note: var string;
     # Still speak, just without persistence -- and say so.
     let tmp = tempPath(".wav")
     var n2 = ""
-    if not synthesize(model, sentence, tmp, n2):
+    if not synthesize(spec, model, sentence, tmp, n2):
       note = n2
       return ""
     note = n2 & " (NOT cached: no writable cacheDir)"
     return tmp
   let dst = joinPath(dir, hex64(fnv1a64(key)) & ".wav")
   var n2 = ""
-  if not synthesize(model, sentence, dst, n2):
+  if not synthesize(spec, model, sentence, dst, n2):
     note = n2
     return ""
   if idx >= 0:
@@ -402,9 +725,13 @@ proc sayPayload*(personId, voice, text: string; segmentIdx: int; final: bool;
   cached = false
   note = ""
   if text.len > 0:
-    wav = ttsSegment(voice, text, note, cached)
+    wav = ttsSegment(voice, text, note, cached, personId)
   else:
     note = "no text in this segment, so nothing was synthesised"
+  # `tts` names the engine so a client knows whether an empty `wav` means
+  # "synthesise it yourself" (client) or "the backend failed" (anything else,
+  # with ttsNote saying why). `voiceSpec` is the resolved voices.json row so a
+  # client-side engine can map the same person to the same voice.
   var o = obj()
   o.put("personId", personId)
   o.put("text", text)
@@ -414,6 +741,8 @@ proc sayPayload*(personId, voice, text: string; segmentIdx: int; final: bool;
   o.put("cachedWav", cached)
   o.put("source", source)
   o.put("voice", voice)
+  o.put("tts", cTtsEngine)
+  o.put("voiceSpec", voiceSpecJson(resolveVoice(voice, personId)))
   o.put("ttsNote", note)
   result = done(o).text
 
@@ -426,9 +755,15 @@ proc ttsStats*(): JsonObject =
   o.put("misses", gTMiss)
   o.put("load", gTLoadNote)
   o.put("defaultVoice", cPiperVoice)
-  o.put("note", "keyed on (tts engine, RESOLVED voice model path, normalized " &
-    "sentence); a hit returns the same file on disk, so the bytes are identical " &
-    "by construction")
+  o.put("kokoroUrl", cKokoroUrl)
+  o.put("kokoroRoot", cKokoroRoot)
+  o.put("chatterboxUrl", cChatterUrl)
+  o.put("chatterboxRoot", cChatterRoot)
+  o.put("voicesDir", cVoicesDir)
+  o.put("voices", gVoicesNote)
+  o.put("note", "keyed on (tts engine, RESOLVED voice model (piper path | " &
+    "kokoro id@speed | chatterbox stem@ex,cfg), normalized sentence); a hit " &
+    "returns the same file on disk, so the bytes are identical by construction")
   result = o
 
 # ---------------------------------------------------------------------------

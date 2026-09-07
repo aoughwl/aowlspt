@@ -1346,6 +1346,14 @@ proc chk8Speech() =
   var n2 = ""
   var c2 = false
   let w2 = ttsSegment("", "The basement door is locked.", n2, c2)
+  if tp.engine == "client":
+    # The finished state for `client` is NO wav and a note that says which
+    # engine declined -- a wav here would be the bug.
+    let okc = w1.len == 0 and w2.len == 0 and contains(n1, "tts=client")
+    check(8, "speech", verdictOf(okc),
+          "tts=client: wav '" & w1 & "' (must be empty), note '" & n1 &
+          "' (must name tts=client); stt " & sp.engine & " ok=" & $sp.ok)
+    return
   let ok = w1.len > 0 and w1 == w2 and c2
   check(8, "speech", verdictOf(ok),
         "tts wav '" & w1 & "' cached-on-second " & $c2 & " same path " &
@@ -1845,6 +1853,8 @@ proc chk16BarkCarriesWav() =
   var sayText = ""
   var sayWav = ""
   var sayNote = ""
+  var sayTts = ""
+  var saySpecTag = ""
   var source = ""
   let served = done(objOf("events", eventsSince(base, 100))).text
   for e in jr.each(jr.field(served, "events")):
@@ -1854,6 +1864,8 @@ proc chk16BarkCarriesWav() =
         sayText = jr.asText(jr.child(d, "text"), "")
         sayWav = jr.asText(jr.child(d, "wav"), "")
         sayNote = jr.asText(jr.child(d, "ttsNote"), "")
+        sayTts = jr.asText(jr.child(d, "tts"), "")
+        saySpecTag = jr.asText(jr.child(jr.child(d, "voiceSpec"), "tag"), "")
         source = "encounter"
   let evidence = "observe emitted " & $n & " directive(s) (" & note &
     "); the served encounter say is text=" & $sayText.len & " chars, wav='" &
@@ -1868,6 +1880,16 @@ proc chk16BarkCarriesWav() =
     check(16, "an encounter bark carries a wav", "INCONCLUSIVE",
           "tts is unavailable, so whether the bark WOULD carry a wav cannot " &
           "be established here -- and a missing engine is never a PASS. " &
+          evidence)
+    return
+  if tp.engine == "client":
+    # The served segment must TELL the client to synthesise: tts:"client",
+    # the text, and the voiceSpec it maps a voice from. A wav would be wrong.
+    check(16, "an encounter bark carries a wav",
+          verdictOf(sayText.len > 0 and sayWav.len == 0 and sayTts == "client" and
+                    saySpecTag.len > 0),
+          "tts=client: served tts='" & sayTts & "' (must be client), voiceSpec.tag='" &
+          saySpecTag & "' (must be set), wav='" & sayWav & "' (must be empty). " &
           evidence)
     return
   check(16, "an encounter bark carries a wav",

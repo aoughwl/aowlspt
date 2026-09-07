@@ -89,6 +89,29 @@ proc readAll*(path: string): string =
   except:
     result = ""
 
+proc listWavStems*(dir: string): seq[string] =
+  ## The `<stem>` of every `<stem>.wav` directly under `dir`, sorted by the
+  ## order the OS lists them; empty when the directory is missing (nimony's
+  ## std/dirs has no dirExists -- walkDir with checkDir raises instead).
+  result = @[]
+  if dir.len == 0: return
+  try:
+    for entry in walkDir(path(dir), relative = true, checkDir = true):
+      let n = $entry.path
+      if n.len > 4 and (n.endsWith(".wav") or n.endsWith(".WAV")):
+        result.add n[0 ..< n.len - 4]
+  except:
+    result = @[]
+
+proc dirPresent*(dir: string): bool =
+  if dir.len == 0: return false
+  try:
+    for entry in walkDir(path(dir), relative = true, checkDir = true):
+      discard entry
+    result = true
+  except:
+    result = false
+
 proc writeAll*(path, content: string): bool =
   try:
     writeFile(path, content)
