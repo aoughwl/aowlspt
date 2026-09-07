@@ -89,7 +89,7 @@ namespace Basement.Client
             if (now - _lastPeople >= PeopleEvery)
             {
                 _lastPeople = now;
-                People.Refresh(Map, main.Position, NoticeM * 4);
+                People.Refresh("", null, 0); // whole population: the fallback binder relocates people from other maps (MEASURED 2026-09-07: factory had 0 of 40)
                 People.MatchByNickname(gw);
                 People.MatchByProximity(gw, main.Position, Map);
             }
@@ -120,7 +120,7 @@ namespace Basement.Client
             }
             catch (Exception ex) { Plugin.Log.LogWarning("basement see: subscribing main-player events threw " + ex.Message); }
             _lastPeople = now;
-            People.Refresh(Map, p, NoticeM * 4);
+            People.Refresh("", null, 0);
             People.MatchByNickname(gw);
             People.MatchByProximity(gw, p, Map);
             _lastMove = now;
