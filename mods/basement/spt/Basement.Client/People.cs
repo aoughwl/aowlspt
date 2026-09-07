@@ -144,6 +144,47 @@ namespace Basement.Client
             }
         }
 
+
+        /// <summary>
+        /// Main thread. The FALLBACK binder, needed because SPT's bots carry random
+        /// nicknames, so MatchByNickname binds nothing in an ordinary raid (MEASURED
+        /// 2026-09-07, first live run: 0 binds, no player_seen ever). Every live,
+        /// unmapped bot is bound to the nearest still-unbound world person on THIS
+        /// map; when the world has nobody left on this map, to any unbound person,
+        /// and the log says the person was relocated. The world's positions are
+        /// its own fiction; the bot is where the person IS for this raid.
+        /// </summary>
+        public static void MatchByProximity(GameWorld gw, Vector3 mainPos, string map)
+        {
+            if (!Plugin.BindUnmatchedBots.Value || gw == null) return;
+            var list = gw.AllAlivePlayersList;
+            if (list == null) return;
+            List<Person> people;
+            lock (Gate) people = new List<Person>(Known.Values);
+            foreach (var p in list)
+            {
+                if (p == null || p.IsYourPlayer) continue;
+                if (PersonFor(p.ProfileId) != null) continue;
+                Person best = null; float bestD = float.MaxValue; bool bestSameMap = false;
+                foreach (var person in people)
+                {
+                    if (!person.Alive || BotFor(person.Id) != null) continue;
+                    bool same = string.Equals(person.Map, map, StringComparison.OrdinalIgnoreCase);
+                    float d = same ? Vector3.Distance(p.Position, new Vector3(person.X, person.Y, person.Z)) : float.MaxValue / 2;
+                    if (best == null || (same && !bestSameMap) || (same == bestSameMap && d < bestD))
+                    { best = person; bestD = d; bestSameMap = same; }
+                }
+                if (best == null)
+                {
+                    if (Plugin.Once("no-unbound-people")) Plugin.Log.LogWarning("basement people: a live bot has no world person left to be -- the world's population (" + people.Count + ") is exhausted on this raid; further bots stay unmapped.");
+                    return;
+                }
+                Bind(best.Id, p, bestSameMap
+                    ? "FALLBACK nearest unbound person on " + map + " (" + F(bestD) + " m from the world's position)"
+                    : "FALLBACK relocated from " + best.Map + " -- the world had nobody left on " + map);
+            }
+        }
+
         private static string F(float v) => v.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture);
     }
 }

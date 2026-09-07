@@ -91,6 +91,7 @@ namespace Basement.Client
                 _lastPeople = now;
                 People.Refresh(Map, main.Position, NoticeM * 4);
                 People.MatchByNickname(gw);
+                People.MatchByProximity(gw, main.Position, Map);
             }
             WatchHands(main);
             ScanView(gw, main, now);
@@ -121,6 +122,7 @@ namespace Basement.Client
             _lastPeople = now;
             People.Refresh(Map, p, NoticeM * 4);
             People.MatchByNickname(gw);
+            People.MatchByProximity(gw, p, Map);
             _lastMove = now;
             SendMoved(main);
         }
