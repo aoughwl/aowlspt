@@ -168,19 +168,64 @@ What the scene must contain for the game to accept it: `LocationScene : MonoBeha
 
 AssetStudio (Perfare, archived; community forks "AssetStudioMod"/"AssetStudio.GUI" by aelurum) reads 2022.3 serialized files and exports meshes (OBJ/FBX), textures and audio one asset at a time; it does **not** reconstruct scenes/prefabs. Use it only to salvage a specific mesh/texture AssetRipper fails on. Not pinned or downloaded.
 
-### 2.3 What `rip.ps1` does
+### 2.3 The dependency closure — measured (this killed the first two runs)
 
-`tools\maprip\rip.ps1` (read it; it is short):
+The first staging (a map's `level{N}` + `sharedassets{N}` only) made AssetRipper log dozens of `Import : Dependency 'sharedassetsNNN.assets' wasn't found` (coordinator's runs 1-2). The cause is measured with UnityPy over `SerializedFile.externals`, iterated to a fixed point from each map's files + `globalgamemanagers(.assets)` + `resources.assets`:
 
-1. Downloads the pinned zip into `%LOCALAPPDATA%\aowlspt\assetripper\2.0.0\`, refuses on sha256 mismatch.
-2. Per map (from `maps.json`, default `factory4_day`): stages `D:\aowlspt-maprip\_staging\<map>_Data\` with **hard links** (same volume, no copy) to `globalgamemanagers(.assets)`, `resources.assets(.resS)`, `sharedassets0`, `level0`, the map's `level{N}`/`sharedassets{N}(.resS)` for every scene in its preset, and `Managed\*.dll`.
-3. Starts AssetRipper `--headless --port 47311`, POSTs the settings, `/LoadFolder`, then `/Export/UnityProject` to `D:\aowlspt-maprip\<map>\`.
-4. Verdict that can fail: every scene name in the preset must exist as a `.unity` file in the export — PASS / FAIL (names listed) / INCONCLUSIVE (no `.unity` at all — read `<map>.assetripper.log`).
-5. `-DryRun` prints the staging plan and touches nothing. `-Maps all` does the 13 locations.
+| map | start files / GB | closure files / GB (+.resS) |
+|---|---|---|
+| factory4_day | 31 / 1.17 | **385 / 17.50** (354 extra `sharedassets*.assets`) |
+| Woods | 21 / 2.48 | 344 / 17.50 |
+| bigmap | 61 / 7.28 | 365 / 18.89 |
+| TarkovStreets | 497 / 4.91 | 662 / 18.07 |
+| laboratory / RezervBase / Sandbox / Interchange / Shoreline / Lighthouse / Labyrinth | 39-101 / 1.2-3.9 | 355-436 / 17.2-17.7 |
+| **all 13 together** | — | **1,542 files / 22.61 GB** |
 
-Expected cost (**estimate**, not measured): factory4_day stages ~1.2 GB (0.21 GB map + 1 GB globals) and should export in a few minutes; Customs (6.3 GB) and Streets (4 GB, 247 scenes) are the heavy ones — tens of minutes each and 2-4x the input size on disk for the exported project (meshes as YAML/FBX-ish `.asset`, textures as PNG). Budget ~60-80 GB on D: for all 13, plus the Unity `Library\` folder when the projects are opened.
+So the closure of ANY one map is effectively the whole build (the `sharedassets` files form one connected graph); per-map staging saves only the scene files (14 `level{N}` instead of 558), not the assets. `maps.json` now carries `closureFiles` per map and `rip.ps1` stages exactly that (hard links, so 17.5 GB of staging costs 0 bytes). RAM on this machine: 31.9 GB total, 14.3 GB free at the time, 12 GB pagefile on the nearly full C: — AssetRipper's peak working set for a 17.5 GB load is recorded by the script (`peakRAM=` in the verdict line), see 2.5.
 
-Known risk in the staging approach: a scene's `sharedassets{N}` can reference another map's `sharedassets{M}` (shared texture atlases). AssetRipper reports those as failed/missing references, not a crash; if `factory4_day` comes out with holes, re-run with the whole `EscapeFromTarkov_Data` folder loaded once (`-Maps all` does NOT do that; it would be a 22 GB single load) — that is the fallback, and it needs the RAM to match.
+### 2.4 What `rip.ps1` does — as fixed after runs 1-3
+
+`tools\maprip\rip.ps1`:
+
+1. Downloads the pinned zip into `<ToolRoot>\2.0.0\` (default `D:\aowlspt-tools\assetripper`; C: has 8.8 GB free), refuses on sha256 mismatch.
+2. Per map: stages `<OutRoot>\_staging\<map>_Data\` with hard links to every `closureFiles` entry + `Managed\*.dll`.
+3. Starts `AssetRipper.GUI.Free.exe --headless --port 47311` with `-RedirectStandardOutput` (measured: the `--log true --log-path "..."` form never started listening; the plain form answers within ~10 s), `TEMP`/`TMP` pointed at `D:\aowlspt-tools\tmp`.
+4. `POST /Settings/Update`, `POST /LoadFolder`. **Measured: both `/LoadFolder` and `/Export/UnityProject` return `302` in < 0.1 s and do the work asynchronously**; `GET /Collections/Count` is per-collection (`404 The path must be included in the request` without `?Path=`), so it is not a readiness signal. The only completion signals are stdout lines — `Processing : Finished processing assets` after a load and `Export : Finished post-export` after an export (measured on a tiny load/export of `factory_day_preset.bundle`; the load log ends `Import : Finished reading files` -> `Processing : ...` -> that line; the export log ends `Export : Finished exporting assets` -> `Export : Saving game assemblies...` -> that line). The script polls the log for those, tracks `PeakWorkingSet64`, and returns `done | died | timeout | error` (OutOfMemory / Unhandled exception lines).
+5. Verdict that can fail: every scene name in the preset must exist as a `.unity` in the export — `PASS` / `FAIL (missing scenes: ...)` / `INCONCLUSIVE (...)`; plus a census line: meshes, materials, prefabs, load/export seconds, peak RAM, staged GB, output GB, `Dependency ... wasn't found` count, error-line count.
+6. `-DryRun` prints the plan and touches nothing; `-Maps all` does the 13 locations, each a separate AssetRipper process (17-19 GB load each — 13 loads of the same graph; a single whole-folder load + one export of all 558 scenes is the alternative when disk allows, since the closure IS the whole build).
+
+### 2.5 The real factory4_day run — measured 2026-09-07
+
+Run 4 (this session; runs 1-3 were the coordinator's and died on the two bugs above). `rip.ps1 -Maps factory4_day -OutRoot D:\aowlspt-maprip -ToolRoot D:\aowlspt-tools\assetripper -TempDir D:\aowlspt-tools\tmp -KeepStaging`, AssetRipper 2.0.0 headless on port 47311, staged 737 files / 17.50 GB (hard links) + `Managed\`.
+
+```
+VERDICT factory4_day : PASS   scenes=14/14 (Factory_Rework_AI, _Admin_Office, _Areas, _Background, _Basement, _Day_Culling,
+                              _Day_Light, _Day_Scripts, _DesignMain, _DesignStuff, _Laboratory, _Main_Building, _Quests,
+                              Factory_Sound_Rework -- every preset scene present as .unity, 0 extra .unity)
+load   = 18 s   ("Import : Finished reading files" -> "Processing : Finished processing assets" at 15:11:25; started 15:11:07)
+        Import : Files use the 'Mono' scripting backend   (Managed\ was picked up)
+        depMissing (Dependency ... wasn't found) = 0       (was dozens with the non-closure staging)
+export = 684 s  (POST 15:14:28 -> "Export : Finished post-export" 15:25:52), 127,371 assets, ~11k assets/min
+RAM    = peak working set 7.72 GB (PeakPagedMemorySize 7.73 GB), 828 CPU-seconds total on 10c/20t
+output = D:\aowlspt-maprip\factory4_day  29,755 MB, 269,439 files
+         97,596 .asset (93,014 of them under Assets\Mesh)  13,388 .png  7,973 .mat  5,567 .physicMaterial
+         1,543 .audioclip  376 .shader (dummies)  325 .prefab  233 .dll  8,694 .cs  24 .terrainlayer  47 NavMesh* files
+         22 TerrainData .asset  0 .exr (no lightmaps exported as EXR -- lightmaps landed as .png or were not separate; unverified which)
+log    = 132,893 lines; real errors 0; 1,543 x "Can't decode audio clip ... audio data could not be found"
+         (every clip: the audio lives in StreamingAssets bundles we excluded -- expected, not a map problem);
+         8 x "Unable to convert '<font> Atlas' to bitmap" (TMP font atlases, irrelevant)
+scripts: LocationScene.cs / BotZone.cs / SpawnPointMarker.cs / ExfiltrationPoint.cs / LootableContainer.cs exported with
+         guids, and the scene YAML references them (LocationScene guid in 14/14 scenes; BotZone in the _AI scene;
+         SpawnPointMarker in 2; ExfiltrationPoint in 1; LootableContainer in 1)
+missing scripts (m_Script: {fileID: 0}) per scene: Factory_Rework_AI 93, Factory_Rework_Background 1, all others 0
+scene sizes: Basement 102 MB, Areas 80 MB, Main_Building 78 MB (8,575 MonoBehaviours), Admin_Office 39 MB, Background 35 MB,
+         Day_Light 25 MB, Laboratory 13 MB, AI 5.5 MB, DesignStuff 4 MB, Day_Scripts 4 MB, Sound 4 MB, DesignMain 0.7 MB,
+         Quests 91 KB, Day_Culling 28 KB
+```
+
+What this settles: AssetRipper 2.0.0 reconstructs BSG's 2022.3.43f1 scenes intact (14/14, no dependency holes with the closure, Mono scripts resolved, terrain and navmesh assets present). Cost per map is fixed by the closure, not the map: ~18 s load + ~11 min export + ~30 GB out (the 93k meshes are the whole game's, exported once per map). For `-Maps all` that is 13 x 30 GB = ~390 GB and ~2.5 h — or one whole-`_Data` load (22.6 GB) and one export with all 558 scenes (~same assets + 544 more scene files), which is the better shape and still needs an export-filter that the free build lacks. Unverified: the 93 missing scripts in `Factory_Rework_AI` (likely generic/obfuscated `CG_*` MonoBehaviours the decompiler skipped — inspect before phase 1), lightmap format, whether Unity opens the 30 GB project without choking on 97k `.asset` imports (expect a long first import; put `Library\` on D:).
+
+Fixes that came out of the run (all in `rip.ps1`): the launch line, the async done-signals, the closure staging, and — found on this run — `[IO.File]::ReadAllText` on the redirected stdout log is DENIED while PowerShell holds it (the load finished in 18 s and the poller spun for minutes reporting an empty last line, because the exception was swallowed: a check that could not fail). Now `FileShare.ReadWrite`, and an unreadable log is a hard `Fail`, never "still loading". The export for this run was therefore driven by hand against the loaded instance (`POST /Export/UnityProject`), and the census by hand; the script's own end-to-end path with the fix is **not yet exercised** — the next `-Maps Woods` run is that test.
 
 ---
 

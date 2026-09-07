@@ -159,8 +159,14 @@ function Wait-LogLine($proc, [string]$log, [string]$doneMarker, [int]$timeoutMin
   $deadline = (Get-Date).AddMinutes($timeoutMin); $lastReport = Get-Date; $lastLine = ''
   while ((Get-Date) -lt $deadline) {
     try { $proc.Refresh(); $ws = $proc.PeakWorkingSet64 / 1GB; if ($ws -gt $peakGB.Value) { $peakGB.Value = $ws } } catch { }
+    # MEASURED 2026-09-07: [IO.File]::ReadAllText is DENIED while Start-Process's redirect holds the file
+    # (the first run loaded in 18 s and the poller never saw it, because a swallowed exception read as "not yet").
+    # Open with FileShare.ReadWrite, and never swallow: an unreadable log is a hard failure, not "still loading".
     $text = ''
-    try { $text = [IO.File]::ReadAllText($log) } catch { }
+    try {
+      $fs = [IO.FileStream]::new($log, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+      try { $sr = [IO.StreamReader]::new($fs); $text = $sr.ReadToEnd() } finally { $fs.Dispose() }
+    } catch { Fail "cannot read $log while AssetRipper runs ($_) -- the poller would spin until timeout" }
     if ($text -match [regex]::Escape($doneMarker)) { return 'done' }
     if ($text -match '(?m)^(Unhandled exception|.*OutOfMemory|Fatal error)') { return 'error' }
     if ($proc.HasExited) { return 'died' }
